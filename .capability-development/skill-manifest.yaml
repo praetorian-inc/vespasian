@@ -1,0 +1,167 @@
+# Vespasian Skill Manifest
+# Maps technologies to implementation skills and patterns
+
+capability: vespasian
+capability_type: Scanner
+created_at: "2026-01-28T04:30:00Z"
+
+# Core technology stack
+technologies:
+  - name: Go
+    version: "1.24"
+    purpose: Core implementation, plugin architecture
+    skills:
+      - implementing-detection-plugins
+      - implementing-go-plugin-registries
+
+  - name: YAML Templates
+    purpose: Declarative probe configurations, wordlists
+    skills:
+      - implementing-yaml-template-engines
+
+  - name: gRPC
+    purpose: gRPC reflection probe
+    skills:
+      - implementing-detection-plugins
+
+  - name: WebSocket (RFC 6455)
+    purpose: WebSocket enumeration probe
+    skills:
+      - implementing-detection-plugins
+
+  - name: OpenAPI/Swagger
+    version: "3.0"
+    purpose: API specification parsing
+    libraries:
+      - "github.com/getkin/kin-openapi/openapi3"
+    skills:
+      - implementing-detection-plugins
+
+  - name: GraphQL
+    purpose: Introspection and schema enumeration
+    skills:
+      - implementing-detection-plugins
+
+# Probe implementation patterns
+probe_patterns:
+  # P1: Critical probes (Go implementation)
+  - name: openapi-probe
+    pattern: Go Plugin
+    rationale: Complex spec parsing, request generation algorithm
+    interface: SpecProbe
+
+  - name: graphql-probe
+    pattern: Go Plugin
+    rationale: Introspection queries, schema parsing, query generation
+    interface: SpecProbe
+
+  - name: grpc-probe
+    pattern: Go Plugin
+    rationale: Custom binary protocol, reflection API
+    interface: ProtocolProbe
+
+  - name: websocket-probe
+    pattern: Go Plugin
+    rationale: RFC 6455 protocol, connection lifecycle
+    interface: ProtocolProbe
+
+  # P2: Important probes (Hybrid approach)
+  - name: parameter-discovery
+    pattern: Hybrid (Go + YAML)
+    rationale: Go fuzzing logic, YAML wordlists
+    interface: FuzzerProbe
+
+  - name: version-enumeration
+    pattern: YAML Templates
+    rationale: Simple path pattern matching
+    interface: HTTPProbe
+
+  # P3: Data source probes (Go implementation)
+  - name: historical-urls
+    pattern: Go Plugin
+    rationale: External API integration
+    interface: DataProbe
+
+  - name: har-import
+    pattern: Go Plugin
+    rationale: File parsing, JSON processing
+    interface: DataProbe
+
+# Registry architecture (from Augustus)
+registry:
+  pattern: "Generic Registry[T]"
+  source: "modules/augustus/pkg/registry/registry.go"
+  components:
+    - name: ProbeRegistry
+      type: "Registry[Probe]"
+      purpose: Core probe registration
+    - name: MatcherRegistry
+      type: "Registry[Matcher]"
+      purpose: Response matchers (from Hadrian)
+
+# Template system (from Hadrian)
+templates:
+  format: YAML
+  source: "modules/hadrian/hadrian-api-tester/pkg/templates/"
+  use_cases:
+    - Endpoint detection patterns
+    - Wordlist-based discovery
+    - Version fingerprinting
+
+# Reusable patterns from existing capabilities
+reuse_from:
+  nerva:
+    - Plugin interface pattern
+    - Protocol routing (TCP, UDP, gRPC)
+    - Service result structure
+    - Priority-based execution
+
+  augustus:
+    - Generic Registry[T]
+    - TypedFactory[C, T]
+    - Config helpers (GetString, GetInt, etc.)
+    - Self-registration via init()
+
+  hadrian:
+    - Template YAML structure
+    - Matcher system (word, regex, status)
+    - Request building patterns
+    - Rate limiting/backoff
+
+  trajan:
+    - JavaScript AST parsing (if needed)
+    - Taint tracking patterns (if needed)
+
+# Skills to invoke during implementation
+implementation_skills:
+  phase_7_architecture:
+    - skill: "gateway-capabilities"
+      purpose: Route to capability-specific skills
+    - skill: "selecting-plugin-implementation-pattern"
+      purpose: Confirm Go vs YAML decisions
+
+  phase_8_implementation:
+    - skill: "implementing-detection-plugins"
+      purpose: Go probe implementation
+    - skill: "implementing-go-plugin-registries"
+      purpose: Registry pattern
+    - skill: "developing-with-tdd"
+      purpose: Test-driven development
+
+  phase_13_testing:
+    - skill: "gateway-testing"
+      purpose: Route to testing skills
+
+# Gap analysis
+gaps_identified:
+  - name: "No existing Katana wrapper"
+    impact: "Must decide: wrap Katana or reimplement crawling"
+    recommendation: "Wrap Katana as subprocess for HTTP crawling"
+
+  - name: "No gRPC reflection library"
+    impact: "Need to integrate grpcurl or implement reflection client"
+    recommendation: "Use github.com/fullstorydev/grpcurl as library"
+
+  - name: "No GraphQL introspection library"
+    impact: "Need schema parsing capability"
+    recommendation: "Implement introspection query handling in Go"

@@ -1,0 +1,96 @@
+capability_name: "Vespasian"
+capability_slug: "vespasian"
+orchestration_skill: "orchestrating-capability-development"
+created_at: "2026-01-28T04:29:41Z"
+description: |
+  Comprehensive API surface enumeration tool with plugin architecture:
+  - HTTP crawling with rate limiting
+  - JavaScript endpoint extraction (fetch, XHR, axios)
+  - OpenAPI/Swagger specification parsing
+  - GraphQL introspection
+  - gRPC reflection
+  - WebSocket detection
+  - WSDL/SOAP parsing
+
+status: "in-progress"
+current_phase: 8
+current_phase_name: "implementation"
+current_batch: 6
+work_type: "LARGE"
+
+phases:
+  1_setup: { status: "completed" }
+  2_triage: { status: "completed" }
+  3_codebase_discovery: { status: "completed" }
+  4_skill_discovery: { status: "completed" }
+  5_complexity: { status: "completed" }
+  6_brainstorming: { status: "completed" }
+  7_architecture_plan: { status: "completed", checkpoint_approved: true }
+  8_implementation:
+    status: "in-progress"
+    batches_completed: 5
+    batches_total: 6
+  9_design_verification: { status: "pending" }
+  10_domain_compliance: { status: "pending" }
+  11_code_quality: { status: "pending" }
+  12_test_planning: { status: "pending" }
+  13_testing: { status: "pending" }
+  14_coverage_verification: { status: "pending" }
+  15_test_quality: { status: "pending" }
+  16_completion: { status: "pending" }
+
+capability_type: "Scanner"
+
+implementation_progress:
+  batches:
+    - batch: 1
+      name: "Core Foundation"
+      tasks: ["T001", "T002", "T003", "T004", "T005"]
+      status: "complete"
+      files: 12
+      tests: 18
+    - batch: 2
+      name: "HTTP Crawler"
+      tasks: ["T006", "T007", "T008"]
+      status: "complete"
+      files: 10
+      tests: 23
+    - batch: 3
+      name: "JavaScript Parsing"
+      tasks: ["T009", "T010", "T011"]
+      status: "complete"
+      files: 5
+      tests: 10
+    - batch: 4
+      name: "OpenAPI/GraphQL"
+      tasks: ["T012", "T013", "T014", "T015"]
+      status: "complete"
+      files: 15
+      tests: 45
+    - batch: 5
+      name: "gRPC/WebSocket/WSDL"
+      tasks: ["T016", "T017", "T018", "T019", "T020", "T021"]
+      status: "complete"
+      files: 11
+      tests: 16
+    - batch: 6
+      name: "Output & Orchestrator"
+      tasks: ["T022", "T023", "T024", "T025"]
+      status: "pending"
+
+  total_files: 53
+  total_tests: 112
+
+probes_registered:
+  - crawler
+  - graphql
+  - grpc
+  - openapi
+  - websocket
+  - wsdl
+
+workspace:
+  path: "/Users/nathansportsman/capabilities/modules/vespasian"
+  branch: "capability/vespasian"
+
+resume_command: "/capability continue ../capabilities/modules/vespasian/.capability-development/ from batch 6"
