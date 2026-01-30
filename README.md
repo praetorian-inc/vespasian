@@ -1,8 +1,10 @@
 # Vespasian - API Surface Enumeration Tool
 
-[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)](https://go.dev/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-176%20passing-brightgreen)](tests/)
+[![CI](https://github.com/praetorian-inc/vespasian/actions/workflows/ci.yml/badge.svg)](https://github.com/praetorian-inc/vespasian/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/praetorian-inc/vespasian/branch/main/graph/badge.svg)](https://codecov.io/gh/praetorian-inc/vespasian)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/praetorian-inc/vespasian)](https://go.dev/)
+[![License](https://img.shields.io/github/license/praetorian-inc/vespasian)](LICENSE)
+[![Go Report Card](https://goreportcard.com/badge/github.com/praetorian-inc/vespasian)](https://goreportcard.com/report/github.com/praetorian-inc/vespasian)
 
 > Discover API endpoints across OpenAPI, GraphQL, gRPC, WebSocket, and WSDL with a single tool.
 
@@ -20,6 +22,47 @@ Vespasian is a comprehensive **API surface enumeration tool** that discovers API
 - [API Reference](#api-reference)
 - [Contributing](#contributing)
 - [License](#license)
+
+## Architecture
+
+```mermaid
+graph LR
+    subgraph Input
+        T[Target URL]
+        C[Config YAML]
+    end
+
+    subgraph Orchestrator
+        O[Discovery Orchestrator]
+    end
+
+    subgraph Probes ["Probes (by priority)"]
+        P1[gRPC Reflection<br/>Priority: 60]
+        P2[WebSocket Detection<br/>Priority: 55]
+        P3[OpenAPI Parser<br/>Priority: 50]
+        P4[WSDL Parser<br/>Priority: 50]
+        P5[GraphQL Introspection<br/>Priority: 45]
+        P6[HTML Crawler]
+        P7[JS Analyzer]
+    end
+
+    subgraph Output
+        OUT[Findings]
+        F1[Terminal]
+        F2[JSON]
+        F3[NDJSON]
+        F4[Markdown]
+        F5[SARIF]
+    end
+
+    T --> O
+    C --> O
+    O --> P1 & P2 & P3 & P4 & P5 & P6 & P7
+    P1 & P2 & P3 & P4 & P5 & P6 & P7 --> OUT
+    OUT --> F1 & F2 & F3 & F4 & F5
+```
+
+The orchestrator runs all applicable probes **concurrently**, sorted by priority. Each probe implements a common interface with `Run()`, `Name()`, `Category()`, `Priority()`, and `Accepts()` methods.
 
 ## Features
 
@@ -269,9 +312,102 @@ type Probe interface {
 }
 ```
 
+## Frequently Asked Questions
+
+### How do I scan a target that requires authentication?
+
+Add custom headers to your configuration file:
+
+```yaml
+http:
+  headers:
+    Authorization: "Bearer your-token-here"
+    X-API-Key: "your-api-key"
+```
+
+### Why isn't GraphQL introspection returning results?
+
+Many production GraphQL servers disable introspection for security. Check if:
+1. The server allows introspection (common in development environments)
+2. You have the correct endpoint path (try `/graphql`, `/api/graphql`, `/query`)
+3. Authentication is required for introspection queries
+
+### How do I add custom OpenAPI specification locations?
+
+Configure custom paths in your YAML config:
+
+```yaml
+probes:
+  openapi:
+    locations:
+      - /api/openapi.json
+      - /docs/swagger.yaml
+      - /internal/api-docs
+```
+
+### What's the difference between JSON and NDJSON output?
+
+- **JSON**: Complete array of all findings, ideal for post-processing with `jq`
+- **NDJSON**: Newline-delimited JSON, streams results as discovered—better for large scans and pipeline integration
+
+### Can I run only specific probes?
+
+Yes, enable only the probes you need:
+
+```yaml
+probes:
+  enabled:
+    - openapi
+    - graphql
+  # Other probes will be skipped
+```
+
+## Troubleshooting
+
+### Error: "connection refused"
+
+**Cause**: Target server is not reachable or not running.
+
+**Solutions**:
+1. Verify the target URL is correct and accessible
+2. Check network connectivity and firewall rules
+3. Ensure the target service is running
+
+### Error: "rate limit exceeded" or 429 responses
+
+**Cause**: Sending requests too quickly for the target server.
+
+**Solution**: Reduce request rate in your configuration:
+
+```yaml
+rate_limit:
+  requests_per_second: 5  # Lower this value
+  burst: 10
+```
+
+### Error: "TLS handshake failure"
+
+**Cause**: SSL/TLS certificate issues with the target.
+
+**Solutions**:
+1. Verify the target uses valid certificates
+2. For testing with self-signed certs, consider using a proxy
+
+### No endpoints discovered
+
+**Possible causes**:
+1. Target doesn't expose API specifications at common locations
+2. Introspection/reflection is disabled on the target
+3. Authentication required but not configured
+
+**Debugging steps**:
+1. Run with verbose output to see probe attempts
+2. Manually verify specification URLs exist
+3. Check if authentication headers are needed
+
 ## Contributing
 
-We welcome contributions! Please see our contributing guidelines for details.
+We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
 
 ### Development Setup
 
@@ -288,6 +424,12 @@ go test ./...
 2. Implement the `Probe` interface
 3. Register via `init()` function
 4. Add tests
+
+## Support
+
+If you find Vespasian useful, please consider giving it a ⭐ on GitHub!
+
+[![GitHub stars](https://img.shields.io/github/stars/praetorian-inc/vespasian?style=social)](https://github.com/praetorian-inc/vespasian)
 
 ## License
 
