@@ -40,13 +40,13 @@ Vespasian uses a two-stage pipeline that separates traffic capture from specific
 ```mermaid
 flowchart LR
     subgraph Capture
-        A[Headless Browser Crawler\nJS execution, auth injection] --> C[capture.json\nObservedRequest array]
-        B[Traffic Importers\nBurp Suite XML, HAR, mitmproxy] --> C
+        A["Headless Browser Crawler<br/>JS execution, auth injection"] --> C["capture.json<br/>ObservedRequest array"]
+        B["Traffic Importers<br/>Burp Suite XML, HAR, mitmproxy"] --> C
     end
     subgraph Generate
-        C --> D[Classifier\nREST, GraphQL, ...]
-        D --> E[Prober\nOPTIONS, schema inference]
-        E --> F[Spec Generator\nOpenAPI 3.0, etc.]
+        C --> D["Classifier<br/>REST, GraphQL, ..."]
+        D --> E["Prober<br/>OPTIONS, schema inference"]
+        E --> F["Spec Generator<br/>OpenAPI 3.0, etc."]
     end
 ```
 
