@@ -130,7 +130,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			return nil, err
 		}
 	case <-ctx.Done():
-		// Context cancelled (e.g., SIGINT) -- force-stop the engine.
+		// Context canceled (e.g., SIGINT) -- force-stop the engine.
 		// engine.Close() is called by the deferred cleanup above.
 		return results, ctx.Err()
 	}
