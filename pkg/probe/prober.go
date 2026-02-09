@@ -32,17 +32,43 @@ type ProbeStrategy interface {
 	Probe(ctx context.Context, endpoints []classify.ClassifiedRequest) ([]classify.ClassifiedRequest, error)
 }
 
+// ProbeError records a failed probe strategy.
+type ProbeError struct {
+	Strategy string
+	Err      error
+}
+
+// Error returns a formatted error string.
+func (e *ProbeError) Error() string {
+	return e.Strategy + ": " + e.Err.Error()
+}
+
+// Unwrap returns the underlying error.
+func (e *ProbeError) Unwrap() error {
+	return e.Err
+}
+
 // RunStrategies applies all probe strategies sequentially to the endpoints.
-func RunStrategies(ctx context.Context, strategies []ProbeStrategy, endpoints []classify.ClassifiedRequest) ([]classify.ClassifiedRequest, error) {
+// Failed strategies are isolated — errors are collected but do not prevent
+// subsequent strategies from executing. Returns the enriched endpoints and
+// any errors encountered.
+func RunStrategies(ctx context.Context, strategies []ProbeStrategy, endpoints []classify.ClassifiedRequest) ([]classify.ClassifiedRequest, []error) {
 	result := endpoints
+	var errs []error
 
 	for _, strategy := range strategies {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, &ProbeError{Strategy: strategy.Name(), Err: err})
+			continue
+		}
+
 		enriched, err := strategy.Probe(ctx, result)
 		if err != nil {
-			return nil, err
+			errs = append(errs, &ProbeError{Strategy: strategy.Name(), Err: err})
+			continue
 		}
 		result = enriched
 	}
 
-	return result, nil
+	return result, errs
 }
