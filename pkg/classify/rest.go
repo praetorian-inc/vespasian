@@ -15,7 +15,6 @@
 package classify
 
 import (
-	"bytes"
 	"net/url"
 	"strings"
 
@@ -36,12 +35,21 @@ var staticPathSegments = []string{
 // apiContentTypes lists content types that indicate API responses.
 var apiContentTypes = []string{
 	"application/json", "application/xml", "text/xml", "application/problem+json",
+	"application/vnd.api+json", "application/hal+json",
 }
 
 // apiPathSegments lists path segments that indicate API endpoints.
 var apiPathSegments = []string{
 	"/api/", "/v1/", "/v2/", "/v3/", "/rest/", "/rpc/", "/graphql",
 }
+
+// Confidence scores assigned by each heuristic rule.
+const (
+	ContentTypeConfidence = 0.8  // Rule 2: API content-type match.
+	PathHeuristicBoost    = 0.15 // Rule 3: API path segment boost.
+	HTTPMethodConfidence  = 0.7  // Rule 4: Non-GET HTTP method signal.
+	JSONBodyConfidence    = 0.85 // Rule 5: JSON response structure.
+)
 
 // RESTClassifier classifies REST API requests using ordered heuristic rules.
 type RESTClassifier struct{}
@@ -96,7 +104,7 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	}
 	for _, apiCT := range apiContentTypes {
 		if ct == apiCT {
-			confidence = 0.8
+			confidence = ContentTypeConfidence
 			reason = "content-type:" + apiCT
 			break
 		}
@@ -105,7 +113,7 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	// Rule 3: Path heuristics.
 	for _, seg := range apiPathSegments {
 		if strings.Contains(lowerPath, seg) {
-			confidence += 0.15
+			confidence += PathHeuristicBoost
 			if confidence > 1.0 {
 				confidence = 1.0
 			}
@@ -121,8 +129,8 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	// Rule 4: HTTP method signal.
 	upper := strings.ToUpper(req.Method)
 	if upper == "POST" || upper == "PUT" || upper == "PATCH" || upper == "DELETE" {
-		if confidence < 0.7 {
-			confidence = 0.7
+		if confidence < HTTPMethodConfidence {
+			confidence = HTTPMethodConfidence
 		}
 		if reason == "" {
 			reason = "method:" + upper
@@ -130,11 +138,12 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	}
 
 	// Rule 5: Response structure (JSON body).
+	// Forward-only scan: find first non-whitespace byte without scanning
+	// the entire body from both ends (avoids O(n) scan on large bodies).
 	if len(req.Response.Body) > 0 {
-		trimmed := bytes.TrimSpace(req.Response.Body)
-		if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
-			if confidence < 0.85 {
-				confidence = 0.85
+		if b, ok := firstNonSpace(req.Response.Body); ok && (b == '{' || b == '[') {
+			if confidence < JSONBodyConfidence {
+				confidence = JSONBodyConfidence
 			}
 			if reason == "" {
 				reason = "response-structure:json"
@@ -143,4 +152,19 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	}
 
 	return confidence > 0, confidence, reason
+}
+
+// firstNonSpace returns the first non-ASCII-whitespace byte in b.
+// It scans forward only, making it O(1) for typical HTTP bodies that
+// start with a non-whitespace character.
+func firstNonSpace(b []byte) (byte, bool) {
+	for _, c := range b {
+		switch c {
+		case ' ', '\t', '\n', '\r':
+			continue
+		default:
+			return c, true
+		}
+	}
+	return 0, false
 }

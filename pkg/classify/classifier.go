@@ -77,6 +77,11 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 // Deduplicate removes duplicate classified requests, keeping the highest confidence.
 // The deduplication key is METHOD:path (query params and fragments stripped).
 // QueryParams from all duplicate observations are merged.
+//
+// Memory usage: The map and order slice grow linearly with unique METHOD:path keys.
+// In practice this is bounded by the upstream crawl layer's MaxPages setting
+// (default 100). The import path (ReadCapture) does not enforce size limits,
+// so callers importing from untrusted capture files should validate input size.
 func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
 	type entry struct {
 		req ClassifiedRequest
@@ -96,6 +101,10 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
 			continue
 		}
 
+		// Dedup key intentionally omits host: the crawl layer's scope
+		// restrictions (same-origin / same-domain) make cross-host
+		// duplicates unlikely, and consolidating by path is the desired
+		// behavior for single-target scans.
 		key := req.Method + ":" + parsedURL.Path
 
 		existing, found := seen[key]

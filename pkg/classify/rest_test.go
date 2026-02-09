@@ -15,17 +15,15 @@
 package classify
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestRESTClassifier_Name(t *testing.T) {
 	c := &RESTClassifier{}
-	if c.Name() != "rest" {
-		t.Errorf("Name() = %q, want %q", c.Name(), "rest")
-	}
+	assert.Equal(t, "rest", c.Name())
 }
 
 func TestRESTClassifier_Classify(t *testing.T) {
@@ -50,7 +48,7 @@ func TestRESTClassifier_Classify(t *testing.T) {
 				},
 			},
 			wantIsAPI:     true,
-			wantMinConf:   0.8,
+			wantMinConf:   ContentTypeConfidence,
 			wantMaxConf:   1.0,
 			wantReasonSub: "content-type",
 		},
@@ -65,7 +63,7 @@ func TestRESTClassifier_Classify(t *testing.T) {
 				},
 			},
 			wantIsAPI:     true,
-			wantMinConf:   0.8,
+			wantMinConf:   ContentTypeConfidence,
 			wantMaxConf:   1.0,
 			wantReasonSub: "content-type",
 		},
@@ -80,7 +78,37 @@ func TestRESTClassifier_Classify(t *testing.T) {
 				},
 			},
 			wantIsAPI:     true,
-			wantMinConf:   0.8,
+			wantMinConf:   ContentTypeConfidence,
+			wantMaxConf:   1.0,
+			wantReasonSub: "content-type",
+		},
+		{
+			name: "vendor JSON:API content-type",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/data",
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: "application/vnd.api+json",
+				},
+			},
+			wantIsAPI:     true,
+			wantMinConf:   ContentTypeConfidence,
+			wantMaxConf:   1.0,
+			wantReasonSub: "content-type",
+		},
+		{
+			name: "HAL JSON content-type",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/data",
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: "application/hal+json",
+				},
+			},
+			wantIsAPI:     true,
+			wantMinConf:   ContentTypeConfidence,
 			wantMaxConf:   1.0,
 			wantReasonSub: "content-type",
 		},
@@ -164,8 +192,8 @@ func TestRESTClassifier_Classify(t *testing.T) {
 				},
 			},
 			wantIsAPI:     true,
-			wantMinConf:   0.15,
-			wantMaxConf:   0.15,
+			wantMinConf:   PathHeuristicBoost,
+			wantMaxConf:   PathHeuristicBoost,
 			wantReasonSub: "path-heuristic",
 		},
 		{
@@ -178,8 +206,8 @@ func TestRESTClassifier_Classify(t *testing.T) {
 				},
 			},
 			wantIsAPI:     true,
-			wantMinConf:   0.7,
-			wantMaxConf:   0.7,
+			wantMinConf:   HTTPMethodConfidence,
+			wantMaxConf:   HTTPMethodConfidence,
 			wantReasonSub: "method",
 		},
 		{
@@ -192,8 +220,8 @@ func TestRESTClassifier_Classify(t *testing.T) {
 				},
 			},
 			wantIsAPI:   true,
-			wantMinConf: 0.7,
-			wantMaxConf: 0.7,
+			wantMinConf: HTTPMethodConfidence,
+			wantMaxConf: HTTPMethodConfidence,
 		},
 		{
 			name: "DELETE request no other signals",
@@ -205,8 +233,8 @@ func TestRESTClassifier_Classify(t *testing.T) {
 				},
 			},
 			wantIsAPI:   true,
-			wantMinConf: 0.7,
-			wantMaxConf: 0.7,
+			wantMinConf: HTTPMethodConfidence,
+			wantMaxConf: HTTPMethodConfidence,
 		},
 		{
 			name: "JSON body without content-type",
@@ -219,8 +247,8 @@ func TestRESTClassifier_Classify(t *testing.T) {
 				},
 			},
 			wantIsAPI:     true,
-			wantMinConf:   0.85,
-			wantMaxConf:   0.85,
+			wantMinConf:   JSONBodyConfidence,
+			wantMaxConf:   JSONBodyConfidence,
 			wantReasonSub: "response-structure",
 		},
 		{
@@ -278,8 +306,8 @@ func TestRESTClassifier_Classify(t *testing.T) {
 				},
 			},
 			wantIsAPI:     true,
-			wantMinConf:   0.85,
-			wantMaxConf:   0.85,
+			wantMinConf:   JSONBodyConfidence,
+			wantMaxConf:   JSONBodyConfidence,
 			wantReasonSub: "response-structure",
 		},
 		{
@@ -307,7 +335,7 @@ func TestRESTClassifier_Classify(t *testing.T) {
 				},
 			},
 			wantIsAPI:     true,
-			wantMinConf:   0.8,
+			wantMinConf:   ContentTypeConfidence,
 			wantMaxConf:   1.0,
 			wantReasonSub: "content-type",
 		},
@@ -331,14 +359,11 @@ func TestRESTClassifier_Classify(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			isAPI, confidence, reason := c.ClassifyDetail(tt.req)
-			if isAPI != tt.wantIsAPI {
-				t.Errorf("isAPI = %v, want %v", isAPI, tt.wantIsAPI)
-			}
-			if confidence < tt.wantMinConf || confidence > tt.wantMaxConf {
-				t.Errorf("confidence = %v, want [%v, %v]", confidence, tt.wantMinConf, tt.wantMaxConf)
-			}
-			if tt.wantReasonSub != "" && !strings.Contains(reason, tt.wantReasonSub) {
-				t.Errorf("reason = %q, want substring %q", reason, tt.wantReasonSub)
+			assert.Equal(t, tt.wantIsAPI, isAPI, "isAPI")
+			assert.GreaterOrEqual(t, confidence, tt.wantMinConf, "confidence lower bound")
+			assert.LessOrEqual(t, confidence, tt.wantMaxConf, "confidence upper bound")
+			if tt.wantReasonSub != "" {
+				assert.Contains(t, reason, tt.wantReasonSub, "reason")
 			}
 		})
 	}
@@ -346,7 +371,5 @@ func TestRESTClassifier_Classify(t *testing.T) {
 
 func TestRESTClassifier_ImplementsDetailedClassifier(t *testing.T) {
 	var c APIClassifier = &RESTClassifier{}
-	if _, ok := c.(DetailedClassifier); !ok {
-		t.Error("RESTClassifier should implement DetailedClassifier")
-	}
+	assert.Implements(t, (*DetailedClassifier)(nil), c)
 }

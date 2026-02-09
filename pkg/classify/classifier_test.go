@@ -18,6 +18,8 @@ import (
 	"testing"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // stubClassifier is a simple classifier for testing that returns fixed values.
@@ -35,9 +37,7 @@ func (s *stubClassifier) Classify(_ crawl.ObservedRequest) (bool, float64) {
 func TestRunClassifiers_Empty(t *testing.T) {
 	classifiers := []APIClassifier{&RESTClassifier{}}
 	results := RunClassifiers(classifiers, nil, 0.5)
-	if len(results) != 0 {
-		t.Errorf("RunClassifiers(nil) = %d results, want 0", len(results))
-	}
+	assert.Empty(t, results)
 }
 
 func TestRunClassifiers_ThresholdFiltering(t *testing.T) {
@@ -62,12 +62,8 @@ func TestRunClassifiers_ThresholdFiltering(t *testing.T) {
 	}
 
 	results := RunClassifiers(classifiers, requests, 0.5)
-	if len(results) != 1 {
-		t.Fatalf("RunClassifiers with threshold 0.5 = %d results, want 1", len(results))
-	}
-	if results[0].Confidence < 0.5 {
-		t.Errorf("result confidence = %v, want >= 0.5", results[0].Confidence)
-	}
+	require.Len(t, results, 1)
+	assert.GreaterOrEqual(t, results[0].Confidence, 0.5)
 }
 
 func TestRunClassifiers_ZeroThreshold(t *testing.T) {
@@ -91,9 +87,7 @@ func TestRunClassifiers_ZeroThreshold(t *testing.T) {
 	}
 
 	results := RunClassifiers(classifiers, requests, 0.0)
-	if len(results) != 2 {
-		t.Errorf("RunClassifiers with threshold 0.0 = %d results, want 2", len(results))
-	}
+	assert.Len(t, results, 2)
 }
 
 func TestRunClassifiers_DetailedReason(t *testing.T) {
@@ -110,15 +104,9 @@ func TestRunClassifiers_DetailedReason(t *testing.T) {
 	}
 
 	results := RunClassifiers(classifiers, requests, 0.5)
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(results))
-	}
-	if results[0].Reason == "" {
-		t.Error("expected non-empty reason from DetailedClassifier")
-	}
-	if results[0].Reason == "classified by rest" {
-		t.Error("expected detailed reason, got generic fallback")
-	}
+	require.Len(t, results, 1)
+	assert.NotEmpty(t, results[0].Reason)
+	assert.NotEqual(t, "classified by rest", results[0].Reason)
 }
 
 func TestRunClassifiers_FallbackReason(t *testing.T) {
@@ -137,12 +125,8 @@ func TestRunClassifiers_FallbackReason(t *testing.T) {
 	}
 
 	results := RunClassifiers(classifiers, requests, 0.5)
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(results))
-	}
-	if results[0].Reason != "classified by stub" {
-		t.Errorf("reason = %q, want %q", results[0].Reason, "classified by stub")
-	}
+	require.Len(t, results, 1)
+	assert.Equal(t, "classified by stub", results[0].Reason)
 }
 
 func TestRunClassifiers_MultipleClassifiers(t *testing.T) {
@@ -158,15 +142,9 @@ func TestRunClassifiers_MultipleClassifiers(t *testing.T) {
 	}
 
 	results := RunClassifiers(classifiers, requests, 0.0)
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(results))
-	}
-	if results[0].APIType != "high" {
-		t.Errorf("APIType = %q, want %q (highest confidence wins)", results[0].APIType, "high")
-	}
-	if results[0].Confidence != 0.9 {
-		t.Errorf("Confidence = %v, want 0.9", results[0].Confidence)
-	}
+	require.Len(t, results, 1)
+	assert.Equal(t, "high", results[0].APIType)
+	assert.InDelta(t, 0.9, results[0].Confidence, 0.001)
 }
 
 func TestDeduplicate_MergesSameEndpoint(t *testing.T) {
@@ -204,17 +182,11 @@ func TestDeduplicate_MergesSameEndpoint(t *testing.T) {
 	}
 
 	result := Deduplicate(classified)
-	if len(result) != 1 {
-		t.Fatalf("Deduplicate = %d results, want 1", len(result))
-	}
+	require.Len(t, result, 1)
 	// Highest confidence kept.
-	if result[0].Confidence != 0.85 {
-		t.Errorf("Confidence = %v, want 0.85", result[0].Confidence)
-	}
+	assert.InDelta(t, 0.85, result[0].Confidence, 0.001)
 	// First occurrence's body preserved.
-	if string(result[0].Response.Body) != `[{"id":1}]` {
-		t.Errorf("Body = %q, want first occurrence body", string(result[0].Response.Body))
-	}
+	assert.Equal(t, `[{"id":1}]`, string(result[0].Response.Body))
 }
 
 func TestDeduplicate_MergesQueryParams(t *testing.T) {
@@ -240,15 +212,9 @@ func TestDeduplicate_MergesQueryParams(t *testing.T) {
 	}
 
 	result := Deduplicate(classified)
-	if len(result) != 1 {
-		t.Fatalf("Deduplicate = %d results, want 1", len(result))
-	}
-	if result[0].QueryParams["page"] != "1" {
-		t.Errorf("missing merged param 'page'")
-	}
-	if result[0].QueryParams["limit"] != "10" {
-		t.Errorf("missing merged param 'limit'")
-	}
+	require.Len(t, result, 1)
+	assert.Equal(t, "1", result[0].QueryParams["page"])
+	assert.Equal(t, "10", result[0].QueryParams["limit"])
 }
 
 func TestDeduplicate_NoDuplicates(t *testing.T) {
@@ -280,9 +246,7 @@ func TestDeduplicate_NoDuplicates(t *testing.T) {
 	}
 
 	result := Deduplicate(classified)
-	if len(result) != 3 {
-		t.Errorf("Deduplicate (no dups) = %d results, want 3", len(result))
-	}
+	assert.Len(t, result, 3)
 }
 
 func TestDeduplicate_KeepsHighestConfidence(t *testing.T) {
@@ -317,20 +281,12 @@ func TestDeduplicate_KeepsHighestConfidence(t *testing.T) {
 	}
 
 	result := Deduplicate(classified)
-	if len(result) != 1 {
-		t.Fatalf("Deduplicate = %d results, want 1", len(result))
-	}
-	if result[0].Confidence != 0.95 {
-		t.Errorf("Confidence = %v, want 0.95 (highest)", result[0].Confidence)
-	}
-	if result[0].Reason != "high" {
-		t.Errorf("Reason = %q, want %q (from highest confidence)", result[0].Reason, "high")
-	}
+	require.Len(t, result, 1)
+	assert.InDelta(t, 0.95, result[0].Confidence, 0.001)
+	assert.Equal(t, "high", result[0].Reason)
 }
 
 func TestDeduplicate_Empty(t *testing.T) {
 	result := Deduplicate(nil)
-	if len(result) != 0 {
-		t.Errorf("Deduplicate(nil) = %d results, want 0", len(result))
-	}
+	assert.Empty(t, result)
 }
