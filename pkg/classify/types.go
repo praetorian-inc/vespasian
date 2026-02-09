@@ -26,4 +26,8 @@ type ClassifiedRequest struct {
 	Confidence float64 `json:"confidence"`
 	Reason     string  `json:"reason"`
 	APIType    string  `json:"api_type"`
+
+	// Probe-enriched fields (populated by pkg/probe strategies)
+	AllowedMethods []string               `json:"allowed_methods,omitempty"`
+	ResponseSchema map[string]interface{} `json:"response_schema,omitempty"`
 }
