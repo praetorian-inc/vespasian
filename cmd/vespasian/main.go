@@ -91,7 +91,7 @@ func (c *CrawlCmd) Run() error {
 		if err != nil {
 			return fmt.Errorf("failed to create output file: %w", err)
 		}
-		defer writer.Close()
+		defer func() { _ = writer.Close() }()
 	} else {
 		writer = os.Stdout
 	}
@@ -193,7 +193,7 @@ func (c *ScanCmd) Run() error {
 		if err != nil {
 			return fmt.Errorf("failed to create output file: %w", err)
 		}
-		defer writer.Close()
+		defer func() { _ = writer.Close() }()
 	} else {
 		writer = os.Stdout
 	}

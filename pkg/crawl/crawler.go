@@ -88,7 +88,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 	if err != nil {
 		return nil, err
 	}
-	defer crawlerOpts.Close()
+	defer func() { _ = crawlerOpts.Close() }()
 
 	// Create engine based on headless mode
 	var engine interface {
@@ -104,7 +104,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 	if err != nil {
 		return nil, err
 	}
-	defer engine.Close()
+	defer func() { _ = engine.Close() }()
 
 	// Start crawling
 	if err := engine.Crawl(targetURL); err != nil {
