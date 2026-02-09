@@ -32,12 +32,12 @@ func TestRESTClassifier_Classify(t *testing.T) {
 	c := &RESTClassifier{}
 
 	tests := []struct {
-		name           string
-		req            crawl.ObservedRequest
-		wantIsAPI      bool
-		wantMinConf    float64
-		wantMaxConf    float64
-		wantReasonSub  string // substring expected in reason
+		name          string
+		req           crawl.ObservedRequest
+		wantIsAPI     bool
+		wantMinConf   float64
+		wantMaxConf   float64
+		wantReasonSub string // substring expected in reason
 	}{
 		{
 			name: "JSON API response",

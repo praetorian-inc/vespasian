@@ -79,7 +79,7 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 // QueryParams from all duplicate observations are merged.
 func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
 	type entry struct {
-		req   ClassifiedRequest
+		req ClassifiedRequest
 	}
 	seen := make(map[string]*entry)
 	var order []string
