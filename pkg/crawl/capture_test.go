@@ -16,6 +16,7 @@ package crawl
 
 import (
 	"bytes"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -206,6 +207,74 @@ func TestReadCapture(t *testing.T) {
 			t.Fatal("Expected error for malformed JSON, got nil")
 		}
 	})
+}
+
+// TestReadCapture_LimitedReader verifies ReadCapture uses limited reader
+func TestReadCapture_LimitedReader(t *testing.T) {
+	t.Run("large input within limit succeeds", func(t *testing.T) {
+		// Create a JSON array with enough data to be significant but under MaxCaptureFileSize
+		largeButValid := `[`
+		for i := 0; i < 100; i++ {
+			if i > 0 {
+				largeButValid += ","
+			}
+			largeButValid += `{"method":"GET","url":"https://example.com/` + strings.Repeat("x", 1000) + `","response":{"status_code":200},"source":"test"}`
+		}
+		largeButValid += `]`
+
+		reader := strings.NewReader(largeButValid)
+		requests, err := ReadCapture(reader)
+		if err != nil {
+			t.Fatalf("ReadCapture failed for large valid input: %v", err)
+		}
+
+		if len(requests) != 100 {
+			t.Errorf("Expected 100 requests, got %d", len(requests))
+		}
+	})
+
+	t.Run("input exceeding MaxCaptureFileSize returns error", func(t *testing.T) {
+		// Create a reader that produces more than MaxCaptureFileSize bytes
+		// Use a custom reader that repeats data indefinitely
+		infiniteReader := &infiniteJSONReader{remaining: MaxCaptureFileSize + 1000}
+		_, err := ReadCapture(infiniteReader)
+		if err == nil {
+			t.Fatal("Expected error for input exceeding MaxCaptureFileSize, got nil")
+		}
+	})
+}
+
+// infiniteJSONReader is a test helper that produces JSON data up to a limit
+type infiniteJSONReader struct {
+	remaining int64
+	started   bool
+}
+
+func (r *infiniteJSONReader) Read(p []byte) (n int, err error) {
+	if r.remaining <= 0 {
+		return 0, io.EOF
+	}
+
+	// Start with opening bracket
+	if !r.started {
+		r.started = true
+		p[0] = '['
+		r.remaining--
+		return 1, nil
+	}
+
+	// Fill buffer with JSON-like data
+	toWrite := int64(len(p))
+	if toWrite > r.remaining {
+		toWrite = r.remaining
+	}
+
+	for i := int64(0); i < toWrite; i++ {
+		p[i] = 'x'
+	}
+
+	r.remaining -= toWrite
+	return int(toWrite), nil
 }
 
 func TestWriteReadRoundTrip(t *testing.T) {

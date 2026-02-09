@@ -27,6 +27,13 @@ import (
 	"github.com/projectdiscovery/katana/pkg/types"
 )
 
+const (
+	// DefaultMaxPages is the maximum number of pages to crawl when no limit is specified.
+	DefaultMaxPages = 1000
+	// MaxResponseBodySize is the maximum response body size to retain for classification (1 MB).
+	MaxResponseBodySize = 1 * 1024 * 1024
+)
+
 // CrawlerOptions configures the crawler behavior.
 type CrawlerOptions struct {
 	Depth    int
@@ -49,7 +56,12 @@ func NewCrawler(opts CrawlerOptions) *Crawler {
 
 // Crawl crawls the target URL and returns observed requests.
 func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRequest, error) {
-	var results []ObservedRequest
+	maxPages := c.opts.MaxPages
+	if maxPages <= 0 {
+		maxPages = DefaultMaxPages
+	}
+	// Pre-allocate results slice with capacity, capped at 1000 to limit initial allocation
+	results := make([]ObservedRequest, 0, min(maxPages, 1000))
 	var mu sync.Mutex
 	pageCount := 0
 
@@ -62,7 +74,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		Headless:          c.opts.Headless,
 		CustomHeaders:     ToStringSlice(c.opts.Headers),
 		Strategy:          "depth-first",
-		BodyReadSize:      10 * 1024 * 1024, // 10 MB limit to prevent unbounded memory allocation
+		BodyReadSize:      2 * 1024 * 1024, // 2 MB limit (reduced - we only need bodies for API classification)
 		Concurrency:       10,
 		Parallelism:       10,
 		RateLimit:         150,
@@ -73,8 +85,8 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			mu.Lock()
 			defer mu.Unlock()
 
-			// Check MaxPages limit
-			if c.opts.MaxPages > 0 && pageCount >= c.opts.MaxPages {
+			// Check MaxPages limit (using resolved maxPages)
+			if pageCount >= maxPages {
 				return
 			}
 			pageCount++
@@ -106,9 +118,21 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 	}
 	defer func() { _ = engine.Close() }()
 
-	// Start crawling
-	if err := engine.Crawl(targetURL); err != nil {
-		return nil, err
+	// Run crawl in goroutine with context cancellation
+	crawlErr := make(chan error, 1)
+	go func() {
+		crawlErr <- engine.Crawl(targetURL)
+	}()
+
+	select {
+	case err := <-crawlErr:
+		if err != nil {
+			return nil, err
+		}
+	case <-ctx.Done():
+		// Context cancelled (e.g., SIGINT) -- force-stop the engine.
+		// engine.Close() is called by the deferred cleanup above.
+		return results, ctx.Err()
 	}
 
 	return results, nil
@@ -128,10 +152,17 @@ func MapResult(r output.Result) ObservedRequest {
 		req.URL = r.Request.URL
 		req.Headers = r.Request.Headers
 		req.Body = []byte(r.Request.Body)
+		// Truncate request body if it exceeds MaxResponseBodySize
+		if len(req.Body) > MaxResponseBodySize {
+			req.Body = req.Body[:MaxResponseBodySize]
+		}
 		req.Source = r.Request.Source
 	}
 
 	// Parse query params from URL
+	// QueryParams stores only the first value for each key. Multi-value
+	// query parameters (e.g., ?ids=1&ids=2) retain only the first value.
+	// This is intentional -- the classifier needs parameter names, not all values.
 	if req.URL != "" {
 		if u, err := url.Parse(req.URL); err == nil {
 			req.QueryParams = make(map[string]string)
@@ -149,6 +180,10 @@ func MapResult(r output.Result) ObservedRequest {
 			Headers:     map[string]string(r.Response.Headers),
 			Body:        []byte(r.Response.Body),
 			ContentType: r.Response.Headers["Content-Type"],
+		}
+		// Truncate response body if it exceeds MaxResponseBodySize
+		if len(req.Response.Body) > MaxResponseBodySize {
+			req.Response.Body = req.Response.Body[:MaxResponseBodySize]
 		}
 	}
 

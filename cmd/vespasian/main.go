@@ -38,6 +38,24 @@ var CLI struct {
 	Version  VersionCmd  `cmd:"" help:"Show version information"`
 }
 
+// parseHeaders converts "Key: Value" strings to a map, validating for CRLF injection.
+func parseHeaders(raw []string) (map[string]string, error) {
+	headers := make(map[string]string)
+	for _, h := range raw {
+		parts := strings.SplitN(h, ":", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid header format (expected 'Key: Value'): %q", h)
+		}
+		name := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		if strings.ContainsAny(name, "\r\n") || strings.ContainsAny(value, "\r\n") {
+			return nil, fmt.Errorf("header contains invalid CRLF characters: %q", h)
+		}
+		headers[name] = value
+	}
+	return headers, nil
+}
+
 // CrawlCmd crawls a web application to capture HTTP traffic.
 type CrawlCmd struct {
 	URL      string        `arg:"" help:"Target URL to crawl"`
@@ -53,14 +71,11 @@ type CrawlCmd struct {
 }
 
 // Run executes the crawl command.
-func (c *CrawlCmd) Run() error {
+func (c *CrawlCmd) Run() (err error) {
 	// Parse headers from "Key: Value" format
-	headers := make(map[string]string)
-	for _, h := range c.Header {
-		parts := strings.SplitN(h, ":", 2)
-		if len(parts) == 2 {
-			headers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-		}
+	headers, err := parseHeaders(c.Header)
+	if err != nil {
+		return fmt.Errorf("invalid header: %w", err)
 	}
 
 	// Create crawler options
@@ -87,17 +102,21 @@ func (c *CrawlCmd) Run() error {
 	// Determine output writer
 	var writer *os.File
 	if c.Output != "" {
-		writer, err = os.Create(c.Output)
+		writer, err = os.OpenFile(c.Output, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 		if err != nil {
 			return fmt.Errorf("failed to create output file: %w", err)
 		}
-		defer func() { _ = writer.Close() }()
+		defer func() {
+			if cerr := writer.Close(); cerr != nil && err == nil {
+				err = fmt.Errorf("failed to close output file: %w", cerr)
+			}
+		}()
 	} else {
 		writer = os.Stdout
 	}
 
 	// Write results
-	if err := crawl.WriteCapture(writer, requests); err != nil {
+	if err = crawl.WriteCapture(writer, requests); err != nil {
 		return fmt.Errorf("failed to write capture: %w", err)
 	}
 
@@ -151,14 +170,11 @@ type ScanCmd struct {
 }
 
 // Run executes the scan command.
-func (c *ScanCmd) Run() error {
+func (c *ScanCmd) Run() (err error) {
 	// Parse headers from "Key: Value" format
-	headers := make(map[string]string)
-	for _, h := range c.Header {
-		parts := strings.SplitN(h, ":", 2)
-		if len(parts) == 2 {
-			headers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-		}
+	headers, err := parseHeaders(c.Header)
+	if err != nil {
+		return fmt.Errorf("invalid header: %w", err)
 	}
 
 	// Create crawler options
@@ -189,11 +205,15 @@ func (c *ScanCmd) Run() error {
 	// Determine output writer
 	var writer *os.File
 	if c.Output != "" {
-		writer, err = os.Create(c.Output)
+		writer, err = os.OpenFile(c.Output, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 		if err != nil {
 			return fmt.Errorf("failed to create output file: %w", err)
 		}
-		defer func() { _ = writer.Close() }()
+		defer func() {
+			if cerr := writer.Close(); cerr != nil && err == nil {
+				err = fmt.Errorf("failed to close output file: %w", cerr)
+			}
+		}()
 	} else {
 		writer = os.Stdout
 	}
@@ -201,7 +221,7 @@ func (c *ScanCmd) Run() error {
 	// Write classified results as JSON
 	encoder := json.NewEncoder(writer)
 	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(classified); err != nil {
+	if err = encoder.Encode(classified); err != nil {
 		return fmt.Errorf("failed to write classified results: %w", err)
 	}
 

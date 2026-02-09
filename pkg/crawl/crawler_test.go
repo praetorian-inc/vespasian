@@ -327,3 +327,109 @@ func TestNewCrawler(t *testing.T) {
 		t.Errorf("crawler.opts.Headers[User-Agent] = %q, want %q", crawler.opts.Headers["User-Agent"], "test")
 	}
 }
+
+// TestDefaultMaxPages verifies the DefaultMaxPages constant value
+func TestDefaultMaxPages(t *testing.T) {
+	if DefaultMaxPages != 1000 {
+		t.Errorf("DefaultMaxPages = %d, want 1000", DefaultMaxPages)
+	}
+}
+
+// TestMaxResponseBodySize verifies the MaxResponseBodySize constant value
+func TestMaxResponseBodySize(t *testing.T) {
+	expected := 1 * 1024 * 1024 // 1 MB
+	if MaxResponseBodySize != expected {
+		t.Errorf("MaxResponseBodySize = %d, want %d", MaxResponseBodySize, expected)
+	}
+}
+
+// TestMapResult_TruncatesLargeResponseBody tests that response bodies exceeding MaxResponseBodySize get truncated
+func TestMapResult_TruncatesLargeResponseBody(t *testing.T) {
+	largeBody := make([]byte, MaxResponseBodySize+1000) // 1000 bytes over limit
+	for i := range largeBody {
+		largeBody[i] = byte('A')
+	}
+
+	result := output.Result{
+		Request: &navigation.Request{
+			Method: "GET",
+			URL:    "https://example.com",
+		},
+		Response: &navigation.Response{
+			StatusCode: 200,
+			Body:       string(largeBody),
+		},
+	}
+
+	observed := MapResult(result)
+
+	if len(observed.Response.Body) != MaxResponseBodySize {
+		t.Errorf("Response body length = %d, want %d (truncated)", len(observed.Response.Body), MaxResponseBodySize)
+	}
+
+	// Verify all bytes are 'A' (no corruption during truncation)
+	for i, b := range observed.Response.Body {
+		if b != byte('A') {
+			t.Errorf("Response body[%d] = %c, want 'A' (truncation corrupted data)", i, b)
+			break
+		}
+	}
+}
+
+// TestMapResult_TruncatesLargeRequestBody tests that request bodies exceeding MaxResponseBodySize get truncated
+func TestMapResult_TruncatesLargeRequestBody(t *testing.T) {
+	largeBody := make([]byte, MaxResponseBodySize+500) // 500 bytes over limit
+	for i := range largeBody {
+		largeBody[i] = byte('B')
+	}
+
+	result := output.Result{
+		Request: &navigation.Request{
+			Method: "POST",
+			URL:    "https://example.com",
+			Body:   string(largeBody),
+		},
+	}
+
+	observed := MapResult(result)
+
+	if len(observed.Body) != MaxResponseBodySize {
+		t.Errorf("Request body length = %d, want %d (truncated)", len(observed.Body), MaxResponseBodySize)
+	}
+
+	// Verify all bytes are 'B' (no corruption during truncation)
+	for i, b := range observed.Body {
+		if b != byte('B') {
+			t.Errorf("Request body[%d] = %c, want 'B' (truncation corrupted data)", i, b)
+			break
+		}
+	}
+}
+
+// TestMapResult_SmallBodyNotTruncated tests that bodies under the limit are preserved
+func TestMapResult_SmallBodyNotTruncated(t *testing.T) {
+	smallRequestBody := []byte("small request body")
+	smallResponseBody := []byte("small response body")
+
+	result := output.Result{
+		Request: &navigation.Request{
+			Method: "POST",
+			URL:    "https://example.com",
+			Body:   string(smallRequestBody),
+		},
+		Response: &navigation.Response{
+			StatusCode: 200,
+			Body:       string(smallResponseBody),
+		},
+	}
+
+	observed := MapResult(result)
+
+	if string(observed.Body) != string(smallRequestBody) {
+		t.Errorf("Request body = %q, want %q (should not be truncated)", string(observed.Body), string(smallRequestBody))
+	}
+
+	if string(observed.Response.Body) != string(smallResponseBody) {
+		t.Errorf("Response body = %q, want %q (should not be truncated)", string(observed.Response.Body), string(smallResponseBody))
+	}
+}
