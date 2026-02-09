@@ -16,10 +16,17 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"os/signal"
+	"strings"
 	"time"
 
 	"github.com/alecthomas/kong"
+	"github.com/praetorian-inc/vespasian/pkg/classify"
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
 // CLI defines the complete command-line interface structure.
@@ -47,7 +54,53 @@ type CrawlCmd struct {
 
 // Run executes the crawl command.
 func (c *CrawlCmd) Run() error {
-	fmt.Println("crawl: not implemented")
+	// Parse headers from "Key: Value" format
+	headers := make(map[string]string)
+	for _, h := range c.Header {
+		parts := strings.SplitN(h, ":", 2)
+		if len(parts) == 2 {
+			headers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+		}
+	}
+
+	// Create crawler options
+	opts := crawl.CrawlerOptions{
+		Depth:    c.Depth,
+		MaxPages: c.MaxPages,
+		Timeout:  c.Timeout,
+		Scope:    c.Scope,
+		Headless: c.Headless,
+		Headers:  headers,
+	}
+
+	// Create context with signal handling for graceful shutdown
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	// Create crawler and execute
+	crawler := crawl.NewCrawler(opts)
+	requests, err := crawler.Crawl(ctx, c.URL)
+	if err != nil {
+		return fmt.Errorf("crawl failed: %w", err)
+	}
+
+	// Determine output writer
+	var writer *os.File
+	if c.Output != "" {
+		writer, err = os.Create(c.Output)
+		if err != nil {
+			return fmt.Errorf("failed to create output file: %w", err)
+		}
+		defer writer.Close()
+	} else {
+		writer = os.Stdout
+	}
+
+	// Write results
+	if err := crawl.WriteCapture(writer, requests); err != nil {
+		return fmt.Errorf("failed to write capture: %w", err)
+	}
+
 	return nil
 }
 
@@ -99,7 +152,59 @@ type ScanCmd struct {
 
 // Run executes the scan command.
 func (c *ScanCmd) Run() error {
-	fmt.Println("scan: not implemented")
+	// Parse headers from "Key: Value" format
+	headers := make(map[string]string)
+	for _, h := range c.Header {
+		parts := strings.SplitN(h, ":", 2)
+		if len(parts) == 2 {
+			headers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+		}
+	}
+
+	// Create crawler options
+	opts := crawl.CrawlerOptions{
+		Depth:    c.Depth,
+		MaxPages: c.MaxPages,
+		Timeout:  c.Timeout,
+		Scope:    c.Scope,
+		Headless: c.Headless,
+		Headers:  headers,
+	}
+
+	// Create context with signal handling for graceful shutdown
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	// Create crawler and execute
+	crawler := crawl.NewCrawler(opts)
+	requests, err := crawler.Crawl(ctx, c.URL)
+	if err != nil {
+		return fmt.Errorf("crawl failed: %w", err)
+	}
+
+	// Classify API requests
+	classifiers := []classify.APIClassifier{&classify.RESTClassifier{}}
+	classified := classify.RunClassifiers(classifiers, requests, c.Confidence)
+
+	// Determine output writer
+	var writer *os.File
+	if c.Output != "" {
+		writer, err = os.Create(c.Output)
+		if err != nil {
+			return fmt.Errorf("failed to create output file: %w", err)
+		}
+		defer writer.Close()
+	} else {
+		writer = os.Stdout
+	}
+
+	// Write classified results as JSON
+	encoder := json.NewEncoder(writer)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(classified); err != nil {
+		return fmt.Errorf("failed to write classified results: %w", err)
+	}
+
 	return nil
 }
 
