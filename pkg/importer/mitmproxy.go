@@ -100,15 +100,18 @@ func (i *MitmproxyImporter) parseFlow(flow mitmproxyFlow) (crawl.ObservedRequest
 		return crawl.ObservedRequest{}, fmt.Errorf("failed to decode response content: %w", err)
 	}
 
+	respHeaders := convertMitmproxyHeaders(flow.Response.Headers)
 	return crawl.ObservedRequest{
-		Method:  flow.Request.Method,
-		URL:     url,
-		Headers: convertMitmproxyHeaders(flow.Request.Headers),
-		Body:    reqBody,
+		Method:      flow.Request.Method,
+		URL:         url,
+		Headers:     convertMitmproxyHeaders(flow.Request.Headers),
+		QueryParams: extractQueryParams(url),
+		Body:        reqBody,
 		Response: crawl.ObservedResponse{
-			StatusCode: flow.Response.StatusCode,
-			Headers:    convertMitmproxyHeaders(flow.Response.Headers),
-			Body:       respBody,
+			StatusCode:  flow.Response.StatusCode,
+			Headers:     respHeaders,
+			ContentType: respHeaders["Content-Type"],
+			Body:        respBody,
 		},
 		Source: "import:mitmproxy",
 	}, nil

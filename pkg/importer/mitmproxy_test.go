@@ -235,3 +235,89 @@ func TestMitmproxyImporter_Import_Errors(t *testing.T) {
 		})
 	}
 }
+
+func TestMitmproxyImporter_ContentType(t *testing.T) {
+	json := `{
+		"request": {
+			"method": "GET",
+			"scheme": "https",
+			"host": "example.com",
+			"port": 443,
+			"path": "/api",
+			"headers": []
+		},
+		"response": {
+			"status_code": 200,
+			"headers": [
+				["Content-Type", "application/json; charset=utf-8"]
+			],
+			"content": "e30="
+		}
+	}`
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(strings.NewReader(json))
+	if err != nil {
+		t.Fatalf("Import() error = %v", err)
+	}
+
+	if len(requests) != 1 {
+		t.Fatalf("Import() returned %d requests, want 1", len(requests))
+	}
+
+	req := requests[0]
+	wantContentType := "application/json; charset=utf-8"
+	if req.Response.ContentType != wantContentType {
+		t.Errorf("Response.ContentType = %q, want %q", req.Response.ContentType, wantContentType)
+	}
+}
+
+func TestMitmproxyImporter_QueryParams(t *testing.T) {
+	json := `{
+		"request": {
+			"method": "GET",
+			"scheme": "https",
+			"host": "example.com",
+			"port": 443,
+			"path": "/api?page=1&limit=10",
+			"headers": []
+		},
+		"response": {
+			"status_code": 200,
+			"headers": [],
+			"content": null
+		}
+	}`
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(strings.NewReader(json))
+	if err != nil {
+		t.Fatalf("Import() error = %v", err)
+	}
+
+	if len(requests) != 1 {
+		t.Fatalf("Import() returned %d requests, want 1", len(requests))
+	}
+
+	req := requests[0]
+	if req.QueryParams == nil {
+		t.Fatal("QueryParams should not be nil")
+	}
+
+	wantParams := map[string]string{
+		"page":  "1",
+		"limit": "10",
+	}
+
+	if len(req.QueryParams) != len(wantParams) {
+		t.Errorf("QueryParams has %d entries, want %d", len(req.QueryParams), len(wantParams))
+	}
+
+	for key, want := range wantParams {
+		if got, ok := req.QueryParams[key]; !ok {
+			t.Errorf("QueryParams missing key %q", key)
+		} else if got != want {
+			t.Errorf("QueryParams[%q] = %q, want %q", key, got, want)
+		}
+	}
+}

@@ -102,14 +102,16 @@ func (i *BurpImporter) parseItem(item burpItem) (crawl.ObservedRequest, error) {
 	}
 
 	return crawl.ObservedRequest{
-		Method:  method,
-		URL:     item.URL,
-		Headers: headers,
-		Body:    body,
+		Method:      method,
+		URL:         item.URL,
+		Headers:     headers,
+		QueryParams: extractQueryParams(item.URL),
+		Body:        body,
 		Response: crawl.ObservedResponse{
-			StatusCode: statusCode,
-			Headers:    respHeaders,
-			Body:       respBody,
+			StatusCode:  statusCode,
+			Headers:     respHeaders,
+			ContentType: respHeaders["Content-Type"],
+			Body:        respBody,
 		},
 		Source: "import:burp",
 	}, nil

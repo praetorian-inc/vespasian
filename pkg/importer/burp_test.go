@@ -235,3 +235,75 @@ func TestBurpImporter_Import_Errors(t *testing.T) {
 		})
 	}
 }
+
+func TestBurpImporter_ContentType(t *testing.T) {
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/api</url>
+		<request base64="true">R0VUIC9hcGkgSFRUUC8xLjENCkhvc3Q6IGV4YW1wbGUuY29tDQoNCg==</request>
+		<status>200</status>
+		<response base64="true">SFRUUC8xLjEgMjAwIE9LDQpDb250ZW50LVR5cGU6IGFwcGxpY2F0aW9uL2pzb247IGNoYXJzZXQ9dXRmLTgNCg0Ke30=</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	requests, err := b.Import(strings.NewReader(xml))
+	if err != nil {
+		t.Fatalf("Import() error = %v", err)
+	}
+
+	if len(requests) != 1 {
+		t.Fatalf("Import() returned %d requests, want 1", len(requests))
+	}
+
+	req := requests[0]
+	wantContentType := "application/json; charset=utf-8"
+	if req.Response.ContentType != wantContentType {
+		t.Errorf("Response.ContentType = %q, want %q", req.Response.ContentType, wantContentType)
+	}
+}
+
+func TestBurpImporter_QueryParams(t *testing.T) {
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/api?page=1&amp;limit=10</url>
+		<request base64="true">R0VUIC9hcGk/cGFnZT0xJmxpbWl0PTEwIEhUVFAvMS4xDQpIb3N0OiBleGFtcGxlLmNvbQ0KDQo=</request>
+		<status>200</status>
+		<response base64="true">SFRUUC8xLjEgMjAwIE9LDQoNCg==</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	requests, err := b.Import(strings.NewReader(xml))
+	if err != nil {
+		t.Fatalf("Import() error = %v", err)
+	}
+
+	if len(requests) != 1 {
+		t.Fatalf("Import() returned %d requests, want 1", len(requests))
+	}
+
+	req := requests[0]
+	if req.QueryParams == nil {
+		t.Fatal("QueryParams should not be nil")
+	}
+
+	wantParams := map[string]string{
+		"page":  "1",
+		"limit": "10",
+	}
+
+	if len(req.QueryParams) != len(wantParams) {
+		t.Errorf("QueryParams has %d entries, want %d", len(req.QueryParams), len(wantParams))
+	}
+
+	for key, want := range wantParams {
+		if got, ok := req.QueryParams[key]; !ok {
+			t.Errorf("QueryParams missing key %q", key)
+		} else if got != want {
+			t.Errorf("QueryParams[%q] = %q, want %q", key, got, want)
+		}
+	}
+}
