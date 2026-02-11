@@ -42,6 +42,12 @@ func TestMatchesScope(t *testing.T) {
 			expected: true,
 		},
 		{
+			name:     "wildcard matches root domain",
+			url:      "https://example.com/api",
+			scope:    "*.example.com",
+			expected: true,
+		},
+		{
 			name:     "wildcard no match",
 			url:      "https://other.com/api",
 			scope:    "*.example.com",
@@ -136,7 +142,7 @@ func TestImportWithOptions(t *testing.T) {
 			opts: ImportOptions{
 				Scope: "*.example.com",
 			},
-			expected: 1,
+			expected: 2,
 		},
 	}
 

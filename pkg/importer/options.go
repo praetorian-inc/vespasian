@@ -31,6 +31,7 @@ type ImportOptions struct {
 
 // matchesScope checks if a URL matches the given scope pattern.
 // Supports exact domain matching and wildcard subdomain matching (*.example.com).
+// Wildcard patterns match both subdomains and the root domain itself.
 // Empty scope matches all URLs.
 func matchesScope(urlStr, scope string) bool {
 	if scope == "" {
@@ -46,9 +47,9 @@ func matchesScope(urlStr, scope string) bool {
 
 	// Check for wildcard pattern
 	if strings.HasPrefix(scope, "*.") {
-		suffix := scope[2:] // Remove "*."
-		// Match subdomains but not the root domain
-		return strings.HasSuffix(host, "."+suffix)
+		suffix := scope[1:] // ".example.com"
+		// Match subdomains (e.g., sub.example.com) or root domain (e.g., example.com)
+		return strings.HasSuffix(host, suffix) || host == scope[2:]
 	}
 
 	// Exact match
