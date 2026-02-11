@@ -41,7 +41,7 @@ type burpItems struct {
 }
 
 type burpItem struct {
-	URL      string `xml:"url"`
+	URL      string   `xml:"url"`
 	Request  burpData `xml:"request"`
 	Status   int      `xml:"status"`
 	Response burpData `xml:"response"`

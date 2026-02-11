@@ -37,15 +37,15 @@ func TestBurpImporter_Import(t *testing.T) {
 	postResponse := "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n\r\n{\"id\":123}"
 
 	tests := []struct {
-		name          string
-		xml           string
-		wantRequests  int
-		wantMethod    string
-		wantURL       string
-		wantSource    string
-		wantStatus    int
-		wantReqBody   string
-		wantRespBody  string
+		name         string
+		xml          string
+		wantRequests int
+		wantMethod   string
+		wantURL      string
+		wantSource   string
+		wantStatus   int
+		wantReqBody  string
+		wantRespBody string
 	}{
 		{
 			name: "base64 encoded GET request",
