@@ -36,6 +36,16 @@ jobs:
       - name: Test
         run: go test -race -coverprofile=coverage.out ./...
 
+      - name: Check coverage threshold
+        run: |
+          total=$(go tool cover -func=coverage.out | grep ^total: | awk '{print $3}' | tr -d '%')
+          echo "Total coverage: ${total}%"
+          threshold=80
+          if [ "$(echo "$total < $threshold" | bc -l)" -eq 1 ]; then
+            echo "Coverage ${total}% is below ${threshold}% threshold"
+            exit 1
+          fi
+
       - name: Upload coverage
         uses: actions/upload-artifact@v6
         with:
