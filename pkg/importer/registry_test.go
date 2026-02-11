@@ -20,27 +20,27 @@ import (
 
 func TestGet(t *testing.T) {
 	tests := []struct {
-		name        string
-		format      string
-		wantErr     bool
+		name         string
+		format       string
+		wantErr      bool
 		wantImporter string
 	}{
 		{
-			name:        "burp format",
-			format:      "burp",
-			wantErr:     false,
+			name:         "burp format",
+			format:       "burp",
+			wantErr:      false,
 			wantImporter: "burp",
 		},
 		{
-			name:        "har format",
-			format:      "har",
-			wantErr:     false,
+			name:         "har format",
+			format:       "har",
+			wantErr:      false,
 			wantImporter: "har",
 		},
 		{
-			name:        "mitmproxy format",
-			format:      "mitmproxy",
-			wantErr:     false,
+			name:         "mitmproxy format",
+			format:       "mitmproxy",
+			wantErr:      false,
 			wantImporter: "mitmproxy",
 		},
 		{
