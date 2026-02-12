@@ -18,6 +18,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -128,9 +129,9 @@ func TestOptionsProbe_InjectsAuthHeaders(t *testing.T) {
 }
 
 func TestOptionsProbe_DeduplicatesByURL(t *testing.T) {
-	var requestCount int
+	var requestCount atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
+		requestCount.Add(1)
 		w.Header().Set("Allow", "GET, POST")
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -149,8 +150,8 @@ func TestOptionsProbe_DeduplicatesByURL(t *testing.T) {
 		t.Fatalf("Probe() error: %v", err)
 	}
 
-	if requestCount != 1 {
-		t.Errorf("expected 1 OPTIONS request (deduplicated), got %d", requestCount)
+	if requestCount.Load() != 1 {
+		t.Errorf("expected 1 OPTIONS request (deduplicated), got %d", requestCount.Load())
 	}
 
 	for i, ep := range result {
@@ -185,5 +186,31 @@ func TestOptionsProbe_PerRequestTimeout(t *testing.T) {
 
 	if len(result[0].AllowedMethods) != 0 {
 		t.Errorf("expected empty AllowedMethods on timeout, got %v", result[0].AllowedMethods)
+	}
+}
+
+func TestOptionsProbe_ZeroTimeoutUsesDefault(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Allow", "GET")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	// Pass zero timeout - should use default, not panic or hang
+	cfg := probe.Config{Client: srv.Client(), Timeout: 0}
+	p := probe.NewOptionsProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{ObservedRequest: crawl.ObservedRequest{URL: srv.URL + "/api/users"}, IsAPI: true},
+	}
+
+	result, err := p.Probe(context.Background(), endpoints)
+	if err != nil {
+		t.Fatalf("Probe() error: %v", err)
+	}
+
+	// Should succeed with default timeout, not fail with 0-timeout context
+	if len(result[0].AllowedMethods) == 0 {
+		t.Error("expected AllowedMethods with default timeout, got empty (0-timeout context expired immediately)")
 	}
 }

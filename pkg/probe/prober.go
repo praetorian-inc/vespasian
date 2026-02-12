@@ -33,6 +33,8 @@ type ProbeStrategy interface {
 }
 
 // ProbeError records a failed probe strategy.
+//
+//nolint:revive // ProbeError name is intentional per specification
 type ProbeError struct {
 	Strategy string
 	Err      error

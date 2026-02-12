@@ -29,7 +29,7 @@ type OptionsProbe struct {
 
 // NewOptionsProbe creates an OptionsProbe with the given configuration.
 func NewOptionsProbe(cfg Config) *OptionsProbe {
-	return &OptionsProbe{config: cfg}
+	return &OptionsProbe{config: cfg.withDefaults()}
 }
 
 // Name returns the probe name.
@@ -41,11 +41,6 @@ func (p *OptionsProbe) Name() string {
 // Endpoints are deduplicated by URL to avoid redundant requests. Individual request
 // failures are handled gracefully — the endpoint is returned without enrichment.
 func (p *OptionsProbe) Probe(ctx context.Context, endpoints []classify.ClassifiedRequest) ([]classify.ClassifiedRequest, error) {
-	client := p.config.Client
-	if client == nil {
-		client = &http.Client{Timeout: p.config.Timeout}
-	}
-
 	// Deduplicate: probe each unique URL once
 	urlMethods := make(map[string][]string)
 	seen := make(map[string]bool)
@@ -56,7 +51,7 @@ func (p *OptionsProbe) Probe(ctx context.Context, endpoints []classify.Classifie
 		}
 		seen[ep.URL] = true
 
-		methods := p.probeURL(ctx, client, ep.URL)
+		methods := p.probeURL(ctx, p.config.Client, ep.URL)
 		if len(methods) > 0 {
 			urlMethods[ep.URL] = methods
 		}
@@ -93,7 +88,7 @@ func (p *OptionsProbe) probeURL(ctx context.Context, client *http.Client, url st
 	if err != nil {
 		return nil
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // best-effort close on read-only response
 
 	return parseAllowHeader(resp.Header.Get("Allow"))
 }

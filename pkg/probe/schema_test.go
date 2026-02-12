@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,7 +31,9 @@ func TestSchemaProbe_InfersObjectSchema(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(respBody)
+		if err := json.NewEncoder(w).Encode(respBody); err != nil {
+			t.Errorf("encode response: %v", err)
+		}
 	}))
 	defer srv.Close()
 
@@ -95,7 +98,9 @@ func TestSchemaProbe_InfersArraySchema(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(respBody)
+		if err := json.NewEncoder(w).Encode(respBody); err != nil {
+			t.Errorf("encode response: %v", err)
+		}
 	}))
 	defer srv.Close()
 
@@ -137,7 +142,9 @@ func TestSchemaProbe_InfersArraySchema(t *testing.T) {
 func TestSchemaProbe_SkipsNonJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
-		w.Write([]byte("<html>not json</html>"))
+		if _, err := w.Write([]byte("<html>not json</html>")); err != nil {
+			t.Errorf("write response: %v", err)
+		}
 	}))
 	defer srv.Close()
 
@@ -172,7 +179,9 @@ func TestSchemaProbe_InjectsAuthHeaders(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		if err := json.NewEncoder(w).Encode(map[string]string{"status": "ok"}); err != nil {
+			t.Errorf("encode response: %v", err)
+		}
 	}))
 	defer srv.Close()
 
@@ -213,7 +222,9 @@ func TestSchemaProbe_HandlesNestedObjects(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(respBody)
+		if err := json.NewEncoder(w).Encode(respBody); err != nil {
+			t.Errorf("encode response: %v", err)
+		}
 	}))
 	defer srv.Close()
 
@@ -240,5 +251,84 @@ func TestSchemaProbe_HandlesNestedObjects(t *testing.T) {
 	userProp := props["user"].(map[string]interface{})
 	if userProp["type"] != "object" {
 		t.Errorf("nested user type: got %v, want object", userProp["type"])
+	}
+}
+
+func TestSchemaProbe_DeduplicatesByURL(t *testing.T) {
+	var requestCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]string{"status": "ok"}); err != nil {
+			t.Errorf("encode response: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := probe.Config{Client: srv.Client(), Timeout: 5 * time.Second}
+	p := probe.NewSchemaProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{ObservedRequest: crawl.ObservedRequest{Method: "GET", URL: srv.URL + "/api/users", Response: crawl.ObservedResponse{ContentType: "application/json"}}, IsAPI: true},
+		{ObservedRequest: crawl.ObservedRequest{Method: "POST", URL: srv.URL + "/api/users", Response: crawl.ObservedResponse{ContentType: "application/json"}}, IsAPI: true},
+	}
+
+	result, err := p.Probe(context.Background(), endpoints)
+	if err != nil {
+		t.Fatalf("Probe() error: %v", err)
+	}
+
+	if requestCount.Load() != 1 {
+		t.Errorf("expected 1 GET request (deduplicated), got %d", requestCount.Load())
+	}
+
+	for i, ep := range result {
+		if ep.ResponseSchema == nil {
+			t.Errorf("endpoint[%d].ResponseSchema: got nil, want non-nil", i)
+		}
+	}
+}
+
+func TestSchemaProbe_InferSchemaMaxDepth(t *testing.T) {
+	// Build deeply nested JSON: {"a":{"a":{"a":...}}} to 100 levels
+	var nested interface{} = map[string]interface{}{"leaf": "value"}
+	for i := 0; i < 100; i++ {
+		nested = map[string]interface{}{"a": nested}
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(nested); err != nil {
+			t.Errorf("encode response: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := probe.Config{Client: srv.Client(), Timeout: 5 * time.Second}
+	p := probe.NewSchemaProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:      srv.URL + "/api/deep",
+				Response: crawl.ObservedResponse{ContentType: "application/json"},
+			},
+			IsAPI: true,
+		},
+	}
+
+	// Should not panic or stack overflow - should complete gracefully
+	result, err := p.Probe(context.Background(), endpoints)
+	if err != nil {
+		t.Fatalf("Probe() error: %v", err)
+	}
+
+	if result[0].ResponseSchema == nil {
+		t.Fatal("ResponseSchema should not be nil for valid JSON")
+	}
+
+	// The schema should exist and have type "object" at the top level
+	if result[0].ResponseSchema["type"] != "object" {
+		t.Errorf("top-level type: got %v, want object", result[0].ResponseSchema["type"])
 	}
 }

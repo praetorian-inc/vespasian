@@ -34,7 +34,7 @@ type SchemaProbe struct {
 
 // NewSchemaProbe creates a SchemaProbe with the given configuration.
 func NewSchemaProbe(cfg Config) *SchemaProbe {
-	return &SchemaProbe{config: cfg}
+	return &SchemaProbe{config: cfg.withDefaults()}
 }
 
 // Name returns the probe name.
@@ -43,24 +43,35 @@ func (p *SchemaProbe) Name() string {
 }
 
 // Probe enriches endpoints with inferred JSON schema from GET responses.
-// Only endpoints with JSON content types are probed. Individual request
-// failures are handled gracefully.
+// Only endpoints with JSON content types are probed. Endpoints are deduplicated
+// by URL to avoid redundant requests. Individual request failures are handled
+// gracefully.
 func (p *SchemaProbe) Probe(ctx context.Context, endpoints []classify.ClassifiedRequest) ([]classify.ClassifiedRequest, error) {
-	client := p.config.Client
-	if client == nil {
-		client = &http.Client{Timeout: p.config.Timeout}
+	// Deduplicate: probe each unique URL once
+	urlSchemas := make(map[string]map[string]interface{})
+	seen := make(map[string]bool)
+
+	for _, ep := range endpoints {
+		if !isJSONContentType(ep.Response.ContentType) {
+			continue
+		}
+		if seen[ep.URL] {
+			continue
+		}
+		seen[ep.URL] = true
+
+		schema := p.probeURL(ctx, p.config.Client, ep.URL)
+		if schema != nil {
+			urlSchemas[ep.URL] = schema
+		}
 	}
 
+	// Apply results to all endpoints
 	result := make([]classify.ClassifiedRequest, len(endpoints))
 	copy(result, endpoints)
 
 	for i := range result {
-		if !isJSONContentType(result[i].Response.ContentType) {
-			continue
-		}
-
-		schema := p.probeURL(ctx, client, result[i].URL)
-		if schema != nil {
+		if schema, ok := urlSchemas[result[i].URL]; ok {
 			result[i].ResponseSchema = schema
 		}
 	}
@@ -86,7 +97,7 @@ func (p *SchemaProbe) probeURL(ctx context.Context, client *http.Client, url str
 	if err != nil {
 		return nil
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // best-effort close on read-only response
 
 	if !isJSONContentType(resp.Header.Get("Content-Type")) {
 		return nil
@@ -105,13 +116,25 @@ func (p *SchemaProbe) probeURL(ctx context.Context, client *http.Client, url str
 	return inferSchema(parsed)
 }
 
+// maxSchemaDepth limits recursion depth for schema inference.
+const maxSchemaDepth = 64
+
 // inferSchema infers a JSON-schema-like structure from a parsed JSON value.
 func inferSchema(v interface{}) map[string]interface{} {
+	return inferSchemaDepth(v, 0)
+}
+
+// inferSchemaDepth recursively infers schema with a depth guard.
+func inferSchemaDepth(v interface{}, depth int) map[string]interface{} {
+	if depth > maxSchemaDepth {
+		return map[string]interface{}{"type": "unknown"}
+	}
+
 	switch val := v.(type) {
 	case map[string]interface{}:
 		props := make(map[string]interface{})
 		for k, child := range val {
-			props[k] = inferSchema(child)
+			props[k] = inferSchemaDepth(child, depth+1)
 		}
 		return map[string]interface{}{
 			"type":       "object",
@@ -123,7 +146,7 @@ func inferSchema(v interface{}) map[string]interface{} {
 			"type": "array",
 		}
 		if len(val) > 0 {
-			schema["items"] = inferSchema(val[0])
+			schema["items"] = inferSchemaDepth(val[0], depth+1)
 		}
 		return schema
 

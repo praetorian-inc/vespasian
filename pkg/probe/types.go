@@ -39,3 +39,14 @@ func DefaultConfig() Config {
 		Timeout: 10 * time.Second,
 	}
 }
+
+// withDefaults returns a copy of cfg with zero values replaced by defaults.
+func (cfg Config) withDefaults() Config {
+	if cfg.Timeout == 0 {
+		cfg.Timeout = 10 * time.Second
+	}
+	if cfg.Client == nil {
+		cfg.Client = &http.Client{Timeout: cfg.Timeout}
+	}
+	return cfg
+}
