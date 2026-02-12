@@ -60,6 +60,11 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 	if maxPages <= 0 {
 		maxPages = DefaultMaxPages
 	}
+
+	// Create a cancellable context to stop Katana when MaxPages is reached.
+	crawlCtx, crawlCancel := context.WithCancel(ctx)
+	defer crawlCancel()
+
 	// Pre-allocate results slice with capacity, capped at 1000 to limit initial allocation
 	results := make([]ObservedRequest, 0, min(maxPages, 1000))
 	var mu sync.Mutex
@@ -74,7 +79,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		Headless:          c.opts.Headless,
 		CustomHeaders:     ToStringSlice(c.opts.Headers),
 		Strategy:          "depth-first",
-		BodyReadSize:      2 * 1024 * 1024, // 2 MB limit (reduced - we only need bodies for API classification)
+		BodyReadSize:      10 * 1024 * 1024, // 10 MB limit to prevent memory exhaustion from hostile targets
 		Concurrency:       10,
 		Parallelism:       10,
 		RateLimit:         150,
@@ -92,6 +97,10 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			pageCount++
 
 			results = append(results, MapResult(result))
+			// Stop Katana once MaxPages is reached to avoid wasting resources.
+			if pageCount >= maxPages {
+				crawlCancel()
+			}
 		},
 	}
 
@@ -127,12 +136,15 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 	select {
 	case err := <-crawlErr:
 		if err != nil {
-			return nil, err
+			return results, err
 		}
-	case <-ctx.Done():
-		// Context canceled (e.g., SIGINT) -- force-stop the engine.
-		// engine.Close() is called by the deferred cleanup above.
-		return results, ctx.Err()
+	case <-crawlCtx.Done():
+		// If the parent context was cancelled (SIGINT/SIGTERM), propagate that error
+		// so the caller can decide whether to save partial results.
+		if ctx.Err() != nil {
+			return results, ctx.Err()
+		}
+		// MaxPages reached — not an error.
 	}
 
 	return results, nil

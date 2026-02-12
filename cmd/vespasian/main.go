@@ -18,10 +18,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/alecthomas/kong"
@@ -56,6 +59,52 @@ func parseHeaders(raw []string) (map[string]string, error) {
 	return headers, nil
 }
 
+// doCrawl executes the common crawl pipeline: parse headers, create crawler,
+// run the crawl with signal handling, and return the results. On graceful
+// shutdown (SIGINT/SIGTERM) partial results are returned instead of an error.
+func doCrawl(targetURL string, rawHeaders []string, opts crawl.CrawlerOptions) ([]crawl.ObservedRequest, error) {
+	headers, err := parseHeaders(rawHeaders)
+	if err != nil {
+		return nil, fmt.Errorf("invalid header: %w", err)
+	}
+	opts.Headers = headers
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	crawler := crawl.NewCrawler(opts)
+	requests, err := crawler.Crawl(ctx, targetURL)
+	if err != nil {
+		if errors.Is(err, context.Canceled) && len(requests) > 0 {
+			// Graceful shutdown — return partial results.
+			return requests, nil
+		}
+		return nil, fmt.Errorf("crawl failed: %w", err)
+	}
+	return requests, nil
+}
+
+// writeOutput opens the output file (or stdout if path is empty), calls fn to
+// write content, and ensures the file is closed properly.
+func writeOutput(path string, fn func(io.Writer) error) error {
+	if path == "" {
+		return fn(os.Stdout)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	writeErr := fn(f)
+	closeErr := f.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	if closeErr != nil {
+		return fmt.Errorf("failed to close output file: %w", closeErr)
+	}
+	return nil
+}
+
 // CrawlCmd crawls a web application to capture HTTP traffic.
 type CrawlCmd struct {
 	URL      string        `arg:"" help:"Target URL to crawl"`
@@ -71,56 +120,21 @@ type CrawlCmd struct {
 }
 
 // Run executes the crawl command.
-func (c *CrawlCmd) Run() (err error) {
-	// Parse headers from "Key: Value" format
-	headers, err := parseHeaders(c.Header)
-	if err != nil {
-		return fmt.Errorf("invalid header: %w", err)
-	}
-
-	// Create crawler options
+func (c *CrawlCmd) Run() error {
 	opts := crawl.CrawlerOptions{
 		Depth:    c.Depth,
 		MaxPages: c.MaxPages,
 		Timeout:  c.Timeout,
 		Scope:    c.Scope,
 		Headless: c.Headless,
-		Headers:  headers,
 	}
-
-	// Create context with signal handling for graceful shutdown
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-
-	// Create crawler and execute
-	crawler := crawl.NewCrawler(opts)
-	requests, err := crawler.Crawl(ctx, c.URL)
+	requests, err := doCrawl(c.URL, c.Header, opts)
 	if err != nil {
-		return fmt.Errorf("crawl failed: %w", err)
+		return err
 	}
-
-	// Determine output writer
-	var writer *os.File
-	if c.Output != "" {
-		writer, err = os.OpenFile(c.Output, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-		if err != nil {
-			return fmt.Errorf("failed to create output file: %w", err)
-		}
-		defer func() {
-			if cerr := writer.Close(); cerr != nil && err == nil {
-				err = fmt.Errorf("failed to close output file: %w", cerr)
-			}
-		}()
-	} else {
-		writer = os.Stdout
-	}
-
-	// Write results
-	if err = crawl.WriteCapture(writer, requests); err != nil {
-		return fmt.Errorf("failed to write capture: %w", err)
-	}
-
-	return nil
+	return writeOutput(c.Output, func(w io.Writer) error {
+		return crawl.WriteCapture(w, requests)
+	})
 }
 
 // ImportCmd imports traffic capture from external sources.
@@ -170,62 +184,29 @@ type ScanCmd struct {
 }
 
 // Run executes the scan command.
-func (c *ScanCmd) Run() (err error) {
-	// Parse headers from "Key: Value" format
-	headers, err := parseHeaders(c.Header)
-	if err != nil {
-		return fmt.Errorf("invalid header: %w", err)
-	}
-
-	// Create crawler options
+func (c *ScanCmd) Run() error {
 	opts := crawl.CrawlerOptions{
 		Depth:    c.Depth,
 		MaxPages: c.MaxPages,
 		Timeout:  c.Timeout,
 		Scope:    c.Scope,
 		Headless: c.Headless,
-		Headers:  headers,
 	}
-
-	// Create context with signal handling for graceful shutdown
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-
-	// Create crawler and execute
-	crawler := crawl.NewCrawler(opts)
-	requests, err := crawler.Crawl(ctx, c.URL)
+	requests, err := doCrawl(c.URL, c.Header, opts)
 	if err != nil {
-		return fmt.Errorf("crawl failed: %w", err)
+		return err
 	}
 
-	// Classify API requests
-	classifiers := []classify.APIClassifier{&classify.RESTClassifier{}}
-	classified := classify.RunClassifiers(classifiers, requests, c.Confidence)
+	classified := classify.RunClassifiers(
+		[]classify.APIClassifier{&classify.RESTClassifier{}},
+		requests, c.Confidence,
+	)
 
-	// Determine output writer
-	var writer *os.File
-	if c.Output != "" {
-		writer, err = os.OpenFile(c.Output, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-		if err != nil {
-			return fmt.Errorf("failed to create output file: %w", err)
-		}
-		defer func() {
-			if cerr := writer.Close(); cerr != nil && err == nil {
-				err = fmt.Errorf("failed to close output file: %w", cerr)
-			}
-		}()
-	} else {
-		writer = os.Stdout
-	}
-
-	// Write classified results as JSON
-	encoder := json.NewEncoder(writer)
-	encoder.SetIndent("", "  ")
-	if err = encoder.Encode(classified); err != nil {
-		return fmt.Errorf("failed to write classified results: %w", err)
-	}
-
-	return nil
+	return writeOutput(c.Output, func(w io.Writer) error {
+		encoder := json.NewEncoder(w)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(classified)
+	})
 }
 
 // VersionCmd shows version information.
