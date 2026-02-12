@@ -139,7 +139,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			return results, err
 		}
 	case <-crawlCtx.Done():
-		// If the parent context was cancelled (SIGINT/SIGTERM), propagate that error
+		// If the parent context was canceled (SIGINT/SIGTERM), propagate that error
 		// so the caller can decide whether to save partial results.
 		if ctx.Err() != nil {
 			return results, ctx.Err()
