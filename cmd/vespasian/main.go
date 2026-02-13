@@ -86,13 +86,17 @@ type GenerateCmd struct {
 const maxCaptureSize = 100 * 1024 * 1024
 
 // Run executes the generate command.
-func (c *GenerateCmd) Run() error {
+func (c *GenerateCmd) Run() (err error) {
 	// Open capture file
 	f, err := os.Open(c.Capture)
 	if err != nil {
 		return fmt.Errorf("opening capture file: %w", err)
 	}
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("closing capture file: %w", cerr)
+		}
+	}()
 
 	// Guard against excessively large capture files.
 	info, err := f.Stat()

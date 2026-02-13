@@ -213,10 +213,10 @@ func TestOpenAPIGenerator_RealWorldExample(t *testing.T) {
 
 	// Verify paths were normalized correctly
 	expectedPaths := []string{
-		"/users/{id}",      // Both /users/42 and /users/87 normalized
-		"/users",           // POST and GET with query params
-		"/resources/{id}",  // UUID normalized
-		"/users/me",        // Literal preserved
+		"/users/{id}",     // Both /users/42 and /users/87 normalized
+		"/users",          // POST and GET with query params
+		"/resources/{id}", // UUID normalized
+		"/users/me",       // Literal preserved
 	}
 
 	for _, path := range expectedPaths {
@@ -360,7 +360,7 @@ func TestP0Fixes_ContextAwarePathParams(t *testing.T) {
 	if pathItem.Get == nil {
 		t.Fatal("GET operation not found")
 	}
-	
+
 	var paramNames []string
 	for _, paramRef := range pathItem.Get.Parameters {
 		if paramRef.Value.In == "path" {
@@ -429,7 +429,7 @@ func TestP0Fixes_ActualStatusCodes(t *testing.T) {
 	}
 
 	paths := parsed["paths"].(map[string]interface{})
-	
+
 	// Check POST /users has 201 response
 	usersPath := paths["/users"].(map[string]interface{})
 	postOp := usersPath["post"].(map[string]interface{})
