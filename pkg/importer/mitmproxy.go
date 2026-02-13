@@ -123,12 +123,7 @@ func (i *MitmproxyImporter) parseFlow(flow mitmproxyFlow) (crawl.ObservedRequest
 // constructURL builds URL from mitmproxy components using url.URL struct.
 func constructURL(scheme, host string, port int, path string) string {
 	// Parse path to separate path and query
-	pathPart := path
-	query := ""
-	if idx := strings.Index(path, "?"); idx != -1 {
-		pathPart = path[:idx]
-		query = path[idx+1:]
-	}
+	pathPart, query, _ := strings.Cut(path, "?")
 
 	u := &url.URL{
 		Scheme:   scheme,
@@ -138,7 +133,8 @@ func constructURL(scheme, host string, port int, path string) string {
 	}
 
 	// Add port if non-default
-	if !((scheme == "https" && port == 443) || (scheme == "http" && port == 80)) {
+	isDefaultPort := (scheme == "https" && port == 443) || (scheme == "http" && port == 80)
+	if !isDefaultPort {
 		u.Host = fmt.Sprintf("%s:%d", host, port)
 	}
 
