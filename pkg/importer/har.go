@@ -66,8 +66,11 @@ type harHeader struct {
 
 // Import reads HAR 1.2 JSON and converts to ObservedRequest format.
 func (i *HARImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
+	// Limit reader to prevent resource exhaustion
+	limitedReader := io.LimitReader(r, maxImportSize)
+
 	var har harLog
-	if err := json.NewDecoder(r).Decode(&har); err != nil {
+	if err := json.NewDecoder(limitedReader).Decode(&har); err != nil {
 		return nil, fmt.Errorf("har importer: failed to decode JSON: %w", err)
 	}
 
