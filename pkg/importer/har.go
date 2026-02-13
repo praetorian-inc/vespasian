@@ -74,17 +74,30 @@ func (i *HARImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
 	var requests []crawl.ObservedRequest
 	for _, entry := range har.Log.Entries {
 		respHeaders := convertHeaders(entry.Response.Headers)
+
+		// Convert request body only if non-empty
+		var reqBody []byte
+		if entry.Request.PostData.Text != "" {
+			reqBody = []byte(entry.Request.PostData.Text)
+		}
+
+		// Convert response body only if non-empty
+		var respBody []byte
+		if entry.Response.Content.Text != "" {
+			respBody = []byte(entry.Response.Content.Text)
+		}
+
 		req := crawl.ObservedRequest{
 			Method:      entry.Request.Method,
 			URL:         entry.Request.URL,
 			Headers:     convertHeaders(entry.Request.Headers),
 			QueryParams: extractQueryParams(entry.Request.URL),
-			Body:        []byte(entry.Request.PostData.Text),
+			Body:        reqBody,
 			Response: crawl.ObservedResponse{
 				StatusCode:  entry.Response.Status,
 				Headers:     respHeaders,
 				ContentType: respHeaders["Content-Type"],
-				Body:        []byte(entry.Response.Content.Text),
+				Body:        respBody,
 			},
 			Source: "import:har",
 		}

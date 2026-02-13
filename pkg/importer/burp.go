@@ -15,7 +15,6 @@
 package importer
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/base64"
 	"encoding/xml"
@@ -25,6 +24,11 @@ import (
 	"strings"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+)
+
+const (
+	// Maximum file size for imports (500MB)
+	maxImportSize = 500 * 1024 * 1024
 )
 
 // BurpImporter imports Burp Suite XML traffic captures.
@@ -54,8 +58,28 @@ type burpData struct {
 
 // Import reads Burp Suite XML and converts to ObservedRequest format.
 func (i *BurpImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
+	// Limit reader to prevent resource exhaustion
+	limitedReader := io.LimitReader(r, maxImportSize)
+
+	// Read first 8KB to check for entity declarations
+	peekSize := 8192
+	buf := make([]byte, peekSize)
+	n, err := io.ReadFull(limitedReader, buf)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return nil, fmt.Errorf("burp importer: failed to read input: %w", err)
+	}
+	buf = buf[:n]
+
+	// Check for DOCTYPE or ENTITY declarations (XXE attack vectors)
+	if bytes.Contains(buf, []byte("<!DOCTYPE")) || bytes.Contains(buf, []byte("<!ENTITY")) {
+		return nil, fmt.Errorf("burp importer: XML contains DOCTYPE or ENTITY declarations which are not allowed")
+	}
+
+	// Combine peek buffer with remaining data
+	fullReader := io.MultiReader(bytes.NewReader(buf), limitedReader)
+
 	var items burpItems
-	if err := xml.NewDecoder(r).Decode(&items); err != nil {
+	if err := xml.NewDecoder(fullReader).Decode(&items); err != nil {
 		return nil, fmt.Errorf("burp importer: failed to decode XML: %w", err)
 	}
 
@@ -118,7 +142,7 @@ func (i *BurpImporter) parseItem(item burpItem) (crawl.ObservedRequest, error) {
 }
 
 func decodeData(d burpData) ([]byte, error) {
-	if d.Base64 == "true" {
+	if strings.EqualFold(d.Base64, "true") {
 		decoded, err := base64.StdEncoding.DecodeString(d.Data)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decode base64: %w", err)
@@ -129,25 +153,45 @@ func decodeData(d burpData) ([]byte, error) {
 }
 
 func parseHTTPRequest(data []byte) (method string, headers map[string]string, body []byte, err error) {
-	scanner := bufio.NewScanner(bytes.NewReader(data))
 	headers = make(map[string]string)
 
-	// Parse request line
-	if !scanner.Scan() {
+	// Find the header/body separator
+	separator := []byte("\r\n\r\n")
+	sepIdx := bytes.Index(data, separator)
+	if sepIdx == -1 {
+		// Try just \n\n as fallback
+		separator = []byte("\n\n")
+		sepIdx = bytes.Index(data, separator)
+		if sepIdx == -1 {
+			return "", nil, nil, fmt.Errorf("no header/body separator found")
+		}
+	}
+
+	// Split headers and body
+	headerSection := data[:sepIdx]
+	if sepIdx+len(separator) < len(data) {
+		body = data[sepIdx+len(separator):]
+	}
+
+	// Parse request line and headers
+	lines := bytes.Split(headerSection, []byte("\n"))
+	if len(lines) == 0 {
 		return "", nil, nil, fmt.Errorf("empty request")
 	}
-	parts := strings.Fields(scanner.Text())
+
+	// Parse request line
+	requestLine := string(bytes.TrimRight(lines[0], "\r"))
+	parts := strings.Fields(requestLine)
 	if len(parts) < 2 {
 		return "", nil, nil, fmt.Errorf("invalid request line")
 	}
 	method = parts[0]
 
 	// Parse headers
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" || line == "\r" {
-			// End of headers
-			break
+	for i := 1; i < len(lines); i++ {
+		line := string(bytes.TrimRight(lines[i], "\r"))
+		if line == "" {
+			continue
 		}
 		// Parse header
 		idx := strings.Index(line, ":")
@@ -158,29 +202,39 @@ func parseHTTPRequest(data []byte) (method string, headers map[string]string, bo
 		}
 	}
 
-	// Rest is body
-	var bodyBuf bytes.Buffer
-	for scanner.Scan() {
-		bodyBuf.Write(scanner.Bytes())
-		bodyBuf.WriteByte('\n')
-	}
-	if bodyBuf.Len() > 0 {
-		// Remove trailing newline
-		body = bytes.TrimRight(bodyBuf.Bytes(), "\n")
-	}
-
 	return method, headers, body, nil
 }
 
 func parseHTTPResponse(data []byte) (statusCode int, headers map[string]string, body []byte, err error) {
-	scanner := bufio.NewScanner(bytes.NewReader(data))
 	headers = make(map[string]string)
 
-	// Parse status line
-	if !scanner.Scan() {
+	// Find the header/body separator
+	separator := []byte("\r\n\r\n")
+	sepIdx := bytes.Index(data, separator)
+	if sepIdx == -1 {
+		// Try just \n\n as fallback
+		separator = []byte("\n\n")
+		sepIdx = bytes.Index(data, separator)
+		if sepIdx == -1 {
+			return 0, nil, nil, fmt.Errorf("no header/body separator found")
+		}
+	}
+
+	// Split headers and body
+	headerSection := data[:sepIdx]
+	if sepIdx+len(separator) < len(data) {
+		body = data[sepIdx+len(separator):]
+	}
+
+	// Parse status line and headers
+	lines := bytes.Split(headerSection, []byte("\n"))
+	if len(lines) == 0 {
 		return 0, nil, nil, fmt.Errorf("empty response")
 	}
-	parts := strings.Fields(scanner.Text())
+
+	// Parse status line
+	statusLine := string(bytes.TrimRight(lines[0], "\r"))
+	parts := strings.Fields(statusLine)
 	if len(parts) < 2 {
 		return 0, nil, nil, fmt.Errorf("invalid status line")
 	}
@@ -190,11 +244,10 @@ func parseHTTPResponse(data []byte) (statusCode int, headers map[string]string, 
 	}
 
 	// Parse headers
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" || line == "\r" {
-			// End of headers
-			break
+	for i := 1; i < len(lines); i++ {
+		line := string(bytes.TrimRight(lines[i], "\r"))
+		if line == "" {
+			continue
 		}
 		// Parse header
 		idx := strings.Index(line, ":")
@@ -203,17 +256,6 @@ func parseHTTPResponse(data []byte) (statusCode int, headers map[string]string, 
 			value := strings.TrimSpace(line[idx+1:])
 			headers[key] = value
 		}
-	}
-
-	// Rest is body
-	var bodyBuf bytes.Buffer
-	for scanner.Scan() {
-		bodyBuf.Write(scanner.Bytes())
-		bodyBuf.WriteByte('\n')
-	}
-	if bodyBuf.Len() > 0 {
-		// Remove trailing newline
-		body = bytes.TrimRight(bodyBuf.Bytes(), "\n")
 	}
 
 	return statusCode, headers, body, nil

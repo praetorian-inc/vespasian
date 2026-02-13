@@ -19,7 +19,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strconv"
+	"net/url"
+	"strings"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
@@ -56,7 +57,9 @@ type mitmproxyResponse struct {
 // Import reads mitmproxy JSON and converts to ObservedRequest format.
 // Handles both single flow and array of flows.
 func (i *MitmproxyImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
-	data, err := io.ReadAll(r)
+	// Limit reader to prevent resource exhaustion
+	limitedReader := io.LimitReader(r, maxImportSize)
+	data, err := io.ReadAll(limitedReader)
 	if err != nil {
 		return nil, fmt.Errorf("mitmproxy importer: failed to read input: %w", err)
 	}
@@ -117,13 +120,29 @@ func (i *MitmproxyImporter) parseFlow(flow mitmproxyFlow) (crawl.ObservedRequest
 	}, nil
 }
 
-// constructURL builds URL from mitmproxy components.
+// constructURL builds URL from mitmproxy components using url.URL struct.
 func constructURL(scheme, host string, port int, path string) string {
-	// Omit default ports
-	if (scheme == "https" && port == 443) || (scheme == "http" && port == 80) {
-		return scheme + "://" + host + path
+	// Parse path to separate path and query
+	pathPart := path
+	query := ""
+	if idx := strings.Index(path, "?"); idx != -1 {
+		pathPart = path[:idx]
+		query = path[idx+1:]
 	}
-	return scheme + "://" + host + ":" + strconv.Itoa(port) + path
+
+	u := &url.URL{
+		Scheme:   scheme,
+		Host:     host,
+		Path:     pathPart,
+		RawQuery: query,
+	}
+
+	// Add port if non-default
+	if !((scheme == "https" && port == 443) || (scheme == "http" && port == 80)) {
+		u.Host = fmt.Sprintf("%s:%d", host, port)
+	}
+
+	return u.String()
 }
 
 // decodeContent decodes base64-encoded content.
