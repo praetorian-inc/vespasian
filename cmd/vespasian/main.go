@@ -17,9 +17,15 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/alecthomas/kong"
+	"github.com/praetorian-inc/vespasian/pkg/classify"
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/generate/rest"
 )
 
 // CLI defines the complete command-line interface structure.
@@ -76,9 +82,78 @@ type GenerateCmd struct {
 	Verbose    bool    `short:"v" help:"Enable verbose logging"`
 }
 
+// maxCaptureSize is the maximum capture file size (100MB).
+const maxCaptureSize = 100 * 1024 * 1024
+
 // Run executes the generate command.
 func (c *GenerateCmd) Run() error {
-	fmt.Println("generate: not implemented")
+	// Open capture file
+	f, err := os.Open(c.Capture)
+	if err != nil {
+		return fmt.Errorf("opening capture file: %w", err)
+	}
+	defer f.Close()
+
+	// Guard against excessively large capture files.
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat capture file: %w", err)
+	}
+	if info.Size() > maxCaptureSize {
+		return fmt.Errorf("capture file too large: %d bytes (max %d)", info.Size(), maxCaptureSize)
+	}
+
+	// Read captured requests
+	requests, err := crawl.ReadCapture(f)
+	if err != nil {
+		return fmt.Errorf("reading capture file: %w", err)
+	}
+
+	// TODO: Use classify.RunClassifiers() once classifier is implemented.
+	// For now, treat all captured requests as API calls.
+	classified := make([]classify.ClassifiedRequest, len(requests))
+	for i, req := range requests {
+		classified[i] = classify.ClassifiedRequest{
+			ObservedRequest: req,
+			IsAPI:           true,
+			Confidence:      c.Confidence,
+			APIType:         c.APIType,
+		}
+	}
+
+	// Infer output format from file extension
+	format := "yaml"
+	if c.Output != "" {
+		ext := strings.ToLower(filepath.Ext(c.Output))
+		if ext == ".json" {
+			format = "json"
+		}
+	}
+
+	// Generate spec
+	gen := &rest.OpenAPIGenerator{Format: format}
+	spec, err := gen.Generate(classified)
+	if err != nil {
+		return fmt.Errorf("generating spec: %w", err)
+	}
+
+	// Guard against empty spec (no endpoints found)
+	if len(spec) == 0 {
+		return fmt.Errorf("no API endpoints found in capture file")
+	}
+
+	// Write output
+	if c.Output != "" {
+		if err := os.WriteFile(c.Output, spec, 0600); err != nil {
+			return fmt.Errorf("writing output: %w", err)
+		}
+		if c.Verbose {
+			fmt.Fprintf(os.Stderr, "Wrote %s (%d bytes)\n", c.Output, len(spec))
+		}
+	} else {
+		fmt.Print(string(spec))
+	}
+
 	return nil
 }
 
