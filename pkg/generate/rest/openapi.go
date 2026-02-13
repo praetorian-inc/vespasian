@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -26,8 +27,12 @@ import (
 
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/praetorian-inc/vespasian/pkg/classify"
+	"github.com/praetorian-inc/vespasian/pkg/generate"
 	"gopkg.in/yaml.v3"
 )
+
+// Compile-time interface compliance check.
+var _ generate.SpecGenerator = (*OpenAPIGenerator)(nil)
 
 // capitalizeFirst capitalizes the first letter of a string (UTF-8 safe).
 func capitalizeFirst(s string) string {
@@ -36,6 +41,20 @@ func capitalizeFirst(s string) string {
 	}
 	r, size := utf8.DecodeRuneInString(s)
 	return string(unicode.ToUpper(r)) + s[size:]
+}
+
+// inferQueryParamType infers the OpenAPI type from a query parameter value.
+func inferQueryParamType(value string) string {
+	if _, err := strconv.Atoi(value); err == nil {
+		return "integer"
+	}
+	if _, err := strconv.ParseFloat(value, 64); err == nil {
+		return "number"
+	}
+	if value == "true" || value == "false" {
+		return "boolean"
+	}
+	return "string"
 }
 
 // OpenAPIGenerator generates OpenAPI 3.0 specifications.
@@ -112,27 +131,50 @@ func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]b
 			Responses: openapi3.NewResponses(),
 		}
 
-		// Use first endpoint from group as representative
 		if len(group) > 0 {
-			endpoint := group[0]
-
-			// Collect union of query parameters from all endpoints in group
-			queryParamNames := make(map[string]struct{})
+			// --- Query parameters: collect union from all endpoints, track frequency and first value ---
+			type queryParamInfo struct {
+				count    int
+				firstVal string
+			}
+			queryParams := make(map[string]*queryParamInfo)
+			endpointsWithParams := 0
 			for _, ep := range group {
-				for name := range ep.QueryParams {
-					queryParamNames[name] = struct{}{}
+				if len(ep.QueryParams) > 0 {
+					endpointsWithParams++
+				}
+				for name, val := range ep.QueryParams {
+					if info, ok := queryParams[name]; ok {
+						info.count++
+					} else {
+						queryParams[name] = &queryParamInfo{count: 1, firstVal: val}
+					}
 				}
 			}
-			if len(queryParamNames) > 0 {
-				operation.Parameters = make(openapi3.Parameters, 0, len(queryParamNames))
-				for name := range queryParamNames {
+			if len(queryParams) > 0 {
+				// Sort parameter names for deterministic output
+				paramNames := make([]string, 0, len(queryParams))
+				for name := range queryParams {
+					paramNames = append(paramNames, name)
+				}
+				sort.Strings(paramNames)
+
+				operation.Parameters = make(openapi3.Parameters, 0, len(queryParams))
+				for _, name := range paramNames {
+					info := queryParams[name]
+					// Required if present in all endpoints that have query params
+					required := endpointsWithParams > 0 && info.count == endpointsWithParams
+
+					// Infer type from first observed value
+					paramType := inferQueryParamType(info.firstVal)
+
 					param := &openapi3.Parameter{
 						Name:     name,
 						In:       "query",
-						Required: false,
+						Required: required,
 						Schema: &openapi3.SchemaRef{
 							Value: &openapi3.Schema{
-								Type: &openapi3.Types{"string"},
+								Type: &openapi3.Types{paramType},
 							},
 						},
 					}
@@ -156,50 +198,61 @@ func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]b
 				operation.Parameters = append(operation.Parameters, &openapi3.ParameterRef{Value: param})
 			}
 
-			// Add request body for POST/PUT/PATCH
-			if (key.method == "post" || key.method == "put" || key.method == "patch") && len(endpoint.Body) > 0 {
-				schema := InferSchema(endpoint.Body)
-				if schema != nil {
-					operation.RequestBody = &openapi3.RequestBodyRef{
-						Value: &openapi3.RequestBody{
-							Content: openapi3.Content{
-								"application/json": &openapi3.MediaType{
-									Schema: schema,
+			// --- Request body: use first endpoint with a body ---
+			for _, ep := range group {
+				if (key.method == "post" || key.method == "put" || key.method == "patch") && len(ep.Body) > 0 {
+					schema := InferSchema(ep.Body)
+					if schema != nil {
+						operation.RequestBody = &openapi3.RequestBodyRef{
+							Value: &openapi3.RequestBody{
+								Content: openapi3.Content{
+									"application/json": &openapi3.MediaType{
+										Schema: schema,
+									},
 								},
 							},
-						},
+						}
 					}
+					break // use first endpoint with body
 				}
 			}
 
-			// Add response
-			statusCode := "200"
-			statusInt := 200
-			if sc := endpoint.Response.StatusCode; sc > 0 {
-				statusCode = strconv.Itoa(sc)
-				statusInt = sc
-			}
+			// --- Responses: collect all distinct status codes ---
+			seenStatus := make(map[string]bool)
+			for _, ep := range group {
+				statusCode := "200"
+				statusInt := 200
+				if sc := ep.Response.StatusCode; sc > 0 {
+					statusCode = strconv.Itoa(sc)
+					statusInt = sc
+				}
 
-			description := http.StatusText(statusInt)
-			if description == "" {
-				description = statusCode
-			}
-			response := &openapi3.Response{
-				Description: &description,
-			}
+				if seenStatus[statusCode] {
+					continue
+				}
+				seenStatus[statusCode] = true
 
-			if len(endpoint.Response.Body) > 0 {
-				schema := InferSchema(endpoint.Response.Body)
-				if schema != nil {
-					response.Content = openapi3.Content{
-						"application/json": &openapi3.MediaType{
-							Schema: schema,
-						},
+				description := http.StatusText(statusInt)
+				if description == "" {
+					description = statusCode
+				}
+				response := &openapi3.Response{
+					Description: &description,
+				}
+
+				if len(ep.Response.Body) > 0 {
+					schema := InferSchema(ep.Response.Body)
+					if schema != nil {
+						response.Content = openapi3.Content{
+							"application/json": &openapi3.MediaType{
+								Schema: schema,
+							},
+						}
 					}
 				}
-			}
 
-			operation.Responses.Set(statusCode, &openapi3.ResponseRef{Value: response})
+				operation.Responses.Set(statusCode, &openapi3.ResponseRef{Value: response})
+			}
 		}
 
 		// Set operation for the method

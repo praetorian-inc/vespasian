@@ -15,8 +15,6 @@
 package rest
 
 import (
-	"fmt"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -129,12 +127,7 @@ func sanitizeParamName(name string) string {
 //   - "data" -> "dataId" (no trailing 's')
 func paramNameFromContext(segment string) string {
 	singular := singularize(segment)
-	raw := singular + "Id"
-	sanitized := sanitizeParamName(raw)
-	if sanitized != raw {
-		fmt.Fprintf(os.Stderr, "warning: path segment %q produced unsafe parameter name %q, sanitized to %q\n", segment, raw, sanitized)
-	}
-	return sanitized
+	return sanitizeParamName(singular + "Id")
 }
 
 // singularize converts a plural word to singular (naive implementation).
