@@ -51,6 +51,9 @@ func parseHeaders(raw []string) (map[string]string, error) {
 		}
 		name := strings.TrimSpace(parts[0])
 		value := strings.TrimSpace(parts[1])
+		if name == "" {
+			return nil, fmt.Errorf("header has empty name: %q", h)
+		}
 		if strings.ContainsAny(name, "\r\n") || strings.ContainsAny(value, "\r\n") {
 			return nil, fmt.Errorf("header contains invalid CRLF characters: %q", h)
 		}
@@ -197,10 +200,10 @@ func (c *ScanCmd) Run() error {
 		return err
 	}
 
-	classified := classify.RunClassifiers(
+	classified := classify.Deduplicate(classify.RunClassifiers(
 		[]classify.APIClassifier{&classify.RESTClassifier{}},
 		requests, c.Confidence,
-	)
+	))
 
 	return writeOutput(c.Output, func(w io.Writer) error {
 		encoder := json.NewEncoder(w)

@@ -178,16 +178,12 @@ func TestParseHeaders_EdgeCases(t *testing.T) {
 		{
 			name:    "colon at start (empty key)",
 			input:   []string{": value"},
-			wantKey: "",
-			wantVal: "value",
-			wantErr: false,
+			wantErr: true,
 		},
 		{
 			name:    "only colon",
 			input:   []string{":"},
-			wantKey: "",
-			wantVal: "",
-			wantErr: false,
+			wantErr: true,
 		},
 	}
 

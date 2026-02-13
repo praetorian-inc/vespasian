@@ -139,6 +139,12 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			return results, err
 		}
 	case <-crawlCtx.Done():
+		// Context canceled (MaxPages reached or SIGINT/SIGTERM).
+		// Close the engine to unblock the goroutine, then drain it
+		// to avoid a goroutine leak.
+		_ = engine.Close()
+		<-crawlErr
+
 		// If the parent context was canceled (SIGINT/SIGTERM), propagate that error
 		// so the caller can decide whether to save partial results.
 		if ctx.Err() != nil {
