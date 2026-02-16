@@ -217,8 +217,8 @@ func TestBurpImporter_Import_Errors(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "malformed response status line",
-			xml:  `<?xml version="1.0"?><items><item><url>https://example.com/test</url><request base64="false">GET / HTTP/1.1\r\nHost: test.com\r\n\r\n</request><response base64="false">HTTP/1.1\r\n\r\n</response></item></items>`,
+			name:    "malformed response status line",
+			xml:     `<?xml version="1.0"?><items><item><url>https://example.com/test</url><request base64="false">GET / HTTP/1.1\r\nHost: test.com\r\n\r\n</request><response base64="false">HTTP/1.1\r\n\r\n</response></item></items>`,
 			wantErr: true,
 		},
 	}
