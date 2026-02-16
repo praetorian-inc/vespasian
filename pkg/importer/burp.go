@@ -31,6 +31,11 @@ const (
 	maxImportSize = 500 * 1024 * 1024
 )
 
+var validHTTPMethods = map[string]bool{
+	"GET": true, "POST": true, "PUT": true, "DELETE": true,
+	"PATCH": true, "HEAD": true, "OPTIONS": true, "TRACE": true, "CONNECT": true,
+}
+
 // BurpImporter imports Burp Suite XML traffic captures.
 type BurpImporter struct{}
 
@@ -59,7 +64,7 @@ type burpData struct {
 // Import reads Burp Suite XML and converts to ObservedRequest format.
 func (i *BurpImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
 	// Limit reader to prevent resource exhaustion
-	limitedReader := io.LimitReader(r, maxImportSize)
+	limitedReader := newLimitedReader(r, maxImportSize)
 
 	// Read all content to check for entity declarations
 	data, err := io.ReadAll(limitedReader)
@@ -67,15 +72,46 @@ func (i *BurpImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
 		return nil, fmt.Errorf("burp importer: failed to read input: %w", err)
 	}
 
+	// Check if file was too large
+	if limitedReader.hitLimit {
+		return nil, ErrFileTooLarge
+	}
+
 	// Check for DOCTYPE or ENTITY declarations (XXE attack vectors)
-	// Case-insensitive per S4
-	upperData := bytes.ToUpper(data)
-	if bytes.Contains(upperData, []byte("<!DOCTYPE")) || bytes.Contains(upperData, []byte("<!ENTITY")) {
+	// Case-insensitive search without memory copy
+	doctypePatterns := [][]byte{
+		[]byte("<!DOCTYPE"), []byte("<!doctype"), []byte("<!Doctype"),
+		[]byte("<!DocType"), []byte("<!DOctype"), []byte("<!dOCTYPE"),
+	}
+	entityPatterns := [][]byte{
+		[]byte("<!ENTITY"), []byte("<!entity"), []byte("<!Entity"),
+		[]byte("<!EnTiTy"), []byte("<!ENtity"), []byte("<!eNTITY"),
+	}
+
+	hasDOCTYPE := false
+	for _, pattern := range doctypePatterns {
+		if bytes.Contains(data, pattern) {
+			hasDOCTYPE = true
+			break
+		}
+	}
+
+	hasENTITY := false
+	for _, pattern := range entityPatterns {
+		if bytes.Contains(data, pattern) {
+			hasENTITY = true
+			break
+		}
+	}
+
+	if hasDOCTYPE || hasENTITY {
 		return nil, fmt.Errorf("burp importer: XML contains DOCTYPE or ENTITY declarations which are not allowed")
 	}
 
 	var items burpItems
-	if err := xml.NewDecoder(bytes.NewReader(data)).Decode(&items); err != nil {
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	decoder.Strict = true
+	if err := decoder.Decode(&items); err != nil {
 		return nil, fmt.Errorf("burp importer: failed to decode XML: %w", err)
 	}
 
@@ -207,7 +243,12 @@ func parseHTTPRequest(data []byte) (method string, headers map[string]string, bo
 		return "", nil, nil, fmt.Errorf("invalid request line")
 	}
 
-	return parts[0], headers, body, nil
+	method = parts[0]
+	if !validHTTPMethods[method] {
+		return "", nil, nil, fmt.Errorf("invalid HTTP method: %s", method)
+	}
+
+	return method, headers, body, nil
 }
 
 func parseHTTPResponse(data []byte) (statusCode int, headers map[string]string, body []byte, err error) {

@@ -20,6 +20,8 @@ import (
 	"testing"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMatchesScope(t *testing.T) {
@@ -82,9 +84,7 @@ func TestMatchesScope(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := matchesScope(tt.url, tt.scope)
-			if result != tt.expected {
-				t.Errorf("matchesScope(%q, %q) = %v, want %v", tt.url, tt.scope, result, tt.expected)
-			}
+			assert.Equal(t, tt.expected, result)
 		})
 	}
 }
@@ -150,12 +150,8 @@ func TestImportWithOptions(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			mock := &mockImporter{requests: requests}
 			result, err := ImportWithOptions(mock, strings.NewReader(""), tt.opts)
-			if err != nil {
-				t.Fatalf("ImportWithOptions failed: %v", err)
-			}
-			if len(result) != tt.expected {
-				t.Errorf("ImportWithOptions returned %d requests, want %d", len(result), tt.expected)
-			}
+			require.NoError(t, err)
+			assert.Len(t, result, tt.expected)
 		})
 	}
 }

@@ -16,6 +16,9 @@ package importer
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestGet(t *testing.T) {
@@ -54,25 +57,13 @@ func TestGet(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			imp, err := Get(tt.format)
 			if tt.wantErr {
-				if err == nil {
-					t.Errorf("Get(%q) expected error, got nil", tt.format)
-				}
+				assert.Error(t, err)
 				return
 			}
 
-			if err != nil {
-				t.Errorf("Get(%q) unexpected error: %v", tt.format, err)
-				return
-			}
-
-			if imp == nil {
-				t.Errorf("Get(%q) returned nil importer", tt.format)
-				return
-			}
-
-			if imp.Name() != tt.wantImporter {
-				t.Errorf("Get(%q).Name() = %q, want %q", tt.format, imp.Name(), tt.wantImporter)
-			}
+			require.NoError(t, err)
+			require.NotNil(t, imp)
+			assert.Equal(t, tt.wantImporter, imp.Name())
 		})
 	}
 }
@@ -87,14 +78,10 @@ func TestSupportedFormats(t *testing.T) {
 		"mitmproxy": true,
 	}
 
-	if len(formats) != len(expectedFormats) {
-		t.Errorf("SupportedFormats() returned %d formats, want %d", len(formats), len(expectedFormats))
-	}
+	assert.Len(t, formats, len(expectedFormats))
 
 	for _, format := range formats {
-		if !expectedFormats[format] {
-			t.Errorf("SupportedFormats() returned unexpected format: %q", format)
-		}
+		assert.True(t, expectedFormats[format], "unexpected format: %s", format)
 	}
 
 	// Verify all expected formats are present
@@ -106,8 +93,6 @@ func TestSupportedFormats(t *testing.T) {
 				break
 			}
 		}
-		if !found {
-			t.Errorf("SupportedFormats() missing expected format: %q", expected)
-		}
+		assert.True(t, found, "missing expected format: %s", expected)
 	}
 }

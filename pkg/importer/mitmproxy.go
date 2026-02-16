@@ -65,55 +65,69 @@ type mitmproxyResponse struct {
 // eliminates the raw JSON buffer, not the parsed data.
 func (i *MitmproxyImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
 	// Limit reader to prevent resource exhaustion
-	limitedReader := io.LimitReader(r, maxImportSize)
+	limitedReader := newLimitedReader(r, maxImportSize)
 	bufReader := bufio.NewReader(limitedReader)
 
 	// Peek first non-whitespace byte to determine JSON type (array vs object)
 	firstByte, err := peekFirstNonWhitespace(bufReader)
 	if err != nil {
+		if limitedReader.hitLimit {
+			return nil, ErrFileTooLarge
+		}
 		return nil, fmt.Errorf("mitmproxy importer: failed to read input: %w", err)
 	}
 
 	decoder := json.NewDecoder(bufReader)
-	var flows []mitmproxyFlow
+	var requests []crawl.ObservedRequest
 
 	switch firstByte {
 	case '[':
-		// Array of flows - stream decode each element
+		// Array of flows - parse and convert in single pass
 		// Consume opening '['
 		if _, err := decoder.Token(); err != nil {
+			if limitedReader.hitLimit {
+				return nil, ErrFileTooLarge
+			}
 			return nil, fmt.Errorf("mitmproxy importer: failed to read array start: %w", err)
 		}
-		// Decode each flow individually (memory efficient)
+		// Decode and convert each flow immediately
 		for decoder.More() {
 			var flow mitmproxyFlow
 			if err := decoder.Decode(&flow); err != nil {
+				if limitedReader.hitLimit {
+					return nil, ErrFileTooLarge
+				}
 				return nil, fmt.Errorf("mitmproxy importer: failed to decode flow: %w", err)
 			}
-			flows = append(flows, flow)
+			req, err := i.parseFlow(flow)
+			if err != nil {
+				return nil, fmt.Errorf("mitmproxy importer: %w", err)
+			}
+			requests = append(requests, req)
 		}
 		// Consume closing ']'
 		if _, err := decoder.Token(); err != nil {
+			if limitedReader.hitLimit {
+				return nil, ErrFileTooLarge
+			}
 			return nil, fmt.Errorf("mitmproxy importer: failed to read array end: %w", err)
 		}
 	case '{':
 		// Single flow object
 		var flow mitmproxyFlow
 		if err := decoder.Decode(&flow); err != nil {
+			if limitedReader.hitLimit {
+				return nil, ErrFileTooLarge
+			}
 			return nil, fmt.Errorf("mitmproxy importer: failed to decode flow: %w", err)
 		}
-		flows = []mitmproxyFlow{flow}
-	default:
-		return nil, fmt.Errorf("mitmproxy importer: expected JSON array or object, got %q", string(firstByte))
-	}
-
-	var requests []crawl.ObservedRequest
-	for _, flow := range flows {
 		req, err := i.parseFlow(flow)
 		if err != nil {
 			return nil, fmt.Errorf("mitmproxy importer: %w", err)
 		}
-		requests = append(requests, req)
+		requests = []crawl.ObservedRequest{req}
+	default:
+		return nil, fmt.Errorf("mitmproxy importer: expected JSON array or object, got %q", string(firstByte))
 	}
 
 	return requests, nil

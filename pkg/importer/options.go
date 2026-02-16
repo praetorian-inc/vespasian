@@ -27,6 +27,9 @@ type ImportOptions struct {
 	// Scope filters requests by domain (e.g., "example.com" or "*.example.com").
 	// Empty scope matches all requests.
 	Scope string
+
+	// MaxEntries limits the number of entries imported. 0 = unlimited.
+	MaxEntries int
 }
 
 // matchesScope checks if a URL matches the given scope pattern.
@@ -61,6 +64,11 @@ func ImportWithOptions(importer TrafficImporter, r io.Reader, opts ImportOptions
 	requests, err := importer.Import(r)
 	if err != nil {
 		return nil, err
+	}
+
+	// Check MaxEntries limit before filtering
+	if opts.MaxEntries > 0 && len(requests) > opts.MaxEntries {
+		return nil, ErrTooManyEntries
 	}
 
 	// If no scope specified, return all requests

@@ -18,13 +18,14 @@ import (
 	"encoding/base64"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestBurpImporter_Name(t *testing.T) {
 	b := &BurpImporter{}
-	if b.Name() != "burp" {
-		t.Errorf("Name() = %q, want %q", b.Name(), "burp")
-	}
+	assert.Equal(t, "burp", b.Name())
 }
 
 func TestBurpImporter_Import(t *testing.T) {
@@ -152,48 +153,40 @@ func TestBurpImporter_Import(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			b := &BurpImporter{}
 			requests, err := b.Import(strings.NewReader(tt.xml))
-			if err != nil {
-				t.Fatalf("Import() error = %v", err)
-			}
+			require.NoError(t, err)
 
-			if len(requests) != tt.wantRequests {
-				t.Fatalf("Import() returned %d requests, want %d", len(requests), tt.wantRequests)
-			}
+			require.Len(t, requests, tt.wantRequests)
 
 			if tt.wantRequests > 0 {
 				req := requests[0]
 
-				if tt.wantMethod != "" && req.Method != tt.wantMethod {
-					t.Errorf("Method = %q, want %q", req.Method, tt.wantMethod)
+				if tt.wantMethod != "" {
+					assert.Equal(t, tt.wantMethod, req.Method)
 				}
 
-				if tt.wantURL != "" && req.URL != tt.wantURL {
-					t.Errorf("URL = %q, want %q", req.URL, tt.wantURL)
+				if tt.wantURL != "" {
+					assert.Equal(t, tt.wantURL, req.URL)
 				}
 
-				if tt.wantSource != "" && req.Source != tt.wantSource {
-					t.Errorf("Source = %q, want %q", req.Source, tt.wantSource)
+				if tt.wantSource != "" {
+					assert.Equal(t, tt.wantSource, req.Source)
 				}
 
-				if tt.wantStatus != 0 && req.Response.StatusCode != tt.wantStatus {
-					t.Errorf("Response.StatusCode = %d, want %d", req.Response.StatusCode, tt.wantStatus)
+				if tt.wantStatus != 0 {
+					assert.Equal(t, tt.wantStatus, req.Response.StatusCode)
 				}
 
-				if tt.wantReqBody != "" && string(req.Body) != tt.wantReqBody {
-					t.Errorf("Body = %q, want %q", string(req.Body), tt.wantReqBody)
+				if tt.wantReqBody != "" {
+					assert.Equal(t, tt.wantReqBody, string(req.Body))
 				}
 
-				if tt.wantRespBody != "" && string(req.Response.Body) != tt.wantRespBody {
-					t.Errorf("Response.Body = %q, want %q", string(req.Response.Body), tt.wantRespBody)
+				if tt.wantRespBody != "" {
+					assert.Equal(t, tt.wantRespBody, string(req.Response.Body))
 				}
 
 				// Verify headers are parsed
-				if len(req.Headers) == 0 {
-					t.Error("Headers should not be empty")
-				}
-				if len(req.Response.Headers) == 0 {
-					t.Error("Response.Headers should not be empty")
-				}
+				assert.NotEmpty(t, req.Headers)
+				assert.NotEmpty(t, req.Response.Headers)
 			}
 		})
 	}
@@ -223,14 +216,21 @@ func TestBurpImporter_Import_Errors(t *testing.T) {
 </items>`,
 			wantErr: true,
 		},
+		{
+			name: "malformed response status line",
+			xml:  `<?xml version="1.0"?><items><item><url>https://example.com/test</url><request base64="false">GET / HTTP/1.1\r\nHost: test.com\r\n\r\n</request><response base64="false">HTTP/1.1\r\n\r\n</response></item></items>`,
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			b := &BurpImporter{}
 			_, err := b.Import(strings.NewReader(tt.xml))
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Import() error = %v, wantErr %v", err, tt.wantErr)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
 			}
 		})
 	}
@@ -285,13 +285,10 @@ func TestBurpImporter_XXEPrevention(t *testing.T) {
 			b := &BurpImporter{}
 			_, err := b.Import(strings.NewReader(tt.xml))
 			if tt.wantErr {
-				if err == nil {
-					t.Error("expected error but got nil")
-				} else if !strings.Contains(err.Error(), tt.errMsg) {
-					t.Errorf("error = %q, want to contain %q", err.Error(), tt.errMsg)
-				}
-			} else if err != nil {
-				t.Errorf("unexpected error: %v", err)
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.errMsg)
+			} else {
+				assert.NoError(t, err)
 			}
 		})
 	}
@@ -310,19 +307,13 @@ func TestBurpImporter_ContentType(t *testing.T) {
 
 	b := &BurpImporter{}
 	requests, err := b.Import(strings.NewReader(xml))
-	if err != nil {
-		t.Fatalf("Import() error = %v", err)
-	}
+	require.NoError(t, err)
 
-	if len(requests) != 1 {
-		t.Fatalf("Import() returned %d requests, want 1", len(requests))
-	}
+	require.Len(t, requests, 1)
 
 	req := requests[0]
 	wantContentType := "application/json; charset=utf-8"
-	if req.Response.ContentType != wantContentType {
-		t.Errorf("Response.ContentType = %q, want %q", req.Response.ContentType, wantContentType)
-	}
+	assert.Equal(t, wantContentType, req.Response.ContentType)
 }
 
 func TestBurpImporter_QueryParams(t *testing.T) {
@@ -338,33 +329,22 @@ func TestBurpImporter_QueryParams(t *testing.T) {
 
 	b := &BurpImporter{}
 	requests, err := b.Import(strings.NewReader(xml))
-	if err != nil {
-		t.Fatalf("Import() error = %v", err)
-	}
+	require.NoError(t, err)
 
-	if len(requests) != 1 {
-		t.Fatalf("Import() returned %d requests, want 1", len(requests))
-	}
+	require.Len(t, requests, 1)
 
 	req := requests[0]
-	if req.QueryParams == nil {
-		t.Fatal("QueryParams should not be nil")
-	}
+	require.NotNil(t, req.QueryParams)
 
 	wantParams := map[string]string{
 		"page":  "1",
 		"limit": "10",
 	}
 
-	if len(req.QueryParams) != len(wantParams) {
-		t.Errorf("QueryParams has %d entries, want %d", len(req.QueryParams), len(wantParams))
-	}
+	assert.Len(t, req.QueryParams, len(wantParams))
 
 	for key, want := range wantParams {
-		if got, ok := req.QueryParams[key]; !ok {
-			t.Errorf("QueryParams missing key %q", key)
-		} else if got != want {
-			t.Errorf("QueryParams[%q] = %q, want %q", key, got, want)
-		}
+		assert.Contains(t, req.QueryParams, key)
+		assert.Equal(t, want, req.QueryParams[key])
 	}
 }
