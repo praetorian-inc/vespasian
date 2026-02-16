@@ -59,11 +59,10 @@ func (p *SchemaProbe) Probe(ctx context.Context, endpoints []classify.Classified
 		if seen[ep.URL] {
 			continue
 		}
-		seen[ep.URL] = true
-
-		if len(seen) > p.config.MaxEndpoints {
+		if len(seen) >= p.config.MaxEndpoints {
 			break
 		}
+		seen[ep.URL] = true
 
 		schema := p.probeURL(ctx, ep.URL)
 		if schema != nil {
@@ -110,7 +109,10 @@ func (p *SchemaProbe) probeURL(ctx context.Context, url string) map[string]inter
 		slog.DebugContext(ctx, "schema probe: request failed", "url", url, "error", err)
 		return nil
 	}
-	defer resp.Body.Close() //nolint:errcheck // best-effort close on read-only response
+	defer func() {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck // best-effort drain
+		resp.Body.Close()                                    //nolint:errcheck // best-effort close on read-only response
+	}()
 
 	if resp.StatusCode >= 400 {
 		slog.DebugContext(ctx, "schema probe: non-success status", "url", url, "status", resp.StatusCode)
@@ -139,6 +141,9 @@ func (p *SchemaProbe) probeURL(ctx context.Context, url string) map[string]inter
 // maxSchemaDepth limits recursion depth for schema inference.
 const maxSchemaDepth = 64
 
+// maxSchemaProperties limits the number of object properties inferred per level.
+const maxSchemaProperties = 200
+
 // inferSchema infers a JSON-schema-like structure from a parsed JSON value.
 func inferSchema(v interface{}) map[string]interface{} {
 	return inferSchemaDepth(v, 0)
@@ -154,6 +159,9 @@ func inferSchemaDepth(v interface{}, depth int) map[string]interface{} {
 	case map[string]interface{}:
 		props := make(map[string]interface{})
 		for k, child := range val {
+			if len(props) >= maxSchemaProperties {
+				break
+			}
 			props[k] = inferSchemaDepth(child, depth+1)
 		}
 		return map[string]interface{}{

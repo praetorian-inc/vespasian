@@ -109,6 +109,10 @@ func ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, e
 		return nil, fmt.Errorf("DNS lookup failed for %q: %w", host, err)
 	}
 
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("DNS lookup for %q returned no addresses", host)
+	}
+
 	for _, ip := range ips {
 		if isPrivateIP(ip.IP) {
 			return nil, fmt.Errorf("blocked: %s resolves to private IP %s", host, ip.IP)
