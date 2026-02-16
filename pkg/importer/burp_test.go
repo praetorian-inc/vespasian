@@ -236,6 +236,67 @@ func TestBurpImporter_Import_Errors(t *testing.T) {
 	}
 }
 
+func TestBurpImporter_XXEPrevention(t *testing.T) {
+	tests := []struct {
+		name    string
+		xml     string
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "DOCTYPE declaration rejected",
+			xml:     `<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe "test">]><items></items>`,
+			wantErr: true,
+			errMsg:  "DOCTYPE or ENTITY",
+		},
+		{
+			name:    "ENTITY declaration rejected",
+			xml:     `<?xml version="1.0"?><!ENTITY xxe SYSTEM "file:///etc/passwd"><items></items>`,
+			wantErr: true,
+			errMsg:  "DOCTYPE or ENTITY",
+		},
+		{
+			name:    "lowercase doctype rejected",
+			xml:     `<?xml version="1.0"?><!doctype foo><items></items>`,
+			wantErr: true,
+			errMsg:  "DOCTYPE or ENTITY",
+		},
+		{
+			name:    "mixed case DOCTYPE rejected",
+			xml:     `<?xml version="1.0"?><!DocType foo><items></items>`,
+			wantErr: true,
+			errMsg:  "DOCTYPE or ENTITY",
+		},
+		{
+			name:    "mixed case ENTITY rejected",
+			xml:     `<?xml version="1.0"?><!EnTiTy xxe "test"><items></items>`,
+			wantErr: true,
+			errMsg:  "DOCTYPE or ENTITY",
+		},
+		{
+			name:    "valid XML without DOCTYPE passes",
+			xml:     `<?xml version="1.0"?><items></items>`,
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &BurpImporter{}
+			_, err := b.Import(strings.NewReader(tt.xml))
+			if tt.wantErr {
+				if err == nil {
+					t.Error("expected error but got nil")
+				} else if !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("error = %q, want to contain %q", err.Error(), tt.errMsg)
+				}
+			} else if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestBurpImporter_ContentType(t *testing.T) {
 	xml := `<?xml version="1.0"?>
 <items>

@@ -61,25 +61,21 @@ func (i *BurpImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
 	// Limit reader to prevent resource exhaustion
 	limitedReader := io.LimitReader(r, maxImportSize)
 
-	// Read first 8KB to check for entity declarations
-	peekSize := 8192
-	buf := make([]byte, peekSize)
-	n, err := io.ReadFull(limitedReader, buf)
-	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+	// Read all content to check for entity declarations
+	data, err := io.ReadAll(limitedReader)
+	if err != nil {
 		return nil, fmt.Errorf("burp importer: failed to read input: %w", err)
 	}
-	buf = buf[:n]
 
 	// Check for DOCTYPE or ENTITY declarations (XXE attack vectors)
-	if bytes.Contains(buf, []byte("<!DOCTYPE")) || bytes.Contains(buf, []byte("<!ENTITY")) {
+	// Case-insensitive per S4
+	upperData := bytes.ToUpper(data)
+	if bytes.Contains(upperData, []byte("<!DOCTYPE")) || bytes.Contains(upperData, []byte("<!ENTITY")) {
 		return nil, fmt.Errorf("burp importer: XML contains DOCTYPE or ENTITY declarations which are not allowed")
 	}
 
-	// Combine peek buffer with remaining data
-	fullReader := io.MultiReader(bytes.NewReader(buf), limitedReader)
-
 	var items burpItems
-	if err := xml.NewDecoder(fullReader).Decode(&items); err != nil {
+	if err := xml.NewDecoder(bytes.NewReader(data)).Decode(&items); err != nil {
 		return nil, fmt.Errorf("burp importer: failed to decode XML: %w", err)
 	}
 
@@ -152,14 +148,15 @@ func decodeData(d burpData) ([]byte, error) {
 	return []byte(d.Data), nil
 }
 
-func parseHTTPRequest(data []byte) (method string, headers map[string]string, body []byte, err error) {
+// splitHTTPMessage splits raw HTTP data into first line, headers, and body.
+// It handles both \r\n\r\n and \n\n as header/body separators.
+func splitHTTPMessage(data []byte) (firstLine string, headers map[string]string, body []byte, err error) {
 	headers = make(map[string]string)
 
 	// Find the header/body separator
 	separator := []byte("\r\n\r\n")
 	sepIdx := bytes.Index(data, separator)
 	if sepIdx == -1 {
-		// Try just \n\n as fallback
 		separator = []byte("\n\n")
 		sepIdx = bytes.Index(data, separator)
 		if sepIdx == -1 {
@@ -173,89 +170,60 @@ func parseHTTPRequest(data []byte) (method string, headers map[string]string, bo
 		body = data[sepIdx+len(separator):]
 	}
 
-	// Parse request line and headers
+	// Parse lines
 	lines := bytes.Split(headerSection, []byte("\n"))
 	if len(lines) == 0 {
-		return "", nil, nil, fmt.Errorf("empty request")
+		return "", nil, nil, fmt.Errorf("empty message")
 	}
 
-	// Parse request line
-	requestLine := string(bytes.TrimRight(lines[0], "\r"))
-	parts := strings.Fields(requestLine)
+	// First line
+	firstLine = string(bytes.TrimRight(lines[0], "\r"))
+
+	// Parse headers
+	for i := 1; i < len(lines); i++ {
+		line := string(bytes.TrimRight(lines[i], "\r"))
+		if line == "" {
+			continue
+		}
+		idx := strings.Index(line, ":")
+		if idx > 0 {
+			key := strings.TrimSpace(line[:idx])
+			value := strings.TrimSpace(line[idx+1:])
+			headers[key] = value
+		}
+	}
+
+	return firstLine, headers, body, nil
+}
+
+func parseHTTPRequest(data []byte) (method string, headers map[string]string, body []byte, err error) {
+	firstLine, headers, body, err := splitHTTPMessage(data)
+	if err != nil {
+		return "", nil, nil, err
+	}
+
+	parts := strings.Fields(firstLine)
 	if len(parts) < 2 {
 		return "", nil, nil, fmt.Errorf("invalid request line")
 	}
-	method = parts[0]
 
-	// Parse headers
-	for i := 1; i < len(lines); i++ {
-		line := string(bytes.TrimRight(lines[i], "\r"))
-		if line == "" {
-			continue
-		}
-		// Parse header
-		idx := strings.Index(line, ":")
-		if idx > 0 {
-			key := strings.TrimSpace(line[:idx])
-			value := strings.TrimSpace(line[idx+1:])
-			headers[key] = value
-		}
-	}
-
-	return method, headers, body, nil
+	return parts[0], headers, body, nil
 }
 
 func parseHTTPResponse(data []byte) (statusCode int, headers map[string]string, body []byte, err error) {
-	headers = make(map[string]string)
-
-	// Find the header/body separator
-	separator := []byte("\r\n\r\n")
-	sepIdx := bytes.Index(data, separator)
-	if sepIdx == -1 {
-		// Try just \n\n as fallback
-		separator = []byte("\n\n")
-		sepIdx = bytes.Index(data, separator)
-		if sepIdx == -1 {
-			return 0, nil, nil, fmt.Errorf("no header/body separator found")
-		}
+	firstLine, headers, body, err := splitHTTPMessage(data)
+	if err != nil {
+		return 0, nil, nil, err
 	}
 
-	// Split headers and body
-	headerSection := data[:sepIdx]
-	if sepIdx+len(separator) < len(data) {
-		body = data[sepIdx+len(separator):]
-	}
-
-	// Parse status line and headers
-	lines := bytes.Split(headerSection, []byte("\n"))
-	if len(lines) == 0 {
-		return 0, nil, nil, fmt.Errorf("empty response")
-	}
-
-	// Parse status line
-	statusLine := string(bytes.TrimRight(lines[0], "\r"))
-	parts := strings.Fields(statusLine)
+	parts := strings.Fields(firstLine)
 	if len(parts) < 2 {
 		return 0, nil, nil, fmt.Errorf("invalid status line")
 	}
+
 	statusCode, err = strconv.Atoi(parts[1])
 	if err != nil {
 		return 0, nil, nil, fmt.Errorf("invalid status code: %w", err)
-	}
-
-	// Parse headers
-	for i := 1; i < len(lines); i++ {
-		line := string(bytes.TrimRight(lines[i], "\r"))
-		if line == "" {
-			continue
-		}
-		// Parse header
-		idx := strings.Index(line, ":")
-		if idx > 0 {
-			key := strings.TrimSpace(line[:idx])
-			value := strings.TrimSpace(line[idx+1:])
-			headers[key] = value
-		}
 	}
 
 	return statusCode, headers, body, nil
