@@ -84,3 +84,17 @@ func TestValidateProbeURL_BlocksIPv6Loopback(t *testing.T) {
 		t.Error("expected IPv6 loopback to be blocked, got nil error")
 	}
 }
+
+func TestValidateProbeURL_BlocksUnspecifiedIPv4(t *testing.T) {
+	err := validateProbeURL("http://0.0.0.0/api")
+	if err == nil {
+		t.Error("expected 0.0.0.0 to be blocked, got nil error")
+	}
+}
+
+func TestValidateProbeURL_BlocksUnspecifiedIPv6(t *testing.T) {
+	err := validateProbeURL("http://[::]/api")
+	if err == nil {
+		t.Error("expected [::] (IPv6 unspecified) to be blocked, got nil error")
+	}
+}

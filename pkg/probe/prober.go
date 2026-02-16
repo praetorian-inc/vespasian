@@ -22,6 +22,8 @@ import (
 )
 
 // ProbeStrategy enriches classified requests with additional information.
+// Implementations MUST NOT modify ObservedRequest fields on the returned slice;
+// only probe-enriched fields (AllowedMethods, ResponseSchema) may be written.
 //
 //nolint:revive // ProbeStrategy name is intentional per specification
 type ProbeStrategy interface {

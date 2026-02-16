@@ -15,6 +15,7 @@
 package probe
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/url"
@@ -45,6 +46,9 @@ func init() {
 
 // isPrivateIP reports whether ip falls within a private or internal network range.
 func isPrivateIP(ip net.IP) bool {
+	if ip.IsUnspecified() {
+		return true
+	}
 	for _, network := range privateNetworks {
 		if network.Contains(ip) {
 			return true
@@ -89,4 +93,29 @@ func validateProbeURL(rawURL string) error {
 	}
 
 	return nil
+}
+
+// ssrfSafeDialContext is a net.Dialer DialContext replacement that re-checks
+// resolved IPs against the SSRF blocklist at connect time, preventing TOCTOU
+// DNS rebinding attacks.
+func ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid address %q: %w", addr, err)
+	}
+
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("DNS lookup failed for %q: %w", host, err)
+	}
+
+	for _, ip := range ips {
+		if isPrivateIP(ip.IP) {
+			return nil, fmt.Errorf("blocked: %s resolves to private IP %s", host, ip.IP)
+		}
+	}
+
+	// Dial the first resolved address.
+	dialer := &net.Dialer{}
+	return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
 }

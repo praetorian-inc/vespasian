@@ -68,6 +68,9 @@ func (cfg Config) withDefaults() Config {
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
+			Transport: &http.Transport{
+				DialContext: ssrfSafeDialContext,
+			},
 		}
 	}
 	return cfg

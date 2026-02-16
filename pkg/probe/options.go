@@ -16,6 +16,7 @@ package probe
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -79,6 +80,7 @@ func (p *OptionsProbe) Probe(ctx context.Context, endpoints []classify.Classifie
 // probeURL sends an OPTIONS request and returns the parsed Allow header methods.
 func (p *OptionsProbe) probeURL(ctx context.Context, url string) []string {
 	if err := p.config.URLValidator(url); err != nil {
+		slog.DebugContext(ctx, "options probe: URL validation failed", "url", url, "error", err)
 		return nil
 	}
 
@@ -96,11 +98,13 @@ func (p *OptionsProbe) probeURL(ctx context.Context, url string) []string {
 
 	resp, err := p.config.Client.Do(req)
 	if err != nil {
+		slog.DebugContext(ctx, "options probe: request failed", "url", url, "error", err)
 		return nil
 	}
 	defer resp.Body.Close() //nolint:errcheck // best-effort close on read-only response
 
 	if resp.StatusCode >= 400 {
+		slog.DebugContext(ctx, "options probe: non-success status", "url", url, "status", resp.StatusCode)
 		return nil
 	}
 

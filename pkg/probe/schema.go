@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -88,6 +89,7 @@ func (p *SchemaProbe) Probe(ctx context.Context, endpoints []classify.Classified
 // probeURL sends a GET request and infers schema from the JSON response.
 func (p *SchemaProbe) probeURL(ctx context.Context, url string) map[string]interface{} {
 	if err := p.config.URLValidator(url); err != nil {
+		slog.DebugContext(ctx, "schema probe: URL validation failed", "url", url, "error", err)
 		return nil
 	}
 
@@ -105,15 +107,18 @@ func (p *SchemaProbe) probeURL(ctx context.Context, url string) map[string]inter
 
 	resp, err := p.config.Client.Do(req)
 	if err != nil {
+		slog.DebugContext(ctx, "schema probe: request failed", "url", url, "error", err)
 		return nil
 	}
 	defer resp.Body.Close() //nolint:errcheck // best-effort close on read-only response
 
 	if resp.StatusCode >= 400 {
+		slog.DebugContext(ctx, "schema probe: non-success status", "url", url, "status", resp.StatusCode)
 		return nil
 	}
 
 	if !isJSONContentType(resp.Header.Get("Content-Type")) {
+		slog.DebugContext(ctx, "schema probe: non-JSON content type", "url", url, "content_type", resp.Header.Get("Content-Type"))
 		return nil
 	}
 
@@ -124,6 +129,7 @@ func (p *SchemaProbe) probeURL(ctx context.Context, url string) map[string]inter
 
 	var parsed interface{}
 	if err := json.Unmarshal(body, &parsed); err != nil {
+		slog.DebugContext(ctx, "schema probe: JSON parse failed", "url", url, "error", err)
 		return nil
 	}
 
