@@ -15,8 +15,9 @@
 package importer
 
 import (
-	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestExtractQueryParams(t *testing.T) {
@@ -93,6 +94,16 @@ func TestExtractQueryParams(t *testing.T) {
 			want: nil,
 		},
 		{
+			name: "empty string URL",
+			url:  "",
+			want: nil,
+		},
+		{
+			name: "scheme with empty host",
+			url:  "http://",
+			want: nil,
+		},
+		{
 			name: "fragment after query",
 			url:  "https://example.com/api?page=1#section",
 			want: map[string]string{"page": "1"},
@@ -102,9 +113,7 @@ func TestExtractQueryParams(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := extractQueryParams(tt.url)
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("extractQueryParams(%q) = %v, want %v", tt.url, got, tt.want)
-			}
+			assert.Equal(t, tt.want, got, "extractQueryParams(%q)", tt.url)
 		})
 	}
 }
