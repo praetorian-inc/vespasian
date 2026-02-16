@@ -19,6 +19,9 @@ import (
 	"io"
 )
 
+// MaxCaptureFileSize is the maximum allowed capture file size for deserialization (100 MB).
+const MaxCaptureFileSize = 100 * 1024 * 1024
+
 // WriteCapture writes observed requests to a writer in JSON format.
 func WriteCapture(w io.Writer, requests []ObservedRequest) error {
 	encoder := json.NewEncoder(w)
@@ -29,7 +32,7 @@ func WriteCapture(w io.Writer, requests []ObservedRequest) error {
 // ReadCapture reads observed requests from a reader in JSON format.
 func ReadCapture(r io.Reader) ([]ObservedRequest, error) {
 	var requests []ObservedRequest
-	decoder := json.NewDecoder(r)
+	decoder := json.NewDecoder(io.LimitReader(r, MaxCaptureFileSize))
 	if err := decoder.Decode(&requests); err != nil {
 		return nil, err
 	}

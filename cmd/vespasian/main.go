@@ -16,10 +16,20 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/alecthomas/kong"
+	"github.com/praetorian-inc/vespasian/pkg/classify"
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
 // CLI defines the complete command-line interface structure.
@@ -29,6 +39,73 @@ var CLI struct {
 	Generate GenerateCmd `cmd:"" help:"Generate API specifications from captured traffic"`
 	Scan     ScanCmd     `cmd:"" help:"Full pipeline: crawl, classify, and generate specs"`
 	Version  VersionCmd  `cmd:"" help:"Show version information"`
+}
+
+// parseHeaders converts "Key: Value" strings to a map, validating for CRLF injection.
+func parseHeaders(raw []string) (map[string]string, error) {
+	headers := make(map[string]string)
+	for _, h := range raw {
+		parts := strings.SplitN(h, ":", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid header format (expected 'Key: Value'): %q", h)
+		}
+		name := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		if name == "" {
+			return nil, fmt.Errorf("header has empty name: %q", h)
+		}
+		if strings.ContainsAny(name, "\r\n") || strings.ContainsAny(value, "\r\n") {
+			return nil, fmt.Errorf("header contains invalid CRLF characters: %q", h)
+		}
+		headers[name] = value
+	}
+	return headers, nil
+}
+
+// doCrawl executes the common crawl pipeline: parse headers, create crawler,
+// run the crawl with signal handling, and return the results. On graceful
+// shutdown (SIGINT/SIGTERM) partial results are returned instead of an error.
+func doCrawl(targetURL string, rawHeaders []string, opts crawl.CrawlerOptions) ([]crawl.ObservedRequest, error) {
+	headers, err := parseHeaders(rawHeaders)
+	if err != nil {
+		return nil, fmt.Errorf("invalid header: %w", err)
+	}
+	opts.Headers = headers
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	crawler := crawl.NewCrawler(opts)
+	requests, err := crawler.Crawl(ctx, targetURL)
+	if err != nil {
+		if errors.Is(err, context.Canceled) && len(requests) > 0 {
+			// Graceful shutdown — return partial results.
+			return requests, nil
+		}
+		return nil, fmt.Errorf("crawl failed: %w", err)
+	}
+	return requests, nil
+}
+
+// writeOutput opens the output file (or stdout if path is empty), calls fn to
+// write content, and ensures the file is closed properly.
+func writeOutput(path string, fn func(io.Writer) error) error {
+	if path == "" {
+		return fn(os.Stdout)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	writeErr := fn(f)
+	closeErr := f.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	if closeErr != nil {
+		return fmt.Errorf("failed to close output file: %w", closeErr)
+	}
+	return nil
 }
 
 // CrawlCmd crawls a web application to capture HTTP traffic.
@@ -47,8 +124,20 @@ type CrawlCmd struct {
 
 // Run executes the crawl command.
 func (c *CrawlCmd) Run() error {
-	fmt.Println("crawl: not implemented")
-	return nil
+	opts := crawl.CrawlerOptions{
+		Depth:    c.Depth,
+		MaxPages: c.MaxPages,
+		Timeout:  c.Timeout,
+		Scope:    c.Scope,
+		Headless: c.Headless,
+	}
+	requests, err := doCrawl(c.URL, c.Header, opts)
+	if err != nil {
+		return err
+	}
+	return writeOutput(c.Output, func(w io.Writer) error {
+		return crawl.WriteCapture(w, requests)
+	})
 }
 
 // ImportCmd imports traffic capture from external sources.
@@ -99,8 +188,28 @@ type ScanCmd struct {
 
 // Run executes the scan command.
 func (c *ScanCmd) Run() error {
-	fmt.Println("scan: not implemented")
-	return nil
+	opts := crawl.CrawlerOptions{
+		Depth:    c.Depth,
+		MaxPages: c.MaxPages,
+		Timeout:  c.Timeout,
+		Scope:    c.Scope,
+		Headless: c.Headless,
+	}
+	requests, err := doCrawl(c.URL, c.Header, opts)
+	if err != nil {
+		return err
+	}
+
+	classified := classify.Deduplicate(classify.RunClassifiers(
+		[]classify.APIClassifier{&classify.RESTClassifier{}},
+		requests, c.Confidence,
+	))
+
+	return writeOutput(c.Output, func(w io.Writer) error {
+		encoder := json.NewEncoder(w)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(classified)
+	})
 }
 
 // VersionCmd shows version information.
