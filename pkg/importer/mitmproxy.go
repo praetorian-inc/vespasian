@@ -57,7 +57,12 @@ type mitmproxyResponse struct {
 
 // Import reads mitmproxy JSON and converts to ObservedRequest format.
 // Handles both single flow and array of flows.
-// Uses streaming decoder to avoid allocating entire input in memory (S3 fix).
+//
+// Memory efficiency (S3 fix): Uses streaming json.NewDecoder instead of io.ReadAll
+// to avoid allocating the entire input as a raw byte buffer (up to 500MB).
+// The decoder reads in ~4KB chunks. Note: parsed flow structs are still accumulated
+// in memory as required by the []ObservedRequest return type - the improvement
+// eliminates the raw JSON buffer, not the parsed data.
 func (i *MitmproxyImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
 	// Limit reader to prevent resource exhaustion
 	limitedReader := io.LimitReader(r, maxImportSize)

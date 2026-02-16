@@ -20,13 +20,12 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMitmproxyImporter_Name(t *testing.T) {
 	m := &MitmproxyImporter{}
-	if m.Name() != "mitmproxy" {
-		t.Errorf("Name() = %q, want %q", m.Name(), "mitmproxy")
-	}
+	assert.Equal(t, "mitmproxy", m.Name())
 }
 
 func TestMitmproxyImporter_Import(t *testing.T) {
@@ -177,46 +176,40 @@ func TestMitmproxyImporter_Import(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			m := &MitmproxyImporter{}
 			requests, err := m.Import(strings.NewReader(tt.json))
-			if err != nil {
-				t.Fatalf("Import() error = %v", err)
-			}
+			require.NoError(t, err)
 
-			if len(requests) != tt.wantRequests {
-				t.Fatalf("Import() returned %d requests, want %d", len(requests), tt.wantRequests)
-			}
+			assert.Len(t, requests, tt.wantRequests)
 
 			if tt.wantRequests > 0 {
 				req := requests[0]
 
-				if tt.wantMethod != "" && req.Method != tt.wantMethod {
-					t.Errorf("Method = %q, want %q", req.Method, tt.wantMethod)
+				if tt.wantMethod != "" {
+					assert.Equal(t, tt.wantMethod, req.Method)
 				}
 
-				if tt.wantURL != "" && req.URL != tt.wantURL {
-					t.Errorf("URL = %q, want %q", req.URL, tt.wantURL)
+				if tt.wantURL != "" {
+					assert.Equal(t, tt.wantURL, req.URL)
 				}
 
-				if tt.wantSource != "" && req.Source != tt.wantSource {
-					t.Errorf("Source = %q, want %q", req.Source, tt.wantSource)
+				if tt.wantSource != "" {
+					assert.Equal(t, tt.wantSource, req.Source)
 				}
 
-				if tt.wantStatus != 0 && req.Response.StatusCode != tt.wantStatus {
-					t.Errorf("Response.StatusCode = %d, want %d", req.Response.StatusCode, tt.wantStatus)
+				if tt.wantStatus != 0 {
+					assert.Equal(t, tt.wantStatus, req.Response.StatusCode)
 				}
 
-				if tt.wantReqBody != "" && string(req.Body) != tt.wantReqBody {
-					t.Errorf("Body = %q, want %q", string(req.Body), tt.wantReqBody)
+				if tt.wantReqBody != "" {
+					assert.Equal(t, tt.wantReqBody, string(req.Body))
 				}
 
-				if tt.wantRespBody != "" && string(req.Response.Body) != tt.wantRespBody {
-					t.Errorf("Response.Body = %q, want %q", string(req.Response.Body), tt.wantRespBody)
+				if tt.wantRespBody != "" {
+					assert.Equal(t, tt.wantRespBody, string(req.Response.Body))
 				}
 
 				// Verify headers are parsed (if present in test case)
 				if tt.wantMethod == "GET" && strings.Contains(tt.json, "User-Agent") {
-					if len(req.Headers) == 0 {
-						t.Error("Headers should not be empty")
-					}
+					assert.NotEmpty(t, req.Headers)
 				}
 			}
 		})
@@ -301,19 +294,13 @@ func TestMitmproxyImporter_ContentType(t *testing.T) {
 
 	m := &MitmproxyImporter{}
 	requests, err := m.Import(strings.NewReader(json))
-	if err != nil {
-		t.Fatalf("Import() error = %v", err)
-	}
+	require.NoError(t, err)
 
-	if len(requests) != 1 {
-		t.Fatalf("Import() returned %d requests, want 1", len(requests))
-	}
+	require.Len(t, requests, 1)
 
 	req := requests[0]
 	wantContentType := "application/json; charset=utf-8"
-	if req.Response.ContentType != wantContentType {
-		t.Errorf("Response.ContentType = %q, want %q", req.Response.ContentType, wantContentType)
-	}
+	assert.Equal(t, wantContentType, req.Response.ContentType)
 }
 
 func TestMitmproxyImporter_QueryParams(t *testing.T) {
@@ -335,33 +322,22 @@ func TestMitmproxyImporter_QueryParams(t *testing.T) {
 
 	m := &MitmproxyImporter{}
 	requests, err := m.Import(strings.NewReader(json))
-	if err != nil {
-		t.Fatalf("Import() error = %v", err)
-	}
+	require.NoError(t, err)
 
-	if len(requests) != 1 {
-		t.Fatalf("Import() returned %d requests, want 1", len(requests))
-	}
+	require.Len(t, requests, 1)
 
 	req := requests[0]
-	if req.QueryParams == nil {
-		t.Fatal("QueryParams should not be nil")
-	}
+	require.NotNil(t, req.QueryParams)
 
 	wantParams := map[string]string{
 		"page":  "1",
 		"limit": "10",
 	}
 
-	if len(req.QueryParams) != len(wantParams) {
-		t.Errorf("QueryParams has %d entries, want %d", len(req.QueryParams), len(wantParams))
-	}
+	assert.Len(t, req.QueryParams, len(wantParams))
 
 	for key, want := range wantParams {
-		if got, ok := req.QueryParams[key]; !ok {
-			t.Errorf("QueryParams missing key %q", key)
-		} else if got != want {
-			t.Errorf("QueryParams[%q] = %q, want %q", key, got, want)
-		}
+		assert.Contains(t, req.QueryParams, key)
+		assert.Equal(t, want, req.QueryParams[key])
 	}
 }
