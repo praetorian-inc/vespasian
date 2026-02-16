@@ -42,6 +42,9 @@ type ProbeError struct {
 
 // Error returns a formatted error string.
 func (e *ProbeError) Error() string {
+	if e.Err == nil {
+		return e.Strategy + ": <nil>"
+	}
 	return e.Strategy + ": " + e.Err.Error()
 }
 
@@ -61,7 +64,7 @@ func RunStrategies(ctx context.Context, strategies []ProbeStrategy, endpoints []
 	for _, strategy := range strategies {
 		if err := ctx.Err(); err != nil {
 			errs = append(errs, &ProbeError{Strategy: strategy.Name(), Err: err})
-			continue
+			break
 		}
 
 		enriched, err := strategy.Probe(ctx, result)

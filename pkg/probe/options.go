@@ -51,13 +51,19 @@ func (p *OptionsProbe) Probe(ctx context.Context, endpoints []classify.Classifie
 		}
 		seen[ep.URL] = true
 
-		methods := p.probeURL(ctx, p.config.Client, ep.URL)
+		if len(seen) > p.config.MaxEndpoints {
+			break
+		}
+
+		methods := p.probeURL(ctx, ep.URL)
 		if len(methods) > 0 {
 			urlMethods[ep.URL] = methods
 		}
 	}
 
-	// Apply results to all endpoints
+	// Copy endpoints to avoid mutating the caller's slice. Note: the shallow copy
+	// aliases mutable embedded fields (Headers, QueryParams maps) from ObservedRequest.
+	// Probes write only to probe-enriched fields (AllowedMethods, ResponseSchema).
 	result := make([]classify.ClassifiedRequest, len(endpoints))
 	copy(result, endpoints)
 
@@ -71,7 +77,11 @@ func (p *OptionsProbe) Probe(ctx context.Context, endpoints []classify.Classifie
 }
 
 // probeURL sends an OPTIONS request and returns the parsed Allow header methods.
-func (p *OptionsProbe) probeURL(ctx context.Context, client *http.Client, url string) []string {
+func (p *OptionsProbe) probeURL(ctx context.Context, url string) []string {
+	if err := p.config.URLValidator(url); err != nil {
+		return nil
+	}
+
 	reqCtx, cancel := context.WithTimeout(ctx, p.config.Timeout)
 	defer cancel()
 
@@ -84,11 +94,15 @@ func (p *OptionsProbe) probeURL(ctx context.Context, client *http.Client, url st
 		req.Header.Set(k, v)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := p.config.Client.Do(req)
 	if err != nil {
 		return nil
 	}
 	defer resp.Body.Close() //nolint:errcheck // best-effort close on read-only response
+
+	if resp.StatusCode >= 400 {
+		return nil
+	}
 
 	return parseAllowHeader(resp.Header.Get("Allow"))
 }
@@ -105,7 +119,7 @@ func parseAllowHeader(header string) []string {
 	for _, part := range parts {
 		method := strings.TrimSpace(part)
 		if method != "" {
-			methods = append(methods, method)
+			methods = append(methods, strings.ToUpper(method))
 		}
 	}
 

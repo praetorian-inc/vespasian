@@ -37,7 +37,7 @@ func TestSchemaProbe_InfersObjectSchema(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := probe.Config{Client: srv.Client(), Timeout: 5 * time.Second}
+	cfg := probe.Config{Client: srv.Client(), Timeout: 5 * time.Second, URLValidator: func(string) error { return nil }}
 	p := probe.NewSchemaProbe(cfg)
 
 	endpoints := []classify.ClassifiedRequest{
@@ -104,7 +104,7 @@ func TestSchemaProbe_InfersArraySchema(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := probe.Config{Client: srv.Client(), Timeout: 5 * time.Second}
+	cfg := probe.Config{Client: srv.Client(), Timeout: 5 * time.Second, URLValidator: func(string) error { return nil }}
 	p := probe.NewSchemaProbe(cfg)
 
 	endpoints := []classify.ClassifiedRequest{
@@ -148,7 +148,7 @@ func TestSchemaProbe_SkipsNonJSON(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := probe.Config{Client: srv.Client(), Timeout: 5 * time.Second}
+	cfg := probe.Config{Client: srv.Client(), Timeout: 5 * time.Second, URLValidator: func(string) error { return nil }}
 	p := probe.NewSchemaProbe(cfg)
 
 	endpoints := []classify.ClassifiedRequest{
@@ -186,9 +186,10 @@ func TestSchemaProbe_InjectsAuthHeaders(t *testing.T) {
 	defer srv.Close()
 
 	cfg := probe.Config{
-		Client:      srv.Client(),
-		Timeout:     5 * time.Second,
-		AuthHeaders: map[string]string{"Authorization": "Bearer schema-token"},
+		Client:       srv.Client(),
+		Timeout:      5 * time.Second,
+		AuthHeaders:  map[string]string{"Authorization": "Bearer schema-token"},
+		URLValidator: func(string) error { return nil },
 	}
 	p := probe.NewSchemaProbe(cfg)
 
@@ -228,7 +229,7 @@ func TestSchemaProbe_HandlesNestedObjects(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := probe.Config{Client: srv.Client(), Timeout: 5 * time.Second}
+	cfg := probe.Config{Client: srv.Client(), Timeout: 5 * time.Second, URLValidator: func(string) error { return nil }}
 	p := probe.NewSchemaProbe(cfg)
 
 	endpoints := []classify.ClassifiedRequest{
@@ -265,7 +266,7 @@ func TestSchemaProbe_DeduplicatesByURL(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := probe.Config{Client: srv.Client(), Timeout: 5 * time.Second}
+	cfg := probe.Config{Client: srv.Client(), Timeout: 5 * time.Second, URLValidator: func(string) error { return nil }}
 	p := probe.NewSchemaProbe(cfg)
 
 	endpoints := []classify.ClassifiedRequest{
@@ -304,7 +305,7 @@ func TestSchemaProbe_InferSchemaMaxDepth(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := probe.Config{Client: srv.Client(), Timeout: 5 * time.Second}
+	cfg := probe.Config{Client: srv.Client(), Timeout: 5 * time.Second, URLValidator: func(string) error { return nil }}
 	p := probe.NewSchemaProbe(cfg)
 
 	endpoints := []classify.ClassifiedRequest{
@@ -330,5 +331,42 @@ func TestSchemaProbe_InferSchemaMaxDepth(t *testing.T) {
 	// The schema should exist and have type "object" at the top level
 	if result[0].ResponseSchema["type"] != "object" {
 		t.Errorf("top-level type: got %v, want object", result[0].ResponseSchema["type"])
+	}
+}
+
+func TestSchemaProbe_Skips4xxAnd5xxResponses(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		if _, err := w.Write([]byte(`{"error":"internal server error"}`)); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := probe.Config{
+		Client:       srv.Client(),
+		Timeout:      5 * time.Second,
+		URLValidator: func(string) error { return nil },
+	}
+	p := probe.NewSchemaProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:      srv.URL + "/api/broken",
+				Response: crawl.ObservedResponse{ContentType: "application/json"},
+			},
+			IsAPI: true,
+		},
+	}
+
+	result, err := p.Probe(context.Background(), endpoints)
+	if err != nil {
+		t.Fatalf("Probe() error: %v", err)
+	}
+
+	if result[0].ResponseSchema != nil {
+		t.Errorf("expected nil ResponseSchema for 500 response, got %v", result[0].ResponseSchema)
 	}
 }

@@ -16,6 +16,7 @@ package probe_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -45,8 +46,9 @@ func TestOptionsProbe_ParsesAllowHeader(t *testing.T) {
 	defer srv.Close()
 
 	cfg := probe.Config{
-		Client:  srv.Client(),
-		Timeout: 5 * time.Second,
+		Client:       srv.Client(),
+		Timeout:      5 * time.Second,
+		URLValidator: func(string) error { return nil },
 	}
 	p := probe.NewOptionsProbe(cfg)
 
@@ -81,7 +83,7 @@ func TestOptionsProbe_EmptyAllowHeader(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := probe.Config{Client: srv.Client(), Timeout: 5 * time.Second}
+	cfg := probe.Config{Client: srv.Client(), Timeout: 5 * time.Second, URLValidator: func(string) error { return nil }}
 	p := probe.NewOptionsProbe(cfg)
 
 	endpoints := []classify.ClassifiedRequest{
@@ -108,9 +110,10 @@ func TestOptionsProbe_InjectsAuthHeaders(t *testing.T) {
 	defer srv.Close()
 
 	cfg := probe.Config{
-		Client:      srv.Client(),
-		Timeout:     5 * time.Second,
-		AuthHeaders: map[string]string{"Authorization": "Bearer test-token"},
+		Client:       srv.Client(),
+		Timeout:      5 * time.Second,
+		AuthHeaders:  map[string]string{"Authorization": "Bearer test-token"},
+		URLValidator: func(string) error { return nil },
 	}
 	p := probe.NewOptionsProbe(cfg)
 
@@ -137,7 +140,7 @@ func TestOptionsProbe_DeduplicatesByURL(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := probe.Config{Client: srv.Client(), Timeout: 5 * time.Second}
+	cfg := probe.Config{Client: srv.Client(), Timeout: 5 * time.Second, URLValidator: func(string) error { return nil }}
 	p := probe.NewOptionsProbe(cfg)
 
 	endpoints := []classify.ClassifiedRequest{
@@ -163,15 +166,16 @@ func TestOptionsProbe_DeduplicatesByURL(t *testing.T) {
 
 func TestOptionsProbe_PerRequestTimeout(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(2 * time.Second)
+		time.Sleep(500 * time.Millisecond)
 		w.Header().Set("Allow", "GET")
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
 
 	cfg := probe.Config{
-		Client:  srv.Client(),
-		Timeout: 100 * time.Millisecond,
+		Client:       srv.Client(),
+		Timeout:      100 * time.Millisecond,
+		URLValidator: func(string) error { return nil },
 	}
 	p := probe.NewOptionsProbe(cfg)
 
@@ -197,7 +201,7 @@ func TestOptionsProbe_ZeroTimeoutUsesDefault(t *testing.T) {
 	defer srv.Close()
 
 	// Pass zero timeout - should use default, not panic or hang
-	cfg := probe.Config{Client: srv.Client(), Timeout: 0}
+	cfg := probe.Config{Client: srv.Client(), Timeout: 0, URLValidator: func(string) error { return nil }}
 	p := probe.NewOptionsProbe(cfg)
 
 	endpoints := []classify.ClassifiedRequest{
@@ -212,5 +216,104 @@ func TestOptionsProbe_ZeroTimeoutUsesDefault(t *testing.T) {
 	// Should succeed with default timeout, not fail with 0-timeout context
 	if len(result[0].AllowedMethods) == 0 {
 		t.Error("expected AllowedMethods with default timeout, got empty (0-timeout context expired immediately)")
+	}
+}
+
+func TestOptionsProbe_Skips4xxAnd5xxResponses(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Allow", "GET, POST, DELETE")
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	cfg := probe.Config{
+		Client:       srv.Client(),
+		Timeout:      5 * time.Second,
+		URLValidator: func(string) error { return nil },
+	}
+	p := probe.NewOptionsProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{ObservedRequest: crawl.ObservedRequest{URL: srv.URL + "/api/users"}, IsAPI: true},
+	}
+
+	result, err := p.Probe(context.Background(), endpoints)
+	if err != nil {
+		t.Fatalf("Probe() error: %v", err)
+	}
+
+	if len(result[0].AllowedMethods) != 0 {
+		t.Errorf("expected empty AllowedMethods for 500 response, got %v", result[0].AllowedMethods)
+	}
+}
+
+func TestOptionsProbe_MaxEndpoints(t *testing.T) {
+	var probeCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probeCount.Add(1)
+		w.Header().Set("Allow", "GET, POST")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	cfg := probe.Config{
+		Client:       srv.Client(),
+		Timeout:      5 * time.Second,
+		MaxEndpoints: 2,
+		URLValidator: func(string) error { return nil },
+	}
+	p := probe.NewOptionsProbe(cfg)
+
+	endpoints := make([]classify.ClassifiedRequest, 5)
+	for i := range endpoints {
+		endpoints[i] = classify.ClassifiedRequest{
+			ObservedRequest: crawl.ObservedRequest{
+				URL: fmt.Sprintf("%s/api/resource/%d", srv.URL, i),
+			},
+			IsAPI: true,
+		}
+	}
+
+	_, err := p.Probe(context.Background(), endpoints)
+	if err != nil {
+		t.Fatalf("Probe() error: %v", err)
+	}
+
+	if probeCount.Load() != 2 {
+		t.Errorf("expected 2 probed URLs (MaxEndpoints=2), got %d", probeCount.Load())
+	}
+}
+
+func TestOptionsProbe_NormalizesMethodsToUppercase(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Allow", "get, Post, DELETE")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	cfg := probe.Config{
+		Client:       srv.Client(),
+		Timeout:      5 * time.Second,
+		URLValidator: func(string) error { return nil },
+	}
+	p := probe.NewOptionsProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{ObservedRequest: crawl.ObservedRequest{URL: srv.URL + "/api/mixed"}, IsAPI: true},
+	}
+
+	result, err := p.Probe(context.Background(), endpoints)
+	if err != nil {
+		t.Fatalf("Probe() error: %v", err)
+	}
+
+	want := []string{"GET", "POST", "DELETE"}
+	if len(result[0].AllowedMethods) != len(want) {
+		t.Fatalf("AllowedMethods length: got %d, want %d", len(result[0].AllowedMethods), len(want))
+	}
+	for i, m := range result[0].AllowedMethods {
+		if m != want[i] {
+			t.Errorf("AllowedMethods[%d]: got %q, want %q", i, m, want[i])
+		}
 	}
 }

@@ -31,7 +31,19 @@ type Config struct {
 
 	// AuthHeaders are injected into every probe request.
 	AuthHeaders map[string]string
+
+	// URLValidator is called before each probe request to validate the target URL.
+	// If nil, the default SSRF-prevention validator is used. Set to a no-op
+	// function in tests that use httptest servers on loopback addresses.
+	URLValidator func(string) error
+
+	// MaxEndpoints limits the number of unique URLs probed per strategy.
+	// If zero, defaults to DefaultMaxEndpoints.
+	MaxEndpoints int
 }
+
+// DefaultMaxEndpoints is the default limit on unique URLs probed per strategy.
+const DefaultMaxEndpoints = 500
 
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
@@ -45,8 +57,18 @@ func (cfg Config) withDefaults() Config {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 10 * time.Second
 	}
+	if cfg.URLValidator == nil {
+		cfg.URLValidator = validateProbeURL
+	}
+	if cfg.MaxEndpoints == 0 {
+		cfg.MaxEndpoints = DefaultMaxEndpoints
+	}
 	if cfg.Client == nil {
-		cfg.Client = &http.Client{Timeout: cfg.Timeout}
+		cfg.Client = &http.Client{
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 	}
 	return cfg
 }

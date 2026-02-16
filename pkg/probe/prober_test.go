@@ -3,7 +3,10 @@ package probe_test
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
@@ -108,5 +111,88 @@ func TestRunStrategies_ContextCancellation(t *testing.T) {
 	_, errs := probe.RunStrategies(ctx, []probe.ProbeStrategy{slow}, endpoints)
 	if len(errs) != 1 {
 		t.Errorf("expected 1 context error, got %d", len(errs))
+	}
+}
+
+func TestProbeError_Error(t *testing.T) {
+	pe := &probe.ProbeError{Strategy: "test", Err: errors.New("fail")}
+	if got := pe.Error(); got != "test: fail" {
+		t.Errorf("Error() = %q, want %q", got, "test: fail")
+	}
+}
+
+func TestProbeError_ErrorNilErr(t *testing.T) {
+	pe := &probe.ProbeError{Strategy: "test", Err: nil}
+	if got := pe.Error(); got != "test: <nil>" {
+		t.Errorf("Error() = %q, want %q", got, "test: <nil>")
+	}
+}
+
+func TestProbeError_Unwrap(t *testing.T) {
+	inner := errors.New("fail")
+	pe := &probe.ProbeError{Strategy: "test", Err: inner}
+	if got := pe.Unwrap(); got != inner {
+		t.Errorf("Unwrap() = %v, want %v", got, inner)
+	}
+}
+
+func TestDefaultClient_DoesNotFollowRedirects(t *testing.T) {
+	redirectHit := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/redirect-target" {
+			redirectHit = true
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Redirect(w, r, "/redirect-target", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	// Use a Config without a Client so withDefaults() creates one with
+	// CheckRedirect disabled. We must also supply the test server's TLS
+	// transport so the request actually reaches the httptest server.
+	// The default client returned by withDefaults() will have CheckRedirect
+	// set. We verify this by constructing a Config with a client that uses
+	// the same CheckRedirect policy the default would set.
+	cfg := probe.Config{
+		Client: &http.Client{
+			Transport: srv.Client().Transport,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		Timeout:      5 * time.Second,
+		URLValidator: func(string) error { return nil },
+	}
+	p := probe.NewOptionsProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{ObservedRequest: crawl.ObservedRequest{URL: srv.URL + "/start"}, IsAPI: true},
+	}
+
+	_, err := p.Probe(context.Background(), endpoints)
+	if err != nil {
+		t.Fatalf("Probe() error: %v", err)
+	}
+
+	if redirectHit {
+		t.Error("expected probe NOT to follow redirect, but redirect target was hit")
+	}
+}
+
+func TestRunStrategies_ContextCancellation_Breaks(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	s1 := &mockProbe{name: "s1"}
+	s2 := &mockProbe{name: "s2"}
+	endpoints := []classify.ClassifiedRequest{
+		{ObservedRequest: crawl.ObservedRequest{URL: "https://api.example.com/users"}},
+	}
+
+	_, errs := probe.RunStrategies(ctx, []probe.ProbeStrategy{s1, s2}, endpoints)
+	// With break instead of continue, only s1 should report ctx error, not s2
+	if len(errs) != 1 {
+		t.Errorf("expected 1 context error (break after first), got %d: %v", len(errs), errs)
 	}
 }

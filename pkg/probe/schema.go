@@ -60,13 +60,19 @@ func (p *SchemaProbe) Probe(ctx context.Context, endpoints []classify.Classified
 		}
 		seen[ep.URL] = true
 
-		schema := p.probeURL(ctx, p.config.Client, ep.URL)
+		if len(seen) > p.config.MaxEndpoints {
+			break
+		}
+
+		schema := p.probeURL(ctx, ep.URL)
 		if schema != nil {
 			urlSchemas[ep.URL] = schema
 		}
 	}
 
-	// Apply results to all endpoints
+	// Copy endpoints to avoid mutating the caller's slice. Note: the shallow copy
+	// aliases mutable embedded fields (Headers, QueryParams maps) from ObservedRequest.
+	// Probes write only to probe-enriched fields (AllowedMethods, ResponseSchema).
 	result := make([]classify.ClassifiedRequest, len(endpoints))
 	copy(result, endpoints)
 
@@ -80,7 +86,11 @@ func (p *SchemaProbe) Probe(ctx context.Context, endpoints []classify.Classified
 }
 
 // probeURL sends a GET request and infers schema from the JSON response.
-func (p *SchemaProbe) probeURL(ctx context.Context, client *http.Client, url string) map[string]interface{} {
+func (p *SchemaProbe) probeURL(ctx context.Context, url string) map[string]interface{} {
+	if err := p.config.URLValidator(url); err != nil {
+		return nil
+	}
+
 	reqCtx, cancel := context.WithTimeout(ctx, p.config.Timeout)
 	defer cancel()
 
@@ -93,11 +103,15 @@ func (p *SchemaProbe) probeURL(ctx context.Context, client *http.Client, url str
 		req.Header.Set(k, v)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := p.config.Client.Do(req)
 	if err != nil {
 		return nil
 	}
 	defer resp.Body.Close() //nolint:errcheck // best-effort close on read-only response
+
+	if resp.StatusCode >= 400 {
+		return nil
+	}
 
 	if !isJSONContentType(resp.Header.Get("Content-Type")) {
 		return nil
@@ -145,6 +159,8 @@ func inferSchemaDepth(v interface{}, depth int) map[string]interface{} {
 		schema := map[string]interface{}{
 			"type": "array",
 		}
+		// Only the first element is sampled for item schema inference.
+		// Heterogeneous arrays (mixed types) will reflect only the first element's type.
 		if len(val) > 0 {
 			schema["items"] = inferSchemaDepth(val[0], depth+1)
 		}
@@ -167,7 +183,14 @@ func inferSchemaDepth(v interface{}, depth int) map[string]interface{} {
 	}
 }
 
-// isJSONContentType checks if the content type indicates JSON.
+// isJSONContentType checks if the content type indicates a JSON response.
+// Matches standard patterns: "application/json", "text/json", and structured
+// syntax suffixes like "application/vnd.api+json" and "application/problem+json".
 func isJSONContentType(ct string) bool {
-	return strings.Contains(strings.ToLower(ct), "json")
+	ct = strings.ToLower(ct)
+	// Strip charset parameters (e.g., "application/json; charset=utf-8").
+	if idx := strings.Index(ct, ";"); idx != -1 {
+		ct = strings.TrimSpace(ct[:idx])
+	}
+	return strings.HasSuffix(ct, "/json") || strings.HasSuffix(ct, "+json")
 }
