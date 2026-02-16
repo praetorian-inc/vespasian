@@ -17,11 +17,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/alecthomas/kong"
@@ -42,6 +45,73 @@ var CLI struct {
 	Version  VersionCmd  `cmd:"" help:"Show version information"`
 }
 
+// parseHeaders converts "Key: Value" strings to a map, validating for CRLF injection.
+func parseHeaders(raw []string) (map[string]string, error) {
+	headers := make(map[string]string)
+	for _, h := range raw {
+		parts := strings.SplitN(h, ":", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid header format (expected 'Key: Value'): %q", h)
+		}
+		name := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		if name == "" {
+			return nil, fmt.Errorf("header has empty name: %q", h)
+		}
+		if strings.ContainsAny(name, "\r\n") || strings.ContainsAny(value, "\r\n") {
+			return nil, fmt.Errorf("header contains invalid CRLF characters: %q", h)
+		}
+		headers[name] = value
+	}
+	return headers, nil
+}
+
+// doCrawl executes the common crawl pipeline: parse headers, create crawler,
+// run the crawl with signal handling, and return the results. On graceful
+// shutdown (SIGINT/SIGTERM) partial results are returned instead of an error.
+func doCrawl(targetURL string, rawHeaders []string, opts crawl.CrawlerOptions) ([]crawl.ObservedRequest, error) {
+	headers, err := parseHeaders(rawHeaders)
+	if err != nil {
+		return nil, fmt.Errorf("invalid header: %w", err)
+	}
+	opts.Headers = headers
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	crawler := crawl.NewCrawler(opts)
+	requests, err := crawler.Crawl(ctx, targetURL)
+	if err != nil {
+		if errors.Is(err, context.Canceled) && len(requests) > 0 {
+			// Graceful shutdown — return partial results.
+			return requests, nil
+		}
+		return nil, fmt.Errorf("crawl failed: %w", err)
+	}
+	return requests, nil
+}
+
+// writeOutput opens the output file (or stdout if path is empty), calls fn to
+// write content, and ensures the file is closed properly.
+func writeOutput(path string, fn func(io.Writer) error) error {
+	if path == "" {
+		return fn(os.Stdout)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	writeErr := fn(f)
+	closeErr := f.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	if closeErr != nil {
+		return fmt.Errorf("failed to close output file: %w", closeErr)
+	}
+	return nil
+}
+
 // CrawlCmd crawls a web application to capture HTTP traffic.
 type CrawlCmd struct {
 	URL      string        `arg:"" help:"Target URL to crawl"`
@@ -58,27 +128,35 @@ type CrawlCmd struct {
 
 // Run executes the crawl command.
 func (c *CrawlCmd) Run() error {
-	ctx, cancel := context.WithTimeout(context.Background(), c.Timeout)
-	defer cancel()
+	if err := validateURL(c.URL); err != nil {
+		return err
+	}
 
-	requests, err := executeCrawl(ctx, c.URL, c.Header, crawl.CrawlerOptions{
+	opts := crawl.CrawlerOptions{
 		Depth:    c.Depth,
 		MaxPages: c.MaxPages,
 		Timeout:  c.Timeout,
 		Scope:    c.Scope,
 		Headless: c.Headless,
-	}, c.Verbose)
+	}
+
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "crawling %s (depth=%d, max-pages=%d, timeout=%s)\n",
+			c.URL, opts.Depth, opts.MaxPages, opts.Timeout)
+	}
+
+	requests, err := doCrawl(c.URL, c.Header, opts)
 	if err != nil {
 		return err
 	}
 
-	w, cleanup, err := openOutput(c.Output)
-	if err != nil {
-		return err
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests))
 	}
-	defer cleanup()
 
-	return crawl.WriteCapture(w, requests)
+	return writeOutput(c.Output, func(w io.Writer) error {
+		return crawl.WriteCapture(w, requests)
+	})
 }
 
 // ImportCmd imports traffic capture from external sources.
@@ -116,13 +194,9 @@ func (c *ImportCmd) Run() error {
 		fmt.Fprintf(os.Stderr, "imported %d requests\n", len(requests))
 	}
 
-	w, cleanup, err := openOutput(c.Output)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	return crawl.WriteCapture(w, requests)
+	return writeOutput(c.Output, func(w io.Writer) error {
+		return crawl.WriteCapture(w, requests)
+	})
 }
 
 // GenerateCmd generates API specifications from captured traffic.
@@ -157,14 +231,10 @@ func (c *GenerateCmd) Run() error {
 		return err
 	}
 
-	w, cleanup, err := openOutput(c.Output)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	_, err = w.Write(spec)
-	return err
+	return writeOutput(c.Output, func(w io.Writer) error {
+		_, writeErr := w.Write(spec)
+		return writeErr
+	})
 }
 
 // ScanCmd runs the full pipeline: crawl, classify, and generate.
@@ -184,37 +254,42 @@ type ScanCmd struct {
 
 // Run executes the scan command (crawl + generate pipeline).
 func (c *ScanCmd) Run() error {
-	ctx, cancel := context.WithTimeout(context.Background(), c.Timeout)
-	defer cancel()
+	if err := validateURL(c.URL); err != nil {
+		return err
+	}
 
-	requests, err := executeCrawl(ctx, c.URL, c.Header, crawl.CrawlerOptions{
+	opts := crawl.CrawlerOptions{
 		Depth:    c.Depth,
 		MaxPages: c.MaxPages,
 		Timeout:  c.Timeout,
 		Scope:    c.Scope,
 		Headless: c.Headless,
-	}, c.Verbose)
+	}
+
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "crawling %s (depth=%d, max-pages=%d, timeout=%s)\n",
+			c.URL, opts.Depth, opts.MaxPages, opts.Timeout)
+	}
+
+	requests, err := doCrawl(c.URL, c.Header, opts)
 	if err != nil {
 		return err
 	}
 
 	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests))
 		fmt.Fprintf(os.Stderr, "generating REST spec\n")
 	}
 
-	spec, err := generateSpec(ctx, requests, "rest", c.Confidence, c.Probe, c.Verbose)
+	spec, err := generateSpec(context.Background(), requests, "rest", c.Confidence, c.Probe, c.Verbose)
 	if err != nil {
 		return err
 	}
 
-	w, cleanup, err := openOutput(c.Output)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	_, err = w.Write(spec)
-	return err
+	return writeOutput(c.Output, func(w io.Writer) error {
+		_, writeErr := w.Write(spec)
+		return writeErr
+	})
 }
 
 // VersionCmd shows version information.
@@ -236,41 +311,10 @@ func main() {
 	ctx.FatalIfErrorf(err)
 }
 
-// executeCrawl validates inputs, creates a crawler, and executes the crawl.
-func executeCrawl(ctx context.Context, targetURL string, rawHeaders []string, opts crawl.CrawlerOptions, verbose bool) ([]crawl.ObservedRequest, error) {
-	if err := validateURL(targetURL); err != nil {
-		return nil, err
-	}
-
-	headers, err := parseHeaders(rawHeaders)
-	if err != nil {
-		return nil, err
-	}
-	opts.Headers = headers
-
-	cr := crawl.NewCrawler(opts)
-
-	if verbose {
-		fmt.Fprintf(os.Stderr, "crawling %s (depth=%d, max-pages=%d, timeout=%s)\n",
-			targetURL, opts.Depth, opts.MaxPages, opts.Timeout)
-	}
-
-	requests, err := cr.Crawl(ctx, targetURL)
-	if err != nil {
-		return nil, fmt.Errorf("crawl failed: %w", err)
-	}
-
-	if verbose {
-		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests))
-	}
-
-	return requests, nil
-}
-
 // generateSpec runs the classify → probe → generate pipeline.
-func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, apiType string, confidence float64, doProbe bool, verbose bool) ([]byte, error) {
+func generateSpec(_ context.Context, requests []crawl.ObservedRequest, apiType string, confidence float64, doProbe bool, verbose bool) ([]byte, error) {
 	classifiers := classifiersForType(apiType)
-	classified := classify.RunClassifiers(classifiers, requests, confidence)
+	classified := classify.Deduplicate(classify.RunClassifiers(classifiers, requests, confidence))
 
 	if verbose {
 		fmt.Fprintf(os.Stderr, "classified %d API requests (threshold=%.2f)\n", len(classified), confidence)
@@ -281,7 +325,7 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, apiType
 			&probe.OptionsProbe{},
 			&probe.SchemaProbe{},
 		}
-		enriched, err := probe.RunStrategies(ctx, strategies, classified)
+		enriched, err := probe.RunStrategies(context.Background(), strategies, classified)
 		if err != nil {
 			return nil, fmt.Errorf("probe failed: %w", err)
 		}
@@ -324,33 +368,4 @@ func validateURL(rawURL string) error {
 		return fmt.Errorf("invalid URL %q: scheme must be http or https", rawURL)
 	}
 	return nil
-}
-
-// parseHeaders parses "Key: Value" header strings into a map.
-func parseHeaders(headers []string) (map[string]string, error) {
-	if len(headers) == 0 {
-		return nil, nil
-	}
-	result := make(map[string]string, len(headers))
-	for _, h := range headers {
-		key, value, ok := strings.Cut(h, ":")
-		if !ok {
-			return nil, fmt.Errorf("invalid header %q: must be in \"Key: Value\" format", h)
-		}
-		result[strings.TrimSpace(key)] = strings.TrimSpace(value)
-	}
-	return result, nil
-}
-
-// openOutput returns a writer for the given path, or stdout if path is empty.
-// The returned cleanup function must be called when writing is complete.
-func openOutput(path string) (io.Writer, func(), error) {
-	if path == "" {
-		return os.Stdout, func() {}, nil
-	}
-	f, err := os.Create(path)
-	if err != nil {
-		return nil, nil, fmt.Errorf("create output file: %w", err)
-	}
-	return f, func() { _ = f.Close() }, nil
 }

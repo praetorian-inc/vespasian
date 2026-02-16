@@ -15,6 +15,7 @@
 package main
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -47,87 +48,234 @@ func TestValidateURL(t *testing.T) {
 	}
 }
 
-func TestParseHeaders(t *testing.T) {
+func TestParseHeaders_Valid(t *testing.T) {
 	tests := []struct {
 		name    string
-		headers []string
-		wantLen int
+		input   []string
+		want    map[string]string
 		wantErr bool
 	}{
-		{"nil headers", nil, 0, false},
-		{"empty headers", []string{}, 0, false},
-		{"single header", []string{"Authorization: Bearer token"}, 1, false},
-		{"multiple headers", []string{"Authorization: Bearer token", "Content-Type: application/json"}, 2, false},
-		{"header with extra colons", []string{"Authorization: Bearer: token: extra"}, 1, false},
-		{"invalid header no colon", []string{"InvalidHeader"}, 0, true},
+		{
+			name:  "single header",
+			input: []string{"Content-Type: application/json"},
+			want: map[string]string{
+				"Content-Type": "application/json",
+			},
+			wantErr: false,
+		},
+		{
+			name: "multiple headers",
+			input: []string{
+				"Content-Type: application/json",
+				"Authorization: Bearer token123",
+				"User-Agent: vespasian/1.0",
+			},
+			want: map[string]string{
+				"Content-Type":  "application/json",
+				"Authorization": "Bearer token123",
+				"User-Agent":    "vespasian/1.0",
+			},
+			wantErr: false,
+		},
+		{
+			name:    "empty slice",
+			input:   []string{},
+			want:    map[string]string{},
+			wantErr: false,
+		},
+		{
+			name:  "header with spaces around colon",
+			input: []string{"Content-Type   :   application/json"},
+			want: map[string]string{
+				"Content-Type": "application/json",
+			},
+			wantErr: false,
+		},
+		{
+			name:  "header with multiple colons in value",
+			input: []string{"X-Custom: value:with:colons"},
+			want: map[string]string{
+				"X-Custom": "value:with:colons",
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := parseHeaders(tt.headers)
+			got, err := parseHeaders(tt.input)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("parseHeaders() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if !tt.wantErr && len(result) != tt.wantLen {
-				t.Errorf("parseHeaders() got %d headers, want %d", len(result), tt.wantLen)
+
+			if len(got) != len(tt.want) {
+				t.Errorf("parseHeaders() got %d headers, want %d", len(got), len(tt.want))
+				return
+			}
+
+			for key, wantValue := range tt.want {
+				gotValue, ok := got[key]
+				if !ok {
+					t.Errorf("parseHeaders() missing key %q", key)
+				}
+				if gotValue != wantValue {
+					t.Errorf("parseHeaders()[%q] = %q, want %q", key, gotValue, wantValue)
+				}
 			}
 		})
 	}
-
-	// Verify specific header values
-	t.Run("header values", func(t *testing.T) {
-		result, err := parseHeaders([]string{"Authorization: Bearer token123"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := result["Authorization"]; got != "Bearer token123" {
-			t.Errorf("got %q, want %q", got, "Bearer token123")
-		}
-	})
-
-	// Verify trimming
-	t.Run("header trimming", func(t *testing.T) {
-		result, err := parseHeaders([]string{"  Key  :  Value  "})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := result["Key"]; got != "Value" {
-			t.Errorf("got %q, want %q", got, "Value")
-		}
-	})
 }
 
-func TestOpenOutput(t *testing.T) {
+func TestParseHeaders_CRLFInjection(t *testing.T) {
+	tests := []struct {
+		name  string
+		input []string
+	}{
+		{
+			name:  "CRLF in header name",
+			input: []string{"Content\r\nType: application/json"},
+		},
+		{
+			name:  "CRLF in header value",
+			input: []string{"Content-Type: application/json\r\nX-Injected: malicious"},
+		},
+		{
+			name:  "CR in header name",
+			input: []string{"Content\rType: application/json"},
+		},
+		{
+			name:  "LF in header value",
+			input: []string{"Content-Type: application/json\nmalicious"},
+		},
+		{
+			name:  "multiple CRLF in value",
+			input: []string{"X-Custom: normal\r\n\r\ninjected"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseHeaders(tt.input)
+			if err == nil {
+				t.Error("parseHeaders() expected error for CRLF injection, got nil")
+			}
+		})
+	}
+}
+
+func TestParseHeaders_InvalidFormat(t *testing.T) {
+	tests := []struct {
+		name  string
+		input []string
+	}{
+		{
+			name:  "missing colon",
+			input: []string{"Content-Type application/json"},
+		},
+		{
+			name:  "empty string",
+			input: []string{""},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseHeaders(tt.input)
+			if err == nil {
+				t.Error("parseHeaders() expected error for invalid format, got nil")
+			}
+		})
+	}
+}
+
+// TestParseHeaders_EdgeCases tests edge cases that are technically valid.
+func TestParseHeaders_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   []string
+		wantKey string
+		wantVal string
+		wantErr bool
+	}{
+		{
+			name:    "colon at end (empty value)",
+			input:   []string{"Key:"},
+			wantKey: "Key",
+			wantVal: "",
+			wantErr: false,
+		},
+		{
+			name:    "colon at start (empty key)",
+			input:   []string{": value"},
+			wantErr: true,
+		},
+		{
+			name:    "only colon",
+			input:   []string{":"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseHeaders(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseHeaders() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr {
+				if len(got) != 1 {
+					t.Errorf("parseHeaders() returned %d headers, want 1", len(got))
+					return
+				}
+				if got[tt.wantKey] != tt.wantVal {
+					t.Errorf("parseHeaders()[%q] = %q, want %q", tt.wantKey, got[tt.wantKey], tt.wantVal)
+				}
+			}
+		})
+	}
+}
+
+func TestParseHeaders_Empty(t *testing.T) {
+	got, err := parseHeaders([]string{})
+	if err != nil {
+		t.Errorf("parseHeaders() error = %v, want nil", err)
+	}
+
+	if len(got) != 0 {
+		t.Errorf("parseHeaders() returned %d headers, want 0", len(got))
+	}
+}
+
+func TestWriteOutput(t *testing.T) {
 	t.Run("stdout when empty", func(t *testing.T) {
-		w, cleanup, err := openOutput("")
+		err := writeOutput("", func(_ io.Writer) error {
+			return nil
+		})
 		if err != nil {
 			t.Fatal(err)
-		}
-		defer cleanup()
-		if w != os.Stdout {
-			t.Error("expected os.Stdout for empty path")
 		}
 	})
 
 	t.Run("file when path given", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "test-output.json")
-		w, cleanup, err := openOutput(path)
+		err := writeOutput(path, func(w io.Writer) error {
+			_, writeErr := w.Write([]byte("test"))
+			return writeErr
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer cleanup()
-		if w == os.Stdout {
-			t.Error("expected file writer, got os.Stdout")
-		}
-		// Verify file was created
-		if _, err := os.Stat(path); os.IsNotExist(err) {
+		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
 			t.Error("output file was not created")
 		}
 	})
 
 	t.Run("error on bad path", func(t *testing.T) {
-		_, _, err := openOutput("/nonexistent/directory/file.json")
+		err := writeOutput("/nonexistent/directory/file.json", func(_ io.Writer) error {
+			return nil
+		})
 		if err == nil {
 			t.Error("expected error for nonexistent directory")
 		}
