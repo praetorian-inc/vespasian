@@ -78,6 +78,21 @@ func TestExtractQueryParams(t *testing.T) {
 			want: nil,
 		},
 		{
+			name: "relative URL without scheme (B3 fix)",
+			url:  "example.com/api?page=1",
+			want: nil,
+		},
+		{
+			name: "path-only URL without host (B3 fix)",
+			url:  "/api?page=1",
+			want: nil,
+		},
+		{
+			name: "scheme-only URL without host (B3 fix)",
+			url:  "https:///api?page=1",
+			want: nil,
+		},
+		{
 			name: "fragment after query",
 			url:  "https://example.com/api?page=1#section",
 			want: map[string]string{"page": "1"},

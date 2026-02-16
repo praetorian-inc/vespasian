@@ -19,9 +19,19 @@ import "net/url"
 // extractQueryParams parses query parameters from a URL string.
 // Returns nil if the URL has no query parameters or is invalid.
 // For duplicate keys, only the first value is returned.
+//
+// Note: Validates URL has scheme and host (absolute URL requirement per B3).
+// url.Parse is lenient and accepts relative paths like "not a url" without error.
+// We require absolute URLs for traffic imports since they represent real requests.
 func extractQueryParams(urlStr string) map[string]string {
 	parsed, err := url.Parse(urlStr)
 	if err != nil {
+		return nil
+	}
+
+	// Validate absolute URL: must have scheme and host (B3 fix)
+	// url.Parse accepts "not a url" as a relative path without error
+	if parsed.Scheme == "" || parsed.Host == "" {
 		return nil
 	}
 
