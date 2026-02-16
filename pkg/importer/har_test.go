@@ -309,3 +309,105 @@ func TestHARImporter_SizeLimit(t *testing.T) {
 	_, err = h.Import(strings.NewReader(truncated))
 	assert.Error(t, err)
 }
+
+func TestHARImporter_EmptyHeaderNames(t *testing.T) {
+	json := `{
+		"log": {
+			"entries": [{
+				"request": {
+					"method": "GET",
+					"url": "https://example.com/api",
+					"headers": [
+						{"name": "", "value": "empty-name-value"},
+						{"name": "Valid-Header", "value": "valid-value"},
+						{"name": "", "value": "another-empty"}
+					]
+				},
+				"response": {
+					"status": 200,
+					"headers": [
+						{"name": "Content-Type", "value": "application/json"},
+						{"name": "", "value": "should-be-skipped"}
+					],
+					"content": {}
+				}
+			}]
+		}
+	}`
+
+	h := &HARImporter{}
+	requests, err := h.Import(strings.NewReader(json))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	// Only valid headers should be present (empty names skipped per RFC 7230)
+	req := requests[0]
+	assert.Len(t, req.Headers, 1)
+	assert.Equal(t, "valid-value", req.Headers["Valid-Header"])
+	assert.NotContains(t, req.Headers, "")
+
+	// Response headers should also skip empty names
+	assert.Len(t, req.Response.Headers, 1)
+	assert.Equal(t, "application/json", req.Response.Headers["Content-Type"])
+}
+
+func TestHARImporter_EmptyPostData(t *testing.T) {
+	json := `{
+		"log": {
+			"entries": [{
+				"request": {
+					"method": "POST",
+					"url": "https://example.com/api",
+					"headers": [],
+					"postData": {
+						"text": ""
+					}
+				},
+				"response": {
+					"status": 200,
+					"headers": [],
+					"content": {}
+				}
+			}]
+		}
+	}`
+
+	h := &HARImporter{}
+	requests, err := h.Import(strings.NewReader(json))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	// Empty postData.text should result in nil body
+	req := requests[0]
+	assert.Nil(t, req.Body)
+}
+
+func TestHARImporter_EmptyResponseContent(t *testing.T) {
+	json := `{
+		"log": {
+			"entries": [{
+				"request": {
+					"method": "GET",
+					"url": "https://example.com/api",
+					"headers": []
+				},
+				"response": {
+					"status": 204,
+					"headers": [],
+					"content": {
+						"text": ""
+					}
+				}
+			}]
+		}
+	}`
+
+	h := &HARImporter{}
+	requests, err := h.Import(strings.NewReader(json))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	// Empty content.text should result in nil body
+	req := requests[0]
+	assert.Nil(t, req.Response.Body)
+}

@@ -31,18 +31,25 @@ const (
 	maxImportSize = 500 * 1024 * 1024
 )
 
-var validHTTPMethods = map[string]bool{
-	"GET": true, "POST": true, "PUT": true, "DELETE": true,
-	"PATCH": true, "HEAD": true, "OPTIONS": true, "TRACE": true, "CONNECT": true,
-}
+var (
+	validHTTPMethods = map[string]bool{
+		"GET": true, "POST": true, "PUT": true, "DELETE": true,
+		"PATCH": true, "HEAD": true, "OPTIONS": true, "TRACE": true, "CONNECT": true,
+	}
+
+	xxeDOCTYPEPatterns = [][]byte{
+		[]byte("<!DOCTYPE"), []byte("<!doctype"), []byte("<!Doctype"),
+		[]byte("<!DocType"), []byte("<!DOctype"), []byte("<!dOCTYPE"),
+	}
+
+	xxeENTITYPatterns = [][]byte{
+		[]byte("<!ENTITY"), []byte("<!entity"), []byte("<!Entity"),
+		[]byte("<!EnTiTy"), []byte("<!ENtity"), []byte("<!eNTITY"),
+	}
+)
 
 // BurpImporter imports Burp Suite XML traffic captures.
 type BurpImporter struct{}
-
-// Name returns the importer name.
-func (i *BurpImporter) Name() string {
-	return "burp"
-}
 
 type burpItems struct {
 	XMLName xml.Name   `xml:"items"`
@@ -59,6 +66,26 @@ type burpItem struct {
 type burpData struct {
 	Base64 string `xml:"base64,attr"`
 	Data   string `xml:",chardata"`
+}
+
+// Name returns the importer name.
+func (BurpImporter) Name() string {
+	return "burp"
+}
+
+// containsXXEPatterns checks for XXE attack vectors in XML data.
+func containsXXEPatterns(data []byte) bool {
+	for _, pattern := range xxeDOCTYPEPatterns {
+		if bytes.Contains(data, pattern) {
+			return true
+		}
+	}
+	for _, pattern := range xxeENTITYPatterns {
+		if bytes.Contains(data, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 // Import reads Burp Suite XML and converts to ObservedRequest format.
@@ -78,34 +105,8 @@ func (i *BurpImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
 	}
 
 	// Check for DOCTYPE or ENTITY declarations (XXE attack vectors)
-	// Case-insensitive search without memory copy
-	doctypePatterns := [][]byte{
-		[]byte("<!DOCTYPE"), []byte("<!doctype"), []byte("<!Doctype"),
-		[]byte("<!DocType"), []byte("<!DOctype"), []byte("<!dOCTYPE"),
-	}
-	entityPatterns := [][]byte{
-		[]byte("<!ENTITY"), []byte("<!entity"), []byte("<!Entity"),
-		[]byte("<!EnTiTy"), []byte("<!ENtity"), []byte("<!eNTITY"),
-	}
-
-	hasDOCTYPE := false
-	for _, pattern := range doctypePatterns {
-		if bytes.Contains(data, pattern) {
-			hasDOCTYPE = true
-			break
-		}
-	}
-
-	hasENTITY := false
-	for _, pattern := range entityPatterns {
-		if bytes.Contains(data, pattern) {
-			hasENTITY = true
-			break
-		}
-	}
-
-	if hasDOCTYPE || hasENTITY {
-		return nil, fmt.Errorf("burp importer: XML contains DOCTYPE or ENTITY declarations which are not allowed")
+	if containsXXEPatterns(data) {
+		return nil, fmt.Errorf("burp importer: XML validation: DOCTYPE or ENTITY declarations not allowed")
 	}
 
 	var items burpItems
@@ -173,6 +174,8 @@ func (i *BurpImporter) parseItem(item burpItem) (crawl.ObservedRequest, error) {
 	}, nil
 }
 
+// decodeData decodes burpData based on base64 attribute.
+// Returns raw bytes if base64="false", decoded bytes if base64="true".
 func decodeData(d burpData) ([]byte, error) {
 	if strings.EqualFold(d.Base64, "true") {
 		decoded, err := base64.StdEncoding.DecodeString(d.Data)
@@ -203,7 +206,10 @@ func splitHTTPMessage(data []byte) (firstLine string, headers map[string]string,
 	// Split headers and body
 	headerSection := data[:sepIdx]
 	if sepIdx+len(separator) < len(data) {
-		body = data[sepIdx+len(separator):]
+		bodyData := data[sepIdx+len(separator):]
+		if len(bodyData) > 0 {
+			body = bodyData
+		}
 	}
 
 	// Parse lines
@@ -217,14 +223,14 @@ func splitHTTPMessage(data []byte) (firstLine string, headers map[string]string,
 
 	// Parse headers
 	for i := 1; i < len(lines); i++ {
-		line := string(bytes.TrimRight(lines[i], "\r"))
-		if line == "" {
+		line := bytes.TrimRight(lines[i], "\r")
+		if len(line) == 0 {
 			continue
 		}
-		idx := strings.Index(line, ":")
+		idx := bytes.IndexByte(line, ':')
 		if idx > 0 {
-			key := strings.TrimSpace(line[:idx])
-			value := strings.TrimSpace(line[idx+1:])
+			key := string(bytes.TrimSpace(line[:idx]))
+			value := string(bytes.TrimSpace(line[idx+1:]))
 			headers[key] = value
 		}
 	}
@@ -232,6 +238,8 @@ func splitHTTPMessage(data []byte) (firstLine string, headers map[string]string,
 	return firstLine, headers, body, nil
 }
 
+// parseHTTPRequest parses raw HTTP request data into method, headers, and body.
+// Validates HTTP method against validHTTPMethods.
 func parseHTTPRequest(data []byte) (method string, headers map[string]string, body []byte, err error) {
 	firstLine, headers, body, err := splitHTTPMessage(data)
 	if err != nil {
@@ -251,6 +259,8 @@ func parseHTTPRequest(data []byte) (method string, headers map[string]string, bo
 	return method, headers, body, nil
 }
 
+// parseHTTPResponse parses raw HTTP response data into status code, headers, and body.
+// Extracts status code from response status line (e.g., "HTTP/1.1 200 OK" -> 200).
 func parseHTTPResponse(data []byte) (statusCode int, headers map[string]string, body []byte, err error) {
 	firstLine, headers, body, err := splitHTTPMessage(data)
 	if err != nil {

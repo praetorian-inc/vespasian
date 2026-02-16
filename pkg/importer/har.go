@@ -26,7 +26,7 @@ import (
 type HARImporter struct{}
 
 // Name returns the importer name.
-func (i *HARImporter) Name() string {
+func (HARImporter) Name() string {
 	return "har"
 }
 
@@ -117,6 +117,9 @@ func (i *HARImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
 func convertHeaders(harHeaders []harHeader) map[string]string {
 	headers := make(map[string]string)
 	for _, h := range harHeaders {
+		if h.Name == "" {
+			continue // Skip invalid headers per RFC 7230
+		}
 		headers[h.Name] = h.Value
 	}
 	return headers

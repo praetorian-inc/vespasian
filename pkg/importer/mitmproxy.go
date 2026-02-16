@@ -29,11 +29,6 @@ import (
 // MitmproxyImporter imports mitmproxy JSON traffic captures.
 type MitmproxyImporter struct{}
 
-// Name returns the importer name.
-func (i *MitmproxyImporter) Name() string {
-	return "mitmproxy"
-}
-
 type mitmproxyFlow struct {
 	Request  mitmproxyRequest  `json:"request"`
 	Response mitmproxyResponse `json:"response"`
@@ -53,6 +48,11 @@ type mitmproxyResponse struct {
 	StatusCode int        `json:"status_code"`
 	Headers    [][]string `json:"headers"`
 	Content    *string    `json:"content"`
+}
+
+// Name returns the importer name.
+func (MitmproxyImporter) Name() string {
+	return "mitmproxy"
 }
 
 // Import reads mitmproxy JSON and converts to ObservedRequest format.
@@ -151,7 +151,14 @@ func peekFirstNonWhitespace(r *bufio.Reader) (byte, error) {
 	}
 }
 
+// parseFlow converts a mitmproxyFlow into an ObservedRequest.
+// Constructs URL from request components, decodes base64 content, and extracts headers.
 func (i *MitmproxyImporter) parseFlow(flow mitmproxyFlow) (crawl.ObservedRequest, error) {
+	// Validate port
+	if flow.Request.Port < 0 || flow.Request.Port > 65535 {
+		return crawl.ObservedRequest{}, fmt.Errorf("invalid port: %d (must be 0-65535)", flow.Request.Port)
+	}
+
 	// Construct URL
 	url := constructURL(flow.Request.Scheme, flow.Request.Host, flow.Request.Port, flow.Request.Path)
 
@@ -205,7 +212,8 @@ func constructURL(scheme, host string, port int, path string) string {
 	return u.String()
 }
 
-// decodeContent decodes base64-encoded content.
+// decodeContent decodes base64-encoded content from mitmproxy flow.
+// Returns nil for nil or empty content, decoded bytes otherwise.
 func decodeContent(content *string) ([]byte, error) {
 	if content == nil || *content == "" {
 		return nil, nil
@@ -219,10 +227,11 @@ func decodeContent(content *string) ([]byte, error) {
 }
 
 // convertMitmproxyHeaders converts mitmproxy header tuples to map.
+// Skips headers with empty names or malformed tuples (per RFC 7230).
 func convertMitmproxyHeaders(mitmHeaders [][]string) map[string]string {
 	headers := make(map[string]string)
 	for _, h := range mitmHeaders {
-		if len(h) >= 2 {
+		if len(h) >= 2 && h[0] != "" {
 			headers[h[0]] = h[1]
 		}
 	}

@@ -348,3 +348,345 @@ func TestBurpImporter_QueryParams(t *testing.T) {
 		assert.Equal(t, want, req.QueryParams[key])
 	}
 }
+
+func TestBurpImporter_DuplicateHeaders(t *testing.T) {
+	// Test that duplicate headers use "last wins" behavior
+	requestWithDuplicates := "GET /api HTTP/1.1\r\nHost: example.com\r\nX-Custom: first\r\nX-Custom: second\r\nX-Custom: last\r\n\r\n"
+	response := "HTTP/1.1 200 OK\r\n\r\n"
+
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/api</url>
+		<request base64="true">` + base64.StdEncoding.EncodeToString([]byte(requestWithDuplicates)) + `</request>
+		<status>200</status>
+		<response base64="true">` + base64.StdEncoding.EncodeToString([]byte(response)) + `</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	requests, err := b.Import(strings.NewReader(xml))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	req := requests[0]
+	// Duplicate headers: last wins
+	assert.Equal(t, "last", req.Headers["X-Custom"])
+}
+
+func TestBurpImporter_InvalidHTTPMethod(t *testing.T) {
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com</url>
+		<request base64="false">INVALID /api HTTP/1.1
+Host: example.com
+
+</request>
+		<status>200</status>
+		<response base64="false">HTTP/1.1 200 OK
+
+</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	_, err := b.Import(strings.NewReader(xml))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid HTTP method")
+}
+
+func TestBurpImporter_MalformedStatusCode(t *testing.T) {
+	// Test with non-numeric status code
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com</url>
+		<request base64="false">GET /api HTTP/1.1
+Host: example.com
+
+</request>
+		<status>200</status>
+		<response base64="false">HTTP/1.1 abc OK
+
+</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	_, err := b.Import(strings.NewReader(xml))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid status code")
+}
+
+func TestBurpImporter_MalformedRequestLine(t *testing.T) {
+	// Test with missing HTTP version
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com</url>
+		<request base64="false">GET
+
+</request>
+		<status>200</status>
+		<response base64="false">HTTP/1.1 200 OK
+
+</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	_, err := b.Import(strings.NewReader(xml))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid request line")
+}
+
+func TestBurpImporter_EmptyRequestBody(t *testing.T) {
+	// GET request should have nil body
+	getRequest := "GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	getResponse := "HTTP/1.1 200 OK\r\n\r\n"
+
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/api</url>
+		<request base64="true">` + base64.StdEncoding.EncodeToString([]byte(getRequest)) + `</request>
+		<status>200</status>
+		<response base64="true">` + base64.StdEncoding.EncodeToString([]byte(getResponse)) + `</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	requests, err := b.Import(strings.NewReader(xml))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	// Body should be nil for empty body (not []byte{})
+	assert.Nil(t, requests[0].Body)
+	assert.Nil(t, requests[0].Response.Body)
+}
+
+func TestBurpImporter_StatusOverride(t *testing.T) {
+	// Verify that XML status overrides parsed response status
+	getRequest := "GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	getResponse := "HTTP/1.1 500 Internal Server Error\r\n\r\n"
+
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/api</url>
+		<request base64="true">` + base64.StdEncoding.EncodeToString([]byte(getRequest)) + `</request>
+		<status>200</status>
+		<response base64="true">` + base64.StdEncoding.EncodeToString([]byte(getResponse)) + `</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	requests, err := b.Import(strings.NewReader(xml))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	// XML status (200) should override parsed response status (500)
+	assert.Equal(t, 200, requests[0].Response.StatusCode)
+}
+
+func TestBurpImporter_LFOnlyLineEndings(t *testing.T) {
+	// Test with LF-only line endings (instead of CRLF)
+	getRequest := "GET /api HTTP/1.1\nHost: example.com\n\n"
+	getResponse := "HTTP/1.1 200 OK\nContent-Type: text/plain\n\nOK"
+
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/api</url>
+		<request base64="true">` + base64.StdEncoding.EncodeToString([]byte(getRequest)) + `</request>
+		<status>200</status>
+		<response base64="true">` + base64.StdEncoding.EncodeToString([]byte(getResponse)) + `</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	requests, err := b.Import(strings.NewReader(xml))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	// Should parse successfully with LF-only endings
+	assert.Equal(t, "GET", requests[0].Method)
+	assert.Equal(t, "example.com", requests[0].Headers["Host"])
+	assert.Equal(t, "OK", string(requests[0].Response.Body))
+}
+
+func TestBurpImporter_HeaderWithEmptyValue(t *testing.T) {
+	// Header with empty value should still be included
+	getRequest := "GET /api HTTP/1.1\r\nHost: example.com\r\nX-Empty:\r\nX-Valid: value\r\n\r\n"
+	getResponse := "HTTP/1.1 200 OK\r\n\r\n"
+
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/api</url>
+		<request base64="true">` + base64.StdEncoding.EncodeToString([]byte(getRequest)) + `</request>
+		<status>200</status>
+		<response base64="true">` + base64.StdEncoding.EncodeToString([]byte(getResponse)) + `</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	requests, err := b.Import(strings.NewReader(xml))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	// Empty value header should be included with empty string value
+	assert.Equal(t, "", requests[0].Headers["X-Empty"])
+	assert.Equal(t, "value", requests[0].Headers["X-Valid"])
+}
+
+func TestBurpImporter_InvalidResponseBase64(t *testing.T) {
+	// Valid request but invalid base64 response
+	getRequest := "GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n"
+
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/api</url>
+		<request base64="true">` + base64.StdEncoding.EncodeToString([]byte(getRequest)) + `</request>
+		<status>200</status>
+		<response base64="true">!!!invalid-base64-data!!!</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	_, err := b.Import(strings.NewReader(xml))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to decode response")
+}
+
+func TestBurpImporter_ResponseNoSeparator(t *testing.T) {
+	// Response without header/body separator
+	getRequest := "GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	badResponse := "HTTP/1.1 200 OK"
+
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/api</url>
+		<request base64="true">` + base64.StdEncoding.EncodeToString([]byte(getRequest)) + `</request>
+		<status>200</status>
+		<response base64="true">` + base64.StdEncoding.EncodeToString([]byte(badResponse)) + `</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	_, err := b.Import(strings.NewReader(xml))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to parse response")
+}
+
+func TestBurpImporter_RequestNoSeparator(t *testing.T) {
+	// Request without header/body separator
+	badRequest := "GET /api HTTP/1.1"
+	getResponse := "HTTP/1.1 200 OK\r\n\r\n"
+
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/api</url>
+		<request base64="true">` + base64.StdEncoding.EncodeToString([]byte(badRequest)) + `</request>
+		<status>200</status>
+		<response base64="true">` + base64.StdEncoding.EncodeToString([]byte(getResponse)) + `</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	_, err := b.Import(strings.NewReader(xml))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to parse request")
+}
+
+func TestBurpImporter_InvalidResponseStatusLine(t *testing.T) {
+	// Response with incomplete status line (less than 2 parts)
+	getRequest := "GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	badResponse := "HTTP/1.1\r\n\r\n" // Missing status code
+
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/api</url>
+		<request base64="true">` + base64.StdEncoding.EncodeToString([]byte(getRequest)) + `</request>
+		<status>0</status>
+		<response base64="true">` + base64.StdEncoding.EncodeToString([]byte(badResponse)) + `</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	_, err := b.Import(strings.NewReader(xml))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid status line")
+}
+
+func TestBurpImporter_MinimalResponse(t *testing.T) {
+	// Response with only status line (no headers)
+	getRequest := "GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	minimalResponse := "HTTP/1.1 200 OK\r\n\r\n" // Only status line, no headers
+
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/api</url>
+		<request base64="true">` + base64.StdEncoding.EncodeToString([]byte(getRequest)) + `</request>
+		<status>200</status>
+		<response base64="true">` + base64.StdEncoding.EncodeToString([]byte(minimalResponse)) + `</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	requests, err := b.Import(strings.NewReader(xml))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	assert.Equal(t, 200, requests[0].Response.StatusCode)
+}
+
+func TestBurpImporter_ResponseWithEmptyLines(t *testing.T) {
+	// Response with empty lines in header section
+	getRequest := "GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	responseWithEmptyLines := "HTTP/1.1 200 OK\r\n\r\n\r\nBody content"
+
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/api</url>
+		<request base64="true">` + base64.StdEncoding.EncodeToString([]byte(getRequest)) + `</request>
+		<status>200</status>
+		<response base64="true">` + base64.StdEncoding.EncodeToString([]byte(responseWithEmptyLines)) + `</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	requests, err := b.Import(strings.NewReader(xml))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+}
+
+func TestBurpImporter_HeadersWithBlankLines(t *testing.T) {
+	// Headers with blank lines between them (unusual but valid per splitHTTPMessage)
+	// The blank line check (len(line) == 0) in splitHTTPMessage needs to be exercised
+	getRequest := "GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	// Response with blank line BETWEEN headers (before separator)
+	responseWithBlankHeader := "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\nX-Custom: value\r\n\r\nBody"
+
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/api</url>
+		<request base64="true">` + base64.StdEncoding.EncodeToString([]byte(getRequest)) + `</request>
+		<status>200</status>
+		<response base64="true">` + base64.StdEncoding.EncodeToString([]byte(responseWithBlankHeader)) + `</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	requests, err := b.Import(strings.NewReader(xml))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	assert.Equal(t, "text/html", requests[0].Response.Headers["Content-Type"])
+}

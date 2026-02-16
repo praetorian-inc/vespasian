@@ -108,6 +108,11 @@ func TestExtractQueryParams(t *testing.T) {
 			url:  "https://example.com/api?page=1#section",
 			want: map[string]string{"page": "1"},
 		},
+		{
+			name: "URL with control character (triggers url.Parse error)",
+			url:  "https://example.com/api?\x00page=1",
+			want: nil,
+		},
 	}
 
 	for _, tt := range tests {

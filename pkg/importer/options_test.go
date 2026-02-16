@@ -15,6 +15,7 @@
 package importer
 
 import (
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -79,6 +80,12 @@ func TestMatchesScope(t *testing.T) {
 			scope:    "example.com",
 			expected: false,
 		},
+		{
+			name:     "url with control character (triggers url.Parse error)",
+			url:      "https://example.com/api?\x00param=1",
+			scope:    "example.com",
+			expected: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -91,6 +98,7 @@ func TestMatchesScope(t *testing.T) {
 
 type mockImporter struct {
 	requests []crawl.ObservedRequest
+	err      error
 }
 
 func (m *mockImporter) Name() string {
@@ -98,6 +106,9 @@ func (m *mockImporter) Name() string {
 }
 
 func (m *mockImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
 	return m.requests, nil
 }
 
@@ -124,11 +135,13 @@ func TestImportWithOptions(t *testing.T) {
 		name     string
 		opts     ImportOptions
 		expected int
+		wantErr  bool
 	}{
 		{
 			name:     "no scope filters all",
 			opts:     ImportOptions{},
 			expected: 3,
+			wantErr:  false,
 		},
 		{
 			name: "exact scope match",
@@ -136,6 +149,7 @@ func TestImportWithOptions(t *testing.T) {
 				Scope: "example.com",
 			},
 			expected: 1,
+			wantErr:  false,
 		},
 		{
 			name: "wildcard scope match",
@@ -143,6 +157,31 @@ func TestImportWithOptions(t *testing.T) {
 				Scope: "*.example.com",
 			},
 			expected: 2,
+			wantErr:  false,
+		},
+		{
+			name: "max entries exact boundary",
+			opts: ImportOptions{
+				MaxEntries: 3,
+			},
+			expected: 3,
+			wantErr:  false,
+		},
+		{
+			name: "max entries one over",
+			opts: ImportOptions{
+				MaxEntries: 2,
+			},
+			expected: 0,
+			wantErr:  true,
+		},
+		{
+			name: "max entries zero unlimited",
+			opts: ImportOptions{
+				MaxEntries: 0,
+			},
+			expected: 3,
+			wantErr:  false,
 		},
 	}
 
@@ -150,8 +189,24 @@ func TestImportWithOptions(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			mock := &mockImporter{requests: requests}
 			result, err := ImportWithOptions(mock, strings.NewReader(""), tt.opts)
-			require.NoError(t, err)
-			assert.Len(t, result, tt.expected)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.ErrorIs(t, err, ErrTooManyEntries)
+			} else {
+				require.NoError(t, err)
+				assert.Len(t, result, tt.expected)
+			}
 		})
 	}
+}
+
+func TestImportWithOptions_ImporterError(t *testing.T) {
+	// Test that importer errors are propagated
+	importerErr := errors.New("simulated importer error")
+	mock := &mockImporter{err: importerErr}
+
+	result, err := ImportWithOptions(mock, strings.NewReader(""), ImportOptions{})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, importerErr)
+	assert.Nil(t, result)
 }

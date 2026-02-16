@@ -16,6 +16,7 @@ package importer
 
 import (
 	"encoding/base64"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -340,4 +341,318 @@ func TestMitmproxyImporter_QueryParams(t *testing.T) {
 		assert.Contains(t, req.QueryParams, key)
 		assert.Equal(t, want, req.QueryParams[key])
 	}
+}
+
+func TestMitmproxyImporter_InvalidPort(t *testing.T) {
+	tests := []struct {
+		name    string
+		port    int
+		wantErr string
+	}{
+		{
+			name:    "negative port",
+			port:    -1,
+			wantErr: "invalid port: -1 (must be 0-65535)",
+		},
+		{
+			name:    "port too large",
+			port:    65536,
+			wantErr: "invalid port: 65536 (must be 0-65535)",
+		},
+		{
+			name:    "very large port",
+			port:    100000,
+			wantErr: "invalid port: 100000 (must be 0-65535)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			json := `{
+				"request": {
+					"method": "GET",
+					"scheme": "https",
+					"host": "example.com",
+					"port": ` + strings.Replace(strings.Replace(`PORT`, "PORT", "", 1), "", fmt.Sprintf("%d", tt.port), 1) + `,
+					"path": "/api",
+					"headers": []
+				},
+				"response": {
+					"status_code": 200,
+					"headers": [],
+					"content": null
+				}
+			}`
+			// Build JSON with port value
+			json = strings.Replace(json, "PORT", "", 1)
+			json = `{
+				"request": {
+					"method": "GET",
+					"scheme": "https",
+					"host": "example.com",
+					"port": ` + fmt.Sprintf("%d", tt.port) + `,
+					"path": "/api",
+					"headers": []
+				},
+				"response": {
+					"status_code": 200,
+					"headers": [],
+					"content": null
+				}
+			}`
+
+			m := &MitmproxyImporter{}
+			_, err := m.Import(strings.NewReader(json))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+func TestMitmproxyImporter_InvalidResponseContent(t *testing.T) {
+	json := `{
+		"request": {
+			"method": "GET",
+			"scheme": "https",
+			"host": "example.com",
+			"port": 443,
+			"path": "/api",
+			"headers": []
+		},
+		"response": {
+			"status_code": 200,
+			"headers": [],
+			"content": "!!!invalid-base64!!!"
+		}
+	}`
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(strings.NewReader(json))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to decode response content")
+}
+
+func TestMitmproxyImporter_EmptyHeaderNames(t *testing.T) {
+	json := `{
+		"request": {
+			"method": "GET",
+			"scheme": "https",
+			"host": "example.com",
+			"port": 443,
+			"path": "/api",
+			"headers": [
+				["", "empty-name-value"],
+				["Valid-Header", "valid-value"],
+				["", "another-empty"],
+				["Another-Valid", "another-value"]
+			]
+		},
+		"response": {
+			"status_code": 200,
+			"headers": [
+				["Content-Type", "application/json"],
+				["", "should-be-skipped"]
+			],
+			"content": null
+		}
+	}`
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(strings.NewReader(json))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	// Only valid headers should be present (empty names skipped)
+	req := requests[0]
+	assert.Len(t, req.Headers, 2)
+	assert.Equal(t, "valid-value", req.Headers["Valid-Header"])
+	assert.Equal(t, "another-value", req.Headers["Another-Valid"])
+	assert.NotContains(t, req.Headers, "")
+
+	// Response headers should also skip empty names
+	assert.Len(t, req.Response.Headers, 1)
+	assert.Equal(t, "application/json", req.Response.Headers["Content-Type"])
+}
+
+func TestMitmproxyImporter_MalformedHeaders(t *testing.T) {
+	json := `{
+		"request": {
+			"method": "GET",
+			"scheme": "https",
+			"host": "example.com",
+			"port": 443,
+			"path": "/api",
+			"headers": [
+				["Only-One-Element"],
+				["Valid-Header", "valid-value"],
+				[],
+				["Another-Valid", "value", "extra-ignored"]
+			]
+		},
+		"response": {
+			"status_code": 200,
+			"headers": [],
+			"content": null
+		}
+	}`
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(strings.NewReader(json))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	// Only valid headers (len >= 2) should be present
+	req := requests[0]
+	assert.Len(t, req.Headers, 2)
+	assert.Equal(t, "valid-value", req.Headers["Valid-Header"])
+	assert.Equal(t, "value", req.Headers["Another-Valid"])
+}
+
+func TestMitmproxyImporter_ArrayParseError(t *testing.T) {
+	// Malformed array with invalid flow object
+	json := `[{"invalid": "structure"}]`
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(strings.NewReader(json))
+	// This should succeed because the JSON is valid, just with missing fields
+	// The flow will have zero values for missing fields
+	require.NoError(t, err)
+	assert.Len(t, requests, 1)
+}
+
+func TestMitmproxyImporter_ValidPortBoundaries(t *testing.T) {
+	tests := []struct {
+		name string
+		port int
+	}{
+		{"port 0", 0},
+		{"port 1", 1},
+		{"port 80", 80},
+		{"port 443", 443},
+		{"port 8080", 8080},
+		{"port 65535", 65535},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			json := `{
+				"request": {
+					"method": "GET",
+					"scheme": "https",
+					"host": "example.com",
+					"port": ` + fmt.Sprintf("%d", tt.port) + `,
+					"path": "/api",
+					"headers": []
+				},
+				"response": {
+					"status_code": 200,
+					"headers": [],
+					"content": null
+				}
+			}`
+
+			m := &MitmproxyImporter{}
+			requests, err := m.Import(strings.NewReader(json))
+			require.NoError(t, err)
+			assert.Len(t, requests, 1)
+		})
+	}
+}
+
+func TestMitmproxyImporter_TruncatedArrayJSON(t *testing.T) {
+	// Test truncated JSON array (simulates hitting file size limit)
+	truncatedJSON := `[{"request":{"method":"GET","scheme":"https","host":"example.com","port":443,"path":"/api","headers":[]},"response":{"status_code":200`
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(strings.NewReader(truncatedJSON))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to decode flow")
+}
+
+func TestMitmproxyImporter_TruncatedObjectJSON(t *testing.T) {
+	// Test truncated single object JSON
+	truncatedJSON := `{"request":{"method":"GET","scheme":"https","host":"example.com","port":443`
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(strings.NewReader(truncatedJSON))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to decode flow")
+}
+
+func TestMitmproxyImporter_ParseFlowErrorInArray(t *testing.T) {
+	// Test parseFlow error within array loop
+	json := `[{"request":{"method":"GET","scheme":"https","host":"example.com","port":-999,"path":"/api","headers":[]},"response":{"status_code":200,"headers":[],"content":null}}]`
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(strings.NewReader(json))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid port")
+}
+
+func TestMitmproxyImporter_EmptyInput(t *testing.T) {
+	// Test empty input triggers peekFirstNonWhitespace error
+	m := &MitmproxyImporter{}
+	_, err := m.Import(strings.NewReader(""))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to read input")
+}
+
+func TestMitmproxyImporter_WhitespaceOnlyInput(t *testing.T) {
+	// Test whitespace-only input triggers EOF error
+	m := &MitmproxyImporter{}
+	_, err := m.Import(strings.NewReader("   \n\t\r  "))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to read input")
+}
+
+func TestMitmproxyImporter_InvalidFirstToken(t *testing.T) {
+	// Test unexpected token (not [ or {) triggers error
+	m := &MitmproxyImporter{}
+	_, err := m.Import(strings.NewReader(`"string value"`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected JSON array or object")
+}
+
+func TestMitmproxyImporter_InvalidArrayToken(t *testing.T) {
+	// Test invalid array start (number instead of flow object)
+	m := &MitmproxyImporter{}
+	_, err := m.Import(strings.NewReader(`[123, 456]`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to decode flow")
+}
+
+func TestMitmproxyImporter_MissingArrayClose(t *testing.T) {
+	// Test array without closing bracket (but valid flow)
+	// This tests the closing ']' token error path
+	json := `[{"request":{"method":"GET","scheme":"https","host":"example.com","port":443,"path":"/","headers":[]},"response":{"status_code":200,"headers":[],"content":null}}`
+	m := &MitmproxyImporter{}
+	_, err := m.Import(strings.NewReader(json))
+	require.Error(t, err)
+	// JSON decoder will report unexpected EOF when looking for closing bracket
+	assert.Contains(t, err.Error(), "mitmproxy importer")
+}
+
+func TestMitmproxyImporter_InvalidRequestContent(t *testing.T) {
+	// Test invalid base64 in request content
+	json := `{
+		"request": {
+			"method": "POST",
+			"scheme": "https",
+			"host": "example.com",
+			"port": 443,
+			"path": "/api",
+			"headers": [],
+			"content": "!!!invalid-base64!!!"
+		},
+		"response": {
+			"status_code": 200,
+			"headers": [],
+			"content": null
+		}
+	}`
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(strings.NewReader(json))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to decode request content")
 }

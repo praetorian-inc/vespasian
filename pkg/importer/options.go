@@ -15,6 +15,7 @@
 package importer
 
 import (
+	"fmt"
 	"io"
 	"net/url"
 	"strings"
@@ -68,7 +69,7 @@ func ImportWithOptions(importer TrafficImporter, r io.Reader, opts ImportOptions
 
 	// Check MaxEntries limit before filtering
 	if opts.MaxEntries > 0 && len(requests) > opts.MaxEntries {
-		return nil, ErrTooManyEntries
+		return nil, fmt.Errorf("%w: got %d entries, max %d", ErrTooManyEntries, len(requests), opts.MaxEntries)
 	}
 
 	// If no scope specified, return all requests
