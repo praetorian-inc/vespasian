@@ -18,6 +18,8 @@ import (
 	"encoding/base64"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestMitmproxyImporter_Name(t *testing.T) {
@@ -140,6 +142,35 @@ func TestMitmproxyImporter_Import(t *testing.T) {
 			]`,
 			wantRequests: 2,
 		},
+		{
+			name:         "empty array",
+			json:         `[]`,
+			wantRequests: 0,
+		},
+		{
+			name: "whitespace before valid object",
+			json: `   {
+				"request": {
+					"method": "GET",
+					"scheme": "https",
+					"host": "example.com",
+					"port": 443,
+					"path": "/api",
+					"headers": [],
+					"content": null
+				},
+				"response": {
+					"status_code": 200,
+					"headers": [],
+					"content": null
+				}
+			}`,
+			wantRequests: 1,
+			wantMethod:   "GET",
+			wantURL:      "https://example.com/api",
+			wantSource:   "import:mitmproxy",
+			wantStatus:   200,
+		},
 	}
 
 	for _, tt := range tests {
@@ -223,15 +254,28 @@ func TestMitmproxyImporter_Import_Errors(t *testing.T) {
 			}`,
 			wantErr: true,
 		},
+		{
+			name:    "invalid JSON type number",
+			json:    "123",
+			wantErr: true,
+		},
+		{
+			name:    "invalid JSON type string",
+			json:    `"hello"`,
+			wantErr: true,
+		},
+		{
+			name:    "empty input",
+			json:    "",
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			m := &MitmproxyImporter{}
 			_, err := m.Import(strings.NewReader(tt.json))
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Import() error = %v, wantErr %v", err, tt.wantErr)
-			}
+			assert.True(t, (err != nil) == tt.wantErr, "Import() error = %v, wantErr %v", err, tt.wantErr)
 		})
 	}
 }

@@ -15,6 +15,7 @@
 package importer
 
 import (
+	"bufio"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -56,23 +57,49 @@ type mitmproxyResponse struct {
 
 // Import reads mitmproxy JSON and converts to ObservedRequest format.
 // Handles both single flow and array of flows.
+// Uses streaming decoder to avoid allocating entire input in memory (S3 fix).
 func (i *MitmproxyImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
 	// Limit reader to prevent resource exhaustion
 	limitedReader := io.LimitReader(r, maxImportSize)
-	data, err := io.ReadAll(limitedReader)
+	bufReader := bufio.NewReader(limitedReader)
+
+	// Peek first non-whitespace byte to determine JSON type (array vs object)
+	firstByte, err := peekFirstNonWhitespace(bufReader)
 	if err != nil {
 		return nil, fmt.Errorf("mitmproxy importer: failed to read input: %w", err)
 	}
 
-	// Try parsing as array first
+	decoder := json.NewDecoder(bufReader)
 	var flows []mitmproxyFlow
-	if err := json.Unmarshal(data, &flows); err != nil {
-		// Try parsing as single flow
+
+	switch firstByte {
+	case '[':
+		// Array of flows - stream decode each element
+		// Consume opening '['
+		if _, err := decoder.Token(); err != nil {
+			return nil, fmt.Errorf("mitmproxy importer: failed to read array start: %w", err)
+		}
+		// Decode each flow individually (memory efficient)
+		for decoder.More() {
+			var flow mitmproxyFlow
+			if err := decoder.Decode(&flow); err != nil {
+				return nil, fmt.Errorf("mitmproxy importer: failed to decode flow: %w", err)
+			}
+			flows = append(flows, flow)
+		}
+		// Consume closing ']'
+		if _, err := decoder.Token(); err != nil {
+			return nil, fmt.Errorf("mitmproxy importer: failed to read array end: %w", err)
+		}
+	case '{':
+		// Single flow object
 		var flow mitmproxyFlow
-		if err := json.Unmarshal(data, &flow); err != nil {
-			return nil, fmt.Errorf("mitmproxy importer: failed to decode JSON: %w", err)
+		if err := decoder.Decode(&flow); err != nil {
+			return nil, fmt.Errorf("mitmproxy importer: failed to decode flow: %w", err)
 		}
 		flows = []mitmproxyFlow{flow}
+	default:
+		return nil, fmt.Errorf("mitmproxy importer: expected JSON array or object, got %q", string(firstByte))
 	}
 
 	var requests []crawl.ObservedRequest
@@ -85,6 +112,24 @@ func (i *MitmproxyImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error)
 	}
 
 	return requests, nil
+}
+
+// peekFirstNonWhitespace reads and unreads bytes until finding a non-whitespace character.
+func peekFirstNonWhitespace(r *bufio.Reader) (byte, error) {
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		// Skip JSON whitespace: space, tab, newline, carriage return
+		if b != ' ' && b != '\t' && b != '\n' && b != '\r' {
+			// Unread so decoder sees it
+			if err := r.UnreadByte(); err != nil {
+				return 0, err
+			}
+			return b, nil
+		}
+	}
 }
 
 func (i *MitmproxyImporter) parseFlow(flow mitmproxyFlow) (crawl.ObservedRequest, error) {
