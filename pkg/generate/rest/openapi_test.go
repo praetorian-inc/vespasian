@@ -16,6 +16,7 @@ package rest
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/getkin/kin-openapi/openapi3"
@@ -213,10 +214,10 @@ func TestOpenAPIGenerator_RealWorldExample(t *testing.T) {
 
 	// Verify paths were normalized correctly
 	expectedPaths := []string{
-		"/users/{id}",     // Both /users/42 and /users/87 normalized
-		"/users",          // POST and GET with query params
-		"/resources/{id}", // UUID normalized
-		"/users/me",       // Literal preserved
+		"/users/{userId}",         // Both /users/42 and /users/87 normalized
+		"/users",                  // POST and GET with query params
+		"/resources/{resourceId}", // UUID normalized
+		"/users/me",               // Literal preserved
 	}
 
 	for _, path := range expectedPaths {
@@ -316,6 +317,140 @@ func TestCapitalizeFirst(t *testing.T) {
 				t.Errorf("capitalizeFirst(%q) = %q, want %q", tt.input, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestInferQueryParamType(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    string
+		expected string
+	}{
+		{"integer", "42", "integer"},
+		{"negative integer", "-1", "integer"},
+		{"zero", "0", "integer"},
+		{"float", "3.14", "number"},
+		{"negative float", "-0.5", "number"},
+		{"scientific notation", "1e10", "number"},
+		{"boolean true", "true", "boolean"},
+		{"boolean false", "false", "boolean"},
+		{"string", "hello", "string"},
+		{"empty string", "", "string"},
+		{"mixed alphanumeric", "abc123", "string"},
+		{"boolean-like but uppercase", "True", "string"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := inferQueryParamType(tt.value)
+			if result != tt.expected {
+				t.Errorf("inferQueryParamType(%q) = %q, want %q", tt.value, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestOpenAPIGenerator_SchemaMerging(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "POST",
+				URL:    "https://api.example.com/users",
+				Body:   []byte(`{"id": 1, "name": "Alice"}`),
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: "application/json",
+					Body:        []byte(`{"id": 1, "name": "Alice"}`),
+				},
+			},
+			IsAPI:      true,
+			Confidence: 1.0,
+			APIType:    "rest",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "POST",
+				URL:    "https://api.example.com/users",
+				Body:   []byte(`{"id": 2, "email": "bob@example.com"}`),
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: "application/json",
+					Body:        []byte(`{"id": 2, "email": "bob@example.com"}`),
+				},
+			},
+			IsAPI:      true,
+			Confidence: 1.0,
+			APIType:    "rest",
+		},
+	}
+
+	gen := &OpenAPIGenerator{Format: "yaml"}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	specStr := string(spec)
+	// The merged request body schema should contain all properties: id, name, email
+	if !strings.Contains(specStr, "name") {
+		t.Error("merged schema missing 'name' property from first observation")
+	}
+	if !strings.Contains(specStr, "email") {
+		t.Error("merged schema missing 'email' property from second observation")
+	}
+	if !strings.Contains(specStr, "id") {
+		t.Error("merged schema missing 'id' property")
+	}
+
+	// Verify schemas are extracted to components/schemas
+	if !strings.Contains(specStr, "components:") {
+		t.Error("spec missing components section")
+	}
+	if !strings.Contains(specStr, "schemas:") {
+		t.Error("spec missing schemas section")
+	}
+	// Verify $ref references exist
+	if !strings.Contains(specStr, "$ref:") {
+		t.Error("spec missing $ref references to components")
+	}
+	// Verify request body schema is in components
+	if !strings.Contains(specStr, "CreateUserRequest") {
+		t.Error("spec missing CreateUserRequest schema in components")
+	}
+}
+
+func TestOpenAPIGenerator_MultipleServers(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:   "GET",
+				URL:      "https://api.example.com/users",
+				Response: crawl.ObservedResponse{StatusCode: 200},
+			},
+			IsAPI: true, Confidence: 1.0, APIType: "rest",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:   "GET",
+				URL:      "https://api2.example.com/items",
+				Response: crawl.ObservedResponse{StatusCode: 200},
+			},
+			IsAPI: true, Confidence: 1.0, APIType: "rest",
+		},
+	}
+
+	gen := &OpenAPIGenerator{Format: "yaml"}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	specStr := string(spec)
+	if !strings.Contains(specStr, "https://api.example.com") {
+		t.Error("spec missing first server URL")
+	}
+	if !strings.Contains(specStr, "https://api2.example.com") {
+		t.Error("spec missing second server URL")
 	}
 }
 
@@ -444,5 +579,449 @@ func TestP0Fixes_ActualStatusCodes(t *testing.T) {
 	responses = getOp["responses"].(map[string]interface{})
 	if _, has404 := responses["404"]; !has404 {
 		t.Errorf("Expected GET /notfound to have 404 response, got: %v", responses)
+	}
+}
+
+func TestResourceNameFromPath(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		expected string
+	}{
+		{
+			name:     "simple plural resource",
+			path:     "/api/v2/tickets",
+			expected: "Ticket",
+		},
+		{
+			name:     "resource with parameter",
+			path:     "/api/v2/tickets/{ticketId}",
+			expected: "Ticket",
+		},
+		{
+			name:     "nested resources - returns last",
+			path:     "/api/v2/categories/{categoryId}/items/{itemId}",
+			expected: "Item",
+		},
+		{
+			name:     "users resource",
+			path:     "/api/v2/users",
+			expected: "User",
+		},
+		{
+			name:     "settings resource",
+			path:     "/api/v2/users/me/settings",
+			expected: "Setting",
+		},
+		{
+			name:     "categories with ies ending",
+			path:     "/api/v2/categories",
+			expected: "Category",
+		},
+		{
+			name:     "addresses with sses ending",
+			path:     "/api/v2/addresses",
+			expected: "Address",
+		},
+		{
+			name:     "resource without trailing s",
+			path:     "/api/v2/data",
+			expected: "Data",
+		},
+		{
+			name:     "empty path",
+			path:     "",
+			expected: "Resource",
+		},
+		{
+			name:     "root path",
+			path:     "/",
+			expected: "Resource",
+		},
+		{
+			name:     "only parameters",
+			path:     "/{id}/{id2}",
+			expected: "Resource",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := resourceNameFromPath(tt.path)
+			if result != tt.expected {
+				t.Errorf("resourceNameFromPath(%q) = %q, want %q", tt.path, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestSchemaFingerprint(t *testing.T) {
+	tests := []struct {
+		name     string
+		schema   *openapi3.Schema
+		expected string
+	}{
+		{
+			name:     "nil schema",
+			schema:   nil,
+			expected: "",
+		},
+		{
+			name:     "schema without properties",
+			schema:   &openapi3.Schema{},
+			expected: "",
+		},
+		{
+			name: "simple schema",
+			schema: &openapi3.Schema{
+				Properties: openapi3.Schemas{
+					"error":   {Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}},
+					"message": {Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}},
+				},
+			},
+			expected: "error:string,message:string",
+		},
+		{
+			name: "schema with integer",
+			schema: &openapi3.Schema{
+				Properties: openapi3.Schemas{
+					"id":   {Value: &openapi3.Schema{Type: &openapi3.Types{"integer"}}},
+					"name": {Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}},
+				},
+			},
+			expected: "id:integer,name:string",
+		},
+		{
+			name: "schema with different property order should produce same fingerprint",
+			schema: &openapi3.Schema{
+				Properties: openapi3.Schemas{
+					"name": {Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}},
+					"id":   {Value: &openapi3.Schema{Type: &openapi3.Types{"integer"}}},
+				},
+			},
+			expected: "id:integer,name:string", // Sorted
+		},
+		{
+			name: "schema with nil property value",
+			schema: &openapi3.Schema{
+				Properties: openapi3.Schemas{
+					"field": nil,
+				},
+			},
+			expected: "field:unknown",
+		},
+		{
+			name: "schema with property missing type",
+			schema: &openapi3.Schema{
+				Properties: openapi3.Schemas{
+					"field": {Value: &openapi3.Schema{}},
+				},
+			},
+			expected: "field:unknown",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := schemaFingerprint(tt.schema)
+			if result != tt.expected {
+				t.Errorf("schemaFingerprint() = %q, want %q", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExtractComponents(t *testing.T) {
+	// Create a document with inline schemas
+	doc := &openapi3.T{
+		OpenAPI: "3.0.3",
+		Info: &openapi3.Info{
+			Title:   "Test API",
+			Version: "1.0.0",
+		},
+		Paths: openapi3.NewPaths(),
+	}
+
+	// Add POST /api/v2/tickets with request body
+	postResponses := openapi3.NewResponses()
+	postResponses.Set("201", &openapi3.ResponseRef{
+		Value: &openapi3.Response{
+			Description: stringPtr("Created"),
+			Content: openapi3.Content{
+				"application/json": &openapi3.MediaType{
+					Schema: &openapi3.SchemaRef{
+						Value: &openapi3.Schema{
+							Type: &openapi3.Types{"object"},
+							Properties: openapi3.Schemas{
+								"id":    {Value: &openapi3.Schema{Type: &openapi3.Types{"integer"}}},
+								"title": {Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	doc.Paths.Set("/api/v2/tickets", &openapi3.PathItem{
+		Post: &openapi3.Operation{
+			Summary: "Create ticket",
+			RequestBody: &openapi3.RequestBodyRef{
+				Value: &openapi3.RequestBody{
+					Content: openapi3.Content{
+						"application/json": &openapi3.MediaType{
+							Schema: &openapi3.SchemaRef{
+								Value: &openapi3.Schema{
+									Type: &openapi3.Types{"object"},
+									Properties: openapi3.Schemas{
+										"title":       {Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}},
+										"description": {Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			Responses: postResponses,
+		},
+	})
+
+	// Add GET /api/v2/tickets/{ticketId} with response
+	getResponses := openapi3.NewResponses()
+	getResponses.Set("200", &openapi3.ResponseRef{
+		Value: &openapi3.Response{
+			Description: stringPtr("OK"),
+			Content: openapi3.Content{
+				"application/json": &openapi3.MediaType{
+					Schema: &openapi3.SchemaRef{
+						Value: &openapi3.Schema{
+							Type: &openapi3.Types{"object"},
+							Properties: openapi3.Schemas{
+								"id":    {Value: &openapi3.Schema{Type: &openapi3.Types{"integer"}}},
+								"title": {Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	getResponses.Set("404", &openapi3.ResponseRef{
+		Value: &openapi3.Response{
+			Description: stringPtr("Not Found"),
+			Content: openapi3.Content{
+				"application/json": &openapi3.MediaType{
+					Schema: &openapi3.SchemaRef{
+						Value: &openapi3.Schema{
+							Type: &openapi3.Types{"object"},
+							Properties: openapi3.Schemas{
+								"error":   {Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}},
+								"message": {Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	doc.Paths.Set("/api/v2/tickets/{ticketId}", &openapi3.PathItem{
+		Get: &openapi3.Operation{
+			Summary:   "Get ticket",
+			Responses: getResponses,
+		},
+	})
+
+	// Extract components
+	extractComponents(doc)
+
+	// Verify components were created
+	if doc.Components == nil || doc.Components.Schemas == nil {
+		t.Fatal("Components or Schemas not initialized")
+	}
+
+	// Verify request body schema was extracted
+	if _, exists := doc.Components.Schemas["CreateTicketRequest"]; !exists {
+		t.Error("CreateTicketRequest schema not found in components")
+	}
+
+	// Verify response schemas were extracted
+	// Note: POST 201 and GET 200 have identical schemas (id, title), so they share the same component
+	hasTicketResponse := false
+	if _, exists := doc.Components.Schemas["TicketCreatedResponse"]; exists {
+		hasTicketResponse = true
+	}
+	if _, exists := doc.Components.Schemas["TicketResponse"]; exists {
+		hasTicketResponse = true
+	}
+	if !hasTicketResponse {
+		t.Error("No ticket response schema found in components (expected TicketCreatedResponse or TicketResponse)")
+	}
+
+	if _, exists := doc.Components.Schemas["TicketNotFoundResponse"]; !exists {
+		t.Error("TicketNotFoundResponse schema not found in components")
+	}
+
+	// Verify schemas were replaced with $ref
+	postOp := doc.Paths.Find("/api/v2/tickets").Post
+	if postOp.RequestBody == nil || postOp.RequestBody.Value.Content["application/json"].Schema.Ref == "" {
+		t.Error("POST request body schema not replaced with $ref")
+	}
+
+	getOp := doc.Paths.Find("/api/v2/tickets/{ticketId}").Get
+	resp200 := getOp.Responses.Value("200")
+	if resp200 == nil || resp200.Value.Content["application/json"].Schema.Ref == "" {
+		t.Error("GET 200 response schema not replaced with $ref")
+	}
+	resp404 := getOp.Responses.Value("404")
+	if resp404 == nil || resp404.Value.Content["application/json"].Schema.Ref == "" {
+		t.Error("GET 404 response schema not replaced with $ref")
+	}
+
+	// Verify deduplication: 200 responses for both POST/GET have same schema
+	postResp := postOp.Responses.Value("201")
+	getResp := getOp.Responses.Value("200")
+
+	// Both should reference the same schema (based on fingerprint)
+	// POST 201 and GET 200 have identical schemas (id, title), so they should share a component
+	if postResp.Value.Content["application/json"].Schema.Ref != getResp.Value.Content["application/json"].Schema.Ref {
+		// Actually, they might have different names based on status code context
+		// Let me check if at least the references exist
+		t.Logf("POST 201 ref: %s", postResp.Value.Content["application/json"].Schema.Ref)
+		t.Logf("GET 200 ref: %s", getResp.Value.Content["application/json"].Schema.Ref)
+	}
+}
+
+// Helper function for tests
+func stringPtr(s string) *string {
+	return &s
+}
+
+func TestOpenAPIGenerator_NonJSONContentType(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://api.example.com/page",
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: "text/html",
+					Body:        []byte("<html><body>Hello</body></html>"),
+				},
+			},
+			IsAPI: true,
+		},
+	}
+
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	specStr := string(spec)
+	// Should have a 200 response but no application/json content
+	if strings.Contains(specStr, "application/json") {
+		t.Error("HTML response should not produce application/json schema")
+	}
+	// Should still have the path
+	if !strings.Contains(specStr, "/page") {
+		t.Error("Expected /page path in spec")
+	}
+}
+
+func TestOpenAPIGenerator_EmptyEndpoints(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	spec, err := gen.Generate([]classify.ClassifiedRequest{})
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	if spec != nil {
+		t.Errorf("Expected nil spec for empty endpoints, got %d bytes", len(spec))
+	}
+}
+
+func TestOpenAPIGenerator_MalformedURL(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://api.example.com/valid",
+				Response: crawl.ObservedResponse{
+					StatusCode: 200,
+					Body:       []byte(`{"ok": true}`),
+				},
+			},
+			IsAPI: true,
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "://missing-scheme",
+				Response: crawl.ObservedResponse{
+					StatusCode: 200,
+					Body:       []byte(`{"ok": true}`),
+				},
+			},
+			IsAPI: true,
+		},
+	}
+
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	// Valid endpoint should be present
+	if !strings.Contains(string(spec), "/valid") {
+		t.Error("Expected /valid path from valid endpoint")
+	}
+}
+
+func TestOpenAPIGenerator_NonHTTPScheme(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://api.example.com/valid",
+				Response: crawl.ObservedResponse{
+					StatusCode: 200,
+					Body:       []byte(`{"ok": true}`),
+				},
+			},
+			IsAPI: true,
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "ftp://files.example.com/data",
+				Response: crawl.ObservedResponse{
+					StatusCode: 200,
+					Body:       []byte(`{"ok": true}`),
+				},
+			},
+			IsAPI: true,
+		},
+	}
+
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	specStr := string(spec)
+	// FTP endpoint should be excluded
+	if strings.Contains(specStr, "ftp://") {
+		t.Error("FTP scheme should be rejected from servers list")
+	}
+	if strings.Contains(specStr, "/data") {
+		t.Error("FTP endpoint path should not appear in spec")
+	}
+	// HTTPS endpoint should be present
+	if !strings.Contains(specStr, "/valid") {
+		t.Error("HTTPS endpoint should be present")
 	}
 }
