@@ -17,22 +17,27 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/alecthomas/kong"
+
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
-	"github.com/praetorian-inc/vespasian/pkg/generate/rest"
+	"github.com/praetorian-inc/vespasian/pkg/generate"
+	"github.com/praetorian-inc/vespasian/pkg/importer"
+	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
+
+// version is set via -ldflags at build time.
+var version = "dev"
 
 // CLI defines the complete command-line interface structure.
 var CLI struct {
@@ -65,17 +70,14 @@ func parseHeaders(raw []string) (map[string]string, error) {
 }
 
 // doCrawl executes the common crawl pipeline: parse headers, create crawler,
-// run the crawl with signal handling, and return the results. On graceful
+// run the crawl with the provided context, and return the results. On graceful
 // shutdown (SIGINT/SIGTERM) partial results are returned instead of an error.
-func doCrawl(targetURL string, rawHeaders []string, opts crawl.CrawlerOptions) ([]crawl.ObservedRequest, error) {
+func doCrawl(ctx context.Context, targetURL string, rawHeaders []string, opts crawl.CrawlerOptions) ([]crawl.ObservedRequest, error) {
 	headers, err := parseHeaders(rawHeaders)
 	if err != nil {
 		return nil, fmt.Errorf("invalid header: %w", err)
 	}
 	opts.Headers = headers
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	crawler := crawl.NewCrawler(opts)
 	requests, err := crawler.Crawl(ctx, targetURL)
@@ -110,12 +112,10 @@ func writeOutput(path string, fn func(io.Writer) error) error {
 	return nil
 }
 
-// CrawlCmd crawls a web application to capture HTTP traffic.
-type CrawlCmd struct {
-	URL      string        `arg:"" help:"Target URL to crawl"`
+// CrawlOptions holds the shared crawl configuration fields used by CrawlCmd and ScanCmd.
+type CrawlOptions struct {
 	Header   []string      `short:"H" help:"Custom headers (repeatable)"`
 	Output   string        `short:"o" help:"Output file path"`
-	Format   string        `default:"json" enum:"json,yaml" help:"Output format"`
 	Depth    int           `default:"3" help:"Maximum crawl depth"`
 	MaxPages int           `default:"100" help:"Maximum pages to crawl"`
 	Timeout  time.Duration `default:"30s" help:"Request timeout"`
@@ -124,8 +124,19 @@ type CrawlCmd struct {
 	Verbose  bool          `short:"v" help:"Enable verbose logging"`
 }
 
+// CrawlCmd crawls a web application to capture HTTP traffic.
+type CrawlCmd struct {
+	URL    string `arg:"" help:"Target URL to crawl"`
+	Format string `default:"json" enum:"json,yaml" help:"Output format"`
+	CrawlOptions
+}
+
 // Run executes the crawl command.
 func (c *CrawlCmd) Run() error {
+	if err := validateURL(c.URL); err != nil {
+		return err
+	}
+
 	opts := crawl.CrawlerOptions{
 		Depth:    c.Depth,
 		MaxPages: c.MaxPages,
@@ -133,10 +144,24 @@ func (c *CrawlCmd) Run() error {
 		Scope:    c.Scope,
 		Headless: c.Headless,
 	}
-	requests, err := doCrawl(c.URL, c.Header, opts)
+
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "crawling %s (depth=%d, max-pages=%d, timeout=%s)\n",
+			c.URL, opts.Depth, opts.MaxPages, opts.Timeout)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	requests, err := doCrawl(ctx, c.URL, c.Header, opts)
 	if err != nil {
 		return err
 	}
+
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests))
+	}
+
 	return writeOutput(c.Output, func(w io.Writer) error {
 		return crawl.WriteCapture(w, requests)
 	})
@@ -144,17 +169,41 @@ func (c *CrawlCmd) Run() error {
 
 // ImportCmd imports traffic capture from external sources.
 type ImportCmd struct {
-	Format  string `arg:"" help:"Import format (e.g., burp, har, mitmproxy)"`
+	Format  string `arg:"" enum:"burp,har,mitmproxy" help:"Import format (burp, har, mitmproxy)"`
 	File    string `arg:"" help:"Input file path"`
 	Output  string `short:"o" help:"Output file path"`
-	Scope   string `optional:"" help:"Filter scope (optional: same-origin or same-domain)"`
 	Verbose bool   `short:"v" help:"Enable verbose logging"`
 }
 
 // Run executes the import command.
 func (c *ImportCmd) Run() error {
-	fmt.Println("import: not implemented")
-	return nil
+	imp, err := importer.Get(c.Format)
+	if err != nil {
+		return err
+	}
+
+	f, err := os.Open(c.File)
+	if err != nil {
+		return fmt.Errorf("open input file: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "importing %s traffic from %s\n", imp.Name(), c.File)
+	}
+
+	requests, err := imp.Import(f)
+	if err != nil {
+		return fmt.Errorf("import failed: %w", err)
+	}
+
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "imported %d requests\n", len(requests))
+	}
+
+	return writeOutput(c.Output, func(w io.Writer) error {
+		return crawl.WriteCapture(w, requests)
+	})
 }
 
 // GenerateCmd generates API specifications from captured traffic.
@@ -172,10 +221,9 @@ const maxCaptureSize = 100 * 1024 * 1024
 
 // Run executes the generate command.
 func (c *GenerateCmd) Run() (err error) {
-	// Open capture file
 	f, err := os.Open(c.Capture)
 	if err != nil {
-		return fmt.Errorf("opening capture file: %w", err)
+		return fmt.Errorf("open capture file: %w", err)
 	}
 	defer func() {
 		if cerr := f.Close(); cerr != nil && err == nil {
@@ -192,77 +240,43 @@ func (c *GenerateCmd) Run() (err error) {
 		return fmt.Errorf("capture file too large: %d bytes (max %d)", info.Size(), maxCaptureSize)
 	}
 
-	// Read captured requests
 	requests, err := crawl.ReadCapture(f)
 	if err != nil {
-		return fmt.Errorf("reading capture file: %w", err)
+		return fmt.Errorf("read capture file: %w", err)
 	}
 
-	// TODO: Use classify.RunClassifiers() once classifier is implemented.
-	// For now, treat all captured requests as API calls.
-	classified := make([]classify.ClassifiedRequest, len(requests))
-	for i, req := range requests {
-		classified[i] = classify.ClassifiedRequest{
-			ObservedRequest: req,
-			IsAPI:           true,
-			Confidence:      c.Confidence,
-			APIType:         c.APIType,
-		}
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "loaded %d captured requests\n", len(requests))
 	}
 
-	// Infer output format from file extension
-	format := "yaml"
-	if c.Output != "" {
-		ext := strings.ToLower(filepath.Ext(c.Output))
-		if ext == ".json" {
-			format = "json"
-		}
-	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	// Generate spec
-	gen := &rest.OpenAPIGenerator{Format: format}
-	spec, err := gen.Generate(classified)
+	spec, err := generateSpec(ctx, requests, c.APIType, c.Confidence, c.Probe, c.Verbose)
 	if err != nil {
-		return fmt.Errorf("generating spec: %w", err)
+		return err
 	}
 
-	// Guard against empty spec (no endpoints found)
-	if len(spec) == 0 {
-		return fmt.Errorf("no API endpoints found in capture file")
-	}
-
-	// Write output
-	if c.Output != "" {
-		if err := os.WriteFile(c.Output, spec, 0600); err != nil {
-			return fmt.Errorf("writing output: %w", err)
-		}
-		if c.Verbose {
-			fmt.Fprintf(os.Stderr, "Wrote %s (%d bytes)\n", c.Output, len(spec))
-		}
-	} else {
-		fmt.Print(string(spec))
-	}
-
-	return nil
+	return writeOutput(c.Output, func(w io.Writer) error {
+		_, writeErr := w.Write(spec)
+		return writeErr
+	})
 }
 
 // ScanCmd runs the full pipeline: crawl, classify, and generate.
 type ScanCmd struct {
-	URL        string        `arg:"" help:"Target URL to scan"`
-	Header     []string      `short:"H" help:"Custom headers (repeatable)"`
-	Output     string        `short:"o" help:"Output file path"`
-	Depth      int           `default:"3" help:"Maximum crawl depth"`
-	MaxPages   int           `default:"100" help:"Maximum pages to crawl"`
-	Timeout    time.Duration `default:"30s" help:"Request timeout"`
-	Scope      string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
-	Headless   bool          `default:"true" help:"Use headless browser"`
-	Confidence float64       `default:"0.5" help:"Minimum confidence threshold"`
-	Probe      bool          `default:"true" help:"Enable endpoint probing"`
-	Verbose    bool          `short:"v" help:"Enable verbose logging"`
+	URL        string  `arg:"" help:"Target URL to scan"`
+	Confidence float64 `default:"0.5" help:"Minimum confidence threshold"`
+	Probe      bool    `default:"true" help:"Enable endpoint probing"`
+	CrawlOptions
 }
 
-// Run executes the scan command.
+// Run executes the scan command (crawl + generate pipeline).
 func (c *ScanCmd) Run() error {
+	if err := validateURL(c.URL); err != nil {
+		return err
+	}
+
 	opts := crawl.CrawlerOptions{
 		Depth:    c.Depth,
 		MaxPages: c.MaxPages,
@@ -270,20 +284,33 @@ func (c *ScanCmd) Run() error {
 		Scope:    c.Scope,
 		Headless: c.Headless,
 	}
-	requests, err := doCrawl(c.URL, c.Header, opts)
+
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "crawling %s (depth=%d, max-pages=%d, timeout=%s)\n",
+			c.URL, opts.Depth, opts.MaxPages, opts.Timeout)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	requests, err := doCrawl(ctx, c.URL, c.Header, opts)
 	if err != nil {
 		return err
 	}
 
-	classified := classify.Deduplicate(classify.RunClassifiers(
-		[]classify.APIClassifier{&classify.RESTClassifier{}},
-		requests, c.Confidence,
-	))
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests))
+		fmt.Fprintf(os.Stderr, "generating REST spec\n")
+	}
+
+	spec, err := generateSpec(ctx, requests, "rest", c.Confidence, c.Probe, c.Verbose)
+	if err != nil {
+		return err
+	}
 
 	return writeOutput(c.Output, func(w io.Writer) error {
-		encoder := json.NewEncoder(w)
-		encoder.SetIndent("", "  ")
-		return encoder.Encode(classified)
+		_, writeErr := w.Write(spec)
+		return writeErr
 	})
 }
 
@@ -292,7 +319,7 @@ type VersionCmd struct{}
 
 // Run executes the version command.
 func (c *VersionCmd) Run() error {
-	fmt.Println("vespasian version dev")
+	fmt.Printf("vespasian version %s\n", version)
 	return nil
 }
 
@@ -304,4 +331,68 @@ func main() {
 	)
 	err := ctx.Run()
 	ctx.FatalIfErrorf(err)
+}
+
+// generateSpec runs the classify → probe → generate pipeline.
+func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, apiType string, confidence float64, doProbe bool, verbose bool) ([]byte, error) {
+	classifiers := classifiersForType(apiType)
+	if classifiers == nil {
+		return nil, fmt.Errorf("unsupported API type: %q", apiType)
+	}
+	classified := classify.Deduplicate(classify.RunClassifiers(classifiers, requests, confidence))
+
+	if verbose {
+		fmt.Fprintf(os.Stderr, "classified %d API requests (threshold=%.2f)\n", len(classified), confidence)
+	}
+
+	if doProbe {
+		strategies := []probe.ProbeStrategy{
+			&probe.OptionsProbe{},
+			&probe.SchemaProbe{},
+		}
+		enriched, probeErrs := probe.RunStrategies(ctx, strategies, classified)
+		if verbose {
+			for _, e := range probeErrs {
+				fmt.Fprintf(os.Stderr, "probe warning: %v\n", e)
+			}
+		}
+		classified = enriched
+	}
+
+	gen, err := generate.Get(apiType)
+	if err != nil {
+		return nil, err
+	}
+
+	spec, err := gen.Generate(classified)
+	if err != nil {
+		return nil, fmt.Errorf("generate failed: %w", err)
+	}
+
+	return spec, nil
+}
+
+// classifiersForType returns the appropriate classifiers for the given API type.
+func classifiersForType(apiType string) []classify.APIClassifier {
+	switch apiType {
+	case "rest":
+		return []classify.APIClassifier{&classify.RESTClassifier{}}
+	default:
+		return nil
+	}
+}
+
+// validateURL checks that the given string is a valid URL with scheme and host.
+func validateURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL %q: %w", rawURL, err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("invalid URL %q: must include scheme and host (e.g., https://example.com)", rawURL)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("invalid URL %q: scheme must be http or https", rawURL)
+	}
+	return nil
 }
