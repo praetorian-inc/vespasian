@@ -30,4 +30,7 @@ type ClassifiedRequest struct {
 	// Probe-enriched fields (populated by pkg/probe strategies)
 	AllowedMethods []string               `json:"allowed_methods,omitempty"`
 	ResponseSchema map[string]interface{} `json:"response_schema,omitempty"`
+
+	// WSDLDocument holds a probed WSDL document for SOAP endpoints.
+	WSDLDocument []byte `json:"wsdl_document,omitempty"`
 }
