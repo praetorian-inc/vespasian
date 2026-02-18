@@ -14,18 +14,36 @@
 
 package importer
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
 
-// Get returns a TrafficImporter for the given format name.
+// registry maps format names to their importers for CLI lookup.
+var registry = map[string]TrafficImporter{
+	"burp":      &BurpImporter{},
+	"har":       &HARImporter{},
+	"mitmproxy": &MitmproxyImporter{},
+}
+
+// Get returns the importer for the given format name.
+// Returns an error if the format is not supported.
 func Get(format string) (TrafficImporter, error) {
-	switch format {
-	case "burp":
-		return &BurpImporter{}, nil
-	case "har":
-		return &HARImporter{}, nil
-	case "mitmproxy":
-		return &MitmproxyImporter{}, nil
-	default:
-		return nil, fmt.Errorf("unsupported import format: %q (supported: burp, har, mitmproxy)", format)
+	imp, ok := registry[format]
+	if !ok {
+		supported := SupportedFormats()
+		return nil, fmt.Errorf("unsupported import format: %s (supported: %s)", format, strings.Join(supported, ", "))
 	}
+	return imp, nil
+}
+
+// SupportedFormats returns a sorted list of all supported format names.
+func SupportedFormats() []string {
+	formats := make([]string, 0, len(registry))
+	for name := range registry {
+		formats = append(formats, name)
+	}
+	sort.Strings(formats)
+	return formats
 }

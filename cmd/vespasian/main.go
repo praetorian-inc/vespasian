@@ -172,7 +172,6 @@ type ImportCmd struct {
 	Format  string `arg:"" enum:"burp,har,mitmproxy" help:"Import format (burp, har, mitmproxy)"`
 	File    string `arg:"" help:"Input file path"`
 	Output  string `short:"o" help:"Output file path"`
-	Scope   string `optional:"" help:"Filter scope (optional: same-origin or same-domain)"`
 	Verbose bool   `short:"v" help:"Enable verbose logging"`
 }
 
@@ -183,7 +182,6 @@ func (c *ImportCmd) Run() error {
 		return err
 	}
 
-	// TODO(LAB-111): Apply io.LimitReader to imported files to prevent memory exhaustion (like ReadCapture does).
 	f, err := os.Open(c.File)
 	if err != nil {
 		return fmt.Errorf("open input file: %w", err)
@@ -198,8 +196,6 @@ func (c *ImportCmd) Run() error {
 	if err != nil {
 		return fmt.Errorf("import failed: %w", err)
 	}
-
-	// TODO(LAB-111): Validate URL schemes in imported data — reject file://, javascript://, etc. to prevent propagation through classify/probe pipeline.
 
 	if c.Verbose {
 		fmt.Fprintf(os.Stderr, "imported %d requests\n", len(requests))
@@ -220,13 +216,29 @@ type GenerateCmd struct {
 	Verbose    bool    `short:"v" help:"Enable verbose logging"`
 }
 
+// maxCaptureSize is the maximum capture file size (100MB).
+const maxCaptureSize = 100 * 1024 * 1024
+
 // Run executes the generate command.
-func (c *GenerateCmd) Run() error {
+func (c *GenerateCmd) Run() (err error) {
 	f, err := os.Open(c.Capture)
 	if err != nil {
 		return fmt.Errorf("open capture file: %w", err)
 	}
-	defer func() { _ = f.Close() }()
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("closing capture file: %w", cerr)
+		}
+	}()
+
+	// Guard against excessively large capture files.
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat capture file: %w", err)
+	}
+	if info.Size() > maxCaptureSize {
+		return fmt.Errorf("capture file too large: %d bytes (max %d)", info.Size(), maxCaptureSize)
+	}
 
 	requests, err := crawl.ReadCapture(f)
 	if err != nil {

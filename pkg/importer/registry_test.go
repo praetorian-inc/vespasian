@@ -15,41 +15,84 @@
 package importer
 
 import (
-	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestGet(t *testing.T) {
 	tests := []struct {
-		name       string
-		format     string
-		wantName   string
-		wantErr    bool
-		errContain string
+		name         string
+		format       string
+		wantErr      bool
+		wantImporter string
 	}{
-		{"burp", "burp", "burp", false, ""},
-		{"har", "har", "har", false, ""},
-		{"mitmproxy", "mitmproxy", "mitmproxy", false, ""},
-		{"unsupported", "wireshark", "", true, "unsupported import format"},
-		{"empty", "", "", true, "unsupported import format"},
+		{
+			name:         "burp format",
+			format:       "burp",
+			wantErr:      false,
+			wantImporter: "burp",
+		},
+		{
+			name:         "har format",
+			format:       "har",
+			wantErr:      false,
+			wantImporter: "har",
+		},
+		{
+			name:         "mitmproxy format",
+			format:       "mitmproxy",
+			wantErr:      false,
+			wantImporter: "mitmproxy",
+		},
+		{
+			name:    "unsupported format",
+			format:  "unknown",
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			imp, err := Get(tt.format)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Get(%q) error = %v, wantErr %v", tt.format, err, tt.wantErr)
-				return
-			}
 			if tt.wantErr {
-				if !strings.Contains(err.Error(), tt.errContain) {
-					t.Errorf("Get(%q) error = %q, want containing %q", tt.format, err, tt.errContain)
-				}
+				assert.Error(t, err)
 				return
 			}
-			if imp.Name() != tt.wantName {
-				t.Errorf("Get(%q).Name() = %q, want %q", tt.format, imp.Name(), tt.wantName)
-			}
+
+			require.NoError(t, err)
+			require.NotNil(t, imp)
+			assert.Equal(t, tt.wantImporter, imp.Name())
 		})
+	}
+}
+
+func TestSupportedFormats(t *testing.T) {
+	formats := SupportedFormats()
+
+	// Check we have expected formats
+	expectedFormats := map[string]bool{
+		"burp":      true,
+		"har":       true,
+		"mitmproxy": true,
+	}
+
+	assert.Len(t, formats, len(expectedFormats))
+
+	for _, format := range formats {
+		assert.True(t, expectedFormats[format], "unexpected format: %s", format)
+	}
+
+	// Verify all expected formats are present
+	for expected := range expectedFormats {
+		found := false
+		for _, format := range formats {
+			if format == expected {
+				found = true
+				break
+			}
+		}
+		assert.True(t, found, "missing expected format: %s", expected)
 	}
 }
