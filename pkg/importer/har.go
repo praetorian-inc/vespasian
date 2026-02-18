@@ -79,6 +79,11 @@ func (i *HARImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
 
 	var requests []crawl.ObservedRequest
 	for _, entry := range har.Log.Entries {
+		// Validate HTTP method for consistency with Burp importer
+		if !validHTTPMethods[entry.Request.Method] {
+			return nil, fmt.Errorf("har importer: invalid HTTP method: %s", entry.Request.Method)
+		}
+
 		respHeaders := convertHeaders(entry.Response.Headers)
 
 		// Convert request body only if non-empty

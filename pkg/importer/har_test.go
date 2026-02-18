@@ -411,3 +411,27 @@ func TestHARImporter_EmptyResponseContent(t *testing.T) {
 	req := requests[0]
 	assert.Nil(t, req.Response.Body)
 }
+
+func TestHARImporter_InvalidMethod(t *testing.T) {
+	json := `{
+		"log": {
+			"entries": [{
+				"request": {
+					"method": "INVALID",
+					"url": "https://example.com/api",
+					"headers": []
+				},
+				"response": {
+					"status": 200,
+					"headers": [],
+					"content": {}
+				}
+			}]
+		}
+	}`
+
+	h := &HARImporter{}
+	_, err := h.Import(strings.NewReader(json))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid HTTP method: INVALID")
+}

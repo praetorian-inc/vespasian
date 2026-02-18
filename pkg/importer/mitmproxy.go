@@ -159,6 +159,11 @@ func (i *MitmproxyImporter) parseFlow(flow mitmproxyFlow) (crawl.ObservedRequest
 		return crawl.ObservedRequest{}, fmt.Errorf("invalid port: %d (must be 0-65535)", flow.Request.Port)
 	}
 
+	// Validate HTTP method for consistency with Burp importer
+	if !validHTTPMethods[flow.Request.Method] {
+		return crawl.ObservedRequest{}, fmt.Errorf("invalid HTTP method: %s", flow.Request.Method)
+	}
+
 	// Construct URL
 	url := constructURL(flow.Request.Scheme, flow.Request.Host, flow.Request.Port, flow.Request.Path)
 

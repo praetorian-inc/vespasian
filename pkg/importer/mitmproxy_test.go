@@ -373,23 +373,6 @@ func TestMitmproxyImporter_InvalidPort(t *testing.T) {
 					"method": "GET",
 					"scheme": "https",
 					"host": "example.com",
-					"port": ` + strings.Replace(strings.Replace(`PORT`, "PORT", "", 1), "", fmt.Sprintf("%d", tt.port), 1) + `,
-					"path": "/api",
-					"headers": []
-				},
-				"response": {
-					"status_code": 200,
-					"headers": [],
-					"content": null
-				}
-			}`
-			// Build JSON with port value
-			json = strings.Replace(json, "PORT", "", 1)
-			json = `{
-				"request": {
-					"method": "GET",
-					"scheme": "https",
-					"host": "example.com",
 					"port": ` + fmt.Sprintf("%d", tt.port) + `,
 					"path": "/api",
 					"headers": []
@@ -509,15 +492,14 @@ func TestMitmproxyImporter_MalformedHeaders(t *testing.T) {
 }
 
 func TestMitmproxyImporter_ArrayParseError(t *testing.T) {
-	// Malformed array with invalid flow object
+	// Malformed array with invalid flow object (missing fields means empty method)
 	json := `[{"invalid": "structure"}]`
 
 	m := &MitmproxyImporter{}
-	requests, err := m.Import(strings.NewReader(json))
-	// This should succeed because the JSON is valid, just with missing fields
-	// The flow will have zero values for missing fields
-	require.NoError(t, err)
-	assert.Len(t, requests, 1)
+	_, err := m.Import(strings.NewReader(json))
+	// Empty method string is invalid per HTTP method validation
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid HTTP method")
 }
 
 func TestMitmproxyImporter_ValidPortBoundaries(t *testing.T) {
@@ -655,4 +637,27 @@ func TestMitmproxyImporter_InvalidRequestContent(t *testing.T) {
 	_, err := m.Import(strings.NewReader(json))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to decode request content")
+}
+
+func TestMitmproxyImporter_InvalidMethod(t *testing.T) {
+	json := `{
+		"request": {
+			"method": "INVALID",
+			"scheme": "https",
+			"host": "example.com",
+			"port": 443,
+			"path": "/api",
+			"headers": []
+		},
+		"response": {
+			"status_code": 200,
+			"headers": [],
+			"content": null
+		}
+	}`
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(strings.NewReader(json))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid HTTP method: INVALID")
 }
