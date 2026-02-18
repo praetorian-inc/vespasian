@@ -2,6 +2,7 @@ version: "2"
 linters:
   enable:
     - gocritic
+    - gosec
     - misspell
     - revive
   settings:

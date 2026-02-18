@@ -6,7 +6,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 .PHONY: build test lint fmt vet check coverage clean
 
 build:
-	go build -ldflags "-X main.version=$(VERSION)" -o $(BUILD_DIR)/$(BINARY) ./cmd/vespasian
+	go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BUILD_DIR)/$(BINARY) ./cmd/vespasian
 
 test:
 	go test -race ./...
@@ -27,4 +27,4 @@ coverage:
 	go tool cover -func=coverage.out
 
 clean:
-	rm -rf $(BUILD_DIR) dist
+	rm -rf $(BUILD_DIR) dist coverage.out

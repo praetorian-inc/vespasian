@@ -9,71 +9,82 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5  # v6.2.0
         with:
           go-version-file: go.mod
 
       - name: Build
-        run: go build ./...
+        run: go build -trimpath -ldflags "-s -w" ./...
 
   test:
     name: Test
     runs-on: ubuntu-latest
+    needs: [build]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5  # v6.2.0
         with:
           go-version-file: go.mod
 
       - name: Test
-        run: go test -race -coverprofile=coverage.out ./...
+        run: make coverage
 
       - name: Check coverage threshold
+        continue-on-error: true
         run: |
-          total=$(go tool cover -func=coverage.out | grep ^total: | awk '{print $3}' | tr -d '%')
-          echo "Total coverage: ${total}%"
-          threshold=80
-          if [ "$(echo "$total < $threshold" | bc -l)" -eq 1 ]; then
-            echo "Coverage ${total}% is below ${threshold}% threshold"
+          set -euo pipefail
+          total=$(go tool cover -func=coverage.out | grep '^total:' | awk '{print $3}' | tr -d '%')
+          if [ -z "$total" ]; then
+            echo "ERROR: could not parse coverage from coverage.out"
             exit 1
           fi
+          echo "Total coverage: ${total}%"
+          threshold=80
+          awk -v cov="$total" -v thr="$threshold" 'BEGIN { if (cov+0 < thr+0) { printf "FAIL: coverage %.1f%% < %d%% threshold\n", cov, thr; exit 1 } }'
 
       - name: Upload coverage
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
         with:
           name: coverage
           path: coverage.out
+          retention-days: 7
 
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    needs: [build]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5  # v6.2.0
         with:
           go-version-file: go.mod
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20  # v9.2.0
         with:
-          version: latest
+          version: v2.10.1
 
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    needs: [build]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5  # v6.2.0
         with:
           go-version-file: go.mod
 
