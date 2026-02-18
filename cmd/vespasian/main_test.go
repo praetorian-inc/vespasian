@@ -15,10 +15,14 @@
 package main
 
 import (
+	"context"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
 func TestValidateURL(t *testing.T) {
@@ -320,8 +324,10 @@ func TestCrawlCmdInvalidURL(t *testing.T) {
 
 func TestCrawlCmdInvalidHeader(t *testing.T) {
 	cmd := &CrawlCmd{
-		URL:    "https://example.com",
-		Header: []string{"no-colon-header"},
+		URL: "https://example.com",
+		CrawlOptions: CrawlOptions{
+			Header: []string{"no-colon-header"},
+		},
 	}
 	err := cmd.Run()
 	if err == nil {
@@ -357,4 +363,187 @@ func TestScanCmdInvalidURL(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for invalid URL")
 	}
+}
+
+// TestGenerateSpec tests the generateSpec pipeline with table-driven cases.
+func TestGenerateSpec(t *testing.T) {
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/api/users",
+			Headers: map[string]string{
+				"Content-Type": "application/json",
+			},
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+			},
+		},
+	}
+
+	tests := []struct {
+		name       string
+		apiType    string
+		probe      bool
+		verbose    bool
+		wantErrStr string
+	}{
+		{
+			name:       "rest with valid requests, probe disabled",
+			apiType:    "rest",
+			probe:      false,
+			wantErrStr: "not implemented",
+		},
+		{
+			name:       "unknown api type",
+			apiType:    "unknown",
+			probe:      false,
+			wantErrStr: "unsupported API type",
+		},
+		{
+			name:       "probe enabled hits not implemented",
+			apiType:    "rest",
+			probe:      true,
+			wantErrStr: "not implemented",
+		},
+		{
+			name:       "verbose logging",
+			apiType:    "rest",
+			probe:      false,
+			verbose:    true,
+			wantErrStr: "not implemented",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := generateSpec(context.Background(), requests, tt.apiType, 0.5, tt.probe, tt.verbose)
+			if err == nil {
+				t.Fatalf("generateSpec() expected error containing %q, got nil", tt.wantErrStr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErrStr) {
+				t.Errorf("generateSpec() error = %q, want error containing %q", err.Error(), tt.wantErrStr)
+			}
+		})
+	}
+}
+
+// TestGenerateSpec_EmptyRequests verifies generateSpec handles empty request slices.
+func TestGenerateSpec_EmptyRequests(t *testing.T) {
+	_, err := generateSpec(context.Background(), []crawl.ObservedRequest{}, "rest", 0.5, false, false)
+	if err == nil {
+		t.Fatal("generateSpec() expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "not implemented") {
+		t.Errorf("generateSpec() error = %q, want error containing \"not implemented\"", err.Error())
+	}
+}
+
+// TestGenerateCmdRun_ValidCapture writes a valid capture file and runs GenerateCmd.
+func TestGenerateCmdRun_ValidCapture(t *testing.T) {
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/api/users",
+			Headers: map[string]string{
+				"Content-Type": "application/json",
+			},
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+			},
+		},
+	}
+
+	// Write capture data to a temp file.
+	capturePath := filepath.Join(t.TempDir(), "capture.json")
+	f, err := os.Create(capturePath)
+	if err != nil {
+		t.Fatalf("failed to create temp capture file: %v", err)
+	}
+	if writeErr := crawl.WriteCapture(f, requests); writeErr != nil {
+		_ = f.Close()
+		t.Fatalf("failed to write capture: %v", writeErr)
+	}
+	_ = f.Close()
+
+	cmd := &GenerateCmd{
+		APIType: "rest",
+		Capture: capturePath,
+		Probe:   false,
+	}
+	err = cmd.Run()
+	if err == nil {
+		t.Fatal("GenerateCmd.Run() expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "not implemented") {
+		t.Errorf("GenerateCmd.Run() error = %q, want error containing \"not implemented\"", err.Error())
+	}
+}
+
+// TestImportCmdRun_ValidFile creates a temp file and runs ImportCmd with burp format.
+func TestImportCmdRun_ValidFile(t *testing.T) {
+	// Write some content to a temp file (burp importer is a stub).
+	tmpFile := filepath.Join(t.TempDir(), "burp-export.xml")
+	if writeErr := os.WriteFile(tmpFile, []byte("<burp></burp>"), 0600); writeErr != nil {
+		t.Fatalf("failed to write temp file: %v", writeErr)
+	}
+
+	cmd := &ImportCmd{
+		Format: "burp",
+		File:   tmpFile,
+	}
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("ImportCmd.Run() expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "not implemented") {
+		t.Errorf("ImportCmd.Run() error = %q, want error containing \"not implemented\"", err.Error())
+	}
+}
+
+// TestCrawlOptions_Embedded verifies that CrawlOptions fields are promoted into CrawlCmd and ScanCmd.
+func TestCrawlOptions_Embedded(t *testing.T) {
+	// Verify CrawlCmd can access embedded CrawlOptions fields directly.
+	c := &CrawlCmd{
+		URL: "https://example.com",
+		CrawlOptions: CrawlOptions{
+			Depth:    5,
+			MaxPages: 50,
+			Verbose:  true,
+		},
+	}
+	if c.Depth != 5 {
+		t.Errorf("CrawlCmd.Depth = %d, want 5", c.Depth)
+	}
+	if c.MaxPages != 50 {
+		t.Errorf("CrawlCmd.MaxPages = %d, want 50", c.MaxPages)
+	}
+	if !c.Verbose {
+		t.Error("CrawlCmd.Verbose = false, want true")
+	}
+
+	// Verify ScanCmd can access embedded CrawlOptions fields directly.
+	s := &ScanCmd{
+		URL: "https://example.com",
+		CrawlOptions: CrawlOptions{
+			Depth:    10,
+			Headless: true,
+		},
+	}
+	if s.Depth != 10 {
+		t.Errorf("ScanCmd.Depth = %d, want 10", s.Depth)
+	}
+	if !s.Headless {
+		t.Error("ScanCmd.Headless = false, want true")
+	}
+}
+
+// TestVersionVariable verifies the version variable is accessible and has a default.
+func TestVersionVariable(t *testing.T) {
+	if version == "" {
+		t.Error("version variable should not be empty")
+	}
+	// Default value is "dev" unless set via ldflags.
+	t.Logf("version = %q", version)
 }

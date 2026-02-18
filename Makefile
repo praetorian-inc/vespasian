@@ -1,11 +1,12 @@
 BINARY := vespasian
 MODULE := github.com/praetorian-inc/vespasian
 BUILD_DIR := bin
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 .PHONY: build test lint fmt vet check clean
 
 build:
-	go build -o $(BUILD_DIR)/$(BINARY) ./cmd/vespasian
+	go build -ldflags "-X main.version=$(VERSION)" -o $(BUILD_DIR)/$(BINARY) ./cmd/vespasian
 
 test:
 	go test -race ./...
