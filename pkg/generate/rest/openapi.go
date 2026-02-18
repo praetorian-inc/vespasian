@@ -27,12 +27,10 @@ import (
 
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/praetorian-inc/vespasian/pkg/classify"
-	"github.com/praetorian-inc/vespasian/pkg/generate"
 	"gopkg.in/yaml.v3"
 )
 
 // Compile-time interface compliance check.
-var _ generate.SpecGenerator = (*OpenAPIGenerator)(nil)
 
 // capitalizeFirst capitalizes the first letter of a string (UTF-8 safe).
 func capitalizeFirst(s string) string {

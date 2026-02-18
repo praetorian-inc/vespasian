@@ -350,9 +350,11 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, apiType
 			&probe.OptionsProbe{},
 			&probe.SchemaProbe{},
 		}
-		enriched, err := probe.RunStrategies(ctx, strategies, classified)
-		if err != nil {
-			return nil, fmt.Errorf("probe failed: %w", err)
+		enriched, probeErrs := probe.RunStrategies(ctx, strategies, classified)
+		if verbose {
+			for _, e := range probeErrs {
+				fmt.Fprintf(os.Stderr, "probe warning: %v\n", e)
+			}
 		}
 		classified = enriched
 	}

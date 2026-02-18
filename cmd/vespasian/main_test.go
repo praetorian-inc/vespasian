@@ -387,55 +387,66 @@ func TestGenerateSpec(t *testing.T) {
 		probe      bool
 		verbose    bool
 		wantErrStr string
+		wantErr    bool
 	}{
 		{
-			name:       "rest with valid requests, probe disabled",
-			apiType:    "rest",
-			probe:      false,
-			wantErrStr: "not implemented",
+			name:    "rest with valid requests, probe disabled",
+			apiType: "rest",
+			probe:   false,
+			wantErr: false,
 		},
 		{
 			name:       "unknown api type",
 			apiType:    "unknown",
 			probe:      false,
+			wantErr:    true,
 			wantErrStr: "unsupported API type",
 		},
 		{
-			name:       "probe enabled hits not implemented",
-			apiType:    "rest",
-			probe:      true,
-			wantErrStr: "not implemented",
+			name:    "probe enabled with real implementations",
+			apiType: "rest",
+			probe:   true,
+			wantErr: false,
 		},
 		{
-			name:       "verbose logging",
-			apiType:    "rest",
-			probe:      false,
-			verbose:    true,
-			wantErrStr: "not implemented",
+			name:    "verbose logging",
+			apiType: "rest",
+			probe:   false,
+			verbose: true,
+			wantErr: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := generateSpec(context.Background(), requests, tt.apiType, 0.5, tt.probe, tt.verbose)
-			if err == nil {
-				t.Fatalf("generateSpec() expected error containing %q, got nil", tt.wantErrStr)
-			}
-			if !strings.Contains(err.Error(), tt.wantErrStr) {
-				t.Errorf("generateSpec() error = %q, want error containing %q", err.Error(), tt.wantErrStr)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("generateSpec() expected error containing %q, got nil", tt.wantErrStr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErrStr) {
+					t.Errorf("generateSpec() error = %q, want error containing %q", err.Error(), tt.wantErrStr)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("generateSpec() unexpected error: %v", err)
+				}
 			}
 		})
 	}
 }
 
 // TestGenerateSpec_EmptyRequests verifies generateSpec handles empty request slices.
+// With real implementations, empty requests produce no classified endpoints,
+// so the generator returns nil spec with no error.
 func TestGenerateSpec_EmptyRequests(t *testing.T) {
-	_, err := generateSpec(context.Background(), []crawl.ObservedRequest{}, "rest", 0.5, false, false)
-	if err == nil {
-		t.Fatal("generateSpec() expected error, got nil")
+	spec, err := generateSpec(context.Background(), []crawl.ObservedRequest{}, "rest", 0.5, false, false)
+	if err != nil {
+		t.Fatalf("generateSpec() unexpected error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "not implemented") {
-		t.Errorf("generateSpec() error = %q, want error containing \"not implemented\"", err.Error())
+	// Empty input produces nil or empty spec — no endpoints found.
+	if len(spec) > 0 {
+		t.Logf("generateSpec() returned %d bytes for empty input", len(spec))
 	}
 }
 
@@ -473,17 +484,15 @@ func TestGenerateCmdRun_ValidCapture(t *testing.T) {
 		Probe:   false,
 	}
 	err = cmd.Run()
-	if err == nil {
-		t.Fatal("GenerateCmd.Run() expected error, got nil")
-	}
-	if !strings.Contains(err.Error(), "not implemented") {
-		t.Errorf("GenerateCmd.Run() error = %q, want error containing \"not implemented\"", err.Error())
+	if err != nil {
+		t.Errorf("GenerateCmd.Run() unexpected error: %v", err)
 	}
 }
 
 // TestImportCmdRun_ValidFile creates a temp file and runs ImportCmd with burp format.
+// The real burp importer expects valid Burp Suite XML with <items> root element.
 func TestImportCmdRun_ValidFile(t *testing.T) {
-	// Write some content to a temp file (burp importer is a stub).
+	// Write invalid Burp XML — real importer rejects <burp> root (expects <items>).
 	tmpFile := filepath.Join(t.TempDir(), "burp-export.xml")
 	if writeErr := os.WriteFile(tmpFile, []byte("<burp></burp>"), 0600); writeErr != nil {
 		t.Fatalf("failed to write temp file: %v", writeErr)
@@ -495,10 +504,25 @@ func TestImportCmdRun_ValidFile(t *testing.T) {
 	}
 	err := cmd.Run()
 	if err == nil {
-		t.Fatal("ImportCmd.Run() expected error, got nil")
+		t.Fatal("ImportCmd.Run() expected error for invalid Burp XML, got nil")
 	}
-	if !strings.Contains(err.Error(), "not implemented") {
-		t.Errorf("ImportCmd.Run() error = %q, want error containing \"not implemented\"", err.Error())
+	// Real burp importer rejects wrong root element.
+	if !strings.Contains(err.Error(), "import failed") {
+		t.Errorf("ImportCmd.Run() error = %q, want error containing \"import failed\"", err.Error())
+	}
+}
+
+// TestScanCmdInvalidHeader verifies that ScanCmd rejects invalid header format.
+func TestScanCmdInvalidHeader(t *testing.T) {
+	cmd := &ScanCmd{
+		URL: "https://example.com",
+		CrawlOptions: CrawlOptions{
+			Header: []string{"no-colon-header"},
+		},
+	}
+	err := cmd.Run()
+	if err == nil {
+		t.Error("expected error for invalid header")
 	}
 }
 
