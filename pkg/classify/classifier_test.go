@@ -290,3 +290,122 @@ func TestDeduplicate_Empty(t *testing.T) {
 	result := Deduplicate(nil)
 	assert.Empty(t, result)
 }
+
+func TestDeduplicate_PreservesDistinctSOAPActions(t *testing.T) {
+	classified := []ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "https://example.com/service",
+				Headers: map[string]string{"SOAPAction": `"urn:GetUser"`},
+			},
+			IsAPI: true, Confidence: 0.95, APIType: "wsdl",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "https://example.com/service",
+				Headers: map[string]string{"SOAPAction": `"urn:DeleteUser"`},
+			},
+			IsAPI: true, Confidence: 0.90, APIType: "wsdl",
+		},
+	}
+
+	result := Deduplicate(classified)
+	assert.Len(t, result, 2, "distinct SOAPActions on same URL must not be merged")
+}
+
+func TestDeduplicate_MergesSameSOAPAction(t *testing.T) {
+	classified := []ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "https://example.com/service?param=1",
+				Headers: map[string]string{"SOAPAction": `"urn:GetUser"`},
+			},
+			IsAPI: true, Confidence: 0.80, APIType: "wsdl",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "https://example.com/service?param=2",
+				Headers: map[string]string{"SOAPAction": `"urn:GetUser"`},
+			},
+			IsAPI: true, Confidence: 0.95, APIType: "wsdl",
+		},
+	}
+
+	result := Deduplicate(classified)
+	require.Len(t, result, 1, "same SOAPAction on same path should merge")
+	assert.InDelta(t, 0.95, result[0].Confidence, 0.001, "highest confidence kept")
+}
+
+func TestDeduplicate_SOAPActionCaseInsensitive(t *testing.T) {
+	classified := []ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "https://example.com/service",
+				Headers: map[string]string{"soapaction": `"urn:GetUser"`},
+			},
+			IsAPI: true, Confidence: 0.90, APIType: "wsdl",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "https://example.com/service",
+				Headers: map[string]string{"SOAPACTION": `"urn:GetUser"`},
+			},
+			IsAPI: true, Confidence: 0.85, APIType: "wsdl",
+		},
+	}
+
+	result := Deduplicate(classified)
+	assert.Len(t, result, 1, "case-insensitive SOAPAction should merge")
+}
+
+func TestDeduplicate_NonSOAPEndpointsStillDedupByPath(t *testing.T) {
+	classified := []ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{Method: "GET", URL: "https://example.com/api/users?page=1"},
+			IsAPI:           true, Confidence: 0.80, APIType: "rest",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "https://example.com/service",
+				Headers: map[string]string{"SOAPAction": `"urn:GetUser"`},
+			},
+			IsAPI: true, Confidence: 0.95, APIType: "wsdl",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{Method: "GET", URL: "https://example.com/api/users?page=2"},
+			IsAPI:           true, Confidence: 0.85, APIType: "rest",
+		},
+	}
+
+	result := Deduplicate(classified)
+	assert.Len(t, result, 2, "REST deduplicates by path, WSDL separate")
+}
+
+func TestRunClassifiers_WSDLWinsOverREST(t *testing.T) {
+	classifiers := []APIClassifier{
+		&RESTClassifier{},
+		&WSDLClassifier{},
+	}
+	requests := []crawl.ObservedRequest{{
+		Method:  "POST",
+		URL:     "https://example.com/service",
+		Headers: map[string]string{"SOAPAction": `"urn:GetUser"`},
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "text/xml",
+			Body:        []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><GetUser/></soap:Body></soap:Envelope>`),
+		},
+	}}
+
+	results := RunClassifiers(classifiers, requests, 0.5)
+	require.Len(t, results, 1)
+	assert.Equal(t, "wsdl", results[0].APIType, "WSDL should win for SOAP traffic")
+	assert.GreaterOrEqual(t, results[0].Confidence, 0.90)
+}

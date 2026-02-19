@@ -16,6 +16,7 @@ package classify
 
 import (
 	"net/url"
+	"strings"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
@@ -107,6 +108,12 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
 		// behavior for single-target scans.
 		key := req.Method + ":" + parsedURL.Path
 
+		// For SOAP endpoints, include SOAPAction in the dedup key so distinct
+		// operations on the same URL path are preserved.
+		if sa := getSoapAction(req.Headers); sa != "" {
+			key += ":" + sa
+		}
+
 		existing, found := seen[key]
 		if !found {
 			order = append(order, key)
@@ -138,4 +145,14 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
 		results = append(results, seen[key].req)
 	}
 	return results
+}
+
+// getSoapAction returns the SOAPAction header value, performing a case-insensitive lookup.
+func getSoapAction(headers map[string]string) string {
+	for k, v := range headers {
+		if strings.EqualFold(k, "soapaction") {
+			return strings.Trim(v, `"`)
+		}
+	}
+	return ""
 }

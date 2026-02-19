@@ -212,7 +212,7 @@ func (c *ImportCmd) Run() error {
 
 // GenerateCmd generates API specifications from captured traffic.
 type GenerateCmd struct {
-	APIType    string  `arg:"" enum:"rest" help:"API type to generate"`
+	APIType    string  `arg:"" enum:"rest,wsdl" help:"API type to generate"`
 	Capture    string  `arg:"" help:"Capture file path"`
 	Output     string  `short:"o" help:"Output file path"`
 	Confidence float64 `default:"0.5" help:"Minimum confidence threshold"`
@@ -350,9 +350,15 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, apiType
 	}
 
 	if doProbe {
-		strategies := []probe.ProbeStrategy{
-			&probe.OptionsProbe{},
-			&probe.SchemaProbe{},
+		var strategies []probe.ProbeStrategy
+		switch apiType {
+		case "wsdl":
+			strategies = []probe.ProbeStrategy{probe.NewWSDLProbe(probe.DefaultConfig())}
+		default:
+			strategies = []probe.ProbeStrategy{
+				&probe.OptionsProbe{},
+				&probe.SchemaProbe{},
+			}
 		}
 		enriched, probeErrs := probe.RunStrategies(ctx, strategies, classified)
 		if verbose {
@@ -381,6 +387,8 @@ func classifiersForType(apiType string) []classify.APIClassifier {
 	switch apiType {
 	case "rest":
 		return []classify.APIClassifier{&classify.RESTClassifier{}}
+	case "wsdl":
+		return []classify.APIClassifier{&classify.WSDLClassifier{}}
 	default:
 		return nil
 	}
