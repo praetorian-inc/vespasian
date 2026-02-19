@@ -39,7 +39,7 @@ func (g *Generator) DefaultExtension() string {
 // Phase 2: Fall back to inferring WSDL from observed traffic.
 func (g *Generator) Generate(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 	if len(endpoints) == 0 {
-		return nil, errors.New("wsdl generate: no endpoints provided")
+		return nil, errors.New("no endpoints provided")
 	}
 
 	// Phase 1: Use probed WSDLDocument or response body if it contains valid WSDL

@@ -38,25 +38,17 @@ func InferWSDL(endpoints []classify.ClassifiedRequest) (*Definitions, error) {
 
 	var operations []string
 	soapActions := make(map[string]string) // operation name -> SOAPAction URI
+	seen := make(map[string]bool)
 
 	for _, ep := range endpoints {
 		opName, soapAction := extractOperation(ep)
-		if opName == "" {
+		if opName == "" || seen[opName] {
 			continue
 		}
-		// Deduplicate
-		found := false
-		for _, existing := range operations {
-			if existing == opName {
-				found = true
-				break
-			}
-		}
-		if !found {
-			operations = append(operations, opName)
-			if soapAction != "" {
-				soapActions[opName] = soapAction
-			}
+		seen[opName] = true
+		operations = append(operations, opName)
+		if soapAction != "" {
+			soapActions[opName] = soapAction
 		}
 	}
 
@@ -170,12 +162,12 @@ func extractNameFromURI(uri string) string {
 	if strings.HasPrefix(uri, "urn:") {
 		return uri[4:]
 	}
-	// Handle URL-style: take last path segment
-	if idx := strings.LastIndex(uri, "/"); idx >= 0 && idx < len(uri)-1 {
+	// Handle fragment: http://example.com/ws#GetUser -> GetUser
+	if idx := strings.LastIndex(uri, "#"); idx >= 0 && idx < len(uri)-1 {
 		return uri[idx+1:]
 	}
-	// Handle fragment: #GetUser
-	if idx := strings.LastIndex(uri, "#"); idx >= 0 && idx < len(uri)-1 {
+	// Handle URL-style: take last path segment
+	if idx := strings.LastIndex(uri, "/"); idx >= 0 && idx < len(uri)-1 {
 		return uri[idx+1:]
 	}
 	return uri

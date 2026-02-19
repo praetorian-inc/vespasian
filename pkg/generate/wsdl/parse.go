@@ -38,8 +38,9 @@ func ParseWSDL(data []byte) (*Definitions, error) {
 }
 
 // charsetReader returns a reader that converts the named charset to UTF-8.
-// For ISO-8859-1/Latin-1, the bytes are already valid UTF-8 for the ASCII
-// range used in WSDL documents, so we pass through directly.
+// For ISO-8859-1/Latin-1, bytes 0-127 map directly to UTF-8. Bytes 128-255
+// are passed through unchanged, which is technically incorrect but sufficient
+// for WSDL element/attribute names that use only ASCII characters.
 func charsetReader(charset string, input io.Reader) (io.Reader, error) {
 	switch strings.ToLower(charset) {
 	case "iso-8859-1", "latin-1", "us-ascii", "ascii":

@@ -18,6 +18,7 @@ import (
 	"fmt"
 
 	"github.com/praetorian-inc/vespasian/pkg/generate/rest"
+	"github.com/praetorian-inc/vespasian/pkg/generate/wsdl"
 )
 
 // Get returns a SpecGenerator for the given API type.
@@ -25,7 +26,9 @@ func Get(apiType string) (SpecGenerator, error) {
 	switch apiType {
 	case "rest":
 		return &rest.OpenAPIGenerator{}, nil
+	case "wsdl":
+		return &wsdl.Generator{}, nil
 	default:
-		return nil, fmt.Errorf("unsupported API type: %q (supported: rest)", apiType)
+		return nil, fmt.Errorf("unsupported API type: %q (supported: rest, wsdl)", apiType)
 	}
 }

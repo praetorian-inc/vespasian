@@ -161,7 +161,7 @@ func TestExtractNameFromURI(t *testing.T) {
 	}{
 		{"urn:GetUser", "GetUser"},
 		{"http://example.com/ws/GetUser", "GetUser"},
-		{"http://example.com/ws#GetUser", "ws#GetUser"},
+		{"http://example.com/ws#GetUser", "GetUser"},
 		{`"urn:GetUser"`, "GetUser"},
 		{"GetUser", "GetUser"},
 		{"", ""},
