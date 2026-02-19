@@ -42,7 +42,6 @@ jobs:
         run: make coverage
 
       - name: Check coverage threshold
-        continue-on-error: true
         run: |
           set -euo pipefail
           total=$(go tool cover -func=coverage.out | grep '^total:' | awk '{print $3}' | tr -d '%')
@@ -90,7 +89,7 @@ jobs:
 
       - name: Check formatting
         run: |
-          unformatted=$(gofmt -l .)
+          unformatted=$(gofmt -s -l .)
           if [ -n "$unformatted" ]; then
             echo "Files not formatted:"
             echo "$unformatted"
