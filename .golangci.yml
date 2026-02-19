@@ -2,9 +2,16 @@ version: "2"
 linters:
   enable:
     - gocritic
+    - gocyclo
+    - gosec
     - misspell
     - revive
   settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    gocyclo:
+      min-complexity: 15
     misspell:
       locale: US
     revive:
@@ -14,6 +21,11 @@ linters:
             - checkPrivateReceivers
   exclusions:
     generated: lax
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocyclo
     paths:
       - third_party$
       - builtin$
@@ -21,6 +33,11 @@ linters:
 formatters:
   enable:
     - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/praetorian-inc/vespasian
   exclusions:
     generated: lax
     paths:

@@ -36,8 +36,12 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
 
-// version is set via -ldflags at build time.
-var version = "dev"
+// Build-time variables injected via ldflags.
+var (
+	version   = "dev"
+	gitCommit = "unknown"
+	buildDate = "unknown"
+)
 
 // CLI defines the complete command-line interface structure.
 var CLI struct {
@@ -319,7 +323,7 @@ type VersionCmd struct{}
 
 // Run executes the version command.
 func (c *VersionCmd) Run() error {
-	fmt.Printf("vespasian version %s\n", version)
+	fmt.Printf("vespasian %s (commit: %s, built: %s)\n", version, gitCommit, buildDate)
 	return nil
 }
 

@@ -5,6 +5,13 @@ builds:
     binary: vespasian
     env:
       - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.gitCommit={{.Commit}}
+      - -X main.buildDate={{.Date}}
     goos:
       - linux
       - darwin
@@ -18,6 +25,7 @@ archives:
 
 checksum:
   name_template: checksums.txt
+  algorithm: sha256
 
 changelog:
   sort: asc
