@@ -9,6 +9,9 @@ builds:
       - -trimpath
     ldflags:
       - -s -w
+      - -X main.version={{.Version}}
+      - -X main.gitCommit={{.Commit}}
+      - -X main.buildDate={{.Date}}
     goos:
       - linux
       - darwin
