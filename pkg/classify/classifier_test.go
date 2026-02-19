@@ -368,7 +368,7 @@ func TestDeduplicate_NonSOAPEndpointsStillDedupByPath(t *testing.T) {
 	classified := []ClassifiedRequest{
 		{
 			ObservedRequest: crawl.ObservedRequest{Method: "GET", URL: "https://example.com/api/users?page=1"},
-			IsAPI: true, Confidence: 0.80, APIType: "rest",
+			IsAPI:           true, Confidence: 0.80, APIType: "rest",
 		},
 		{
 			ObservedRequest: crawl.ObservedRequest{
@@ -380,7 +380,7 @@ func TestDeduplicate_NonSOAPEndpointsStillDedupByPath(t *testing.T) {
 		},
 		{
 			ObservedRequest: crawl.ObservedRequest{Method: "GET", URL: "https://example.com/api/users?page=2"},
-			IsAPI: true, Confidence: 0.85, APIType: "rest",
+			IsAPI:           true, Confidence: 0.85, APIType: "rest",
 		},
 	}
 
@@ -394,8 +394,8 @@ func TestRunClassifiers_WSDLWinsOverREST(t *testing.T) {
 		&WSDLClassifier{},
 	}
 	requests := []crawl.ObservedRequest{{
-		Method: "POST",
-		URL:    "https://example.com/service",
+		Method:  "POST",
+		URL:     "https://example.com/service",
 		Headers: map[string]string{"SOAPAction": `"urn:GetUser"`},
 		Response: crawl.ObservedResponse{
 			StatusCode:  200,

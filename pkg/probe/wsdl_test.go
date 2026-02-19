@@ -259,7 +259,7 @@ func TestWSDLProbe_RejectsNonWSDLXML(t *testing.T) {
 
 	endpoints := []classify.ClassifiedRequest{{
 		ObservedRequest: crawl.ObservedRequest{Method: "POST", URL: srv.URL + "/service"},
-		IsAPI: true, APIType: "wsdl",
+		IsAPI:           true, APIType: "wsdl",
 	}}
 
 	result, err := p.Probe(context.Background(), endpoints)
@@ -283,7 +283,7 @@ func TestWSDLProbe_DoesNotMutateInput(t *testing.T) {
 
 	original := []classify.ClassifiedRequest{{
 		ObservedRequest: crawl.ObservedRequest{Method: "POST", URL: srv.URL + "/service"},
-		IsAPI: true, APIType: "wsdl",
+		IsAPI:           true, APIType: "wsdl",
 	}}
 
 	result, err := p.Probe(context.Background(), original)
