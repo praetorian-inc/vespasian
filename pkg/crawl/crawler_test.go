@@ -15,6 +15,8 @@
 package crawl
 
 import (
+	"context"
+	"strings"
 	"testing"
 
 	"github.com/projectdiscovery/katana/pkg/navigation"
@@ -325,6 +327,34 @@ func TestNewCrawler(t *testing.T) {
 	}
 	if crawler.opts.Headers["User-Agent"] != "test" {
 		t.Errorf("crawler.opts.Headers[User-Agent] = %q, want %q", crawler.opts.Headers["User-Agent"], "test")
+	}
+}
+
+// TestCrawl_NegativeDepthReturnsError tests that negative depth is rejected
+func TestCrawl_NegativeDepthReturnsError(t *testing.T) {
+	crawler := NewCrawler(CrawlerOptions{
+		Depth: -1,
+	})
+	_, err := crawler.Crawl(context.Background(), "https://example.com")
+	if err == nil {
+		t.Fatal("expected error for negative depth, got nil")
+	}
+	if !strings.Contains(err.Error(), "depth must be non-negative") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// TestCrawl_EmptyURLReturnsError tests that empty URL is rejected
+func TestCrawl_EmptyURLReturnsError(t *testing.T) {
+	crawler := NewCrawler(CrawlerOptions{
+		Depth: 3,
+	})
+	_, err := crawler.Crawl(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected error for empty URL, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid target URL") {
+		t.Errorf("unexpected error message: %v", err)
 	}
 }
 

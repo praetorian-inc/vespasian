@@ -16,6 +16,7 @@ package crawl
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"sync"
 	"time"
@@ -59,6 +60,14 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 	maxPages := c.opts.MaxPages
 	if maxPages <= 0 {
 		maxPages = DefaultMaxPages
+	}
+
+	if c.opts.Depth < 0 {
+		return nil, fmt.Errorf("depth must be non-negative, got %d", c.opts.Depth)
+	}
+
+	if _, err := url.Parse(targetURL); err != nil || targetURL == "" {
+		return nil, fmt.Errorf("invalid target URL: %q", targetURL)
 	}
 
 	// Create a cancellable context to stop Katana when MaxPages is reached.
@@ -125,7 +134,9 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = engine.Close() }()
+	var closeOnce sync.Once
+	closeEngine := func() { closeOnce.Do(func() { _ = engine.Close() }) }
+	defer closeEngine()
 
 	// Run crawl in goroutine with context cancellation
 	crawlErr := make(chan error, 1)
@@ -142,7 +153,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		// Context canceled (MaxPages reached or SIGINT/SIGTERM).
 		// Close the engine to unblock the goroutine, then drain it
 		// to avoid a goroutine leak.
-		_ = engine.Close()
+		closeEngine()
 		<-crawlErr
 
 		// If the parent context was canceled (SIGINT/SIGTERM), propagate that error
