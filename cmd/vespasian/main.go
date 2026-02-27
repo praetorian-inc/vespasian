@@ -86,8 +86,8 @@ func doCrawl(ctx context.Context, targetURL string, rawHeaders []string, opts cr
 	crawler := crawl.NewCrawler(opts)
 	requests, err := crawler.Crawl(ctx, targetURL)
 	if err != nil {
-		if errors.Is(err, context.Canceled) && len(requests) > 0 {
-			// Graceful shutdown — return partial results.
+		if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && len(requests) > 0 {
+			// Graceful shutdown or timeout — return partial results.
 			return requests, nil
 		}
 		return nil, fmt.Errorf("crawl failed: %w", err)
