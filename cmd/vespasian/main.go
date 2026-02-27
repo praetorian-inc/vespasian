@@ -122,7 +122,7 @@ type CrawlOptions struct {
 	Output   string        `short:"o" help:"Output file path"`
 	Depth    int           `default:"3" help:"Maximum crawl depth"`
 	MaxPages int           `default:"100" help:"Maximum pages to crawl"`
-	Timeout  time.Duration `default:"30s" help:"Request timeout"`
+	Timeout  time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
 	Scope    string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
 	Headless bool          `default:"true" help:"Use headless browser"`
 	Verbose  bool          `short:"v" help:"Enable verbose logging"`
