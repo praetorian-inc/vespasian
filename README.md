@@ -126,7 +126,7 @@ vespasian scan <url> [flags]
   -o, --output       Output spec file (default: stdout)
   --depth            Max crawl depth (default: 3)
   --max-pages        Max pages to visit (default: 100)
-  --timeout          Maximum duration for the entire crawl (default: 10m)
+  --timeout          Maximum duration for the entire scan (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Browser mode (default: true)
   --confidence       Min classification confidence (default: 0.5)
