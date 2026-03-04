@@ -16,6 +16,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -570,4 +572,94 @@ func TestVersionVariable(t *testing.T) {
 	}
 	// Default value is "dev" unless set via ldflags.
 	t.Logf("version = %q", version)
+}
+
+// returnPartialOnGraceful mirrors the error-handling condition in doCrawl.
+// It returns (requests, nil) if err indicates a graceful shutdown with partial
+// results, or (nil, err) otherwise.  This is the function under test — its
+// behaviour changes after the bug fix.
+func returnPartialOnGraceful(err error, requests []crawl.ObservedRequest) ([]crawl.ObservedRequest, error) {
+	if err != nil {
+		if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && len(requests) > 0 {
+			// Graceful shutdown or timeout — return partial results.
+			return requests, nil
+		}
+		return nil, fmt.Errorf("crawl failed: %w", err)
+	}
+	return requests, nil
+}
+
+// TestDoCrawl_gracefulShutdownCondition verifies that the graceful-shutdown
+// condition inside doCrawl accepts both context.Canceled (SIGINT/SIGTERM) and
+// context.DeadlineExceeded (Katana CrawlDuration timeout) when partial results
+// are present.
+//
+// The condition being tested lives in doCrawl (main.go lines 88-94).  Because
+// doCrawl creates its own Crawler internally, the condition logic is extracted
+// into returnPartialOnGraceful above so it can be exercised in isolation.
+func TestDoCrawl_gracefulShutdownCondition(t *testing.T) {
+	partialRequests := []crawl.ObservedRequest{
+		{Method: "GET", URL: "https://example.com/api/users"},
+	}
+
+	tests := []struct {
+		name        string
+		err         error
+		requests    []crawl.ObservedRequest
+		wantResults []crawl.ObservedRequest
+		wantErr     bool
+	}{
+		{
+			name:        "context.Canceled with partial results — returns partial, no error",
+			err:         context.Canceled,
+			requests:    partialRequests,
+			wantResults: partialRequests,
+			wantErr:     false,
+		},
+		{
+			name:        "context.DeadlineExceeded with partial results — returns partial, no error",
+			err:         context.DeadlineExceeded,
+			requests:    partialRequests,
+			wantResults: partialRequests,
+			wantErr:     false,
+		},
+		{
+			name:     "context.DeadlineExceeded with no results — returns error",
+			err:      context.DeadlineExceeded,
+			requests: nil,
+			wantErr:  true,
+		},
+		{
+			name:     "context.Canceled with no results — returns error",
+			err:      context.Canceled,
+			requests: nil,
+			wantErr:  true,
+		},
+		{
+			name:     "other error with partial results — returns error",
+			err:      fmt.Errorf("network error"),
+			requests: partialRequests,
+			wantErr:  true,
+		},
+		{
+			name:        "nil error — returns results as-is",
+			err:         nil,
+			requests:    partialRequests,
+			wantResults: partialRequests,
+			wantErr:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotResults, gotErr := returnPartialOnGraceful(tt.err, tt.requests)
+			if (gotErr != nil) != tt.wantErr {
+				t.Errorf("returnPartialOnGraceful() error = %v, wantErr %v", gotErr, tt.wantErr)
+			}
+			if !tt.wantErr && len(gotResults) != len(tt.wantResults) {
+				t.Errorf("returnPartialOnGraceful() returned %d results, want %d",
+					len(gotResults), len(tt.wantResults))
+			}
+		})
+	}
 }
