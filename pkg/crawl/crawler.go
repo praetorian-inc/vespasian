@@ -32,6 +32,10 @@ const (
 	DefaultMaxPages = 1000
 	// MaxResponseBodySize is the maximum response body size to retain for classification (1 MB).
 	MaxResponseBodySize = 1 * 1024 * 1024
+	// PageTimeout is the per-page timeout in seconds for go-rod and HTTP requests.
+	// This is an internal constant, not user-configurable — it prevents a single
+	// unresponsive page from blocking the sequential headless crawl.
+	PageTimeout = 30
 )
 
 // CrawlerOptions configures the crawler behavior.
@@ -73,7 +77,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 	// Build Katana options
 	katanaOpts := &types.Options{
 		MaxDepth:          c.opts.Depth,
-		Timeout:           int(c.opts.Timeout.Seconds()),
+		Timeout:           PageTimeout,
 		CrawlDuration:     c.opts.Timeout,
 		FieldScope:        MapScope(c.opts.Scope),
 		Headless:          c.opts.Headless,

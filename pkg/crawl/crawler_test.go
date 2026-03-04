@@ -343,6 +343,13 @@ func TestMaxResponseBodySize(t *testing.T) {
 	}
 }
 
+
+// TestPageTimeout verifies the PageTimeout constant value
+func TestPageTimeout(t *testing.T) {
+	if PageTimeout != 30 {
+		t.Errorf("PageTimeout = %d, want 30", PageTimeout)
+	}
+}
 // TestMapResult_TruncatesLargeResponseBody tests that response bodies exceeding MaxResponseBodySize get truncated
 func TestMapResult_TruncatesLargeResponseBody(t *testing.T) {
 	largeBody := make([]byte, MaxResponseBodySize+1000) // 1000 bytes over limit
