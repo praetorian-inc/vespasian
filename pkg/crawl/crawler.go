@@ -66,7 +66,8 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		return nil, fmt.Errorf("depth must be non-negative, got %d", c.opts.Depth)
 	}
 
-	if _, err := url.Parse(targetURL); err != nil || targetURL == "" {
+	u, err := url.Parse(targetURL)
+	if err != nil || targetURL == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return nil, fmt.Errorf("invalid target URL: %q", targetURL)
 	}
 

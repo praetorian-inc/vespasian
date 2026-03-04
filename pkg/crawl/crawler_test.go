@@ -17,6 +17,7 @@ package crawl
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/projectdiscovery/katana/pkg/navigation"
@@ -355,6 +356,37 @@ func TestCrawl_EmptyURLReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid target URL") {
 		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// TestCrawl_SchemelessURLReturnsError tests that URLs without http/https scheme are rejected
+func TestCrawl_SchemelessURLReturnsError(t *testing.T) {
+	crawler := NewCrawler(CrawlerOptions{
+		Depth: 3,
+	})
+	_, err := crawler.Crawl(context.Background(), "not-a-url")
+	if err == nil {
+		t.Fatal("expected error for schemeless URL, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid target URL") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// TestCloseEngineOnce verifies the sync.Once wrapper prevents double-close.
+// This mirrors the closeEngine pattern in Crawl (crawler.go lines 143-145)
+// where engine.Close() can be called both explicitly on context cancellation
+// and via defer.
+func TestCloseEngineOnce(t *testing.T) {
+	var count int
+	var once sync.Once
+	closeEngine := func() { once.Do(func() { count++ }) }
+
+	closeEngine()
+	closeEngine()
+
+	if count != 1 {
+		t.Errorf("close called %d times, want 1", count)
 	}
 }
 
