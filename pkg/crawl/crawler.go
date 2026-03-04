@@ -83,6 +83,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		Concurrency:       10,
 		Parallelism:       10,
 		RateLimit:         150,
+		TimeStable:        3, // seconds to wait for DOM stability; 0 causes go-rod panic in time.NewTicker
 		ScrapeJSResponses: true,
 		XhrExtraction:     true,
 		Silent:            true,
