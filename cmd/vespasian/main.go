@@ -17,6 +17,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -50,6 +52,47 @@ var CLI struct {
 	Generate GenerateCmd `cmd:"" help:"Generate API specifications from captured traffic"`
 	Scan     ScanCmd     `cmd:"" help:"Full pipeline: crawl, classify, and generate specs"`
 	Version  VersionCmd  `cmd:"" help:"Show version information"`
+}
+
+// RequestIDHeader is the header name used for crawl session traceability.
+const RequestIDHeader = "X-Vespasian-Request-Id"
+
+// generateRequestID produces a 32-character hex string from 16 random bytes.
+func generateRequestID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate request ID: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// headerExistsCaseInsensitive checks whether a header name exists in the map
+// using a case-insensitive comparison, per RFC 7230.
+func headerExistsCaseInsensitive(headers map[string]string, name string) bool {
+	for k := range headers {
+		if strings.EqualFold(k, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// injectRequestID adds an auto-generated X-Vespasian-Request-Id header to the
+// map unless disabled or the user already supplied one via -H. Returns the
+// generated ID (empty if skipped or user-supplied).
+func injectRequestID(headers map[string]string, disabled bool) (string, error) {
+	if disabled {
+		return "", nil
+	}
+	if headerExistsCaseInsensitive(headers, RequestIDHeader) {
+		return "", nil
+	}
+	id, err := generateRequestID()
+	if err != nil {
+		return "", err
+	}
+	headers[RequestIDHeader] = id
+	return id, nil
 }
 
 // parseHeaders converts "Key: Value" strings to a map, validating header names
@@ -226,8 +269,9 @@ type CrawlOptions struct {
 	Timeout  time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
 	Scope    string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
 	Headless bool          `default:"true" help:"Use headless browser"`
-	Proxy    string        `help:"Proxy address for headless browser (e.g., http://127.0.0.1:8080). Note: TLS certificate verification is disabled during crawls."`
-	Verbose  bool          `short:"v" help:"Enable verbose logging"`
+	Proxy       string        `help:"Proxy address for headless browser (e.g., http://127.0.0.1:8080). Note: TLS certificate verification is disabled during crawls."`
+	NoRequestID bool          `name:"no-request-id" help:"Disable automatic X-Vespasian-Request-Id header"`
+	Verbose     bool          `short:"v" help:"Enable verbose logging"`
 }
 
 // setupForceExitHandler spawns a goroutine that waits for the first signal
@@ -270,23 +314,30 @@ func onForceExit(stderr io.Writer, cleanup func(), exitFn func(int)) {
 
 // browserSetupResult holds the resources created by setupBrowserAndSignals.
 type browserSetupResult struct {
-	opts    crawl.CrawlerOptions
-	ctx     context.Context
-	cleanup func() // caller must defer this
+	opts      crawl.CrawlerOptions
+	ctx       context.Context
+	cleanup   func() // caller must defer this
+	requestID string // auto-generated session ID; empty if disabled or user-supplied
 }
 
-// setupBrowserAndSignals validates headers, creates a BrowserManager (if
-// headless), wires up signal handling with force-exit support, and returns a
-// cancellable context. Headers are validated before launching Chrome so that
-// invalid headers fail fast without wasting browser startup time. The returned
-// cleanup function closes the browser and stops the signal handler; callers
-// must defer it.
+// setupBrowserAndSignals validates headers, injects the request ID header (if
+// enabled), creates a BrowserManager (if headless), wires up signal handling
+// with force-exit support, and returns a cancellable context. Headers are
+// validated before launching Chrome so that invalid headers fail fast without
+// wasting browser startup time. The returned cleanup function closes the
+// browser and stops the signal handler; callers must defer it.
 func setupBrowserAndSignals(rawHeaders []string, crawlOpts CrawlOptions, extraOpts crawl.CrawlerOptions) (browserSetupResult, error) {
 	// Validate headers before launching Chrome — fail fast on invalid input.
 	headers, err := parseHeaders(rawHeaders)
 	if err != nil {
 		return browserSetupResult{}, fmt.Errorf("invalid header: %w", err)
 	}
+
+	requestID, err := injectRequestID(headers, crawlOpts.NoRequestID)
+	if err != nil {
+		return browserSetupResult{}, err
+	}
+
 	extraOpts.Headers = headers
 
 	var browserMgr *crawl.BrowserManager
@@ -319,9 +370,10 @@ func setupBrowserAndSignals(rawHeaders []string, crawlOpts CrawlOptions, extraOp
 	}
 
 	return browserSetupResult{
-		opts:    extraOpts,
-		ctx:     ctx,
-		cleanup: cleanup,
+		opts:      extraOpts,
+		ctx:       ctx,
+		cleanup:   cleanup,
+		requestID: requestID,
 	}, nil
 }
 
@@ -362,6 +414,9 @@ func (c *CrawlCmd) Run() error {
 	}
 
 	if c.Verbose {
+		if bs.requestID != "" {
+			fmt.Fprintf(os.Stderr, "request-id: %s\n", bs.requestID)
+		}
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests))
 	}
 
@@ -504,6 +559,9 @@ func (c *ScanCmd) Run() error {
 	}
 
 	if c.Verbose {
+		if bs.requestID != "" {
+			fmt.Fprintf(os.Stderr, "request-id: %s\n", bs.requestID)
+		}
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests))
 		fmt.Fprintf(os.Stderr, "generating REST spec\n")
 	}
