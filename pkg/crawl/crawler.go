@@ -184,7 +184,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			// Signal received (SIGINT/SIGTERM or programmatic cancel).
 			// Notify the user immediately before any cleanup.
 			if c.opts.Stderr != nil {
-				fmt.Fprintf(c.opts.Stderr, "interrupt received, stopping crawl...\n")
+				fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n")
 			}
 
 			// Kill Chrome immediately to stop all outbound requests.
