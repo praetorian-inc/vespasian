@@ -15,6 +15,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -576,12 +577,12 @@ func TestVersionVariable(t *testing.T) {
 
 // returnPartialOnGraceful mirrors the error-handling condition in doCrawl.
 // It returns (requests, nil) if err indicates a graceful shutdown with partial
-// results, or (nil, err) otherwise.  This is the function under test — its
-// behaviour changes after the bug fix.
-func returnPartialOnGraceful(err error, requests []crawl.ObservedRequest) ([]crawl.ObservedRequest, error) {
+// results, or (nil, err) otherwise.  The stderr writer receives the interrupt
+// message when partial results are returned.
+func returnPartialOnGraceful(stderr io.Writer, err error, requests []crawl.ObservedRequest) ([]crawl.ObservedRequest, error) {
 	if err != nil {
 		if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && len(requests) > 0 {
-			// Graceful shutdown or timeout — return partial results.
+			fmt.Fprintf(stderr, "interrupt received, returning %d partial results\n", len(requests))
 			return requests, nil
 		}
 		return nil, fmt.Errorf("crawl failed: %w", err)
@@ -594,7 +595,7 @@ func returnPartialOnGraceful(err error, requests []crawl.ObservedRequest) ([]cra
 // context.DeadlineExceeded (Katana CrawlDuration timeout) when partial results
 // are present.
 //
-// The condition being tested lives in doCrawl (main.go lines 88-94).  Because
+// The condition being tested lives in doCrawl (main.go lines 88-97).  Because
 // doCrawl creates its own Crawler internally, the condition logic is extracted
 // into returnPartialOnGraceful above so it can be exercised in isolation.
 func TestDoCrawl_gracefulShutdownCondition(t *testing.T) {
@@ -608,6 +609,7 @@ func TestDoCrawl_gracefulShutdownCondition(t *testing.T) {
 		requests    []crawl.ObservedRequest
 		wantResults []crawl.ObservedRequest
 		wantErr     bool
+		wantStderr  string
 	}{
 		{
 			name:        "context.Canceled with partial results — returns partial, no error",
@@ -615,6 +617,7 @@ func TestDoCrawl_gracefulShutdownCondition(t *testing.T) {
 			requests:    partialRequests,
 			wantResults: partialRequests,
 			wantErr:     false,
+			wantStderr:  "interrupt received, returning 1 partial results\n",
 		},
 		{
 			name:        "context.DeadlineExceeded with partial results — returns partial, no error",
@@ -622,6 +625,7 @@ func TestDoCrawl_gracefulShutdownCondition(t *testing.T) {
 			requests:    partialRequests,
 			wantResults: partialRequests,
 			wantErr:     false,
+			wantStderr:  "interrupt received, returning 1 partial results\n",
 		},
 		{
 			name:     "context.DeadlineExceeded with no results — returns error",
@@ -652,13 +656,20 @@ func TestDoCrawl_gracefulShutdownCondition(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotResults, gotErr := returnPartialOnGraceful(tt.err, tt.requests)
+			var buf bytes.Buffer
+			gotResults, gotErr := returnPartialOnGraceful(&buf, tt.err, tt.requests)
 			if (gotErr != nil) != tt.wantErr {
 				t.Errorf("returnPartialOnGraceful() error = %v, wantErr %v", gotErr, tt.wantErr)
 			}
 			if !tt.wantErr && len(gotResults) != len(tt.wantResults) {
 				t.Errorf("returnPartialOnGraceful() returned %d results, want %d",
 					len(gotResults), len(tt.wantResults))
+			}
+			if tt.wantStderr != "" && buf.String() != tt.wantStderr {
+				t.Errorf("stderr = %q, want %q", buf.String(), tt.wantStderr)
+			}
+			if tt.wantStderr == "" && buf.Len() > 0 {
+				t.Errorf("unexpected stderr output: %q", buf.String())
 			}
 		})
 	}

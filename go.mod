@@ -7,6 +7,7 @@ toolchain go1.24.13
 require (
 	github.com/alecthomas/kong v1.14.0
 	github.com/getkin/kin-openapi v0.133.0
+	github.com/go-rod/rod v0.116.2
 	github.com/projectdiscovery/goflags v0.1.74
 	github.com/projectdiscovery/katana v1.4.0
 	github.com/stretchr/testify v1.11.1
@@ -40,7 +41,6 @@ require (
 	github.com/gaissmai/bart v0.26.0 // indirect
 	github.com/go-openapi/jsonpointer v0.21.0 // indirect
 	github.com/go-openapi/swag v0.23.0 // indirect
-	github.com/go-rod/rod v0.116.2 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
 	github.com/gorilla/css v1.0.1 // indirect

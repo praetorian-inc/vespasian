@@ -76,7 +76,9 @@ func parseHeaders(raw []string) (map[string]string, error) {
 // doCrawl executes the common crawl pipeline: parse headers, create crawler,
 // run the crawl with the provided context, and return the results. On graceful
 // shutdown (SIGINT/SIGTERM) partial results are returned instead of an error.
-func doCrawl(ctx context.Context, targetURL string, rawHeaders []string, opts crawl.CrawlerOptions) ([]crawl.ObservedRequest, error) {
+// The stderr parameter controls where user-facing status messages are written,
+// allowing tests to capture output.
+func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, rawHeaders []string, opts crawl.CrawlerOptions) ([]crawl.ObservedRequest, error) {
 	headers, err := parseHeaders(rawHeaders)
 	if err != nil {
 		return nil, fmt.Errorf("invalid header: %w", err)
@@ -87,7 +89,7 @@ func doCrawl(ctx context.Context, targetURL string, rawHeaders []string, opts cr
 	requests, err := crawler.Crawl(ctx, targetURL)
 	if err != nil {
 		if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && len(requests) > 0 {
-			// Graceful shutdown or timeout — return partial results.
+			fmt.Fprintf(stderr, "interrupt received, returning %d partial results\n", len(requests))
 			return requests, nil
 		}
 		return nil, fmt.Errorf("crawl failed: %w", err)
@@ -128,6 +130,19 @@ type CrawlOptions struct {
 	Verbose  bool          `short:"v" help:"Enable verbose logging"`
 }
 
+// setupForceExitHandler spawns a goroutine that listens for a second
+// SIGINT/SIGTERM and force-exits the process. The first signal is consumed
+// by signal.NotifyContext; this catches the second one.
+func setupForceExitHandler() {
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		<-sigCh
+		fmt.Fprintf(os.Stderr, "forcing immediate exit\n")
+		os.Exit(1)
+	}()
+}
+
 // CrawlCmd crawls a web application to capture HTTP traffic.
 type CrawlCmd struct {
 	URL    string `arg:"" help:"Target URL to crawl"`
@@ -157,7 +172,9 @@ func (c *CrawlCmd) Run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	requests, err := doCrawl(ctx, c.URL, c.Header, opts)
+	setupForceExitHandler()
+
+	requests, err := doCrawl(ctx, os.Stderr, c.URL, c.Header, opts)
 	if err != nil {
 		return err
 	}
@@ -297,7 +314,9 @@ func (c *ScanCmd) Run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	requests, err := doCrawl(ctx, c.URL, c.Header, opts)
+	setupForceExitHandler()
+
+	requests, err := doCrawl(ctx, os.Stderr, c.URL, c.Header, opts)
 	if err != nil {
 		return err
 	}

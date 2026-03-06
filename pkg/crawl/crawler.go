@@ -16,6 +16,7 @@ package crawl
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"sync"
 	"time"
@@ -36,6 +37,10 @@ const (
 	// This is an internal constant, not user-configurable — it prevents a single
 	// unresponsive page from blocking the sequential headless crawl.
 	PageTimeout = 30
+	// ShutdownGracePeriod is the bounded wait after killing Chrome for Katana's
+	// internal result buffer to drain. Chrome is dead at this point — no network
+	// activity — we're just collecting already-buffered results.
+	ShutdownGracePeriod = 2 * time.Second
 )
 
 // CrawlerOptions configures the crawler behavior.
@@ -63,6 +68,27 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 	maxPages := c.opts.MaxPages
 	if maxPages <= 0 {
 		maxPages = DefaultMaxPages
+	}
+
+	if c.opts.Depth < 0 {
+		return nil, fmt.Errorf("depth must be non-negative, got %d", c.opts.Depth)
+	}
+
+	u, err := url.Parse(targetURL)
+	if err != nil || targetURL == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return nil, fmt.Errorf("invalid target URL: %q", targetURL)
+	}
+
+	// Launch Chrome under vespasian's control when in headless mode.
+	// This lets us kill the browser immediately on signal, stopping all
+	// outbound requests — Katana's internal context is disconnected from ours.
+	var browserMgr *BrowserManager
+	if c.opts.Headless {
+		browserMgr, err = NewBrowserManager(BrowserOptions{Headless: true})
+		if err != nil {
+			return nil, fmt.Errorf("launch browser: %w", err)
+		}
+		defer browserMgr.Close()
 	}
 
 	// Create a cancellable context to stop Katana when MaxPages is reached.
@@ -109,6 +135,12 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		},
 	}
 
+	// When vespasian owns the browser, pass the WS URL to Katana so it
+	// connects to our Chrome instance instead of launching its own.
+	if browserMgr != nil {
+		katanaOpts.ChromeWSUrl = browserMgr.WSURL()
+	}
+
 	// Initialize crawler options
 	crawlerOpts, err := types.NewCrawlerOptions(katanaOpts)
 	if err != nil {
@@ -144,18 +176,34 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			return results, err
 		}
 	case <-crawlCtx.Done():
-		// Context canceled (MaxPages reached or SIGINT/SIGTERM).
-		// Close the engine to unblock the goroutine, then drain it
-		// to avoid a goroutine leak.
-		_ = engine.Close()
-		<-crawlErr
-
-		// If the parent context was canceled (SIGINT/SIGTERM), propagate that error
-		// so the caller can decide whether to save partial results.
+		// crawlCtx fires for both MaxPages (crawlCancel in OnResult) and
+		// signal (parent ctx canceled). Check which case we're in.
 		if ctx.Err() != nil {
+			// Signal received (SIGINT/SIGTERM or programmatic cancel).
+			// Kill Chrome immediately to stop all outbound requests.
+			if browserMgr != nil {
+				browserMgr.Kill()
+			}
+
+			// Bounded wait: drain Katana's internal result buffer.
+			// Chrome is dead — no network activity — we're just collecting
+			// already-buffered results.
+			timer := time.NewTimer(ShutdownGracePeriod)
+			defer timer.Stop()
+			select {
+			case <-crawlErr:
+				// Crawl goroutine exited cleanly.
+			case <-timer.C:
+				// Goroutine leaked but Chrome is dead — no network activity.
+			}
+
+			_ = engine.Close()
 			return results, ctx.Err()
 		}
-		// MaxPages reached — not an error.
+
+		// MaxPages reached — close engine and drain goroutine.
+		_ = engine.Close()
+		<-crawlErr
 	}
 
 	return results, nil
