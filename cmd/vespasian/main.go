@@ -84,12 +84,13 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, rawHeaders
 		return nil, fmt.Errorf("invalid header: %w", err)
 	}
 	opts.Headers = headers
+	opts.Stderr = stderr
 
 	crawler := crawl.NewCrawler(opts)
 	requests, err := crawler.Crawl(ctx, targetURL)
 	if err != nil {
 		if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && len(requests) > 0 {
-			fmt.Fprintf(stderr, "interrupt received, returning %d partial results\n", len(requests))
+			fmt.Fprintf(stderr, "returning %d partial results\n", len(requests))
 			return requests, nil
 		}
 		return nil, fmt.Errorf("crawl failed: %w", err)

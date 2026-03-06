@@ -17,6 +17,7 @@ package crawl
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/url"
 	"sync"
 	"time"
@@ -51,6 +52,7 @@ type CrawlerOptions struct {
 	Scope    string
 	Headless bool
 	Headers  map[string]string
+	Stderr   io.Writer // user-facing status messages; nil disables output
 }
 
 // Crawler performs web crawling to capture HTTP traffic.
@@ -180,6 +182,11 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		// signal (parent ctx canceled). Check which case we're in.
 		if ctx.Err() != nil {
 			// Signal received (SIGINT/SIGTERM or programmatic cancel).
+			// Notify the user immediately before any cleanup.
+			if c.opts.Stderr != nil {
+				fmt.Fprintf(c.opts.Stderr, "interrupt received, stopping crawl...\n")
+			}
+
 			// Kill Chrome immediately to stop all outbound requests.
 			if browserMgr != nil {
 				browserMgr.Kill()
