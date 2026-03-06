@@ -56,6 +56,7 @@ type CrawlerOptions struct {
 	Scope    string
 	Headless bool
 	Headers  map[string]string
+	Proxy    string    // optional: proxy address for Chrome (e.g., "http://127.0.0.1:8080")
 	Stderr   io.Writer // user-facing status messages; nil disables output
 
 	// BrowserMgr provides a caller-owned Chrome instance. When set, Crawl()
@@ -101,7 +102,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		browserMgr = c.opts.BrowserMgr
 		// Caller owns lifecycle — don't defer Close here.
 	} else if c.opts.Headless {
-		browserMgr, err = NewBrowserManager(BrowserOptions{Headless: true})
+		browserMgr, err = NewBrowserManager(BrowserOptions{Headless: true, Proxy: c.opts.Proxy})
 		if err != nil {
 			return nil, fmt.Errorf("launch browser: %w", err)
 		}

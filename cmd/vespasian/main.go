@@ -207,6 +207,7 @@ type CrawlOptions struct {
 	Timeout  time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
 	Scope    string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
 	Headless bool          `default:"true" help:"Use headless browser"`
+	Proxy    string        `help:"Proxy address for headless browser (e.g., http://127.0.0.1:8080 for Burp Suite)"`
 	Verbose  bool          `short:"v" help:"Enable verbose logging"`
 }
 
@@ -272,7 +273,7 @@ func setupBrowserAndSignals(rawHeaders []string, crawlOpts CrawlOptions, extraOp
 	var browserMgr *crawl.BrowserManager
 
 	if crawlOpts.Headless {
-		browserMgr, err = crawl.NewBrowserManager(crawl.BrowserOptions{Headless: true})
+		browserMgr, err = crawl.NewBrowserManager(crawl.BrowserOptions{Headless: true, Proxy: crawlOpts.Proxy})
 		if err != nil {
 			return browserSetupResult{}, fmt.Errorf("launch browser: %w", err)
 		}
@@ -324,6 +325,7 @@ func (c *CrawlCmd) Run() error {
 		Timeout:  c.Timeout,
 		Scope:    c.Scope,
 		Headless: c.Headless,
+		Proxy:    c.Proxy,
 	})
 	if err != nil {
 		return err
@@ -465,6 +467,7 @@ func (c *ScanCmd) Run() error {
 		Timeout:  c.Timeout,
 		Scope:    c.Scope,
 		Headless: c.Headless,
+		Proxy:    c.Proxy,
 	})
 	if err != nil {
 		return err

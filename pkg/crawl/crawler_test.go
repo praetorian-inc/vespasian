@@ -309,6 +309,7 @@ func TestNewCrawler(t *testing.T) {
 		MaxPages: 100,
 		Scope:    "same-domain",
 		Headless: true,
+		Proxy:    "http://127.0.0.1:8080",
 		Headers: map[string]string{
 			"User-Agent": "test",
 		},
@@ -331,6 +332,9 @@ func TestNewCrawler(t *testing.T) {
 	}
 	if !crawler.opts.Headless {
 		t.Errorf("crawler.opts.Headless = false, want true")
+	}
+	if crawler.opts.Proxy != "http://127.0.0.1:8080" {
+		t.Errorf("crawler.opts.Proxy = %q, want %q", crawler.opts.Proxy, "http://127.0.0.1:8080")
 	}
 	if crawler.opts.Headers["User-Agent"] != "test" {
 		t.Errorf("crawler.opts.Headers[User-Agent] = %q, want %q", crawler.opts.Headers["User-Agent"], "test")

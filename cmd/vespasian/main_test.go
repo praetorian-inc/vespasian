@@ -615,6 +615,32 @@ func TestCrawlOptions_Embedded(t *testing.T) {
 	}
 }
 
+// TestCrawlOptions_Proxy verifies that the --proxy flag is accessible on both
+// CrawlCmd and ScanCmd via the embedded CrawlOptions.
+func TestCrawlOptions_Proxy(t *testing.T) {
+	proxy := "http://127.0.0.1:8080"
+
+	c := &CrawlCmd{
+		URL: "https://example.com",
+		CrawlOptions: CrawlOptions{
+			Proxy: proxy,
+		},
+	}
+	if c.Proxy != proxy {
+		t.Errorf("CrawlCmd.Proxy = %q, want %q", c.Proxy, proxy)
+	}
+
+	s := &ScanCmd{
+		URL: "https://example.com",
+		CrawlOptions: CrawlOptions{
+			Proxy: proxy,
+		},
+	}
+	if s.Proxy != proxy {
+		t.Errorf("ScanCmd.Proxy = %q, want %q", s.Proxy, proxy)
+	}
+}
+
 // TestVersionVariable verifies the version variable is accessible and has a default.
 func TestVersionVariable(t *testing.T) {
 	if version == "" {

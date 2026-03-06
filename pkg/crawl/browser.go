@@ -34,6 +34,10 @@ type BrowserOptions struct {
 	// is passed directly to exec.Command — it must be a trusted, hardcoded
 	// path. Never populate from user-controlled input.
 	ChromePath string
+
+	// Proxy sets the Chrome --proxy-server flag, routing all browser traffic
+	// through the given address (e.g., "http://127.0.0.1:8080" for Burp Suite).
+	Proxy string
 }
 
 // BrowserManager owns the Chrome process lifecycle. It launches Chrome via
@@ -57,6 +61,9 @@ func NewBrowserManager(opts BrowserOptions) (*BrowserManager, error) {
 	}
 	if opts.ChromePath != "" {
 		l = l.Bin(opts.ChromePath)
+	}
+	if opts.Proxy != "" {
+		l = l.Set("proxy-server", opts.Proxy)
 	}
 
 	wsURL, err := l.Launch()
