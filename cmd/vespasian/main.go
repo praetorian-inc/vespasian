@@ -129,6 +129,11 @@ const shutdownBackstop = 10 * time.Second
 func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl.CrawlerOptions) ([]crawl.ObservedRequest, error) {
 	opts.Stderr = stderr
 
+	if opts.Proxy != "" && !opts.Headless {
+		fmt.Fprintf(stderr, "warning: --proxy is only supported with headless browser mode; ignoring proxy setting\n")
+		opts.Proxy = ""
+	}
+
 	crawler := crawl.NewCrawler(opts)
 
 	// Run Crawl in a goroutine so we can apply a backstop timeout after

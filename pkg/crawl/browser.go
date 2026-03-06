@@ -15,6 +15,8 @@
 package crawl
 
 import (
+	"fmt"
+	"net/url"
 	"sync"
 
 	"github.com/go-rod/rod/lib/launcher"
@@ -63,6 +65,9 @@ func NewBrowserManager(opts BrowserOptions) (*BrowserManager, error) {
 		l = l.Bin(opts.ChromePath)
 	}
 	if opts.Proxy != "" {
+		if err := validateProxyAddr(opts.Proxy); err != nil {
+			return nil, err
+		}
 		l = l.Set("proxy-server", opts.Proxy)
 	}
 
@@ -113,4 +118,24 @@ func (b *BrowserManager) Close() {
 // PID returns the Chrome process ID, useful for testing.
 func (b *BrowserManager) PID() int {
 	return b.launcher.PID()
+}
+
+// validateProxyAddr checks that the proxy address is a valid HTTP/HTTPS URL
+// with a host and port. This prevents typos from producing confusing Chrome
+// launch errors and ensures no credentials are embedded in the URL.
+func validateProxyAddr(addr string) error {
+	u, err := url.Parse(addr)
+	if err != nil {
+		return fmt.Errorf("invalid proxy address %q: %w", addr, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "socks5" {
+		return fmt.Errorf("invalid proxy address %q: scheme must be http, https, or socks5", addr)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("invalid proxy address %q: missing host", addr)
+	}
+	if u.User != nil {
+		return fmt.Errorf("invalid proxy address %q: embedded credentials are not supported (they would be visible in process listing); configure authentication in your proxy instead", addr)
+	}
+	return nil
 }

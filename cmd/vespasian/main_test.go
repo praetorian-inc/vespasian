@@ -615,6 +615,23 @@ func TestCrawlOptions_Embedded(t *testing.T) {
 	}
 }
 
+// TestDoCrawl_ProxyIgnoredWithoutHeadless verifies that doCrawl warns and clears
+// the proxy option when headless mode is disabled.
+func TestDoCrawl_ProxyIgnoredWithoutHeadless(t *testing.T) {
+	var buf bytes.Buffer
+	opts := crawl.CrawlerOptions{
+		Headless: false,
+		Proxy:    "http://127.0.0.1:8080",
+	}
+	// doCrawl will warn and clear proxy before creating the crawler.
+	// It will then fail on the actual crawl (no valid URL), but we only
+	// care about the warning message.
+	_, _ = doCrawl(context.Background(), &buf, "https://example.com", nil, opts)
+	if !strings.Contains(buf.String(), "warning: --proxy is only supported with headless browser mode") {
+		t.Errorf("expected proxy warning on stderr, got %q", buf.String())
+	}
+}
+
 // TestCrawlOptions_Proxy verifies that the --proxy flag is accessible on both
 // CrawlCmd and ScanCmd via the embedded CrawlOptions.
 func TestCrawlOptions_Proxy(t *testing.T) {
