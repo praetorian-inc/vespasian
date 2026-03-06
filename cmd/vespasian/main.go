@@ -130,11 +130,13 @@ type CrawlOptions struct {
 	Verbose  bool          `short:"v" help:"Enable verbose logging"`
 }
 
-// setupForceExitHandler spawns a goroutine that listens for a second
-// SIGINT/SIGTERM and force-exits the process. The first signal is consumed
-// by signal.NotifyContext; this catches the second one.
-func setupForceExitHandler() {
+// setupForceExitHandler spawns a goroutine that waits for the first signal
+// to be handled (ctx.Done), then registers for a second SIGINT/SIGTERM and
+// force-exits the process. This avoids a race where both the graceful handler
+// and the force-exit handler consume the same signal simultaneously.
+func setupForceExitHandler(ctx context.Context) {
 	go func() {
+		<-ctx.Done() // First signal consumed by signal.NotifyContext
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 		<-sigCh
@@ -172,7 +174,7 @@ func (c *CrawlCmd) Run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	setupForceExitHandler()
+	setupForceExitHandler(ctx)
 
 	requests, err := doCrawl(ctx, os.Stderr, c.URL, c.Header, opts)
 	if err != nil {
@@ -314,7 +316,7 @@ func (c *ScanCmd) Run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	setupForceExitHandler()
+	setupForceExitHandler(ctx)
 
 	requests, err := doCrawl(ctx, os.Stderr, c.URL, c.Header, opts)
 	if err != nil {
