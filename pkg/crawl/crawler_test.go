@@ -359,17 +359,28 @@ func TestCrawl_EmptyURLReturnsError(t *testing.T) {
 	}
 }
 
-// TestCrawl_SchemelessURLReturnsError tests that URLs without http/https scheme are rejected
-func TestCrawl_SchemelessURLReturnsError(t *testing.T) {
-	crawler := NewCrawler(CrawlerOptions{
-		Depth: 3,
-	})
-	_, err := crawler.Crawl(context.Background(), "not-a-url")
-	if err == nil {
-		t.Fatal("expected error for schemeless URL, got nil")
+// TestCrawl_InvalidSchemeReturnsError tests that URLs without http/https scheme
+// are rejected, including non-HTTP schemes that could be SSRF vectors.
+func TestCrawl_InvalidSchemeReturnsError(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{"schemeless", "not-a-url"},
+		{"file scheme", "file:///etc/passwd"},
+		{"ftp scheme", "ftp://example.com"},
 	}
-	if !strings.Contains(err.Error(), "invalid target URL") {
-		t.Errorf("unexpected error message: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			crawler := NewCrawler(CrawlerOptions{Depth: 3})
+			_, err := crawler.Crawl(context.Background(), tt.url)
+			if err == nil {
+				t.Fatalf("expected error for %q, got nil", tt.url)
+			}
+			if !strings.Contains(err.Error(), "invalid target URL") {
+				t.Errorf("unexpected error message: %v", err)
+			}
+		})
 	}
 }
 
