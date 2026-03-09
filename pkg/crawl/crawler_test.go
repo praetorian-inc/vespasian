@@ -15,6 +15,9 @@
 package crawl
 
 import (
+	"context"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/projectdiscovery/katana/pkg/navigation"
@@ -325,6 +328,76 @@ func TestNewCrawler(t *testing.T) {
 	}
 	if crawler.opts.Headers["User-Agent"] != "test" {
 		t.Errorf("crawler.opts.Headers[User-Agent] = %q, want %q", crawler.opts.Headers["User-Agent"], "test")
+	}
+}
+
+// TestCrawl_NegativeDepthReturnsError tests that negative depth is rejected
+func TestCrawl_NegativeDepthReturnsError(t *testing.T) {
+	crawler := NewCrawler(CrawlerOptions{
+		Depth: -1,
+	})
+	_, err := crawler.Crawl(context.Background(), "https://example.com")
+	if err == nil {
+		t.Fatal("expected error for negative depth, got nil")
+	}
+	if !strings.Contains(err.Error(), "depth must be non-negative") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// TestCrawl_EmptyURLReturnsError tests that empty URL is rejected
+func TestCrawl_EmptyURLReturnsError(t *testing.T) {
+	crawler := NewCrawler(CrawlerOptions{
+		Depth: 3,
+	})
+	_, err := crawler.Crawl(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected error for empty URL, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid target URL") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// TestCrawl_InvalidSchemeReturnsError tests that URLs without http/https scheme
+// are rejected, including non-HTTP schemes that could be SSRF vectors.
+func TestCrawl_InvalidSchemeReturnsError(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{"schemeless", "not-a-url"},
+		{"file scheme", "file:///etc/passwd"},
+		{"ftp scheme", "ftp://example.com"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			crawler := NewCrawler(CrawlerOptions{Depth: 3})
+			_, err := crawler.Crawl(context.Background(), tt.url)
+			if err == nil {
+				t.Fatalf("expected error for %q, got nil", tt.url)
+			}
+			if !strings.Contains(err.Error(), "invalid target URL") {
+				t.Errorf("unexpected error message: %v", err)
+			}
+		})
+	}
+}
+
+// TestCloseEngineOnce verifies the sync.Once wrapper prevents double-close.
+// This mirrors the closeEngine pattern in Crawl (crawler.go lines 143-145)
+// where engine.Close() can be called both explicitly on context cancellation
+// and via defer.
+func TestCloseEngineOnce(t *testing.T) {
+	var count int
+	var once sync.Once
+	closeEngine := func() { once.Do(func() { count++ }) }
+
+	closeEngine()
+	closeEngine()
+
+	if count != 1 {
+		t.Errorf("close called %d times, want 1", count)
 	}
 }
 

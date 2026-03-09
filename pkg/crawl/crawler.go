@@ -17,7 +17,6 @@ package crawl
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/url"
 	"sync"
 	"time"
@@ -79,18 +78,6 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 	u, err := url.Parse(targetURL)
 	if err != nil || targetURL == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return nil, fmt.Errorf("invalid target URL: %q", targetURL)
-	}
-
-	// Launch Chrome under vespasian's control when in headless mode.
-	// This lets us kill the browser immediately on signal, stopping all
-	// outbound requests — Katana's internal context is disconnected from ours.
-	var browserMgr *BrowserManager
-	if c.opts.Headless {
-		browserMgr, err = NewBrowserManager(BrowserOptions{Headless: true})
-		if err != nil {
-			return nil, fmt.Errorf("launch browser: %w", err)
-		}
-		defer browserMgr.Close()
 	}
 
 	// Create a cancellable context to stop Katana when MaxPages is reached.
@@ -164,7 +151,9 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = engine.Close() }()
+	var closeOnce sync.Once
+	closeEngine := func() { closeOnce.Do(func() { _ = engine.Close() }) }
+	defer closeEngine()
 
 	// Run crawl in goroutine with context cancellation
 	crawlErr := make(chan error, 1)
@@ -178,8 +167,14 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			return results, err
 		}
 	case <-crawlCtx.Done():
-		// crawlCtx fires for both MaxPages (crawlCancel in OnResult) and
-		// signal (parent ctx canceled). Check which case we're in.
+		// Context canceled (MaxPages reached or SIGINT/SIGTERM).
+		// Close the engine to unblock the goroutine, then drain it
+		// to avoid a goroutine leak.
+		closeEngine()
+		<-crawlErr
+
+		// If the parent context was canceled (SIGINT/SIGTERM), propagate that error
+		// so the caller can decide whether to save partial results.
 		if ctx.Err() != nil {
 			// Signal received (SIGINT/SIGTERM or programmatic cancel).
 			// Notify the user immediately before any cleanup.
