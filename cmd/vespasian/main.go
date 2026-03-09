@@ -212,7 +212,7 @@ type CrawlOptions struct {
 	Timeout  time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
 	Scope    string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
 	Headless bool          `default:"true" help:"Use headless browser"`
-	Proxy    string        `help:"Proxy address for headless browser (e.g., http://127.0.0.1:8080 for Burp Suite)"`
+	Proxy    string        `help:"Proxy address for headless browser (e.g., http://127.0.0.1:8080). Note: TLS certificate verification is disabled during crawls."`
 	Verbose  bool          `short:"v" help:"Enable verbose logging"`
 }
 
