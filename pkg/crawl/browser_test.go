@@ -74,7 +74,7 @@ func TestBrowserManager_LaunchAndKill(t *testing.T) {
 	}
 
 	// Cleanup temp dir
-	mgr.Cleanup()
+	mgr.cleanup()
 }
 
 // TestBrowserManager_KillIdempotent verifies that calling Kill multiple times
@@ -123,7 +123,7 @@ func TestBrowserManager_CloseIdempotent(t *testing.T) {
 	}
 
 	mgr.Close()
-	// Second close should not panic — Kill is protected by sync.Once
-	// and Cleanup waits on an already-closed channel.
+	// Second close should not panic — both Kill and cleanup are
+	// protected by sync.Once.
 	mgr.Close()
 }

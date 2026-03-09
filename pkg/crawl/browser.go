@@ -31,9 +31,10 @@ type BrowserOptions struct {
 // go-rod's launcher and retains the handle so vespasian can kill the browser
 // immediately on signal, stopping all outbound requests.
 type BrowserManager struct {
-	launcher *launcher.Launcher
-	wsURL    string
-	killOnce sync.Once
+	launcher    *launcher.Launcher
+	wsURL       string
+	killOnce    sync.Once
+	cleanupOnce sync.Once
 }
 
 // NewBrowserManager launches a Chrome instance with the given options and
@@ -75,17 +76,19 @@ func (b *BrowserManager) Kill() {
 	})
 }
 
-// Cleanup waits for Chrome to exit and removes the temporary user data
-// directory. Call this after Kill to ensure full cleanup.
-func (b *BrowserManager) Cleanup() {
-	b.launcher.Cleanup()
+// cleanup waits for Chrome to exit and removes the temporary user data
+// directory. Safe to call multiple times.
+func (b *BrowserManager) cleanup() {
+	b.cleanupOnce.Do(func() {
+		b.launcher.Cleanup()
+	})
 }
 
 // Close kills Chrome (if still running) and cleans up resources. Intended
 // for use with defer in the normal (non-signal) path.
 func (b *BrowserManager) Close() {
 	b.Kill()
-	b.Cleanup()
+	b.cleanup()
 }
 
 // PID returns the Chrome process ID, useful for testing.

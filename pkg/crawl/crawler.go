@@ -201,7 +201,11 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			case <-crawlErr:
 				// Crawl goroutine exited cleanly.
 			case <-timer.C:
-				// Goroutine leaked but Chrome is dead — no network activity.
+				// Goroutine still running — Chrome is dead so no network activity.
+				// engine.Close() below will cause engine.Crawl() to return shortly,
+				// at which point the goroutine exits. In a long-lived process calling
+				// Crawl() repeatedly after interrupts, callers should be aware of
+				// this brief overlap.
 			}
 
 			_ = engine.Close()
