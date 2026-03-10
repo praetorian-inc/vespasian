@@ -138,6 +138,21 @@ func (i *BurpImporter) parseItem(item burpItem) (crawl.ObservedRequest, error) {
 		return crawl.ObservedRequest{}, fmt.Errorf("failed to parse request: %w", err)
 	}
 
+	// Handle empty response data (e.g., timeouts, connection resets)
+	if len(respBytes) == 0 {
+		return crawl.ObservedRequest{
+			Method:      method,
+			URL:         item.URL,
+			Headers:     headers,
+			QueryParams: extractQueryParams(item.URL),
+			Body:        body,
+			Response: crawl.ObservedResponse{
+				StatusCode: item.Status,
+			},
+			Source: "import:burp",
+		}, nil
+	}
+
 	// Parse HTTP response
 	statusCode, respHeaders, respBody, err := parseHTTPResponse(respBytes)
 	if err != nil {

@@ -693,3 +693,31 @@ func TestBurpImporter_HeadersWithBlankLines(t *testing.T) {
 	require.Len(t, requests, 1)
 	assert.Equal(t, "text/html", requests[0].Response.Headers["Content-Type"])
 }
+
+func TestBurpImporter_EmptyResponse(t *testing.T) {
+	// Simulate a timeout/connection reset where Burp records an empty response
+	getRequest := "GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n"
+
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/api</url>
+		<request base64="true">` + base64.StdEncoding.EncodeToString([]byte(getRequest)) + `</request>
+		<status>504</status>
+		<response base64="true">` + base64.StdEncoding.EncodeToString([]byte("")) + `</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	requests, err := b.Import(strings.NewReader(xml))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	req := requests[0]
+	assert.Equal(t, "GET", req.Method)
+	assert.Equal(t, "https://example.com/api", req.URL)
+	assert.Equal(t, "import:burp", req.Source)
+	assert.Equal(t, 504, req.Response.StatusCode)
+	assert.Nil(t, req.Response.Headers)
+	assert.Nil(t, req.Response.Body)
+}
