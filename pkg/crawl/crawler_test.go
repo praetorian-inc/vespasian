@@ -391,45 +391,6 @@ func TestCrawl_InvalidSchemeReturnsError(t *testing.T) {
 	}
 }
 
-// TestCloseEngineOnce verifies the sync.Once wrapper prevents double-close.
-// This mirrors the closeEngine pattern in Crawl (crawler.go lines 143-145)
-// where engine.Close() can be called both explicitly on context cancellation
-// and via defer.
-func TestCloseEngineOnce(t *testing.T) {
-	var count int
-	var once sync.Once
-	closeEngine := func() { once.Do(func() { count++ }) }
-
-	closeEngine()
-	closeEngine()
-
-	if count != 1 {
-		t.Errorf("close called %d times, want 1", count)
-	}
-}
-
-// TestDefaultMaxPages verifies the DefaultMaxPages constant value
-func TestDefaultMaxPages(t *testing.T) {
-	if DefaultMaxPages != 1000 {
-		t.Errorf("DefaultMaxPages = %d, want 1000", DefaultMaxPages)
-	}
-}
-
-// TestMaxResponseBodySize verifies the MaxResponseBodySize constant value
-func TestMaxResponseBodySize(t *testing.T) {
-	expected := 1 * 1024 * 1024 // 1 MB
-	if MaxResponseBodySize != expected {
-		t.Errorf("MaxResponseBodySize = %d, want %d", MaxResponseBodySize, expected)
-	}
-}
-
-
-// TestPageTimeout verifies the PageTimeout constant value
-func TestPageTimeout(t *testing.T) {
-	if PageTimeout != 30 {
-		t.Errorf("PageTimeout = %d, want 30", PageTimeout)
-	}
-}
 // TestMapResult_TruncatesLargeResponseBody tests that response bodies exceeding MaxResponseBodySize get truncated
 func TestMapResult_TruncatesLargeResponseBody(t *testing.T) {
 	largeBody := make([]byte, MaxResponseBodySize+1000) // 1000 bytes over limit

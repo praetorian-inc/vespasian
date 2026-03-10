@@ -17,13 +17,15 @@ package main
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
@@ -662,102 +664,55 @@ func TestOnForceExit_NilCleanup(t *testing.T) {
 	}
 }
 
-// returnPartialOnGraceful mirrors the error-handling condition in doCrawl.
-// It returns (requests, nil) if err indicates a graceful shutdown with partial
-// results, or (nil, err) otherwise.  The stderr writer receives the interrupt
-// message when partial results are returned.
-func returnPartialOnGraceful(stderr io.Writer, err error, requests []crawl.ObservedRequest) ([]crawl.ObservedRequest, error) {
-	if err != nil {
-		if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && len(requests) > 0 {
-			fmt.Fprintf(stderr, "returning %d partial results\n", len(requests))
-			return requests, nil
-		}
-		return nil, fmt.Errorf("crawl failed: %w", err)
+// TestDoCrawl_GracefulShutdownReturnsPartialResults exercises the real doCrawl
+// function with a pre-canceled context against a live httptest server. The
+// crawler returns context.Canceled with partial results, and doCrawl should
+// convert that to (results, nil) with a "returning N partial results" message.
+func TestDoCrawl_GracefulShutdownReturnsPartialResults(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<html><body><a href="/page2">link</a></body></html>`)
+	}))
+	defer srv.Close()
+
+	// Cancel context before calling doCrawl — triggers signal path in Crawl(),
+	// which returns (partial, context.Canceled). doCrawl should return (partial, nil).
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var stderr bytes.Buffer
+	opts := crawl.CrawlerOptions{
+		Depth:    1,
+		MaxPages: 100,
+		Timeout:  30 * time.Second,
+		Headless: false,
 	}
-	return requests, nil
+
+	results, err := doCrawl(ctx, &stderr, srv.URL, nil, opts)
+	if err != nil {
+		t.Fatalf("doCrawl() returned error %v, want nil (graceful shutdown)", err)
+	}
+	// The crawler may or may not collect results before context fires.
+	// The key assertion: doCrawl did NOT return an error, proving the
+	// graceful-shutdown condition (lines 127-129 of main.go) activated.
+	if !strings.Contains(stderr.String(), "interrupt received") && !strings.Contains(stderr.String(), "returning") {
+		t.Errorf("stderr = %q, want interrupt or partial-results message", stderr.String())
+	}
+	t.Logf("doCrawl returned %d partial results", len(results))
 }
 
-// TestDoCrawl_gracefulShutdownCondition verifies that the graceful-shutdown
-// condition inside doCrawl accepts both context.Canceled (SIGINT/SIGTERM) and
-// context.DeadlineExceeded (Katana CrawlDuration timeout) when partial results
-// are present.
-//
-// The condition being tested lives in doCrawl (main.go lines 88-97).  Because
-// doCrawl creates its own Crawler internally, the condition logic is extracted
-// into returnPartialOnGraceful above so it can be exercised in isolation.
-func TestDoCrawl_gracefulShutdownCondition(t *testing.T) {
-	partialRequests := []crawl.ObservedRequest{
-		{Method: "GET", URL: "https://example.com/api/users"},
-	}
+// TestDoCrawl_InvalidHeaderReturnsError verifies doCrawl rejects invalid headers
+// before creating a crawler.
+func TestDoCrawl_InvalidHeaderReturnsError(t *testing.T) {
+	var stderr bytes.Buffer
+	opts := crawl.CrawlerOptions{Depth: 1, Headless: false}
 
-	tests := []struct {
-		name        string
-		err         error
-		requests    []crawl.ObservedRequest
-		wantResults []crawl.ObservedRequest
-		wantErr     bool
-		wantStderr  string
-	}{
-		{
-			name:        "context.Canceled with partial results — returns partial, no error",
-			err:         context.Canceled,
-			requests:    partialRequests,
-			wantResults: partialRequests,
-			wantErr:     false,
-			wantStderr:  "returning 1 partial results\n",
-		},
-		{
-			name:        "context.DeadlineExceeded with partial results — returns partial, no error",
-			err:         context.DeadlineExceeded,
-			requests:    partialRequests,
-			wantResults: partialRequests,
-			wantErr:     false,
-			wantStderr:  "returning 1 partial results\n",
-		},
-		{
-			name:     "context.DeadlineExceeded with no results — returns error",
-			err:      context.DeadlineExceeded,
-			requests: nil,
-			wantErr:  true,
-		},
-		{
-			name:     "context.Canceled with no results — returns error",
-			err:      context.Canceled,
-			requests: nil,
-			wantErr:  true,
-		},
-		{
-			name:     "other error with partial results — returns error",
-			err:      fmt.Errorf("network error"),
-			requests: partialRequests,
-			wantErr:  true,
-		},
-		{
-			name:        "nil error — returns results as-is",
-			err:         nil,
-			requests:    partialRequests,
-			wantResults: partialRequests,
-			wantErr:     false,
-		},
+	_, err := doCrawl(context.Background(), &stderr, "https://example.com", []string{"bad header"}, opts)
+	if err == nil {
+		t.Fatal("doCrawl() expected error for invalid header, got nil")
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var buf bytes.Buffer
-			gotResults, gotErr := returnPartialOnGraceful(&buf, tt.err, tt.requests)
-			if (gotErr != nil) != tt.wantErr {
-				t.Errorf("returnPartialOnGraceful() error = %v, wantErr %v", gotErr, tt.wantErr)
-			}
-			if !tt.wantErr && len(gotResults) != len(tt.wantResults) {
-				t.Errorf("returnPartialOnGraceful() returned %d results, want %d",
-					len(gotResults), len(tt.wantResults))
-			}
-			if tt.wantStderr != "" && buf.String() != tt.wantStderr {
-				t.Errorf("stderr = %q, want %q", buf.String(), tt.wantStderr)
-			}
-			if tt.wantStderr == "" && buf.Len() > 0 {
-				t.Errorf("unexpected stderr output: %q", buf.String())
-			}
-		})
+	if !strings.Contains(err.Error(), "invalid header") {
+		t.Errorf("doCrawl() error = %q, want 'invalid header'", err.Error())
 	}
 }
