@@ -52,7 +52,8 @@ var CLI struct {
 	Version  VersionCmd  `cmd:"" help:"Show version information"`
 }
 
-// parseHeaders converts "Key: Value" strings to a map, validating for CRLF injection.
+// parseHeaders converts "Key: Value" strings to a map, validating header names
+// against RFC 7230 token production and header values against CRLF injection.
 func parseHeaders(raw []string) (map[string]string, error) {
 	headers := make(map[string]string)
 	for _, h := range raw {
@@ -65,12 +66,46 @@ func parseHeaders(raw []string) (map[string]string, error) {
 		if name == "" {
 			return nil, fmt.Errorf("header has empty name: %q", h)
 		}
-		if strings.ContainsAny(name, "\r\n") || strings.ContainsAny(value, "\r\n") {
-			return nil, fmt.Errorf("header contains invalid CRLF characters: %q", h)
+		if !isValidHeaderName(name) {
+			return nil, fmt.Errorf("header name contains invalid characters (RFC 7230): %q", h)
+		}
+		if strings.ContainsAny(value, "\r\n") {
+			return nil, fmt.Errorf("header value contains invalid CRLF characters: %q", h)
 		}
 		headers[name] = value
 	}
 	return headers, nil
+}
+
+// isValidHeaderName checks that name consists only of RFC 7230 token characters.
+// tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+//
+//	"^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+func isValidHeaderName(name string) bool {
+	for i := 0; i < len(name); i++ {
+		if !isTokenChar(name[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// isTokenChar returns true if c is a valid RFC 7230 tchar.
+func isTokenChar(c byte) bool {
+	switch {
+	case c >= 'A' && c <= 'Z':
+		return true
+	case c >= 'a' && c <= 'z':
+		return true
+	case c >= '0' && c <= '9':
+		return true
+	case c == '!' || c == '#' || c == '$' || c == '%' || c == '&' ||
+		c == '\'' || c == '*' || c == '+' || c == '-' || c == '.' ||
+		c == '^' || c == '_' || c == '`' || c == '|' || c == '~':
+		return true
+	default:
+		return false
+	}
 }
 
 // doCrawl executes the common crawl pipeline: parse headers, create crawler,
@@ -186,6 +221,18 @@ func (c *CrawlCmd) Run() error {
 		Headless: c.Headless,
 	}
 
+	// Create browser before signal setup so force-exit can clean up temp dirs.
+	var browserMgr *crawl.BrowserManager
+	if c.Headless {
+		var err error
+		browserMgr, err = crawl.NewBrowserManager(crawl.BrowserOptions{Headless: true})
+		if err != nil {
+			return fmt.Errorf("launch browser: %w", err)
+		}
+		defer browserMgr.Close()
+		opts.BrowserMgr = browserMgr
+	}
+
 	if c.Verbose {
 		fmt.Fprintf(os.Stderr, "crawling %s (depth=%d, max-pages=%d, timeout=%s)\n",
 			c.URL, opts.Depth, opts.MaxPages, opts.Timeout)
@@ -194,7 +241,11 @@ func (c *CrawlCmd) Run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	setupForceExitHandler(ctx, os.Stderr, nil, os.Exit)
+	setupForceExitHandler(ctx, os.Stderr, func() {
+		if browserMgr != nil {
+			browserMgr.Close()
+		}
+	}, os.Exit)
 
 	requests, err := doCrawl(ctx, os.Stderr, c.URL, c.Header, opts)
 	if err != nil {
@@ -328,6 +379,18 @@ func (c *ScanCmd) Run() error {
 		Headless: c.Headless,
 	}
 
+	// Create browser before signal setup so force-exit can clean up temp dirs.
+	var browserMgr *crawl.BrowserManager
+	if c.Headless {
+		var err error
+		browserMgr, err = crawl.NewBrowserManager(crawl.BrowserOptions{Headless: true})
+		if err != nil {
+			return fmt.Errorf("launch browser: %w", err)
+		}
+		defer browserMgr.Close()
+		opts.BrowserMgr = browserMgr
+	}
+
 	if c.Verbose {
 		fmt.Fprintf(os.Stderr, "crawling %s (depth=%d, max-pages=%d, timeout=%s)\n",
 			c.URL, opts.Depth, opts.MaxPages, opts.Timeout)
@@ -336,7 +399,11 @@ func (c *ScanCmd) Run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	setupForceExitHandler(ctx, os.Stderr, nil, os.Exit)
+	setupForceExitHandler(ctx, os.Stderr, func() {
+		if browserMgr != nil {
+			browserMgr.Close()
+		}
+	}, os.Exit)
 
 	requests, err := doCrawl(ctx, os.Stderr, c.URL, c.Header, opts)
 	if err != nil {

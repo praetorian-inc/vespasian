@@ -171,6 +171,49 @@ func TestParseHeaders_CRLFInjection(t *testing.T) {
 	}
 }
 
+// TestParseHeaders_RFC7230InvalidNames tests that header names with characters
+// outside the RFC 7230 token production are rejected.
+func TestParseHeaders_RFC7230InvalidNames(t *testing.T) {
+	tests := []struct {
+		name  string
+		input []string
+	}{
+		{
+			name:  "space in header name",
+			input: []string{"Content Type: application/json"},
+		},
+		{
+			name:  "parenthesis in header name",
+			input: []string{"Content(Type): application/json"},
+		},
+		{
+			name:  "slash in header name",
+			input: []string{"Content/Type: application/json"},
+		},
+		{
+			name:  "equals in header name",
+			input: []string{"Content=Type: application/json"},
+		},
+		{
+			name:  "at sign in header name",
+			input: []string{"Content@Type: application/json"},
+		},
+		{
+			name:  "bracket in header name",
+			input: []string{"Content[Type]: application/json"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseHeaders(tt.input)
+			if err == nil {
+				t.Error("parseHeaders() expected error for invalid header name, got nil")
+			}
+		})
+	}
+}
+
 func TestParseHeaders_InvalidFormat(t *testing.T) {
 	tests := []struct {
 		name  string

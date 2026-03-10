@@ -64,6 +64,9 @@ func NewBrowserManager(opts BrowserOptions) (*BrowserManager, error) {
 // WSURL returns the Chrome DevTools Protocol WebSocket URL. Pass this to
 // Katana's ChromeWSUrl option so it connects to our browser instead of
 // launching its own.
+//
+// Security: this URL grants full control of the browser session. Do not
+// log it or expose it to untrusted callers.
 func (b *BrowserManager) WSURL() string {
 	return b.wsURL
 }
