@@ -37,11 +37,6 @@ var (
 		"PATCH": true, "HEAD": true, "OPTIONS": true, "TRACE": true, "CONNECT": true,
 	}
 
-	xxeDOCTYPEPatterns = [][]byte{
-		[]byte("<!DOCTYPE"), []byte("<!doctype"), []byte("<!Doctype"),
-		[]byte("<!DocType"), []byte("<!DOctype"), []byte("<!dOCTYPE"),
-	}
-
 	xxeENTITYPatterns = [][]byte{
 		[]byte("<!ENTITY"), []byte("<!entity"), []byte("<!Entity"),
 		[]byte("<!EnTiTy"), []byte("<!ENtity"), []byte("<!eNTITY"),
@@ -73,13 +68,9 @@ func (BurpImporter) Name() string {
 	return "burp"
 }
 
-// containsXXEPatterns checks for XXE attack vectors in XML data.
-func containsXXEPatterns(data []byte) bool {
-	for _, pattern := range xxeDOCTYPEPatterns {
-		if bytes.Contains(data, pattern) {
-			return true
-		}
-	}
+// containsXXEEntity checks for ENTITY declarations in XML data (XXE attack vector).
+// DOCTYPE declarations are allowed as they are standard in Burp Suite XML exports.
+func containsXXEEntity(data []byte) bool {
 	for _, pattern := range xxeENTITYPatterns {
 		if bytes.Contains(data, pattern) {
 			return true
@@ -104,9 +95,9 @@ func (i *BurpImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
 		return nil, ErrFileTooLarge
 	}
 
-	// Check for DOCTYPE or ENTITY declarations (XXE attack vectors)
-	if containsXXEPatterns(data) {
-		return nil, fmt.Errorf("burp importer: XML validation: DOCTYPE or ENTITY declarations not allowed")
+	// Check for ENTITY declarations (XXE attack vectors)
+	if containsXXEEntity(data) {
+		return nil, fmt.Errorf("burp importer: XML validation: ENTITY declarations not allowed")
 	}
 
 	var items burpItems

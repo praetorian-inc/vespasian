@@ -244,38 +244,41 @@ func TestBurpImporter_XXEPrevention(t *testing.T) {
 		errMsg  string
 	}{
 		{
-			name:    "DOCTYPE declaration rejected",
+			name:    "DOCTYPE with ENTITY declaration rejected",
 			xml:     `<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe "test">]><items></items>`,
 			wantErr: true,
-			errMsg:  "DOCTYPE or ENTITY",
+			errMsg:  "ENTITY",
 		},
 		{
 			name:    "ENTITY declaration rejected",
 			xml:     `<?xml version="1.0"?><!ENTITY xxe SYSTEM "file:///etc/passwd"><items></items>`,
 			wantErr: true,
-			errMsg:  "DOCTYPE or ENTITY",
+			errMsg:  "ENTITY",
 		},
 		{
-			name:    "lowercase doctype rejected",
+			name:    "lowercase doctype passes",
 			xml:     `<?xml version="1.0"?><!doctype foo><items></items>`,
-			wantErr: true,
-			errMsg:  "DOCTYPE or ENTITY",
+			wantErr: false,
 		},
 		{
-			name:    "mixed case DOCTYPE rejected",
+			name:    "mixed case DOCTYPE passes",
 			xml:     `<?xml version="1.0"?><!DocType foo><items></items>`,
-			wantErr: true,
-			errMsg:  "DOCTYPE or ENTITY",
+			wantErr: false,
 		},
 		{
 			name:    "mixed case ENTITY rejected",
 			xml:     `<?xml version="1.0"?><!EnTiTy xxe "test"><items></items>`,
 			wantErr: true,
-			errMsg:  "DOCTYPE or ENTITY",
+			errMsg:  "ENTITY",
 		},
 		{
 			name:    "valid XML without DOCTYPE passes",
 			xml:     `<?xml version="1.0"?><items></items>`,
+			wantErr: false,
+		},
+		{
+			name:    "Burp Suite XML with DOCTYPE passes",
+			xml:     `<?xml version="1.0"?><!DOCTYPE items [<!ELEMENT items (item)*><!ELEMENT item (url|request|status|response)*>]><items><item><url>http://example.com</url><request base64="true">R0VUIC8gSFRUUC8xLjENCkhvc3Q6IGV4YW1wbGUuY29tDQoNCg==</request><status>200</status><response base64="true">SFRUUC8xLjEgMjAwIE9LDQpDb250ZW50LVR5cGU6IHRleHQvaHRtbA0KDQpPSw==</response></item></items>`,
 			wantErr: false,
 		},
 	}
