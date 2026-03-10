@@ -575,6 +575,50 @@ func TestVersionVariable(t *testing.T) {
 	t.Logf("version = %q", version)
 }
 
+// TestOnForceExit_WritesMessageAndExits verifies that the force-exit logic
+// writes the expected message to stderr and calls exitFn with code 1.
+func TestOnForceExit_WritesMessageAndExits(t *testing.T) {
+	var stderr bytes.Buffer
+	var exitCode int
+
+	onForceExit(&stderr, nil, func(code int) { exitCode = code })
+
+	if exitCode != 1 {
+		t.Errorf("exitFn called with code %d, want 1", exitCode)
+	}
+	if !strings.Contains(stderr.String(), "forcing immediate exit") {
+		t.Errorf("stderr = %q, want message containing 'forcing immediate exit'", stderr.String())
+	}
+}
+
+// TestOnForceExit_CallsCleanupBeforeExit verifies that the cleanup function
+// is called before the exit message and exitFn.
+func TestOnForceExit_CallsCleanupBeforeExit(t *testing.T) {
+	var stderr bytes.Buffer
+	var order []string
+
+	cleanup := func() { order = append(order, "cleanup") }
+	exitFn := func(code int) { order = append(order, "exit") }
+
+	onForceExit(&stderr, cleanup, exitFn)
+
+	if len(order) != 2 || order[0] != "cleanup" || order[1] != "exit" {
+		t.Errorf("call order = %v, want [cleanup exit]", order)
+	}
+}
+
+// TestOnForceExit_NilCleanup verifies that nil cleanup does not panic.
+func TestOnForceExit_NilCleanup(t *testing.T) {
+	var stderr bytes.Buffer
+	called := false
+
+	onForceExit(&stderr, nil, func(code int) { called = true })
+
+	if !called {
+		t.Error("exitFn was not called")
+	}
+}
+
 // returnPartialOnGraceful mirrors the error-handling condition in doCrawl.
 // It returns (requests, nil) if err indicates a graceful shutdown with partial
 // results, or (nil, err) otherwise.  The stderr writer receives the interrupt

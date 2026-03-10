@@ -135,15 +135,34 @@ type CrawlOptions struct {
 // to be handled (ctx.Done), then registers for a second SIGINT/SIGTERM and
 // force-exits the process. This avoids a race where both the graceful handler
 // and the force-exit handler consume the same signal simultaneously.
-func setupForceExitHandler(ctx context.Context) {
+//
+// The cleanup function is called before exiting to perform best-effort resource
+// cleanup (e.g., removing temp directories) that would otherwise be skipped by
+// os.Exit bypassing deferred functions. Chrome is already dead at this point
+// (killed on first signal), so cleanup is purely disk hygiene.
+func setupForceExitHandler(ctx context.Context, stderr io.Writer, cleanup func(), exitFn func(int)) {
 	go func() {
 		<-ctx.Done() // First signal consumed by signal.NotifyContext
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 		<-sigCh
-		fmt.Fprintf(os.Stderr, "forcing immediate exit\n")
-		os.Exit(1)
+		if cleanup != nil {
+			cleanup()
+		}
+		fmt.Fprintf(stderr, "forcing immediate exit\n")
+		exitFn(1)
 	}()
+}
+
+// onForceExit is the testable core of setupForceExitHandler. It runs cleanup,
+// writes the exit message, and calls exitFn. Extracted so tests can exercise
+// the logic without sending real signals.
+func onForceExit(stderr io.Writer, cleanup func(), exitFn func(int)) {
+	if cleanup != nil {
+		cleanup()
+	}
+	fmt.Fprintf(stderr, "forcing immediate exit\n")
+	exitFn(1)
 }
 
 // CrawlCmd crawls a web application to capture HTTP traffic.
@@ -175,7 +194,7 @@ func (c *CrawlCmd) Run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	setupForceExitHandler(ctx)
+	setupForceExitHandler(ctx, os.Stderr, nil, os.Exit)
 
 	requests, err := doCrawl(ctx, os.Stderr, c.URL, c.Header, opts)
 	if err != nil {
@@ -317,7 +336,7 @@ func (c *ScanCmd) Run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	setupForceExitHandler(ctx)
+	setupForceExitHandler(ctx, os.Stderr, nil, os.Exit)
 
 	requests, err := doCrawl(ctx, os.Stderr, c.URL, c.Header, opts)
 	if err != nil {
