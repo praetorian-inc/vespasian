@@ -76,22 +76,22 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 
 	// Build Katana options
 	katanaOpts := &types.Options{
-		MaxDepth:          c.opts.Depth,
-		Timeout:           PageTimeout,
-		CrawlDuration:     c.opts.Timeout,
-		FieldScope:        MapScope(c.opts.Scope),
-		Headless:          c.opts.Headless,
-		CustomHeaders:     ToStringSlice(c.opts.Headers),
-		Strategy:          "depth-first",
-		BodyReadSize:      10 * 1024 * 1024, // 10 MB limit to prevent memory exhaustion from hostile targets
-		Concurrency:       10,
-		Parallelism:       10,
-		RateLimit:         150,
-		TimeStable:        3, // seconds to wait for DOM stability; 0 causes go-rod panic in time.NewTicker
+		MaxDepth:               c.opts.Depth,
+		Timeout:                PageTimeout,
+		CrawlDuration:          c.opts.Timeout,
+		FieldScope:             MapScope(c.opts.Scope),
+		Headless:               c.opts.Headless,
+		CustomHeaders:          ToStringSlice(c.opts.Headers),
+		Strategy:               "depth-first",
+		BodyReadSize:           10 * 1024 * 1024, // 10 MB limit to prevent memory exhaustion from hostile targets
+		Concurrency:            10,
+		Parallelism:            10,
+		RateLimit:              150,
+		TimeStable:             3, // seconds to wait for DOM stability; 0 causes go-rod panic in time.NewTicker
 		ScrapeJSResponses:      true,
 		ScrapeJSLuiceResponses: true,
-		XhrExtraction:     true,
-		Silent:            true,
+		XhrExtraction:          true,
+		Silent:                 true,
 		OnResult: func(result output.Result) {
 			mu.Lock()
 			defer mu.Unlock()
