@@ -181,6 +181,8 @@ func MapResult(r output.Result) ObservedRequest {
 			req.Body = req.Body[:MaxResponseBodySize]
 		}
 		req.Source = r.Request.Source
+		req.Tag = r.Request.Tag
+		req.Attribute = r.Request.Attribute
 	}
 
 	// Parse query params from URL
