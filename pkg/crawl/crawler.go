@@ -17,6 +17,7 @@ package crawl
 import (
 	"context"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -202,7 +203,7 @@ func MapResult(r output.Result) ObservedRequest {
 			StatusCode:  r.Response.StatusCode,
 			Headers:     map[string]string(r.Response.Headers),
 			Body:        []byte(r.Response.Body),
-			ContentType: r.Response.Headers["Content-Type"],
+			ContentType: getHeader(r.Response.Headers, "Content-Type"),
 		}
 		// Truncate response body if it exceeds MaxResponseBodySize
 		if len(req.Response.Body) > MaxResponseBodySize {
@@ -211,6 +212,16 @@ func MapResult(r output.Result) ObservedRequest {
 	}
 
 	return req
+}
+
+// getHeader performs a case-insensitive lookup of a header name in a map.
+func getHeader(headers map[string]string, name string) string {
+	for k, v := range headers {
+		if strings.EqualFold(k, name) {
+			return v
+		}
+	}
+	return ""
 }
 
 // MapScope converts scope string to Katana FieldScope.
