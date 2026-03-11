@@ -36,11 +36,6 @@ var (
 		"GET": true, "POST": true, "PUT": true, "DELETE": true,
 		"PATCH": true, "HEAD": true, "OPTIONS": true, "TRACE": true, "CONNECT": true,
 	}
-
-	xxeENTITYPatterns = [][]byte{
-		[]byte("<!ENTITY"), []byte("<!entity"), []byte("<!Entity"),
-		[]byte("<!EnTiTy"), []byte("<!ENtity"), []byte("<!eNTITY"),
-	}
 )
 
 // BurpImporter imports Burp Suite XML traffic captures.
@@ -71,12 +66,7 @@ func (BurpImporter) Name() string {
 // containsXXEEntity checks for ENTITY declarations in XML data (XXE attack vector).
 // DOCTYPE declarations are allowed as they are standard in Burp Suite XML exports.
 func containsXXEEntity(data []byte) bool {
-	for _, pattern := range xxeENTITYPatterns {
-		if bytes.Contains(data, pattern) {
-			return true
-		}
-	}
-	return false
+	return bytes.Contains(bytes.ToUpper(data), []byte("<!ENTITY"))
 }
 
 // Import reads Burp Suite XML and converts to ObservedRequest format.

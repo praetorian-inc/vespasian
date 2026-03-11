@@ -272,6 +272,24 @@ func TestBurpImporter_XXEPrevention(t *testing.T) {
 			errMsg:  "ENTITY",
 		},
 		{
+			name:    "previously bypassing mixed case eNtItY rejected",
+			xml:     `<?xml version="1.0"?><!eNtItY xxe SYSTEM "file:///etc/passwd"><items></items>`,
+			wantErr: true,
+			errMsg:  "ENTITY",
+		},
+		{
+			name:    "alternating case entity rejected",
+			xml:     `<?xml version="1.0"?><!eNtITy xxe "test"><items></items>`,
+			wantErr: true,
+			errMsg:  "ENTITY",
+		},
+		{
+			name:    "all lowercase entity rejected",
+			xml:     `<?xml version="1.0"?><!entity xxe SYSTEM "file:///etc/passwd"><items></items>`,
+			wantErr: true,
+			errMsg:  "ENTITY",
+		},
+		{
 			name:    "valid XML without DOCTYPE passes",
 			xml:     `<?xml version="1.0"?><items></items>`,
 			wantErr: false,
@@ -718,6 +736,34 @@ func TestBurpImporter_EmptyResponse(t *testing.T) {
 	assert.Equal(t, "https://example.com/api", req.URL)
 	assert.Equal(t, "import:burp", req.Source)
 	assert.Equal(t, 504, req.Response.StatusCode)
+	assert.Nil(t, req.Response.Headers)
+	assert.Nil(t, req.Response.Body)
+}
+
+func TestBurpImporter_EmptyResponseNonBase64(t *testing.T) {
+	// Non-base64 empty response element (no base64 attribute or base64="false")
+	getRequest := "GET /page HTTP/1.1\r\nHost: example.com\r\n\r\n"
+
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/page</url>
+		<request base64="true">` + base64.StdEncoding.EncodeToString([]byte(getRequest)) + `</request>
+		<status>0</status>
+		<response></response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	requests, err := b.Import(strings.NewReader(xml))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	req := requests[0]
+	assert.Equal(t, "GET", req.Method)
+	assert.Equal(t, "https://example.com/page", req.URL)
+	assert.Equal(t, "import:burp", req.Source)
+	assert.Equal(t, 0, req.Response.StatusCode)
 	assert.Nil(t, req.Response.Headers)
 	assert.Nil(t, req.Response.Body)
 }
