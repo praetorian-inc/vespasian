@@ -135,6 +135,10 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		XhrExtraction:     true,
 		Silent:            true,
 		OnResult: func(result output.Result) {
+			// Map result outside the lock — MapResult may do URL parsing
+			// and body truncation, which is wasted work under contention.
+			mapped := MapResult(result)
+
 			mu.Lock()
 			defer mu.Unlock()
 
@@ -144,7 +148,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			}
 			pageCount++
 
-			results = append(results, MapResult(result))
+			results = append(results, mapped)
 			// Stop Katana once MaxPages is reached to avoid wasting resources.
 			if pageCount >= maxPages {
 				crawlCancel()

@@ -108,6 +108,13 @@ func isTokenChar(c byte) bool {
 	}
 }
 
+// shutdownBackstop is the maximum time doCrawl waits for Crawl() to return
+// after context cancellation. Crawl() has internal bounded shutdown (~2.5s),
+// so this is a defense-in-depth timeout that avoids blocking indefinitely if
+// the engine is stuck. The force-exit handler (second signal) is the final
+// safety net beyond this.
+const shutdownBackstop = 10 * time.Second
+
 // doCrawl executes the common crawl pipeline: parse headers, create crawler,
 // run the crawl with the provided context, and return the results. On graceful
 // shutdown (SIGINT/SIGTERM) partial results are returned instead of an error.
@@ -122,7 +129,42 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, rawHeaders
 	opts.Stderr = stderr
 
 	crawler := crawl.NewCrawler(opts)
-	requests, err := crawler.Crawl(ctx, targetURL)
+
+	// Run Crawl in a goroutine so we can apply a backstop timeout after
+	// context cancellation. Without this, a stuck Crawl() blocks forever.
+	//
+	// Goroutine lifecycle: if the backstop fires before Crawl() returns,
+	// the goroutine remains alive until Crawl() eventually completes.
+	// The buffered channel (capacity 1) ensures it won't block on send.
+	// In a CLI context the process exits shortly after, and the force-exit
+	// handler (second SIGINT) is the final safety net.
+	type crawlResult struct {
+		requests []crawl.ObservedRequest
+		err      error
+	}
+	ch := make(chan crawlResult, 1)
+	go func() {
+		reqs, crawlErr := crawler.Crawl(ctx, targetURL)
+		ch <- crawlResult{reqs, crawlErr}
+	}()
+
+	var requests []crawl.ObservedRequest
+	select {
+	case r := <-ch:
+		requests, err = r.requests, r.err
+	case <-ctx.Done():
+		// Context cancelled (signal or deadline). Give Crawl() up to
+		// shutdownBackstop to finish its bounded internal shutdown.
+		backstop := time.NewTimer(shutdownBackstop)
+		select {
+		case r := <-ch:
+			requests, err = r.requests, r.err
+		case <-backstop.C:
+			return nil, fmt.Errorf("crawl failed: shutdown timed out after %s", shutdownBackstop)
+		}
+		backstop.Stop()
+	}
+
 	if err != nil {
 		if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && len(requests) > 0 {
 			fmt.Fprintf(stderr, "returning %d partial results\n", len(requests))
@@ -226,17 +268,21 @@ func setupBrowserAndSignals(crawlOpts CrawlOptions, extraOpts crawl.CrawlerOptio
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 
-	setupForceExitHandler(ctx, os.Stderr, func() {
+	// Single closure for browser teardown, shared between the force-exit
+	// handler and the deferred cleanup. BrowserManager.Close() is already
+	// idempotent (sync.Once), but a shared closure makes the intent explicit
+	// and avoids duplicating the nil-check.
+	closeBrowser := func() {
 		if browserMgr != nil {
 			browserMgr.Close()
 		}
-	}, os.Exit)
+	}
+
+	setupForceExitHandler(ctx, os.Stderr, closeBrowser, os.Exit)
 
 	cleanup := func() {
 		stop()
-		if browserMgr != nil {
-			browserMgr.Close()
-		}
+		closeBrowser()
 	}
 
 	return browserSetupResult{
