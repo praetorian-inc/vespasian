@@ -22,9 +22,18 @@ import (
 
 // BrowserOptions configures Chrome launch parameters.
 type BrowserOptions struct {
-	Headless   bool
-	NoSandbox  bool
-	ChromePath string // optional: path to system Chrome binary
+	Headless bool
+
+	// NoSandbox disables Chrome's OS-level sandbox. This removes a primary
+	// exploit mitigation barrier and should only be set in containerized or
+	// CI environments where the sandbox cannot be enabled (e.g., Docker
+	// without --cap-add SYS_ADMIN).
+	NoSandbox bool
+
+	// ChromePath overrides the Chrome binary used by the launcher. This value
+	// is passed directly to exec.Command — it must be a trusted, hardcoded
+	// path. Never populate from user-controlled input.
+	ChromePath string
 }
 
 // BrowserManager owns the Chrome process lifecycle. It launches Chrome via

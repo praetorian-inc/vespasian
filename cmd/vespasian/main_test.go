@@ -664,6 +664,24 @@ func TestOnForceExit_NilCleanup(t *testing.T) {
 	}
 }
 
+// TestOnForceExit_CleanupPanicRecovery verifies that if cleanup() panics,
+// exitFn is still called (process doesn't get stuck).
+func TestOnForceExit_CleanupPanicRecovery(t *testing.T) {
+	var stderr bytes.Buffer
+	var exitCode int
+
+	cleanup := func() { panic("cleanup exploded") }
+
+	onForceExit(&stderr, cleanup, func(code int) { exitCode = code })
+
+	if exitCode != 1 {
+		t.Errorf("exitFn called with code %d, want 1", exitCode)
+	}
+	if !strings.Contains(stderr.String(), "forcing immediate exit") {
+		t.Errorf("stderr = %q, want message containing 'forcing immediate exit'", stderr.String())
+	}
+}
+
 // TestDoCrawl_GracefulShutdownReturnsPartialResults exercises the real doCrawl
 // function with a pre-canceled context against a live httptest server. The
 // crawler returns context.Canceled with partial results, and doCrawl should
@@ -700,6 +718,39 @@ func TestDoCrawl_GracefulShutdownReturnsPartialResults(t *testing.T) {
 		t.Errorf("stderr = %q, want interrupt or partial-results message", stderr.String())
 	}
 	t.Logf("doCrawl returned %d partial results", len(results))
+}
+
+// TestDoCrawl_DeadlineExceededReturnsPartialResults exercises doCrawl with a
+// context that hits its deadline. The crawler returns context.DeadlineExceeded
+// with partial results, and doCrawl should convert that to (results, nil).
+func TestDoCrawl_DeadlineExceededReturnsPartialResults(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<html><body><a href="/page2">link</a></body></html>`)
+	}))
+	defer srv.Close()
+
+	// Use a very short deadline so the crawl times out quickly.
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	defer cancel()
+
+	// Let the deadline expire before calling doCrawl.
+	time.Sleep(5 * time.Millisecond)
+
+	var stderr bytes.Buffer
+	opts := crawl.CrawlerOptions{
+		Depth:    1,
+		MaxPages: 100,
+		Timeout:  30 * time.Second,
+		Headless: false,
+	}
+
+	results, err := doCrawl(ctx, &stderr, srv.URL, nil, opts)
+	if err != nil {
+		t.Fatalf("doCrawl() returned error %v, want nil (graceful shutdown on deadline)", err)
+	}
+	t.Logf("doCrawl returned %d partial results on DeadlineExceeded", len(results))
 }
 
 // TestDoCrawl_InvalidHeaderReturnsError verifies doCrawl rejects invalid headers

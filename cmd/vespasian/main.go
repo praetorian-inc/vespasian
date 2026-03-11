@@ -181,23 +181,70 @@ func setupForceExitHandler(ctx context.Context, stderr io.Writer, cleanup func()
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 		<-sigCh
-		if cleanup != nil {
-			cleanup()
-		}
-		fmt.Fprintf(stderr, "forcing immediate exit\n")
-		exitFn(1)
+		onForceExit(stderr, cleanup, exitFn)
 	}()
 }
 
-// onForceExit is the testable core of setupForceExitHandler. It runs cleanup,
-// writes the exit message, and calls exitFn. Extracted so tests can exercise
-// the logic without sending real signals.
+// onForceExit is the testable core of setupForceExitHandler. It runs cleanup
+// (with panic recovery to guarantee exitFn is called), writes the exit message,
+// and calls exitFn. Extracted so tests can exercise the logic without sending
+// real signals.
 func onForceExit(stderr io.Writer, cleanup func(), exitFn func(int)) {
 	if cleanup != nil {
-		cleanup()
+		func() {
+			defer func() { recover() }()
+			cleanup()
+		}()
 	}
 	fmt.Fprintf(stderr, "forcing immediate exit\n")
 	exitFn(1)
+}
+
+// browserSetupResult holds the resources created by setupBrowserAndSignals.
+type browserSetupResult struct {
+	opts    crawl.CrawlerOptions
+	ctx     context.Context
+	stop    context.CancelFunc
+	cleanup func() // caller must defer this
+}
+
+// setupBrowserAndSignals creates a BrowserManager (if headless), wires up
+// signal handling with force-exit support, and returns a cancellable context.
+// The returned cleanup function closes the browser and stops the signal handler;
+// callers must defer it.
+func setupBrowserAndSignals(crawlOpts CrawlOptions, extraOpts crawl.CrawlerOptions) (browserSetupResult, error) {
+	var browserMgr *crawl.BrowserManager
+
+	if crawlOpts.Headless {
+		var err error
+		browserMgr, err = crawl.NewBrowserManager(crawl.BrowserOptions{Headless: true})
+		if err != nil {
+			return browserSetupResult{}, fmt.Errorf("launch browser: %w", err)
+		}
+		extraOpts.BrowserMgr = browserMgr
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+
+	setupForceExitHandler(ctx, os.Stderr, func() {
+		if browserMgr != nil {
+			browserMgr.Close()
+		}
+	}, os.Exit)
+
+	cleanup := func() {
+		stop()
+		if browserMgr != nil {
+			browserMgr.Close()
+		}
+	}
+
+	return browserSetupResult{
+		opts:    extraOpts,
+		ctx:     ctx,
+		stop:    stop,
+		cleanup: cleanup,
+	}, nil
 }
 
 // CrawlCmd crawls a web application to capture HTTP traffic.
@@ -213,41 +260,24 @@ func (c *CrawlCmd) Run() error {
 		return err
 	}
 
-	opts := crawl.CrawlerOptions{
+	bs, err := setupBrowserAndSignals(c.CrawlOptions, crawl.CrawlerOptions{
 		Depth:    c.Depth,
 		MaxPages: c.MaxPages,
 		Timeout:  c.Timeout,
 		Scope:    c.Scope,
 		Headless: c.Headless,
+	})
+	if err != nil {
+		return err
 	}
-
-	// Create browser before signal setup so force-exit can clean up temp dirs.
-	var browserMgr *crawl.BrowserManager
-	if c.Headless {
-		var err error
-		browserMgr, err = crawl.NewBrowserManager(crawl.BrowserOptions{Headless: true})
-		if err != nil {
-			return fmt.Errorf("launch browser: %w", err)
-		}
-		defer browserMgr.Close()
-		opts.BrowserMgr = browserMgr
-	}
+	defer bs.cleanup()
 
 	if c.Verbose {
 		fmt.Fprintf(os.Stderr, "crawling %s (depth=%d, max-pages=%d, timeout=%s)\n",
-			c.URL, opts.Depth, opts.MaxPages, opts.Timeout)
+			c.URL, bs.opts.Depth, bs.opts.MaxPages, bs.opts.Timeout)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	setupForceExitHandler(ctx, os.Stderr, func() {
-		if browserMgr != nil {
-			browserMgr.Close()
-		}
-	}, os.Exit)
-
-	requests, err := doCrawl(ctx, os.Stderr, c.URL, c.Header, opts)
+	requests, err := doCrawl(bs.ctx, os.Stderr, c.URL, c.Header, bs.opts)
 	if err != nil {
 		return err
 	}
@@ -371,41 +401,24 @@ func (c *ScanCmd) Run() error {
 		return err
 	}
 
-	opts := crawl.CrawlerOptions{
+	bs, err := setupBrowserAndSignals(c.CrawlOptions, crawl.CrawlerOptions{
 		Depth:    c.Depth,
 		MaxPages: c.MaxPages,
 		Timeout:  c.Timeout,
 		Scope:    c.Scope,
 		Headless: c.Headless,
+	})
+	if err != nil {
+		return err
 	}
-
-	// Create browser before signal setup so force-exit can clean up temp dirs.
-	var browserMgr *crawl.BrowserManager
-	if c.Headless {
-		var err error
-		browserMgr, err = crawl.NewBrowserManager(crawl.BrowserOptions{Headless: true})
-		if err != nil {
-			return fmt.Errorf("launch browser: %w", err)
-		}
-		defer browserMgr.Close()
-		opts.BrowserMgr = browserMgr
-	}
+	defer bs.cleanup()
 
 	if c.Verbose {
 		fmt.Fprintf(os.Stderr, "crawling %s (depth=%d, max-pages=%d, timeout=%s)\n",
-			c.URL, opts.Depth, opts.MaxPages, opts.Timeout)
+			c.URL, bs.opts.Depth, bs.opts.MaxPages, bs.opts.Timeout)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	setupForceExitHandler(ctx, os.Stderr, func() {
-		if browserMgr != nil {
-			browserMgr.Close()
-		}
-	}, os.Exit)
-
-	requests, err := doCrawl(ctx, os.Stderr, c.URL, c.Header, opts)
+	requests, err := doCrawl(bs.ctx, os.Stderr, c.URL, c.Header, bs.opts)
 	if err != nil {
 		return err
 	}
@@ -415,7 +428,7 @@ func (c *ScanCmd) Run() error {
 		fmt.Fprintf(os.Stderr, "generating REST spec\n")
 	}
 
-	spec, err := generateSpec(ctx, requests, "rest", c.Confidence, c.Probe, c.Verbose)
+	spec, err := generateSpec(bs.ctx, requests, "rest", c.Confidence, c.Probe, c.Verbose)
 	if err != nil {
 		return err
 	}

@@ -52,8 +52,15 @@ type CrawlerOptions struct {
 	Scope      string
 	Headless   bool
 	Headers    map[string]string
-	Stderr     io.Writer       // user-facing status messages; nil disables output
-	BrowserMgr *BrowserManager // if set, Crawl() uses this browser; caller owns lifecycle
+	Stderr io.Writer // user-facing status messages; nil disables output
+
+	// BrowserMgr provides a caller-owned Chrome instance. When set, Crawl()
+	// connects to this browser instead of launching its own. Callers who want
+	// immediate signal-based browser termination (force-exit killing Chrome on
+	// second SIGINT) MUST provide their own BrowserManager and wire it into
+	// their signal handler. The internal fallback (BrowserMgr == nil) launches
+	// a browser that lacks force-exit integration.
+	BrowserMgr *BrowserManager
 }
 
 // Crawler performs web crawling to capture HTTP traffic.
