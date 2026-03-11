@@ -343,13 +343,13 @@ func TestMaxResponseBodySize(t *testing.T) {
 	}
 }
 
-
 // TestPageTimeout verifies the PageTimeout constant value
 func TestPageTimeout(t *testing.T) {
 	if PageTimeout != 30 {
 		t.Errorf("PageTimeout = %d, want 30", PageTimeout)
 	}
 }
+
 // TestMapResult_TruncatesLargeResponseBody tests that response bodies exceeding MaxResponseBodySize get truncated
 func TestMapResult_TruncatesLargeResponseBody(t *testing.T) {
 	largeBody := make([]byte, MaxResponseBodySize+1000) // 1000 bytes over limit
@@ -438,5 +438,63 @@ func TestMapResult_SmallBodyNotTruncated(t *testing.T) {
 
 	if string(observed.Response.Body) != string(smallResponseBody) {
 		t.Errorf("Response body = %q, want %q (should not be truncated)", string(observed.Response.Body), string(smallResponseBody))
+	}
+}
+
+// TestMapResult_LowercaseContentType tests that MapResult extracts ContentType
+// from lowercase header keys, as Katana normalizes response headers to lowercase.
+func TestMapResult_LowercaseContentType(t *testing.T) {
+	tests := []struct {
+		name            string
+		headers         navigation.Headers
+		wantContentType string
+	}{
+		{
+			name:            "lowercase content-type from Katana",
+			headers:         navigation.Headers{"content-type": "application/json"},
+			wantContentType: "application/json",
+		},
+		{
+			name:            "title-case Content-Type",
+			headers:         navigation.Headers{"Content-Type": "text/html"},
+			wantContentType: "text/html",
+		},
+		{
+			name:            "uppercase CONTENT-TYPE",
+			headers:         navigation.Headers{"CONTENT-TYPE": "application/xml"},
+			wantContentType: "application/xml",
+		},
+		{
+			name:            "no content-type header",
+			headers:         navigation.Headers{"X-Custom": "value"},
+			wantContentType: "",
+		},
+		{
+			name:            "empty headers",
+			headers:         navigation.Headers{},
+			wantContentType: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := output.Result{
+				Request: &navigation.Request{
+					Method: "GET",
+					URL:    "https://example.com/api/data",
+				},
+				Response: &navigation.Response{
+					StatusCode: 200,
+					Headers:    tt.headers,
+					Body:       "response",
+				},
+			}
+
+			observed := MapResult(result)
+
+			if observed.Response.ContentType != tt.wantContentType {
+				t.Errorf("ContentType = %q, want %q", observed.Response.ContentType, tt.wantContentType)
+			}
+		})
 	}
 }
