@@ -42,17 +42,21 @@ const (
 	// internal result buffer to drain. Chrome is dead at this point — no network
 	// activity — we're just collecting already-buffered results.
 	ShutdownGracePeriod = 2 * time.Second
+	// DrainTimeout is the secondary bounded wait after engine.Close() for the
+	// crawl goroutine to exit. Prevents goroutine leaks when the engine is slow
+	// to shut down.
+	DrainTimeout = 500 * time.Millisecond
 )
 
 // CrawlerOptions configures the crawler behavior.
 type CrawlerOptions struct {
-	Depth      int
-	MaxPages   int
-	Timeout    time.Duration
-	Scope      string
-	Headless   bool
-	Headers    map[string]string
-	Stderr io.Writer // user-facing status messages; nil disables output
+	Depth    int
+	MaxPages int
+	Timeout  time.Duration
+	Scope    string
+	Headless bool
+	Headers  map[string]string
+	Stderr   io.Writer // user-facing status messages; nil disables output
 
 	// BrowserMgr provides a caller-owned Chrome instance. When set, Crawl()
 	// connects to this browser instead of launching its own. Callers who want
@@ -115,18 +119,18 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 
 	// Build Katana options
 	katanaOpts := &types.Options{
-		MaxDepth:          c.opts.Depth,
-		Timeout:           PageTimeout,
-		CrawlDuration:     c.opts.Timeout,
-		FieldScope:        MapScope(c.opts.Scope),
-		Headless:          c.opts.Headless,
-		CustomHeaders:     ToStringSlice(c.opts.Headers),
-		Strategy:          "depth-first",
+		MaxDepth:      c.opts.Depth,
+		Timeout:       PageTimeout,
+		CrawlDuration: c.opts.Timeout,
+		FieldScope:    MapScope(c.opts.Scope),
+		Headless:      c.opts.Headless,
+		CustomHeaders: ToStringSlice(c.opts.Headers),
+		Strategy:      "depth-first",
 		// BodyReadSize (10 MB) is intentionally larger than MaxResponseBodySize (1 MB).
 		// Katana needs the full body for link extraction and JS parsing to maximize
 		// crawl coverage; we only retain MaxResponseBodySize for classification.
 		// Peak memory: up to Concurrency × BodyReadSize (100 MB with 10 workers).
-		BodyReadSize: 10 * 1024 * 1024,
+		BodyReadSize:      10 * 1024 * 1024,
 		Concurrency:       10,
 		Parallelism:       10,
 		RateLimit:         150,
@@ -235,7 +239,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			if timerExpired {
 				// engine.Close() causes engine.Crawl() to return shortly.
 				// Wait briefly to prevent goroutine leak.
-				drainTimer := time.NewTimer(500 * time.Millisecond)
+				drainTimer := time.NewTimer(DrainTimeout)
 				select {
 				case <-crawlErr:
 				case <-drainTimer.C:
@@ -252,9 +256,15 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			return snapshot, ctx.Err()
 		}
 
-		// MaxPages reached — close engine and drain goroutine.
+		// MaxPages reached — close engine and drain goroutine with a bounded wait
+		// to match the signal path's timeout discipline.
 		closeEngine()
-		<-crawlErr
+		drainTimer := time.NewTimer(ShutdownGracePeriod)
+		select {
+		case <-crawlErr:
+		case <-drainTimer.C:
+		}
+		drainTimer.Stop()
 	}
 
 	mu.Lock()

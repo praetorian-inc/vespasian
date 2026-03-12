@@ -665,7 +665,7 @@ func TestOnForceExit_NilCleanup(t *testing.T) {
 }
 
 // TestOnForceExit_CleanupPanicRecovery verifies that if cleanup() panics,
-// exitFn is still called (process doesn't get stuck).
+// exitFn is still called and the panic value is logged.
 func TestOnForceExit_CleanupPanicRecovery(t *testing.T) {
 	var stderr bytes.Buffer
 	var exitCode int
@@ -677,8 +677,12 @@ func TestOnForceExit_CleanupPanicRecovery(t *testing.T) {
 	if exitCode != 1 {
 		t.Errorf("exitFn called with code %d, want 1", exitCode)
 	}
-	if !strings.Contains(stderr.String(), "forcing immediate exit") {
-		t.Errorf("stderr = %q, want message containing 'forcing immediate exit'", stderr.String())
+	output := stderr.String()
+	if !strings.Contains(output, "cleanup panicked: cleanup exploded") {
+		t.Errorf("stderr = %q, want message containing panic value", output)
+	}
+	if !strings.Contains(output, "forcing immediate exit") {
+		t.Errorf("stderr = %q, want message containing 'forcing immediate exit'", output)
 	}
 }
 
@@ -707,7 +711,7 @@ func TestDoCrawl_GracefulShutdownReturnsPartialResults(t *testing.T) {
 		Headless: false,
 	}
 
-	results, err := doCrawl(ctx, &stderr, srv.URL, nil, opts)
+	results, err := doCrawl(ctx, &stderr, srv.URL, opts)
 	if err != nil {
 		t.Fatalf("doCrawl() returned error %v, want nil (graceful shutdown)", err)
 	}
@@ -746,24 +750,25 @@ func TestDoCrawl_DeadlineExceededReturnsPartialResults(t *testing.T) {
 		Headless: false,
 	}
 
-	results, err := doCrawl(ctx, &stderr, srv.URL, nil, opts)
+	results, err := doCrawl(ctx, &stderr, srv.URL, opts)
 	if err != nil {
 		t.Fatalf("doCrawl() returned error %v, want nil (graceful shutdown on deadline)", err)
 	}
 	t.Logf("doCrawl returned %d partial results on DeadlineExceeded", len(results))
 }
 
-// TestDoCrawl_InvalidHeaderReturnsError verifies doCrawl rejects invalid headers
-// before creating a crawler.
-func TestDoCrawl_InvalidHeaderReturnsError(t *testing.T) {
-	var stderr bytes.Buffer
-	opts := crawl.CrawlerOptions{Depth: 1, Headless: false}
-
-	_, err := doCrawl(context.Background(), &stderr, "https://example.com", []string{"bad header"}, opts)
+// TestSetupBrowserAndSignals_InvalidHeaderReturnsError verifies that invalid
+// headers are rejected before launching Chrome.
+func TestSetupBrowserAndSignals_InvalidHeaderReturnsError(t *testing.T) {
+	_, err := setupBrowserAndSignals(
+		[]string{"bad header"},
+		CrawlOptions{Headless: false},
+		crawl.CrawlerOptions{Depth: 1},
+	)
 	if err == nil {
-		t.Fatal("doCrawl() expected error for invalid header, got nil")
+		t.Fatal("setupBrowserAndSignals() expected error for invalid header, got nil")
 	}
 	if !strings.Contains(err.Error(), "invalid header") {
-		t.Errorf("doCrawl() error = %q, want 'invalid header'", err.Error())
+		t.Errorf("setupBrowserAndSignals() error = %q, want 'invalid header'", err.Error())
 	}
 }

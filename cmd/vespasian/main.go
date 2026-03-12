@@ -115,17 +115,18 @@ func isTokenChar(c byte) bool {
 // safety net beyond this.
 const shutdownBackstop = 10 * time.Second
 
-// doCrawl executes the common crawl pipeline: parse headers, create crawler,
-// run the crawl with the provided context, and return the results. On graceful
-// shutdown (SIGINT/SIGTERM) partial results are returned instead of an error.
+// doCrawl executes the common crawl pipeline: create crawler, run the crawl
+// with the provided context, and return the results. On graceful shutdown
+// (SIGINT/SIGTERM) partial results are returned instead of an error.
 // The stderr parameter controls where user-facing status messages are written,
 // allowing tests to capture output.
-func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, rawHeaders []string, opts crawl.CrawlerOptions) ([]crawl.ObservedRequest, error) {
-	headers, err := parseHeaders(rawHeaders)
-	if err != nil {
-		return nil, fmt.Errorf("invalid header: %w", err)
-	}
-	opts.Headers = headers
+//
+// Goroutine lifecycle: if the backstop timer fires before Crawl() returns, the
+// crawl goroutine leaks until Crawl() eventually completes. In CLI usage the
+// process exits shortly after and the force-exit handler (second SIGINT) is the
+// final safety net. Library callers should be aware that a stuck engine may
+// leave a goroutine alive after doCrawl returns.
+func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl.CrawlerOptions) ([]crawl.ObservedRequest, error) {
 	opts.Stderr = stderr
 
 	crawler := crawl.NewCrawler(opts)
@@ -149,6 +150,7 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, rawHeaders
 	}()
 
 	var requests []crawl.ObservedRequest
+	var err error
 	select {
 	case r := <-ch:
 		requests, err = r.requests, r.err
@@ -234,7 +236,11 @@ func setupForceExitHandler(ctx context.Context, stderr io.Writer, cleanup func()
 func onForceExit(stderr io.Writer, cleanup func(), exitFn func(int)) {
 	if cleanup != nil {
 		func() {
-			defer func() { recover() }()
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(stderr, "cleanup panicked: %v\n", r)
+				}
+			}()
 			cleanup()
 		}()
 	}
@@ -246,19 +252,26 @@ func onForceExit(stderr io.Writer, cleanup func(), exitFn func(int)) {
 type browserSetupResult struct {
 	opts    crawl.CrawlerOptions
 	ctx     context.Context
-	stop    context.CancelFunc
 	cleanup func() // caller must defer this
 }
 
-// setupBrowserAndSignals creates a BrowserManager (if headless), wires up
-// signal handling with force-exit support, and returns a cancellable context.
-// The returned cleanup function closes the browser and stops the signal handler;
-// callers must defer it.
-func setupBrowserAndSignals(crawlOpts CrawlOptions, extraOpts crawl.CrawlerOptions) (browserSetupResult, error) {
+// setupBrowserAndSignals validates headers, creates a BrowserManager (if
+// headless), wires up signal handling with force-exit support, and returns a
+// cancellable context. Headers are validated before launching Chrome so that
+// invalid headers fail fast without wasting browser startup time. The returned
+// cleanup function closes the browser and stops the signal handler; callers
+// must defer it.
+func setupBrowserAndSignals(rawHeaders []string, crawlOpts CrawlOptions, extraOpts crawl.CrawlerOptions) (browserSetupResult, error) {
+	// Validate headers before launching Chrome — fail fast on invalid input.
+	headers, err := parseHeaders(rawHeaders)
+	if err != nil {
+		return browserSetupResult{}, fmt.Errorf("invalid header: %w", err)
+	}
+	extraOpts.Headers = headers
+
 	var browserMgr *crawl.BrowserManager
 
 	if crawlOpts.Headless {
-		var err error
 		browserMgr, err = crawl.NewBrowserManager(crawl.BrowserOptions{Headless: true})
 		if err != nil {
 			return browserSetupResult{}, fmt.Errorf("launch browser: %w", err)
@@ -288,7 +301,6 @@ func setupBrowserAndSignals(crawlOpts CrawlOptions, extraOpts crawl.CrawlerOptio
 	return browserSetupResult{
 		opts:    extraOpts,
 		ctx:     ctx,
-		stop:    stop,
 		cleanup: cleanup,
 	}, nil
 }
@@ -306,7 +318,7 @@ func (c *CrawlCmd) Run() error {
 		return err
 	}
 
-	bs, err := setupBrowserAndSignals(c.CrawlOptions, crawl.CrawlerOptions{
+	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions, crawl.CrawlerOptions{
 		Depth:    c.Depth,
 		MaxPages: c.MaxPages,
 		Timeout:  c.Timeout,
@@ -323,7 +335,7 @@ func (c *CrawlCmd) Run() error {
 			c.URL, bs.opts.Depth, bs.opts.MaxPages, bs.opts.Timeout)
 	}
 
-	requests, err := doCrawl(bs.ctx, os.Stderr, c.URL, c.Header, bs.opts)
+	requests, err := doCrawl(bs.ctx, os.Stderr, c.URL, bs.opts)
 	if err != nil {
 		return err
 	}
@@ -447,7 +459,7 @@ func (c *ScanCmd) Run() error {
 		return err
 	}
 
-	bs, err := setupBrowserAndSignals(c.CrawlOptions, crawl.CrawlerOptions{
+	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions, crawl.CrawlerOptions{
 		Depth:    c.Depth,
 		MaxPages: c.MaxPages,
 		Timeout:  c.Timeout,
@@ -464,7 +476,7 @@ func (c *ScanCmd) Run() error {
 			c.URL, bs.opts.Depth, bs.opts.MaxPages, bs.opts.Timeout)
 	}
 
-	requests, err := doCrawl(bs.ctx, os.Stderr, c.URL, c.Header, bs.opts)
+	requests, err := doCrawl(bs.ctx, os.Stderr, c.URL, bs.opts)
 	if err != nil {
 		return err
 	}
