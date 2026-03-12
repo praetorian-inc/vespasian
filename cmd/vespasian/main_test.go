@@ -421,7 +421,7 @@ func TestGenerateSpec(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := generateSpec(context.Background(), requests, tt.apiType, 0.5, tt.probe, tt.verbose)
+			_, err := generateSpec(context.Background(), requests, tt.apiType, 0.5, tt.probe, tt.verbose, nil)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("generateSpec() expected error containing %q, got nil", tt.wantErrStr)
@@ -442,7 +442,7 @@ func TestGenerateSpec(t *testing.T) {
 // With real implementations, empty requests produce no classified endpoints,
 // so the generator returns nil spec with no error.
 func TestGenerateSpec_EmptyRequests(t *testing.T) {
-	spec, err := generateSpec(context.Background(), []crawl.ObservedRequest{}, "rest", 0.5, false, false)
+	spec, err := generateSpec(context.Background(), []crawl.ObservedRequest{}, "rest", 0.5, false, false, nil)
 	if err != nil {
 		t.Fatalf("generateSpec() unexpected error: %v", err)
 	}

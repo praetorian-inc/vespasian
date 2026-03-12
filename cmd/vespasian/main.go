@@ -212,12 +212,13 @@ func (c *ImportCmd) Run() error {
 
 // GenerateCmd generates API specifications from captured traffic.
 type GenerateCmd struct {
-	APIType    string  `arg:"" enum:"rest,wsdl" help:"API type to generate"`
-	Capture    string  `arg:"" help:"Capture file path"`
-	Output     string  `short:"o" help:"Output file path"`
-	Confidence float64 `default:"0.5" help:"Minimum confidence threshold"`
-	Probe      bool    `default:"true" help:"Enable endpoint probing"`
-	Verbose    bool    `short:"v" help:"Enable verbose logging"`
+	APIType    string   `arg:"" enum:"rest,wsdl" help:"API type to generate"`
+	Capture    string   `arg:"" help:"Capture file path"`
+	Output     string   `short:"o" help:"Output file path"`
+	Header     []string `short:"H" help:"Auth headers for replaying incomplete requests (repeatable)"`
+	Confidence float64  `default:"0.5" help:"Minimum confidence threshold"`
+	Probe      bool     `default:"true" help:"Enable endpoint probing"`
+	Verbose    bool     `short:"v" help:"Enable verbose logging"`
 }
 
 // maxCaptureSize is the maximum capture file size (100MB).
@@ -256,7 +257,12 @@ func (c *GenerateCmd) Run() (err error) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	spec, err := generateSpec(ctx, requests, c.APIType, c.Confidence, c.Probe, c.Verbose)
+	headers, err := parseHeaders(c.Header)
+	if err != nil {
+		return fmt.Errorf("invalid header: %w", err)
+	}
+
+	spec, err := generateSpec(ctx, requests, c.APIType, c.Confidence, c.Probe, c.Verbose, headers)
 	if err != nil {
 		return err
 	}
@@ -307,7 +313,12 @@ func (c *ScanCmd) Run() error {
 		fmt.Fprintf(os.Stderr, "generating REST spec\n")
 	}
 
-	spec, err := generateSpec(ctx, requests, "rest", c.Confidence, c.Probe, c.Verbose)
+	headers, err := parseHeaders(c.Header)
+	if err != nil {
+		return fmt.Errorf("invalid header: %w", err)
+	}
+
+	spec, err := generateSpec(ctx, requests, "rest", c.Confidence, c.Probe, c.Verbose, headers)
 	if err != nil {
 		return err
 	}
@@ -337,8 +348,22 @@ func main() {
 	ctx.FatalIfErrorf(err)
 }
 
-// generateSpec runs the classify → probe → generate pipeline.
-func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, apiType string, confidence float64, doProbe bool, verbose bool) ([]byte, error) {
+// generateSpec runs the replay → classify → probe → generate pipeline.
+// When headers are provided, requests with missing responses are replayed
+// with auth headers to capture full request/response pairs (e.g., XHR-extracted
+// URLs discovered during headless crawling).
+func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, apiType string, confidence float64, doProbe bool, verbose bool, headers map[string]string) ([]byte, error) {
+	// Replay requests that lack responses (e.g., XHR-extracted URLs).
+	if len(headers) > 0 {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "replaying %d requests with auth headers\n", len(requests))
+		}
+		requests = crawl.ReplayAndMerge(ctx, requests, headers)
+		if verbose {
+			fmt.Fprintf(os.Stderr, "after replay: %d requests\n", len(requests))
+		}
+	}
+
 	classifiers := classifiersForType(apiType)
 	if classifiers == nil {
 		return nil, fmt.Errorf("unsupported API type: %q", apiType)
