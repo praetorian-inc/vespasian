@@ -17,7 +17,9 @@ package crawl
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/url"
+	"os"
 	"sync"
 	"time"
 
@@ -84,6 +86,25 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 	var mu sync.Mutex
 	pageCount := 0
 
+	// When headless crawling with a Bearer token, pre-seed the browser's
+	// localStorage with the token. SPAs commonly gate API calls on
+	// localStorage auth tokens — without this, the browser's JavaScript
+	// won't make authenticated fetch/XHR requests even though Katana
+	// injects the -H header at the CDP network level.
+	var chromeDataDir string
+	if c.opts.Headless {
+		if bearerToken := extractBearerToken(c.opts.Headers); bearerToken != "" {
+			dataDir, seedErr := preSeedBrowserAuth(targetURL, bearerToken)
+			if seedErr != nil {
+				slog.Warn("failed to pre-seed browser auth, crawl will proceed without localStorage injection",
+					"error", seedErr)
+			} else {
+				chromeDataDir = dataDir
+				defer func() { _ = os.RemoveAll(chromeDataDir) }()
+			}
+		}
+	}
+
 	// Build Katana options
 	katanaOpts := &types.Options{
 		MaxDepth:          c.opts.Depth,
@@ -101,6 +122,8 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		ScrapeJSResponses: true,
 		XhrExtraction:     true,
 		Silent:            true,
+		ChromeDataDir:     chromeDataDir,
+		HeadlessNoIncognito: chromeDataDir != "",
 		OnResult: func(result output.Result) {
 			mu.Lock()
 			defer mu.Unlock()
