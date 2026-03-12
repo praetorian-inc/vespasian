@@ -486,7 +486,14 @@ func (c *ScanCmd) Run() error {
 		fmt.Fprintf(os.Stderr, "generating REST spec\n")
 	}
 
-	spec, err := generateSpec(bs.ctx, requests, "rest", c.Confidence, c.Probe, c.Verbose)
+	// Create a fresh signal context for the generate phase. If a signal
+	// interrupted the crawl, bs.ctx is already cancelled — doCrawl swallowed
+	// the error and returned partial results. Using the cancelled context
+	// would cause generateSpec's probing to bail out immediately.
+	genCtx, genStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer genStop()
+
+	spec, err := generateSpec(genCtx, requests, "rest", c.Confidence, c.Probe, c.Verbose)
 	if err != nil {
 		return err
 	}
