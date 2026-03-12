@@ -421,7 +421,7 @@ func TestGenerateSpec(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := generateSpec(context.Background(), requests, tt.apiType, 0.5, tt.probe, tt.verbose)
+			_, err := generateSpec(context.Background(), requests, tt.apiType, 0.5, tt.probe, false, tt.verbose)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("generateSpec() expected error containing %q, got nil", tt.wantErrStr)
@@ -442,7 +442,7 @@ func TestGenerateSpec(t *testing.T) {
 // With real implementations, empty requests produce no classified endpoints,
 // so the generator returns nil spec with no error.
 func TestGenerateSpec_EmptyRequests(t *testing.T) {
-	spec, err := generateSpec(context.Background(), []crawl.ObservedRequest{}, "rest", 0.5, false, false)
+	spec, err := generateSpec(context.Background(), []crawl.ObservedRequest{}, "rest", 0.5, false, false, false)
 	if err != nil {
 		t.Fatalf("generateSpec() unexpected error: %v", err)
 	}
@@ -562,6 +562,139 @@ func TestCrawlOptions_Embedded(t *testing.T) {
 	}
 	if !s.Headless {
 		t.Error("ScanCmd.Headless = false, want true")
+	}
+}
+
+// TestDangerousAllowPrivate_GenerateSpec tests generateSpec with allowPrivate=true.
+func TestDangerousAllowPrivate_GenerateSpec(t *testing.T) {
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/api/users",
+			Headers: map[string]string{
+				"Content-Type": "application/json",
+			},
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+			},
+		},
+	}
+
+	tests := []struct {
+		name    string
+		probe   bool
+		wantErr bool
+	}{
+		{
+			name:    "allowPrivate with probe disabled",
+			probe:   false,
+			wantErr: false,
+		},
+		{
+			name:    "allowPrivate with probe enabled",
+			probe:   true,
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := generateSpec(context.Background(), requests, "rest", 0.5, tt.probe, true, false)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("generateSpec() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestDangerousAllowPrivate_GenerateCmd verifies GenerateCmd accepts DangerousAllowPrivate
+// and completes without error when probing with the flag enabled.
+func TestDangerousAllowPrivate_GenerateCmd(t *testing.T) {
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/api/users",
+			Headers: map[string]string{
+				"Content-Type": "application/json",
+			},
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+			},
+		},
+	}
+
+	capturePath := filepath.Join(t.TempDir(), "capture.json")
+	f, err := os.Create(capturePath)
+	if err != nil {
+		t.Fatalf("failed to create temp capture file: %v", err)
+	}
+	if writeErr := crawl.WriteCapture(f, requests); writeErr != nil {
+		_ = f.Close()
+		t.Fatalf("failed to write capture: %v", writeErr)
+	}
+	_ = f.Close()
+
+	cmd := &GenerateCmd{
+		APIType:               "rest",
+		Capture:               capturePath,
+		Probe:                 true,
+		DangerousAllowPrivate: true,
+	}
+	if err := cmd.Run(); err != nil {
+		t.Errorf("GenerateCmd.Run() with DangerousAllowPrivate unexpected error: %v", err)
+	}
+}
+
+// TestDangerousAllowPrivate_ScanCmd verifies ScanCmd accepts the DangerousAllowPrivate field.
+func TestDangerousAllowPrivate_ScanCmd(t *testing.T) {
+	cmd := &ScanCmd{
+		URL:                   "https://example.com",
+		DangerousAllowPrivate: true,
+		CrawlOptions: CrawlOptions{
+			Depth:    3,
+			MaxPages: 100,
+		},
+	}
+	if !cmd.DangerousAllowPrivate {
+		t.Error("ScanCmd.DangerousAllowPrivate = false, want true")
+	}
+	if cmd.URL != "https://example.com" {
+		t.Errorf("ScanCmd.URL = %q, want %q", cmd.URL, "https://example.com")
+	}
+}
+
+// TestDangerousAllowPrivate_SameOutputForPublicURLs verifies that allowPrivate=true
+// and allowPrivate=false produce identical specs when all targets are public.
+func TestDangerousAllowPrivate_SameOutputForPublicURLs(t *testing.T) {
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/api/users",
+			Headers: map[string]string{
+				"Content-Type": "application/json",
+			},
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+			},
+		},
+	}
+
+	specWithout, err := generateSpec(context.Background(), requests, "rest", 0.5, false, false, false)
+	if err != nil {
+		t.Fatalf("generateSpec(allowPrivate=false) unexpected error: %v", err)
+	}
+
+	specWith, err := generateSpec(context.Background(), requests, "rest", 0.5, false, true, false)
+	if err != nil {
+		t.Fatalf("generateSpec(allowPrivate=true) unexpected error: %v", err)
+	}
+
+	if string(specWithout) != string(specWith) {
+		t.Errorf("specs differ for public URLs:\n  allowPrivate=false: %d bytes\n  allowPrivate=true:  %d bytes",
+			len(specWithout), len(specWith))
 	}
 }
 

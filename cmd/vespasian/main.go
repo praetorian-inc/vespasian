@@ -212,12 +212,13 @@ func (c *ImportCmd) Run() error {
 
 // GenerateCmd generates API specifications from captured traffic.
 type GenerateCmd struct {
-	APIType    string  `arg:"" enum:"rest,wsdl" help:"API type to generate"`
-	Capture    string  `arg:"" help:"Capture file path"`
-	Output     string  `short:"o" help:"Output file path"`
-	Confidence float64 `default:"0.5" help:"Minimum confidence threshold"`
-	Probe      bool    `default:"true" help:"Enable endpoint probing"`
-	Verbose    bool    `short:"v" help:"Enable verbose logging"`
+	APIType               string  `arg:"" enum:"rest,wsdl" help:"API type to generate"`
+	Capture               string  `arg:"" help:"Capture file path"`
+	Output                string  `short:"o" help:"Output file path"`
+	Confidence            float64 `default:"0.5" help:"Minimum confidence threshold"`
+	Probe                 bool    `default:"true" help:"Enable endpoint probing"`
+	DangerousAllowPrivate bool    `help:"Disable SSRF protection for probes, allowing private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
+	Verbose               bool    `short:"v" help:"Enable verbose logging"`
 }
 
 // maxCaptureSize is the maximum capture file size (100MB).
@@ -256,7 +257,7 @@ func (c *GenerateCmd) Run() (err error) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	spec, err := generateSpec(ctx, requests, c.APIType, c.Confidence, c.Probe, c.Verbose)
+	spec, err := generateSpec(ctx, requests, c.APIType, c.Confidence, c.Probe, c.DangerousAllowPrivate, c.Verbose)
 	if err != nil {
 		return err
 	}
@@ -269,9 +270,10 @@ func (c *GenerateCmd) Run() (err error) {
 
 // ScanCmd runs the full pipeline: crawl, classify, and generate.
 type ScanCmd struct {
-	URL        string  `arg:"" help:"Target URL to scan"`
-	Confidence float64 `default:"0.5" help:"Minimum confidence threshold"`
-	Probe      bool    `default:"true" help:"Enable endpoint probing"`
+	URL                   string  `arg:"" help:"Target URL to scan"`
+	Confidence            float64 `default:"0.5" help:"Minimum confidence threshold"`
+	Probe                 bool    `default:"true" help:"Enable endpoint probing"`
+	DangerousAllowPrivate bool    `help:"Disable SSRF protection for probes, allowing private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 	CrawlOptions
 }
 
@@ -307,7 +309,7 @@ func (c *ScanCmd) Run() error {
 		fmt.Fprintf(os.Stderr, "generating REST spec\n")
 	}
 
-	spec, err := generateSpec(ctx, requests, "rest", c.Confidence, c.Probe, c.Verbose)
+	spec, err := generateSpec(ctx, requests, "rest", c.Confidence, c.Probe, c.DangerousAllowPrivate, c.Verbose)
 	if err != nil {
 		return err
 	}
@@ -338,7 +340,7 @@ func main() {
 }
 
 // generateSpec runs the classify → probe → generate pipeline.
-func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, apiType string, confidence float64, doProbe bool, verbose bool) ([]byte, error) {
+func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, apiType string, confidence float64, doProbe bool, allowPrivate bool, verbose bool) ([]byte, error) {
 	classifiers := classifiersForType(apiType)
 	if classifiers == nil {
 		return nil, fmt.Errorf("unsupported API type: %q", apiType)
@@ -349,15 +351,23 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, apiType
 		fmt.Fprintf(os.Stderr, "classified %d API requests (threshold=%.2f)\n", len(classified), confidence)
 	}
 
+	if allowPrivate {
+		fmt.Fprintf(os.Stderr, "WARNING: SSRF protection disabled — probes may target private/internal networks\n")
+	}
+
 	if doProbe {
+		cfg := probe.DefaultConfig()
+		if allowPrivate {
+			cfg.URLValidator = func(string) error { return nil }
+		}
 		var strategies []probe.ProbeStrategy
 		switch apiType {
 		case "wsdl":
-			strategies = []probe.ProbeStrategy{probe.NewWSDLProbe(probe.DefaultConfig())}
+			strategies = []probe.ProbeStrategy{probe.NewWSDLProbe(cfg)}
 		default:
 			strategies = []probe.ProbeStrategy{
-				&probe.OptionsProbe{},
-				&probe.SchemaProbe{},
+				probe.NewOptionsProbe(cfg),
+				probe.NewSchemaProbe(cfg),
 			}
 		}
 		enriched, probeErrs := probe.RunStrategies(ctx, strategies, classified)
