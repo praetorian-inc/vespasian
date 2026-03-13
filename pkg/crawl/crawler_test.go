@@ -387,6 +387,32 @@ func TestValidateProxyAddr(t *testing.T) {
 			}
 		})
 	}
+
+	// Verify credentials are never echoed in error messages, even when
+	// other validation (e.g., scheme) would also fail.
+	credentialLeakCases := []struct {
+		name string
+		addr string
+	}{
+		{"http with creds", "http://admin:s3cret@proxy:8080"},
+		{"wrong scheme with creds", "ftp://admin:s3cret@proxy:21"},
+		{"user only", "http://admin@proxy:8080"},
+	}
+	for _, tt := range credentialLeakCases {
+		t.Run("redacted/"+tt.name, func(t *testing.T) {
+			err := validateProxyAddr(tt.addr)
+			if err == nil {
+				t.Fatal("expected error for embedded credentials")
+			}
+			msg := err.Error()
+			if strings.Contains(msg, "admin") || strings.Contains(msg, "s3cret") {
+				t.Errorf("error message leaks credentials: %s", msg)
+			}
+			if !strings.Contains(msg, "xxxxx") {
+				t.Errorf("error message should contain redacted placeholder 'xxxxx': %s", msg)
+			}
+		})
+	}
 }
 
 // TestDefaultMaxPages verifies the DefaultMaxPages constant value

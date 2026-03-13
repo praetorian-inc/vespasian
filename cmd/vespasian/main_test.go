@@ -632,6 +632,22 @@ func TestDoCrawl_ProxyIgnoredWithoutHeadless(t *testing.T) {
 	}
 }
 
+// TestDoCrawl_ProxyPortlessWarning verifies that doCrawl warns when the proxy
+// address has no explicit port.
+func TestDoCrawl_ProxyPortlessWarning(t *testing.T) {
+	var buf bytes.Buffer
+	opts := crawl.CrawlerOptions{
+		Headless: true,
+		Proxy:    "http://proxy.local",
+	}
+	// doCrawl will warn about the missing port, then fail on the actual crawl.
+	// We only care about the warning message.
+	_, _ = doCrawl(context.Background(), &buf, "https://example.com", opts)
+	if !strings.Contains(buf.String(), "has no explicit port") {
+		t.Errorf("expected port-less warning on stderr, got %q", buf.String())
+	}
+}
+
 // TestCrawlOptions_Proxy verifies that the --proxy flag is accessible on both
 // CrawlCmd and ScanCmd via the embedded CrawlOptions.
 func TestCrawlOptions_Proxy(t *testing.T) {

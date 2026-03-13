@@ -235,7 +235,9 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			}
 			timer.Stop()
 
-			closeEngine()
+			// Close engine with a bounded wait — engine.Close() may block
+			// if the killed Chrome process left the engine in a bad state.
+			boundedRun(closeEngine, DrainTimeout)
 
 			if timerExpired {
 				// engine.Close() causes engine.Crawl() to return shortly.
@@ -257,9 +259,10 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			return snapshot, ctx.Err()
 		}
 
-		// MaxPages reached — close engine and drain goroutine with a bounded wait
-		// to match the signal path's timeout discipline.
-		closeEngine()
+		// MaxPages reached — close engine with bounded wait, then drain
+		// crawl goroutine to match the signal path's timeout discipline.
+		boundedRun(closeEngine, DrainTimeout)
+
 		drainTimer := time.NewTimer(ShutdownGracePeriod)
 		select {
 		case <-crawlErr:
@@ -342,4 +345,21 @@ func ToStringSlice(headers map[string]string) goflags.StringSlice {
 		result = append(result, key+": "+value)
 	}
 	return result
+}
+
+// boundedRun executes fn in a goroutine and waits up to timeout for it to
+// complete. If fn doesn't finish in time, boundedRun returns and the goroutine
+// remains alive until fn eventually returns.
+func boundedRun(fn func(), timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		fn()
+		close(done)
+	}()
+	t := time.NewTimer(timeout)
+	select {
+	case <-done:
+	case <-t.C:
+	}
+	t.Stop()
 }

@@ -134,6 +134,16 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl
 		opts.Proxy = ""
 	}
 
+	// Safety: opts.Proxy is printed below. All current callers (CrawlCmd.Run,
+	// ScanCmd.Run) validate via setupBrowserAndSignals → validateProxyAddr first,
+	// which rejects embedded credentials. If adding a new caller, ensure
+	// validateProxyAddr runs before reaching this point.
+	if opts.Proxy != "" {
+		if u, err := url.Parse(opts.Proxy); err == nil && u.Port() == "" {
+			fmt.Fprintf(stderr, "warning: --proxy address %q has no explicit port; most proxies require one (e.g., :8080)\n", opts.Proxy)
+		}
+	}
+
 	crawler := crawl.NewCrawler(opts)
 
 	// Run Crawl in a goroutine so we can apply a backstop timeout after
@@ -174,7 +184,11 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl
 
 	if err != nil {
 		if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && len(requests) > 0 {
-			fmt.Fprintf(stderr, "returning %d partial results\n", len(requests))
+			noun := "results"
+			if len(requests) == 1 {
+				noun = "result"
+			}
+			fmt.Fprintf(stderr, "returning %d partial %s\n", len(requests), noun)
 			return requests, nil
 		}
 		return nil, fmt.Errorf("crawl failed: %w", err)
