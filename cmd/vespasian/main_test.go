@@ -161,6 +161,10 @@ func TestParseHeaders_CRLFInjection(t *testing.T) {
 			name:  "multiple CRLF in value",
 			input: []string{"X-Custom: normal\r\n\r\ninjected"},
 		},
+		{
+			name:  "null byte in header value",
+			input: []string{"X-Custom: before\x00after"},
+		},
 	}
 
 	for _, tt := range tests {

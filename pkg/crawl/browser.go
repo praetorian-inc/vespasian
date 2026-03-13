@@ -41,7 +41,7 @@ type BrowserOptions struct {
 // immediately on signal, stopping all outbound requests.
 type BrowserManager struct {
 	launcher    *launcher.Launcher
-	wsURL       string
+	wsEndpoint  string
 	killOnce    sync.Once
 	cleanupOnce sync.Once
 }
@@ -65,19 +65,19 @@ func NewBrowserManager(opts BrowserOptions) (*BrowserManager, error) {
 	}
 
 	return &BrowserManager{
-		launcher: l,
-		wsURL:    wsURL,
+		launcher:   l,
+		wsEndpoint: wsURL,
 	}, nil
 }
 
-// WSURL returns the Chrome DevTools Protocol WebSocket URL. Pass this to
+// wsURL returns the Chrome DevTools Protocol WebSocket URL. Pass this to
 // Katana's ChromeWSUrl option so it connects to our browser instead of
 // launching its own.
 //
 // Security: this URL grants full control of the browser session. Do not
 // log it or expose it to untrusted callers.
-func (b *BrowserManager) WSURL() string {
-	return b.wsURL
+func (b *BrowserManager) wsURL() string {
+	return b.wsEndpoint
 }
 
 // Kill immediately terminates the Chrome process. This stops all outbound

@@ -45,12 +45,12 @@ func TestBrowserManager_LaunchAndKill(t *testing.T) {
 	}
 
 	// Verify WS URL looks valid
-	wsURL := mgr.WSURL()
+	wsURL := mgr.wsURL()
 	if wsURL == "" {
-		t.Fatal("WSURL() returned empty string")
+		t.Fatal("wsURL() returned empty string")
 	}
 	if !strings.HasPrefix(wsURL, "ws://") {
-		t.Errorf("WSURL() = %q, want ws:// prefix", wsURL)
+		t.Errorf("wsURL() = %q, want ws:// prefix", wsURL)
 	}
 
 	// Verify Chrome is running

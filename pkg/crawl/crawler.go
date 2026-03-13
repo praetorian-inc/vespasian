@@ -163,7 +163,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 	// When vespasian owns the browser, pass the WS URL to Katana so it
 	// connects to our Chrome instance instead of launching its own.
 	if browserMgr != nil {
-		katanaOpts.ChromeWSUrl = browserMgr.WSURL()
+		katanaOpts.ChromeWSUrl = browserMgr.wsURL()
 	}
 
 	// Initialize crawler options

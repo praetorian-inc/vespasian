@@ -69,8 +69,8 @@ func parseHeaders(raw []string) (map[string]string, error) {
 		if !isValidHeaderName(name) {
 			return nil, fmt.Errorf("header name contains invalid characters (RFC 7230): %q", h)
 		}
-		if strings.ContainsAny(value, "\r\n") {
-			return nil, fmt.Errorf("header value contains invalid CRLF characters: %q", h)
+		if strings.ContainsAny(value, "\r\n\x00") {
+			return nil, fmt.Errorf("header value contains invalid characters: %q", h)
 		}
 		headers[name] = value
 	}
