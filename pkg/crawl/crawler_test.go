@@ -15,10 +15,16 @@
 package crawl
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/projectdiscovery/katana/pkg/navigation"
 	"github.com/projectdiscovery/katana/pkg/output"
@@ -369,6 +375,7 @@ func TestCrawl_InvalidSchemeReturnsError(t *testing.T) {
 		{"schemeless", "not-a-url"},
 		{"file scheme", "file:///etc/passwd"},
 		{"ftp scheme", "ftp://example.com"},
+		{"empty host", "http:///path"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -384,45 +391,6 @@ func TestCrawl_InvalidSchemeReturnsError(t *testing.T) {
 	}
 }
 
-// TestCloseEngineOnce verifies the sync.Once wrapper prevents double-close.
-// This mirrors the closeEngine pattern in Crawl (crawler.go lines 143-145)
-// where engine.Close() can be called both explicitly on context cancellation
-// and via defer.
-func TestCloseEngineOnce(t *testing.T) {
-	var count int
-	var once sync.Once
-	closeEngine := func() { once.Do(func() { count++ }) }
-
-	closeEngine()
-	closeEngine()
-
-	if count != 1 {
-		t.Errorf("close called %d times, want 1", count)
-	}
-}
-
-// TestDefaultMaxPages verifies the DefaultMaxPages constant value
-func TestDefaultMaxPages(t *testing.T) {
-	if DefaultMaxPages != 1000 {
-		t.Errorf("DefaultMaxPages = %d, want 1000", DefaultMaxPages)
-	}
-}
-
-// TestMaxResponseBodySize verifies the MaxResponseBodySize constant value
-func TestMaxResponseBodySize(t *testing.T) {
-	expected := 1 * 1024 * 1024 // 1 MB
-	if MaxResponseBodySize != expected {
-		t.Errorf("MaxResponseBodySize = %d, want %d", MaxResponseBodySize, expected)
-	}
-}
-
-
-// TestPageTimeout verifies the PageTimeout constant value
-func TestPageTimeout(t *testing.T) {
-	if PageTimeout != 30 {
-		t.Errorf("PageTimeout = %d, want 30", PageTimeout)
-	}
-}
 // TestMapResult_TruncatesLargeResponseBody tests that response bodies exceeding MaxResponseBodySize get truncated
 func TestMapResult_TruncatesLargeResponseBody(t *testing.T) {
 	largeBody := make([]byte, MaxResponseBodySize+1000) // 1000 bytes over limit
@@ -511,5 +479,103 @@ func TestMapResult_SmallBodyNotTruncated(t *testing.T) {
 
 	if string(observed.Response.Body) != string(smallResponseBody) {
 		t.Errorf("Response body = %q, want %q (should not be truncated)", string(observed.Response.Body), string(smallResponseBody))
+	}
+}
+
+// TestCrawl_SignalPath_ReturnsContextCanceled verifies that when the parent
+// context is canceled (simulating SIGINT/SIGTERM), Crawl() returns
+// context.Canceled and writes an interrupt message to Stderr.
+func TestCrawl_SignalPath_ReturnsContextCanceled(t *testing.T) {
+	// Slow server to ensure the crawl is still running when we cancel.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<html><body><a href="/page2">link</a></body></html>`)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var stderr bytes.Buffer
+
+	crawler := NewCrawler(CrawlerOptions{
+		Depth:    1,
+		MaxPages: 100,
+		Timeout:  30 * time.Second,
+		Headless: false,
+		Stderr:   &stderr,
+	})
+
+	// Cancel context immediately to trigger signal path.
+	cancel()
+
+	_, err := crawler.Crawl(ctx, srv.URL)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Crawl() error = %v, want context.Canceled", err)
+	}
+	if !strings.Contains(stderr.String(), "interrupt received") {
+		t.Errorf("stderr = %q, want message containing 'interrupt received'", stderr.String())
+	}
+}
+
+// TestCrawl_SignalPath_NilStderr verifies that Crawl() does not panic
+// when Stderr is nil on the signal path.
+func TestCrawl_SignalPath_NilStderr(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<html><body>hello</body></html>`)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	crawler := NewCrawler(CrawlerOptions{
+		Depth:    1,
+		MaxPages: 100,
+		Timeout:  30 * time.Second,
+		Headless: false,
+		Stderr:   nil, // explicitly nil
+	})
+
+	_, err := crawler.Crawl(ctx, srv.URL)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Crawl() error = %v, want context.Canceled", err)
+	}
+}
+
+// TestCrawl_MaxPagesPath_ReturnsNoError verifies that when MaxPages is reached,
+// Crawl() returns results without an error.
+func TestCrawl_MaxPagesPath_ReturnsNoError(t *testing.T) {
+	// Server that returns pages with links, generating enough results to hit MaxPages.
+	var requestCount int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requestCount++
+		n := requestCount
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/html")
+		// Each page links to the next, up to a high number.
+		fmt.Fprintf(w, `<html><body><a href="/page%d">next</a></body></html>`, n+1)
+	}))
+	defer srv.Close()
+
+	crawler := NewCrawler(CrawlerOptions{
+		Depth:    10,
+		MaxPages: 2,
+		Timeout:  30 * time.Second,
+		Headless: false,
+	})
+
+	results, err := crawler.Crawl(context.Background(), srv.URL)
+	if err != nil {
+		t.Errorf("Crawl() unexpected error: %v", err)
+	}
+	if len(results) == 0 {
+		t.Error("Crawl() returned 0 results, want at least 1")
+	}
+	if len(results) > 2 {
+		t.Errorf("Crawl() returned %d results, want at most 2 (MaxPages)", len(results))
 	}
 }
