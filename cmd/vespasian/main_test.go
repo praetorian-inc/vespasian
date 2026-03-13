@@ -626,7 +626,7 @@ func TestDoCrawl_ProxyIgnoredWithoutHeadless(t *testing.T) {
 	// doCrawl will warn and clear proxy before creating the crawler.
 	// It will then fail on the actual crawl (no valid URL), but we only
 	// care about the warning message.
-	_, _ = doCrawl(context.Background(), &buf, "https://example.com", nil, opts)
+	_, _ = doCrawl(context.Background(), &buf, "https://example.com", opts)
 	if !strings.Contains(buf.String(), "warning: --proxy is only supported with headless browser mode") {
 		t.Errorf("expected proxy warning on stderr, got %q", buf.String())
 	}
