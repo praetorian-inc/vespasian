@@ -38,3 +38,10 @@ Thumbs.db
 
 # .claude
 .claude/
+
+# Live test artifacts
+test/.live-test-config
+test/.results/
+test/.*.pid
+test/rest-api/rest-api
+test/soap-service/soap-service

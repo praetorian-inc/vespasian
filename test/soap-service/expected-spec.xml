@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions name="soap" targetNamespace="http://localhost:8991/" xmlns="http://schemas.xmlsoap.org/wsdl/" xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/" xmlns:tns="http://localhost:8991/" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <message name="GetUserRequest">
+    <part name="parameters" element="tns:GetUser"></part>
+  </message>
+  <message name="GetUserResponse">
+    <part name="parameters" element="tns:GetUserResponse"></part>
+  </message>
+  <message name="ListUsersRequest">
+    <part name="parameters" element="tns:ListUsers"></part>
+  </message>
+  <message name="ListUsersResponse">
+    <part name="parameters" element="tns:ListUsersResponse"></part>
+  </message>
+  <message name="CreateUserRequest">
+    <part name="parameters" element="tns:CreateUser"></part>
+  </message>
+  <message name="CreateUserResponse">
+    <part name="parameters" element="tns:CreateUserResponse"></part>
+  </message>
+  <portType name="soapPortType">
+    <operation name="GetUser">
+      <input message="tns:GetUserRequest"></input>
+      <output message="tns:GetUserResponse"></output>
+    </operation>
+    <operation name="ListUsers">
+      <input message="tns:ListUsersRequest"></input>
+      <output message="tns:ListUsersResponse"></output>
+    </operation>
+    <operation name="CreateUser">
+      <input message="tns:CreateUserRequest"></input>
+      <output message="tns:CreateUserResponse"></output>
+    </operation>
+  </portType>
+  <binding name="soapBinding" type="tns:soapPortType">
+    <binding xmlns="http://schemas.xmlsoap.org/wsdl/soap/" style="document" transport="http://schemas.xmlsoap.org/soap/http"></binding>
+    <operation name="GetUser">
+      <operation xmlns="http://schemas.xmlsoap.org/wsdl/soap/" soapAction="urn:GetUser"></operation>
+    </operation>
+    <operation name="ListUsers">
+      <operation xmlns="http://schemas.xmlsoap.org/wsdl/soap/" soapAction="urn:ListUsers"></operation>
+    </operation>
+    <operation name="CreateUser">
+      <operation xmlns="http://schemas.xmlsoap.org/wsdl/soap/" soapAction="urn:CreateUser"></operation>
+    </operation>
+  </binding>
+  <service name="soap">
+    <port name="soapPort" binding="tns:soapBinding">
+      <address xmlns="http://schemas.xmlsoap.org/wsdl/soap/" location="http://localhost:8991/soap"></address>
+    </port>
+  </service>
+</definitions>

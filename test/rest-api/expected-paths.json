@@ -1,0 +1,15 @@
+{
+  "description": "Expected API paths from a live crawl of the REST API target. The crawler discovers GET endpoints via links on the index page. Parameter names may vary (e.g., {userId} vs {id}).",
+  "paths": {
+    "/api/health": ["GET"],
+    "/api/users": ["GET"],
+    "/api/users/{id}": ["GET"],
+    "/api/users/{id}/email-address": ["GET"],
+    "/api/products": ["GET"],
+    "/api/products/{id}": ["GET"],
+    "/api/orders": ["GET"],
+    "/api/orders/{id}": ["GET"]
+  },
+  "total_paths": 8,
+  "excluded_patterns": [".js", ".css", ".png", ".ico", ".svg", ".woff"]
+}

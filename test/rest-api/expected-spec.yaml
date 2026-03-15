@@ -1,0 +1,181 @@
+components:
+    schemas:
+        Email-addressResponse:
+            properties:
+                email:
+                    type: string
+            type: object
+        HealthResponse:
+            properties:
+                status:
+                    type: string
+            type: object
+        OrderResponse:
+            properties:
+                id:
+                    type: integer
+                product_id:
+                    type: integer
+                quantity:
+                    type: integer
+                user_id:
+                    type: integer
+            type: object
+        ProductResponse:
+            properties:
+                id:
+                    type: integer
+                name:
+                    type: string
+                price:
+                    type: number
+            type: object
+        UserResponse:
+            properties:
+                email:
+                    type: string
+                id:
+                    type: integer
+                name:
+                    type: string
+            type: object
+info:
+    title: localhost:8990 API
+    version: 1.0.0
+openapi: 3.0.3
+paths:
+    /api/health:
+        get:
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/HealthResponse'
+                    description: OK
+            summary: Get /api/health
+    /api/orders:
+        get:
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                items:
+                                    properties:
+                                        id:
+                                            type: integer
+                                        product_id:
+                                            type: integer
+                                        quantity:
+                                            type: integer
+                                        user_id:
+                                            type: integer
+                                    type: object
+                                type: array
+                    description: OK
+            summary: Get /api/orders
+    /api/orders/{orderId}:
+        get:
+            parameters:
+                - in: path
+                  name: orderId
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/OrderResponse'
+                    description: OK
+            summary: Get /api/orders/{orderId}
+    /api/products:
+        get:
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                items:
+                                    properties:
+                                        id:
+                                            type: integer
+                                        name:
+                                            type: string
+                                        price:
+                                            type: number
+                                    type: object
+                                type: array
+                    description: OK
+            summary: Get /api/products
+    /api/products/{productId}:
+        get:
+            parameters:
+                - in: path
+                  name: productId
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ProductResponse'
+                    description: OK
+            summary: Get /api/products/{productId}
+    /api/users:
+        get:
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                items:
+                                    properties:
+                                        email:
+                                            type: string
+                                        id:
+                                            type: integer
+                                        name:
+                                            type: string
+                                    type: object
+                                type: array
+                    description: OK
+            summary: Get /api/users
+    /api/users/{userId}:
+        get:
+            parameters:
+                - in: path
+                  name: userId
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/UserResponse'
+                    description: OK
+            summary: Get /api/users/{userId}
+    /api/users/{userId}/email-address:
+        get:
+            parameters:
+                - in: path
+                  name: userId
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/Email-addressResponse'
+                    description: OK
+            summary: Get /api/users/{userId}/email-address
+servers:
+    - url: http://localhost:8990

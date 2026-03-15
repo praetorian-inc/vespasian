@@ -1,0 +1,69 @@
+[
+  {
+    "method": "POST",
+    "url": "http://localhost:8991/soap",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "urn:GetUser"
+    },
+    "body": "PD94bWwgdmVyc2lvbj0iMS4wIj8+PHNvYXA6RW52ZWxvcGUgeG1sbnM6c29hcD0iaHR0cDovL3NjaGVtYXMueG1sc29hcC5vcmcvc29hcC9lbnZlbG9wZS8iPjxzb2FwOkJvZHk+PHRuczpHZXRVc2VyUmVxdWVzdCB4bWxuczp0bnM9Imh0dHA6Ly9sb2NhbGhvc3Qvc29hcCI+PGlkPjE8L2lkPjwvdG5zOkdldFVzZXJSZXF1ZXN0Pjwvc29hcDpCb2R5Pjwvc29hcDpFbnZlbG9wZT4=",
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "text/xml; charset=utf-8"
+      },
+      "content_type": "text/xml; charset=utf-8",
+      "body": "PHNvYXA6RW52ZWxvcGUgeG1sbnM6c29hcD0iaHR0cDovL3NjaGVtYXMueG1sc29hcC5vcmcvc29hcC9lbnZlbG9wZS8iPjxzb2FwOkJvZHk+PHRuczpHZXRVc2VyUmVzcG9uc2UgeG1sbnM6dG5zPSJodHRwOi8vbG9jYWxob3N0L3NvYXAiPjxpZD4xPC9pZD48L3RuczpHZXRVc2VyUmVzcG9uc2U+PC9zb2FwOkJvZHk+PC9zb2FwOkVudmVsb3BlPg=="
+    },
+    "source": "test-runner"
+  },
+  {
+    "method": "POST",
+    "url": "http://localhost:8991/soap",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "urn:ListUsers"
+    },
+    "body": "PD94bWwgdmVyc2lvbj0iMS4wIj8+PHNvYXA6RW52ZWxvcGUgeG1sbnM6c29hcD0iaHR0cDovL3NjaGVtYXMueG1sc29hcC5vcmcvc29hcC9lbnZlbG9wZS8iPjxzb2FwOkJvZHk+PHRuczpMaXN0VXNlcnNSZXF1ZXN0IHhtbG5zOnRucz0iaHR0cDovL2xvY2FsaG9zdC9zb2FwIj48aWQ+MTwvaWQ+PC90bnM6TGlzdFVzZXJzUmVxdWVzdD48L3NvYXA6Qm9keT48L3NvYXA6RW52ZWxvcGU+",
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "text/xml; charset=utf-8"
+      },
+      "content_type": "text/xml; charset=utf-8",
+      "body": "PHNvYXA6RW52ZWxvcGUgeG1sbnM6c29hcD0iaHR0cDovL3NjaGVtYXMueG1sc29hcC5vcmcvc29hcC9lbnZlbG9wZS8iPjxzb2FwOkJvZHk+PHRuczpMaXN0VXNlcnNSZXNwb25zZSB4bWxuczp0bnM9Imh0dHA6Ly9sb2NhbGhvc3Qvc29hcCI+PGlkPjE8L2lkPjwvdG5zOkxpc3RVc2Vyc1Jlc3BvbnNlPjwvc29hcDpCb2R5Pjwvc29hcDpFbnZlbG9wZT4="
+    },
+    "source": "test-runner"
+  },
+  {
+    "method": "POST",
+    "url": "http://localhost:8991/soap",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "urn:CreateUser"
+    },
+    "body": "PD94bWwgdmVyc2lvbj0iMS4wIj8+PHNvYXA6RW52ZWxvcGUgeG1sbnM6c29hcD0iaHR0cDovL3NjaGVtYXMueG1sc29hcC5vcmcvc29hcC9lbnZlbG9wZS8iPjxzb2FwOkJvZHk+PHRuczpDcmVhdGVVc2VyUmVxdWVzdCB4bWxuczp0bnM9Imh0dHA6Ly9sb2NhbGhvc3Qvc29hcCI+PGlkPjE8L2lkPjwvdG5zOkNyZWF0ZVVzZXJSZXF1ZXN0Pjwvc29hcDpCb2R5Pjwvc29hcDpFbnZlbG9wZT4=",
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "text/xml; charset=utf-8"
+      },
+      "content_type": "text/xml; charset=utf-8",
+      "body": "PHNvYXA6RW52ZWxvcGUgeG1sbnM6c29hcD0iaHR0cDovL3NjaGVtYXMueG1sc29hcC5vcmcvc29hcC9lbnZlbG9wZS8iPjxzb2FwOkJvZHk+PHRuczpDcmVhdGVVc2VyUmVzcG9uc2UgeG1sbnM6dG5zPSJodHRwOi8vbG9jYWxob3N0L3NvYXAiPjxpZD4xPC9pZD48L3RuczpDcmVhdGVVc2VyUmVzcG9uc2U+PC9zb2FwOkJvZHk+PC9zb2FwOkVudmVsb3BlPg=="
+    },
+    "source": "test-runner"
+  },
+  {
+    "method": "GET",
+    "url": "http://localhost:8991/service.wsdl",
+    "headers": {},
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "text/xml; charset=utf-8"
+      },
+      "content_type": "text/xml; charset=utf-8"
+    },
+    "source": "test-runner"
+  }
+]

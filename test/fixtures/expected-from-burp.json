@@ -1,0 +1,12 @@
+{
+  "description": "Expected output after importing sample-burp-export.xml",
+  "total_requests": 5,
+  "expected_urls": [
+    "http://localhost:8990/api/users",
+    "http://localhost:8990/api/users/1",
+    "http://localhost:8990/api/products",
+    "http://localhost:8990/api/products/1",
+    "http://localhost:8990/api/orders"
+  ],
+  "expected_methods": ["GET", "GET", "GET", "GET", "POST"]
+}
