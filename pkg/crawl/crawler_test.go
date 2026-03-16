@@ -436,12 +436,13 @@ func TestCrawl_EmptyURLReturnsError(t *testing.T) {
 	}
 }
 
-<<<<<<< fix/content-type-header-case
 // TestPageTimeout verifies the PageTimeout constant value
 func TestPageTimeout(t *testing.T) {
 	if PageTimeout != 30 {
 		t.Errorf("PageTimeout = %d, want 30", PageTimeout)
-=======
+	}
+}
+
 // TestCrawl_InvalidSchemeReturnsError tests that URLs without http/https scheme
 // are rejected, including non-HTTP schemes that could be SSRF vectors.
 func TestCrawl_InvalidSchemeReturnsError(t *testing.T) {
@@ -465,7 +466,6 @@ func TestCrawl_InvalidSchemeReturnsError(t *testing.T) {
 				t.Errorf("unexpected error message: %v", err)
 			}
 		})
->>>>>>> main
 	}
 }
 
@@ -560,7 +560,6 @@ func TestMapResult_SmallBodyNotTruncated(t *testing.T) {
 	}
 }
 
-<<<<<<< fix/content-type-header-case
 // TestMapResult_LowercaseContentType tests that MapResult extracts ContentType
 // from lowercase header keys, as Katana normalizes response headers to lowercase.
 func TestMapResult_LowercaseContentType(t *testing.T) {
@@ -616,7 +615,9 @@ func TestMapResult_LowercaseContentType(t *testing.T) {
 				t.Errorf("ContentType = %q, want %q", observed.Response.ContentType, tt.wantContentType)
 			}
 		})
-=======
+	}
+}
+
 // TestCrawl_SignalPath_ReturnsContextCanceled verifies that when the parent
 // context is canceled (simulating SIGINT/SIGTERM), Crawl() returns
 // context.Canceled and writes an interrupt message to Stderr.
@@ -712,6 +713,5 @@ func TestCrawl_MaxPagesPath_ReturnsNoError(t *testing.T) {
 	}
 	if len(results) > 2 {
 		t.Errorf("Crawl() returned %d results, want at most 2 (MaxPages)", len(results))
->>>>>>> main
 	}
 }
