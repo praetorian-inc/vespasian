@@ -120,7 +120,6 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 
 	// Build Katana options
 	katanaOpts := &types.Options{
-
 		MaxDepth:      c.opts.Depth,
 		Timeout:       PageTimeout,
 		CrawlDuration: c.opts.Timeout,

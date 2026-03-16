@@ -440,7 +440,7 @@ func TestCrawl_EmptyURLReturnsError(t *testing.T) {
 func TestPageTimeout(t *testing.T) {
 	if PageTimeout != 30 {
 		t.Errorf("PageTimeout = %d, want 30", PageTimeout)
-  }
+	}
 }
 
 // TestCrawl_InvalidSchemeReturnsError tests that URLs without http/https scheme
@@ -618,7 +618,7 @@ func TestMapResult_JsluiceTagAndAttribute(t *testing.T) {
 				t.Errorf("Attribute = %q, want %q", observed.Attribute, tt.attribute)
 			}
 		})
-  }
+	}
 }
 
 // TestCrawl_SignalPath_ReturnsContextCanceled verifies that when the parent
