@@ -66,7 +66,13 @@ func (BurpImporter) Name() string {
 // containsXXEEntity checks for ENTITY declarations in XML data (XXE attack vector).
 // DOCTYPE declarations are allowed as they are standard in Burp Suite XML exports.
 func containsXXEEntity(data []byte) bool {
-	return bytes.Contains(bytes.ToUpper(data), []byte("<!ENTITY"))
+	target := []byte("<!ENTITY")
+	for i := 0; i <= len(data)-len(target); i++ {
+		if data[i] == '<' && bytes.EqualFold(data[i:i+len(target)], target) {
+			return true
+		}
+	}
+	return false
 }
 
 // Import reads Burp Suite XML and converts to ObservedRequest format.
