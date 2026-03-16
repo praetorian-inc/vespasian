@@ -129,6 +129,21 @@ const shutdownBackstop = 10 * time.Second
 func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl.CrawlerOptions) ([]crawl.ObservedRequest, error) {
 	opts.Stderr = stderr
 
+	if opts.Proxy != "" && !opts.Headless {
+		fmt.Fprintf(stderr, "warning: --proxy is only supported with headless browser mode; ignoring proxy setting\n")
+		opts.Proxy = ""
+	}
+
+	// Safety: opts.Proxy is printed below. All current callers (CrawlCmd.Run,
+	// ScanCmd.Run) validate via setupBrowserAndSignals → validateProxyAddr first,
+	// which rejects embedded credentials. If adding a new caller, ensure
+	// validateProxyAddr runs before reaching this point.
+	if opts.Proxy != "" {
+		if u, err := url.Parse(opts.Proxy); err == nil && u.Port() == "" {
+			fmt.Fprintf(stderr, "warning: --proxy address %q has no explicit port; most proxies require one (e.g., :8080)\n", opts.Proxy)
+		}
+	}
+
 	crawler := crawl.NewCrawler(opts)
 
 	// Run Crawl in a goroutine so we can apply a backstop timeout after
@@ -169,7 +184,11 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl
 
 	if err != nil {
 		if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && len(requests) > 0 {
-			fmt.Fprintf(stderr, "returning %d partial results\n", len(requests))
+			noun := "results"
+			if len(requests) == 1 {
+				noun = "result"
+			}
+			fmt.Fprintf(stderr, "returning %d partial %s\n", len(requests), noun)
 			return requests, nil
 		}
 		return nil, fmt.Errorf("crawl failed: %w", err)
@@ -207,6 +226,7 @@ type CrawlOptions struct {
 	Timeout  time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
 	Scope    string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
 	Headless bool          `default:"true" help:"Use headless browser"`
+	Proxy    string        `help:"Proxy address for headless browser (e.g., http://127.0.0.1:8080). Note: TLS certificate verification is disabled during crawls."`
 	Verbose  bool          `short:"v" help:"Enable verbose logging"`
 }
 
@@ -272,7 +292,7 @@ func setupBrowserAndSignals(rawHeaders []string, crawlOpts CrawlOptions, extraOp
 	var browserMgr *crawl.BrowserManager
 
 	if crawlOpts.Headless {
-		browserMgr, err = crawl.NewBrowserManager(crawl.BrowserOptions{Headless: true})
+		browserMgr, err = crawl.NewBrowserManager(crawl.BrowserOptions{Headless: true, Proxy: crawlOpts.Proxy})
 		if err != nil {
 			return browserSetupResult{}, fmt.Errorf("launch browser: %w", err)
 		}
@@ -324,6 +344,7 @@ func (c *CrawlCmd) Run() error {
 		Timeout:  c.Timeout,
 		Scope:    c.Scope,
 		Headless: c.Headless,
+		Proxy:    c.Proxy,
 	})
 	if err != nil {
 		return err
@@ -465,6 +486,7 @@ func (c *ScanCmd) Run() error {
 		Timeout:  c.Timeout,
 		Scope:    c.Scope,
 		Headless: c.Headless,
+		Proxy:    c.Proxy,
 	})
 	if err != nil {
 		return err

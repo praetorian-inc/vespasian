@@ -615,6 +615,65 @@ func TestCrawlOptions_Embedded(t *testing.T) {
 	}
 }
 
+// TestDoCrawl_ProxyIgnoredWithoutHeadless verifies that doCrawl warns and clears
+// the proxy option when headless mode is disabled.
+func TestDoCrawl_ProxyIgnoredWithoutHeadless(t *testing.T) {
+	var buf bytes.Buffer
+	opts := crawl.CrawlerOptions{
+		Headless: false,
+		Proxy:    "http://127.0.0.1:8080",
+	}
+	// doCrawl will warn and clear proxy before creating the crawler.
+	// It will then fail on the actual crawl (no valid URL), but we only
+	// care about the warning message.
+	_, _ = doCrawl(context.Background(), &buf, "https://example.com", opts)
+	if !strings.Contains(buf.String(), "warning: --proxy is only supported with headless browser mode") {
+		t.Errorf("expected proxy warning on stderr, got %q", buf.String())
+	}
+}
+
+// TestDoCrawl_ProxyPortlessWarning verifies that doCrawl warns when the proxy
+// address has no explicit port.
+func TestDoCrawl_ProxyPortlessWarning(t *testing.T) {
+	var buf bytes.Buffer
+	opts := crawl.CrawlerOptions{
+		Headless: true,
+		Proxy:    "http://proxy.local",
+	}
+	// doCrawl will warn about the missing port, then fail on the actual crawl.
+	// We only care about the warning message.
+	_, _ = doCrawl(context.Background(), &buf, "https://example.com", opts)
+	if !strings.Contains(buf.String(), "has no explicit port") {
+		t.Errorf("expected port-less warning on stderr, got %q", buf.String())
+	}
+}
+
+// TestCrawlOptions_Proxy verifies that the --proxy flag is accessible on both
+// CrawlCmd and ScanCmd via the embedded CrawlOptions.
+func TestCrawlOptions_Proxy(t *testing.T) {
+	proxy := "http://127.0.0.1:8080"
+
+	c := &CrawlCmd{
+		URL: "https://example.com",
+		CrawlOptions: CrawlOptions{
+			Proxy: proxy,
+		},
+	}
+	if c.Proxy != proxy {
+		t.Errorf("CrawlCmd.Proxy = %q, want %q", c.Proxy, proxy)
+	}
+
+	s := &ScanCmd{
+		URL: "https://example.com",
+		CrawlOptions: CrawlOptions{
+			Proxy: proxy,
+		},
+	}
+	if s.Proxy != proxy {
+		t.Errorf("ScanCmd.Proxy = %q, want %q", s.Proxy, proxy)
+	}
+}
+
 // TestVersionVariable verifies the version variable is accessible and has a default.
 func TestVersionVariable(t *testing.T) {
 	if version == "" {

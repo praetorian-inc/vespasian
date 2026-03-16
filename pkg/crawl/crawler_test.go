@@ -309,6 +309,7 @@ func TestNewCrawler(t *testing.T) {
 		MaxPages: 100,
 		Scope:    "same-domain",
 		Headless: true,
+		Proxy:    "http://127.0.0.1:8080",
 		Headers: map[string]string{
 			"User-Agent": "test",
 		},
@@ -332,6 +333,9 @@ func TestNewCrawler(t *testing.T) {
 	if !crawler.opts.Headless {
 		t.Errorf("crawler.opts.Headless = false, want true")
 	}
+	if crawler.opts.Proxy != "http://127.0.0.1:8080" {
+		t.Errorf("crawler.opts.Proxy = %q, want %q", crawler.opts.Proxy, "http://127.0.0.1:8080")
+	}
 	if crawler.opts.Headers["User-Agent"] != "test" {
 		t.Errorf("crawler.opts.Headers[User-Agent] = %q, want %q", crawler.opts.Headers["User-Agent"], "test")
 	}
@@ -348,6 +352,73 @@ func TestCrawl_NegativeDepthReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "depth must be non-negative") {
 		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// TestValidateProxyAddr tests the proxy address validation.
+func TestValidateProxyAddr(t *testing.T) {
+	tests := []struct {
+		name    string
+		addr    string
+		wantErr bool
+		errMsg  string
+	}{
+		{"valid http", "http://127.0.0.1:8080", false, ""},
+		{"valid https", "https://proxy.example.com:8443", false, ""},
+		{"valid socks5", "socks5://127.0.0.1:1080", false, ""},
+		{"valid http no port", "http://proxy.local", false, ""},
+		{"missing scheme", "127.0.0.1:8080", true, "invalid proxy address"},
+		{"ftp scheme", "ftp://proxy:21", true, "scheme must be"},
+		{"empty host", "http://", true, "missing host"},
+		{"embedded credentials", "http://user:pass@127.0.0.1:8080", true, "embedded credentials"},
+		{"embedded user only", "http://user@127.0.0.1:8080", true, "embedded credentials"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateProxyAddr(tt.addr)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateProxyAddr(%q) error = %v, wantErr %v", tt.addr, err, tt.wantErr)
+			}
+			if tt.wantErr && tt.errMsg != "" && err != nil {
+				if !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("validateProxyAddr(%q) error = %q, want containing %q", tt.addr, err.Error(), tt.errMsg)
+				}
+			}
+		})
+	}
+
+	// Verify credentials are never echoed in error messages, even when
+	// other validation (e.g., scheme) would also fail.
+	credentialLeakCases := []struct {
+		name string
+		addr string
+	}{
+		{"http with creds", "http://admin:s3cret@proxy:8080"},
+		{"wrong scheme with creds", "ftp://admin:s3cret@proxy:21"},
+		{"user only", "http://admin@proxy:8080"},
+	}
+	for _, tt := range credentialLeakCases {
+		t.Run("redacted/"+tt.name, func(t *testing.T) {
+			err := validateProxyAddr(tt.addr)
+			if err == nil {
+				t.Fatal("expected error for embedded credentials")
+			}
+			msg := err.Error()
+			if strings.Contains(msg, "admin") || strings.Contains(msg, "s3cret") {
+				t.Errorf("error message leaks credentials: %s", msg)
+			}
+			if !strings.Contains(msg, "xxxxx") {
+				t.Errorf("error message should contain redacted placeholder 'xxxxx': %s", msg)
+			}
+		})
+	}
+}
+
+// TestDefaultMaxPages verifies the DefaultMaxPages constant value
+func TestDefaultMaxPages(t *testing.T) {
+	if DefaultMaxPages != 1000 {
+		t.Errorf("DefaultMaxPages = %d, want 1000", DefaultMaxPages)
 	}
 }
 
