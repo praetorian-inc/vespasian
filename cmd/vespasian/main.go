@@ -52,7 +52,8 @@ var CLI struct {
 	Version  VersionCmd  `cmd:"" help:"Show version information"`
 }
 
-// parseHeaders converts "Key: Value" strings to a map, validating for CRLF injection.
+// parseHeaders converts "Key: Value" strings to a map, validating header names
+// against RFC 7230 token production and header values against CRLF injection.
 func parseHeaders(raw []string) (map[string]string, error) {
 	headers := make(map[string]string)
 	for _, h := range raw {
@@ -65,29 +66,129 @@ func parseHeaders(raw []string) (map[string]string, error) {
 		if name == "" {
 			return nil, fmt.Errorf("header has empty name: %q", h)
 		}
-		if strings.ContainsAny(name, "\r\n") || strings.ContainsAny(value, "\r\n") {
-			return nil, fmt.Errorf("header contains invalid CRLF characters: %q", h)
+		if !isValidHeaderName(name) {
+			return nil, fmt.Errorf("header name contains invalid characters (RFC 7230): %q", h)
+		}
+		if strings.ContainsAny(value, "\r\n\x00") {
+			return nil, fmt.Errorf("header value contains invalid characters: %q", h)
 		}
 		headers[name] = value
 	}
 	return headers, nil
 }
 
-// doCrawl executes the common crawl pipeline: parse headers, create crawler,
-// run the crawl with the provided context, and return the results. On graceful
-// shutdown (SIGINT/SIGTERM) partial results are returned instead of an error.
-func doCrawl(ctx context.Context, targetURL string, rawHeaders []string, opts crawl.CrawlerOptions) ([]crawl.ObservedRequest, error) {
-	headers, err := parseHeaders(rawHeaders)
-	if err != nil {
-		return nil, fmt.Errorf("invalid header: %w", err)
+// isValidHeaderName checks that name consists only of RFC 7230 token characters.
+// tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+//
+//	"^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+func isValidHeaderName(name string) bool {
+	for i := 0; i < len(name); i++ {
+		if !isTokenChar(name[i]) {
+			return false
+		}
 	}
-	opts.Headers = headers
+	return true
+}
+
+// isTokenChar returns true if c is a valid RFC 7230 tchar.
+func isTokenChar(c byte) bool {
+	switch {
+	case c >= 'A' && c <= 'Z':
+		return true
+	case c >= 'a' && c <= 'z':
+		return true
+	case c >= '0' && c <= '9':
+		return true
+	case c == '!' || c == '#' || c == '$' || c == '%' || c == '&' ||
+		c == '\'' || c == '*' || c == '+' || c == '-' || c == '.' ||
+		c == '^' || c == '_' || c == '`' || c == '|' || c == '~':
+		return true
+	default:
+		return false
+	}
+}
+
+// shutdownBackstop is the maximum time doCrawl waits for Crawl() to return
+// after context cancellation. Crawl() has internal bounded shutdown (~2.5s),
+// so this is a defense-in-depth timeout that avoids blocking indefinitely if
+// the engine is stuck. The force-exit handler (second signal) is the final
+// safety net beyond this.
+const shutdownBackstop = 10 * time.Second
+
+// doCrawl executes the common crawl pipeline: create crawler, run the crawl
+// with the provided context, and return the results. On graceful shutdown
+// (SIGINT/SIGTERM) partial results are returned instead of an error.
+// The stderr parameter controls where user-facing status messages are written,
+// allowing tests to capture output.
+//
+// Goroutine lifecycle: if the backstop timer fires before Crawl() returns, the
+// crawl goroutine leaks until Crawl() eventually completes. In CLI usage the
+// process exits shortly after and the force-exit handler (second SIGINT) is the
+// final safety net. Library callers should be aware that a stuck engine may
+// leave a goroutine alive after doCrawl returns.
+func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl.CrawlerOptions) ([]crawl.ObservedRequest, error) {
+	opts.Stderr = stderr
+
+	if opts.Proxy != "" && !opts.Headless {
+		fmt.Fprintf(stderr, "warning: --proxy is only supported with headless browser mode; ignoring proxy setting\n")
+		opts.Proxy = ""
+	}
+
+	// Safety: opts.Proxy is printed below. All current callers (CrawlCmd.Run,
+	// ScanCmd.Run) validate via setupBrowserAndSignals → validateProxyAddr first,
+	// which rejects embedded credentials. If adding a new caller, ensure
+	// validateProxyAddr runs before reaching this point.
+	if opts.Proxy != "" {
+		if u, err := url.Parse(opts.Proxy); err == nil && u.Port() == "" {
+			fmt.Fprintf(stderr, "warning: --proxy address %q has no explicit port; most proxies require one (e.g., :8080)\n", opts.Proxy)
+		}
+	}
 
 	crawler := crawl.NewCrawler(opts)
-	requests, err := crawler.Crawl(ctx, targetURL)
+
+	// Run Crawl in a goroutine so we can apply a backstop timeout after
+	// context cancellation. Without this, a stuck Crawl() blocks forever.
+	//
+	// Goroutine lifecycle: if the backstop fires before Crawl() returns,
+	// the goroutine remains alive until Crawl() eventually completes.
+	// The buffered channel (capacity 1) ensures it won't block on send.
+	// In a CLI context the process exits shortly after, and the force-exit
+	// handler (second SIGINT) is the final safety net.
+	type crawlResult struct {
+		requests []crawl.ObservedRequest
+		err      error
+	}
+	ch := make(chan crawlResult, 1)
+	go func() {
+		reqs, crawlErr := crawler.Crawl(ctx, targetURL)
+		ch <- crawlResult{reqs, crawlErr}
+	}()
+
+	var requests []crawl.ObservedRequest
+	var err error
+	select {
+	case r := <-ch:
+		requests, err = r.requests, r.err
+	case <-ctx.Done():
+		// Context cancelled (signal or deadline). Give Crawl() up to
+		// shutdownBackstop to finish its bounded internal shutdown.
+		backstop := time.NewTimer(shutdownBackstop)
+		select {
+		case r := <-ch:
+			requests, err = r.requests, r.err
+		case <-backstop.C:
+			return nil, fmt.Errorf("crawl failed: shutdown timed out after %s", shutdownBackstop)
+		}
+		backstop.Stop()
+	}
+
 	if err != nil {
 		if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && len(requests) > 0 {
-			// Graceful shutdown or timeout — return partial results.
+			noun := "results"
+			if len(requests) == 1 {
+				noun = "result"
+			}
+			fmt.Fprintf(stderr, "returning %d partial %s\n", len(requests), noun)
 			return requests, nil
 		}
 		return nil, fmt.Errorf("crawl failed: %w", err)
@@ -125,7 +226,103 @@ type CrawlOptions struct {
 	Timeout  time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
 	Scope    string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
 	Headless bool          `default:"true" help:"Use headless browser"`
+	Proxy    string        `help:"Proxy address for headless browser (e.g., http://127.0.0.1:8080). Note: TLS certificate verification is disabled during crawls."`
 	Verbose  bool          `short:"v" help:"Enable verbose logging"`
+}
+
+// setupForceExitHandler spawns a goroutine that waits for the first signal
+// to be handled (ctx.Done), then registers for a second SIGINT/SIGTERM and
+// force-exits the process. This avoids a race where both the graceful handler
+// and the force-exit handler consume the same signal simultaneously.
+//
+// The cleanup function is called before exiting to perform best-effort resource
+// cleanup (e.g., removing temp directories) that would otherwise be skipped by
+// os.Exit bypassing deferred functions. Chrome is already dead at this point
+// (killed on first signal), so cleanup is purely disk hygiene.
+func setupForceExitHandler(ctx context.Context, stderr io.Writer, cleanup func(), exitFn func(int)) {
+	go func() {
+		<-ctx.Done() // First signal consumed by signal.NotifyContext
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		<-sigCh
+		onForceExit(stderr, cleanup, exitFn)
+	}()
+}
+
+// onForceExit is the testable core of setupForceExitHandler. It runs cleanup
+// (with panic recovery to guarantee exitFn is called), writes the exit message,
+// and calls exitFn. Extracted so tests can exercise the logic without sending
+// real signals.
+func onForceExit(stderr io.Writer, cleanup func(), exitFn func(int)) {
+	if cleanup != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(stderr, "cleanup panicked: %v\n", r)
+				}
+			}()
+			cleanup()
+		}()
+	}
+	fmt.Fprintf(stderr, "forcing immediate exit\n")
+	exitFn(1)
+}
+
+// browserSetupResult holds the resources created by setupBrowserAndSignals.
+type browserSetupResult struct {
+	opts    crawl.CrawlerOptions
+	ctx     context.Context
+	cleanup func() // caller must defer this
+}
+
+// setupBrowserAndSignals validates headers, creates a BrowserManager (if
+// headless), wires up signal handling with force-exit support, and returns a
+// cancellable context. Headers are validated before launching Chrome so that
+// invalid headers fail fast without wasting browser startup time. The returned
+// cleanup function closes the browser and stops the signal handler; callers
+// must defer it.
+func setupBrowserAndSignals(rawHeaders []string, crawlOpts CrawlOptions, extraOpts crawl.CrawlerOptions) (browserSetupResult, error) {
+	// Validate headers before launching Chrome — fail fast on invalid input.
+	headers, err := parseHeaders(rawHeaders)
+	if err != nil {
+		return browserSetupResult{}, fmt.Errorf("invalid header: %w", err)
+	}
+	extraOpts.Headers = headers
+
+	var browserMgr *crawl.BrowserManager
+
+	if crawlOpts.Headless {
+		browserMgr, err = crawl.NewBrowserManager(crawl.BrowserOptions{Headless: true, Proxy: crawlOpts.Proxy})
+		if err != nil {
+			return browserSetupResult{}, fmt.Errorf("launch browser: %w", err)
+		}
+		extraOpts.BrowserMgr = browserMgr
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+
+	// Single closure for browser teardown, shared between the force-exit
+	// handler and the deferred cleanup. BrowserManager.Close() is already
+	// idempotent (sync.Once), but a shared closure makes the intent explicit
+	// and avoids duplicating the nil-check.
+	closeBrowser := func() {
+		if browserMgr != nil {
+			browserMgr.Close()
+		}
+	}
+
+	setupForceExitHandler(ctx, os.Stderr, closeBrowser, os.Exit)
+
+	cleanup := func() {
+		stop()
+		closeBrowser()
+	}
+
+	return browserSetupResult{
+		opts:    extraOpts,
+		ctx:     ctx,
+		cleanup: cleanup,
+	}, nil
 }
 
 // CrawlCmd crawls a web application to capture HTTP traffic.
@@ -141,23 +338,25 @@ func (c *CrawlCmd) Run() error {
 		return err
 	}
 
-	opts := crawl.CrawlerOptions{
+	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions, crawl.CrawlerOptions{
 		Depth:    c.Depth,
 		MaxPages: c.MaxPages,
 		Timeout:  c.Timeout,
 		Scope:    c.Scope,
 		Headless: c.Headless,
+		Proxy:    c.Proxy,
+	})
+	if err != nil {
+		return err
 	}
+	defer bs.cleanup()
 
 	if c.Verbose {
 		fmt.Fprintf(os.Stderr, "crawling %s (depth=%d, max-pages=%d, timeout=%s)\n",
-			c.URL, opts.Depth, opts.MaxPages, opts.Timeout)
+			c.URL, bs.opts.Depth, bs.opts.MaxPages, bs.opts.Timeout)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	requests, err := doCrawl(ctx, c.URL, c.Header, opts)
+	requests, err := doCrawl(bs.ctx, os.Stderr, c.URL, bs.opts)
 	if err != nil {
 		return err
 	}
@@ -283,23 +482,25 @@ func (c *ScanCmd) Run() error {
 		return err
 	}
 
-	opts := crawl.CrawlerOptions{
+	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions, crawl.CrawlerOptions{
 		Depth:    c.Depth,
 		MaxPages: c.MaxPages,
 		Timeout:  c.Timeout,
 		Scope:    c.Scope,
 		Headless: c.Headless,
+		Proxy:    c.Proxy,
+	})
+	if err != nil {
+		return err
 	}
+	defer bs.cleanup()
 
 	if c.Verbose {
 		fmt.Fprintf(os.Stderr, "crawling %s (depth=%d, max-pages=%d, timeout=%s)\n",
-			c.URL, opts.Depth, opts.MaxPages, opts.Timeout)
+			c.URL, bs.opts.Depth, bs.opts.MaxPages, bs.opts.Timeout)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	requests, err := doCrawl(ctx, c.URL, c.Header, opts)
+	requests, err := doCrawl(bs.ctx, os.Stderr, c.URL, bs.opts)
 	if err != nil {
 		return err
 	}
@@ -309,7 +510,14 @@ func (c *ScanCmd) Run() error {
 		fmt.Fprintf(os.Stderr, "generating REST spec\n")
 	}
 
-	spec, err := generateSpec(ctx, requests, "rest", c.Confidence, c.Probe, c.DangerousAllowPrivate, c.Verbose)
+	// Create a fresh signal context for the generate phase. If a signal
+	// interrupted the crawl, bs.ctx is already cancelled — doCrawl swallowed
+	// the error and returned partial results. Using the cancelled context
+	// would cause generateSpec's probing to bail out immediately.
+	genCtx, genStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer genStop()
+
+	spec, err := generateSpec(genCtx, requests, "rest", c.Confidence, c.Probe, c.Verbose)
 	if err != nil {
 		return err
 	}
