@@ -262,13 +262,13 @@ func writeOutput(path string, fn func(io.Writer) error) error {
 
 // CrawlOptions holds the shared crawl configuration fields used by CrawlCmd and ScanCmd.
 type CrawlOptions struct {
-	Header   []string      `short:"H" help:"Custom headers (repeatable)"`
-	Output   string        `short:"o" help:"Output file path"`
-	Depth    int           `default:"3" help:"Maximum crawl depth"`
-	MaxPages int           `default:"100" help:"Maximum pages to crawl"`
-	Timeout  time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
-	Scope    string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
-	Headless bool          `default:"true" help:"Use headless browser"`
+	Header      []string      `short:"H" help:"Custom headers (repeatable)"`
+	Output      string        `short:"o" help:"Output file path"`
+	Depth       int           `default:"3" help:"Maximum crawl depth"`
+	MaxPages    int           `default:"100" help:"Maximum pages to crawl"`
+	Timeout     time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
+	Scope       string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
+	Headless    bool          `default:"true" help:"Use headless browser"`
 	Proxy       string        `help:"Proxy address for headless browser (e.g., http://127.0.0.1:8080). Note: TLS certificate verification is disabled during crawls."`
 	NoRequestID bool          `name:"no-request-id" help:"Disable automatic X-Vespasian-Request-Id header"`
 	Verbose     bool          `short:"v" help:"Enable verbose logging"`
