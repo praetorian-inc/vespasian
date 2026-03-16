@@ -15,14 +15,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"errors"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
@@ -158,6 +162,10 @@ func TestParseHeaders_CRLFInjection(t *testing.T) {
 			name:  "multiple CRLF in value",
 			input: []string{"X-Custom: normal\r\n\r\ninjected"},
 		},
+		{
+			name:  "null byte in header value",
+			input: []string{"X-Custom: before\x00after"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -165,6 +173,49 @@ func TestParseHeaders_CRLFInjection(t *testing.T) {
 			_, err := parseHeaders(tt.input)
 			if err == nil {
 				t.Error("parseHeaders() expected error for CRLF injection, got nil")
+			}
+		})
+	}
+}
+
+// TestParseHeaders_RFC7230InvalidNames tests that header names with characters
+// outside the RFC 7230 token production are rejected.
+func TestParseHeaders_RFC7230InvalidNames(t *testing.T) {
+	tests := []struct {
+		name  string
+		input []string
+	}{
+		{
+			name:  "space in header name",
+			input: []string{"Content Type: application/json"},
+		},
+		{
+			name:  "parenthesis in header name",
+			input: []string{"Content(Type): application/json"},
+		},
+		{
+			name:  "slash in header name",
+			input: []string{"Content/Type: application/json"},
+		},
+		{
+			name:  "equals in header name",
+			input: []string{"Content=Type: application/json"},
+		},
+		{
+			name:  "at sign in header name",
+			input: []string{"Content@Type: application/json"},
+		},
+		{
+			name:  "bracket in header name",
+			input: []string{"Content[Type]: application/json"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseHeaders(tt.input)
+			if err == nil {
+				t.Error("parseHeaders() expected error for invalid header name, got nil")
 			}
 		})
 	}
@@ -565,6 +616,65 @@ func TestCrawlOptions_Embedded(t *testing.T) {
 	}
 }
 
+// TestDoCrawl_ProxyIgnoredWithoutHeadless verifies that doCrawl warns and clears
+// the proxy option when headless mode is disabled.
+func TestDoCrawl_ProxyIgnoredWithoutHeadless(t *testing.T) {
+	var buf bytes.Buffer
+	opts := crawl.CrawlerOptions{
+		Headless: false,
+		Proxy:    "http://127.0.0.1:8080",
+	}
+	// doCrawl will warn and clear proxy before creating the crawler.
+	// It will then fail on the actual crawl (no valid URL), but we only
+	// care about the warning message.
+	_, _ = doCrawl(context.Background(), &buf, "https://example.com", opts)
+	if !strings.Contains(buf.String(), "warning: --proxy is only supported with headless browser mode") {
+		t.Errorf("expected proxy warning on stderr, got %q", buf.String())
+	}
+}
+
+// TestDoCrawl_ProxyPortlessWarning verifies that doCrawl warns when the proxy
+// address has no explicit port.
+func TestDoCrawl_ProxyPortlessWarning(t *testing.T) {
+	var buf bytes.Buffer
+	opts := crawl.CrawlerOptions{
+		Headless: true,
+		Proxy:    "http://proxy.local",
+	}
+	// doCrawl will warn about the missing port, then fail on the actual crawl.
+	// We only care about the warning message.
+	_, _ = doCrawl(context.Background(), &buf, "https://example.com", opts)
+	if !strings.Contains(buf.String(), "has no explicit port") {
+		t.Errorf("expected port-less warning on stderr, got %q", buf.String())
+	}
+}
+
+// TestCrawlOptions_Proxy verifies that the --proxy flag is accessible on both
+// CrawlCmd and ScanCmd via the embedded CrawlOptions.
+func TestCrawlOptions_Proxy(t *testing.T) {
+	proxy := "http://127.0.0.1:8080"
+
+	c := &CrawlCmd{
+		URL: "https://example.com",
+		CrawlOptions: CrawlOptions{
+			Proxy: proxy,
+		},
+	}
+	if c.Proxy != proxy {
+		t.Errorf("CrawlCmd.Proxy = %q, want %q", c.Proxy, proxy)
+	}
+
+	s := &ScanCmd{
+		URL: "https://example.com",
+		CrawlOptions: CrawlOptions{
+			Proxy: proxy,
+		},
+	}
+	if s.Proxy != proxy {
+		t.Errorf("ScanCmd.Proxy = %q, want %q", s.Proxy, proxy)
+	}
+}
+
 // TestVersionVariable verifies the version variable is accessible and has a default.
 func TestVersionVariable(t *testing.T) {
 	if version == "" {
@@ -574,92 +684,309 @@ func TestVersionVariable(t *testing.T) {
 	t.Logf("version = %q", version)
 }
 
-// returnPartialOnGraceful mirrors the error-handling condition in doCrawl.
-// It returns (requests, nil) if err indicates a graceful shutdown with partial
-// results, or (nil, err) otherwise.  This is the function under test — its
-// behaviour changes after the bug fix.
-func returnPartialOnGraceful(err error, requests []crawl.ObservedRequest) ([]crawl.ObservedRequest, error) {
-	if err != nil {
-		if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && len(requests) > 0 {
-			// Graceful shutdown or timeout — return partial results.
-			return requests, nil
-		}
-		return nil, fmt.Errorf("crawl failed: %w", err)
+// TestOnForceExit_WritesMessageAndExits verifies that the force-exit logic
+// writes the expected message to stderr and calls exitFn with code 1.
+func TestOnForceExit_WritesMessageAndExits(t *testing.T) {
+	var stderr bytes.Buffer
+	var exitCode int
+
+	onForceExit(&stderr, nil, func(code int) { exitCode = code })
+
+	if exitCode != 1 {
+		t.Errorf("exitFn called with code %d, want 1", exitCode)
 	}
-	return requests, nil
+	if !strings.Contains(stderr.String(), "forcing immediate exit") {
+		t.Errorf("stderr = %q, want message containing 'forcing immediate exit'", stderr.String())
+	}
 }
 
-// TestDoCrawl_gracefulShutdownCondition verifies that the graceful-shutdown
-// condition inside doCrawl accepts both context.Canceled (SIGINT/SIGTERM) and
-// context.DeadlineExceeded (Katana CrawlDuration timeout) when partial results
-// are present.
-//
-// The condition being tested lives in doCrawl (main.go lines 88-94).  Because
-// doCrawl creates its own Crawler internally, the condition logic is extracted
-// into returnPartialOnGraceful above so it can be exercised in isolation.
-func TestDoCrawl_gracefulShutdownCondition(t *testing.T) {
-	partialRequests := []crawl.ObservedRequest{
-		{Method: "GET", URL: "https://example.com/api/users"},
+// TestOnForceExit_CallsCleanupBeforeExit verifies that the cleanup function
+// is called before the exit message and exitFn.
+func TestOnForceExit_CallsCleanupBeforeExit(t *testing.T) {
+	var stderr bytes.Buffer
+	var order []string
+
+	cleanup := func() { order = append(order, "cleanup") }
+	exitFn := func(code int) { order = append(order, "exit") }
+
+	onForceExit(&stderr, cleanup, exitFn)
+
+	if len(order) != 2 || order[0] != "cleanup" || order[1] != "exit" {
+		t.Errorf("call order = %v, want [cleanup exit]", order)
+	}
+}
+
+// TestOnForceExit_NilCleanup verifies that nil cleanup does not panic.
+func TestOnForceExit_NilCleanup(t *testing.T) {
+	var stderr bytes.Buffer
+	called := false
+
+	onForceExit(&stderr, nil, func(code int) { called = true })
+
+	if !called {
+		t.Error("exitFn was not called")
+	}
+}
+
+// TestOnForceExit_CleanupPanicRecovery verifies that if cleanup() panics,
+// exitFn is still called and the panic value is logged.
+func TestOnForceExit_CleanupPanicRecovery(t *testing.T) {
+	var stderr bytes.Buffer
+	var exitCode int
+
+	cleanup := func() { panic("cleanup exploded") }
+
+	onForceExit(&stderr, cleanup, func(code int) { exitCode = code })
+
+	if exitCode != 1 {
+		t.Errorf("exitFn called with code %d, want 1", exitCode)
+	}
+	output := stderr.String()
+	if !strings.Contains(output, "cleanup panicked: cleanup exploded") {
+		t.Errorf("stderr = %q, want message containing panic value", output)
+	}
+	if !strings.Contains(output, "forcing immediate exit") {
+		t.Errorf("stderr = %q, want message containing 'forcing immediate exit'", output)
+	}
+}
+
+// TestDoCrawl_GracefulShutdownReturnsPartialResults exercises the real doCrawl
+// function with a pre-canceled context against a live httptest server. The
+// crawler returns context.Canceled with partial results, and doCrawl should
+// convert that to (results, nil) with a "returning N partial results" message.
+func TestDoCrawl_GracefulShutdownReturnsPartialResults(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<html><body><a href="/page2">link</a></body></html>`)
+	}))
+	defer srv.Close()
+
+	// Cancel context before calling doCrawl — triggers signal path in Crawl(),
+	// which returns (partial, context.Canceled). doCrawl should return (partial, nil).
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var stderr bytes.Buffer
+	opts := crawl.CrawlerOptions{
+		Depth:    1,
+		MaxPages: 100,
+		Timeout:  30 * time.Second,
+		Headless: false,
 	}
 
-	tests := []struct {
-		name        string
-		err         error
-		requests    []crawl.ObservedRequest
-		wantResults []crawl.ObservedRequest
-		wantErr     bool
-	}{
-		{
-			name:        "context.Canceled with partial results — returns partial, no error",
-			err:         context.Canceled,
-			requests:    partialRequests,
-			wantResults: partialRequests,
-			wantErr:     false,
-		},
-		{
-			name:        "context.DeadlineExceeded with partial results — returns partial, no error",
-			err:         context.DeadlineExceeded,
-			requests:    partialRequests,
-			wantResults: partialRequests,
-			wantErr:     false,
-		},
-		{
-			name:     "context.DeadlineExceeded with no results — returns error",
-			err:      context.DeadlineExceeded,
-			requests: nil,
-			wantErr:  true,
-		},
-		{
-			name:     "context.Canceled with no results — returns error",
-			err:      context.Canceled,
-			requests: nil,
-			wantErr:  true,
-		},
-		{
-			name:     "other error with partial results — returns error",
-			err:      fmt.Errorf("network error"),
-			requests: partialRequests,
-			wantErr:  true,
-		},
-		{
-			name:        "nil error — returns results as-is",
-			err:         nil,
-			requests:    partialRequests,
-			wantResults: partialRequests,
-			wantErr:     false,
-		},
+	results, err := doCrawl(ctx, &stderr, srv.URL, opts)
+	if err != nil {
+		t.Fatalf("doCrawl() returned error %v, want nil (graceful shutdown)", err)
+	}
+	// The crawler may or may not collect results before context fires.
+	// The key assertion: doCrawl did NOT return an error, proving the
+	// graceful-shutdown condition (lines 127-129 of main.go) activated.
+	if !strings.Contains(stderr.String(), "interrupt received") && !strings.Contains(stderr.String(), "returning") {
+		t.Errorf("stderr = %q, want interrupt or partial-results message", stderr.String())
+	}
+	t.Logf("doCrawl returned %d partial results", len(results))
+}
+
+// TestDoCrawl_DeadlineExceededReturnsPartialResults exercises doCrawl with a
+// context that hits its deadline. The crawler returns context.DeadlineExceeded
+// with partial results, and doCrawl should convert that to (results, nil).
+func TestDoCrawl_DeadlineExceededReturnsPartialResults(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<html><body><a href="/page2">link</a></body></html>`)
+	}))
+	defer srv.Close()
+
+	// Use a very short deadline so the crawl times out quickly.
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	defer cancel()
+
+	// Let the deadline expire before calling doCrawl.
+	time.Sleep(5 * time.Millisecond)
+
+	var stderr bytes.Buffer
+	opts := crawl.CrawlerOptions{
+		Depth:    1,
+		MaxPages: 100,
+		Timeout:  30 * time.Second,
+		Headless: false,
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gotResults, gotErr := returnPartialOnGraceful(tt.err, tt.requests)
-			if (gotErr != nil) != tt.wantErr {
-				t.Errorf("returnPartialOnGraceful() error = %v, wantErr %v", gotErr, tt.wantErr)
+	results, err := doCrawl(ctx, &stderr, srv.URL, opts)
+	if err != nil {
+		t.Fatalf("doCrawl() returned error %v, want nil (graceful shutdown on deadline)", err)
+	}
+	t.Logf("doCrawl returned %d partial results on DeadlineExceeded", len(results))
+}
+
+// TestSetupBrowserAndSignals_InvalidHeaderReturnsError verifies that invalid
+// headers are rejected before launching Chrome.
+func TestSetupBrowserAndSignals_InvalidHeaderReturnsError(t *testing.T) {
+	_, err := setupBrowserAndSignals(
+		[]string{"bad header"},
+		CrawlOptions{Headless: false},
+		crawl.CrawlerOptions{Depth: 1},
+	)
+	if err == nil {
+		t.Fatal("setupBrowserAndSignals() expected error for invalid header, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid header") {
+		t.Errorf("setupBrowserAndSignals() error = %q, want 'invalid header'", err.Error())
+	}
+}
+
+func TestGenerateRequestID(t *testing.T) {
+	t.Run("produces 32-char hex string", func(t *testing.T) {
+		id, err := generateRequestID()
+		if err != nil {
+			t.Fatalf("generateRequestID() error = %v", err)
+		}
+		if len(id) != 32 {
+			t.Errorf("generateRequestID() length = %d, want 32", len(id))
+		}
+		if _, err := hex.DecodeString(id); err != nil {
+			t.Errorf("generateRequestID() returned non-hex string: %q", id)
+		}
+	})
+
+	t.Run("produces unique values", func(t *testing.T) {
+		ids := make(map[string]bool)
+		for i := 0; i < 100; i++ {
+			id, err := generateRequestID()
+			if err != nil {
+				t.Fatalf("generateRequestID() error = %v", err)
 			}
-			if !tt.wantErr && len(gotResults) != len(tt.wantResults) {
-				t.Errorf("returnPartialOnGraceful() returned %d results, want %d",
-					len(gotResults), len(tt.wantResults))
+			if ids[id] {
+				t.Fatalf("generateRequestID() produced duplicate ID: %q", id)
 			}
-		})
+			ids[id] = true
+		}
+	})
+}
+
+func TestInjectRequestID(t *testing.T) {
+	t.Run("default injects header", func(t *testing.T) {
+		headers := map[string]string{}
+		id, err := injectRequestID(headers, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(id) != 32 {
+			t.Errorf("request ID length = %d, want 32", len(id))
+		}
+		if headers[RequestIDHeader] != id {
+			t.Errorf("header value = %q, want %q", headers[RequestIDHeader], id)
+		}
+	})
+
+	t.Run("disabled skips injection", func(t *testing.T) {
+		headers := map[string]string{}
+		id, err := injectRequestID(headers, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id != "" {
+			t.Errorf("expected empty ID when disabled, got %q", id)
+		}
+		if _, ok := headers[RequestIDHeader]; ok {
+			t.Error("expected no header when disabled")
+		}
+	})
+
+	t.Run("user-supplied value is preserved", func(t *testing.T) {
+		headers := map[string]string{RequestIDHeader: "my-custom-id"}
+		id, err := injectRequestID(headers, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id != "" {
+			t.Errorf("expected empty ID when user-supplied, got %q", id)
+		}
+		if headers[RequestIDHeader] != "my-custom-id" {
+			t.Errorf("user value overwritten: got %q", headers[RequestIDHeader])
+		}
+	})
+
+	t.Run("user-supplied value with different casing is preserved", func(t *testing.T) {
+		headers := map[string]string{"x-vespasian-request-id": "lowercase-id"}
+		id, err := injectRequestID(headers, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id != "" {
+			t.Errorf("expected empty ID when user-supplied, got %q", id)
+		}
+		// Should not inject canonical header when lowercase variant exists
+		if _, exists := headers[RequestIDHeader]; exists {
+			t.Error("should not inject canonical header when lowercase variant exists")
+		}
+		if headers["x-vespasian-request-id"] != "lowercase-id" {
+			t.Errorf("user value overwritten: got %q", headers["x-vespasian-request-id"])
+		}
+	})
+}
+
+// TestSetupBrowserAndSignals_InjectsRequestID verifies that setupBrowserAndSignals
+// injects the request ID header by default and returns it in the result.
+func TestSetupBrowserAndSignals_InjectsRequestID(t *testing.T) {
+	bs, err := setupBrowserAndSignals(
+		nil,
+		CrawlOptions{Headless: false},
+		crawl.CrawlerOptions{Depth: 1},
+	)
+	if err != nil {
+		t.Fatalf("setupBrowserAndSignals() error = %v", err)
+	}
+	defer bs.cleanup()
+
+	if len(bs.requestID) != 32 {
+		t.Errorf("requestID length = %d, want 32", len(bs.requestID))
+	}
+	if bs.opts.Headers[RequestIDHeader] != bs.requestID {
+		t.Errorf("header = %q, want %q", bs.opts.Headers[RequestIDHeader], bs.requestID)
+	}
+}
+
+// TestSetupBrowserAndSignals_NoRequestIDDisablesInjection verifies that
+// NoRequestID=true prevents the header from being injected.
+func TestSetupBrowserAndSignals_NoRequestIDDisablesInjection(t *testing.T) {
+	bs, err := setupBrowserAndSignals(
+		nil,
+		CrawlOptions{Headless: false, NoRequestID: true},
+		crawl.CrawlerOptions{Depth: 1},
+	)
+	if err != nil {
+		t.Fatalf("setupBrowserAndSignals() error = %v", err)
+	}
+	defer bs.cleanup()
+
+	if bs.requestID != "" {
+		t.Errorf("requestID = %q, want empty", bs.requestID)
+	}
+	if _, ok := bs.opts.Headers[RequestIDHeader]; ok {
+		t.Error("header should not be present when NoRequestID is true")
+	}
+}
+
+// TestSetupBrowserAndSignals_UserSuppliedRequestIDPreserved verifies that a
+// user-supplied X-Vespasian-Request-Id via -H takes precedence.
+func TestSetupBrowserAndSignals_UserSuppliedRequestIDPreserved(t *testing.T) {
+	bs, err := setupBrowserAndSignals(
+		[]string{"X-Vespasian-Request-Id: user-value"},
+		CrawlOptions{Headless: false},
+		crawl.CrawlerOptions{Depth: 1},
+	)
+	if err != nil {
+		t.Fatalf("setupBrowserAndSignals() error = %v", err)
+	}
+	defer bs.cleanup()
+
+	if bs.requestID != "" {
+		t.Errorf("requestID = %q, want empty (user-supplied)", bs.requestID)
+	}
+	if bs.opts.Headers[RequestIDHeader] != "user-value" {
+		t.Errorf("header = %q, want %q", bs.opts.Headers[RequestIDHeader], "user-value")
 	}
 }
