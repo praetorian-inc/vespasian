@@ -68,6 +68,8 @@ func (BurpImporter) Name() string {
 func containsXXEEntity(data []byte) bool {
 	target := []byte("<!ENTITY")
 	for i := 0; i <= len(data)-len(target); i++ {
+		// Fast-path: skip positions that don't start with '<' to avoid
+		// calling EqualFold on every byte offset.
 		if data[i] == '<' && bytes.EqualFold(data[i:i+len(target)], target) {
 			return true
 		}
@@ -144,6 +146,7 @@ func (i *BurpImporter) parseItem(item burpItem) (crawl.ObservedRequest, error) {
 			Body:        body,
 			Response: crawl.ObservedResponse{
 				StatusCode: item.Status,
+				Headers:    map[string]string{},
 			},
 			Source: "import:burp",
 		}, nil

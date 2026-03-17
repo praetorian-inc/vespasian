@@ -722,6 +722,7 @@ func TestBurpImporter_EmptyResponse(t *testing.T) {
 		<url>https://example.com/api</url>
 		<request base64="true">` + base64.StdEncoding.EncodeToString([]byte(getRequest)) + `</request>
 		<status>504</status>
+		<!-- base64("") == "" — simulates Burp's <response base64="true"></response> for timed-out requests -->
 		<response base64="true">` + base64.StdEncoding.EncodeToString([]byte("")) + `</response>
 	</item>
 </items>`
@@ -736,7 +737,7 @@ func TestBurpImporter_EmptyResponse(t *testing.T) {
 	assert.Equal(t, "https://example.com/api", req.URL)
 	assert.Equal(t, "import:burp", req.Source)
 	assert.Equal(t, 504, req.Response.StatusCode)
-	assert.Nil(t, req.Response.Headers)
+	assert.Empty(t, req.Response.Headers)
 	assert.Nil(t, req.Response.Body)
 }
 
@@ -764,6 +765,6 @@ func TestBurpImporter_EmptyResponseNonBase64(t *testing.T) {
 	assert.Equal(t, "https://example.com/page", req.URL)
 	assert.Equal(t, "import:burp", req.Source)
 	assert.Equal(t, 0, req.Response.StatusCode)
-	assert.Nil(t, req.Response.Headers)
+	assert.Empty(t, req.Response.Headers)
 	assert.Nil(t, req.Response.Body)
 }
