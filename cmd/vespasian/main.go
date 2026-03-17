@@ -759,6 +759,8 @@ func classifiersForType(apiType string) []classify.APIClassifier {
 		return []classify.APIClassifier{&classify.RESTClassifier{}}
 	case apiTypeWSDL:
 		return []classify.APIClassifier{&classify.WSDLClassifier{}}
+	case "graphql":
+		return []classify.APIClassifier{&classify.GraphQLClassifier{}}
 	default:
 		return nil
 	}
