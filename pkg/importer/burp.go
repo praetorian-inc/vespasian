@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"golang.org/x/net/html/charset"
 )
 
 const (
@@ -81,6 +82,7 @@ func (i *BurpImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
 	var items burpItems
 	decoder := xml.NewDecoder(bytes.NewReader(data))
 	decoder.Strict = true
+	decoder.CharsetReader = charset.NewReaderLabel
 	if err := decoder.Decode(&items); err != nil {
 		return nil, fmt.Errorf("burp importer: failed to decode XML: %w", err)
 	}
