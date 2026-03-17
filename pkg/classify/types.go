@@ -33,4 +33,38 @@ type ClassifiedRequest struct {
 
 	// WSDLDocument holds a probed WSDL document for SOAP endpoints.
 	WSDLDocument []byte `json:"wsdl_document,omitempty"`
+
+	// GraphQLSchema holds the parsed introspection result for GraphQL endpoints.
+	// Nil means introspection was not attempted or failed.
+	GraphQLSchema *GraphQLIntrospection `json:"graphql_schema,omitempty"`
+}
+
+// GraphQLIntrospection holds parsed GraphQL introspection results.
+type GraphQLIntrospection struct {
+	// IntrospectionEnabled indicates whether the endpoint responded to introspection.
+	IntrospectionEnabled bool `json:"introspection_enabled"`
+	// Types is the parsed list of types from __schema.types.
+	Types []GraphQLType `json:"types,omitempty"`
+	// RawResponse stores the raw introspection JSON for downstream generators.
+	RawResponse []byte `json:"raw_response,omitempty"`
+}
+
+// GraphQLType represents a single type from a GraphQL introspection response.
+type GraphQLType struct {
+	Name   string         `json:"name"`
+	Kind   string         `json:"kind"`
+	Fields []GraphQLField `json:"fields,omitempty"`
+}
+
+// GraphQLField represents a field on a GraphQL type.
+type GraphQLField struct {
+	Name string         `json:"name"`
+	Type GraphQLTypeRef `json:"type"`
+}
+
+// GraphQLTypeRef represents a type reference (name + kind + ofType for wrapping types).
+type GraphQLTypeRef struct {
+	Name   *string        `json:"name"`
+	Kind   string         `json:"kind"`
+	OfType *GraphQLTypeRef `json:"ofType,omitempty"`
 }

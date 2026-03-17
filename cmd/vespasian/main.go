@@ -724,6 +724,8 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts ge
 		switch opts.APIType {
 		case apiTypeWSDL:
 			strategies = []probe.ProbeStrategy{probe.NewWSDLProbe(cfg)}
+		case apiTypeGraphQL:
+			strategies = []probe.ProbeStrategy{probe.NewGraphQLProbe(cfg)}
 		default:
 			strategies = []probe.ProbeStrategy{
 				probe.NewOptionsProbe(cfg),
