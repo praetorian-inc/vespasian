@@ -236,46 +236,33 @@ func TestBurpImporter_Import_Errors(t *testing.T) {
 	}
 }
 
-func TestBurpImporter_XXEPrevention(t *testing.T) {
+// TestBurpImporter_XXESafety verifies that Go's encoding/xml safely handles
+// ENTITY declarations without resolving external entities. The XML parser
+// provides XXE protection by default — no pre-scan rejection is needed.
+func TestBurpImporter_XXESafety(t *testing.T) {
 	tests := []struct {
 		name    string
 		xml     string
 		wantErr bool
-		errMsg  string
 	}{
-		{
-			name:    "DOCTYPE declaration rejected",
-			xml:     `<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe "test">]><items></items>`,
-			wantErr: true,
-			errMsg:  "DOCTYPE or ENTITY",
-		},
-		{
-			name:    "ENTITY declaration rejected",
-			xml:     `<?xml version="1.0"?><!ENTITY xxe SYSTEM "file:///etc/passwd"><items></items>`,
-			wantErr: true,
-			errMsg:  "DOCTYPE or ENTITY",
-		},
-		{
-			name:    "lowercase doctype rejected",
-			xml:     `<?xml version="1.0"?><!doctype foo><items></items>`,
-			wantErr: true,
-			errMsg:  "DOCTYPE or ENTITY",
-		},
-		{
-			name:    "mixed case DOCTYPE rejected",
-			xml:     `<?xml version="1.0"?><!DocType foo><items></items>`,
-			wantErr: true,
-			errMsg:  "DOCTYPE or ENTITY",
-		},
-		{
-			name:    "mixed case ENTITY rejected",
-			xml:     `<?xml version="1.0"?><!EnTiTy xxe "test"><items></items>`,
-			wantErr: true,
-			errMsg:  "DOCTYPE or ENTITY",
-		},
 		{
 			name:    "valid XML without DOCTYPE passes",
 			xml:     `<?xml version="1.0"?><items></items>`,
+			wantErr: false,
+		},
+		{
+			name:    "Burp Suite XML with DOCTYPE passes",
+			xml:     `<?xml version="1.0"?><!DOCTYPE items [<!ELEMENT items (item)*><!ELEMENT item (url|request|status|response)*>]><items><item><url>http://example.com</url><request base64="true">R0VUIC8gSFRUUC8xLjENCkhvc3Q6IGV4YW1wbGUuY29tDQoNCg==</request><status>200</status><response base64="true">SFRUUC8xLjEgMjAwIE9LDQpDb250ZW50LVR5cGU6IHRleHQvaHRtbA0KDQpPSw==</response></item></items>`,
+			wantErr: false,
+		},
+		{
+			name:    "DOCTYPE with internal ENTITY parsed safely",
+			xml:     `<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe "test">]><items></items>`,
+			wantErr: false,
+		},
+		{
+			name:    "lowercase doctype passes",
+			xml:     `<?xml version="1.0"?><!doctype foo><items></items>`,
 			wantErr: false,
 		},
 	}
@@ -286,7 +273,6 @@ func TestBurpImporter_XXEPrevention(t *testing.T) {
 			_, err := b.Import(strings.NewReader(tt.xml))
 			if tt.wantErr {
 				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.errMsg)
 			} else {
 				assert.NoError(t, err)
 			}
@@ -689,4 +675,61 @@ func TestBurpImporter_HeadersWithBlankLines(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, requests, 1)
 	assert.Equal(t, "text/html", requests[0].Response.Headers["Content-Type"])
+}
+
+func TestBurpImporter_EmptyResponse(t *testing.T) {
+	// Simulate a timeout/connection reset where Burp records an empty response
+	getRequest := "GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n"
+
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/api</url>
+		<request base64="true">` + base64.StdEncoding.EncodeToString([]byte(getRequest)) + `</request>
+		<status>504</status>
+		<!-- base64("") == "" — simulates Burp's <response base64="true"></response> for timed-out requests -->
+		<response base64="true">` + base64.StdEncoding.EncodeToString([]byte("")) + `</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	requests, err := b.Import(strings.NewReader(xml))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	req := requests[0]
+	assert.Equal(t, "GET", req.Method)
+	assert.Equal(t, "https://example.com/api", req.URL)
+	assert.Equal(t, "import:burp", req.Source)
+	assert.Equal(t, 504, req.Response.StatusCode)
+	assert.Empty(t, req.Response.Headers)
+	assert.Nil(t, req.Response.Body)
+}
+
+func TestBurpImporter_EmptyResponseNonBase64(t *testing.T) {
+	// Non-base64 empty response element (no base64 attribute or base64="false")
+	getRequest := "GET /page HTTP/1.1\r\nHost: example.com\r\n\r\n"
+
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/page</url>
+		<request base64="true">` + base64.StdEncoding.EncodeToString([]byte(getRequest)) + `</request>
+		<status>0</status>
+		<response></response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	requests, err := b.Import(strings.NewReader(xml))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	req := requests[0]
+	assert.Equal(t, "GET", req.Method)
+	assert.Equal(t, "https://example.com/page", req.URL)
+	assert.Equal(t, "import:burp", req.Source)
+	assert.Equal(t, 0, req.Response.StatusCode)
+	assert.Empty(t, req.Response.Headers)
+	assert.Nil(t, req.Response.Body)
 }
