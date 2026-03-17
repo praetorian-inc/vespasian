@@ -98,6 +98,14 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 
 	// Rule 2: Content-type filter.
 	ct := strings.ToLower(req.Response.ContentType)
+	if ct == "" {
+		for k, v := range req.Response.Headers {
+			if strings.EqualFold(k, "content-type") {
+				ct = strings.ToLower(v)
+				break
+			}
+		}
+	}
 	// Strip charset parameters (e.g., "application/json; charset=utf-8").
 	if idx := strings.Index(ct, ";"); idx != -1 {
 		ct = strings.TrimSpace(ct[:idx])
