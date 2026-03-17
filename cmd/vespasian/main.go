@@ -172,15 +172,6 @@ const shutdownBackstop = 10 * time.Second
 func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl.CrawlerOptions) ([]crawl.ObservedRequest, error) {
 	opts.Stderr = stderr
 
-	if opts.Proxy != "" && !opts.Headless {
-		fmt.Fprintf(stderr, "warning: --proxy is only supported with headless browser mode; ignoring proxy setting\n")
-		opts.Proxy = ""
-	}
-
-	// Safety: opts.Proxy is printed below. All current callers (CrawlCmd.Run,
-	// ScanCmd.Run) validate via setupBrowserAndSignals → validateProxyAddr first,
-	// which rejects embedded credentials. If adding a new caller, ensure
-	// validateProxyAddr runs before reaching this point.
 	if opts.Proxy != "" {
 		if u, err := url.Parse(opts.Proxy); err == nil && u.Port() == "" {
 			fmt.Fprintf(stderr, "warning: --proxy address %q has no explicit port; most proxies require one (e.g., :8080)\n", opts.Proxy)
@@ -340,33 +331,15 @@ func setupBrowserAndSignals(rawHeaders []string, crawlOpts CrawlOptions, extraOp
 
 	extraOpts.Headers = headers
 
-	var browserMgr *crawl.BrowserManager
-
-	if crawlOpts.Headless {
-		browserMgr, err = crawl.NewBrowserManager(crawl.BrowserOptions{Headless: true, Proxy: crawlOpts.Proxy})
-		if err != nil {
-			return browserSetupResult{}, fmt.Errorf("launch browser: %w", err)
-		}
-		extraOpts.BrowserMgr = browserMgr
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 
-	// Single closure for browser teardown, shared between the force-exit
-	// handler and the deferred cleanup. BrowserManager.Close() is already
-	// idempotent (sync.Once), but a shared closure makes the intent explicit
-	// and avoids duplicating the nil-check.
-	closeBrowser := func() {
-		if browserMgr != nil {
-			browserMgr.Close()
-		}
-	}
-
-	setupForceExitHandler(ctx, os.Stderr, closeBrowser, os.Exit)
+	// The headless engine manages its own Chrome lifecycle, so there is
+	// no external browser to tear down. The force-exit handler just needs
+	// to stop the signal handler.
+	setupForceExitHandler(ctx, os.Stderr, nil, os.Exit)
 
 	cleanup := func() {
 		stop()
-		closeBrowser()
 	}
 
 	return browserSetupResult{

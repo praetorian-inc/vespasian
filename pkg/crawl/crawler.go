@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"github.com/projectdiscovery/goflags"
-	"github.com/projectdiscovery/katana/pkg/engine/hybrid"
+	"github.com/projectdiscovery/katana/pkg/engine/headless"
 	"github.com/projectdiscovery/katana/pkg/engine/standard"
 	"github.com/projectdiscovery/katana/pkg/output"
 	"github.com/projectdiscovery/katana/pkg/types"
@@ -58,14 +58,6 @@ type CrawlerOptions struct {
 	Headers  map[string]string
 	Proxy    string    // optional: proxy address for Chrome (e.g., "http://127.0.0.1:8080")
 	Stderr   io.Writer // user-facing status messages; nil disables output
-
-	// BrowserMgr provides a caller-owned Chrome instance. When set, Crawl()
-	// connects to this browser instead of launching its own. Callers who want
-	// immediate signal-based browser termination (force-exit killing Chrome on
-	// second SIGINT) MUST provide their own BrowserManager and wire it into
-	// their signal handler. The internal fallback (BrowserMgr == nil) launches
-	// a browser that lacks force-exit integration.
-	BrowserMgr *BrowserManager
 }
 
 // Crawler performs web crawling to capture HTTP traffic.
@@ -94,97 +86,141 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		return nil, fmt.Errorf("invalid target URL: %q", targetURL)
 	}
 
-	// Use caller-provided browser or launch Chrome under vespasian's control.
-	// This lets us kill the browser immediately on signal, stopping all
-	// outbound requests — Katana's internal context is disconnected from ours.
-	var browserMgr *BrowserManager
-	if c.opts.BrowserMgr != nil {
-		browserMgr = c.opts.BrowserMgr
-		// Caller owns lifecycle — don't defer Close here.
-	} else if c.opts.Headless {
-		browserMgr, err = NewBrowserManager(BrowserOptions{Headless: true, Proxy: c.opts.Proxy})
-		if err != nil {
-			return nil, fmt.Errorf("launch browser: %w", err)
-		}
-		defer browserMgr.Close()
+	if c.opts.Headless {
+		return c.crawlHeadless(ctx, targetURL, maxPages)
 	}
+	return c.crawlStandard(ctx, targetURL, maxPages)
+}
 
-	// Create a cancellable context to stop Katana when MaxPages is reached.
-	crawlCtx, crawlCancel := context.WithCancel(ctx)
-	defer crawlCancel()
-
-	// Pre-allocate results slice with capacity, capped at 1000 to limit initial allocation
+// crawlHeadless uses Katana's new headless engine which has its own Chrome
+// lifecycle and CDP-based network capture. This produces significantly better
+// SPA crawl coverage than the hybrid engine.
+func (c *Crawler) crawlHeadless(ctx context.Context, targetURL string, maxPages int) ([]ObservedRequest, error) {
 	results := make([]ObservedRequest, 0, min(maxPages, 1000))
 	var mu sync.Mutex
-	pageCount := 0
 
-	// Build Katana options
 	katanaOpts := &types.Options{
 		MaxDepth:      c.opts.Depth,
 		Timeout:       PageTimeout,
 		CrawlDuration: c.opts.Timeout,
 		FieldScope:    MapScope(c.opts.Scope),
-		Headless:      c.opts.Headless,
+		Headless:      true,
 		CustomHeaders: ToStringSlice(c.opts.Headers),
-		Strategy:      "depth-first",
-		// BodyReadSize (10 MB) is intentionally larger than MaxResponseBodySize (1 MB).
-		// Katana needs the full body for link extraction and JS parsing to maximize
-		// crawl coverage; we only retain MaxResponseBodySize for classification.
-		// Peak memory: up to Concurrency × BodyReadSize (100 MB with 10 workers).
-		BodyReadSize:      10 * 1024 * 1024,
-		Concurrency:       10,
-		Parallelism:       10,
-		RateLimit:         150,
-		TimeStable:        3, // seconds to wait for DOM stability; 0 causes go-rod panic in time.NewTicker
-		ScrapeJSResponses: true,
-		XhrExtraction:     true,
-		Silent:            true,
-		OnResult: func(result output.Result) {
-			// Map result outside the lock — MapResult may do URL parsing
-			// and body truncation, which is wasted work under contention.
-			mapped := MapResult(result)
-
-			mu.Lock()
-			defer mu.Unlock()
-
-			// Check MaxPages limit (using resolved maxPages)
-			if pageCount >= maxPages {
-				return
-			}
-			pageCount++
-
-			results = append(results, mapped)
-			// Stop Katana once MaxPages is reached to avoid wasting resources.
-			if pageCount >= maxPages {
-				crawlCancel()
-			}
-		},
+		Proxy:         c.opts.Proxy,
+		Silent:        true,
 	}
 
-	// When vespasian owns the browser, pass the WS URL to Katana so it
-	// connects to our Chrome instance instead of launching its own.
-	if browserMgr != nil {
-		katanaOpts.ChromeWSUrl = browserMgr.wsURL()
-	}
-
-	// Initialize crawler options
 	crawlerOpts, err := types.NewCrawlerOptions(katanaOpts)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = crawlerOpts.Close() }()
 
-	// Create engine based on headless mode
-	var engine interface {
-		Crawl(string) error
-		Close() error
+	// Replace the default output writer with one that captures results
+	// into our slice. The headless engine calls OutputWriter.Write() for
+	// each discovered request — OnResult is not used by this engine.
+	crawlerOpts.OutputWriter = &resultCaptureWriter{
+		results:  &results,
+		mu:       &mu,
+		maxPages: maxPages,
 	}
 
-	if c.opts.Headless {
-		engine, err = hybrid.New(crawlerOpts)
-	} else {
-		engine, err = standard.New(crawlerOpts)
+	engine, err := headless.New(crawlerOpts)
+	if err != nil {
+		return nil, err
 	}
+	defer engine.Close()
+
+	crawlErr := make(chan error, 1)
+	go func() {
+		crawlErr <- engine.Crawl(targetURL)
+	}()
+
+	select {
+	case err := <-crawlErr:
+		if err != nil {
+			mu.Lock()
+			snapshot := make([]ObservedRequest, len(results))
+			copy(snapshot, results)
+			mu.Unlock()
+			return snapshot, err
+		}
+	case <-ctx.Done():
+		if c.opts.Stderr != nil {
+			fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n")
+		}
+		// The headless engine manages its own browser. Closing the engine
+		// will terminate the browser. engine.Close() is deferred above.
+		// Wait briefly for the crawl goroutine to finish.
+		timer := time.NewTimer(ShutdownGracePeriod)
+		select {
+		case <-crawlErr:
+		case <-timer.C:
+		}
+		timer.Stop()
+
+		mu.Lock()
+		snapshot := make([]ObservedRequest, len(results))
+		copy(snapshot, results)
+		mu.Unlock()
+		return snapshot, ctx.Err()
+	}
+
+	mu.Lock()
+	snapshot := make([]ObservedRequest, len(results))
+	copy(snapshot, results)
+	mu.Unlock()
+	return snapshot, nil
+}
+
+// crawlStandard uses Katana's standard (non-headless) HTTP engine.
+func (c *Crawler) crawlStandard(ctx context.Context, targetURL string, maxPages int) ([]ObservedRequest, error) {
+	crawlCtx, crawlCancel := context.WithCancel(ctx)
+	defer crawlCancel()
+
+	results := make([]ObservedRequest, 0, min(maxPages, 1000))
+	var mu sync.Mutex
+	pageCount := 0
+
+	katanaOpts := &types.Options{
+		MaxDepth:      c.opts.Depth,
+		Timeout:       PageTimeout,
+		CrawlDuration: c.opts.Timeout,
+		FieldScope:    MapScope(c.opts.Scope),
+		Headless:      false,
+		CustomHeaders: ToStringSlice(c.opts.Headers),
+		Proxy:         c.opts.Proxy,
+		Strategy:      "depth-first",
+		BodyReadSize:  10 * 1024 * 1024,
+		Concurrency:   10,
+		Parallelism:   10,
+		RateLimit:     150,
+		Silent:        true,
+		OnResult: func(result output.Result) {
+			mapped := MapResult(result)
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			if pageCount >= maxPages {
+				return
+			}
+			pageCount++
+
+			results = append(results, mapped)
+			if pageCount >= maxPages {
+				crawlCancel()
+			}
+		},
+	}
+
+	crawlerOpts, err := types.NewCrawlerOptions(katanaOpts)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = crawlerOpts.Close() }()
+
+	engine, err := standard.New(crawlerOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -192,7 +228,6 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 	closeEngine := func() { closeOnce.Do(func() { _ = engine.Close() }) }
 	defer closeEngine()
 
-	// Run crawl in goroutine with context cancellation
 	crawlErr := make(chan error, 1)
 	go func() {
 		crawlErr <- engine.Crawl(targetURL)
@@ -208,50 +243,20 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			return snapshot, err
 		}
 	case <-crawlCtx.Done():
-		// crawlCtx fires for both MaxPages (crawlCancel in OnResult) and
-		// signal (parent ctx canceled). Check which case we're in.
 		if ctx.Err() != nil {
-			// Signal received (SIGINT/SIGTERM or programmatic cancel).
-			// Notify the user immediately before any cleanup.
 			if c.opts.Stderr != nil {
 				fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n")
 			}
 
-			// Kill Chrome immediately to stop all outbound requests.
-			if browserMgr != nil {
-				browserMgr.Kill()
-			}
-
-			// Bounded wait: drain Katana's internal result buffer.
-			// Chrome is dead — no network activity — we're just collecting
-			// already-buffered results.
 			timer := time.NewTimer(ShutdownGracePeriod)
-			var timerExpired bool
 			select {
 			case <-crawlErr:
-				// Crawl goroutine exited cleanly.
 			case <-timer.C:
-				timerExpired = true
 			}
 			timer.Stop()
 
-			// Close engine with a bounded wait — engine.Close() may block
-			// if the killed Chrome process left the engine in a bad state.
 			boundedRun(closeEngine, DrainTimeout)
 
-			if timerExpired {
-				// engine.Close() causes engine.Crawl() to return shortly.
-				// Wait briefly to prevent goroutine leak.
-				drainTimer := time.NewTimer(DrainTimeout)
-				select {
-				case <-crawlErr:
-				case <-drainTimer.C:
-				}
-				drainTimer.Stop()
-			}
-
-			// Snapshot results under lock — Katana's internal goroutines
-			// may still be calling OnResult during shutdown.
 			mu.Lock()
 			snapshot := make([]ObservedRequest, len(results))
 			copy(snapshot, results)
@@ -259,8 +264,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			return snapshot, ctx.Err()
 		}
 
-		// MaxPages reached — close engine with bounded wait, then drain
-		// crawl goroutine to match the signal path's timeout discipline.
+		// MaxPages reached
 		boundedRun(closeEngine, DrainTimeout)
 
 		drainTimer := time.NewTimer(ShutdownGracePeriod)
@@ -277,6 +281,34 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 	mu.Unlock()
 	return snapshot, nil
 }
+
+// resultCaptureWriter implements output.Writer to capture crawl results
+// into a slice instead of writing to stdout/file. Used by the headless
+// engine which calls OutputWriter.Write() for each discovered request.
+type resultCaptureWriter struct {
+	results  *[]ObservedRequest
+	mu       *sync.Mutex
+	maxPages int
+}
+
+func (w *resultCaptureWriter) Write(result *output.Result) error {
+	if result == nil {
+		return nil
+	}
+	mapped := MapResult(*result)
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if len(*w.results) >= w.maxPages {
+		return nil
+	}
+	*w.results = append(*w.results, mapped)
+	return nil
+}
+
+func (w *resultCaptureWriter) WriteErr(_ *output.Error) error { return nil }
+func (w *resultCaptureWriter) Close() error                   { return nil }
 
 // MapResult converts Katana output.Result to ObservedRequest.
 func MapResult(r output.Result) ObservedRequest {
