@@ -517,7 +517,7 @@ func (c *ScanCmd) Run() error {
 	genCtx, genStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer genStop()
 
-	spec, err := generateSpec(genCtx, requests, "rest", c.Confidence, c.Probe, c.Verbose)
+	spec, err := generateSpec(genCtx, requests, "rest", c.Confidence, c.Probe, c.DangerousAllowPrivate, c.Verbose)
 	if err != nil {
 		return err
 	}
