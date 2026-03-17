@@ -63,26 +63,11 @@ func (BurpImporter) Name() string {
 	return "burp"
 }
 
-// containsXXEEntity checks for ENTITY declarations in XML data (XXE attack vector).
-// DOCTYPE declarations are allowed as they are standard in Burp Suite XML exports.
-func containsXXEEntity(data []byte) bool {
-	target := []byte("<!ENTITY")
-	for i := 0; i <= len(data)-len(target); i++ {
-		// Fast-path: skip positions that don't start with '<' to avoid
-		// calling EqualFold on every byte offset.
-		if data[i] == '<' && bytes.EqualFold(data[i:i+len(target)], target) {
-			return true
-		}
-	}
-	return false
-}
-
 // Import reads Burp Suite XML and converts to ObservedRequest format.
 func (i *BurpImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
 	// Limit reader to prevent resource exhaustion
 	limitedReader := newLimitedReader(r, maxImportSize)
 
-	// Read all content to check for entity declarations
 	data, err := io.ReadAll(limitedReader)
 	if err != nil {
 		return nil, fmt.Errorf("burp importer: failed to read input: %w", err)
@@ -91,11 +76,6 @@ func (i *BurpImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
 	// Check if file was too large
 	if limitedReader.hitLimit {
 		return nil, ErrFileTooLarge
-	}
-
-	// Check for ENTITY declarations (XXE attack vectors)
-	if containsXXEEntity(data) {
-		return nil, fmt.Errorf("burp importer: XML validation: ENTITY declarations not allowed")
 	}
 
 	var items burpItems

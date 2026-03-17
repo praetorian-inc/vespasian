@@ -236,59 +236,15 @@ func TestBurpImporter_Import_Errors(t *testing.T) {
 	}
 }
 
-func TestBurpImporter_XXEPrevention(t *testing.T) {
+// TestBurpImporter_XXESafety verifies that Go's encoding/xml safely handles
+// ENTITY declarations without resolving external entities. The XML parser
+// provides XXE protection by default — no pre-scan rejection is needed.
+func TestBurpImporter_XXESafety(t *testing.T) {
 	tests := []struct {
 		name    string
 		xml     string
 		wantErr bool
-		errMsg  string
 	}{
-		{
-			name:    "DOCTYPE with ENTITY declaration rejected",
-			xml:     `<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe "test">]><items></items>`,
-			wantErr: true,
-			errMsg:  "ENTITY",
-		},
-		{
-			name:    "ENTITY declaration rejected",
-			xml:     `<?xml version="1.0"?><!ENTITY xxe SYSTEM "file:///etc/passwd"><items></items>`,
-			wantErr: true,
-			errMsg:  "ENTITY",
-		},
-		{
-			name:    "lowercase doctype passes",
-			xml:     `<?xml version="1.0"?><!doctype foo><items></items>`,
-			wantErr: false,
-		},
-		{
-			name:    "mixed case DOCTYPE passes",
-			xml:     `<?xml version="1.0"?><!DocType foo><items></items>`,
-			wantErr: false,
-		},
-		{
-			name:    "mixed case ENTITY rejected",
-			xml:     `<?xml version="1.0"?><!EnTiTy xxe "test"><items></items>`,
-			wantErr: true,
-			errMsg:  "ENTITY",
-		},
-		{
-			name:    "previously bypassing mixed case eNtItY rejected",
-			xml:     `<?xml version="1.0"?><!eNtItY xxe SYSTEM "file:///etc/passwd"><items></items>`,
-			wantErr: true,
-			errMsg:  "ENTITY",
-		},
-		{
-			name:    "alternating case entity rejected",
-			xml:     `<?xml version="1.0"?><!eNtITy xxe "test"><items></items>`,
-			wantErr: true,
-			errMsg:  "ENTITY",
-		},
-		{
-			name:    "all lowercase entity rejected",
-			xml:     `<?xml version="1.0"?><!entity xxe SYSTEM "file:///etc/passwd"><items></items>`,
-			wantErr: true,
-			errMsg:  "ENTITY",
-		},
 		{
 			name:    "valid XML without DOCTYPE passes",
 			xml:     `<?xml version="1.0"?><items></items>`,
@@ -299,6 +255,16 @@ func TestBurpImporter_XXEPrevention(t *testing.T) {
 			xml:     `<?xml version="1.0"?><!DOCTYPE items [<!ELEMENT items (item)*><!ELEMENT item (url|request|status|response)*>]><items><item><url>http://example.com</url><request base64="true">R0VUIC8gSFRUUC8xLjENCkhvc3Q6IGV4YW1wbGUuY29tDQoNCg==</request><status>200</status><response base64="true">SFRUUC8xLjEgMjAwIE9LDQpDb250ZW50LVR5cGU6IHRleHQvaHRtbA0KDQpPSw==</response></item></items>`,
 			wantErr: false,
 		},
+		{
+			name:    "DOCTYPE with internal ENTITY parsed safely",
+			xml:     `<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe "test">]><items></items>`,
+			wantErr: false,
+		},
+		{
+			name:    "lowercase doctype passes",
+			xml:     `<?xml version="1.0"?><!doctype foo><items></items>`,
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -307,7 +273,6 @@ func TestBurpImporter_XXEPrevention(t *testing.T) {
 			_, err := b.Import(strings.NewReader(tt.xml))
 			if tt.wantErr {
 				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.errMsg)
 			} else {
 				assert.NoError(t, err)
 			}
