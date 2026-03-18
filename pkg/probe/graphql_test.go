@@ -74,7 +74,7 @@ func TestGraphQLProbe_Name(t *testing.T) {
 func TestGraphQLProbe_SuccessfulIntrospection(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(validIntrospectionResponse))
+		w.Write([]byte(validIntrospectionResponse)) //nolint:gosec // test handler
 	}))
 	defer srv.Close()
 
@@ -127,7 +127,7 @@ func TestGraphQLProbe_SuccessfulIntrospection(t *testing.T) {
 func TestGraphQLProbe_IntrospectionDisabled(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"errors":[{"message":"introspection is disabled"}]}`))
+		w.Write([]byte(`{"errors":[{"message":"introspection is disabled"}]}`)) //nolint:gosec // test handler
 	}))
 	defer srv.Close()
 
@@ -211,7 +211,7 @@ func TestGraphQLProbe_DeduplicatesByURL(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(validIntrospectionResponse))
+		w.Write([]byte(validIntrospectionResponse)) //nolint:gosec // test handler
 	}))
 	defer srv.Close()
 
@@ -250,7 +250,7 @@ func TestGraphQLProbe_MaxEndpointsRespected(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(validIntrospectionResponse))
+		w.Write([]byte(validIntrospectionResponse)) //nolint:gosec // test handler
 	}))
 	defer srv.Close()
 
@@ -281,7 +281,7 @@ func TestGraphQLProbe_MaxEndpointsRespected(t *testing.T) {
 func TestGraphQLProbe_DoesNotMutateInput(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(validIntrospectionResponse))
+		w.Write([]byte(validIntrospectionResponse)) //nolint:gosec // test handler
 	}))
 	defer srv.Close()
 
@@ -308,7 +308,7 @@ func TestGraphQLProbe_DoesNotMutateInput(t *testing.T) {
 func TestGraphQLProbe_MalformedJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{not valid json`))
+		w.Write([]byte(`{not valid json`)) //nolint:gosec // test handler
 	}))
 	defer srv.Close()
 
