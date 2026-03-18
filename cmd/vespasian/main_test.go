@@ -435,18 +435,20 @@ func TestGenerateSpec(t *testing.T) {
 	}
 
 	tests := []struct {
-		name       string
-		apiType    string
-		probe      bool
-		verbose    bool
-		wantErrStr string
-		wantErr    bool
+		name        string
+		apiType     string
+		probe       bool
+		deduplicate bool
+		verbose     bool
+		wantErrStr  string
+		wantErr     bool
 	}{
 		{
-			name:    "rest with valid requests, probe disabled",
-			apiType: "rest",
-			probe:   false,
-			wantErr: false,
+			name:        "rest with valid requests, probe disabled",
+			apiType:     "rest",
+			probe:       false,
+			deduplicate: true,
+			wantErr:     false,
 		},
 		{
 			name:       "unknown api type",
@@ -456,23 +458,32 @@ func TestGenerateSpec(t *testing.T) {
 			wantErrStr: "unsupported API type",
 		},
 		{
-			name:    "probe enabled with real implementations",
-			apiType: "rest",
-			probe:   true,
-			wantErr: false,
+			name:        "probe enabled with real implementations",
+			apiType:     "rest",
+			probe:       true,
+			deduplicate: true,
+			wantErr:     false,
 		},
 		{
-			name:    "verbose logging",
-			apiType: "rest",
-			probe:   false,
-			verbose: true,
-			wantErr: false,
+			name:        "verbose logging",
+			apiType:     "rest",
+			probe:       false,
+			deduplicate: true,
+			verbose:     true,
+			wantErr:     false,
+		},
+		{
+			name:        "rest without deduplication",
+			apiType:     "rest",
+			probe:       false,
+			deduplicate: false,
+			wantErr:     false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := generateSpec(context.Background(), requests, tt.apiType, 0.5, tt.probe, true, tt.verbose)
+			_, err := generateSpec(context.Background(), requests, tt.apiType, 0.5, tt.probe, tt.deduplicate, tt.verbose)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("generateSpec() expected error containing %q, got nil", tt.wantErrStr)
@@ -532,9 +543,10 @@ func TestGenerateCmdRun_ValidCapture(t *testing.T) {
 	_ = f.Close()
 
 	cmd := &GenerateCmd{
-		APIType: "rest",
-		Capture: capturePath,
-		Probe:   false,
+		APIType:     "rest",
+		Capture:     capturePath,
+		Probe:       false,
+		Deduplicate: true,
 	}
 	err = cmd.Run()
 	if err != nil {

@@ -471,7 +471,7 @@ type GenerateCmd struct {
 	Output      string  `short:"o" help:"Output file path"`
 	Confidence  float64 `default:"0.5" help:"Minimum confidence threshold"`
 	Probe       bool    `default:"true" help:"Enable endpoint probing"`
-	Deduplicate bool    `default:"true" help:"Deduplicate classified endpoints before probing (default: true)"`
+	Deduplicate bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
 	Verbose     bool    `short:"v" help:"Enable verbose logging"`
 }
 
@@ -527,7 +527,7 @@ type ScanCmd struct {
 	URL         string  `arg:"" help:"Target URL to scan"`
 	Confidence  float64 `default:"0.5" help:"Minimum confidence threshold"`
 	Probe       bool    `default:"true" help:"Enable endpoint probing"`
-	Deduplicate bool    `default:"true" help:"Deduplicate classified endpoints before probing (default: true)"`
+	Deduplicate bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
 	CrawlOptions
 }
 
