@@ -19,15 +19,13 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
+	"github.com/vektah/gqlparser/v2/ast"
+	"github.com/vektah/gqlparser/v2/parser"
 )
-
-// operationRe matches GraphQL operation declarations (query/mutation/subscription OperationName).
-var operationRe = regexp.MustCompile(`^\s*(query|mutation|subscription)\s+(\w+)`)
 
 // graphqlBody represents a parsed GraphQL request body.
 type graphqlBody struct {
@@ -38,9 +36,10 @@ type graphqlBody struct {
 // inferredOperation holds an inferred GraphQL operation.
 type inferredOperation struct {
 	OpType     string            // "query", "mutation", or "subscription"
-	Name       string            // operation name
-	Args       map[string]string // variable name -> inferred type
+	FieldName  string            // root field name from the selection set
+	Args       map[string]string // argument name -> type
 	ReturnType string            // inferred return type name
+	IsList     bool              // whether the return type is a list
 }
 
 // inferredType holds a synthetic type inferred from response data.
@@ -54,7 +53,7 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 	var ops []inferredOperation
 	syntheticTypes := make(map[string]*inferredType)
 	anonCounter := 0
-	seen := make(map[string]bool) // deduplicate by operation name
+	seen := make(map[string]bool) // deduplicate by root field name
 
 	for _, ep := range endpoints {
 		if ep.APIType != "graphql" {
@@ -66,29 +65,29 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 			continue
 		}
 
-		opType, opName := extractOperationInfo(body.Query)
-		if opName == "" {
-			anonCounter++
-			opName = fmt.Sprintf("Anonymous%d", anonCounter)
-		}
-		if opType == "" {
-			opType = "query"
-		}
-
-		if seen[opName] {
+		parsed := parseQueryAST(body.Query)
+		if parsed == nil {
 			continue
 		}
-		seen[opName] = true
 
-		// Infer argument types from variables
-		args := make(map[string]string)
-		for k, v := range body.Variables {
-			args[k] = inferTypeFromValue(v)
+		opType := astOpTypeToString(parsed.opType)
+		fieldName := parsed.rootFieldName
+		if fieldName == "" {
+			anonCounter++
+			fieldName = fmt.Sprintf("anonymous%d", anonCounter)
 		}
 
-		// Infer return type from response
-		returnTypeName := opName + "Response"
-		responseFields := inferFieldsFromResponse(ep.Response.Body, opName)
+		if seen[fieldName] {
+			continue
+		}
+		seen[fieldName] = true
+
+		// Build argument types: prefer AST variable definitions mapped through arguments
+		args := buildArgTypes(parsed, body.Variables)
+
+		// Infer return type from response, using root field name to locate data
+		returnTypeName := upperFirst(fieldName) + "Response"
+		responseFields, isList := inferFieldsFromResponse(ep.Response.Body, fieldName, parsed.selectionFields)
 		if len(responseFields) > 0 {
 			syntheticTypes[returnTypeName] = &inferredType{
 				Name:   returnTypeName,
@@ -98,9 +97,10 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 
 		ops = append(ops, inferredOperation{
 			OpType:     opType,
-			Name:       opName,
+			FieldName:  fieldName,
 			Args:       args,
 			ReturnType: returnTypeName,
+			IsList:     isList,
 		})
 	}
 
@@ -108,9 +108,9 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 		return nil, errors.New("no GraphQL operations found in traffic")
 	}
 
-	// Sort operations by name for deterministic output
+	// Sort operations by field name for deterministic output
 	sort.Slice(ops, func(i, j int) bool {
-		return ops[i].Name < ops[j].Name
+		return ops[i].FieldName < ops[j].FieldName
 	})
 
 	var sb strings.Builder
@@ -133,13 +133,17 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 		fmt.Fprintf(&sb, "\ntype %s {\n", typeName)
 		for _, op := range groupOps {
 			sb.WriteString("  ")
-			sb.WriteString(op.Name)
+			sb.WriteString(op.FieldName)
 			if len(op.Args) > 0 {
 				sb.WriteString("(")
 				writeArgs(&sb, op.Args)
 				sb.WriteString(")")
 			}
-			fmt.Fprintf(&sb, ": %s\n", op.ReturnType)
+			returnType := op.ReturnType
+			if op.IsList {
+				returnType = "[" + returnType + "]"
+			}
+			fmt.Fprintf(&sb, ": %s\n", returnType)
 		}
 		sb.WriteString("}\n")
 	}
@@ -155,7 +159,6 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 		st := syntheticTypes[name]
 		fmt.Fprintf(&sb, "\ntype %s {\n", st.Name)
 
-		// Sort fields for determinism
 		var fieldNames []string
 		for fn := range st.Fields {
 			fieldNames = append(fieldNames, fn)
@@ -169,6 +172,126 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 	}
 
 	return []byte(sb.String()), nil
+}
+
+// parsedQuery holds the results of parsing a GraphQL query string with gqlparser.
+type parsedQuery struct {
+	opType         ast.Operation
+	opName         string
+	rootFieldName  string
+	rootFieldArgs  []*ast.Argument      // arguments on the root field
+	varDefs        ast.VariableDefinitionList
+	selectionFields []string            // field names from the root field's selection set
+}
+
+// parseQueryAST parses a GraphQL query string and extracts operation info.
+func parseQueryAST(query string) *parsedQuery {
+	doc, parseErr := parser.ParseQuery(&ast.Source{Input: query})
+	if parseErr != nil || len(doc.Operations) == 0 {
+		return nil
+	}
+
+	op := doc.Operations[0]
+	result := &parsedQuery{
+		opType:  op.Operation,
+		opName:  op.Name,
+		varDefs: op.VariableDefinitions,
+	}
+
+	// Extract root field name and its selection set from the first field in the operation
+	if len(op.SelectionSet) > 0 {
+		if field, ok := op.SelectionSet[0].(*ast.Field); ok {
+			result.rootFieldName = field.Name
+			result.rootFieldArgs = field.Arguments
+			for _, sel := range field.SelectionSet {
+				if subField, ok := sel.(*ast.Field); ok {
+					result.selectionFields = append(result.selectionFields, subField.Name)
+				}
+			}
+		}
+	}
+
+	return result
+}
+
+// astOpTypeToString converts an ast.Operation to a string.
+func astOpTypeToString(op ast.Operation) string {
+	switch op {
+	case ast.Mutation:
+		return "mutation"
+	case ast.Subscription:
+		return "subscription"
+	default:
+		return "query"
+	}
+}
+
+// astTypeToSDL converts a gqlparser AST type to its SDL string representation.
+func astTypeToSDL(t *ast.Type) string {
+	if t == nil {
+		return "String"
+	}
+	var base string
+	if t.Elem != nil {
+		// List type
+		base = "[" + astTypeToSDL(t.Elem) + "]"
+	} else {
+		base = t.NamedType
+		if base == "" {
+			base = "String"
+		}
+	}
+	if t.NonNull {
+		base += "!"
+	}
+	return base
+}
+
+// buildArgTypes builds argument type mappings. It prefers declared variable types from the AST,
+// falling back to JSON value inference for variables not declared in the query.
+func buildArgTypes(parsed *parsedQuery, variables map[string]interface{}) map[string]string {
+	args := make(map[string]string)
+
+	// Build a map from variable name to its declared type
+	varTypes := make(map[string]string)
+	for _, vd := range parsed.varDefs {
+		varTypes[vd.Variable] = astTypeToSDL(vd.Type)
+	}
+
+	// Map root field arguments: arg name -> type from the variable it references
+	for _, arg := range parsed.rootFieldArgs {
+		argName := arg.Name
+		// If the argument value is a variable reference, use the variable's declared type
+		if arg.Value != nil && arg.Value.Kind == ast.Variable {
+			varName := arg.Value.Raw
+			if declaredType, ok := varTypes[varName]; ok {
+				args[argName] = declaredType
+				continue
+			}
+			// Fall back to JSON inference for this variable
+			if val, ok := variables[varName]; ok {
+				args[argName] = inferTypeFromValue(val)
+				continue
+			}
+		}
+		// Default fallback
+		args[argName] = "String"
+	}
+
+	// If no root field arguments were extracted but we have variables, use them directly
+	if len(args) == 0 {
+		for varName, varType := range varTypes {
+			args[varName] = varType
+		}
+		// For variables not declared in the query, infer from JSON values
+		for k, v := range variables {
+			if _, exists := args[k]; !exists {
+				args[k] = inferTypeFromValue(v)
+			}
+		}
+	}
+
+	return args
 }
 
 // writeArgs writes sorted argument definitions.
@@ -202,15 +325,6 @@ func parseGraphQLBody(body []byte) *graphqlBody {
 	return &gb
 }
 
-// extractOperationInfo extracts the operation type and name from a GraphQL query string.
-func extractOperationInfo(query string) (opType, opName string) {
-	matches := operationRe.FindStringSubmatch(query)
-	if len(matches) >= 3 {
-		return matches[1], matches[2]
-	}
-	return "", ""
-}
-
 // inferTypeFromValue infers a GraphQL type from a JSON value.
 func inferTypeFromValue(v interface{}) string {
 	switch val := v.(type) {
@@ -230,48 +344,85 @@ func inferTypeFromValue(v interface{}) string {
 	}
 }
 
-// inferFieldsFromResponse parses a GraphQL JSON response and extracts field types
-// from data.<operationName> or data.<firstKey>.
-func inferFieldsFromResponse(body []byte, opName string) map[string]string {
+// inferFieldsFromResponse parses a GraphQL JSON response and extracts field types.
+// It uses the root field name to locate the data, handles array responses,
+// and uses selectionFields to guide which fields to include.
+// Returns the fields map and whether the response value was an array.
+func inferFieldsFromResponse(body []byte, rootFieldName string, selectionFields []string) (map[string]string, bool) {
 	if len(body) == 0 {
-		return nil
+		return nil, false
 	}
 
 	var envelope map[string]interface{}
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		return nil
+		return nil, false
 	}
 
 	data, ok := envelope["data"]
 	if !ok {
-		return nil
+		return nil, false
 	}
 
 	dataMap, ok := data.(map[string]interface{})
 	if !ok {
-		return nil
+		return nil, false
 	}
 
-	// Try operation name first, then first key
-	var responseObj map[string]interface{}
-	if obj, ok := dataMap[opName]; ok {
-		responseObj, _ = obj.(map[string]interface{})
-	}
-	if responseObj == nil {
-		// Use first key
+	// Look up the root field by name, then fall back to first key
+	responseVal, ok := dataMap[rootFieldName]
+	if !ok {
 		for _, v := range dataMap {
-			responseObj, _ = v.(map[string]interface{})
+			responseVal = v
 			break
 		}
 	}
 
+	if responseVal == nil {
+		return nil, false
+	}
+
+	// Handle array responses: inspect the first element
+	isList := false
+	var responseObj map[string]interface{}
+	switch rv := responseVal.(type) {
+	case []interface{}:
+		isList = true
+		if len(rv) > 0 {
+			responseObj, _ = rv[0].(map[string]interface{})
+		}
+	case map[string]interface{}:
+		responseObj = rv
+	}
+
 	if responseObj == nil {
-		return nil
+		return nil, isList
 	}
 
 	fields := make(map[string]string)
-	for k, v := range responseObj {
-		fields[k] = inferTypeFromValue(v)
+
+	// If we have selection fields from the query AST, use them as the authoritative field list
+	if len(selectionFields) > 0 {
+		for _, fieldName := range selectionFields {
+			if v, ok := responseObj[fieldName]; ok {
+				fields[fieldName] = inferTypeFromValue(v)
+			} else {
+				fields[fieldName] = "String"
+			}
+		}
+	} else {
+		// Fall back to all fields from the response object
+		for k, v := range responseObj {
+			fields[k] = inferTypeFromValue(v)
+		}
 	}
-	return fields
+
+	return fields, isList
+}
+
+// upperFirst returns the string with its first character uppercased.
+func upperFirst(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }

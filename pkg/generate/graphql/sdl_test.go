@@ -252,11 +252,18 @@ func TestGenerator_Phase2_InferFromTraffic(t *testing.T) {
 	if !strings.Contains(sdl, "type Query {") {
 		t.Error("missing type Query")
 	}
-	if !strings.Contains(sdl, "GetUser") {
-		t.Error("missing operation name GetUser")
+	// Should use root field name "user" not operation name "GetUser"
+	if !strings.Contains(sdl, "user") {
+		t.Error("missing root field name 'user'")
+	}
+	if strings.Contains(sdl, "GetUser") {
+		t.Error("should not use operation name 'GetUser' as field name")
 	}
 	if !strings.Contains(sdl, "id: String") {
 		t.Error("missing inferred field 'id: String'")
+	}
+	if !strings.Contains(sdl, "name: String") {
+		t.Error("missing inferred field 'name: String'")
 	}
 }
 
@@ -284,8 +291,9 @@ func TestGenerator_Phase2_MutationDetection(t *testing.T) {
 	if !strings.Contains(sdl, "type Mutation {") {
 		t.Errorf("expected 'type Mutation', got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "CreateUser") {
-		t.Error("missing operation name CreateUser")
+	// Should use root field name "createUser"
+	if !strings.Contains(sdl, "createUser") {
+		t.Error("missing root field name 'createUser'")
 	}
 }
 
@@ -295,7 +303,7 @@ func TestGenerator_Phase2_VariableTypeInference(t *testing.T) {
 		{
 			ObservedRequest: crawl.ObservedRequest{
 				URL:  "http://example.com/graphql",
-				Body: []byte(`{"query":"query Search { search { id } }","variables":{"term":"hello","limit":10,"active":true,"score":3.14}}`),
+				Body: []byte(`{"query":"query Search($term: String, $limit: Int, $active: Boolean, $score: Float) { search(term: $term, limit: $limit, active: $active, score: $score) { id } }","variables":{"term":"hello","limit":10,"active":true,"score":3.14}}`),
 				Response: crawl.ObservedResponse{
 					Body: []byte(`{"data":{"search":{"id":"1"}}}`),
 				},
@@ -321,6 +329,117 @@ func TestGenerator_Phase2_VariableTypeInference(t *testing.T) {
 	}
 	if !strings.Contains(sdl, "score: Float") {
 		t.Errorf("expected 'score: Float' in args, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_ArrayResponse(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query GetPastes { pastes { id title content public } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"pastes":[{"id":"1","title":"First","content":"Hello","public":true},{"id":"2","title":"Second","content":"World","public":false}]}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Should use list return type
+	if !strings.Contains(sdl, "[PastesResponse]") {
+		t.Errorf("expected list return type '[PastesResponse]', got:\n%s", sdl)
+	}
+	// Should have the response type with fields from the array elements
+	if !strings.Contains(sdl, "type PastesResponse {") {
+		t.Errorf("expected 'type PastesResponse', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "id: String") {
+		t.Errorf("expected 'id: String' in PastesResponse, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "title: String") {
+		t.Errorf("expected 'title: String' in PastesResponse, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "public: Boolean") {
+		t.Errorf("expected 'public: Boolean' in PastesResponse, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_TypedVariableDefinitions(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"mutation CreatePaste($title: String!, $content: String!, $public: Boolean) { createPaste(title: $title, content: $content, public: $public) { id } }","variables":{"title":"Test","content":"Body","public":true}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"createPaste":{"id":"42"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Should preserve non-null modifier from variable definition
+	if !strings.Contains(sdl, "title: String!") {
+		t.Errorf("expected 'title: String!' (non-null from variable def), got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "content: String!") {
+		t.Errorf("expected 'content: String!' (non-null from variable def), got:\n%s", sdl)
+	}
+	// Boolean without ! should remain nullable
+	if !strings.Contains(sdl, "public: Boolean") {
+		t.Errorf("expected 'public: Boolean' (nullable), got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_NestedSelectionSet(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query GetUser { user { id name email } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"user":{"id":"1","name":"Alice","email":"alice@example.com","internalField":"secret"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Should include fields from the selection set
+	if !strings.Contains(sdl, "id: String") {
+		t.Errorf("expected 'id: String', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "name: String") {
+		t.Errorf("expected 'name: String', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "email: String") {
+		t.Errorf("expected 'email: String', got:\n%s", sdl)
+	}
+	// Selection set is authoritative — fields not in it should be excluded
+	if strings.Contains(sdl, "internalField") {
+		t.Error("should not include 'internalField' which is not in the selection set")
 	}
 }
 
@@ -352,8 +471,9 @@ func TestGenerator_Phase1_FallsToPhase2(t *testing.T) {
 	if !strings.Contains(sdl, "# Inferred from observed traffic") {
 		t.Error("expected phase 2 inference header")
 	}
-	if !strings.Contains(sdl, "Hello") {
-		t.Error("expected operation name Hello")
+	// Should use root field name "hello"
+	if !strings.Contains(sdl, "hello") {
+		t.Error("expected root field name 'hello'")
 	}
 }
 
