@@ -116,8 +116,8 @@ func (p *GraphQLProbe) probeEndpoint(ctx context.Context, targetURL string) *cla
 		return nil
 	}
 	defer func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck // best-effort drain
-		resp.Body.Close()                                     //nolint:errcheck // best-effort close
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // best-effort drain
+		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close
 	}()
 
 	if resp.StatusCode >= 400 {

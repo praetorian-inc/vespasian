@@ -22,9 +22,10 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/vektah/gqlparser/v2/ast"
 	"github.com/vektah/gqlparser/v2/parser"
+
+	"github.com/praetorian-inc/vespasian/pkg/classify"
 )
 
 // graphqlBody represents a parsed GraphQL request body.
@@ -56,52 +57,9 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 	seen := make(map[string]bool) // deduplicate by root field name
 
 	for _, ep := range endpoints {
-		if ep.APIType != "graphql" {
-			continue
+		if op, ok := processEndpoint(ep, seen, &anonCounter, syntheticTypes); ok {
+			ops = append(ops, op)
 		}
-
-		body := parseGraphQLBody(ep.Body)
-		if body == nil {
-			continue
-		}
-
-		parsed := parseQueryAST(body.Query)
-		if parsed == nil {
-			continue
-		}
-
-		opType := astOpTypeToString(parsed.opType)
-		fieldName := parsed.rootFieldName
-		if fieldName == "" {
-			anonCounter++
-			fieldName = fmt.Sprintf("anonymous%d", anonCounter)
-		}
-
-		if seen[fieldName] {
-			continue
-		}
-		seen[fieldName] = true
-
-		// Build argument types: prefer AST variable definitions mapped through arguments
-		args := buildArgTypes(parsed, body.Variables)
-
-		// Infer return type from response, using root field name to locate data
-		returnTypeName := upperFirst(fieldName) + "Response"
-		responseFields, isList := inferFieldsFromResponse(ep.Response.Body, fieldName, parsed.selectionFields)
-		if len(responseFields) > 0 {
-			syntheticTypes[returnTypeName] = &inferredType{
-				Name:   returnTypeName,
-				Fields: responseFields,
-			}
-		}
-
-		ops = append(ops, inferredOperation{
-			OpType:     opType,
-			FieldName:  fieldName,
-			Args:       args,
-			ReturnType: returnTypeName,
-			IsList:     isList,
-		})
 	}
 
 	if len(ops) == 0 {
@@ -172,6 +130,54 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 	}
 
 	return []byte(sb.String()), nil
+}
+
+// processEndpoint processes a single classified endpoint and returns an inferred operation.
+func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCounter *int, syntheticTypes map[string]*inferredType) (inferredOperation, bool) {
+	if ep.APIType != "graphql" {
+		return inferredOperation{}, false
+	}
+
+	body := parseGraphQLBody(ep.Body)
+	if body == nil {
+		return inferredOperation{}, false
+	}
+
+	parsed := parseQueryAST(body.Query)
+	if parsed == nil {
+		return inferredOperation{}, false
+	}
+
+	opType := astOpTypeToString(parsed.opType)
+	fieldName := parsed.rootFieldName
+	if fieldName == "" {
+		*anonCounter++
+		fieldName = fmt.Sprintf("anonymous%d", *anonCounter)
+	}
+
+	if seen[fieldName] {
+		return inferredOperation{}, false
+	}
+	seen[fieldName] = true
+
+	args := buildArgTypes(parsed, body.Variables)
+
+	returnTypeName := upperFirst(fieldName) + "Response"
+	responseFields, isList := inferFieldsFromResponse(ep.Response.Body, fieldName, parsed.selectionFields)
+	if len(responseFields) > 0 {
+		syntheticTypes[returnTypeName] = &inferredType{
+			Name:   returnTypeName,
+			Fields: responseFields,
+		}
+	}
+
+	return inferredOperation{
+		OpType:     opType,
+		FieldName:  fieldName,
+		Args:       args,
+		ReturnType: returnTypeName,
+		IsList:     isList,
+	}, true
 }
 
 // parsedQuery holds the results of parsing a GraphQL query string with gqlparser.
@@ -349,52 +355,8 @@ func inferTypeFromValue(v interface{}) string {
 // and uses selectionFields to guide which fields to include.
 // Returns the fields map and whether the response value was an array.
 func inferFieldsFromResponse(body []byte, rootFieldName string, selectionFields []string) (map[string]string, bool) {
-	if len(body) == 0 {
-		return nil, false
-	}
-
-	var envelope map[string]interface{}
-	if err := json.Unmarshal(body, &envelope); err != nil {
-		return nil, false
-	}
-
-	data, ok := envelope["data"]
+	responseObj, isList, ok := unwrapResponseValue(body, rootFieldName)
 	if !ok {
-		return nil, false
-	}
-
-	dataMap, ok := data.(map[string]interface{})
-	if !ok {
-		return nil, false
-	}
-
-	// Look up the root field by name, then fall back to first key
-	responseVal, ok := dataMap[rootFieldName]
-	if !ok {
-		for _, v := range dataMap {
-			responseVal = v
-			break
-		}
-	}
-
-	if responseVal == nil {
-		return nil, false
-	}
-
-	// Handle array responses: inspect the first element
-	isList := false
-	var responseObj map[string]interface{}
-	switch rv := responseVal.(type) {
-	case []interface{}:
-		isList = true
-		if len(rv) > 0 {
-			responseObj, _ = rv[0].(map[string]interface{})
-		}
-	case map[string]interface{}:
-		responseObj = rv
-	}
-
-	if responseObj == nil {
 		return nil, isList
 	}
 
@@ -417,6 +379,56 @@ func inferFieldsFromResponse(body []byte, rootFieldName string, selectionFields 
 	}
 
 	return fields, isList
+}
+
+// unwrapResponseValue parses a GraphQL JSON response envelope, locates the response
+// value for the given root field, and unwraps arrays. Returns the response object,
+// whether it was a list, and whether a valid object was found.
+func unwrapResponseValue(body []byte, rootFieldName string) (map[string]interface{}, bool, bool) {
+	if len(body) == 0 {
+		return nil, false, false
+	}
+
+	var envelope map[string]interface{}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, false, false
+	}
+
+	data, ok := envelope["data"]
+	if !ok {
+		return nil, false, false
+	}
+
+	dataMap, ok := data.(map[string]interface{})
+	if !ok {
+		return nil, false, false
+	}
+
+	responseVal, ok := dataMap[rootFieldName]
+	if !ok {
+		for _, v := range dataMap {
+			responseVal = v
+			break
+		}
+	}
+
+	if responseVal == nil {
+		return nil, false, false
+	}
+
+	switch rv := responseVal.(type) {
+	case []interface{}:
+		if len(rv) > 0 {
+			if obj, ok := rv[0].(map[string]interface{}); ok {
+				return obj, true, true
+			}
+		}
+		return nil, true, false
+	case map[string]interface{}:
+		return rv, false, true
+	default:
+		return nil, false, false
+	}
 }
 
 // upperFirst returns the string with its first character uppercased.

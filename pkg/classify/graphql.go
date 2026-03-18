@@ -86,25 +86,7 @@ func (c *GraphQLClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, flo
 	}
 
 	// Rule 3: Request body analysis (POST only).
-	if strings.EqualFold(req.Method, "POST") && len(req.Body) > 0 {
-		if b, ok := firstNonSpace(req.Body); ok && b == '{' {
-			if hasGraphQLBody(req.Body) {
-				if pathMatched {
-					confidence = GraphQLFullMatchConfidence
-					reason = "graphql-path+graphql-body"
-				} else {
-					if confidence < GraphQLBodyConfidence {
-						confidence = GraphQLBodyConfidence
-					}
-					if reason == "" {
-						reason = "graphql-body"
-					} else {
-						reason += "+graphql-body"
-					}
-				}
-			}
-		}
-	}
+	confidence, reason = classifyGraphQLBody(req, pathMatched, confidence, reason)
 
 	// Rule 4: Response structure — only boosts when another signal already matched.
 	if confidence > 0 && len(req.Response.Body) > 0 && hasGraphQLContentType(req.Response) {
@@ -117,6 +99,29 @@ func (c *GraphQLClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, flo
 	}
 
 	return confidence > 0, confidence, reason
+}
+
+// classifyGraphQLBody applies Rule 3: request body analysis for POST requests.
+func classifyGraphQLBody(req crawl.ObservedRequest, pathMatched bool, confidence float64, reason string) (float64, string) {
+	if !strings.EqualFold(req.Method, "POST") || len(req.Body) == 0 {
+		return confidence, reason
+	}
+	b, ok := firstNonSpace(req.Body)
+	if !ok || b != '{' || !hasGraphQLBody(req.Body) {
+		return confidence, reason
+	}
+	if pathMatched {
+		return GraphQLFullMatchConfidence, "graphql-path+graphql-body"
+	}
+	if confidence < GraphQLBodyConfidence {
+		confidence = GraphQLBodyConfidence
+	}
+	if reason == "" {
+		reason = "graphql-body"
+	} else {
+		reason += "+graphql-body"
+	}
+	return confidence, reason
 }
 
 // hasGraphQLBody checks if the request body contains a GraphQL query structure.

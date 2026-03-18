@@ -64,7 +64,7 @@ type GraphQLField struct {
 
 // GraphQLTypeRef represents a type reference (name + kind + ofType for wrapping types).
 type GraphQLTypeRef struct {
-	Name   *string        `json:"name"`
-	Kind   string         `json:"kind"`
+	Name   *string         `json:"name"`
+	Kind   string          `json:"kind"`
 	OfType *GraphQLTypeRef `json:"ofType,omitempty"`
 }

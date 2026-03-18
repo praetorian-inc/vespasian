@@ -497,10 +497,8 @@ func TestGenerateSpec(t *testing.T) {
 				if !strings.Contains(err.Error(), tt.wantErrStr) {
 					t.Errorf("generateSpec() error = %q, want error containing %q", err.Error(), tt.wantErrStr)
 				}
-			} else {
-				if err != nil {
-					t.Errorf("generateSpec() unexpected error: %v", err)
-				}
+			} else if err != nil {
+				t.Errorf("generateSpec() unexpected error: %v", err)
 			}
 		})
 	}
