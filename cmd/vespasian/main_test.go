@@ -347,7 +347,7 @@ func TestClassifiersForType(t *testing.T) {
 	}{
 		{"rest returns classifier", "rest", 1},
 		{"unknown returns nil", "unknown", 0},
-		{"graphql returns nil", "graphql", 0},
+		{"graphql returns classifier", "graphql", 1},
 	}
 
 	for _, tt := range tests {
