@@ -28,7 +28,7 @@ func TestGet(t *testing.T) {
 		errContain string
 	}{
 		{"rest", "rest", "rest", false, ""},
-		{"unsupported graphql", "graphql", "", true, "unsupported API type"},
+		{"graphql", "graphql", "graphql", false, ""},
 		{"empty", "", "", true, "unsupported API type"},
 	}
 
