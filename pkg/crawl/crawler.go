@@ -137,8 +137,9 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		Parallelism:       10,
 		RateLimit:         150,
 		TimeStable:        3, // seconds to wait for DOM stability; 0 causes go-rod panic in time.NewTicker
-		ScrapeJSResponses: true,
-		XhrExtraction:     true,
+		ScrapeJSResponses:      true,
+		ScrapeJSLuiceResponses: true,
+		XhrExtraction:          true,
 		Silent:            true,
 		OnResult: func(result output.Result) {
 			// Map result outside the lock — MapResult may do URL parsing

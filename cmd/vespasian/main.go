@@ -563,7 +563,6 @@ func (c *ScanCmd) Run() error {
 			fmt.Fprintf(os.Stderr, "request-id: %s\n", bs.requestID)
 		}
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests))
-		fmt.Fprintf(os.Stderr, "generating REST spec\n")
 	}
 
 	// Create a fresh signal context for the generate phase. If a signal
@@ -572,6 +571,20 @@ func (c *ScanCmd) Run() error {
 	// would cause generateSpec's probing to bail out immediately.
 	genCtx, genStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer genStop()
+
+	// Replay JS-extracted URLs with raw HTTP to bypass SPA catch-all routing.
+	// URLs extracted from JavaScript bundles are visited by the headless browser,
+	// which gets the SPA shell (index.html) instead of the API response. Re-fetching
+	// them with a direct HTTP request reaches the actual API backend.
+	requests = crawl.ReplayJSExtracted(genCtx, requests, crawl.JSReplayConfig{
+		Headers: bs.opts.Headers,
+		Verbose: c.Verbose,
+		Stderr:  os.Stderr,
+	})
+
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "generating REST spec\n")
+	}
 
 	spec, err := generateSpec(genCtx, requests, "rest", c.Confidence, c.Probe, c.Verbose)
 	if err != nil {
