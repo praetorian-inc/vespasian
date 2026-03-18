@@ -114,7 +114,7 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 	})
 
 	var sb strings.Builder
-	sb.WriteString("# Inferred from observed traffic (introspection disabled)\n")
+	sb.WriteString("# Inferred from observed traffic\n")
 
 	// Group operations by type
 	grouped := make(map[string][]inferredOperation)
@@ -176,12 +176,12 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 
 // parsedQuery holds the results of parsing a GraphQL query string with gqlparser.
 type parsedQuery struct {
-	opType         ast.Operation
-	opName         string
-	rootFieldName  string
-	rootFieldArgs  []*ast.Argument      // arguments on the root field
-	varDefs        ast.VariableDefinitionList
-	selectionFields []string            // field names from the root field's selection set
+	opType          ast.Operation
+	opName          string
+	rootFieldName   string
+	rootFieldArgs   []*ast.Argument // arguments on the root field
+	varDefs         ast.VariableDefinitionList
+	selectionFields []string // field names from the root field's selection set
 }
 
 // parseQueryAST parses a GraphQL query string and extracts operation info.
