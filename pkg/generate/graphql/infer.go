@@ -18,7 +18,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"mime"
+	"mime/multipart"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -38,6 +42,7 @@ type graphqlBody struct {
 type inferredOperation struct {
 	OpType     string            // "query", "mutation", or "subscription"
 	FieldName  string            // root field name from the selection set
+	OpName     string            // original operation name from the query
 	Args       map[string]string // argument name -> type
 	ReturnType string            // inferred return type name
 	IsList     bool              // whether the return type is a list
@@ -54,7 +59,7 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 	var ops []inferredOperation
 	syntheticTypes := make(map[string]*inferredType)
 	anonCounter := 0
-	seen := make(map[string]bool) // deduplicate by root field name
+	seen := make(map[string]bool) // deduplicate by composite key (opType:fieldName:opName)
 
 	for _, ep := range endpoints {
 		if op, ok := processEndpoint(ep, seen, &anonCounter, syntheticTypes); ok {
@@ -78,6 +83,41 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 	grouped := make(map[string][]inferredOperation)
 	for _, op := range ops {
 		grouped[op.OpType] = append(grouped[op.OpType], op)
+	}
+
+	// Disambiguate field name collisions within each operation type
+	for opType, groupOps := range grouped {
+		fieldCount := make(map[string]int)
+		for _, op := range groupOps {
+			fieldCount[op.FieldName]++
+		}
+
+		fieldSeen := make(map[string]bool)
+		for i, op := range groupOps {
+			if fieldCount[op.FieldName] > 1 {
+				if !fieldSeen[op.FieldName] {
+					// First occurrence keeps the bare name
+					fieldSeen[op.FieldName] = true
+				} else {
+					// Subsequent occurrences get a suffix from the operation name
+					suffix := op.OpName
+					if suffix == "" {
+						suffix = fmt.Sprintf("variant%d", i)
+					}
+					newFieldName := op.FieldName + "_" + suffix
+					newReturnType := upperFirst(newFieldName) + "Response"
+					// Update the synthetic type name if it exists
+					if st, ok := syntheticTypes[op.ReturnType]; ok {
+						delete(syntheticTypes, op.ReturnType)
+						st.Name = newReturnType
+						syntheticTypes[newReturnType] = st
+					}
+					groupOps[i].FieldName = newFieldName
+					groupOps[i].ReturnType = newReturnType
+				}
+			}
+		}
+		grouped[opType] = groupOps
 	}
 
 	// Emit operation types in canonical order
@@ -140,6 +180,14 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 
 	body := parseGraphQLBody(ep.Body)
 	if body == nil {
+		body = parseGraphQLURL(ep.URL)
+	}
+	if body == nil {
+		if ct := getContentType(ep.Headers); strings.Contains(ct, "multipart") {
+			body = parseGraphQLMultipart(ep.Body, ct)
+		}
+	}
+	if body == nil {
 		return inferredOperation{}, false
 	}
 
@@ -151,14 +199,19 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 	opType := astOpTypeToString(parsed.opType)
 	fieldName := parsed.rootFieldName
 	if fieldName == "" {
+		fieldName = lowerFirst(parsed.opName)
+	}
+	if fieldName == "" {
 		*anonCounter++
 		fieldName = fmt.Sprintf("anonymous%d", *anonCounter)
 	}
 
-	if seen[fieldName] {
+	// Deduplicate by composite key incorporating operation name
+	dedupKey := opType + ":" + fieldName + ":" + parsed.opName
+	if seen[dedupKey] {
 		return inferredOperation{}, false
 	}
-	seen[fieldName] = true
+	seen[dedupKey] = true
 
 	args := buildArgTypes(parsed, body.Variables)
 
@@ -174,6 +227,7 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 	return inferredOperation{
 		OpType:     opType,
 		FieldName:  fieldName,
+		OpName:     parsed.opName,
 		Args:       args,
 		ReturnType: returnTypeName,
 		IsList:     isList,
@@ -204,20 +258,57 @@ func parseQueryAST(query string) *parsedQuery {
 		varDefs: op.VariableDefinitions,
 	}
 
-	// Extract root field name and its selection set from the first field in the operation
+	// Extract root field name and its selection set, resolving fragment spreads
 	if len(op.SelectionSet) > 0 {
-		if field, ok := op.SelectionSet[0].(*ast.Field); ok {
+		if field := resolveFirstField(op.SelectionSet, doc.Fragments); field != nil {
 			result.rootFieldName = field.Name
 			result.rootFieldArgs = field.Arguments
-			for _, sel := range field.SelectionSet {
-				if subField, ok := sel.(*ast.Field); ok {
-					result.selectionFields = append(result.selectionFields, subField.Name)
-				}
-			}
+			result.selectionFields = collectSelectionFields(field.SelectionSet, doc.Fragments)
 		}
 	}
 
 	return result
+}
+
+// resolveFirstField walks a selection set to find the first concrete *ast.Field,
+// resolving fragment spreads and inline fragments as needed.
+func resolveFirstField(selections ast.SelectionSet, fragments ast.FragmentDefinitionList) *ast.Field {
+	for _, sel := range selections {
+		switch s := sel.(type) {
+		case *ast.Field:
+			return s
+		case *ast.FragmentSpread:
+			if frag := fragments.ForName(s.Name); frag != nil {
+				if field := resolveFirstField(frag.SelectionSet, fragments); field != nil {
+					return field
+				}
+			}
+		case *ast.InlineFragment:
+			if field := resolveFirstField(s.SelectionSet, fragments); field != nil {
+				return field
+			}
+		}
+	}
+	return nil
+}
+
+// collectSelectionFields recursively collects field names from a selection set,
+// resolving fragment spreads and inline fragments.
+func collectSelectionFields(selections ast.SelectionSet, fragments ast.FragmentDefinitionList) []string {
+	var fields []string
+	for _, sel := range selections {
+		switch s := sel.(type) {
+		case *ast.Field:
+			fields = append(fields, s.Name)
+		case *ast.FragmentSpread:
+			if frag := fragments.ForName(s.Name); frag != nil {
+				fields = append(fields, collectSelectionFields(frag.SelectionSet, fragments)...)
+			}
+		case *ast.InlineFragment:
+			fields = append(fields, collectSelectionFields(s.SelectionSet, fragments)...)
+		}
+	}
+	return fields
 }
 
 // astOpTypeToString converts an ast.Operation to a string.
@@ -441,4 +532,72 @@ func upperFirst(s string) string {
 		return s
 	}
 	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+// lowerFirst returns the string with its first character lowercased.
+func lowerFirst(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToLower(s[:1]) + s[1:]
+}
+
+// parseGraphQLURL extracts a GraphQL operation from URL query parameters (GET requests).
+func parseGraphQLURL(rawURL string) *graphqlBody {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil
+	}
+	query := u.Query().Get("query")
+	if query == "" {
+		return nil
+	}
+	gb := &graphqlBody{Query: query}
+	if vars := u.Query().Get("variables"); vars != "" {
+		_ = json.Unmarshal([]byte(vars), &gb.Variables)
+	}
+	return gb
+}
+
+// parseGraphQLMultipart extracts a GraphQL operation from a multipart form data body.
+func parseGraphQLMultipart(body []byte, contentType string) *graphqlBody {
+	_, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return nil
+	}
+	boundary := params["boundary"]
+	if boundary == "" {
+		return nil
+	}
+	reader := multipart.NewReader(strings.NewReader(string(body)), boundary)
+	for {
+		part, err := reader.NextPart()
+		if err != nil {
+			return nil
+		}
+		if part.FormName() == "operations" {
+			data, err := io.ReadAll(part)
+			if err != nil {
+				return nil
+			}
+			var gb graphqlBody
+			if err := json.Unmarshal(data, &gb); err != nil {
+				return nil
+			}
+			if gb.Query == "" {
+				return nil
+			}
+			return &gb
+		}
+	}
+}
+
+// getContentType returns the Content-Type header value, case-insensitively.
+func getContentType(headers map[string]string) string {
+	for k, v := range headers {
+		if strings.EqualFold(k, "content-type") {
+			return v
+		}
+	}
+	return ""
 }

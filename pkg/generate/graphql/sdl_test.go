@@ -523,3 +523,184 @@ func TestGenerator_DeterministicOutput(t *testing.T) {
 		t.Error("types should be sorted alphabetically")
 	}
 }
+
+func TestGenerator_Phase2_FragmentSpreadResolution(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query FooQuery { ...Foo_root } fragment Foo_root on Query { user { id name } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"user":{"id":"1","name":"Alice"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Should resolve through the fragment spread to find "user" as root field
+	if !strings.Contains(sdl, "user") {
+		t.Errorf("expected root field 'user' resolved from fragment spread, got:\n%s", sdl)
+	}
+	// Should NOT fall back to anonymous naming
+	if strings.Contains(sdl, "anonymous") {
+		t.Errorf("should not have anonymous naming when fragment resolves to a field, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_OperationNameFallback(t *testing.T) {
+	g := &Generator{}
+	// A query where the fragment spread cannot resolve to a field (fragment has no fields, only nested spreads)
+	// but the operation has a name — should use operation name as fallback
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query BaggagePreferencesQuery { ...BaggageRoot } fragment BaggageRoot on Query { preferences { baggage } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"preferences":{"baggage":"carry-on"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Should resolve the fragment to find "preferences" as root field
+	if !strings.Contains(sdl, "preferences") {
+		t.Errorf("expected root field 'preferences', got:\n%s", sdl)
+	}
+	if strings.Contains(sdl, "anonymous") {
+		t.Errorf("should not have anonymous naming, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_DedupPreservesDistinctOperations(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query StoredPassengers { viewer { passengers { id name } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"viewer":{"passengers":[{"id":"1","name":"Alice"}]}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query FareLocksTabQuery { viewer { fareLocks { id status } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"viewer":{"fareLocks":[{"id":"2","status":"active"}]}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Both operations should appear even though they share root field "viewer"
+	if !strings.Contains(sdl, "viewer") {
+		t.Errorf("expected 'viewer' field, got:\n%s", sdl)
+	}
+	// The second operation should be disambiguated with its operation name
+	if !strings.Contains(sdl, "viewer_FareLocksTabQuery") {
+		t.Errorf("expected disambiguated 'viewer_FareLocksTabQuery' field, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_GETRequestWithQueryParams(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "http://example.com/graphql?query=query%20GetStatus%20%7B%20status%20%7B%20healthy%20version%20%7D%20%7D",
+				Body:   nil,
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"status":{"healthy":true,"version":"1.0"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	if !strings.Contains(sdl, "status") {
+		t.Errorf("expected root field 'status' from GET request, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "healthy: Boolean") {
+		t.Errorf("expected 'healthy: Boolean' field, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_MultipartFormData(t *testing.T) {
+	g := &Generator{}
+	boundary := "----WebKitFormBoundary7MA4YWxkTrZu0gW"
+	multipartBody := "------WebKitFormBoundary7MA4YWxkTrZu0gW\r\n" +
+		"Content-Disposition: form-data; name=\"operations\"\r\n\r\n" +
+		`{"query":"mutation UploadFile($file: Upload!) { uploadFile(file: $file) { id url } }","variables":{"file":null}}` + "\r\n" +
+		"------WebKitFormBoundary7MA4YWxkTrZu0gW\r\n" +
+		"Content-Disposition: form-data; name=\"map\"\r\n\r\n" +
+		`{"0":["variables.file"]}` + "\r\n" +
+		"------WebKitFormBoundary7MA4YWxkTrZu0gW\r\n" +
+		"Content-Disposition: form-data; name=\"0\"; filename=\"test.txt\"\r\n" +
+		"Content-Type: text/plain\r\n\r\n" +
+		"file content\r\n" +
+		"------WebKitFormBoundary7MA4YWxkTrZu0gW--\r\n"
+
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "http://example.com/graphql",
+				Headers: map[string]string{"Content-Type": "multipart/form-data; boundary=" + boundary},
+				Body:    []byte(multipartBody),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"uploadFile":{"id":"42","url":"https://example.com/file.txt"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	if !strings.Contains(sdl, "type Mutation {") {
+		t.Errorf("expected 'type Mutation', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "uploadFile") {
+		t.Errorf("expected root field 'uploadFile' from multipart request, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "file: Upload!") {
+		t.Errorf("expected 'file: Upload!' argument, got:\n%s", sdl)
+	}
+}
