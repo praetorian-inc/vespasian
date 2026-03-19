@@ -481,3 +481,160 @@ func TestReplayJSExtracted_TruncatedBody(t *testing.T) {
 	assert.Equal(t, srv.URL+"/api/v2/hidden", result[1].URL)
 	assert.Equal(t, "application/json", result[1].Response.ContentType)
 }
+
+func TestReplayJSExtracted_EmptyBody(t *testing.T) {
+	// Simulate a JS file discovered by Katana with an empty response body.
+	// ReplayJSExtracted should re-fetch the JS file and extract API paths.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			w.Write([]byte(`var endpoint = "/api/v1/users";`)) //nolint:errcheck
+		case "/api/v1/users":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`[{"id":1}]`)) //nolint:errcheck
+		}
+	}))
+	defer srv.Close()
+
+	requests := []ObservedRequest{
+		{
+			Method: "GET",
+			URL:    srv.URL + "/app.js",
+			Source: "katana",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/javascript",
+				Body:        nil, // empty — Katana didn't capture the body
+			},
+		},
+	}
+
+	cfg := JSReplayConfig{Client: srv.Client()}
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	require.Len(t, result, 2)
+	assert.Equal(t, srv.URL+"/api/v1/users", result[1].URL)
+	assert.Equal(t, "js-extract", result[1].Source)
+	assert.Equal(t, "application/json", result[1].Response.ContentType)
+}
+
+func TestExtractScriptURLs(t *testing.T) {
+	html := []byte(`<!DOCTYPE html>
+<html>
+<head>
+<script src="main.js"></script>
+<script src="/assets/public/app.js"></script>
+<script src="https://cdn.example.com/lib.js"></script>
+</head>
+</html>`)
+
+	urls := extractScriptURLs(html, "http://localhost:3000/")
+	assert.Contains(t, urls, "http://localhost:3000/main.js")
+	assert.Contains(t, urls, "http://localhost:3000/assets/public/app.js")
+	assert.Contains(t, urls, "https://cdn.example.com/lib.js")
+	assert.Len(t, urls, 3)
+}
+
+func TestExtractScriptURLs_Deduplicates(t *testing.T) {
+	html := []byte(`<script src="main.js"></script><script src="main.js"></script>`)
+	urls := extractScriptURLs(html, "http://localhost:3000/")
+	assert.Len(t, urls, 1)
+}
+
+func TestLooksLikeHTML(t *testing.T) {
+	assert.True(t, looksLikeHTML([]byte(`<!DOCTYPE html><html>`)))
+	assert.True(t, looksLikeHTML([]byte(`<html lang="en">`)))
+	assert.True(t, looksLikeHTML([]byte("  \n  <!doctype html>")))
+	assert.False(t, looksLikeHTML([]byte(`var x = "/api/v1/users";`)))
+	assert.False(t, looksLikeHTML([]byte(`(function(){`)))
+	assert.False(t, looksLikeHTML(nil))
+	assert.False(t, looksLikeHTML([]byte("")))
+}
+
+func TestFetchJSBody_RejectsHTML(t *testing.T) {
+	// Simulate SPA catch-all: server returns HTML for any path.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(`<!DOCTYPE html><html><body>SPA</body></html>`)) //nolint:errcheck
+	}))
+	defer srv.Close()
+
+	cfg := JSReplayConfig{Client: srv.Client()}.withDefaults()
+	body := fetchJSBody(context.Background(), cfg, srv.URL+"/nonexistent.js")
+	assert.Nil(t, body, "fetchJSBody should return nil for HTML responses")
+}
+
+func TestFetchJSBody_RejectsHTMLWithoutContentType(t *testing.T) {
+	// Server returns HTML body without setting Content-Type header.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<!DOCTYPE html><html><body>SPA</body></html>`)) //nolint:errcheck
+	}))
+	defer srv.Close()
+
+	cfg := JSReplayConfig{Client: srv.Client()}.withDefaults()
+	body := fetchJSBody(context.Background(), cfg, srv.URL+"/nonexistent.js")
+	assert.Nil(t, body, "fetchJSBody should detect HTML from body even without Content-Type")
+}
+
+func TestReplayJSExtracted_HTMLScriptDiscovery(t *testing.T) {
+	// Simulate an SPA where:
+	// - The HTML page has <script> tags with correct JS URLs
+	// - Katana discovers mangled JS URLs with empty bodies
+	// - The HTML-discovered JS URLs serve actual JavaScript with API paths
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/main.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			w.Write([]byte(`var api = "/api/v1/products"; var other = "/rest/user/login";`)) //nolint:errcheck
+		case "/api/v1/products":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"data":[]}`)) //nolint:errcheck
+		case "/rest/user/login":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"status":"ok"}`)) //nolint:errcheck
+		default:
+			// SPA catch-all: return HTML for all other paths.
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte(`<!DOCTYPE html><html><head><script src="main.js"></script></head></html>`)) //nolint:errcheck
+		}
+	}))
+	defer srv.Close()
+
+	requests := []ObservedRequest{
+		{
+			// Root HTML page — contains <script src="main.js">
+			Method: "GET",
+			URL:    srv.URL + "/",
+			Source: "katana",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<!DOCTYPE html><html><head><script src="main.js"></script></head></html>`),
+			},
+		},
+		{
+			// Katana discovered this mangled JS URL — will get HTML from catch-all
+			Method: "GET",
+			URL:    srv.URL + "/text/assets/main.js",
+			Source: "katana",
+			Response: ObservedResponse{
+				StatusCode: 200,
+				Body:       nil, // empty body
+			},
+		},
+	}
+
+	cfg := JSReplayConfig{Client: srv.Client()}
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	// Should find API endpoints from the HTML-discovered main.js
+	var apiURLs []string
+	for _, r := range result {
+		if r.Source == "js-extract" {
+			apiURLs = append(apiURLs, r.URL)
+		}
+	}
+	assert.Contains(t, apiURLs, srv.URL+"/api/v1/products")
+	assert.Contains(t, apiURLs, srv.URL+"/rest/user/login")
+}

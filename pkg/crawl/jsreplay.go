@@ -15,6 +15,7 @@
 package crawl
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -82,6 +83,57 @@ var jsContentTypes = []string{
 	"application/javascript",
 	"text/javascript",
 	"application/x-javascript",
+}
+
+// htmlContentTypes identifies HTML response content types.
+var htmlContentTypes = []string{
+	"text/html",
+	"application/xhtml+xml",
+}
+
+// isHTMLResponse reports whether the response content type indicates HTML.
+func isHTMLResponse(contentType string) bool {
+	ct := strings.ToLower(contentType)
+	if idx := strings.Index(ct, ";"); idx != -1 {
+		ct = strings.TrimSpace(ct[:idx])
+	}
+	for _, htmlCT := range htmlContentTypes {
+		if ct == htmlCT {
+			return true
+		}
+	}
+	return false
+}
+
+// scriptSrcPattern extracts src attributes from <script> tags in HTML.
+var scriptSrcPattern = regexp.MustCompile(`(?i)<script[^>]+src=["']([^"']+\.(?:js|mjs))["']`)
+
+// extractScriptURLs parses HTML for <script src="..."> tags and resolves
+// them against the page URL to produce absolute JS file URLs.
+func extractScriptURLs(htmlBody []byte, pageURL string) []string {
+	base, err := url.Parse(pageURL)
+	if err != nil {
+		return nil
+	}
+
+	seen := make(map[string]bool)
+	var urls []string
+	for _, match := range scriptSrcPattern.FindAllSubmatch(htmlBody, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		src := string(match[1])
+		ref, err := url.Parse(src)
+		if err != nil {
+			continue
+		}
+		resolved := base.ResolveReference(ref).String()
+		if !seen[resolved] {
+			seen[resolved] = true
+			urls = append(urls, resolved)
+		}
+	}
+	return urls
 }
 
 // --- Extraction patterns ---
@@ -399,46 +451,39 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		return requests
 	}
 
+	// Discover JS file URLs from HTML <script> tags. Katana often mangles
+	// relative JS paths when resolving against SPA routes, so we parse HTML
+	// responses ourselves and resolve <script src> against the page URL.
+	htmlJSURLs := make(map[string]bool)
+	for _, req := range requests {
+		body := req.Response.Body
+		if len(body) == 0 {
+			continue
+		}
+		// Only process HTML responses.
+		if !isHTMLResponse(req.Response.ContentType) && !looksLikeHTML(body) {
+			continue
+		}
+		for _, jsURL := range extractScriptURLs(body, req.URL) {
+			htmlJSURLs[jsURL] = true
+		}
+	}
+	if cfg.Verbose && len(htmlJSURLs) > 0 {
+		fmt.Fprintf(cfg.Stderr, "js-extract: discovered %d JS URLs from HTML <script> tags\n", len(htmlJSURLs))
+		for u := range htmlJSURLs {
+			fmt.Fprintf(cfg.Stderr, "  %s\n", u)
+		}
+	}
+
 	// Scan all JS response bodies for API paths.
 	allPaths := make(map[string]bool)
-	for _, req := range requests {
-		if !isJSURL(req.URL) && !isJSResponse(req.Response.ContentType) {
-			continue
-		}
-		if cfg.Verbose {
-			fmt.Fprintf(cfg.Stderr, "js-extract: found JS file %s (ct=%q, body=%d bytes)\n",
-				req.URL, req.Response.ContentType, len(req.Response.Body))
-		}
+	processedJSURLs := make(map[string]bool)
 
-		jsBody := req.Response.Body
-
-		// If the body was truncated at MaxResponseBodySize (1 MB), re-fetch
-		// the full JS file. SPA bundles are often >1 MB and API path strings
-		// may be past the truncation point.
-		if len(jsBody) >= MaxResponseBodySize {
-			if cfg.Verbose {
-				fmt.Fprintf(cfg.Stderr, "js-extract: body truncated at %d bytes, re-fetching %s\n",
-					MaxResponseBodySize, req.URL)
-			}
-			fullBody := fetchJSBody(ctx, cfg, req.URL)
-			if fullBody != nil {
-				jsBody = fullBody
-				if cfg.Verbose {
-					fmt.Fprintf(cfg.Stderr, "js-extract: re-fetched %d bytes from %s\n", len(jsBody), req.URL)
-				}
-			}
-		}
-
-		if len(jsBody) == 0 {
-			if cfg.Verbose {
-				fmt.Fprintf(cfg.Stderr, "js-extract: skipping %s (empty body)\n", req.URL)
-			}
-			continue
-		}
-
+	// processJS extracts API paths from a JS body and adds them to allPaths.
+	processJS := func(jsURL string, jsBody []byte) {
 		paths := extractAPIPaths(jsBody, requests)
 		if cfg.Verbose {
-			fmt.Fprintf(cfg.Stderr, "js-extract: extracted %d API paths from %s\n", len(paths), req.URL)
+			fmt.Fprintf(cfg.Stderr, "js-extract: extracted %d API paths from %s\n", len(paths), jsURL)
 			for _, p := range paths {
 				fmt.Fprintf(cfg.Stderr, "  %s\n", p)
 			}
@@ -446,6 +491,73 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		for _, p := range paths {
 			allPaths[p] = true
 		}
+	}
+
+	for _, req := range requests {
+		if !isJSURL(req.URL) && !isJSResponse(req.Response.ContentType) {
+			continue
+		}
+		processedJSURLs[req.URL] = true
+		if cfg.Verbose {
+			fmt.Fprintf(cfg.Stderr, "js-extract: found JS file %s (ct=%q, body=%d bytes)\n",
+				req.URL, req.Response.ContentType, len(req.Response.Body))
+		}
+
+		jsBody := req.Response.Body
+
+		// Re-fetch the JS file when the body is empty (Katana often reports
+		// JS URLs without populating the response body) or truncated at
+		// MaxResponseBodySize (SPA bundles are often >1 MB and API path
+		// strings may be past the truncation point).
+		if len(jsBody) == 0 || len(jsBody) >= MaxResponseBodySize {
+			if cfg.Verbose {
+				if len(jsBody) == 0 {
+					fmt.Fprintf(cfg.Stderr, "js-extract: empty body, fetching %s\n", req.URL)
+				} else {
+					fmt.Fprintf(cfg.Stderr, "js-extract: body truncated at %d bytes, re-fetching %s\n",
+						MaxResponseBodySize, req.URL)
+				}
+			}
+			fullBody := fetchJSBody(ctx, cfg, req.URL)
+			if fullBody != nil {
+				jsBody = fullBody
+				if cfg.Verbose {
+					fmt.Fprintf(cfg.Stderr, "js-extract: fetched %d bytes from %s\n", len(jsBody), req.URL)
+				}
+			}
+		}
+
+		if len(jsBody) == 0 {
+			if cfg.Verbose {
+				fmt.Fprintf(cfg.Stderr, "js-extract: skipping %s (empty body after fetch attempt)\n", req.URL)
+			}
+			continue
+		}
+
+		processJS(req.URL, jsBody)
+	}
+
+	// Fetch and process JS files discovered from HTML <script> tags that
+	// weren't already processed from the crawl results.
+	for jsURL := range htmlJSURLs {
+		if processedJSURLs[jsURL] {
+			continue
+		}
+		processedJSURLs[jsURL] = true
+		if cfg.Verbose {
+			fmt.Fprintf(cfg.Stderr, "js-extract: fetching HTML-discovered JS %s\n", jsURL)
+		}
+		jsBody := fetchJSBody(ctx, cfg, jsURL)
+		if jsBody == nil {
+			if cfg.Verbose {
+				fmt.Fprintf(cfg.Stderr, "js-extract: skipping %s (fetch failed)\n", jsURL)
+			}
+			continue
+		}
+		if cfg.Verbose {
+			fmt.Fprintf(cfg.Stderr, "js-extract: fetched %d bytes from %s\n", len(jsBody), jsURL)
+		}
+		processJS(jsURL, jsBody)
 	}
 
 	if cfg.Verbose {
@@ -501,6 +613,7 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 // --- HTTP helpers ---
 
 // fetchJSBody re-fetches a JS file with a larger body limit than the crawler uses.
+// Returns nil if the response is an error, HTML (SPA catch-all), or unreadable.
 func fetchJSBody(ctx context.Context, cfg JSReplayConfig, rawURL string) []byte {
 	reqCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
@@ -526,11 +639,37 @@ func fetchJSBody(ctx context.Context, cfg JSReplayConfig, rawURL string) []byte 
 		return nil
 	}
 
+	// Reject HTML responses — the URL likely hit an SPA catch-all route
+	// that serves index.html for any unknown path.
+	if isHTMLResponse(resp.Header.Get("Content-Type")) {
+		return nil
+	}
+
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxJSBodySize))
 	if err != nil {
 		return nil
 	}
+
+	// Guard against servers that don't set Content-Type: if the body
+	// starts with <!DOCTYPE or <html, it's HTML, not JavaScript.
+	if len(body) > 0 && looksLikeHTML(body) {
+		return nil
+	}
+
 	return body
+}
+
+// looksLikeHTML checks if a response body appears to be HTML content
+// by looking for common HTML document markers at the start of the body.
+func looksLikeHTML(body []byte) bool {
+	// Skip leading whitespace/BOM.
+	trimmed := bytes.TrimLeft(body, " \t\r\n\xef\xbb\xbf")
+	if len(trimmed) == 0 {
+		return false
+	}
+	lower := bytes.ToLower(trimmed[:min(len(trimmed), 50)])
+	return bytes.HasPrefix(lower, []byte("<!doctype")) ||
+		bytes.HasPrefix(lower, []byte("<html"))
 }
 
 // probeURL makes a direct HTTP GET request to the URL and returns the response.
