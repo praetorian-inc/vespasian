@@ -106,12 +106,10 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 					}
 					newFieldName := op.FieldName + "_" + suffix
 					newReturnType := upperFirst(newFieldName) + "Response"
-					// Update the synthetic type name if it exists
-					if st, ok := syntheticTypes[op.ReturnType]; ok {
-						delete(syntheticTypes, op.ReturnType)
-						st.Name = newReturnType
-						syntheticTypes[newReturnType] = st
-					}
+					// Update synthetic types: rename root and any nested types with the old prefix
+					oldPrefix := upperFirst(op.FieldName) + "_"
+					newPrefix := upperFirst(newFieldName) + "_"
+					renameSyntheticTypes(syntheticTypes, op.ReturnType, newReturnType, oldPrefix, newPrefix)
 					groupOps[i].FieldName = newFieldName
 					groupOps[i].ReturnType = newReturnType
 				}
@@ -216,7 +214,16 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 	args := buildArgTypes(parsed, body.Variables)
 
 	returnTypeName := upperFirst(fieldName) + "Response"
-	responseFields, isList := inferFieldsFromResponse(ep.Response.Body, fieldName, parsed.selectionFields)
+	typePrefix := upperFirst(fieldName)
+
+	responseObj, isList, responseOK := unwrapResponseValue(ep.Response.Body, fieldName)
+	var responseFields map[string]string
+	if responseOK && responseObj != nil && len(parsed.selectionTree) > 0 {
+		responseFields = inferFieldsRecursive(responseObj, parsed.selectionTree, typePrefix, syntheticTypes)
+	} else {
+		// Fallback: existing flat inference
+		responseFields, isList = inferFieldsFromResponse(ep.Response.Body, fieldName, parsed.selectionFields)
+	}
 	if len(responseFields) > 0 {
 		syntheticTypes[returnTypeName] = &inferredType{
 			Name:   returnTypeName,
@@ -234,6 +241,12 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 	}, true
 }
 
+// selectionNode represents a field in a nested selection tree.
+type selectionNode struct {
+	Name     string
+	Children []*selectionNode // nil = leaf (scalar), non-nil = object with sub-fields
+}
+
 // parsedQuery holds the results of parsing a GraphQL query string with gqlparser.
 type parsedQuery struct {
 	opType          ast.Operation
@@ -241,7 +254,8 @@ type parsedQuery struct {
 	rootFieldName   string
 	rootFieldArgs   []*ast.Argument // arguments on the root field
 	varDefs         ast.VariableDefinitionList
-	selectionFields []string // field names from the root field's selection set
+	selectionFields []string           // field names from the root field's selection set (flat)
+	selectionTree   []*selectionNode   // nested selection tree for recursive type inference
 }
 
 // parseQueryAST parses a GraphQL query string and extracts operation info.
@@ -264,6 +278,7 @@ func parseQueryAST(query string) *parsedQuery {
 			result.rootFieldName = field.Name
 			result.rootFieldArgs = field.Arguments
 			result.selectionFields = collectSelectionFields(field.SelectionSet, doc.Fragments)
+			result.selectionTree = collectSelectionTree(field.SelectionSet, doc.Fragments)
 		}
 	}
 
@@ -308,6 +323,151 @@ func collectSelectionFields(selections ast.SelectionSet, fragments ast.FragmentD
 			fields = append(fields, collectSelectionFields(s.SelectionSet, fragments)...)
 		}
 	}
+	return fields
+}
+
+// isMetaField returns true for GraphQL introspection meta-fields like __typename.
+func isMetaField(name string) bool {
+	return strings.HasPrefix(name, "__")
+}
+
+// collectSelectionTree builds a recursive selection tree from an AST selection set.
+func collectSelectionTree(selections ast.SelectionSet, fragments ast.FragmentDefinitionList) []*selectionNode {
+	// Use ordered dedup: track seen names and their indices
+	seen := make(map[string]int)
+	var nodes []*selectionNode
+
+	for _, sel := range selections {
+		switch s := sel.(type) {
+		case *ast.Field:
+			if isMetaField(s.Name) {
+				continue
+			}
+			var children []*selectionNode
+			if len(s.SelectionSet) > 0 {
+				children = collectSelectionTree(s.SelectionSet, fragments)
+			}
+			if idx, ok := seen[s.Name]; ok {
+				// Merge children into existing node
+				if children != nil {
+					nodes[idx].Children = mergeSelectionNodes(nodes[idx].Children, children)
+				}
+			} else {
+				seen[s.Name] = len(nodes)
+				nodes = append(nodes, &selectionNode{Name: s.Name, Children: children})
+			}
+		case *ast.FragmentSpread:
+			if frag := fragments.ForName(s.Name); frag != nil {
+				fragNodes := collectSelectionTree(frag.SelectionSet, fragments)
+				nodes, seen = mergeIntoNodeList(nodes, seen, fragNodes)
+			}
+		case *ast.InlineFragment:
+			inlineNodes := collectSelectionTree(s.SelectionSet, fragments)
+			nodes, seen = mergeIntoNodeList(nodes, seen, inlineNodes)
+		}
+	}
+
+	return nodes
+}
+
+// mergeIntoNodeList merges source nodes into an existing ordered node list with deduplication.
+func mergeIntoNodeList(nodes []*selectionNode, seen map[string]int, source []*selectionNode) ([]*selectionNode, map[string]int) {
+	for _, sn := range source {
+		if idx, ok := seen[sn.Name]; ok {
+			if sn.Children != nil {
+				nodes[idx].Children = mergeSelectionNodes(nodes[idx].Children, sn.Children)
+			}
+		} else {
+			seen[sn.Name] = len(nodes)
+			nodes = append(nodes, sn)
+		}
+	}
+	return nodes, seen
+}
+
+// mergeSelectionNodes merges two child node slices, deduplicating by name.
+func mergeSelectionNodes(a, b []*selectionNode) []*selectionNode {
+	seen := make(map[string]int)
+	var merged []*selectionNode
+	for _, n := range a {
+		seen[n.Name] = len(merged)
+		merged = append(merged, n)
+	}
+	for _, n := range b {
+		if idx, ok := seen[n.Name]; ok {
+			if n.Children != nil {
+				merged[idx].Children = mergeSelectionNodes(merged[idx].Children, n.Children)
+			}
+		} else {
+			seen[n.Name] = len(merged)
+			merged = append(merged, n)
+		}
+	}
+	return merged
+}
+
+// inferFieldsRecursive walks the selection tree and response JSON together to build
+// nested synthetic types. It returns the fields map for the current level.
+func inferFieldsRecursive(
+	responseObj map[string]interface{},
+	tree []*selectionNode,
+	typePrefix string,
+	syntheticTypes map[string]*inferredType,
+) map[string]string {
+	fields := make(map[string]string)
+
+	for _, node := range tree {
+		if node.Children == nil {
+			// Leaf node: infer scalar type from response
+			if responseObj != nil {
+				if v, ok := responseObj[node.Name]; ok {
+					fields[node.Name] = inferTypeFromValue(v)
+					continue
+				}
+			}
+			fields[node.Name] = "String"
+			continue
+		}
+
+		// Object node: generate nested type
+		nestedTypeName := typePrefix + "_" + upperFirst(node.Name) + "Response"
+
+		// Extract nested response value
+		var nestedObj map[string]interface{}
+		isList := false
+		if responseObj != nil {
+			if v, ok := responseObj[node.Name]; ok {
+				switch rv := v.(type) {
+				case map[string]interface{}:
+					nestedObj = rv
+				case []interface{}:
+					isList = true
+					if len(rv) > 0 {
+						if obj, ok := rv[0].(map[string]interface{}); ok {
+							nestedObj = obj
+						}
+					}
+				}
+			}
+		}
+
+		// Recurse to build nested type fields
+		nestedFields := inferFieldsRecursive(nestedObj, node.Children, typePrefix+"_"+upperFirst(node.Name), syntheticTypes)
+
+		if len(nestedFields) > 0 {
+			syntheticTypes[nestedTypeName] = &inferredType{
+				Name:   nestedTypeName,
+				Fields: nestedFields,
+			}
+		}
+
+		if isList {
+			fields[node.Name] = "[" + nestedTypeName + "]"
+		} else {
+			fields[node.Name] = nestedTypeName
+		}
+	}
+
 	return fields
 }
 
@@ -523,6 +683,37 @@ func unwrapResponseValue(body []byte, rootFieldName string) (map[string]interfac
 		return rv, false, true
 	default:
 		return nil, false, false
+	}
+}
+
+// renameSyntheticTypes renames the root type and any nested types that share the old prefix.
+// It also updates field type references within renamed types.
+func renameSyntheticTypes(syntheticTypes map[string]*inferredType, oldRoot, newRoot, oldPrefix, newPrefix string) {
+	// Collect all types that need renaming
+	renames := make(map[string]string) // old name -> new name
+	if _, ok := syntheticTypes[oldRoot]; ok {
+		renames[oldRoot] = newRoot
+	}
+	for name := range syntheticTypes {
+		if strings.HasPrefix(name, oldPrefix) {
+			newName := newPrefix + name[len(oldPrefix):]
+			renames[name] = newName
+		}
+	}
+
+	// Apply renames
+	for oldName, newName := range renames {
+		st := syntheticTypes[oldName]
+		delete(syntheticTypes, oldName)
+		st.Name = newName
+		// Update field type references within this type
+		for fn, ft := range st.Fields {
+			for oldRef, newRef := range renames {
+				ft = strings.ReplaceAll(ft, oldRef, newRef)
+			}
+			st.Fields[fn] = ft
+		}
+		syntheticTypes[newName] = st
 	}
 }
 

@@ -704,3 +704,210 @@ func TestGenerator_Phase2_MultipartFormData(t *testing.T) {
 		t.Errorf("expected 'file: Upload!' argument, got:\n%s", sdl)
 	}
 }
+
+func TestGenerator_Phase2_NestedObjectType(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query GetUser { user { id profile { bio avatar } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"user":{"id":"1","profile":{"bio":"hi","avatar":"pic.png"}}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	if !strings.Contains(sdl, "profile: User_ProfileResponse") {
+		t.Errorf("expected 'profile: User_ProfileResponse', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "type User_ProfileResponse {") {
+		t.Errorf("expected 'type User_ProfileResponse', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "bio: String") {
+		t.Errorf("expected 'bio: String' in nested type, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "avatar: String") {
+		t.Errorf("expected 'avatar: String' in nested type, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "id: String") {
+		t.Errorf("expected 'id: String' in root type, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_MultiLevelNesting(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query GetViewer { viewer { locale { language { code } currency { code } } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"viewer":{"locale":{"language":{"code":"en"},"currency":{"code":"USD"}}}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	if !strings.Contains(sdl, "locale: Viewer_LocaleResponse") {
+		t.Errorf("expected 'locale: Viewer_LocaleResponse', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "type Viewer_LocaleResponse {") {
+		t.Errorf("expected 'type Viewer_LocaleResponse', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "language: Viewer_Locale_LanguageResponse") {
+		t.Errorf("expected 'language: Viewer_Locale_LanguageResponse', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "currency: Viewer_Locale_CurrencyResponse") {
+		t.Errorf("expected 'currency: Viewer_Locale_CurrencyResponse', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "type Viewer_Locale_LanguageResponse {") {
+		t.Errorf("expected 'type Viewer_Locale_LanguageResponse', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "type Viewer_Locale_CurrencyResponse {") {
+		t.Errorf("expected 'type Viewer_Locale_CurrencyResponse', got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_InlineFragmentMerging(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query GetUser { user { id ... on Admin { role } ... on Member { level } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"user":{"id":"1","role":"admin","level":"senior"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	if !strings.Contains(sdl, "role: String") {
+		t.Errorf("expected 'role: String' from inline fragment, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "level: String") {
+		t.Errorf("expected 'level: String' from inline fragment, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "id: String") {
+		t.Errorf("expected 'id: String', got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_NestedArray(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query GetUser { user { id posts { id title } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"user":{"id":"1","posts":[{"id":"10","title":"Hello"},{"id":"11","title":"World"}]}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	if !strings.Contains(sdl, "posts: [User_PostsResponse]") {
+		t.Errorf("expected 'posts: [User_PostsResponse]', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "type User_PostsResponse {") {
+		t.Errorf("expected 'type User_PostsResponse', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "title: String") {
+		t.Errorf("expected 'title: String' in nested array type, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_NamedFragmentWithNesting(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query GetUser { user { ...UserFields } } fragment UserFields on User { id profile { bio } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"user":{"id":"1","profile":{"bio":"hello"}}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	if !strings.Contains(sdl, "profile: User_ProfileResponse") {
+		t.Errorf("expected 'profile: User_ProfileResponse' from fragment, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "type User_ProfileResponse {") {
+		t.Errorf("expected 'type User_ProfileResponse', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "bio: String") {
+		t.Errorf("expected 'bio: String' in nested type from fragment, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_TypenameFiltered(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query GetUser { user { __typename id name } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"user":{"__typename":"User","id":"1","name":"Alice"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	if strings.Contains(sdl, "__typename") {
+		t.Errorf("__typename should be filtered from output, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "id: String") {
+		t.Errorf("expected 'id: String', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "name: String") {
+		t.Errorf("expected 'name: String', got:\n%s", sdl)
+	}
+}
