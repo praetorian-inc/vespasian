@@ -354,7 +354,9 @@ func collectSelectionFields(selections ast.SelectionSet, fragments ast.FragmentD
 	for _, sel := range selections {
 		switch s := sel.(type) {
 		case *ast.Field:
-			fields = append(fields, s.Name)
+			if !isMetaField(s.Name) {
+				fields = append(fields, s.Name)
+			}
 		case *ast.FragmentSpread:
 			if frag := fragments.ForName(s.Name); frag != nil {
 				fields = append(fields, collectSelectionFields(frag.SelectionSet, fragments)...)
@@ -777,7 +779,9 @@ func inferFieldsFromResponse(body []byte, rootFieldName string, selectionFields 
 	} else {
 		// Fall back to all fields from the response object
 		for k, v := range responseObj {
-			fields[k] = inferTypeFromValue(v)
+			if !isMetaField(k) {
+				fields[k] = inferTypeFromValue(v)
+			}
 		}
 	}
 
