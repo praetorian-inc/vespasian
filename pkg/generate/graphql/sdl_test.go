@@ -974,3 +974,211 @@ func TestGenerator_Phase2_DisambiguationWithNesting(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerator_Phase2_InputTypeScalarFields(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"mutation CreateEvent($input: NewEventsInput!) { createEvent(input: $input) { id } }","variables":{"input":{"title":"Conference","count":5,"active":true,"rating":4.5}}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"createEvent":{"id":"1"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	if !strings.Contains(sdl, "input NewEventsInput {") {
+		t.Errorf("expected 'input NewEventsInput', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "title: String") {
+		t.Errorf("expected 'title: String' in input type, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "count: Int") {
+		t.Errorf("expected 'count: Int' in input type, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "active: Boolean") {
+		t.Errorf("expected 'active: Boolean' in input type, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "rating: Float") {
+		t.Errorf("expected 'rating: Float' in input type, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_InputTypeNestedObjects(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"mutation UpdateIdentity($input: UpdateIdentityInput!) { updateIdentity(input: $input) { id } }","variables":{"input":{"name":"Alice","address":{"street":"123 Main St","city":"Springfield"}}}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"updateIdentity":{"id":"1"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	if !strings.Contains(sdl, "input UpdateIdentityInput {") {
+		t.Errorf("expected 'input UpdateIdentityInput', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "name: String") {
+		t.Errorf("expected 'name: String' in input type, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "address: UpdateIdentityInput_Address") {
+		t.Errorf("expected 'address: UpdateIdentityInput_Address' in input type, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "input UpdateIdentityInput_Address {") {
+		t.Errorf("expected nested 'input UpdateIdentityInput_Address', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "street: String") {
+		t.Errorf("expected 'street: String' in nested input type, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "city: String") {
+		t.Errorf("expected 'city: String' in nested input type, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_InputTypeArrayOfObjects(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"mutation AddItems($items: [ItemInput!]!) { addItems(items: $items) { count } }","variables":{"items":[{"name":"Widget","qty":3},{"name":"Gadget","qty":1}]}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"addItems":{"count":2}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	if !strings.Contains(sdl, "input ItemInput {") {
+		t.Errorf("expected 'input ItemInput', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "name: String") {
+		t.Errorf("expected 'name: String' in input type, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "qty: Int") {
+		t.Errorf("expected 'qty: Int' in input type, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_InputTypeMergeAcrossOperations(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"mutation CreateA($input: SharedInput!) { createA(input: $input) { id } }","variables":{"input":{"name":"Alice"}}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"createA":{"id":"1"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"mutation CreateB($input: SharedInput!) { createB(input: $input) { id } }","variables":{"input":{"name":"Bob","email":"bob@example.com"}}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"createB":{"id":"2"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	if !strings.Contains(sdl, "input SharedInput {") {
+		t.Errorf("expected 'input SharedInput', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "name: String") {
+		t.Errorf("expected 'name: String' in merged input type, got:\n%s", sdl)
+	}
+	// Second op adds "email" field — should be merged in
+	if !strings.Contains(sdl, "email: String") {
+		t.Errorf("expected 'email: String' from second op merged into SharedInput, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_InputTypeCustomScalarSkipped(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"mutation UploadFile($file: Upload!) { uploadFile(file: $file) { id } }","variables":{"file":null}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"uploadFile":{"id":"42"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Upload variable is null — should NOT generate an input type for it
+	if strings.Contains(sdl, "input Upload {") {
+		t.Errorf("should not generate input type for custom scalar Upload, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_InputTypeNullVariableSkipped(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"mutation Update($input: UpdateInput!) { update(input: $input) { id } }","variables":{"input":null}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"update":{"id":"1"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Null variable value — should NOT generate an input type
+	if strings.Contains(sdl, "input UpdateInput {") {
+		t.Errorf("should not generate input type for null variable, got:\n%s", sdl)
+	}
+}

@@ -60,11 +60,12 @@ type inferredType struct {
 func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 	var ops []inferredOperation
 	syntheticTypes := make(map[string]*inferredType)
+	syntheticInputTypes := make(map[string]*inferredType)
 	anonCounter := 0
 	seen := make(map[string]bool) // deduplicate by composite key (opType:fieldName:opName)
 
 	for _, ep := range endpoints {
-		if op, ok := processEndpoint(ep, seen, &anonCounter, syntheticTypes); ok {
+		if op, ok := processEndpoint(ep, seen, &anonCounter, syntheticTypes, syntheticInputTypes); ok {
 			ops = append(ops, op)
 		}
 	}
@@ -184,11 +185,34 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 		sb.WriteString("}\n")
 	}
 
+	// Emit synthetic input types sorted by name
+	var inputTypeNames []string
+	for name := range syntheticInputTypes {
+		inputTypeNames = append(inputTypeNames, name)
+	}
+	sort.Strings(inputTypeNames)
+
+	for _, name := range inputTypeNames {
+		it := syntheticInputTypes[name]
+		fmt.Fprintf(&sb, "\ninput %s {\n", it.Name)
+
+		var fieldNames []string
+		for fn := range it.Fields {
+			fieldNames = append(fieldNames, fn)
+		}
+		sort.Strings(fieldNames)
+
+		for _, fn := range fieldNames {
+			fmt.Fprintf(&sb, "  %s: %s\n", fn, it.Fields[fn])
+		}
+		sb.WriteString("}\n")
+	}
+
 	return []byte(sb.String()), nil
 }
 
 // processEndpoint processes a single classified endpoint and returns an inferred operation.
-func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCounter *int, syntheticTypes map[string]*inferredType) (inferredOperation, bool) {
+func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCounter *int, syntheticTypes map[string]*inferredType, syntheticInputTypes map[string]*inferredType) (inferredOperation, bool) {
 	if ep.APIType != "graphql" {
 		return inferredOperation{}, false
 	}
@@ -229,6 +253,7 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 	seen[dedupKey] = true
 
 	args := buildArgTypes(parsed, body.Variables)
+	inferInputTypes(parsed, body.Variables, syntheticInputTypes)
 
 	returnTypeName := upperFirst(fieldName) + "Response"
 	typePrefix := upperFirst(fieldName)
@@ -484,6 +509,118 @@ func inferFieldsRecursive(
 	}
 
 	return fields
+}
+
+// extractNamedType unwraps list/non-null wrappers from an AST type to get the base named type.
+// E.g., [Foo!]! -> "Foo".
+func extractNamedType(t *ast.Type) string {
+	if t == nil {
+		return ""
+	}
+	if t.Elem != nil {
+		return extractNamedType(t.Elem)
+	}
+	return t.NamedType
+}
+
+// inferInputFieldsRecursive walks a JSON object and builds input type field definitions,
+// creating nested input types for nested objects.
+func inferInputFieldsRecursive(
+	obj map[string]interface{},
+	parentTypeName string,
+	inputTypes map[string]*inferredType,
+) map[string]string {
+	fields := make(map[string]string)
+
+	for key, val := range obj {
+		switch v := val.(type) {
+		case map[string]interface{}:
+			nestedTypeName := parentTypeName + "_" + upperFirst(key)
+			nestedFields := inferInputFieldsRecursive(v, nestedTypeName, inputTypes)
+			inputTypes[nestedTypeName] = &inferredType{
+				Name:   nestedTypeName,
+				Fields: nestedFields,
+			}
+			fields[key] = nestedTypeName
+		case []interface{}:
+			if len(v) > 0 {
+				if obj, ok := v[0].(map[string]interface{}); ok {
+					elemTypeName := parentTypeName + "_" + upperFirst(key)
+					elemFields := inferInputFieldsRecursive(obj, elemTypeName, inputTypes)
+					inputTypes[elemTypeName] = &inferredType{
+						Name:   elemTypeName,
+						Fields: elemFields,
+					}
+					fields[key] = "[" + elemTypeName + "]"
+				} else {
+					fields[key] = "[" + inferTypeFromValue(v[0]) + "]"
+				}
+			} else {
+				fields[key] = "[String]"
+			}
+		default:
+			fields[key] = inferTypeFromValue(val)
+		}
+	}
+
+	return fields
+}
+
+// inferInputTypes examines variable definitions and their runtime values to build
+// input type definitions for non-scalar variable types.
+func inferInputTypes(
+	parsed *parsedQuery,
+	variables map[string]interface{},
+	inputTypes map[string]*inferredType,
+) {
+	for _, vd := range parsed.varDefs {
+		baseType := extractNamedType(vd.Type)
+		if baseType == "" || builtinScalars[baseType] {
+			continue
+		}
+
+		val, ok := variables[vd.Variable]
+		if !ok || val == nil {
+			continue
+		}
+
+		switch v := val.(type) {
+		case map[string]interface{}:
+			fields := inferInputFieldsRecursive(v, baseType, inputTypes)
+			if existing, ok := inputTypes[baseType]; ok {
+				// Merge fields: first-wins per field
+				for k, ft := range fields {
+					if _, exists := existing.Fields[k]; !exists {
+						existing.Fields[k] = ft
+					}
+				}
+			} else {
+				inputTypes[baseType] = &inferredType{
+					Name:   baseType,
+					Fields: fields,
+				}
+			}
+		case []interface{}:
+			if len(v) > 0 {
+				if obj, ok := v[0].(map[string]interface{}); ok {
+					// The base type is the element type name
+					fields := inferInputFieldsRecursive(obj, baseType, inputTypes)
+					if existing, ok := inputTypes[baseType]; ok {
+						for k, ft := range fields {
+							if _, exists := existing.Fields[k]; !exists {
+								existing.Fields[k] = ft
+							}
+						}
+					} else {
+						inputTypes[baseType] = &inferredType{
+							Name:   baseType,
+							Fields: fields,
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 // astOpTypeToString converts an ast.Operation to a string.
