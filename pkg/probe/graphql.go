@@ -29,7 +29,8 @@ import (
 const maxIntrospectionBodySize = 5 << 20 // 5 MB
 
 // introspectionQuery is the GraphQL introspection query sent to discovered endpoints.
-const introspectionQuery = `{"query":"{ __schema { types { name kind fields { name type { name kind ofType { name } } } } } }"}`
+// The ofType fragment recurses 7 levels deep to handle deeply nested wrappers like [User!]!.
+const introspectionQuery = `{"query":"{ __schema { types { name kind fields { name type { name kind ofType { name kind ofType { name kind ofType { name kind ofType { name kind ofType { name kind ofType { name kind ofType { name kind } } } } } } } } } } } }"}`
 
 // GraphQLProbe sends an introspection query to discovered GraphQL endpoints
 // and parses the response into a structured schema representation.
@@ -142,14 +143,8 @@ func parseIntrospectionResponse(body []byte) *classify.GraphQLIntrospection {
 					Name   string `json:"name"`
 					Kind   string `json:"kind"`
 					Fields []struct {
-						Name string `json:"name"`
-						Type struct {
-							Name   *string `json:"name"`
-							Kind   string  `json:"kind"`
-							OfType *struct {
-								Name *string `json:"name"`
-							} `json:"ofType"`
-						} `json:"type"`
+						Name string          `json:"name"`
+						Type json.RawMessage `json:"type"`
 					} `json:"fields"`
 				} `json:"types"`
 			} `json:"__schema"`
@@ -177,17 +172,13 @@ func parseIntrospectionResponse(body []byte) *classify.GraphQLIntrospection {
 			Kind: t.Kind,
 		}
 		for _, f := range t.Fields {
+			var typeRef classify.GraphQLTypeRef
+			if err := json.Unmarshal(f.Type, &typeRef); err != nil {
+				continue
+			}
 			gf := classify.GraphQLField{
 				Name: f.Name,
-				Type: classify.GraphQLTypeRef{
-					Name: f.Type.Name,
-					Kind: f.Type.Kind,
-				},
-			}
-			if f.Type.OfType != nil {
-				gf.Type.OfType = &classify.GraphQLTypeRef{
-					Name: f.Type.OfType.Name,
-				}
+				Type: typeRef,
 			}
 			gt.Fields = append(gt.Fields, gf)
 		}

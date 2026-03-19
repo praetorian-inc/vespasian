@@ -162,8 +162,7 @@ func looksLikeGraphQL(s string) bool {
 		}
 	}
 
-	// Fallback: if the string contains a brace, it likely has GraphQL syntax.
-	return strings.ContainsRune(trimmed, '{')
+	return false
 }
 
 // hasGraphQLContentType checks if the response has a JSON-compatible content type

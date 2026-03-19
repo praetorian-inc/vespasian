@@ -406,9 +406,13 @@ func unwrapResponseValue(body []byte, rootFieldName string) (map[string]interfac
 
 	responseVal, ok := dataMap[rootFieldName]
 	if !ok {
-		for _, v := range dataMap {
-			responseVal = v
-			break
+		keys := make([]string, 0, len(dataMap))
+		for k := range dataMap {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		if len(keys) > 0 {
+			responseVal = dataMap[keys[0]]
 		}
 	}
 
