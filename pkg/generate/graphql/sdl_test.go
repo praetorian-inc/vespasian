@@ -726,11 +726,11 @@ func TestGenerator_Phase2_NestedObjectType(t *testing.T) {
 	}
 
 	sdl := string(out)
-	if !strings.Contains(sdl, "profile: User_ProfileResponse") {
-		t.Errorf("expected 'profile: User_ProfileResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "profile: GetUser_ProfileResponse") {
+		t.Errorf("expected 'profile: GetUser_ProfileResponse', got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "type User_ProfileResponse {") {
-		t.Errorf("expected 'type User_ProfileResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "type GetUser_ProfileResponse {") {
+		t.Errorf("expected 'type GetUser_ProfileResponse', got:\n%s", sdl)
 	}
 	if !strings.Contains(sdl, "bio: String") {
 		t.Errorf("expected 'bio: String' in nested type, got:\n%s", sdl)
@@ -764,23 +764,23 @@ func TestGenerator_Phase2_MultiLevelNesting(t *testing.T) {
 	}
 
 	sdl := string(out)
-	if !strings.Contains(sdl, "locale: Viewer_LocaleResponse") {
-		t.Errorf("expected 'locale: Viewer_LocaleResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "locale: GetViewer_LocaleResponse") {
+		t.Errorf("expected 'locale: GetViewer_LocaleResponse', got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "type Viewer_LocaleResponse {") {
-		t.Errorf("expected 'type Viewer_LocaleResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "type GetViewer_LocaleResponse {") {
+		t.Errorf("expected 'type GetViewer_LocaleResponse', got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "language: Viewer_Locale_LanguageResponse") {
-		t.Errorf("expected 'language: Viewer_Locale_LanguageResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "language: GetViewer_Locale_LanguageResponse") {
+		t.Errorf("expected 'language: GetViewer_Locale_LanguageResponse', got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "currency: Viewer_Locale_CurrencyResponse") {
-		t.Errorf("expected 'currency: Viewer_Locale_CurrencyResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "currency: GetViewer_Locale_CurrencyResponse") {
+		t.Errorf("expected 'currency: GetViewer_Locale_CurrencyResponse', got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "type Viewer_Locale_LanguageResponse {") {
-		t.Errorf("expected 'type Viewer_Locale_LanguageResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "type GetViewer_Locale_LanguageResponse {") {
+		t.Errorf("expected 'type GetViewer_Locale_LanguageResponse', got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "type Viewer_Locale_CurrencyResponse {") {
-		t.Errorf("expected 'type Viewer_Locale_CurrencyResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "type GetViewer_Locale_CurrencyResponse {") {
+		t.Errorf("expected 'type GetViewer_Locale_CurrencyResponse', got:\n%s", sdl)
 	}
 }
 
@@ -837,11 +837,11 @@ func TestGenerator_Phase2_NestedArray(t *testing.T) {
 	}
 
 	sdl := string(out)
-	if !strings.Contains(sdl, "posts: [User_PostsResponse]") {
-		t.Errorf("expected 'posts: [User_PostsResponse]', got:\n%s", sdl)
+	if !strings.Contains(sdl, "posts: [GetUser_PostsResponse]") {
+		t.Errorf("expected 'posts: [GetUser_PostsResponse]', got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "type User_PostsResponse {") {
-		t.Errorf("expected 'type User_PostsResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "type GetUser_PostsResponse {") {
+		t.Errorf("expected 'type GetUser_PostsResponse', got:\n%s", sdl)
 	}
 	if !strings.Contains(sdl, "title: String") {
 		t.Errorf("expected 'title: String' in nested array type, got:\n%s", sdl)
@@ -869,11 +869,11 @@ func TestGenerator_Phase2_NamedFragmentWithNesting(t *testing.T) {
 	}
 
 	sdl := string(out)
-	if !strings.Contains(sdl, "profile: User_ProfileResponse") {
-		t.Errorf("expected 'profile: User_ProfileResponse' from fragment, got:\n%s", sdl)
+	if !strings.Contains(sdl, "profile: GetUser_ProfileResponse") {
+		t.Errorf("expected 'profile: GetUser_ProfileResponse' from fragment, got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "type User_ProfileResponse {") {
-		t.Errorf("expected 'type User_ProfileResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "type GetUser_ProfileResponse {") {
+		t.Errorf("expected 'type GetUser_ProfileResponse', got:\n%s", sdl)
 	}
 	if !strings.Contains(sdl, "bio: String") {
 		t.Errorf("expected 'bio: String' in nested type from fragment, got:\n%s", sdl)
@@ -909,5 +909,68 @@ func TestGenerator_Phase2_TypenameFiltered(t *testing.T) {
 	}
 	if !strings.Contains(sdl, "name: String") {
 		t.Errorf("expected 'name: String', got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_DisambiguationWithNesting(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query StoredPassengers { viewer { passengers { id name } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"viewer":{"passengers":[{"id":"1","name":"Alice"}]}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query FareLocksTabQuery { viewer { fareLocks { id status } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"viewer":{"fareLocks":[{"id":"2","status":"active"}]}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+
+	// First op keeps bare "viewer" field, nested types use op name "StoredPassengers"
+	if !strings.Contains(sdl, "passengers: [StoredPassengers_PassengersResponse]") {
+		t.Errorf("expected 'passengers: [StoredPassengers_PassengersResponse]', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "type StoredPassengers_PassengersResponse {") {
+		t.Errorf("expected 'type StoredPassengers_PassengersResponse', got:\n%s", sdl)
+	}
+
+	// Second op gets disambiguated field "viewer_FareLocksTabQuery", nested types use op name "FareLocksTabQuery"
+	if !strings.Contains(sdl, "viewer_FareLocksTabQuery") {
+		t.Errorf("expected disambiguated field 'viewer_FareLocksTabQuery', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "fareLocks: [FareLocksTabQuery_FareLocksResponse]") {
+		t.Errorf("expected 'fareLocks: [FareLocksTabQuery_FareLocksResponse]', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "type FareLocksTabQuery_FareLocksResponse {") {
+		t.Errorf("expected 'type FareLocksTabQuery_FareLocksResponse', got:\n%s", sdl)
+	}
+
+	// Assert no cascading rename — no type name should exceed 100 characters
+	for _, line := range strings.Split(sdl, "\n") {
+		if strings.HasPrefix(line, "type ") {
+			typeName := strings.TrimPrefix(line, "type ")
+			typeName = strings.TrimSuffix(typeName, " {")
+			if len(typeName) > 100 {
+				t.Errorf("type name too long (%d chars): %s", len(typeName), typeName)
+			}
+		}
 	}
 }

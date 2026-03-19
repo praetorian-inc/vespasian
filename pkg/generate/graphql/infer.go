@@ -40,12 +40,14 @@ type graphqlBody struct {
 
 // inferredOperation holds an inferred GraphQL operation.
 type inferredOperation struct {
-	OpType     string            // "query", "mutation", or "subscription"
-	FieldName  string            // root field name from the selection set
-	OpName     string            // original operation name from the query
-	Args       map[string]string // argument name -> type
-	ReturnType string            // inferred return type name
-	IsList     bool              // whether the return type is a list
+	OpType         string            // "query", "mutation", or "subscription"
+	FieldName      string            // root field name from the selection set
+	OpName         string            // original operation name from the query
+	Args           map[string]string // argument name -> type
+	ReturnType     string            // inferred return type name
+	IsList         bool              // whether the return type is a list
+	TypePrefix     string            // prefix used for nested type names (op name when available)
+	ResponseFields map[string]string // fields for the root synthetic type (created after disambiguation)
 }
 
 // inferredType holds a synthetic type inferred from response data.
@@ -106,16 +108,31 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 					}
 					newFieldName := op.FieldName + "_" + suffix
 					newReturnType := upperFirst(newFieldName) + "Response"
-					// Update synthetic types: rename root and any nested types with the old prefix
-					oldPrefix := upperFirst(op.FieldName) + "_"
-					newPrefix := upperFirst(newFieldName) + "_"
-					renameSyntheticTypes(syntheticTypes, op.ReturnType, newReturnType, oldPrefix, newPrefix)
+					// Only rename the root type — nested types use op-name prefix
+					// and don't collide across operations
+					if st, ok := syntheticTypes[op.ReturnType]; ok {
+						delete(syntheticTypes, op.ReturnType)
+						st.Name = newReturnType
+						syntheticTypes[newReturnType] = st
+					}
 					groupOps[i].FieldName = newFieldName
 					groupOps[i].ReturnType = newReturnType
 				}
 			}
 		}
 		grouped[opType] = groupOps
+	}
+
+	// Create root synthetic types after disambiguation to avoid map collisions
+	for _, groupOps := range grouped {
+		for _, op := range groupOps {
+			if len(op.ResponseFields) > 0 {
+				syntheticTypes[op.ReturnType] = &inferredType{
+					Name:   op.ReturnType,
+					Fields: op.ResponseFields,
+				}
+			}
+		}
 	}
 
 	// Emit operation types in canonical order
@@ -215,6 +232,9 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 
 	returnTypeName := upperFirst(fieldName) + "Response"
 	typePrefix := upperFirst(fieldName)
+	if parsed.opName != "" {
+		typePrefix = parsed.opName
+	}
 
 	responseObj, isList, responseOK := unwrapResponseValue(ep.Response.Body, fieldName)
 	var responseFields map[string]string
@@ -224,20 +244,15 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 		// Fallback: existing flat inference
 		responseFields, isList = inferFieldsFromResponse(ep.Response.Body, fieldName, parsed.selectionFields)
 	}
-	if len(responseFields) > 0 {
-		syntheticTypes[returnTypeName] = &inferredType{
-			Name:   returnTypeName,
-			Fields: responseFields,
-		}
-	}
-
 	return inferredOperation{
-		OpType:     opType,
-		FieldName:  fieldName,
-		OpName:     parsed.opName,
-		Args:       args,
-		ReturnType: returnTypeName,
-		IsList:     isList,
+		OpType:         opType,
+		FieldName:      fieldName,
+		OpName:         parsed.opName,
+		Args:           args,
+		ReturnType:     returnTypeName,
+		IsList:         isList,
+		TypePrefix:     typePrefix,
+		ResponseFields: responseFields,
 	}, true
 }
 
@@ -683,37 +698,6 @@ func unwrapResponseValue(body []byte, rootFieldName string) (map[string]interfac
 		return rv, false, true
 	default:
 		return nil, false, false
-	}
-}
-
-// renameSyntheticTypes renames the root type and any nested types that share the old prefix.
-// It also updates field type references within renamed types.
-func renameSyntheticTypes(syntheticTypes map[string]*inferredType, oldRoot, newRoot, oldPrefix, newPrefix string) {
-	// Collect all types that need renaming
-	renames := make(map[string]string) // old name -> new name
-	if _, ok := syntheticTypes[oldRoot]; ok {
-		renames[oldRoot] = newRoot
-	}
-	for name := range syntheticTypes {
-		if strings.HasPrefix(name, oldPrefix) {
-			newName := newPrefix + name[len(oldPrefix):]
-			renames[name] = newName
-		}
-	}
-
-	// Apply renames
-	for oldName, newName := range renames {
-		st := syntheticTypes[oldName]
-		delete(syntheticTypes, oldName)
-		st.Name = newName
-		// Update field type references within this type
-		for fn, ft := range st.Fields {
-			for oldRef, newRef := range renames {
-				ft = strings.ReplaceAll(ft, oldRef, newRef)
-			}
-			st.Fields[fn] = ft
-		}
-		syntheticTypes[newName] = st
 	}
 }
 
