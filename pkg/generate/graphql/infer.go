@@ -208,6 +208,17 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 				}
 				grouped[opType] = groupOps
 			}
+			// Update field references in synthetic types that still point to the deleted Response type
+			for _, st := range syntheticTypes {
+				for fieldName, fieldType := range st.Fields {
+					if fieldType == responseName {
+						st.Fields[fieldName] = unionName
+					}
+					if fieldType == "["+responseName+"]" {
+						st.Fields[fieldName] = "[" + unionName + "]"
+					}
+				}
+			}
 		}
 		// Also remove any type with the same name as the union itself
 		delete(syntheticTypes, unionName)
