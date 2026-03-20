@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -513,7 +514,14 @@ func (c *GenerateCmd) Run() (err error) {
 	defer stop()
 
 
-	spec, err := generateSpec(ctx, requests, c.APIType, c.Confidence, c.Probe, c.Deduplicate, c.DangerousAllowPrivate, c.Verbose)
+	spec, err := generateSpec(ctx, requests, generateSpecOptions{
+		APIType:      c.APIType,
+		Confidence:   c.Confidence,
+		Probe:        c.Probe,
+		Deduplicate:  c.Deduplicate,
+		AllowPrivate: c.DangerousAllowPrivate,
+		Verbose:      c.Verbose,
+	})
 	if err != nil {
 		return err
 	}
@@ -580,7 +588,14 @@ func (c *ScanCmd) Run() error {
 	defer genStop()
 
 
-	spec, err := generateSpec(genCtx, requests, "rest", c.Confidence, c.Probe, c.Deduplicate, c.DangerousAllowPrivate, c.Verbose)
+	spec, err := generateSpec(genCtx, requests, generateSpecOptions{
+		APIType:      "rest",
+		Confidence:   c.Confidence,
+		Probe:        c.Probe,
+		Deduplicate:  c.Deduplicate,
+		AllowPrivate: c.DangerousAllowPrivate,
+		Verbose:      c.Verbose,
+	})
 	if err != nil {
 		return err
 	}
@@ -610,33 +625,52 @@ func main() {
 	ctx.FatalIfErrorf(err)
 }
 
-// generateSpec runs the classify → probe → generate pipeline.
+// generateSpecOptions holds parameters for generateSpec, avoiding consecutive
+// bool arguments that are easy to transpose at call sites.
+type generateSpecOptions struct {
+	APIType      string
+	Confidence   float64
+	Probe        bool
+	Deduplicate  bool
+	AllowPrivate bool
+	Verbose      bool
+}
 
-func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, apiType string, confidence float64, doProbe bool, deduplicate bool, allowPrivate bool, verbose bool) ([]byte, error) {
-	classifiers := classifiersForType(apiType)
+// generateSpec runs the classify → probe → generate pipeline.
+func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts generateSpecOptions) ([]byte, error) {
+	classifiers := classifiersForType(opts.APIType)
 	if classifiers == nil {
-		return nil, fmt.Errorf("unsupported API type: %q", apiType)
+		return nil, fmt.Errorf("unsupported API type: %q", opts.APIType)
 	}
-	classified := classify.RunClassifiers(classifiers, requests, confidence)
-	if deduplicate {
+	classified := classify.RunClassifiers(classifiers, requests, opts.Confidence)
+	if opts.Deduplicate {
 		classified = classify.Deduplicate(classified)
 	}
 
-	if verbose {
-		fmt.Fprintf(os.Stderr, "classified %d API requests (threshold=%.2f)\n", len(classified), confidence)
+	if opts.Verbose {
+		fmt.Fprintf(os.Stderr, "classified %d API requests (threshold=%.2f)\n", len(classified), opts.Confidence)
 	}
 
-	if allowPrivate {
+	if opts.AllowPrivate && opts.Probe {
 		fmt.Fprintf(os.Stderr, "WARNING: SSRF protection disabled — probes may target private/internal networks\n")
 	}
 
-	if doProbe {
+	if opts.Probe {
 		cfg := probe.DefaultConfig()
-		if allowPrivate {
+		if opts.AllowPrivate {
 			cfg.URLValidator = func(string) error { return nil }
+			cfg.Client = &http.Client{
+				CheckRedirect: func(req *http.Request, via []*http.Request) error {
+					return http.ErrUseLastResponse
+				},
+				Transport: &http.Transport{
+					TLSHandshakeTimeout:   10 * time.Second,
+					ResponseHeaderTimeout: 10 * time.Second,
+				},
+			}
 		}
 		var strategies []probe.ProbeStrategy
-		switch apiType {
+		switch opts.APIType {
 		case "wsdl":
 			strategies = []probe.ProbeStrategy{probe.NewWSDLProbe(cfg)}
 		default:
@@ -646,7 +680,7 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, apiType
 			}
 		}
 		enriched, probeErrs := probe.RunStrategies(ctx, strategies, classified)
-		if verbose {
+		if opts.Verbose {
 			for _, e := range probeErrs {
 				fmt.Fprintf(os.Stderr, "probe warning: %v\n", e)
 			}
@@ -654,7 +688,7 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, apiType
 		classified = enriched
 	}
 
-	gen, err := generate.Get(apiType)
+	gen, err := generate.Get(opts.APIType)
 	if err != nil {
 		return nil, err
 	}
