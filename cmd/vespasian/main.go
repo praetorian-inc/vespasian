@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -472,6 +473,7 @@ type GenerateCmd struct {
 	Confidence  float64 `default:"0.5" help:"Minimum confidence threshold"`
 	Probe       bool    `default:"true" help:"Enable endpoint probing"`
 	Deduplicate bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
+	DangerousAllowPrivate bool    `help:"Disable SSRF protection for probes, allowing private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 	Verbose     bool    `short:"v" help:"Enable verbose logging"`
 }
 
@@ -511,7 +513,15 @@ func (c *GenerateCmd) Run() (err error) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	spec, err := generateSpec(ctx, requests, c.APIType, c.Confidence, c.Probe, c.Deduplicate, c.Verbose)
+
+	spec, err := generateSpec(ctx, requests, generateSpecOptions{
+		APIType:      c.APIType,
+		Confidence:   c.Confidence,
+		Probe:        c.Probe,
+		Deduplicate:  c.Deduplicate,
+		AllowPrivate: c.DangerousAllowPrivate,
+		Verbose:      c.Verbose,
+	})
 	if err != nil {
 		return err
 	}
@@ -528,6 +538,8 @@ type ScanCmd struct {
 	Confidence  float64 `default:"0.5" help:"Minimum confidence threshold"`
 	Probe       bool    `default:"true" help:"Enable endpoint probing"`
 	Deduplicate bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
+	DangerousAllowPrivate bool    `help:"Disable SSRF protection for probes, allowing private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
+
 	CrawlOptions
 }
 
@@ -575,7 +587,15 @@ func (c *ScanCmd) Run() error {
 	genCtx, genStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer genStop()
 
-	spec, err := generateSpec(genCtx, requests, "rest", c.Confidence, c.Probe, c.Deduplicate, c.Verbose)
+
+	spec, err := generateSpec(genCtx, requests, generateSpecOptions{
+		APIType:      "rest",
+		Confidence:   c.Confidence,
+		Probe:        c.Probe,
+		Deduplicate:  c.Deduplicate,
+		AllowPrivate: c.DangerousAllowPrivate,
+		Verbose:      c.Verbose,
+	})
 	if err != nil {
 		return err
 	}
@@ -605,34 +625,62 @@ func main() {
 	ctx.FatalIfErrorf(err)
 }
 
+// generateSpecOptions holds parameters for generateSpec, avoiding consecutive
+// bool arguments that are easy to transpose at call sites.
+type generateSpecOptions struct {
+	APIType      string
+	Confidence   float64
+	Probe        bool
+	Deduplicate  bool
+	AllowPrivate bool
+	Verbose      bool
+}
+
 // generateSpec runs the classify → probe → generate pipeline.
-func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, apiType string, confidence float64, doProbe bool, deduplicate bool, verbose bool) ([]byte, error) {
-	classifiers := classifiersForType(apiType)
+func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts generateSpecOptions) ([]byte, error) {
+	classifiers := classifiersForType(opts.APIType)
 	if classifiers == nil {
-		return nil, fmt.Errorf("unsupported API type: %q", apiType)
+		return nil, fmt.Errorf("unsupported API type: %q", opts.APIType)
 	}
-	classified := classify.RunClassifiers(classifiers, requests, confidence)
-	if deduplicate {
+	classified := classify.RunClassifiers(classifiers, requests, opts.Confidence)
+	if opts.Deduplicate {
 		classified = classify.Deduplicate(classified)
 	}
 
-	if verbose {
-		fmt.Fprintf(os.Stderr, "classified %d API requests (threshold=%.2f)\n", len(classified), confidence)
+	if opts.Verbose {
+		fmt.Fprintf(os.Stderr, "classified %d API requests (threshold=%.2f)\n", len(classified), opts.Confidence)
 	}
 
-	if doProbe {
+	if opts.AllowPrivate && opts.Probe {
+		fmt.Fprintf(os.Stderr, "WARNING: SSRF protection disabled — probes may target private/internal networks\n")
+	}
+
+	if opts.Probe {
+		cfg := probe.DefaultConfig()
+		if opts.AllowPrivate {
+			cfg.URLValidator = func(string) error { return nil }
+			cfg.Client = &http.Client{
+				CheckRedirect: func(req *http.Request, via []*http.Request) error {
+					return http.ErrUseLastResponse
+				},
+				Transport: &http.Transport{
+					TLSHandshakeTimeout:   10 * time.Second,
+					ResponseHeaderTimeout: 10 * time.Second,
+				},
+			}
+		}
 		var strategies []probe.ProbeStrategy
-		switch apiType {
+		switch opts.APIType {
 		case "wsdl":
-			strategies = []probe.ProbeStrategy{probe.NewWSDLProbe(probe.DefaultConfig())}
+			strategies = []probe.ProbeStrategy{probe.NewWSDLProbe(cfg)}
 		default:
 			strategies = []probe.ProbeStrategy{
-				&probe.OptionsProbe{},
-				&probe.SchemaProbe{},
+				probe.NewOptionsProbe(cfg),
+				probe.NewSchemaProbe(cfg),
 			}
 		}
 		enriched, probeErrs := probe.RunStrategies(ctx, strategies, classified)
-		if verbose {
+		if opts.Verbose {
 			for _, e := range probeErrs {
 				fmt.Fprintf(os.Stderr, "probe warning: %v\n", e)
 			}
@@ -640,7 +688,7 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, apiType
 		classified = enriched
 	}
 
-	gen, err := generate.Get(apiType)
+	gen, err := generate.Get(opts.APIType)
 	if err != nil {
 		return nil, err
 	}
