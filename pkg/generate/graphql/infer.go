@@ -61,12 +61,13 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 	var ops []inferredOperation
 	syntheticTypes := make(map[string]*inferredType)
 	syntheticInputTypes := make(map[string]*inferredType)
-	syntheticUnions := make(map[string][]string) // union name -> member type names
+	syntheticUnions := make(map[string][]string)          // union name -> member type names
+	observedEnumValues := make(map[string]map[string]bool) // type name -> set of observed string values
 	anonCounter := 0
 	seen := make(map[string]bool) // deduplicate by composite key (opType:fieldName:opName)
 
 	for _, ep := range endpoints {
-		if epOps, ok := processEndpoint(ep, seen, &anonCounter, syntheticTypes, syntheticInputTypes, syntheticUnions); ok {
+		if epOps, ok := processEndpoint(ep, seen, &anonCounter, syntheticTypes, syntheticInputTypes, syntheticUnions, observedEnumValues); ok {
 			ops = append(ops, epOps...)
 		}
 	}
@@ -319,12 +320,26 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 		fmt.Fprintf(&sb, "\nunion %s = %s\n", name, strings.Join(members, " | "))
 	}
 
-	// Emit custom scalar declarations for referenced but undeclared types (e.g., Upload)
+	// Emit custom scalar/enum declarations for referenced but undeclared types
 	referencedScalars := collectCustomScalars(grouped, syntheticTypes, syntheticInputTypes, syntheticUnions)
 	if len(referencedScalars) > 0 {
 		sort.Strings(referencedScalars)
 		for _, s := range referencedScalars {
-			fmt.Fprintf(&sb, "\nscalar %s\n", s)
+			if values, ok := observedEnumValues[s]; ok && len(values) > 0 {
+				// Emit as enum with observed values
+				var sortedVals []string
+				for v := range values {
+					sortedVals = append(sortedVals, v)
+				}
+				sort.Strings(sortedVals)
+				fmt.Fprintf(&sb, "\nenum %s {\n", s)
+				for _, v := range sortedVals {
+					fmt.Fprintf(&sb, "  %s\n", v)
+				}
+				sb.WriteString("}\n")
+			} else {
+				fmt.Fprintf(&sb, "\nscalar %s\n", s)
+			}
 		}
 	}
 
@@ -333,7 +348,7 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 
 // processEndpoint processes a single classified endpoint and returns inferred operations
 // (one per root field in multi-root queries).
-func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCounter *int, syntheticTypes map[string]*inferredType, syntheticInputTypes map[string]*inferredType, syntheticUnions map[string][]string) ([]inferredOperation, bool) {
+func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCounter *int, syntheticTypes map[string]*inferredType, syntheticInputTypes map[string]*inferredType, syntheticUnions map[string][]string, observedEnumValues map[string]map[string]bool) ([]inferredOperation, bool) {
 	if ep.APIType != "graphql" {
 		return nil, false
 	}
@@ -358,7 +373,7 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 
 	var ops []inferredOperation
 	for _, parsed := range parsedQueries {
-		op, ok := processParsedQuery(parsed, ep, body, seen, anonCounter, syntheticTypes, syntheticInputTypes, syntheticUnions)
+		op, ok := processParsedQuery(parsed, ep, body, seen, anonCounter, syntheticTypes, syntheticInputTypes, syntheticUnions, observedEnumValues)
 		if ok {
 			ops = append(ops, op)
 		}
@@ -371,7 +386,7 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 }
 
 // processParsedQuery processes a single parsed query (one root field) from an endpoint.
-func processParsedQuery(parsed *parsedQuery, ep classify.ClassifiedRequest, body *graphqlBody, seen map[string]bool, anonCounter *int, syntheticTypes map[string]*inferredType, syntheticInputTypes map[string]*inferredType, syntheticUnions map[string][]string) (inferredOperation, bool) {
+func processParsedQuery(parsed *parsedQuery, ep classify.ClassifiedRequest, body *graphqlBody, seen map[string]bool, anonCounter *int, syntheticTypes map[string]*inferredType, syntheticInputTypes map[string]*inferredType, syntheticUnions map[string][]string, observedEnumValues map[string]map[string]bool) (inferredOperation, bool) {
 	opType := astOpTypeToString(parsed.opType)
 	fieldName := parsed.rootFieldName
 	if fieldName == "" {
@@ -399,6 +414,10 @@ func processParsedQuery(parsed *parsedQuery, ep classify.ClassifiedRequest, body
 	for _, vd := range parsed.varDefs {
 		varTypes[vd.Variable] = astTypeToSDL(vd.Type)
 	}
+
+	// Collect observed enum values: when a non-builtin, non-input variable has a string value,
+	// record it as a potential enum value for that type.
+	collectEnumValues(parsed, body.Variables, syntheticInputTypes, observedEnumValues)
 
 	returnTypeName := upperFirst(fieldName) + "Response"
 	typePrefix := upperFirst(fieldName)
@@ -1211,7 +1230,7 @@ func inferFieldArgTypes(args []*ast.Argument, varTypes map[string]string, inputT
 		}
 		if arg.Value != nil && arg.Value.Kind == ast.ObjectValue {
 			inputTypeName := fieldPrefix + "_" + upperFirst(arg.Name) + "Input"
-			inferInputTypeFromASTObject(arg.Value, inputTypeName, inputTypes)
+			inferInputTypeFromASTObject(arg.Value, inputTypeName, inputTypes, varTypes)
 			result[arg.Name] = inputTypeName
 			continue
 		}
@@ -1364,6 +1383,50 @@ func inferInputTypes(
 	}
 }
 
+// collectEnumValues records observed string values for non-builtin, non-input variable types.
+// When a variable is declared as a custom type (e.g., $status: InterviewInvitationStatus) and
+// its runtime value is a string, we record that string as a potential enum value.
+func collectEnumValues(
+	parsed *parsedQuery,
+	variables map[string]interface{},
+	inputTypes map[string]*inferredType,
+	observedEnumValues map[string]map[string]bool,
+) {
+	for _, vd := range parsed.varDefs {
+		baseType := extractNamedType(vd.Type)
+		if baseType == "" || builtinScalars[baseType] {
+			continue
+		}
+		// Skip types that are already known input types
+		if _, isInput := inputTypes[baseType]; isInput {
+			continue
+		}
+
+		val, ok := variables[vd.Variable]
+		if !ok || val == nil {
+			continue
+		}
+
+		switch v := val.(type) {
+		case string:
+			if observedEnumValues[baseType] == nil {
+				observedEnumValues[baseType] = make(map[string]bool)
+			}
+			observedEnumValues[baseType][v] = true
+		case []interface{}:
+			// Array of enum values (e.g., $intents: [UserVerificationIntent!]!)
+			for _, elem := range v {
+				if s, ok := elem.(string); ok {
+					if observedEnumValues[baseType] == nil {
+						observedEnumValues[baseType] = make(map[string]bool)
+					}
+					observedEnumValues[baseType][s] = true
+				}
+			}
+		}
+	}
+}
+
 // astOpTypeToString converts an ast.Operation to a string.
 func astOpTypeToString(op ast.Operation) string {
 	switch op {
@@ -1423,17 +1486,30 @@ func inferTypeFromASTValue(v *ast.Value) string {
 }
 
 // inferInputTypeFromASTObject creates an input type definition from an AST object value.
-func inferInputTypeFromASTObject(value *ast.Value, typeName string, inputTypes map[string]*inferredType) {
+func inferInputTypeFromASTObject(value *ast.Value, typeName string, inputTypes map[string]*inferredType, varTypes ...map[string]string) {
 	if value == nil || value.Kind != ast.ObjectValue {
 		return
+	}
+
+	// Merge varTypes if provided
+	var vt map[string]string
+	if len(varTypes) > 0 {
+		vt = varTypes[0]
 	}
 
 	fields := make(map[string]string)
 	for _, child := range value.Children {
 		if child.Value != nil && child.Value.Kind == ast.ObjectValue {
 			nestedTypeName := typeName + "_" + upperFirst(child.Name)
-			inferInputTypeFromASTObject(child.Value, nestedTypeName, inputTypes)
+			inferInputTypeFromASTObject(child.Value, nestedTypeName, inputTypes, varTypes...)
 			fields[child.Name] = nestedTypeName
+		} else if child.Value != nil && child.Value.Kind == ast.Variable && vt != nil {
+			// Resolve variable reference to its declared type
+			if t, ok := vt[child.Value.Raw]; ok {
+				fields[child.Name] = t
+			} else {
+				fields[child.Name] = inferTypeFromASTValue(child.Value)
+			}
 		} else {
 			fields[child.Name] = inferTypeFromASTValue(child.Value)
 		}
@@ -1484,7 +1560,7 @@ func buildArgTypes(parsed *parsedQuery, variables map[string]interface{}, inputT
 		// Use rootFieldName + argName to disambiguate (e.g., ValidateEmail_InputInput vs SetCurrentUserFlowState_InputInput)
 		if arg.Value != nil && arg.Value.Kind == ast.ObjectValue {
 			inputTypeName := upperFirst(parsed.rootFieldName) + "_" + upperFirst(argName) + "Input"
-			inferInputTypeFromASTObject(arg.Value, inputTypeName, inputTypes)
+			inferInputTypeFromASTObject(arg.Value, inputTypeName, inputTypes, varTypes)
 			args[argName] = inputTypeName
 			continue
 		}
@@ -1770,12 +1846,28 @@ func isMoreSpecificType(newType, existingType string) bool {
 	if existingType == "String" && newType != "String" && newType != "" {
 		return true
 	}
+	// Unwrap list/non-null wrappers and compare base types
+	existingBase := unwrapBaseType(existingType)
+	newBase := unwrapBaseType(newType)
+	if existingBase == "String" && newBase != "String" && newBase != "" {
+		return true
+	}
 	// Prefer non-null over nullable of the same base type
 	if strings.HasSuffix(newType, "!") && !strings.HasSuffix(existingType, "!") &&
 		strings.TrimSuffix(newType, "!") == existingType {
 		return true
 	}
 	return false
+}
+
+// unwrapBaseType strips list brackets and non-null markers to get the base named type.
+func unwrapBaseType(t string) string {
+	base := t
+	base = strings.TrimSuffix(base, "!")
+	base = strings.TrimPrefix(base, "[")
+	base = strings.TrimSuffix(base, "]")
+	base = strings.TrimSuffix(base, "!")
+	return base
 }
 
 // isScalarType returns true if the type string represents a built-in GraphQL scalar.
@@ -1956,6 +2048,12 @@ func collectCustomScalars(
 			for _, argType := range args {
 				checkCustomScalar(argType, known, candidates)
 			}
+		}
+	}
+	// Check input type fields for custom scalar references
+	for _, it := range syntheticInputTypes {
+		for _, fieldType := range it.Fields {
+			checkCustomScalar(fieldType, known, candidates)
 		}
 	}
 
