@@ -1397,11 +1397,11 @@ func TestGenerator_Phase2_InlineObjectLiteralInputType(t *testing.T) {
 
 	sdl := string(out)
 	// Should create an input type from the inline object literal
-	if !strings.Contains(sdl, "userData: UserDataInput") {
-		t.Errorf("expected 'userData: UserDataInput' from inline object, got:\n%s", sdl)
+	if !strings.Contains(sdl, "userData: CreateUser_UserDataInput") {
+		t.Errorf("expected 'userData: CreateUser_UserDataInput' from inline object, got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "input UserDataInput {") {
-		t.Errorf("expected 'input UserDataInput' type definition, got:\n%s", sdl)
+	if !strings.Contains(sdl, "input CreateUser_UserDataInput {") {
+		t.Errorf("expected 'input CreateUser_UserDataInput' type definition, got:\n%s", sdl)
 	}
 	if !strings.Contains(sdl, "username: String") {
 		t.Errorf("expected 'username: String' in input type, got:\n%s", sdl)

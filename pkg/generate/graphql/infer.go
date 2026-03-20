@@ -1054,7 +1054,7 @@ func inferFieldsRecursive(
 	for _, node := range tree {
 		// Infer field arguments if present
 		if len(node.Arguments) > 0 {
-			args := inferFieldArgTypes(node.Arguments, varTypes, inputTypes)
+			args := inferFieldArgTypes(node.Arguments, varTypes, inputTypes, typePrefix+"_"+upperFirst(node.Name))
 			if len(args) > 0 {
 				storeFieldArgs(syntheticTypes, parentTypeName, node.Name, args)
 			}
@@ -1199,7 +1199,8 @@ func inferFieldsRecursive(
 }
 
 // inferFieldArgTypes infers argument types for a field's arguments.
-func inferFieldArgTypes(args []*ast.Argument, varTypes map[string]string, inputTypes map[string]*inferredType) map[string]string {
+// fieldPrefix is used to disambiguate inline object type names (e.g., "AiInterviewer_BulkConfigs").
+func inferFieldArgTypes(args []*ast.Argument, varTypes map[string]string, inputTypes map[string]*inferredType, fieldPrefix string) map[string]string {
 	result := make(map[string]string)
 	for _, arg := range args {
 		if arg.Value != nil && arg.Value.Kind == ast.Variable {
@@ -1209,7 +1210,7 @@ func inferFieldArgTypes(args []*ast.Argument, varTypes map[string]string, inputT
 			}
 		}
 		if arg.Value != nil && arg.Value.Kind == ast.ObjectValue {
-			inputTypeName := upperFirst(arg.Name) + "Input"
+			inputTypeName := fieldPrefix + "_" + upperFirst(arg.Name) + "Input"
 			inferInputTypeFromASTObject(arg.Value, inputTypeName, inputTypes)
 			result[arg.Name] = inputTypeName
 			continue
@@ -1480,8 +1481,9 @@ func buildArgTypes(parsed *parsedQuery, variables map[string]interface{}, inputT
 			}
 		}
 		// Fix 3: Inline object literal — create input type
+		// Use rootFieldName + argName to disambiguate (e.g., ValidateEmail_InputInput vs SetCurrentUserFlowState_InputInput)
 		if arg.Value != nil && arg.Value.Kind == ast.ObjectValue {
-			inputTypeName := upperFirst(argName) + "Input"
+			inputTypeName := upperFirst(parsed.rootFieldName) + "_" + upperFirst(argName) + "Input"
 			inferInputTypeFromASTObject(arg.Value, inputTypeName, inputTypes)
 			args[argName] = inputTypeName
 			continue
