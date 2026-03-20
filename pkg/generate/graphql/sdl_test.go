@@ -618,13 +618,20 @@ func TestGenerator_Phase2_DedupPreservesDistinctOperations(t *testing.T) {
 	}
 
 	sdl := string(out)
-	// Both operations should appear even though they share root field "viewer"
+	// Both operations should be merged into a single "viewer" field
 	if !strings.Contains(sdl, "viewer") {
 		t.Errorf("expected 'viewer' field, got:\n%s", sdl)
 	}
-	// The second operation should be disambiguated with its operation name
-	if !strings.Contains(sdl, "viewer_FareLocksTabQuery") {
-		t.Errorf("expected disambiguated 'viewer_FareLocksTabQuery' field, got:\n%s", sdl)
+	// Should NOT have disambiguated fields — they should be merged
+	if strings.Contains(sdl, "viewer_FareLocksTabQuery") {
+		t.Errorf("should not have disambiguated 'viewer_FareLocksTabQuery' — operations should be merged, got:\n%s", sdl)
+	}
+	// The merged ViewerResponse should contain fields from both operations
+	if !strings.Contains(sdl, "passengers") {
+		t.Errorf("expected 'passengers' field from first operation in merged type, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "fareLocks") {
+		t.Errorf("expected 'fareLocks' field from second operation in merged type, got:\n%s", sdl)
 	}
 }
 
@@ -726,11 +733,11 @@ func TestGenerator_Phase2_NestedObjectType(t *testing.T) {
 	}
 
 	sdl := string(out)
-	if !strings.Contains(sdl, "profile: GetUser_ProfileResponse") {
-		t.Errorf("expected 'profile: GetUser_ProfileResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "profile: User_ProfileResponse") {
+		t.Errorf("expected 'profile: User_ProfileResponse', got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "type GetUser_ProfileResponse {") {
-		t.Errorf("expected 'type GetUser_ProfileResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "type User_ProfileResponse {") {
+		t.Errorf("expected 'type User_ProfileResponse', got:\n%s", sdl)
 	}
 	if !strings.Contains(sdl, "bio: String") {
 		t.Errorf("expected 'bio: String' in nested type, got:\n%s", sdl)
@@ -764,23 +771,23 @@ func TestGenerator_Phase2_MultiLevelNesting(t *testing.T) {
 	}
 
 	sdl := string(out)
-	if !strings.Contains(sdl, "locale: GetViewer_LocaleResponse") {
-		t.Errorf("expected 'locale: GetViewer_LocaleResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "locale: Viewer_LocaleResponse") {
+		t.Errorf("expected 'locale: Viewer_LocaleResponse', got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "type GetViewer_LocaleResponse {") {
-		t.Errorf("expected 'type GetViewer_LocaleResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "type Viewer_LocaleResponse {") {
+		t.Errorf("expected 'type Viewer_LocaleResponse', got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "language: GetViewer_Locale_LanguageResponse") {
-		t.Errorf("expected 'language: GetViewer_Locale_LanguageResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "language: Viewer_Locale_LanguageResponse") {
+		t.Errorf("expected 'language: Viewer_Locale_LanguageResponse', got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "currency: GetViewer_Locale_CurrencyResponse") {
-		t.Errorf("expected 'currency: GetViewer_Locale_CurrencyResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "currency: Viewer_Locale_CurrencyResponse") {
+		t.Errorf("expected 'currency: Viewer_Locale_CurrencyResponse', got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "type GetViewer_Locale_LanguageResponse {") {
-		t.Errorf("expected 'type GetViewer_Locale_LanguageResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "type Viewer_Locale_LanguageResponse {") {
+		t.Errorf("expected 'type Viewer_Locale_LanguageResponse', got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "type GetViewer_Locale_CurrencyResponse {") {
-		t.Errorf("expected 'type GetViewer_Locale_CurrencyResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "type Viewer_Locale_CurrencyResponse {") {
+		t.Errorf("expected 'type Viewer_Locale_CurrencyResponse', got:\n%s", sdl)
 	}
 }
 
@@ -837,11 +844,11 @@ func TestGenerator_Phase2_NestedArray(t *testing.T) {
 	}
 
 	sdl := string(out)
-	if !strings.Contains(sdl, "posts: [GetUser_PostsResponse]") {
-		t.Errorf("expected 'posts: [GetUser_PostsResponse]', got:\n%s", sdl)
+	if !strings.Contains(sdl, "posts: [User_PostsResponse]") {
+		t.Errorf("expected 'posts: [User_PostsResponse]', got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "type GetUser_PostsResponse {") {
-		t.Errorf("expected 'type GetUser_PostsResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "type User_PostsResponse {") {
+		t.Errorf("expected 'type User_PostsResponse', got:\n%s", sdl)
 	}
 	if !strings.Contains(sdl, "title: String") {
 		t.Errorf("expected 'title: String' in nested array type, got:\n%s", sdl)
@@ -869,11 +876,11 @@ func TestGenerator_Phase2_NamedFragmentWithNesting(t *testing.T) {
 	}
 
 	sdl := string(out)
-	if !strings.Contains(sdl, "profile: GetUser_ProfileResponse") {
-		t.Errorf("expected 'profile: GetUser_ProfileResponse' from fragment, got:\n%s", sdl)
+	if !strings.Contains(sdl, "profile: User_ProfileResponse") {
+		t.Errorf("expected 'profile: User_ProfileResponse' from fragment, got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "type GetUser_ProfileResponse {") {
-		t.Errorf("expected 'type GetUser_ProfileResponse', got:\n%s", sdl)
+	if !strings.Contains(sdl, "type User_ProfileResponse {") {
+		t.Errorf("expected 'type User_ProfileResponse', got:\n%s", sdl)
 	}
 	if !strings.Contains(sdl, "bio: String") {
 		t.Errorf("expected 'bio: String' in nested type from fragment, got:\n%s", sdl)
@@ -912,7 +919,7 @@ func TestGenerator_Phase2_TypenameFiltered(t *testing.T) {
 	}
 }
 
-func TestGenerator_Phase2_DisambiguationWithNesting(t *testing.T) {
+func TestGenerator_Phase2_MergedFieldsWithNesting(t *testing.T) {
 	g := &Generator{}
 	endpoints := []classify.ClassifiedRequest{
 		{
@@ -944,34 +951,80 @@ func TestGenerator_Phase2_DisambiguationWithNesting(t *testing.T) {
 
 	sdl := string(out)
 
-	// First op keeps bare "viewer" field, nested types use op name "StoredPassengers"
-	if !strings.Contains(sdl, "passengers: [StoredPassengers_PassengersResponse]") {
-		t.Errorf("expected 'passengers: [StoredPassengers_PassengersResponse]', got:\n%s", sdl)
-	}
-	if !strings.Contains(sdl, "type StoredPassengers_PassengersResponse {") {
-		t.Errorf("expected 'type StoredPassengers_PassengersResponse', got:\n%s", sdl)
+	// Should have a single "viewer" field (merged, not disambiguated)
+	if strings.Contains(sdl, "viewer_FareLocksTabQuery") {
+		t.Errorf("should not have disambiguated field — operations should be merged, got:\n%s", sdl)
 	}
 
-	// Second op gets disambiguated field "viewer_FareLocksTabQuery", nested types use op name "FareLocksTabQuery"
-	if !strings.Contains(sdl, "viewer_FareLocksTabQuery") {
-		t.Errorf("expected disambiguated field 'viewer_FareLocksTabQuery', got:\n%s", sdl)
-	}
-	if !strings.Contains(sdl, "fareLocks: [FareLocksTabQuery_FareLocksResponse]") {
-		t.Errorf("expected 'fareLocks: [FareLocksTabQuery_FareLocksResponse]', got:\n%s", sdl)
-	}
-	if !strings.Contains(sdl, "type FareLocksTabQuery_FareLocksResponse {") {
-		t.Errorf("expected 'type FareLocksTabQuery_FareLocksResponse', got:\n%s", sdl)
+	// Merged ViewerResponse should contain fields from both operations
+	if !strings.Contains(sdl, "type ViewerResponse {") {
+		t.Errorf("expected 'type ViewerResponse', got:\n%s", sdl)
 	}
 
-	// Assert no cascading rename — no type name should exceed 100 characters
-	for _, line := range strings.Split(sdl, "\n") {
-		if strings.HasPrefix(line, "type ") {
-			typeName := strings.TrimPrefix(line, "type ")
-			typeName = strings.TrimSuffix(typeName, " {")
-			if len(typeName) > 100 {
-				t.Errorf("type name too long (%d chars): %s", len(typeName), typeName)
-			}
-		}
+	// Both nested types should use Viewer_ prefix (field-name based)
+	if !strings.Contains(sdl, "passengers: [Viewer_PassengersResponse]") {
+		t.Errorf("expected 'passengers: [Viewer_PassengersResponse]', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "type Viewer_PassengersResponse {") {
+		t.Errorf("expected 'type Viewer_PassengersResponse', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "fareLocks: [Viewer_FareLocksResponse]") {
+		t.Errorf("expected 'fareLocks: [Viewer_FareLocksResponse]', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "type Viewer_FareLocksResponse {") {
+		t.Errorf("expected 'type Viewer_FareLocksResponse', got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_MergedArgs(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query SearchA($term: String!) { search(term: $term) { id } }","variables":{"term":"hello"}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"search":{"id":"1"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query SearchB($term: String!, $limit: Int) { search(term: $term, limit: $limit) { id title } }","variables":{"term":"world","limit":10}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"search":{"id":"2","title":"Result"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+
+	// Should have a single "search" field with merged args from both operations
+	if !strings.Contains(sdl, "term: String!") {
+		t.Errorf("expected 'term: String!' from first operation, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "limit: Int") {
+		t.Errorf("expected 'limit: Int' from second operation, got:\n%s", sdl)
+	}
+	// Should NOT have disambiguated fields
+	if strings.Contains(sdl, "search_SearchB") {
+		t.Errorf("should not have disambiguated field — operations should be merged, got:\n%s", sdl)
+	}
+	// Merged response should contain fields from both operations
+	if !strings.Contains(sdl, "id: String") {
+		t.Errorf("expected 'id: String' in merged response, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "title: String") {
+		t.Errorf("expected 'title: String' from second operation in merged response, got:\n%s", sdl)
 	}
 }
 

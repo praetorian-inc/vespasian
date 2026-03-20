@@ -46,8 +46,7 @@ type inferredOperation struct {
 	Args           map[string]string // argument name -> type
 	ReturnType     string            // inferred return type name
 	IsList         bool              // whether the return type is a list
-	TypePrefix     string            // prefix used for nested type names (op name when available)
-	ResponseFields map[string]string // fields for the root synthetic type (created after disambiguation)
+	ResponseFields map[string]string // fields for the root synthetic type
 }
 
 // inferredType holds a synthetic type inferred from response data.
@@ -88,49 +87,60 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 		grouped[op.OpType] = append(grouped[op.OpType], op)
 	}
 
-	// Disambiguate field name collisions within each operation type
+	// Merge operations with the same root field name within each operation type
 	for opType, groupOps := range grouped {
-		fieldCount := make(map[string]int)
-		for _, op := range groupOps {
-			fieldCount[op.FieldName]++
-		}
+		merged := make(map[string]*inferredOperation) // fieldName -> merged op
+		var order []string                             // preserve first-seen order
 
-		fieldSeen := make(map[string]bool)
-		for i, op := range groupOps {
-			if fieldCount[op.FieldName] > 1 {
-				if !fieldSeen[op.FieldName] {
-					// First occurrence keeps the bare name
-					fieldSeen[op.FieldName] = true
-				} else {
-					// Subsequent occurrences get a suffix from the operation name
-					suffix := op.OpName
-					if suffix == "" {
-						suffix = fmt.Sprintf("variant%d", i)
+		for i := range groupOps {
+			op := &groupOps[i]
+			if existing, ok := merged[op.FieldName]; ok {
+				// Merge args (add new args, keep existing)
+				for k, v := range op.Args {
+					if _, exists := existing.Args[k]; !exists {
+						existing.Args[k] = v
 					}
-					newFieldName := op.FieldName + "_" + suffix
-					newReturnType := upperFirst(newFieldName) + "Response"
-					// Only rename the root type — nested types use op-name prefix
-					// and don't collide across operations
-					if st, ok := syntheticTypes[op.ReturnType]; ok {
-						delete(syntheticTypes, op.ReturnType)
-						st.Name = newReturnType
-						syntheticTypes[newReturnType] = st
-					}
-					groupOps[i].FieldName = newFieldName
-					groupOps[i].ReturnType = newReturnType
 				}
+				// Merge response fields
+				for k, v := range op.ResponseFields {
+					if _, exists := existing.ResponseFields[k]; !exists {
+						existing.ResponseFields[k] = v
+					}
+				}
+				// Upgrade to list if any operation shows it as a list
+				if op.IsList {
+					existing.IsList = true
+				}
+			} else {
+				merged[op.FieldName] = op
+				order = append(order, op.FieldName)
 			}
 		}
-		grouped[opType] = groupOps
+
+		// Rebuild groupOps from merged map in original order
+		var mergedOps []inferredOperation
+		for _, name := range order {
+			mergedOps = append(mergedOps, *merged[name])
+		}
+		grouped[opType] = mergedOps
 	}
 
-	// Create root synthetic types after disambiguation to avoid map collisions
+	// Create root synthetic types from merged operations
 	for _, groupOps := range grouped {
 		for _, op := range groupOps {
 			if len(op.ResponseFields) > 0 {
-				syntheticTypes[op.ReturnType] = &inferredType{
-					Name:   op.ReturnType,
-					Fields: op.ResponseFields,
+				if existing, ok := syntheticTypes[op.ReturnType]; ok {
+					// Merge fields into existing type
+					for k, v := range op.ResponseFields {
+						if _, exists := existing.Fields[k]; !exists {
+							existing.Fields[k] = v
+						}
+					}
+				} else {
+					syntheticTypes[op.ReturnType] = &inferredType{
+						Name:   op.ReturnType,
+						Fields: op.ResponseFields,
+					}
 				}
 			}
 		}
@@ -257,9 +267,6 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 
 	returnTypeName := upperFirst(fieldName) + "Response"
 	typePrefix := upperFirst(fieldName)
-	if parsed.opName != "" {
-		typePrefix = parsed.opName
-	}
 
 	responseObj, isList, responseOK := unwrapResponseValue(ep.Response.Body, fieldName)
 	var responseFields map[string]string
@@ -276,7 +283,6 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 		Args:           args,
 		ReturnType:     returnTypeName,
 		IsList:         isList,
-		TypePrefix:     typePrefix,
 		ResponseFields: responseFields,
 	}, true
 }
@@ -497,9 +503,17 @@ func inferFieldsRecursive(
 		nestedFields := inferFieldsRecursive(nestedObj, node.Children, typePrefix+"_"+upperFirst(node.Name), syntheticTypes)
 
 		if len(nestedFields) > 0 {
-			syntheticTypes[nestedTypeName] = &inferredType{
-				Name:   nestedTypeName,
-				Fields: nestedFields,
+			if existing, ok := syntheticTypes[nestedTypeName]; ok {
+				for k, v := range nestedFields {
+					if _, exists := existing.Fields[k]; !exists {
+						existing.Fields[k] = v
+					}
+				}
+			} else {
+				syntheticTypes[nestedTypeName] = &inferredType{
+					Name:   nestedTypeName,
+					Fields: nestedFields,
+				}
 			}
 		}
 
