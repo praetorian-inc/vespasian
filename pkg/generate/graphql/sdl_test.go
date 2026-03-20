@@ -812,14 +812,61 @@ func TestGenerator_Phase2_InlineFragmentMerging(t *testing.T) {
 	}
 
 	sdl := string(out)
+	// Mixed case: direct field "id" + inline fragments should produce a union
+	if !strings.Contains(sdl, "union UserResult = Admin | Member") && !strings.Contains(sdl, "union UserResult = Member | Admin") {
+		t.Errorf("expected 'union UserResult = Admin | Member', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "type Admin {") {
+		t.Errorf("expected 'type Admin' union member, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "type Member {") {
+		t.Errorf("expected 'type Member' union member, got:\n%s", sdl)
+	}
+	// Common field "id" should be merged into each union member
 	if !strings.Contains(sdl, "role: String") {
-		t.Errorf("expected 'role: String' from inline fragment, got:\n%s", sdl)
+		t.Errorf("expected 'role: String' in Admin type, got:\n%s", sdl)
 	}
 	if !strings.Contains(sdl, "level: String") {
-		t.Errorf("expected 'level: String' from inline fragment, got:\n%s", sdl)
+		t.Errorf("expected 'level: String' in Member type, got:\n%s", sdl)
 	}
-	if !strings.Contains(sdl, "id: String") {
-		t.Errorf("expected 'id: String', got:\n%s", sdl)
+}
+
+func TestGenerator_Phase2_NestedMixedInlineFragments(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query GetOrder { order { item { name ... on BookItem { isbn } ... on FoodItem { calories } } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"order":{"item":{"name":"Test","isbn":"123-456"}}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Nested field "item" has direct field "name" + inline fragments → union
+	if !strings.Contains(sdl, "union Order_ItemResult = BookItem | FoodItem") && !strings.Contains(sdl, "union Order_ItemResult = FoodItem | BookItem") {
+		t.Errorf("expected 'union Order_ItemResult = BookItem | FoodItem', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "type BookItem {") {
+		t.Errorf("expected 'type BookItem', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "type FoodItem {") {
+		t.Errorf("expected 'type FoodItem', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "isbn: String") {
+		t.Errorf("expected 'isbn: String' in BookItem, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "calories: String") {
+		t.Errorf("expected 'calories: String' in FoodItem, got:\n%s", sdl)
 	}
 }
 

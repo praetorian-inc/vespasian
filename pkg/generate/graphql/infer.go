@@ -395,7 +395,7 @@ func processParsedQuery(parsed *parsedQuery, ep classify.ClassifiedRequest, body
 	responseObj, isList, responseOK := unwrapResponseValue(ep.Response.Body, fieldName)
 	var responseFields map[string]string
 
-	if len(parsed.inlineFragments) >= 1 && !parsed.hasNonFragmentFields {
+	if len(parsed.inlineFragments) >= 1 {
 		// Union type inference from inline fragments
 		unionName := typePrefix + "Result"
 		var memberNames []string
@@ -404,6 +404,15 @@ func processParsedQuery(parsed *parsedQuery, ep classify.ClassifiedRequest, body
 		mergedObj := mergeArrayElements(ep.Response.Body, fieldName)
 		if mergedObj == nil {
 			mergedObj = responseObj
+		}
+
+		// Mixed case: merge common (direct) fields into each fragment's selection tree
+		if parsed.hasNonFragmentFields && len(parsed.selectionTree) > 0 {
+			for i := range parsed.inlineFragments {
+				parsed.inlineFragments[i].SelectionTree = mergeSelectionNodes(
+					parsed.inlineFragments[i].SelectionTree, parsed.selectionTree,
+				)
+			}
 		}
 
 		for _, frag := range parsed.inlineFragments {
@@ -518,6 +527,16 @@ func parseQueryAST(query string) []*parsedQuery {
 
 	var results []*parsedQuery
 	for _, field := range rootFields {
+		frags := collectInlineFragments(field.SelectionSet, doc.Fragments)
+		hasDirect := hasTopLevelFields(field.SelectionSet)
+		var tree []*selectionNode
+		if len(frags) > 0 && hasDirect {
+			// Mixed case: only collect direct fields for selectionTree;
+			// type-conditioned content stays in inlineFragments only.
+			tree = collectDirectFieldNodes(field.SelectionSet, doc.Fragments)
+		} else {
+			tree = collectSelectionTree(field.SelectionSet, doc.Fragments)
+		}
 		result := &parsedQuery{
 			opType:               op.Operation,
 			opName:               op.Name,
@@ -525,9 +544,9 @@ func parseQueryAST(query string) []*parsedQuery {
 			rootFieldName:        field.Name,
 			rootFieldArgs:        field.Arguments,
 			selectionFields:      collectSelectionFields(field.SelectionSet, doc.Fragments),
-			selectionTree:        collectSelectionTree(field.SelectionSet, doc.Fragments),
-			inlineFragments:      collectInlineFragments(field.SelectionSet, doc.Fragments),
-			hasNonFragmentFields: hasTopLevelFields(field.SelectionSet),
+			selectionTree:        tree,
+			inlineFragments:      frags,
+			hasNonFragmentFields: hasDirect,
 		}
 		results = append(results, result)
 	}
@@ -663,6 +682,10 @@ func collectSelectionTree(selections ast.SelectionSet, fragments ast.FragmentDef
 				if len(subFrags) > 0 && !hasDirectFields {
 					// Pure union/interface pattern: don't flatten into children
 					children = nil
+				} else if len(subFrags) > 0 {
+					// Mixed case: only collect direct (non-typed) fields as children.
+					// Type-conditioned content stays in InlineFragments only.
+					children = collectDirectFieldNodes(s.SelectionSet, fragments)
 				} else {
 					children = collectSelectionTree(s.SelectionSet, fragments)
 				}
@@ -1019,8 +1042,8 @@ func inferFieldsRecursive(
 			}
 		}
 
-		// Sub-field union/interface pattern: inline fragments without direct fields
-		if len(node.InlineFragments) > 0 && !node.HasDirectFields {
+		// Sub-field union/interface pattern: inline fragments (with or without direct fields)
+		if len(node.InlineFragments) > 0 {
 			unionName := typePrefix + "_" + upperFirst(node.Name) + "Result"
 			var memberNames []string
 
@@ -1037,6 +1060,16 @@ func inferFieldsRecursive(
 						// Merge all array elements for richer type inference
 						nestedObj = mergeArrayElementsRaw(rv)
 					}
+				}
+			}
+
+			// Mixed case: merge common (direct) fields into each fragment's selection tree
+			// so union member types include the shared fields alongside their type-specific fields
+			if node.HasDirectFields && node.Children != nil {
+				for i := range node.InlineFragments {
+					node.InlineFragments[i].SelectionTree = mergeSelectionNodes(
+						node.InlineFragments[i].SelectionTree, node.Children,
+					)
 				}
 			}
 
