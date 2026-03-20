@@ -383,7 +383,7 @@ func processParsedQuery(parsed *parsedQuery, ep classify.ClassifiedRequest, body
 	responseObj, isList, responseOK := unwrapResponseValue(ep.Response.Body, fieldName)
 	var responseFields map[string]string
 
-	if len(parsed.inlineFragments) >= 2 && !parsed.hasNonFragmentFields {
+	if len(parsed.inlineFragments) >= 1 && !parsed.hasNonFragmentFields {
 		// Union type inference from inline fragments
 		unionName := typePrefix + "Result"
 		var memberNames []string
@@ -644,11 +644,34 @@ func collectInlineFragments(selections ast.SelectionSet, fragments ast.FragmentD
 			}
 		case *ast.FragmentSpread:
 			if frag := fragments.ForName(s.Name); frag != nil {
+				// Check for nested inline fragments within the named fragment
 				nested := collectInlineFragments(frag.SelectionSet, fragments)
-				for _, n := range nested {
-					if !seen[n.TypeName] {
-						seen[n.TypeName] = true
-						frags = append(frags, n)
+				if len(nested) > 0 {
+					// Fragment contains type-narrowing inline fragments (e.g., fragment X on Viewer { ... on User { ... } })
+					// Only extract the nested fragments — the outer fragment is on the parent type, not a union member
+					for _, n := range nested {
+						if !seen[n.TypeName] {
+							seen[n.TypeName] = true
+							frags = append(frags, n)
+						}
+					}
+				} else if frag.TypeCondition != "" && !seen[frag.TypeCondition] {
+					// Fragment has no nested inline fragments and has substantive fields —
+					// treat it as a typed fragment (e.g., fragment UserFields on User { id profile { bio } }).
+					tree := collectSelectionTree(frag.SelectionSet, fragments)
+					hasSubstantiveFields := false
+					for _, node := range tree {
+						if !isMetaField(node.Name) {
+							hasSubstantiveFields = true
+							break
+						}
+					}
+					if hasSubstantiveFields {
+						seen[frag.TypeCondition] = true
+						frags = append(frags, inlineFragmentInfo{
+							TypeName:      frag.TypeCondition,
+							SelectionTree: tree,
+						})
 					}
 				}
 			}

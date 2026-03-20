@@ -1942,3 +1942,206 @@ func TestGenerator_Phase2_UploadScalarDeclared(t *testing.T) {
 		t.Errorf("expected 'scalar Upload' declaration, got:\n%s", sdl)
 	}
 }
+
+func TestGenerator_Phase2_SingleInlineFragmentUnionPath(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query GetViewer { viewer { __typename ... on User { travelers { name } } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"viewer":{"__typename":"User","travelers":[{"name":"Alice"}]}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Single inline fragment should create union path with correct type
+	if !strings.Contains(sdl, "union ViewerResult = User") {
+		t.Errorf("expected 'union ViewerResult = User', got:\n%s", sdl)
+	}
+	// Fields should be on User, not on a generic ViewerResponse
+	if !strings.Contains(sdl, "type User {") {
+		t.Errorf("expected 'type User', got:\n%s", sdl)
+	}
+	// Nested types should use User_ prefix, not Viewer_
+	if !strings.Contains(sdl, "travelers: [User_TravelersResponse]") {
+		t.Errorf("expected 'travelers: [User_TravelersResponse]', got:\n%s", sdl)
+	}
+	// Should NOT have ViewerResponse type
+	if strings.Contains(sdl, "type ViewerResponse") {
+		t.Errorf("should not have 'type ViewerResponse', got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_NamedFragmentSpreadUnionPath(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query GetViewer { viewer { ...ViewerFields } } fragment ViewerFields on User { unfinishedBooking { status } cards { last4 } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"viewer":{"unfinishedBooking":{"status":"pending"},"cards":[{"last4":"1234"}]}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Named fragment with TypeCondition should create union with correct member type
+	if !strings.Contains(sdl, "union ViewerResult = User") {
+		t.Errorf("expected 'union ViewerResult = User', got:\n%s", sdl)
+	}
+	// Fields should be on User type
+	if !strings.Contains(sdl, "type User {") {
+		t.Errorf("expected 'type User', got:\n%s", sdl)
+	}
+	// Nested types should use User_ prefix
+	if !strings.Contains(sdl, "unfinishedBooking: User_UnfinishedBookingResponse") {
+		t.Errorf("expected 'unfinishedBooking: User_UnfinishedBookingResponse', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "cards: [User_CardsResponse]") {
+		t.Errorf("expected 'cards: [User_CardsResponse]', got:\n%s", sdl)
+	}
+	// Should NOT have ViewerResponse
+	if strings.Contains(sdl, "type ViewerResponse") {
+		t.Errorf("should not have 'type ViewerResponse', got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_MixedSingleAndMultiFragmentOps(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		// Multi-fragment operation: creates union ViewerResult = Unauthorized | User
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query Op1 { viewer { ... on Unauthorized { reason } ... on User { name } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"viewer":{"name":"Alice"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+		// Single-fragment operation: should merge into existing union
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query Op2 { viewer { ... on User { travelers { name } wallet { balance } } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"viewer":{"travelers":[{"name":"Bob"}],"wallet":{"balance":"100"}}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Union should exist with both members
+	if !strings.Contains(sdl, "union ViewerResult") {
+		t.Errorf("expected 'union ViewerResult', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "Unauthorized") {
+		t.Errorf("expected 'Unauthorized' in union, got:\n%s", sdl)
+	}
+	// User should have fields from BOTH operations
+	if !strings.Contains(sdl, "name: String") {
+		t.Errorf("expected 'name: String' on User, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "travelers: [User_TravelersResponse]") {
+		t.Errorf("expected 'travelers: [User_TravelersResponse]' on User, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "wallet: User_WalletResponse") {
+		t.Errorf("expected 'wallet: User_WalletResponse' on User, got:\n%s", sdl)
+	}
+	// Unauthorized should only have reason
+	if !strings.Contains(sdl, "reason: String") {
+		t.Errorf("expected 'reason: String' on Unauthorized, got:\n%s", sdl)
+	}
+	// Should NOT have ViewerResponse
+	if strings.Contains(sdl, "type ViewerResponse") {
+		t.Errorf("should not have 'type ViewerResponse', got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_MultipleSingleFragmentOpsAccumulate(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query Op1 { viewer { ... on User { name } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"viewer":{"name":"Alice"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query Op2 { viewer { ... on User { email } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"viewer":{"email":"alice@example.com"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query Op3 { viewer { ... on User { locale } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"viewer":{"locale":"en-US"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// All three operations should create/merge into same union
+	if !strings.Contains(sdl, "union ViewerResult = User") {
+		t.Errorf("expected 'union ViewerResult = User', got:\n%s", sdl)
+	}
+	// User should accumulate fields from all three operations
+	if !strings.Contains(sdl, "name: String") {
+		t.Errorf("expected 'name: String' from Op1, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "email: String") {
+		t.Errorf("expected 'email: String' from Op2, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "locale: String") {
+		t.Errorf("expected 'locale: String' from Op3, got:\n%s", sdl)
+	}
+	// Should be exactly one User type
+	userTypeCount := strings.Count(sdl, "type User {")
+	if userTypeCount != 1 {
+		t.Errorf("expected exactly 1 'type User {', got %d in:\n%s", userTypeCount, sdl)
+	}
+}
