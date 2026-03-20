@@ -591,6 +591,42 @@ func TestMapResult_JsluiceTagAndAttribute(t *testing.T) {
 			name:      "empty tag and attribute",
 			tag:       "",
 			attribute: "",
+		}
+	}
+}
+
+// TestMapResult_LowercaseContentType tests that MapResult extracts ContentType
+// from lowercase header keys, as Katana normalizes response headers to lowercase.
+func TestMapResult_LowercaseContentType(t *testing.T) {
+	tests := []struct {
+		name            string
+		headers         navigation.Headers
+		wantContentType string
+	}{
+		{
+			name:            "lowercase content-type from Katana",
+			headers:         navigation.Headers{"content-type": "application/json"},
+			wantContentType: "application/json",
+		},
+		{
+			name:            "title-case Content-Type",
+			headers:         navigation.Headers{"Content-Type": "text/html"},
+			wantContentType: "text/html",
+		},
+		{
+			name:            "uppercase CONTENT-TYPE",
+			headers:         navigation.Headers{"CONTENT-TYPE": "application/xml"},
+			wantContentType: "application/xml",
+		},
+		{
+			name:            "no content-type header",
+			headers:         navigation.Headers{"X-Custom": "value"},
+			wantContentType: "",
+		},
+		{
+			name:            "empty headers",
+			headers:         navigation.Headers{},
+			wantContentType: "",
 		},
 	}
 
@@ -606,16 +642,18 @@ func TestMapResult_JsluiceTagAndAttribute(t *testing.T) {
 				},
 				Response: &navigation.Response{
 					StatusCode: 200,
+
 				},
 			}
 
 			observed := MapResult(result)
-
+			
 			if observed.Tag != tt.tag {
 				t.Errorf("Tag = %q, want %q", observed.Tag, tt.tag)
 			}
 			if observed.Attribute != tt.attribute {
 				t.Errorf("Attribute = %q, want %q", observed.Attribute, tt.attribute)
+
 			}
 		})
 	}

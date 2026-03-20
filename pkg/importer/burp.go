@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"golang.org/x/net/html/charset"
 )
 
 const (
@@ -35,16 +36,6 @@ var (
 	validHTTPMethods = map[string]bool{
 		"GET": true, "POST": true, "PUT": true, "DELETE": true,
 		"PATCH": true, "HEAD": true, "OPTIONS": true, "TRACE": true, "CONNECT": true,
-	}
-
-	xxeDOCTYPEPatterns = [][]byte{
-		[]byte("<!DOCTYPE"), []byte("<!doctype"), []byte("<!Doctype"),
-		[]byte("<!DocType"), []byte("<!DOctype"), []byte("<!dOCTYPE"),
-	}
-
-	xxeENTITYPatterns = [][]byte{
-		[]byte("<!ENTITY"), []byte("<!entity"), []byte("<!Entity"),
-		[]byte("<!EnTiTy"), []byte("<!ENtity"), []byte("<!eNTITY"),
 	}
 )
 
@@ -73,27 +64,11 @@ func (BurpImporter) Name() string {
 	return "burp"
 }
 
-// containsXXEPatterns checks for XXE attack vectors in XML data.
-func containsXXEPatterns(data []byte) bool {
-	for _, pattern := range xxeDOCTYPEPatterns {
-		if bytes.Contains(data, pattern) {
-			return true
-		}
-	}
-	for _, pattern := range xxeENTITYPatterns {
-		if bytes.Contains(data, pattern) {
-			return true
-		}
-	}
-	return false
-}
-
 // Import reads Burp Suite XML and converts to ObservedRequest format.
 func (i *BurpImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
 	// Limit reader to prevent resource exhaustion
 	limitedReader := newLimitedReader(r, maxImportSize)
 
-	// Read all content to check for entity declarations
 	data, err := io.ReadAll(limitedReader)
 	if err != nil {
 		return nil, fmt.Errorf("burp importer: failed to read input: %w", err)
@@ -104,14 +79,10 @@ func (i *BurpImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
 		return nil, ErrFileTooLarge
 	}
 
-	// Check for DOCTYPE or ENTITY declarations (XXE attack vectors)
-	if containsXXEPatterns(data) {
-		return nil, fmt.Errorf("burp importer: XML validation: DOCTYPE or ENTITY declarations not allowed")
-	}
-
 	var items burpItems
 	decoder := xml.NewDecoder(bytes.NewReader(data))
 	decoder.Strict = true
+	decoder.CharsetReader = charset.NewReaderLabel
 	if err := decoder.Decode(&items); err != nil {
 		return nil, fmt.Errorf("burp importer: failed to decode XML: %w", err)
 	}
@@ -145,6 +116,22 @@ func (i *BurpImporter) parseItem(item burpItem) (crawl.ObservedRequest, error) {
 	method, headers, body, err := parseHTTPRequest(reqBytes)
 	if err != nil {
 		return crawl.ObservedRequest{}, fmt.Errorf("failed to parse request: %w", err)
+	}
+
+	// Handle empty response data (e.g., timeouts, connection resets)
+	if len(respBytes) == 0 {
+		return crawl.ObservedRequest{
+			Method:      method,
+			URL:         item.URL,
+			Headers:     headers,
+			QueryParams: extractQueryParams(item.URL),
+			Body:        body,
+			Response: crawl.ObservedResponse{
+				StatusCode: item.Status,
+				Headers:    map[string]string{},
+			},
+			Source: "import:burp",
+		}, nil
 	}
 
 	// Parse HTTP response
