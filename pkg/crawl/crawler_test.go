@@ -591,7 +591,32 @@ func TestMapResult_JsluiceTagAndAttribute(t *testing.T) {
 			name:      "empty tag and attribute",
 			tag:       "",
 			attribute: "",
-		}
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := output.Result{
+				Request: &navigation.Request{
+					Method:    "GET",
+					URL:       "https://example.com/api/endpoint",
+					Source:    "crawler",
+					Tag:       tt.tag,
+					Attribute: tt.attribute,
+				},
+				Response: &navigation.Response{
+					StatusCode: 200,
+				},
+			}
+
+			observed := MapResult(result)
+			if observed.Tag != tt.tag {
+				t.Errorf("Tag = %q, want %q", observed.Tag, tt.tag)
+			}
+			if observed.Attribute != tt.attribute {
+				t.Errorf("Attribute = %q, want %q", observed.Attribute, tt.attribute)
+			}
+		})
 	}
 }
 
@@ -634,26 +659,19 @@ func TestMapResult_LowercaseContentType(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := output.Result{
 				Request: &navigation.Request{
-					Method:    "GET",
-					URL:       "https://example.com/api/endpoint",
-					Source:    "crawler",
-					Tag:       tt.tag,
-					Attribute: tt.attribute,
+					Method: "GET",
+					URL:    "https://example.com/api/data",
 				},
 				Response: &navigation.Response{
 					StatusCode: 200,
-
+					Headers:    tt.headers,
+					Body:       "response",
 				},
 			}
 
 			observed := MapResult(result)
-			
-			if observed.Tag != tt.tag {
-				t.Errorf("Tag = %q, want %q", observed.Tag, tt.tag)
-			}
-			if observed.Attribute != tt.attribute {
-				t.Errorf("Attribute = %q, want %q", observed.Attribute, tt.attribute)
-
+			if observed.Response.ContentType != tt.wantContentType {
+				t.Errorf("ContentType = %q, want %q", observed.Response.ContentType, tt.wantContentType)
 			}
 		})
 	}

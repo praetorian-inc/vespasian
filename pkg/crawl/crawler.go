@@ -132,15 +132,15 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		// Katana needs the full body for link extraction and JS parsing to maximize
 		// crawl coverage; we only retain MaxResponseBodySize for classification.
 		// Peak memory: up to Concurrency × BodyReadSize (100 MB with 10 workers).
-		BodyReadSize:      10 * 1024 * 1024,
-		Concurrency:       10,
-		Parallelism:       10,
-		RateLimit:         150,
-		TimeStable:        3, // seconds to wait for DOM stability; 0 causes go-rod panic in time.NewTicker
-		ScrapeJSResponses: true,
+		BodyReadSize:           10 * 1024 * 1024,
+		Concurrency:            10,
+		Parallelism:            10,
+		RateLimit:              150,
+		TimeStable:             3, // seconds to wait for DOM stability; 0 causes go-rod panic in time.NewTicker
+		ScrapeJSResponses:      true,
 		ScrapeJSLuiceResponses: true,
-		XhrExtraction:     true,
-		Silent:            true,
+		XhrExtraction:          true,
+		Silent:                 true,
 		OnResult: func(result output.Result) {
 			// Map result outside the lock — MapResult may do URL parsing
 			// and body truncation, which is wasted work under contention.
