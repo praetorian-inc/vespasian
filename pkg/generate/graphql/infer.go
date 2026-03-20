@@ -371,8 +371,10 @@ func processParsedQuery(parsed *parsedQuery, ep classify.ClassifiedRequest, body
 		fieldName = fmt.Sprintf("anonymous%d", *anonCounter)
 	}
 
-	// Deduplicate by composite key incorporating operation name
-	dedupKey := opType + ":" + fieldName + ":" + parsed.opName
+	// Deduplicate by composite key incorporating operation name and selection fingerprint.
+	// The fingerprint ensures different queries with the same opName are not collapsed.
+	selFP := selectionFingerprint(parsed.selectionFields)
+	dedupKey := opType + ":" + fieldName + ":" + parsed.opName + ":" + selFP
 	if seen[dedupKey] {
 		return inferredOperation{}, false
 	}
@@ -465,8 +467,9 @@ func processParsedQuery(parsed *parsedQuery, ep classify.ClassifiedRequest, body
 // selectionNode represents a field in a nested selection tree.
 type selectionNode struct {
 	Name            string
-	Children        []*selectionNode   // nil = leaf (scalar), non-nil = object with sub-fields
-	Arguments       []*ast.Argument    // field-level arguments from the query AST
+	Aliases         []string             // aliases used for this field in queries (for response data lookup)
+	Children        []*selectionNode     // nil = leaf (scalar), non-nil = object with sub-fields
+	Arguments       []*ast.Argument      // field-level arguments from the query AST
 	InlineFragments []inlineFragmentInfo // inline fragments with type conditions on this sub-field
 	HasDirectFields bool                 // true if this field has direct field selections alongside inline fragments
 }
@@ -509,6 +512,10 @@ func parseQueryAST(query string) []*parsedQuery {
 		return nil
 	}
 
+	// Merge duplicate root fields (e.g., multiple fragment spreads contributing the same
+	// field name like "viewer") so all selection sets and arguments are combined.
+	rootFields = mergeRootFieldsByName(rootFields)
+
 	var results []*parsedQuery
 	for _, field := range rootFields {
 		result := &parsedQuery{
@@ -545,6 +552,36 @@ func resolveAllFields(selections ast.SelectionSet, fragments ast.FragmentDefinit
 		}
 	}
 	return fields
+}
+
+// mergeRootFieldsByName groups root fields by name and merges their SelectionSets
+// and Arguments. This handles queries where multiple fragment spreads contribute
+// different selection sets for the same root field (e.g., "viewer").
+func mergeRootFieldsByName(fields []*ast.Field) []*ast.Field {
+	seen := make(map[string]int)
+	var result []*ast.Field
+	for _, f := range fields {
+		if idx, ok := seen[f.Name]; ok {
+			result[idx].SelectionSet = append(result[idx].SelectionSet, f.SelectionSet...)
+			// Union-merge arguments by name
+			for _, newArg := range f.Arguments {
+				found := false
+				for _, ea := range result[idx].Arguments {
+					if ea.Name == newArg.Name {
+						found = true
+						break
+					}
+				}
+				if !found {
+					result[idx].Arguments = append(result[idx].Arguments, newArg)
+				}
+			}
+		} else {
+			seen[f.Name] = len(result)
+			result = append(result, f)
+		}
+	}
+	return result
 }
 
 // resolveFirstField walks a selection set to find the first concrete *ast.Field,
@@ -588,6 +625,15 @@ func collectSelectionFields(selections ast.SelectionSet, fragments ast.FragmentD
 		}
 	}
 	return fields
+}
+
+// selectionFingerprint returns a deterministic string fingerprint for a set of field names.
+// Used to distinguish queries with different selection sets but the same operation name.
+func selectionFingerprint(fields []string) string {
+	sorted := make([]string, len(fields))
+	copy(sorted, fields)
+	sort.Strings(sorted)
+	return strings.Join(sorted, ",")
 }
 
 // isMetaField returns true for GraphQL introspection meta-fields like __typename.
@@ -644,10 +690,19 @@ func collectSelectionTree(selections ast.SelectionSet, fragments ast.FragmentDef
 						nodes[idx].Arguments = append(nodes[idx].Arguments, newArg)
 					}
 				}
+				// Track alias for response data lookup
+				if s.Alias != "" && s.Alias != s.Name {
+					nodes[idx].Aliases = appendUnique(nodes[idx].Aliases, s.Alias)
+				}
 			} else {
+				var aliases []string
+				if s.Alias != "" && s.Alias != s.Name {
+					aliases = []string{s.Alias}
+				}
 				seen[s.Name] = len(nodes)
 				nodes = append(nodes, &selectionNode{
 					Name:            s.Name,
+					Aliases:         aliases,
 					Children:        children,
 					Arguments:       s.Arguments,
 					InlineFragments: subFrags,
@@ -694,13 +749,31 @@ func collectInlineFragments(selections ast.SelectionSet, fragments ast.FragmentD
 				nested := collectInlineFragments(frag.SelectionSet, fragments)
 				if len(nested) > 0 {
 					// Fragment contains type-narrowing inline fragments (e.g., fragment X on Viewer { ... on User { ... } })
-					// Only extract the nested fragments — the outer fragment is on the parent type, not a union member
+					// Extract the nested fragments — the outer fragment is on the parent type, not a union member
 					for _, n := range nested {
 						if idx, ok := seen[n.TypeName]; ok {
 							frags[idx].SelectionTree = mergeSelectionNodes(frags[idx].SelectionTree, n.SelectionTree)
 						} else {
 							seen[n.TypeName] = len(frags)
 							frags = append(frags, n)
+						}
+					}
+					// Also collect direct *ast.Field entries from the fragment body
+					// and merge them into the fragment's type condition. This handles
+					// fragments that have both nested inline fragments AND direct fields
+					// (e.g., fragment Wallet_user on User { ...WalletDashboard_user referFriend { ... } })
+					if frag.TypeCondition != "" {
+						directTree := collectDirectFieldNodes(frag.SelectionSet, fragments)
+						if len(directTree) > 0 {
+							if idx, ok := seen[frag.TypeCondition]; ok {
+								frags[idx].SelectionTree = mergeSelectionNodes(frags[idx].SelectionTree, directTree)
+							} else {
+								seen[frag.TypeCondition] = len(frags)
+								frags = append(frags, inlineFragmentInfo{
+									TypeName:      frag.TypeCondition,
+									SelectionTree: directTree,
+								})
+							}
 						}
 					}
 				} else if frag.TypeCondition != "" {
@@ -731,6 +804,22 @@ func collectInlineFragments(selections ast.SelectionSet, fragments ast.FragmentD
 	}
 
 	return frags
+}
+
+// collectDirectFieldNodes extracts only direct *ast.Field entries from a selection set
+// (ignoring inline fragments and fragment spreads) and builds them into selection nodes.
+// Used to capture sibling fields that appear alongside nested inline fragments.
+func collectDirectFieldNodes(selections ast.SelectionSet, fragments ast.FragmentDefinitionList) []*selectionNode {
+	var fieldOnly ast.SelectionSet
+	for _, sel := range selections {
+		if _, ok := sel.(*ast.Field); ok {
+			fieldOnly = append(fieldOnly, sel)
+		}
+	}
+	if len(fieldOnly) == 0 {
+		return nil
+	}
+	return collectSelectionTree(fieldOnly, fragments)
 }
 
 // hasTopLevelFields returns true if a selection set contains direct field selections
@@ -768,6 +857,10 @@ func mergeIntoNodeList(nodes []*selectionNode, seen map[string]int, source []*se
 				if !found {
 					nodes[idx].Arguments = append(nodes[idx].Arguments, newArg)
 				}
+			}
+			// Merge aliases
+			for _, alias := range sn.Aliases {
+				nodes[idx].Aliases = appendUnique(nodes[idx].Aliases, alias)
 			}
 		} else {
 			seen[sn.Name] = len(nodes)
@@ -808,6 +901,10 @@ func mergeSelectionNodes(a, b []*selectionNode) []*selectionNode {
 					merged[idx].Arguments = append(merged[idx].Arguments, newArg)
 				}
 			}
+			// Merge aliases
+			for _, alias := range n.Aliases {
+				merged[idx].Aliases = appendUnique(merged[idx].Aliases, alias)
+			}
 		} else {
 			seen[n.Name] = len(merged)
 			merged = append(merged, n)
@@ -834,6 +931,67 @@ func mergeInlineFragments(a, b []inlineFragmentInfo) []inlineFragmentInfo {
 		}
 	}
 	return merged
+}
+
+// lookupResponseValue looks up a response value by the node's name and any known aliases.
+// When multiple keys match (e.g., aliased and non-aliased versions of the same field),
+// it prefers the richest value — a non-nil map or non-empty slice over nil/empty ones.
+// This ensures aliased fields like `validFareLocks: fareLocks(first:3)` contribute
+// their response data for type inference even when a non-aliased empty variant exists.
+func lookupResponseValue(responseObj map[string]interface{}, node *selectionNode) (interface{}, bool) {
+	var bestVal interface{}
+	found := false
+
+	// Check canonical name
+	if v, ok := responseObj[node.Name]; ok {
+		bestVal = v
+		found = true
+	}
+
+	// Check aliases, preferring richer values
+	for _, alias := range node.Aliases {
+		if alias != node.Name {
+			if v, ok := responseObj[alias]; ok {
+				if !found || isRicherValue(v, bestVal) {
+					bestVal = v
+					found = true
+				}
+			}
+		}
+	}
+
+	return bestVal, found
+}
+
+// isRicherValue returns true if candidate provides more type information than current.
+// A non-nil map or non-empty slice is richer than nil, a scalar, or an empty collection.
+func isRicherValue(candidate, current interface{}) bool {
+	if current == nil {
+		return candidate != nil
+	}
+	switch cv := candidate.(type) {
+	case map[string]interface{}:
+		if cm, ok := current.(map[string]interface{}); ok {
+			return len(cv) > len(cm)
+		}
+		return true // map is richer than scalar/nil
+	case []interface{}:
+		if ca, ok := current.([]interface{}); ok {
+			return len(cv) > len(ca)
+		}
+		return true // non-empty list is richer than scalar/nil
+	}
+	return false
+}
+
+// appendUnique appends a string to a slice only if it is not already present.
+func appendUnique(slice []string, val string) []string {
+	for _, s := range slice {
+		if s == val {
+			return slice
+		}
+	}
+	return append(slice, val)
 }
 
 // inferFieldsRecursive walks the selection tree and response JSON together to build
@@ -870,7 +1028,7 @@ func inferFieldsRecursive(
 			var nestedObj map[string]interface{}
 			isList := false
 			if responseObj != nil {
-				if v, ok := responseObj[node.Name]; ok {
+				if v, ok := lookupResponseValue(responseObj, node); ok {
 					switch rv := v.(type) {
 					case map[string]interface{}:
 						nestedObj = rv
@@ -929,7 +1087,7 @@ func inferFieldsRecursive(
 		if node.Children == nil {
 			// Leaf node: infer scalar type from response
 			if responseObj != nil {
-				if v, ok := responseObj[node.Name]; ok {
+				if v, ok := lookupResponseValue(responseObj, node); ok {
 					fields[node.Name] = inferTypeFromValue(v)
 					continue
 				}
@@ -945,7 +1103,7 @@ func inferFieldsRecursive(
 		var nestedObj map[string]interface{}
 		isList := false
 		if responseObj != nil {
-			if v, ok := responseObj[node.Name]; ok {
+			if v, ok := lookupResponseValue(responseObj, node); ok {
 				switch rv := v.(type) {
 				case map[string]interface{}:
 					nestedObj = rv
