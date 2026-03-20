@@ -51,8 +51,9 @@ type inferredOperation struct {
 
 // inferredType holds a synthetic type inferred from response data.
 type inferredType struct {
-	Name   string
-	Fields map[string]string // field name -> type string
+	Name      string
+	Fields    map[string]string            // field name -> type string
+	FieldArgs map[string]map[string]string // field name -> (arg name -> arg type)
 }
 
 // inferSDL produces a partial SDL from observed GraphQL traffic.
@@ -145,8 +146,9 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 					}
 				} else {
 					syntheticTypes[op.ReturnType] = &inferredType{
-						Name:   op.ReturnType,
-						Fields: op.ResponseFields,
+						Name:      op.ReturnType,
+						Fields:    op.ResponseFields,
+						FieldArgs: make(map[string]map[string]string),
 					}
 				}
 			}
@@ -197,6 +199,14 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 		sort.Strings(fieldNames)
 
 		for _, fn := range fieldNames {
+			if st.FieldArgs != nil {
+				if args, ok := st.FieldArgs[fn]; ok && len(args) > 0 {
+					fmt.Fprintf(&sb, "  %s(", fn)
+					writeArgs(&sb, args)
+					fmt.Fprintf(&sb, "): %s\n", st.Fields[fn])
+					continue
+				}
+			}
 			fmt.Fprintf(&sb, "  %s: %s\n", fn, st.Fields[fn])
 		}
 		sb.WriteString("}\n")
@@ -284,6 +294,12 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 	args := buildArgTypes(parsed, body.Variables, syntheticInputTypes)
 	inferInputTypes(parsed, body.Variables, syntheticInputTypes)
 
+	// Build variable type map for resolving field argument types
+	varTypes := make(map[string]string)
+	for _, vd := range parsed.varDefs {
+		varTypes[vd.Variable] = astTypeToSDL(vd.Type)
+	}
+
 	returnTypeName := upperFirst(fieldName) + "Response"
 	typePrefix := upperFirst(fieldName)
 
@@ -303,7 +319,7 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 
 		for _, frag := range parsed.inlineFragments {
 			memberNames = append(memberNames, frag.TypeName)
-			fragFields := inferFieldsRecursive(mergedObj, frag.SelectionTree, frag.TypeName, syntheticTypes)
+			fragFields := inferFieldsRecursive(mergedObj, frag.SelectionTree, frag.TypeName, syntheticTypes, varTypes, syntheticInputTypes, frag.TypeName)
 			if len(fragFields) > 0 {
 				if existing, ok := syntheticTypes[frag.TypeName]; ok {
 					for k, v := range fragFields {
@@ -313,8 +329,9 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 					}
 				} else {
 					syntheticTypes[frag.TypeName] = &inferredType{
-						Name:   frag.TypeName,
-						Fields: fragFields,
+						Name:      frag.TypeName,
+						Fields:    fragFields,
+						FieldArgs: make(map[string]map[string]string),
 					}
 				}
 			}
@@ -323,13 +340,13 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 		syntheticUnions[unionName] = memberNames
 		returnTypeName = unionName
 	} else if responseOK && responseObj != nil && len(parsed.selectionTree) > 0 {
-		responseFields = inferFieldsRecursive(responseObj, parsed.selectionTree, typePrefix, syntheticTypes)
+		responseFields = inferFieldsRecursive(responseObj, parsed.selectionTree, typePrefix, syntheticTypes, varTypes, syntheticInputTypes, returnTypeName)
 	} else if scalarType, ok := detectScalarReturnType(ep.Response.Body, fieldName); ok {
 		// Fix 1: Scalar root field return
 		returnTypeName = scalarType
 	} else if len(parsed.selectionTree) > 0 {
 		// Fix 4: Response was null/error but we have selection tree — generate type from selection fields
-		responseFields = inferFieldsRecursive(nil, parsed.selectionTree, typePrefix, syntheticTypes)
+		responseFields = inferFieldsRecursive(nil, parsed.selectionTree, typePrefix, syntheticTypes, varTypes, syntheticInputTypes, returnTypeName)
 	} else {
 		// Fallback: existing flat inference
 		responseFields, isList = inferFieldsFromResponse(ep.Response.Body, fieldName, parsed.selectionFields)
@@ -347,8 +364,9 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 
 // selectionNode represents a field in a nested selection tree.
 type selectionNode struct {
-	Name     string
-	Children []*selectionNode // nil = leaf (scalar), non-nil = object with sub-fields
+	Name      string
+	Children  []*selectionNode // nil = leaf (scalar), non-nil = object with sub-fields
+	Arguments []*ast.Argument  // field-level arguments from the query AST
 }
 
 // inlineFragmentInfo holds type condition and selection tree from an inline fragment.
@@ -468,9 +486,13 @@ func collectSelectionTree(selections ast.SelectionSet, fragments ast.FragmentDef
 				if children != nil {
 					nodes[idx].Children = mergeSelectionNodes(nodes[idx].Children, children)
 				}
+				// Merge arguments: keep first non-empty set
+				if len(nodes[idx].Arguments) == 0 && len(s.Arguments) > 0 {
+					nodes[idx].Arguments = s.Arguments
+				}
 			} else {
 				seen[s.Name] = len(nodes)
-				nodes = append(nodes, &selectionNode{Name: s.Name, Children: children})
+				nodes = append(nodes, &selectionNode{Name: s.Name, Children: children, Arguments: s.Arguments})
 			}
 		case *ast.FragmentSpread:
 			if frag := fragments.ForName(s.Name); frag != nil {
@@ -536,6 +558,9 @@ func mergeIntoNodeList(nodes []*selectionNode, seen map[string]int, source []*se
 			if sn.Children != nil {
 				nodes[idx].Children = mergeSelectionNodes(nodes[idx].Children, sn.Children)
 			}
+			if len(nodes[idx].Arguments) == 0 && len(sn.Arguments) > 0 {
+				nodes[idx].Arguments = sn.Arguments
+			}
 		} else {
 			seen[sn.Name] = len(nodes)
 			nodes = append(nodes, sn)
@@ -557,6 +582,9 @@ func mergeSelectionNodes(a, b []*selectionNode) []*selectionNode {
 			if n.Children != nil {
 				merged[idx].Children = mergeSelectionNodes(merged[idx].Children, n.Children)
 			}
+			if len(merged[idx].Arguments) == 0 && len(n.Arguments) > 0 {
+				merged[idx].Arguments = n.Arguments
+			}
 		} else {
 			seen[n.Name] = len(merged)
 			merged = append(merged, n)
@@ -567,15 +595,28 @@ func mergeSelectionNodes(a, b []*selectionNode) []*selectionNode {
 
 // inferFieldsRecursive walks the selection tree and response JSON together to build
 // nested synthetic types. It returns the fields map for the current level.
+// parentTypeName identifies the synthetic type being built at this level, so field
+// arguments can be stored in its FieldArgs.
 func inferFieldsRecursive(
 	responseObj map[string]interface{},
 	tree []*selectionNode,
 	typePrefix string,
 	syntheticTypes map[string]*inferredType,
+	varTypes map[string]string,
+	inputTypes map[string]*inferredType,
+	parentTypeName string,
 ) map[string]string {
 	fields := make(map[string]string)
 
 	for _, node := range tree {
+		// Infer field arguments if present
+		if len(node.Arguments) > 0 {
+			args := inferFieldArgTypes(node.Arguments, varTypes, inputTypes)
+			if len(args) > 0 {
+				storeFieldArgs(syntheticTypes, parentTypeName, node.Name, args)
+			}
+		}
+
 		if node.Children == nil {
 			// Leaf node: infer scalar type from response
 			if responseObj != nil {
@@ -611,7 +652,7 @@ func inferFieldsRecursive(
 		}
 
 		// Recurse to build nested type fields
-		nestedFields := inferFieldsRecursive(nestedObj, node.Children, typePrefix+"_"+upperFirst(node.Name), syntheticTypes)
+		nestedFields := inferFieldsRecursive(nestedObj, node.Children, typePrefix+"_"+upperFirst(node.Name), syntheticTypes, varTypes, inputTypes, nestedTypeName)
 
 		if len(nestedFields) > 0 {
 			if existing, ok := syntheticTypes[nestedTypeName]; ok {
@@ -622,8 +663,9 @@ func inferFieldsRecursive(
 				}
 			} else {
 				syntheticTypes[nestedTypeName] = &inferredType{
-					Name:   nestedTypeName,
-					Fields: nestedFields,
+					Name:      nestedTypeName,
+					Fields:    nestedFields,
+					FieldArgs: make(map[string]map[string]string),
 				}
 			}
 		}
@@ -636,6 +678,59 @@ func inferFieldsRecursive(
 	}
 
 	return fields
+}
+
+// inferFieldArgTypes infers argument types for a field's arguments.
+func inferFieldArgTypes(args []*ast.Argument, varTypes map[string]string, inputTypes map[string]*inferredType) map[string]string {
+	result := make(map[string]string)
+	for _, arg := range args {
+		if arg.Value != nil && arg.Value.Kind == ast.Variable {
+			if t, ok := varTypes[arg.Value.Raw]; ok {
+				result[arg.Name] = t
+				continue
+			}
+		}
+		if arg.Value != nil && arg.Value.Kind == ast.ObjectValue {
+			inputTypeName := upperFirst(arg.Name) + "Input"
+			inferInputTypeFromASTObject(arg.Value, inputTypeName, inputTypes)
+			result[arg.Name] = inputTypeName
+			continue
+		}
+		if arg.Value != nil {
+			result[arg.Name] = inferTypeFromASTValue(arg.Value)
+			continue
+		}
+		result[arg.Name] = "String"
+	}
+	return result
+}
+
+// storeFieldArgs stores field argument definitions on a synthetic type, creating the type if needed.
+func storeFieldArgs(syntheticTypes map[string]*inferredType, typeName string, fieldName string, args map[string]string) {
+	st, ok := syntheticTypes[typeName]
+	if !ok {
+		st = &inferredType{
+			Name:      typeName,
+			Fields:    make(map[string]string),
+			FieldArgs: make(map[string]map[string]string),
+		}
+		syntheticTypes[typeName] = st
+	}
+	if st.FieldArgs == nil {
+		st.FieldArgs = make(map[string]map[string]string)
+	}
+	if existing, ok := st.FieldArgs[fieldName]; ok {
+		// Merge: prefer more specific types
+		for k, v := range args {
+			if existingType, exists := existing[k]; !exists {
+				existing[k] = v
+			} else if isMoreSpecificType(v, existingType) {
+				existing[k] = v
+			}
+		}
+	} else {
+		st.FieldArgs[fieldName] = args
+	}
 }
 
 // extractNamedType unwraps list/non-null wrappers from an AST type to get the base named type.
