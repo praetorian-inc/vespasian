@@ -403,7 +403,7 @@ func processParsedQuery(parsed *parsedQuery, ep classify.ClassifiedRequest, body
 	returnTypeName := upperFirst(fieldName) + "Response"
 	typePrefix := upperFirst(fieldName)
 
-	responseObj, isList, responseOK := unwrapResponseValue(ep.Response.Body, fieldName)
+	responseObj, isList, responseOK := unwrapResponseValue(ep.Response.Body, fieldName, parsed.rootFieldAliases...)
 	var responseFields map[string]string
 
 	if len(parsed.inlineFragments) >= 1 {
@@ -412,7 +412,7 @@ func processParsedQuery(parsed *parsedQuery, ep classify.ClassifiedRequest, body
 		var memberNames []string
 
 		// Merge all array elements for type inference
-		mergedObj := mergeArrayElements(ep.Response.Body, fieldName)
+		mergedObj := mergeArrayElements(ep.Response.Body, fieldName, parsed.rootFieldAliases...)
 		if mergedObj == nil {
 			mergedObj = responseObj
 		}
@@ -464,14 +464,14 @@ func processParsedQuery(parsed *parsedQuery, ep classify.ClassifiedRequest, body
 		returnTypeName = unionName
 	} else if responseOK && responseObj != nil && len(parsed.selectionTree) > 0 {
 		responseFields = inferFieldsRecursive(responseObj, parsed.selectionTree, typePrefix, syntheticTypes, varTypes, syntheticInputTypes, returnTypeName, syntheticUnions)
-	} else if scalarType, ok := detectScalarReturnType(ep.Response.Body, fieldName); ok {
+	} else if scalarType, ok := detectScalarReturnType(ep.Response.Body, fieldName, parsed.rootFieldAliases...); ok {
 		returnTypeName = scalarType
 	} else if len(parsed.selectionTree) > 0 {
 		// Response was null/error but we have selection tree — generate type from selection fields
 		responseFields = inferFieldsRecursive(nil, parsed.selectionTree, typePrefix, syntheticTypes, varTypes, syntheticInputTypes, returnTypeName, syntheticUnions)
 	} else {
 		// Fallback: existing flat inference
-		responseFields, isList = inferFieldsFromResponse(ep.Response.Body, fieldName, parsed.selectionFields)
+		responseFields, isList = inferFieldsFromResponse(ep.Response.Body, fieldName, parsed.selectionFields, parsed.rootFieldAliases...)
 	}
 	return inferredOperation{
 		OpType:         opType,
@@ -505,7 +505,8 @@ type parsedQuery struct {
 	opType               ast.Operation
 	opName               string
 	rootFieldName        string
-	rootFieldArgs        []*ast.Argument // arguments on the root field
+	rootFieldAliases     []string              // aliases used for this root field in queries (for response data lookup)
+	rootFieldArgs        []*ast.Argument       // arguments on the root field
 	varDefs              ast.VariableDefinitionList
 	selectionFields      []string              // field names from the root field's selection set (flat)
 	selectionTree        []*selectionNode      // nested selection tree for recursive type inference
@@ -548,11 +549,17 @@ func parseQueryAST(query string) []*parsedQuery {
 		} else {
 			tree = collectSelectionTree(field.SelectionSet, doc.Fragments)
 		}
+		// Capture root field alias if it differs from the field name
+		var aliases []string
+		if field.Alias != "" && field.Alias != field.Name {
+			aliases = []string{field.Alias}
+		}
 		result := &parsedQuery{
 			opType:               op.Operation,
 			opName:               op.Name,
 			varDefs:              op.VariableDefinitions,
 			rootFieldName:        field.Name,
+			rootFieldAliases:     aliases,
 			rootFieldArgs:        field.Arguments,
 			selectionFields:      collectSelectionFields(field.SelectionSet, doc.Fragments),
 			selectionTree:        tree,
@@ -1545,8 +1552,8 @@ func inferTypeFromValue(v interface{}) string {
 // It uses the root field name to locate the data, handles array responses,
 // and uses selectionFields to guide which fields to include.
 // Returns the fields map and whether the response value was an array.
-func inferFieldsFromResponse(body []byte, rootFieldName string, selectionFields []string) (map[string]string, bool) {
-	responseObj, isList, ok := unwrapResponseValue(body, rootFieldName)
+func inferFieldsFromResponse(body []byte, rootFieldName string, selectionFields []string, aliases ...string) (map[string]string, bool) {
+	responseObj, isList, ok := unwrapResponseValue(body, rootFieldName, aliases...)
 	if !ok {
 		return nil, isList
 	}
@@ -1577,7 +1584,7 @@ func inferFieldsFromResponse(body []byte, rootFieldName string, selectionFields 
 // unwrapResponseValue parses a GraphQL JSON response envelope, locates the response
 // value for the given root field, and unwraps arrays. Returns the response object,
 // whether it was a list, and whether a valid object was found.
-func unwrapResponseValue(body []byte, rootFieldName string) (map[string]interface{}, bool, bool) {
+func unwrapResponseValue(body []byte, rootFieldName string, aliases ...string) (map[string]interface{}, bool, bool) {
 	if len(body) == 0 {
 		return nil, false, false
 	}
@@ -1599,17 +1606,17 @@ func unwrapResponseValue(body []byte, rootFieldName string) (map[string]interfac
 
 	responseVal, ok := dataMap[rootFieldName]
 	if !ok {
-		keys := make([]string, 0, len(dataMap))
-		for k := range dataMap {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		if len(keys) > 0 {
-			responseVal = dataMap[keys[0]]
+		// Try aliases before giving up
+		for _, alias := range aliases {
+			if v, exists := dataMap[alias]; exists {
+				responseVal = v
+				ok = true
+				break
+			}
 		}
 	}
 
-	if responseVal == nil {
+	if !ok || responseVal == nil {
 		return nil, false, false
 	}
 
@@ -1630,7 +1637,7 @@ func unwrapResponseValue(body []byte, rootFieldName string) (map[string]interfac
 
 // detectScalarReturnType checks if a GraphQL response field is a scalar value
 // and returns the corresponding SDL type name.
-func detectScalarReturnType(body []byte, rootFieldName string) (string, bool) {
+func detectScalarReturnType(body []byte, rootFieldName string, aliases ...string) (string, bool) {
 	if len(body) == 0 {
 		return "", false
 	}
@@ -1652,14 +1659,15 @@ func detectScalarReturnType(body []byte, rootFieldName string) (string, bool) {
 
 	responseVal, ok := dataMap[rootFieldName]
 	if !ok {
-		keys := make([]string, 0, len(dataMap))
-		for k := range dataMap {
-			keys = append(keys, k)
+		// Try aliases before giving up
+		for _, alias := range aliases {
+			if v, exists := dataMap[alias]; exists {
+				responseVal = v
+				ok = true
+				break
+			}
 		}
-		sort.Strings(keys)
-		if len(keys) > 0 {
-			responseVal = dataMap[keys[0]]
-		} else {
+		if !ok {
 			return "", false
 		}
 	}
@@ -1681,7 +1689,7 @@ func detectScalarReturnType(body []byte, rootFieldName string) (string, bool) {
 
 // mergeArrayElements parses a GraphQL response and merges all array elements
 // for the given root field into a single map for comprehensive type inference.
-func mergeArrayElements(body []byte, rootFieldName string) map[string]interface{} {
+func mergeArrayElements(body []byte, rootFieldName string, aliases ...string) map[string]interface{} {
 	if len(body) == 0 {
 		return nil
 	}
@@ -1703,7 +1711,17 @@ func mergeArrayElements(body []byte, rootFieldName string) map[string]interface{
 
 	responseVal, ok := dataMap[rootFieldName]
 	if !ok {
-		return nil
+		// Try aliases before giving up
+		for _, alias := range aliases {
+			if v, exists := dataMap[alias]; exists {
+				responseVal = v
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return nil
+		}
 	}
 
 	arr, ok := responseVal.([]interface{})
