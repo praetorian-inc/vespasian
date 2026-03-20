@@ -451,7 +451,9 @@ func processParsedQuery(parsed *parsedQuery, ep classify.ClassifiedRequest, body
 			if len(fragFields) > 0 {
 				if existing, ok := syntheticTypes[frag.TypeName]; ok {
 					for k, v := range fragFields {
-						if _, exists := existing.Fields[k]; !exists {
+						if existingType, exists := existing.Fields[k]; !exists {
+							existing.Fields[k] = v
+						} else if isMoreSpecificType(v, existingType) {
 							existing.Fields[k] = v
 						}
 					}
@@ -1116,7 +1118,9 @@ func inferFieldsRecursive(
 				if len(fragFields) > 0 {
 					if existing, ok := syntheticTypes[frag.TypeName]; ok {
 						for k, v := range fragFields {
-							if _, exists := existing.Fields[k]; !exists {
+							if existingType, exists := existing.Fields[k]; !exists {
+								existing.Fields[k] = v
+							} else if isMoreSpecificType(v, existingType) {
 								existing.Fields[k] = v
 							}
 						}
@@ -1179,11 +1183,8 @@ func inferFieldsRecursive(
 					nestedObj = rv
 				case []interface{}:
 					isList = true
-					if len(rv) > 0 {
-						if obj, ok := rv[0].(map[string]interface{}); ok {
-							nestedObj = obj
-						}
-					}
+					// Merge all array elements for richer type inference
+					nestedObj = mergeArrayElementsRaw(rv)
 				}
 			}
 		}
@@ -1194,7 +1195,9 @@ func inferFieldsRecursive(
 		if len(nestedFields) > 0 {
 			if existing, ok := syntheticTypes[nestedTypeName]; ok {
 				for k, v := range nestedFields {
-					if _, exists := existing.Fields[k]; !exists {
+					if existingType, exists := existing.Fields[k]; !exists {
+						existing.Fields[k] = v
+					} else if isMoreSpecificType(v, existingType) {
 						existing.Fields[k] = v
 					}
 				}
