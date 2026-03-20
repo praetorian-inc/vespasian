@@ -17,6 +17,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -50,6 +52,47 @@ var CLI struct {
 	Generate GenerateCmd `cmd:"" help:"Generate API specifications from captured traffic"`
 	Scan     ScanCmd     `cmd:"" help:"Full pipeline: crawl, classify, and generate specs"`
 	Version  VersionCmd  `cmd:"" help:"Show version information"`
+}
+
+// RequestIDHeader is the header name used for crawl session traceability.
+const RequestIDHeader = "X-Vespasian-Request-Id"
+
+// generateRequestID produces a 32-character hex string from 16 random bytes.
+func generateRequestID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate request ID: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// headerExistsCaseInsensitive checks whether a header name exists in the map
+// using a case-insensitive comparison, per RFC 7230.
+func headerExistsCaseInsensitive(headers map[string]string, name string) bool {
+	for k := range headers {
+		if strings.EqualFold(k, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// injectRequestID adds an auto-generated X-Vespasian-Request-Id header to the
+// map unless disabled or the user already supplied one via -H. Returns the
+// generated ID (empty if skipped or user-supplied).
+func injectRequestID(headers map[string]string, disabled bool) (string, error) {
+	if disabled {
+		return "", nil
+	}
+	if headerExistsCaseInsensitive(headers, RequestIDHeader) {
+		return "", nil
+	}
+	id, err := generateRequestID()
+	if err != nil {
+		return "", err
+	}
+	headers[RequestIDHeader] = id
+	return id, nil
 }
 
 // parseHeaders converts "Key: Value" strings to a map, validating header names
@@ -219,15 +262,16 @@ func writeOutput(path string, fn func(io.Writer) error) error {
 
 // CrawlOptions holds the shared crawl configuration fields used by CrawlCmd and ScanCmd.
 type CrawlOptions struct {
-	Header   []string      `short:"H" help:"Custom headers (repeatable)"`
-	Output   string        `short:"o" help:"Output file path"`
-	Depth    int           `default:"3" help:"Maximum crawl depth"`
-	MaxPages int           `default:"100" help:"Maximum pages to crawl"`
-	Timeout  time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
-	Scope    string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
-	Headless bool          `default:"true" help:"Use headless browser"`
-	Proxy    string        `help:"Proxy address for headless browser (e.g., http://127.0.0.1:8080). Note: TLS certificate verification is disabled during crawls."`
-	Verbose  bool          `short:"v" help:"Enable verbose logging"`
+	Header      []string      `short:"H" help:"Custom headers (repeatable)"`
+	Output      string        `short:"o" help:"Output file path"`
+	Depth       int           `default:"3" help:"Maximum crawl depth"`
+	MaxPages    int           `default:"100" help:"Maximum pages to crawl"`
+	Timeout     time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
+	Scope       string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
+	Headless    bool          `default:"true" help:"Use headless browser"`
+	Proxy       string        `help:"Proxy address for headless browser (e.g., http://127.0.0.1:8080). Note: TLS certificate verification is disabled during crawls."`
+	NoRequestID bool          `name:"no-request-id" help:"Disable automatic X-Vespasian-Request-Id header"`
+	Verbose     bool          `short:"v" help:"Enable verbose logging"`
 }
 
 // setupForceExitHandler spawns a goroutine that waits for the first signal
@@ -270,23 +314,30 @@ func onForceExit(stderr io.Writer, cleanup func(), exitFn func(int)) {
 
 // browserSetupResult holds the resources created by setupBrowserAndSignals.
 type browserSetupResult struct {
-	opts    crawl.CrawlerOptions
-	ctx     context.Context
-	cleanup func() // caller must defer this
+	opts      crawl.CrawlerOptions
+	ctx       context.Context
+	cleanup   func() // caller must defer this
+	requestID string // auto-generated session ID; empty if disabled or user-supplied
 }
 
-// setupBrowserAndSignals validates headers, creates a BrowserManager (if
-// headless), wires up signal handling with force-exit support, and returns a
-// cancellable context. Headers are validated before launching Chrome so that
-// invalid headers fail fast without wasting browser startup time. The returned
-// cleanup function closes the browser and stops the signal handler; callers
-// must defer it.
+// setupBrowserAndSignals validates headers, injects the request ID header (if
+// enabled), creates a BrowserManager (if headless), wires up signal handling
+// with force-exit support, and returns a cancellable context. Headers are
+// validated before launching Chrome so that invalid headers fail fast without
+// wasting browser startup time. The returned cleanup function closes the
+// browser and stops the signal handler; callers must defer it.
 func setupBrowserAndSignals(rawHeaders []string, crawlOpts CrawlOptions, extraOpts crawl.CrawlerOptions) (browserSetupResult, error) {
 	// Validate headers before launching Chrome — fail fast on invalid input.
 	headers, err := parseHeaders(rawHeaders)
 	if err != nil {
 		return browserSetupResult{}, fmt.Errorf("invalid header: %w", err)
 	}
+
+	requestID, err := injectRequestID(headers, crawlOpts.NoRequestID)
+	if err != nil {
+		return browserSetupResult{}, err
+	}
+
 	extraOpts.Headers = headers
 
 	var browserMgr *crawl.BrowserManager
@@ -319,9 +370,10 @@ func setupBrowserAndSignals(rawHeaders []string, crawlOpts CrawlOptions, extraOp
 	}
 
 	return browserSetupResult{
-		opts:    extraOpts,
-		ctx:     ctx,
-		cleanup: cleanup,
+		opts:      extraOpts,
+		ctx:       ctx,
+		cleanup:   cleanup,
+		requestID: requestID,
 	}, nil
 }
 
@@ -362,6 +414,9 @@ func (c *CrawlCmd) Run() error {
 	}
 
 	if c.Verbose {
+		if bs.requestID != "" {
+			fmt.Fprintf(os.Stderr, "request-id: %s\n", bs.requestID)
+		}
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests))
 	}
 
@@ -411,13 +466,14 @@ func (c *ImportCmd) Run() error {
 
 // GenerateCmd generates API specifications from captured traffic.
 type GenerateCmd struct {
-	APIType               string  `arg:"" enum:"rest,wsdl" help:"API type to generate"`
-	Capture               string  `arg:"" help:"Capture file path"`
-	Output                string  `short:"o" help:"Output file path"`
-	Confidence            float64 `default:"0.5" help:"Minimum confidence threshold"`
-	Probe                 bool    `default:"true" help:"Enable endpoint probing"`
+	APIType     string  `arg:"" enum:"rest,wsdl" help:"API type to generate"`
+	Capture     string  `arg:"" help:"Capture file path"`
+	Output      string  `short:"o" help:"Output file path"`
+	Confidence  float64 `default:"0.5" help:"Minimum confidence threshold"`
+	Probe       bool    `default:"true" help:"Enable endpoint probing"`
+	Deduplicate bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
 	DangerousAllowPrivate bool    `help:"Disable SSRF protection for probes, allowing private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
-	Verbose               bool    `short:"v" help:"Enable verbose logging"`
+	Verbose     bool    `short:"v" help:"Enable verbose logging"`
 }
 
 // maxCaptureSize is the maximum capture file size (100MB).
@@ -456,7 +512,8 @@ func (c *GenerateCmd) Run() (err error) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	spec, err := generateSpec(ctx, requests, c.APIType, c.Confidence, c.Probe, c.DangerousAllowPrivate, c.Verbose)
+
+	spec, err := generateSpec(ctx, requests, c.APIType, c.Confidence, c.Probe, c.Deduplicate, c.DangerousAllowPrivate, c.Verbose)
 	if err != nil {
 		return err
 	}
@@ -469,10 +526,12 @@ func (c *GenerateCmd) Run() (err error) {
 
 // ScanCmd runs the full pipeline: crawl, classify, and generate.
 type ScanCmd struct {
-	URL                   string  `arg:"" help:"Target URL to scan"`
-	Confidence            float64 `default:"0.5" help:"Minimum confidence threshold"`
-	Probe                 bool    `default:"true" help:"Enable endpoint probing"`
+	URL         string  `arg:"" help:"Target URL to scan"`
+	Confidence  float64 `default:"0.5" help:"Minimum confidence threshold"`
+	Probe       bool    `default:"true" help:"Enable endpoint probing"`
+	Deduplicate bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
 	DangerousAllowPrivate bool    `help:"Disable SSRF protection for probes, allowing private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
+
 	CrawlOptions
 }
 
@@ -506,6 +565,9 @@ func (c *ScanCmd) Run() error {
 	}
 
 	if c.Verbose {
+		if bs.requestID != "" {
+			fmt.Fprintf(os.Stderr, "request-id: %s\n", bs.requestID)
+		}
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests))
 		fmt.Fprintf(os.Stderr, "generating REST spec\n")
 	}
@@ -517,7 +579,8 @@ func (c *ScanCmd) Run() error {
 	genCtx, genStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer genStop()
 
-	spec, err := generateSpec(genCtx, requests, "rest", c.Confidence, c.Probe, c.DangerousAllowPrivate, c.Verbose)
+
+	spec, err := generateSpec(genCtx, requests, "rest", c.Confidence, c.Probe, c.Deduplicate, c.DangerousAllowPrivate, c.Verbose)
 	if err != nil {
 		return err
 	}
@@ -548,12 +611,16 @@ func main() {
 }
 
 // generateSpec runs the classify → probe → generate pipeline.
-func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, apiType string, confidence float64, doProbe bool, allowPrivate bool, verbose bool) ([]byte, error) {
+
+func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, apiType string, confidence float64, doProbe bool, deduplicate bool, allowPrivate bool, verbose bool) ([]byte, error) {
 	classifiers := classifiersForType(apiType)
 	if classifiers == nil {
 		return nil, fmt.Errorf("unsupported API type: %q", apiType)
 	}
-	classified := classify.Deduplicate(classify.RunClassifiers(classifiers, requests, confidence))
+	classified := classify.RunClassifiers(classifiers, requests, confidence)
+	if deduplicate {
+		classified = classify.Deduplicate(classified)
+	}
 
 	if verbose {
 		fmt.Fprintf(os.Stderr, "classified %d API requests (threshold=%.2f)\n", len(classified), confidence)

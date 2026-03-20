@@ -373,3 +373,103 @@ func TestRESTClassifier_ImplementsDetailedClassifier(t *testing.T) {
 	var c APIClassifier = &RESTClassifier{}
 	assert.Implements(t, (*DetailedClassifier)(nil), c)
 }
+
+// TestClassifyDetail_FallbackToHeaders verifies the classifier falls back to
+// Response.Headers when ContentType is empty, as happens when headers have
+// non-standard casing and ContentType wasn't populated by the crawler.
+func TestClassifyDetail_FallbackToHeaders(t *testing.T) {
+	c := &RESTClassifier{}
+
+	tests := []struct {
+		name          string
+		req           crawl.ObservedRequest
+		wantIsAPI     bool
+		wantMinConf   float64
+		wantReasonSub string
+	}{
+		{
+			name: "empty ContentType with lowercase content-type in Headers",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/data",
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: "",
+					Headers:     map[string]string{"content-type": "application/json"},
+				},
+			},
+			wantIsAPI:     true,
+			wantMinConf:   ContentTypeConfidence,
+			wantReasonSub: "content-type",
+		},
+		{
+			name: "empty ContentType with mixed-case Content-Type in Headers",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/data",
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: "",
+					Headers:     map[string]string{"Content-Type": "application/xml"},
+				},
+			},
+			wantIsAPI:     true,
+			wantMinConf:   ContentTypeConfidence,
+			wantReasonSub: "content-type",
+		},
+		{
+			name: "empty ContentType with no content-type in Headers",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/data",
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: "",
+					Headers:     map[string]string{"X-Request-Id": "abc123"},
+				},
+			},
+			wantIsAPI:   false,
+			wantMinConf: 0,
+		},
+		{
+			name: "empty ContentType with content-type charset in Headers",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/data",
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: "",
+					Headers:     map[string]string{"content-type": "application/json; charset=utf-8"},
+				},
+			},
+			wantIsAPI:     true,
+			wantMinConf:   ContentTypeConfidence,
+			wantReasonSub: "content-type",
+		},
+		{
+			name: "empty ContentType and nil Headers",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/data",
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: "",
+					Headers:     nil,
+				},
+			},
+			wantIsAPI:   false,
+			wantMinConf: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isAPI, confidence, reason := c.ClassifyDetail(tt.req)
+			assert.Equal(t, tt.wantIsAPI, isAPI, "isAPI")
+			assert.GreaterOrEqual(t, confidence, tt.wantMinConf, "confidence lower bound")
+			if tt.wantReasonSub != "" {
+				assert.Contains(t, reason, tt.wantReasonSub, "reason")
+			}
+		})
+	}
+}

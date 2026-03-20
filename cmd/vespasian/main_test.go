@@ -17,6 +17,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -434,18 +435,20 @@ func TestGenerateSpec(t *testing.T) {
 	}
 
 	tests := []struct {
-		name       string
-		apiType    string
-		probe      bool
-		verbose    bool
-		wantErrStr string
-		wantErr    bool
+		name        string
+		apiType     string
+		probe       bool
+		deduplicate bool
+		verbose     bool
+		wantErrStr  string
+		wantErr     bool
 	}{
 		{
-			name:    "rest with valid requests, probe disabled",
-			apiType: "rest",
-			probe:   false,
-			wantErr: false,
+			name:        "rest with valid requests, probe disabled",
+			apiType:     "rest",
+			probe:       false,
+			deduplicate: true,
+			wantErr:     false,
 		},
 		{
 			name:       "unknown api type",
@@ -455,23 +458,32 @@ func TestGenerateSpec(t *testing.T) {
 			wantErrStr: "unsupported API type",
 		},
 		{
-			name:    "probe enabled with real implementations",
-			apiType: "rest",
-			probe:   true,
-			wantErr: false,
+			name:        "probe enabled with real implementations",
+			apiType:     "rest",
+			probe:       true,
+			deduplicate: true,
+			wantErr:     false,
 		},
 		{
-			name:    "verbose logging",
-			apiType: "rest",
-			probe:   false,
-			verbose: true,
-			wantErr: false,
+			name:        "verbose logging",
+			apiType:     "rest",
+			probe:       false,
+			deduplicate: true,
+			verbose:     true,
+			wantErr:     false,
+		},
+		{
+			name:        "rest without deduplication",
+			apiType:     "rest",
+			probe:       false,
+			deduplicate: false,
+			wantErr:     false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := generateSpec(context.Background(), requests, tt.apiType, 0.5, tt.probe, false, tt.verbose)
+			_, err := generateSpec(context.Background(), requests, tt.apiType, 0.5, tt.probe, tt.deduplicate, false, tt.verbose)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("generateSpec() expected error containing %q, got nil", tt.wantErrStr)
@@ -492,7 +504,8 @@ func TestGenerateSpec(t *testing.T) {
 // With real implementations, empty requests produce no classified endpoints,
 // so the generator returns nil spec with no error.
 func TestGenerateSpec_EmptyRequests(t *testing.T) {
-	spec, err := generateSpec(context.Background(), []crawl.ObservedRequest{}, "rest", 0.5, false, false, false)
+
+	spec, err := generateSpec(context.Background(), []crawl.ObservedRequest{}, "rest", 0.5, false, true, false, false)
 	if err != nil {
 		t.Fatalf("generateSpec() unexpected error: %v", err)
 	}
@@ -531,9 +544,10 @@ func TestGenerateCmdRun_ValidCapture(t *testing.T) {
 	_ = f.Close()
 
 	cmd := &GenerateCmd{
-		APIType: "rest",
-		Capture: capturePath,
-		Probe:   false,
+		APIType:     "rest",
+		Capture:     capturePath,
+		Probe:       false,
+		Deduplicate: true,
 	}
 	err = cmd.Run()
 	if err != nil {
@@ -650,7 +664,7 @@ func TestDangerousAllowPrivate_GenerateSpec(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := generateSpec(context.Background(), requests, "rest", 0.5, tt.probe, true, false)
+			_, err := generateSpec(context.Background(), requests, "rest", 0.5, tt.probe, true, true, false)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("generateSpec() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -732,12 +746,12 @@ func TestDangerousAllowPrivate_SameOutputForPublicURLs(t *testing.T) {
 		},
 	}
 
-	specWithout, err := generateSpec(context.Background(), requests, "rest", 0.5, false, false, false)
+	specWithout, err := generateSpec(context.Background(), requests, "rest", 0.5, false, true, false, false)
 	if err != nil {
 		t.Fatalf("generateSpec(allowPrivate=false) unexpected error: %v", err)
 	}
 
-	specWith, err := generateSpec(context.Background(), requests, "rest", 0.5, false, true, false)
+	specWith, err := generateSpec(context.Background(), requests, "rest", 0.5, false, true, true, false)
 	if err != nil {
 		t.Fatalf("generateSpec(allowPrivate=true) unexpected error: %v", err)
 	}
@@ -966,5 +980,159 @@ func TestSetupBrowserAndSignals_InvalidHeaderReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid header") {
 		t.Errorf("setupBrowserAndSignals() error = %q, want 'invalid header'", err.Error())
+	}
+}
+
+func TestGenerateRequestID(t *testing.T) {
+	t.Run("produces 32-char hex string", func(t *testing.T) {
+		id, err := generateRequestID()
+		if err != nil {
+			t.Fatalf("generateRequestID() error = %v", err)
+		}
+		if len(id) != 32 {
+			t.Errorf("generateRequestID() length = %d, want 32", len(id))
+		}
+		if _, err := hex.DecodeString(id); err != nil {
+			t.Errorf("generateRequestID() returned non-hex string: %q", id)
+		}
+	})
+
+	t.Run("produces unique values", func(t *testing.T) {
+		ids := make(map[string]bool)
+		for i := 0; i < 100; i++ {
+			id, err := generateRequestID()
+			if err != nil {
+				t.Fatalf("generateRequestID() error = %v", err)
+			}
+			if ids[id] {
+				t.Fatalf("generateRequestID() produced duplicate ID: %q", id)
+			}
+			ids[id] = true
+		}
+	})
+}
+
+func TestInjectRequestID(t *testing.T) {
+	t.Run("default injects header", func(t *testing.T) {
+		headers := map[string]string{}
+		id, err := injectRequestID(headers, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(id) != 32 {
+			t.Errorf("request ID length = %d, want 32", len(id))
+		}
+		if headers[RequestIDHeader] != id {
+			t.Errorf("header value = %q, want %q", headers[RequestIDHeader], id)
+		}
+	})
+
+	t.Run("disabled skips injection", func(t *testing.T) {
+		headers := map[string]string{}
+		id, err := injectRequestID(headers, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id != "" {
+			t.Errorf("expected empty ID when disabled, got %q", id)
+		}
+		if _, ok := headers[RequestIDHeader]; ok {
+			t.Error("expected no header when disabled")
+		}
+	})
+
+	t.Run("user-supplied value is preserved", func(t *testing.T) {
+		headers := map[string]string{RequestIDHeader: "my-custom-id"}
+		id, err := injectRequestID(headers, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id != "" {
+			t.Errorf("expected empty ID when user-supplied, got %q", id)
+		}
+		if headers[RequestIDHeader] != "my-custom-id" {
+			t.Errorf("user value overwritten: got %q", headers[RequestIDHeader])
+		}
+	})
+
+	t.Run("user-supplied value with different casing is preserved", func(t *testing.T) {
+		headers := map[string]string{"x-vespasian-request-id": "lowercase-id"}
+		id, err := injectRequestID(headers, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id != "" {
+			t.Errorf("expected empty ID when user-supplied, got %q", id)
+		}
+		// Should not inject canonical header when lowercase variant exists
+		if _, exists := headers[RequestIDHeader]; exists {
+			t.Error("should not inject canonical header when lowercase variant exists")
+		}
+		if headers["x-vespasian-request-id"] != "lowercase-id" {
+			t.Errorf("user value overwritten: got %q", headers["x-vespasian-request-id"])
+		}
+	})
+}
+
+// TestSetupBrowserAndSignals_InjectsRequestID verifies that setupBrowserAndSignals
+// injects the request ID header by default and returns it in the result.
+func TestSetupBrowserAndSignals_InjectsRequestID(t *testing.T) {
+	bs, err := setupBrowserAndSignals(
+		nil,
+		CrawlOptions{Headless: false},
+		crawl.CrawlerOptions{Depth: 1},
+	)
+	if err != nil {
+		t.Fatalf("setupBrowserAndSignals() error = %v", err)
+	}
+	defer bs.cleanup()
+
+	if len(bs.requestID) != 32 {
+		t.Errorf("requestID length = %d, want 32", len(bs.requestID))
+	}
+	if bs.opts.Headers[RequestIDHeader] != bs.requestID {
+		t.Errorf("header = %q, want %q", bs.opts.Headers[RequestIDHeader], bs.requestID)
+	}
+}
+
+// TestSetupBrowserAndSignals_NoRequestIDDisablesInjection verifies that
+// NoRequestID=true prevents the header from being injected.
+func TestSetupBrowserAndSignals_NoRequestIDDisablesInjection(t *testing.T) {
+	bs, err := setupBrowserAndSignals(
+		nil,
+		CrawlOptions{Headless: false, NoRequestID: true},
+		crawl.CrawlerOptions{Depth: 1},
+	)
+	if err != nil {
+		t.Fatalf("setupBrowserAndSignals() error = %v", err)
+	}
+	defer bs.cleanup()
+
+	if bs.requestID != "" {
+		t.Errorf("requestID = %q, want empty", bs.requestID)
+	}
+	if _, ok := bs.opts.Headers[RequestIDHeader]; ok {
+		t.Error("header should not be present when NoRequestID is true")
+	}
+}
+
+// TestSetupBrowserAndSignals_UserSuppliedRequestIDPreserved verifies that a
+// user-supplied X-Vespasian-Request-Id via -H takes precedence.
+func TestSetupBrowserAndSignals_UserSuppliedRequestIDPreserved(t *testing.T) {
+	bs, err := setupBrowserAndSignals(
+		[]string{"X-Vespasian-Request-Id: user-value"},
+		CrawlOptions{Headless: false},
+		crawl.CrawlerOptions{Depth: 1},
+	)
+	if err != nil {
+		t.Fatalf("setupBrowserAndSignals() error = %v", err)
+	}
+	defer bs.cleanup()
+
+	if bs.requestID != "" {
+		t.Errorf("requestID = %q, want empty (user-supplied)", bs.requestID)
+	}
+	if bs.opts.Headers[RequestIDHeader] != "user-value" {
+		t.Errorf("header = %q, want %q", bs.opts.Headers[RequestIDHeader], "user-value")
 	}
 }
