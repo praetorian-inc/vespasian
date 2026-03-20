@@ -60,11 +60,12 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 	var ops []inferredOperation
 	syntheticTypes := make(map[string]*inferredType)
 	syntheticInputTypes := make(map[string]*inferredType)
+	syntheticUnions := make(map[string][]string) // union name -> member type names
 	anonCounter := 0
 	seen := make(map[string]bool) // deduplicate by composite key (opType:fieldName:opName)
 
 	for _, ep := range endpoints {
-		if op, ok := processEndpoint(ep, seen, &anonCounter, syntheticTypes, syntheticInputTypes); ok {
+		if op, ok := processEndpoint(ep, seen, &anonCounter, syntheticTypes, syntheticInputTypes, syntheticUnions); ok {
 			ops = append(ops, op)
 		}
 	}
@@ -95,15 +96,19 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 		for i := range groupOps {
 			op := &groupOps[i]
 			if existing, ok := merged[op.FieldName]; ok {
-				// Merge args (add new args, keep existing)
+				// Merge args: prefer more specific types over String
 				for k, v := range op.Args {
-					if _, exists := existing.Args[k]; !exists {
+					if existingType, exists := existing.Args[k]; !exists {
+						existing.Args[k] = v
+					} else if isMoreSpecificType(v, existingType) {
 						existing.Args[k] = v
 					}
 				}
-				// Merge response fields
+				// Merge response fields: prefer more specific types
 				for k, v := range op.ResponseFields {
-					if _, exists := existing.ResponseFields[k]; !exists {
+					if existingType, exists := existing.ResponseFields[k]; !exists {
+						existing.ResponseFields[k] = v
+					} else if isMoreSpecificType(v, existingType) {
 						existing.ResponseFields[k] = v
 					}
 				}
@@ -130,9 +135,11 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 		for _, op := range groupOps {
 			if len(op.ResponseFields) > 0 {
 				if existing, ok := syntheticTypes[op.ReturnType]; ok {
-					// Merge fields into existing type
+					// Merge fields into existing type: prefer more specific types
 					for k, v := range op.ResponseFields {
-						if _, exists := existing.Fields[k]; !exists {
+						if existingType, exists := existing.Fields[k]; !exists {
+							existing.Fields[k] = v
+						} else if isMoreSpecificType(v, existingType) {
 							existing.Fields[k] = v
 						}
 					}
@@ -218,11 +225,23 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 		sb.WriteString("}\n")
 	}
 
+	// Emit synthetic union types sorted by name
+	var unionNames []string
+	for name := range syntheticUnions {
+		unionNames = append(unionNames, name)
+	}
+	sort.Strings(unionNames)
+
+	for _, name := range unionNames {
+		members := syntheticUnions[name]
+		fmt.Fprintf(&sb, "\nunion %s = %s\n", name, strings.Join(members, " | "))
+	}
+
 	return []byte(sb.String()), nil
 }
 
 // processEndpoint processes a single classified endpoint and returns an inferred operation.
-func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCounter *int, syntheticTypes map[string]*inferredType, syntheticInputTypes map[string]*inferredType) (inferredOperation, bool) {
+func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCounter *int, syntheticTypes map[string]*inferredType, syntheticInputTypes map[string]*inferredType, syntheticUnions map[string][]string) (inferredOperation, bool) {
 	if ep.APIType != "graphql" {
 		return inferredOperation{}, false
 	}
@@ -262,7 +281,7 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 	}
 	seen[dedupKey] = true
 
-	args := buildArgTypes(parsed, body.Variables)
+	args := buildArgTypes(parsed, body.Variables, syntheticInputTypes)
 	inferInputTypes(parsed, body.Variables, syntheticInputTypes)
 
 	returnTypeName := upperFirst(fieldName) + "Response"
@@ -270,8 +289,47 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 
 	responseObj, isList, responseOK := unwrapResponseValue(ep.Response.Body, fieldName)
 	var responseFields map[string]string
-	if responseOK && responseObj != nil && len(parsed.selectionTree) > 0 {
+
+	if len(parsed.inlineFragments) >= 2 && !parsed.hasNonFragmentFields {
+		// Fix 5: Union type inference from inline fragments
+		unionName := typePrefix + "Result"
+		var memberNames []string
+
+		// Merge all array elements for type inference
+		mergedObj := mergeArrayElements(ep.Response.Body, fieldName)
+		if mergedObj == nil {
+			mergedObj = responseObj
+		}
+
+		for _, frag := range parsed.inlineFragments {
+			memberNames = append(memberNames, frag.TypeName)
+			fragFields := inferFieldsRecursive(mergedObj, frag.SelectionTree, frag.TypeName, syntheticTypes)
+			if len(fragFields) > 0 {
+				if existing, ok := syntheticTypes[frag.TypeName]; ok {
+					for k, v := range fragFields {
+						if _, exists := existing.Fields[k]; !exists {
+							existing.Fields[k] = v
+						}
+					}
+				} else {
+					syntheticTypes[frag.TypeName] = &inferredType{
+						Name:   frag.TypeName,
+						Fields: fragFields,
+					}
+				}
+			}
+		}
+
+		syntheticUnions[unionName] = memberNames
+		returnTypeName = unionName
+	} else if responseOK && responseObj != nil && len(parsed.selectionTree) > 0 {
 		responseFields = inferFieldsRecursive(responseObj, parsed.selectionTree, typePrefix, syntheticTypes)
+	} else if scalarType, ok := detectScalarReturnType(ep.Response.Body, fieldName); ok {
+		// Fix 1: Scalar root field return
+		returnTypeName = scalarType
+	} else if len(parsed.selectionTree) > 0 {
+		// Fix 4: Response was null/error but we have selection tree — generate type from selection fields
+		responseFields = inferFieldsRecursive(nil, parsed.selectionTree, typePrefix, syntheticTypes)
 	} else {
 		// Fallback: existing flat inference
 		responseFields, isList = inferFieldsFromResponse(ep.Response.Body, fieldName, parsed.selectionFields)
@@ -293,15 +351,23 @@ type selectionNode struct {
 	Children []*selectionNode // nil = leaf (scalar), non-nil = object with sub-fields
 }
 
+// inlineFragmentInfo holds type condition and selection tree from an inline fragment.
+type inlineFragmentInfo struct {
+	TypeName      string           // the type condition, e.g., "PasteObject"
+	SelectionTree []*selectionNode // nested selection tree for this fragment
+}
+
 // parsedQuery holds the results of parsing a GraphQL query string with gqlparser.
 type parsedQuery struct {
-	opType          ast.Operation
-	opName          string
-	rootFieldName   string
-	rootFieldArgs   []*ast.Argument // arguments on the root field
-	varDefs         ast.VariableDefinitionList
-	selectionFields []string           // field names from the root field's selection set (flat)
-	selectionTree   []*selectionNode   // nested selection tree for recursive type inference
+	opType               ast.Operation
+	opName               string
+	rootFieldName        string
+	rootFieldArgs        []*ast.Argument // arguments on the root field
+	varDefs              ast.VariableDefinitionList
+	selectionFields      []string              // field names from the root field's selection set (flat)
+	selectionTree        []*selectionNode      // nested selection tree for recursive type inference
+	inlineFragments      []inlineFragmentInfo  // inline fragments with type conditions on root field
+	hasNonFragmentFields bool                  // true if root field has direct field selections alongside inline fragments
 }
 
 // parseQueryAST parses a GraphQL query string and extracts operation info.
@@ -325,6 +391,8 @@ func parseQueryAST(query string) *parsedQuery {
 			result.rootFieldArgs = field.Arguments
 			result.selectionFields = collectSelectionFields(field.SelectionSet, doc.Fragments)
 			result.selectionTree = collectSelectionTree(field.SelectionSet, doc.Fragments)
+			result.inlineFragments = collectInlineFragments(field.SelectionSet, doc.Fragments)
+			result.hasNonFragmentFields = hasTopLevelFields(field.SelectionSet)
 		}
 	}
 
@@ -416,6 +484,49 @@ func collectSelectionTree(selections ast.SelectionSet, fragments ast.FragmentDef
 	}
 
 	return nodes
+}
+
+// collectInlineFragments extracts inline fragments with type conditions from a selection set.
+func collectInlineFragments(selections ast.SelectionSet, fragments ast.FragmentDefinitionList) []inlineFragmentInfo {
+	var frags []inlineFragmentInfo
+	seen := make(map[string]bool)
+
+	for _, sel := range selections {
+		switch s := sel.(type) {
+		case *ast.InlineFragment:
+			if s.TypeCondition != "" && !seen[s.TypeCondition] {
+				seen[s.TypeCondition] = true
+				tree := collectSelectionTree(s.SelectionSet, fragments)
+				frags = append(frags, inlineFragmentInfo{
+					TypeName:      s.TypeCondition,
+					SelectionTree: tree,
+				})
+			}
+		case *ast.FragmentSpread:
+			if frag := fragments.ForName(s.Name); frag != nil {
+				nested := collectInlineFragments(frag.SelectionSet, fragments)
+				for _, n := range nested {
+					if !seen[n.TypeName] {
+						seen[n.TypeName] = true
+						frags = append(frags, n)
+					}
+				}
+			}
+		}
+	}
+
+	return frags
+}
+
+// hasTopLevelFields returns true if a selection set contains direct field selections
+// (not inside inline fragments). Used to distinguish union patterns from interface patterns.
+func hasTopLevelFields(selections ast.SelectionSet) bool {
+	for _, sel := range selections {
+		if f, ok := sel.(*ast.Field); ok && !isMetaField(f.Name) {
+			return true
+		}
+	}
+	return false
 }
 
 // mergeIntoNodeList merges source nodes into an existing ordered node list with deduplication.
@@ -672,9 +783,65 @@ func astTypeToSDL(t *ast.Type) string {
 	return base
 }
 
+// inferTypeFromASTValue infers a GraphQL type from an AST value kind.
+func inferTypeFromASTValue(v *ast.Value) string {
+	if v == nil {
+		return "String"
+	}
+	switch v.Kind {
+	case ast.IntValue:
+		return "Int"
+	case ast.FloatValue:
+		return "Float"
+	case ast.BooleanValue:
+		return "Boolean"
+	case ast.StringValue, ast.BlockValue:
+		return "String"
+	case ast.ListValue:
+		if len(v.Children) > 0 {
+			elemType := inferTypeFromASTValue(v.Children[0].Value)
+			return "[" + elemType + "]"
+		}
+		return "[String]"
+	default:
+		return "String"
+	}
+}
+
+// inferInputTypeFromASTObject creates an input type definition from an AST object value.
+func inferInputTypeFromASTObject(value *ast.Value, typeName string, inputTypes map[string]*inferredType) {
+	if value == nil || value.Kind != ast.ObjectValue {
+		return
+	}
+
+	fields := make(map[string]string)
+	for _, child := range value.Children {
+		if child.Value != nil && child.Value.Kind == ast.ObjectValue {
+			nestedTypeName := typeName + "_" + upperFirst(child.Name)
+			inferInputTypeFromASTObject(child.Value, nestedTypeName, inputTypes)
+			fields[child.Name] = nestedTypeName
+		} else {
+			fields[child.Name] = inferTypeFromASTValue(child.Value)
+		}
+	}
+
+	if existing, ok := inputTypes[typeName]; ok {
+		for k, v := range fields {
+			if _, exists := existing.Fields[k]; !exists {
+				existing.Fields[k] = v
+			}
+		}
+	} else {
+		inputTypes[typeName] = &inferredType{
+			Name:   typeName,
+			Fields: fields,
+		}
+	}
+}
+
 // buildArgTypes builds argument type mappings. It prefers declared variable types from the AST,
 // falling back to JSON value inference for variables not declared in the query.
-func buildArgTypes(parsed *parsedQuery, variables map[string]interface{}) map[string]string {
+func buildArgTypes(parsed *parsedQuery, variables map[string]interface{}, inputTypes map[string]*inferredType) map[string]string {
 	args := make(map[string]string)
 
 	// Build a map from variable name to its declared type
@@ -698,6 +865,18 @@ func buildArgTypes(parsed *parsedQuery, variables map[string]interface{}) map[st
 				args[argName] = inferTypeFromValue(val)
 				continue
 			}
+		}
+		// Fix 3: Inline object literal — create input type
+		if arg.Value != nil && arg.Value.Kind == ast.ObjectValue {
+			inputTypeName := upperFirst(argName) + "Input"
+			inferInputTypeFromASTObject(arg.Value, inputTypeName, inputTypes)
+			args[argName] = inputTypeName
+			continue
+		}
+		// Fix 2: Infer type from inline literal value
+		if arg.Value != nil {
+			args[argName] = inferTypeFromASTValue(arg.Value)
+			continue
 		}
 		// Default fallback
 		args[argName] = "String"
@@ -854,6 +1033,117 @@ func unwrapResponseValue(body []byte, rootFieldName string) (map[string]interfac
 	default:
 		return nil, false, false
 	}
+}
+
+// detectScalarReturnType checks if a GraphQL response field is a scalar value
+// and returns the corresponding SDL type name.
+func detectScalarReturnType(body []byte, rootFieldName string) (string, bool) {
+	if len(body) == 0 {
+		return "", false
+	}
+
+	var envelope map[string]interface{}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return "", false
+	}
+
+	data, ok := envelope["data"]
+	if !ok {
+		return "", false
+	}
+
+	dataMap, ok := data.(map[string]interface{})
+	if !ok {
+		return "", false
+	}
+
+	responseVal, ok := dataMap[rootFieldName]
+	if !ok {
+		keys := make([]string, 0, len(dataMap))
+		for k := range dataMap {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		if len(keys) > 0 {
+			responseVal = dataMap[keys[0]]
+		} else {
+			return "", false
+		}
+	}
+
+	switch v := responseVal.(type) {
+	case string:
+		return "String", true
+	case bool:
+		return "Boolean", true
+	case float64:
+		if v == math.Trunc(v) {
+			return "Int", true
+		}
+		return "Float", true
+	default:
+		return "", false
+	}
+}
+
+// mergeArrayElements parses a GraphQL response and merges all array elements
+// for the given root field into a single map for comprehensive type inference.
+func mergeArrayElements(body []byte, rootFieldName string) map[string]interface{} {
+	if len(body) == 0 {
+		return nil
+	}
+
+	var envelope map[string]interface{}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil
+	}
+
+	data, ok := envelope["data"]
+	if !ok {
+		return nil
+	}
+
+	dataMap, ok := data.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	responseVal, ok := dataMap[rootFieldName]
+	if !ok {
+		return nil
+	}
+
+	arr, ok := responseVal.([]interface{})
+	if !ok {
+		return nil
+	}
+
+	merged := make(map[string]interface{})
+	for _, elem := range arr {
+		if obj, ok := elem.(map[string]interface{}); ok {
+			for k, v := range obj {
+				if _, exists := merged[k]; !exists {
+					merged[k] = v
+				}
+			}
+		}
+	}
+
+	return merged
+}
+
+// isMoreSpecificType returns true if newType is more specific than existingType.
+// Used during merge to prefer typed args over String defaults.
+func isMoreSpecificType(newType, existingType string) bool {
+	if existingType == "String" && newType != "String" && newType != "" {
+		return true
+	}
+	// Prefer non-null over nullable of the same base type
+	if strings.HasSuffix(newType, "!") && !strings.HasSuffix(existingType, "!") &&
+		strings.TrimSuffix(newType, "!") == existingType {
+		return true
+	}
+	return false
 }
 
 // upperFirst returns the string with its first character uppercased.

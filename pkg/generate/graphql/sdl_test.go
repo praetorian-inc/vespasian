@@ -1235,3 +1235,296 @@ func TestGenerator_Phase2_InputTypeNullVariableSkipped(t *testing.T) {
 		t.Errorf("should not generate input type for null variable, got:\n%s", sdl)
 	}
 }
+
+func TestGenerator_Phase2_ScalarReturnType(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query { systemHealth }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"systemHealth":"OK"}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query { deleteAllPastes }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"deleteAllPastes":true}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Scalar string return should use String directly, not SystemHealthResponse
+	if !strings.Contains(sdl, "systemHealth: String") {
+		t.Errorf("expected 'systemHealth: String' (scalar return), got:\n%s", sdl)
+	}
+	if strings.Contains(sdl, "SystemHealthResponse") {
+		t.Errorf("should not create SystemHealthResponse for scalar return, got:\n%s", sdl)
+	}
+	// Scalar boolean return
+	if !strings.Contains(sdl, "deleteAllPastes: Boolean") {
+		t.Errorf("expected 'deleteAllPastes: Boolean' (scalar return), got:\n%s", sdl)
+	}
+	if strings.Contains(sdl, "DeleteAllPastesResponse") {
+		t.Errorf("should not create DeleteAllPastesResponse for scalar return, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_InlineLiteralArgTypes(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"{ paste(id: 1) { title } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"paste":{"title":"Hello"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"{ pastes(public: true, limit: 10) { title } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"pastes":[{"title":"Hello"}]}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Inline int literal should be inferred as Int
+	if !strings.Contains(sdl, "id: Int") {
+		t.Errorf("expected 'id: Int' from inline literal, got:\n%s", sdl)
+	}
+	// Inline boolean literal
+	if !strings.Contains(sdl, "public: Boolean") {
+		t.Errorf("expected 'public: Boolean' from inline literal, got:\n%s", sdl)
+	}
+	// Inline int literal
+	if !strings.Contains(sdl, "limit: Int") {
+		t.Errorf("expected 'limit: Int' from inline literal, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_InlineObjectLiteralInputType(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"mutation { createUser(userData: {username: \"test\", email: \"test@test.com\", password: \"pass\"}) { id } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"createUser":{"id":"1"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Should create an input type from the inline object literal
+	if !strings.Contains(sdl, "userData: UserDataInput") {
+		t.Errorf("expected 'userData: UserDataInput' from inline object, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "input UserDataInput {") {
+		t.Errorf("expected 'input UserDataInput' type definition, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "username: String") {
+		t.Errorf("expected 'username: String' in input type, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "email: String") {
+		t.Errorf("expected 'email: String' in input type, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "password: String") {
+		t.Errorf("expected 'password: String' in input type, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_NullResponseFallbackToSelectionTree(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query { paste(id: 1) { id title content public } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"paste":null}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Even with null response, should generate type from selection tree
+	if !strings.Contains(sdl, "type PasteResponse {") {
+		t.Errorf("expected 'type PasteResponse' even with null response, got:\n%s", sdl)
+	}
+	// Fields should default to String when response is null
+	if !strings.Contains(sdl, "id: String") {
+		t.Errorf("expected 'id: String' fallback field, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "title: String") {
+		t.Errorf("expected 'title: String' fallback field, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "content: String") {
+		t.Errorf("expected 'content: String' fallback field, got:\n%s", sdl)
+	}
+	// Arg type from inline literal
+	if !strings.Contains(sdl, "id: Int") {
+		t.Errorf("expected 'id: Int' arg from inline literal, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_UnionTypeFromInlineFragments(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query { search(keyword: \"test\") { ... on PasteObject { id title content } ... on UserObject { id username password } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"search":[{"id":"1","title":"Test","content":"Hello"},{"id":"2","username":"admin","password":"secret"}]}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Should create a union type
+	if !strings.Contains(sdl, "union SearchResult = PasteObject | UserObject") {
+		t.Errorf("expected union declaration, got:\n%s", sdl)
+	}
+	// Return type should reference the union
+	if !strings.Contains(sdl, "search(keyword: String): [SearchResult]") {
+		t.Errorf("expected 'search(...): [SearchResult]', got:\n%s", sdl)
+	}
+	// Separate types for each fragment member
+	if !strings.Contains(sdl, "type PasteObject {") {
+		t.Errorf("expected 'type PasteObject', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "type UserObject {") {
+		t.Errorf("expected 'type UserObject', got:\n%s", sdl)
+	}
+	// PasteObject should have its own fields
+	if !strings.Contains(sdl, "title: String") {
+		t.Errorf("expected 'title: String' in PasteObject, got:\n%s", sdl)
+	}
+	// UserObject should have its own fields
+	if !strings.Contains(sdl, "username: String") {
+		t.Errorf("expected 'username: String' in UserObject, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_MergePreferSpecificTypes(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		// Anonymous operation with inline literals (will infer String for all)
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"{ pastes(public: true, limit: 10) { id title } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"pastes":[{"id":"1","title":"Hello"}]}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+		// Named operation with typed variable declarations
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query GetPastes($public: Boolean, $limit: Int) { pastes(public: $public, limit: $limit) { id title } }","variables":{"public":true,"limit":10}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"pastes":[{"id":"1","title":"Hello"}]}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// The merge should prefer Boolean over the inline-inferred type
+	if !strings.Contains(sdl, "public: Boolean") {
+		t.Errorf("expected 'public: Boolean' after merge (specific over String), got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "limit: Int") {
+		t.Errorf("expected 'limit: Int' after merge (specific over String), got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_ErrorResponseFallbackToSelectionTree(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query { me(token: \"invalid\") { id username } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"errors":[{"message":"Unauthorized"}]}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Even with error response, should generate type from selection tree
+	if !strings.Contains(sdl, "type MeResponse {") {
+		t.Errorf("expected 'type MeResponse' even with error response, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "id: String") {
+		t.Errorf("expected 'id: String' fallback field, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "username: String") {
+		t.Errorf("expected 'username: String' fallback field, got:\n%s", sdl)
+	}
+}
