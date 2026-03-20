@@ -98,6 +98,9 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 			op := &groupOps[i]
 			if existing, ok := merged[op.FieldName]; ok {
 				// Merge args: prefer more specific types over String
+				if existing.Args == nil {
+					existing.Args = make(map[string]string)
+				}
 				for k, v := range op.Args {
 					if existingType, exists := existing.Args[k]; !exists {
 						existing.Args[k] = v
@@ -106,6 +109,9 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 					}
 				}
 				// Merge response fields: prefer more specific types
+				if existing.ResponseFields == nil {
+					existing.ResponseFields = make(map[string]string)
+				}
 				for k, v := range op.ResponseFields {
 					if existingType, exists := existing.ResponseFields[k]; !exists {
 						existing.ResponseFields[k] = v
