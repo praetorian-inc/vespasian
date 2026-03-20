@@ -1528,3 +1528,170 @@ func TestGenerator_Phase2_ErrorResponseFallbackToSelectionTree(t *testing.T) {
 		t.Errorf("expected 'username: String' fallback field, got:\n%s", sdl)
 	}
 }
+
+func TestGenerator_Phase2_CrossTypeFieldTypePropagation(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		// pastes returns real data with correct types
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query { pastes { id title content burn public ownerId } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"pastes":[{"id":"1","title":"Test","content":"Hello","burn":false,"public":true,"ownerId":1}]}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+		// paste returns null — all fields default to String
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query { paste(id: 1) { id title content burn public ownerId } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"paste":null}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// PasteResponse (from null response) should have types propagated from PastesResponse
+	if !strings.Contains(sdl, "type PasteResponse {") {
+		t.Errorf("expected 'type PasteResponse', got:\n%s", sdl)
+	}
+
+	// Check PasteResponse has propagated types, not all-String
+	// Extract PasteResponse block
+	pasteRespIdx := strings.Index(sdl, "type PasteResponse {")
+	if pasteRespIdx < 0 {
+		t.Fatal("PasteResponse not found in output")
+	}
+	pasteRespEnd := strings.Index(sdl[pasteRespIdx:], "}\n")
+	pasteRespBlock := sdl[pasteRespIdx : pasteRespIdx+pasteRespEnd+2]
+
+	if !strings.Contains(pasteRespBlock, "burn: Boolean") {
+		t.Errorf("expected 'burn: Boolean' in PasteResponse (propagated), got:\n%s", pasteRespBlock)
+	}
+	if !strings.Contains(pasteRespBlock, "public: Boolean") {
+		t.Errorf("expected 'public: Boolean' in PasteResponse (propagated), got:\n%s", pasteRespBlock)
+	}
+	if !strings.Contains(pasteRespBlock, "ownerId: Int") {
+		t.Errorf("expected 'ownerId: Int' in PasteResponse (propagated), got:\n%s", pasteRespBlock)
+	}
+}
+
+func TestGenerator_Phase2_CrossTypePropagationSafety(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		// deletePaste has result: Boolean (only 1 field — too few to group)
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"mutation { deletePaste(id: 1) { result } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"deletePaste":{"result":true}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+		// importPaste has result: String (only 1 field — should NOT be changed to Boolean)
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"mutation { importPaste(url: \"http://example.com\") { result } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"importPaste":{"result":"success"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+
+	// ImportPasteResponse should keep result: String (not cross-pollinated from DeletePasteResponse)
+	importIdx := strings.Index(sdl, "type ImportPasteResponse {")
+	if importIdx < 0 {
+		t.Fatal("ImportPasteResponse not found in output")
+	}
+	importEnd := strings.Index(sdl[importIdx:], "}\n")
+	importBlock := sdl[importIdx : importIdx+importEnd+2]
+
+	if !strings.Contains(importBlock, "result: String") {
+		t.Errorf("expected 'result: String' in ImportPasteResponse (NOT propagated), got:\n%s", importBlock)
+	}
+}
+
+func TestUnifyStructuralFieldTypes_Unit(t *testing.T) {
+	// Type A has real data: burn=Boolean, public=Boolean, ownerId=Int
+	// Type B has null fallback: burn=String, public=String, ownerId=String
+	// Both share 6 scalar fields with identical names → should unify
+	typeA := &inferredType{
+		Name: "TypeA",
+		Fields: map[string]string{
+			"id":      "String",
+			"title":   "String",
+			"content": "String",
+			"burn":    "Boolean",
+			"public":  "Boolean",
+			"ownerId": "Int",
+		},
+	}
+	typeB := &inferredType{
+		Name: "TypeB",
+		Fields: map[string]string{
+			"id":      "String",
+			"title":   "String",
+			"content": "String",
+			"burn":    "String",
+			"public":  "String",
+			"ownerId": "String",
+		},
+	}
+	// Type C is unrelated (only 1 shared field)
+	typeC := &inferredType{
+		Name: "TypeC",
+		Fields: map[string]string{
+			"result": "Boolean",
+		},
+	}
+
+	types := map[string]*inferredType{
+		"TypeA": typeA,
+		"TypeB": typeB,
+		"TypeC": typeC,
+	}
+
+	unifyStructuralFieldTypes(types)
+
+	// TypeB should have propagated types from TypeA
+	if types["TypeB"].Fields["burn"] != "Boolean" {
+		t.Errorf("expected TypeB.burn = Boolean, got %s", types["TypeB"].Fields["burn"])
+	}
+	if types["TypeB"].Fields["public"] != "Boolean" {
+		t.Errorf("expected TypeB.public = Boolean, got %s", types["TypeB"].Fields["public"])
+	}
+	if types["TypeB"].Fields["ownerId"] != "Int" {
+		t.Errorf("expected TypeB.ownerId = Int, got %s", types["TypeB"].Fields["ownerId"])
+	}
+	// TypeC should be unchanged
+	if types["TypeC"].Fields["result"] != "Boolean" {
+		t.Errorf("expected TypeC.result = Boolean (unchanged), got %s", types["TypeC"].Fields["result"])
+	}
+	// TypeA should be unchanged
+	if types["TypeA"].Fields["burn"] != "Boolean" {
+		t.Errorf("expected TypeA.burn = Boolean (unchanged), got %s", types["TypeA"].Fields["burn"])
+	}
+}

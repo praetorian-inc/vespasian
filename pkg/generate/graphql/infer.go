@@ -155,6 +155,9 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 		}
 	}
 
+	// Cross-type field type propagation: unify structurally similar types
+	unifyStructuralFieldTypes(syntheticTypes)
+
 	// Emit operation types in canonical order
 	for _, opType := range []string{"query", "mutation", "subscription"} {
 		groupOps, ok := grouped[opType]
@@ -1239,6 +1242,145 @@ func isMoreSpecificType(newType, existingType string) bool {
 		return true
 	}
 	return false
+}
+
+// isScalarType returns true if the type string represents a built-in GraphQL scalar.
+func isScalarType(t string) bool {
+	base := strings.TrimSuffix(t, "!")
+	return builtinScalars[base]
+}
+
+// scalarFieldNames returns the set of field names whose types are scalars.
+func scalarFieldNames(st *inferredType) map[string]bool {
+	names := make(map[string]bool)
+	for fieldName, fieldType := range st.Fields {
+		if isScalarType(fieldType) {
+			names[fieldName] = true
+		}
+	}
+	return names
+}
+
+// jaccardSimilarity computes |A∩B| / |A∪B| for two string sets.
+func jaccardSimilarity(a, b map[string]bool) float64 {
+	if len(a) == 0 && len(b) == 0 {
+		return 0
+	}
+	intersection := 0
+	for k := range a {
+		if b[k] {
+			intersection++
+		}
+	}
+	union := len(a) + len(b) - intersection
+	if union == 0 {
+		return 0
+	}
+	return float64(intersection) / float64(union)
+}
+
+// unifyStructuralFieldTypes detects structurally similar synthetic types and
+// propagates more-specific scalar field types across them. This fixes the case
+// where null responses cause all fields to default to String, even when other
+// operations returning the same structure have real data with correct types.
+func unifyStructuralFieldTypes(syntheticTypes map[string]*inferredType) {
+	// Step 1: Collect scalar field name sets for each type (skip types with < 3 scalar fields)
+	type typeInfo struct {
+		name        string
+		scalarNames map[string]bool
+	}
+	var candidates []typeInfo
+	for name, st := range syntheticTypes {
+		sn := scalarFieldNames(st)
+		if len(sn) >= 3 {
+			candidates = append(candidates, typeInfo{name: name, scalarNames: sn})
+		}
+	}
+
+	if len(candidates) < 2 {
+		return
+	}
+
+	// Sort for deterministic grouping
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].name < candidates[j].name
+	})
+
+	// Step 2: Union-find to group structurally similar types
+	parent := make([]int, len(candidates))
+	for i := range parent {
+		parent[i] = i
+	}
+	var find func(int) int
+	find = func(x int) int {
+		if parent[x] != x {
+			parent[x] = find(parent[x])
+		}
+		return parent[x]
+	}
+	union := func(x, y int) {
+		px, py := find(x), find(y)
+		if px != py {
+			parent[px] = py
+		}
+	}
+
+	for i := 0; i < len(candidates); i++ {
+		for j := i + 1; j < len(candidates); j++ {
+			// Count shared scalar fields
+			shared := 0
+			for k := range candidates[i].scalarNames {
+				if candidates[j].scalarNames[k] {
+					shared++
+				}
+			}
+			if shared >= 3 && jaccardSimilarity(candidates[i].scalarNames, candidates[j].scalarNames) >= 0.5 {
+				union(i, j)
+			}
+		}
+	}
+
+	// Step 3: Collect groups
+	groups := make(map[int][]int)
+	for i := range candidates {
+		root := find(i)
+		groups[root] = append(groups[root], i)
+	}
+
+	// Step 4: Within each group, propagate the most specific type for each scalar field
+	for _, members := range groups {
+		if len(members) < 2 {
+			continue
+		}
+
+		// Find the best type for each field across all group members
+		bestType := make(map[string]string)
+		for _, idx := range members {
+			st := syntheticTypes[candidates[idx].name]
+			for fieldName, fieldType := range st.Fields {
+				if !isScalarType(fieldType) {
+					continue
+				}
+				if existing, ok := bestType[fieldName]; !ok {
+					bestType[fieldName] = fieldType
+				} else if isMoreSpecificType(fieldType, existing) {
+					bestType[fieldName] = fieldType
+				}
+			}
+		}
+
+		// Apply best types back to all group members (only upgrade, never downgrade)
+		for _, idx := range members {
+			st := syntheticTypes[candidates[idx].name]
+			for fieldName, best := range bestType {
+				if current, ok := st.Fields[fieldName]; ok && isScalarType(current) {
+					if isMoreSpecificType(best, current) {
+						st.Fields[fieldName] = best
+					}
+				}
+			}
+		}
+	}
 }
 
 // upperFirst returns the string with its first character uppercased.
