@@ -175,7 +175,17 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 		// Convention: union is FooResult, response type is FooResponse
 		baseName := strings.TrimSuffix(unionName, "Result")
 		responseName := baseName + "Response"
-		if responseType, ok := syntheticTypes[responseName]; ok {
+
+		// Check if the Response type name is a union member — if so, keep it
+		isUnionMember := false
+		for _, m := range members {
+			if m == responseName {
+				isUnionMember = true
+				break
+			}
+		}
+
+		if responseType, ok := syntheticTypes[responseName]; ok && !isUnionMember {
 			// Merge response fields into the first union member type
 			if len(members) > 0 && len(responseType.Fields) > 0 {
 				firstMember := members[0]
@@ -396,7 +406,7 @@ func processParsedQuery(parsed *parsedQuery, ep classify.ClassifiedRequest, body
 
 		for _, frag := range parsed.inlineFragments {
 			memberNames = append(memberNames, frag.TypeName)
-			fragFields := inferFieldsRecursive(mergedObj, frag.SelectionTree, frag.TypeName, syntheticTypes, varTypes, syntheticInputTypes, frag.TypeName)
+			fragFields := inferFieldsRecursive(mergedObj, frag.SelectionTree, frag.TypeName, syntheticTypes, varTypes, syntheticInputTypes, frag.TypeName, syntheticUnions)
 			if len(fragFields) > 0 {
 				if existing, ok := syntheticTypes[frag.TypeName]; ok {
 					for k, v := range fragFields {
@@ -431,12 +441,12 @@ func processParsedQuery(parsed *parsedQuery, ep classify.ClassifiedRequest, body
 		}
 		returnTypeName = unionName
 	} else if responseOK && responseObj != nil && len(parsed.selectionTree) > 0 {
-		responseFields = inferFieldsRecursive(responseObj, parsed.selectionTree, typePrefix, syntheticTypes, varTypes, syntheticInputTypes, returnTypeName)
+		responseFields = inferFieldsRecursive(responseObj, parsed.selectionTree, typePrefix, syntheticTypes, varTypes, syntheticInputTypes, returnTypeName, syntheticUnions)
 	} else if scalarType, ok := detectScalarReturnType(ep.Response.Body, fieldName); ok {
 		returnTypeName = scalarType
 	} else if len(parsed.selectionTree) > 0 {
 		// Response was null/error but we have selection tree — generate type from selection fields
-		responseFields = inferFieldsRecursive(nil, parsed.selectionTree, typePrefix, syntheticTypes, varTypes, syntheticInputTypes, returnTypeName)
+		responseFields = inferFieldsRecursive(nil, parsed.selectionTree, typePrefix, syntheticTypes, varTypes, syntheticInputTypes, returnTypeName, syntheticUnions)
 	} else {
 		// Fallback: existing flat inference
 		responseFields, isList = inferFieldsFromResponse(ep.Response.Body, fieldName, parsed.selectionFields)
@@ -454,9 +464,11 @@ func processParsedQuery(parsed *parsedQuery, ep classify.ClassifiedRequest, body
 
 // selectionNode represents a field in a nested selection tree.
 type selectionNode struct {
-	Name      string
-	Children  []*selectionNode // nil = leaf (scalar), non-nil = object with sub-fields
-	Arguments []*ast.Argument  // field-level arguments from the query AST
+	Name            string
+	Children        []*selectionNode   // nil = leaf (scalar), non-nil = object with sub-fields
+	Arguments       []*ast.Argument    // field-level arguments from the query AST
+	InlineFragments []inlineFragmentInfo // inline fragments with type conditions on this sub-field
+	HasDirectFields bool                 // true if this field has direct field selections alongside inline fragments
 }
 
 // inlineFragmentInfo holds type condition and selection tree from an inline fragment.
@@ -596,21 +608,51 @@ func collectSelectionTree(selections ast.SelectionSet, fragments ast.FragmentDef
 				continue
 			}
 			var children []*selectionNode
+			var subFrags []inlineFragmentInfo
+			hasDirectFields := false
 			if len(s.SelectionSet) > 0 {
-				children = collectSelectionTree(s.SelectionSet, fragments)
+				// Check if this sub-field has inline fragments (union/interface pattern)
+				subFrags = collectInlineFragments(s.SelectionSet, fragments)
+				hasDirectFields = hasTopLevelFields(s.SelectionSet)
+				if len(subFrags) > 0 && !hasDirectFields {
+					// Pure union/interface pattern: don't flatten into children
+					children = nil
+				} else {
+					children = collectSelectionTree(s.SelectionSet, fragments)
+				}
 			}
 			if idx, ok := seen[s.Name]; ok {
 				// Merge children into existing node
 				if children != nil {
 					nodes[idx].Children = mergeSelectionNodes(nodes[idx].Children, children)
 				}
-				// Merge arguments: keep first non-empty set
-				if len(nodes[idx].Arguments) == 0 && len(s.Arguments) > 0 {
-					nodes[idx].Arguments = s.Arguments
+				// Merge inline fragments from sub-field
+				if len(subFrags) > 0 {
+					nodes[idx].InlineFragments = mergeInlineFragments(nodes[idx].InlineFragments, subFrags)
+					nodes[idx].HasDirectFields = nodes[idx].HasDirectFields || hasDirectFields
+				}
+				// Merge arguments: union by argument name
+				for _, newArg := range s.Arguments {
+					found := false
+					for _, existingArg := range nodes[idx].Arguments {
+						if existingArg.Name == newArg.Name {
+							found = true
+							break
+						}
+					}
+					if !found {
+						nodes[idx].Arguments = append(nodes[idx].Arguments, newArg)
+					}
 				}
 			} else {
 				seen[s.Name] = len(nodes)
-				nodes = append(nodes, &selectionNode{Name: s.Name, Children: children, Arguments: s.Arguments})
+				nodes = append(nodes, &selectionNode{
+					Name:            s.Name,
+					Children:        children,
+					Arguments:       s.Arguments,
+					InlineFragments: subFrags,
+					HasDirectFields: hasDirectFields,
+				})
 			}
 		case *ast.FragmentSpread:
 			if frag := fragments.ForName(s.Name); frag != nil {
@@ -629,18 +671,22 @@ func collectSelectionTree(selections ast.SelectionSet, fragments ast.FragmentDef
 // collectInlineFragments extracts inline fragments with type conditions from a selection set.
 func collectInlineFragments(selections ast.SelectionSet, fragments ast.FragmentDefinitionList) []inlineFragmentInfo {
 	var frags []inlineFragmentInfo
-	seen := make(map[string]bool)
+	seen := make(map[string]int) // type name -> index in frags (merge duplicate type conditions)
 
 	for _, sel := range selections {
 		switch s := sel.(type) {
 		case *ast.InlineFragment:
-			if s.TypeCondition != "" && !seen[s.TypeCondition] {
-				seen[s.TypeCondition] = true
+			if s.TypeCondition != "" {
 				tree := collectSelectionTree(s.SelectionSet, fragments)
-				frags = append(frags, inlineFragmentInfo{
-					TypeName:      s.TypeCondition,
-					SelectionTree: tree,
-				})
+				if idx, ok := seen[s.TypeCondition]; ok {
+					frags[idx].SelectionTree = mergeSelectionNodes(frags[idx].SelectionTree, tree)
+				} else {
+					seen[s.TypeCondition] = len(frags)
+					frags = append(frags, inlineFragmentInfo{
+						TypeName:      s.TypeCondition,
+						SelectionTree: tree,
+					})
+				}
 			}
 		case *ast.FragmentSpread:
 			if frag := fragments.ForName(s.Name); frag != nil {
@@ -650,12 +696,14 @@ func collectInlineFragments(selections ast.SelectionSet, fragments ast.FragmentD
 					// Fragment contains type-narrowing inline fragments (e.g., fragment X on Viewer { ... on User { ... } })
 					// Only extract the nested fragments — the outer fragment is on the parent type, not a union member
 					for _, n := range nested {
-						if !seen[n.TypeName] {
-							seen[n.TypeName] = true
+						if idx, ok := seen[n.TypeName]; ok {
+							frags[idx].SelectionTree = mergeSelectionNodes(frags[idx].SelectionTree, n.SelectionTree)
+						} else {
+							seen[n.TypeName] = len(frags)
 							frags = append(frags, n)
 						}
 					}
-				} else if frag.TypeCondition != "" && !seen[frag.TypeCondition] {
+				} else if frag.TypeCondition != "" {
 					// Fragment has no nested inline fragments and has substantive fields —
 					// treat it as a typed fragment (e.g., fragment UserFields on User { id profile { bio } }).
 					tree := collectSelectionTree(frag.SelectionSet, fragments)
@@ -667,11 +715,15 @@ func collectInlineFragments(selections ast.SelectionSet, fragments ast.FragmentD
 						}
 					}
 					if hasSubstantiveFields {
-						seen[frag.TypeCondition] = true
-						frags = append(frags, inlineFragmentInfo{
-							TypeName:      frag.TypeCondition,
-							SelectionTree: tree,
-						})
+						if idx, ok := seen[frag.TypeCondition]; ok {
+							frags[idx].SelectionTree = mergeSelectionNodes(frags[idx].SelectionTree, tree)
+						} else {
+							seen[frag.TypeCondition] = len(frags)
+							frags = append(frags, inlineFragmentInfo{
+								TypeName:      frag.TypeCondition,
+								SelectionTree: tree,
+							})
+						}
 					}
 				}
 			}
@@ -699,8 +751,23 @@ func mergeIntoNodeList(nodes []*selectionNode, seen map[string]int, source []*se
 			if sn.Children != nil {
 				nodes[idx].Children = mergeSelectionNodes(nodes[idx].Children, sn.Children)
 			}
-			if len(nodes[idx].Arguments) == 0 && len(sn.Arguments) > 0 {
-				nodes[idx].Arguments = sn.Arguments
+			// Merge inline fragments from sub-field
+			if len(sn.InlineFragments) > 0 {
+				nodes[idx].InlineFragments = mergeInlineFragments(nodes[idx].InlineFragments, sn.InlineFragments)
+				nodes[idx].HasDirectFields = nodes[idx].HasDirectFields || sn.HasDirectFields
+			}
+			// Merge arguments: union by argument name
+			for _, newArg := range sn.Arguments {
+				found := false
+				for _, existingArg := range nodes[idx].Arguments {
+					if existingArg.Name == newArg.Name {
+						found = true
+						break
+					}
+				}
+				if !found {
+					nodes[idx].Arguments = append(nodes[idx].Arguments, newArg)
+				}
 			}
 		} else {
 			seen[sn.Name] = len(nodes)
@@ -723,12 +790,47 @@ func mergeSelectionNodes(a, b []*selectionNode) []*selectionNode {
 			if n.Children != nil {
 				merged[idx].Children = mergeSelectionNodes(merged[idx].Children, n.Children)
 			}
-			if len(merged[idx].Arguments) == 0 && len(n.Arguments) > 0 {
-				merged[idx].Arguments = n.Arguments
+			// Merge inline fragments from sub-field
+			if len(n.InlineFragments) > 0 {
+				merged[idx].InlineFragments = mergeInlineFragments(merged[idx].InlineFragments, n.InlineFragments)
+				merged[idx].HasDirectFields = merged[idx].HasDirectFields || n.HasDirectFields
+			}
+			// Merge arguments: union by argument name
+			for _, newArg := range n.Arguments {
+				found := false
+				for _, existingArg := range merged[idx].Arguments {
+					if existingArg.Name == newArg.Name {
+						found = true
+						break
+					}
+				}
+				if !found {
+					merged[idx].Arguments = append(merged[idx].Arguments, newArg)
+				}
 			}
 		} else {
 			seen[n.Name] = len(merged)
 			merged = append(merged, n)
+		}
+	}
+	return merged
+}
+
+// mergeInlineFragments merges two inline fragment lists, deduplicating by type name
+// and merging selection trees for duplicate type conditions.
+func mergeInlineFragments(a, b []inlineFragmentInfo) []inlineFragmentInfo {
+	seen := make(map[string]int)
+	var merged []inlineFragmentInfo
+	for i, f := range a {
+		seen[f.TypeName] = i
+		merged = append(merged, f)
+	}
+	for _, f := range b {
+		if idx, ok := seen[f.TypeName]; ok {
+			merged[idx].SelectionTree = mergeSelectionNodes(merged[idx].SelectionTree, f.SelectionTree)
+		} else {
+			seen[f.TypeName] = len(merged)
+			merged = append(merged, f)
 		}
 	}
 	return merged
@@ -746,6 +848,7 @@ func inferFieldsRecursive(
 	varTypes map[string]string,
 	inputTypes map[string]*inferredType,
 	parentTypeName string,
+	syntheticUnions map[string][]string,
 ) map[string]string {
 	fields := make(map[string]string)
 
@@ -756,6 +859,71 @@ func inferFieldsRecursive(
 			if len(args) > 0 {
 				storeFieldArgs(syntheticTypes, parentTypeName, node.Name, args)
 			}
+		}
+
+		// Sub-field union/interface pattern: inline fragments without direct fields
+		if len(node.InlineFragments) > 0 && !node.HasDirectFields {
+			unionName := typePrefix + "_" + upperFirst(node.Name) + "Result"
+			var memberNames []string
+
+			// Extract nested response value for type matching
+			var nestedObj map[string]interface{}
+			isList := false
+			if responseObj != nil {
+				if v, ok := responseObj[node.Name]; ok {
+					switch rv := v.(type) {
+					case map[string]interface{}:
+						nestedObj = rv
+					case []interface{}:
+						isList = true
+						// Merge all array elements for richer type inference
+						nestedObj = mergeArrayElementsRaw(rv)
+					}
+				}
+			}
+
+			for _, frag := range node.InlineFragments {
+				memberNames = append(memberNames, frag.TypeName)
+				fragFields := inferFieldsRecursive(nestedObj, frag.SelectionTree, frag.TypeName, syntheticTypes, varTypes, inputTypes, frag.TypeName, syntheticUnions)
+				if len(fragFields) > 0 {
+					if existing, ok := syntheticTypes[frag.TypeName]; ok {
+						for k, v := range fragFields {
+							if _, exists := existing.Fields[k]; !exists {
+								existing.Fields[k] = v
+							}
+						}
+					} else {
+						syntheticTypes[frag.TypeName] = &inferredType{
+							Name:      frag.TypeName,
+							Fields:    fragFields,
+							FieldArgs: make(map[string]map[string]string),
+						}
+					}
+				}
+			}
+
+			// Register union (merge with existing members)
+			if existingMembers, ok := syntheticUnions[unionName]; ok {
+				memberSet := make(map[string]bool)
+				for _, m := range existingMembers {
+					memberSet[m] = true
+				}
+				for _, m := range memberNames {
+					if !memberSet[m] {
+						existingMembers = append(existingMembers, m)
+					}
+				}
+				syntheticUnions[unionName] = existingMembers
+			} else {
+				syntheticUnions[unionName] = memberNames
+			}
+
+			if isList {
+				fields[node.Name] = "[" + unionName + "]"
+			} else {
+				fields[node.Name] = unionName
+			}
+			continue
 		}
 
 		if node.Children == nil {
@@ -793,7 +961,7 @@ func inferFieldsRecursive(
 		}
 
 		// Recurse to build nested type fields
-		nestedFields := inferFieldsRecursive(nestedObj, node.Children, typePrefix+"_"+upperFirst(node.Name), syntheticTypes, varTypes, inputTypes, nestedTypeName)
+		nestedFields := inferFieldsRecursive(nestedObj, node.Children, typePrefix+"_"+upperFirst(node.Name), syntheticTypes, varTypes, inputTypes, nestedTypeName, syntheticUnions)
 
 		if len(nestedFields) > 0 {
 			if existing, ok := syntheticTypes[nestedTypeName]; ok {
@@ -1352,6 +1520,25 @@ func mergeArrayElements(body []byte, rootFieldName string) map[string]interface{
 		}
 	}
 
+	return merged
+}
+
+// mergeArrayElementsRaw merges all object elements of a raw JSON array into a single
+// map, collecting the union of all fields. Used for sub-field array union inference.
+func mergeArrayElementsRaw(arr []interface{}) map[string]interface{} {
+	merged := make(map[string]interface{})
+	for _, elem := range arr {
+		if obj, ok := elem.(map[string]interface{}); ok {
+			for k, v := range obj {
+				if _, exists := merged[k]; !exists {
+					merged[k] = v
+				}
+			}
+		}
+	}
+	if len(merged) == 0 {
+		return nil
+	}
 	return merged
 }
 
