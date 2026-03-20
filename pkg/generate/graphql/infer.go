@@ -66,8 +66,8 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 	seen := make(map[string]bool) // deduplicate by composite key (opType:fieldName:opName)
 
 	for _, ep := range endpoints {
-		if op, ok := processEndpoint(ep, seen, &anonCounter, syntheticTypes, syntheticInputTypes, syntheticUnions); ok {
-			ops = append(ops, op)
+		if epOps, ok := processEndpoint(ep, seen, &anonCounter, syntheticTypes, syntheticInputTypes, syntheticUnions); ok {
+			ops = append(ops, epOps...)
 		}
 	}
 
@@ -140,25 +140,67 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 	// Create root synthetic types from merged operations
 	for _, groupOps := range grouped {
 		for _, op := range groupOps {
-			if len(op.ResponseFields) > 0 {
-				if existing, ok := syntheticTypes[op.ReturnType]; ok {
-					// Merge fields into existing type: prefer more specific types
-					for k, v := range op.ResponseFields {
-						if existingType, exists := existing.Fields[k]; !exists {
-							existing.Fields[k] = v
-						} else if isMoreSpecificType(v, existingType) {
-							existing.Fields[k] = v
-						}
+			// Skip union return types — they don't need a plain type definition
+			if _, isUnion := syntheticUnions[op.ReturnType]; isUnion {
+				continue
+			}
+			fields := op.ResponseFields
+			if fields == nil {
+				fields = make(map[string]string)
+			}
+			if existing, ok := syntheticTypes[op.ReturnType]; ok {
+				// Merge fields into existing type: prefer more specific types
+				for k, v := range fields {
+					if existingType, exists := existing.Fields[k]; !exists {
+						existing.Fields[k] = v
+					} else if isMoreSpecificType(v, existingType) {
+						existing.Fields[k] = v
 					}
-				} else {
-					syntheticTypes[op.ReturnType] = &inferredType{
-						Name:      op.ReturnType,
-						Fields:    op.ResponseFields,
-						FieldArgs: make(map[string]map[string]string),
-					}
+				}
+			} else {
+				syntheticTypes[op.ReturnType] = &inferredType{
+					Name:      op.ReturnType,
+					Fields:    fields,
+					FieldArgs: make(map[string]map[string]string),
 				}
 			}
 		}
+	}
+
+	// Reconcile type/union name collisions (D2, D6):
+	// If a union XResult exists and a type XResponse also exists, merge XResponse fields
+	// into the first union member type and remove the empty XResponse.
+	for unionName, members := range syntheticUnions {
+		// Find the corresponding Response type that may conflict
+		// Convention: union is FooResult, response type is FooResponse
+		baseName := strings.TrimSuffix(unionName, "Result")
+		responseName := baseName + "Response"
+		if responseType, ok := syntheticTypes[responseName]; ok {
+			// Merge response fields into the first union member type
+			if len(members) > 0 && len(responseType.Fields) > 0 {
+				firstMember := members[0]
+				if memberType, ok := syntheticTypes[firstMember]; ok {
+					for k, v := range responseType.Fields {
+						if _, exists := memberType.Fields[k]; !exists {
+							memberType.Fields[k] = v
+						}
+					}
+				}
+			}
+			// Remove the conflicting Response type
+			delete(syntheticTypes, responseName)
+			// Update any ops that reference the Response type to point to the union
+			for opType, groupOps := range grouped {
+				for i := range groupOps {
+					if groupOps[i].ReturnType == responseName {
+						groupOps[i].ReturnType = unionName
+					}
+				}
+				grouped[opType] = groupOps
+			}
+		}
+		// Also remove any type with the same name as the union itself
+		delete(syntheticTypes, unionName)
 	}
 
 	// Cross-type field type propagation: unify structurally similar types
@@ -256,13 +298,23 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 		fmt.Fprintf(&sb, "\nunion %s = %s\n", name, strings.Join(members, " | "))
 	}
 
+	// Emit custom scalar declarations for referenced but undeclared types (e.g., Upload)
+	referencedScalars := collectCustomScalars(grouped, syntheticTypes, syntheticInputTypes, syntheticUnions)
+	if len(referencedScalars) > 0 {
+		sort.Strings(referencedScalars)
+		for _, s := range referencedScalars {
+			fmt.Fprintf(&sb, "\nscalar %s\n", s)
+		}
+	}
+
 	return []byte(sb.String()), nil
 }
 
-// processEndpoint processes a single classified endpoint and returns an inferred operation.
-func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCounter *int, syntheticTypes map[string]*inferredType, syntheticInputTypes map[string]*inferredType, syntheticUnions map[string][]string) (inferredOperation, bool) {
+// processEndpoint processes a single classified endpoint and returns inferred operations
+// (one per root field in multi-root queries).
+func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCounter *int, syntheticTypes map[string]*inferredType, syntheticInputTypes map[string]*inferredType, syntheticUnions map[string][]string) ([]inferredOperation, bool) {
 	if ep.APIType != "graphql" {
-		return inferredOperation{}, false
+		return nil, false
 	}
 
 	body := parseGraphQLBody(ep.Body)
@@ -275,14 +327,30 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 		}
 	}
 	if body == nil {
-		return inferredOperation{}, false
+		return nil, false
 	}
 
-	parsed := parseQueryAST(body.Query)
-	if parsed == nil {
-		return inferredOperation{}, false
+	parsedQueries := parseQueryAST(body.Query)
+	if len(parsedQueries) == 0 {
+		return nil, false
 	}
 
+	var ops []inferredOperation
+	for _, parsed := range parsedQueries {
+		op, ok := processParsedQuery(parsed, ep, body, seen, anonCounter, syntheticTypes, syntheticInputTypes, syntheticUnions)
+		if ok {
+			ops = append(ops, op)
+		}
+	}
+
+	if len(ops) == 0 {
+		return nil, false
+	}
+	return ops, true
+}
+
+// processParsedQuery processes a single parsed query (one root field) from an endpoint.
+func processParsedQuery(parsed *parsedQuery, ep classify.ClassifiedRequest, body *graphqlBody, seen map[string]bool, anonCounter *int, syntheticTypes map[string]*inferredType, syntheticInputTypes map[string]*inferredType, syntheticUnions map[string][]string) (inferredOperation, bool) {
 	opType := astOpTypeToString(parsed.opType)
 	fieldName := parsed.rootFieldName
 	if fieldName == "" {
@@ -316,7 +384,7 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 	var responseFields map[string]string
 
 	if len(parsed.inlineFragments) >= 2 && !parsed.hasNonFragmentFields {
-		// Fix 5: Union type inference from inline fragments
+		// Union type inference from inline fragments
 		unionName := typePrefix + "Result"
 		var memberNames []string
 
@@ -346,15 +414,28 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 			}
 		}
 
-		syntheticUnions[unionName] = memberNames
+		// Merge union members instead of overwriting
+		if existingMembers, ok := syntheticUnions[unionName]; ok {
+			memberSet := make(map[string]bool)
+			for _, m := range existingMembers {
+				memberSet[m] = true
+			}
+			for _, m := range memberNames {
+				if !memberSet[m] {
+					existingMembers = append(existingMembers, m)
+				}
+			}
+			syntheticUnions[unionName] = existingMembers
+		} else {
+			syntheticUnions[unionName] = memberNames
+		}
 		returnTypeName = unionName
 	} else if responseOK && responseObj != nil && len(parsed.selectionTree) > 0 {
 		responseFields = inferFieldsRecursive(responseObj, parsed.selectionTree, typePrefix, syntheticTypes, varTypes, syntheticInputTypes, returnTypeName)
 	} else if scalarType, ok := detectScalarReturnType(ep.Response.Body, fieldName); ok {
-		// Fix 1: Scalar root field return
 		returnTypeName = scalarType
 	} else if len(parsed.selectionTree) > 0 {
-		// Fix 4: Response was null/error but we have selection tree — generate type from selection fields
+		// Response was null/error but we have selection tree — generate type from selection fields
 		responseFields = inferFieldsRecursive(nil, parsed.selectionTree, typePrefix, syntheticTypes, varTypes, syntheticInputTypes, returnTypeName)
 	} else {
 		// Fallback: existing flat inference
@@ -397,33 +478,61 @@ type parsedQuery struct {
 	hasNonFragmentFields bool                  // true if root field has direct field selections alongside inline fragments
 }
 
-// parseQueryAST parses a GraphQL query string and extracts operation info.
-func parseQueryAST(query string) *parsedQuery {
+// parseQueryAST parses a GraphQL query string and extracts operation info for all root fields.
+func parseQueryAST(query string) []*parsedQuery {
 	doc, parseErr := parser.ParseQuery(&ast.Source{Input: query})
 	if parseErr != nil || len(doc.Operations) == 0 {
 		return nil
 	}
 
 	op := doc.Operations[0]
-	result := &parsedQuery{
-		opType:  op.Operation,
-		opName:  op.Name,
-		varDefs: op.VariableDefinitions,
+
+	// Extract all root fields from the selection set
+	if len(op.SelectionSet) == 0 {
+		return nil
 	}
 
-	// Extract root field name and its selection set, resolving fragment spreads
-	if len(op.SelectionSet) > 0 {
-		if field := resolveFirstField(op.SelectionSet, doc.Fragments); field != nil {
-			result.rootFieldName = field.Name
-			result.rootFieldArgs = field.Arguments
-			result.selectionFields = collectSelectionFields(field.SelectionSet, doc.Fragments)
-			result.selectionTree = collectSelectionTree(field.SelectionSet, doc.Fragments)
-			result.inlineFragments = collectInlineFragments(field.SelectionSet, doc.Fragments)
-			result.hasNonFragmentFields = hasTopLevelFields(field.SelectionSet)
+	rootFields := resolveAllFields(op.SelectionSet, doc.Fragments)
+	if len(rootFields) == 0 {
+		return nil
+	}
+
+	var results []*parsedQuery
+	for _, field := range rootFields {
+		result := &parsedQuery{
+			opType:               op.Operation,
+			opName:               op.Name,
+			varDefs:              op.VariableDefinitions,
+			rootFieldName:        field.Name,
+			rootFieldArgs:        field.Arguments,
+			selectionFields:      collectSelectionFields(field.SelectionSet, doc.Fragments),
+			selectionTree:        collectSelectionTree(field.SelectionSet, doc.Fragments),
+			inlineFragments:      collectInlineFragments(field.SelectionSet, doc.Fragments),
+			hasNonFragmentFields: hasTopLevelFields(field.SelectionSet),
+		}
+		results = append(results, result)
+	}
+
+	return results
+}
+
+// resolveAllFields walks a selection set to collect all concrete *ast.Field entries,
+// resolving fragment spreads and inline fragments as needed.
+func resolveAllFields(selections ast.SelectionSet, fragments ast.FragmentDefinitionList) []*ast.Field {
+	var fields []*ast.Field
+	for _, sel := range selections {
+		switch s := sel.(type) {
+		case *ast.Field:
+			fields = append(fields, s)
+		case *ast.FragmentSpread:
+			if frag := fragments.ForName(s.Name); frag != nil {
+				fields = append(fields, resolveAllFields(frag.SelectionSet, fragments)...)
+			}
+		case *ast.InlineFragment:
+			fields = append(fields, resolveAllFields(s.SelectionSet, fragments)...)
 		}
 	}
-
-	return result
+	return fields
 }
 
 // resolveFirstField walks a selection set to find the first concrete *ast.Field,
@@ -986,19 +1095,6 @@ func buildArgTypes(parsed *parsedQuery, variables map[string]interface{}, inputT
 		args[argName] = "String"
 	}
 
-	// If no root field arguments were extracted but we have variables, use them directly
-	if len(args) == 0 {
-		for varName, varType := range varTypes {
-			args[varName] = varType
-		}
-		// For variables not declared in the query, infer from JSON values
-		for k, v := range variables {
-			if _, exists := args[k]; !exists {
-				args[k] = inferTypeFromValue(v)
-			}
-		}
-	}
-
 	return args
 }
 
@@ -1387,6 +1483,69 @@ func unifyStructuralFieldTypes(syntheticTypes map[string]*inferredType) {
 			}
 		}
 	}
+}
+
+// collectCustomScalars finds type names referenced in fields/args that are not builtins,
+// not synthetic types, not synthetic input types, and not unions. These are custom scalars
+// (e.g., Upload) that need explicit scalar declarations.
+func collectCustomScalars(
+	grouped map[string][]inferredOperation,
+	syntheticTypes map[string]*inferredType,
+	syntheticInputTypes map[string]*inferredType,
+	syntheticUnions map[string][]string,
+) []string {
+	known := make(map[string]bool)
+	for name := range syntheticTypes {
+		known[name] = true
+	}
+	for name := range syntheticInputTypes {
+		known[name] = true
+	}
+	for name := range syntheticUnions {
+		known[name] = true
+	}
+
+	candidates := make(map[string]bool)
+
+	// Check operation args
+	for _, groupOps := range grouped {
+		for _, op := range groupOps {
+			for _, argType := range op.Args {
+				checkCustomScalar(argType, known, candidates)
+			}
+		}
+	}
+	// Check synthetic type fields and field args
+	for _, st := range syntheticTypes {
+		for _, fieldType := range st.Fields {
+			checkCustomScalar(fieldType, known, candidates)
+		}
+		for _, args := range st.FieldArgs {
+			for _, argType := range args {
+				checkCustomScalar(argType, known, candidates)
+			}
+		}
+	}
+
+	var scalars []string
+	for s := range candidates {
+		scalars = append(scalars, s)
+	}
+	return scalars
+}
+
+// checkCustomScalar unwraps a type string and adds any non-builtin, non-known base type
+// to the candidates set.
+func checkCustomScalar(typeStr string, known map[string]bool, candidates map[string]bool) {
+	base := typeStr
+	base = strings.TrimSuffix(base, "!")
+	base = strings.TrimPrefix(base, "[")
+	base = strings.TrimSuffix(base, "]")
+	base = strings.TrimSuffix(base, "!")
+	if base == "" || builtinScalars[base] || known[base] {
+		return
+	}
+	candidates[base] = true
 }
 
 // upperFirst returns the string with its first character uppercased.

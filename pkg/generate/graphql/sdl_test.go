@@ -1695,3 +1695,250 @@ func TestUnifyStructuralFieldTypes_Unit(t *testing.T) {
 		t.Errorf("expected TypeA.burn = Boolean (unchanged), got %s", types["TypeA"].Fields["burn"])
 	}
 }
+
+func TestGenerator_Phase2_MultiRootQuery(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query SettingsTabQuery { availableCountries { id name } viewer { email billingAddresses { street } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"availableCountries":[{"id":"US","name":"United States"}],"viewer":{"email":"test@example.com","billingAddresses":[{"street":"123 Main St"}]}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Both root fields should be present
+	if !strings.Contains(sdl, "availableCountries") {
+		t.Errorf("expected 'availableCountries' root field from multi-root query, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "viewer") {
+		t.Errorf("expected 'viewer' root field from multi-root query, got:\n%s", sdl)
+	}
+	// The viewer type should have email and billingAddresses
+	if !strings.Contains(sdl, "email: String") {
+		t.Errorf("expected 'email: String' in viewer type, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "billingAddresses") {
+		t.Errorf("expected 'billingAddresses' in viewer type, got:\n%s", sdl)
+	}
+	// availableCountries should be a list
+	if !strings.Contains(sdl, "[AvailableCountriesResponse]") {
+		t.Errorf("expected '[AvailableCountriesResponse]' list return type, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_NoVariableFallbackToArgs(t *testing.T) {
+	g := &Generator{}
+	// Query with variables but root field has NO arguments — variables are used by nested fields only
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query GetViewer($currencyId: String!, $market: String!) { viewer { referFriendPromoValues(currencyId: $currencyId, market: $market) { amount } } }","variables":{"currencyId":"USD","market":"US"}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"viewer":{"referFriendPromoValues":{"amount":10}}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// viewer should NOT have currencyId or market as arguments
+	if strings.Contains(sdl, "viewer(") {
+		t.Errorf("viewer should have no arguments — variables belong to nested fields, got:\n%s", sdl)
+	}
+	// But the nested field should have the arguments
+	if !strings.Contains(sdl, "referFriendPromoValues(") {
+		t.Errorf("expected 'referFriendPromoValues' to have arguments, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "currencyId: String!") {
+		t.Errorf("expected 'currencyId: String!' on nested field, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "market: String!") {
+		t.Errorf("expected 'market: String!' on nested field, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_UnionMemberMergingAcrossOps(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		// First operation: viewer with ... on User and ... on Node
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query Op1 { viewer { ... on User { name } ... on Node { id } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"viewer":{"name":"Alice","id":"1"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+		// Second operation: viewer with ... on User and ... on Unauthorized
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query Op2 { viewer { ... on User { email } ... on Unauthorized { reason } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"viewer":{"email":"alice@example.com"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Union should contain all three members from both operations
+	if !strings.Contains(sdl, "union ViewerResult") {
+		t.Errorf("expected 'union ViewerResult', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "User") {
+		t.Errorf("expected 'User' in union, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "Node") {
+		t.Errorf("expected 'Node' in union, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "Unauthorized") {
+		t.Errorf("expected 'Unauthorized' in union, got:\n%s", sdl)
+	}
+	// Should NOT have a separate "type ViewerResult" — only the union
+	viewerResultTypeCount := strings.Count(sdl, "type ViewerResult")
+	if viewerResultTypeCount > 0 {
+		t.Errorf("should not have 'type ViewerResult' — only union, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_TypeUnionCollisionResolved(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		// Operation that triggers union path (inline fragments only)
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query Op1 { viewer { ... on User { name } ... on Node { id } } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"viewer":{"name":"Alice","id":"1"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+		// Operation that triggers regular type path (direct fields)
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"query Op2 { viewer { email locale } }","variables":{}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"viewer":{"email":"alice@example.com","locale":"en-US"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Should have union ViewerResult (not both type and union)
+	if !strings.Contains(sdl, "union ViewerResult") {
+		t.Errorf("expected 'union ViewerResult', got:\n%s", sdl)
+	}
+	// Should NOT have both "type ViewerResult" and "union ViewerResult"
+	if strings.Contains(sdl, "type ViewerResult") {
+		t.Errorf("should not have 'type ViewerResult' when union exists, got:\n%s", sdl)
+	}
+	// Should NOT have empty ViewerResponse type
+	if strings.Contains(sdl, "type ViewerResponse {") {
+		t.Errorf("should not have empty 'type ViewerResponse' — should be merged/removed, got:\n%s", sdl)
+	}
+	// Fields from the direct-fields operation should be merged into the first union member
+	if !strings.Contains(sdl, "type User {") {
+		t.Errorf("expected 'type User', got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_EmptyReturnTypeStillDefined(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:  "http://example.com/graphql",
+				Body: []byte(`{"query":"mutation UpdateLocale($input: UpdateLocaleInput!) { updateLocale(input: $input) { __typename } }","variables":{"input":{"locale":"en"}}}`),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"updateLocale":{"__typename":"UpdateLocalePayload"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	// Even though only __typename was returned, the return type should be defined
+	if !strings.Contains(sdl, "type UpdateLocaleResponse {") {
+		t.Errorf("expected 'type UpdateLocaleResponse' even with only __typename fields, got:\n%s", sdl)
+	}
+	// The mutation should reference it
+	if !strings.Contains(sdl, "updateLocale(input: UpdateLocaleInput!): UpdateLocaleResponse") {
+		t.Errorf("expected mutation to reference UpdateLocaleResponse, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase2_UploadScalarDeclared(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				URL:     "http://example.com/graphql",
+				Headers: map[string]string{"Content-Type": "multipart/form-data; boundary=----WebKitFormBoundary"},
+				Body: []byte("------WebKitFormBoundary\r\n" +
+					"Content-Disposition: form-data; name=\"operations\"\r\n\r\n" +
+					`{"query":"mutation Upload($file: Upload!) { uploadProfilePicture(file: $file) { url } }","variables":{"file":null}}` + "\r\n" +
+					"------WebKitFormBoundary\r\n" +
+					"Content-Disposition: form-data; name=\"map\"\r\n\r\n" +
+					`{"0":["variables.file"]}` + "\r\n" +
+					"------WebKitFormBoundary--\r\n"),
+				Response: crawl.ObservedResponse{
+					Body: []byte(`{"data":{"uploadProfilePicture":{"url":"https://example.com/pic.jpg"}}}`),
+				},
+			},
+			APIType: "graphql",
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	if !strings.Contains(sdl, "scalar Upload") {
+		t.Errorf("expected 'scalar Upload' declaration, got:\n%s", sdl)
+	}
+}
