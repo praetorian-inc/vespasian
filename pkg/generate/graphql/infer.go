@@ -145,6 +145,10 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 			if _, isUnion := syntheticUnions[op.ReturnType]; isUnion {
 				continue
 			}
+			// Skip builtin scalar return types — they must not be redefined as object types
+			if builtinScalars[op.ReturnType] {
+				continue
+			}
 			fields := op.ResponseFields
 			if fields == nil {
 				fields = make(map[string]string)
