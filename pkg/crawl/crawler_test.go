@@ -560,6 +560,66 @@ func TestMapResult_SmallBodyNotTruncated(t *testing.T) {
 	}
 }
 
+// TestMapResult_JsluiceTagAndAttribute tests that jsluice Tag and Attribute fields are propagated
+func TestMapResult_JsluiceTagAndAttribute(t *testing.T) {
+	tests := []struct {
+		name      string
+		tag       string
+		attribute string
+	}{
+		{
+			name:      "jsluice fetch endpoint",
+			tag:       "script",
+			attribute: "jsluice-fetch",
+		},
+		{
+			name:      "jsluice xhr endpoint",
+			tag:       "script",
+			attribute: "jsluice-xhr",
+		},
+		{
+			name:      "htmx hx-get attribute",
+			tag:       "div",
+			attribute: "hx-get",
+		},
+		{
+			name:      "htmx hx-post attribute",
+			tag:       "form",
+			attribute: "hx-post",
+		},
+		{
+			name:      "empty tag and attribute",
+			tag:       "",
+			attribute: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := output.Result{
+				Request: &navigation.Request{
+					Method:    "GET",
+					URL:       "https://example.com/api/endpoint",
+					Source:    "crawler",
+					Tag:       tt.tag,
+					Attribute: tt.attribute,
+				},
+				Response: &navigation.Response{
+					StatusCode: 200,
+				},
+			}
+
+			observed := MapResult(result)
+			if observed.Tag != tt.tag {
+				t.Errorf("Tag = %q, want %q", observed.Tag, tt.tag)
+			}
+			if observed.Attribute != tt.attribute {
+				t.Errorf("Attribute = %q, want %q", observed.Attribute, tt.attribute)
+			}
+		})
+	}
+}
+
 // TestMapResult_LowercaseContentType tests that MapResult extracts ContentType
 // from lowercase header keys, as Katana normalizes response headers to lowercase.
 func TestMapResult_LowercaseContentType(t *testing.T) {
@@ -610,7 +670,6 @@ func TestMapResult_LowercaseContentType(t *testing.T) {
 			}
 
 			observed := MapResult(result)
-
 			if observed.Response.ContentType != tt.wantContentType {
 				t.Errorf("ContentType = %q, want %q", observed.Response.ContentType, tt.wantContentType)
 			}

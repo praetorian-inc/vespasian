@@ -24,6 +24,8 @@ type ObservedRequest struct {
 	Body        []byte            `json:"body,omitempty"`
 	Response    ObservedResponse  `json:"response"`
 	Source      string            `json:"source"`
+	Tag         string            `json:"tag,omitempty"`
+	Attribute   string            `json:"attribute,omitempty"`
 	PageURL     string            `json:"page_url,omitempty"`
 }
 
