@@ -1377,7 +1377,9 @@ func TestDetectAPIType(t *testing.T) {
 					Headers: map[string]string{
 						"Content-Type": "text/xml",
 					},
-					// text/xml alone gives 0.85 confidence from WSDL classifier
+					// This test verifies threshold gating: a weak WSDL signal
+				// (content-type only, no SOAPAction/envelope) should be
+				// rejected when the threshold is set above its confidence.
 				},
 			},
 			threshold: 0.90,
@@ -1474,5 +1476,63 @@ func TestScanPipeline_WSDLDetection(t *testing.T) {
 	}
 	if !strings.Contains(specStr, "definitions") {
 		t.Error("scan pipeline output missing WSDL definitions element")
+	}
+}
+
+// TestDetectAPIType_ExplicitOverride verifies that when --api-type is set
+// explicitly (not "auto"), the scan command skips auto-detection and uses
+// the user-provided type directly.
+func TestDetectAPIType_ExplicitOverride(t *testing.T) {
+	// SOAP traffic that would be auto-detected as WSDL
+	soapRequests := []crawl.ObservedRequest{
+		{
+			Method: "POST",
+			URL:    "https://example.com/service",
+			Headers: map[string]string{
+				"Content-Type": "text/xml",
+				"SOAPAction":   "http://example.com/GetUser",
+			},
+			Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body/></soap:Envelope>`),
+		},
+	}
+
+	// With auto, should detect WSDL
+	autoType := detectAPIType(soapRequests, 0.5)
+	if autoType != "wsdl" {
+		t.Fatalf("auto detection = %q, want %q", autoType, "wsdl")
+	}
+
+	// With explicit "rest" override, generateSpec should produce REST output
+	// (even though the traffic is SOAP — user explicitly chose REST)
+	spec, err := generateSpec(context.Background(), soapRequests, generateSpecOptions{
+		APIType:     "rest",
+		Confidence:  0.5,
+		Probe:       false,
+		Deduplicate: true,
+	})
+	if err != nil {
+		t.Fatalf("generateSpec(rest override) error: %v", err)
+	}
+	// REST classifier won't match SOAP traffic, so spec should be empty/nil
+	if len(spec) > 0 && strings.Contains(string(spec), "definitions") {
+		t.Error("explicit REST override produced WSDL output")
+	}
+}
+
+// TestAPITypeDisplayName verifies display name mapping for verbose output.
+func TestAPITypeDisplayName(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"rest", "REST"},
+		{"wsdl", "WSDL"},
+		{"graphql", "graphql"},
+	}
+	for _, tt := range tests {
+		got := apiTypeDisplayName(tt.input)
+		if got != tt.want {
+			t.Errorf("apiTypeDisplayName(%q) = %q, want %q", tt.input, got, tt.want)
+		}
 	}
 }

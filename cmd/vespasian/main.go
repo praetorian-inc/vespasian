@@ -535,6 +535,7 @@ func (c *GenerateCmd) Run() (err error) {
 // ScanCmd runs the full pipeline: crawl, classify, and generate.
 type ScanCmd struct {
 	URL         string  `arg:"" help:"Target URL to scan"`
+	APIType     string  `default:"auto" enum:"auto,rest,wsdl" help:"API type to generate (auto detects from traffic)" name:"api-type"`
 	Confidence  float64 `default:"0.5" help:"Minimum confidence threshold"`
 	Probe       bool    `default:"true" help:"Enable endpoint probing"`
 	Deduplicate bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
@@ -579,11 +580,16 @@ func (c *ScanCmd) Run() error {
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests))
 	}
 
-	apiType := detectAPIType(requests, c.Confidence)
+	apiType := c.APIType
+	if apiType == "auto" {
+		apiType = detectAPIType(requests, c.Confidence)
+		if c.Verbose {
+			fmt.Fprintf(os.Stderr, "detected API type: %s\n", apiType)
+		}
+	}
 
 	if c.Verbose {
-		fmt.Fprintf(os.Stderr, "detected API type: %s\n", apiType)
-		fmt.Fprintf(os.Stderr, "generating %s spec\n", strings.ToUpper(apiType))
+		fmt.Fprintf(os.Stderr, "generating %s spec\n", apiTypeDisplayName(apiType))
 	}
 
 	// Create a fresh signal context for the generate phase. If a signal
@@ -718,11 +724,17 @@ func classifiersForType(apiType string) []classify.APIClassifier {
 	}
 }
 
-// detectAPIType runs both REST and WSDL classifiers against captured traffic
-// and returns the API type that best matches. If any request matches the WSDL
-// classifier above the given threshold, "wsdl" is returned — SOAP services
-// typically expose a single endpoint so even one match is a strong signal.
-// Otherwise "rest" is returned as the default.
+// detectAPIType runs the WSDL classifier against captured traffic and returns
+// the API type that best matches. If any request matches the WSDL classifier
+// above the given threshold, "wsdl" is returned — SOAP services typically
+// expose a single endpoint so even one match is a strong signal. Otherwise
+// "rest" is returned as the default.
+//
+// Note: this performs a lightweight classification pass separate from the full
+// RunClassifiers call inside generateSpec. The duplication is intentional —
+// detectAPIType only needs to answer "which generator?" and returns early on
+// the first WSDL match, while generateSpec's pass produces the full
+// ClassifiedRequest slice needed for generation.
 func detectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
 	wsdlClassifier := &classify.WSDLClassifier{}
 	for _, req := range requests {
@@ -731,6 +743,18 @@ func detectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
 		}
 	}
 	return "rest"
+}
+
+// apiTypeDisplayName returns a human-readable display name for an API type.
+func apiTypeDisplayName(apiType string) string {
+	switch apiType {
+	case "wsdl":
+		return "WSDL"
+	case "rest":
+		return "REST"
+	default:
+		return apiType
+	}
 }
 
 // validateURL checks that the given string is a valid URL with scheme and host.

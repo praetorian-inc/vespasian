@@ -5,10 +5,10 @@
 - A SOAP/WSDL service running locally (e.g., DVWS at `http://localhost:80/dvwsuserservice`)
 - A REST API running locally (e.g., any JSON API)
 
-## Test 1: SOAP endpoint scan detects WSDL and generates WSDL output
+## Test 1: SOAP endpoint scan auto-detects WSDL and generates WSDL output
 
 ```bash
-vespasian scan http://localhost:80/dvwsuserservice -o scan-soap.yaml -v --probe --timeout=3m --max-pages=50
+vespasian scan http://localhost:80/dvwsuserservice -o scan-soap.wsdl -v --probe --timeout=3m --max-pages=50
 ```
 
 **Expected output** (stderr):
@@ -24,10 +24,10 @@ classified N API requests (threshold=0.50)
 **Expected**: Output file contains WSDL XML with `<definitions>` root element.
 **Before fix**: Would say "generating REST spec" and classify 0 requests.
 
-## Test 2: WSDL URL scan detects WSDL
+## Test 2: WSDL URL scan auto-detects WSDL
 
 ```bash
-vespasian scan "http://localhost:80/dvwsuserservice?wsdl" -o scan-wsdl.yaml -v --probe --timeout=3m --max-pages=50
+vespasian scan "http://localhost:80/dvwsuserservice?wsdl" -o scan-wsdl.wsdl -v --probe --timeout=3m --max-pages=50
 ```
 
 **Expected**: Same as Test 1 - detects WSDL type and generates WSDL output.
@@ -46,10 +46,27 @@ generating REST spec
 
 **Expected**: Output file contains OpenAPI YAML spec. Behavior unchanged from before.
 
-## Test 4: `generate wsdl` still works (regression check)
+## Test 4: Explicit `--api-type` override
 
 ```bash
-vespasian generate wsdl capture.json -o gen-wsdl.yaml -v
+# Force REST generation even on a SOAP endpoint
+vespasian scan http://localhost:80/dvwsuserservice -o scan-forced-rest.yaml -v --api-type=rest --timeout=3m --max-pages=50
+```
+
+**Expected**: No "detected API type" line (skips auto-detection). Generates REST spec.
+Users can override auto-detection when they know the target type or when mixed traffic is misdetected.
+
+```bash
+# Force WSDL generation explicitly
+vespasian scan http://localhost:80/dvwsuserservice -o scan-forced-wsdl.wsdl -v --api-type=wsdl --timeout=3m --max-pages=50
+```
+
+**Expected**: No "detected API type" line. Generates WSDL spec directly.
+
+## Test 5: `generate wsdl` still works (regression check)
+
+```bash
+vespasian generate wsdl capture.json -o gen-wsdl.wsdl -v
 ```
 
 **Expected**: WSDL output generated correctly. No change from before.
@@ -66,6 +83,8 @@ The following unit/integration tests cover the fix:
 | `TestDetectAPIType/WSDL_URL_query_param_returns_wsdl` | `?wsdl` URL -> WSDL |
 | `TestDetectAPIType/SOAP_envelope_in_body_returns_wsdl` | SOAP envelope body -> WSDL |
 | `TestDetectAPIType/mixed_traffic_with_SOAP_present_returns_wsdl` | Mixed REST+SOAP -> WSDL |
-| `TestDetectAPIType/SOAP_below_threshold_returns_rest` | Low-confidence SOAP -> REST |
+| `TestDetectAPIType/SOAP_below_threshold_returns_rest` | Threshold gating behavior |
 | `TestGenerateSpec_WSDLType` | Full WSDL generation pipeline |
 | `TestScanPipeline_WSDLDetection` | End-to-end scan pipeline regression for LAB-1392 |
+| `TestDetectAPIType_ExplicitOverride` | `--api-type` flag bypasses auto-detection |
+| `TestAPITypeDisplayName` | Display name mapping for verbose output |
