@@ -477,6 +477,13 @@ type GenerateCmd struct {
 	Verbose     bool    `short:"v" help:"Enable verbose logging"`
 }
 
+// API type constants used for classification routing and generation.
+const (
+	apiTypeAuto = "auto"
+	apiTypeREST = "rest"
+	apiTypeWSDL = "wsdl"
+)
+
 // maxCaptureSize is the maximum capture file size (100MB).
 const maxCaptureSize = 100 * 1024 * 1024
 
@@ -581,7 +588,7 @@ func (c *ScanCmd) Run() error {
 	}
 
 	apiType := c.APIType
-	if apiType == "auto" {
+	if apiType == apiTypeAuto {
 		apiType = detectAPIType(requests, c.Confidence)
 		if c.Verbose {
 			fmt.Fprintf(os.Stderr, "detected API type: %s\n", apiType)
@@ -682,7 +689,7 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts ge
 		}
 		var strategies []probe.ProbeStrategy
 		switch opts.APIType {
-		case "wsdl":
+		case apiTypeWSDL:
 			strategies = []probe.ProbeStrategy{probe.NewWSDLProbe(cfg)}
 		default:
 			strategies = []probe.ProbeStrategy{
@@ -715,9 +722,9 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts ge
 // classifiersForType returns the appropriate classifiers for the given API type.
 func classifiersForType(apiType string) []classify.APIClassifier {
 	switch apiType {
-	case "rest":
+	case apiTypeREST:
 		return []classify.APIClassifier{&classify.RESTClassifier{}}
-	case "wsdl":
+	case apiTypeWSDL:
 		return []classify.APIClassifier{&classify.WSDLClassifier{}}
 	default:
 		return nil
@@ -736,21 +743,22 @@ func classifiersForType(apiType string) []classify.APIClassifier {
 // the first WSDL match, while generateSpec's pass produces the full
 // ClassifiedRequest slice needed for generation.
 func detectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
+	// Currently binary: WSDL vs REST. Extend this function when adding new API types.
 	wsdlClassifier := &classify.WSDLClassifier{}
 	for _, req := range requests {
 		if isAPI, confidence := wsdlClassifier.Classify(req); isAPI && confidence >= threshold {
-			return "wsdl"
+			return apiTypeWSDL
 		}
 	}
-	return "rest"
+	return apiTypeREST
 }
 
 // apiTypeDisplayName returns a human-readable display name for an API type.
 func apiTypeDisplayName(apiType string) string {
 	switch apiType {
-	case "wsdl":
+	case apiTypeWSDL:
 		return "WSDL"
-	case "rest":
+	case apiTypeREST:
 		return "REST"
 	default:
 		return apiType

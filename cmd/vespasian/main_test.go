@@ -1378,8 +1378,10 @@ func TestDetectAPIType(t *testing.T) {
 						"Content-Type": "text/xml",
 					},
 					// This test verifies threshold gating: a weak WSDL signal
-				// (content-type only, no SOAPAction/envelope) should be
-				// rejected when the threshold is set above its confidence.
+				// (content-type only, no SOAPAction/envelope) produces a
+				// confidence around 0.85. Setting threshold=0.90 ensures
+				// detection is rejected. If WSDLClassifier scoring changes,
+				// this test may need threshold adjustment.
 				},
 			},
 			threshold: 0.90,
@@ -1424,8 +1426,11 @@ func TestGenerateSpec_WSDLType(t *testing.T) {
 	if len(spec) == 0 {
 		t.Fatal("generateSpec(wsdl) returned empty spec for SOAP traffic")
 	}
-	// Verify the output contains WSDL markers
+	// Verify the output is WSDL, not REST/OpenAPI
 	specStr := string(spec)
+	if strings.Contains(specStr, "openapi") {
+		t.Errorf("generateSpec(wsdl) produced OpenAPI spec instead of WSDL:\n%s", specStr)
+	}
 	if !strings.Contains(specStr, "definitions") {
 		t.Errorf("generateSpec(wsdl) output missing WSDL definitions element:\n%s", specStr)
 	}
