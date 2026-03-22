@@ -744,8 +744,13 @@ func classifiersForType(apiType string) []classify.APIClassifier {
 // the first WSDL match, while generateSpec's pass produces the full
 // ClassifiedRequest slice needed for generation.
 func detectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
-	// Currently checks WSDL vs REST. When GraphQL classifier lands (PR #44),
-	// add a GraphQL check here before the WSDL check.
+	// Currently checks WSDL vs REST. GraphQL auto-detection depends on PR #44.
+	//
+	// Merge strategy with PR #44 (feat/graphql-support):
+	//   - If PR #44 merges first: resolve enum tag conflict (both have graphql),
+	//     then add a GraphQLClassifier check here before the WSDL check.
+	//   - If this PR merges first: PR #44 gets the auto-detection framework and
+	//     just needs to add a classifiersForType case + GraphQL check here.
 	wsdlClassifier := &classify.WSDLClassifier{}
 	for _, req := range requests {
 		if isAPI, confidence := wsdlClassifier.Classify(req); isAPI && confidence >= threshold {
