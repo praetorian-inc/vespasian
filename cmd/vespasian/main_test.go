@@ -1276,7 +1276,7 @@ func TestDetectAPIType(t *testing.T) {
 			name:      "empty requests defaults to rest",
 			requests:  nil,
 			threshold: 0.5,
-			want:      "rest",
+			want:      apiTypeREST,
 		},
 		{
 			name: "REST JSON requests returns rest",
@@ -1294,7 +1294,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      "rest",
+			want:      apiTypeREST,
 		},
 		{
 			name: "SOAP request with SOAPAction header returns wsdl",
@@ -1310,7 +1310,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      "wsdl",
+			want:      apiTypeWSDL,
 		},
 		{
 			name: "WSDL URL query param returns wsdl",
@@ -1324,7 +1324,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      "wsdl",
+			want:      apiTypeWSDL,
 		},
 		{
 			name: "SOAP envelope in body returns wsdl",
@@ -1339,7 +1339,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      "wsdl",
+			want:      apiTypeWSDL,
 		},
 		{
 			name: "mixed traffic with SOAP present returns wsdl",
@@ -1366,7 +1366,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      "wsdl",
+			want:      apiTypeWSDL,
 		},
 		{
 			name: "SOAP below threshold returns rest",
@@ -1385,7 +1385,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.90,
-			want:      "rest",
+			want:      apiTypeREST,
 		},
 	}
 
@@ -1415,7 +1415,7 @@ func TestGenerateSpec_WSDLType(t *testing.T) {
 	}
 
 	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
-		APIType:     "wsdl",
+		APIType:     apiTypeWSDL,
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
@@ -1456,8 +1456,8 @@ func TestScanPipeline_WSDLDetection(t *testing.T) {
 
 	// Step 1: Detect API type (this is the new logic)
 	apiType := detectAPIType(soapRequests, 0.5)
-	if apiType != "wsdl" {
-		t.Fatalf("detectAPIType() = %q for SOAP traffic, want %q", apiType, "wsdl")
+	if apiType != apiTypeWSDL {
+		t.Fatalf("detectAPIType() = %q for SOAP traffic, want %q", apiType, apiTypeWSDL)
 	}
 
 	// Step 2: Generate spec with detected type
@@ -1503,14 +1503,14 @@ func TestDetectAPIType_ExplicitOverride(t *testing.T) {
 
 	// With auto, should detect WSDL
 	autoType := detectAPIType(soapRequests, 0.5)
-	if autoType != "wsdl" {
-		t.Fatalf("auto detection = %q, want %q", autoType, "wsdl")
+	if autoType != apiTypeWSDL {
+		t.Fatalf("auto detection = %q, want %q", autoType, apiTypeWSDL)
 	}
 
-	// With explicit "rest" override, generateSpec should produce REST output
+	// With explicit REST override, generateSpec should produce REST output
 	// (even though the traffic is SOAP — user explicitly chose REST)
 	spec, err := generateSpec(context.Background(), soapRequests, generateSpecOptions{
-		APIType:     "rest",
+		APIType:     apiTypeREST,
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
@@ -1530,8 +1530,8 @@ func TestAPITypeDisplayName(t *testing.T) {
 		input string
 		want  string
 	}{
-		{"rest", "REST"},
-		{"wsdl", "WSDL"},
+		{apiTypeREST, "REST"},
+		{apiTypeWSDL, "WSDL"},
 		{"graphql", "graphql"},
 	}
 	for _, tt := range tests {
