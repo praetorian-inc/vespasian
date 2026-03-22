@@ -1532,7 +1532,8 @@ func TestAPITypeDisplayName(t *testing.T) {
 	}{
 		{apiTypeREST, "REST"},
 		{apiTypeWSDL, "WSDL"},
-		{"graphql", "graphql"},
+		{apiTypeGraphQL, "GraphQL"},
+		{"unknown", "unknown"},
 	}
 	for _, tt := range tests {
 		got := apiTypeDisplayName(tt.input)

@@ -467,7 +467,7 @@ func (c *ImportCmd) Run() error {
 
 // GenerateCmd generates API specifications from captured traffic.
 type GenerateCmd struct {
-	APIType     string  `arg:"" enum:"rest,wsdl" help:"API type to generate"`
+	APIType     string  `arg:"" enum:"rest,wsdl,graphql" help:"API type to generate (rest, wsdl, graphql)"`
 	Capture     string  `arg:"" help:"Capture file path"`
 	Output      string  `short:"o" help:"Output file path"`
 	Confidence  float64 `default:"0.5" help:"Minimum confidence threshold"`
@@ -479,9 +479,10 @@ type GenerateCmd struct {
 
 // API type constants used for classification routing and generation.
 const (
-	apiTypeAuto = "auto"
-	apiTypeREST = "rest"
-	apiTypeWSDL = "wsdl"
+	apiTypeAuto    = "auto"
+	apiTypeREST    = "rest"
+	apiTypeWSDL    = "wsdl"
+	apiTypeGraphQL = "graphql"
 )
 
 // maxCaptureSize is the maximum capture file size (100MB).
@@ -542,7 +543,7 @@ func (c *GenerateCmd) Run() (err error) {
 // ScanCmd runs the full pipeline: crawl, classify, and generate.
 type ScanCmd struct {
 	URL         string  `arg:"" help:"Target URL to scan"`
-	APIType     string  `default:"auto" enum:"auto,rest,wsdl" help:"API type to generate (auto detects from traffic)" name:"api-type"`
+	APIType     string  `default:"auto" enum:"auto,rest,wsdl,graphql" help:"API type to generate (auto detects from traffic)" name:"api-type"`
 	Confidence  float64 `default:"0.5" help:"Minimum confidence threshold"`
 	Probe       bool    `default:"true" help:"Enable endpoint probing"`
 	Deduplicate bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
@@ -743,7 +744,8 @@ func classifiersForType(apiType string) []classify.APIClassifier {
 // the first WSDL match, while generateSpec's pass produces the full
 // ClassifiedRequest slice needed for generation.
 func detectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
-	// Currently binary: WSDL vs REST. Extend this function when adding new API types.
+	// Currently checks WSDL vs REST. When GraphQL classifier lands (PR #44),
+	// add a GraphQL check here before the WSDL check.
 	wsdlClassifier := &classify.WSDLClassifier{}
 	for _, req := range requests {
 		if isAPI, confidence := wsdlClassifier.Classify(req); isAPI && confidence >= threshold {
@@ -756,10 +758,12 @@ func detectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
 // apiTypeDisplayName returns a human-readable display name for an API type.
 func apiTypeDisplayName(apiType string) string {
 	switch apiType {
-	case apiTypeWSDL:
-		return "WSDL"
 	case apiTypeREST:
 		return "REST"
+	case apiTypeWSDL:
+		return "WSDL"
+	case apiTypeGraphQL:
+		return "GraphQL"
 	default:
 		return apiType
 	}
