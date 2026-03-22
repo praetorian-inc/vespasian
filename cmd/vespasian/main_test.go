@@ -1262,3 +1262,217 @@ func TestSetupBrowserAndSignals_UserSuppliedRequestIDPreserved(t *testing.T) {
 		t.Errorf("header = %q, want %q", bs.opts.Headers[RequestIDHeader], "user-value")
 	}
 }
+
+// TestDetectAPIType verifies that detectAPIType correctly identifies SOAP/WSDL
+// traffic and falls back to REST for non-SOAP traffic.
+func TestDetectAPIType(t *testing.T) {
+	tests := []struct {
+		name      string
+		requests  []crawl.ObservedRequest
+		threshold float64
+		want      string
+	}{
+		{
+			name:      "empty requests defaults to rest",
+			requests:  nil,
+			threshold: 0.5,
+			want:      "rest",
+		},
+		{
+			name: "REST JSON requests returns rest",
+			requests: []crawl.ObservedRequest{
+				{
+					Method: "GET",
+					URL:    "https://example.com/api/users",
+					Headers: map[string]string{
+						"Content-Type": "application/json",
+					},
+					Response: crawl.ObservedResponse{
+						StatusCode:  200,
+						ContentType: "application/json",
+					},
+				},
+			},
+			threshold: 0.5,
+			want:      "rest",
+		},
+		{
+			name: "SOAP request with SOAPAction header returns wsdl",
+			requests: []crawl.ObservedRequest{
+				{
+					Method: "POST",
+					URL:    "https://example.com/service",
+					Headers: map[string]string{
+						"Content-Type": "text/xml",
+						"SOAPAction":   "http://example.com/GetUser",
+					},
+					Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body/></soap:Envelope>`),
+				},
+			},
+			threshold: 0.5,
+			want:      "wsdl",
+		},
+		{
+			name: "WSDL URL query param returns wsdl",
+			requests: []crawl.ObservedRequest{
+				{
+					Method: "GET",
+					URL:    "https://example.com/service?wsdl",
+					Headers: map[string]string{
+						"Content-Type": "text/xml",
+					},
+				},
+			},
+			threshold: 0.5,
+			want:      "wsdl",
+		},
+		{
+			name: "SOAP envelope in body returns wsdl",
+			requests: []crawl.ObservedRequest{
+				{
+					Method: "POST",
+					URL:    "https://example.com/service",
+					Headers: map[string]string{
+						"Content-Type": "text/xml",
+					},
+					Body: []byte(`<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><GetUser/></soap:Body></soap:Envelope>`),
+				},
+			},
+			threshold: 0.5,
+			want:      "wsdl",
+		},
+		{
+			name: "mixed traffic with SOAP present returns wsdl",
+			requests: []crawl.ObservedRequest{
+				{
+					Method: "GET",
+					URL:    "https://example.com/api/users",
+					Headers: map[string]string{
+						"Content-Type": "application/json",
+					},
+					Response: crawl.ObservedResponse{
+						StatusCode:  200,
+						ContentType: "application/json",
+					},
+				},
+				{
+					Method: "POST",
+					URL:    "https://example.com/service",
+					Headers: map[string]string{
+						"Content-Type": "text/xml",
+						"SOAPAction":   "http://example.com/GetUser",
+					},
+					Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body/></soap:Envelope>`),
+				},
+			},
+			threshold: 0.5,
+			want:      "wsdl",
+		},
+		{
+			name: "SOAP below threshold returns rest",
+			requests: []crawl.ObservedRequest{
+				{
+					Method: "POST",
+					URL:    "https://example.com/service",
+					Headers: map[string]string{
+						"Content-Type": "text/xml",
+					},
+					// text/xml alone gives 0.85 confidence from WSDL classifier
+				},
+			},
+			threshold: 0.90,
+			want:      "rest",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := detectAPIType(tt.requests, tt.threshold)
+			if got != tt.want {
+				t.Errorf("detectAPIType() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGenerateSpec_WSDLType verifies that generateSpec works end-to-end with
+// WSDL-classified traffic (the pipeline that was broken before the fix).
+func TestGenerateSpec_WSDLType(t *testing.T) {
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "POST",
+			URL:    "https://example.com/service",
+			Headers: map[string]string{
+				"Content-Type": "text/xml",
+				"SOAPAction":   "http://example.com/GetUser",
+			},
+			Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><GetUser xmlns="http://example.com/"/></soap:Body></soap:Envelope>`),
+		},
+	}
+
+	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
+		APIType:     "wsdl",
+		Confidence:  0.5,
+		Probe:       false,
+		Deduplicate: true,
+	})
+	if err != nil {
+		t.Fatalf("generateSpec(wsdl) unexpected error: %v", err)
+	}
+	if len(spec) == 0 {
+		t.Fatal("generateSpec(wsdl) returned empty spec for SOAP traffic")
+	}
+	// Verify the output contains WSDL markers
+	specStr := string(spec)
+	if !strings.Contains(specStr, "definitions") {
+		t.Errorf("generateSpec(wsdl) output missing WSDL definitions element:\n%s", specStr)
+	}
+}
+
+// TestScanPipeline_WSDLDetection is an integration test verifying the full
+// scan pipeline detects WSDL traffic and routes to the WSDL generator.
+// This is the core regression test for LAB-1392.
+func TestScanPipeline_WSDLDetection(t *testing.T) {
+	// Simulate what happens inside ScanCmd.Run(): capture traffic, detect type,
+	// generate spec — but without the actual crawl (which needs a live server).
+	soapRequests := []crawl.ObservedRequest{
+		{
+			Method: "POST",
+			URL:    "https://example.com/dvwsuserservice",
+			Headers: map[string]string{
+				"Content-Type": "text/xml; charset=utf-8",
+				"SOAPAction":   "http://example.com/GetUser",
+			},
+			Body: []byte(`<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><GetUser xmlns="http://example.com/"/></soap:Body></soap:Envelope>`),
+		},
+	}
+
+	// Step 1: Detect API type (this is the new logic)
+	apiType := detectAPIType(soapRequests, 0.5)
+	if apiType != "wsdl" {
+		t.Fatalf("detectAPIType() = %q for SOAP traffic, want %q", apiType, "wsdl")
+	}
+
+	// Step 2: Generate spec with detected type
+	spec, err := generateSpec(context.Background(), soapRequests, generateSpecOptions{
+		APIType:     apiType,
+		Confidence:  0.5,
+		Probe:       false,
+		Deduplicate: true,
+	})
+	if err != nil {
+		t.Fatalf("generateSpec(%s) error: %v", apiType, err)
+	}
+	if len(spec) == 0 {
+		t.Fatal("scan pipeline produced empty output for SOAP traffic")
+	}
+
+	// Step 3: Verify output is WSDL, not REST/OpenAPI
+	specStr := string(spec)
+	if strings.Contains(specStr, "openapi") {
+		t.Error("scan pipeline produced OpenAPI spec for SOAP traffic — should be WSDL")
+	}
+	if !strings.Contains(specStr, "definitions") {
+		t.Error("scan pipeline output missing WSDL definitions element")
+	}
+}

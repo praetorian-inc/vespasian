@@ -577,7 +577,13 @@ func (c *ScanCmd) Run() error {
 			fmt.Fprintf(os.Stderr, "request-id: %s\n", bs.requestID)
 		}
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests))
-		fmt.Fprintf(os.Stderr, "generating REST spec\n")
+	}
+
+	apiType := detectAPIType(requests, c.Confidence)
+
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "detected API type: %s\n", apiType)
+		fmt.Fprintf(os.Stderr, "generating %s spec\n", strings.ToUpper(apiType))
 	}
 
 	// Create a fresh signal context for the generate phase. If a signal
@@ -587,9 +593,8 @@ func (c *ScanCmd) Run() error {
 	genCtx, genStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer genStop()
 
-
 	spec, err := generateSpec(genCtx, requests, generateSpecOptions{
-		APIType:      "rest",
+		APIType:      apiType,
 		Confidence:   c.Confidence,
 		Probe:        c.Probe,
 		Deduplicate:  c.Deduplicate,
@@ -711,6 +716,21 @@ func classifiersForType(apiType string) []classify.APIClassifier {
 	default:
 		return nil
 	}
+}
+
+// detectAPIType runs both REST and WSDL classifiers against captured traffic
+// and returns the API type that best matches. If any request matches the WSDL
+// classifier above the given threshold, "wsdl" is returned — SOAP services
+// typically expose a single endpoint so even one match is a strong signal.
+// Otherwise "rest" is returned as the default.
+func detectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
+	wsdlClassifier := &classify.WSDLClassifier{}
+	for _, req := range requests {
+		if isAPI, confidence := wsdlClassifier.Classify(req); isAPI && confidence >= threshold {
+			return "wsdl"
+		}
+	}
+	return "rest"
 }
 
 // validateURL checks that the given string is a valid URL with scheme and host.
