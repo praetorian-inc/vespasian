@@ -800,6 +800,10 @@ func detectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
 func probeWSDLDocument(targetURL string, allowPrivate bool, verbose bool) []byte {
 	wsdlURL := strings.TrimRight(targetURL, "?") + "?wsdl"
 
+	if verbose {
+		fmt.Fprintf(os.Stderr, "wsdl discovery: probing %s\n", wsdlURL)
+	}
+
 	if !allowPrivate {
 		if err := probe.ValidateProbeURL(wsdlURL); err != nil {
 			if verbose {
@@ -819,7 +823,7 @@ func probeWSDLDocument(targetURL string, allowPrivate bool, verbose bool) []byte
 	resp, err := client.Get(wsdlURL)
 	if err != nil {
 		if verbose {
-			fmt.Fprintf(os.Stderr, "wsdl discovery: probe failed for %s: %v\n", wsdlURL, err)
+			fmt.Fprintf(os.Stderr, "wsdl discovery: request failed: %v\n", err)
 		}
 		return nil
 	}
@@ -829,6 +833,9 @@ func probeWSDLDocument(targetURL string, allowPrivate bool, verbose bool) []byte
 	}()
 
 	if resp.StatusCode >= 400 {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "wsdl discovery: %s returned HTTP %d\n", wsdlURL, resp.StatusCode)
+		}
 		return nil
 	}
 
@@ -839,6 +846,9 @@ func probeWSDLDocument(targetURL string, allowPrivate bool, verbose bool) []byte
 
 	// Validate the response is actually a WSDL document
 	if _, parseErr := wsdlgen.ParseWSDL(body); parseErr != nil {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "wsdl discovery: response is not valid WSDL: %v\n", parseErr)
+		}
 		return nil
 	}
 
