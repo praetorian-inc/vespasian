@@ -57,8 +57,13 @@ func isPrivateIP(ip net.IP) bool {
 	return false
 }
 
-// validateProbeURL checks that rawURL is safe to probe. It rejects non-HTTP(S)
+// ValidateProbeURL checks that rawURL is safe to probe. It rejects non-HTTP(S)
 // schemes and URLs that resolve to private/internal IP addresses (SSRF protection).
+func ValidateProbeURL(rawURL string) error {
+	return validateProbeURL(rawURL)
+}
+
+// validateProbeURL is the internal implementation of ValidateProbeURL.
 func validateProbeURL(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {

@@ -35,6 +35,7 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/generate"
+	wsdlgen "github.com/praetorian-inc/vespasian/pkg/generate/wsdl"
 	"github.com/praetorian-inc/vespasian/pkg/importer"
 	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
@@ -596,6 +597,31 @@ func (c *ScanCmd) Run() error {
 		}
 	}
 
+	// When auto-detection or explicit WSDL mode is active, try fetching a
+	// WSDL document from <targetURL>?wsdl. SOAP services return HTML for
+	// browser GETs so crawl traffic rarely contains WSDL signals — active
+	// probing is the reliable discovery method.
+	if apiType == apiTypeAuto || apiType == apiTypeWSDL || apiType == apiTypeREST {
+		wsdlDoc := probeWSDLDocument(c.URL, c.DangerousAllowPrivate, c.Verbose)
+		if wsdlDoc != nil {
+			apiType = apiTypeWSDL
+			if c.Verbose {
+				fmt.Fprintf(os.Stderr, "discovered WSDL document at %s?wsdl\n", c.URL)
+			}
+			// Inject a synthetic request carrying the WSDL document so
+			// the generator's Phase 1 can return it directly.
+			requests = append(requests, crawl.ObservedRequest{
+				Method: "GET",
+				URL:    c.URL + "?wsdl",
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: "text/xml",
+					Body:        wsdlDoc,
+				},
+			})
+		}
+	}
+
 	if c.Verbose {
 		fmt.Fprintf(os.Stderr, "generating %s spec\n", apiTypeDisplayName(apiType))
 	}
@@ -764,6 +790,59 @@ func detectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
 		return apiTypeWSDL
 	}
 	return apiTypeREST
+}
+
+// probeWSDLDocument attempts to fetch a WSDL document from targetURL?wsdl.
+// Returns the raw WSDL bytes if the response is a valid WSDL document, or nil
+// if the probe fails or returns non-WSDL content. This is the primary WSDL
+// discovery mechanism for the scan pipeline because headless browser crawls
+// of SOAP endpoints typically capture HTML, not XML.
+func probeWSDLDocument(targetURL string, allowPrivate bool, verbose bool) []byte {
+	wsdlURL := strings.TrimRight(targetURL, "?") + "?wsdl"
+
+	if !allowPrivate {
+		if err := probe.ValidateProbeURL(wsdlURL); err != nil {
+			if verbose {
+				fmt.Fprintf(os.Stderr, "wsdl discovery: skipping %s (SSRF protection: %v)\n", wsdlURL, err)
+			}
+			return nil
+		}
+	}
+
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	resp, err := client.Get(wsdlURL)
+	if err != nil {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "wsdl discovery: probe failed for %s: %v\n", wsdlURL, err)
+		}
+		return nil
+	}
+	defer func() {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck
+		resp.Body.Close()                                     //nolint:errcheck
+	}()
+
+	if resp.StatusCode >= 400 {
+		return nil
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20)) // 2MB limit
+	if err != nil {
+		return nil
+	}
+
+	// Validate the response is actually a WSDL document
+	if _, parseErr := wsdlgen.ParseWSDL(body); parseErr != nil {
+		return nil
+	}
+
+	return body
 }
 
 // apiTypeDisplayName returns a human-readable display name for an API type.

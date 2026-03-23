@@ -1736,6 +1736,160 @@ func TestGenerateSpec_WSDLEmptyBodyNoResponse(t *testing.T) {
 	}
 }
 
+// TestProbeWSDLDocument_ValidWSDL verifies that probeWSDLDocument fetches and
+// validates a WSDL document from a ?wsdl endpoint.
+func TestProbeWSDLDocument_ValidWSDL(t *testing.T) {
+	validWSDL := `<?xml version="1.0"?>
+<definitions name="Calculator"
+  xmlns="http://schemas.xmlsoap.org/wsdl/"
+  xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"
+  xmlns:tns="http://example.com/"
+  targetNamespace="http://example.com/">
+  <message name="AddRequest"><part name="parameters" element="tns:Add"/></message>
+  <message name="AddResponse"><part name="parameters" element="tns:AddResponse"/></message>
+  <portType name="CalculatorPortType">
+    <operation name="Add">
+      <input message="tns:AddRequest"/>
+      <output message="tns:AddResponse"/>
+    </operation>
+  </portType>
+</definitions>`
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.RawQuery == "wsdl" {
+			w.Header().Set("Content-Type", "text/xml")
+			w.Write([]byte(validWSDL))
+			return
+		}
+		// Base URL returns HTML (like real SOAP services)
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte("<html><body>Service Description</body></html>"))
+	}))
+	defer ts.Close()
+
+	doc := probeWSDLDocument(ts.URL+"/calculator.asmx", true, false)
+	if doc == nil {
+		t.Fatal("probeWSDLDocument returned nil for valid WSDL endpoint")
+	}
+	if !strings.Contains(string(doc), "Calculator") {
+		t.Errorf("expected WSDL document with Calculator service, got:\n%s", string(doc))
+	}
+}
+
+// TestProbeWSDLDocument_NoWSDL verifies that probeWSDLDocument returns nil
+// when the endpoint doesn't serve WSDL.
+func TestProbeWSDLDocument_NoWSDL(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte("<html><body>Not a SOAP service</body></html>"))
+	}))
+	defer ts.Close()
+
+	doc := probeWSDLDocument(ts.URL, true, false)
+	if doc != nil {
+		t.Errorf("probeWSDLDocument should return nil for non-WSDL endpoint, got %d bytes", len(doc))
+	}
+}
+
+// TestProbeWSDLDocument_404 verifies that probeWSDLDocument returns nil
+// when the ?wsdl endpoint returns an error status.
+func TestProbeWSDLDocument_404(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	doc := probeWSDLDocument(ts.URL, true, false)
+	if doc != nil {
+		t.Error("probeWSDLDocument should return nil for 404 response")
+	}
+}
+
+// TestScanPipeline_WSDLDiscoveryProbe is an end-to-end test verifying that
+// the scan pipeline discovers a WSDL document via active probing even when
+// crawl traffic contains no SOAP signals (the real-world scenario for LAB-1392).
+func TestScanPipeline_WSDLDiscoveryProbe(t *testing.T) {
+	validWSDL := `<?xml version="1.0"?>
+<definitions name="Calculator"
+  xmlns="http://schemas.xmlsoap.org/wsdl/"
+  xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"
+  xmlns:tns="http://example.com/"
+  targetNamespace="http://example.com/">
+  <message name="AddRequest"><part name="parameters" element="tns:Add"/></message>
+  <message name="AddResponse"><part name="parameters" element="tns:AddResponse"/></message>
+  <portType name="CalculatorPortType">
+    <operation name="Add">
+      <input message="tns:AddRequest"/>
+      <output message="tns:AddResponse"/>
+    </operation>
+  </portType>
+</definitions>`
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.RawQuery == "wsdl" {
+			w.Header().Set("Content-Type", "text/xml")
+			w.Write([]byte(validWSDL))
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte("<html><body>Service</body></html>"))
+	}))
+	defer ts.Close()
+
+	// Simulate crawl output: browser visited the HTML page, no SOAP signals
+	crawlTraffic := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    ts.URL + "/calculator.asmx",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte("<html><body>Service</body></html>"),
+			},
+		},
+	}
+
+	// Passive detection sees no WSDL — but active probe finds it
+	passiveType := detectAPIType(crawlTraffic, 0.5)
+	if passiveType != apiTypeREST {
+		t.Fatalf("passive detection should return REST for HTML, got %q", passiveType)
+	}
+
+	// Active probe discovers the WSDL document
+	wsdlDoc := probeWSDLDocument(ts.URL+"/calculator.asmx", true, false)
+	if wsdlDoc == nil {
+		t.Fatal("probeWSDLDocument should find the WSDL document")
+	}
+
+	// Inject synthetic request (same as ScanCmd.Run does)
+	crawlTraffic = append(crawlTraffic, crawl.ObservedRequest{
+		Method: "GET",
+		URL:    ts.URL + "/calculator.asmx?wsdl",
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "text/xml",
+			Body:        wsdlDoc,
+		},
+	})
+
+	// Generate WSDL spec
+	spec, err := generateSpec(context.Background(), crawlTraffic, generateSpecOptions{
+		APIType:     apiTypeWSDL,
+		Confidence:  0.5,
+		Probe:       false,
+		Deduplicate: true,
+	})
+	if err != nil {
+		t.Fatalf("generateSpec error: %v", err)
+	}
+	if len(spec) == 0 {
+		t.Fatal("pipeline produced empty output")
+	}
+	if !strings.Contains(string(spec), "Calculator") {
+		t.Errorf("expected WSDL with Calculator service, got:\n%s", string(spec))
+	}
+}
+
 // TestAPITypeDisplayName verifies display name mapping for verbose output.
 func TestAPITypeDisplayName(t *testing.T) {
 	tests := []struct {
