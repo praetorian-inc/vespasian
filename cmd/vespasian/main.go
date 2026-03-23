@@ -732,25 +732,36 @@ func classifiersForType(apiType string) []classify.APIClassifier {
 	}
 }
 
-// detectAPIType runs the WSDL classifier against captured traffic and returns
-// the API type that best matches. If any request matches the WSDL classifier
-// above the given threshold, "wsdl" is returned — SOAP services typically
-// expose a single endpoint so even one match is a strong signal. Otherwise
-// "rest" is returned as the default.
+// detectAPIType runs both WSDL and REST classifiers against captured traffic
+// and returns the API type with the most matches. For WSDL to win, it must
+// have at least one match AND represent the majority of classified traffic.
+// When WSDL matches exist but are the minority (mixed REST+SOAP), REST is
+// returned to avoid losing REST endpoint discovery.
 //
 // Note: this performs a lightweight classification pass separate from the full
 // RunClassifiers call inside generateSpec. The duplication is intentional —
-// detectAPIType only needs to answer "which generator?" and returns early on
-// the first WSDL match, while generateSpec's pass produces the full
-// ClassifiedRequest slice needed for generation.
+// detectAPIType only needs to answer "which generator?", while generateSpec's
+// pass produces the full ClassifiedRequest slice needed for generation.
 func detectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
 	// Currently checks WSDL vs REST. Add GraphQL check here when
 	// GraphQLClassifier is available.
 	wsdlClassifier := &classify.WSDLClassifier{}
+	restClassifier := &classify.RESTClassifier{}
+
+	var wsdlCount, restCount int
 	for _, req := range requests {
 		if isAPI, confidence := wsdlClassifier.Classify(req); isAPI && confidence >= threshold {
-			return apiTypeWSDL
+			wsdlCount++
 		}
+		if isAPI, confidence := restClassifier.Classify(req); isAPI && confidence >= threshold {
+			restCount++
+		}
+	}
+
+	// WSDL wins only when it has matches and they represent the majority
+	// of classified traffic (or there are no REST matches at all).
+	if wsdlCount > 0 && wsdlCount >= restCount {
+		return apiTypeWSDL
 	}
 	return apiTypeREST
 }

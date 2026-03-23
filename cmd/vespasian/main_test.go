@@ -1342,19 +1342,8 @@ func TestDetectAPIType(t *testing.T) {
 			want:      apiTypeWSDL,
 		},
 		{
-			name: "mixed traffic with SOAP present returns wsdl",
+			name: "majority SOAP traffic returns wsdl",
 			requests: []crawl.ObservedRequest{
-				{
-					Method: "GET",
-					URL:    "https://example.com/api/users",
-					Headers: map[string]string{
-						"Content-Type": "application/json",
-					},
-					Response: crawl.ObservedResponse{
-						StatusCode:  200,
-						ContentType: "application/json",
-					},
-				},
 				{
 					Method: "POST",
 					URL:    "https://example.com/service",
@@ -1364,9 +1353,60 @@ func TestDetectAPIType(t *testing.T) {
 					},
 					Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body/></soap:Envelope>`),
 				},
+				{
+					Method: "POST",
+					URL:    "https://example.com/service",
+					Headers: map[string]string{
+						"Content-Type": "text/xml",
+						"SOAPAction":   "http://example.com/ListUsers",
+					},
+					Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body/></soap:Envelope>`),
+				},
 			},
 			threshold: 0.5,
 			want:      apiTypeWSDL,
+		},
+		{
+			name: "minority SOAP in mostly REST traffic returns rest",
+			requests: []crawl.ObservedRequest{
+				{
+					Method: "GET",
+					URL:    "https://example.com/api/users",
+					Headers: map[string]string{
+						"Accept": "application/json",
+					},
+					Response: crawl.ObservedResponse{
+						StatusCode:  200,
+						ContentType: "application/json",
+						Body:        []byte(`[{"id":1}]`),
+					},
+				},
+				{
+					Method: "GET",
+					URL:    "https://example.com/api/posts",
+					Headers: map[string]string{
+						"Accept": "application/json",
+					},
+					Response: crawl.ObservedResponse{
+						StatusCode:  200,
+						ContentType: "application/json",
+						Body:        []byte(`[{"id":1}]`),
+					},
+				},
+				{
+					Method: "GET",
+					URL:    "https://example.com/health",
+					Headers: map[string]string{
+						"Accept": "application/json",
+					},
+					Response: crawl.ObservedResponse{
+						StatusCode:  200,
+						ContentType: "text/xml",
+					},
+				},
+			},
+			threshold: 0.5,
+			want:      apiTypeREST,
 		},
 		{
 			name: "SOAP below threshold returns rest",
@@ -1521,6 +1561,178 @@ func TestDetectAPIType_ExplicitOverride(t *testing.T) {
 	// REST classifier won't match SOAP traffic, so spec should be empty/nil
 	if len(spec) > 0 && strings.Contains(string(spec), "definitions") {
 		t.Error("explicit REST override produced WSDL output")
+	}
+}
+
+// TestGenerateSpec_WSDLFromResponseBody verifies that the WSDL generator can
+// extract operations from response bodies when request bodies are empty — the
+// typical pattern for crawl-captured SOAP traffic.
+func TestGenerateSpec_WSDLFromResponseBody(t *testing.T) {
+	// Simulate crawl-captured traffic: the crawler observed a response to a
+	// SOAP endpoint but didn't replay the request, so Body is empty.
+	// The response body contains a SOAP envelope with an operation element.
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/dvwsuserservice",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/xml",
+				Body: []byte(`<?xml version="1.0"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <GetUserResponse xmlns="http://example.com/">
+      <User><Name>Alice</Name></User>
+    </GetUserResponse>
+  </soap:Body>
+</soap:Envelope>`),
+			},
+		},
+	}
+
+	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
+		APIType:     apiTypeWSDL,
+		Confidence:  0.5,
+		Probe:       false,
+		Deduplicate: true,
+	})
+	if err != nil {
+		t.Fatalf("generateSpec(wsdl, response-body traffic) unexpected error: %v", err)
+	}
+	if len(spec) == 0 {
+		t.Fatal("generateSpec(wsdl, response-body traffic) returned empty spec")
+	}
+	specStr := string(spec)
+	if !strings.Contains(specStr, "definitions") {
+		t.Errorf("output missing WSDL definitions element:\n%s", specStr)
+	}
+	if !strings.Contains(specStr, "GetUser") {
+		t.Errorf("output missing inferred GetUser operation (stripped Response suffix):\n%s", specStr)
+	}
+}
+
+// TestGenerateSpec_WSDLFromCrawledWSDLDocument verifies that when a ?wsdl URL
+// is crawled and the response body is a valid WSDL document, the generator
+// returns it directly (Phase 1) without needing to infer operations.
+func TestGenerateSpec_WSDLFromCrawledWSDLDocument(t *testing.T) {
+	validWSDL := []byte(`<?xml version="1.0"?>
+<definitions name="TestService"
+  xmlns="http://schemas.xmlsoap.org/wsdl/"
+  xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"
+  xmlns:tns="http://example.com/"
+  targetNamespace="http://example.com/">
+  <message name="GetUserRequest"><part name="parameters" element="tns:GetUser"/></message>
+  <message name="GetUserResponse"><part name="parameters" element="tns:GetUserResponse"/></message>
+  <portType name="TestServicePortType">
+    <operation name="GetUser">
+      <input message="tns:GetUserRequest"/>
+      <output message="tns:GetUserResponse"/>
+    </operation>
+  </portType>
+</definitions>`)
+
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/dvwsuserservice?wsdl",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/xml",
+				Body:        validWSDL,
+			},
+		},
+	}
+
+	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
+		APIType:     apiTypeWSDL,
+		Confidence:  0.5,
+		Probe:       false,
+		Deduplicate: true,
+	})
+	if err != nil {
+		t.Fatalf("generateSpec(wsdl, crawled ?wsdl doc) unexpected error: %v", err)
+	}
+	if len(spec) == 0 {
+		t.Fatal("generateSpec(wsdl, crawled ?wsdl doc) returned empty spec")
+	}
+	// Should return the original WSDL document via Phase 1
+	if !strings.Contains(string(spec), "TestService") {
+		t.Errorf("expected original WSDL document to be returned, got:\n%s", string(spec))
+	}
+}
+
+// TestScanPipeline_RealisticCrawlTraffic is a regression test for LAB-1392
+// using traffic patterns that match real crawl output (empty request bodies,
+// content-type only signals, SOAP response envelopes).
+func TestScanPipeline_RealisticCrawlTraffic(t *testing.T) {
+	// Realistic: crawler GETs a SOAP endpoint, observes text/xml response
+	// with a SOAP envelope, but request body is empty.
+	crawlTraffic := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/dvwsuserservice",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/xml; charset=utf-8",
+				Body: []byte(`<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><GetUserResponse xmlns="http://example.com/"><User><Name>Alice</Name></User></GetUserResponse></soap:Body></soap:Envelope>`),
+			},
+		},
+	}
+
+	// Step 1: Auto-detect should identify WSDL
+	apiType := detectAPIType(crawlTraffic, 0.5)
+	if apiType != apiTypeWSDL {
+		t.Fatalf("detectAPIType() = %q, want %q", apiType, apiTypeWSDL)
+	}
+
+	// Step 2: Generate should produce WSDL output
+	spec, err := generateSpec(context.Background(), crawlTraffic, generateSpecOptions{
+		APIType:     apiType,
+		Confidence:  0.5,
+		Probe:       false,
+		Deduplicate: true,
+	})
+	if err != nil {
+		t.Fatalf("generateSpec(%s) error: %v", apiType, err)
+	}
+	if len(spec) == 0 {
+		t.Fatal("scan pipeline produced empty output for realistic crawl SOAP traffic")
+	}
+	specStr := string(spec)
+	if !strings.Contains(specStr, "definitions") {
+		t.Error("output missing WSDL definitions element")
+	}
+	if !strings.Contains(specStr, "GetUser") {
+		t.Error("output missing inferred GetUser operation from response body")
+	}
+}
+
+// TestGenerateSpec_WSDLEmptyBodyNoResponse verifies that InferWSDL returns
+// a clear error when request bodies are empty AND response bodies have no
+// SOAP envelope — documenting the known limitation.
+func TestGenerateSpec_WSDLEmptyBodyNoResponse(t *testing.T) {
+	// Minimal SOAP signal: content-type only, no request body, no SOAP
+	// envelope in response. This is the case the reviewer flagged.
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/service",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/xml",
+				Body:        []byte(`<html><body>Not a SOAP response</body></html>`),
+			},
+		},
+	}
+
+	_, err := generateSpec(context.Background(), requests, generateSpecOptions{
+		APIType:     apiTypeWSDL,
+		Confidence:  0.5,
+		Probe:       false,
+		Deduplicate: true,
+	})
+	if err == nil {
+		t.Error("expected error for empty-body WSDL traffic with no SOAP response, got nil")
 	}
 }
 

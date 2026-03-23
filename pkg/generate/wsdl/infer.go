@@ -130,7 +130,12 @@ func InferWSDL(endpoints []classify.ClassifiedRequest) (*Definitions, error) {
 }
 
 // extractOperation extracts the operation name from a classified SOAP request.
-// First tries SOAPAction header, then falls back to SOAP body first child element.
+// It tries multiple sources in order:
+//  1. SOAPAction header (highest fidelity)
+//  2. Request body first child element inside soap:Body
+//  3. Response body first child element inside soap:Body (for crawl-captured
+//     traffic where the request body is empty but the response contains a
+//     SOAP envelope with an operation-named element like <GetUserResponse>)
 func extractOperation(ep classify.ClassifiedRequest) (opName string, soapAction string) {
 	// Try SOAPAction header (case-insensitive)
 	for k, v := range ep.Headers {
@@ -144,10 +149,22 @@ func extractOperation(ep classify.ClassifiedRequest) (opName string, soapAction 
 		}
 	}
 
-	// Fall back to SOAP body first child element name
+	// Fall back to SOAP body first child element name (request body)
 	if len(ep.Body) > 0 {
 		opName = extractFirstBodyElement(ep.Body)
 		if opName != "" {
+			return opName, ""
+		}
+	}
+
+	// Fall back to response body — crawl-captured traffic often has empty
+	// request bodies but the SOAP response contains the envelope structure.
+	// Response operation elements are typically named <FooResponse>, so we
+	// strip the "Response" suffix to recover the operation name.
+	if len(ep.Response.Body) > 0 {
+		respOp := extractFirstBodyElement(ep.Response.Body)
+		if respOp != "" {
+			opName = strings.TrimSuffix(respOp, "Response")
 			return opName, ""
 		}
 	}
