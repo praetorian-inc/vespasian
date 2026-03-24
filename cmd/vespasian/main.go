@@ -47,6 +47,7 @@ var (
 
 // CLI defines the complete command-line interface structure.
 var CLI struct {
+	NoBanner bool        `help:"Suppress the startup banner" name:"no-banner"`
 	Crawl    CrawlCmd    `cmd:"" help:"Crawl a web application to discover API endpoints"`
 	Import   ImportCmd   `cmd:"" help:"Import traffic capture from external sources"`
 	Generate GenerateCmd `cmd:"" help:"Generate API specifications from captured traffic"`
@@ -599,6 +600,9 @@ func main() {
 		kong.Description("API discovery tool for security assessments."),
 		kong.UsageOnError(),
 	)
+	if !CLI.NoBanner {
+		printBanner()
+	}
 	err := ctx.Run()
 	ctx.FatalIfErrorf(err)
 }
