@@ -47,19 +47,48 @@ type GraphQLIntrospection struct {
 	Types []GraphQLType `json:"types,omitempty"`
 	// RawResponse stores the raw introspection JSON for downstream generators.
 	RawResponse []byte `json:"raw_response,omitempty"`
+	// Root type names from __schema.queryType/mutationType/subscriptionType.
+	QueryTypeName        string `json:"query_type_name,omitempty"`
+	MutationTypeName     string `json:"mutation_type_name,omitempty"`
+	SubscriptionTypeName string `json:"subscription_type_name,omitempty"`
 }
 
 // GraphQLType represents a single type from a GraphQL introspection response.
 type GraphQLType struct {
-	Name   string         `json:"name"`
-	Kind   string         `json:"kind"`
-	Fields []GraphQLField `json:"fields,omitempty"`
+	Name          string              `json:"name"`
+	Kind          string              `json:"kind"`
+	Description   string              `json:"description,omitempty"`
+	Fields        []GraphQLField      `json:"fields,omitempty"`
+	InputFields   []GraphQLInputValue `json:"inputFields,omitempty"`
+	EnumValues    []GraphQLEnumValue  `json:"enumValues,omitempty"`
+	Interfaces    []GraphQLTypeRef    `json:"interfaces,omitempty"`
+	PossibleTypes []GraphQLTypeRef    `json:"possibleTypes,omitempty"`
 }
 
 // GraphQLField represents a field on a GraphQL type.
 type GraphQLField struct {
-	Name string         `json:"name"`
-	Type GraphQLTypeRef `json:"type"`
+	Name              string              `json:"name"`
+	Description       string              `json:"description,omitempty"`
+	Type              GraphQLTypeRef      `json:"type"`
+	Args              []GraphQLInputValue `json:"args,omitempty"`
+	IsDeprecated      bool                `json:"isDeprecated,omitempty"`
+	DeprecationReason string              `json:"deprecationReason,omitempty"`
+}
+
+// GraphQLInputValue represents an argument or input field.
+type GraphQLInputValue struct {
+	Name         string         `json:"name"`
+	Description  string         `json:"description,omitempty"`
+	Type         GraphQLTypeRef `json:"type"`
+	DefaultValue *string        `json:"defaultValue,omitempty"`
+}
+
+// GraphQLEnumValue represents a single value of an enum type.
+type GraphQLEnumValue struct {
+	Name              string `json:"name"`
+	Description       string `json:"description,omitempty"`
+	IsDeprecated      bool   `json:"isDeprecated,omitempty"`
+	DeprecationReason string `json:"deprecationReason,omitempty"`
 }
 
 // GraphQLTypeRef represents a type reference (name + kind + ofType for wrapping types).

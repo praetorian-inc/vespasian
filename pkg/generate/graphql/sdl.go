@@ -97,8 +97,8 @@ func generateFromIntrospection(schema *classify.GraphQLIntrospection) ([]byte, e
 		return userTypes[i].Name < userTypes[j].Name
 	})
 
-	// Emit schema block if root types are present
-	writeSchemaBlock(&sb, userTypes)
+	// Emit schema block using introspection root type names if available
+	writeSchemaBlockFromIntrospection(&sb, schema, userTypes)
 
 	// Emit type definitions
 	for i, t := range userTypes {
@@ -111,20 +111,38 @@ func generateFromIntrospection(schema *classify.GraphQLIntrospection) ([]byte, e
 	return []byte(sb.String()), nil
 }
 
-// writeSchemaBlock emits a schema { ... } block if any root types exist.
-func writeSchemaBlock(sb *strings.Builder, types []classify.GraphQLType) {
-	var roots []string
-	rootMap := make(map[string]bool)
+// writeSchemaBlockFromIntrospection emits a schema { ... } block using introspection
+// root type names when available, falling back to conventional name detection.
+func writeSchemaBlockFromIntrospection(sb *strings.Builder, schema *classify.GraphQLIntrospection, types []classify.GraphQLType) {
+	// Build a set of type names that actually exist
+	typeExists := make(map[string]bool)
 	for _, t := range types {
-		if rootTypeNames[t.Name] && (t.Kind == "OBJECT") {
-			rootMap[t.Name] = true
-		}
+		typeExists[t.Name] = true
 	}
 
-	// Emit in canonical order
-	for _, name := range []string{"Query", "Mutation", "Subscription"} {
-		if rootMap[name] {
-			roots = append(roots, name)
+	type rootEntry struct {
+		op   string
+		name string
+	}
+	var roots []rootEntry
+
+	// Use introspection root type names if available
+	if schema.QueryTypeName != "" && typeExists[schema.QueryTypeName] {
+		roots = append(roots, rootEntry{"query", schema.QueryTypeName})
+	}
+	if schema.MutationTypeName != "" && typeExists[schema.MutationTypeName] {
+		roots = append(roots, rootEntry{"mutation", schema.MutationTypeName})
+	}
+	if schema.SubscriptionTypeName != "" && typeExists[schema.SubscriptionTypeName] {
+		roots = append(roots, rootEntry{"subscription", schema.SubscriptionTypeName})
+	}
+
+	// Fall back to conventional name detection if no root type names from introspection
+	if len(roots) == 0 {
+		for _, name := range []string{"Query", "Mutation", "Subscription"} {
+			if typeExists[name] {
+				roots = append(roots, rootEntry{strings.ToLower(name), name})
+			}
 		}
 	}
 
@@ -133,8 +151,8 @@ func writeSchemaBlock(sb *strings.Builder, types []classify.GraphQLType) {
 	}
 
 	sb.WriteString("schema {\n")
-	for _, name := range roots {
-		fmt.Fprintf(sb, "  %s: %s\n", strings.ToLower(name), name)
+	for _, r := range roots {
+		fmt.Fprintf(sb, "  %s: %s\n", r.op, r.name)
 	}
 	sb.WriteString("}\n")
 }
@@ -143,12 +161,26 @@ func writeSchemaBlock(sb *strings.Builder, types []classify.GraphQLType) {
 func writeTypeDefinition(sb *strings.Builder, t classify.GraphQLType) {
 	switch t.Kind {
 	case "OBJECT":
-		fmt.Fprintf(sb, "type %s {\n", t.Name)
+		if len(t.Interfaces) > 0 {
+			names := make([]string, 0, len(t.Interfaces))
+			for _, iface := range t.Interfaces {
+				if iface.Name != nil {
+					names = append(names, *iface.Name)
+				}
+			}
+			if len(names) > 0 {
+				fmt.Fprintf(sb, "type %s implements %s {\n", t.Name, strings.Join(names, " & "))
+			} else {
+				fmt.Fprintf(sb, "type %s {\n", t.Name)
+			}
+		} else {
+			fmt.Fprintf(sb, "type %s {\n", t.Name)
+		}
 		writeFields(sb, t.Fields)
 		sb.WriteString("}\n")
 	case "INPUT_OBJECT":
 		fmt.Fprintf(sb, "input %s {\n", t.Name)
-		writeFields(sb, t.Fields)
+		writeInputFields(sb, t.InputFields)
 		sb.WriteString("}\n")
 	case "INTERFACE":
 		fmt.Fprintf(sb, "interface %s {\n", t.Name)
@@ -156,22 +188,59 @@ func writeTypeDefinition(sb *strings.Builder, t classify.GraphQLType) {
 		sb.WriteString("}\n")
 	case "ENUM":
 		fmt.Fprintf(sb, "enum %s {\n", t.Name)
-		for _, f := range t.Fields {
-			fmt.Fprintf(sb, "  %s\n", f.Name)
+		if len(t.EnumValues) > 0 {
+			for _, ev := range t.EnumValues {
+				fmt.Fprintf(sb, "  %s\n", ev.Name)
+			}
+		} else {
+			// Fall back to field names for Tier 3 responses
+			for _, f := range t.Fields {
+				fmt.Fprintf(sb, "  %s\n", f.Name)
+			}
 		}
 		sb.WriteString("}\n")
 	case "UNION":
-		fmt.Fprintf(sb, "union %s\n", t.Name)
+		if len(t.PossibleTypes) > 0 {
+			names := make([]string, 0, len(t.PossibleTypes))
+			for _, pt := range t.PossibleTypes {
+				if pt.Name != nil {
+					names = append(names, *pt.Name)
+				}
+			}
+			fmt.Fprintf(sb, "union %s = %s\n", t.Name, strings.Join(names, " | "))
+		} else {
+			fmt.Fprintf(sb, "union %s\n", t.Name)
+		}
 	case "SCALAR":
 		fmt.Fprintf(sb, "scalar %s\n", t.Name)
 	}
 }
 
-// writeFields emits field definitions for object/input/interface types.
+// writeFields emits field definitions with arguments for object/interface types.
 func writeFields(sb *strings.Builder, fields []classify.GraphQLField) {
+	for _, f := range fields {
+		if len(f.Args) > 0 {
+			fmt.Fprintf(sb, "  %s(%s): %s\n", f.Name, formatArgs(f.Args), typeRefToSDL(f.Type))
+		} else {
+			fmt.Fprintf(sb, "  %s: %s\n", f.Name, typeRefToSDL(f.Type))
+		}
+	}
+}
+
+// writeInputFields emits input field definitions.
+func writeInputFields(sb *strings.Builder, fields []classify.GraphQLInputValue) {
 	for _, f := range fields {
 		fmt.Fprintf(sb, "  %s: %s\n", f.Name, typeRefToSDL(f.Type))
 	}
+}
+
+// formatArgs formats a list of input values as SDL argument syntax.
+func formatArgs(args []classify.GraphQLInputValue) string {
+	parts := make([]string, 0, len(args))
+	for _, a := range args {
+		parts = append(parts, fmt.Sprintf("%s: %s", a.Name, typeRefToSDL(a.Type)))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // typeRefToSDL converts a GraphQLTypeRef to its SDL string representation.

@@ -87,7 +87,7 @@ func TestGenerator_Phase1_IntrospectionSDL(t *testing.T) {
 					{
 						Name: "CreateUserInput",
 						Kind: "INPUT_OBJECT",
-						Fields: []classify.GraphQLField{
+						InputFields: []classify.GraphQLInputValue{
 							{Name: "name", Type: classify.GraphQLTypeRef{Name: strPtr("String"), Kind: "SCALAR"}},
 							{Name: "email", Type: classify.GraphQLTypeRef{Name: strPtr("String"), Kind: "SCALAR"}},
 						},
@@ -132,6 +132,10 @@ func TestGenerator_Phase1_IntrospectionSDL(t *testing.T) {
 	// Verify fields
 	if !strings.Contains(sdl, "users: [User]") {
 		t.Error("missing LIST type rendering for users field")
+	}
+	// Verify input fields render
+	if !strings.Contains(sdl, "  name: String") {
+		t.Error("missing input field 'name' in CreateUserInput")
 	}
 }
 
@@ -222,6 +226,254 @@ func TestGenerator_Phase1_HandlesWrappingTypes(t *testing.T) {
 	}
 	if !strings.Contains(sdl, "requiredList: [User]!") {
 		t.Errorf("expected NON_NULL(LIST) rendering '[User]!', got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase1_FieldArgs(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			APIType: "graphql",
+			GraphQLSchema: &classify.GraphQLIntrospection{
+				IntrospectionEnabled: true,
+				Types: []classify.GraphQLType{
+					{
+						Name: "Query",
+						Kind: "OBJECT",
+						Fields: []classify.GraphQLField{
+							{
+								Name: "user",
+								Args: []classify.GraphQLInputValue{
+									{Name: "id", Type: classify.GraphQLTypeRef{Kind: "NON_NULL", OfType: &classify.GraphQLTypeRef{Name: strPtr("ID"), Kind: "SCALAR"}}},
+								},
+								Type: classify.GraphQLTypeRef{Name: strPtr("User"), Kind: "OBJECT"},
+							},
+							{
+								Name: "users",
+								Args: []classify.GraphQLInputValue{
+									{Name: "limit", Type: classify.GraphQLTypeRef{Name: strPtr("Int"), Kind: "SCALAR"}},
+									{Name: "offset", Type: classify.GraphQLTypeRef{Name: strPtr("Int"), Kind: "SCALAR"}},
+								},
+								Type: classify.GraphQLTypeRef{Kind: "LIST", OfType: &classify.GraphQLTypeRef{Name: strPtr("User"), Kind: "OBJECT"}},
+							},
+						},
+					},
+					{
+						Name: "User",
+						Kind: "OBJECT",
+						Fields: []classify.GraphQLField{
+							{Name: "id", Type: classify.GraphQLTypeRef{Name: strPtr("ID"), Kind: "SCALAR"}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	if !strings.Contains(sdl, "user(id: ID!): User") {
+		t.Errorf("expected field with arg 'user(id: ID!): User', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "users(limit: Int, offset: Int): [User]") {
+		t.Errorf("expected field with multiple args, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase1_EnumValues(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			APIType: "graphql",
+			GraphQLSchema: &classify.GraphQLIntrospection{
+				IntrospectionEnabled: true,
+				Types: []classify.GraphQLType{
+					{
+						Name: "Query",
+						Kind: "OBJECT",
+						Fields: []classify.GraphQLField{
+							{Name: "hello", Type: classify.GraphQLTypeRef{Name: strPtr("String"), Kind: "SCALAR"}},
+						},
+					},
+					{
+						Name: "Role",
+						Kind: "ENUM",
+						EnumValues: []classify.GraphQLEnumValue{
+							{Name: "ADMIN"},
+							{Name: "EDITOR"},
+							{Name: "VIEWER"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	if !strings.Contains(sdl, "enum Role {") {
+		t.Errorf("missing enum Role, got:\n%s", sdl)
+	}
+	for _, val := range []string{"ADMIN", "EDITOR", "VIEWER"} {
+		if !strings.Contains(sdl, "  "+val) {
+			t.Errorf("missing enum value %s, got:\n%s", val, sdl)
+		}
+	}
+}
+
+func TestGenerator_Phase1_UnionPossibleTypes(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			APIType: "graphql",
+			GraphQLSchema: &classify.GraphQLIntrospection{
+				IntrospectionEnabled: true,
+				Types: []classify.GraphQLType{
+					{
+						Name: "Query",
+						Kind: "OBJECT",
+						Fields: []classify.GraphQLField{
+							{Name: "search", Type: classify.GraphQLTypeRef{Name: strPtr("SearchResult"), Kind: "UNION"}},
+						},
+					},
+					{
+						Name: "SearchResult",
+						Kind: "UNION",
+						PossibleTypes: []classify.GraphQLTypeRef{
+							{Name: strPtr("User"), Kind: "OBJECT"},
+							{Name: strPtr("Post"), Kind: "OBJECT"},
+						},
+					},
+					{
+						Name: "User",
+						Kind: "OBJECT",
+						Fields: []classify.GraphQLField{
+							{Name: "id", Type: classify.GraphQLTypeRef{Name: strPtr("ID"), Kind: "SCALAR"}},
+						},
+					},
+					{
+						Name: "Post",
+						Kind: "OBJECT",
+						Fields: []classify.GraphQLField{
+							{Name: "id", Type: classify.GraphQLTypeRef{Name: strPtr("ID"), Kind: "SCALAR"}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	if !strings.Contains(sdl, "union SearchResult = User | Post") {
+		t.Errorf("expected union with possible types, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase1_InterfaceImplements(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			APIType: "graphql",
+			GraphQLSchema: &classify.GraphQLIntrospection{
+				IntrospectionEnabled: true,
+				Types: []classify.GraphQLType{
+					{
+						Name: "Query",
+						Kind: "OBJECT",
+						Fields: []classify.GraphQLField{
+							{Name: "node", Type: classify.GraphQLTypeRef{Name: strPtr("Node"), Kind: "INTERFACE"}},
+						},
+					},
+					{
+						Name: "Node",
+						Kind: "INTERFACE",
+						Fields: []classify.GraphQLField{
+							{Name: "id", Type: classify.GraphQLTypeRef{Kind: "NON_NULL", OfType: &classify.GraphQLTypeRef{Name: strPtr("ID"), Kind: "SCALAR"}}},
+						},
+					},
+					{
+						Name: "User",
+						Kind: "OBJECT",
+						Interfaces: []classify.GraphQLTypeRef{
+							{Name: strPtr("Node"), Kind: "INTERFACE"},
+						},
+						Fields: []classify.GraphQLField{
+							{Name: "id", Type: classify.GraphQLTypeRef{Kind: "NON_NULL", OfType: &classify.GraphQLTypeRef{Name: strPtr("ID"), Kind: "SCALAR"}}},
+							{Name: "name", Type: classify.GraphQLTypeRef{Name: strPtr("String"), Kind: "SCALAR"}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	if !strings.Contains(sdl, "type User implements Node {") {
+		t.Errorf("expected 'type User implements Node', got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "interface Node {") {
+		t.Errorf("missing interface Node, got:\n%s", sdl)
+	}
+}
+
+func TestGenerator_Phase1_RootTypeNamesFromIntrospection(t *testing.T) {
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			APIType: "graphql",
+			GraphQLSchema: &classify.GraphQLIntrospection{
+				IntrospectionEnabled: true,
+				QueryTypeName:       "RootQuery",
+				MutationTypeName:    "RootMutation",
+				Types: []classify.GraphQLType{
+					{
+						Name: "RootQuery",
+						Kind: "OBJECT",
+						Fields: []classify.GraphQLField{
+							{Name: "hello", Type: classify.GraphQLTypeRef{Name: strPtr("String"), Kind: "SCALAR"}},
+						},
+					},
+					{
+						Name: "RootMutation",
+						Kind: "OBJECT",
+						Fields: []classify.GraphQLField{
+							{Name: "doThing", Type: classify.GraphQLTypeRef{Name: strPtr("Boolean"), Kind: "SCALAR"}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	sdl := string(out)
+	if !strings.Contains(sdl, "query: RootQuery") {
+		t.Errorf("expected 'query: RootQuery' in schema block, got:\n%s", sdl)
+	}
+	if !strings.Contains(sdl, "mutation: RootMutation") {
+		t.Errorf("expected 'mutation: RootMutation' in schema block, got:\n%s", sdl)
 	}
 }
 
