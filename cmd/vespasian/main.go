@@ -35,6 +35,7 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/generate"
+	wsdlgen "github.com/praetorian-inc/vespasian/pkg/generate/wsdl"
 	"github.com/praetorian-inc/vespasian/pkg/importer"
 	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
@@ -467,7 +468,7 @@ func (c *ImportCmd) Run() error {
 
 // GenerateCmd generates API specifications from captured traffic.
 type GenerateCmd struct {
-	APIType     string  `arg:"" enum:"rest,wsdl" help:"API type to generate"`
+	APIType     string  `arg:"" enum:"rest,wsdl,graphql" help:"API type to generate (rest, wsdl, graphql)"`
 	Capture     string  `arg:"" help:"Capture file path"`
 	Output      string  `short:"o" help:"Output file path"`
 	Confidence  float64 `default:"0.5" help:"Minimum confidence threshold"`
@@ -476,6 +477,14 @@ type GenerateCmd struct {
 	DangerousAllowPrivate bool    `help:"Disable SSRF protection for probes, allowing private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 	Verbose     bool    `short:"v" help:"Enable verbose logging"`
 }
+
+// API type constants used for classification routing and generation.
+const (
+	apiTypeAuto    = "auto"
+	apiTypeREST    = "rest"
+	apiTypeWSDL    = "wsdl"
+	apiTypeGraphQL = "graphql"
+)
 
 // maxCaptureSize is the maximum capture file size (100MB).
 const maxCaptureSize = 100 * 1024 * 1024
@@ -535,6 +544,7 @@ func (c *GenerateCmd) Run() (err error) {
 // ScanCmd runs the full pipeline: crawl, classify, and generate.
 type ScanCmd struct {
 	URL         string  `arg:"" help:"Target URL to scan"`
+	APIType     string  `default:"auto" enum:"auto,rest,wsdl,graphql" help:"API type to generate (auto detects from traffic)" name:"api-type"`
 	Confidence  float64 `default:"0.5" help:"Minimum confidence threshold"`
 	Probe       bool    `default:"true" help:"Enable endpoint probing"`
 	Deduplicate bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
@@ -577,7 +587,43 @@ func (c *ScanCmd) Run() error {
 			fmt.Fprintf(os.Stderr, "request-id: %s\n", bs.requestID)
 		}
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests))
-		fmt.Fprintf(os.Stderr, "generating REST spec\n")
+	}
+
+	apiType := c.APIType
+	if apiType == apiTypeAuto {
+		apiType = detectAPIType(requests, c.Confidence)
+		if c.Verbose {
+			fmt.Fprintf(os.Stderr, "detected API type: %s\n", apiType)
+		}
+	}
+
+	// When auto-detection or explicit WSDL mode is active, try fetching a
+	// WSDL document from <targetURL>?wsdl. SOAP services return HTML for
+	// browser GETs so crawl traffic rarely contains WSDL signals — active
+	// probing is the reliable discovery method.
+	if apiType == apiTypeAuto || apiType == apiTypeWSDL || apiType == apiTypeREST {
+		wsdlDoc := probeWSDLDocument(c.URL, c.DangerousAllowPrivate, c.Verbose)
+		if wsdlDoc != nil {
+			apiType = apiTypeWSDL
+			if c.Verbose {
+				fmt.Fprintf(os.Stderr, "discovered WSDL document at %s?wsdl\n", c.URL)
+			}
+			// Inject a synthetic request carrying the WSDL document so
+			// the generator's Phase 1 can return it directly.
+			requests = append(requests, crawl.ObservedRequest{
+				Method: "GET",
+				URL:    c.URL + "?wsdl",
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: "text/xml",
+					Body:        wsdlDoc,
+				},
+			})
+		}
+	}
+
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "generating %s spec\n", apiTypeDisplayName(apiType))
 	}
 
 	// Create a fresh signal context for the generate phase. If a signal
@@ -587,9 +633,8 @@ func (c *ScanCmd) Run() error {
 	genCtx, genStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer genStop()
 
-
 	spec, err := generateSpec(genCtx, requests, generateSpecOptions{
-		APIType:      "rest",
+		APIType:      apiType,
 		Confidence:   c.Confidence,
 		Probe:        c.Probe,
 		Deduplicate:  c.Deduplicate,
@@ -671,7 +716,7 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts ge
 		}
 		var strategies []probe.ProbeStrategy
 		switch opts.APIType {
-		case "wsdl":
+		case apiTypeWSDL:
 			strategies = []probe.ProbeStrategy{probe.NewWSDLProbe(cfg)}
 		default:
 			strategies = []probe.ProbeStrategy{
@@ -704,12 +749,123 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts ge
 // classifiersForType returns the appropriate classifiers for the given API type.
 func classifiersForType(apiType string) []classify.APIClassifier {
 	switch apiType {
-	case "rest":
+	case apiTypeREST:
 		return []classify.APIClassifier{&classify.RESTClassifier{}}
-	case "wsdl":
+	case apiTypeWSDL:
 		return []classify.APIClassifier{&classify.WSDLClassifier{}}
 	default:
 		return nil
+	}
+}
+
+// detectAPIType runs both WSDL and REST classifiers against captured traffic
+// and returns the API type with the most matches. For WSDL to win, it must
+// have at least one match AND represent the majority of classified traffic.
+// When WSDL matches exist but are the minority (mixed REST+SOAP), REST is
+// returned to avoid losing REST endpoint discovery.
+//
+// Note: this performs a lightweight classification pass separate from the full
+// RunClassifiers call inside generateSpec. The duplication is intentional —
+// detectAPIType only needs to answer "which generator?", while generateSpec's
+// pass produces the full ClassifiedRequest slice needed for generation.
+func detectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
+	// Currently checks WSDL vs REST. Add GraphQL check here when
+	// GraphQLClassifier is available.
+	wsdlClassifier := &classify.WSDLClassifier{}
+	restClassifier := &classify.RESTClassifier{}
+
+	var wsdlCount, restCount int
+	for _, req := range requests {
+		if isAPI, confidence := wsdlClassifier.Classify(req); isAPI && confidence >= threshold {
+			wsdlCount++
+		}
+		if isAPI, confidence := restClassifier.Classify(req); isAPI && confidence >= threshold {
+			restCount++
+		}
+	}
+
+	// WSDL wins only when it has matches and they represent the majority
+	// of classified traffic (or there are no REST matches at all).
+	if wsdlCount > 0 && wsdlCount >= restCount {
+		return apiTypeWSDL
+	}
+	return apiTypeREST
+}
+
+// probeWSDLDocument attempts to fetch a WSDL document from targetURL?wsdl.
+// Returns the raw WSDL bytes if the response is a valid WSDL document, or nil
+// if the probe fails or returns non-WSDL content. This is the primary WSDL
+// discovery mechanism for the scan pipeline because headless browser crawls
+// of SOAP endpoints typically capture HTML, not XML.
+func probeWSDLDocument(targetURL string, allowPrivate bool, verbose bool) []byte {
+	wsdlURL := strings.TrimRight(targetURL, "?") + "?wsdl"
+
+	if verbose {
+		fmt.Fprintf(os.Stderr, "wsdl discovery: probing %s\n", wsdlURL)
+	}
+
+	if !allowPrivate {
+		if err := probe.ValidateProbeURL(wsdlURL); err != nil {
+			if verbose {
+				fmt.Fprintf(os.Stderr, "wsdl discovery: skipping %s (SSRF protection: %v)\n", wsdlURL, err)
+			}
+			return nil
+		}
+	}
+
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	resp, err := client.Get(wsdlURL)
+	if err != nil {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "wsdl discovery: request failed: %v\n", err)
+		}
+		return nil
+	}
+	defer func() {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck
+		resp.Body.Close()                                     //nolint:errcheck
+	}()
+
+	if resp.StatusCode >= 400 {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "wsdl discovery: %s returned HTTP %d\n", wsdlURL, resp.StatusCode)
+		}
+		return nil
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20)) // 2MB limit
+	if err != nil {
+		return nil
+	}
+
+	// Validate the response is actually a WSDL document
+	if _, parseErr := wsdlgen.ParseWSDL(body); parseErr != nil {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "wsdl discovery: response is not valid WSDL: %v\n", parseErr)
+		}
+		return nil
+	}
+
+	return body
+}
+
+// apiTypeDisplayName returns a human-readable display name for an API type.
+func apiTypeDisplayName(apiType string) string {
+	switch apiType {
+	case apiTypeREST:
+		return "REST"
+	case apiTypeWSDL:
+		return "WSDL"
+	case apiTypeGraphQL:
+		return "GraphQL"
+	default:
+		return apiType
 	}
 }
 

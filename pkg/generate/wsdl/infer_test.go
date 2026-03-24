@@ -133,6 +133,57 @@ func TestInferWSDL_NoExtractableOperations(t *testing.T) {
 	assert.Contains(t, err.Error(), "no SOAP operations")
 }
 
+func TestInferWSDL_FromResponseBody(t *testing.T) {
+	// Simulates crawl-captured traffic where request body is empty but
+	// the response contains a SOAP envelope.
+	endpoints := []classify.ClassifiedRequest{{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: "GET",
+			URL:    "http://example.com/service",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/xml",
+				Body: []byte(`<?xml version="1.0"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <GetUserResponse xmlns="http://example.com/">
+      <User><Name>Alice</Name></User>
+    </GetUserResponse>
+  </soap:Body>
+</soap:Envelope>`),
+			},
+		},
+	}}
+
+	defs, err := InferWSDL(endpoints)
+	require.NoError(t, err)
+	require.Len(t, defs.PortTypes[0].Operations, 1)
+	assert.Equal(t, "GetUser", defs.PortTypes[0].Operations[0].Name,
+		"should strip Response suffix from response body element")
+}
+
+func TestInferWSDL_ResponseBodyNoSuffix(t *testing.T) {
+	// Response body element without "Response" suffix should still work.
+	endpoints := []classify.ClassifiedRequest{{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: "GET",
+			URL:    "http://example.com/service",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/xml",
+				Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body><ListUsers xmlns="http://example.com/"/></soap:Body>
+</soap:Envelope>`),
+			},
+		},
+	}}
+
+	defs, err := InferWSDL(endpoints)
+	require.NoError(t, err)
+	require.Len(t, defs.PortTypes[0].Operations, 1)
+	assert.Equal(t, "ListUsers", defs.PortTypes[0].Operations[0].Name)
+}
+
 func TestInferServiceName(t *testing.T) {
 	tests := []struct {
 		url  string
