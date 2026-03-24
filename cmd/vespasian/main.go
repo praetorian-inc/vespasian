@@ -229,12 +229,14 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl
 	}
 
 	if err != nil {
-		if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && len(requests) > 0 {
-			noun := "results"
-			if len(requests) == 1 {
-				noun = "result"
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if len(requests) > 0 {
+				noun := "results"
+				if len(requests) == 1 {
+					noun = "result"
+				}
+				fmt.Fprintf(stderr, "returning %d partial %s\n", len(requests), noun)
 			}
-			fmt.Fprintf(stderr, "returning %d partial %s\n", len(requests), noun)
 			return requests, nil
 		}
 		return nil, fmt.Errorf("crawl failed: %w", err)
