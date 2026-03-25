@@ -95,6 +95,17 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		return nil, fmt.Errorf("invalid target URL: %q", targetURL)
 	}
 
+	// Early return if the parent context is already cancelled. This avoids
+	// initialising Katana (LevelDB, filters, output writer) only to tear
+	// everything down immediately, and prevents internal goroutine leaks
+	// that cause data races on Katana's global CustomFieldsMap.
+	if ctx.Err() != nil {
+		if c.opts.Stderr != nil {
+			fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n")
+		}
+		return nil, ctx.Err()
+	}
+
 	// Use caller-provided browser or launch Chrome under vespasian's control.
 	// This lets us kill the browser immediately on signal, stopping all
 	// outbound requests — Katana's internal context is disconnected from ours.
