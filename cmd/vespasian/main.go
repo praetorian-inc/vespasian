@@ -761,7 +761,7 @@ func classifiersForType(apiType string) []classify.APIClassifier {
 		return []classify.APIClassifier{&classify.RESTClassifier{}}
 	case apiTypeWSDL:
 		return []classify.APIClassifier{&classify.WSDLClassifier{}}
-	case "graphql":
+	case apiTypeGraphQL:
 		return []classify.APIClassifier{&classify.GraphQLClassifier{}}
 	default:
 		return nil
@@ -779,12 +779,11 @@ func classifiersForType(apiType string) []classify.APIClassifier {
 // detectAPIType only needs to answer "which generator?", while generateSpec's
 // pass produces the full ClassifiedRequest slice needed for generation.
 func detectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
-	// Currently checks WSDL vs REST. Add GraphQL check here when
-	// GraphQLClassifier is available.
 	wsdlClassifier := &classify.WSDLClassifier{}
 	restClassifier := &classify.RESTClassifier{}
+	graphqlClassifier := &classify.GraphQLClassifier{}
 
-	var wsdlCount, restCount int
+	var wsdlCount, restCount, graphqlCount int
 	for _, req := range requests {
 		if isAPI, confidence := wsdlClassifier.Classify(req); isAPI && confidence >= threshold {
 			wsdlCount++
@@ -792,8 +791,15 @@ func detectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
 		if isAPI, confidence := restClassifier.Classify(req); isAPI && confidence >= threshold {
 			restCount++
 		}
+		if isAPI, confidence := graphqlClassifier.Classify(req); isAPI && confidence >= threshold {
+			graphqlCount++
+		}
 	}
 
+	// GraphQL wins when it has matches and at least as many as both others.
+	if graphqlCount > 0 && graphqlCount >= wsdlCount && graphqlCount >= restCount {
+		return apiTypeGraphQL
+	}
 	// WSDL wins only when it has matches and they represent the majority
 	// of classified traffic (or there are no REST matches at all).
 	if wsdlCount > 0 && wsdlCount >= restCount {

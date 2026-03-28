@@ -1425,6 +1425,114 @@ func TestDetectAPIType(t *testing.T) {
 			threshold: 0.90,
 			want:      apiTypeREST,
 		},
+		{
+			name: "GraphQL POST to /graphql returns graphql",
+			requests: []crawl.ObservedRequest{
+				{
+					Method: "POST",
+					URL:    "https://example.com/graphql",
+					Headers: map[string]string{
+						"Content-Type": "application/json",
+					},
+					Body: []byte(`{"query":"{ users { id name } }"}`),
+					Response: crawl.ObservedResponse{
+						StatusCode:  200,
+						ContentType: "application/json",
+						Body:        []byte(`{"data":{"users":[{"id":"1","name":"Alice"}]}}`),
+					},
+				},
+			},
+			threshold: 0.5,
+			want:      apiTypeGraphQL,
+		},
+		{
+			name: "majority GraphQL traffic returns graphql",
+			requests: []crawl.ObservedRequest{
+				{
+					Method: "POST",
+					URL:    "https://example.com/graphql",
+					Headers: map[string]string{
+						"Content-Type": "application/json",
+					},
+					Body: []byte(`{"query":"{ users { id } }"}`),
+					Response: crawl.ObservedResponse{
+						StatusCode:  200,
+						ContentType: "application/json",
+						Body:        []byte(`{"data":{"users":[]}}`),
+					},
+				},
+				{
+					Method: "POST",
+					URL:    "https://example.com/graphql",
+					Headers: map[string]string{
+						"Content-Type": "application/json",
+					},
+					Body: []byte(`{"query":"mutation { createUser(name: \"Bob\") { id } }"}`),
+					Response: crawl.ObservedResponse{
+						StatusCode:  200,
+						ContentType: "application/json",
+						Body:        []byte(`{"data":{"createUser":{"id":"2"}}}`),
+					},
+				},
+				{
+					// Non-API request (HTML page) — REST classifier won't match this,
+					// so GraphQL count (2) ties REST count (2) and GraphQL wins via >=.
+					Method: "GET",
+					URL:    "https://example.com/",
+					Response: crawl.ObservedResponse{
+						StatusCode:  200,
+						ContentType: "text/html",
+						Body:        []byte(`<html><body>Welcome</body></html>`),
+					},
+				},
+			},
+			threshold: 0.5,
+			want:      apiTypeGraphQL,
+		},
+		{
+			name: "minority GraphQL in mostly REST traffic returns rest",
+			requests: []crawl.ObservedRequest{
+				{
+					Method: "GET",
+					URL:    "https://example.com/api/users",
+					Headers: map[string]string{
+						"Accept": "application/json",
+					},
+					Response: crawl.ObservedResponse{
+						StatusCode:  200,
+						ContentType: "application/json",
+						Body:        []byte(`[{"id":1}]`),
+					},
+				},
+				{
+					Method: "GET",
+					URL:    "https://example.com/api/posts",
+					Headers: map[string]string{
+						"Accept": "application/json",
+					},
+					Response: crawl.ObservedResponse{
+						StatusCode:  200,
+						ContentType: "application/json",
+						Body:        []byte(`[{"id":1}]`),
+					},
+				},
+				{
+					Method: "POST",
+					URL:    "https://example.com/graphql",
+					Headers: map[string]string{
+						"Content-Type": "application/json",
+					},
+					Body: []byte(`{"query":"{ users { id } }"}`),
+					Response: crawl.ObservedResponse{
+						StatusCode:  200,
+						ContentType: "application/json",
+						Body:        []byte(`{"data":{"users":[]}}`),
+					},
+				},
+			},
+			threshold: 0.5,
+			want:      apiTypeREST,
+		},
 	}
 
 	for _, tt := range tests {
