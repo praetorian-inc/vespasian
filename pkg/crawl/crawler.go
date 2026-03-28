@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,6 +57,7 @@ type CrawlerOptions struct {
 	Scope    string
 	Headless bool
 	Headers  map[string]string
+	Proxy    string    // optional: proxy address for Chrome (e.g., "http://127.0.0.1:8080")
 	Stderr   io.Writer // user-facing status messages; nil disables output
 
 	// BrowserMgr provides a caller-owned Chrome instance. When set, Crawl()
@@ -93,6 +95,17 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		return nil, fmt.Errorf("invalid target URL: %q", targetURL)
 	}
 
+	// Early return if the parent context is already cancelled. This avoids
+	// initialising Katana (LevelDB, filters, output writer) only to tear
+	// everything down immediately, and prevents internal goroutine leaks
+	// that cause data races on Katana's global CustomFieldsMap.
+	if ctx.Err() != nil {
+		if c.opts.Stderr != nil {
+			fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n")
+		}
+		return nil, ctx.Err()
+	}
+
 	// Use caller-provided browser or launch Chrome under vespasian's control.
 	// This lets us kill the browser immediately on signal, stopping all
 	// outbound requests — Katana's internal context is disconnected from ours.
@@ -101,7 +114,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		browserMgr = c.opts.BrowserMgr
 		// Caller owns lifecycle — don't defer Close here.
 	} else if c.opts.Headless {
-		browserMgr, err = NewBrowserManager(BrowserOptions{Headless: true})
+		browserMgr, err = NewBrowserManager(BrowserOptions{Headless: true, Proxy: c.opts.Proxy})
 		if err != nil {
 			return nil, fmt.Errorf("launch browser: %w", err)
 		}
@@ -130,14 +143,15 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		// Katana needs the full body for link extraction and JS parsing to maximize
 		// crawl coverage; we only retain MaxResponseBodySize for classification.
 		// Peak memory: up to Concurrency × BodyReadSize (100 MB with 10 workers).
-		BodyReadSize:      10 * 1024 * 1024,
-		Concurrency:       10,
-		Parallelism:       10,
-		RateLimit:         150,
-		TimeStable:        3, // seconds to wait for DOM stability; 0 causes go-rod panic in time.NewTicker
-		ScrapeJSResponses: true,
-		XhrExtraction:     true,
-		Silent:            true,
+		BodyReadSize:           10 * 1024 * 1024,
+		Concurrency:            10,
+		Parallelism:            10,
+		RateLimit:              150,
+		TimeStable:             3, // seconds to wait for DOM stability; 0 causes go-rod panic in time.NewTicker
+		ScrapeJSResponses:      true,
+		ScrapeJSLuiceResponses: true,
+		XhrExtraction:          true,
+		Silent:                 true,
 		OnResult: func(result output.Result) {
 			// Map result outside the lock — MapResult may do URL parsing
 			// and body truncation, which is wasted work under contention.
@@ -234,7 +248,9 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			}
 			timer.Stop()
 
-			closeEngine()
+			// Close engine with a bounded wait — engine.Close() may block
+			// if the killed Chrome process left the engine in a bad state.
+			boundedRun(closeEngine, DrainTimeout)
 
 			if timerExpired {
 				// engine.Close() causes engine.Crawl() to return shortly.
@@ -256,9 +272,10 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			return snapshot, ctx.Err()
 		}
 
-		// MaxPages reached — close engine and drain goroutine with a bounded wait
-		// to match the signal path's timeout discipline.
-		closeEngine()
+		// MaxPages reached — close engine with bounded wait, then drain
+		// crawl goroutine to match the signal path's timeout discipline.
+		boundedRun(closeEngine, DrainTimeout)
+
 		drainTimer := time.NewTimer(ShutdownGracePeriod)
 		select {
 		case <-crawlErr:
@@ -293,6 +310,8 @@ func MapResult(r output.Result) ObservedRequest {
 			req.Body = req.Body[:MaxResponseBodySize]
 		}
 		req.Source = r.Request.Source
+		req.Tag = r.Request.Tag
+		req.Attribute = r.Request.Attribute
 	}
 
 	// Parse query params from URL
@@ -315,7 +334,7 @@ func MapResult(r output.Result) ObservedRequest {
 			StatusCode:  r.Response.StatusCode,
 			Headers:     map[string]string(r.Response.Headers),
 			Body:        []byte(r.Response.Body),
-			ContentType: r.Response.Headers["Content-Type"],
+			ContentType: getHeader(r.Response.Headers, "Content-Type"),
 		}
 		// Truncate response body if it exceeds MaxResponseBodySize
 		if len(req.Response.Body) > MaxResponseBodySize {
@@ -324,6 +343,16 @@ func MapResult(r output.Result) ObservedRequest {
 	}
 
 	return req
+}
+
+// getHeader performs a case-insensitive lookup of a header name in a map.
+func getHeader(headers map[string]string, name string) string {
+	for k, v := range headers {
+		if strings.EqualFold(k, name) {
+			return v
+		}
+	}
+	return ""
 }
 
 // MapScope converts scope string to Katana FieldScope.
@@ -341,4 +370,21 @@ func ToStringSlice(headers map[string]string) goflags.StringSlice {
 		result = append(result, key+": "+value)
 	}
 	return result
+}
+
+// boundedRun executes fn in a goroutine and waits up to timeout for it to
+// complete. If fn doesn't finish in time, boundedRun returns and the goroutine
+// remains alive until fn eventually returns.
+func boundedRun(fn func(), timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		fn()
+		close(done)
+	}()
+	t := time.NewTimer(timeout)
+	select {
+	case <-done:
+	case <-t.C:
+	}
+	t.Stop()
 }

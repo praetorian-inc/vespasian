@@ -17,9 +17,10 @@ package classify
 import (
 	"testing"
 
-	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
 // stubClassifier is a simple classifier for testing that returns fixed values.

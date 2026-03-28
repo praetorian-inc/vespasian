@@ -309,6 +309,7 @@ func TestNewCrawler(t *testing.T) {
 		MaxPages: 100,
 		Scope:    "same-domain",
 		Headless: true,
+		Proxy:    "http://127.0.0.1:8080",
 		Headers: map[string]string{
 			"User-Agent": "test",
 		},
@@ -332,6 +333,9 @@ func TestNewCrawler(t *testing.T) {
 	if !crawler.opts.Headless {
 		t.Errorf("crawler.opts.Headless = false, want true")
 	}
+	if crawler.opts.Proxy != "http://127.0.0.1:8080" {
+		t.Errorf("crawler.opts.Proxy = %q, want %q", crawler.opts.Proxy, "http://127.0.0.1:8080")
+	}
 	if crawler.opts.Headers["User-Agent"] != "test" {
 		t.Errorf("crawler.opts.Headers[User-Agent] = %q, want %q", crawler.opts.Headers["User-Agent"], "test")
 	}
@@ -351,6 +355,73 @@ func TestCrawl_NegativeDepthReturnsError(t *testing.T) {
 	}
 }
 
+// TestValidateProxyAddr tests the proxy address validation.
+func TestValidateProxyAddr(t *testing.T) {
+	tests := []struct {
+		name    string
+		addr    string
+		wantErr bool
+		errMsg  string
+	}{
+		{"valid http", "http://127.0.0.1:8080", false, ""},
+		{"valid https", "https://proxy.example.com:8443", false, ""},
+		{"valid socks5", "socks5://127.0.0.1:1080", false, ""},
+		{"valid http no port", "http://proxy.local", false, ""},
+		{"missing scheme", "127.0.0.1:8080", true, "invalid proxy address"},
+		{"ftp scheme", "ftp://proxy:21", true, "scheme must be"},
+		{"empty host", "http://", true, "missing host"},
+		{"embedded credentials", "http://user:pass@127.0.0.1:8080", true, "embedded credentials"},
+		{"embedded user only", "http://user@127.0.0.1:8080", true, "embedded credentials"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateProxyAddr(tt.addr)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateProxyAddr(%q) error = %v, wantErr %v", tt.addr, err, tt.wantErr)
+			}
+			if tt.wantErr && tt.errMsg != "" && err != nil {
+				if !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("validateProxyAddr(%q) error = %q, want containing %q", tt.addr, err.Error(), tt.errMsg)
+				}
+			}
+		})
+	}
+
+	// Verify credentials are never echoed in error messages, even when
+	// other validation (e.g., scheme) would also fail.
+	credentialLeakCases := []struct {
+		name string
+		addr string
+	}{
+		{"http with creds", "http://admin:s3cret@proxy:8080"},
+		{"wrong scheme with creds", "ftp://admin:s3cret@proxy:21"},
+		{"user only", "http://admin@proxy:8080"},
+	}
+	for _, tt := range credentialLeakCases {
+		t.Run("redacted/"+tt.name, func(t *testing.T) {
+			err := validateProxyAddr(tt.addr)
+			if err == nil {
+				t.Fatal("expected error for embedded credentials")
+			}
+			msg := err.Error()
+			if strings.Contains(msg, "admin") || strings.Contains(msg, "s3cret") {
+				t.Errorf("error message leaks credentials: %s", msg)
+			}
+			if !strings.Contains(msg, "xxxxx") {
+				t.Errorf("error message should contain redacted placeholder 'xxxxx': %s", msg)
+			}
+		})
+	}
+}
+
+// TestDefaultMaxPages verifies the DefaultMaxPages constant value
+func TestDefaultMaxPages(t *testing.T) {
+	if DefaultMaxPages != 1000 {
+		t.Errorf("DefaultMaxPages = %d, want 1000", DefaultMaxPages)
+	}
+}
+
 // TestCrawl_EmptyURLReturnsError tests that empty URL is rejected
 func TestCrawl_EmptyURLReturnsError(t *testing.T) {
 	crawler := NewCrawler(CrawlerOptions{
@@ -362,6 +433,13 @@ func TestCrawl_EmptyURLReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid target URL") {
 		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// TestPageTimeout verifies the PageTimeout constant value
+func TestPageTimeout(t *testing.T) {
+	if PageTimeout != 30 {
+		t.Errorf("PageTimeout = %d, want 30", PageTimeout)
 	}
 }
 
@@ -479,6 +557,123 @@ func TestMapResult_SmallBodyNotTruncated(t *testing.T) {
 
 	if string(observed.Response.Body) != string(smallResponseBody) {
 		t.Errorf("Response body = %q, want %q (should not be truncated)", string(observed.Response.Body), string(smallResponseBody))
+	}
+}
+
+// TestMapResult_JsluiceTagAndAttribute tests that jsluice Tag and Attribute fields are propagated
+func TestMapResult_JsluiceTagAndAttribute(t *testing.T) {
+	tests := []struct {
+		name      string
+		tag       string
+		attribute string
+	}{
+		{
+			name:      "jsluice fetch endpoint",
+			tag:       "script",
+			attribute: "jsluice-fetch",
+		},
+		{
+			name:      "jsluice xhr endpoint",
+			tag:       "script",
+			attribute: "jsluice-xhr",
+		},
+		{
+			name:      "htmx hx-get attribute",
+			tag:       "div",
+			attribute: "hx-get",
+		},
+		{
+			name:      "htmx hx-post attribute",
+			tag:       "form",
+			attribute: "hx-post",
+		},
+		{
+			name:      "empty tag and attribute",
+			tag:       "",
+			attribute: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := output.Result{
+				Request: &navigation.Request{
+					Method:    "GET",
+					URL:       "https://example.com/api/endpoint",
+					Source:    "crawler",
+					Tag:       tt.tag,
+					Attribute: tt.attribute,
+				},
+				Response: &navigation.Response{
+					StatusCode: 200,
+				},
+			}
+
+			observed := MapResult(result)
+			if observed.Tag != tt.tag {
+				t.Errorf("Tag = %q, want %q", observed.Tag, tt.tag)
+			}
+			if observed.Attribute != tt.attribute {
+				t.Errorf("Attribute = %q, want %q", observed.Attribute, tt.attribute)
+			}
+		})
+	}
+}
+
+// TestMapResult_LowercaseContentType tests that MapResult extracts ContentType
+// from lowercase header keys, as Katana normalizes response headers to lowercase.
+func TestMapResult_LowercaseContentType(t *testing.T) {
+	tests := []struct {
+		name            string
+		headers         navigation.Headers
+		wantContentType string
+	}{
+		{
+			name:            "lowercase content-type from Katana",
+			headers:         navigation.Headers{"content-type": "application/json"},
+			wantContentType: "application/json",
+		},
+		{
+			name:            "title-case Content-Type",
+			headers:         navigation.Headers{"Content-Type": "text/html"},
+			wantContentType: "text/html",
+		},
+		{
+			name:            "uppercase CONTENT-TYPE",
+			headers:         navigation.Headers{"CONTENT-TYPE": "application/xml"},
+			wantContentType: "application/xml",
+		},
+		{
+			name:            "no content-type header",
+			headers:         navigation.Headers{"X-Custom": "value"},
+			wantContentType: "",
+		},
+		{
+			name:            "empty headers",
+			headers:         navigation.Headers{},
+			wantContentType: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := output.Result{
+				Request: &navigation.Request{
+					Method: "GET",
+					URL:    "https://example.com/api/data",
+				},
+				Response: &navigation.Response{
+					StatusCode: 200,
+					Headers:    tt.headers,
+					Body:       "response",
+				},
+			}
+
+			observed := MapResult(result)
+			if observed.Response.ContentType != tt.wantContentType {
+				t.Errorf("ContentType = %q, want %q", observed.Response.ContentType, tt.wantContentType)
+			}
+		})
 	}
 }
 
