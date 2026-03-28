@@ -104,7 +104,7 @@ func handleUsers(w http.ResponseWriter, r *http.Request) {
 		users = append(users, u)
 		writeJSON(w, http.StatusCreated, u)
 	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 	}
 }
 
@@ -152,7 +152,7 @@ func handleUserByID(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		w.WriteHeader(http.StatusNoContent)
 	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 	}
 }
 
@@ -174,7 +174,7 @@ func handleUserEmail(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, eu)
 	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 	}
 }
 
@@ -186,7 +186,7 @@ func handleProducts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
 	writeJSON(w, http.StatusOK, products)
@@ -200,7 +200,7 @@ func handleProductByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
 	writeJSON(w, http.StatusOK, products[0])
@@ -226,7 +226,7 @@ func handleOrders(w http.ResponseWriter, r *http.Request) {
 		orders = append(orders, o)
 		writeJSON(w, http.StatusCreated, o)
 	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 	}
 }
 
@@ -238,7 +238,7 @@ func handleOrderByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
 	writeJSON(w, http.StatusOK, orders[0])

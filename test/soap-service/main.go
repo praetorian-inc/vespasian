@@ -61,6 +61,14 @@ func soapResponse(operation string, body string) string {
 </soap:Envelope>`, operation, body, operation)
 }
 
+func xmlEscape(s string) string {
+	var b strings.Builder
+	if err := xml.EscapeText(&b, []byte(s)); err != nil {
+		return s
+	}
+	return b.String()
+}
+
 func soapFault(code, message string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
@@ -70,7 +78,7 @@ func soapFault(code, message string) string {
       <faultstring>%s</faultstring>
     </soap:Fault>
   </soap:Body>
-</soap:Envelope>`, code, message)
+</soap:Envelope>`, xmlEscape(code), xmlEscape(message))
 }
 
 func handleGetUser() string {
@@ -96,7 +104,9 @@ func handleCreateUser() string {
 
 func handleSOAP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		fmt.Fprint(w, soapFault("soap:Client", "Method not allowed"))
 		return
 	}
 
@@ -112,7 +122,7 @@ func handleSOAP(w http.ResponseWriter, r *http.Request) {
 		operation = "CreateUser"
 	default:
 		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprint(w, soapFault("soap:Client", "Unknown SOAPAction: "+soapAction))
 		return
 	}

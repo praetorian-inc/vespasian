@@ -49,22 +49,25 @@ paths_indent = None
 found_paths = []
 for line in content.split("\n"):
     stripped = line.rstrip()
-    if re.match(r"^paths:\s*$", stripped):
+    if re.match(r"^paths:\s*(|\{\})\s*$", stripped):
         in_paths = True
+        if "{}" in stripped:
+            break  # inline empty mapping, no children
         continue
     if in_paths:
         # Another top-level key ends paths section
         if stripped and not stripped[0].isspace():
             break
         # Detect the indent of the first child to know the path indent level
-        m = re.match(r'^(\s+)["\']?(/[^:"\']*)["\']?:', stripped)
+        m = re.match(r'^(\s+)(?:"(/[^"]*)"|\'(/[^\']*)\'|(/[^:"\']*)):', stripped)
         if m:
             indent = m.group(1)
+            path = m.group(2) or m.group(3) or m.group(4)
             if paths_indent is None:
                 paths_indent = indent
             # Only match paths at the same indent level (not nested keys)
             if indent == paths_indent:
-                found_paths.append(m.group(2))
+                found_paths.append(path)
 
 missing = []
 for path in expected["paths"]:
@@ -101,13 +104,19 @@ validate_openapi_structure() {
 
     local result
     result=$(python3 - "$spec_file" << 'PYEOF'
-import sys
+import sys, re
 
 with open(sys.argv[1]) as f:
     content = f.read()
 
-required = ["openapi:", "info:", "paths:"]
-missing = [r for r in required if r not in content]
+# Check for required top-level YAML keys (not indented, not in comments)
+required = ["openapi", "info", "paths"]
+missing = []
+for key in required:
+    # Match key at start of line (no leading whitespace), not in a comment
+    if not re.search(r'^' + re.escape(key) + r'\s*:', content, re.MULTILINE):
+        missing.append(key + ":")
+
 if missing:
     print("MISSING fields: " + ", ".join(missing))
     sys.exit(1)
@@ -298,6 +307,94 @@ PYEOF
     return 0
 }
 
+# validate_graphql_operations checks that a GraphQL SDL file contains expected operations.
+# Usage: validate_graphql_operations <sdl_file> <expected_json>
+validate_graphql_operations() {
+    local sdl_file=$1
+    local expected_json=$2
+
+    if [ ! -f "$sdl_file" ]; then
+        log_fail "SDL file not found: $sdl_file"
+        return 1
+    fi
+
+    local result
+    result=$(python3 - "$sdl_file" "$expected_json" << 'PYEOF'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    content = f.read()
+
+with open(sys.argv[2]) as f:
+    expected = json.load(f)
+
+missing = []
+for op in expected.get("queries", []):
+    # Check for field name in Query type (e.g., "  users(" or "  users:")
+    if op + "(" not in content and op + ":" not in content:
+        missing.append("query:" + op)
+
+for op in expected.get("mutations", []):
+    if op + "(" not in content and op + ":" not in content:
+        missing.append("mutation:" + op)
+
+if missing:
+    print("MISSING operations: " + ", ".join(missing))
+    sys.exit(1)
+
+total = len(expected.get("queries", [])) + len(expected.get("mutations", []))
+print("OK: all %d operations found" % total)
+PYEOF
+    )
+
+    if [ $? -ne 0 ]; then
+        log_fail "GraphQL operations: $result"
+        return 1
+    fi
+    log_ok "GraphQL operations: $result"
+    return 0
+}
+
+# validate_graphql_structure checks that a GraphQL SDL file has basic structural validity.
+# Usage: validate_graphql_structure <sdl_file>
+validate_graphql_structure() {
+    local sdl_file=$1
+
+    if [ ! -f "$sdl_file" ]; then
+        log_fail "SDL file not found: $sdl_file"
+        return 1
+    fi
+
+    local result
+    result=$(python3 - "$sdl_file" << 'PYEOF'
+import sys
+
+with open(sys.argv[1]) as f:
+    content = f.read()
+
+checks = []
+if "type Query {" not in content:
+    checks.append("missing 'type Query'")
+if "}" not in content:
+    checks.append("missing closing braces")
+if len(content.strip()) < 50:
+    checks.append("suspiciously short (%d chars)" % len(content.strip()))
+
+if checks:
+    print("INVALID: " + ", ".join(checks))
+    sys.exit(1)
+print("OK: valid GraphQL SDL structure")
+PYEOF
+    )
+
+    if [ $? -ne 0 ]; then
+        log_fail "GraphQL structure: $result"
+        return 1
+    fi
+    log_ok "GraphQL structure: $result"
+    return 0
+}
+
 # compare_files diffs an actual file against an expected file.
 # For specs/WSDL, port numbers are normalized before comparison since they may vary.
 # Usage: compare_files <actual_file> <expected_file> <label> [--normalize-ports]
@@ -434,13 +531,15 @@ paths_indent = None
 count = 0
 for line in content.split("\n"):
     stripped = line.rstrip()
-    if re.match(r"^paths:\s*$", stripped):
+    if re.match(r"^paths:\s*(|\{\})\s*$", stripped):
         in_paths = True
+        if "{}" in stripped:
+            break  # inline empty mapping, no children
         continue
     if in_paths:
         if stripped and not stripped[0].isspace():
             break
-        m = re.match(r'^(\s+)["\']?(/[^:"\']*)["\']?:', stripped)
+        m = re.match(r'^(\s+)(?:"(/[^"]*)"|\'(/[^\']*)\'|(/[^:"\']*)):', stripped)
         if m:
             indent = m.group(1)
             if paths_indent is None:

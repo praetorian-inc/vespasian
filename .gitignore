@@ -45,3 +45,4 @@ test/.results/
 test/.*.pid
 test/rest-api/rest-api
 test/soap-service/soap-service
+test/graphql-server/node_modules/
