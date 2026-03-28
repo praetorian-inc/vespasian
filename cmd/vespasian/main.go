@@ -384,8 +384,7 @@ func setupBrowserAndSignals(rawHeaders []string, crawlOpts CrawlOptions, extraOp
 
 // CrawlCmd crawls a web application to capture HTTP traffic.
 type CrawlCmd struct {
-	URL    string `arg:"" help:"Target URL to crawl"`
-	Format string `default:"json" enum:"json,yaml" help:"Output format"`
+	URL string `arg:"" help:"Target URL to crawl"`
 	CrawlOptions
 }
 

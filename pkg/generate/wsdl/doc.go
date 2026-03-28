@@ -12,20 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package generate
-
-import (
-	"github.com/praetorian-inc/vespasian/pkg/classify"
-)
-
-// SpecGenerator generates API specifications from classified requests.
-type SpecGenerator interface {
-	// APIType returns the API type this generator supports (e.g., "rest", "graphql").
-	APIType() string
-
-	// Generate produces an API specification from the endpoints.
-	Generate(endpoints []classify.ClassifiedRequest) ([]byte, error)
-
-	// DefaultExtension returns the default file extension for the generated spec.
-	DefaultExtension() string
-}
+// Package wsdl generates WSDL specifications from classified SOAP requests.
+// It supports two generation modes:
+//
+//   - Document-based: when a ?wsdl probe fetches an existing WSDL document,
+//     it is returned directly after validation.
+//   - Inference-based: when no WSDL document is available, the package infers
+//     WSDL operations from observed SOAPAction headers and SOAP envelope
+//     structures in the captured traffic.
+//
+// The package also provides [ParseWSDL] for parsing and validating WSDL XML
+// documents, and type definitions for WSDL XML unmarshaling.
+package wsdl

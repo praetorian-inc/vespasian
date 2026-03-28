@@ -12,20 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package generate
-
-import (
-	"github.com/praetorian-inc/vespasian/pkg/classify"
-)
-
-// SpecGenerator generates API specifications from classified requests.
-type SpecGenerator interface {
-	// APIType returns the API type this generator supports (e.g., "rest", "graphql").
-	APIType() string
-
-	// Generate produces an API specification from the endpoints.
-	Generate(endpoints []classify.ClassifiedRequest) ([]byte, error)
-
-	// DefaultExtension returns the default file extension for the generated spec.
-	DefaultExtension() string
-}
+// Package graphql generates GraphQL SDL (Schema Definition Language)
+// specifications from classified requests. It supports two generation modes:
+//
+//   - Introspection-based: when the probe stage successfully runs a GraphQL
+//     introspection query, the full type system is converted to SDL.
+//   - Traffic-based inference: when introspection is disabled, the package
+//     infers a partial schema from observed queries and mutations in the
+//     captured traffic.
+//
+// The [Generator] type implements the [generate.SpecGenerator] interface.
+package graphql

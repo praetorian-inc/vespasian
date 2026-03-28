@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package importer defines the interface for converting external traffic
-// captures into the vespasian ObservedRequest format.
 package importer
 
 import (
