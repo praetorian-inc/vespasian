@@ -1,0 +1,7 @@
+{
+  "description": "Expected GraphQL operations from the reference capture. The inference engine extracts operation types, field names, argument types, and return types from observed traffic.",
+  "queries": ["post", "search", "serverInfo", "user", "users"],
+  "mutations": ["createPost", "createUser", "likePost"],
+  "total_operations": 8,
+  "graphql_endpoint": "/graphql"
+}

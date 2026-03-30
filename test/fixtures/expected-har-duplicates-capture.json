@@ -1,0 +1,42 @@
+[
+  {
+    "method": "GET",
+    "url": "http://localhost:8990/api/users",
+    "headers": {
+      "Accept": "application/json",
+      "Host": "localhost:8990",
+      "X-Custom": "second"
+    },
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Set-Cookie": "tracking=xyz789"
+      },
+      "content_type": "application/json",
+      "body": "W3siaWQiOjEsIm5hbWUiOiJBbGljZSJ9XQ=="
+    },
+    "source": "import:har"
+  },
+  {
+    "method": "GET",
+    "url": "http://localhost:8990/api/products?category=electronics\u0026sort=price\u0026sort=name",
+    "headers": {
+      "Accept": "application/json",
+      "Host": "localhost:8990"
+    },
+    "query_params": {
+      "category": "electronics",
+      "sort": "price"
+    },
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "W3siaWQiOjEsIm5hbWUiOiJXaWRnZXQifV0="
+    },
+    "source": "import:har"
+  }
+]

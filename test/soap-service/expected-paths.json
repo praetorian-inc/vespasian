@@ -1,0 +1,7 @@
+{
+  "description": "Expected SOAP operations for the SOAP service test target",
+  "operations": ["GetUser", "ListUsers", "CreateUser"],
+  "total_operations": 3,
+  "wsdl_endpoint": "/service.wsdl",
+  "soap_endpoint": "/soap"
+}

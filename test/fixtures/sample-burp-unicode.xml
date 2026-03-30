@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<items>
+  <item>
+    <url>http://localhost:8990/api/categories/caf%C3%A9</url>
+    <request base64="false"><![CDATA[GET /api/categories/caf%C3%A9 HTTP/1.1
+Host: localhost:8990
+Accept: application/json
+
+]]></request>
+    <status>200</status>
+    <response base64="false"><![CDATA[HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"category":"café","status":"found"}
+]]></response>
+  </item>
+  <item>
+    <url>http://localhost:8990/api/search?q=%E4%B8%96%E7%95%8C</url>
+    <request base64="false"><![CDATA[GET /api/search?q=%E4%B8%96%E7%95%8C HTTP/1.1
+Host: localhost:8990
+Accept: application/json
+
+]]></request>
+    <status>200</status>
+    <response base64="false"><![CDATA[HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"query":"世界","filter":"","page":"","results":[]}
+]]></response>
+  </item>
+  <item>
+    <url>http://localhost:8990/api/users</url>
+    <request base64="false"><![CDATA[POST /api/users HTTP/1.1
+Host: localhost:8990
+Content-Type: application/json
+
+{"name":"José García","email":"josé@example.com"}
+]]></request>
+    <status>201</status>
+    <response base64="false"><![CDATA[HTTP/1.1 201 Created
+Content-Type: application/json
+
+{"id":4,"name":"José García","email":"josé@example.com"}
+]]></response>
+  </item>
+</items>

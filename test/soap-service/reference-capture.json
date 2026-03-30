@@ -1,0 +1,69 @@
+[
+  {
+    "method": "POST",
+    "url": "http://localhost:8991/soap",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "urn:GetUser"
+    },
+    "body": "PD94bWwgdmVyc2lvbj0iMS4wIj8+PHNvYXA6RW52ZWxvcGUgeG1sbnM6c29hcD0iaHR0cDovL3NjaGVtYXMueG1sc29hcC5vcmcvc29hcC9lbnZlbG9wZS8iPjxzb2FwOkJvZHk+PHRuczpHZXRVc2VyUmVxdWVzdCB4bWxuczp0bnM9Imh0dHA6Ly9sb2NhbGhvc3Qvc29hcCI+PGlkPjE8L2lkPjwvdG5zOkdldFVzZXJSZXF1ZXN0Pjwvc29hcDpCb2R5Pjwvc29hcDpFbnZlbG9wZT4=",
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "text/xml; charset=utf-8"
+      },
+      "content_type": "text/xml; charset=utf-8",
+      "body": "PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPHNvYXA6RW52ZWxvcGUgeG1sbnM6c29hcD0iaHR0cDovL3NjaGVtYXMueG1sc29hcC5vcmcvc29hcC9lbnZlbG9wZS8iIHhtbG5zOnRucz0iaHR0cDovL2xvY2FsaG9zdC9zb2FwIj4KICA8c29hcDpCb2R5PgogICAgPHRuczpHZXRVc2VyUmVzcG9uc2U+CiAgICAgIDxpZD4xPC9pZD48bmFtZT5BbGljZTwvbmFtZT48ZW1haWw+YWxpY2VAZXhhbXBsZS5jb208L2VtYWlsPgogICAgPC90bnM6R2V0VXNlclJlc3BvbnNlPgogIDwvc29hcDpCb2R5Pgo8L3NvYXA6RW52ZWxvcGU+"
+    },
+    "source": "test-runner"
+  },
+  {
+    "method": "POST",
+    "url": "http://localhost:8991/soap",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "urn:ListUsers"
+    },
+    "body": "PD94bWwgdmVyc2lvbj0iMS4wIj8+PHNvYXA6RW52ZWxvcGUgeG1sbnM6c29hcD0iaHR0cDovL3NjaGVtYXMueG1sc29hcC5vcmcvc29hcC9lbnZlbG9wZS8iPjxzb2FwOkJvZHk+PHRuczpMaXN0VXNlcnNSZXF1ZXN0IHhtbG5zOnRucz0iaHR0cDovL2xvY2FsaG9zdC9zb2FwIj48aWQ+MTwvaWQ+PC90bnM6TGlzdFVzZXJzUmVxdWVzdD48L3NvYXA6Qm9keT48L3NvYXA6RW52ZWxvcGU+",
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "text/xml; charset=utf-8"
+      },
+      "content_type": "text/xml; charset=utf-8",
+      "body": "PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPHNvYXA6RW52ZWxvcGUgeG1sbnM6c29hcD0iaHR0cDovL3NjaGVtYXMueG1sc29hcC5vcmcvc29hcC9lbnZlbG9wZS8iIHhtbG5zOnRucz0iaHR0cDovL2xvY2FsaG9zdC9zb2FwIj4KICA8c29hcDpCb2R5PgogICAgPHRuczpMaXN0VXNlcnNSZXNwb25zZT4KICAgICAgPHVzZXI+PGlkPjE8L2lkPjxuYW1lPkFsaWNlPC9uYW1lPjxlbWFpbD5hbGljZUBleGFtcGxlLmNvbTwvZW1haWw+PC91c2VyPjx1c2VyPjxpZD4yPC9pZD48bmFtZT5Cb2I8L25hbWU+PGVtYWlsPmJvYkBleGFtcGxlLmNvbTwvZW1haWw+PC91c2VyPjx1c2VyPjxpZD4zPC9pZD48bmFtZT5DaGFybGllPC9uYW1lPjxlbWFpbD5jaGFybGllQGV4YW1wbGUuY29tPC9lbWFpbD48L3VzZXI+CiAgICA8L3RuczpMaXN0VXNlcnNSZXNwb25zZT4KICA8L3NvYXA6Qm9keT4KPC9zb2FwOkVudmVsb3BlPg=="
+    },
+    "source": "test-runner"
+  },
+  {
+    "method": "POST",
+    "url": "http://localhost:8991/soap",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "urn:CreateUser"
+    },
+    "body": "PD94bWwgdmVyc2lvbj0iMS4wIj8+PHNvYXA6RW52ZWxvcGUgeG1sbnM6c29hcD0iaHR0cDovL3NjaGVtYXMueG1sc29hcC5vcmcvc29hcC9lbnZlbG9wZS8iPjxzb2FwOkJvZHk+PHRuczpDcmVhdGVVc2VyUmVxdWVzdCB4bWxuczp0bnM9Imh0dHA6Ly9sb2NhbGhvc3Qvc29hcCI+PGlkPjE8L2lkPjwvdG5zOkNyZWF0ZVVzZXJSZXF1ZXN0Pjwvc29hcDpCb2R5Pjwvc29hcDpFbnZlbG9wZT4=",
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "text/xml; charset=utf-8"
+      },
+      "content_type": "text/xml; charset=utf-8",
+      "body": "PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPHNvYXA6RW52ZWxvcGUgeG1sbnM6c29hcD0iaHR0cDovL3NjaGVtYXMueG1sc29hcC5vcmcvc29hcC9lbnZlbG9wZS8iIHhtbG5zOnRucz0iaHR0cDovL2xvY2FsaG9zdC9zb2FwIj4KICA8c29hcDpCb2R5PgogICAgPHRuczpDcmVhdGVVc2VyUmVzcG9uc2U+CiAgICAgIDxpZD40PC9pZD48bmFtZT5OZXdVc2VyPC9uYW1lPjxlbWFpbD5uZXdAZXhhbXBsZS5jb208L2VtYWlsPgogICAgPC90bnM6Q3JlYXRlVXNlclJlc3BvbnNlPgogIDwvc29hcDpCb2R5Pgo8L3NvYXA6RW52ZWxvcGU+"
+    },
+    "source": "test-runner"
+  },
+  {
+    "method": "GET",
+    "url": "http://localhost:8991/service.wsdl",
+    "headers": {},
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "text/xml; charset=utf-8"
+      },
+      "content_type": "text/xml; charset=utf-8"
+    },
+    "source": "test-runner"
+  }
+]

@@ -1,0 +1,106 @@
+[
+  {
+    "method": "POST",
+    "url": "http://localhost:4000/graphql",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": "eyJxdWVyeSI6ICJxdWVyeSBHZXRVc2VycygkbGltaXQ6IEludCkgeyB1c2VycyhsaW1pdDogJGxpbWl0KSB7IGlkIG5hbWUgZW1haWwgcm9sZSBjcmVhdGVkQXQgfSB9IiwgInZhcmlhYmxlcyI6IHsibGltaXQiOiAxMH19",
+    "response": {
+      "status_code": 200,
+      "content_type": "application/json",
+      "body": "eyJkYXRhIjp7InVzZXJzIjpbeyJpZCI6IjEiLCJuYW1lIjoiQWxpY2UgSm9obnNvbiIsImVtYWlsIjoiYWxpY2VAZXhhbXBsZS5jb20iLCJyb2xlIjoiQURNSU4iLCJjcmVhdGVkQXQiOiIyMDI2LTAxLTE1VDEwOjAwOjAwWiJ9LHsiaWQiOiIyIiwibmFtZSI6IkJvYiBTbWl0aCIsImVtYWlsIjoiYm9iQGV4YW1wbGUuY29tIiwicm9sZSI6IkVESVRPUiIsImNyZWF0ZWRBdCI6IjIwMjYtMDItMDFUMTI6MDA6MDBaIn0seyJpZCI6IjMiLCJuYW1lIjoiQ2Fyb2wgV2hpdGUiLCJlbWFpbCI6ImNhcm9sQGV4YW1wbGUuY29tIiwicm9sZSI6IlZJRVdFUiIsImNyZWF0ZWRBdCI6IjIwMjYtMDMtMTBUMDg6MzA6MDBaIn1dfX0="
+    }
+  },
+  {
+    "method": "POST",
+    "url": "http://localhost:4000/graphql",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": "eyJxdWVyeSI6ICJxdWVyeSBHZXRVc2VyKCRpZDogSUQhKSB7IHVzZXIoaWQ6ICRpZCkgeyBpZCBuYW1lIGVtYWlsIHBvc3RzIHsgaWQgdGl0bGUgbGlrZXMgcHVibGlzaGVkIH0gfSB9IiwgInZhcmlhYmxlcyI6IHsiaWQiOiAiMSJ9fQ==",
+    "response": {
+      "status_code": 200,
+      "content_type": "application/json",
+      "body": "eyJkYXRhIjp7InVzZXIiOnsiaWQiOiIxIiwibmFtZSI6IkFsaWNlIEpvaG5zb24iLCJlbWFpbCI6ImFsaWNlQGV4YW1wbGUuY29tIiwicG9zdHMiOlt7ImlkIjoiMTAiLCJ0aXRsZSI6IkdldHRpbmcgU3RhcnRlZCB3aXRoIEdyYXBoUUwiLCJsaWtlcyI6NDIsInB1Ymxpc2hlZCI6dHJ1ZX0seyJpZCI6IjExIiwidGl0bGUiOiJBZHZhbmNlZCBNdXRhdGlvbnMiLCJsaWtlcyI6MTgsInB1Ymxpc2hlZCI6dHJ1ZX1dfX19"
+    }
+  },
+  {
+    "method": "POST",
+    "url": "http://localhost:4000/graphql",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": "eyJxdWVyeSI6ICJxdWVyeSBHZXRQb3N0KCRpZDogSUQhKSB7IHBvc3QoaWQ6ICRpZCkgeyBpZCB0aXRsZSBjb250ZW50IGF1dGhvciB7IGlkIG5hbWUgfSB0YWdzIGxpa2VzIHB1Ymxpc2hlZCBjcmVhdGVkQXQgfSB9IiwgInZhcmlhYmxlcyI6IHsiaWQiOiAiMTAifX0=",
+    "response": {
+      "status_code": 200,
+      "content_type": "application/json",
+      "body": "eyJkYXRhIjp7InBvc3QiOnsiaWQiOiIxMCIsInRpdGxlIjoiR2V0dGluZyBTdGFydGVkIHdpdGggR3JhcGhRTCIsImNvbnRlbnQiOiJHcmFwaFFMIGlzIGEgcXVlcnkgbGFuZ3VhZ2UuLi4iLCJhdXRob3IiOnsiaWQiOiIxIiwibmFtZSI6IkFsaWNlIEpvaG5zb24ifSwidGFncyI6WyJncmFwaHFsIiwidHV0b3JpYWwiXSwibGlrZXMiOjQyLCJwdWJsaXNoZWQiOnRydWUsImNyZWF0ZWRBdCI6IjIwMjYtMDEtMjBUMTQ6MDA6MDBaIn19fQ=="
+    }
+  },
+  {
+    "method": "POST",
+    "url": "http://localhost:4000/graphql",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": "eyJxdWVyeSI6ICJxdWVyeSBTZWFyY2hDb250ZW50KCRxOiBTdHJpbmchLCAkdHlwZTogU2VhcmNoVHlwZSkgeyBzZWFyY2gocXVlcnk6ICRxLCB0eXBlOiAkdHlwZSkgeyB1c2VycyB7IGlkIG5hbWUgZW1haWwgfSBwb3N0cyB7IGlkIHRpdGxlIH0gdG90YWxDb3VudCB9IH0iLCAidmFyaWFibGVzIjogeyJxIjogImdyYXBocWwiLCAidHlwZSI6ICJQT1NUIn19",
+    "response": {
+      "status_code": 200,
+      "content_type": "application/json",
+      "body": "eyJkYXRhIjp7InNlYXJjaCI6eyJ1c2VycyI6W10sInBvc3RzIjpbeyJpZCI6IjEwIiwidGl0bGUiOiJHZXR0aW5nIFN0YXJ0ZWQgd2l0aCBHcmFwaFFMIn0seyJpZCI6IjExIiwidGl0bGUiOiJBZHZhbmNlZCBNdXRhdGlvbnMifV0sInRvdGFsQ291bnQiOjJ9fX0="
+    }
+  },
+  {
+    "method": "POST",
+    "url": "http://localhost:4000/graphql",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": "eyJxdWVyeSI6ICJtdXRhdGlvbiBDcmVhdGVOZXdVc2VyKCRpbnB1dDogQ3JlYXRlVXNlcklucHV0ISkgeyBjcmVhdGVVc2VyKGlucHV0OiAkaW5wdXQpIHsgaWQgbmFtZSBlbWFpbCByb2xlIH0gfSIsICJ2YXJpYWJsZXMiOiB7ImlucHV0IjogeyJuYW1lIjogIkRhdmUiLCAiZW1haWwiOiAiZGF2ZUBleGFtcGxlLmNvbSIsICJyb2xlIjogIkVESVRPUiJ9fX0=",
+    "response": {
+      "status_code": 200,
+      "content_type": "application/json",
+      "body": "eyJkYXRhIjp7ImNyZWF0ZVVzZXIiOnsiaWQiOiI1IiwibmFtZSI6IkRhdmUiLCJlbWFpbCI6ImRhdmVAZXhhbXBsZS5jb20iLCJyb2xlIjoiRURJVE9SIn19fQ=="
+    }
+  },
+  {
+    "method": "POST",
+    "url": "http://localhost:4000/graphql",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": "eyJxdWVyeSI6ICJtdXRhdGlvbiBDcmVhdGVOZXdQb3N0KCRpbnB1dDogQ3JlYXRlUG9zdElucHV0ISkgeyBjcmVhdGVQb3N0KGlucHV0OiAkaW5wdXQpIHsgaWQgdGl0bGUgY29udGVudCB0YWdzIHB1Ymxpc2hlZCB9IH0iLCAidmFyaWFibGVzIjogeyJpbnB1dCI6IHsidGl0bGUiOiAiTmV3IFBvc3QiLCAiY29udGVudCI6ICJIZWxsbyB3b3JsZCIsICJhdXRob3JJZCI6ICIxIiwgInRhZ3MiOiBbInRlc3QiXX19fQ==",
+    "response": {
+      "status_code": 200,
+      "content_type": "application/json",
+      "body": "eyJkYXRhIjp7ImNyZWF0ZVBvc3QiOnsiaWQiOiIxNCIsInRpdGxlIjoiTmV3IFBvc3QiLCJjb250ZW50IjoiSGVsbG8gd29ybGQiLCJ0YWdzIjpbInRlc3QiXSwicHVibGlzaGVkIjpmYWxzZX19fQ=="
+    }
+  },
+  {
+    "method": "POST",
+    "url": "http://localhost:4000/graphql",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": "eyJxdWVyeSI6ICJtdXRhdGlvbiBMaWtlQVBvc3QoJGlkOiBJRCEpIHsgbGlrZVBvc3QoaWQ6ICRpZCkgeyBpZCB0aXRsZSBsaWtlcyB9IH0iLCAidmFyaWFibGVzIjogeyJpZCI6ICIxMCJ9fQ==",
+    "response": {
+      "status_code": 200,
+      "content_type": "application/json",
+      "body": "eyJkYXRhIjp7Imxpa2VQb3N0Ijp7ImlkIjoiMTAiLCJ0aXRsZSI6IkdldHRpbmcgU3RhcnRlZCB3aXRoIEdyYXBoUUwiLCJsaWtlcyI6NDN9fX0="
+    }
+  },
+  {
+    "method": "POST",
+    "url": "http://localhost:4000/graphql",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": "eyJxdWVyeSI6ICJ7IHNlcnZlckluZm8geyB2ZXJzaW9uIHVwdGltZSB9IH0ifQ==",
+    "response": {
+      "status_code": 200,
+      "content_type": "application/json",
+      "body": "eyJkYXRhIjp7InNlcnZlckluZm8iOnsidmVyc2lvbiI6IjEuMC4wIiwidXB0aW1lIjoxMjMuNDU2fX19"
+    }
+  }
+]

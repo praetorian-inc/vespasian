@@ -1,0 +1,10 @@
+{
+  "description": "Expected output after importing sample-capture.har",
+  "total_requests": 3,
+  "expected_urls": [
+    "http://localhost:8990/api/users",
+    "http://localhost:8990/api/products",
+    "http://localhost:8990/api/orders"
+  ],
+  "expected_methods": ["GET", "GET", "POST"]
+}

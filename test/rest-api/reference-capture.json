@@ -1,0 +1,130 @@
+[
+  {
+    "method": "GET",
+    "url": "http://localhost:8990/api/health",
+    "headers": {
+      "Accept": "application/json"
+    },
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "eyJzdGF0dXMiOiJvayJ9"
+    },
+    "source": "test-crawl"
+  },
+  {
+    "method": "GET",
+    "url": "http://localhost:8990/api/users",
+    "headers": {
+      "Accept": "application/json"
+    },
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "W3siaWQiOjEsIm5hbWUiOiJBbGljZSIsImVtYWlsIjoiYWxpY2VAZXhhbXBsZS5jb20ifSx7ImlkIjoyLCJuYW1lIjoiQm9iIiwiZW1haWwiOiJib2JAZXhhbXBsZS5jb20ifSx7ImlkIjozLCJuYW1lIjoiQ2hhcmxpZSIsImVtYWlsIjoiY2hhcmxpZUBleGFtcGxlLmNvbSJ9XQ=="
+    },
+    "source": "test-crawl"
+  },
+  {
+    "method": "GET",
+    "url": "http://localhost:8990/api/users/1",
+    "headers": {
+      "Accept": "application/json"
+    },
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "eyJpZCI6MSwibmFtZSI6IkFsaWNlIiwiZW1haWwiOiJhbGljZUBleGFtcGxlLmNvbSJ9"
+    },
+    "source": "test-crawl"
+  },
+  {
+    "method": "GET",
+    "url": "http://localhost:8990/api/users/1/email-address",
+    "headers": {
+      "Accept": "application/json"
+    },
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "eyJlbWFpbCI6ImFsaWNlQGV4YW1wbGUuY29tIn0="
+    },
+    "source": "test-crawl"
+  },
+  {
+    "method": "GET",
+    "url": "http://localhost:8990/api/products",
+    "headers": {
+      "Accept": "application/json"
+    },
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "W3siaWQiOjEsIm5hbWUiOiJXaWRnZXQiLCJwcmljZSI6OS45OX0seyJpZCI6MiwibmFtZSI6IkdhZGdldCIsInByaWNlIjoyNC45OX0seyJpZCI6MywibmFtZSI6Ikdpem1vIiwicHJpY2UiOjE0Ljk5fV0="
+    },
+    "source": "test-crawl"
+  },
+  {
+    "method": "GET",
+    "url": "http://localhost:8990/api/products/1",
+    "headers": {
+      "Accept": "application/json"
+    },
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "eyJpZCI6MSwibmFtZSI6IldpZGdldCIsInByaWNlIjo5Ljk5fQ=="
+    },
+    "source": "test-crawl"
+  },
+  {
+    "method": "GET",
+    "url": "http://localhost:8990/api/orders",
+    "headers": {
+      "Accept": "application/json"
+    },
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "W3siaWQiOjEsInVzZXJfaWQiOjEsInByb2R1Y3RfaWQiOjIsInF1YW50aXR5IjoxfSx7ImlkIjoyLCJ1c2VyX2lkIjoyLCJwcm9kdWN0X2lkIjoxLCJxdWFudGl0eSI6M31d"
+    },
+    "source": "test-crawl"
+  },
+  {
+    "method": "GET",
+    "url": "http://localhost:8990/api/orders/1",
+    "headers": {
+      "Accept": "application/json"
+    },
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "eyJpZCI6MSwidXNlcl9pZCI6MSwicHJvZHVjdF9pZCI6MiwicXVhbnRpdHkiOjF9"
+    },
+    "source": "test-crawl"
+  }
+]

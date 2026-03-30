@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<items>
+  <item>
+    <url>http://localhost:8990/api/users</url>
+    <request base64="false"><![CDATA[GET /api/users HTTP/1.1
+Host: localhost:8990
+
+]]></request>
+    <status>200</status>
+    <response base64="false"><![CDATA[HTTP/1.1 200 OK
+Content-Type: application/json
+
+[{"id":1,"name":"Alice"}]
+]]></response>
+  </item>
+  <item>
+    <url></url>
+    <request base64="false"><![CDATA[]]></request>
+    <status></status>
+    <response base64="false"><![CDATA[]]></response>
+  </item>
+  <item>
+    <url>http://localhost:8990/api/products</url>
+    <request base64="false"><![CDATA[GET /api/products HTTP/1.1
+Host: localhost:8990
+
+]]></request>
+    <status>200</status>
+  </item>
+  <item>
+    <url>not-a-valid-url</url>
+    <request base64="false"><![CDATA[GET /invalid HTTP/1.1
+
+]]></request>
+    <status>404</status>
+    <response base64="false"><![CDATA[HTTP/1.1 404 Not Found
+
+]]></response>
+  </item>
+</items>
