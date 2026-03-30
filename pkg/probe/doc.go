@@ -20,7 +20,7 @@
 //   - [OptionsProbe]: sends OPTIONS requests to discover allowed HTTP methods.
 //   - [SchemaProbe]: infers JSON schema from endpoint responses.
 //   - [WSDLProbe]: fetches ?wsdl documents from SOAP service URLs.
-//   - [GraphQLProbe]: runs tiered introspection queries (4 tiers for WAF bypass)
+//   - [GraphQLProbe]: runs tiered introspection queries (3 tiers for WAF bypass)
 //     and falls back to traffic-based inference when introspection is disabled.
 //
 // SSRF protection is built in: [ValidateProbeURL] blocks requests to private
