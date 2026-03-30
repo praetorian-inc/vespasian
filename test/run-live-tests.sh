@@ -637,7 +637,7 @@ PYEOF
     fi
 
     # Step 6: Introspection-specific checks (full schema should have non-null types)
-    local introspection_check
+    local introspection_check rc=0
     introspection_check=$(python3 - "$spec_file" << 'PYEOF'
 import sys
 
@@ -658,8 +658,8 @@ if checks:
     sys.exit(1)
 print("OK: introspection-quality SDL (schema block, non-null types, enums)")
 PYEOF
-    )
-    if [ $? -ne 0 ]; then
+    ) || rc=$?
+    if [ $rc -ne 0 ]; then
         log_warn "Introspection check: $introspection_check"
         # Not a hard failure — inference fallback is valid behavior
     else
@@ -1165,14 +1165,15 @@ test_crawl_unreachable() {
         log_ok "Crawl unreachable: exited with code ${crawl_exit} (graceful failure)"
     elif [ -f "$capture_file" ]; then
         local count
-        count=$(python3 -c "
+        count=$(python3 - "$capture_file" << 'PYEOF' 2>/dev/null
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
     print(len(d) if isinstance(d, list) else 0)
 except:
     print(0)
-" "$capture_file" 2>/dev/null)
+PYEOF
+        )
         log_ok "Crawl unreachable: exited 0 with ${count} results"
     else
         log_ok "Crawl unreachable: exited 0, no output file"

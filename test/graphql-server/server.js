@@ -104,7 +104,7 @@ const SEED_POSTS = Object.freeze([
 ]);
 
 // Working copies — mutations operate on these, preserving seed data
-let users = SEED_USERS.map((u) => ({ ...u, tags: u.tags ? [...u.tags] : undefined }));
+let users = SEED_USERS.map((u) => ({ ...u }));
 let posts = SEED_POSTS.map((p) => ({ ...p, tags: [...p.tags] }));
 let nextUserId = 4;
 let nextPostId = 14;
@@ -386,6 +386,12 @@ const pages = {
   `),
 };
 
+// safeJsonStringify escapes < to \u003c so that </script> in a string
+// value cannot break out of a <script> tag (standard XSS prevention).
+function safeJsonStringify(val) {
+  return JSON.stringify(val).replace(/</g, "\\u003c");
+}
+
 // Dynamic user detail page
 function userPage(id) {
   return layout("User", `
@@ -397,7 +403,7 @@ function userPage(id) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           query: "query GetUser($id: ID!) { user(id: $id) { id name email role createdAt posts { id title likes published } } }",
-          variables: { id: ${JSON.stringify(id)} }
+          variables: { id: ${safeJsonStringify(id)} }
         })
       }).then(r => r.json()).then(d => {
         const u = d.data.user;
@@ -420,7 +426,7 @@ function postPage(id) {
   return layout("Post", `
     <div id="post"></div>
     <script>
-      let postId = ${JSON.stringify(id)};
+      let postId = ${safeJsonStringify(id)};
       function loadPost() {
         fetch("/graphql", {
           method: "POST",
