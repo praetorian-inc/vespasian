@@ -22,31 +22,9 @@ CONFIG_FILE="${SCRIPT_DIR}/.live-test-config"
 RESULTS_DIR="${SCRIPT_DIR}/.results"
 VESPASIAN="${PROJECT_ROOT}/bin/vespasian"
 
-# ──────────────────────────────────────────────────────────────
-# Colors and logging
-# ──────────────────────────────────────────────────────────────
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
-
-log_header() {
-    echo ""
-    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${BLUE}  $1${NC}"
-    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════${NC}"
-}
-
-log_info()   { echo -e "${CYAN}[INFO]${NC} $1"; }
-log_ok()     { echo -e "${GREEN}[OK]${NC} $1"; }
-log_warn()   { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_fail()   { echo -e "${RED}[FAIL]${NC} $1"; }
-
-# Source validation functions
+# Source shared colors, logging, and validation functions
+# shellcheck source=common.sh
+source "${SCRIPT_DIR}/common.sh"
 # shellcheck source=validate.sh
 source "${SCRIPT_DIR}/validate.sh"
 
@@ -97,23 +75,6 @@ set_test_result() {
     TEST_EXPECTED["$name"]="$expected"
     TEST_DURATION["$name"]="$duration"
 }
-
-# ──────────────────────────────────────────────────────────────
-# Cleanup
-# ──────────────────────────────────────────────────────────────
-
-PIDS_TO_CLEANUP=""
-
-cleanup() {
-    for pid in $PIDS_TO_CLEANUP; do
-        if kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-        fi
-    done
-}
-
-trap cleanup EXIT
 
 # ──────────────────────────────────────────────────────────────
 # Helpers
@@ -1893,9 +1854,16 @@ usage() {
     echo ""
     echo "Options:"
     echo "  --targets <list>      Comma-separated targets to test (default: all)"
-    echo "                        Valid: rest-api,soap-service,import-burp,import-har,"
-    echo "                        generate-rest,generate-wsdl,import-malformed,"
-    echo "                        import-empty,edge-cases,crawl-unreachable"
+    echo "                        Valid targets:"
+    echo "                          Live:       rest-api, soap-service, graphql-server"
+    echo "                          Generate:   generate-rest, generate-wsdl,"
+    echo "                                      generate-graphql, generate-graphql-imports"
+    echo "                          Import:     import-burp, import-har, import-base64,"
+    echo "                                      import-mitmproxy, import-unicode,"
+    echo "                                      import-duplicates, import-malformed,"
+    echo "                                      import-empty"
+    echo "                          Crawl:      crawl-depth, crawl-unreachable"
+    echo "                          Edge cases: edge-cases, classifier-edge, spec-edge"
     echo "  --verbose             Enable verbose vespasian output"
     echo "  --no-build            Skip building vespasian and target binaries"
     echo "  --no-start            Don't start/stop services (assume already running)"

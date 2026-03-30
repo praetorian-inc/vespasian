@@ -102,7 +102,7 @@ validate_openapi_structure() {
         return 1
     fi
 
-    local result
+    local result rc=0
     result=$(python3 - "$spec_file" << 'PYEOF'
 import sys, re
 
@@ -122,9 +122,9 @@ if missing:
     sys.exit(1)
 print("OK: valid OpenAPI structure")
 PYEOF
-    )
+    ) || rc=$?
 
-    if [ $? -ne 0 ]; then
+    if [ $rc -ne 0 ]; then
         log_fail "OpenAPI structure: $result"
         return 1
     fi
@@ -142,7 +142,7 @@ validate_no_static_assets() {
         return 1
     fi
 
-    local result
+    local result rc=0
     result=$(python3 - "$spec_file" << 'PYEOF'
 import sys, re
 
@@ -164,9 +164,9 @@ if found:
     sys.exit(1)
 print("OK: no static assets in spec")
 PYEOF
-    )
+    ) || rc=$?
 
-    if [ $? -ne 0 ]; then
+    if [ $rc -ne 0 ]; then
         log_fail "Static asset check: $result"
         return 1
     fi
@@ -185,7 +185,7 @@ validate_capture() {
         return 1
     fi
 
-    local result
+    local result rc=0
     result=$(python3 - "$capture_file" "$min_requests" << 'PYEOF'
 import json, sys
 
@@ -199,9 +199,9 @@ if count < min_req:
     sys.exit(1)
 print("OK: %d requests captured (minimum: %d)" % (count, min_req))
 PYEOF
-    )
+    ) || rc=$?
 
-    if [ $? -ne 0 ]; then
+    if [ $rc -ne 0 ]; then
         log_fail "Capture validation: $result"
         return 1
     fi
@@ -220,7 +220,7 @@ validate_import() {
         return 1
     fi
 
-    local result
+    local result rc=0
     result=$(python3 - "$imported_file" "$expected_json" << 'PYEOF'
 import json, sys
 
@@ -255,9 +255,9 @@ if missing:
 
 print("OK: %d requests with all expected URLs" % actual_count)
 PYEOF
-    )
+    ) || rc=$?
 
-    if [ $? -ne 0 ]; then
+    if [ $rc -ne 0 ]; then
         log_fail "Import validation: $result"
         return 1
     fi
@@ -276,7 +276,7 @@ validate_soap_operations() {
         return 1
     fi
 
-    local result
+    local result rc=0
     result=$(python3 - "$wsdl_file" "$expected_json" << 'PYEOF'
 import json, sys
 
@@ -297,9 +297,9 @@ if missing:
 
 print("OK: all %d operations found" % len(expected["operations"]))
 PYEOF
-    )
+    ) || rc=$?
 
-    if [ $? -ne 0 ]; then
+    if [ $rc -ne 0 ]; then
         log_fail "SOAP operations: $result"
         return 1
     fi
@@ -318,7 +318,7 @@ validate_graphql_operations() {
         return 1
     fi
 
-    local result
+    local result rc=0
     result=$(python3 - "$sdl_file" "$expected_json" << 'PYEOF'
 import json, sys
 
@@ -345,9 +345,9 @@ if missing:
 total = len(expected.get("queries", [])) + len(expected.get("mutations", []))
 print("OK: all %d operations found" % total)
 PYEOF
-    )
+    ) || rc=$?
 
-    if [ $? -ne 0 ]; then
+    if [ $rc -ne 0 ]; then
         log_fail "GraphQL operations: $result"
         return 1
     fi
@@ -365,7 +365,7 @@ validate_graphql_structure() {
         return 1
     fi
 
-    local result
+    local result rc=0
     result=$(python3 - "$sdl_file" << 'PYEOF'
 import sys
 
@@ -385,9 +385,9 @@ if checks:
     sys.exit(1)
 print("OK: valid GraphQL SDL structure")
 PYEOF
-    )
+    ) || rc=$?
 
-    if [ $? -ne 0 ]; then
+    if [ $rc -ne 0 ]; then
         log_fail "GraphQL structure: $result"
         return 1
     fi
@@ -461,7 +461,7 @@ compare_json() {
         return 1
     fi
 
-    local result
+    local result rc=0
     result=$(python3 - "$actual" "$expected" "$normalize" << 'PYEOF'
 import json, sys, re
 
@@ -506,9 +506,9 @@ if len(a_lines) != len(e_lines):
     print("DIFF: expected %d lines, got %d" % (len(e_lines), len(a_lines)))
     sys.exit(1)
 PYEOF
-    )
+    ) || rc=$?
 
-    if [ $? -ne 0 ]; then
+    if [ $rc -ne 0 ]; then
         log_fail "${label}: ${result}"
         return 1
     fi

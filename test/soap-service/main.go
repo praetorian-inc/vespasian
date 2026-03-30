@@ -84,13 +84,13 @@ func soapFault(code, message string) string {
 func handleGetUser() string {
 	return soapResponse("GetUser", fmt.Sprintf(
 		"<id>%d</id><name>%s</name><email>%s</email>",
-		users[0].ID, users[0].Name, users[0].Email))
+		users[0].ID, xmlEscape(users[0].Name), xmlEscape(users[0].Email)))
 }
 
 func handleListUsers() string {
 	var sb strings.Builder
 	for _, u := range users {
-		fmt.Fprintf(&sb, "<user><id>%d</id><name>%s</name><email>%s</email></user>", u.ID, u.Name, u.Email)
+		fmt.Fprintf(&sb, "<user><id>%d</id><name>%s</name><email>%s</email></user>", u.ID, xmlEscape(u.Name), xmlEscape(u.Email))
 	}
 	return soapResponse("ListUsers", sb.String())
 }
@@ -99,7 +99,7 @@ func handleCreateUser() string {
 	u := User{ID: len(users) + 1, Name: "NewUser", Email: "new@example.com"}
 	return soapResponse("CreateUser", fmt.Sprintf(
 		"<id>%d</id><name>%s</name><email>%s</email>",
-		u.ID, u.Name, u.Email))
+		u.ID, xmlEscape(u.Name), xmlEscape(u.Email)))
 }
 
 func handleSOAP(w http.ResponseWriter, r *http.Request) {

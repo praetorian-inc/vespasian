@@ -28,29 +28,9 @@ DEFAULT_GRAPHQL_SERVER_PORT=8992
 # All available targets
 ALL_TARGETS="rest-api,soap-service,graphql-server"
 
-# ──────────────────────────────────────────────────────────────
-# Colors and logging
-# ──────────────────────────────────────────────────────────────
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
-
-log_header() {
-    echo ""
-    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${BLUE}  $1${NC}"
-    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════${NC}"
-}
-
-log_info()   { echo -e "${CYAN}[INFO]${NC} $1"; }
-log_ok()     { echo -e "${GREEN}[OK]${NC} $1"; }
-log_warn()   { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_fail()   { echo -e "${RED}[FAIL]${NC} $1"; }
+# Source shared colors and logging
+# shellcheck source=common.sh
+source "${SCRIPT_DIR}/common.sh"
 
 # ──────────────────────────────────────────────────────────────
 # Port resolution
@@ -237,7 +217,7 @@ start_graphql_server() {
     local port=$1
     log_info "Starting graphql-server on port ${port}..."
     cd "${SCRIPT_DIR}/graphql-server"
-    PORT="$port" node server.js > /dev/null 2>&1 &
+    PORT="$port" node server.js > "${SCRIPT_DIR}/.graphql-server.log" 2>&1 &
     local pid=$!
     echo "$pid" > "${SCRIPT_DIR}/.graphql-server.pid"
 
@@ -287,6 +267,7 @@ do_teardown() {
     rm -f "${SCRIPT_DIR}/.rest-api.pid"
     rm -f "${SCRIPT_DIR}/.soap-service.pid"
     rm -f "${SCRIPT_DIR}/.graphql-server.pid"
+    rm -f "${SCRIPT_DIR}/.graphql-server.log"
     rm -rf "${SCRIPT_DIR}/.results"
 
     log_ok "Teardown complete"

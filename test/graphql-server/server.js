@@ -184,6 +184,9 @@ const layout = (title, body) => `<!DOCTYPE html>
   button { padding: 0.5em 1.5em; background: #333; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
   #results { margin-top: 1em; }
 </style>
+<script>
+  function esc(s) { var d = document.createElement('div'); d.appendChild(document.createTextNode(s)); return d.innerHTML; }
+</script>
 </head>
 <body>
 <nav>
@@ -211,7 +214,7 @@ const pages = {
       }).then(r => r.json()).then(d => {
         const info = d.data.serverInfo;
         document.getElementById("info").innerHTML =
-          '<p class="meta">Server v' + info.version + ' | uptime: ' + info.uptime.toFixed(1) + 's</p>';
+          '<p class="meta">Server v' + esc(info.version) + ' | uptime: ' + info.uptime.toFixed(1) + 's</p>';
       });
 
       fetch("/graphql", {
@@ -224,9 +227,9 @@ const pages = {
         document.getElementById("recent").innerHTML = d.data.posts
           .filter(p => p.published)
           .map(p => '<div class="card">' +
-            '<h3><a href="/posts/' + p.id + '">' + p.title + '</a></h3>' +
-            '<p class="meta">by ' + p.author.name + ' | ' + p.likes + ' likes | ' + p.createdAt.slice(0,10) + '</p>' +
-            '<p>' + p.tags.map(t => '<span class="tag">' + t + '</span>').join('') + '</p>' +
+            '<h3><a href="/posts/' + esc(p.id) + '">' + esc(p.title) + '</a></h3>' +
+            '<p class="meta">by ' + esc(p.author.name) + ' | ' + p.likes + ' likes | ' + esc(p.createdAt.slice(0,10)) + '</p>' +
+            '<p>' + p.tags.map(t => '<span class="tag">' + esc(t) + '</span>').join('') + '</p>' +
           '</div>').join('');
       });
     </script>
@@ -246,9 +249,9 @@ const pages = {
       }).then(r => r.json()).then(d => {
         document.getElementById("users").innerHTML = d.data.users.map(u =>
           '<div class="card">' +
-            '<h3><a href="/users/' + u.id + '">' + u.name + '</a></h3>' +
-            '<p class="meta">' + u.email + ' | ' + u.role + ' | joined ' + u.createdAt.slice(0,10) + '</p>' +
-            '<p>' + u.posts.length + ' posts: ' + u.posts.map(p => '<a href="/posts/' + p.id + '">' + p.title + '</a>').join(', ') + '</p>' +
+            '<h3><a href="/users/' + esc(u.id) + '">' + esc(u.name) + '</a></h3>' +
+            '<p class="meta">' + esc(u.email) + ' | ' + esc(u.role) + ' | joined ' + esc(u.createdAt.slice(0,10)) + '</p>' +
+            '<p>' + u.posts.length + ' posts: ' + u.posts.map(p => '<a href="/posts/' + esc(p.id) + '">' + esc(p.title) + '</a>').join(', ') + '</p>' +
           '</div>').join('');
       });
     </script>
@@ -267,10 +270,10 @@ const pages = {
       }).then(r => r.json()).then(d => {
         document.getElementById("posts").innerHTML = d.data.posts.map(p =>
           '<div class="card">' +
-            '<h3><a href="/posts/' + p.id + '">' + p.title + '</a>' + (p.published ? '' : ' <em>(draft)</em>') + '</h3>' +
-            '<p>' + p.content.slice(0, 120) + '</p>' +
-            '<p class="meta">by <a href="/users/' + p.author.id + '">' + p.author.name + '</a> | ' + p.likes + ' likes</p>' +
-            '<p>' + p.tags.map(t => '<span class="tag">' + t + '</span>').join('') + '</p>' +
+            '<h3><a href="/posts/' + esc(p.id) + '">' + esc(p.title) + '</a>' + (p.published ? '' : ' <em>(draft)</em>') + '</h3>' +
+            '<p>' + esc(p.content.slice(0, 120)) + '</p>' +
+            '<p class="meta">by <a href="/users/' + esc(p.author.id) + '">' + esc(p.author.name) + '</a> | ' + p.likes + ' likes</p>' +
+            '<p>' + p.tags.map(t => '<span class="tag">' + esc(t) + '</span>').join('') + '</p>' +
           '</div>').join('');
       });
     </script>
@@ -308,12 +311,12 @@ const pages = {
           let html = '<p>Found ' + s.totalCount + ' results</p>';
           if (s.users.length) {
             html += '<h3>Users</h3>' + s.users.map(u =>
-              '<div class="card"><a href="/users/' + u.id + '">' + u.name + '</a> - ' + u.email + '</div>'
+              '<div class="card"><a href="/users/' + esc(u.id) + '">' + esc(u.name) + '</a> - ' + esc(u.email) + '</div>'
             ).join('');
           }
           if (s.posts.length) {
             html += '<h3>Posts</h3>' + s.posts.map(p =>
-              '<div class="card"><a href="/posts/' + p.id + '">' + p.title + '</a></div>'
+              '<div class="card"><a href="/posts/' + esc(p.id) + '">' + esc(p.title) + '</a></div>'
             ).join('');
           }
           document.getElementById("results").innerHTML = html;
@@ -373,7 +376,7 @@ const pages = {
         }).then(r => r.json()).then(d => {
           const p = d.data.createPost;
           document.getElementById("result").innerHTML =
-            '<div class="card"><h3>Created: ' + p.title + '</h3><p>ID: ' + p.id + ' | Published: ' + p.published + '</p></div>';
+            '<div class="card"><h3>Created: ' + esc(p.title) + '</h3><p>ID: ' + esc(p.id) + ' | Published: ' + p.published + '</p></div>';
         });
       });
     </script>
@@ -391,17 +394,17 @@ function userPage(id) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           query: "query GetUser($id: ID!) { user(id: $id) { id name email role createdAt posts { id title likes published } } }",
-          variables: { id: "${id}" }
+          variables: { id: ${JSON.stringify(id)} }
         })
       }).then(r => r.json()).then(d => {
         const u = d.data.user;
         if (!u) { document.getElementById("user").innerHTML = "<p>User not found</p>"; return; }
         document.getElementById("user").innerHTML =
-          '<div class="card"><h2>' + u.name + '</h2>' +
-          '<p class="meta">' + u.email + ' | ' + u.role + ' | joined ' + u.createdAt.slice(0,10) + '</p>' +
+          '<div class="card"><h2>' + esc(u.name) + '</h2>' +
+          '<p class="meta">' + esc(u.email) + ' | ' + esc(u.role) + ' | joined ' + esc(u.createdAt.slice(0,10)) + '</p>' +
           '<h3>Posts</h3>' +
           u.posts.map(p =>
-            '<div class="card"><a href="/posts/' + p.id + '">' + p.title + '</a> | ' + p.likes + ' likes' +
+            '<div class="card"><a href="/posts/' + esc(p.id) + '">' + esc(p.title) + '</a> | ' + p.likes + ' likes' +
             (p.published ? '' : ' (draft)') + '</div>'
           ).join('') + '</div>';
       });
@@ -414,7 +417,7 @@ function postPage(id) {
   return layout("Post", `
     <div id="post"></div>
     <script>
-      let postId = "${id}";
+      let postId = ${JSON.stringify(id)};
       function loadPost() {
         fetch("/graphql", {
           method: "POST",
@@ -427,11 +430,11 @@ function postPage(id) {
           const p = d.data.post;
           if (!p) { document.getElementById("post").innerHTML = "<p>Post not found</p>"; return; }
           document.getElementById("post").innerHTML =
-            '<h1>' + p.title + '</h1>' +
-            '<p class="meta">by <a href="/users/' + p.author.id + '">' + p.author.name + '</a> | ' +
-            p.createdAt.slice(0,10) + (p.published ? '' : ' | <em>draft</em>') + '</p>' +
-            '<p>' + p.content + '</p>' +
-            '<p>' + p.tags.map(t => '<span class="tag">' + t + '</span>').join('') + '</p>' +
+            '<h1>' + esc(p.title) + '</h1>' +
+            '<p class="meta">by <a href="/users/' + esc(p.author.id) + '">' + esc(p.author.name) + '</a> | ' +
+            esc(p.createdAt.slice(0,10)) + (p.published ? '' : ' | <em>draft</em>') + '</p>' +
+            '<p>' + esc(p.content) + '</p>' +
+            '<p>' + p.tags.map(t => '<span class="tag">' + esc(t) + '</span>').join('') + '</p>' +
             '<p><button onclick="likePost()">\u2764 Like (' + p.likes + ')</button></p>';
         });
       }
@@ -485,15 +488,15 @@ async function start() {
     console.log("Server ready at http://localhost:" + port + "/");
     console.log("GraphQL endpoint: http://localhost:" + port + "/graphql");
     console.log("\nPages:");
-    console.log("  http://localhost:4000/          (home + recent posts)");
-    console.log("  http://localhost:4000/users      (all users)");
-    console.log("  http://localhost:4000/users/1    (user detail)");
-    console.log("  http://localhost:4000/posts      (all posts)");
-    console.log("  http://localhost:4000/posts/10   (post detail + like)");
-    console.log("  http://localhost:4000/search     (search)");
-    console.log("  http://localhost:4000/create     (create post form)");
+    console.log("  http://localhost:" + port + "/          (home + recent posts)");
+    console.log("  http://localhost:" + port + "/users      (all users)");
+    console.log("  http://localhost:" + port + "/users/1    (user detail)");
+    console.log("  http://localhost:" + port + "/posts      (all posts)");
+    console.log("  http://localhost:" + port + "/posts/10   (post detail + like)");
+    console.log("  http://localhost:" + port + "/search     (search)");
+    console.log("  http://localhost:" + port + "/create     (create post form)");
     console.log("\nVespasian:");
-    console.log("  ./vespasian-test scan http://localhost:4000/ --api-type graphql -v -o schema.graphql");
+    console.log("  ./vespasian-test scan http://localhost:" + port + "/ --api-type graphql -v -o schema.graphql");
   });
 }
 
