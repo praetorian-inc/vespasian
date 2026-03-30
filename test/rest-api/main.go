@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 )
 
 // User represents a user resource.
@@ -56,6 +57,8 @@ type EmailUpdate struct {
 }
 
 var (
+	mu sync.Mutex
+
 	users = []User{
 		{ID: 1, Name: "Alice", Email: "alice@example.com"},
 		{ID: 2, Name: "Bob", Email: "bob@example.com"},
@@ -91,6 +94,8 @@ func handleUsers(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, users)
@@ -132,6 +137,8 @@ func handleUserByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	mu.Lock()
+	defer mu.Unlock()
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, users[0])
@@ -163,6 +170,8 @@ func handleUserEmail(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, EmailUpdate{Email: users[0].Email})
@@ -189,6 +198,8 @@ func handleProducts(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	writeJSON(w, http.StatusOK, products)
 }
 
@@ -203,6 +214,8 @@ func handleProductByID(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	writeJSON(w, http.StatusOK, products[0])
 }
 
@@ -213,6 +226,8 @@ func handleOrders(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, orders)
@@ -241,6 +256,8 @@ func handleOrderByID(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	writeJSON(w, http.StatusOK, orders[0])
 }
 

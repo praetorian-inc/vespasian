@@ -247,7 +247,7 @@ stop_service() {
         rm -f "$pidfile"
     else
         # Try pkill as fallback
-        pkill -f "${name}$" 2>/dev/null && log_ok "Stopped ${name} via pkill" || true
+        pkill -f "${SCRIPT_DIR}/${name}" 2>/dev/null && log_ok "Stopped ${name} via pkill" || true
     fi
 }
 

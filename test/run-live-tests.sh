@@ -45,7 +45,7 @@ load_config() {
         [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
         # Validate format
         if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@,+\"\ -]*$ ]]; then
-            eval "$line"
+            declare -g "$line"
         else
             log_warn "Skipping invalid config line: $line"
         fi
@@ -240,19 +240,22 @@ test_soap_service() {
     # For SOAP testing, we create a synthetic capture with the SOAP requests.
     log_info "Creating SOAP capture with direct requests..."
     local soap_capture="${target_dir}/soap-capture.json"
-    python3 -c "
-import json, base64
+    python3 - "$port" "$soap_capture" << 'PYEOF' 2>/dev/null
+import json, base64, sys
+
+port = sys.argv[1]
+outfile = sys.argv[2]
 
 def b64(s):
     return base64.b64encode(s.encode()).decode()
 
 requests = []
 for action in ['GetUser', 'ListUsers', 'CreateUser']:
-    body = '<?xml version=\"1.0\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Body><tns:%sRequest xmlns:tns=\"http://localhost/soap\"><id>1</id></tns:%sRequest></soap:Body></soap:Envelope>' % (action, action)
-    resp_body = '<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Body><tns:%sResponse xmlns:tns=\"http://localhost/soap\"><id>1</id></tns:%sResponse></soap:Body></soap:Envelope>' % (action, action)
+    body = '<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><tns:%sRequest xmlns:tns="http://localhost/soap"><id>1</id></tns:%sRequest></soap:Body></soap:Envelope>' % (action, action)
+    resp_body = '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><tns:%sResponse xmlns:tns="http://localhost/soap"><id>1</id></tns:%sResponse></soap:Body></soap:Envelope>' % (action, action)
     req = {
         'method': 'POST',
-        'url': 'http://localhost:${port}/soap',
+        'url': 'http://localhost:%s/soap' % port,
         'headers': {
             'Content-Type': 'text/xml; charset=utf-8',
             'SOAPAction': 'urn:%s' % action
@@ -271,7 +274,7 @@ for action in ['GetUser', 'ListUsers', 'CreateUser']:
 # Also add the WSDL fetch
 requests.append({
     'method': 'GET',
-    'url': 'http://localhost:${port}/service.wsdl',
+    'url': 'http://localhost:%s/service.wsdl' % port,
     'headers': {},
     'response': {
         'status_code': 200,
@@ -281,10 +284,9 @@ requests.append({
     'source': 'test-runner'
 })
 
-import sys
-with open(sys.argv[1], 'w') as f:
+with open(outfile, 'w') as f:
     json.dump(requests, f, indent=2)
-" "$soap_capture" 2>/dev/null
+PYEOF
 
     # Step 2: Generate WSDL spec
     log_info "Generating WSDL spec..."
@@ -566,7 +568,8 @@ test_graphql_server() {
     )
 
     # Build a capture file from live traffic
-    python3 - "$base_url" "${queries[@]}" << 'PYEOF' > "$capture_file"
+    local rc=0
+    python3 - "$base_url" "${queries[@]}" << 'PYEOF' > "$capture_file" || rc=$?
 import json, sys, base64, urllib.request
 
 base_url = sys.argv[1]
@@ -580,7 +583,7 @@ for q in queries:
         headers={"Content-Type": "application/json"}
     )
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             resp_body = resp.read()
         entries.append({
             "method": "POST",
@@ -600,7 +603,7 @@ for q in queries:
 json.dump(entries, sys.stdout, indent=2)
 PYEOF
 
-    if [ $? -ne 0 ]; then
+    if [ $rc -ne 0 ]; then
         log_fail "Failed to send GraphQL queries"
         set_test_result "graphql-server" "FAIL" "?" "?" "$((SECONDS - start))"
         return 1
@@ -1453,8 +1456,11 @@ test_classifier_edge_cases() {
     # Build a synthetic capture with classifier edge case requests
     log_info "Creating classifier edge case capture..."
     local capture="${target_dir}/capture.json"
-    python3 -c "
-import json, base64
+    python3 - "$port" "$capture" << 'PYEOF' 2>/dev/null
+import json, base64, sys
+
+port = sys.argv[1]
+outfile = sys.argv[2]
 
 def b64(s): return base64.b64encode(s.encode()).decode()
 
@@ -1462,73 +1468,73 @@ requests = [
     # RSS feed - should NOT be classified as SOAP/WSDL
     {
         'method': 'GET',
-        'url': 'http://localhost:${port}/feed.xml',
+        'url': 'http://localhost:%s/feed.xml' % port,
         'headers': {'Accept': 'application/rss+xml'},
         'response': {
             'status_code': 200,
             'headers': {'Content-Type': 'application/rss+xml'},
             'content_type': 'application/rss+xml',
-            'body': b64('<rss version=\"2.0\"><channel><title>Test</title></channel></rss>')
+            'body': b64('<rss version="2.0"><channel><title>Test</title></channel></rss>')
         },
         'source': 'test'
     },
     # API v1 endpoint
     {
         'method': 'GET',
-        'url': 'http://localhost:${port}/api/v1/resources',
+        'url': 'http://localhost:%s/api/v1/resources' % port,
         'headers': {'Accept': 'application/json'},
         'response': {
             'status_code': 200,
             'headers': {'Content-Type': 'application/json'},
             'content_type': 'application/json',
-            'body': b64('{\"version\":\"v1\",\"items\":[{\"id\":\"1\"}]}')
+            'body': b64('{"version":"v1","items":[{"id":"1"}]}')
         },
         'source': 'test'
     },
     # API v2 endpoint
     {
         'method': 'GET',
-        'url': 'http://localhost:${port}/api/v2/resources',
+        'url': 'http://localhost:%s/api/v2/resources' % port,
         'headers': {'Accept': 'application/json'},
         'response': {
             'status_code': 200,
             'headers': {'Content-Type': 'application/json'},
             'content_type': 'application/json',
-            'body': b64('{\"version\":\"v2\",\"data\":[{\"id\":1}]}')
+            'body': b64('{"version":"v2","data":[{"id":1}]}')
         },
         'source': 'test'
     },
     # GraphQL POST
     {
         'method': 'POST',
-        'url': 'http://localhost:${port}/graphql',
+        'url': 'http://localhost:%s/graphql' % port,
         'headers': {'Content-Type': 'application/json'},
-        'body': b64('{\"query\":\"{ users { id name } }\"}'),
+        'body': b64('{"query":"{ users { id name } }"}'),
         'response': {
             'status_code': 200,
             'headers': {'Content-Type': 'application/json'},
             'content_type': 'application/json',
-            'body': b64('{\"data\":{\"users\":[{\"id\":\"1\",\"name\":\"Alice\"}]}}')
+            'body': b64('{"data":{"users":[{"id":"1","name":"Alice"}]}}')
         },
         'source': 'test'
     },
     # Mismatched content-type: JSON body but text/html header
     {
         'method': 'GET',
-        'url': 'http://localhost:${port}/api/mismatched-ct',
+        'url': 'http://localhost:%s/api/mismatched-ct' % port,
         'headers': {},
         'response': {
             'status_code': 200,
             'headers': {'Content-Type': 'text/html'},
             'content_type': 'text/html',
-            'body': b64('{\"status\":\"mismatched\"}')
+            'body': b64('{"status":"mismatched"}')
         },
         'source': 'test'
     },
     # HTML error from API path
     {
         'method': 'GET',
-        'url': 'http://localhost:${port}/api/html-error',
+        'url': 'http://localhost:%s/api/html-error' % port,
         'headers': {},
         'response': {
             'status_code': 502,
@@ -1540,11 +1546,10 @@ requests = [
     },
 ]
 
-import sys
-with open(sys.argv[1], 'w') as f:
+with open(outfile, 'w') as f:
     json.dump(requests, f, indent=2)
 print('Created capture with %d requests' % len(requests))
-" "$capture" 2>/dev/null
+PYEOF
 
     # Generate REST spec
     local spec="${target_dir}/spec.yaml"
@@ -1630,8 +1635,11 @@ test_spec_edge_cases() {
     # Build a synthetic capture with spec generation edge cases
     log_info "Creating spec edge case capture..."
     local capture="${target_dir}/capture.json"
-    python3 -c "
-import json, base64
+    python3 - "$port" "$capture" << 'PYEOF' 2>/dev/null
+import json, base64, sys
+
+port = sys.argv[1]
+outfile = sys.argv[2]
 
 def b64(s): return base64.b64encode(s.encode()).decode()
 
@@ -1639,95 +1647,95 @@ requests = [
     # Multi-param: /api/users/{id}/orders
     {
         'method': 'GET',
-        'url': 'http://localhost:${port}/api/users/1/orders',
+        'url': 'http://localhost:%s/api/users/1/orders' % port,
         'headers': {'Accept': 'application/json'},
         'response': {
             'status_code': 200,
             'headers': {'Content-Type': 'application/json'},
             'content_type': 'application/json',
-            'body': b64('[{\"order_id\":\"101\"},{\"order_id\":\"102\"}]')
+            'body': b64('[{"order_id":"101"},{"order_id":"102"}]')
         },
         'source': 'test'
     },
     # Multi-param: /api/users/{id}/orders/{orderId} - two different IDs
     {
         'method': 'GET',
-        'url': 'http://localhost:${port}/api/users/1/orders/101',
+        'url': 'http://localhost:%s/api/users/1/orders/101' % port,
         'headers': {'Accept': 'application/json'},
         'response': {
             'status_code': 200,
             'headers': {'Content-Type': 'application/json'},
             'content_type': 'application/json',
-            'body': b64('{\"order_id\":\"101\",\"user_id\":\"1\",\"product\":\"Widget\"}')
+            'body': b64('{"order_id":"101","user_id":"1","product":"Widget"}')
         },
         'source': 'test'
     },
     {
         'method': 'GET',
-        'url': 'http://localhost:${port}/api/users/2/orders/102',
+        'url': 'http://localhost:%s/api/users/2/orders/102' % port,
         'headers': {'Accept': 'application/json'},
         'response': {
             'status_code': 200,
             'headers': {'Content-Type': 'application/json'},
             'content_type': 'application/json',
-            'body': b64('{\"order_id\":\"102\",\"user_id\":\"2\",\"product\":\"Gadget\"}')
+            'body': b64('{"order_id":"102","user_id":"2","product":"Gadget"}')
         },
         'source': 'test'
     },
     # UUID path params - two different UUIDs to trigger parameterization
     {
         'method': 'GET',
-        'url': 'http://localhost:${port}/api/assets/550e8400-e29b-41d4-a716-446655440000',
+        'url': 'http://localhost:%s/api/assets/550e8400-e29b-41d4-a716-446655440000' % port,
         'headers': {'Accept': 'application/json'},
         'response': {
             'status_code': 200,
             'headers': {'Content-Type': 'application/json'},
             'content_type': 'application/json',
-            'body': b64('{\"id\":\"550e8400-e29b-41d4-a716-446655440000\",\"type\":\"asset\"}')
+            'body': b64('{"id":"550e8400-e29b-41d4-a716-446655440000","type":"asset"}')
         },
         'source': 'test'
     },
     {
         'method': 'GET',
-        'url': 'http://localhost:${port}/api/assets/6ba7b810-9dad-11d1-80b4-00c04fd430c8',
+        'url': 'http://localhost:%s/api/assets/6ba7b810-9dad-11d1-80b4-00c04fd430c8' % port,
         'headers': {'Accept': 'application/json'},
         'response': {
             'status_code': 200,
             'headers': {'Content-Type': 'application/json'},
             'content_type': 'application/json',
-            'body': b64('{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"type\":\"asset\"}')
+            'body': b64('{"id":"6ba7b810-9dad-11d1-80b4-00c04fd430c8","type":"asset"}')
         },
         'source': 'test'
     },
     # Numeric IDs - two different to trigger parameterization
     {
         'method': 'GET',
-        'url': 'http://localhost:${port}/api/items/42',
+        'url': 'http://localhost:%s/api/items/42' % port,
         'headers': {'Accept': 'application/json'},
         'response': {
             'status_code': 200,
             'headers': {'Content-Type': 'application/json'},
             'content_type': 'application/json',
-            'body': b64('{\"id\":\"42\",\"type\":\"item\"}')
+            'body': b64('{"id":"42","type":"item"}')
         },
         'source': 'test'
     },
     {
         'method': 'GET',
-        'url': 'http://localhost:${port}/api/items/99',
+        'url': 'http://localhost:%s/api/items/99' % port,
         'headers': {'Accept': 'application/json'},
         'response': {
             'status_code': 200,
             'headers': {'Content-Type': 'application/json'},
             'content_type': 'application/json',
-            'body': b64('{\"id\":\"99\",\"type\":\"item\"}')
+            'body': b64('{"id":"99","type":"item"}')
         },
         'source': 'test'
     },
     # Empty 200 response body
     {
         'method': 'GET',
-        'url': 'http://localhost:${port}/api/empty-ok',
+        'url': 'http://localhost:%s/api/empty-ok' % port,
         'headers': {'Accept': 'application/json'},
         'response': {
             'status_code': 200,
@@ -1738,11 +1746,10 @@ requests = [
     },
 ]
 
-import sys
-with open(sys.argv[1], 'w') as f:
+with open(outfile, 'w') as f:
     json.dump(requests, f, indent=2)
 print('Created capture with %d requests' % len(requests))
-" "$capture" 2>/dev/null
+PYEOF
 
     # Generate spec
     local spec="${target_dir}/spec.yaml"

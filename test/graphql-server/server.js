@@ -89,20 +89,23 @@ const typeDefs = `#graphql
   union SearchItem = User | Post
 `;
 
-// Sample data
-const users = [
+// Seed data (frozen) — working copies are reset on each server start
+const SEED_USERS = Object.freeze([
   { id: "1", name: "Alice Johnson", email: "alice@example.com", role: "ADMIN", createdAt: "2026-01-15T10:00:00Z" },
   { id: "2", name: "Bob Smith", email: "bob@example.com", role: "EDITOR", createdAt: "2026-02-01T12:00:00Z" },
   { id: "3", name: "Carol White", email: "carol@example.com", role: "VIEWER", createdAt: "2026-03-10T08:30:00Z" },
-];
+]);
 
-const posts = [
+const SEED_POSTS = Object.freeze([
   { id: "10", title: "Getting Started with GraphQL", content: "GraphQL is a query language for APIs that gives clients the power to ask for exactly what they need.", authorId: "1", tags: ["graphql", "tutorial"], likes: 42, published: true, createdAt: "2026-01-20T14:00:00Z" },
   { id: "11", title: "Advanced Mutations", content: "Mutations allow you to modify server-side data and return the updated result.", authorId: "1", tags: ["graphql", "advanced"], likes: 18, published: true, createdAt: "2026-02-05T09:00:00Z" },
   { id: "12", title: "Draft Post", content: "Work in progress...", authorId: "2", tags: [], likes: 0, published: false, createdAt: "2026-03-01T16:00:00Z" },
   { id: "13", title: "Security Best Practices", content: "Always validate input, use parameterized queries, and implement proper authentication.", authorId: "2", tags: ["security", "best-practices"], likes: 73, published: true, createdAt: "2026-03-15T11:00:00Z" },
-];
+]);
 
+// Working copies — mutations operate on these, preserving seed data
+let users = SEED_USERS.map((u) => ({ ...u, tags: u.tags ? [...u.tags] : undefined }));
+let posts = SEED_POSTS.map((p) => ({ ...p, tags: [...p.tags] }));
 let nextUserId = 4;
 let nextPostId = 14;
 
