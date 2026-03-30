@@ -161,7 +161,7 @@ Vespasian classifies and generates specifications for three API types:
 | API Type | Classification Signals | Output Format | Probing |
 |----------|----------------------|---------------|---------|
 | **REST** | JSON/XML content-type, `/api/` `/v1/` path patterns, HTTP methods | OpenAPI 3.0 (YAML/JSON) | OPTIONS discovery, JSON schema inference |
-| **GraphQL** | `/graphql` path, query structure in POST body, `data`/`errors` response keys | GraphQL SDL | Tiered introspection queries (4 tiers for WAF bypass) |
+| **GraphQL** | `/graphql` path, query structure in POST body, `data`/`errors` response keys | GraphQL SDL | Tiered introspection queries (3 tiers for WAF bypass) |
 | **WSDL/SOAP** | SOAPAction header, SOAP envelope in body, `?wsdl` URL parameter | WSDL XML | Active `?wsdl` document fetching |
 
 ### REST Classification Heuristics
@@ -184,7 +184,8 @@ Vespasian classifies and generates specifications for three API types:
 Vespasian uses a tiered introspection strategy to handle WAF-protected GraphQL servers:
 
 - **Tier 1**: Full introspection with descriptions, deprecation, and directives
-- **Tier 2-4**: Progressively simpler queries that bypass common WAF rules
+- **Tier 2**: Minimal-complete query without descriptions, deprecation info, or directives
+- **Tier 3**: Minimal last-resort query with the smallest payload
 - **Fallback**: Traffic-based inference from observed queries and mutations when introspection is disabled
 
 ## CLI Reference
