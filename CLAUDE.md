@@ -67,7 +67,7 @@ The CLI (`cmd/vespasian`) uses Kong for argument parsing. Each command (crawl, i
 - **cmd/vespasian**: CLI entry point, command definitions, signal handling, browser lifecycle management
 - **pkg/crawl**: Headless browser crawling via Katana, capture file I/O (`ObservedRequest` JSON format), browser manager with Chrome lifecycle
 - **pkg/classify**: Request classification engine with confidence-based heuristics; classifiers for REST, GraphQL, and WSDL; deduplication
-- **pkg/probe**: Active endpoint probing strategies (OPTIONS discovery, JSON schema inference, WSDL document fetching, GraphQL introspection with 4-tier WAF bypass); SSRF protection with DNS rebinding mitigation
+- **pkg/probe**: Active endpoint probing strategies (OPTIONS discovery, JSON schema inference, WSDL document fetching, GraphQL introspection with 3-tier WAF bypass); SSRF protection with DNS rebinding mitigation
 - **pkg/generate**: Spec generation interface and registry; delegates to sub-packages by API type
 - **pkg/generate/rest**: OpenAPI 3.0 generation, path normalization (UUID detection, context-aware parameter naming), JSON schema inference
 - **pkg/generate/graphql**: GraphQL SDL generation from introspection results or traffic-based inference
