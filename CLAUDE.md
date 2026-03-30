@@ -101,10 +101,20 @@ The `test/` directory contains live test targets:
 - **test/rest-api/**: Go HTTP server exposing REST endpoints for end-to-end testing
 - **test/soap-service/**: Go HTTP server exposing SOAP/WSDL endpoints
 - **test/graphql-server/**: Node.js GraphQL server with Apollo
-- **test/run-live-tests.sh**: End-to-end test runner that starts servers, runs vespasian, and validates output
-- **test/validate.sh**: Output validation helpers
 
-Each test target includes reference captures and expected output specs for regression testing.
+## Code Conventions
+
+- Go file naming: lowercase with underscores (e.g., `rest_classifier.go`, not `restClassifier.go`)
+- Test files match source files (`foo.go` → `foo_test.go`)
+- Formatting enforced by `gofmt -s` (run `make fmt`)
+- Linting via `golangci-lint` with gocritic, misspell, revive (run `make lint`)
+- Package-level documentation lives in `doc.go` files
+
+## Development Workflow
+
+- After implementing a feature or fix, run `make check` to ensure all tests and the linter pass.
+- After modifying a Go source file, update its package's `doc.go` if the change affects the package's public API or purpose.
+- After adding or changing features, review `README.md` and `CLAUDE.md` for accuracy and update them if needed.
 
 ## CI
 

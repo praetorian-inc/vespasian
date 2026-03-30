@@ -21,6 +21,5 @@
 //   - [graphql]: GraphQL SDL from introspection or traffic inference
 //   - [wsdl]: WSDL XML from SOAP traffic
 //
-// Use [Get] to retrieve a generator by API type name, and [SupportedTypes] to
-// list all registered generators.
+// Use [Get] to retrieve a generator by API type name.
 package generate
