@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package classify provides API classification for observed HTTP requests.
 package classify
 
 import (

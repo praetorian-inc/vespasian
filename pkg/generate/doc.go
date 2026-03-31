@@ -12,20 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package generate defines the [SpecGenerator] interface for producing API
+// specifications from classified requests, and provides a registry for looking
+// up generators by API type.
+//
+// Generators are implemented in sub-packages:
+//   - [rest]: OpenAPI 3.0 (YAML) from REST traffic
+//   - [graphql]: GraphQL SDL from introspection or traffic inference
+//   - [wsdl]: WSDL XML from SOAP traffic
+//
+// Use [Get] to retrieve a generator by API type name.
 package generate
-
-import (
-	"github.com/praetorian-inc/vespasian/pkg/classify"
-)
-
-// SpecGenerator generates API specifications from classified requests.
-type SpecGenerator interface {
-	// APIType returns the API type this generator supports (e.g., "rest", "graphql").
-	APIType() string
-
-	// Generate produces an API specification from the endpoints.
-	Generate(endpoints []classify.ClassifiedRequest) ([]byte, error)
-
-	// DefaultExtension returns the default file extension for the generated spec.
-	DefaultExtension() string
-}

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package crawl provides types and utilities for capturing HTTP traffic.
 package crawl
 
 // ObservedRequest represents a captured HTTP request and its response.

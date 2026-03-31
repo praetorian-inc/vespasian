@@ -384,8 +384,7 @@ func setupBrowserAndSignals(rawHeaders []string, crawlOpts CrawlOptions, extraOp
 
 // CrawlCmd crawls a web application to capture HTTP traffic.
 type CrawlCmd struct {
-	URL    string `arg:"" help:"Target URL to crawl"`
-	Format string `default:"json" enum:"json,yaml" help:"Output format"`
+	URL string `arg:"" help:"Target URL to crawl"`
 	CrawlOptions
 }
 
@@ -471,14 +470,14 @@ func (c *ImportCmd) Run() error {
 
 // GenerateCmd generates API specifications from captured traffic.
 type GenerateCmd struct {
-	APIType     string  `arg:"" enum:"rest,wsdl,graphql" help:"API type to generate (rest, wsdl, graphql)"`
-	Capture     string  `arg:"" help:"Capture file path"`
-	Output      string  `short:"o" help:"Output file path"`
-	Confidence  float64 `default:"0.5" help:"Minimum confidence threshold"`
-	Probe       bool    `default:"true" help:"Enable endpoint probing"`
-	Deduplicate bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
+	APIType               string  `arg:"" enum:"rest,wsdl,graphql" help:"API type to generate (rest, wsdl, graphql)"`
+	Capture               string  `arg:"" help:"Capture file path"`
+	Output                string  `short:"o" help:"Output file path"`
+	Confidence            float64 `default:"0.5" help:"Minimum confidence threshold"`
+	Probe                 bool    `default:"true" help:"Enable endpoint probing"`
+	Deduplicate           bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
 	DangerousAllowPrivate bool    `help:"Disable SSRF protection for probes, allowing private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
-	Verbose     bool    `short:"v" help:"Enable verbose logging"`
+	Verbose               bool    `short:"v" help:"Enable verbose logging"`
 }
 
 // API type constants used for classification routing and generation.
@@ -525,7 +524,6 @@ func (c *GenerateCmd) Run() (err error) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-
 	spec, err := generateSpec(ctx, requests, generateSpecOptions{
 		APIType:      c.APIType,
 		Confidence:   c.Confidence,
@@ -546,11 +544,11 @@ func (c *GenerateCmd) Run() (err error) {
 
 // ScanCmd runs the full pipeline: crawl, classify, and generate.
 type ScanCmd struct {
-	URL         string  `arg:"" help:"Target URL to scan"`
-	APIType     string  `default:"auto" enum:"auto,rest,wsdl,graphql" help:"API type to generate (auto detects from traffic)" name:"api-type"`
-	Confidence  float64 `default:"0.5" help:"Minimum confidence threshold"`
-	Probe       bool    `default:"true" help:"Enable endpoint probing"`
-	Deduplicate bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
+	URL                   string  `arg:"" help:"Target URL to scan"`
+	APIType               string  `default:"auto" enum:"auto,rest,wsdl,graphql" help:"API type to generate (auto detects from traffic)" name:"api-type"`
+	Confidence            float64 `default:"0.5" help:"Minimum confidence threshold"`
+	Probe                 bool    `default:"true" help:"Enable endpoint probing"`
+	Deduplicate           bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
 	DangerousAllowPrivate bool    `help:"Disable SSRF protection for probes, allowing private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 
 	CrawlOptions
@@ -845,7 +843,7 @@ func probeWSDLDocument(targetURL string, allowPrivate bool, verbose bool) []byte
 	}
 	defer func() {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck
-		resp.Body.Close()                                     //nolint:errcheck
+		resp.Body.Close()                                    //nolint:errcheck
 	}()
 
 	if resp.StatusCode >= 400 {

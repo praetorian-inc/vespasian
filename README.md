@@ -221,7 +221,6 @@ Captures HTTP traffic by driving a headless browser through the target applicati
 vespasian crawl <url> [flags]
   -H, --header       Auth headers to inject (repeatable)
   -o, --output       Capture output file (default: stdout)
-  --format           Capture format: json, yaml (default: json)
   --depth            Max crawl depth (default: 3)
   --max-pages        Max pages to visit (default: 100)
   --timeout          Maximum duration for the entire crawl (default: 10m)
