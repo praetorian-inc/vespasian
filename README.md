@@ -1,12 +1,26 @@
-# Vespasian: API Discovery and Specification Generation Tool
+<p align="center">
+  <a href="https://github.com/praetorian-inc/vespasian">
+    <img src="docs/images/banner.png" alt="Vespasian — API discovery and specification generation from live HTTP traffic" width="100%">
+  </a>
+</p>
 
-[![CI](https://github.com/praetorian-inc/vespasian/actions/workflows/ci.yml/badge.svg)](https://github.com/praetorian-inc/vespasian/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/praetorian-inc/vespasian)](https://goreportcard.com/report/github.com/praetorian-inc/vespasian)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+<p align="center">
+  <strong>Discover API endpoints from real HTTP traffic. Generate OpenAPI, GraphQL SDL, and WSDL specs automatically.</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/praetorian-inc/vespasian/actions/workflows/ci.yml"><img src="https://github.com/praetorian-inc/vespasian/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://goreportcard.com/report/github.com/praetorian-inc/vespasian"><img src="https://goreportcard.com/badge/github.com/praetorian-inc/vespasian" alt="Go Report Card"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
+</p>
+
+---
+
+# Vespasian: API Discovery and Specification Generation Tool
 
 **Vespasian discovers API endpoints by observing real HTTP traffic and generates API specification files from those observations.** It captures traffic through headless browser crawling or imports it from existing sources (Burp Suite XML exports, HAR files, and mitmproxy dumps), then classifies requests, probes discovered endpoints, and outputs specifications in the native format for each API type: OpenAPI 3.0 for REST, GraphQL SDL for GraphQL, and WSDL for SOAP services.
 
-Built for penetration testers and security engineers who need to map the API attack surface of applications when clients don't provide API documentation.
+Built for penetration testers and security engineers who need to map the API attack surface of web applications, single-page apps, and microservices — especially when clients don't provide API documentation.
 
 ## Why Vespasian?
 
