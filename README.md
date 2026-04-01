@@ -20,7 +20,7 @@
 
 **Vespasian discovers API endpoints by observing real HTTP traffic and generates API specification files from those observations.** It captures traffic through headless browser crawling or imports it from existing sources (Burp Suite XML exports, HAR files, and mitmproxy dumps), then classifies requests, probes discovered endpoints, and outputs specifications in the native format for each API type: OpenAPI 3.0 for REST, GraphQL SDL for GraphQL, and WSDL for SOAP services.
 
-Built for penetration testers and security engineers who need to map the API attack surface of web applications, single-page apps, and microservices — especially when clients don't provide API documentation.
+Built for penetration testers and security engineers who need to map the API attack surface of web applications, single-page apps, and microservices when the API documentation is not available.
 
 ## Why Vespasian?
 
