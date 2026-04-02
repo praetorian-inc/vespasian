@@ -441,8 +441,8 @@ func TestGenerator_Phase1_RootTypeNamesFromIntrospection(t *testing.T) {
 			APIType: "graphql",
 			GraphQLSchema: &classify.GraphQLIntrospection{
 				IntrospectionEnabled: true,
-				QueryTypeName:       "RootQuery",
-				MutationTypeName:    "RootMutation",
+				QueryTypeName:        "RootQuery",
+				MutationTypeName:     "RootMutation",
 				Types: []classify.GraphQLType{
 					{
 						Name: "RootQuery",

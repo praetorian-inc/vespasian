@@ -61,7 +61,7 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 	var ops []inferredOperation
 	syntheticTypes := make(map[string]*inferredType)
 	syntheticInputTypes := make(map[string]*inferredType)
-	syntheticUnions := make(map[string][]string)          // union name -> member type names
+	syntheticUnions := make(map[string][]string)           // union name -> member type names
 	observedEnumValues := make(map[string]map[string]bool) // type name -> set of observed string values
 	anonCounter := 0
 	seen := make(map[string]bool) // deduplicate by composite key (opType:fieldName:opName)
@@ -93,7 +93,7 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 	// Merge operations with the same root field name within each operation type
 	for opType, groupOps := range grouped {
 		merged := make(map[string]*inferredOperation) // fieldName -> merged op
-		var order []string                             // preserve first-seen order
+		var order []string                            // preserve first-seen order
 
 		for i := range groupOps {
 			op := &groupOps[i]
@@ -530,13 +530,13 @@ type parsedQuery struct {
 	opType               ast.Operation
 	opName               string
 	rootFieldName        string
-	rootFieldAliases     []string              // aliases used for this root field in queries (for response data lookup)
-	rootFieldArgs        []*ast.Argument       // arguments on the root field
+	rootFieldAliases     []string        // aliases used for this root field in queries (for response data lookup)
+	rootFieldArgs        []*ast.Argument // arguments on the root field
 	varDefs              ast.VariableDefinitionList
-	selectionFields      []string              // field names from the root field's selection set (flat)
-	selectionTree        []*selectionNode      // nested selection tree for recursive type inference
-	inlineFragments      []inlineFragmentInfo  // inline fragments with type conditions on root field
-	hasNonFragmentFields bool                  // true if root field has direct field selections alongside inline fragments
+	selectionFields      []string             // field names from the root field's selection set (flat)
+	selectionTree        []*selectionNode     // nested selection tree for recursive type inference
+	inlineFragments      []inlineFragmentInfo // inline fragments with type conditions on root field
+	hasNonFragmentFields bool                 // true if root field has direct field selections alongside inline fragments
 }
 
 // parseQueryAST parses a GraphQL query string and extracts operation info for all root fields.

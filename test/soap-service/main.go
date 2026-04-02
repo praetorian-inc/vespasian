@@ -28,8 +28,8 @@ import (
 
 // SOAPEnvelope wraps a SOAP request or response body.
 type SOAPEnvelope struct {
-	XMLName xml.Name    `xml:"Envelope"`
-	Body    SOAPBody    `xml:"Body"`
+	XMLName xml.Name `xml:"Envelope"`
+	Body    SOAPBody `xml:"Body"`
 }
 
 // SOAPBody is the body of a SOAP envelope.

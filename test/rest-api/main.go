@@ -45,10 +45,10 @@ type Product struct {
 
 // Order represents an order resource.
 type Order struct {
-	ID        int   `json:"id"`
-	UserID    int   `json:"user_id"`
-	ProductID int   `json:"product_id"`
-	Quantity  int   `json:"quantity"`
+	ID        int `json:"id"`
+	UserID    int `json:"user_id"`
+	ProductID int `json:"product_id"`
+	Quantity  int `json:"quantity"`
 }
 
 // EmailUpdate represents a request to update a user's email.
@@ -591,11 +591,11 @@ func handleUserOrders(w http.ResponseWriter, r *http.Request) {
 	// parts: ["{id}", "orders"] or ["{id}", "orders", "{orderId}"]
 	if len(parts) >= 3 {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"order_id":   parts[2],
-			"user_id":    parts[0],
-			"product":    "Widget",
-			"quantity":   2,
-			"total":      19.98,
+			"order_id": parts[2],
+			"user_id":  parts[0],
+			"product":  "Widget",
+			"quantity": 2,
+			"total":    19.98,
 		})
 	} else {
 		writeJSON(w, http.StatusOK, []map[string]interface{}{

@@ -289,7 +289,7 @@ func (p *GraphQLProbe) sendIntrospection(ctx context.Context, targetURL, query s
 	}
 	defer func() {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // best-effort drain
-		resp.Body.Close()                                     //nolint:errcheck,gosec // best-effort close
+		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close
 	}()
 
 	if resp.StatusCode >= 400 {
@@ -325,15 +325,15 @@ func parseIntrospectionResponse(body []byte) *classify.GraphQLIntrospection {
 					Kind        string `json:"kind"`
 					Description string `json:"description"`
 					Fields      []struct {
-						Name              string              `json:"name"`
-						Description       string              `json:"description"`
-						Type              json.RawMessage     `json:"type"`
-						Args              []json.RawMessage   `json:"args"`
-						IsDeprecated      bool                `json:"isDeprecated"`
-						DeprecationReason string              `json:"deprecationReason"`
+						Name              string            `json:"name"`
+						Description       string            `json:"description"`
+						Type              json.RawMessage   `json:"type"`
+						Args              []json.RawMessage `json:"args"`
+						IsDeprecated      bool              `json:"isDeprecated"`
+						DeprecationReason string            `json:"deprecationReason"`
 					} `json:"fields"`
-					InputFields   []json.RawMessage `json:"inputFields"`
-					EnumValues    []struct {
+					InputFields []json.RawMessage `json:"inputFields"`
+					EnumValues  []struct {
 						Name              string `json:"name"`
 						Description       string `json:"description"`
 						IsDeprecated      bool   `json:"isDeprecated"`
