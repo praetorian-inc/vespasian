@@ -57,7 +57,7 @@ type inferredType struct {
 }
 
 // inferSDL produces a partial SDL from observed GraphQL traffic.
-func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) {
+func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) { //nolint:gocyclo // central SDL inference orchestration
 	var ops []inferredOperation
 	syntheticTypes := make(map[string]*inferredType)
 	syntheticInputTypes := make(map[string]*inferredType)
@@ -390,7 +390,7 @@ func processEndpoint(ep classify.ClassifiedRequest, seen map[string]bool, anonCo
 }
 
 // processParsedQuery processes a single parsed query (one root field) from an endpoint.
-func processParsedQuery(parsed *parsedQuery, ep classify.ClassifiedRequest, body *graphqlBody, seen map[string]bool, anonCounter *int, syntheticTypes map[string]*inferredType, syntheticInputTypes map[string]*inferredType, syntheticUnions map[string][]string, observedEnumValues map[string]map[string]bool) (inferredOperation, bool) {
+func processParsedQuery(parsed *parsedQuery, ep classify.ClassifiedRequest, body *graphqlBody, seen map[string]bool, anonCounter *int, syntheticTypes map[string]*inferredType, syntheticInputTypes map[string]*inferredType, syntheticUnions map[string][]string, observedEnumValues map[string]map[string]bool) (inferredOperation, bool) { //nolint:gocyclo // query AST processing
 	opType := astOpTypeToString(parsed.opType)
 	fieldName := parsed.rootFieldName
 	if fieldName == "" {
@@ -682,7 +682,7 @@ func isMetaField(name string) bool {
 }
 
 // collectSelectionTree builds a recursive selection tree from an AST selection set.
-func collectSelectionTree(selections ast.SelectionSet, fragments ast.FragmentDefinitionList) []*selectionNode {
+func collectSelectionTree(selections ast.SelectionSet, fragments ast.FragmentDefinitionList) []*selectionNode { //nolint:gocyclo // recursive selection tree traversal
 	// Use ordered dedup: track seen names and their indices
 	seen := make(map[string]int)
 	var nodes []*selectionNode
@@ -769,7 +769,7 @@ func collectSelectionTree(selections ast.SelectionSet, fragments ast.FragmentDef
 }
 
 // collectInlineFragments extracts inline fragments with type conditions from a selection set.
-func collectInlineFragments(selections ast.SelectionSet, fragments ast.FragmentDefinitionList) []inlineFragmentInfo {
+func collectInlineFragments(selections ast.SelectionSet, fragments ast.FragmentDefinitionList) []inlineFragmentInfo { //nolint:gocyclo // fragment collection logic
 	var frags []inlineFragmentInfo
 	seen := make(map[string]int) // type name -> index in frags (merge duplicate type conditions)
 
@@ -1043,7 +1043,7 @@ func appendUnique(slice []string, val string) []string {
 // nested synthetic types. It returns the fields map for the current level.
 // parentTypeName identifies the synthetic type being built at this level, so field
 // arguments can be stored in its FieldArgs.
-func inferFieldsRecursive(
+func inferFieldsRecursive( //nolint:gocyclo // recursive field type inference
 	responseObj map[string]interface{},
 	tree []*selectionNode,
 	typePrefix string,
@@ -1314,7 +1314,7 @@ func inferInputFieldsRecursive(
 
 // inferInputTypes examines variable definitions and their runtime values to build
 // input type definitions for non-scalar variable types.
-func inferInputTypes(
+func inferInputTypes( //nolint:gocyclo // input type inference
 	parsed *parsedQuery,
 	variables map[string]interface{},
 	inputTypes map[string]*inferredType,
@@ -1896,7 +1896,7 @@ func jaccardSimilarity(a, b map[string]bool) float64 {
 // propagates more-specific scalar field types across them. This fixes the case
 // where null responses cause all fields to default to String, even when other
 // operations returning the same structure have real data with correct types.
-func unifyStructuralFieldTypes(syntheticTypes map[string]*inferredType) {
+func unifyStructuralFieldTypes(syntheticTypes map[string]*inferredType) { //nolint:gocyclo // type unification logic
 	// Step 1: Collect scalar field name sets for each type (skip types with < 3 scalar fields)
 	type typeInfo struct {
 		name        string
@@ -2093,7 +2093,7 @@ func parseGraphQLURL(rawURL string) *graphqlBody {
 	}
 	gb := &graphqlBody{Query: query}
 	if vars := u.Query().Get("variables"); vars != "" {
-		json.Unmarshal([]byte(vars), &gb.Variables) //nolint:errcheck // best-effort parse; invalid variables are silently ignored
+		json.Unmarshal([]byte(vars), &gb.Variables) //nolint:errcheck,gosec // best-effort parse; invalid variables are silently ignored
 	}
 	return gb
 }

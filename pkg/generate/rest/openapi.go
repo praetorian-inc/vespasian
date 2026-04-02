@@ -123,7 +123,7 @@ func groupEndpoints(endpoints []classify.ClassifiedRequest) map[endpointKey][]cl
 }
 
 // buildOperation builds a single OpenAPI operation from a group of classified requests.
-func buildOperation(key endpointKey, group []classify.ClassifiedRequest) *openapi3.Operation {
+func buildOperation(key endpointKey, group []classify.ClassifiedRequest) *openapi3.Operation { //nolint:gocyclo // OpenAPI operation builder
 	operation := &openapi3.Operation{
 		Summary:   capitalizeFirst(key.method) + " " + key.path,
 		Responses: &openapi3.Responses{},
@@ -313,7 +313,7 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest) *openap
 }
 
 // Generate produces an OpenAPI specification.
-func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]byte, error) {
+func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]byte, error) { //nolint:gocyclo // top-level generation orchestration
 	if len(endpoints) == 0 {
 		return nil, nil
 	}
@@ -460,7 +460,7 @@ func schemaFingerprint(schema *openapi3.Schema) string {
 
 // extractComponents extracts inline schemas to components/schemas with $ref references.
 // This is called after all paths are built, before validation.
-func extractComponents(doc *openapi3.T) {
+func extractComponents(doc *openapi3.T) { //nolint:gocyclo // component extraction logic
 	// Initialize components if needed
 	if doc.Components == nil {
 		doc.Components = &openapi3.Components{}

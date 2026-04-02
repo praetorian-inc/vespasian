@@ -104,14 +104,14 @@ func (p *SchemaProbe) probeURL(ctx context.Context, url string) map[string]inter
 		req.Header.Set(k, v)
 	}
 
-	resp, err := p.config.Client.Do(req)
+	resp, err := p.config.Client.Do(req) //nolint:gosec // G704: intentional outbound probe with SSRF protection
 	if err != nil {
 		slog.DebugContext(ctx, "schema probe: request failed", "url", url, "error", err)
 		return nil
 	}
 	defer func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck // best-effort drain
-		resp.Body.Close()                                    //nolint:errcheck // best-effort close on read-only response
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // best-effort drain
+		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close on read-only response
 	}()
 
 	if resp.StatusCode >= 400 {

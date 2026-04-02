@@ -123,7 +123,7 @@ func handleSOAP(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, soapFault("soap:Client", "Unknown SOAPAction: "+soapAction)) //nolint:errcheck // test server best-effort response
+		fmt.Fprint(w, soapFault("soap:Client", "Unknown SOAPAction: "+soapAction)) //nolint:errcheck,gosec // test server best-effort response
 		return
 	}
 
@@ -169,7 +169,7 @@ func handleWSDL(w http.ResponseWriter, r *http.Request) {
 
 	var wsdlData []byte
 	for _, path := range candidates {
-		data, readErr := os.ReadFile(path)
+		data, readErr := os.ReadFile(path) //nolint:gosec // G304: test server, path from known WSDL files
 		if readErr == nil {
 			wsdlData = data
 			break
@@ -182,7 +182,7 @@ func handleWSDL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-	w.Write(wsdlData) //nolint:errcheck // test server best-effort response
+	w.Write(wsdlData) //nolint:errcheck,gosec // test server best-effort response
 }
 
 func handleIndex(w http.ResponseWriter, _ *http.Request) {
@@ -202,8 +202,8 @@ func main() {
 	mux.HandleFunc("/soap", handleSOAP)
 
 	addr := ":" + port
-	log.Printf("soap-service listening on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	log.Printf("soap-service listening on %s", addr)       //nolint:gosec // test server, log injection N/A
+	if err := http.ListenAndServe(addr, mux); err != nil { //nolint:gosec // test server, timeouts not needed
 		log.Fatal(err)
 	}
 }

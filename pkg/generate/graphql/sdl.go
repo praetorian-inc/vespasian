@@ -150,7 +150,7 @@ func writeSchemaBlockFromIntrospection(sb *strings.Builder, schema *classify.Gra
 }
 
 // writeTypeDefinition emits a single SDL type definition.
-func writeTypeDefinition(sb *strings.Builder, t classify.GraphQLType) {
+func writeTypeDefinition(sb *strings.Builder, t classify.GraphQLType) { //nolint:gocyclo // SDL type serialization
 	switch t.Kind {
 	case "OBJECT":
 		if len(t.Interfaces) > 0 {

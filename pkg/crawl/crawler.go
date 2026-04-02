@@ -80,7 +80,7 @@ func NewCrawler(opts CrawlerOptions) *Crawler {
 }
 
 // Crawl crawls the target URL and returns observed requests.
-func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRequest, error) {
+func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRequest, error) { //nolint:gocyclo // top-level crawl orchestration
 	maxPages := c.opts.MaxPages
 	if maxPages <= 0 {
 		maxPages = DefaultMaxPages
@@ -202,7 +202,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		return nil, err
 	}
 	var closeOnce sync.Once
-	closeEngine := func() { closeOnce.Do(func() { engine.Close() }) } //nolint:errcheck // best-effort cleanup
+	closeEngine := func() { closeOnce.Do(func() { engine.Close() }) } //nolint:errcheck,gosec // best-effort cleanup
 	defer closeEngine()
 
 	// Run crawl in goroutine with context cancellation

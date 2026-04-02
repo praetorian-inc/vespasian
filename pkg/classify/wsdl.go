@@ -47,7 +47,7 @@ func (c *WSDLClassifier) Classify(req crawl.ObservedRequest) (bool, float64) {
 //
 // Negative signal: RSS/Atom feeds reduce confidence to 0.3 when only
 // the soap-content-type signal matched.
-func (c *WSDLClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float64, string) {
+func (c *WSDLClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float64, string) { //nolint:gocyclo // multi-signal heuristic classifier
 	parsedURL, err := url.Parse(req.URL)
 	if err != nil {
 		return false, 0, ""

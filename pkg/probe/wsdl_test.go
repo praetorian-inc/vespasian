@@ -46,7 +46,7 @@ func TestWSDLProbe_ValidWSDL(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.RawQuery == "wsdl" {
 			w.Header().Set("Content-Type", "text/xml")
-			w.Write([]byte(wsdlDoc))
+			w.Write([]byte(wsdlDoc)) //nolint:gosec // G104: test code
 		} else {
 			w.WriteHeader(http.StatusOK)
 		}
@@ -109,7 +109,7 @@ func TestWSDLProbe_NoDoubleAppendWSDL(t *testing.T) {
 		requestCount.Add(1)
 		if r.URL.RawQuery == "wsdl" {
 			w.Header().Set("Content-Type", "text/xml")
-			w.Write([]byte(`<definitions xmlns="http://schemas.xmlsoap.org/wsdl/"><portType name="PT"/></definitions>`))
+			w.Write([]byte(`<definitions xmlns="http://schemas.xmlsoap.org/wsdl/"><portType name="PT"/></definitions>`)) //nolint:gosec // G104: test code
 		} else {
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -172,7 +172,7 @@ func TestWSDLProbe_MaxEndpointsRespected(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount.Add(1)
 		w.Header().Set("Content-Type", "text/xml")
-		w.Write([]byte(`<definitions xmlns="http://schemas.xmlsoap.org/wsdl/"><portType name="PT"/></definitions>`))
+		w.Write([]byte(`<definitions xmlns="http://schemas.xmlsoap.org/wsdl/"><portType name="PT"/></definitions>`)) //nolint:gosec // G104: test code
 	}))
 	defer srv.Close()
 
@@ -205,7 +205,7 @@ func TestWSDLProbe_DeduplicatesByBaseURL(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount.Add(1)
 		w.Header().Set("Content-Type", "text/xml")
-		w.Write([]byte(`<definitions xmlns="http://schemas.xmlsoap.org/wsdl/"><portType name="PT"/></definitions>`))
+		w.Write([]byte(`<definitions xmlns="http://schemas.xmlsoap.org/wsdl/"><portType name="PT"/></definitions>`)) //nolint:gosec // G104: test code
 	}))
 	defer srv.Close()
 
@@ -250,7 +250,7 @@ func TestWSDLProbe_DeduplicatesByBaseURL(t *testing.T) {
 func TestWSDLProbe_RejectsNonWSDLXML(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/xml")
-		w.Write([]byte(`<html><body>Not a WSDL</body></html>`))
+		w.Write([]byte(`<html><body>Not a WSDL</body></html>`)) //nolint:gosec // G104: test code
 	}))
 	defer srv.Close()
 
@@ -274,7 +274,7 @@ func TestWSDLProbe_RejectsNonWSDLXML(t *testing.T) {
 func TestWSDLProbe_DoesNotMutateInput(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/xml")
-		w.Write([]byte(`<definitions xmlns="http://schemas.xmlsoap.org/wsdl/"><portType name="PT"/></definitions>`))
+		w.Write([]byte(`<definitions xmlns="http://schemas.xmlsoap.org/wsdl/"><portType name="PT"/></definitions>`)) //nolint:gosec // G104: test code
 	}))
 	defer srv.Close()
 

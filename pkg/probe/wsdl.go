@@ -110,14 +110,14 @@ func (p *WSDLProbe) fetchWSDL(ctx context.Context, baseURL string) []byte {
 		req.Header.Set(k, v)
 	}
 
-	resp, err := p.config.Client.Do(req)
+	resp, err := p.config.Client.Do(req) //nolint:gosec // G704: intentional outbound probe with SSRF protection
 	if err != nil {
 		slog.DebugContext(ctx, "wsdl probe: request failed", "url", wsdlURL, "error", err)
 		return nil
 	}
 	defer func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck // best-effort drain
-		resp.Body.Close()                                    //nolint:errcheck // best-effort close
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // best-effort drain
+		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close
 	}()
 
 	if resp.StatusCode >= 400 {
