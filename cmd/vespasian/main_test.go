@@ -1416,10 +1416,10 @@ func TestDetectAPIType(t *testing.T) {
 						"Content-Type": "text/xml",
 					},
 					// This test verifies threshold gating: a weak WSDL signal
-				// (content-type only, no SOAPAction/envelope) produces a
-				// confidence around 0.85. Setting threshold=0.90 ensures
-				// detection is rejected. If WSDLClassifier scoring changes,
-				// this test may need threshold adjustment.
+					// (content-type only, no SOAPAction/envelope) produces a
+					// confidence around 0.85. Setting threshold=0.90 ensures
+					// detection is rejected. If WSDLClassifier scoring changes,
+					// this test may need threshold adjustment.
 				},
 			},
 			threshold: 0.90,
@@ -1780,7 +1780,7 @@ func TestScanPipeline_RealisticCrawlTraffic(t *testing.T) {
 			Response: crawl.ObservedResponse{
 				StatusCode:  200,
 				ContentType: "text/xml; charset=utf-8",
-				Body: []byte(`<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><GetUserResponse xmlns="http://example.com/"><User><Name>Alice</Name></User></GetUserResponse></soap:Body></soap:Envelope>`),
+				Body:        []byte(`<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><GetUserResponse xmlns="http://example.com/"><User><Name>Alice</Name></User></GetUserResponse></soap:Body></soap:Envelope>`),
 			},
 		},
 	}

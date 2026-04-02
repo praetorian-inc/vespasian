@@ -376,39 +376,41 @@ main() {
         exit 0
     fi
 
-    # ── Port resolution ──
-    log_header "Resolving Ports"
-
-    REST_API_PORT=$(find_available_port "$DEFAULT_REST_API_PORT")
-    if [ -z "$REST_API_PORT" ]; then
-        log_fail "Cannot find available port for rest-api (tried ${DEFAULT_REST_API_PORT}-$((DEFAULT_REST_API_PORT + 20)))"
-        exit 1
-    fi
-    log_ok "rest-api: port ${REST_API_PORT}"
-
-    SOAP_SERVICE_PORT=$(find_available_port "$DEFAULT_SOAP_SERVICE_PORT")
-    if [ -z "$SOAP_SERVICE_PORT" ]; then
-        log_fail "Cannot find available port for soap-service (tried ${DEFAULT_SOAP_SERVICE_PORT}-$((DEFAULT_SOAP_SERVICE_PORT + 20)))"
-        exit 1
-    fi
-    log_ok "soap-service: port ${SOAP_SERVICE_PORT}"
-
-    GRAPHQL_SERVER_PORT=$(find_available_port "$DEFAULT_GRAPHQL_SERVER_PORT")
-    if [ -z "$GRAPHQL_SERVER_PORT" ]; then
-        log_fail "Cannot find available port for graphql-server (tried ${DEFAULT_GRAPHQL_SERVER_PORT}-$((DEFAULT_GRAPHQL_SERVER_PORT + 20)))"
-        exit 1
-    fi
-    log_ok "graphql-server: port ${GRAPHQL_SERVER_PORT}"
-
-    # ── Start services ──
+    # ── Resolve ports and start services ──
+    # Each port is resolved immediately before starting that service so the
+    # next service's port check sees the previous one as occupied.
     log_header "Starting Services"
 
     local start_failed=0
     for target in "${TARGET_ARRAY[@]}"; do
         case "$target" in
-            rest-api)        start_rest_api "$REST_API_PORT" || start_failed=1 ;;
-            soap-service)    start_soap_service "$SOAP_SERVICE_PORT" || start_failed=1 ;;
-            graphql-server)  start_graphql_server "$GRAPHQL_SERVER_PORT" || start_failed=1 ;;
+            rest-api)
+                REST_API_PORT=$(find_available_port "$DEFAULT_REST_API_PORT")
+                if [ -z "$REST_API_PORT" ]; then
+                    log_fail "Cannot find available port for rest-api (tried ${DEFAULT_REST_API_PORT}-$((DEFAULT_REST_API_PORT + 20)))"
+                    exit 1
+                fi
+                log_ok "rest-api: port ${REST_API_PORT}"
+                start_rest_api "$REST_API_PORT" || start_failed=1
+                ;;
+            soap-service)
+                SOAP_SERVICE_PORT=$(find_available_port "$DEFAULT_SOAP_SERVICE_PORT")
+                if [ -z "$SOAP_SERVICE_PORT" ]; then
+                    log_fail "Cannot find available port for soap-service (tried ${DEFAULT_SOAP_SERVICE_PORT}-$((DEFAULT_SOAP_SERVICE_PORT + 20)))"
+                    exit 1
+                fi
+                log_ok "soap-service: port ${SOAP_SERVICE_PORT}"
+                start_soap_service "$SOAP_SERVICE_PORT" || start_failed=1
+                ;;
+            graphql-server)
+                GRAPHQL_SERVER_PORT=$(find_available_port "$DEFAULT_GRAPHQL_SERVER_PORT")
+                if [ -z "$GRAPHQL_SERVER_PORT" ]; then
+                    log_fail "Cannot find available port for graphql-server (tried ${DEFAULT_GRAPHQL_SERVER_PORT}-$((DEFAULT_GRAPHQL_SERVER_PORT + 20)))"
+                    exit 1
+                fi
+                log_ok "graphql-server: port ${GRAPHQL_SERVER_PORT}"
+                start_graphql_server "$GRAPHQL_SERVER_PORT" || start_failed=1
+                ;;
         esac
     done
 
