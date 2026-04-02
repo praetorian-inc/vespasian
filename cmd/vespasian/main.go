@@ -176,7 +176,7 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl
 	opts.Stderr = stderr
 
 	if opts.Proxy != "" && !opts.Headless {
-		fmt.Fprintf(stderr, "warning: --proxy is only supported with headless browser mode; ignoring proxy setting\n")
+		fmt.Fprintf(stderr, "warning: --proxy is only supported with headless browser mode; ignoring proxy setting\n") //nolint:errcheck // best-effort warning
 		opts.Proxy = ""
 	}
 
@@ -186,7 +186,7 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl
 	// validateProxyAddr runs before reaching this point.
 	if opts.Proxy != "" {
 		if u, err := url.Parse(opts.Proxy); err == nil && u.Port() == "" {
-			fmt.Fprintf(stderr, "warning: --proxy address %q has no explicit port; most proxies require one (e.g., :8080)\n", opts.Proxy)
+			fmt.Fprintf(stderr, "warning: --proxy address %q has no explicit port; most proxies require one (e.g., :8080)\n", opts.Proxy) //nolint:errcheck // best-effort warning
 		}
 	}
 
@@ -235,7 +235,7 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl
 				if len(requests) == 1 {
 					noun = "result"
 				}
-				fmt.Fprintf(stderr, "returning %d partial %s\n", len(requests), noun)
+				fmt.Fprintf(stderr, "returning %d partial %s\n", len(requests), noun) //nolint:errcheck // best-effort status message
 			}
 			return requests, nil
 		}
@@ -307,13 +307,13 @@ func onForceExit(stderr io.Writer, cleanup func(), exitFn func(int)) {
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					fmt.Fprintf(stderr, "cleanup panicked: %v\n", r)
+					fmt.Fprintf(stderr, "cleanup panicked: %v\n", r) //nolint:errcheck // best-effort panic message
 				}
 			}()
 			cleanup()
 		}()
 	}
-	fmt.Fprintf(stderr, "forcing immediate exit\n")
+	fmt.Fprintf(stderr, "forcing immediate exit\n") //nolint:errcheck // best-effort status message
 	exitFn(1)
 }
 
@@ -448,7 +448,7 @@ func (c *ImportCmd) Run() error {
 	if err != nil {
 		return fmt.Errorf("open input file: %w", err)
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close() //nolint:errcheck // read-only file
 
 	if c.Verbose {
 		fmt.Fprintf(os.Stderr, "importing %s traffic from %s\n", imp.Name(), c.File)

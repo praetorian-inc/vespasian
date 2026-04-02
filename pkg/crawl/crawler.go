@@ -101,7 +101,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 	// that cause data races on Katana's global CustomFieldsMap.
 	if ctx.Err() != nil {
 		if c.opts.Stderr != nil {
-			fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n")
+			fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n") //nolint:errcheck // best-effort status message
 		}
 		return nil, ctx.Err()
 	}
@@ -185,7 +185,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = crawlerOpts.Close() }()
+	defer crawlerOpts.Close() //nolint:errcheck // best-effort cleanup
 
 	// Create engine based on headless mode
 	var engine interface {
@@ -202,7 +202,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		return nil, err
 	}
 	var closeOnce sync.Once
-	closeEngine := func() { closeOnce.Do(func() { _ = engine.Close() }) }
+	closeEngine := func() { closeOnce.Do(func() { engine.Close() }) } //nolint:errcheck // best-effort cleanup
 	defer closeEngine()
 
 	// Run crawl in goroutine with context cancellation
@@ -227,7 +227,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			// Signal received (SIGINT/SIGTERM or programmatic cancel).
 			// Notify the user immediately before any cleanup.
 			if c.opts.Stderr != nil {
-				fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n")
+				fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n") //nolint:errcheck // best-effort status message
 			}
 
 			// Kill Chrome immediately to stop all outbound requests.

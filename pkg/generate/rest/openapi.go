@@ -92,7 +92,7 @@ func extractServers(endpoints []classify.ClassifiedRequest) (openapi3.Servers, s
 
 	if len(servers) > 0 {
 		// Use first server's host for title
-		firstURL, _ := url.Parse(servers[0].URL)
+		firstURL, _ := url.Parse(servers[0].URL) //nolint:errcheck // nil check below handles parse failure
 		if firstURL != nil {
 			titleHost = firstURL.Host + " API"
 		}

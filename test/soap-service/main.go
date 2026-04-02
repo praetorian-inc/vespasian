@@ -106,7 +106,7 @@ func handleSOAP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		fmt.Fprint(w, soapFault("soap:Client", "Method not allowed"))
+		fmt.Fprint(w, soapFault("soap:Client", "Method not allowed")) //nolint:errcheck // test server best-effort response
 		return
 	}
 
@@ -123,7 +123,7 @@ func handleSOAP(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, soapFault("soap:Client", "Unknown SOAPAction: "+soapAction))
+		fmt.Fprint(w, soapFault("soap:Client", "Unknown SOAPAction: "+soapAction)) //nolint:errcheck // test server best-effort response
 		return
 	}
 
@@ -138,7 +138,7 @@ func handleSOAP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-	fmt.Fprint(w, response)
+	fmt.Fprint(w, response) //nolint:errcheck // test server best-effort response
 }
 
 func handleWSDL(w http.ResponseWriter, r *http.Request) {
@@ -182,28 +182,12 @@ func handleWSDL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-	_, _ = w.Write(wsdlData)
+	w.Write(wsdlData) //nolint:errcheck // test server best-effort response
 }
 
 func handleIndex(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprint(w, `<!DOCTYPE html>
-<html>
-<head><title>Vespasian Test SOAP Service</title></head>
-<body>
-<h1>Vespasian Test SOAP Service</h1>
-<ul>
-  <li><a href="/service.wsdl">Service WSDL</a></li>
-  <li>POST /soap - SOAP Endpoint (use SOAPAction header)</li>
-</ul>
-<h2>Operations</h2>
-<ul>
-  <li>GetUser (SOAPAction: urn:GetUser)</li>
-  <li>ListUsers (SOAPAction: urn:ListUsers)</li>
-  <li>CreateUser (SOAPAction: urn:CreateUser)</li>
-</ul>
-</body>
-</html>`)
+	fmt.Fprint(w, "<!DOCTYPE html>\n<html>\n<head><title>Vespasian Test SOAP Service</title></head>\n<body>\n<h1>Vespasian Test SOAP Service</h1>\n<ul>\n  <li><a href=\"/service.wsdl\">Service WSDL</a></li>\n  <li>POST /soap - SOAP Endpoint (use SOAPAction header)</li>\n</ul>\n<h2>Operations</h2>\n<ul>\n  <li>GetUser (SOAPAction: urn:GetUser)</li>\n  <li>ListUsers (SOAPAction: urn:ListUsers)</li>\n  <li>CreateUser (SOAPAction: urn:CreateUser)</li>\n</ul>\n</body>\n</html>") //nolint:errcheck // test server best-effort response
 }
 
 func main() {
