@@ -25,8 +25,9 @@ import (
 	"unicode/utf8"
 
 	"github.com/getkin/kin-openapi/openapi3"
-	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"gopkg.in/yaml.v3"
+
+	"github.com/praetorian-inc/vespasian/pkg/classify"
 )
 
 // Compile-time interface compliance check.

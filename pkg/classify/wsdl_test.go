@@ -17,8 +17,9 @@ package classify
 import (
 	"testing"
 
-	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
 func TestWSDLClassifier_Classify(t *testing.T) {

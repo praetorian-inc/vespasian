@@ -646,28 +646,6 @@ func mergeRootFieldsByName(fields []*ast.Field) []*ast.Field {
 	return result
 }
 
-// resolveFirstField walks a selection set to find the first concrete *ast.Field,
-// resolving fragment spreads and inline fragments as needed.
-func resolveFirstField(selections ast.SelectionSet, fragments ast.FragmentDefinitionList) *ast.Field {
-	for _, sel := range selections {
-		switch s := sel.(type) {
-		case *ast.Field:
-			return s
-		case *ast.FragmentSpread:
-			if frag := fragments.ForName(s.Name); frag != nil {
-				if field := resolveFirstField(frag.SelectionSet, fragments); field != nil {
-					return field
-				}
-			}
-		case *ast.InlineFragment:
-			if field := resolveFirstField(s.SelectionSet, fragments); field != nil {
-				return field
-			}
-		}
-	}
-	return nil
-}
-
 // collectSelectionFields recursively collects field names from a selection set,
 // resolving fragment spreads and inline fragments.
 func collectSelectionFields(selections ast.SelectionSet, fragments ast.FragmentDefinitionList) []string {
@@ -722,14 +700,15 @@ func collectSelectionTree(selections ast.SelectionSet, fragments ast.FragmentDef
 				// Check if this sub-field has inline fragments (union/interface pattern)
 				subFrags = collectInlineFragments(s.SelectionSet, fragments)
 				hasDirectFields = hasTopLevelFields(s.SelectionSet)
-				if len(subFrags) > 0 && !hasDirectFields {
+				switch {
+				case len(subFrags) > 0 && !hasDirectFields:
 					// Pure union/interface pattern: don't flatten into children
 					children = nil
-				} else if len(subFrags) > 0 {
+				case len(subFrags) > 0:
 					// Mixed case: only collect direct (non-typed) fields as children.
 					// Type-conditioned content stays in InlineFragments only.
 					children = collectDirectFieldNodes(s.SelectionSet, fragments)
-				} else {
+				default:
 					children = collectSelectionTree(s.SelectionSet, fragments)
 				}
 			}
@@ -1506,18 +1485,19 @@ func inferInputTypeFromASTObject(value *ast.Value, typeName string, inputTypes m
 
 	fields := make(map[string]string)
 	for _, child := range value.Children {
-		if child.Value != nil && child.Value.Kind == ast.ObjectValue {
+		switch {
+		case child.Value != nil && child.Value.Kind == ast.ObjectValue:
 			nestedTypeName := typeName + "_" + upperFirst(child.Name)
 			inferInputTypeFromASTObject(child.Value, nestedTypeName, inputTypes, varTypes...)
 			fields[child.Name] = nestedTypeName
-		} else if child.Value != nil && child.Value.Kind == ast.Variable && vt != nil {
+		case child.Value != nil && child.Value.Kind == ast.Variable && vt != nil:
 			// Resolve variable reference to its declared type
 			if t, ok := vt[child.Value.Raw]; ok {
 				fields[child.Name] = t
 			} else {
 				fields[child.Name] = inferTypeFromASTValue(child.Value)
 			}
-		} else {
+		default:
 			fields[child.Name] = inferTypeFromASTValue(child.Value)
 		}
 	}

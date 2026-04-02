@@ -95,8 +95,8 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		return nil, fmt.Errorf("invalid target URL: %q", targetURL)
 	}
 
-	// Early return if the parent context is already cancelled. This avoids
-	// initialising Katana (LevelDB, filters, output writer) only to tear
+	// Early return if the parent context is already canceled. This avoids
+	// initializing Katana (LevelDB, filters, output writer) only to tear
 	// everything down immediately, and prevents internal goroutine leaks
 	// that cause data races on Katana's global CustomFieldsMap.
 	if ctx.Err() != nil {

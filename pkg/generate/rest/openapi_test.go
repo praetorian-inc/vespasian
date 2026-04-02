@@ -20,9 +20,10 @@ import (
 	"testing"
 
 	"github.com/getkin/kin-openapi/openapi3"
+	"gopkg.in/yaml.v3"
+
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
-	"gopkg.in/yaml.v3"
 )
 
 func TestOpenAPIGenerator_Generate_Basic(t *testing.T) {

@@ -216,7 +216,7 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl
 	case r := <-ch:
 		requests, err = r.requests, r.err
 	case <-ctx.Done():
-		// Context cancelled (signal or deadline). Give Crawl() up to
+		// Context canceled (signal or deadline). Give Crawl() up to
 		// shutdownBackstop to finish its bounded internal shutdown.
 		backstop := time.NewTimer(shutdownBackstop)
 		select {
@@ -628,8 +628,8 @@ func (c *ScanCmd) Run() error {
 	}
 
 	// Create a fresh signal context for the generate phase. If a signal
-	// interrupted the crawl, bs.ctx is already cancelled — doCrawl swallowed
-	// the error and returned partial results. Using the cancelled context
+	// interrupted the crawl, bs.ctx is already canceled — doCrawl swallowed
+	// the error and returned partial results. Using the canceled context
 	// would cause generateSpec's probing to bail out immediately.
 	genCtx, genStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer genStop()

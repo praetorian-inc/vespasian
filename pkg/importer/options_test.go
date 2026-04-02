@@ -20,9 +20,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
 func TestMatchesScope(t *testing.T) {

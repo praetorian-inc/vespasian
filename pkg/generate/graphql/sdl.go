@@ -32,13 +32,6 @@ var builtinScalars = map[string]bool{
 	"ID":      true,
 }
 
-// rootTypeNames are the conventional root operation type names.
-var rootTypeNames = map[string]bool{
-	"Query":        true,
-	"Mutation":     true,
-	"Subscription": true,
-}
-
 // Generator produces GraphQL SDL specifications from classified requests.
 type Generator struct{}
 

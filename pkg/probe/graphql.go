@@ -164,7 +164,7 @@ fragment TypeRef on __Type {
 const introspectionQueryTier3 = `{"query":"{ __schema { types { name kind fields { name type { name kind ofType { name kind ofType { name kind ofType { name kind ofType { name kind ofType { name kind ofType { name kind ofType { name kind } } } } } } } } } } } }"}`
 
 // mustMarshalQuery wraps a GraphQL query string as a JSON {"query": "..."} body.
-// Panics if marshalling fails (only called with compile-time constants).
+// Panics if marshaling fails (only called with compile-time constants).
 func mustMarshalQuery(query string) string {
 	b, err := json.Marshal(map[string]string{"query": query})
 	if err != nil {
