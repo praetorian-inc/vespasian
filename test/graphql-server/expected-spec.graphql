@@ -1,0 +1,113 @@
+# Inferred from observed traffic
+
+type Query {
+  post(id: ID!): PostResponse
+  search(query: String!, type: SearchType): SearchResponse
+  serverInfo: ServerInfoResponse
+  user(id: ID!): UserResponse
+  users(limit: Int): [UsersResponse]
+}
+
+type Mutation {
+  createPost(input: CreatePostInput!): CreatePostResponse
+  createUser(input: CreateUserInput!): CreateUserResponse
+  likePost(id: ID!): LikePostResponse
+}
+
+type CreatePostResponse {
+  content: String
+  id: String
+  published: Boolean
+  tags: String
+  title: String
+}
+
+type CreateUserResponse {
+  email: String
+  id: String
+  name: String
+  role: String
+}
+
+type LikePostResponse {
+  id: String
+  likes: Int
+  title: String
+}
+
+type PostResponse {
+  author: Post_AuthorResponse
+  content: String
+  createdAt: String
+  id: String
+  likes: Int
+  published: Boolean
+  tags: String
+  title: String
+}
+
+type Post_AuthorResponse {
+  id: String
+  name: String
+}
+
+type SearchResponse {
+  posts: [Search_PostsResponse]
+  totalCount: Int
+  users: [Search_UsersResponse]
+}
+
+type Search_PostsResponse {
+  id: String
+  title: String
+}
+
+type Search_UsersResponse {
+  email: String
+  id: String
+  name: String
+}
+
+type ServerInfoResponse {
+  uptime: Float
+  version: String
+}
+
+type UserResponse {
+  email: String
+  id: String
+  name: String
+  posts: [User_PostsResponse]
+}
+
+type User_PostsResponse {
+  id: String
+  likes: Int
+  published: Boolean
+  title: String
+}
+
+type UsersResponse {
+  createdAt: String
+  email: String
+  id: String
+  name: String
+  role: String
+}
+
+input CreatePostInput {
+  authorId: String
+  content: String
+  tags: [String]
+  title: String
+}
+
+input CreateUserInput {
+  email: String
+  name: String
+  role: String
+}
+
+enum SearchType {
+  POST
+}

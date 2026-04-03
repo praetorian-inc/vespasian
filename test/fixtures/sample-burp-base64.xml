@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<items>
+  <item>
+    <url>http://localhost:8990/api/users</url>
+    <request base64="true"><![CDATA[R0VUIC9hcGkvdXNlcnMgSFRUUC8xLjENCkhvc3Q6IGxvY2FsaG9zdDo4OTkwDQpBY2NlcHQ6IGFwcGxpY2F0aW9uL2pzb24NCg0K]]></request>
+    <status>200</status>
+    <response base64="true"><![CDATA[SFRUUC8xLjEgMjAwIE9LDQpDb250ZW50LVR5cGU6IGFwcGxpY2F0aW9uL2pzb24NCg0KW3siaWQiOjEsIm5hbWUiOiJBbGljZSJ9XQ==]]></response>
+  </item>
+  <item>
+    <url>http://localhost:8990/api/products/1</url>
+    <request base64="true"><![CDATA[R0VUIC9hcGkvcHJvZHVjdHMvMSBIVFRQLzEuMQ0KSG9zdDogbG9jYWxob3N0Ojg5OTANCg0K]]></request>
+    <status>200</status>
+    <response base64="true"><![CDATA[SFRUUC8xLjEgMjAwIE9LDQpDb250ZW50LVR5cGU6IGFwcGxpY2F0aW9uL2pzb24NCg0KeyJpZCI6MSwibmFtZSI6IldpZGdldCIsInByaWNlIjo5Ljk5fQ==]]></response>
+  </item>
+</items>

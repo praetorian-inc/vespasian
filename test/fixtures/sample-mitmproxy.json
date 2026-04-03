@@ -1,0 +1,65 @@
+[
+  {
+    "request": {
+      "method": "GET",
+      "scheme": "http",
+      "host": "localhost",
+      "port": 8990,
+      "path": "/api/users",
+      "headers": [
+        ["Host", "localhost:8990"],
+        ["Accept", "application/json"]
+      ],
+      "content": null
+    },
+    "response": {
+      "status_code": 200,
+      "headers": [
+        ["Content-Type", "application/json"]
+      ],
+      "content": "W3siaWQiOjEsIm5hbWUiOiJBbGljZSJ9LHsiaWQiOjIsIm5hbWUiOiJCb2IifV0="
+    }
+  },
+  {
+    "request": {
+      "method": "POST",
+      "scheme": "http",
+      "host": "localhost",
+      "port": 8990,
+      "path": "/api/orders",
+      "headers": [
+        ["Host", "localhost:8990"],
+        ["Content-Type", "application/json"]
+      ],
+      "content": "eyJ1c2VyX2lkIjoxLCJwcm9kdWN0X2lkIjoyLCJxdWFudGl0eSI6MX0="
+    },
+    "response": {
+      "status_code": 201,
+      "headers": [
+        ["Content-Type", "application/json"]
+      ],
+      "content": "eyJpZCI6MywidXNlcl9pZCI6MSwicHJvZHVjdF9pZCI6MiwicXVhbnRpdHkiOjF9"
+    }
+  },
+  {
+    "request": {
+      "method": "GET",
+      "scheme": "http",
+      "host": "localhost",
+      "port": 8990,
+      "path": "/api/products/1",
+      "headers": [
+        ["Host", "localhost:8990"],
+        ["Accept", "application/json"]
+      ],
+      "content": null
+    },
+    "response": {
+      "status_code": 200,
+      "headers": [
+        ["Content-Type", "application/json"]
+      ],
+      "content": "eyJpZCI6MSwibmFtZSI6IldpZGdldCIsInByaWNlIjo5Ljk5fQ=="
+    }
+  }
+]

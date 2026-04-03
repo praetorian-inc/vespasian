@@ -1,0 +1,57 @@
+[
+  {
+    "method": "GET",
+    "url": "http://localhost:8990/api/categories/caf%C3%A9",
+    "headers": {
+      "Accept": "application/json",
+      "Host": "localhost:8990"
+    },
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "eyJjYXRlZ29yeSI6ImNhZsOpIiwic3RhdHVzIjoiZm91bmQifQo="
+    },
+    "source": "import:burp"
+  },
+  {
+    "method": "GET",
+    "url": "http://localhost:8990/api/search?q=%E4%B8%96%E7%95%8C",
+    "headers": {
+      "Accept": "application/json",
+      "Host": "localhost:8990"
+    },
+    "query_params": {
+      "q": "世界"
+    },
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "eyJxdWVyeSI6IuS4lueVjCIsImZpbHRlciI6IiIsInBhZ2UiOiIiLCJyZXN1bHRzIjpbXX0K"
+    },
+    "source": "import:burp"
+  },
+  {
+    "method": "POST",
+    "url": "http://localhost:8990/api/users",
+    "headers": {
+      "Content-Type": "application/json",
+      "Host": "localhost:8990"
+    },
+    "body": "eyJuYW1lIjoiSm9zw6kgR2FyY8OtYSIsImVtYWlsIjoiam9zw6lAZXhhbXBsZS5jb20ifQo=",
+    "response": {
+      "status_code": 201,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "eyJpZCI6NCwibmFtZSI6Ikpvc8OpIEdhcmPDrWEiLCJlbWFpbCI6Impvc8OpQGV4YW1wbGUuY29tIn0K"
+    },
+    "source": "import:burp"
+  }
+]

@@ -1,0 +1,35 @@
+[
+  {
+    "method": "GET",
+    "url": "http://localhost:8990/api/users",
+    "headers": {
+      "Accept": "application/json",
+      "Host": "localhost:8990"
+    },
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "W3siaWQiOjEsIm5hbWUiOiJBbGljZSJ9XQ=="
+    },
+    "source": "import:burp"
+  },
+  {
+    "method": "GET",
+    "url": "http://localhost:8990/api/products/1",
+    "headers": {
+      "Host": "localhost:8990"
+    },
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "eyJpZCI6MSwibmFtZSI6IldpZGdldCIsInByaWNlIjo5Ljk5fQ=="
+    },
+    "source": "import:burp"
+  }
+]

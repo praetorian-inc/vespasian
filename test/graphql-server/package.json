@@ -1,0 +1,9 @@
+{
+  "name": "vespasian-test-graphql",
+  "private": true,
+  "dependencies": {
+    "@apollo/server": "^4.13.0",
+    "express": "^5.2.1",
+    "graphql": "^16.13.1"
+  }
+}

@@ -1,0 +1,79 @@
+<?xml version="1.0"?>
+<items>
+  <item>
+    <url>http://localhost:8990/api/users</url>
+    <request base64="false"><![CDATA[GET /api/users HTTP/1.1
+Host: localhost:8990
+Accept: application/json
+User-Agent: BurpSuite/2024.1
+
+]]></request>
+    <status>200</status>
+    <response base64="false"><![CDATA[HTTP/1.1 200 OK
+Content-Type: application/json
+
+[{"id":1,"name":"Alice","email":"alice@example.com"},{"id":2,"name":"Bob","email":"bob@example.com"}]
+]]></response>
+  </item>
+  <item>
+    <url>http://localhost:8990/api/users/1</url>
+    <request base64="false"><![CDATA[GET /api/users/1 HTTP/1.1
+Host: localhost:8990
+Accept: application/json
+User-Agent: BurpSuite/2024.1
+
+]]></request>
+    <status>200</status>
+    <response base64="false"><![CDATA[HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"id":1,"name":"Alice","email":"alice@example.com"}
+]]></response>
+  </item>
+  <item>
+    <url>http://localhost:8990/api/products</url>
+    <request base64="false"><![CDATA[GET /api/products HTTP/1.1
+Host: localhost:8990
+Accept: application/json
+User-Agent: BurpSuite/2024.1
+
+]]></request>
+    <status>200</status>
+    <response base64="false"><![CDATA[HTTP/1.1 200 OK
+Content-Type: application/json
+
+[{"id":1,"name":"Widget","price":9.99},{"id":2,"name":"Gadget","price":24.99}]
+]]></response>
+  </item>
+  <item>
+    <url>http://localhost:8990/api/products/1</url>
+    <request base64="false"><![CDATA[GET /api/products/1 HTTP/1.1
+Host: localhost:8990
+Accept: application/json
+User-Agent: BurpSuite/2024.1
+
+]]></request>
+    <status>200</status>
+    <response base64="false"><![CDATA[HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"id":1,"name":"Widget","price":9.99}
+]]></response>
+  </item>
+  <item>
+    <url>http://localhost:8990/api/orders</url>
+    <request base64="false"><![CDATA[POST /api/orders HTTP/1.1
+Host: localhost:8990
+Content-Type: application/json
+User-Agent: BurpSuite/2024.1
+
+{"user_id":1,"product_id":2,"quantity":1}
+]]></request>
+    <status>201</status>
+    <response base64="false"><![CDATA[HTTP/1.1 201 Created
+Content-Type: application/json
+
+{"id":3,"user_id":1,"product_id":2,"quantity":1}
+]]></response>
+  </item>
+</items>

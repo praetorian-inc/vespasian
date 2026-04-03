@@ -1,0 +1,54 @@
+[
+  {
+    "method": "GET",
+    "url": "http://localhost:8990/api/users",
+    "headers": {
+      "Accept": "application/json",
+      "Host": "localhost:8990"
+    },
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "W3siaWQiOjEsIm5hbWUiOiJBbGljZSJ9LHsiaWQiOjIsIm5hbWUiOiJCb2IifV0="
+    },
+    "source": "import:mitmproxy"
+  },
+  {
+    "method": "POST",
+    "url": "http://localhost:8990/api/orders",
+    "headers": {
+      "Content-Type": "application/json",
+      "Host": "localhost:8990"
+    },
+    "body": "eyJ1c2VyX2lkIjoxLCJwcm9kdWN0X2lkIjoyLCJxdWFudGl0eSI6MX0=",
+    "response": {
+      "status_code": 201,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "eyJpZCI6MywidXNlcl9pZCI6MSwicHJvZHVjdF9pZCI6MiwicXVhbnRpdHkiOjF9"
+    },
+    "source": "import:mitmproxy"
+  },
+  {
+    "method": "GET",
+    "url": "http://localhost:8990/api/products/1",
+    "headers": {
+      "Accept": "application/json",
+      "Host": "localhost:8990"
+    },
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "eyJpZCI6MSwibmFtZSI6IldpZGdldCIsInByaWNlIjo5Ljk5fQ=="
+    },
+    "source": "import:mitmproxy"
+  }
+]

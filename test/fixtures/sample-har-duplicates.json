@@ -1,0 +1,52 @@
+{
+  "log": {
+    "version": "1.2",
+    "entries": [
+      {
+        "request": {
+          "method": "GET",
+          "url": "http://localhost:8990/api/users",
+          "headers": [
+            {"name": "Host", "value": "localhost:8990"},
+            {"name": "Accept", "value": "text/html"},
+            {"name": "Accept", "value": "application/json"},
+            {"name": "X-Custom", "value": "first"},
+            {"name": "X-Custom", "value": "second"}
+          ]
+        },
+        "response": {
+          "status": 200,
+          "headers": [
+            {"name": "Content-Type", "value": "application/json"},
+            {"name": "Set-Cookie", "value": "session=abc123"},
+            {"name": "Set-Cookie", "value": "tracking=xyz789"}
+          ],
+          "content": {
+            "text": "[{\"id\":1,\"name\":\"Alice\"}]",
+            "mimeType": "application/json"
+          }
+        }
+      },
+      {
+        "request": {
+          "method": "GET",
+          "url": "http://localhost:8990/api/products?category=electronics&sort=price&sort=name",
+          "headers": [
+            {"name": "Host", "value": "localhost:8990"},
+            {"name": "Accept", "value": "application/json"}
+          ]
+        },
+        "response": {
+          "status": 200,
+          "headers": [
+            {"name": "Content-Type", "value": "application/json"}
+          ],
+          "content": {
+            "text": "[{\"id\":1,\"name\":\"Widget\"}]",
+            "mimeType": "application/json"
+          }
+        }
+      }
+    ]
+  }
+}

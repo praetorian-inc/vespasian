@@ -1,0 +1,67 @@
+{
+  "log": {
+    "entries": [
+      {
+        "request": {
+          "method": "GET",
+          "url": "http://localhost:8990/api/users",
+          "headers": [
+            {"name": "Host", "value": "localhost:8990"}
+          ]
+        },
+        "response": {
+          "status": 200,
+          "headers": [
+            {"name": "Content-Type", "value": "application/json"}
+          ],
+          "content": {
+            "text": "[{\"id\":1}]",
+            "mimeType": "application/json"
+          }
+        }
+      },
+      {
+        "request": {
+          "method": "",
+          "url": "",
+          "headers": []
+        },
+        "response": {
+          "status": 0,
+          "headers": [],
+          "content": {}
+        }
+      },
+      {
+        "request": {
+          "method": "GET",
+          "url": "http://localhost:8990/api/products",
+          "headers": [
+            {"name": "", "value": "should-be-skipped"},
+            {"name": "Accept", "value": "application/json"}
+          ]
+        },
+        "response": {
+          "status": 200,
+          "headers": [],
+          "content": {
+            "text": "",
+            "mimeType": ""
+          }
+        }
+      },
+      {
+        "request": {
+          "method": "GET",
+          "url": "not-a-url",
+          "headers": []
+        },
+        "response": {
+          "status": 404,
+          "headers": [],
+          "content": {}
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,48 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# Build output
+bin/
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# .claude
+.claude/
+
+# Live test artifacts
+test/.live-test-config
+test/.results/
+test/.*.pid
+test/rest-api/rest-api
+test/soap-service/soap-service
+test/graphql-server/node_modules/
