@@ -25,8 +25,10 @@
 //
 // SSRF protection is built in: [ValidateProbeURL] blocks requests to private
 // and loopback addresses (RFC 1918, RFC 4193, link-local) with DNS rebinding
-// mitigation. This can be bypassed with --dangerous-allow-private for testing
-// internal targets.
+// mitigation. [SSRFSafeDialContext] provides a net.Dialer-compatible dial
+// function that re-checks resolved IPs at connect time, eliminating the
+// TOCTOU window between DNS validation and connection. This can be bypassed
+// with --dangerous-allow-private for testing internal targets.
 //
 // [RunStrategies] applies a set of strategies to classified requests and
 // returns the enriched results along with any non-fatal probe errors.

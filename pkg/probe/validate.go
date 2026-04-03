@@ -100,9 +100,14 @@ func validateProbeURL(rawURL string) error {
 	return nil
 }
 
-// ssrfSafeDialContext is a net.Dialer DialContext replacement that re-checks
+// SSRFSafeDialContext is a net.Dialer DialContext replacement that re-checks
 // resolved IPs against the SSRF blocklist at connect time, preventing TOCTOU
 // DNS rebinding attacks.
+func SSRFSafeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return ssrfSafeDialContext(ctx, network, addr)
+}
+
+// ssrfSafeDialContext is the internal implementation of SSRFSafeDialContext.
 func ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
