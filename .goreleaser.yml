@@ -4,7 +4,7 @@ builds:
   - main: ./cmd/vespasian
     binary: vespasian
     env:
-      - CGO_ENABLED=0
+      - CGO_ENABLED=1
     flags:
       - -trimpath
     ldflags:
@@ -14,10 +14,8 @@ builds:
       - -X main.buildDate={{.Date}}
     goos:
       - linux
-      - darwin
     goarch:
       - amd64
-      - arm64
 
 archives:
   - format: tar.gz
