@@ -164,7 +164,7 @@ fragment TypeRef on __Type {
 const introspectionQueryTier3 = `{"query":"{ __schema { types { name kind fields { name type { name kind ofType { name kind ofType { name kind ofType { name kind ofType { name kind ofType { name kind ofType { name kind ofType { name kind } } } } } } } } } } } }"}`
 
 // mustMarshalQuery wraps a GraphQL query string as a JSON {"query": "..."} body.
-// Panics if marshalling fails (only called with compile-time constants).
+// Panics if marshaling fails (only called with compile-time constants).
 func mustMarshalQuery(query string) string {
 	b, err := json.Marshal(map[string]string{"query": query})
 	if err != nil {
@@ -282,7 +282,7 @@ func (p *GraphQLProbe) sendIntrospection(ctx context.Context, targetURL, query s
 		req.Header.Set(k, v)
 	}
 
-	resp, err := p.config.Client.Do(req)
+	resp, err := p.config.Client.Do(req) //nolint:gosec // G704: intentional outbound probe with SSRF protection
 	if err != nil {
 		slog.DebugContext(ctx, "graphql probe: request failed", "url", targetURL, "tier", tier, "error", err)
 		return nil, nil
@@ -313,7 +313,7 @@ func (p *GraphQLProbe) sendIntrospection(ctx context.Context, targetURL, query s
 }
 
 // parseIntrospectionResponse parses a GraphQL introspection JSON response.
-func parseIntrospectionResponse(body []byte) *classify.GraphQLIntrospection {
+func parseIntrospectionResponse(body []byte) *classify.GraphQLIntrospection { //nolint:gocyclo // introspection response parsing
 	var envelope struct {
 		Data struct {
 			Schema struct {

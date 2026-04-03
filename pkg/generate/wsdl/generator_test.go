@@ -195,7 +195,7 @@ func TestParseWSDL_BasicDocument(t *testing.T) {
 		t.Error("expected 1 portType with 1 operation")
 	}
 
-	// Verify roundtrip marshalling works
+	// Verify roundtrip marshaling works
 	_, err = xml.MarshalIndent(defs, "", "  ")
 	if err != nil {
 		t.Fatalf("MarshalIndent error: %v", err)

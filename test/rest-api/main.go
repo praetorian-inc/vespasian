@@ -78,7 +78,7 @@ var (
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	json.NewEncoder(w).Encode(v) //nolint:errcheck,gosec // test server best-effort response
 }
 
 func setCORSHeaders(w http.ResponseWriter) {
@@ -363,7 +363,7 @@ func handleBinaryResponse(w http.ResponseWriter, _ *http.Request) {
 	// Minimal PNG: 8-byte header + minimal IHDR + IEND
 	data := make([]byte, 128)
 	copy(data, []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A})
-	_, _ = w.Write(data)
+	w.Write(data) //nolint:errcheck,gosec // test server best-effort response
 }
 
 // handleMixedContent returns JSON with a field containing base64 binary data.
@@ -375,7 +375,7 @@ func handleMixedContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	randomBytes := make([]byte, 64)
-	_, _ = rand.Read(randomBytes)
+	rand.Read(randomBytes) //nolint:errcheck // test server best-effort
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"id":     1,
 		"name":   "binary-test",
@@ -407,7 +407,7 @@ func handleTrailingSlash(w http.ResponseWriter, r *http.Request) {
 func handleMismatchedContentType(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "mismatched"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "mismatched"}) //nolint:errcheck,gosec // test server best-effort response
 }
 
 // handleAuthRequired returns 401 unless Authorization header is present.
@@ -427,7 +427,7 @@ func handleDeepLinks(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w)
 	level := strings.TrimPrefix(r.URL.Path, "/api/deep/")
 	var depth int
-	fmt.Sscanf(level, "%d", &depth)
+	fmt.Sscanf(level, "%d", &depth) //nolint:errcheck,gosec // test server best-effort parse
 	if depth <= 0 {
 		depth = 1
 	}
@@ -438,11 +438,7 @@ func handleDeepLinks(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprintf(w, `<html><body>
-<h1>Level %d</h1>
-<a href="/api/deep/%d">Go deeper</a>
-<a href="/api/deep/data/%d">Data at level %d</a>
-</body></html>`, depth, depth+1, depth, depth)
+	fmt.Fprintf(w, "<html><body>\n<h1>Level %d</h1>\n<a href=\"/api/deep/%d\">Go deeper</a>\n<a href=\"/api/deep/data/%d\">Data at level %d</a>\n</body></html>", depth, depth+1, depth, depth) //nolint:errcheck // test server best-effort response
 }
 
 // handleDeepData returns JSON data at a specific depth level.
@@ -458,11 +454,11 @@ func handleDeepData(w http.ResponseWriter, r *http.Request) {
 // handleManyLinks returns a page with many links to test max-pages.
 func handleManyLinks(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprint(w, "<html><body><h1>Many Links</h1><ul>")
+	fmt.Fprint(w, "<html><body><h1>Many Links</h1><ul>") //nolint:errcheck // test server best-effort response
 	for i := 1; i <= 20; i++ {
-		fmt.Fprintf(w, `<li><a href="/api/items/%d">Item %d</a></li>`, i, i)
+		fmt.Fprintf(w, `<li><a href="/api/items/%d">Item %d</a></li>`, i, i) //nolint:errcheck // test server best-effort response
 	}
-	fmt.Fprint(w, "</ul></body></html>")
+	fmt.Fprint(w, "</ul></body></html>") //nolint:errcheck // test server best-effort response
 }
 
 // handleItem returns a single item by numeric or UUID ID.
@@ -475,23 +471,13 @@ func handleItem(w http.ResponseWriter, r *http.Request) {
 // handleLoopPage returns a page that links back to itself (infinite loop test).
 func handleLoopPage(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprint(w, `<html><body>
-<h1>Loop Page</h1>
-<a href="/api/loop">Self link</a>
-<a href="/api/loop?ref=1">Self with param 1</a>
-<a href="/api/loop?ref=2">Self with param 2</a>
-<a href="/api/loop-b">Partner loop</a>
-</body></html>`)
+	fmt.Fprint(w, "<html><body>\n<h1>Loop Page</h1>\n<a href=\"/api/loop\">Self link</a>\n<a href=\"/api/loop?ref=1\">Self with param 1</a>\n<a href=\"/api/loop?ref=2\">Self with param 2</a>\n<a href=\"/api/loop-b\">Partner loop</a>\n</body></html>") //nolint:errcheck // test server best-effort response
 }
 
 // handleLoopPageB links back to handleLoopPage.
 func handleLoopPageB(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprint(w, `<html><body>
-<h1>Loop Page B</h1>
-<a href="/api/loop">Back to loop A</a>
-<a href="/api/loop-b">Self link</a>
-</body></html>`)
+	fmt.Fprint(w, "<html><body>\n<h1>Loop Page B</h1>\n<a href=\"/api/loop\">Back to loop A</a>\n<a href=\"/api/loop-b\">Self link</a>\n</body></html>") //nolint:errcheck // test server best-effort response
 }
 
 // handleGzipResponse returns gzip-compressed JSON.
@@ -504,8 +490,8 @@ func handleGzipResponse(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Encoding", "gzip")
 	gz := gzip.NewWriter(w)
-	_ = json.NewEncoder(gz).Encode(map[string]string{"compressed": "true", "data": "gzip-test-payload"})
-	_ = gz.Close()
+	json.NewEncoder(gz).Encode(map[string]string{"compressed": "true", "data": "gzip-test-payload"}) //nolint:errcheck,gosec // test server best-effort response
+	gz.Close()                                                                                       //nolint:errcheck,gosec // best-effort cleanup
 }
 
 // ── Classifier edge case endpoints ──────────────────────────
@@ -513,15 +499,7 @@ func handleGzipResponse(w http.ResponseWriter, r *http.Request) {
 // handleRSSFeed returns an RSS feed (XML that looks like SOAP but isn't).
 func handleRSSFeed(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/rss+xml")
-	fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0">
-  <channel>
-    <title>Test Feed</title>
-    <link>http://localhost:8990</link>
-    <item><title>Item 1</title><description>Test item</description></item>
-    <item><title>Item 2</title><description>Another item</description></item>
-  </channel>
-</rss>`)
+	fmt.Fprint(w, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\">\n  <channel>\n    <title>Test Feed</title>\n    <link>http://localhost:8990</link>\n    <item><title>Item 1</title><description>Test item</description></item>\n    <item><title>Item 2</title><description>Another item</description></item>\n  </channel>\n</rss>") //nolint:errcheck // test server best-effort response
 }
 
 // handleV1Resources and handleV2Resources test API version path heuristics.
@@ -552,7 +530,7 @@ func handleGraphQL(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		// GraphiQL-style HTML page
 		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprint(w, `<html><body><h1>GraphQL Endpoint</h1><p>POST a query to this endpoint.</p></body></html>`)
+		fmt.Fprint(w, `<html><body><h1>GraphQL Endpoint</h1><p>POST a query to this endpoint.</p></body></html>`) //nolint:errcheck // test server best-effort response
 		return
 	}
 	var body map[string]interface{}
@@ -575,8 +553,7 @@ func handleGraphQL(w http.ResponseWriter, r *http.Request) {
 func handleHTMLError(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusBadGateway)
-	fmt.Fprint(w, `<html><head><title>502 Bad Gateway</title></head>
-<body><h1>502 Bad Gateway</h1><p>The upstream server returned an error.</p></body></html>`)
+	fmt.Fprint(w, "<html><head><title>502 Bad Gateway</title></head>\n<body><h1>502 Bad Gateway</h1><p>The upstream server returned an error.</p></body></html>") //nolint:errcheck // test server best-effort response
 }
 
 // ── Spec generation edge case endpoints ─────────────────────
@@ -625,7 +602,7 @@ func handleEmptyOK(w http.ResponseWriter, _ *http.Request) {
 
 func handleIndex(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprint(w, `<!DOCTYPE html>
+	const indexHTML = `<!DOCTYPE html>
 <html>
 <head><title>Vespasian Test REST API</title></head>
 <body>
@@ -652,12 +629,13 @@ func handleIndex(w http.ResponseWriter, _ *http.Request) {
   <li>POST /api/orders - Create order</li>
 </ul>
 </body>
-</html>`)
+</html>`
+	fmt.Fprint(w, indexHTML) //nolint:errcheck // test server best-effort response
 }
 
 func handleEdgeCaseIndex(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprint(w, `<!DOCTYPE html>
+	const edgeCaseHTML = `<!DOCTYPE html>
 <html>
 <head><title>Edge Case Endpoints</title></head>
 <body>
@@ -709,7 +687,8 @@ func handleEdgeCaseIndex(w http.ResponseWriter, _ *http.Request) {
   <li><a href="/api/items/99">GET /api/items/99</a> - Numeric ID (2)</li>
 </ul>
 </body>
-</html>`)
+</html>`
+	fmt.Fprint(w, edgeCaseHTML) //nolint:errcheck // test server best-effort response
 }
 
 func main() {
@@ -769,8 +748,8 @@ func main() {
 	// /api/users/{id}/orders is routed via handleUserByID
 
 	addr := ":" + port
-	log.Printf("rest-api listening on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	log.Printf("rest-api listening on %s", addr)           //nolint:gosec // test server, log injection N/A
+	if err := http.ListenAndServe(addr, mux); err != nil { //nolint:gosec // test server, timeouts not needed
 		log.Fatal(err)
 	}
 }

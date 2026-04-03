@@ -541,7 +541,7 @@ func TestGenerateCmdRun_ValidCapture(t *testing.T) {
 
 	// Write capture data to a temp file.
 	capturePath := filepath.Join(t.TempDir(), "capture.json")
-	f, err := os.Create(capturePath)
+	f, err := os.Create(capturePath) //nolint:gosec // G304: test file
 	if err != nil {
 		t.Fatalf("failed to create temp capture file: %v", err)
 	}
@@ -704,7 +704,7 @@ func TestDangerousAllowPrivate_GenerateCmd(t *testing.T) {
 	}
 
 	capturePath := filepath.Join(t.TempDir(), "capture.json")
-	f, err := os.Create(capturePath)
+	f, err := os.Create(capturePath) //nolint:gosec // G304: test file
 	if err != nil {
 		t.Fatalf("failed to create temp capture file: %v", err)
 	}
@@ -876,9 +876,9 @@ func TestDangerousAllowPrivate_WarningOnlyWhenProbing(t *testing.T) {
 		AllowPrivate: true,
 	})
 
-	w.Close()
+	w.Close() //nolint:gosec // G104: test code
 	var buf bytes.Buffer
-	io.Copy(&buf, r)
+	io.Copy(&buf, r) //nolint:gosec // G104: test code
 	os.Stderr = oldStderr
 
 	if strings.Contains(buf.String(), "WARNING") {
@@ -1864,12 +1864,12 @@ func TestProbeWSDLDocument_ValidWSDL(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.RawQuery == "wsdl" {
 			w.Header().Set("Content-Type", "text/xml")
-			w.Write([]byte(validWSDL))
+			w.Write([]byte(validWSDL)) //nolint:gosec // G104: test code
 			return
 		}
 		// Base URL returns HTML (like real SOAP services)
 		w.Header().Set("Content-Type", "text/html")
-		w.Write([]byte("<html><body>Service Description</body></html>"))
+		w.Write([]byte("<html><body>Service Description</body></html>")) //nolint:gosec // G104: test code
 	}))
 	defer ts.Close()
 
@@ -1887,7 +1887,7 @@ func TestProbeWSDLDocument_ValidWSDL(t *testing.T) {
 func TestProbeWSDLDocument_NoWSDL(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
-		w.Write([]byte("<html><body>Not a SOAP service</body></html>"))
+		w.Write([]byte("<html><body>Not a SOAP service</body></html>")) //nolint:gosec // G104: test code
 	}))
 	defer ts.Close()
 
@@ -1934,11 +1934,11 @@ func TestScanPipeline_WSDLDiscoveryProbe(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.RawQuery == "wsdl" {
 			w.Header().Set("Content-Type", "text/xml")
-			w.Write([]byte(validWSDL))
+			w.Write([]byte(validWSDL)) //nolint:gosec // G104: test code
 			return
 		}
 		w.Header().Set("Content-Type", "text/html")
-		w.Write([]byte("<html><body>Service</body></html>"))
+		w.Write([]byte("<html><body>Service</body></html>")) //nolint:gosec // G104: test code
 	}))
 	defer ts.Close()
 

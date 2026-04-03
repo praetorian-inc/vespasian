@@ -137,7 +137,7 @@ func isValidHeaderName(name string) bool {
 }
 
 // isTokenChar returns true if c is a valid RFC 7230 tchar.
-func isTokenChar(c byte) bool {
+func isTokenChar(c byte) bool { //nolint:gocyclo // character-class lookup table
 	switch {
 	case c >= 'A' && c <= 'Z':
 		return true
@@ -176,7 +176,7 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl
 	opts.Stderr = stderr
 
 	if opts.Proxy != "" && !opts.Headless {
-		fmt.Fprintf(stderr, "warning: --proxy is only supported with headless browser mode; ignoring proxy setting\n")
+		fmt.Fprintf(stderr, "warning: --proxy is only supported with headless browser mode; ignoring proxy setting\n") //nolint:errcheck // best-effort warning
 		opts.Proxy = ""
 	}
 
@@ -186,7 +186,7 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl
 	// validateProxyAddr runs before reaching this point.
 	if opts.Proxy != "" {
 		if u, err := url.Parse(opts.Proxy); err == nil && u.Port() == "" {
-			fmt.Fprintf(stderr, "warning: --proxy address %q has no explicit port; most proxies require one (e.g., :8080)\n", opts.Proxy)
+			fmt.Fprintf(stderr, "warning: --proxy address %q has no explicit port; most proxies require one (e.g., :8080)\n", opts.Proxy) //nolint:errcheck // best-effort warning
 		}
 	}
 
@@ -216,7 +216,7 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl
 	case r := <-ch:
 		requests, err = r.requests, r.err
 	case <-ctx.Done():
-		// Context cancelled (signal or deadline). Give Crawl() up to
+		// Context canceled (signal or deadline). Give Crawl() up to
 		// shutdownBackstop to finish its bounded internal shutdown.
 		backstop := time.NewTimer(shutdownBackstop)
 		select {
@@ -235,7 +235,7 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl
 				if len(requests) == 1 {
 					noun = "result"
 				}
-				fmt.Fprintf(stderr, "returning %d partial %s\n", len(requests), noun)
+				fmt.Fprintf(stderr, "returning %d partial %s\n", len(requests), noun) //nolint:errcheck // best-effort status message
 			}
 			return requests, nil
 		}
@@ -250,7 +250,7 @@ func writeOutput(path string, fn func(io.Writer) error) error {
 	if path == "" {
 		return fn(os.Stdout)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600) //nolint:gosec // G304: CLI tool, user controls output path
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %w", err)
 	}
@@ -307,13 +307,13 @@ func onForceExit(stderr io.Writer, cleanup func(), exitFn func(int)) {
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					fmt.Fprintf(stderr, "cleanup panicked: %v\n", r)
+					fmt.Fprintf(stderr, "cleanup panicked: %v\n", r) //nolint:errcheck // best-effort panic message
 				}
 			}()
 			cleanup()
 		}()
 	}
-	fmt.Fprintf(stderr, "forcing immediate exit\n")
+	fmt.Fprintf(stderr, "forcing immediate exit\n") //nolint:errcheck // best-effort status message
 	exitFn(1)
 }
 
@@ -421,7 +421,7 @@ func (c *CrawlCmd) Run() error {
 		if bs.requestID != "" {
 			fmt.Fprintf(os.Stderr, "request-id: %s\n", bs.requestID)
 		}
-		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests))
+		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
 	return writeOutput(c.Output, func(w io.Writer) error {
@@ -448,7 +448,7 @@ func (c *ImportCmd) Run() error {
 	if err != nil {
 		return fmt.Errorf("open input file: %w", err)
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close() //nolint:errcheck // read-only file
 
 	if c.Verbose {
 		fmt.Fprintf(os.Stderr, "importing %s traffic from %s\n", imp.Name(), c.File)
@@ -460,7 +460,7 @@ func (c *ImportCmd) Run() error {
 	}
 
 	if c.Verbose {
-		fmt.Fprintf(os.Stderr, "imported %d requests\n", len(requests))
+		fmt.Fprintf(os.Stderr, "imported %d requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
 	return writeOutput(c.Output, func(w io.Writer) error {
@@ -518,7 +518,7 @@ func (c *GenerateCmd) Run() (err error) {
 	}
 
 	if c.Verbose {
-		fmt.Fprintf(os.Stderr, "loaded %d captured requests\n", len(requests))
+		fmt.Fprintf(os.Stderr, "loaded %d captured requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -555,7 +555,7 @@ type ScanCmd struct {
 }
 
 // Run executes the scan command (crawl + generate pipeline).
-func (c *ScanCmd) Run() error {
+func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	if err := validateURL(c.URL); err != nil {
 		return err
 	}
@@ -587,14 +587,14 @@ func (c *ScanCmd) Run() error {
 		if bs.requestID != "" {
 			fmt.Fprintf(os.Stderr, "request-id: %s\n", bs.requestID)
 		}
-		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests))
+		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
 	apiType := c.APIType
 	if apiType == apiTypeAuto {
 		apiType = detectAPIType(requests, c.Confidence)
 		if c.Verbose {
-			fmt.Fprintf(os.Stderr, "detected API type: %s\n", apiType)
+			fmt.Fprintf(os.Stderr, "detected API type: %s\n", apiType) //nolint:gosec // G705: writing to stderr, not web response
 		}
 	}
 
@@ -624,12 +624,12 @@ func (c *ScanCmd) Run() error {
 	}
 
 	if c.Verbose {
-		fmt.Fprintf(os.Stderr, "generating %s spec\n", apiTypeDisplayName(apiType))
+		fmt.Fprintf(os.Stderr, "generating %s spec\n", apiTypeDisplayName(apiType)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
 	// Create a fresh signal context for the generate phase. If a signal
-	// interrupted the crawl, bs.ctx is already cancelled — doCrawl swallowed
-	// the error and returned partial results. Using the cancelled context
+	// interrupted the crawl, bs.ctx is already canceled — doCrawl swallowed
+	// the error and returned partial results. Using the canceled context
 	// would cause generateSpec's probing to bail out immediately.
 	genCtx, genStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer genStop()
@@ -697,7 +697,7 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts ge
 	}
 
 	if opts.Verbose {
-		fmt.Fprintf(os.Stderr, "classified %d API requests (threshold=%.2f)\n", len(classified), opts.Confidence)
+		fmt.Fprintf(os.Stderr, "classified %d API requests (threshold=%.2f)\n", len(classified), opts.Confidence) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
 	if opts.AllowPrivate && opts.Probe {
@@ -842,8 +842,8 @@ func probeWSDLDocument(targetURL string, allowPrivate bool, verbose bool) []byte
 		return nil
 	}
 	defer func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck
-		resp.Body.Close()                                    //nolint:errcheck
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // best-effort drain
+		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close
 	}()
 
 	if resp.StatusCode >= 400 {

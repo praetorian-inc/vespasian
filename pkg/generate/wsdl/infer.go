@@ -199,8 +199,7 @@ func extractFirstBodyElement(body []byte) string {
 		if err != nil {
 			return ""
 		}
-		switch t := tok.(type) {
-		case xml.StartElement:
+		if t, ok := tok.(xml.StartElement); ok {
 			local := t.Name.Local
 			if strings.EqualFold(local, "body") {
 				inBody = true

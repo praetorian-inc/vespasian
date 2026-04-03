@@ -80,7 +80,7 @@ func NewCrawler(opts CrawlerOptions) *Crawler {
 }
 
 // Crawl crawls the target URL and returns observed requests.
-func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRequest, error) {
+func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRequest, error) { //nolint:gocyclo // top-level crawl orchestration
 	maxPages := c.opts.MaxPages
 	if maxPages <= 0 {
 		maxPages = DefaultMaxPages
@@ -95,13 +95,13 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		return nil, fmt.Errorf("invalid target URL: %q", targetURL)
 	}
 
-	// Early return if the parent context is already cancelled. This avoids
-	// initialising Katana (LevelDB, filters, output writer) only to tear
+	// Early return if the parent context is already canceled. This avoids
+	// initializing Katana (LevelDB, filters, output writer) only to tear
 	// everything down immediately, and prevents internal goroutine leaks
 	// that cause data races on Katana's global CustomFieldsMap.
 	if ctx.Err() != nil {
 		if c.opts.Stderr != nil {
-			fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n")
+			fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n") //nolint:errcheck // best-effort status message
 		}
 		return nil, ctx.Err()
 	}
@@ -185,7 +185,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = crawlerOpts.Close() }()
+	defer crawlerOpts.Close() //nolint:errcheck // best-effort cleanup
 
 	// Create engine based on headless mode
 	var engine interface {
@@ -202,7 +202,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		return nil, err
 	}
 	var closeOnce sync.Once
-	closeEngine := func() { closeOnce.Do(func() { _ = engine.Close() }) }
+	closeEngine := func() { closeOnce.Do(func() { engine.Close() }) } //nolint:errcheck,gosec // best-effort cleanup
 	defer closeEngine()
 
 	// Run crawl in goroutine with context cancellation
@@ -227,7 +227,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			// Signal received (SIGINT/SIGTERM or programmatic cancel).
 			// Notify the user immediately before any cleanup.
 			if c.opts.Stderr != nil {
-				fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n")
+				fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n") //nolint:errcheck // best-effort status message
 			}
 
 			// Kill Chrome immediately to stop all outbound requests.

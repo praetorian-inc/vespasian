@@ -23,8 +23,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"golang.org/x/net/html/charset"
+
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
 const (

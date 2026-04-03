@@ -32,13 +32,6 @@ var builtinScalars = map[string]bool{
 	"ID":      true,
 }
 
-// rootTypeNames are the conventional root operation type names.
-var rootTypeNames = map[string]bool{
-	"Query":        true,
-	"Mutation":     true,
-	"Subscription": true,
-}
-
 // Generator produces GraphQL SDL specifications from classified requests.
 type Generator struct{}
 
@@ -157,7 +150,7 @@ func writeSchemaBlockFromIntrospection(sb *strings.Builder, schema *classify.Gra
 }
 
 // writeTypeDefinition emits a single SDL type definition.
-func writeTypeDefinition(sb *strings.Builder, t classify.GraphQLType) {
+func writeTypeDefinition(sb *strings.Builder, t classify.GraphQLType) { //nolint:gocyclo // SDL type serialization
 	switch t.Kind {
 	case "OBJECT":
 		if len(t.Interfaces) > 0 {

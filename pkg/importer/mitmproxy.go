@@ -63,7 +63,7 @@ func (MitmproxyImporter) Name() string {
 // The decoder reads in ~4KB chunks. Note: parsed flow structs are still accumulated
 // in memory as required by the []ObservedRequest return type - the improvement
 // eliminates the raw JSON buffer, not the parsed data.
-func (i *MitmproxyImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
+func (i *MitmproxyImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) { //nolint:gocyclo // mitmproxy format parsing
 	// Limit reader to prevent resource exhaustion
 	limitedReader := newLimitedReader(r, maxImportSize)
 	bufReader := bufio.NewReader(limitedReader)
