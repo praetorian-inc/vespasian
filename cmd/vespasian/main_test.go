@@ -1996,6 +1996,63 @@ func TestScanPipeline_WSDLDiscoveryProbe(t *testing.T) {
 	}
 }
 
+// TestProbeWSDLDocument_URLConstruction verifies that probeWSDLDocument
+// constructs the ?wsdl query correctly regardless of whether the input URL
+// has no query, an existing query string, or a trailing bare "?".
+func TestProbeWSDLDocument_URLConstruction(t *testing.T) {
+	tests := []struct {
+		name      string
+		inputPath string // path+query appended to ts.URL
+		wantQuery string // expected RawQuery seen by the server
+	}{
+		{
+			name:      "plain URL",
+			inputPath: "/service",
+			wantQuery: "wsdl",
+		},
+		{
+			name:      "URL with existing query",
+			inputPath: "/service?foo=bar",
+			wantQuery: "wsdl",
+		},
+		{
+			name:      "URL with trailing question mark",
+			inputPath: "/service?",
+			wantQuery: "wsdl",
+		},
+	}
+
+	validWSDL := `<?xml version="1.0"?>
+<definitions name="Test"
+  xmlns="http://schemas.xmlsoap.org/wsdl/"
+  xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"
+  xmlns:tns="http://example.com/"
+  targetNamespace="http://example.com/">
+</definitions>`
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotQuery string
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotQuery = r.URL.RawQuery
+				if r.URL.RawQuery == "wsdl" {
+					w.Header().Set("Content-Type", "text/xml")
+					w.Write([]byte(validWSDL)) //nolint:gosec // G104: test code
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			defer ts.Close()
+
+			probeWSDLDocument(ts.URL+tt.inputPath, true, false)
+
+			if gotQuery != tt.wantQuery {
+				t.Errorf("probeWSDLDocument(%q) sent query %q, want %q", tt.inputPath, gotQuery, tt.wantQuery)
+			}
+		})
+	}
+}
+
 // TestAPITypeDisplayName verifies display name mapping for verbose output.
 func TestAPITypeDisplayName(t *testing.T) {
 	tests := []struct {
