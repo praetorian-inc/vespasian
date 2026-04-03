@@ -827,8 +827,15 @@ func probeWSDLDocument(targetURL string, allowPrivate bool, verbose bool) []byte
 		}
 	}
 
+	transport := &http.Transport{
+		DialContext: probe.SSRFSafeDialContext,
+	}
+	if allowPrivate {
+		transport = &http.Transport{}
+	}
 	client := &http.Client{
-		Timeout: 15 * time.Second,
+		Timeout:   15 * time.Second,
+		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
