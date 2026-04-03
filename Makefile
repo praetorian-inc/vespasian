@@ -26,7 +26,7 @@ vet:
 check: fmt vet lint test
 
 coverage:
-	go test -race -coverprofile=coverage.out ./...
+	go test -race -coverprofile=coverage.out $$(go list ./... | grep -v '/test/')
 	go tool cover -func=coverage.out
 
 deps:

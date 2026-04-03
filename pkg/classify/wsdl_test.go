@@ -232,6 +232,41 @@ func TestWSDLClassifier_Classify(t *testing.T) {
 	}
 }
 
+func TestWSDLClassifier_Name(t *testing.T) {
+	c := &WSDLClassifier{}
+	assert.Equal(t, "wsdl", c.Name())
+}
+
+func TestWSDLClassifier_ClassifyWrapper(t *testing.T) {
+	c := &WSDLClassifier{}
+
+	// Positive: request with SOAPAction header should be detected.
+	pos := crawl.ObservedRequest{
+		Method: "POST",
+		URL:    "https://example.com/service",
+		Headers: map[string]string{
+			"SOAPAction": `"urn:GetUser"`,
+		},
+	}
+	isAPI, confidence := c.Classify(pos)
+	assert.True(t, isAPI, "expected SOAP request to be classified as API")
+	assert.GreaterOrEqual(t, confidence, 0.95)
+
+	// Negative: plain JSON endpoint should not be detected as WSDL.
+	neg := crawl.ObservedRequest{
+		Method: "GET",
+		URL:    "https://example.com/api/users",
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "application/json",
+			Body:        []byte(`{"users":[]}`),
+		},
+	}
+	isAPI, confidence = c.Classify(neg)
+	assert.False(t, isAPI, "expected REST request to not be classified as WSDL")
+	assert.Equal(t, 0.0, confidence)
+}
+
 func TestWSDLClassifier_ImplementsDetailedClassifier(t *testing.T) {
 	var c APIClassifier = &WSDLClassifier{}
 	assert.Implements(t, (*DetailedClassifier)(nil), c)

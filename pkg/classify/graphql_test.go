@@ -342,6 +342,39 @@ func TestGraphQLClassifier_Classify(t *testing.T) {
 	}
 }
 
+func TestGraphQLClassifier_Name(t *testing.T) {
+	c := &GraphQLClassifier{}
+	assert.Equal(t, "graphql", c.Name())
+}
+
+func TestGraphQLClassifier_ClassifyWrapper(t *testing.T) {
+	c := &GraphQLClassifier{}
+
+	// Positive: POST to /graphql with GraphQL body should be detected.
+	pos := crawl.ObservedRequest{
+		Method: "POST",
+		URL:    "https://example.com/graphql",
+		Body:   []byte(`{"query":"{ users { id } }"}`),
+	}
+	isAPI, confidence := c.Classify(pos)
+	assert.True(t, isAPI, "expected GraphQL request to be classified as API")
+	assert.GreaterOrEqual(t, confidence, GraphQLFullMatchConfidence)
+
+	// Negative: plain REST JSON endpoint should not be detected.
+	neg := crawl.ObservedRequest{
+		Method: "GET",
+		URL:    "https://example.com/api/users",
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "application/json",
+			Body:        []byte(`{"users":[]}`),
+		},
+	}
+	isAPI, confidence = c.Classify(neg)
+	assert.False(t, isAPI, "expected REST request to not be classified as GraphQL")
+	assert.Equal(t, 0.0, confidence)
+}
+
 func TestGraphQLClassifier_ImplementsDetailedClassifier(t *testing.T) {
 	var c APIClassifier = &GraphQLClassifier{}
 	assert.Implements(t, (*DetailedClassifier)(nil), c)

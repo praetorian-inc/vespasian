@@ -370,6 +370,37 @@ func TestRESTClassifier_Classify(t *testing.T) {
 	}
 }
 
+func TestRESTClassifier_ClassifyWrapper(t *testing.T) {
+	c := &RESTClassifier{}
+
+	// Positive: JSON content-type response should be detected as REST API.
+	pos := crawl.ObservedRequest{
+		Method: "GET",
+		URL:    "https://example.com/data",
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "application/json",
+		},
+	}
+	isAPI, confidence := c.Classify(pos)
+	assert.True(t, isAPI, "expected JSON API response to be classified as REST")
+	assert.GreaterOrEqual(t, confidence, ContentTypeConfidence)
+
+	// Negative: HTML response should not be detected as REST API.
+	neg := crawl.ObservedRequest{
+		Method: "GET",
+		URL:    "https://example.com/page",
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "text/html",
+			Body:        []byte(`<html><body>Hello</body></html>`),
+		},
+	}
+	isAPI, confidence = c.Classify(neg)
+	assert.False(t, isAPI, "expected HTML response to not be classified as REST")
+	assert.Equal(t, 0.0, confidence)
+}
+
 func TestRESTClassifier_ImplementsDetailedClassifier(t *testing.T) {
 	var c APIClassifier = &RESTClassifier{}
 	assert.Implements(t, (*DetailedClassifier)(nil), c)
