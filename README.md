@@ -1,26 +1,12 @@
-<p align="center">
-  <a href="https://github.com/praetorian-inc/vespasian">
-    <img src="docs/images/banner.png" alt="Vespasian — API discovery and specification generation from live HTTP traffic" width="100%">
-  </a>
-</p>
-
-<p align="center">
-  <strong>Discover API endpoints from real HTTP traffic. Generate OpenAPI, GraphQL SDL, and WSDL specs automatically.</strong>
-</p>
-
-<p align="center">
-  <a href="https://github.com/praetorian-inc/vespasian/actions/workflows/ci.yml"><img src="https://github.com/praetorian-inc/vespasian/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://goreportcard.com/report/github.com/praetorian-inc/vespasian"><img src="https://goreportcard.com/badge/github.com/praetorian-inc/vespasian" alt="Go Report Card"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
-</p>
-
----
-
 # Vespasian: API Discovery and Specification Generation Tool
 
-**Vespasian discovers API endpoints by observing real HTTP traffic and generates API specification files from those observations.** It captures traffic through headless browser crawling or imports it from existing sources (Burp Suite XML exports, HAR files, and mitmproxy dumps), then classifies requests, probes discovered endpoints, and outputs specifications in the native format for each API type: OpenAPI 3.0 for REST, GraphQL SDL for GraphQL, and WSDL for SOAP services.
+[![Go Version](https://img.shields.io/badge/Go-1.24%2B-blue.svg)](https://go.dev/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![GitHub Release](https://img.shields.io/github/v/release/praetorian-inc/vespasian)](https://github.com/praetorian-inc/vespasian/releases)
 
-Built for penetration testers and security engineers who need to map the API attack surface of web applications, single-page apps, and microservices when the API documentation is not available.
+**Vespasian is an open-source API discovery tool that observes real HTTP traffic and automatically generates API specifications.** It captures traffic through headless browser crawling or imports it from existing sources (Burp Suite XML exports, HAR files, and mitmproxy dumps), then classifies requests, probes discovered endpoints, and outputs specifications in the native format for each API type: OpenAPI 3.0 for REST, GraphQL SDL for GraphQL, and WSDL for SOAP services.
+
+Built for penetration testers and security engineers who need to map the API attack surface of applications when clients don't provide API documentation.
 
 ## Why Vespasian?
 
@@ -32,21 +18,21 @@ Existing approaches to API discovery have limitations:
 - **Static analysis** cannot observe requests that are constructed dynamically at runtime
 - **Manual proxy capture** is time-consuming and produces raw traffic without structured specifications
 
-Vespasian takes a different approach: it observes actual network traffic at the wire level, then uses classification heuristics and active probing to produce structured API specifications automatically. Because this is inherently probabilistic, Vespasian discovers only the endpoints present in the captured traffic, but it reliably maps the API surface that an application actually exposes during use.
+Vespasian takes a different approach: it observes actual network traffic at the wire level, then uses classification heuristics and active probing to produce structured API specifications automatically. Unlike web crawlers that only follow HTML links, Vespasian intercepts all HTTP traffic from a headless browser — including XHR/fetch calls, WebSocket upgrades, and dynamically constructed requests that never appear in HTML source.
 
 ## Key Features
 
 | Feature | Description |
-|---------|-------------|
+|---|---|
 | **REST API Discovery** | Classifies REST endpoints via content-type, path patterns, and response structure; outputs OpenAPI 3.0 |
 | **GraphQL API Discovery** | Detects GraphQL endpoints, runs tiered introspection queries, and generates GraphQL SDL schemas |
 | **WSDL/SOAP Discovery** | Identifies SOAP services via SOAPAction headers and envelope detection; fetches and parses WSDL documents |
 | **API Type Auto-Detection** | Automatically determines API type (REST, GraphQL, WSDL) from captured traffic without manual selection |
-| **Headless Browser Crawling** | Drives a headless Chrome browser with full JavaScript execution for SPA support, powered by [Katana](https://github.com/projectdiscovery/katana) |
+| **Headless Browser Crawling** | Drives a headless Chrome browser with full JavaScript execution for SPA support, powered by Katana |
 | **Traffic Import** | Import existing captures from Burp Suite XML, HAR 1.2 files, and mitmproxy dumps |
 | **Active Probing** | OPTIONS discovery, JSON schema inference, WSDL document fetching, and GraphQL introspection |
 | **Path Normalization** | `/users/42` and `/users/87` become `/users/{id}` with known literal preservation (`/me`, `/self`) |
-| **SSRF Protection** | Blocks probing of private and loopback addresses by default. Use `--dangerous-allow-private` to test internal targets. |
+| **SSRF Protection** | Blocks probing of private and loopback addresses by default. Use `--dangerous-allow-private` to test internal targets |
 | **Proxy Support** | Route headless browser traffic through Burp Suite or other intercepting proxies |
 | **Two-Stage Pipeline** | Capture once, generate many: separate capture and generation steps for maximum flexibility |
 
@@ -54,17 +40,14 @@ Vespasian takes a different approach: it observes actual network traffic at the 
 
 Vespasian uses a two-stage pipeline that separates traffic capture from specification generation:
 
-```mermaid
-flowchart LR
-    subgraph Capture
-        A["Headless Browser Crawler<br/>JS execution, auth injection"] --> C["capture.json<br/>ObservedRequest array"]
-        B["Traffic Importers<br/>Burp Suite XML, HAR, mitmproxy"] --> C
-    end
-    subgraph Generate
-        C --> D["Classifier<br/>REST, GraphQL, WSDL"]
-        D --> E["Prober<br/>OPTIONS, schema, WSDL, introspection"]
-        E --> F["Spec Generator<br/>OpenAPI 3.0, GraphQL SDL, WSDL"]
-    end
+```
+┌─────────────┐     ┌──────────────┐     ┌────────────┐     ┌───────────┐     ┌────────────┐
+│   Crawler    │────▶│  Classifier  │────▶│   Prober   │────▶│ Generator │────▶│  API Spec  │
+│  / Importer  │     │              │     │            │     │           │     │   Output   │
+└─────────────┘     └──────────────┘     └────────────┘     └───────────┘     └────────────┘
+  Capture traffic    Separate API calls    Enrich with       Produce spec      OpenAPI 3.0
+  or import from     from static assets    active requests   from classified   GraphQL SDL
+  Burp/HAR/mitmproxy                                        traffic           WSDL
 ```
 
 **Why two stages:**
@@ -170,114 +153,19 @@ Generate an API specification with Vespasian, then pass it directly to [Hadrian]
 
 ## API Type Support
 
-Vespasian classifies and generates specifications for three API types:
-
 | API Type | Classification Signals | Output Format | Probing |
-|----------|----------------------|---------------|---------|
+|---|---|---|---|
 | **REST** | JSON/XML content-type, `/api/` `/v1/` path patterns, HTTP methods | OpenAPI 3.0 (YAML/JSON) | OPTIONS discovery, JSON schema inference |
 | **GraphQL** | `/graphql` path, query structure in POST body, `data`/`errors` response keys | GraphQL SDL | Tiered introspection queries (3 tiers for WAF bypass) |
 | **WSDL/SOAP** | SOAPAction header, SOAP envelope in body, `?wsdl` URL parameter | WSDL XML | Active `?wsdl` document fetching |
-
-### REST Classification Heuristics
-
-1. **Content-type**: responses with `application/json` or `application/xml`
-2. **Static asset exclusion**: drops `.js`, `.css`, `.png`, `.woff`, `/static/`, `/assets/`
-3. **Path heuristics**: `/api/`, `/v1/`, `/v2/`, `/v3/`, `/rest/`, `/rpc/` paths boost confidence
-4. **HTTP method**: POST/PUT/PATCH/DELETE to non-page URLs
-5. **Response structure**: JSON object or array bodies (not HTML)
-
-### GraphQL Classification Heuristics
-
-1. **Path matching**: `/graphql` path (0.70 confidence)
-2. **Query structure**: GraphQL query syntax in POST body (0.85 confidence)
-3. **Response structure**: `data`/`errors` keys in response (0.80 confidence)
-4. **Combined signals**: path + body together (0.95 confidence)
-
-### GraphQL Introspection
-
-Vespasian uses a tiered introspection strategy to handle WAF-protected GraphQL servers:
-
-- **Tier 1**: Full introspection with descriptions, deprecation, and directives
-- **Tier 2**: Minimal-complete query without descriptions, deprecation info, or directives
-- **Tier 3**: Minimal last-resort query with the smallest payload
-- **Fallback**: Traffic-based inference from observed queries and mutations when introspection is disabled
-
-## CLI Reference
-
-### `vespasian scan`
-
-Convenience command that crawls a target and generates a specification in one step.
-
-```
-vespasian scan <url> [flags]
-  --api-type         API type: auto, rest, graphql, wsdl (default: auto)
-  -H, --header       Auth headers to inject (repeatable)
-  -o, --output       Output spec file (default: stdout)
-  --depth            Max crawl depth (default: 3)
-  --max-pages        Max pages to visit (default: 100)
-  --timeout          Maximum duration for the entire scan (default: 10m)
-  --scope            same-origin or same-domain (default: same-origin)
-  --headless         Browser mode (default: true)
-  --proxy            Proxy URL for headless browser (e.g., http://127.0.0.1:8080)
-  --confidence       Min classification confidence (default: 0.5)
-  --probe            Enable active probing (default: true)
-  --deduplicate      Deduplicate endpoints before probing (default: true)
-  --dangerous-allow-private  Disable SSRF protection for private targets
-  --no-request-id    Disable auto X-Vespasian-Request-Id header
-  -v, --verbose      Show requests in real-time
-```
-
-### `vespasian crawl`
-
-Captures HTTP traffic by driving a headless browser through the target application.
-
-```
-vespasian crawl <url> [flags]
-  -H, --header       Auth headers to inject (repeatable)
-  -o, --output       Capture output file (default: stdout)
-  --depth            Max crawl depth (default: 3)
-  --max-pages        Max pages to visit (default: 100)
-  --timeout          Maximum duration for the entire crawl (default: 10m)
-  --scope            same-origin or same-domain (default: same-origin)
-  --headless         Browser mode (default: true)
-  --proxy            Proxy URL for headless browser (e.g., http://127.0.0.1:8080)
-  --no-request-id    Disable auto X-Vespasian-Request-Id header
-  -v, --verbose      Show requests in real-time
-```
-
-### `vespasian import`
-
-Converts traffic captures from external tools and formats into the Vespasian capture format.
-
-```
-vespasian import <format> <file> [flags]
-  Formats: burp, har, mitmproxy
-  -o, --output       Capture output file (default: stdout)
-  -v, --verbose      Show imported requests
-```
-
-### `vespasian generate`
-
-Produces an API specification from a capture file.
-
-```
-vespasian generate <api-type> <capture-file> [flags]
-  API types: rest, graphql, wsdl
-  -o, --output       Output file (default: stdout)
-  --confidence       Min classification confidence (default: 0.5)
-  --probe            Enable active probing (default: true)
-  --deduplicate      Deduplicate endpoints before probing (default: true)
-  --dangerous-allow-private  Disable SSRF protection for private targets
-  -v, --verbose      Show discovered endpoints
-```
 
 ## Architecture
 
 ### Pipeline Components
 
 | Component | Purpose | Supported Types |
-|-----------|---------|-----------------|
-| **Crawler** | Drives a headless browser to capture HTTP traffic, powered by [Katana](https://github.com/projectdiscovery/katana) | Protocol-agnostic |
+|---|---|---|
+| **Crawler** | Drives a headless browser to capture HTTP traffic, powered by Katana | Protocol-agnostic |
 | **Importers** | Convert Burp Suite XML, HAR, and mitmproxy traffic to capture format | All three formats |
 | **Classifier** | Separates API calls from static assets using heuristics | REST, GraphQL, WSDL |
 | **Prober** | Enriches endpoints via active requests | OPTIONS, JSON schema, WSDL fetch, GraphQL introspection |
@@ -301,11 +189,11 @@ pkg/generate/
 
 ### What types of APIs can Vespasian discover?
 
-Vespasian discovers **REST APIs** (generating OpenAPI 3.0 specs), **GraphQL APIs** (generating SDL schemas via introspection or traffic inference), and **SOAP/WSDL services** (generating WSDL documents). It automatically detects the API type from captured traffic, or you can specify it explicitly with `--api-type`.
+Vespasian discovers REST APIs (generating OpenAPI 3.0 specs), GraphQL APIs (generating SDL schemas via introspection or traffic inference), and SOAP/WSDL services (generating WSDL documents). It automatically detects the API type from captured traffic, or you can specify it explicitly with `--api-type`.
 
 ### How is Vespasian different from running a web crawler?
 
-Standard web crawlers follow HTML links and index pages. Vespasian intercepts **all HTTP traffic** from a headless browser, including XHR/fetch API calls, WebSocket upgrades, and dynamically constructed requests that don't appear in HTML. It then classifies those requests by API type and generates structured specifications, not just URL lists.
+Standard web crawlers follow HTML links and index pages. Vespasian intercepts all HTTP traffic from a headless browser, including XHR/fetch API calls, WebSocket upgrades, and dynamically constructed requests that don't appear in HTML. It then classifies those requests by API type and generates structured specifications, not just URL lists.
 
 ### Does Vespasian find undocumented APIs?
 
@@ -321,14 +209,14 @@ Yes. Vespasian uses a tiered introspection strategy. If the full introspection q
 
 ### Is it safe to run against production?
 
-Vespasian's crawl stage drives a browser and follows links, which is read-only. The probing stage sends OPTIONS requests, fetches `?wsdl` documents, and runs GraphQL introspection queries, all of which are read-only operations. However, always coordinate with the target owner and prefer staging environments during security assessments.
+Vespasian's crawl stage drives a browser and follows links, which is read-only. The probing stage sends OPTIONS requests, fetches `?wsdl` documents, and runs GraphQL introspection queries — all read-only operations. However, always coordinate with the target owner and prefer staging environments during security assessments.
 
 ## Development
 
 ### Prerequisites
 
-- [Go 1.24+](https://go.dev/dl/)
-- [golangci-lint](https://golangci-lint.run/welcome/install/)
+- Go 1.24+
+- golangci-lint
 
 ### Build and Test
 
@@ -339,9 +227,6 @@ make build       # Build the binary to bin/vespasian
 make test        # Run tests with race detection
 make lint        # Run golangci-lint (gocritic, misspell, revive)
 make check       # Run all checks (fmt, vet, lint, test)
-```
-
-```bash
 make coverage    # Generate coverage report
 make deps        # Download and tidy modules
 make clean       # Remove build artifacts
@@ -349,13 +234,7 @@ make clean       # Remove build artifacts
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/my-feature`)
-3. Commit your changes (`git commit -am 'Add my feature'`)
-4. Push to the branch (`git push origin feature/my-feature`)
-5. Open a Pull Request
-
-Please ensure all CI checks pass before requesting review.
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
@@ -363,4 +242,4 @@ This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE
 
 ## About Praetorian
 
-[Praetorian](https://www.praetorian.com/) is a cybersecurity company that helps organizations secure their most critical assets through offensive security services and the [Praetorian Guard](https://www.praetorian.com/guard) attack surface management platform.
+[Praetorian](https://www.praetorian.com) is a cybersecurity company that helps organizations secure their most critical assets through offensive security services and the [Praetorian Guard](https://www.praetorian.com/guard) attack surface management platform.
