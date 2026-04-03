@@ -812,7 +812,15 @@ func detectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
 // discovery mechanism for the scan pipeline because headless browser crawls
 // of SOAP endpoints typically capture HTML, not XML.
 func probeWSDLDocument(targetURL string, allowPrivate bool, verbose bool) []byte {
-	wsdlURL := strings.TrimRight(targetURL, "?") + "?wsdl"
+	parsedURL, err := url.Parse(targetURL)
+	if err != nil {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "wsdl discovery: invalid URL %q: %v\n", targetURL, err) //nolint:errcheck,gosec // best-effort status message
+		}
+		return nil
+	}
+	parsedURL.RawQuery = "wsdl"
+	wsdlURL := parsedURL.String()
 
 	if verbose {
 		fmt.Fprintf(os.Stderr, "wsdl discovery: probing %s\n", wsdlURL)
