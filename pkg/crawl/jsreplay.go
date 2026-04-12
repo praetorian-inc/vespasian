@@ -256,7 +256,7 @@ func resolveBaseURL(targetURL string) string {
 //     relative to the JS file URL, producing URLs like /static/js/identity/.
 //     These are identified by matching crawl results whose source is a JS file
 //     and whose URL is a single segment appended to the JS file's directory.
-func extractServicePrefixes(jsBody []byte, requests []ObservedRequest) []string {
+func extractServicePrefixes(jsBody []byte, requests []ObservedRequest) []string { //nolint:gocyclo // multi-strategy prefix discovery
 	seen := make(map[string]bool)
 	var prefixes []string
 
@@ -318,7 +318,7 @@ func extractServicePrefixes(jsBody []byte, requests []ObservedRequest) []string 
 		// Must be a reasonable service name (lowercase alpha, short).
 		valid := true
 		for _, c := range suffix {
-			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' && c != '_' {
 				valid = false
 				break
 			}
@@ -340,7 +340,7 @@ func extractServicePrefixes(jsBody []byte, requests []ObservedRequest) []string 
 //
 // Returns deduplicated path strings. Paths with discovered service prefixes
 // are expanded; already-prefixed and full-URL paths are kept as-is.
-func extractAPIPaths(jsBody []byte, requests []ObservedRequest) []string {
+func extractAPIPaths(jsBody []byte, requests []ObservedRequest) []string { //nolint:gocyclo // multi-strategy path extraction
 	prefixes := extractServicePrefixes(jsBody, requests)
 
 	seen := make(map[string]bool)
@@ -436,8 +436,15 @@ func extractAPIPaths(jsBody []byte, requests []ObservedRequest) []string {
 // concatenations that jsluice cannot resolve). By regex-extracting these paths
 // from the JS body and probing them directly with raw HTTP, we bypass both the
 // SPA catch-all routing and jsluice's static analysis limitations.
-func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSReplayConfig) []ObservedRequest {
+func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSReplayConfig) []ObservedRequest { //nolint:gocyclo // top-level JS extraction orchestration
 	cfg = cfg.withDefaults()
+
+	// logf is a no-op unless verbose mode is on; silences errcheck lint.
+	logf := func(format string, args ...interface{}) {
+		if cfg.Verbose {
+			fmt.Fprintf(cfg.Stderr, format, args...) //nolint:errcheck // debug logging to stderr
+		}
+	}
 
 	// Determine the base URL from the first request.
 	baseURL := ""
@@ -468,10 +475,10 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 			htmlJSURLs[jsURL] = true
 		}
 	}
-	if cfg.Verbose && len(htmlJSURLs) > 0 {
-		fmt.Fprintf(cfg.Stderr, "js-extract: discovered %d JS URLs from HTML <script> tags\n", len(htmlJSURLs))
+	if len(htmlJSURLs) > 0 {
+		logf("js-extract: discovered %d JS URLs from HTML <script> tags\n", len(htmlJSURLs))
 		for u := range htmlJSURLs {
-			fmt.Fprintf(cfg.Stderr, "  %s\n", u)
+			logf("  %s\n", u)
 		}
 	}
 
@@ -482,11 +489,9 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	// processJS extracts API paths from a JS body and adds them to allPaths.
 	processJS := func(jsURL string, jsBody []byte) {
 		paths := extractAPIPaths(jsBody, requests)
-		if cfg.Verbose {
-			fmt.Fprintf(cfg.Stderr, "js-extract: extracted %d API paths from %s\n", len(paths), jsURL)
-			for _, p := range paths {
-				fmt.Fprintf(cfg.Stderr, "  %s\n", p)
-			}
+		logf("js-extract: extracted %d API paths from %s\n", len(paths), jsURL)
+		for _, p := range paths {
+			logf("  %s\n", p)
 		}
 		for _, p := range paths {
 			allPaths[p] = true
@@ -498,10 +503,8 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 			continue
 		}
 		processedJSURLs[req.URL] = true
-		if cfg.Verbose {
-			fmt.Fprintf(cfg.Stderr, "js-extract: found JS file %s (ct=%q, body=%d bytes)\n",
-				req.URL, req.Response.ContentType, len(req.Response.Body))
-		}
+		logf("js-extract: found JS file %s (ct=%q, body=%d bytes)\n",
+			req.URL, req.Response.ContentType, len(req.Response.Body))
 
 		jsBody := req.Response.Body
 
@@ -510,27 +513,21 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		// MaxResponseBodySize (SPA bundles are often >1 MB and API path
 		// strings may be past the truncation point).
 		if len(jsBody) == 0 || len(jsBody) >= MaxResponseBodySize {
-			if cfg.Verbose {
-				if len(jsBody) == 0 {
-					fmt.Fprintf(cfg.Stderr, "js-extract: empty body, fetching %s\n", req.URL)
-				} else {
-					fmt.Fprintf(cfg.Stderr, "js-extract: body truncated at %d bytes, re-fetching %s\n",
-						MaxResponseBodySize, req.URL)
-				}
+			if len(jsBody) == 0 {
+				logf("js-extract: empty body, fetching %s\n", req.URL)
+			} else {
+				logf("js-extract: body truncated at %d bytes, re-fetching %s\n",
+					MaxResponseBodySize, req.URL)
 			}
 			fullBody := fetchJSBody(ctx, cfg, req.URL)
 			if fullBody != nil {
 				jsBody = fullBody
-				if cfg.Verbose {
-					fmt.Fprintf(cfg.Stderr, "js-extract: fetched %d bytes from %s\n", len(jsBody), req.URL)
-				}
+				logf("js-extract: fetched %d bytes from %s\n", len(jsBody), req.URL)
 			}
 		}
 
 		if len(jsBody) == 0 {
-			if cfg.Verbose {
-				fmt.Fprintf(cfg.Stderr, "js-extract: skipping %s (empty body after fetch attempt)\n", req.URL)
-			}
+			logf("js-extract: skipping %s (empty body after fetch attempt)\n", req.URL)
 			continue
 		}
 
@@ -544,25 +541,17 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 			continue
 		}
 		processedJSURLs[jsURL] = true
-		if cfg.Verbose {
-			fmt.Fprintf(cfg.Stderr, "js-extract: fetching HTML-discovered JS %s\n", jsURL)
-		}
+		logf("js-extract: fetching HTML-discovered JS %s\n", jsURL)
 		jsBody := fetchJSBody(ctx, cfg, jsURL)
 		if jsBody == nil {
-			if cfg.Verbose {
-				fmt.Fprintf(cfg.Stderr, "js-extract: skipping %s (fetch failed)\n", jsURL)
-			}
+			logf("js-extract: skipping %s (fetch failed)\n", jsURL)
 			continue
 		}
-		if cfg.Verbose {
-			fmt.Fprintf(cfg.Stderr, "js-extract: fetched %d bytes from %s\n", len(jsBody), jsURL)
-		}
+		logf("js-extract: fetched %d bytes from %s\n", len(jsBody), jsURL)
 		processJS(jsURL, jsBody)
 	}
 
-	if cfg.Verbose {
-		fmt.Fprintf(cfg.Stderr, "js-extract: %d unique API paths found across all JS files\n", len(allPaths))
-	}
+	logf("js-extract: %d unique API paths found across all JS files\n", len(allPaths))
 
 	if len(allPaths) == 0 {
 		return requests
@@ -626,13 +615,13 @@ func fetchJSBody(ctx context.Context, cfg JSReplayConfig, rawURL string) []byte 
 		req.Header.Set(k, v)
 	}
 
-	resp, err := cfg.Client.Do(req)
+	resp, err := cfg.Client.Do(req) //nolint:gosec // G704: intentional outbound fetch of JS file
 	if err != nil {
 		return nil
 	}
 	defer func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck
-		resp.Body.Close()                                     //nolint:errcheck
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // drain body before close
+		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close
 	}()
 
 	if resp.StatusCode >= 400 {
@@ -685,13 +674,13 @@ func probeURL(ctx context.Context, cfg JSReplayConfig, rawURL string) *ObservedR
 		req.Header.Set(k, v)
 	}
 
-	resp, err := cfg.Client.Do(req)
+	resp, err := cfg.Client.Do(req) //nolint:gosec // G704: intentional outbound probe of discovered endpoint
 	if err != nil {
 		return nil
 	}
 	defer func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck
-		resp.Body.Close()                                     //nolint:errcheck
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // drain body before close
+		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close
 	}()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxReplayBodySize))

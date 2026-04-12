@@ -274,13 +274,13 @@ func TestReplayJSExtracted(t *testing.T) {
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"name":"Test User"}`)) //nolint:errcheck
+			w.Write([]byte(`{"name":"Test User"}`)) //nolint:errcheck,gosec // test handler
 		case "/workshop/api/shop/products":
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`[{"id":1}]`)) //nolint:errcheck
+			w.Write([]byte(`[{"id":1}]`)) //nolint:errcheck,gosec // test handler
 		default:
 			w.Header().Set("Content-Type", "text/html")
-			w.Write([]byte("<html>SPA</html>")) //nolint:errcheck
+			w.Write([]byte("<html>SPA</html>")) //nolint:errcheck,gosec // test handler
 		}
 	}))
 	defer srv.Close()
@@ -344,7 +344,7 @@ func TestReplayJSExtracted(t *testing.T) {
 func TestReplayJSExtracted_FullURLs(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"ok":true}`)) //nolint:errcheck
+		w.Write([]byte(`{"ok":true}`)) //nolint:errcheck,gosec // test handler
 	}))
 	defer srv.Close()
 
@@ -390,7 +390,7 @@ func TestReplayJSExtracted_MaxEndpoints(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{}`)) //nolint:errcheck
+		w.Write([]byte(`{}`)) //nolint:errcheck,gosec // test handler
 	}))
 	defer srv.Close()
 
@@ -417,7 +417,7 @@ func TestReplayJSExtracted_MaxEndpoints(t *testing.T) {
 func TestReplayJSExtracted_ContextCancellation(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{}`)) //nolint:errcheck
+		w.Write([]byte(`{}`)) //nolint:errcheck,gosec // test handler
 	}))
 	defer srv.Close()
 
@@ -449,10 +449,10 @@ func TestReplayJSExtracted_TruncatedBody(t *testing.T) {
 		switch r.URL.Path {
 		case "/app.js":
 			w.Header().Set("Content-Type", "application/javascript")
-			w.Write(fullJS) //nolint:errcheck
+			w.Write(fullJS) //nolint:errcheck,gosec // test handler
 		case "/api/v2/hidden":
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"found":true}`)) //nolint:errcheck
+			w.Write([]byte(`{"found":true}`)) //nolint:errcheck,gosec // test handler
 		}
 	}))
 	defer srv.Close()
@@ -489,10 +489,10 @@ func TestReplayJSExtracted_EmptyBody(t *testing.T) {
 		switch r.URL.Path {
 		case "/app.js":
 			w.Header().Set("Content-Type", "application/javascript")
-			w.Write([]byte(`var endpoint = "/api/v1/users";`)) //nolint:errcheck
+			w.Write([]byte(`var endpoint = "/api/v1/users";`)) //nolint:errcheck,gosec // test handler
 		case "/api/v1/users":
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`[{"id":1}]`)) //nolint:errcheck
+			w.Write([]byte(`[{"id":1}]`)) //nolint:errcheck,gosec // test handler
 		}
 	}))
 	defer srv.Close()
@@ -556,7 +556,7 @@ func TestFetchJSBody_RejectsHTML(t *testing.T) {
 	// Simulate SPA catch-all: server returns HTML for any path.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(`<!DOCTYPE html><html><body>SPA</body></html>`)) //nolint:errcheck
+		w.Write([]byte(`<!DOCTYPE html><html><body>SPA</body></html>`)) //nolint:errcheck,gosec // test handler
 	}))
 	defer srv.Close()
 
@@ -568,7 +568,7 @@ func TestFetchJSBody_RejectsHTML(t *testing.T) {
 func TestFetchJSBody_RejectsHTMLWithoutContentType(t *testing.T) {
 	// Server returns HTML body without setting Content-Type header.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`<!DOCTYPE html><html><body>SPA</body></html>`)) //nolint:errcheck
+		w.Write([]byte(`<!DOCTYPE html><html><body>SPA</body></html>`)) //nolint:errcheck,gosec // test handler
 	}))
 	defer srv.Close()
 
@@ -586,17 +586,17 @@ func TestReplayJSExtracted_HTMLScriptDiscovery(t *testing.T) {
 		switch r.URL.Path {
 		case "/main.js":
 			w.Header().Set("Content-Type", "application/javascript")
-			w.Write([]byte(`var api = "/api/v1/products"; var other = "/rest/user/login";`)) //nolint:errcheck
+			w.Write([]byte(`var api = "/api/v1/products"; var other = "/rest/user/login";`)) //nolint:errcheck,gosec // test handler
 		case "/api/v1/products":
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"data":[]}`)) //nolint:errcheck
+			w.Write([]byte(`{"data":[]}`)) //nolint:errcheck,gosec // test handler
 		case "/rest/user/login":
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"status":"ok"}`)) //nolint:errcheck
+			w.Write([]byte(`{"status":"ok"}`)) //nolint:errcheck,gosec // test handler
 		default:
 			// SPA catch-all: return HTML for all other paths.
 			w.Header().Set("Content-Type", "text/html")
-			w.Write([]byte(`<!DOCTYPE html><html><head><script src="main.js"></script></head></html>`)) //nolint:errcheck
+			w.Write([]byte(`<!DOCTYPE html><html><head><script src="main.js"></script></head></html>`)) //nolint:errcheck,gosec // test handler
 		}
 	}))
 	defer srv.Close()
