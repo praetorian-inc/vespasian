@@ -634,6 +634,16 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	genCtx, genStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer genStop()
 
+	// Replay JS-extracted URLs with raw HTTP to bypass SPA catch-all routing.
+	// URLs extracted from JavaScript bundles are visited by the headless browser,
+	// which gets the SPA shell (index.html) instead of the API response. Re-fetching
+	// them with a direct HTTP request reaches the actual API backend.
+	requests = crawl.ReplayJSExtracted(genCtx, requests, crawl.JSReplayConfig{
+		Headers: bs.opts.Headers,
+		Verbose: c.Verbose,
+		Stderr:  os.Stderr,
+	})
+
 	spec, err := generateSpec(genCtx, requests, generateSpecOptions{
 		APIType:      apiType,
 		Confidence:   c.Confidence,
