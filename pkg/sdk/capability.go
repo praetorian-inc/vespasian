@@ -198,35 +198,7 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 		}
 	}
 
-	if resolvedAPIType == "auto" {
-		resolvedAPIType = detectAPIType(requests, p.confidence)
-	}
-
-	classifiers := classifiersForType(resolvedAPIType)
-	if classifiers == nil {
-		return fmt.Errorf("unsupported API type: %q", resolvedAPIType)
-	}
-	classified := classify.RunClassifiers(classifiers, requests, p.confidence)
-	// Deduplication is always enabled in the SDK (the CLI exposes it as a
-	// flag for debugging, but disabling it is not useful in production).
-	classified = classify.Deduplicate(classified)
-
-	if p.enableProbe {
-		cfg := probe.DefaultConfig()
-		strategies := probeStrategiesForType(resolvedAPIType, cfg)
-		enriched, probeErrs := probe.RunStrategies(crawlCtx, strategies, classified)
-		if len(enriched) == 0 && len(probeErrs) > 0 {
-			return fmt.Errorf("all probes failed: %v", probeErrs[0])
-		}
-		classified = enriched
-	}
-
-	gen, err := generate.Get(resolvedAPIType)
-	if err != nil {
-		return fmt.Errorf("get generator for %q: %w", resolvedAPIType, err)
-	}
-
-	spec, err := gen.Generate(classified)
+	spec, err := ClassifyProbeGenerate(crawlCtx, requests, resolvedAPIType, p.confidence, p.enableProbe)
 	if err != nil {
 		return fmt.Errorf("generate spec: %w", err)
 	}
@@ -240,10 +212,55 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 	})
 }
 
-// detectAPIType runs all three classifiers and returns the winning API type.
+// ClassifyProbeGenerate runs the classification, probing, and generation pipeline
+// on pre-crawled requests. This is the shared pipeline used by both the standalone
+// CLI and the Chariot platform wrapper. It handles API type auto-detection,
+// WSDL document probing, deduplication, and spec generation.
+//
+// Parameters:
+//   - ctx: context for cancellation/timeout during probing
+//   - requests: observed HTTP requests from a crawl
+//   - apiType: "rest", "wsdl", "graphql", or "auto" for auto-detection
+//   - confidence: minimum classification confidence threshold (0.0-1.0)
+//   - probeEnabled: whether to run active endpoint probing
+//
+// Returns the generated spec bytes (OpenAPI YAML, GraphQL SDL, or WSDL XML) or an error.
+func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest, apiType string, confidence float64, probeEnabled bool) ([]byte, error) {
+	resolvedAPIType := apiType
+	if resolvedAPIType == "auto" {
+		resolvedAPIType = DetectAPIType(requests, confidence)
+	}
+
+	classifiers := classifiersForType(resolvedAPIType)
+	if classifiers == nil {
+		return nil, fmt.Errorf("unsupported API type: %q", resolvedAPIType)
+	}
+
+	classified := classify.RunClassifiers(classifiers, requests, confidence)
+	classified = classify.Deduplicate(classified)
+
+	if probeEnabled {
+		cfg := probe.DefaultConfig()
+		strategies := probeStrategiesForType(resolvedAPIType, cfg)
+		enriched, probeErrs := probe.RunStrategies(ctx, strategies, classified)
+		if len(enriched) == 0 && len(probeErrs) > 0 {
+			return nil, fmt.Errorf("all probes failed: %v", probeErrs[0])
+		}
+		classified = enriched
+	}
+
+	gen, err := generate.Get(resolvedAPIType)
+	if err != nil {
+		return nil, fmt.Errorf("get generator for %q: %w", resolvedAPIType, err)
+	}
+
+	return gen.Generate(classified)
+}
+
+// DetectAPIType runs all three classifiers and returns the winning API type.
 // GraphQL wins when it has the most (or tied-most) matches. WSDL wins when it
 // has matches and is >= REST. Otherwise REST is returned.
-func detectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
+func DetectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
 	wsdlClassifier := &classify.WSDLClassifier{}
 	restClassifier := &classify.RESTClassifier{}
 	graphqlClassifier := &classify.GraphQLClassifier{}

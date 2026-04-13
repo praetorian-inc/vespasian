@@ -74,7 +74,7 @@ func restRequest() crawl.ObservedRequest {
 }
 
 func TestDetectAPIType_Empty(t *testing.T) {
-	result := detectAPIType([]crawl.ObservedRequest{}, 0.5)
+	result := DetectAPIType([]crawl.ObservedRequest{}, 0.5)
 	assert.Equal(t, "rest", result, "empty request list should default to rest")
 }
 
@@ -87,7 +87,7 @@ func TestDetectAPIType_GraphQLWins(t *testing.T) {
 		graphqlRequest(),
 		graphqlRequest(),
 	}
-	result := detectAPIType(requests, 0.5)
+	result := DetectAPIType(requests, 0.5)
 	assert.Equal(t, "graphql", result)
 }
 
@@ -101,7 +101,7 @@ func TestDetectAPIType_WSDLWins(t *testing.T) {
 		soapRequest(),
 		soapRequest(),
 	}
-	result := detectAPIType(requests, 0.5)
+	result := DetectAPIType(requests, 0.5)
 	assert.Equal(t, "wsdl", result)
 }
 
@@ -110,7 +110,7 @@ func TestDetectAPIType_RESTDefault(t *testing.T) {
 		restRequest(),
 		restRequest(),
 	}
-	result := detectAPIType(requests, 0.5)
+	result := DetectAPIType(requests, 0.5)
 	assert.Equal(t, "rest", result)
 }
 
@@ -135,7 +135,7 @@ func TestDetectAPIType_GraphQLWinsOverWSDLTie(t *testing.T) {
 	// graphqlCount(1) >= restCount(2)? No.
 	// wsdlCount(1) >= restCount(2)? No.
 	// Result: REST.
-	result := detectAPIType(requests, 0.5)
+	result := DetectAPIType(requests, 0.5)
 	assert.Equal(t, "rest", result)
 }
 
@@ -148,7 +148,7 @@ func TestDetectAPIType_WSDLTieBeatsREST(t *testing.T) {
 	requests := []crawl.ObservedRequest{
 		soapRequest(),
 	}
-	result := detectAPIType(requests, 0.5)
+	result := DetectAPIType(requests, 0.5)
 	assert.Equal(t, "wsdl", result)
 }
 
@@ -158,7 +158,7 @@ func TestDetectAPIType_HighThresholdFallsToREST(t *testing.T) {
 		graphqlRequest(), // confidence ~0.70 for path-only match
 	}
 	// Threshold above the path-only GraphQL confidence of 0.70.
-	result := detectAPIType(requests, 0.99)
+	result := DetectAPIType(requests, 0.99)
 	assert.Equal(t, "rest", result)
 }
 
