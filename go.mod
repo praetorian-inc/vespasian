@@ -6,6 +6,7 @@ require (
 	github.com/alecthomas/kong v1.14.0
 	github.com/getkin/kin-openapi v0.133.0
 	github.com/go-rod/rod v0.116.2
+	github.com/praetorian-inc/capability-sdk v0.0.0-20260407200040-0c1ef1feb1e6
 	github.com/projectdiscovery/goflags v0.1.74
 	github.com/projectdiscovery/katana v1.5.0
 	github.com/stretchr/testify v1.11.1
@@ -19,7 +20,6 @@ require (
 	github.com/Mzack9999/go-http-digest-auth-client v0.6.1-0.20220414142836-eb8883508809 // indirect
 	github.com/PuerkitoBio/goquery v1.11.0 // indirect
 	github.com/STARRY-S/zip v0.2.3 // indirect
-	github.com/agnivade/levenshtein v1.2.1 // indirect
 	github.com/akrylysov/pogreb v0.10.1 // indirect
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/andybalholm/cascadia v1.3.3 // indirect
@@ -111,7 +111,7 @@ require (
 	github.com/ulikunitz/xz v0.5.15 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasttemplate v1.2.2 // indirect
-	github.com/vektah/gqlparser/v2 v2.5.32 // indirect
+	github.com/vektah/gqlparser/v2 v2.5.32
 	github.com/vulncheck-oss/go-exploit v1.51.0 // indirect
 	github.com/weppos/publicsuffix-go v0.40.3-0.20250408071509-6074bbe7fd39 // indirect
 	github.com/woodsbury/decimal128 v1.3.0 // indirect
@@ -129,7 +129,7 @@ require (
 	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
 	golang.org/x/mod v0.32.0 // indirect
-	golang.org/x/net v0.51.0 // indirect
+	golang.org/x/net v0.51.0
 	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
