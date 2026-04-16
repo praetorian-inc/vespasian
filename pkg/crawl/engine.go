@@ -260,12 +260,43 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 		return capture.Results(), nil, nil
 	}
 
-	// Extract links from the stabilized DOM.
+	// Extract links, run jsluice, and discover forms from the stabilized page.
+	capturedResults := capture.Results()
+	results, links := enrichFromPage(page, capturedResults, target.URL)
+	return results, links, nil
+}
+
+// enrichFromPage extracts links from the DOM, runs jsluice on JS sources and
+// inline scripts, and discovers forms. It returns the enriched results and all
+// discovered links for the frontier.
+func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string) ([]ObservedRequest, []string) {
+	// Extract links from the DOM.
 	links, err := extractLinks(page)
 	if err != nil {
-		// Non-fatal: return captured network requests even if link extraction fails.
-		return capture.Results(), nil, nil //nolint:nilerr // link extraction failure is non-fatal
+		return captured, nil
 	}
 
-	return capture.Results(), links, nil
+	// Run jsluice on captured JS response bodies.
+	jsFromResponses := extractURLsFromResponses(captured)
+	if len(jsFromResponses) > 0 {
+		links = append(links, jsExtractedToLinks(jsFromResponses, pageURL)...)
+	}
+
+	// Run jsluice on inline <script> tags.
+	jsFromInline := extractURLsFromInlineScripts(page)
+	if len(jsFromInline) > 0 {
+		links = append(links, jsExtractedToLinks(jsFromInline, pageURL)...)
+	}
+
+	// Extract forms and emit synthetic ObservedRequests for POST endpoints.
+	forms, err := extractForms(page)
+	if err == nil && len(forms) > 0 {
+		formRequests := formsToObservedRequests(forms, pageURL)
+		captured = append(captured, formRequests...)
+		for _, f := range forms {
+			links = append(links, f.Action)
+		}
+	}
+
+	return captured, links
 }

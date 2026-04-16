@@ -3,6 +3,7 @@ module github.com/praetorian-inc/vespasian
 go 1.25.8
 
 require (
+	github.com/BishopFox/jsluice v0.0.0-20240110145140-0ddfab153e06
 	github.com/alecthomas/kong v1.14.0
 	github.com/getkin/kin-openapi v0.133.0
 	github.com/go-rod/rod v0.116.2
@@ -16,7 +17,6 @@ require (
 )
 
 require (
-	github.com/BishopFox/jsluice v0.0.0-20240110145140-0ddfab153e06 // indirect
 	github.com/Knetic/govaluate v3.0.0+incompatible // indirect
 	github.com/Mzack9999/gcache v0.0.0-20230410081825-519e28eab057 // indirect
 	github.com/Mzack9999/go-http-digest-auth-client v0.6.1-0.20220414142836-eb8883508809 // indirect
