@@ -121,6 +121,28 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		defer browserMgr.Close()
 	}
 
+	// Extract Cookie headers for direct injection into Chrome's cookie store.
+	// Network.setExtraHTTPHeaders (Katana's addHeadersToPage) does not reliably
+	// propagate Cookie headers across redirects and Fetch-intercepted requests
+	// in headless Chrome. Injecting via Storage.setCookies ensures cookies
+	// survive the full browser session.
+	headers := c.opts.Headers
+	var hasCookies bool
+	if c.opts.Headless && browserMgr != nil {
+		cookieValue, remaining := ExtractCookieHeader(headers)
+		if cookieValue != "" {
+			cookies, parseErr := ParseCookiesToParams(targetURL, cookieValue)
+			if parseErr != nil {
+				return nil, fmt.Errorf("parse cookie header: %w", parseErr)
+			}
+			if err := browserMgr.SetCookies(cookies); err != nil {
+				return nil, fmt.Errorf("inject cookies into browser: %w", err)
+			}
+			headers = remaining
+			hasCookies = true
+		}
+	}
+
 	// Create a cancellable context to stop Katana when MaxPages is reached.
 	crawlCtx, crawlCancel := context.WithCancel(ctx)
 	defer crawlCancel()
@@ -137,7 +159,11 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		CrawlDuration: c.opts.Timeout,
 		FieldScope:    MapScope(c.opts.Scope),
 		Headless:      c.opts.Headless,
-		CustomHeaders: ToStringSlice(c.opts.Headers),
+		CustomHeaders: ToStringSlice(headers),
+		// Disable incognito mode when cookies were injected into Chrome's
+		// default browser context. Incognito creates a fresh context with an
+		// empty cookie jar, discarding the injected cookies.
+		HeadlessNoIncognito: hasCookies,
 		Strategy:      "depth-first",
 		// BodyReadSize (10 MB) is intentionally larger than MaxResponseBodySize (1 MB).
 		// Katana needs the full body for link extraction and JS parsing to maximize
