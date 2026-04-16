@@ -147,6 +147,11 @@ func TestNormalizeURL(t *testing.T) {
 		{"preserves query", "https://example.com/page?q=1#frag", "https://example.com/page?q=1"},
 		{"empty string", "", ""},
 		{"root path", "https://example.com/", "https://example.com/"},
+		{"lowercases host", "https://Example.COM/Page", "https://example.com/Page"},
+		{"lowercases scheme", "HTTP://example.com/page", "http://example.com/page"},
+		{"removes default https port", "https://example.com:443/page", "https://example.com/page"},
+		{"removes default http port", "http://example.com:80/page", "http://example.com/page"},
+		{"preserves non-default port", "https://example.com:8443/page", "https://example.com:8443/page"},
 	}
 
 	for _, tt := range tests {

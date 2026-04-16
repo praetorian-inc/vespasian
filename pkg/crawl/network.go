@@ -95,15 +95,21 @@ func (c *pageNetworkCapture) setupListeners(page *rod.Page) func() {
 		func(e *proto.NetworkLoadingFinished) {
 			c.mu.Lock()
 			req, ok := c.pending[e.RequestID]
-			if !ok {
+			if !ok || req.complete {
+				// Not found or already finalized — skip to prevent
+				// duplicate writes from replayed CDP events (H-1 fix).
 				c.mu.Unlock()
 				return
 			}
+			// Mark complete under lock before releasing for the blocking
+			// CDP call. This ensures no other handler can finalize this
+			// request concurrently (H-1 fix).
+			req.complete = true
 			c.mu.Unlock()
 
-			// Fetch response body outside the lock — this is a CDP call that
-			// can block. The body may be unavailable (e.g., for redirects or
-			// cached responses); that's fine.
+			// Fetch response body outside the lock — this is a CDP call
+			// that can block. The body may be unavailable (e.g., for
+			// redirects or cached responses); that's fine.
 			body, err := proto.NetworkGetResponseBody{RequestID: e.RequestID}.Call(page)
 			if err == nil && body != nil {
 				var bodyBytes []byte
@@ -115,13 +121,13 @@ func (c *pageNetworkCapture) setupListeners(page *rod.Page) func() {
 				} else {
 					bodyBytes = []byte(body.Body)
 				}
+				// Truncate at collection time to bound memory usage.
+				// Without this, a hostile page generating many large XHR
+				// responses could exhaust memory (H-3 fix).
+				bodyBytes = truncateBody(bodyBytes)
+
 				c.mu.Lock()
 				req.respBody = bodyBytes
-				req.complete = true
-				c.mu.Unlock()
-			} else {
-				c.mu.Lock()
-				req.complete = true
 				c.mu.Unlock()
 			}
 		},

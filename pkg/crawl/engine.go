@@ -28,6 +28,11 @@ import (
 // DefaultConcurrency is the default number of concurrent browser tabs.
 const DefaultConcurrency = 10
 
+// MaxConcurrency is the upper bound on concurrent browser tabs. Each tab
+// consumes significant Chrome process memory (~50 MB), so unbounded values
+// could exhaust system resources.
+const MaxConcurrency = 50
+
 // DefaultStableWait is the default DOM stability wait duration.
 const DefaultStableWait = 3 * time.Second
 
@@ -57,6 +62,12 @@ type rodEngine struct {
 func newRodEngine(wsURL string, opts engineOptions) (*rodEngine, error) {
 	if opts.Concurrency <= 0 {
 		opts.Concurrency = DefaultConcurrency
+	}
+	if opts.Concurrency > MaxConcurrency {
+		if opts.Stderr != nil {
+			fmt.Fprintf(opts.Stderr, "warning: --concurrency %d exceeds maximum (%d), capping\n", opts.Concurrency, MaxConcurrency) //nolint:errcheck // best-effort
+		}
+		opts.Concurrency = MaxConcurrency
 	}
 	if opts.PageTimeout <= 0 {
 		opts.PageTimeout = time.Duration(PageTimeout) * time.Second

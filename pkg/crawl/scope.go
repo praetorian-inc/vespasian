@@ -83,7 +83,8 @@ func registeredDomain(host string) (string, error) {
 	return domain, nil
 }
 
-// normalizeURL strips the fragment and normalizes a URL for deduplication.
+// normalizeURL normalizes a URL for deduplication by lowercasing the scheme
+// and host, stripping fragments, and removing default ports.
 // It returns the empty string for unparseable URLs.
 func normalizeURL(rawURL string) string {
 	u, err := url.Parse(rawURL)
@@ -91,5 +92,15 @@ func normalizeURL(rawURL string) string {
 		return ""
 	}
 	u.Fragment = ""
+	u.Host = strings.ToLower(u.Host)
+	u.Scheme = strings.ToLower(u.Scheme)
+
+	// Remove default ports to avoid treating example.com and example.com:443 as different.
+	hostname := u.Hostname()
+	port := u.Port()
+	if (u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443") {
+		u.Host = hostname
+	}
+
 	return u.String()
 }
