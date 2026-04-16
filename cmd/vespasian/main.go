@@ -275,6 +275,7 @@ type CrawlOptions struct {
 	Scope       string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
 	Headless    bool          `default:"true" help:"Use headless browser"`
 	Proxy       string        `help:"Proxy address for headless browser (e.g., http://127.0.0.1:8080). Note: TLS certificate verification is disabled during crawls."`
+	Concurrency int           `default:"10" help:"Number of concurrent browser tabs for headless crawling"`
 	NoRequestID bool          `name:"no-request-id" help:"Disable automatic X-Vespasian-Request-Id header"`
 	Verbose     bool          `short:"v" help:"Enable verbose logging"`
 }
@@ -395,12 +396,13 @@ func (c *CrawlCmd) Run() error {
 	}
 
 	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions, crawl.CrawlerOptions{
-		Depth:    c.Depth,
-		MaxPages: c.MaxPages,
-		Timeout:  c.Timeout,
-		Scope:    c.Scope,
-		Headless: c.Headless,
-		Proxy:    c.Proxy,
+		Depth:       c.Depth,
+		MaxPages:    c.MaxPages,
+		Timeout:     c.Timeout,
+		Scope:       c.Scope,
+		Headless:    c.Headless,
+		Proxy:       c.Proxy,
+		Concurrency: c.Concurrency,
 	})
 	if err != nil {
 		return err
@@ -561,12 +563,13 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	}
 
 	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions, crawl.CrawlerOptions{
-		Depth:    c.Depth,
-		MaxPages: c.MaxPages,
-		Timeout:  c.Timeout,
-		Scope:    c.Scope,
-		Headless: c.Headless,
-		Proxy:    c.Proxy,
+		Depth:       c.Depth,
+		MaxPages:    c.MaxPages,
+		Timeout:     c.Timeout,
+		Scope:       c.Scope,
+		Headless:    c.Headless,
+		Proxy:       c.Proxy,
+		Concurrency: c.Concurrency,
 	})
 	if err != nil {
 		return err
