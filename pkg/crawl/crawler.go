@@ -164,7 +164,7 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 		// default browser context. Incognito creates a fresh context with an
 		// empty cookie jar, discarding the injected cookies.
 		HeadlessNoIncognito: hasCookies,
-		Strategy:      "depth-first",
+		Strategy:            "depth-first",
 		// BodyReadSize (10 MB) is intentionally larger than MaxResponseBodySize (1 MB).
 		// Katana needs the full body for link extraction and JS parsing to maximize
 		// crawl coverage; we only retain MaxResponseBodySize for classification.
