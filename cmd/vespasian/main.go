@@ -563,13 +563,14 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	}
 
 	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions, crawl.CrawlerOptions{
-		Depth:       c.Depth,
-		MaxPages:    c.MaxPages,
-		Timeout:     c.Timeout,
-		Scope:       c.Scope,
-		Headless:    c.Headless,
-		Proxy:       c.Proxy,
-		Concurrency: c.Concurrency,
+		Depth:        c.Depth,
+		MaxPages:     c.MaxPages,
+		Timeout:      c.Timeout,
+		Scope:        c.Scope,
+		Headless:     c.Headless,
+		Proxy:        c.Proxy,
+		Concurrency:  c.Concurrency,
+		AllowPrivate: c.DangerousAllowPrivate,
 	})
 	if err != nil {
 		return err

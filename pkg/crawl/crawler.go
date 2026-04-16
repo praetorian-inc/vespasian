@@ -50,15 +50,16 @@ const (
 
 // CrawlerOptions configures the crawler behavior.
 type CrawlerOptions struct {
-	Depth       int
-	MaxPages    int
-	Timeout     time.Duration
-	Scope       string
-	Headless    bool
-	Headers     map[string]string
-	Proxy       string    // optional: proxy address for Chrome (e.g., "http://127.0.0.1:8080")
-	Concurrency int       // headless tab concurrency; 0 uses DefaultConcurrency (10)
-	Stderr      io.Writer // user-facing status messages; nil disables output
+	Depth        int
+	MaxPages     int
+	Timeout      time.Duration
+	Scope        string
+	Headless     bool
+	Headers      map[string]string
+	Proxy        string    // optional: proxy address for Chrome (e.g., "http://127.0.0.1:8080")
+	Concurrency  int       // headless tab concurrency; 0 uses DefaultConcurrency (10)
+	AllowPrivate bool      // disable SSRF protection, allowing private/internal targets
+	Stderr       io.Writer // user-facing status messages; nil disables output
 
 	// BrowserMgr provides a caller-owned Chrome instance. When set, Crawl()
 	// connects to this browser instead of launching its own. Callers who want
@@ -132,7 +133,7 @@ func (c *Crawler) crawlHeadless(ctx context.Context, targetURL string, maxPages 
 		defer cancel()
 	}
 
-	scopeFn, err := scopeChecker(targetURL, c.opts.Scope)
+	scopeFn, err := scopeChecker(targetURL, c.opts.Scope, c.opts.AllowPrivate)
 	if err != nil {
 		return nil, fmt.Errorf("scope setup: %w", err)
 	}
