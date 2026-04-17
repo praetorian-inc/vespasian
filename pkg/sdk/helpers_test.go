@@ -468,3 +468,48 @@ func TestClassifyProbeGenerate_DeduplicateTrue(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, spec)
 }
+
+// ---------------------------------------------------------------------------
+// probeWSDLDocument
+// ---------------------------------------------------------------------------
+
+// TestProbeWSDLDocument_NilContext verifies that passing a nil context does not
+// panic. The nil-context guard at capability.go:392-394 replaces nil with
+// context.Background() before reaching http.NewRequestWithContext.
+// A loopback URL guarantees ValidateProbeURL rejects before any network call.
+func TestProbeWSDLDocument_NilContext(t *testing.T) {
+	result := probeWSDLDocument(nil, "http://127.0.0.1/service") //nolint:staticcheck // intentionally testing the nil-ctx guard
+	assert.Nil(t, result)
+}
+
+// TestProbeWSDLDocument_RejectsInvalidOrBlockedURLs verifies that malformed URLs
+// and SSRF-dangerous addresses are rejected before any HTTP round-trip.
+func TestProbeWSDLDocument_RejectsInvalidOrBlockedURLs(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{"malformed", "://bad"},
+		{"non-http-scheme", "ftp://example.com/service"},
+		{"loopback-blocked", "http://127.0.0.1/service"},
+		{"link-local-blocked", "http://169.254.169.254/service"},
+		{"rfc1918-blocked", "http://10.0.0.1/service"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := probeWSDLDocument(context.Background(), tc.url)
+			assert.Nil(t, result)
+		})
+	}
+}
+
+// TestProbeWSDLDocument_CanceledContext verifies that a pre-canceled context
+// does not panic and returns nil. A loopback URL short-circuits at
+// ValidateProbeURL so this test is hermetic (no network calls required).
+func TestProbeWSDLDocument_CanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-canceled
+
+	result := probeWSDLDocument(ctx, "http://127.0.0.1/service")
+	assert.Nil(t, result)
+}

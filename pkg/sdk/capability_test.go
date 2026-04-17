@@ -207,3 +207,24 @@ func TestCapability_Match_BadScheme(t *testing.T) {
 		})
 	}
 }
+
+// TestCapability_Invoke_RejectsInvalidScope verifies that scope validation runs
+// before any browser launch or crawl work. The scope check at capability.go:191-193
+// must fire immediately, making this test complete in well under 100 ms.
+func TestCapability_Invoke_RejectsInvalidScope(t *testing.T) {
+	c := &sdk.Capability{}
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{
+			{Name: "scope", Value: "not-a-scope"},
+			{Name: "headless", Value: "false"}, // belt-and-suspenders: avoid browser path if scope check ever moves
+		},
+	}
+	input := capmodel.WebApplication{PrimaryURL: "http://example.com"}
+
+	// A nil emitter is fine because Emit is never reached when scope is invalid.
+	err := c.Invoke(ctx, input, nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid scope")
+	assert.Contains(t, err.Error(), "not-a-scope")
+}
