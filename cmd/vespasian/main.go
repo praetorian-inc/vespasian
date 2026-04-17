@@ -275,6 +275,7 @@ type CrawlOptions struct {
 	Scope       string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
 	Headless    bool          `default:"true" help:"Use headless browser"`
 	Proxy       string        `help:"Proxy address for headless browser (e.g., http://127.0.0.1:8080). Note: TLS certificate verification is disabled during crawls."`
+	Concurrency int           `default:"10" help:"Number of concurrent browser tabs for headless crawling"`
 	NoRequestID bool          `name:"no-request-id" help:"Disable automatic X-Vespasian-Request-Id header"`
 	Verbose     bool          `short:"v" help:"Enable verbose logging"`
 }
@@ -384,7 +385,8 @@ func setupBrowserAndSignals(rawHeaders []string, crawlOpts CrawlOptions, extraOp
 
 // CrawlCmd crawls a web application to capture HTTP traffic.
 type CrawlCmd struct {
-	URL string `arg:"" help:"Target URL to crawl"`
+	URL                   string `arg:"" help:"Target URL to crawl"`
+	DangerousAllowPrivate bool   `help:"Disable SSRF protection for crawling, allowing private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 	CrawlOptions
 }
 
@@ -395,12 +397,14 @@ func (c *CrawlCmd) Run() error {
 	}
 
 	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions, crawl.CrawlerOptions{
-		Depth:    c.Depth,
-		MaxPages: c.MaxPages,
-		Timeout:  c.Timeout,
-		Scope:    c.Scope,
-		Headless: c.Headless,
-		Proxy:    c.Proxy,
+		Depth:        c.Depth,
+		MaxPages:     c.MaxPages,
+		Timeout:      c.Timeout,
+		Scope:        c.Scope,
+		Headless:     c.Headless,
+		Proxy:        c.Proxy,
+		Concurrency:  c.Concurrency,
+		AllowPrivate: c.DangerousAllowPrivate,
 	})
 	if err != nil {
 		return err
@@ -561,12 +565,14 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	}
 
 	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions, crawl.CrawlerOptions{
-		Depth:    c.Depth,
-		MaxPages: c.MaxPages,
-		Timeout:  c.Timeout,
-		Scope:    c.Scope,
-		Headless: c.Headless,
-		Proxy:    c.Proxy,
+		Depth:        c.Depth,
+		MaxPages:     c.MaxPages,
+		Timeout:      c.Timeout,
+		Scope:        c.Scope,
+		Headless:     c.Headless,
+		Proxy:        c.Proxy,
+		Concurrency:  c.Concurrency,
+		AllowPrivate: c.DangerousAllowPrivate,
 	})
 	if err != nil {
 		return err

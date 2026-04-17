@@ -12,21 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package crawl drives a headless Chrome browser via [Katana] to capture HTTP
-// traffic from web applications. It intercepts all outbound requests—including
-// XHR, fetch, and dynamically constructed calls from JavaScript—and records
-// them as [ObservedRequest] values.
+// Package crawl drives a headless Chrome browser to capture HTTP traffic from
+// web applications. It intercepts all outbound requests—including XHR, fetch,
+// and dynamically constructed calls from JavaScript—and records them as
+// [ObservedRequest] values.
+//
+// In headless mode (default), the package uses [go-rod] directly to run
+// concurrent browser tabs, overlapping DOM stability waits for significantly
+// faster crawls. In non-headless mode (--headless=false), it falls back to
+// [Katana]'s standard HTTP engine.
 //
 // The package also defines the capture file format: a JSON array of
 // ObservedRequest structs that serves as the interchange format between the
 // capture stage (crawl or import) and the generation stage.
 //
 // Key types:
-//   - [Crawler] orchestrates a headless browser crawl with configurable depth,
-//     page limits, timeouts, and scope restrictions.
+//   - [Crawler] orchestrates a browser crawl with configurable depth,
+//     page limits, timeouts, concurrency, and scope restrictions.
 //   - [BrowserManager] manages Chrome process lifecycle, including proxy
 //     configuration and graceful shutdown.
 //   - [ObservedRequest] and [ObservedResponse] represent captured HTTP traffic.
 //
+// [go-rod]: https://github.com/go-rod/rod
 // [Katana]: https://github.com/projectdiscovery/katana
 package crawl
