@@ -70,12 +70,21 @@ func ParseCookiesToParams(targetURL, cookieValue string) ([]*proto.NetworkCookie
 		}
 
 		params = append(params, &proto.NetworkCookieParam{
-			Name:   name,
-			Value:  value,
+			Name:  name,
+			Value: value,
+			// Domain is set to the exact hostname (no leading dot), producing a
+			// host-only cookie. Subdomain redirects will not carry these cookies.
+			// This is correct for LAB-2222's session-cookie scope.
 			Domain: u.Hostname(),
+			// Path is "/" regardless of the target URL's path so session cookies
+			// apply to all endpoints on the host, matching standard session-cookie
+			// behavior.
 			Path:   "/",
 			Secure: u.Scheme == "https",
-			URL:    u.Scheme + "://" + u.Host,
+			// HttpOnly is deliberately omitted so apps that read auth state via
+			// JS document.cookie continue to work. HttpOnly does not affect
+			// outbound request cookie attachment — it only restricts JS reads.
+			URL: u.Scheme + "://" + u.Host,
 		})
 	}
 

@@ -135,11 +135,13 @@ func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReques
 			if parseErr != nil {
 				return nil, fmt.Errorf("parse cookie header: %w", parseErr)
 			}
-			if err := browserMgr.SetCookies(cookies); err != nil {
-				return nil, fmt.Errorf("inject cookies into browser: %w", err)
+			if len(cookies) > 0 {
+				if err := browserMgr.SetCookies(cookies); err != nil {
+					return nil, fmt.Errorf("inject cookies into browser: %w", err)
+				}
+				headers = remaining
+				hasCookies = true
 			}
-			headers = remaining
-			hasCookies = true
 		}
 	}
 

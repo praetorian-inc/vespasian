@@ -15,6 +15,7 @@
 package crawl
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -90,7 +91,7 @@ func TestExtractCookieHeader(t *testing.T) {
 			}
 			// Verify cookie header is not in remaining
 			for k := range remaining {
-				if k == "Cookie" || k == "cookie" || k == "COOKIE" {
+				if strings.EqualFold(k, "Cookie") {
 					t.Errorf("remaining still contains cookie header %q", k)
 				}
 			}
