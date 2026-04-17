@@ -234,7 +234,10 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 	// Wire up network capture before navigation.
 	capture, waitEvents := newPageNetworkCapture(page, target.URL)
 
-	// Start the event listener in a goroutine.
+	// Start the event listener in a goroutine. The goroutine exits when
+	// the page is closed (deferred above) or the page context expires.
+	// go-rod's EachEvent internally listens on the page's CDP session,
+	// which is torn down by page.Close().
 	go waitEvents()
 
 	// Navigate to the target URL.
@@ -273,17 +276,21 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 
 	// Extract links, run jsluice, and discover forms from the stabilized page.
 	capturedResults := capture.Results()
-	results, links := enrichFromPage(page, capturedResults, target.URL)
+	results, links := enrichFromPage(page, capturedResults, target.URL, e.opts.Stderr)
 	return results, links, nil
 }
 
 // enrichFromPage extracts links from the DOM, runs jsluice on JS sources and
 // inline scripts, and discovers forms. It returns the enriched results and all
-// discovered links for the frontier.
-func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string) ([]ObservedRequest, []string) {
+// discovered links for the frontier. Errors are logged to stderr (if non-nil)
+// but are non-fatal — captured network results are always returned.
+func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, stderr io.Writer) ([]ObservedRequest, []string) {
 	// Extract links from the DOM.
 	links, err := extractLinks(page)
 	if err != nil {
+		if stderr != nil {
+			fmt.Fprintf(stderr, "link extraction failed for %s: %v\n", pageURL, err) //nolint:errcheck // best-effort
+		}
 		return captured, nil
 	}
 

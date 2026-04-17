@@ -266,7 +266,7 @@ func TestRodEngine_ScopeFiltering(t *testing.T) {
 	}))
 	defer root.Close()
 
-	scopeFn, err := scopeChecker(root.URL, "same-origin")
+	scopeFn, err := scopeChecker(root.URL, "same-origin", true)
 	if err != nil {
 		t.Fatalf("scopeChecker: %v", err)
 	}

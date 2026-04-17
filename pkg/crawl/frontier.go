@@ -104,6 +104,14 @@ func (f *urlFrontier) Pop() (urlEntry, bool) {
 		if len(f.queue) > 0 {
 			entry := f.queue[0]
 			f.queue = f.queue[1:]
+			// Compact the backing array when it's 4x larger than needed.
+			// Without this, consumed slots hold stale entries that can't
+			// be GC'd — a memory concern on large crawls.
+			if cap(f.queue) > 4*len(f.queue) && len(f.queue) > 0 {
+				compact := make([]urlEntry, len(f.queue))
+				copy(compact, f.queue)
+				f.queue = compact
+			}
 			return entry, true
 		}
 

@@ -385,7 +385,8 @@ func setupBrowserAndSignals(rawHeaders []string, crawlOpts CrawlOptions, extraOp
 
 // CrawlCmd crawls a web application to capture HTTP traffic.
 type CrawlCmd struct {
-	URL string `arg:"" help:"Target URL to crawl"`
+	URL                   string `arg:"" help:"Target URL to crawl"`
+	DangerousAllowPrivate bool   `help:"Disable SSRF protection for crawling, allowing private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 	CrawlOptions
 }
 
@@ -396,13 +397,14 @@ func (c *CrawlCmd) Run() error {
 	}
 
 	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions, crawl.CrawlerOptions{
-		Depth:       c.Depth,
-		MaxPages:    c.MaxPages,
-		Timeout:     c.Timeout,
-		Scope:       c.Scope,
-		Headless:    c.Headless,
-		Proxy:       c.Proxy,
-		Concurrency: c.Concurrency,
+		Depth:        c.Depth,
+		MaxPages:     c.MaxPages,
+		Timeout:      c.Timeout,
+		Scope:        c.Scope,
+		Headless:     c.Headless,
+		Proxy:        c.Proxy,
+		Concurrency:  c.Concurrency,
+		AllowPrivate: c.DangerousAllowPrivate,
 	})
 	if err != nil {
 		return err

@@ -101,10 +101,10 @@ func formsToObservedRequests(forms []discoveredForm, pageURL string) []ObservedR
 			URL:     f.Action,
 			Source:  "form",
 			PageURL: pageURL,
-			Headers: map[string]string{},
 		}
 
 		if f.Method == "POST" {
+			obs.Headers = map[string]string{}
 			// Encode fields as URL-encoded form body.
 			formData := url.Values{}
 			for k, v := range f.Fields {

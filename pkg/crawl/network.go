@@ -78,7 +78,7 @@ func (c *pageNetworkCapture) setupListeners(page *rod.Page) func() {
 				method:  e.Request.Method,
 				url:     e.Request.URL,
 				headers: flattenNetworkHeaders(e.Request.Headers),
-				body:    e.Request.PostData,
+				body:    string(truncateBody([]byte(e.Request.PostData))),
 			}
 		},
 		func(e *proto.NetworkResponseReceived) {
@@ -148,20 +148,22 @@ func (c *pageNetworkCapture) Results() []ObservedRequest {
 }
 
 // mapNetworkToObservedRequest converts a captured network exchange to an
-// ObservedRequest, applying body truncation and extracting query parameters.
+// ObservedRequest and extracts query parameters. Body truncation is applied
+// at collection time (NetworkRequestWillBeSent for request bodies,
+// NetworkLoadingFinished for response bodies), not here.
 func mapNetworkToObservedRequest(req *pendingRequest, pageURL string) ObservedRequest {
 	obs := ObservedRequest{
 		Method:  req.method,
 		URL:     req.url,
 		Headers: req.headers,
-		Body:    truncateBody([]byte(req.body)),
+		Body:    []byte(req.body),
 		Source:  "browser",
 		PageURL: pageURL,
 		Response: ObservedResponse{
 			StatusCode:  req.statusCode,
 			Headers:     req.respHeaders,
 			ContentType: req.contentType,
-			Body:        truncateBody(req.respBody),
+			Body:        req.respBody,
 		},
 	}
 

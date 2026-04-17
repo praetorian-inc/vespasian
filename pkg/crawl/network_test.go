@@ -80,24 +80,40 @@ func TestMapNetworkToObservedRequest_EmptyMethod(t *testing.T) {
 	}
 }
 
-func TestMapNetworkToObservedRequest_BodyTruncation(t *testing.T) {
-	largeBody := strings.Repeat("x", MaxResponseBodySize+100)
+func TestMapNetworkToObservedRequest_BodyPassthrough(t *testing.T) {
+	// Bodies are truncated at collection time (in the CDP event handlers),
+	// not in mapNetworkToObservedRequest. Verify the mapping passes
+	// pre-truncated bodies through unchanged.
+	truncatedBody := strings.Repeat("x", MaxResponseBodySize)
 
 	req := &pendingRequest{
 		method:   "GET",
 		url:      "https://example.com/large",
-		respBody: []byte(largeBody),
-		body:     largeBody,
+		respBody: []byte(truncatedBody),
+		body:     truncatedBody,
 		complete: true,
 	}
 
 	obs := mapNetworkToObservedRequest(req, "https://example.com/")
 
 	if len(obs.Response.Body) != MaxResponseBodySize {
-		t.Errorf("Response.Body len = %d, want %d (truncated)", len(obs.Response.Body), MaxResponseBodySize)
+		t.Errorf("Response.Body len = %d, want %d", len(obs.Response.Body), MaxResponseBodySize)
 	}
 	if len(obs.Body) != MaxResponseBodySize {
-		t.Errorf("Body len = %d, want %d (truncated)", len(obs.Body), MaxResponseBodySize)
+		t.Errorf("Body len = %d, want %d", len(obs.Body), MaxResponseBodySize)
+	}
+}
+
+func TestTruncateBody_AtCollectionTime(t *testing.T) {
+	// Verify truncateBody works correctly — this is called in the CDP
+	// event handlers to bound memory at collection time.
+	large := make([]byte, MaxResponseBodySize+500)
+	for i := range large {
+		large[i] = 'x'
+	}
+	got := truncateBody(large)
+	if len(got) != MaxResponseBodySize {
+		t.Errorf("truncateBody(large) len = %d, want %d", len(got), MaxResponseBodySize)
 	}
 }
 
