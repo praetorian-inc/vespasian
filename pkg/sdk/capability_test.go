@@ -41,7 +41,7 @@ func TestCapability_Parameters(t *testing.T) {
 	c := &sdk.Capability{}
 	params := c.Parameters()
 
-	require.Len(t, params, 7)
+	require.Len(t, params, 11)
 
 	byName := make(map[string]capability.Parameter, len(params))
 	for _, p := range params {
@@ -93,6 +93,35 @@ func TestCapability_Parameters(t *testing.T) {
 
 	t.Run("probe", func(t *testing.T) {
 		p, ok := byName["probe"]
+		require.True(t, ok)
+		assert.Equal(t, "bool", p.Type)
+		assert.Equal(t, "true", p.Default)
+	})
+
+	t.Run("scope", func(t *testing.T) {
+		p, ok := byName["scope"]
+		require.True(t, ok)
+		assert.Equal(t, "string", p.Type)
+		assert.Equal(t, "same-origin", p.Default)
+		assert.ElementsMatch(t, []string{"same-origin", "same-domain"}, p.Options)
+	})
+
+	t.Run("headers", func(t *testing.T) {
+		p, ok := byName["headers"]
+		require.True(t, ok)
+		assert.Equal(t, "string", p.Type)
+		assert.Equal(t, "", p.Default)
+	})
+
+	t.Run("proxy", func(t *testing.T) {
+		p, ok := byName["proxy"]
+		require.True(t, ok)
+		assert.Equal(t, "string", p.Type)
+		assert.Equal(t, "", p.Default)
+	})
+
+	t.Run("deduplicate", func(t *testing.T) {
+		p, ok := byName["deduplicate"]
 		require.True(t, ok)
 		assert.Equal(t, "bool", p.Type)
 		assert.Equal(t, "true", p.Default)

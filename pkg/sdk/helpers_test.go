@@ -17,6 +17,7 @@
 package sdk
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -250,6 +251,10 @@ func TestResolveParams_Defaults(t *testing.T) {
 	assert.InDelta(t, 0.5, p.confidence, 0.001)
 	assert.True(t, p.headless)
 	assert.True(t, p.enableProbe)
+	assert.Equal(t, "same-origin", p.scope)
+	assert.Nil(t, p.headers)
+	assert.Equal(t, "", p.proxy)
+	assert.True(t, p.deduplicate)
 }
 
 func TestResolveParams_AllOverridden(t *testing.T) {
@@ -262,6 +267,10 @@ func TestResolveParams_AllOverridden(t *testing.T) {
 			{Name: "confidence", Value: "0.8"},
 			{Name: "headless", Value: "false"},
 			{Name: "probe", Value: "false"},
+			{Name: "scope", Value: "same-domain"},
+			{Name: "headers", Value: "X-Token: abc, X-Org: test"},
+			{Name: "proxy", Value: "http://127.0.0.1:8080"},
+			{Name: "deduplicate", Value: "false"},
 		},
 	}
 
@@ -274,6 +283,10 @@ func TestResolveParams_AllOverridden(t *testing.T) {
 	assert.InDelta(t, 0.8, p.confidence, 0.001)
 	assert.False(t, p.headless)
 	assert.False(t, p.enableProbe)
+	assert.Equal(t, "same-domain", p.scope)
+	assert.Equal(t, map[string]string{"X-Token": "abc", "X-Org": "test"}, p.headers)
+	assert.Equal(t, "http://127.0.0.1:8080", p.proxy)
+	assert.False(t, p.deduplicate)
 }
 
 func TestResolveParams_PartialOverride(t *testing.T) {
@@ -335,4 +348,123 @@ func TestResolveParams_EmptyAPIType(t *testing.T) {
 	// GetString returns ("", false) when Value is empty and no Default is set
 	// on the Parameter in the ctx. resolveParams checks v != "" before overriding.
 	assert.Equal(t, "auto", p.apiType)
+}
+
+// ---------------------------------------------------------------------------
+// resolveParams bound-check tests
+// ---------------------------------------------------------------------------
+
+// TestResolveParams_NegativeDepth documents that negative depth values pass
+// through unvalidated. If future validation is added, update this test.
+func TestResolveParams_NegativeDepth(t *testing.T) {
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{{Name: "depth", Value: "-1"}},
+	}
+	p := resolveParams(ctx)
+	assert.Equal(t, -1, p.depth)
+}
+
+func TestResolveParams_ZeroMaxPages(t *testing.T) {
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{{Name: "max_pages", Value: "0"}},
+	}
+	p := resolveParams(ctx)
+	assert.Equal(t, 0, p.maxPages)
+}
+
+func TestResolveParams_NegativeTimeout(t *testing.T) {
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{{Name: "timeout", Value: "-1"}},
+	}
+	p := resolveParams(ctx)
+	assert.Equal(t, -1, p.timeoutSecs)
+}
+
+func TestResolveParams_OutOfRangeConfidence(t *testing.T) {
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{{Name: "confidence", Value: "2.0"}},
+	}
+	p := resolveParams(ctx)
+	assert.InDelta(t, 2.0, p.confidence, 0.001)
+}
+
+// ---------------------------------------------------------------------------
+// parseHeaderString
+// ---------------------------------------------------------------------------
+
+func TestParseHeaderString_SingleHeader(t *testing.T) {
+	result := parseHeaderString("Authorization: Bearer token123")
+	require.Len(t, result, 1)
+	assert.Equal(t, "Bearer token123", result["Authorization"])
+}
+
+func TestParseHeaderString_MultipleHeaders(t *testing.T) {
+	result := parseHeaderString("X-Token: abc, X-Org: test")
+	require.Len(t, result, 2)
+	assert.Equal(t, "abc", result["X-Token"])
+	assert.Equal(t, "test", result["X-Org"])
+}
+
+func TestParseHeaderString_Empty(t *testing.T) {
+	result := parseHeaderString("")
+	assert.Empty(t, result)
+}
+
+func TestParseHeaderString_MalformedEntry(t *testing.T) {
+	// Entries without colon are silently ignored.
+	result := parseHeaderString("NoColonHere, X-Valid: yes")
+	require.Len(t, result, 1)
+	assert.Equal(t, "yes", result["X-Valid"])
+}
+
+func TestParseHeaderString_ValueWithColon(t *testing.T) {
+	// SplitN(..., 2) means the first colon is the separator; rest is the value.
+	result := parseHeaderString("Authorization: Bearer foo:bar")
+	require.Len(t, result, 1)
+	assert.Equal(t, "Bearer foo:bar", result["Authorization"])
+}
+
+// ---------------------------------------------------------------------------
+// ClassifyProbeGenerate
+// ---------------------------------------------------------------------------
+
+func TestClassifyProbeGenerate_EmptyRequests(t *testing.T) {
+	ctx := context.Background()
+	spec, err := ClassifyProbeGenerate(ctx, nil, "rest", 0.5, true, false)
+	require.NoError(t, err)
+	// REST generator should return a minimal spec even for empty input.
+	_ = spec
+}
+
+func TestClassifyProbeGenerate_UnsupportedAPIType(t *testing.T) {
+	ctx := context.Background()
+	_, err := ClassifyProbeGenerate(ctx, nil, "bogus", 0.5, true, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported API type")
+}
+
+func TestClassifyProbeGenerate_RespectsDeduplicateFalse(t *testing.T) {
+	ctx := context.Background()
+	// Duplicate REST requests — with deduplicate=false both should be retained
+	// through classification; the generator should still produce a valid spec.
+	requests := []crawl.ObservedRequest{
+		{Method: "GET", URL: "http://example.com/api/users", Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`[{"id":1}]`)}},
+		{Method: "GET", URL: "http://example.com/api/users", Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`[{"id":2}]`)}},
+	}
+	spec, err := ClassifyProbeGenerate(ctx, requests, "rest", 0.5, false, false)
+	require.NoError(t, err)
+	require.NotNil(t, spec)
+}
+
+func TestClassifyProbeGenerate_DeduplicateTrue(t *testing.T) {
+	ctx := context.Background()
+	// Same duplicate requests — deduplicate=true should collapse them before
+	// generation; result is still a valid spec.
+	requests := []crawl.ObservedRequest{
+		{Method: "GET", URL: "http://example.com/api/users", Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`[{"id":1}]`)}},
+		{Method: "GET", URL: "http://example.com/api/users", Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`[{"id":2}]`)}},
+	}
+	spec, err := ClassifyProbeGenerate(ctx, requests, "rest", 0.5, true, false)
+	require.NoError(t, err)
+	require.NotNil(t, spec)
 }

@@ -20,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/praetorian-inc/capability-sdk/pkg/capability"
@@ -69,11 +70,24 @@ func (c *Capability) Parameters() []capability.Parameter {
 			WithDefault("true"),
 		capability.Bool("probe", "Enable endpoint probing").
 			WithDefault("true"),
+		capability.String("scope", "Crawl scope").
+			WithDefault("same-origin").
+			WithOptions("same-origin", "same-domain"),
+		capability.String("headers", "Additional request headers as comma-separated 'Key: Value' pairs").
+			WithDefault(""),
+		capability.String("proxy", "Proxy address for the headless browser (e.g. http://127.0.0.1:8080)").
+			WithDefault(""),
+		capability.Bool("deduplicate", "Deduplicate classified endpoints before spec generation").
+			WithDefault("true"),
 	}
 }
 
 // Match validates that the input WebApplication is suitable for this capability.
 // Returns an error if PrimaryURL is empty or does not have a valid http/https scheme and host.
+//
+// NOTE: Match does not block private/loopback hosts. Chariot seeds are customer-approved
+// targets, so PrimaryURL is treated as a trusted input. The crawl pipeline enforces
+// SSRF protection via probe.SSRFSafeDialContext for active probing calls.
 func (c *Capability) Match(_ capability.ExecutionContext, input capmodel.WebApplication) error {
 	if input.PrimaryURL == "" {
 		return fmt.Errorf("primary_url is required")
@@ -104,9 +118,17 @@ type invokeParams struct {
 	confidence  float64
 	headless    bool
 	enableProbe bool
+	scope       string
+	headers     map[string]string
+	proxy       string
+	deduplicate bool
 }
 
 // resolveParams extracts and defaults all Invoke parameters from the execution context.
+//
+// NOTE: Parse failures in GetInt/GetFloat/GetBool return (zero-value, false), so the
+// hardcoded defaults are retained. This is intentional — defensive defaults match the
+// behavior of Kong's CLI flag defaults and avoid surfacing parse errors to callers.
 func resolveParams(ctx capability.ExecutionContext) invokeParams {
 	p := invokeParams{
 		apiType:     "auto",
@@ -116,6 +138,10 @@ func resolveParams(ctx capability.ExecutionContext) invokeParams {
 		confidence:  0.5,
 		headless:    true,
 		enableProbe: true,
+		scope:       "same-origin",
+		headers:     nil,
+		proxy:       "",
+		deduplicate: true,
 	}
 
 	if v, _ := ctx.Parameters.GetString("api_type"); v != "" {
@@ -139,6 +165,18 @@ func resolveParams(ctx capability.ExecutionContext) invokeParams {
 	if v, ok := ctx.Parameters.GetBool("probe"); ok {
 		p.enableProbe = v
 	}
+	if v, _ := ctx.Parameters.GetString("scope"); v != "" {
+		p.scope = v
+	}
+	if v, _ := ctx.Parameters.GetString("headers"); v != "" {
+		p.headers = parseHeaderString(v)
+	}
+	if v, _ := ctx.Parameters.GetString("proxy"); v != "" {
+		p.proxy = v
+	}
+	if v, ok := ctx.Parameters.GetBool("deduplicate"); ok {
+		p.deduplicate = v
+	}
 
 	return p
 }
@@ -150,17 +188,24 @@ func resolveParams(ctx capability.ExecutionContext) invokeParams {
 func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebApplication, output capability.Emitter) error {
 	p := resolveParams(ctx)
 
+	if p.scope != "same-origin" && p.scope != "same-domain" {
+		return fmt.Errorf("invalid scope %q: must be same-origin or same-domain", p.scope)
+	}
+
 	crawlTimeout := time.Duration(p.timeoutSecs) * time.Second
 	// NOTE: capability.ExecutionContext does not carry a context.Context,
 	// so we create a standalone context with timeout. If the SDK adds
 	// context support in the future, this should thread the parent context.
-	crawlCtx, cancel := context.WithTimeout(context.Background(), crawlTimeout)
-	defer cancel()
+	crawlCtx, crawlCancel := context.WithTimeout(context.Background(), crawlTimeout)
+	defer crawlCancel()
 
 	var browserMgr *crawl.BrowserManager
 	if p.headless {
 		var err error
-		browserMgr, err = crawl.NewBrowserManager(crawl.BrowserOptions{Headless: true})
+		browserMgr, err = crawl.NewBrowserManager(crawl.BrowserOptions{
+			Headless: true,
+			Proxy:    p.proxy,
+		})
 		if err != nil {
 			return fmt.Errorf("launch browser: %w", err)
 		}
@@ -172,19 +217,34 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 		MaxPages:   p.maxPages,
 		Timeout:    crawlTimeout,
 		Headless:   p.headless,
+		Scope:      p.scope,
+		Headers:    p.headers,
+		Proxy:      p.proxy,
 		BrowserMgr: browserMgr,
 		Stderr:     io.Discard,
 	})
 
 	requests, err := crawler.Crawl(crawlCtx, input.PrimaryURL)
+	// Cancel crawl context as soon as the crawl completes so that the generate
+	// phase gets a fresh budget. If the crawl consumed the full timeout the
+	// canceled context would cause probing to bail out immediately — mirroring
+	// the pattern used in cmd/vespasian/main.go.
+	crawlCancel()
+
 	if err != nil {
 		return fmt.Errorf("crawl %q: %w", input.PrimaryURL, err)
 	}
 
+	// NOTE: capability.ExecutionContext does not carry a context.Context,
+	// so we create a fresh standalone context for the generate phase. Using
+	// a separate context ensures the crawl budget does not starve probing.
+	genCtx, genCancel := context.WithTimeout(context.Background(), crawlTimeout)
+	defer genCancel()
+
 	resolvedAPIType := p.apiType
 
 	if resolvedAPIType == "auto" || resolvedAPIType == "wsdl" || resolvedAPIType == "rest" {
-		if wsdlDoc := probeWSDLDocument(input.PrimaryURL); wsdlDoc != nil {
+		if wsdlDoc := probeWSDLDocument(genCtx, input.PrimaryURL); wsdlDoc != nil {
 			resolvedAPIType = "wsdl"
 			requests = append(requests, crawl.ObservedRequest{
 				Method: "GET",
@@ -198,34 +258,35 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 		}
 	}
 
-	spec, err := ClassifyProbeGenerate(crawlCtx, requests, resolvedAPIType, p.confidence, p.enableProbe)
+	spec, err := ClassifyProbeGenerate(genCtx, requests, resolvedAPIType, p.confidence, p.deduplicate, p.enableProbe)
 	if err != nil {
 		return fmt.Errorf("generate spec: %w", err)
 	}
 
+	// Preserve all input fields and overlay only the generated spec field.
 	// The capmodel.WebApplication model has a single spec field (OpenAPI).
 	// For non-REST types (GraphQL SDL, WSDL), the spec is stored in this
 	// field as the model does not have type-specific spec fields.
-	return output.Emit(capmodel.WebApplication{
-		PrimaryURL: input.PrimaryURL,
-		OpenAPI:    string(spec),
-	})
+	webApp := input
+	webApp.OpenAPI = string(spec)
+	return output.Emit(webApp)
 }
 
 // ClassifyProbeGenerate runs the classification, probing, and generation pipeline
 // on pre-crawled requests. This is the shared pipeline used by both the standalone
 // CLI and the Chariot platform wrapper. It handles API type auto-detection,
-// WSDL document probing, deduplication, and spec generation.
+// deduplication, and spec generation.
 //
 // Parameters:
 //   - ctx: context for cancellation/timeout during probing
 //   - requests: observed HTTP requests from a crawl
 //   - apiType: "rest", "wsdl", "graphql", or "auto" for auto-detection
 //   - confidence: minimum classification confidence threshold (0.0-1.0)
+//   - deduplicate: whether to deduplicate classified endpoints before generation
 //   - probeEnabled: whether to run active endpoint probing
 //
 // Returns the generated spec bytes (OpenAPI YAML, GraphQL SDL, or WSDL XML) or an error.
-func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest, apiType string, confidence float64, probeEnabled bool) ([]byte, error) {
+func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest, apiType string, confidence float64, deduplicate bool, probeEnabled bool) ([]byte, error) {
 	resolvedAPIType := apiType
 	if resolvedAPIType == "auto" {
 		resolvedAPIType = DetectAPIType(requests, confidence)
@@ -237,7 +298,9 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 	}
 
 	classified := classify.RunClassifiers(classifiers, requests, confidence)
-	classified = classify.Deduplicate(classified)
+	if deduplicate {
+		classified = classify.Deduplicate(classified)
+	}
 
 	if probeEnabled {
 		cfg := probe.DefaultConfig()
@@ -323,7 +386,13 @@ func probeStrategiesForType(apiType string, cfg probe.Config) []probe.ProbeStrat
 // probeWSDLDocument attempts to fetch a WSDL document from targetURL?wsdl.
 // Returns the raw WSDL bytes if the response is a valid WSDL document, or nil
 // if the probe fails, is blocked by SSRF protection, or returns non-WSDL content.
-func probeWSDLDocument(targetURL string) []byte {
+//
+// NOTE: Silent failures are intentional — this is a best-effort probe.
+func probeWSDLDocument(ctx context.Context, targetURL string) []byte {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	parsedURL, err := url.Parse(targetURL)
 	if err != nil {
 		return nil
@@ -338,23 +407,45 @@ func probeWSDLDocument(targetURL string) []byte {
 	client := &http.Client{
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
-			DialContext: probe.SSRFSafeDialContext,
+			DialContext:           probe.SSRFSafeDialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 10 * time.Second,
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
 
-	resp, err := client.Get(wsdlURL) //nolint:gosec // URL validated by ValidateProbeURL above
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wsdlURL, nil)
+	if err != nil {
+		return nil
+	}
+
+	resp, err := client.Do(req) //nolint:gosec // URL validated by ValidateProbeURL above
 	if err != nil {
 		return nil
 	}
 	defer func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // best-effort drain
-		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 2<<20)) //nolint:errcheck,gosec // best-effort drain
+		resp.Body.Close()                                     //nolint:errcheck,gosec // best-effort close
 	}()
 
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return nil
+	}
+
 	if resp.StatusCode >= 400 {
+		return nil
+	}
+
+	// Validate Content-Type before attempting to parse as WSDL.
+	// Empty content-type is permitted — some real-world WSDL endpoints omit it.
+	ct := resp.Header.Get("Content-Type")
+	ct = strings.ToLower(strings.TrimSpace(strings.Split(ct, ";")[0]))
+	switch ct {
+	case "text/xml", "application/xml", "application/wsdl+xml", "":
+		// acceptable
+	default:
 		return nil
 	}
 
@@ -368,4 +459,21 @@ func probeWSDLDocument(targetURL string) []byte {
 	}
 
 	return body
+}
+
+// parseHeaderString parses a comma-separated list of "Key: Value" header pairs
+// into a map. Entries that do not contain a colon are silently ignored.
+func parseHeaderString(raw string) map[string]string {
+	headers := make(map[string]string)
+	for _, hdr := range strings.Split(raw, ",") {
+		hdr = strings.TrimSpace(hdr)
+		if hdr == "" {
+			continue
+		}
+		parts := strings.SplitN(hdr, ":", 2)
+		if len(parts) == 2 {
+			headers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+		}
+	}
+	return headers
 }
