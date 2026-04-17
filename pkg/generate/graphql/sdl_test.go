@@ -2444,3 +2444,125 @@ func TestGenerator_Phase2_MultipleSingleFragmentOpsAccumulate(t *testing.T) {
 		t.Errorf("expected exactly 1 'type User {', got %d in:\n%s", userTypeCount, sdl)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// lowerFirst
+// ---------------------------------------------------------------------------
+
+func TestLowerFirst_Empty(t *testing.T) {
+	if got := lowerFirst(""); got != "" {
+		t.Errorf("lowerFirst(\"\") = %q, want %q", got, "")
+	}
+}
+
+func TestLowerFirst_AlreadyLower(t *testing.T) {
+	if got := lowerFirst("user"); got != "user" {
+		t.Errorf("lowerFirst(\"user\") = %q, want %q", got, "user")
+	}
+}
+
+func TestLowerFirst_Upper(t *testing.T) {
+	if got := lowerFirst("User"); got != "user" {
+		t.Errorf("lowerFirst(\"User\") = %q, want %q", got, "user")
+	}
+}
+
+func TestLowerFirst_SingleChar(t *testing.T) {
+	if got := lowerFirst("A"); got != "a" {
+		t.Errorf("lowerFirst(\"A\") = %q, want %q", got, "a")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// appendUnique
+// ---------------------------------------------------------------------------
+
+func TestAppendUnique_AddsNew(t *testing.T) {
+	result := appendUnique([]string{"a", "b"}, "c")
+	if len(result) != 3 || result[2] != "c" {
+		t.Errorf("appendUnique expected [a b c], got %v", result)
+	}
+}
+
+func TestAppendUnique_SkipsDuplicate(t *testing.T) {
+	result := appendUnique([]string{"a", "b"}, "a")
+	if len(result) != 2 {
+		t.Errorf("appendUnique expected no change for duplicate, got %v", result)
+	}
+}
+
+func TestAppendUnique_EmptySlice(t *testing.T) {
+	result := appendUnique(nil, "x")
+	if len(result) != 1 || result[0] != "x" {
+		t.Errorf("appendUnique on nil expected [x], got %v", result)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// isRicherValue
+// ---------------------------------------------------------------------------
+
+func TestIsRicherValue_CurrentNil(t *testing.T) {
+	// Any non-nil candidate is richer than nil.
+	if !isRicherValue("hello", nil) {
+		t.Error("expected non-nil string to be richer than nil")
+	}
+	if isRicherValue(nil, nil) {
+		t.Error("expected nil to not be richer than nil")
+	}
+}
+
+func TestIsRicherValue_MapRicherThanScalar(t *testing.T) {
+	candidate := map[string]interface{}{"a": 1}
+	current := "scalar"
+	if !isRicherValue(candidate, current) {
+		t.Error("expected map to be richer than scalar")
+	}
+}
+
+func TestIsRicherValue_LargerMapRicher(t *testing.T) {
+	candidate := map[string]interface{}{"a": 1, "b": 2}
+	current := map[string]interface{}{"a": 1}
+	if !isRicherValue(candidate, current) {
+		t.Error("expected larger map to be richer")
+	}
+}
+
+func TestIsRicherValue_SmallerMapNotRicher(t *testing.T) {
+	candidate := map[string]interface{}{"a": 1}
+	current := map[string]interface{}{"a": 1, "b": 2}
+	if isRicherValue(candidate, current) {
+		t.Error("expected smaller map to not be richer")
+	}
+}
+
+func TestIsRicherValue_SliceRicherThanScalar(t *testing.T) {
+	candidate := []interface{}{1, 2}
+	current := "scalar"
+	if !isRicherValue(candidate, current) {
+		t.Error("expected slice to be richer than scalar")
+	}
+}
+
+func TestIsRicherValue_LargerSliceRicher(t *testing.T) {
+	candidate := []interface{}{1, 2, 3}
+	current := []interface{}{1}
+	if !isRicherValue(candidate, current) {
+		t.Error("expected larger slice to be richer")
+	}
+}
+
+func TestIsRicherValue_SmallerSliceNotRicher(t *testing.T) {
+	candidate := []interface{}{1}
+	current := []interface{}{1, 2}
+	if isRicherValue(candidate, current) {
+		t.Error("expected smaller slice to not be richer")
+	}
+}
+
+func TestIsRicherValue_ScalarNotRicher(t *testing.T) {
+	// A scalar (string) candidate against any non-nil current is never richer.
+	if isRicherValue("hello", "world") {
+		t.Error("expected scalar to not be richer than another scalar")
+	}
+}

@@ -15,6 +15,7 @@
 package probe
 
 import (
+	"context"
 	"testing"
 )
 
@@ -96,5 +97,60 @@ func TestValidateProbeURL_BlocksUnspecifiedIPv6(t *testing.T) {
 	err := validateProbeURL("http://[::]/api")
 	if err == nil {
 		t.Error("expected [::] (IPv6 unspecified) to be blocked, got nil error")
+	}
+}
+
+// TestValidateProbeURL_Exported verifies that the exported ValidateProbeURL
+// wrapper delegates to validateProbeURL correctly.
+func TestValidateProbeURL_Exported(t *testing.T) {
+	// A private IP must be rejected — exercises the exported wrapper.
+	err := ValidateProbeURL("http://127.0.0.1/api")
+	if err == nil {
+		t.Error("expected loopback address to be blocked via exported ValidateProbeURL")
+	}
+}
+
+// TestSSRFSafeDialContext_BlocksPrivateIP verifies that ssrfSafeDialContext
+// rejects connections to private IP addresses without requiring a real TCP dial.
+// A pre-canceled context is used so even DNS resolution is bounded.
+func TestSSRFSafeDialContext_BlocksPrivateIP(t *testing.T) {
+	ctx := context.Background()
+	// 127.0.0.1 resolves immediately (no external DNS) and is a private IP,
+	// so ssrfSafeDialContext should return an error before attempting to dial.
+	_, err := ssrfSafeDialContext(ctx, "tcp", "127.0.0.1:80")
+	if err == nil {
+		t.Error("expected loopback address to be blocked by ssrfSafeDialContext")
+	}
+}
+
+// TestSSRFSafeDialContext_Exported exercises the exported SSRFSafeDialContext
+// wrapper to ensure it delegates to the internal implementation.
+func TestSSRFSafeDialContext_Exported(t *testing.T) {
+	ctx := context.Background()
+	_, err := SSRFSafeDialContext(ctx, "tcp", "127.0.0.1:80")
+	if err == nil {
+		t.Error("expected loopback address to be blocked via exported SSRFSafeDialContext")
+	}
+}
+
+// TestSSRFSafeDialContext_InvalidAddress exercises the net.SplitHostPort error
+// branch (validate.go:112-115) in ssrfSafeDialContext.
+func TestSSRFSafeDialContext_InvalidAddress(t *testing.T) {
+	ctx := context.Background()
+	// An address without a port triggers net.SplitHostPort to return an error.
+	_, err := ssrfSafeDialContext(ctx, "tcp", "no-port")
+	if err == nil {
+		t.Error("expected invalid address (no port) to return error")
+	}
+}
+
+// TestSSRFSafeDialContext_DNSFailure exercises the DNS lookup failure branch
+// (validate.go:117-120) in ssrfSafeDialContext using a canceled context.
+func TestSSRFSafeDialContext_DNSFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-canceled causes LookupIPAddr to fail
+	_, err := ssrfSafeDialContext(ctx, "tcp", "example.invalid:80")
+	if err == nil {
+		t.Error("expected DNS lookup to fail with canceled context or invalid hostname")
 	}
 }

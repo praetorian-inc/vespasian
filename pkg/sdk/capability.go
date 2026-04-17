@@ -383,6 +383,34 @@ func probeStrategiesForType(apiType string, cfg probe.Config) []probe.ProbeStrat
 	}
 }
 
+// isRejectedWSDLStatus reports whether the HTTP status code should cause
+// probeWSDLDocument to reject the response without attempting to parse.
+// 3xx responses reach us because CheckRedirect returns ErrUseLastResponse;
+// 4xx+ indicates the endpoint does not serve WSDL.
+func isRejectedWSDLStatus(status int) bool {
+	if status >= 300 && status < 400 {
+		return true
+	}
+	if status >= 400 {
+		return true
+	}
+	return false
+}
+
+// isAcceptableWSDLContentType reports whether a response's Content-Type
+// header value is one the WSDL probe will accept. An empty content type is
+// allowed because some WSDL endpoints omit it; the parser is then the
+// authority. Any other value short-circuits the probe.
+func isAcceptableWSDLContentType(header string) bool {
+	ct := strings.ToLower(strings.TrimSpace(strings.Split(header, ";")[0]))
+	switch ct {
+	case "", "text/xml", "application/xml", "application/wsdl+xml":
+		return true
+	default:
+		return false
+	}
+}
+
 // probeWSDLDocument attempts to fetch a WSDL document from targetURL?wsdl.
 // Returns the raw WSDL bytes if the response is a valid WSDL document, or nil
 // if the probe fails, is blocked by SSRF protection, or returns non-WSDL content.
@@ -430,22 +458,13 @@ func probeWSDLDocument(ctx context.Context, targetURL string) []byte {
 		resp.Body.Close()                                     //nolint:errcheck,gosec // best-effort close
 	}()
 
-	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		return nil
-	}
-
-	if resp.StatusCode >= 400 {
+	if isRejectedWSDLStatus(resp.StatusCode) {
 		return nil
 	}
 
 	// Validate Content-Type before attempting to parse as WSDL.
 	// Empty content-type is permitted — some real-world WSDL endpoints omit it.
-	ct := resp.Header.Get("Content-Type")
-	ct = strings.ToLower(strings.TrimSpace(strings.Split(ct, ";")[0]))
-	switch ct {
-	case "text/xml", "application/xml", "application/wsdl+xml", "":
-		// acceptable
-	default:
+	if !isAcceptableWSDLContentType(resp.Header.Get("Content-Type")) {
 		return nil
 	}
 

@@ -24,11 +24,30 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/praetorian-inc/capability-sdk/pkg/capability"
+	"github.com/praetorian-inc/capability-sdk/pkg/capmodel"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
+
+// ---------------------------------------------------------------------------
+// Match (url.Parse failure branch)
+// ---------------------------------------------------------------------------
+
+// TestMatch_URLParseError covers the url.Parse failure branch (capability.go:97-99)
+// which is the one branch not covered by the black-box tests in capability_test.go.
+// A URL with a space in the host causes url.Parse to return an error on Go 1.12+.
+func TestMatch_URLParseError(t *testing.T) {
+	c := &Capability{}
+	ctx := capability.ExecutionContext{}
+
+	// A URL with a space in the host is unparseable by net/url.
+	input := capmodel.WebApplication{PrimaryURL: "http://example .com/"}
+	err := c.Match(ctx, input)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid primary_url")
+}
 
 // ---------------------------------------------------------------------------
 // detectAPIType
@@ -469,6 +488,119 @@ func TestClassifyProbeGenerate_DeduplicateTrue(t *testing.T) {
 	require.NotNil(t, spec)
 }
 
+// TestClassifyProbeGenerate_AutoDetectsREST exercises the "auto" API type
+// detection branch (ClassifyProbeGenerate lines 291-293). With REST-like
+// traffic, DetectAPIType should resolve to "rest" and the pipeline should
+// produce a non-empty OpenAPI spec.
+func TestClassifyProbeGenerate_AutoDetectsREST(t *testing.T) {
+	ctx := context.Background()
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "http://example.com/api/users",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Body:        []byte(`[{"id":1,"name":"alice"}]`),
+			},
+		},
+	}
+	spec, err := ClassifyProbeGenerate(ctx, requests, "auto", 0.5, true, false)
+	require.NoError(t, err)
+	assert.NotEmpty(t, spec)
+}
+
+// TestClassifyProbeGenerate_GeneratesRESTSpec verifies successful spec generation
+// with multiple REST endpoints (exercises the generate.Get + gen.Generate path).
+// The spec should contain the "openapi" marker expected for OpenAPI 3.0 output.
+func TestClassifyProbeGenerate_GeneratesRESTSpec(t *testing.T) {
+	ctx := context.Background()
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "http://example.com/api/users/42",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Body:        []byte(`{"id":42,"name":"alice"}`),
+			},
+		},
+		{
+			Method: "POST",
+			URL:    "http://example.com/api/users",
+			Response: crawl.ObservedResponse{
+				StatusCode:  201,
+				ContentType: "application/json",
+				Body:        []byte(`{"id":43}`),
+			},
+		},
+	}
+	spec, err := ClassifyProbeGenerate(ctx, requests, "rest", 0.5, true, false)
+	require.NoError(t, err)
+	require.NotEmpty(t, spec)
+	assert.Contains(t, string(spec), "openapi")
+}
+
+// TestClassifyProbeGenerate_ProbeEnabledOnREST exercises the probeEnabled=true
+// branch (ClassifyProbeGenerate lines 305-312). A pre-canceled context ensures
+// probes fail fast without network calls. RunStrategies preserves the original
+// classified endpoints even when strategies error, so the pipeline still
+// produces a spec when classified results are non-empty.
+func TestClassifyProbeGenerate_ProbeEnabledOnREST(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately — probes fail fast, no network calls
+
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "http://example.com/api/items",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Body:        []byte(`{"id":1}`),
+			},
+		},
+	}
+	// probeEnabled=true exercises the probe branch; canceled context keeps the
+	// test hermetic. The function either produces a spec or returns an error —
+	// both outcomes are valid; the goal is branch coverage.
+	spec, err := ClassifyProbeGenerate(ctx, requests, "rest", 0.5, true, true)
+	if err != nil {
+		assert.Contains(t, err.Error(), "probes failed")
+	} else {
+		assert.NotEmpty(t, spec)
+	}
+}
+
+// TestClassifyProbeGenerate_AllProbesFailed exercises the early-return branch
+// (ClassifyProbeGenerate line 310) where enriched is empty and probeErrs is
+// non-empty. This requires: no classified endpoints (threshold=1.1 eliminates
+// every request) AND probeEnabled=true AND at least one probe error. With an
+// empty classified list RunStrategies returns ([], [contextErr]), satisfying
+// len(enriched)==0 && len(probeErrs)>0.
+func TestClassifyProbeGenerate_AllProbesFailed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-canceled so every probe strategy errors immediately
+
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "http://example.com/api/items",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Body:        []byte(`{"id":1}`),
+			},
+		},
+	}
+	// Threshold above 1.0 means classify.RunClassifiers returns nothing, so
+	// classified is empty. probeEnabled=true with canceled ctx → probe errors.
+	// Condition: len(enriched)==0 && len(probeErrs)>0 → error returned.
+	_, err := ClassifyProbeGenerate(ctx, requests, "rest", 1.1, true, true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "all probes failed")
+}
+
 // ---------------------------------------------------------------------------
 // probeWSDLDocument
 // ---------------------------------------------------------------------------
@@ -512,4 +644,69 @@ func TestProbeWSDLDocument_CanceledContext(t *testing.T) {
 
 	result := probeWSDLDocument(ctx, "http://127.0.0.1/service")
 	assert.Nil(t, result)
+}
+
+// ---------------------------------------------------------------------------
+// isRejectedWSDLStatus
+// ---------------------------------------------------------------------------
+
+func TestIsRejectedWSDLStatus(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		want   bool
+	}{
+		{"200 OK", 200, false},
+		{"201 Created", 201, false},
+		{"204 No Content", 204, false},
+		{"299", 299, false},
+		{"300 Multiple Choices", 300, true},
+		{"301 Moved", 301, true},
+		{"302 Found", 302, true},
+		{"307 Temporary Redirect", 307, true},
+		{"308 Permanent Redirect", 308, true},
+		{"399", 399, true},
+		{"400 Bad Request", 400, true},
+		{"401 Unauthorized", 401, true},
+		{"403 Forbidden", 403, true},
+		{"404 Not Found", 404, true},
+		{"500 Internal Server Error", 500, true},
+		{"503 Service Unavailable", 503, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isRejectedWSDLStatus(tt.status))
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// isAcceptableWSDLContentType
+// ---------------------------------------------------------------------------
+
+func TestIsAcceptableWSDLContentType(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+		want   bool
+	}{
+		{"empty", "", true},
+		{"text/xml", "text/xml", true},
+		{"application/xml", "application/xml", true},
+		{"application/wsdl+xml", "application/wsdl+xml", true},
+		{"text/xml with charset", "text/xml; charset=utf-8", true},
+		{"application/xml with charset", "application/xml; charset=UTF-8", true},
+		{"uppercase", "TEXT/XML", true},
+		{"mixed case with whitespace", "  Application/XML  ", true},
+		{"text/html", "text/html", false},
+		{"application/json", "application/json", false},
+		{"text/plain", "text/plain", false},
+		{"application/octet-stream", "application/octet-stream", false},
+		{"html with charset", "text/html; charset=utf-8", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isAcceptableWSDLContentType(tt.header))
+		})
+	}
 }
