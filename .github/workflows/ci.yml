@@ -12,10 +12,13 @@ permissions:
 
 jobs:
   ci:
-    uses: praetorian-inc/public-workflows/.github/workflows/go-ci.yml@f89bda45e8073b1b6ac20198164de2b71ebf0c69  # v1.0.2
+    uses: praetorian-inc/public-workflows/.github/workflows/go-ci.yml@1073478d5f4a99443b302f174f25e84ac4655e59  # v1.0.3
     permissions:
       contents: read
     with:
       build-cmd-path: ./cmd/vespasian
       build-binary-name: vespasian
+      build-cgo-enabled: "1"
+      build-matrix-os: '["linux"]'
+      build-matrix-arch: '["amd64"]'
     secrets: inherit
