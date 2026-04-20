@@ -39,7 +39,7 @@ func extractForms(page *rod.Page) ([]discoveredForm, error) {
 	if err != nil {
 		return nil, err
 	}
-	baseURL := pageInfo.URL
+	baseURL := effectiveBaseURL(page, pageInfo.URL)
 
 	formElements, err := page.Elements("form")
 	if err != nil {

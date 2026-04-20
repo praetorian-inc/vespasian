@@ -35,16 +35,39 @@ var linkSelectors = []struct {
 	{"[data-url]", "data-url"},
 }
 
+// nonPageExtensions lists URL path suffixes for resources that are never
+// crawlable HTML pages. Navigating to them wastes the page budget and can
+// produce recursive "nested" paths on SPAs whose server returns a catch-all
+// HTML body for any path (e.g., /socket.io/socket.io/... on Juice Shop).
+var nonPageExtensions = []string{
+	".js", ".mjs", ".cjs", ".css", ".map",
+	".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".bmp", ".avif",
+	".woff", ".woff2", ".ttf", ".otf", ".eot",
+	".mp3", ".mp4", ".webm", ".ogg", ".wav", ".avi", ".mov",
+	".pdf", ".zip", ".tar", ".gz", ".rar", ".7z",
+}
+
+// nonPagePathFragments lists path fragments that indicate real-time or
+// streaming transports rather than crawlable pages. Navigating to them would
+// either 400 or (on SPA catch-all servers) return the SPA shell HTML and
+// trigger the same app code again at a nested path.
+var nonPagePathFragments = []string{
+	"/socket.io/",
+	"/engine.io/",
+}
+
 // extractLinks extracts all navigable URLs from the current page DOM.
 // It queries for links, forms, iframes, and common SPA data attributes,
-// resolving all URLs to absolute form against the page's current URL.
-// Returned URLs are deduplicated.
+// resolves all URLs against the page's <base href> (falling back to the
+// current page URL if no base tag is present), and filters out non-page
+// resources (JS bundles, images, fonts, socket.io, etc.) whose content is
+// already captured via CDP network interception.
 func extractLinks(page *rod.Page) ([]string, error) {
 	pageInfo, err := page.Info()
 	if err != nil {
 		return nil, err
 	}
-	baseURL := pageInfo.URL
+	baseURL := effectiveBaseURL(page, pageInfo.URL)
 
 	seen := make(map[string]bool)
 	var links []string
@@ -65,6 +88,10 @@ func extractLinks(page *rod.Page) ([]string, error) {
 				continue
 			}
 
+			if !isLikelyPage(resolved) {
+				continue
+			}
+
 			if seen[resolved] {
 				continue
 			}
@@ -74,6 +101,36 @@ func extractLinks(page *rod.Page) ([]string, error) {
 	}
 
 	return links, nil
+}
+
+// effectiveBaseURL returns the URL that relative references on the page should
+// be resolved against. It mirrors the browser's algorithm: use <base href>
+// when present (resolving it against the current page URL first in case the
+// base tag itself holds a relative value), otherwise fall back to the page
+// URL. Returns pageURL on any parse failure.
+func effectiveBaseURL(page *rod.Page, pageURL string) string {
+	el, err := page.Element("base[href]")
+	if err != nil || el == nil {
+		return pageURL
+	}
+	href, err := el.Attribute("href")
+	if err != nil || href == nil || strings.TrimSpace(*href) == "" {
+		return pageURL
+	}
+
+	pageU, err := url.Parse(pageURL)
+	if err != nil {
+		return pageURL
+	}
+	refU, err := url.Parse(strings.TrimSpace(*href))
+	if err != nil {
+		return pageURL
+	}
+	resolved := pageU.ResolveReference(refU)
+	if resolved.Scheme != "http" && resolved.Scheme != "https" {
+		return pageURL
+	}
+	return resolved.String()
 }
 
 // resolveURL resolves a potentially relative URL against the base URL.
@@ -115,4 +172,38 @@ func resolveURL(base, ref string) (string, error) {
 	// Strip fragment for cleaner URLs.
 	resolved.Fragment = ""
 	return resolved.String(), nil
+}
+
+// isLikelyPage returns true when rawURL is plausibly a crawlable HTML page.
+// It rejects URLs with obvious non-HTML file extensions and known
+// non-crawlable transport paths (socket.io, engine.io). Returning false
+// prevents the frontier from enqueuing a URL whose only content is static
+// assets already captured via network interception, or an endpoint whose
+// SPA catch-all response would cause recursive path nesting.
+//
+// Parse failures return true (permissive): the frontier/scope stages can
+// still reject malformed URLs. The function is advisory, not authoritative.
+func isLikelyPage(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return true
+	}
+	path := strings.ToLower(u.Path)
+	for _, frag := range nonPagePathFragments {
+		if strings.Contains(path, frag) {
+			return false
+		}
+	}
+	// Look at the last segment only — a path like /assets/main.js/index
+	// would be navigable, but /assets/main.js itself is a bundle.
+	last := path
+	if idx := strings.LastIndex(path, "/"); idx >= 0 {
+		last = path[idx+1:]
+	}
+	for _, ext := range nonPageExtensions {
+		if strings.HasSuffix(last, ext) {
+			return false
+		}
+	}
+	return true
 }

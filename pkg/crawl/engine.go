@@ -284,7 +284,19 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 // inline scripts, and discovers forms. It returns the enriched results and all
 // discovered links for the frontier. Errors are logged to stderr (if non-nil)
 // but are non-fatal — captured network results are always returned.
+//
+// pageURL is the URL the worker navigated to (used for form PageURL tagging
+// and as a fallback for URL resolution when the DOM provides no <base href>
+// and page.Info() returns an error).
 func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, stderr io.Writer) ([]ObservedRequest, []string) {
+	// Resolve the effective base URL for any relative references on this page.
+	// jsluice-extracted URLs and form actions must honor <base href> the same
+	// way the browser would, or we end up queuing mangled/nested paths.
+	baseURL := pageURL
+	if info, err := page.Info(); err == nil && info.URL != "" {
+		baseURL = effectiveBaseURL(page, info.URL)
+	}
+
 	// Extract links from the DOM.
 	links, err := extractLinks(page)
 	if err != nil {
@@ -297,13 +309,13 @@ func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, 
 	// Run jsluice on captured JS response bodies.
 	jsFromResponses := extractURLsFromResponses(captured)
 	if len(jsFromResponses) > 0 {
-		links = append(links, jsExtractedToLinks(jsFromResponses, pageURL)...)
+		links = append(links, jsExtractedToLinks(jsFromResponses, baseURL)...)
 	}
 
 	// Run jsluice on inline <script> tags.
 	jsFromInline := extractURLsFromInlineScripts(page)
 	if len(jsFromInline) > 0 {
-		links = append(links, jsExtractedToLinks(jsFromInline, pageURL)...)
+		links = append(links, jsExtractedToLinks(jsFromInline, baseURL)...)
 	}
 
 	// Extract forms and emit synthetic ObservedRequests for POST endpoints.
@@ -312,7 +324,12 @@ func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, 
 		formRequests := formsToObservedRequests(forms, pageURL)
 		captured = append(captured, formRequests...)
 		for _, f := range forms {
-			links = append(links, f.Action)
+			if f.Action == "" {
+				continue
+			}
+			if resolved, rerr := resolveURL(baseURL, f.Action); rerr == nil && isLikelyPage(resolved) {
+				links = append(links, resolved)
+			}
 		}
 	}
 

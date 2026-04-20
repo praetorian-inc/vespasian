@@ -124,3 +124,92 @@ func TestResolveURL_TelScheme(t *testing.T) {
 		t.Error("expected error for tel: URL")
 	}
 }
+
+// --- Base-href awareness (LAB-2221 Issue A) -----------------------------
+
+// Regression: when an SPA page is served under a deep path but declares
+// <base href="/">, relative script/link paths must resolve against the
+// base (producing /main.js) instead of the page URL (which would produce
+// /walletExploitAddress/socket.io/main.js).
+func TestResolveURL_BaseHrefRoot(t *testing.T) {
+	got, err := resolveURL("https://example.com/", "main.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "https://example.com/main.js" {
+		t.Errorf("got %q, want %q", got, "https://example.com/main.js")
+	}
+}
+
+// --- isLikelyPage asset filter (LAB-2221) -------------------------------
+
+func TestIsLikelyPage_AcceptsHTMLPaths(t *testing.T) {
+	cases := []string{
+		"https://example.com/",
+		"https://example.com/login",
+		"https://example.com/api/users",
+		"https://example.com/path/with.dots/resource",
+		"https://example.com/#/product/1",
+		"https://example.com/search?q=test",
+	}
+	for _, c := range cases {
+		if !isLikelyPage(c) {
+			t.Errorf("isLikelyPage(%q) = false, want true", c)
+		}
+	}
+}
+
+func TestIsLikelyPage_RejectsAssetExtensions(t *testing.T) {
+	cases := []string{
+		"https://example.com/main.js",
+		"https://example.com/polyfills.mjs",
+		"https://example.com/chunk-ABCDE.js",
+		"https://example.com/styles.css",
+		"https://example.com/main.js.map",
+		"https://example.com/assets/public/favicon_js.ico",
+		"https://example.com/assets/public/images/JuiceShop_Logo.png",
+		"https://example.com/assets/font.woff2",
+		"https://example.com/doc.pdf",
+		"https://example.com/archive.zip",
+	}
+	for _, c := range cases {
+		if isLikelyPage(c) {
+			t.Errorf("isLikelyPage(%q) = true, want false", c)
+		}
+	}
+}
+
+func TestIsLikelyPage_RejectsStreamingEndpoints(t *testing.T) {
+	// These endpoints return the SPA catch-all HTML on Juice Shop when
+	// hit via GET without the right protocol handshake; navigating to
+	// them would trigger recursive path nesting through relative asset
+	// references.
+	cases := []string{
+		"http://localhost:3000/socket.io/",
+		"http://localhost:3000/socket.io/?EIO=4&transport=polling&t=abc",
+		"http://localhost:3000/engine.io/socket.io/",
+	}
+	for _, c := range cases {
+		if isLikelyPage(c) {
+			t.Errorf("isLikelyPage(%q) = true, want false", c)
+		}
+	}
+}
+
+func TestIsLikelyPage_IsCaseInsensitive(t *testing.T) {
+	if isLikelyPage("https://example.com/BUNDLE.JS") {
+		t.Error("isLikelyPage should be case-insensitive on extensions")
+	}
+	if isLikelyPage("https://example.com/IMAGE.PNG") {
+		t.Error("isLikelyPage should be case-insensitive on extensions")
+	}
+}
+
+func TestIsLikelyPage_UnparseableInputIsPermissive(t *testing.T) {
+	// Weird/unparseable URLs are passed through — the frontier and scope
+	// checker are authoritative; isLikelyPage only filters obvious assets.
+	// net/url.Parse is extremely lenient, so just verify the default.
+	if !isLikelyPage("") {
+		t.Error("isLikelyPage(\"\") = false, want true (permissive default)")
+	}
+}
