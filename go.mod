@@ -4,7 +4,7 @@ go 1.25.8
 
 require (
 	github.com/BishopFox/jsluice v0.0.0-20240110145140-0ddfab153e06
-	github.com/alecthomas/kong v1.14.0
+	github.com/alecthomas/kong v1.15.0
 	github.com/getkin/kin-openapi v0.134.0
 	github.com/go-rod/rod v0.116.2
 	github.com/projectdiscovery/goflags v0.1.74
