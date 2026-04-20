@@ -437,12 +437,28 @@ func (c *CrawlCmd) Run() error {
 
 // openImportInputFile opens an import source and upgrades permission failures with recovery guidance.
 func openImportInputFile(path string) (*os.File, error) {
-	f, err := os.Open(path)
+	cleanPath := cleanInputPath(path)
+	f, err := os.Open(filepath.Clean(cleanPath))
 	if err != nil {
-		return nil, formatImportInputFileError(path, err)
+		return nil, formatImportInputFileError(cleanPath, err)
 	}
 
 	return f, nil
+}
+
+// cleanInputPath normalizes input paths and resolves relative paths for safer file access.
+func cleanInputPath(path string) string {
+	cleanPath := filepath.Clean(path)
+	if filepath.IsAbs(cleanPath) {
+		return cleanPath
+	}
+
+	absPath, err := filepath.Abs(cleanPath)
+	if err != nil {
+		return cleanPath
+	}
+
+	return absPath
 }
 
 // formatImportInputFileError rewrites permission errors into actionable import guidance.
@@ -553,7 +569,8 @@ const maxCaptureSize = 100 * 1024 * 1024
 
 // Run executes the generate command.
 func (c *GenerateCmd) Run() (err error) {
-	f, err := os.Open(c.Capture)
+	capturePath := cleanInputPath(c.Capture)
+	f, err := os.Open(filepath.Clean(capturePath))
 	if err != nil {
 		return fmt.Errorf("open capture file: %w", err)
 	}

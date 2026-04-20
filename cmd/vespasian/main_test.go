@@ -438,6 +438,35 @@ func TestImportCmdPermissionDenied(t *testing.T) {
 	}
 }
 
+func TestCleanInputPath(t *testing.T) {
+	originalWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %v", err)
+	}
+
+	tempDir := t.TempDir()
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("failed to change working directory: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(originalWD)
+	})
+
+	got := cleanInputPath(filepath.Join(".", "captures", "..", "capture.json"))
+	want := filepath.Join(tempDir, "capture.json")
+	gotDirResolved, err := filepath.EvalSymlinks(filepath.Dir(got))
+	if err != nil {
+		t.Fatalf("failed to resolve cleaned path directory: %v", err)
+	}
+	wantDirResolved, err := filepath.EvalSymlinks(filepath.Dir(want))
+	if err != nil {
+		t.Fatalf("failed to resolve expected path directory: %v", err)
+	}
+	if filepath.Join(gotDirResolved, filepath.Base(got)) != filepath.Join(wantDirResolved, filepath.Base(want)) {
+		t.Fatalf("cleanInputPath() = %q, want %q", got, want)
+	}
+}
+
 func TestGenerateCmdMissingCapture(t *testing.T) {
 	cmd := &GenerateCmd{
 		APIType: "rest",

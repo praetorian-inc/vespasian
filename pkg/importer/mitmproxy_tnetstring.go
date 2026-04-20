@@ -175,6 +175,33 @@ func readTnetstring(r *bufio.Reader, availableBytes int64, maxBodySize int64) (a
 	if err != nil {
 		return nil, err
 	}
+	lengthPrefix, err := readTnetstringLengthPrefix(r, firstByte)
+	if err != nil {
+		return nil, err
+	}
+
+	length, err := parseTnetstringLength(lengthPrefix, maxBodySize)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateTnetstringLength(length, len(lengthPrefix), availableBytes); err != nil {
+		return nil, err
+	}
+
+	body, err := readTnetstringBody(r, length)
+	if err != nil {
+		return nil, invalidTnetstringLength(length)
+	}
+
+	tag, err := readTnetstringTag(r, length)
+	if err != nil {
+		return nil, err
+	}
+
+	return parseTnetstringValue(tag, body)
+}
+
+func readTnetstringLengthPrefix(r *bufio.Reader, firstByte byte) ([]byte, error) {
 	if firstByte < '0' || firstByte > '9' {
 		return nil, fmt.Errorf("not a tnetstring: missing or invalid length prefix")
 	}
@@ -189,45 +216,63 @@ func readTnetstring(r *bufio.Reader, availableBytes int64, maxBodySize int64) (a
 			return nil, err
 		}
 		if b == ':' {
-			break
+			return lengthPrefix, nil
 		}
 		if b < '0' || b > '9' {
 			return nil, fmt.Errorf("not a tnetstring: missing or invalid length prefix")
 		}
 		lengthPrefix = append(lengthPrefix, b)
 	}
+}
 
+func parseTnetstringLength(lengthPrefix []byte, maxBodySize int64) (int, error) {
 	if len(lengthPrefix) > 12 {
-		return nil, fmt.Errorf("not a tnetstring: absurdly large length prefix")
+		return 0, fmt.Errorf("not a tnetstring: absurdly large length prefix")
 	}
 
 	length, err := strconv.Atoi(string(lengthPrefix))
 	if err != nil {
-		return nil, fmt.Errorf("not a tnetstring: missing or invalid length prefix")
+		return 0, fmt.Errorf("not a tnetstring: missing or invalid length prefix")
 	}
 	if int64(length) > maxBodySize {
-		return nil, ErrFileTooLarge
+		return 0, ErrFileTooLarge
 	}
 
-	remainingAfterPrefix := availableBytes - int64(len(lengthPrefix)) - 1
+	return length, nil
+}
+
+func validateTnetstringLength(length int, prefixLength int, availableBytes int64) error {
+	remainingAfterPrefix := availableBytes - int64(prefixLength) - 1
 	if remainingAfterPrefix < 0 || int64(length)+1 > remainingAfterPrefix {
-		return nil, fmt.Errorf("not a tnetstring: invalid length prefix: %d", length)
+		return invalidTnetstringLength(length)
 	}
 
+	return nil
+}
+
+func readTnetstringBody(r *bufio.Reader, length int) ([]byte, error) {
 	body := make([]byte, length)
 	if _, err := io.ReadFull(r, body); err != nil {
-		return nil, fmt.Errorf("not a tnetstring: invalid length prefix: %d", length)
-	}
-
-	tag, err := r.ReadByte()
-	if err != nil {
-		if err == io.EOF {
-			return nil, fmt.Errorf("not a tnetstring: invalid length prefix: %d", length)
-		}
 		return nil, err
 	}
 
-	return parseTnetstringValue(tag, body)
+	return body, nil
+}
+
+func readTnetstringTag(r *bufio.Reader, length int) (byte, error) {
+	tag, err := r.ReadByte()
+	if err != nil {
+		if err == io.EOF {
+			return 0, invalidTnetstringLength(length)
+		}
+		return 0, err
+	}
+
+	return tag, nil
+}
+
+func invalidTnetstringLength(length int) error {
+	return fmt.Errorf("not a tnetstring: invalid length prefix: %d", length)
 }
 
 // parseTnetstringSegment decodes one nested tnetstring value from a byte slice.
@@ -267,71 +312,110 @@ func parseTnetstringSegment(data []byte) (any, int, error) {
 
 // parseTnetstringValue converts a tnetstring tag/body pair into native Go values.
 func parseTnetstringValue(tag byte, body []byte) (any, error) {
+	if value, handled, err := parseTnetstringScalar(tag, body); handled || err != nil {
+		return value, err
+	}
+
 	switch tag {
-	case ',':
-		return body, nil
-	case ';':
-		return string(body), nil
-	case '#':
-		value, err := strconv.Atoi(string(body))
-		if err != nil {
-			return nil, fmt.Errorf("not a tnetstring: invalid integer literal: %q", string(body))
-		}
-		return value, nil
-	case '^':
-		value, err := strconv.ParseFloat(string(body), 64)
-		if err != nil {
-			return nil, fmt.Errorf("not a tnetstring: invalid float literal: %q", string(body))
-		}
-		return value, nil
-	case '!':
-		switch string(body) {
-		case "true":
-			return true, nil
-		case "false":
-			return false, nil
-		default:
-			return nil, fmt.Errorf("not a tnetstring: invalid boolean literal: %q", string(body))
-		}
-	case '~':
-		if len(body) != 0 {
-			return nil, fmt.Errorf("not a tnetstring: invalid null literal: %q", string(body))
-		}
-		return nil, nil
 	case ']':
-		items := make([]any, 0)
-		for offset := 0; offset < len(body); {
-			item, size, err := parseTnetstringSegment(body[offset:])
-			if err != nil {
-				return nil, err
-			}
-			items = append(items, item)
-			offset += size
-		}
-		return items, nil
+		return parseTnetstringList(body)
 	case '}':
-		values := make(map[string]any)
-		for offset := 0; offset < len(body); {
-			keyRaw, size, err := parseTnetstringSegment(body[offset:])
-			if err != nil {
-				return nil, err
-			}
-			offset += size
-
-			value, size, err := parseTnetstringSegment(body[offset:])
-			if err != nil {
-				return nil, err
-			}
-			offset += size
-
-			key, err := tnetValueString(keyRaw)
-			if err != nil {
-				return nil, fmt.Errorf("not a tnetstring: invalid dictionary key: %w", err)
-			}
-			values[key] = value
-		}
-		return values, nil
+		return parseTnetstringDict(body)
 	default:
 		return nil, fmt.Errorf("unknown type tag: %d", tag)
 	}
+}
+
+func parseTnetstringScalar(tag byte, body []byte) (any, bool, error) {
+	switch tag {
+	case ',':
+		return body, true, nil
+	case ';':
+		return string(body), true, nil
+	case '#':
+		value, err := strconv.Atoi(string(body))
+		if err != nil {
+			return nil, true, fmt.Errorf("not a tnetstring: invalid integer literal: %q", string(body))
+		}
+		return value, true, nil
+	case '^':
+		value, err := strconv.ParseFloat(string(body), 64)
+		if err != nil {
+			return nil, true, fmt.Errorf("not a tnetstring: invalid float literal: %q", string(body))
+		}
+		return value, true, nil
+	case '!':
+		return parseTnetstringBool(body)
+	case '~':
+		return parseTnetstringNull(body)
+	default:
+		return nil, false, nil
+	}
+}
+
+func parseTnetstringBool(body []byte) (any, bool, error) {
+	switch string(body) {
+	case "true":
+		return true, true, nil
+	case "false":
+		return false, true, nil
+	default:
+		return nil, true, fmt.Errorf("not a tnetstring: invalid boolean literal: %q", string(body))
+	}
+}
+
+func parseTnetstringNull(body []byte) (any, bool, error) {
+	if len(body) != 0 {
+		return nil, true, fmt.Errorf("not a tnetstring: invalid null literal: %q", string(body))
+	}
+
+	return nil, true, nil
+}
+
+func parseTnetstringList(body []byte) ([]any, error) {
+	items := make([]any, 0)
+	for offset := 0; offset < len(body); {
+		item, size, err := parseTnetstringSegment(body[offset:])
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+		offset += size
+	}
+
+	return items, nil
+}
+
+func parseTnetstringDict(body []byte) (map[string]any, error) {
+	values := make(map[string]any)
+	for offset := 0; offset < len(body); {
+		keyRaw, value, nextOffset, err := parseTnetstringDictEntry(body, offset)
+		if err != nil {
+			return nil, err
+		}
+
+		key, err := tnetValueString(keyRaw)
+		if err != nil {
+			return nil, fmt.Errorf("not a tnetstring: invalid dictionary key: %w", err)
+		}
+		values[key] = value
+		offset = nextOffset
+	}
+
+	return values, nil
+}
+
+func parseTnetstringDictEntry(body []byte, offset int) (any, any, int, error) {
+	keyRaw, size, err := parseTnetstringSegment(body[offset:])
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	offset += size
+
+	value, size, err := parseTnetstringSegment(body[offset:])
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	return keyRaw, value, offset + size, nil
 }
