@@ -297,10 +297,10 @@ test_soap_service() {
     # For SOAP testing, we create a synthetic capture with the SOAP requests.
     log_info "Creating SOAP capture with direct requests..."
     local soap_capture="${target_dir}/soap-capture.json"
-    python3 - "$port" "$soap_capture" << 'PYEOF' 2>/dev/null
+    python3 - "$base_url" "$soap_capture" << 'PYEOF' 2>/dev/null
 import json, base64, sys
 
-port = sys.argv[1]
+base_url = sys.argv[1].rstrip('/')
 outfile = sys.argv[2]
 
 def b64(s):
@@ -312,7 +312,7 @@ for action in ['GetUser', 'ListUsers', 'CreateUser']:
     resp_body = '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><tns:%sResponse xmlns:tns="http://localhost/soap"><id>1</id></tns:%sResponse></soap:Body></soap:Envelope>' % (action, action)
     req = {
         'method': 'POST',
-        'url': 'http://localhost:%s/soap' % port,
+        'url': base_url + '/soap',
         'headers': {
             'Content-Type': 'text/xml; charset=utf-8',
             'SOAPAction': 'urn:%s' % action
@@ -331,7 +331,7 @@ for action in ['GetUser', 'ListUsers', 'CreateUser']:
 # Also add the WSDL fetch
 requests.append({
     'method': 'GET',
-    'url': 'http://localhost:%s/service.wsdl' % port,
+    'url': base_url + '/service.wsdl',
     'headers': {},
     'response': {
         'status_code': 200,
@@ -1211,15 +1211,17 @@ test_crawl_unreachable() {
     # test asserts graceful behavior against an unreachable target, which is
     # easier to guarantee on the in-container loopback than on the host gateway.
     log_info "Crawling unreachable target (http://localhost:19999)..."
-    local crawl_output
+    # Capture exit code explicitly: under `set -euo pipefail`, relying on $? after
+    # a multi-line command substitution assignment is fragile. Pre-init and use
+    # `|| crawl_exit=$?` so the non-zero path is always recorded.
+    local crawl_output crawl_exit=0
     crawl_output=$("$VESPASIAN" crawl "http://localhost:19999" \
         -o "$capture_file" \
         --depth 1 \
         --max-pages 5 \
         --timeout 15s \
         --dangerous-allow-private \
-        $verbose_flag 2>&1)
-    local crawl_exit=$?
+        $verbose_flag 2>&1) || crawl_exit=$?
 
     # Either the crawl fails with non-zero exit, or it succeeds with 0 results.
     # Either is acceptable — what matters is no crash/panic.
