@@ -22,6 +22,12 @@ CONFIG_FILE="${SCRIPT_DIR}/.live-test-config"
 RESULTS_DIR="${SCRIPT_DIR}/.results"
 VESPASIAN="${PROJECT_ROOT}/bin/vespasian"
 
+# Hostname the test harness uses to reach the target services. Defaults to
+# "localhost" for host-only runs. Set TEST_HOST=host.docker.internal (or the
+# devcontainer's detected host gateway) when the harness runs inside a
+# devcontainer while the target services run on the Docker host.
+TEST_HOST="${TEST_HOST:-localhost}"
+
 # Source shared colors, logging, and validation functions
 # shellcheck source=common.sh
 source "${SCRIPT_DIR}/common.sh"
@@ -117,7 +123,7 @@ PYEOF
 
 test_rest_api() {
     local port="${REST_API_PORT:-8990}"
-    local base_url="http://localhost:${port}"
+    local base_url="http://${TEST_HOST}:${port}"
     local target_dir="${RESULTS_DIR}/rest-api"
     local capture_file="${target_dir}/capture.json"
     local spec_file="${target_dir}/spec.yaml"
@@ -141,6 +147,7 @@ test_rest_api() {
         --depth 2 \
         --max-pages 50 \
         --timeout 2m \
+        --dangerous-allow-private \
         $verbose_flag 2>&1; then
         log_fail "Crawl failed"
         set_test_result "rest-api" "FAIL" "?" "?" "$((SECONDS - start))"
@@ -197,7 +204,7 @@ test_rest_api() {
 
 test_soap_service() {
     local port="${SOAP_SERVICE_PORT:-8991}"
-    local base_url="http://localhost:${port}"
+    local base_url="http://${TEST_HOST}:${port}"
     local target_dir="${RESULTS_DIR}/soap-service"
     local capture_file="${target_dir}/capture.json"
     local spec_file="${target_dir}/spec.xml"
@@ -218,7 +225,7 @@ test_soap_service() {
     # First, make some SOAP requests to generate traffic for the capture.
     log_info "Generating SOAP traffic..."
     for action in GetUser ListUsers CreateUser; do
-        curl -sf -X POST "http://localhost:${port}/soap" \
+        curl -sf -X POST "${base_url}/soap" \
             -H "Content-Type: text/xml; charset=utf-8" \
             -H "SOAPAction: \"urn:${action}\"" \
             -d "<?xml version=\"1.0\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Body><tns:${action}Request xmlns:tns=\"http://localhost/soap\"><id>1</id></tns:${action}Request></soap:Body></soap:Envelope>" \
@@ -232,6 +239,7 @@ test_soap_service() {
         --depth 2 \
         --max-pages 20 \
         --timeout 1m \
+        --dangerous-allow-private \
         $verbose_flag 2>&1; then
         log_warn "Crawl returned non-zero (may still have partial results)"
     fi
@@ -539,7 +547,7 @@ test_generate_wsdl() {
 
 test_graphql_server() {
     local port="${GRAPHQL_SERVER_PORT:-8992}"
-    local base_url="http://localhost:${port}"
+    local base_url="http://${TEST_HOST}:${port}"
     local target_dir="${RESULTS_DIR}/graphql-server"
     local capture_file="${target_dir}/capture.json"
     local spec_file="${target_dir}/spec.graphql"
@@ -946,7 +954,7 @@ test_import_empty() {
 
 test_edge_cases() {
     local port="${REST_API_PORT:-8990}"
-    local base_url="http://localhost:${port}"
+    local base_url="http://${TEST_HOST}:${port}"
     local target_dir="${RESULTS_DIR}/edge-cases"
     local verbose_flag=""
 
@@ -1085,6 +1093,7 @@ test_edge_cases() {
         --depth 3 \
         --max-pages 200 \
         --timeout 3m \
+        --dangerous-allow-private \
         $verbose_flag 2>&1; then
         log_ok "Crawl with edge cases: completed without crash"
 
@@ -1156,6 +1165,7 @@ test_crawl_unreachable() {
         --depth 1 \
         --max-pages 5 \
         --timeout 15s \
+        --dangerous-allow-private \
         $verbose_flag 2>&1)
     local crawl_exit=$?
 
@@ -1343,7 +1353,7 @@ test_import_duplicates() {
 
 test_crawl_depth() {
     local port="${REST_API_PORT:-8990}"
-    local base_url="http://localhost:${port}"
+    local base_url="http://${TEST_HOST}:${port}"
     local target_dir="${RESULTS_DIR}/crawl-depth"
     local verbose_flag=""
 
@@ -1365,6 +1375,7 @@ test_crawl_depth() {
         --depth 2 \
         --max-pages 50 \
         --timeout 1m \
+        --dangerous-allow-private \
         $verbose_flag 2>&1; then
 
         # Should have levels 1-2, but not 3+
@@ -1395,6 +1406,7 @@ PYEOF
         --depth 2 \
         --max-pages 10 \
         --timeout 1m \
+        --dangerous-allow-private \
         $verbose_flag 2>&1; then
 
         local page_count
@@ -1418,6 +1430,7 @@ PYEOF
         --depth 3 \
         --max-pages 20 \
         --timeout 30s \
+        --dangerous-allow-private \
         $verbose_flag 2>&1; then
         log_ok "Loop detection: crawl completed (did not hang)"
     else
@@ -1440,7 +1453,7 @@ PYEOF
 
 test_classifier_edge_cases() {
     local port="${REST_API_PORT:-8990}"
-    local base_url="http://localhost:${port}"
+    local base_url="http://${TEST_HOST}:${port}"
     local target_dir="${RESULTS_DIR}/classifier-edge"
     local verbose_flag=""
 

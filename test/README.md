@@ -99,6 +99,22 @@ Options:
 
 ## Configuration
 
+### `TEST_HOST` (optional)
+
+`run-live-tests.sh` reaches the target services at `http://${TEST_HOST:-localhost}:<port>`. The default (`localhost`) is correct when the harness and the targets run on the same host.
+
+Override `TEST_HOST` when the harness runs inside a devcontainer while the target services run on the Docker host. Example (Docker Desktop):
+
+```bash
+TEST_HOST=host.docker.internal ./test/run-live-tests.sh --targets rest-api
+```
+
+For Linux devcontainers without Docker Desktop, use the detected host gateway (e.g. the address of the `docker0` bridge or whatever name resolves to the host from inside the container).
+
+`setup-live-targets.sh` does not read `TEST_HOST` — run it on the host that actually runs the target binaries.
+
+### `.live-test-config`
+
 The setup script writes `.live-test-config` with resolved ports:
 
 ```
@@ -289,6 +305,8 @@ Ensure the target service is running and healthy:
 ```bash
 curl http://localhost:8990/api/health
 ```
+
+If you're running the harness inside a devcontainer and the targets are on the host, set `TEST_HOST` (see Configuration above). Without it, the crawler's SSRF guard rejects the seed URL and the capture is empty.
 
 ### Build failures
 
