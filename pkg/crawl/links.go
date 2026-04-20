@@ -47,13 +47,15 @@ var nonPageExtensions = []string{
 	".pdf", ".zip", ".tar", ".gz", ".rar", ".7z",
 }
 
-// nonPagePathFragments lists path fragments that indicate real-time or
-// streaming transports rather than crawlable pages. Navigating to them would
-// either 400 or (on SPA catch-all servers) return the SPA shell HTML and
-// trigger the same app code again at a nested path.
-var nonPagePathFragments = []string{
-	"/socket.io/",
-	"/engine.io/",
+// nonPagePathSegments lists path segments that indicate real-time or
+// streaming transports rather than crawlable pages. Matching is done per
+// path segment (split on "/") so that bare forms like /socket.io and
+// /socket.io?EIO=… are caught alongside /socket.io/…. Navigating to these
+// endpoints would either 400 or (on SPA catch-all servers) return the SPA
+// shell HTML and trigger the same app code again at a nested path.
+var nonPagePathSegments = []string{
+	"socket.io",
+	"engine.io",
 }
 
 // extractLinks extracts all navigable URLs from the current page DOM.
@@ -109,11 +111,15 @@ func extractLinks(page *rod.Page) ([]string, error) {
 // base tag itself holds a relative value), otherwise fall back to the page
 // URL. Returns pageURL on any parse failure.
 func effectiveBaseURL(page *rod.Page, pageURL string) string {
-	el, err := page.Element("base[href]")
-	if err != nil || el == nil {
+	// Use Elements (plural) rather than Element: the singular variant
+	// waits/retries until the page's context timeout when the selector
+	// is absent. Most pages have no <base>, so this would add a 1s+
+	// stall to every page visit.
+	elements, err := page.Elements("base[href]")
+	if err != nil || len(elements) == 0 {
 		return pageURL
 	}
-	href, err := el.Attribute("href")
+	href, err := elements[0].Attribute("href")
 	if err != nil || href == nil || strings.TrimSpace(*href) == "" {
 		return pageURL
 	}
@@ -189,9 +195,14 @@ func isLikelyPage(rawURL string) bool {
 		return true
 	}
 	path := strings.ToLower(u.Path)
-	for _, frag := range nonPagePathFragments {
-		if strings.Contains(path, frag) {
-			return false
+	for _, seg := range strings.Split(path, "/") {
+		if seg == "" {
+			continue
+		}
+		for _, blocked := range nonPagePathSegments {
+			if seg == blocked {
+				return false
+			}
 		}
 	}
 	// Look at the last segment only — a path like /assets/main.js/index

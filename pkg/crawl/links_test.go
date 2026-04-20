@@ -183,15 +183,34 @@ func TestIsLikelyPage_RejectsStreamingEndpoints(t *testing.T) {
 	// These endpoints return the SPA catch-all HTML on Juice Shop when
 	// hit via GET without the right protocol handshake; navigating to
 	// them would trigger recursive path nesting through relative asset
-	// references.
+	// references. Covers both trailing-slash and bare forms since the
+	// socket.io client uses both depending on transport state.
 	cases := []string{
 		"http://localhost:3000/socket.io/",
+		"http://localhost:3000/socket.io",
+		"http://localhost:3000/socket.io?EIO=4&transport=polling&t=abc",
 		"http://localhost:3000/socket.io/?EIO=4&transport=polling&t=abc",
+		"http://localhost:3000/engine.io",
 		"http://localhost:3000/engine.io/socket.io/",
 	}
 	for _, c := range cases {
 		if isLikelyPage(c) {
 			t.Errorf("isLikelyPage(%q) = true, want false", c)
+		}
+	}
+}
+
+// Guard against over-eager segment matching: a path whose segment merely
+// contains "socket.io" as a substring (e.g., /my-socket.io-wrapper) must
+// not be rejected.
+func TestIsLikelyPage_SegmentMatchIsExact(t *testing.T) {
+	cases := []string{
+		"http://localhost:3000/my-socket.io-wrapper",
+		"http://localhost:3000/docs/socket.io-guide",
+	}
+	for _, c := range cases {
+		if !isLikelyPage(c) {
+			t.Errorf("isLikelyPage(%q) = false, want true (substring, not segment)", c)
 		}
 	}
 }
