@@ -558,3 +558,74 @@ func TestIsHTMLResponse_ContentTypeInHeadersMap(t *testing.T) {
 		t.Errorf("expected true when Content-Type is in Headers map")
 	}
 }
+
+func TestExtractForms_GetMergesActionQueryString(t *testing.T) {
+	body := `<form action="/search?lang=en"><input name="q" value="foo"></form>`
+	reqs := []crawl.ObservedRequest{htmlReq("https://host/page", body)}
+	got := ExtractForms(reqs)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(got))
+	}
+	r := got[0]
+	if r.QueryParams["lang"] != "en" {
+		t.Errorf("QueryParams[lang] = %q, want en", r.QueryParams["lang"])
+	}
+	if r.QueryParams["q"] != "foo" {
+		t.Errorf("QueryParams[q] = %q, want foo", r.QueryParams["q"])
+	}
+	if !strings.Contains(r.URL, "lang=en") {
+		t.Errorf("URL missing lang=en; got %q", r.URL)
+	}
+	if !strings.Contains(r.URL, "q=foo") {
+		t.Errorf("URL missing q=foo; got %q", r.URL)
+	}
+}
+
+func TestExtractForms_GetFormFieldOverridesActionQueryDuplicate(t *testing.T) {
+	body := `<form action="/search?q=default"><input name="q" value="new"></form>`
+	reqs := []crawl.ObservedRequest{htmlReq("https://host/page", body)}
+	got := ExtractForms(reqs)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(got))
+	}
+	if got[0].QueryParams["q"] != "new" {
+		t.Errorf("QueryParams[q] = %q, want new (form field should win)", got[0].QueryParams["q"])
+	}
+}
+
+func TestExtractForms_PostPreservesActionQueryString(t *testing.T) {
+	body := `<form method="post" action="/login?ref=home"><input name="user" value="alice"></form>`
+	reqs := []crawl.ObservedRequest{htmlReq("https://host/page", body)}
+	got := ExtractForms(reqs)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(got))
+	}
+	r := got[0]
+	if !strings.Contains(r.URL, "ref=home") {
+		t.Errorf("URL missing ref=home; got %q", r.URL)
+	}
+	if r.QueryParams["ref"] != "home" {
+		t.Errorf("QueryParams[ref] = %q, want home", r.QueryParams["ref"])
+	}
+	bodyStr := string(r.Body)
+	if !strings.Contains(bodyStr, "user=alice") {
+		t.Errorf("body missing user=alice; got %q", bodyStr)
+	}
+	if strings.Contains(bodyStr, "ref=") {
+		t.Errorf("body should not contain ref=; got %q", bodyStr)
+	}
+}
+
+func TestParseForms_NestedUnclosedFormsFlushedInnermostFirst(t *testing.T) {
+	body := []byte(`<form action="/outer"><form action="/inner"><input name="x">`)
+	forms := parseForms(body)
+	if len(forms) != 2 {
+		t.Fatalf("expected 2 forms, got %d", len(forms))
+	}
+	if forms[0].Action != "/inner" {
+		t.Errorf("forms[0].Action = %q, want /inner", forms[0].Action)
+	}
+	if forms[1].Action != "/outer" {
+		t.Errorf("forms[1].Action = %q, want /outer", forms[1].Action)
+	}
+}

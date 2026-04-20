@@ -117,9 +117,10 @@ func parseForms(body []byte) []staticForm {
 		tt := z.Next()
 		switch tt {
 		case html.ErrorToken:
-			// EOF or malformed — flush any unclosed forms then return.
-			for _, f := range stack {
-				results = append(results, *f)
+			// EOF or malformed — flush unclosed forms innermost-first to match
+			// normal close-tag order (</form> pops from the top of the stack).
+			for i := len(stack) - 1; i >= 0; i-- {
+				results = append(results, *stack[i])
 			}
 			return results
 
@@ -234,9 +235,12 @@ func synthesizeRequest(f staticForm, baseURL string) (crawl.ObservedRequest, boo
 			return crawl.ObservedRequest{}, false
 		}
 		q := u.Query()
+		// Form fields take precedence over pre-existing action-URL query values
+		// on key conflict; all duplicate form-field values are preserved.
 		for k, vs := range values {
-			if len(vs) > 0 {
-				q.Set(k, vs[0])
+			q.Del(k)
+			for _, v := range vs {
+				q.Add(k, v)
 			}
 		}
 		u.RawQuery = q.Encode()
@@ -245,7 +249,7 @@ func synthesizeRequest(f staticForm, baseURL string) (crawl.ObservedRequest, boo
 	} else {
 		// NOTE: Even when the form declares multipart/form-data, we URL-encode
 		// the body. The goal of ExtractForms is parameter discovery for spec
-		// generation, not faithful request replay. Mirrors pkg/crawl/forms.go:113
+		// generation, not faithful request replay. Mirrors crawl.formsToObservedRequests
 		// for consistency.
 		obs.Headers = map[string]string{"content-type": enctype}
 		obs.Body = []byte(values.Encode())
@@ -306,7 +310,7 @@ func isCSRFName(name string) bool {
 }
 
 // isSkippableType reports whether an <input type="..."> carries no
-// parameter-discovery data. Matches pkg/crawl/forms.go:172-182 exactly:
+// parameter-discovery data. Matches crawl.isSkippableInputType exactly:
 // submit, button, image, reset, file (all lowercased).
 func isSkippableType(inputType string) bool {
 	switch inputType {
@@ -325,11 +329,13 @@ func fieldValue(f staticFormField) string {
 }
 
 // fieldsToValues converts staticFormField slice into url.Values, preserving
-// insertion order (url.Values.Encode sorts alphabetically — that's fine).
+// insertion order and all duplicates. url.Values.Add is used (not Set) because
+// staticForm.Fields explicitly allows duplicate names (e.g. multi-select
+// checkboxes, array-style names like tags[], repeated hidden fields).
 func fieldsToValues(fields []staticFormField) url.Values {
 	values := url.Values{}
 	for _, fld := range fields {
-		values.Set(fld.Name, fieldValue(fld))
+		values.Add(fld.Name, fieldValue(fld))
 	}
 	return values
 }
