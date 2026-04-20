@@ -22,6 +22,12 @@ CONFIG_FILE="${SCRIPT_DIR}/.live-test-config"
 RESULTS_DIR="${SCRIPT_DIR}/.results"
 VESPASIAN="${PROJECT_ROOT}/bin/vespasian"
 
+# Hostname the test harness uses to reach the target services. Defaults to
+# "localhost" for host-only runs. Set TEST_HOST=host.docker.internal (or the
+# devcontainer's detected host gateway) when the harness runs inside a
+# devcontainer while the target services run on the Docker host.
+TEST_HOST="${TEST_HOST:-localhost}"
+
 # Source shared colors, logging, and validation functions
 # shellcheck source=common.sh
 source "${SCRIPT_DIR}/common.sh"
@@ -52,6 +58,53 @@ load_config() {
     done < "$CONFIG_FILE"
 
     log_ok "Loaded config from ${CONFIG_FILE}"
+}
+
+# Probe one target's health endpoint at TEST_HOST. Returns 0 on success or
+# when the port is unset (target wasn't configured by setup-live-targets.sh).
+_probe_target_host() {
+    local port=$1 path=$2 name=$3
+    [ -z "$port" ] && return 0
+    local url="http://${TEST_HOST}:${port}${path}"
+    local curl_err
+    if curl_err=$(curl -sS -o /dev/null --max-time 5 "$url" 2>&1); then
+        log_ok "${name} reachable at ${url}"
+        return 0
+    fi
+    log_fail "${name} is unreachable at ${url}: ${curl_err}"
+    return 1
+}
+
+# Verify each selected live target is reachable at TEST_HOST before any
+# crawls run. A misconfigured TEST_HOST (typical for devcontainer users
+# who forgot to set it) otherwise surfaces as mysterious empty captures
+# downstream. Importer-only, synthetic-capture, and crawl-unreachable runs
+# don't touch a live host and are skipped.
+preflight_test_host() {
+    local targets=$1
+    local failed=0
+    case ",${targets}," in
+        *,rest-api,*|*,edge-cases,*|*,crawl-depth,*)
+            _probe_target_host "${REST_API_PORT:-}" "/api/health" "rest-api" || failed=1
+            ;;
+    esac
+    case ",${targets}," in
+        *,soap-service,*)
+            _probe_target_host "${SOAP_SERVICE_PORT:-}" "/service.wsdl" "soap-service" || failed=1
+            ;;
+    esac
+    case ",${targets}," in
+        *,graphql-server,*)
+            _probe_target_host "${GRAPHQL_SERVER_PORT:-}" "/" "graphql-server" || failed=1
+            ;;
+    esac
+    [ $failed -eq 0 ] && return 0
+    if [ "$TEST_HOST" = "localhost" ]; then
+        log_info "Is ./test/setup-live-targets.sh running? Check the failing URL on this host."
+    else
+        log_info "TEST_HOST=${TEST_HOST} cannot reach one or more targets. For a devcontainer on Docker Desktop try TEST_HOST=host.docker.internal."
+    fi
+    exit 1
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -117,7 +170,7 @@ PYEOF
 
 test_rest_api() {
     local port="${REST_API_PORT:-8990}"
-    local base_url="http://localhost:${port}"
+    local base_url="http://${TEST_HOST}:${port}"
     local target_dir="${RESULTS_DIR}/rest-api"
     local capture_file="${target_dir}/capture.json"
     local spec_file="${target_dir}/spec.yaml"
@@ -141,6 +194,7 @@ test_rest_api() {
         --depth 2 \
         --max-pages 50 \
         --timeout 2m \
+        --dangerous-allow-private \
         $verbose_flag 2>&1; then
         log_fail "Crawl failed"
         set_test_result "rest-api" "FAIL" "?" "?" "$((SECONDS - start))"
@@ -197,7 +251,7 @@ test_rest_api() {
 
 test_soap_service() {
     local port="${SOAP_SERVICE_PORT:-8991}"
-    local base_url="http://localhost:${port}"
+    local base_url="http://${TEST_HOST}:${port}"
     local target_dir="${RESULTS_DIR}/soap-service"
     local capture_file="${target_dir}/capture.json"
     local spec_file="${target_dir}/spec.xml"
@@ -216,9 +270,11 @@ test_soap_service() {
 
     # Step 1: Crawl the SOAP service
     # First, make some SOAP requests to generate traffic for the capture.
+    # Note: xmlns:tns="http://localhost/soap" is a SOAP target-namespace
+    # identifier (not a URL), so it stays literal regardless of TEST_HOST.
     log_info "Generating SOAP traffic..."
     for action in GetUser ListUsers CreateUser; do
-        curl -sf -X POST "http://localhost:${port}/soap" \
+        curl -sf -X POST "${base_url}/soap" \
             -H "Content-Type: text/xml; charset=utf-8" \
             -H "SOAPAction: \"urn:${action}\"" \
             -d "<?xml version=\"1.0\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Body><tns:${action}Request xmlns:tns=\"http://localhost/soap\"><id>1</id></tns:${action}Request></soap:Body></soap:Envelope>" \
@@ -232,6 +288,7 @@ test_soap_service() {
         --depth 2 \
         --max-pages 20 \
         --timeout 1m \
+        --dangerous-allow-private \
         $verbose_flag 2>&1; then
         log_warn "Crawl returned non-zero (may still have partial results)"
     fi
@@ -240,10 +297,10 @@ test_soap_service() {
     # For SOAP testing, we create a synthetic capture with the SOAP requests.
     log_info "Creating SOAP capture with direct requests..."
     local soap_capture="${target_dir}/soap-capture.json"
-    python3 - "$port" "$soap_capture" << 'PYEOF' 2>/dev/null
+    python3 - "$base_url" "$soap_capture" << 'PYEOF' 2>/dev/null
 import json, base64, sys
 
-port = sys.argv[1]
+base_url = sys.argv[1].rstrip('/')
 outfile = sys.argv[2]
 
 def b64(s):
@@ -255,7 +312,7 @@ for action in ['GetUser', 'ListUsers', 'CreateUser']:
     resp_body = '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><tns:%sResponse xmlns:tns="http://localhost/soap"><id>1</id></tns:%sResponse></soap:Body></soap:Envelope>' % (action, action)
     req = {
         'method': 'POST',
-        'url': 'http://localhost:%s/soap' % port,
+        'url': base_url + '/soap',
         'headers': {
             'Content-Type': 'text/xml; charset=utf-8',
             'SOAPAction': 'urn:%s' % action
@@ -274,7 +331,7 @@ for action in ['GetUser', 'ListUsers', 'CreateUser']:
 # Also add the WSDL fetch
 requests.append({
     'method': 'GET',
-    'url': 'http://localhost:%s/service.wsdl' % port,
+    'url': base_url + '/service.wsdl',
     'headers': {},
     'response': {
         'status_code': 200,
@@ -539,7 +596,7 @@ test_generate_wsdl() {
 
 test_graphql_server() {
     local port="${GRAPHQL_SERVER_PORT:-8992}"
-    local base_url="http://localhost:${port}"
+    local base_url="http://${TEST_HOST}:${port}"
     local target_dir="${RESULTS_DIR}/graphql-server"
     local capture_file="${target_dir}/capture.json"
     local spec_file="${target_dir}/spec.graphql"
@@ -946,7 +1003,7 @@ test_import_empty() {
 
 test_edge_cases() {
     local port="${REST_API_PORT:-8990}"
-    local base_url="http://localhost:${port}"
+    local base_url="http://${TEST_HOST}:${port}"
     local target_dir="${RESULTS_DIR}/edge-cases"
     local verbose_flag=""
 
@@ -1085,6 +1142,7 @@ test_edge_cases() {
         --depth 3 \
         --max-pages 200 \
         --timeout 3m \
+        --dangerous-allow-private \
         $verbose_flag 2>&1; then
         log_ok "Crawl with edge cases: completed without crash"
 
@@ -1148,16 +1206,22 @@ test_crawl_unreachable() {
 
     log_header "Testing: crawl-unreachable (target not running)"
 
-    # Crawl a port where nothing is listening
+    # Crawl a port where nothing is listening.
+    # Intentionally hardcoded to localhost:19999 regardless of TEST_HOST — this
+    # test asserts graceful behavior against an unreachable target, which is
+    # easier to guarantee on the in-container loopback than on the host gateway.
     log_info "Crawling unreachable target (http://localhost:19999)..."
-    local crawl_output
+    # Capture exit code explicitly: under `set -euo pipefail`, relying on $? after
+    # a multi-line command substitution assignment is fragile. Pre-init and use
+    # `|| crawl_exit=$?` so the non-zero path is always recorded.
+    local crawl_output crawl_exit=0
     crawl_output=$("$VESPASIAN" crawl "http://localhost:19999" \
         -o "$capture_file" \
         --depth 1 \
         --max-pages 5 \
         --timeout 15s \
-        $verbose_flag 2>&1)
-    local crawl_exit=$?
+        --dangerous-allow-private \
+        $verbose_flag 2>&1) || crawl_exit=$?
 
     # Either the crawl fails with non-zero exit, or it succeeds with 0 results.
     # Either is acceptable — what matters is no crash/panic.
@@ -1343,7 +1407,7 @@ test_import_duplicates() {
 
 test_crawl_depth() {
     local port="${REST_API_PORT:-8990}"
-    local base_url="http://localhost:${port}"
+    local base_url="http://${TEST_HOST}:${port}"
     local target_dir="${RESULTS_DIR}/crawl-depth"
     local verbose_flag=""
 
@@ -1365,6 +1429,7 @@ test_crawl_depth() {
         --depth 2 \
         --max-pages 50 \
         --timeout 1m \
+        --dangerous-allow-private \
         $verbose_flag 2>&1; then
 
         # Should have levels 1-2, but not 3+
@@ -1395,6 +1460,7 @@ PYEOF
         --depth 2 \
         --max-pages 10 \
         --timeout 1m \
+        --dangerous-allow-private \
         $verbose_flag 2>&1; then
 
         local page_count
@@ -1418,6 +1484,7 @@ PYEOF
         --depth 3 \
         --max-pages 20 \
         --timeout 30s \
+        --dangerous-allow-private \
         $verbose_flag 2>&1; then
         log_ok "Loop detection: crawl completed (did not hang)"
     else
@@ -1440,7 +1507,6 @@ PYEOF
 
 test_classifier_edge_cases() {
     local port="${REST_API_PORT:-8990}"
-    local base_url="http://localhost:${port}"
     local target_dir="${RESULTS_DIR}/classifier-edge"
     local verbose_flag=""
 
@@ -1934,6 +2000,8 @@ main() {
         targets="${targets},edge-cases,crawl-depth,crawl-unreachable"
         targets="${targets},classifier-edge,spec-edge"
     fi
+
+    preflight_test_host "$targets"
 
     # Create results directory
     mkdir -p "$RESULTS_DIR"
