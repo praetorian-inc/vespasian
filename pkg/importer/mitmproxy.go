@@ -143,27 +143,39 @@ func (i *MitmproxyImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error)
 		}
 		requests = []crawl.ObservedRequest{req}
 	case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
-		for {
-			availableBytes := int64(bufReader.Buffered()) + limitedReader.remaining
-			rawFlow, err := readTnetstring(bufReader, availableBytes, maxImportSize)
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
+		return i.importNativeDump(bufReader, limitedReader)
+	default:
+		return nil, fmt.Errorf("mitmproxy importer: expected JSON array or object, got %q", string(firstByte))
+	}
+
+	return requests, nil
+}
+
+// importNativeDump reads concatenated native mitmproxy tnetstring flows.
+func (i *MitmproxyImporter) importNativeDump(bufReader *bufio.Reader, limitedReader *limitedReader) ([]crawl.ObservedRequest, error) {
+	var requests []crawl.ObservedRequest
+
+	for {
+		availableBytes := int64(bufReader.Buffered()) + limitedReader.remaining
+		rawFlow, err := readTnetstring(bufReader, availableBytes, maxImportSize)
+		if err != nil {
+			if err == io.EOF {
 				if limitedReader.hitLimit {
 					return nil, ErrFileTooLarge
 				}
-				return nil, fmt.Errorf("mitmproxy importer: failed to decode tnetstring flow: %w", err)
+				break
 			}
-
-			req, err := i.parseNativeFlow(rawFlow)
-			if err != nil {
-				return nil, fmt.Errorf("mitmproxy importer: %w", err)
+			if limitedReader.hitLimit {
+				return nil, ErrFileTooLarge
 			}
-			requests = append(requests, req)
+			return nil, fmt.Errorf("mitmproxy importer: failed to decode tnetstring flow: %w", err)
 		}
-	default:
-		return nil, fmt.Errorf("mitmproxy importer: expected JSON array or object, got %q", string(firstByte))
+
+		req, err := i.parseNativeFlow(rawFlow)
+		if err != nil {
+			return nil, fmt.Errorf("mitmproxy importer: %w", err)
+		}
+		requests = append(requests, req)
 	}
 
 	return requests, nil
@@ -218,6 +230,7 @@ func (i *MitmproxyImporter) parseFlow(flow mitmproxyFlow) (crawl.ObservedRequest
 	)
 }
 
+// parseNativeFlow normalizes one native mitmproxy flow record into capture data.
 func (i *MitmproxyImporter) parseNativeFlow(rawFlow any) (crawl.ObservedRequest, error) {
 	flowMap, ok := rawFlow.(map[string]any)
 	if !ok {
@@ -242,6 +255,7 @@ func (i *MitmproxyImporter) parseNativeFlow(rawFlow any) (crawl.ObservedRequest,
 	return buildObservedRequest(request, response)
 }
 
+// buildObservedRequest applies shared validation and response shaping for both mitmproxy formats.
 func buildObservedRequest(request mitmproxyNormalizedRequest, response mitmproxyNormalizedResponse) (crawl.ObservedRequest, error) {
 	if request.Port < 0 || request.Port > 65535 {
 		return crawl.ObservedRequest{}, fmt.Errorf("invalid port: %d (must be 0-65535)", request.Port)

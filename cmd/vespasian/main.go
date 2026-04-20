@@ -435,6 +435,7 @@ func (c *CrawlCmd) Run() error {
 	})
 }
 
+// openImportInputFile opens an import source and upgrades permission failures with recovery guidance.
 func openImportInputFile(path string) (*os.File, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -444,6 +445,7 @@ func openImportInputFile(path string) (*os.File, error) {
 	return f, nil
 }
 
+// formatImportInputFileError rewrites permission errors into actionable import guidance.
 func formatImportInputFileError(path string, err error) error {
 	if errors.Is(err, fs.ErrPermission) || os.IsPermission(err) {
 		var msg strings.Builder
@@ -459,6 +461,7 @@ func formatImportInputFileError(path string, err error) error {
 	return fmt.Errorf("open input file: %w", err)
 }
 
+// isLikelyMacOSProtectedPath reports whether a path lives in a folder commonly gated by macOS TCC.
 func isLikelyMacOSProtectedPath(path string) bool {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {

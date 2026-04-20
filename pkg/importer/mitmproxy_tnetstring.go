@@ -21,6 +21,7 @@ import (
 	"strconv"
 )
 
+// parseNativeRequest extracts the request fields needed from a native mitmproxy flow map.
 func parseNativeRequest(raw map[string]any) (mitmproxyNormalizedRequest, error) {
 	method, err := tnetValueString(raw["method"])
 	if err != nil {
@@ -62,6 +63,7 @@ func parseNativeRequest(raw map[string]any) (mitmproxyNormalizedRequest, error) 
 	}, nil
 }
 
+// parseNativeResponse extracts the response fields needed from a native mitmproxy flow map.
 func parseNativeResponse(raw any) (mitmproxyNormalizedResponse, error) {
 	if raw == nil {
 		return mitmproxyNormalizedResponse{}, nil
@@ -92,6 +94,7 @@ func parseNativeResponse(raw any) (mitmproxyNormalizedResponse, error) {
 	}, nil
 }
 
+// tnetHeaderPairs converts native mitmproxy header tuples into the shared header representation.
 func tnetHeaderPairs(raw any) ([][]string, error) {
 	if raw == nil {
 		return nil, nil
@@ -124,6 +127,7 @@ func tnetHeaderPairs(raw any) ([][]string, error) {
 	return headers, nil
 }
 
+// tnetValueString converts a parsed tnetstring scalar into a Go string.
 func tnetValueString(raw any) (string, error) {
 	switch value := raw.(type) {
 	case string:
@@ -135,6 +139,7 @@ func tnetValueString(raw any) (string, error) {
 	}
 }
 
+// tnetValueBytes converts a parsed tnetstring scalar into raw bytes.
 func tnetValueBytes(raw any) ([]byte, error) {
 	if raw == nil {
 		return nil, nil
@@ -150,6 +155,7 @@ func tnetValueBytes(raw any) ([]byte, error) {
 	}
 }
 
+// tnetValueInt converts a parsed tnetstring numeric value into a Go int.
 func tnetValueInt(raw any) (int, error) {
 	switch value := raw.(type) {
 	case int:
@@ -163,6 +169,7 @@ func tnetValueInt(raw any) (int, error) {
 	}
 }
 
+// readTnetstring reads one top-level tnetstring value with size sanity checks.
 func readTnetstring(r *bufio.Reader, availableBytes int64, maxBodySize int64) (any, error) {
 	firstByte, err := r.ReadByte()
 	if err != nil {
@@ -223,6 +230,7 @@ func readTnetstring(r *bufio.Reader, availableBytes int64, maxBodySize int64) (a
 	return parseTnetstringValue(tag, body)
 }
 
+// parseTnetstringSegment decodes one nested tnetstring value from a byte slice.
 func parseTnetstringSegment(data []byte) (any, int, error) {
 	prefixEnd := -1
 	for i, b := range data {
@@ -257,6 +265,7 @@ func parseTnetstringSegment(data []byte) (any, int, error) {
 	return value, bodyEnd + 1, nil
 }
 
+// parseTnetstringValue converts a tnetstring tag/body pair into native Go values.
 func parseTnetstringValue(tag byte, body []byte) (any, error) {
 	switch tag {
 	case ',':

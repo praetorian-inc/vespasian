@@ -777,6 +777,33 @@ func TestReadTnetstring_LengthExceedsConfiguredLimit(t *testing.T) {
 	require.ErrorIs(t, err, ErrFileTooLarge)
 }
 
+func TestMitmproxyImporter_NativeDumpHitLimitReturnsFileTooLarge(t *testing.T) {
+	m := &MitmproxyImporter{}
+
+	flow := encodeTnetDict(
+		tnetKV("request", encodeTnetDict(
+			tnetKV("method", encodeTnetBytes("GET")),
+			tnetKV("scheme", encodeTnetBytes("https")),
+			tnetKV("host", encodeTnetString("example.com")),
+			tnetKV("port", encodeTnetInt(443)),
+			tnetKV("path", encodeTnetBytes("/limited")),
+			tnetKV("headers", encodeTnetList()),
+			tnetKV("content", encodeTnetNil()),
+		)),
+		tnetKV("response", encodeTnetDict(
+			tnetKV("status_code", encodeTnetInt(200)),
+			tnetKV("headers", encodeTnetList()),
+			tnetKV("content", encodeTnetNil()),
+		)),
+		tnetKV("type", encodeTnetString("http")),
+		tnetKV("version", encodeTnetInt(21)),
+	)
+
+	lr := newLimitedReader(bytes.NewReader(flow), int64(len(flow)))
+	_, err := m.importNativeDump(bufio.NewReader(lr), lr)
+	require.ErrorIs(t, err, ErrFileTooLarge)
+}
+
 type tnetKVPair struct {
 	key   string
 	value []byte
