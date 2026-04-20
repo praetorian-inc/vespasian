@@ -15,6 +15,8 @@
 package importer
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/base64"
 	"fmt"
 	"strings"
@@ -215,6 +217,108 @@ func TestMitmproxyImporter_Import(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMitmproxyImporter_ImportNativeDump(t *testing.T) {
+	m := &MitmproxyImporter{}
+
+	flow := encodeTnetDict(
+		tnetKV("request", encodeTnetDict(
+			tnetKV("method", encodeTnetBytes("POST")),
+			tnetKV("scheme", encodeTnetBytes("https")),
+			tnetKV("host", encodeTnetString("api.example.com")),
+			tnetKV("port", encodeTnetInt(443)),
+			tnetKV("path", encodeTnetBytes("/graphql?op=Ping")),
+			tnetKV("headers", encodeTnetList(
+				encodeTnetList(
+					encodeTnetBytes("Content-Type"),
+					encodeTnetBytes("application/json"),
+				),
+				encodeTnetList(
+					encodeTnetBytes("X-Test"),
+					encodeTnetBytes("native"),
+				),
+			)),
+			tnetKV("content", encodeTnetBytes(`{"query":"query Ping { ping }"}`)),
+		)),
+		tnetKV("response", encodeTnetDict(
+			tnetKV("status_code", encodeTnetInt(200)),
+			tnetKV("headers", encodeTnetList(
+				encodeTnetList(
+					encodeTnetBytes("Content-Type"),
+					encodeTnetBytes("application/json"),
+				),
+			)),
+			tnetKV("content", encodeTnetBytes(`{"data":{"ping":"pong"}}`)),
+		)),
+		tnetKV("type", encodeTnetString("http")),
+		tnetKV("version", encodeTnetInt(21)),
+	)
+
+	requests, err := m.Import(bytes.NewReader(flow))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	req := requests[0]
+	assert.Equal(t, "POST", req.Method)
+	assert.Equal(t, "https://api.example.com/graphql?op=Ping", req.URL)
+	assert.Equal(t, `{"query":"query Ping { ping }"}`, string(req.Body))
+	assert.Equal(t, "native", req.Headers["X-Test"])
+	assert.Equal(t, 200, req.Response.StatusCode)
+	assert.Equal(t, `{"data":{"ping":"pong"}}`, string(req.Response.Body))
+	assert.Equal(t, "application/json", req.Response.ContentType)
+	assert.Equal(t, "import:mitmproxy", req.Source)
+}
+
+func TestMitmproxyImporter_ImportNativeDumpConcatenatedFlows(t *testing.T) {
+	m := &MitmproxyImporter{}
+
+	firstFlow := encodeTnetDict(
+		tnetKV("request", encodeTnetDict(
+			tnetKV("method", encodeTnetBytes("GET")),
+			tnetKV("scheme", encodeTnetBytes("http")),
+			tnetKV("host", encodeTnetString("example.com")),
+			tnetKV("port", encodeTnetInt(80)),
+			tnetKV("path", encodeTnetBytes("/one")),
+			tnetKV("headers", encodeTnetList()),
+			tnetKV("content", encodeTnetNil()),
+		)),
+		tnetKV("response", encodeTnetDict(
+			tnetKV("status_code", encodeTnetInt(204)),
+			tnetKV("headers", encodeTnetList()),
+			tnetKV("content", encodeTnetNil()),
+		)),
+		tnetKV("type", encodeTnetString("http")),
+		tnetKV("version", encodeTnetInt(21)),
+	)
+	secondFlow := encodeTnetDict(
+		tnetKV("request", encodeTnetDict(
+			tnetKV("method", encodeTnetBytes("GET")),
+			tnetKV("scheme", encodeTnetBytes("https")),
+			tnetKV("host", encodeTnetString("example.com")),
+			tnetKV("port", encodeTnetInt(443)),
+			tnetKV("path", encodeTnetBytes("/two?x=1")),
+			tnetKV("headers", encodeTnetList()),
+			tnetKV("content", encodeTnetNil()),
+		)),
+		tnetKV("response", encodeTnetDict(
+			tnetKV("status_code", encodeTnetInt(200)),
+			tnetKV("headers", encodeTnetList()),
+			tnetKV("content", encodeTnetBytes("ok")),
+		)),
+		tnetKV("type", encodeTnetString("http")),
+		tnetKV("version", encodeTnetInt(21)),
+	)
+
+	requests, err := m.Import(bytes.NewReader(append(firstFlow, secondFlow...)))
+	require.NoError(t, err)
+	require.Len(t, requests, 2)
+
+	assert.Equal(t, "http://example.com/one", requests[0].URL)
+	assert.Equal(t, 204, requests[0].Response.StatusCode)
+	assert.Equal(t, "https://example.com/two?x=1", requests[1].URL)
+	assert.Equal(t, "1", requests[1].QueryParams["x"])
+	assert.Equal(t, "ok", string(requests[1].Response.Body))
 }
 
 func TestMitmproxyImporter_Import_Errors(t *testing.T) {
@@ -660,4 +764,82 @@ func TestMitmproxyImporter_InvalidMethod(t *testing.T) {
 	_, err := m.Import(strings.NewReader(json))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid HTTP method: INVALID")
+}
+
+func TestReadTnetstring_LengthExceedsAvailableData(t *testing.T) {
+	_, err := readTnetstring(bufio.NewReader(strings.NewReader("10:abc,")), 6, maxImportSize)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid length prefix")
+}
+
+func TestReadTnetstring_LengthExceedsConfiguredLimit(t *testing.T) {
+	_, err := readTnetstring(bufio.NewReader(strings.NewReader("10:abc,")), 32, 4)
+	require.ErrorIs(t, err, ErrFileTooLarge)
+}
+
+func TestMitmproxyImporter_NativeDumpHitLimitReturnsFileTooLarge(t *testing.T) {
+	m := &MitmproxyImporter{}
+
+	flow := encodeTnetDict(
+		tnetKV("request", encodeTnetDict(
+			tnetKV("method", encodeTnetBytes("GET")),
+			tnetKV("scheme", encodeTnetBytes("https")),
+			tnetKV("host", encodeTnetString("example.com")),
+			tnetKV("port", encodeTnetInt(443)),
+			tnetKV("path", encodeTnetBytes("/limited")),
+			tnetKV("headers", encodeTnetList()),
+			tnetKV("content", encodeTnetNil()),
+		)),
+		tnetKV("response", encodeTnetDict(
+			tnetKV("status_code", encodeTnetInt(200)),
+			tnetKV("headers", encodeTnetList()),
+			tnetKV("content", encodeTnetNil()),
+		)),
+		tnetKV("type", encodeTnetString("http")),
+		tnetKV("version", encodeTnetInt(21)),
+	)
+
+	lr := newLimitedReader(bytes.NewReader(flow), int64(len(flow)))
+	_, err := m.importNativeDump(bufio.NewReader(lr), lr)
+	require.ErrorIs(t, err, ErrFileTooLarge)
+}
+
+type tnetKVPair struct {
+	key   string
+	value []byte
+}
+
+func tnetKV(key string, value []byte) tnetKVPair {
+	return tnetKVPair{key: key, value: value}
+}
+
+func encodeTnetBytes(value string) []byte {
+	return []byte(fmt.Sprintf("%d:%s,", len(value), value))
+}
+
+func encodeTnetString(value string) []byte {
+	return []byte(fmt.Sprintf("%d:%s;", len(value), value))
+}
+
+func encodeTnetInt(value int) []byte {
+	raw := fmt.Sprintf("%d", value)
+	return []byte(fmt.Sprintf("%d:%s#", len(raw), raw))
+}
+
+func encodeTnetNil() []byte {
+	return []byte("0:~")
+}
+
+func encodeTnetList(items ...[]byte) []byte {
+	body := bytes.Join(items, nil)
+	return []byte(fmt.Sprintf("%d:%s]", len(body), body))
+}
+
+func encodeTnetDict(items ...tnetKVPair) []byte {
+	parts := make([][]byte, 0, len(items)*2)
+	for _, item := range items {
+		parts = append(parts, encodeTnetString(item.key), item.value)
+	}
+	body := bytes.Join(parts, nil)
+	return []byte(fmt.Sprintf("%d:%s}", len(body), body))
 }

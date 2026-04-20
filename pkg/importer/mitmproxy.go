@@ -50,6 +50,22 @@ type mitmproxyResponse struct {
 	Content    *string    `json:"content"`
 }
 
+type mitmproxyNormalizedRequest struct {
+	Method  string
+	Scheme  string
+	Host    string
+	Port    int
+	Path    string
+	Headers [][]string
+	Content []byte
+}
+
+type mitmproxyNormalizedResponse struct {
+	StatusCode int
+	Headers    [][]string
+	Content    []byte
+}
+
 // Name returns the importer name.
 func (MitmproxyImporter) Name() string {
 	return "mitmproxy"
@@ -126,8 +142,40 @@ func (i *MitmproxyImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error)
 			return nil, fmt.Errorf("mitmproxy importer: %w", err)
 		}
 		requests = []crawl.ObservedRequest{req}
+	case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		return i.importNativeDump(bufReader, limitedReader)
 	default:
 		return nil, fmt.Errorf("mitmproxy importer: expected JSON array or object, got %q", string(firstByte))
+	}
+
+	return requests, nil
+}
+
+// importNativeDump reads concatenated native mitmproxy tnetstring flows.
+func (i *MitmproxyImporter) importNativeDump(bufReader *bufio.Reader, limitedReader *limitedReader) ([]crawl.ObservedRequest, error) {
+	var requests []crawl.ObservedRequest
+
+	for {
+		availableBytes := int64(bufReader.Buffered()) + limitedReader.remaining
+		rawFlow, err := readTnetstring(bufReader, availableBytes, maxImportSize)
+		if err != nil {
+			if err == io.EOF {
+				if limitedReader.hitLimit {
+					return nil, ErrFileTooLarge
+				}
+				break
+			}
+			if limitedReader.hitLimit {
+				return nil, ErrFileTooLarge
+			}
+			return nil, fmt.Errorf("mitmproxy importer: failed to decode tnetstring flow: %w", err)
+		}
+
+		req, err := i.parseNativeFlow(rawFlow)
+		if err != nil {
+			return nil, fmt.Errorf("mitmproxy importer: %w", err)
+		}
+		requests = append(requests, req)
 	}
 
 	return requests, nil
@@ -154,43 +202,82 @@ func peekFirstNonWhitespace(r *bufio.Reader) (byte, error) {
 // parseFlow converts a mitmproxyFlow into an ObservedRequest.
 // Constructs URL from request components, decodes base64 content, and extracts headers.
 func (i *MitmproxyImporter) parseFlow(flow mitmproxyFlow) (crawl.ObservedRequest, error) {
-	// Validate port
-	if flow.Request.Port < 0 || flow.Request.Port > 65535 {
-		return crawl.ObservedRequest{}, fmt.Errorf("invalid port: %d (must be 0-65535)", flow.Request.Port)
-	}
-
-	// Validate HTTP method for consistency with Burp importer
-	if !validHTTPMethods[flow.Request.Method] {
-		return crawl.ObservedRequest{}, fmt.Errorf("invalid HTTP method: %s", flow.Request.Method)
-	}
-
-	// Construct URL
-	url := constructURL(flow.Request.Scheme, flow.Request.Host, flow.Request.Port, flow.Request.Path)
-
-	// Decode request content
 	reqBody, err := decodeContent(flow.Request.Content)
 	if err != nil {
 		return crawl.ObservedRequest{}, fmt.Errorf("failed to decode request content: %w", err)
 	}
 
-	// Decode response content
 	respBody, err := decodeContent(flow.Response.Content)
 	if err != nil {
 		return crawl.ObservedRequest{}, fmt.Errorf("failed to decode response content: %w", err)
 	}
 
-	respHeaders := convertMitmproxyHeaders(flow.Response.Headers)
+	return buildObservedRequest(
+		mitmproxyNormalizedRequest{
+			Method:  flow.Request.Method,
+			Scheme:  flow.Request.Scheme,
+			Host:    flow.Request.Host,
+			Port:    flow.Request.Port,
+			Path:    flow.Request.Path,
+			Headers: flow.Request.Headers,
+			Content: reqBody,
+		},
+		mitmproxyNormalizedResponse{
+			StatusCode: flow.Response.StatusCode,
+			Headers:    flow.Response.Headers,
+			Content:    respBody,
+		},
+	)
+}
+
+// parseNativeFlow normalizes one native mitmproxy flow record into capture data.
+func (i *MitmproxyImporter) parseNativeFlow(rawFlow any) (crawl.ObservedRequest, error) {
+	flowMap, ok := rawFlow.(map[string]any)
+	if !ok {
+		return crawl.ObservedRequest{}, fmt.Errorf("invalid native mitmproxy flow")
+	}
+
+	requestMap, ok := flowMap["request"].(map[string]any)
+	if !ok {
+		return crawl.ObservedRequest{}, fmt.Errorf("invalid native mitmproxy request")
+	}
+
+	request, err := parseNativeRequest(requestMap)
+	if err != nil {
+		return crawl.ObservedRequest{}, err
+	}
+
+	response, err := parseNativeResponse(flowMap["response"])
+	if err != nil {
+		return crawl.ObservedRequest{}, err
+	}
+
+	return buildObservedRequest(request, response)
+}
+
+// buildObservedRequest applies shared validation and response shaping for both mitmproxy formats.
+func buildObservedRequest(request mitmproxyNormalizedRequest, response mitmproxyNormalizedResponse) (crawl.ObservedRequest, error) {
+	if request.Port < 0 || request.Port > 65535 {
+		return crawl.ObservedRequest{}, fmt.Errorf("invalid port: %d (must be 0-65535)", request.Port)
+	}
+	if !validHTTPMethods[request.Method] {
+		return crawl.ObservedRequest{}, fmt.Errorf("invalid HTTP method: %s", request.Method)
+	}
+
+	url := constructURL(request.Scheme, request.Host, request.Port, request.Path)
+	respHeaders := convertMitmproxyHeaders(response.Headers)
+
 	return crawl.ObservedRequest{
-		Method:      flow.Request.Method,
+		Method:      request.Method,
 		URL:         url,
-		Headers:     convertMitmproxyHeaders(flow.Request.Headers),
+		Headers:     convertMitmproxyHeaders(request.Headers),
 		QueryParams: extractQueryParams(url),
-		Body:        reqBody,
+		Body:        request.Content,
 		Response: crawl.ObservedResponse{
-			StatusCode:  flow.Response.StatusCode,
+			StatusCode:  response.StatusCode,
 			Headers:     respHeaders,
 			ContentType: respHeaders["Content-Type"],
-			Body:        respBody,
+			Body:        response.Content,
 		},
 		Source: "import:mitmproxy",
 	}, nil

@@ -24,6 +24,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -396,6 +397,73 @@ func TestImportCmdMissingFile(t *testing.T) {
 	err := cmd.Run()
 	if err == nil {
 		t.Error("expected error for missing file")
+	}
+	if !strings.Contains(err.Error(), "open input file") {
+		t.Errorf("ImportCmd.Run() error = %q, want error containing %q", err.Error(), "open input file")
+	}
+}
+
+func TestImportCmdPermissionDenied(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod-based permission test is not reliable on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("permission-denied test is not reliable when running as root")
+	}
+
+	tmpFile := filepath.Join(t.TempDir(), "permission-denied.xml")
+	if writeErr := os.WriteFile(tmpFile, []byte("<items></items>"), 0600); writeErr != nil {
+		t.Fatalf("failed to write temp file: %v", writeErr)
+	}
+	if chmodErr := os.Chmod(tmpFile, 0200); chmodErr != nil {
+		t.Fatalf("failed to remove read permission: %v", chmodErr)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(tmpFile, 0600)
+	})
+
+	cmd := &ImportCmd{
+		Format: "burp",
+		File:   tmpFile,
+	}
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("expected error for unreadable file")
+	}
+	if !strings.Contains(err.Error(), "vespasian could not read input file") {
+		t.Errorf("ImportCmd.Run() error = %q, want error containing %q", err.Error(), "vespasian could not read input file")
+	}
+	if !strings.Contains(err.Error(), "Move or copy the file to a non-protected path such as /tmp and retry") {
+		t.Errorf("ImportCmd.Run() error = %q, want recovery guidance", err.Error())
+	}
+}
+
+func TestCleanInputPath(t *testing.T) {
+	originalWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %v", err)
+	}
+
+	tempDir := t.TempDir()
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("failed to change working directory: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(originalWD)
+	})
+
+	got := cleanInputPath(filepath.Join(".", "captures", "..", "capture.json"))
+	want := filepath.Join(tempDir, "capture.json")
+	gotDirResolved, err := filepath.EvalSymlinks(filepath.Dir(got))
+	if err != nil {
+		t.Fatalf("failed to resolve cleaned path directory: %v", err)
+	}
+	wantDirResolved, err := filepath.EvalSymlinks(filepath.Dir(want))
+	if err != nil {
+		t.Fatalf("failed to resolve expected path directory: %v", err)
+	}
+	if filepath.Join(gotDirResolved, filepath.Base(got)) != filepath.Join(wantDirResolved, filepath.Base(want)) {
+		t.Fatalf("cleanInputPath() = %q, want %q", got, want)
 	}
 }
 
