@@ -22,10 +22,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -433,6 +435,57 @@ func (c *CrawlCmd) Run() error {
 	})
 }
 
+func openImportInputFile(path string) (*os.File, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, formatImportInputFileError(path, err)
+	}
+
+	return f, nil
+}
+
+func formatImportInputFileError(path string, err error) error {
+	if errors.Is(err, fs.ErrPermission) || os.IsPermission(err) {
+		var msg strings.Builder
+		fmt.Fprintf(&msg, "vespasian could not read input file %q: %v", path, err)
+		if isLikelyMacOSProtectedPath(path) {
+			msg.WriteString(". macOS may block terminal/app access to files in Downloads, Desktop, or Documents")
+		}
+		msg.WriteString(". Move or copy the file to a non-protected path such as /tmp and retry, or grant the terminal/app access to that folder")
+
+		return errors.New(msg.String())
+	}
+
+	return fmt.Errorf("open input file: %w", err)
+}
+
+func isLikelyMacOSProtectedPath(path string) bool {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+
+	cleanPath := filepath.Clean(path)
+	if !filepath.IsAbs(cleanPath) {
+		if absPath, absErr := filepath.Abs(cleanPath); absErr == nil {
+			cleanPath = absPath
+		}
+	}
+
+	for _, dir := range []string{"Downloads", "Desktop", "Documents"} {
+		protectedDir := filepath.Join(homeDir, dir)
+		relPath, relErr := filepath.Rel(protectedDir, cleanPath)
+		if relErr != nil {
+			continue
+		}
+		if relPath == "." || (relPath != ".." && !strings.HasPrefix(relPath, ".."+string(os.PathSeparator))) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // ImportCmd imports traffic capture from external sources.
 type ImportCmd struct {
 	Format  string `arg:"" enum:"burp,har,mitmproxy" help:"Import format (burp, har, mitmproxy)"`
@@ -448,9 +501,9 @@ func (c *ImportCmd) Run() error {
 		return err
 	}
 
-	f, err := os.Open(c.File)
+	f, err := openImportInputFile(c.File)
 	if err != nil {
-		return fmt.Errorf("open input file: %w", err)
+		return err
 	}
 	defer f.Close() //nolint:errcheck // read-only file
 

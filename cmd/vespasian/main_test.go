@@ -24,6 +24,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -396,6 +397,44 @@ func TestImportCmdMissingFile(t *testing.T) {
 	err := cmd.Run()
 	if err == nil {
 		t.Error("expected error for missing file")
+	}
+	if !strings.Contains(err.Error(), "open input file") {
+		t.Errorf("ImportCmd.Run() error = %q, want error containing %q", err.Error(), "open input file")
+	}
+}
+
+func TestImportCmdPermissionDenied(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod-based permission test is not reliable on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("permission-denied test is not reliable when running as root")
+	}
+
+	tmpFile := filepath.Join(t.TempDir(), "permission-denied.xml")
+	if writeErr := os.WriteFile(tmpFile, []byte("<items></items>"), 0600); writeErr != nil {
+		t.Fatalf("failed to write temp file: %v", writeErr)
+	}
+	if chmodErr := os.Chmod(tmpFile, 0200); chmodErr != nil {
+		t.Fatalf("failed to remove read permission: %v", chmodErr)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(tmpFile, 0600)
+	})
+
+	cmd := &ImportCmd{
+		Format: "burp",
+		File:   tmpFile,
+	}
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("expected error for unreadable file")
+	}
+	if !strings.Contains(err.Error(), "vespasian could not read input file") {
+		t.Errorf("ImportCmd.Run() error = %q, want error containing %q", err.Error(), "vespasian could not read input file")
+	}
+	if !strings.Contains(err.Error(), "Move or copy the file to a non-protected path such as /tmp and retry") {
+		t.Errorf("ImportCmd.Run() error = %q, want recovery guidance", err.Error())
 	}
 }
 
