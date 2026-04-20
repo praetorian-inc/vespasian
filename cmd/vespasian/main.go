@@ -32,6 +32,7 @@ import (
 
 	"github.com/alecthomas/kong"
 
+	"github.com/praetorian-inc/vespasian/pkg/analyze"
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/generate"
@@ -697,6 +698,9 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts ge
 	if classifiers == nil {
 		return nil, fmt.Errorf("unsupported API type: %q", opts.APIType)
 	}
+	// Augment captured traffic with forms parsed from HTML response bodies.
+	// Source="static:html" distinguishes these from live captures.
+	requests = append(requests, analyze.ExtractForms(requests)...)
 	classified := classify.RunClassifiers(classifiers, requests, opts.Confidence)
 	if opts.Deduplicate {
 		classified = classify.Deduplicate(classified)

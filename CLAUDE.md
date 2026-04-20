@@ -57,15 +57,17 @@ The CLI (`cmd/vespasian`) uses Kong for argument parsing. Each command (crawl, i
 
 1. Crawl target URL → `[]crawl.ObservedRequest`
 2. Auto-detect API type (or use explicit `--api-type`)
-3. Classify requests via `classify.RunClassifiers()` with confidence threshold
-4. Deduplicate classified endpoints
-5. Probe endpoints via `probe.RunStrategies()` (OPTIONS, schema, WSDL fetch, GraphQL introspection)
-6. Generate spec via `generate.Get(apiType).Generate()`
+3. Augment requests with static HTML form analysis via `analyze.ExtractForms()` (emits synthetic `ObservedRequest` entries with `Source="static:html"` for every `<form>` in HTML response bodies)
+4. Classify requests via `classify.RunClassifiers()` with confidence threshold
+5. Deduplicate classified endpoints
+6. Probe endpoints via `probe.RunStrategies()` (OPTIONS, schema, WSDL fetch, GraphQL introspection)
+7. Generate spec via `generate.Get(apiType).Generate()`
 
 ### Key Packages
 
 - **cmd/vespasian**: CLI entry point, command definitions, signal handling, browser lifecycle management
 - **pkg/crawl**: Headless browser crawling via Katana, capture file I/O (`ObservedRequest` JSON format), browser manager with Chrome lifecycle
+- **pkg/analyze**: Static analysis of captured HTML response bodies; extracts `<form>` endpoints and parameter names as synthetic `ObservedRequest` entries (`Source="static:html"`) to surface form-based APIs not triggered during crawl
 - **pkg/classify**: Request classification engine with confidence-based heuristics; classifiers for REST, GraphQL, and WSDL; deduplication
 - **pkg/probe**: Active endpoint probing strategies (OPTIONS discovery, JSON schema inference, WSDL document fetching, GraphQL introspection with 3-tier WAF bypass); SSRF protection with DNS rebinding mitigation
 - **pkg/generate**: Spec generation interface and registry; delegates to sub-packages by API type

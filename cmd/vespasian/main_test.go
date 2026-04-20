@@ -28,6 +28,8 @@ import (
 	"testing"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
@@ -2069,5 +2071,78 @@ func TestAPITypeDisplayName(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("apiTypeDisplayName(%q) = %q, want %q", tt.input, got, tt.want)
 		}
+	}
+}
+
+// TestGenerateSpec_ExtractsFormParametersIntoOpenAPI verifies the end-to-end promise of the
+// HTML form extraction feature: a GET response whose HTML body contains a <form action="/login"
+// method="POST"> must produce a generated OpenAPI spec that includes a POST /login path.
+//
+// This is the integration seam: crawl.ObservedRequest → analyze.ExtractForms →
+// classify.RunClassifiers → REST generator → YAML output. Unit tests in pkg/analyze/ prove
+// ExtractForms produces the correct synthetic request; this test proves that synthetic request
+// flows all the way through generateSpec and appears in the final spec.
+//
+// Note on parameter assertions: the REST generator's InferSchema is JSON-only. URL-encoded form
+// bodies (e.g., "username=&password=") are not valid JSON and produce no requestBody schema.
+// Accordingly, this test asserts the weakest true statement: /login with a post operation
+// exists in the spec. The presence of the path proves the full pipeline ran; schema assertions
+// would require a form-aware schema inference layer that is out of scope for this ticket.
+func TestGenerateSpec_ExtractsFormParametersIntoOpenAPI(t *testing.T) {
+	htmlBody := `<html><body><form action="/login" method="POST"><input name="username"><input name="password" type="password"></form></body></html>`
+
+	req := crawl.ObservedRequest{
+		Method: "GET",
+		URL:    "https://app.example.com/login",
+		Source: "browser",
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "text/html; charset=utf-8",
+			Body:        []byte(htmlBody),
+		},
+	}
+
+	spec, err := generateSpec(context.Background(), []crawl.ObservedRequest{req}, generateSpecOptions{
+		APIType:     "rest",
+		Confidence:  0.5,
+		Probe:       false,
+		Deduplicate: true,
+		Verbose:     false,
+	})
+
+	if err != nil {
+		t.Fatalf("generateSpec() unexpected error: %v", err)
+	}
+	if len(spec) == 0 {
+		t.Fatal("generateSpec() returned empty spec; expected OpenAPI YAML with /login path")
+	}
+
+	// Unmarshal into a generic map so we can navigate without importing kin-openapi.
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("failed to unmarshal generated spec as YAML: %v", err)
+	}
+
+	// Assert paths section exists and contains /login.
+	pathsRaw, ok := parsed["paths"]
+	if !ok {
+		t.Fatal("spec missing 'paths' key")
+	}
+	paths, ok := pathsRaw.(map[string]interface{})
+	if !ok {
+		t.Fatalf("'paths' is not a map, got %T", pathsRaw)
+	}
+	loginPathRaw, ok := paths["/login"]
+	if !ok {
+		t.Fatalf("spec paths do not contain '/login'; paths = %v", paths)
+	}
+
+	// Assert /login has a post operation.
+	loginPath, ok := loginPathRaw.(map[string]interface{})
+	if !ok {
+		t.Fatalf("'/login' path item is not a map, got %T", loginPathRaw)
+	}
+	if _, ok := loginPath["post"]; !ok {
+		t.Errorf("'/login' path does not have a 'post' operation; got operations: %v", loginPath)
 	}
 }
