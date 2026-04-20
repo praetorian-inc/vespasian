@@ -1,0 +1,585 @@
+components:
+    schemas:
+        Application-configurationResponse:
+            properties:
+                config:
+                    properties:
+                        application:
+                            properties:
+                                altcoinName:
+                                    type: string
+                                chatBot:
+                                    properties:
+                                        avatar:
+                                            type: string
+                                        defaultResponse:
+                                            type: string
+                                        greeting:
+                                            type: string
+                                        name:
+                                            type: string
+                                        trainingData:
+                                            type: string
+                                    type: object
+                                cookieConsent:
+                                    properties:
+                                        dismissText:
+                                            type: string
+                                        linkText:
+                                            type: string
+                                        linkUrl:
+                                            type: string
+                                        message:
+                                            type: string
+                                    type: object
+                                customMetricsPrefix:
+                                    type: string
+                                domain:
+                                    type: string
+                                easterEggPlanet:
+                                    properties:
+                                        name:
+                                            type: string
+                                        overlayMap:
+                                            type: string
+                                    type: object
+                                favicon:
+                                    type: string
+                                googleOauth:
+                                    properties:
+                                        authorizedRedirects:
+                                            items:
+                                                properties:
+                                                    uri:
+                                                        type: string
+                                                type: object
+                                            type: array
+                                        clientId:
+                                            type: string
+                                    type: object
+                                localBackupEnabled:
+                                    type: boolean
+                                logo:
+                                    type: string
+                                name:
+                                    type: string
+                                numberOfRandomFakeUsers:
+                                    type: integer
+                                privacyContactEmail:
+                                    type: string
+                                promotion:
+                                    properties:
+                                        subtitles:
+                                            type: string
+                                        video:
+                                            type: string
+                                    type: object
+                                recyclePage:
+                                    properties:
+                                        bottomProductImage:
+                                            type: string
+                                        topProductImage:
+                                            type: string
+                                    type: object
+                                securityTxt:
+                                    properties:
+                                        acknowledgements:
+                                            type: string
+                                        contact:
+                                            type: string
+                                        csaf:
+                                            type: string
+                                        encryption:
+                                            type: string
+                                        hiring:
+                                            type: string
+                                    type: object
+                                showGitHubLinks:
+                                    type: boolean
+                                showVersionNumber:
+                                    type: boolean
+                                social:
+                                    properties:
+                                        blueSkyUrl:
+                                            type: string
+                                        facebookUrl:
+                                            type: string
+                                        mastodonUrl:
+                                            type: string
+                                        nftUrl:
+                                            type: string
+                                        pressKitUrl:
+                                            type: string
+                                        questionnaireUrl:
+                                            nullable: true
+                                        redditUrl:
+                                            type: string
+                                        slackUrl:
+                                            type: string
+                                        twitterUrl:
+                                            type: string
+                                    type: object
+                                theme:
+                                    type: string
+                                welcomeBanner:
+                                    properties:
+                                        message:
+                                            type: string
+                                        showOnFirstStart:
+                                            type: boolean
+                                        title:
+                                            type: string
+                                    type: object
+                            type: object
+                        challenges:
+                            properties:
+                                codingChallengesEnabled:
+                                    type: string
+                                csafHashValue:
+                                    type: string
+                                metricsIgnoredUserAgents:
+                                    items:
+                                        type: string
+                                    type: array
+                                overwriteUrlForProductTamperingChallenge:
+                                    type: string
+                                restrictToTutorialsFirst:
+                                    type: boolean
+                                safetyMode:
+                                    type: string
+                                showHints:
+                                    type: boolean
+                                showMitigations:
+                                    type: boolean
+                                showSolvedNotifications:
+                                    type: boolean
+                                xssBonusPayload:
+                                    type: string
+                            type: object
+                        ctf:
+                            properties:
+                                countryMapping:
+                                    nullable: true
+                                showCountryDetailsInNotifications:
+                                    type: string
+                                showFlagsInNotifications:
+                                    type: boolean
+                                systemWideNotifications:
+                                    properties:
+                                        pollFrequencySeconds:
+                                            nullable: true
+                                        url:
+                                            nullable: true
+                                    type: object
+                            type: object
+                        hackingInstructor:
+                            properties:
+                                avatarImage:
+                                    type: string
+                                hintPlaybackSpeed:
+                                    type: string
+                                isEnabled:
+                                    type: boolean
+                            type: object
+                        memories:
+                            items:
+                                properties:
+                                    caption:
+                                        type: string
+                                    image:
+                                        type: string
+                                    user:
+                                        type: string
+                                type: object
+                            type: array
+                        products:
+                            items:
+                                properties:
+                                    deluxePrice:
+                                        type: number
+                                    description:
+                                        type: string
+                                    image:
+                                        type: string
+                                    limitPerUser:
+                                        type: integer
+                                    name:
+                                        type: string
+                                    price:
+                                        type: number
+                                    reviews:
+                                        items:
+                                            properties:
+                                                author:
+                                                    type: string
+                                                text:
+                                                    type: string
+                                            type: object
+                                        type: array
+                                type: object
+                            type: array
+                        server:
+                            properties:
+                                basePath:
+                                    type: string
+                                baseUrl:
+                                    type: string
+                                port:
+                                    type: integer
+                            type: object
+                    type: object
+            type: object
+        Application-versionResponse:
+            properties:
+                version:
+                    type: string
+            type: object
+        ChallengeResponse:
+            properties:
+                data:
+                    items:
+                        properties:
+                            category:
+                                type: string
+                            codingChallengeStatus:
+                                type: integer
+                            createdAt:
+                                type: string
+                            description:
+                                type: string
+                            difficulty:
+                                type: integer
+                            disabledEnv:
+                                nullable: true
+                            hasCodingChallenge:
+                                type: boolean
+                            id:
+                                type: integer
+                            key:
+                                type: string
+                            mitigationUrl:
+                                type: string
+                            name:
+                                type: string
+                            solved:
+                                type: boolean
+                            tags:
+                                nullable: true
+                            tutorialOrder:
+                                nullable: true
+                            updatedAt:
+                                type: string
+                        type: object
+                    type: array
+                status:
+                    type: string
+            type: object
+        Continue-codeResponse:
+            properties:
+                continueCode:
+                    type: string
+            type: object
+        Deluxe-membershipResponse:
+            properties:
+                data:
+                    properties:
+                        membershipCost:
+                            type: integer
+                    type: object
+                status:
+                    type: string
+            type: object
+        SaveLoginIpResponse:
+            properties:
+                createdAt:
+                    type: string
+                deletedAt:
+                    nullable: true
+                deluxeToken:
+                    type: string
+                email:
+                    type: string
+                id:
+                    type: integer
+                isActive:
+                    type: boolean
+                lastLoginIp:
+                    type: string
+                password:
+                    type: string
+                profileImage:
+                    type: string
+                role:
+                    type: string
+                totpSecret:
+                    type: string
+                updatedAt:
+                    type: string
+                username:
+                    type: string
+            type: object
+        WhoamiResponse:
+            properties:
+                user:
+                    type: object
+            type: object
+info:
+    title: localhost:3000 API
+    version: 1.0.0
+openapi: 3.0.3
+paths:
+    /api/BasketItems:
+        get:
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ChallengeResponse'
+                    description: OK
+            summary: Get /api/BasketItems
+    /api/Challenges:
+        get:
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ChallengeResponse'
+                    description: OK
+            summary: Get /api/Challenges
+    /api/Challenges/:
+        get:
+            parameters:
+                - in: query
+                  name: name
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ChallengeResponse'
+                    description: OK
+            summary: Get /api/Challenges/
+    /api/Quantitys/:
+        get:
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ChallengeResponse'
+                    description: OK
+            summary: Get /api/Quantitys/
+    /api/Users:
+        get:
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ChallengeResponse'
+                    description: OK
+            summary: Get /api/Users
+    /rest/admin/application-configuration:
+        get:
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/Application-configurationResponse'
+                    description: OK
+            summary: Get /rest/admin/application-configuration
+    /rest/admin/application-version:
+        get:
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/Application-versionResponse'
+                    description: OK
+            summary: Get /rest/admin/application-version
+    /rest/continue-code:
+        get:
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/Continue-codeResponse'
+                    description: OK
+            summary: Get /rest/continue-code
+    /rest/continue-code-findIt:
+        get:
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                type: object
+                    description: OK
+            summary: Get /rest/continue-code-findIt
+    /rest/continue-code-fixIt:
+        get:
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                type: object
+                    description: OK
+            summary: Get /rest/continue-code-fixIt
+    /rest/deluxe-membership:
+        get:
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/Deluxe-membershipResponse'
+                    description: OK
+            summary: Get /rest/deluxe-membership
+    /rest/languages:
+        get:
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                items:
+                                    properties:
+                                        gauge:
+                                            type: string
+                                        icons:
+                                            items:
+                                                type: string
+                                            type: array
+                                        key:
+                                            type: string
+                                        lang:
+                                            type: string
+                                        percentage:
+                                            type: integer
+                                        shortKey:
+                                            type: string
+                                    type: object
+                                type: array
+                    description: OK
+            summary: Get /rest/languages
+    /rest/products/search:
+        get:
+            parameters:
+                - in: query
+                  name: q
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ChallengeResponse'
+                    description: OK
+            summary: Get /rest/products/search
+    /rest/saveLoginIp:
+        get:
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/SaveLoginIpResponse'
+                    description: OK
+            summary: Get /rest/saveLoginIp
+    /rest/user/authentication-details/:
+        get:
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ChallengeResponse'
+                    description: OK
+            summary: Get /rest/user/authentication-details/
+    /rest/user/whoami:
+        get:
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/WhoamiResponse'
+                    description: OK
+            summary: Get /rest/user/whoami
+    /socket.io/:
+        post:
+            parameters:
+                - in: query
+                  name: EIO
+                  required: true
+                  schema:
+                    type: integer
+                - in: query
+                  name: sid
+                  required: true
+                  schema:
+                    type: string
+                - in: query
+                  name: t
+                  required: true
+                  schema:
+                    type: string
+                - in: query
+                  name: transport
+                  required: true
+                  schema:
+                    type: string
+            requestBody:
+                content:
+                    application/json:
+                        schema:
+                            type: integer
+            responses:
+                "200":
+                    description: OK
+            summary: Post /socket.io/
+    /socket.io/socket.io/:
+        post:
+            parameters:
+                - in: query
+                  name: EIO
+                  required: true
+                  schema:
+                    type: integer
+                - in: query
+                  name: sid
+                  required: true
+                  schema:
+                    type: string
+                - in: query
+                  name: t
+                  required: true
+                  schema:
+                    type: string
+                - in: query
+                  name: transport
+                  required: true
+                  schema:
+                    type: string
+            requestBody:
+                content:
+                    application/json:
+                        schema:
+                            type: integer
+            responses:
+                "200":
+                    description: OK
+            summary: Post /socket.io/socket.io/
+servers:
+    - url: http://localhost:3000

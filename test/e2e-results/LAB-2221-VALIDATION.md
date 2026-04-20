@@ -73,8 +73,37 @@ make build
 ```
 
 Artifacts:
-- `lab2221-fix-crawl.json` — raw capture with all 200 requests
-- `lab2221-fix-spec.yaml` — generated OpenAPI 3 spec
+- `lab2221-fix-crawl.json` — unauth capture with all 200 requests
+- `lab2221-fix-spec.yaml` — unauth OpenAPI 3 spec (8 endpoints)
+- `lab2221-fix-spec-auth.yaml` — authenticated spec (18 endpoints: adds
+  `/api/BasketItems`, `/api/Users`, `/rest/user/whoami`, `/rest/continue-code*`,
+  `/rest/deluxe-membership`, `/rest/saveLoginIp`, `/rest/user/authentication-details/`)
+
+### WebGoat smoke check (regression guard for server-rendered apps)
+
+Registered a new user and logged in to obtain a JSESSIONID, then ran:
+
+```bash
+./bin/vespasian crawl \
+  --dangerous-allow-private --headless \
+  --max-pages=100 --depth=3 --timeout=90s \
+  -H "Cookie: JSESSIONID=<session>" \
+  -o webgoat-crawl.json \
+  http://localhost:8080/WebGoat/start.mvc
+./bin/vespasian generate rest webgoat-crawl.json \
+  --confidence=0.3 --dangerous-allow-private \
+  -o webgoat-spec.yaml
+```
+
+Result: 62 captures / 56 unique URLs, zero mangled paths, zero recursive
+nesting. 2 JSON endpoints classified at `--confidence=0.3`
+(`/WebGoat/service/labels.mvc`, `/WebGoat/service/lessonmenu.mvc`). The base-
+href / asset-filter fixes are a no-op for a traditional server-rendered app,
+as expected.
+
+Artifacts:
+- `lab2221-webgoat-crawl.json`
+- `lab2221-webgoat-spec.yaml`
 
 ## Tests
 
