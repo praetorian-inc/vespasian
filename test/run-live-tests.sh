@@ -60,6 +60,25 @@ load_config() {
     log_ok "Loaded config from ${CONFIG_FILE}"
 }
 
+# Verify the harness can reach rest-api at TEST_HOST. A misconfigured TEST_HOST
+# (typical for devcontainer users who forgot to set it) otherwise surfaces as
+# mysterious empty captures downstream.
+preflight_test_host() {
+    local port="${REST_API_PORT:-}"
+    [ -z "$port" ] && return 0
+    local url="http://${TEST_HOST}:${port}/api/health"
+    if ! curl -sf -o /dev/null --max-time 5 "$url" 2>/dev/null; then
+        log_fail "rest-api is unreachable at ${url}"
+        if [ "$TEST_HOST" = "localhost" ]; then
+            log_info "Is ./test/setup-live-targets.sh running? Check 'curl ${url}' on this host."
+        else
+            log_info "TEST_HOST=${TEST_HOST} cannot reach the target. For a devcontainer on Docker Desktop try TEST_HOST=host.docker.internal."
+        fi
+        exit 1
+    fi
+    log_ok "rest-api reachable at ${url}"
+}
+
 # ──────────────────────────────────────────────────────────────
 # Result tracking
 # ──────────────────────────────────────────────────────────────
@@ -223,6 +242,8 @@ test_soap_service() {
 
     # Step 1: Crawl the SOAP service
     # First, make some SOAP requests to generate traffic for the capture.
+    # Note: xmlns:tns="http://localhost/soap" is a SOAP target-namespace
+    # identifier (not a URL), so it stays literal regardless of TEST_HOST.
     log_info "Generating SOAP traffic..."
     for action in GetUser ListUsers CreateUser; do
         curl -sf -X POST "${base_url}/soap" \
@@ -1157,7 +1178,10 @@ test_crawl_unreachable() {
 
     log_header "Testing: crawl-unreachable (target not running)"
 
-    # Crawl a port where nothing is listening
+    # Crawl a port where nothing is listening.
+    # Intentionally hardcoded to localhost:19999 regardless of TEST_HOST — this
+    # test asserts graceful behavior against an unreachable target, which is
+    # easier to guarantee on the in-container loopback than on the host gateway.
     log_info "Crawling unreachable target (http://localhost:19999)..."
     local crawl_output
     crawl_output=$("$VESPASIAN" crawl "http://localhost:19999" \
@@ -1453,7 +1477,6 @@ PYEOF
 
 test_classifier_edge_cases() {
     local port="${REST_API_PORT:-8990}"
-    local base_url="http://${TEST_HOST}:${port}"
     local target_dir="${RESULTS_DIR}/classifier-edge"
     local verbose_flag=""
 
@@ -1937,6 +1960,7 @@ main() {
 
     # Load config
     load_config
+    preflight_test_host
 
     # Default targets from config
     if [ -z "$targets" ]; then

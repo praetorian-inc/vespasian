@@ -300,13 +300,13 @@ brew install --cask google-chrome
 
 ### Crawl produces empty capture
 
-Ensure the target service is running and healthy:
+Ensure the target service is running and healthy. Run the check from the host that started the services (`setup-live-targets.sh` binds to localhost there):
 
 ```bash
 curl http://localhost:8990/api/health
 ```
 
-If you're running the harness inside a devcontainer and the targets are on the host, set `TEST_HOST` (see Configuration above). Without it, the crawler's SSRF guard rejects the seed URL and the capture is empty.
+If you're running the harness inside a devcontainer and the targets are on the host, set `TEST_HOST` (see Configuration above) and verify connectivity from inside the container with `curl http://${TEST_HOST}:8990/api/health`. Without `TEST_HOST`, the crawler's SSRF guard rejects the seed URL and the capture is empty.
 
 ### Build failures
 
