@@ -306,7 +306,7 @@ Ensure the target service is running and healthy. Run the check from the host th
 curl http://localhost:8990/api/health
 ```
 
-If you're running the harness inside a devcontainer and the targets are on the host, set `TEST_HOST` (see Configuration above) and verify connectivity from inside the container with `curl http://${TEST_HOST}:8990/api/health`. Without `TEST_HOST`, the crawler's SSRF guard rejects the seed URL and the capture is empty.
+If you're running the harness inside a devcontainer and the targets are on the host, set `TEST_HOST` (see Configuration above) and verify connectivity from inside the container with `curl http://${TEST_HOST}:8990/api/health`. Without `TEST_HOST`, `localhost` resolves to the container's own loopback (not the Docker host), the crawler connects to nothing, and the capture is empty.
 
 ### Build failures
 

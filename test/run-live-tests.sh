@@ -60,29 +60,49 @@ load_config() {
     log_ok "Loaded config from ${CONFIG_FILE}"
 }
 
-# Verify the harness can reach rest-api at TEST_HOST. A misconfigured TEST_HOST
-# (typical for devcontainer users who forgot to set it) otherwise surfaces as
-# mysterious empty captures downstream.
-#
-# Only runs when the selected target list includes a target that crawls the
-# live rest-api server. Importer-only, synthetic-capture, and crawl-unreachable
-# runs do not need rest-api up and skip this check.
+# Probe one target's health endpoint at TEST_HOST. Returns 0 on success or
+# when the port is unset (target wasn't configured by setup-live-targets.sh).
+_probe_target_host() {
+    local port=$1 path=$2 name=$3
+    [ -z "$port" ] && return 0
+    local url="http://${TEST_HOST}:${port}${path}"
+    local curl_err
+    if curl_err=$(curl -sS -o /dev/null --max-time 5 "$url" 2>&1); then
+        log_ok "${name} reachable at ${url}"
+        return 0
+    fi
+    log_fail "${name} is unreachable at ${url}: ${curl_err}"
+    return 1
+}
+
+# Verify each selected live target is reachable at TEST_HOST before any
+# crawls run. A misconfigured TEST_HOST (typical for devcontainer users
+# who forgot to set it) otherwise surfaces as mysterious empty captures
+# downstream. Importer-only, synthetic-capture, and crawl-unreachable runs
+# don't touch a live host and are skipped.
 preflight_test_host() {
     local targets=$1
+    local failed=0
     case ",${targets}," in
-        *,rest-api,*|*,edge-cases,*|*,crawl-depth,*) ;;
-        *) return 0 ;;
+        *,rest-api,*|*,edge-cases,*|*,crawl-depth,*)
+            _probe_target_host "${REST_API_PORT:-}" "/api/health" "rest-api" || failed=1
+            ;;
     esac
-    local port="${REST_API_PORT:-}"
-    [ -z "$port" ] && return 0
-    local url="http://${TEST_HOST}:${port}/api/health"
-    local curl_err
-    curl_err=$(curl -sS -o /dev/null --max-time 5 "$url" 2>&1) && return 0
-    log_fail "rest-api is unreachable at ${url}: ${curl_err}"
+    case ",${targets}," in
+        *,soap-service,*)
+            _probe_target_host "${SOAP_SERVICE_PORT:-}" "/service.wsdl" "soap-service" || failed=1
+            ;;
+    esac
+    case ",${targets}," in
+        *,graphql-server,*)
+            _probe_target_host "${GRAPHQL_SERVER_PORT:-}" "/" "graphql-server" || failed=1
+            ;;
+    esac
+    [ $failed -eq 0 ] && return 0
     if [ "$TEST_HOST" = "localhost" ]; then
-        log_info "Is ./test/setup-live-targets.sh running? Check 'curl ${url}' on this host."
+        log_info "Is ./test/setup-live-targets.sh running? Check the failing URL on this host."
     else
-        log_info "TEST_HOST=${TEST_HOST} cannot reach the target. For a devcontainer on Docker Desktop try TEST_HOST=host.docker.internal."
+        log_info "TEST_HOST=${TEST_HOST} cannot reach one or more targets. For a devcontainer on Docker Desktop try TEST_HOST=host.docker.internal."
     fi
     exit 1
 }
