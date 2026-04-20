@@ -63,20 +63,28 @@ load_config() {
 # Verify the harness can reach rest-api at TEST_HOST. A misconfigured TEST_HOST
 # (typical for devcontainer users who forgot to set it) otherwise surfaces as
 # mysterious empty captures downstream.
+#
+# Only runs when the selected target list includes a target that crawls the
+# live rest-api server. Importer-only, synthetic-capture, and crawl-unreachable
+# runs do not need rest-api up and skip this check.
 preflight_test_host() {
+    local targets=$1
+    case ",${targets}," in
+        *,rest-api,*|*,edge-cases,*|*,crawl-depth,*) ;;
+        *) return 0 ;;
+    esac
     local port="${REST_API_PORT:-}"
     [ -z "$port" ] && return 0
     local url="http://${TEST_HOST}:${port}/api/health"
-    if ! curl -sf -o /dev/null --max-time 5 "$url" 2>/dev/null; then
-        log_fail "rest-api is unreachable at ${url}"
-        if [ "$TEST_HOST" = "localhost" ]; then
-            log_info "Is ./test/setup-live-targets.sh running? Check 'curl ${url}' on this host."
-        else
-            log_info "TEST_HOST=${TEST_HOST} cannot reach the target. For a devcontainer on Docker Desktop try TEST_HOST=host.docker.internal."
-        fi
-        exit 1
+    local curl_err
+    curl_err=$(curl -sS -o /dev/null --max-time 5 "$url" 2>&1) && return 0
+    log_fail "rest-api is unreachable at ${url}: ${curl_err}"
+    if [ "$TEST_HOST" = "localhost" ]; then
+        log_info "Is ./test/setup-live-targets.sh running? Check 'curl ${url}' on this host."
+    else
+        log_info "TEST_HOST=${TEST_HOST} cannot reach the target. For a devcontainer on Docker Desktop try TEST_HOST=host.docker.internal."
     fi
-    log_ok "rest-api reachable at ${url}"
+    exit 1
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -1960,7 +1968,6 @@ main() {
 
     # Load config
     load_config
-    preflight_test_host
 
     # Default targets from config
     if [ -z "$targets" ]; then
@@ -1971,6 +1978,8 @@ main() {
         targets="${targets},edge-cases,crawl-depth,crawl-unreachable"
         targets="${targets},classifier-edge,spec-edge"
     fi
+
+    preflight_test_host "$targets"
 
     # Create results directory
     mkdir -p "$RESULTS_DIR"
