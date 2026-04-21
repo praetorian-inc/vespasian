@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Byte-level assertions prevent the encoder-as-oracle problem: if the encoder
@@ -98,6 +99,12 @@ func TestEncode_DictKeysSortedDeterministically(t *testing.T) {
 	aIdx := findSubstring(got, "1:a,")
 	mIdx := findSubstring(got, "1:m,")
 	zIdx := findSubstring(got, "1:z,")
+	// Assert presence BEFORE comparing indices. Without this, a missing key
+	// returns -1 which could falsely satisfy the ordering check (e.g.
+	// aIdx=-1 < mIdx=5 < zIdx=10 would pass even with key "a" absent).
+	require.NotEqual(t, -1, aIdx, "key \"a\" not found in %q", got)
+	require.NotEqual(t, -1, mIdx, "key \"m\" not found in %q", got)
+	require.NotEqual(t, -1, zIdx, "key \"z\" not found in %q", got)
 	assert.True(t, aIdx < mIdx && mIdx < zIdx,
 		"keys not emitted in sorted order: a@%d, m@%d, z@%d in %q", aIdx, mIdx, zIdx, got)
 }

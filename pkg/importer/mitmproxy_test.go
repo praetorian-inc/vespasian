@@ -881,7 +881,7 @@ func TestMitmproxyImporter_Native_TruncatedStream(t *testing.T) {
 }
 
 func TestMitmproxyImporter_Native_InvalidPortPropagates(t *testing.T) {
-	// Port validation from the shared parseFlow path still applies.
+	// Port validation rejects out-of-range values before URL construction.
 	state := flowState(
 		"GET", "https", "example.com", 443, "/api",
 		nil, nil, 200, nil, nil,
@@ -895,8 +895,44 @@ func TestMitmproxyImporter_Native_InvalidPortPropagates(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid port")
 }
 
-func TestMitmproxyImporter_Native_AuthorityFallbackForEmptyPath(t *testing.T) {
-	// CONNECT-like requests may have an empty path; we fall back to authority.
+// TestMitmproxyImporter_Native_MissingPort ensures missing `port` surfaces as
+// a clear error rather than silently defaulting to 0 (which previously
+// produced URLs like "https://example.com:0/" for malformed captures).
+func TestMitmproxyImporter_Native_MissingPort(t *testing.T) {
+	state := flowState(
+		"GET", "https", "example.com", 443, "/api",
+		nil, nil, 200, nil, nil,
+	)
+	req := state["request"].(map[string]any)
+	delete(req, "port")
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(bytes.NewReader(encodeTnet(state)))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `missing "port"`)
+}
+
+// TestMitmproxyImporter_Native_PortWrongType ensures a `port` field decoded as
+// bytes or a string (rather than tnetstring int) produces a clear error.
+func TestMitmproxyImporter_Native_PortWrongType(t *testing.T) {
+	state := flowState(
+		"GET", "https", "example.com", 443, "/api",
+		nil, nil, 200, nil, nil,
+	)
+	req := state["request"].(map[string]any)
+	req["port"] = []byte("443")
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(bytes.NewReader(encodeTnet(state)))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `"port" is`)
+}
+
+func TestMitmproxyImporter_Native_ConnectRequestEmptyPath(t *testing.T) {
+	// CONNECT flows carry their target in the authority; the path field is
+	// typically empty. We normalize those to "https://host:port/" rather
+	// than embedding the authority as a URL path, which would yield bogus
+	// URLs like "https://example.com/example.com:443".
 	state := flowState(
 		"CONNECT", "https", "example.com", 443, "",
 		nil, nil, 200, nil, nil,
@@ -912,9 +948,25 @@ func TestMitmproxyImporter_Native_AuthorityFallbackForEmptyPath(t *testing.T) {
 	got := requests[0]
 	assert.Equal(t, "CONNECT", got.Method)
 	assert.Equal(t, 200, got.Response.StatusCode)
-	// URL uses the authority-derived path ("example.com:443") without the
-	// host/port duplication that would result from a plain "/" fallback.
-	assert.Equal(t, "https://example.com/example.com:443", got.URL)
+	// Default HTTPS port → host alone, path "/".
+	assert.Equal(t, "https://example.com/", got.URL)
+}
+
+func TestMitmproxyImporter_Native_ConnectRequestNonDefaultPort(t *testing.T) {
+	// When the CONNECT target uses a non-default port, the port should appear
+	// in host:port form in the URL, and the path stays "/".
+	state := flowState(
+		"CONNECT", "https", "example.com", 8443, "",
+		nil, nil, 200, nil, nil,
+	)
+	req := state["request"].(map[string]any)
+	req["authority"] = []byte("example.com:8443")
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(bytes.NewReader(encodeTnet(state)))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	assert.Equal(t, "https://example.com:8443/", requests[0].URL)
 }
 
 // TestMitmproxyImporter_Native_MalformedInMultiFlowStream characterizes the

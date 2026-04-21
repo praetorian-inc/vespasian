@@ -293,6 +293,28 @@ func TestTnetstring_ListElementCountCap_AboveCapRejected(t *testing.T) {
 	assert.Contains(t, err.Error(), "list exceeds")
 }
 
+// TestTnetstring_DictElementCountCap_RepeatedKeysStillRejected verifies the
+// cardinality cap counts pairs, not unique keys. An attacker who floods a
+// dict payload with the SAME key would otherwise leave len(result) pinned at
+// 1 while the loop consumes unbounded CPU parsing bogus pairs.
+func TestTnetstring_DictElementCountCap_RepeatedKeysStillRejected(t *testing.T) {
+	const lowered = 3
+	withTempCap(t, &maxTnetstringElements, lowered)
+
+	// Emit lowered+2 pairs all using the same key "a".
+	const pairCount = lowered + 2
+	var body bytes.Buffer
+	for i := 0; i < pairCount; i++ {
+		body.WriteString("1:a,1:v,")
+	}
+	dictEncoded := encodeWithLen(body.Bytes(), '}')
+
+	r := bufio.NewReader(bytes.NewReader(dictEncoded))
+	_, err := decodeTnetstringStream(r, 0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "dict exceeds")
+}
+
 // TestTnetstring_DictElementCountCap_AboveCapRejected mirrors the list test
 // for the dict path, which has its own check at a different line.
 func TestTnetstring_DictElementCountCap_AboveCapRejected(t *testing.T) {

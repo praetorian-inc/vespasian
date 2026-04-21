@@ -33,5 +33,11 @@
 //     See the package-private caps (e.g. maxNativeFlows for the native
 //     mitmproxy path) for current values. Pass [ImportOptions.MaxEntries]
 //     through [ImportWithOptions] to apply a tighter caller-specified limit.
+//   - Per-element size (native mitmproxy only): any single tnetstring
+//     element is capped at 64 MB. This applies to request/response BODIES
+//     as well as the flow dict itself. Captures containing a single
+//     response body larger than 64 MB will be rejected even when the total
+//     file is below the 500 MB cap. The error message surfaces this limit
+//     so operators can tell the difference from the file-size cap.
 //   - Callers can also apply a scope filter via [ImportOptions.Scope].
 package importer

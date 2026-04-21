@@ -59,6 +59,12 @@ func repoRoot(t *testing.T) string {
 //
 //	go run ./test/fixtures/gen_mitmproxy_native > test/fixtures/sample-mitmproxy.mitm
 func TestMitmproxyFixture_MatchesGenerator(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		// Module-only / prebuilt-binary CI harnesses can run `go test` without
+		// a `go` toolchain on PATH. Skip rather than fail so the test still
+		// guards drift in environments where subprocess compile is possible.
+		t.Skipf("go toolchain not on PATH, skipping drift check: %v", err)
+	}
 	root := repoRoot(t)
 	fixturePath := filepath.Join(root, "test", "fixtures", "sample-mitmproxy.mitm")
 	committed, err := os.ReadFile(fixturePath) //nolint:gosec // test-time fixture read, path derived from repo root

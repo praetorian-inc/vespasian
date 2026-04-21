@@ -248,12 +248,17 @@ func flowFromNativeState(state map[string]any) (mitmproxyFlow, error) {
 		return mitmproxyFlow{}, fmt.Errorf("flow \"request\" is %T, want dict", reqAny)
 	}
 
+	method := tnetBytesOrString(reqMap["method"])
+	port, err := requirePort(reqMap["port"])
+	if err != nil {
+		return mitmproxyFlow{}, err
+	}
 	req := mitmproxyRequest{
-		Method:  tnetBytesOrString(reqMap["method"]),
+		Method:  method,
 		Scheme:  tnetBytesOrString(reqMap["scheme"]),
 		Host:    tnetBytesOrString(reqMap["host"]),
-		Port:    int(tnetInt64(reqMap["port"])),
-		Path:    buildRequestPath(reqMap),
+		Port:    port,
+		Path:    buildRequestPath(reqMap, method),
 		Headers: nativeHeaders(reqMap["headers"]),
 		Content: nativeContent(reqMap["content"]),
 	}
@@ -276,13 +281,26 @@ func flowFromNativeState(state map[string]any) (mitmproxyFlow, error) {
 
 // buildRequestPath returns the request path (with query string if any).
 // mitmproxy's HTTPFlow.get_state() stores the full request target verbatim
-// from the wire in the `path` field (e.g. "/api?x=1"). CONNECT requests may
-// leave `path` empty and surface the target via `authority` instead.
-func buildRequestPath(reqMap map[string]any) string {
+// from the wire in the `path` field (e.g. "/api?x=1").
+//
+// CONNECT requests carry their target in the authority (e.g.
+// "example.com:443") instead of a path. The authority is already reflected
+// in the flow's host/port fields, so we do not embed it into the path — that
+// would produce malformed URLs like "https://example.com/example.com:443".
+// Instead, fall back to "/" so the URL becomes "https://example.com:443/".
+func buildRequestPath(reqMap map[string]any, method string) string {
 	if path := tnetBytesOrString(reqMap["path"]); path != "" {
 		return path
 	}
-	return tnetBytesOrString(reqMap["authority"])
+	if method == "CONNECT" {
+		return "/"
+	}
+	// Non-CONNECT request missing a path is unusual; fall back to authority
+	// so downstream URL parsing surfaces the data rather than dropping it.
+	if authority := tnetBytesOrString(reqMap["authority"]); authority != "" {
+		return authority
+	}
+	return "/"
 }
 
 // nativeHeaders converts mitmproxy's [][name, value] byte-pair list (as returned
@@ -359,6 +377,29 @@ func tnetInt64(v any) int64 {
 	default:
 		return 0
 	}
+}
+
+// requirePort extracts a mitmproxy `port` field that MUST be a tnetstring
+// integer. Missing, wrong-typed, or out-of-range values are errors — silently
+// defaulting to 0 would produce URLs like "https://example.com:0/" for
+// malformed captures, which is worse than a clear import failure.
+func requirePort(v any) (int, error) {
+	if v == nil {
+		return 0, fmt.Errorf("flow missing \"port\" field")
+	}
+	var n int64
+	switch x := v.(type) {
+	case int64:
+		n = x
+	case int:
+		n = int64(x)
+	default:
+		return 0, fmt.Errorf("flow \"port\" is %T, want integer", v)
+	}
+	if n < 0 || n > 65535 {
+		return 0, fmt.Errorf("invalid port: %d (must be 0-65535)", n)
+	}
+	return int(n), nil
 }
 
 // peekFirstNonWhitespace reads and unreads bytes until finding a non-whitespace character.

@@ -174,7 +174,11 @@ func readLengthPrefix(r io.ByteReader, maxLen int) (int, error) {
 		return 0, fmt.Errorf("tnetstring: parse length %q: %w", digits, err)
 	}
 	if length < 0 || length > maxTnetstringElement {
-		return 0, fmt.Errorf("tnetstring: length %d exceeds per-element cap %d", length, maxTnetstringElement)
+		return 0, fmt.Errorf(
+			"tnetstring: single element is %d bytes, exceeding the %d-byte per-element cap "+
+				"(raise maxTnetstringElement if you are importing flows with response bodies larger than %d MB)",
+			length, maxTnetstringElement, maxTnetstringElement/(1024*1024),
+		)
 	}
 	if length > maxLen {
 		return 0, fmt.Errorf("tnetstring: length %d exceeds remaining buffer %d", length, maxLen)
@@ -193,13 +197,13 @@ func parseTnetPayload(t tnetType, payload []byte, depth int) (any, error) {
 	case tnetInt:
 		n, err := strconv.ParseInt(string(payload), 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("tnetstring: parse int %q: %w", payload, err)
+			return nil, fmt.Errorf("tnetstring: parse int %s: %w", payloadPreview(payload), err)
 		}
 		return n, nil
 	case tnetFloat:
 		f, err := strconv.ParseFloat(string(payload), 64)
 		if err != nil {
-			return nil, fmt.Errorf("tnetstring: parse float %q: %w", payload, err)
+			return nil, fmt.Errorf("tnetstring: parse float %s: %w", payloadPreview(payload), err)
 		}
 		return f, nil
 	case tnetBool:
@@ -209,7 +213,7 @@ func parseTnetPayload(t tnetType, payload []byte, depth int) (any, error) {
 		case "false":
 			return false, nil
 		default:
-			return nil, fmt.Errorf("tnetstring: invalid bool %q", payload)
+			return nil, fmt.Errorf("tnetstring: invalid bool %s", payloadPreview(payload))
 		}
 	case tnetNull:
 		if len(payload) != 0 {
@@ -244,8 +248,12 @@ func parseTnetList(payload []byte, depth int) ([]any, error) {
 func parseTnetDict(payload []byte, depth int) (map[string]any, error) {
 	result := map[string]any{}
 	r := bytes.NewReader(payload)
+	// pairsParsed counts every key/value pair parsed, not unique keys. This
+	// bounds CPU even when an attacker floods the payload with repeated keys
+	// (which would leave len(result) pinned at 1 and let the loop run free).
+	var pairsParsed int
 	for r.Len() > 0 {
-		if len(result) >= maxTnetstringElements {
+		if pairsParsed >= maxTnetstringElements {
 			return nil, fmt.Errorf("tnetstring: dict exceeds %d entries", maxTnetstringElements)
 		}
 		keyVal, err := decodeTnetstringInner(r, depth)
@@ -264,6 +272,7 @@ func parseTnetDict(payload []byte, depth int) (map[string]any, error) {
 			return nil, fmt.Errorf("tnetstring: dict value for key %q: %w", key, err)
 		}
 		result[key] = valueVal
+		pairsParsed++
 	}
 	return result, nil
 }
@@ -279,4 +288,19 @@ func coerceDictKey(v any) (string, error) {
 	default:
 		return "", fmt.Errorf("tnetstring: unsupported dict key type %T", v)
 	}
+}
+
+// maxPayloadPreview is the longest attacker-controlled byte slice we embed
+// verbatim into an error string. Larger payloads are summarized as
+// "<preview>... (N bytes total)" to keep log volume bounded.
+const maxPayloadPreview = 64
+
+// payloadPreview renders up to maxPayloadPreview bytes of payload for use in
+// error messages. Longer payloads are truncated and annotated with the full
+// length so operators still see the size without pasting 64 MB into the log.
+func payloadPreview(payload []byte) string {
+	if len(payload) <= maxPayloadPreview {
+		return fmt.Sprintf("%q", payload)
+	}
+	return fmt.Sprintf("%q... (%d bytes total)", payload[:maxPayloadPreview], len(payload))
 }
