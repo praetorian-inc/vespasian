@@ -479,13 +479,53 @@ func TestResolveAction_AbsolutePath(t *testing.T) {
 	}
 }
 
-func TestResolveAction_AbsoluteURL(t *testing.T) {
-	got, ok := resolveAction("https://h/", "https://other/y")
+func TestResolveAction_OffHostAbsoluteURLRejected(t *testing.T) {
+	_, ok := resolveAction("https://h/", "https://other/y")
+	if ok {
+		t.Errorf("expected ok=false for off-host absolute URL, got true")
+	}
+}
+
+func TestResolveAction_SameHostAbsoluteURLAllowed(t *testing.T) {
+	got, ok := resolveAction("https://h/", "https://h/other")
 	if !ok {
 		t.Fatalf("ok = false, want true")
 	}
-	if got != "https://other/y" {
-		t.Errorf("got %q, want https://other/y", got)
+	if got != "https://h/other" {
+		t.Errorf("got %q, want https://h/other", got)
+	}
+}
+
+func TestResolveAction_ProtocolRelativeCrossHostRejected(t *testing.T) {
+	_, ok := resolveAction("https://h/", "//other/y")
+	if ok {
+		t.Errorf("expected ok=false for protocol-relative cross-host URL, got true")
+	}
+}
+
+func TestResolveAction_DifferentPortRejected(t *testing.T) {
+	_, ok := resolveAction("https://h:443/", "https://h:8080/")
+	if ok {
+		t.Errorf("expected ok=false for different port, got true")
+	}
+}
+
+func TestResolveAction_HostnameComparisonCaseInsensitive(t *testing.T) {
+	got, ok := resolveAction("https://Host/", "https://host/x")
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	if got != "https://host/x" {
+		t.Errorf("got %q, want https://host/x", got)
+	}
+}
+
+func TestExtractForms_OffHostActionSkipped(t *testing.T) {
+	body := `<form action="https://evil.com/steal"><input name="x"></form>`
+	reqs := []crawl.ObservedRequest{htmlReq("https://target.com/page", body)}
+	got := ExtractForms(reqs)
+	if len(got) != 0 {
+		t.Errorf("expected 0 results for off-host form action, got %d", len(got))
 	}
 }
 
@@ -627,5 +667,88 @@ func TestParseForms_NestedUnclosedFormsFlushedInnermostFirst(t *testing.T) {
 	}
 	if forms[1].Action != "/outer" {
 		t.Errorf("forms[1].Action = %q, want /outer", forms[1].Action)
+	}
+}
+
+func TestParseForms_TextareaDefaultValue(t *testing.T) {
+	body := []byte(`<form><textarea name="bio">Some default text</textarea></form>`)
+	forms := parseForms(body)
+	if len(forms) != 1 || len(forms[0].Fields) != 1 {
+		t.Fatalf("unexpected parse result: forms=%d", len(forms))
+	}
+	if forms[0].Fields[0].Value != "Some default text" {
+		t.Errorf("Value = %q, want \"Some default text\"", forms[0].Fields[0].Value)
+	}
+}
+
+func TestParseForms_TextareaWhitespaceOnlyValueIsEmpty(t *testing.T) {
+	body := []byte("<form><textarea name=\"notes\">   \n\t  </textarea></form>")
+	forms := parseForms(body)
+	if len(forms) != 1 || len(forms[0].Fields) != 1 {
+		t.Fatalf("unexpected parse result")
+	}
+	if forms[0].Fields[0].Value != "" {
+		t.Errorf("Value = %q, want empty string for whitespace-only textarea", forms[0].Fields[0].Value)
+	}
+}
+
+func TestParseForms_SelectSelectedOptionValue(t *testing.T) {
+	body := []byte(`<form><select name="country"><option value="us">United States</option><option value="ca" selected>Canada</option></select></form>`)
+	forms := parseForms(body)
+	if len(forms) != 1 || len(forms[0].Fields) != 1 {
+		t.Fatalf("unexpected parse result")
+	}
+	if forms[0].Fields[0].Value != "ca" {
+		t.Errorf("Value = %q, want \"ca\" (selected option)", forms[0].Fields[0].Value)
+	}
+}
+
+func TestParseForms_SelectNoSelectedUsesFirstOption(t *testing.T) {
+	body := []byte(`<form><select name="size"><option value="sm">Small</option><option value="lg">Large</option></select></form>`)
+	forms := parseForms(body)
+	if len(forms) != 1 || len(forms[0].Fields) != 1 {
+		t.Fatalf("unexpected parse result")
+	}
+	if forms[0].Fields[0].Value != "sm" {
+		t.Errorf("Value = %q, want \"sm\" (first option)", forms[0].Fields[0].Value)
+	}
+}
+
+func TestParseForms_SelectOptionNoValueAttrUsesText(t *testing.T) {
+	body := []byte(`<form><select name="color"><option>Red</option><option>Blue</option></select></form>`)
+	forms := parseForms(body)
+	if len(forms) != 1 || len(forms[0].Fields) != 1 {
+		t.Fatalf("unexpected parse result")
+	}
+	if forms[0].Fields[0].Value != "Red" {
+		t.Errorf("Value = %q, want \"Red\" (option text fallback, first option)", forms[0].Fields[0].Value)
+	}
+}
+
+func TestExtractForms_TextareaValueInGETQuery(t *testing.T) {
+	body := `<form action="/submit"><textarea name="msg">hello world</textarea></form>`
+	reqs := []crawl.ObservedRequest{htmlReq("https://host/page", body)}
+	got := ExtractForms(reqs)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(got))
+	}
+	if got[0].QueryParams["msg"] != "hello world" {
+		t.Errorf("QueryParams[msg] = %q, want \"hello world\"", got[0].QueryParams["msg"])
+	}
+	if !strings.Contains(got[0].URL, "msg=hello+world") && !strings.Contains(got[0].URL, "msg=hello%20world") {
+		t.Errorf("URL missing msg value; got %q", got[0].URL)
+	}
+}
+
+func TestExtractForms_SelectValueInPOSTBody(t *testing.T) {
+	body := `<form method="post" action="/submit"><select name="country"><option value="us">US</option><option value="ca" selected>Canada</option></select></form>`
+	reqs := []crawl.ObservedRequest{htmlReq("https://host/page", body)}
+	got := ExtractForms(reqs)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(got))
+	}
+	bodyStr := string(got[0].Body)
+	if !strings.Contains(bodyStr, "country=ca") {
+		t.Errorf("body missing country=ca; got %q", bodyStr)
 	}
 }

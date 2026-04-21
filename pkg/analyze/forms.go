@@ -106,12 +106,25 @@ func isHTMLResponse(resp crawl.ObservedResponse) bool {
 		strings.Contains(head, "<form")
 }
 
+// pendingFieldState tracks state for elements whose value spans multiple tokens
+// (textarea text content and select option values).
+type pendingFieldState struct {
+	field       *staticFormField // pointer into the parent form's Fields slice
+	inTextarea  bool
+	inSelect    bool
+	inOption    bool
+	optionValue string  // value attr of current <option> (may be empty → use text)
+	optionText  string  // accumulated text content of current <option>
+	firstOption *string // non-nil once the first option's value is determined
+}
+
 // parseForms tokenizes body and returns every <form> element found, including
 // leftovers left open at EOF and recoverable nested forms.
 func parseForms(body []byte) []staticForm {
 	z := html.NewTokenizer(bytes.NewReader(body))
 	var stack []*staticForm
 	var results []staticForm
+	var pending *pendingFieldState
 
 	for {
 		tt := z.Next()
@@ -119,16 +132,34 @@ func parseForms(body []byte) []staticForm {
 		case html.ErrorToken:
 			// EOF or malformed — flush unclosed forms innermost-first to match
 			// normal close-tag order (</form> pops from the top of the stack).
+			// Resolve any in-flight select.
+			if pending != nil && pending.inSelect {
+				resolveSelectValue(pending)
+			}
 			for i := len(stack) - 1; i >= 0; i-- {
 				results = append(results, *stack[i])
 			}
 			return results
 
 		case html.StartTagToken, html.SelfClosingTagToken:
-			stack = handleStartTag(z.Token(), stack)
+			tok := z.Token()
+			if pending != nil {
+				handlePendingStartTag(tok, pending)
+				continue
+			}
+			stack = handleStartTag(tok, stack, &pending)
+
+		case html.TextToken:
+			if pending != nil {
+				handlePendingText(string(z.Raw()), pending)
+			}
 
 		case html.EndTagToken:
 			tok := z.Token()
+			if pending != nil {
+				handlePendingEndTag(tok, &pending)
+				continue
+			}
 			if tok.DataAtom == atom.Form && len(stack) > 0 {
 				f := stack[len(stack)-1]
 				stack = stack[:len(stack)-1]
@@ -138,9 +169,89 @@ func parseForms(body []byte) []staticForm {
 	}
 }
 
+// handlePendingStartTag handles a start tag token while inside a textarea or
+// select element. Only <option> tags inside a select are relevant.
+func handlePendingStartTag(tok html.Token, pending *pendingFieldState) {
+	if !pending.inSelect || tok.DataAtom != atom.Option {
+		return
+	}
+	pending.inOption = true
+	pending.optionValue = getAttr(tok, "value")
+	pending.optionText = ""
+	if hasAttr(tok, "selected") && pending.field.Value == "" {
+		// Sentinel marks that a selected option was found; resolved at </option>.
+		pending.field.Value = "\x00selected"
+	}
+}
+
+// handlePendingText accumulates text tokens while inside a textarea or select.
+func handlePendingText(text string, pending *pendingFieldState) {
+	if pending.inTextarea {
+		pending.field.Value += text
+	} else if pending.inSelect && pending.inOption {
+		pending.optionText += text
+	}
+}
+
+// handlePendingEndTag processes an end tag while pending is active. It updates
+// or clears the pending pointer via the pointer-to-pointer parameter.
+func handlePendingEndTag(tok html.Token, pending **pendingFieldState) {
+	p := *pending
+	switch tok.DataAtom {
+	case atom.Option:
+		if p.inSelect && p.inOption {
+			commitOption(p)
+		}
+	case atom.Select:
+		resolveSelectValue(p)
+		*pending = nil
+	case atom.Textarea:
+		p.field.Value = strings.TrimSpace(p.field.Value)
+		*pending = nil
+	}
+}
+
+// commitOption finalizes the current <option> inside a select: resolves the
+// selected-sentinel if present and tracks the first-option fallback.
+func commitOption(p *pendingFieldState) {
+	optVal := p.optionValue
+	if optVal == "" {
+		optVal = strings.TrimSpace(p.optionText)
+	}
+	if p.field.Value == "\x00selected" {
+		p.field.Value = optVal
+	}
+	if p.firstOption == nil {
+		v := optVal
+		p.firstOption = &v
+	}
+	p.inOption = false
+	p.optionValue = ""
+	p.optionText = ""
+}
+
+// resolveSelectValue finalizes the Value on a pending select field. It uses the
+// selected option's value if one was found, otherwise falls back to the first
+// option's value.
+func resolveSelectValue(p *pendingFieldState) {
+	if p.field.Value == "\x00selected" || p.field.Value == "" {
+		if p.field.Value == "\x00selected" {
+			// selected sentinel but no value resolved yet — means the </option>
+			// closed before we committed; shouldn't happen with well-formed HTML
+			// but clear the sentinel just in case.
+			p.field.Value = ""
+		}
+		if p.field.Value == "" && p.firstOption != nil {
+			p.field.Value = *p.firstOption
+		}
+	}
+}
+
 // handleStartTag processes a start/self-closing tag token and updates the
-// form stack. Returns the updated stack.
-func handleStartTag(tok html.Token, stack []*staticForm) []*staticForm {
+// form stack. pending is set when a textarea or select element is opened so
+// that subsequent text tokens and option tags can be routed to the right field.
+// Returns the updated stack.
+func handleStartTag(tok html.Token, stack []*staticForm, pending **pendingFieldState) []*staticForm {
 	switch tok.DataAtom {
 	case atom.Form:
 		f := &staticForm{
@@ -177,7 +288,7 @@ func handleStartTag(tok html.Token, stack []*staticForm) []*staticForm {
 			CSRF:        isCSRFName(name),
 		})
 
-	case atom.Select, atom.Textarea:
+	case atom.Textarea:
 		if len(stack) == 0 {
 			break
 		}
@@ -191,11 +302,45 @@ func handleStartTag(tok html.Token, stack []*staticForm) []*staticForm {
 		f := stack[len(stack)-1]
 		f.Fields = append(f.Fields, staticFormField{
 			Name:        name,
-			Type:        tok.Data, // "select" or "textarea" — not a real input type
+			Type:        "textarea",
 			Placeholder: getAttr(tok, "placeholder"),
 			Required:    hasAttr(tok, "required"),
 			CSRF:        isCSRFName(name),
 		})
+		// Record a pointer to the newly appended field so text tokens can
+		// accumulate into its Value until </textarea>.
+		fieldPtr := &f.Fields[len(f.Fields)-1]
+		*pending = &pendingFieldState{
+			field:      fieldPtr,
+			inTextarea: true,
+		}
+
+	case atom.Select:
+		if len(stack) == 0 {
+			break
+		}
+		if _, hasFormAttr := getAttrOK(tok, "form"); hasFormAttr {
+			break
+		}
+		name := getAttr(tok, "name")
+		if name == "" {
+			break
+		}
+		f := stack[len(stack)-1]
+		f.Fields = append(f.Fields, staticFormField{
+			Name:        name,
+			Type:        "select",
+			Placeholder: getAttr(tok, "placeholder"),
+			Required:    hasAttr(tok, "required"),
+			CSRF:        isCSRFName(name),
+		})
+		// Record a pointer to the newly appended field so option tokens can
+		// be examined until </select>.
+		fieldPtr := &f.Fields[len(f.Fields)-1]
+		*pending = &pendingFieldState{
+			field:    fieldPtr,
+			inSelect: true,
+		}
 	}
 	return stack
 }
@@ -264,16 +409,18 @@ func synthesizeRequest(f staticForm, baseURL string) (crawl.ObservedRequest, boo
 
 // resolveAction resolves a form action against baseURL. Empty/missing action
 // ("") returns baseURL unchanged (self-submit). Non-http(s) schemes and
-// unparseable URLs return ("", false).
+// unparseable URLs return ("", false). Off-host actions (different hostname or
+// port from base) are rejected to keep synthesized requests within the parent
+// request's scope.
 func resolveAction(base, ref string) (string, bool) {
 	ref = strings.TrimSpace(ref)
+	baseU, err := url.Parse(base)
+	if err != nil || (baseU.Scheme != "http" && baseU.Scheme != "https") {
+		return "", false
+	}
 	if ref == "" {
-		u, err := url.Parse(base)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-			return "", false
-		}
-		u.Fragment = ""
-		return u.String(), true
+		baseU.Fragment = ""
+		return baseU.String(), true
 	}
 	lower := strings.ToLower(ref)
 	if strings.HasPrefix(lower, "javascript:") ||
@@ -283,16 +430,17 @@ func resolveAction(base, ref string) (string, bool) {
 		strings.HasPrefix(lower, "blob:") {
 		return "", false
 	}
-	baseU, err := url.Parse(base)
-	if err != nil {
-		return "", false
-	}
 	refU, err := url.Parse(ref)
 	if err != nil {
 		return "", false
 	}
 	resolved := baseU.ResolveReference(refU)
 	if resolved.Scheme != "http" && resolved.Scheme != "https" {
+		return "", false
+	}
+	// Reject off-host actions: hostname and port must both match the base URL.
+	if !strings.EqualFold(resolved.Hostname(), baseU.Hostname()) ||
+		resolved.Port() != baseU.Port() {
 		return "", false
 	}
 	resolved.Fragment = ""
