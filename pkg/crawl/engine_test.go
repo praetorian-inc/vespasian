@@ -1,0 +1,145 @@
+// Copyright 2026 Praetorian Security, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package crawl
+
+import (
+	"slices"
+	"testing"
+)
+
+// mergeEnrichedLinks is the pure, DOM-free portion of enrichFromPage. These
+// tests cover the branches that aren't exercised by TestRodEngine_*
+// integration tests (which are gated behind //go:build integration and
+// excluded from the default coverage run).
+
+func TestMergeEnrichedLinks_CombinesAllSources(t *testing.T) {
+	captured := []ObservedRequest{{Method: "GET", URL: "https://ex.com/"}}
+	domLinks := []string{"https://ex.com/login", "https://ex.com/about"}
+	jsFromResponses := []jsExtractedURL{{URL: "/api/products", Method: "GET"}}
+	jsFromInline := []jsExtractedURL{{URL: "/rest/users", Method: "GET"}}
+	forms := []discoveredForm{{
+		Action:      "https://ex.com/submit",
+		Method:      "POST",
+		ContentType: "application/x-www-form-urlencoded",
+		Fields:      map[string]string{"name": "alice"},
+	}}
+
+	captured, links := mergeEnrichedLinks(
+		captured, domLinks, jsFromResponses, jsFromInline, forms,
+		"https://ex.com/", "https://ex.com/",
+	)
+
+	want := []string{
+		"https://ex.com/login",
+		"https://ex.com/about",
+		"https://ex.com/api/products",
+		"https://ex.com/rest/users",
+		"https://ex.com/submit",
+	}
+	for _, w := range want {
+		if !slices.Contains(links, w) {
+			t.Errorf("links missing %q; got %v", w, links)
+		}
+	}
+
+	// Form produces a synthetic POST ObservedRequest in captured.
+	foundForm := false
+	for _, c := range captured {
+		if c.Method == "POST" && c.URL == "https://ex.com/submit" && c.Source == "form" {
+			foundForm = true
+			break
+		}
+	}
+	if !foundForm {
+		t.Errorf("expected synthetic form request in captured; got %v", captured)
+	}
+}
+
+// jsluice-extracted URLs that point at assets or streaming transports must
+// be dropped before entering the frontier — this is the LAB-2221 fix that
+// prevents /socket.io/socket.io/... mangled paths on SPA catch-all servers.
+func TestMergeEnrichedLinks_FiltersAssetsFromJSLuice(t *testing.T) {
+	jsluice := []jsExtractedURL{
+		{URL: "/api/orders"},
+		{URL: "/main.js"},
+		{URL: "/socket.io/"},
+	}
+	_, links := mergeEnrichedLinks(nil, nil, jsluice, nil, nil, "https://ex.com/", "https://ex.com/")
+
+	if !slices.Contains(links, "https://ex.com/api/orders") {
+		t.Errorf("expected /api/orders in links; got %v", links)
+	}
+	if slices.Contains(links, "https://ex.com/main.js") {
+		t.Errorf("main.js leaked through filter; got %v", links)
+	}
+	if slices.Contains(links, "https://ex.com/socket.io/") {
+		t.Errorf("socket.io leaked through filter; got %v", links)
+	}
+}
+
+// Form actions resolve against the base URL (so relative action="/api"
+// works on any SPA route) and are passed through isLikelyPage so that
+// asset-shaped actions (action="/app.js") are not queued.
+func TestMergeEnrichedLinks_FormActionResolution(t *testing.T) {
+	forms := []discoveredForm{
+		{Action: "https://ex.com/api/login", Method: "POST"},
+		{Action: "https://ex.com/main.js", Method: "POST"}, // asset-shaped — filtered
+		{Action: "https://ex.com/rel", Method: "POST"},
+		{Action: "", Method: "GET"}, // empty — skipped without error
+	}
+	_, links := mergeEnrichedLinks(nil, nil, nil, nil, forms, "https://ex.com/login", "https://ex.com/")
+
+	if !slices.Contains(links, "https://ex.com/api/login") {
+		t.Errorf("expected resolved form action in links; got %v", links)
+	}
+	if !slices.Contains(links, "https://ex.com/rel") {
+		t.Errorf("expected relative form action in links; got %v", links)
+	}
+	if slices.Contains(links, "https://ex.com/main.js") {
+		t.Errorf("asset form action wrongly queued; got %v", links)
+	}
+}
+
+// No-action forms must record pageURL as Action (HTML §4.10.21.3), not
+// baseURL. This is the QUAL-002 regression fix: previously, a login form
+// with no explicit action on /login with <base href="/"> would report
+// its endpoint as "/" instead of "/login".
+func TestMergeEnrichedLinks_NoActionFormUsesPageURL(t *testing.T) {
+	// Simulate what extractForms emits when there's no action attribute:
+	// Action is set to pageURL, not baseURL.
+	forms := []discoveredForm{{Action: "https://ex.com/login", Method: "POST"}}
+	captured, _ := mergeEnrichedLinks(nil, nil, nil, nil, forms, "https://ex.com/login", "https://ex.com/")
+
+	found := false
+	for _, c := range captured {
+		if c.URL == "https://ex.com/login" && c.Method == "POST" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected synthetic POST on /login; got %v", captured)
+	}
+}
+
+func TestMergeEnrichedLinks_EmptyInputs(t *testing.T) {
+	captured, links := mergeEnrichedLinks(nil, nil, nil, nil, nil, "https://ex.com/", "https://ex.com/")
+	if len(captured) != 0 {
+		t.Errorf("captured = %v, want empty", captured)
+	}
+	if len(links) != 0 {
+		t.Errorf("links = %v, want empty", links)
+	}
+}

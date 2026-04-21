@@ -376,6 +376,13 @@ func TestRodEngine_BaseHrefResolution(t *testing.T) {
 	if visited[mangled] {
 		t.Errorf("should NOT have visited %q (page-URL-resolved mangled path)", mangled)
 	}
+	// Absolute root-relative links (<a href="/api/users">) should be
+	// unaffected by <base href> and navigated at spa.URL+/api/users. Pin
+	// this explicitly so a future change that breaks absolute handling
+	// doesn't slip through.
+	if !visited[spa.URL+"/api/users"] {
+		t.Errorf("expected to visit absolute %q, got none. Visited: %v", spa.URL+"/api/users", keys(visited))
+	}
 	// The mangled asset path is the critical signal of the original bug —
 	// if the crawler had resolved against the page URL rather than base
 	// href, it would have tried to fetch /deep/page/app.js. This one

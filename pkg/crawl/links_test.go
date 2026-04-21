@@ -141,6 +141,107 @@ func TestResolveURL_BaseHrefRoot(t *testing.T) {
 	}
 }
 
+// effectiveBaseURLFrom is the pure URL-resolution core of effectiveBaseURL.
+// These tests cover the behavior that makes the LAB-2221 fix a red-green
+// regression against the pre-fix code: pre-fix, extractLinks never read
+// <base href> at all and always resolved against the page URL, so a <base
+// href="/"> on a deep page URL had no effect. The happy-path case below
+// would have returned "https://ex.com/deep/page/here" before the fix.
+func TestEffectiveBaseURLFrom_HappyPath(t *testing.T) {
+	got := effectiveBaseURLFrom("/", "https://ex.com/deep/page/here")
+	if got != "https://ex.com/" {
+		t.Errorf("got %q, want %q", got, "https://ex.com/")
+	}
+}
+
+func TestEffectiveBaseURLFrom_AbsoluteHTTPSBase(t *testing.T) {
+	got := effectiveBaseURLFrom("https://cdn.example.com/app/", "https://ex.com/page")
+	if got != "https://cdn.example.com/app/" {
+		t.Errorf("got %q, want %q", got, "https://cdn.example.com/app/")
+	}
+}
+
+func TestEffectiveBaseURLFrom_RelativeBase(t *testing.T) {
+	got := effectiveBaseURLFrom("../api/", "https://ex.com/deep/page/")
+	if got != "https://ex.com/deep/api/" {
+		t.Errorf("got %q, want %q", got, "https://ex.com/deep/api/")
+	}
+}
+
+// Empty/whitespace/nil href all fall back to the page URL.
+func TestEffectiveBaseURLFrom_EmptyHref(t *testing.T) {
+	for _, in := range []string{"", "   ", "\t\n "} {
+		got := effectiveBaseURLFrom(in, "https://ex.com/page")
+		if got != "https://ex.com/page" {
+			t.Errorf("effectiveBaseURLFrom(%q, ...) = %q, want page URL", in, got)
+		}
+	}
+}
+
+// Non-http(s) base schemes are rejected — attacker-controlled <base
+// href="javascript:..."> or <base href="data:..."> must not become the
+// resolution anchor for relative refs.
+func TestEffectiveBaseURLFrom_DisallowedSchemes(t *testing.T) {
+	cases := []string{
+		"javascript:void(0)",
+		"data:text/html,x",
+		"file:///etc/passwd",
+		"ftp://files.example.com/",
+	}
+	for _, in := range cases {
+		got := effectiveBaseURLFrom(in, "https://ex.com/page")
+		if got != "https://ex.com/page" {
+			t.Errorf("effectiveBaseURLFrom(%q, ...) = %q, want page URL", in, got)
+		}
+	}
+}
+
+// SEC-BE-001 regression: a page served over HTTPS must not accept an
+// http:// <base href> — that would downgrade every relative reference on
+// the page to plaintext and leak any operator-supplied auth headers or
+// session cookies. The reverse (https base on http page) is safe.
+func TestEffectiveBaseURLFrom_RejectsSchemeDowngrade(t *testing.T) {
+	got := effectiveBaseURLFrom("http://target.com/", "https://target.com/page")
+	if got != "https://target.com/page" {
+		t.Errorf("downgrade not rejected: got %q, want %q", got, "https://target.com/page")
+	}
+}
+
+func TestEffectiveBaseURLFrom_AllowsUpgrade(t *testing.T) {
+	got := effectiveBaseURLFrom("https://target.com/", "http://target.com/page")
+	if got != "https://target.com/" {
+		t.Errorf("scheme upgrade wrongly rejected: got %q, want %q", got, "https://target.com/")
+	}
+}
+
+// Protocol-relative base refs (//host/path) inherit the page scheme — this
+// is the common SPA case where <base href="//cdn/..."> keeps https when
+// the page is https.
+func TestEffectiveBaseURLFrom_ProtocolRelativeBase(t *testing.T) {
+	got := effectiveBaseURLFrom("//cdn.ex.com/app/", "https://ex.com/page")
+	if got != "https://cdn.ex.com/app/" {
+		t.Errorf("got %q, want %q", got, "https://cdn.ex.com/app/")
+	}
+}
+
+// Malformed page URL falls back cleanly — we return the malformed input
+// as-is so the caller can still emit it for diagnostic logs.
+func TestEffectiveBaseURLFrom_MalformedPageURL(t *testing.T) {
+	bad := "http://[::1:" // unterminated IPv6
+	got := effectiveBaseURLFrom("/", bad)
+	if got != bad {
+		t.Errorf("got %q, want unchanged input %q", got, bad)
+	}
+}
+
+// Malformed base href falls back to the page URL.
+func TestEffectiveBaseURLFrom_MalformedHref(t *testing.T) {
+	got := effectiveBaseURLFrom("http://[::1:", "https://ex.com/page")
+	if got != "https://ex.com/page" {
+		t.Errorf("got %q, want %q", got, "https://ex.com/page")
+	}
+}
+
 // --- isLikelyPage asset filter (LAB-2221) -------------------------------
 
 func TestIsLikelyPage_AcceptsHTMLPaths(t *testing.T) {
@@ -151,6 +252,9 @@ func TestIsLikelyPage_AcceptsHTMLPaths(t *testing.T) {
 		"https://example.com/path/with.dots/resource",
 		"https://example.com/#/product/1",
 		"https://example.com/search?q=test",
+		// Query-only URL with no path — e.g., /?q=term or bare
+		// https://host?q=1 — must still be treated as a page.
+		"https://example.com?q=1",
 	}
 	for _, c := range cases {
 		if !isLikelyPage(c) {
@@ -224,11 +328,18 @@ func TestIsLikelyPage_IsCaseInsensitive(t *testing.T) {
 	}
 }
 
+// Parse-failure path: this intentionally uses an input net/url.Parse
+// actually rejects (unterminated IPv6 literal). When parsing fails,
+// isLikelyPage is permissive — the frontier and scope stages are
+// authoritative for rejecting bad URLs. Also covers the empty-string
+// default. (A previous iteration tested only "" and admitted in its
+// own comment that the err path was unreachable — this input actually
+// drives it.)
 func TestIsLikelyPage_UnparseableInputIsPermissive(t *testing.T) {
-	// Weird/unparseable URLs are passed through — the frontier and scope
-	// checker are authoritative; isLikelyPage only filters obvious assets.
-	// net/url.Parse is extremely lenient, so just verify the default.
-	if !isLikelyPage("") {
-		t.Error("isLikelyPage(\"\") = false, want true (permissive default)")
+	cases := []string{"", "http://[::1:"}
+	for _, c := range cases {
+		if !isLikelyPage(c) {
+			t.Errorf("isLikelyPage(%q) = false, want true (permissive default)", c)
+		}
 	}
 }

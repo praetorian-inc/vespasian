@@ -60,17 +60,12 @@ var nonPagePathSegments = []string{
 
 // extractLinks extracts all navigable URLs from the current page DOM.
 // It queries for links, forms, iframes, and common SPA data attributes,
-// resolves all URLs against the page's <base href> (falling back to the
-// current page URL if no base tag is present), and filters out non-page
-// resources (JS bundles, images, fonts, socket.io, etc.) whose content is
-// already captured via CDP network interception.
-func extractLinks(page *rod.Page) ([]string, error) {
-	pageInfo, err := page.Info()
-	if err != nil {
-		return nil, err
-	}
-	baseURL := effectiveBaseURL(page, pageInfo.URL)
-
+// resolves all URLs against baseURL (pre-computed by the caller — typically
+// via effectiveBaseURL — so multiple CDP round-trips aren't issued per
+// page), and filters out non-page resources (JS bundles, images, fonts,
+// socket.io, etc.) whose content is already captured via CDP network
+// interception.
+func extractLinks(page *rod.Page, baseURL string) ([]string, error) {
 	seen := make(map[string]bool)
 	var links []string
 
@@ -109,7 +104,10 @@ func extractLinks(page *rod.Page) ([]string, error) {
 // be resolved against. It mirrors the browser's algorithm: use <base href>
 // when present (resolving it against the current page URL first in case the
 // base tag itself holds a relative value), otherwise fall back to the page
-// URL. Returns pageURL on any parse failure.
+// URL. Returns pageURL on any parse failure or disallowed scheme.
+//
+// The DOM read is split from the resolution logic so the latter can be unit
+// tested without a live browser — see [effectiveBaseURLFrom].
 func effectiveBaseURL(page *rod.Page, pageURL string) string {
 	// Use Elements (plural) rather than Element: the singular variant
 	// waits/retries until the page's context timeout when the selector
@@ -120,20 +118,44 @@ func effectiveBaseURL(page *rod.Page, pageURL string) string {
 		return pageURL
 	}
 	href, err := elements[0].Attribute("href")
-	if err != nil || href == nil || strings.TrimSpace(*href) == "" {
+	if err != nil || href == nil {
 		return pageURL
 	}
+	return effectiveBaseURLFrom(*href, pageURL)
+}
 
+// effectiveBaseURLFrom is the pure URL-resolution logic behind
+// [effectiveBaseURL]. It resolves rawHref against pageURL and returns the
+// result when it is a usable HTTP(S) URL that does not downgrade the page's
+// transport; otherwise it returns pageURL unchanged. Inputs that are empty,
+// whitespace-only, unparseable, or produce a non-http(s) scheme are treated
+// as absent.
+//
+// Scheme-downgrade guard (SEC-BE-001): an attacker-controlled in-scope page
+// that declares <base href="http://target.com/"> on an HTTPS crawl would
+// otherwise cause every relative ref on that page to resolve to http://…,
+// stripping TLS for subsequent requests. Those requests would carry any
+// operator-supplied headers (Authorization, cookies, CSRF tokens), leaking
+// them in plaintext. Reject http base refs when the page itself was served
+// over https. The reverse (https base on http page) is safe and allowed.
+func effectiveBaseURLFrom(rawHref, pageURL string) string {
+	href := strings.TrimSpace(rawHref)
+	if href == "" {
+		return pageURL
+	}
 	pageU, err := url.Parse(pageURL)
 	if err != nil {
 		return pageURL
 	}
-	refU, err := url.Parse(strings.TrimSpace(*href))
+	refU, err := url.Parse(href)
 	if err != nil {
 		return pageURL
 	}
 	resolved := pageU.ResolveReference(refU)
 	if resolved.Scheme != "http" && resolved.Scheme != "https" {
+		return pageURL
+	}
+	if pageU.Scheme == "https" && resolved.Scheme == "http" {
 		return pageURL
 	}
 	return resolved.String()

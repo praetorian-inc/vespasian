@@ -288,17 +288,23 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 // pageURL is the URL the worker navigated to (used for form PageURL tagging
 // and as a fallback for URL resolution when the DOM provides no <base href>
 // and page.Info() returns an error).
+//
+// This function handles the DOM-reading side (page.Info, extractLinks,
+// extractForms, extractURLsFromInlineScripts) and then delegates the pure
+// link-combining logic to [mergeEnrichedLinks], which is directly unit
+// tested.
 func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, stderr io.Writer) ([]ObservedRequest, []string) {
 	// Resolve the effective base URL for any relative references on this page.
 	// jsluice-extracted URLs and form actions must honor <base href> the same
 	// way the browser would, or we end up queuing mangled/nested paths.
-	baseURL := pageURL
+	resolvedPageURL := pageURL
 	if info, err := page.Info(); err == nil && info.URL != "" {
-		baseURL = effectiveBaseURL(page, info.URL)
+		resolvedPageURL = info.URL
 	}
+	baseURL := effectiveBaseURL(page, resolvedPageURL)
 
 	// Extract links from the DOM.
-	links, err := extractLinks(page)
+	domLinks, err := extractLinks(page, baseURL)
 	if err != nil {
 		if stderr != nil {
 			fmt.Fprintf(stderr, "link extraction failed for %s: %v\n", pageURL, err) //nolint:errcheck // best-effort
@@ -306,21 +312,51 @@ func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, 
 		return captured, nil
 	}
 
-	// Run jsluice on captured JS response bodies.
 	jsFromResponses := extractURLsFromResponses(captured)
+	jsFromInline := extractURLsFromInlineScripts(page)
+
+	// extractForms uses resolvedPageURL for no-action forms (HTML spec) and
+	// baseURL for explicit action refs (browser behavior). A DOM query error
+	// here is non-fatal — treat as "no forms discovered" and keep going.
+	forms, ferr := extractForms(page, resolvedPageURL, baseURL)
+	if ferr != nil && stderr != nil {
+		fmt.Fprintf(stderr, "form extraction failed for %s: %v\n", pageURL, ferr) //nolint:errcheck // best-effort
+	}
+
+	captured, links := mergeEnrichedLinks(captured, domLinks, jsFromResponses, jsFromInline, forms, resolvedPageURL, baseURL)
+	return captured, links
+}
+
+// mergeEnrichedLinks combines every link source discovered on a page into a
+// single link list for the frontier, appends synthetic form ObservedRequests
+// to captured, and returns the combined (captured, links) pair. This is the
+// pure, DOM-free portion of enrichFromPage and is directly unit tested.
+//
+//   - jsFromResponses/jsFromInline come from jsluice and are routed through
+//     jsExtractedToLinks so asset-only hits (main.js, styles.css) are
+//     dropped before entering the frontier.
+//   - form actions are normalized via resolveURL + isLikelyPage for the
+//     same reason — avoids enqueuing a .js or /socket.io action.
+//   - pageURL is the resolved navigation URL; baseURL is the <base href>-
+//     aware base. Both are passed because forms need page-URL semantics
+//     for PageURL tagging but base-URL semantics for explicit action refs.
+func mergeEnrichedLinks(
+	captured []ObservedRequest,
+	domLinks []string,
+	jsFromResponses, jsFromInline []jsExtractedURL,
+	forms []discoveredForm,
+	pageURL, baseURL string,
+) ([]ObservedRequest, []string) {
+	links := append([]string(nil), domLinks...)
+
 	if len(jsFromResponses) > 0 {
 		links = append(links, jsExtractedToLinks(jsFromResponses, baseURL)...)
 	}
-
-	// Run jsluice on inline <script> tags.
-	jsFromInline := extractURLsFromInlineScripts(page)
 	if len(jsFromInline) > 0 {
 		links = append(links, jsExtractedToLinks(jsFromInline, baseURL)...)
 	}
 
-	// Extract forms and emit synthetic ObservedRequests for POST endpoints.
-	forms, err := extractForms(page)
-	if err == nil && len(forms) > 0 {
+	if len(forms) > 0 {
 		formRequests := formsToObservedRequests(forms, pageURL)
 		captured = append(captured, formRequests...)
 		for _, f := range forms {

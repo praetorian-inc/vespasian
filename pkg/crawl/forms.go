@@ -31,16 +31,13 @@ type discoveredForm struct {
 }
 
 // extractForms finds all <form> elements in the page DOM and extracts their
-// action, method, and input fields. Form actions are resolved to absolute URLs
-// against the page's current URL. This enables discovery of POST endpoints that
-// would otherwise be invisible to pure link extraction.
-func extractForms(page *rod.Page) ([]discoveredForm, error) {
-	pageInfo, err := page.Info()
-	if err != nil {
-		return nil, err
-	}
-	baseURL := effectiveBaseURL(page, pageInfo.URL)
-
+// action, method, and input fields. Explicit action="…" attributes are
+// resolved against baseURL (the page's <base href>-aware base) so that
+// relative refs on SPA routes produce the same URL the browser would submit
+// to. When a form has no action attribute the HTML spec (§4.10.21.3) says
+// the form submits to the document's URL — pageURL here — *not* the base
+// href, so no-action forms keep the current route.
+func extractForms(page *rod.Page, pageURL, baseURL string) ([]discoveredForm, error) {
 	formElements, err := page.Elements("form")
 	if err != nil {
 		return nil, err
@@ -71,8 +68,11 @@ func extractForms(page *rod.Page) ([]discoveredForm, error) {
 			}
 			df.Action = resolved
 		} else {
-			// No action attribute — form submits to the current page URL.
-			df.Action = baseURL
+			// No action attribute — HTML spec says the form submits to the
+			// document's URL. Using baseURL here would place no-action
+			// forms at the <base href>-resolved root (e.g., "/" on a page
+			// served from /login), reporting the wrong endpoint.
+			df.Action = pageURL
 		}
 
 		// Extract enctype if specified.
