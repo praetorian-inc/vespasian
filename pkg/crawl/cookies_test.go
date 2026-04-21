@@ -167,6 +167,24 @@ func TestParseCookiesToParams(t *testing.T) {
 			wantErr:     true,
 		},
 		{
+			name:        "bare hostname rejected",
+			targetURL:   "example.com",
+			cookieValue: "JSESSIONID=abc",
+			wantErr:     true,
+		},
+		{
+			name:        "scheme-only rejected",
+			targetURL:   "http://",
+			cookieValue: "JSESSIONID=abc",
+			wantErr:     true,
+		},
+		{
+			name:        "non-http scheme rejected",
+			targetURL:   "ftp://example.com",
+			cookieValue: "JSESSIONID=abc",
+			wantErr:     true,
+		},
+		{
 			name:        "cookie without value",
 			targetURL:   "https://example.com",
 			cookieValue: "flag",
@@ -207,8 +225,10 @@ func TestParseCookiesToParams_CookieFields(t *testing.T) {
 	if p.Value != "abc123" {
 		t.Errorf("Value = %q, want %q", p.Value, "abc123")
 	}
-	if p.Domain != "example.com" {
-		t.Errorf("Domain = %q, want %q", p.Domain, "example.com")
+	// Domain is intentionally unset: Chrome derives host-only scope from
+	// URL when Domain is empty. Populating both is redundant.
+	if p.Domain != "" {
+		t.Errorf("Domain = %q, want %q (derived from URL)", p.Domain, "")
 	}
 	if p.Path != "/" {
 		t.Errorf("Path = %q, want %q", p.Path, "/")
@@ -232,8 +252,8 @@ func TestParseCookiesToParams_HTTPNotSecure(t *testing.T) {
 	if params[0].Secure {
 		t.Error("Secure = true, want false for http")
 	}
-	if params[0].Domain != "localhost" {
-		t.Errorf("Domain = %q, want %q", params[0].Domain, "localhost")
+	if params[0].URL != "http://localhost:8080" {
+		t.Errorf("URL = %q, want %q", params[0].URL, "http://localhost:8080")
 	}
 }
 

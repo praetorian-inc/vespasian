@@ -17,6 +17,7 @@ package crawl
 import (
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 
 	"github.com/go-rod/rod/lib/proto"
@@ -28,7 +29,17 @@ import (
 func ExtractCookieHeader(headers map[string]string) (cookieValue string, remaining map[string]string) {
 	remaining = make(map[string]string, len(headers))
 	var cookieParts []string
-	for k, v := range headers {
+	// Iterate in sorted key order so concatenation of differently-cased
+	// "Cookie" headers is deterministic across runs (Go map iteration is
+	// randomized). Matters for duplicate cookie precedence.
+	keys := make([]string, 0, len(headers))
+	for k := range headers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		v := headers[k]
 		if strings.EqualFold(k, "Cookie") {
 			cookieParts = append(cookieParts, v)
 		} else {
@@ -51,6 +62,13 @@ func ParseCookiesToParams(targetURL, cookieValue string) ([]*proto.NetworkCookie
 	if err != nil {
 		return nil, fmt.Errorf("parse target URL for cookies: %w", err)
 	}
+	// url.Parse accepts bare hostnames and scheme-only strings without
+	// erroring. Reject anything that isn't an absolute http(s) URL so we
+	// don't emit cookies with an empty Host (which Chrome would drop
+	// silently, causing LAB-2222 to regress without any signal).
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, fmt.Errorf("invalid target URL for cookies %q: must be an absolute http(s) URL", targetURL)
+	}
 
 	var params []*proto.NetworkCookieParam
 	for _, pair := range strings.Split(cookieValue, ";") {
@@ -72,10 +90,6 @@ func ParseCookiesToParams(targetURL, cookieValue string) ([]*proto.NetworkCookie
 		params = append(params, &proto.NetworkCookieParam{
 			Name:  name,
 			Value: value,
-			// Domain is set to the exact hostname (no leading dot), producing a
-			// host-only cookie. Subdomain redirects will not carry these cookies.
-			// This is correct for LAB-2222's session-cookie scope.
-			Domain: u.Hostname(),
 			// Path is "/" regardless of the target URL's path so session cookies
 			// apply to all endpoints on the host, matching standard session-cookie
 			// behavior.
@@ -84,6 +98,12 @@ func ParseCookiesToParams(targetURL, cookieValue string) ([]*proto.NetworkCookie
 			// HttpOnly is deliberately omitted so apps that read auth state via
 			// JS document.cookie continue to work. HttpOnly does not affect
 			// outbound request cookie attachment — it only restricts JS reads.
+			//
+			// Setting URL (and omitting Domain) produces a host-only cookie
+			// scoped to the exact hostname — subdomain redirects won't carry
+			// these cookies. This is the correct scope for LAB-2222's
+			// session-cookie propagation. Passing both Domain and URL is
+			// redundant: Chrome derives Domain from URL when Domain is unset.
 			URL: u.Scheme + "://" + u.Host,
 		})
 	}
