@@ -193,6 +193,76 @@ func TestTnetstring_InvalidInt(t *testing.T) {
 	assert.Contains(t, err.Error(), "parse int")
 }
 
+// TestTnetstring_InvalidIntHugePayloadBounded is a regression test for the
+// round-5 finding that the strconv.NumError wrapped into a %w error string
+// re-embedded the full input payload, defeating payloadPreview. A 1 KB
+// invalid-int payload must produce an error message bounded by the preview
+// constant plus a small formatting overhead, not by the input size.
+func TestTnetstring_InvalidIntHugePayloadBounded(t *testing.T) {
+	const n = 1024
+	payload := make([]byte, n)
+	for i := range payload {
+		payload[i] = 'a' // not a digit -> ParseInt fails
+	}
+	input := fmt.Sprintf("%d:%s#", n, payload)
+
+	r := bufio.NewReader(strings.NewReader(input))
+	_, err := decodeTnetstringStream(r, 0)
+	require.Error(t, err)
+
+	// Error message must embed the total length but NOT the full payload.
+	msg := err.Error()
+	assert.Contains(t, msg, "parse int")
+	assert.Contains(t, msg, "bytes total")
+	// Comfortable upper bound: preview (64) + format overhead (~80). A 1 KB
+	// payload embed would blow past this.
+	assert.Less(t, len(msg), 256,
+		"error message not bounded by payloadPreview: got %d bytes", len(msg))
+}
+
+// TestTnetstring_DictHugeKeyErrorBounded verifies that a dict with a huge
+// attacker-controlled key and no following value produces an error message
+// bounded by payloadPreview rather than embedding the full key.
+// Regression for round-5 SEC-BE-R5-002.
+func TestTnetstring_DictHugeKeyErrorBounded(t *testing.T) {
+	// Large bytes key followed by nothing → "dict key ... has no value".
+	const keyLen = 4096
+	key := make([]byte, keyLen)
+	for i := range key {
+		key[i] = 'k'
+	}
+	// Encode as a dict containing only the key element, with no value after.
+	keyElement := fmt.Sprintf("%d:%s,", keyLen, key) // <len>:<payload>,
+	dict := fmt.Sprintf("%d:%s}", len(keyElement), keyElement)
+
+	r := bufio.NewReader(strings.NewReader(dict))
+	_, err := decodeTnetstringStream(r, 0)
+	require.Error(t, err)
+	msg := err.Error()
+	assert.Contains(t, msg, "has no value")
+	assert.Contains(t, msg, "bytes total")
+	assert.Less(t, len(msg), 256,
+		"dict-key error not bounded: got %d bytes", len(msg))
+}
+
+// TestTnetstring_InvalidFloatHugePayloadBounded mirrors the int test for
+// the float branch.
+func TestTnetstring_InvalidFloatHugePayloadBounded(t *testing.T) {
+	const n = 1024
+	payload := make([]byte, n)
+	for i := range payload {
+		payload[i] = 'x' // not a float
+	}
+	input := fmt.Sprintf("%d:%s^", n, payload)
+
+	r := bufio.NewReader(strings.NewReader(input))
+	_, err := decodeTnetstringStream(r, 0)
+	require.Error(t, err)
+	msg := err.Error()
+	assert.Contains(t, msg, "parse float")
+	assert.Less(t, len(msg), 256)
+}
+
 func TestTnetstring_NonEmptyNull(t *testing.T) {
 	r := bufio.NewReader(strings.NewReader("3:abc~"))
 	_, err := decodeTnetstringStream(r, 0)

@@ -197,13 +197,13 @@ func parseTnetPayload(t tnetType, payload []byte, depth int) (any, error) {
 	case tnetInt:
 		n, err := strconv.ParseInt(string(payload), 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("tnetstring: parse int %s: %w", payloadPreview(payload), err)
+			return nil, fmt.Errorf("tnetstring: parse int %s: %s", payloadPreview(payload), unwrapStrconvReason(err))
 		}
 		return n, nil
 	case tnetFloat:
 		f, err := strconv.ParseFloat(string(payload), 64)
 		if err != nil {
-			return nil, fmt.Errorf("tnetstring: parse float %s: %w", payloadPreview(payload), err)
+			return nil, fmt.Errorf("tnetstring: parse float %s: %s", payloadPreview(payload), unwrapStrconvReason(err))
 		}
 		return f, nil
 	case tnetBool:
@@ -265,11 +265,11 @@ func parseTnetDict(payload []byte, depth int) (map[string]any, error) {
 			return nil, err
 		}
 		if r.Len() == 0 {
-			return nil, fmt.Errorf("tnetstring: dict key %q has no value", key)
+			return nil, fmt.Errorf("tnetstring: dict key %s has no value", payloadPreview([]byte(key)))
 		}
 		valueVal, err := decodeTnetstringInner(r, depth)
 		if err != nil {
-			return nil, fmt.Errorf("tnetstring: dict value for key %q: %w", key, err)
+			return nil, fmt.Errorf("tnetstring: dict value for key %s: %w", payloadPreview([]byte(key)), err)
 		}
 		result[key] = valueVal
 		pairsParsed++
@@ -303,4 +303,16 @@ func payloadPreview(payload []byte) string {
 		return fmt.Sprintf("%q", payload)
 	}
 	return fmt.Sprintf("%q... (%d bytes total)", payload[:maxPayloadPreview], len(payload))
+}
+
+// unwrapStrconvReason returns the inner cause of a strconv error without the
+// Num field (which re-embeds the full input). strconv.NumError.Error() would
+// otherwise produce `strconv.ParseInt: parsing "<full payload>": invalid
+// syntax`, defeating payloadPreview for large attacker-controlled inputs.
+func unwrapStrconvReason(err error) string {
+	var ne *strconv.NumError
+	if errors.As(err, &ne) {
+		return ne.Err.Error()
+	}
+	return err.Error()
 }

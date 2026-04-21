@@ -383,6 +383,12 @@ func tnetInt64(v any) int64 {
 // integer. Missing, wrong-typed, or out-of-range values are errors — silently
 // defaulting to 0 would produce URLs like "https://example.com:0/" for
 // malformed captures, which is worse than a clear import failure.
+//
+// float64 is deliberately NOT accepted even though the sibling tnetInt64
+// helper coerces it: mitmproxy's HTTPFlow.get_state() always emits port as
+// a tnetstring int (`#` type), never a float (`^`), and a float here almost
+// certainly means a malformed or hand-crafted capture. Silently rounding
+// 443.5 → 443 would mask a real data-integrity problem.
 func requirePort(v any) (int, error) {
 	if v == nil {
 		return 0, fmt.Errorf("flow missing \"port\" field")
