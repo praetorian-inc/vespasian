@@ -62,7 +62,8 @@ flowchart LR
         B["Traffic Importers<br/>Burp Suite XML, HAR, mitmproxy"] --> C
     end
     subgraph Generate
-        C --> D["Classifier<br/>REST, GraphQL, WSDL"]
+        C --> S["Static Analyzer<br/>HTML form extraction"]
+        S --> D["Classifier<br/>REST, GraphQL, WSDL"]
         D --> E["Prober<br/>OPTIONS, schema, WSDL, introspection"]
         E --> F["Spec Generator<br/>OpenAPI 3.0, GraphQL SDL, WSDL"]
     end

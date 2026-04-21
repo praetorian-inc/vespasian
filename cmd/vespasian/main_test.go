@@ -2146,3 +2146,128 @@ func TestGenerateSpec_ExtractsFormParametersIntoOpenAPI(t *testing.T) {
 		t.Errorf("'/login' path does not have a 'post' operation; got operations: %v", loginPath)
 	}
 }
+
+// TestGenerateSpec_ExtractsGETFormParametersIntoOpenAPI verifies that a GET
+// form's input fields are surfaced as query parameters in the generated OpenAPI
+// spec. This exercises the analyze → deduplicate → generate pipeline:
+// ExtractForms synthesizes a GET /search?q= ObservedRequest, Deduplicate merges
+// its QueryParams into a co-located classified endpoint, and the REST generator
+// emits those QueryParams as OpenAPI parameters[].
+//
+// Note on classification threshold: synthetic static:html GET form requests
+// score 0 confidence with the current RESTClassifier because they carry no
+// response body, no API content-type, and no non-GET method — the three rules
+// that drive confidence above zero. Using Confidence: 0.0 here is intentional:
+// it lets the synthetic request through the classification gate so Deduplicate
+// can merge its QueryParams into the co-located live GET /search request, which
+// is classified normally at 0.85. This tests the parameter-propagation path
+// without requiring a classifier change in this PR; improving static:html GET
+// classification is tracked as a follow-up.
+func TestGenerateSpec_ExtractsGETFormParametersIntoOpenAPI(t *testing.T) {
+	htmlBody := `<html><body><form action="/search"><input name="q"></form></body></html>`
+
+	requests := []crawl.ObservedRequest{
+		// Request 1: a live browser capture of GET /search returning JSON. The JSON
+		// response body gives the REST classifier 0.85 confidence, ensuring this
+		// endpoint lands in the spec at any reasonable threshold.
+		{
+			Method: "GET",
+			URL:    "https://app.example.com/search",
+			Source: "browser",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Body:        []byte(`{"results":[]}`),
+			},
+		},
+		// Request 2: the HTML page that contains the search form. ExtractForms
+		// synthesizes a GET /search?q= entry from this response body; Deduplicate
+		// merges it into Request 1's entry, adding "q" to its QueryParams.
+		{
+			Method: "GET",
+			URL:    "https://app.example.com/",
+			Source: "browser",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html; charset=utf-8",
+				Body:        []byte(htmlBody),
+			},
+		},
+	}
+
+	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
+		APIType:     "rest",
+		Confidence:  0.0, // See function comment: synthetic GET form requests score 0 confidence.
+		Probe:       false,
+		Deduplicate: true,
+		Verbose:     false,
+	})
+
+	if err != nil {
+		t.Fatalf("generateSpec() unexpected error: %v", err)
+	}
+	if len(spec) == 0 {
+		t.Fatal("generateSpec() returned empty spec; expected OpenAPI YAML with /search path")
+	}
+
+	// Unmarshal into a generic map so we can navigate without importing kin-openapi.
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("failed to unmarshal generated spec as YAML: %v", err)
+	}
+
+	// Assert paths section exists and contains /search.
+	pathsRaw, ok := parsed["paths"]
+	if !ok {
+		t.Fatal("spec missing 'paths' key")
+	}
+	paths, ok := pathsRaw.(map[string]interface{})
+	if !ok {
+		t.Fatalf("'paths' is not a map, got %T", pathsRaw)
+	}
+	searchPathRaw, ok := paths["/search"]
+	if !ok {
+		t.Fatalf("spec paths do not contain '/search'; paths = %v", paths)
+	}
+
+	// Assert /search has a get operation.
+	searchPath, ok := searchPathRaw.(map[string]interface{})
+	if !ok {
+		t.Fatalf("'/search' path item is not a map, got %T", searchPathRaw)
+	}
+	getOpRaw, ok := searchPath["get"]
+	if !ok {
+		t.Fatalf("'/search' path does not have a 'get' operation; got operations: %v", searchPath)
+	}
+
+	// Assert the get operation has a parameter named "q". This is the core
+	// assertion: the "q" field from the HTML form must appear in the generated
+	// spec's query parameters list, proving the full analyze → deduplicate →
+	// generate pipeline correctly surfaces GET form fields.
+	getOp, ok := getOpRaw.(map[string]interface{})
+	if !ok {
+		t.Fatalf("'/search' get operation is not a map, got %T", getOpRaw)
+	}
+	parametersRaw, ok := getOp["parameters"]
+	if !ok {
+		t.Fatalf("'/search' get operation has no 'parameters' key; operation = %v", getOp)
+	}
+	parameters, ok := parametersRaw.([]interface{})
+	if !ok {
+		t.Fatalf("'/search' get parameters is not a slice, got %T", parametersRaw)
+	}
+	foundQ := false
+	for _, pRaw := range parameters {
+		p, ok := pRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if p["name"] == "q" {
+			foundQ = true
+			break
+		}
+	}
+	if !foundQ {
+		t.Errorf("'/search' get parameters do not contain a parameter with name 'q'; parameters = %v", parameters)
+	}
+}

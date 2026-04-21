@@ -439,7 +439,7 @@ func TestDeduplicate_MergesDynamicAndStaticHTMLObservations(t *testing.T) {
 	obsB := ClassifiedRequest{
 		ObservedRequest: crawl.ObservedRequest{
 			Method:      "POST",
-			URL:         "https://app.example.com/login",
+			URL:         "https://app.example.com/login?csrf=abc",
 			Source:      "static:html",
 			QueryParams: map[string]string{"csrf": "abc"},
 			Body:        []byte("username=&password="),

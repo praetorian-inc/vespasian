@@ -29,6 +29,12 @@ import (
 // synthesized from static HTML form analysis.
 const SourceStaticHTML = "static:html"
 
+const (
+	maxFormsPerBody   = 1000
+	maxFieldsPerForm  = 500
+	maxAttrValueBytes = 4096
+)
+
 // staticForm is the intermediate representation of a parsed <form>.
 type staticForm struct {
 	Action  string            // raw action attribute (unresolved)
@@ -102,8 +108,7 @@ func isHTMLResponse(resp crawl.ObservedResponse) bool {
 	}
 	head := strings.ToLower(string(resp.Body[:n]))
 	return strings.Contains(head, "<!doctype html") ||
-		strings.Contains(head, "<html") ||
-		strings.Contains(head, "<form")
+		strings.Contains(head, "<html")
 }
 
 // pendingFieldState tracks state for elements whose value spans multiple tokens
@@ -130,21 +135,18 @@ func parseForms(body []byte) []staticForm {
 		tt := z.Next()
 		switch tt {
 		case html.ErrorToken:
-			// EOF or malformed — flush unclosed forms innermost-first to match
-			// normal close-tag order (</form> pops from the top of the stack).
-			// Resolve any in-flight select.
-			if pending != nil && pending.inSelect {
-				resolveSelectValue(pending)
-			}
-			for i := len(stack) - 1; i >= 0; i-- {
-				results = append(results, *stack[i])
-			}
-			return results
+			return flushUnclosedForms(stack, results, pending)
 
 		case html.StartTagToken, html.SelfClosingTagToken:
 			tok := z.Token()
 			if pending != nil {
 				handlePendingStartTag(tok, pending)
+				continue
+			}
+			// Cap: once we have reached the maximum number of forms, skip new
+			// <form> start tags but continue tokenizing so unclosed forms on the
+			// stack are still flushed at EOF.
+			if tok.DataAtom == atom.Form && len(results)+len(stack) >= maxFormsPerBody {
 				continue
 			}
 			stack = handleStartTag(tok, stack, &pending)
@@ -167,6 +169,18 @@ func parseForms(body []byte) []staticForm {
 			}
 		}
 	}
+}
+
+// flushUnclosedForms appends all forms remaining on the stack (innermost-first)
+// to results and returns the final slice. Any in-flight select is resolved first.
+func flushUnclosedForms(stack []*staticForm, results []staticForm, pending *pendingFieldState) []staticForm {
+	if pending != nil && pending.inSelect {
+		resolveSelectValue(pending)
+	}
+	for i := len(stack) - 1; i >= 0; i-- {
+		results = append(results, *stack[i])
+	}
+	return results
 }
 
 // handlePendingStartTag handles a start tag token while inside a textarea or
@@ -262,87 +276,115 @@ func handleStartTag(tok html.Token, stack []*staticForm, pending **pendingFieldS
 		stack = append(stack, f)
 
 	case atom.Input:
-		if len(stack) == 0 {
-			break
-		}
-		// Skip form="..." cross-association per ticket scope note.
-		if _, hasFormAttr := getAttrOK(tok, "form"); hasFormAttr {
-			break
-		}
-		name := getAttr(tok, "name")
-		if name == "" {
-			break
-		}
-		typ := strings.ToLower(getAttr(tok, "type"))
-		if isSkippableType(typ) {
-			break
-		}
-		f := stack[len(stack)-1]
-		f.Fields = append(f.Fields, staticFormField{
-			Name:        name,
-			Type:        typ,
-			Value:       getAttr(tok, "value"),
-			Placeholder: getAttr(tok, "placeholder"),
-			Required:    hasAttr(tok, "required"),
-			Hidden:      typ == "hidden",
-			CSRF:        isCSRFName(name),
-		})
+		handleInputTag(tok, stack)
 
 	case atom.Textarea:
-		if len(stack) == 0 {
-			break
-		}
-		if _, hasFormAttr := getAttrOK(tok, "form"); hasFormAttr {
-			break
-		}
-		name := getAttr(tok, "name")
-		if name == "" {
-			break
-		}
-		f := stack[len(stack)-1]
-		f.Fields = append(f.Fields, staticFormField{
-			Name:        name,
-			Type:        "textarea",
-			Placeholder: getAttr(tok, "placeholder"),
-			Required:    hasAttr(tok, "required"),
-			CSRF:        isCSRFName(name),
-		})
-		// Record a pointer to the newly appended field so text tokens can
-		// accumulate into its Value until </textarea>.
-		fieldPtr := &f.Fields[len(f.Fields)-1]
-		*pending = &pendingFieldState{
-			field:      fieldPtr,
-			inTextarea: true,
-		}
+		handleTextareaTag(tok, stack, pending)
 
 	case atom.Select:
-		if len(stack) == 0 {
-			break
-		}
-		if _, hasFormAttr := getAttrOK(tok, "form"); hasFormAttr {
-			break
-		}
-		name := getAttr(tok, "name")
-		if name == "" {
-			break
-		}
-		f := stack[len(stack)-1]
-		f.Fields = append(f.Fields, staticFormField{
-			Name:        name,
-			Type:        "select",
-			Placeholder: getAttr(tok, "placeholder"),
-			Required:    hasAttr(tok, "required"),
-			CSRF:        isCSRFName(name),
-		})
-		// Record a pointer to the newly appended field so option tokens can
-		// be examined until </select>.
-		fieldPtr := &f.Fields[len(f.Fields)-1]
-		*pending = &pendingFieldState{
-			field:    fieldPtr,
-			inSelect: true,
-		}
+		handleSelectTag(tok, stack, pending)
 	}
 	return stack
+}
+
+// handleInputTag appends a field to the current form when the <input> is valid
+// (has a name, is within a form, is not cross-associated, and is not a
+// skippable type such as submit/button/image/file/reset).
+func handleInputTag(tok html.Token, stack []*staticForm) {
+	if len(stack) == 0 {
+		return
+	}
+	if _, hasFormAttr := getAttrOK(tok, "form"); hasFormAttr {
+		return
+	}
+	name := getAttr(tok, "name")
+	if name == "" {
+		return
+	}
+	typ := strings.ToLower(getAttr(tok, "type"))
+	if isSkippableType(typ) {
+		return
+	}
+	f := stack[len(stack)-1]
+	if len(f.Fields) >= maxFieldsPerForm {
+		return
+	}
+	f.Fields = append(f.Fields, staticFormField{
+		Name:        name,
+		Type:        typ,
+		Value:       getAttr(tok, "value"),
+		Placeholder: getAttr(tok, "placeholder"),
+		Required:    hasAttr(tok, "required"),
+		Hidden:      typ == "hidden",
+		CSRF:        isCSRFName(name),
+	})
+}
+
+// handleTextareaTag appends a textarea field to the current form and sets
+// pending so that subsequent text tokens accumulate into its Value until
+// the matching </textarea>.
+func handleTextareaTag(tok html.Token, stack []*staticForm, pending **pendingFieldState) {
+	if len(stack) == 0 {
+		return
+	}
+	if _, hasFormAttr := getAttrOK(tok, "form"); hasFormAttr {
+		return
+	}
+	name := getAttr(tok, "name")
+	if name == "" {
+		return
+	}
+	f := stack[len(stack)-1]
+	if len(f.Fields) >= maxFieldsPerForm {
+		return
+	}
+	f.Fields = append(f.Fields, staticFormField{
+		Name:        name,
+		Type:        "textarea",
+		Placeholder: getAttr(tok, "placeholder"),
+		Required:    hasAttr(tok, "required"),
+		CSRF:        isCSRFName(name),
+	})
+	// Record a pointer to the newly appended field so text tokens can
+	// accumulate into its Value until </textarea>.
+	fieldPtr := &f.Fields[len(f.Fields)-1]
+	*pending = &pendingFieldState{
+		field:      fieldPtr,
+		inTextarea: true,
+	}
+}
+
+// handleSelectTag appends a select field to the current form and sets pending
+// so that <option> tokens can be examined until the matching </select>.
+func handleSelectTag(tok html.Token, stack []*staticForm, pending **pendingFieldState) {
+	if len(stack) == 0 {
+		return
+	}
+	if _, hasFormAttr := getAttrOK(tok, "form"); hasFormAttr {
+		return
+	}
+	name := getAttr(tok, "name")
+	if name == "" {
+		return
+	}
+	f := stack[len(stack)-1]
+	if len(f.Fields) >= maxFieldsPerForm {
+		return
+	}
+	f.Fields = append(f.Fields, staticFormField{
+		Name:        name,
+		Type:        "select",
+		Placeholder: getAttr(tok, "placeholder"),
+		Required:    hasAttr(tok, "required"),
+		CSRF:        isCSRFName(name),
+	})
+	// Record a pointer to the newly appended field so option tokens can
+	// be examined until </select>.
+	fieldPtr := &f.Fields[len(f.Fields)-1]
+	*pending = &pendingFieldState{
+		field:    fieldPtr,
+		inSelect: true,
+	}
 }
 
 // synthesizeRequest converts a parsed form into an ObservedRequest. It
@@ -418,16 +460,13 @@ func resolveAction(base, ref string) (string, bool) {
 	if err != nil || (baseU.Scheme != "http" && baseU.Scheme != "https") {
 		return "", false
 	}
+	// Strip userinfo from base URL to prevent credentials from being persisted.
+	baseU.User = nil
 	if ref == "" {
 		baseU.Fragment = ""
 		return baseU.String(), true
 	}
-	lower := strings.ToLower(ref)
-	if strings.HasPrefix(lower, "javascript:") ||
-		strings.HasPrefix(lower, "mailto:") ||
-		strings.HasPrefix(lower, "data:") ||
-		strings.HasPrefix(lower, "tel:") ||
-		strings.HasPrefix(lower, "blob:") {
+	if isUnsupportedSchemeRef(ref) {
 		return "", false
 	}
 	refU, err := url.Parse(ref)
@@ -435,16 +474,44 @@ func resolveAction(base, ref string) (string, bool) {
 		return "", false
 	}
 	resolved := baseU.ResolveReference(refU)
-	if resolved.Scheme != "http" && resolved.Scheme != "https" {
+	if !validateResolvedURL(baseU, resolved) {
 		return "", false
+	}
+	// Strip userinfo from the resolved URL to prevent credentials from being
+	// persisted into capture.json or sent in synthetic requests.
+	resolved.User = nil
+	resolved.Fragment = ""
+	return resolved.String(), true
+}
+
+// isUnsupportedSchemeRef reports whether ref begins with a scheme that cannot
+// produce a valid HTTP(S) action URL (javascript:, mailto:, data:, tel:, blob:).
+func isUnsupportedSchemeRef(ref string) bool {
+	lower := strings.ToLower(ref)
+	return strings.HasPrefix(lower, "javascript:") ||
+		strings.HasPrefix(lower, "mailto:") ||
+		strings.HasPrefix(lower, "data:") ||
+		strings.HasPrefix(lower, "tel:") ||
+		strings.HasPrefix(lower, "blob:")
+}
+
+// validateResolvedURL checks that the resolved URL is an HTTP(S) URL on the
+// same scheme, hostname, and port as the base URL. Returns false if any
+// constraint is violated.
+func validateResolvedURL(baseU, resolved *url.URL) bool {
+	if resolved.Scheme != "http" && resolved.Scheme != "https" {
+		return false
+	}
+	// Reject scheme changes: different scheme = different origin.
+	if resolved.Scheme != baseU.Scheme {
+		return false
 	}
 	// Reject off-host actions: hostname and port must both match the base URL.
 	if !strings.EqualFold(resolved.Hostname(), baseU.Hostname()) ||
 		resolved.Port() != baseU.Port() {
-		return "", false
+		return false
 	}
-	resolved.Fragment = ""
-	return resolved.String(), true
+	return true
 }
 
 // isCSRFName matches common CSRF parameter names (case-insensitive substring):
@@ -469,7 +536,12 @@ func isSkippableType(inputType string) bool {
 }
 
 // fieldValue returns value, or placeholder if value is empty, or "".
+// CSRF fields always return "" regardless of Value/Placeholder to prevent
+// one-time tokens from being persisted into capture.json or replayed.
 func fieldValue(f staticFormField) string {
+	if f.CSRF {
+		return ""
+	}
 	if f.Value != "" {
 		return f.Value
 	}
@@ -506,6 +578,9 @@ func flattenQuery(v url.Values) map[string]string {
 func getAttr(t html.Token, key string) string {
 	for _, a := range t.Attr {
 		if a.Key == key {
+			if len(a.Val) > maxAttrValueBytes {
+				return a.Val[:maxAttrValueBytes]
+			}
 			return a.Val
 		}
 	}

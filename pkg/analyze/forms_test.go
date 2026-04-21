@@ -201,6 +201,15 @@ func TestExtractForms_SelectAndTextareaExtracted(t *testing.T) {
 	if _, ok := got[0].QueryParams["bio"]; !ok {
 		t.Errorf("QueryParams missing bio; got %v", got[0].QueryParams)
 	}
+	// TEST-004: assert values, not just key presence.
+	// select with no value attribute -> option text content ("US").
+	if got[0].QueryParams["country"] != "US" {
+		t.Errorf("QueryParams[country] = %q, want US", got[0].QueryParams["country"])
+	}
+	// textarea with empty content -> empty string.
+	if got[0].QueryParams["bio"] != "" {
+		t.Errorf("QueryParams[bio] = %q, want empty string", got[0].QueryParams["bio"])
+	}
 }
 
 func TestExtractForms_FormWithNoNamedFields(t *testing.T) {
@@ -750,5 +759,154 @@ func TestExtractForms_SelectValueInPOSTBody(t *testing.T) {
 	bodyStr := string(got[0].Body)
 	if !strings.Contains(bodyStr, "country=ca") {
 		t.Errorf("body missing country=ca; got %q", bodyStr)
+	}
+}
+
+// SEC-BE-004: resolveAction must strip userinfo from the resolved URL.
+func TestResolveAction_UserinfoStripped(t *testing.T) {
+	// Non-empty ref: userinfo in ref URL must be stripped.
+	got, ok := resolveAction("https://h/", "https://admin:hunter2@h/x")
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	if strings.Contains(got, "admin") || strings.Contains(got, "hunter2") {
+		t.Errorf("userinfo not stripped from resolved URL; got %q", got)
+	}
+}
+
+// SEC-BE-002: CSRF field values must not appear in synthesized requests.
+func TestExtractForms_CSRFValueNotReplayed(t *testing.T) {
+	body := `<form method="post" action="/submit"><input type="hidden" name="csrf_token" value="SECRET123"></form>`
+	reqs := []crawl.ObservedRequest{htmlReq("https://host/", body)}
+	got := ExtractForms(reqs)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(got))
+	}
+	bodyStr := string(got[0].Body)
+	// Field name must still be present (parameter discovery).
+	if !strings.Contains(bodyStr, "csrf_token=") {
+		t.Errorf("csrf_token field name missing from body; got %q", bodyStr)
+	}
+	// But the secret value must NOT be present.
+	if strings.Contains(bodyStr, "SECRET123") {
+		t.Errorf("CSRF value SECRET123 must not appear in synthesized body; got %q", bodyStr)
+	}
+}
+
+// SEC-BE-001: parseForms must cap output at maxFormsPerBody forms and
+// maxFieldsPerForm fields per form, and getAttr must cap attribute value length
+// at maxAttrValueBytes.
+func TestParseForms_CapsEnforced(t *testing.T) {
+	t.Run("maxFormsPerBody", func(t *testing.T) {
+		// Build 2000 sibling <form> elements.
+		var b strings.Builder
+		for i := 0; i < 2000; i++ {
+			b.WriteString(`<form action="/x"><input name="q"></form>`)
+		}
+		forms := parseForms([]byte(b.String()))
+		if len(forms) != maxFormsPerBody {
+			t.Errorf("len(forms) = %d, want %d", len(forms), maxFormsPerBody)
+		}
+	})
+
+	t.Run("maxFieldsPerForm", func(t *testing.T) {
+		// Build one form with 1000 <input> fields.
+		var b strings.Builder
+		b.WriteString(`<form action="/x">`)
+		for i := 0; i < 1000; i++ {
+			b.WriteString(`<input name="f">`)
+		}
+		b.WriteString(`</form>`)
+		forms := parseForms([]byte(b.String()))
+		if len(forms) != 1 {
+			t.Fatalf("expected 1 form, got %d", len(forms))
+		}
+		if len(forms[0].Fields) != maxFieldsPerForm {
+			t.Errorf("len(Fields) = %d, want %d", len(forms[0].Fields), maxFieldsPerForm)
+		}
+	})
+
+	t.Run("maxAttrValueBytes", func(t *testing.T) {
+		// Build a single input with a value longer than maxAttrValueBytes.
+		longVal := strings.Repeat("a", 5000)
+		body := []byte(`<form><input name="x" value="` + longVal + `"></form>`)
+		forms := parseForms(body)
+		if len(forms) != 1 || len(forms[0].Fields) != 1 {
+			t.Fatalf("unexpected parse result: %d forms", len(forms))
+		}
+		if len(forms[0].Fields[0].Value) > maxAttrValueBytes {
+			t.Errorf("Value length = %d, want <= %d", len(forms[0].Fields[0].Value), maxAttrValueBytes)
+		}
+	})
+}
+
+// QUAL-002: A JSON response body containing a <form> string must NOT be sniffed
+// as HTML when ContentType is empty.
+func TestIsHTMLResponse_JSONWithFormStringNotSniffedAsHTML(t *testing.T) {
+	resp := crawl.ObservedResponse{
+		ContentType: "",
+		Body:        []byte(`{"msg":"<form action='/x'>"}`),
+	}
+	if isHTMLResponse(resp) {
+		t.Errorf("expected false: JSON body with <form> string should not sniff as HTML")
+	}
+}
+
+// SEC-BE-003: Scheme change on same host must be rejected (http to https is a
+// different origin and must not produce a synthetic request).
+func TestResolveAction_SchemeChangeSameHostRejected(t *testing.T) {
+	_, ok := resolveAction("http://h/", "https://h/x")
+	if ok {
+		t.Errorf("expected ok=false for scheme change on same host, got true")
+	}
+}
+
+// TEST-002: required attribute on <input> and <select> must set Required=true;
+// absence must leave Required=false.
+func TestParseForms_RequiredFlag(t *testing.T) {
+	body := []byte(`<form><input name="email" required><input name="age"><select name="country" required></select><textarea name="bio"></textarea></form>`)
+	forms := parseForms(body)
+	if len(forms) != 1 {
+		t.Fatalf("expected 1 form, got %d", len(forms))
+	}
+	fields := forms[0].Fields
+	if len(fields) != 4 {
+		t.Fatalf("expected 4 fields, got %d: %v", len(fields), fields)
+	}
+	cases := []struct {
+		name     string
+		required bool
+	}{
+		{"email", true},
+		{"age", false},
+		{"country", true},
+		{"bio", false},
+	}
+	for i, tc := range cases {
+		if fields[i].Name != tc.name {
+			t.Errorf("fields[%d].Name = %q, want %q", i, fields[i].Name, tc.name)
+		}
+		if fields[i].Required != tc.required {
+			t.Errorf("fields[%d] (%s).Required = %v, want %v", i, tc.name, fields[i].Required, tc.required)
+		}
+	}
+}
+
+// TEST-003a: protocol-relative URL on same host must resolve to the base scheme.
+func TestResolveAction_ProtocolRelativeSameHost(t *testing.T) {
+	got, ok := resolveAction("https://h/a", "//h/b")
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	if got != "https://h/b" {
+		t.Errorf("got %q, want https://h/b", got)
+	}
+}
+
+// TEST-003b: ftp:// scheme in the ref must be rejected.
+func TestResolveAction_FTPSchemeRejected(t *testing.T) {
+	_, ok := resolveAction("https://h/a", "ftp://h/b")
+	if ok {
+		t.Errorf("expected ok=false for ftp:// scheme, got true")
 	}
 }
