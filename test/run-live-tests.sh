@@ -1269,6 +1269,61 @@ test_import_mitmproxy() {
     fi
 }
 
+# test_import_mitmproxy_native exercises the native binary flow format
+# produced by mitmproxy's `w` command (tnetstring-encoded flows). Regression
+# coverage for LAB-2309, where a .mitm file produced by mitmproxy 12.x was
+# rejected with "expected JSON array or object, got '2'".
+test_import_mitmproxy_native() {
+    local target_dir="${RESULTS_DIR}/import-mitmproxy-native"
+    local imported_file="${target_dir}/imported.json"
+    local fixture="${SCRIPT_DIR}/fixtures/sample-mitmproxy.mitm"
+    local expected_capture="${SCRIPT_DIR}/fixtures/expected-mitmproxy-capture.json"
+
+    mkdir -p "$target_dir"
+    init_test_status "import-mitmproxy-native"
+
+    local start=$SECONDS
+    local failures=0
+
+    log_header "Testing: import-mitmproxy-native (LAB-2309 native .mitm format)"
+
+    if [ ! -f "$fixture" ]; then
+        log_fail "Native fixture missing: $fixture"
+        log_info "Regenerate with: go run ./test/fixtures/gen_mitmproxy_native > test/fixtures/sample-mitmproxy.mitm"
+        set_test_result "import-mitmproxy-native" "FAIL" "?" "3" "$((SECONDS - start))"
+        return 1
+    fi
+
+    # Sanity-check: first byte should be an ASCII digit (tnetstring length
+    # prefix). If it's not, the fixture isn't the format we claim to test.
+    local first_byte
+    first_byte=$(head -c 1 "$fixture")
+    if ! [[ "$first_byte" =~ [0-9] ]]; then
+        log_fail "Fixture first byte is '$first_byte', expected a digit (tnetstring prefix)"
+        set_test_result "import-mitmproxy-native" "FAIL" "?" "3" "$((SECONDS - start))"
+        return 1
+    fi
+
+    if ! "$VESPASIAN" import mitmproxy "$fixture" -o "$imported_file" 2>&1; then
+        log_fail "Native mitmproxy import failed"
+        set_test_result "import-mitmproxy-native" "FAIL" "?" "3" "$((SECONDS - start))"
+        return 1
+    fi
+
+    if ! compare_json "$imported_file" "$expected_capture" "import-mitmproxy-native capture"; then
+        failures=$((failures + 1))
+    fi
+
+    local duration=$((SECONDS - start))
+    if [ $failures -eq 0 ]; then
+        set_test_result "import-mitmproxy-native" "PASS" "3" "3" "$duration"
+        log_ok "import-mitmproxy-native: PASSED (${duration}s)"
+    else
+        set_test_result "import-mitmproxy-native" "FAIL" "?" "3" "$duration"
+        log_fail "import-mitmproxy-native: FAILED (${duration}s)"
+    fi
+}
+
 test_import_unicode() {
     local target_dir="${RESULTS_DIR}/import-unicode"
     local imported_file="${target_dir}/imported.json"
@@ -1867,9 +1922,9 @@ usage() {
     echo "                          Generate:   generate-rest, generate-wsdl,"
     echo "                                      generate-graphql, generate-graphql-imports"
     echo "                          Import:     import-burp, import-har, import-base64,"
-    echo "                                      import-mitmproxy, import-unicode,"
-    echo "                                      import-duplicates, import-malformed,"
-    echo "                                      import-empty"
+    echo "                                      import-mitmproxy, import-mitmproxy-native,"
+    echo "                                      import-unicode, import-duplicates,"
+    echo "                                      import-malformed, import-empty"
     echo "                          Crawl:      crawl-depth, crawl-unreachable"
     echo "                          Edge cases: edge-cases, classifier-edge, spec-edge"
     echo "  --verbose             Enable verbose vespasian output"
@@ -1929,7 +1984,7 @@ main() {
     if [ -z "$targets" ]; then
         targets="${TARGETS_SETUP:-rest-api,soap-service,graphql-server}"
         # Always include importer tests
-        targets="${targets},import-burp,import-har,import-base64,import-mitmproxy,import-unicode,import-duplicates,import-malformed,import-empty"
+        targets="${targets},import-burp,import-har,import-base64,import-mitmproxy,import-mitmproxy-native,import-unicode,import-duplicates,import-malformed,import-empty"
         targets="${targets},generate-rest,generate-wsdl,generate-graphql,generate-graphql-imports"
         targets="${targets},edge-cases,crawl-depth,crawl-unreachable"
         targets="${targets},classifier-edge,spec-edge"
@@ -1965,6 +2020,7 @@ main() {
             import-har)         test_import_har ;;
             import-base64)      test_import_base64 ;;
             import-mitmproxy)   test_import_mitmproxy ;;
+            import-mitmproxy-native) test_import_mitmproxy_native ;;
             import-unicode)     test_import_unicode ;;
             import-duplicates)  test_import_duplicates ;;
             import-malformed)   test_import_malformed ;;

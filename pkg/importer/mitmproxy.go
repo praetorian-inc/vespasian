@@ -26,7 +26,15 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
-// MitmproxyImporter imports mitmproxy JSON traffic captures.
+// MitmproxyImporter imports mitmproxy traffic captures. It accepts two input
+// formats:
+//
+//  1. The JSON export produced by `mitmdump -w 'json:out.json'` style exporters.
+//  2. The native binary flow file produced by the mitmproxy `w` command
+//     (`.mitm` / `.flows`), which uses tnetstring-serialized flow dicts.
+//
+// Format detection peeks the first non-whitespace byte: `[` or `{` selects the
+// JSON path; an ASCII digit selects the native tnetstring path.
 type MitmproxyImporter struct{}
 
 type mitmproxyFlow struct {
@@ -55,20 +63,48 @@ func (MitmproxyImporter) Name() string {
 	return "mitmproxy"
 }
 
-// Import reads mitmproxy JSON and converts to ObservedRequest format.
-// Handles both single flow and array of flows.
-//
-// Memory efficiency (S3 fix): Uses streaming json.NewDecoder instead of io.ReadAll
-// to avoid allocating the entire input as a raw byte buffer (up to 500MB).
-// The decoder reads in ~4KB chunks. Note: parsed flow structs are still accumulated
-// in memory as required by the []ObservedRequest return type - the improvement
-// eliminates the raw JSON buffer, not the parsed data.
-func (i *MitmproxyImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) { //nolint:gocyclo // mitmproxy format parsing
-	// Limit reader to prevent resource exhaustion
+// Import reads mitmproxy traffic and converts it to ObservedRequest format.
+// It supports both mitmproxy's JSON export and the native tnetstring-based
+// flow dump produced by `File > Save` (the `w` command in mitmproxy).
+func (i *MitmproxyImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error) {
 	limitedReader := newLimitedReader(r, maxImportSize)
 	bufReader := bufio.NewReader(limitedReader)
 
-	// Peek first non-whitespace byte to determine JSON type (array vs object)
+	firstByte, err := peekFirstNonWhitespace(bufReader)
+	if err != nil {
+		if limitedReader.hitLimit {
+			return nil, ErrFileTooLarge
+		}
+		return nil, fmt.Errorf("mitmproxy importer: failed to read input: %w", err)
+	}
+
+	// Format dispatch by first non-whitespace byte. mitmproxy's JSON export
+	// always begins with '[' (array of flows) or '{' (single flow). Its native
+	// flow dump always begins with an ASCII digit (the tnetstring length
+	// prefix). These triggers are disjoint so there is no overlap to resolve.
+	switch {
+	case firstByte == '[' || firstByte == '{':
+		return i.importJSON(bufReader, limitedReader)
+	case firstByte >= '0' && firstByte <= '9':
+		return i.importNative(bufReader, limitedReader)
+	default:
+		return nil, fmt.Errorf(
+			"mitmproxy importer: unrecognized format (first byte %q); "+
+				"expected JSON export starting with '[' or '{', or a native "+
+				"tnetstring flow dump starting with an ASCII digit - for "+
+				"native .mitm files, convert with "+
+				"`mitmdump -nr input.mitm -w 'hardump:output.har'` and import "+
+				"using --format har",
+			string(firstByte),
+		)
+	}
+}
+
+// importJSON parses the JSON export format.
+//
+// Memory efficiency (S3 fix): Uses streaming json.NewDecoder instead of io.ReadAll
+// to avoid allocating the entire input as a raw byte buffer (up to 500MB).
+func (i *MitmproxyImporter) importJSON(bufReader *bufio.Reader, limitedReader *limitedReader) ([]crawl.ObservedRequest, error) { //nolint:gocyclo // format parsing
 	firstByte, err := peekFirstNonWhitespace(bufReader)
 	if err != nil {
 		if limitedReader.hitLimit {
@@ -82,15 +118,12 @@ func (i *MitmproxyImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error)
 
 	switch firstByte {
 	case '[':
-		// Array of flows - parse and convert in single pass
-		// Consume opening '['
 		if _, err := decoder.Token(); err != nil {
 			if limitedReader.hitLimit {
 				return nil, ErrFileTooLarge
 			}
 			return nil, fmt.Errorf("mitmproxy importer: failed to read array start: %w", err)
 		}
-		// Decode and convert each flow immediately
 		for decoder.More() {
 			var flow mitmproxyFlow
 			if err := decoder.Decode(&flow); err != nil {
@@ -105,7 +138,6 @@ func (i *MitmproxyImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error)
 			}
 			requests = append(requests, req)
 		}
-		// Consume closing ']'
 		if _, err := decoder.Token(); err != nil {
 			if limitedReader.hitLimit {
 				return nil, ErrFileTooLarge
@@ -113,7 +145,6 @@ func (i *MitmproxyImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error)
 			return nil, fmt.Errorf("mitmproxy importer: failed to read array end: %w", err)
 		}
 	case '{':
-		// Single flow object
 		var flow mitmproxyFlow
 		if err := decoder.Decode(&flow); err != nil {
 			if limitedReader.hitLimit {
@@ -126,11 +157,208 @@ func (i *MitmproxyImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error)
 			return nil, fmt.Errorf("mitmproxy importer: %w", err)
 		}
 		requests = []crawl.ObservedRequest{req}
-	default:
-		return nil, fmt.Errorf("mitmproxy importer: expected JSON array or object, got %q", string(firstByte))
 	}
 
 	return requests, nil
+}
+
+// maxNativeFlows caps the total number of flow records (HTTP + skipped) that
+// importNative will iterate over. The 500MB file-size cap already bounds the
+// raw input, but an attacker could encode millions of small non-HTTP flows to
+// burn CPU parsing records that produce no output. A hard cap here is cheap
+// and bounds the loop regardless of skipped-flow ratio.
+//
+// Declared as a var (not a const) so tests can lower the cap and exercise
+// the rejection path with a small crafted payload. Production callers MUST
+// treat this as read-only.
+var maxNativeFlows = 500_000
+
+// importNative parses mitmproxy's native binary flow format. Each flow is a
+// tnetstring-encoded dict; multiple flows are simply concatenated.
+func (i *MitmproxyImporter) importNative(bufReader *bufio.Reader, limitedReader *limitedReader) ([]crawl.ObservedRequest, error) {
+	var requests []crawl.ObservedRequest
+	var seen int
+	for {
+		// Detect end-of-stream between flows without consuming bytes.
+		if _, err := bufReader.Peek(1); err != nil {
+			if err == io.EOF {
+				return requests, nil
+			}
+			if limitedReader.hitLimit {
+				return nil, ErrFileTooLarge
+			}
+			return nil, fmt.Errorf("mitmproxy importer: peek native stream: %w", err)
+		}
+
+		if seen >= maxNativeFlows {
+			return nil, fmt.Errorf("%w: native flow count exceeded %d", ErrTooManyEntries, maxNativeFlows)
+		}
+		seen++
+
+		raw, err := decodeTnetstringStream(bufReader, 0)
+		if err != nil {
+			if limitedReader.hitLimit {
+				return nil, ErrFileTooLarge
+			}
+			return nil, fmt.Errorf("mitmproxy importer: decode native flow: %w", err)
+		}
+
+		state, ok := raw.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("mitmproxy importer: expected flow dict, got %T", raw)
+		}
+
+		// Only HTTP flows produce ObservedRequest entries. mitmproxy mixed
+		// captures can include "tcp", "udp", "dns" records; skip those. A
+		// missing/unparseable `type` key is also treated as non-HTTP because
+		// HTTPFlow.get_state() always populates it.
+		if flowType := tnetBytesOrString(state["type"]); flowType != "http" {
+			continue
+		}
+
+		flow, err := flowFromNativeState(state)
+		if err != nil {
+			return nil, fmt.Errorf("mitmproxy importer: %w", err)
+		}
+		req, err := i.parseFlow(flow)
+		if err != nil {
+			return nil, fmt.Errorf("mitmproxy importer: %w", err)
+		}
+		requests = append(requests, req)
+	}
+}
+
+// flowFromNativeState translates a tnetstring-decoded HTTPFlow state dict into
+// the shared mitmproxyFlow struct used by the JSON path. Fields are sourced
+// from mitmproxy.http.HTTPFlow.get_state().
+//
+// Scope note: mitmproxy flow state also carries `websocket` (WebSocket frames
+// after an HTTP Upgrade), `error` (transport-level errors), and `trailers`
+// (HTTP trailers) sub-dicts. vespasian's ObservedRequest model does not
+// represent these, so they are intentionally dropped. If future probes or
+// classifiers need them, extend ObservedRequest first and thread fields
+// through here.
+func flowFromNativeState(state map[string]any) (mitmproxyFlow, error) {
+	reqAny, ok := state["request"]
+	if !ok {
+		return mitmproxyFlow{}, fmt.Errorf("flow missing \"request\" field")
+	}
+	reqMap, ok := reqAny.(map[string]any)
+	if !ok {
+		return mitmproxyFlow{}, fmt.Errorf("flow \"request\" is %T, want dict", reqAny)
+	}
+
+	req := mitmproxyRequest{
+		Method:  tnetBytesOrString(reqMap["method"]),
+		Scheme:  tnetBytesOrString(reqMap["scheme"]),
+		Host:    tnetBytesOrString(reqMap["host"]),
+		Port:    int(tnetInt64(reqMap["port"])),
+		Path:    buildRequestPath(reqMap),
+		Headers: nativeHeaders(reqMap["headers"]),
+		Content: nativeContent(reqMap["content"]),
+	}
+
+	var resp mitmproxyResponse
+	if respAny, ok := state["response"]; ok && respAny != nil {
+		respMap, ok := respAny.(map[string]any)
+		if !ok {
+			return mitmproxyFlow{}, fmt.Errorf("flow \"response\" is %T, want dict", respAny)
+		}
+		resp = mitmproxyResponse{
+			StatusCode: int(tnetInt64(respMap["status_code"])),
+			Headers:    nativeHeaders(respMap["headers"]),
+			Content:    nativeContent(respMap["content"]),
+		}
+	}
+
+	return mitmproxyFlow{Request: req, Response: resp}, nil
+}
+
+// buildRequestPath returns the request path (with query string if any).
+// mitmproxy's HTTPFlow.get_state() stores the full request target verbatim
+// from the wire in the `path` field (e.g. "/api?x=1"). CONNECT requests may
+// leave `path` empty and surface the target via `authority` instead.
+func buildRequestPath(reqMap map[string]any) string {
+	if path := tnetBytesOrString(reqMap["path"]); path != "" {
+		return path
+	}
+	return tnetBytesOrString(reqMap["authority"])
+}
+
+// nativeHeaders converts mitmproxy's [][name, value] byte-pair list (as returned
+// by Headers.get_state()) into the [][]string format expected by parseFlow.
+func nativeHeaders(v any) [][]string {
+	list, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([][]string, 0, len(list))
+	for _, entry := range list {
+		pair, ok := entry.([]any)
+		if !ok || len(pair) < 2 {
+			continue
+		}
+		out = append(out, []string{
+			tnetBytesOrString(pair[0]),
+			tnetBytesOrString(pair[1]),
+		})
+	}
+	return out
+}
+
+// nativeContent encodes the raw request/response body as base64 so parseFlow's
+// shared decode path handles it.
+//
+// Returns nil for both absent bodies (no `content` key) and explicitly empty
+// bodies (zero-length content). ObservedRequest already uses a nil-byte-slice
+// Body field and does not distinguish "no body" from "Content-Length: 0", so
+// conflating them here matches existing behavior and keeps the JSON and
+// native paths aligned.
+func nativeContent(v any) *string {
+	if v == nil {
+		return nil
+	}
+	var raw []byte
+	switch b := v.(type) {
+	case []byte:
+		raw = b
+	case string:
+		raw = []byte(b)
+	default:
+		return nil
+	}
+	if len(raw) == 0 {
+		return nil
+	}
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	return &encoded
+}
+
+// tnetBytesOrString coerces a tnetstring-decoded value to a string, accepting
+// either a []byte (the common case for mitmproxy state) or a string.
+func tnetBytesOrString(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case []byte:
+		return string(x)
+	default:
+		return ""
+	}
+}
+
+// tnetInt64 coerces an int-like tnetstring value to int64.
+func tnetInt64(v any) int64 {
+	switch x := v.(type) {
+	case int64:
+		return x
+	case int:
+		return int64(x)
+	case float64:
+		return int64(x)
+	default:
+		return 0
+	}
 }
 
 // peekFirstNonWhitespace reads and unreads bytes until finding a non-whitespace character.
@@ -140,9 +368,7 @@ func peekFirstNonWhitespace(r *bufio.Reader) (byte, error) {
 		if err != nil {
 			return 0, err
 		}
-		// Skip JSON whitespace: space, tab, newline, carriage return
 		if b != ' ' && b != '\t' && b != '\n' && b != '\r' {
-			// Unread so decoder sees it
 			if err := r.UnreadByte(); err != nil {
 				return 0, err
 			}
@@ -154,26 +380,21 @@ func peekFirstNonWhitespace(r *bufio.Reader) (byte, error) {
 // parseFlow converts a mitmproxyFlow into an ObservedRequest.
 // Constructs URL from request components, decodes base64 content, and extracts headers.
 func (i *MitmproxyImporter) parseFlow(flow mitmproxyFlow) (crawl.ObservedRequest, error) {
-	// Validate port
 	if flow.Request.Port < 0 || flow.Request.Port > 65535 {
 		return crawl.ObservedRequest{}, fmt.Errorf("invalid port: %d (must be 0-65535)", flow.Request.Port)
 	}
 
-	// Validate HTTP method for consistency with Burp importer
 	if !validHTTPMethods[flow.Request.Method] {
 		return crawl.ObservedRequest{}, fmt.Errorf("invalid HTTP method: %s", flow.Request.Method)
 	}
 
-	// Construct URL
 	url := constructURL(flow.Request.Scheme, flow.Request.Host, flow.Request.Port, flow.Request.Path)
 
-	// Decode request content
 	reqBody, err := decodeContent(flow.Request.Content)
 	if err != nil {
 		return crawl.ObservedRequest{}, fmt.Errorf("failed to decode request content: %w", err)
 	}
 
-	// Decode response content
 	respBody, err := decodeContent(flow.Response.Content)
 	if err != nil {
 		return crawl.ObservedRequest{}, fmt.Errorf("failed to decode response content: %w", err)
@@ -198,7 +419,6 @@ func (i *MitmproxyImporter) parseFlow(flow mitmproxyFlow) (crawl.ObservedRequest
 
 // constructURL builds URL from mitmproxy components using url.URL struct.
 func constructURL(scheme, host string, port int, path string) string {
-	// Parse path to separate path and query
 	pathPart, query, _ := strings.Cut(path, "?")
 
 	u := &url.URL{
@@ -208,7 +428,6 @@ func constructURL(scheme, host string, port int, path string) string {
 		RawQuery: query,
 	}
 
-	// Add port if non-default
 	isDefaultPort := (scheme == "https" && port == 443) || (scheme == "http" && port == 80)
 	if !isDefaultPort {
 		u.Host = fmt.Sprintf("%s:%d", host, port)

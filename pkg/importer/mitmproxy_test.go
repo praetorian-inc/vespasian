@@ -15,7 +15,9 @@
 package importer
 
 import (
+	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -588,11 +590,13 @@ func TestMitmproxyImporter_WhitespaceOnlyInput(t *testing.T) {
 }
 
 func TestMitmproxyImporter_InvalidFirstToken(t *testing.T) {
-	// Test unexpected token (not [ or {) triggers error
+	// Test unexpected token (not [, {, or digit) triggers a format-unknown error
+	// with guidance on converting native .mitm files to HAR.
 	m := &MitmproxyImporter{}
 	_, err := m.Import(strings.NewReader(`"string value"`))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "expected JSON array or object")
+	assert.Contains(t, err.Error(), "unrecognized format")
+	assert.Contains(t, err.Error(), "mitmdump -nr")
 }
 
 func TestMitmproxyImporter_InvalidArrayToken(t *testing.T) {
@@ -660,4 +664,533 @@ func TestMitmproxyImporter_InvalidMethod(t *testing.T) {
 	_, err := m.Import(strings.NewReader(json))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid HTTP method: INVALID")
+}
+
+// ─── Native (tnetstring) flow format ──────────────────────────────────────────
+//
+// The following tests exercise the binary flow format produced by mitmproxy's
+// `w` command. flowState builds a minimal-but-valid HTTPFlow get_state() dict
+// so tests read close to the Python source.
+
+// flowState produces a dict matching mitmproxy.http.HTTPFlow.get_state().
+// Headers are serialized as a list-of-byte-pairs, bodies as raw bytes.
+func flowState(method, scheme, host string, port int, path string, reqHeaders [][2]string, reqBody []byte, statusCode int, respHeaders [][2]string, respBody []byte) map[string]any {
+	reqHdrList := make([]any, 0, len(reqHeaders))
+	for _, h := range reqHeaders {
+		reqHdrList = append(reqHdrList, []any{[]byte(h[0]), []byte(h[1])})
+	}
+	respHdrList := make([]any, 0, len(respHeaders))
+	for _, h := range respHeaders {
+		respHdrList = append(respHdrList, []any{[]byte(h[0]), []byte(h[1])})
+	}
+	return map[string]any{
+		"type":   []byte("http"),
+		"id":     []byte("00000000-0000-0000-0000-000000000001"),
+		"marked": []byte(""),
+		"request": map[string]any{
+			"http_version": []byte("HTTP/1.1"),
+			"method":       []byte(method),
+			"scheme":       []byte(scheme),
+			"host":         []byte(host),
+			"port":         int64(port),
+			"path":         []byte(path),
+			"authority":    []byte(""),
+			"headers":      reqHdrList,
+			"content":      reqBody,
+		},
+		"response": map[string]any{
+			"http_version": []byte("HTTP/1.1"),
+			"status_code":  int64(statusCode),
+			"reason":       []byte("OK"),
+			"headers":      respHdrList,
+			"content":      respBody,
+		},
+	}
+}
+
+func TestMitmproxyImporter_Native_SingleFlow(t *testing.T) {
+	state := flowState(
+		"GET", "https", "example.com", 443, "/api?page=1",
+		[][2]string{{"User-Agent", "test"}, {"Accept", "application/json"}},
+		nil,
+		200,
+		[][2]string{{"Content-Type", "application/json"}},
+		[]byte(`{"id":1}`),
+	)
+	encoded := encodeTnet(state)
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(bytes.NewReader(encoded))
+	require.NoError(t, err)
+
+	require.Len(t, requests, 1)
+	req := requests[0]
+	assert.Equal(t, "GET", req.Method)
+	assert.Equal(t, "https://example.com/api?page=1", req.URL)
+	assert.Equal(t, "import:mitmproxy", req.Source)
+	assert.Equal(t, 200, req.Response.StatusCode)
+	assert.Equal(t, "application/json", req.Response.ContentType)
+	assert.Equal(t, `{"id":1}`, string(req.Response.Body))
+	assert.Equal(t, "test", req.Headers["User-Agent"])
+	assert.Equal(t, "application/json", req.Headers["Accept"])
+	assert.Equal(t, "1", req.QueryParams["page"])
+}
+
+func TestMitmproxyImporter_Native_MultipleFlows(t *testing.T) {
+	flow1 := encodeTnet(flowState(
+		"GET", "https", "a.example.com", 443, "/one",
+		nil, nil, 200, nil, nil,
+	))
+	flow2 := encodeTnet(flowState(
+		"POST", "http", "b.example.com", 8080, "/two",
+		[][2]string{{"Content-Type", "text/plain"}}, []byte("hello"),
+		201, nil, nil,
+	))
+
+	var combined bytes.Buffer
+	combined.Write(flow1)
+	combined.Write(flow2)
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(&combined)
+	require.NoError(t, err)
+
+	require.Len(t, requests, 2)
+	assert.Equal(t, "https://a.example.com/one", requests[0].URL)
+	assert.Equal(t, "http://b.example.com:8080/two", requests[1].URL)
+	assert.Equal(t, []byte("hello"), requests[1].Body)
+	assert.Equal(t, 201, requests[1].Response.StatusCode)
+}
+
+func TestMitmproxyImporter_Native_SkipsNonHTTPFlows(t *testing.T) {
+	// Non-HTTP flow (e.g., TCP) should be skipped, not errored.
+	tcpFlow := map[string]any{
+		"type":     []byte("tcp"),
+		"id":       []byte("tcp-1"),
+		"messages": []any{},
+	}
+	httpFlow := flowState(
+		"GET", "https", "example.com", 443, "/ok",
+		nil, nil, 200, nil, nil,
+	)
+
+	var combined bytes.Buffer
+	combined.Write(encodeTnet(tcpFlow))
+	combined.Write(encodeTnet(httpFlow))
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(&combined)
+	require.NoError(t, err)
+
+	require.Len(t, requests, 1)
+	assert.Equal(t, "https://example.com/ok", requests[0].URL)
+}
+
+func TestMitmproxyImporter_Native_MissingResponse(t *testing.T) {
+	// Flow with null response (e.g., error or in-flight) still imports; the
+	// resulting ObservedRequest simply has zero-valued response fields.
+	state := flowState(
+		"GET", "https", "example.com", 443, "/pending",
+		nil, nil, 0, nil, nil,
+	)
+	state["response"] = nil
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(bytes.NewReader(encodeTnet(state)))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	assert.Equal(t, 0, requests[0].Response.StatusCode)
+	assert.Nil(t, requests[0].Response.Body)
+}
+
+func TestMitmproxyImporter_Native_RegressionLAB2309(t *testing.T) {
+	// Regression test for LAB-2309: a native mitmproxy flow dump starts with
+	// an ASCII digit (the tnetstring length prefix), which historically hit
+	// the "expected JSON array or object" path and rejected the file with:
+	//
+	//   "mitmproxy importer: expected JSON array or object, got \"2\""
+	//
+	// This test defends against a regression to that dispatch by (1) asserting
+	// the fixture actually starts with a digit (reproducing the user's
+	// reported failure mode) and (2) asserting the import succeeds with
+	// meaningful data, so flipping the dispatch back to the JSON-only path
+	// fails with a concrete error instead of silently no-op'ing.
+	state := flowState(
+		"GET", "https", "example.com", 443, "/api?x=1",
+		[][2]string{{"User-Agent", "lab2309-test"}},
+		nil,
+		200,
+		[][2]string{{"Content-Type", "application/json"}},
+		[]byte(`{"ok":true}`),
+	)
+	encoded := encodeTnet(state)
+
+	// Confirm the fixture starts with the byte class that triggered the bug.
+	require.GreaterOrEqual(t, encoded[0], byte('0'))
+	require.LessOrEqual(t, encoded[0], byte('9'))
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(bytes.NewReader(encoded))
+	require.NoError(t, err, "LAB-2309: native flow must decode without the pre-fix JSON error")
+
+	require.Len(t, requests, 1)
+	req := requests[0]
+	// End-to-end field propagation — a regression that hits the wrong dispatch
+	// would either error or produce zero-valued fields.
+	assert.Equal(t, "GET", req.Method)
+	assert.Equal(t, "https://example.com/api?x=1", req.URL)
+	assert.Equal(t, "lab2309-test", req.Headers["User-Agent"])
+	assert.Equal(t, 200, req.Response.StatusCode)
+	assert.Equal(t, "application/json", req.Response.ContentType)
+	assert.Equal(t, `{"ok":true}`, string(req.Response.Body))
+	assert.Equal(t, "import:mitmproxy", req.Source)
+}
+
+func TestMitmproxyImporter_Native_InvalidFlowDict(t *testing.T) {
+	// Top-level element is a bytes value, not a dict.
+	encoded := encodeTnet([]byte("not a flow"))
+	m := &MitmproxyImporter{}
+	_, err := m.Import(bytes.NewReader(encoded))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected flow dict")
+}
+
+func TestMitmproxyImporter_Native_MissingRequest(t *testing.T) {
+	state := map[string]any{
+		"type": []byte("http"),
+		"id":   []byte("bad-flow"),
+	}
+	m := &MitmproxyImporter{}
+	_, err := m.Import(bytes.NewReader(encodeTnet(state)))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing \"request\"")
+}
+
+func TestMitmproxyImporter_Native_TruncatedStream(t *testing.T) {
+	encoded := encodeTnet(flowState(
+		"GET", "https", "example.com", 443, "/api",
+		nil, nil, 200, nil, nil,
+	))
+	// Chop off the last half.
+	truncated := encoded[:len(encoded)/2]
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(bytes.NewReader(truncated))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decode native flow")
+}
+
+func TestMitmproxyImporter_Native_InvalidPortPropagates(t *testing.T) {
+	// Port validation from the shared parseFlow path still applies.
+	state := flowState(
+		"GET", "https", "example.com", 443, "/api",
+		nil, nil, 200, nil, nil,
+	)
+	req := state["request"].(map[string]any)
+	req["port"] = int64(70000)
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(bytes.NewReader(encodeTnet(state)))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid port")
+}
+
+func TestMitmproxyImporter_Native_AuthorityFallbackForEmptyPath(t *testing.T) {
+	// CONNECT-like requests may have an empty path; we fall back to authority.
+	state := flowState(
+		"CONNECT", "https", "example.com", 443, "",
+		nil, nil, 200, nil, nil,
+	)
+	req := state["request"].(map[string]any)
+	req["authority"] = []byte("example.com:443")
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(bytes.NewReader(encodeTnet(state)))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	got := requests[0]
+	assert.Equal(t, "CONNECT", got.Method)
+	assert.Equal(t, 200, got.Response.StatusCode)
+	// URL uses the authority-derived path ("example.com:443") without the
+	// host/port duplication that would result from a plain "/" fallback.
+	assert.Equal(t, "https://example.com/example.com:443", got.URL)
+}
+
+// TestMitmproxyImporter_Native_MalformedInMultiFlowStream characterizes the
+// importer's current behavior when one flow in a multi-flow stream is
+// malformed: the whole import fails and no requests are returned. This is
+// deliberate — the decoder can't know whether the remainder of the file is
+// salvageable after a mid-stream parse error, and partial imports would be
+// misleading. The test exists to make the behavior explicit so a future
+// change to "skip-bad, keep-good" is a deliberate decision, not an accident.
+func TestMitmproxyImporter_Native_MalformedInMultiFlowStream(t *testing.T) {
+	good := encodeTnet(flowState(
+		"GET", "https", "a.example.com", 443, "/ok",
+		nil, nil, 200, nil, nil,
+	))
+	// Corrupt tnetstring: length prefix references more bytes than exist.
+	bad := []byte("999999:short,")
+
+	var stream bytes.Buffer
+	stream.Write(good)
+	stream.Write(bad)
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(&stream)
+	require.Error(t, err)
+	assert.Nil(t, requests, "partial import must not be returned when a later flow fails")
+}
+
+// TestMitmproxyImporter_Native_WebSocketFlowSkipped documents handling for
+// non-HTTP flow types that mitmproxy can write alongside HTTP in mixed
+// captures (tcp, dns, and — historically — websocket/frames records).
+func TestMitmproxyImporter_Native_WebSocketFlowSkipped(t *testing.T) {
+	wsFlow := map[string]any{
+		"type":     []byte("websocket"),
+		"id":       []byte("ws-1"),
+		"messages": []any{},
+	}
+	httpFlow := flowState(
+		"GET", "https", "example.com", 443, "/real",
+		nil, nil, 200, nil, nil,
+	)
+
+	var combined bytes.Buffer
+	combined.Write(encodeTnet(wsFlow))
+	combined.Write(encodeTnet(httpFlow))
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(&combined)
+	require.NoError(t, err)
+
+	require.Len(t, requests, 1)
+	assert.Equal(t, "https://example.com/real", requests[0].URL)
+}
+
+// TestMitmproxyImporter_Native_FlowWithoutTypeSkipped locks in the policy
+// clarified in QUAL-004: a flow dict without a `type` key is treated as
+// non-HTTP and skipped, not implicitly treated as HTTP.
+func TestMitmproxyImporter_Native_FlowWithoutTypeSkipped(t *testing.T) {
+	typeless := map[string]any{
+		"id": []byte("typeless-1"),
+	}
+	httpFlow := flowState(
+		"GET", "https", "example.com", 443, "/good",
+		nil, nil, 200, nil, nil,
+	)
+	var combined bytes.Buffer
+	combined.Write(encodeTnet(typeless))
+	combined.Write(encodeTnet(httpFlow))
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(&combined)
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	assert.Equal(t, "https://example.com/good", requests[0].URL)
+}
+
+// TestMitmproxyImporter_Native_NonUTF8InHeaderValueAccepted characterizes
+// behavior for non-UTF-8 bytes inside tnetstring `,` (bytes) payloads, which
+// is how mitmproxy actually serializes header values. Go's `string` type can
+// carry non-UTF-8 bytes unchanged, so we pass them through verbatim; this is
+// safe because downstream consumers treat header values as opaque strings.
+func TestMitmproxyImporter_Native_NonUTF8InHeaderValueAccepted(t *testing.T) {
+	state := flowState(
+		"GET", "https", "example.com", 443, "/api",
+		nil, nil, 200, nil, nil,
+	)
+	reqMap := state["request"].(map[string]any)
+	reqMap["headers"] = []any{
+		[]any{[]byte("X-Binary"), []byte{0xff, 0xfe, 0x00}},
+	}
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(bytes.NewReader(encodeTnet(state)))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	assert.Equal(t, string([]byte{0xff, 0xfe, 0x00}), requests[0].Headers["X-Binary"])
+}
+
+// TestMitmproxyImporter_Native_StringTypeInHeaderValue exercises the
+// tnetstring `;` (UTF-8 string) type through an integration path. The
+// shared encoder emits bytes (`,`) for all strings, so this test builds the
+// raw tnetstring elements with tiny local helpers instead of splicing
+// encoder output. Regression for round-2 TEST-R2-006.
+func TestMitmproxyImporter_Native_StringTypeInHeaderValue(t *testing.T) {
+	// Headers list containing a single pair where the value uses `;` (string)
+	// type rather than the encoder's default `,` (bytes) type.
+	pair := tnetListElement(
+		tnetBytesElement("X-String"),
+		tnetStringElement("hello"),
+	)
+	headers := tnetListElement(pair)
+
+	// Request dict. All fields except `headers` use encoder defaults.
+	request := tnetDictElement(
+		tnetBytesElement("method"), tnetBytesElement("GET"),
+		tnetBytesElement("scheme"), tnetBytesElement("https"),
+		tnetBytesElement("host"), tnetBytesElement("example.com"),
+		tnetBytesElement("port"), []byte("3:443#"),
+		tnetBytesElement("path"), tnetBytesElement("/str"),
+		tnetBytesElement("content"), []byte("0:~"),
+		tnetBytesElement("headers"), headers,
+	)
+
+	// Top-level HTTP flow state.
+	flowEnc := tnetDictElement(
+		tnetBytesElement("type"), tnetBytesElement("http"),
+		tnetBytesElement("id"), tnetBytesElement("str"),
+		tnetBytesElement("request"), request,
+	)
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(bytes.NewReader(flowEnc))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	assert.Equal(t, "hello", requests[0].Headers["X-String"])
+}
+
+// TestMitmproxyImporter_Native_BodyWithPercentFormatDirective exercises the
+// QUAL-009 regression: when the encoder used fmt.Sprintf("%d:%s,", ...) on
+// []byte, a body containing '%' was misencoded. The fix is in the shared
+// encoder, but we test end-to-end here because the bug was hidden by the
+// same encoder being used on both sides of round-trip tests.
+func TestMitmproxyImporter_Native_BodyWithPercentFormatDirective(t *testing.T) {
+	tricky := []byte(`POST %d OK %s %%EOF`)
+	state := flowState(
+		"POST", "https", "example.com", 443, "/upload",
+		[][2]string{{"Content-Type", "text/plain"}}, tricky,
+		201, nil, nil,
+	)
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(bytes.NewReader(encodeTnet(state)))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	assert.Equal(t, tricky, requests[0].Body,
+		"body with %% must survive encode/decode byte-for-byte")
+}
+
+// TestMitmproxyImporter_Native_MaxFlowsCap verifies that a pathological
+// input consisting of many tiny non-HTTP flow records trips the
+// maxNativeFlows counter and returns a wrapped ErrTooManyEntries. We lower
+// the cap temporarily so the test doesn't need to construct 500K flows.
+// Regression for round-2 TEST-R2-003.
+func TestMitmproxyImporter_Native_MaxFlowsCap(t *testing.T) {
+	withTempCap(t, &maxNativeFlows, 5)
+
+	// Build a stream of 10 minimal non-HTTP flow dicts (type=tcp).
+	// Each is a well-formed tnetstring-encoded dict so parsing succeeds
+	// for the ones below the cap; the 6th triggers the cap.
+	tcpFlow := encodeTnet(map[string]any{
+		"type": []byte("tcp"),
+		"id":   []byte("t"),
+	})
+	var stream bytes.Buffer
+	for i := 0; i < 10; i++ {
+		stream.Write(tcpFlow)
+	}
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(&stream)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrTooManyEntries),
+		"expected wrapped ErrTooManyEntries, got %v", err)
+	assert.Contains(t, err.Error(), "native flow count exceeded")
+}
+
+// TestMitmproxyImporter_Native_MaxFlowsCap_HTTPFlows is the mirror case of
+// MaxFlowsCap using real HTTP flows instead of tcp skip-records, confirming
+// the cap also fires on the productive-flow path rather than only catching
+// traffic that would be skipped anyway. Regression for round-3 TEST-R3-004.
+func TestMitmproxyImporter_Native_MaxFlowsCap_HTTPFlows(t *testing.T) {
+	withTempCap(t, &maxNativeFlows, 3)
+
+	httpFlow := encodeTnet(flowState(
+		"GET", "https", "example.com", 443, "/api",
+		nil, nil, 200, nil, nil,
+	))
+	var stream bytes.Buffer
+	for i := 0; i < 8; i++ { // 8 > lowered cap of 3
+		stream.Write(httpFlow)
+	}
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(&stream)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrTooManyEntries),
+		"expected wrapped ErrTooManyEntries, got %v", err)
+}
+
+// TestMitmproxyImporter_Native_RequestNotDict covers the error branch in
+// flowFromNativeState where the `request` field decodes to something other
+// than a dict (e.g. a bytes value). Regression for round-2 TEST-R2-004.
+func TestMitmproxyImporter_Native_RequestNotDict(t *testing.T) {
+	state := map[string]any{
+		"type":    []byte("http"),
+		"id":      []byte("bad-req"),
+		"request": []byte("not a dict"),
+	}
+	m := &MitmproxyImporter{}
+	_, err := m.Import(bytes.NewReader(encodeTnet(state)))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `"request" is`)
+}
+
+// TestMitmproxyImporter_Native_ResponseNotDict covers the error branch in
+// flowFromNativeState where `response` is present but not a dict. Distinct
+// from the "response missing" (nil) case, which is handled gracefully.
+// Regression for round-2 TEST-R2-004.
+func TestMitmproxyImporter_Native_ResponseNotDict(t *testing.T) {
+	state := flowState(
+		"GET", "https", "example.com", 443, "/api",
+		nil, nil, 200, nil, nil,
+	)
+	state["response"] = []byte("not a dict")
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(bytes.NewReader(encodeTnet(state)))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `"response" is`)
+}
+
+// TestMitmproxyImporter_Native_StringTypedDictKey covers the `string` branch
+// of coerceDictKey in the integration path. All natural mitmproxy output
+// uses bytes-typed keys, but the decoder tolerates string-typed keys too.
+func TestMitmproxyImporter_Native_StringTypedDictKey(t *testing.T) {
+	// Manually build: dict with key serialized as `;` (string) type rather
+	// than `,` (bytes). The rest matches a minimal http flow state.
+	// Format: "<n>:<keyEncAsString><valEnc>...<keyEnc><valEnc>...}"
+	innerReq := encodeTnet(map[string]any{
+		"method":  []byte("GET"),
+		"scheme":  []byte("https"),
+		"host":    []byte("example.com"),
+		"port":    int64(443),
+		"path":    []byte("/str"),
+		"headers": []any{},
+		"content": nil,
+	})
+	// Build keys: `type` using tnetType=string, value `http` as bytes.
+	typeKey := []byte("4:type;")
+	typeVal := []byte("4:http,")
+	requestKey := []byte("7:request;")
+	// id key
+	idKey := []byte("2:id;")
+	idVal := []byte("1:x,")
+
+	var body bytes.Buffer
+	body.Write(typeKey)
+	body.Write(typeVal)
+	body.Write(idKey)
+	body.Write(idVal)
+	body.Write(requestKey)
+	body.Write(innerReq)
+
+	dict := fmt.Sprintf("%d:%s}", body.Len(), body.String())
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(bytes.NewReader([]byte(dict)))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	assert.Equal(t, "https://example.com/str", requests[0].URL)
 }

@@ -19,11 +19,19 @@
 // Supported formats:
 //   - Burp Suite XML: exported proxy history from Burp Suite.
 //   - HAR 1.2: HTTP Archive files from browser dev tools or other proxies.
-//   - mitmproxy: flow dumps from mitmproxy's JSON export.
+//   - mitmproxy: both the JSON export and the native tnetstring-based flow
+//     dump produced by mitmproxy's "save flows" (`w`) command.
 //
 // Use [Get] to retrieve an importer by format name, and [SupportedFormats]
 // to list all registered importers.
 //
-// Safety limits: files larger than 500 MB or containing more than 100,000
-// entries are rejected to prevent resource exhaustion.
+// Safety limits:
+//
+//   - File size: 500 MB hard cap (all formats).
+//   - Entry count: each importer enforces a format-specific cap on the
+//     number of records it will parse, to bound CPU on pathological inputs.
+//     See the package-private caps (e.g. maxNativeFlows for the native
+//     mitmproxy path) for current values. Pass [ImportOptions.MaxEntries]
+//     through [ImportWithOptions] to apply a tighter caller-specified limit.
+//   - Callers can also apply a scope filter via [ImportOptions.Scope].
 package importer
