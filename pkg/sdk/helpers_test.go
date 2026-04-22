@@ -17,8 +17,14 @@
 package sdk
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -709,4 +715,327 @@ func TestIsAcceptableWSDLContentType(t *testing.T) {
 			assert.Equal(t, tt.want, isAcceptableWSDLContentType(tt.header))
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Group A — TEST-004 (nit): parseHeaderString edge cases
+// ---------------------------------------------------------------------------
+
+// TestParseHeaderString_WhitespaceOnlyInteriorEntry exercises the
+// `if hdr == "" { continue }` branch in parseHeaderString
+// (capability.go:528-530). After trimming, the interior blank segment
+// produced by ", ," becomes an empty string and must be skipped so that
+// only the two valid headers survive.
+func TestParseHeaderString_WhitespaceOnlyInteriorEntry(t *testing.T) {
+	result := parseHeaderString("X-A: 1, , X-B: 2")
+	require.Len(t, result, 2)
+	assert.Equal(t, "1", result["X-A"])
+	assert.Equal(t, "2", result["X-B"])
+}
+
+// TestParseHeaderString_EmptyValue exercises the path through the
+// SplitN branch (capability.go:531-533) where the value after the colon
+// is absent, resulting in an empty string being stored. This documents
+// that an entry like "X-Empty:" is accepted and stored as an empty value.
+func TestParseHeaderString_EmptyValue(t *testing.T) {
+	result := parseHeaderString("X-Empty:, X-Set: ok")
+	require.Len(t, result, 2)
+	assert.Equal(t, "", result["X-Empty"])
+	assert.Equal(t, "ok", result["X-Set"])
+}
+
+// ---------------------------------------------------------------------------
+// Group B — TEST-003 (medium): decodeWSDLResponse table-driven tests
+// ---------------------------------------------------------------------------
+
+// validWSDL is a minimal WSDL document that satisfies wsdlgen.ParseWSDL.
+// Copied from pkg/generate/wsdl/generator_test.go:179-183.
+const validWSDL = `<definitions name="Svc" xmlns="http://schemas.xmlsoap.org/wsdl/">
+  <message name="Msg"><part name="p" type="xsd:string"/></message>
+  <portType name="PT"><operation name="Op"><input message="tns:Msg"/></operation></portType>
+</definitions>`
+
+// makeWSDLResponse builds an *http.Response in-memory for use with
+// decodeWSDLResponse, which is a pure function and needs no httptest.Server.
+func makeWSDLResponse(status int, contentType string, body []byte) *http.Response {
+	h := http.Header{}
+	if contentType != "" {
+		h.Set("Content-Type", contentType)
+	}
+	return &http.Response{
+		StatusCode: status,
+		Header:     h,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	}
+}
+
+// TestDecodeWSDLResponse_ValidWSDL exercises the happy path through all gates
+// in decodeWSDLResponse (capability.go:507-522): 200 status passes the status
+// gate, text/xml passes the content-type gate, and validWSDL passes ParseWSDL.
+func TestDecodeWSDLResponse_ValidWSDL(t *testing.T) {
+	resp := makeWSDLResponse(200, "text/xml", []byte(validWSDL))
+	got := decodeWSDLResponse(resp)
+	assert.Equal(t, []byte(validWSDL), got)
+}
+
+// TestDecodeWSDLResponse_RejectedContentType exercises the content-type gate
+// (capability.go:511-513). Even though the body is a valid WSDL, text/html
+// is rejected before the body is read.
+func TestDecodeWSDLResponse_RejectedContentType(t *testing.T) {
+	resp := makeWSDLResponse(200, "text/html", []byte(validWSDL))
+	got := decodeWSDLResponse(resp)
+	assert.Nil(t, got)
+}
+
+// TestDecodeWSDLResponse_RejectedStatus exercises the status gate
+// (capability.go:508-510). The status check fires before content-type,
+// so all non-2xx codes return nil regardless of body content.
+func TestDecodeWSDLResponse_RejectedStatus(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+	}{
+		{"301 redirect", 301},
+		{"404 not found", 404},
+		{"500 server error", 500},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := makeWSDLResponse(tt.status, "text/xml", []byte(validWSDL))
+			got := decodeWSDLResponse(resp)
+			assert.Nil(t, got)
+		})
+	}
+}
+
+// TestDecodeWSDLResponse_UnparseableBody exercises the ParseWSDL gate
+// (capability.go:518-520). Status and content-type pass, but the body is
+// not valid XML so wsdlgen.ParseWSDL rejects it and nil is returned.
+func TestDecodeWSDLResponse_UnparseableBody(t *testing.T) {
+	resp := makeWSDLResponse(200, "text/xml", []byte("not-valid-xml"))
+	got := decodeWSDLResponse(resp)
+	assert.Nil(t, got)
+}
+
+// TestDecodeWSDLResponse_EmptyContentTypeAccepted exercises the empty-string
+// branch inside isAcceptableWSDLContentType (capability.go:444) when called
+// end-to-end through decodeWSDLResponse. An empty Content-Type is intentionally
+// permitted because some WSDL endpoints omit it; the parser is then the authority.
+func TestDecodeWSDLResponse_EmptyContentTypeAccepted(t *testing.T) {
+	resp := makeWSDLResponse(200, "", []byte(validWSDL))
+	got := decodeWSDLResponse(resp)
+	assert.Equal(t, []byte(validWSDL), got)
+}
+
+// errReader is a minimal io.Reader that always returns an error on the first
+// Read call. Used to exercise the io.ReadAll error branch in decodeWSDLResponse.
+type errReader struct{}
+
+func (errReader) Read(_ []byte) (int, error) { return 0, errors.New("read failure") }
+
+// TestDecodeWSDLResponse_BodyReadError exercises the io.ReadAll error branch
+// (capability.go:515-517) that guards against mid-read body errors such as a
+// TLS abort after headers or a truncated chunked response.
+func TestDecodeWSDLResponse_BodyReadError(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/xml"}},
+		Body:       io.NopCloser(errReader{}),
+	}
+	got := decodeWSDLResponse(resp)
+	assert.Nil(t, got)
+}
+
+// ---------------------------------------------------------------------------
+// Group C — TEST-001: Invoke end-to-end via stubbed pipeline
+// ---------------------------------------------------------------------------
+
+// captureEmitter returns a *capmodel.WebApplication pointer that is populated
+// when the returned Emitter is called, and an Emitter that enforces that it
+// receives exactly one WebApplication model.
+func captureEmitter(t *testing.T) (*capmodel.WebApplication, capability.Emitter) {
+	t.Helper()
+	var captured capmodel.WebApplication
+	emit := capability.EmitterFunc(func(models ...any) error {
+		require.Len(t, models, 1, "Emit should be called with exactly one model")
+		w, ok := models[0].(capmodel.WebApplication)
+		require.True(t, ok, "emitted model must be capmodel.WebApplication, got %T", models[0])
+		captured = w
+		return nil
+	})
+	return &captured, emit
+}
+
+// TestInvoke_EmitsWebApplicationPreservingInputFields is the regression guard
+// for prior-MED-3: Invoke must preserve all input WebApplication fields and
+// overlay only OpenAPI. The stubbed crawlFn returns a single REST-like request
+// so the pipeline produces a non-empty OpenAPI spec.
+func TestInvoke_EmitsWebApplicationPreservingInputFields(t *testing.T) {
+	input := capmodel.WebApplication{
+		PrimaryURL: "http://example.com",
+		URLs:       []string{"http://example.com", "http://example.com/page"},
+		Name:       "example app",
+		Seed:       true,
+	}
+
+	cap := &Capability{
+		crawlFn: func(_ context.Context, _ string, _ invokeParams) ([]crawl.ObservedRequest, error) {
+			return []crawl.ObservedRequest{
+				{
+					Method: "GET",
+					URL:    "http://example.com/api/users",
+					Response: crawl.ObservedResponse{
+						StatusCode:  200,
+						ContentType: "application/json",
+						Body:        []byte(`[{"id":1,"name":"alice"}]`),
+					},
+				},
+			}, nil
+		},
+		wsdlProbeFn: func(_ context.Context, _ string) []byte { return nil },
+	}
+
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{
+			{Name: "headless", Value: "false"},
+			{Name: "probe", Value: "false"},
+			{Name: "api_type", Value: "rest"},
+		},
+	}
+
+	captured, emitter := captureEmitter(t)
+	err := cap.Invoke(ctx, input, emitter)
+	require.NoError(t, err)
+
+	assert.Equal(t, input.PrimaryURL, captured.PrimaryURL)
+	assert.Equal(t, input.URLs, captured.URLs)
+	assert.Equal(t, input.Name, captured.Name)
+	assert.Equal(t, input.Seed, captured.Seed)
+	assert.NotEmpty(t, captured.OpenAPI)
+	assert.True(t, strings.Contains(captured.OpenAPI, "openapi"),
+		"expected OpenAPI 3.0 marker in generated spec, got: %s", captured.OpenAPI)
+}
+
+// TestInvoke_WSDLProbeSynthesizesRequest exercises the WSDL probe branch in
+// Invoke (capability.go:283-296): when wsdlProbeFn returns non-nil bytes the
+// resolved API type becomes "wsdl" and a synthetic ObservedRequest carrying
+// the WSDL body is injected into the pipeline.
+func TestInvoke_WSDLProbeSynthesizesRequest(t *testing.T) {
+	cap := &Capability{
+		crawlFn: func(_ context.Context, _ string, _ invokeParams) ([]crawl.ObservedRequest, error) {
+			return nil, nil // no crawl results
+		},
+		wsdlProbeFn: func(_ context.Context, _ string) []byte {
+			return []byte(validWSDL)
+		},
+	}
+
+	input := capmodel.WebApplication{PrimaryURL: "http://example.com"}
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{
+			{Name: "headless", Value: "false"},
+			{Name: "probe", Value: "false"},
+			{Name: "api_type", Value: "auto"},
+		},
+	}
+
+	captured, emitter := captureEmitter(t)
+	err := cap.Invoke(ctx, input, emitter)
+	require.NoError(t, err)
+	assert.NotEmpty(t, captured.OpenAPI)
+	assert.True(t,
+		strings.Contains(strings.ToLower(captured.OpenAPI), "wsdl") ||
+			strings.Contains(captured.OpenAPI, "<definitions"),
+		"expected WSDL content in generated spec, got: %s", captured.OpenAPI)
+}
+
+// TestInvoke_CrawlErrorPropagates verifies that a crawl error is wrapped and
+// returned from Invoke without calling the emitter.
+func TestInvoke_CrawlErrorPropagates(t *testing.T) {
+	cap := &Capability{
+		crawlFn: func(_ context.Context, _ string, _ invokeParams) ([]crawl.ObservedRequest, error) {
+			return nil, errors.New("boom")
+		},
+	}
+
+	input := capmodel.WebApplication{PrimaryURL: "http://example.com"}
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{
+			{Name: "headless", Value: "false"},
+		},
+	}
+
+	noEmit := capability.EmitterFunc(func(models ...any) error {
+		t.Fatal("Emit should not be called on crawl error")
+		return nil
+	})
+
+	err := cap.Invoke(ctx, input, noEmit)
+	require.Error(t, err)
+	assert.True(t, strings.Contains(err.Error(), "crawl"),
+		"expected error to mention 'crawl', got: %s", err.Error())
+	assert.True(t, strings.Contains(err.Error(), "boom"),
+		"expected error to contain original message 'boom', got: %s", err.Error())
+}
+
+// ---------------------------------------------------------------------------
+// Group D — TEST-002: context lifecycle regression guard
+// ---------------------------------------------------------------------------
+
+// TestInvoke_GenPhaseUsesFreshContext is the regression guard for prior-MED-2:
+// Invoke must create two independent context.WithTimeout calls — one for the
+// crawl phase (capability.go:251) and a fresh one for the generate phase
+// (capability.go:273). If a future refactor collapses them back into a single
+// context, genDeadline == crawlDeadline, so genDeadline.After(crawlDeadline)
+// returns false and the assertion fails, catching the regression.
+func TestInvoke_GenPhaseUsesFreshContext(t *testing.T) {
+	var (
+		crawlDeadline   time.Time
+		crawlDeadlineOK bool
+		genDeadline     time.Time
+		genDeadlineOK   bool
+	)
+
+	restReq := crawl.ObservedRequest{
+		Method: "GET",
+		URL:    "http://example.com/api/items",
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "application/json",
+			Body:        []byte(`[{"id":1}]`),
+		},
+	}
+
+	cap := &Capability{
+		crawlFn: func(ctx context.Context, _ string, _ invokeParams) ([]crawl.ObservedRequest, error) {
+			crawlDeadline, crawlDeadlineOK = ctx.Deadline()
+			time.Sleep(50 * time.Millisecond) // simulate some crawl work
+			return []crawl.ObservedRequest{restReq}, nil
+		},
+		wsdlProbeFn: func(ctx context.Context, _ string) []byte {
+			genDeadline, genDeadlineOK = ctx.Deadline()
+			return nil
+		},
+	}
+
+	input := capmodel.WebApplication{PrimaryURL: "http://example.com"}
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{
+			{Name: "timeout", Value: "2"}, // 2-second budget
+			{Name: "headless", Value: "false"},
+			{Name: "probe", Value: "false"},
+			{Name: "api_type", Value: "rest"},
+		},
+	}
+
+	captured, emitter := captureEmitter(t)
+	err := cap.Invoke(ctx, input, emitter)
+	require.NoError(t, err)
+	_ = captured
+
+	assert.True(t, crawlDeadlineOK, "crawlCtx must have a deadline")
+	assert.True(t, genDeadlineOK, "genCtx must have a deadline")
+	assert.True(t, genDeadline.After(crawlDeadline),
+		"genDeadline %v should be later than crawlDeadline %v — the two contexts must be independent (prior-MED-2 fix)",
+		genDeadline, crawlDeadline)
 }

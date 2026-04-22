@@ -35,7 +35,26 @@ import (
 
 // Capability implements capability.Capability[capmodel.WebApplication] for
 // running Vespasian's API discovery pipeline as a Chariot platform capability.
-type Capability struct{}
+//
+// All unexported fields are test seams — callers in production leave them nil
+// and the zero-value Capability uses the real browser-backed crawler and
+// real HTTP-backed WSDL probe. Tests set these fields to stub the pipeline
+// and assert Invoke's end-to-end wiring (emit shape, context lifecycle,
+// WSDL synthesis). Keep the fields unexported so this is strictly an
+// in-package test seam, not part of the public API.
+type Capability struct {
+	// crawlFn, when non-nil, replaces the real browser-backed crawl step.
+	// Takes the crawl-phase context, target URL, and resolved Invoke
+	// parameters; returns the observed requests the generate phase will
+	// consume. A nil value means "use the real browser-backed crawler".
+	crawlFn func(ctx context.Context, targetURL string, p invokeParams) ([]crawl.ObservedRequest, error)
+
+	// wsdlProbeFn, when non-nil, replaces the real HTTP-backed WSDL probe.
+	// Takes the generate-phase context and target URL; returns raw WSDL bytes
+	// when the endpoint serves a valid WSDL document, or nil otherwise. A nil
+	// value means "use probeWSDLDocument".
+	wsdlProbeFn func(ctx context.Context, targetURL string) []byte
+}
 
 // Name returns the capability name.
 func (c *Capability) Name() string {
@@ -181,6 +200,39 @@ func resolveParams(ctx capability.ExecutionContext) invokeParams {
 	return p
 }
 
+// runRealCrawl launches the headless browser (when enabled) and runs the
+// Katana-backed crawler against targetURL. This is the default crawlFn used
+// when Capability.crawlFn is nil. It owns its browser lifecycle and closes
+// the browser before returning.
+func runRealCrawl(ctx context.Context, targetURL string, p invokeParams) ([]crawl.ObservedRequest, error) {
+	var browserMgr *crawl.BrowserManager
+	if p.headless {
+		var err error
+		browserMgr, err = crawl.NewBrowserManager(crawl.BrowserOptions{
+			Headless: true,
+			Proxy:    p.proxy,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("launch browser: %w", err)
+		}
+		defer browserMgr.Close()
+	}
+
+	crawler := crawl.NewCrawler(crawl.CrawlerOptions{
+		Depth:      p.depth,
+		MaxPages:   p.maxPages,
+		Timeout:    time.Duration(p.timeoutSecs) * time.Second,
+		Headless:   p.headless,
+		Scope:      p.scope,
+		Headers:    p.headers,
+		Proxy:      p.proxy,
+		BrowserMgr: browserMgr,
+		Stderr:     io.Discard,
+	})
+
+	return crawler.Crawl(ctx, targetURL)
+}
+
 // Invoke runs the Vespasian pipeline against the input WebApplication and emits
 // a capmodel.WebApplication with the generated API specification. The spec format
 // depends on the detected API type: OpenAPI 3.0 for REST, GraphQL SDL for GraphQL,
@@ -199,32 +251,12 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 	crawlCtx, crawlCancel := context.WithTimeout(context.Background(), crawlTimeout)
 	defer crawlCancel()
 
-	var browserMgr *crawl.BrowserManager
-	if p.headless {
-		var err error
-		browserMgr, err = crawl.NewBrowserManager(crawl.BrowserOptions{
-			Headless: true,
-			Proxy:    p.proxy,
-		})
-		if err != nil {
-			return fmt.Errorf("launch browser: %w", err)
-		}
-		defer browserMgr.Close()
+	crawlFn := c.crawlFn
+	if crawlFn == nil {
+		crawlFn = runRealCrawl
 	}
 
-	crawler := crawl.NewCrawler(crawl.CrawlerOptions{
-		Depth:      p.depth,
-		MaxPages:   p.maxPages,
-		Timeout:    crawlTimeout,
-		Headless:   p.headless,
-		Scope:      p.scope,
-		Headers:    p.headers,
-		Proxy:      p.proxy,
-		BrowserMgr: browserMgr,
-		Stderr:     io.Discard,
-	})
-
-	requests, err := crawler.Crawl(crawlCtx, input.PrimaryURL)
+	requests, err := crawlFn(crawlCtx, input.PrimaryURL, p)
 	// Cancel crawl context as soon as the crawl completes so that the generate
 	// phase gets a fresh budget. If the crawl consumed the full timeout the
 	// canceled context would cause probing to bail out immediately — mirroring
@@ -241,10 +273,15 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 	genCtx, genCancel := context.WithTimeout(context.Background(), crawlTimeout)
 	defer genCancel()
 
+	wsdlProbeFn := c.wsdlProbeFn
+	if wsdlProbeFn == nil {
+		wsdlProbeFn = probeWSDLDocument
+	}
+
 	resolvedAPIType := p.apiType
 
 	if resolvedAPIType == "auto" || resolvedAPIType == "wsdl" || resolvedAPIType == "rest" {
-		if wsdlDoc := probeWSDLDocument(genCtx, input.PrimaryURL); wsdlDoc != nil {
+		if wsdlDoc := wsdlProbeFn(genCtx, input.PrimaryURL); wsdlDoc != nil {
 			resolvedAPIType = "wsdl"
 			requests = append(requests, crawl.ObservedRequest{
 				Method: "GET",
@@ -458,25 +495,29 @@ func probeWSDLDocument(ctx context.Context, targetURL string) []byte {
 		resp.Body.Close()                                     //nolint:errcheck,gosec // best-effort close
 	}()
 
+	return decodeWSDLResponse(resp)
+}
+
+// decodeWSDLResponse inspects an HTTP response and returns the WSDL body bytes
+// when the response is a parseable WSDL document, or nil otherwise. It applies
+// the same status, content-type, size, and parse gates used by the live probe
+// so that the two code paths stay in sync.
+//
+// The caller owns resp.Body and must close it.
+func decodeWSDLResponse(resp *http.Response) []byte {
 	if isRejectedWSDLStatus(resp.StatusCode) {
 		return nil
 	}
-
-	// Validate Content-Type before attempting to parse as WSDL.
-	// Empty content-type is permitted — some real-world WSDL endpoints omit it.
 	if !isAcceptableWSDLContentType(resp.Header.Get("Content-Type")) {
 		return nil
 	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20)) // 2MB limit
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
 		return nil
 	}
-
 	if _, parseErr := wsdlgen.ParseWSDL(body); parseErr != nil {
 		return nil
 	}
-
 	return body
 }
 
