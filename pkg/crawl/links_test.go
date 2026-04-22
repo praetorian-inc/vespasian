@@ -233,7 +233,7 @@ func TestEffectiveBaseURLFrom_AcceptsSameHostAbsoluteBase(t *testing.T) {
 // re-anchor relative references to attacker.com. Doing so would poison
 // capture.json / the produced spec with attacker-host endpoints, since
 // synthetic form ObservedRequests are appended without a scope filter at
-// this stage. Pin the behaviour so this guard is not silently removed.
+// this stage. Pin the behavior so this guard is not silently removed.
 func TestEffectiveBaseURLFrom_RejectsCrossHostBase(t *testing.T) {
 	got := effectiveBaseURLFrom("https://attacker.com/", "https://target.com/login")
 	if got != "https://target.com/login" {
@@ -253,7 +253,7 @@ func TestEffectiveBaseURLFrom_HostCompareIsCaseInsensitive(t *testing.T) {
 // served from https://ex.com/page is rejected. This is conservative —
 // a well-intentioned refactor to compare hostname-only (stripping the
 // port) would silently accept port-different bases, which we do not
-// want for our threat model. Pin the behaviour.
+// want for our threat model. Pin the behavior.
 func TestEffectiveBaseURLFrom_PortDifferentIsCrossHost(t *testing.T) {
 	got := effectiveBaseURLFrom("https://ex.com:8443/", "https://ex.com/page")
 	if got != "https://ex.com/page" {
