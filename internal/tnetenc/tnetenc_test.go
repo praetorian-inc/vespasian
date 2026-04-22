@@ -15,6 +15,7 @@
 package tnetenc
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -96,9 +97,9 @@ func TestEncode_DictKeysSortedDeterministically(t *testing.T) {
 	}
 	got := string(Encode(d))
 	// Decoded key order should be a, m, z.
-	aIdx := findSubstring(got, "1:a,")
-	mIdx := findSubstring(got, "1:m,")
-	zIdx := findSubstring(got, "1:z,")
+	aIdx := strings.Index(got, "1:a,")
+	mIdx := strings.Index(got, "1:m,")
+	zIdx := strings.Index(got, "1:z,")
 	// Assert presence BEFORE comparing indices. Without this, a missing key
 	// returns -1 which could falsely satisfy the ordering check (e.g.
 	// aIdx=-1 < mIdx=5 < zIdx=10 would pass even with key "a" absent).
@@ -112,13 +113,4 @@ func TestEncode_DictKeysSortedDeterministically(t *testing.T) {
 func TestEncode_UnsupportedTypePanics(t *testing.T) {
 	assert.Panics(t, func() { Encode(uint32(42)) })
 	assert.Panics(t, func() { Encode(complex(1.0, 2.0)) })
-}
-
-func findSubstring(haystack, needle string) int {
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return i
-		}
-	}
-	return -1
 }

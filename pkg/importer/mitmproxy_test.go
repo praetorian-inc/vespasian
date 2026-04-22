@@ -1074,6 +1074,41 @@ func TestMitmproxyImporter_Native_NonUTF8InHeaderValueAccepted(t *testing.T) {
 	assert.Equal(t, string([]byte{0xff, 0xfe, 0x00}), requests[0].Headers["X-Binary"])
 }
 
+// TestMitmproxyImporter_Native_MalformedHeaderPairSkipped pins nativeHeaders'
+// skip-on-malformed behavior for the native path. The JSON path is covered
+// by TestMitmproxyImporter_MalformedHeaders; without this the two `continue`
+// branches at nativeHeaders (non-list entry, len(pair)<2) stay uncovered,
+// and a refactor that flipped the skip into a hard error would not fail.
+func TestMitmproxyImporter_Native_MalformedHeaderPairSkipped(t *testing.T) {
+	state := flowState(
+		"GET", "https", "example.com", 443, "/api",
+		nil, nil, 200, nil, nil,
+	)
+	reqMap := state["request"].(map[string]any)
+	// Mixed list: non-list entry, empty pair, 1-element pair, valid 2-element
+	// pair, 3-element pair (extra elements ignored per existing JSON test).
+	reqMap["headers"] = []any{
+		[]byte("not-a-list"),
+		[]any{},
+		[]any{[]byte("X-Lonely")},
+		[]any{[]byte("X-Valid"), []byte("keep-me")},
+		[]any{[]byte("X-Extra"), []byte("keep-this-value"), []byte("ignored")},
+	}
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(bytes.NewReader(encodeTnet(state)))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	// Only the two well-formed pairs survive. Shape is identical to the JSON
+	// path behavior exercised by TestMitmproxyImporter_MalformedHeaders.
+	req := requests[0]
+	assert.Len(t, req.Headers, 2)
+	assert.Equal(t, "keep-me", req.Headers["X-Valid"])
+	assert.Equal(t, "keep-this-value", req.Headers["X-Extra"])
+	assert.NotContains(t, req.Headers, "X-Lonely")
+}
+
 // TestMitmproxyImporter_Native_StringTypeInHeaderValue exercises the
 // tnetstring `;` (UTF-8 string) type through an integration path. The
 // shared encoder emits bytes (`,`) for all strings, so this test builds the
@@ -1452,6 +1487,82 @@ func TestMitmproxyImporter_Native_InvalidHostRejected(t *testing.T) {
 			_, err := m.Import(bytes.NewReader(encodeTnet(state)))
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tc.wantMsg)
+		})
+	}
+}
+
+// TestMitmproxyImporter_Native_LargeMethodBoundedInError confirms that a
+// crafted flow with an outsized method field produces an error message
+// bounded by previewString, not the full attacker-controlled payload. The
+// tnetstring decoder's per-element cap would otherwise allow up to 64 MB of
+// method bytes to ride through into parseFlow's error string.
+//
+// Regression for round-7 SEC-BE-001.
+func TestMitmproxyImporter_Native_LargeMethodBoundedInError(t *testing.T) {
+	const n = 4096 // comfortably over maxPreviewBytes (64) but small enough to keep the test fast
+	bigMethod := strings.Repeat("A", n)
+	state := flowState(
+		"GET", "https", "example.com", 443, "/api",
+		nil, nil, 200, nil, nil,
+	)
+	req := state["request"].(map[string]any)
+	req["method"] = []byte(bigMethod)
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(bytes.NewReader(encodeTnet(state)))
+	require.Error(t, err)
+	msg := err.Error()
+	assert.Contains(t, msg, "invalid HTTP method")
+	assert.Contains(t, msg, "bytes total")
+	// A 4 KB payload embed would blow past this. Upper bound = preview (64)
+	// + format overhead (~120).
+	assert.Less(t, len(msg), 256,
+		"error message not bounded: got %d bytes", len(msg))
+}
+
+// TestMitmproxyImporter_Native_LargeSchemeBoundedInError mirrors the method
+// bound for the scheme field (same code path, different branch).
+func TestMitmproxyImporter_Native_LargeSchemeBoundedInError(t *testing.T) {
+	const n = 4096
+	bigScheme := strings.Repeat("z", n)
+	state := flowState(
+		"GET", "https", "example.com", 443, "/api",
+		nil, nil, 200, nil, nil,
+	)
+	req := state["request"].(map[string]any)
+	req["scheme"] = []byte(bigScheme)
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(bytes.NewReader(encodeTnet(state)))
+	require.Error(t, err)
+	msg := err.Error()
+	assert.Contains(t, msg, "unsupported scheme")
+	assert.Contains(t, msg, "bytes total")
+	assert.Less(t, len(msg), 256)
+}
+
+// TestTnetInt64_OnlyAcceptsInt64 pins the narrowed contract: the helper
+// accepts int64 (what the decoder emits for `#`-type elements) and returns
+// 0 for anything else. Regression for round-7 TEST-002 — the older helper
+// also coerced int and float64, masking schema drift.
+func TestTnetInt64_OnlyAcceptsInt64(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+		want int64
+	}{
+		{"int64 positive", int64(443), 443},
+		{"int64 zero", int64(0), 0},
+		{"int64 negative", int64(-1), -1},
+		{"plain int not coerced", 443, 0},
+		{"float64 not coerced", 443.0, 0},
+		{"string not coerced", "443", 0},
+		{"bytes not coerced", []byte("443"), 0},
+		{"nil", nil, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, tnetInt64(tc.in))
 		})
 	}
 }

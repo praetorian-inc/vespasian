@@ -263,7 +263,7 @@ func flowFromNativeState(state map[string]any) (mitmproxyFlow, error) {
 		Scheme:  tnetBytesOrString(reqMap["scheme"]),
 		Host:    tnetBytesOrString(reqMap["host"]),
 		Port:    port,
-		Path:    buildRequestPath(reqMap, method),
+		Path:    buildRequestPath(reqMap),
 		Headers: nativeHeaders(reqMap["headers"]),
 		Content: nativeContent(reqMap["content"]),
 	}
@@ -289,14 +289,11 @@ func flowFromNativeState(state map[string]any) (mitmproxyFlow, error) {
 // from the wire in the `path` field (e.g. "/api?x=1").
 //
 // CONNECT requests carry their target in the authority (e.g.
-// "example.com:443") instead of a path. The authority is already reflected
-// in the flow's host/port fields, so we do not embed it into the path — that
-// would produce malformed URLs like "https://example.com/example.com:443".
-// Non-CONNECT requests missing a path fall back to "/" for the same reason:
-// surfacing a malformed URL through downstream consumers (which may re-fetch,
-// replay, or log the URL) is more hazardous than defaulting to root and
-// logging a less-specific target.
-func buildRequestPath(reqMap map[string]any, _ string) string {
+// "example.com:443") instead of a path; both CONNECT and non-CONNECT
+// requests missing a path fall back to "/" because the authority is
+// already reflected in host/port and embedding it into the path would
+// produce malformed URLs like "https://example.com/example.com:443".
+func buildRequestPath(reqMap map[string]any) string {
 	if path := tnetBytesOrString(reqMap["path"]); path != "" {
 		return path
 	}
@@ -366,18 +363,33 @@ func tnetBytesOrString(v any) string {
 	}
 }
 
-// tnetInt64 coerces an int-like tnetstring value to int64.
+// tnetInt64 coerces a tnetstring int value to int64. Only int64 is accepted
+// because the decoder always emits int64 for `#`-type elements; broader
+// coercion would silently mask schema drift (e.g. a status_code field
+// unexpectedly serialized as a float). Missing or wrong-typed values
+// intentionally return 0 so status_code defaults cleanly.
 func tnetInt64(v any) int64 {
-	switch x := v.(type) {
-	case int64:
-		return x
-	case int:
-		return int64(x)
-	case float64:
-		return int64(x)
-	default:
-		return 0
+	if n, ok := v.(int64); ok {
+		return n
 	}
+	return 0
+}
+
+// maxPreviewBytes caps how many bytes of an attacker-controlled string we
+// embed verbatim into an error message. Matches the rationale for
+// payloadPreview in tnetstring.go: without a bound, a 64 MB scheme/method
+// field from a crafted `.mitm` file would write 64 MB into the operator's
+// terminal or CI log before the importer aborts.
+const maxPreviewBytes = 64
+
+// previewString renders up to maxPreviewBytes of s verbatim; longer inputs
+// are truncated and annotated with the original byte length so the operator
+// still sees "this was enormous" without pasting megabytes into a log.
+func previewString(s string) string {
+	if len(s) <= maxPreviewBytes {
+		return s
+	}
+	return fmt.Sprintf("%s... (%d bytes total)", s[:maxPreviewBytes], len(s))
 }
 
 // requirePort extracts a mitmproxy `port` field that MUST be a tnetstring
@@ -485,11 +497,11 @@ func (i *MitmproxyImporter) parseFlow(flow mitmproxyFlow) (crawl.ObservedRequest
 	}
 
 	if !validHTTPMethods[flow.Request.Method] {
-		return crawl.ObservedRequest{}, fmt.Errorf("invalid HTTP method: %s", flow.Request.Method)
+		return crawl.ObservedRequest{}, fmt.Errorf("invalid HTTP method: %s", previewString(flow.Request.Method))
 	}
 
 	if !allowedSchemes[flow.Request.Scheme] {
-		return crawl.ObservedRequest{}, fmt.Errorf("unsupported scheme %q (only http/https allowed)", flow.Request.Scheme)
+		return crawl.ObservedRequest{}, fmt.Errorf("unsupported scheme %q (only http/https allowed)", previewString(flow.Request.Scheme))
 	}
 
 	if err := validateHost(flow.Request.Host); err != nil {

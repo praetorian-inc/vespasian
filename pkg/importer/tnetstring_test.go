@@ -435,7 +435,7 @@ func TestTnetstring_ListElementCountCap_BelowCapAccepted(t *testing.T) {
 	for i := 0; i < n; i++ {
 		body.WriteString("0:,")
 	}
-	listEncoded := encodeWithLen(body.Bytes(), ']')
+	listEncoded := buildElement(body.Bytes(), ']')
 
 	r := bufio.NewReader(bytes.NewReader(listEncoded))
 	got, err := decodeTnetstringStream(r, 0)
@@ -460,7 +460,7 @@ func TestTnetstring_ListElementCountCap_AboveCapRejected(t *testing.T) {
 	for i := 0; i < elementCount; i++ {
 		body.WriteString("0:,") // minimal empty-bytes element, 3 bytes each
 	}
-	listEncoded := encodeWithLen(body.Bytes(), ']')
+	listEncoded := buildElement(body.Bytes(), ']')
 
 	r := bufio.NewReader(bytes.NewReader(listEncoded))
 	_, err := decodeTnetstringStream(r, 0)
@@ -482,7 +482,7 @@ func TestTnetstring_DictElementCountCap_RepeatedKeysStillRejected(t *testing.T) 
 	for i := 0; i < pairCount; i++ {
 		body.WriteString("1:a,1:v,")
 	}
-	dictEncoded := encodeWithLen(body.Bytes(), '}')
+	dictEncoded := buildElement(body.Bytes(), '}')
 
 	r := bufio.NewReader(bytes.NewReader(dictEncoded))
 	_, err := decodeTnetstringStream(r, 0)
@@ -502,22 +502,10 @@ func TestTnetstring_DictElementCountCap_AboveCapRejected(t *testing.T) {
 	for i := 0; i < pairCount; i++ {
 		fmt.Fprintf(&body, "1:%c,1:v,", 'a'+byte(i))
 	}
-	dictEncoded := encodeWithLen(body.Bytes(), '}')
+	dictEncoded := buildElement(body.Bytes(), '}')
 
 	r := bufio.NewReader(bytes.NewReader(dictEncoded))
 	_, err := decodeTnetstringStream(r, 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "dict exceeds")
-}
-
-// encodeWithLen is a tiny test helper for constructing raw container bytes
-// without exercising the shared encoder (whose bug would otherwise be an
-// oracle for the decoder).
-func encodeWithLen(payload []byte, marker byte) []byte {
-	prefix := fmt.Sprintf("%d:", len(payload))
-	out := make([]byte, 0, len(prefix)+len(payload)+1)
-	out = append(out, prefix...)
-	out = append(out, payload...)
-	out = append(out, marker)
-	return out
 }

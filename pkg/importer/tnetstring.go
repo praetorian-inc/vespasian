@@ -212,7 +212,10 @@ func readLengthPrefix(r io.ByteReader, maxLen int) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("tnetstring: parse length %q: %w", digits, err)
 	}
-	if length < 0 || length > maxTnetstringElement {
+	// length >= 0 by construction: readLengthPrefix only appends ASCII digit
+	// bytes, so strconv.Atoi cannot return a negative result. Only the upper
+	// bound needs a runtime check.
+	if length > maxTnetstringElement {
 		return 0, fmt.Errorf(
 			"tnetstring: single element is %d bytes, exceeding the %d-byte per-element cap "+
 				"(raise maxTnetstringElement if you are importing flows with response bodies larger than %d MB)",
