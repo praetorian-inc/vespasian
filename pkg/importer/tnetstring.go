@@ -333,19 +333,15 @@ func coerceDictKey(v any) (string, error) {
 	}
 }
 
-// maxPayloadPreview is the longest attacker-controlled byte slice we embed
-// verbatim into an error string. Larger payloads are summarized as
-// "<preview>... (N bytes total)" to keep log volume bounded.
-const maxPayloadPreview = 64
-
-// payloadPreview renders up to maxPayloadPreview bytes of payload for use in
-// error messages. Longer payloads are truncated and annotated with the full
-// length so operators still see the size without pasting 64 MB into the log.
+// payloadPreview renders up to maxPreviewLen (helpers.go) bytes of payload
+// for use in error messages. Longer payloads are truncated and annotated
+// with the full length so operators still see the size without pasting 64 MB
+// into the log.
 func payloadPreview(payload []byte) string {
-	if len(payload) <= maxPayloadPreview {
+	if len(payload) <= maxPreviewLen {
 		return fmt.Sprintf("%q", payload)
 	}
-	return fmt.Sprintf("%q... (%d bytes total)", payload[:maxPayloadPreview], len(payload))
+	return fmt.Sprintf("%q... (%d bytes total)", payload[:maxPreviewLen], len(payload))
 }
 
 // unwrapStrconvReason returns the inner cause of a strconv error without the

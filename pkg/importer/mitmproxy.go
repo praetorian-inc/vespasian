@@ -284,15 +284,14 @@ func flowFromNativeState(state map[string]any) (mitmproxyFlow, error) {
 	return mitmproxyFlow{Request: req, Response: resp}, nil
 }
 
-// buildRequestPath returns the request path (with query string if any).
-// mitmproxy's HTTPFlow.get_state() stores the full request target verbatim
-// from the wire in the `path` field (e.g. "/api?x=1").
-//
-// CONNECT requests carry their target in the authority (e.g.
-// "example.com:443") instead of a path; both CONNECT and non-CONNECT
-// requests missing a path fall back to "/" because the authority is
-// already reflected in host/port and embedding it into the path would
-// produce malformed URLs like "https://example.com/example.com:443".
+// buildRequestPath returns the `path` field from reqMap, normalized to "/"
+// when absent or empty. mitmproxy's HTTPFlow.get_state() stores the full
+// request target verbatim from the wire in `path` (e.g. "/api?x=1"), except
+// for CONNECT flows whose target lives in the `authority` field (not path).
+// CONNECT flows therefore arrive here with an empty path and receive the
+// "/" fallback — the authority is already reflected in host/port, and
+// embedding it into the path would produce malformed URLs like
+// "https://example.com/example.com:443".
 func buildRequestPath(reqMap map[string]any) string {
 	if path := tnetBytesOrString(reqMap["path"]); path != "" {
 		return path
@@ -375,21 +374,15 @@ func tnetInt64(v any) int64 {
 	return 0
 }
 
-// maxPreviewBytes caps how many bytes of an attacker-controlled string we
-// embed verbatim into an error message. Matches the rationale for
-// payloadPreview in tnetstring.go: without a bound, a 64 MB scheme/method
-// field from a crafted `.mitm` file would write 64 MB into the operator's
-// terminal or CI log before the importer aborts.
-const maxPreviewBytes = 64
-
-// previewString renders up to maxPreviewBytes of s verbatim; longer inputs
-// are truncated and annotated with the original byte length so the operator
-// still sees "this was enormous" without pasting megabytes into a log.
+// previewString renders up to maxPreviewLen (helpers.go) bytes of s
+// verbatim; longer inputs are truncated and annotated with the original byte
+// length so the operator still sees "this was enormous" without pasting
+// megabytes into a log.
 func previewString(s string) string {
-	if len(s) <= maxPreviewBytes {
+	if len(s) <= maxPreviewLen {
 		return s
 	}
-	return fmt.Sprintf("%s... (%d bytes total)", s[:maxPreviewBytes], len(s))
+	return fmt.Sprintf("%s... (%d bytes total)", s[:maxPreviewLen], len(s))
 }
 
 // requirePort extracts a mitmproxy `port` field that MUST be a tnetstring
@@ -501,7 +494,7 @@ func (i *MitmproxyImporter) parseFlow(flow mitmproxyFlow) (crawl.ObservedRequest
 	}
 
 	if !allowedSchemes[flow.Request.Scheme] {
-		return crawl.ObservedRequest{}, fmt.Errorf("unsupported scheme %q (only http/https allowed)", previewString(flow.Request.Scheme))
+		return crawl.ObservedRequest{}, fmt.Errorf("unsupported scheme %s (only http/https allowed)", previewString(flow.Request.Scheme))
 	}
 
 	if err := validateHost(flow.Request.Host); err != nil {

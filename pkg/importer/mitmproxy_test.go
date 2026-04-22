@@ -1109,6 +1109,107 @@ func TestMitmproxyImporter_Native_MalformedHeaderPairSkipped(t *testing.T) {
 	assert.NotContains(t, req.Headers, "X-Lonely")
 }
 
+// TestMitmproxyImporter_Native_HeadersNotAList pins the top-level
+// type-assertion failure in nativeHeaders: when `request.headers` is not
+// a tnetstring list (e.g. bytes, int, dict), the helper silently drops all
+// headers for the flow and the import still succeeds. Without this test a
+// future refactor could flip the `return nil` into a hard error (or a
+// permissive fall-through) without any test failing. Pairs with
+// TestMitmproxyImporter_Native_MalformedHeaderPairSkipped, which covers
+// malformed entries inside a well-formed list.
+func TestMitmproxyImporter_Native_HeadersNotAList(t *testing.T) {
+	cases := []struct {
+		name  string
+		value any
+	}{
+		{"bytes", []byte("not-a-list")},
+		{"int", int64(0)},
+		{"dict", map[string]any{"unexpected": []byte("shape")}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state := flowState(
+				"GET", "https", "example.com", 443, "/api",
+				nil, nil, 200, nil, nil,
+			)
+			state["request"].(map[string]any)["headers"] = tc.value
+
+			m := &MitmproxyImporter{}
+			requests, err := m.Import(bytes.NewReader(encodeTnet(state)))
+			require.NoError(t, err, "wrong-type headers field must be silently dropped, not errored")
+			require.Len(t, requests, 1)
+			assert.Empty(t, requests[0].Headers)
+		})
+	}
+}
+
+// TestMitmproxyImporter_Native_ContentAsString exercises the tnetstring `;`
+// (UTF-8 string) branch of nativeContent end-to-end. The decoder produces
+// string-typed values for `;` elements (see
+// TestMitmproxyImporter_Native_StringTypeInHeaderValue for the header-path
+// proof); content MUST survive that type unchanged. Without this test the
+// string branch of the type-switch could silently break and only the bytes
+// branch would catch it.
+func TestMitmproxyImporter_Native_ContentAsString(t *testing.T) {
+	// Hand-roll a flow where `request.content` uses type marker `;` (string)
+	// rather than `,` (bytes); the shared encoder always emits `,` so we
+	// splice raw elements via the buildElement helpers.
+	content := buildElement([]byte("hello-string-body"), ';')
+	request := tnetDictElement(
+		tnetBytesElement("method"), tnetBytesElement("GET"),
+		tnetBytesElement("scheme"), tnetBytesElement("https"),
+		tnetBytesElement("host"), tnetBytesElement("example.com"),
+		tnetBytesElement("port"), []byte("3:443#"),
+		tnetBytesElement("path"), tnetBytesElement("/api"),
+		tnetBytesElement("content"), content,
+		tnetBytesElement("headers"), buildElement(nil, ']'),
+	)
+	flowEnc := tnetDictElement(
+		tnetBytesElement("type"), tnetBytesElement("http"),
+		tnetBytesElement("id"), tnetBytesElement("s1"),
+		tnetBytesElement("request"), request,
+	)
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(bytes.NewReader(flowEnc))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	assert.Equal(t, []byte("hello-string-body"), requests[0].Body,
+		"string-typed content must round-trip to Body as bytes")
+}
+
+// TestMitmproxyImporter_Native_ContentWrongTypeDroppedSilently pins the
+// default branch of nativeContent's type-switch: if `content` is a dict or
+// int (which mitmproxy would never emit), import succeeds with a nil Body.
+// Documents the silent-drop contract so a future refactor can't flip it to
+// an error without tripping this test.
+func TestMitmproxyImporter_Native_ContentWrongTypeDroppedSilently(t *testing.T) {
+	// Build flow manually so we can place a dict value in `content` — the
+	// encoder's type switch would panic on a map-valued content via the
+	// flowState helper because it interprets content as []byte.
+	content := tnetDictElement(tnetBytesElement("unexpected"), tnetBytesElement("shape"))
+	request := tnetDictElement(
+		tnetBytesElement("method"), tnetBytesElement("GET"),
+		tnetBytesElement("scheme"), tnetBytesElement("https"),
+		tnetBytesElement("host"), tnetBytesElement("example.com"),
+		tnetBytesElement("port"), []byte("3:443#"),
+		tnetBytesElement("path"), tnetBytesElement("/api"),
+		tnetBytesElement("content"), content,
+		tnetBytesElement("headers"), buildElement(nil, ']'),
+	)
+	flowEnc := tnetDictElement(
+		tnetBytesElement("type"), tnetBytesElement("http"),
+		tnetBytesElement("id"), tnetBytesElement("w1"),
+		tnetBytesElement("request"), request,
+	)
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(bytes.NewReader(flowEnc))
+	require.NoError(t, err, "wrong-type content field must be silently dropped, not errored")
+	require.Len(t, requests, 1)
+	assert.Nil(t, requests[0].Body)
+}
+
 // TestMitmproxyImporter_Native_StringTypeInHeaderValue exercises the
 // tnetstring `;` (UTF-8 string) type through an integration path. The
 // shared encoder emits bytes (`,`) for all strings, so this test builds the
