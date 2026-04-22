@@ -330,8 +330,11 @@ func TestCrawler_CookieHeaderPropagatesAcrossRedirects(t *testing.T) {
 				http.Redirect(w, r, "/login", http.StatusFound)
 				return
 			}
-			w.Header().Set("Content-Type", "text/html")
-			fmt.Fprint(w, `<html><body><a href="/protected">go</a></body></html>`)
+			// Authed "/" 302 -> /protected exercises the cookie-across-redirect
+			// path directly — the Spring-Security scenario this test regresses.
+			// Previously returned an HTML link, which only tested frontier
+			// link-following, not server-side redirect cookie propagation.
+			http.Redirect(w, r, "/protected", http.StatusFound)
 		case "/login":
 			w.Header().Set("Content-Type", "text/html")
 			fmt.Fprint(w, `<html><body><h1>Login</h1></body></html>`)

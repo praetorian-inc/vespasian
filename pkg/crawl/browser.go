@@ -134,7 +134,7 @@ func (b *BrowserManager) Close() {
 // browser requests — unlike Network.setExtraHTTPHeaders, cookies set via the
 // Storage domain survive redirects, new tabs, and Fetch API interception.
 func (b *BrowserManager) SetCookies(cookies []*proto.NetworkCookieParam) error {
-	if b.browser == nil {
+	if b == nil || b.browser == nil {
 		return fmt.Errorf("browser not connected")
 	}
 	return b.browser.SetCookies(cookies)
