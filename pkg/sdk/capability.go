@@ -491,8 +491,12 @@ func probeWSDLDocument(ctx context.Context, targetURL string) []byte {
 		return nil
 	}
 	defer func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 2<<20)) //nolint:errcheck,gosec // best-effort drain
-		resp.Body.Close()                                     //nolint:errcheck,gosec // best-effort close
+		// Drain up to 2 MiB so the connection can return to the keep-alive
+		// pool, then close. Both errors are unrecoverable here — the return
+		// value is already decided by decodeWSDLResponse below — so they are
+		// intentionally discarded via explicit _ assignment.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 2<<20)) //nolint:errcheck
+		_ = resp.Body.Close()                                        //nolint:errcheck
 	}()
 
 	return decodeWSDLResponse(resp)
