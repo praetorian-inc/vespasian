@@ -15,22 +15,37 @@
 package importer
 
 import (
-	"fmt"
+	"strconv"
 	"testing"
 )
+
+// buildElement builds a raw tnetstring element "<len>:<payload><marker>" by
+// explicit byte concatenation — never via fmt.Sprintf("%d:%s,", len, payload),
+// because %s on []byte re-interprets percent signs in the payload as format
+// directives, silently corrupting binary bodies. The shared production
+// encoder (tnetenc.encodeWithMarker) uses the same safe pattern.
+func buildElement(payload []byte, marker byte) []byte {
+	lenStr := strconv.Itoa(len(payload))
+	out := make([]byte, 0, len(lenStr)+1+len(payload)+1)
+	out = append(out, lenStr...)
+	out = append(out, ':')
+	out = append(out, payload...)
+	out = append(out, marker)
+	return out
+}
 
 // tnetBytesElement builds a raw tnetstring bytes element ("N:payload,").
 // Unlike the shared encodeTnet helper, the result is deterministic and
 // inspectable — length prefix + raw payload + marker byte, nothing else.
 func tnetBytesElement(payload string) []byte {
-	return []byte(fmt.Sprintf("%d:%s,", len(payload), payload))
+	return buildElement([]byte(payload), ',')
 }
 
 // tnetStringElement builds a raw tnetstring UTF-8-string element ("N:payload;").
 // The shared encoder emits everything as bytes (`,`); this helper is the only
 // way to exercise the decoder's `;` path in integration tests.
 func tnetStringElement(payload string) []byte {
-	return []byte(fmt.Sprintf("%d:%s;", len(payload), payload))
+	return buildElement([]byte(payload), ';')
 }
 
 // tnetListElement wraps already-encoded tnetstring elements into a list
@@ -40,7 +55,7 @@ func tnetListElement(elements ...[]byte) []byte {
 	for _, e := range elements {
 		body = append(body, e...)
 	}
-	return []byte(fmt.Sprintf("%d:%s]", len(body), body))
+	return buildElement(body, ']')
 }
 
 // tnetDictElement wraps alternating key and value elements into a dict
@@ -53,7 +68,7 @@ func tnetDictElement(keysAndValues ...[]byte) []byte {
 	for _, e := range keysAndValues {
 		body = append(body, e...)
 	}
-	return []byte(fmt.Sprintf("%d:%s}", len(body), body))
+	return buildElement(body, '}')
 }
 
 // withTempCap temporarily sets *target to newValue and registers a Cleanup

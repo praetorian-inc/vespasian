@@ -16,7 +16,6 @@ package importer
 
 import (
 	"bufio"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -42,6 +41,11 @@ type mitmproxyFlow struct {
 	Response mitmproxyResponse `json:"response"`
 }
 
+// Content fields are []byte rather than *string so Go's encoding/json handles
+// the base64 round-trip natively, and the native path can assign raw bytes
+// directly without re-encoding. A 64 MB body would otherwise peak at
+// raw + base64 + decoded ~= 3.3x memory because the native path base64-encoded
+// into a *string only so parseFlow could base64-decode it back.
 type mitmproxyRequest struct {
 	Method  string     `json:"method"`
 	Scheme  string     `json:"scheme"`
@@ -49,13 +53,13 @@ type mitmproxyRequest struct {
 	Port    int        `json:"port"`
 	Path    string     `json:"path"`
 	Headers [][]string `json:"headers"`
-	Content *string    `json:"content"`
+	Content []byte     `json:"content"`
 }
 
 type mitmproxyResponse struct {
 	StatusCode int        `json:"status_code"`
 	Headers    [][]string `json:"headers"`
-	Content    *string    `json:"content"`
+	Content    []byte     `json:"content"`
 }
 
 // Name returns the importer name.
@@ -84,7 +88,7 @@ func (i *MitmproxyImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error)
 	// prefix). These triggers are disjoint so there is no overlap to resolve.
 	switch {
 	case firstByte == '[' || firstByte == '{':
-		return i.importJSON(bufReader, limitedReader)
+		return i.importJSON(bufReader, limitedReader, firstByte)
 	case firstByte >= '0' && firstByte <= '9':
 		return i.importNative(bufReader, limitedReader)
 	default:
@@ -100,19 +104,13 @@ func (i *MitmproxyImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error)
 	}
 }
 
-// importJSON parses the JSON export format.
+// importJSON parses the JSON export format. firstByte is passed from the
+// caller (Import) so we do not peek the stream twice; the caller has already
+// guaranteed it is '[' or '{'. A default case guards that invariant.
 //
 // Memory efficiency (S3 fix): Uses streaming json.NewDecoder instead of io.ReadAll
 // to avoid allocating the entire input as a raw byte buffer (up to 500MB).
-func (i *MitmproxyImporter) importJSON(bufReader *bufio.Reader, limitedReader *limitedReader) ([]crawl.ObservedRequest, error) { //nolint:gocyclo // format parsing
-	firstByte, err := peekFirstNonWhitespace(bufReader)
-	if err != nil {
-		if limitedReader.hitLimit {
-			return nil, ErrFileTooLarge
-		}
-		return nil, fmt.Errorf("mitmproxy importer: failed to read input: %w", err)
-	}
-
+func (i *MitmproxyImporter) importJSON(bufReader *bufio.Reader, limitedReader *limitedReader, firstByte byte) ([]crawl.ObservedRequest, error) { //nolint:gocyclo // format parsing
 	decoder := json.NewDecoder(bufReader)
 	var requests []crawl.ObservedRequest
 
@@ -157,6 +155,11 @@ func (i *MitmproxyImporter) importJSON(bufReader *bufio.Reader, limitedReader *l
 			return nil, fmt.Errorf("mitmproxy importer: %w", err)
 		}
 		requests = []crawl.ObservedRequest{req}
+	default:
+		// Defensive: Import's dispatch guarantees firstByte is '[' or '{'.
+		// Surfacing an explicit error here prevents a silent (nil, nil)
+		// return if a future refactor accidentally routes other bytes here.
+		return nil, fmt.Errorf("mitmproxy importer: importJSON called with unexpected first byte %q", firstByte)
 	}
 
 	return requests, nil
@@ -170,7 +173,9 @@ func (i *MitmproxyImporter) importJSON(bufReader *bufio.Reader, limitedReader *l
 //
 // Declared as a var (not a const) so tests can lower the cap and exercise
 // the rejection path with a small crafted payload. Production callers MUST
-// treat this as read-only.
+// treat this as read-only. NOT PARALLEL-SAFE: mutation via withTempCap is
+// not concurrency-safe, so no caller may use t.Parallel(); see
+// testhelpers_test.go::withTempCap for the constraint.
 var maxNativeFlows = 500_000
 
 // importNative parses mitmproxy's native binary flow format. Each flow is a
@@ -287,18 +292,13 @@ func flowFromNativeState(state map[string]any) (mitmproxyFlow, error) {
 // "example.com:443") instead of a path. The authority is already reflected
 // in the flow's host/port fields, so we do not embed it into the path — that
 // would produce malformed URLs like "https://example.com/example.com:443".
-// Instead, fall back to "/" so the URL becomes "https://example.com:443/".
-func buildRequestPath(reqMap map[string]any, method string) string {
+// Non-CONNECT requests missing a path fall back to "/" for the same reason:
+// surfacing a malformed URL through downstream consumers (which may re-fetch,
+// replay, or log the URL) is more hazardous than defaulting to root and
+// logging a less-specific target.
+func buildRequestPath(reqMap map[string]any, _ string) string {
 	if path := tnetBytesOrString(reqMap["path"]); path != "" {
 		return path
-	}
-	if method == "CONNECT" {
-		return "/"
-	}
-	// Non-CONNECT request missing a path is unusual; fall back to authority
-	// so downstream URL parsing surfaces the data rather than dropping it.
-	if authority := tnetBytesOrString(reqMap["authority"]); authority != "" {
-		return authority
 	}
 	return "/"
 }
@@ -324,15 +324,17 @@ func nativeHeaders(v any) [][]string {
 	return out
 }
 
-// nativeContent encodes the raw request/response body as base64 so parseFlow's
-// shared decode path handles it.
+// nativeContent passes the raw request/response body through to parseFlow as
+// []byte (the same wire type mitmproxy stored), avoiding the base64 round-trip
+// the JSON path uses. A 64 MB body would otherwise peak at
+// raw(64MB) + base64(~85MB) + decoded(64MB) = ~213MB per flow.
 //
 // Returns nil for both absent bodies (no `content` key) and explicitly empty
 // bodies (zero-length content). ObservedRequest already uses a nil-byte-slice
 // Body field and does not distinguish "no body" from "Content-Length: 0", so
 // conflating them here matches existing behavior and keeps the JSON and
 // native paths aligned.
-func nativeContent(v any) *string {
+func nativeContent(v any) []byte {
 	if v == nil {
 		return nil
 	}
@@ -348,8 +350,7 @@ func nativeContent(v any) *string {
 	if len(raw) == 0 {
 		return nil
 	}
-	encoded := base64.StdEncoding.EncodeToString(raw)
-	return &encoded
+	return raw
 }
 
 // tnetBytesOrString coerces a tnetstring-decoded value to a string, accepting
@@ -424,8 +425,60 @@ func peekFirstNonWhitespace(r *bufio.Reader) (byte, error) {
 	}
 }
 
+// allowedSchemes enumerates URL schemes accepted from mitmproxy captures.
+// The native path accepts untrusted `.mitm` files, so an attacker could
+// forge `scheme=file|javascript|gopher|data|ldap|dict|...` which would then
+// ride through to any downstream consumer that re-fetches, replays, or
+// inspects the ObservedRequest.URL. mitmproxy itself only emits http/https,
+// so constraining at the importer boundary costs nothing legitimate.
+var allowedSchemes = map[string]bool{
+	"http":  true,
+	"https": true,
+}
+
+// maxHostLength is RFC 1035's 253-octet limit for a fully qualified domain
+// name (excluding the trailing dot). mitmproxy `.mitm` files are attacker-
+// controllable input; without a bound the `host` field can carry up to the
+// 64 MB per-element tnetstring cap, which is nonsense as a hostname and a
+// foot-gun for downstream consumers (rate limiters, scope filters, loggers)
+// that trust the host-derived slice.
+const maxHostLength = 253
+
+// validateHost rejects empty hosts, overlong hosts, embedded userinfo, and
+// whitespace or control bytes. The check is deliberately conservative — a
+// legitimate mitmproxy capture never contains any of these — so a rejection
+// reliably indicates a forged or malformed capture, not a real site.
+//
+// Applied at the importer boundary (both JSON and native paths) so downstream
+// code that URL-parses `ObservedRequest.URL` receives a host that satisfies
+// the invariants documented here, rather than having to re-validate.
+func validateHost(host string) error {
+	if host == "" {
+		return fmt.Errorf("empty host")
+	}
+	if len(host) > maxHostLength {
+		return fmt.Errorf("host length %d exceeds RFC 1035 limit of %d", len(host), maxHostLength)
+	}
+	if strings.ContainsRune(host, '@') {
+		// Embedded userinfo ("user:pass@host") weaponizes the host field into
+		// a credential smuggler if a downstream consumer splits on `@`.
+		return fmt.Errorf("host contains embedded userinfo (\"@\")")
+	}
+	for _, r := range host {
+		// Reject ASCII control bytes and whitespace. Non-ASCII (e.g. IDN) is
+		// permitted because mitmproxy's host field may carry punycode or
+		// UTF-8 forms; deeper validation is the URL-parser's job.
+		if r < 0x21 || r == 0x7f {
+			return fmt.Errorf("host contains control/whitespace byte %q", r)
+		}
+	}
+	return nil
+}
+
 // parseFlow converts a mitmproxyFlow into an ObservedRequest.
-// Constructs URL from request components, decodes base64 content, and extracts headers.
+// Constructs URL from request components and extracts headers. Bodies are
+// already raw []byte (native path assigns directly; JSON path base64-decodes
+// during json.Decode since Go maps JSON strings into []byte as base64).
 func (i *MitmproxyImporter) parseFlow(flow mitmproxyFlow) (crawl.ObservedRequest, error) {
 	if flow.Request.Port < 0 || flow.Request.Port > 65535 {
 		return crawl.ObservedRequest{}, fmt.Errorf("invalid port: %d (must be 0-65535)", flow.Request.Port)
@@ -435,17 +488,15 @@ func (i *MitmproxyImporter) parseFlow(flow mitmproxyFlow) (crawl.ObservedRequest
 		return crawl.ObservedRequest{}, fmt.Errorf("invalid HTTP method: %s", flow.Request.Method)
 	}
 
+	if !allowedSchemes[flow.Request.Scheme] {
+		return crawl.ObservedRequest{}, fmt.Errorf("unsupported scheme %q (only http/https allowed)", flow.Request.Scheme)
+	}
+
+	if err := validateHost(flow.Request.Host); err != nil {
+		return crawl.ObservedRequest{}, fmt.Errorf("invalid host: %w", err)
+	}
+
 	url := constructURL(flow.Request.Scheme, flow.Request.Host, flow.Request.Port, flow.Request.Path)
-
-	reqBody, err := decodeContent(flow.Request.Content)
-	if err != nil {
-		return crawl.ObservedRequest{}, fmt.Errorf("failed to decode request content: %w", err)
-	}
-
-	respBody, err := decodeContent(flow.Response.Content)
-	if err != nil {
-		return crawl.ObservedRequest{}, fmt.Errorf("failed to decode response content: %w", err)
-	}
 
 	respHeaders := convertMitmproxyHeaders(flow.Response.Headers)
 	return crawl.ObservedRequest{
@@ -453,15 +504,26 @@ func (i *MitmproxyImporter) parseFlow(flow mitmproxyFlow) (crawl.ObservedRequest
 		URL:         url,
 		Headers:     convertMitmproxyHeaders(flow.Request.Headers),
 		QueryParams: extractQueryParams(url),
-		Body:        reqBody,
+		Body:        nilIfEmpty(flow.Request.Content),
 		Response: crawl.ObservedResponse{
 			StatusCode:  flow.Response.StatusCode,
 			Headers:     respHeaders,
 			ContentType: respHeaders["Content-Type"],
-			Body:        respBody,
+			Body:        nilIfEmpty(flow.Response.Content),
 		},
 		Source: "import:mitmproxy",
 	}, nil
+}
+
+// nilIfEmpty normalizes a zero-length body to nil so downstream consumers
+// cannot tell "no body" apart from "Content-Length: 0". Matches pre-existing
+// behavior where the JSON path's decodeContent returned (nil, nil) for both
+// nil *string and empty string.
+func nilIfEmpty(b []byte) []byte {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
 }
 
 // constructURL builds URL from mitmproxy components using url.URL struct.
@@ -481,20 +543,6 @@ func constructURL(scheme, host string, port int, path string) string {
 	}
 
 	return u.String()
-}
-
-// decodeContent decodes base64-encoded content from mitmproxy flow.
-// Returns nil for nil or empty content, decoded bytes otherwise.
-func decodeContent(content *string) ([]byte, error) {
-	if content == nil || *content == "" {
-		return nil, nil
-	}
-
-	decoded, err := base64.StdEncoding.DecodeString(*content)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode base64: %w", err)
-	}
-	return decoded, nil
 }
 
 // convertMitmproxyHeaders converts mitmproxy header tuples to map.

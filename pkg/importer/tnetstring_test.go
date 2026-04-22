@@ -157,6 +157,11 @@ func TestTnetstring_InvalidInputs(t *testing.T) {
 		{"unknown type byte", "5:hello?"},
 		{"empty input", ""},
 		{"prefix too long", "12345678901:xxx,"},
+		// Explicit coverage: leading minus is structurally rejected by the
+		// "non-digit prefix" case above, but pinning it separately ensures a
+		// future refactor of the length-prefix reader that started tolerating
+		// signed ints would surface here instead of passing silently.
+		{"negative length", "-1:x,"},
 		{"invalid float payload", "3:abc^"},
 		// Dict with a single int key and no value: payload "3:k#0" is "3:k#"
 		// (int key "k") + "0" (start of the next element — truncated).
@@ -276,6 +281,106 @@ func TestTnetstring_LengthTooLarge(t *testing.T) {
 	_, err := decodeTnetstringStream(r, 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "per-element cap")
+}
+
+// TestTnetstring_ElementAtCapAccepted and
+// TestTnetstring_ElementAtCapPlusOneRejected together pin the exact per-
+// element cap boundary. maxTnetstringElement is promoted to a var so
+// withTempCap can lower it — without this, a refactor that flipped `>` to
+// `>=` (or vice versa) in readLengthPrefix would silently pass because only
+// the far-side rejection is currently exercised (by TestTnetstring_LengthTooLarge).
+//
+// Regression for review TEST-007.
+func TestTnetstring_ElementAtCapAccepted(t *testing.T) {
+	const lowered = 64
+	withTempCap(t, &maxTnetstringElement, lowered)
+
+	payload := strings.Repeat("x", lowered)
+	input := fmt.Sprintf("%d:%s,", lowered, payload)
+	r := bufio.NewReader(strings.NewReader(input))
+	got, err := decodeTnetstringStream(r, 0)
+	require.NoError(t, err)
+	assert.Equal(t, []byte(payload), got)
+}
+
+func TestTnetstring_ElementAtCapPlusOneRejected(t *testing.T) {
+	const lowered = 64
+	withTempCap(t, &maxTnetstringElement, lowered)
+
+	payload := strings.Repeat("x", lowered+1)
+	input := fmt.Sprintf("%d:%s,", lowered+1, payload)
+	r := bufio.NewReader(strings.NewReader(input))
+	_, err := decodeTnetstringStream(r, 0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "per-element cap")
+}
+
+// TestTnetstring_DepthAtCapAccepted / _DepthAtCapPlusOneRejected pin the
+// exact depth boundary. TestTnetstring_DepthLimitRejected already exercises
+// depth=2*cap rejection; without these, a refactor flipping `>` to `>=` in
+// decodeTnetstringStream/Inner would silently pass.
+//
+// Regression for review TEST-007.
+func TestTnetstring_DepthAtCapAccepted(t *testing.T) {
+	// The depth check is `depth > maxTnetstringDepth`, so depth=cap is
+	// accepted and depth=cap+1 is rejected. The decoder starts at depth=0
+	// and increments once per nested level, so a payload with physical
+	// depth N reaches decoder depth N-1 at the innermost element. Therefore
+	// to exercise decoder depth == maxTnetstringDepth we need a physical
+	// depth of maxTnetstringDepth+1 — i.e. one innermost empty list wrapped
+	// by maxTnetstringDepth outer lists.
+	var v any = []any{}
+	for i := 0; i < maxTnetstringDepth; i++ {
+		v = []any{v}
+	}
+	encoded := encodeTnet(v)
+
+	r := bufio.NewReader(bytes.NewReader(encoded))
+	got, err := decodeTnetstringStream(r, 0)
+	require.NoError(t, err, "decoder depth == maxTnetstringDepth must decode successfully")
+	assert.NotNil(t, got)
+}
+
+func TestTnetstring_DepthAtCapPlusOneRejected(t *testing.T) {
+	// One more wrapper than the at-cap test lifts decoder depth to
+	// maxTnetstringDepth+1, which trips ErrTnetstringDepth.
+	var v any = []any{}
+	for i := 0; i < maxTnetstringDepth+1; i++ {
+		v = []any{v}
+	}
+	encoded := encodeTnet(v)
+
+	r := bufio.NewReader(bytes.NewReader(encoded))
+	_, err := decodeTnetstringStream(r, 0)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrTnetstringDepth)
+}
+
+// TestTnetstring_LengthPrefixAtDigitCap pins the exact digit-count boundary
+// for the length prefix. maxLengthPrefixDigits=9 prevents strconv.Atoi
+// overflow; the existing "prefix too long" case in TestTnetstring_InvalidInputs
+// uses 11 digits, leaving a gap between 9 (accepted) and 10 (rejected).
+//
+// Regression for review TEST-006.
+func TestTnetstring_LengthPrefixAtDigitCap(t *testing.T) {
+	t.Run("9 digits accepted", func(t *testing.T) {
+		// "000000000:<nothing>," = 9-digit length prefix of 0 followed by
+		// empty-bytes payload. 9 digits is the inclusive cap.
+		input := "000000000:,"
+		r := bufio.NewReader(strings.NewReader(input))
+		got, err := decodeTnetstringStream(r, 0)
+		require.NoError(t, err)
+		assert.Equal(t, []byte{}, got)
+	})
+	t.Run("10 digits rejected", func(t *testing.T) {
+		// "0000000000:,": same semantics but one extra digit -> rejected
+		// before even parsing the number.
+		input := "0000000000:,"
+		r := bufio.NewReader(strings.NewReader(input))
+		_, err := decodeTnetstringStream(r, 0)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "length prefix exceeds")
+	})
 }
 
 func TestTnetstring_IntegerDictKey(t *testing.T) {

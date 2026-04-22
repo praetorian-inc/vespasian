@@ -1277,6 +1277,11 @@ test_import_mitmproxy_native() {
     local target_dir="${RESULTS_DIR}/import-mitmproxy-native"
     local imported_file="${target_dir}/imported.json"
     local fixture="${SCRIPT_DIR}/fixtures/sample-mitmproxy.mitm"
+    # Deliberately shares expected-mitmproxy-capture.json with
+    # test_import_mitmproxy: both format paths (JSON export + native
+    # tnetstring) normalize to the same ObservedRequest output, so asserting
+    # against the same expected capture also verifies the two paths agree.
+    # A drift in either path will be caught by this shared baseline.
     local expected_capture="${SCRIPT_DIR}/fixtures/expected-mitmproxy-capture.json"
 
     mkdir -p "$target_dir"

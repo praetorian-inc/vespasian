@@ -19,6 +19,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -414,7 +416,11 @@ func TestMitmproxyImporter_InvalidResponseContent(t *testing.T) {
 	m := &MitmproxyImporter{}
 	_, err := m.Import(strings.NewReader(json))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to decode response content")
+	// Content fields decode base64 during json.Decode (Go maps JSON strings
+	// into []byte via base64), so invalid base64 surfaces from the decoder
+	// rather than a separate decodeContent step.
+	assert.Contains(t, err.Error(), "failed to decode flow")
+	assert.Contains(t, err.Error(), "illegal base64")
 }
 
 func TestMitmproxyImporter_EmptyHeaderNames(t *testing.T) {
@@ -640,7 +646,11 @@ func TestMitmproxyImporter_InvalidRequestContent(t *testing.T) {
 	m := &MitmproxyImporter{}
 	_, err := m.Import(strings.NewReader(json))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to decode request content")
+	// Content fields decode base64 during json.Decode (Go maps JSON strings
+	// into []byte via base64), so invalid base64 surfaces from the decoder
+	// rather than a separate decodeContent step.
+	assert.Contains(t, err.Error(), "failed to decode flow")
+	assert.Contains(t, err.Error(), "illegal base64")
 }
 
 func TestMitmproxyImporter_InvalidMethod(t *testing.T) {
@@ -1245,4 +1255,223 @@ func TestMitmproxyImporter_Native_StringTypedDictKey(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, requests, 1)
 	assert.Equal(t, "https://example.com/str", requests[0].URL)
+}
+
+// TestMitmproxyImporter_Native_BOMPrefixRejected confirms that a UTF-8 BOM
+// (0xEF 0xBB 0xBF) followed by otherwise-valid JSON does NOT select either
+// importer path. The first non-whitespace byte 0xEF is neither `[`/`{` nor
+// an ASCII digit, so dispatch falls through to the "unrecognized format"
+// branch. Regression for review TEST-002.
+func TestMitmproxyImporter_BOMPrefixRejected(t *testing.T) {
+	var input []byte
+	input = append(input, 0xEF, 0xBB, 0xBF) // UTF-8 BOM
+	input = append(input, []byte(`{"request":{}}`)...)
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(bytes.NewReader(input))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unrecognized format")
+}
+
+// TestMitmproxyImporter_LeadingMinusRejected confirms the dispatch rejects a
+// leading `-` as neither JSON nor native tnetstring. Structurally overlaps
+// with TestMitmproxyImporter_InvalidFirstToken, but explicitly pinning `-`
+// defends against a future refactor of the length-prefix check that started
+// tolerating signed ints. Regression for review TEST-002.
+func TestMitmproxyImporter_LeadingMinusRejected(t *testing.T) {
+	m := &MitmproxyImporter{}
+	_, err := m.Import(strings.NewReader("-1:x,"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unrecognized format")
+}
+
+// TestMitmproxyImporter_Native_GeneratedFixtureImports loads the committed
+// sample-mitmproxy.mitm and runs it through MitmproxyImporter.Import, so the
+// generator-to-importer path is exercised by a unit test rather than only
+// by the gated live test `import-mitmproxy-native`. Without this, a
+// generator that silently produces unparseable bytes would still pass the
+// existing fixture-drift check. Regression for review TEST-001.
+func TestMitmproxyImporter_Native_GeneratedFixtureImports(t *testing.T) {
+	root := repoRoot(t)
+	path := filepath.Join(root, "test", "fixtures", "sample-mitmproxy.mitm")
+	data, err := os.ReadFile(path) //nolint:gosec // test-time fixture read, path derived from repo root
+	require.NoError(t, err)
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(bytes.NewReader(data))
+	require.NoError(t, err, "generated fixture failed to import")
+
+	// The generator (test/fixtures/gen_mitmproxy_native/main.go) emits three
+	// HTTP flows against http://localhost:8990; see that file for the
+	// canonical contents.
+	require.Len(t, requests, 3, "generator produces 3 HTTP flows")
+
+	// Pin method, URL, and response status per flow so a generator change
+	// that alters shape surfaces here rather than silently skewing fixtures.
+	expected := []struct {
+		method, url string
+		statusCode  int
+	}{
+		{"GET", "http://localhost:8990/api/users", 200},
+		{"POST", "http://localhost:8990/api/orders", 201},
+		{"GET", "http://localhost:8990/api/products/1", 200},
+	}
+	for i, exp := range expected {
+		assert.Equal(t, exp.method, requests[i].Method, "flow %d method", i)
+		assert.Equal(t, exp.url, requests[i].URL, "flow %d URL", i)
+		assert.Equal(t, exp.statusCode, requests[i].Response.StatusCode, "flow %d status", i)
+		assert.Equal(t, "import:mitmproxy", requests[i].Source, "flow %d source", i)
+		assert.NotEmpty(t, requests[i].Response.Body, "flow %d response body", i)
+	}
+
+	// POST flow carries a request body in the generator input; verify the
+	// body survives the native-path round-trip end-to-end (regression for
+	// the base64-round-trip removal in SEC-BE-003).
+	assert.Equal(t, []byte(`{"user_id":1,"product_id":2,"quantity":1}`), requests[1].Body)
+}
+
+// TestMitmproxyImporter_Native_MaxFlowsCap_AtCap pairs with
+// TestMitmproxyImporter_Native_MaxFlowsCap to pin the exact cap boundary.
+// A stream with exactly N valid HTTP flows (N == lowered cap) must decode
+// without error, while N+1 trips ErrTooManyEntries.
+//
+// Regression for review TEST-004.
+func TestMitmproxyImporter_Native_MaxFlowsCap_AtCap(t *testing.T) {
+	const lowered = 3
+	withTempCap(t, &maxNativeFlows, lowered)
+
+	httpFlow := encodeTnet(flowState(
+		"GET", "https", "example.com", 443, "/api",
+		nil, nil, 200, nil, nil,
+	))
+	var stream bytes.Buffer
+	for i := 0; i < lowered; i++ {
+		stream.Write(httpFlow)
+	}
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(&stream)
+	require.NoError(t, err, "exactly cap flows must be accepted")
+	require.Len(t, requests, lowered)
+}
+
+// TestMitmproxyImporter_Native_RegressionLAB2309_ErrorMessagePin is a
+// defense-in-depth companion to TestMitmproxyImporter_Native_RegressionLAB2309.
+// The original test proves the fixture decodes cleanly; this one confirms
+// the success path does NOT carry the pre-fix error text anywhere. A future
+// dispatch rewrite that accidentally succeeded on digit-prefixed input via
+// an unrelated path would fail this check.
+//
+// Regression for review TEST-003.
+func TestMitmproxyImporter_Native_RegressionLAB2309_ErrorMessagePin(t *testing.T) {
+	state := flowState(
+		"GET", "https", "example.com", 443, "/api",
+		nil, nil, 200, nil, nil,
+	)
+	encoded := encodeTnet(state)
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(bytes.NewReader(encoded))
+	require.NoError(t, err, "native flow must not produce the pre-fix JSON error")
+	// err is nil, so there is no message to inspect. The surviving assertion
+	// is: reaching this line at all means the dispatch did not reject with
+	// the pre-fix "expected JSON array or object" text — that path returned
+	// an error, which NoError above would have caught.
+}
+
+// TestMitmproxyImporter_Native_UnsafeSchemeRejected covers SEC-BE-001:
+// mitmproxy `.mitm` files are untrusted input, so schemes other than
+// http/https must be rejected at the importer boundary to prevent scheme-
+// confusion bugs in downstream consumers that re-fetch or replay URLs.
+func TestMitmproxyImporter_Native_UnsafeSchemeRejected(t *testing.T) {
+	schemes := []string{"file", "javascript", "gopher", "data", "ldap", "dict", "ftp"}
+	for _, scheme := range schemes {
+		t.Run(scheme, func(t *testing.T) {
+			state := flowState(
+				"GET", scheme, "example.com", 443, "/api",
+				nil, nil, 200, nil, nil,
+			)
+
+			m := &MitmproxyImporter{}
+			_, err := m.Import(bytes.NewReader(encodeTnet(state)))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "unsupported scheme")
+		})
+	}
+}
+
+// TestMitmproxyImporter_JSON_UnsafeSchemeRejected is the JSON-path mirror of
+// the native scheme test so both importer paths enforce the same whitelist.
+func TestMitmproxyImporter_JSON_UnsafeSchemeRejected(t *testing.T) {
+	jsonFlow := `{
+		"request": {
+			"method": "GET",
+			"scheme": "file",
+			"host": "example.com",
+			"port": 443,
+			"path": "/etc/passwd",
+			"headers": []
+		},
+		"response": {
+			"status_code": 200,
+			"headers": [],
+			"content": null
+		}
+	}`
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(strings.NewReader(jsonFlow))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported scheme")
+}
+
+// TestMitmproxyImporter_Native_InvalidHostRejected covers SEC-BE-002: hosts
+// with userinfo, control bytes, or overlong lengths must be rejected at the
+// importer boundary so downstream consumers cannot be tricked by a forged
+// `.mitm` capture.
+func TestMitmproxyImporter_Native_InvalidHostRejected(t *testing.T) {
+	cases := []struct {
+		name    string
+		host    string
+		wantMsg string
+	}{
+		{"empty", "", "empty host"},
+		{"embedded userinfo", "user:pass@attacker.example", "embedded userinfo"},
+		{"control byte", "example\x00.com", "control/whitespace"},
+		{"whitespace", "example .com", "control/whitespace"},
+		{"over 253 chars", strings.Repeat("a", 254), "exceeds RFC 1035"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state := flowState(
+				"GET", "https", tc.host, 443, "/api",
+				nil, nil, 200, nil, nil,
+			)
+
+			m := &MitmproxyImporter{}
+			_, err := m.Import(bytes.NewReader(encodeTnet(state)))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantMsg)
+		})
+	}
+}
+
+// TestMitmproxyImporter_BuildRequestPath_EmptyPathFallsBackToRoot pins
+// QUAL-003: for non-CONNECT requests with empty path, buildRequestPath now
+// returns "/" rather than falling back to the authority (which produced
+// malformed URLs like "https://example.com/example.com:80").
+func TestMitmproxyImporter_BuildRequestPath_EmptyPathFallsBackToRoot(t *testing.T) {
+	state := flowState(
+		"GET", "https", "example.com", 443, "",
+		nil, nil, 200, nil, nil,
+	)
+	req := state["request"].(map[string]any)
+	req["authority"] = []byte("example.com:443")
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(bytes.NewReader(encodeTnet(state)))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	// Path falls back to "/" — authority is already reflected in host/port.
+	assert.Equal(t, "https://example.com/", requests[0].URL)
 }

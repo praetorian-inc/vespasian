@@ -50,19 +50,26 @@ import (
 // maxImportSize cap so a malformed header with a huge length prefix cannot
 // trigger a large allocation before io.ReadFull validates the bytes exist.
 // maxTnetstringDepth bounds mutual recursion (dict→list→dict→...) to prevent
-// stack exhaustion on crafted inputs. maxTnetstringElements caps how many
-// items a single list or dict can hold, which bounds the pointer/interface
-// overhead that compound types can amplify out of their payload byte count.
+// stack exhaustion on crafted inputs.
 const (
-	maxTnetstringElement  = 64 * 1024 * 1024 // 64 MB per-element allocation bound
-	maxTnetstringDepth    = 64               // mitmproxy flow dicts nest ~4 levels in practice
-	maxLengthPrefixDigits = 9                // digits(maxTnetstringElement) = 8; 9 leaves headroom
+	maxTnetstringDepth    = 64 // mitmproxy flow dicts nest ~4 levels in practice
+	maxLengthPrefixDigits = 9  // digits(maxTnetstringElement) = 8; 9 leaves headroom
 )
+
+// maxTnetstringElement caps any single element's payload size. Declared as a
+// var (not a const) so tests can lower the cap and exercise the boundary
+// (at-cap accepted / above-cap rejected) without allocating 64 MB in-test.
+// Production callers MUST treat this as read-only. NOT PARALLEL-SAFE:
+// mutation via withTempCap is not concurrency-safe, so no caller may use
+// t.Parallel(); see testhelpers_test.go::withTempCap for the constraint.
+var maxTnetstringElement = 64 * 1024 * 1024 // 64 MB per-element allocation bound
 
 // maxTnetstringElements caps list/dict cardinality. Declared as a var (not a
 // const) so tests can lower the cap and exercise the rejection path with a
 // small crafted payload rather than allocating a million elements in-test.
-// Production callers MUST treat this as read-only.
+// Production callers MUST treat this as read-only. NOT PARALLEL-SAFE:
+// mutation via withTempCap is not concurrency-safe, so no caller may use
+// t.Parallel(); see testhelpers_test.go::withTempCap for the constraint.
 var maxTnetstringElements = 1 << 20 // 1M entries per list or dict
 
 // ErrTnetstringDepth reports recursion beyond maxTnetstringDepth.
@@ -96,9 +103,9 @@ func decodeTnetstringStream(r *bufio.Reader, depth int) (any, error) {
 		return nil, err
 	}
 
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, fmt.Errorf("tnetstring: read payload (len=%d): %w", length, err)
+	payload, err := readStreamPayload(r, length)
+	if err != nil {
+		return nil, err
 	}
 
 	typeByte, err := r.ReadByte()
@@ -107,6 +114,38 @@ func decodeTnetstringStream(r *bufio.Reader, depth int) (any, error) {
 	}
 
 	return parseTnetPayload(tnetType(typeByte), payload, depth)
+}
+
+// streamInitialCap bounds allocator amplification for truncated streams. The
+// stream path cannot know how many bytes actually remain (unlike
+// decodeTnetstringInner, which bounds length by r.Len()), so a malformed
+// prefix like "67108864:<EOF>" would otherwise force a 64 MB transient
+// allocation before io.ReadFull notices the stream ended. Pre-sizing at
+// 1 MB means a truncated claim aborts after that initial allocation at most,
+// instead of the full claimed size; bytes.Buffer then grows on demand as
+// real data arrives.
+const streamInitialCap = 1 << 20 // 1 MB
+
+// readStreamPayload reads exactly `length` bytes into a fresh slice, growing
+// the buffer as bytes arrive so a truncated stream cannot amplify a bogus
+// length prefix into a large transient allocation.
+func readStreamPayload(r io.Reader, length int) ([]byte, error) {
+	if length == 0 {
+		return []byte{}, nil
+	}
+	// Pre-grow to the smaller of length and the chunk cap. For a legitimate
+	// small payload this is a single allocation; for a large or forged
+	// length, Buffer grows incrementally as io.CopyN writes arrive.
+	initial := length
+	if initial > streamInitialCap {
+		initial = streamInitialCap
+	}
+	var buf bytes.Buffer
+	buf.Grow(initial)
+	if _, err := io.CopyN(&buf, r, int64(length)); err != nil {
+		return nil, fmt.Errorf("tnetstring: read payload (len=%d, got=%d): %w", length, buf.Len(), err)
+	}
+	return buf.Bytes(), nil
 }
 
 // decodeTnetstringInner reads one tnetstring element from a bounded
@@ -189,9 +228,10 @@ func readLengthPrefix(r io.ByteReader, maxLen int) (int, error) {
 func parseTnetPayload(t tnetType, payload []byte, depth int) (any, error) {
 	switch t {
 	case tnetBytes:
-		buf := make([]byte, len(payload))
-		copy(buf, payload)
-		return buf, nil
+		// payload is freshly allocated by the caller
+		// (decodeTnetstringStream/decodeTnetstringInner), so it is safe to
+		// return directly without copying — no parent buffer shares it.
+		return payload, nil
 	case tnetString:
 		return string(payload), nil
 	case tnetInt:
