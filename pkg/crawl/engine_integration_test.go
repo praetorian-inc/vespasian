@@ -392,6 +392,9 @@ func TestRodEngine_BaseHrefResolution(t *testing.T) {
 	}
 }
 
+// keys is a test helper scoped to the integration build tag — only
+// compiled when -tags=integration is set. Do not reference it from
+// tests that build under the default tag.
 func keys(m map[string]bool) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

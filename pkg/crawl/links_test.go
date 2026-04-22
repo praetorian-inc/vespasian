@@ -154,10 +154,13 @@ func TestEffectiveBaseURLFrom_HappyPath(t *testing.T) {
 	}
 }
 
-func TestEffectiveBaseURLFrom_AbsoluteHTTPSBase(t *testing.T) {
+// Cross-host absolute base is rejected — the SEC-BE-001 cross-host guard.
+// Previously this returned the CDN URL; now it must return pageURL because
+// cdn.example.com differs from ex.com.
+func TestEffectiveBaseURLFrom_RejectsCrossHostAbsoluteBase(t *testing.T) {
 	got := effectiveBaseURLFrom("https://cdn.example.com/app/", "https://ex.com/page")
-	if got != "https://cdn.example.com/app/" {
-		t.Errorf("got %q, want %q", got, "https://cdn.example.com/app/")
+	if got != "https://ex.com/page" {
+		t.Errorf("got %q, want %q", got, "https://ex.com/page")
 	}
 }
 
@@ -214,13 +217,57 @@ func TestEffectiveBaseURLFrom_AllowsUpgrade(t *testing.T) {
 	}
 }
 
-// Protocol-relative base refs (//host/path) inherit the page scheme — this
-// is the common SPA case where <base href="//cdn/..."> keeps https when
-// the page is https.
-func TestEffectiveBaseURLFrom_ProtocolRelativeBase(t *testing.T) {
+// Same-host absolute base is accepted — a page at target.com declaring
+// <base href="https://target.com/app/"> must still honor the deeper base,
+// this is only disallowed when the host differs.
+func TestEffectiveBaseURLFrom_AcceptsSameHostAbsoluteBase(t *testing.T) {
+	got := effectiveBaseURLFrom("https://ex.com/app/", "https://ex.com/page")
+	if got != "https://ex.com/app/" {
+		t.Errorf("got %q, want %q", got, "https://ex.com/app/")
+	}
+}
+
+// SEC-BE-001 regression: an in-scope page that declares a <base href> on
+// a different host (e.g., <base href="https://attacker.com/"> on a
+// target.com page, via stored XSS or attacker-owned subdomain) must not
+// re-anchor relative references to attacker.com. Doing so would poison
+// capture.json / the produced spec with attacker-host endpoints, since
+// synthetic form ObservedRequests are appended without a scope filter at
+// this stage. Pin the behaviour so this guard is not silently removed.
+func TestEffectiveBaseURLFrom_RejectsCrossHostBase(t *testing.T) {
+	got := effectiveBaseURLFrom("https://attacker.com/", "https://target.com/login")
+	if got != "https://target.com/login" {
+		t.Errorf("cross-host base not rejected: got %q, want %q", got, "https://target.com/login")
+	}
+}
+
+func TestEffectiveBaseURLFrom_HostCompareIsCaseInsensitive(t *testing.T) {
+	got := effectiveBaseURLFrom("https://EX.COM/app/", "https://ex.com/page")
+	if got != "https://EX.COM/app/" {
+		t.Errorf("case-only host mismatch wrongly rejected: got %q, want %q", got, "https://EX.COM/app/")
+	}
+}
+
+// Port-different same-hostname is treated as cross-host because url.Host
+// includes the port. A <base href="https://ex.com:8443/"> on a page
+// served from https://ex.com/page is rejected. This is conservative —
+// a well-intentioned refactor to compare hostname-only (stripping the
+// port) would silently accept port-different bases, which we do not
+// want for our threat model. Pin the behaviour.
+func TestEffectiveBaseURLFrom_PortDifferentIsCrossHost(t *testing.T) {
+	got := effectiveBaseURLFrom("https://ex.com:8443/", "https://ex.com/page")
+	if got != "https://ex.com/page" {
+		t.Errorf("port-different base not rejected: got %q, want %q", got, "https://ex.com/page")
+	}
+}
+
+// Cross-host protocol-relative base is rejected — the SEC-BE-001 cross-host
+// guard applies to protocol-relative forms too. Previously this returned the
+// CDN URL; now it must return pageURL because cdn.ex.com differs from ex.com.
+func TestEffectiveBaseURLFrom_RejectsCrossHostProtocolRelativeBase(t *testing.T) {
 	got := effectiveBaseURLFrom("//cdn.ex.com/app/", "https://ex.com/page")
-	if got != "https://cdn.ex.com/app/" {
-		t.Errorf("got %q, want %q", got, "https://cdn.ex.com/app/")
+	if got != "https://ex.com/page" {
+		t.Errorf("got %q, want %q", got, "https://ex.com/page")
 	}
 }
 

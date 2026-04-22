@@ -335,11 +335,17 @@ func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, 
 //   - jsFromResponses/jsFromInline come from jsluice and are routed through
 //     jsExtractedToLinks so asset-only hits (main.js, styles.css) are
 //     dropped before entering the frontier.
-//   - form actions are normalized via resolveURL + isLikelyPage for the
-//     same reason — avoids enqueuing a .js or /socket.io action.
+//   - form actions arrive pre-resolved from extractForms (explicit
+//     action= values resolved against baseURL; no-action forms set to
+//     pageURL). Only the asset/streaming filter applies here.
 //   - pageURL is the resolved navigation URL; baseURL is the <base href>-
 //     aware base. Both are passed because forms need page-URL semantics
 //     for PageURL tagging but base-URL semantics for explicit action refs.
+//
+// The returned links slice may contain cross-source duplicates (a URL
+// reached from both a DOM href and a jsluice hit will appear twice).
+// The frontier deduplicates on Push, so callers should not add another
+// dedup layer here.
 func mergeEnrichedLinks(
 	captured []ObservedRequest,
 	domLinks []string,
@@ -359,12 +365,15 @@ func mergeEnrichedLinks(
 	if len(forms) > 0 {
 		formRequests := formsToObservedRequests(forms, pageURL)
 		captured = append(captured, formRequests...)
+		// f.Action is always absolute: extractForms resolves explicit
+		// action attributes against baseURL, and forms with no action
+		// are set to pageURL. Only the asset/streaming filter runs here.
 		for _, f := range forms {
 			if f.Action == "" {
 				continue
 			}
-			if resolved, rerr := resolveURL(baseURL, f.Action); rerr == nil && isLikelyPage(resolved) {
-				links = append(links, resolved)
+			if isLikelyPage(f.Action) {
+				links = append(links, f.Action)
 			}
 		}
 	}

@@ -89,33 +89,50 @@ func TestMergeEnrichedLinks_FiltersAssetsFromJSLuice(t *testing.T) {
 	}
 }
 
-// Form actions resolve against the base URL (so relative action="/api"
-// works on any SPA route) and are passed through isLikelyPage so that
-// asset-shaped actions (action="/app.js") are not queued.
-func TestMergeEnrichedLinks_FormActionResolution(t *testing.T) {
+// TestMergeEnrichedLinks_InlineOnly covers the jsFromInline branch
+// (engine.go:355-357) independently — previously only tested in
+// combination with jsFromResponses via TestMergeEnrichedLinks_CombinesAllSources.
+// Asset filtering must apply to inline-discovered URLs the same way it
+// applies to response-discovered ones.
+func TestMergeEnrichedLinks_InlineOnly(t *testing.T) {
+	inline := []jsExtractedURL{
+		{URL: "/rest/customers"},
+		{URL: "/vendor.js"},
+	}
+	_, links := mergeEnrichedLinks(nil, nil, nil, inline, nil, "https://ex.com/", "https://ex.com/")
+
+	if !slices.Contains(links, "https://ex.com/rest/customers") {
+		t.Errorf("expected /rest/customers in links; got %v", links)
+	}
+	if slices.Contains(links, "https://ex.com/vendor.js") {
+		t.Errorf("inline-only vendor.js leaked through filter; got %v", links)
+	}
+}
+
+// Form actions arrive pre-resolved from extractForms (see resolveFormAction
+// for the resolution semantics and TestResolveFormAction_* for its
+// per-branch coverage). mergeEnrichedLinks only applies the asset/streaming
+// filter so that asset-shaped actions (action="/app.js") are not queued.
+func TestMergeEnrichedLinks_FormActionFiltering(t *testing.T) {
 	forms := []discoveredForm{
 		{Action: "https://ex.com/api/login", Method: "POST"},
 		{Action: "https://ex.com/main.js", Method: "POST"}, // asset-shaped — filtered
-		{Action: "https://ex.com/rel", Method: "POST"},
-		{Action: "", Method: "GET"}, // empty — skipped without error
+		{Action: "", Method: "GET"},                        // empty — skipped without error
 	}
 	_, links := mergeEnrichedLinks(nil, nil, nil, nil, forms, "https://ex.com/login", "https://ex.com/")
 
 	if !slices.Contains(links, "https://ex.com/api/login") {
-		t.Errorf("expected resolved form action in links; got %v", links)
-	}
-	if !slices.Contains(links, "https://ex.com/rel") {
-		t.Errorf("expected relative form action in links; got %v", links)
+		t.Errorf("expected form action in links; got %v", links)
 	}
 	if slices.Contains(links, "https://ex.com/main.js") {
 		t.Errorf("asset form action wrongly queued; got %v", links)
 	}
 }
 
-// No-action forms must record pageURL as Action (HTML §4.10.21.3), not
-// baseURL. This is the QUAL-002 regression fix: previously, a login form
-// with no explicit action on /login with <base href="/"> would report
-// its endpoint as "/" instead of "/login".
+// No-action forms get Action=pageURL (HTML §4.10.21.3). This test pins
+// what happens in mergeEnrichedLinks once extractForms / resolveFormAction
+// has already set Action — the per-branch coverage of resolveFormAction
+// itself lives in TestResolveFormAction_NoActionUsesPageURL.
 func TestMergeEnrichedLinks_NoActionFormUsesPageURL(t *testing.T) {
 	// Simulate what extractForms emits when there's no action attribute:
 	// Action is set to pageURL, not baseURL.

@@ -126,18 +126,29 @@ func effectiveBaseURL(page *rod.Page, pageURL string) string {
 
 // effectiveBaseURLFrom is the pure URL-resolution logic behind
 // [effectiveBaseURL]. It resolves rawHref against pageURL and returns the
-// result when it is a usable HTTP(S) URL that does not downgrade the page's
-// transport; otherwise it returns pageURL unchanged. Inputs that are empty,
+// result when it is a usable HTTP(S) URL that passes both guards below;
+// otherwise it returns pageURL unchanged. Inputs that are empty,
 // whitespace-only, unparseable, or produce a non-http(s) scheme are treated
 // as absent.
 //
-// Scheme-downgrade guard (SEC-BE-001): an attacker-controlled in-scope page
-// that declares <base href="http://target.com/"> on an HTTPS crawl would
-// otherwise cause every relative ref on that page to resolve to http://…,
-// stripping TLS for subsequent requests. Those requests would carry any
-// operator-supplied headers (Authorization, cookies, CSRF tokens), leaking
-// them in plaintext. Reject http base refs when the page itself was served
-// over https. The reverse (https base on http page) is safe and allowed.
+// Scheme-downgrade guard: an attacker-controlled in-scope page that declares
+// <base href="http://target.com/"> on an HTTPS crawl would otherwise cause
+// every relative ref on that page to resolve to http://…, stripping TLS for
+// subsequent requests. Those requests would carry any operator-supplied
+// headers (Authorization, cookies, CSRF tokens), leaking them in plaintext.
+// Reject http base refs when the page itself was served over https. The
+// reverse (https base on http page) is safe and allowed.
+//
+// Cross-host guard: a <base href="https://attacker.com/"> on an in-scope
+// target.com page (injected via stored XSS or an attacker-owned subdomain)
+// must not re-anchor relative references to the attacker's host. Every
+// relative form action and every jsluice-extracted URL would otherwise
+// resolve to attacker.com, and because synthetic form ObservedRequests flow
+// into captured without a scope filter at this stage, those attacker-host
+// entries would poison capture.json and the downstream OpenAPI/GraphQL/WSDL
+// deliverable. Relative and root-relative bases (the LAB-2221 Juice Shop
+// <base href="/"> case) continue to work because ResolveReference produces a
+// same-host result in those cases.
 func effectiveBaseURLFrom(rawHref, pageURL string) string {
 	href := strings.TrimSpace(rawHref)
 	if href == "" {
@@ -156,6 +167,9 @@ func effectiveBaseURLFrom(rawHref, pageURL string) string {
 		return pageURL
 	}
 	if pageU.Scheme == "https" && resolved.Scheme == "http" {
+		return pageURL
+	}
+	if resolved.Host != "" && !strings.EqualFold(resolved.Host, pageU.Host) {
 		return pageURL
 	}
 	return resolved.String()
