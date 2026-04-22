@@ -124,7 +124,14 @@ func decodeTnetstringStream(r *bufio.Reader, depth int) (any, error) {
 // 1 MB means a truncated claim aborts after that initial allocation at most,
 // instead of the full claimed size; bytes.Buffer then grows on demand as
 // real data arrives.
-const streamInitialCap = 1 << 20 // 1 MB
+//
+// Declared as a var (not a const) so tests can lower the cap and exercise
+// the pre-grow boundary (at-cap accepted, over-cap grown via append) with
+// small crafted payloads. Production callers MUST treat this as read-only.
+// NOT PARALLEL-SAFE: mutation via withTempCap is not concurrency-safe, so
+// no caller may use t.Parallel(); see testhelpers_test.go::withTempCap for
+// the constraint.
+var streamInitialCap = 1 << 20 // 1 MB
 
 // readStreamPayload reads exactly `length` bytes into a fresh slice, growing
 // the buffer as bytes arrive so a truncated stream cannot amplify a bogus

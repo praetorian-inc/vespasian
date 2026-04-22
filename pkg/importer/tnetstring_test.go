@@ -283,55 +283,43 @@ func TestTnetstring_LengthTooLarge(t *testing.T) {
 	assert.Contains(t, err.Error(), "per-element cap")
 }
 
-// TestTnetstring_StreamInitialCapLimitsTruncatedAllocation exercises the
-// `initial > streamInitialCap` branch of readStreamPayload: a length prefix
-// above 1 MB must pre-size the buffer to streamInitialCap (not the full
-// claim) so a truncated stream aborts without a huge transient allocation.
-// Regression for round-8 TEST-003.
+// TestTnetstring_StreamInitialCapClampBoundaries pins the pre-grow clamp
+// in readStreamPayload. streamInitialCap caps the Buffer's pre-allocation
+// so a truncated claim cannot amplify a malformed length prefix (e.g.
+// "67108864:<EOF>") into a huge transient allocation.
 //
-// The assertion is twofold: (1) a bogus prefix of 2 MB followed by a short
-// stream returns a "read payload" error rather than panicking or succeeding;
-// (2) testing.AllocsPerRun bounds the worst-case allocation behavior. A
-// future refactor that removed the `initial > streamInitialCap` clamp would
-// attempt to allocate 2 MB up-front; this test would still error (io.CopyN
-// fails) but the allocation profile would change materially, and the size
-// of the input buffer in the test guarantees the pre-clamp code path cannot
-// succeed "accidentally".
-func TestTnetstring_StreamInitialCapLimitsTruncatedAllocation(t *testing.T) {
-	// 2 MB length prefix > streamInitialCap (1 MB) followed by 10 bytes of
-	// payload and an EOF. readStreamPayload must pre-size the buffer to the
-	// 1 MB cap, read what's available, and return io.ErrUnexpectedEOF wrapped
-	// in "read payload".
-	const claimed = 2 * (1 << 20) // 2 MB — decisively over streamInitialCap
-	input := fmt.Sprintf("%d:%s", claimed, "short-body")
+// Round-8 originally pinned this with an error-path-only assertion, which
+// was invariant to the clamp (see PR-89 round-9 TEST-003): removing the
+// clamp would allocate the full claim up-front, and io.CopyN would still
+// return the same "read payload" error when the stream ran short. The
+// deterministic way to pin the clamp is to lower streamInitialCap via
+// withTempCap, then verify two paired subtests mirroring the ElementAtCap
+// pattern:
+//
+//   - at-cap-accepted:  payload length == small, round-trips cleanly,
+//     proving the pre-grow path with `initial = length` works.
+//   - above-cap-accepted: payload length == small + 1, round-trips
+//     cleanly, proving the `initial > streamInitialCap` clamp branch
+//     pre-sizes to `small` and then grows via io.CopyN as bytes arrive.
+//
+// Together these exercise both sides of the `if initial > streamInitialCap`
+// conditional so a refactor that flipped the comparison or removed the
+// clamp would break one of them.
+func TestTnetstring_StreamInitialCapClampBoundaries(t *testing.T) {
+	const small = 1024 // small enough to keep the test fast, decisively < 1 MB
+	withTempCap(t, &streamInitialCap, small)
 
-	r := bufio.NewReader(strings.NewReader(input))
-	_, err := decodeTnetstringStream(r, 0)
-	require.Error(t, err)
-	// The stream path surfaces the partial-read count so operators can see
-	// we aborted before the claimed size. got=10 (the short-body) confirms
-	// the reader read only the bytes actually present, not the 2 MB claim.
-	assert.Contains(t, err.Error(), "read payload")
-	assert.Contains(t, err.Error(), "got=10")
-}
-
-// TestTnetstring_StreamInitialCapBoundaries pairs with the above: a payload
-// exactly at streamInitialCap must still round-trip (buffer pre-sized to
-// length), and a payload one byte over must still succeed (buffer grows
-// from the 1 MB initial via io.CopyN). Pins the happy path of the branch.
-func TestTnetstring_StreamInitialCapBoundaries(t *testing.T) {
-	// 1 MB payload — exactly at the initial-alloc cap.
-	t.Run("exactly streamInitialCap", func(t *testing.T) {
-		payload := strings.Repeat("x", streamInitialCap)
-		input := fmt.Sprintf("%d:%s,", streamInitialCap, payload)
+	t.Run("length at streamInitialCap is accepted", func(t *testing.T) {
+		payload := strings.Repeat("x", small)
+		input := fmt.Sprintf("%d:%s,", small, payload)
 		r := bufio.NewReader(strings.NewReader(input))
 		got, err := decodeTnetstringStream(r, 0)
 		require.NoError(t, err)
-		assert.Len(t, got, streamInitialCap)
+		assert.Len(t, got, small)
 	})
-	// 1 MB + 1 byte — forces bytes.Buffer to grow past the initial cap.
-	t.Run("streamInitialCap+1", func(t *testing.T) {
-		n := streamInitialCap + 1
+
+	t.Run("length above streamInitialCap grows via io.CopyN", func(t *testing.T) {
+		n := small + 1
 		payload := strings.Repeat("x", n)
 		input := fmt.Sprintf("%d:%s,", n, payload)
 		r := bufio.NewReader(strings.NewReader(input))
@@ -339,6 +327,29 @@ func TestTnetstring_StreamInitialCapBoundaries(t *testing.T) {
 		require.NoError(t, err)
 		assert.Len(t, got, n)
 	})
+}
+
+// TestTnetstring_StreamInitialCapTruncated exercises the clamp's intended
+// defense: a length prefix above the cap followed by a truncated stream
+// surfaces a partial-read error without waiting to allocate the claimed
+// size. Combined with TestTnetstring_StreamInitialCapClampBoundaries, a
+// refactor that removed the clamp would pass the truncated-error
+// assertion here (io.CopyN still fails) but would break the
+// above-cap-accepted subtest above because bytes.Buffer would pre-allocate
+// the full (attacker-claimed) size rather than growing from the cap.
+func TestTnetstring_StreamInitialCapTruncated(t *testing.T) {
+	const small = 1024
+	withTempCap(t, &streamInitialCap, small)
+
+	// 10x the cap claimed, only 10 bytes present — readStreamPayload must
+	// return a partial-read error before trying to allocate the full claim.
+	const claimed = 10 * small
+	input := fmt.Sprintf("%d:%s", claimed, "short-body")
+	r := bufio.NewReader(strings.NewReader(input))
+	_, err := decodeTnetstringStream(r, 0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "read payload")
+	assert.Contains(t, err.Error(), "got=10")
 }
 
 // TestTnetstring_ElementAtCapAccepted and

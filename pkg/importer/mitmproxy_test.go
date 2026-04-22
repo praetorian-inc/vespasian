@@ -1210,6 +1210,46 @@ func TestMitmproxyImporter_Native_ContentWrongTypeDroppedSilently(t *testing.T) 
 	assert.Nil(t, requests[0].Body)
 }
 
+// TestMitmproxyImporter_Native_StatusCodeWrongTypeSilentZero pins the
+// Import-boundary contract for wrong-typed response.status_code fields.
+// tnetInt64 returns 0 for any non-int64 value (pinned in isolation by
+// TestTnetInt64_OnlyAcceptsInt64); this test locks the end-to-end behavior:
+// a flow whose status_code is bytes/string/float imports successfully with
+// StatusCode==0 rather than erroring. A future tightening of tnetInt64 to
+// return an error for wrong types would silently change importer behavior;
+// this test is the guard at the Import seam.
+func TestMitmproxyImporter_Native_StatusCodeWrongTypeSilentZero(t *testing.T) {
+	// Build the flow with status_code as bytes rather than int. flowState
+	// would route through int64, so splice the raw dict to keep the
+	// attacker-controlled type.
+	request := tnetDictElement(
+		tnetBytesElement("method"), tnetBytesElement("GET"),
+		tnetBytesElement("scheme"), tnetBytesElement("https"),
+		tnetBytesElement("host"), tnetBytesElement("example.com"),
+		tnetBytesElement("port"), []byte("3:443#"),
+		tnetBytesElement("path"), tnetBytesElement("/api"),
+		tnetBytesElement("content"), []byte("0:~"),
+		tnetBytesElement("headers"), buildElement(nil, ']'),
+	)
+	response := tnetDictElement(
+		tnetBytesElement("status_code"), tnetBytesElement("200"), // bytes, not int64
+		tnetBytesElement("headers"), buildElement(nil, ']'),
+		tnetBytesElement("content"), []byte("0:~"),
+	)
+	flowEnc := tnetDictElement(
+		tnetBytesElement("type"), tnetBytesElement("http"),
+		tnetBytesElement("id"), tnetBytesElement("sc1"),
+		tnetBytesElement("request"), request,
+		tnetBytesElement("response"), response,
+	)
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(bytes.NewReader(flowEnc))
+	require.NoError(t, err, "wrong-type status_code must be silently zeroed, not errored")
+	require.Len(t, requests, 1)
+	assert.Equal(t, 0, requests[0].Response.StatusCode)
+}
+
 // TestMitmproxyImporter_Native_StringTypeInHeaderValue exercises the
 // tnetstring `;` (UTF-8 string) type through an integration path. The
 // shared encoder emits bytes (`,`) for all strings, so this test builds the

@@ -390,22 +390,18 @@ func previewString(s string) string {
 // defaulting to 0 would produce URLs like "https://example.com:0/" for
 // malformed captures, which is worse than a clear import failure.
 //
-// float64 is deliberately NOT accepted even though the sibling tnetInt64
-// helper coerces it: mitmproxy's HTTPFlow.get_state() always emits port as
-// a tnetstring int (`#` type), never a float (`^`), and a float here almost
-// certainly means a malformed or hand-crafted capture. Silently rounding
-// 443.5 → 443 would mask a real data-integrity problem.
+// Only int64 is accepted (matching tnetInt64's narrowed contract, round-7).
+// The tnetstring decoder always emits int64 for `#`-type elements, so
+// accepting plain int or float64 would only mask schema drift or a
+// hand-crafted capture — silently rounding 443.5 → 443 would hide real
+// data-integrity problems, and int vs int64 is a decoder-internal detail
+// that production code should never see.
 func requirePort(v any) (int, error) {
 	if v == nil {
 		return 0, fmt.Errorf("flow missing \"port\" field")
 	}
-	var n int64
-	switch x := v.(type) {
-	case int64:
-		n = x
-	case int:
-		n = int64(x)
-	default:
+	n, ok := v.(int64)
+	if !ok {
 		return 0, fmt.Errorf("flow \"port\" is %T, want integer", v)
 	}
 	if n < 0 || n > 65535 {
