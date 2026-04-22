@@ -194,7 +194,7 @@ func decodeTnetstringInner(r *bytes.Reader, depth int) (any, error) {
 // For the stream-level caller the two bounds coincide (`maxLen ==
 // maxTnetstringElement`), making the second check redundant in that one
 // code path; the duplication is intentional defense-in-depth.
-func readLengthPrefix(r io.ByteReader, maxLen int) (int, error) {
+func readLengthPrefix(r io.ByteReader, maxLen int) (int, error) { //nolint:gocyclo // length prefix validation
 	digits := make([]byte, 0, maxLengthPrefixDigits)
 	for {
 		b, err := r.ReadByte()
@@ -235,7 +235,7 @@ func readLengthPrefix(r io.ByteReader, maxLen int) (int, error) {
 	return length, nil
 }
 
-func parseTnetPayload(t tnetType, payload []byte, depth int) (any, error) {
+func parseTnetPayload(t tnetType, payload []byte, depth int) (any, error) { //nolint:gocyclo // tnetstring type dispatch
 	switch t {
 	case tnetBytes:
 		// payload is freshly allocated by the caller

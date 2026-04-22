@@ -673,7 +673,7 @@ func TestMitmproxyImporter_InvalidMethod(t *testing.T) {
 	m := &MitmproxyImporter{}
 	_, err := m.Import(strings.NewReader(json))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid HTTP method: INVALID")
+	assert.Contains(t, err.Error(), `invalid HTTP method: "INVALID"`)
 }
 
 // ─── Native (tnetstring) flow format ──────────────────────────────────────────
@@ -1726,4 +1726,86 @@ func TestMitmproxyImporter_BuildRequestPath_EmptyPathFallsBackToRoot(t *testing.
 	require.Len(t, requests, 1)
 	// Path falls back to "/" — authority is already reflected in host/port.
 	assert.Equal(t, "https://example.com/", requests[0].URL)
+}
+
+// TestPreviewString_AtCapNoTruncation and _AtCapPlusOneTruncated pin the
+// exact maxPreviewLen boundary for previewString. Round-10 TEST-001: the
+// pre-existing "<256 bytes" bounded-error assertions would still pass if the
+// constant silently drifted (32 or 128 bytes would both pass). These two
+// tests make maxPreviewLen itself load-bearing for the test suite.
+func TestPreviewString_AtCapNoTruncation(t *testing.T) {
+	body := strings.Repeat("a", maxPreviewLen)
+	got := previewString(body)
+	// %q-quoted, no length suffix: every ASCII letter survives as-is so
+	// the quoted form is `"aaa..."` (maxPreviewLen a's + 2 quote bytes).
+	want := fmt.Sprintf("%q", body)
+	assert.Equal(t, want, got)
+	assert.NotContains(t, got, "bytes total",
+		"input at cap must not be annotated with a length suffix")
+}
+
+func TestPreviewString_AtCapPlusOneTruncated(t *testing.T) {
+	body := strings.Repeat("a", maxPreviewLen+1)
+	got := previewString(body)
+	// Truncated form: quoted prefix of exactly maxPreviewLen bytes + the
+	// "... (N bytes total)" annotation carrying the true length.
+	wantPrefix := fmt.Sprintf("%q", body[:maxPreviewLen])
+	assert.True(t, strings.HasPrefix(got, wantPrefix),
+		"expected truncated preview to start with %s, got %s", wantPrefix, got)
+	assert.Contains(t, got, fmt.Sprintf("(%d bytes total)", maxPreviewLen+1))
+}
+
+// TestPreviewString_QuotesControlBytes pins SEC-BE-001: a crafted method
+// /scheme containing ANSI escape or other control bytes must be Go-escaped
+// in the error string so it cannot clear the operator's terminal or poison
+// log parsers. This is what `%q` gives us; `%s` would pass these through.
+func TestPreviewString_QuotesControlBytes(t *testing.T) {
+	// ESC (\x1b) + "[2J" is the xterm "clear screen" sequence.
+	got := previewString("FOO\x1b[2J")
+	// %q-encodes \x1b as \x1b literal (i.e. the four characters \, x, 1, b),
+	// never as the actual ESC byte.
+	assert.Contains(t, got, `\x1b`)
+	assert.NotContains(t, got, "\x1b",
+		"raw ESC byte must not appear in preview output")
+}
+
+// TestMitmproxyImporter_Native_ConstructURLPreservesPercentEncoding pins
+// QUAL-002: mitmproxy stores the wire request target verbatim in the `path`
+// field, so pre-encoded bytes like `%20` must survive unchanged into
+// ObservedRequest.URL. The pre-fix code assigned pathPart to u.Path, and
+// url.URL.String() then ran its own escaping, double-encoding `%20` to
+// `%2520`. Pins the paired Path/RawPath assignment in constructURL.
+func TestMitmproxyImporter_Native_ConstructURLPreservesPercentEncoding(t *testing.T) {
+	state := flowState(
+		"GET", "https", "example.com", 443, "/api/hello%20world",
+		nil, nil, 200, nil, nil,
+	)
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(bytes.NewReader(encodeTnet(state)))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	// The pre-fix output was "https://example.com/api/hello%2520world".
+	assert.Equal(t, "https://example.com/api/hello%20world", requests[0].URL)
+	assert.NotContains(t, requests[0].URL, "%2520",
+		"percent sign must not be double-encoded")
+}
+
+// TestMitmproxyImporter_Native_ConstructURLWithQueryString checks the
+// sibling case for pre-encoded bytes in the path half when the `path` field
+// also carries a query string. strings.Cut splits on the first `?`, so
+// encoding discipline must hold for the path half even when query is
+// present.
+func TestMitmproxyImporter_Native_ConstructURLWithQueryString(t *testing.T) {
+	state := flowState(
+		"GET", "https", "example.com", 443, "/api/hello%20world?q=foo+bar",
+		nil, nil, 200, nil, nil,
+	)
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(bytes.NewReader(encodeTnet(state)))
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	assert.Equal(t, "https://example.com/api/hello%20world?q=foo+bar", requests[0].URL)
+	assert.NotContains(t, requests[0].URL, "%2520")
 }

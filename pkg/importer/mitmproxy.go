@@ -110,39 +110,33 @@ func (i *MitmproxyImporter) Import(r io.Reader) ([]crawl.ObservedRequest, error)
 //
 // Memory efficiency (S3 fix): Uses streaming json.NewDecoder instead of io.ReadAll
 // to avoid allocating the entire input as a raw byte buffer (up to 500MB).
-func (i *MitmproxyImporter) importJSON(bufReader *bufio.Reader, limitedReader *limitedReader, firstByte byte) ([]crawl.ObservedRequest, error) { //nolint:gocyclo // format parsing
+func (i *MitmproxyImporter) importJSON(bufReader *bufio.Reader, limitedReader *limitedReader, firstByte byte) ([]crawl.ObservedRequest, error) {
 	decoder := json.NewDecoder(bufReader)
-	var requests []crawl.ObservedRequest
-
 	switch firstByte {
 	case '[':
-		if _, err := decoder.Token(); err != nil {
-			if limitedReader.hitLimit {
-				return nil, ErrFileTooLarge
-			}
-			return nil, fmt.Errorf("mitmproxy importer: failed to read array start: %w", err)
-		}
-		for decoder.More() {
-			var flow mitmproxyFlow
-			if err := decoder.Decode(&flow); err != nil {
-				if limitedReader.hitLimit {
-					return nil, ErrFileTooLarge
-				}
-				return nil, fmt.Errorf("mitmproxy importer: failed to decode flow: %w", err)
-			}
-			req, err := i.parseFlow(flow)
-			if err != nil {
-				return nil, fmt.Errorf("mitmproxy importer: %w", err)
-			}
-			requests = append(requests, req)
-		}
-		if _, err := decoder.Token(); err != nil {
-			if limitedReader.hitLimit {
-				return nil, ErrFileTooLarge
-			}
-			return nil, fmt.Errorf("mitmproxy importer: failed to read array end: %w", err)
-		}
+		return i.parseJSONArray(decoder, limitedReader)
 	case '{':
+		return i.parseJSONObject(decoder, limitedReader)
+	default:
+		// Defensive: Import's dispatch guarantees firstByte is '[' or '{'.
+		// Surfacing an explicit error here prevents a silent (nil, nil)
+		// return if a future refactor accidentally routes other bytes here.
+		return nil, fmt.Errorf("mitmproxy importer: importJSON called with unexpected first byte %q", firstByte)
+	}
+}
+
+// parseJSONArray decodes an array of mitmproxy flows ("[{...},{...}]"). The
+// decoder has not yet consumed the opening '[' — Token() reads and validates
+// it, then the loop decodes each element until ']'.
+func (i *MitmproxyImporter) parseJSONArray(decoder *json.Decoder, limitedReader *limitedReader) ([]crawl.ObservedRequest, error) {
+	if _, err := decoder.Token(); err != nil {
+		if limitedReader.hitLimit {
+			return nil, ErrFileTooLarge
+		}
+		return nil, fmt.Errorf("mitmproxy importer: failed to read array start: %w", err)
+	}
+	var requests []crawl.ObservedRequest
+	for decoder.More() {
 		var flow mitmproxyFlow
 		if err := decoder.Decode(&flow); err != nil {
 			if limitedReader.hitLimit {
@@ -154,15 +148,32 @@ func (i *MitmproxyImporter) importJSON(bufReader *bufio.Reader, limitedReader *l
 		if err != nil {
 			return nil, fmt.Errorf("mitmproxy importer: %w", err)
 		}
-		requests = []crawl.ObservedRequest{req}
-	default:
-		// Defensive: Import's dispatch guarantees firstByte is '[' or '{'.
-		// Surfacing an explicit error here prevents a silent (nil, nil)
-		// return if a future refactor accidentally routes other bytes here.
-		return nil, fmt.Errorf("mitmproxy importer: importJSON called with unexpected first byte %q", firstByte)
+		requests = append(requests, req)
 	}
-
+	if _, err := decoder.Token(); err != nil {
+		if limitedReader.hitLimit {
+			return nil, ErrFileTooLarge
+		}
+		return nil, fmt.Errorf("mitmproxy importer: failed to read array end: %w", err)
+	}
 	return requests, nil
+}
+
+// parseJSONObject decodes a single-flow JSON document ("{...}"). Decode reads
+// the whole object in one call, so no separate Token() bracketing is needed.
+func (i *MitmproxyImporter) parseJSONObject(decoder *json.Decoder, limitedReader *limitedReader) ([]crawl.ObservedRequest, error) {
+	var flow mitmproxyFlow
+	if err := decoder.Decode(&flow); err != nil {
+		if limitedReader.hitLimit {
+			return nil, ErrFileTooLarge
+		}
+		return nil, fmt.Errorf("mitmproxy importer: failed to decode flow: %w", err)
+	}
+	req, err := i.parseFlow(flow)
+	if err != nil {
+		return nil, fmt.Errorf("mitmproxy importer: %w", err)
+	}
+	return []crawl.ObservedRequest{req}, nil
 }
 
 // maxNativeFlows caps the total number of flow records (HTTP + skipped) that
@@ -374,15 +385,18 @@ func tnetInt64(v any) int64 {
 	return 0
 }
 
-// previewString renders up to maxPreviewLen (helpers.go) bytes of s
-// verbatim; longer inputs are truncated and annotated with the original byte
+// previewString renders up to maxPreviewLen (helpers.go) bytes of s using %q
+// quoting; longer inputs are truncated and annotated with the original byte
 // length so the operator still sees "this was enormous" without pasting
-// megabytes into a log.
+// megabytes into a log. %q-quoting escapes control bytes (ANSI escapes, NUL,
+// etc.) so a crafted method or scheme cannot clear the operator's terminal,
+// recolor output, or poison log parsers when the error string is rendered —
+// aligning with payloadPreview's quoting discipline in tnetstring.go.
 func previewString(s string) string {
 	if len(s) <= maxPreviewLen {
-		return s
+		return fmt.Sprintf("%q", s)
 	}
-	return fmt.Sprintf("%s... (%d bytes total)", s[:maxPreviewLen], len(s))
+	return fmt.Sprintf("%q... (%d bytes total)", s[:maxPreviewLen], len(s))
 }
 
 // requirePort extracts a mitmproxy `port` field that MUST be a tnetstring
@@ -528,14 +542,28 @@ func nilIfEmpty(b []byte) []byte {
 }
 
 // constructURL builds URL from mitmproxy components using url.URL struct.
+//
+// mitmproxy stores the verbatim wire request target in `path` (per
+// HTTPFlow.get_state()), so pathPart is expected to already be RFC 3986
+// percent-encoded. Assigning it to u.Path alone would cause url.URL.String()
+// to re-encode any `%` characters, double-encoding sequences like
+// `/api/hello%20world` into `/api/hello%2520world`. Setting both u.Path
+// (decoded) and u.RawPath (verbatim) makes EscapedPath() emit the wire form
+// unchanged; if the path isn't well-formed percent-encoding, we fall back to
+// Path-only and let url.URL handle it.
 func constructURL(scheme, host string, port int, path string) string {
 	pathPart, query, _ := strings.Cut(path, "?")
 
 	u := &url.URL{
 		Scheme:   scheme,
 		Host:     host,
-		Path:     pathPart,
 		RawQuery: query,
+	}
+	if decoded, err := url.PathUnescape(pathPart); err == nil {
+		u.Path = decoded
+		u.RawPath = pathPart
+	} else {
+		u.Path = pathPart
 	}
 
 	isDefaultPort := (scheme == "https" && port == 443) || (scheme == "http" && port == 80)

@@ -17,13 +17,14 @@ package importer
 import "net/url"
 
 // maxPreviewLen caps how many bytes of an attacker-controlled string we embed
-// verbatim into an error message, shared by the mitmproxy importer's
-// previewString (for method/scheme) and the tnetstring decoder's
-// payloadPreview (for element payloads). Without the bound, a crafted
-// `.mitm` file could write up to 64 MB into the operator's terminal or CI
-// log before the importer aborts. The two helpers keep separate signatures
-// (string vs []byte, %s vs %q quoting) but must cap at the same length so a
-// future bound change applies uniformly.
+// into an error message, shared by the mitmproxy importer's previewString
+// (for method/scheme) and the tnetstring decoder's payloadPreview (for
+// element payloads). Without the bound, a crafted `.mitm` file could write
+// up to 64 MB into the operator's terminal or CI log before the importer
+// aborts. The two helpers keep separate signatures (string vs []byte) but
+// both use %q quoting so control bytes are Go-escaped rather than rendered
+// verbatim — a crafted ANSI sequence in method/scheme cannot recolor output
+// or clear the screen when the error string is printed.
 const maxPreviewLen = 64
 
 // extractQueryParams parses query parameters from a URL string.

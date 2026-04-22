@@ -578,3 +578,116 @@ func TestTnetstring_DictElementCountCap_AboveCapRejected(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "dict exceeds")
 }
+
+// TestTnetstring_ListAtCap_Accepted and _AtCapPlusOne_Rejected pin the
+// exact cardinality boundary for parseTnetList. The cap check
+// `len(result) >= maxTnetstringElements` fires only when the loop re-enters
+// with another element still to decode, so:
+//
+//   - exactly `cap` elements are accepted (loop exits when r.Len() reaches 0
+//     immediately after the cap-th append, never re-checking the guard);
+//   - exactly `cap+1` elements are rejected (after cap appends, r.Len() > 0,
+//     the top-of-loop guard sees len==cap and errors).
+//
+// Round-10 TEST-002: a `>=`→`>` refactor would loosen the cap by one and
+// pass existing above-cap (cap+5) and below-cap (cap/10000) tests — only
+// this paired at-cap + at-cap+1 coverage pins the operator.
+func TestTnetstring_ListAtCap_Accepted(t *testing.T) {
+	const lowered = 10
+	withTempCap(t, &maxTnetstringElements, lowered)
+
+	// Exactly cap minimal empty-bytes elements. After the cap-th append
+	// r.Len() reaches 0 and the loop exits before re-checking the guard.
+	var body bytes.Buffer
+	for i := 0; i < lowered; i++ {
+		body.WriteString("0:,")
+	}
+	listEncoded := buildElement(body.Bytes(), ']')
+
+	r := bufio.NewReader(bytes.NewReader(listEncoded))
+	got, err := decodeTnetstringStream(r, 0)
+	require.NoError(t, err, "cap entries must decode successfully")
+	require.Len(t, got.([]any), lowered)
+}
+
+func TestTnetstring_ListAtCapPlusOne_Rejected(t *testing.T) {
+	const lowered = 10
+	withTempCap(t, &maxTnetstringElements, lowered)
+
+	// Exactly cap+1 elements: after cap appends, one element still remains
+	// to be decoded; the `len(result) >= cap` guard rejects on the next
+	// iteration before decoding it.
+	var body bytes.Buffer
+	for i := 0; i < lowered+1; i++ {
+		body.WriteString("0:,")
+	}
+	listEncoded := buildElement(body.Bytes(), ']')
+
+	r := bufio.NewReader(bytes.NewReader(listEncoded))
+	_, err := decodeTnetstringStream(r, 0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "list exceeds")
+}
+
+// TestTnetstring_DictAtCap_Accepted / _AtCapPlusOne_Rejected mirror the
+// list pair for parseTnetDict, which counts pairsParsed (not unique keys)
+// against the same cap. Paired at-cap coverage catches off-by-one refactors
+// that the existing above-cap (cap+2) test would pass silently.
+func TestTnetstring_DictAtCap_Accepted(t *testing.T) {
+	const lowered = 10
+	withTempCap(t, &maxTnetstringElements, lowered)
+
+	// Exactly cap unique key/value pairs.
+	var body bytes.Buffer
+	for i := 0; i < lowered; i++ {
+		fmt.Fprintf(&body, "1:%c,1:v,", 'a'+byte(i))
+	}
+	dictEncoded := buildElement(body.Bytes(), '}')
+
+	r := bufio.NewReader(bytes.NewReader(dictEncoded))
+	got, err := decodeTnetstringStream(r, 0)
+	require.NoError(t, err, "cap pairs must decode successfully")
+	require.Len(t, got.(map[string]any), lowered)
+}
+
+func TestTnetstring_DictAtCapPlusOne_Rejected(t *testing.T) {
+	const lowered = 10
+	withTempCap(t, &maxTnetstringElements, lowered)
+
+	// Exactly cap+1 pairs: parseTnetDict's pairsParsed >= cap guard fires
+	// when the loop re-enters after the cap-th pair with more bytes left.
+	var body bytes.Buffer
+	for i := 0; i < lowered+1; i++ {
+		fmt.Fprintf(&body, "1:%c,1:v,", 'a'+byte(i))
+	}
+	dictEncoded := buildElement(body.Bytes(), '}')
+
+	r := bufio.NewReader(bytes.NewReader(dictEncoded))
+	_, err := decodeTnetstringStream(r, 0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "dict exceeds")
+}
+
+// TestPayloadPreview_AtCapNoTruncation and _AtCapPlusOneTruncated pin the
+// exact maxPreviewLen boundary for payloadPreview. Mirrors the
+// previewString pair in mitmproxy_test.go; together they make the preview
+// constant itself load-bearing for the error-shape test suite. Round-10
+// TEST-001.
+func TestPayloadPreview_AtCapNoTruncation(t *testing.T) {
+	body := bytes.Repeat([]byte{'a'}, maxPreviewLen)
+	got := payloadPreview(body)
+	// %q-quoted, no length suffix.
+	want := fmt.Sprintf("%q", body)
+	assert.Equal(t, want, got)
+	assert.NotContains(t, got, "bytes total",
+		"payload at cap must not be annotated with a length suffix")
+}
+
+func TestPayloadPreview_AtCapPlusOneTruncated(t *testing.T) {
+	body := bytes.Repeat([]byte{'a'}, maxPreviewLen+1)
+	got := payloadPreview(body)
+	wantPrefix := fmt.Sprintf("%q", body[:maxPreviewLen])
+	assert.True(t, strings.HasPrefix(got, wantPrefix),
+		"expected truncated payload preview to start with %s, got %s", wantPrefix, got)
+	assert.Contains(t, got, fmt.Sprintf("(%d bytes total)", maxPreviewLen+1))
+}
