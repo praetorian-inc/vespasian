@@ -15,8 +15,11 @@
 package crawl
 
 import (
+	"errors"
 	"strings"
 	"testing"
+
+	"github.com/go-rod/rod/lib/proto"
 )
 
 func TestExtractCookieHeader(t *testing.T) {
@@ -190,6 +193,17 @@ func TestParseCookiesToParams(t *testing.T) {
 			cookieValue: "flag",
 			wantCount:   1,
 		},
+		// TEST-003 regression: a cookie pair whose name is empty (e.g. "=orphan")
+		// is silently skipped by ParseCookiesToParams. The existing
+		// "whitespace-only pairs" case covers the trimmed-empty branch, but no
+		// test asserts the "valued pair with empty name" branch explicitly. A
+		// refactor that changed the silent skip to an error would not be caught.
+		{
+			name:        "pair with empty name silently skipped",
+			cookieValue: "=orphan; valid=yes",
+			targetURL:   "https://example.com",
+			wantCount:   1,
+		},
 	}
 
 	for _, tt := range tests {
@@ -282,5 +296,152 @@ func TestParseCookiesToParams_MultipleCookies(t *testing.T) {
 	}
 	if names["theme"] != "dark" {
 		t.Errorf("theme = %q, want %q", names["theme"], "dark")
+	}
+}
+
+// TEST-004/005 regression: ApplyCookieHeader is the pipeline behind the
+// LAB-2222 fix. These tests pin the wiring (extract → parse → inject)
+// in the default build tag so a refactor that stops calling the
+// injector, or forgets to strip Cookie from engine headers, fails
+// here instead of requiring the //go:build integration suite to run.
+
+func TestApplyCookieHeader_CookiePresent_InjectsAndStripsHeader(t *testing.T) {
+	var injected [][]*proto.NetworkCookieParam
+	inject := func(params []*proto.NetworkCookieParam) error {
+		injected = append(injected, params)
+		return nil
+	}
+	headers := map[string]string{
+		"Cookie":        "JSESSIONID=abc123",
+		"Authorization": "Bearer tok",
+		"X-Custom":      "v",
+	}
+
+	extra, err := ApplyCookieHeader(headers, "https://target.example/app", inject)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(injected) != 1 {
+		t.Fatalf("inject called %d times, want 1", len(injected))
+	}
+	if len(injected[0]) != 1 {
+		t.Fatalf("got %d cookies, want 1", len(injected[0]))
+	}
+	if injected[0][0].Name != "JSESSIONID" || injected[0][0].Value != "abc123" {
+		t.Errorf("got cookie %q=%q, want JSESSIONID=abc123", injected[0][0].Name, injected[0][0].Value)
+	}
+	if _, present := extra["Cookie"]; present {
+		t.Error("Cookie header leaked into engine extra headers — would be doubly injected")
+	}
+	if extra["Authorization"] != "Bearer tok" {
+		t.Errorf("Authorization stripped: extra=%v", extra)
+	}
+	if extra["X-Custom"] != "v" {
+		t.Errorf("unrelated header stripped: extra=%v", extra)
+	}
+}
+
+func TestApplyCookieHeader_NoCookie_InjectorNotCalled(t *testing.T) {
+	called := false
+	inject := func([]*proto.NetworkCookieParam) error {
+		called = true
+		return nil
+	}
+	headers := map[string]string{"Authorization": "Bearer tok"}
+
+	extra, err := ApplyCookieHeader(headers, "https://target.example/", inject)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if called {
+		t.Error("injector called even though no Cookie header present")
+	}
+	if extra["Authorization"] != "Bearer tok" {
+		t.Errorf("Authorization header dropped: extra=%v", extra)
+	}
+}
+
+func TestApplyCookieHeader_ParseError_Wrapped(t *testing.T) {
+	inject := func([]*proto.NetworkCookieParam) error {
+		t.Fatal("injector must not be called when parse fails")
+		return nil
+	}
+	headers := map[string]string{"Cookie": "JSESSIONID=abc"}
+
+	_, err := ApplyCookieHeader(headers, ":://invalid-url", inject)
+	if err == nil {
+		t.Fatal("expected parse error, got nil")
+	}
+	if !strings.HasPrefix(err.Error(), "parse cookies:") {
+		t.Errorf("want error prefix 'parse cookies:', got %q", err.Error())
+	}
+}
+
+func TestApplyCookieHeader_InjectError_Wrapped(t *testing.T) {
+	injectErr := errors.New("boom from CDP")
+	inject := func([]*proto.NetworkCookieParam) error {
+		return injectErr
+	}
+	headers := map[string]string{"Cookie": "JSESSIONID=abc"}
+
+	_, err := ApplyCookieHeader(headers, "https://target.example/", inject)
+	if err == nil {
+		t.Fatal("expected inject error, got nil")
+	}
+	if !strings.HasPrefix(err.Error(), "inject cookies:") {
+		t.Errorf("want error prefix 'inject cookies:', got %q", err.Error())
+	}
+	if !errors.Is(err, injectErr) {
+		t.Errorf("want wrapped inject error, got %v", err)
+	}
+}
+
+func TestApplyCookieHeader_CaseInsensitiveCookieKey(t *testing.T) {
+	// Mirror TEST-002's concern on ExtractCookieHeader: lowercase "cookie"
+	// must also trigger extract+inject, not leak into engine headers.
+	called := false
+	inject := func(params []*proto.NetworkCookieParam) error {
+		called = true
+		if len(params) != 1 || params[0].Name != "JSESSIONID" {
+			t.Errorf("unexpected cookies passed to inject: %v", params)
+		}
+		return nil
+	}
+	headers := map[string]string{"cookie": "JSESSIONID=abc"}
+
+	extra, err := ApplyCookieHeader(headers, "https://target.example/", inject)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !called {
+		t.Error("lowercase cookie header did not trigger injector")
+	}
+	if _, present := extra["cookie"]; present {
+		t.Error("lowercase cookie header leaked into engine extra headers")
+	}
+}
+
+// TEST-002 regression: ExtractCookieHeader documents that concatenation of
+// differently-cased Cookie keys is deterministic across runs (the
+// implementation sorts keys before iterating). Without a test that mixes
+// casings, removing the sort would not cause any existing test to fail
+// deterministically — only flake over many runs. Pin the contract.
+func TestExtractCookieHeader_DeterministicSortedConcat(t *testing.T) {
+	headers := map[string]string{
+		"Cookie": "a=1",
+		"cookie": "b=2",
+	}
+	// Run the extraction many times — if the sort were removed, Go map
+	// iteration randomization would surface a mismatched order within a
+	// few hundred iterations.
+	for i := 0; i < 200; i++ {
+		got, remaining := ExtractCookieHeader(headers)
+		// "Cookie" sorts before "cookie" in byte order (uppercase first).
+		if got != "a=1; b=2" {
+			t.Fatalf("iter %d: got %q, want %q", i, got, "a=1; b=2")
+		}
+		if len(remaining) != 0 {
+			t.Fatalf("iter %d: remaining = %v, want empty", i, remaining)
+		}
 	}
 }

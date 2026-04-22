@@ -122,6 +122,9 @@ func (b *BrowserManager) cleanup() {
 // Close kills Chrome (if still running) and cleans up resources. Intended
 // for use with defer in the normal (non-signal) path.
 func (b *BrowserManager) Close() {
+	if b.browser != nil {
+		_ = b.browser.Close() // best-effort; process may already be dead
+	}
 	b.Kill()
 	b.cleanup()
 }

@@ -370,7 +370,9 @@ func TestCrawler_CookieHeaderPropagatesAcrossRedirects(t *testing.T) {
 	// propagates to the redirect follow-up.
 	seenProtected := false
 	for _, r := range results {
-		if r.URL == srv.URL+"/protected" && r.Response.StatusCode == 200 {
+		if r.URL == srv.URL+"/protected" &&
+			r.Response.StatusCode == 200 &&
+			strings.Contains(string(r.Response.Body), "Protected content") {
 			seenProtected = true
 			break
 		}

@@ -144,15 +144,11 @@ func (c *Crawler) crawlHeadless(ctx context.Context, targetURL string, maxPages 
 	// survive server-side redirects (e.g., Spring Security's 302→/login on
 	// WebGoat strips the JSESSIONID, breaking session auth). Cookies in
 	// Chrome's own store persist across redirects, new tabs, and fetches.
-	cookieValue, extraHeaders := ExtractCookieHeader(c.opts.Headers)
-	if cookieValue != "" {
-		params, cerr := ParseCookiesToParams(targetURL, cookieValue)
-		if cerr != nil {
-			return nil, fmt.Errorf("parse cookies: %w", cerr)
-		}
-		if serr := browserMgr.SetCookies(params); serr != nil {
-			return nil, fmt.Errorf("inject cookies: %w", serr)
-		}
+	// See ApplyCookieHeader for the extract/parse/inject pipeline and
+	// cookies_test.go for the wiring coverage.
+	extraHeaders, err := ApplyCookieHeader(c.opts.Headers, targetURL, browserMgr.SetCookies)
+	if err != nil {
+		return nil, err
 	}
 
 	engine, err := newRodEngine(browserMgr.wsURL(), engineOptions{

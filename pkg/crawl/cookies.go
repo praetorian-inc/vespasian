@@ -110,3 +110,37 @@ func ParseCookiesToParams(targetURL, cookieValue string) ([]*proto.NetworkCookie
 
 	return params, nil
 }
+
+// CookieInjector installs cookies into a browser's cookie store. The
+// production implementation is BrowserManager.SetCookies; tests pass a
+// spy. The signature mirrors rod.Browser.SetCookies so production
+// callers can pass it as a method value (browserMgr.SetCookies).
+type CookieInjector func(cookies []*proto.NetworkCookieParam) error
+
+// ApplyCookieHeader is the full pipeline behind the LAB-2222 fix:
+// (1) strip Cookie from headers via ExtractCookieHeader,
+// (2) parse the cookie value into NetworkCookieParams,
+// (3) install them via inject (typically BrowserManager.SetCookies).
+// It returns the header map with Cookie removed so the caller can pass
+// it to the engine as extra HTTP headers without double-injecting the
+// cookie (which would land in Network.setExtraHTTPHeaders and get
+// stripped by Spring Security-style redirects — the original bug).
+//
+// When headers contains no Cookie entry, inject is NOT called and the
+// headers map is returned with Cookie removal applied idempotently.
+// Parse and inject errors are wrapped with "parse cookies:" and
+// "inject cookies:" respectively — operators rely on these prefixes.
+func ApplyCookieHeader(headers map[string]string, targetURL string, inject CookieInjector) (map[string]string, error) {
+	cookieValue, extraHeaders := ExtractCookieHeader(headers)
+	if cookieValue == "" {
+		return extraHeaders, nil
+	}
+	params, err := ParseCookiesToParams(targetURL, cookieValue)
+	if err != nil {
+		return nil, fmt.Errorf("parse cookies: %w", err)
+	}
+	if err := inject(params); err != nil {
+		return nil, fmt.Errorf("inject cookies: %w", err)
+	}
+	return extraHeaders, nil
+}
