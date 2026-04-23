@@ -381,6 +381,10 @@ func mergeEnrichedLinks(
 		// captured-append side.) f.Action is always absolute per
 		// resolveFormAction; empty Action means the form spec-defaults to
 		// pageURL, which is same-origin by definition — keep those.
+		//
+		// Fast path: nil scopeFn means no filtering; alias `forms` directly
+		// to avoid allocation. Do not mutate scopedForms when scopeFn is nil
+		// — the alias would leak back to the caller's slice.
 		scopedForms := forms
 		if scopeFn != nil {
 			scopedForms = make([]discoveredForm, 0, len(forms))

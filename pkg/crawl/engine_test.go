@@ -49,10 +49,12 @@ func TestMergeEnrichedLinks_CombinesAllSources(t *testing.T) {
 		"https://ex.com/rest/users",
 		"https://ex.com/submit",
 	}
-	for _, w := range want {
-		if !slices.Contains(links, w) {
-			t.Errorf("links missing %q; got %v", w, links)
-		}
+	// Pin the contract from mergeEnrichedLinks's doc comment: DOM links,
+	// then js-from-responses, then js-from-inline, then form actions.
+	// A refactor that shuffles source order (e.g. forms before DOM links)
+	// would slip past a membership-only check.
+	if !slices.Equal(links, want) {
+		t.Errorf("links order mismatch\n got:  %v\n want: %v", links, want)
 	}
 
 	// Form produces a synthetic POST ObservedRequest in captured.
@@ -164,11 +166,14 @@ func TestMergeEnrichedLinks_FormActionFiltering(t *testing.T) {
 	}
 }
 
-// No-action forms get Action=pageURL (HTML §4.10.21.3). This test pins
-// what happens in mergeEnrichedLinks once extractForms / resolveFormAction
-// has already set Action — the per-branch coverage of resolveFormAction
-// itself lives in TestResolveFormAction_NoActionUsesPageURL.
-func TestMergeEnrichedLinks_NoActionFormUsesPageURL(t *testing.T) {
+// TestMergeEnrichedLinks_PreResolvedFormActionIsCaptured pins the
+// contract at the mergeEnrichedLinks boundary: forms arrive with Action
+// already resolved (extractForms / resolveFormAction handle the
+// resolution, including the HTML §4.10.21.3 no-action -> pageURL rule).
+// mergeEnrichedLinks's job is to emit a synthetic ObservedRequest for
+// whatever absolute Action it sees. resolveFormAction's own per-branch
+// coverage lives in TestResolveFormAction_NoActionUsesPageURL.
+func TestMergeEnrichedLinks_PreResolvedFormActionIsCaptured(t *testing.T) {
 	// Simulate what extractForms emits when there's no action attribute:
 	// Action is set to pageURL, not baseURL.
 	forms := []discoveredForm{{Action: "https://ex.com/login", Method: "POST"}}
@@ -201,6 +206,12 @@ func TestMergeEnrichedLinks_EmptyInputs(t *testing.T) {
 // Without scope enforcement in mergeEnrichedLinks, the attacker-host URL would
 // flow to capture.json and be re-requested by downstream probes carrying any
 // operator-supplied --header values (Authorization, cookies, CSRF tokens).
+//
+// Note: the "attacker URL absent from links" assertion below is load-bearing,
+// not belt-and-suspenders. The scope filter's scopedForms slice feeds BOTH
+// the captured-append path AND the links-append loop in mergeEnrichedLinks
+// — a future refactor that split them must still catch cross-host URLs at
+// both sinks. Do not remove the links check if this test is later split.
 func TestMergeEnrichedLinks_FormActionCrossHostIsNotCaptured(t *testing.T) {
 	forms := []discoveredForm{
 		{Action: "https://attacker.example/evil", Method: "GET"},
@@ -223,6 +234,14 @@ func TestMergeEnrichedLinks_FormActionCrossHostIsNotCaptured(t *testing.T) {
 		if strings.Contains(u, "attacker.example") {
 			t.Fatalf("cross-host form URL leaked into links: %q", u)
 		}
+	}
+
+	// Positive links-side assertion: the in-scope form action DOES land
+	// in links. Without this, a bug that drops ALL forms from the links-
+	// append loop (early return, accidental break, wrong variable) would
+	// not be caught.
+	if !slices.Contains(links, "https://in-scope.example/login") {
+		t.Errorf("expected in-scope form action in links; got %v", links)
 	}
 
 	// The in-scope form action IS captured (no false negative).
@@ -258,5 +277,73 @@ func TestMergeEnrichedLinks_NilScopeFnDoesNotFilter(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("nil scopeFn should pass all forms through; got %v", captured)
+	}
+}
+
+// TEST-002 (PR #88 review round 11): the scope filter has an early-accept
+// branch — f.Action == "" is kept regardless of scopeFn. Existing tests
+// cover nil scopeFn and non-empty Action with non-nil scopeFn; the combo
+// empty Action + reject-all scopeFn is not pinned. A refactor that
+// dropped the `f.Action == ""` branch would silently change behavior
+// here (the form would be dropped instead of kept). The empty-Action
+// invariant comes from resolveFormAction (which always maps empty raw
+// action to pageURL, same-origin) and is the reason the early-accept
+// is safe.
+func TestMergeEnrichedLinks_EmptyActionPassesThroughWhenScopeFnWouldReject(t *testing.T) {
+	forms := []discoveredForm{{Action: "", Method: "GET"}}
+	scope := func(string) bool { return false }
+	captured, _ := mergeEnrichedLinks(nil, nil, nil, nil, forms,
+		"https://ex.com/login", "https://ex.com/", scope)
+	if len(captured) != 1 {
+		t.Fatalf("expected empty-Action form to pass through scope filter; got %d captured", len(captured))
+	}
+	// formsToObservedRequests emits URL="" for empty Action.
+	if captured[0].URL != "" {
+		t.Errorf("expected captured URL to be empty (Action=\"\"); got %q", captured[0].URL)
+	}
+}
+
+// TEST-004 (PR #88 review round 11): realistic pages mix forms with
+// empty action, in-scope absolute action, and out-of-scope absolute
+// action. Each branch is covered in isolation; this pins their
+// interaction (ordering, partial-filtering bugs, one-off off-by-one
+// skips).
+func TestMergeEnrichedLinks_MixedFormsWithScope(t *testing.T) {
+	forms := []discoveredForm{
+		{Action: "", Method: "GET"},                              // empty → pageURL, always kept
+		{Action: "https://in-scope.example/api", Method: "POST"}, // in-scope, kept
+		{Action: "https://attacker.example/evil", Method: "GET"}, // out-of-scope, dropped
+	}
+	scope := func(u string) bool { return strings.Contains(u, "in-scope.example") }
+	captured, links := mergeEnrichedLinks(nil, nil, nil, nil, forms,
+		"https://in-scope.example/login", "https://in-scope.example/", scope)
+
+	// captured must contain exactly the two kept forms — empty Action
+	// produces URL="" and the in-scope form produces the /api URL.
+	if len(captured) != 2 {
+		t.Fatalf("expected 2 captured ObservedRequests, got %d: %v", len(captured), captured)
+	}
+	urls := []string{captured[0].URL, captured[1].URL}
+	if !slices.Contains(urls, "") {
+		t.Errorf("expected empty-Action form in captured (URL=\"\"); got %v", urls)
+	}
+	if !slices.Contains(urls, "https://in-scope.example/api") {
+		t.Errorf("expected in-scope form in captured; got %v", urls)
+	}
+	for _, r := range captured {
+		if strings.Contains(r.URL, "attacker.example") {
+			t.Fatalf("attacker URL leaked into captured: %q", r.URL)
+		}
+	}
+
+	// links must contain /api and NOT /evil. (Empty Action doesn't feed
+	// the links loop — the `if f.Action == ""` continue skips it.)
+	if !slices.Contains(links, "https://in-scope.example/api") {
+		t.Errorf("expected in-scope form action in links; got %v", links)
+	}
+	for _, u := range links {
+		if strings.Contains(u, "attacker.example") {
+			t.Fatalf("attacker URL leaked into links: %q", u)
+		}
 	}
 }
