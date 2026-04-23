@@ -305,6 +305,7 @@ func TestTnetstring_LengthTooLarge(t *testing.T) {
 // Together these exercise both sides of the `if initial > streamInitialCap`
 // conditional so a refactor that flipped the comparison or removed the
 // clamp would break one of them.
+
 // streamInitialCapTestBound is the lowered streamInitialCap value shared by
 // TestTnetstring_StreamInitialCapClampBoundaries and
 // TestTnetstring_StreamInitialCapTruncated. Both tests are explicitly coupled
