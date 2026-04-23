@@ -71,12 +71,12 @@ func TestMergeEnrichedLinks_CombinesAllSources(t *testing.T) {
 // be dropped before entering the frontier — this is the LAB-2221 fix that
 // prevents /socket.io/socket.io/... mangled paths on SPA catch-all servers.
 func TestMergeEnrichedLinks_FiltersAssetsFromJSLuice(t *testing.T) {
-	jsluice := []jsExtractedURL{
+	extracted := []jsExtractedURL{
 		{URL: "/api/orders"},
 		{URL: "/main.js"},
 		{URL: "/socket.io/"},
 	}
-	_, links := mergeEnrichedLinks(nil, nil, jsluice, nil, nil, "https://ex.com/", "https://ex.com/")
+	_, links := mergeEnrichedLinks(nil, nil, extracted, nil, nil, "https://ex.com/", "https://ex.com/")
 
 	if !slices.Contains(links, "https://ex.com/api/orders") {
 		t.Errorf("expected /api/orders in links; got %v", links)
@@ -106,6 +106,40 @@ func TestMergeEnrichedLinks_InlineOnly(t *testing.T) {
 	}
 	if slices.Contains(links, "https://ex.com/vendor.js") {
 		t.Errorf("inline-only vendor.js leaked through filter; got %v", links)
+	}
+}
+
+// TestMergeEnrichedLinks_JSLuiceResolvedAgainstBaseNotPage pins the
+// primary LAB-2221 pre-fix defect: mergeEnrichedLinks must route
+// jsFromResponses and jsFromInline through baseURL (not pageURL) when
+// they differ. Without this test, a refactor that reverted engine.go:365
+// or :368 from baseURL to pageURL would reintroduce the SPA deep-path
+// bug and the default suite would still pass (the integration-tagged
+// TestRodEngine_BaseHrefResolution is the only other catch).
+func TestMergeEnrichedLinks_JSLuiceResolvedAgainstBaseNotPage(t *testing.T) {
+	const pageURL = "https://ex.com/deep/page/here"
+	const baseURL = "https://ex.com/"
+
+	fromResponses := []jsExtractedURL{{URL: "/api/users"}}
+	fromInline := []jsExtractedURL{{URL: "orders"}}
+
+	_, links := mergeEnrichedLinks(nil, nil, fromResponses, fromInline, nil, pageURL, baseURL)
+
+	// Root-relative jsluice URL resolves against base root.
+	if !slices.Contains(links, "https://ex.com/api/users") {
+		t.Errorf("expected /api/users resolved against base root; got %v", links)
+	}
+	// Bare-relative jsluice URL resolves against base root, not deep page.
+	if !slices.Contains(links, "https://ex.com/orders") {
+		t.Errorf("expected orders resolved against base root; got %v", links)
+	}
+	// Pre-fix behavior: the two strings below must NOT appear. A regression
+	// that swapped baseURL→pageURL at engine.go:365/368 would produce them.
+	if slices.Contains(links, "https://ex.com/deep/page/here/api/users") {
+		t.Errorf("regression: jsFromResponses resolved against pageURL; got %v", links)
+	}
+	if slices.Contains(links, "https://ex.com/deep/page/orders") {
+		t.Errorf("regression: jsFromInline resolved against pageURL; got %v", links)
 	}
 }
 
