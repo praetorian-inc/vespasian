@@ -16,6 +16,7 @@ package crawl
 
 import (
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -38,7 +39,7 @@ func TestMergeEnrichedLinks_CombinesAllSources(t *testing.T) {
 
 	captured, links := mergeEnrichedLinks(
 		captured, domLinks, jsFromResponses, jsFromInline, forms,
-		"https://ex.com/", "https://ex.com/",
+		"https://ex.com/", "https://ex.com/", nil,
 	)
 
 	want := []string{
@@ -76,7 +77,7 @@ func TestMergeEnrichedLinks_FiltersAssetsFromJSLuice(t *testing.T) {
 		{URL: "/main.js"},
 		{URL: "/socket.io/"},
 	}
-	_, links := mergeEnrichedLinks(nil, nil, extracted, nil, nil, "https://ex.com/", "https://ex.com/")
+	_, links := mergeEnrichedLinks(nil, nil, extracted, nil, nil, "https://ex.com/", "https://ex.com/", nil)
 
 	if !slices.Contains(links, "https://ex.com/api/orders") {
 		t.Errorf("expected /api/orders in links; got %v", links)
@@ -99,7 +100,7 @@ func TestMergeEnrichedLinks_InlineOnly(t *testing.T) {
 		{URL: "/rest/customers"},
 		{URL: "/vendor.js"},
 	}
-	_, links := mergeEnrichedLinks(nil, nil, nil, inline, nil, "https://ex.com/", "https://ex.com/")
+	_, links := mergeEnrichedLinks(nil, nil, nil, inline, nil, "https://ex.com/", "https://ex.com/", nil)
 
 	if !slices.Contains(links, "https://ex.com/rest/customers") {
 		t.Errorf("expected /rest/customers in links; got %v", links)
@@ -123,7 +124,7 @@ func TestMergeEnrichedLinks_JSLuiceResolvedAgainstBaseNotPage(t *testing.T) {
 	fromResponses := []jsExtractedURL{{URL: "/api/users"}}
 	fromInline := []jsExtractedURL{{URL: "orders"}}
 
-	_, links := mergeEnrichedLinks(nil, nil, fromResponses, fromInline, nil, pageURL, baseURL)
+	_, links := mergeEnrichedLinks(nil, nil, fromResponses, fromInline, nil, pageURL, baseURL, nil)
 
 	// Root-relative jsluice URL resolves against base root.
 	if !slices.Contains(links, "https://ex.com/api/users") {
@@ -153,7 +154,7 @@ func TestMergeEnrichedLinks_FormActionFiltering(t *testing.T) {
 		{Action: "https://ex.com/main.js", Method: "POST"}, // asset-shaped — filtered
 		{Action: "", Method: "GET"},                        // empty — skipped without error
 	}
-	_, links := mergeEnrichedLinks(nil, nil, nil, nil, forms, "https://ex.com/login", "https://ex.com/")
+	_, links := mergeEnrichedLinks(nil, nil, nil, nil, forms, "https://ex.com/login", "https://ex.com/", nil)
 
 	if !slices.Contains(links, "https://ex.com/api/login") {
 		t.Errorf("expected form action in links; got %v", links)
@@ -171,7 +172,7 @@ func TestMergeEnrichedLinks_NoActionFormUsesPageURL(t *testing.T) {
 	// Simulate what extractForms emits when there's no action attribute:
 	// Action is set to pageURL, not baseURL.
 	forms := []discoveredForm{{Action: "https://ex.com/login", Method: "POST"}}
-	captured, _ := mergeEnrichedLinks(nil, nil, nil, nil, forms, "https://ex.com/login", "https://ex.com/")
+	captured, _ := mergeEnrichedLinks(nil, nil, nil, nil, forms, "https://ex.com/login", "https://ex.com/", nil)
 
 	found := false
 	for _, c := range captured {
@@ -186,11 +187,76 @@ func TestMergeEnrichedLinks_NoActionFormUsesPageURL(t *testing.T) {
 }
 
 func TestMergeEnrichedLinks_EmptyInputs(t *testing.T) {
-	captured, links := mergeEnrichedLinks(nil, nil, nil, nil, nil, "https://ex.com/", "https://ex.com/")
+	captured, links := mergeEnrichedLinks(nil, nil, nil, nil, nil, "https://ex.com/", "https://ex.com/", nil)
 	if len(captured) != 0 {
 		t.Errorf("captured = %v, want empty", captured)
 	}
 	if len(links) != 0 {
 		t.Errorf("links = %v, want empty", links)
+	}
+}
+
+// SEC-BE-001 regression (PR #88 review 4165223270): a <form action="https://attacker/">
+// on an in-scope page must not produce a synthetic ObservedRequest in captured.
+// Without scope enforcement in mergeEnrichedLinks, the attacker-host URL would
+// flow to capture.json and be re-requested by downstream probes carrying any
+// operator-supplied --header values (Authorization, cookies, CSRF tokens).
+func TestMergeEnrichedLinks_FormActionCrossHostIsNotCaptured(t *testing.T) {
+	forms := []discoveredForm{
+		{Action: "https://attacker.example/evil", Method: "GET"},
+		{Action: "https://in-scope.example/login", Method: "POST"},
+	}
+	scope := func(u string) bool { return strings.Contains(u, "in-scope.example") }
+
+	captured, links := mergeEnrichedLinks(
+		nil, nil, nil, nil, forms,
+		"https://in-scope.example/login", "https://in-scope.example/", scope,
+	)
+
+	// The attacker-host URL must NOT appear anywhere in captured or links.
+	for _, r := range captured {
+		if strings.Contains(r.URL, "attacker.example") {
+			t.Fatalf("cross-host form URL leaked into captured: %q", r.URL)
+		}
+	}
+	for _, u := range links {
+		if strings.Contains(u, "attacker.example") {
+			t.Fatalf("cross-host form URL leaked into links: %q", u)
+		}
+	}
+
+	// The in-scope form action IS captured (no false negative).
+	foundInScope := false
+	for _, r := range captured {
+		if r.URL == "https://in-scope.example/login" && r.Source == "form" {
+			foundInScope = true
+			break
+		}
+	}
+	if !foundInScope {
+		t.Errorf("expected in-scope form in captured; got %v", captured)
+	}
+}
+
+// Nil scopeFn preserves pre-fix behavior: no filtering applied.
+// Pins the nil-contract so a future refactor that makes scopeFn required
+// without updating all call sites is caught.
+func TestMergeEnrichedLinks_NilScopeFnDoesNotFilter(t *testing.T) {
+	forms := []discoveredForm{
+		{Action: "https://anywhere.example/x", Method: "POST"},
+	}
+	captured, _ := mergeEnrichedLinks(
+		nil, nil, nil, nil, forms,
+		"https://in-scope.example/", "https://in-scope.example/", nil,
+	)
+	found := false
+	for _, r := range captured {
+		if r.URL == "https://anywhere.example/x" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("nil scopeFn should pass all forms through; got %v", captured)
 	}
 }

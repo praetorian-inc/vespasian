@@ -276,7 +276,7 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 
 	// Extract links, run jsluice, and discover forms from the stabilized page.
 	capturedResults := capture.Results()
-	results, links := enrichFromPage(page, capturedResults, target.URL, e.opts.Stderr)
+	results, links := enrichFromPage(page, capturedResults, target.URL, e.opts.Stderr, e.opts.ScopeCheck)
 	return results, links, nil
 }
 
@@ -289,11 +289,14 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 // and as a fallback for URL resolution when the DOM provides no <base href>
 // and page.Info() returns an error).
 //
+// scopeFn is forwarded to mergeEnrichedLinks so form actions whose host
+// is out of scope are not appended as synthetic ObservedRequests.
+//
 // This function handles the DOM-reading side (page.Info, extractLinks,
 // extractForms, extractURLsFromInlineScripts) and then delegates the pure
 // link-combining logic to [mergeEnrichedLinks], which is directly unit
 // tested.
-func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, stderr io.Writer) ([]ObservedRequest, []string) {
+func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, stderr io.Writer, scopeFn func(string) bool) ([]ObservedRequest, []string) {
 	// Resolve the effective base URL for any relative references on this page.
 	// jsluice-extracted URLs and form actions must honor <base href> the same
 	// way the browser would, or we end up queuing mangled/nested paths.
@@ -323,7 +326,7 @@ func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, 
 		fmt.Fprintf(stderr, "form extraction failed for %s: %v\n", pageURL, ferr) //nolint:errcheck // best-effort
 	}
 
-	captured, links := mergeEnrichedLinks(captured, domLinks, jsFromResponses, jsFromInline, forms, resolvedPageURL, baseURL)
+	captured, links := mergeEnrichedLinks(captured, domLinks, jsFromResponses, jsFromInline, forms, resolvedPageURL, baseURL, scopeFn)
 	return captured, links
 }
 
@@ -341,6 +344,11 @@ func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, 
 //   - pageURL is the resolved navigation URL; baseURL is the <base href>-
 //     aware base. Both are passed because forms need page-URL semantics
 //     for PageURL tagging but base-URL semantics for explicit action refs.
+//   - scopeFn filters form actions before they become synthetic
+//     ObservedRequests. Frontier-side links already go through scope
+//     at Push; this protects the captured-append path from
+//     attacker-host form actions on an in-scope page. When scopeFn is
+//     nil, no filtering is applied.
 //
 // The returned links slice may contain cross-source duplicates (a URL
 // reached from both a DOM href and a jsluice hit will appear twice).
@@ -352,6 +360,7 @@ func mergeEnrichedLinks(
 	jsFromResponses, jsFromInline []jsExtractedURL,
 	forms []discoveredForm,
 	pageURL, baseURL string,
+	scopeFn func(string) bool,
 ) ([]ObservedRequest, []string) {
 	links := append([]string(nil), domLinks...)
 
@@ -363,12 +372,27 @@ func mergeEnrichedLinks(
 	}
 
 	if len(forms) > 0 {
-		formRequests := formsToObservedRequests(forms, pageURL)
+		// Scope-enforce form actions before they become synthetic
+		// ObservedRequests. Without this, a <form action="https://attacker/x">
+		// on an in-scope page would flow into captured -> capture.json ->
+		// probes, which would re-request the attacker URL with any
+		// operator-supplied headers attached. (Frontier-side links are
+		// scope-checked at Push; this closes the corresponding gap on the
+		// captured-append side.) f.Action is always absolute per
+		// resolveFormAction; empty Action means the form spec-defaults to
+		// pageURL, which is same-origin by definition — keep those.
+		scopedForms := forms
+		if scopeFn != nil {
+			scopedForms = make([]discoveredForm, 0, len(forms))
+			for _, f := range forms {
+				if f.Action == "" || scopeFn(f.Action) {
+					scopedForms = append(scopedForms, f)
+				}
+			}
+		}
+		formRequests := formsToObservedRequests(scopedForms, pageURL)
 		captured = append(captured, formRequests...)
-		// f.Action is always absolute: extractForms resolves explicit
-		// action attributes against baseURL, and forms with no action
-		// are set to pageURL. Only the asset/streaming filter runs here.
-		for _, f := range forms {
+		for _, f := range scopedForms {
 			if f.Action == "" {
 				continue
 			}
