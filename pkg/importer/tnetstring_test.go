@@ -305,8 +305,15 @@ func TestTnetstring_LengthTooLarge(t *testing.T) {
 // Together these exercise both sides of the `if initial > streamInitialCap`
 // conditional so a refactor that flipped the comparison or removed the
 // clamp would break one of them.
+// streamInitialCapTestBound is the lowered streamInitialCap value shared by
+// TestTnetstring_StreamInitialCapClampBoundaries and
+// TestTnetstring_StreamInitialCapTruncated. Both tests are explicitly coupled
+// by doc comment and must agree on the bound so the "removing the clamp
+// breaks exactly one of them" invariant holds.
+const streamInitialCapTestBound = 1024 // decisively < 1 MB, keeps the tests fast
+
 func TestTnetstring_StreamInitialCapClampBoundaries(t *testing.T) {
-	const small = 1024 // small enough to keep the test fast, decisively < 1 MB
+	const small = streamInitialCapTestBound
 	withTempCap(t, &streamInitialCap, small)
 
 	t.Run("length at streamInitialCap is accepted", func(t *testing.T) {
@@ -338,7 +345,7 @@ func TestTnetstring_StreamInitialCapClampBoundaries(t *testing.T) {
 // above-cap-accepted subtest above because bytes.Buffer would pre-allocate
 // the full (attacker-claimed) size rather than growing from the cap.
 func TestTnetstring_StreamInitialCapTruncated(t *testing.T) {
-	const small = 1024
+	const small = streamInitialCapTestBound
 	withTempCap(t, &streamInitialCap, small)
 
 	// 10x the cap claimed, only 10 bytes present — readStreamPayload must
@@ -690,4 +697,22 @@ func TestPayloadPreview_AtCapPlusOneTruncated(t *testing.T) {
 	assert.True(t, strings.HasPrefix(got, wantPrefix),
 		"expected truncated payload preview to start with %s, got %s", wantPrefix, got)
 	assert.Contains(t, got, fmt.Sprintf("(%d bytes total)", maxPreviewLen+1))
+}
+
+// TestPayloadPreview_QuotesControlBytes mirrors TestPreviewString_QuotesControlBytes
+// for the payload-side helper. Both previewString and payloadPreview share the
+// %q quoting discipline documented in helpers.go (maxPreviewLen); this test
+// pins that discipline for payloadPreview independently so a regression
+// flipping the format verb to %s on only one helper would be caught. Without
+// this test, payloadPreview's bounded-error callers (parse int / parse float /
+// invalid bool / dict key without value) exercise the function only with
+// ASCII-letter payloads, and a %q→%s regression would pass silently.
+func TestPayloadPreview_QuotesControlBytes(t *testing.T) {
+	// ESC (\x1b) + "[2J" is the xterm "clear screen" sequence.
+	got := payloadPreview([]byte("FOO\x1b[2J"))
+	// %q renders \x1b as the four literal characters \, x, 1, b, never as
+	// the raw ESC byte that would reach the operator's terminal.
+	assert.Contains(t, got, `\x1b`)
+	assert.NotContains(t, got, "\x1b",
+		"raw ESC byte must not appear in payload preview output")
 }
