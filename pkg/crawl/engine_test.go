@@ -69,3 +69,68 @@ func TestRodEngine_Crawl_SeedRejectedByFrontierReturnsError(t *testing.T) {
 		t.Errorf("Crawl error %q should name the remediation flag (%s) so operators know what to do", err, flagDangerousAllowPrivate)
 	}
 }
+
+// TestRodEngine_Crawl_SeedRejectionRedactsUserinfo covers the follow-up to
+// LAB-2438: an operator may paste a credentialed seed URL (e.g.
+// http://user:pass@internal.corp) and forget flagDangerousAllowPrivate. The
+// rejection error is written to stderr by kong's FatalIfErrorf and can land in
+// shell history, terminal scrollback, or CI logs. The error message therefore
+// must not echo the password (or username) back to the operator.
+func TestRodEngine_Crawl_SeedRejectionRedactsUserinfo(t *testing.T) {
+	rejectAll := func(string) bool { return false }
+
+	e := &rodEngine{
+		browser: nil,
+		opts: engineOptions{
+			Concurrency: 1, MaxPages: 10, MaxDepth: 2, ScopeCheck: rejectAll,
+		},
+		frontier: newURLFrontier(2, rejectAll),
+	}
+
+	seed := "http://admin:s3cret@10.0.0.5:8080/path"
+	err := e.Crawl(context.Background(), seed, func(ObservedRequest) {
+		t.Fatal("onResult must not be called when the seed is rejected")
+	})
+	if err == nil {
+		t.Fatal("Crawl returned nil error on rejected credentialed seed; expected a descriptive error")
+	}
+	if strings.Contains(err.Error(), "s3cret") {
+		t.Errorf("Crawl error %q MUST NOT echo the seed password; it could land in shell history or CI logs", err)
+	}
+	if strings.Contains(err.Error(), "admin") {
+		t.Errorf("Crawl error %q MUST NOT echo the seed username; redactSeedURL is expected to strip the full userinfo block", err)
+	}
+	// The rest of the URL (host, port, path) is operator-supplied context and
+	// must still be present so the operator can identify which seed failed.
+	if !strings.Contains(err.Error(), "10.0.0.5:8080") {
+		t.Errorf("Crawl error %q should still echo the host:port after redaction", err)
+	}
+	if !strings.Contains(err.Error(), "/path") {
+		t.Errorf("Crawl error %q should still echo the path after redaction", err)
+	}
+}
+
+// TestRedactSeedURL table-drives the redaction helper directly so regressions
+// in url.Parse handling (empty URLs, malformed, no userinfo) are caught
+// independently of the Crawl integration above.
+func TestRedactSeedURL(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"no userinfo", "http://example.com/x", "http://example.com/x"},
+		{"user+password", "http://u:p@example.com:443/x?q=1", "http://example.com:443/x?q=1"},
+		{"user only", "http://u@example.com/x", "http://example.com/x"},
+		{"empty password", "http://u:@example.com/x", "http://example.com/x"},
+		{"malformed returned as-is", "://not a url", "://not a url"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := redactSeedURL(tc.in)
+			if got != tc.want {
+				t.Errorf("redactSeedURL(%q) = %q; want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}

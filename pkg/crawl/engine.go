@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/url"
 	"sync"
 	"time"
 
@@ -34,6 +35,19 @@ const DefaultConcurrency = 10
 // `name:"..."` tag on CrawlCmd.DangerousAllowPrivate / ScanCmd.DangerousAllowPrivate
 // in cmd/vespasian/main.go.
 const flagDangerousAllowPrivate = "--dangerous-allow-private"
+
+// redactSeedURL returns raw with any userinfo (user[:password]) removed so the
+// URL can be echoed to stderr / logs without leaking credentials. If raw does
+// not parse as a URL, it is returned unchanged — the operator-facing error is
+// still useful without redaction and we never want to swallow the seed string.
+func redactSeedURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	u.User = nil
+	return u.String()
+}
 
 // MaxConcurrency is the upper bound on concurrent browser tabs. Each tab
 // consumes significant Chrome process memory (~50 MB), so unbounded values
@@ -108,9 +122,15 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 	// is set). Without this guard the crawl silently returned zero captures
 	// with no error to help the operator diagnose (LAB-2438).
 	if e.frontier.Push([]urlEntry{{URL: seedURL, Depth: 0}}) == 0 {
+		// redactSeedURL strips userinfo (user[:password]) before echoing the
+		// seed URL to stderr. If an operator pastes a credentialed URL and
+		// forgets flagDangerousAllowPrivate, the error message still lands in
+		// shell history / CI logs / scrollback — without this we would emit
+		// the cleartext credentials. url.Parse errors return the raw string
+		// unchanged so the operator still sees an actionable message.
 		return fmt.Errorf("seed URL rejected by frontier (scope, SSRF, or parse): %s; "+
 			"if crawling a private host (localhost, 127.0.0.1, RFC1918, link-local), "+
-			"pass %s", seedURL, flagDangerousAllowPrivate)
+			"pass %s", redactSeedURL(seedURL), flagDangerousAllowPrivate)
 	}
 
 	// Track page count for MaxPages enforcement. The onResult callback in
