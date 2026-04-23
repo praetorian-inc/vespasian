@@ -184,6 +184,13 @@ func TestRedactSeedURL(t *testing.T) {
 		// string contains "@", so we fail closed: the placeholder is emitted
 		// instead of echoing "admin:se%zz@host/path" with credentials.
 		{"malformed with userinfo redacts to placeholder", "http://admin:se%zz@host/path", unparseableURLPlaceholder}, //nolint:gosec // G101: intentional malformed test credential used to verify fail-closed redaction
+		// Opaque form: "http:user:pass@host/path" parses as Opaque="user:pass@host/path"
+		// with u.User nil. Clearing u.User is a no-op and u.String() would
+		// round-trip the credentials — the residual "@" check forces the
+		// placeholder. Not reachable via the CLI (main.go:validateURL blocks
+		// empty-Host URLs) but pinned here because redactSeedURL lives at a
+		// package boundary.
+		{"opaque with userinfo redacts to placeholder", "http:admin:pw@host/path", unparseableURLPlaceholder}, //nolint:gosec // G101: intentional opaque-form test credential used to verify fail-closed redaction
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
