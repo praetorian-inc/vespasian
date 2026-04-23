@@ -46,7 +46,7 @@ Vespasian takes a different approach: it observes actual network traffic at the 
 | **Traffic Import** | Import existing captures from Burp Suite XML, HAR 1.2 files, and mitmproxy dumps |
 | **Active Probing** | OPTIONS discovery, JSON schema inference, WSDL document fetching, and GraphQL introspection |
 | **Path Normalization** | `/users/42` and `/users/87` become `/users/{id}` with known literal preservation (`/me`, `/self`) |
-| **SSRF Protection** | Blocks probing of private and loopback addresses by default. Use `--dangerous-allow-private` to test internal targets. |
+| **SSRF Protection** | Blocks crawling and probing of private and loopback addresses by default. Pass `--dangerous-allow-private` to test internal targets (localhost, 127.0.0.1, RFC1918, link-local); the flag is required when the seed URL is itself a private host. |
 | **Proxy Support** | Route headless browser traffic through Burp Suite or other intercepting proxies |
 | **Two-Stage Pipeline** | Capture once, generate many: separate capture and generation steps for maximum flexibility |
 
@@ -222,7 +222,9 @@ vespasian scan <url> [flags]
   --confidence       Min classification confidence (default: 0.5)
   --probe            Enable active probing (default: true)
   --deduplicate      Deduplicate endpoints before probing (default: true)
-  --dangerous-allow-private  Disable SSRF protection for private targets
+  --dangerous-allow-private  Disable SSRF protection for private/localhost targets.
+                     Required when the seed URL is a private host (localhost,
+                     127.0.0.1, RFC1918, link-local).
   --no-request-id    Disable auto X-Vespasian-Request-Id header
   -v, --verbose      Show requests in real-time
 ```
@@ -241,6 +243,9 @@ vespasian crawl <url> [flags]
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Browser mode (default: true)
   --proxy            Proxy URL for headless browser (e.g., http://127.0.0.1:8080)
+  --dangerous-allow-private  Disable SSRF protection for private/localhost targets.
+                     Required when the seed URL is a private host (localhost,
+                     127.0.0.1, RFC1918, link-local).
   --no-request-id    Disable auto X-Vespasian-Request-Id header
   -v, --verbose      Show requests in real-time
 ```
@@ -267,7 +272,9 @@ vespasian generate <api-type> <capture-file> [flags]
   --confidence       Min classification confidence (default: 0.5)
   --probe            Enable active probing (default: true)
   --deduplicate      Deduplicate endpoints before probing (default: true)
-  --dangerous-allow-private  Disable SSRF protection for private targets
+  --dangerous-allow-private  Disable SSRF protection on the probe path
+                     (OPTIONS/schema/WSDL-fetch/GraphQL-introspection requests
+                     to private hosts).
   -v, --verbose      Show discovered endpoints
 ```
 

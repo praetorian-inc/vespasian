@@ -94,8 +94,17 @@ func newRodEngine(wsURL string, opts engineOptions) (*rodEngine, error) {
 // completes (frontier exhausted, maxPages reached, or ctx canceled). Each
 // captured network request is passed to onResult as it is observed.
 func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(ObservedRequest)) error {
-	// Seed the frontier.
-	e.frontier.Push([]urlEntry{{URL: seedURL, Depth: 0}})
+	// Seed the frontier. If Push adds zero entries the seed was rejected
+	// (malformed URL, scope mismatch, or — the common case — the seed is a
+	// private host such as localhost / 127.0.0.1 / RFC1918 / 169.254.*, which
+	// the scope predicate's SSRF check rejects unless --dangerous-allow-private
+	// is set). Without this guard the crawl silently returned zero captures
+	// with no error to help the operator diagnose (LAB-2438).
+	if e.frontier.Push([]urlEntry{{URL: seedURL, Depth: 0}}) == 0 {
+		return fmt.Errorf("seed URL rejected by frontier (scope, SSRF, or parse): %s; "+
+			"if crawling a private host (localhost, 127.0.0.1, RFC1918, link-local), "+
+			"pass --dangerous-allow-private", seedURL)
+	}
 
 	// Track page count for MaxPages enforcement. The onResult callback in
 	// Crawler.crawlHeadless also tracks this, but we need our own counter
