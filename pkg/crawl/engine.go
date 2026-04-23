@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,26 +30,6 @@ import (
 // DefaultConcurrency is the default number of concurrent browser tabs.
 const DefaultConcurrency = 10
 
-// flagDangerousAllowPrivate is the CLI flag name that disables SSRF protection
-// for private/localhost targets. It is referenced in operator-facing error
-// messages so operators can copy-paste it verbatim; keep this in sync with the
-// `name:"..."` tag on CrawlCmd.DangerousAllowPrivate / ScanCmd.DangerousAllowPrivate
-// in cmd/vespasian/main.go.
-const flagDangerousAllowPrivate = "--dangerous-allow-private"
-
-// redactSeedURL returns raw with any userinfo (user[:password]) removed so the
-// URL can be echoed to stderr / logs without leaking credentials. If raw does
-// not parse as a URL, it is returned unchanged — the operator-facing error is
-// still useful without redaction and we never want to swallow the seed string.
-func redactSeedURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return raw
-	}
-	u.User = nil
-	return u.String()
-}
-
 // MaxConcurrency is the upper bound on concurrent browser tabs. Each tab
 // consumes significant Chrome process memory (~50 MB), so unbounded values
 // could exhaust system resources.
@@ -56,6 +37,42 @@ const MaxConcurrency = 50
 
 // DefaultStableWait is the default DOM stability wait duration.
 const DefaultStableWait = 3 * time.Second
+
+// ---- operator-message helpers ----
+
+// flagDangerousAllowPrivate is the CLI flag name that disables SSRF protection
+// for private/localhost targets. It is referenced in operator-facing error
+// messages so operators can copy-paste it verbatim; keep this in sync with the
+// `name:"..."` tag on CrawlCmd.DangerousAllowPrivate / ScanCmd.DangerousAllowPrivate
+// in cmd/vespasian/main.go.
+const flagDangerousAllowPrivate = "--dangerous-allow-private"
+
+// unparseableURLPlaceholder is substituted for a URL that failed url.Parse AND
+// contains an "@" (meaning we cannot safely strip userinfo without parsing).
+// Emitting the raw string in that case would leak credentials the whole point
+// of redactSeedURL is to hide.
+const unparseableURLPlaceholder = "<unparseable URL with userinfo redacted>"
+
+// redactSeedURL returns raw with any userinfo (user[:password]) removed so the
+// URL can be echoed to stderr / logs without leaking credentials. Behavior:
+//   - url.Parse succeeds: userinfo is stripped and the URL is re-serialized.
+//   - url.Parse fails AND raw contains "@": fail closed — emit a generic
+//     placeholder instead of the raw string, since a parse failure on a URL
+//     with "@" (e.g. "http://admin:se%zz@host/path" — invalid percent escape
+//     in userinfo) would otherwise echo the credentials verbatim.
+//   - url.Parse fails AND raw contains no "@": return raw unchanged; nothing
+//     to redact and the operator still gets an actionable error.
+func redactSeedURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		if strings.Contains(raw, "@") {
+			return unparseableURLPlaceholder
+		}
+		return raw
+	}
+	u.User = nil
+	return u.String()
+}
 
 // engineOptions configures the concurrent headless crawl engine.
 type engineOptions struct {

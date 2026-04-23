@@ -223,9 +223,11 @@ vespasian scan <url> [flags]
   --probe            Enable active probing (default: true)
   --deduplicate      Deduplicate endpoints before probing (default: true)
   --dangerous-allow-private  Disable SSRF protection for crawling and probes,
-                     allowing private/localhost targets. Required when the seed
-                     URL is a private host (localhost, 127.0.0.1, RFC1918,
-                     link-local).
+                     allowing private/localhost targets (localhost, 127.0.0.1,
+                     RFC1918, link-local). Required when the seed URL is a
+                     private host, otherwise the crawl exits with an error and
+                     captures nothing. WARNING: Do not use on production
+                     systems.
   --no-request-id    Disable auto X-Vespasian-Request-Id header
   -v, --verbose      Show requests in real-time
 ```
@@ -244,9 +246,12 @@ vespasian crawl <url> [flags]
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Browser mode (default: true)
   --proxy            Proxy URL for headless browser (e.g., http://127.0.0.1:8080)
-  --dangerous-allow-private  Disable SSRF protection for private/localhost targets.
-                     Required when the seed URL is a private host (localhost,
-                     127.0.0.1, RFC1918, link-local).
+  --dangerous-allow-private  Disable SSRF protection for crawling, allowing
+                     private/localhost targets (localhost, 127.0.0.1, RFC1918,
+                     link-local). Required when the seed URL is a private
+                     host, otherwise the crawl exits with an error and
+                     captures nothing. WARNING: Do not use on production
+                     systems.
   --no-request-id    Disable auto X-Vespasian-Request-Id header
   -v, --verbose      Show requests in real-time
 ```
@@ -274,8 +279,9 @@ vespasian generate <api-type> <capture-file> [flags]
   --probe            Enable active probing (default: true)
   --deduplicate      Deduplicate endpoints before probing (default: true)
   --dangerous-allow-private  Disable SSRF protection on the probe path
-                     (OPTIONS/schema/WSDL-fetch/GraphQL introspection requests
-                     to private hosts).
+                     (OPTIONS/schema/WSDL-fetch/GraphQL introspection) for
+                     private/localhost targets. WARNING: Do not use on
+                     production systems.
   -v, --verbose      Show discovered endpoints
 ```
 
