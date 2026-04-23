@@ -480,7 +480,7 @@ type GenerateCmd struct {
 	Confidence            float64 `default:"0.5" help:"Minimum confidence threshold"`
 	Probe                 bool    `default:"true" help:"Enable endpoint probing"`
 	Deduplicate           bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
-	DangerousAllowPrivate bool    `help:"Disable SSRF protection for probes, allowing private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
+	DangerousAllowPrivate bool    `help:"Disable SSRF protection on the probe path (OPTIONS/schema/WSDL-fetch/GraphQL introspection) for private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 	Verbose               bool    `short:"v" help:"Enable verbose logging"`
 }
 
