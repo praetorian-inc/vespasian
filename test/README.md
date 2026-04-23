@@ -42,7 +42,7 @@ For each target:
 6. **Validate spec** — Path/operation coverage, schema structure, no static assets
 7. **Print summary** — Pass/fail status with endpoint counts and durations
 
-> **Why `--dangerous-allow-private`?** All live targets run on `localhost`, which the crawler's SSRF gate treats as a private host. The flag is required on every `vespasian crawl` invocation in this suite; running without it will exit non-zero with `seed URL rejected by frontier ...`. The flag name reflects production danger — never pass it on non-test crawls.
+> **Why `--dangerous-allow-private`?** All live targets run on `localhost`, which the crawler's SSRF gate treats as a private host. The flag is required on every `vespasian crawl` invocation in this suite; running without it will exit non-zero with `seed URL rejected by frontier ...`. The flag name reflects production-risk semantics — pass it only when you intend to crawl a known-private host (e.g., this suite, or an internal-network assessment).
 
 For the GraphQL live test (`graphql-server`):
 

@@ -28,6 +28,13 @@ import (
 // DefaultConcurrency is the default number of concurrent browser tabs.
 const DefaultConcurrency = 10
 
+// flagDangerousAllowPrivate is the CLI flag name that disables SSRF protection
+// for private/localhost targets. It is referenced in operator-facing error
+// messages so operators can copy-paste it verbatim; keep this in sync with the
+// `name:"..."` tag on CrawlCmd.DangerousAllowPrivate / ScanCmd.DangerousAllowPrivate
+// in cmd/vespasian/main.go.
+const flagDangerousAllowPrivate = "--dangerous-allow-private"
+
 // MaxConcurrency is the upper bound on concurrent browser tabs. Each tab
 // consumes significant Chrome process memory (~50 MB), so unbounded values
 // could exhaust system resources.
@@ -97,13 +104,13 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 	// Seed the frontier. If Push adds zero entries the seed was rejected
 	// (malformed URL, scope mismatch, or — the common case — the seed is a
 	// private host such as localhost / 127.0.0.1 / RFC1918 / 169.254.*, which
-	// the scope predicate's SSRF check rejects unless --dangerous-allow-private
+	// the scope predicate's SSRF check rejects unless flagDangerousAllowPrivate
 	// is set). Without this guard the crawl silently returned zero captures
 	// with no error to help the operator diagnose (LAB-2438).
 	if e.frontier.Push([]urlEntry{{URL: seedURL, Depth: 0}}) == 0 {
 		return fmt.Errorf("seed URL rejected by frontier (scope, SSRF, or parse): %s; "+
 			"if crawling a private host (localhost, 127.0.0.1, RFC1918, link-local), "+
-			"pass --dangerous-allow-private", seedURL)
+			"pass %s", seedURL, flagDangerousAllowPrivate)
 	}
 
 	// Track page count for MaxPages enforcement. The onResult callback in
