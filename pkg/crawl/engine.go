@@ -59,15 +59,19 @@ const redactedURLPlaceholder = "<URL with userinfo redacted>"
 //   - url.Parse succeeds AND the re-serialized URL has no "@": userinfo is
 //     stripped via u.User = nil and the URL is re-serialized.
 //   - url.Parse succeeds AND the re-serialized URL still contains "@":
-//     the URL is in opaque form (e.g. "http:user:pass@host/path" parses into
-//     u.Opaque rather than u.User, so u.User = nil is a no-op). Fail closed —
-//     emit the placeholder rather than round-trip credentials through u.String().
+//     either the URL is in opaque form (e.g. "http:user:pass@host/path" parses
+//     into u.Opaque rather than u.User, so u.User = nil is a no-op), or "@"
+//     appears unencoded in the path/query (Go preserves it there — e.g.
+//     "http://example.com/@user" or "http://example.com/?q=a@b"). Fail closed
+//     in both cases: emit the placeholder rather than round-trip credentials
+//     through u.String(). For the path/query case this is a deliberate false
+//     positive — operators lose host/path context, but we accept that to avoid
+//     any risk of echoing credentials. Keep the check in place.
 //   - url.Parse fails AND raw contains "@": fail closed — emit the placeholder,
 //     since a parse failure on a URL with "@" (e.g. "http://admin:se%zz@host/path"
 //     — invalid percent escape in userinfo) would otherwise echo the credentials
 //     verbatim. Note: "@" may also appear in the path or query of a malformed
-//     URL (with no real userinfo); we accept that false positive (operator loses
-//     host/path context) to avoid any risk of echoing credentials.
+//     URL (with no real userinfo); same deliberate false positive as above.
 //   - url.Parse fails AND raw contains no "@": return raw unchanged; nothing
 //     to redact and the operator still gets an actionable error.
 func redactSeedURL(raw string) string {
@@ -79,10 +83,14 @@ func redactSeedURL(raw string) string {
 		return raw
 	}
 	u.User = nil
-	// Defensive: opaque URLs (e.g. "http:user:pass@host/path") parse with
-	// userinfo in u.Opaque, so u.User = nil above is a no-op and the
-	// credentials survive u.String(). Any residual "@" after clearing User
-	// means we cannot safely emit the URL; fall back to the placeholder.
+	// Defensive: the residual-"@" check catches two distinct cases:
+	//   1. Opaque URLs (e.g. "http:user:pass@host/path") parse with userinfo
+	//      in u.Opaque, so u.User = nil above is a no-op and credentials
+	//      would survive u.String() verbatim.
+	//   2. "@" unencoded in the path or query (e.g. "http://example.com/@user")
+	//      — no credentials, but we cannot cheaply distinguish this case from
+	//      (1), so we fall back to the placeholder. Deliberate false positive;
+	//      see the function-level doc comment.
 	out := u.String()
 	if strings.Contains(out, "@") {
 		return redactedURLPlaceholder

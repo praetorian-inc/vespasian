@@ -197,6 +197,15 @@ func TestRedactSeedURL(t *testing.T) {
 		// empty-Host URLs) but pinned here because redactSeedURL lives at a
 		// package boundary.
 		{"opaque with userinfo redacts to placeholder", "http:admin:pw@host/path", redactedURLPlaceholder}, //nolint:gosec // G101: intentional opaque-form test credential used to verify fail-closed redaction
+		// Deliberate false positive: "@" is legal in path/query components
+		// (Go preserves it unencoded). The residual-"@" check cannot cheaply
+		// distinguish this from opaque-form credential smuggling, so we fail
+		// closed. Operators lose host/path context; accepted as the safer
+		// default. Pin the behavior so a future refactor that "fixes" the
+		// false positive by removing the check does not silently expose the
+		// opaque-form credential-leak path.
+		{"@ in path falls back to placeholder", "http://example.com/@user", redactedURLPlaceholder},
+		{"@ in query falls back to placeholder", "http://example.com/?q=a@b", redactedURLPlaceholder},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
