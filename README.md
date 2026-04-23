@@ -222,9 +222,10 @@ vespasian scan <url> [flags]
   --confidence       Min classification confidence (default: 0.5)
   --probe            Enable active probing (default: true)
   --deduplicate      Deduplicate endpoints before probing (default: true)
-  --dangerous-allow-private  Disable SSRF protection for private/localhost targets.
-                     Required when the seed URL is a private host (localhost,
-                     127.0.0.1, RFC1918, link-local).
+  --dangerous-allow-private  Disable SSRF protection for crawling and probes,
+                     allowing private/localhost targets. Required when the seed
+                     URL is a private host (localhost, 127.0.0.1, RFC1918,
+                     link-local).
   --no-request-id    Disable auto X-Vespasian-Request-Id header
   -v, --verbose      Show requests in real-time
 ```
@@ -273,7 +274,7 @@ vespasian generate <api-type> <capture-file> [flags]
   --probe            Enable active probing (default: true)
   --deduplicate      Deduplicate endpoints before probing (default: true)
   --dangerous-allow-private  Disable SSRF protection on the probe path
-                     (OPTIONS/schema/WSDL-fetch/GraphQL-introspection requests
+                     (OPTIONS/schema/WSDL-fetch/GraphQL introspection requests
                      to private hosts).
   -v, --verbose      Show discovered endpoints
 ```

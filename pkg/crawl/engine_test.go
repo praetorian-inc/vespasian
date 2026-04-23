@@ -65,7 +65,7 @@ func TestRodEngine_Crawl_SeedRejectedByFrontierReturnsError(t *testing.T) {
 	if !strings.Contains(err.Error(), "http://localhost:9000") {
 		t.Errorf("Crawl error %q should echo the seed URL for operator diagnosis", err)
 	}
-	if !strings.Contains(err.Error(), "--dangerous-allow-private") {
-		t.Errorf("Crawl error %q should name the remediation flag (--dangerous-allow-private) so operators know what to do", err)
+	if !strings.Contains(err.Error(), flagDangerousAllowPrivate) {
+		t.Errorf("Crawl error %q should name the remediation flag (%s) so operators know what to do", err, flagDangerousAllowPrivate)
 	}
 }
