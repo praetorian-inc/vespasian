@@ -138,13 +138,26 @@ func (c *Crawler) crawlHeadless(ctx context.Context, targetURL string, maxPages 
 		return nil, fmt.Errorf("scope setup: %w", err)
 	}
 
+	// LAB-2222: a Cookie value passed via --header must be injected into
+	// Chrome's cookie store (Storage.setCookies), not attached as an extra
+	// HTTP header. Extra headers set via Network.setExtraHTTPHeaders don't
+	// survive server-side redirects (e.g., Spring Security's 302→/login on
+	// WebGoat strips the JSESSIONID, breaking session auth). Cookies in
+	// Chrome's own store persist across redirects, new tabs, and fetches.
+	// See ApplyCookieHeader for the extract/parse/inject pipeline and
+	// cookies_test.go for the wiring coverage.
+	extraHeaders, err := ApplyCookieHeader(c.opts.Headers, targetURL, browserMgr.SetCookies)
+	if err != nil {
+		return nil, err
+	}
+
 	engine, err := newRodEngine(browserMgr.wsURL(), engineOptions{
 		Concurrency:   c.opts.Concurrency,
 		MaxPages:      maxPages,
 		MaxDepth:      c.opts.Depth,
 		PageTimeout:   time.Duration(PageTimeout) * time.Second,
 		StableTimeout: DefaultStableWait,
-		Headers:       c.opts.Headers,
+		Headers:       extraHeaders,
 		ScopeCheck:    scopeFn,
 		Stderr:        c.opts.Stderr,
 	})
