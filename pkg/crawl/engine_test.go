@@ -87,7 +87,7 @@ func TestRodEngine_Crawl_SeedRejectionRedactsUserinfo(t *testing.T) {
 		frontier: newURLFrontier(2, rejectAll),
 	}
 
-	seed := "http://admin:s3cret@10.0.0.5:8080/path"
+	seed := "http://admin:s3cret@10.0.0.5:8080/path" //nolint:gosec // G101: intentional test credential used to verify redactSeedURL strips userinfo from error messages
 	err := e.Crawl(context.Background(), seed, func(ObservedRequest) {
 		t.Fatal("onResult must not be called when the seed is rejected")
 	})
