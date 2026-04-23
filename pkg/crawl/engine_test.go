@@ -113,9 +113,15 @@ func TestRodEngine_Crawl_SeedAcceptedDoesNotReturnRejectionError(t *testing.T) {
 		frontier: newURLFrontier(2, acceptAll),
 	}
 
+	// With Concurrency=0 and context.Background(), Crawl's control flow is
+	// deterministically: Push succeeds → range over 0 launches no workers →
+	// wg.Wait returns immediately → return ctx.Err() == nil. Any non-nil error
+	// at all is a regression of AC #2 (happy path must not fail). Asserting
+	// err == nil (rather than only inspecting for the rejection substring)
+	// keeps the tripwire broad so an unrelated regression does not slip past.
 	err := e.Crawl(context.Background(), "http://example.com", func(ObservedRequest) {})
-	if err != nil && strings.Contains(err.Error(), "seed URL rejected by frontier") {
-		t.Fatalf("Crawl returned rejection error %q on accept-all predicate; AC #2 requires the happy path to not trigger the rejection path", err)
+	if err != nil {
+		t.Fatalf("Crawl returned unexpected error %q on accept-all predicate; AC #2 happy path must return nil", err)
 	}
 }
 
@@ -183,14 +189,14 @@ func TestRedactSeedURL(t *testing.T) {
 		// url.Parse fails (invalid percent-escape in userinfo) AND the raw
 		// string contains "@", so we fail closed: the placeholder is emitted
 		// instead of echoing "admin:se%zz@host/path" with credentials.
-		{"malformed with userinfo redacts to placeholder", "http://admin:se%zz@host/path", unparseableURLPlaceholder}, //nolint:gosec // G101: intentional malformed test credential used to verify fail-closed redaction
+		{"malformed with userinfo redacts to placeholder", "http://admin:se%zz@host/path", redactedURLPlaceholder}, //nolint:gosec // G101: intentional malformed test credential used to verify fail-closed redaction
 		// Opaque form: "http:user:pass@host/path" parses as Opaque="user:pass@host/path"
 		// with u.User nil. Clearing u.User is a no-op and u.String() would
 		// round-trip the credentials — the residual "@" check forces the
 		// placeholder. Not reachable via the CLI (main.go:validateURL blocks
 		// empty-Host URLs) but pinned here because redactSeedURL lives at a
 		// package boundary.
-		{"opaque with userinfo redacts to placeholder", "http:admin:pw@host/path", unparseableURLPlaceholder}, //nolint:gosec // G101: intentional opaque-form test credential used to verify fail-closed redaction
+		{"opaque with userinfo redacts to placeholder", "http:admin:pw@host/path", redactedURLPlaceholder}, //nolint:gosec // G101: intentional opaque-form test credential used to verify fail-closed redaction
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

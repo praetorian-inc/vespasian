@@ -47,12 +47,12 @@ const DefaultStableWait = 3 * time.Second
 // in cmd/vespasian/main.go.
 const flagDangerousAllowPrivate = "--dangerous-allow-private"
 
-// unparseableURLPlaceholder is substituted for a URL that cannot be safely
+// redactedURLPlaceholder is substituted for a URL that cannot be safely
 // stripped of userinfo (either url.Parse failed and "@" is present, or
 // url.Parse succeeded into an opaque form where u.User is not populated).
 // Emitting the raw string in either case would leak credentials — the whole
 // point of redactSeedURL is to hide them.
-const unparseableURLPlaceholder = "<unparseable URL with userinfo redacted>"
+const redactedURLPlaceholder = "<URL with userinfo redacted>"
 
 // redactSeedURL returns raw with any userinfo (user[:password]) removed so the
 // URL can be echoed to stderr / logs without leaking credentials. Behavior:
@@ -74,7 +74,7 @@ func redactSeedURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
 		if strings.Contains(raw, "@") {
-			return unparseableURLPlaceholder
+			return redactedURLPlaceholder
 		}
 		return raw
 	}
@@ -85,7 +85,7 @@ func redactSeedURL(raw string) string {
 	// means we cannot safely emit the URL; fall back to the placeholder.
 	out := u.String()
 	if strings.Contains(out, "@") {
-		return unparseableURLPlaceholder
+		return redactedURLPlaceholder
 	}
 	return out
 }
