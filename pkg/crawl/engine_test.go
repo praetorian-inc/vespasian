@@ -15,6 +15,7 @@
 package crawl
 
 import (
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -345,5 +346,72 @@ func TestMergeEnrichedLinks_MixedFormsWithScope(t *testing.T) {
 		if strings.Contains(u, "attacker.example") {
 			t.Fatalf("attacker URL leaked into links: %q", u)
 		}
+	}
+}
+
+// Round-11 TEST-001 regression: enrichFromPage threads scopeFn (from
+// e.opts.ScopeCheck) through to mergeEnrichedLinks in a single one-line
+// call. Integration test TestRodEngine_ScopeFiltering covers this in a
+// full browser environment, but default-suite coverage was absent — a
+// refactor that dropped scopeFn at the enrichFromPage -> mergeEnrichedLinks
+// call site would not fail any default-suite test.
+//
+// These tests install a spy merger via the package-level mergeEnrichedLinksFn
+// var (exposed for exactly this purpose), then call enrichFromPage with a
+// nil *rod.Page (routed straight to the merger by the nil-page guard) and
+// verify the spy observed the same scopeFn function pointer the caller passed.
+
+func TestEnrichFromPage_ThreadsScopeFnToMergeEnrichedLinks(t *testing.T) {
+	var captured struct {
+		scopeFn func(string) bool
+		pageURL string
+		baseURL string
+	}
+	orig := mergeEnrichedLinksFn
+	mergeEnrichedLinksFn = func(c []ObservedRequest, domLinks []string, jsFromResponses, jsFromInline []jsExtractedURL, forms []discoveredForm, pageURL, baseURL string, scopeFn func(string) bool) ([]ObservedRequest, []string) {
+		captured.scopeFn = scopeFn
+		captured.pageURL = pageURL
+		captured.baseURL = baseURL
+		return c, nil
+	}
+	t.Cleanup(func() { mergeEnrichedLinksFn = orig })
+
+	myScope := func(string) bool { return false }
+	_, _ = enrichFromPage(nil, nil, "https://ex.com/login", nil, myScope)
+
+	if captured.scopeFn == nil {
+		t.Fatal("scopeFn was not passed to mergeEnrichedLinks")
+	}
+	// Compare function pointers: the spy must have received the SAME
+	// scopeFn the caller passed, not nil and not some wrapper.
+	if reflect.ValueOf(captured.scopeFn).Pointer() != reflect.ValueOf(myScope).Pointer() {
+		t.Errorf("scopeFn identity differs: enrichFromPage passed a different function to mergeEnrichedLinks")
+	}
+	if captured.pageURL != "https://ex.com/login" {
+		t.Errorf("pageURL = %q, want %q", captured.pageURL, "https://ex.com/login")
+	}
+	// The nil-page guard uses pageURL for both pageURL AND baseURL since
+	// there's no DOM to read a <base href> from.
+	if captured.baseURL != "https://ex.com/login" {
+		t.Errorf("baseURL = %q, want %q (nil-page guard uses pageURL)", captured.baseURL, "https://ex.com/login")
+	}
+}
+
+// Companion: enrichFromPage with nil scopeFn must forward nil (not a
+// wrapper). Protects against a refactor that silently defaults scopeFn
+// to an accept-all function before the merger call.
+func TestEnrichFromPage_ThreadsNilScopeFn(t *testing.T) {
+	var got func(string) bool
+	orig := mergeEnrichedLinksFn
+	mergeEnrichedLinksFn = func(c []ObservedRequest, _ []string, _, _ []jsExtractedURL, _ []discoveredForm, _, _ string, scopeFn func(string) bool) ([]ObservedRequest, []string) {
+		got = scopeFn
+		return c, nil
+	}
+	t.Cleanup(func() { mergeEnrichedLinksFn = orig })
+
+	_, _ = enrichFromPage(nil, nil, "https://ex.com/", nil, nil)
+
+	if got != nil {
+		t.Errorf("nil scopeFn was wrapped into non-nil by enrichFromPage; got non-nil function — mergeEnrichedLinks would apply filtering")
 	}
 }

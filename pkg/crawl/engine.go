@@ -297,6 +297,16 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 // link-combining logic to [mergeEnrichedLinks], which is directly unit
 // tested.
 func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, stderr io.Writer, scopeFn func(string) bool) ([]ObservedRequest, []string) {
+	// Defensive: a nil page means there's nothing to read from the DOM.
+	// Route straight to the merger so any already-captured network requests
+	// are still returned. No production caller passes nil today — this
+	// guard exists so the merger-threading contract can be tested without
+	// standing up a real rod.Page (round-11 TEST-001).
+	if page == nil {
+		captured, links := mergeEnrichedLinksFn(captured, nil, nil, nil, nil, pageURL, pageURL, scopeFn)
+		return captured, links
+	}
+
 	// Resolve the effective base URL for any relative references on this page.
 	// jsluice-extracted URLs and form actions must honor <base href> the same
 	// way the browser would, or we end up queuing mangled/nested paths.
@@ -326,9 +336,17 @@ func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, 
 		fmt.Fprintf(stderr, "form extraction failed for %s: %v\n", pageURL, ferr) //nolint:errcheck // best-effort
 	}
 
-	captured, links := mergeEnrichedLinks(captured, domLinks, jsFromResponses, jsFromInline, forms, resolvedPageURL, baseURL, scopeFn)
+	captured, links := mergeEnrichedLinksFn(captured, domLinks, jsFromResponses, jsFromInline, forms, resolvedPageURL, baseURL, scopeFn)
 	return captured, links
 }
+
+// mergeEnrichedLinksFn is the function enrichFromPage calls to combine
+// page-extracted inputs with scope enforcement. Package-level var so tests
+// can verify the scopeFn argument is threaded correctly from e.opts.ScopeCheck
+// through enrichFromPage to mergeEnrichedLinks (the one-line call was
+// previously integration-only coverage — see LAB-2221 round-11 TEST-001).
+// Production callers always see the real mergeEnrichedLinks.
+var mergeEnrichedLinksFn = mergeEnrichedLinks
 
 // mergeEnrichedLinks combines every link source discovered on a page into a
 // single link list for the frontier, appends synthetic form ObservedRequests
