@@ -27,12 +27,16 @@
 //
 // Safety limits:
 //
-//   - File size: 500 MB hard cap (all formats).
-//   - Entry count: each importer enforces a format-specific cap on the
-//     number of records it will parse, to bound CPU on pathological inputs.
-//     See the package-private caps (e.g. maxNativeFlows for the native
-//     mitmproxy path) for current values. Pass [ImportOptions.MaxEntries]
-//     through [ImportWithOptions] to apply a tighter caller-specified limit.
+//   - File size: 500 MB hard cap (all formats), enforced by the shared
+//     limitedReader wrapper on every importer's input stream.
+//   - Entry count: only the native mitmproxy path carries an in-parser
+//     flow-count cap (maxNativeFlows = 500k). Burp XML, HAR, and mitmproxy
+//     JSON paths are bounded only by the 500 MB file-size cap plus their
+//     format's intrinsic per-element constraints (e.g. the native path's
+//     64 MB per-tnetstring-element cap).
+//   - Consumer-side limit: [ImportOptions.MaxEntries] applied via
+//     [ImportWithOptions] filters the returned slice post-parse — it is
+//     not a parser-allocation bound.
 //   - Per-element size (native mitmproxy only): any single tnetstring
 //     element is capped at 64 MB. This applies to request/response BODIES
 //     as well as the flow dict itself. Captures containing a single

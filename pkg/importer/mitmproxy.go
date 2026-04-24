@@ -250,10 +250,14 @@ func (i *MitmproxyImporter) importNative(bufReader *bufio.Reader, limitedReader 
 //
 // Scope note: mitmproxy flow state also carries `websocket` (WebSocket frames
 // after an HTTP Upgrade), `error` (transport-level errors), and `trailers`
-// (HTTP trailers) sub-dicts. vespasian's ObservedRequest model does not
-// represent these, so they are intentionally dropped. If future probes or
-// classifiers need them, extend ObservedRequest first and thread fields
-// through here.
+// (HTTP trailers) sub-dicts. These are intentionally and permanently
+// out-of-scope for this importer — vespasian's API-discovery pipeline
+// consumes request/response pairs only, and ObservedRequest has no fields
+// for transport-level errors, post-upgrade frames, or trailing headers. If
+// future probes or classifiers need them, that is a deliberate
+// ObservedRequest schema change that should land before (not alongside)
+// extending this function; no follow-up ticket is tracked because the
+// omission is not tech debt.
 func flowFromNativeState(state map[string]any) (mitmproxyFlow, error) {
 	reqAny, ok := state["request"]
 	if !ok {
@@ -440,6 +444,13 @@ func peekFirstNonWhitespace(r *bufio.Reader) (byte, error) {
 // ride through to any downstream consumer that re-fetches, replays, or
 // inspects the ObservedRequest.URL. mitmproxy itself only emits http/https,
 // so constraining at the importer boundary costs nothing legitimate.
+//
+// Treat as read-only at runtime. Declared as a var (not a const) only
+// because Go does not allow const maps; no production call site mutates
+// it, and no test currently overrides it via withTempCap. If a future
+// test needs to add a scheme, mirror the NOT PARALLEL-SAFE discipline
+// used for the tnetstring size caps (no t.Parallel, restore via
+// t.Cleanup).
 var allowedSchemes = map[string]bool{
 	"http":  true,
 	"https": true,
@@ -489,6 +500,22 @@ func validateHost(host string) error {
 		// "[host]:port" — do both together so URL generation stays valid.
 		return fmt.Errorf("host contains port separator (\":\"); port must be carried in the port field")
 	}
+	if strings.ContainsAny(host, "/?#\\[]") {
+		// The remaining RFC 3986 authority-terminating delimiters are the
+		// same defense-in-depth class as ':'. url.URL.String() emits Host
+		// unescaped, so host="evil.com?hijacked=1" with port=443 yields
+		// URL "https://evil.com?hijacked=1/real-path?real=1"; downstream
+		// re-parse sees Host=evil.com plus a corrupted RawQuery and the
+		// captured path/query is silently overwritten. '#' smuggles a
+		// fragment (path dropped), '/' smuggles a path prefix, '\' is
+		// treated by some lenient parsers as a path separator, and '['/']'
+		// create IPv6-bracket confusion. mitmproxy's HTTPFlow.get_state()
+		// never emits any of these in the host field, so rejection is
+		// pure gain. If future IPv6 support lands, bracketed "[::1]" hosts
+		// must be re-allowed alongside constructURL bracketing — do both
+		// together.
+		return fmt.Errorf("host contains URL-delimiter byte; authority components must live in their own fields")
+	}
 	for _, r := range host {
 		// Reject ASCII control bytes and whitespace. Non-ASCII (e.g. IDN) is
 		// permitted because mitmproxy's host field may carry punycode or
@@ -511,6 +538,12 @@ func validateHost(host string) error {
 // already raw []byte (native path assigns directly; JSON path base64-decodes
 // during json.Decode since Go maps JSON strings into []byte as base64).
 func (i *MitmproxyImporter) parseFlow(flow mitmproxyFlow) (crawl.ObservedRequest, error) {
+	// JSON path: json.Decode accepts any int that fits in Go's int type, so
+	// a forged JSON capture can set `port: -1` or `port: 999999`. The native
+	// path runs through requirePort (tnetstring.go) which already bounds the
+	// range before we get here, so this guard is redundant for native flows
+	// but necessary for the JSON path — keep both call sites reaching the
+	// same error message.
 	if flow.Request.Port < 0 || flow.Request.Port > 65535 {
 		return crawl.ObservedRequest{}, fmt.Errorf("invalid port: %d (must be 0-65535)", flow.Request.Port)
 	}
@@ -565,8 +598,20 @@ func nilIfEmpty(b []byte) []byte {
 // to re-encode any `%` characters, double-encoding sequences like
 // `/api/hello%20world` into `/api/hello%2520world`. Setting both u.Path
 // (decoded) and u.RawPath (verbatim) makes EscapedPath() emit the wire form
-// unchanged; if the path isn't well-formed percent-encoding, we fall back to
-// Path-only and let url.URL handle it.
+// unchanged.
+//
+// Malformed-input fallback: if pathPart is not well-formed percent-encoding
+// (e.g. `/api/bad%ZZ`, where %ZZ is not a valid hex escape), PathUnescape
+// returns an error and we fall back to `u.Path = pathPart` with no RawPath.
+// url.URL.String() then runs EscapedPath() over the raw bytes, which
+// re-percent-encodes `%` into `%25` — so `/api/bad%ZZ` comes out as
+// `/api/bad%25ZZ` in ObservedRequest.URL. This is lossy: downstream
+// consumers see a valid-shaped URL that no longer represents the exact
+// wire bytes. It is intentional — the alternative is to fail the entire
+// import over a single malformed path, which would reject real-world
+// captures with byte-level wire noise. If you need to tell "corrupted
+// input" apart from "valid percent-encoding" downstream, inspect the path
+// byte-for-byte against the captured flow, not the reconstructed URL.
 func constructURL(scheme, host string, port int, path string) string {
 	pathPart, query, _ := strings.Cut(path, "?")
 

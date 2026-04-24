@@ -213,6 +213,14 @@ func readLengthPrefix(r io.ByteReader, maxLen int) (int, error) { //nolint:gocyc
 		if b < '0' || b > '9' {
 			return 0, fmt.Errorf("tnetstring: invalid length prefix byte %q", b)
 		}
+		// Digit-count cap is checked AFTER digit validity so the error
+		// classification is stable — an invalid byte past the cap still
+		// reports "invalid length prefix byte", not "exceeds N digits".
+		// A consequence is that the (maxLengthPrefixDigits+1)-th byte is
+		// consumed from the underlying reader before the cap error fires;
+		// this is intentional, since the reader is already past the point
+		// where the stream is well-formed and callers treat the error as
+		// terminal.
 		if len(digits) == maxLengthPrefixDigits {
 			return 0, fmt.Errorf("tnetstring: length prefix exceeds %d digits", maxLengthPrefixDigits)
 		}

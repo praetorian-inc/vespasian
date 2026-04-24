@@ -17,6 +17,7 @@ package importer
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1625,6 +1626,18 @@ func TestMitmproxyImporter_Native_InvalidHostRejected(t *testing.T) {
 		// default) would ride through constructURL's isDefaultPort branch and
 		// emit URL "https://evil.example.com:1337/...", bypassing requirePort.
 		{"embedded port separator", "evil.example.com:1337", "port separator"},
+		// URL-delimiter rejections close the remaining authority-smuggling
+		// shapes (SEC-BE-001, round 4). Each delimiter lets an attacker-
+		// supplied host overwrite a downstream URL component: '/' smuggles
+		// path prefix, '?' overwrites query, '#' takes over fragment (path
+		// dropped), '\' is treated as path by lenient parsers, '['/']'
+		// create IPv6-bracket parser confusion.
+		{"embedded slash", "evil.example.com/hijacked", "URL-delimiter"},
+		{"embedded question", "evil.example.com?hijacked=1", "URL-delimiter"},
+		{"embedded hash", "evil.example.com#frag", "URL-delimiter"},
+		{"embedded backslash", "evil.example.com\\hijacked", "URL-delimiter"},
+		{"embedded open bracket", "evil.example.com[", "URL-delimiter"},
+		{"embedded close bracket", "evil.example.com]", "URL-delimiter"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1817,4 +1830,83 @@ func TestMitmproxyImporter_Native_ConstructURLWithQueryString(t *testing.T) {
 	require.Len(t, requests, 1)
 	assert.Equal(t, "https://example.com/api/hello%20world?q=foo+bar", requests[0].URL)
 	assert.NotContains(t, requests[0].URL, "%2520")
+}
+
+// TestMitmproxyImporter_parseJSONArray_HitLimitReturnsErrFileTooLarge
+// pins the hitLimit propagation at parseJSONArray's three distinct error
+// sites (mitmproxy.go lines 133-135 Token-start, 142-144 Decode-body,
+// 154-156 Token-end). Each site has the same `if limitedReader.hitLimit
+// { return nil, ErrFileTooLarge }` guard; a regression that dropped any
+// one of them would be silently invisible without per-site coverage.
+// The three subtests size limitedReader's cap to force EOF at each
+// distinct point in the parse:
+//   - cap=0        → decoder cannot even read '['  → Token-start branch
+//   - cap=2        → decoder reads '[' but chokes on the body → Decode branch
+//   - cap=len-1    → full object decodes; closing ']' is unreachable → Token-end
+//
+// Paired with the object-path test below.
+func TestMitmproxyImporter_parseJSONArray_HitLimitReturnsErrFileTooLarge(t *testing.T) {
+	input := `[{"request":{"method":"GET","scheme":"http","host":"example.com","port":80,"path":"/"}}]`
+	cases := []struct {
+		name string
+		cap  int64
+	}{
+		{"token_start_hitlimit", 0},                   // 133-135: Token() fails on '['
+		{"decode_body_hitlimit", 2},                   // 142-144: '[' read, Decode on body EOFs
+		{"token_end_hitlimit", int64(len(input)) - 1}, // 154-156: body decodes, closing ']' unreachable
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lr := newLimitedReader(strings.NewReader(input), tc.cap)
+			dec := json.NewDecoder(lr)
+			m := &MitmproxyImporter{}
+			_, err := m.parseJSONArray(dec, lr)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrFileTooLarge)
+		})
+	}
+}
+
+// TestMitmproxyImporter_parseJSONObject_HitLimitReturnsErrFileTooLarge
+// is the single-object counterpart to the array test above. parseJSONObject
+// has exactly one hitLimit propagation site (mitmproxy.go lines 167-169);
+// this test pins it. The two tests together cover every hitLimit branch
+// introduced by round-10's importJSON split.
+func TestMitmproxyImporter_parseJSONObject_HitLimitReturnsErrFileTooLarge(t *testing.T) {
+	input := `{"request":{"method":"GET","scheme":"http","host":"example.com","port":80,"path":"/"}}`
+	lr := newLimitedReader(strings.NewReader(input), 5)
+	dec := json.NewDecoder(lr)
+	m := &MitmproxyImporter{}
+	_, err := m.parseJSONObject(dec, lr)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrFileTooLarge)
+}
+
+// TestMitmproxyImporter_Native_ConstructURLInvalidPercentEscapeFallsBack
+// pins the else-branch of constructURL's PathUnescape-failure fallback
+// (mitmproxy.go lines 614-616). All other constructURL tests feed
+// well-formed percent-encoding (%20, etc.), so this branch was at 0%
+// coverage: a refactor dropping the fallback (or changing it to an
+// error return) would previously have passed every test. Input path
+// "/api/bad%ZZ" is not valid percent-encoding (%ZZ is not a hex escape),
+// so PathUnescape errors and the fallback assigns u.Path = pathPart
+// (Path-only, no RawPath). url.URL.String() then re-percent-encodes the
+// literal '%' in the path to %25, producing "/api/bad%25ZZ" in the
+// emitted URL — that lossy round-trip is documented in constructURL's
+// fallback comment and pinned here.
+func TestMitmproxyImporter_Native_ConstructURLInvalidPercentEscapeFallsBack(t *testing.T) {
+	state := flowState(
+		"GET", "https", "example.com", 443, "/api/bad%ZZ",
+		nil, nil, 200, nil, nil,
+	)
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(bytes.NewReader(encodeTnet(state)))
+	require.NoError(t, err, "import should succeed; malformed percent-escape falls back to Path-only")
+	require.Len(t, requests, 1)
+	// %25 is the re-encoding of the literal '%' in pathPart after the
+	// PathUnescape-failure fallback hands the raw bytes to Path and
+	// url.URL.String() runs EscapedPath over them.
+	assert.Equal(t, "https://example.com/api/bad%25ZZ", requests[0].URL,
+		"PathUnescape-failure fallback should double-encode '%%' to '%%25'")
 }
