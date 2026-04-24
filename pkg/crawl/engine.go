@@ -18,6 +18,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,6 +37,66 @@ const MaxConcurrency = 50
 
 // DefaultStableWait is the default DOM stability wait duration.
 const DefaultStableWait = 3 * time.Second
+
+// ---- operator-message helpers ----
+
+// flagDangerousAllowPrivate is the CLI flag name that disables SSRF protection
+// for private/localhost targets. It is referenced in operator-facing error
+// messages so operators can copy-paste it verbatim; keep this in sync with the
+// `name:"..."` tag on CrawlCmd.DangerousAllowPrivate / ScanCmd.DangerousAllowPrivate
+// in cmd/vespasian/main.go.
+const flagDangerousAllowPrivate = "--dangerous-allow-private"
+
+// redactedURLPlaceholder is substituted for a URL that cannot be safely
+// stripped of userinfo (either url.Parse failed and "@" is present, or
+// url.Parse succeeded into an opaque form where u.User is not populated).
+// Emitting the raw string in either case would leak credentials — the whole
+// point of redactSeedURL is to hide them.
+const redactedURLPlaceholder = "<URL with userinfo redacted>"
+
+// redactSeedURL returns raw with any userinfo (user[:password]) removed so the
+// URL can be echoed to stderr / logs without leaking credentials. Behavior:
+//   - url.Parse succeeds AND the re-serialized URL has no "@": userinfo is
+//     stripped via u.User = nil and the URL is re-serialized.
+//   - url.Parse succeeds AND the re-serialized URL still contains "@":
+//     either the URL is in opaque form (e.g. "http:user:pass@host/path" parses
+//     into u.Opaque rather than u.User, so u.User = nil is a no-op), or "@"
+//     appears unencoded in the path/query (Go preserves it there — e.g.
+//     "http://example.com/@user" or "http://example.com/?q=a@b"). Fail closed
+//     in both cases: emit the placeholder rather than round-trip credentials
+//     through u.String(). For the path/query case this is a deliberate false
+//     positive — operators lose host/path context, but we accept that to avoid
+//     any risk of echoing credentials. Keep the check in place.
+//   - url.Parse fails AND raw contains "@": fail closed — emit the placeholder,
+//     since a parse failure on a URL with "@" (e.g. "http://admin:se%zz@host/path"
+//     — invalid percent escape in userinfo) would otherwise echo the credentials
+//     verbatim. Note: "@" may also appear in the path or query of a malformed
+//     URL (with no real userinfo); same deliberate false positive as above.
+//   - url.Parse fails AND raw contains no "@": return raw unchanged; nothing
+//     to redact and the operator still gets an actionable error.
+func redactSeedURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		if strings.Contains(raw, "@") {
+			return redactedURLPlaceholder
+		}
+		return raw
+	}
+	u.User = nil
+	// Defensive: the residual-"@" check catches two distinct cases:
+	//   1. Opaque URLs (e.g. "http:user:pass@host/path") parse with userinfo
+	//      in u.Opaque, so u.User = nil above is a no-op and credentials
+	//      would survive u.String() verbatim.
+	//   2. "@" unencoded in the path or query (e.g. "http://example.com/@user")
+	//      — no credentials, but we cannot cheaply distinguish this case from
+	//      (1), so we fall back to the placeholder. Deliberate false positive;
+	//      see the function-level doc comment.
+	out := u.String()
+	if strings.Contains(out, "@") {
+		return redactedURLPlaceholder
+	}
+	return out
+}
 
 // engineOptions configures the concurrent headless crawl engine.
 type engineOptions struct {
@@ -94,8 +156,23 @@ func newRodEngine(wsURL string, opts engineOptions) (*rodEngine, error) {
 // completes (frontier exhausted, maxPages reached, or ctx canceled). Each
 // captured network request is passed to onResult as it is observed.
 func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(ObservedRequest)) error {
-	// Seed the frontier.
-	e.frontier.Push([]urlEntry{{URL: seedURL, Depth: 0}})
+	// Seed the frontier. If Push adds zero entries the seed was rejected
+	// (malformed URL, scope mismatch, or — the common case — the seed is a
+	// private host such as localhost / 127.0.0.1 / RFC1918 / 169.254.*, which
+	// the scope predicate's SSRF check rejects unless flagDangerousAllowPrivate
+	// is set). Without this guard the crawl silently returned zero captures
+	// with no error to help the operator diagnose (LAB-2438).
+	if e.frontier.Push([]urlEntry{{URL: seedURL, Depth: 0}}) == 0 {
+		// redactSeedURL strips userinfo (user[:password]) before echoing the
+		// seed URL to stderr. If an operator pastes a credentialed URL and
+		// forgets flagDangerousAllowPrivate, the error message still lands in
+		// shell history / CI logs / scrollback — without this we would emit
+		// the cleartext credentials. url.Parse errors return the raw string
+		// unchanged so the operator still sees an actionable message.
+		return fmt.Errorf("seed URL rejected by frontier (scope, SSRF, or parse): %s; "+
+			"if crawling a private host (localhost, 127.0.0.1, RFC1918, link-local), "+
+			"pass %s", redactSeedURL(seedURL), flagDangerousAllowPrivate)
+	}
 
 	// Track page count for MaxPages enforcement. The onResult callback in
 	// Crawler.crawlHeadless also tracks this, but we need our own counter

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -305,6 +306,87 @@ func TestRodEngine_ScopeFiltering(t *testing.T) {
 		t.Logf("Visited: %s", url)
 	}
 	mu.Unlock()
+}
+
+// TestCrawler_CookieHeaderPropagatesAcrossRedirects regresses LAB-2222: a
+// session cookie supplied via -H "Cookie: ..." must be attached to every
+// subsequent request the browser makes, including redirect follow-ups. The
+// test server mimics Spring Security: unauthenticated requests get a 302 to
+// /login; authenticated requests (valid JSESSIONID) get the protected
+// payload. If the crawler stuffs the cookie into Network.setExtraHTTPHeaders
+// instead of Chrome's cookie store, the 302 follow-up will strip it and the
+// test will see no authenticated /protected hit.
+func TestCrawler_CookieHeaderPropagatesAcrossRedirects(t *testing.T) {
+	const sessionID = "TESTSESSION123"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authed := false
+		if c, err := r.Cookie("JSESSIONID"); err == nil && c.Value == sessionID {
+			authed = true
+		}
+		switch r.URL.Path {
+		case "/":
+			if !authed {
+				http.Redirect(w, r, "/login", http.StatusFound)
+				return
+			}
+			// Authed "/" 302 -> /protected exercises the cookie-across-redirect
+			// path directly — the Spring-Security scenario this test regresses.
+			// Previously returned an HTML link, which only tested frontier
+			// link-following, not server-side redirect cookie propagation.
+			http.Redirect(w, r, "/protected", http.StatusFound)
+		case "/login":
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, `<html><body><h1>Login</h1></body></html>`)
+		case "/protected":
+			if !authed {
+				http.Redirect(w, r, "/login", http.StatusFound)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, `<html><body><h1>Protected content</h1></body></html>`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	bm := launchTestBrowser(t)
+	c := NewCrawler(CrawlerOptions{
+		Depth:        2,
+		MaxPages:     20,
+		Timeout:      30 * time.Second,
+		Scope:        "same-origin",
+		Headless:     true,
+		Headers:      map[string]string{"Cookie": "JSESSIONID=" + sessionID},
+		AllowPrivate: true,
+		BrowserMgr:   bm,
+	})
+
+	results, err := c.Crawl(context.Background(), srv.URL+"/")
+	if err != nil {
+		t.Fatalf("Crawl error: %v", err)
+	}
+
+	// We expect to see the /protected page actually rendered (200 with the
+	// "Protected content" marker), which only happens when the cookie
+	// propagates to the redirect follow-up.
+	seenProtected := false
+	for _, r := range results {
+		if r.URL == srv.URL+"/protected" &&
+			r.Response.StatusCode == 200 &&
+			strings.Contains(string(r.Response.Body), "Protected content") {
+			seenProtected = true
+			break
+		}
+	}
+	if !seenProtected {
+		seen := make([]string, 0, len(results))
+		for _, r := range results {
+			seen = append(seen, fmt.Sprintf("%d %s", r.Response.StatusCode, r.URL))
+		}
+		t.Errorf("expected authenticated 200 on /protected; session cookie did not propagate. Captured:\n  %s", strings.Join(seen, "\n  "))
+	}
 }
 
 func TestRodEngine_DepthLimit(t *testing.T) {

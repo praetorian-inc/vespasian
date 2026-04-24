@@ -102,6 +102,8 @@ The `test/` directory contains live test targets:
 - **test/soap-service/**: Go HTTP server exposing SOAP/WSDL endpoints
 - **test/graphql-server/**: Node.js GraphQL server with Apollo
 
+See `test/README.md` for how to run the suite, including the `TEST_HOST` override for devcontainer setups.
+
 ## Code Conventions
 
 - Go file naming: lowercase with underscores (e.g., `rest_classifier.go`, not `restClassifier.go`)
