@@ -65,12 +65,11 @@ func TestEncode_PercentInPayloadIsNotFormatDirective(t *testing.T) {
 func TestEncode_NullByteInPayload(t *testing.T) {
 	// Arbitrary binary bodies (including NUL) must survive encoding intact.
 	payload := []byte{0x00, 0xFF, 0x7F, 0x01}
-	got := Encode(payload)
-	// "4:" + 4 payload bytes + ","
-	assert.Equal(t, 7, len(got))
-	assert.Equal(t, "4:", string(got[:2]))
-	assert.Equal(t, payload, got[2:6])
-	assert.Equal(t, byte(','), got[6])
+	// "4:" + 4 payload bytes + "," — one byte-exact compare keeps the diff
+	// readable if the encoder ever drifts on length prefix, marker, or
+	// payload framing.
+	want := append([]byte("4:"), append(payload, ',')...)
+	assert.Equal(t, want, Encode(payload))
 }
 
 func TestEncode_EmptyList(t *testing.T) {

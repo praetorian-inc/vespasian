@@ -486,6 +486,13 @@ func validateHost(host string) error {
 		// (https default) yields URL "https://evil.com:1337/...". mitmproxy's
 		// HTTPFlow.get_state() never populates host with a port suffix (port
 		// lives in its own field), so this rejection has zero legitimate cost.
+		//
+		// IPv6 literals (e.g. "::1", "2001:db8::1") are intentionally out of
+		// scope: mitmproxy's IPv6-capture support has not been exercised here,
+		// constructURL does not bracket IPv6 hosts per RFC 3986, and no test
+		// fixture covers v6 flows. If IPv6 support is needed, allow colons
+		// only when net.ParseIP(host) != nil AND teach constructURL to emit
+		// "[host]:port" — do both together so URL generation stays valid.
 		return fmt.Errorf("host contains port separator (\":\"); port must be carried in the port field")
 	}
 	for _, r := range host {

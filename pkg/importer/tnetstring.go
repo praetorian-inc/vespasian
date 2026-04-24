@@ -52,8 +52,14 @@ import (
 // maxTnetstringDepth bounds mutual recursion (dict→list→dict→...) to prevent
 // stack exhaustion on crafted inputs.
 const (
-	maxTnetstringDepth    = 64 // mitmproxy flow dicts nest ~4 levels in practice
-	maxLengthPrefixDigits = 9  // digits(maxTnetstringElement) = 8; 9 leaves headroom
+	maxTnetstringDepth = 64 // mitmproxy flow dicts nest ~4 levels in practice
+	// maxLengthPrefixDigits=9 keeps the parsed length below 10^9 ≈ 2^30, well
+	// inside int32 range on every Go-supported target. readLengthPrefix relies
+	// on this for its strconv.Atoi call: with int potentially 32-bit on some
+	// platforms, letting the cap grow past 9 digits would re-introduce overflow
+	// risk. Changing this constant requires re-validating the Atoi invariant
+	// (or switching to strconv.ParseInt with explicit bit size).
+	maxLengthPrefixDigits = 9 // digits(maxTnetstringElement) = 8; 9 leaves headroom
 )
 
 // maxTnetstringElement caps any single element's payload size. Declared as a
