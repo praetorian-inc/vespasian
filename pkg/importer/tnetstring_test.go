@@ -17,7 +17,9 @@ package importer
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -716,4 +718,64 @@ func TestPayloadPreview_QuotesControlBytes(t *testing.T) {
 	assert.Contains(t, got, `\x1b`)
 	assert.NotContains(t, got, "\x1b",
 		"raw ESC byte must not appear in payload preview output")
+}
+
+// TestUnwrapStrconvReason_NonNumErrorFallbackBoundedByPreviewBytes pins the
+// else-branch of unwrapStrconvReason (non-*strconv.NumError inputs). The
+// fallback is dead at current call sites — ParseInt/ParseFloat always wrap
+// into *strconv.NumError — but the function still bounds its output so a
+// future caller that passes an arbitrary error with attacker-controlled
+// Error() bytes cannot sidestep the 64-byte previewBytes discipline that
+// every other error path respects. Test feeds an error whose Error() is
+// 512 bytes and asserts the returned string is < 256 bytes and contains
+// the "(N bytes total)" truncation marker that previewBytes emits.
+func TestUnwrapStrconvReason_NonNumErrorFallbackBoundedByPreviewBytes(t *testing.T) {
+	huge := strings.Repeat("A", 512) // well above maxPreviewLen (64)
+	got := unwrapStrconvReason(errors.New(huge))
+	// previewBytes truncates to maxPreviewLen and appends the original length.
+	assert.Contains(t, got, fmt.Sprintf("(%d bytes total)", len(huge)),
+		"non-NumError fallback must funnel through previewBytes")
+	assert.Less(t, len(got), 256,
+		"fallback return must be bounded, got %d bytes", len(got))
+}
+
+// TestUnwrapStrconvReason_NumErrorReturnsInnerReason covers the happy path
+// and complements the fallback test above: a *strconv.NumError unwraps to
+// its inner .Err without the .Num field re-embedding the attacker payload.
+func TestUnwrapStrconvReason_NumErrorReturnsInnerReason(t *testing.T) {
+	// strconv.ParseInt on a non-numeric input builds a NumError whose .Num
+	// is the full attacker-controlled input. unwrapStrconvReason must peel
+	// it off and return only the inner reason.
+	payload := strings.Repeat("B", 1024)
+	_, parseErr := strconv.ParseInt(payload, 10, 64)
+	require.Error(t, parseErr)
+	got := unwrapStrconvReason(parseErr)
+	// ParseInt's inner reason is "invalid syntax" — short and fixed.
+	assert.Equal(t, "invalid syntax", got)
+	assert.NotContains(t, got, payload[:32],
+		"unwrapped reason must not re-embed the NumError.Num payload")
+}
+
+// TestTnetstring_ParseTnetDict_ValueDecodeErrorWrapped pins the value-decode
+// error wrapper `fmt.Errorf("tnetstring: dict value for key %s: %w", ...)`
+// (tnetstring.go:334-338). Existing tests cover the key-decode error path;
+// this is its symmetric value-side counterpart — a well-formed key followed
+// by a malformed value element. Without this test a refactor changing the
+// %w wrapping or the key-context prefix would pass silently.
+func TestTnetstring_ParseTnetDict_ValueDecodeErrorWrapped(t *testing.T) {
+	// Well-formed bytes-element key "1:k,", followed by a malformed value
+	// that claims 99 bytes of content but only 5 are provided before the ','
+	// marker. The inner decode sees the length mismatch and errors.
+	key := tnetBytesElement("k")
+	malformedValue := []byte("99:short,")
+	dictBody := make([]byte, 0, len(key)+len(malformedValue))
+	dictBody = append(dictBody, key...)
+	dictBody = append(dictBody, malformedValue...)
+	dict := buildElement(dictBody, '}')
+
+	m := &MitmproxyImporter{}
+	_, err := m.Import(bytes.NewReader(dict))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "dict value for key",
+		"value-decode error must be wrapped with key-context prefix")
 }

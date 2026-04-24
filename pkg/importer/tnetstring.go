@@ -366,10 +366,16 @@ func payloadPreview(payload []byte) string {
 // Num field (which re-embeds the full input). strconv.NumError.Error() would
 // otherwise produce `strconv.ParseInt: parsing "<full payload>": invalid
 // syntax`, defeating payloadPreview for large attacker-controlled inputs.
+//
+// The non-NumError fallback (bottom branch) is dead at current call sites —
+// strconv.ParseInt/ParseFloat always return *strconv.NumError — but it
+// bounds its output via previewBytes anyway so any future caller can't
+// sidestep the 64-byte preview discipline by passing an arbitrary error
+// whose Error() returns attacker-controlled megabytes.
 func unwrapStrconvReason(err error) string {
 	var ne *strconv.NumError
 	if errors.As(err, &ne) {
 		return ne.Err.Error()
 	}
-	return err.Error()
+	return previewBytes([]byte(err.Error()))
 }

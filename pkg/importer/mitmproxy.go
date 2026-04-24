@@ -118,10 +118,11 @@ func (i *MitmproxyImporter) importJSON(bufReader *bufio.Reader, limitedReader *l
 	case '{':
 		return i.parseJSONObject(decoder, limitedReader)
 	default:
-		// Defensive: Import's dispatch guarantees firstByte is '[' or '{'.
-		// Surfacing an explicit error here prevents a silent (nil, nil)
-		// return if a future refactor accidentally routes other bytes here.
-		return nil, fmt.Errorf("mitmproxy importer: importJSON called with unexpected first byte %q", firstByte)
+		// Import's dispatch is the sole call site and guarantees firstByte is
+		// '[' or '{'. If a future refactor breaks that invariant, fail loudly
+		// rather than silently returning nil — a panic here surfaces the
+		// programming error immediately instead of producing empty captures.
+		panic(fmt.Sprintf("mitmproxy importer: importJSON called with unexpected first byte %q — Import dispatch invariant violated", firstByte))
 	}
 }
 
@@ -416,10 +417,23 @@ func requirePort(v any) (int, error) {
 	if !ok {
 		return 0, fmt.Errorf("flow \"port\" is %T, want integer", v)
 	}
-	if n < 0 || n > 65535 {
-		return 0, fmt.Errorf("invalid port: %d (must be 0-65535)", n)
+	if err := validatePortRange(int(n)); err != nil {
+		return 0, err
 	}
 	return int(n), nil
+}
+
+// validatePortRange enforces the 0-65535 TCP/UDP port range shared by the
+// native and JSON import paths. The native path reaches it via requirePort
+// (after type-narrowing int64); the JSON path calls it directly from
+// parseFlow (json.Decode accepts any int that fits in Go's int). Keeping the
+// range and error message in one place means a future change to the valid
+// range or diagnostic text touches one line, not two.
+func validatePortRange(port int) error {
+	if port < 0 || port > 65535 {
+		return fmt.Errorf("invalid port: %d (must be 0-65535)", port)
+	}
+	return nil
 }
 
 // peekFirstNonWhitespace reads and unreads bytes until finding a non-whitespace character.
@@ -430,6 +444,11 @@ func peekFirstNonWhitespace(r *bufio.Reader) (byte, error) {
 			return 0, err
 		}
 		if b != ' ' && b != '\t' && b != '\n' && b != '\r' {
+			// UnreadByte only fails when no prior ReadByte has been made on
+			// this reader — unreachable here because ReadByte succeeded
+			// on the preceding line. The error return is kept to honor
+			// io.ByteScanner's documented contract; coverage tools will
+			// show this branch as permanently uncovered.
 			if err := r.UnreadByte(); err != nil {
 				return 0, err
 			}
@@ -540,12 +559,12 @@ func validateHost(host string) error {
 func (i *MitmproxyImporter) parseFlow(flow mitmproxyFlow) (crawl.ObservedRequest, error) {
 	// JSON path: json.Decode accepts any int that fits in Go's int type, so
 	// a forged JSON capture can set `port: -1` or `port: 999999`. The native
-	// path runs through requirePort (tnetstring.go) which already bounds the
-	// range before we get here, so this guard is redundant for native flows
-	// but necessary for the JSON path — keep both call sites reaching the
-	// same error message.
-	if flow.Request.Port < 0 || flow.Request.Port > 65535 {
-		return crawl.ObservedRequest{}, fmt.Errorf("invalid port: %d (must be 0-65535)", flow.Request.Port)
+	// path runs through requirePort which already bounds the range before
+	// we get here, so this guard is redundant for native flows but necessary
+	// for JSON. Both paths call validatePortRange so the bound and error
+	// message stay in one place.
+	if err := validatePortRange(flow.Request.Port); err != nil {
+		return crawl.ObservedRequest{}, err
 	}
 
 	if !validHTTPMethods[flow.Request.Method] {
@@ -637,6 +656,14 @@ func constructURL(scheme, host string, port int, path string) string {
 
 // convertMitmproxyHeaders converts mitmproxy header tuples to map.
 // Skips headers with empty names or malformed tuples (per RFC 7230).
+//
+// Duplicate-name policy: last value wins. HTTP permits repeated header
+// names (e.g. multiple `Set-Cookie` lines) and mitmproxy preserves them
+// as separate entries, but ObservedRequest.Headers is `map[string]string`
+// so only a single value can survive. This mirrors the pre-existing JSON
+// path's behavior and is inherent to the shared output schema — changing
+// it requires evolving ObservedRequest.Headers to `map[string][]string`
+// first, which is out of scope here.
 func convertMitmproxyHeaders(mitmHeaders [][]string) map[string]string {
 	headers := make(map[string]string)
 	for _, h := range mitmHeaders {
