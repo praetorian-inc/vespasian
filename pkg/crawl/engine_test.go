@@ -384,6 +384,13 @@ func TestEnrichFromPage_ThreadsScopeFnToMergeEnrichedLinks(t *testing.T) {
 	}
 	// Compare function pointers: the spy must have received the SAME
 	// scopeFn the caller passed, not nil and not some wrapper.
+	//
+	// reflect.Value.Pointer is used instead of `==` because Go forbids
+	// equality on function values other than against nil (spec §Comparison
+	// operators). Two distinct func literals with identical bodies produce
+	// different pointers here, which is the property we want to test: any
+	// refactor that replaces the caller's scopeFn with a wrapper before
+	// reaching the merger would flip this comparison.
 	if reflect.ValueOf(captured.scopeFn).Pointer() != reflect.ValueOf(myScope).Pointer() {
 		t.Errorf("scopeFn identity differs: enrichFromPage passed a different function to mergeEnrichedLinks")
 	}

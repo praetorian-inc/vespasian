@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 	"time"
 
@@ -316,13 +317,15 @@ func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, 
 	}
 	baseURL := effectiveBaseURL(page, resolvedPageURL)
 
-	// Extract links from the DOM.
+	// Extract links from the DOM. A failure here is non-fatal — it only
+	// affects DOM-sourced href discovery. Continue with domLinks=nil so the
+	// JS-from-responses, inline-script, and form paths still enrich captured.
 	domLinks, err := extractLinks(page, baseURL)
 	if err != nil {
 		if stderr != nil {
 			fmt.Fprintf(stderr, "link extraction failed for %s: %v\n", pageURL, err) //nolint:errcheck // best-effort
 		}
-		return captured, nil
+		domLinks = nil
 	}
 
 	jsFromResponses := extractURLsFromResponses(captured)
@@ -346,6 +349,11 @@ func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, 
 // through enrichFromPage to mergeEnrichedLinks (the one-line call was
 // previously integration-only coverage — see LAB-2221 round-11 TEST-001).
 // Production callers always see the real mergeEnrichedLinks.
+//
+// NOT PARALLEL-SAFE: tests swap this via a t.Cleanup-restored pattern and
+// MUST NOT call t.Parallel() — concurrent swaps would race on the global.
+// No sync is used here because the production read path is single-threaded
+// per page and the test swap happens before the call under test.
 var mergeEnrichedLinksFn = mergeEnrichedLinks
 
 // mergeEnrichedLinks combines every link source discovered on a page into a
@@ -380,7 +388,7 @@ func mergeEnrichedLinks(
 	pageURL, baseURL string,
 	scopeFn func(string) bool,
 ) ([]ObservedRequest, []string) {
-	links := append([]string(nil), domLinks...)
+	links := slices.Clone(domLinks)
 
 	if len(jsFromResponses) > 0 {
 		links = append(links, jsExtractedToLinks(jsFromResponses, baseURL)...)
