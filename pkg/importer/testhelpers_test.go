@@ -62,7 +62,11 @@ func tnetStringElement(payload string) []byte {
 // tnetListElement wraps already-encoded tnetstring elements into a list
 // payload ("N:<elements>]"). Pass raw helper output in order.
 func tnetListElement(elements ...[]byte) []byte {
-	var body []byte
+	n := 0
+	for _, e := range elements {
+		n += len(e)
+	}
+	body := make([]byte, 0, n)
 	for _, e := range elements {
 		body = append(body, e...)
 	}
@@ -75,7 +79,11 @@ func tnetDictElement(keysAndValues ...[]byte) []byte {
 	if len(keysAndValues)%2 != 0 {
 		panic("tnetDictElement: odd number of key/value pieces")
 	}
-	var body []byte
+	n := 0
+	for _, e := range keysAndValues {
+		n += len(e)
+	}
+	body := make([]byte, 0, n)
 	for _, e := range keysAndValues {
 		body = append(body, e...)
 	}

@@ -274,6 +274,11 @@ func TestTnetstring_NonEmptyNull(t *testing.T) {
 	r := bufio.NewReader(strings.NewReader("3:abc~"))
 	_, err := decodeTnetstringStream(r, 0)
 	require.Error(t, err)
+	// Pin the specific error class — a refactor that generalized this to a
+	// less-specific message (e.g. just "invalid null") would pass the bare
+	// require.Error but lose diagnostic value. Every other negative path in
+	// this file asserts on a substring; keep the discipline uniform.
+	assert.Contains(t, err.Error(), "null element")
 }
 
 func TestTnetstring_LengthTooLarge(t *testing.T) {
