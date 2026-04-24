@@ -36,11 +36,13 @@ For each target:
 
 1. **Build** vespasian and target binaries
 2. **Start** target services (with auto-resolved ports)
-3. **Crawl** — `vespasian crawl <url> -o capture.json`
+3. **Crawl** — `vespasian crawl <url> --dangerous-allow-private -o capture.json`
 4. **Validate capture** — Check request count and expected URLs
 5. **Generate** — `vespasian generate <type> capture.json -o spec.<ext>`
 6. **Validate spec** — Path/operation coverage, schema structure, no static assets
 7. **Print summary** — Pass/fail status with endpoint counts and durations
+
+> **Why `--dangerous-allow-private`?** All live targets run on `localhost`, which the crawler's SSRF gate treats as a private host. The flag is required on every `vespasian crawl` invocation in this suite; running without it will exit non-zero with `seed URL rejected by frontier ...`. The flag name reflects production-risk semantics — pass it only when you intend to crawl a known-private host (e.g., this suite, or an internal-network assessment).
 
 For the GraphQL live test (`graphql-server`):
 
@@ -307,6 +309,15 @@ curl http://localhost:8990/api/health
 ```
 
 If you're running the harness inside a devcontainer and the targets are on the host, set `TEST_HOST` (see Configuration above) and verify connectivity from inside the container with `curl http://${TEST_HOST}:8990/api/health`. Without `TEST_HOST`, `localhost` resolves to the container's own loopback (not the Docker host), the crawler connects to nothing, and the capture is empty.
+
+### Crawl exits with `seed URL rejected by frontier (scope, SSRF, or parse): ...`
+
+The seed URL is a private host (`localhost`, `127.0.0.1`, RFC1918, or link-local) and `--dangerous-allow-private` was not passed. All live tests in this suite crawl localhost targets, so every `vespasian crawl` invocation in `run-live-tests.sh` already includes the flag. If you are reproducing a single test by hand, add the flag to your command line:
+
+```bash
+./bin/vespasian crawl http://localhost:8990 --dangerous-allow-private \
+    -o /tmp/cap.json --depth 2 --max-pages 50
+```
 
 ### Build failures
 

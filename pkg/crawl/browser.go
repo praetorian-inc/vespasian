@@ -123,6 +123,7 @@ func (b *BrowserManager) cleanup() {
 // for use with defer in the normal (non-signal) path.
 func (b *BrowserManager) Close() {
 	if b.browser != nil {
+		// #nosec G104 -- best-effort close on a process that may already be dead; any error is unactionable and the subsequent Kill() + cleanup() still execute.
 		b.browser.Close() //nolint:errcheck,gosec // best-effort; process may already be dead
 	}
 	b.Kill()
