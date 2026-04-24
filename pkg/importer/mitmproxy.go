@@ -479,6 +479,15 @@ func validateHost(host string) error {
 		// a credential smuggler if a downstream consumer splits on `@`.
 		return fmt.Errorf("host contains embedded userinfo (\"@\")")
 	}
+	if strings.ContainsRune(host, ':') {
+		// A ':' in host smuggles an attacker-chosen port past requirePort's
+		// 0-65535 check: constructURL's isDefaultPort branch assigns
+		// u.Host = host verbatim, so host="evil.com:1337" with port=443
+		// (https default) yields URL "https://evil.com:1337/...". mitmproxy's
+		// HTTPFlow.get_state() never populates host with a port suffix (port
+		// lives in its own field), so this rejection has zero legitimate cost.
+		return fmt.Errorf("host contains port separator (\":\"); port must be carried in the port field")
+	}
 	for _, r := range host {
 		// Reject ASCII control bytes and whitespace. Non-ASCII (e.g. IDN) is
 		// permitted because mitmproxy's host field may carry punycode or

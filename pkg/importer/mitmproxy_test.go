@@ -1616,6 +1616,11 @@ func TestMitmproxyImporter_Native_InvalidHostRejected(t *testing.T) {
 		{"control byte", "example\x00.com", "control/whitespace"},
 		{"whitespace", "example .com", "control/whitespace"},
 		{"over 253 chars", strings.Repeat("a", 254), "exceeds RFC 1035"},
+		// Port-separator rejection closes a host/port smuggling path: without
+		// this check, host="evil.example.com:1337" with port=443 (https
+		// default) would ride through constructURL's isDefaultPort branch and
+		// emit URL "https://evil.example.com:1337/...", bypassing requirePort.
+		{"embedded port separator", "evil.example.com:1337", "port separator"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
