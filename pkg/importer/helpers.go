@@ -14,18 +14,34 @@
 
 package importer
 
-import "net/url"
+import (
+	"fmt"
+	"net/url"
+)
 
 // maxPreviewLen caps how many bytes of an attacker-controlled string we embed
 // into an error message, shared by the mitmproxy importer's previewString
 // (for method/scheme) and the tnetstring decoder's payloadPreview (for
-// element payloads). Without the bound, a crafted `.mitm` file could write
-// up to 64 MB into the operator's terminal or CI log before the importer
-// aborts. The two helpers keep separate signatures (string vs []byte) but
-// both use %q quoting so control bytes are Go-escaped rather than rendered
-// verbatim — a crafted ANSI sequence in method/scheme cannot recolor output
-// or clear the screen when the error string is printed.
+// element payloads) — both of which delegate to previewBytes below. Without
+// the bound, a crafted `.mitm` file could write up to 64 MB into the
+// operator's terminal or CI log before the importer aborts.
 const maxPreviewLen = 64
+
+// previewBytes is the single source of truth for attacker-payload preview
+// formatting. It renders up to maxPreviewLen bytes of payload using %q
+// quoting; longer inputs are truncated and annotated with the original byte
+// length so operators still see "this was enormous" without pasting megabytes
+// into a log. %q quoting escapes control bytes (ANSI escapes, NUL, etc.) so
+// crafted method/scheme/payload content cannot clear the operator's terminal,
+// recolor output, or poison log parsers when the error string is rendered.
+// previewString and payloadPreview are type-convenience wrappers; modify the
+// format here and they both track automatically.
+func previewBytes(payload []byte) string {
+	if len(payload) <= maxPreviewLen {
+		return fmt.Sprintf("%q", payload)
+	}
+	return fmt.Sprintf("%q... (%d bytes total)", payload[:maxPreviewLen], len(payload))
+}
 
 // extractQueryParams parses query parameters from a URL string.
 // Returns nil if the URL has no query parameters or is invalid.

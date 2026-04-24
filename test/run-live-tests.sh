@@ -1365,10 +1365,17 @@ test_import_mitmproxy_native() {
 
     # Sanity-check: first byte should be an ASCII digit (tnetstring length
     # prefix). If it's not, the fixture isn't the format we claim to test.
+    # Read via od so NUL-byte corruption produces hex "00" rather than the
+    # empty string bash yields for $(head -c 1) on NUL (command substitution
+    # strips NULs) — that empty value would previously fail the [0-9] regex
+    # with the misleading "expected a digit" error even when the real cause
+    # is file corruption.
     local first_byte
-    first_byte=$(head -c 1 "$fixture")
-    if ! [[ "$first_byte" =~ [0-9] ]]; then
-        log_fail "Fixture first byte is '$first_byte', expected a digit (tnetstring prefix)"
+    first_byte=$(od -A n -N 1 -t x1 "$fixture" | tr -d ' \n')
+    # Accept hex 31..39 ('1'..'9'). A zero-length prefix ('0') is valid
+    # tnetstring but not a shape mitmproxy's .mitm stream ever emits.
+    if ! [[ "$first_byte" =~ ^3[1-9]$ ]]; then
+        log_fail "Fixture first byte is 0x${first_byte:-<empty>}, expected an ASCII digit 1-9 (tnetstring length prefix)"
         set_test_result "import-mitmproxy-native" "FAIL" "?" "3" "$((SECONDS - start))"
         return 1
     fi

@@ -346,15 +346,12 @@ func coerceDictKey(v any) (string, error) {
 	}
 }
 
-// payloadPreview renders up to maxPreviewLen (helpers.go) bytes of payload
-// for use in error messages. Longer payloads are truncated and annotated
-// with the full length so operators still see the size without pasting 64 MB
-// into the log.
+// payloadPreview is a []byte-typed convenience wrapper around previewBytes
+// (helpers.go), used for tnetstring decoder error paths where the caller
+// already holds a byte slice. The formatting, cap, and quoting discipline
+// all live in previewBytes — modify there.
 func payloadPreview(payload []byte) string {
-	if len(payload) <= maxPreviewLen {
-		return fmt.Sprintf("%q", payload)
-	}
-	return fmt.Sprintf("%q... (%d bytes total)", payload[:maxPreviewLen], len(payload))
+	return previewBytes(payload)
 }
 
 // unwrapStrconvReason returns the inner cause of a strconv error without the

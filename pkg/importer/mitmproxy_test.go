@@ -1424,10 +1424,14 @@ func TestMitmproxyImporter_Native_StringTypedDictKey(t *testing.T) {
 	body.Write(requestKey)
 	body.Write(innerReq)
 
-	dict := fmt.Sprintf("%d:%s}", body.Len(), body.String())
+	// Use buildElement (testhelpers_test.go) so this test follows the same
+	// %-unsafe byte-concat discipline as every other raw-element construction
+	// in this file. fmt.Sprintf("%d:%s}", ...) would render the body via %s,
+	// which re-interprets any '%' in the bytes as a format directive.
+	dict := buildElement(body.Bytes(), '}')
 
 	m := &MitmproxyImporter{}
-	requests, err := m.Import(bytes.NewReader([]byte(dict)))
+	requests, err := m.Import(bytes.NewReader(dict))
 	require.NoError(t, err)
 	require.Len(t, requests, 1)
 	assert.Equal(t, "https://example.com/str", requests[0].URL)

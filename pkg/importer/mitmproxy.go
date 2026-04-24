@@ -385,18 +385,12 @@ func tnetInt64(v any) int64 {
 	return 0
 }
 
-// previewString renders up to maxPreviewLen (helpers.go) bytes of s using %q
-// quoting; longer inputs are truncated and annotated with the original byte
-// length so the operator still sees "this was enormous" without pasting
-// megabytes into a log. %q-quoting escapes control bytes (ANSI escapes, NUL,
-// etc.) so a crafted method or scheme cannot clear the operator's terminal,
-// recolor output, or poison log parsers when the error string is rendered —
-// aligning with payloadPreview's quoting discipline in tnetstring.go.
+// previewString is a string-typed convenience wrapper around previewBytes
+// (helpers.go), used for the mitmproxy importer's method/scheme error paths
+// where the caller already holds a string. The formatting, cap, and quoting
+// discipline all live in previewBytes — modify there.
 func previewString(s string) string {
-	if len(s) <= maxPreviewLen {
-		return fmt.Sprintf("%q", s)
-	}
-	return fmt.Sprintf("%q... (%d bytes total)", s[:maxPreviewLen], len(s))
+	return previewBytes([]byte(s))
 }
 
 // requirePort extracts a mitmproxy `port` field that MUST be a tnetstring
@@ -499,6 +493,12 @@ func validateHost(host string) error {
 		// Reject ASCII control bytes and whitespace. Non-ASCII (e.g. IDN) is
 		// permitted because mitmproxy's host field may carry punycode or
 		// UTF-8 forms; deeper validation is the URL-parser's job.
+		//
+		// Rune iteration is safe for this byte-range check: every non-ASCII
+		// rune decodes to a value ≥ 0x80, so it never satisfies r < 0x21
+		// and cannot match r == 0x7f. The loop therefore rejects exactly the
+		// ASCII control/whitespace bytes that byte iteration would, with no
+		// false positives on multi-byte UTF-8 continuation bytes.
 		if r < 0x21 || r == 0x7f {
 			return fmt.Errorf("host contains control/whitespace byte %q", r)
 		}

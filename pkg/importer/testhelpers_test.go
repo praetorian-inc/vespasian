@@ -24,6 +24,17 @@ import (
 // because %s on []byte re-interprets percent signs in the payload as format
 // directives, silently corrupting binary bodies. The shared production
 // encoder (tnetenc.encodeWithMarker) uses the same safe pattern.
+//
+// Why this is deliberately duplicated from tnetenc.encodeWithMarker:
+// tnetenc.Encode selects the marker automatically based on Go type and only
+// emits the four production markers (','/']'/'}'/'#'/'!'/'~'). Tests here
+// need to craft edge-case elements — including malformed markers like ';'
+// used for UTF-8-string typing, type-marker mismatches, and markers the
+// encoder's type switch does not produce. Exporting encodeWithMarker would
+// leak a test-only primitive into the production API surface; duplicating
+// it in the test package keeps the production surface minimal while still
+// sharing the %-unsafe byte-concat discipline. If you change the wire
+// format (length-prefix syntax, marker position), update both locations.
 func buildElement(payload []byte, marker byte) []byte {
 	lenStr := strconv.Itoa(len(payload))
 	out := make([]byte, 0, len(lenStr)+1+len(payload)+1)
