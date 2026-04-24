@@ -1910,3 +1910,26 @@ func TestMitmproxyImporter_Native_ConstructURLInvalidPercentEscapeFallsBack(t *t
 	assert.Equal(t, "https://example.com/api/bad%25ZZ", requests[0].URL,
 		"PathUnescape-failure fallback should double-encode '%%' to '%%25'")
 }
+
+// TestConvertMitmproxyHeaders_DuplicateNameLastWins pins the duplicate-name
+// policy documented on convertMitmproxyHeaders. HTTP permits repeated header
+// names (e.g. multiple Set-Cookie lines) and mitmproxy preserves them as
+// separate tuples, but ObservedRequest.Headers is map[string]string so only
+// one value can survive. The function's current behavior — and its newly-
+// documented contract — is last-write-wins. Without this test a refactor
+// (strings.Join, first-seen-wins, etc.) would silently break the contract
+// because every other header-covering test uses unique names.
+func TestConvertMitmproxyHeaders_DuplicateNameLastWins(t *testing.T) {
+	got := convertMitmproxyHeaders([][]string{
+		{"X-Test", "first"},
+		{"X-Test", "second"},
+		{"X-Other", "only"},
+		{"X-Test", "third"},
+	})
+	assert.Equal(t, "third", got["X-Test"],
+		"duplicate header names must resolve to the last value (last-write-wins)")
+	assert.Equal(t, "only", got["X-Other"],
+		"non-duplicate header names unaffected")
+	assert.Len(t, got, 2,
+		"duplicates must collapse to a single map entry per name")
+}

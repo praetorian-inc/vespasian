@@ -757,11 +757,13 @@ func TestUnwrapStrconvReason_NumErrorReturnsInnerReason(t *testing.T) {
 }
 
 // TestTnetstring_ParseTnetDict_ValueDecodeErrorWrapped pins the value-decode
-// error wrapper `fmt.Errorf("tnetstring: dict value for key %s: %w", ...)`
-// (tnetstring.go:334-338). Existing tests cover the key-decode error path;
-// this is its symmetric value-side counterpart — a well-formed key followed
-// by a malformed value element. Without this test a refactor changing the
-// %w wrapping or the key-context prefix would pass silently.
+// error wrapper inside parseTnetDict — specifically the
+// `fmt.Errorf("tnetstring: dict value for key %s: %w", ...)` call that fires
+// when an inner decodeTnetstringInner on the value element returns an error.
+// Existing tests cover the key-decode error path; this is its symmetric
+// value-side counterpart — a well-formed key followed by a malformed value
+// element. Without this test a refactor changing the %w wrapping or the
+// key-context prefix would pass silently.
 func TestTnetstring_ParseTnetDict_ValueDecodeErrorWrapped(t *testing.T) {
 	// Well-formed bytes-element key "1:k,", followed by a malformed value
 	// that claims 99 bytes of content but only 5 are provided before the ','
