@@ -114,6 +114,16 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
 			key += ":" + sa
 		}
 
+		// If this observation has a body, include the base content type in the
+		// key so that distinct request body shapes (JSON, urlencoded, multipart)
+		// survive deduplication on the same path. Empty bodies (e.g. GET) do
+		// not split.
+		if len(req.Body) > 0 {
+			if ct := getContentType(req.Headers); ct != "" {
+				key += ":" + baseMediaType(ct)
+			}
+		}
+
 		existing, found := seen[key]
 		if !found {
 			order = append(order, key)
@@ -155,4 +165,26 @@ func getSoapAction(headers map[string]string) string {
 		}
 	}
 	return ""
+}
+
+// getContentType returns the Content-Type header value, case-insensitively.
+func getContentType(headers map[string]string) string {
+	for k, v := range headers {
+		if strings.EqualFold(k, "content-type") {
+			return v
+		}
+	}
+	return ""
+}
+
+// baseMediaType returns the lowercased media type from a Content-Type value,
+// stripped of any parameters (e.g. "; boundary=..."). Returns "" on empty input.
+func baseMediaType(ct string) string {
+	if ct == "" {
+		return ""
+	}
+	if i := strings.Index(ct, ";"); i >= 0 {
+		ct = ct[:i]
+	}
+	return strings.ToLower(strings.TrimSpace(ct))
 }

@@ -15,11 +15,16 @@
 package rest
 
 import (
+	"bytes"
 	"encoding/json"
+	"mime/multipart"
+	"net/textproto"
 	"strings"
 	"testing"
 
 	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
@@ -656,6 +661,72 @@ func TestResourceNameFromPath(t *testing.T) {
 	}
 }
 
+func TestResourceNameFromPath_StripsExtensions(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		expected string
+	}{
+		{name: "php extension", path: "/login.php", expected: "Login"},
+		{name: "mvc extension", path: "/register.mvc", expected: "Register"},
+		{name: "json extension", path: "/data.json", expected: "Data"},
+		{name: "asp extension", path: "/page.asp", expected: "Page"},
+		{name: "aspx extension", path: "/submit.aspx", expected: "Submit"},
+		{name: "jsp extension", path: "/view.jsp", expected: "View"},
+		{name: "html extension", path: "/index.html", expected: "Index"},
+		{name: "htm extension", path: "/home.htm", expected: "Home"},
+		{name: "xml extension", path: "/feed.xml", expected: "Feed"},
+		{name: "action extension", path: "/save.action", expected: "Save"},
+		{name: "do extension", path: "/process.do", expected: "Process"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := resourceNameFromPath(tt.path)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestResourceNameFromPath_HandlesHyphens(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		expected string
+	}{
+		{name: "hyphenated segment", path: "/stored-xss", expected: singularize("StoredXss")},
+		{name: "multi-hyphenated", path: "/cross-site-scripting", expected: singularize("CrossSiteScripting")},
+		{name: "underscore segment", path: "/user_profile", expected: singularize("UserProfile")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := resourceNameFromPath(tt.path)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestResourceNameFromPath_FallbackOnEmpty(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		expected string
+	}{
+		{name: "root path", path: "/", expected: "Resource"},
+		{name: "empty string", path: "", expected: "Resource"},
+		{name: "extension-only segment", path: "/.php", expected: "Resource"},
+		{name: "numeric-only segment", path: "/123", expected: "Resource123"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := resourceNameFromPath(tt.path)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
 func TestSchemaFingerprint(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -892,6 +963,145 @@ func TestExtractComponents(t *testing.T) {
 		t.Logf("POST 201 ref: %s", postResp.Value.Content["application/json"].Schema.Ref)
 		t.Logf("GET 200 ref: %s", getResp.Value.Content["application/json"].Schema.Ref)
 	}
+}
+
+func TestBuildOperation_FormBody(t *testing.T) {
+	t.Run("url-encoded form body", func(t *testing.T) {
+		gen := &OpenAPIGenerator{}
+		endpoints := []classify.ClassifiedRequest{
+			{
+				ObservedRequest: crawl.ObservedRequest{
+					Method: "POST",
+					URL:    "https://api.example.com/login",
+					Headers: map[string]string{
+						"content-type": "application/x-www-form-urlencoded",
+					},
+					Body: []byte("username=alice&password=secret"),
+					Response: crawl.ObservedResponse{
+						StatusCode: 200,
+					},
+				},
+				IsAPI: true,
+			},
+		}
+		spec, err := gen.Generate(endpoints)
+		require.NoError(t, err, "Generate should succeed")
+
+		var parsed map[string]interface{}
+		require.NoError(t, yaml.Unmarshal(spec, &parsed), "YAML parse should succeed")
+
+		// Dig into paths./login.post.requestBody.content
+		paths, _ := parsed["paths"].(map[string]interface{})
+		loginPath, _ := paths["/login"].(map[string]interface{})
+		post, _ := loginPath["post"].(map[string]interface{})
+		requestBody, _ := post["requestBody"].(map[string]interface{})
+		content, _ := requestBody["content"].(map[string]interface{})
+
+		_, hasFormEncoded := content["application/x-www-form-urlencoded"]
+		assert.True(t, hasFormEncoded, "expected application/x-www-form-urlencoded in content, got keys: %v", content)
+		_, hasJSON := content["application/json"]
+		assert.False(t, hasJSON, "expected no application/json key for url-encoded-only endpoint")
+	})
+
+	t.Run("mixed json and url-encoded observations", func(t *testing.T) {
+		gen := &OpenAPIGenerator{}
+		endpoints := []classify.ClassifiedRequest{
+			{
+				ObservedRequest: crawl.ObservedRequest{
+					Method: "POST",
+					URL:    "https://api.example.com/submit",
+					Headers: map[string]string{
+						"content-type": "application/json",
+					},
+					Body:     []byte(`{"name":"Alice"}`),
+					Response: crawl.ObservedResponse{StatusCode: 200},
+				},
+				IsAPI: true,
+			},
+			{
+				ObservedRequest: crawl.ObservedRequest{
+					Method: "POST",
+					URL:    "https://api.example.com/submit",
+					Headers: map[string]string{
+						"Content-Type": "application/x-www-form-urlencoded",
+					},
+					Body:     []byte("name=Bob"),
+					Response: crawl.ObservedResponse{StatusCode: 200},
+				},
+				IsAPI: true,
+			},
+		}
+		spec, err := gen.Generate(endpoints)
+		require.NoError(t, err, "Generate should succeed")
+
+		var parsed map[string]interface{}
+		require.NoError(t, yaml.Unmarshal(spec, &parsed), "YAML parse should succeed")
+
+		paths, _ := parsed["paths"].(map[string]interface{})
+		submitPath, _ := paths["/submit"].(map[string]interface{})
+		post, _ := submitPath["post"].(map[string]interface{})
+		requestBody, _ := post["requestBody"].(map[string]interface{})
+		content, _ := requestBody["content"].(map[string]interface{})
+
+		_, hasJSON := content["application/json"]
+		assert.True(t, hasJSON, "expected application/json in content, got keys: %v", content)
+		_, hasFormEncoded := content["application/x-www-form-urlencoded"]
+		assert.True(t, hasFormEncoded, "expected application/x-www-form-urlencoded in content, got keys: %v", content)
+	})
+}
+
+func TestOpenAPIGenerator_MultipartFormData_EndToEnd(t *testing.T) {
+	// Build a well-formed multipart/form-data body with one text field and
+	// one file upload field, then pass it through gen.Generate() and assert
+	// that the resulting spec carries a multipart/form-data requestBody with
+	// the file field typed as string/binary.
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+
+	// Text field
+	err := w.WriteField("username", "alice")
+	require.NoError(t, err)
+
+	// File field
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition", `form-data; name="avatar"; filename="photo.jpg"`)
+	h.Set("Content-Type", "image/jpeg")
+	fw, err := w.CreatePart(h)
+	require.NoError(t, err)
+	_, _ = fw.Write([]byte("JPEG_DATA"))
+	_ = w.Close()
+
+	contentType := "multipart/form-data; boundary=" + w.Boundary()
+
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "POST",
+				URL:    "https://api.example.com/upload",
+				Headers: map[string]string{
+					"content-type": contentType,
+				},
+				Body: buf.Bytes(),
+				Response: crawl.ObservedResponse{
+					StatusCode: 200,
+				},
+			},
+			IsAPI: true,
+		},
+	}
+
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err, "Generate should succeed")
+
+	specStr := string(spec)
+
+	// The requestBody content must have a multipart/form-data key.
+	assert.Contains(t, specStr, "multipart/form-data", "spec missing multipart/form-data content type in requestBody")
+
+	// The file field must be present and typed string/binary.
+	assert.Contains(t, specStr, "avatar", "spec missing 'avatar' field from multipart body")
+	assert.Contains(t, specStr, "binary", "spec missing format: binary for file upload field")
 }
 
 // Helper function for tests

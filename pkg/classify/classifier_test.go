@@ -389,6 +389,94 @@ func TestDeduplicate_NonSOAPEndpointsStillDedupByPath(t *testing.T) {
 	assert.Len(t, result, 2, "REST deduplicates by path, WSDL separate")
 }
 
+func TestDeduplicate_KeepsDistinctBodiesByContentType(t *testing.T) {
+	classified := []ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "https://example.com/api/submit",
+				Headers: map[string]string{"Content-Type": "application/json"},
+				Body:    []byte(`{"key":"value"}`),
+			},
+			IsAPI: true, Confidence: 0.9, APIType: "rest",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "https://example.com/api/submit",
+				Headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
+				Body:    []byte(`key=value`),
+			},
+			IsAPI: true, Confidence: 0.8, APIType: "rest",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "https://example.com/api/submit",
+				Headers: map[string]string{"Content-Type": "multipart/form-data; boundary=abc123"},
+				Body:    []byte(`--abc123\r\nContent-Disposition: form-data; name="key"\r\n\r\nvalue\r\n--abc123--`),
+			},
+			IsAPI: true, Confidence: 0.85, APIType: "rest",
+		},
+	}
+
+	result := Deduplicate(classified)
+	assert.Len(t, result, 3, "distinct content types on same path must not be merged")
+}
+
+func TestDeduplicate_MergesSameContentType(t *testing.T) {
+	classified := []ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "https://example.com/api/create",
+				Headers: map[string]string{"Content-Type": "application/json"},
+				Body:    []byte(`{"name":"first"}`),
+			},
+			IsAPI: true, Confidence: 0.8, APIType: "rest",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "https://example.com/api/create",
+				Headers: map[string]string{"Content-Type": "application/json"},
+				Body:    []byte(`{"name":"second"}`),
+			},
+			IsAPI: true, Confidence: 0.9, APIType: "rest",
+		},
+	}
+
+	result := Deduplicate(classified)
+	require.Len(t, result, 1, "same content type on same path should collapse to one entry")
+	assert.InDelta(t, 0.9, result[0].Confidence, 0.001, "highest confidence kept")
+}
+
+func TestDeduplicate_GETsCollapseIgnoringContentType(t *testing.T) {
+	classified := []ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "GET",
+				URL:     "https://example.com/api/items",
+				Headers: map[string]string{"Content-Type": "application/json"},
+				// No body
+			},
+			IsAPI: true, Confidence: 0.8, APIType: "rest",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "GET",
+				URL:     "https://example.com/api/items?page=2",
+				Headers: map[string]string{"Content-Type": "application/xml"},
+				// No body
+			},
+			IsAPI: true, Confidence: 0.85, APIType: "rest",
+		},
+	}
+
+	result := Deduplicate(classified)
+	require.Len(t, result, 1, "empty-body GETs should collapse by path regardless of Content-Type header")
+}
+
 func TestRunClassifiers_WSDLWinsOverREST(t *testing.T) {
 	classifiers := []APIClassifier{
 		&RESTClassifier{},
