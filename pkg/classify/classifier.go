@@ -128,6 +128,15 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
 			if ct := getContentType(req.Headers); ct != "" {
 				key += ":" + baseMediaType(ct)
 			}
+			// Append a short fingerprint of the body so distinct payload shapes
+			// on the same endpoint+method+CT survive deduplication. This is
+			// required for downstream form/JSON merge logic in buildOperation
+			// to see all observations and union their fields. 8 bytes (64 bits)
+			// is a deliberate balance: birthday-collision probability is ~7e-13
+			// at 500 distinct bodies per endpoint, well under realistic crawl
+			// scale (capped at MaxPages, default 100). A collision would
+			// silently merge two distinct bodies into one dedup bucket; this
+			// is no worse than pre-fix behavior and worth the simpler key.
 			h := sha256.Sum256(req.Body)
 			key += ":" + hex.EncodeToString(h[:8])
 		}
