@@ -15,6 +15,7 @@
 package classify
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -341,6 +342,45 @@ func TestDeduplicate_MergesSameSOAPAction(t *testing.T) {
 	assert.InDelta(t, 0.95, result[0].Confidence, 0.001, "highest confidence kept")
 }
 
+// TestDeduplicate_SOAPDistinctBodiesSurvive verifies that two SOAP requests
+// to the same endpoint and SOAPAction with DIFFERENT envelope bytes are
+// preserved as separate entries — the new body-fingerprint behavior. This
+// makes the contrast with TestDeduplicate_MergesSameSOAPAction (which uses
+// empty bodies) explicit, so future readers don't think the bodyless test
+// implies bodies are also collapsed.
+func TestDeduplicate_SOAPDistinctBodiesSurvive(t *testing.T) {
+	classified := []ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "POST",
+				URL:    "https://example.com/service",
+				Headers: map[string]string{
+					"SOAPAction":   `"urn:GetUser"`,
+					"Content-Type": "text/xml; charset=utf-8",
+				},
+				Body: []byte(`<env:Envelope xmlns:env="..."><env:Body><GetUser><id>1</id></GetUser></env:Body></env:Envelope>`),
+			},
+			IsAPI: true, Confidence: 0.85, APIType: "wsdl",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "POST",
+				URL:    "https://example.com/service",
+				Headers: map[string]string{
+					"SOAPAction":   `"urn:GetUser"`,
+					"Content-Type": "text/xml; charset=utf-8",
+				},
+				Body: []byte(`<env:Envelope xmlns:env="..."><env:Body><GetUser><id>2</id></GetUser></env:Body></env:Envelope>`),
+			},
+			IsAPI: true, Confidence: 0.90, APIType: "wsdl",
+		},
+	}
+
+	result := Deduplicate(classified)
+	require.Len(t, result, 2,
+		"distinct SOAP envelope bodies on same path+SOAPAction should survive (allows downstream merge to see all observations)")
+}
+
 func TestDeduplicate_SOAPActionCaseInsensitive(t *testing.T) {
 	classified := []ClassifiedRequest{
 		{
@@ -550,4 +590,31 @@ func TestDeduplicate_GETsStillCollapseByPath(t *testing.T) {
 	assert.InDelta(t, 0.85, result[0].Confidence, 0.001, "highest confidence kept")
 	// Query params from all 3 observations should be merged.
 	assert.Equal(t, "1", result[0].QueryParams["page"])
+}
+
+// BenchmarkDeduplicate exercises the dedup hot path (key construction +
+// body fingerprint when applicable) at varying scales. Establishes a
+// baseline before stretch-goal performance work.
+func BenchmarkDeduplicate(b *testing.B) {
+	for _, n := range []int{100, 1000, 5000} {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			// Build a fixture: n distinct POST observations, urlencoded bodies
+			input := make([]ClassifiedRequest, n)
+			for i := 0; i < n; i++ {
+				input[i] = ClassifiedRequest{
+					ObservedRequest: crawl.ObservedRequest{
+						Method:  "POST",
+						URL:     fmt.Sprintf("https://example.com/api/endpoint%d", i%50),
+						Headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
+						Body:    []byte(fmt.Sprintf("name=u%d&value=%d", i, i)),
+					},
+					IsAPI: true, Confidence: 0.9, APIType: "rest",
+				}
+			}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_ = Deduplicate(input)
+			}
+		})
+	}
 }

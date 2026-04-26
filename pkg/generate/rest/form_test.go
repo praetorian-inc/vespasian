@@ -521,6 +521,38 @@ func TestParseMultipartForm_Malformed_MissingClosingBoundary(t *testing.T) {
 	}
 }
 
+// BenchmarkParseURLEncodedForm and BenchmarkParseMultipartForm establish
+// performance baselines for the form parsers introduced by LAB-2106.
+// Useful as a reference before stretch-goal performance investigation.
+func BenchmarkParseURLEncodedForm(b *testing.B) {
+	body := []byte("username=alice&password=secret&age=30&admin=true&remember_me=false&note=hello+world")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = ParseURLEncodedForm(body)
+	}
+}
+
+func BenchmarkParseMultipartForm(b *testing.B) {
+	// Construct a representative multipart body once
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	_ = w.WriteField("title", "benchmark doc")
+	_ = w.WriteField("description", "performance baseline")
+	hdr := make(textproto.MIMEHeader)
+	hdr.Set("Content-Disposition", `form-data; name="file"; filename="test.bin"`)
+	hdr.Set("Content-Type", "application/octet-stream")
+	fw, _ := w.CreatePart(hdr)
+	_, _ = fw.Write(make([]byte, 1024))
+	_ = w.Close()
+	body := buf.Bytes()
+	boundary := w.Boundary()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = ParseMultipartForm(body, boundary)
+	}
+}
+
 // TestParseMultipartForm_EmptyFieldValue verifies that a text field with an
 // empty value ("") is parsed as type string. An empty string does not match
 // integer, number, or boolean, so inferQueryParamType returns "string".
