@@ -1236,3 +1236,43 @@ func TestOpenAPIGenerator_NonHTTPScheme(t *testing.T) {
 		t.Error("HTTPS endpoint should be present")
 	}
 }
+
+// TestExtractComponents_Deterministic verifies that Generate produces byte-identical
+// output across multiple runs when many paths share the same schema fingerprint.
+// Non-determinism would arise from iterating doc.Paths.Map() in random order:
+// the first path encountered for a given fingerprint wins the component name.
+func TestExtractComponents_Deterministic(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+
+	// Build 26 endpoints /v1/a … /v1/z, each with the same request body shape
+	// {name: string, count: integer}. They all produce the same schema fingerprint,
+	// so whichever path is iterated first sets the component name. Without a
+	// deterministic sort, the chosen name varies between runs.
+	body := []byte(`{"name":"x","count":1}`)
+	endpoints := make([]classify.ClassifiedRequest, 0, 26)
+	for c := 'a'; c <= 'z'; c++ {
+		endpoints = append(endpoints, classify.ClassifiedRequest{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "https://api.example.com/v1/" + string(c),
+				Headers: map[string]string{"Content-Type": "application/json"},
+				Body:    body,
+				Response: crawl.ObservedResponse{
+					StatusCode: 201,
+					Body:       []byte(`{"id":1}`),
+				},
+			},
+			IsAPI: true,
+		})
+	}
+
+	// Run Generate 5 times; all outputs must be byte-identical.
+	first, err := gen.Generate(endpoints)
+	require.NoError(t, err, "first Generate call failed")
+
+	for i := 2; i <= 5; i++ {
+		out, err := gen.Generate(endpoints)
+		require.NoError(t, err, "Generate call %d failed", i)
+		assert.Equal(t, first, out, "Generate run %d produced different output than run 1 — non-determinism detected", i)
+	}
+}

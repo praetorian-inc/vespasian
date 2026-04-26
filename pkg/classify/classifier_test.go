@@ -425,13 +425,15 @@ func TestDeduplicate_KeepsDistinctBodiesByContentType(t *testing.T) {
 }
 
 func TestDeduplicate_MergesSameContentType(t *testing.T) {
+	// Byte-identical bodies with the same CT must collapse — they are true duplicates.
+	body := []byte(`{"name":"alice"}`)
 	classified := []ClassifiedRequest{
 		{
 			ObservedRequest: crawl.ObservedRequest{
 				Method:  "POST",
 				URL:     "https://example.com/api/create",
 				Headers: map[string]string{"Content-Type": "application/json"},
-				Body:    []byte(`{"name":"first"}`),
+				Body:    body,
 			},
 			IsAPI: true, Confidence: 0.8, APIType: "rest",
 		},
@@ -440,14 +442,14 @@ func TestDeduplicate_MergesSameContentType(t *testing.T) {
 				Method:  "POST",
 				URL:     "https://example.com/api/create",
 				Headers: map[string]string{"Content-Type": "application/json"},
-				Body:    []byte(`{"name":"second"}`),
+				Body:    body,
 			},
 			IsAPI: true, Confidence: 0.9, APIType: "rest",
 		},
 	}
 
 	result := Deduplicate(classified)
-	require.Len(t, result, 1, "same content type on same path should collapse to one entry")
+	require.Len(t, result, 1, "byte-identical bodies on same path+CT should collapse to one entry")
 	assert.InDelta(t, 0.9, result[0].Confidence, 0.001, "highest confidence kept")
 }
 
@@ -497,4 +499,55 @@ func TestRunClassifiers_WSDLWinsOverREST(t *testing.T) {
 	require.Len(t, results, 1)
 	assert.Equal(t, "wsdl", results[0].APIType, "WSDL should win for SOAP traffic")
 	assert.GreaterOrEqual(t, results[0].Confidence, 0.90)
+}
+
+// TestDeduplicate_DistinctBodiesSurvive verifies that form-encoded POST observations
+// with distinct body bytes survive deduplication as separate entries, enabling
+// downstream buildOperation to union fields across observations (LAB-2106).
+func TestDeduplicate_DistinctBodiesSurvive(t *testing.T) {
+	ct := "application/x-www-form-urlencoded"
+	classified := []ClassifiedRequest{
+		{ObservedRequest: crawl.ObservedRequest{Method: "POST", URL: "https://example.com/api/checkout", Headers: map[string]string{"Content-Type": ct}, Body: []byte("product_id=1&qty=1")}, IsAPI: true, Confidence: 0.8},
+		{ObservedRequest: crawl.ObservedRequest{Method: "POST", URL: "https://example.com/api/checkout", Headers: map[string]string{"Content-Type": ct}, Body: []byte("product_id=2&coupon=SAVE10")}, IsAPI: true, Confidence: 0.8},
+		{ObservedRequest: crawl.ObservedRequest{Method: "POST", URL: "https://example.com/api/checkout", Headers: map[string]string{"Content-Type": ct}, Body: []byte("product_id=3&gift_wrap=true&note=hello")}, IsAPI: true, Confidence: 0.8},
+		{ObservedRequest: crawl.ObservedRequest{Method: "POST", URL: "https://example.com/api/checkout", Headers: map[string]string{"Content-Type": ct}, Body: []byte("product_id=4&address_id=99")}, IsAPI: true, Confidence: 0.8},
+		{ObservedRequest: crawl.ObservedRequest{Method: "POST", URL: "https://example.com/api/checkout", Headers: map[string]string{"Content-Type": ct}, Body: []byte("product_id=5&promo=FLASH")}, IsAPI: true, Confidence: 0.8},
+	}
+
+	result := Deduplicate(classified)
+	assert.Len(t, result, 5, "5 POST observations with distinct bodies must each survive dedup")
+}
+
+// TestDeduplicate_IdenticalBodiesCollapse verifies that POST observations with
+// byte-identical bodies collapse to a single entry (true duplicates).
+func TestDeduplicate_IdenticalBodiesCollapse(t *testing.T) {
+	body := []byte(`{"user":"alice","role":"admin"}`)
+	ct := "application/json"
+	classified := []ClassifiedRequest{
+		{ObservedRequest: crawl.ObservedRequest{Method: "POST", URL: "https://example.com/api/users", Headers: map[string]string{"Content-Type": ct}, Body: body}, IsAPI: true, Confidence: 0.8},
+		{ObservedRequest: crawl.ObservedRequest{Method: "POST", URL: "https://example.com/api/users", Headers: map[string]string{"Content-Type": ct}, Body: body}, IsAPI: true, Confidence: 0.85},
+		{ObservedRequest: crawl.ObservedRequest{Method: "POST", URL: "https://example.com/api/users", Headers: map[string]string{"Content-Type": ct}, Body: body}, IsAPI: true, Confidence: 0.9},
+		{ObservedRequest: crawl.ObservedRequest{Method: "POST", URL: "https://example.com/api/users", Headers: map[string]string{"Content-Type": ct}, Body: body}, IsAPI: true, Confidence: 0.7},
+		{ObservedRequest: crawl.ObservedRequest{Method: "POST", URL: "https://example.com/api/users", Headers: map[string]string{"Content-Type": ct}, Body: body}, IsAPI: true, Confidence: 0.75},
+	}
+
+	result := Deduplicate(classified)
+	require.Len(t, result, 1, "5 POST observations with byte-identical bodies must collapse to 1 entry")
+	assert.InDelta(t, 0.9, result[0].Confidence, 0.001, "highest confidence kept")
+}
+
+// TestDeduplicate_GETsStillCollapseByPath verifies that bodyless GETs continue
+// to deduplicate by path regardless of any header differences (unchanged behavior).
+func TestDeduplicate_GETsStillCollapseByPath(t *testing.T) {
+	classified := []ClassifiedRequest{
+		{ObservedRequest: crawl.ObservedRequest{Method: "GET", URL: "https://example.com/api/products?page=1", QueryParams: map[string]string{"page": "1"}}, IsAPI: true, Confidence: 0.8},
+		{ObservedRequest: crawl.ObservedRequest{Method: "GET", URL: "https://example.com/api/products?page=2", QueryParams: map[string]string{"page": "2"}}, IsAPI: true, Confidence: 0.85},
+		{ObservedRequest: crawl.ObservedRequest{Method: "GET", URL: "https://example.com/api/products?page=3", QueryParams: map[string]string{"page": "3"}}, IsAPI: true, Confidence: 0.75},
+	}
+
+	result := Deduplicate(classified)
+	require.Len(t, result, 1, "bodyless GETs must still collapse by path")
+	assert.InDelta(t, 0.85, result[0].Confidence, 0.001, "highest confidence kept")
+	// Query params from all 3 observations should be merged.
+	assert.Equal(t, "1", result[0].QueryParams["page"])
 }

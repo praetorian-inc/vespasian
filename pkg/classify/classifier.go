@@ -15,6 +15,8 @@
 package classify
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/url"
 	"strings"
 
@@ -114,14 +116,20 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
 			key += ":" + sa
 		}
 
-		// If this observation has a body, include the base content type in the
-		// key so that distinct request body shapes (JSON, urlencoded, multipart)
-		// survive deduplication on the same path. Empty bodies (e.g. GET) do
-		// not split.
+		// If this observation has a body, include the base content type and a
+		// short hash of the body bytes in the key so that:
+		//   - Distinct body shapes on the same path+method survive as separate
+		//     entries (required for downstream form/JSON field-merge logic in
+		//     buildOperation in pkg/generate/rest/openapi.go, which unions fields
+		//     across observations).
+		//   - Identical bodies still collapse correctly (true duplicates).
+		//   - Empty-body requests (GET, DELETE, HEAD, OPTIONS) are unaffected.
 		if len(req.Body) > 0 {
 			if ct := getContentType(req.Headers); ct != "" {
 				key += ":" + baseMediaType(ct)
 			}
+			h := sha256.Sum256(req.Body)
+			key += ":" + hex.EncodeToString(h[:8])
 		}
 
 		existing, found := seen[key]

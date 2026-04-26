@@ -605,8 +605,16 @@ func extractComponents(doc *openapi3.T) { //nolint:gocyclo // component extracti
 		}
 	}
 
-	// Walk all paths and operations
-	for path := range doc.Paths.Map() {
+	// Walk all paths and operations in deterministic order so that when multiple
+	// paths share a schema fingerprint, the component name (chosen on first encounter)
+	// is stable across runs.
+	pathsMap := doc.Paths.Map()
+	sortedPaths := make([]string, 0, len(pathsMap))
+	for p := range pathsMap {
+		sortedPaths = append(sortedPaths, p)
+	}
+	sort.Strings(sortedPaths)
+	for _, path := range sortedPaths {
 		pathItem := doc.Paths.Find(path)
 		if pathItem == nil {
 			continue
