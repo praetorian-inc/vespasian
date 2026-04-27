@@ -518,6 +518,25 @@ func isUnsupportedSchemeRef(ref string) bool {
 		strings.HasPrefix(lower, "blob:")
 }
 
+// effectivePort returns the URL's port, expanding empty values to the scheme's
+// default (80 for http, 443 for https). Required so that "https://host/" and
+// "https://host:443/x" compare as the same origin in validateResolvedURL —
+// url.URL.Port() returns "" when the default port is omitted, which would
+// otherwise cause same-origin form actions that include the explicit default
+// port to be incorrectly rejected as off-host.
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch u.Scheme {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	}
+	return ""
+}
+
 // validateResolvedURL checks that the resolved URL is an HTTP(S) URL on the
 // same scheme, hostname, and port as the base URL. Returns false if any
 // constraint is violated.
@@ -530,8 +549,10 @@ func validateResolvedURL(baseU, resolved *url.URL) bool {
 		return false
 	}
 	// Reject off-host actions: hostname and port must both match the base URL.
+	// effectivePort normalises omitted default ports so that "https://host/" and
+	// "https://host:443/x" are treated as the same origin (RFC 3986 §3.2.3).
 	if !strings.EqualFold(resolved.Hostname(), baseU.Hostname()) ||
-		resolved.Port() != baseU.Port() {
+		effectivePort(resolved) != effectivePort(baseU) {
 		return false
 	}
 	return true

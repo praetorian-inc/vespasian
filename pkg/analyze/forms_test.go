@@ -520,6 +520,50 @@ func TestResolveAction_DifferentPortRejected(t *testing.T) {
 	}
 }
 
+// CodeRabbit follow-up: implicit default port (omitted) and explicit default
+// port must be treated as the same origin. https://h/ and https://h:443/ are
+// the same origin per RFC 3986 §3.2.3; url.URL.Port() returns "" in the first
+// case and "443" in the second, so a naive direct comparison would falsely
+// reject these as off-host. Both directions of the substitution must hold.
+func TestResolveAction_ExplicitDefaultPortMatchesImplicit_HTTPS(t *testing.T) {
+	// base implicit, ref explicit :443
+	got, _, ok := resolveAction("https://h/", "https://h:443/x")
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	if got != "https://h:443/x" && got != "https://h/x" {
+		t.Errorf("got %q, want https://h:443/x or https://h/x", got)
+	}
+
+	// base explicit :443, ref implicit
+	got, _, ok = resolveAction("https://h:443/", "https://h/x")
+	if !ok {
+		t.Fatalf("reverse direction: ok = false, want true")
+	}
+	if got != "https://h/x" && got != "https://h:443/x" {
+		t.Errorf("reverse direction: got %q", got)
+	}
+}
+
+func TestResolveAction_ExplicitDefaultPortMatchesImplicit_HTTP(t *testing.T) {
+	got, _, ok := resolveAction("http://h/", "http://h:80/x")
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	if got != "http://h:80/x" && got != "http://h/x" {
+		t.Errorf("got %q", got)
+	}
+}
+
+// Negative guard: the effectivePort fix must not accidentally normalize
+// non-default ports — :8443 is not the same origin as :443.
+func TestResolveAction_NonDefaultPortStillDistinct(t *testing.T) {
+	_, _, ok := resolveAction("https://h/", "https://h:8443/x")
+	if ok {
+		t.Errorf("expected ok=false for :8443 vs implicit :443, got true")
+	}
+}
+
 func TestResolveAction_HostnameComparisonCaseInsensitive(t *testing.T) {
 	got, _, ok := resolveAction("https://Host/", "https://host/x")
 	if !ok {
