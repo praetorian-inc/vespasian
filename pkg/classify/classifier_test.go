@@ -592,6 +592,42 @@ func TestDeduplicate_GETsStillCollapseByPath(t *testing.T) {
 	assert.Equal(t, "1", result[0].QueryParams["page"])
 }
 
+// TestDeduplicate_MultipartBoundaryNormalized verifies that two logically
+// identical multipart bodies with DIFFERENT boundary tokens dedup correctly.
+// Boundaries are random per-request from clients, so without normalization
+// every observation would be unique.
+func TestDeduplicate_MultipartBoundaryNormalized(t *testing.T) {
+	body1 := []byte("--BoundaryAAA\r\n" +
+		"Content-Disposition: form-data; name=\"x\"\r\n\r\n" +
+		"value\r\n" +
+		"--BoundaryAAA--\r\n")
+	body2 := []byte("--BoundaryZZZ\r\n" +
+		"Content-Disposition: form-data; name=\"x\"\r\n\r\n" +
+		"value\r\n" +
+		"--BoundaryZZZ--\r\n")
+	classified := []ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "POST", URL: "https://example.com/api/upload",
+				Headers: map[string]string{"Content-Type": "multipart/form-data; boundary=BoundaryAAA"},
+				Body:    body1,
+			},
+			IsAPI: true, Confidence: 0.85, APIType: "rest",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "POST", URL: "https://example.com/api/upload",
+				Headers: map[string]string{"Content-Type": "multipart/form-data; boundary=BoundaryZZZ"},
+				Body:    body2,
+			},
+			IsAPI: true, Confidence: 0.95, APIType: "rest",
+		},
+	}
+	result := Deduplicate(classified)
+	require.Len(t, result, 1, "identical multipart content with different boundaries should dedup to one entry")
+	assert.InDelta(t, 0.95, result[0].Confidence, 0.001, "highest confidence kept")
+}
+
 // BenchmarkDeduplicate exercises the dedup hot path (key construction +
 // body fingerprint when applicable) at varying scales. Establishes a
 // baseline before stretch-goal performance work.
@@ -600,13 +636,13 @@ func BenchmarkDeduplicate(b *testing.B) {
 		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
 			// Build a fixture: n distinct POST observations, urlencoded bodies
 			input := make([]ClassifiedRequest, n)
-			for i := 0; i < n; i++ {
+			for i := range n {
 				input[i] = ClassifiedRequest{
 					ObservedRequest: crawl.ObservedRequest{
 						Method:  "POST",
 						URL:     fmt.Sprintf("https://example.com/api/endpoint%d", i%50),
 						Headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
-						Body:    []byte(fmt.Sprintf("name=u%d&value=%d", i, i)),
+						Body:    fmt.Appendf(nil, "name=u%d&value=%d", i, i),
 					},
 					IsAPI: true, Confidence: 0.9, APIType: "rest",
 				}

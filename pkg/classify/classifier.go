@@ -15,8 +15,10 @@
 package classify
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"mime"
 	"net/url"
 	"strings"
 
@@ -85,7 +87,7 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 // In practice this is bounded by the upstream crawl layer's MaxPages setting
 // (default 100). The import path (ReadCapture) does not enforce size limits,
 // so callers importing from untrusted capture files should validate input size.
-func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
+func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest { //nolint:gocyclo // boundary normalization for multipart adds necessary branches
 	type entry struct {
 		req ClassifiedRequest
 	}
@@ -137,7 +139,18 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
 			// scale (capped at MaxPages, default 100). A collision would
 			// silently merge two distinct bodies into one dedup bucket; this
 			// is no worse than pre-fix behavior and worth the simpler key.
-			h := sha256.Sum256(req.Body)
+			fingerprintBody := req.Body
+			if ct := getContentType(req.Headers); ct != "" {
+				if mt, params, err := mime.ParseMediaType(ct); err == nil && mt == "multipart/form-data" {
+					if boundary := params["boundary"]; boundary != "" {
+						// Multipart bodies contain a random boundary token (per-request) that
+						// would otherwise make every observation unique. Normalize it to a
+						// sentinel so identical logical forms with different boundaries dedup.
+						fingerprintBody = bytes.ReplaceAll(req.Body, []byte(boundary), []byte("BOUNDARY"))
+					}
+				}
+			}
+			h := sha256.Sum256(fingerprintBody)
 			key += ":" + hex.EncodeToString(h[:8])
 		}
 

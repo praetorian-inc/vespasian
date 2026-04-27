@@ -133,18 +133,10 @@ func mergeJSONBodies(bodies [][]byte) *openapi3.SchemaRef {
 		if schema == nil {
 			continue
 		}
-		if merged == nil {
-			merged = schema
-			continue
-		}
-		if merged.Value != nil && merged.Value.Properties != nil &&
-			schema.Value != nil && schema.Value.Properties != nil {
-			for propName, propSchema := range schema.Value.Properties {
-				if _, exists := merged.Value.Properties[propName]; !exists {
-					merged.Value.Properties[propName] = propSchema
-				}
-			}
-		}
+		// Delegate to mergeObjectSchemas (defined in form.go) so JSON, urlencoded,
+		// and multipart all share the same conflict-resolution semantics: union
+		// of properties; conflicting types promote to string.
+		merged = mergeObjectSchemas(merged, schema)
 	}
 	return merged
 }
@@ -643,7 +635,13 @@ func extractComponents(doc *openapi3.T) { //nolint:gocyclo // component extracti
 			// Extract request body schema
 			if op.operation.RequestBody != nil && op.operation.RequestBody.Value != nil {
 				reqBody := op.operation.RequestBody.Value
-				for _, mediaType := range reqBody.Content {
+				ctKeys := make([]string, 0, len(reqBody.Content))
+				for k := range reqBody.Content {
+					ctKeys = append(ctKeys, k)
+				}
+				sort.Strings(ctKeys)
+				for _, ctKey := range ctKeys {
+					mediaType := reqBody.Content[ctKey]
 					if mediaType == nil || mediaType.Schema == nil {
 						continue
 					}
@@ -679,13 +677,27 @@ func extractComponents(doc *openapi3.T) { //nolint:gocyclo // component extracti
 
 			// Extract response schemas
 			if op.operation.Responses != nil {
+				sortedStatusCodes := make([]string, 0, op.operation.Responses.Len())
 				for statusCode := range op.operation.Responses.Map() {
+					sortedStatusCodes = append(sortedStatusCodes, statusCode)
+				}
+				sort.Strings(sortedStatusCodes)
+				for _, statusCode := range sortedStatusCodes {
 					respRef := op.operation.Responses.Value(statusCode)
 					if respRef == nil || respRef.Value == nil {
 						continue
 					}
 					response := respRef.Value
-					if mediaType := response.Content["application/json"]; mediaType != nil && mediaType.Schema != nil {
+					respCtKeys := make([]string, 0, len(response.Content))
+					for k := range response.Content {
+						respCtKeys = append(respCtKeys, k)
+					}
+					sort.Strings(respCtKeys)
+					for _, respCtKey := range respCtKeys {
+						mediaType := response.Content[respCtKey]
+						if mediaType == nil || mediaType.Schema == nil {
+							continue
+						}
 						if schema := mediaType.Schema.Value; schema != nil && schema.Properties != nil {
 							fingerprint := schemaFingerprint(schema)
 							if fingerprint != "" {

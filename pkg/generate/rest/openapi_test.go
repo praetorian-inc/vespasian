@@ -1104,6 +1104,45 @@ func TestOpenAPIGenerator_MultipartFormData_EndToEnd(t *testing.T) {
 	assert.Contains(t, specStr, "binary", "spec missing format: binary for file upload field")
 }
 
+// TestExtractComponents_DeterministicMultiContentType ensures that when a
+// single endpoint exposes multiple media types with DIFFERENT schemas (e.g.,
+// JSON + urlencoded observations), component names are stable across runs.
+// The previous TestExtractComponents_Deterministic only used one media type
+// per path and missed the inner-map iteration order issue.
+func TestExtractComponents_DeterministicMultiContentType(t *testing.T) {
+	var obs []classify.ClassifiedRequest
+	for _, p := range []string{"/api/a", "/api/b", "/api/c", "/api/d", "/api/e"} {
+		obs = append(obs,
+			classify.ClassifiedRequest{
+				ObservedRequest: crawl.ObservedRequest{
+					Method: "POST", URL: "http://x.test" + p,
+					Headers: map[string]string{"Content-Type": "application/json"},
+					Body:    []byte(`{"jsonField":"v"}`),
+				},
+				IsAPI: true, Confidence: 0.9, APIType: "rest",
+			},
+			classify.ClassifiedRequest{
+				ObservedRequest: crawl.ObservedRequest{
+					Method: "POST", URL: "http://x.test" + p,
+					Headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
+					Body:    []byte(`urlencodedField=v`),
+				},
+				IsAPI: true, Confidence: 0.9, APIType: "rest",
+			},
+		)
+	}
+	gen := &OpenAPIGenerator{}
+	runs := make([][]byte, 5)
+	for i := 0; i < 5; i++ {
+		out, err := gen.Generate(obs)
+		require.NoError(t, err)
+		runs[i] = out
+	}
+	for i := 1; i < 5; i++ {
+		assert.Equal(t, string(runs[0]), string(runs[i]), "run %d differs from run 0", i)
+	}
+}
+
 // Helper function for tests
 func stringPtr(s string) *string {
 	return &s
@@ -1235,6 +1274,27 @@ func TestOpenAPIGenerator_NonHTTPScheme(t *testing.T) {
 	if !strings.Contains(specStr, "/valid") {
 		t.Error("HTTPS endpoint should be present")
 	}
+}
+
+// TestMergeJSONBodies_TypeConflictPromotesToString verifies that JSON merge
+// uses the same conflict-resolution as form merge (was: silently kept first
+// type). Two observations with `count: 42` then `count: "hello"` should yield
+// a string-typed schema (matching urlencoded/multipart behavior).
+func TestMergeJSONBodies_TypeConflictPromotesToString(t *testing.T) {
+	bodies := [][]byte{
+		[]byte(`{"count": 42}`),
+		[]byte(`{"count": "hello"}`),
+	}
+	merged := mergeJSONBodies(bodies)
+	require.NotNil(t, merged)
+	require.NotNil(t, merged.Value)
+	require.NotNil(t, merged.Value.Properties)
+	countProp := merged.Value.Properties["count"]
+	require.NotNil(t, countProp)
+	require.NotNil(t, countProp.Value.Type)
+	require.NotEmpty(t, countProp.Value.Type.Slice())
+	assert.Equal(t, "string", countProp.Value.Type.Slice()[0],
+		"conflicting types should promote to string (matching form merge behavior)")
 }
 
 // TestExtractComponents_Deterministic verifies that Generate produces byte-identical

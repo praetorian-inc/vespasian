@@ -29,35 +29,25 @@ func TestParseURLEncodedForm(t *testing.T) {
 	t.Run("basic fields with type inference", func(t *testing.T) {
 		body := []byte("name=Alice&age=30")
 		schema := ParseURLEncodedForm(body)
-		if schema == nil {
-			t.Fatal("expected schema, got nil")
-		}
-		if schema.Value == nil || schema.Value.Properties == nil {
-			t.Fatal("expected object schema with properties")
-		}
-		if _, ok := schema.Value.Properties["name"]; !ok {
-			t.Error("expected property 'name'")
-		}
-		if _, ok := schema.Value.Properties["age"]; !ok {
-			t.Error("expected property 'age'")
-		}
+		require.NotNil(t, schema, "expected schema, got nil")
+		require.NotNil(t, schema.Value, "expected object schema")
+		require.NotNil(t, schema.Value.Properties, "expected schema with properties")
+
+		assert.Contains(t, schema.Value.Properties, "name", "expected property 'name'")
+		assert.Contains(t, schema.Value.Properties, "age", "expected property 'age'")
+
+		require.NotNil(t, schema.Value.Properties["name"])
 		nameType := schema.Value.Properties["name"].Value.Type.Slice()[0]
-		if nameType != "string" {
-			t.Errorf("name type = %q, want string", nameType)
-		}
+		assert.Equal(t, "string", nameType, "name type = %q, want string", nameType)
+
+		require.NotNil(t, schema.Value.Properties["age"])
 		ageType := schema.Value.Properties["age"].Value.Type.Slice()[0]
-		if ageType != "integer" {
-			t.Errorf("age type = %q, want integer", ageType)
-		}
+		assert.Equal(t, "integer", ageType, "age type = %q, want integer", ageType)
 	})
 
 	t.Run("empty body returns nil", func(t *testing.T) {
-		if schema := ParseURLEncodedForm([]byte("")); schema != nil {
-			t.Error("expected nil for empty body")
-		}
-		if schema := ParseURLEncodedForm(nil); schema != nil {
-			t.Error("expected nil for nil body")
-		}
+		assert.Nil(t, ParseURLEncodedForm([]byte("")), "expected nil for empty body")
+		assert.Nil(t, ParseURLEncodedForm(nil), "expected nil for nil body")
 	})
 }
 
@@ -65,21 +55,19 @@ func TestParseMultipartForm(t *testing.T) {
 	t.Run("text field becomes string", func(t *testing.T) {
 		var buf bytes.Buffer
 		w := multipart.NewWriter(&buf)
-		if err := w.WriteField("username", "alice"); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, w.WriteField("username", "alice"))
 		_ = w.Close()
 
 		schema := ParseMultipartForm(buf.Bytes(), w.Boundary())
-		if schema == nil {
-			t.Fatal("expected schema, got nil")
-		}
-		if _, ok := schema.Value.Properties["username"]; !ok {
-			t.Error("expected property 'username'")
-		}
-		uType := schema.Value.Properties["username"].Value.Type.Slice()[0]
-		if uType != "string" {
-			t.Errorf("username type = %q, want string", uType)
+		require.NotNil(t, schema, "expected schema, got nil")
+		require.NotNil(t, schema.Value)
+		require.NotNil(t, schema.Value.Properties)
+
+		assert.Contains(t, schema.Value.Properties, "username", "expected property 'username'")
+		if prop, ok := schema.Value.Properties["username"]; ok {
+			require.NotNil(t, prop)
+			uType := prop.Value.Type.Slice()[0]
+			assert.Equal(t, "string", uType, "username type = %q, want string", uType)
 		}
 	})
 
@@ -90,63 +78,48 @@ func TestParseMultipartForm(t *testing.T) {
 		h.Set("Content-Disposition", `form-data; name="avatar"; filename="photo.jpg"`)
 		h.Set("Content-Type", "image/jpeg")
 		fw, err := w.CreatePart(h)
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 		_, _ = fw.Write([]byte("JPEG_DATA"))
 		_ = w.Close()
 
 		schema := ParseMultipartForm(buf.Bytes(), w.Boundary())
-		if schema == nil {
-			t.Fatal("expected schema, got nil")
-		}
+		require.NotNil(t, schema, "expected schema, got nil")
+		require.NotNil(t, schema.Value)
+		require.NotNil(t, schema.Value.Properties)
+
 		prop, ok := schema.Value.Properties["avatar"]
-		if !ok {
-			t.Fatal("expected property 'avatar'")
-		}
-		if prop.Value.Type.Slice()[0] != "string" {
-			t.Errorf("avatar type = %q, want string", prop.Value.Type.Slice()[0])
-		}
-		if prop.Value.Format != "binary" {
-			t.Errorf("avatar format = %q, want binary", prop.Value.Format)
-		}
+		require.True(t, ok, "expected property 'avatar'")
+		require.NotNil(t, prop)
+		assert.Equal(t, "string", prop.Value.Type.Slice()[0], "avatar type = %q, want string", prop.Value.Type.Slice()[0])
+		assert.Equal(t, "binary", prop.Value.Format, "avatar format = %q, want binary", prop.Value.Format)
 	})
 
 	t.Run("mixed text and file fields", func(t *testing.T) {
 		var buf bytes.Buffer
 		w := multipart.NewWriter(&buf)
-		if err := w.WriteField("description", "hello world"); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, w.WriteField("description", "hello world"))
 		h := make(textproto.MIMEHeader)
 		h.Set("Content-Disposition", `form-data; name="upload"; filename="data.bin"`)
 		fw, err := w.CreatePart(h)
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 		_, _ = fw.Write([]byte("binary content"))
 		_ = w.Close()
 
 		schema := ParseMultipartForm(buf.Bytes(), w.Boundary())
-		if schema == nil {
-			t.Fatal("expected schema, got nil")
-		}
-		if _, ok := schema.Value.Properties["description"]; !ok {
-			t.Error("expected property 'description'")
-		}
+		require.NotNil(t, schema, "expected schema, got nil")
+		require.NotNil(t, schema.Value)
+		require.NotNil(t, schema.Value.Properties)
+
+		assert.Contains(t, schema.Value.Properties, "description", "expected property 'description'")
+
 		upload, ok := schema.Value.Properties["upload"]
-		if !ok {
-			t.Fatal("expected property 'upload'")
-		}
-		if upload.Value.Format != "binary" {
-			t.Errorf("upload format = %q, want binary", upload.Value.Format)
-		}
+		require.True(t, ok, "expected property 'upload'")
+		require.NotNil(t, upload)
+		assert.Equal(t, "binary", upload.Value.Format, "upload format = %q, want binary", upload.Value.Format)
 	})
 
 	t.Run("empty boundary returns nil", func(t *testing.T) {
-		if schema := ParseMultipartForm([]byte("data"), ""); schema != nil {
-			t.Error("expected nil for empty boundary")
-		}
+		assert.Nil(t, ParseMultipartForm([]byte("data"), ""), "expected nil for empty boundary")
 	})
 }
 
@@ -154,17 +127,13 @@ func TestMergeMultipartBodies(t *testing.T) {
 	t.Run("merges properties from two observations", func(t *testing.T) {
 		var buf1 bytes.Buffer
 		w1 := multipart.NewWriter(&buf1)
-		if err := w1.WriteField("username", "alice"); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, w1.WriteField("username", "alice"))
 		_ = w1.Close()
 		ct1 := "multipart/form-data; boundary=" + w1.Boundary()
 
 		var buf2 bytes.Buffer
 		w2 := multipart.NewWriter(&buf2)
-		if err := w2.WriteField("email", "alice@example.com"); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, w2.WriteField("email", "alice@example.com"))
 		_ = w2.Close()
 		ct2 := "multipart/form-data; boundary=" + w2.Boundary()
 
@@ -172,48 +141,38 @@ func TestMergeMultipartBodies(t *testing.T) {
 			[][]byte{buf1.Bytes(), buf2.Bytes()},
 			[]string{ct1, ct2},
 		)
-		if schema == nil {
-			t.Fatal("expected merged schema, got nil")
-		}
-		if _, ok := schema.Value.Properties["username"]; !ok {
-			t.Error("expected property 'username' from first observation")
-		}
-		if _, ok := schema.Value.Properties["email"]; !ok {
-			t.Error("expected property 'email' from second observation")
-		}
+		require.NotNil(t, schema, "expected merged schema, got nil")
+		require.NotNil(t, schema.Value)
+		require.NotNil(t, schema.Value.Properties)
+
+		assert.Contains(t, schema.Value.Properties, "username", "expected property 'username' from first observation")
+		assert.Contains(t, schema.Value.Properties, "email", "expected property 'email' from second observation")
 	})
 
 	t.Run("single observation returns that observation's schema", func(t *testing.T) {
 		var buf bytes.Buffer
 		w := multipart.NewWriter(&buf)
-		if err := w.WriteField("field1", "value1"); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, w.WriteField("field1", "value1"))
 		_ = w.Close()
 		ct := "multipart/form-data; boundary=" + w.Boundary()
 
 		schema := mergeMultipartBodies([][]byte{buf.Bytes()}, []string{ct})
-		if schema == nil {
-			t.Fatal("expected schema, got nil")
-		}
-		if _, ok := schema.Value.Properties["field1"]; !ok {
-			t.Error("expected property 'field1'")
-		}
+		require.NotNil(t, schema, "expected schema, got nil")
+		require.NotNil(t, schema.Value)
+		require.NotNil(t, schema.Value.Properties)
+
+		assert.Contains(t, schema.Value.Properties, "field1", "expected property 'field1'")
 	})
 
 	t.Run("missing content-type entry skips that observation", func(t *testing.T) {
 		var buf bytes.Buffer
 		w := multipart.NewWriter(&buf)
-		if err := w.WriteField("name", "bob"); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, w.WriteField("name", "bob"))
 		_ = w.Close()
 		// Provide body but no corresponding content-type entry.
 		schema := mergeMultipartBodies([][]byte{buf.Bytes()}, []string{})
 		// With no boundary the observation is skipped; result is nil.
-		if schema != nil {
-			t.Error("expected nil when no content-type provided")
-		}
+		assert.Nil(t, schema, "expected nil when no content-type provided")
 	})
 }
 
@@ -222,62 +181,70 @@ func TestMergeObjectSchemas(t *testing.T) {
 		// base has "count" as integer, overlay has "count" as string — conflict.
 		base := ParseURLEncodedForm([]byte("count=42"))
 		overlay := ParseURLEncodedForm([]byte("count=hello"))
-		if base == nil || overlay == nil {
-			t.Fatal("test setup failed: expected non-nil schemas")
-		}
+		require.NotNil(t, base, "test setup failed: expected non-nil base schema")
+		require.NotNil(t, overlay, "test setup failed: expected non-nil overlay schema")
 
 		merged := mergeObjectSchemas(base, overlay)
-		if merged == nil {
-			t.Fatal("expected merged schema, got nil")
-		}
+		require.NotNil(t, merged, "expected merged schema, got nil")
+		require.NotNil(t, merged.Value)
+		require.NotNil(t, merged.Value.Properties)
+
 		countProp, ok := merged.Value.Properties["count"]
-		if !ok {
-			t.Fatal("expected property 'count' in merged schema")
-		}
+		require.True(t, ok, "expected property 'count' in merged schema")
+		require.NotNil(t, countProp)
 		// After conflict, property should be promoted to string.
 		gotType := countProp.Value.Type.Slice()[0]
-		if gotType != "string" {
-			t.Errorf("count type after conflict = %q, want string", gotType)
-		}
+		assert.Equal(t, "string", gotType, "count type after conflict = %q, want string", gotType)
 	})
 
 	t.Run("no conflict keeps original types", func(t *testing.T) {
 		base := ParseURLEncodedForm([]byte("name=Alice&count=5"))
 		overlay := ParseURLEncodedForm([]byte("active=true"))
-		if base == nil || overlay == nil {
-			t.Fatal("test setup failed: expected non-nil schemas")
-		}
+		require.NotNil(t, base, "test setup failed: expected non-nil base schema")
+		require.NotNil(t, overlay, "test setup failed: expected non-nil overlay schema")
 
 		merged := mergeObjectSchemas(base, overlay)
-		if merged == nil {
-			t.Fatal("expected merged schema, got nil")
-		}
-		if _, ok := merged.Value.Properties["active"]; !ok {
-			t.Error("expected property 'active' from overlay")
-		}
+		require.NotNil(t, merged, "expected merged schema, got nil")
+		require.NotNil(t, merged.Value)
+		require.NotNil(t, merged.Value.Properties)
+
+		assert.Contains(t, merged.Value.Properties, "active", "expected property 'active' from overlay")
 		// count was only in base; type should be unchanged.
 		countProp, ok := merged.Value.Properties["count"]
-		if !ok {
-			t.Fatal("expected property 'count' in merged schema")
-		}
-		if countProp.Value.Type.Slice()[0] != "integer" {
-			t.Errorf("count type = %q, want integer", countProp.Value.Type.Slice()[0])
-		}
+		require.True(t, ok, "expected property 'count' in merged schema")
+		require.NotNil(t, countProp)
+		assert.Equal(t, "integer", countProp.Value.Type.Slice()[0], "count type = %q, want integer", countProp.Value.Type.Slice()[0])
 	})
 
 	t.Run("nil base returns overlay", func(t *testing.T) {
-		overlay := ParseURLEncodedForm([]byte("x=1"))
+		overlay := ParseURLEncodedForm([]byte("name=Alice"))
 		result := mergeObjectSchemas(nil, overlay)
-		if result != overlay {
-			t.Error("expected overlay to be returned when base is nil")
+		// Pointer equality still holds today; also verify content equality for resilience.
+		assert.True(t, result == overlay, "expected overlay to be returned when base is nil")
+		require.NotNil(t, result)
+		require.NotNil(t, result.Value)
+		require.NotNil(t, result.Value.Properties)
+		nameProp, ok := result.Value.Properties["name"]
+		assert.True(t, ok, "expected 'name' property in result when base is nil")
+		if ok {
+			require.NotNil(t, nameProp)
+			assert.Equal(t, "string", nameProp.Value.Type.Slice()[0])
 		}
 	})
 
 	t.Run("nil overlay returns base", func(t *testing.T) {
-		base := ParseURLEncodedForm([]byte("x=1"))
+		base := ParseURLEncodedForm([]byte("name=Alice"))
 		result := mergeObjectSchemas(base, nil)
-		if result != base {
-			t.Error("expected base to be returned when overlay is nil")
+		// Pointer equality still holds today; also verify content equality for resilience.
+		assert.True(t, result == base, "expected base to be returned when overlay is nil")
+		require.NotNil(t, result)
+		require.NotNil(t, result.Value)
+		require.NotNil(t, result.Value.Properties)
+		nameProp, ok := result.Value.Properties["name"]
+		assert.True(t, ok, "expected 'name' property in result when overlay is nil")
+		if ok {
+			require.NotNil(t, nameProp)
+			assert.Equal(t, "string", nameProp.Value.Type.Slice()[0])
 		}
 	})
 }
@@ -286,34 +253,36 @@ func TestSchemaTypesConflict(t *testing.T) {
 	t.Run("same types do not conflict", func(t *testing.T) {
 		a := ParseURLEncodedForm([]byte("val=hello"))
 		b := ParseURLEncodedForm([]byte("val=world"))
-		if a == nil || b == nil {
-			t.Fatal("test setup failed")
-		}
+		require.NotNil(t, a, "test setup failed")
+		require.NotNil(t, b, "test setup failed")
 		aProp := a.Value.Properties["val"]
 		bProp := b.Value.Properties["val"]
-		if schemaTypesConflict(aProp, bProp) {
-			t.Error("string vs string should not conflict")
-		}
+		assert.False(t, schemaTypesConflict(aProp, bProp), "string vs string should not conflict")
 	})
 
 	t.Run("different types conflict", func(t *testing.T) {
 		// "val=42" infers integer; "val=hello" infers string.
 		aBase := ParseURLEncodedForm([]byte("val=42"))
 		bBase := ParseURLEncodedForm([]byte("val=hello"))
-		if aBase == nil || bBase == nil {
-			t.Fatal("test setup failed")
-		}
+		require.NotNil(t, aBase, "test setup failed")
+		require.NotNil(t, bBase, "test setup failed")
 		aProp := aBase.Value.Properties["val"]
 		bProp := bBase.Value.Properties["val"]
-		if !schemaTypesConflict(aProp, bProp) {
-			t.Error("integer vs string should conflict")
-		}
+		assert.True(t, schemaTypesConflict(aProp, bProp), "integer vs string should conflict")
 	})
 
 	t.Run("nil schema refs do not conflict", func(t *testing.T) {
-		if schemaTypesConflict(nil, nil) {
-			t.Error("nil vs nil should not conflict")
-		}
+		assert.False(t, schemaTypesConflict(nil, nil), "nil vs nil should not conflict")
+	})
+
+	t.Run("nil_base_nonnil_overlay_does_not_conflict", func(t *testing.T) {
+		nonNil := ParseURLEncodedForm([]byte("name=Alice")).Value.Properties["name"]
+		assert.False(t, schemaTypesConflict(nil, nonNil))
+	})
+
+	t.Run("nonnil_base_nil_overlay_does_not_conflict", func(t *testing.T) {
+		nonNil := ParseURLEncodedForm([]byte("name=Alice")).Value.Properties["name"]
+		assert.False(t, schemaTypesConflict(nonNil, nil))
 	})
 }
 
@@ -322,9 +291,7 @@ func TestParseURLEncodedForm_MalformedQuery(t *testing.T) {
 	// error, so ParseURLEncodedForm must return nil (covers the err != nil
 	// branch at form.go:50).
 	schema := ParseURLEncodedForm([]byte("%ZZ=bad"))
-	if schema != nil {
-		t.Errorf("expected nil for malformed query string, got %+v", schema)
-	}
+	assert.Nil(t, schema, "expected nil for malformed query string, got %+v", schema)
 }
 
 func TestParseMultipartForm_AllPartsNameless(t *testing.T) {
@@ -339,16 +306,12 @@ func TestParseMultipartForm_AllPartsNameless(t *testing.T) {
 	h.Set("Content-Disposition", "form-data")
 	h.Set("Content-Type", "text/plain")
 	fw, err := w.CreatePart(h)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	_, _ = fw.Write([]byte("some data"))
 	_ = w.Close()
 
 	schema := ParseMultipartForm(buf.Bytes(), w.Boundary())
-	if schema != nil {
-		t.Errorf("expected nil when all parts are nameless, got %+v", schema)
-	}
+	assert.Nil(t, schema, "expected nil when all parts are nameless, got %+v", schema)
 }
 
 func TestSchemaTypesConflict_NilValueType(t *testing.T) {
@@ -357,9 +320,7 @@ func TestSchemaTypesConflict_NilValueType(t *testing.T) {
 	// fires before any comparison.
 	a := &openapi3.SchemaRef{Value: &openapi3.Schema{}}
 	b := &openapi3.SchemaRef{Value: &openapi3.Schema{}}
-	if schemaTypesConflict(a, b) {
-		t.Error("expected false when both Value.Type are nil, got true")
-	}
+	assert.False(t, schemaTypesConflict(a, b), "expected false when both Value.Type are nil, got true")
 }
 
 // ---------------------------------------------------------------------------
@@ -527,7 +488,7 @@ func TestParseMultipartForm_Malformed_MissingClosingBoundary(t *testing.T) {
 func BenchmarkParseURLEncodedForm(b *testing.B) {
 	body := []byte("username=alice&password=secret&age=30&admin=true&remember_me=false&note=hello+world")
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = ParseURLEncodedForm(body)
 	}
 }
@@ -548,7 +509,7 @@ func BenchmarkParseMultipartForm(b *testing.B) {
 	boundary := w.Boundary()
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = ParseMultipartForm(body, boundary)
 	}
 }
@@ -656,29 +617,23 @@ func TestGetHeader_CaseInsensitiveFallback(t *testing.T) {
 		"Content-Type": "application/json",
 	}
 	got := getHeader(headers, "content-type")
-	if got != "application/json" {
-		t.Errorf("getHeader case-insensitive fallback: got %q, want %q", got, "application/json")
-	}
+	assert.Equal(t, "application/json", got, "getHeader case-insensitive fallback: got %q, want %q", got, "application/json")
 }
 
 func TestExtractBoundary(t *testing.T) {
 	t.Run("valid content-type with boundary", func(t *testing.T) {
 		ct := `multipart/form-data; boundary=----WebKitFormBoundaryABC123`
 		boundary := extractBoundary(ct)
-		if boundary != "----WebKitFormBoundaryABC123" {
-			t.Errorf("boundary = %q, want ----WebKitFormBoundaryABC123", boundary)
-		}
+		assert.Equal(t, "----WebKitFormBoundaryABC123", boundary, "boundary = %q, want ----WebKitFormBoundaryABC123", boundary)
 	})
 
 	t.Run("no boundary returns empty string", func(t *testing.T) {
-		if boundary := extractBoundary("application/json"); boundary != "" {
-			t.Errorf("boundary = %q, want empty string", boundary)
-		}
+		boundary := extractBoundary("application/json")
+		assert.Equal(t, "", boundary, "boundary = %q, want empty string", boundary)
 	})
 
 	t.Run("malformed content-type returns empty string", func(t *testing.T) {
-		if boundary := extractBoundary(""); boundary != "" {
-			t.Errorf("boundary = %q, want empty string", boundary)
-		}
+		boundary := extractBoundary("")
+		assert.Equal(t, "", boundary, "boundary = %q, want empty string", boundary)
 	})
 }

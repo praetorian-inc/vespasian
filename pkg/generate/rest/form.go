@@ -15,6 +15,7 @@
 package rest
 
 import (
+	"bytes"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -24,9 +25,11 @@ import (
 	"github.com/getkin/kin-openapi/openapi3"
 )
 
-// getHeader retrieves a header value case-insensitively. It checks for an exact
-// match first, then falls back to a case-insensitive scan. This handles browsers
-// (lowercase "content-type") and Burp/HAR importers (title-case "Content-Type").
+// getHeader retrieves a header value case-insensitively. The exact-match
+// shortcut at the top is a performance optimization for the common path
+// (browser-lowercased "content-type"); the loop handles other casings such
+// as Burp/HAR's title-case "Content-Type". Both branches return semantically
+// identical results — the shortcut is not a behavioral distinction.
 func getHeader(headers map[string]string, name string) string {
 	if v, ok := headers[name]; ok {
 		return v
@@ -67,7 +70,7 @@ func ParseMultipartForm(body []byte, boundary string) *openapi3.SchemaRef {
 	if boundary == "" {
 		return nil
 	}
-	reader := multipart.NewReader(strings.NewReader(string(body)), boundary)
+	reader := multipart.NewReader(bytes.NewReader(body), boundary)
 	schema := openapi3.NewObjectSchema()
 	for {
 		part, err := reader.NextPart()
@@ -83,8 +86,11 @@ func ParseMultipartForm(body []byte, boundary string) *openapi3.SchemaRef {
 			fileSchema.Format = "binary"
 			schema.Properties[name] = openapi3.NewSchemaRef("", fileSchema)
 		} else {
+			// Type inference only needs a small prefix of the value (we only check
+			// for integer/number/boolean format); reading the entire part into memory
+			// is wasteful for large text fields.
 			var buf strings.Builder
-			_, _ = io.Copy(&buf, part) //nolint:errcheck // read from in-memory multipart part; errors are not actionable
+			_, _ = io.Copy(&buf, io.LimitReader(part, 4096)) //nolint:errcheck // read from in-memory multipart part; errors are not actionable
 			t := inferQueryParamType(buf.String())
 			schema.Properties[name] = openapi3.NewSchemaRef("", &openapi3.Schema{
 				Type: &openapi3.Types{t},
