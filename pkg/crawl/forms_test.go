@@ -163,3 +163,76 @@ func TestDiscoveredForm_DefaultValues(t *testing.T) {
 		t.Errorf("expected query param in URL for GET form, got %q", results[0].URL)
 	}
 }
+
+// resolveFormAction is the pure attribute-resolution core of extractForms.
+// Default-suite coverage for every branch.
+
+// No action attribute → pageURL (HTML §4.10.21.3). This is the TEST-005
+// regression: previously the no-action branch used baseURL, so a login
+// form with no action on /login with <base href="/"> reported its
+// endpoint as "/" instead of "/login".
+func TestResolveFormAction_NoActionUsesPageURL(t *testing.T) {
+	got, ok := resolveFormAction("", "https://ex.com/login", "https://ex.com/")
+	if !ok || got != "https://ex.com/login" {
+		t.Errorf("got (%q, %v), want (%q, true)", got, ok, "https://ex.com/login")
+	}
+}
+
+func TestResolveFormAction_WhitespaceActionUsesPageURL(t *testing.T) {
+	got, ok := resolveFormAction("   \t\n", "https://ex.com/login", "https://ex.com/")
+	if !ok || got != "https://ex.com/login" {
+		t.Errorf("got (%q, %v), want (%q, true)", got, ok, "https://ex.com/login")
+	}
+}
+
+// Relative action resolves against baseURL, not pageURL — this is the
+// TEST-003 coverage gap. A regression that passed pageURL to resolveURL
+// would produce https://ex.com/deep/page/api/login instead.
+func TestResolveFormAction_RootRelativeResolvesAgainstBase(t *testing.T) {
+	got, ok := resolveFormAction("/api/login", "https://ex.com/deep/page", "https://ex.com/")
+	if !ok || got != "https://ex.com/api/login" {
+		t.Errorf("got (%q, %v), want (%q, true)", got, ok, "https://ex.com/api/login")
+	}
+}
+
+// Bare relative action resolves against baseURL, not deep/page — TEST-004.
+func TestResolveFormAction_BareRelativeResolvesAgainstBase(t *testing.T) {
+	got, ok := resolveFormAction("submit", "https://ex.com/deep/page", "https://ex.com/")
+	if !ok || got != "https://ex.com/submit" {
+		t.Errorf("got (%q, %v), want (%q, true)", got, ok, "https://ex.com/submit")
+	}
+}
+
+// Absolute HTTPS action passes through unchanged.
+func TestResolveFormAction_AbsoluteAction(t *testing.T) {
+	got, ok := resolveFormAction("https://ex.com/api/login", "https://ex.com/login", "https://ex.com/")
+	if !ok || got != "https://ex.com/api/login" {
+		t.Errorf("got (%q, %v), want (%q, true)", got, ok, "https://ex.com/api/login")
+	}
+}
+
+// Non-navigable schemes are rejected so the caller can drop the form —
+// TEST-001 coverage for javascript:, mailto:, data:, tel:, blob:.
+func TestResolveFormAction_NonNavigableSchemesRejected(t *testing.T) {
+	cases := []string{
+		"javascript:void(0)",
+		"mailto:x@y.com",
+		"data:text/html,<x>",
+		"tel:+1234567890",
+		"blob:https://ex.com/abc",
+	}
+	for _, raw := range cases {
+		got, ok := resolveFormAction(raw, "https://ex.com/login", "https://ex.com/")
+		if ok || got != "" {
+			t.Errorf("resolveFormAction(%q, ...) = (%q, %v), want (\"\", false)", raw, got, ok)
+		}
+	}
+}
+
+// Malformed action → ("", false) so the form is skipped.
+func TestResolveFormAction_MalformedActionRejected(t *testing.T) {
+	got, ok := resolveFormAction("http://[::1:", "https://ex.com/login", "https://ex.com/")
+	if ok || got != "" {
+		t.Errorf("got (%q, %v), want (\"\", false)", got, ok)
+	}
+}

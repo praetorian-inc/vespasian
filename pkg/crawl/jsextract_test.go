@@ -205,3 +205,55 @@ func TestJsExtractedToLinks(t *testing.T) {
 		t.Errorf("expected /api/users once, got %d times", count)
 	}
 }
+
+// Regression guard for the asset-filter wired into jsExtractedToLinks
+// (LAB-2221): jsluice sometimes pulls out string constants like "main.js"
+// or "/socket.io/" that look like URLs but aren't crawlable pages. If we
+// enqueue them we end up either fetching a known static asset (already
+// captured via CDP) or, on SPA catch-all servers, triggering recursive
+// nested paths like /socket.io/socket.io/.... The filter must drop them
+// before they reach the frontier.
+func TestJsExtractedToLinks_FiltersAssets(t *testing.T) {
+	extracted := []jsExtractedURL{
+		{URL: "/api/users"},
+		{URL: "/main.js"},
+		{URL: "/assets/chunk-ABCDE.mjs"},
+		{URL: "/styles.css"},
+		{URL: "/assets/public/images/logo.png"},
+		{URL: "/assets/font.woff2"},
+		{URL: "/socket.io/"},
+		{URL: "/engine.io/socket.io/"},
+	}
+
+	links := jsExtractedToLinks(extracted, "https://example.com/app")
+
+	rejected := []string{
+		"https://example.com/main.js",
+		"https://example.com/assets/chunk-ABCDE.mjs",
+		"https://example.com/styles.css",
+		"https://example.com/assets/public/images/logo.png",
+		"https://example.com/assets/font.woff2",
+		"https://example.com/socket.io/",
+		"https://example.com/engine.io/socket.io/",
+	}
+
+	for _, bad := range rejected {
+		for _, got := range links {
+			if got == bad {
+				t.Errorf("asset URL %q leaked through filter; links=%v", bad, links)
+			}
+		}
+	}
+
+	// Real API path must still be present.
+	found := false
+	for _, got := range links {
+		if got == "https://example.com/api/users" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("legitimate API path dropped by filter; links=%v", links)
+	}
+}
