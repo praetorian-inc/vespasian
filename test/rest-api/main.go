@@ -271,6 +271,64 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// handleLogin accepts application/x-www-form-urlencoded POST (login form).
+// Exercises vespasian's urlencoded form body parsing.
+func handleLogin(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Allow", "POST, OPTIONS")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4*1024) // 4KB login cap
+	if err := r.ParseForm(); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid form"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"username":    r.FormValue("username"),
+		"remember_me": r.FormValue("remember_me") == "true",
+		"token":       "fake-session-token",
+	})
+}
+
+// handleUpload accepts multipart/form-data POST with a file and text fields.
+// Exercises vespasian's multipart form body parsing.
+func handleUpload(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Allow", "POST, OPTIONS")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10MB upload cap
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid multipart"})
+		return
+	}
+	description := r.FormValue("description")
+	filename := ""
+	size := int64(0)
+	if file, header, err := r.FormFile("file"); err == nil {
+		filename = header.Filename
+		size = header.Size
+		_ = file.Close() //nolint:errcheck // test server best-effort cleanup
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"description": description,
+		"filename":    filename,
+		"size":        size,
+	})
+}
+
 // ── Edge case endpoints ─────────────────────────────────────
 
 // handleLargeResponse returns a large JSON array (~100KB) to test body truncation.
@@ -627,7 +685,32 @@ func handleIndex(w http.ResponseWriter, _ *http.Request) {
   <li>DELETE /api/users/{id} - Delete user</li>
   <li>PUT /api/users/{id}/email-address - Update email</li>
   <li>POST /api/orders - Create order</li>
+  <li>POST /api/login - URL-encoded form login</li>
+  <li>POST /api/upload - Multipart file upload</li>
 </ul>
+<script>
+  // Fire urlencoded POST to /api/login on page load (for form data E2E testing)
+  (function() {
+    const params = new URLSearchParams();
+    params.append('username', 'alice');
+    params.append('password', 'secret123');
+    params.append('remember_me', 'true');
+    fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString()
+    }).catch(function() {});
+
+    // Fire multipart POST to /api/upload on page load
+    const fd = new FormData();
+    fd.append('description', 'test upload from crawler');
+    fd.append('file', new Blob(['sample file content'], { type: 'text/plain' }), 'sample.txt');
+    fetch('/api/upload', {
+      method: 'POST',
+      body: fd
+    }).catch(function() {});
+  })();
+</script>
 </body>
 </html>`
 	fmt.Fprint(w, indexHTML) //nolint:errcheck // test server best-effort response
@@ -707,6 +790,8 @@ func main() {
 	mux.HandleFunc("/api/products/", handleProductByID)
 	mux.HandleFunc("/api/orders", handleOrders)
 	mux.HandleFunc("/api/orders/", handleOrderByID)
+	mux.HandleFunc("/api/login", handleLogin)
+	mux.HandleFunc("/api/upload", handleUpload)
 
 	// Edge case: response types
 	mux.HandleFunc("/api/large", handleLargeResponse)

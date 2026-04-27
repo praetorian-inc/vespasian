@@ -1,6 +1,6 @@
 components:
     schemas:
-        Email-addressResponse:
+        EmailAddressResponse:
             properties:
                 email:
                     type: string
@@ -174,7 +174,7 @@ paths:
                     content:
                         application/json:
                             schema:
-                                $ref: '#/components/schemas/Email-addressResponse'
+                                $ref: '#/components/schemas/EmailAddressResponse'
                     description: OK
             summary: Get /api/users/{userId}/email-address
 servers:

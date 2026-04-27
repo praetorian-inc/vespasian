@@ -15,6 +15,10 @@
 package classify
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"mime"
 	"net/url"
 	"strings"
 
@@ -83,7 +87,7 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 // In practice this is bounded by the upstream crawl layer's MaxPages setting
 // (default 100). The import path (ReadCapture) does not enforce size limits,
 // so callers importing from untrusted capture files should validate input size.
-func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
+func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest { //nolint:gocyclo // boundary normalization for multipart adds necessary branches
 	type entry struct {
 		req ClassifiedRequest
 	}
@@ -112,6 +116,42 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
 		// operations on the same URL path are preserved.
 		if sa := getSoapAction(req.Headers); sa != "" {
 			key += ":" + sa
+		}
+
+		// If this observation has a body, include the base content type and a
+		// short hash of the body bytes in the key so that:
+		//   - Distinct body shapes on the same path+method survive as separate
+		//     entries (required for downstream form/JSON field-merge logic in
+		//     buildOperation in pkg/generate/rest/openapi.go, which unions fields
+		//     across observations).
+		//   - Identical bodies still collapse correctly (true duplicates).
+		//   - Empty-body requests (GET, DELETE, HEAD, OPTIONS) are unaffected.
+		if len(req.Body) > 0 {
+			if ct := getContentType(req.Headers); ct != "" {
+				key += ":" + baseMediaType(ct)
+			}
+			// Append a short fingerprint of the body so distinct payload shapes
+			// on the same endpoint+method+CT survive deduplication. This is
+			// required for downstream form/JSON merge logic in buildOperation
+			// to see all observations and union their fields. 8 bytes (64 bits)
+			// is a deliberate balance: birthday-collision probability is ~7e-13
+			// at 500 distinct bodies per endpoint, well under realistic crawl
+			// scale (capped at MaxPages, default 100). A collision would
+			// silently merge two distinct bodies into one dedup bucket; this
+			// is no worse than pre-fix behavior and worth the simpler key.
+			fingerprintBody := req.Body
+			if ct := getContentType(req.Headers); ct != "" {
+				if mt, params, err := mime.ParseMediaType(ct); err == nil && mt == "multipart/form-data" {
+					if boundary := params["boundary"]; boundary != "" {
+						// Multipart bodies contain a random boundary token (per-request) that
+						// would otherwise make every observation unique. Normalize it to a
+						// sentinel so identical logical forms with different boundaries dedup.
+						fingerprintBody = bytes.ReplaceAll(req.Body, []byte(boundary), []byte("BOUNDARY"))
+					}
+				}
+			}
+			h := sha256.Sum256(fingerprintBody)
+			key += ":" + hex.EncodeToString(h[:8])
 		}
 
 		existing, found := seen[key]
@@ -155,4 +195,26 @@ func getSoapAction(headers map[string]string) string {
 		}
 	}
 	return ""
+}
+
+// getContentType returns the Content-Type header value, case-insensitively.
+func getContentType(headers map[string]string) string {
+	for k, v := range headers {
+		if strings.EqualFold(k, "content-type") {
+			return v
+		}
+	}
+	return ""
+}
+
+// baseMediaType returns the lowercased media type from a Content-Type value,
+// stripped of any parameters (e.g. "; boundary=..."). Returns "" on empty input.
+func baseMediaType(ct string) string {
+	if ct == "" {
+		return ""
+	}
+	if i := strings.Index(ct, ";"); i >= 0 {
+		ct = ct[:i]
+	}
+	return strings.ToLower(strings.TrimSpace(ct))
 }
