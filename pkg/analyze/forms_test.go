@@ -15,6 +15,7 @@
 package analyze
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 
@@ -459,7 +460,7 @@ func TestParseForms_FormAttrCrossAssociationIgnored(t *testing.T) {
 // --- resolveAction tests ---
 
 func TestResolveAction_Empty(t *testing.T) {
-	got, ok := resolveAction("https://h/p", "")
+	got, _, ok := resolveAction("https://h/p", "")
 	if !ok {
 		t.Fatalf("ok = false, want true")
 	}
@@ -469,7 +470,7 @@ func TestResolveAction_Empty(t *testing.T) {
 }
 
 func TestResolveAction_RelativePath(t *testing.T) {
-	got, ok := resolveAction("https://h/a/b", "c")
+	got, _, ok := resolveAction("https://h/a/b", "c")
 	if !ok {
 		t.Fatalf("ok = false, want true")
 	}
@@ -479,7 +480,7 @@ func TestResolveAction_RelativePath(t *testing.T) {
 }
 
 func TestResolveAction_AbsolutePath(t *testing.T) {
-	got, ok := resolveAction("https://h/a/b", "/x")
+	got, _, ok := resolveAction("https://h/a/b", "/x")
 	if !ok {
 		t.Fatalf("ok = false, want true")
 	}
@@ -489,14 +490,14 @@ func TestResolveAction_AbsolutePath(t *testing.T) {
 }
 
 func TestResolveAction_OffHostAbsoluteURLRejected(t *testing.T) {
-	_, ok := resolveAction("https://h/", "https://other/y")
+	_, _, ok := resolveAction("https://h/", "https://other/y")
 	if ok {
 		t.Errorf("expected ok=false for off-host absolute URL, got true")
 	}
 }
 
 func TestResolveAction_SameHostAbsoluteURLAllowed(t *testing.T) {
-	got, ok := resolveAction("https://h/", "https://h/other")
+	got, _, ok := resolveAction("https://h/", "https://h/other")
 	if !ok {
 		t.Fatalf("ok = false, want true")
 	}
@@ -506,21 +507,21 @@ func TestResolveAction_SameHostAbsoluteURLAllowed(t *testing.T) {
 }
 
 func TestResolveAction_ProtocolRelativeCrossHostRejected(t *testing.T) {
-	_, ok := resolveAction("https://h/", "//other/y")
+	_, _, ok := resolveAction("https://h/", "//other/y")
 	if ok {
 		t.Errorf("expected ok=false for protocol-relative cross-host URL, got true")
 	}
 }
 
 func TestResolveAction_DifferentPortRejected(t *testing.T) {
-	_, ok := resolveAction("https://h:443/", "https://h:8080/")
+	_, _, ok := resolveAction("https://h:443/", "https://h:8080/")
 	if ok {
 		t.Errorf("expected ok=false for different port, got true")
 	}
 }
 
 func TestResolveAction_HostnameComparisonCaseInsensitive(t *testing.T) {
-	got, ok := resolveAction("https://Host/", "https://host/x")
+	got, _, ok := resolveAction("https://Host/", "https://host/x")
 	if !ok {
 		t.Fatalf("ok = false, want true")
 	}
@@ -539,14 +540,14 @@ func TestExtractForms_OffHostActionSkipped(t *testing.T) {
 }
 
 func TestResolveAction_JavascriptScheme(t *testing.T) {
-	_, ok := resolveAction("https://h/", "javascript:void(0)")
+	_, _, ok := resolveAction("https://h/", "javascript:void(0)")
 	if ok {
 		t.Errorf("expected ok=false for javascript: scheme")
 	}
 }
 
 func TestResolveAction_FragmentStripped(t *testing.T) {
-	got, ok := resolveAction("https://h/", "/x#frag")
+	got, _, ok := resolveAction("https://h/", "/x#frag")
 	if !ok {
 		t.Fatalf("ok = false, want true")
 	}
@@ -765,7 +766,7 @@ func TestExtractForms_SelectValueInPOSTBody(t *testing.T) {
 // SEC-BE-004: resolveAction must strip userinfo from the resolved URL.
 func TestResolveAction_UserinfoStripped(t *testing.T) {
 	// Non-empty ref: userinfo in ref URL must be stripped.
-	got, ok := resolveAction("https://h/", "https://admin:hunter2@h/x")
+	got, _, ok := resolveAction("https://h/", "https://admin:hunter2@h/x")
 	if !ok {
 		t.Fatalf("ok = false, want true")
 	}
@@ -838,6 +839,32 @@ func TestParseForms_CapsEnforced(t *testing.T) {
 			t.Errorf("Value length = %d, want <= %d", len(forms[0].Fields[0].Value), maxAttrValueBytes)
 		}
 	})
+
+	t.Run("maxFieldValueBytes_textarea", func(t *testing.T) {
+		longText := strings.Repeat("a", 10000)
+		body := []byte(`<form><textarea name="bio">` + longText + `</textarea></form>`)
+		forms := parseForms(body)
+		if len(forms) != 1 || len(forms[0].Fields) != 1 {
+			t.Fatalf("unexpected parse result: %d forms", len(forms))
+		}
+		if len(forms[0].Fields[0].Value) > maxFieldValueBytes {
+			t.Errorf("textarea Value length = %d, want <= %d", len(forms[0].Fields[0].Value), maxFieldValueBytes)
+		}
+	})
+
+	t.Run("maxFieldValueBytes_optionText", func(t *testing.T) {
+		// Option without value attribute uses option text as the value;
+		// oversized option text must also be capped.
+		longText := strings.Repeat("b", 10000)
+		body := []byte(`<form><select name="x"><option selected>` + longText + `</option></select></form>`)
+		forms := parseForms(body)
+		if len(forms) != 1 || len(forms[0].Fields) != 1 {
+			t.Fatalf("unexpected parse result: %d forms", len(forms))
+		}
+		if len(forms[0].Fields[0].Value) > maxFieldValueBytes {
+			t.Errorf("select Value (from option text) length = %d, want <= %d", len(forms[0].Fields[0].Value), maxFieldValueBytes)
+		}
+	})
 }
 
 // QUAL-002: A JSON response body containing a <form> string must NOT be sniffed
@@ -855,7 +882,7 @@ func TestIsHTMLResponse_JSONWithFormStringNotSniffedAsHTML(t *testing.T) {
 // SEC-BE-003: Scheme change on same host must be rejected (http to https is a
 // different origin and must not produce a synthetic request).
 func TestResolveAction_SchemeChangeSameHostRejected(t *testing.T) {
-	_, ok := resolveAction("http://h/", "https://h/x")
+	_, _, ok := resolveAction("http://h/", "https://h/x")
 	if ok {
 		t.Errorf("expected ok=false for scheme change on same host, got true")
 	}
@@ -894,7 +921,7 @@ func TestParseForms_RequiredFlag(t *testing.T) {
 
 // TEST-003a: protocol-relative URL on same host must resolve to the base scheme.
 func TestResolveAction_ProtocolRelativeSameHost(t *testing.T) {
-	got, ok := resolveAction("https://h/a", "//h/b")
+	got, _, ok := resolveAction("https://h/a", "//h/b")
 	if !ok {
 		t.Fatalf("ok = false, want true")
 	}
@@ -905,8 +932,117 @@ func TestResolveAction_ProtocolRelativeSameHost(t *testing.T) {
 
 // TEST-003b: ftp:// scheme in the ref must be rejected.
 func TestResolveAction_FTPSchemeRejected(t *testing.T) {
-	_, ok := resolveAction("https://h/a", "ftp://h/b")
+	_, _, ok := resolveAction("https://h/a", "ftp://h/b")
 	if ok {
 		t.Errorf("expected ok=false for ftp:// scheme, got true")
+	}
+}
+
+// TEST-001: PageURL on synthesized requests must have userinfo stripped.
+// Parent requests imported from Burp/HAR captures may contain credentials
+// (https://user:pass@host/path); those must not leak into capture.json.
+func TestExtractForms_PageURLUserinfoStripped(t *testing.T) {
+	req := crawl.ObservedRequest{ //nolint:gosec // G101: intentional test fixture for userinfo stripping
+		URL: "https://admin:secret@host/page",
+		Response: crawl.ObservedResponse{
+			ContentType: "text/html",
+			Body:        []byte(`<form action="/x"><input name="q"></form>`),
+		},
+	}
+	got := ExtractForms([]crawl.ObservedRequest{req})
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(got))
+	}
+	if strings.Contains(got[0].PageURL, "admin") || strings.Contains(got[0].PageURL, "secret") {
+		t.Errorf("userinfo not stripped from PageURL; got %q", got[0].PageURL)
+	}
+	// Sanity: URL field must also still be sanitized.
+	if strings.Contains(got[0].URL, "admin") || strings.Contains(got[0].URL, "secret") {
+		t.Errorf("userinfo present in URL; got %q", got[0].URL)
+	}
+}
+
+// TEST-002: the outer range-loop over requests must invoke form parsing once
+// per HTML request. Pins regressions that break after the first iteration.
+func TestExtractForms_MultipleHTMLRequestsEachProduceForms(t *testing.T) {
+	reqs := []crawl.ObservedRequest{
+		htmlReq("https://host/login", `<form action="/login" method="post"><input name="username"></form>`),
+		htmlReq("https://host/register", `<form action="/register" method="post"><input name="email"></form>`),
+	}
+	got := ExtractForms(reqs)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(got))
+	}
+	// Each synthetic request carries its parent's PageURL.
+	if got[0].PageURL != "https://host/login" {
+		t.Errorf("got[0].PageURL = %q, want https://host/login", got[0].PageURL)
+	}
+	if got[1].PageURL != "https://host/register" {
+		t.Errorf("got[1].PageURL = %q, want https://host/register", got[1].PageURL)
+	}
+	// Action URLs differ.
+	if got[0].URL == got[1].URL {
+		t.Errorf("URLs are equal, want distinct; both = %q", got[0].URL)
+	}
+	if got[0].URL != "https://host/login" {
+		t.Errorf("got[0].URL = %q, want https://host/login", got[0].URL)
+	}
+	if got[1].URL != "https://host/register" {
+		t.Errorf("got[1].URL = %q, want https://host/register", got[1].URL)
+	}
+}
+
+// TEST-003: ExtractForms must tolerate nil and empty input without panic.
+func TestExtractForms_EmptyInputReturnsEmpty(t *testing.T) {
+	if got := ExtractForms(nil); len(got) != 0 {
+		t.Errorf("ExtractForms(nil) len = %d, want 0", len(got))
+	}
+	if got := ExtractForms([]crawl.ObservedRequest{}); len(got) != 0 {
+		t.Errorf("ExtractForms([]) len = %d, want 0", len(got))
+	}
+}
+
+// TEST-004: duplicate field names (e.g. array-style "tags[]", multi-select
+// checkboxes, repeated hidden fields) must be preserved, not collapsed. The
+// comment on fieldsToValues explicitly promises url.Values.Add (not Set).
+func TestExtractForms_DuplicateNamePreservedPOST(t *testing.T) {
+	body := `<form method="post" action="/x"><input name="tags[]" value="a"><input name="tags[]" value="b"></form>`
+	reqs := []crawl.ObservedRequest{htmlReq("https://host/", body)}
+	got := ExtractForms(reqs)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(got))
+	}
+	values, err := url.ParseQuery(string(got[0].Body))
+	if err != nil {
+		t.Fatalf("ParseQuery: %v", err)
+	}
+	tags := values["tags[]"]
+	if len(tags) != 2 {
+		t.Fatalf("len(tags[]) = %d, want 2; full values = %v", len(tags), values)
+	}
+	set := map[string]bool{tags[0]: true, tags[1]: true}
+	if !set["a"] || !set["b"] {
+		t.Errorf("tags[] = %v, want {a,b}", tags)
+	}
+}
+
+func TestExtractForms_DuplicateNamePreservedGET(t *testing.T) {
+	body := `<form action="/x"><input name="tags[]" value="a"><input name="tags[]" value="b"></form>`
+	reqs := []crawl.ObservedRequest{htmlReq("https://host/", body)}
+	got := ExtractForms(reqs)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(got))
+	}
+	u, err := url.Parse(got[0].URL)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	tags := u.Query()["tags[]"]
+	if len(tags) != 2 {
+		t.Fatalf("len(tags[]) = %d, want 2; raw URL = %q", len(tags), got[0].URL)
+	}
+	set := map[string]bool{tags[0]: true, tags[1]: true}
+	if !set["a"] || !set["b"] {
+		t.Errorf("tags[] = %v, want {a,b}", tags)
 	}
 }

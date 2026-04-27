@@ -56,8 +56,8 @@ The `scan` command combines both stages. The `crawl`/`import` and `generate` com
 The CLI (`cmd/vespasian`) uses Kong for argument parsing. Each command (crawl, import, generate, scan) has a `Run()` method. The scan pipeline:
 
 1. Crawl target URL → `[]crawl.ObservedRequest`
-2. Auto-detect API type (or use explicit `--api-type`)
-3. Augment requests with static HTML form analysis via `analyze.ExtractForms()` (emits synthetic `ObservedRequest` entries with `Source="static:html"` for every `<form>` in HTML response bodies)
+2. Augment requests with static HTML form analysis via `analyze.ExtractForms()` (emits synthetic `ObservedRequest` entries with `Source="static:html"` for every `<form>` in HTML response bodies) — done **before** auto-detection so form-derived REST signals feed the heuristic
+3. Auto-detect API type (or use explicit `--api-type`)
 4. Classify requests via `classify.RunClassifiers()` with confidence threshold
 5. Deduplicate classified endpoints
 6. Probe endpoints via `probe.RunStrategies()` (OPTIONS, schema, WSDL fetch, GraphQL introspection)

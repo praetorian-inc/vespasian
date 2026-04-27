@@ -30,9 +30,10 @@ import (
 const SourceStaticHTML = "static:html"
 
 const (
-	maxFormsPerBody   = 1000
-	maxFieldsPerForm  = 500
-	maxAttrValueBytes = 4096
+	maxFormsPerBody    = 1000
+	maxFieldsPerForm   = 500
+	maxAttrValueBytes  = 4096
+	maxFieldValueBytes = 4096 // cap textarea text content and <option> text
 )
 
 // staticForm is the intermediate representation of a parsed <form>.
@@ -199,12 +200,29 @@ func handlePendingStartTag(tok html.Token, pending *pendingFieldState) {
 }
 
 // handlePendingText accumulates text tokens while inside a textarea or select.
+// Accumulation is capped at maxFieldValueBytes to prevent attacker-controlled
+// HTML (imported captures, stored content on target) from growing synthesized
+// request bodies without bound.
 func handlePendingText(text string, pending *pendingFieldState) {
-	if pending.inTextarea {
-		pending.field.Value += text
-	} else if pending.inSelect && pending.inOption {
-		pending.optionText += text
+	switch {
+	case pending.inTextarea:
+		pending.field.Value = appendCapped(pending.field.Value, text, maxFieldValueBytes)
+	case pending.inSelect && pending.inOption:
+		pending.optionText = appendCapped(pending.optionText, text, maxFieldValueBytes)
 	}
+}
+
+// appendCapped returns prefix+suffix truncated to cap bytes. It avoids
+// materializing the combined string when the prefix is already at or above cap.
+func appendCapped(prefix, suffix string, cap int) string {
+	if len(prefix) >= cap {
+		return prefix
+	}
+	remaining := cap - len(prefix)
+	if len(suffix) > remaining {
+		suffix = suffix[:remaining]
+	}
+	return prefix + suffix
 }
 
 // handlePendingEndTag processes an end tag while pending is active. It updates
@@ -392,7 +410,7 @@ func handleSelectTag(tok html.Token, stack []*staticForm, pending **pendingField
 // QueryParams/Source/PageURL. Returns (_, false) if the action cannot be
 // resolved to an http(s) URL.
 func synthesizeRequest(f staticForm, baseURL string) (crawl.ObservedRequest, bool) {
-	resolved, ok := resolveAction(baseURL, f.Action)
+	resolved, sanitizedBase, ok := resolveAction(baseURL, f.Action)
 	if !ok {
 		return crawl.ObservedRequest{}, false
 	}
@@ -411,7 +429,7 @@ func synthesizeRequest(f staticForm, baseURL string) (crawl.ObservedRequest, boo
 		Method:  method,
 		URL:     resolved,
 		Source:  SourceStaticHTML,
-		PageURL: baseURL,
+		PageURL: sanitizedBase,
 	}
 
 	values := fieldsToValues(f.Fields)
@@ -451,37 +469,42 @@ func synthesizeRequest(f staticForm, baseURL string) (crawl.ObservedRequest, boo
 
 // resolveAction resolves a form action against baseURL. Empty/missing action
 // ("") returns baseURL unchanged (self-submit). Non-http(s) schemes and
-// unparseable URLs return ("", false). Off-host actions (different hostname or
-// port from base) are rejected to keep synthesized requests within the parent
-// request's scope.
-func resolveAction(base, ref string) (string, bool) {
+// unparseable URLs return ("", "", false). Off-host actions (different hostname
+// or port from base) are rejected to keep synthesized requests within the
+// parent request's scope.
+//
+// Returns the resolved action URL and a sanitized copy of the base URL (userinfo
+// stripped, fragment stripped). Both are safe to persist into capture.json.
+func resolveAction(base, ref string) (string, string, bool) {
 	ref = strings.TrimSpace(ref)
 	baseU, err := url.Parse(base)
 	if err != nil || (baseU.Scheme != "http" && baseU.Scheme != "https") {
-		return "", false
+		return "", "", false
 	}
-	// Strip userinfo from base URL to prevent credentials from being persisted.
+	// Strip userinfo and fragment from base URL to prevent credentials from being
+	// persisted into capture.json.
 	baseU.User = nil
+	baseU.Fragment = ""
+	sanitizedBase := baseU.String()
 	if ref == "" {
-		baseU.Fragment = ""
-		return baseU.String(), true
+		return sanitizedBase, sanitizedBase, true
 	}
 	if isUnsupportedSchemeRef(ref) {
-		return "", false
+		return "", "", false
 	}
 	refU, err := url.Parse(ref)
 	if err != nil {
-		return "", false
+		return "", "", false
 	}
 	resolved := baseU.ResolveReference(refU)
 	if !validateResolvedURL(baseU, resolved) {
-		return "", false
+		return "", "", false
 	}
 	// Strip userinfo from the resolved URL to prevent credentials from being
 	// persisted into capture.json or sent in synthetic requests.
 	resolved.User = nil
 	resolved.Fragment = ""
-	return resolved.String(), true
+	return resolved.String(), sanitizedBase, true
 }
 
 // isUnsupportedSchemeRef reports whether ref begins with a scheme that cannot

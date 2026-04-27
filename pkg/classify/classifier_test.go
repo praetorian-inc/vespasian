@@ -467,3 +467,53 @@ func TestDeduplicate_MergesDynamicAndStaticHTMLObservations(t *testing.T) {
 	assert.Equal(t, obsA.Body, result[0].Body, "first-seen (browser) body must be preserved, not the static form body")
 	assert.Equal(t, obsA.Response.StatusCode, result[0].Response.StatusCode, "first-seen response status must be preserved")
 }
+
+// TEST-007: the more realistic ordering — browser capture with higher
+// confidence than the synthetic static:html observation — must still merge
+// QueryParams from both, and must keep the browser body (first-seen) and the
+// browser confidence (highest). Confidence-max and first-seen-body are
+// independent invariants; this pins them separately from the companion test.
+func TestDeduplicate_StaticFormLowerConfidenceStillMergesQueryParams(t *testing.T) {
+	obsA := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method:      "POST",
+			URL:         "https://app.example.com/login",
+			Source:      "browser",
+			QueryParams: map[string]string{"redirect": "/home"},
+			Body:        []byte(`redirect=%2Fhome`),
+			Response: crawl.ObservedResponse{
+				StatusCode: 302,
+			},
+		},
+		IsAPI:      true,
+		Confidence: 0.9,
+		APIType:    "rest",
+	}
+	obsB := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method:      "POST",
+			URL:         "https://app.example.com/login?csrf=abc",
+			Source:      "static:html",
+			QueryParams: map[string]string{"csrf": "abc"},
+			Body:        []byte("username=&password="),
+		},
+		IsAPI:      true,
+		Confidence: 0.4,
+		APIType:    "rest",
+	}
+
+	result := Deduplicate([]ClassifiedRequest{obsA, obsB})
+
+	require.Len(t, result, 1)
+
+	// Highest confidence wins — browser (0.9) > static:html (0.4).
+	assert.InDelta(t, 0.9, result[0].Confidence, 0.001, "highest confidence must be kept")
+
+	// QueryParams from both observations must be merged.
+	assert.Equal(t, "/home", result[0].QueryParams["redirect"], "redirect param from browser observation must be preserved")
+	assert.Equal(t, "abc", result[0].QueryParams["csrf"], "csrf param from static:html observation must be merged in")
+
+	// First-seen body/response wins (obsA came first) — independent of confidence order.
+	assert.Equal(t, obsA.Body, result[0].Body, "first-seen (browser) body must be preserved")
+	assert.Equal(t, obsA.Response.StatusCode, result[0].Response.StatusCode, "first-seen response status must be preserved")
+}

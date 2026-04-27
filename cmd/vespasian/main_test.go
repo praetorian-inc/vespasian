@@ -30,6 +30,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/praetorian-inc/vespasian/pkg/analyze"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
@@ -2102,7 +2103,10 @@ func TestGenerateSpec_ExtractsFormParametersIntoOpenAPI(t *testing.T) {
 		},
 	}
 
-	spec, err := generateSpec(context.Background(), []crawl.ObservedRequest{req}, generateSpecOptions{
+	requests := []crawl.ObservedRequest{req}
+	requests = append(requests, analyze.ExtractForms(requests)...)
+
+	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
 		APIType:     "rest",
 		Confidence:  0.5,
 		Probe:       false,
@@ -2195,6 +2199,8 @@ func TestGenerateSpec_ExtractsGETFormParametersIntoOpenAPI(t *testing.T) {
 		},
 	}
 
+	requests = append(requests, analyze.ExtractForms(requests)...)
+
 	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
 		APIType:     "rest",
 		Confidence:  0.0, // See function comment: synthetic GET form requests score 0 confidence.
@@ -2269,5 +2275,59 @@ func TestGenerateSpec_ExtractsGETFormParametersIntoOpenAPI(t *testing.T) {
 	}
 	if !foundQ {
 		t.Errorf("'/search' get parameters do not contain a parameter with name 'q'; parameters = %v", parameters)
+	}
+}
+
+// QUAL-001 regression guard: pins that ExtractForms must run BEFORE detectAPIType.
+// A static-only HTML landing page whose only API signal is a <form action="/api/…"
+// method="POST"> has no REST signals raw, but classifies as REST after ExtractForms
+// synthesizes the POST observation. A regression that reverts the ScanCmd.Run
+// reorder would silently fall through here.
+func TestDetectAPIType_StaticHTMLPostFormDrivesREST(t *testing.T) {
+	// A SOAP request anchors the raw set to WSDL so that rawType != apiTypeREST.
+	// Without this, detectAPIType falls back to REST even with zero signals,
+	// making it impossible to observe the change ExtractForms causes.
+	soapAnchor := crawl.ObservedRequest{
+		Method: "POST",
+		URL:    "https://example.com/service",
+		Headers: map[string]string{
+			"SOAPAction": "http://example.com/GetUser",
+		},
+	}
+
+	// Landing page: static HTML with two POST forms targeting /api/* paths.
+	// Two forms ensure that after ExtractForms the synthesized restCount (2)
+	// exceeds wsdlCount (1), so detectAPIType flips from WSDL to REST.
+	landingPage := crawl.ObservedRequest{
+		Method: "GET",
+		URL:    "https://example.com/",
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "text/html",
+			Body: []byte(`<!doctype html><html><body>` +
+				`<form action="/api/login" method="POST">` +
+				`<input name="username">` +
+				`<input name="password">` +
+				`</form>` +
+				`<form action="/api/register" method="POST">` +
+				`<input name="email">` +
+				`<input name="password">` +
+				`</form>` +
+				`</body></html>`),
+		},
+	}
+
+	raw := []crawl.ObservedRequest{soapAnchor, landingPage}
+	rawType := detectAPIType(raw, 0.5)
+
+	augmented := append([]crawl.ObservedRequest{}, raw...)
+	augmented = append(augmented, analyze.ExtractForms(raw)...)
+	augType := detectAPIType(augmented, 0.5)
+
+	if augType != apiTypeREST {
+		t.Errorf("detectAPIType(augmented) = %q, want %q", augType, apiTypeREST)
+	}
+	if rawType == augType {
+		t.Errorf("ExtractForms must change classification: raw=%q augmented=%q (both same — pipeline reorder isn't load-bearing)", rawType, augType)
 	}
 }
