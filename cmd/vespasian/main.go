@@ -32,6 +32,7 @@ import (
 
 	"github.com/alecthomas/kong"
 
+	"github.com/praetorian-inc/vespasian/pkg/analyze"
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/generate"
@@ -596,6 +597,14 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
+	// Augment captured traffic with forms parsed from HTML response bodies
+	// BEFORE auto-detection so static:html observations feed the heuristic —
+	// a site whose only REST signal is a <form action="/api/…"> in an
+	// otherwise-static landing page would otherwise be misclassified.
+	// GenerateCmd skips detection, so it does not need this pre-step; the
+	// call has been removed from generateSpec to avoid double-augmentation.
+	requests = append(requests, analyze.ExtractForms(requests)...)
+
 	apiType := c.APIType
 	if apiType == apiTypeAuto {
 		apiType = detectAPIType(requests, c.Confidence)
@@ -691,7 +700,10 @@ type generateSpecOptions struct {
 	Verbose      bool
 }
 
-// generateSpec runs the classify → probe → generate pipeline.
+// generateSpec runs the classify → probe → generate pipeline. It trusts its
+// caller to have already augmented requests with static-HTML form observations
+// (ScanCmd.Run does this before auto-detection; GenerateCmd works from an
+// existing capture that already contains any static:html entries).
 func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts generateSpecOptions) ([]byte, error) {
 	classifiers := classifiersForType(opts.APIType)
 	if classifiers == nil {
