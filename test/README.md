@@ -195,7 +195,7 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 ## Expected Results
 
-All 20 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest).
+All 21 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest).
 
 ```
   TARGET                      STATUS    ENDPOINTS   EXPECTED   DURATION
@@ -216,12 +216,13 @@ All 20 tests should pass. Order is non-deterministic and durations vary by machi
   import-har                  PASS      3           3          1s
   import-malformed            PASS      0           0          1s
   import-mitmproxy            PASS      3           3          0s
+  import-mitmproxy-native     PASS      3           3          1s
   import-unicode              PASS      3           3          0s
   rest-api                    PASS      8           8          79s
   soap-service                PASS      3           3          51s
   spec-edge                   PASS      -           -          0s
 
-  Total: 20 passed, 0 failed, 0 skipped
+  Total: 21 passed, 0 failed, 0 skipped
 ```
 
 Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are informational and do not cause failures.
