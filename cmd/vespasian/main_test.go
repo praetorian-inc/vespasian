@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/sdk"
 )
 
 func TestValidateURL(t *testing.T) {
@@ -352,7 +353,7 @@ func TestClassifiersForType(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			classifiers := classifiersForType(tt.apiType)
+			classifiers := sdk.ClassifiersForType(tt.apiType)
 			if len(classifiers) != tt.wantLen {
 				t.Errorf("classifiersForType(%q) got %d classifiers, want %d", tt.apiType, len(classifiers), tt.wantLen)
 			}
@@ -1537,9 +1538,9 @@ func TestDetectAPIType(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := detectAPIType(tt.requests, tt.threshold)
+			got := sdk.DetectAPIType(tt.requests, tt.threshold)
 			if got != tt.want {
-				t.Errorf("detectAPIType() = %q, want %q", got, tt.want)
+				t.Errorf("sdk.DetectAPIType() = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -1601,9 +1602,9 @@ func TestScanPipeline_WSDLDetection(t *testing.T) {
 	}
 
 	// Step 1: Detect API type (this is the new logic)
-	apiType := detectAPIType(soapRequests, 0.5)
+	apiType := sdk.DetectAPIType(soapRequests, 0.5)
 	if apiType != apiTypeWSDL {
-		t.Fatalf("detectAPIType() = %q for SOAP traffic, want %q", apiType, apiTypeWSDL)
+		t.Fatalf("sdk.DetectAPIType() = %q for SOAP traffic, want %q", apiType, apiTypeWSDL)
 	}
 
 	// Step 2: Generate spec with detected type
@@ -1648,7 +1649,7 @@ func TestDetectAPIType_ExplicitOverride(t *testing.T) {
 	}
 
 	// With auto, should detect WSDL
-	autoType := detectAPIType(soapRequests, 0.5)
+	autoType := sdk.DetectAPIType(soapRequests, 0.5)
 	if autoType != apiTypeWSDL {
 		t.Fatalf("auto detection = %q, want %q", autoType, apiTypeWSDL)
 	}
@@ -1786,9 +1787,9 @@ func TestScanPipeline_RealisticCrawlTraffic(t *testing.T) {
 	}
 
 	// Step 1: Auto-detect should identify WSDL
-	apiType := detectAPIType(crawlTraffic, 0.5)
+	apiType := sdk.DetectAPIType(crawlTraffic, 0.5)
 	if apiType != apiTypeWSDL {
-		t.Fatalf("detectAPIType() = %q, want %q", apiType, apiTypeWSDL)
+		t.Fatalf("sdk.DetectAPIType() = %q, want %q", apiType, apiTypeWSDL)
 	}
 
 	// Step 2: Generate should produce WSDL output
@@ -1956,7 +1957,7 @@ func TestScanPipeline_WSDLDiscoveryProbe(t *testing.T) {
 	}
 
 	// Passive detection sees no WSDL — but active probe finds it
-	passiveType := detectAPIType(crawlTraffic, 0.5)
+	passiveType := sdk.DetectAPIType(crawlTraffic, 0.5)
 	if passiveType != apiTypeREST {
 		t.Fatalf("passive detection should return REST for HTML, got %q", passiveType)
 	}

@@ -21,7 +21,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -148,7 +150,7 @@ func TestDetectAPIType_RESTDefault(t *testing.T) {
 // via tie-break. This case actually falls through to REST — corrected below.
 //
 // A true tie that GraphQL wins: only graphql requests with no pure-REST mix.
-func TestDetectAPIType_GraphQLWinsOverWSDLTie(t *testing.T) {
+func TestDetectAPIType_NeitherGraphQLNorWSDLTiesREST(t *testing.T) {
 	// Multiple graphql requests so graphqlCount > 0 and graphqlCount >= wsdlCount.
 	// wsdlCount stays 0, restCount equals graphqlCount (POST fires REST).
 	// Condition: graphqlCount(2) >= wsdlCount(0) && graphqlCount(2) >= restCount(2) → true.
@@ -379,14 +381,35 @@ func TestResolveParams_EmptyAPIType(t *testing.T) {
 // resolveParams bound-check tests
 // ---------------------------------------------------------------------------
 
-// TestResolveParams_NegativeDepth documents that negative depth values pass
-// through unvalidated. If future validation is added, update this test.
+// TestResolveParams_NegativeDepth documents that resolveParams itself does not
+// validate: negative depth passes through unmodified. The validate() call in
+// Invoke is responsible for rejecting it.
 func TestResolveParams_NegativeDepth(t *testing.T) {
 	ctx := capability.ExecutionContext{
 		Parameters: capability.Parameters{{Name: "depth", Value: "-1"}},
 	}
 	p := resolveParams(ctx)
 	assert.Equal(t, -1, p.depth)
+}
+
+// TestInvoke_NegativeDepthIsRejected verifies that Invoke rejects depth < 1
+// before creating any context or performing any crawl work.
+func TestInvoke_NegativeDepthIsRejected(t *testing.T) {
+	cap := &Capability{
+		crawlFn: func(_ context.Context, _ string, _ invokeParams) ([]crawl.ObservedRequest, error) {
+			t.Fatal("crawlFn must not be called when params are invalid")
+			return nil, nil
+		},
+	}
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{
+			{Name: "depth", Value: "-1"},
+			{Name: "headless", Value: "false"},
+		},
+	}
+	err := cap.Invoke(ctx, capmodel.WebApplication{PrimaryURL: "http://example.com"}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid depth")
 }
 
 func TestResolveParams_ZeroMaxPages(t *testing.T) {
@@ -397,6 +420,25 @@ func TestResolveParams_ZeroMaxPages(t *testing.T) {
 	assert.Equal(t, 0, p.maxPages)
 }
 
+// TestInvoke_ZeroMaxPagesIsRejected verifies that Invoke rejects max_pages < 1.
+func TestInvoke_ZeroMaxPagesIsRejected(t *testing.T) {
+	cap := &Capability{
+		crawlFn: func(_ context.Context, _ string, _ invokeParams) ([]crawl.ObservedRequest, error) {
+			t.Fatal("crawlFn must not be called when params are invalid")
+			return nil, nil
+		},
+	}
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{
+			{Name: "max_pages", Value: "0"},
+			{Name: "headless", Value: "false"},
+		},
+	}
+	err := cap.Invoke(ctx, capmodel.WebApplication{PrimaryURL: "http://example.com"}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid max_pages")
+}
+
 func TestResolveParams_NegativeTimeout(t *testing.T) {
 	ctx := capability.ExecutionContext{
 		Parameters: capability.Parameters{{Name: "timeout", Value: "-1"}},
@@ -405,12 +447,51 @@ func TestResolveParams_NegativeTimeout(t *testing.T) {
 	assert.Equal(t, -1, p.timeoutSecs)
 }
 
+// TestInvoke_NegativeTimeoutIsRejected verifies that Invoke rejects timeout < 1.
+func TestInvoke_NegativeTimeoutIsRejected(t *testing.T) {
+	cap := &Capability{
+		crawlFn: func(_ context.Context, _ string, _ invokeParams) ([]crawl.ObservedRequest, error) {
+			t.Fatal("crawlFn must not be called when params are invalid")
+			return nil, nil
+		},
+	}
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{
+			{Name: "timeout", Value: "-1"},
+			{Name: "headless", Value: "false"},
+		},
+	}
+	err := cap.Invoke(ctx, capmodel.WebApplication{PrimaryURL: "http://example.com"}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid timeout")
+}
+
 func TestResolveParams_OutOfRangeConfidence(t *testing.T) {
 	ctx := capability.ExecutionContext{
 		Parameters: capability.Parameters{{Name: "confidence", Value: "2.0"}},
 	}
 	p := resolveParams(ctx)
 	assert.InDelta(t, 2.0, p.confidence, 0.001)
+}
+
+// TestInvoke_OutOfRangeConfidenceIsRejected verifies that Invoke rejects
+// confidence > 1.0.
+func TestInvoke_OutOfRangeConfidenceIsRejected(t *testing.T) {
+	cap := &Capability{
+		crawlFn: func(_ context.Context, _ string, _ invokeParams) ([]crawl.ObservedRequest, error) {
+			t.Fatal("crawlFn must not be called when params are invalid")
+			return nil, nil
+		},
+	}
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{
+			{Name: "confidence", Value: "2.0"},
+			{Name: "headless", Value: "false"},
+		},
+	}
+	err := cap.Invoke(ctx, capmodel.WebApplication{PrimaryURL: "http://example.com"}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid confidence")
 }
 
 // ---------------------------------------------------------------------------
@@ -457,8 +538,10 @@ func TestClassifyProbeGenerate_EmptyRequests(t *testing.T) {
 	ctx := context.Background()
 	spec, err := ClassifyProbeGenerate(ctx, nil, "rest", 0.5, true, false)
 	require.NoError(t, err)
-	// REST generator should return a minimal spec even for empty input.
-	_ = spec
+	// The REST generator returns nil for an empty classified list — this is the
+	// documented behavior of OpenAPIGenerator.Generate when no endpoints are
+	// present. The pipeline must not error; nil spec is the expected outcome.
+	assert.Nil(t, spec)
 }
 
 func TestClassifyProbeGenerate_UnsupportedAPIType(t *testing.T) {
@@ -549,9 +632,10 @@ func TestClassifyProbeGenerate_GeneratesRESTSpec(t *testing.T) {
 
 // TestClassifyProbeGenerate_ProbeEnabledOnREST exercises the probeEnabled=true
 // branch (ClassifyProbeGenerate lines 305-312). A pre-canceled context ensures
-// probes fail fast without network calls. RunStrategies preserves the original
-// classified endpoints even when strategies error, so the pipeline still
-// produces a spec when classified results are non-empty.
+// probes fail fast without network calls. probe.RunStrategies preserves the
+// original classified endpoints even when strategies error, so the pipeline
+// always produces a non-empty spec when classified results are non-empty —
+// the canceled context does not cause an early return here.
 func TestClassifyProbeGenerate_ProbeEnabledOnREST(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately — probes fail fast, no network calls
@@ -568,14 +652,11 @@ func TestClassifyProbeGenerate_ProbeEnabledOnREST(t *testing.T) {
 		},
 	}
 	// probeEnabled=true exercises the probe branch; canceled context keeps the
-	// test hermetic. The function either produces a spec or returns an error —
-	// both outcomes are valid; the goal is branch coverage.
+	// test hermetic. RunStrategies returns classified endpoints even on error, so
+	// ClassifyProbeGenerate must succeed and produce a non-empty spec.
 	spec, err := ClassifyProbeGenerate(ctx, requests, "rest", 0.5, true, true)
-	if err != nil {
-		assert.Contains(t, err.Error(), "probes failed")
-	} else {
-		assert.NotEmpty(t, spec)
-	}
+	require.NoError(t, err)
+	assert.NotEmpty(t, spec)
 }
 
 // TestClassifyProbeGenerate_AllProbesFailed exercises the early-return branch
@@ -649,6 +730,50 @@ func TestProbeWSDLDocument_CanceledContext(t *testing.T) {
 	cancel() // pre-canceled
 
 	result := probeWSDLDocument(ctx, "http://127.0.0.1/service")
+	assert.Nil(t, result)
+}
+
+// TestProbeWSDLDocument_Success exercises the full happy-path through
+// probeWSDLDocument using an httptest.Server on loopback. Both SSRF seams
+// are replaced for the duration of the test so the loopback dial succeeds.
+func TestProbeWSDLDocument_Success(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/xml")
+		_, _ = w.Write([]byte(validWSDL))
+	}))
+	t.Cleanup(srv.Close)
+
+	orig := validateProbeURLFunc
+	validateProbeURLFunc = func(_ string) error { return nil }
+	t.Cleanup(func() { validateProbeURLFunc = orig })
+
+	origDial := dialContextForWSDLProbe
+	dialContextForWSDLProbe = (&net.Dialer{}).DialContext
+	t.Cleanup(func() { dialContextForWSDLProbe = origDial })
+
+	result := probeWSDLDocument(context.Background(), srv.URL+"/service")
+	require.Equal(t, []byte(validWSDL), result)
+}
+
+// TestProbeWSDLDocument_3xxRejected verifies that a 302 redirect response is
+// rejected. probeWSDLDocument sets CheckRedirect: ErrUseLastResponse so the
+// redirect is not followed; isRejectedWSDLStatus(302) then returns true and
+// nil is returned — pinning the combination of both behaviors together.
+func TestProbeWSDLDocument_3xxRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://example.com/elsewhere", http.StatusFound)
+	}))
+	t.Cleanup(srv.Close)
+
+	orig := validateProbeURLFunc
+	validateProbeURLFunc = func(_ string) error { return nil }
+	t.Cleanup(func() { validateProbeURLFunc = orig })
+
+	origDial := dialContextForWSDLProbe
+	dialContextForWSDLProbe = (&net.Dialer{}).DialContext
+	t.Cleanup(func() { dialContextForWSDLProbe = origDial })
+
+	result := probeWSDLDocument(context.Background(), srv.URL+"/service")
 	assert.Nil(t, result)
 }
 
@@ -984,10 +1109,14 @@ func TestInvoke_CrawlErrorPropagates(t *testing.T) {
 
 // TestInvoke_GenPhaseUsesFreshContext is the regression guard for prior-MED-2:
 // Invoke must create two independent context.WithTimeout calls — one for the
-// crawl phase (capability.go:251) and a fresh one for the generate phase
-// (capability.go:273). If a future refactor collapses them back into a single
-// context, genDeadline == crawlDeadline, so genDeadline.After(crawlDeadline)
-// returns false and the assertion fails, catching the regression.
+// crawl phase and a fresh one for the generate phase. If a future refactor
+// collapses them back into a single context, genDeadline == crawlDeadline, so
+// genDeadline.After(crawlDeadline) returns false and the assertion fails,
+// catching the regression.
+//
+// api_type=auto is used so that wsdlProbeFn is invoked (SEC-BE-002 gates the
+// probe to "auto" only), giving us a hook to capture the generate-phase context
+// deadline without any additional plumbing.
 func TestInvoke_GenPhaseUsesFreshContext(t *testing.T) {
 	var (
 		crawlDeadline   time.Time
@@ -1024,7 +1153,7 @@ func TestInvoke_GenPhaseUsesFreshContext(t *testing.T) {
 			{Name: "timeout", Value: "2"}, // 2-second budget
 			{Name: "headless", Value: "false"},
 			{Name: "probe", Value: "false"},
-			{Name: "api_type", Value: "rest"},
+			{Name: "api_type", Value: "auto"}, // "auto" so wsdlProbeFn is invoked to capture genCtx deadline
 		},
 	}
 
@@ -1044,20 +1173,19 @@ func TestInvoke_GenPhaseUsesFreshContext(t *testing.T) {
 // TEST-004: WSDL probe overrides api_type=rest (SEC-BE-002 regression anchor)
 // ---------------------------------------------------------------------------
 
-// TestInvoke_RESTAPITypeWSDLProbeOverridesToWSDL documents the current behavior
-// (questioned by SEC-BE-002 / coderabbitai) at capability.go:283: when api_type=rest
-// is requested and the WSDL probe returns a valid WSDL body, Invoke overrides the
-// resolved API type to "wsdl" and the emitted spec contains WSDL content.
-//
-// This test is a regression anchor. When SEC-BE-002 is fixed (WSDL probe must NOT
-// override an explicit api_type=rest), this test should be updated to assert that
-// the probe result is discarded and the spec is OpenAPI (not WSDL).
-func TestInvoke_RESTAPITypeWSDLProbeOverridesToWSDL(t *testing.T) {
+// TestInvoke_RESTAPITypeSkipsWSDLProbe verifies that the WSDL probe is NOT invoked
+// when api_type=rest is requested (SEC-BE-002 fix). The operator's explicit choice
+// must not be overridden by a server-controlled response. The emitted spec must be
+// OpenAPI, not WSDL.
+func TestInvoke_RESTAPITypeSkipsWSDLProbe(t *testing.T) {
+	wsdlProbeCalled := false
+
 	cap := &Capability{
 		crawlFn: func(_ context.Context, _ string, _ invokeParams) ([]crawl.ObservedRequest, error) {
 			return []crawl.ObservedRequest{restRequest()}, nil
 		},
 		wsdlProbeFn: func(_ context.Context, _ string) []byte {
+			wsdlProbeCalled = true
 			return []byte(validWSDL)
 		},
 	}
@@ -1075,10 +1203,11 @@ func TestInvoke_RESTAPITypeWSDLProbeOverridesToWSDL(t *testing.T) {
 	err := cap.Invoke(ctx, input, emitter)
 	require.NoError(t, err)
 	assert.NotEmpty(t, captured.OpenAPI)
-	assert.True(t,
-		strings.Contains(strings.ToLower(captured.OpenAPI), "wsdl") ||
-			strings.Contains(captured.OpenAPI, "<definitions"),
-		"expected WSDL content in generated spec (current SEC-BE-002 behavior), got: %s", captured.OpenAPI)
+	assert.False(t, wsdlProbeCalled, "wsdlProbeFn must not be called when api_type=rest")
+	assert.True(t, strings.Contains(captured.OpenAPI, "openapi"),
+		"expected OpenAPI spec when api_type=rest, got: %s", captured.OpenAPI)
+	assert.False(t, strings.Contains(captured.OpenAPI, "<definitions"),
+		"expected no WSDL content when api_type=rest, got: %s", captured.OpenAPI)
 }
 
 // ---------------------------------------------------------------------------

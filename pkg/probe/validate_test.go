@@ -16,7 +16,10 @@ package probe
 
 import (
 	"context"
+	"net"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestValidateProbeURL_PublicURL(t *testing.T) {
@@ -112,7 +115,9 @@ func TestValidateProbeURL_Exported(t *testing.T) {
 
 // TestSSRFSafeDialContext_BlocksPrivateIP verifies that ssrfSafeDialContext
 // rejects connections to private IP addresses without requiring a real TCP dial.
-// A pre-canceled context is used so even DNS resolution is bounded.
+// context.Background() is sufficient here because ssrfSafeDialContext rejects
+// the private IP synchronously via the IP-range check before performing any
+// DNS lookup or network operation.
 func TestSSRFSafeDialContext_BlocksPrivateIP(t *testing.T) {
 	ctx := context.Background()
 	// 127.0.0.1 resolves immediately (no external DNS) and is a private IP,
@@ -153,4 +158,36 @@ func TestSSRFSafeDialContext_DNSFailure(t *testing.T) {
 	if err == nil {
 		t.Error("expected DNS lookup to fail with canceled context or invalid hostname")
 	}
+}
+
+// TestSSRFSafeDialContext_DialsResolvedPublicIP pins down that
+// ssrfSafeDialContext calls the dialer with the *resolved IP*, not the original
+// hostname. This is the TOCTOU DNS-rebinding mitigation: the dialer must always
+// receive an IP-literal address regardless of what the caller passed.
+func TestSSRFSafeDialContext_DialsResolvedPublicIP(t *testing.T) {
+	var dialedAddr string
+	origDialFunc := dialFunc
+	dialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialedAddr = addr
+		// Return a dummy net.Pipe conn so the dial appears to succeed without
+		// a real TCP connection.
+		c, _ := net.Pipe()
+		return c, nil
+	}
+	t.Cleanup(func() { dialFunc = origDialFunc })
+
+	// Use a public-IP literal as the host so the resolver returns it unchanged
+	// and isPrivateIP returns false. A literal IP bypasses external DNS, making
+	// this test hermetic.
+	_, err := ssrfSafeDialContext(context.Background(), "tcp", "8.8.8.8:80")
+	require.NoError(t, err)
+
+	// The dialer must be called with the resolved IP, not the original host.
+	// For a literal IP host, the resolved IP equals the host — we still assert
+	// it was called with an IP-form address (not "host:port" with a hostname).
+	host, port, err := net.SplitHostPort(dialedAddr)
+	require.NoError(t, err)
+	require.Equal(t, "80", port)
+	require.NotNil(t, net.ParseIP(host), "dialed host %q must be an IP literal", host)
+	require.Equal(t, "8.8.8.8", host)
 }

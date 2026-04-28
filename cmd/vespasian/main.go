@@ -38,6 +38,7 @@ import (
 	wsdlgen "github.com/praetorian-inc/vespasian/pkg/generate/wsdl"
 	"github.com/praetorian-inc/vespasian/pkg/importer"
 	"github.com/praetorian-inc/vespasian/pkg/probe"
+	"github.com/praetorian-inc/vespasian/pkg/sdk"
 )
 
 // Build-time variables injected via ldflags.
@@ -598,7 +599,7 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 
 	apiType := c.APIType
 	if apiType == apiTypeAuto {
-		apiType = detectAPIType(requests, c.Confidence)
+		apiType = sdk.DetectAPIType(requests, c.Confidence)
 		if c.Verbose {
 			fmt.Fprintf(os.Stderr, "detected API type: %s\n", apiType) //nolint:gosec // G705: writing to stderr, not web response
 		}
@@ -693,7 +694,7 @@ type generateSpecOptions struct {
 
 // generateSpec runs the classify → probe → generate pipeline.
 func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts generateSpecOptions) ([]byte, error) {
-	classifiers := classifiersForType(opts.APIType)
+	classifiers := sdk.ClassifiersForType(opts.APIType)
 	if classifiers == nil {
 		return nil, fmt.Errorf("unsupported API type: %q", opts.APIType)
 	}
@@ -756,60 +757,6 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts ge
 	}
 
 	return spec, nil
-}
-
-// classifiersForType returns the appropriate classifiers for the given API type.
-func classifiersForType(apiType string) []classify.APIClassifier {
-	switch apiType {
-	case apiTypeREST:
-		return []classify.APIClassifier{&classify.RESTClassifier{}}
-	case apiTypeWSDL:
-		return []classify.APIClassifier{&classify.WSDLClassifier{}}
-	case apiTypeGraphQL:
-		return []classify.APIClassifier{&classify.GraphQLClassifier{}}
-	default:
-		return nil
-	}
-}
-
-// detectAPIType runs both WSDL and REST classifiers against captured traffic
-// and returns the API type with the most matches. For WSDL to win, it must
-// have at least one match AND represent the majority of classified traffic.
-// When WSDL matches exist but are the minority (mixed REST+SOAP), REST is
-// returned to avoid losing REST endpoint discovery.
-//
-// Note: this performs a lightweight classification pass separate from the full
-// RunClassifiers call inside generateSpec. The duplication is intentional —
-// detectAPIType only needs to answer "which generator?", while generateSpec's
-// pass produces the full ClassifiedRequest slice needed for generation.
-func detectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
-	wsdlClassifier := &classify.WSDLClassifier{}
-	restClassifier := &classify.RESTClassifier{}
-	graphqlClassifier := &classify.GraphQLClassifier{}
-
-	var wsdlCount, restCount, graphqlCount int
-	for _, req := range requests {
-		if isAPI, confidence := wsdlClassifier.Classify(req); isAPI && confidence >= threshold {
-			wsdlCount++
-		}
-		if isAPI, confidence := restClassifier.Classify(req); isAPI && confidence >= threshold {
-			restCount++
-		}
-		if isAPI, confidence := graphqlClassifier.Classify(req); isAPI && confidence >= threshold {
-			graphqlCount++
-		}
-	}
-
-	// GraphQL wins when it has matches and at least as many as both others.
-	if graphqlCount > 0 && graphqlCount >= wsdlCount && graphqlCount >= restCount {
-		return apiTypeGraphQL
-	}
-	// WSDL wins only when it has matches and they represent the majority
-	// of classified traffic (or there are no REST matches at all).
-	if wsdlCount > 0 && wsdlCount >= restCount {
-		return apiTypeWSDL
-	}
-	return apiTypeREST
 }
 
 // probeWSDLDocument attempts to fetch a WSDL document from targetURL?wsdl.

@@ -73,6 +73,7 @@ The CLI (`cmd/vespasian`) uses Kong for argument parsing. Each command (crawl, i
 - **pkg/generate/graphql**: GraphQL SDL generation from introspection results or traffic-based inference
 - **pkg/generate/wsdl**: WSDL generation from SOAP traffic, WSDL document parsing, type inference from SOAP envelopes
 - **pkg/importer**: Traffic importers for Burp Suite XML, HAR 1.2, and mitmproxy dumps; format registry with size limits (500MB)
+- **pkg/sdk**: Chariot capability integration. Implements `capability.Capability[capmodel.WebApplication]`; exports `ClassifyProbeGenerate`, `DetectAPIType`, and `ClassifiersForType` so external wrappers can reuse the classify-probe-generate pipeline without reimplementing it.
 
 ### Key Patterns
 

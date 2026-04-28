@@ -295,7 +295,12 @@ pkg/generate/
   ├── rest/             OpenAPI 3.0 generation, path normalization, schema inference
   ├── graphql/          GraphQL SDL generation, introspection, traffic inference
   └── wsdl/             WSDL generation, SOAP operation extraction
+pkg/sdk/                Chariot capability integration (embedded usage)
 ```
+
+### SDK / Embedded Usage
+
+In addition to the CLI, Vespasian ships an SDK in [`pkg/sdk`](pkg/sdk) that implements `capability.Capability[capmodel.WebApplication]` from `github.com/praetorian-inc/capability-sdk`. This lets the Praetorian Chariot platform (and any other capability-sdk consumer) run Vespasian's classify-probe-generate pipeline in-process without re-implementing it. The exported helpers `ClassifyProbeGenerate`, `DetectAPIType`, and `ClassifiersForType` are also reusable directly.
 
 ## Frequently Asked Questions
 

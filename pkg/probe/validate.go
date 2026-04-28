@@ -107,6 +107,14 @@ func SSRFSafeDialContext(ctx context.Context, network, addr string) (net.Conn, e
 	return ssrfSafeDialContext(ctx, network, addr)
 }
 
+// dialFunc is the default dialer used by ssrfSafeDialContext. Tests in this
+// package can swap it out to assert the address passed to DialContext is the
+// resolved IP rather than the original host.
+var dialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
+	d := &net.Dialer{}
+	return d.DialContext(ctx, network, addr)
+}
+
 // ssrfSafeDialContext is the internal implementation of SSRFSafeDialContext.
 func ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
@@ -129,7 +137,7 @@ func ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, e
 		}
 	}
 
-	// Dial the first resolved address.
-	dialer := &net.Dialer{}
-	return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+	// Dial the first resolved address by IP so that the address passed to
+	// dialFunc is the resolved IP, not the original hostname.
+	return dialFunc(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
 }

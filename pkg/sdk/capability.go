@@ -33,6 +33,18 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
 
+// validateProbeURLFunc is the SSRF guard used by probeWSDLDocument. Stored as
+// a package var so tests can swap in a permissive validator when exercising
+// the HTTP integration against an httptest server on loopback. Production
+// code paths leave this untouched.
+var validateProbeURLFunc = probe.ValidateProbeURL
+
+// dialContextForWSDLProbe is the dialer used by the probeWSDLDocument
+// http.Transport. Stored as a package var so tests can swap in a vanilla
+// dialer to reach an httptest loopback server. Production callers leave
+// this untouched.
+var dialContextForWSDLProbe = probe.SSRFSafeDialContext
+
 // Capability implements capability.Capability[capmodel.WebApplication] for
 // running Vespasian's API discovery pipeline as a Chariot platform capability.
 //
@@ -148,6 +160,9 @@ type invokeParams struct {
 // NOTE: Parse failures in GetInt/GetFloat/GetBool return (zero-value, false), so the
 // hardcoded defaults are retained. This is intentional — defensive defaults match the
 // behavior of Kong's CLI flag defaults and avoid surfacing parse errors to callers.
+//
+// NOTE: The high parameter count is expected — it mirrors the full set of tunable
+// knobs the capability exposes, and complexity scales linearly with that count.
 func resolveParams(ctx capability.ExecutionContext) invokeParams {
 	p := invokeParams{
 		apiType:     "auto",
@@ -198,6 +213,26 @@ func resolveParams(ctx capability.ExecutionContext) invokeParams {
 	}
 
 	return p
+}
+
+// validate checks that all numeric and range-bounded invokeParams fields hold
+// meaningful values. It is called by Invoke immediately after resolveParams so
+// that garbage inputs (negative timeout, zero max_pages, out-of-range confidence)
+// are rejected before any context or browser is created.
+func (p invokeParams) validate() error {
+	if p.depth < 1 {
+		return fmt.Errorf("invalid depth %v: must be >= 1", p.depth)
+	}
+	if p.maxPages < 1 {
+		return fmt.Errorf("invalid max_pages %v: must be >= 1", p.maxPages)
+	}
+	if p.timeoutSecs < 1 {
+		return fmt.Errorf("invalid timeout %v: must be >= 1", p.timeoutSecs)
+	}
+	if p.confidence < 0.0 || p.confidence > 1.0 {
+		return fmt.Errorf("invalid confidence %v: must be between 0.0 and 1.0", p.confidence)
+	}
+	return nil
 }
 
 // buildCrawlerOptions translates the resolved invokeParams (and an optional
@@ -252,11 +287,15 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 		return fmt.Errorf("invalid scope %q: must be same-origin or same-domain", p.scope)
 	}
 
-	crawlTimeout := time.Duration(p.timeoutSecs) * time.Second
+	if err := p.validate(); err != nil {
+		return err
+	}
+
+	phaseBudget := time.Duration(p.timeoutSecs) * time.Second
 	// NOTE: capability.ExecutionContext does not carry a context.Context,
 	// so we create a standalone context with timeout. If the SDK adds
 	// context support in the future, this should thread the parent context.
-	crawlCtx, crawlCancel := context.WithTimeout(context.Background(), crawlTimeout)
+	crawlCtx, crawlCancel := context.WithTimeout(context.Background(), phaseBudget)
 	defer crawlCancel()
 
 	crawlFn := c.crawlFn
@@ -278,7 +317,7 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 	// NOTE: capability.ExecutionContext does not carry a context.Context,
 	// so we create a fresh standalone context for the generate phase. Using
 	// a separate context ensures the crawl budget does not starve probing.
-	genCtx, genCancel := context.WithTimeout(context.Background(), crawlTimeout)
+	genCtx, genCancel := context.WithTimeout(context.Background(), phaseBudget)
 	defer genCancel()
 
 	wsdlProbeFn := c.wsdlProbeFn
@@ -286,21 +325,9 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 		wsdlProbeFn = probeWSDLDocument
 	}
 
-	resolvedAPIType := p.apiType
-
-	if resolvedAPIType == "auto" || resolvedAPIType == "wsdl" || resolvedAPIType == "rest" {
-		if wsdlDoc := wsdlProbeFn(genCtx, input.PrimaryURL); wsdlDoc != nil {
-			resolvedAPIType = "wsdl"
-			requests = append(requests, crawl.ObservedRequest{
-				Method: "GET",
-				URL:    input.PrimaryURL + "?wsdl",
-				Response: crawl.ObservedResponse{
-					StatusCode:  200,
-					ContentType: "text/xml",
-					Body:        wsdlDoc,
-				},
-			})
-		}
+	resolvedAPIType, syntheticReq := resolveAPITypeWithWSDLProbe(genCtx, p.apiType, input.PrimaryURL, wsdlProbeFn)
+	if syntheticReq != nil {
+		requests = append(requests, *syntheticReq)
 	}
 
 	spec, err := ClassifyProbeGenerate(genCtx, requests, resolvedAPIType, p.confidence, p.deduplicate, p.enableProbe)
@@ -315,6 +342,49 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 	webApp := input
 	webApp.OpenAPI = string(spec)
 	return output.Emit(webApp)
+}
+
+// resolveAPITypeWithWSDLProbe runs the WSDL probe only when api_type is "auto"
+// (operator already chose a specific type — don't let the server override it).
+// Returns the resolved API type and a synthetic ObservedRequest carrying the WSDL
+// body when the probe succeeds, or (apiType, nil) when no probe is needed or fails.
+func resolveAPITypeWithWSDLProbe(ctx context.Context, apiType, primaryURL string, probeFn func(context.Context, string) []byte) (string, *crawl.ObservedRequest) {
+	if apiType != "auto" {
+		return apiType, nil
+	}
+	wsdlDoc := probeFn(ctx, primaryURL)
+	if wsdlDoc == nil {
+		return apiType, nil
+	}
+	wsdlURL, err := buildWSDLProbeURL(primaryURL)
+	if err != nil {
+		return apiType, nil
+	}
+	syntheticReq := &crawl.ObservedRequest{
+		Method: "GET",
+		URL:    wsdlURL,
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "text/xml",
+			Body:        wsdlDoc,
+		},
+	}
+	return "wsdl", syntheticReq
+}
+
+// buildWSDLProbeURL constructs the URL used to probe for a WSDL document by
+// adding "wsdl" as a query parameter while preserving any existing query string.
+// Both probeWSDLDocument and resolveAPITypeWithWSDLProbe use this helper so that
+// the synthetic ObservedRequest URL always matches the URL actually probed.
+func buildWSDLProbeURL(targetURL string) (string, error) {
+	parsedURL, err := url.Parse(targetURL)
+	if err != nil {
+		return "", err
+	}
+	q := parsedURL.Query()
+	q.Set("wsdl", "")
+	parsedURL.RawQuery = q.Encode()
+	return parsedURL.String(), nil
 }
 
 // ClassifyProbeGenerate runs the classification, probing, and generation pipeline
@@ -395,8 +465,13 @@ func DetectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
 	return "rest"
 }
 
-// classifiersForType returns the appropriate classifiers for the given API type,
+// ClassifiersForType returns the appropriate classifiers for the given API type,
 // or nil if the API type is not recognized.
+func ClassifiersForType(apiType string) []classify.APIClassifier {
+	return classifiersForType(apiType)
+}
+
+// classifiersForType is the internal implementation of ClassifiersForType.
 func classifiersForType(apiType string) []classify.APIClassifier {
 	switch apiType {
 	case "rest":
@@ -430,16 +505,11 @@ func probeStrategiesForType(apiType string, cfg probe.Config) []probe.ProbeStrat
 
 // isRejectedWSDLStatus reports whether the HTTP status code should cause
 // probeWSDLDocument to reject the response without attempting to parse.
-// 3xx responses reach us because CheckRedirect returns ErrUseLastResponse;
-// 4xx+ indicates the endpoint does not serve WSDL.
+// Anything ≥300 is rejected: 3xx responses reach us because CheckRedirect
+// returns ErrUseLastResponse (not a final WSDL response), and 4xx/5xx
+// indicate the endpoint does not serve WSDL.
 func isRejectedWSDLStatus(status int) bool {
-	if status >= 300 && status < 400 {
-		return true
-	}
-	if status >= 400 {
-		return true
-	}
-	return false
+	return status >= 300
 }
 
 // isAcceptableWSDLContentType reports whether a response's Content-Type
@@ -456,9 +526,10 @@ func isAcceptableWSDLContentType(header string) bool {
 	}
 }
 
-// probeWSDLDocument attempts to fetch a WSDL document from targetURL?wsdl.
-// Returns the raw WSDL bytes if the response is a valid WSDL document, or nil
-// if the probe fails, is blocked by SSRF protection, or returns non-WSDL content.
+// probeWSDLDocument attempts to fetch a WSDL document from targetURL with ?wsdl
+// appended. Existing query parameters are preserved. Returns the raw WSDL bytes
+// if the response is a valid WSDL document, or nil if the probe fails, is blocked
+// by SSRF protection, or returns non-WSDL content.
 //
 // NOTE: Silent failures are intentional — this is a best-effort probe.
 func probeWSDLDocument(ctx context.Context, targetURL string) []byte {
@@ -466,21 +537,19 @@ func probeWSDLDocument(ctx context.Context, targetURL string) []byte {
 		ctx = context.Background()
 	}
 
-	parsedURL, err := url.Parse(targetURL)
+	wsdlURL, err := buildWSDLProbeURL(targetURL)
 	if err != nil {
 		return nil
 	}
-	parsedURL.RawQuery = "wsdl"
-	wsdlURL := parsedURL.String()
 
-	if err := probe.ValidateProbeURL(wsdlURL); err != nil {
+	if err := validateProbeURLFunc(wsdlURL); err != nil {
 		return nil
 	}
 
 	client := &http.Client{
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
-			DialContext:           probe.SSRFSafeDialContext,
+			DialContext:           dialContextForWSDLProbe,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: 10 * time.Second,
 		},
@@ -533,8 +602,18 @@ func decodeWSDLResponse(resp *http.Response) []byte {
 	return body
 }
 
+// headerValueIsSafe reports whether s is safe to use as an HTTP header key or
+// value. It rejects any string containing CR, LF, or NUL characters that could
+// be used to smuggle additional headers through CDP/katana paths that bypass
+// net/http's own validation.
+func headerValueIsSafe(s string) bool {
+	return !strings.ContainsAny(s, "\r\n\x00")
+}
+
 // parseHeaderString parses a comma-separated list of "Key: Value" header pairs
-// into a map. Entries that do not contain a colon are silently ignored.
+// into a map. Entries that do not contain a colon are silently ignored. Entries
+// whose trimmed key or value contain CR, LF, or NUL are also silently dropped
+// to prevent header injection.
 func parseHeaderString(raw string) map[string]string {
 	headers := make(map[string]string)
 	for _, hdr := range strings.Split(raw, ",") {
@@ -544,7 +623,12 @@ func parseHeaderString(raw string) map[string]string {
 		}
 		parts := strings.SplitN(hdr, ":", 2)
 		if len(parts) == 2 {
-			headers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			if !headerValueIsSafe(key) || !headerValueIsSafe(val) {
+				continue
+			}
+			headers[key] = val
 		}
 	}
 	return headers
