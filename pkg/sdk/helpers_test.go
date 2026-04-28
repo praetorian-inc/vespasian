@@ -1209,6 +1209,6 @@ func TestRunRealCrawl_NonHeadlessReturnsErrorOnCanceledContext(t *testing.T) {
 	}
 
 	requests, err := runRealCrawl(ctx, "http://example.com", p)
-	assert.Error(t, err, "expected an error when context is already canceled")
+	require.ErrorIs(t, err, context.Canceled)
 	assert.Nil(t, requests, "expected nil requests when context is already canceled")
 }
