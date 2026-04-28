@@ -1341,3 +1341,209 @@ func TestRunRealCrawl_NonHeadlessReturnsErrorOnCanceledContext(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 	assert.Nil(t, requests, "expected nil requests when context is already canceled")
 }
+
+// ---------------------------------------------------------------------------
+// TestInvokeParams_Validate — positive + negative boundary cases
+// ---------------------------------------------------------------------------
+
+// TestInvokeParams_Validate exercises invokeParams.validate() directly to pin
+// the exact boundary conditions accepted and rejected. This guards against
+// off-by-one regressions (e.g. < 1 flipped to <= 1) that would not be caught
+// by the existing TestInvoke_*IsRejected tests because those tests only cover
+// the negative path through Invoke's wiring, not validate() boundaries.
+func TestInvokeParams_Validate(t *testing.T) {
+	cases := []struct {
+		name    string
+		p       invokeParams
+		wantErr string // empty = expect no error
+	}{
+		// Positive boundary cases — these MUST be accepted.
+		{"depth=1 accepted", invokeParams{depth: 1, maxPages: 1, timeoutSecs: 1, confidence: 0.5}, ""},
+		{"maxPages=1 accepted", invokeParams{depth: 5, maxPages: 1, timeoutSecs: 1, confidence: 0.5}, ""},
+		{"timeoutSecs=1 accepted", invokeParams{depth: 5, maxPages: 5, timeoutSecs: 1, confidence: 0.5}, ""},
+		{"confidence=0.0 accepted", invokeParams{depth: 5, maxPages: 5, timeoutSecs: 5, confidence: 0.0}, ""},
+		{"confidence=1.0 accepted", invokeParams{depth: 5, maxPages: 5, timeoutSecs: 5, confidence: 1.0}, ""},
+		// Negative boundary cases — these MUST be rejected.
+		{"depth=0 rejected", invokeParams{depth: 0, maxPages: 5, timeoutSecs: 5, confidence: 0.5}, "invalid depth"},
+		{"maxPages=0 rejected", invokeParams{depth: 5, maxPages: 0, timeoutSecs: 5, confidence: 0.5}, "invalid max_pages"},
+		{"timeoutSecs=0 rejected", invokeParams{depth: 5, maxPages: 5, timeoutSecs: 0, confidence: 0.5}, "invalid timeout"},
+		{"confidence=-0.1 rejected", invokeParams{depth: 5, maxPages: 5, timeoutSecs: 5, confidence: -0.1}, "invalid confidence"},
+		{"confidence=1.1 rejected", invokeParams{depth: 5, maxPages: 5, timeoutSecs: 5, confidence: 1.1}, "invalid confidence"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.p.validate()
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestResolveAPITypeWithWSDLProbe_* — auto+nil branch and non-auto fast-path
+// ---------------------------------------------------------------------------
+
+// TestResolveAPITypeWithWSDLProbe_AutoButProbeReturnsNil verifies that when
+// apiType=="auto" and the probe function returns nil, the resolved type stays
+// "auto" and no synthetic request is produced. This branch was previously
+// uncovered.
+func TestResolveAPITypeWithWSDLProbe_AutoButProbeReturnsNil(t *testing.T) {
+	probeCalled := false
+	probeFn := func(_ context.Context, _ string) []byte {
+		probeCalled = true
+		return nil
+	}
+	apiType, syntheticReq := resolveAPITypeWithWSDLProbe(
+		context.Background(), "auto", "http://example.com", probeFn,
+	)
+	assert.True(t, probeCalled, "probeFn must be invoked when apiType=auto")
+	assert.Equal(t, "auto", apiType, "apiType must remain 'auto' when probe returns nil")
+	assert.Nil(t, syntheticReq, "no synthetic request when probe returns nil")
+}
+
+// TestResolveAPITypeWithWSDLProbe_NonAutoSkipsProbe verifies that any apiType
+// other than "auto" causes probeFn to be skipped entirely and the original
+// apiType is returned unchanged with no synthetic request.
+func TestResolveAPITypeWithWSDLProbe_NonAutoSkipsProbe(t *testing.T) {
+	for _, apiType := range []string{"rest", "graphql", "wsdl", "anything"} {
+		t.Run(apiType, func(t *testing.T) {
+			probeCalled := false
+			gotType, syntheticReq := resolveAPITypeWithWSDLProbe(
+				context.Background(), apiType, "http://example.com",
+				func(_ context.Context, _ string) []byte {
+					probeCalled = true
+					return nil
+				},
+			)
+			assert.False(t, probeCalled, "probeFn must not be invoked for apiType=%s", apiType)
+			assert.Equal(t, apiType, gotType)
+			assert.Nil(t, syntheticReq)
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestBuildWSDLProbeURL — pin the SEC-BE-003/SEC-BE-004 URL-building contract
+// ---------------------------------------------------------------------------
+
+// TestBuildWSDLProbeURL pins the exact output of buildWSDLProbeURL for a range
+// of inputs. The expected values were determined empirically by running the
+// implementation: q.Set("wsdl","") followed by q.Encode() produces "wsdl="
+// (with trailing "="), and existing query keys are sorted alphabetically by
+// url.Values.Encode, placing "token" before "wsdl".
+func TestBuildWSDLProbeURL(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{"empty query gets wsdl flag", "https://example.com/svc", "https://example.com/svc?wsdl=", false},
+		{"existing query preserved", "https://example.com/svc?token=abc", "https://example.com/svc?token=abc&wsdl=", false},
+		{"existing wsdl key replaced", "https://example.com/svc?wsdl=old", "https://example.com/svc?wsdl=", false},
+		{"path preserved", "https://example.com/a/b/c", "https://example.com/a/b/c?wsdl=", false},
+		{"port preserved", "https://example.com:8443/svc", "https://example.com:8443/svc?wsdl=", false},
+		{"malformed input rejected", "://bad", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := buildWSDLProbeURL(tc.input)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestParseHeaderString_DropsCRLFAndNUL + TestHeaderValueIsSafe — SEC-BE-005
+// ---------------------------------------------------------------------------
+
+// TestParseHeaderString_DropsCRLFAndNUL is the regression guard for SEC-BE-005.
+// The reviewer explicitly requested a test demonstrating that CR, LF, and NUL
+// bytes in header keys or values cause the entire entry to be silently dropped.
+// Expected values were verified empirically against the production implementation.
+func TestParseHeaderString_DropsCRLFAndNUL(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want map[string]string
+	}{
+		{
+			"CR in value dropped",
+			"X-Bad: foo\rInjected: yes, X-Good: ok",
+			map[string]string{"X-Good": "ok"},
+		},
+		{
+			"LF in value dropped",
+			"X-Bad: foo\nInjected: yes, X-Good: ok",
+			map[string]string{"X-Good": "ok"},
+		},
+		{
+			"CRLF in value dropped",
+			"X-Bad: foo\r\nInjected: yes, X-Good: ok",
+			map[string]string{"X-Good": "ok"},
+		},
+		{
+			"NUL in value dropped",
+			"X-Bad: foo\x00bar, X-Good: ok",
+			map[string]string{"X-Good": "ok"},
+		},
+		{
+			"CR in key dropped",
+			"X-Bad\rInjected: yes, X-Good: ok",
+			map[string]string{"X-Good": "ok"},
+		},
+		{
+			"LF in key dropped",
+			"X-Bad\nInjected: yes, X-Good: ok",
+			map[string]string{"X-Good": "ok"},
+		},
+		{
+			"NUL in key dropped",
+			"X-Bad\x00Injected: yes, X-Good: ok",
+			map[string]string{"X-Good": "ok"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseHeaderString(tc.raw)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestHeaderValueIsSafe directly exercises the headerValueIsSafe predicate that
+// backs the SEC-BE-005 filter. A future regression that removes or inverts this
+// guard would cause TestParseHeaderString_DropsCRLFAndNUL to fail, but
+// TestHeaderValueIsSafe pinpoints the exact predicate that broke.
+func TestHeaderValueIsSafe(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"plain ascii", "Bearer abc123", true},
+		{"empty", "", true},
+		{"with space", "Bearer foo bar", true},
+		{"with colon (allowed in value)", "Bearer foo:bar", true},
+		{"contains CR", "foo\rbar", false},
+		{"contains LF", "foo\nbar", false},
+		{"contains CRLF", "foo\r\nbar", false},
+		{"contains NUL", "foo\x00bar", false},
+		{"only CR", "\r", false},
+		{"only LF", "\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, headerValueIsSafe(tc.in))
+		})
+	}
+}
