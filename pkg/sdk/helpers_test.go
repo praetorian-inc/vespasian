@@ -1039,3 +1039,176 @@ func TestInvoke_GenPhaseUsesFreshContext(t *testing.T) {
 		"genDeadline %v should be later than crawlDeadline %v — the two contexts must be independent (prior-MED-2 fix)",
 		genDeadline, crawlDeadline)
 }
+
+// ---------------------------------------------------------------------------
+// TEST-004: WSDL probe overrides api_type=rest (SEC-BE-002 regression anchor)
+// ---------------------------------------------------------------------------
+
+// TestInvoke_RESTAPITypeWSDLProbeOverridesToWSDL documents the current behavior
+// (questioned by SEC-BE-002 / coderabbitai) at capability.go:283: when api_type=rest
+// is requested and the WSDL probe returns a valid WSDL body, Invoke overrides the
+// resolved API type to "wsdl" and the emitted spec contains WSDL content.
+//
+// This test is a regression anchor. When SEC-BE-002 is fixed (WSDL probe must NOT
+// override an explicit api_type=rest), this test should be updated to assert that
+// the probe result is discarded and the spec is OpenAPI (not WSDL).
+func TestInvoke_RESTAPITypeWSDLProbeOverridesToWSDL(t *testing.T) {
+	cap := &Capability{
+		crawlFn: func(_ context.Context, _ string, _ invokeParams) ([]crawl.ObservedRequest, error) {
+			return []crawl.ObservedRequest{restRequest()}, nil
+		},
+		wsdlProbeFn: func(_ context.Context, _ string) []byte {
+			return []byte(validWSDL)
+		},
+	}
+
+	input := capmodel.WebApplication{PrimaryURL: "http://example.com"}
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{
+			{Name: "headless", Value: "false"},
+			{Name: "probe", Value: "false"},
+			{Name: "api_type", Value: "rest"},
+		},
+	}
+
+	captured, emitter := captureEmitter(t)
+	err := cap.Invoke(ctx, input, emitter)
+	require.NoError(t, err)
+	assert.NotEmpty(t, captured.OpenAPI)
+	assert.True(t,
+		strings.Contains(strings.ToLower(captured.OpenAPI), "wsdl") ||
+			strings.Contains(captured.OpenAPI, "<definitions"),
+		"expected WSDL content in generated spec (current SEC-BE-002 behavior), got: %s", captured.OpenAPI)
+}
+
+// ---------------------------------------------------------------------------
+// TEST-003: api_type=graphql skips WSDL probe
+// ---------------------------------------------------------------------------
+
+// TestInvoke_GraphQLAPITypeSkipsWSDLProbe verifies that the api_type=graphql branch
+// never invokes wsdlProbeFn. The WSDL probe is guarded at capability.go:283 by
+// resolvedAPIType == "auto" || resolvedAPIType == "wsdl" || resolvedAPIType == "rest",
+// which excludes "graphql". The test fails if wsdlProbeCalled is true after Invoke.
+// The emitted spec must contain the inferred-SDL marker "# Inferred from observed traffic"
+// written by pkg/generate/graphql/infer.go:85 when no introspection schema is present.
+func TestInvoke_GraphQLAPITypeSkipsWSDLProbe(t *testing.T) {
+	wsdlProbeCalled := false
+
+	cap := &Capability{
+		crawlFn: func(_ context.Context, _ string, _ invokeParams) ([]crawl.ObservedRequest, error) {
+			return []crawl.ObservedRequest{graphqlRequest(), graphqlRequest()}, nil
+		},
+		wsdlProbeFn: func(_ context.Context, _ string) []byte {
+			wsdlProbeCalled = true
+			return nil
+		},
+	}
+
+	input := capmodel.WebApplication{PrimaryURL: "http://example.com"}
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{
+			{Name: "headless", Value: "false"},
+			{Name: "probe", Value: "false"},
+			{Name: "api_type", Value: "graphql"},
+		},
+	}
+
+	captured, emitter := captureEmitter(t)
+	err := cap.Invoke(ctx, input, emitter)
+	require.NoError(t, err)
+	assert.NotEmpty(t, captured.OpenAPI)
+	assert.Contains(t, captured.OpenAPI, "# Inferred from observed traffic",
+		"expected GraphQL SDL inferred-from-traffic marker in spec, got: %s", captured.OpenAPI)
+	assert.False(t, wsdlProbeCalled, "wsdlProbeFn must not be called when api_type=graphql")
+}
+
+// ---------------------------------------------------------------------------
+// TEST-005: generate-spec error propagates with correct prefix
+// ---------------------------------------------------------------------------
+
+// TestInvoke_GenerateErrorPropagates mirrors TestInvoke_CrawlErrorPropagates but
+// for the generate-spec path. Setting api_type=bogus forces ClassifyProbeGenerate
+// to return "unsupported API type: \"bogus\"" (capability.go:333-335).
+// The WSDL probe branch at capability.go:283 is skipped because "bogus" is not
+// "auto", "wsdl", or "rest". The emitter must never be called.
+func TestInvoke_GenerateErrorPropagates(t *testing.T) {
+	cap := &Capability{
+		crawlFn: func(_ context.Context, _ string, _ invokeParams) ([]crawl.ObservedRequest, error) {
+			return []crawl.ObservedRequest{restRequest()}, nil
+		},
+	}
+
+	input := capmodel.WebApplication{PrimaryURL: "http://example.com"}
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{
+			{Name: "headless", Value: "false"},
+			{Name: "probe", Value: "false"},
+			{Name: "api_type", Value: "bogus"},
+		},
+	}
+
+	noEmit := capability.EmitterFunc(func(models ...any) error {
+		t.Fatal("Emit should not be called on generate error")
+		return nil
+	})
+
+	err := cap.Invoke(ctx, input, noEmit)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "generate spec",
+		"expected error to mention 'generate spec', got: %s", err.Error())
+	assert.Contains(t, err.Error(), "unsupported API type",
+		"expected error to contain 'unsupported API type', got: %s", err.Error())
+}
+
+// ---------------------------------------------------------------------------
+// TEST-002: buildCrawlerOptions parameter wiring + runRealCrawl non-headless
+// ---------------------------------------------------------------------------
+
+// TestBuildCrawlerOptions_ParameterWiring verifies that buildCrawlerOptions maps
+// every invokeParams field to the correct crawl.CrawlerOptions field. This test
+// is hermetic -- no browser is launched and no network calls are made.
+func TestBuildCrawlerOptions_ParameterWiring(t *testing.T) {
+	p := invokeParams{
+		depth:       7,
+		maxPages:    250,
+		timeoutSecs: 120,
+		headless:    true,
+		scope:       "same-domain",
+		headers:     map[string]string{"X-Test": "1"},
+		proxy:       "http://127.0.0.1:8080",
+	}
+
+	opts := buildCrawlerOptions(p, nil)
+
+	assert.Equal(t, 7, opts.Depth)
+	assert.Equal(t, 250, opts.MaxPages)
+	assert.Equal(t, 120*time.Second, opts.Timeout)
+	assert.True(t, opts.Headless)
+	assert.Equal(t, "same-domain", opts.Scope)
+	assert.Equal(t, map[string]string{"X-Test": "1"}, opts.Headers)
+	assert.Equal(t, "http://127.0.0.1:8080", opts.Proxy)
+	assert.Nil(t, opts.BrowserMgr)
+	assert.NotNil(t, opts.Stderr, "Stderr should be io.Discard (non-nil)")
+}
+
+// TestRunRealCrawl_NonHeadlessReturnsErrorOnCanceledContext verifies that
+// runRealCrawl propagates a canceled context without launching a browser when
+// headless=false. The early-return at pkg/crawl/crawler.go:100-105 checks
+// ctx.Err() before any engine setup, so this test is hermetic and exercises
+// the headless=false branch + crawl.NewCrawler construction.
+func TestRunRealCrawl_NonHeadlessReturnsErrorOnCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel before passing to runRealCrawl
+
+	p := invokeParams{
+		depth:       1,
+		maxPages:    1,
+		timeoutSecs: 1,
+		headless:    false,
+		scope:       "same-origin",
+	}
+
+	requests, err := runRealCrawl(ctx, "http://example.com", p)
+	assert.Error(t, err, "expected an error when context is already canceled")
+	assert.Nil(t, requests, "expected nil requests when context is already canceled")
+}

@@ -200,6 +200,24 @@ func resolveParams(ctx capability.ExecutionContext) invokeParams {
 	return p
 }
 
+// buildCrawlerOptions translates the resolved invokeParams (and an optional
+// caller-owned browser) into the crawl.CrawlerOptions used by runRealCrawl.
+// Extracted so the parameter wiring can be unit-tested without launching a
+// real browser or making network calls.
+func buildCrawlerOptions(p invokeParams, browserMgr *crawl.BrowserManager) crawl.CrawlerOptions {
+	return crawl.CrawlerOptions{
+		Depth:      p.depth,
+		MaxPages:   p.maxPages,
+		Timeout:    time.Duration(p.timeoutSecs) * time.Second,
+		Headless:   p.headless,
+		Scope:      p.scope,
+		Headers:    p.headers,
+		Proxy:      p.proxy,
+		BrowserMgr: browserMgr,
+		Stderr:     io.Discard,
+	}
+}
+
 // runRealCrawl launches the headless browser (when enabled) and runs the
 // Katana-backed crawler against targetURL. This is the default crawlFn used
 // when Capability.crawlFn is nil. It owns its browser lifecycle and closes
@@ -218,17 +236,7 @@ func runRealCrawl(ctx context.Context, targetURL string, p invokeParams) ([]craw
 		defer browserMgr.Close()
 	}
 
-	crawler := crawl.NewCrawler(crawl.CrawlerOptions{
-		Depth:      p.depth,
-		MaxPages:   p.maxPages,
-		Timeout:    time.Duration(p.timeoutSecs) * time.Second,
-		Headless:   p.headless,
-		Scope:      p.scope,
-		Headers:    p.headers,
-		Proxy:      p.proxy,
-		BrowserMgr: browserMgr,
-		Stderr:     io.Discard,
-	})
+	crawler := crawl.NewCrawler(buildCrawlerOptions(p, browserMgr))
 
 	return crawler.Crawl(ctx, targetURL)
 }
