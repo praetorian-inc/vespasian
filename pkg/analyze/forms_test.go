@@ -131,6 +131,18 @@ func TestExtractForms_MultipartEnctypeRetained(t *testing.T) {
 	}
 }
 
+func TestExtractForms_TextPlainEnctypeRetained(t *testing.T) {
+	body := `<form method="post" enctype="text/plain" action="/x"><input name="a"></form>`
+	reqs := []crawl.ObservedRequest{htmlReq("https://host/", body)}
+	got := ExtractForms(reqs)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(got))
+	}
+	if got[0].Headers["content-type"] != "text/plain" {
+		t.Errorf("Headers[content-type] = %q, want text/plain", got[0].Headers["content-type"])
+	}
+}
+
 func TestExtractForms_RelativeActionResolved(t *testing.T) {
 	reqs := []crawl.ObservedRequest{htmlReq("https://ex.com/users/42/edit", `<form action="../profile"><input name="x"></form>`)}
 	got := ExtractForms(reqs)
@@ -195,17 +207,11 @@ func TestExtractForms_NestedFormsBothEmitted(t *testing.T) {
 		t.Fatalf("expected 2 results, got %d", len(got))
 	}
 	urls := map[string]bool{got[0].URL: true, got[1].URL: true}
-	if !urls["https://host/a"] && !urls["https://host/a?x="] {
-		t.Errorf("missing /a form; got %v", urls)
+	if !urls["https://host/a"] {
+		t.Errorf("expected /a form URL https://host/a (no query); got %v", urls)
 	}
-	found := false
-	for u := range urls {
-		if strings.HasPrefix(u, "https://host/b") {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("missing /b form; got %v", urls)
+	if !urls["https://host/b?x="] {
+		t.Errorf("expected /b form URL https://host/b?x=; got %v", urls)
 	}
 	// TEST-007: every synthesized request (not just one) must carry SourceStaticHTML.
 	for i, r := range got {
@@ -320,6 +326,8 @@ func TestExtractForms_MethodNormalised(t *testing.T) {
 		{"PATCH", "PATCH"},
 		{"delete", "DELETE"},
 		{"PuT", "PUT"},
+		{"head", "HEAD"},
+		{"OPTIONS", "OPTIONS"},
 	}
 	for _, tc := range cases {
 		var body string
@@ -457,17 +465,39 @@ func TestParseForms_HiddenFlag(t *testing.T) {
 	}
 }
 
-func TestParseForms_CSRFFlagAllVariants(t *testing.T) {
+func TestParseForms_SensitiveFlagAllVariants(t *testing.T) {
 	cases := []struct {
-		name   string
-		isCSRF bool
+		name        string
+		isSensitive bool
 	}{
+		// Existing CSRF cases — must still match.
 		{"csrf_token", true},
 		{"_token", true},
 		{"authenticity_token", true},
 		{"XSRF-Token", true},
 		{"MY_CSRF", true},
+		// New sensitive-name cases.
+		{"apikey", true},
+		{"api_key", true},
+		{"api-key", true},
+		{"X-API-Key", true},
+		{"sessionid", true},
+		{"session_id", true},
+		{"access_token", true},
+		{"refresh_token", true},
+		{"bearer", true},
+		{"Authorization-Bearer", true},
+		{"jwt", true},
+		{"oauth_signature", true},
+		{"SAMLRequest", true},
+		{"SAMLResponse", true},
+		{"RelayState", true},
+		// Negatives — must NOT match.
 		{"unrelated", false},
+		{"username", false},
+		{"email", false},
+		{"state", false}, // intentionally not matched (collides with US-state forms)
+		{"nonce", false}, // intentionally not matched (collides with too many things)
 	}
 	for _, tc := range cases {
 		body := []byte(`<form><input name="` + tc.name + `"></form>`)
@@ -476,9 +506,9 @@ func TestParseForms_CSRFFlagAllVariants(t *testing.T) {
 			t.Errorf("name=%q: unexpected parse result", tc.name)
 			continue
 		}
-		got := forms[0].Fields[0].CSRF
-		if got != tc.isCSRF {
-			t.Errorf("name=%q: CSRF=%v, want %v", tc.name, got, tc.isCSRF)
+		got := forms[0].Fields[0].Sensitive
+		if got != tc.isSensitive {
+			t.Errorf("name=%q: Sensitive=%v, want %v", tc.name, got, tc.isSensitive)
 		}
 	}
 }
@@ -1334,6 +1364,45 @@ func TestExtractForms_HiddenFieldVariousSecretNamesStripped(t *testing.T) {
 		bodyStr := string(got[0].Body)
 		if strings.Contains(bodyStr, secretVal) {
 			t.Errorf("name=%q: secret value %q must not appear in body (SEC-BE-005); got %q", name, secretVal, bodyStr)
+		}
+	}
+}
+
+// TestExtractForms_SensitiveNonHiddenValueNotReplayed verifies that fields
+// flagged Sensitive by name (SEC-BE-001) get their values blanked end-to-end
+// through ExtractForms even when they are NOT type="hidden" — i.e., the
+// Sensitive branch of fieldValue's `f.Sensitive || f.Hidden` predicate is
+// independently load-bearing. Hidden-input coverage lives in
+// TestExtractForms_HiddenFieldVariousSecretNamesStripped.
+func TestExtractForms_SensitiveNonHiddenValueNotReplayed(t *testing.T) {
+	names := []string{
+		"apikey",
+		"api_key",
+		"X-API-Key",
+		"bearer",
+		"jwt",
+		"access_token",
+		"refresh_token",
+		"oauth_signature",
+		"SAMLRequest",
+		"RelayState",
+	}
+	for _, name := range names {
+		secretVal := "SECRET-VAL-FOR-" + name
+		// Note: no type="hidden" — exercises the Sensitive-only branch.
+		body := `<form method="post" action="/x"><input name="` + name + `" value="` + secretVal + `"></form>`
+		reqs := []crawl.ObservedRequest{htmlReq("https://host/", body)}
+		got := ExtractForms(reqs)
+		if len(got) != 1 {
+			t.Errorf("name=%q: expected 1 result, got %d", name, len(got))
+			continue
+		}
+		bodyStr := string(got[0].Body)
+		if !strings.Contains(bodyStr, name+"=") {
+			t.Errorf("name=%q: field name missing from body (must be preserved); got %q", name, bodyStr)
+		}
+		if strings.Contains(bodyStr, secretVal) {
+			t.Errorf("name=%q: secret value %q must not appear in body (SEC-BE-001 Sensitive branch); got %q", name, secretVal, bodyStr)
 		}
 	}
 }

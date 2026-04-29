@@ -526,6 +526,11 @@ func (c *GenerateCmd) Run() (err error) {
 		fmt.Fprintf(os.Stderr, "loaded %d captured requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
+	// Augment with static-HTML form observations so captures produced by
+	// crawl/import (which don't run form extraction) get the same treatment
+	// as captures produced by scan.
+	requests = augmentWithStaticForms(requests)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -696,19 +701,19 @@ type generateSpecOptions struct {
 }
 
 // augmentWithStaticForms appends synthetic ObservedRequests parsed from HTML
-// response bodies (see analyze.ExtractForms) BEFORE auto-detection so
-// static:html observations feed the API-type heuristic. Sites whose only REST
-// signal is a <form action="/api/…"> in an otherwise-static landing page would
-// be misclassified without this pre-step. GenerateCmd skips detection, so it
-// does not need this pre-augmentation.
+// response bodies (see analyze.ExtractForms) so that <form action="/api/…">
+// landing-page signals feed classification, deduplication, and probing.
+// Both ScanCmd (before auto-detection) and GenerateCmd (after loading the
+// capture) call this so the two-stage pipeline is behaviorally equivalent
+// regardless of whether the capture came from scan, crawl, or import.
 func augmentWithStaticForms(requests []crawl.ObservedRequest) []crawl.ObservedRequest {
 	return append(requests, analyze.ExtractForms(requests)...)
 }
 
 // generateSpec runs the classify → probe → generate pipeline. It trusts its
 // caller to have already augmented requests with static-HTML form observations
-// (ScanCmd.Run does this before auto-detection; GenerateCmd works from an
-// existing capture that already contains any static:html entries).
+// (both ScanCmd and GenerateCmd call augmentWithStaticForms before invoking
+// this function).
 func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts generateSpecOptions) ([]byte, error) {
 	classifiers := classifiersForType(opts.APIType)
 	if classifiers == nil {

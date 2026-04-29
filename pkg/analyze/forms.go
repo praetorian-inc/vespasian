@@ -52,8 +52,13 @@ type staticFormField struct {
 	Placeholder string
 	Required    bool
 	Hidden      bool // type=="hidden"
-	CSRF        bool // heuristic match on Name
+	Sensitive   bool // heuristic match on Name (CSRF, session, token, API key, etc.)
 }
+
+// sentinelSelectedOption marks a select field whose <option selected> was
+// observed before its value was resolved. The NUL prefix ensures the marker
+// cannot collide with any real form value parsed from HTML.
+const sentinelSelectedOption = "\x00selected"
 
 // ExtractForms scans each request's HTML response body for <form> elements
 // and returns one synthetic ObservedRequest per form. Non-HTML responses and
@@ -202,7 +207,7 @@ func handlePendingStartTag(tok html.Token, pending *pendingFieldState) {
 	pending.optionText = ""
 	if hasAttr(tok, "selected") && pending.field.Value == "" {
 		// Sentinel marks that a selected option was found; resolved at </option>.
-		pending.field.Value = "\x00selected"
+		pending.field.Value = sentinelSelectedOption
 	}
 }
 
@@ -257,7 +262,7 @@ func commitOption(p *pendingFieldState) {
 	if optVal == "" {
 		optVal = strings.TrimSpace(p.optionText)
 	}
-	if p.field.Value == "\x00selected" {
+	if p.field.Value == sentinelSelectedOption {
 		p.field.Value = optVal
 	}
 	if p.firstOption == nil {
@@ -273,7 +278,7 @@ func commitOption(p *pendingFieldState) {
 // selected option's value if one was found, otherwise falls back to the first
 // option's value.
 func resolveSelectValue(p *pendingFieldState) {
-	if p.field.Value == "\x00selected" {
+	if p.field.Value == sentinelSelectedOption {
 		p.field.Value = ""
 	}
 	if p.field.Value == "" && p.firstOption != nil {
@@ -354,7 +359,7 @@ func handleInputTag(tok html.Token, stack []*staticForm) {
 		Placeholder: getAttr(tok, "placeholder"),
 		Required:    hasAttr(tok, "required"),
 		Hidden:      typ == "hidden",
-		CSRF:        isCSRFName(name),
+		Sensitive:   isSensitiveName(name),
 	})
 }
 
@@ -371,7 +376,7 @@ func handleTextareaTag(tok html.Token, stack []*staticForm, pending **pendingFie
 		Type:        "textarea",
 		Placeholder: getAttr(tok, "placeholder"),
 		Required:    hasAttr(tok, "required"),
-		CSRF:        isCSRFName(name),
+		Sensitive:   isSensitiveName(name),
 	})
 	// Record a pointer to the newly appended field so text tokens can
 	// accumulate into its Value until </textarea>.
@@ -394,7 +399,7 @@ func handleSelectTag(tok html.Token, stack []*staticForm, pending **pendingField
 		Type:        "select",
 		Placeholder: getAttr(tok, "placeholder"),
 		Required:    hasAttr(tok, "required"),
-		CSRF:        isCSRFName(name),
+		Sensitive:   isSensitiveName(name),
 	})
 	// Record a pointer to the newly appended field so option tokens can
 	// be examined until </select>.
@@ -597,14 +602,38 @@ func containsControlByte(s string) bool {
 	return false
 }
 
-// isCSRFName matches common CSRF parameter names (case-insensitive substring):
-// "csrf", "_token", "authenticity_token", "xsrf".
-func isCSRFName(name string) bool {
+// isSensitiveName matches form-field names that commonly carry secrets or
+// anti-CSRF tokens. Matched names have their values blanked by fieldValue so
+// they are never persisted into capture.json or replayed during probing.
+// Matching is a case-insensitive substring check against a known list:
+//
+//   - CSRF / XSRF tokens: "csrf", "xsrf", "_token", "authenticity_token"
+//   - Session and auth tokens: "session" (matches "sessionid" by substring),
+//     "access_token", "refresh_token", "bearer", "jwt", "oauth"
+//   - API keys: "apikey", "api_key", "api-key"
+//   - SAML markers: "samlrequest", "samlresponse", "relaystate"
+//
+// "nonce" and "state" are intentionally excluded from the substring list
+// because they collide with common non-sensitive parameter names (e.g.,
+// `state=California` in address forms).
+func isSensitiveName(name string) bool {
 	n := strings.ToLower(name)
-	return strings.Contains(n, "csrf") ||
-		strings.Contains(n, "xsrf") ||
-		n == "_token" ||
-		strings.Contains(n, "authenticity_token")
+	if n == "_token" {
+		return true
+	}
+	sensitiveSubstrings := []string{
+		"csrf", "xsrf", "authenticity_token",
+		"session", "access_token", "refresh_token",
+		"bearer", "jwt", "oauth",
+		"apikey", "api_key", "api-key",
+		"samlrequest", "samlresponse", "relaystate",
+	}
+	for _, s := range sensitiveSubstrings {
+		if strings.Contains(n, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // isSkippableType reports whether an <input type="..."> carries no
@@ -619,14 +648,15 @@ func isSkippableType(inputType string) bool {
 }
 
 // fieldValue returns value, or placeholder if value is empty, or "".
-// CSRF fields always return "" regardless of Value/Placeholder to prevent
-// one-time tokens from being persisted into capture.json or replayed.
+// Sensitive fields (CSRF tokens, session IDs, API keys, JWTs, OAuth tokens,
+// SAML state — see isSensitiveName) always return "" regardless of
+// Value/Placeholder to prevent secrets from being persisted into capture.json
+// or replayed during probing.
 // Hidden fields also always return "" because hidden inputs commonly bear
-// secrets (CSRF tokens, session IDs, OAuth nonces, SAML state, API keys,
-// JWTs) that must not be persisted or replayed; the field NAME alone is what
+// secrets that must not be persisted or replayed; the field NAME alone is what
 // spec generation needs.
 func fieldValue(f staticFormField) string {
-	if f.CSRF || f.Hidden {
+	if f.Sensitive || f.Hidden {
 		return ""
 	}
 	if f.Value != "" {
