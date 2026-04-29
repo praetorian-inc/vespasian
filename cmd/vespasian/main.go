@@ -609,7 +609,7 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	// WSDL document from <targetURL>?wsdl. SOAP services return HTML for
 	// browser GETs so crawl traffic rarely contains WSDL signals — active
 	// probing is the reliable discovery method.
-	if apiType == apiTypeAuto || apiType == apiTypeWSDL || apiType == apiTypeREST {
+	if shouldProbeWSDL(c.APIType) {
 		wsdlDoc := probeWSDLDocument(c.URL, c.DangerousAllowPrivate, c.Verbose)
 		if wsdlDoc != nil {
 			apiType = apiTypeWSDL
@@ -835,6 +835,15 @@ func probeWSDLDocument(targetURL string, allowPrivate bool, verbose bool) []byte
 	}
 
 	return body
+}
+
+// shouldProbeWSDL reports whether ScanCmd should probe <url>?wsdl based on the
+// operator's explicit --api-type choice. REST is excluded so that an explicit
+// --api-type rest is not silently rewritten to WSDL when the server happens to
+// expose a WSDL document. Mirrors pkg/sdk.resolveAPITypeWithWSDLProbe semantics
+// (probe only when the operator did not pin a non-WSDL type).
+func shouldProbeWSDL(cliAPIType string) bool {
+	return cliAPIType == apiTypeAuto || cliAPIType == apiTypeWSDL
 }
 
 // apiTypeDisplayName returns a human-readable display name for an API type.

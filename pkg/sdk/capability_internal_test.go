@@ -1431,10 +1431,9 @@ func TestResolveAPITypeWithWSDLProbe_NonAutoSkipsProbe(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestBuildWSDLProbeURL pins the exact output of buildWSDLProbeURL for a range
-// of inputs. The expected values were determined empirically by running the
-// implementation: q.Set("wsdl","") followed by q.Encode() produces "wsdl="
-// (with trailing "="), and existing query keys are sorted alphabetically by
-// url.Values.Encode, placing "token" before "wsdl".
+// of inputs. The implementation sets RawQuery to the bare flag "wsdl" (no "=")
+// when the query is empty, or appends "&wsdl" to the existing raw query string
+// verbatim, preserving key order without re-encoding.
 func TestBuildWSDLProbeURL(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -1442,11 +1441,11 @@ func TestBuildWSDLProbeURL(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{"empty query gets wsdl flag", "https://example.com/svc", "https://example.com/svc?wsdl=", false},
-		{"existing query preserved", "https://example.com/svc?token=abc", "https://example.com/svc?token=abc&wsdl=", false},
-		{"existing wsdl key replaced", "https://example.com/svc?wsdl=old", "https://example.com/svc?wsdl=", false},
-		{"path preserved", "https://example.com/a/b/c", "https://example.com/a/b/c?wsdl=", false},
-		{"port preserved", "https://example.com:8443/svc", "https://example.com:8443/svc?wsdl=", false},
+		{"empty query gets wsdl flag", "https://example.com/svc", "https://example.com/svc?wsdl", false},
+		{"existing query preserved", "https://example.com/svc?token=abc", "https://example.com/svc?token=abc&wsdl", false},
+		{"existing wsdl key appended", "https://example.com/svc?wsdl=old", "https://example.com/svc?wsdl=old&wsdl", false},
+		{"path preserved", "https://example.com/a/b/c", "https://example.com/a/b/c?wsdl", false},
+		{"port preserved", "https://example.com:8443/svc", "https://example.com:8443/svc?wsdl", false},
 		{"malformed input rejected", "://bad", "", true},
 	}
 	for _, tc := range cases {

@@ -1631,10 +1631,11 @@ func TestScanPipeline_WSDLDetection(t *testing.T) {
 	}
 }
 
-// TestDetectAPIType_ExplicitOverride verifies that when --api-type is set
-// explicitly (not "auto"), the scan command skips auto-detection and uses
-// the user-provided type directly.
-func TestDetectAPIType_ExplicitOverride(t *testing.T) {
+// TestGenerateSpec_ExplicitRESTOverride_NoWSDLOutput verifies that when
+// generateSpec is called with an explicit REST api-type, it produces REST
+// output even when the traffic is SOAP. This covers the generateSpec path
+// only — not the scan-time WSDL probe gate (see TestShouldProbeWSDL).
+func TestGenerateSpec_ExplicitRESTOverride_NoWSDLOutput(t *testing.T) {
 	// SOAP traffic that would be auto-detected as WSDL
 	soapRequests := []crawl.ObservedRequest{
 		{
@@ -1668,6 +1669,25 @@ func TestDetectAPIType_ExplicitOverride(t *testing.T) {
 	// REST classifier won't match SOAP traffic, so spec should be empty/nil
 	if len(spec) > 0 && strings.Contains(string(spec), "definitions") {
 		t.Error("explicit REST override produced WSDL output")
+	}
+}
+
+func TestShouldProbeWSDL(t *testing.T) {
+	cases := []struct {
+		cli  string
+		want bool
+	}{
+		{apiTypeAuto, true},
+		{apiTypeWSDL, true},
+		{apiTypeREST, false},
+		{apiTypeGraphQL, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.cli, func(t *testing.T) {
+			if got := shouldProbeWSDL(tc.cli); got != tc.want {
+				t.Errorf("shouldProbeWSDL(%q) = %v, want %v", tc.cli, got, tc.want)
+			}
+		})
 	}
 }
 

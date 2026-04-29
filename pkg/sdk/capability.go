@@ -133,7 +133,7 @@ func (c *Capability) Match(_ capability.ExecutionContext, input capmodel.WebAppl
 		return fmt.Errorf("invalid primary_url %q: scheme must be http or https", input.PrimaryURL)
 	}
 
-	if u.Host == "" {
+	if u.Hostname() == "" {
 		return fmt.Errorf("invalid primary_url %q: missing host", input.PrimaryURL)
 	}
 
@@ -381,9 +381,11 @@ func buildWSDLProbeURL(targetURL string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	q := parsedURL.Query()
-	q.Set("wsdl", "")
-	parsedURL.RawQuery = q.Encode()
+	if parsedURL.RawQuery == "" {
+		parsedURL.RawQuery = "wsdl"
+	} else {
+		parsedURL.RawQuery += "&wsdl"
+	}
 	return parsedURL.String(), nil
 }
 
@@ -611,25 +613,41 @@ func headerValueIsSafe(s string) bool {
 }
 
 // parseHeaderString parses a comma-separated list of "Key: Value" header pairs
-// into a map. Entries that do not contain a colon are silently ignored. Entries
-// whose trimmed key or value contain CR, LF, or NUL are also silently dropped
-// to prevent header injection.
+// into a map. Entries that do not contain a colon are treated as a continuation
+// of the previous entry's value (with the comma re-inserted), allowing header
+// values that legitimately contain commas (e.g., "Accept: application/json,
+// text/plain"). Entries whose trimmed key or value contain CR, LF, or NUL are
+// silently dropped to prevent header injection. Fragments that appear before any
+// colon-bearing entry are silently ignored.
 func parseHeaderString(raw string) map[string]string {
+	type entry struct {
+		key string
+		val string
+	}
+	var entries []entry
+	for _, fragment := range strings.Split(raw, ",") {
+		if strings.Contains(fragment, ":") {
+			parts := strings.SplitN(fragment, ":", 2)
+			entries = append(entries, entry{
+				key: parts[0],
+				val: parts[1],
+			})
+		} else if len(entries) > 0 && strings.TrimSpace(fragment) != "" {
+			// Continuation: re-insert the comma and append to the last value.
+			// Whitespace-only fragments (e.g., from ", ,") are silently skipped.
+			entries[len(entries)-1].val += "," + fragment
+		}
+		// Fragments with no colon and no prior entry, or whitespace-only, are silently ignored.
+	}
+
 	headers := make(map[string]string)
-	for _, hdr := range strings.Split(raw, ",") {
-		hdr = strings.TrimSpace(hdr)
-		if hdr == "" {
+	for _, e := range entries {
+		key := strings.TrimSpace(e.key)
+		val := strings.TrimSpace(e.val)
+		if !headerValueIsSafe(key) || !headerValueIsSafe(val) {
 			continue
 		}
-		parts := strings.SplitN(hdr, ":", 2)
-		if len(parts) == 2 {
-			key := strings.TrimSpace(parts[0])
-			val := strings.TrimSpace(parts[1])
-			if !headerValueIsSafe(key) || !headerValueIsSafe(val) {
-				continue
-			}
-			headers[key] = val
-		}
+		headers[key] = val
 	}
 	return headers
 }
