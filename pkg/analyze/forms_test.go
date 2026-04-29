@@ -22,6 +22,16 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
+// parseBody returns the synthesized request's url-encoded body as url.Values.
+func parseBody(t *testing.T, r crawl.ObservedRequest) url.Values {
+	t.Helper()
+	v, err := url.ParseQuery(string(r.Body))
+	if err != nil {
+		t.Fatalf("ParseQuery: %v", err)
+	}
+	return v
+}
+
 // htmlReq is a helper that builds a minimal ObservedRequest with an HTML response body.
 func htmlReq(pageURL, body string) crawl.ObservedRequest {
 	return crawl.ObservedRequest{
@@ -79,17 +89,21 @@ func TestExtractForms_PostFormMixedInputs(t *testing.T) {
 	if r.Headers["content-type"] != "application/x-www-form-urlencoded" {
 		t.Errorf("content-type = %q, want application/x-www-form-urlencoded", r.Headers["content-type"])
 	}
-	bodyStr := string(r.Body)
-	if !strings.Contains(bodyStr, "username=") {
-		t.Errorf("body missing username=; got %q", bodyStr)
+	vals := parseBody(t, r)
+	if v, ok := vals["username"]; !ok || (len(v) > 0 && v[0] != "") {
+		t.Errorf(`vals["username"] = %v, want present with empty value`, v)
 	}
-	if !strings.Contains(bodyStr, "password=") {
-		t.Errorf("body missing password=; got %q", bodyStr)
+	if v, ok := vals["password"]; !ok || (len(v) > 0 && v[0] != "") {
+		t.Errorf(`vals["password"] = %v, want present with empty value`, v)
 	}
-	if !strings.Contains(bodyStr, "remember=") {
-		t.Errorf("body missing remember=; got %q", bodyStr)
+	if v, ok := vals["remember"]; !ok {
+		t.Errorf(`vals["remember"] missing; got %v`, vals)
+	} else if len(v) > 0 && v[0] != "" {
+		// remember is hidden — value MUST be stripped per SEC-BE-005
+		t.Errorf(`vals["remember"] = %v, want present with empty value (hidden value stripped)`, v)
 	}
 	// submit and button should not appear
+	bodyStr := string(r.Body)
 	if strings.Contains(bodyStr, "Login") {
 		t.Errorf("submit value should not appear in body; got %q", bodyStr)
 	}
@@ -139,6 +153,9 @@ func TestExtractForms_MissingActionSelfSubmits(t *testing.T) {
 	}
 }
 
+// TestExtractForms_HiddenFieldFlagged verifies that hidden fields have their
+// names preserved (for parameter discovery) while their values are stripped
+// (SEC-BE-005: hidden fields commonly bear secrets that must not be replayed).
 func TestExtractForms_HiddenFieldFlagged(t *testing.T) {
 	body := `<form method="post" action="/go"><input type="hidden" name="return_to" value="/home"></form>`
 	reqs := []crawl.ObservedRequest{htmlReq("https://host/page", body)}
@@ -146,8 +163,11 @@ func TestExtractForms_HiddenFieldFlagged(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(got))
 	}
-	if !strings.Contains(string(got[0].Body), "return_to=") {
-		t.Errorf("body missing return_to=; got %q", string(got[0].Body))
+	vals := parseBody(t, got[0])
+	if v, ok := vals["return_to"]; !ok {
+		t.Errorf(`vals["return_to"] missing; got %v`, vals)
+	} else if len(v) > 0 && v[0] != "" {
+		t.Errorf(`vals["return_to"] = %q, want empty (hidden value stripped per SEC-BE-005)`, v[0])
 	}
 }
 
@@ -186,6 +206,12 @@ func TestExtractForms_NestedFormsBothEmitted(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("missing /b form; got %v", urls)
+	}
+	// TEST-007: every synthesized request (not just one) must carry SourceStaticHTML.
+	for i, r := range got {
+		if r.Source != SourceStaticHTML {
+			t.Errorf("got[%d].Source = %q, want %q", i, r.Source, SourceStaticHTML)
+		}
 	}
 }
 
@@ -281,15 +307,36 @@ func TestExtractForms_NamelessInputsIgnored(t *testing.T) {
 	}
 }
 
-func TestExtractForms_UppercasedMethodNormalised(t *testing.T) {
-	body := `<form method="post" action="/x"><input name="a"></form>`
-	reqs := []crawl.ObservedRequest{htmlReq("https://host/", body)}
-	got := ExtractForms(reqs)
-	if len(got) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(got))
+func TestExtractForms_MethodNormalised(t *testing.T) {
+	cases := []struct {
+		input    string // value for method attribute; "" means omit the attribute
+		expected string
+	}{
+		{"post", "POST"},
+		{"POST", "POST"},
+		{"Post", "POST"},
+		{" post ", "POST"},
+		{"", "GET"}, // omitted method defaults to GET
+		{"PATCH", "PATCH"},
+		{"delete", "DELETE"},
+		{"PuT", "PUT"},
 	}
-	if got[0].Method != "POST" {
-		t.Errorf("Method = %q, want POST", got[0].Method)
+	for _, tc := range cases {
+		var body string
+		if tc.input == "" {
+			body = `<form action="/x"><input name="a"></form>`
+		} else {
+			body = `<form method="` + tc.input + `" action="/x"><input name="a"></form>`
+		}
+		reqs := []crawl.ObservedRequest{htmlReq("https://host/", body)}
+		got := ExtractForms(reqs)
+		if len(got) != 1 {
+			t.Errorf("input=%q: expected 1 result, got %d", tc.input, len(got))
+			continue
+		}
+		if got[0].Method != tc.expected {
+			t.Errorf("input=%q: Method = %q, want %q", tc.input, got[0].Method, tc.expected)
+		}
 	}
 }
 
@@ -332,10 +379,11 @@ func TestExtractForms_SubmitButtonImageResetFileSkipped(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(got))
 	}
-	bodyStr := string(got[0].Body)
-	if !strings.Contains(bodyStr, "valid=yes") {
-		t.Errorf("body missing valid=yes; got %q", bodyStr)
+	vals := parseBody(t, got[0])
+	if vals.Get("valid") != "yes" {
+		t.Errorf(`vals["valid"] = %q, want "yes"`, vals.Get("valid"))
 	}
+	bodyStr := string(got[0].Body)
 	for _, skipped := range []string{"sub=", "btn=", "img=", "rst=", "fil="} {
 		if strings.Contains(bodyStr, skipped) {
 			t.Errorf("body should not contain %q; got %q", skipped, bodyStr)
@@ -1089,4 +1137,367 @@ func TestExtractForms_DuplicateNamePreservedGET(t *testing.T) {
 	if !set["a"] || !set["b"] {
 		t.Errorf("tags[] = %v, want {a,b}", tags)
 	}
+}
+
+// --- TEST-002: forms inside table elements ---
+
+// TestExtractForms_FormInsideTable verifies that a form nested inside table
+// elements is correctly parsed and synthesized.
+func TestExtractForms_FormInsideTable(t *testing.T) {
+	body := `<table><tr><td><form action="/x"><input name="q"></form></td></tr></table>`
+	reqs := []crawl.ObservedRequest{htmlReq("https://host/", body)}
+	got := ExtractForms(reqs)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(got))
+	}
+	if got[0].URL != "https://host/x?q=" {
+		t.Errorf("URL = %q, want https://host/x?q=", got[0].URL)
+	}
+}
+
+// TestExtractForms_FormSpanningTableRows pins the tokenizer-based behavior
+// for the malformed-HTML case where <form> wraps <tr>/<td> inside a <table>.
+// The Go html tokenizer does NOT apply HTML5 foster-parenting rules, so the
+// form tag may be re-ordered relative to the table structure. This test locks
+// whatever the current tokenizer produces so that a later switch to html.Parse
+// (which applies foster-parenting) would be detected.
+func TestExtractForms_FormSpanningTableRows(t *testing.T) {
+	body := `<table><form action="/x"><tr><td><input name="q"></td></tr></form></table>`
+	reqs := []crawl.ObservedRequest{htmlReq("https://host/", body)}
+	got := ExtractForms(reqs)
+	// The tokenizer-based parser does see the <form> and <input> tokens in
+	// document order and emits one synthetic request. If this ever starts
+	// producing 0 results, a switch to an HTML5-foster-parenting parser
+	// was likely made and this test must be updated.
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result (pin current tokenizer behavior), got %d", len(got))
+	}
+	if !strings.Contains(got[0].URL, "/x") {
+		t.Errorf("URL %q does not reference /x action", got[0].URL)
+	}
+	if !strings.Contains(got[0].URL, "q=") {
+		t.Errorf("URL %q missing q= field", got[0].URL)
+	}
+}
+
+// --- TEST-003: fragment-only action tests ---
+
+// TestExtractForms_FragmentOnlyActionSelfSubmits verifies that fragment-only
+// actions (#section, #) resolve to the page URL (self-submit semantics).
+func TestExtractForms_FragmentOnlyActionSelfSubmits(t *testing.T) {
+	cases := []struct {
+		action string
+	}{
+		{"#section"},
+		{"#"},
+	}
+	for _, tc := range cases {
+		body := `<form action="` + tc.action + `"><input name="q"></form>`
+		reqs := []crawl.ObservedRequest{htmlReq("https://host/page", body)}
+		got := ExtractForms(reqs)
+		if len(got) != 1 {
+			t.Errorf("action=%q: expected 1 result, got %d", tc.action, len(got))
+			continue
+		}
+		if got[0].URL != "https://host/page?q=" {
+			t.Errorf("action=%q: URL = %q, want https://host/page?q=", tc.action, got[0].URL)
+		}
+	}
+}
+
+// TestResolveAction_FragmentOnly verifies that resolveAction resolves a
+// fragment-only ref to the base URL (with fragment stripped).
+func TestResolveAction_FragmentOnly(t *testing.T) {
+	got, _, ok := resolveAction("https://h/p", "#frag")
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	if got != "https://h/p" {
+		t.Errorf("got %q, want https://h/p", got)
+	}
+}
+
+// --- TEST-004: entity-encoded attributes ---
+
+// TestExtractForms_EntityEncodedAttributes verifies that HTML entity-encoded
+// characters in action attributes and field names/values are decoded correctly.
+func TestExtractForms_EntityEncodedAttributes(t *testing.T) {
+	t.Run("ActionQueryAmpersandDecoded", func(t *testing.T) {
+		body := `<form action="/search?a=1&amp;b=2"><input name="q"></form>`
+		reqs := []crawl.ObservedRequest{htmlReq("https://host/", body)}
+		got := ExtractForms(reqs)
+		if len(got) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(got))
+		}
+		u, err := url.Parse(got[0].URL)
+		if err != nil {
+			t.Fatalf("url.Parse: %v", err)
+		}
+		if u.Query().Get("a") != "1" {
+			t.Errorf("query a = %q, want 1", u.Query().Get("a"))
+		}
+		if u.Query().Get("b") != "2" {
+			t.Errorf("query b = %q, want 2", u.Query().Get("b"))
+		}
+		if _, ok := u.Query()["q"]; !ok {
+			t.Errorf("query missing q key; full query: %v", u.Query())
+		}
+		if strings.Contains(got[0].URL, "&amp;") {
+			t.Errorf("URL contains raw &amp; entity; got %q", got[0].URL)
+		}
+	})
+
+	t.Run("FieldNameAndValueEntityDecoded", func(t *testing.T) {
+		body := `<form method="post" action="/x"><input name="user&amp;name" value="O&apos;Brien"></form>`
+		reqs := []crawl.ObservedRequest{htmlReq("https://host/", body)}
+		got := ExtractForms(reqs)
+		if len(got) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(got))
+		}
+		vals, err := url.ParseQuery(string(got[0].Body))
+		if err != nil {
+			t.Fatalf("ParseQuery: %v", err)
+		}
+		// user&name is NOT a hidden field, so its value IS preserved per SEC-BE-005.
+		if vals.Get("user&name") != "O'Brien" {
+			t.Errorf(`vals["user&name"] = %q, want "O'Brien"; all vals: %v`, vals.Get("user&name"), vals)
+		}
+	})
+}
+
+// --- SEC-BE-005 regression tests ---
+
+// TestExtractForms_HiddenSessionIDValueNotReplayed verifies that hidden input
+// values are stripped (SEC-BE-005) for both POST and GET forms.
+func TestExtractForms_HiddenSessionIDValueNotReplayed(t *testing.T) {
+	t.Run("POST", func(t *testing.T) {
+		body := `<form method="post" action="/go"><input type="hidden" name="sessionid" value="SECRET-SESSION-1234"></form>`
+		reqs := []crawl.ObservedRequest{htmlReq("https://host/", body)}
+		got := ExtractForms(reqs)
+		if len(got) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(got))
+		}
+		bodyStr := string(got[0].Body)
+		if !strings.Contains(bodyStr, "sessionid=") {
+			t.Errorf("body missing sessionid= (name must be preserved); got %q", bodyStr)
+		}
+		if strings.Contains(bodyStr, "SECRET-SESSION-1234") {
+			t.Errorf("body contains secret value SECRET-SESSION-1234 (must be stripped per SEC-BE-005); got %q", bodyStr)
+		}
+	})
+
+	t.Run("GET", func(t *testing.T) {
+		body := `<form action="/go"><input type="hidden" name="sessionid" value="SECRET-SESSION-1234"></form>`
+		reqs := []crawl.ObservedRequest{htmlReq("https://host/", body)}
+		got := ExtractForms(reqs)
+		if len(got) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(got))
+		}
+		if !strings.Contains(got[0].URL, "sessionid=") {
+			t.Errorf("URL missing sessionid= (name must be preserved); got %q", got[0].URL)
+		}
+		if strings.Contains(got[0].URL, "SECRET-SESSION-1234") {
+			t.Errorf("URL contains secret value SECRET-SESSION-1234 (must be stripped per SEC-BE-005); got %q", got[0].URL)
+		}
+	})
+}
+
+// TestExtractForms_HiddenFieldVariousSecretNamesStripped verifies that
+// SEC-BE-005 applies to ALL hidden fields regardless of field name — not just
+// names that match the narrower CSRF-name heuristic. This proves that the
+// default-strip-value-from-all-Hidden behavior is in effect.
+func TestExtractForms_HiddenFieldVariousSecretNamesStripped(t *testing.T) {
+	names := []string{
+		"__RequestVerificationToken",
+		"state",
+		"nonce",
+		"code_verifier",
+		"RelayState",
+		"SAMLRequest",
+		"phpsessid",
+		"jsessionid",
+		"api_key",
+		"access_token",
+		"id_token",
+		"bearer",
+		"jwt",
+	}
+	for _, name := range names {
+		secretVal := "SECRET-VAL-FOR-" + name
+		body := `<form method="post" action="/x"><input type="hidden" name="` + name + `" value="` + secretVal + `"></form>`
+		reqs := []crawl.ObservedRequest{htmlReq("https://host/", body)}
+		got := ExtractForms(reqs)
+		if len(got) != 1 {
+			t.Errorf("name=%q: expected 1 result, got %d", name, len(got))
+			continue
+		}
+		bodyStr := string(got[0].Body)
+		if strings.Contains(bodyStr, secretVal) {
+			t.Errorf("name=%q: secret value %q must not appear in body (SEC-BE-005); got %q", name, secretVal, bodyStr)
+		}
+	}
+}
+
+// --- SEC-BE-001 regression test ---
+
+// TestExtractForms_OversizedBodyTruncated verifies that response bodies larger
+// than maxBodyBytes (8 MiB) are truncated before tokenizing, so content past
+// the cap is ignored.
+func TestExtractForms_OversizedBodyTruncated(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping oversized body test in short mode")
+	}
+	// Build an HTML body that exceeds 8 MiB:
+	//   - starts with an early form
+	//   - padded with > 8 MiB of filler comments
+	//   - ends with a late form that must NOT be found
+	earlyForm := `<form action="/early"><input name="x"></form>`
+	lateForm := `<form action="/late"><input name="late"></form>`
+
+	// Each comment is ~40 bytes; we need > maxBodyBytes / 40 iterations.
+	commentUnit := `<!-- padding padding padding padding -->`
+	repeatsNeeded := (maxBodyBytes / len(commentUnit)) + 100
+
+	var b strings.Builder
+	b.WriteString(earlyForm)
+	b.WriteString(strings.Repeat(commentUnit, repeatsNeeded))
+	b.WriteString(lateForm)
+
+	reqs := []crawl.ObservedRequest{htmlReq("https://host/", b.String())}
+	got := ExtractForms(reqs)
+
+	foundEarly := false
+	foundLate := false
+	for _, r := range got {
+		if strings.Contains(r.URL, "/early") {
+			foundEarly = true
+		}
+		if strings.Contains(r.URL, "/late") {
+			foundLate = true
+		}
+	}
+
+	if !foundEarly {
+		t.Errorf("expected /early form to be found (it precedes the truncation point), but it was not; got %d results: %v",
+			len(got), got)
+	}
+	if foundLate {
+		t.Errorf("expected /late form to be absent (it follows the truncation point), but it was found; got %d results: %v",
+			len(got), got)
+	}
+}
+
+// --- SEC-BE-002 regression test ---
+
+// TestExtractForms_FieldNameWithControlBytesDropped verifies that field names
+// containing control bytes (< 0x20 or == 0x7f) are dropped entirely.
+func TestExtractForms_FieldNameWithControlBytesDropped(t *testing.T) {
+	// &#13; is CR (0x0D), a control byte that must be rejected.
+	body := `<form action="/x"><input name="ok"><input name="bad&#13;name"></form>`
+	reqs := []crawl.ObservedRequest{htmlReq("https://host/", body)}
+	got := ExtractForms(reqs)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(got))
+	}
+	if !strings.Contains(got[0].URL, "ok=") {
+		t.Errorf("URL missing ok= (valid field must be present); got %q", got[0].URL)
+	}
+	// Verify no control bytes appear anywhere in the URL.
+	for i := 0; i < len(got[0].URL); i++ {
+		b := got[0].URL[i]
+		if b < 0x20 || b == 0x7f {
+			t.Errorf("URL contains control byte 0x%02x at position %d; got %q", b, i, got[0].URL)
+		}
+	}
+	// QueryParams must not contain a key with control bytes.
+	if got[0].QueryParams != nil {
+		for k := range got[0].QueryParams {
+			for i := 0; i < len(k); i++ {
+				b := k[i]
+				if b < 0x20 || b == 0x7f {
+					t.Errorf("QueryParams key %q contains control byte 0x%02x", k, b)
+				}
+			}
+		}
+	}
+	if _, ok := got[0].QueryParams["ok"]; !ok {
+		t.Errorf("QueryParams missing ok key; got %v", got[0].QueryParams)
+	}
+}
+
+// --- SEC-BE-003 regression test ---
+
+// TestExtractForms_DirtyMethodFallsBackToGET verifies that form method
+// attributes containing control characters or unknown verbs are normalised
+// to GET.
+func TestExtractForms_DirtyMethodFallsBackToGET(t *testing.T) {
+	cases := []struct {
+		input    string // method attribute value; "" means omit
+		expected string
+	}{
+		{"GE&#13;&#10;T", "GET"},
+		{"FROBNICATE", "GET"},
+		{"&#0;POST", "GET"},
+		{"POST", "POST"},
+		{"", "GET"},
+	}
+	for _, tc := range cases {
+		var body string
+		if tc.input == "" {
+			body = `<form action="/x"><input name="q"></form>`
+		} else {
+			body = `<form method="` + tc.input + `" action="/x"><input name="q"></form>`
+		}
+		reqs := []crawl.ObservedRequest{htmlReq("https://host/", body)}
+		got := ExtractForms(reqs)
+		if len(got) != 1 {
+			t.Errorf("input=%q: expected 1 result, got %d", tc.input, len(got))
+			continue
+		}
+		if got[0].Method != tc.expected {
+			t.Errorf("input=%q: Method = %q, want %q", tc.input, got[0].Method, tc.expected)
+		}
+	}
+}
+
+// --- SEC-BE-004 regression test ---
+
+// TestExtractForms_DirtyEnctypeFallsBackToDefault verifies that enctype values
+// containing control characters (potential header-injection payloads) are
+// rejected and fall back to application/x-www-form-urlencoded.
+func TestExtractForms_DirtyEnctypeFallsBackToDefault(t *testing.T) {
+	t.Run("InjectedEnctype", func(t *testing.T) {
+		// &#13;&#10; is CRLF — a potential header-injection payload.
+		body := `<form method="post" enctype="text/plain&#13;&#10;X-Inject: evil" action="/x"><input name="q"></form>`
+		reqs := []crawl.ObservedRequest{htmlReq("https://host/", body)}
+		got := ExtractForms(reqs)
+		if len(got) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(got))
+		}
+		ct := got[0].Headers["content-type"]
+		if ct != "application/x-www-form-urlencoded" {
+			t.Errorf("content-type = %q, want application/x-www-form-urlencoded", ct)
+		}
+		// Verify the header value contains no control bytes.
+		for i := 0; i < len(ct); i++ {
+			b := ct[i]
+			if b < 0x20 || b == 0x7f {
+				t.Errorf("content-type contains control byte 0x%02x at position %d: %q", b, i, ct)
+			}
+		}
+	})
+
+	t.Run("UppercaseMultipartNormalised", func(t *testing.T) {
+		// Uppercase enctype must be lowercased and accepted.
+		body := `<form method="post" enctype="MULTIPART/FORM-DATA" action="/x"><input name="q"></form>`
+		reqs := []crawl.ObservedRequest{htmlReq("https://host/", body)}
+		got := ExtractForms(reqs)
+		if len(got) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(got))
+		}
+		ct := got[0].Headers["content-type"]
+		if ct != "multipart/form-data" {
+			t.Errorf("content-type = %q, want multipart/form-data (lowercased)", ct)
+		}
+	})
 }

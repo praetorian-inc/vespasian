@@ -2278,6 +2278,131 @@ func TestGenerateSpec_ExtractsGETFormParametersIntoOpenAPI(t *testing.T) {
 	}
 }
 
+// --- TEST-001: augmentWithStaticForms unit tests ---
+
+// TestAugmentWithStaticForms tests the augmentWithStaticForms helper introduced
+// in the ScanCmd refactor (TEST-001 source change).
+func TestAugmentWithStaticForms(t *testing.T) {
+	t.Run("AppendsSyntheticAfterOriginal", func(t *testing.T) {
+		htmlBody := `<form action="/x"><input name="q"></form>`
+		requests := []crawl.ObservedRequest{
+			{
+				Method: "GET",
+				URL:    "https://host/page",
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: "text/html",
+					Body:        []byte(htmlBody),
+				},
+			},
+		}
+		out := augmentWithStaticForms(requests)
+		if len(out) != len(requests)+1 {
+			t.Fatalf("len(out) = %d, want %d", len(out), len(requests)+1)
+		}
+		synth := out[len(requests)]
+		if synth.Source != analyze.SourceStaticHTML {
+			t.Errorf("out[%d].Source = %q, want %q", len(requests), synth.Source, analyze.SourceStaticHTML)
+		}
+		if !strings.Contains(synth.URL, "/x") {
+			t.Errorf("out[%d].URL = %q, want URL containing /x", len(requests), synth.URL)
+		}
+	})
+
+	t.Run("EmptyInputReturnsEmpty", func(t *testing.T) {
+		if out := augmentWithStaticForms(nil); len(out) != 0 {
+			t.Errorf("augmentWithStaticForms(nil) len = %d, want 0", len(out))
+		}
+		if out := augmentWithStaticForms([]crawl.ObservedRequest{}); len(out) != 0 {
+			t.Errorf("augmentWithStaticForms([]) len = %d, want 0", len(out))
+		}
+	})
+
+	t.Run("NonHTMLRequestUnchanged", func(t *testing.T) {
+		requests := []crawl.ObservedRequest{
+			{
+				Method: "GET",
+				URL:    "https://host/api/data",
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: "application/json",
+					Body:        []byte(`{"key":"value"}`),
+				},
+			},
+		}
+		out := augmentWithStaticForms(requests)
+		// No HTML body → ExtractForms produces nothing → out == original slice
+		if len(out) != 1 {
+			t.Errorf("len(out) = %d, want 1 (non-HTML request produces no synth)", len(out))
+		}
+	})
+}
+
+// --- QUAL-001: synthetic-only GET form does not create a path in the spec ---
+
+// TestGenerateSpec_SyntheticOnlyGETFormYieldsNoPath verifies that a synthetic
+// GET form request alone (with no co-located live classified request) does NOT
+// produce a /search path in the generated OpenAPI spec at the default confidence
+// threshold. This pins the contract that synthetic static:html GET requests
+// (which score 0 confidence with the current RESTClassifier) need a co-located
+// live request to land in the spec — synthetic-only is not sufficient at the
+// default 0.5 confidence threshold.
+func TestGenerateSpec_SyntheticOnlyGETFormYieldsNoPath(t *testing.T) {
+	htmlBody := `<html><body><form action="/search"><input name="q"></form></body></html>`
+
+	// Only the HTML landing page — no live browser GET /search request.
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://app.example.com/",
+			Source: "browser",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html; charset=utf-8",
+				Body:        []byte(htmlBody),
+			},
+		},
+	}
+	requests = append(requests, analyze.ExtractForms(requests)...)
+
+	// Use the default confidence threshold (0.5). Synthetic static:html GET
+	// form requests score 0 confidence, so they will not pass this gate.
+	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
+		APIType:     "rest",
+		Confidence:  0.5,
+		Probe:       false,
+		Deduplicate: true,
+		Verbose:     false,
+	})
+	if err != nil {
+		t.Fatalf("generateSpec() unexpected error: %v", err)
+	}
+
+	// Spec may be empty or contain paths for high-confidence endpoints — either
+	// way /search must not appear, because no live GET /search request was
+	// captured.
+	if len(spec) == 0 {
+		return // empty spec trivially satisfies the assertion
+	}
+
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("failed to unmarshal generated spec as YAML: %v", err)
+	}
+
+	pathsRaw, ok := parsed["paths"]
+	if !ok {
+		return // no paths section → /search definitely absent
+	}
+	paths, ok := pathsRaw.(map[string]interface{})
+	if !ok {
+		return
+	}
+	if _, found := paths["/search"]; found {
+		t.Errorf("spec contains /search path, but it should not: synthetic-only GET form request is insufficient for path creation at default confidence; paths = %v", paths)
+	}
+}
+
 // QUAL-001 regression guard: pins that ExtractForms must run BEFORE detectAPIType.
 // A static-only HTML landing page whose only API signal is a <form action="/api/…"
 // method="POST"> has no REST signals raw, but classifies as REST after ExtractForms

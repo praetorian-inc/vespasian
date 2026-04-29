@@ -33,7 +33,8 @@ const (
 	maxFormsPerBody    = 1000
 	maxFieldsPerForm   = 500
 	maxAttrValueBytes  = 4096
-	maxFieldValueBytes = 4096 // cap textarea text content and <option> text
+	maxFieldValueBytes = 4096    // cap textarea text content and <option> text
+	maxBodyBytes       = 8 << 20 // 8 MiB cap on HTML response bodies passed to parseForms
 )
 
 // staticForm is the intermediate representation of a parsed <form>.
@@ -56,8 +57,10 @@ type staticFormField struct {
 
 // ExtractForms scans each request's HTML response body for <form> elements
 // and returns one synthetic ObservedRequest per form. Non-HTML responses and
-// responses with empty bodies are skipped. The returned slice can be appended
-// directly to the captured requests slice before classification.
+// responses with empty bodies are skipped. Response bodies larger than
+// maxBodyBytes (8 MiB) are truncated before parsing to bound memory usage.
+// The returned slice can be appended directly to the captured requests slice
+// before classification.
 func ExtractForms(requests []crawl.ObservedRequest) []crawl.ObservedRequest {
 	var out []crawl.ObservedRequest
 	for _, req := range requests {
@@ -67,7 +70,11 @@ func ExtractForms(requests []crawl.ObservedRequest) []crawl.ObservedRequest {
 		if len(req.Response.Body) == 0 {
 			continue
 		}
-		forms := parseForms(req.Response.Body)
+		body := req.Response.Body
+		if len(body) > maxBodyBytes {
+			body = body[:maxBodyBytes]
+		}
+		forms := parseForms(body)
 		for _, f := range forms {
 			synth, ok := synthesizeRequest(f, req.URL)
 			if !ok {
@@ -212,13 +219,13 @@ func handlePendingText(text string, pending *pendingFieldState) {
 	}
 }
 
-// appendCapped returns prefix+suffix truncated to cap bytes. It avoids
-// materializing the combined string when the prefix is already at or above cap.
-func appendCapped(prefix, suffix string, cap int) string {
-	if len(prefix) >= cap {
+// appendCapped returns prefix+suffix truncated to limit bytes. It avoids
+// materializing the combined string when the prefix is already at or above limit.
+func appendCapped(prefix, suffix string, limit int) string {
+	if len(prefix) >= limit {
 		return prefix
 	}
-	remaining := cap - len(prefix)
+	remaining := limit - len(prefix)
 	if len(suffix) > remaining {
 		suffix = suffix[:remaining]
 	}
@@ -266,16 +273,11 @@ func commitOption(p *pendingFieldState) {
 // selected option's value if one was found, otherwise falls back to the first
 // option's value.
 func resolveSelectValue(p *pendingFieldState) {
-	if p.field.Value == "\x00selected" || p.field.Value == "" {
-		if p.field.Value == "\x00selected" {
-			// selected sentinel but no value resolved yet — means the </option>
-			// closed before we committed; shouldn't happen with well-formed HTML
-			// but clear the sentinel just in case.
-			p.field.Value = ""
-		}
-		if p.field.Value == "" && p.firstOption != nil {
-			p.field.Value = *p.firstOption
-		}
+	if p.field.Value == "\x00selected" {
+		p.field.Value = ""
+	}
+	if p.field.Value == "" && p.firstOption != nil {
+		p.field.Value = *p.firstOption
 	}
 }
 
@@ -305,32 +307,50 @@ func handleStartTag(tok html.Token, stack []*staticForm, pending **pendingFieldS
 	return stack
 }
 
-// handleInputTag appends a field to the current form when the <input> is valid
-// (has a name, is within a form, is not cross-associated, and is not a
-// skippable type such as submit/button/image/file/reset).
-func handleInputTag(tok html.Token, stack []*staticForm) {
+// currentFormForField runs the common entry guards every handle*Tag function
+// needs: returns the current (innermost) form pointer along with the field
+// name if the field should be appended. Returns ok=false when the tag should
+// be ignored (no current form, cross-form association via form-attr, missing
+// name, control bytes in name, or per-form field cap reached).
+func currentFormForField(tok html.Token, stack []*staticForm) (*staticForm, string, bool) {
 	if len(stack) == 0 {
-		return
+		return nil, "", false
 	}
 	if _, hasFormAttr := getAttrOK(tok, "form"); hasFormAttr {
-		return
+		return nil, "", false
 	}
 	name := getAttr(tok, "name")
-	if name == "" {
+	if name == "" || containsControlByte(name) {
+		return nil, "", false
+	}
+	f := stack[len(stack)-1]
+	if len(f.Fields) >= maxFieldsPerForm {
+		return nil, "", false
+	}
+	return f, name, true
+}
+
+// handleInputTag appends a field to the current form when the <input> is valid
+// (has a name, is within a form, is not cross-associated, is not a
+// skippable type such as submit/button/image/file/reset, and the name contains
+// no control bytes).
+func handleInputTag(tok html.Token, stack []*staticForm) {
+	f, name, ok := currentFormForField(tok, stack)
+	if !ok {
 		return
 	}
 	typ := strings.ToLower(getAttr(tok, "type"))
 	if isSkippableType(typ) {
 		return
 	}
-	f := stack[len(stack)-1]
-	if len(f.Fields) >= maxFieldsPerForm {
-		return
+	value := getAttr(tok, "value")
+	if typ == "hidden" {
+		value = ""
 	}
 	f.Fields = append(f.Fields, staticFormField{
 		Name:        name,
 		Type:        typ,
-		Value:       getAttr(tok, "value"),
+		Value:       value,
 		Placeholder: getAttr(tok, "placeholder"),
 		Required:    hasAttr(tok, "required"),
 		Hidden:      typ == "hidden",
@@ -342,18 +362,8 @@ func handleInputTag(tok html.Token, stack []*staticForm) {
 // pending so that subsequent text tokens accumulate into its Value until
 // the matching </textarea>.
 func handleTextareaTag(tok html.Token, stack []*staticForm, pending **pendingFieldState) {
-	if len(stack) == 0 {
-		return
-	}
-	if _, hasFormAttr := getAttrOK(tok, "form"); hasFormAttr {
-		return
-	}
-	name := getAttr(tok, "name")
-	if name == "" {
-		return
-	}
-	f := stack[len(stack)-1]
-	if len(f.Fields) >= maxFieldsPerForm {
+	f, name, ok := currentFormForField(tok, stack)
+	if !ok {
 		return
 	}
 	f.Fields = append(f.Fields, staticFormField{
@@ -375,18 +385,8 @@ func handleTextareaTag(tok html.Token, stack []*staticForm, pending **pendingFie
 // handleSelectTag appends a select field to the current form and sets pending
 // so that <option> tokens can be examined until the matching </select>.
 func handleSelectTag(tok html.Token, stack []*staticForm, pending **pendingFieldState) {
-	if len(stack) == 0 {
-		return
-	}
-	if _, hasFormAttr := getAttrOK(tok, "form"); hasFormAttr {
-		return
-	}
-	name := getAttr(tok, "name")
-	if name == "" {
-		return
-	}
-	f := stack[len(stack)-1]
-	if len(f.Fields) >= maxFieldsPerForm {
+	f, name, ok := currentFormForField(tok, stack)
+	if !ok {
 		return
 	}
 	f.Fields = append(f.Fields, staticFormField{
@@ -419,9 +419,15 @@ func synthesizeRequest(f staticForm, baseURL string) (crawl.ObservedRequest, boo
 	if method == "" {
 		method = "GET"
 	}
+	if _, allowed := allowedFormMethods[method]; !allowed {
+		method = "GET"
+	}
 
-	enctype := strings.TrimSpace(f.Enctype)
+	enctype := strings.ToLower(strings.TrimSpace(f.Enctype))
 	if enctype == "" {
+		enctype = "application/x-www-form-urlencoded"
+	}
+	if _, allowed := allowedFormEnctypes[enctype]; !allowed {
 		enctype = "application/x-www-form-urlencoded"
 	}
 
@@ -558,6 +564,39 @@ func validateResolvedURL(baseU, resolved *url.URL) bool {
 	return true
 }
 
+// allowedFormMethods is the set of HTTP method strings accepted by synthesizeRequest.
+// Any form method not in this set is normalised to "GET".
+var allowedFormMethods = map[string]struct{}{
+	"GET":     {},
+	"POST":    {},
+	"PUT":     {},
+	"PATCH":   {},
+	"DELETE":  {},
+	"HEAD":    {},
+	"OPTIONS": {},
+}
+
+// allowedFormEnctypes is the set of MIME types accepted as form enctype values.
+// Any enctype not in this set is normalised to "application/x-www-form-urlencoded".
+var allowedFormEnctypes = map[string]struct{}{
+	"application/x-www-form-urlencoded": {},
+	"multipart/form-data":               {},
+	"text/plain":                        {},
+}
+
+// containsControlByte returns true if s contains any byte below 0x20 (space)
+// or equal to 0x7f (DEL). Used to reject field names that contain CR, LF, NUL,
+// or other control characters that could enable header injection or log forging.
+func containsControlByte(s string) bool {
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b < 0x20 || b == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
 // isCSRFName matches common CSRF parameter names (case-insensitive substring):
 // "csrf", "_token", "authenticity_token", "xsrf".
 func isCSRFName(name string) bool {
@@ -582,8 +621,12 @@ func isSkippableType(inputType string) bool {
 // fieldValue returns value, or placeholder if value is empty, or "".
 // CSRF fields always return "" regardless of Value/Placeholder to prevent
 // one-time tokens from being persisted into capture.json or replayed.
+// Hidden fields also always return "" because hidden inputs commonly bear
+// secrets (CSRF tokens, session IDs, OAuth nonces, SAML state, API keys,
+// JWTs) that must not be persisted or replayed; the field NAME alone is what
+// spec generation needs.
 func fieldValue(f staticFormField) string {
-	if f.CSRF {
+	if f.CSRF || f.Hidden {
 		return ""
 	}
 	if f.Value != "" {

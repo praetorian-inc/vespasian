@@ -597,13 +597,8 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
-	// Augment captured traffic with forms parsed from HTML response bodies
-	// BEFORE auto-detection so static:html observations feed the heuristic —
-	// a site whose only REST signal is a <form action="/api/…"> in an
-	// otherwise-static landing page would otherwise be misclassified.
-	// GenerateCmd skips detection, so it does not need this pre-step; the
-	// call has been removed from generateSpec to avoid double-augmentation.
-	requests = append(requests, analyze.ExtractForms(requests)...)
+	// Augment BEFORE auto-detection (see augmentWithStaticForms doc comment).
+	requests = augmentWithStaticForms(requests)
 
 	apiType := c.APIType
 	if apiType == apiTypeAuto {
@@ -698,6 +693,16 @@ type generateSpecOptions struct {
 	Deduplicate  bool
 	AllowPrivate bool
 	Verbose      bool
+}
+
+// augmentWithStaticForms appends synthetic ObservedRequests parsed from HTML
+// response bodies (see analyze.ExtractForms) BEFORE auto-detection so
+// static:html observations feed the API-type heuristic. Sites whose only REST
+// signal is a <form action="/api/…"> in an otherwise-static landing page would
+// be misclassified without this pre-step. GenerateCmd skips detection, so it
+// does not need this pre-augmentation.
+func augmentWithStaticForms(requests []crawl.ObservedRequest) []crawl.ObservedRequest {
+	return append(requests, analyze.ExtractForms(requests)...)
 }
 
 // generateSpec runs the classify → probe → generate pipeline. It trusts its
