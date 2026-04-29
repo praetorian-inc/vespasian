@@ -869,6 +869,18 @@ func TestParseHeaderString_EmptyValue(t *testing.T) {
 	assert.Equal(t, "ok", result["X-Set"])
 }
 
+// TestParseHeaderString_CommaInValue verifies the comma-continuation fix:
+// a comma inside a header value (after the first colon) must not split the
+// value into a separate header entry. Pre-fix, "Accept: application/json, text/plain"
+// would have been parsed as two fragments — "Accept: application/json" and the
+// orphan "text/plain" — silently dropped as malformed. Post-fix the entire
+// string after the colon is kept as the value.
+func TestParseHeaderString_CommaInValue(t *testing.T) {
+	result := parseHeaderString("Accept: application/json, text/plain")
+	require.Len(t, result, 1)
+	assert.Equal(t, "application/json, text/plain", result["Accept"])
+}
+
 // ---------------------------------------------------------------------------
 // Group B — TEST-003 (medium): decodeWSDLResponse table-driven tests
 // ---------------------------------------------------------------------------

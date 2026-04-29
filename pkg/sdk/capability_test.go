@@ -174,6 +174,9 @@ func TestCapability_Match_InvalidURL(t *testing.T) {
 		{"no scheme no host", "not-a-url"},
 		{"path only", "/api/v1"},
 		{"empty host with scheme", "http://"},
+		// u.Host is ":443" (non-empty) pre-fix, but u.Hostname() returns ""
+		// (strips the port), so the post-fix Hostname() check correctly rejects it.
+		{"port-only host", "http://:443"},
 	}
 
 	for _, tt := range tests {
