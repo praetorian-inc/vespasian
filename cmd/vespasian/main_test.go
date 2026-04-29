@@ -355,7 +355,7 @@ func TestClassifiersForType(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			classifiers := sdk.ClassifiersForType(tt.apiType)
 			if len(classifiers) != tt.wantLen {
-				t.Errorf("classifiersForType(%q) got %d classifiers, want %d", tt.apiType, len(classifiers), tt.wantLen)
+				t.Errorf("ClassifiersForType(%q) got %d classifiers, want %d", tt.apiType, len(classifiers), tt.wantLen)
 			}
 		})
 	}

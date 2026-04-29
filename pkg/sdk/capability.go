@@ -335,6 +335,12 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 		return fmt.Errorf("generate spec: %w", err)
 	}
 
+	// No APIs discovered: emit nothing. An empty spec field would be
+	// indistinguishable from a successful zero-endpoint discovery downstream.
+	if len(spec) == 0 {
+		return nil
+	}
+
 	// Preserve all input fields and overlay only the generated spec field.
 	// The capmodel.WebApplication model has a single spec field (OpenAPI).
 	// For non-REST types (GraphQL SDL, WSDL), the spec is stored in this
@@ -409,7 +415,7 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 		resolvedAPIType = DetectAPIType(requests, confidence)
 	}
 
-	classifiers := classifiersForType(resolvedAPIType)
+	classifiers := ClassifiersForType(resolvedAPIType)
 	if classifiers == nil {
 		return nil, fmt.Errorf("unsupported API type: %q", resolvedAPIType)
 	}
@@ -421,7 +427,7 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 
 	if probeEnabled {
 		cfg := probe.DefaultConfig()
-		strategies := probeStrategiesForType(resolvedAPIType, cfg)
+		strategies := ProbeStrategiesForType(resolvedAPIType, cfg)
 		enriched, probeErrs := probe.RunStrategies(ctx, strategies, classified)
 		if len(enriched) == 0 && len(probeErrs) > 0 {
 			return nil, fmt.Errorf("all probes failed: %v", probeErrs[0])
@@ -470,11 +476,6 @@ func DetectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
 // ClassifiersForType returns the appropriate classifiers for the given API type,
 // or nil if the API type is not recognized.
 func ClassifiersForType(apiType string) []classify.APIClassifier {
-	return classifiersForType(apiType)
-}
-
-// classifiersForType is the internal implementation of ClassifiersForType.
-func classifiersForType(apiType string) []classify.APIClassifier {
 	switch apiType {
 	case "rest":
 		return []classify.APIClassifier{&classify.RESTClassifier{}}
@@ -487,9 +488,9 @@ func classifiersForType(apiType string) []classify.APIClassifier {
 	}
 }
 
-// probeStrategiesForType returns the appropriate probe strategies for the given API type,
+// ProbeStrategiesForType returns the appropriate probe strategies for the given API type,
 // or nil if the API type is not recognized.
-func probeStrategiesForType(apiType string, cfg probe.Config) []probe.ProbeStrategy {
+func ProbeStrategiesForType(apiType string, cfg probe.Config) []probe.ProbeStrategy {
 	switch apiType {
 	case "rest":
 		return []probe.ProbeStrategy{

@@ -725,18 +725,7 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts ge
 				},
 			}
 		}
-		var strategies []probe.ProbeStrategy
-		switch opts.APIType {
-		case apiTypeWSDL:
-			strategies = []probe.ProbeStrategy{probe.NewWSDLProbe(cfg)}
-		case apiTypeGraphQL:
-			strategies = []probe.ProbeStrategy{probe.NewGraphQLProbe(cfg)}
-		default:
-			strategies = []probe.ProbeStrategy{
-				probe.NewOptionsProbe(cfg),
-				probe.NewSchemaProbe(cfg),
-			}
-		}
+		strategies := sdk.ProbeStrategiesForType(opts.APIType, cfg)
 		enriched, probeErrs := probe.RunStrategies(ctx, strategies, classified)
 		if opts.Verbose {
 			for _, e := range probeErrs {
