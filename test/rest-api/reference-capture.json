@@ -126,5 +126,43 @@
       "body": "eyJpZCI6MSwidXNlcl9pZCI6MSwicHJvZHVjdF9pZCI6MiwicXVhbnRpdHkiOjF9"
     },
     "source": "test-crawl"
+  },
+  {
+    "_comment": "LAB-2106: urlencoded form body — pins ParseURLEncodedForm output in golden spec",
+    "method": "POST",
+    "url": "http://localhost:8990/api/login",
+    "headers": {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Accept": "application/json"
+    },
+    "body": "dXNlcm5hbWU9YWxpY2UmcGFzc3dvcmQ9c2VjcmV0",
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "eyJ0b2tlbiI6ImFiYzEyMyJ9"
+    },
+    "source": "test-crawl"
+  },
+  {
+    "_comment": "LAB-2106: multipart form body with file + text field — pins ParseMultipartForm output in golden spec",
+    "method": "POST",
+    "url": "http://localhost:8990/api/upload",
+    "headers": {
+      "Content-Type": "multipart/form-data; boundary=----FormBoundary7MA4YWxkTrZu0gW",
+      "Accept": "application/json"
+    },
+    "body": "LS0tLS0tRm9ybUJvdW5kYXJ5N01BNFlXeGtUclp1MGdXDQpDb250ZW50LURpc3Bvc2l0aW9uOiBmb3JtLWRhdGE7IG5hbWU9ImRlc2NyaXB0aW9uIg0KDQpoZWxsbyB3b3JsZA0KLS0tLS0tRm9ybUJvdW5kYXJ5N01BNFlXeGtUclp1MGdXDQpDb250ZW50LURpc3Bvc2l0aW9uOiBmb3JtLWRhdGE7IG5hbWU9ImZpbGUiOyBmaWxlbmFtZT0idGVzdC50eHQiDQpDb250ZW50LVR5cGU6IHRleHQvcGxhaW4NCg0KZmlsZSBjb250ZW50DQotLS0tLS1Gb3JtQm91bmRhcnk3TUE0WVd4a1RyWnUwZ1ctLQ0K",
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "eyJzdGF0dXMiOiJ1cGxvYWRlZCJ9"
+    },
+    "source": "test-crawl"
   }
 ]

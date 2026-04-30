@@ -16,6 +16,7 @@ package rest
 
 import (
 	"bytes"
+	"fmt"
 	"mime/multipart"
 	"net/textproto"
 	"testing"
@@ -173,6 +174,34 @@ func TestMergeMultipartBodies(t *testing.T) {
 		schema := mergeMultipartBodies([][]byte{buf.Bytes()}, []string{})
 		// With no boundary the observation is skipped; result is nil.
 		assert.Nil(t, schema, "expected nil when no content-type provided")
+	})
+
+	t.Run("partial content-types — second observation skipped", func(t *testing.T) {
+		// Build two valid multipart bodies with different fields.
+		var buf1 bytes.Buffer
+		w1 := multipart.NewWriter(&buf1)
+		require.NoError(t, w1.WriteField("fieldA", "valueA"))
+		_ = w1.Close()
+		ct1 := "multipart/form-data; boundary=" + w1.Boundary()
+
+		var buf2 bytes.Buffer
+		w2 := multipart.NewWriter(&buf2)
+		require.NoError(t, w2.WriteField("fieldB", "valueB"))
+		_ = w2.Close()
+		// Only pass one content-type (for body1); body2 gets no CT entry.
+		schema := mergeMultipartBodies(
+			[][]byte{buf1.Bytes(), buf2.Bytes()},
+			[]string{ct1}, // length-1 — body2 boundary resolves to empty
+		)
+		require.NotNil(t, schema, "expected non-nil schema from first body")
+		require.NotNil(t, schema.Value)
+		require.NotNil(t, schema.Value.Properties)
+
+		// Only fieldA (from body1) should be present; fieldB (body2) is skipped.
+		assert.Contains(t, schema.Value.Properties, "fieldA",
+			"expected property 'fieldA' from body1")
+		assert.NotContains(t, schema.Value.Properties, "fieldB",
+			"expected property 'fieldB' from body2 to be absent (no CT provided)")
 	})
 }
 
@@ -480,6 +509,33 @@ func TestParseMultipartForm_Malformed_MissingClosingBoundary(t *testing.T) {
 		require.NotNil(t, prop.Value)
 		assert.Equal(t, "string", prop.Value.Type.Slice()[0])
 	}
+}
+
+// TestParseMultipartForm_PartCountCapped verifies that ParseMultipartForm
+// stops processing after maxMultipartParts parts, guarding against a hostile
+// multipart body that contains millions of trivial parts (SEC-BE-002).
+// The function must return a non-nil schema (not nil or hang) and must not
+// have processed more than maxMultipartParts parts.
+func TestParseMultipartForm_PartCountCapped(t *testing.T) {
+	// Build a body with maxMultipartParts+1 parts.
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	for i := 0; i <= maxMultipartParts; i++ {
+		err := w.WriteField(fmt.Sprintf("field%d", i), "v")
+		require.NoError(t, err)
+	}
+	_ = w.Close()
+
+	schema := ParseMultipartForm(buf.Bytes(), w.Boundary())
+
+	// Must return a non-nil schema (the first maxMultipartParts parts were processed).
+	require.NotNil(t, schema, "ParseMultipartForm should return a schema, not nil")
+	require.NotNil(t, schema.Value)
+	require.NotNil(t, schema.Value.Properties)
+
+	// Must have processed at most maxMultipartParts properties.
+	assert.LessOrEqual(t, len(schema.Value.Properties), maxMultipartParts,
+		"schema must contain at most maxMultipartParts properties; got %d", len(schema.Value.Properties))
 }
 
 // BenchmarkParseURLEncodedForm and BenchmarkParseMultipartForm establish

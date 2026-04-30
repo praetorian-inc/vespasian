@@ -23,4 +23,11 @@
 //     parameterized templates while preserving known literals (/me, /self).
 //   - Schema inference examines response JSON to generate OpenAPI schema
 //     objects with depth and property guards.
+//   - [ParseURLEncodedForm] and [ParseMultipartForm] parse request bodies for
+//     application/x-www-form-urlencoded and multipart/form-data content types
+//     respectively. File upload fields are represented as type: string,
+//     format: binary. Text fields undergo type inference (integer, number,
+//     boolean, string). Multiple observations for the same endpoint and
+//     content-type are merged in buildOperation via per-content-type grouping,
+//     unioning properties and promoting conflicting types to string.
 package rest

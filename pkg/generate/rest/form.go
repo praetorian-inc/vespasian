@@ -25,6 +25,11 @@ import (
 	"github.com/getkin/kin-openapi/openapi3"
 )
 
+// maxMultipartParts bounds memory under adversarial input where a hostile
+// multipart body might contain millions of trivial parts. Realistic forms
+// have well below this limit.
+const maxMultipartParts = 1000
+
 // getHeader retrieves a header value case-insensitively. The exact-match
 // shortcut at the top is a performance optimization for the common path
 // (browser-lowercased "content-type"); the loop handles other casings such
@@ -72,9 +77,16 @@ func ParseMultipartForm(body []byte, boundary string) *openapi3.SchemaRef {
 	}
 	reader := multipart.NewReader(bytes.NewReader(body), boundary)
 	schema := openapi3.NewObjectSchema()
+	partCount := 0
 	for {
 		part, err := reader.NextPart()
 		if err != nil {
+			break
+		}
+		partCount++
+		if partCount > maxMultipartParts {
+			// Defensive: bound memory under adversarial input where a hostile
+			// multipart body might contain millions of trivial parts.
 			break
 		}
 		name := part.FormName()

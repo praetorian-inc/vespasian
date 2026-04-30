@@ -379,6 +379,20 @@ func TestDeduplicate_SOAPDistinctBodiesSurvive(t *testing.T) {
 	result := Deduplicate(classified)
 	require.Len(t, result, 2,
 		"distinct SOAP envelope bodies on same path+SOAPAction should survive (allows downstream merge to see all observations)")
+
+	// Also assert the actual envelope bytes survive.
+	gotBodies := make([]string, 0, len(result))
+	for _, r := range result {
+		gotBodies = append(gotBodies, string(r.Body))
+	}
+	assert.ElementsMatch(t,
+		[]string{
+			`<env:Envelope xmlns:env="..."><env:Body><GetUser><id>1</id></GetUser></env:Body></env:Envelope>`,
+			`<env:Envelope xmlns:env="..."><env:Body><GetUser><id>2</id></GetUser></env:Body></env:Envelope>`,
+		},
+		gotBodies,
+		"both SOAP envelope bodies (<id>1</id> and <id>2</id>) must survive dedup",
+	)
 }
 
 func TestDeduplicate_SOAPActionCaseInsensitive(t *testing.T) {
@@ -556,6 +570,23 @@ func TestDeduplicate_DistinctBodiesSurvive(t *testing.T) {
 
 	result := Deduplicate(classified)
 	assert.Len(t, result, 5, "5 POST observations with distinct bodies must each survive dedup")
+
+	// Also assert that the SET of body bytes in the result equals the input set.
+	gotBodies := make([]string, 0, len(result))
+	for _, r := range result {
+		gotBodies = append(gotBodies, string(r.Body))
+	}
+	assert.ElementsMatch(t,
+		[]string{
+			"product_id=1&qty=1",
+			"product_id=2&coupon=SAVE10",
+			"product_id=3&gift_wrap=true&note=hello",
+			"product_id=4&address_id=99",
+			"product_id=5&promo=FLASH",
+		},
+		gotBodies,
+		"result bodies should match input bodies exactly",
+	)
 }
 
 // TestDeduplicate_IdenticalBodiesCollapse verifies that POST observations with

@@ -1104,6 +1104,72 @@ func TestOpenAPIGenerator_MultipartFormData_EndToEnd(t *testing.T) {
 	assert.Contains(t, specStr, "binary", "spec missing format: binary for file upload field")
 }
 
+// TestExtractComponents_RequestResponseScopedRefs verifies that when a request
+// body and a 200 response body share IDENTICAL property shapes (echo-style
+// endpoint), the generated $ref values are DIFFERENT — the request gets a
+// name ending in "Request" and the response gets a name ending in "Response".
+// Pre-fix, fingerprintToName was shared between request and response extraction,
+// causing the response to reuse the request's component name (e.g., the response
+// would be tagged "CreateXRequest" instead of "XResponse").
+func TestExtractComponents_RequestResponseScopedRefs(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+
+	// Echo-style endpoint: request and response have identical property shapes.
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "POST",
+				URL:    "https://api.example.com/echo",
+				Headers: map[string]string{
+					"Content-Type": "application/json",
+				},
+				Body: []byte(`{"id": 1, "name": "x"}`),
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: "application/json",
+					Body:        []byte(`{"id": 1, "name": "x"}`),
+				},
+			},
+			IsAPI: true,
+		},
+	}
+
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err, "Generate should succeed")
+
+	loader := openapi3.NewLoader()
+	doc, err := loader.LoadFromData(spec)
+	require.NoError(t, err, "Generated spec should be valid OpenAPI")
+
+	echoPath := doc.Paths.Find("/echo")
+	require.NotNil(t, echoPath, "expected /echo path")
+	require.NotNil(t, echoPath.Post, "expected POST on /echo")
+
+	// Get the request body $ref.
+	reqBody := echoPath.Post.RequestBody
+	require.NotNil(t, reqBody, "expected requestBody")
+	jsonReqMedia := reqBody.Value.Content["application/json"]
+	require.NotNil(t, jsonReqMedia, "expected application/json in requestBody")
+	reqRef := jsonReqMedia.Schema.Ref
+	assert.NotEmpty(t, reqRef, "expected $ref in requestBody schema")
+	assert.True(t, strings.HasSuffix(reqRef, "Request"),
+		"requestBody $ref %q should end with 'Request'", reqRef)
+
+	// Get the 200 response $ref.
+	resp200 := echoPath.Post.Responses.Value("200")
+	require.NotNil(t, resp200, "expected 200 response")
+	jsonRespMedia := resp200.Value.Content["application/json"]
+	require.NotNil(t, jsonRespMedia, "expected application/json in 200 response")
+	respRef := jsonRespMedia.Schema.Ref
+	assert.NotEmpty(t, respRef, "expected $ref in 200 response schema")
+	assert.True(t, strings.HasSuffix(respRef, "Response"),
+		"200 response $ref %q should end with 'Response'", respRef)
+
+	// The two $ref values must be DIFFERENT (pre-fix they were the same).
+	assert.NotEqual(t, reqRef, respRef,
+		"request and response $refs must differ (echo endpoints share property shapes but not component names)")
+}
+
 // TestExtractComponents_DeterministicMultiContentType ensures that when a
 // single endpoint exposes multiple media types with DIFFERENT schemas (e.g.,
 // JSON + urlencoded observations), component names are stable across runs.
@@ -1140,6 +1206,89 @@ func TestExtractComponents_DeterministicMultiContentType(t *testing.T) {
 	}
 	for i := 1; i < 5; i++ {
 		assert.Equal(t, string(runs[0]), string(runs[i]), "run %d differs from run 0", i)
+	}
+}
+
+// TestOpenAPIGenerator_MultipartRepeatedFileFields_E2E verifies that when a
+// multipart body contains two parts with the same name="files" both carrying
+// filenames, the generated spec contains exactly ONE "files" property with
+// format: binary.
+//
+// Current intentional last-wins behavior: the second part overwrites the first
+// in schema.Properties, so only one "files" entry exists. This is documented
+// here so future readers understand the design decision and can change it if
+// array semantics are desired.
+func TestOpenAPIGenerator_MultipartRepeatedFileFields_E2E(t *testing.T) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+
+	// Two file parts with the same name "files".
+	for _, fname := range []string{"a.jpg", "b.png"} {
+		h := make(textproto.MIMEHeader)
+		h.Set("Content-Disposition", `form-data; name="files"; filename="`+fname+`"`)
+		h.Set("Content-Type", "image/jpeg")
+		fw, err := w.CreatePart(h)
+		require.NoError(t, err)
+		_, _ = fw.Write([]byte("filedata"))
+	}
+	_ = w.Close()
+
+	contentType := "multipart/form-data; boundary=" + w.Boundary()
+
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "POST",
+				URL:    "https://api.example.com/upload",
+				Headers: map[string]string{
+					"content-type": contentType,
+				},
+				Body: buf.Bytes(),
+				Response: crawl.ObservedResponse{
+					StatusCode: 200,
+				},
+			},
+			IsAPI: true,
+		},
+	}
+
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err, "Generate should succeed")
+
+	loader := openapi3.NewLoader()
+	doc, err := loader.LoadFromData(spec)
+	require.NoError(t, err, "Generated spec should be valid OpenAPI")
+
+	uploadPath := doc.Paths.Find("/upload")
+	require.NotNil(t, uploadPath, "expected /upload path in spec")
+	require.NotNil(t, uploadPath.Post, "expected POST operation on /upload")
+	require.NotNil(t, uploadPath.Post.RequestBody, "expected requestBody on POST /upload")
+
+	content := uploadPath.Post.RequestBody.Value.Content
+	multipartMedia, ok := content["multipart/form-data"]
+	require.True(t, ok, "expected multipart/form-data content type in requestBody")
+
+	// Resolve $ref if needed
+	schema := multipartMedia.Schema
+	if schema.Ref != "" {
+		// Look up the component
+		refName := strings.TrimPrefix(schema.Ref, "#/components/schemas/")
+		schema = doc.Components.Schemas[refName]
+	}
+	require.NotNil(t, schema, "expected schema for multipart/form-data")
+	require.NotNil(t, schema.Value, "expected schema value")
+	require.NotNil(t, schema.Value.Properties, "expected schema properties")
+
+	// Exactly ONE "files" property (last-wins: second part overwrites first).
+	filesProp, ok := schema.Value.Properties["files"]
+	assert.True(t, ok, "expected exactly one 'files' property in schema")
+	if ok {
+		require.NotNil(t, filesProp.Value)
+		assert.Equal(t, "string", filesProp.Value.Type.Slice()[0],
+			"'files' property should be type string")
+		assert.Equal(t, "binary", filesProp.Value.Format,
+			"'files' property should have format: binary")
 	}
 }
 

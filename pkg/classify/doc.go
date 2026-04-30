@@ -26,5 +26,9 @@
 //
 // [RunClassifiers] applies one or more classifiers to a slice of observed
 // requests, returning only those that exceed the confidence threshold.
-// [Deduplicate] removes duplicate endpoints based on method and normalized URL.
+// [Deduplicate] removes duplicate endpoints based on method, normalized URL,
+// and (for non-empty bodies) Content-Type plus an 8-byte body fingerprint.
+// Bodyless requests still collapse by method and path. Distinct request body
+// shapes on the same endpoint+content-type survive as separate entries so
+// downstream merge logic can union their fields.
 package classify

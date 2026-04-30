@@ -487,6 +487,12 @@ func resourceNameFromPath(path string) string {
 
 // toCamelCase converts a string to CamelCase by splitting on non-alphanumeric
 // characters and capitalizing the first letter of each resulting segment.
+//
+// Note: this function is ASCII-only by design. Non-ASCII letters (e.g., 'é',
+// 'ñ', '日本語') fall through to the separator branch and are dropped from the
+// output. OpenAPI component names are conventionally ASCII; if a path segment
+// is entirely non-ASCII the result will be empty and resourceNameFromPath
+// falls back to "Resource".
 func toCamelCase(s string) string {
 	var b strings.Builder
 	capitalizeNext := true
@@ -559,9 +565,14 @@ func extractComponents(doc *openapi3.T) { //nolint:gocyclo // component extracti
 		doc.Components.Schemas = make(openapi3.Schemas)
 	}
 
-	// Track schemas by fingerprint for deduplication
-	fingerprintToName := make(map[string]string)
-	// Track name collisions
+	// Separate fingerprint→name maps for request and response so an echo-style
+	// endpoint where the request and response bodies share the same property
+	// shape doesn't cause the response to reuse the request's component name
+	// (e.g., a response getting tagged `CreateUserRequest`).
+	fingerprintToReqName := make(map[string]string)
+	fingerprintToRespName := make(map[string]string)
+	// Track name collisions — shared across both maps so we never generate
+	// two components with the same name (e.g., UserResponse collision).
 	nameCounter := make(map[string]int)
 
 	// Helper to ensure unique component name
@@ -649,11 +660,11 @@ func extractComponents(doc *openapi3.T) { //nolint:gocyclo // component extracti
 						fingerprint := schemaFingerprint(schema)
 						if fingerprint != "" {
 							var componentName string
-							if existingName, exists := fingerprintToName[fingerprint]; exists {
-								// Reuse existing component
+							if existingName, exists := fingerprintToReqName[fingerprint]; exists {
+								// Reuse existing request component
 								componentName = existingName
 							} else {
-								// Create new component
+								// Create new request component
 								methodPrefix := ""
 								switch op.method {
 								case "post":
@@ -664,7 +675,7 @@ func extractComponents(doc *openapi3.T) { //nolint:gocyclo // component extracti
 								baseName := methodPrefix + resourceName + "Request"
 								componentName = ensureUniqueName(baseName)
 								doc.Components.Schemas[componentName] = &openapi3.SchemaRef{Value: schema}
-								fingerprintToName[fingerprint] = componentName
+								fingerprintToReqName[fingerprint] = componentName
 							}
 							// Replace inline schema with $ref
 							mediaType.Schema = &openapi3.SchemaRef{
@@ -702,11 +713,11 @@ func extractComponents(doc *openapi3.T) { //nolint:gocyclo // component extracti
 							fingerprint := schemaFingerprint(schema)
 							if fingerprint != "" {
 								var componentName string
-								if existingName, exists := fingerprintToName[fingerprint]; exists {
-									// Reuse existing component
+								if existingName, exists := fingerprintToRespName[fingerprint]; exists {
+									// Reuse existing response component
 									componentName = existingName
 								} else {
-									// Create new component
+									// Create new response component
 									suffix := statusContext(statusCode)
 									if suffix == "" {
 										continue // Skip 204 No Content
@@ -714,7 +725,7 @@ func extractComponents(doc *openapi3.T) { //nolint:gocyclo // component extracti
 									baseName := resourceName + suffix
 									componentName = ensureUniqueName(baseName)
 									doc.Components.Schemas[componentName] = &openapi3.SchemaRef{Value: schema}
-									fingerprintToName[fingerprint] = componentName
+									fingerprintToRespName[fingerprint] = componentName
 								}
 								// Replace inline schema with $ref
 								mediaType.Schema = &openapi3.SchemaRef{
