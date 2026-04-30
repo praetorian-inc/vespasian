@@ -174,7 +174,7 @@ Vespasian classifies and generates specifications for three API types:
 
 | API Type | Classification Signals | Output Format | Probing |
 |----------|----------------------|---------------|---------|
-| **REST** | JSON/XML content-type, `/api/` `/v1/` path patterns, HTTP methods | OpenAPI 3.0 (YAML/JSON) | OPTIONS discovery, JSON schema inference |
+| **REST** | JSON/XML content-type, `/api/` `/v1/` path patterns, HTTP methods | OpenAPI 3.0 (YAML/JSON) | OPTIONS discovery, JSON, urlencoded, and multipart request-body inference |
 | **GraphQL** | `/graphql` path, query structure in POST body, `data`/`errors` response keys | GraphQL SDL | Tiered introspection queries (3 tiers for WAF bypass) |
 | **WSDL/SOAP** | SOAPAction header, SOAP envelope in body, `?wsdl` URL parameter | WSDL XML | Active `?wsdl` document fetching |
 

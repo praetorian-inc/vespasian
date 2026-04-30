@@ -1,6 +1,21 @@
 components:
     schemas:
-        Email-addressResponse:
+        CreateLoginRequest:
+            properties:
+                password:
+                    type: string
+                username:
+                    type: string
+            type: object
+        CreateUploadRequest:
+            properties:
+                description:
+                    type: string
+                file:
+                    format: binary
+                    type: string
+            type: object
+        EmailAddressResponse:
             properties:
                 email:
                     type: string
@@ -8,6 +23,11 @@ components:
         HealthResponse:
             properties:
                 status:
+                    type: string
+            type: object
+        LoginResponse:
+            properties:
+                token:
                     type: string
             type: object
         OrderResponse:
@@ -54,6 +74,21 @@ paths:
                                 $ref: '#/components/schemas/HealthResponse'
                     description: OK
             summary: Get /api/health
+    /api/login:
+        post:
+            requestBody:
+                content:
+                    application/x-www-form-urlencoded:
+                        schema:
+                            $ref: '#/components/schemas/CreateLoginRequest'
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/LoginResponse'
+                    description: OK
+            summary: Post /api/login
     /api/orders:
         get:
             responses:
@@ -126,6 +161,21 @@ paths:
                                 $ref: '#/components/schemas/ProductResponse'
                     description: OK
             summary: Get /api/products/{productId}
+    /api/upload:
+        post:
+            requestBody:
+                content:
+                    multipart/form-data:
+                        schema:
+                            $ref: '#/components/schemas/CreateUploadRequest'
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/HealthResponse'
+                    description: OK
+            summary: Post /api/upload
     /api/users:
         get:
             responses:
@@ -174,7 +224,7 @@ paths:
                     content:
                         application/json:
                             schema:
-                                $ref: '#/components/schemas/Email-addressResponse'
+                                $ref: '#/components/schemas/EmailAddressResponse'
                     description: OK
             summary: Get /api/users/{userId}/email-address
 servers:

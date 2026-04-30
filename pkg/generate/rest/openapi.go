@@ -122,6 +122,25 @@ func groupEndpoints(endpoints []classify.ClassifiedRequest) map[endpointKey][]cl
 	return endpointGroups
 }
 
+// mergeJSONBodies infers and merges JSON schemas from multiple body observations.
+func mergeJSONBodies(bodies [][]byte) *openapi3.SchemaRef {
+	var merged *openapi3.SchemaRef
+	for _, body := range bodies {
+		if len(body) == 0 {
+			continue
+		}
+		schema := InferSchema(body)
+		if schema == nil {
+			continue
+		}
+		// Delegate to mergeObjectSchemas (defined in form.go) so JSON, urlencoded,
+		// and multipart all share the same conflict-resolution semantics: union
+		// of properties; conflicting types promote to string.
+		merged = mergeObjectSchemas(merged, schema)
+	}
+	return merged
+}
+
 // buildOperation builds a single OpenAPI operation from a group of classified requests.
 func buildOperation(key endpointKey, group []classify.ClassifiedRequest) *openapi3.Operation { //nolint:gocyclo // OpenAPI operation builder
 	operation := &openapi3.Operation{
@@ -199,41 +218,57 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest) *openap
 		operation.Parameters = append(operation.Parameters, &openapi3.ParameterRef{Value: param})
 	}
 
-	// --- Request body: merge schemas across all observations ---
+	// --- Request body: partition by content type and merge ---
 	if key.method == "post" || key.method == "put" || key.method == "patch" {
-		var mergedSchema *openapi3.SchemaRef
+		type bodyObs struct {
+			body        []byte
+			contentType string
+		}
+		ctGroups := map[string][]bodyObs{}
+
 		for _, ep := range group {
 			if len(ep.Body) == 0 {
 				continue
 			}
-			schema := InferSchema(ep.Body)
-			if schema == nil {
-				continue
-			}
-			if mergedSchema == nil {
-				mergedSchema = schema
-				continue
-			}
-			// Merge properties from this schema into the merged schema
-			// Only merge if both are objects
-			if mergedSchema.Value != nil && mergedSchema.Value.Properties != nil &&
-				schema.Value != nil && schema.Value.Properties != nil {
-				for propName, propSchema := range schema.Value.Properties {
-					if _, exists := mergedSchema.Value.Properties[propName]; !exists {
-						mergedSchema.Value.Properties[propName] = propSchema
-					}
+			ct := getHeader(ep.Headers, "content-type")
+			baseType := "application/json"
+			if ct != "" {
+				trimmed := strings.ToLower(strings.TrimSpace(strings.SplitN(ct, ";", 2)[0]))
+				if trimmed != "" {
+					baseType = trimmed
 				}
 			}
+			ctGroups[baseType] = append(ctGroups[baseType], bodyObs{body: ep.Body, contentType: ct})
 		}
-		if mergedSchema != nil {
-			operation.RequestBody = &openapi3.RequestBodyRef{
-				Value: &openapi3.RequestBody{
-					Content: openapi3.Content{
-						"application/json": &openapi3.MediaType{
-							Schema: mergedSchema,
-						},
+
+		if len(ctGroups) > 0 {
+			content := openapi3.Content{}
+			for mediaType, obs := range ctGroups {
+				bodies := make([][]byte, len(obs))
+				contentTypes := make([]string, len(obs))
+				for i, o := range obs {
+					bodies[i] = o.body
+					contentTypes[i] = o.contentType
+				}
+				var schema *openapi3.SchemaRef
+				switch mediaType {
+				case "application/x-www-form-urlencoded":
+					schema = mergeURLEncodedBodies(bodies)
+				case "multipart/form-data":
+					schema = mergeMultipartBodies(bodies, contentTypes)
+				default:
+					schema = mergeJSONBodies(bodies)
+				}
+				if schema != nil {
+					content[mediaType] = &openapi3.MediaType{Schema: schema}
+				}
+			}
+			if len(content) > 0 {
+				operation.RequestBody = &openapi3.RequestBodyRef{
+					Value: &openapi3.RequestBody{
+						Content: content,
 					},
-				},
+				}
 			}
 		}
 	}
@@ -420,6 +455,14 @@ func extractPathParams(path string) []string {
 	return params
 }
 
+// commonPathExtensions are file extensions often seen in web app URLs that should
+// not form part of an OpenAPI component name (they're not resource names, they're
+// server-side file types).
+var commonPathExtensions = map[string]bool{
+	".php": true, ".asp": true, ".aspx": true, ".jsp": true, ".mvc": true,
+	".html": true, ".htm": true, ".json": true, ".xml": true, ".action": true, ".do": true,
+}
+
 // resourceNameFromPath extracts and capitalizes the resource name from an API path.
 // It returns the last non-parameterized, non-empty segment as a singular, capitalized word.
 // Examples:
@@ -427,6 +470,8 @@ func extractPathParams(path string) []string {
 //   - "/api/v2/tickets/{ticketId}" → "Ticket"
 //   - "/api/v2/categories/{categoryId}/items/{itemId}" → "Item"
 //   - "/api/v2/users/me/settings" → "Setting"
+//   - "/login.php" → "Login"
+//   - "/stored-xss" → "StoredXss"
 func resourceNameFromPath(path string) string {
 	segments := strings.Split(path, "/")
 	// Walk backwards to find last non-param, non-empty segment
@@ -435,9 +480,60 @@ func resourceNameFromPath(path string) string {
 		if seg == "" || strings.HasPrefix(seg, "{") {
 			continue
 		}
-		return capitalizeFirst(singularize(seg))
+		return sanitizeResourceName(seg)
 	}
 	return "Resource"
+}
+
+// toCamelCase converts a string to CamelCase by splitting on non-alphanumeric
+// characters and capitalizing the first letter of each resulting segment.
+//
+// Note: this function is ASCII-only by design. Non-ASCII letters (e.g., 'é',
+// 'ñ', '日本語') fall through to the separator branch and are dropped from the
+// output. OpenAPI component names are conventionally ASCII; if a path segment
+// is entirely non-ASCII the result will be empty and resourceNameFromPath
+// falls back to "Resource".
+func toCamelCase(s string) string {
+	var b strings.Builder
+	capitalizeNext := true
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+			if capitalizeNext {
+				r = r - 'a' + 'A'
+			}
+			b.WriteRune(r)
+			capitalizeNext = false
+		case (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+			capitalizeNext = false
+		default:
+			capitalizeNext = true
+		}
+	}
+	return b.String()
+}
+
+// sanitizeResourceName turns a path segment into a valid OpenAPI component name
+// fragment: strips common file extensions, splits on non-alphanumerics, capitalizes
+// and joins each part, then singularizes. Falls back to "Resource" if the segment
+// sanitizes to empty.
+func sanitizeResourceName(seg string) string {
+	lower := strings.ToLower(seg)
+	for ext := range commonPathExtensions {
+		if strings.HasSuffix(lower, ext) {
+			seg = seg[:len(seg)-len(ext)]
+			break
+		}
+	}
+	result := toCamelCase(seg)
+	if result == "" {
+		return "Resource"
+	}
+	if result[0] >= '0' && result[0] <= '9' {
+		return "Resource" + result
+	}
+	return singularize(result)
 }
 
 // schemaFingerprint computes a string fingerprint of a schema for deduplication.
@@ -469,9 +565,14 @@ func extractComponents(doc *openapi3.T) { //nolint:gocyclo // component extracti
 		doc.Components.Schemas = make(openapi3.Schemas)
 	}
 
-	// Track schemas by fingerprint for deduplication
-	fingerprintToName := make(map[string]string)
-	// Track name collisions
+	// Separate fingerprint→name maps for request and response so an echo-style
+	// endpoint where the request and response bodies share the same property
+	// shape doesn't cause the response to reuse the request's component name
+	// (e.g., a response getting tagged `CreateUserRequest`).
+	fingerprintToReqName := make(map[string]string)
+	fingerprintToRespName := make(map[string]string)
+	// Track name collisions — shared across both maps so we never generate
+	// two components with the same name (e.g., UserResponse collision).
 	nameCounter := make(map[string]int)
 
 	// Helper to ensure unique component name
@@ -507,8 +608,16 @@ func extractComponents(doc *openapi3.T) { //nolint:gocyclo // component extracti
 		}
 	}
 
-	// Walk all paths and operations
-	for path := range doc.Paths.Map() {
+	// Walk all paths and operations in deterministic order so that when multiple
+	// paths share a schema fingerprint, the component name (chosen on first encounter)
+	// is stable across runs.
+	pathsMap := doc.Paths.Map()
+	sortedPaths := make([]string, 0, len(pathsMap))
+	for p := range pathsMap {
+		sortedPaths = append(sortedPaths, p)
+	}
+	sort.Strings(sortedPaths)
+	for _, path := range sortedPaths {
 		pathItem := doc.Paths.Find(path)
 		if pathItem == nil {
 			continue
@@ -537,16 +646,25 @@ func extractComponents(doc *openapi3.T) { //nolint:gocyclo // component extracti
 			// Extract request body schema
 			if op.operation.RequestBody != nil && op.operation.RequestBody.Value != nil {
 				reqBody := op.operation.RequestBody.Value
-				if mediaType := reqBody.Content["application/json"]; mediaType != nil && mediaType.Schema != nil {
+				ctKeys := make([]string, 0, len(reqBody.Content))
+				for k := range reqBody.Content {
+					ctKeys = append(ctKeys, k)
+				}
+				sort.Strings(ctKeys)
+				for _, ctKey := range ctKeys {
+					mediaType := reqBody.Content[ctKey]
+					if mediaType == nil || mediaType.Schema == nil {
+						continue
+					}
 					if schema := mediaType.Schema.Value; schema != nil && schema.Properties != nil {
 						fingerprint := schemaFingerprint(schema)
 						if fingerprint != "" {
 							var componentName string
-							if existingName, exists := fingerprintToName[fingerprint]; exists {
-								// Reuse existing component
+							if existingName, exists := fingerprintToReqName[fingerprint]; exists {
+								// Reuse existing request component
 								componentName = existingName
 							} else {
-								// Create new component
+								// Create new request component
 								methodPrefix := ""
 								switch op.method {
 								case "post":
@@ -557,7 +675,7 @@ func extractComponents(doc *openapi3.T) { //nolint:gocyclo // component extracti
 								baseName := methodPrefix + resourceName + "Request"
 								componentName = ensureUniqueName(baseName)
 								doc.Components.Schemas[componentName] = &openapi3.SchemaRef{Value: schema}
-								fingerprintToName[fingerprint] = componentName
+								fingerprintToReqName[fingerprint] = componentName
 							}
 							// Replace inline schema with $ref
 							mediaType.Schema = &openapi3.SchemaRef{
@@ -570,22 +688,36 @@ func extractComponents(doc *openapi3.T) { //nolint:gocyclo // component extracti
 
 			// Extract response schemas
 			if op.operation.Responses != nil {
+				sortedStatusCodes := make([]string, 0, op.operation.Responses.Len())
 				for statusCode := range op.operation.Responses.Map() {
+					sortedStatusCodes = append(sortedStatusCodes, statusCode)
+				}
+				sort.Strings(sortedStatusCodes)
+				for _, statusCode := range sortedStatusCodes {
 					respRef := op.operation.Responses.Value(statusCode)
 					if respRef == nil || respRef.Value == nil {
 						continue
 					}
 					response := respRef.Value
-					if mediaType := response.Content["application/json"]; mediaType != nil && mediaType.Schema != nil {
+					respCtKeys := make([]string, 0, len(response.Content))
+					for k := range response.Content {
+						respCtKeys = append(respCtKeys, k)
+					}
+					sort.Strings(respCtKeys)
+					for _, respCtKey := range respCtKeys {
+						mediaType := response.Content[respCtKey]
+						if mediaType == nil || mediaType.Schema == nil {
+							continue
+						}
 						if schema := mediaType.Schema.Value; schema != nil && schema.Properties != nil {
 							fingerprint := schemaFingerprint(schema)
 							if fingerprint != "" {
 								var componentName string
-								if existingName, exists := fingerprintToName[fingerprint]; exists {
-									// Reuse existing component
+								if existingName, exists := fingerprintToRespName[fingerprint]; exists {
+									// Reuse existing response component
 									componentName = existingName
 								} else {
-									// Create new component
+									// Create new response component
 									suffix := statusContext(statusCode)
 									if suffix == "" {
 										continue // Skip 204 No Content
@@ -593,7 +725,7 @@ func extractComponents(doc *openapi3.T) { //nolint:gocyclo // component extracti
 									baseName := resourceName + suffix
 									componentName = ensureUniqueName(baseName)
 									doc.Components.Schemas[componentName] = &openapi3.SchemaRef{Value: schema}
-									fingerprintToName[fingerprint] = componentName
+									fingerprintToRespName[fingerprint] = componentName
 								}
 								// Replace inline schema with $ref
 								mediaType.Schema = &openapi3.SchemaRef{
