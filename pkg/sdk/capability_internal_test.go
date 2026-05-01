@@ -874,6 +874,41 @@ func TestInvoke_AutoResolvesNonWSDLToConcreteSpecFormat(t *testing.T) {
 		"auto + REST traffic + nil WSDL probe must resolve to openapi, never empty")
 }
 
+// TestInvoke_AutoResolvesGraphQLToGraphQLSpecFormat is the GraphQL twin of
+// TestInvoke_AutoResolvesNonWSDLToConcreteSpecFormat. It pins the second
+// reachable arm of the auto-resolution block at capability.go:368-373: when
+// api_type=auto, the WSDL probe returns nil, and the classifier detects
+// GraphQL traffic, the emitted SpecFormat must be model.SpecFormatGraphQL,
+// never empty and never the REST fallback. A regression that hardcoded "rest"
+// in the auto-resolution block would pass the REST twin but corrupt this path
+// silently — this test catches that. Two graphqlRequest() instances are used
+// because graphqlClassifier requires a count above the REST default to win
+// inside DetectAPIType.
+func TestInvoke_AutoResolvesGraphQLToGraphQLSpecFormat(t *testing.T) {
+	cap := &Capability{
+		crawlFn: func(_ context.Context, _ string, _ invokeParams) ([]crawl.ObservedRequest, error) {
+			return []crawl.ObservedRequest{graphqlRequest(), graphqlRequest()}, nil
+		},
+		wsdlProbeFn: func(_ context.Context, _ string) []byte { return nil },
+	}
+
+	input := capmodel.WebApplication{PrimaryURL: "http://example.com"}
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{
+			{Name: "headless", Value: "false"},
+			{Name: "probe", Value: "false"},
+			{Name: "api_type", Value: "auto"},
+		},
+	}
+
+	captured, emitter := captureEmitter(t)
+	err := cap.Invoke(ctx, input, emitter)
+	require.NoError(t, err)
+	assert.NotEmpty(t, captured.Spec)
+	assert.Equal(t, model.SpecFormatGraphQL, captured.SpecFormat,
+		"auto + GraphQL traffic + nil WSDL probe must resolve to graphql, never empty")
+}
+
 // ---------------------------------------------------------------------------
 // Group A — TEST-004 (nit): parseHeaderString edge cases
 // ---------------------------------------------------------------------------
