@@ -25,6 +25,7 @@ import (
 
 	"github.com/praetorian-inc/capability-sdk/pkg/capability"
 	"github.com/praetorian-inc/capability-sdk/pkg/capmodel"
+	"github.com/praetorian-inc/tabularium/pkg/model/model"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
@@ -32,6 +33,39 @@ import (
 	wsdlgen "github.com/praetorian-inc/vespasian/pkg/generate/wsdl"
 	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
+
+// SpecOutput mirrors the post-LAB-2807 capmodel.WebApplication wire shape.
+// It is emitted in place of capmodel.WebApplication until tabularium PR #324
+// merges and the capmodel sync bot regenerates capability-sdk's
+// capmodel.WebApplication to include Spec and SpecFormat fields. At that point,
+// remove this type and emit capmodel.WebApplication directly. The JSON tags here
+// must stay byte-for-byte identical to the post-sync capmodel.WebApplication
+// shape so the wire format does not change when the swap happens.
+type SpecOutput struct {
+	PrimaryURL string   `json:"primary_url"`
+	URLs       []string `json:"urls"`
+	Name       string   `json:"name"`
+	Seed       bool     `json:"seed"`
+	Spec       string   `json:"spec"`
+	SpecFormat string   `json:"spec_format"`
+}
+
+// specFormatForAPIType maps the resolved API type ("rest" / "graphql" / "wsdl")
+// to the corresponding tabularium SpecFormat constant. Returns the empty string
+// for unknown types; in the Invoke path this is unreachable because Invoke
+// pre-resolves "auto" via resolveAPITypeWithWSDLProbe before reaching emit.
+func specFormatForAPIType(apiType string) string {
+	switch apiType {
+	case "rest":
+		return model.SpecFormatOpenAPI
+	case "graphql":
+		return model.SpecFormatGraphQL
+	case "wsdl":
+		return model.SpecFormatWSDL
+	default:
+		return ""
+	}
+}
 
 // validateProbeURLFunc is the SSRF guard used by probeWSDLDocument. Stored as
 // a package var so tests can swap in a permissive validator when exercising
@@ -341,12 +375,18 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 		return nil
 	}
 
-	// Preserve all input fields and overlay only the generated spec field.
-	// The capmodel.WebApplication model has a single spec field (OpenAPI).
-	// For non-REST types (GraphQL SDL, WSDL), the spec is stored in this
-	// field as the model does not have type-specific spec fields.
-	webApp := input
-	webApp.OpenAPI = string(spec)
+	// Preserve all input fields and overlay only the generated spec fields.
+	// SpecOutput carries the post-LAB-2807 wire shape (Spec + SpecFormat) in
+	// place of capmodel.WebApplication until tabularium PR #324 merges and the
+	// capmodel sync bot regenerates capability-sdk with the new fields.
+	webApp := SpecOutput{
+		PrimaryURL: input.PrimaryURL,
+		URLs:       input.URLs,
+		Name:       input.Name,
+		Seed:       input.Seed,
+		Spec:       string(spec),
+		SpecFormat: specFormatForAPIType(resolvedAPIType),
+	}
 	return output.Emit(webApp)
 }
 

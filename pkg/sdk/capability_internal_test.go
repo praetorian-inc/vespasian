@@ -33,6 +33,7 @@ import (
 
 	"github.com/praetorian-inc/capability-sdk/pkg/capability"
 	"github.com/praetorian-inc/capability-sdk/pkg/capmodel"
+	"github.com/praetorian-inc/tabularium/pkg/model/model"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
@@ -987,16 +988,16 @@ func TestDecodeWSDLResponse_BodyReadError(t *testing.T) {
 // Group C — TEST-001: Invoke end-to-end via stubbed pipeline
 // ---------------------------------------------------------------------------
 
-// captureEmitter returns a *capmodel.WebApplication pointer that is populated
+// captureEmitter returns a *SpecOutput pointer that is populated
 // when the returned Emitter is called, and an Emitter that enforces that it
-// receives exactly one WebApplication model.
-func captureEmitter(t *testing.T) (*capmodel.WebApplication, capability.Emitter) {
+// receives exactly one SpecOutput model.
+func captureEmitter(t *testing.T) (*SpecOutput, capability.Emitter) {
 	t.Helper()
-	var captured capmodel.WebApplication
+	var captured SpecOutput
 	emit := capability.EmitterFunc(func(models ...any) error {
 		require.Len(t, models, 1, "Emit should be called with exactly one model")
-		w, ok := models[0].(capmodel.WebApplication)
-		require.True(t, ok, "emitted model must be capmodel.WebApplication, got %T", models[0])
+		w, ok := models[0].(SpecOutput)
+		require.True(t, ok, "emitted model must be SpecOutput, got %T", models[0])
 		captured = w
 		return nil
 	})
@@ -1005,7 +1006,7 @@ func captureEmitter(t *testing.T) (*capmodel.WebApplication, capability.Emitter)
 
 // TestInvoke_EmitsWebApplicationPreservingInputFields is the regression guard
 // for prior-MED-3: Invoke must preserve all input WebApplication fields and
-// overlay only OpenAPI. The stubbed crawlFn returns a single REST-like request
+// overlay only Spec + SpecFormat. The stubbed crawlFn returns a single REST-like request
 // so the pipeline produces a non-empty OpenAPI spec.
 func TestInvoke_EmitsWebApplicationPreservingInputFields(t *testing.T) {
 	input := capmodel.WebApplication{
@@ -1048,9 +1049,10 @@ func TestInvoke_EmitsWebApplicationPreservingInputFields(t *testing.T) {
 	assert.Equal(t, input.URLs, captured.URLs)
 	assert.Equal(t, input.Name, captured.Name)
 	assert.Equal(t, input.Seed, captured.Seed)
-	assert.NotEmpty(t, captured.OpenAPI)
-	assert.True(t, strings.Contains(captured.OpenAPI, "openapi"),
-		"expected OpenAPI 3.0 marker in generated spec, got: %s", captured.OpenAPI)
+	assert.NotEmpty(t, captured.Spec)
+	assert.True(t, strings.Contains(captured.Spec, "openapi"),
+		"expected OpenAPI 3.0 marker in generated spec, got: %s", captured.Spec)
+	assert.Equal(t, model.SpecFormatOpenAPI, captured.SpecFormat)
 }
 
 // TestInvoke_WSDLProbeSynthesizesRequest exercises the WSDL probe branch in
@@ -1079,11 +1081,12 @@ func TestInvoke_WSDLProbeSynthesizesRequest(t *testing.T) {
 	captured, emitter := captureEmitter(t)
 	err := cap.Invoke(ctx, input, emitter)
 	require.NoError(t, err)
-	assert.NotEmpty(t, captured.OpenAPI)
+	assert.NotEmpty(t, captured.Spec)
 	assert.True(t,
-		strings.Contains(strings.ToLower(captured.OpenAPI), "wsdl") ||
-			strings.Contains(captured.OpenAPI, "<definitions"),
-		"expected WSDL content in generated spec, got: %s", captured.OpenAPI)
+		strings.Contains(strings.ToLower(captured.Spec), "wsdl") ||
+			strings.Contains(captured.Spec, "<definitions"),
+		"expected WSDL content in generated spec, got: %s", captured.Spec)
+	assert.Equal(t, model.SpecFormatWSDL, captured.SpecFormat)
 }
 
 // TestInvoke_CrawlErrorPropagates verifies that a crawl error is wrapped and
@@ -1210,12 +1213,13 @@ func TestInvoke_RESTAPITypeSkipsWSDLProbe(t *testing.T) {
 	captured, emitter := captureEmitter(t)
 	err := cap.Invoke(ctx, input, emitter)
 	require.NoError(t, err)
-	assert.NotEmpty(t, captured.OpenAPI)
+	assert.NotEmpty(t, captured.Spec)
 	assert.False(t, wsdlProbeCalled, "wsdlProbeFn must not be called when api_type=rest")
-	assert.True(t, strings.Contains(captured.OpenAPI, "openapi"),
-		"expected OpenAPI spec when api_type=rest, got: %s", captured.OpenAPI)
-	assert.False(t, strings.Contains(captured.OpenAPI, "<definitions"),
-		"expected no WSDL content when api_type=rest, got: %s", captured.OpenAPI)
+	assert.True(t, strings.Contains(captured.Spec, "openapi"),
+		"expected OpenAPI spec when api_type=rest, got: %s", captured.Spec)
+	assert.False(t, strings.Contains(captured.Spec, "<definitions"),
+		"expected no WSDL content when api_type=rest, got: %s", captured.Spec)
+	assert.Equal(t, model.SpecFormatOpenAPI, captured.SpecFormat)
 }
 
 // ---------------------------------------------------------------------------
@@ -1253,9 +1257,10 @@ func TestInvoke_GraphQLAPITypeSkipsWSDLProbe(t *testing.T) {
 	captured, emitter := captureEmitter(t)
 	err := cap.Invoke(ctx, input, emitter)
 	require.NoError(t, err)
-	assert.NotEmpty(t, captured.OpenAPI)
-	assert.Contains(t, captured.OpenAPI, "# Inferred from observed traffic",
-		"expected GraphQL SDL inferred-from-traffic marker in spec, got: %s", captured.OpenAPI)
+	assert.NotEmpty(t, captured.Spec)
+	assert.Contains(t, captured.Spec, "# Inferred from observed traffic",
+		"expected GraphQL SDL inferred-from-traffic marker in spec, got: %s", captured.Spec)
+	assert.Equal(t, model.SpecFormatGraphQL, captured.SpecFormat)
 	assert.False(t, wsdlProbeCalled, "wsdlProbeFn must not be called when api_type=graphql")
 }
 

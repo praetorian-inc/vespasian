@@ -18,6 +18,17 @@ require (
 )
 
 require (
+	github.com/aws/aws-sdk-go-v2 v1.41.1 // indirect
+	github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue v1.20.10 // indirect
+	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.50.2 // indirect
+	github.com/aws/aws-sdk-go-v2/service/dynamodbstreams v1.30.3 // indirect
+	github.com/aws/smithy-go v1.24.0 // indirect
+	github.com/go-openapi/swag/jsonname v0.25.1 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/knqyf263/go-cpe v0.0.0-20230627041855-cb0794d06872 // indirect
+)
+
+require (
 	github.com/Knetic/govaluate v3.0.0+incompatible // indirect
 	github.com/Mzack9999/gcache v0.0.0-20230410081825-519e28eab057 // indirect
 	github.com/Mzack9999/go-http-digest-auth-client v0.6.1-0.20220414142836-eb8883508809 // indirect
@@ -41,8 +52,7 @@ require (
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/dsnet/compress v0.0.2-0.20230904184137-39efe44ab707 // indirect
 	github.com/gaissmai/bart v0.26.0 // indirect
-	github.com/go-openapi/jsonpointer v0.21.0 // indirect
-	github.com/go-openapi/swag v0.23.0 // indirect
+	github.com/go-openapi/jsonpointer v0.22.1 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
 	github.com/gorilla/css v1.0.1 // indirect
@@ -61,7 +71,7 @@ require (
 	github.com/logrusorgru/aurora v2.0.3+incompatible // indirect
 	github.com/logrusorgru/aurora/v4 v4.0.0 // indirect
 	github.com/lukasbob/srcset v0.0.0-20190730101422-86b742e617f3 // indirect
-	github.com/mailru/easyjson v0.7.7 // indirect
+	github.com/mailru/easyjson v0.9.1 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mholt/archives v0.1.5 // indirect
 	github.com/microcosm-cc/bluemonday v1.0.27 // indirect
@@ -79,6 +89,7 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.23 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
+	github.com/praetorian-inc/tabularium v1.0.307-pre-1-hunterverhelst-lab-2807-tabularium-rename-webapplicationopenapi-spec-add-specformat
 	github.com/projectdiscovery/blackrock v0.0.1 // indirect
 	github.com/projectdiscovery/dsl v0.8.5 // indirect
 	github.com/projectdiscovery/fastdialer v0.5.2 // indirect
@@ -137,3 +148,9 @@ require (
 	golang.org/x/tools v0.41.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
+
+// TEMP: pin to tabularium PR #324 HEAD until LAB-2807 merges and the
+// capmodel sync bot regenerates capability-sdk's capmodel.WebApplication
+// with Spec / SpecFormat fields. Remove this replace and bump the require
+// to a stable tabularium release after merge + sync.
+replace github.com/praetorian-inc/tabularium => github.com/praetorian-inc/tabularium v1.0.307-pre-1-hunterverhelst-lab-2807-tabularium-rename-webapplicationopenapi-spec-add-specformat
