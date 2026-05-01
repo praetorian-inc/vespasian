@@ -53,7 +53,8 @@ type SpecOutput struct {
 // specFormatForAPIType maps the resolved API type ("rest" / "graphql" / "wsdl")
 // to the corresponding tabularium SpecFormat constant. Returns the empty string
 // for unknown types; in the Invoke path this is unreachable because Invoke
-// pre-resolves "auto" via resolveAPITypeWithWSDLProbe before reaching emit.
+// pre-resolves "auto" via resolveAPITypeWithWSDLProbe + DetectAPIType before
+// reaching emit.
 func specFormatForAPIType(apiType string) string {
 	switch apiType {
 	case "rest":
@@ -362,6 +363,13 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 	resolvedAPIType, syntheticReq := resolveAPITypeWithWSDLProbe(genCtx, p.apiType, input.PrimaryURL, wsdlProbeFn)
 	if syntheticReq != nil {
 		requests = append(requests, *syntheticReq)
+	}
+
+	// resolveAPITypeWithWSDLProbe only promotes auto→wsdl when the probe matches.
+	// Promote the remaining auto→{rest,graphql,wsdl} via classifier-based detection
+	// here so SpecFormat below is always concrete (never empty) for a successful emit.
+	if resolvedAPIType == "auto" {
+		resolvedAPIType = DetectAPIType(requests, p.confidence)
 	}
 
 	spec, err := ClassifyProbeGenerate(genCtx, requests, resolvedAPIType, p.confidence, p.deduplicate, p.enableProbe)

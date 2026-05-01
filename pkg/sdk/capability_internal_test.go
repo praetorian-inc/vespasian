@@ -843,6 +843,37 @@ func TestIsAcceptableWSDLContentType(t *testing.T) {
 	}
 }
 
+// TestInvoke_AutoResolvesNonWSDLToConcreteSpecFormat is the regression guard
+// for the auto-resolution gap: when api_type=auto and the WSDL probe returns
+// nil, Invoke must still emit a concrete SpecFormat (matching the actual
+// classifier-detected type), never the empty string. Before the fix at
+// capability.go:368-373, this path emitted SpecFormat="" because
+// resolveAPITypeWithWSDLProbe only resolves auto→wsdl, not auto→rest/graphql.
+func TestInvoke_AutoResolvesNonWSDLToConcreteSpecFormat(t *testing.T) {
+	cap := &Capability{
+		crawlFn: func(_ context.Context, _ string, _ invokeParams) ([]crawl.ObservedRequest, error) {
+			return []crawl.ObservedRequest{restRequest()}, nil
+		},
+		wsdlProbeFn: func(_ context.Context, _ string) []byte { return nil },
+	}
+
+	input := capmodel.WebApplication{PrimaryURL: "http://example.com"}
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{
+			{Name: "headless", Value: "false"},
+			{Name: "probe", Value: "false"},
+			{Name: "api_type", Value: "auto"},
+		},
+	}
+
+	captured, emitter := captureEmitter(t)
+	err := cap.Invoke(ctx, input, emitter)
+	require.NoError(t, err)
+	assert.NotEmpty(t, captured.Spec)
+	assert.Equal(t, model.SpecFormatOpenAPI, captured.SpecFormat,
+		"auto + REST traffic + nil WSDL probe must resolve to openapi, never empty")
+}
+
 // ---------------------------------------------------------------------------
 // Group A — TEST-004 (nit): parseHeaderString edge cases
 // ---------------------------------------------------------------------------
@@ -1163,7 +1194,8 @@ func TestInvoke_GenPhaseUsesFreshContext(t *testing.T) {
 	captured, emitter := captureEmitter(t)
 	err := cap.Invoke(ctx, input, emitter)
 	require.NoError(t, err)
-	_ = captured
+	assert.Equal(t, model.SpecFormatOpenAPI, captured.SpecFormat,
+		"auto + REST traffic + nil WSDL probe must resolve SpecFormat to openapi")
 
 	require.NotNil(t, crawlCtx, "crawlCtx must be captured by crawlFn")
 	require.NotNil(t, genCtx, "genCtx must be captured by wsdlProbeFn")
