@@ -24,8 +24,16 @@
 //
 // Key entry points:
 //   - [ValidateURL] checks a URL up-front and returns a descriptive error
-//     when it should not be probed.
+//     when it should not be probed. DNS lookups are bounded by an internal
+//     timeout.
+//   - [ValidateURLContext] is the same check but uses the caller's context
+//     for DNS lookup, allowing a single loop-level deadline to bound the
+//     entire validation phase.
 //   - [SafeDialContext] is a net.Dialer-compatible DialContext that runs the
 //     blocklist check at connect time so transports get protection without
-//     additional plumbing.
+//     additional plumbing. It iterates over resolved IPs and returns the
+//     first successful connection (no IP-list "happy eyeballs" reordering,
+//     just sequential fallback).
+//   - [IsPrivateIP] is a fail-closed predicate (nil/zero-length IP is treated
+//     as private) so callers can compose it without nil-checks.
 package ssrf

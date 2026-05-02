@@ -25,13 +25,8 @@ import (
 // schemes and URLs that resolve to private/internal IP addresses (SSRF protection).
 //
 // Equivalent to [ssrf.ValidateURL]; kept as a thin wrapper so existing callers
-// of pkg/probe continue to work.
+// of pkg/probe continue to work. New code should call ssrf.ValidateURL directly.
 func ValidateProbeURL(rawURL string) error {
-	return ssrf.ValidateURL(rawURL)
-}
-
-// validateProbeURL is the internal implementation of ValidateProbeURL.
-func validateProbeURL(rawURL string) error {
 	return ssrf.ValidateURL(rawURL)
 }
 
@@ -40,12 +35,8 @@ func validateProbeURL(rawURL string) error {
 // DNS rebinding attacks.
 //
 // Equivalent to [ssrf.SafeDialContext]; kept as a thin wrapper so existing
-// callers of pkg/probe continue to work.
+// callers of pkg/probe continue to work. New code should call
+// ssrf.SafeDialContext directly.
 func SSRFSafeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	return ssrf.SafeDialContext(ctx, network, addr)
-}
-
-// ssrfSafeDialContext is the internal implementation of SSRFSafeDialContext.
-func ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	return ssrf.SafeDialContext(ctx, network, addr)
 }

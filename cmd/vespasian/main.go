@@ -476,7 +476,7 @@ type GenerateCmd struct {
 	Confidence            float64 `default:"0.5" help:"Minimum confidence threshold"`
 	Probe                 bool    `default:"true" help:"Enable endpoint probing"`
 	Deduplicate           bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
-	DangerousAllowPrivate bool    `help:"Disable SSRF protection for probes, allowing private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
+	DangerousAllowPrivate bool    `help:"Disable SSRF protection for crawling and probes, allowing private/localhost targets. Required when the seed URL is a private host. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 	Verbose               bool    `short:"v" help:"Enable verbose logging"`
 }
 
@@ -549,7 +549,7 @@ type ScanCmd struct {
 	Confidence            float64 `default:"0.5" help:"Minimum confidence threshold"`
 	Probe                 bool    `default:"true" help:"Enable endpoint probing"`
 	Deduplicate           bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
-	DangerousAllowPrivate bool    `help:"Disable SSRF protection for probes, allowing private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
+	DangerousAllowPrivate bool    `help:"Disable SSRF protection for crawling and probes, allowing private/localhost targets. Required when the seed URL is a private host. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 
 	CrawlOptions
 }

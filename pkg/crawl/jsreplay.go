@@ -66,7 +66,12 @@ type JSReplayConfig struct {
 	// AllowCrossOrigin allows probing and JS-fetching of URLs whose origin
 	// does not match the scan target. Default false: cross-origin URLs are
 	// skipped to avoid using Vespasian as a request reflector and to avoid
-	// leaking auth headers.
+	// leaking auth headers. Even when AllowCrossOrigin is true, user-supplied
+	// Headers are NEVER forwarded to off-origin destinations — the same-origin
+	// gate on Headers is independent of AllowCrossOrigin and only relaxed by
+	// using a different scan target. Enabling this exposes the operator's IP
+	// to attacker-chosen hosts (subject to SSRF and MaxEndpoints) and is
+	// appropriate only for trusted-tenant or multi-host scans.
 	AllowCrossOrigin bool
 
 	// Timeout is the per-request timeout. Defaults to 10 seconds.
@@ -122,27 +127,51 @@ func (cfg JSReplayConfig) withDefaults() JSReplayConfig {
 		}
 	}
 	if cfg.Client == nil {
-		var transport *http.Transport
-		if t, ok := http.DefaultTransport.(*http.Transport); ok {
-			transport = t.Clone()
-		} else {
-			transport = &http.Transport{}
+		cfg.Client = newSSRFSafeClient(cfg.Timeout, cfg.AllowPrivate)
+	} else if !cfg.AllowPrivate {
+		// Caller supplied their own client. Try to install ssrf.SafeDialContext
+		// on its transport so we don't silently lose the dial-time SSRF check
+		// (a TOCTOU window for DNS rebinding between ValidateURL and the
+		// actual TCP connect). If the transport is not an *http.Transport we
+		// cannot wrap it; fall back to enforcing the pre-dial validation only.
+		if t, ok := cfg.Client.Transport.(*http.Transport); ok {
+			t.DialContext = ssrf.SafeDialContext
+		} else if cfg.Client.Transport == nil {
+			cfg.Client.Transport = &http.Transport{DialContext: ssrf.SafeDialContext}
 		}
-		if !cfg.AllowPrivate {
-			transport.DialContext = ssrf.SafeDialContext
-		}
-		cfg.Client = &http.Client{
-			Timeout:   cfg.Timeout,
-			Transport: transport,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
+		// If Timeout is unset on a caller-supplied client, set it so a
+		// slow-loris response body cannot stall the replay loop indefinitely.
+		if cfg.Client.Timeout == 0 {
+			cfg.Client.Timeout = cfg.Timeout
 		}
 	}
 	if cfg.Stderr == nil {
 		cfg.Stderr = io.Discard
 	}
 	return cfg
+}
+
+// newSSRFSafeClient builds the default *http.Client used by ReplayJSExtracted.
+// It clones DefaultTransport, optionally swaps DialContext for ssrf.SafeDialContext,
+// installs a per-request timeout, and refuses to follow redirects so probe
+// results record the actual response from the URL we asked for.
+func newSSRFSafeClient(timeout time.Duration, allowPrivate bool) *http.Client {
+	var transport *http.Transport
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = t.Clone()
+	} else {
+		transport = &http.Transport{}
+	}
+	if !allowPrivate {
+		transport.DialContext = ssrf.SafeDialContext
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
 // maxReplayBodySize limits response body reads during probing (1 MB).
@@ -280,6 +309,12 @@ var servicePrefixPattern = regexp.MustCompile(
 )
 
 // apiIndicators are the path segments that signal an API endpoint.
+//
+// MAINTENANCE: this list is duplicated by hand inside apiPathPattern,
+// templateLiteralPattern, and fullURLPattern above (the regex alternation
+// `api/|v[1-9][0-9]*/|rest/|rpc/|graphql`). When adding a new indicator,
+// update both this slice AND the three regex literals — they are required
+// to stay in sync.
 var apiIndicators = []string{"api/", "v1/", "v2/", "v3/", "v4/", "rest/", "rpc/", "graphql"}
 
 // staticFileExts are file extensions to skip when extracting API paths.
@@ -395,9 +430,12 @@ func copyHeaders(h map[string]string) map[string]string {
 	return out
 }
 
-// validateFullURL parses a full URL extracted from JS and rejects URLs with
-// embedded credentials, non-http(s) schemes, or empty hosts. Returns the
-// canonicalized URL on success.
+// validateFullURL is a parse-time canonicalization that rejects URLs with
+// embedded credentials, non-http(s) schemes, or empty hosts. It returns the
+// canonicalized URL on success. SSRF screening (blocklist + DNS) is layered
+// separately at probe time via ssrf.ValidateURL — callers MUST run that
+// before issuing any request, since validateFullURL alone does not reject
+// URLs whose Host is a private IP literal.
 func validateFullURL(raw string) (string, bool) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -854,20 +892,24 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		// Same-origin gate: by default, drop URLs whose origin doesn't
 		// match the scan target. This prevents the JS bundle from using
 		// Vespasian as a request reflector and stops auth-header leaks
-		// to attacker-controlled hosts.
+		// to attacker-controlled hosts. Skipped URLs do NOT consume the
+		// MaxEndpoints budget — otherwise an attacker could salt the
+		// bundle with cross-origin URLs to suppress legitimate API
+		// discovery.
 		if !cfg.AllowCrossOrigin && !isSameOrigin(fullURL, targetOrigin) {
 			warnf("js-extract: skipping cross-origin URL %s (use AllowCrossOrigin to allow)\n",
 				sanitizeForLog(fullURL))
-			probed++
 			continue
 		}
 
 		// SSRF validation: refuse private/loopback/link-local destinations
 		// unless the operator has explicitly opted in via AllowPrivate.
+		// Use the loop context so a JS bundle full of slow/black-holed
+		// hostnames cannot stall the validation phase past MaxTotalTime.
+		// Skipped URLs do NOT consume the MaxEndpoints budget.
 		if !cfg.AllowPrivate {
-			if err := ssrf.ValidateURL(fullURL); err != nil {
+			if err := ssrf.ValidateURLContext(loopCtx, fullURL); err != nil {
 				warnf("js-extract: skipping %s: %v\n", sanitizeForLog(fullURL), err)
-				probed++
 				continue
 			}
 		}
@@ -916,9 +958,14 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 
 // --- HTTP helpers ---
 
+// jsReplayUserAgent identifies probe requests as coming from Vespasian's
+// JS-replay step so cross-origin destinations can attribute the traffic.
+const jsReplayUserAgent = "vespasian-js-extract/1.0"
+
 // doRequest builds and executes an HTTP GET against rawURL using cfg.Client.
 // Headers from cfg.Headers are attached only when rawURL is same-origin with
-// targetOrigin (or AllowCrossOrigin is true). The caller must ensure the
+// targetOrigin (header forwarding is independent of AllowCrossOrigin so auth
+// headers never leave the target's origin). The caller must ensure the
 // response body is consumed and closed via the returned cleanup function.
 func doRequest(ctx context.Context, cfg JSReplayConfig, rawURL, targetOrigin string) (*http.Response, func(), error) {
 	reqCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
@@ -929,10 +976,16 @@ func doRequest(ctx context.Context, cfg JSReplayConfig, rawURL, targetOrigin str
 		return nil, func() {}, err
 	}
 
+	// Identify ourselves so cross-origin destinations can correlate the
+	// traffic to a Vespasian scan rather than attribute it to a generic
+	// Go-http-client. Same-origin Headers (set below) can override this
+	// if the operator passes their own User-Agent via --header.
+	req.Header.Set("User-Agent", jsReplayUserAgent)
+
 	// Same-origin gate for header forwarding: never send Authorization /
 	// Cookie / X-API-Key to an off-target host, even when AllowCrossOrigin
-	// permits the probe (SEC-BE-002, SEC-BE-006). Header forwarding is
-	// strictly tied to host equality, not to whether the probe was allowed.
+	// permits the probe. Header forwarding is strictly tied to host
+	// equality, not to whether the probe was allowed.
 	if isSameOrigin(rawURL, targetOrigin) {
 		for k, v := range cfg.Headers {
 			req.Header.Set(k, v)
@@ -946,8 +999,13 @@ func doRequest(ctx context.Context, cfg JSReplayConfig, rawURL, targetOrigin str
 	}
 
 	cleanup := func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // drain body before close
-		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close
+		// Drain a bounded prefix of the body so the connection can be
+		// reused, then close it. Both errors are intentionally ignored
+		// (the response is about to be discarded either way) but the
+		// blank-identifier assignment + nolint annotation keeps both
+		// gosec (G104) and errcheck quiet.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // best-effort drain
+		_ = resp.Body.Close()                                       //nolint:errcheck,gosec // best-effort close
 		cancel()
 	}
 	return resp, cleanup, nil
@@ -964,7 +1022,7 @@ func fetchJSBody(ctx context.Context, cfg JSReplayConfig, rawURL, targetOrigin s
 		return nil
 	}
 	if !cfg.AllowPrivate {
-		if err := ssrf.ValidateURL(rawURL); err != nil {
+		if err := ssrf.ValidateURLContext(ctx, rawURL); err != nil {
 			return nil
 		}
 	}

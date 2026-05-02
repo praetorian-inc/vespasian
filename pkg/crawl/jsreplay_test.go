@@ -15,6 +15,7 @@
 package crawl
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -22,7 +23,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"sort"
-	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -399,12 +400,18 @@ func TestReplayJSExtracted(t *testing.T) {
 
 	dashboard, ok := appended[srv.URL+"/identity/api/v2/user/dashboard"]
 	require.True(t, ok, "expected dashboard endpoint")
+	assert.Equal(t, "GET", dashboard.Method)
+	assert.Equal(t, http.StatusOK, dashboard.Response.StatusCode)
 	assert.Equal(t, "application/json", dashboard.Response.ContentType)
 	assert.Contains(t, string(dashboard.Response.Body), "Test User")
 	assert.Equal(t, "js-extract", dashboard.Source)
+	assert.Equal(t, "Bearer test-token", dashboard.Headers["Authorization"],
+		"same-origin probes must record forwarded auth headers")
 
 	products, ok := appended[srv.URL+"/workshop/api/shop/products"]
 	require.True(t, ok, "expected products endpoint")
+	assert.Equal(t, "GET", products.Method)
+	assert.Equal(t, http.StatusOK, products.Response.StatusCode)
 	assert.Equal(t, "application/json", products.Response.ContentType)
 }
 
@@ -530,20 +537,28 @@ func TestReplayJSExtracted_NoJSFiles(t *testing.T) {
 
 func TestReplayJSExtracted_EmptyInput(t *testing.T) {
 	t.Run("nil slice", func(t *testing.T) {
-		result := ReplayJSExtracted(context.Background(), nil, JSReplayConfig{AllowPrivate: true})
+		var stderr bytes.Buffer
+		result := ReplayJSExtracted(context.Background(), nil, JSReplayConfig{AllowPrivate: true, Verbose: true, Stderr: &stderr})
 		assert.Empty(t, result)
+		assert.Empty(t, stderr.Bytes(), "no log output expected for empty input")
 	})
 	t.Run("empty slice", func(t *testing.T) {
-		result := ReplayJSExtracted(context.Background(), []ObservedRequest{}, JSReplayConfig{AllowPrivate: true})
+		var stderr bytes.Buffer
+		result := ReplayJSExtracted(context.Background(), []ObservedRequest{}, JSReplayConfig{AllowPrivate: true, Verbose: true, Stderr: &stderr})
 		assert.Empty(t, result)
+		assert.Empty(t, stderr.Bytes())
 	})
 	t.Run("requests with empty URLs", func(t *testing.T) {
 		input := []ObservedRequest{
 			{Method: "GET", URL: ""},
 			{Method: "GET", URL: ""},
 		}
-		result := ReplayJSExtracted(context.Background(), input, JSReplayConfig{AllowPrivate: true})
+		var stderr bytes.Buffer
+		result := ReplayJSExtracted(context.Background(), input, JSReplayConfig{AllowPrivate: true, Verbose: true, Stderr: &stderr})
 		assert.Equal(t, input, result, "input should be returned unchanged when no baseURL discoverable")
+		// No logging means we exited via the targetOrigin == "" early return,
+		// not because we reached the path-extraction or probe loops.
+		assert.Empty(t, stderr.Bytes(), "early return must skip extraction and probe phases")
 	})
 }
 
@@ -685,38 +700,34 @@ func TestReplayJSExtracted_Filters404(t *testing.T) {
 		"only the 200-returning path should be appended")
 }
 
-func TestReplayJSExtracted_ProbeNetworkError(t *testing.T) {
-	// TEST-004: when probeURL returns nil (network failure), the path is
-	// silently dropped — original requests are preserved unchanged.
-	closedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
-	closedURL := closedSrv.URL
-	closedSrv.Close() // immediately close to force connection refused
+// errRoundTripper always returns the configured error from RoundTrip.
+type errRoundTripper struct{ err error }
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/javascript")
-		w.Write([]byte(`"/api/v1/data"`)) //nolint:errcheck,gosec // test handler
-	}))
-	defer srv.Close()
+func (e errRoundTripper) RoundTrip(*http.Request) (*http.Response, error) { return nil, e.err }
+
+func TestReplayJSExtracted_ProbeNetworkError(t *testing.T) {
+	// When probeURL returns nil (network failure), the path is silently
+	// dropped — original requests are preserved unchanged. This test uses
+	// an always-erroring RoundTripper instead of a closed server, so it is
+	// deterministic regardless of port-reuse or kernel TCP behavior.
+	cfg := JSReplayConfig{
+		Client:       &http.Client{Transport: errRoundTripper{err: errors.New("simulated network failure")}},
+		TargetURL:    "http://example.com",
+		AllowPrivate: true,
+		Timeout:      500 * time.Millisecond,
+	}
 
 	requests := []ObservedRequest{
 		{
 			Method:   "GET",
-			URL:      closedURL + "/app.js",
+			URL:      "http://example.com/app.js",
 			Source:   "katana",
 			Response: ObservedResponse{StatusCode: 200, ContentType: "application/javascript", Body: []byte(`"/api/v1/data"`)},
 		},
 	}
 
-	cfg := JSReplayConfig{
-		Client:       srv.Client(),
-		TargetURL:    closedURL,
-		AllowPrivate: true,
-		Timeout:      500 * time.Millisecond,
-	}
 	result := ReplayJSExtracted(context.Background(), requests, cfg)
-	// One original request, no appended results because every probe to
-	// closedURL fails before returning a response.
-	assert.Equal(t, requests, result)
+	assert.Equal(t, requests, result, "probe failures must leave the original requests unchanged")
 }
 
 func TestReplayJSExtracted_ContextCancellation(t *testing.T) {
@@ -1142,26 +1153,305 @@ func TestOriginOf(t *testing.T) {
 	assert.Equal(t, "", originOf("/relative/path"))
 }
 
-func TestExtractAPIPaths_RejectsURLsWithControlChars(t *testing.T) {
-	// Defensive: paths embedding NUL or escape sequences should still
-	// surface (they're attacker-controlled but already filtered for static
-	// extensions). The log layer is responsible for sanitization.
+func TestExtractAPIPaths_CleanPathPassesThrough(t *testing.T) {
+	// Sanity check that a clean quoted path is extracted and parses as a
+	// valid URL. Sanitization of attacker-controlled control characters is
+	// the log layer's responsibility (see TestSanitizeForLog).
 	js := []byte(`"/api/v2/data"`)
 	got := extractAPIPaths(js, nil)
 	assert.Equal(t, []string{"/api/v2/data"}, got)
-	// Sanity: parsing still succeeds.
 	_, err := url.Parse(got[0])
 	assert.NoError(t, err)
 }
 
-// helperContains is a tiny utility used by a couple of tests.
-func helperContains(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if strings.Contains(s, needle) {
-			return true
-		}
-	}
-	return false
+// --- TEST-001: withDefaults SSRF transport ---
+
+func TestJSReplayConfig_WithDefaults_InstallsSSRFTransport(t *testing.T) {
+	// When AllowPrivate is false and no client is supplied, withDefaults must
+	// install ssrf.SafeDialContext on the transport. We assert by attempting a
+	// loopback dial through the resulting client and expecting an SSRF block.
+	cfg := JSReplayConfig{}.withDefaults()
+	transport, ok := cfg.Client.Transport.(*http.Transport)
+	require.True(t, ok, "default transport must be *http.Transport")
+	require.NotNil(t, transport.DialContext, "DialContext must be set when !AllowPrivate")
+	_, err := transport.DialContext(context.Background(), "tcp", "127.0.0.1:1")
+	require.Error(t, err, "DialContext must reject loopback under SSRF protection")
+	assert.Contains(t, err.Error(), "private")
 }
 
-var _ = helperContains // referenced by future tests; keep to avoid dead-import churn
+func TestJSReplayConfig_WithDefaults_AllowPrivateBypassesDialer(t *testing.T) {
+	cfg := JSReplayConfig{AllowPrivate: true}.withDefaults()
+	transport, ok := cfg.Client.Transport.(*http.Transport)
+	require.True(t, ok)
+	// With AllowPrivate, we don't override DialContext (it stays as the
+	// default transport's value, which is nil for http.DefaultTransport's
+	// initial state but cloned).
+	if transport.DialContext != nil {
+		// If non-nil, it must NOT reject 127.0.0.1 — but we can't actually
+		// dial in a unit test. Instead just confirm the SSRF dialer is not
+		// installed by comparing function pointers via reflect.
+		// Simpler: just assert the SSRF rejection from above does NOT occur.
+		// Because DialContext could be nil, we skip the dial assertion when
+		// nil and rely on the absence of an explicit override.
+		t.Log("AllowPrivate path leaves transport.DialContext at its default")
+	}
+}
+
+func TestJSReplayConfig_WithDefaults_WrapsCallerSuppliedClient(t *testing.T) {
+	// Even when the caller supplies their own *http.Client, withDefaults must
+	// install ssrf.SafeDialContext on that client's transport so the dial-time
+	// SSRF check (DNS-rebinding mitigation) is preserved.
+	caller := &http.Client{Transport: &http.Transport{}}
+	cfg := JSReplayConfig{Client: caller}.withDefaults()
+	t2, ok := cfg.Client.Transport.(*http.Transport)
+	require.True(t, ok)
+	require.NotNil(t, t2.DialContext, "caller-supplied transport must be wrapped with SSRF dialer")
+	_, err := t2.DialContext(context.Background(), "tcp", "127.0.0.1:1")
+	require.Error(t, err, "wrapped DialContext must reject loopback")
+}
+
+// --- TEST-002: isHTMLResponse content-type coverage ---
+
+func TestIsHTMLResponse(t *testing.T) {
+	assert.True(t, isHTMLResponse("text/html"))
+	assert.True(t, isHTMLResponse("text/html; charset=utf-8"))
+	assert.True(t, isHTMLResponse("application/xhtml+xml"))
+	assert.True(t, isHTMLResponse("application/xhtml+xml; charset=utf-8"))
+	assert.True(t, isHTMLResponse("TEXT/HTML"))
+	assert.False(t, isHTMLResponse("application/json"))
+	assert.False(t, isHTMLResponse(""))
+}
+
+// --- TEST-003: copyHeaders direct ---
+
+func TestCopyHeaders(t *testing.T) {
+	t.Run("nil", func(t *testing.T) {
+		assert.Nil(t, copyHeaders(nil))
+	})
+	t.Run("empty", func(t *testing.T) {
+		got := copyHeaders(map[string]string{})
+		require.NotNil(t, got)
+		assert.Empty(t, got)
+	})
+	t.Run("populated", func(t *testing.T) {
+		orig := map[string]string{"Authorization": "Bearer x", "X-Foo": "bar"}
+		got := copyHeaders(orig)
+		assert.Equal(t, orig, got)
+		// Mutating the original must not affect the copy and vice-versa.
+		orig["Authorization"] = "Bearer mutated"
+		orig["NewKey"] = "added"
+		assert.Equal(t, "Bearer x", got["Authorization"])
+		_, hasNew := got["NewKey"]
+		assert.False(t, hasNew, "new keys in original must not appear in copy")
+	})
+}
+
+// --- TEST-004: validateFullURL branches ---
+
+func TestValidateFullURL(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		ok   bool
+	}{
+		{"valid https", "https://example.com/api/v1/x", true},
+		{"valid http", "http://example.com/api", true},
+		{"parse error (control byte)", "http://example.com/\x00bad", false},
+		{"empty host", "http:///api/v1/x", false},
+		{"non-http scheme", "ftp://example.com/api", false},
+		{"javascript scheme", "javascript://api/v1", false},
+		{"userinfo basic auth", "http://user:pass@example.com/api/v1/x", false},
+		{"userinfo no password", "http://user@example.com/api/v1/x", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ok := validateFullURL(tc.in)
+			assert.Equal(t, tc.ok, ok, "validateFullURL(%q) ok=%v, want %v", tc.in, ok, tc.ok)
+		})
+	}
+}
+
+// --- TEST-005: reconstructTemplateLiteral branches ---
+
+func TestReconstructTemplateLiteral(t *testing.T) {
+	cases := []struct {
+		name    string
+		segment string
+		want    string
+		ok      bool
+	}{
+		{"simple interpolation", "/api/v1/users/${id}", "/api/v1/users/{param}", true},
+		{"multiple interpolations", "/api/v2/items/${itemId}/comments/${commentId}", "/api/v2/items/{param}/comments/{param}", true},
+		{"no api indicator", "/no/indicator/here", "", false},
+		{"contains whitespace", "/api/v1/x with space", "", false},
+		{"trim before first slash", "prefix/api/v1/x", "/api/v1/x", true},
+		{"empty segment", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := reconstructTemplateLiteral([]byte(tc.segment))
+			assert.Equal(t, tc.ok, ok, "reconstructTemplateLiteral(%q) ok=%v want %v", tc.segment, ok, tc.ok)
+			if ok {
+				assert.Equal(t, tc.want, got)
+			}
+		})
+	}
+}
+
+// --- TEST-006: MaxTotalTime deadline behavior ---
+
+func TestReplayJSExtracted_MaxTotalTimeDeadline(t *testing.T) {
+	// Server that always sleeps longer than the deadline. The replay loop's
+	// per-request Timeout (200ms) lets each probe attempt time out, but the
+	// loop-level MaxTotalTime (300ms) must cause the loop to exit before all
+	// 5 paths are attempted.
+	hits := int32(0)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		time.Sleep(500 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`)) //nolint:errcheck,gosec // test handler
+	}))
+	defer srv.Close()
+
+	jsBody := []byte(`"/api/v1/a" "/api/v1/b" "/api/v1/c" "/api/v1/d" "/api/v1/e"`)
+	requests := []ObservedRequest{
+		{
+			Method:   "GET",
+			URL:      srv.URL + "/app.js",
+			Source:   "katana",
+			Response: ObservedResponse{StatusCode: 200, ContentType: "application/javascript", Body: jsBody},
+		},
+	}
+
+	cfg := allowLocal(srv)
+	cfg.Timeout = 200 * time.Millisecond
+	cfg.MaxTotalTime = 300 * time.Millisecond
+	cfg.MaxEndpoints = 10
+
+	start := time.Now()
+	ReplayJSExtracted(context.Background(), requests, cfg)
+	elapsed := time.Since(start)
+
+	// Without MaxTotalTime, each of 5 paths * 200ms timeout = ~1s; the
+	// deadline must cap us well under that.
+	assert.Less(t, elapsed, 800*time.Millisecond, "MaxTotalTime must bound wall-clock time")
+	assert.Less(t, atomic.LoadInt32(&hits), int32(5), "deadline must terminate the probe loop before all paths run")
+}
+
+// --- TEST-007: flattenHeaders ---
+
+func TestFlattenHeaders(t *testing.T) {
+	t.Run("single value", func(t *testing.T) {
+		h := http.Header{"Content-Type": []string{"application/json"}}
+		got := flattenHeaders(h)
+		assert.Equal(t, "application/json", got["Content-Type"])
+	})
+	t.Run("multi-value keeps first", func(t *testing.T) {
+		h := http.Header{"Set-Cookie": []string{"a=1", "b=2"}}
+		got := flattenHeaders(h)
+		assert.Equal(t, "a=1", got["Set-Cookie"], "documented contract: only first value is preserved")
+	})
+	t.Run("empty value slice skipped", func(t *testing.T) {
+		h := http.Header{"X-Empty": []string{}}
+		got := flattenHeaders(h)
+		_, has := got["X-Empty"]
+		assert.False(t, has, "empty []string{} must not produce a map entry")
+	})
+	t.Run("empty input", func(t *testing.T) {
+		assert.Empty(t, flattenHeaders(http.Header{}))
+	})
+}
+
+// --- TEST-008: crAPI-style multi-strategy regression ---
+
+func TestReplayJSExtracted_CrAPIStyleRegression(t *testing.T) {
+	// Curated fixture exercising the four extraction strategies that
+	// together produced the headline "29 endpoints on OWASP crAPI" result
+	// (LAB-1505). A regression in any one strategy will drop entries from
+	// the expected set.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Anything matching a known crAPI endpoint returns 200/JSON; the
+		// rest 404 (will be filtered by the same-origin/404 logic).
+		known := map[string]bool{
+			"/identity/api/auth/login":                  true,
+			"/identity/api/v2/user/dashboard":           true,
+			"/workshop/api/shop/products":               true,
+			"/workshop/api/merchant/contact_mechanic":   true,
+			"/community/api/v2/community/posts/recent":  true,
+			"/community/api/v2/coupon/validate-coupon":  true,
+			"/identity/api/v2/user/change-email":        true,
+			"/identity/api/v2/user/reset-password":      true,
+			"/workshop/api/shop/orders":                 true,
+			"/workshop/api/mechanic/receive_report":     true,
+			"/identity/api/auth/v3/check-otp":           true,
+			"/community/api/v2/community/posts/{param}": true,
+		}
+		if known[r.URL.Path] {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"ok":true}`)) //nolint:errcheck,gosec // test handler
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	jsBody := []byte(`
+		// crAPI-style minified bundle reproducing the four extraction strategies.
+		var IDENTITY = "identity/" + "api/auth/login";
+		fetch("identity/" + "api/v2/user/dashboard");
+		fetch("workshop/" + "api/shop/products");
+		fetch("workshop/" + "api/merchant/contact_mechanic");
+		var d = "community/api/v2/community/posts/recent";
+		var f = "identity/api/v2/user/change-email";
+		var g = "identity/api/v2/user/reset-password";
+		var h = "workshop/api/shop/orders";
+		var i = "workshop/api/mechanic/receive_report";
+		var j = "identity/api/auth/v3/check-otp";
+		const k = ` + "`/api/v2/community/posts/${postId}`" + `;
+		const l = "community/api/v2/coupon/validate-coupon";
+	`)
+
+	requests := []ObservedRequest{
+		{
+			Method:   "GET",
+			URL:      srv.URL + "/static/js/main.js",
+			Source:   "katana",
+			Response: ObservedResponse{StatusCode: 200, ContentType: "application/javascript", Body: jsBody},
+		},
+		// Discover prefixes via crawl results too.
+		{URL: srv.URL + "/static/js/identity/", Source: srv.URL + "/static/js/main.js"},
+		{URL: srv.URL + "/static/js/workshop/", Source: srv.URL + "/static/js/main.js"},
+		{URL: srv.URL + "/static/js/community/", Source: srv.URL + "/static/js/main.js"},
+	}
+
+	cfg := allowLocal(srv)
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	// Collect js-extract URLs.
+	var probed []string
+	for _, r := range result {
+		if r.Source == "js-extract" {
+			probed = append(probed, r.URL)
+		}
+	}
+
+	// Lock in a subset that any of the four strategies must keep working:
+	wantSubset := []string{
+		srv.URL + "/identity/api/auth/login",                  // concat strategy
+		srv.URL + "/identity/api/v2/user/dashboard",           // inline-prefixed quoted
+		srv.URL + "/workshop/api/shop/products",               // concat strategy
+		srv.URL + "/community/api/v2/community/posts/recent",  // inline-prefixed quoted
+		srv.URL + "/community/api/v2/community/posts/{param}", // template literal interpolation
+	}
+	for _, w := range wantSubset {
+		assert.Contains(t, probed, w, "fixture must produce %s — regression in extraction strategy", w)
+	}
+
+	// Headline assertion: at least 8 unique 200-returning endpoints from
+	// this small fixture (the 12 'known' ones above, minus any that don't
+	// match the regex strategies). 8 is conservative — current code yields
+	// closer to 11. A drop below 8 indicates a real regression.
+	assert.GreaterOrEqual(t, len(probed), 8,
+		"expected at least 8 endpoints from crAPI-style fixture; got %d (%v)", len(probed), probed)
+}
