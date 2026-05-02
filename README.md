@@ -43,6 +43,7 @@ Vespasian takes a different approach: it observes actual network traffic at the 
 | **WSDL/SOAP Discovery** | Identifies SOAP services via SOAPAction headers and envelope detection; fetches and parses WSDL documents |
 | **API Type Auto-Detection** | Automatically determines API type (REST, GraphQL, WSDL) from captured traffic without manual selection |
 | **Headless Browser Crawling** | Drives a headless Chrome browser with full JavaScript execution for SPA support, powered by [Katana](https://github.com/projectdiscovery/katana) |
+| **SPA Bundle Extraction** | Post-crawl pass that scans JavaScript bundles for API path strings and probes them with raw HTTP, recovering endpoints the headless browser could not exercise |
 | **Traffic Import** | Import existing captures from Burp Suite XML, HAR 1.2 files, and mitmproxy dumps |
 | **Active Probing** | OPTIONS discovery, JSON schema inference, WSDL document fetching, and GraphQL introspection |
 | **Path Normalization** | `/users/42` and `/users/87` become `/users/{id}` with known literal preservation (`/me`, `/self`) |
@@ -73,6 +74,33 @@ flowchart LR
 - **Debuggable.** The capture file is inspectable JSON, isolating capture bugs from generation bugs.
 - **Composable.** Import traffic from any source (browser crawls, proxy captures, mobile testing).
 - **Offline analysis.** Generate specifications without network access, useful during limited engagement windows.
+
+### SPA Bundle Extraction
+
+Many single-page applications bundle their API paths as string literals inside
+JavaScript files (`/api/v2/users`, `` `/api/items/${id}` ``,
+`"identity/" + "api/auth/login"`). The headless browser only exercises the
+paths the user actually clicks on; the rest stay hidden. After the crawl,
+Vespasian re-scans every captured JavaScript bundle for API-path patterns
+and probes the discovered URLs with raw HTTP requests. Wrong combinations
+(typically caused by the regex matching unrelated string literals) come back
+404 and are dropped.
+
+By default this step:
+
+- only probes URLs whose origin matches the scan target — cross-origin URLs
+  embedded in the bundle are skipped to avoid using Vespasian as a request
+  reflector;
+- never forwards `--header` values (Authorization, Cookie, ...) to
+  cross-origin destinations;
+- enforces SSRF protection on every URL unless `--dangerous-allow-private`
+  is set;
+- caps probe attempts at 500 per scan and total wall-clock time at 10
+  minutes for the JS-replay step.
+
+If a discovered SPA bundle is over 1 MB (the default crawl truncation
+limit), Vespasian re-fetches it with a 10 MB cap before scanning so paths
+embedded after the truncation point are still recovered.
 
 ## How to Install Vespasian
 

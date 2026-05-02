@@ -12,6 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// JS replay threat model:
+//
+// ReplayJSExtracted issues outbound HTTP requests to URLs derived from the
+// target SPA's JavaScript bundles. Those bundles are attacker-controlled
+// when the target is hostile, so this code treats every extracted URL as
+// untrusted input and applies three defenses:
+//
+//  1. Same-origin gate: by default, only URLs whose scheme/host/port match
+//     the scan target are probed and only those requests carry the user's
+//     headers (e.g., Authorization). AllowCrossOrigin opts out for
+//     trusted-tenant scans.
+//  2. SSRF validation: every URL is checked against ssrf.ValidateURL
+//     and the underlying transport uses ssrf.SafeDialContext to defeat
+//     DNS rebinding. AllowPrivate disables both for explicit local testing.
+//  3. Bounded execution: MaxEndpoints caps probe attempts (not just results)
+//     and MaxTotalTime caps wall-clock time across the whole step.
+
 package crawl
 
 import (
@@ -22,42 +39,101 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/praetorian-inc/vespasian/pkg/ssrf"
 )
 
 // JSReplayConfig configures the JS API path extraction and probing step.
 type JSReplayConfig struct {
-	// Headers are injected into every probe request (e.g., Authorization).
+	// Headers are injected into probe requests that target the same origin
+	// as the scan target (e.g., Authorization). They are NOT forwarded to
+	// cross-origin URLs unless AllowCrossOrigin is true.
 	Headers map[string]string
+
+	// TargetURL is the scan's intended target. It is used to derive the
+	// same-origin host for header forwarding and probe filtering. If
+	// empty, the first non-empty request URL is used as a fallback.
+	TargetURL string
+
+	// AllowPrivate disables SSRF protection (ValidateProbeURL and
+	// SSRFSafeDialContext). Mirrors --dangerous-allow-private.
+	AllowPrivate bool
+
+	// AllowCrossOrigin allows probing and JS-fetching of URLs whose origin
+	// does not match the scan target. Default false: cross-origin URLs are
+	// skipped to avoid using Vespasian as a request reflector and to avoid
+	// leaking auth headers.
+	AllowCrossOrigin bool
 
 	// Timeout is the per-request timeout. Defaults to 10 seconds.
 	Timeout time.Duration
 
-	// MaxEndpoints limits the number of URLs probed. Defaults to 500.
+	// MaxTotalTime caps the wall-clock time of the whole replay step.
+	// Defaults to MaxEndpoints * Timeout, capped at 10 minutes.
+	MaxTotalTime time.Duration
+
+	// MaxEndpoints limits the number of probe attempts (successful or not).
+	// Defaults to 500.
 	MaxEndpoints int
 
-	// Client is the HTTP client. If nil, a default client is created.
+	// Client is the HTTP client. If nil, a default client is created with
+	// SSRF-safe transport when !AllowPrivate.
 	Client *http.Client
 
 	// Verbose enables debug logging to Stderr.
 	Verbose bool
 
 	// Stderr is the writer for debug output. Defaults to io.Discard.
+	// Warnings (cap reached, cross-origin skipped) are emitted regardless
+	// of Verbose, but still go to this writer.
 	Stderr io.Writer
 }
 
-// withDefaults fills in zero-value fields with sensible defaults.
+const (
+	// defaultMaxEndpoints is the default cap on probe attempts.
+	defaultMaxEndpoints = 500
+
+	// defaultTimeout is the default per-request timeout.
+	defaultTimeout = 10 * time.Second
+
+	// maxTotalTimeCap caps MaxTotalTime regardless of MaxEndpoints*Timeout.
+	maxTotalTimeCap = 10 * time.Minute
+)
+
+// withDefaults fills in zero-value fields with sensible defaults and installs
+// an SSRF-safe HTTP transport when AllowPrivate is false.
 func (cfg JSReplayConfig) withDefaults() JSReplayConfig {
 	if cfg.Timeout == 0 {
-		cfg.Timeout = 10 * time.Second
+		cfg.Timeout = defaultTimeout
 	}
 	if cfg.MaxEndpoints == 0 {
-		cfg.MaxEndpoints = 500
+		cfg.MaxEndpoints = defaultMaxEndpoints
+	}
+	if cfg.MaxTotalTime == 0 {
+		// Worst-case: every probe times out. Cap at maxTotalTimeCap to
+		// keep predictable wall-clock behavior even with large MaxEndpoints.
+		cfg.MaxTotalTime = time.Duration(cfg.MaxEndpoints) * cfg.Timeout
+		if cfg.MaxTotalTime > maxTotalTimeCap {
+			cfg.MaxTotalTime = maxTotalTimeCap
+		}
 	}
 	if cfg.Client == nil {
+		var transport *http.Transport
+		if t, ok := http.DefaultTransport.(*http.Transport); ok {
+			transport = t.Clone()
+		} else {
+			transport = &http.Transport{}
+		}
+		if !cfg.AllowPrivate {
+			transport.DialContext = ssrf.SafeDialContext
+		}
 		cfg.Client = &http.Client{
-			Timeout: cfg.Timeout,
+			Timeout:   cfg.Timeout,
+			Transport: transport,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -91,18 +167,29 @@ var htmlContentTypes = []string{
 	"application/xhtml+xml",
 }
 
-// isHTMLResponse reports whether the response content type indicates HTML.
-func isHTMLResponse(contentType string) bool {
+// matchesContentType reports whether contentType (with optional ;charset
+// parameters) matches any entry in types. Comparison is case-insensitive.
+func matchesContentType(contentType string, types []string) bool {
 	ct := strings.ToLower(contentType)
 	if idx := strings.Index(ct, ";"); idx != -1 {
 		ct = strings.TrimSpace(ct[:idx])
 	}
-	for _, htmlCT := range htmlContentTypes {
-		if ct == htmlCT {
+	for _, t := range types {
+		if ct == t {
 			return true
 		}
 	}
 	return false
+}
+
+// isHTMLResponse reports whether the response content type indicates HTML.
+func isHTMLResponse(contentType string) bool {
+	return matchesContentType(contentType, htmlContentTypes)
+}
+
+// isJSResponse reports whether the response content type indicates JavaScript.
+func isJSResponse(contentType string) bool {
+	return matchesContentType(contentType, jsContentTypes)
 }
 
 // scriptSrcPattern extracts src attributes from <script> tags in HTML.
@@ -137,6 +224,13 @@ func extractScriptURLs(htmlBody []byte, pageURL string) []string {
 }
 
 // --- Extraction patterns ---
+//
+// Regex extraction is inherently lossy: it cannot distinguish a real path
+// literal from a comment, an error string, or a locale message that happens
+// to contain "/api/...". False positives are expected and handled at probe
+// time by the 404 filter (probe loop in ReplayJSExtracted) — wrong paths
+// return 404 from the target and are dropped before being appended to the
+// result. The MaxEndpoints cap bounds the cost of false positives.
 
 // apiPathPattern matches API-like path strings in single/double-quoted JS strings.
 // Captures paths containing /api/, /v1/, /v2/, /rest/, /rpc/, /graphql.
@@ -150,14 +244,16 @@ var apiPathPattern = regexp.MustCompile(
 )
 
 // templateLiteralPattern matches API-like paths in JS template literals (backticks).
-// Handles interpolation placeholders like ${id} by treating ${ as a path terminator.
+// This is a fallback for simple cases without ${...} interpolation; richer
+// reconstruction (preserving the literal segments around interpolations) is
+// handled by extractTemplateLiteralPaths below.
 var templateLiteralPattern = regexp.MustCompile(
 	"`" +
 		`(/?` +
 		`(?:[a-zA-Z0-9_-]+/)*` +
 		`(?:api/|v[1-9][0-9]*/|rest/|rpc/|graphql)` +
 		`[a-zA-Z0-9/_\{}.:-]*)` +
-		"(?:`|\\$\\{)",
+		"`",
 )
 
 // fullURLPattern matches full API URLs (http/https) in JS strings.
@@ -171,8 +267,14 @@ var fullURLPattern = regexp.MustCompile(
 		`["'` + "`]",
 )
 
-// servicePrefixPattern matches service prefix strings concatenated with API paths.
+// servicePrefixPattern matches service prefix strings concatenated with API paths
+// using the `+` operator between two QUOTED string literals.
 // E.g., "identity/" + "api/auth/login" — captures "identity/".
+//
+// Note: backtick template literal concatenations are not matched (use
+// extractTemplateLiteralPaths for those). String.prototype.concat() —
+// e.g. "/api/posts/".concat(id, "/comment") — is intentionally out of
+// scope (see LAB-1368 for follow-up).
 var servicePrefixPattern = regexp.MustCompile(
 	`["']([a-zA-Z][a-zA-Z0-9_-]{1,30}/)["']\s*\+\s*["'](?:api/|v[1-9])`,
 )
@@ -183,21 +285,12 @@ var apiIndicators = []string{"api/", "v1/", "v2/", "v3/", "v4/", "rest/", "rpc/"
 // staticFileExts are file extensions to skip when extracting API paths.
 var staticFileExts = []string{".js", ".css", ".map", ".html", ".htm", ".png", ".jpg", ".svg"}
 
-// --- Helper functions ---
+// templateLiteralOpenPattern locates opening backticks of a template literal.
+// extractTemplateLiteralPaths walks the body byte-by-byte starting from each
+// match to handle ${...} interpolations correctly.
+var templateLiteralOpenPattern = regexp.MustCompile("`")
 
-// isJSResponse reports whether the response content type indicates JavaScript.
-func isJSResponse(contentType string) bool {
-	ct := strings.ToLower(contentType)
-	if idx := strings.Index(ct, ";"); idx != -1 {
-		ct = strings.TrimSpace(ct[:idx])
-	}
-	for _, jsCT := range jsContentTypes {
-		if ct == jsCT {
-			return true
-		}
-	}
-	return false
-}
+// --- Helper functions ---
 
 // isJSURL reports whether the URL path ends with a JavaScript file extension.
 func isJSURL(rawURL string) bool {
@@ -214,6 +307,17 @@ func isStaticFile(path string) bool {
 	lower := strings.ToLower(path)
 	for _, ext := range staticFileExts {
 		if strings.HasSuffix(lower, ext) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasAPIIndicator reports whether the path contains a known API indicator.
+func hasAPIIndicator(path string) bool {
+	lower := strings.ToLower(path)
+	for _, indicator := range apiIndicators {
+		if strings.Contains(lower, indicator) {
 			return true
 		}
 	}
@@ -245,6 +349,73 @@ func resolveBaseURL(targetURL string) string {
 		return targetURL
 	}
 	return u.Scheme + "://" + u.Host
+}
+
+// originOf returns the scheme://host[:port] origin of rawURL, or "" if it
+// cannot be parsed or has no host.
+func originOf(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// isSameOrigin reports whether rawURL has the same origin as targetOrigin.
+// targetOrigin should already be in scheme://host[:port] form.
+func isSameOrigin(rawURL, targetOrigin string) bool {
+	if targetOrigin == "" {
+		return false
+	}
+	return originOf(rawURL) == targetOrigin
+}
+
+// sanitizeForLog escapes terminal control characters and other non-printable
+// bytes so an attacker-controlled string from a JS bundle cannot inject ANSI
+// sequences or NUL bytes when emitted to the operator's terminal.
+func sanitizeForLog(s string) string {
+	if s == "" {
+		return s
+	}
+	// strconv.Quote escapes control chars, non-printable bytes, and quotes;
+	// it returns a Go-quoted string, which is safe to render verbatim.
+	return strconv.Quote(s)
+}
+
+// copyHeaders returns a defensive copy of h to avoid sharing the caller's
+// map across recorded ObservedRequest values.
+func copyHeaders(h map[string]string) map[string]string {
+	if h == nil {
+		return nil
+	}
+	out := make(map[string]string, len(h))
+	for k, v := range h {
+		out[k] = v
+	}
+	return out
+}
+
+// validateFullURL parses a full URL extracted from JS and rejects URLs with
+// embedded credentials, non-http(s) schemes, or empty hosts. Returns the
+// canonicalized URL on success.
+func validateFullURL(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", false
+	}
+	if u.Host == "" {
+		return "", false
+	}
+	if u.User != nil {
+		// Reject embedded credentials (http://user:pass@host/...) — the
+		// JS bundle can otherwise force Vespasian to send arbitrary basic
+		// auth on the operator's behalf.
+		return "", false
+	}
+	return u.String(), true
 }
 
 // --- Extraction logic ---
@@ -331,10 +502,82 @@ func extractServicePrefixes(jsBody []byte, requests []ObservedRequest) []string 
 	return prefixes
 }
 
+// extractTemplateLiteralPaths walks each backtick-delimited template literal
+// and reconstructs the literal segments around ${...} interpolations into
+// path templates with {param}-style placeholders.
+//
+// E.g., `/api/users/${id}/profile` -> /api/users/{id}/profile
+func extractTemplateLiteralPaths(jsBody []byte) []string {
+	var paths []string
+	starts := templateLiteralOpenPattern.FindAllIndex(jsBody, -1)
+	// FindAllIndex returns every backtick; pair them up sequentially.
+	for i := 0; i+1 < len(starts); i += 2 {
+		open := starts[i][1]       // byte after opening backtick
+		closeIdx := starts[i+1][0] // byte of closing backtick
+		if closeIdx <= open {
+			continue
+		}
+		segment := jsBody[open:closeIdx]
+		path, ok := reconstructTemplateLiteral(segment)
+		if !ok {
+			continue
+		}
+		paths = append(paths, path)
+	}
+	return paths
+}
+
+// reconstructTemplateLiteral converts a single template literal body (the
+// text between two backticks) into a path string by replacing ${...}
+// interpolations with {param} placeholders. It returns the path and true if
+// it contains an API indicator and looks path-like, otherwise empty/false.
+func reconstructTemplateLiteral(segment []byte) (string, bool) {
+	var b strings.Builder
+	depth := 0
+	for i := 0; i < len(segment); i++ {
+		c := segment[i]
+		if depth == 0 {
+			if c == '$' && i+1 < len(segment) && segment[i+1] == '{' {
+				b.WriteString("{param}")
+				depth = 1
+				i++ // skip the '{'
+				continue
+			}
+			b.WriteByte(c)
+			continue
+		}
+		// Inside ${...}: consume until matching closing brace.
+		switch c {
+		case '{':
+			depth++
+		case '}':
+			depth--
+		}
+	}
+	candidate := b.String()
+	// Trim non-path noise from each end. Template literals embed paths in
+	// expressions like ` + path + `; we want only the path-like core.
+	candidate = strings.TrimSpace(candidate)
+	if !strings.HasPrefix(candidate, "/") && !strings.HasPrefix(candidate, "http://") && !strings.HasPrefix(candidate, "https://") {
+		// Look for the first slash and trim before it.
+		if idx := strings.Index(candidate, "/"); idx > 0 {
+			candidate = candidate[idx:]
+		}
+	}
+	if candidate == "" || !hasAPIIndicator(candidate) {
+		return "", false
+	}
+	// Reject candidates with embedded whitespace (likely not a single path).
+	if strings.ContainsAny(candidate, " \t\r\n") {
+		return "", false
+	}
+	return candidate, true
+}
+
 // extractAPIPaths scans JavaScript source code for API path patterns using
 // multiple extraction strategies:
 //  1. Single/double-quoted strings containing API indicators
-//  2. Template literals (backticks) with interpolation
+//  2. Template literals (backticks), including ${...} interpolations
 //  3. Full URLs (http/https) pointing to API endpoints
 //  4. Service prefix concatenation (e.g., "identity/" + "api/auth/login")
 //
@@ -351,12 +594,18 @@ func extractAPIPaths(jsBody []byte, requests []ObservedRequest) []string { //nol
 			return
 		}
 
-		// Full URLs are kept as-is (they include scheme+host).
+		// Full URLs are kept as-is (they include scheme+host) after a
+		// defense-in-depth validation pass that rejects credentials,
+		// non-http(s) schemes, and empty hosts.
 		if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
-			raw = strings.TrimRight(raw, "/")
-			if !seen[raw] {
-				seen[raw] = true
-				paths = append(paths, raw)
+			cleaned, ok := validateFullURL(raw)
+			if !ok {
+				return
+			}
+			cleaned = strings.TrimRight(cleaned, "/")
+			if !seen[cleaned] {
+				seen[cleaned] = true
+				paths = append(paths, cleaned)
 			}
 			return
 		}
@@ -407,7 +656,12 @@ func extractAPIPaths(jsBody []byte, requests []ObservedRequest) []string { //nol
 		}
 	}
 
-	// Strategy 2: Template literal API paths.
+	// Strategy 2a: Template literal API paths (with ${...} reconstruction).
+	for _, p := range extractTemplateLiteralPaths(jsBody) {
+		addPath(p)
+	}
+
+	// Strategy 2b: Simple template literal pattern fallback.
 	for _, match := range templateLiteralPattern.FindAllSubmatch(jsBody, -1) {
 		if len(match) >= 2 {
 			addPath(string(match[1]))
@@ -436,27 +690,41 @@ func extractAPIPaths(jsBody []byte, requests []ObservedRequest) []string { //nol
 // concatenations that jsluice cannot resolve). By regex-extracting these paths
 // from the JS body and probing them directly with raw HTTP, we bypass both the
 // SPA catch-all routing and jsluice's static analysis limitations.
+//
+// Security defenses are described in the file-level comment block.
 func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSReplayConfig) []ObservedRequest { //nolint:gocyclo // top-level JS extraction orchestration
 	cfg = cfg.withDefaults()
 
-	// logf is a no-op unless verbose mode is on; silences errcheck lint.
+	// logf is a no-op unless verbose mode is on; warnf always emits.
 	logf := func(format string, args ...interface{}) {
 		if cfg.Verbose {
 			fmt.Fprintf(cfg.Stderr, format, args...) //nolint:errcheck // debug logging to stderr
 		}
 	}
+	warnf := func(format string, args ...interface{}) {
+		fmt.Fprintf(cfg.Stderr, format, args...) //nolint:errcheck // operator-facing warning
+	}
 
-	// Determine the base URL from the first request.
-	baseURL := ""
-	for _, req := range requests {
-		if req.URL != "" {
-			baseURL = resolveBaseURL(req.URL)
-			break
+	// Determine the target origin from cfg.TargetURL or the first request.
+	targetOrigin := originOf(cfg.TargetURL)
+	if targetOrigin == "" {
+		for _, req := range requests {
+			if req.URL != "" {
+				targetOrigin = originOf(req.URL)
+				if targetOrigin != "" {
+					break
+				}
+			}
 		}
 	}
-	if baseURL == "" {
+	if targetOrigin == "" {
 		return requests
 	}
+
+	// Apply a wall-clock deadline to bound the whole step regardless of how
+	// many slow endpoints the JS bundle contains.
+	loopCtx, cancel := context.WithTimeout(ctx, cfg.MaxTotalTime)
+	defer cancel()
 
 	// Discover JS file URLs from HTML <script> tags. Katana often mangles
 	// relative JS paths when resolving against SPA routes, so we parse HTML
@@ -478,7 +746,7 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	if len(htmlJSURLs) > 0 {
 		logf("js-extract: discovered %d JS URLs from HTML <script> tags\n", len(htmlJSURLs))
 		for u := range htmlJSURLs {
-			logf("  %s\n", u)
+			logf("  %s\n", sanitizeForLog(u))
 		}
 	}
 
@@ -489,9 +757,9 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	// processJS extracts API paths from a JS body and adds them to allPaths.
 	processJS := func(jsURL string, jsBody []byte) {
 		paths := extractAPIPaths(jsBody, requests)
-		logf("js-extract: extracted %d API paths from %s\n", len(paths), jsURL)
+		logf("js-extract: extracted %d API paths from %s\n", len(paths), sanitizeForLog(jsURL))
 		for _, p := range paths {
-			logf("  %s\n", p)
+			logf("  %s\n", sanitizeForLog(p))
 		}
 		for _, p := range paths {
 			allPaths[p] = true
@@ -503,8 +771,8 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 			continue
 		}
 		processedJSURLs[req.URL] = true
-		logf("js-extract: found JS file %s (ct=%q, body=%d bytes)\n",
-			req.URL, req.Response.ContentType, len(req.Response.Body))
+		logf("js-extract: found JS file %s (ct=%s, body=%d bytes)\n",
+			sanitizeForLog(req.URL), sanitizeForLog(req.Response.ContentType), len(req.Response.Body))
 
 		jsBody := req.Response.Body
 
@@ -514,20 +782,20 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		// strings may be past the truncation point).
 		if len(jsBody) == 0 || len(jsBody) >= MaxResponseBodySize {
 			if len(jsBody) == 0 {
-				logf("js-extract: empty body, fetching %s\n", req.URL)
+				logf("js-extract: empty body, fetching %s\n", sanitizeForLog(req.URL))
 			} else {
 				logf("js-extract: body truncated at %d bytes, re-fetching %s\n",
-					MaxResponseBodySize, req.URL)
+					MaxResponseBodySize, sanitizeForLog(req.URL))
 			}
-			fullBody := fetchJSBody(ctx, cfg, req.URL)
+			fullBody := fetchJSBody(loopCtx, cfg, req.URL, targetOrigin)
 			if fullBody != nil {
 				jsBody = fullBody
-				logf("js-extract: fetched %d bytes from %s\n", len(jsBody), req.URL)
+				logf("js-extract: fetched %d bytes from %s\n", len(jsBody), sanitizeForLog(req.URL))
 			}
 		}
 
 		if len(jsBody) == 0 {
-			logf("js-extract: skipping %s (empty body after fetch attempt)\n", req.URL)
+			logf("js-extract: skipping %s (empty body after fetch attempt)\n", sanitizeForLog(req.URL))
 			continue
 		}
 
@@ -541,13 +809,13 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 			continue
 		}
 		processedJSURLs[jsURL] = true
-		logf("js-extract: fetching HTML-discovered JS %s\n", jsURL)
-		jsBody := fetchJSBody(ctx, cfg, jsURL)
+		logf("js-extract: fetching HTML-discovered JS %s\n", sanitizeForLog(jsURL))
+		jsBody := fetchJSBody(loopCtx, cfg, jsURL, targetOrigin)
 		if jsBody == nil {
-			logf("js-extract: skipping %s (fetch failed)\n", jsURL)
+			logf("js-extract: skipping %s (fetch failed)\n", sanitizeForLog(jsURL))
 			continue
 		}
-		logf("js-extract: fetched %d bytes from %s\n", len(jsBody), jsURL)
+		logf("js-extract: fetched %d bytes from %s\n", len(jsBody), sanitizeForLog(jsURL))
 		processJS(jsURL, jsBody)
 	}
 
@@ -557,23 +825,56 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		return requests
 	}
 
+	// Sort paths for deterministic iteration. Without this, MaxEndpoints
+	// truncation produces a different probed set every run, which makes
+	// the tool's output non-reproducible.
+	sortedPaths := make([]string, 0, len(allPaths))
+	for p := range allPaths {
+		sortedPaths = append(sortedPaths, p)
+	}
+	sort.Strings(sortedPaths)
+
 	// Probe each discovered API path with a raw HTTP request.
 	result := make([]ObservedRequest, len(requests))
 	copy(result, requests)
 
 	probed := 0
-	for path := range allPaths {
+	for _, path := range sortedPaths {
 		if probed >= cfg.MaxEndpoints {
 			break
 		}
 
-		// Full URLs are probed as-is; relative paths are resolved against baseURL.
+		// Full URLs are probed as-is; relative paths are resolved against
+		// the target origin.
 		fullURL := path
 		if !strings.HasPrefix(path, "http://") && !strings.HasPrefix(path, "https://") {
-			fullURL = baseURL + path
+			fullURL = targetOrigin + path
 		}
 
-		resp := probeURL(ctx, cfg, fullURL)
+		// Same-origin gate: by default, drop URLs whose origin doesn't
+		// match the scan target. This prevents the JS bundle from using
+		// Vespasian as a request reflector and stops auth-header leaks
+		// to attacker-controlled hosts.
+		if !cfg.AllowCrossOrigin && !isSameOrigin(fullURL, targetOrigin) {
+			warnf("js-extract: skipping cross-origin URL %s (use AllowCrossOrigin to allow)\n",
+				sanitizeForLog(fullURL))
+			probed++
+			continue
+		}
+
+		// SSRF validation: refuse private/loopback/link-local destinations
+		// unless the operator has explicitly opted in via AllowPrivate.
+		if !cfg.AllowPrivate {
+			if err := ssrf.ValidateURL(fullURL); err != nil {
+				warnf("js-extract: skipping %s: %v\n", sanitizeForLog(fullURL), err)
+				probed++
+				continue
+			}
+		}
+
+		probed++
+
+		resp := probeURL(loopCtx, cfg, fullURL, targetOrigin)
 		if resp == nil {
 			continue
 		}
@@ -586,14 +887,28 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 			continue
 		}
 
+		// Defensive header copy: cfg.Headers is shared across all
+		// callers, so capture a snapshot per result to avoid later
+		// mutations bleeding into already-recorded requests. Recorded
+		// headers track what the wire actually carried — empty for
+		// cross-origin probes (see header-forwarding gate above).
+		var recorded map[string]string
+		if isSameOrigin(fullURL, targetOrigin) {
+			recorded = copyHeaders(cfg.Headers)
+		}
+
 		result = append(result, ObservedRequest{
 			Method:   "GET",
 			URL:      fullURL,
-			Headers:  cfg.Headers,
+			Headers:  recorded,
 			Response: *resp,
 			Source:   "js-extract",
 		})
-		probed++
+	}
+
+	if probed >= cfg.MaxEndpoints && len(sortedPaths) > cfg.MaxEndpoints {
+		warnf("js-extract: warning: probed %d/%d discovered paths (MaxEndpoints limit reached; raise MaxEndpoints to scan more)\n",
+			probed, len(sortedPaths))
 	}
 
 	return result
@@ -601,28 +916,64 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 
 // --- HTTP helpers ---
 
-// fetchJSBody re-fetches a JS file with a larger body limit than the crawler uses.
-// Returns nil if the response is an error, HTML (SPA catch-all), or unreadable.
-func fetchJSBody(ctx context.Context, cfg JSReplayConfig, rawURL string) []byte {
+// doRequest builds and executes an HTTP GET against rawURL using cfg.Client.
+// Headers from cfg.Headers are attached only when rawURL is same-origin with
+// targetOrigin (or AllowCrossOrigin is true). The caller must ensure the
+// response body is consumed and closed via the returned cleanup function.
+func doRequest(ctx context.Context, cfg JSReplayConfig, rawURL, targetOrigin string) (*http.Response, func(), error) {
 	reqCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
-	defer cancel()
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil
-	}
-	for k, v := range cfg.Headers {
-		req.Header.Set(k, v)
+		cancel()
+		return nil, func() {}, err
 	}
 
-	resp, err := cfg.Client.Do(req) //nolint:gosec // G704: intentional outbound fetch of JS file
+	// Same-origin gate for header forwarding: never send Authorization /
+	// Cookie / X-API-Key to an off-target host, even when AllowCrossOrigin
+	// permits the probe (SEC-BE-002, SEC-BE-006). Header forwarding is
+	// strictly tied to host equality, not to whether the probe was allowed.
+	if isSameOrigin(rawURL, targetOrigin) {
+		for k, v := range cfg.Headers {
+			req.Header.Set(k, v)
+		}
+	}
+
+	resp, err := cfg.Client.Do(req) //nolint:gosec // G704: intentional outbound request to discovered URL
+	if err != nil {
+		cancel()
+		return nil, func() {}, err
+	}
+
+	cleanup := func() {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // drain body before close
+		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close
+		cancel()
+	}
+	return resp, cleanup, nil
+}
+
+// fetchJSBody re-fetches a JS file with a larger body limit than the crawler uses.
+// Returns nil if the response is an error, HTML (SPA catch-all), or unreadable.
+// Off-origin URLs are skipped unless AllowCrossOrigin is set.
+func fetchJSBody(ctx context.Context, cfg JSReplayConfig, rawURL, targetOrigin string) []byte {
+	if !cfg.AllowCrossOrigin && !isSameOrigin(rawURL, targetOrigin) {
+		// Don't re-fetch cross-origin scripts: it both leaks the user's
+		// headers (when AllowCrossOrigin is false) and turns Vespasian
+		// into a third-party-CDN reflector for the JS bundle author.
+		return nil
+	}
+	if !cfg.AllowPrivate {
+		if err := ssrf.ValidateURL(rawURL); err != nil {
+			return nil
+		}
+	}
+
+	resp, cleanup, err := doRequest(ctx, cfg, rawURL, targetOrigin)
 	if err != nil {
 		return nil
 	}
-	defer func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // drain body before close
-		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close
-	}()
+	defer cleanup()
 
 	if resp.StatusCode >= 400 {
 		return nil
@@ -662,26 +1013,12 @@ func looksLikeHTML(body []byte) bool {
 }
 
 // probeURL makes a direct HTTP GET request to the URL and returns the response.
-func probeURL(ctx context.Context, cfg JSReplayConfig, rawURL string) *ObservedResponse {
-	reqCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, rawURL, nil)
+func probeURL(ctx context.Context, cfg JSReplayConfig, rawURL, targetOrigin string) *ObservedResponse {
+	resp, cleanup, err := doRequest(ctx, cfg, rawURL, targetOrigin)
 	if err != nil {
 		return nil
 	}
-	for k, v := range cfg.Headers {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := cfg.Client.Do(req) //nolint:gosec // G704: intentional outbound probe of discovered endpoint
-	if err != nil {
-		return nil
-	}
-	defer func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // drain body before close
-		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close
-	}()
+	defer cleanup()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxReplayBodySize))
 	if err != nil {

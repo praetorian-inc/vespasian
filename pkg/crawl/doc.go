@@ -21,12 +21,26 @@
 // ObservedRequest structs that serves as the interchange format between the
 // capture stage (crawl or import) and the generation stage.
 //
+// After the headless crawl, the package runs a post-crawl JS extraction
+// step that scans response bodies of JavaScript bundles for API path
+// strings and probes them with raw HTTP requests. This recovers endpoints
+// that the headless browser cannot exercise (paths gated behind user
+// interactions or built from runtime string concatenations) and bypasses
+// SPA catch-all routing that would otherwise return index.html instead of
+// API responses.
+//
 // Key types:
 //   - [Crawler] orchestrates a headless browser crawl with configurable depth,
 //     page limits, timeouts, and scope restrictions.
 //   - [BrowserManager] manages Chrome process lifecycle, including proxy
 //     configuration and graceful shutdown.
 //   - [ObservedRequest] and [ObservedResponse] represent captured HTTP traffic.
+//   - [JSReplayConfig] and [ReplayJSExtracted] implement the post-crawl JS
+//     bundle scanning step. The replay step enforces a same-origin gate
+//     (auth headers and probes are restricted to the scan target's origin
+//     by default) and uses [github.com/praetorian-inc/vespasian/pkg/ssrf]
+//     for SSRF protection unless the operator explicitly opts out via
+//     AllowPrivate.
 //
 // [Katana]: https://github.com/projectdiscovery/katana
 package crawl

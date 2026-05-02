@@ -639,9 +639,11 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	// which gets the SPA shell (index.html) instead of the API response. Re-fetching
 	// them with a direct HTTP request reaches the actual API backend.
 	requests = crawl.ReplayJSExtracted(genCtx, requests, crawl.JSReplayConfig{
-		Headers: bs.opts.Headers,
-		Verbose: c.Verbose,
-		Stderr:  os.Stderr,
+		Headers:      bs.opts.Headers,
+		TargetURL:    c.URL,
+		AllowPrivate: c.DangerousAllowPrivate,
+		Verbose:      c.Verbose,
+		Stderr:       os.Stderr,
 	})
 
 	spec, err := generateSpec(genCtx, requests, generateSpecOptions{
