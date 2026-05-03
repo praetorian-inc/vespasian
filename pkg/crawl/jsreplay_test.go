@@ -1497,25 +1497,43 @@ func TestExtractTemplateLiteralPaths_NestedLiterals(t *testing.T) {
 	// with the outer ones, producing a garbage path. The interpolation-aware
 	// walker must recurse into the inner ${`...`} and emerge with the outer
 	// literal correctly bounded.
-	js := []byte("const url = `/api/v1/items/${`p${idx}`}/data`;")
-	got := extractTemplateLiteralPaths(js)
-	// Outer literal reconstructs to /api/v1/items/{param}/data; the inner
-	// `p${idx}` doesn't match an API indicator, so it's not surfaced.
-	assert.Contains(t, got, "/api/v1/items/{param}/data",
-		"outer template literal must reconstruct correctly even with nested literals")
+	t.Run("inner literal without API indicator is not surfaced", func(t *testing.T) {
+		js := []byte("const url = `/api/v1/items/${`p${idx}`}/data`;")
+		got := extractTemplateLiteralPaths(js)
+		assert.Equal(t, []string{"/api/v1/items/{param}/data"}, got,
+			"only the outer literal should surface; the inner `p${idx}` has no API indicator")
+	})
+
+	t.Run("nested literal must not bleed into outer reconstruction", func(t *testing.T) {
+		// Failure mode of naive pairing: the inner literal's bytes leak
+		// into the outer reconstruction (e.g., the closing backtick of
+		// the inner pairs with the opening of the outer, producing
+		// `/api/v1/outer/${`+/api/v1/inner+...`). The walker must keep
+		// the outer literal exactly bounded.
+		js := []byte("const u = `/api/v1/outer/${`/api/v1/inner`}/end`;")
+		got := extractTemplateLiteralPaths(js)
+		require.Len(t, got, 1, "exactly one outer literal expected")
+		assert.Equal(t, "/api/v1/outer/{param}/end", got[0],
+			"outer literal must reconstruct independently of the inner")
+	})
 }
 
 func TestExtractTemplateLiteralPaths_EscapedBacktick(t *testing.T) {
 	// Backslash-escaped backticks inside a template literal must not close
-	// the outer literal.
-	js := []byte("const url = `/api/v1/escaped/\\`/data`;")
-	got := extractTemplateLiteralPaths(js)
-	// Either we surface a path with the escape preserved, or none at all —
-	// what we MUST NOT do is mispair to produce e.g. `/api/v1/escaped/`
-	// (closing at the escaped backtick) followed by orphaned junk.
-	for _, p := range got {
-		assert.NotContains(t, p, "data`", "must not mispair on escaped backtick")
-	}
+	// the outer literal. The walker should treat them as literal characters.
+	t.Run("escaped backtick keeps outer literal intact", func(t *testing.T) {
+		js := []byte("const url = `/api/v1/escaped/x\\`y/data`;")
+		got := extractTemplateLiteralPaths(js)
+		require.Len(t, got, 1, "exactly one literal expected")
+		// The escape is preserved verbatim in the reconstruction; what we
+		// MUST NOT do is mispair (closing at the escaped backtick) and
+		// produce `/api/v1/escaped/x` plus orphaned junk.
+		assert.Contains(t, got[0], "/api/v1/escaped/")
+		assert.Contains(t, got[0], "/data")
+		for _, p := range got {
+			assert.NotContains(t, p, "data`", "must not mispair on escaped backtick")
+		}
+	})
 }
 
 // --- CR-8: 3xx redirect follow ---
@@ -1541,9 +1559,9 @@ func TestFetchJSBody_FollowsRedirect(t *testing.T) {
 }
 
 func TestFetchJSBody_RedirectLoopBounded(t *testing.T) {
-	hits := 0
+	hits := int32(0)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits++
+		atomic.AddInt32(&hits, 1)
 		// Always redirect to itself: should bail out after maxJSRedirects.
 		http.Redirect(w, r, r.URL.Path, http.StatusFound)
 	}))
@@ -1552,15 +1570,21 @@ func TestFetchJSBody_RedirectLoopBounded(t *testing.T) {
 	cfg := allowLocal(srv).withDefaults()
 	body := fetchJSBody(context.Background(), cfg, srv.URL+"/loop.js", srv.URL)
 	assert.Nil(t, body, "infinite redirect chain must terminate with nil body")
-	assert.LessOrEqual(t, hits, maxJSRedirects+1,
-		"redirect-loop bound must cap server hits (got %d, cap %d)", hits, maxJSRedirects+1)
+	// Exact equality: the original request + maxJSRedirects follow-ups =
+	// maxJSRedirects+1 server hits. Off-by-one in either direction is a
+	// regression in the security invariant.
+	assert.Equal(t, int32(maxJSRedirects+1), atomic.LoadInt32(&hits),
+		"redirect-loop bound must produce exactly maxJSRedirects+1 hits")
 }
 
 func TestFetchJSBody_RedirectToCrossOriginRejected(t *testing.T) {
 	// A redirect that lands on a different origin must be rejected by the
 	// same-origin gate (unless AllowCrossOrigin is set), even when the
-	// initial request was same-origin.
+	// initial request was same-origin. We attribute the rejection by
+	// asserting zero hits on the off-origin server.
+	offHits := int32(0)
 	off := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&offHits, 1)
 		w.Header().Set("Content-Type", "application/javascript")
 		w.Write([]byte(`var leak = "/api/v1/leak";`)) //nolint:errcheck,gosec // test handler
 	}))
@@ -1574,4 +1598,74 @@ func TestFetchJSBody_RedirectToCrossOriginRejected(t *testing.T) {
 	cfg := allowLocal(srv).withDefaults()
 	body := fetchJSBody(context.Background(), cfg, srv.URL+"/redir.js", srv.URL)
 	assert.Nil(t, body, "redirect to cross-origin host must be rejected when AllowCrossOrigin is false")
+	assert.Equal(t, int32(0), atomic.LoadInt32(&offHits),
+		"the off-origin server must not be hit — rejection must happen at the same-origin gate")
+}
+
+// --- TEST-004 (iter-5): resolveRedirect direct cases ---
+
+func TestResolveRedirect(t *testing.T) {
+	cases := []struct {
+		name    string
+		current string
+		loc     string
+		want    string
+		wantErr bool
+	}{
+		{"absolute https", "https://example.com/old", "https://other.example/new", "https://other.example/new", false},
+		{"path-relative", "https://example.com/dir/old.js", "/abs/new.js", "https://example.com/abs/new.js", false},
+		{"parent-relative", "https://example.com/dir/sub/old.js", "../new.js", "https://example.com/dir/new.js", false},
+		{"scheme-relative", "https://example.com/old", "//cdn.example/new.js", "https://cdn.example/new.js", false},
+		{"same-page anchor", "https://example.com/old", "#frag", "https://example.com/old#frag", false},
+		{"empty location surfaces empty result", "https://example.com/old", "", "https://example.com/old", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveRedirect(tc.current, tc.loc)
+			if tc.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestResolveRedirect_InvalidCurrent(t *testing.T) {
+	// Control byte forces url.Parse to error.
+	_, err := resolveRedirect("http://example.com/\x00bad", "/new")
+	assert.Error(t, err)
+}
+
+// --- TEST-001 (iter-5): caller's *http.Client is not mutated by withDefaults ---
+
+func TestJSReplayConfig_WithDefaults_DoesNotMutateCallerClient(t *testing.T) {
+	// Hand withDefaults a client whose CheckRedirect IS NOT noRedirect.
+	// withDefaults must shallow-copy the client and set CheckRedirect on
+	// the copy — the caller's original CheckRedirect must remain unchanged.
+	called := int32(0)
+	originalCheck := func(*http.Request, []*http.Request) error {
+		atomic.AddInt32(&called, 1)
+		return nil
+	}
+	caller := &http.Client{
+		CheckRedirect: originalCheck,
+		Transport:     &http.Transport{},
+	}
+
+	for _, allowPrivate := range []bool{false, true} {
+		t.Run("AllowPrivate="+map[bool]string{false: "false", true: "true"}[allowPrivate], func(t *testing.T) {
+			cfg := JSReplayConfig{Client: caller, AllowPrivate: allowPrivate}.withDefaults()
+			// Sanity: withDefaults installed noRedirect on the copy.
+			err := cfg.Client.CheckRedirect(nil, nil)
+			assert.True(t, errors.Is(err, http.ErrUseLastResponse),
+				"withDefaults must install noRedirect on the returned client")
+			// Caller's CheckRedirect must still be the original.
+			require.NotNil(t, caller.CheckRedirect, "caller.CheckRedirect must not be wiped")
+			_ = caller.CheckRedirect(nil, nil)
+		})
+	}
+	assert.Equal(t, int32(2), atomic.LoadInt32(&called),
+		"caller.CheckRedirect must be preserved across both AllowPrivate modes")
 }

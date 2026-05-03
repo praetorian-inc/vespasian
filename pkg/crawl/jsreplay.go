@@ -628,7 +628,7 @@ func extractTemplateLiteralPaths(jsBody []byte) []string {
 // matches the opening backtick before `start`, walking past `${...}`
 // interpolations and any nested template literals inside them. Returns -1
 // if no matching backtick is found.
-func findTemplateLiteralEnd(jsBody []byte, start int) int {
+func findTemplateLiteralEnd(jsBody []byte, start int) int { //nolint:gocyclo // template-literal state machine — splitting hurts readability
 	exprDepth := 0 // brace depth inside ${...} on the current literal
 	for i := start; i < len(jsBody); i++ {
 		c := jsBody[i]
@@ -660,6 +660,14 @@ func findTemplateLiteralEnd(jsBody []byte, start int) int {
 			exprDepth++
 		case '}':
 			exprDepth--
+			if exprDepth < 0 {
+				// Malformed JS: unbalanced '}' inside a ${...}
+				// interpolation. Without this guard, exprDepth stays
+				// negative and the top-level branch (which recognizes
+				// the closing backtick) is never re-entered, so we'd
+				// silently scan to end-of-input. Bail explicitly.
+				return -1
+			}
 		case '\\':
 			if i+1 < len(jsBody) {
 				i++
