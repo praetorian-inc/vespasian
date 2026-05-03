@@ -131,10 +131,34 @@ func (cfg JSReplayConfig) withDefaults() JSReplayConfig {
 	}
 	if cfg.Client == nil {
 		cfg.Client = newSSRFSafeClient(cfg.Timeout, cfg.AllowPrivate)
-	} else if !cfg.AllowPrivate {
-		cfg.Client = wrapClientWithSSRF(cfg.Client, cfg.Timeout, cfg.Stderr)
+	} else {
+		// Caller supplied a client. SSRF-wrap when AllowPrivate is false,
+		// and always enforce our redirect policy: probeURL records the
+		// status we asked for (no auto-follow), and fetchJSBody follows
+		// 3xx manually with bounded depth + per-hop SSRF/same-origin
+		// re-validation.
+		if !cfg.AllowPrivate {
+			cfg.Client = wrapClientWithSSRF(cfg.Client, cfg.Timeout, cfg.Stderr)
+		} else {
+			// AllowPrivate path: still need a copy so we don't mutate the
+			// caller's CheckRedirect.
+			clone := *cfg.Client
+			cfg.Client = &clone
+			if cfg.Client.Timeout == 0 {
+				cfg.Client.Timeout = cfg.Timeout
+			}
+		}
+		cfg.Client.CheckRedirect = noRedirect
 	}
 	return cfg
+}
+
+// noRedirect is the redirect policy used by ReplayJSExtracted's HTTP client.
+// It causes Go's http.Client to return 3xx responses verbatim instead of
+// auto-following them; probeURL needs the actual response from the URL we
+// asked for, and fetchJSBody manages its own bounded redirect-follow loop.
+func noRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 // wrapClientWithSSRF returns a copy of caller with its transport replaced by
@@ -195,11 +219,9 @@ func newSSRFSafeClient(timeout time.Duration, allowPrivate bool) *http.Client {
 		transport.DialContext = ssrf.SafeDialContext
 	}
 	return &http.Client{
-		Timeout:   timeout,
-		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+		Timeout:       timeout,
+		Transport:     transport,
+		CheckRedirect: noRedirect,
 	}
 }
 
@@ -355,11 +377,6 @@ var apiIndicators = []string{"api/", "v1/", "v2/", "v3/", "v4/", "rest/", "rpc/"
 
 // staticFileExts are file extensions to skip when extracting API paths.
 var staticFileExts = []string{".js", ".css", ".map", ".html", ".htm", ".png", ".jpg", ".svg"}
-
-// templateLiteralOpenPattern locates opening backticks of a template literal.
-// extractTemplateLiteralPaths walks the body byte-by-byte starting from each
-// match to handle ${...} interpolations correctly.
-var templateLiteralOpenPattern = regexp.MustCompile("`")
 
 // --- Helper functions ---
 
@@ -580,25 +597,76 @@ func extractServicePrefixes(jsBody []byte, requests []ObservedRequest) []string 
 // and reconstructs the literal segments around ${...} interpolations into
 // path templates with {param}-style placeholders.
 //
-// E.g., `/api/users/${id}/profile` -> /api/users/{id}/profile
+// The walker is interpolation-aware: backticks that appear inside a `${...}`
+// expression are treated as nested template literals (their own opening/closing
+// backticks) rather than as a closing delimiter for the outer literal. Without
+// this, `outer ${`inner`}` would be mispaired and produce garbled output.
+//
+// E.g., `/api/users/${id}/profile` -> /api/users/{param}/profile
 func extractTemplateLiteralPaths(jsBody []byte) []string {
 	var paths []string
-	starts := templateLiteralOpenPattern.FindAllIndex(jsBody, -1)
-	// FindAllIndex returns every backtick; pair them up sequentially.
-	for i := 0; i+1 < len(starts); i += 2 {
-		open := starts[i][1]       // byte after opening backtick
-		closeIdx := starts[i+1][0] // byte of closing backtick
-		if closeIdx <= open {
+	for i := 0; i < len(jsBody); i++ {
+		if jsBody[i] != '`' {
 			continue
 		}
-		segment := jsBody[open:closeIdx]
-		path, ok := reconstructTemplateLiteral(segment)
-		if !ok {
-			continue
+		// Found an opening backtick. Find the matching closing backtick at
+		// the same nesting level.
+		end := findTemplateLiteralEnd(jsBody, i+1)
+		if end < 0 {
+			break // unterminated literal — bail out of the whole scan
 		}
-		paths = append(paths, path)
+		segment := jsBody[i+1 : end]
+		if path, ok := reconstructTemplateLiteral(segment); ok {
+			paths = append(paths, path)
+		}
+		i = end // resume scanning after the closing backtick
 	}
 	return paths
+}
+
+// findTemplateLiteralEnd returns the index of the closing backtick that
+// matches the opening backtick before `start`, walking past `${...}`
+// interpolations and any nested template literals inside them. Returns -1
+// if no matching backtick is found.
+func findTemplateLiteralEnd(jsBody []byte, start int) int {
+	exprDepth := 0 // brace depth inside ${...} on the current literal
+	for i := start; i < len(jsBody); i++ {
+		c := jsBody[i]
+		if exprDepth == 0 {
+			if c == '`' {
+				return i
+			}
+			if c == '$' && i+1 < len(jsBody) && jsBody[i+1] == '{' {
+				exprDepth = 1
+				i++ // skip the '{'
+				continue
+			}
+			if c == '\\' && i+1 < len(jsBody) {
+				i++ // skip the escaped byte
+				continue
+			}
+			continue
+		}
+		// We're inside a ${...} expression. Skip nested template literals
+		// recursively so their backticks don't close the outer one.
+		switch c {
+		case '`':
+			nested := findTemplateLiteralEnd(jsBody, i+1)
+			if nested < 0 {
+				return -1
+			}
+			i = nested
+		case '{':
+			exprDepth++
+		case '}':
+			exprDepth--
+		case '\\':
+			if i+1 < len(jsBody) {
+				i++
+			}
+		}
+	}
+	return -1
 }
 
 // reconstructTemplateLiteral converts a single template literal body (the
@@ -1048,50 +1116,117 @@ func doRequest(ctx context.Context, cfg JSReplayConfig, rawURL, targetOrigin str
 	return resp, cleanup, nil
 }
 
-// fetchJSBody re-fetches a JS file with a larger body limit than the crawler uses.
-// Returns nil if the response is an error, HTML (SPA catch-all), or unreadable.
-// Off-origin URLs are skipped unless AllowCrossOrigin is set.
+// maxJSRedirects bounds the number of 3xx redirects fetchJSBody will follow
+// when a CDN serves a JS bundle behind a redirect. Production CDNs typically
+// chain at most 1-2 redirects (e.g., versioned to immutable URL); 5 is
+// generous and aligns with browser behavior.
+const maxJSRedirects = 5
+
+// fetchJSBody re-fetches a JS file with a larger body limit than the crawler
+// uses. Returns nil if the response is an error, HTML (SPA catch-all), or
+// unreadable. Off-origin URLs are skipped unless AllowCrossOrigin is set.
+//
+// Because the shared *http.Client refuses redirects (CheckRedirect returns
+// ErrUseLastResponse so probe results record the actual response from the
+// requested URL), this function manually follows up to maxJSRedirects 3xx
+// responses before applying the HTML/error-status filters. Each hop is
+// re-validated against the same-origin gate and SSRF checks so a malicious
+// JS URL cannot redirect into a private destination or off-target host.
 func fetchJSBody(ctx context.Context, cfg JSReplayConfig, rawURL, targetOrigin string) []byte {
+	for hop := 0; hop <= maxJSRedirects; hop++ {
+		if !canFetchURL(ctx, cfg, rawURL, targetOrigin) {
+			return nil
+		}
+		body, redirectTo, terminal := fetchJSBodyHop(ctx, cfg, rawURL, targetOrigin)
+		if terminal {
+			return body
+		}
+		if redirectTo == "" || hop == maxJSRedirects {
+			return nil
+		}
+		rawURL = redirectTo
+	}
+	return nil
+}
+
+// canFetchURL applies the same-origin gate and SSRF check before any HTTP
+// request is issued. Returns false if the URL must not be fetched.
+func canFetchURL(ctx context.Context, cfg JSReplayConfig, rawURL, targetOrigin string) bool {
 	if !cfg.AllowCrossOrigin && !isSameOrigin(rawURL, targetOrigin) {
 		// Don't re-fetch cross-origin scripts: it both leaks the user's
 		// headers (when AllowCrossOrigin is false) and turns Vespasian
 		// into a third-party-CDN reflector for the JS bundle author.
-		return nil
+		return false
 	}
 	if !cfg.AllowPrivate {
 		if err := ssrf.ValidateURLContext(ctx, rawURL); err != nil {
-			return nil
+			return false
 		}
 	}
+	return true
+}
 
+// fetchJSBodyHop performs a single HTTP GET and classifies the response.
+// Returns (body, "", true) when the response is terminal (a final body or
+// an error to surface as nil), or (nil, redirectURL, false) when the caller
+// should follow a 3xx to redirectURL.
+func fetchJSBodyHop(ctx context.Context, cfg JSReplayConfig, rawURL, targetOrigin string) (body []byte, redirectTo string, terminal bool) {
 	resp, cleanup, err := doRequest(ctx, cfg, rawURL, targetOrigin)
 	if err != nil {
-		return nil
+		return nil, "", true
 	}
 	defer cleanup()
 
+	// 3xx: caller follows.
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		loc := resp.Header.Get("Location")
+		if loc == "" {
+			return nil, "", true
+		}
+		next, err := resolveRedirect(rawURL, loc)
+		if err != nil {
+			return nil, "", true
+		}
+		return nil, next, false
+	}
+
 	if resp.StatusCode >= 400 {
-		return nil
+		return nil, "", true
 	}
 
 	// Reject HTML responses — the URL likely hit an SPA catch-all route
 	// that serves index.html for any unknown path.
 	if isHTMLResponse(resp.Header.Get("Content-Type")) {
-		return nil
+		return nil, "", true
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxJSBodySize))
+	read, err := io.ReadAll(io.LimitReader(resp.Body, maxJSBodySize))
 	if err != nil {
-		return nil
+		return nil, "", true
 	}
 
 	// Guard against servers that don't set Content-Type: if the body
 	// starts with <!DOCTYPE or <html, it's HTML, not JavaScript.
-	if len(body) > 0 && looksLikeHTML(body) {
-		return nil
+	if len(read) > 0 && looksLikeHTML(read) {
+		return nil, "", true
 	}
 
-	return body
+	return read, "", true
+}
+
+// resolveRedirect resolves the Location header value against the current URL,
+// returning the absolute URL of the next hop. Empty input or unparsable
+// values produce an error so callers can abort the chain.
+func resolveRedirect(currentURL, location string) (string, error) {
+	cur, err := url.Parse(currentURL)
+	if err != nil {
+		return "", err
+	}
+	loc, err := url.Parse(location)
+	if err != nil {
+		return "", err
+	}
+	return cur.ResolveReference(loc).String(), nil
 }
 
 // looksLikeHTML checks if a response body appears to be HTML content

@@ -1489,3 +1489,89 @@ func TestReplayJSExtracted_CrAPIStyleRegression(t *testing.T) {
 	assert.GreaterOrEqual(t, len(probed), 8,
 		"expected at least 8 endpoints from crAPI-style fixture; got %d (%v)", len(probed), probed)
 }
+
+// --- CR-7: nested template literal pairing ---
+
+func TestExtractTemplateLiteralPaths_NestedLiterals(t *testing.T) {
+	// Naive sequential backtick pairing would mispair the inner backticks
+	// with the outer ones, producing a garbage path. The interpolation-aware
+	// walker must recurse into the inner ${`...`} and emerge with the outer
+	// literal correctly bounded.
+	js := []byte("const url = `/api/v1/items/${`p${idx}`}/data`;")
+	got := extractTemplateLiteralPaths(js)
+	// Outer literal reconstructs to /api/v1/items/{param}/data; the inner
+	// `p${idx}` doesn't match an API indicator, so it's not surfaced.
+	assert.Contains(t, got, "/api/v1/items/{param}/data",
+		"outer template literal must reconstruct correctly even with nested literals")
+}
+
+func TestExtractTemplateLiteralPaths_EscapedBacktick(t *testing.T) {
+	// Backslash-escaped backticks inside a template literal must not close
+	// the outer literal.
+	js := []byte("const url = `/api/v1/escaped/\\`/data`;")
+	got := extractTemplateLiteralPaths(js)
+	// Either we surface a path with the escape preserved, or none at all —
+	// what we MUST NOT do is mispair to produce e.g. `/api/v1/escaped/`
+	// (closing at the escaped backtick) followed by orphaned junk.
+	for _, p := range got {
+		assert.NotContains(t, p, "data`", "must not mispair on escaped backtick")
+	}
+}
+
+// --- CR-8: 3xx redirect follow ---
+
+func TestFetchJSBody_FollowsRedirect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/old.js":
+			http.Redirect(w, r, "/new.js", http.StatusMovedPermanently)
+		case "/new.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			w.Write([]byte(`var endpoint = "/api/v1/redirected";`)) //nolint:errcheck,gosec // test handler
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := allowLocal(srv).withDefaults()
+	body := fetchJSBody(context.Background(), cfg, srv.URL+"/old.js", srv.URL)
+	require.NotNil(t, body, "fetchJSBody must follow 301 to recover the JS")
+	assert.Contains(t, string(body), "/api/v1/redirected")
+}
+
+func TestFetchJSBody_RedirectLoopBounded(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		// Always redirect to itself: should bail out after maxJSRedirects.
+		http.Redirect(w, r, r.URL.Path, http.StatusFound)
+	}))
+	defer srv.Close()
+
+	cfg := allowLocal(srv).withDefaults()
+	body := fetchJSBody(context.Background(), cfg, srv.URL+"/loop.js", srv.URL)
+	assert.Nil(t, body, "infinite redirect chain must terminate with nil body")
+	assert.LessOrEqual(t, hits, maxJSRedirects+1,
+		"redirect-loop bound must cap server hits (got %d, cap %d)", hits, maxJSRedirects+1)
+}
+
+func TestFetchJSBody_RedirectToCrossOriginRejected(t *testing.T) {
+	// A redirect that lands on a different origin must be rejected by the
+	// same-origin gate (unless AllowCrossOrigin is set), even when the
+	// initial request was same-origin.
+	off := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Write([]byte(`var leak = "/api/v1/leak";`)) //nolint:errcheck,gosec // test handler
+	}))
+	defer off.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, off.URL+"/cdn.js", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	cfg := allowLocal(srv).withDefaults()
+	body := fetchJSBody(context.Background(), cfg, srv.URL+"/redir.js", srv.URL)
+	assert.Nil(t, body, "redirect to cross-origin host must be rejected when AllowCrossOrigin is false")
+}

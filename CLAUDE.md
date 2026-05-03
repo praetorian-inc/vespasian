@@ -73,7 +73,7 @@ The CLI (`cmd/vespasian`) uses Kong for argument parsing. Each command (crawl, i
 - **pkg/generate/rest**: OpenAPI 3.0 generation, path normalization (UUID detection, context-aware parameter naming), JSON schema inference
 - **pkg/generate/graphql**: GraphQL SDL generation from introspection results or traffic-based inference
 - **pkg/generate/wsdl**: WSDL generation from SOAP traffic, WSDL document parsing, type inference from SOAP envelopes
-- **pkg/importer**: Traffic importers for Burp Suite XML, HAR 1.2, and mitmproxy dumps; format registry with size limits (500MB)
+- **pkg/importer**: Traffic importers for Burp Suite XML, HAR 1.2, and mitmproxy dumps (including mitmproxy's native tnetstring `.mitm` format); format registry with layered safety caps — 500 MB per file, 64 MB per tnetstring element, 1 M entries per list/dict, 500 K flows per native stream
 
 ### Key Patterns
 
@@ -102,6 +102,8 @@ The `test/` directory contains live test targets:
 - **test/rest-api/**: Go HTTP server exposing REST endpoints for end-to-end testing
 - **test/soap-service/**: Go HTTP server exposing SOAP/WSDL endpoints
 - **test/graphql-server/**: Node.js GraphQL server with Apollo
+
+See `test/README.md` for how to run the suite, including the `TEST_HOST` override for devcontainer setups.
 
 ## Code Conventions
 

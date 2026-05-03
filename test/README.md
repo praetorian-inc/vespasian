@@ -36,11 +36,13 @@ For each target:
 
 1. **Build** vespasian and target binaries
 2. **Start** target services (with auto-resolved ports)
-3. **Crawl** — `vespasian crawl <url> -o capture.json`
+3. **Crawl** — `vespasian crawl <url> --dangerous-allow-private -o capture.json`
 4. **Validate capture** — Check request count and expected URLs
 5. **Generate** — `vespasian generate <type> capture.json -o spec.<ext>`
 6. **Validate spec** — Path/operation coverage, schema structure, no static assets
 7. **Print summary** — Pass/fail status with endpoint counts and durations
+
+> **Why `--dangerous-allow-private`?** All live targets run on `localhost`, which the crawler's SSRF gate treats as a private host. The flag is required on every `vespasian crawl` invocation in this suite; running without it will exit non-zero with `seed URL rejected by frontier ...`. The flag name reflects production-risk semantics — pass it only when you intend to crawl a known-private host (e.g., this suite, or an internal-network assessment).
 
 For the GraphQL live test (`graphql-server`):
 
@@ -98,6 +100,22 @@ Options:
 ```
 
 ## Configuration
+
+### `TEST_HOST` (optional)
+
+`run-live-tests.sh` reaches the target services at `http://${TEST_HOST:-localhost}:<port>`. The default (`localhost`) is correct when the harness and the targets run on the same host.
+
+Override `TEST_HOST` when the harness runs inside a devcontainer while the target services run on the Docker host. Example (Docker Desktop):
+
+```bash
+TEST_HOST=host.docker.internal ./test/run-live-tests.sh --targets rest-api
+```
+
+For Linux devcontainers without Docker Desktop, use the detected host gateway (e.g. the address of the `docker0` bridge or whatever name resolves to the host from inside the container).
+
+`setup-live-targets.sh` does not read `TEST_HOST` — run it on the host that actually runs the target binaries.
+
+### `.live-test-config`
 
 The setup script writes `.live-test-config` with resolved ports:
 
@@ -177,7 +195,7 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 ## Expected Results
 
-All 20 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest).
+All 21 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest).
 
 ```
   TARGET                      STATUS    ENDPOINTS   EXPECTED   DURATION
@@ -198,12 +216,13 @@ All 20 tests should pass. Order is non-deterministic and durations vary by machi
   import-har                  PASS      3           3          1s
   import-malformed            PASS      0           0          1s
   import-mitmproxy            PASS      3           3          0s
+  import-mitmproxy-native     PASS      3           3          1s
   import-unicode              PASS      3           3          0s
   rest-api                    PASS      8           8          79s
   soap-service                PASS      3           3          51s
   spec-edge                   PASS      -           -          0s
 
-  Total: 20 passed, 0 failed, 0 skipped
+  Total: 21 passed, 0 failed, 0 skipped
 ```
 
 Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are informational and do not cause failures.
@@ -284,10 +303,21 @@ brew install --cask google-chrome
 
 ### Crawl produces empty capture
 
-Ensure the target service is running and healthy:
+Ensure the target service is running and healthy. Run the check from the host that started the services (`setup-live-targets.sh` binds to localhost there):
 
 ```bash
 curl http://localhost:8990/api/health
+```
+
+If you're running the harness inside a devcontainer and the targets are on the host, set `TEST_HOST` (see Configuration above) and verify connectivity from inside the container with `curl http://${TEST_HOST}:8990/api/health`. Without `TEST_HOST`, `localhost` resolves to the container's own loopback (not the Docker host), the crawler connects to nothing, and the capture is empty.
+
+### Crawl exits with `seed URL rejected by frontier (scope, SSRF, or parse): ...`
+
+The seed URL is a private host (`localhost`, `127.0.0.1`, RFC1918, or link-local) and `--dangerous-allow-private` was not passed. All live tests in this suite crawl localhost targets, so every `vespasian crawl` invocation in `run-live-tests.sh` already includes the flag. If you are reproducing a single test by hand, add the flag to your command line:
+
+```bash
+./bin/vespasian crawl http://localhost:8990 --dangerous-allow-private \
+    -o /tmp/cap.json --depth 2 --max-pages 50
 ```
 
 ### Build failures

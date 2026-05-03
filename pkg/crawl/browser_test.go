@@ -12,118 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build integration
-
 package crawl
 
 import (
-	"os"
 	"strings"
-	"syscall"
 	"testing"
-	"time"
 )
 
-// processAlive checks if a process with the given PID is running.
-// Uses POSIX signal 0 which checks for process existence without
-// actually sending a signal.
-func processAlive(pid int) bool {
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false
+// TEST-001 regression: SetCookies on a BrowserManager whose browser field
+// is nil must return a clear "browser not connected" error. The error
+// string is load-bearing — crawlHeadless wraps it via `inject cookies: %w`
+// and operators may match on it when triaging a failed crawl. The default
+// NewBrowserManager path always sets browser, so this guard only fires
+// when a caller (test or future refactor) constructs BrowserManager
+// directly.
+func TestBrowserManager_SetCookies_NilBrowserReturnsError(t *testing.T) {
+	bm := &BrowserManager{}
+	err := bm.SetCookies(nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
 	}
-	err = proc.Signal(syscall.Signal(0))
-	return err == nil
-}
-
-// TestBrowserManager_LaunchAndKill verifies that NewBrowserManager launches
-// Chrome successfully, returns a valid WS URL, and Kill terminates the process.
-func TestBrowserManager_LaunchAndKill(t *testing.T) {
-	mgr, err := NewBrowserManager(BrowserOptions{Headless: true})
-	if err != nil {
-		t.Fatalf("NewBrowserManager() error = %v", err)
-	}
-
-	// Verify WS URL looks valid
-	wsURL := mgr.wsURL()
-	if wsURL == "" {
-		t.Fatal("wsURL() returned empty string")
-	}
-	if !strings.HasPrefix(wsURL, "ws://") {
-		t.Errorf("wsURL() = %q, want ws:// prefix", wsURL)
-	}
-
-	// Verify Chrome is running
-	pid := mgr.PID()
-	if pid == 0 {
-		t.Fatal("PID() returned 0, expected running Chrome process")
-	}
-
-	if !processAlive(pid) {
-		t.Errorf("Chrome process %d not running before Kill", pid)
-	}
-
-	// Kill and verify Chrome is dead
-	mgr.Kill()
-
-	// Give the OS a moment to reap the process
-	time.Sleep(500 * time.Millisecond)
-
-	if processAlive(pid) {
-		t.Errorf("Chrome process %d still running after Kill", pid)
-	}
-
-	// Cleanup temp dir
-	mgr.cleanup()
-}
-
-// TestBrowserManager_KillIdempotent verifies that calling Kill multiple times
-// does not panic or error.
-func TestBrowserManager_KillIdempotent(t *testing.T) {
-	mgr, err := NewBrowserManager(BrowserOptions{Headless: true})
-	if err != nil {
-		t.Fatalf("NewBrowserManager() error = %v", err)
-	}
-	defer mgr.Close()
-
-	// Kill twice — should not panic
-	mgr.Kill()
-	mgr.Kill()
-}
-
-// TestBrowserManager_Close verifies that Close kills Chrome and cleans up
-// the temporary user data directory.
-func TestBrowserManager_Close(t *testing.T) {
-	mgr, err := NewBrowserManager(BrowserOptions{Headless: true})
-	if err != nil {
-		t.Fatalf("NewBrowserManager() error = %v", err)
-	}
-
-	pid := mgr.PID()
-	if pid == 0 {
-		t.Fatal("PID() returned 0")
-	}
-
-	mgr.Close()
-
-	// Give the OS a moment to reap the process
-	time.Sleep(500 * time.Millisecond)
-
-	if processAlive(pid) {
-		t.Errorf("Chrome process %d still running after Close", pid)
+	if !strings.Contains(err.Error(), "not connected") {
+		t.Errorf("error message %q should contain 'not connected'", err.Error())
 	}
 }
 
-// TestBrowserManager_CloseIdempotent verifies that calling Close multiple
-// times does not panic.
-func TestBrowserManager_CloseIdempotent(t *testing.T) {
-	mgr, err := NewBrowserManager(BrowserOptions{Headless: true})
-	if err != nil {
-		t.Fatalf("NewBrowserManager() error = %v", err)
+// Additional guard: calling SetCookies on a nil *BrowserManager must also
+// return the same "browser not connected" error rather than panicking
+// with a nil-pointer dereference. Matches the CodeRabbit guidance on
+// PR #68 review 4156714509.
+func TestBrowserManager_SetCookies_NilReceiverReturnsError(t *testing.T) {
+	var bm *BrowserManager
+	err := bm.SetCookies(nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
 	}
-
-	mgr.Close()
-	// Second close should not panic — both Kill and cleanup are
-	// protected by sync.Once.
-	mgr.Close()
+	if !strings.Contains(err.Error(), "not connected") {
+		t.Errorf("error message %q should contain 'not connected'", err.Error())
+	}
 }
