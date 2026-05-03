@@ -296,11 +296,6 @@ func TestHasInlinePrefix(t *testing.T) {
 	assert.False(t, hasInlinePrefix("v2/users"))
 }
 
-func TestResolveBaseURL(t *testing.T) {
-	assert.Equal(t, "https://example.com", resolveBaseURL("https://example.com/static/js/main.js"))
-	assert.Equal(t, "https://api.example.com", resolveBaseURL("https://api.example.com/v1/users"))
-}
-
 func TestJSReplayConfig_WithDefaults(t *testing.T) {
 	t.Run("zero values get defaults", func(t *testing.T) {
 		cfg := JSReplayConfig{AllowPrivate: true}.withDefaults()
@@ -1524,15 +1519,14 @@ func TestExtractTemplateLiteralPaths_EscapedBacktick(t *testing.T) {
 	t.Run("escaped backtick keeps outer literal intact", func(t *testing.T) {
 		js := []byte("const url = `/api/v1/escaped/x\\`y/data`;")
 		got := extractTemplateLiteralPaths(js)
-		require.Len(t, got, 1, "exactly one literal expected")
-		// The escape is preserved verbatim in the reconstruction; what we
-		// MUST NOT do is mispair (closing at the escaped backtick) and
-		// produce `/api/v1/escaped/x` plus orphaned junk.
-		assert.Contains(t, got[0], "/api/v1/escaped/")
-		assert.Contains(t, got[0], "/data")
-		for _, p := range got {
-			assert.NotContains(t, p, "data`", "must not mispair on escaped backtick")
-		}
+		// Pin the exact reconstruction. The walker preserves the verbatim
+		// escape bytes (`\` + backtick) — what it MUST NOT do is mispair
+		// at the escaped backtick and produce `/api/v1/escaped/x` plus
+		// orphaned junk. Pinning the exact string catches both directions
+		// of regression: the escape being silently dropped, AND the
+		// mispairing that this test was originally written to catch.
+		assert.Equal(t, []string{"/api/v1/escaped/x\\`y/data"}, got,
+			"escaped backtick must be preserved and the literal must remain bounded")
 	})
 }
 
@@ -1617,7 +1611,12 @@ func TestResolveRedirect(t *testing.T) {
 		{"parent-relative", "https://example.com/dir/sub/old.js", "../new.js", "https://example.com/dir/new.js", false},
 		{"scheme-relative", "https://example.com/old", "//cdn.example/new.js", "https://cdn.example/new.js", false},
 		{"same-page anchor", "https://example.com/old", "#frag", "https://example.com/old#frag", false},
-		{"empty location surfaces empty result", "https://example.com/old", "", "https://example.com/old", false},
+		// url.Parse("") returns the zero-value URL; ResolveReference
+		// against the current URL returns the current URL unchanged.
+		// fetchJSBody's caller-side code rejects an empty Location BEFORE
+		// invoking resolveRedirect, so this case documents the resolver's
+		// raw contract rather than a code path reached at runtime.
+		{"empty location returns current URL unchanged", "https://example.com/old", "", "https://example.com/old", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -366,14 +366,12 @@ var servicePrefixPattern = regexp.MustCompile(
 	`["']([a-zA-Z][a-zA-Z0-9_-]{1,30}/)["']\s*\+\s*["'](?:api/|v[1-9])`,
 )
 
-// apiIndicators are the path segments that signal an API endpoint.
-//
-// MAINTENANCE: this list is duplicated by hand inside apiPathPattern,
-// templateLiteralPattern, and fullURLPattern above (the regex alternation
-// `api/|v[1-9][0-9]*/|rest/|rpc/|graphql`). When adding a new indicator,
-// update both this slice AND the three regex literals — they are required
-// to stay in sync.
-var apiIndicators = []string{"api/", "v1/", "v2/", "v3/", "v4/", "rest/", "rpc/", "graphql"}
+// apiIndicatorPattern matches the path segments that signal an API endpoint.
+// It is the single source of truth shared with the apiPathPattern,
+// templateLiteralPattern, and fullURLPattern extraction regexes — keeping
+// the alternation in one place prevents the v[1-9][0-9]* vs. v1-v4 drift
+// that the iter-7 review flagged.
+var apiIndicatorPattern = regexp.MustCompile(`(?i)(?:api/|v[1-9][0-9]*/|rest/|rpc/|graphql)`)
 
 // staticFileExts are file extensions to skip when extracting API paths.
 var staticFileExts = []string{".js", ".css", ".map", ".html", ".htm", ".png", ".jpg", ".svg"}
@@ -403,13 +401,7 @@ func isStaticFile(path string) bool {
 
 // hasAPIIndicator reports whether the path contains a known API indicator.
 func hasAPIIndicator(path string) bool {
-	lower := strings.ToLower(path)
-	for _, indicator := range apiIndicators {
-		if strings.Contains(lower, indicator) {
-			return true
-		}
-	}
-	return false
+	return apiIndicatorPattern.MatchString(path)
 }
 
 // hasInlinePrefix reports whether the path has a non-API segment before the
@@ -418,25 +410,8 @@ func hasAPIIndicator(path string) bool {
 // Paths like "api/v2/users" do NOT have an inline prefix — "api/" before "v2/"
 // is itself an API indicator, not a service prefix.
 func hasInlinePrefix(trimmedPath string) bool {
-	// Find the earliest API indicator in the path.
-	earliest := -1
-	for _, indicator := range apiIndicators {
-		idx := strings.Index(trimmedPath, indicator)
-		if idx >= 0 && (earliest < 0 || idx < earliest) {
-			earliest = idx
-		}
-	}
-	// If the first API indicator is not at the start, there's a prefix before it.
-	return earliest > 0
-}
-
-// resolveBaseURL extracts the scheme and host from a target URL.
-func resolveBaseURL(targetURL string) string {
-	u, err := url.Parse(targetURL)
-	if err != nil {
-		return targetURL
-	}
-	return u.Scheme + "://" + u.Host
+	loc := apiIndicatorPattern.FindStringIndex(trimmedPath)
+	return loc != nil && loc[0] > 0
 }
 
 // originOf returns the scheme://host[:port] origin of rawURL, or "" if it
