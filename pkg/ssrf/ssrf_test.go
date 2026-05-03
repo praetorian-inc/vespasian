@@ -22,7 +22,10 @@ import (
 )
 
 func TestValidateURL_PublicURL(t *testing.T) {
-	if err := ValidateURL("https://example.com/api"); err != nil {
+	// Use a public IP literal (Google DNS) so the test does not depend on
+	// outbound DNS or internet access — same code path as a public hostname,
+	// just without the lookup.
+	if err := ValidateURL("https://8.8.8.8/api"); err != nil {
 		t.Errorf("expected public URL to be allowed, got error: %v", err)
 	}
 }
@@ -113,10 +116,13 @@ func TestValidateURL_BlocksUnspecifiedIPv6(t *testing.T) {
 }
 
 func TestValidateURLContext_HonorsDeadline(t *testing.T) {
-	// A canceled ctx should cause LookupIPAddr to fail fast for non-IP hostnames.
+	// A canceled ctx must cause LookupIPAddr to fail for non-IP hostnames.
+	// Use TEST-NET-2 (RFC 5737 documentation range) since we want a host
+	// that requires DNS resolution; the lookup will fail-fast on the
+	// canceled ctx before any actual resolver call.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := ValidateURLContext(ctx, "https://example.com/api")
+	err := ValidateURLContext(ctx, "https://documentation.test/api")
 	if err == nil {
 		t.Error("expected canceled context to fail validation for non-IP host")
 	}

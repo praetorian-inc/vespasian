@@ -30,7 +30,7 @@ func TestValidateProbeURL_DelegatesToSSRF(t *testing.T) {
 		url    string
 		expect bool // true if delegation should report blocked
 	}{
-		{"public URL allowed", "https://example.com/api", false},
+		{"public URL allowed", "https://8.8.8.8/api", false},
 		{"private IP blocked", "http://127.0.0.1/api", true},
 		{"link-local blocked", "http://169.254.169.254/", true},
 		{"non-http scheme blocked", "ftp://example.com/", true},

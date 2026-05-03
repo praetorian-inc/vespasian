@@ -126,29 +126,58 @@ func (cfg JSReplayConfig) withDefaults() JSReplayConfig {
 			cfg.MaxTotalTime = maxTotalTimeCap
 		}
 	}
-	if cfg.Client == nil {
-		cfg.Client = newSSRFSafeClient(cfg.Timeout, cfg.AllowPrivate)
-	} else if !cfg.AllowPrivate {
-		// Caller supplied their own client. Try to install ssrf.SafeDialContext
-		// on its transport so we don't silently lose the dial-time SSRF check
-		// (a TOCTOU window for DNS rebinding between ValidateURL and the
-		// actual TCP connect). If the transport is not an *http.Transport we
-		// cannot wrap it; fall back to enforcing the pre-dial validation only.
-		if t, ok := cfg.Client.Transport.(*http.Transport); ok {
-			t.DialContext = ssrf.SafeDialContext
-		} else if cfg.Client.Transport == nil {
-			cfg.Client.Transport = &http.Transport{DialContext: ssrf.SafeDialContext}
-		}
-		// If Timeout is unset on a caller-supplied client, set it so a
-		// slow-loris response body cannot stall the replay loop indefinitely.
-		if cfg.Client.Timeout == 0 {
-			cfg.Client.Timeout = cfg.Timeout
-		}
-	}
 	if cfg.Stderr == nil {
 		cfg.Stderr = io.Discard
 	}
+	if cfg.Client == nil {
+		cfg.Client = newSSRFSafeClient(cfg.Timeout, cfg.AllowPrivate)
+	} else if !cfg.AllowPrivate {
+		cfg.Client = wrapClientWithSSRF(cfg.Client, cfg.Timeout, cfg.Stderr)
+	}
 	return cfg
+}
+
+// wrapClientWithSSRF returns a copy of caller with its transport replaced by
+// a clone that has ssrf.SafeDialContext installed. We never mutate the
+// caller's *http.Client or *http.Transport: doing so would silently change
+// the dial behavior of every other holder of those pointers (a logging
+// middleware, a connection-pool, a test harness). Instead:
+//
+//   - *http.Transport: cloned, then SafeDialContext installed on the clone.
+//   - nil Transport: replaced with a clone of the well-tuned default
+//     transport (which carries TLSHandshakeTimeout/IdleConnTimeout/etc.)
+//     plus SafeDialContext.
+//   - any other RoundTripper (logging/retry/recording middleware, custom
+//     transport): we cannot wrap the dialer, so we leave the transport
+//     alone and emit a warning to stderr — pre-dial ssrf.ValidateURLContext
+//     remains the only line of defense for this caller (which is still a
+//     correct SSRF guard in default config but loses the DNS-rebinding
+//     mitigation that the dial-time check provides).
+//
+// Timeout is set on the returned client copy if the caller left it unset,
+// so a slow-loris response body cannot stall the replay loop indefinitely.
+func wrapClientWithSSRF(caller *http.Client, timeout time.Duration, stderr io.Writer) *http.Client {
+	clone := *caller // shallow copy — we'll only mutate the local clone
+	switch t := caller.Transport.(type) {
+	case *http.Transport:
+		tc := t.Clone()
+		tc.DialContext = ssrf.SafeDialContext
+		clone.Transport = tc
+	case nil:
+		// Build a fresh transport with sensible defaults rather than a
+		// bare &http.Transport{}; reuse the same construction path as
+		// the no-client case.
+		clone.Transport = newSSRFSafeClient(timeout, false).Transport
+	default:
+		fmt.Fprintf(stderr, //nolint:errcheck // best-effort warning
+			"js-extract: warning: caller-supplied http.Client.Transport is %T (not *http.Transport); "+
+				"dial-time SSRF protection cannot be installed and DNS rebinding remains possible. "+
+				"pre-dial ssrf.ValidateURLContext still blocks the default attack path.\n", t)
+	}
+	if clone.Timeout == 0 {
+		clone.Timeout = timeout
+	}
+	return &clone
 }
 
 // newSSRFSafeClient builds the default *http.Client used by ReplayJSExtracted.
@@ -222,10 +251,14 @@ func isJSResponse(contentType string) bool {
 }
 
 // scriptSrcPattern extracts src attributes from <script> tags in HTML.
-var scriptSrcPattern = regexp.MustCompile(`(?i)<script[^>]+src=["']([^"']+\.(?:js|mjs))["']`)
+// We deliberately accept any src value (not just *.js / *.mjs) so cache-
+// busted URLs like /main.js?v=123 or /chunk.abc.js#sourcemap are caught;
+// the resolved URL is filtered through isJSURL afterwards.
+var scriptSrcPattern = regexp.MustCompile(`(?i)<script[^>]+src=["']([^"']+)["']`)
 
 // extractScriptURLs parses HTML for <script src="..."> tags and resolves
-// them against the page URL to produce absolute JS file URLs.
+// them against the page URL to produce absolute JS file URLs. Non-JS srcs
+// (e.g., importmaps, JSON modules) are dropped via the isJSURL filter.
 func extractScriptURLs(htmlBody []byte, pageURL string) []string {
 	base, err := url.Parse(pageURL)
 	if err != nil {
@@ -244,6 +277,9 @@ func extractScriptURLs(htmlBody []byte, pageURL string) []string {
 			continue
 		}
 		resolved := base.ResolveReference(ref).String()
+		if !isJSURL(resolved) {
+			continue
+		}
 		if !seen[resolved] {
 			seen[resolved] = true
 			urls = append(urls, resolved)
@@ -960,7 +996,8 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 
 // jsReplayUserAgent identifies probe requests as coming from Vespasian's
 // JS-replay step so cross-origin destinations can attribute the traffic.
-const jsReplayUserAgent = "vespasian-js-extract/1.0"
+// No version is included so the constant doesn't drift from the binary.
+const jsReplayUserAgent = "vespasian-js-extract"
 
 // doRequest builds and executes an HTTP GET against rawURL using cfg.Client.
 // Headers from cfg.Headers are attached only when rawURL is same-origin with

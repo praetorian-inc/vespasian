@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"sort"
 	"sync/atomic"
 	"testing"
@@ -29,6 +30,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/praetorian-inc/vespasian/pkg/ssrf"
 )
 
 // allowLocal returns a config that disables SSRF protection so tests can
@@ -1180,20 +1183,26 @@ func TestJSReplayConfig_WithDefaults_InstallsSSRFTransport(t *testing.T) {
 }
 
 func TestJSReplayConfig_WithDefaults_AllowPrivateBypassesDialer(t *testing.T) {
+	// With AllowPrivate, withDefaults must NOT install ssrf.SafeDialContext.
+	// Compare function pointers via reflect: if our SafeDialContext was
+	// installed, the pointer would equal ssrf.SafeDialContext's.
 	cfg := JSReplayConfig{AllowPrivate: true}.withDefaults()
 	transport, ok := cfg.Client.Transport.(*http.Transport)
 	require.True(t, ok)
-	// With AllowPrivate, we don't override DialContext (it stays as the
-	// default transport's value, which is nil for http.DefaultTransport's
-	// initial state but cloned).
 	if transport.DialContext != nil {
-		// If non-nil, it must NOT reject 127.0.0.1 — but we can't actually
-		// dial in a unit test. Instead just confirm the SSRF dialer is not
-		// installed by comparing function pointers via reflect.
-		// Simpler: just assert the SSRF rejection from above does NOT occur.
-		// Because DialContext could be nil, we skip the dial assertion when
-		// nil and rely on the absence of an explicit override.
-		t.Log("AllowPrivate path leaves transport.DialContext at its default")
+		gotPtr := reflect.ValueOf(transport.DialContext).Pointer()
+		ssrfPtr := reflect.ValueOf(ssrf.SafeDialContext).Pointer()
+		assert.NotEqual(t, ssrfPtr, gotPtr,
+			"AllowPrivate=true must NOT install ssrf.SafeDialContext")
+	}
+	// And confirm a loopback dial through the resulting client is NOT
+	// blocked by our SSRF guard. (It may still fail because port 1 is
+	// closed — the test asserts the error is NOT the SSRF "private IP"
+	// error our guard would produce.)
+	_, err := cfg.Client.Get("http://127.0.0.1:1/")
+	if err != nil {
+		assert.NotContains(t, err.Error(), "blocked private",
+			"AllowPrivate=true must not produce SSRF blocking errors")
 	}
 }
 
@@ -1282,6 +1291,11 @@ func TestReconstructTemplateLiteral(t *testing.T) {
 	}{
 		{"simple interpolation", "/api/v1/users/${id}", "/api/v1/users/{param}", true},
 		{"multiple interpolations", "/api/v2/items/${itemId}/comments/${commentId}", "/api/v2/items/{param}/comments/{param}", true},
+		// Nested braces inside the interpolation must not unbalance the
+		// scanner: the depth counter has to walk past the inner {} pair
+		// and resume copying literals only after the outer } closes.
+		{"nested object literal in interpolation", "/api/v1/q/${ {a:1} }/end", "/api/v1/q/{param}/end", true},
+		{"nested function call", "/api/v1/x/${fn({k:v})}/y", "/api/v1/x/{param}/y", true},
 		{"no api indicator", "/no/indicator/here", "", false},
 		{"contains whitespace", "/api/v1/x with space", "", false},
 		{"trim before first slash", "prefix/api/v1/x", "/api/v1/x", true},
@@ -1301,20 +1315,38 @@ func TestReconstructTemplateLiteral(t *testing.T) {
 // --- TEST-006: MaxTotalTime deadline behavior ---
 
 func TestReplayJSExtracted_MaxTotalTimeDeadline(t *testing.T) {
-	// Server that always sleeps longer than the deadline. The replay loop's
-	// per-request Timeout (200ms) lets each probe attempt time out, but the
-	// loop-level MaxTotalTime (300ms) must cause the loop to exit before all
-	// 5 paths are attempted.
+	// The probe handler always sleeps for `handlerSleep`. Without the
+	// MaxTotalTime cap, hitting all `pathCount` paths sequentially would
+	// take ~handlerSleep * pathCount. The MaxTotalTime is set well below
+	// that, so the loop must exit early.
+	//
+	// We assert two things: (a) the elapsed wall-clock is bounded by the
+	// deadline plus a generous slack (so the test is not flaky on slow
+	// CI runners or under -race), and (b) strictly fewer than pathCount
+	// probes hit the server.
+	const (
+		pathCount    = 8
+		handlerSleep = 250 * time.Millisecond
+		perRequest   = 350 * time.Millisecond
+		totalBudget  = 600 * time.Millisecond
+		slack        = 3 * time.Second // generous: race detector + CI variance
+	)
+
 	hits := int32(0)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(handlerSleep)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{}`)) //nolint:errcheck,gosec // test handler
 	}))
 	defer srv.Close()
 
-	jsBody := []byte(`"/api/v1/a" "/api/v1/b" "/api/v1/c" "/api/v1/d" "/api/v1/e"`)
+	// Build pathCount distinct API paths.
+	var jsBody []byte
+	for i := 0; i < pathCount; i++ {
+		jsBody = append(jsBody, []byte(`"/api/v1/p`+string(rune('a'+i))+`" `)...)
+	}
+
 	requests := []ObservedRequest{
 		{
 			Method:   "GET",
@@ -1325,18 +1357,20 @@ func TestReplayJSExtracted_MaxTotalTimeDeadline(t *testing.T) {
 	}
 
 	cfg := allowLocal(srv)
-	cfg.Timeout = 200 * time.Millisecond
-	cfg.MaxTotalTime = 300 * time.Millisecond
-	cfg.MaxEndpoints = 10
+	cfg.Timeout = perRequest
+	cfg.MaxTotalTime = totalBudget
+	cfg.MaxEndpoints = pathCount * 2 // ensure MaxEndpoints isn't what stops us
 
 	start := time.Now()
 	ReplayJSExtracted(context.Background(), requests, cfg)
 	elapsed := time.Since(start)
 
-	// Without MaxTotalTime, each of 5 paths * 200ms timeout = ~1s; the
-	// deadline must cap us well under that.
-	assert.Less(t, elapsed, 800*time.Millisecond, "MaxTotalTime must bound wall-clock time")
-	assert.Less(t, atomic.LoadInt32(&hits), int32(5), "deadline must terminate the probe loop before all paths run")
+	upperBound := totalBudget + slack
+	assert.Less(t, elapsed, upperBound,
+		"MaxTotalTime must bound wall-clock time (got %v, ceiling %v)", elapsed, upperBound)
+	finalHits := atomic.LoadInt32(&hits)
+	assert.Less(t, finalHits, int32(pathCount),
+		"deadline must terminate the probe loop before all %d paths run (got %d)", pathCount, finalHits)
 }
 
 // --- TEST-007: flattenHeaders ---
