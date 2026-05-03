@@ -294,6 +294,31 @@ func TestHasInlinePrefix(t *testing.T) {
 	assert.True(t, hasInlinePrefix("community/v2/posts"))
 	assert.False(t, hasInlinePrefix("api/auth/login"))
 	assert.False(t, hasInlinePrefix("v2/users"))
+	// Regression: iter-7 found apiIndicators only listed v1-v4 even though
+	// the extraction regexes accept v[1-9][0-9]*. Iter-8 unified them via
+	// apiIndicatorPattern. These cases lock in v5+ classification so a
+	// regression that re-narrows the alternation to v[1-4] would fail.
+	assert.True(t, hasInlinePrefix("billing/v5/invoices"))
+	assert.True(t, hasInlinePrefix("payments/v9/refunds"))
+	assert.True(t, hasInlinePrefix("legacy/v42/users"))
+	assert.False(t, hasInlinePrefix("v5/invoices"))
+	assert.False(t, hasInlinePrefix("v42/users"))
+}
+
+func TestHasAPIIndicator(t *testing.T) {
+	// Exercises apiIndicatorPattern across the full v[1-9][0-9]* range plus
+	// every other alternation branch (api/, rest/, rpc/, graphql) so a
+	// future re-narrowing of the alternation is caught directly.
+	for _, s := range []string{
+		"/api/auth/login", "/v1/users", "/v2/items", "/v5/orders",
+		"/v9/refunds", "/v42/legacy", "/rest/data/query", "/rpc/method",
+		"/graphql",
+	} {
+		assert.True(t, hasAPIIndicator(s), "expected %q to be classified as API indicator", s)
+	}
+	for _, s := range []string{"/static/image.png", "/assets/lib.js", "v0/zero"} {
+		assert.False(t, hasAPIIndicator(s), "expected %q NOT to be classified as API indicator", s)
+	}
 }
 
 func TestJSReplayConfig_WithDefaults(t *testing.T) {

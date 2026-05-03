@@ -325,7 +325,7 @@ var apiPathPattern = regexp.MustCompile(
 	`["']` +
 		`(/?` +
 		`(?:[a-zA-Z0-9_-]+/)*` +
-		`(?:api/|v[1-9][0-9]*/|rest/|rpc/|graphql)` +
+		apiIndicatorAlternation +
 		`[a-zA-Z0-9/_\{}.:-]*)` +
 		`["']`,
 )
@@ -338,7 +338,7 @@ var templateLiteralPattern = regexp.MustCompile(
 	"`" +
 		`(/?` +
 		`(?:[a-zA-Z0-9_-]+/)*` +
-		`(?:api/|v[1-9][0-9]*/|rest/|rpc/|graphql)` +
+		apiIndicatorAlternation +
 		`[a-zA-Z0-9/_\{}.:-]*)` +
 		"`",
 )
@@ -349,10 +349,17 @@ var fullURLPattern = regexp.MustCompile(
 	`["'` + "`]" +
 		`(https?://[a-zA-Z0-9._-]+(?::[0-9]+)?` +
 		`/(?:[a-zA-Z0-9_-]+/)*` +
-		`(?:api/|v[1-9][0-9]*/|rest/|rpc/|graphql)` +
+		apiIndicatorAlternation +
 		`[a-zA-Z0-9/_\{}.:-]*)` +
 		`["'` + "`]",
 )
+
+// apiIndicatorAlternation is the single source of truth for which path
+// segments signal an API endpoint. It is concatenated into every extraction
+// regex (apiPathPattern, templateLiteralPattern, fullURLPattern,
+// servicePrefixPattern) and into apiIndicatorPattern, so the set cannot
+// drift between extraction and classification.
+const apiIndicatorAlternation = `(?:api/|v[1-9][0-9]*/|rest/|rpc/|graphql)`
 
 // servicePrefixPattern matches service prefix strings concatenated with API paths
 // using the `+` operator between two QUOTED string literals.
@@ -363,15 +370,13 @@ var fullURLPattern = regexp.MustCompile(
 // e.g. "/api/posts/".concat(id, "/comment") — is intentionally out of
 // scope (see LAB-1368 for follow-up).
 var servicePrefixPattern = regexp.MustCompile(
-	`["']([a-zA-Z][a-zA-Z0-9_-]{1,30}/)["']\s*\+\s*["'](?:api/|v[1-9])`,
+	`["']([a-zA-Z][a-zA-Z0-9_-]{1,30}/)["']\s*\+\s*["']` + apiIndicatorAlternation,
 )
 
 // apiIndicatorPattern matches the path segments that signal an API endpoint.
-// It is the single source of truth shared with the apiPathPattern,
-// templateLiteralPattern, and fullURLPattern extraction regexes — keeping
-// the alternation in one place prevents the v[1-9][0-9]* vs. v1-v4 drift
-// that the iter-7 review flagged.
-var apiIndicatorPattern = regexp.MustCompile(`(?i)(?:api/|v[1-9][0-9]*/|rest/|rpc/|graphql)`)
+// Sourced from apiIndicatorAlternation so it is impossible for it to drift
+// from the extraction regexes.
+var apiIndicatorPattern = regexp.MustCompile(`(?i)` + apiIndicatorAlternation)
 
 // staticFileExts are file extensions to skip when extracting API paths.
 var staticFileExts = []string{".js", ".css", ".map", ".html", ".htm", ".png", ".jpg", ".svg"}
@@ -1198,8 +1203,11 @@ func fetchJSBodyHop(ctx context.Context, cfg JSReplayConfig, rawURL, targetOrigi
 }
 
 // resolveRedirect resolves the Location header value against the current URL,
-// returning the absolute URL of the next hop. Empty input or unparsable
-// values produce an error so callers can abort the chain.
+// returning the absolute URL of the next hop. An unparsable currentURL or
+// Location returns an error so callers can abort the chain. An empty
+// Location returns currentURL unchanged (Go's url.ResolveReference contract);
+// fetchJSBody guards against empty Locations BEFORE calling this function so
+// the empty-Location case is documentary rather than reachable at runtime.
 func resolveRedirect(currentURL, location string) (string, error) {
 	cur, err := url.Parse(currentURL)
 	if err != nil {
