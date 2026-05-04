@@ -378,6 +378,41 @@ var servicePrefixPattern = regexp.MustCompile(
 // from the extraction regexes.
 var apiIndicatorPattern = regexp.MustCompile(`(?i)` + apiIndicatorAlternation)
 
+// standalonePrefixPattern matches bare service-prefix string literals like
+// "identity/", "workshop/", "community/" — short lowercase-alpha-with-dashes
+// segments ending in a slash. Catches bundles that build URLs by
+// concatenating a config constant with a path:
+//
+//	const SVC_IDENTITY = "identity/"
+//	fetch(SVC_IDENTITY + "api/auth/login")
+//
+// rather than the strict literal+literal form servicePrefixPattern requires.
+//
+// Hardened against false positives (asset folders like "images/", "static/",
+// "vendor/") via three filters in extractServicePrefixes:
+//
+//  1. Exclude API indicators (api/, v1/, ...) — those would otherwise be
+//     mistaken for service prefixes.
+//  2. Frequency threshold — a real service prefix is referenced repeatedly
+//     in the bundle (every fetch call); one-off literals are usually folder
+//     names. Requires ≥ standalonePrefixMinFrequency occurrences.
+//  3. Per-bundle cap — bound the fan-out at maxStandalonePrefixesPerBundle
+//     so a noisy bundle cannot exhaust MaxEndpoints with N×M expansions.
+var standalonePrefixPattern = regexp.MustCompile(
+	`["']([a-z][a-z0-9_-]{1,30}/)["']`,
+)
+
+// standalonePrefixMinFrequency is how many times a candidate must appear in
+// a bundle to be considered a real service prefix. Service prefixes are
+// referenced at every fetch call (typically dozens or hundreds of times);
+// asset-folder names usually appear once or twice in metadata.
+const standalonePrefixMinFrequency = 2
+
+// maxStandalonePrefixesPerBundle caps Strategy 3 contributions per JS file.
+// Bounds the worst-case N (paths) × M (prefixes) probe-budget consumption
+// when a bundle contains many short standalone string literals.
+const maxStandalonePrefixesPerBundle = 8
+
 // staticFileExts are file extensions to skip when extracting API paths.
 var staticFileExts = []string{".js", ".css", ".map", ".html", ".htm", ".png", ".jpg", ".svg"}
 
@@ -570,7 +605,76 @@ func extractServicePrefixes(jsBody []byte, requests []ObservedRequest) []string 
 		}
 	}
 
+	// Strategy 3: standalone short-segment string literals.
+	//
+	// Many SPAs (e.g., crAPI) declare service prefixes as runtime constants
+	// (`const SVC = "identity/"`) and concatenate at call time, so the
+	// strict literal+literal `servicePrefixPattern` never fires.
+	//
+	// The bare-pattern matches a wide universe of strings — folder names,
+	// CSS classes, asset prefixes — so we apply three filters:
+	//   - exclude API indicators (would self-classify as prefix)
+	//   - require ≥ standalonePrefixMinFrequency occurrences in the bundle
+	//   - cap at maxStandalonePrefixesPerBundle, sorted by descending
+	//     frequency then ascending lexicographic order for determinism
+	addStandaloneCandidates(jsBody, add, seen)
+
 	return prefixes
+}
+
+// addStandaloneCandidates is Strategy 3 of extractServicePrefixes. Pulled
+// out so the prefix-discovery pipeline reads top-down and the rubric (filter
+// → frequency-count → cap → sort → emit) is testable in isolation.
+func addStandaloneCandidates(jsBody []byte, add func(string), seen map[string]bool) {
+	freq := make(map[string]int)
+	for _, match := range standalonePrefixPattern.FindAllSubmatch(jsBody, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		candidate := string(match[1])
+		// Filter 1: API indicators are not service prefixes.
+		if apiIndicatorPattern.MatchString(candidate) {
+			continue
+		}
+		// Already-emitted prefixes (Strategy 1 / 2) — count toward the
+		// per-bundle cap so we don't add yet more on top of them.
+		if seen[candidate] {
+			continue
+		}
+		freq[candidate]++
+	}
+
+	// Filter 2: frequency threshold.
+	type cand struct {
+		name  string
+		count int
+	}
+	candidates := make([]cand, 0, len(freq))
+	for name, n := range freq {
+		if n < standalonePrefixMinFrequency {
+			continue
+		}
+		candidates = append(candidates, cand{name, n})
+	}
+
+	// Cap-aware sort: descending count, ascending name for tie-breaking.
+	// This gives deterministic IDs across runs and prefers prefixes used
+	// many times (likelier to be real service prefixes).
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].count != candidates[j].count {
+			return candidates[i].count > candidates[j].count
+		}
+		return candidates[i].name < candidates[j].name
+	})
+
+	// Filter 3: per-bundle cap.
+	limit := maxStandalonePrefixesPerBundle
+	if len(candidates) < limit {
+		limit = len(candidates)
+	}
+	for i := 0; i < limit; i++ {
+		add(candidates[i].name)
+	}
 }
 
 // extractTemplateLiteralPaths walks each backtick-delimited template literal

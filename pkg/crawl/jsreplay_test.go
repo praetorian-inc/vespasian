@@ -18,12 +18,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"reflect"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1692,4 +1694,109 @@ func TestJSReplayConfig_WithDefaults_DoesNotMutateCallerClient(t *testing.T) {
 	}
 	assert.Equal(t, int32(2), atomic.LoadInt32(&called),
 		"caller.CheckRedirect must be preserved across both AllowPrivate modes")
+}
+
+// --- Strategy 3: standalone-literal service-prefix discovery ---
+
+func TestExtractServicePrefixes_Strategy3_CrAPIShape(t *testing.T) {
+	// crAPI-style bundle: service prefixes declared as runtime constants
+	// and referenced via concatenation at fetch-call sites. Each prefix
+	// appears 3+ times because every API call goes through it.
+	js := []byte(`
+		const SVC_IDENTITY = "identity/";
+		const SVC_WORKSHOP = "workshop/";
+		const SVC_COMMUNITY = "community/";
+		fetch(SVC_IDENTITY + "api/auth/login");
+		fetch("identity/" + "api/v2/user/dashboard");
+		fetch("workshop/" + "api/shop/products");
+		fetch("workshop/" + "api/shop/orders");
+		fetch("community/" + "api/v2/posts");
+		fetch("community/" + "api/v2/coupon");
+	`)
+	got := extractServicePrefixes(js, nil)
+	sort.Strings(got)
+	assert.Equal(t, []string{"community/", "identity/", "workshop/"}, got,
+		"all three prefixes should be discovered (Strategy 1 hits everything; Strategy 3 dedups)")
+}
+
+func TestExtractServicePrefixes_Strategy3_ConstOnly(t *testing.T) {
+	// Bundle uses prefixes ONLY via constants (no literal+literal). Strategy
+	// 1 finds nothing; Strategy 3 must catch the bare prefix literals.
+	// Each prefix is referenced ≥2 times (once in const decl + once in
+	// concatenation via `+ varname`, but only the bare literal is a string,
+	// so we synthesize multiple bare references to satisfy the frequency
+	// threshold).
+	js := []byte(`
+		const SVC_IDENTITY = "identity/";
+		const SVC_WORKSHOP = "workshop/";
+		const SVC_COMMUNITY = "community/";
+		const FALLBACK_IDENTITY = "identity/";
+		const FALLBACK_WORKSHOP = "workshop/";
+		const FALLBACK_COMMUNITY = "community/";
+		fetch(SVC_IDENTITY + somePath);
+		fetch(SVC_WORKSHOP + somePath);
+		fetch(SVC_COMMUNITY + somePath);
+	`)
+	got := extractServicePrefixes(js, nil)
+	sort.Strings(got)
+	assert.Equal(t, []string{"community/", "identity/", "workshop/"}, got,
+		"Strategy 3 must catch standalone-literal prefixes Strategy 1 misses")
+}
+
+func TestExtractServicePrefixes_Strategy3_FrequencyThreshold(t *testing.T) {
+	// One-off literals (asset-folder names that appear once) must be
+	// rejected. Real prefixes (≥2 occurrences) must be kept.
+	js := []byte(`
+		const SVC = "real/";
+		fetch(SVC + "api/x");
+		fetch(SVC + "api/y");
+		const ASSET_FOLDER = "images/";   // one-off, should be rejected
+		const TEMP_VAR = "vendor/";       // one-off, should be rejected
+		const ANOTHER = "real/";          // raises real/ to 2 occurrences
+	`)
+	got := extractServicePrefixes(js, nil)
+	assert.Equal(t, []string{"real/"}, got,
+		"only the real/ prefix (≥2 occurrences) should survive the frequency filter")
+}
+
+func TestExtractServicePrefixes_Strategy3_PerBundleCap(t *testing.T) {
+	// Construct a bundle with > maxStandalonePrefixesPerBundle distinct
+	// candidates each appearing twice. Verify the cap kicks in.
+	var b strings.Builder
+	for i := 0; i < maxStandalonePrefixesPerBundle*3; i++ {
+		// "px/" "py/" "pz/" ... — short distinct prefixes
+		name := fmt.Sprintf("p%c%c/", 'a'+(i/26), 'a'+(i%26))
+		b.WriteString(`"` + name + `";`)
+		b.WriteString(`"` + name + `";`) // 2 occurrences each
+	}
+	got := extractServicePrefixes([]byte(b.String()), nil)
+	assert.Len(t, got, maxStandalonePrefixesPerBundle,
+		"per-bundle cap must bound the number of Strategy 3 candidates emitted")
+}
+
+func TestExtractServicePrefixes_Strategy3_RejectsAPIIndicators(t *testing.T) {
+	// Even if "api/" or "v1/" appears as a standalone literal multiple
+	// times, it must not be classified as a service prefix.
+	js := []byte(`
+		"api/"; "api/"; "api/";
+		"v1/"; "v1/"; "v1/";
+		"rest/"; "rest/"; "rest/";
+		"real/"; "real/";
+	`)
+	got := extractServicePrefixes(js, nil)
+	assert.Equal(t, []string{"real/"}, got,
+		"API indicators (api/, v1/, rest/) must never be classified as service prefixes")
+}
+
+func TestExtractServicePrefixes_Strategy3_DoesNotDuplicateStrategy1(t *testing.T) {
+	// When Strategy 1 already emitted "identity/" via literal+literal,
+	// Strategy 3 must not double-count or re-add it.
+	js := []byte(`
+		"identity/" + "api/auth/login";
+		"identity/";  // bare literal — Strategy 3 candidate, but already in seen
+		"identity/";
+	`)
+	got := extractServicePrefixes(js, nil)
+	assert.Equal(t, []string{"identity/"}, got,
+		"Strategy 3 must not duplicate Strategy 1 hits")
 }
