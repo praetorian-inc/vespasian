@@ -403,10 +403,17 @@ var standalonePrefixPattern = regexp.MustCompile(
 )
 
 // standalonePrefixMinFrequency is how many times a candidate must appear in
-// a bundle to be considered a real service prefix. Service prefixes are
-// referenced at every fetch call (typically dozens or hundreds of times);
-// asset-folder names usually appear once or twice in metadata.
-const standalonePrefixMinFrequency = 2
+// a bundle to be considered a real service prefix.
+//
+// Set to 1 because production SPAs (e.g., OWASP crAPI) typically declare each
+// service prefix exactly once as a runtime constant (`const SVC_X = "x/"`)
+// and reference it via the variable thereafter — a literal-match count >= 2
+// would reject these legitimate prefixes. Noise control is delegated to
+// (a) the API-indicator filter, (b) the per-bundle cap of 8, and (c) the
+// downstream 404 filter that drops wrong-prefix probe combinations. Together
+// these bound the amplification cost of false-positive prefixes without
+// trading away recall on real-world bundles.
+const standalonePrefixMinFrequency = 1
 
 // maxBundlePrefixCap caps the TOTAL number of service prefixes
 // extractServicePrefixes will emit for a single JS bundle. Strategy 3

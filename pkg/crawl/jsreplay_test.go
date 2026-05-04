@@ -1773,19 +1773,24 @@ func TestExtractServicePrefixes_Strategy3_ConstOnly(t *testing.T) {
 }
 
 func TestExtractServicePrefixes_Strategy3_FrequencyThreshold(t *testing.T) {
-	// One-off literals (asset-folder names that appear once) must be
-	// rejected. Real prefixes (≥2 occurrences) must be kept.
+	// Frequency threshold is intentionally permissive (>=1) because
+	// production SPAs (e.g., OWASP crAPI) declare each service prefix
+	// exactly once as a runtime constant. Noise control is delegated to
+	// the API-indicator filter, the per-bundle cap, and the downstream
+	// 404 filter. This test pins that single-occurrence prefixes are
+	// emitted (regression: a tighter threshold would silently drop
+	// legitimate prefixes like crAPI's "identity/").
 	js := []byte(`
-		const SVC = "real/";
-		fetch(SVC + "api/x");
-		fetch(SVC + "api/y");
-		const ASSET_FOLDER = "images/";   // one-off, should be rejected
-		const TEMP_VAR = "vendor/";       // one-off, should be rejected
-		const ANOTHER = "real/";          // raises real/ to 2 occurrences
+		const SVC_REAL = "real/";          // single occurrence
+		const ASSET_FOLDER = "images/";    // single occurrence
+		const TEMP_VAR = "vendor/";        // single occurrence
+		fetch(SVC_REAL + "api/x");
 	`)
 	got := extractServicePrefixes(js, nil)
-	assert.Equal(t, []string{"real/"}, got,
-		"only the real/ prefix (≥2 occurrences) should survive the frequency filter")
+	sort.Strings(got)
+	assert.Equal(t, []string{"images/", "real/", "vendor/"}, got,
+		"single-occurrence prefixes must be emitted; noise control is "+
+			"delegated to the cap + 404 filter, not the frequency threshold")
 }
 
 func TestExtractServicePrefixes_Strategy3_PerBundleCap(t *testing.T) {
