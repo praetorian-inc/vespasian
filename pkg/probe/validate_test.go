@@ -15,86 +15,47 @@
 package probe
 
 import (
+	"context"
 	"testing"
+
+	"github.com/praetorian-inc/vespasian/pkg/ssrf"
 )
 
-func TestValidateProbeURL_PublicURL(t *testing.T) {
-	err := validateProbeURL("https://example.com/api")
-	if err != nil {
-		t.Errorf("expected public URL to be allowed, got error: %v", err)
-	}
-}
+// The full SSRF behavior is exercised by pkg/ssrf's tests. The wrapper layer
+// here only needs to assert that it delegates and keeps the public API stable.
 
-func TestValidateProbeURL_BlocksPrivateIPs(t *testing.T) {
+func TestValidateProbeURL_DelegatesToSSRF(t *testing.T) {
 	cases := []struct {
-		name string
-		url  string
+		name   string
+		url    string
+		expect bool // true if delegation should report blocked
 	}{
-		{"loopback", "http://127.0.0.1/api"},
-		{"rfc1918-10", "http://10.0.0.1/api"},
-		{"rfc1918-172", "http://172.16.0.1/api"},
-		{"rfc1918-192", "http://192.168.1.1/api"},
+		{"public URL allowed", "https://8.8.8.8/api", false},
+		{"private IP blocked", "http://127.0.0.1/api", true},
+		{"link-local blocked", "http://169.254.169.254/", true},
+		{"non-http scheme blocked", "ftp://example.com/", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateProbeURL(tc.url)
-			if err == nil {
-				t.Errorf("expected %s to be blocked, got nil error", tc.url)
+			wrapErr := ValidateProbeURL(tc.url)
+			ssrfErr := ssrf.ValidateURL(tc.url)
+			if (wrapErr == nil) != (ssrfErr == nil) {
+				t.Errorf("wrapper/SSRF disagreement for %s: wrapper=%v ssrf=%v", tc.url, wrapErr, ssrfErr)
+			}
+			if (wrapErr != nil) != tc.expect {
+				t.Errorf("ValidateProbeURL(%s) blocked=%v, want %v", tc.url, wrapErr != nil, tc.expect)
 			}
 		})
 	}
 }
 
-func TestValidateProbeURL_BlocksLinkLocal(t *testing.T) {
-	// AWS metadata endpoint
-	err := validateProbeURL("http://169.254.169.254/latest/meta-data/")
-	if err == nil {
-		t.Error("expected link-local (AWS metadata) to be blocked, got nil error")
+func TestSSRFSafeDialContext_DelegatesToSSRF(t *testing.T) {
+	// A loopback dial through the wrapper must fail with the same blocklist
+	// behavior as ssrf.SafeDialContext.
+	if _, err := SSRFSafeDialContext(context.Background(), "tcp", "127.0.0.1:1"); err == nil {
+		t.Error("expected wrapper to reject loopback dial")
 	}
-}
-
-func TestValidateProbeURL_BlocksNonHTTPSchemes(t *testing.T) {
-	cases := []struct {
-		name string
-		url  string
-	}{
-		{"ftp", "ftp://example.com/file"},
-		{"file", "file:///etc/passwd"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := validateProbeURL(tc.url)
-			if err == nil {
-				t.Errorf("expected scheme %q to be blocked, got nil error", tc.name)
-			}
-		})
-	}
-}
-
-func TestValidateProbeURL_InvalidURL(t *testing.T) {
-	err := validateProbeURL("://not-a-url")
-	if err == nil {
-		t.Error("expected invalid URL to return error, got nil")
-	}
-}
-
-func TestValidateProbeURL_BlocksIPv6Loopback(t *testing.T) {
-	err := validateProbeURL("http://[::1]/api")
-	if err == nil {
-		t.Error("expected IPv6 loopback to be blocked, got nil error")
-	}
-}
-
-func TestValidateProbeURL_BlocksUnspecifiedIPv4(t *testing.T) {
-	err := validateProbeURL("http://0.0.0.0/api")
-	if err == nil {
-		t.Error("expected 0.0.0.0 to be blocked, got nil error")
-	}
-}
-
-func TestValidateProbeURL_BlocksUnspecifiedIPv6(t *testing.T) {
-	err := validateProbeURL("http://[::]/api")
-	if err == nil {
-		t.Error("expected [::] (IPv6 unspecified) to be blocked, got nil error")
+	if _, err := ssrf.SafeDialContext(context.Background(), "tcp", "127.0.0.1:1"); err == nil {
+		t.Error("expected ssrf.SafeDialContext to reject loopback dial")
 	}
 }

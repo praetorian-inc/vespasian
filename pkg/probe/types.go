@@ -17,6 +17,8 @@ package probe
 import (
 	"net/http"
 	"time"
+
+	"github.com/praetorian-inc/vespasian/pkg/ssrf"
 )
 
 // Config holds shared configuration for probe strategies.
@@ -58,7 +60,7 @@ func (cfg Config) withDefaults() Config {
 		cfg.Timeout = 10 * time.Second
 	}
 	if cfg.URLValidator == nil {
-		cfg.URLValidator = validateProbeURL
+		cfg.URLValidator = ssrf.ValidateURL
 	}
 	if cfg.MaxEndpoints == 0 {
 		cfg.MaxEndpoints = DefaultMaxEndpoints
@@ -69,7 +71,7 @@ func (cfg Config) withDefaults() Config {
 				return http.ErrUseLastResponse
 			},
 			Transport: &http.Transport{
-				DialContext:           ssrfSafeDialContext,
+				DialContext:           ssrf.SafeDialContext,
 				TLSHandshakeTimeout:   10 * time.Second,
 				ResponseHeaderTimeout: 10 * time.Second,
 				IdleConnTimeout:       90 * time.Second,
