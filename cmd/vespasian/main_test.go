@@ -2071,3 +2071,67 @@ func TestAPITypeDisplayName(t *testing.T) {
 		}
 	}
 }
+
+// TestMaybeReplayJSExtracted_GatesOnProbe is the regression test for CR-1
+// (CodeRabbit review #4215872430). The gate's job: --probe=false must NOT
+// trigger any outbound HTTP from the JS-replay step. A silent removal of
+// the gate (or moving the ReplayJSExtracted call outside it) would fail
+// here.
+func TestMaybeReplayJSExtracted_GatesOnProbe(t *testing.T) {
+	// Server records every inbound path so we can assert exactly how many
+	// HTTP requests the JS-replay step made under each probe setting.
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	// Capture containing a JS bundle whose extracted paths would trigger
+	// probes IF the gate is open.
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    srv.URL + "/static/js/main.js",
+			Source: "katana",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/javascript",
+				Body:        []byte(`var u = "/api/v1/users"; var v = "/api/v1/items";`),
+			},
+		},
+	}
+
+	cfg := crawl.JSReplayConfig{
+		Client:       srv.Client(),
+		TargetURL:    srv.URL,
+		AllowPrivate: true,
+	}
+
+	t.Run("Probe=false suppresses JS replay (no outbound HTTP)", func(t *testing.T) {
+		hits = 0
+		got := maybeReplayJSExtracted(context.Background(), requests, false, cfg)
+		if hits != 0 {
+			t.Errorf("Probe=false: expected 0 server hits, got %d", hits)
+		}
+		if len(got) != len(requests) {
+			t.Errorf("Probe=false: expected requests passed through unchanged, got len=%d want %d", len(got), len(requests))
+		}
+		if got[0].URL != requests[0].URL {
+			t.Errorf("Probe=false: first request URL changed: got %q want %q", got[0].URL, requests[0].URL)
+		}
+	})
+
+	t.Run("Probe=true triggers JS replay (outbound HTTP fires)", func(t *testing.T) {
+		hits = 0
+		got := maybeReplayJSExtracted(context.Background(), requests, true, cfg)
+		if hits == 0 {
+			t.Errorf("Probe=true: expected ≥1 server hit, got 0 — gate may have flipped wrong")
+		}
+		// JS-extracted probes are appended to the input slice.
+		if len(got) <= len(requests) {
+			t.Errorf("Probe=true: expected probed requests appended, got len=%d (input was %d)", len(got), len(requests))
+		}
+	})
+}
