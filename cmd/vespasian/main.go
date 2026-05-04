@@ -644,13 +644,21 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	// URLs extracted from JavaScript bundles are visited by the headless browser,
 	// which gets the SPA shell (index.html) instead of the API response. Re-fetching
 	// them with a direct HTTP request reaches the actual API backend.
-	requests = crawl.ReplayJSExtracted(genCtx, requests, crawl.JSReplayConfig{
-		Headers:      bs.opts.Headers,
-		TargetURL:    c.URL,
-		AllowPrivate: c.DangerousAllowPrivate,
-		Verbose:      c.Verbose,
-		Stderr:       os.Stderr,
-	})
+	//
+	// Gated on c.Probe — this step issues outbound HTTP requests, so users who
+	// pass --probe=false to keep the scan passive (capture-only) must NOT see
+	// surprise probes from the JS-replay step. When probing is disabled, the
+	// captured requests pass through unchanged and only static analysis happens
+	// downstream in generateSpec.
+	if c.Probe {
+		requests = crawl.ReplayJSExtracted(genCtx, requests, crawl.JSReplayConfig{
+			Headers:      bs.opts.Headers,
+			TargetURL:    c.URL,
+			AllowPrivate: c.DangerousAllowPrivate,
+			Verbose:      c.Verbose,
+			Stderr:       os.Stderr,
+		})
+	}
 
 	spec, err := generateSpec(genCtx, requests, generateSpecOptions{
 		APIType:      apiType,

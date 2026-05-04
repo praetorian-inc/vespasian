@@ -1162,18 +1162,47 @@ func TestMatchesContentType(t *testing.T) {
 }
 
 func TestIsSameOrigin(t *testing.T) {
-	target := "https://example.com:8443"
-	assert.True(t, isSameOrigin("https://example.com:8443/api/v1/x", target))
-	assert.False(t, isSameOrigin("https://example.com/api/v1/x", target), "different port = different origin")
-	assert.False(t, isSameOrigin("http://example.com:8443/api/v1/x", target), "different scheme = different origin")
-	assert.False(t, isSameOrigin("https://other.example.com/api", target))
-	assert.False(t, isSameOrigin("not a url", target))
-	assert.False(t, isSameOrigin("https://example.com/api/v1/x", ""))
+	t.Run("explicit non-default port", func(t *testing.T) {
+		target := "https://example.com:8443"
+		assert.True(t, isSameOrigin("https://example.com:8443/api/v1/x", target))
+		assert.False(t, isSameOrigin("https://example.com/api/v1/x", target),
+			"non-default 8443 vs default 443 = different origin")
+		assert.False(t, isSameOrigin("http://example.com:8443/api/v1/x", target),
+			"different scheme = different origin")
+		assert.False(t, isSameOrigin("https://other.example.com/api", target))
+		assert.False(t, isSameOrigin("not a url", target))
+		assert.False(t, isSameOrigin("https://example.com/api/v1/x", ""))
+	})
+
+	// Regression for CR-2: implicit vs explicit default ports must collapse.
+	t.Run("default-port normalization", func(t *testing.T) {
+		// https default is 443.
+		assert.True(t, isSameOrigin("https://example.com/api", "https://example.com:443"),
+			"implicit https default port must equal explicit :443")
+		assert.True(t, isSameOrigin("https://example.com:443/api", "https://example.com"),
+			"explicit :443 must equal implicit https default")
+		// http default is 80.
+		assert.True(t, isSameOrigin("http://example.com/api", "http://example.com:80"),
+			"implicit http default port must equal explicit :80")
+		// Cross-default: https default 443 vs http default 80 — different scheme,
+		// different origin even though the ports are both "default".
+		assert.False(t, isSameOrigin("http://example.com:80", "https://example.com:443"))
+	})
+
+	// Regression for CR-2: scheme/host case must not affect equality.
+	t.Run("case insensitivity", func(t *testing.T) {
+		assert.True(t, isSameOrigin("HTTPS://Example.COM/api", "https://example.com"),
+			"scheme + host comparison is case-insensitive")
+	})
 }
 
 func TestOriginOf(t *testing.T) {
-	assert.Equal(t, "https://example.com", originOf("https://example.com/api"))
+	// Normalization makes default ports explicit and lower-cases scheme + host
+	// so isSameOrigin can compare strings directly.
+	assert.Equal(t, "https://example.com:443", originOf("https://example.com/api"))
+	assert.Equal(t, "http://example.com:80", originOf("http://example.com/api"))
 	assert.Equal(t, "https://example.com:8443", originOf("https://example.com:8443/x"))
+	assert.Equal(t, "https://example.com:443", originOf("HTTPS://Example.COM/api"))
 	assert.Equal(t, "", originOf("not a url"))
 	assert.Equal(t, "", originOf("/relative/path"))
 }
@@ -1760,17 +1789,17 @@ func TestExtractServicePrefixes_Strategy3_FrequencyThreshold(t *testing.T) {
 }
 
 func TestExtractServicePrefixes_Strategy3_PerBundleCap(t *testing.T) {
-	// Construct a bundle with > maxStandalonePrefixesPerBundle distinct
+	// Construct a bundle with > maxBundlePrefixCap distinct
 	// candidates each appearing twice. Verify the cap kicks in.
 	var b strings.Builder
-	for i := 0; i < maxStandalonePrefixesPerBundle*3; i++ {
+	for i := 0; i < maxBundlePrefixCap*3; i++ {
 		// "px/" "py/" "pz/" ... — short distinct prefixes
 		name := fmt.Sprintf("p%c%c/", 'a'+(i/26), 'a'+(i%26))
 		b.WriteString(`"` + name + `";`)
 		b.WriteString(`"` + name + `";`) // 2 occurrences each
 	}
 	got := extractServicePrefixes([]byte(b.String()), nil)
-	assert.Len(t, got, maxStandalonePrefixesPerBundle,
+	assert.Len(t, got, maxBundlePrefixCap,
 		"per-bundle cap must bound the number of Strategy 3 candidates emitted")
 }
 
@@ -1877,4 +1906,56 @@ func TestReplayJSExtracted_Strategy3_EndToEnd(t *testing.T) {
 		"bare /api/auth/login should have been 404'd and dropped")
 	assert.NotContains(t, probed, srv.URL+"/api/shop/products",
 		"bare /api/shop/products should have been 404'd and dropped")
+}
+
+func TestExtractServicePrefixes_Strategy3_TotalBundleCapRespectsPriorStrategies(t *testing.T) {
+	// Regression for CR-3: the per-bundle cap is a TOTAL across all
+	// strategies. If Strategy 1 has already emitted N prefixes,
+	// Strategy 3 must add at most max(0, cap-N) more — never the full
+	// cap on top of Strategies 1 and 2.
+
+	t.Run("Strategy 1 emits 3, Strategy 3 must add at most cap-3 more", func(t *testing.T) {
+		var b strings.Builder
+		// Strategy 1 hits (literal+literal): produce 3 prefixes.
+		b.WriteString(`"alpha/" + "api/x";`)
+		b.WriteString(`"bravo/" + "api/y";`)
+		b.WriteString(`"charlie/" + "api/z";`)
+		// Strategy 3 candidates: distinct names, each ≥2 occurrences.
+		// More than cap so we know the budget is what limits the result.
+		for i := 0; i < maxBundlePrefixCap*2; i++ {
+			name := fmt.Sprintf("p%c%c/", 'a'+(i/26), 'a'+(i%26))
+			b.WriteString(`"` + name + `";`)
+			b.WriteString(`"` + name + `";`)
+		}
+		got := extractServicePrefixes([]byte(b.String()), nil)
+		assert.LessOrEqual(t, len(got), maxBundlePrefixCap,
+			"total prefix emissions across all strategies must not exceed maxBundlePrefixCap")
+		assert.GreaterOrEqual(t, len(got), 3,
+			"Strategy 1 emissions (alpha/, bravo/, charlie/) must always survive")
+	})
+
+	t.Run("Strategy 1 already saturates the cap, Strategy 3 adds nothing", func(t *testing.T) {
+		var b strings.Builder
+		// Strategy 1 hits: emit exactly maxBundlePrefixCap prefixes.
+		for i := 0; i < maxBundlePrefixCap; i++ {
+			name := fmt.Sprintf("a%c/", 'a'+i)
+			b.WriteString(`"` + name + `" + "api/x";`)
+		}
+		// Strategy 3 candidates that should be rejected because the
+		// budget is already exhausted.
+		for i := 0; i < 5; i++ {
+			name := fmt.Sprintf("z%c/", 'a'+i)
+			b.WriteString(`"` + name + `";`)
+			b.WriteString(`"` + name + `";`)
+		}
+		got := extractServicePrefixes([]byte(b.String()), nil)
+		assert.Equal(t, maxBundlePrefixCap, len(got),
+			"saturated cap must produce exactly maxBundlePrefixCap entries")
+		// All entries should start with 'a' (Strategy 1) — no 'z' Strategy 3
+		// candidates should have leaked through.
+		for _, p := range got {
+			assert.True(t, strings.HasPrefix(p, "a"),
+				"Strategy 3 must add nothing once Strategies 1+2 saturate the cap; got %q", p)
+		}
+	})
 }

@@ -396,7 +396,7 @@ var apiIndicatorPattern = regexp.MustCompile(`(?i)` + apiIndicatorAlternation)
 //  2. Frequency threshold — a real service prefix is referenced repeatedly
 //     in the bundle (every fetch call); one-off literals are usually folder
 //     names. Requires ≥ standalonePrefixMinFrequency occurrences.
-//  3. Per-bundle cap — bound the fan-out at maxStandalonePrefixesPerBundle
+//  3. Per-bundle cap — bound the fan-out at maxBundlePrefixCap
 //     so a noisy bundle cannot exhaust MaxEndpoints with N×M expansions.
 var standalonePrefixPattern = regexp.MustCompile(
 	`["']([a-z][a-z0-9_-]{1,30}/)["']`,
@@ -408,10 +408,14 @@ var standalonePrefixPattern = regexp.MustCompile(
 // asset-folder names usually appear once or twice in metadata.
 const standalonePrefixMinFrequency = 2
 
-// maxStandalonePrefixesPerBundle caps Strategy 3 contributions per JS file.
+// maxBundlePrefixCap caps the TOTAL number of service prefixes
+// extractServicePrefixes will emit for a single JS bundle. Strategy 3
+// respects this cap as a budget — if Strategies 1 and 2 have already
+// emitted N prefixes, Strategy 3 will add at most max(0, cap-N) more.
+//
 // Bounds the worst-case N (paths) × M (prefixes) probe-budget consumption
 // when a bundle contains many short standalone string literals.
-const maxStandalonePrefixesPerBundle = 8
+const maxBundlePrefixCap = 8
 
 // staticFileExts are file extensions to skip when extracting API paths.
 var staticFileExts = []string{".js", ".css", ".map", ".html", ".htm", ".png", ".jpg", ".svg"}
@@ -454,23 +458,58 @@ func hasInlinePrefix(trimmedPath string) bool {
 	return loc != nil && loc[0] > 0
 }
 
-// originOf returns the scheme://host[:port] origin of rawURL, or "" if it
-// cannot be parsed or has no host.
+// defaultPortForScheme returns the canonical default port for a URL scheme,
+// or "" if the scheme has no default we recognize. Used by originOf to
+// canonicalize implicit-vs-explicit-port forms (https://example.com and
+// https://example.com:443 must compare equal).
+func defaultPortForScheme(scheme string) string {
+	switch strings.ToLower(scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	}
+	return ""
+}
+
+// originOf returns the canonicalized scheme://host:port origin of rawURL, or
+// "" if it cannot be parsed or has no host. Default ports are made explicit
+// and the scheme + host are lower-cased so that
+//
+//	https://example.com   ->  https://example.com:443
+//	HTTPS://Example.com   ->  https://example.com:443
+//	https://example.com:443 -> https://example.com:443
+//
+// all collapse to the same string. Without this normalization, isSameOrigin
+// would treat the implicit-port and explicit-port forms as different origins
+// and incorrectly skip valid same-origin probes.
 func originOf(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Host == "" {
 		return ""
 	}
-	return u.Scheme + "://" + u.Host
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if port == "" {
+		port = defaultPortForScheme(scheme)
+	}
+	if port == "" {
+		// Unknown scheme without an explicit port: fall back to the raw
+		// host string so non-http(s) URLs still compare consistently.
+		return scheme + "://" + host
+	}
+	return scheme + "://" + host + ":" + port
 }
 
 // isSameOrigin reports whether rawURL has the same origin as targetOrigin.
-// targetOrigin should already be in scheme://host[:port] form.
+// Both sides are normalized via originOf so default-port-vs-explicit-port
+// pairs (e.g., https://example.com and https://example.com:443) compare equal.
 func isSameOrigin(rawURL, targetOrigin string) bool {
 	if targetOrigin == "" {
 		return false
 	}
-	return originOf(rawURL) == targetOrigin
+	return originOf(rawURL) == originOf(targetOrigin)
 }
 
 // sanitizeForLog escapes terminal control characters and other non-printable
@@ -615,7 +654,7 @@ func extractServicePrefixes(jsBody []byte, requests []ObservedRequest) []string 
 	// CSS classes, asset prefixes — so we apply three filters:
 	//   - exclude API indicators (would self-classify as prefix)
 	//   - require ≥ standalonePrefixMinFrequency occurrences in the bundle
-	//   - cap at maxStandalonePrefixesPerBundle, sorted by descending
+	//   - cap at maxBundlePrefixCap, sorted by descending
 	//     frequency then ascending lexicographic order for determinism
 	addStandaloneCandidates(jsBody, add, seen)
 
@@ -625,7 +664,22 @@ func extractServicePrefixes(jsBody []byte, requests []ObservedRequest) []string 
 // addStandaloneCandidates is Strategy 3 of extractServicePrefixes. Pulled
 // out so the prefix-discovery pipeline reads top-down and the rubric (filter
 // → frequency-count → cap → sort → emit) is testable in isolation.
+//
+// Respects maxBundlePrefixCap as a TOTAL budget across the whole bundle: if
+// Strategies 1 and 2 have already emitted N prefixes (N == len(seen) at
+// entry to this function), Strategy 3 will add at most max(0, cap - N) more.
+// This guarantees the bundle never exceeds the cap regardless of how the
+// earlier strategies fared.
 func addStandaloneCandidates(jsBody []byte, add func(string), seen map[string]bool) {
+	// Snapshot the existing prefix count BEFORE we start adding.
+	existing := len(seen)
+	if existing >= maxBundlePrefixCap {
+		// Strategies 1 + 2 already saturated the bundle's budget; nothing
+		// to add here.
+		return
+	}
+	budget := maxBundlePrefixCap - existing
+
 	freq := make(map[string]int)
 	for _, match := range standalonePrefixPattern.FindAllSubmatch(jsBody, -1) {
 		if len(match) < 2 {
@@ -638,8 +692,8 @@ func addStandaloneCandidates(jsBody []byte, add func(string), seen map[string]bo
 		}
 		// Skip prefixes already emitted by Strategy 1 / 2. We continue
 		// before incrementing freq, so these are entirely excluded from
-		// Strategy 3's frequency-count + cap accounting; the per-bundle
-		// cap applies only to net-new candidates this strategy discovers.
+		// Strategy 3's frequency-count accounting (they are already
+		// counted toward the cap via `existing` above).
 		if seen[candidate] {
 			continue
 		}
@@ -669,8 +723,8 @@ func addStandaloneCandidates(jsBody []byte, add func(string), seen map[string]bo
 		return candidates[i].name < candidates[j].name
 	})
 
-	// Filter 3: per-bundle cap.
-	limit := maxStandalonePrefixesPerBundle
+	// Filter 3: per-bundle TOTAL cap (Strategies 1 + 2 + 3 combined).
+	limit := budget
 	if len(candidates) < limit {
 		limit = len(candidates)
 	}
