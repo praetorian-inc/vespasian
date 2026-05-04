@@ -1800,3 +1800,81 @@ func TestExtractServicePrefixes_Strategy3_DoesNotDuplicateStrategy1(t *testing.T
 	assert.Equal(t, []string{"identity/"}, got,
 		"Strategy 3 must not duplicate Strategy 1 hits")
 }
+
+// TestReplayJSExtracted_Strategy3_EndToEnd locks in the headline crAPI
+// claim: a const-only bundle (no Strategy 1 literal+literal hits, no
+// Strategy 2 crawl-result hints) where ONLY Strategy 3 can drive the
+// prefix-expansion that lets ReplayJSExtracted recover real endpoints.
+//
+// Without addStandaloneCandidates, the bare extracted /api/auth/login and
+// /api/shop/products would be probed without any service prefix and the
+// origin server's 404s would drop them all. With Strategy 3, the bundle's
+// "identity/" and "workshop/" standalone literals (each appearing 2+ times)
+// get picked up, addPath fans out the bare paths into prefixed forms, and
+// the real endpoints survive the 404 filter.
+func TestReplayJSExtracted_Strategy3_EndToEnd(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/identity/api/auth/login", "/workshop/api/shop/products":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		default:
+			// Includes the BARE forms /api/auth/login and /api/shop/products
+			// so a regression that disabled Strategy 3 would 404 here.
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	// Bundle that NO other strategy can decode:
+	//  - No literal+literal `+` concatenation (Strategy 1 would catch).
+	//  - No requests sourced from a JS file under a prefix subdirectory
+	//    (Strategy 2 would catch).
+	// Only the standalone bare prefix literals exist, each ≥2 times to
+	// satisfy the frequency threshold. The bare API paths reference SVC_*
+	// runtime constants which the regex extraction can't follow.
+	jsBody := []byte(`
+		const SVC_IDENTITY = "identity/";
+		const SVC_WORKSHOP = "workshop/";
+		const SVC_FALLBACK_IDENTITY = "identity/";
+		const SVC_FALLBACK_WORKSHOP = "workshop/";
+		fetch(SVC_IDENTITY + "/api/auth/login");
+		fetch(SVC_WORKSHOP + "/api/shop/products");
+		const PATHS = ["/api/auth/login", "/api/shop/products"];
+	`)
+
+	requests := []ObservedRequest{
+		{
+			Method: "GET",
+			URL:    srv.URL + "/static/js/main.js",
+			Source: "katana",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/javascript",
+				Body:        jsBody,
+			},
+		},
+	}
+
+	cfg := allowLocal(srv)
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	var probed []string
+	for _, r := range result {
+		if r.Source == "js-extract" {
+			probed = append(probed, r.URL)
+		}
+	}
+	sort.Strings(probed)
+
+	// Both prefixed forms must appear; bare /api/... must NOT (would mean
+	// Strategy 3 didn't fire and the 404 filter dropped everything real).
+	assert.Contains(t, probed, srv.URL+"/identity/api/auth/login",
+		"Strategy 3 must produce /identity/api/auth/login from const-only bundle")
+	assert.Contains(t, probed, srv.URL+"/workshop/api/shop/products",
+		"Strategy 3 must produce /workshop/api/shop/products from const-only bundle")
+	assert.NotContains(t, probed, srv.URL+"/api/auth/login",
+		"bare /api/auth/login should have been 404'd and dropped")
+	assert.NotContains(t, probed, srv.URL+"/api/shop/products",
+		"bare /api/shop/products should have been 404'd and dropped")
+}

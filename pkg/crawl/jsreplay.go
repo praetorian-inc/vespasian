@@ -636,8 +636,10 @@ func addStandaloneCandidates(jsBody []byte, add func(string), seen map[string]bo
 		if apiIndicatorPattern.MatchString(candidate) {
 			continue
 		}
-		// Already-emitted prefixes (Strategy 1 / 2) — count toward the
-		// per-bundle cap so we don't add yet more on top of them.
+		// Skip prefixes already emitted by Strategy 1 / 2. We continue
+		// before incrementing freq, so these are entirely excluded from
+		// Strategy 3's frequency-count + cap accounting; the per-bundle
+		// cap applies only to net-new candidates this strategy discovers.
 		if seen[candidate] {
 			continue
 		}
