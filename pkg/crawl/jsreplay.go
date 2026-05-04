@@ -378,6 +378,22 @@ var servicePrefixPattern = regexp.MustCompile(
 // from the extraction regexes.
 var apiIndicatorPattern = regexp.MustCompile(`(?i)` + apiIndicatorAlternation)
 
+// standalonePrefixPattern matches bare service-prefix string literals like
+// "identity/", "workshop/", "community/" — short lowercase-alpha-with-dashes
+// segments ending in a slash. Catches bundles that build URLs by
+// concatenating a config constant with a path:
+//
+//	const SVC_IDENTITY = "identity/"
+//	fetch(SVC_IDENTITY + "api/auth/login")
+//
+// rather than the strict literal+literal form servicePrefixPattern requires.
+// The standalone-prefix candidate is filtered against apiIndicatorPattern in
+// extractServicePrefixes so common API segments (api/, v1/, ...) cannot be
+// mistaken for service prefixes.
+var standalonePrefixPattern = regexp.MustCompile(
+	`["']([a-z][a-z0-9_-]{1,30}/)["']`,
+)
+
 // staticFileExts are file extensions to skip when extracting API paths.
 var staticFileExts = []string{".js", ".css", ".map", ".html", ".htm", ".png", ".jpg", ".svg"}
 
@@ -568,6 +584,24 @@ func extractServicePrefixes(jsBody []byte, requests []ObservedRequest) []string 
 		if valid && len(suffix) >= 2 && len(suffix) <= 30 {
 			add(suffix + "/")
 		}
+	}
+
+	// Strategy 3: standalone short-segment string literals.
+	// Many SPAs (e.g., crAPI) declare service prefixes as runtime constants
+	// (`const SVC = "identity/"`) and concatenate at call time, so the strict
+	// literal+literal `servicePrefixPattern` never fires. This strategy
+	// captures any "<word>/" string literal that is NOT itself an API
+	// indicator (api/, v1/, rest/, rpc/, graphql) — those would otherwise
+	// be misclassified as prefixes.
+	for _, match := range standalonePrefixPattern.FindAllSubmatch(jsBody, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		candidate := string(match[1])
+		if apiIndicatorPattern.MatchString(candidate) {
+			continue
+		}
+		add(candidate)
 	}
 
 	return prefixes
