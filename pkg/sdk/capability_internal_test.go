@@ -948,6 +948,50 @@ func TestParseHeaderString_CommaInValue(t *testing.T) {
 	assert.Equal(t, "application/json, text/plain", result["Accept"])
 }
 
+// TestParseHeaderString_ColonInValueContinuation verifies that comma-separated
+// fragments whose first non-whitespace token contains a colon (e.g. URLs such
+// as "https://svc:8443/path") are treated as continuations of the previous
+// header's value rather than as new header entries. Pre-fix, the parser used
+// strings.Contains(fragment, ":") which caused the second URL fragment to be
+// misclassified as a new header named "<https". Post-fix the check must
+// examine only the candidate key (the portion before the first colon with no
+// whitespace/tabs in it).
+func TestParseHeaderString_ColonInValueContinuation(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want map[string]string
+	}{
+		{
+			// URL in value: the second fragment " <https://svc:8443/b>" contains a
+			// colon but should be treated as a continuation, not a new header.
+			"URL in value not misclassified as new header",
+			"Link: <https://svc:8443/a>, <https://svc:8443/b>",
+			map[string]string{"Link": "<https://svc:8443/a>, <https://svc:8443/b>"},
+		},
+		{
+			// Colon in the middle of a continuation fragment: " span:def" starts
+			// with whitespace before its colon, so it is NOT a new header key.
+			"colon after whitespace in continuation treated as value",
+			"X-Trace: req:abc, span:def",
+			map[string]string{"X-Trace": "req:abc, span:def"},
+		},
+		{
+			// Positive regression: two distinct headers whose keys have no
+			// whitespace before their colon must still be split correctly.
+			"two distinct headers split correctly",
+			"A: 1, B: 2",
+			map[string]string{"A": "1", "B": "2"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseHeaderString(tc.raw)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Group B — TEST-003 (medium): decodeWSDLResponse table-driven tests
 // ---------------------------------------------------------------------------
@@ -1502,10 +1546,10 @@ func TestResolveAPITypeWithWSDLProbe_AutoButProbeReturnsNil(t *testing.T) {
 }
 
 // TestResolveAPITypeWithWSDLProbe_NonAutoSkipsProbe verifies that any apiType
-// other than "auto" causes probeFn to be skipped entirely and the original
-// apiType is returned unchanged with no synthetic request.
+// other than "auto" or "wsdl" causes probeFn to be skipped entirely and the
+// original apiType is returned unchanged with no synthetic request.
 func TestResolveAPITypeWithWSDLProbe_NonAutoSkipsProbe(t *testing.T) {
-	for _, apiType := range []string{"rest", "graphql", "wsdl", "anything"} {
+	for _, apiType := range []string{"rest", "graphql", "anything"} {
 		t.Run(apiType, func(t *testing.T) {
 			probeCalled := false
 			gotType, syntheticReq := resolveAPITypeWithWSDLProbe(
@@ -1520,6 +1564,49 @@ func TestResolveAPITypeWithWSDLProbe_NonAutoSkipsProbe(t *testing.T) {
 			assert.Nil(t, syntheticReq)
 		})
 	}
+}
+
+// TestResolveAPITypeWithWSDLProbe_WSDLModeRunsProbe verifies that when
+// apiType=="wsdl" the probe is invoked (rather than skipped), the returned
+// apiType remains "wsdl", and a non-nil synthetic ObservedRequest is produced
+// with the correct method, URL, and response body. This pins the desired
+// behavior from the CodeRabbit review: explicit wsdl mode should still probe
+// so that a synthetic request is created when the probe succeeds.
+func TestResolveAPITypeWithWSDLProbe_WSDLModeRunsProbe(t *testing.T) {
+	probeBody := []byte("<wsdl:definitions/>")
+	probeCalled := false
+	probeFn := func(_ context.Context, _ string) []byte {
+		probeCalled = true
+		return probeBody
+	}
+	apiType, syntheticReq := resolveAPITypeWithWSDLProbe(
+		context.Background(), "wsdl", "http://example.com/svc", probeFn,
+	)
+	assert.True(t, probeCalled, "probeFn must be invoked when apiType=wsdl")
+	assert.Equal(t, "wsdl", apiType)
+	require.NotNil(t, syntheticReq, "a synthetic request must be produced when probe returns data")
+	assert.Equal(t, "GET", syntheticReq.Method)
+	assert.Equal(t, "http://example.com/svc?wsdl", syntheticReq.URL)
+	assert.Equal(t, probeBody, syntheticReq.Response.Body)
+}
+
+// TestResolveAPITypeWithWSDLProbe_WSDLModeProbeReturnsNil verifies that when
+// apiType=="wsdl" and the probe returns nil, probeFn is still invoked, the
+// returned apiType remains "wsdl", and syntheticReq is nil. This preserves the
+// contract for sites where a WSDL document was already observed during crawl
+// so no synthetic request injection is needed.
+func TestResolveAPITypeWithWSDLProbe_WSDLModeProbeReturnsNil(t *testing.T) {
+	probeCalled := false
+	probeFn := func(_ context.Context, _ string) []byte {
+		probeCalled = true
+		return nil
+	}
+	apiType, syntheticReq := resolveAPITypeWithWSDLProbe(
+		context.Background(), "wsdl", "http://example.com/svc", probeFn,
+	)
+	assert.True(t, probeCalled, "probeFn must be invoked when apiType=wsdl")
+	assert.Equal(t, "wsdl", apiType)
+	assert.Nil(t, syntheticReq, "no synthetic request when probe returns nil")
 }
 
 // ---------------------------------------------------------------------------

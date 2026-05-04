@@ -398,12 +398,17 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 	return output.Emit(webApp)
 }
 
-// resolveAPITypeWithWSDLProbe runs the WSDL probe only when api_type is "auto"
-// (operator already chose a specific type — don't let the server override it).
+// resolveAPITypeWithWSDLProbe runs the WSDL probe when api_type is "auto" or
+// "wsdl". For all other types the operator already chose a specific type —
+// don't let the server override it — so the probe is skipped and apiType is
+// returned unchanged. When apiType is "wsdl" the probe still runs so that a
+// synthetic ObservedRequest is produced when the server returns a WSDL
+// document; the resolved type stays "wsdl" regardless (a wsdl operator-choice
+// is not overridden by the probe result).
 // Returns the resolved API type and a synthetic ObservedRequest carrying the WSDL
 // body when the probe succeeds, or (apiType, nil) when no probe is needed or fails.
 func resolveAPITypeWithWSDLProbe(ctx context.Context, apiType, primaryURL string, probeFn func(context.Context, string) []byte) (string, *crawl.ObservedRequest) {
-	if apiType != "auto" {
+	if apiType != "auto" && apiType != "wsdl" {
 		return apiType, nil
 	}
 	wsdlDoc := probeFn(ctx, primaryURL)
@@ -675,18 +680,33 @@ func parseHeaderString(raw string) map[string]string {
 	}
 	var entries []entry
 	for _, fragment := range strings.Split(raw, ",") {
-		if strings.Contains(fragment, ":") {
-			parts := strings.SplitN(fragment, ":", 2)
+		trimmed := strings.TrimLeft(fragment, " \t")
+		idx := strings.Index(trimmed, ":")
+		// A fragment starts a new header only when:
+		// 1. The colon exists and is not the first character (idx > 0).
+		// 2. The candidate key (everything before the colon) contains no
+		//    whitespace — per RFC 7230, a header field-name is a token.
+		// 3. The character immediately after the colon is a space, a tab,
+		//    or end-of-string (empty value). HTTP header syntax is
+		//    "key: value" or "key:"; a colon followed directly by a
+		//    non-space character indicates the colon is part of a value
+		//    (e.g., "span:def" or "<https://svc:8443/...>"), not a
+		//    key–value separator.
+		afterColon := idx + 1
+		isHeaderStart := idx > 0 &&
+			!strings.ContainsAny(trimmed[:idx], " \t") &&
+			(afterColon >= len(trimmed) || trimmed[afterColon] == ' ' || trimmed[afterColon] == '\t')
+		if isHeaderStart {
 			entries = append(entries, entry{
-				key: parts[0],
-				val: parts[1],
+				key: trimmed[:idx],
+				val: trimmed[idx+1:],
 			})
 		} else if len(entries) > 0 && strings.TrimSpace(fragment) != "" {
 			// Continuation: re-insert the comma and append to the last value.
 			// Whitespace-only fragments (e.g., from ", ,") are silently skipped.
 			entries[len(entries)-1].val += "," + fragment
 		}
-		// Fragments with no colon and no prior entry, or whitespace-only, are silently ignored.
+		// Fragments with no colon-prefixed key and no prior entry, or whitespace-only, are silently ignored.
 	}
 
 	headers := make(map[string]string)
