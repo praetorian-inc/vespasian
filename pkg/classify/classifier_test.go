@@ -659,6 +659,40 @@ func TestDeduplicate_MultipartBoundaryNormalized(t *testing.T) {
 	assert.InDelta(t, 0.95, result[0].Confidence, 0.001, "highest confidence kept")
 }
 
+// TestDeduplicate_MultipartShortBoundarySkipsNormalize verifies that when the
+// multipart boundary is shorter than 4 characters, boundary normalization is
+// skipped and the raw body bytes are used for fingerprinting instead.
+// Two observations with boundary=ab (2 chars) and different boundary values
+// but otherwise identical content must NOT dedup because the normalization
+// path is not taken — they hash to different raw bytes.
+func TestDeduplicate_MultipartShortBoundarySkipsNormalize(t *testing.T) {
+	// Both observations have the same logical content but different raw bytes
+	// because the boundary tokens differ and are NOT normalized (len < 4).
+	body1 := []byte("--ab\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\nvalue\r\n--ab--\r\n")
+	body2 := []byte("--cd\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\nvalue\r\n--cd--\r\n")
+	classified := []ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "POST", URL: "https://example.com/api/upload",
+				Headers: map[string]string{"Content-Type": "multipart/form-data; boundary=ab"},
+				Body:    body1,
+			},
+			IsAPI: true, Confidence: 0.85, APIType: "rest",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "POST", URL: "https://example.com/api/upload",
+				Headers: map[string]string{"Content-Type": "multipart/form-data; boundary=cd"},
+				Body:    body2,
+			},
+			IsAPI: true, Confidence: 0.90, APIType: "rest",
+		},
+	}
+	result := Deduplicate(classified)
+	assert.Len(t, result, 2,
+		"short boundaries (<4 chars) skip normalization, so raw body hashes differ and observations must NOT dedup")
+}
+
 // BenchmarkDeduplicate exercises the dedup hot path (key construction +
 // body fingerprint when applicable) at varying scales. Establishes a
 // baseline before stretch-goal performance work.
@@ -679,7 +713,7 @@ func BenchmarkDeduplicate(b *testing.B) {
 				}
 			}
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				_ = Deduplicate(input)
 			}
 		})

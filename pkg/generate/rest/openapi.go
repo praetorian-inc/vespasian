@@ -30,8 +30,6 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 )
 
-// Compile-time interface compliance check.
-
 // capitalizeFirst capitalizes the first letter of a string (UTF-8 safe).
 func capitalizeFirst(s string) string {
 	if s == "" {
@@ -243,7 +241,13 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest) *openap
 
 		if len(ctGroups) > 0 {
 			content := openapi3.Content{}
-			for mediaType, obs := range ctGroups {
+			ctKeys := make([]string, 0, len(ctGroups))
+			for k := range ctGroups {
+				ctKeys = append(ctKeys, k)
+			}
+			sort.Strings(ctKeys)
+			for _, mediaType := range ctKeys {
+				obs := ctGroups[mediaType]
 				bodies := make([][]byte, len(obs))
 				contentTypes := make([]string, len(obs))
 				for i, o := range obs {

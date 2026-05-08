@@ -134,18 +134,23 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest { //nolint:
 			// on the same endpoint+method+CT survive deduplication. This is
 			// required for downstream form/JSON merge logic in buildOperation
 			// to see all observations and union their fields. 8 bytes (64 bits)
-			// is a deliberate balance: birthday-collision probability is ~7e-13
+			// is a deliberate balance: birthday-collision probability is ~1e-14
 			// at 500 distinct bodies per endpoint, well under realistic crawl
-			// scale (capped at MaxPages, default 100). A collision would
-			// silently merge two distinct bodies into one dedup bucket; this
-			// is no worse than pre-fix behavior and worth the simpler key.
+			// scale (capped at MaxPages, default 100). With 1M distinct bodies the
+			// probability rises to ~5e-8, still negligible in practice.
+			// A collision would silently merge two distinct bodies into one dedup
+			// bucket; this is no worse than pre-fix behavior and worth the simpler key.
 			fingerprintBody := req.Body
 			if ct := getContentType(req.Headers); ct != "" {
 				if mt, params, err := mime.ParseMediaType(ct); err == nil && mt == "multipart/form-data" {
-					if boundary := params["boundary"]; boundary != "" {
+					if boundary := params["boundary"]; len(boundary) >= 4 {
 						// Multipart bodies contain a random boundary token (per-request) that
 						// would otherwise make every observation unique. Normalize it to a
 						// sentinel so identical logical forms with different boundaries dedup.
+						// boundary < 4 chars: skip normalization, fall through to raw body hash.
+						// This is defensive — RFC 2046 allows 1-70 char boundaries but real-world
+						// browsers/libraries use 30+ chars. A pathologically short boundary would
+						// corrupt the body more than it'd help dedup.
 						fingerprintBody = bytes.ReplaceAll(req.Body, []byte(boundary), []byte("BOUNDARY"))
 					}
 				}

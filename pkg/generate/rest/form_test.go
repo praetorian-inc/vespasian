@@ -622,6 +622,31 @@ func TestParseMultipartForm_BinaryFile(t *testing.T) {
 	}
 }
 
+// TestParseURLEncodedForm_BodyTooLarge verifies that ParseURLEncodedForm rejects
+// bodies larger than maxURLEncodedBodySize (10 MB) and returns nil, mirroring
+// the cap applied by the JSON parser (InferSchema) and multipart parser.
+func TestParseURLEncodedForm_BodyTooLarge(t *testing.T) {
+	body := make([]byte, maxURLEncodedBodySize+1)
+	schema := ParseURLEncodedForm(body)
+	assert.Nil(t, schema, "expected nil for body exceeding maxURLEncodedBodySize, got non-nil schema")
+}
+
+// TestParseURLEncodedForm_TooManyFields verifies that ParseURLEncodedForm rejects
+// bodies containing more than maxFormFields distinct keys and returns nil,
+// mirroring multipart's maxMultipartParts defense against adversarial input.
+func TestParseURLEncodedForm_TooManyFields(t *testing.T) {
+	// Build a body with maxFormFields+1 distinct keys.
+	var buf []byte
+	for i := 0; i <= maxFormFields; i++ {
+		if i > 0 {
+			buf = append(buf, '&')
+		}
+		buf = fmt.Appendf(buf, "k%d=v", i)
+	}
+	schema := ParseURLEncodedForm(buf)
+	assert.Nil(t, schema, "expected nil for body with more than maxFormFields keys, got non-nil schema")
+}
+
 // TestMergeURLEncodedBodies_DifferentFieldsPerObservation verifies that merging
 // three observations with partially overlapping fields produces a schema with
 // the union of all observed fields (a, b, c, d).

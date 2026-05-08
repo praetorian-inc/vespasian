@@ -30,6 +30,11 @@ import (
 // have well below this limit.
 const maxMultipartParts = 1000
 
+const (
+	maxURLEncodedBodySize = 10 * 1024 * 1024 // 10MB; matches JSON InferSchema cap
+	maxFormFields         = 1000             // matches maxMultipartParts
+)
+
 // getHeader retrieves a header value case-insensitively. The exact-match
 // shortcut at the top is a performance optimization for the common path
 // (browser-lowercased "content-type"); the loop handles other casings such
@@ -54,8 +59,20 @@ func ParseURLEncodedForm(body []byte) *openapi3.SchemaRef {
 	if len(body) == 0 {
 		return nil
 	}
+	// Bound resident memory under adversarial input. The JSON path has the
+	// same cap (schema.go:maxBodySize); aligning here so all three body parsers
+	// (JSON / urlencoded / multipart) reject obviously hostile sizes uniformly.
+	if len(body) > maxURLEncodedBodySize {
+		return nil
+	}
 	values, err := url.ParseQuery(string(body))
 	if err != nil || len(values) == 0 {
+		return nil
+	}
+	if len(values) > maxFormFields {
+		// Defensive: don't allocate one schema property per field on adversarial
+		// bodies (millions of `k=v&` pairs). Drop on the floor to mirror
+		// multipart's maxMultipartParts behavior.
 		return nil
 	}
 	schema := openapi3.NewObjectSchema()

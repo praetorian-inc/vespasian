@@ -319,9 +319,7 @@ func TestCapitalizeFirst(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := capitalizeFirst(tt.input)
-			if result != tt.expected {
-				t.Errorf("capitalizeFirst(%q) = %q, want %q", tt.input, result, tt.expected)
-			}
+			assert.Equal(t, tt.expected, result, "capitalizeFirst(%q)", tt.input)
 		})
 	}
 }
@@ -349,9 +347,7 @@ func TestInferQueryParamType(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := inferQueryParamType(tt.value)
-			if result != tt.expected {
-				t.Errorf("inferQueryParamType(%q) = %q, want %q", tt.value, result, tt.expected)
-			}
+			assert.Equal(t, tt.expected, result, "inferQueryParamType(%q)", tt.value)
 		})
 	}
 }
@@ -909,60 +905,49 @@ func TestExtractComponents(t *testing.T) {
 	extractComponents(doc)
 
 	// Verify components were created
-	if doc.Components == nil || doc.Components.Schemas == nil {
-		t.Fatal("Components or Schemas not initialized")
-	}
+	require.NotNil(t, doc.Components, "Components should be initialized")
+	require.NotNil(t, doc.Components.Schemas, "Schemas should be initialized")
 
 	// Verify request body schema was extracted
-	if _, exists := doc.Components.Schemas["CreateTicketRequest"]; !exists {
-		t.Error("CreateTicketRequest schema not found in components")
-	}
+	assert.Contains(t, doc.Components.Schemas, "CreateTicketRequest",
+		"CreateTicketRequest schema not found in components")
 
 	// Verify response schemas were extracted
 	// Note: POST 201 and GET 200 have identical schemas (id, title), so they share the same component
-	hasTicketResponse := false
-	if _, exists := doc.Components.Schemas["TicketCreatedResponse"]; exists {
-		hasTicketResponse = true
-	}
-	if _, exists := doc.Components.Schemas["TicketResponse"]; exists {
-		hasTicketResponse = true
-	}
-	if !hasTicketResponse {
-		t.Error("No ticket response schema found in components (expected TicketCreatedResponse or TicketResponse)")
-	}
+	_, hasCreatedResponse := doc.Components.Schemas["TicketCreatedResponse"]
+	_, hasTicketResponse := doc.Components.Schemas["TicketResponse"]
+	assert.True(t, hasCreatedResponse || hasTicketResponse,
+		"No ticket response schema found in components (expected TicketCreatedResponse or TicketResponse)")
 
-	if _, exists := doc.Components.Schemas["TicketNotFoundResponse"]; !exists {
-		t.Error("TicketNotFoundResponse schema not found in components")
-	}
+	assert.Contains(t, doc.Components.Schemas, "TicketNotFoundResponse",
+		"TicketNotFoundResponse schema not found in components")
 
 	// Verify schemas were replaced with $ref
 	postOp := doc.Paths.Find("/api/v2/tickets").Post
-	if postOp.RequestBody == nil || postOp.RequestBody.Value.Content["application/json"].Schema.Ref == "" {
-		t.Error("POST request body schema not replaced with $ref")
-	}
+	require.NotNil(t, postOp.RequestBody, "POST request body should not be nil")
+	assert.NotEmpty(t, postOp.RequestBody.Value.Content["application/json"].Schema.Ref,
+		"POST request body schema not replaced with $ref")
 
 	getOp := doc.Paths.Find("/api/v2/tickets/{ticketId}").Get
 	resp200 := getOp.Responses.Value("200")
-	if resp200 == nil || resp200.Value.Content["application/json"].Schema.Ref == "" {
-		t.Error("GET 200 response schema not replaced with $ref")
-	}
+	require.NotNil(t, resp200, "GET 200 response should not be nil")
+	assert.NotEmpty(t, resp200.Value.Content["application/json"].Schema.Ref,
+		"GET 200 response schema not replaced with $ref")
+
 	resp404 := getOp.Responses.Value("404")
-	if resp404 == nil || resp404.Value.Content["application/json"].Schema.Ref == "" {
-		t.Error("GET 404 response schema not replaced with $ref")
-	}
+	require.NotNil(t, resp404, "GET 404 response should not be nil")
+	assert.NotEmpty(t, resp404.Value.Content["application/json"].Schema.Ref,
+		"GET 404 response schema not replaced with $ref")
 
-	// Verify deduplication: 200 responses for both POST/GET have same schema
+	// Verify deduplication: POST 201 and GET 200 have identical schemas (id, title).
+	// They may or may not share the same $ref depending on the response-vs-request
+	// fingerprint maps; at minimum, both $refs must be non-empty (already checked above).
 	postResp := postOp.Responses.Value("201")
+	require.NotNil(t, postResp, "POST 201 response should not be nil")
 	getResp := getOp.Responses.Value("200")
-
-	// Both should reference the same schema (based on fingerprint)
-	// POST 201 and GET 200 have identical schemas (id, title), so they should share a component
-	if postResp.Value.Content["application/json"].Schema.Ref != getResp.Value.Content["application/json"].Schema.Ref {
-		// Actually, they might have different names based on status code context
-		// Let me check if at least the references exist
-		t.Logf("POST 201 ref: %s", postResp.Value.Content["application/json"].Schema.Ref)
-		t.Logf("GET 200 ref: %s", getResp.Value.Content["application/json"].Schema.Ref)
-	}
+	require.NotNil(t, getResp, "GET 200 response should not be nil")
+	t.Logf("POST 201 ref: %s", postResp.Value.Content["application/json"].Schema.Ref)
+	t.Logf("GET 200 ref: %s", getResp.Value.Content["application/json"].Schema.Ref)
 }
 
 func TestBuildOperation_FormBody(t *testing.T) {
