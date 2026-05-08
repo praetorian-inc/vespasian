@@ -14,13 +14,19 @@
 
 // Package rest generates OpenAPI 3.0 specifications from classified REST
 // requests. It handles path normalization (collapsing /users/42 and /users/87
-// into /users/{id}), UUID detection, context-aware parameter naming, and JSON
-// schema inference from response bodies.
+// into /users/{id}), dynamic-segment detection, context-aware parameter
+// naming, and JSON schema inference from response bodies.
 //
 // Key components:
 //   - [OpenAPIGenerator] produces a valid OpenAPI 3.0 document in YAML format.
-//   - Path normalization replaces numeric and UUID path segments with
-//     parameterized templates while preserving known literals (/me, /self).
+//   - Path normalization replaces dynamic path segments with parameterized
+//     templates. Single-path detection covers UUIDs, MongoDB ObjectIDs,
+//     numeric IDs, short hex hashes, and base64/base64url tokens.
+//     Observation-based detection ([NormalizePathsWithNames]) additionally
+//     identifies slug-style identifiers when multiple distinct values are
+//     observed at the same path position. Known literals (`me`, `current`,
+//     `self`, `new`, `list`, `search`) are preserved against all forms of
+//     parameterization.
 //   - Schema inference examines response JSON to generate OpenAPI schema
 //     objects with depth and property guards.
 package rest

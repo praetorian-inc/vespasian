@@ -15,6 +15,7 @@
 package rest
 
 import (
+	"sort"
 	"testing"
 )
 
@@ -132,6 +133,59 @@ func TestNormalizePath_LiteralPreservation(t *testing.T) {
 	}
 }
 
+func TestNormalizePath_DynamicSegmentExpansion(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "mongodb objectid",
+			input:    "/articles/507f1f77bcf86cd799439011",
+			expected: "/articles/{id}",
+		},
+		{
+			name:     "short hex hash 8 chars",
+			input:    "/commits/a1b2c3d4",
+			expected: "/commits/{id}",
+		},
+		{
+			name:     "short hex hash 12 chars",
+			input:    "/commits/abcdef012345",
+			expected: "/commits/{id}",
+		},
+		{
+			name:     "base64url token",
+			input:    "/tokens/eyJhbGciOiJIUzI1NiJ9X-_test",
+			expected: "/tokens/{id}",
+		},
+		{
+			name:     "base64 with mixed case and digits",
+			input:    "/sessions/AbCdEfGhIj1234567890",
+			expected: "/sessions/{id}",
+		},
+		{
+			name:     "no false positive on simple slug",
+			input:    "/articles/my-blog-post",
+			expected: "/articles/my-blog-post",
+		},
+		{
+			name:     "no false positive on dictionary word",
+			input:    "/users/profile",
+			expected: "/users/profile",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := NormalizePath(tt.input)
+			if result != tt.expected {
+				t.Errorf("NormalizePath(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
 func TestNormalizePathWithNames_ContextAwareNaming(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -195,6 +249,85 @@ func TestNormalizePathWithNames_ContextAwareNaming(t *testing.T) {
 			result := NormalizePathWithNames(tt.input)
 			if result != tt.expected {
 				t.Errorf("NormalizePathWithNames(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestNormalizePathWithNames_NewKinds(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "mongodb objectid contextual name",
+			input:    "/articles/507f1f77bcf86cd799439011",
+			expected: "/articles/{articleId}",
+		},
+		{
+			name:     "short hex hash contextual name",
+			input:    "/commits/a1b2c3d4",
+			expected: "/commits/{commitId}",
+		},
+		{
+			name:     "short hex hash 6 chars",
+			input:    "/blobs/abc123",
+			expected: "/blobs/{blobId}",
+		},
+		{
+			name:     "base64url token uses Token suffix",
+			input:    "/sessions/AbCdEfGhIj1234567890XY",
+			expected: "/sessions/{sessionToken}",
+		},
+		{
+			name:     "base64 with padding uses Token suffix",
+			input:    "/api/keys/ZXhhbXBsZS10b2tlbi1kYXRh",
+			expected: "/api/keys/{keyToken}",
+		},
+		{
+			name:     "ObjectID embedded among literals",
+			input:    "/v1/users/507f1f77bcf86cd799439011/avatar",
+			expected: "/v1/users/{userId}/avatar",
+		},
+		{
+			name:     "literal preserved despite shape similar to short hex",
+			input:    "/users/list",
+			expected: "/users/list",
+		},
+		{
+			name:     "literal me preserved",
+			input:    "/users/me/profile",
+			expected: "/users/me/profile",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := NormalizePathWithNames(tt.input)
+			if result != tt.expected {
+				t.Errorf("NormalizePathWithNames(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestNormalizePathWithNames_NoFalsePositiveOnDictionaryWords(t *testing.T) {
+	// Dictionary words and slugs must not be parameterized by the single-path
+	// pass — only the observation-based pass may promote them to parameters.
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"articles slug", "/articles/my-blog-post"},
+		{"users profile", "/users/profile"},
+		{"common english word", "/items/recommendation"},
+		{"slug with digits", "/articles/2024-year-in-review"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := NormalizePathWithNames(c.path); got != c.path {
+				t.Errorf("NormalizePathWithNames(%q) = %q, want unchanged literal", c.path, got)
 			}
 		})
 	}
@@ -283,5 +416,210 @@ func TestNormalizePathWithNames_ConsecutiveIDs(t *testing.T) {
 				t.Errorf("NormalizePathWithNames(%q) = %q, want %q", tt.input, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestNormalizePathsWithNames_SlugObservation(t *testing.T) {
+	paths := []string{
+		"/articles/my-first-post",
+		"/articles/my-second-post",
+		"/articles/yet-another-post",
+	}
+	got := NormalizePathsWithNames(paths)
+
+	// All three slug-style observations should collapse to a single
+	// parameterized path because the position varies across observations.
+	want := map[string]string{
+		"/articles/my-first-post":    "/articles/{articleSlug}",
+		"/articles/my-second-post":   "/articles/{articleSlug}",
+		"/articles/yet-another-post": "/articles/{articleSlug}",
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("path %q normalized to %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+func TestNormalizePathsWithNames_LiteralNotPromotedAcrossPositions(t *testing.T) {
+	paths := []string{
+		"/users/me/profile",
+		"/users/jane/profile",
+		"/users/bob/profile",
+	}
+	got := NormalizePathsWithNames(paths)
+
+	// `me` is a known literal and must not be parameterized even though
+	// `jane` and `bob` vary at the same position. The two non-literal
+	// observations promote that position to a slug; the `me` observation
+	// stays literal.
+	if got["/users/me/profile"] != "/users/me/profile" {
+		t.Errorf("literal `me` was rewritten: got %q", got["/users/me/profile"])
+	}
+	if got["/users/jane/profile"] != "/users/{userSlug}/profile" {
+		t.Errorf("varying segment not parameterized: got %q", got["/users/jane/profile"])
+	}
+	if got["/users/bob/profile"] != "/users/{userSlug}/profile" {
+		t.Errorf("varying segment not parameterized: got %q", got["/users/bob/profile"])
+	}
+}
+
+func TestNormalizePathsWithNames_RootResourceNeverPromoted(t *testing.T) {
+	// Different first-segment resource types must not collapse into a single
+	// slug parameter just because they vary at the same position index.
+	paths := []string{
+		"/users",
+		"/posts",
+		"/articles",
+		"/sessions",
+	}
+	got := NormalizePathsWithNames(paths)
+	for _, p := range paths {
+		if got[p] != p {
+			t.Errorf("root resource %q was promoted: got %q", p, got[p])
+		}
+	}
+}
+
+func TestNormalizePathsWithNames_SinglePathNoSlug(t *testing.T) {
+	// One observation cannot demonstrate variation, so the literal segment
+	// must be preserved.
+	paths := []string{"/articles/my-only-post"}
+	got := NormalizePathsWithNames(paths)
+	if got["/articles/my-only-post"] != "/articles/my-only-post" {
+		t.Errorf("single observation parameterized: %v", got)
+	}
+}
+
+func TestNormalizePathsWithNames_RegressionUUIDAndNumeric(t *testing.T) {
+	paths := []string{
+		"/users/42",
+		"/users/43",
+		"/users/550e8400-e29b-41d4-a716-446655440000",
+		"/posts/1",
+		"/posts/2",
+	}
+	got := NormalizePathsWithNames(paths)
+	want := map[string]string{
+		"/users/42": "/users/{userId}",
+		"/users/43": "/users/{userId}",
+		"/users/550e8400-e29b-41d4-a716-446655440000": "/users/{userId}",
+		"/posts/1": "/posts/{postId}",
+		"/posts/2": "/posts/{postId}",
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("path %q normalized to %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+func TestNormalizePathsWithNames_MixedKinds(t *testing.T) {
+	paths := []string{
+		"/articles/my-first-post",
+		"/articles/507f1f77bcf86cd799439011", // ObjectID
+		"/articles/another-post",
+	}
+	got := NormalizePathsWithNames(paths)
+	want := map[string]string{
+		"/articles/my-first-post":            "/articles/{articleSlug}",
+		"/articles/507f1f77bcf86cd799439011": "/articles/{articleId}",
+		"/articles/another-post":             "/articles/{articleSlug}",
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("path %q normalized to %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+func TestNormalizePathsWithNames_DifferentShapesNotConflated(t *testing.T) {
+	// Same position index but different prefix/suffix shapes. The two slug
+	// positions are independent, so each must be evaluated within its own
+	// shape bucket.
+	paths := []string{
+		"/articles/foo",
+		"/articles/bar",
+		"/users/me",
+		"/users/baz",
+	}
+	got := NormalizePathsWithNames(paths)
+
+	// /articles position has two distinct values -> slug.
+	if got["/articles/foo"] != "/articles/{articleSlug}" {
+		t.Errorf("articles/foo got %q", got["/articles/foo"])
+	}
+	if got["/articles/bar"] != "/articles/{articleSlug}" {
+		t.Errorf("articles/bar got %q", got["/articles/bar"])
+	}
+	// /users position has only one non-literal value (`baz`); `me` is excluded
+	// from observation. With only one varying value, no promotion.
+	if got["/users/me"] != "/users/me" {
+		t.Errorf("users/me literal lost: %q", got["/users/me"])
+	}
+	if got["/users/baz"] != "/users/baz" {
+		t.Errorf("users/baz prematurely promoted: %q", got["/users/baz"])
+	}
+}
+
+func TestNormalizePathsWithNames_EmptyAndDuplicateInputs(t *testing.T) {
+	if got := NormalizePathsWithNames(nil); len(got) != 0 {
+		t.Errorf("NormalizePathsWithNames(nil) = %v, want empty map", got)
+	}
+
+	dupPaths := []string{"/users/42", "/users/42", "/users/43"}
+	got := NormalizePathsWithNames(dupPaths)
+	if len(got) != 2 {
+		// Sort for stable error output
+		keys := make([]string, 0, len(got))
+		for k := range got {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		t.Errorf("expected 2 distinct keys, got %d: %v", len(got), keys)
+	}
+	if got["/users/42"] != "/users/{userId}" {
+		t.Errorf("got %q for /users/42", got["/users/42"])
+	}
+}
+
+func TestParamNameFromKind_NoContextFallbacks(t *testing.T) {
+	cases := []struct {
+		kind paramKind
+		want string
+	}{
+		{kindUUID, "id"},
+		{kindObjectID, "id"},
+		{kindNumeric, "id"},
+		{kindShortHex, "id"},
+		{kindBase64, "token"},
+		{kindSlug, "slug"},
+	}
+	for _, c := range cases {
+		if got := paramNameFromKind("", c.kind); got != c.want {
+			t.Errorf("paramNameFromKind(\"\", %v) = %q, want %q", c.kind, got, c.want)
+		}
+	}
+}
+
+func TestIsBase64Token(t *testing.T) {
+	cases := []struct {
+		segment string
+		want    bool
+	}{
+		{"AbCdEfGhIj1234567890", true},               // mixed case + digits, length 20
+		{"ZXhhbXBsZS10b2tlbi1kYXRh", true},           // base64-looking
+		{"my-very-long-blog-post-title-here", false}, // pure-lower slug
+		{"abcdef0123456789", false},                  // all hex/lower-digit, no upper -> not base64
+		{"short", false},                             // too short
+		{"AbCdEfGhIj++==", false},                    // length 14, below threshold
+		{"Aa1Bb2Cc3Dd4Ee5Ff6", true},                 // mixed case + digits, length >= 16
+		{"AaaaaaaaaaaaaaaaaaaaB", false},             // missing digit -> reject
+		{"012345678901234567890123", false},          // pure digits handled by numeric kind, base64 alone false (no upper/lower)
+	}
+	for _, c := range cases {
+		if got := isBase64Token(c.segment); got != c.want {
+			t.Errorf("isBase64Token(%q) = %v, want %v", c.segment, got, c.want)
+		}
 	}
 }
