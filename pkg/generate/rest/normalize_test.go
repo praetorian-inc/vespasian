@@ -15,7 +15,9 @@
 package rest
 
 import (
+	"fmt"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -1025,4 +1027,92 @@ func TestIsBase64Token(t *testing.T) {
 			t.Errorf("isBase64Token(%q) = %v, want %v", c.segment, got, c.want)
 		}
 	}
+}
+
+func TestNormalizePathsWithNames_MaxPromotionRoundsCap(t *testing.T) {
+	// Locks in the saturation contract for the maxPromotionRounds = 8 cap
+	// (normalize.go around `const maxPromotionRounds = 8`), the SEC-BE-001
+	// defense against CPU-DoS on pathological inputs. The cap MUST guarantee
+	// that NormalizePathsWithNames terminates with a well-formed result for
+	// any input, regardless of how many rounds the algorithm would otherwise
+	// require to fully converge.
+	//
+	// We assert two properties:
+	//
+	//   (a) Saturation safety — even on a deliberately complex fixture
+	//       the function returns without panicking, every input path
+	//       appears in the output map (no silent drops), and every output
+	//       is a non-empty string that begins with `/` (a valid path
+	//       template). Some segments may remain literal at saturation —
+	//       that is the documented best-effort contract.
+	//
+	//   (b) Cap-not-silently-lowered — the cap value MUST be at least 2.
+	//       The fixture below is one that requires exactly 2 rounds to
+	//       fully converge (every path resolves to /repos/{repoSlug}/{repoSlug2}).
+	//       If a future refactor silently lowers the cap to 1, the
+	//       expected templates will not appear and the assertion fails.
+	//       This sub-property is also implicitly covered by
+	//       TestNormalizePathsWithNames_FixedPointIterationRequired but is
+	//       repeated here so the cap-monitor test is self-contained.
+
+	t.Run("saturation_safety_on_deep_overlap_fixture", func(t *testing.T) {
+		// Construct a deeply-nested fixture with multiple varying positions
+		// and partial overlap. Realistic inputs like this converge in
+		// 2-3 rounds; the test does not depend on hitting the cap, only
+		// on the saturation invariants holding.
+		var paths []string
+		owners := []string{"alice", "bob", "carol", "dave", "eve"}
+		repos := []string{"proj-a", "proj-b", "proj-c"}
+		issues := []string{"1", "2", "3"}
+		for _, o := range owners {
+			for _, r := range repos {
+				for _, i := range issues {
+					paths = append(paths, fmt.Sprintf("/svc/repos/%s/%s/issues/%s", o, r, i))
+				}
+			}
+		}
+
+		got := NormalizePathsWithNames(paths)
+
+		// Saturation invariant 1: every input path is preserved as a key.
+		for _, p := range paths {
+			out, ok := got[p]
+			if !ok {
+				t.Errorf("input path %q missing from output map (cap may have dropped paths)", p)
+				continue
+			}
+			if out == "" {
+				t.Errorf("path %q produced empty output", p)
+			}
+			if !strings.HasPrefix(out, "/") {
+				t.Errorf("path %q produced non-path output %q", p, out)
+			}
+		}
+
+		// Saturation invariant 2: output map size never exceeds input size
+		// (deduplication is the only path that reduces it).
+		if len(got) > len(paths) {
+			t.Errorf("got %d output entries, want at most %d", len(got), len(paths))
+		}
+	})
+
+	t.Run("cap_supports_at_least_two_rounds", func(t *testing.T) {
+		// Fixture mirrors TestNormalizePathsWithNames_FixedPointIterationRequired:
+		// genuinely needs round 2 to converge. If the cap is silently
+		// lowered to 1, alice/proj-b and bob/proj-c stay literal at
+		// position 2.
+		paths := []string{
+			"/repos/alice/proj-a",
+			"/repos/alice/proj-b",
+			"/repos/bob/proj-a",
+			"/repos/bob/proj-c",
+		}
+		got := NormalizePathsWithNames(paths)
+		const want = "/repos/{repoSlug}/{repoSlug2}"
+		for _, p := range paths {
+			if got[p] != want {
+				t.Errorf("path %q normalized to %q, want %q — maxPromotionRounds may have been silently lowered below 2", p, got[p], want)
+			}
+		}
+	})
 }
