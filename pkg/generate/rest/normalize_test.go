@@ -276,6 +276,20 @@ func TestNormalizePathWithNames_NewKinds(t *testing.T) {
 			expected: "/blobs/{blobId}",
 		},
 		{
+			// Positive coverage for the uppercase A-F discriminator branch
+			// of isShortHexHash. Uppercase hex like "ABCDEF" is a real
+			// short-SHA shape; without this case the uppercase clause has
+			// no positive test.
+			name:     "uppercase short hex hash",
+			input:    "/commits/ABCDEF",
+			expected: "/commits/{commitId}",
+		},
+		{
+			name:     "mixed-case short hex hash",
+			input:    "/commits/AbCdEf12",
+			expected: "/commits/{commitId}",
+		},
+		{
 			name:     "base64url token uses Token suffix",
 			input:    "/sessions/AbCdEfGhIj1234567890XY",
 			expected: "/sessions/{sessionToken}",
@@ -516,6 +530,7 @@ func TestNormalizePathsWithNames_ResourceTypeBehindPathPrefixNeverPromoted(t *te
 	// "literal context" is the scaffold itself — which is not a resource.
 	groups := [][]string{
 		{"/api/users", "/api/posts", "/api/articles"},
+		{"/apis/users", "/apis/posts", "/apis/articles"},
 		{"/v1/users", "/v1/posts", "/v1/articles"},
 		{"/v2/products", "/v2/orders", "/v2/customers"},
 		{"/api/v1/users", "/api/v1/posts", "/api/v1/articles"},
@@ -621,6 +636,12 @@ func TestNormalizePathsWithNames_RegressionUUIDAndNumeric(t *testing.T) {
 }
 
 func TestNormalizePathsWithNames_MixedKinds(t *testing.T) {
+	// When an observation-promoted slug coexists at the same path position
+	// with a regex-classified kind (here, an ObjectID), the post-process
+	// unification collapses them onto kindSlug so a single OpenAPI path
+	// template emerges. Without this, downstream tooling would see two
+	// distinct templates (/articles/{articleSlug} and /articles/{articleId})
+	// for the same parameterized endpoint.
 	paths := []string{
 		"/articles/my-first-post",
 		"/articles/507f1f77bcf86cd799439011", // ObjectID
@@ -629,8 +650,29 @@ func TestNormalizePathsWithNames_MixedKinds(t *testing.T) {
 	got := NormalizePathsWithNames(paths)
 	want := map[string]string{
 		"/articles/my-first-post":            "/articles/{articleSlug}",
-		"/articles/507f1f77bcf86cd799439011": "/articles/{articleId}",
+		"/articles/507f1f77bcf86cd799439011": "/articles/{articleSlug}",
 		"/articles/another-post":             "/articles/{articleSlug}",
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("path %q normalized to %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+func TestNormalizePathsWithNames_MixedKindsWithoutSlugObservation(t *testing.T) {
+	// When no slug observation is promoted (single observation of a slug
+	// shape), the regex-classified kind keeps its template; the literal
+	// stays literal. Unification only runs when a slug actually exists at
+	// the shape position.
+	paths := []string{
+		"/articles/my-only-post",             // 1 literal observation, not promoted
+		"/articles/507f1f77bcf86cd799439011", // ObjectID, regex-classified
+	}
+	got := NormalizePathsWithNames(paths)
+	want := map[string]string{
+		"/articles/my-only-post":             "/articles/my-only-post",
+		"/articles/507f1f77bcf86cd799439011": "/articles/{articleId}",
 	}
 	for k, v := range want {
 		if got[k] != v {
@@ -704,6 +746,92 @@ func TestParamNameFromKind_NoContextFallbacks(t *testing.T) {
 	for _, c := range cases {
 		if got := paramNameFromKind("", c.kind); got != c.want {
 			t.Errorf("paramNameFromKind(\"\", %v) = %q, want %q", c.kind, got, c.want)
+		}
+	}
+}
+
+func TestParamNameFromKind_WithContext(t *testing.T) {
+	// Direct table-driven coverage for the contextual path of
+	// paramNameFromKind: singularize(prev) + suffixForKind(kind). This
+	// isolates the suffix selection from path splitting, so a regression
+	// that maps kindBase64 to "Slug" or kindSlug to "Token" fails here
+	// instead of in a far-removed full-path test.
+	cases := []struct {
+		name string
+		prev string
+		kind paramKind
+		want string
+	}{
+		{"users + UUID", "users", kindUUID, "userId"},
+		{"users + ObjectID", "users", kindObjectID, "userId"},
+		{"users + numeric", "users", kindNumeric, "userId"},
+		{"users + shortHex", "users", kindShortHex, "userId"},
+		{"sessions + base64", "sessions", kindBase64, "sessionToken"},
+		{"articles + slug", "articles", kindSlug, "articleSlug"},
+		{"categories + slug", "categories", kindSlug, "categorySlug"},
+		{"addresses + UUID", "addresses", kindUUID, "addressId"},
+		{"data + UUID (no plural)", "data", kindUUID, "dataId"},
+		{"hyphen-context + slug", "my-resource", kindSlug, "myResourceSlug"},
+		{"dot-context + slug", "v2.foo", kindSlug, "v2FooSlug"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := paramNameFromKind(c.prev, c.kind); got != c.want {
+				t.Errorf("paramNameFromKind(%q, %v) = %q, want %q", c.prev, c.kind, got, c.want)
+			}
+		})
+	}
+}
+
+func TestSanitizeParamName_HyphenAndDotConversion(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain alphanumeric unchanged", "userId", "userId"},
+		{"underscore preserved", "user_id", "user_id"},
+		{"hyphen becomes camelCase", "my-service", "myService"},
+		{"dot becomes camelCase", "v2.foo.bar", "v2FooBar"},
+		{"trailing hyphen swallowed", "user-", "user"},
+		{"leading hyphen swallowed", "-user", "User"},
+		{"unsafe characters dropped", "us%er!", "user"},
+		{"empty input becomes id", "", "id"},
+		{"only-unsafe becomes id", "!?", "id"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := sanitizeParamName(c.in); got != c.want {
+				t.Errorf("sanitizeParamName(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+func TestNormalizePathsWithNames_DepthFiveMultiVarying(t *testing.T) {
+	// Depth-5 paths with overlap at multiple positions exercise the
+	// fixed-point iteration of promoteVaryingPositions across more than
+	// two adjacent literal positions. A regression that artificially caps
+	// iteration at one extra round will not promote the deepest position
+	// and therefore fails this test.
+	paths := []string{
+		"/repos/alice/proj1/issues/1",
+		"/repos/alice/proj1/issues/2",
+		"/repos/alice/proj2/issues/1",
+		"/repos/bob/proj1/issues/1",
+		"/repos/bob/proj2/issues/2",
+	}
+	got := NormalizePathsWithNames(paths)
+	// Owner (position 2) and project (position 3) are slug-shaped and
+	// vary across observations — they are promoted to kindSlug by the
+	// fixed-point iteration. The trailing numeric segments at position 5
+	// are regex-classified as kindNumeric on the first pass and rendered
+	// with the conventional `Id` suffix; they don't go through the
+	// observation pass at all. All three positions are parameterized.
+	const want = "/repos/{repoSlug}/{repoSlug2}/issues/{issueId}"
+	for _, p := range paths {
+		if got[p] != want {
+			t.Errorf("path %q normalized to %q, want %q", p, got[p], want)
 		}
 	}
 }

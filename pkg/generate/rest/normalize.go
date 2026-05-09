@@ -41,6 +41,11 @@ var (
 	// numericRegex matches purely numeric segments.
 	numericRegex = regexp.MustCompile(`^[0-9]+$`)
 	// objectIDRegex matches MongoDB ObjectIDs: exactly 24 hex characters.
+	// Hex strings of intermediate length (13-23 characters) are intentionally
+	// not classified as a parameter kind by the regex pass — they are
+	// uncommon as identifiers in real APIs. If observed varying across paths
+	// they will still be promoted by observation-based detection in
+	// NormalizePathsWithNames.
 	objectIDRegex = regexp.MustCompile(`^[0-9a-fA-F]{24}$`)
 	// shortHexRegex matches short hex hashes: 6-12 hex characters.
 	// Pure-numeric strings are excluded by the caller so they classify as kindNumeric instead.
@@ -53,10 +58,11 @@ var (
 	// characters; standard base64 may also include `+` and `/`, both of which
 	// are valid in path segments after percent-decoding.
 	base64Regex = regexp.MustCompile(`^[A-Za-z0-9_\-+/]{16,}={0,2}$`)
-	// versionPrefixRegex matches "v" followed by one or more digits — the
-	// conventional API version segment (v1, v2, v123). Used by isPathPrefix
-	// to skip these segments when looking for resource-type context.
-	versionPrefixRegex = regexp.MustCompile(`^v[0-9]+$`)
+	// versionPrefixRegex matches "v" followed by digits, requiring the
+	// leading digit to be non-zero — `v1`, `v2`, `v123` qualify but
+	// `v0`, `v01`, `v001` do not (none of those are conventional REST
+	// version markers).
+	versionPrefixRegex = regexp.MustCompile(`^v[1-9][0-9]*$`)
 )
 
 // knownLiterals are exact path segment values that must be preserved as
@@ -101,6 +107,12 @@ func isPathPrefix(segment string) bool {
 // least one digit or uppercase A-F so that pure-lowercase English words
 // composed of [a-f] characters (e.g., "facade", "decade", "beaded") are
 // not misclassified as hashes.
+//
+// Trade-off: all-uppercase hex words (e.g., "FACADE", "DECADE") still
+// classify as hashes because their uppercase A-F characters satisfy the
+// discriminator. URL path segments are almost never all-uppercase English
+// words, so this edge case is accepted in exchange for catching real
+// uppercase short-SHAs like "ABCDEF".
 func isShortHexHash(segment string) bool {
 	if !shortHexRegex.MatchString(segment) {
 		return false
@@ -255,7 +267,51 @@ func NormalizePathsWithNames(paths []string) map[string]string {
 			break
 		}
 	}
+	unifyMixedKindsAtSamePosition(infos)
 	return renderNormalizedPaths(paths, infos)
+}
+
+// unifyMixedKindsAtSamePosition collapses regex-classified kinds onto
+// kindSlug when an observation-promoted slug shares the same shape position
+// in another path. Without this pass, /articles/my-first-post,
+// /articles/507f1f77bcf86cd799439011, and /articles/another-post would
+// produce two distinct OpenAPI path templates — /articles/{articleSlug}
+// for the slug observations and /articles/{articleId} for the ObjectID —
+// even though they describe the same parameterized endpoint. Whenever a
+// position has been promoted to kindSlug for any path, any other path
+// whose segment at the same position is a different non-literal kind
+// (UUID, ObjectID, numeric, short hex, base64) is unified onto kindSlug
+// so a single template emerges. Literal segments are not touched.
+func unifyMixedKindsAtSamePosition(infos []pathInfo) {
+	type loc struct{ pathIdx, segIdx int }
+	groups := make(map[posKey][]loc)
+	hasSlug := make(map[posKey]bool)
+	hasOther := make(map[posKey]bool)
+	for pIdx := range infos {
+		info := &infos[pIdx]
+		for sIdx, k := range info.kinds {
+			if k == kindLiteral {
+				continue
+			}
+			key := positionKey(*info, sIdx)
+			groups[key] = append(groups[key], loc{pIdx, sIdx})
+			if k == kindSlug {
+				hasSlug[key] = true
+			} else {
+				hasOther[key] = true
+			}
+		}
+	}
+	for key, locs := range groups {
+		if !hasSlug[key] || !hasOther[key] {
+			continue
+		}
+		for _, l := range locs {
+			if infos[l.pathIdx].kinds[l.segIdx] != kindSlug {
+				infos[l.pathIdx].kinds[l.segIdx] = kindSlug
+			}
+		}
+	}
 }
 
 // classifyPaths splits each input path and classifies each segment by its
@@ -457,20 +513,43 @@ func deduplicateParamNames(segments []string) {
 	}
 }
 
-// sanitizeParamName removes characters that are not safe for OpenAPI parameter names.
-// Allows alphanumeric characters, underscores, hyphens, and dots.
+// sanitizeParamName produces an OpenAPI-friendly parameter name.
+//
+// Allowed characters: alphanumeric and underscore. Hyphens and dots are
+// converted to camelCase boundaries: the next ASCII lowercase letter after
+// a `-` or `.` is uppercased, and the separator is dropped. Other
+// characters are dropped silently. An empty result becomes "id".
+//
+// This makes parameter names compatible with the wide majority of OpenAPI
+// client generators, many of which treat hyphens/dots as invalid identifier
+// characters or as word separators that produce unusable accessors. For
+// example, the context segment `my-service` yields the suffix `myService`
+// rather than `my-service`.
 func sanitizeParamName(name string) string {
 	var b strings.Builder
+	upperNext := false
 	for _, r := range name {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+		switch {
+		case r == '-' || r == '.':
+			upperNext = true
+		case r >= 'a' && r <= 'z':
+			if upperNext {
+				b.WriteRune(r - ('a' - 'A'))
+			} else {
+				b.WriteRune(r)
+			}
+			upperNext = false
+		case r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_':
 			b.WriteRune(r)
+			upperNext = false
+		default:
+			// Drop disallowed characters silently.
 		}
 	}
-	result := b.String()
-	if result == "" {
+	if b.Len() == 0 {
 		return "id"
 	}
-	return result
+	return b.String()
 }
 
 // paramNameFromKind derives a parameter name from a path segment and the kind
