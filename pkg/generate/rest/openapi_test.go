@@ -323,36 +323,6 @@ func TestCapitalizeFirst(t *testing.T) {
 	}
 }
 
-func TestInferQueryParamType(t *testing.T) {
-	tests := []struct {
-		name     string
-		value    string
-		expected string
-	}{
-		{"integer", "42", "integer"},
-		{"negative integer", "-1", "integer"},
-		{"zero", "0", "integer"},
-		{"float", "3.14", "number"},
-		{"negative float", "-0.5", "number"},
-		{"scientific notation", "1e10", "number"},
-		{"boolean true", "true", "boolean"},
-		{"boolean false", "false", "boolean"},
-		{"string", "hello", "string"},
-		{"empty string", "", "string"},
-		{"mixed alphanumeric", "abc123", "string"},
-		{"boolean-like but uppercase", "True", "string"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := inferQueryParamType(tt.value)
-			if result != tt.expected {
-				t.Errorf("inferQueryParamType(%q) = %q, want %q", tt.value, result, tt.expected)
-			}
-		})
-	}
-}
-
 func TestOpenAPIGenerator_SchemaMerging(t *testing.T) {
 	endpoints := []classify.ClassifiedRequest{
 		{

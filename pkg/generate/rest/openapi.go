@@ -47,8 +47,6 @@ func capitalizeFirst(s string) string {
 //   - "number"  if every value parses as float (and at least one is non-int)
 //   - "boolean" if every value is "true" or "false"
 //   - "string"  otherwise (mixed or string)
-//
-// Mirrors the precedence of inferQueryParamType for consistency.
 func inferQueryParamItemsType(values []string) string {
 	if len(values) == 0 {
 		return "string"
@@ -75,20 +73,6 @@ func inferQueryParamItemsType(values []string) string {
 	default:
 		return "string"
 	}
-}
-
-// inferQueryParamType infers the OpenAPI type from a query parameter value.
-func inferQueryParamType(value string) string {
-	if _, err := strconv.Atoi(value); err == nil {
-		return "integer"
-	}
-	if _, err := strconv.ParseFloat(value, 64); err == nil {
-		return "number"
-	}
-	if value == "true" || value == "false" {
-		return "boolean"
-	}
-	return "string"
 }
 
 // OpenAPIGenerator generates OpenAPI 3.0 specifications.
