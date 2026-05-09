@@ -302,6 +302,11 @@ func unifyMixedKindsAtSamePosition(infos []pathInfo) {
 			}
 		}
 	}
+	// Map iteration order is non-deterministic in Go, but the inner
+	// assignment (kinds[i] = kindSlug) is idempotent and reaches a single
+	// fixed final state. The observable output of NormalizePathsWithNames is
+	// therefore deterministic regardless of which order keys are visited.
+	// Adding any order-sensitive operation here would break that invariant.
 	for key, locs := range groups {
 		if !hasSlug[key] || !hasOther[key] {
 			continue
@@ -362,14 +367,20 @@ func findVaryingPositions(infos []pathInfo) map[posKey]struct{} {
 // least one segment was promoted, so callers can break out of fixed-point
 // iteration loops without performing redundant work.
 //
-// We iterate by index and mutate kinds in place. The kinds slice is shared
-// with the caller's pathInfo by virtue of Go's slice header — there is no
-// struct copy/write-back step.
+// Promotions are computed against an immutable snapshot of `kinds`, then
+// applied in a second pass. Mutating `kinds` while iterating would change
+// the shape used to compute positionKey for subsequent positions in the
+// same path — producing keys that no longer match `varying` and silently
+// suppressing promotion of those positions in this round. The atomic
+// two-pass strategy ensures every position eligible at the start of the
+// round is promoted at the end of the round, giving the outer fixed-point
+// loop a clean view of the next round's candidate set.
 func promoteVaryingPositions(infos []pathInfo, varying map[posKey]struct{}) bool {
 	if len(varying) == 0 {
 		return false
 	}
-	promoted := false
+	type loc struct{ pathIdx, segIdx int }
+	var toPromote []loc
 	for idx := range infos {
 		info := &infos[idx]
 		for i, seg := range info.segments {
@@ -380,12 +391,17 @@ func promoteVaryingPositions(infos []pathInfo, varying map[posKey]struct{}) bool
 				continue
 			}
 			if info.kinds[i] != kindSlug {
-				info.kinds[i] = kindSlug
-				promoted = true
+				toPromote = append(toPromote, loc{idx, i})
 			}
 		}
 	}
-	return promoted
+	if len(toPromote) == 0 {
+		return false
+	}
+	for _, l := range toPromote {
+		infos[l.pathIdx].kinds[l.segIdx] = kindSlug
+	}
+	return true
 }
 
 // renderNormalizedPaths produces the final map of input paths to normalized
@@ -525,6 +541,14 @@ func deduplicateParamNames(segments []string) {
 // characters or as word separators that produce unusable accessors. For
 // example, the context segment `my-service` yields the suffix `myService`
 // rather than `my-service`.
+//
+// Precondition: callers in this package only invoke sanitizeParamName with
+// the output of singularize(prevSegment) appended to a kind-suffix (`Id`,
+// `Token`, `Slug`). prevSegment is a URL path literal, so it cannot start
+// with `-` or `.`. If a future caller passes input beginning with a
+// separator, the first surviving lowercase letter will be uppercased and
+// emit a PascalCase-first name (e.g., `-user` → `User`). The function does
+// not validate the precondition; uphold it at the call site.
 func sanitizeParamName(name string) string {
 	var b strings.Builder
 	upperNext := false

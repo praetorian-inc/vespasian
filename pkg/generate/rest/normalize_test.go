@@ -546,6 +546,53 @@ func TestNormalizePathsWithNames_ResourceTypeBehindPathPrefixNeverPromoted(t *te
 	}
 }
 
+func TestNormalizePathsWithNames_VersionPrefixBoundary(t *testing.T) {
+	// versionPrefixRegex is `^v[1-9][0-9]*$` (round-3 tightening). v0, v01,
+	// v001 are NOT scaffold prefixes — `/v0/users/<varying>` therefore has
+	// non-scaffold literal context (`v0`) and the observation pass DOES
+	// promote the trailing varying segment, while v1/v2 (real prefixes)
+	// still suppress promotion of the immediately-following resource segment.
+	t.Run("v0 is not a scaffold so users segment is observable", func(t *testing.T) {
+		paths := []string{"/v0/users/alice", "/v0/users/bob", "/v0/users/carol"}
+		got := NormalizePathsWithNames(paths)
+		for _, p := range paths {
+			if got[p] != "/v0/users/{userSlug}" {
+				t.Errorf("path %q normalized to %q, want /v0/users/{userSlug}", p, got[p])
+			}
+		}
+	})
+	t.Run("v01 with leading zero is not a scaffold", func(t *testing.T) {
+		paths := []string{"/v01/users/alice", "/v01/users/bob", "/v01/users/carol"}
+		got := NormalizePathsWithNames(paths)
+		for _, p := range paths {
+			if got[p] != "/v01/users/{userSlug}" {
+				t.Errorf("path %q normalized to %q, want /v01/users/{userSlug}", p, got[p])
+			}
+		}
+	})
+	t.Run("v001 with multiple leading zeros is not a scaffold", func(t *testing.T) {
+		paths := []string{"/v001/items/foo", "/v001/items/bar", "/v001/items/baz"}
+		got := NormalizePathsWithNames(paths)
+		for _, p := range paths {
+			if got[p] != "/v001/items/{itemSlug}" {
+				t.Errorf("path %q normalized to %q, want /v001/items/{itemSlug}", p, got[p])
+			}
+		}
+	})
+	t.Run("v1 IS a scaffold so users stays literal", func(t *testing.T) {
+		// Sanity check that v1 still behaves as a scaffold (covered also by
+		// ResourceTypeBehindPathPrefixNeverPromoted, but worth a direct
+		// contrast against the v0 case to make the boundary explicit).
+		paths := []string{"/v1/users", "/v1/posts", "/v1/articles"}
+		got := NormalizePathsWithNames(paths)
+		for _, p := range paths {
+			if got[p] != p {
+				t.Errorf("v1 scaffold path %q was promoted: got %q", p, got[p])
+			}
+		}
+	})
+}
+
 func TestNormalizePathsWithNames_PromotesAfterPathPrefix(t *testing.T) {
 	// The segment AFTER the resource type — even when a scaffold prefix is
 	// present — should still be promoted when it varies. /api/users/<id> is
@@ -609,6 +656,49 @@ func TestNormalizePathsWithNames_SinglePathNoSlug(t *testing.T) {
 	got := NormalizePathsWithNames(paths)
 	if got["/articles/my-only-post"] != "/articles/my-only-post" {
 		t.Errorf("single observation parameterized: %v", got)
+	}
+}
+
+func TestNormalizePathsWithNames_MixedKindsUnifyAcrossAllRegexKinds(t *testing.T) {
+	// unifyMixedKindsAtSamePosition uses the same `hasOther` map for every
+	// non-slug kind, so a position holding slug + UUID + ObjectID + ShortHex
+	// + numeric must fully collapse onto kindSlug. This guards against a
+	// future refactor that special-cases one kind (e.g., only collapsing
+	// kindObjectID) and silently leaves other regex kinds emitting their
+	// own templates alongside the slug.
+	paths := []string{
+		"/articles/my-first-post",                        // observation-promoted slug
+		"/articles/my-second-post",                       // observation-promoted slug (anchors variation)
+		"/articles/550e8400-e29b-41d4-a716-446655440000", // UUID
+		"/articles/507f1f77bcf86cd799439011",             // ObjectID (24 hex)
+		"/articles/AbCdEf12",                             // short hex (uppercase + digit)
+		"/articles/42",                                   // numeric
+	}
+	got := NormalizePathsWithNames(paths)
+	const want = "/articles/{articleSlug}"
+	for _, p := range paths {
+		if got[p] != want {
+			t.Errorf("path %q normalized to %q, want %q", p, got[p], want)
+		}
+	}
+}
+
+func TestNormalizePathsWithNames_SlugOnlyNoOpUnification(t *testing.T) {
+	// When every observation at a shape position is already kindSlug (no
+	// regex-classified peer), unifyMixedKindsAtSamePosition's `!hasOther`
+	// branch fires and the function does nothing. Output is identical to
+	// the post-promotion state. This locks in that the unification pass is
+	// inert when there is nothing to unify.
+	paths := []string{
+		"/items/foo-1",
+		"/items/bar-2",
+		"/items/baz-3",
+	}
+	got := NormalizePathsWithNames(paths)
+	for _, p := range paths {
+		if got[p] != "/items/{itemSlug}" {
+			t.Errorf("path %q normalized to %q, want /items/{itemSlug}", p, got[p])
+		}
 	}
 }
 
@@ -729,6 +819,9 @@ func TestNormalizePathsWithNames_EmptyAndDuplicateInputs(t *testing.T) {
 	if got["/users/42"] != "/users/{userId}" {
 		t.Errorf("got %q for /users/42", got["/users/42"])
 	}
+	if got["/users/43"] != "/users/{userId}" {
+		t.Errorf("got %q for /users/43", got["/users/43"])
+	}
 }
 
 func TestParamNameFromKind_NoContextFallbacks(t *testing.T) {
@@ -808,12 +901,16 @@ func TestSanitizeParamName_HyphenAndDotConversion(t *testing.T) {
 	}
 }
 
-func TestNormalizePathsWithNames_DepthFiveMultiVarying(t *testing.T) {
-	// Depth-5 paths with overlap at multiple positions exercise the
-	// fixed-point iteration of promoteVaryingPositions across more than
-	// two adjacent literal positions. A regression that artificially caps
-	// iteration at one extra round will not promote the deepest position
-	// and therefore fails this test.
+func TestNormalizePathsWithNames_DeepPathsAcrossPositions(t *testing.T) {
+	// Depth-5 smoke test: owner (position 2), project (position 3), and the
+	// trailing numeric segment (position 5) all parameterize. Owner and
+	// project are slug-shaped and vary across observations with enough
+	// overlap that strict bucketing in a single round identifies both as
+	// varying; the trailing numeric is regex-classified as kindNumeric and
+	// renders with the `Id` suffix. This test exercises multi-position
+	// promotion plus the slug+numeric rendering through deep paths — it
+	// does NOT prove the fixed-point property (see
+	// TestNormalizePathsWithNames_FixedPointIterationRequired for that).
 	paths := []string{
 		"/repos/alice/proj1/issues/1",
 		"/repos/alice/proj1/issues/2",
@@ -822,13 +919,44 @@ func TestNormalizePathsWithNames_DepthFiveMultiVarying(t *testing.T) {
 		"/repos/bob/proj2/issues/2",
 	}
 	got := NormalizePathsWithNames(paths)
-	// Owner (position 2) and project (position 3) are slug-shaped and
-	// vary across observations — they are promoted to kindSlug by the
-	// fixed-point iteration. The trailing numeric segments at position 5
-	// are regex-classified as kindNumeric on the first pass and rendered
-	// with the conventional `Id` suffix; they don't go through the
-	// observation pass at all. All three positions are parameterized.
 	const want = "/repos/{repoSlug}/{repoSlug2}/issues/{issueId}"
+	for _, p := range paths {
+		if got[p] != want {
+			t.Errorf("path %q normalized to %q, want %q", p, got[p], want)
+		}
+	}
+}
+
+func TestNormalizePathsWithNames_FixedPointIterationRequired(t *testing.T) {
+	// This fixture genuinely requires more than one promotion round.
+	//
+	// In round 1, only the alice/proj-a + bob/proj-a pair shares a suffix
+	// (proj-a) so position 2 promotes only at those two paths; the alice
+	// and bob "loners" (alice/proj-b and bob/proj-c) sit in singleton
+	// suffix-buckets at position 2 and are NOT promoted in round 1.
+	// Position 3 shares the prefix /repos/alice between alice/proj-a and
+	// alice/proj-b (and /repos/bob between bob/proj-a and bob/proj-c) so
+	// position 3 promotes for all four paths in round 1.
+	//
+	// After round 1, position 2 of alice/proj-b and bob/proj-c is still
+	// kindLiteral but their position-3 segments are now kindSlug. The
+	// suffix shape collapses to "/{}" — which matches the suffix shape of
+	// alice/proj-a and bob/proj-a (also "/{}" after round-1 promotion).
+	// In round 2, alice/proj-b's position 2 bucket joins bob/proj-c's
+	// position 2 bucket via the shared "/{}" suffix shape. The bucket
+	// gains both alice and bob → varying → promote.
+	//
+	// A capped-iteration implementation (single round) would leave
+	// alice/proj-b at /repos/alice/{repoSlug} and bob/proj-c at
+	// /repos/bob/{repoSlug} — three distinct paths instead of one.
+	paths := []string{
+		"/repos/alice/proj-a",
+		"/repos/alice/proj-b",
+		"/repos/bob/proj-a",
+		"/repos/bob/proj-c",
+	}
+	got := NormalizePathsWithNames(paths)
+	const want = "/repos/{repoSlug}/{repoSlug2}"
 	for _, p := range paths {
 		if got[p] != want {
 			t.Errorf("path %q normalized to %q, want %q", p, got[p], want)
