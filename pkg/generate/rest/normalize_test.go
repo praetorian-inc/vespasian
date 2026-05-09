@@ -476,6 +476,9 @@ func TestNormalizePathsWithNames_SlugObservation(t *testing.T) {
 		"/articles/my-second-post":   "/articles/{articleSlug}",
 		"/articles/yet-another-post": "/articles/{articleSlug}",
 	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d entries, want %d: %#v", len(got), len(want), got)
+	}
 	for k, v := range want {
 		if got[k] != v {
 			t.Errorf("path %q normalized to %q, want %q", k, got[k], v)
@@ -718,6 +721,9 @@ func TestNormalizePathsWithNames_RegressionUUIDAndNumeric(t *testing.T) {
 		"/posts/1": "/posts/{postId}",
 		"/posts/2": "/posts/{postId}",
 	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d entries, want %d: %#v", len(got), len(want), got)
+	}
 	for k, v := range want {
 		if got[k] != v {
 			t.Errorf("path %q normalized to %q, want %q", k, got[k], v)
@@ -743,6 +749,9 @@ func TestNormalizePathsWithNames_MixedKinds(t *testing.T) {
 		"/articles/507f1f77bcf86cd799439011": "/articles/{articleSlug}",
 		"/articles/another-post":             "/articles/{articleSlug}",
 	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d entries, want %d: %#v", len(got), len(want), got)
+	}
 	for k, v := range want {
 		if got[k] != v {
 			t.Errorf("path %q normalized to %q, want %q", k, got[k], v)
@@ -763,6 +772,9 @@ func TestNormalizePathsWithNames_MixedKindsWithoutSlugObservation(t *testing.T) 
 	want := map[string]string{
 		"/articles/my-only-post":             "/articles/my-only-post",
 		"/articles/507f1f77bcf86cd799439011": "/articles/{articleId}",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d entries, want %d: %#v", len(got), len(want), got)
 	}
 	for k, v := range want {
 		if got[k] != v {
@@ -964,6 +976,34 @@ func TestNormalizePathsWithNames_FixedPointIterationRequired(t *testing.T) {
 	}
 }
 
+func TestNormalizePathsWithNames_IntraRoundAdjacentPositionPromotion(t *testing.T) {
+	// Pin down the exact failure mode of the pre-fix in-place algorithm:
+	// two positions in the SAME path promoted in the SAME round via
+	// different bucket keys. With four overlapping observations, round 1
+	// finds varying buckets at BOTH position 2 (prefix=/x, suffix=/y/{b|c})
+	// and position 4 (prefix=/x/{a|d}/y, suffix=) of every path. The
+	// atomic two-pass strategy in promoteVaryingPositions promotes both
+	// in the same call. An in-place implementation would mutate position 2
+	// first, change the shape used to compute position 4's posKey, and
+	// silently skip position 4's promotion in this round.
+	paths := []string{
+		"/x/a/y/b",
+		"/x/a/y/c", // anchors position 4's /x/a/y prefix bucket
+		"/x/d/y/b", // anchors position 2's /y/b suffix bucket
+		"/x/d/y/c", // anchors position 2's /y/c suffix bucket and position 4's /x/d/y prefix bucket
+	}
+	got := NormalizePathsWithNames(paths)
+	const want = "/x/{xSlug}/y/{ySlug}"
+	if len(got) != len(paths) {
+		t.Fatalf("got %d entries, want %d: %#v", len(got), len(paths), got)
+	}
+	for _, p := range paths {
+		if got[p] != want {
+			t.Errorf("path %q normalized to %q, want %q", p, got[p], want)
+		}
+	}
+}
+
 func TestIsBase64Token(t *testing.T) {
 	cases := []struct {
 		segment string
@@ -978,6 +1018,7 @@ func TestIsBase64Token(t *testing.T) {
 		{"Aa1Bb2Cc3Dd4Ee5Ff6", true},                 // mixed case + digits, length >= 16
 		{"AaaaaaaaaaaaaaaaaaaaB", false},             // missing digit -> reject
 		{"012345678901234567890123", false},          // pure digits handled by numeric kind, base64 alone false (no upper/lower)
+		{"ABCDEF0123456789XY", false},                // all-uppercase + digits, no lowercase -> false (documented trade-off; rare in URL paths, accepted asymmetry vs isShortHexHash)
 	}
 	for _, c := range cases {
 		if got := isBase64Token(c.segment); got != c.want {

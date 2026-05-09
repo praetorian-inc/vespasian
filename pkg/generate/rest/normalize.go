@@ -62,6 +62,15 @@ var (
 	// leading digit to be non-zero — `v1`, `v2`, `v123` qualify but
 	// `v0`, `v01`, `v001` do not (none of those are conventional REST
 	// version markers).
+	//
+	// Design note on `v0`: a small number of APIs do publish under
+	// `/v0/...` for alpha or pre-release surfaces. We deliberately keep
+	// `v0` OUT of the scaffold set so that paths like `/v0/users/<varying>`
+	// participate in observation-based promotion rather than being treated
+	// as protected resource scaffold. If a future maintainer is tempted to
+	// relax this regex to `^v[0-9]+$`, note that doing so will suppress
+	// promotion of resource-type segments under `/v0/...` and require new
+	// regression tests to lock in the desired behavior.
 	versionPrefixRegex = regexp.MustCompile(`^v[1-9][0-9]*$`)
 )
 
@@ -157,6 +166,16 @@ func classifyParamSegment(segment string) paramKind {
 // base64-specific punctuation `+`/`/`/`=`). This guard prevents long
 // lower-case slugs (e.g., `the-best-blog-post-ever`) from classifying as
 // base64.
+//
+// Trade-off: an all-uppercase base64-shaped token without `+`/`/`/`=`
+// punctuation (e.g., `ABCDEF0123456789XY`) returns false and falls
+// through to kindLiteral. This is the symmetric cost of requiring mixed
+// case + digit to reject all-lowercase slugs; it is asymmetric with
+// isShortHexHash, which DOES accept all-uppercase hex strings (because
+// short-SHA refs are commonly uppercased while base64 tokens are not).
+// All-uppercase base64 in URL path positions is rare; if encountered, the
+// observation-based pass in NormalizePathsWithNames will still detect it
+// as a slug given enough varying observations.
 func isBase64Token(segment string) bool {
 	if !base64Regex.MatchString(segment) {
 		return false
@@ -201,7 +220,7 @@ func NormalizePath(path string) string {
 //   - /posts/5/comments/7                          -> /posts/{postId}/comments/{commentId}
 //   - /articles/507f1f77bcf86cd799439011           -> /articles/{articleId}   (MongoDB ObjectID)
 //   - /commits/a1b2c3d4                            -> /commits/{commitId}     (short hex)
-//   - /tokens/ZXhhbXBsZS1iYXNlNjR1cmwtdG9rZW4      -> /tokens/{tokenToken}    (base64)
+//   - /sessions/AbCdEfGhIj1234567890XY             -> /sessions/{sessionToken} (base64)
 //   - /users/me                                    -> /users/me               (literal preserved)
 //
 // For slug-style identifiers that vary across observed paths, use
@@ -258,11 +277,28 @@ func NormalizePathsWithNames(paths []string) map[string]string {
 	}
 
 	infos := classifyPaths(paths)
-	for {
+	// Bound the fixed-point iteration to a small constant. Each round can
+	// only convert kindLiteral to kindSlug (monotonic), so termination is
+	// guaranteed by the size of the literal set; under realistic API
+	// captures fewer than five rounds are required. The cap protects
+	// against pathological inputs (deeply-nested adversarial paths) where
+	// the loop could otherwise reach O(S) iterations and produce an O(N*S^3)
+	// CPU-DoS surface at the generate step. After the cap, any remaining
+	// unpromoted segments stay literal — best-effort detection — and
+	// unifyMixedKindsAtSamePosition still runs on whatever kinds are
+	// present. See SEC-BE-001 in the LAB-2107 review history.
+	const maxPromotionRounds = 8
+	for round := 0; round < maxPromotionRounds; round++ {
 		varying := findVaryingPositions(infos)
 		if len(varying) == 0 {
 			break
 		}
+		// Defensive guard: if findVaryingPositions returned a non-empty
+		// set, promoteVaryingPositions is expected to convert at least one
+		// segment (the find phase only surfaces literal candidates).
+		// promoteVaryingPositions returning false here would indicate an
+		// internal contract break; we exit the loop safely rather than
+		// spin.
 		if !promoteVaryingPositions(infos, varying) {
 			break
 		}
@@ -367,6 +403,11 @@ func findVaryingPositions(infos []pathInfo) map[posKey]struct{} {
 // least one segment was promoted, so callers can break out of fixed-point
 // iteration loops without performing redundant work.
 //
+// Caller contract: `varying` is non-empty. The sole caller in this package
+// (NormalizePathsWithNames) only reaches this function with a non-empty
+// varying set; we therefore do not include a defensive `len(varying)==0`
+// short-circuit.
+//
 // Promotions are computed against an immutable snapshot of `kinds`, then
 // applied in a second pass. Mutating `kinds` while iterating would change
 // the shape used to compute positionKey for subsequent positions in the
@@ -376,11 +417,11 @@ func findVaryingPositions(infos []pathInfo) map[posKey]struct{} {
 // round is promoted at the end of the round, giving the outer fixed-point
 // loop a clean view of the next round's candidate set.
 func promoteVaryingPositions(infos []pathInfo, varying map[posKey]struct{}) bool {
-	if len(varying) == 0 {
-		return false
-	}
 	type loc struct{ pathIdx, segIdx int }
-	var toPromote []loc
+	// len(infos) is the number of paths and is a reasonable upper-bound
+	// hint for typical API captures (a single promotion per path is
+	// common); the slice grows beyond if more positions promote per path.
+	toPromote := make([]loc, 0, len(infos))
 	for idx := range infos {
 		info := &infos[idx]
 		for i, seg := range info.segments {
