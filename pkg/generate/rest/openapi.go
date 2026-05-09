@@ -163,8 +163,11 @@ func computeSourceTag(group []classify.ClassifiedRequest) string {
 		}
 		if tag == "" {
 			tag = friendly
+			continue
 		}
-		// If mixed static types, keep first (deterministic).
+		if tag != friendly {
+			return "dynamic"
+		}
 	}
 	return tag
 }

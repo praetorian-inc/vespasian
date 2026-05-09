@@ -142,6 +142,52 @@ func TestToRequests_PageURLPropagated(t *testing.T) {
 	}
 }
 
+// F6: relative endpoints should resolve against PageURL when available.
+func TestToRequests_RelativeEndpoint_ResolvedAgainstPageURL(t *testing.T) {
+	// Bundle at /static/js/app.js, PageURL at /dashboard.
+	// endpoint "api/users" is relative to the page, not the bundle.
+	endpoints := []ExtractedEndpoint{
+		{
+			Method:       "GET",
+			URL:          "api/users",
+			PageURL:      "https://h/dashboard",
+			SourceTag:    SourceJS,
+			OriginBundle: "https://h/static/js/app.js",
+		},
+	}
+	reqs := toRequests(endpoints, "https://h/static/js/app.js")
+	if len(reqs) != 1 {
+		t.Fatalf("expected 1 request, got %d", len(reqs))
+	}
+	// Should resolve relative to page URL: https://h/api/users
+	want := "https://h/api/users"
+	if reqs[0].URL != want {
+		t.Errorf("expected URL=%s (resolved against PageURL), got %s", want, reqs[0].URL)
+	}
+}
+
+// F6b: when PageURL is empty, fallback to captureURL (existing behavior preserved).
+func TestToRequests_RelativeEndpoint_FallsBackToCaptureURL(t *testing.T) {
+	endpoints := []ExtractedEndpoint{
+		{
+			Method:       "GET",
+			URL:          "api/users",
+			PageURL:      "", // empty
+			SourceTag:    SourceJS,
+			OriginBundle: "https://h/app.js",
+		},
+	}
+	reqs := toRequests(endpoints, "https://h/app.js")
+	if len(reqs) != 1 {
+		t.Fatalf("expected 1 request, got %d", len(reqs))
+	}
+	// Resolves against bundle URL: https://h/api/users
+	want := "https://h/api/users"
+	if reqs[0].URL != want {
+		t.Errorf("expected URL=%s (fallback to captureURL), got %s", want, reqs[0].URL)
+	}
+}
+
 func TestToRequests_InferSchemaCompatible(t *testing.T) {
 	endpoints := []ExtractedEndpoint{
 		{Method: "POST", URL: "/api/x", BodyFields: []string{"name", "email"}, SourceTag: SourceJS, OriginBundle: "https://h/app.js"},

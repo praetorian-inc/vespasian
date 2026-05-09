@@ -15,6 +15,7 @@
 package jsstatic
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -262,6 +263,85 @@ func TestExtractFromBundle_TemplateLiteralMember(t *testing.T) {
 	ep := findEndpoint(endpoints, "/u/{id}")
 	if ep == nil {
 		t.Fatalf("expected endpoint /u/{id}, got: %v", endpoints)
+	}
+}
+
+// F8: fetch with template-literal URL + body must produce body fields.
+func TestExtractFromBundle_FetchTemplateLiteralWithBody(t *testing.T) {
+	src := []byte("fetch(`/users/${id}`, {method:\"POST\", body: JSON.stringify({name, email})})")
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js", Options{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	ep := findEndpoint(endpoints, "/users/{id}")
+	if ep == nil {
+		t.Fatalf("expected endpoint /users/{id}, got: %v", endpoints)
+	}
+	if ep.Method != "POST" {
+		t.Errorf("Method = %q, want POST", ep.Method)
+	}
+	if len(ep.BodyFields) != 2 || ep.BodyFields[0] != "email" || ep.BodyFields[1] != "name" {
+		t.Errorf("BodyFields = %v, want [email name]", ep.BodyFields)
+	}
+}
+
+// F7: axios.get with template-literal URL must yield endpoint.
+func TestExtractFromBundle_AxiosTemplateLiteral(t *testing.T) {
+	src := []byte("axios.get(`/users/${id}`)")
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js", Options{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	ep := findEndpoint(endpoints, "/users/{id}")
+	if ep == nil {
+		t.Fatalf("expected endpoint /users/{id}, got: %v", endpoints)
+	}
+	if ep.Method != "GET" {
+		t.Errorf("Method = %q, want GET", ep.Method)
+	}
+}
+
+// F4: collectObjectKeys must strip surrounding quotes from string-literal keys.
+func TestCollectObjectKeys_StringLiteralKeys(t *testing.T) {
+	src := []byte(`fetch("/x", {method:"POST", body: JSON.stringify({"first-name": 1, "last-name": 2})})`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js", Options{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	ep := findEndpoint(endpoints, "/x")
+	if ep == nil {
+		t.Fatalf("expected endpoint /x, got: %v", endpoints)
+	}
+	// Keys should be unquoted: first-name, last-name (sorted).
+	if len(ep.BodyFields) != 2 {
+		t.Fatalf("expected 2 BodyFields, got %v", ep.BodyFields)
+	}
+	if ep.BodyFields[0] != "first-name" || ep.BodyFields[1] != "last-name" {
+		t.Errorf("BodyFields = %v, want [first-name last-name]", ep.BodyFields)
+	}
+}
+
+// F2: collapseTemplateLiteral must handle nested braces.
+func TestCollapseTemplateLiteral_NestedBraces(t *testing.T) {
+	// fetch(`/api/${getId({user:1})}`) — nested object inside substitution.
+	src := []byte("fetch(`/api/${getId({user:1})}`)")
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js", Options{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Should yield /api/{param} (or /api/EXPR normalised), NOT /api/EXPR)}
+	ep := findEndpoint(endpoints, "/api/{param}")
+	if ep == nil {
+		// Also accept /api/{getId} if identifier is recovered.
+		ep = findEndpoint(endpoints, "/api/{getId}")
+		if ep == nil {
+			// Print what we got to help diagnose.
+			t.Fatalf("expected endpoint /api/{param} or similar, got: %v", endpoints)
+		}
+	}
+	// Ensure no artifact like ")}".
+	if ep != nil && (strings.Contains(ep.URL, ")") || strings.Contains(ep.URL, "}})")) {
+		t.Errorf("endpoint URL contains brace artifact: %q", ep.URL)
 	}
 }
 

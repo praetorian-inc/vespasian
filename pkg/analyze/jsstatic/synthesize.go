@@ -39,10 +39,10 @@ func toRequests(endpoints []ExtractedEndpoint, captureURL string) []crawl.Observ
 		return nil
 	}
 
-	var base *url.URL
+	var bundleBase *url.URL
 	if captureURL != "" {
 		if parsed, err := url.Parse(captureURL); err == nil {
-			base = parsed
+			bundleBase = parsed
 		}
 	}
 
@@ -55,7 +55,14 @@ func toRequests(endpoints []ExtractedEndpoint, captureURL string) []crawl.Observ
 		}
 
 		// Resolve URL: absolute URLs are preserved; relative URLs are resolved
-		// against the bundle's origin URL.
+		// against PageURL first (document-relative paths), falling back to the
+		// bundle URL when PageURL is empty or unparseable.
+		base := bundleBase
+		if ep.PageURL != "" {
+			if pageBase, err := url.Parse(ep.PageURL); err == nil && pageBase.Host != "" {
+				base = pageBase
+			}
+		}
 		req.URL = resolveURL(ep.URL, base)
 
 		// Synthesize JSON body when BodyFields are present.

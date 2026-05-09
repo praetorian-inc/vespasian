@@ -152,8 +152,8 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	var result perBundleResult
 	body := req.Response.Body
 
-	// Run sourcemap recovery.
-	smSources, smStats := recoverSourcemap(body, req.URL, opts)
+	// Run sourcemap recovery (ctx propagated for remote fetch cancellation).
+	smSources, smStats := recoverSourcemap(ctx, body, req.URL, opts)
 	result.stats.SourcemapFetchFails += smStats.SourcemapFetchFails
 	result.stats.SourcemapsRecovered += smStats.SourcemapsRecovered
 

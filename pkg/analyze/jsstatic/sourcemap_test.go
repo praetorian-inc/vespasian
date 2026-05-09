@@ -15,6 +15,7 @@
 package jsstatic
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -40,7 +41,7 @@ func makeSourcemapDataURI(sourcesContent []string) string {
 
 func TestSourcemap_NoComment(t *testing.T) {
 	bundle := []byte(`console.log("hello world");`)
-	sources, stats := recoverSourcemap(bundle, "", Options{})
+	sources, stats := recoverSourcemap(context.Background(), bundle, "", Options{})
 	if len(sources) != 0 {
 		t.Errorf("expected 0 sources, got %d: %v", len(sources), sources)
 	}
@@ -54,7 +55,7 @@ func TestSourcemap_DataURIInline(t *testing.T) {
 	uri := makeSourcemapDataURI(content)
 	bundle := []byte("console.log(1);\n//# sourceMappingURL=" + uri + "\n")
 
-	sources, stats := recoverSourcemap(bundle, "", Options{})
+	sources, stats := recoverSourcemap(context.Background(), bundle, "", Options{})
 	if len(sources) != 1 {
 		t.Fatalf("expected 1 source, got %d: %v", len(sources), sources)
 	}
@@ -73,7 +74,7 @@ func TestSourcemap_DataURIInline_NonJSON(t *testing.T) {
 	// Bad base64 / non-JSON payload -> fail counted, no sources.
 	bundle := []byte("console.log(1);\n//# sourceMappingURL=data:application/json;base64,!!!not_base64!!!\n")
 
-	sources, stats := recoverSourcemap(bundle, "", Options{})
+	sources, stats := recoverSourcemap(context.Background(), bundle, "", Options{})
 	if len(sources) != 0 {
 		t.Errorf("expected 0 sources, got %d", len(sources))
 	}
@@ -89,7 +90,7 @@ func TestSourcemap_CommentSyntaxVariants(t *testing.T) {
 	// Both //# and //@ forms should be detected.
 	for _, prefix := range []string{"//# ", "//@ "} {
 		bundle := []byte("console.log(1);\n" + prefix + "sourceMappingURL=" + uri + "\n")
-		sources, stats := recoverSourcemap(bundle, "", Options{})
+		sources, stats := recoverSourcemap(context.Background(), bundle, "", Options{})
 		if len(sources) != 1 {
 			t.Errorf("prefix %q: expected 1 source, got %d", prefix, len(sources))
 		}
@@ -107,7 +108,7 @@ func TestSourcemap_CommentNotInTrailingWindow(t *testing.T) {
 	filler := strings.Repeat("x", 3000)
 	bundle := []byte(comment + filler)
 
-	sources, stats := recoverSourcemap(bundle, "", Options{})
+	sources, stats := recoverSourcemap(context.Background(), bundle, "", Options{})
 	if len(sources) != 0 {
 		t.Errorf("expected 0 sources (comment outside trailing window), got %d", len(sources))
 	}
@@ -148,7 +149,7 @@ func TestSourcemap_RemoteSourcesContent(t *testing.T) {
 		AllowPrivate:    true, // test server is on 127.0.0.1
 		HTTPClient:      srv.Client(),
 	}
-	sources, stats := recoverSourcemap(bundle, bundleURL, opts)
+	sources, stats := recoverSourcemap(context.Background(), bundle, bundleURL, opts)
 	if len(sources) != 1 {
 		t.Fatalf("expected 1 source, got %d: %v", len(sources), sources)
 	}
@@ -175,7 +176,7 @@ func TestSourcemap_RemoteFetch404(t *testing.T) {
 		AllowPrivate:    true,
 		HTTPClient:      srv.Client(),
 	}
-	sources, stats := recoverSourcemap(bundle, bundleURL, opts)
+	sources, stats := recoverSourcemap(context.Background(), bundle, bundleURL, opts)
 	if len(sources) != 0 {
 		t.Errorf("expected 0 sources on 404, got %d", len(sources))
 	}
@@ -201,7 +202,7 @@ func TestSourcemap_RemoteFetchTimeout(t *testing.T) {
 		AllowPrivate:    true,
 		HTTPClient:      client,
 	}
-	sources, stats := recoverSourcemap(bundle, bundleURL, opts)
+	sources, stats := recoverSourcemap(context.Background(), bundle, bundleURL, opts)
 	if len(sources) != 0 {
 		t.Errorf("expected 0 sources on timeout, got %d", len(sources))
 	}
@@ -226,7 +227,7 @@ func TestSourcemap_FetchSourcemapsDisabled(t *testing.T) {
 		FetchSourcemaps: false,
 		HTTPClient:      srv.Client(),
 	}
-	sources, _ := recoverSourcemap(bundle, bundleURL, opts)
+	sources, _ := recoverSourcemap(context.Background(), bundle, bundleURL, opts)
 	if len(sources) != 0 {
 		t.Errorf("expected 0 sources when FetchSourcemaps=false, got %d", len(sources))
 	}
@@ -256,7 +257,7 @@ func TestSourcemap_CrossHostRefused(t *testing.T) {
 		AllowPrivate:    true,
 		HTTPClient:      srv.Client(),
 	}
-	sources, _ := recoverSourcemap(bundle, bundleURL, opts)
+	sources, _ := recoverSourcemap(context.Background(), bundle, bundleURL, opts)
 	if len(sources) != 0 {
 		t.Errorf("expected 0 sources for cross-host sourcemap, got %d", len(sources))
 	}
@@ -283,7 +284,7 @@ func TestSourcemap_AllowPrivateGate(t *testing.T) {
 		AllowPrivate:    false,
 		// HTTPClient is nil so defaultSourcemapClient is used (SSRF protected).
 	}
-	sourcesBlocked, statsBlocked := recoverSourcemap(bundle, bundleURL, optsBlocked)
+	sourcesBlocked, statsBlocked := recoverSourcemap(context.Background(), bundle, bundleURL, optsBlocked)
 	if len(sourcesBlocked) != 0 {
 		t.Errorf("AllowPrivate=false: expected 0 sources, got %d", len(sourcesBlocked))
 	}
@@ -297,12 +298,143 @@ func TestSourcemap_AllowPrivateGate(t *testing.T) {
 		AllowPrivate:    true,
 		HTTPClient:      srv.Client(),
 	}
-	sourcesAllowed, statsAllowed := recoverSourcemap(bundle, bundleURL, optsAllowed)
+	sourcesAllowed, statsAllowed := recoverSourcemap(context.Background(), bundle, bundleURL, optsAllowed)
 	if len(sourcesAllowed) != 1 {
 		t.Fatalf("AllowPrivate=true: expected 1 source, got %d", len(sourcesAllowed))
 	}
 	if statsAllowed.SourcemapsRecovered != 1 {
 		t.Errorf("AllowPrivate=true: expected 1 recovered, got %d", statsAllowed.SourcemapsRecovered)
+	}
+}
+
+// F12a: redirect to a different host must be blocked (CheckRedirect).
+func TestSourcemap_RedirectToDifferentHostBlocked(t *testing.T) {
+	// origin server redirects to a different host.
+	var externalHits atomic.Int32
+	external := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		externalHits.Add(1)
+		content := makeSourcemapJSON([]string{"var external = true;"})
+		_, _ = w.Write(content)
+	}))
+	defer external.Close()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, external.URL+"/evil.js.map", http.StatusFound)
+	}))
+	defer origin.Close()
+
+	bundleURL := origin.URL + "/app.js"
+	mapURL := origin.URL + "/app.js.map"
+	bundle := []byte(fmt.Sprintf("console.log(1);\n//# sourceMappingURL=%s\n", mapURL))
+
+	opts := Options{
+		FetchSourcemaps: true,
+		AllowPrivate:    true,
+		// Use default client (no custom client) so CheckRedirect is set by defaultSourcemapClient.
+	}
+	sources, stats := recoverSourcemap(context.Background(), bundle, bundleURL, opts)
+	// Redirect must be blocked; no sources returned and no hit on external server.
+	if externalHits.Load() != 0 {
+		t.Errorf("redirect followed to different host: %d hits on external server", externalHits.Load())
+	}
+	if len(sources) != 0 {
+		t.Errorf("expected 0 sources when redirect is blocked, got %d", len(sources))
+	}
+	if stats.SourcemapFetchFails != 1 {
+		t.Errorf("expected 1 fetch fail for blocked redirect, got %d", stats.SourcemapFetchFails)
+	}
+}
+
+// F12b: cross-scheme sourcemap (https bundle, http sourcemap) must be rejected by sameHost.
+func TestSourcemap_CrossSchemeRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		content := makeSourcemapJSON([]string{"var x = 1;"})
+		_, _ = w.Write(content)
+	}))
+	defer srv.Close()
+
+	// Bundle URL uses https; sourcemap URL uses http (different scheme).
+	// We use the test server's URL but manually rewrite its scheme to simulate.
+	mapURL := srv.URL + "/app.js.map" // http://...
+	bundleURL := "https://" + srv.Listener.Addr().String() + "/app.js"
+
+	bundle := []byte(fmt.Sprintf("console.log(1);\n//# sourceMappingURL=%s\n", mapURL))
+	opts := Options{
+		FetchSourcemaps: true,
+		AllowPrivate:    true,
+		HTTPClient:      srv.Client(),
+	}
+	sources, _ := recoverSourcemap(context.Background(), bundle, bundleURL, opts)
+	// Different schemes → sameHost returns false → no fetch.
+	if len(sources) != 0 {
+		t.Errorf("expected 0 sources for cross-scheme sourcemap, got %d", len(sources))
+	}
+}
+
+// F12c: default-port handling — example.com:443 vs example.com must be same-host.
+func TestSourcemap_DefaultPortSameHost(t *testing.T) {
+	// sameHost("https://example.com:443/...", "https://example.com/...") must be true.
+	// Use Hostname() comparison via sameHost function.
+	if !sameHost("https://example.com:443/app.js", "https://example.com/app.js.map") {
+		t.Error("expected example.com:443 to match example.com for same-host check")
+	}
+	if !sameHost("https://example.com/app.js", "https://example.com:443/app.js.map") {
+		t.Error("expected example.com to match example.com:443 for same-host check")
+	}
+	// Different schemes must not match.
+	if sameHost("https://example.com/app.js", "http://example.com/app.js.map") {
+		t.Error("expected https vs http to fail same-host check")
+	}
+}
+
+// F3: non-base64 data URI sourcemap payloads must be URL-decoded before JSON parsing.
+func TestParseDataURISourcemap_URLEncodedNonBase64(t *testing.T) {
+	// data:application/json,%7B%22sourcesContent%22:[%22fetch('/x')%22]%7D
+	// URL-decoded: {"sourcesContent":["fetch('/x')"]}
+	uri := `data:application/json,%7B%22sourcesContent%22%3A%5B%22fetch%28%27%2Fx%27%29%22%5D%7D`
+	bundle := []byte("console.log(1);\n//# sourceMappingURL=" + uri + "\n")
+
+	sources, stats := recoverSourcemap(context.Background(), bundle, "", Options{})
+	if len(sources) != 1 {
+		t.Fatalf("expected 1 source, got %d: %v (stats: %+v)", len(sources), sources, stats)
+	}
+	if stats.SourcemapFetchFails != 0 {
+		t.Errorf("expected 0 fetch fails, got %d", stats.SourcemapFetchFails)
+	}
+}
+
+// F1: relative sourceMappingURL must be resolved against bundle URL.
+func TestSourcemap_RelativeMapURL_ResolvesAgainstBundle(t *testing.T) {
+	content := []string{"var relative = true;"}
+	body := makeSourcemapJSON(content)
+
+	var hitPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	// bundleURL is at /static/js/app.js; relative map is app.js.map
+	bundleURL := srv.URL + "/static/js/app.js"
+	bundle := []byte("console.log(1);\n//# sourceMappingURL=app.js.map\n")
+
+	opts := Options{
+		FetchSourcemaps: true,
+		AllowPrivate:    true,
+		HTTPClient:      srv.Client(),
+	}
+	sources, stats := recoverSourcemap(context.Background(), bundle, bundleURL, opts)
+	if len(sources) != 1 {
+		t.Fatalf("expected 1 source, got %d: %v", len(sources), sources)
+	}
+	// The fetch must have hit /static/js/app.js.map (resolved against bundle).
+	if hitPath != "/static/js/app.js.map" {
+		t.Errorf("expected hit /static/js/app.js.map, got %q", hitPath)
+	}
+	if stats.SourcemapsRecovered != 1 {
+		t.Errorf("expected 1 recovered, got %d", stats.SourcemapsRecovered)
 	}
 }
 
@@ -330,7 +462,7 @@ func TestSourcemap_OversizedResponseRejected(t *testing.T) {
 		AllowPrivate:    true,
 		HTTPClient:      srv.Client(),
 	}
-	sources, stats := recoverSourcemap(bundle, bundleURL, opts)
+	sources, stats := recoverSourcemap(context.Background(), bundle, bundleURL, opts)
 	if len(sources) != 0 {
 		t.Errorf("expected 0 sources for oversized response, got %d", len(sources))
 	}

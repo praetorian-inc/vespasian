@@ -97,7 +97,15 @@ func collapseTemplateLiteral(n *jsluice.Node) (string, []string) {
 	}
 	inner := raw[1 : len(raw)-1] // strip backticks
 
-	// Collect tokens from substitution child nodes.
+	tokens := collectTemplateTokens(n)
+	collapsed := replaceTemplateSubs(inner)
+	return collapsed, tokens
+}
+
+// collectTemplateTokens walks template_substitution children and returns
+// recovered identifier names (including the .property of member_expression
+// substitutions).
+func collectTemplateTokens(n *jsluice.Node) []string {
 	var tokens []string
 	for i := 0; i < n.ChildCount(); i++ {
 		child := n.Child(i)
@@ -110,31 +118,49 @@ func collapseTemplateLiteral(n *jsluice.Node) (string, []string) {
 			case "identifier":
 				tokens = append(tokens, sub.Content())
 			case "member_expression":
-				prop := sub.ChildByFieldName("property")
-				if prop != nil {
+				if prop := sub.ChildByFieldName("property"); prop != nil {
 					tokens = append(tokens, prop.Content())
 				}
 			}
 		}
 	}
+	return tokens
+}
 
-	// Replace ${...} patterns with EXPR placeholder.
+// replaceTemplateSubs replaces every ${...} substitution in inner with the
+// jsluice EXPR placeholder. Brace-depth counting handles nested braces like
+// ${fn({a:1})} — a naive first-`}` scan would corrupt the URL.
+func replaceTemplateSubs(inner string) string {
 	var result strings.Builder
-	i := 0
-	for i < len(inner) {
+	for i := 0; i < len(inner); {
 		if i+2 <= len(inner) && inner[i] == '$' && inner[i+1] == '{' {
-			j := i + 2
-			for j < len(inner) && inner[j] != '}' {
-				j++
-			}
+			j := skipBalancedBraces(inner, i+2)
 			result.WriteString(jsluice.ExpressionPlaceholder)
-			i = j + 1
-		} else {
-			result.WriteByte(inner[i])
-			i++
+			i = j
+			continue
+		}
+		result.WriteByte(inner[i])
+		i++
+	}
+	return result.String()
+}
+
+// skipBalancedBraces returns the index just past the matching '}' starting
+// from start (which points at the byte AFTER the opening '${').
+func skipBalancedBraces(s string, start int) int {
+	depth := 1
+	for j := start; j < len(s); j++ {
+		switch s[j] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return j + 1
+			}
 		}
 	}
-	return result.String(), tokens
+	return len(s)
 }
 
 // extractMethodFromOptions extracts the HTTP method string from an options
@@ -241,7 +267,13 @@ func collectObjectKeys(objNode *jsluice.Node) []string {
 		case "pair":
 			keyNode := child.ChildByFieldName("key")
 			if keyNode != nil && keyNode.IsValid() {
-				keys = append(keys, keyNode.Content())
+				k := keyNode.Content()
+				// String-literal keys (type "string") have surrounding quotes;
+				// strip leading/trailing " ' ` so the body field names are bare.
+				if keyNode.Type() == "string" {
+					k = strings.Trim(k, "\"'`")
+				}
+				keys = append(keys, k)
 			}
 		case "shorthand_property_identifier":
 			keys = append(keys, child.Content())
@@ -395,15 +427,21 @@ func extractAxiosConfigCall(fn, args *jsluice.Node, baseURL string) (ExtractedEn
 	}, true
 }
 
-// normalizedURLFromLiteral pulls a string literal out of a node, applies
-// scheme/asset and EXPR-only filtering, and runs EXPR normalisation. Returns
-// ok=false when the node is not a usable URL literal.
+// normalizedURLFromLiteral pulls a URL out of a node (string or template_string),
+// applies scheme/asset and EXPR-only filtering, and runs EXPR normalisation.
+// Returns ok=false when the node is not a usable URL literal.
 func normalizedURLFromLiteral(n *jsluice.Node) (string, bool) {
-	rawURL := extractStringLiteral(n)
+	var rawURL string
+	var tokens []string
+	if n != nil && n.Type() == "template_string" {
+		rawURL, tokens = collapseTemplateLiteral(n)
+	} else {
+		rawURL = extractStringLiteral(n)
+	}
 	if rawURL == "" || filterURL(rawURL) || isExprOnly(rawURL) {
 		return "", false
 	}
-	normalized, err := NormalizeEXPRPath(rawURL, nil)
+	normalized, err := NormalizeEXPRPath(rawURL, tokens)
 	if err != nil || normalized == "" {
 		normalized = rawURL
 	}
@@ -438,60 +476,74 @@ func augmentFetchBodyFields(analyzer *jsluice.Analyzer) map[endpointKey][]string
 	result := make(map[endpointKey][]string)
 
 	analyzer.Query("(call_expression) @call", func(n *jsluice.Node) {
-		fn := n.ChildByFieldName("function")
-		if fn == nil || fn.Content() != "fetch" {
-			return
+		if k, fields, ok := fetchBodyFromCall(n); ok {
+			result[k] = fields
 		}
-		args := n.ChildByFieldName("arguments")
-		if args == nil {
-			return
-		}
-
-		// URL is first arg.
-		urlArg := args.NamedChild(0)
-		if urlArg == nil {
-			return
-		}
-		rawURL := extractStringLiteral(urlArg)
-		if rawURL == "" {
-			return
-		}
-		// NormalizeEXPRPath only errors on malformed URLs; the assert at the
-		// start of axios extraction has already validated rawURL. Treat any
-		// error as "leave the URL untouched."
-		normalized, normErr := NormalizeEXPRPath(rawURL, nil)
-		if normErr != nil || normalized == "" {
-			normalized = rawURL
-		}
-
-		// Options object is second arg.
-		optArg := args.NamedChild(1)
-		if optArg == nil || optArg.Type() != "object" {
-			return
-		}
-
-		// Find body key.
-		obj := optArg.AsObject()
-		bodyNode := obj.GetNode("body")
-		if bodyNode == nil || !bodyNode.IsValid() {
-			return
-		}
-
-		fields := extractJSONStringifyKeys(bodyNode)
-		if len(fields) == 0 {
-			return
-		}
-
-		method := "POST" // fetch with body defaults to POST
-		if m := extractMethodFromOptions(optArg); m != "" && fetchHTTPMethods[m] {
-			method = m
-		}
-
-		key := endpointKey{method, normalized}
-		result[key] = fields
 	})
 
 	return result
+}
+
+// fetchBodyFromCall extracts the (key, body fields) pair for a fetch() call
+// node. Returns ok=false if the node is not a fetch with a body-bearing
+// options object. Splitting this out keeps augmentFetchBodyFields below the
+// gocyclo budget.
+func fetchBodyFromCall(n *jsluice.Node) (endpointKey, []string, bool) {
+	var k endpointKey
+	fn := n.ChildByFieldName("function")
+	if fn == nil || fn.Content() != "fetch" {
+		return k, nil, false
+	}
+	args := n.ChildByFieldName("arguments")
+	if args == nil {
+		return k, nil, false
+	}
+
+	urlArg := args.NamedChild(0)
+	if urlArg == nil {
+		return k, nil, false
+	}
+	rawURL, tokens := urlFromArg(urlArg)
+	if rawURL == "" {
+		return k, nil, false
+	}
+	// NormalizeEXPRPath errors only on malformed URLs; on error, fall through
+	// to the raw URL.
+	normalized, normErr := NormalizeEXPRPath(rawURL, tokens)
+	if normErr != nil || normalized == "" {
+		normalized = rawURL
+	}
+
+	optArg := args.NamedChild(1)
+	if optArg == nil || optArg.Type() != "object" {
+		return k, nil, false
+	}
+	obj := optArg.AsObject()
+	bodyNode := obj.GetNode("body")
+	if bodyNode == nil || !bodyNode.IsValid() {
+		return k, nil, false
+	}
+	fields := extractJSONStringifyKeys(bodyNode)
+	if len(fields) == 0 {
+		return k, nil, false
+	}
+
+	method := "POST" // fetch with body defaults to POST
+	if m := extractMethodFromOptions(optArg); m != "" && fetchHTTPMethods[m] {
+		method = m
+	}
+
+	k = endpointKey{method, normalized}
+	return k, fields, true
+}
+
+// urlFromArg extracts (rawURL, tokens) from either a string literal or a
+// template_string node. Returns ("", nil) for any other node type.
+func urlFromArg(n *jsluice.Node) (string, []string) {
+	if n.Type() == "template_string" {
+		return collapseTemplateLiteral(n)
+	}
+	return extractStringLiteral(n), nil
 }
 
 // endpointKey is a dedup key for ExtractedEndpoints.

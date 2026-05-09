@@ -16,6 +16,7 @@ package jsstatic
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -60,51 +61,21 @@ const maxSourcemapResponseSize = 10 * 1024 * 1024 // 10 MB
 // and parses the sourcesContent inline. If it points to a remote URL and
 // opts.FetchSourcemaps is true, it fetches the remote sourcemap.
 //
+// ctx is propagated into remote fetch HTTP requests so that cancellation and
+// deadlines from the caller are honored.
+//
 // Returns the recovered source strings and partial Stats for accounting.
-func recoverSourcemap(bundle []byte, bundleURL string, opts Options) ([]string, Stats) {
+func recoverSourcemap(ctx context.Context, bundle []byte, bundleURL string, opts Options) ([]string, Stats) {
 	var stats Stats
 
-	if len(bundle) == 0 {
-		return nil, stats
-	}
-
-	// Only scan the trailing window.
-	window := bundle
-	if len(window) > trailingWindowSize {
-		window = window[len(window)-trailingWindowSize:]
-	}
-
-	// Locate the sourceMappingURL comment.
-	var mappingURL string
-	for _, prefix := range sourceMappingCommentPrefixes {
-		idx := bytes.LastIndex(window, prefix)
-		if idx == -1 {
-			continue
-		}
-		rest := window[idx+len(prefix):]
-		// URL ends at the next newline or end of buffer.
-		if nl := bytes.IndexByte(rest, '\n'); nl != -1 {
-			rest = rest[:nl]
-		}
-		mappingURL = strings.TrimSpace(string(rest))
-		break
-	}
-
+	mappingURL := findSourceMappingURL(bundle)
 	if mappingURL == "" {
 		return nil, stats
 	}
 
 	// Handle data: URIs inline (no network required).
 	if strings.HasPrefix(mappingURL, "data:") {
-		sources, err := parseDataURISourcemap(mappingURL)
-		if err != nil {
-			stats.SourcemapFetchFails++
-			return nil, stats
-		}
-		if len(sources) > 0 {
-			stats.SourcemapsRecovered++
-		}
-		return sources, stats
+		return decodeDataURISourcemap(mappingURL)
 	}
 
 	// Remote URL: only fetch when FetchSourcemaps is enabled.
@@ -112,20 +83,20 @@ func recoverSourcemap(bundle []byte, bundleURL string, opts Options) ([]string, 
 		return nil, stats
 	}
 
+	mappingURL = resolveRelativeMapURL(bundleURL, mappingURL)
+
 	// Cross-host protection: only fetch when the sourcemap URL is on the same
 	// host as the bundle (§7 "Cross-host sourcemap fetch" deferred/refused).
 	if !sameHost(bundleURL, mappingURL) {
 		return nil, stats
 	}
 
-	// Build HTTP client.
 	client := opts.HTTPClient
 	if client == nil {
 		client = defaultSourcemapClient(opts.AllowPrivate)
 	}
 
-	// Fetch the remote sourcemap.
-	sources, err := fetchRemoteSourcemap(client, mappingURL, opts.AllowPrivate)
+	sources, err := fetchRemoteSourcemap(ctx, client, mappingURL, opts.AllowPrivate)
 	if err != nil {
 		stats.SourcemapFetchFails++
 		return nil, stats
@@ -136,31 +107,100 @@ func recoverSourcemap(bundle []byte, bundleURL string, opts Options) ([]string, 
 	return sources, stats
 }
 
+// findSourceMappingURL scans the trailing window of a JS bundle for a
+// `//# sourceMappingURL=` (or `//@`) pragma and returns the URL portion.
+func findSourceMappingURL(bundle []byte) string {
+	if len(bundle) == 0 {
+		return ""
+	}
+	window := bundle
+	if len(window) > trailingWindowSize {
+		window = window[len(window)-trailingWindowSize:]
+	}
+	for _, prefix := range sourceMappingCommentPrefixes {
+		idx := bytes.LastIndex(window, prefix)
+		if idx == -1 {
+			continue
+		}
+		rest := window[idx+len(prefix):]
+		if nl := bytes.IndexByte(rest, '\n'); nl != -1 {
+			rest = rest[:nl]
+		}
+		return strings.TrimSpace(string(rest))
+	}
+	return ""
+}
+
+// decodeDataURISourcemap parses an inline data: sourceMappingURL and returns
+// the recovered sources plus accounting stats.
+func decodeDataURISourcemap(mappingURL string) ([]string, Stats) {
+	var stats Stats
+	sources, err := parseDataURISourcemap(mappingURL)
+	if err != nil {
+		stats.SourcemapFetchFails++
+		return nil, stats
+	}
+	if len(sources) > 0 {
+		stats.SourcemapsRecovered++
+	}
+	return sources, stats
+}
+
+// resolveRelativeMapURL resolves a possibly-relative mapping URL against the
+// bundle URL so that "app.js.map" becomes "https://h/static/js/app.js.map"
+// before the same-host check (which requires a non-empty Host component).
+func resolveRelativeMapURL(bundleURL, mappingURL string) string {
+	if bundleURL == "" {
+		return mappingURL
+	}
+	base, err := url.Parse(bundleURL)
+	if err != nil {
+		return mappingURL
+	}
+	ref, err := url.Parse(mappingURL)
+	if err != nil {
+		return mappingURL
+	}
+	return base.ResolveReference(ref).String()
+}
+
 // sameHost returns true when both rawA and rawB are valid URLs sharing the
-// same host (scheme+host pair). If either cannot be parsed, returns false.
+// same hostname AND scheme. Hostname() is used so that example.com:443 and
+// example.com compare equal; a.Host == b.Host would fail for default ports.
+// Cross-scheme (http vs https) is also rejected to prevent mixed-content fetches.
 func sameHost(rawA, rawB string) bool {
 	if rawA == "" || rawB == "" {
 		return false
 	}
 	a, err := url.Parse(rawA)
-	if err != nil || a.Host == "" {
+	if err != nil || a.Hostname() == "" || a.Scheme == "" {
 		return false
 	}
 	b, err := url.Parse(rawB)
-	if err != nil || b.Host == "" {
+	if err != nil || b.Hostname() == "" || b.Scheme == "" {
 		return false
 	}
-	return a.Host == b.Host
+	return a.Hostname() == b.Hostname() && a.Scheme == b.Scheme
+}
+
+// noFollowRedirects is a CheckRedirect function that prevents the HTTP client
+// from following 3xx responses. A same-host .js.map URL that redirects to a
+// different host would bypass the sameHost pre-flight check; blocking all
+// redirects closes this gap.
+func noFollowRedirects(_ *http.Request, _ []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 // defaultSourcemapClient builds an http.Client for sourcemap fetches.
 // When allowPrivate is false, the SSRF-safe dial context from pkg/probe is
 // used. When allowPrivate is true, a permissive dialer is used instead.
+// Redirects are disabled unconditionally to prevent host-redirect bypass.
 func defaultSourcemapClient(allowPrivate bool) *http.Client {
 	timeout := 10 * time.Second
 	if allowPrivate {
 		return &http.Client{
-			Timeout: timeout,
+			Timeout:       timeout,
+			CheckRedirect: noFollowRedirects,
 			Transport: &http.Transport{
 				DialContext: (&net.Dialer{
 					Timeout: timeout,
@@ -171,7 +211,8 @@ func defaultSourcemapClient(allowPrivate bool) *http.Client {
 		}
 	}
 	return &http.Client{
-		Timeout: timeout,
+		Timeout:       timeout,
+		CheckRedirect: noFollowRedirects,
 		Transport: &http.Transport{
 			DialContext:           probe.SSRFSafeDialContext,
 			TLSHandshakeTimeout:   timeout,
@@ -181,9 +222,18 @@ func defaultSourcemapClient(allowPrivate bool) *http.Client {
 }
 
 // fetchRemoteSourcemap GETs the sourcemap URL, reads up to maxSourcemapResponseSize
-// bytes, and returns sourcesContent strings.
-func fetchRemoteSourcemap(client *http.Client, mapURL string, allowPrivate bool) ([]string, error) {
-	resp, err := client.Get(mapURL) //nolint:noctx
+// bytes, and returns sourcesContent strings. ctx is propagated into the HTTP
+// request so that cancellation from the caller is honored.
+func fetchRemoteSourcemap(ctx context.Context, client *http.Client, mapURL string, allowPrivate bool) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, mapURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	// gosec G107/G704: mapURL is host-validated (sameHost) and dial-validated
+	// (probe.SSRFSafeDialContext or, when AllowPrivate is true, an explicit
+	// opt-in). Redirects are blocked via CheckRedirect=noFollowRedirects on
+	// the default client. The taint warning here is a known false positive.
+	resp, err := client.Do(req) //nolint:gosec // mapURL pre-validated; see comment above
 	if err != nil {
 		return nil, err
 	}
@@ -240,7 +290,12 @@ func parseDataURISourcemap(uri string) ([]string, error) {
 		}
 		raw = decoded
 	} else {
-		raw = []byte(data)
+		// Non-base64 data URIs are URL-encoded; decode before JSON parsing.
+		unescaped, err := url.PathUnescape(data)
+		if err != nil {
+			return nil, err
+		}
+		raw = []byte(unescaped)
 	}
 
 	var doc sourceMapDoc

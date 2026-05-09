@@ -1141,6 +1141,34 @@ func TestOpenAPI_XVespasianSource_OmittedForEmptySource(t *testing.T) {
 	}
 }
 
+// F5: mixed static-only groups (static:js + static:js-sourcemap) must resolve to "dynamic".
+func TestComputeSourceTag_MixedStaticGroups(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	// Two entries for the same endpoint: one from js bundle, one from sourcemap.
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "static:js"),
+		makeClassified("GET", "https://h/api/x", "static:js-sourcemap"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	ext, ok := getOp["x-vespasian-source"]
+	if !ok {
+		t.Fatal("expected x-vespasian-source extension to be present")
+	}
+	if ext != "dynamic" {
+		t.Errorf("expected x-vespasian-source=dynamic for mixed static group, got %v", ext)
+	}
+}
+
 func TestOpenAPI_XVespasianSource_NoStaticPresent_ByteCompat(t *testing.T) {
 	// When no static: sources exist anywhere in input, generate twice with
 	// identical inputs and assert output is identical (byte compat).

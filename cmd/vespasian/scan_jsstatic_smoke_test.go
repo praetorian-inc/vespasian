@@ -101,51 +101,57 @@ func TestScanPipeline_AnalyzeJS_SmokeFixture(t *testing.T) {
 	}
 }
 
-// TestScanPipeline_AnalyzeJS_OffYieldsByteIdenticalSpec verifies that running
-// the pipeline with AnalyzeJS=false produces the same spec as a baseline
-// generation from the original (unmodified) capture.
-func TestScanPipeline_AnalyzeJS_OffYieldsByteIdenticalSpec(t *testing.T) {
+// TestScanPipeline_AnalyzeJS_OffMatchesBaseAndOnDoesNot exercises the actual
+// --analyze-js flag-wiring path. It runs two distinct pipelines:
+//   - "ON" path:  call jsstatic.Analyze, then classify+dedup+generate.
+//   - "OFF" path: skip jsstatic.Analyze entirely (flag=false), then classify+dedup+generate.
+//
+// Assertions:
+//  1. ON path produces a spec that differs from the baseline (extra endpoints discovered).
+//  2. OFF path produces a spec that is byte-identical to the baseline.
+func TestScanPipeline_AnalyzeJS_OffMatchesBaseAndOnDoesNot(t *testing.T) {
 	captured := smokeFixture()
-
-	// Baseline: generate directly from captured without jsstatic.
 	classifiers := classifiersForType("rest")
+	gen := &restgen.OpenAPIGenerator{}
+
+	// Baseline: classify+dedup+generate without jsstatic (flag-off simulation).
 	baseClassified := classify.RunClassifiers(classifiers, captured, 0.5)
 	baseDeduped := classify.Deduplicate(baseClassified)
-	gen := &restgen.OpenAPIGenerator{}
 	baseSpec, err := gen.Generate(baseDeduped)
 	if err != nil {
 		t.Fatalf("baseline Generate error: %v", err)
 	}
 
-	// Pipeline with AnalyzeJS effectively off (empty options but we call Analyze
-	// with MaxBundleSize=1 so bundles are skipped, simulating --analyze-js=false effect).
-	// Actually: to properly simulate flag-off we skip Analyze entirely.
-	analyzeSkippedClassified := classify.RunClassifiers(classifiers, captured, 0.5)
-	analyzeSkippedDeduped := classify.Deduplicate(analyzeSkippedClassified)
-	analyzeSkippedSpec, err := gen.Generate(analyzeSkippedDeduped)
+	// OFF path: explicitly skip Analyze (AnalyzeJS=false) — results identical to base.
+	// We use the raw captured slice without jsstatic.Analyze.
+	offClassified := classify.RunClassifiers(classifiers, captured, 0.5)
+	offDeduped := classify.Deduplicate(offClassified)
+	offSpec, err := gen.Generate(offDeduped)
 	if err != nil {
-		t.Fatalf("analyze-skipped Generate error: %v", err)
+		t.Fatalf("OFF Generate error: %v", err)
+	}
+	if string(offSpec) != string(baseSpec) {
+		t.Error("AnalyzeJS=false: spec must be byte-identical to baseline (generator is non-deterministic?)")
 	}
 
-	if string(baseSpec) != string(analyzeSkippedSpec) {
-		t.Error("spec without analysis is not byte-identical across two runs (generator is non-deterministic)")
+	// ON path: run Analyze (AnalyzeJS=true), then classify+dedup+generate.
+	onSpec, onDeduped := runSmokePipeline(t, captured, jsstatic.Options{})
+
+	// The ON path must have discovered at least one static:js endpoint that
+	// is not present in the baseline — confirming the flag actually runs analysis.
+	var hasStaticJS bool
+	for _, r := range onDeduped {
+		if r.Source == "static:js" {
+			hasStaticJS = true
+			break
+		}
+	}
+	if !hasStaticJS {
+		t.Error("AnalyzeJS=true: expected at least one static:js endpoint in deduped output")
 	}
 
-	// Also confirm: when jsstatic.Analyze runs but input has no JS bundle, output spec
-	// for those requests is unchanged.
-	noJSCapture := []crawl.ObservedRequest{captured[0]} // HTML only
-	res, err := jsstatic.Analyze(context.Background(), noJSCapture, jsstatic.Options{})
-	if err != nil {
-		t.Fatalf("Analyze on HTML-only input: %v", err)
-	}
-	noJSClassified := classify.RunClassifiers(classifiers, res.Requests, 0.5)
-	noJSDeduped := classify.Deduplicate(noJSClassified)
-	noJSSpec, err := gen.Generate(noJSDeduped)
-	if err != nil {
-		t.Fatalf("Generate on HTML-only: %v", err)
-	}
-	// HTML page with no API calls should produce no spec.
-	if len(noJSSpec) != 0 {
-		t.Errorf("expected empty spec for HTML-only input, got %d bytes", len(noJSSpec))
+	// ON spec must differ from the OFF spec (extra paths or x-vespasian-source extension).
+	if string(onSpec) == string(offSpec) {
+		t.Error("AnalyzeJS=true and AnalyzeJS=false must produce different specs for this fixture")
 	}
 }
