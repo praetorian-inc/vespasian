@@ -1026,3 +1026,156 @@ func TestOpenAPIGenerator_NonHTTPScheme(t *testing.T) {
 		t.Error("HTTPS endpoint should be present")
 	}
 }
+
+// --- Task 13: x-vespasian-source extension tests ---
+
+func makeClassified(method, rawURL, source string) classify.ClassifiedRequest {
+	return classify.ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: method,
+			URL:    rawURL,
+			Source: source,
+		},
+		IsAPI:      true,
+		Confidence: 0.9,
+		APIType:    "rest",
+	}
+}
+
+func TestOpenAPI_XVespasianSource_DynamicWins(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "katana"),
+		makeClassified("GET", "https://h/api/x", "static:js"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	ext, ok := getOp["x-vespasian-source"]
+	if !ok {
+		t.Fatal("expected x-vespasian-source extension to be present")
+	}
+	if ext != "dynamic" {
+		t.Errorf("expected x-vespasian-source=dynamic, got %v", ext)
+	}
+}
+
+func TestOpenAPI_XVespasianSource_JSBundleOnly(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "static:js"),
+		makeClassified("GET", "https://h/api/x", "static:js"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	ext, ok := getOp["x-vespasian-source"]
+	if !ok {
+		t.Fatal("expected x-vespasian-source extension to be present")
+	}
+	if ext != "js-bundle" {
+		t.Errorf("expected x-vespasian-source=js-bundle, got %v", ext)
+	}
+}
+
+func TestOpenAPI_XVespasianSource_JSSourcemap(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "static:js-sourcemap"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	ext, ok := getOp["x-vespasian-source"]
+	if !ok {
+		t.Fatal("expected x-vespasian-source extension to be present")
+	}
+	if ext != "js-sourcemap" {
+		t.Errorf("expected x-vespasian-source=js-sourcemap, got %v", ext)
+	}
+}
+
+func TestOpenAPI_XVespasianSource_OmittedForEmptySource(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	// No static: source anywhere in the input.
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", ""),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	if _, ok := getOp["x-vespasian-source"]; ok {
+		t.Error("expected x-vespasian-source to be absent when source is empty")
+	}
+}
+
+func TestOpenAPI_XVespasianSource_NoStaticPresent_ByteCompat(t *testing.T) {
+	// When no static: sources exist anywhere in input, generate twice with
+	// identical inputs and assert output is identical (byte compat).
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "katana"),
+		makeClassified("POST", "https://h/api/y", "browser"),
+	}
+
+	spec1, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate (run 1) failed: %v", err)
+	}
+	spec2, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate (run 2) failed: %v", err)
+	}
+	if string(spec1) != string(spec2) {
+		t.Error("Generate output is not deterministic / byte-compatible across runs")
+	}
+
+	// Also verify extension is absent on every operation.
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec1, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	for _, pathVal := range paths {
+		pathItem := pathVal.(map[string]interface{})
+		for _, opVal := range pathItem {
+			if op, ok := opVal.(map[string]interface{}); ok {
+				if _, hasExt := op["x-vespasian-source"]; hasExt {
+					t.Error("expected x-vespasian-source to be absent when no static sources in input")
+				}
+			}
+		}
+	}
+}
