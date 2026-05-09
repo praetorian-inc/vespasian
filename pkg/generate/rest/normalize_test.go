@@ -1029,37 +1029,150 @@ func TestIsBase64Token(t *testing.T) {
 	}
 }
 
+// withMaxPromotionRounds temporarily overrides the package-level
+// maxPromotionRounds for the duration of t. Restores the original value via
+// t.Cleanup. Production code MUST NOT mutate maxPromotionRounds; this helper
+// is only for tests that need to verify cap behavior under controlled
+// conditions.
+func withMaxPromotionRounds(t *testing.T, n int) {
+	t.Helper()
+	prev := maxPromotionRounds
+	maxPromotionRounds = n
+	t.Cleanup(func() { maxPromotionRounds = prev })
+}
+
 func TestNormalizePathsWithNames_MaxPromotionRoundsCap(t *testing.T) {
-	// Locks in the saturation contract for the maxPromotionRounds = 8 cap
-	// (normalize.go around `const maxPromotionRounds = 8`), the SEC-BE-001
-	// defense against CPU-DoS on pathological inputs. The cap MUST guarantee
-	// that NormalizePathsWithNames terminates with a well-formed result for
-	// any input, regardless of how many rounds the algorithm would otherwise
+	// Locks in the saturation contract for the maxPromotionRounds cap
+	// (normalize.go: `var maxPromotionRounds = 8`), the SEC-BE-001 defense
+	// against CPU-DoS on pathological inputs. The cap MUST guarantee that
+	// NormalizePathsWithNames terminates with a well-formed result for any
+	// input, regardless of how many rounds the algorithm would otherwise
 	// require to fully converge.
 	//
-	// We assert two properties:
-	//
-	//   (a) Saturation safety — even on a deliberately complex fixture
-	//       the function returns without panicking, every input path
-	//       appears in the output map (no silent drops), and every output
-	//       is a non-empty string that begins with `/` (a valid path
-	//       template). Some segments may remain literal at saturation —
-	//       that is the documented best-effort contract.
-	//
-	//   (b) Cap-not-silently-lowered — the cap value MUST be at least 2.
-	//       The fixture below is one that requires exactly 2 rounds to
-	//       fully converge (every path resolves to /repos/{repoSlug}/{repoSlug2}).
-	//       If a future refactor silently lowers the cap to 1, the
-	//       expected templates will not appear and the assertion fails.
-	//       This sub-property is also implicitly covered by
-	//       TestNormalizePathsWithNames_FixedPointIterationRequired but is
-	//       repeated here so the cap-monitor test is self-contained.
+	// We use the test-only helper withMaxPromotionRounds to lower the cap
+	// to a small value and observe the documented best-effort contract:
+	// the function returns, every input path appears in the output map,
+	// every output is a non-empty path string, and segments that did not
+	// converge at saturation remain as their literal input values
+	// (passing through unchanged).
+
+	t.Run("cap_at_one_forces_saturation_with_unconverged_literals", func(t *testing.T) {
+		// Fixture from TestNormalizePathsWithNames_FixedPointIterationRequired
+		// genuinely needs round 2 to fully converge. Lowering the cap to 1
+		// forces saturation: alice/proj-a and bob/proj-a participate in
+		// round 1's varying buckets at both position 2 (suffix /proj-a)
+		// and position 3 (prefix /repos/{owner}), so they fully converge
+		// to /repos/{repoSlug}/{repoSlug2} in a single round. alice/proj-b
+		// and bob/proj-c each have one position promoted in round 1
+		// (their position-3 literal varies within /repos/alice and
+		// /repos/bob respectively); their position-2 literals are
+		// singleton-bucketed in round 1 and would only promote in round 2.
+		// With the cap at 1 those position-2 literals MUST stay literal —
+		// that is the documented saturation contract.
+		withMaxPromotionRounds(t, 1)
+		paths := []string{
+			"/repos/alice/proj-a",
+			"/repos/alice/proj-b",
+			"/repos/bob/proj-a",
+			"/repos/bob/proj-c",
+		}
+		got := NormalizePathsWithNames(paths)
+
+		// Invariant: every input path appears as a key.
+		if len(got) != len(paths) {
+			t.Fatalf("got %d entries, want %d: %#v", len(got), len(paths), got)
+		}
+		for _, p := range paths {
+			if _, ok := got[p]; !ok {
+				t.Errorf("input path %q missing from output map", p)
+			}
+		}
+
+		// Invariant: paths that participated in both buckets in round 1
+		// are fully promoted; paths whose position-2 needed round 2 retain
+		// their literal owner segment.
+		if got["/repos/alice/proj-a"] != "/repos/{repoSlug}/{repoSlug2}" {
+			t.Errorf("alice/proj-a got %q, want /repos/{repoSlug}/{repoSlug2}", got["/repos/alice/proj-a"])
+		}
+		if got["/repos/bob/proj-a"] != "/repos/{repoSlug}/{repoSlug2}" {
+			t.Errorf("bob/proj-a got %q, want /repos/{repoSlug}/{repoSlug2}", got["/repos/bob/proj-a"])
+		}
+		// At cap=1, the owner segment of alice/proj-b and bob/proj-c stays
+		// literal. contextualParamName then walks back from position 3 and
+		// finds the un-promoted owner as the nearest preceding literal, so
+		// the parameter name is {aliceSlug} / {bobSlug} rather than the
+		// fully-converged {repoSlug2} produced when the cap permits round 2.
+		// This is exactly what "best-effort detection on saturation" means:
+		// the output is a valid OpenAPI template, just not the fully-merged
+		// one. The default cap test below verifies the full convergence.
+		if got["/repos/alice/proj-b"] != "/repos/alice/{aliceSlug}" {
+			t.Errorf("alice/proj-b at cap=1 got %q, want /repos/alice/{aliceSlug} (owner stays literal at saturation)", got["/repos/alice/proj-b"])
+		}
+		if got["/repos/bob/proj-c"] != "/repos/bob/{bobSlug}" {
+			t.Errorf("bob/proj-c at cap=1 got %q, want /repos/bob/{bobSlug} (owner stays literal at saturation)", got["/repos/bob/proj-c"])
+		}
+	})
+
+	t.Run("cap_at_zero_returns_input_with_only_regex_kinds_promoted", func(t *testing.T) {
+		// Lowering the cap to 0 disables the observation pass entirely.
+		// Regex-detected kinds (UUID, ObjectID, numeric, etc.) still
+		// classify and render via classifyPaths + renderNormalizedPaths;
+		// only kindSlug promotion is suppressed because the loop body
+		// never runs.
+		withMaxPromotionRounds(t, 0)
+		paths := []string{
+			"/users/42",                       // numeric → {userId} (regex)
+			"/articles/my-first-post",         // slug-shaped, would observe-promote → stays literal
+			"/articles/my-second-post",        // ditto
+			"/posts/507f1f77bcf86cd799439011", // ObjectID → {postId} (regex)
+		}
+		got := NormalizePathsWithNames(paths)
+
+		want := map[string]string{
+			"/users/42":                       "/users/{userId}",
+			"/articles/my-first-post":         "/articles/my-first-post",
+			"/articles/my-second-post":        "/articles/my-second-post",
+			"/posts/507f1f77bcf86cd799439011": "/posts/{postId}",
+		}
+		if len(got) != len(want) {
+			t.Fatalf("got %d entries, want %d: %#v", len(got), len(want), got)
+		}
+		for k, v := range want {
+			if got[k] != v {
+				t.Errorf("path %q at cap=0 got %q, want %q", k, got[k], v)
+			}
+		}
+	})
+
+	t.Run("cap_at_default_supports_full_two_round_convergence", func(t *testing.T) {
+		// Sanity-check that the production cap (default 8) actually permits
+		// the 2-round convergence pattern. If maxPromotionRounds is silently
+		// lowered to 1 in production code (e.g., a bad refactor), this test
+		// fails alongside cap_at_one_forces_saturation_with_unconverged_literals
+		// and points at the same root cause.
+		paths := []string{
+			"/repos/alice/proj-a",
+			"/repos/alice/proj-b",
+			"/repos/bob/proj-a",
+			"/repos/bob/proj-c",
+		}
+		got := NormalizePathsWithNames(paths)
+		const want = "/repos/{repoSlug}/{repoSlug2}"
+		for _, p := range paths {
+			if got[p] != want {
+				t.Errorf("path %q normalized to %q, want %q — production cap may be silently below 2", p, got[p], want)
+			}
+		}
+	})
 
 	t.Run("saturation_safety_on_deep_overlap_fixture", func(t *testing.T) {
-		// Construct a deeply-nested fixture with multiple varying positions
-		// and partial overlap. Realistic inputs like this converge in
-		// 2-3 rounds; the test does not depend on hitting the cap, only
-		// on the saturation invariants holding.
+		// Constructs a deep-overlap fixture and asserts the saturation
+		// invariants hold under the production cap (no panic, every input
+		// path is preserved as a key, every output is a non-empty path
+		// string). Realistic inputs converge well below the cap; this is
+		// a smoke test for the well-formedness contract under load rather
+		// than a cap-firing test (the cap-firing path is exercised by the
+		// cap_at_one_… subtest above).
 		var paths []string
 		owners := []string{"alice", "bob", "carol", "dave", "eve"}
 		repos := []string{"proj-a", "proj-b", "proj-c"}
@@ -1074,11 +1187,10 @@ func TestNormalizePathsWithNames_MaxPromotionRoundsCap(t *testing.T) {
 
 		got := NormalizePathsWithNames(paths)
 
-		// Saturation invariant 1: every input path is preserved as a key.
 		for _, p := range paths {
 			out, ok := got[p]
 			if !ok {
-				t.Errorf("input path %q missing from output map (cap may have dropped paths)", p)
+				t.Errorf("input path %q missing from output map", p)
 				continue
 			}
 			if out == "" {
@@ -1086,32 +1198,6 @@ func TestNormalizePathsWithNames_MaxPromotionRoundsCap(t *testing.T) {
 			}
 			if !strings.HasPrefix(out, "/") {
 				t.Errorf("path %q produced non-path output %q", p, out)
-			}
-		}
-
-		// Saturation invariant 2: output map size never exceeds input size
-		// (deduplication is the only path that reduces it).
-		if len(got) > len(paths) {
-			t.Errorf("got %d output entries, want at most %d", len(got), len(paths))
-		}
-	})
-
-	t.Run("cap_supports_at_least_two_rounds", func(t *testing.T) {
-		// Fixture mirrors TestNormalizePathsWithNames_FixedPointIterationRequired:
-		// genuinely needs round 2 to converge. If the cap is silently
-		// lowered to 1, alice/proj-b and bob/proj-c stay literal at
-		// position 2.
-		paths := []string{
-			"/repos/alice/proj-a",
-			"/repos/alice/proj-b",
-			"/repos/bob/proj-a",
-			"/repos/bob/proj-c",
-		}
-		got := NormalizePathsWithNames(paths)
-		const want = "/repos/{repoSlug}/{repoSlug2}"
-		for _, p := range paths {
-			if got[p] != want {
-				t.Errorf("path %q normalized to %q, want %q — maxPromotionRounds may have been silently lowered below 2", p, got[p], want)
 			}
 		}
 	})

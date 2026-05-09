@@ -225,6 +225,14 @@ func NormalizePath(path string) string {
 //
 // For slug-style identifiers that vary across observed paths, use
 // NormalizePathsWithNames which performs observation-based detection.
+//
+// This function remains exported as a single-path utility for callers that
+// only have one path to normalize and intentionally do not need slug
+// detection (e.g., ad-hoc tooling, debug utilities, simple migrations). The
+// production OpenAPI generation pipeline does not call this function — it
+// uses NormalizePathsWithNames so observation-based detection can fire
+// across the full population. New code with access to a population of
+// paths should prefer NormalizePathsWithNames.
 func NormalizePathWithNames(path string) string {
 	segments := strings.Split(path, "/")
 	kinds := make([]paramKind, len(segments))
@@ -252,6 +260,13 @@ type posKey struct {
 	length int
 }
 
+// segLoc is a (path, segment) coordinate used by promoteVaryingPositions
+// and unifyMixedKindsAtSamePosition to record which segments need to be
+// rewritten in a separate pass.
+type segLoc struct {
+	pathIdx, segIdx int
+}
+
 // NormalizePathsWithNames classifies each input path's segments by regex /
 // literal kind, then performs observation-based detection: a position whose
 // literal segment value varies across paths sharing the same prefix and
@@ -271,24 +286,21 @@ type posKey struct {
 // position's bucket is a singleton. Add overlapping observations (e.g.,
 // `/repos/alice/proj1` together with `/repos/alice/proj2` and
 // `/repos/bob/proj1`) to anchor the inference.
+//
+// Saturation behavior: if the maxPromotionRounds cap fires (see SEC-BE-001
+// note below), any segments that did not converge to kindSlug remain
+// kindLiteral and pass through unchanged in the returned map. The function
+// has no error channel and does not signal cap saturation to the caller
+// today; downstream consumers receive a partially-normalized result. A
+// debug logging hook for cap-saturation events is a reasonable future
+// addition but is not in scope for LAB-2107.
 func NormalizePathsWithNames(paths []string) map[string]string {
 	if len(paths) == 0 {
 		return map[string]string{}
 	}
 
 	infos := classifyPaths(paths)
-	// Bound the fixed-point iteration to a small constant. Each round can
-	// only convert kindLiteral to kindSlug (monotonic), so termination is
-	// guaranteed by the size of the literal set; under realistic API
-	// captures fewer than five rounds are required. The cap protects
-	// against pathological inputs (deeply-nested adversarial paths) where
-	// the loop could otherwise reach O(S) iterations and produce an O(N*S^3)
-	// CPU-DoS surface at the generate step. After the cap, any remaining
-	// unpromoted segments stay literal — best-effort detection — and
-	// unifyMixedKindsAtSamePosition still runs on whatever kinds are
-	// present. See SEC-BE-001 in the LAB-2107 review history.
-	const maxPromotionRounds = 8
-	for round := 0; round < maxPromotionRounds; round++ {
+	for i := 0; i < maxPromotionRounds; i++ {
 		varying := findVaryingPositions(infos)
 		if len(varying) == 0 {
 			break
@@ -307,6 +319,22 @@ func NormalizePathsWithNames(paths []string) map[string]string {
 	return renderNormalizedPaths(paths, infos)
 }
 
+// maxPromotionRounds bounds the fixed-point iteration in
+// NormalizePathsWithNames. Each round can only convert kindLiteral to
+// kindSlug (monotonic), so termination is guaranteed by the size of the
+// literal set; under realistic API captures fewer than five rounds are
+// required. The cap protects against pathological inputs (deeply-nested
+// adversarial paths) where the loop could otherwise reach O(S) iterations
+// and produce an O(N*S^3) CPU-DoS surface at the generate step. After the
+// cap, any remaining unpromoted segments stay literal — best-effort
+// detection — and unifyMixedKindsAtSamePosition still runs on whatever
+// kinds are present. See SEC-BE-001 in the LAB-2107 review history.
+//
+// This is a `var` (not a `const`) so tests can lower it with t.Setenv-style
+// save/restore to verify the saturation contract under controlled
+// conditions. Production code MUST NOT mutate this value.
+var maxPromotionRounds = 8
+
 // unifyMixedKindsAtSamePosition collapses regex-classified kinds onto
 // kindSlug when an observation-promoted slug shares the same shape position
 // in another path. Without this pass, /articles/my-first-post,
@@ -319,8 +347,7 @@ func NormalizePathsWithNames(paths []string) map[string]string {
 // (UUID, ObjectID, numeric, short hex, base64) is unified onto kindSlug
 // so a single template emerges. Literal segments are not touched.
 func unifyMixedKindsAtSamePosition(infos []pathInfo) {
-	type loc struct{ pathIdx, segIdx int }
-	groups := make(map[posKey][]loc)
+	groups := make(map[posKey][]segLoc)
 	hasSlug := make(map[posKey]bool)
 	hasOther := make(map[posKey]bool)
 	for pIdx := range infos {
@@ -330,7 +357,7 @@ func unifyMixedKindsAtSamePosition(infos []pathInfo) {
 				continue
 			}
 			key := positionKey(*info, sIdx)
-			groups[key] = append(groups[key], loc{pIdx, sIdx})
+			groups[key] = append(groups[key], segLoc{pIdx, sIdx})
 			if k == kindSlug {
 				hasSlug[key] = true
 			} else {
@@ -417,11 +444,10 @@ func findVaryingPositions(infos []pathInfo) map[posKey]struct{} {
 // round is promoted at the end of the round, giving the outer fixed-point
 // loop a clean view of the next round's candidate set.
 func promoteVaryingPositions(infos []pathInfo, varying map[posKey]struct{}) bool {
-	type loc struct{ pathIdx, segIdx int }
 	// len(infos) is the number of paths and is a reasonable upper-bound
 	// hint for typical API captures (a single promotion per path is
 	// common); the slice grows beyond if more positions promote per path.
-	toPromote := make([]loc, 0, len(infos))
+	toPromote := make([]segLoc, 0, len(infos))
 	for idx := range infos {
 		info := &infos[idx]
 		for i, seg := range info.segments {
@@ -432,7 +458,7 @@ func promoteVaryingPositions(infos []pathInfo, varying map[posKey]struct{}) bool
 				continue
 			}
 			if info.kinds[i] != kindSlug {
-				toPromote = append(toPromote, loc{idx, i})
+				toPromote = append(toPromote, segLoc{idx, i})
 			}
 		}
 	}
@@ -528,6 +554,20 @@ func shapeKey(segments []string, kinds []paramKind) string {
 // applyKindsToSegments rewrites segments in place: any non-literal kind is
 // replaced with `{<contextName>}` derived from the preceding non-empty,
 // non-parameterized segment.
+//
+// Mutation safety: this loop walks left-to-right and rewrites segments[i]
+// before computing contextualParamName for i+1. The backwards walk in
+// contextualParamName looks for the nearest preceding *literal* segment
+// (kinds[j] == kindLiteral). When a previous index j was rewritten in this
+// loop, kinds[j] is non-literal, so the backwards walk skips j and reads
+// only segments whose value has NOT been touched. The in-place strategy
+// is therefore safe — no snapshot is required — and matches the cheaper
+// single-pass design of NormalizePathWithNames.
+//
+// promoteVaryingPositions has a different invariant (it computes posKey
+// from segments + kinds for SUBSEQUENT positions in the same path, not
+// preceding ones) and therefore uses a two-pass strategy. Do not assume
+// the patterns are interchangeable.
 func applyKindsToSegments(segments []string, kinds []paramKind) {
 	for i := range segments {
 		if kinds[i] == kindLiteral {

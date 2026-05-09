@@ -19,14 +19,17 @@
 //
 // Key components:
 //   - [OpenAPIGenerator] produces a valid OpenAPI 3.0 document in YAML format.
-//   - Path normalization replaces dynamic path segments with parameterized
-//     templates. Single-path detection covers UUIDs, MongoDB ObjectIDs,
-//     numeric IDs, short hex hashes, and base64/base64url tokens.
-//     Observation-based detection ([NormalizePathsWithNames]) additionally
-//     identifies slug-style identifiers when multiple distinct values are
-//     observed at the same path position. Known literals (`me`, `current`,
-//     `self`, `new`, `list`, `search`) are preserved against all forms of
-//     parameterization.
+//   - [NormalizePathsWithNames] is the primary normalization entry point. It
+//     accepts a population of observed paths and returns a map of input path
+//     to template path, performing both single-path regex detection (UUIDs,
+//     MongoDB ObjectIDs, numeric IDs, short hex hashes, base64/base64url
+//     tokens) and observation-based slug detection across the population.
+//     Known literals (`me`, `current`, `self`, `new`, `list`, `search`) are
+//     preserved against all forms of parameterization.
+//   - [NormalizePathWithNames] is a single-path convenience that performs
+//     only the regex-detection pass; callers that have a population of
+//     paths should prefer [NormalizePathsWithNames] so slug detection can
+//     fire.
 //   - Schema inference examines response JSON to generate OpenAPI schema
 //     objects with depth and property guards.
 package rest
