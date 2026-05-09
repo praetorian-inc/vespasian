@@ -322,9 +322,9 @@ func TestBurpImporter_QueryParams(t *testing.T) {
 	req := requests[0]
 	require.NotNil(t, req.QueryParams)
 
-	wantParams := map[string]string{
-		"page":  "1",
-		"limit": "10",
+	wantParams := map[string][]string{
+		"page":  {"1"},
+		"limit": {"10"},
 	}
 
 	assert.Len(t, req.QueryParams, len(wantParams))
@@ -333,6 +333,30 @@ func TestBurpImporter_QueryParams(t *testing.T) {
 		assert.Contains(t, req.QueryParams, key)
 		assert.Equal(t, want, req.QueryParams[key])
 	}
+}
+
+func TestBurpImporter_QueryParams_MultiValue(t *testing.T) {
+	// The request line encodes: GET /api?ids=1&ids=2 HTTP/1.1\r\nHost: example.com\r\n\r\n
+	requestLine := "GET /api?ids=1&ids=2 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	xml := `<?xml version="1.0"?>
+<items>
+	<item>
+		<url>https://example.com/api?ids=1&amp;ids=2</url>
+		<request base64="true">` + base64.StdEncoding.EncodeToString([]byte(requestLine)) + `</request>
+		<status>200</status>
+		<response base64="true">SFRUUC8xLjEgMjAwIE9LDQoNCg==</response>
+	</item>
+</items>`
+
+	b := &BurpImporter{}
+	requests, err := b.Import(strings.NewReader(xml))
+	require.NoError(t, err)
+
+	require.Len(t, requests, 1)
+
+	req := requests[0]
+	require.NotNil(t, req.QueryParams)
+	assert.Equal(t, []string{"1", "2"}, req.QueryParams["ids"])
 }
 
 func TestBurpImporter_DuplicateHeaders(t *testing.T) {

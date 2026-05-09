@@ -280,9 +280,9 @@ func TestHARImporter_QueryParams(t *testing.T) {
 	req := requests[0]
 	require.NotNil(t, req.QueryParams)
 
-	wantParams := map[string]string{
-		"page":  "1",
-		"limit": "10",
+	wantParams := map[string][]string{
+		"page":  {"1"},
+		"limit": {"10"},
 	}
 
 	assert.Len(t, req.QueryParams, len(wantParams))
@@ -291,6 +291,35 @@ func TestHARImporter_QueryParams(t *testing.T) {
 		assert.Contains(t, req.QueryParams, key)
 		assert.Equal(t, want, req.QueryParams[key])
 	}
+}
+
+func TestHARImporter_QueryParams_MultiValue(t *testing.T) {
+	json := `{
+		"log": {
+			"entries": [{
+				"request": {
+					"method": "GET",
+					"url": "https://example.com/api?ids=1&ids=2",
+					"headers": []
+				},
+				"response": {
+					"status": 200,
+					"headers": [],
+					"content": {}
+				}
+			}]
+		}
+	}`
+
+	h := &HARImporter{}
+	requests, err := h.Import(strings.NewReader(json))
+	require.NoError(t, err)
+
+	require.Len(t, requests, 1)
+
+	req := requests[0]
+	require.NotNil(t, req.QueryParams)
+	assert.Equal(t, []string{"1", "2"}, req.QueryParams["ids"])
 }
 
 func TestHARImporter_SizeLimit(t *testing.T) {

@@ -41,6 +41,42 @@ func capitalizeFirst(s string) string {
 	return string(unicode.ToUpper(r)) + s[size:]
 }
 
+// inferQueryParamItemsType infers the OpenAPI items type from a slice of
+// observed query-parameter values. Returns:
+//   - "integer" if every value parses as int
+//   - "number"  if every value parses as float (and at least one is non-int)
+//   - "boolean" if every value is "true" or "false"
+//   - "string"  otherwise (mixed or string)
+//
+// Mirrors the precedence of inferQueryParamType for consistency.
+func inferQueryParamItemsType(values []string) string {
+	if len(values) == 0 {
+		return "string"
+	}
+	allInt, allFloat, allBool := true, true, true
+	for _, v := range values {
+		if _, err := strconv.Atoi(v); err != nil {
+			allInt = false
+		}
+		if _, err := strconv.ParseFloat(v, 64); err != nil {
+			allFloat = false
+		}
+		if v != "true" && v != "false" {
+			allBool = false
+		}
+	}
+	switch {
+	case allInt:
+		return "integer"
+	case allFloat:
+		return "number"
+	case allBool:
+		return "boolean"
+	default:
+		return "string"
+	}
+}
+
 // inferQueryParamType infers the OpenAPI type from a query parameter value.
 func inferQueryParamType(value string) string {
 	if _, err := strconv.Atoi(value); err == nil {
@@ -133,10 +169,11 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest) *openap
 		return operation
 	}
 
-	// --- Query parameters: collect union from all endpoints, track frequency and first value ---
+	// --- Query parameters: collect union from all endpoints, track frequency, values, and multi-value ---
 	type queryParamInfo struct {
-		count    int
-		firstVal string
+		count          int      // # of endpoints observing this param (for `required`)
+		values         []string // union of ALL values seen, order-preserved (for items inference + array detection)
+		multiValueSeen bool     // true iff any single observation had >1 values
 	}
 	queryParams := make(map[string]*queryParamInfo)
 	endpointsWithParams := 0
@@ -144,12 +181,17 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest) *openap
 		if len(ep.QueryParams) > 0 {
 			endpointsWithParams++
 		}
-		for name, val := range ep.QueryParams {
-			if info, ok := queryParams[name]; ok {
-				info.count++
-			} else {
-				queryParams[name] = &queryParamInfo{count: 1, firstVal: val}
+		for name, vals := range ep.QueryParams {
+			info, ok := queryParams[name]
+			if !ok {
+				info = &queryParamInfo{}
+				queryParams[name] = info
 			}
+			info.count++
+			if len(vals) > 1 {
+				info.multiValueSeen = true
+			}
+			info.values = classify.MergeUniqueOrdered(info.values, vals)
 		}
 	}
 	if len(queryParams) > 0 {
@@ -166,18 +208,40 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest) *openap
 			// Required if present in all endpoints that have query params
 			required := endpointsWithParams > 0 && info.count == endpointsWithParams
 
-			// Infer type from first observed value
-			paramType := inferQueryParamType(info.firstVal)
-
-			param := &openapi3.Parameter{
-				Name:     name,
-				In:       "query",
-				Required: required,
-				Schema: &openapi3.SchemaRef{
-					Value: &openapi3.Schema{
-						Type: &openapi3.Types{paramType},
+			var param *openapi3.Parameter
+			if info.multiValueSeen {
+				// Emit array parameter with items type, style=form, explode=true
+				itemsType := inferQueryParamItemsType(info.values)
+				trueVal := true
+				schema := &openapi3.Schema{
+					Type: &openapi3.Types{"array"},
+					Items: &openapi3.SchemaRef{
+						Value: &openapi3.Schema{
+							Type: &openapi3.Types{itemsType},
+						},
 					},
-				},
+				}
+				param = &openapi3.Parameter{
+					Name:     name,
+					In:       "query",
+					Required: required,
+					Schema:   &openapi3.SchemaRef{Value: schema},
+					Style:    "form",
+					Explode:  &trueVal,
+				}
+			} else {
+				// Emit scalar parameter using first observed value
+				paramType := inferQueryParamType(info.values[0])
+				param = &openapi3.Parameter{
+					Name:     name,
+					In:       "query",
+					Required: required,
+					Schema: &openapi3.SchemaRef{
+						Value: &openapi3.Schema{
+							Type: &openapi3.Types{paramType},
+						},
+					},
+				}
 			}
 			operation.Parameters = append(operation.Parameters, &openapi3.ParameterRef{Value: param})
 		}

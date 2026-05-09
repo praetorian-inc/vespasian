@@ -154,7 +154,7 @@ func TestDeduplicate_MergesSameEndpoint(t *testing.T) {
 			ObservedRequest: crawl.ObservedRequest{
 				Method:      "GET",
 				URL:         "https://example.com/api/users?page=1",
-				QueryParams: map[string]string{"page": "1"},
+				QueryParams: map[string][]string{"page": {"1"}},
 				Response: crawl.ObservedResponse{
 					StatusCode: 200,
 					Body:       []byte(`[{"id":1}]`),
@@ -169,7 +169,7 @@ func TestDeduplicate_MergesSameEndpoint(t *testing.T) {
 			ObservedRequest: crawl.ObservedRequest{
 				Method:      "GET",
 				URL:         "https://example.com/api/users?page=2",
-				QueryParams: map[string]string{"page": "2"},
+				QueryParams: map[string][]string{"page": {"2"}},
 				Response: crawl.ObservedResponse{
 					StatusCode: 200,
 					Body:       []byte(`[{"id":2}]`),
@@ -196,7 +196,7 @@ func TestDeduplicate_MergesQueryParams(t *testing.T) {
 			ObservedRequest: crawl.ObservedRequest{
 				Method:      "GET",
 				URL:         "https://example.com/api/users?page=1",
-				QueryParams: map[string]string{"page": "1"},
+				QueryParams: map[string][]string{"page": {"1"}},
 			},
 			IsAPI:      true,
 			Confidence: 0.8,
@@ -205,7 +205,7 @@ func TestDeduplicate_MergesQueryParams(t *testing.T) {
 			ObservedRequest: crawl.ObservedRequest{
 				Method:      "GET",
 				URL:         "https://example.com/api/users?limit=10",
-				QueryParams: map[string]string{"limit": "10"},
+				QueryParams: map[string][]string{"limit": {"10"}},
 			},
 			IsAPI:      true,
 			Confidence: 0.7,
@@ -214,8 +214,83 @@ func TestDeduplicate_MergesQueryParams(t *testing.T) {
 
 	result := Deduplicate(classified)
 	require.Len(t, result, 1)
-	assert.Equal(t, "1", result[0].QueryParams["page"])
-	assert.Equal(t, "10", result[0].QueryParams["limit"])
+	assert.Equal(t, []string{"1"}, result[0].QueryParams["page"])
+	assert.Equal(t, []string{"10"}, result[0].QueryParams["limit"])
+}
+
+func TestDeduplicate_MergesMultiValueQueryParams(t *testing.T) {
+	classified := []ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://example.com/api/items?tag=a&tag=b",
+				QueryParams: map[string][]string{"tag": {"a", "b"}},
+			},
+			IsAPI:      true,
+			Confidence: 0.8,
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://example.com/api/items?tag=b&tag=c",
+				QueryParams: map[string][]string{"tag": {"b", "c"}},
+			},
+			IsAPI:      true,
+			Confidence: 0.8,
+		},
+	}
+
+	result := Deduplicate(classified)
+	require.Len(t, result, 1)
+	// Union with order preservation and dedup: a, b (from first), c (new from second).
+	assert.Equal(t, []string{"a", "b", "c"}, result[0].QueryParams["tag"])
+}
+
+func TestMergeUniqueOrdered(t *testing.T) {
+	tests := []struct {
+		name string
+		a    []string
+		b    []string
+		want []string
+	}{
+		{
+			name: "both nil",
+			a:    nil,
+			b:    nil,
+			want: nil,
+		},
+		{
+			name: "a non-nil b nil",
+			a:    []string{"a"},
+			b:    nil,
+			want: []string{"a"},
+		},
+		{
+			name: "a nil b non-nil",
+			a:    nil,
+			b:    []string{"a", "b"},
+			want: []string{"a", "b"},
+		},
+		{
+			name: "merge with overlap",
+			a:    []string{"a", "b"},
+			b:    []string{"b", "c"},
+			want: []string{"a", "b", "c"},
+		},
+		{
+			name: "b has duplicates already in a",
+			a:    []string{"a"},
+			b:    []string{"a", "a"},
+			want: []string{"a"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := MergeUniqueOrdered(tt.a, tt.b)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 func TestDeduplicate_NoDuplicates(t *testing.T) {

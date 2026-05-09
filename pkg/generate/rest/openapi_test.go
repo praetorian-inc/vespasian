@@ -20,6 +20,8 @@ import (
 	"testing"
 
 	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
@@ -164,9 +166,9 @@ func TestOpenAPIGenerator_RealWorldExample(t *testing.T) {
 			ObservedRequest: crawl.ObservedRequest{
 				Method: "GET",
 				URL:    "https://api.example.com/users?limit=10&offset=0",
-				QueryParams: map[string]string{
-					"limit":  "10",
-					"offset": "0",
+				QueryParams: map[string][]string{
+					"limit":  {"10"},
+					"offset": {"0"},
 				},
 				Response: crawl.ObservedResponse{
 					StatusCode: 200,
@@ -1024,5 +1026,138 @@ func TestOpenAPIGenerator_NonHTTPScheme(t *testing.T) {
 	// HTTPS endpoint should be present
 	if !strings.Contains(specStr, "/valid") {
 		t.Error("HTTPS endpoint should be present")
+	}
+}
+
+// TestBuildOperation_ScalarQueryParam is a regression test: a scalar query param
+// should produce a non-array parameter with no Style or Explode set.
+func TestBuildOperation_ScalarQueryParam(t *testing.T) {
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://api.example.com/items?page=1",
+				QueryParams: map[string][]string{"page": {"1"}},
+				Response:    crawl.ObservedResponse{StatusCode: 200},
+			},
+			IsAPI: true,
+		},
+	}
+	key := endpointKey{path: "/items", method: "get"}
+	op := buildOperation(key, group)
+
+	require.Len(t, op.Parameters, 1)
+	param := op.Parameters[0].Value
+	require.NotNil(t, param)
+	require.NotNil(t, param.Schema)
+	require.NotNil(t, param.Schema.Value)
+	require.NotNil(t, param.Schema.Value.Type)
+
+	assert.Equal(t, "integer", param.Schema.Value.Type.Slice()[0], "type should be integer for scalar")
+	assert.Equal(t, "", param.Style, "scalar param should have no style")
+	assert.Nil(t, param.Explode, "scalar param should have nil Explode")
+	assert.Nil(t, param.Schema.Value.Items, "scalar param should have no items")
+}
+
+// TestBuildOperation_MultiValueQueryParam_AllInts tests that an array param with
+// all-integer values produces type:array with items type:integer and style/explode set.
+func TestBuildOperation_MultiValueQueryParam_AllInts(t *testing.T) {
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://api.example.com/items?ids=1&ids=2&ids=3",
+				QueryParams: map[string][]string{"ids": {"1", "2", "3"}},
+				Response:    crawl.ObservedResponse{StatusCode: 200},
+			},
+			IsAPI: true,
+		},
+	}
+	key := endpointKey{path: "/items", method: "get"}
+	op := buildOperation(key, group)
+
+	require.Len(t, op.Parameters, 1)
+	param := op.Parameters[0].Value
+	require.NotNil(t, param)
+	require.NotNil(t, param.Schema)
+	require.NotNil(t, param.Schema.Value)
+	require.NotNil(t, param.Schema.Value.Type)
+
+	assert.Equal(t, "array", param.Schema.Value.Type.Slice()[0], "type should be array")
+	require.NotNil(t, param.Schema.Value.Items, "items must be set for array param")
+	require.NotNil(t, param.Schema.Value.Items.Value)
+	require.NotNil(t, param.Schema.Value.Items.Value.Type)
+	assert.Equal(t, "integer", param.Schema.Value.Items.Value.Type.Slice()[0], "items type should be integer")
+	assert.Equal(t, "form", param.Style, "style should be form")
+	require.NotNil(t, param.Explode)
+	assert.True(t, *param.Explode, "explode should be true")
+}
+
+// TestBuildOperation_MultiValueQueryParam_Mixed tests that a mixed-type array
+// falls back to items type:string.
+func TestBuildOperation_MultiValueQueryParam_Mixed(t *testing.T) {
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://api.example.com/items?tag=a&tag=1",
+				QueryParams: map[string][]string{"tag": {"a", "1"}},
+				Response:    crawl.ObservedResponse{StatusCode: 200},
+			},
+			IsAPI: true,
+		},
+	}
+	key := endpointKey{path: "/items", method: "get"}
+	op := buildOperation(key, group)
+
+	require.Len(t, op.Parameters, 1)
+	param := op.Parameters[0].Value
+	require.NotNil(t, param.Schema.Value.Items)
+	assert.Equal(t, "string", param.Schema.Value.Items.Value.Type.Slice()[0], "mixed values should produce items type:string")
+}
+
+// TestBuildOperation_MultiValueQueryParam_AllBool tests all-boolean array values.
+func TestBuildOperation_MultiValueQueryParam_AllBool(t *testing.T) {
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://api.example.com/flags?flag=true&flag=false",
+				QueryParams: map[string][]string{"flag": {"true", "false"}},
+				Response:    crawl.ObservedResponse{StatusCode: 200},
+			},
+			IsAPI: true,
+		},
+	}
+	key := endpointKey{path: "/flags", method: "get"}
+	op := buildOperation(key, group)
+
+	require.Len(t, op.Parameters, 1)
+	param := op.Parameters[0].Value
+	require.NotNil(t, param.Schema.Value.Items)
+	assert.Equal(t, "boolean", param.Schema.Value.Items.Value.Type.Slice()[0], "all-bool values should produce items type:boolean")
+}
+
+// TestInferQueryParamItemsType tests the items type inference function directly.
+func TestInferQueryParamItemsType(t *testing.T) {
+	tests := []struct {
+		name   string
+		values []string
+		want   string
+	}{
+		{name: "empty slice", values: []string{}, want: "string"},
+		{name: "all integers", values: []string{"1", "2", "3"}, want: "integer"},
+		{name: "all floats", values: []string{"1.5", "2.5"}, want: "number"},
+		{name: "all booleans", values: []string{"true", "false"}, want: "boolean"},
+		{name: "mixed string and int", values: []string{"a", "1"}, want: "string"},
+		{name: "single string", values: []string{"hello"}, want: "string"},
+		{name: "integer is also float, int wins", values: []string{"1", "2"}, want: "integer"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := inferQueryParamItemsType(tt.values)
+			assert.Equal(t, tt.want, got)
+		})
 	}
 }

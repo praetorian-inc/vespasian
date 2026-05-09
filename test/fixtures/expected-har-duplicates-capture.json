@@ -26,8 +26,8 @@
       "Host": "localhost:8990"
     },
     "query_params": {
-      "category": "electronics",
-      "sort": "price"
+      "category": ["electronics"],
+      "sort": ["price", "name"]
     },
     "response": {
       "status_code": 200,

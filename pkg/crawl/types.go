@@ -16,16 +16,16 @@ package crawl
 
 // ObservedRequest represents a captured HTTP request and its response.
 type ObservedRequest struct {
-	Method      string            `json:"method"`
-	URL         string            `json:"url"`
-	Headers     map[string]string `json:"headers,omitempty"`
-	QueryParams map[string]string `json:"query_params,omitempty"`
-	Body        []byte            `json:"body,omitempty"`
-	Response    ObservedResponse  `json:"response"`
-	Source      string            `json:"source"`
-	Tag         string            `json:"tag,omitempty"`
-	Attribute   string            `json:"attribute,omitempty"`
-	PageURL     string            `json:"page_url,omitempty"`
+	Method      string              `json:"method"`
+	URL         string              `json:"url"`
+	Headers     map[string]string   `json:"headers,omitempty"`
+	QueryParams map[string][]string `json:"query_params,omitempty"`
+	Body        []byte              `json:"body,omitempty"`
+	Response    ObservedResponse    `json:"response"`
+	Source      string              `json:"source"`
+	Tag         string              `json:"tag,omitempty"`
+	Attribute   string              `json:"attribute,omitempty"`
+	PageURL     string              `json:"page_url,omitempty"`
 }
 
 // ObservedResponse represents a captured HTTP response.

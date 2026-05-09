@@ -134,12 +134,7 @@ func formsToObservedRequests(forms []discoveredForm, pageURL string) []ObservedR
 
 			// Parse query params from the action URL.
 			if u, err := url.Parse(f.Action); err == nil {
-				obs.QueryParams = make(map[string]string)
-				for key, values := range u.Query() {
-					if len(values) > 0 {
-						obs.QueryParams[key] = values[0]
-					}
-				}
+				obs.QueryParams = u.Query()
 			}
 		} else {
 			// GET form: merge fields into query params.
@@ -151,12 +146,7 @@ func formsToObservedRequests(forms []discoveredForm, pageURL string) []ObservedR
 				u.RawQuery = q.Encode()
 				obs.URL = u.String()
 
-				obs.QueryParams = make(map[string]string)
-				for key, values := range u.Query() {
-					if len(values) > 0 {
-						obs.QueryParams[key] = values[0]
-					}
-				}
+				obs.QueryParams = u.Query()
 			}
 		}
 

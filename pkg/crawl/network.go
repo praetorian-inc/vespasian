@@ -174,12 +174,7 @@ func mapNetworkToObservedRequest(req *pendingRequest, pageURL string) ObservedRe
 	// Parse query parameters from URL.
 	if obs.URL != "" {
 		if u, err := url.Parse(obs.URL); err == nil {
-			obs.QueryParams = make(map[string]string)
-			for key, values := range u.Query() {
-				if len(values) > 0 {
-					obs.QueryParams[key] = values[0]
-				}
-			}
+			obs.QueryParams = u.Query()
 		}
 	}
 

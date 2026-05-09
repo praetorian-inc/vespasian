@@ -77,7 +77,8 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 
 // Deduplicate removes duplicate classified requests, keeping the highest confidence.
 // The deduplication key is METHOD:path (query params and fragments stripped).
-// QueryParams from all duplicate observations are merged.
+// Multi-value QueryParams from duplicate observations are merged with union-of-values,
+// preserving first-seen order.
 //
 // Memory usage: The map and order slice grow linearly with unique METHOD:path keys.
 // In practice this is bounded by the upstream crawl layer's MaxPages setting
@@ -119,15 +120,13 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
 			order = append(order, key)
 			seen[key] = &entry{req: req}
 		} else {
-			// Merge unique QueryParams.
+			// Merge multi-value QueryParams: union per key, preserving first-seen order.
 			if req.QueryParams != nil {
 				if existing.req.QueryParams == nil {
-					existing.req.QueryParams = make(map[string]string)
+					existing.req.QueryParams = make(map[string][]string)
 				}
-				for k, v := range req.QueryParams {
-					if _, exists := existing.req.QueryParams[k]; !exists {
-						existing.req.QueryParams[k] = v
-					}
+				for k, vs := range req.QueryParams {
+					existing.req.QueryParams[k] = MergeUniqueOrdered(existing.req.QueryParams[k], vs)
 				}
 			}
 
@@ -145,6 +144,26 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
 		results = append(results, seen[key].req)
 	}
 	return results
+}
+
+// MergeUniqueOrdered appends values from b to a, skipping any value already
+// present in a. Preserves first-seen order. Returns the merged slice.
+func MergeUniqueOrdered(a, b []string) []string {
+	if len(b) == 0 {
+		return a
+	}
+	seen := make(map[string]struct{}, len(a))
+	for _, v := range a {
+		seen[v] = struct{}{}
+	}
+	for _, v := range b {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		a = append(a, v)
+		seen[v] = struct{}{}
+	}
+	return a
 }
 
 // getSoapAction returns the SOAPAction header value, performing a case-insensitive lookup.

@@ -31,8 +31,8 @@ func TestWriteCapture(t *testing.T) {
 				Headers: map[string]string{
 					"User-Agent": "Mozilla/5.0",
 				},
-				QueryParams: map[string]string{
-					"page": "1",
+				QueryParams: map[string][]string{
+					"page": {"1"},
 				},
 				Body: []byte("request body"),
 				Response: ObservedResponse{
@@ -133,7 +133,7 @@ func TestReadCapture(t *testing.T) {
       "User-Agent": "Mozilla/5.0"
     },
     "query_params": {
-      "page": "1"
+      "page": ["1"]
     },
     "body": "cmVxdWVzdCBib2R5",
     "response": {
@@ -287,9 +287,9 @@ func TestWriteReadRoundTrip(t *testing.T) {
 					"User-Agent":   "TestAgent/1.0",
 					"Content-Type": "application/json",
 				},
-				QueryParams: map[string]string{
-					"id":    "123",
-					"debug": "true",
+				QueryParams: map[string][]string{
+					"id":    {"123"},
+					"debug": {"true"},
 				},
 				Body: []byte("test request body"),
 				Response: ObservedResponse{

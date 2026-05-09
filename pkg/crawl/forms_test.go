@@ -87,11 +87,11 @@ func TestFormsToObservedRequests_GetForm(t *testing.T) {
 		t.Errorf("Method = %q, want GET", r.Method)
 	}
 	// GET forms should merge fields into query params.
-	if r.QueryParams["q"] != "test" {
-		t.Errorf("QueryParams[q] = %q, want %q", r.QueryParams["q"], "test")
+	if len(r.QueryParams["q"]) == 0 || r.QueryParams["q"][0] != "test" {
+		t.Errorf("QueryParams[q] = %v, want [test]", r.QueryParams["q"])
 	}
-	if r.QueryParams["page"] != "1" {
-		t.Errorf("QueryParams[page] = %q, want %q", r.QueryParams["page"], "1")
+	if len(r.QueryParams["page"]) == 0 || r.QueryParams["page"][0] != "1" {
+		t.Errorf("QueryParams[page] = %v, want [1]", r.QueryParams["page"])
 	}
 	// Body should be empty for GET.
 	if len(r.Body) > 0 {
