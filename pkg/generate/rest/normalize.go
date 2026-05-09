@@ -44,12 +44,19 @@ var (
 	objectIDRegex = regexp.MustCompile(`^[0-9a-fA-F]{24}$`)
 	// shortHexRegex matches short hex hashes: 6-12 hex characters.
 	// Pure-numeric strings are excluded by the caller so they classify as kindNumeric instead.
+	// The caller (isShortHexHash) additionally requires at least one digit or
+	// uppercase letter to avoid matching pure-lowercase English words that
+	// happen to consist of [a-f] characters (e.g., "facade", "decade").
 	shortHexRegex = regexp.MustCompile(`^[0-9a-fA-F]{6,12}$`)
 	// base64Regex matches base64 / base64url tokens that are at least 16
 	// characters long. The base64 character set is constrained to URL-safe
 	// characters; standard base64 may also include `+` and `/`, both of which
 	// are valid in path segments after percent-decoding.
 	base64Regex = regexp.MustCompile(`^[A-Za-z0-9_\-+/]{16,}={0,2}$`)
+	// versionPrefixRegex matches "v" followed by one or more digits — the
+	// conventional API version segment (v1, v2, v123). Used by isPathPrefix
+	// to skip these segments when looking for resource-type context.
+	versionPrefixRegex = regexp.MustCompile(`^v[0-9]+$`)
 )
 
 // knownLiterals are exact path segment values that must be preserved as
@@ -63,6 +70,47 @@ var knownLiterals = map[string]struct{}{
 	"new":     {},
 	"list":    {},
 	"search":  {},
+}
+
+// pathPrefixes are scaffold segments that wrap an API surface but do not
+// themselves identify a resource. When an observed path looks like
+// `/api/users` or `/v1/posts`, the leading scaffold should not count as the
+// "resource type" preceding a parameter — otherwise observation-based
+// detection would conflate distinct resource types (`users`, `posts`) into a
+// single varying parameter.
+var pathPrefixes = map[string]struct{}{
+	"api":  {},
+	"apis": {},
+	"rest": {},
+}
+
+// isPathPrefix reports whether a literal segment is a known API scaffold
+// (api / rest / version segments like v1, v2). isObservationCandidate uses
+// this to skip paths whose only preceding literal context is a scaffold —
+// the segment immediately following such a scaffold is the resource type
+// and must not be parameterized.
+func isPathPrefix(segment string) bool {
+	if _, ok := pathPrefixes[segment]; ok {
+		return true
+	}
+	return versionPrefixRegex.MatchString(segment)
+}
+
+// isShortHexHash reports whether a segment looks like a short hex hash
+// (e.g., a git short-SHA `a1b2c3d4`). It requires the regex match plus at
+// least one digit or uppercase A-F so that pure-lowercase English words
+// composed of [a-f] characters (e.g., "facade", "decade", "beaded") are
+// not misclassified as hashes.
+func isShortHexHash(segment string) bool {
+	if !shortHexRegex.MatchString(segment) {
+		return false
+	}
+	for _, r := range segment {
+		if (r >= '0' && r <= '9') || (r >= 'A' && r <= 'F') {
+			return true
+		}
+	}
+	return false
 }
 
 // classifyParamSegment determines whether a path segment is a dynamic-parameter
@@ -84,9 +132,7 @@ func classifyParamSegment(segment string) paramKind {
 		return kindObjectID
 	case numericRegex.MatchString(segment):
 		return kindNumeric
-	case shortHexRegex.MatchString(segment):
-		// numericRegex was checked first, so an all-digit segment cannot reach
-		// here. The remaining hex strings are short hashes.
+	case isShortHexHash(segment):
 		return kindShortHex
 	case isBase64Token(segment):
 		return kindBase64
@@ -175,22 +221,40 @@ type posKey struct {
 	length int
 }
 
-// NormalizePathsWithNames runs NormalizePathWithNames on each input path and
-// then performs observation-based detection: any path position whose value
-// varies across paths sharing the same prefix and suffix shape is promoted
-// to a slug-style parameter.
+// NormalizePathsWithNames classifies each input path's segments by regex /
+// literal kind, then performs observation-based detection: a position whose
+// literal segment value varies across paths sharing the same prefix and
+// suffix shape (and same path length) is promoted to a slug-style
+// parameter. Promotion runs to a fixed point — promoting one position can
+// change the shape of a sibling position, exposing additional varying
+// buckets — so the function iterates until no further promotions occur.
 //
 // Returns a map keyed by the original input path. When the same path appears
 // multiple times the map collapses to a single normalized entry, which is
 // the desired behavior for grouping observed endpoints.
+//
+// Limitation: detection requires at least two literal observations sharing
+// both prefix and suffix shape. Pure-diagonal observations such as
+// `[/repos/alice/proj1, /repos/bob/proj2, /repos/carol/proj3]` — where every
+// (owner, project) pair is unique — cannot be promoted, because each
+// position's bucket is a singleton. Add overlapping observations (e.g.,
+// `/repos/alice/proj1` together with `/repos/alice/proj2` and
+// `/repos/bob/proj1`) to anchor the inference.
 func NormalizePathsWithNames(paths []string) map[string]string {
 	if len(paths) == 0 {
 		return map[string]string{}
 	}
 
 	infos := classifyPaths(paths)
-	varyingPositions := findVaryingPositions(infos)
-	promoteVaryingPositions(infos, varyingPositions)
+	for {
+		varying := findVaryingPositions(infos)
+		if len(varying) == 0 {
+			break
+		}
+		if !promoteVaryingPositions(infos, varying) {
+			break
+		}
+	}
 	return renderNormalizedPaths(paths, infos)
 }
 
@@ -238,23 +302,34 @@ func findVaryingPositions(infos []pathInfo) map[posKey]struct{} {
 }
 
 // promoteVaryingPositions rewrites the kind of each segment that lies in a
-// varying position bucket from kindLiteral to kindSlug.
-func promoteVaryingPositions(infos []pathInfo, varying map[posKey]struct{}) {
+// varying position bucket from kindLiteral to kindSlug. Returns true when at
+// least one segment was promoted, so callers can break out of fixed-point
+// iteration loops without performing redundant work.
+//
+// We iterate by index and mutate kinds in place. The kinds slice is shared
+// with the caller's pathInfo by virtue of Go's slice header — there is no
+// struct copy/write-back step.
+func promoteVaryingPositions(infos []pathInfo, varying map[posKey]struct{}) bool {
 	if len(varying) == 0 {
-		return
+		return false
 	}
+	promoted := false
 	for idx := range infos {
-		info := infos[idx]
+		info := &infos[idx]
 		for i, seg := range info.segments {
-			if !isObservationCandidate(info, i, seg) {
+			if !isObservationCandidate(*info, i, seg) {
 				continue
 			}
-			if _, ok := varying[positionKey(info, i)]; ok {
+			if _, ok := varying[positionKey(*info, i)]; !ok {
+				continue
+			}
+			if info.kinds[i] != kindSlug {
 				info.kinds[i] = kindSlug
+				promoted = true
 			}
 		}
-		infos[idx] = info
 	}
+	return promoted
 }
 
 // renderNormalizedPaths produces the final map of input paths to normalized
@@ -298,17 +373,24 @@ func positionKey(info pathInfo, i int) posKey {
 }
 
 // hasLiteralContext reports whether a path slice contains at least one
-// non-empty literal segment. Observation-based detection requires this so
-// that the very first resource segment of a path (which is the resource
-// type, not a parameter) cannot be promoted to a parameter.
+// non-empty literal segment that is NOT a known API scaffold (`api`, `rest`,
+// or a `v\d+` version marker). Observation-based detection requires this so
+// that the very first resource segment of a path — including paths that
+// start with a scaffold like `/api/users` or `/v1/users` — cannot be
+// promoted to a parameter. The scaffold by itself is not enough context to
+// identify the next segment as a parameter rather than a resource type.
 func hasLiteralContext(segments []string, kinds []paramKind) bool {
 	for i, s := range segments {
 		if s == "" {
 			continue
 		}
-		if kinds[i] == kindLiteral {
-			return true
+		if kinds[i] != kindLiteral {
+			continue
 		}
+		if isPathPrefix(s) {
+			continue
+		}
+		return true
 	}
 	return false
 }
@@ -404,6 +486,9 @@ func paramNameFromKind(prevSegment string, kind paramKind) string {
 	return sanitizeParamName(singular + suffix)
 }
 
+// suffixForKind returns the parameter name suffix associated with a paramKind:
+// "Token" for base64 tokens, "Slug" for observation-promoted slugs, "Id" for
+// every other identifier-shaped kind (UUID, ObjectID, numeric, short hex).
 func suffixForKind(kind paramKind) string {
 	switch kind {
 	case kindBase64:

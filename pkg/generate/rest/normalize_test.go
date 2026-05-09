@@ -312,6 +312,34 @@ func TestNormalizePathWithNames_NewKinds(t *testing.T) {
 	}
 }
 
+func TestNormalizePathWithNames_NoFalsePositiveOnHexWords(t *testing.T) {
+	// Pure-lowercase English words composed entirely of [a-f] characters
+	// have the right length to match the short-hex regex but are not
+	// hashes. classifyParamSegment must reject them (isShortHexHash
+	// requires at least one digit or uppercase letter).
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"facade is six lowercase hex chars", "/commits/facade"},
+		{"decade is six lowercase hex chars", "/users/decade"},
+		{"defaced is seven lowercase hex chars", "/items/defaced"},
+		{"beaded is six lowercase hex chars", "/state/beaded"},
+		{"deface is six lowercase hex chars", "/actions/deface"},
+		{"accede is six lowercase hex chars", "/votes/accede"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := NormalizePathWithNames(c.path); got != c.path {
+				t.Errorf("NormalizePathWithNames(%q) = %q, want unchanged literal", c.path, got)
+			}
+			if got := NormalizePath(c.path); got != c.path {
+				t.Errorf("NormalizePath(%q) = %q, want unchanged literal", c.path, got)
+			}
+		})
+	}
+}
+
 func TestNormalizePathWithNames_NoFalsePositiveOnDictionaryWords(t *testing.T) {
 	// Dictionary words and slugs must not be parameterized by the single-path
 	// pass — only the observation-based pass may promote them to parameters.
@@ -477,6 +505,84 @@ func TestNormalizePathsWithNames_RootResourceNeverPromoted(t *testing.T) {
 	for _, p := range paths {
 		if got[p] != p {
 			t.Errorf("root resource %q was promoted: got %q", p, got[p])
+		}
+	}
+}
+
+func TestNormalizePathsWithNames_ResourceTypeBehindPathPrefixNeverPromoted(t *testing.T) {
+	// /api/<resource> and /v1/<resource> are common API shapes. The first
+	// resource segment after a known scaffold (api, rest, v1, v2, ...) must
+	// not be promoted to a slug parameter, because the only preceding
+	// "literal context" is the scaffold itself — which is not a resource.
+	groups := [][]string{
+		{"/api/users", "/api/posts", "/api/articles"},
+		{"/v1/users", "/v1/posts", "/v1/articles"},
+		{"/v2/products", "/v2/orders", "/v2/customers"},
+		{"/api/v1/users", "/api/v1/posts", "/api/v1/articles"},
+		{"/rest/users", "/rest/posts"},
+	}
+	for _, paths := range groups {
+		got := NormalizePathsWithNames(paths)
+		for _, p := range paths {
+			if got[p] != p {
+				t.Errorf("scaffold-prefixed resource %q was promoted: got %q", p, got[p])
+			}
+		}
+	}
+}
+
+func TestNormalizePathsWithNames_PromotesAfterPathPrefix(t *testing.T) {
+	// The segment AFTER the resource type — even when a scaffold prefix is
+	// present — should still be promoted when it varies. /api/users/<id> is
+	// a parameter; the bug fix for scaffold protection must not over-correct.
+	paths := []string{
+		"/api/users/alice",
+		"/api/users/bob",
+		"/api/users/carol",
+	}
+	got := NormalizePathsWithNames(paths)
+	for _, p := range paths {
+		if got[p] != "/api/users/{userSlug}" {
+			t.Errorf("path %q normalized to %q, want /api/users/{userSlug}", p, got[p])
+		}
+	}
+}
+
+func TestNormalizePathsWithNames_MultiVaryingPositionsWithOverlap(t *testing.T) {
+	// When observations overlap (the same owner appears with multiple repos
+	// AND the same repo name appears with multiple owners), strict
+	// prefix+suffix bucketing has anchors at both positions and the
+	// fixed-point iteration promotes both.
+	paths := []string{
+		"/repos/alice/proj1",
+		"/repos/alice/proj2",
+		"/repos/bob/proj1",
+		"/repos/bob/proj2",
+	}
+	got := NormalizePathsWithNames(paths)
+	for _, p := range paths {
+		want := "/repos/{repoSlug}/{repoSlug2}"
+		if got[p] != want {
+			t.Errorf("path %q normalized to %q, want %q", p, got[p], want)
+		}
+	}
+}
+
+func TestNormalizePathsWithNames_DiagonalObservationsLimitation(t *testing.T) {
+	// Pure-diagonal observations — every (owner, repo) pair unique, no
+	// overlapping prefix/suffix — cannot be promoted by strict bucketing.
+	// Each position's bucket is a singleton, so no variation is observable.
+	// This test documents the current behavior; users with this shape need
+	// to wait for additional observations to anchor the inference.
+	paths := []string{
+		"/repos/alice/proj1",
+		"/repos/bob/proj2",
+		"/repos/carol/proj3",
+	}
+	got := NormalizePathsWithNames(paths)
+	for _, p := range paths {
+		if got[p] != p {
+			t.Errorf("diagonal-only observation %q unexpectedly promoted to %q (algorithm limitation expected)", p, got[p])
 		}
 	}
 }
