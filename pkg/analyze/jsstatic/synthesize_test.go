@@ -142,7 +142,7 @@ func TestToRequests_PageURLPropagated(t *testing.T) {
 	}
 }
 
-// F6: relative endpoints should resolve against PageURL when available.
+// relative endpoints should resolve against PageURL when available.
 func TestToRequests_RelativeEndpoint_ResolvedAgainstPageURL(t *testing.T) {
 	// Bundle at /static/js/app.js, PageURL at /dashboard.
 	// endpoint "api/users" is relative to the page, not the bundle.
@@ -166,25 +166,31 @@ func TestToRequests_RelativeEndpoint_ResolvedAgainstPageURL(t *testing.T) {
 	}
 }
 
-// F6b: when PageURL is empty, fallback to captureURL (existing behavior preserved).
+// When PageURL is empty, fallback to captureURL (the bundle URL). This test
+// uses a non-root bundle path so the bundle-base resolution yields a URL that
+// is distinguishable from a hypothetical page-base resolution. If a future
+// change accidentally swapped the precedence, this test would fail.
 func TestToRequests_RelativeEndpoint_FallsBackToCaptureURL(t *testing.T) {
 	endpoints := []ExtractedEndpoint{
 		{
 			Method:       "GET",
 			URL:          "api/users",
-			PageURL:      "", // empty
+			PageURL:      "", // empty → must fall back to captureURL
 			SourceTag:    SourceJS,
-			OriginBundle: "https://h/app.js",
+			OriginBundle: "https://h/static/js/app.js",
 		},
 	}
-	reqs := toRequests(endpoints, "https://h/app.js")
+	reqs := toRequests(endpoints, "https://h/static/js/app.js")
 	if len(reqs) != 1 {
 		t.Fatalf("expected 1 request, got %d", len(reqs))
 	}
-	// Resolves against bundle URL: https://h/api/users
-	want := "https://h/api/users"
+	// captureURL is the bundle URL "https://h/static/js/app.js"; relative
+	// resolution against that base yields "https://h/static/js/api/users".
+	// (Page-base would have yielded "https://h/api/users", which is rejected
+	// by this assertion if precedence is wrong.)
+	want := "https://h/static/js/api/users"
 	if reqs[0].URL != want {
-		t.Errorf("expected URL=%s (fallback to captureURL), got %s", want, reqs[0].URL)
+		t.Errorf("expected URL=%s (bundle-base fallback), got %s", want, reqs[0].URL)
 	}
 }
 

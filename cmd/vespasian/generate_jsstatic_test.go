@@ -26,15 +26,13 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
-// TestGenerateCmd_Run_WithAnalyzeJS exercises the (*GenerateCmd).Run() path
-// when AnalyzeJS=true. It writes a fixture capture.json containing one JS-bundle
-// ObservedRequest with a fetch("/api/discovered") call, runs Run(), and asserts
-// the generated OpenAPI YAML contains /api/discovered as a path.
-func TestGenerateCmd_Run_WithAnalyzeJS(t *testing.T) {
-	dir := t.TempDir()
-
+// TestGenerateCmd_Run_AnalyzeJS_OnAndOff exercises the (*GenerateCmd).Run()
+// path with AnalyzeJS toggled on and off using the same JS-bundle fixture, so
+// the test pins the differential behavior: with --analyze-js the
+// JS-discovered endpoint MUST appear; with --analyze-js=false it MUST NOT.
+func TestGenerateCmd_Run_AnalyzeJS_OnAndOff(t *testing.T) {
 	// Build a capture fixture with one JS bundle that has a unique endpoint.
-	// Use a POST fetch so the REST classifier assigns HTTPMethodConfidence=0.7 (> 0.5 threshold).
+	// Use a POST fetch so the REST classifier assigns HTTPMethodConfidence=0.7.
 	capture := []crawl.ObservedRequest{
 		{
 			Method: "GET",
@@ -51,34 +49,50 @@ func TestGenerateCmd_Run_WithAnalyzeJS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal capture: %v", err)
 	}
-	captureFile := filepath.Join(dir, "capture.json")
-	if err := os.WriteFile(captureFile, captureData, 0o600); err != nil {
-		t.Fatalf("write capture: %v", err)
+
+	cases := []struct {
+		name      string
+		analyzeJS bool
+		want      bool // whether /api/discovered should appear in the output
+	}{
+		{name: "on", analyzeJS: true, want: true},
+		{name: "off", analyzeJS: false, want: false},
 	}
 
-	outputFile := filepath.Join(dir, "out.yaml")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			captureFile := filepath.Join(dir, "capture.json")
+			if err := os.WriteFile(captureFile, captureData, 0o600); err != nil {
+				t.Fatalf("write capture: %v", err)
+			}
+			outputFile := filepath.Join(dir, "out.yaml")
 
-	cmd := &GenerateCmd{
-		APIType:         "rest",
-		Capture:         captureFile,
-		Output:          outputFile,
-		Confidence:      0.5,
-		Probe:           false, // no probing — offline test
-		Deduplicate:     true,
-		AnalyzeJS:       true,
-		FetchSourcemaps: false,
-	}
+			cmd := &GenerateCmd{
+				APIType:         "rest",
+				Capture:         captureFile,
+				Output:          outputFile,
+				Confidence:      0.5,
+				Probe:           false, // no probing — offline test
+				Deduplicate:     true,
+				AnalyzeJS:       tc.analyzeJS,
+				FetchSourcemaps: false,
+			}
 
-	if runErr := cmd.Run(); runErr != nil {
-		t.Fatalf("Run() failed: %v", runErr)
-	}
+			if runErr := cmd.Run(); runErr != nil {
+				t.Fatalf("Run() failed: %v", runErr)
+			}
 
-	outData, err := os.ReadFile(outputFile) //nolint:gosec // outputFile is constructed from t.TempDir() within this test
-	if err != nil {
-		t.Fatalf("read output: %v", err)
-	}
-	if !strings.Contains(string(outData), "/api/discovered") {
-		t.Errorf("expected /api/discovered in output YAML, got:\n%s", string(outData))
+			outData, err := os.ReadFile(outputFile) //nolint:gosec // outputFile is from t.TempDir()
+			if err != nil {
+				t.Fatalf("read output: %v", err)
+			}
+			has := strings.Contains(string(outData), "/api/discovered")
+			if has != tc.want {
+				t.Errorf("AnalyzeJS=%v: /api/discovered present=%v, want=%v\nOutput:\n%s",
+					tc.analyzeJS, has, tc.want, string(outData))
+			}
+		})
 	}
 }
 

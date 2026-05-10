@@ -149,6 +149,12 @@ func decodeDataURISourcemap(mappingURL string) ([]string, Stats) {
 // resolveRelativeMapURL resolves a possibly-relative mapping URL against the
 // bundle URL so that "app.js.map" becomes "https://h/static/js/app.js.map"
 // before the same-host check (which requires a non-empty Host component).
+//
+// On parse failure, returns mappingURL unchanged. This is safe because the
+// caller (recoverSourcemap) immediately runs the result through sameHost,
+// which rejects URLs with empty Hostname/Scheme — a parse-failed value will
+// not pass that gate. This preserves the "fail closed" property without
+// needing a separate error channel.
 func resolveRelativeMapURL(bundleURL, mappingURL string) string {
 	if bundleURL == "" {
 		return mappingURL
@@ -165,9 +171,11 @@ func resolveRelativeMapURL(bundleURL, mappingURL string) string {
 }
 
 // sameHost returns true when both rawA and rawB are valid URLs sharing the
-// same hostname AND scheme. Hostname() is used so that example.com:443 and
-// example.com compare equal; a.Host == b.Host would fail for default ports.
-// Cross-scheme (http vs https) is also rejected to prevent mixed-content fetches.
+// same hostname, scheme, AND effective port. Default ports are normalised
+// (http -> 80, https -> 443) so https://example.com and https://example.com:443
+// compare equal, but https://example.com:8443 and https://example.com:443 do
+// NOT — a non-default-port bundle must match a non-default-port sourcemap.
+// Cross-scheme (http vs https) is rejected to prevent mixed-content fetches.
 func sameHost(rawA, rawB string) bool {
 	if rawA == "" || rawB == "" {
 		return false
@@ -180,7 +188,25 @@ func sameHost(rawA, rawB string) bool {
 	if err != nil || b.Hostname() == "" || b.Scheme == "" {
 		return false
 	}
-	return a.Hostname() == b.Hostname() && a.Scheme == b.Scheme
+	if a.Hostname() != b.Hostname() || a.Scheme != b.Scheme {
+		return false
+	}
+	return effectivePort(a) == effectivePort(b)
+}
+
+// effectivePort returns the port for u, falling back to the scheme's default
+// (80 for http, 443 for https) when no explicit port is set.
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch u.Scheme {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	}
+	return ""
 }
 
 // noFollowRedirects is a CheckRedirect function that prevents the HTTP client

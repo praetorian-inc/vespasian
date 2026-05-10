@@ -31,7 +31,7 @@ func findEndpoint(endpoints []ExtractedEndpoint, wantURL string) *ExtractedEndpo
 
 func TestExtractFromBundle_Fetch(t *testing.T) {
 	src := []byte(`fetch("/api/users")`)
-	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js", Options{})
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -46,7 +46,7 @@ func TestExtractFromBundle_Fetch(t *testing.T) {
 
 func TestExtractFromBundle_FetchPostMethod(t *testing.T) {
 	src := []byte(`fetch("/api/x", {method: "POST"})`)
-	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js", Options{})
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -60,9 +60,9 @@ func TestExtractFromBundle_FetchPostMethod(t *testing.T) {
 }
 
 func TestExtractFromBundle_FetchPostJSONStringify(t *testing.T) {
-	// Task 5 tightened: BodyFields should contain the JSON.stringify object keys.
+	// BodyFields should contain the JSON.stringify object keys.
 	src := []byte(`fetch("/api/x", {method:"POST", body: JSON.stringify({name, email})})`)
-	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js", Options{})
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -80,9 +80,9 @@ func TestExtractFromBundle_FetchPostJSONStringify(t *testing.T) {
 }
 
 func TestExtractFromBundle_FetchTemplateLiteralPathParam(t *testing.T) {
-	// Task 4 tightened: token recovery enabled, should use identifier name.
+	// Token recovery enabled — the path parameter should use the identifier name.
 	src := []byte("fetch(`/api/users/${userId}`)")
-	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js", Options{})
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestExtractFromBundle_FiltersAssetURLs(t *testing.T) {
 		`fetch("/favicon.ico")`,
 	}
 	for _, src := range assets {
-		endpoints, err := ExtractFromBundle([]byte(src), "", Options{})
+		endpoints, err := ExtractFromBundle([]byte(src), "")
 		if err != nil {
 			t.Fatalf("unexpected error for %q: %v", src, err)
 		}
@@ -123,7 +123,7 @@ func TestExtractFromBundle_FiltersDataAndJsSchemes(t *testing.T) {
 		`fetch("chrome-extension://abc/page.html")`,
 	}
 	for _, src := range schemes {
-		endpoints, err := ExtractFromBundle([]byte(src), "", Options{})
+		endpoints, err := ExtractFromBundle([]byte(src), "")
 		if err != nil {
 			t.Fatalf("unexpected error for %q: %v", src, err)
 		}
@@ -136,7 +136,7 @@ func TestExtractFromBundle_FiltersDataAndJsSchemes(t *testing.T) {
 func TestExtractFromBundle_FiltersExprOnlyURLs(t *testing.T) {
 	// A URL that is purely EXPR should be dropped.
 	src := []byte("fetch(someVar)")
-	endpoints, err := ExtractFromBundle(src, "", Options{})
+	endpoints, err := ExtractFromBundle(src, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestExtractFromBundle_FiltersExprOnlyURLs(t *testing.T) {
 
 func TestExtractFromBundle_AxiosGet(t *testing.T) {
 	src := []byte(`axios.get("/api/items")`)
-	endpoints, err := ExtractFromBundle(src, "", Options{})
+	endpoints, err := ExtractFromBundle(src, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestExtractFromBundle_AxiosGet(t *testing.T) {
 
 func TestExtractFromBundle_AxiosPost(t *testing.T) {
 	src := []byte(`axios.post("/api/x", {a, b})`)
-	endpoints, err := ExtractFromBundle(src, "", Options{})
+	endpoints, err := ExtractFromBundle(src, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestExtractFromBundle_AxiosPost(t *testing.T) {
 
 func TestExtractFromBundle_AxiosConfigObject(t *testing.T) {
 	src := []byte(`axios({url:"/api/x", method:"PUT", data:{x, y}})`)
-	endpoints, err := ExtractFromBundle(src, "", Options{})
+	endpoints, err := ExtractFromBundle(src, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestExtractFromBundle_AxiosConfigObject(t *testing.T) {
 
 func TestExtractFromBundle_AxiosShorthandPropertyKeys(t *testing.T) {
 	src := []byte(`axios.post("/x", {name})`)
-	endpoints, err := ExtractFromBundle(src, "", Options{})
+	endpoints, err := ExtractFromBundle(src, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -216,7 +216,7 @@ func TestExtractFromBundle_AxiosShorthandPropertyKeys(t *testing.T) {
 
 func TestExtractFromBundle_AxiosUnknownMethodIgnored(t *testing.T) {
 	src := []byte(`axios.unknown("/x")`)
-	endpoints, err := ExtractFromBundle(src, "", Options{})
+	endpoints, err := ExtractFromBundle(src, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestExtractFromBundle_AxiosUnknownMethodIgnored(t *testing.T) {
 
 func TestExtractFromBundle_FetchPlainBodyStringIgnored(t *testing.T) {
 	src := []byte(`fetch("/x", {body:"raw"})`)
-	endpoints, err := ExtractFromBundle(src, "", Options{})
+	endpoints, err := ExtractFromBundle(src, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestExtractFromBundle_FetchPlainBodyStringIgnored(t *testing.T) {
 func TestExtractFromBundle_TemplateLiteralUnnamed(t *testing.T) {
 	// Call expression inside template substitution -> not a recoverable name.
 	src := []byte("fetch(`/api/${a()}/x`)")
-	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js", Options{})
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestExtractFromBundle_TemplateLiteralUnnamed(t *testing.T) {
 func TestExtractFromBundle_TemplateLiteralMember(t *testing.T) {
 	// member_expression: user.id -> rightmost name is 'id'.
 	src := []byte("fetch(`/u/${user.id}`)")
-	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js", Options{})
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -266,10 +266,10 @@ func TestExtractFromBundle_TemplateLiteralMember(t *testing.T) {
 	}
 }
 
-// F8: fetch with template-literal URL + body must produce body fields.
+// fetch with template-literal URL + body must produce body fields.
 func TestExtractFromBundle_FetchTemplateLiteralWithBody(t *testing.T) {
 	src := []byte("fetch(`/users/${id}`, {method:\"POST\", body: JSON.stringify({name, email})})")
-	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js", Options{})
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -285,10 +285,10 @@ func TestExtractFromBundle_FetchTemplateLiteralWithBody(t *testing.T) {
 	}
 }
 
-// F7: axios.get with template-literal URL must yield endpoint.
+// axios.get with template-literal URL must yield endpoint.
 func TestExtractFromBundle_AxiosTemplateLiteral(t *testing.T) {
 	src := []byte("axios.get(`/users/${id}`)")
-	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js", Options{})
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -301,10 +301,10 @@ func TestExtractFromBundle_AxiosTemplateLiteral(t *testing.T) {
 	}
 }
 
-// F4: collectObjectKeys must strip surrounding quotes from string-literal keys.
+// collectObjectKeys must strip surrounding quotes from string-literal keys.
 func TestCollectObjectKeys_StringLiteralKeys(t *testing.T) {
 	src := []byte(`fetch("/x", {method:"POST", body: JSON.stringify({"first-name": 1, "last-name": 2})})`)
-	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js", Options{})
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -321,32 +321,37 @@ func TestCollectObjectKeys_StringLiteralKeys(t *testing.T) {
 	}
 }
 
-// F2: collapseTemplateLiteral must handle nested braces.
+// collapseTemplateLiteral must handle nested braces. The nested object
+// `{user:1}` inside the call expression `getId({user:1})` would corrupt the
+// URL into `/api/EXPR)}` if the implementation used a naive first-`}` scan.
+// We assert the EXACT recovered URL and fail hard on any brace artifact.
 func TestCollapseTemplateLiteral_NestedBraces(t *testing.T) {
-	// fetch(`/api/${getId({user:1})}`) — nested object inside substitution.
 	src := []byte("fetch(`/api/${getId({user:1})}`)")
-	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js", Options{})
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// Should yield /api/{param} (or /api/EXPR normalised), NOT /api/EXPR)}
-	ep := findEndpoint(endpoints, "/api/{param}")
+	// The substitution is a call_expression `getId({user:1})`. Token-recovery
+	// only picks up identifier and member_expression substitutions (where the
+	// recovered name is a meaningful runtime value); call expressions yield an
+	// unnamed parameter, so NormalizeEXPRPath falls back to the {param} default.
+	const want = "/api/{param}"
+	ep := findEndpoint(endpoints, want)
 	if ep == nil {
-		// Also accept /api/{getId} if identifier is recovered.
-		ep = findEndpoint(endpoints, "/api/{getId}")
-		if ep == nil {
-			// Print what we got to help diagnose.
-			t.Fatalf("expected endpoint /api/{param} or similar, got: %v", endpoints)
-		}
+		t.Fatalf("expected endpoint %q, got: %v", want, endpoints)
 	}
-	// Ensure no artifact like ")}".
-	if ep != nil && (strings.Contains(ep.URL, ")") || strings.Contains(ep.URL, "}})")) {
-		t.Errorf("endpoint URL contains brace artifact: %q", ep.URL)
+	// Hard check: no corruption artifacts. The legitimate {param} placeholder
+	// contains `{` and `}`, but a naive first-`}` scan would leave fragments
+	// like `EXPR)}`, `})}`, `:1})}` inside the URL.
+	for _, frag := range []string{")", "EXPR", "${", "})}", ":1}"} {
+		if strings.Contains(ep.URL, frag) {
+			t.Fatalf("endpoint URL %q still contains template artifact %q", ep.URL, frag)
+		}
 	}
 }
 
 func TestExtractFromBundle_EmptyInput(t *testing.T) {
-	endpoints, err := ExtractFromBundle(nil, "", Options{})
+	endpoints, err := ExtractFromBundle(nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

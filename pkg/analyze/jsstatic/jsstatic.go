@@ -109,12 +109,13 @@ type Result struct {
 // Stats counts what the analyser saw and emitted. Useful for verbose output
 // and for tests.
 type Stats struct {
-	BundlesAnalyzed     int // JS bodies passed to jsluice (post-filter, post-size-cap).
-	BundlesSkipped      int // JS bodies skipped (oversized, empty, parse timeout).
-	SourcemapsRecovered int // .js.map sources successfully decoded via sourcesContent.
-	SourcemapFetchFails int // sourceMappingURL comments seen but fetch failed.
-	EndpointsFound      int // raw extractedEndpoint count, pre-filter.
-	EndpointsKept       int // endpoints that survived filtering and made it into Requests.
+	BundlesAnalyzed         int // JS bodies passed to jsluice (post-filter, post-size-cap).
+	BundlesSkipped          int // JS bodies skipped (oversized, empty, parse timeout).
+	SourcemapsRecovered     int // .js.map sources successfully decoded via sourcesContent.
+	SourcemapFetchFails     int // sourceMappingURL comments seen but fetch failed.
+	EndpointsFound          int // raw extractedEndpoint count, pre-filter.
+	EndpointsKept           int // endpoints that survived filtering and made it into Requests.
+	SourcemapSourceTimeouts int // individual sourcemap source extractions skipped due to timeout or panic.
 }
 
 // ExtractedEndpoint is the analyser's intermediate representation. It is the
@@ -157,7 +158,8 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	result.stats.SourcemapFetchFails += smStats.SourcemapFetchFails
 	result.stats.SourcemapsRecovered += smStats.SourcemapsRecovered
 
-	// Extract endpoints from the bundle body.
+	// Extract endpoints from the bundle body. Wrap in a goroutine with
+	// PerBundleTimeout so a pathological bundle cannot block indefinitely.
 	bundleCh := make(chan []ExtractedEndpoint, 1)
 	go func() {
 		defer func() {
@@ -166,7 +168,7 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 				bundleCh <- nil
 			}
 		}()
-		eps, extractErr := ExtractFromBundle(body, req.URL, opts)
+		eps, extractErr := ExtractFromBundle(body, req.URL)
 		if extractErr != nil {
 			opts.Logger.Warn("bundle extract error", "url", req.URL, "err", extractErr)
 		}
@@ -203,14 +205,47 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	result.requests = append(result.requests, synth...)
 	result.stats.EndpointsKept += len(synth)
 
-	// Process each recovered sourcemap source. Per-source extraction errors
-	// are best-effort (one bad sourcesContent entry should not abort the rest).
+	// Process each recovered sourcemap source. Each extraction is wrapped in
+	// a goroutine with PerBundleTimeout + recover() so a pathological
+	// sourcesContent entry cannot hang or panic the worker.
 	for _, src := range smSources {
-		smEps, smErr := ExtractFromBundle([]byte(src), req.URL, opts)
-		if smErr != nil && opts.Logger != nil {
-			opts.Logger.Debug("jsstatic: sourcemap source extraction failed",
-				"bundle", req.URL, "error", smErr)
+		// Apply MaxBundleSize cap to individual sourcemap sources.
+		if len(src) > opts.MaxBundleSize {
+			result.stats.SourcemapSourceTimeouts++
+			opts.Logger.Warn("sourcemap source oversized, skipping", "bundle", req.URL, "size", len(src))
+			continue
 		}
+
+		srcCopy := src // capture for goroutine
+		srcCh := make(chan []ExtractedEndpoint, 1)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					opts.Logger.Error("jsluice panic in sourcemap source", "bundle", req.URL, "panic", r)
+					srcCh <- nil
+				}
+			}()
+			smEps, smErr := ExtractFromBundle([]byte(srcCopy), req.URL)
+			if smErr != nil {
+				opts.Logger.Debug("sourcemap source extraction failed",
+					"bundle", req.URL, "error", smErr)
+			}
+			srcCh <- smEps
+		}()
+
+		srcCtx, srcCancel := context.WithTimeout(ctx, opts.PerBundleTimeout)
+		var smEps []ExtractedEndpoint
+		select {
+		case eps := <-srcCh:
+			smEps = eps
+		case <-srcCtx.Done():
+			result.stats.SourcemapSourceTimeouts++
+			opts.Logger.Warn("sourcemap source parse timeout", "bundle", req.URL)
+			srcCancel()
+			continue
+		}
+		srcCancel()
+
 		result.stats.EndpointsFound += len(smEps)
 		for i := range smEps {
 			smEps[i].SourceTag = SourceSourcemap
@@ -241,8 +276,10 @@ func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options
 
 	opts = opts.withDefaults()
 
-	// Identify JS bundles to analyze.
+	// Single-pass: classify each captured request as a bundle to analyze,
+	// an oversized bundle to skip (counted), or a non-JS entry to ignore.
 	var bundles []crawl.ObservedRequest
+	var stats Stats
 	for _, req := range captured {
 		ct := req.Response.ContentType
 		body := req.Response.Body
@@ -250,20 +287,11 @@ func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options
 			continue
 		}
 		if len(body) > opts.MaxBundleSize {
-			// Oversized: skip and count.
+			// Oversized: skip and count in one pass.
+			stats.BundlesSkipped++
 			continue
 		}
 		bundles = append(bundles, req)
-	}
-
-	// Count oversized bundles separately for Stats.
-	var stats Stats
-	for _, req := range captured {
-		ct := req.Response.ContentType
-		body := req.Response.Body
-		if isJSContentType(ct) && len(body) > opts.MaxBundleSize {
-			stats.BundlesSkipped++
-		}
 	}
 
 	if len(bundles) == 0 {
@@ -322,6 +350,13 @@ func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options
 	out := make([]crawl.ObservedRequest, len(captured), len(captured)+len(synthesized))
 	copy(out, captured)
 	out = append(out, synthesized...)
+
+	// Check whether context was canceled during the run. A mid-run cancel
+	// returns the partial result alongside the error so callers can decide
+	// whether to use partial output.
+	if err := ctx.Err(); err != nil {
+		return Result{Requests: out, Stats: stats}, err
+	}
 
 	return Result{Requests: out, Stats: stats}, nil
 }

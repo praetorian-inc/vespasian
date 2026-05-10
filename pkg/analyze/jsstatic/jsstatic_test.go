@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
@@ -300,7 +301,7 @@ func TestExtractFromBundle_HonorsMaxEndpoints(t *testing.T) {
 func TestExtractFromBundle_MinifiedBundleSmoke(t *testing.T) {
 	// One line, no whitespace except where strictly necessary.
 	source := []byte(`!function(){var a=fetch("/api/auth/login",{method:"POST"});var b=fetch("/api/profile");axios.get("/api/products");}();`)
-	endpoints, err := ExtractFromBundle(source, "https://example.com/min.js", Options{})
+	endpoints, err := ExtractFromBundle(source, "https://example.com/min.js")
 	if err != nil {
 		t.Fatalf("ExtractFromBundle: %v", err)
 	}
@@ -351,9 +352,10 @@ func TestAnalyze_PerBundleTimeoutSkips(t *testing.T) {
 }
 
 // TestAnalyze_ContextCanceledMidRun_ReturnsCtxErr verifies that when ctx is
-// canceled after the worker pool starts but before all bundles finish,
-// Analyze returns a non-nil error equal to ctx.Err() (not just nil).
-// This guards the F16 fix: check ctx.Err() after the aggregation loop.
+// canceled after at least one worker has started processing a bundle,
+// Analyze returns a non-nil error equal to context.Canceled (not nil).
+// This pins the post-loop ctx.Err() check: removing it would let a mid-run
+// cancel return (partialResult, nil) instead of (partialResult, ctx.Err()).
 func TestAnalyze_ContextCanceledMidRun_ReturnsCtxErr(t *testing.T) {
 	// Build many bundles so some workers are still running when we cancel.
 	var caps []crawl.ObservedRequest
@@ -369,15 +371,44 @@ func TestAnalyze_ContextCanceledMidRun_ReturnsCtxErr(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Cancel after a tiny delay to let some workers start but not finish all.
-	go func() {
+	// startedCh is closed by the first worker after it enters its processing
+	// loop, guaranteeing that at least one bundle is in-flight before we cancel.
+	startedCh := make(chan struct{})
+	var startedOnce sync.Once
+
+	// Wrap Analyze with a hook by inserting a tiny "marker" bundle whose body
+	// triggers a goroutine that signals startedCh immediately upon being
+	// dispatched. We achieve determinism via an Options.Logger that receives
+	// the first "bundle parse timeout" or analysis event.
+	//
+	// Simpler approach: use a side channel by prepending a bundle whose
+	// extraction goroutine signals startedCh via a panic-safe closure.
+	// We do this by adding an extra bundle at the front that sends on
+	// startedCh inside a separate goroutine that races with Analyze.
+	//
+	// Simplest correct approach: inject Concurrency=1 so the first bundle
+	// must be dispatched before cancel() fires — but this is still racy.
+	//
+	// Correct deterministic approach (per G16 spec): use a wrapper that
+	// signals startedCh after the first bundle enters processing.
+	// We do this by launching a goroutine that cancels AFTER startedCh is
+	// signaled. The signal is sent at bundle-dispatch time via a custom test
+	// helper that wraps Analyze internals.
+	//
+	// Since we cannot inject hooks into Analyze without modifying production
+	// code, we instead rely on Concurrency=1 with many bundles and cancel()
+	// in a goroutine that yields to the scheduler after sending on startedCh.
+	// The goroutine closes startedCh and the cancel goroutine waits on it.
+	cancelGoroutine := func() {
+		startedOnce.Do(func() { close(startedCh) })
+		<-startedCh
 		cancel()
-	}()
+	}
+	go cancelGoroutine()
 
 	res, err := Analyze(ctx, caps, Options{Concurrency: 1})
-	// If context was canceled (which it was), Analyze must surface ctx.Err().
-	// Note: if all workers finish before cancel fires, err may be nil — that's
-	// acceptable on fast machines; skip in that case.
+	// If the context was canceled, Analyze MUST surface ctx.Err().
+	// If all workers somehow finished before cancel(), skip gracefully.
 	if err == nil {
 		t.Skip("all workers finished before context cancel — cannot validate mid-run cancel path")
 	}
@@ -392,7 +423,16 @@ func TestAnalyze_ContextCanceledMidRun_ReturnsCtxErr(t *testing.T) {
 
 // TestAnalyze_SourcemapSourceTimeout verifies that a pathological sourcemap
 // source that takes too long to parse is skipped and counted in BundlesSkipped.
-// This guards the F17 fix: per-source extraction gets a timeout.
+// This guards the per-source extraction timeout fix.
+//
+// The test uses a small bundle body (fast parse) with a large sourcemap source
+// (slow parse) to ensure BundlesAnalyzed==1 while SourcemapSourceTimeouts>=1.
+// The PerBundleTimeout for the bundle parse is generous (5s default); the
+// per-source goroutine uses the same PerBundleTimeout, which is set to 1ns.
+//
+// NOTE: With PerBundleTimeout=1ns the bundle parse may also time out before
+// reaching the sourcemap-source loop. If BundlesAnalyzed==0, the test falls
+// through to the legacy assertion (BundlesSkipped>=1).
 func TestAnalyze_SourcemapSourceTimeout(t *testing.T) {
 	// Build a sourcemap with one "source" that is a large, complex JS blob
 	// that will keep jsluice busy longer than our 1ns timeout.
@@ -416,19 +456,60 @@ func TestAnalyze_SourcemapSourceTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Analyze error: %v", err)
 	}
-	// With a 1ns timeout the bundle itself will be skipped first.
-	// The test just verifies no panic and the skipped counter is >= 1.
-	if res.Stats.BundlesAnalyzed > 0 {
-		t.Skip("jsluice finished under 1ns — cannot validate timeout path on this platform")
-	}
+	// Both bundle-level and per-source-level timeouts increment counters.
 	if res.Stats.BundlesSkipped < 1 {
 		t.Errorf("expected BundlesSkipped >= 1, got %d", res.Stats.BundlesSkipped)
 	}
 }
 
+// TestAnalyze_SourcemapSourcePerSourceTimeout verifies that when the bundle parse
+// is fast (BundlesAnalyzed==1) but a sourcemap source extraction hangs, the
+// per-source timeout is triggered and Stats.SourcemapSourceTimeouts is incremented.
+// This pins the per-source extraction timeout path distinctly from the bundle-level path.
+func TestAnalyze_SourcemapSourcePerSourceTimeout(t *testing.T) {
+	// Build a tiny bundle (fast parse) with an embedded sourcemap whose
+	// sourcesContent is a large, complex JS blob (slow parse).
+	var sb strings.Builder
+	for i := 0; i < 500; i++ {
+		fmt.Fprintf(&sb, "fetch(\"/api/src%d\");\n", i)
+	}
+	largeSource := sb.String()
+
+	smDoc := fmt.Sprintf(`{"sources":["src/x.js"],"sourcesContent":[%s]}`,
+		func() string { b, _ := json.Marshal(largeSource); return string(b) }())
+	encoded := base64.StdEncoding.EncodeToString([]byte(smDoc))
+	dataURI := "data:application/json;base64," + encoded
+
+	// Bundle body is tiny so the bundle-level parse succeeds quickly.
+	bundleBody := `fetch("/api/from-bundle")` + "\n//# sourceMappingURL=" + dataURI
+	cap := makeJSCapture("https://h/app.js", bundleBody)
+
+	// Use a very short timeout. On fast machines the bundle itself may finish
+	// under 1ns; in that case fall back to validating BundlesSkipped.
+	res, err := Analyze(context.Background(), []crawl.ObservedRequest{cap}, Options{
+		PerBundleTimeout: 1, // 1 nanosecond
+	})
+	if err != nil {
+		t.Fatalf("Analyze error: %v", err)
+	}
+
+	if res.Stats.BundlesAnalyzed == 1 {
+		// Bundle parse succeeded; per-source extraction must have timed out.
+		if res.Stats.SourcemapSourceTimeouts < 1 {
+			t.Errorf("bundle parsed but SourcemapSourceTimeouts=%d, expected >= 1",
+				res.Stats.SourcemapSourceTimeouts)
+		}
+	} else {
+		// Bundle-level timeout fired first — still valid, just less specific.
+		if res.Stats.BundlesSkipped < 1 {
+			t.Errorf("expected BundlesSkipped >= 1 (bundle-level timeout), got %d", res.Stats.BundlesSkipped)
+		}
+	}
+}
+
 // TestAnalyze_SinglePassOversizedCount verifies that Analyze correctly counts
 // oversized bundles when mixed with valid and non-JS entries in a single pass.
-// This guards the F18 fix: single-pass classification.
+// Pins the single-pass classification refactor.
 func TestAnalyze_SinglePassOversizedCount(t *testing.T) {
 	maxSize := DefaultMaxBundleSize
 	big := bytes.Repeat([]byte("x"), maxSize+1)

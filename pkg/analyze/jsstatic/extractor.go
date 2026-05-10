@@ -186,10 +186,10 @@ var fetchHTTPMethods = map[string]bool{
 }
 
 // extractTemplateLiteralFetches walks the AST for fetch(...) calls whose
-// first argument is a template_string and returns extracted endpoints.
-// recoverTokens controls whether identifier tokens are recovered from
-// template substitutions (false in Task 3, true after Task 4).
-func extractTemplateLiteralFetches(analyzer *jsluice.Analyzer, baseURL string, recoverTokens bool) []ExtractedEndpoint {
+// first argument is a template_string and returns extracted endpoints with
+// identifier tokens recovered from template substitutions (e.g., ${userId}
+// → token "userId" used to name the path parameter).
+func extractTemplateLiteralFetches(analyzer *jsluice.Analyzer, baseURL string) []ExtractedEndpoint {
 	var endpoints []ExtractedEndpoint
 
 	// Walk call_expressions directly.
@@ -213,12 +213,7 @@ func extractTemplateLiteralFetches(analyzer *jsluice.Analyzer, baseURL string, r
 			return
 		}
 
-		var useTokens []string
-		if recoverTokens {
-			useTokens = tokens
-		}
-
-		normalized, err := NormalizeEXPRPath(rawURL, useTokens)
+		normalized, err := NormalizeEXPRPath(rawURL, tokens)
 		if err != nil {
 			normalized = rawURL
 		}
@@ -555,13 +550,10 @@ type endpointKey struct {
 // ExtractFromBundle wraps jsluice.NewAnalyzer(b).GetURLs() and applies
 // URL filtering, EXPR normalization, and body-field collection.
 // baseURL is the URL the bundle was served from.
-func ExtractFromBundle(jsSource []byte, baseURL string, opts Options) ([]ExtractedEndpoint, error) {
+func ExtractFromBundle(jsSource []byte, baseURL string) ([]ExtractedEndpoint, error) {
 	if len(jsSource) == 0 {
 		return nil, nil
 	}
-
-	// opts is accepted for future use (e.g., filtering thresholds); unused today.
-	_ = opts
 
 	analyzer := jsluice.NewAnalyzer(jsSource)
 
@@ -583,7 +575,7 @@ func ExtractFromBundle(jsSource []byte, baseURL string, opts Options) ([]Extract
 	fetchBodyFields := augmentFetchBodyFields(analyzer)
 
 	// 3. Add endpoints from template-literal fetch calls (not found by jsluice).
-	for _, ep := range extractTemplateLiteralFetches(analyzer, baseURL, true) {
+	for _, ep := range extractTemplateLiteralFetches(analyzer, baseURL) {
 		k := endpointKey{ep.Method, ep.URL}
 		if seen[k] {
 			continue

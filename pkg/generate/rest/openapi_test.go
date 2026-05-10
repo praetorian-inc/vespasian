@@ -1027,7 +1027,7 @@ func TestOpenAPIGenerator_NonHTTPScheme(t *testing.T) {
 	}
 }
 
-// --- Task 13: x-vespasian-source extension tests ---
+// --- x-vespasian-source extension tests ---
 
 func makeClassified(method, rawURL, source string) classify.ClassifiedRequest {
 	return classify.ClassifiedRequest{
@@ -1141,7 +1141,7 @@ func TestOpenAPI_XVespasianSource_OmittedForEmptySource(t *testing.T) {
 	}
 }
 
-// F5: mixed static-only groups (static:js + static:js-sourcemap) must resolve to "dynamic".
+// mixed static-only groups (static:js + static:js-sourcemap) must resolve to "dynamic".
 func TestComputeSourceTag_MixedStaticGroups(t *testing.T) {
 	gen := &OpenAPIGenerator{}
 	// Two entries for the same endpoint: one from js bundle, one from sourcemap.

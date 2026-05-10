@@ -424,22 +424,12 @@ func (c *CrawlCmd) Run() error {
 		return err
 	}
 
-	if c.AnalyzeJS {
-		aopts := jsstatic.Options{
-			FetchSourcemaps: c.FetchSourcemaps,
-			AllowPrivate:    c.DangerousAllowPrivate,
-		}
-		res, aerr := jsstatic.Analyze(bs.ctx, requests, aopts)
-		if aerr != nil {
-			fmt.Fprintf(os.Stderr, "warning: js-static analysis failed: %v\n", aerr) //nolint:errcheck // best-effort status message
-		} else {
-			if c.Verbose {
-				fmt.Fprintf(os.Stderr, "js-static: bundles=%d, sourcemaps=%d, endpoints=%d\n", //nolint:gosec // G705: writing to stderr, not web response
-					res.Stats.BundlesAnalyzed, res.Stats.SourcemapsRecovered, res.Stats.EndpointsKept)
-			}
-			requests = res.Requests
-		}
-	}
+	requests = runJSAnalysisStage(bs.ctx, requests, jsAnalysisArgs{
+		enabled:         c.AnalyzeJS,
+		fetchSourcemaps: c.FetchSourcemaps,
+		allowPrivate:    c.DangerousAllowPrivate,
+		verbose:         c.Verbose,
+	})
 
 	if c.Verbose {
 		if bs.requestID != "" {
@@ -550,22 +540,12 @@ func (c *GenerateCmd) Run() (err error) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if c.AnalyzeJS {
-		aopts := jsstatic.Options{
-			FetchSourcemaps: c.FetchSourcemaps,
-			AllowPrivate:    c.DangerousAllowPrivate,
-		}
-		res, aerr := jsstatic.Analyze(ctx, requests, aopts)
-		if aerr != nil {
-			fmt.Fprintf(os.Stderr, "warning: js-static analysis failed: %v\n", aerr) //nolint:errcheck // best-effort status message
-		} else {
-			if c.Verbose {
-				fmt.Fprintf(os.Stderr, "js-static: bundles=%d, sourcemaps=%d, endpoints=%d\n", //nolint:gosec // G705: writing to stderr, not web response
-					res.Stats.BundlesAnalyzed, res.Stats.SourcemapsRecovered, res.Stats.EndpointsKept)
-			}
-			requests = res.Requests
-		}
-	}
+	requests = runJSAnalysisStage(ctx, requests, jsAnalysisArgs{
+		enabled:         c.AnalyzeJS,
+		fetchSourcemaps: c.FetchSourcemaps,
+		allowPrivate:    c.DangerousAllowPrivate,
+		verbose:         c.Verbose,
+	})
 
 	spec, err := generateSpec(ctx, requests, generateSpecOptions{
 		APIType:      c.APIType,
@@ -628,22 +608,12 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		return err
 	}
 
-	if c.AnalyzeJS {
-		aopts := jsstatic.Options{
-			FetchSourcemaps: c.FetchSourcemaps,
-			AllowPrivate:    c.DangerousAllowPrivate,
-		}
-		res, aerr := jsstatic.Analyze(bs.ctx, requests, aopts)
-		if aerr != nil {
-			fmt.Fprintf(os.Stderr, "warning: js-static analysis failed: %v\n", aerr) //nolint:errcheck // best-effort status message
-		} else {
-			if c.Verbose {
-				fmt.Fprintf(os.Stderr, "js-static: bundles=%d, sourcemaps=%d, endpoints=%d\n", //nolint:gosec // G705: writing to stderr, not web response
-					res.Stats.BundlesAnalyzed, res.Stats.SourcemapsRecovered, res.Stats.EndpointsKept)
-			}
-			requests = res.Requests
-		}
-	}
+	requests = runJSAnalysisStage(bs.ctx, requests, jsAnalysisArgs{
+		enabled:         c.AnalyzeJS,
+		fetchSourcemaps: c.FetchSourcemaps,
+		allowPrivate:    c.DangerousAllowPrivate,
+		verbose:         c.Verbose,
+	})
 
 	if c.Verbose {
 		if bs.requestID != "" {
@@ -973,4 +943,37 @@ func validateURL(rawURL string) error {
 		return fmt.Errorf("invalid URL %q: scheme must be http or https", rawURL)
 	}
 	return nil
+}
+
+// jsAnalysisArgs bundles the flag values that drive jsstatic.Analyze. Used by
+// runJSAnalysisStage so each *Cmd.Run only has to assemble these fields once.
+type jsAnalysisArgs struct {
+	enabled         bool
+	fetchSourcemaps bool
+	allowPrivate    bool
+	verbose         bool
+}
+
+// runJSAnalysisStage runs jsstatic.Analyze on requests and returns the
+// (possibly enriched) request slice. When args.enabled is false, returns
+// requests unchanged. Errors from Analyze are logged and treated as a no-op
+// (best-effort enrichment must never fail the surrounding pipeline).
+func runJSAnalysisStage(ctx context.Context, requests []crawl.ObservedRequest, args jsAnalysisArgs) []crawl.ObservedRequest {
+	if !args.enabled {
+		return requests
+	}
+	aopts := jsstatic.Options{
+		FetchSourcemaps: args.fetchSourcemaps,
+		AllowPrivate:    args.allowPrivate,
+	}
+	res, err := jsstatic.Analyze(ctx, requests, aopts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: js-static analysis failed: %v\n", err) //nolint:errcheck // best-effort status message
+		return requests
+	}
+	if args.verbose {
+		fmt.Fprintf(os.Stderr, "js-static: bundles=%d, sourcemaps=%d, endpoints=%d\n", //nolint:gosec // G705: writing to stderr, not web response
+			res.Stats.BundlesAnalyzed, res.Stats.SourcemapsRecovered, res.Stats.EndpointsKept)
+	}
+	return res.Requests
 }

@@ -17,7 +17,6 @@ package jsstatic
 import (
 	"encoding/json"
 	"net/url"
-	"sort"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
@@ -96,25 +95,18 @@ func resolveURL(rawURL string, base *url.URL) string {
 	return base.ResolveReference(ref).String()
 }
 
-// synthBody marshals a sorted map of field-name → nil into a JSON object byte
-// slice. Returns nil when fields is empty.
+// synthBody marshals a map of field-name → nil into a JSON object byte slice.
+// Returns nil when fields is empty. encoding/json.Marshal sorts string map
+// keys lexicographically, so the output is deterministic without an explicit
+// pre-sort of the input slice.
 func synthBody(fields []string) []byte {
 	if len(fields) == 0 {
 		return nil
 	}
-	// Sort for deterministic output.
-	sorted := make([]string, len(fields))
-	copy(sorted, fields)
-	sort.Strings(sorted)
-
-	// Build an ordered-key JSON object manually so the output is deterministic
-	// regardless of Go map iteration order.
-	obj := make(map[string]interface{}, len(sorted))
-	for _, f := range sorted {
+	obj := make(map[string]interface{}, len(fields))
+	for _, f := range fields {
 		obj[f] = nil
 	}
-
-	// json.Marshal on a map produces sorted keys in Go 1.12+.
 	b, err := json.Marshal(obj)
 	if err != nil {
 		return nil

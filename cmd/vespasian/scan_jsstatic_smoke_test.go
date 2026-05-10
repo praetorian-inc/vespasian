@@ -102,19 +102,25 @@ func TestScanPipeline_AnalyzeJS_SmokeFixture(t *testing.T) {
 }
 
 // TestScanPipeline_AnalyzeJS_OffMatchesBaseAndOnDoesNot exercises the actual
-// --analyze-js flag-wiring path. It runs two distinct pipelines:
-//   - "ON" path:  call jsstatic.Analyze, then classify+dedup+generate.
-//   - "OFF" path: skip jsstatic.Analyze entirely (flag=false), then classify+dedup+generate.
+// --analyze-js flag-wiring path through `runJSAnalysisStage` (the same helper
+// used by ScanCmd.Run / GenerateCmd.Run / CrawlCmd.Run). It runs two distinct
+// pipelines:
+//   - "ON" path:  runJSAnalysisStage(enabled=true) → Analyze runs, requests grow.
+//   - "OFF" path: runJSAnalysisStage(enabled=false) → no-op, requests unchanged.
 //
 // Assertions:
-//  1. ON path produces a spec that differs from the baseline (extra endpoints discovered).
-//  2. OFF path produces a spec that is byte-identical to the baseline.
+//  1. ON path produces a spec that differs from the OFF path (extra endpoints discovered).
+//  2. OFF path produces a spec byte-identical to a third independent baseline run.
+//
+// If a future change breaks the `if !args.enabled { return requests }` guard
+// in runJSAnalysisStage, the OFF spec would suddenly contain static:js
+// endpoints and this test would fail — making the flag wiring tamper-evident.
 func TestScanPipeline_AnalyzeJS_OffMatchesBaseAndOnDoesNot(t *testing.T) {
 	captured := smokeFixture()
 	classifiers := classifiersForType("rest")
 	gen := &restgen.OpenAPIGenerator{}
 
-	// Baseline: classify+dedup+generate without jsstatic (flag-off simulation).
+	// Baseline: classify+dedup+generate against raw captured (no Analyze invoked).
 	baseClassified := classify.RunClassifiers(classifiers, captured, 0.5)
 	baseDeduped := classify.Deduplicate(baseClassified)
 	baseSpec, err := gen.Generate(baseDeduped)
@@ -122,23 +128,40 @@ func TestScanPipeline_AnalyzeJS_OffMatchesBaseAndOnDoesNot(t *testing.T) {
 		t.Fatalf("baseline Generate error: %v", err)
 	}
 
-	// OFF path: explicitly skip Analyze (AnalyzeJS=false) — results identical to base.
-	// We use the raw captured slice without jsstatic.Analyze.
-	offClassified := classify.RunClassifiers(classifiers, captured, 0.5)
+	// OFF path: invoke the actual production helper with enabled=false.
+	offRequests := runJSAnalysisStage(context.Background(), captured, jsAnalysisArgs{
+		enabled: false,
+	})
+	if len(offRequests) != len(captured) {
+		t.Fatalf("AnalyzeJS=false: helper must return captured unchanged; got len=%d, want %d",
+			len(offRequests), len(captured))
+	}
+	offClassified := classify.RunClassifiers(classifiers, offRequests, 0.5)
 	offDeduped := classify.Deduplicate(offClassified)
 	offSpec, err := gen.Generate(offDeduped)
 	if err != nil {
 		t.Fatalf("OFF Generate error: %v", err)
 	}
 	if string(offSpec) != string(baseSpec) {
-		t.Error("AnalyzeJS=false: spec must be byte-identical to baseline (generator is non-deterministic?)")
+		t.Error("AnalyzeJS=false: spec must be byte-identical to baseline; runJSAnalysisStage(enabled=false) altered behavior")
 	}
 
-	// ON path: run Analyze (AnalyzeJS=true), then classify+dedup+generate.
-	onSpec, onDeduped := runSmokePipeline(t, captured, jsstatic.Options{})
+	// ON path: invoke the helper with enabled=true.
+	onRequests := runJSAnalysisStage(context.Background(), captured, jsAnalysisArgs{
+		enabled: true,
+	})
+	if len(onRequests) <= len(captured) {
+		t.Fatalf("AnalyzeJS=true: helper must append synthesized requests; got len=%d, want >%d",
+			len(onRequests), len(captured))
+	}
+	onClassified := classify.RunClassifiers(classifiers, onRequests, 0.5)
+	onDeduped := classify.Deduplicate(onClassified)
+	onSpec, err := gen.Generate(onDeduped)
+	if err != nil {
+		t.Fatalf("ON Generate error: %v", err)
+	}
 
-	// The ON path must have discovered at least one static:js endpoint that
-	// is not present in the baseline — confirming the flag actually runs analysis.
+	// At least one static:js entry must survive dedup.
 	var hasStaticJS bool
 	for _, r := range onDeduped {
 		if r.Source == "static:js" {
@@ -150,7 +173,8 @@ func TestScanPipeline_AnalyzeJS_OffMatchesBaseAndOnDoesNot(t *testing.T) {
 		t.Error("AnalyzeJS=true: expected at least one static:js endpoint in deduped output")
 	}
 
-	// ON spec must differ from the OFF spec (extra paths or x-vespasian-source extension).
+	// ON and OFF specs MUST diverge for this fixture (the JS bundle's
+	// fetch/axios endpoints are not in the dynamic captured set).
 	if string(onSpec) == string(offSpec) {
 		t.Error("AnalyzeJS=true and AnalyzeJS=false must produce different specs for this fixture")
 	}

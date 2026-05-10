@@ -117,7 +117,7 @@ func TestSourcemap_CommentNotInTrailingWindow(t *testing.T) {
 	}
 }
 
-// ---- Task 7: remote sourcemap fetch tests ----
+// ---- remote sourcemap fetch tests ----
 
 // makeSourcemapJSON returns a valid sourcemap JSON body with the given sourcesContent.
 func makeSourcemapJSON(sourcesContent []string) []byte {
@@ -364,10 +364,15 @@ func TestSourcemap_CrossSchemeRejected(t *testing.T) {
 		AllowPrivate:    true,
 		HTTPClient:      srv.Client(),
 	}
-	sources, _ := recoverSourcemap(context.Background(), bundle, bundleURL, opts)
-	// Different schemes → sameHost returns false → no fetch.
+	sources, stats := recoverSourcemap(context.Background(), bundle, bundleURL, opts)
+	// Different schemes → sameHost returns false → no fetch attempted.
 	if len(sources) != 0 {
 		t.Errorf("expected 0 sources for cross-scheme sourcemap, got %d", len(sources))
+	}
+	// No fetch attempted means the fail counter should NOT be incremented.
+	if stats.SourcemapFetchFails != 0 {
+		t.Errorf("cross-scheme rejection happens BEFORE fetch — SourcemapFetchFails should be 0, got %d",
+			stats.SourcemapFetchFails)
 	}
 }
 
@@ -387,7 +392,7 @@ func TestSourcemap_DefaultPortSameHost(t *testing.T) {
 	}
 }
 
-// F3: non-base64 data URI sourcemap payloads must be URL-decoded before JSON parsing.
+// non-base64 data URI sourcemap payloads must be URL-decoded before JSON parsing.
 func TestParseDataURISourcemap_URLEncodedNonBase64(t *testing.T) {
 	// data:application/json,%7B%22sourcesContent%22:[%22fetch('/x')%22]%7D
 	// URL-decoded: {"sourcesContent":["fetch('/x')"]}
@@ -403,7 +408,7 @@ func TestParseDataURISourcemap_URLEncodedNonBase64(t *testing.T) {
 	}
 }
 
-// F1: relative sourceMappingURL must be resolved against bundle URL.
+// relative sourceMappingURL must be resolved against bundle URL.
 func TestSourcemap_RelativeMapURL_ResolvesAgainstBundle(t *testing.T) {
 	content := []string{"var relative = true;"}
 	body := makeSourcemapJSON(content)
@@ -468,5 +473,40 @@ func TestSourcemap_OversizedResponseRejected(t *testing.T) {
 	}
 	if stats.SourcemapFetchFails != 1 {
 		t.Errorf("expected 1 fail for oversized response, got %d", stats.SourcemapFetchFails)
+	}
+}
+
+// TestNoFollowRedirects pins the CheckRedirect behavior directly: any 3xx
+// response from a sourcemap fetch must be treated as the final response (no
+// follow). A future change to CheckRedirect would silently re-introduce the
+// SSRF/redirect-bypass surface this test guards against.
+func TestNoFollowRedirects(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "https://example.com/x.js.map", nil)
+	if err := noFollowRedirects(req, nil); err != http.ErrUseLastResponse {
+		t.Errorf("noFollowRedirects = %v, want http.ErrUseLastResponse", err)
+	}
+}
+
+// TestSameHost_DefaultPortNormalisation pins the port-normalisation rule:
+// https://h vs https://h:443 are same-host (default port resolves to 443),
+// but https://h vs https://h:8443 are NOT (explicit non-default port).
+func TestSameHost_DefaultPortNormalisation(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"https://h.example/app.js", "https://h.example/app.js.map", true},
+		{"https://h.example/app.js", "https://h.example:443/app.js.map", true},
+		{"http://h.example/app.js", "http://h.example:80/app.js.map", true},
+		{"https://h.example:8443/app.js", "https://h.example/app.js.map", false},
+		{"https://h.example:8443/app.js", "https://h.example:443/app.js.map", false},
+		{"http://h.example/app.js", "https://h.example/app.js.map", false}, // cross-scheme
+		{"https://h.example/app.js", "https://other.example/app.js.map", false},
+	}
+	for _, tc := range cases {
+		got := sameHost(tc.a, tc.b)
+		if got != tc.want {
+			t.Errorf("sameHost(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
 	}
 }
