@@ -22,10 +22,18 @@ type ObservedRequest struct {
 	QueryParams map[string]string `json:"query_params,omitempty"`
 	Body        []byte            `json:"body,omitempty"`
 	Response    ObservedResponse  `json:"response"`
-	Source      string            `json:"source"`
-	Tag         string            `json:"tag,omitempty"`
-	Attribute   string            `json:"attribute,omitempty"`
-	PageURL     string            `json:"page_url,omitempty"`
+	// Source identifies the channel the request was observed on. Known values:
+	//
+	//   - "katana", "browser"            (live crawl, see pkg/crawl)
+	//   - "form"                         (form submission, see pkg/crawl)
+	//   - "import:burp", "import:har",
+	//     "import:mitmproxy"             (offline imports, see pkg/importer)
+	//   - "static:js"                    (static analysis of JS bundles, pkg/analyze/jsstatic)
+	//   - "static:js-sourcemap"          (recovered via .js.map sourcesContent)
+	Source    string `json:"source"`
+	Tag       string `json:"tag,omitempty"`
+	Attribute string `json:"attribute,omitempty"`
+	PageURL   string `json:"page_url,omitempty"`
 }
 
 // ObservedResponse represents a captured HTTP response.

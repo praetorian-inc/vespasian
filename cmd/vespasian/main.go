@@ -32,6 +32,7 @@ import (
 
 	"github.com/alecthomas/kong"
 
+	"github.com/praetorian-inc/vespasian/pkg/analyze/jsstatic"
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/generate"
@@ -267,17 +268,19 @@ func writeOutput(path string, fn func(io.Writer) error) error {
 
 // CrawlOptions holds the shared crawl configuration fields used by CrawlCmd and ScanCmd.
 type CrawlOptions struct {
-	Header      []string      `short:"H" help:"Custom headers (repeatable)"`
-	Output      string        `short:"o" help:"Output file path"`
-	Depth       int           `default:"3" help:"Maximum crawl depth"`
-	MaxPages    int           `default:"100" help:"Maximum pages to crawl"`
-	Timeout     time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
-	Scope       string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
-	Headless    bool          `default:"true" help:"Use headless browser"`
-	Proxy       string        `help:"Proxy address for headless browser (e.g., http://127.0.0.1:8080). Note: TLS certificate verification is disabled during crawls."`
-	Concurrency int           `default:"10" help:"Number of concurrent browser tabs for headless crawling"`
-	NoRequestID bool          `name:"no-request-id" help:"Disable automatic X-Vespasian-Request-Id header"`
-	Verbose     bool          `short:"v" help:"Enable verbose logging"`
+	Header          []string      `short:"H" help:"Custom headers (repeatable)"`
+	Output          string        `short:"o" help:"Output file path"`
+	Depth           int           `default:"3" help:"Maximum crawl depth"`
+	MaxPages        int           `default:"100" help:"Maximum pages to crawl"`
+	Timeout         time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
+	Scope           string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
+	Headless        bool          `default:"true" help:"Use headless browser"`
+	Proxy           string        `help:"Proxy address for headless browser (e.g., http://127.0.0.1:8080). Note: TLS certificate verification is disabled during crawls."`
+	Concurrency     int           `default:"10" help:"Number of concurrent browser tabs for headless crawling"`
+	NoRequestID     bool          `name:"no-request-id" help:"Disable automatic X-Vespasian-Request-Id header"`
+	Verbose         bool          `short:"v" help:"Enable verbose logging"`
+	AnalyzeJS       bool          `name:"analyze-js"      default:"true"  help:"Statically analyze captured JS bundles to discover API endpoints, parameters, and request bodies."`
+	FetchSourcemaps bool          `name:"fetch-sourcemaps" default:"true"  help:"When --analyze-js is set, fetch .js.map sourcemaps referenced via //# sourceMappingURL= comments to recover original sources."`
 }
 
 // setupForceExitHandler spawns a goroutine that waits for the first signal
@@ -421,6 +424,13 @@ func (c *CrawlCmd) Run() error {
 		return err
 	}
 
+	requests = runJSAnalysisStage(bs.ctx, requests, jsAnalysisArgs{
+		enabled:         c.AnalyzeJS,
+		fetchSourcemaps: c.FetchSourcemaps,
+		allowPrivate:    c.DangerousAllowPrivate,
+		verbose:         c.Verbose,
+	})
+
 	if c.Verbose {
 		if bs.requestID != "" {
 			fmt.Fprintf(os.Stderr, "request-id: %s\n", bs.requestID)
@@ -482,6 +492,8 @@ type GenerateCmd struct {
 	Deduplicate           bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
 	DangerousAllowPrivate bool    `help:"Disable SSRF protection on the probe path (OPTIONS/schema/WSDL-fetch/GraphQL introspection) for private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 	Verbose               bool    `short:"v" help:"Enable verbose logging"`
+	AnalyzeJS             bool    `name:"analyze-js"       default:"true"  help:"Statically analyze JS bundles in the imported capture (when present)."`
+	FetchSourcemaps       bool    `name:"fetch-sourcemaps" default:"false" help:"When --analyze-js is set, fetch .js.map sourcemaps referenced via //# sourceMappingURL= comments. Default false on generate (offline-friendly)."`
 }
 
 // API type constants used for classification routing and generation.
@@ -527,6 +539,13 @@ func (c *GenerateCmd) Run() (err error) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	requests = runJSAnalysisStage(ctx, requests, jsAnalysisArgs{
+		enabled:         c.AnalyzeJS,
+		fetchSourcemaps: c.FetchSourcemaps,
+		allowPrivate:    c.DangerousAllowPrivate,
+		verbose:         c.Verbose,
+	})
 
 	spec, err := generateSpec(ctx, requests, generateSpecOptions{
 		APIType:      c.APIType,
@@ -588,6 +607,13 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	if err != nil {
 		return err
 	}
+
+	requests = runJSAnalysisStage(bs.ctx, requests, jsAnalysisArgs{
+		enabled:         c.AnalyzeJS,
+		fetchSourcemaps: c.FetchSourcemaps,
+		allowPrivate:    c.DangerousAllowPrivate,
+		verbose:         c.Verbose,
+	})
 
 	if c.Verbose {
 		if bs.requestID != "" {
@@ -917,4 +943,37 @@ func validateURL(rawURL string) error {
 		return fmt.Errorf("invalid URL %q: scheme must be http or https", rawURL)
 	}
 	return nil
+}
+
+// jsAnalysisArgs bundles the flag values that drive jsstatic.Analyze. Used by
+// runJSAnalysisStage so each *Cmd.Run only has to assemble these fields once.
+type jsAnalysisArgs struct {
+	enabled         bool
+	fetchSourcemaps bool
+	allowPrivate    bool
+	verbose         bool
+}
+
+// runJSAnalysisStage runs jsstatic.Analyze on requests and returns the
+// (possibly enriched) request slice. When args.enabled is false, returns
+// requests unchanged. Errors from Analyze are logged and treated as a no-op
+// (best-effort enrichment must never fail the surrounding pipeline).
+func runJSAnalysisStage(ctx context.Context, requests []crawl.ObservedRequest, args jsAnalysisArgs) []crawl.ObservedRequest {
+	if !args.enabled {
+		return requests
+	}
+	aopts := jsstatic.Options{
+		FetchSourcemaps: args.fetchSourcemaps,
+		AllowPrivate:    args.allowPrivate,
+	}
+	res, err := jsstatic.Analyze(ctx, requests, aopts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: js-static analysis failed: %v\n", err) //nolint:errcheck // best-effort status message
+		return requests
+	}
+	if args.verbose {
+		fmt.Fprintf(os.Stderr, "js-static: bundles=%d, sourcemaps=%d, endpoints=%d\n", //nolint:gosec // G705: writing to stderr, not web response
+			res.Stats.BundlesAnalyzed, res.Stats.SourcemapsRecovered, res.Stats.EndpointsKept)
+	}
+	return res.Requests
 }
