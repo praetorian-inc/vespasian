@@ -43,6 +43,7 @@ Vespasian takes a different approach: it observes actual network traffic at the 
 | **WSDL/SOAP Discovery** | Identifies SOAP services via SOAPAction headers and envelope detection; fetches and parses WSDL documents |
 | **API Type Auto-Detection** | Automatically determines API type (REST, GraphQL, WSDL) from captured traffic without manual selection |
 | **Headless Browser Crawling** | Drives a headless Chrome browser with full JavaScript execution for SPA support, powered by [Katana](https://github.com/projectdiscovery/katana) |
+| **Static Form Extraction** | Statically parses `<form>` elements in captured HTML responses — including login, search, and admin forms — to surface submission endpoints and parameters that dynamic crawling may never trigger |
 | **Traffic Import** | Import existing captures from Burp Suite XML, HAR 1.2 files, and mitmproxy dumps |
 | **Active Probing** | OPTIONS discovery, JSON schema inference, WSDL document fetching, and GraphQL introspection |
 | **Path Normalization** | `/users/42` and `/users/87` become `/users/{id}` with known literal preservation (`/me`, `/self`) |
@@ -61,7 +62,8 @@ flowchart LR
         B["Traffic Importers<br/>Burp Suite XML, HAR, mitmproxy"] --> C
     end
     subgraph Generate
-        C --> D["Classifier<br/>REST, GraphQL, WSDL"]
+        C --> S["Static Analyzer<br/>HTML form extraction"]
+        S --> D["Classifier<br/>REST, GraphQL, WSDL"]
         D --> E["Prober<br/>OPTIONS, schema, WSDL, introspection"]
         E --> F["Spec Generator<br/>OpenAPI 3.0, GraphQL SDL, WSDL"]
     end
@@ -303,6 +305,7 @@ vespasian generate <api-type> <capture-file> [flags]
 cmd/vespasian/          CLI entry point
 pkg/crawl/              Headless browser crawler + capture format
 pkg/importer/           Traffic importers (Burp, HAR, mitmproxy)
+pkg/analyze/            Static HTML form extraction from captured response bodies
 pkg/classify/           API classification (REST, GraphQL, WSDL)
 pkg/probe/              Endpoint probing (OPTIONS, schema, WSDL, GraphQL introspection)
 pkg/generate/
