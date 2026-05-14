@@ -72,7 +72,7 @@ func TestExtractForms_SimpleGetForm(t *testing.T) {
 func TestExtractForms_PostFormMixedInputs(t *testing.T) {
 	body := `<form method="post" action="/login">
 		<input name="username" type="text">
-		<input name="password" type="password">
+		<input name="password" type="password" value="hunter2" placeholder="enter password">
 		<input name="remember" type="hidden" value="1">
 		<input type="submit" value="Login">
 		<button type="button">Cancel</button>
@@ -106,6 +106,12 @@ func TestExtractForms_PostFormMixedInputs(t *testing.T) {
 	bodyStr := string(r.Body)
 	if strings.Contains(bodyStr, "Login") {
 		t.Errorf("submit value should not appear in body; got %q", bodyStr)
+	}
+	if strings.Contains(bodyStr, "hunter2") {
+		t.Errorf("password value must not appear in body; got %q", bodyStr)
+	}
+	if strings.Contains(bodyStr, "enter+password") || strings.Contains(bodyStr, "enter password") {
+		t.Errorf("password placeholder must not appear in body; got %q", bodyStr)
 	}
 }
 
@@ -180,6 +186,33 @@ func TestExtractForms_HiddenFieldFlagged(t *testing.T) {
 		t.Errorf(`vals["return_to"] missing; got %v`, vals)
 	} else if len(v) > 0 && v[0] != "" {
 		t.Errorf(`vals["return_to"] = %q, want empty (hidden value stripped per SEC-BE-005)`, v[0])
+	}
+}
+
+// TestExtractForms_PasswordValueAndPlaceholderBlanked verifies that password-type
+// inputs have their names preserved (for parameter discovery) while their values
+// AND placeholders are stripped (SEC-BE-001: password fields commonly carry
+// credentials that must not be persisted to capture.json or replayed during
+// probing). Mirrors TestExtractForms_HiddenFieldFlagged for the password case.
+func TestExtractForms_PasswordValueAndPlaceholderBlanked(t *testing.T) {
+	body := `<form method="post" action="/login"><input type="password" name="password" value="hunter2" placeholder="enter password"></form>`
+	reqs := []crawl.ObservedRequest{htmlReq("https://host/login", body)}
+	got := ExtractForms(reqs)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(got))
+	}
+	vals := parseBody(t, got[0])
+	if v, ok := vals["password"]; !ok {
+		t.Errorf(`vals["password"] missing; got %v`, vals)
+	} else if len(v) > 0 && v[0] != "" {
+		t.Errorf(`vals["password"] = %q, want empty (password value stripped per SEC-BE-001)`, v[0])
+	}
+	bodyStr := string(got[0].Body)
+	if strings.Contains(bodyStr, "hunter2") {
+		t.Errorf("password value must not appear in body; got %q", bodyStr)
+	}
+	if strings.Contains(bodyStr, "enter+password") || strings.Contains(bodyStr, "enter password") {
+		t.Errorf("password placeholder must not appear in body; got %q", bodyStr)
 	}
 }
 
@@ -661,10 +694,24 @@ func TestExtractForms_OffHostActionSkipped(t *testing.T) {
 	}
 }
 
-func TestResolveAction_JavascriptScheme(t *testing.T) {
-	_, _, ok := resolveAction("https://h/", "javascript:void(0)")
-	if ok {
-		t.Errorf("expected ok=false for javascript: scheme")
+func TestResolveAction_UnsupportedSchemes(t *testing.T) {
+	cases := []struct {
+		name string
+		ref  string
+	}{
+		{"javascript", "javascript:void(0)"},
+		{"mailto", "mailto:user@example.com"},
+		{"data", "data:text/html,<h1>x</h1>"},
+		{"tel", "tel:+15551234567"},
+		{"blob", "blob:https://h/abc-123"},
+		{"javascript-uppercase", "JavaScript:alert(1)"}, // case-insensitive
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, ok := resolveAction("https://h/", tc.ref); ok {
+				t.Errorf("expected ok=false for %s scheme", tc.name)
+			}
+		})
 	}
 }
 

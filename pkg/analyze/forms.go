@@ -349,7 +349,7 @@ func handleInputTag(tok html.Token, stack []*staticForm) {
 		return
 	}
 	value := getAttr(tok, "value")
-	if typ == "hidden" {
+	if typ == "hidden" || typ == "password" {
 		value = ""
 	}
 	f.Fields = append(f.Fields, staticFormField{
@@ -359,7 +359,7 @@ func handleInputTag(tok html.Token, stack []*staticForm) {
 		Placeholder: getAttr(tok, "placeholder"),
 		Required:    hasAttr(tok, "required"),
 		Hidden:      typ == "hidden",
-		Sensitive:   isSensitiveName(name),
+		Sensitive:   isSensitiveName(name) || typ == "password",
 	})
 }
 
@@ -602,6 +602,14 @@ func containsControlByte(s string) bool {
 	return false
 }
 
+var sensitiveSubstrings = []string{
+	"csrf", "xsrf", "authenticity_token",
+	"session", "access_token", "refresh_token",
+	"bearer", "jwt", "oauth",
+	"apikey", "api_key", "api-key",
+	"samlrequest", "samlresponse", "relaystate",
+}
+
 // isSensitiveName matches form-field names that commonly carry secrets or
 // anti-CSRF tokens. Matched names have their values blanked by fieldValue so
 // they are never persisted into capture.json or replayed during probing.
@@ -620,13 +628,6 @@ func isSensitiveName(name string) bool {
 	n := strings.ToLower(name)
 	if n == "_token" {
 		return true
-	}
-	sensitiveSubstrings := []string{
-		"csrf", "xsrf", "authenticity_token",
-		"session", "access_token", "refresh_token",
-		"bearer", "jwt", "oauth",
-		"apikey", "api_key", "api-key",
-		"samlrequest", "samlresponse", "relaystate",
 	}
 	for _, s := range sensitiveSubstrings {
 		if strings.Contains(n, s) {
