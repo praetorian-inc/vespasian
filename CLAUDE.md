@@ -56,20 +56,22 @@ The `scan` command combines both stages. The `crawl`/`import` and `generate` com
 The CLI (`cmd/vespasian`) uses Kong for argument parsing. Each command (crawl, import, generate, scan) has a `Run()` method. The scan pipeline:
 
 1. Crawl target URL → `[]crawl.ObservedRequest`
-2. Auto-detect API type (or use explicit `--api-type`)
-3. Classify requests via `classify.RunClassifiers()` with confidence threshold
-4. Deduplicate classified endpoints
-5. Probe endpoints via `probe.RunStrategies()` (OPTIONS, schema, WSDL fetch, GraphQL introspection)
-6. Generate spec via `generate.Get(apiType).Generate()`
+2. Augment requests with static HTML form analysis via `analyze.ExtractForms()` (emits synthetic `ObservedRequest` entries with `Source="static:html"` for every `<form>` in HTML response bodies) — done **before** auto-detection so form-derived REST signals feed the heuristic
+3. Auto-detect API type (or use explicit `--api-type`)
+4. Classify requests via `classify.RunClassifiers()` with confidence threshold
+5. Deduplicate classified endpoints
+6. Probe endpoints via `probe.RunStrategies()` (OPTIONS, schema, WSDL fetch, GraphQL introspection)
+7. Generate spec via `generate.Get(apiType).Generate()`
 
 ### Key Packages
 
 - **cmd/vespasian**: CLI entry point, command definitions, signal handling, browser lifecycle management
 - **pkg/crawl**: Headless browser crawling via Katana, capture file I/O (`ObservedRequest` JSON format), browser manager with Chrome lifecycle
+- **pkg/analyze**: Static analysis of captured HTML response bodies; extracts `<form>` endpoints and parameter names as synthetic `ObservedRequest` entries (`Source="static:html"`) to surface form-based APIs not triggered during crawl
 - **pkg/classify**: Request classification engine with confidence-based heuristics; classifiers for REST, GraphQL, and WSDL; deduplication
 - **pkg/probe**: Active endpoint probing strategies (OPTIONS discovery, JSON schema inference, WSDL document fetching, GraphQL introspection with 3-tier WAF bypass); SSRF protection with DNS rebinding mitigation
 - **pkg/generate**: Spec generation interface and registry; delegates to sub-packages by API type
-- **pkg/generate/rest**: OpenAPI 3.0 generation, path normalization (UUID detection, context-aware parameter naming), JSON schema inference
+- **pkg/generate/rest**: OpenAPI 3.0 generation, path normalization (UUID detection, context-aware parameter naming), JSON schema inference, form-encoded and multipart request-body inference
 - **pkg/generate/graphql**: GraphQL SDL generation from introspection results or traffic-based inference
 - **pkg/generate/wsdl**: WSDL generation from SOAP traffic, WSDL document parsing, type inference from SOAP envelopes
 - **pkg/importer**: Traffic importers for Burp Suite XML, HAR 1.2, and mitmproxy dumps (including mitmproxy's native tnetstring `.mitm` format); format registry with layered safety caps — 500 MB per file, 64 MB per tnetstring element, 1 M entries per list/dict, 500 K flows per native stream
