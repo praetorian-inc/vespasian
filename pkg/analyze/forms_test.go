@@ -269,12 +269,12 @@ func TestExtractForms_SelectAndTextareaExtracted(t *testing.T) {
 	}
 	// TEST-004: assert values, not just key presence.
 	// select with no value attribute -> option text content ("US").
-	if got[0].QueryParams["country"] != "US" {
-		t.Errorf("QueryParams[country] = %q, want US", got[0].QueryParams["country"])
+	if len(got[0].QueryParams["country"]) != 1 || got[0].QueryParams["country"][0] != "US" {
+		t.Errorf("QueryParams[country] = %v, want [US]", got[0].QueryParams["country"])
 	}
 	// textarea with empty content -> empty string.
-	if got[0].QueryParams["bio"] != "" {
-		t.Errorf("QueryParams[bio] = %q, want empty string", got[0].QueryParams["bio"])
+	if len(got[0].QueryParams["bio"]) != 1 || got[0].QueryParams["bio"][0] != "" {
+		t.Errorf("QueryParams[bio] = %v, want [\"\"]", got[0].QueryParams["bio"])
 	}
 }
 
@@ -439,8 +439,8 @@ func TestExtractForms_ValueFallbackPlaceholder(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(got))
 	}
-	if got[0].QueryParams["q"] != "search" {
-		t.Errorf("QueryParams[q] = %q, want search", got[0].QueryParams["q"])
+	if len(got[0].QueryParams["q"]) != 1 || got[0].QueryParams["q"][0] != "search" {
+		t.Errorf("QueryParams[q] = %v, want [search]", got[0].QueryParams["q"])
 	}
 }
 
@@ -786,11 +786,11 @@ func TestExtractForms_GetMergesActionQueryString(t *testing.T) {
 		t.Fatalf("expected 1 result, got %d", len(got))
 	}
 	r := got[0]
-	if r.QueryParams["lang"] != "en" {
-		t.Errorf("QueryParams[lang] = %q, want en", r.QueryParams["lang"])
+	if len(r.QueryParams["lang"]) != 1 || r.QueryParams["lang"][0] != "en" {
+		t.Errorf("QueryParams[lang] = %v, want [en]", r.QueryParams["lang"])
 	}
-	if r.QueryParams["q"] != "foo" {
-		t.Errorf("QueryParams[q] = %q, want foo", r.QueryParams["q"])
+	if len(r.QueryParams["q"]) != 1 || r.QueryParams["q"][0] != "foo" {
+		t.Errorf("QueryParams[q] = %v, want [foo]", r.QueryParams["q"])
 	}
 	if !strings.Contains(r.URL, "lang=en") {
 		t.Errorf("URL missing lang=en; got %q", r.URL)
@@ -807,8 +807,8 @@ func TestExtractForms_GetFormFieldOverridesActionQueryDuplicate(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(got))
 	}
-	if got[0].QueryParams["q"] != "new" {
-		t.Errorf("QueryParams[q] = %q, want new (form field should win)", got[0].QueryParams["q"])
+	if len(got[0].QueryParams["q"]) != 1 || got[0].QueryParams["q"][0] != "new" {
+		t.Errorf("QueryParams[q] = %v, want [new] (form field should win)", got[0].QueryParams["q"])
 	}
 }
 
@@ -823,8 +823,8 @@ func TestExtractForms_PostPreservesActionQueryString(t *testing.T) {
 	if !strings.Contains(r.URL, "ref=home") {
 		t.Errorf("URL missing ref=home; got %q", r.URL)
 	}
-	if r.QueryParams["ref"] != "home" {
-		t.Errorf("QueryParams[ref] = %q, want home", r.QueryParams["ref"])
+	if len(r.QueryParams["ref"]) != 1 || r.QueryParams["ref"][0] != "home" {
+		t.Errorf("QueryParams[ref] = %v, want [home]", r.QueryParams["ref"])
 	}
 	bodyStr := string(r.Body)
 	if !strings.Contains(bodyStr, "user=alice") {
@@ -911,8 +911,8 @@ func TestExtractForms_TextareaValueInGETQuery(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(got))
 	}
-	if got[0].QueryParams["msg"] != "hello world" {
-		t.Errorf("QueryParams[msg] = %q, want \"hello world\"", got[0].QueryParams["msg"])
+	if len(got[0].QueryParams["msg"]) != 1 || got[0].QueryParams["msg"][0] != "hello world" {
+		t.Errorf("QueryParams[msg] = %v, want [\"hello world\"]", got[0].QueryParams["msg"])
 	}
 	if !strings.Contains(got[0].URL, "msg=hello+world") && !strings.Contains(got[0].URL, "msg=hello%20world") {
 		t.Errorf("URL missing msg value; got %q", got[0].URL)

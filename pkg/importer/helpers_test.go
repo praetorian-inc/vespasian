@@ -24,34 +24,39 @@ func TestExtractQueryParams(t *testing.T) {
 	tests := []struct {
 		name string
 		url  string
-		want map[string]string
+		want map[string][]string
 	}{
 		{
 			name: "single parameter",
 			url:  "https://example.com/api?page=1",
-			want: map[string]string{"page": "1"},
+			want: map[string][]string{"page": {"1"}},
 		},
 		{
 			name: "multiple parameters",
 			url:  "https://example.com/api?page=1&limit=10&sort=desc",
-			want: map[string]string{
-				"page":  "1",
-				"limit": "10",
-				"sort":  "desc",
+			want: map[string][]string{
+				"page":  {"1"},
+				"limit": {"10"},
+				"sort":  {"desc"},
 			},
 		},
 		{
 			name: "parameter with special characters",
 			url:  "https://example.com/search?q=hello+world&filter=type%3Dpost",
-			want: map[string]string{
-				"q":      "hello world",
-				"filter": "type=post",
+			want: map[string][]string{
+				"q":      {"hello world"},
+				"filter": {"type=post"},
 			},
 		},
 		{
-			name: "duplicate keys (takes first value)",
-			url:  "https://example.com/api?tag=go&tag=rust",
-			want: map[string]string{"tag": "go"},
+			name: "multi-value key preserves all values",
+			url:  "https://example.com/api?tag=a&tag=b&tag=c",
+			want: map[string][]string{"tag": {"a", "b", "c"}},
+		},
+		{
+			name: "mixed single and multi-value",
+			url:  "https://example.com/api?page=1&tag=a&tag=b",
+			want: map[string][]string{"page": {"1"}, "tag": {"a", "b"}},
 		},
 		{
 			name: "no query parameters",
@@ -66,12 +71,12 @@ func TestExtractQueryParams(t *testing.T) {
 		{
 			name: "parameter with empty value",
 			url:  "https://example.com/api?key=",
-			want: map[string]string{"key": ""},
+			want: map[string][]string{"key": {""}},
 		},
 		{
 			name: "parameter without value",
 			url:  "https://example.com/api?flag",
-			want: map[string]string{"flag": ""},
+			want: map[string][]string{"flag": {""}},
 		},
 		{
 			name: "invalid URL",
@@ -106,7 +111,7 @@ func TestExtractQueryParams(t *testing.T) {
 		{
 			name: "fragment after query",
 			url:  "https://example.com/api?page=1#section",
-			want: map[string]string{"page": "1"},
+			want: map[string][]string{"page": {"1"}},
 		},
 		{
 			name: "URL with control character (triggers url.Parse error)",

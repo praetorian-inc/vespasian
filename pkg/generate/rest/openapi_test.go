@@ -169,9 +169,9 @@ func TestOpenAPIGenerator_RealWorldExample(t *testing.T) {
 			ObservedRequest: crawl.ObservedRequest{
 				Method: "GET",
 				URL:    "https://api.example.com/users?limit=10&offset=0",
-				QueryParams: map[string]string{
-					"limit":  "10",
-					"offset": "0",
+				QueryParams: map[string][]string{
+					"limit":  {"10"},
+					"offset": {"0"},
 				},
 				Response: crawl.ObservedResponse{
 					StatusCode: 200,
@@ -1408,6 +1408,281 @@ func TestOpenAPIGenerator_NonHTTPScheme(t *testing.T) {
 	if !strings.Contains(specStr, "/valid") {
 		t.Error("HTTPS endpoint should be present")
 	}
+}
+
+// TestBuildOperation_EmptyValuesQueryParam is a regression test for D2: a query
+// parameter with an empty observed-values slice must be silently omitted from
+// the generated Operation. Prior to the D2 fix, buildOperation would panic
+// with an index-out-of-range accessing info.values[0] on the scalar branch.
+func TestBuildOperation_EmptyValuesQueryParam(t *testing.T) {
+	// "foo" has an empty values slice — simulates a hand-crafted capture where
+	// the param key is present but no values were ever recorded.
+	// "bar" is a normal scalar param that should still appear.
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://api.example.com/items?bar=1",
+				QueryParams: map[string][]string{"foo": {}, "bar": {"1"}},
+				Response:    crawl.ObservedResponse{StatusCode: 200},
+			},
+			IsAPI: true,
+		},
+	}
+	key := endpointKey{path: "/items", method: "get"}
+
+	// Must not panic.
+	op := buildOperation(key, group)
+
+	// "foo" must be absent — no observed values means we cannot document it.
+	for _, paramRef := range op.Parameters {
+		if paramRef.Value != nil && paramRef.Value.Name == "foo" {
+			t.Errorf("parameter 'foo' with empty values should be omitted, but was emitted")
+		}
+	}
+
+	// "bar" must still be present.
+	found := false
+	for _, paramRef := range op.Parameters {
+		if paramRef.Value != nil && paramRef.Value.Name == "bar" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("parameter 'bar' with a valid value should be emitted")
+	}
+}
+
+// TestBuildOperation_ScalarQueryParam is a regression test: a scalar query param
+// should produce a non-array parameter with no Style or Explode set.
+func TestBuildOperation_ScalarQueryParam(t *testing.T) {
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://api.example.com/items?page=1",
+				QueryParams: map[string][]string{"page": {"1"}},
+				Response:    crawl.ObservedResponse{StatusCode: 200},
+			},
+			IsAPI: true,
+		},
+	}
+	key := endpointKey{path: "/items", method: "get"}
+	op := buildOperation(key, group)
+
+	require.Len(t, op.Parameters, 1)
+	param := op.Parameters[0].Value
+	require.NotNil(t, param)
+	require.NotNil(t, param.Schema)
+	require.NotNil(t, param.Schema.Value)
+	require.NotNil(t, param.Schema.Value.Type)
+
+	assert.Equal(t, "integer", param.Schema.Value.Type.Slice()[0], "type should be integer for scalar")
+	assert.Equal(t, "", param.Style, "scalar param should have no style")
+	assert.Nil(t, param.Explode, "scalar param should have nil Explode")
+	assert.Nil(t, param.Schema.Value.Items, "scalar param should have no items")
+}
+
+// TestBuildOperation_MultiValueQueryParam_AllInts tests that an array param with
+// all-integer values produces type:array with items type:integer and style/explode set.
+func TestBuildOperation_MultiValueQueryParam_AllInts(t *testing.T) {
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://api.example.com/items?ids=1&ids=2&ids=3",
+				QueryParams: map[string][]string{"ids": {"1", "2", "3"}},
+				Response:    crawl.ObservedResponse{StatusCode: 200},
+			},
+			IsAPI: true,
+		},
+	}
+	key := endpointKey{path: "/items", method: "get"}
+	op := buildOperation(key, group)
+
+	require.Len(t, op.Parameters, 1)
+	param := op.Parameters[0].Value
+	require.NotNil(t, param)
+	require.NotNil(t, param.Schema)
+	require.NotNil(t, param.Schema.Value)
+	require.NotNil(t, param.Schema.Value.Type)
+
+	assert.Equal(t, "array", param.Schema.Value.Type.Slice()[0], "type should be array")
+	require.NotNil(t, param.Schema.Value.Items, "items must be set for array param")
+	require.NotNil(t, param.Schema.Value.Items.Value)
+	require.NotNil(t, param.Schema.Value.Items.Value.Type)
+	assert.Equal(t, "integer", param.Schema.Value.Items.Value.Type.Slice()[0], "items type should be integer")
+	assert.Equal(t, "form", param.Style, "style should be form")
+	require.NotNil(t, param.Explode)
+	assert.True(t, *param.Explode, "explode should be true")
+}
+
+// TestBuildOperation_MultiValueQueryParam_Mixed tests that a mixed-type array
+// falls back to items type:string.
+func TestBuildOperation_MultiValueQueryParam_Mixed(t *testing.T) {
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://api.example.com/items?tag=a&tag=1",
+				QueryParams: map[string][]string{"tag": {"a", "1"}},
+				Response:    crawl.ObservedResponse{StatusCode: 200},
+			},
+			IsAPI: true,
+		},
+	}
+	key := endpointKey{path: "/items", method: "get"}
+	op := buildOperation(key, group)
+
+	require.Len(t, op.Parameters, 1)
+	param := op.Parameters[0].Value
+	require.NotNil(t, param.Schema.Value.Items)
+	assert.Equal(t, "string", param.Schema.Value.Items.Value.Type.Slice()[0], "mixed values should produce items type:string")
+}
+
+// TestBuildOperation_MultiValueQueryParam_AllBool tests all-boolean array values.
+func TestBuildOperation_MultiValueQueryParam_AllBool(t *testing.T) {
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://api.example.com/flags?flag=true&flag=false",
+				QueryParams: map[string][]string{"flag": {"true", "false"}},
+				Response:    crawl.ObservedResponse{StatusCode: 200},
+			},
+			IsAPI: true,
+		},
+	}
+	key := endpointKey{path: "/flags", method: "get"}
+	op := buildOperation(key, group)
+
+	require.Len(t, op.Parameters, 1)
+	param := op.Parameters[0].Value
+	require.NotNil(t, param.Schema.Value.Items)
+	assert.Equal(t, "boolean", param.Schema.Value.Items.Value.Type.Slice()[0], "all-bool values should produce items type:boolean")
+}
+
+// TestInferQueryParamItemsType tests the items type inference function directly.
+func TestInferQueryParamItemsType(t *testing.T) {
+	tests := []struct {
+		name   string
+		values []string
+		want   string
+	}{
+		{name: "empty slice", values: []string{}, want: "string"},
+		{name: "all integers", values: []string{"1", "2", "3"}, want: "integer"},
+		{name: "all floats", values: []string{"1.5", "2.5"}, want: "number"},
+		{name: "all booleans", values: []string{"true", "false"}, want: "boolean"},
+		{name: "mixed string and int", values: []string{"a", "1"}, want: "string"},
+		{name: "single string", values: []string{"hello"}, want: "string"},
+		{name: "integer is also float, int wins", values: []string{"1", "2"}, want: "integer"},
+		{name: "single negative integer", values: []string{"-1"}, want: "integer"},
+		{name: "single zero", values: []string{"0"}, want: "integer"},
+		{name: "single negative float", values: []string{"-0.5"}, want: "number"},
+		{name: "single scientific notation", values: []string{"1e10"}, want: "number"},
+		{name: "single empty string", values: []string{""}, want: "string"},
+		{name: "single mixed alphanumeric", values: []string{"abc123"}, want: "string"},
+		{name: "single uppercase boolean-like", values: []string{"True"}, want: "string"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := inferQueryParamItemsType(tt.values)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestBuildOperation_ScalarQueryParam_OrderIndependence(t *testing.T) {
+	// Two observations of the same scalar param: int first, then float.
+	// Pre-fix: scalar branch took values[0] = "1" → emitted integer.
+	// Post-fix: inferQueryParamItemsType walks all values → emits number.
+	group := []classify.ClassifiedRequest{
+		{ObservedRequest: crawl.ObservedRequest{
+			Method: "GET", URL: "https://x.test/items?limit=1",
+			QueryParams: map[string][]string{"limit": {"1"}},
+		}},
+		{ObservedRequest: crawl.ObservedRequest{
+			Method: "GET", URL: "https://x.test/items?limit=1.5",
+			QueryParams: map[string][]string{"limit": {"1.5"}},
+		}},
+	}
+	op := buildOperation(endpointKey{path: "/items", method: "get"}, group)
+	require.NotNil(t, op)
+	require.Len(t, op.Parameters, 1)
+	p := op.Parameters[0].Value
+	require.NotNil(t, p)
+	require.NotNil(t, p.Schema)
+	require.NotNil(t, p.Schema.Value)
+	require.NotNil(t, p.Schema.Value.Type)
+	assert.Equal(t, []string{"number"}, p.Schema.Value.Type.Slice(),
+		"scalar param type must be inferred from ALL observed values, not just the first")
+	// Confirm scalar emission (not array): no Style/Explode set
+	assert.Empty(t, p.Style, "scalar param should not set Style")
+	assert.Nil(t, p.Explode, "scalar param should not set Explode")
+}
+
+func TestBuildOperation_PostDedupScalarNotOverWidened(t *testing.T) {
+	// Regression: when classify.Deduplicate merges two scalar observations
+	// of the same endpoint into one ClassifiedRequest, buildOperation must
+	// still emit the param as scalar (not array). The pre-fix bug was that
+	// the merged QueryParams slice had len > 1, tripping multiValueSeen.
+	// The fix uses MultiValueQueryKeys (populated by RunClassifiers BEFORE
+	// dedup) to record per-observation truth.
+	//
+	// Simulate post-dedup state: one ClassifiedRequest with merged values
+	// AND an empty MultiValueQueryKeys map (no key was multi-value in any
+	// contributing observation).
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://x.test/items?page=1",
+				QueryParams: map[string][]string{"page": {"1", "2"}},
+			},
+			MultiValueQueryKeys: map[string]bool{}, // empty: page was scalar in both contributing obs
+		},
+	}
+	op := buildOperation(endpointKey{path: "/items", method: "get"}, group)
+	require.NotNil(t, op)
+	require.Len(t, op.Parameters, 1)
+	p := op.Parameters[0].Value
+	require.NotNil(t, p.Schema)
+	require.NotNil(t, p.Schema.Value)
+	require.NotNil(t, p.Schema.Value.Type)
+	assert.Equal(t, []string{"integer"}, p.Schema.Value.Type.Slice(),
+		"scalar param surviving dedup union must NOT be over-widened to array")
+	assert.Empty(t, p.Style, "scalar must not set Style")
+	assert.Nil(t, p.Explode, "scalar must not set Explode")
+	assert.Nil(t, p.Schema.Value.Items, "scalar must not have Items")
+}
+
+func TestBuildOperation_PostDedupArrayStillDetected(t *testing.T) {
+	// Companion regression: when a key WAS multi-value in a contributing
+	// observation, MultiValueQueryKeys carries that truth through dedup,
+	// and buildOperation must emit the param as array.
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://x.test/items?tag=a&tag=b",
+				QueryParams: map[string][]string{"tag": {"a", "b"}},
+			},
+			MultiValueQueryKeys: map[string]bool{"tag": true},
+		},
+	}
+	op := buildOperation(endpointKey{path: "/items", method: "get"}, group)
+	require.NotNil(t, op)
+	require.Len(t, op.Parameters, 1)
+	p := op.Parameters[0].Value
+	require.NotNil(t, p.Schema)
+	require.NotNil(t, p.Schema.Value)
+	require.NotNil(t, p.Schema.Value.Type)
+	assert.Equal(t, []string{"array"}, p.Schema.Value.Type.Slice(),
+		"key with MultiValueQueryKeys=true must emit as array")
+	assert.Equal(t, "form", p.Style)
+	require.NotNil(t, p.Explode)
+	assert.True(t, *p.Explode)
 }
 
 // TestMergeJSONBodies_TypeConflictPromotesToString verifies that JSON merge

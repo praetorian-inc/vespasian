@@ -51,6 +51,18 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 		bestMatch.IsAPI = false
 		bestMatch.Confidence = 0
 
+		// Capture per-observation multi-value-ness BEFORE Deduplicate can
+		// merge values across observations and obscure which keys were
+		// truly multi-value in any single request. Always non-nil so
+		// downstream consumers can distinguish "RunClassifiers ran, no
+		// multi-value keys" from "ClassifiedRequest built directly".
+		bestMatch.MultiValueQueryKeys = make(map[string]bool)
+		for k, vs := range req.QueryParams {
+			if len(vs) > 1 {
+				bestMatch.MultiValueQueryKeys[k] = true
+			}
+		}
+
 		for _, classifier := range classifiers {
 			var isAPI bool
 			var confidence float64
@@ -81,7 +93,8 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 
 // Deduplicate removes duplicate classified requests, keeping the highest confidence.
 // The deduplication key is METHOD:path (query params and fragments stripped).
-// QueryParams from all duplicate observations are merged.
+// Multi-value QueryParams from duplicate observations are merged with union-of-values,
+// preserving first-seen order.
 //
 // Memory usage: The map and order slice grow linearly with unique METHOD:path keys.
 // In practice this is bounded by the upstream crawl layer's MaxPages setting
@@ -163,19 +176,36 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest { //nolint:
 		existing, found := seen[key]
 		if !found {
 			order = append(order, key)
-			seen[key] = &entry{req: req}
-		} else {
-			// Merge unique QueryParams.
+			// Deep-copy QueryParams so that merging into the entry does not mutate
+			// the caller's original ClassifiedRequest slices.
+			entryCopy := req
 			if req.QueryParams != nil {
-				if existing.req.QueryParams == nil {
-					existing.req.QueryParams = make(map[string]string)
-				}
-				for k, v := range req.QueryParams {
-					if _, exists := existing.req.QueryParams[k]; !exists {
-						existing.req.QueryParams[k] = v
-					}
+				entryCopy.QueryParams = make(map[string][]string, len(req.QueryParams))
+				for k, vs := range req.QueryParams {
+					copied := make([]string, len(vs))
+					copy(copied, vs)
+					entryCopy.QueryParams[k] = copied
 				}
 			}
+			entryCopy.MultiValueQueryKeys = mergeMultiValueKeys(nil, req.MultiValueQueryKeys)
+			seen[key] = &entry{req: entryCopy}
+		} else {
+			// Merge multi-value QueryParams: union per key, preserving first-seen order.
+			if req.QueryParams != nil {
+				if existing.req.QueryParams == nil {
+					existing.req.QueryParams = make(map[string][]string)
+				}
+				for k, vs := range req.QueryParams {
+					existing.req.QueryParams[k] = MergeUniqueOrdered(existing.req.QueryParams[k], vs)
+				}
+			}
+
+			// Union MultiValueQueryKeys: a key is multi-value in the
+			// dedup entry if ANY contributing observation saw it as
+			// multi-value. (Scalar values that merely differ across
+			// observations do NOT make the merged entry multi-value —
+			// that's the regression this tracking exists to prevent.)
+			existing.req.MultiValueQueryKeys = mergeMultiValueKeys(existing.req.MultiValueQueryKeys, req.MultiValueQueryKeys)
 
 			// Keep highest confidence, but preserve first occurrence's body/response.
 			if req.Confidence > existing.req.Confidence {
@@ -191,6 +221,63 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest { //nolint:
 		results = append(results, seen[key].req)
 	}
 	return results
+}
+
+// MergeUniqueOrdered returns a new slice containing the values of a followed
+// by the values of b, with duplicates removed. The first occurrence of each
+// distinct value wins, preserving order. Neither input slice is modified.
+//
+// This function is safe to call when a or b reference data that should not be
+// mutated (e.g., observation data passed to Deduplicate) — the returned slice
+// is always a fresh allocation.
+//
+// Returns nil when both inputs are empty (treats nil and empty slices
+// interchangeably) so callers can range over the result without a nil-check.
+func MergeUniqueOrdered(a, b []string) []string {
+	if len(a) == 0 && len(b) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(a)+len(b))
+	seen := make(map[string]struct{}, len(a)+len(b))
+	for _, v := range a {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	for _, v := range b {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+// mergeMultiValueKeys returns dst with each true entry from src added.
+// If src is nil, dst is returned unchanged. If dst is nil and src is
+// non-nil, a fresh map sized to src is allocated. Used by Deduplicate to
+// union per-observation multi-value-key tracking across merged requests.
+//
+// False-valued entries in src are intentionally omitted: consumers
+// (notably buildOperation in pkg/generate/rest) treat map-absence as
+// "not multi-value", matching Go's zero-value semantics for bool, so
+// there is no need to record key=false explicitly.
+func mergeMultiValueKeys(dst, src map[string]bool) map[string]bool {
+	if src == nil {
+		return dst
+	}
+	if dst == nil {
+		dst = make(map[string]bool, len(src))
+	}
+	for k, v := range src {
+		if v {
+			dst[k] = true
+		}
+	}
+	return dst
 }
 
 // getSoapAction returns the SOAPAction header value, performing a case-insensitive lookup.

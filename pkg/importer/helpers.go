@@ -44,35 +44,24 @@ func previewBytes(payload []byte) string {
 }
 
 // extractQueryParams parses query parameters from a URL string.
-// Returns nil if the URL has no query parameters or is invalid.
-// For duplicate keys, only the first value is returned.
+// Returns nil if the URL is invalid or not absolute.
+// All values for a key are preserved (multi-value query params).
 //
-// Note: Validates URL has scheme and host (absolute URL requirement per B3).
-// url.Parse is lenient and accepts relative paths like "not a url" without error.
-// We require absolute URLs for traffic imports since they represent real requests.
-func extractQueryParams(urlStr string) map[string]string {
+// The Scheme+Host check below is required because url.Parse is intentionally
+// lenient: it accepts relative paths (e.g. "not a url") without error, setting
+// Scheme and Host to "". Traffic imports represent real captured requests and
+// must have absolute URLs, so we reject anything without both fields.
+func extractQueryParams(urlStr string) map[string][]string {
 	parsed, err := url.Parse(urlStr)
 	if err != nil {
 		return nil
 	}
-
-	// Validate absolute URL: must have scheme and host (B3 fix)
-	// url.Parse accepts "not a url" as a relative path without error
 	if parsed.Scheme == "" || parsed.Host == "" {
 		return nil
 	}
-
 	queryValues := parsed.Query()
 	if len(queryValues) == 0 {
 		return nil
 	}
-
-	params := make(map[string]string)
-	for key, values := range queryValues {
-		if len(values) > 0 {
-			params[key] = values[0] // Take first value for duplicate keys
-		}
-	}
-
-	return params
+	return queryValues
 }
