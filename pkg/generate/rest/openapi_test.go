@@ -1210,3 +1210,66 @@ func TestBuildOperation_ScalarQueryParam_OrderIndependence(t *testing.T) {
 	assert.Empty(t, p.Style, "scalar param should not set Style")
 	assert.Nil(t, p.Explode, "scalar param should not set Explode")
 }
+
+func TestBuildOperation_PostDedupScalarNotOverWidened(t *testing.T) {
+	// Regression: when classify.Deduplicate merges two scalar observations
+	// of the same endpoint into one ClassifiedRequest, buildOperation must
+	// still emit the param as scalar (not array). The pre-fix bug was that
+	// the merged QueryParams slice had len > 1, tripping multiValueSeen.
+	// The fix uses MultiValueQueryKeys (populated by RunClassifiers BEFORE
+	// dedup) to record per-observation truth.
+	//
+	// Simulate post-dedup state: one ClassifiedRequest with merged values
+	// AND an empty MultiValueQueryKeys map (no key was multi-value in any
+	// contributing observation).
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://x.test/items?page=1",
+				QueryParams: map[string][]string{"page": {"1", "2"}},
+			},
+			MultiValueQueryKeys: map[string]bool{}, // empty: page was scalar in both contributing obs
+		},
+	}
+	op := buildOperation(endpointKey{path: "/items", method: "get"}, group)
+	require.NotNil(t, op)
+	require.Len(t, op.Parameters, 1)
+	p := op.Parameters[0].Value
+	require.NotNil(t, p.Schema)
+	require.NotNil(t, p.Schema.Value)
+	require.NotNil(t, p.Schema.Value.Type)
+	assert.Equal(t, []string{"integer"}, p.Schema.Value.Type.Slice(),
+		"scalar param surviving dedup union must NOT be over-widened to array")
+	assert.Empty(t, p.Style, "scalar must not set Style")
+	assert.Nil(t, p.Explode, "scalar must not set Explode")
+	assert.Nil(t, p.Schema.Value.Items, "scalar must not have Items")
+}
+
+func TestBuildOperation_PostDedupArrayStillDetected(t *testing.T) {
+	// Companion regression: when a key WAS multi-value in a contributing
+	// observation, MultiValueQueryKeys carries that truth through dedup,
+	// and buildOperation must emit the param as array.
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://x.test/items?tag=a&tag=b",
+				QueryParams: map[string][]string{"tag": {"a", "b"}},
+			},
+			MultiValueQueryKeys: map[string]bool{"tag": true},
+		},
+	}
+	op := buildOperation(endpointKey{path: "/items", method: "get"}, group)
+	require.NotNil(t, op)
+	require.Len(t, op.Parameters, 1)
+	p := op.Parameters[0].Value
+	require.NotNil(t, p.Schema)
+	require.NotNil(t, p.Schema.Value)
+	require.NotNil(t, p.Schema.Value.Type)
+	assert.Equal(t, []string{"array"}, p.Schema.Value.Type.Slice(),
+		"key with MultiValueQueryKeys=true must emit as array")
+	assert.Equal(t, "form", p.Style)
+	require.NotNil(t, p.Explode)
+	assert.True(t, *p.Explode)
+}

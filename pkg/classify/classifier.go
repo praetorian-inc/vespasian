@@ -47,6 +47,18 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 		bestMatch.IsAPI = false
 		bestMatch.Confidence = 0
 
+		// Capture per-observation multi-value-ness BEFORE Deduplicate can
+		// merge values across observations and obscure which keys were
+		// truly multi-value in any single request. Always non-nil so
+		// downstream consumers can distinguish "RunClassifiers ran, no
+		// multi-value keys" from "ClassifiedRequest built directly".
+		bestMatch.MultiValueQueryKeys = make(map[string]bool)
+		for k, vs := range req.QueryParams {
+			if len(vs) > 1 {
+				bestMatch.MultiValueQueryKeys[k] = true
+			}
+		}
+
 		for _, classifier := range classifiers {
 			var isAPI bool
 			var confidence float64
@@ -129,6 +141,7 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
 					entryCopy.QueryParams[k] = copied
 				}
 			}
+			entryCopy.MultiValueQueryKeys = mergeMultiValueKeys(nil, req.MultiValueQueryKeys)
 			seen[key] = &entry{req: entryCopy}
 		} else {
 			// Merge multi-value QueryParams: union per key, preserving first-seen order.
@@ -140,6 +153,13 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
 					existing.req.QueryParams[k] = MergeUniqueOrdered(existing.req.QueryParams[k], vs)
 				}
 			}
+
+			// Union MultiValueQueryKeys: a key is multi-value in the
+			// dedup entry if ANY contributing observation saw it as
+			// multi-value. (Scalar values that merely differ across
+			// observations do NOT make the merged entry multi-value —
+			// that's the regression this tracking exists to prevent.)
+			existing.req.MultiValueQueryKeys = mergeMultiValueKeys(existing.req.MultiValueQueryKeys, req.MultiValueQueryKeys)
 
 			// Keep highest confidence, but preserve first occurrence's body/response.
 			if req.Confidence > existing.req.Confidence {
@@ -188,6 +208,25 @@ func MergeUniqueOrdered(a, b []string) []string {
 		out = append(out, v)
 	}
 	return out
+}
+
+// mergeMultiValueKeys returns dst with each true entry from src added.
+// If src is nil, dst is returned unchanged. If dst is nil and src is
+// non-nil, a fresh map sized to src is allocated. Used by Deduplicate to
+// union per-observation multi-value-key tracking across merged requests.
+func mergeMultiValueKeys(dst, src map[string]bool) map[string]bool {
+	if src == nil {
+		return dst
+	}
+	if dst == nil {
+		dst = make(map[string]bool, len(src))
+	}
+	for k, v := range src {
+		if v {
+			dst[k] = true
+		}
+	}
+	return dst
 }
 
 // getSoapAction returns the SOAPAction header value, performing a case-insensitive lookup.

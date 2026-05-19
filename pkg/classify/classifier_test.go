@@ -518,3 +518,87 @@ func TestRunClassifiers_WSDLWinsOverREST(t *testing.T) {
 	assert.Equal(t, "wsdl", results[0].APIType, "WSDL should win for SOAP traffic")
 	assert.GreaterOrEqual(t, results[0].Confidence, 0.90)
 }
+
+func TestRunClassifiers_PopulatesMultiValueQueryKeys(t *testing.T) {
+	// RunClassifiers must record which keys were observed as multi-value
+	// (len > 1) BEFORE Deduplicate can merge values across observations.
+	classifiers := []APIClassifier{&RESTClassifier{}}
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/api/items?tag=a&tag=b&page=1",
+			QueryParams: map[string][]string{
+				"tag":  {"a", "b"}, // multi-value
+				"page": {"1"},      // scalar
+			},
+			Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json"},
+		},
+		{
+			Method: "GET",
+			URL:    "https://example.com/api/items?page=2",
+			QueryParams: map[string][]string{
+				"page": {"2"}, // scalar
+			},
+			Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json"},
+		},
+	}
+	results := RunClassifiers(classifiers, requests, 0.5)
+	require.Len(t, results, 2)
+
+	// First request: tag multi-value, page scalar.
+	require.NotNil(t, results[0].MultiValueQueryKeys, "MultiValueQueryKeys must always be non-nil after RunClassifiers")
+	assert.True(t, results[0].MultiValueQueryKeys["tag"], "tag was observed as multi-value")
+	assert.False(t, results[0].MultiValueQueryKeys["page"], "page was scalar in obs 1")
+
+	// Second request: page scalar, no multi-value keys.
+	require.NotNil(t, results[1].MultiValueQueryKeys, "MultiValueQueryKeys must always be non-nil after RunClassifiers")
+	assert.Empty(t, results[1].MultiValueQueryKeys, "no key was multi-value in obs 2")
+}
+
+func TestDeduplicate_UnionsMultiValueQueryKeys(t *testing.T) {
+	// Regression: Deduplicate merges QueryParams via union, which makes
+	// the merged slice len > 1 even when each contributing observation
+	// was scalar. MultiValueQueryKeys must carry the per-observation
+	// truth through dedup so downstream consumers (OpenAPI generator)
+	// can tell "actually multi-value" from "scalar with different values
+	// across observations".
+	classified := []ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://x.test/items?page=1",
+				QueryParams: map[string][]string{"page": {"1"}},
+			},
+			MultiValueQueryKeys: map[string]bool{}, // page scalar
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://x.test/items?page=2",
+				QueryParams: map[string][]string{"page": {"2"}},
+			},
+			MultiValueQueryKeys: map[string]bool{}, // page scalar
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://x.test/items?tag=a&tag=b",
+				QueryParams: map[string][]string{"tag": {"a", "b"}},
+			},
+			MultiValueQueryKeys: map[string]bool{"tag": true},
+		},
+	}
+	result := Deduplicate(classified)
+	require.Len(t, result, 1, "all three observations dedup to one GET:/items")
+
+	// Merged QueryParams: page=[1,2], tag=[a,b].
+	assert.Equal(t, []string{"1", "2"}, result[0].QueryParams["page"])
+	assert.Equal(t, []string{"a", "b"}, result[0].QueryParams["tag"])
+
+	// Critical: MultiValueQueryKeys must reflect per-observation truth.
+	require.NotNil(t, result[0].MultiValueQueryKeys)
+	assert.False(t, result[0].MultiValueQueryKeys["page"],
+		"page was scalar in every contributing observation; dedup must NOT mark it multi-value")
+	assert.True(t, result[0].MultiValueQueryKeys["tag"],
+		"tag was multi-value in obs 3; dedup must preserve that bit")
+}

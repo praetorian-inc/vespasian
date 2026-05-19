@@ -172,7 +172,18 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest) *openap
 				queryParams[name] = info
 			}
 			info.count++
-			if len(vals) > 1 {
+			// Prefer the per-observation truth recorded by RunClassifiers
+			// (MultiValueQueryKeys) — that survives Deduplicate's
+			// union-merge, whereas len(vals) > 1 here can falsely fire
+			// when dedup merged two scalar observations of the same key
+			// with different values. Fall back to len-based detection
+			// only when MultiValueQueryKeys is nil (direct test
+			// construction that doesn't go through RunClassifiers).
+			if ep.MultiValueQueryKeys != nil {
+				if ep.MultiValueQueryKeys[name] {
+					info.multiValueSeen = true
+				}
+			} else if len(vals) > 1 {
 				info.multiValueSeen = true
 			}
 			info.values = classify.MergeUniqueOrdered(info.values, vals)
