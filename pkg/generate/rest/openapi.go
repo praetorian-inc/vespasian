@@ -114,23 +114,35 @@ func extractServers(endpoints []classify.ClassifiedRequest) (openapi3.Servers, s
 }
 
 // groupEndpoints groups and sorts endpoints by normalized path and HTTP method.
+//
+// Path normalization runs in two passes so that slug-style identifiers can be
+// detected from the population of observed paths. The first pass parses URLs
+// and collects their paths; the second pass calls NormalizePathsWithNames
+// once, which performs both regex-based and observation-based detection.
 func groupEndpoints(endpoints []classify.ClassifiedRequest) map[endpointKey][]classify.ClassifiedRequest {
-	endpointGroups := make(map[endpointKey][]classify.ClassifiedRequest)
-
+	type parsedEndpoint struct {
+		path     string
+		endpoint classify.ClassifiedRequest
+	}
+	parsed := make([]parsedEndpoint, 0, len(endpoints))
+	rawPaths := make([]string, 0, len(endpoints))
 	for _, endpoint := range endpoints {
 		parsedURL, err := url.Parse(endpoint.URL)
 		if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
 			// Skip malformed URLs or non-HTTP/HTTPS schemes
 			continue
 		}
-
-		normalizedPath := NormalizePathWithNames(parsedURL.Path)
-		method := strings.ToLower(endpoint.Method)
-
-		key := endpointKey{normalizedPath, method}
-		endpointGroups[key] = append(endpointGroups[key], endpoint)
+		parsed = append(parsed, parsedEndpoint{path: parsedURL.Path, endpoint: endpoint})
+		rawPaths = append(rawPaths, parsedURL.Path)
 	}
 
+	normalized := NormalizePathsWithNames(rawPaths)
+
+	endpointGroups := make(map[endpointKey][]classify.ClassifiedRequest)
+	for _, p := range parsed {
+		key := endpointKey{normalized[p.path], strings.ToLower(p.endpoint.Method)}
+		endpointGroups[key] = append(endpointGroups[key], p.endpoint)
+	}
 	return endpointGroups
 }
 
