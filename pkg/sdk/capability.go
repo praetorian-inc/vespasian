@@ -25,7 +25,6 @@ import (
 
 	"github.com/praetorian-inc/capability-sdk/pkg/capability"
 	"github.com/praetorian-inc/capability-sdk/pkg/capmodel"
-	"github.com/praetorian-inc/tabularium/pkg/model/model"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
@@ -34,35 +33,19 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
 
-// SpecOutput mirrors the post-LAB-2807 capmodel.WebApplication wire shape.
-// It is emitted in place of capmodel.WebApplication until tabularium PR #324
-// merges and the capmodel sync bot regenerates capability-sdk's
-// capmodel.WebApplication to include Spec and SpecFormat fields. At that point,
-// remove this type and emit capmodel.WebApplication directly. The JSON tags here
-// must stay byte-for-byte identical to the post-sync capmodel.WebApplication
-// shape so the wire format does not change when the swap happens.
-type SpecOutput struct {
-	PrimaryURL string   `json:"primary_url"`
-	URLs       []string `json:"urls"`
-	Name       string   `json:"name"`
-	Seed       bool     `json:"seed"`
-	Spec       string   `json:"spec"`
-	SpecFormat string   `json:"spec_format"`
-}
-
 // specFormatForAPIType maps the resolved API type ("rest" / "graphql" / "wsdl")
-// to the corresponding tabularium SpecFormat constant. Returns the empty string
+// to the corresponding capmodel SpecFormat constant. Returns the empty string
 // for unknown types; in the Invoke path this is unreachable because Invoke
 // pre-resolves "auto" via resolveAPITypeWithWSDLProbe + DetectAPIType before
 // reaching emit.
 func specFormatForAPIType(apiType string) string {
 	switch apiType {
 	case "rest":
-		return model.SpecFormatOpenAPI
+		return capmodel.SpecFormatOpenAPI
 	case "graphql":
-		return model.SpecFormatGraphQL
+		return capmodel.SpecFormatGraphQL
 	case "wsdl":
-		return model.SpecFormatWSDL
+		return capmodel.SpecFormatWSDL
 	default:
 		return ""
 	}
@@ -384,10 +367,7 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 	}
 
 	// Preserve all input fields and overlay only the generated spec fields.
-	// SpecOutput carries the post-LAB-2807 wire shape (Spec + SpecFormat) in
-	// place of capmodel.WebApplication until tabularium PR #324 merges and the
-	// capmodel sync bot regenerates capability-sdk with the new fields.
-	webApp := SpecOutput{
+	webApp := capmodel.WebApplication{
 		PrimaryURL: input.PrimaryURL,
 		URLs:       input.URLs,
 		Name:       input.Name,

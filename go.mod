@@ -7,7 +7,7 @@ require (
 	github.com/alecthomas/kong v1.14.0
 	github.com/getkin/kin-openapi v0.134.0
 	github.com/go-rod/rod v0.116.2
-	github.com/praetorian-inc/capability-sdk v0.0.0-20260407200040-0c1ef1feb1e6
+	github.com/praetorian-inc/capability-sdk v0.0.0-20260521173605-4b0d5a7320ae
 	github.com/projectdiscovery/goflags v0.1.74
 	github.com/projectdiscovery/katana v1.5.0
 	github.com/stretchr/testify v1.11.1
@@ -17,16 +17,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-require (
-	github.com/aws/aws-sdk-go-v2 v1.41.1 // indirect
-	github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue v1.20.10 // indirect
-	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.50.2 // indirect
-	github.com/aws/aws-sdk-go-v2/service/dynamodbstreams v1.30.3 // indirect
-	github.com/aws/smithy-go v1.24.0 // indirect
-	github.com/go-openapi/swag/jsonname v0.25.1 // indirect
-	github.com/google/uuid v1.6.0 // indirect
-	github.com/knqyf263/go-cpe v0.0.0-20230627041855-cb0794d06872 // indirect
-)
+require github.com/go-openapi/swag/jsonname v0.25.1 // indirect
 
 require (
 	github.com/Knetic/govaluate v3.0.0+incompatible // indirect
@@ -89,7 +80,6 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.23 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
-	github.com/praetorian-inc/tabularium v1.0.307-pre-1-hunterverhelst-lab-2807-tabularium-rename-webapplicationopenapi-spec-add-specformat
 	github.com/projectdiscovery/blackrock v0.0.1 // indirect
 	github.com/projectdiscovery/dsl v0.8.5 // indirect
 	github.com/projectdiscovery/fastdialer v0.5.2 // indirect
@@ -148,9 +138,3 @@ require (
 	golang.org/x/tools v0.41.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
-
-// TEMP: pin to tabularium PR #324 HEAD until LAB-2807 merges and the
-// capmodel sync bot regenerates capability-sdk's capmodel.WebApplication
-// with Spec / SpecFormat fields. Remove this replace and bump the require
-// to a stable tabularium release after merge + sync.
-replace github.com/praetorian-inc/tabularium => github.com/praetorian-inc/tabularium v1.0.307-pre-1-hunterverhelst-lab-2807-tabularium-rename-webapplicationopenapi-spec-add-specformat

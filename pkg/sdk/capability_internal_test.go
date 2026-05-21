@@ -33,7 +33,6 @@ import (
 
 	"github.com/praetorian-inc/capability-sdk/pkg/capability"
 	"github.com/praetorian-inc/capability-sdk/pkg/capmodel"
-	"github.com/praetorian-inc/tabularium/pkg/model/model"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
@@ -870,7 +869,7 @@ func TestInvoke_AutoResolvesNonWSDLToConcreteSpecFormat(t *testing.T) {
 	err := cap.Invoke(ctx, input, emitter)
 	require.NoError(t, err)
 	assert.NotEmpty(t, captured.Spec)
-	assert.Equal(t, model.SpecFormatOpenAPI, captured.SpecFormat,
+	assert.Equal(t, capmodel.SpecFormatOpenAPI, captured.SpecFormat,
 		"auto + REST traffic + nil WSDL probe must resolve to openapi, never empty")
 }
 
@@ -878,7 +877,7 @@ func TestInvoke_AutoResolvesNonWSDLToConcreteSpecFormat(t *testing.T) {
 // TestInvoke_AutoResolvesNonWSDLToConcreteSpecFormat. It pins the second
 // reachable arm of the auto-resolution block at capability.go:368-373: when
 // api_type=auto, the WSDL probe returns nil, and the classifier detects
-// GraphQL traffic, the emitted SpecFormat must be model.SpecFormatGraphQL,
+// GraphQL traffic, the emitted SpecFormat must be capmodel.SpecFormatGraphQL,
 // never empty and never the REST fallback. A regression that hardcoded "rest"
 // in the auto-resolution block would pass the REST twin but corrupt this path
 // silently — this test catches that. Two graphqlRequest() instances are used
@@ -905,7 +904,7 @@ func TestInvoke_AutoResolvesGraphQLToGraphQLSpecFormat(t *testing.T) {
 	err := cap.Invoke(ctx, input, emitter)
 	require.NoError(t, err)
 	assert.NotEmpty(t, captured.Spec)
-	assert.Equal(t, model.SpecFormatGraphQL, captured.SpecFormat,
+	assert.Equal(t, capmodel.SpecFormatGraphQL, captured.SpecFormat,
 		"auto + GraphQL traffic + nil WSDL probe must resolve to graphql, never empty")
 }
 
@@ -1098,16 +1097,16 @@ func TestDecodeWSDLResponse_BodyReadError(t *testing.T) {
 // Group C — TEST-001: Invoke end-to-end via stubbed pipeline
 // ---------------------------------------------------------------------------
 
-// captureEmitter returns a *SpecOutput pointer that is populated
+// captureEmitter returns a *capmodel.WebApplication pointer that is populated
 // when the returned Emitter is called, and an Emitter that enforces that it
-// receives exactly one SpecOutput model.
-func captureEmitter(t *testing.T) (*SpecOutput, capability.Emitter) {
+// receives exactly one capmodel.WebApplication model.
+func captureEmitter(t *testing.T) (*capmodel.WebApplication, capability.Emitter) {
 	t.Helper()
-	var captured SpecOutput
+	var captured capmodel.WebApplication
 	emit := capability.EmitterFunc(func(models ...any) error {
 		require.Len(t, models, 1, "Emit should be called with exactly one model")
-		w, ok := models[0].(SpecOutput)
-		require.True(t, ok, "emitted model must be SpecOutput, got %T", models[0])
+		w, ok := models[0].(capmodel.WebApplication)
+		require.True(t, ok, "emitted model must be capmodel.WebApplication, got %T", models[0])
 		captured = w
 		return nil
 	})
@@ -1162,7 +1161,7 @@ func TestInvoke_EmitsWebApplicationPreservingInputFields(t *testing.T) {
 	assert.NotEmpty(t, captured.Spec)
 	assert.True(t, strings.Contains(captured.Spec, "openapi"),
 		"expected OpenAPI 3.0 marker in generated spec, got: %s", captured.Spec)
-	assert.Equal(t, model.SpecFormatOpenAPI, captured.SpecFormat)
+	assert.Equal(t, capmodel.SpecFormatOpenAPI, captured.SpecFormat)
 }
 
 // TestInvoke_WSDLProbeSynthesizesRequest exercises the WSDL probe branch in
@@ -1196,7 +1195,7 @@ func TestInvoke_WSDLProbeSynthesizesRequest(t *testing.T) {
 		strings.Contains(strings.ToLower(captured.Spec), "wsdl") ||
 			strings.Contains(captured.Spec, "<definitions"),
 		"expected WSDL content in generated spec, got: %s", captured.Spec)
-	assert.Equal(t, model.SpecFormatWSDL, captured.SpecFormat)
+	assert.Equal(t, capmodel.SpecFormatWSDL, captured.SpecFormat)
 }
 
 // TestInvoke_CrawlErrorPropagates verifies that a crawl error is wrapped and
@@ -1273,7 +1272,7 @@ func TestInvoke_GenPhaseUsesFreshContext(t *testing.T) {
 	captured, emitter := captureEmitter(t)
 	err := cap.Invoke(ctx, input, emitter)
 	require.NoError(t, err)
-	assert.Equal(t, model.SpecFormatOpenAPI, captured.SpecFormat,
+	assert.Equal(t, capmodel.SpecFormatOpenAPI, captured.SpecFormat,
 		"auto + REST traffic + nil WSDL probe must resolve SpecFormat to openapi")
 
 	require.NotNil(t, crawlCtx, "crawlCtx must be captured by crawlFn")
@@ -1330,7 +1329,7 @@ func TestInvoke_RESTAPITypeSkipsWSDLProbe(t *testing.T) {
 		"expected OpenAPI spec when api_type=rest, got: %s", captured.Spec)
 	assert.False(t, strings.Contains(captured.Spec, "<definitions"),
 		"expected no WSDL content when api_type=rest, got: %s", captured.Spec)
-	assert.Equal(t, model.SpecFormatOpenAPI, captured.SpecFormat)
+	assert.Equal(t, capmodel.SpecFormatOpenAPI, captured.SpecFormat)
 }
 
 // ---------------------------------------------------------------------------
@@ -1371,7 +1370,7 @@ func TestInvoke_GraphQLAPITypeSkipsWSDLProbe(t *testing.T) {
 	assert.NotEmpty(t, captured.Spec)
 	assert.Contains(t, captured.Spec, "# Inferred from observed traffic",
 		"expected GraphQL SDL inferred-from-traffic marker in spec, got: %s", captured.Spec)
-	assert.Equal(t, model.SpecFormatGraphQL, captured.SpecFormat)
+	assert.Equal(t, capmodel.SpecFormatGraphQL, captured.SpecFormat)
 	assert.False(t, wsdlProbeCalled, "wsdlProbeFn must not be called when api_type=graphql")
 }
 
