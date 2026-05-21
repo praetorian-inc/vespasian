@@ -2464,14 +2464,14 @@ func TestDetectAPIType_StaticHTMLPostFormDrivesREST(t *testing.T) {
 	}
 
 	raw := []crawl.ObservedRequest{soapAnchor, landingPage}
-	rawType := detectAPIType(raw, 0.5)
+	rawType := sdk.DetectAPIType(raw, 0.5)
 
 	augmented := append([]crawl.ObservedRequest{}, raw...)
 	augmented = append(augmented, analyze.ExtractForms(raw)...)
-	augType := detectAPIType(augmented, 0.5)
+	augType := sdk.DetectAPIType(augmented, 0.5)
 
 	if augType != apiTypeREST {
-		t.Errorf("detectAPIType(augmented) = %q, want %q", augType, apiTypeREST)
+		t.Errorf("sdk.DetectAPIType(augmented) = %q, want %q", augType, apiTypeREST)
 	}
 	if rawType == augType {
 		t.Errorf("ExtractForms must change classification: raw=%q augmented=%q (both same — pipeline reorder isn't load-bearing)", rawType, augType)
