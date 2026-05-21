@@ -335,6 +335,8 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 	// NOTE: capability.ExecutionContext does not carry a context.Context,
 	// so we create a fresh standalone context for the generate phase. Using
 	// a separate context ensures the crawl budget does not starve probing.
+	// If the SDK adds context support in the future, this should also thread
+	// the parent context.
 	genCtx, genCancel := context.WithTimeout(context.Background(), phaseBudget)
 	defer genCancel()
 
@@ -461,11 +463,14 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 	if probeEnabled {
 		cfg := probe.DefaultConfig()
 		strategies := ProbeStrategiesForType(resolvedAPIType, cfg)
-		enriched, probeErrs := probe.RunStrategies(ctx, strategies, classified)
-		if len(enriched) == 0 && len(probeErrs) > 0 {
-			return nil, fmt.Errorf("all probes failed: %v", probeErrs[0])
+		enriched, _ := probe.RunStrategies(ctx, strategies, classified)
+		// Match the CLI behavior in cmd/vespasian/main.go: a probe failure
+		// should not discard successful classification. Only adopt the
+		// probe-enriched slice when it has results; otherwise keep the
+		// pre-probe classified slice and let generation proceed.
+		if len(enriched) > 0 {
+			classified = enriched
 		}
-		classified = enriched
 	}
 
 	gen, err := generate.Get(resolvedAPIType)
@@ -568,6 +573,13 @@ func isAcceptableWSDLContentType(header string) bool {
 // by SSRF protection, or returns non-WSDL content.
 //
 // NOTE: Silent failures are intentional — this is a best-effort probe.
+//
+// NOTE: probeWSDLDocument enforces SSRF gates (validateProbeURLFunc and
+// dialContextForWSDLProbe) that reject private/loopback hosts. Match
+// intentionally accepts such hosts under the Chariot trusted-seed model, so
+// a private-IP PrimaryURL will silently fail this probe and auto-detection
+// will fall through to REST/GraphQL. To probe a private-IP SOAP target,
+// use the CLI with --dangerous-allow-private instead.
 func probeWSDLDocument(ctx context.Context, targetURL string) []byte {
 	if ctx == nil {
 		ctx = context.Background()
@@ -593,6 +605,7 @@ func probeWSDLDocument(ctx context.Context, targetURL string) []byte {
 			return http.ErrUseLastResponse
 		},
 	}
+	defer client.CloseIdleConnections()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wsdlURL, nil)
 	if err != nil {

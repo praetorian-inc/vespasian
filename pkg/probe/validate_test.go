@@ -177,8 +177,13 @@ func TestSSRFSafeDialContext_DialsResolvedPublicIP(t *testing.T) {
 	t.Cleanup(func() { dialFunc = origDialFunc })
 
 	// Use a public-IP literal as the host so the resolver returns it unchanged
-	// and isPrivateIP returns false. A literal IP bypasses external DNS, making
-	// this test hermetic.
+	// and isPrivateIP returns false. ssrfSafeDialContext calls
+	// net.DefaultResolver.LookupIPAddr at validate.go:125, which fast-paths IP
+	// literals through net.ParseIP without making a DNS query — this is what
+	// keeps this test hermetic in network-restricted sandboxes. If a future Go
+	// version removes the IP-literal fast-path (or a misconfigured nsswitch /
+	// cgo resolver bypasses it), this test would need a resolver seam
+	// (parallel to dialFunc) that injects a fixed LookupIPAddr result.
 	_, err := ssrfSafeDialContext(context.Background(), "tcp", "8.8.8.8:80")
 	require.NoError(t, err)
 

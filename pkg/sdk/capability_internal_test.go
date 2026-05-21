@@ -631,14 +631,15 @@ func TestClassifyProbeGenerate_GeneratesRESTSpec(t *testing.T) {
 }
 
 // TestClassifyProbeGenerate_ProbeEnabledOnREST exercises the probeEnabled=true
-// branch (ClassifyProbeGenerate lines 305-312). A pre-canceled context ensures
-// probes fail fast without network calls. probe.RunStrategies preserves the
-// original classified endpoints even when strategies error, so the pipeline
-// always produces a non-empty spec when classified results are non-empty —
-// the canceled context does not cause an early return here.
+// branch in ClassifyProbeGenerate. A pre-canceled context causes Dial to fail
+// before any sockets open, keeping the test hermetic; probe.RunStrategies
+// still constructs *http.Request and invokes Transport.RoundTrip, but no
+// connection is established. RunStrategies preserves the original classified
+// endpoints even when every strategy errors, so the pipeline must succeed and
+// produce a non-empty spec when classified results are non-empty.
 func TestClassifyProbeGenerate_ProbeEnabledOnREST(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel immediately — probes fail fast, no network calls
+	cancel() // pre-canceled context: dial fails before any sockets open, keeping this hermetic
 
 	requests := []crawl.ObservedRequest{
 		{
@@ -659,13 +660,17 @@ func TestClassifyProbeGenerate_ProbeEnabledOnREST(t *testing.T) {
 	assert.NotEmpty(t, spec)
 }
 
-// TestClassifyProbeGenerate_AllProbesFailed exercises the early-return branch
-// (ClassifyProbeGenerate line 310) where enriched is empty and probeErrs is
-// non-empty. This requires: no classified endpoints (threshold=1.1 eliminates
-// every request) AND probeEnabled=true AND at least one probe error. With an
-// empty classified list RunStrategies returns ([], [contextErr]), satisfying
-// len(enriched)==0 && len(probeErrs)>0.
-func TestClassifyProbeGenerate_AllProbesFailed(t *testing.T) {
+// TestClassifyProbeGenerate_AllProbesFailedFallback exercises the fallback
+// branch in ClassifyProbeGenerate: when probing returns no enriched results
+// (e.g. canceled context errors every strategy) the function must NOT discard
+// the pre-probe classified slice and must NOT return an error. This mirrors
+// the CLI behavior at cmd/vespasian/main.go:751-757.
+//
+// With threshold > 1.0 RunClassifiers returns nothing, so classified is empty
+// going into the probe stage and stays empty afterwards. The REST generator
+// returns nil for an empty classified list; the assertion is nil error + nil
+// spec, matching TestClassifyProbeGenerate_EmptyRequests.
+func TestClassifyProbeGenerate_AllProbesFailedFallback(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // pre-canceled so every probe strategy errors immediately
 
@@ -680,12 +685,9 @@ func TestClassifyProbeGenerate_AllProbesFailed(t *testing.T) {
 			},
 		},
 	}
-	// Threshold above 1.0 means classify.RunClassifiers returns nothing, so
-	// classified is empty. probeEnabled=true with canceled ctx → probe errors.
-	// Condition: len(enriched)==0 && len(probeErrs)>0 → error returned.
-	_, err := ClassifyProbeGenerate(ctx, requests, "rest", 1.1, true, true)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "all probes failed")
+	spec, err := ClassifyProbeGenerate(ctx, requests, "rest", 1.1, true, true)
+	require.NoError(t, err)
+	assert.Nil(t, spec)
 }
 
 // ---------------------------------------------------------------------------
@@ -1727,4 +1729,103 @@ func TestHeaderValueIsSafe(t *testing.T) {
 			assert.Equal(t, tc.want, headerValueIsSafe(tc.in))
 		})
 	}
+}
+
+// TestInvoke_ProbeEnabledEmitsSpec is the Invoke-level coverage for the
+// probeEnabled=true path (capability.go probe branch in ClassifyProbeGenerate
+// reached via Invoke). All other TestInvoke_* tests pass probe=false to stay
+// hermetic, which leaves the genCtx -> probe-strategies wiring exercised only
+// indirectly via TestClassifyProbeGenerate_ProbeEnabledOnREST. That inner test
+// receives a caller-supplied ctx so it cannot catch a regression that swapped
+// crawlCtx for genCtx at the Invoke level — this test closes that gap.
+//
+// The crawled request URL targets http://127.0.0.1:1 so the probe dial fails
+// fast (no listener) without any external network traffic. probe.RunStrategies
+// preserves the classified endpoints on dial errors, so Invoke must still emit
+// a non-empty OpenAPI spec.
+func TestInvoke_ProbeEnabledEmitsSpec(t *testing.T) {
+	cap := &Capability{
+		crawlFn: func(_ context.Context, _ string, _ invokeParams) ([]crawl.ObservedRequest, error) {
+			return []crawl.ObservedRequest{
+				{
+					Method: "GET",
+					URL:    "http://127.0.0.1:1/api/items",
+					Response: crawl.ObservedResponse{
+						StatusCode:  200,
+						ContentType: "application/json",
+						Body:        []byte(`[{"id":1}]`),
+					},
+				},
+			}, nil
+		},
+		wsdlProbeFn: func(_ context.Context, _ string) []byte { return nil },
+	}
+
+	input := capmodel.WebApplication{PrimaryURL: "http://127.0.0.1:1"}
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{
+			{Name: "headless", Value: "false"},
+			{Name: "probe", Value: "true"},
+			{Name: "api_type", Value: "rest"},
+			{Name: "timeout", Value: "1"}, // 1s phase budget bounds the probe dial
+		},
+	}
+
+	captured, emitter := captureEmitter(t)
+	err := cap.Invoke(ctx, input, emitter)
+	require.NoError(t, err)
+	require.NotEmpty(t, captured.Spec)
+	assert.True(t, strings.Contains(captured.Spec, "openapi"),
+		"expected OpenAPI 3.0 marker in generated spec, got: %s", captured.Spec)
+	assert.Equal(t, capmodel.SpecFormatOpenAPI, captured.SpecFormat)
+}
+
+// TestInvoke_EmptySpecEmitsNothing pins the discriminator-protecting early
+// return in Invoke: when ClassifyProbeGenerate returns an empty spec, Invoke
+// must return nil without calling the emitter. An empty Spec field would be
+// indistinguishable from a successful zero-endpoint discovery downstream
+// (capability.go comment in the early-return block), so emitting nothing is
+// the documented contract.
+//
+// Force-empty pipeline: crawlFn returns one REST request whose classifier
+// confidence is 0.95 (content-type 0.8 + /api/ path boost 0.15). Using
+// confidence=1.0 (the maximum valid threshold) means 0.95 < 1.0, so
+// classify.RunClassifiers drops every request. The REST generator returns nil
+// for an empty classified list. The fatalEmitter calls t.Fatal if Invoke
+// ever reaches the emit step.
+func TestInvoke_EmptySpecEmitsNothing(t *testing.T) {
+	cap := &Capability{
+		crawlFn: func(_ context.Context, _ string, _ invokeParams) ([]crawl.ObservedRequest, error) {
+			return []crawl.ObservedRequest{
+				{
+					Method: "GET",
+					URL:    "http://example.com/api/items",
+					Response: crawl.ObservedResponse{
+						StatusCode:  200,
+						ContentType: "application/json",
+						Body:        []byte(`{"id":1}`),
+					},
+				},
+			}, nil
+		},
+		wsdlProbeFn: func(_ context.Context, _ string) []byte { return nil },
+	}
+
+	input := capmodel.WebApplication{PrimaryURL: "http://example.com"}
+	ctx := capability.ExecutionContext{
+		Parameters: capability.Parameters{
+			{Name: "headless", Value: "false"},
+			{Name: "probe", Value: "false"},
+			{Name: "api_type", Value: "rest"},
+			{Name: "confidence", Value: "1.0"}, // max valid threshold; REST request scores 0.95 so it is dropped
+		},
+	}
+
+	fatalEmitter := capability.EmitterFunc(func(models ...any) error {
+		t.Fatal("Emit must not be called when ClassifyProbeGenerate returns an empty spec")
+		return nil
+	})
+
+	err := cap.Invoke(ctx, input, fatalEmitter)
+	require.NoError(t, err)
 }
