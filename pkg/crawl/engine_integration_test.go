@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -305,6 +306,183 @@ func TestRodEngine_ScopeFiltering(t *testing.T) {
 		t.Logf("Visited: %s", url)
 	}
 	mu.Unlock()
+}
+
+// TestRodEngine_BaseHrefResolution regresses LAB-2221 Issue A: a page served
+// under a deep path with <base href="/"> must have its relative asset refs
+// resolved against the base tag, not the page URL. Previously the crawler
+// would queue /deep/nested/main.js instead of /main.js, producing mangled
+// recursive paths on SPA catch-all servers.
+func TestRodEngine_BaseHrefResolution(t *testing.T) {
+	// The "SPA" always returns the same HTML body with <base href="/">,
+	// simulating Juice Shop's catch-all routing. Relative refs on the
+	// page (logo.png, app.js, /api/users) must all resolve to the root.
+	spa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<html>
+			<head><base href="/"></head>
+			<body>
+				<a href="login">Login</a>
+				<a href="/api/users">Users</a>
+				<script src="app.js"></script>
+			</body>
+		</html>`)
+	}))
+	defer spa.Close()
+
+	bm := launchTestBrowser(t)
+	scopeFn, err := scopeChecker(spa.URL, "same-origin", true)
+	if err != nil {
+		t.Fatalf("scopeChecker: %v", err)
+	}
+	engine, err := newRodEngine(bm.wsURL(), engineOptions{
+		Concurrency:   2,
+		MaxPages:      20,
+		MaxDepth:      2,
+		PageTimeout:   10 * time.Second,
+		StableTimeout: 500 * time.Millisecond,
+		ScopeCheck:    scopeFn,
+	})
+	if err != nil {
+		t.Fatalf("newRodEngine: %v", err)
+	}
+	defer engine.Close()
+
+	var mu sync.Mutex
+	visited := make(map[string]bool)
+
+	// Start the crawl from a deep path. Without base-href support, relative
+	// refs would resolve against /deep/page/, producing /deep/page/login,
+	// /deep/page/app.js, etc.
+	err = engine.Crawl(context.Background(), spa.URL+"/deep/page/here", func(req ObservedRequest) {
+		mu.Lock()
+		visited[req.URL] = true
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Logf("Crawl error (may be non-fatal): %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// The crawler must have navigated to /login (resolved via <base href=/>),
+	// NOT /deep/page/login (which would be the bug).
+	want := spa.URL + "/login"
+	mangled := spa.URL + "/deep/page/login"
+
+	if !visited[want] {
+		t.Errorf("expected to visit %q (base-href-resolved), got none. Visited: %v", want, keys(visited))
+	}
+	if visited[mangled] {
+		t.Errorf("should NOT have visited %q (page-URL-resolved mangled path)", mangled)
+	}
+	// Absolute root-relative links (<a href="/api/users">) should be
+	// unaffected by <base href> and navigated at spa.URL+/api/users. Pin
+	// this explicitly so a future change that breaks absolute handling
+	// doesn't slip through.
+	if !visited[spa.URL+"/api/users"] {
+		t.Errorf("expected to visit absolute %q, got none. Visited: %v", spa.URL+"/api/users", keys(visited))
+	}
+	// The mangled asset path is the critical signal of the original bug —
+	// if the crawler had resolved against the page URL rather than base
+	// href, it would have tried to fetch /deep/page/app.js. This one
+	// should not appear in any form.
+	if visited[spa.URL+"/deep/page/app.js"] {
+		t.Errorf("should NOT have fetched %q (page-URL-resolved mangled asset)", spa.URL+"/deep/page/app.js")
+	}
+}
+
+// keys is a test helper scoped to the integration build tag — only
+// compiled when -tags=integration is set. Do not reference it from
+// tests that build under the default tag.
+func keys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// TestCrawler_CookieHeaderPropagatesAcrossRedirects regresses LAB-2222: a
+// session cookie supplied via -H "Cookie: ..." must be attached to every
+// subsequent request the browser makes, including redirect follow-ups. The
+// test server mimics Spring Security: unauthenticated requests get a 302 to
+// /login; authenticated requests (valid JSESSIONID) get the protected
+// payload. If the crawler stuffs the cookie into Network.setExtraHTTPHeaders
+// instead of Chrome's cookie store, the 302 follow-up will strip it and the
+// test will see no authenticated /protected hit.
+func TestCrawler_CookieHeaderPropagatesAcrossRedirects(t *testing.T) {
+	const sessionID = "TESTSESSION123"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authed := false
+		if c, err := r.Cookie("JSESSIONID"); err == nil && c.Value == sessionID {
+			authed = true
+		}
+		switch r.URL.Path {
+		case "/":
+			if !authed {
+				http.Redirect(w, r, "/login", http.StatusFound)
+				return
+			}
+			// Authed "/" 302 -> /protected exercises the cookie-across-redirect
+			// path directly — the Spring-Security scenario this test regresses.
+			// Previously returned an HTML link, which only tested frontier
+			// link-following, not server-side redirect cookie propagation.
+			http.Redirect(w, r, "/protected", http.StatusFound)
+		case "/login":
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, `<html><body><h1>Login</h1></body></html>`)
+		case "/protected":
+			if !authed {
+				http.Redirect(w, r, "/login", http.StatusFound)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, `<html><body><h1>Protected content</h1></body></html>`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	bm := launchTestBrowser(t)
+	c := NewCrawler(CrawlerOptions{
+		Depth:        2,
+		MaxPages:     20,
+		Timeout:      30 * time.Second,
+		Scope:        "same-origin",
+		Headless:     true,
+		Headers:      map[string]string{"Cookie": "JSESSIONID=" + sessionID},
+		AllowPrivate: true,
+		BrowserMgr:   bm,
+	})
+
+	results, err := c.Crawl(context.Background(), srv.URL+"/")
+	if err != nil {
+		t.Fatalf("Crawl error: %v", err)
+	}
+
+	// We expect to see the /protected page actually rendered (200 with the
+	// "Protected content" marker), which only happens when the cookie
+	// propagates to the redirect follow-up.
+	seenProtected := false
+	for _, r := range results {
+		if r.URL == srv.URL+"/protected" &&
+			r.Response.StatusCode == 200 &&
+			strings.Contains(string(r.Response.Body), "Protected content") {
+			seenProtected = true
+			break
+		}
+	}
+	if !seenProtected {
+		seen := make([]string, 0, len(results))
+		for _, r := range results {
+			seen = append(seen, fmt.Sprintf("%d %s", r.Response.StatusCode, r.URL))
+		}
+		t.Errorf("expected authenticated 200 on /protected; session cookie did not propagate. Captured:\n  %s", strings.Join(seen, "\n  "))
+	}
 }
 
 func TestRodEngine_DepthLimit(t *testing.T) {

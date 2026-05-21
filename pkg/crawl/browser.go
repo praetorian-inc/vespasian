@@ -19,7 +19,9 @@ import (
 	"net/url"
 	"sync"
 
+	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/proto"
 )
 
 // BrowserOptions configures Chrome launch parameters.
@@ -47,6 +49,7 @@ type BrowserOptions struct {
 // immediately on signal, stopping all outbound requests.
 type BrowserManager struct {
 	launcher    *launcher.Launcher
+	browser     *rod.Browser
 	wsEndpoint  string
 	killOnce    sync.Once
 	cleanupOnce sync.Once
@@ -76,8 +79,16 @@ func NewBrowserManager(opts BrowserOptions) (*BrowserManager, error) {
 		return nil, err
 	}
 
+	browser := rod.New().ControlURL(wsURL)
+	if err := browser.Connect(); err != nil {
+		l.Kill()
+		l.Cleanup()
+		return nil, fmt.Errorf("connect to browser: %w", err)
+	}
+
 	return &BrowserManager{
 		launcher:   l,
+		browser:    browser,
 		wsEndpoint: wsURL,
 	}, nil
 }
@@ -111,8 +122,23 @@ func (b *BrowserManager) cleanup() {
 // Close kills Chrome (if still running) and cleans up resources. Intended
 // for use with defer in the normal (non-signal) path.
 func (b *BrowserManager) Close() {
+	if b.browser != nil {
+		// #nosec G104 -- best-effort close on a process that may already be dead; any error is unactionable and the subsequent Kill() + cleanup() still execute.
+		b.browser.Close() //nolint:errcheck,gosec // best-effort; process may already be dead
+	}
 	b.Kill()
 	b.cleanup()
+}
+
+// SetCookies injects cookies into Chrome's cookie store via the Storage.setCookies
+// CDP protocol. This is the reliable way to propagate session cookies across all
+// browser requests — unlike Network.setExtraHTTPHeaders, cookies set via the
+// Storage domain survive redirects, new tabs, and Fetch API interception.
+func (b *BrowserManager) SetCookies(cookies []*proto.NetworkCookieParam) error {
+	if b == nil || b.browser == nil {
+		return fmt.Errorf("browser not connected")
+	}
+	return b.browser.SetCookies(cookies)
 }
 
 // PID returns the Chrome process ID, useful for testing.

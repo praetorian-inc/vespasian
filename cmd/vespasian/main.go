@@ -32,6 +32,7 @@ import (
 
 	"github.com/alecthomas/kong"
 
+	"github.com/praetorian-inc/vespasian/pkg/analyze"
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/generate"
@@ -387,7 +388,7 @@ func setupBrowserAndSignals(rawHeaders []string, crawlOpts CrawlOptions, extraOp
 // CrawlCmd crawls a web application to capture HTTP traffic.
 type CrawlCmd struct {
 	URL                   string `arg:"" help:"Target URL to crawl"`
-	DangerousAllowPrivate bool   `help:"Disable SSRF protection for crawling, allowing private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
+	DangerousAllowPrivate bool   `help:"Disable SSRF protection for crawling, allowing private/localhost targets (localhost, 127.0.0.1, RFC1918, link-local). Required when the seed URL is a private host, otherwise the crawl exits with an error and captures nothing. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 	CrawlOptions
 }
 
@@ -481,7 +482,7 @@ type GenerateCmd struct {
 	Confidence            float64 `default:"0.5" help:"Minimum confidence threshold"`
 	Probe                 bool    `default:"true" help:"Enable endpoint probing"`
 	Deduplicate           bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
-	DangerousAllowPrivate bool    `help:"Disable SSRF protection for probes, allowing private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
+	DangerousAllowPrivate bool    `help:"Disable SSRF protection on the probe path (OPTIONS/schema/WSDL-fetch/GraphQL introspection) for private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 	Verbose               bool    `short:"v" help:"Enable verbose logging"`
 }
 
@@ -526,6 +527,11 @@ func (c *GenerateCmd) Run() (err error) {
 		fmt.Fprintf(os.Stderr, "loaded %d captured requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
+	// Augment with static-HTML form observations so captures produced by
+	// crawl/import (which don't run form extraction) get the same treatment
+	// as captures produced by scan.
+	requests = augmentWithStaticForms(requests)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -554,7 +560,7 @@ type ScanCmd struct {
 	Confidence            float64 `default:"0.5" help:"Minimum confidence threshold"`
 	Probe                 bool    `default:"true" help:"Enable endpoint probing"`
 	Deduplicate           bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
-	DangerousAllowPrivate bool    `help:"Disable SSRF protection for probes, allowing private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
+	DangerousAllowPrivate bool    `help:"Disable SSRF protection for crawling and probes, allowing private/localhost targets (localhost, 127.0.0.1, RFC1918, link-local). Required when the seed URL is a private host, otherwise the crawl exits with an error and captures nothing. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 
 	CrawlOptions
 }
@@ -596,6 +602,9 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		}
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
+
+	// Augment BEFORE auto-detection (see augmentWithStaticForms doc comment).
+	requests = augmentWithStaticForms(requests)
 
 	apiType := c.APIType
 	if apiType == apiTypeAuto {
@@ -692,7 +701,20 @@ type generateSpecOptions struct {
 	Verbose      bool
 }
 
-// generateSpec runs the classify → probe → generate pipeline.
+// augmentWithStaticForms appends synthetic ObservedRequests parsed from HTML
+// response bodies (see analyze.ExtractForms) so that <form action="/api/…">
+// landing-page signals feed classification, deduplication, and probing.
+// Both ScanCmd (before auto-detection) and GenerateCmd (after loading the
+// capture) call this so the two-stage pipeline is behaviorally equivalent
+// regardless of whether the capture came from scan, crawl, or import.
+func augmentWithStaticForms(requests []crawl.ObservedRequest) []crawl.ObservedRequest {
+	return append(requests, analyze.ExtractForms(requests)...)
+}
+
+// generateSpec runs the classify → probe → generate pipeline. It trusts its
+// caller to have already augmented requests with static-HTML form observations
+// (both ScanCmd and GenerateCmd call augmentWithStaticForms before invoking
+// this function).
 func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts generateSpecOptions) ([]byte, error) {
 	classifiers := sdk.ClassifiersForType(opts.APIType)
 	if classifiers == nil {

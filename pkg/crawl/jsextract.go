@@ -125,6 +125,10 @@ func isJavaScriptContentType(ct string) bool {
 
 // jsExtractedToLinks resolves jsluice-discovered URLs against a base URL and
 // returns them as plain URL strings suitable for pushing to the frontier.
+// URLs pointing at static assets or streaming transports (JS/CSS/images/
+// socket.io/...) are dropped — their content is already captured via network
+// interception and navigating to them wastes the page budget (and produces
+// nested "mangled" paths on SPA catch-all servers).
 func jsExtractedToLinks(extracted []jsExtractedURL, baseURL string) []string {
 	seen := make(map[string]bool)
 	var links []string
@@ -132,6 +136,9 @@ func jsExtractedToLinks(extracted []jsExtractedURL, baseURL string) []string {
 	for _, e := range extracted {
 		resolved, err := resolveURL(baseURL, e.URL)
 		if err != nil {
+			continue
+		}
+		if !isLikelyPage(resolved) {
 			continue
 		}
 		if seen[resolved] {

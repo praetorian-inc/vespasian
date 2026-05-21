@@ -14,38 +14,56 @@
 
 package importer
 
-import "net/url"
+import (
+	"fmt"
+	"net/url"
+
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
+)
+
+// maxPreviewLen caps how many bytes of an attacker-controlled string we embed
+// into an error message, shared by the mitmproxy importer's previewString
+// (for method/scheme) and the tnetstring decoder's payloadPreview (for
+// element payloads) — both of which delegate to previewBytes below. Without
+// the bound, a crafted `.mitm` file could write up to 64 MB into the
+// operator's terminal or CI log before the importer aborts.
+const maxPreviewLen = 64
+
+// previewBytes is the single source of truth for attacker-payload preview
+// formatting. It renders up to maxPreviewLen bytes of payload using %q
+// quoting; longer inputs are truncated and annotated with the original byte
+// length so operators still see "this was enormous" without pasting megabytes
+// into a log. %q quoting escapes control bytes (ANSI escapes, NUL, etc.) so
+// crafted method/scheme/payload content cannot clear the operator's terminal,
+// recolor output, or poison log parsers when the error string is rendered.
+// previewString and payloadPreview are type-convenience wrappers; modify the
+// format here and they both track automatically.
+func previewBytes(payload []byte) string {
+	if len(payload) <= maxPreviewLen {
+		return fmt.Sprintf("%q", payload)
+	}
+	return fmt.Sprintf("%q... (%d bytes total)", payload[:maxPreviewLen], len(payload))
+}
 
 // extractQueryParams parses query parameters from a URL string.
-// Returns nil if the URL has no query parameters or is invalid.
-// For duplicate keys, only the first value is returned.
+// Returns nil if the URL is invalid or not absolute.
+// All values for a key are preserved (multi-value query params).
 //
-// Note: Validates URL has scheme and host (absolute URL requirement per B3).
-// url.Parse is lenient and accepts relative paths like "not a url" without error.
-// We require absolute URLs for traffic imports since they represent real requests.
-func extractQueryParams(urlStr string) map[string]string {
+// The Scheme+Host check below is required because url.Parse is intentionally
+// lenient: it accepts relative paths (e.g. "not a url") without error, setting
+// Scheme and Host to "". Traffic imports represent real captured requests and
+// must have absolute URLs, so we reject anything without both fields.
+func extractQueryParams(urlStr string) map[string][]string {
 	parsed, err := url.Parse(urlStr)
 	if err != nil {
 		return nil
 	}
-
-	// Validate absolute URL: must have scheme and host (B3 fix)
-	// url.Parse accepts "not a url" as a relative path without error
 	if parsed.Scheme == "" || parsed.Host == "" {
 		return nil
 	}
-
-	queryValues := parsed.Query()
+	queryValues := crawl.CapQueryValues(parsed.Query())
 	if len(queryValues) == 0 {
 		return nil
 	}
-
-	params := make(map[string]string)
-	for key, values := range queryValues {
-		if len(values) > 0 {
-			params[key] = values[0] // Take first value for duplicate keys
-		}
-	}
-
-	return params
+	return queryValues
 }

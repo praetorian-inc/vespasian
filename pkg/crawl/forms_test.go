@@ -15,6 +15,7 @@
 package crawl
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -87,11 +88,11 @@ func TestFormsToObservedRequests_GetForm(t *testing.T) {
 		t.Errorf("Method = %q, want GET", r.Method)
 	}
 	// GET forms should merge fields into query params.
-	if r.QueryParams["q"] != "test" {
-		t.Errorf("QueryParams[q] = %q, want %q", r.QueryParams["q"], "test")
+	if len(r.QueryParams["q"]) == 0 || r.QueryParams["q"][0] != "test" {
+		t.Errorf("QueryParams[q] = %v, want [test]", r.QueryParams["q"])
 	}
-	if r.QueryParams["page"] != "1" {
-		t.Errorf("QueryParams[page] = %q, want %q", r.QueryParams["page"], "1")
+	if len(r.QueryParams["page"]) == 0 || r.QueryParams["page"][0] != "1" {
+		t.Errorf("QueryParams[page] = %v, want [1]", r.QueryParams["page"])
 	}
 	// Body should be empty for GET.
 	if len(r.Body) > 0 {
@@ -161,5 +162,129 @@ func TestDiscoveredForm_DefaultValues(t *testing.T) {
 	// Empty method means GET form behavior (fields in query params).
 	if !strings.Contains(results[0].URL, "x=1") {
 		t.Errorf("expected query param in URL for GET form, got %q", results[0].URL)
+	}
+}
+
+// TestFormsToObservedRequests_PostMultiValueQueryParams (TEST-004) verifies that
+// a POST form whose action URL contains multi-value query params preserves them.
+func TestFormsToObservedRequests_PostMultiValueQueryParams(t *testing.T) {
+	forms := []discoveredForm{
+		{
+			Action:      "https://example.com/api/items?tag=a&tag=b",
+			Method:      "POST",
+			ContentType: "application/x-www-form-urlencoded",
+			Fields:      map[string]string{},
+		},
+	}
+
+	results := formsToObservedRequests(forms, "https://example.com/")
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+
+	r := results[0]
+	if !reflect.DeepEqual(r.QueryParams["tag"], []string{"a", "b"}) {
+		t.Errorf("QueryParams[tag] = %v, want [a b]", r.QueryParams["tag"])
+	}
+}
+
+// TestFormsToObservedRequests_GetMultiValueQueryParams (TEST-004) verifies that
+// a GET form whose action URL already has multi-value params preserves them
+// after field merging, and that new single-value fields are also present.
+func TestFormsToObservedRequests_GetMultiValueQueryParams(t *testing.T) {
+	forms := []discoveredForm{
+		{
+			Action: "https://x.test/search?tag=a&tag=b",
+			Method: "GET",
+			Fields: map[string]string{
+				"q": "hello",
+			},
+		},
+	}
+
+	results := formsToObservedRequests(forms, "https://x.test/")
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+
+	r := results[0]
+	if !reflect.DeepEqual(r.QueryParams["tag"], []string{"a", "b"}) {
+		t.Errorf("QueryParams[tag] = %v, want [a b]", r.QueryParams["tag"])
+	}
+	if !reflect.DeepEqual(r.QueryParams["q"], []string{"hello"}) {
+		t.Errorf("QueryParams[q] = %v, want [hello]", r.QueryParams["q"])
+	}
+}
+
+// resolveFormAction is the pure attribute-resolution core of extractForms.
+// Default-suite coverage for every branch.
+
+// No action attribute → pageURL (HTML §4.10.21.3). This is the TEST-005
+// regression: previously the no-action branch used baseURL, so a login
+// form with no action on /login with <base href="/"> reported its
+// endpoint as "/" instead of "/login".
+func TestResolveFormAction_NoActionUsesPageURL(t *testing.T) {
+	got, ok := resolveFormAction("", "https://ex.com/login", "https://ex.com/")
+	if !ok || got != "https://ex.com/login" {
+		t.Errorf("got (%q, %v), want (%q, true)", got, ok, "https://ex.com/login")
+	}
+}
+
+func TestResolveFormAction_WhitespaceActionUsesPageURL(t *testing.T) {
+	got, ok := resolveFormAction("   \t\n", "https://ex.com/login", "https://ex.com/")
+	if !ok || got != "https://ex.com/login" {
+		t.Errorf("got (%q, %v), want (%q, true)", got, ok, "https://ex.com/login")
+	}
+}
+
+// Relative action resolves against baseURL, not pageURL — this is the
+// TEST-003 coverage gap. A regression that passed pageURL to resolveURL
+// would produce https://ex.com/deep/page/api/login instead.
+func TestResolveFormAction_RootRelativeResolvesAgainstBase(t *testing.T) {
+	got, ok := resolveFormAction("/api/login", "https://ex.com/deep/page", "https://ex.com/")
+	if !ok || got != "https://ex.com/api/login" {
+		t.Errorf("got (%q, %v), want (%q, true)", got, ok, "https://ex.com/api/login")
+	}
+}
+
+// Bare relative action resolves against baseURL, not deep/page — TEST-004.
+func TestResolveFormAction_BareRelativeResolvesAgainstBase(t *testing.T) {
+	got, ok := resolveFormAction("submit", "https://ex.com/deep/page", "https://ex.com/")
+	if !ok || got != "https://ex.com/submit" {
+		t.Errorf("got (%q, %v), want (%q, true)", got, ok, "https://ex.com/submit")
+	}
+}
+
+// Absolute HTTPS action passes through unchanged.
+func TestResolveFormAction_AbsoluteAction(t *testing.T) {
+	got, ok := resolveFormAction("https://ex.com/api/login", "https://ex.com/login", "https://ex.com/")
+	if !ok || got != "https://ex.com/api/login" {
+		t.Errorf("got (%q, %v), want (%q, true)", got, ok, "https://ex.com/api/login")
+	}
+}
+
+// Non-navigable schemes are rejected so the caller can drop the form —
+// TEST-001 coverage for javascript:, mailto:, data:, tel:, blob:.
+func TestResolveFormAction_NonNavigableSchemesRejected(t *testing.T) {
+	cases := []string{
+		"javascript:void(0)",
+		"mailto:x@y.com",
+		"data:text/html,<x>",
+		"tel:+1234567890",
+		"blob:https://ex.com/abc",
+	}
+	for _, raw := range cases {
+		got, ok := resolveFormAction(raw, "https://ex.com/login", "https://ex.com/")
+		if ok || got != "" {
+			t.Errorf("resolveFormAction(%q, ...) = (%q, %v), want (\"\", false)", raw, got, ok)
+		}
+	}
+}
+
+// Malformed action → ("", false) so the form is skipped.
+func TestResolveFormAction_MalformedActionRejected(t *testing.T) {
+	got, ok := resolveFormAction("http://[::1:", "https://ex.com/login", "https://ex.com/")
+	if ok || got != "" {
+		t.Errorf("got (%q, %v), want (\"\", false)", got, ok)
 	}
 }

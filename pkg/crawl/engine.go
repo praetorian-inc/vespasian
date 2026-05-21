@@ -18,6 +18,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/url"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,6 +38,66 @@ const MaxConcurrency = 50
 
 // DefaultStableWait is the default DOM stability wait duration.
 const DefaultStableWait = 3 * time.Second
+
+// ---- operator-message helpers ----
+
+// flagDangerousAllowPrivate is the CLI flag name that disables SSRF protection
+// for private/localhost targets. It is referenced in operator-facing error
+// messages so operators can copy-paste it verbatim; keep this in sync with the
+// `name:"..."` tag on CrawlCmd.DangerousAllowPrivate / ScanCmd.DangerousAllowPrivate
+// in cmd/vespasian/main.go.
+const flagDangerousAllowPrivate = "--dangerous-allow-private"
+
+// redactedURLPlaceholder is substituted for a URL that cannot be safely
+// stripped of userinfo (either url.Parse failed and "@" is present, or
+// url.Parse succeeded into an opaque form where u.User is not populated).
+// Emitting the raw string in either case would leak credentials — the whole
+// point of redactSeedURL is to hide them.
+const redactedURLPlaceholder = "<URL with userinfo redacted>"
+
+// redactSeedURL returns raw with any userinfo (user[:password]) removed so the
+// URL can be echoed to stderr / logs without leaking credentials. Behavior:
+//   - url.Parse succeeds AND the re-serialized URL has no "@": userinfo is
+//     stripped via u.User = nil and the URL is re-serialized.
+//   - url.Parse succeeds AND the re-serialized URL still contains "@":
+//     either the URL is in opaque form (e.g. "http:user:pass@host/path" parses
+//     into u.Opaque rather than u.User, so u.User = nil is a no-op), or "@"
+//     appears unencoded in the path/query (Go preserves it there — e.g.
+//     "http://example.com/@user" or "http://example.com/?q=a@b"). Fail closed
+//     in both cases: emit the placeholder rather than round-trip credentials
+//     through u.String(). For the path/query case this is a deliberate false
+//     positive — operators lose host/path context, but we accept that to avoid
+//     any risk of echoing credentials. Keep the check in place.
+//   - url.Parse fails AND raw contains "@": fail closed — emit the placeholder,
+//     since a parse failure on a URL with "@" (e.g. "http://admin:se%zz@host/path"
+//     — invalid percent escape in userinfo) would otherwise echo the credentials
+//     verbatim. Note: "@" may also appear in the path or query of a malformed
+//     URL (with no real userinfo); same deliberate false positive as above.
+//   - url.Parse fails AND raw contains no "@": return raw unchanged; nothing
+//     to redact and the operator still gets an actionable error.
+func redactSeedURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		if strings.Contains(raw, "@") {
+			return redactedURLPlaceholder
+		}
+		return raw
+	}
+	u.User = nil
+	// Defensive: the residual-"@" check catches two distinct cases:
+	//   1. Opaque URLs (e.g. "http:user:pass@host/path") parse with userinfo
+	//      in u.Opaque, so u.User = nil above is a no-op and credentials
+	//      would survive u.String() verbatim.
+	//   2. "@" unencoded in the path or query (e.g. "http://example.com/@user")
+	//      — no credentials, but we cannot cheaply distinguish this case from
+	//      (1), so we fall back to the placeholder. Deliberate false positive;
+	//      see the function-level doc comment.
+	out := u.String()
+	if strings.Contains(out, "@") {
+		return redactedURLPlaceholder
+	}
+	return out
+}
 
 // engineOptions configures the concurrent headless crawl engine.
 type engineOptions struct {
@@ -94,8 +157,23 @@ func newRodEngine(wsURL string, opts engineOptions) (*rodEngine, error) {
 // completes (frontier exhausted, maxPages reached, or ctx canceled). Each
 // captured network request is passed to onResult as it is observed.
 func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(ObservedRequest)) error {
-	// Seed the frontier.
-	e.frontier.Push([]urlEntry{{URL: seedURL, Depth: 0}})
+	// Seed the frontier. If Push adds zero entries the seed was rejected
+	// (malformed URL, scope mismatch, or — the common case — the seed is a
+	// private host such as localhost / 127.0.0.1 / RFC1918 / 169.254.*, which
+	// the scope predicate's SSRF check rejects unless flagDangerousAllowPrivate
+	// is set). Without this guard the crawl silently returned zero captures
+	// with no error to help the operator diagnose (LAB-2438).
+	if e.frontier.Push([]urlEntry{{URL: seedURL, Depth: 0}}) == 0 {
+		// redactSeedURL strips userinfo (user[:password]) before echoing the
+		// seed URL to stderr. If an operator pastes a credentialed URL and
+		// forgets flagDangerousAllowPrivate, the error message still lands in
+		// shell history / CI logs / scrollback — without this we would emit
+		// the cleartext credentials. url.Parse errors return the raw string
+		// unchanged so the operator still sees an actionable message.
+		return fmt.Errorf("seed URL rejected by frontier (scope, SSRF, or parse): %s; "+
+			"if crawling a private host (localhost, 127.0.0.1, RFC1918, link-local), "+
+			"pass %s", redactSeedURL(seedURL), flagDangerousAllowPrivate)
+	}
 
 	// Track page count for MaxPages enforcement. The onResult callback in
 	// Crawler.crawlHeadless also tracks this, but we need our own counter
@@ -276,7 +354,7 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 
 	// Extract links, run jsluice, and discover forms from the stabilized page.
 	capturedResults := capture.Results()
-	results, links := enrichFromPage(page, capturedResults, target.URL, e.opts.Stderr)
+	results, links := enrichFromPage(page, capturedResults, target.URL, e.opts.Stderr, e.opts.ScopeCheck)
 	return results, links, nil
 }
 
@@ -284,35 +362,150 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 // inline scripts, and discovers forms. It returns the enriched results and all
 // discovered links for the frontier. Errors are logged to stderr (if non-nil)
 // but are non-fatal — captured network results are always returned.
-func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, stderr io.Writer) ([]ObservedRequest, []string) {
-	// Extract links from the DOM.
-	links, err := extractLinks(page)
+//
+// pageURL is the URL the worker navigated to (used for form PageURL tagging
+// and as a fallback for URL resolution when the DOM provides no <base href>
+// and page.Info() returns an error).
+//
+// scopeFn is forwarded to mergeEnrichedLinks so form actions whose host
+// is out of scope are not appended as synthetic ObservedRequests.
+//
+// This function handles the DOM-reading side (page.Info, extractLinks,
+// extractForms, extractURLsFromInlineScripts) and then delegates the pure
+// link-combining logic to [mergeEnrichedLinks], which is directly unit
+// tested.
+func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, stderr io.Writer, scopeFn func(string) bool) ([]ObservedRequest, []string) {
+	// Defensive: a nil page means there's nothing to read from the DOM.
+	// Route straight to the merger so any already-captured network requests
+	// are still returned. No production caller passes nil today — this
+	// guard exists so the merger-threading contract can be tested without
+	// standing up a real rod.Page (round-11 TEST-001).
+	if page == nil {
+		captured, links := mergeEnrichedLinksFn(captured, nil, nil, nil, nil, pageURL, pageURL, scopeFn)
+		return captured, links
+	}
+
+	// Resolve the effective base URL for any relative references on this page.
+	// jsluice-extracted URLs and form actions must honor <base href> the same
+	// way the browser would, or we end up queuing mangled/nested paths.
+	resolvedPageURL := pageURL
+	if info, err := page.Info(); err == nil && info.URL != "" {
+		resolvedPageURL = info.URL
+	}
+	baseURL := effectiveBaseURL(page, resolvedPageURL)
+
+	// Extract links from the DOM. A failure here is non-fatal — it only
+	// affects DOM-sourced href discovery. Continue with domLinks=nil so the
+	// JS-from-responses, inline-script, and form paths still enrich captured.
+	domLinks, err := extractLinks(page, baseURL)
 	if err != nil {
 		if stderr != nil {
 			fmt.Fprintf(stderr, "link extraction failed for %s: %v\n", pageURL, err) //nolint:errcheck // best-effort
 		}
-		return captured, nil
+		domLinks = nil
 	}
 
-	// Run jsluice on captured JS response bodies.
 	jsFromResponses := extractURLsFromResponses(captured)
-	if len(jsFromResponses) > 0 {
-		links = append(links, jsExtractedToLinks(jsFromResponses, pageURL)...)
-	}
-
-	// Run jsluice on inline <script> tags.
 	jsFromInline := extractURLsFromInlineScripts(page)
-	if len(jsFromInline) > 0 {
-		links = append(links, jsExtractedToLinks(jsFromInline, pageURL)...)
+
+	// extractForms uses resolvedPageURL for no-action forms (HTML spec) and
+	// baseURL for explicit action refs (browser behavior). A DOM query error
+	// here is non-fatal — treat as "no forms discovered" and keep going.
+	forms, ferr := extractForms(page, resolvedPageURL, baseURL)
+	if ferr != nil && stderr != nil {
+		fmt.Fprintf(stderr, "form extraction failed for %s: %v\n", pageURL, ferr) //nolint:errcheck // best-effort
 	}
 
-	// Extract forms and emit synthetic ObservedRequests for POST endpoints.
-	forms, err := extractForms(page)
-	if err == nil && len(forms) > 0 {
-		formRequests := formsToObservedRequests(forms, pageURL)
+	captured, links := mergeEnrichedLinksFn(captured, domLinks, jsFromResponses, jsFromInline, forms, resolvedPageURL, baseURL, scopeFn)
+	return captured, links
+}
+
+// mergeEnrichedLinksFn is the function enrichFromPage calls to combine
+// page-extracted inputs with scope enforcement. Package-level var so tests
+// can verify the scopeFn argument is threaded correctly from e.opts.ScopeCheck
+// through enrichFromPage to mergeEnrichedLinks (the one-line call was
+// previously integration-only coverage — see LAB-2221 round-11 TEST-001).
+// Production callers always see the real mergeEnrichedLinks.
+//
+// NOT PARALLEL-SAFE: tests swap this via a t.Cleanup-restored pattern and
+// MUST NOT call t.Parallel() — concurrent swaps would race on the global.
+// No sync is used here because the production read path is single-threaded
+// per page and the test swap happens before the call under test.
+var mergeEnrichedLinksFn = mergeEnrichedLinks
+
+// mergeEnrichedLinks combines every link source discovered on a page into a
+// single link list for the frontier, appends synthetic form ObservedRequests
+// to captured, and returns the combined (captured, links) pair. This is the
+// pure, DOM-free portion of enrichFromPage and is directly unit tested.
+//
+//   - jsFromResponses/jsFromInline come from jsluice and are routed through
+//     jsExtractedToLinks so asset-only hits (main.js, styles.css) are
+//     dropped before entering the frontier.
+//   - form actions arrive pre-resolved from extractForms (explicit
+//     action= values resolved against baseURL; no-action forms set to
+//     pageURL). Only the asset/streaming filter applies here.
+//   - pageURL is the resolved navigation URL; baseURL is the <base href>-
+//     aware base. Both are passed because forms need page-URL semantics
+//     for PageURL tagging but base-URL semantics for explicit action refs.
+//   - scopeFn filters form actions before they become synthetic
+//     ObservedRequests. Frontier-side links already go through scope
+//     at Push; this protects the captured-append path from
+//     attacker-host form actions on an in-scope page. When scopeFn is
+//     nil, no filtering is applied.
+//
+// The returned links slice may contain cross-source duplicates (a URL
+// reached from both a DOM href and a jsluice hit will appear twice).
+// The frontier deduplicates on Push, so callers should not add another
+// dedup layer here.
+func mergeEnrichedLinks(
+	captured []ObservedRequest,
+	domLinks []string,
+	jsFromResponses, jsFromInline []jsExtractedURL,
+	forms []discoveredForm,
+	pageURL, baseURL string,
+	scopeFn func(string) bool,
+) ([]ObservedRequest, []string) {
+	links := slices.Clone(domLinks)
+
+	if len(jsFromResponses) > 0 {
+		links = append(links, jsExtractedToLinks(jsFromResponses, baseURL)...)
+	}
+	if len(jsFromInline) > 0 {
+		links = append(links, jsExtractedToLinks(jsFromInline, baseURL)...)
+	}
+
+	if len(forms) > 0 {
+		// Scope-enforce form actions before they become synthetic
+		// ObservedRequests. Without this, a <form action="https://attacker/x">
+		// on an in-scope page would flow into captured -> capture.json ->
+		// probes, which would re-request the attacker URL with any
+		// operator-supplied headers attached. (Frontier-side links are
+		// scope-checked at Push; this closes the corresponding gap on the
+		// captured-append side.) f.Action is always absolute per
+		// resolveFormAction; empty Action means the form spec-defaults to
+		// pageURL, which is same-origin by definition — keep those.
+		//
+		// Fast path: nil scopeFn means no filtering; alias `forms` directly
+		// to avoid allocation. Do not mutate scopedForms when scopeFn is nil
+		// — the alias would leak back to the caller's slice.
+		scopedForms := forms
+		if scopeFn != nil {
+			scopedForms = make([]discoveredForm, 0, len(forms))
+			for _, f := range forms {
+				if f.Action == "" || scopeFn(f.Action) {
+					scopedForms = append(scopedForms, f)
+				}
+			}
+		}
+		formRequests := formsToObservedRequests(scopedForms, pageURL)
 		captured = append(captured, formRequests...)
-		for _, f := range forms {
-			links = append(links, f.Action)
+		for _, f := range scopedForms {
+			if f.Action == "" {
+				continue
+			}
+			if isLikelyPage(f.Action) {
+				links = append(links, f.Action)
+			}
 		}
 	}
 

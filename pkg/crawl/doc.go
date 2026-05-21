@@ -33,6 +33,18 @@
 //     configuration and graceful shutdown.
 //   - [ObservedRequest] and [ObservedResponse] represent captured HTTP traffic.
 //
+// Session-cookie helpers (LAB-2222) let callers bootstrap Chrome's cookie
+// store from a user-supplied Cookie header so subsequent navigations are
+// authenticated. Callers typically extract a Cookie header from their input
+// headers, convert it to CDP cookie parameters for the target origin, and
+// set those on the browser before navigation:
+//   - [ExtractCookieHeader] separates Cookie values (case-insensitively)
+//     from the remaining headers, returning a concatenated cookie string
+//     and a map of the non-cookie headers.
+//   - [ParseCookiesToParams] converts a Cookie header value into CDP
+//     [proto.NetworkCookieParam] entries scoped to the target URL's host
+//     and scheme. Rejects non-http(s) or hostless target URLs.
+//
 // [go-rod]: https://github.com/go-rod/rod
 // [Katana]: https://github.com/projectdiscovery/katana
 package crawl

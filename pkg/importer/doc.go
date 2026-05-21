@@ -19,11 +19,29 @@
 // Supported formats:
 //   - Burp Suite XML: exported proxy history from Burp Suite.
 //   - HAR 1.2: HTTP Archive files from browser dev tools or other proxies.
-//   - mitmproxy: flow dumps from mitmproxy's JSON export.
+//   - mitmproxy: both the JSON export and the native tnetstring-based flow
+//     dump produced by mitmproxy's "save flows" (`w`) command.
 //
 // Use [Get] to retrieve an importer by format name, and [SupportedFormats]
 // to list all registered importers.
 //
-// Safety limits: files larger than 500 MB or containing more than 100,000
-// entries are rejected to prevent resource exhaustion.
+// Safety limits:
+//
+//   - File size: 500 MB hard cap (all formats), enforced by the shared
+//     limitedReader wrapper on every importer's input stream.
+//   - Entry count: only the native mitmproxy path carries an in-parser
+//     flow-count cap (maxNativeFlows = 500k). Burp XML, HAR, and mitmproxy
+//     JSON paths are bounded only by the 500 MB file-size cap plus their
+//     format's intrinsic per-element constraints (e.g. the native path's
+//     64 MB per-tnetstring-element cap).
+//   - Consumer-side limit: [ImportOptions.MaxEntries] applied via
+//     [ImportWithOptions] filters the returned slice post-parse — it is
+//     not a parser-allocation bound.
+//   - Per-element size (native mitmproxy only): any single tnetstring
+//     element is capped at 64 MB. This applies to request/response BODIES
+//     as well as the flow dict itself. Captures containing a single
+//     response body larger than 64 MB will be rejected even when the total
+//     file is below the 500 MB cap. The error message surfaces this limit
+//     so operators can tell the difference from the file-size cap.
+//   - Callers can also apply a scope filter via [ImportOptions.Scope].
 package importer
