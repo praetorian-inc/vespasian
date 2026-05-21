@@ -524,6 +524,91 @@ func TestP0Fixes_ContextAwarePathParams(t *testing.T) {
 	}
 }
 
+func TestOpenAPIGenerator_SlugObservation(t *testing.T) {
+	// Three slug-shaped observations under a common prefix must be grouped
+	// into a single parameterized path by Generate(). This locks in the
+	// contract that observation-based slug detection (NormalizePathsWithNames)
+	// is wired into groupEndpoints; a regression that reverts the wiring to
+	// per-endpoint normalization would produce three distinct paths and fail
+	// this test.
+	gen := &OpenAPIGenerator{}
+
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://api.example.com/articles/my-first-post",
+				Response: crawl.ObservedResponse{
+					StatusCode: 200,
+					Body:       []byte(`{"title": "first"}`),
+				},
+			},
+			IsAPI: true,
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://api.example.com/articles/another-post",
+				Response: crawl.ObservedResponse{
+					StatusCode: 200,
+					Body:       []byte(`{"title": "another"}`),
+				},
+			},
+			IsAPI: true,
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://api.example.com/articles/yet-another-post",
+				Response: crawl.ObservedResponse{
+					StatusCode: 200,
+					Body:       []byte(`{"title": "yet another"}`),
+				},
+			},
+			IsAPI: true,
+		},
+	}
+
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	loader := openapi3.NewLoader()
+	doc, err := loader.LoadFromData(spec)
+	if err != nil {
+		t.Fatalf("Generated spec failed validation: %v", err)
+	}
+
+	// Exactly one path should exist; observation-based detection collapses
+	// the three slug observations onto /articles/{articleSlug}.
+	if doc.Paths.Len() != 1 {
+		paths := append([]string{}, doc.Paths.InMatchingOrder()...)
+		t.Fatalf("expected 1 path in spec, got %d: %v", doc.Paths.Len(), paths)
+	}
+
+	expectedPath := "/articles/{articleSlug}"
+	pathItem := doc.Paths.Find(expectedPath)
+	if pathItem == nil {
+		paths := append([]string{}, doc.Paths.InMatchingOrder()...)
+		t.Fatalf("expected path %q not found in spec; got: %v", expectedPath, paths)
+	}
+	if pathItem.Get == nil {
+		t.Fatal("GET operation not found on /articles/{articleSlug}")
+	}
+
+	// Verify the path parameter is present and correctly named.
+	var pathParamNames []string
+	for _, paramRef := range pathItem.Get.Parameters {
+		if paramRef.Value.In == "path" {
+			pathParamNames = append(pathParamNames, paramRef.Value.Name)
+		}
+	}
+	if len(pathParamNames) != 1 || pathParamNames[0] != "articleSlug" {
+		t.Errorf("path parameters = %v, want exactly [articleSlug]", pathParamNames)
+	}
+}
+
 func TestP0Fixes_ActualStatusCodes(t *testing.T) {
 	gen := &OpenAPIGenerator{}
 
