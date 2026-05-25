@@ -134,17 +134,30 @@ func TestExtractFromBundle_FiltersDataAndJsSchemes(t *testing.T) {
 }
 
 func TestExtractFromBundle_FiltersExprOnlyURLs(t *testing.T) {
-	// A URL that is purely EXPR should be dropped.
-	src := []byte("fetch(someVar)")
+	// A bundle that contains BOTH a real fetch and a pure-EXPR fetch. The
+	// real one must survive; the EXPR-only one must be filtered. This pins
+	// the filter behavior without depending on jsluice emitting an "EXPR"
+	// entry for the pure-dynamic call (which would make the assertion
+	// vacuous when jsluice silently drops it upstream).
+	src := []byte(`fetch("/api/real"); fetch(someVar);`)
 	endpoints, err := ExtractFromBundle(src, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// Purely dynamic var -> jsluice may emit "EXPR"; filter it out.
+	if len(endpoints) == 0 {
+		t.Fatal("expected at least the /api/real endpoint to survive the filter")
+	}
+	var sawReal bool
 	for _, ep := range endpoints {
 		if ep.URL == "EXPR" || ep.URL == "" {
 			t.Errorf("expected EXPR-only URL to be filtered, got: %v", ep)
 		}
+		if ep.URL == "/api/real" {
+			sawReal = true
+		}
+	}
+	if !sawReal {
+		t.Errorf("expected /api/real to be kept, got endpoints: %v", endpoints)
 	}
 }
 

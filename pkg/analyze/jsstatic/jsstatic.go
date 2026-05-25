@@ -48,6 +48,13 @@ const (
 // stage's posture.
 type Options struct {
 	// HTTPClient is the client used for sourcemap fetches.
+	//
+	// When set, the caller is responsible for configuring an SSRF-safe Transport
+	// (typically by using probe.SSRFSafeDialContext on the DialContext) and any
+	// proxy/TLS/mTLS settings. Analyze overlays a noFollowRedirects CheckRedirect
+	// on a shallow copy of the supplied client at fetch time so a same-host
+	// .js.map URL cannot 302 to a different host and bypass the sameHost
+	// pre-flight check; this overlay does not mutate the caller's client.
 	HTTPClient *http.Client
 
 	// FetchSourcemaps enables remote .js.map fetching when a sourceMappingURL
@@ -109,13 +116,25 @@ type Result struct {
 // Stats counts what the analyser saw and emitted. Useful for verbose output
 // and for tests.
 type Stats struct {
-	BundlesAnalyzed         int // JS bodies passed to jsluice (post-filter, post-size-cap).
-	BundlesSkipped          int // JS bodies skipped (oversized, empty, parse timeout).
-	SourcemapsRecovered     int // .js.map sources successfully decoded via sourcesContent.
-	SourcemapFetchFails     int // sourceMappingURL comments seen but fetch failed.
-	EndpointsFound          int // raw extractedEndpoint count, pre-filter.
-	EndpointsKept           int // endpoints that survived filtering and made it into Requests.
-	SourcemapSourceTimeouts int // individual sourcemap source extractions skipped due to timeout or panic.
+	BundlesAnalyzed     int // JS bodies passed to jsluice (post-filter, post-size-cap).
+	BundlesSkipped      int // JS bodies skipped (oversized, empty, parse timeout).
+	SourcemapsRecovered int // .js.map sources successfully decoded via sourcesContent.
+	SourcemapFetchFails int // sourceMappingURL comments seen but fetch failed.
+	EndpointsFound      int // raw extractedEndpoint count, pre-filter.
+	EndpointsKept       int // endpoints that survived filtering and made it into Requests.
+	// SourcemapSourceTimeouts counts individual sourcemap source extractions
+	// that were skipped. Increments on per-source PerBundleTimeout, on a
+	// goroutine panic recovered during extraction, AND when an individual
+	// sourcesContent string exceeds MaxBundleSize (an oversize is treated as
+	// "this source would have to be skipped anyway"). Despite the name,
+	// "timeouts" here means "skipped extractions" — readers that need to
+	// distinguish causes should inspect the logger output, which records the
+	// reason for every increment.
+	SourcemapSourceTimeouts int
+	// BundlesAbandonedOnCancel counts bundles that were still in workCh when
+	// Analyze observed ctx cancellation. They are not analyzed and not counted
+	// in BundlesAnalyzed or BundlesSkipped. Always 0 on a clean run.
+	BundlesAbandonedOnCancel int
 }
 
 // ExtractedEndpoint is the analyser's intermediate representation. It is the
@@ -149,6 +168,15 @@ func isJSContentType(ct string) bool {
 // analyzeOne analyzes a single captured JS bundle. It runs sourcemap recovery
 // and extractor extraction, then synthesizes requests. The function is safe to
 // call from goroutines; it has no shared mutable state.
+//
+// Length rationale: this function intentionally exceeds the project's ~60-line
+// guideline. It is the linear sequence of one bundle's life-cycle (recover
+// sourcemap → extract bundle with timeout → cap + tag → synthesize → loop over
+// sourcemap sources with per-source timeout → synthesize). Splitting it would
+// trade three trivially-named helpers for an extra goroutine-lifetime contract
+// per helper — the helpers would have to take, leak, and clean up the bundleCh
+// and srcCh channels and propagate Stats accumulators back. The single function
+// keeps the timeout + recover + accounting pattern in one readable block.
 func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) perBundleResult {
 	var result perBundleResult
 	body := req.Response.Body
@@ -268,6 +296,14 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 // The error return is reserved for catastrophic failures (e.g., context
 // canceled). Per-bundle parse failures are logged and counted in Stats but
 // do not abort the analysis.
+//
+// Length rationale: this function intentionally exceeds the project's ~60-line
+// guideline. Its body is the orchestration shape of the package — pre-loop
+// classification, worker-pool fan-out, fan-in with Stats merge, output slice
+// build, and post-run cancellation check. Splitting the merge or fan-out
+// into helpers would force them to expose Stats, work channels, and the
+// abandoned-on-cancel accounting as parameters, which would obscure rather
+// than clarify the orchestration.
 func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options) (Result, error) {
 	// Check context before any work.
 	if ctx.Err() != nil {
@@ -299,11 +335,7 @@ func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options
 	}
 
 	// Worker pool for parallel bundle analysis.
-	type work struct {
-		idx int
-		req crawl.ObservedRequest
-	}
-	workCh := make(chan work, len(bundles))
+	workCh := make(chan crawl.ObservedRequest, len(bundles))
 	resultCh := make(chan perBundleResult, len(bundles))
 
 	var wg sync.WaitGroup
@@ -311,20 +343,20 @@ func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for w := range workCh {
+			for req := range workCh {
 				select {
 				case <-ctx.Done():
 					return
 				default:
 				}
-				r := analyzeOne(ctx, w.req, opts)
+				r := analyzeOne(ctx, req, opts)
 				resultCh <- r
 			}
 		}()
 	}
 
-	for i, req := range bundles {
-		workCh <- work{i, req}
+	for _, req := range bundles {
+		workCh <- req
 	}
 	close(workCh)
 
@@ -334,16 +366,24 @@ func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options
 		close(resultCh)
 	}()
 
-	// Collect results.
+	// Collect results. workerProcessed tracks bundles a worker actually picked
+	// up (analyzed OR per-bundle-skipped). The difference vs len(bundles) on a
+	// canceled run is the BundlesAbandonedOnCancel count below.
 	var synthesized []crawl.ObservedRequest
+	workerProcessed := 0
 	for r := range resultCh {
 		stats.BundlesAnalyzed += r.stats.BundlesAnalyzed
 		stats.BundlesSkipped += r.stats.BundlesSkipped
 		stats.SourcemapsRecovered += r.stats.SourcemapsRecovered
 		stats.SourcemapFetchFails += r.stats.SourcemapFetchFails
+		stats.SourcemapSourceTimeouts += r.stats.SourcemapSourceTimeouts
 		stats.EndpointsFound += r.stats.EndpointsFound
 		stats.EndpointsKept += r.stats.EndpointsKept
 		synthesized = append(synthesized, r.requests...)
+		workerProcessed += r.stats.BundlesAnalyzed + r.stats.BundlesSkipped
+	}
+	if abandoned := len(bundles) - workerProcessed; abandoned > 0 {
+		stats.BundlesAbandonedOnCancel = abandoned
 	}
 
 	// Build result: original captured first, synthesized appended after.

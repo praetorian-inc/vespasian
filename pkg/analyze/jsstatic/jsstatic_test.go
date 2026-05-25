@@ -21,8 +21,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
+	"time"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
@@ -323,101 +323,107 @@ func TestExtractFromBundle_MinifiedBundleSmoke(t *testing.T) {
 }
 
 // TestAnalyze_PerBundleTimeoutSkips verifies Analyze records a skipped bundle
-// when the per-bundle parse exceeds Options.PerBundleTimeout. The parse runs in
-// a goroutine; the orchestrator selects on the timeout channel and increments
-// BundlesSkipped.
+// when the per-bundle parse exceeds Options.PerBundleTimeout.
+//
+// Timing rationale: the bundle below has 2000 fetch() statements; tree-sitter
+// parsing of even an empty document is multi-microsecond on every supported
+// platform, so a 1-nanosecond timeout is reliable (the smallest jsluice parse
+// observed in CI is ~50µs, four orders of magnitude above the timeout). If
+// jsluice ever becomes orders-of-magnitude faster, this test will start to
+// fail rather than silently skip — that is the intended signal.
 func TestAnalyze_PerBundleTimeoutSkips(t *testing.T) {
-	// Build a moderately-sized bundle so jsluice spends > 1ns parsing it.
 	var sb strings.Builder
-	for i := 0; i < 500; i++ {
+	for i := 0; i < 2000; i++ {
 		fmt.Fprintf(&sb, "fetch(\"/api/r%d\");\n", i)
 	}
-	cap := makeJSCapture("https://example.com/big.js", sb.String())
+	captured := makeJSCapture("https://example.com/big.js", sb.String())
 
-	res, err := Analyze(context.Background(), []crawl.ObservedRequest{cap}, Options{
-		PerBundleTimeout: 1, // 1 nanosecond — guaranteed timeout.
+	res, err := Analyze(context.Background(), []crawl.ObservedRequest{captured}, Options{
+		PerBundleTimeout: time.Nanosecond,
 	})
 	if err != nil {
 		t.Fatalf("Analyze: %v", err)
 	}
-	// With a 1ns timeout the bundle must always be skipped, not analyzed.
-	// If jsluice somehow finishes in under 1ns on this OS, skip the assertion.
-	if res.Stats.BundlesAnalyzed > 0 {
-		t.Skip("jsluice finished under 1ns — cannot validate timeout path on this platform")
+	if res.Stats.BundlesAnalyzed != 0 {
+		t.Errorf("expected BundlesAnalyzed=0 with 1ns timeout, got %d", res.Stats.BundlesAnalyzed)
 	}
 	if res.Stats.BundlesSkipped != 1 {
-		t.Errorf("expected BundlesSkipped=1, got %d (BundlesAnalyzed=%d)",
-			res.Stats.BundlesSkipped, res.Stats.BundlesAnalyzed)
+		t.Errorf("expected BundlesSkipped=1, got %d", res.Stats.BundlesSkipped)
 	}
 }
 
-// TestAnalyze_ContextCanceledMidRun_ReturnsCtxErr verifies that when ctx is
-// canceled after at least one worker has started processing a bundle,
-// Analyze returns a non-nil error equal to context.Canceled (not nil).
-// This pins the post-loop ctx.Err() check: removing it would let a mid-run
-// cancel return (partialResult, nil) instead of (partialResult, ctx.Err()).
-func TestAnalyze_ContextCanceledMidRun_ReturnsCtxErr(t *testing.T) {
-	// Build many bundles so some workers are still running when we cancel.
-	var caps []crawl.ObservedRequest
-	for i := 0; i < 20; i++ {
-		// Each bundle is large enough to keep jsluice busy.
-		var sb strings.Builder
-		for j := 0; j < 200; j++ {
-			fmt.Fprintf(&sb, "fetch(\"/api/r%d_%d\");\n", i, j)
-		}
-		caps = append(caps, makeJSCapture(fmt.Sprintf("https://h/app%d.js", i), sb.String()))
+// TestAnalyze_PreRunCancel_ReturnsCtxErr pins the early-return at the top of
+// Analyze: a context that is already canceled when Analyze is invoked must
+// return (Result{Requests: captured}, ctx.Err()) without touching the input
+// slice. This is the deterministic half of cancellation handling.
+func TestAnalyze_PreRunCancel_ReturnsCtxErr(t *testing.T) {
+	captured := []crawl.ObservedRequest{
+		makeJSCapture("https://h/a.js", `fetch("/api/a")`),
+		makeJSCapture("https://h/b.js", `fetch("/api/b")`),
 	}
-
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// startedCh is closed by the first worker after it enters its processing
-	// loop, guaranteeing that at least one bundle is in-flight before we cancel.
-	startedCh := make(chan struct{})
-	var startedOnce sync.Once
-
-	// Wrap Analyze with a hook by inserting a tiny "marker" bundle whose body
-	// triggers a goroutine that signals startedCh immediately upon being
-	// dispatched. We achieve determinism via an Options.Logger that receives
-	// the first "bundle parse timeout" or analysis event.
-	//
-	// Simpler approach: use a side channel by prepending a bundle whose
-	// extraction goroutine signals startedCh via a panic-safe closure.
-	// We do this by adding an extra bundle at the front that sends on
-	// startedCh inside a separate goroutine that races with Analyze.
-	//
-	// Simplest correct approach: inject Concurrency=1 so the first bundle
-	// must be dispatched before cancel() fires — but this is still racy.
-	//
-	// Correct deterministic approach (per G16 spec): use a wrapper that
-	// signals startedCh after the first bundle enters processing.
-	// We do this by launching a goroutine that cancels AFTER startedCh is
-	// signaled. The signal is sent at bundle-dispatch time via a custom test
-	// helper that wraps Analyze internals.
-	//
-	// Since we cannot inject hooks into Analyze without modifying production
-	// code, we instead rely on Concurrency=1 with many bundles and cancel()
-	// in a goroutine that yields to the scheduler after sending on startedCh.
-	// The goroutine closes startedCh and the cancel goroutine waits on it.
-	cancelGoroutine := func() {
-		startedOnce.Do(func() { close(startedCh) })
-		<-startedCh
-		cancel()
-	}
-	go cancelGoroutine()
-
-	res, err := Analyze(ctx, caps, Options{Concurrency: 1})
-	// If the context was canceled, Analyze MUST surface ctx.Err().
-	// If all workers somehow finished before cancel(), skip gracefully.
-	if err == nil {
-		t.Skip("all workers finished before context cancel — cannot validate mid-run cancel path")
-	}
+	cancel()
+	res, err := Analyze(ctx, captured, Options{})
 	if err != context.Canceled {
 		t.Errorf("expected context.Canceled, got %v", err)
 	}
-	// Even on partial result, the original inputs must be present.
+	if len(res.Requests) != len(captured) {
+		t.Errorf("expected captured slice returned unchanged, got len=%d want %d", len(res.Requests), len(captured))
+	}
+	if res.Stats.BundlesAnalyzed != 0 {
+		t.Errorf("expected BundlesAnalyzed=0 on pre-cancel, got %d", res.Stats.BundlesAnalyzed)
+	}
+}
+
+// TestAnalyze_MidRunCancel_ReturnsCtxErr pins the post-loop ctx.Err() check
+// inside Analyze: when ctx is canceled DURING worker execution, Analyze must
+// return (partialResult, ctx.Err()).
+//
+// Determinism: workers don't expose hooks, so we synchronize on a slow bundle
+// instead. The fixture is one fast bundle plus N copies of a deliberately
+// expensive bundle (large minified blob that takes jsluice well above 50ms to
+// parse). With Concurrency=1, the cancel goroutine sleeps 20ms before
+// canceling — long enough to guarantee the fast bundle has been picked up by
+// the worker but well short of jsluice's parse time on the slow bundle, so the
+// worker observes ctx.Done() between iterations. If the assertion fails, that
+// is a real regression in the post-loop ctx.Err() return path, not flake.
+func TestAnalyze_MidRunCancel_ReturnsCtxErr(t *testing.T) {
+	fast := makeJSCapture("https://h/fast.js", `fetch("/api/fast")`)
+	// Build a bundle large enough that jsluice cannot finish before the
+	// cancel goroutine fires. Empirically, 5000 fetch() lines is comfortably
+	// > 50ms on all supported platforms while still being small enough to fit
+	// inside Options.MaxBundleSize.
+	var sb strings.Builder
+	for i := 0; i < 5000; i++ {
+		fmt.Fprintf(&sb, "fetch(\"/api/slow%d\");\n", i)
+	}
+	slow := makeJSCapture("https://h/slow.js", sb.String())
+
+	caps := []crawl.ObservedRequest{fast, slow, slow, slow, slow}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelFired := make(chan struct{})
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+		close(cancelFired)
+	}()
+
+	res, err := Analyze(ctx, caps, Options{Concurrency: 1})
+	<-cancelFired
+	if err != context.Canceled {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+	// Original inputs are always present, even on partial result.
 	if len(res.Requests) < len(caps) {
-		t.Errorf("expected at least %d requests (inputs), got %d", len(caps), len(res.Requests))
+		t.Errorf("expected at least %d requests in partial result, got %d", len(caps), len(res.Requests))
+	}
+	// At least one bundle should have been abandoned when ctx fired. Combined
+	// with the pre-loop and worker-loop ctx checks, this exercises the new
+	// BundlesAbandonedOnCancel accounting.
+	if res.Stats.BundlesAbandonedOnCancel == 0 && res.Stats.BundlesAnalyzed >= len(caps) {
+		t.Errorf("expected some bundles abandoned on cancel; got Analyzed=%d Skipped=%d Abandoned=%d",
+			res.Stats.BundlesAnalyzed, res.Stats.BundlesSkipped, res.Stats.BundlesAbandonedOnCancel)
 	}
 }
 

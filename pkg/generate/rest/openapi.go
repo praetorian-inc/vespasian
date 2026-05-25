@@ -137,18 +137,20 @@ func anyStaticSource(endpoints []classify.ClassifiedRequest) bool {
 
 // computeSourceTag derives the x-vespasian-source value for an operation group.
 // Mapping (architecture.md §7):
-//   - any request with Source not starting "static:" → "dynamic"
+//   - any request with Source not starting "static:" (including empty Source from
+//     pre-LAB-2108 captures or untagged dynamic entries) → "dynamic"
 //   - all requests Source == "static:js"             → "js-bundle"
 //   - all requests Source == "static:js-sourcemap"   → "js-sourcemap"
-//   - all requests Source == ""                       → "" (extension omitted)
+//   - mixed static prefixes within a group           → "dynamic"
+//
+// Empty Source is treated as a dynamic signal so that a group containing both
+// dynamic (untagged) and static entries resolves to "dynamic" rather than
+// inheriting the static tag from the static-only subset.
 func computeSourceTag(group []classify.ClassifiedRequest) string {
 	var tag string
 	for _, ep := range group {
-		if ep.Source == "" {
-			continue
-		}
 		if !strings.HasPrefix(ep.Source, "static:") {
-			// Any dynamic source wins immediately.
+			// Any dynamic source (including the empty/untagged case) wins immediately.
 			return "dynamic"
 		}
 		// Static source: map to friendly name.

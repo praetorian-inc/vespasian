@@ -94,6 +94,15 @@ func recoverSourcemap(ctx context.Context, bundle []byte, bundleURL string, opts
 	client := opts.HTTPClient
 	if client == nil {
 		client = defaultSourcemapClient(opts.AllowPrivate)
+	} else {
+		// Caller-supplied client: enforce noFollowRedirects on a shallow copy so
+		// a same-host .js.map URL cannot 302 to an attacker host and bypass the
+		// sameHost pre-flight check above. We do not mutate the caller's client.
+		// The caller remains responsible for SSRF-safe dialing on the underlying
+		// Transport — see Options.HTTPClient doc.
+		clientCopy := *client
+		clientCopy.CheckRedirect = noFollowRedirects
+		client = &clientCopy
 	}
 
 	sources, err := fetchRemoteSourcemap(ctx, client, mappingURL, opts.AllowPrivate)

@@ -375,7 +375,7 @@ func handleMixedContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	randomBytes := make([]byte, 64)
-	rand.Read(randomBytes) //nolint:errcheck // test server best-effort
+	rand.Read(randomBytes) //nolint:errcheck,gosec // test server best-effort, error ignored intentionally
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"id":     1,
 		"name":   "binary-test",

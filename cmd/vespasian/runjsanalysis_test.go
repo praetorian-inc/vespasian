@@ -1,0 +1,170 @@
+// Copyright 2026 Praetorian Security, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
+)
+
+// captureStderr lives in display_test.go and is re-used here.
+
+// jsFixtureCapture returns one HTML page and one JS bundle exercising fetch.
+// Shared by the error-path and verbose-path tests.
+func jsFixtureCapture() []crawl.ObservedRequest {
+	return []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/",
+			Source: "katana",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<html></html>`),
+			},
+		},
+		{
+			Method: "GET",
+			URL:    "https://example.com/app.js",
+			Source: "katana",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/javascript",
+				Body:        []byte(`fetch("/api/v1/users")`),
+			},
+		},
+	}
+}
+
+// TEST-001 (helper-level integration): when enabled=true the helper hands the
+// captured slice to jsstatic.Analyze and returns an enriched slice with
+// SourceJS entries appended. This is the code path that ScanCmd.Run and
+// CrawlCmd.Run reach into; testing the helper at this granularity covers the
+// same plumbing without requiring a real headless browser.
+func TestRunJSAnalysisStage_Enabled_AppendsStaticEntries(t *testing.T) {
+	captured := jsFixtureCapture()
+	out := runJSAnalysisStage(context.Background(), captured, jsAnalysisArgs{
+		enabled:         true,
+		fetchSourcemaps: false,
+		allowPrivate:    true,
+	})
+	if len(out) <= len(captured) {
+		t.Fatalf("expected enriched slice longer than input; got %d in, %d out", len(captured), len(out))
+	}
+	// Dynamic entries must still come first (classify.Deduplicate relies on
+	// first-write-wins). At least one static:js entry must be appended.
+	var sawStatic bool
+	for i, r := range out {
+		if i < len(captured) {
+			if r.Source == "static:js" {
+				t.Errorf("static entry at position %d (still in dynamic prefix)", i)
+			}
+			continue
+		}
+		if r.Source == "static:js" {
+			sawStatic = true
+		}
+	}
+	if !sawStatic {
+		t.Error("expected at least one static:js entry appended after dynamic prefix")
+	}
+}
+
+// Enabled=false short-circuits and returns the input slice unchanged.
+func TestRunJSAnalysisStage_Disabled_ShortCircuits(t *testing.T) {
+	captured := jsFixtureCapture()
+	out := runJSAnalysisStage(context.Background(), captured, jsAnalysisArgs{enabled: false})
+	// Same length, same backing data (returned input directly).
+	if len(out) != len(captured) {
+		t.Fatalf("expected unchanged slice; got %d in, %d out", len(captured), len(out))
+	}
+	for i := range out {
+		if out[i].URL != captured[i].URL {
+			t.Errorf("entry %d URL mismatch: got %q, want %q", i, out[i].URL, captured[i].URL)
+		}
+	}
+}
+
+// TEST-002: when jsstatic.Analyze returns an error (here: pre-canceled ctx),
+// runJSAnalysisStage writes a warning to stderr and returns the ORIGINAL
+// requests slice rather than the partial result. This is the contract the
+// surrounding pipeline relies on — JS analysis must never fail the run.
+func TestRunJSAnalysisStage_ErrorPath_ReturnsOriginalAndWarns(t *testing.T) {
+	captured := jsFixtureCapture()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel so Analyze returns ctx.Err() immediately
+	var out []crawl.ObservedRequest
+	stderr := captureStderr(t, func() {
+		out = runJSAnalysisStage(ctx, captured, jsAnalysisArgs{
+			enabled:         true,
+			fetchSourcemaps: false,
+			allowPrivate:    true,
+		})
+	})
+	// Must be the original slice (identical length and URLs), not enriched.
+	if len(out) != len(captured) {
+		t.Fatalf("expected original slice on error; got %d in, %d out", len(captured), len(out))
+	}
+	for i := range out {
+		if out[i].URL != captured[i].URL {
+			t.Errorf("entry %d URL mismatch: got %q, want %q", i, out[i].URL, captured[i].URL)
+		}
+	}
+	if !strings.Contains(stderr, "warning: js-static analysis failed") {
+		t.Errorf("expected warning on stderr, got: %q", stderr)
+	}
+}
+
+// TEST-003: verbose=true prints the stats line to stderr.
+func TestRunJSAnalysisStage_Verbose_LogsStats(t *testing.T) {
+	captured := jsFixtureCapture()
+	var out []crawl.ObservedRequest
+	stderr := captureStderr(t, func() {
+		out = runJSAnalysisStage(context.Background(), captured, jsAnalysisArgs{
+			enabled:         true,
+			fetchSourcemaps: false,
+			allowPrivate:    true,
+			verbose:         true,
+		})
+	})
+	if len(out) <= len(captured) {
+		t.Errorf("expected enriched slice; got %d in, %d out", len(captured), len(out))
+	}
+	if !strings.Contains(stderr, "js-static:") {
+		t.Errorf("expected 'js-static:' status line on stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stderr, "bundles=") || !strings.Contains(stderr, "endpoints=") {
+		t.Errorf("expected stats fields in stderr line, got: %q", stderr)
+	}
+}
+
+// Verbose=false must NOT log the stats line.
+func TestRunJSAnalysisStage_NonVerbose_DoesNotLog(t *testing.T) {
+	captured := jsFixtureCapture()
+	stderr := captureStderr(t, func() {
+		_ = runJSAnalysisStage(context.Background(), captured, jsAnalysisArgs{
+			enabled:         true,
+			fetchSourcemaps: false,
+			allowPrivate:    true,
+			verbose:         false,
+		})
+	})
+	if strings.Contains(stderr, "js-static:") {
+		t.Errorf("expected no status line when verbose=false, got: %q", stderr)
+	}
+}

@@ -345,6 +345,52 @@ func TestSourcemap_RedirectToDifferentHostBlocked(t *testing.T) {
 	}
 }
 
+// Regression for SEC-BE-002 / SEC-FE-001: when the caller supplies an
+// Options.HTTPClient that does not set CheckRedirect, recoverSourcemap must
+// still block 3xx-to-different-host redirects. The fix overlays
+// noFollowRedirects on a shallow copy of the supplied client.
+func TestSourcemap_CallerSuppliedClient_RedirectStillBlocked(t *testing.T) {
+	var externalHits atomic.Int32
+	external := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		externalHits.Add(1)
+		_, _ = w.Write(makeSourcemapJSON([]string{"var external = true;"}))
+	}))
+	defer external.Close()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, external.URL+"/evil.js.map", http.StatusFound)
+	}))
+	defer origin.Close()
+
+	bundleURL := origin.URL + "/app.js"
+	mapURL := origin.URL + "/app.js.map"
+	bundle := []byte(fmt.Sprintf("console.log(1);\n//# sourceMappingURL=%s\n", mapURL))
+
+	// Caller-supplied client with NO CheckRedirect — the default http.Client
+	// behavior is to follow redirects. recoverSourcemap must overlay
+	// noFollowRedirects so the cross-host redirect is still rejected.
+	caller := &http.Client{Timeout: 5 * time.Second}
+	opts := Options{
+		FetchSourcemaps: true,
+		AllowPrivate:    true,
+		HTTPClient:      caller,
+	}
+	sources, stats := recoverSourcemap(context.Background(), bundle, bundleURL, opts)
+	if externalHits.Load() != 0 {
+		t.Errorf("redirect was followed: %d hits on external host", externalHits.Load())
+	}
+	if len(sources) != 0 {
+		t.Errorf("expected 0 sources when redirect blocked, got %d", len(sources))
+	}
+	if stats.SourcemapFetchFails != 1 {
+		t.Errorf("expected 1 fetch fail when redirect blocked, got %d", stats.SourcemapFetchFails)
+	}
+	// And the overlay must not have mutated the caller's *http.Client.
+	if caller.CheckRedirect != nil {
+		t.Error("caller's http.Client.CheckRedirect was mutated; the overlay must use a copy")
+	}
+}
+
 // F12b: cross-scheme sourcemap (https bundle, http sourcemap) must be rejected by sameHost.
 func TestSourcemap_CrossSchemeRejected(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

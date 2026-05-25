@@ -1141,6 +1141,41 @@ func TestOpenAPI_XVespasianSource_OmittedForEmptySource(t *testing.T) {
 	}
 }
 
+// Regression for QUAL-005: a group that mixes untagged (Source=="") dynamic
+// entries with static:js entries must resolve to "dynamic", not "js-bundle".
+// The presence of at least one static:* in the overall input still triggers
+// the extension via anyStaticSource(); within the group, an empty Source is a
+// dynamic signal and must not be skipped.
+func TestComputeSourceTag_MixedEmptyAndStaticInGroup_ResolvesDynamic(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		// Untagged dynamic entry for /api/x (pre-LAB-2108 capture style).
+		makeClassified("GET", "https://h/api/x", ""),
+		// Static entry for the same endpoint key.
+		makeClassified("GET", "https://h/api/x", "static:js"),
+		// Unrelated static entry so anyStaticSource gates the extension on.
+		makeClassified("GET", "https://h/api/y", "static:js"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	ext, ok := getOp["x-vespasian-source"]
+	if !ok {
+		t.Fatal("expected x-vespasian-source extension to be present for mixed group")
+	}
+	if ext != "dynamic" {
+		t.Errorf("expected x-vespasian-source=dynamic when group mixes empty Source and static:js, got %v", ext)
+	}
+}
+
 // mixed static-only groups (static:js + static:js-sourcemap) must resolve to "dynamic".
 func TestComputeSourceTag_MixedStaticGroups(t *testing.T) {
 	gen := &OpenAPIGenerator{}
