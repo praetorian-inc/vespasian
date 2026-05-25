@@ -366,12 +366,71 @@ const apiIndicatorAlternation = `(?:api/|v[1-9][0-9]*/|rest/|rpc/|graphql)`
 // E.g., "identity/" + "api/auth/login" — captures "identity/".
 //
 // Note: backtick template literal concatenations are not matched (use
-// extractTemplateLiteralPaths for those). String.prototype.concat() —
-// e.g. "/api/posts/".concat(id, "/comment") — is intentionally out of
-// scope (see LAB-1368 for follow-up).
+// extractTemplateLiteralPaths for those). Concatenation with non-literal
+// operands — e.g. "/api/posts/".concat(id, "/comment") or "/api/users/" + id
+// + "/posts" — is handled separately by extractConcatPaths (see LAB-1368).
 var servicePrefixPattern = regexp.MustCompile(
 	`["']([a-zA-Z][a-zA-Z0-9_-]{1,30}/)["']\s*\+\s*["']` + apiIndicatorAlternation,
 )
+
+// concatMethodPattern matches a quoted string literal receiver followed by
+// `.concat(` — i.e. the head of a `.concat()` call. The path receiver is
+// captured as group 1 (without surrounding quotes). The argument list is
+// NOT matched by the regex because regular expressions cannot balance
+// nested parentheses (e.g. `.concat(foo(a, b), "/x")`); the matching
+// closing `)` is found by a paren-aware scan at the match site.
+//
+// Targets the LAB-1368 case: "/api/posts/".concat(id, "/comment").
+// The receiver must be a string literal — chained-method or computed
+// receivers (e.g. `obj.url.concat(...)`) would require an AST and are
+// intentionally out of scope.
+var concatMethodPattern = regexp.MustCompile(
+	`["']` +
+		`(/?[a-zA-Z0-9/_{}.:?=&%~-]*)` +
+		`["']\.concat\(`,
+)
+
+// concatPlusHeadPattern matches the head of a `+`-concat chain whose first
+// operand is a quoted string literal containing an API indicator and is
+// followed by a `+` operator. Subsequent operands are walked by
+// parsePlusChain rather than captured here because regex cannot bound an
+// arbitrary chain without runaway backtracking.
+//
+// Targets the LAB-1368 case: "/api/users/" + id + "/posts".
+// The leading API-indicator anchor keeps random `"a" + b + "c"` literals
+// from triggering the chain walker.
+//
+// Returns: group 1 = head literal (without surrounding quotes); match end
+// is positioned immediately after the trailing `+`, which is where
+// parsePlusChain begins its walk.
+var concatPlusHeadPattern = regexp.MustCompile(
+	`["']` +
+		`(/?` +
+		`(?:[a-zA-Z0-9_-]+/)*` +
+		apiIndicatorAlternation +
+		`[a-zA-Z0-9/_{}.:-]*)` +
+		`["']\s*\+`,
+)
+
+// concatPathSentinel is what we substitute for any non-literal concat
+// argument or +-chain operand. A pure numeric segment so the REST
+// generator's NormalizePathWithNames turns it into a named {param} (see
+// pkg/generate/rest/normalize.go). Using "0" rather than "{}" keeps the
+// reconstructed path a syntactically valid HTTP path that the prober can
+// actually issue a request against.
+const concatPathSentinel = "0"
+
+// maxConcatChainOperands bounds the length of a `+`-concat chain
+// parsePlusChain will walk before bailing out. Real URL chains rarely
+// exceed a handful of segments; past this we are almost certainly chasing
+// noise in unrelated expressions and stopping limits worst-case work.
+const maxConcatChainOperands = 16
+
+// maxConcatArgList is the maximum size of the raw argument list passed to
+// parseConcatArgs. Mirrors the {0,500} cap baked into concatMethodPattern;
+// kept as a named constant for documentation and to keep both call sites
+// agreeing on the bound.
+const maxConcatArgList = 500
 
 // apiIndicatorPattern matches the path segments that signal an API endpoint.
 // Sourced from apiIndicatorAlternation so it is impossible for it to drift
@@ -871,12 +930,400 @@ func reconstructTemplateLiteral(segment []byte) (string, bool) {
 	return candidate, true
 }
 
+// extractConcatPaths scans for API paths built by JS string concatenation
+// involving at least one non-literal operand (identifier, expression, ...).
+// Two forms are recognized:
+//
+//  1. String.prototype.concat method form:
+//     "/api/posts/".concat(id, "/comment") -> /api/posts/0/comment
+//  2. `+`-operator chain form:
+//     "/api/users/" + id + "/posts" -> /api/users/0/posts
+//
+// Non-literal operands are replaced with concatPathSentinel ("0") so the
+// reconstructed path is a valid HTTP path that the prober can issue. The
+// downstream REST normalizer turns the sentinel into a named {param}.
+//
+// Pure literal+literal concatenations (no identifier) are also accepted by
+// the method form and emitted with the literals joined verbatim; the +
+// form requires at least one non-literal operand because literal+literal
+// `+` chains are already handled by servicePrefixPattern + apiPathPattern.
+func extractConcatPaths(jsBody []byte) []string {
+	seen := make(map[string]bool)
+	var paths []string
+
+	emit := func(p string) {
+		if p == "" || !hasAPIIndicator(p) {
+			return
+		}
+		if strings.ContainsAny(p, " \t\r\n") {
+			return
+		}
+		if seen[p] {
+			return
+		}
+		seen[p] = true
+		paths = append(paths, p)
+	}
+
+	// Form 1: .concat() method form.
+	for _, match := range concatMethodPattern.FindAllSubmatchIndex(jsBody, -1) {
+		// match indices: [0,1]=full match (incl. `.concat(`), [2,3]=receiver.
+		if len(match) < 4 || match[2] < 0 {
+			continue
+		}
+		receiver := string(jsBody[match[2]:match[3]])
+		argEnd := findConcatArgListEnd(jsBody, match[1])
+		if argEnd < 0 {
+			continue
+		}
+		argList := string(jsBody[match[1]:argEnd])
+		if len(argList) > maxConcatArgList {
+			continue
+		}
+		emit(receiver + parseConcatArgs(argList))
+	}
+
+	// Form 2: `+`-chain form.
+	for _, match := range concatPlusHeadPattern.FindAllSubmatchIndex(jsBody, -1) {
+		// match indices: [0,1]=full match (incl. trailing `+`),
+		// [2,3]=head literal.
+		if len(match) < 4 || match[2] < 0 {
+			continue
+		}
+		head := string(jsBody[match[2]:match[3]])
+		suffix := parsePlusChain(jsBody, match[1])
+		emit(head + suffix)
+	}
+
+	return paths
+}
+
+// parseConcatArgs splits a JS .concat() argument list and returns the
+// reconstructed suffix string. Each comma-separated argument is either a
+// quoted string literal (kept verbatim, quotes stripped), a backtick
+// template literal with no ${} interpolation (kept verbatim), or any other
+// expression token (replaced with concatPathSentinel).
+//
+// argList is the raw source between the `(` and `)` of the .concat call.
+// Commas inside matched quotes are NOT treated as separators.
+func parseConcatArgs(argList string) string {
+	args := splitConcatArgs(argList)
+	var b strings.Builder
+	for _, arg := range args {
+		arg = strings.TrimSpace(arg)
+		if arg == "" {
+			continue
+		}
+		if lit, ok := stringLiteralValue(arg); ok {
+			b.WriteString(lit)
+			continue
+		}
+		b.WriteString(concatPathSentinel)
+	}
+	return b.String()
+}
+
+// findConcatArgListEnd returns the index of the `)` that closes the
+// .concat( opened immediately before start, accounting for nested
+// parens/brackets/braces and string literals so a `)` inside a quoted
+// argument or a nested call (e.g. `.concat(foo(a, b), "/x")`) doesn't
+// terminate the scan prematurely. Returns -1 if the call is malformed or
+// the matching `)` is not found within maxConcatArgList bytes.
+func findConcatArgListEnd(jsBody []byte, start int) int { //nolint:gocyclo // small state machine
+	depthRound, depthSquare, depthCurly := 0, 0, 0
+	limit := start + maxConcatArgList
+	if limit > len(jsBody) {
+		limit = len(jsBody)
+	}
+	for i := start; i < limit; i++ {
+		c := jsBody[i]
+		switch c {
+		case '"', '\'', '`':
+			end := scanStringLiteral(jsBody, i)
+			if end < 0 {
+				return -1
+			}
+			i = end
+		case '(':
+			depthRound++
+		case ')':
+			if depthRound == 0 && depthSquare == 0 && depthCurly == 0 {
+				return i
+			}
+			if depthRound > 0 {
+				depthRound--
+			}
+		case '[':
+			depthSquare++
+		case ']':
+			if depthSquare > 0 {
+				depthSquare--
+			}
+		case '{':
+			depthCurly++
+		case '}':
+			if depthCurly > 0 {
+				depthCurly--
+			}
+		}
+	}
+	return -1
+}
+
+// splitConcatArgs splits argList on top-level commas, ignoring commas
+// inside matched quotes, backticks, brackets, braces, or parentheses.
+// Returns the raw argument strings (whitespace not trimmed).
+func splitConcatArgs(argList string) []string { //nolint:gocyclo // small string-state machine; splitting hurts readability
+	var args []string
+	var b strings.Builder
+	depthRound, depthSquare, depthCurly := 0, 0, 0
+	var quote byte // 0 when not in a string, else the opening byte
+	for i := 0; i < len(argList); i++ {
+		c := argList[i]
+		if quote != 0 {
+			b.WriteByte(c)
+			if c == '\\' && i+1 < len(argList) {
+				b.WriteByte(argList[i+1])
+				i++
+				continue
+			}
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'', '`':
+			quote = c
+			b.WriteByte(c)
+		case '(':
+			depthRound++
+			b.WriteByte(c)
+		case ')':
+			if depthRound > 0 {
+				depthRound--
+			}
+			b.WriteByte(c)
+		case '[':
+			depthSquare++
+			b.WriteByte(c)
+		case ']':
+			if depthSquare > 0 {
+				depthSquare--
+			}
+			b.WriteByte(c)
+		case '{':
+			depthCurly++
+			b.WriteByte(c)
+		case '}':
+			if depthCurly > 0 {
+				depthCurly--
+			}
+			b.WriteByte(c)
+		case ',':
+			if depthRound == 0 && depthSquare == 0 && depthCurly == 0 {
+				args = append(args, b.String())
+				b.Reset()
+				continue
+			}
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	if b.Len() > 0 {
+		args = append(args, b.String())
+	}
+	return args
+}
+
+// stringLiteralValue reports whether s is a JS string or template literal
+// with no ${} interpolation and returns its unquoted text. Escape
+// sequences inside the literal are NOT decoded — for our use (path
+// reconstruction) the raw text is what we want, since JS escapes rarely
+// appear in URL paths and decoding them risks introducing characters that
+// don't round-trip through the prober.
+func stringLiteralValue(s string) (string, bool) {
+	if len(s) < 2 {
+		return "", false
+	}
+	first, last := s[0], s[len(s)-1]
+	if first != last {
+		return "", false
+	}
+	switch first {
+	case '"', '\'':
+		return s[1 : len(s)-1], true
+	case '`':
+		inner := s[1 : len(s)-1]
+		if strings.Contains(inner, "${") {
+			return "", false
+		}
+		return inner, true
+	}
+	return "", false
+}
+
+// parsePlusChain walks a `+`-concat chain starting at start (the byte
+// immediately after a `+` that follows the head literal). It alternates
+// operand and `+` tokens, collecting string-literal operands verbatim and
+// substituting concatPathSentinel for any other operand. Returns the
+// reconstructed suffix.
+//
+// Walks at most maxConcatChainOperands operands; bails immediately on a
+// malformed operand, a missing connecting `+`, or any unexpected
+// character. Trailing whitespace and the final operand are tolerated.
+func parsePlusChain(jsBody []byte, start int) string {
+	var b strings.Builder
+	pos := start
+	for op := 0; op < maxConcatChainOperands; op++ {
+		pos = skipPlusChainWhitespace(jsBody, pos)
+		if pos >= len(jsBody) {
+			return b.String()
+		}
+		lit, end, ok := readChainOperand(jsBody, pos)
+		if !ok {
+			return b.String()
+		}
+		b.WriteString(lit)
+		pos = skipPlusChainWhitespace(jsBody, end)
+		if pos >= len(jsBody) || jsBody[pos] != '+' {
+			return b.String()
+		}
+		pos++
+	}
+	return b.String()
+}
+
+// readChainOperand reads a single operand from a `+`-concat chain at pos.
+// A string literal returns its unquoted text; any other operand returns
+// concatPathSentinel. Operand boundary is the next top-level `+`, `;`,
+// `,`, newline, or matched closing bracket of the surrounding expression.
+// Returns (text, end-index past the operand, ok).
+func readChainOperand(jsBody []byte, pos int) (string, int, bool) {
+	if pos >= len(jsBody) {
+		return "", pos, false
+	}
+	c := jsBody[pos]
+	if c == '"' || c == '\'' || c == '`' {
+		end := scanStringLiteral(jsBody, pos)
+		if end < 0 {
+			return "", pos, false
+		}
+		raw := string(jsBody[pos : end+1])
+		if lit, ok := stringLiteralValue(raw); ok {
+			return lit, end + 1, true
+		}
+		return concatPathSentinel, end + 1, true
+	}
+	end := scanIdentifierOperand(jsBody, pos)
+	if end == pos {
+		return "", pos, false
+	}
+	return concatPathSentinel, end, true
+}
+
+// scanStringLiteral returns the index of the matching closing quote of
+// the string starting at start, or -1 if not found within a bounded scan.
+// Handles backslash escapes; for template literals (`...`) the scan also
+// walks past ${} interpolations so nested `+` characters inside them are
+// not mistaken for chain separators.
+func scanStringLiteral(jsBody []byte, start int) int {
+	if start >= len(jsBody) {
+		return -1
+	}
+	quote := jsBody[start]
+	if quote == '`' {
+		end := findTemplateLiteralEnd(jsBody, start+1)
+		return end
+	}
+	for i := start + 1; i < len(jsBody); i++ {
+		c := jsBody[i]
+		if c == '\\' && i+1 < len(jsBody) {
+			i++
+			continue
+		}
+		if c == quote {
+			return i
+		}
+		if c == '\n' {
+			return -1
+		}
+	}
+	return -1
+}
+
+// scanIdentifierOperand returns the end index (exclusive) of a single
+// non-literal operand starting at pos. The operand is consumed up to the
+// next top-level operator or terminator. Bracketed sub-expressions are
+// skipped so commas/+ inside them do not split the operand.
+func scanIdentifierOperand(jsBody []byte, pos int) int { //nolint:gocyclo // small state machine
+	depthRound, depthSquare, depthCurly := 0, 0, 0
+	i := pos
+	for ; i < len(jsBody); i++ {
+		c := jsBody[i]
+		if depthRound == 0 && depthSquare == 0 && depthCurly == 0 {
+			switch c {
+			case '+', ';', ',', '\n', '\r':
+				return i
+			case ')', ']', '}':
+				return i
+			}
+		}
+		switch c {
+		case '(':
+			depthRound++
+		case ')':
+			if depthRound > 0 {
+				depthRound--
+			}
+		case '[':
+			depthSquare++
+		case ']':
+			if depthSquare > 0 {
+				depthSquare--
+			}
+		case '{':
+			depthCurly++
+		case '}':
+			if depthCurly > 0 {
+				depthCurly--
+			}
+		case '"', '\'', '`':
+			end := scanStringLiteral(jsBody, i)
+			if end < 0 {
+				return i
+			}
+			i = end
+		}
+	}
+	return i
+}
+
+// skipPlusChainWhitespace advances past spaces, tabs, and newlines.
+// Newlines are skipped here because parsePlusChain only calls this while
+// positioned BETWEEN operands (always after a `+`), where typical JS
+// formatting may break the line. Chain termination by an unaccompanied
+// newline is enforced by scanIdentifierOperand, which stops at `\n` so an
+// identifier operand cannot gobble up the following statement.
+func skipPlusChainWhitespace(jsBody []byte, pos int) int {
+	for pos < len(jsBody) {
+		c := jsBody[pos]
+		if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+			return pos
+		}
+		pos++
+	}
+	return pos
+}
+
 // extractAPIPaths scans JavaScript source code for API path patterns using
 // multiple extraction strategies:
 //  1. Single/double-quoted strings containing API indicators
 //  2. Template literals (backticks), including ${...} interpolations
 //  3. Full URLs (http/https) pointing to API endpoints
 //  4. Service prefix concatenation (e.g., "identity/" + "api/auth/login")
+//  5. String.prototype.concat() and +-chain with identifiers (LAB-1368)
 //
 // Returns deduplicated path strings. Paths with discovered service prefixes
 // are expanded; already-prefixed and full-URL paths are kept as-is.
@@ -970,6 +1417,14 @@ func extractAPIPaths(jsBody []byte, requests []ObservedRequest) []string { //nol
 		if len(match) >= 2 {
 			addPath(string(match[1]))
 		}
+	}
+
+	// Strategy 4: String.prototype.concat() and +-chain with identifiers
+	// (LAB-1368). Reconstructed paths use a numeric sentinel for non-literal
+	// operands so the REST normalizer can parameterize them. Run last so the
+	// more-precise strategies above win the dedup race when both match.
+	for _, p := range extractConcatPaths(jsBody) {
+		addPath(p)
 	}
 
 	return paths

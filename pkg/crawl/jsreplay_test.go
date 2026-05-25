@@ -162,6 +162,23 @@ func TestExtractAPIPaths(t *testing.T) {
 			},
 		},
 		{
+			name: "concat with identifier (LAB-1368)",
+			js: `
+				fetch("/api/posts/".concat(id, "/comment"));
+				fetch("/api/users/" + uid + "/profile");
+			`,
+			want: []string{
+				// "/api/posts/" (concat receiver) and "/api/users/" (+-chain
+				// head literal) are both picked up by Strategy 1 as plain
+				// quoted strings; the reconstructed concat/plus paths are
+				// the new contribution from Strategy 4. Both forms coexist.
+				"/api/posts",
+				"/api/posts/0/comment",
+				"/api/users",
+				"/api/users/0/profile",
+			},
+		},
+		{
 			name: "mixed strategies",
 			js: `
 				"identity/"+"api/auth/login"
@@ -206,6 +223,414 @@ func TestExtractAPIPaths_TemplateLiteralInterpolation(t *testing.T) {
 		"/api/users/{param}/profile",
 		"/api/v2/items/{param}/comments/{param}",
 	}, got)
+}
+
+func TestExtractConcatPaths(t *testing.T) {
+	tests := []struct {
+		name string
+		js   string
+		want []string
+	}{
+		{
+			name: "ticket example: concat with identifier",
+			js:   `fetch("/api/posts/".concat(id, "/comment"));`,
+			want: []string{"/api/posts/0/comment"},
+		},
+		{
+			name: "concat with multiple identifiers",
+			js:   `axios.get("/api/posts/".concat(postId, "/comments/", commentId));`,
+			want: []string{"/api/posts/0/comments/0"},
+		},
+		{
+			name: "concat with leading identifier",
+			js:   `fetch("/api/v1/users/".concat(id));`,
+			want: []string{"/api/v1/users/0"},
+		},
+		{
+			name: "concat with template literal arg (no interp)",
+			js:   "fetch(\"/api/posts/\".concat(id, `/comment`));",
+			want: []string{"/api/posts/0/comment"},
+		},
+		{
+			name: "concat with template literal containing interp falls back to sentinel",
+			js:   "fetch(\"/api/posts/\".concat(`${id}`, \"/comment\"));",
+			want: []string{"/api/posts/0/comment"},
+		},
+		{
+			name: "pure literal concat is kept",
+			js:   `fetch("/api/posts/".concat("recent"));`,
+			want: []string{"/api/posts/recent"},
+		},
+		{
+			name: "concat with method call argument",
+			js:   `fetch("/api/v2/users/".concat(getUserId(), "/profile"));`,
+			want: []string{"/api/v2/users/0/profile"},
+		},
+		{
+			name: "concat with expression argument (ternary)",
+			js:   `fetch("/api/items/".concat(active ? a : b, "/x"));`,
+			want: []string{"/api/items/0/x"},
+		},
+		{
+			name: "concat with no API indicator dropped",
+			js:   `"foo".concat(bar, "/baz");`,
+			want: nil,
+		},
+		{
+			name: "concat with empty arg list — receiver lacking API indicator dropped",
+			js:   `"foo".concat();`,
+			want: nil,
+		},
+		{
+			name: "concat with empty arg list keeps API-indicator receiver",
+			js:   `"/api/v2/users".concat();`,
+			want: []string{"/api/v2/users"},
+		},
+		{
+			name: "plus chain with identifier",
+			js:   `fetch("/api/users/" + id + "/posts");`,
+			want: []string{"/api/users/0/posts"},
+		},
+		{
+			name: "plus chain with multiple identifiers",
+			js:   `fetch("/api/users/" + uid + "/posts/" + pid + "/likes");`,
+			want: []string{"/api/users/0/posts/0/likes"},
+		},
+		{
+			name: "plus chain head without API indicator ignored",
+			js:   `fetch("foo/" + id + "/bar");`,
+			want: nil,
+		},
+		{
+			name: "plus chain stops at semicolon",
+			js:   `var u = "/api/v2/posts/" + id; doOther();`,
+			want: []string{"/api/v2/posts/0"},
+		},
+		{
+			name: "plus chain stops at newline without trailing +",
+			js:   "var u = \"/api/v2/posts/\" + id\nvar v = 1;\n",
+			want: []string{"/api/v2/posts/0"},
+		},
+		{
+			name: "plus chain continues across newline after +",
+			js:   "var u = \"/api/v2/posts/\" + id +\n  \"/comment\";\n",
+			want: []string{"/api/v2/posts/0/comment"},
+		},
+		{
+			name: "plus chain with method-call operand",
+			js:   `var u = "/api/v2/posts/" + post.getId() + "/comment";`,
+			want: []string{"/api/v2/posts/0/comment"},
+		},
+		{
+			name: "concat and plus together (dedup across forms)",
+			js: `
+				fetch("/api/posts/".concat(id, "/comment"));
+				var p = "/api/posts/" + id + "/comment";
+			`,
+			want: []string{"/api/posts/0/comment"},
+		},
+		{
+			name: "both forms in one file emit different paths",
+			js: `
+				fetch("/api/posts/".concat(id, "/comment"));
+				var p = "/api/users/" + uid + "/profile";
+			`,
+			want: []string{"/api/posts/0/comment", "/api/users/0/profile"},
+		},
+		{
+			name: "minified concat",
+			js:   `function r(i){return"/api/posts/".concat(i,"/comment")}`,
+			want: []string{"/api/posts/0/comment"},
+		},
+		{
+			name: "minified plus",
+			js:   `function r(i){return"/api/posts/"+i+"/comment"}`,
+			want: []string{"/api/posts/0/comment"},
+		},
+		{
+			name: "concat receiver is non-literal (member access) ignored",
+			js:   `obj.url.concat(id, "/x");`,
+			want: nil,
+		},
+		{
+			name: "no concatenation expressions present",
+			js:   `fetch("/api/v2/users");`,
+			want: nil,
+		},
+		{
+			name: "concat with nested call containing comma",
+			js:   `fetch("/api/posts/".concat(foo(a, b), "/x"));`,
+			want: []string{"/api/posts/0/x"},
+		},
+		{
+			name: "concat with array literal arg containing comma",
+			js:   `fetch("/api/posts/".concat([a, b].join("/"), "/x"));`,
+			want: []string{"/api/posts/0/x"},
+		},
+		{
+			name: "concat path with whitespace inside literal reconstruction is dropped",
+			js:   `fetch("/api/posts/".concat(id, " /comment"));`,
+			want: nil,
+		},
+		{
+			name: "plus chain capped at maxConcatChainOperands",
+			js: `var u = "/api/posts/" + a + "/" + b + "/" + c + "/" + d + "/" +
+				e + "/" + f + "/" + g + "/" + h + "/" + i + "/" + j + "/" +
+				k + "/" + l + "/" + m + "/" + n + "/end";`,
+			// 16 operands consumed before bail; reconstruction is bounded but
+			// the exact tail is implementation-defined. We assert prefix-only.
+			want: nil, // see prefix assertion in dedicated test below
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.want == nil && strings.Contains(tt.name, "capped") {
+				// Asserted in TestExtractConcatPaths_PlusChainCap.
+				return
+			}
+			got := extractConcatPaths([]byte(tt.js))
+			sort.Strings(got)
+			sort.Strings(tt.want)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestExtractConcatPaths_PlusChainCap asserts that a `+`-chain longer than
+// maxConcatChainOperands is bounded (we walk a prefix and stop) rather than
+// blowing past the cap or panicking.
+func TestExtractConcatPaths_PlusChainCap(t *testing.T) {
+	js := `var u = "/api/posts/" + a + "/" + b + "/" + c + "/" + d + "/" +
+		e + "/" + f + "/" + g + "/" + h + "/" + i + "/" + j + "/" +
+		k + "/" + l + "/" + m + "/" + n + "/end";`
+
+	got := extractConcatPaths([]byte(js))
+	assert.Len(t, got, 1, "should still emit one bounded path")
+	assert.True(t, strings.HasPrefix(got[0], "/api/posts/0/0/"),
+		"prefix should be reconstructed, got %q", got[0])
+}
+
+// TestExtractConcatPaths_FlowsThroughExtractAPIPaths verifies the new
+// strategy is wired into the orchestrator. The literal receiver of the
+// .concat() call ("/api/posts/") is independently picked up by Strategy 1
+// (apiPathPattern), so the orchestrator emits both the literal receiver
+// AND the reconstructed concat path — this is intentional: the literal
+// form might exist as a real endpoint, and the reconstructed form is the
+// new contribution from Strategy 4.
+func TestExtractConcatPaths_FlowsThroughExtractAPIPaths(t *testing.T) {
+	js := `
+		fetch("/api/posts/".concat(id, "/comment"));
+		fetch("/api/posts/recent");
+	`
+	got := extractAPIPaths([]byte(js), nil)
+	sort.Strings(got)
+	assert.Equal(t, []string{
+		"/api/posts",
+		"/api/posts/0/comment",
+		"/api/posts/recent",
+	}, got)
+}
+
+func TestFindConcatArgListEnd(t *testing.T) {
+	// Caller passes the index immediately after `(`; result is the index
+	// of the matching `)` or -1.
+	tests := []struct {
+		name string
+		src  string
+		// position of `)` we expect; if -1, scan should fail
+		want int
+	}{
+		{"empty args", `)`, 0},
+		{"simple args", `id, "/x")`, 8},
+		{"nested call", `foo(a, b), "/x")`, 15},
+		{"nested array", `[a, b], "/x")`, 12},
+		{"nested object", `{a: 1}, "/x")`, 12},
+		{"paren inside string", `")(", x)`, 7},
+		{"escaped quote", `"a\"b", x)`, 9},
+		{"unterminated string", `"a`, -1},
+		{"missing close", `id, "/x"`, -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := findConcatArgListEnd([]byte(tt.src), 0)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestFindConcatArgListEnd_BoundedByMaxConcatArgList(t *testing.T) {
+	// Build an arg list whose closing `)` sits past maxConcatArgList — the
+	// scanner must bail with -1 rather than walking the whole buffer.
+	huge := strings.Repeat("a, ", (maxConcatArgList/3)+10) + ")"
+	got := findConcatArgListEnd([]byte(huge), 0)
+	assert.Equal(t, -1, got, "should bail when matching ) is past the cap")
+}
+
+func TestScanStringLiteral(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		want int // index of closing quote, or -1
+	}{
+		{"double quote", `"abc"`, 4},
+		{"single quote", `'abc'`, 4},
+		{"backtick", "`abc`", 4},
+		{"escape", `"a\"b"`, 5},
+		{"unterminated double", `"abc`, -1},
+		{"newline terminates double", "\"abc\nrest", -1},
+		{"unterminated single", `'abc`, -1},
+		{"backtick with interp", "`a${x}b`", 7},
+		{"backtick unterminated", "`abc", -1},
+		{"empty input", ``, -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := scanStringLiteral([]byte(tt.src), 0)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestScanIdentifierOperand(t *testing.T) {
+	// Returns the end index (exclusive) of the operand starting at 0.
+	tests := []struct {
+		name string
+		src  string
+		want int
+	}{
+		{"plain ident", `id+`, 2},
+		{"ident with dot", `obj.id+`, 6},
+		{"call", `foo()+`, 5},
+		{"call with comma", `foo(a, b)+`, 9},
+		{"index expr", `arr[i]+`, 6},
+		{"object expr", `{k: 1}+`, 6},
+		{"string literal in operand", `x("/a")+`, 7},
+		{"backtick literal in operand", "x(`a`)+", 6},
+		{"terminate semicolon", `id;`, 2},
+		{"terminate comma", `id,`, 2},
+		{"terminate newline", "id\n", 2},
+		{"terminate cr", "id\r", 2},
+		{"terminate close paren outside depth", `id)`, 2},
+		{"terminate close bracket outside depth", `id]`, 2},
+		{"terminate close brace outside depth", `id}`, 2},
+		// Unterminated string inside operand: scan bails at the offending
+		// quote position rather than walking off the end of input.
+		{"unterminated string bails", `x("`, 2},
+		{"all the way to EOF", `idEOF`, 5},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := scanIdentifierOperand([]byte(tt.src), 0)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestReadChainOperand_StringLiteralPaths(t *testing.T) {
+	// String literal operand → unquoted text; non-literal → sentinel.
+	got, end, ok := readChainOperand([]byte(`"abc"+`), 0)
+	assert.True(t, ok)
+	assert.Equal(t, "abc", got)
+	assert.Equal(t, 5, end)
+
+	got, _, ok = readChainOperand([]byte(`id+`), 0)
+	assert.True(t, ok)
+	assert.Equal(t, concatPathSentinel, got)
+
+	// Backtick with interpolation → sentinel (not unquoted).
+	got, _, ok = readChainOperand([]byte("`${x}`+"), 0)
+	assert.True(t, ok)
+	assert.Equal(t, concatPathSentinel, got)
+
+	// Empty input → not ok.
+	_, _, ok = readChainOperand(nil, 0)
+	assert.False(t, ok)
+
+	// Unterminated string at start → not ok.
+	_, _, ok = readChainOperand([]byte(`"abc`), 0)
+	assert.False(t, ok)
+}
+
+func TestParseConcatArgs(t *testing.T) {
+	tests := []struct {
+		name    string
+		argList string
+		want    string
+	}{
+		{"single ident", "id", "0"},
+		{"single literal", `"abc"`, "abc"},
+		{"single literal single-quoted", `'abc'`, "abc"},
+		{"single backtick literal", "`abc`", "abc"},
+		{"backtick with interp falls back", "`${x}`", "0"},
+		{"ident then literal", `id, "/x"`, "0/x"},
+		{"literal then ident", `"/a", id`, "/a0"},
+		{"three args mixed", `a, "/b/", c`, "0/b/0"},
+		{"trailing whitespace ok", ` id , "/x" `, "0/x"},
+		{"empty arg list", ``, ""},
+		{"only commas drops empties", `,,,`, ""},
+		{"function call arg", `foo(a, b)`, "0"},
+		{"array arg", `[a, b]`, "0"},
+		{"object arg", `{a: 1}`, "0"},
+		{"nested literal inside function arg", `foo("/x")`, "0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseConcatArgs(tt.argList)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestStringLiteralValue(t *testing.T) {
+	tests := []struct {
+		in       string
+		wantText string
+		wantOK   bool
+	}{
+		{`"abc"`, "abc", true},
+		{`'abc'`, "abc", true},
+		{"`abc`", "abc", true},
+		{"`a${x}b`", "", false},
+		{"abc", "", false},
+		{`"unterminated`, "", false},
+		{``, "", false},
+		{`"`, "", false},
+		{`""`, "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			got, ok := stringLiteralValue(tt.in)
+			assert.Equal(t, tt.wantOK, ok)
+			if ok {
+				assert.Equal(t, tt.wantText, got)
+			}
+		})
+	}
+}
+
+func TestSplitConcatArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"empty", "", nil},
+		{"single", `"a"`, []string{`"a"`}},
+		{"two", `"a", b`, []string{`"a"`, ` b`}},
+		{"comma in string", `"a, b", c`, []string{`"a, b"`, ` c`}},
+		{"comma in parens", `foo(a, b), c`, []string{`foo(a, b)`, ` c`}},
+		{"comma in array", `[a, b], c`, []string{`[a, b]`, ` c`}},
+		{"comma in object", `{a: 1, b: 2}, c`, []string{`{a: 1, b: 2}`, ` c`}},
+		{"escape in string", `"a\"b", c`, []string{`"a\"b"`, ` c`}},
+		{"backtick comma", "`a,b`, c", []string{"`a,b`", ` c`}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := splitConcatArgs(tt.in)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 func TestExtractServicePrefixes(t *testing.T) {
