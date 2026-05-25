@@ -15,10 +15,15 @@
 package classify
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"mime"
 	"net/url"
 	"strings"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 )
 
 // APIClassifier determines if a request is an API call.
@@ -46,6 +51,18 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 		bestMatch.ObservedRequest = req
 		bestMatch.IsAPI = false
 		bestMatch.Confidence = 0
+
+		// Capture per-observation multi-value-ness BEFORE Deduplicate can
+		// merge values across observations and obscure which keys were
+		// truly multi-value in any single request. Always non-nil so
+		// downstream consumers can distinguish "RunClassifiers ran, no
+		// multi-value keys" from "ClassifiedRequest built directly".
+		bestMatch.MultiValueQueryKeys = make(map[string]bool)
+		for k, vs := range req.QueryParams {
+			if len(vs) > 1 {
+				bestMatch.MultiValueQueryKeys[k] = true
+			}
+		}
 
 		for _, classifier := range classifiers {
 			var isAPI bool
@@ -77,13 +94,14 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 
 // Deduplicate removes duplicate classified requests, keeping the highest confidence.
 // The deduplication key is METHOD:path (query params and fragments stripped).
-// QueryParams from all duplicate observations are merged.
+// Multi-value QueryParams from duplicate observations are merged with union-of-values,
+// preserving first-seen order.
 //
 // Memory usage: The map and order slice grow linearly with unique METHOD:path keys.
 // In practice this is bounded by the upstream crawl layer's MaxPages setting
 // (default 100). The import path (ReadCapture) does not enforce size limits,
 // so callers importing from untrusted capture files should validate input size.
-func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
+func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest { //nolint:gocyclo // boundary normalization for multipart adds necessary branches
 	type entry struct {
 		req ClassifiedRequest
 	}
@@ -114,22 +132,81 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
 			key += ":" + sa
 		}
 
-		existing, found := seen[key]
-		if !found {
-			order = append(order, key)
-			seen[key] = &entry{req: req}
-		} else {
-			// Merge unique QueryParams.
-			if req.QueryParams != nil {
-				if existing.req.QueryParams == nil {
-					existing.req.QueryParams = make(map[string]string)
-				}
-				for k, v := range req.QueryParams {
-					if _, exists := existing.req.QueryParams[k]; !exists {
-						existing.req.QueryParams[k] = v
+		// If this observation has a body, include the base content type and a
+		// short hash of the body bytes in the key so that:
+		//   - Distinct body shapes on the same path+method survive as separate
+		//     entries (required for downstream form/JSON field-merge logic in
+		//     buildOperation in pkg/generate/rest/openapi.go, which unions fields
+		//     across observations).
+		//   - Identical bodies still collapse correctly (true duplicates).
+		//   - Empty-body requests (GET, DELETE, HEAD, OPTIONS) are unaffected.
+		if len(req.Body) > 0 {
+			ct := getContentType(req.Headers)
+			if ct != "" {
+				key += ":" + mediatype.Base(ct)
+			}
+			// Append a short fingerprint of the body so distinct payload shapes
+			// on the same endpoint+method+CT survive deduplication. This is
+			// required for downstream form/JSON merge logic in buildOperation
+			// to see all observations and union their fields. 8 bytes (64 bits)
+			// is a deliberate balance: birthday-collision probability is ~1e-14
+			// at 500 distinct bodies per endpoint, well under realistic crawl
+			// scale (capped at MaxPages, default 100). With 1M distinct bodies the
+			// probability rises to ~5e-8, still negligible in practice.
+			// A collision would silently merge two distinct bodies into one dedup
+			// bucket; this is no worse than pre-fix behavior and worth the simpler key.
+			fingerprintBody := req.Body
+			if ct != "" {
+				if mt, params, err := mime.ParseMediaType(ct); err == nil && mt == "multipart/form-data" {
+					if boundary := params["boundary"]; len(boundary) >= 4 {
+						// Multipart bodies contain a random boundary token (per-request) that
+						// would otherwise make every observation unique. Normalize it to a
+						// sentinel so identical logical forms with different boundaries dedup.
+						// boundary < 4 chars: skip normalization, fall through to raw body hash.
+						// This is defensive — RFC 2046 allows 1-70 char boundaries but real-world
+						// browsers/libraries use 30+ chars. A pathologically short boundary would
+						// corrupt the body more than it'd help dedup.
+						fingerprintBody = bytes.ReplaceAll(req.Body, []byte(boundary), []byte("BOUNDARY"))
 					}
 				}
 			}
+			h := sha256.Sum256(fingerprintBody)
+			key += ":" + hex.EncodeToString(h[:8])
+		}
+
+		existing, found := seen[key]
+		if !found {
+			order = append(order, key)
+			// Deep-copy QueryParams so that merging into the entry does not mutate
+			// the caller's original ClassifiedRequest slices.
+			entryCopy := req
+			if req.QueryParams != nil {
+				entryCopy.QueryParams = make(map[string][]string, len(req.QueryParams))
+				for k, vs := range req.QueryParams {
+					copied := make([]string, len(vs))
+					copy(copied, vs)
+					entryCopy.QueryParams[k] = copied
+				}
+			}
+			entryCopy.MultiValueQueryKeys = mergeMultiValueKeys(nil, req.MultiValueQueryKeys)
+			seen[key] = &entry{req: entryCopy}
+		} else {
+			// Merge multi-value QueryParams: union per key, preserving first-seen order.
+			if req.QueryParams != nil {
+				if existing.req.QueryParams == nil {
+					existing.req.QueryParams = make(map[string][]string)
+				}
+				for k, vs := range req.QueryParams {
+					existing.req.QueryParams[k] = MergeUniqueOrdered(existing.req.QueryParams[k], vs)
+				}
+			}
+
+			// Union MultiValueQueryKeys: a key is multi-value in the
+			// dedup entry if ANY contributing observation saw it as
+			// multi-value. (Scalar values that merely differ across
+			// observations do NOT make the merged entry multi-value —
+			// that's the regression this tracking exists to prevent.)
+			existing.req.MultiValueQueryKeys = mergeMultiValueKeys(existing.req.MultiValueQueryKeys, req.MultiValueQueryKeys)
 
 			// Keep highest confidence, but preserve first occurrence's body/response.
 			if req.Confidence > existing.req.Confidence {
@@ -147,11 +224,92 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest {
 	return results
 }
 
+// MergeUniqueOrdered returns a new slice containing the values of a followed
+// by the values of b, with duplicates removed. The first occurrence of each
+// distinct value wins, preserving order. Neither input slice is modified.
+//
+// This function is safe to call when a or b reference data that should not be
+// mutated (e.g., observation data passed to Deduplicate) — the returned slice
+// is always a fresh allocation.
+//
+// The output is capped at crawl.MaxQueryParamValues entries; duplicates are
+// removed regardless of where they appear in a or b.
+//
+// Returns nil when both inputs are empty (treats nil and empty slices
+// interchangeably) so callers can range over the result without a nil-check.
+func MergeUniqueOrdered(a, b []string) []string {
+	if len(a) == 0 && len(b) == 0 {
+		return nil
+	}
+	limit := crawl.MaxQueryParamValues
+	outCapacity := len(a) + len(b)
+	if outCapacity > limit {
+		outCapacity = limit
+	}
+	out := make([]string, 0, outCapacity)
+	seen := make(map[string]struct{}, outCapacity)
+	for _, v := range a {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+		if len(out) >= limit {
+			return out
+		}
+	}
+	for _, v := range b {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+		if len(out) >= limit {
+			return out
+		}
+	}
+	return out
+}
+
+// mergeMultiValueKeys returns dst with each true entry from src added.
+// If src is nil, dst is returned unchanged. If dst is nil and src is
+// non-nil, a fresh map sized to src is allocated. Used by Deduplicate to
+// union per-observation multi-value-key tracking across merged requests.
+//
+// False-valued entries in src are intentionally omitted: consumers
+// (notably buildOperation in pkg/generate/rest) treat map-absence as
+// "not multi-value", matching Go's zero-value semantics for bool, so
+// there is no need to record key=false explicitly.
+func mergeMultiValueKeys(dst, src map[string]bool) map[string]bool {
+	if src == nil {
+		return dst
+	}
+	if dst == nil {
+		dst = make(map[string]bool, len(src))
+	}
+	for k, v := range src {
+		if v {
+			dst[k] = true
+		}
+	}
+	return dst
+}
+
 // getSoapAction returns the SOAPAction header value, performing a case-insensitive lookup.
 func getSoapAction(headers map[string]string) string {
 	for k, v := range headers {
 		if strings.EqualFold(k, "soapaction") {
 			return strings.Trim(v, `"`)
+		}
+	}
+	return ""
+}
+
+// getContentType returns the Content-Type header value, case-insensitively.
+func getContentType(headers map[string]string) string {
+	for k, v := range headers {
+		if strings.EqualFold(k, "content-type") {
+			return v
 		}
 	}
 	return ""

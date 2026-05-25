@@ -24,7 +24,7 @@
       "Host": "localhost:8990"
     },
     "query_params": {
-      "q": "世界"
+      "q": ["世界"]
     },
     "response": {
       "status_code": 200,

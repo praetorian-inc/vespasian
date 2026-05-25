@@ -85,18 +85,23 @@ type Options struct {
 	Logger *slog.Logger
 }
 
-// withDefaults returns a copy of o with zero values replaced by defaults.
+// withDefaults returns a copy of o with zero-or-negative numeric values replaced
+// by their Default* constants. The `<= 0` guards (rather than `== 0`) close a
+// gap CodeRabbit caught: a caller passing Concurrency: -1 would previously have
+// kept the negative value, which spawns no workers and silently classifies all
+// bundles as BundlesAbandonedOnCancel on a non-canceled run. Treating
+// non-positive values as "use the default" matches what callers mean.
 func (o Options) withDefaults() Options {
-	if o.PerBundleTimeout == 0 {
+	if o.PerBundleTimeout <= 0 {
 		o.PerBundleTimeout = DefaultPerBundleTimeout
 	}
-	if o.MaxBundleSize == 0 {
+	if o.MaxBundleSize <= 0 {
 		o.MaxBundleSize = DefaultMaxBundleSize
 	}
-	if o.MaxEndpointsPerBundle == 0 {
+	if o.MaxEndpointsPerBundle <= 0 {
 		o.MaxEndpointsPerBundle = DefaultMaxEndpointsPerBundle
 	}
-	if o.Concurrency == 0 {
+	if o.Concurrency <= 0 {
 		o.Concurrency = DefaultConcurrency
 	}
 	if o.Logger == nil {
@@ -120,8 +125,8 @@ type Stats struct {
 	BundlesSkipped      int // JS bodies skipped (oversized, empty, parse timeout).
 	SourcemapsRecovered int // .js.map sources successfully decoded via sourcesContent.
 	SourcemapFetchFails int // sourceMappingURL comments seen but fetch failed.
-	EndpointsFound      int // raw extractedEndpoint count, pre-filter.
-	EndpointsKept       int // endpoints that survived filtering and made it into Requests.
+	EndpointsFound      int // endpoints emitted by ExtractFromBundle, before MaxEndpointsPerBundle cap and toRequests synthesis.
+	EndpointsKept       int // endpoints that survived the cap and synthesis and made it into Requests.
 	// SourcemapSourceTimeouts counts individual sourcemap source extractions
 	// that were skipped. Increments on per-source PerBundleTimeout, on a
 	// goroutine panic recovered during extraction, AND when an individual
@@ -165,115 +170,81 @@ func isJSContentType(ct string) bool {
 		lower == "application/x-js"
 }
 
+// extractWithTimeout runs ExtractFromBundle in a goroutine with a per-source
+// PerBundleTimeout and panic recovery. Returns (endpoints, timedOut). On a
+// recovered panic the goroutine logs and treats the result as empty. The kind
+// argument ("bundle" or "sourcemap-source") tags log records so an operator
+// reading logs can tell which extraction phase produced an event.
+func extractWithTimeout(ctx context.Context, source []byte, sourceURL, kind string, opts Options) ([]ExtractedEndpoint, bool) {
+	ch := make(chan []ExtractedEndpoint, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				opts.Logger.Error("jsluice panic", "kind", kind, "source", sourceURL, "panic", r)
+				ch <- nil
+			}
+		}()
+		eps, err := ExtractFromBundle(source, sourceURL)
+		if err != nil {
+			opts.Logger.Warn("extract error", "kind", kind, "source", sourceURL, "err", err)
+		}
+		ch <- eps
+	}()
+	timeoutCtx, cancel := context.WithTimeout(ctx, opts.PerBundleTimeout)
+	defer cancel()
+	select {
+	case eps := <-ch:
+		return eps, false
+	case <-timeoutCtx.Done():
+		opts.Logger.Warn("parse timeout", "kind", kind, "source", sourceURL)
+		return nil, true
+	}
+}
+
 // analyzeOne analyzes a single captured JS bundle. It runs sourcemap recovery
 // and extractor extraction, then synthesizes requests. The function is safe to
 // call from goroutines; it has no shared mutable state.
-//
-// Length rationale: this function intentionally exceeds the project's ~60-line
-// guideline. It is the linear sequence of one bundle's life-cycle (recover
-// sourcemap → extract bundle with timeout → cap + tag → synthesize → loop over
-// sourcemap sources with per-source timeout → synthesize). Splitting it would
-// trade three trivially-named helpers for an extra goroutine-lifetime contract
-// per helper — the helpers would have to take, leak, and clean up the bundleCh
-// and srcCh channels and propagate Stats accumulators back. The single function
-// keeps the timeout + recover + accounting pattern in one readable block.
 func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) perBundleResult {
 	var result perBundleResult
 	body := req.Response.Body
 
-	// Run sourcemap recovery (ctx propagated for remote fetch cancellation).
+	// Sourcemap recovery (ctx propagated for remote fetch cancellation).
 	smSources, smStats := recoverSourcemap(ctx, body, req.URL, opts)
 	result.stats.SourcemapFetchFails += smStats.SourcemapFetchFails
 	result.stats.SourcemapsRecovered += smStats.SourcemapsRecovered
 
-	// Extract endpoints from the bundle body. Wrap in a goroutine with
-	// PerBundleTimeout so a pathological bundle cannot block indefinitely.
-	bundleCh := make(chan []ExtractedEndpoint, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				opts.Logger.Error("jsluice panic", "bundle", req.URL, "panic", r)
-				bundleCh <- nil
-			}
-		}()
-		eps, extractErr := ExtractFromBundle(body, req.URL)
-		if extractErr != nil {
-			opts.Logger.Warn("bundle extract error", "url", req.URL, "err", extractErr)
-		}
-		bundleCh <- eps
-	}()
-
-	var bundleEps []ExtractedEndpoint
-	bundleCtx, cancel := context.WithTimeout(ctx, opts.PerBundleTimeout)
-	defer cancel()
-	select {
-	case eps := <-bundleCh:
-		bundleEps = eps
-	case <-bundleCtx.Done():
+	// Extract endpoints from the bundle body with per-bundle timeout.
+	bundleEps, timedOut := extractWithTimeout(ctx, body, req.URL, "bundle", opts)
+	if timedOut {
 		result.stats.BundlesSkipped++
-		opts.Logger.Warn("bundle parse timeout", "url", req.URL)
 		return result
 	}
 
 	result.stats.BundlesAnalyzed++
 	result.stats.EndpointsFound += len(bundleEps)
-
-	// Cap endpoints per bundle.
 	if len(bundleEps) > opts.MaxEndpointsPerBundle {
 		bundleEps = bundleEps[:opts.MaxEndpointsPerBundle]
 	}
-
-	// Tag bundle endpoints as static:js.
 	for i := range bundleEps {
 		bundleEps[i].SourceTag = SourceJS
 	}
-
-	// Synthesize requests from bundle endpoints.
 	synth := toRequests(bundleEps, req.URL)
 	result.requests = append(result.requests, synth...)
 	result.stats.EndpointsKept += len(synth)
 
-	// Process each recovered sourcemap source. Each extraction is wrapped in
-	// a goroutine with PerBundleTimeout + recover() so a pathological
-	// sourcesContent entry cannot hang or panic the worker.
+	// Process each recovered sourcemap source. Each uses the same timeout +
+	// recover pattern; oversized sources are skipped without extraction.
 	for _, src := range smSources {
-		// Apply MaxBundleSize cap to individual sourcemap sources.
 		if len(src) > opts.MaxBundleSize {
 			result.stats.SourcemapSourceTimeouts++
 			opts.Logger.Warn("sourcemap source oversized, skipping", "bundle", req.URL, "size", len(src))
 			continue
 		}
-
-		srcCopy := src // capture for goroutine
-		srcCh := make(chan []ExtractedEndpoint, 1)
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					opts.Logger.Error("jsluice panic in sourcemap source", "bundle", req.URL, "panic", r)
-					srcCh <- nil
-				}
-			}()
-			smEps, smErr := ExtractFromBundle([]byte(srcCopy), req.URL)
-			if smErr != nil {
-				opts.Logger.Debug("sourcemap source extraction failed",
-					"bundle", req.URL, "error", smErr)
-			}
-			srcCh <- smEps
-		}()
-
-		srcCtx, srcCancel := context.WithTimeout(ctx, opts.PerBundleTimeout)
-		var smEps []ExtractedEndpoint
-		select {
-		case eps := <-srcCh:
-			smEps = eps
-		case <-srcCtx.Done():
+		smEps, timedOut := extractWithTimeout(ctx, []byte(src), req.URL, "sourcemap-source", opts)
+		if timedOut {
 			result.stats.SourcemapSourceTimeouts++
-			opts.Logger.Warn("sourcemap source parse timeout", "bundle", req.URL)
-			srcCancel()
 			continue
 		}
-		srcCancel()
-
 		result.stats.EndpointsFound += len(smEps)
 		for i := range smEps {
 			smEps[i].SourceTag = SourceSourcemap

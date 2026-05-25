@@ -351,17 +351,9 @@ func MapResult(r output.Result) ObservedRequest {
 	}
 
 	// Parse query params from URL
-	// QueryParams stores only the first value for each key. Multi-value
-	// query parameters (e.g., ?ids=1&ids=2) retain only the first value.
-	// This is intentional -- the classifier needs parameter names, not all values.
 	if req.URL != "" {
 		if u, err := url.Parse(req.URL); err == nil {
-			req.QueryParams = make(map[string]string)
-			for key, values := range u.Query() {
-				if len(values) > 0 {
-					req.QueryParams[key] = values[0]
-				}
-			}
+			req.QueryParams = CapQueryValues(u.Query())
 		}
 	}
 

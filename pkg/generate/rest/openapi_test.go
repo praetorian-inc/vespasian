@@ -15,11 +15,16 @@
 package rest
 
 import (
+	"bytes"
 	"encoding/json"
+	"mime/multipart"
+	"net/textproto"
 	"strings"
 	"testing"
 
 	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
@@ -164,9 +169,9 @@ func TestOpenAPIGenerator_RealWorldExample(t *testing.T) {
 			ObservedRequest: crawl.ObservedRequest{
 				Method: "GET",
 				URL:    "https://api.example.com/users?limit=10&offset=0",
-				QueryParams: map[string]string{
-					"limit":  "10",
-					"offset": "0",
+				QueryParams: map[string][]string{
+					"limit":  {"10"},
+					"offset": {"0"},
 				},
 				Response: crawl.ObservedResponse{
 					StatusCode: 200,
@@ -314,9 +319,7 @@ func TestCapitalizeFirst(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := capitalizeFirst(tt.input)
-			if result != tt.expected {
-				t.Errorf("capitalizeFirst(%q) = %q, want %q", tt.input, result, tt.expected)
-			}
+			assert.Equal(t, tt.expected, result, "capitalizeFirst(%q)", tt.input)
 		})
 	}
 }
@@ -344,9 +347,7 @@ func TestInferQueryParamType(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := inferQueryParamType(tt.value)
-			if result != tt.expected {
-				t.Errorf("inferQueryParamType(%q) = %q, want %q", tt.value, result, tt.expected)
-			}
+			assert.Equal(t, tt.expected, result, "inferQueryParamType(%q)", tt.value)
 		})
 	}
 }
@@ -523,6 +524,91 @@ func TestP0Fixes_ContextAwarePathParams(t *testing.T) {
 	}
 }
 
+func TestOpenAPIGenerator_SlugObservation(t *testing.T) {
+	// Three slug-shaped observations under a common prefix must be grouped
+	// into a single parameterized path by Generate(). This locks in the
+	// contract that observation-based slug detection (NormalizePathsWithNames)
+	// is wired into groupEndpoints; a regression that reverts the wiring to
+	// per-endpoint normalization would produce three distinct paths and fail
+	// this test.
+	gen := &OpenAPIGenerator{}
+
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://api.example.com/articles/my-first-post",
+				Response: crawl.ObservedResponse{
+					StatusCode: 200,
+					Body:       []byte(`{"title": "first"}`),
+				},
+			},
+			IsAPI: true,
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://api.example.com/articles/another-post",
+				Response: crawl.ObservedResponse{
+					StatusCode: 200,
+					Body:       []byte(`{"title": "another"}`),
+				},
+			},
+			IsAPI: true,
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://api.example.com/articles/yet-another-post",
+				Response: crawl.ObservedResponse{
+					StatusCode: 200,
+					Body:       []byte(`{"title": "yet another"}`),
+				},
+			},
+			IsAPI: true,
+		},
+	}
+
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	loader := openapi3.NewLoader()
+	doc, err := loader.LoadFromData(spec)
+	if err != nil {
+		t.Fatalf("Generated spec failed validation: %v", err)
+	}
+
+	// Exactly one path should exist; observation-based detection collapses
+	// the three slug observations onto /articles/{articleSlug}.
+	if doc.Paths.Len() != 1 {
+		paths := append([]string{}, doc.Paths.InMatchingOrder()...)
+		t.Fatalf("expected 1 path in spec, got %d: %v", doc.Paths.Len(), paths)
+	}
+
+	expectedPath := "/articles/{articleSlug}"
+	pathItem := doc.Paths.Find(expectedPath)
+	if pathItem == nil {
+		paths := append([]string{}, doc.Paths.InMatchingOrder()...)
+		t.Fatalf("expected path %q not found in spec; got: %v", expectedPath, paths)
+	}
+	if pathItem.Get == nil {
+		t.Fatal("GET operation not found on /articles/{articleSlug}")
+	}
+
+	// Verify the path parameter is present and correctly named.
+	var pathParamNames []string
+	for _, paramRef := range pathItem.Get.Parameters {
+		if paramRef.Value.In == "path" {
+			pathParamNames = append(pathParamNames, paramRef.Value.Name)
+		}
+	}
+	if len(pathParamNames) != 1 || pathParamNames[0] != "articleSlug" {
+		t.Errorf("path parameters = %v, want exactly [articleSlug]", pathParamNames)
+	}
+}
+
 func TestP0Fixes_ActualStatusCodes(t *testing.T) {
 	gen := &OpenAPIGenerator{}
 
@@ -652,6 +738,72 @@ func TestResourceNameFromPath(t *testing.T) {
 			if result != tt.expected {
 				t.Errorf("resourceNameFromPath(%q) = %q, want %q", tt.path, result, tt.expected)
 			}
+		})
+	}
+}
+
+func TestResourceNameFromPath_StripsExtensions(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		expected string
+	}{
+		{name: "php extension", path: "/login.php", expected: "Login"},
+		{name: "mvc extension", path: "/register.mvc", expected: "Register"},
+		{name: "json extension", path: "/data.json", expected: "Data"},
+		{name: "asp extension", path: "/page.asp", expected: "Page"},
+		{name: "aspx extension", path: "/submit.aspx", expected: "Submit"},
+		{name: "jsp extension", path: "/view.jsp", expected: "View"},
+		{name: "html extension", path: "/index.html", expected: "Index"},
+		{name: "htm extension", path: "/home.htm", expected: "Home"},
+		{name: "xml extension", path: "/feed.xml", expected: "Feed"},
+		{name: "action extension", path: "/save.action", expected: "Save"},
+		{name: "do extension", path: "/process.do", expected: "Process"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := resourceNameFromPath(tt.path)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestResourceNameFromPath_HandlesHyphens(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		expected string
+	}{
+		{name: "hyphenated segment", path: "/stored-xss", expected: singularize("StoredXss")},
+		{name: "multi-hyphenated", path: "/cross-site-scripting", expected: singularize("CrossSiteScripting")},
+		{name: "underscore segment", path: "/user_profile", expected: singularize("UserProfile")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := resourceNameFromPath(tt.path)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestResourceNameFromPath_FallbackOnEmpty(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		expected string
+	}{
+		{name: "root path", path: "/", expected: "Resource"},
+		{name: "empty string", path: "", expected: "Resource"},
+		{name: "extension-only segment", path: "/.php", expected: "Resource"},
+		{name: "numeric-only segment", path: "/123", expected: "Resource123"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := resourceNameFromPath(tt.path)
+			assert.Equal(t, tt.expected, result)
 		})
 	}
 }
@@ -838,59 +990,375 @@ func TestExtractComponents(t *testing.T) {
 	extractComponents(doc)
 
 	// Verify components were created
-	if doc.Components == nil || doc.Components.Schemas == nil {
-		t.Fatal("Components or Schemas not initialized")
-	}
+	require.NotNil(t, doc.Components, "Components should be initialized")
+	require.NotNil(t, doc.Components.Schemas, "Schemas should be initialized")
 
 	// Verify request body schema was extracted
-	if _, exists := doc.Components.Schemas["CreateTicketRequest"]; !exists {
-		t.Error("CreateTicketRequest schema not found in components")
-	}
+	assert.Contains(t, doc.Components.Schemas, "CreateTicketRequest",
+		"CreateTicketRequest schema not found in components")
 
 	// Verify response schemas were extracted
 	// Note: POST 201 and GET 200 have identical schemas (id, title), so they share the same component
-	hasTicketResponse := false
-	if _, exists := doc.Components.Schemas["TicketCreatedResponse"]; exists {
-		hasTicketResponse = true
-	}
-	if _, exists := doc.Components.Schemas["TicketResponse"]; exists {
-		hasTicketResponse = true
-	}
-	if !hasTicketResponse {
-		t.Error("No ticket response schema found in components (expected TicketCreatedResponse or TicketResponse)")
-	}
+	_, hasCreatedResponse := doc.Components.Schemas["TicketCreatedResponse"]
+	_, hasTicketResponse := doc.Components.Schemas["TicketResponse"]
+	assert.True(t, hasCreatedResponse || hasTicketResponse,
+		"No ticket response schema found in components (expected TicketCreatedResponse or TicketResponse)")
 
-	if _, exists := doc.Components.Schemas["TicketNotFoundResponse"]; !exists {
-		t.Error("TicketNotFoundResponse schema not found in components")
-	}
+	assert.Contains(t, doc.Components.Schemas, "TicketNotFoundResponse",
+		"TicketNotFoundResponse schema not found in components")
 
 	// Verify schemas were replaced with $ref
 	postOp := doc.Paths.Find("/api/v2/tickets").Post
-	if postOp.RequestBody == nil || postOp.RequestBody.Value.Content["application/json"].Schema.Ref == "" {
-		t.Error("POST request body schema not replaced with $ref")
-	}
+	require.NotNil(t, postOp.RequestBody, "POST request body should not be nil")
+	assert.NotEmpty(t, postOp.RequestBody.Value.Content["application/json"].Schema.Ref,
+		"POST request body schema not replaced with $ref")
 
 	getOp := doc.Paths.Find("/api/v2/tickets/{ticketId}").Get
 	resp200 := getOp.Responses.Value("200")
-	if resp200 == nil || resp200.Value.Content["application/json"].Schema.Ref == "" {
-		t.Error("GET 200 response schema not replaced with $ref")
-	}
+	require.NotNil(t, resp200, "GET 200 response should not be nil")
+	assert.NotEmpty(t, resp200.Value.Content["application/json"].Schema.Ref,
+		"GET 200 response schema not replaced with $ref")
+
 	resp404 := getOp.Responses.Value("404")
-	if resp404 == nil || resp404.Value.Content["application/json"].Schema.Ref == "" {
-		t.Error("GET 404 response schema not replaced with $ref")
+	require.NotNil(t, resp404, "GET 404 response should not be nil")
+	assert.NotEmpty(t, resp404.Value.Content["application/json"].Schema.Ref,
+		"GET 404 response schema not replaced with $ref")
+
+	// Verify deduplication: POST 201 and GET 200 have identical schemas (id, title).
+	// They may or may not share the same $ref depending on the response-vs-request
+	// fingerprint maps; at minimum, both $refs must be non-empty (already checked above).
+	postResp := postOp.Responses.Value("201")
+	require.NotNil(t, postResp, "POST 201 response should not be nil")
+	getResp := getOp.Responses.Value("200")
+	require.NotNil(t, getResp, "GET 200 response should not be nil")
+	t.Logf("POST 201 ref: %s", postResp.Value.Content["application/json"].Schema.Ref)
+	t.Logf("GET 200 ref: %s", getResp.Value.Content["application/json"].Schema.Ref)
+}
+
+func TestBuildOperation_FormBody(t *testing.T) {
+	t.Run("url-encoded form body", func(t *testing.T) {
+		gen := &OpenAPIGenerator{}
+		endpoints := []classify.ClassifiedRequest{
+			{
+				ObservedRequest: crawl.ObservedRequest{
+					Method: "POST",
+					URL:    "https://api.example.com/login",
+					Headers: map[string]string{
+						"content-type": "application/x-www-form-urlencoded",
+					},
+					Body: []byte("username=alice&password=secret"),
+					Response: crawl.ObservedResponse{
+						StatusCode: 200,
+					},
+				},
+				IsAPI: true,
+			},
+		}
+		spec, err := gen.Generate(endpoints)
+		require.NoError(t, err, "Generate should succeed")
+
+		var parsed map[string]interface{}
+		require.NoError(t, yaml.Unmarshal(spec, &parsed), "YAML parse should succeed")
+
+		// Dig into paths./login.post.requestBody.content
+		paths, _ := parsed["paths"].(map[string]interface{})
+		loginPath, _ := paths["/login"].(map[string]interface{})
+		post, _ := loginPath["post"].(map[string]interface{})
+		requestBody, _ := post["requestBody"].(map[string]interface{})
+		content, _ := requestBody["content"].(map[string]interface{})
+
+		_, hasFormEncoded := content["application/x-www-form-urlencoded"]
+		assert.True(t, hasFormEncoded, "expected application/x-www-form-urlencoded in content, got keys: %v", content)
+		_, hasJSON := content["application/json"]
+		assert.False(t, hasJSON, "expected no application/json key for url-encoded-only endpoint")
+	})
+
+	t.Run("mixed json and url-encoded observations", func(t *testing.T) {
+		gen := &OpenAPIGenerator{}
+		endpoints := []classify.ClassifiedRequest{
+			{
+				ObservedRequest: crawl.ObservedRequest{
+					Method: "POST",
+					URL:    "https://api.example.com/submit",
+					Headers: map[string]string{
+						"content-type": "application/json",
+					},
+					Body:     []byte(`{"name":"Alice"}`),
+					Response: crawl.ObservedResponse{StatusCode: 200},
+				},
+				IsAPI: true,
+			},
+			{
+				ObservedRequest: crawl.ObservedRequest{
+					Method: "POST",
+					URL:    "https://api.example.com/submit",
+					Headers: map[string]string{
+						"Content-Type": "application/x-www-form-urlencoded",
+					},
+					Body:     []byte("name=Bob"),
+					Response: crawl.ObservedResponse{StatusCode: 200},
+				},
+				IsAPI: true,
+			},
+		}
+		spec, err := gen.Generate(endpoints)
+		require.NoError(t, err, "Generate should succeed")
+
+		var parsed map[string]interface{}
+		require.NoError(t, yaml.Unmarshal(spec, &parsed), "YAML parse should succeed")
+
+		paths, _ := parsed["paths"].(map[string]interface{})
+		submitPath, _ := paths["/submit"].(map[string]interface{})
+		post, _ := submitPath["post"].(map[string]interface{})
+		requestBody, _ := post["requestBody"].(map[string]interface{})
+		content, _ := requestBody["content"].(map[string]interface{})
+
+		_, hasJSON := content["application/json"]
+		assert.True(t, hasJSON, "expected application/json in content, got keys: %v", content)
+		_, hasFormEncoded := content["application/x-www-form-urlencoded"]
+		assert.True(t, hasFormEncoded, "expected application/x-www-form-urlencoded in content, got keys: %v", content)
+	})
+}
+
+func TestOpenAPIGenerator_MultipartFormData_EndToEnd(t *testing.T) {
+	// Build a well-formed multipart/form-data body with one text field and
+	// one file upload field, then pass it through gen.Generate() and assert
+	// that the resulting spec carries a multipart/form-data requestBody with
+	// the file field typed as string/binary.
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+
+	// Text field
+	err := w.WriteField("username", "alice")
+	require.NoError(t, err)
+
+	// File field
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition", `form-data; name="avatar"; filename="photo.jpg"`)
+	h.Set("Content-Type", "image/jpeg")
+	fw, err := w.CreatePart(h)
+	require.NoError(t, err)
+	_, _ = fw.Write([]byte("JPEG_DATA"))
+	_ = w.Close()
+
+	contentType := "multipart/form-data; boundary=" + w.Boundary()
+
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "POST",
+				URL:    "https://api.example.com/upload",
+				Headers: map[string]string{
+					"content-type": contentType,
+				},
+				Body: buf.Bytes(),
+				Response: crawl.ObservedResponse{
+					StatusCode: 200,
+				},
+			},
+			IsAPI: true,
+		},
 	}
 
-	// Verify deduplication: 200 responses for both POST/GET have same schema
-	postResp := postOp.Responses.Value("201")
-	getResp := getOp.Responses.Value("200")
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err, "Generate should succeed")
 
-	// Both should reference the same schema (based on fingerprint)
-	// POST 201 and GET 200 have identical schemas (id, title), so they should share a component
-	if postResp.Value.Content["application/json"].Schema.Ref != getResp.Value.Content["application/json"].Schema.Ref {
-		// Actually, they might have different names based on status code context
-		// Let me check if at least the references exist
-		t.Logf("POST 201 ref: %s", postResp.Value.Content["application/json"].Schema.Ref)
-		t.Logf("GET 200 ref: %s", getResp.Value.Content["application/json"].Schema.Ref)
+	specStr := string(spec)
+
+	// The requestBody content must have a multipart/form-data key.
+	assert.Contains(t, specStr, "multipart/form-data", "spec missing multipart/form-data content type in requestBody")
+
+	// The file field must be present and typed string/binary.
+	assert.Contains(t, specStr, "avatar", "spec missing 'avatar' field from multipart body")
+	assert.Contains(t, specStr, "binary", "spec missing format: binary for file upload field")
+}
+
+// TestExtractComponents_RequestResponseScopedRefs verifies that when a request
+// body and a 200 response body share IDENTICAL property shapes (echo-style
+// endpoint), the generated $ref values are DIFFERENT — the request gets a
+// name ending in "Request" and the response gets a name ending in "Response".
+// Pre-fix, fingerprintToName was shared between request and response extraction,
+// causing the response to reuse the request's component name (e.g., the response
+// would be tagged "CreateXRequest" instead of "XResponse").
+func TestExtractComponents_RequestResponseScopedRefs(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+
+	// Echo-style endpoint: request and response have identical property shapes.
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "POST",
+				URL:    "https://api.example.com/echo",
+				Headers: map[string]string{
+					"Content-Type": "application/json",
+				},
+				Body: []byte(`{"id": 1, "name": "x"}`),
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: "application/json",
+					Body:        []byte(`{"id": 1, "name": "x"}`),
+				},
+			},
+			IsAPI: true,
+		},
+	}
+
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err, "Generate should succeed")
+
+	loader := openapi3.NewLoader()
+	doc, err := loader.LoadFromData(spec)
+	require.NoError(t, err, "Generated spec should be valid OpenAPI")
+
+	echoPath := doc.Paths.Find("/echo")
+	require.NotNil(t, echoPath, "expected /echo path")
+	require.NotNil(t, echoPath.Post, "expected POST on /echo")
+
+	// Get the request body $ref.
+	reqBody := echoPath.Post.RequestBody
+	require.NotNil(t, reqBody, "expected requestBody")
+	jsonReqMedia := reqBody.Value.Content["application/json"]
+	require.NotNil(t, jsonReqMedia, "expected application/json in requestBody")
+	reqRef := jsonReqMedia.Schema.Ref
+	assert.NotEmpty(t, reqRef, "expected $ref in requestBody schema")
+	assert.True(t, strings.HasSuffix(reqRef, "Request"),
+		"requestBody $ref %q should end with 'Request'", reqRef)
+
+	// Get the 200 response $ref.
+	resp200 := echoPath.Post.Responses.Value("200")
+	require.NotNil(t, resp200, "expected 200 response")
+	jsonRespMedia := resp200.Value.Content["application/json"]
+	require.NotNil(t, jsonRespMedia, "expected application/json in 200 response")
+	respRef := jsonRespMedia.Schema.Ref
+	assert.NotEmpty(t, respRef, "expected $ref in 200 response schema")
+	assert.True(t, strings.HasSuffix(respRef, "Response"),
+		"200 response $ref %q should end with 'Response'", respRef)
+
+	// The two $ref values must be DIFFERENT (pre-fix they were the same).
+	assert.NotEqual(t, reqRef, respRef,
+		"request and response $refs must differ (echo endpoints share property shapes but not component names)")
+}
+
+// TestExtractComponents_DeterministicMultiContentType ensures that when a
+// single endpoint exposes multiple media types with DIFFERENT schemas (e.g.,
+// JSON + urlencoded observations), component names are stable across runs.
+// The previous TestExtractComponents_Deterministic only used one media type
+// per path and missed the inner-map iteration order issue.
+func TestExtractComponents_DeterministicMultiContentType(t *testing.T) {
+	var obs []classify.ClassifiedRequest
+	for _, p := range []string{"/api/a", "/api/b", "/api/c", "/api/d", "/api/e"} {
+		obs = append(obs,
+			classify.ClassifiedRequest{
+				ObservedRequest: crawl.ObservedRequest{
+					Method: "POST", URL: "http://x.test" + p,
+					Headers: map[string]string{"Content-Type": "application/json"},
+					Body:    []byte(`{"jsonField":"v"}`),
+				},
+				IsAPI: true, Confidence: 0.9, APIType: "rest",
+			},
+			classify.ClassifiedRequest{
+				ObservedRequest: crawl.ObservedRequest{
+					Method: "POST", URL: "http://x.test" + p,
+					Headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
+					Body:    []byte(`urlencodedField=v`),
+				},
+				IsAPI: true, Confidence: 0.9, APIType: "rest",
+			},
+		)
+	}
+	gen := &OpenAPIGenerator{}
+	runs := make([][]byte, 5)
+	for i := 0; i < 5; i++ {
+		out, err := gen.Generate(obs)
+		require.NoError(t, err)
+		runs[i] = out
+	}
+	for i := 1; i < 5; i++ {
+		assert.Equal(t, string(runs[0]), string(runs[i]), "run %d differs from run 0", i)
+	}
+}
+
+// TestOpenAPIGenerator_MultipartRepeatedFileFields_E2E verifies that when a
+// multipart body contains two parts with the same name="files" both carrying
+// filenames, the generated spec contains exactly ONE "files" property with
+// format: binary.
+//
+// Current intentional last-wins behavior: the second part overwrites the first
+// in schema.Properties, so only one "files" entry exists. This is documented
+// here so future readers understand the design decision and can change it if
+// array semantics are desired.
+func TestOpenAPIGenerator_MultipartRepeatedFileFields_E2E(t *testing.T) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+
+	// Two file parts with the same name "files".
+	for _, fname := range []string{"a.jpg", "b.png"} {
+		h := make(textproto.MIMEHeader)
+		h.Set("Content-Disposition", `form-data; name="files"; filename="`+fname+`"`)
+		h.Set("Content-Type", "image/jpeg")
+		fw, err := w.CreatePart(h)
+		require.NoError(t, err)
+		_, _ = fw.Write([]byte("filedata"))
+	}
+	_ = w.Close()
+
+	contentType := "multipart/form-data; boundary=" + w.Boundary()
+
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "POST",
+				URL:    "https://api.example.com/upload",
+				Headers: map[string]string{
+					"content-type": contentType,
+				},
+				Body: buf.Bytes(),
+				Response: crawl.ObservedResponse{
+					StatusCode: 200,
+				},
+			},
+			IsAPI: true,
+		},
+	}
+
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err, "Generate should succeed")
+
+	loader := openapi3.NewLoader()
+	doc, err := loader.LoadFromData(spec)
+	require.NoError(t, err, "Generated spec should be valid OpenAPI")
+
+	uploadPath := doc.Paths.Find("/upload")
+	require.NotNil(t, uploadPath, "expected /upload path in spec")
+	require.NotNil(t, uploadPath.Post, "expected POST operation on /upload")
+	require.NotNil(t, uploadPath.Post.RequestBody, "expected requestBody on POST /upload")
+
+	content := uploadPath.Post.RequestBody.Value.Content
+	multipartMedia, ok := content["multipart/form-data"]
+	require.True(t, ok, "expected multipart/form-data content type in requestBody")
+
+	// Resolve $ref if needed
+	schema := multipartMedia.Schema
+	if schema.Ref != "" {
+		// Look up the component
+		refName := strings.TrimPrefix(schema.Ref, "#/components/schemas/")
+		schema = doc.Components.Schemas[refName]
+	}
+	require.NotNil(t, schema, "expected schema for multipart/form-data")
+	require.NotNil(t, schema.Value, "expected schema value")
+	require.NotNil(t, schema.Value.Properties, "expected schema properties")
+
+	// Exactly ONE "files" property (last-wins: second part overwrites first).
+	filesProp, ok := schema.Value.Properties["files"]
+	assert.True(t, ok, "expected exactly one 'files' property in schema")
+	if ok {
+		require.NotNil(t, filesProp.Value)
+		assert.Equal(t, "string", filesProp.Value.Type.Slice()[0],
+			"'files' property should be type string")
+		assert.Equal(t, "binary", filesProp.Value.Format,
+			"'files' property should have format: binary")
 	}
 }
 
@@ -1240,5 +1708,364 @@ func TestOpenAPI_XVespasianSource_NoStaticPresent_ByteCompat(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestBuildOperation_EmptyValuesQueryParam is a regression test for D2: a query
+// parameter with an empty observed-values slice must be silently omitted from
+// the generated Operation. Prior to the D2 fix, buildOperation would panic
+// with an index-out-of-range accessing info.values[0] on the scalar branch.
+func TestBuildOperation_EmptyValuesQueryParam(t *testing.T) {
+	// "foo" has an empty values slice — simulates a hand-crafted capture where
+	// the param key is present but no values were ever recorded.
+	// "bar" is a normal scalar param that should still appear.
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://api.example.com/items?bar=1",
+				QueryParams: map[string][]string{"foo": {}, "bar": {"1"}},
+				Response:    crawl.ObservedResponse{StatusCode: 200},
+			},
+			IsAPI: true,
+		},
+	}
+	key := endpointKey{path: "/items", method: "get"}
+
+	// Must not panic.
+	op := buildOperation(key, group, false)
+
+	// "foo" must be absent — no observed values means we cannot document it.
+	for _, paramRef := range op.Parameters {
+		if paramRef.Value != nil && paramRef.Value.Name == "foo" {
+			t.Errorf("parameter 'foo' with empty values should be omitted, but was emitted")
+		}
+	}
+
+	// "bar" must still be present.
+	found := false
+	for _, paramRef := range op.Parameters {
+		if paramRef.Value != nil && paramRef.Value.Name == "bar" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("parameter 'bar' with a valid value should be emitted")
+	}
+}
+
+// TestBuildOperation_ScalarQueryParam is a regression test: a scalar query param
+// should produce a non-array parameter with no Style or Explode set.
+func TestBuildOperation_ScalarQueryParam(t *testing.T) {
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://api.example.com/items?page=1",
+				QueryParams: map[string][]string{"page": {"1"}},
+				Response:    crawl.ObservedResponse{StatusCode: 200},
+			},
+			IsAPI: true,
+		},
+	}
+	key := endpointKey{path: "/items", method: "get"}
+	op := buildOperation(key, group, false)
+
+	require.Len(t, op.Parameters, 1)
+	param := op.Parameters[0].Value
+	require.NotNil(t, param)
+	require.NotNil(t, param.Schema)
+	require.NotNil(t, param.Schema.Value)
+	require.NotNil(t, param.Schema.Value.Type)
+
+	assert.Equal(t, "integer", param.Schema.Value.Type.Slice()[0], "type should be integer for scalar")
+	assert.Equal(t, "", param.Style, "scalar param should have no style")
+	assert.Nil(t, param.Explode, "scalar param should have nil Explode")
+	assert.Nil(t, param.Schema.Value.Items, "scalar param should have no items")
+}
+
+// TestBuildOperation_MultiValueQueryParam_AllInts tests that an array param with
+// all-integer values produces type:array with items type:integer and style/explode set.
+func TestBuildOperation_MultiValueQueryParam_AllInts(t *testing.T) {
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://api.example.com/items?ids=1&ids=2&ids=3",
+				QueryParams: map[string][]string{"ids": {"1", "2", "3"}},
+				Response:    crawl.ObservedResponse{StatusCode: 200},
+			},
+			IsAPI: true,
+		},
+	}
+	key := endpointKey{path: "/items", method: "get"}
+	op := buildOperation(key, group, false)
+
+	require.Len(t, op.Parameters, 1)
+	param := op.Parameters[0].Value
+	require.NotNil(t, param)
+	require.NotNil(t, param.Schema)
+	require.NotNil(t, param.Schema.Value)
+	require.NotNil(t, param.Schema.Value.Type)
+
+	assert.Equal(t, "array", param.Schema.Value.Type.Slice()[0], "type should be array")
+	require.NotNil(t, param.Schema.Value.Items, "items must be set for array param")
+	require.NotNil(t, param.Schema.Value.Items.Value)
+	require.NotNil(t, param.Schema.Value.Items.Value.Type)
+	assert.Equal(t, "integer", param.Schema.Value.Items.Value.Type.Slice()[0], "items type should be integer")
+	assert.Equal(t, "form", param.Style, "style should be form")
+	require.NotNil(t, param.Explode)
+	assert.True(t, *param.Explode, "explode should be true")
+}
+
+// TestBuildOperation_MultiValueQueryParam_Mixed tests that a mixed-type array
+// falls back to items type:string.
+func TestBuildOperation_MultiValueQueryParam_Mixed(t *testing.T) {
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://api.example.com/items?tag=a&tag=1",
+				QueryParams: map[string][]string{"tag": {"a", "1"}},
+				Response:    crawl.ObservedResponse{StatusCode: 200},
+			},
+			IsAPI: true,
+		},
+	}
+	key := endpointKey{path: "/items", method: "get"}
+	op := buildOperation(key, group, false)
+
+	require.Len(t, op.Parameters, 1)
+	param := op.Parameters[0].Value
+	require.NotNil(t, param.Schema.Value.Items)
+	assert.Equal(t, "string", param.Schema.Value.Items.Value.Type.Slice()[0], "mixed values should produce items type:string")
+}
+
+// TestBuildOperation_MultiValueQueryParam_AllBool tests all-boolean array values.
+func TestBuildOperation_MultiValueQueryParam_AllBool(t *testing.T) {
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://api.example.com/flags?flag=true&flag=false",
+				QueryParams: map[string][]string{"flag": {"true", "false"}},
+				Response:    crawl.ObservedResponse{StatusCode: 200},
+			},
+			IsAPI: true,
+		},
+	}
+	key := endpointKey{path: "/flags", method: "get"}
+	op := buildOperation(key, group, false)
+
+	require.Len(t, op.Parameters, 1)
+	param := op.Parameters[0].Value
+	require.NotNil(t, param.Schema.Value.Items)
+	assert.Equal(t, "boolean", param.Schema.Value.Items.Value.Type.Slice()[0], "all-bool values should produce items type:boolean")
+}
+
+// TestInferQueryParamItemsType tests the items type inference function directly.
+func TestInferQueryParamItemsType(t *testing.T) {
+	tests := []struct {
+		name   string
+		values []string
+		want   string
+	}{
+		{name: "empty slice", values: []string{}, want: "string"},
+		{name: "all integers", values: []string{"1", "2", "3"}, want: "integer"},
+		{name: "all floats", values: []string{"1.5", "2.5"}, want: "number"},
+		{name: "all booleans", values: []string{"true", "false"}, want: "boolean"},
+		{name: "mixed string and int", values: []string{"a", "1"}, want: "string"},
+		{name: "single string", values: []string{"hello"}, want: "string"},
+		{name: "integer is also float, int wins", values: []string{"1", "2"}, want: "integer"},
+		{name: "single negative integer", values: []string{"-1"}, want: "integer"},
+		{name: "single zero", values: []string{"0"}, want: "integer"},
+		{name: "single negative float", values: []string{"-0.5"}, want: "number"},
+		{name: "single scientific notation", values: []string{"1e10"}, want: "number"},
+		{name: "single empty string", values: []string{""}, want: "string"},
+		{name: "single mixed alphanumeric", values: []string{"abc123"}, want: "string"},
+		{name: "single uppercase boolean-like", values: []string{"True"}, want: "string"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := inferQueryParamItemsType(tt.values)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestBuildOperation_ScalarQueryParam_OrderIndependence(t *testing.T) {
+	// Two observations of the same scalar param: int first, then float.
+	// Pre-fix: scalar branch took values[0] = "1" → emitted integer.
+	// Post-fix: inferQueryParamItemsType walks all values → emits number.
+	group := []classify.ClassifiedRequest{
+		{ObservedRequest: crawl.ObservedRequest{
+			Method: "GET", URL: "https://x.test/items?limit=1",
+			QueryParams: map[string][]string{"limit": {"1"}},
+		}},
+		{ObservedRequest: crawl.ObservedRequest{
+			Method: "GET", URL: "https://x.test/items?limit=1.5",
+			QueryParams: map[string][]string{"limit": {"1.5"}},
+		}},
+	}
+	op := buildOperation(endpointKey{path: "/items", method: "get"}, group, false)
+	require.NotNil(t, op)
+	require.Len(t, op.Parameters, 1)
+	p := op.Parameters[0].Value
+	require.NotNil(t, p)
+	require.NotNil(t, p.Schema)
+	require.NotNil(t, p.Schema.Value)
+	require.NotNil(t, p.Schema.Value.Type)
+	assert.Equal(t, []string{"number"}, p.Schema.Value.Type.Slice(),
+		"scalar param type must be inferred from ALL observed values, not just the first")
+	// Confirm scalar emission (not array): no Style/Explode set
+	assert.Empty(t, p.Style, "scalar param should not set Style")
+	assert.Nil(t, p.Explode, "scalar param should not set Explode")
+}
+
+func TestBuildOperation_PostDedupScalarNotOverWidened(t *testing.T) {
+	// Regression: when classify.Deduplicate merges two scalar observations
+	// of the same endpoint into one ClassifiedRequest, buildOperation must
+	// still emit the param as scalar (not array). The pre-fix bug was that
+	// the merged QueryParams slice had len > 1, tripping multiValueSeen.
+	// The fix uses MultiValueQueryKeys (populated by RunClassifiers BEFORE
+	// dedup) to record per-observation truth.
+	//
+	// Simulate post-dedup state: one ClassifiedRequest with merged values
+	// AND an empty MultiValueQueryKeys map (no key was multi-value in any
+	// contributing observation).
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://x.test/items?page=1",
+				QueryParams: map[string][]string{"page": {"1", "2"}},
+			},
+			MultiValueQueryKeys: map[string]bool{}, // empty: page was scalar in both contributing obs
+		},
+	}
+	op := buildOperation(endpointKey{path: "/items", method: "get"}, group, false)
+	require.NotNil(t, op)
+	require.Len(t, op.Parameters, 1)
+	p := op.Parameters[0].Value
+	require.NotNil(t, p.Schema)
+	require.NotNil(t, p.Schema.Value)
+	require.NotNil(t, p.Schema.Value.Type)
+	assert.Equal(t, []string{"integer"}, p.Schema.Value.Type.Slice(),
+		"scalar param surviving dedup union must NOT be over-widened to array")
+	assert.Empty(t, p.Style, "scalar must not set Style")
+	assert.Nil(t, p.Explode, "scalar must not set Explode")
+	assert.Nil(t, p.Schema.Value.Items, "scalar must not have Items")
+}
+
+func TestBuildOperation_PostDedupArrayStillDetected(t *testing.T) {
+	// Companion regression: when a key WAS multi-value in a contributing
+	// observation, MultiValueQueryKeys carries that truth through dedup,
+	// and buildOperation must emit the param as array.
+	group := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:      "GET",
+				URL:         "https://x.test/items?tag=a&tag=b",
+				QueryParams: map[string][]string{"tag": {"a", "b"}},
+			},
+			MultiValueQueryKeys: map[string]bool{"tag": true},
+		},
+	}
+	op := buildOperation(endpointKey{path: "/items", method: "get"}, group, false)
+	require.NotNil(t, op)
+	require.Len(t, op.Parameters, 1)
+	p := op.Parameters[0].Value
+	require.NotNil(t, p.Schema)
+	require.NotNil(t, p.Schema.Value)
+	require.NotNil(t, p.Schema.Value.Type)
+	assert.Equal(t, []string{"array"}, p.Schema.Value.Type.Slice(),
+		"key with MultiValueQueryKeys=true must emit as array")
+	assert.Equal(t, "form", p.Style)
+	require.NotNil(t, p.Explode)
+	assert.True(t, *p.Explode)
+}
+
+// TestMergeJSONBodies_TypeConflictPromotesToString verifies that JSON merge
+// uses the same conflict-resolution as form merge (was: silently kept first
+// type). Two observations with `count: 42` then `count: "hello"` should yield
+// a string-typed schema (matching urlencoded/multipart behavior).
+func TestMergeJSONBodies_TypeConflictPromotesToString(t *testing.T) {
+	bodies := [][]byte{
+		[]byte(`{"count": 42}`),
+		[]byte(`{"count": "hello"}`),
+	}
+	merged := mergeJSONBodies(bodies)
+	require.NotNil(t, merged)
+	require.NotNil(t, merged.Value)
+	require.NotNil(t, merged.Value.Properties)
+	countProp := merged.Value.Properties["count"]
+	require.NotNil(t, countProp)
+	require.NotNil(t, countProp.Value.Type)
+	require.NotEmpty(t, countProp.Value.Type.Slice())
+	assert.Equal(t, "string", countProp.Value.Type.Slice()[0],
+		"conflicting types should promote to string (matching form merge behavior)")
+}
+
+// TestMergeJSONBodies_SkipBranches verifies that mergeJSONBodies correctly skips
+// nil/empty bodies and bodies that fail JSON inference, while still merging valid ones.
+func TestMergeJSONBodies_SkipBranches(t *testing.T) {
+	t.Run("skips empty body", func(t *testing.T) {
+		bodies := [][]byte{nil, []byte(`{"a":1}`)}
+		merged := mergeJSONBodies(bodies)
+		require.NotNil(t, merged, "expected non-nil result when one body is valid")
+		require.NotNil(t, merged.Value)
+		require.NotNil(t, merged.Value.Properties)
+		assert.Contains(t, merged.Value.Properties, "a", "valid body's property 'a' should be present")
+	})
+
+	t.Run("skips body that fails inference", func(t *testing.T) {
+		bodies := [][]byte{[]byte("not valid json"), []byte(`{"a":1}`)}
+		merged := mergeJSONBodies(bodies)
+		require.NotNil(t, merged, "expected non-nil result when one body is valid")
+		require.NotNil(t, merged.Value)
+		require.NotNil(t, merged.Value.Properties)
+		assert.Contains(t, merged.Value.Properties, "a", "valid body's property 'a' should be present")
+		assert.Len(t, merged.Value.Properties, 1, "only the valid body should contribute properties")
+	})
+}
+
+// TestExtractComponents_Deterministic verifies that Generate produces byte-identical
+// output across multiple runs when many paths share the same schema fingerprint.
+// Non-determinism would arise from iterating doc.Paths.Map() in random order:
+// the first path encountered for a given fingerprint wins the component name.
+func TestExtractComponents_Deterministic(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+
+	// Build 26 endpoints /v1/a … /v1/z, each with the same request body shape
+	// {name: string, count: integer}. They all produce the same schema fingerprint,
+	// so whichever path is iterated first sets the component name. Without a
+	// deterministic sort, the chosen name varies between runs.
+	body := []byte(`{"name":"x","count":1}`)
+	endpoints := make([]classify.ClassifiedRequest, 0, 26)
+	for c := 'a'; c <= 'z'; c++ {
+		endpoints = append(endpoints, classify.ClassifiedRequest{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "https://api.example.com/v1/" + string(c),
+				Headers: map[string]string{"Content-Type": "application/json"},
+				Body:    body,
+				Response: crawl.ObservedResponse{
+					StatusCode: 201,
+					Body:       []byte(`{"id":1}`),
+				},
+			},
+			IsAPI: true,
+		})
+	}
+
+	// Run Generate 5 times; all outputs must be byte-identical.
+	first, err := gen.Generate(endpoints)
+	require.NoError(t, err, "first Generate call failed")
+
+	for i := 2; i <= 5; i++ {
+		out, err := gen.Generate(endpoints)
+		require.NoError(t, err, "Generate call %d failed", i)
+		assert.Equal(t, first, out, "Generate run %d produced different output than run 1 — non-determinism detected", i)
 	}
 }

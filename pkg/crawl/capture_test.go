@@ -16,11 +16,156 @@ package crawl
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"net/url"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
+
+// makeUniqueStrings returns a slice of n distinct strings "v", "vv", "vvv", ...
+// Shared across TestCapQueryValues subtests (Rule of Three satisfied: 6+ callers).
+func makeUniqueStrings(n int) []string {
+	vs := make([]string, n)
+	for i := range n {
+		vs[i] = strings.Repeat("v", i+1)
+	}
+	return vs
+}
+
+// TestCapQueryValues (SEC-BE-001) verifies that CapQueryValues enforces the
+// MaxQueryParamValues cap per key, mutates q in place, and handles edge cases.
+func TestCapQueryValues(t *testing.T) {
+	t.Run("under_cap_no_truncation", func(t *testing.T) {
+		q := url.Values{"k": makeUniqueStrings(10)}
+		got := CapQueryValues(q)
+		if len(got["k"]) != 10 {
+			t.Errorf("len = %d, want 10 (values under cap must not be truncated)", len(got["k"]))
+		}
+	})
+
+	t.Run("exactly_at_cap_no_truncation", func(t *testing.T) {
+		q := url.Values{"k": makeUniqueStrings(MaxQueryParamValues)}
+		got := CapQueryValues(q)
+		if len(got["k"]) != MaxQueryParamValues {
+			t.Errorf("len = %d, want %d (values exactly at cap must not be truncated)", len(got["k"]), MaxQueryParamValues)
+		}
+	})
+
+	t.Run("over_cap_truncates_to_MaxQueryParamValues", func(t *testing.T) {
+		q := url.Values{"k": makeUniqueStrings(MaxQueryParamValues + 50)}
+		got := CapQueryValues(q)
+		if len(got["k"]) != MaxQueryParamValues {
+			t.Errorf("len = %d, want %d (values over cap must be truncated)", len(got["k"]), MaxQueryParamValues)
+		}
+	})
+
+	t.Run("multiple_keys_only_over_cap_keys_truncated", func(t *testing.T) {
+		q := url.Values{
+			"under": makeUniqueStrings(10),
+			"at":    makeUniqueStrings(MaxQueryParamValues),
+			"over":  makeUniqueStrings(MaxQueryParamValues + 20),
+		}
+		CapQueryValues(q)
+		if len(q["under"]) != 10 {
+			t.Errorf("q[under] len = %d, want 10 (under-cap key must not be truncated)", len(q["under"]))
+		}
+		if len(q["at"]) != MaxQueryParamValues {
+			t.Errorf("q[at] len = %d, want %d (at-cap key must not be truncated)", len(q["at"]), MaxQueryParamValues)
+		}
+		if len(q["over"]) != MaxQueryParamValues {
+			t.Errorf("q[over] len = %d, want %d (over-cap key must be truncated)", len(q["over"]), MaxQueryParamValues)
+		}
+	})
+
+	t.Run("nil_map_returns_nil", func(t *testing.T) {
+		// ranging over a nil map is a no-op in Go; CapQueryValues must not panic.
+		got := CapQueryValues(nil)
+		if got != nil {
+			t.Errorf("got %v, want nil (nil input must return nil)", got)
+		}
+	})
+
+	t.Run("empty_map_returns_empty", func(t *testing.T) {
+		q := url.Values{}
+		got := CapQueryValues(q)
+		if len(got) != 0 {
+			t.Errorf("len = %d, want 0 (empty map must return empty)", len(got))
+		}
+	})
+
+	t.Run("mutation_in_place", func(t *testing.T) {
+		// Callers in crawler.go / network.go / forms.go rely on CapQueryValues
+		// mutating q and returning the same map -- not a copy.
+		q := url.Values{"k": makeUniqueStrings(MaxQueryParamValues + 1)}
+		got := CapQueryValues(q)
+		// Same map identity: pointer equality via reflect.
+		if reflect.ValueOf(q).Pointer() != reflect.ValueOf(got).Pointer() {
+			t.Error("CapQueryValues must return the same map it received (mutation in place)")
+		}
+		// In-place mutation: q itself was modified, not a copy.
+		if len(q["k"]) != MaxQueryParamValues {
+			t.Errorf("q[k] len = %d after CapQueryValues, want %d (in-place mutation)", len(q["k"]), MaxQueryParamValues)
+		}
+	})
+}
+
+// TestCapture_MultiValueQueryParamsRoundTrip (TEST-003) verifies that an
+// ObservedRequest with multi-value QueryParams survives a WriteCapture/ReadCapture
+// round-trip with exact value preservation.
+func TestCapture_MultiValueQueryParamsRoundTrip(t *testing.T) {
+	original := []ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/api/items",
+			QueryParams: map[string][]string{
+				"tag": {"a", "b"},
+			},
+			Response: ObservedResponse{
+				StatusCode: 200,
+			},
+			Source: "browser",
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := WriteCapture(&buf, original); err != nil {
+		t.Fatalf("WriteCapture failed: %v", err)
+	}
+
+	result, err := ReadCapture(&buf)
+	if err != nil {
+		t.Fatalf("ReadCapture failed: %v", err)
+	}
+
+	if len(result) != 1 {
+		t.Fatalf("expected 1 request, got %d", len(result))
+	}
+	if !reflect.DeepEqual(original[0].QueryParams, result[0].QueryParams) {
+		t.Errorf("QueryParams mismatch: want %v, got %v", original[0].QueryParams, result[0].QueryParams)
+	}
+}
+
+// TestReadCapture_RejectsLegacyShape (TEST-003) verifies that the old
+// map[string]string shape for query_params (used in versions ≤ LAB-2110)
+// produces a non-nil unmarshal error rather than silently dropping values.
+func TestReadCapture_RejectsLegacyShape(t *testing.T) {
+	// Old shape: query_params is map[string]string, not map[string][]string.
+	legacy := `[{"method":"GET","url":"http://x.test/","query_params":{"k":"v"},"response":{"status_code":200},"source":"test"}]`
+
+	_, err := ReadCapture(strings.NewReader(legacy))
+	if err == nil {
+		t.Fatal("expected unmarshal error for legacy map[string]string shape, got nil")
+	}
+	var typeErr *json.UnmarshalTypeError
+	if !errors.As(err, &typeErr) {
+		t.Errorf("expected *json.UnmarshalTypeError, got %T: %v", err, err)
+	}
+}
 
 func TestWriteCapture(t *testing.T) {
 	t.Run("single request serializes correctly", func(t *testing.T) {
@@ -31,8 +176,8 @@ func TestWriteCapture(t *testing.T) {
 				Headers: map[string]string{
 					"User-Agent": "Mozilla/5.0",
 				},
-				QueryParams: map[string]string{
-					"page": "1",
+				QueryParams: map[string][]string{
+					"page": {"1"},
 				},
 				Body: []byte("request body"),
 				Response: ObservedResponse{
@@ -133,7 +278,7 @@ func TestReadCapture(t *testing.T) {
       "User-Agent": "Mozilla/5.0"
     },
     "query_params": {
-      "page": "1"
+      "page": ["1"]
     },
     "body": "cmVxdWVzdCBib2R5",
     "response": {
@@ -287,9 +432,9 @@ func TestWriteReadRoundTrip(t *testing.T) {
 					"User-Agent":   "TestAgent/1.0",
 					"Content-Type": "application/json",
 				},
-				QueryParams: map[string]string{
-					"id":    "123",
-					"debug": "true",
+				QueryParams: map[string][]string{
+					"id":    {"123"},
+					"debug": {"true"},
 				},
 				Body: []byte("test request body"),
 				Response: ObservedResponse{
@@ -430,6 +575,76 @@ func TestWriteReadRoundTrip(t *testing.T) {
 		// Compare - nil maps should be preserved as nil
 		if !reflect.DeepEqual(original, result) {
 			t.Errorf("Round-trip data mismatch.\nOriginal: %+v\nResult: %+v", original, result)
+		}
+	})
+}
+
+// TestCapQueryValues_KeyCap (SEC-BE-003) verifies that CapQueryValues enforces
+// the MaxQueryParamKeys cap, drops excess keys deterministically in
+// lexicographic order, and leaves the per-key value cap unchanged.
+func TestCapQueryValues_KeyCap(t *testing.T) {
+	t.Run("caps_distinct_keys_at_MaxQueryParamKeys", func(t *testing.T) {
+		q := url.Values{}
+		for i := 0; i < MaxQueryParamKeys+50; i++ {
+			key := fmt.Sprintf("key%05d", i)
+			q[key] = []string{"v"}
+		}
+		CapQueryValues(q)
+		if len(q) != MaxQueryParamKeys {
+			t.Errorf("len(q) = %d, want %d (keys over cap must be dropped)", len(q), MaxQueryParamKeys)
+		}
+	})
+
+	t.Run("key_count_cap_is_deterministic_lexicographic", func(t *testing.T) {
+		// Build two identical url.Values and verify the kept key sets are identical
+		// and are the lex-smallest MaxQueryParamKeys keys.
+		// Keys are "key00000" .. "key00561" (512+50=562 total); zero-padded so
+		// lexicographic order matches numeric order.
+		total := MaxQueryParamKeys + 50
+		makeQ := func() url.Values {
+			q := url.Values{}
+			for i := 0; i < total; i++ {
+				key := fmt.Sprintf("key%05d", i)
+				q[key] = []string{"v"}
+			}
+			return q
+		}
+
+		q1 := makeQ()
+		q2 := makeQ()
+		CapQueryValues(q1)
+		CapQueryValues(q2)
+
+		// TEST-004: direct two-set equality via sorted slices — self-contained, no
+		// implicit dependency on a preceding length check.
+		keys1 := make([]string, 0, len(q1))
+		for k := range q1 {
+			keys1 = append(keys1, k)
+		}
+		sort.Strings(keys1)
+		keys2 := make([]string, 0, len(q2))
+		for k := range q2 {
+			keys2 = append(keys2, k)
+		}
+		sort.Strings(keys2)
+		if !reflect.DeepEqual(keys1, keys2) {
+			t.Errorf("determinism failed: run1 kept %v, run2 kept %v", keys1, keys2)
+		}
+
+		// The kept keys must be the lex-smallest MaxQueryParamKeys keys.
+		// "key00000" .. "key00511" sort before "key00512" .. "key00561".
+		for i := 0; i < MaxQueryParamKeys; i++ {
+			key := fmt.Sprintf("key%05d", i)
+			if _, ok := q1[key]; !ok {
+				t.Errorf("expected lex-smallest key %q to be retained, but it was dropped", key)
+			}
+		}
+		// Keys from MaxQueryParamKeys onward must be dropped.
+		for i := MaxQueryParamKeys; i < total; i++ {
+			key := fmt.Sprintf("key%05d", i)
+			if _, ok := q1[key]; ok {
+				t.Errorf("expected key %q (past cap) to be dropped, but it was retained", key)
+			}
 		}
 	})
 }

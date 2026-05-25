@@ -26,6 +26,19 @@ type ClassifiedRequest struct {
 	Reason     string  `json:"reason"`
 	APIType    string  `json:"api_type"`
 
+	// MultiValueQueryKeys records which query-parameter keys were observed
+	// as multi-value (len > 1) in any contributing ObservedRequest.
+	// Populated by RunClassifiers and unioned by Deduplicate so the OpenAPI
+	// generator can distinguish "this param was ?tag=a&tag=b in a single
+	// request" from "this param had different scalar values across
+	// deduplicated requests" — a distinction the merged QueryParams slice
+	// length alone cannot preserve.
+	//
+	// Non-nil when produced by RunClassifiers (empty if no multi-value
+	// keys). Nil signals direct construction (e.g., unit tests); consumers
+	// should fall back to len-based detection in that case.
+	MultiValueQueryKeys map[string]bool `json:"multi_value_query_keys,omitempty"`
+
 	// Probe-enriched fields (populated by pkg/probe strategies)
 	AllowedMethods []string               `json:"allowed_methods,omitempty"`
 	ResponseSchema map[string]interface{} `json:"response_schema,omitempty"`

@@ -15,6 +15,7 @@
 package crawl
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -87,11 +88,11 @@ func TestFormsToObservedRequests_GetForm(t *testing.T) {
 		t.Errorf("Method = %q, want GET", r.Method)
 	}
 	// GET forms should merge fields into query params.
-	if r.QueryParams["q"] != "test" {
-		t.Errorf("QueryParams[q] = %q, want %q", r.QueryParams["q"], "test")
+	if len(r.QueryParams["q"]) == 0 || r.QueryParams["q"][0] != "test" {
+		t.Errorf("QueryParams[q] = %v, want [test]", r.QueryParams["q"])
 	}
-	if r.QueryParams["page"] != "1" {
-		t.Errorf("QueryParams[page] = %q, want %q", r.QueryParams["page"], "1")
+	if len(r.QueryParams["page"]) == 0 || r.QueryParams["page"][0] != "1" {
+		t.Errorf("QueryParams[page] = %v, want [1]", r.QueryParams["page"])
 	}
 	// Body should be empty for GET.
 	if len(r.Body) > 0 {
@@ -161,6 +162,57 @@ func TestDiscoveredForm_DefaultValues(t *testing.T) {
 	// Empty method means GET form behavior (fields in query params).
 	if !strings.Contains(results[0].URL, "x=1") {
 		t.Errorf("expected query param in URL for GET form, got %q", results[0].URL)
+	}
+}
+
+// TestFormsToObservedRequests_PostMultiValueQueryParams (TEST-004) verifies that
+// a POST form whose action URL contains multi-value query params preserves them.
+func TestFormsToObservedRequests_PostMultiValueQueryParams(t *testing.T) {
+	forms := []discoveredForm{
+		{
+			Action:      "https://example.com/api/items?tag=a&tag=b",
+			Method:      "POST",
+			ContentType: "application/x-www-form-urlencoded",
+			Fields:      map[string]string{},
+		},
+	}
+
+	results := formsToObservedRequests(forms, "https://example.com/")
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+
+	r := results[0]
+	if !reflect.DeepEqual(r.QueryParams["tag"], []string{"a", "b"}) {
+		t.Errorf("QueryParams[tag] = %v, want [a b]", r.QueryParams["tag"])
+	}
+}
+
+// TestFormsToObservedRequests_GetMultiValueQueryParams (TEST-004) verifies that
+// a GET form whose action URL already has multi-value params preserves them
+// after field merging, and that new single-value fields are also present.
+func TestFormsToObservedRequests_GetMultiValueQueryParams(t *testing.T) {
+	forms := []discoveredForm{
+		{
+			Action: "https://x.test/search?tag=a&tag=b",
+			Method: "GET",
+			Fields: map[string]string{
+				"q": "hello",
+			},
+		},
+	}
+
+	results := formsToObservedRequests(forms, "https://x.test/")
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+
+	r := results[0]
+	if !reflect.DeepEqual(r.QueryParams["tag"], []string{"a", "b"}) {
+		t.Errorf("QueryParams[tag] = %v, want [a b]", r.QueryParams["tag"])
+	}
+	if !reflect.DeepEqual(r.QueryParams["q"], []string{"hello"}) {
+		t.Errorf("QueryParams[q] = %v, want [hello]", r.QueryParams["q"])
 	}
 }
 

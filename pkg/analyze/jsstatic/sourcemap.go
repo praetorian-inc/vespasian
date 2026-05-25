@@ -105,7 +105,7 @@ func recoverSourcemap(ctx context.Context, bundle []byte, bundleURL string, opts
 		client = &clientCopy
 	}
 
-	sources, err := fetchRemoteSourcemap(ctx, client, mappingURL, opts.AllowPrivate)
+	sources, err := fetchRemoteSourcemap(ctx, client, mappingURL)
 	if err != nil {
 		stats.SourcemapFetchFails++
 		return nil, stats
@@ -258,8 +258,12 @@ func defaultSourcemapClient(allowPrivate bool) *http.Client {
 
 // fetchRemoteSourcemap GETs the sourcemap URL, reads up to maxSourcemapResponseSize
 // bytes, and returns sourcesContent strings. ctx is propagated into the HTTP
-// request so that cancellation from the caller is honored.
-func fetchRemoteSourcemap(ctx context.Context, client *http.Client, mapURL string, allowPrivate bool) ([]string, error) {
+// request so that cancellation from the caller is honored. The SSRF posture
+// is established on the client argument by the caller (recoverSourcemap picks
+// either defaultSourcemapClient(allowPrivate) or the user-supplied client
+// wrapped with noFollowRedirects), so this function does not need to know
+// about it.
+func fetchRemoteSourcemap(ctx context.Context, client *http.Client, mapURL string) ([]string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, mapURL, nil)
 	if err != nil {
 		return nil, err

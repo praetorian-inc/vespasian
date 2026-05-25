@@ -335,9 +335,9 @@ func TestMitmproxyImporter_QueryParams(t *testing.T) {
 	req := requests[0]
 	require.NotNil(t, req.QueryParams)
 
-	wantParams := map[string]string{
-		"page":  "1",
-		"limit": "10",
+	wantParams := map[string][]string{
+		"page":  {"1"},
+		"limit": {"10"},
 	}
 
 	assert.Len(t, req.QueryParams, len(wantParams))
@@ -346,6 +346,34 @@ func TestMitmproxyImporter_QueryParams(t *testing.T) {
 		assert.Contains(t, req.QueryParams, key)
 		assert.Equal(t, want, req.QueryParams[key])
 	}
+}
+
+func TestMitmproxyImporter_QueryParams_MultiValue(t *testing.T) {
+	json := `{
+		"request": {
+			"method": "GET",
+			"scheme": "https",
+			"host": "example.com",
+			"port": 443,
+			"path": "/api?ids=1&ids=2",
+			"headers": []
+		},
+		"response": {
+			"status_code": 200,
+			"headers": [],
+			"content": null
+		}
+	}`
+
+	m := &MitmproxyImporter{}
+	requests, err := m.Import(strings.NewReader(json))
+	require.NoError(t, err)
+
+	require.Len(t, requests, 1)
+
+	req := requests[0]
+	require.NotNil(t, req.QueryParams)
+	assert.Equal(t, []string{"1", "2"}, req.QueryParams["ids"])
 }
 
 func TestMitmproxyImporter_InvalidPort(t *testing.T) {
@@ -744,7 +772,7 @@ func TestMitmproxyImporter_Native_SingleFlow(t *testing.T) {
 	assert.Equal(t, `{"id":1}`, string(req.Response.Body))
 	assert.Equal(t, "test", req.Headers["User-Agent"])
 	assert.Equal(t, "application/json", req.Headers["Accept"])
-	assert.Equal(t, "1", req.QueryParams["page"])
+	assert.Equal(t, []string{"1"}, req.QueryParams["page"])
 }
 
 func TestMitmproxyImporter_Native_MultipleFlows(t *testing.T) {

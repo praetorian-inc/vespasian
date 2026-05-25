@@ -49,11 +49,11 @@ func TestMapNetworkToObservedRequest_Normal(t *testing.T) {
 	if obs.PageURL != "https://example.com/app" {
 		t.Errorf("PageURL = %q, want %q", obs.PageURL, "https://example.com/app")
 	}
-	if obs.QueryParams["page"] != "1" {
-		t.Errorf("QueryParams[page] = %q, want %q", obs.QueryParams["page"], "1")
+	if len(obs.QueryParams["page"]) == 0 || obs.QueryParams["page"][0] != "1" {
+		t.Errorf("QueryParams[page] = %v, want [1]", obs.QueryParams["page"])
 	}
-	if obs.QueryParams["limit"] != "10" {
-		t.Errorf("QueryParams[limit] = %q, want %q", obs.QueryParams["limit"], "10")
+	if len(obs.QueryParams["limit"]) == 0 || obs.QueryParams["limit"][0] != "10" {
+		t.Errorf("QueryParams[limit] = %v, want [10]", obs.QueryParams["limit"])
 	}
 	if string(obs.Body) != `{"name":"Alice"}` {
 		t.Errorf("Body = %q, want request body", string(obs.Body))
@@ -201,5 +201,22 @@ func TestFlattenNetworkHeaders_Empty(t *testing.T) {
 	flat = flattenNetworkHeaders(proto.NetworkHeaders{})
 	if flat != nil {
 		t.Errorf("flattenNetworkHeaders({}) = %v, want nil", flat)
+	}
+}
+
+// TestMapNetworkToObservedRequest_MultiValueQueryParam tests that multi-value query params are preserved.
+func TestMapNetworkToObservedRequest_MultiValueQueryParam(t *testing.T) {
+	req := &pendingRequest{
+		method: "GET",
+		url:    "https://example.com/api?tag=a&tag=b",
+	}
+
+	obs := mapNetworkToObservedRequest(req, "https://example.com/")
+
+	if len(obs.QueryParams["tag"]) != 2 {
+		t.Errorf("QueryParams[tag] length = %d, want 2", len(obs.QueryParams["tag"]))
+	}
+	if obs.QueryParams["tag"][0] != "a" || obs.QueryParams["tag"][1] != "b" {
+		t.Errorf("QueryParams[tag] = %v, want [a b]", obs.QueryParams["tag"])
 	}
 }

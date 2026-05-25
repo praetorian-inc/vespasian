@@ -16,18 +16,19 @@ package crawl
 
 // ObservedRequest represents a captured HTTP request and its response.
 type ObservedRequest struct {
-	Method      string            `json:"method"`
-	URL         string            `json:"url"`
-	Headers     map[string]string `json:"headers,omitempty"`
-	QueryParams map[string]string `json:"query_params,omitempty"`
-	Body        []byte            `json:"body,omitempty"`
-	Response    ObservedResponse  `json:"response"`
+	Method      string              `json:"method"`
+	URL         string              `json:"url"`
+	Headers     map[string]string   `json:"headers,omitempty"`
+	QueryParams map[string][]string `json:"query_params,omitempty"`
+	Body        []byte              `json:"body,omitempty"`
+	Response    ObservedResponse    `json:"response"`
 	// Source identifies the channel the request was observed on. Known values:
 	//
 	//   - "katana", "browser"            (live crawl, see pkg/crawl)
 	//   - "form"                         (form submission, see pkg/crawl)
 	//   - "import:burp", "import:har",
 	//     "import:mitmproxy"             (offline imports, see pkg/importer)
+	//   - "static:html"                  (static analysis of HTML <form> elements, pkg/analyze)
 	//   - "static:js"                    (static analysis of JS bundles, pkg/analyze/jsstatic)
 	//   - "static:js-sourcemap"          (recovered via .js.map sourcesContent)
 	Source    string `json:"source"`

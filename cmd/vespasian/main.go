@@ -32,6 +32,7 @@ import (
 
 	"github.com/alecthomas/kong"
 
+	"github.com/praetorian-inc/vespasian/pkg/analyze"
 	"github.com/praetorian-inc/vespasian/pkg/analyze/jsstatic"
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
@@ -537,6 +538,11 @@ func (c *GenerateCmd) Run() (err error) {
 		fmt.Fprintf(os.Stderr, "loaded %d captured requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
+	// Augment with static-HTML form observations so captures produced by
+	// crawl/import (which don't run form extraction) get the same treatment
+	// as captures produced by scan.
+	requests = augmentWithStaticForms(requests)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -621,6 +627,9 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		}
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
+
+	// Augment BEFORE auto-detection (see augmentWithStaticForms doc comment).
+	requests = augmentWithStaticForms(requests)
 
 	apiType := c.APIType
 	if apiType == apiTypeAuto {
@@ -717,7 +726,20 @@ type generateSpecOptions struct {
 	Verbose      bool
 }
 
-// generateSpec runs the classify → probe → generate pipeline.
+// augmentWithStaticForms appends synthetic ObservedRequests parsed from HTML
+// response bodies (see analyze.ExtractForms) so that <form action="/api/…">
+// landing-page signals feed classification, deduplication, and probing.
+// Both ScanCmd (before auto-detection) and GenerateCmd (after loading the
+// capture) call this so the two-stage pipeline is behaviorally equivalent
+// regardless of whether the capture came from scan, crawl, or import.
+func augmentWithStaticForms(requests []crawl.ObservedRequest) []crawl.ObservedRequest {
+	return append(requests, analyze.ExtractForms(requests)...)
+}
+
+// generateSpec runs the classify → probe → generate pipeline. It trusts its
+// caller to have already augmented requests with static-HTML form observations
+// (both ScanCmd and GenerateCmd call augmentWithStaticForms before invoking
+// this function).
 func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts generateSpecOptions) ([]byte, error) {
 	classifiers := classifiersForType(opts.APIType)
 	if classifiers == nil {

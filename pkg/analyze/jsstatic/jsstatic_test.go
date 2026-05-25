@@ -200,6 +200,31 @@ func TestAnalyze_ContextCancel(t *testing.T) {
 	}
 }
 
+// TestAnalyze_NonPositiveOptionsResolveToDefaults pins the CodeRabbit fix: a
+// caller passing Concurrency: -1 (or any other non-positive numeric option)
+// must get the default behavior, not zero workers / zero bundle size / zero
+// timeout. Pre-fix this would leave Concurrency at -1, spawn no workers, and
+// silently classify every bundle as BundlesAbandonedOnCancel on a clean run.
+func TestAnalyze_NonPositiveOptionsResolveToDefaults(t *testing.T) {
+	captured := []crawl.ObservedRequest{makeJSCapture("https://h/app.js", `fetch("/api/x")`)}
+	res, err := Analyze(context.Background(), captured, Options{
+		Concurrency:           -1,
+		PerBundleTimeout:      -1,
+		MaxBundleSize:         -1,
+		MaxEndpointsPerBundle: -1,
+	})
+	if err != nil {
+		t.Fatalf("Analyze with negative Options: %v", err)
+	}
+	if res.Stats.BundlesAnalyzed != 1 {
+		t.Errorf("expected BundlesAnalyzed=1 (defaults applied to negative values), got %d", res.Stats.BundlesAnalyzed)
+	}
+	if res.Stats.BundlesAbandonedOnCancel != 0 {
+		t.Errorf("expected BundlesAbandonedOnCancel=0 on clean run with negative-Concurrency input, got %d",
+			res.Stats.BundlesAbandonedOnCancel)
+	}
+}
+
 func TestAnalyze_DefaultOptionsAreSane(t *testing.T) {
 	captured := []crawl.ObservedRequest{makeJSCapture("https://h/app.js", `fetch("/api/x")`)}
 	// Should not panic with zero Options.
