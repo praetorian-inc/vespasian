@@ -520,3 +520,76 @@ func TestExtractFirstBodyElement_NamespaceGate(t *testing.T) {
 		})
 	}
 }
+
+// CR1 (CodeRabbit round-3 review): regression for the dedup-branch
+// SOAPAction backfill. If endpoint 1 registers the operation (via body
+// child element) without a SOAPAction header, and a later endpoint for
+// the same operation carries the SOAPAction, the binding metadata must
+// be backfilled — otherwise the generated WSDL binding loses the
+// soapAction attribute.
+func TestInferWSDL_BackfillsSOAPActionInDedupBranch(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		{
+			// Endpoint 1: registers GetUser via body child, NO SOAPAction.
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "POST",
+				URL:    "http://example.com/svc",
+				Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+					`<soap:Body><GetUser><id>1</id></GetUser></soap:Body></soap:Envelope>`),
+			},
+		},
+		{
+			// Endpoint 2: same op, CARRIES SOAPAction. Goes through the
+			// dedup branch — the backfill must capture this header.
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "http://example.com/svc",
+				Headers: map[string]string{"SOAPAction": `"urn:GetUser"`},
+				Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+					`<soap:Body><GetUser><id>2</id></GetUser></soap:Body></soap:Envelope>`),
+			},
+		},
+	}
+
+	defs, err := InferWSDL(endpoints)
+	require.NoError(t, err)
+	require.Len(t, defs.Bindings, 1)
+	require.Len(t, defs.Bindings[0].Operations, 1)
+	require.NotNil(t, defs.Bindings[0].Operations[0].SOAPOperation,
+		"binding operation must carry SOAPOperation backfilled from endpoint 2")
+	assert.Equal(t, "urn:GetUser", defs.Bindings[0].Operations[0].SOAPOperation.SOAPAction,
+		"SOAPAction must be backfilled when first observation lacked it")
+}
+
+// CR1 negative: when the first observation already carries SOAPAction, a
+// later same-op endpoint with a different SOAPAction must NOT overwrite
+// it. First-observed-soapaction wins (matches first-observed-type-wins
+// throughout the package).
+func TestInferWSDL_DoesNotOverwriteExistingSOAPAction(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "http://example.com/svc",
+				Headers: map[string]string{"SOAPAction": `"urn:GetUserV1"`},
+				Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+					`<soap:Body><GetUserV1><id>1</id></GetUserV1></soap:Body></soap:Envelope>`),
+			},
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "http://example.com/svc",
+				Headers: map[string]string{"SOAPAction": `"urn:GetUserV1Alt"`},
+				Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+					`<soap:Body><GetUserV1><id>2</id></GetUserV1></soap:Body></soap:Envelope>`),
+			},
+		},
+	}
+
+	defs, err := InferWSDL(endpoints)
+	require.NoError(t, err)
+	require.NotNil(t, defs.Bindings[0].Operations[0].SOAPOperation)
+	assert.Equal(t, "urn:GetUserV1", defs.Bindings[0].Operations[0].SOAPOperation.SOAPAction,
+		"first-observed SOAPAction must not be overwritten by a later same-op endpoint")
+}

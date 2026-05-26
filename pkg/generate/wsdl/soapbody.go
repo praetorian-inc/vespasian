@@ -226,11 +226,21 @@ func findXSIType(attrs []xml.Attr) string {
 	return ""
 }
 
-// resolveXSIType maps an xsi:type value to an XSD type string.
-// Simple fallback: only "xsd" and "xs" prefixes map to XSD built-ins;
-// all other prefixes are treated as tns: user-defined types.
-// An empty value falls back to xsd:string (the rule-9 default).
+// resolveXSIType maps an xsi:type attribute value to an XSD type string.
+// Whitespace around the value is trimmed before parsing. An empty or
+// whitespace-only value falls back to xsd:string.
+//
+// Simple-prefix fallback: only the canonical "xsd" and "xs" prefixes map
+// to XSD built-ins (e.g. xs:int → xsd:int). Non-canonical prefixes
+// (e.g. ns0:CustomType) ALSO fall back to xsd:string rather than emitting
+// a tns:typeName reference — the generator does not synthesize matching
+// <complexType> definitions for inferred types, so emitting tns:typeName
+// would produce a dangling reference in the WSDL. Losing the type name
+// is acceptable for fallback inference; the schema's targetNamespace and
+// element ordering are still correct (architecture §11 — full prefix-stack
+// resolution and custom-type emission deferred until a corpus demands it).
 func resolveXSIType(value string) string {
+	value = strings.TrimSpace(value)
 	if value == "" {
 		return "xsd:string"
 	}
@@ -243,7 +253,8 @@ func resolveXSIType(value string) string {
 	if prefix == "xsd" || prefix == "xs" {
 		return "xsd:" + localName
 	}
-	return "tns:" + localName
+	// Non-canonical prefix: avoid emitting a dangling tns: reference.
+	return "xsd:string"
 }
 
 // isPlausibleDate does a basic range check for YYYY-MM-DD strings already

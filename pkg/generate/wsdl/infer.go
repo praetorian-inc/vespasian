@@ -41,29 +41,39 @@ func InferWSDL(endpoints []classify.ClassifiedRequest) (*Definitions, error) {
 	seen := make(map[string]bool)
 	observations := make(map[string]*soapBodyInfo)
 
-	for _, ep := range endpoints {
-		opName, soapAction := extractOperation(ep)
-		if opName == "" || seen[opName] {
-			// Even for duplicate ops, merge any new param observations.
-			if opName != "" && len(ep.Body) > 0 {
-				if info := extractSOAPParameters(ep.Body); info != nil {
-					if existing := observations[opName]; existing != nil {
-						existing.merge(info)
-					} else {
-						observations[opName] = info
-					}
-				}
-			}
-			continue
-		}
-		seen[opName] = true
-		operations = append(operations, opName)
-		if soapAction != "" {
+	// record consolidates per-endpoint bookkeeping that applies whether the
+	// op is being seen for the first time or as a duplicate: backfill
+	// SOAPAction binding metadata if missing, and union body-derived
+	// parameter observations into the per-op aggregator. First-observed
+	// SOAPAction wins; param merging follows first-with-type-wins.
+	record := func(opName, soapAction string, body []byte) {
+		if soapAction != "" && soapActions[opName] == "" {
 			soapActions[opName] = soapAction
 		}
-		if info := extractSOAPParameters(ep.Body); info != nil {
-			observations[opName] = info
+		if len(body) == 0 {
+			return
 		}
+		info := extractSOAPParameters(body)
+		if info == nil {
+			return
+		}
+		if existing := observations[opName]; existing != nil {
+			existing.merge(info)
+			return
+		}
+		observations[opName] = info
+	}
+
+	for _, ep := range endpoints {
+		opName, soapAction := extractOperation(ep)
+		if opName == "" {
+			continue
+		}
+		if !seen[opName] {
+			seen[opName] = true
+			operations = append(operations, opName)
+		}
+		record(opName, soapAction, ep.Body)
 	}
 
 	if len(operations) == 0 {

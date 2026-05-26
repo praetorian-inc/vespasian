@@ -286,12 +286,16 @@ func TestExtractSOAPParameters_XSIType(t *testing.T) {
 		assert.Equal(t, "xsd:boolean", result.Params["a"].XSDType)
 	})
 
-	t.Run("unknown prefix becomes tns:", func(t *testing.T) {
+	// Non-canonical xsi:type prefix (e.g. ns0:CustomType) falls back to
+	// xsd:string instead of emitting a dangling tns:CustomType reference —
+	// the generator does not synthesize matching <complexType> definitions.
+	t.Run("unknown prefix falls back to xsd:string to avoid dangling reference", func(t *testing.T) {
 		body := fmt.Sprintf(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><Op %s><a xsi:type="ns0:CustomType">irrelevant</a></Op></soap:Body></soap:Envelope>`, xsiDecl)
 		result := extractSOAPParameters([]byte(body))
 		require.NotNil(t, result)
 		require.Contains(t, result.Params, "a")
-		assert.Equal(t, "tns:CustomType", result.Params["a"].XSDType)
+		assert.Equal(t, "xsd:string", result.Params["a"].XSDType,
+			"non-canonical prefix must not emit tns:CustomType (no matching complexType in WSDL)")
 	})
 
 	t.Run("empty element with xsi:type is typed not skipped", func(t *testing.T) {
@@ -517,9 +521,16 @@ func TestResolveXSIType(t *testing.T) {
 	}{
 		{"xsd:int", "xsd:int", "xsd prefix passthrough"},
 		{"xs:boolean", "xsd:boolean", "xs prefix normalized to xsd"},
-		{"ns0:Custom", "tns:Custom", "unknown prefix becomes tns"},
+		// Non-canonical prefix → xsd:string (avoid dangling tns: reference;
+		// see resolveXSIType doc comment in soapbody.go).
+		{"ns0:Custom", "xsd:string", "non-canonical prefix falls back to xsd:string"},
+		{"my:Foo", "xsd:string", "non-canonical prefix with short name"},
 		{"boolean", "xsd:boolean", "no-colon prepends xsd"},
 		{"", "xsd:string", "empty falls back to xsd:string"},
+		// Whitespace handling: TrimSpace runs before parsing.
+		{"   ", "xsd:string", "whitespace-only falls back to xsd:string"},
+		{"  xsd:int  ", "xsd:int", "leading/trailing whitespace is trimmed"},
+		{"\txs:boolean\n", "xsd:boolean", "tab/newline whitespace is trimmed"},
 	}
 
 	for _, tt := range tests {
