@@ -683,3 +683,129 @@ func TestInferTypesFromObservations(t *testing.T) {
 		assert.Empty(t, el.ComplexType.Sequence, "all-skipped params yields empty sequence")
 	})
 }
+
+// QUAL-002 fix: same-name sibling with mixed type info — first-typed-wins.
+// For SOAP arrays / repeated elements, an empty observation must not
+// overwrite a typed earlier one.
+func TestWalkOperation_FirstTypedSiblingWins(t *testing.T) {
+	t.Run("typed then empty: typed wins", func(t *testing.T) {
+		body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+			`<soap:Body><Op><item>42</item><item></item></Op></soap:Body></soap:Envelope>`
+		result := extractSOAPParameters([]byte(body))
+		require.NotNil(t, result)
+		require.Contains(t, result.Params, "item")
+		assert.Equal(t, "xsd:int", result.Params["item"].XSDType,
+			"first observation with a real value must not be overwritten by an empty sibling")
+	})
+
+	t.Run("empty then typed: typed upgrades", func(t *testing.T) {
+		body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+			`<soap:Body><Op><item></item><item>42</item></Op></soap:Body></soap:Envelope>`
+		result := extractSOAPParameters([]byte(body))
+		require.NotNil(t, result)
+		require.Contains(t, result.Params, "item")
+		assert.Equal(t, "xsd:int", result.Params["item"].XSDType,
+			"empty first observation must be upgraded by a later typed sibling")
+	})
+
+	t.Run("typed then typed: first wins", func(t *testing.T) {
+		body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+			`<soap:Body><Op><item>42</item><item>hello</item></Op></soap:Body></soap:Envelope>`
+		result := extractSOAPParameters([]byte(body))
+		require.NotNil(t, result)
+		assert.Equal(t, "xsd:int", result.Params["item"].XSDType,
+			"first-typed-wins: later observation with different type must not overwrite")
+	})
+}
+
+// QUAL-002 fix mirror for walkParam's children loop — same rule applies
+// to repeated children inside a complex parameter.
+func TestWalkParam_FirstTypedChildWins(t *testing.T) {
+	body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+		`<soap:Body><Op><wrapper><value>3.14</value><value></value></wrapper></Op></soap:Body></soap:Envelope>`
+	result := extractSOAPParameters([]byte(body))
+	require.NotNil(t, result)
+	require.Contains(t, result.Params, "wrapper")
+	require.True(t, result.Params["wrapper"].IsComplex)
+	require.NotNil(t, result.Params["wrapper"].Children)
+	require.Contains(t, result.Params["wrapper"].Children.Params, "value")
+	assert.Equal(t, "xsd:decimal", result.Params["wrapper"].Children.Params["value"].XSDType,
+		"nested same-name sibling: first-typed-wins")
+}
+
+// QUAL-003 fix: merge upgrades an empty-typed parameter when a later
+// observation has type info.
+func TestSoapBodyInfo_Merge_UpgradesEmptyType(t *testing.T) {
+	a := &soapBodyInfo{
+		OrderedKeys: []string{"status"},
+		Params:      map[string]*inferredParam{"status": {Name: "status", XSDType: ""}},
+	}
+	b := &soapBodyInfo{
+		OrderedKeys: []string{"status"},
+		Params:      map[string]*inferredParam{"status": {Name: "status", XSDType: "xsd:string"}},
+	}
+	a.merge(b)
+	assert.Equal(t, "xsd:string", a.Params["status"].XSDType,
+		"merge must upgrade an empty XSDType from a later observation that has type info")
+}
+
+// QUAL-003 negative: merge must NOT downgrade a typed parameter when a
+// later observation is empty.
+func TestSoapBodyInfo_Merge_DoesNotDowngradeTypedParam(t *testing.T) {
+	a := &soapBodyInfo{
+		OrderedKeys: []string{"status"},
+		Params:      map[string]*inferredParam{"status": {Name: "status", XSDType: "xsd:int"}},
+	}
+	b := &soapBodyInfo{
+		OrderedKeys: []string{"status"},
+		Params:      map[string]*inferredParam{"status": {Name: "status", XSDType: ""}},
+	}
+	a.merge(b)
+	assert.Equal(t, "xsd:int", a.Params["status"].XSDType,
+		"merge must not downgrade a typed param with an empty later observation")
+}
+
+// QUAL-003 upgrade-to-complex: a scalar-but-empty first observation can be
+// upgraded to a complex type by a later observation.
+func TestSoapBodyInfo_Merge_UpgradesEmptyToComplex(t *testing.T) {
+	a := &soapBodyInfo{
+		OrderedKeys: []string{"data"},
+		Params:      map[string]*inferredParam{"data": {Name: "data", XSDType: ""}},
+	}
+	b := &soapBodyInfo{
+		OrderedKeys: []string{"data"},
+		Params: map[string]*inferredParam{
+			"data": {
+				Name: "data", IsComplex: true,
+				Children: &soapBodyInfo{
+					OrderedKeys: []string{"id"},
+					Params:      map[string]*inferredParam{"id": {Name: "id", XSDType: "xsd:int"}},
+				},
+			},
+		},
+	}
+	a.merge(b)
+	assert.True(t, a.Params["data"].IsComplex, "empty scalar must be upgradable to complex")
+	require.NotNil(t, a.Params["data"].Children)
+	assert.Equal(t, "xsd:int", a.Params["data"].Children.Params["id"].XSDType)
+}
+
+// hasType() unit tests — pin the predicate behavior used by the three
+// upgrade gates above.
+func TestInferredParam_HasType(t *testing.T) {
+	tests := []struct {
+		name string
+		p    *inferredParam
+		want bool
+	}{
+		{"empty leaf has no type", &inferredParam{}, false},
+		{"typed leaf has type", &inferredParam{XSDType: "xsd:int"}, true},
+		{"complex without children has type", &inferredParam{IsComplex: true}, true},
+		{"complex with children has type", &inferredParam{IsComplex: true, Children: &soapBodyInfo{}}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.p.hasType())
+		})
+	}
+}

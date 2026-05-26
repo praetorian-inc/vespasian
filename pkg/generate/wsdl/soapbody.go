@@ -46,7 +46,11 @@ var (
 
 // soapBodyInfo is the per-request extraction result. nil for failures.
 type soapBodyInfo struct {
-	OpNamespace string // xml.Name.Space of the operation element; "" if none
+	// OpNamespace records the operation element's XML namespace URI.
+	// Captured for diagnostic use and merge propagation; not threaded into
+	// the emitted XSD because the schema's targetNamespace is URL-derived
+	// for consistency with the WSDL Messages wiring (architecture §11).
+	OpNamespace string
 	OrderedKeys []string
 	Params      map[string]*inferredParam
 }
@@ -54,11 +58,22 @@ type soapBodyInfo struct {
 // inferredParam is one observed parameter under the operation element.
 // Leaf params have XSDType set; complex params have Children populated.
 type inferredParam struct {
-	Name      string
+	Name string
+	// Namespace records the observed parameter element's XML namespace URI.
+	// Captured for diagnostic use; not threaded into the emitted XSD for the
+	// same reason as soapBodyInfo.OpNamespace (architecture §11).
 	Namespace string
 	XSDType   string
 	IsComplex bool
 	Children  *soapBodyInfo
+}
+
+// hasType reports whether the parameter carries usable type information —
+// either a resolved XSD type string or a populated complex-type subtree.
+// Used to gate same-name-sibling upgrades so a typed observation is not
+// overwritten by a later empty one.
+func (p *inferredParam) hasType() bool {
+	return p.IsComplex || p.XSDType != ""
 }
 
 // extractSOAPParameters walks a SOAP envelope and extracts typed parameters
@@ -113,10 +128,19 @@ func walkOperation(decoder *xml.Decoder, opStart xml.StartElement, depth int) *s
 				continue
 			}
 			param := walkParam(decoder, t, depth+1)
-			if _, seen := info.Params[param.Name]; !seen {
+			existing, seen := info.Params[param.Name]
+			if !seen {
 				info.OrderedKeys = append(info.OrderedKeys, param.Name)
+				info.Params[param.Name] = param
+				continue
 			}
-			info.Params[param.Name] = param
+			// Same-name sibling (XML arrays / repeated elements): first
+			// observation with type info wins. Upgrade only if the prior
+			// observation was untyped and the new one has type info; never
+			// overwrite a typed param with an empty one.
+			if !existing.hasType() && param.hasType() {
+				info.Params[param.Name] = param
+			}
 		}
 	}
 }
@@ -162,10 +186,17 @@ func walkParam(decoder *xml.Decoder, paramStart xml.StartElement, depth int) *in
 				}
 			}
 			child := walkParam(decoder, t, depth+1)
-			if _, seen := p.Children.Params[child.Name]; !seen {
+			existing, seen := p.Children.Params[child.Name]
+			if !seen {
 				p.Children.OrderedKeys = append(p.Children.OrderedKeys, child.Name)
+				p.Children.Params[child.Name] = child
+				continue
 			}
-			p.Children.Params[child.Name] = child
+			// Same-name sibling under a parent: first-with-type wins (see
+			// walkOperation for the same rule).
+			if !existing.hasType() && child.hasType() {
+				p.Children.Params[child.Name] = child
+			}
 		}
 	}
 done:
@@ -250,7 +281,9 @@ func inferTypeFromValue(text string) string {
 	return "xsd:string"
 }
 
-// merge unions parameters from b into a. First-observed type wins on conflict.
+// merge unions parameters from b into a. First-with-type wins on conflict —
+// a later observation can upgrade an empty-typed parameter, but never
+// overwrite a typed one with an empty one.
 func (a *soapBodyInfo) merge(b *soapBodyInfo) {
 	if a.OpNamespace == "" && b.OpNamespace != "" {
 		a.OpNamespace = b.OpNamespace
@@ -264,7 +297,14 @@ func (a *soapBodyInfo) merge(b *soapBodyInfo) {
 			a.Params[k] = bParam
 			continue
 		}
-		// Both saw it: first-observed type wins; recurse for complex children
+		// Upgrade: existing was empty (no type, not complex) and the new
+		// observation has type info. Required for the <status/> then
+		// <status>active</status> sequence across captures.
+		if !existing.hasType() && bParam.hasType() {
+			a.Params[k] = bParam
+			continue
+		}
+		// Both have type info: first wins; recurse for complex children.
 		if existing.IsComplex && bParam.IsComplex && existing.Children != nil && bParam.Children != nil {
 			existing.Children.merge(bParam.Children)
 		}

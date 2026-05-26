@@ -467,3 +467,56 @@ func TestInferWSDL_SchemaTargetNamespacePreserved(t *testing.T) {
 	assert.Equal(t, expected, defs.TargetNS,
 		"definitions.targetNamespace must match for tns: consistency")
 }
+
+// TEST-001 (round-2 blocker fix): regression test for the namespace-aware
+// Body match added to extractFirstBodyElement. A <body> element that is NOT
+// in a SOAP envelope namespace must be ignored — protects against false
+// matches on HTML bodies, custom XML wrappers, or fault detail payloads.
+func TestExtractFirstBodyElement_NamespaceGate(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "SOAP 1.1 envelope: matches body and returns first child",
+			body: `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+				`<soap:Body><GetUser/></soap:Body></soap:Envelope>`,
+			want: "GetUser",
+		},
+		{
+			name: "SOAP 1.2 envelope: matches body and returns first child",
+			body: `<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope">` +
+				`<env:Body><GetUser/></env:Body></env:Envelope>`,
+			want: "GetUser",
+		},
+		{
+			name: "HTML-like document: body with no namespace must NOT match",
+			body: `<html><body><div>not a SOAP op</div></body></html>`,
+			want: "",
+		},
+		{
+			name: "Wrapped body in non-SOAP namespace must NOT match",
+			body: `<wrapper xmlns="http://example.com/other"><body><FakeOp/></body></wrapper>`,
+			want: "",
+		},
+		{
+			name: "Envelope with no Body element returns empty",
+			body: `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+				`<soap:Header/></soap:Envelope>`,
+			want: "",
+		},
+		{
+			name: "Empty input",
+			body: ``,
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractFirstBodyElement([]byte(tt.body))
+			assert.Equal(t, tt.want, got, "extractFirstBodyElement(%q)", tt.body)
+		})
+	}
+}
