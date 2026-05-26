@@ -202,11 +202,16 @@ func anyStaticSource(endpoints []classify.ClassifiedRequest) bool {
 //   - all requests Source == "static:js"             → "js-bundle"
 //   - all requests Source == "static:js-sourcemap"   → "js-sourcemap"
 //   - mixed JS-static prefixes within a group        → "dynamic"
+//   - empty group (len(group) == 0)                  → "" (no extension emitted)
+//
+// The empty-group case is unreachable in current usage because groupEndpoints
+// only creates a key when at least one ClassifiedRequest matches; this contract
+// is documented for defense-in-depth so future callers can rely on it.
 //
 // This is intentionally a closed allow-list rather than a strings.TrimPrefix
 // open list — a new "static:foo" source must NOT silently surface as
 // x-vespasian-source: foo because the extension consumer contract names only
-// the three values above.
+// the three non-empty values above.
 func computeSourceTag(group []classify.ClassifiedRequest) string {
 	var tag string
 	for _, ep := range group {

@@ -425,19 +425,22 @@ func (c *CrawlCmd) Run() error {
 		return err
 	}
 
+	if c.Verbose {
+		if bs.requestID != "" {
+			fmt.Fprintf(os.Stderr, "request-id: %s\n", bs.requestID)
+		}
+		// Log the captured count BEFORE augmentation/JS analysis so the number
+		// reflects what the crawler observed, not the post-static-analysis
+		// total. Matches ScanCmd.Run's ordering.
+		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
+	}
+
 	requests = runJSAnalysisStage(bs.ctx, requests, jsAnalysisArgs{
 		enabled:         c.AnalyzeJS,
 		fetchSourcemaps: c.FetchSourcemaps,
 		allowPrivate:    c.DangerousAllowPrivate,
 		verbose:         c.Verbose,
 	})
-
-	if c.Verbose {
-		if bs.requestID != "" {
-			fmt.Fprintf(os.Stderr, "request-id: %s\n", bs.requestID)
-		}
-		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
-	}
 
 	return writeOutput(c.Output, func(w io.Writer) error {
 		return crawl.WriteCapture(w, requests)

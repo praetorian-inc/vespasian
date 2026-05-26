@@ -220,6 +220,9 @@ func extractWithTimeout(ctx context.Context, source []byte, sourceURL, kind stri
 				ch <- result{nil, true}
 			}
 		}()
+		if testInjectPanic != nil {
+			testInjectPanic(kind)
+		}
 		eps, err := ExtractFromBundle(source, sourceURL)
 		if err != nil {
 			opts.Logger.Warn("extract error", "kind", kind, "source", sourceURL, "err", err)
@@ -243,6 +246,18 @@ func extractWithTimeout(ctx context.Context, source []byte, sourceURL, kind stri
 // analyzeOne analyzes a single captured JS bundle. It runs sourcemap recovery
 // and extractor extraction, then synthesizes requests. The function is safe to
 // call from goroutines; it has no shared mutable state.
+// testInjectPanic is a panic-fault-injection point used by jsstatic's
+// panic-recovery regression tests. The hook is consulted at exactly two
+// call sites — the top of safeAnalyzeOne (loc="analyzeOne") and inside the
+// extraction goroutine in extractWithTimeout (loc="bundle" or
+// loc="sourcemap-source"). Production builds leave it nil; the runtime cost
+// is one nil-check at each call site. The hook exists because neither
+// safeAnalyzeOne's body nor the goroutine's body has a naturally-panicking
+// path that an external test can reliably trigger, and we want positive
+// regression coverage of the recover/counter contracts (QUAL-004 and the
+// SourcemapSourcePanics counter introduced for QUAL-002).
+var testInjectPanic func(loc string)
+
 // safeAnalyzeOne wraps analyzeOne with a recover() so that a panic outside the
 // per-extraction goroutines (e.g. in toRequests, normalize, or the accounting
 // logic) cannot leave the worker pool's resultCh without a value. Without this
@@ -256,6 +271,9 @@ func safeAnalyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options
 			result = perBundleResult{stats: Stats{AnalyzeOnePanics: 1}}
 		}
 	}()
+	if testInjectPanic != nil {
+		testInjectPanic("analyzeOne")
+	}
 	return analyzeOne(ctx, req, opts)
 }
 

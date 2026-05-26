@@ -1678,14 +1678,22 @@ func TestOpenAPI_XVespasianSource_StaticHtmlIgnored(t *testing.T) {
 	}
 }
 
-// Regression for CR-2: a group that mixes a JS static source with a non-JS
-// static source must resolve to "dynamic", not "js-bundle" or "html".
-func TestComputeSourceTag_StaticHtmlMixedWithJS_ResolvesDynamic(t *testing.T) {
+// Regression for CR-2: a group containing ONLY static:html, in a corpus where
+// another group has static:js (so anyStaticSource gates the extension on),
+// must resolve to "dynamic" — not "html". Pre-fix this test would have failed:
+// computeSourceTag's strings.TrimPrefix default would have emitted
+// x-vespasian-source: "html" for the /api/x group. Post-fix the JS-only
+// allow-list early-returns "dynamic" for any non-JS static source. This is
+// the only single-group composition that distinguishes pre-fix from post-fix
+// behavior; the StaticHtmlIgnored test above covers the corpus-gate case.
+func TestComputeSourceTag_StaticHtmlOnlyGroupInJSCorpus_ResolvesDynamic(t *testing.T) {
 	gen := &OpenAPIGenerator{}
 	endpoints := []classify.ClassifiedRequest{
+		// /api/x has ONLY static:html — pre-fix would emit "html" here.
 		makeClassified("GET", "https://h/api/x", "static:html"),
-		makeClassified("GET", "https://h/api/x", "static:js"),
-		// Unrelated JS-static entry so anyStaticSource gates the extension on.
+		makeClassified("GET", "https://h/api/x", "static:html"),
+		// Unrelated static:js entry forces anyStaticSource to fire (true under
+		// both pre-fix HasPrefix("static:") AND post-fix isJSStaticSource).
 		makeClassified("GET", "https://h/api/z", "static:js"),
 	}
 	spec, err := gen.Generate(endpoints)
@@ -1701,10 +1709,10 @@ func TestComputeSourceTag_StaticHtmlMixedWithJS_ResolvesDynamic(t *testing.T) {
 	getOp := apiX["get"].(map[string]interface{})
 	ext, ok := getOp["x-vespasian-source"]
 	if !ok {
-		t.Fatal("expected x-vespasian-source to be present for mixed group")
+		t.Fatal("expected x-vespasian-source extension to be present (anyStaticSource fires from /api/z)")
 	}
 	if ext != "dynamic" {
-		t.Errorf("expected x-vespasian-source=dynamic when group mixes static:html and static:js, got %v", ext)
+		t.Errorf("expected x-vespasian-source=dynamic for static:html-only group, got %v (a 'html' or other non-allowed value means the allow-list regressed)", ext)
 	}
 }
 

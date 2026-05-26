@@ -17,10 +17,9 @@ package jsstatic
 import (
 	"fmt"
 	"strings"
-)
 
-// exprPlaceholder is jsluice's ExpressionPlaceholder value.
-const exprPlaceholder = "EXPR"
+	"github.com/BishopFox/jsluice"
+)
 
 // NormalizeEXPRPath replaces jsluice EXPR placeholders in a URL's path with
 // OpenAPI-style {paramName} segments using the supplied template tokens. If a
@@ -64,12 +63,14 @@ func NormalizeEXPRPath(rawURL string, tokens []string) string {
 		}
 	}
 
-	// Replace EXPR segments with {paramName}.
+	// Replace EXPR segments with {paramName}. Source the placeholder value
+	// directly from jsluice (which exports it as a var, not a const, so any
+	// upstream override stays in sync between this file and extractor.go).
 	tokenIdx := 0
 	unnamedCount := 0
 	segments := strings.Split(path, "/")
 	for i, seg := range segments {
-		if seg != exprPlaceholder {
+		if seg != jsluice.ExpressionPlaceholder {
 			continue
 		}
 		if tokenIdx < len(tokens) {

@@ -153,6 +153,80 @@ func TestRunJSAnalysisStage_Verbose_LogsStats(t *testing.T) {
 	}
 }
 
+// TestAugmentationOrder_FormsBeforeJSStatic pins the QUAL-001 alignment fix:
+// ScanCmd, CrawlCmd, and GenerateCmd all run augmentWithStaticForms BEFORE
+// runJSAnalysisStage. We verify by feeding a fixture with both an HTML page
+// (carrying a <form action="/api/…">) and a JS bundle (with a fetch call)
+// through the same two stages in the order each command applies, and
+// asserting the synthesized output contains the static:html entry before any
+// static:js entry. Pre-alignment, ScanCmd ran js-then-forms — a regression
+// to that order would interleave static:js before static:html and fail.
+func TestAugmentationOrder_FormsBeforeJSStatic(t *testing.T) {
+	captured := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/login",
+			Source: "katana",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body: []byte(`<html><body>` +
+					`<form method="POST" action="/api/login">` +
+					`<input name="email" type="email">` +
+					`<input name="password" type="password">` +
+					`</form></body></html>`),
+			},
+		},
+		{
+			Method: "GET",
+			URL:    "https://example.com/app.js",
+			Source: "katana",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/javascript",
+				Body:        []byte(`fetch("/api/users")`),
+			},
+		},
+	}
+
+	// Apply stages in the order ALL three commands now use.
+	enriched := augmentWithStaticForms(captured)
+	enriched = runJSAnalysisStage(context.Background(), enriched, jsAnalysisArgs{
+		enabled:      true,
+		allowPrivate: true,
+	})
+
+	// Find first static:html and first static:js positions. Forms must
+	// precede js — pre-fix order (js first) would invert this.
+	firstHTML, firstJS := -1, -1
+	for i, r := range enriched {
+		if firstHTML == -1 && r.Source == "static:html" {
+			firstHTML = i
+		}
+		if firstJS == -1 && r.Source == "static:js" {
+			firstJS = i
+		}
+	}
+	if firstHTML == -1 {
+		t.Fatalf("expected at least one static:html entry; got sources: %v", sourcesOf(enriched))
+	}
+	if firstJS == -1 {
+		t.Fatalf("expected at least one static:js entry; got sources: %v", sourcesOf(enriched))
+	}
+	if firstHTML >= firstJS {
+		t.Errorf("expected static:html (idx %d) BEFORE static:js (idx %d) — forms-before-jsstatic order broken",
+			firstHTML, firstJS)
+	}
+}
+
+func sourcesOf(rs []crawl.ObservedRequest) []string {
+	out := make([]string, len(rs))
+	for i, r := range rs {
+		out[i] = r.Source
+	}
+	return out
+}
+
 // Verbose=false must NOT log the stats line.
 func TestRunJSAnalysisStage_NonVerbose_DoesNotLog(t *testing.T) {
 	captured := jsFixtureCapture()

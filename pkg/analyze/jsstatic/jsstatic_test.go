@@ -230,6 +230,90 @@ func TestAnalyze_NonPositiveOptionsResolveToDefaults(t *testing.T) {
 	}
 }
 
+// TestSafeAnalyzeOne_PanicRecovery is the positive regression test for QUAL-004.
+// Forces a panic inside safeAnalyzeOne's call path via testInjectPanic and
+// verifies (a) the panic is recovered (Analyze does not crash), (b)
+// AnalyzeOnePanics is incremented, (c) workerProcessed is NOT understated so
+// BundlesAbandonedOnCancel stays at zero on a clean non-canceled run.
+func TestSafeAnalyzeOne_PanicRecovery(t *testing.T) {
+	testInjectPanic = func(loc string) {
+		if loc == "analyzeOne" {
+			panic("forced QUAL-004 regression test panic")
+		}
+	}
+	defer func() { testInjectPanic = nil }()
+
+	captured := []crawl.ObservedRequest{
+		makeJSCapture("https://h/a.js", `fetch("/api/a")`),
+		makeJSCapture("https://h/b.js", `fetch("/api/b")`),
+	}
+	res, err := Analyze(context.Background(), captured, Options{Concurrency: 1})
+	if err != nil {
+		t.Fatalf("Analyze returned err on panic-injected run: %v (panic must be swallowed)", err)
+	}
+	if res.Stats.AnalyzeOnePanics != len(captured) {
+		t.Errorf("AnalyzeOnePanics = %d, want %d (one per bundle that panicked)",
+			res.Stats.AnalyzeOnePanics, len(captured))
+	}
+	if res.Stats.BundlesAnalyzed != 0 {
+		t.Errorf("BundlesAnalyzed = %d, want 0 (panic short-circuits before BundlesAnalyzed++)",
+			res.Stats.BundlesAnalyzed)
+	}
+	if res.Stats.BundlesAbandonedOnCancel != 0 {
+		t.Errorf("BundlesAbandonedOnCancel = %d, want 0 (panic must not look like cancel)",
+			res.Stats.BundlesAbandonedOnCancel)
+	}
+	if len(res.Requests) != len(captured) {
+		t.Errorf("Requests length = %d, want %d (original inputs only on panic)",
+			len(res.Requests), len(captured))
+	}
+}
+
+// TestAnalyze_SourcemapSourcePanic_IncrementsPanicCounter is the positive
+// regression test for the SourcemapSourcePanics counter (QUAL-002 split).
+// Forces a panic inside the extraction goroutine when processing a recovered
+// sourcemap source, and verifies the panic counter increments while the
+// timeout/oversized counters stay at zero.
+func TestAnalyze_SourcemapSourcePanic_IncrementsPanicCounter(t *testing.T) {
+	testInjectPanic = func(loc string) {
+		if loc == "sourcemap-source" {
+			panic("forced sourcemap-source panic for regression test")
+		}
+	}
+	defer func() { testInjectPanic = nil }()
+
+	// Bundle body has a normal fetch (bundle extraction must succeed). The
+	// inline sourcemap data URI carries one source that — when extraction is
+	// dispatched — will hit the injected panic.
+	srcContent := `fetch("/api/from-sourcemap")`
+	smDoc := fmt.Sprintf(`{"sources":["src/index.js"],"sourcesContent":[%s]}`,
+		func() string { b, _ := json.Marshal(srcContent); return string(b) }())
+	encoded := base64.StdEncoding.EncodeToString([]byte(smDoc))
+	dataURI := "data:application/json;base64," + encoded
+	bundleBody := `fetch("/api/from-bundle")` + "\n//# sourceMappingURL=" + dataURI
+
+	bundle := makeJSCapture("https://h/app.js", bundleBody)
+	res, err := Analyze(context.Background(), []crawl.ObservedRequest{bundle}, Options{})
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if res.Stats.SourcemapSourcePanics != 1 {
+		t.Errorf("SourcemapSourcePanics = %d, want 1", res.Stats.SourcemapSourcePanics)
+	}
+	if res.Stats.SourcemapSourceTimeouts != 0 {
+		t.Errorf("SourcemapSourceTimeouts = %d, want 0 (panic must NOT count as timeout)",
+			res.Stats.SourcemapSourceTimeouts)
+	}
+	if res.Stats.SourcemapSourcesOversized != 0 {
+		t.Errorf("SourcemapSourcesOversized = %d, want 0", res.Stats.SourcemapSourcesOversized)
+	}
+	// Bundle body extraction (no panic injected for kind="bundle") should
+	// still have succeeded.
+	if res.Stats.BundlesAnalyzed != 1 {
+		t.Errorf("BundlesAnalyzed = %d, want 1 (bundle path unaffected)", res.Stats.BundlesAnalyzed)
+	}
+}
+
 func TestAnalyze_DefaultOptionsAreSane(t *testing.T) {
 	captured := []crawl.ObservedRequest{makeJSCapture("https://h/app.js", `fetch("/api/x")`)}
 	// Should not panic with zero Options.
@@ -268,16 +352,31 @@ func TestAnalyze_MaxEndpointsPerBundle_AppliesToSourcemapToo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Analyze error: %v", err)
 	}
-	// EndpointsKept (bundle-body + sourcemap-source combined) must not exceed
-	// the cap. Pre-fix this would have been 3 + 20 = 23.
-	if res.Stats.EndpointsKept > 5 {
-		t.Errorf("EndpointsKept = %d, want <= 5 (MaxEndpointsPerBundle)", res.Stats.EndpointsKept)
+	// EndpointsKept (bundle-body + sourcemap-source combined) must equal the
+	// cap exactly: 3 bundle-body endpoints + 2 from the sourcemap to reach 5.
+	// Pre-fix this would have been 3 + 20 = 23 (no cap on sourcemap path).
+	// A regression that DROPS sourcemap contribution entirely would yield 3,
+	// also failing this assertion — so this pins both upper AND lower bounds.
+	if res.Stats.EndpointsKept != 5 {
+		t.Errorf("EndpointsKept = %d, want exactly 5 (MaxEndpointsPerBundle, fully consumed by bundle+sourcemap)",
+			res.Stats.EndpointsKept)
 	}
-	// Synthesized request count (excluding the original captured bundle) must
-	// also obey the cap.
 	synthCount := len(res.Requests) - 1 // -1 for the original bundle request
-	if synthCount > 5 {
-		t.Errorf("synthesized request count = %d, want <= 5", synthCount)
+	if synthCount != 5 {
+		t.Errorf("synthesized request count = %d, want exactly 5", synthCount)
+	}
+	// Sanity: at least one sourcemap-derived entry must have survived (the
+	// cap is supposed to admit some sourcemap endpoints, not lock them out
+	// entirely).
+	var sawSourcemap bool
+	for _, r := range res.Requests {
+		if r.Source == SourceSourcemap {
+			sawSourcemap = true
+			break
+		}
+	}
+	if !sawSourcemap {
+		t.Error("expected at least one static:js-sourcemap entry under the cap; got none — sourcemap contribution was dropped entirely")
 	}
 }
 
