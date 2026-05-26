@@ -122,7 +122,7 @@ func TestSSRFSafeDialContext_BlocksPrivateIP(t *testing.T) {
 	ctx := context.Background()
 	// 127.0.0.1 resolves immediately (no external DNS) and is a private IP,
 	// so ssrfSafeDialContext should return an error before attempting to dial.
-	_, err := ssrfSafeDialContext(ctx, "tcp", "127.0.0.1:80")
+	_, err := ssrfSafeDialContext(ctx, "tcp", "127.0.0.1:80", (&net.Dialer{}).DialContext)
 	if err == nil {
 		t.Error("expected loopback address to be blocked by ssrfSafeDialContext")
 	}
@@ -143,21 +143,20 @@ func TestSSRFSafeDialContext_Exported(t *testing.T) {
 func TestSSRFSafeDialContext_InvalidAddress(t *testing.T) {
 	ctx := context.Background()
 	// An address without a port triggers net.SplitHostPort to return an error.
-	_, err := ssrfSafeDialContext(ctx, "tcp", "no-port")
+	_, err := ssrfSafeDialContext(ctx, "tcp", "no-port", (&net.Dialer{}).DialContext)
 	if err == nil {
 		t.Error("expected invalid address (no port) to return error")
 	}
 }
 
 // TestSSRFSafeDialContext_DNSFailure exercises the DNS lookup failure branch
-// (validate.go:117-120) in ssrfSafeDialContext using a canceled context.
+// (validate.go:117-120) in ssrfSafeDialContext using an invalid hostname.
 func TestSSRFSafeDialContext_DNSFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // pre-canceled causes LookupIPAddr to fail
-	_, err := ssrfSafeDialContext(ctx, "tcp", "example.invalid:80")
-	if err == nil {
-		t.Error("expected DNS lookup to fail with canceled context or invalid hostname")
-	}
+	cancel()
+	_, err := ssrfSafeDialContext(ctx, "tcp", "example.invalid:80", (&net.Dialer{}).DialContext)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "DNS lookup failed")
 }
 
 // TestSSRFSafeDialContext_DialsResolvedPublicIP pins down that
@@ -166,15 +165,13 @@ func TestSSRFSafeDialContext_DNSFailure(t *testing.T) {
 // receive an IP-literal address regardless of what the caller passed.
 func TestSSRFSafeDialContext_DialsResolvedPublicIP(t *testing.T) {
 	var dialedAddr string
-	origDialFunc := dialFunc
-	dialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
+	testDialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		dialedAddr = addr
 		// Return a dummy net.Pipe conn so the dial appears to succeed without
 		// a real TCP connection.
 		c, _ := net.Pipe()
 		return c, nil
 	}
-	t.Cleanup(func() { dialFunc = origDialFunc })
 
 	// Use a public-IP literal as the host so the resolver returns it unchanged
 	// and isPrivateIP returns false. ssrfSafeDialContext calls
@@ -183,8 +180,8 @@ func TestSSRFSafeDialContext_DialsResolvedPublicIP(t *testing.T) {
 	// keeps this test hermetic in network-restricted sandboxes. If a future Go
 	// version removes the IP-literal fast-path (or a misconfigured nsswitch /
 	// cgo resolver bypasses it), this test would need a resolver seam
-	// (parallel to dialFunc) that injects a fixed LookupIPAddr result.
-	_, err := ssrfSafeDialContext(context.Background(), "tcp", "8.8.8.8:80")
+	// that injects a fixed LookupIPAddr result.
+	_, err := ssrfSafeDialContext(context.Background(), "tcp", "8.8.8.8:80", testDialer)
 	require.NoError(t, err)
 
 	// The dialer must be called with the resolved IP, not the original host.

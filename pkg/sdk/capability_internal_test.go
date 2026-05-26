@@ -536,7 +536,7 @@ func TestParseHeaderString_ValueWithColon(t *testing.T) {
 
 func TestClassifyProbeGenerate_EmptyRequests(t *testing.T) {
 	ctx := context.Background()
-	spec, err := ClassifyProbeGenerate(ctx, nil, "rest", 0.5, true, false)
+	spec, _, err := ClassifyProbeGenerate(ctx, nil, "rest", 0.5, true, false)
 	require.NoError(t, err)
 	// The REST generator returns nil for an empty classified list — this is the
 	// documented behavior of OpenAPIGenerator.Generate when no endpoints are
@@ -546,7 +546,7 @@ func TestClassifyProbeGenerate_EmptyRequests(t *testing.T) {
 
 func TestClassifyProbeGenerate_UnsupportedAPIType(t *testing.T) {
 	ctx := context.Background()
-	_, err := ClassifyProbeGenerate(ctx, nil, "bogus", 0.5, true, false)
+	_, _, err := ClassifyProbeGenerate(ctx, nil, "bogus", 0.5, true, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported API type")
 }
@@ -559,7 +559,7 @@ func TestClassifyProbeGenerate_RespectsDeduplicateFalse(t *testing.T) {
 		{Method: "GET", URL: "http://example.com/api/users", Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`[{"id":1}]`)}},
 		{Method: "GET", URL: "http://example.com/api/users", Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`[{"id":2}]`)}},
 	}
-	spec, err := ClassifyProbeGenerate(ctx, requests, "rest", 0.5, false, false)
+	spec, _, err := ClassifyProbeGenerate(ctx, requests, "rest", 0.5, false, false)
 	require.NoError(t, err)
 	require.NotNil(t, spec)
 }
@@ -572,7 +572,7 @@ func TestClassifyProbeGenerate_DeduplicateTrue(t *testing.T) {
 		{Method: "GET", URL: "http://example.com/api/users", Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`[{"id":1}]`)}},
 		{Method: "GET", URL: "http://example.com/api/users", Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`[{"id":2}]`)}},
 	}
-	spec, err := ClassifyProbeGenerate(ctx, requests, "rest", 0.5, true, false)
+	spec, _, err := ClassifyProbeGenerate(ctx, requests, "rest", 0.5, true, false)
 	require.NoError(t, err)
 	require.NotNil(t, spec)
 }
@@ -594,7 +594,7 @@ func TestClassifyProbeGenerate_AutoDetectsREST(t *testing.T) {
 			},
 		},
 	}
-	spec, err := ClassifyProbeGenerate(ctx, requests, "auto", 0.5, true, false)
+	spec, _, err := ClassifyProbeGenerate(ctx, requests, "auto", 0.5, true, false)
 	require.NoError(t, err)
 	assert.NotEmpty(t, spec)
 }
@@ -624,7 +624,7 @@ func TestClassifyProbeGenerate_GeneratesRESTSpec(t *testing.T) {
 			},
 		},
 	}
-	spec, err := ClassifyProbeGenerate(ctx, requests, "rest", 0.5, true, false)
+	spec, _, err := ClassifyProbeGenerate(ctx, requests, "rest", 0.5, true, false)
 	require.NoError(t, err)
 	require.NotEmpty(t, spec)
 	assert.Contains(t, string(spec), "openapi")
@@ -655,7 +655,7 @@ func TestClassifyProbeGenerate_ProbeEnabledOnREST(t *testing.T) {
 	// probeEnabled=true exercises the probe branch; canceled context keeps the
 	// test hermetic. RunStrategies returns classified endpoints even on error, so
 	// ClassifyProbeGenerate must succeed and produce a non-empty spec.
-	spec, err := ClassifyProbeGenerate(ctx, requests, "rest", 0.5, true, true)
+	spec, _, err := ClassifyProbeGenerate(ctx, requests, "rest", 0.5, true, true)
 	require.NoError(t, err)
 	assert.NotEmpty(t, spec)
 }
@@ -685,7 +685,7 @@ func TestClassifyProbeGenerate_AllProbesFailedFallback(t *testing.T) {
 			},
 		},
 	}
-	spec, err := ClassifyProbeGenerate(ctx, requests, "rest", 1.1, true, true)
+	spec, _, err := ClassifyProbeGenerate(ctx, requests, "rest", 1.1, true, true)
 	require.NoError(t, err)
 	assert.Nil(t, spec)
 }
@@ -736,8 +736,8 @@ func TestProbeWSDLDocument_CanceledContext(t *testing.T) {
 }
 
 // TestProbeWSDLDocument_Success exercises the full happy-path through
-// probeWSDLDocument using an httptest.Server on loopback. Both SSRF seams
-// are replaced for the duration of the test so the loopback dial succeeds.
+// probeWSDLDocumentWith using an httptest.Server on loopback. A test-local
+// validator and dialer are supplied directly so the loopback dial succeeds.
 func TestProbeWSDLDocument_Success(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/xml")
@@ -745,21 +745,16 @@ func TestProbeWSDLDocument_Success(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	orig := validateProbeURLFunc
-	validateProbeURLFunc = func(_ string) error { return nil }
-	t.Cleanup(func() { validateProbeURLFunc = orig })
+	validator := func(_ string) error { return nil }
+	dialer := (&net.Dialer{}).DialContext
 
-	origDial := dialContextForWSDLProbe
-	dialContextForWSDLProbe = (&net.Dialer{}).DialContext
-	t.Cleanup(func() { dialContextForWSDLProbe = origDial })
-
-	result := probeWSDLDocument(context.Background(), srv.URL+"/service")
+	result := probeWSDLDocumentWith(context.Background(), srv.URL+"/service", validator, dialer)
 	require.Equal(t, []byte(validWSDL), result)
 }
 
 // TestProbeWSDLDocument_3xxRejected verifies that a 302 redirect response is
-// rejected. probeWSDLDocument sets CheckRedirect: ErrUseLastResponse so the
-// redirect is not followed; isRejectedWSDLStatus(302) then returns true and
+// rejected. probeWSDLDocumentWith sets CheckRedirect: ErrUseLastResponse so the
+// redirect is not followed; IsRejectedWSDLStatus(302) then returns true and
 // nil is returned — pinning the combination of both behaviors together.
 func TestProbeWSDLDocument_3xxRejected(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -767,20 +762,40 @@ func TestProbeWSDLDocument_3xxRejected(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	orig := validateProbeURLFunc
-	validateProbeURLFunc = func(_ string) error { return nil }
-	t.Cleanup(func() { validateProbeURLFunc = orig })
+	validator := func(_ string) error { return nil }
+	dialer := (&net.Dialer{}).DialContext
 
-	origDial := dialContextForWSDLProbe
-	dialContextForWSDLProbe = (&net.Dialer{}).DialContext
-	t.Cleanup(func() { dialContextForWSDLProbe = origDial })
-
-	result := probeWSDLDocument(context.Background(), srv.URL+"/service")
+	result := probeWSDLDocumentWith(context.Background(), srv.URL+"/service", validator, dialer)
 	assert.Nil(t, result)
 }
 
 // ---------------------------------------------------------------------------
-// isRejectedWSDLStatus
+// specFormatForAPIType
+// ---------------------------------------------------------------------------
+
+// TestSpecFormatForAPIType verifies that specFormatForAPIType maps each known
+// API type to the correct capmodel.SpecFormat constant and returns "" for
+// unknown or empty types.
+func TestSpecFormatForAPIType(t *testing.T) {
+	cases := []struct {
+		apiType string
+		want    string
+	}{
+		{"rest", capmodel.SpecFormatOpenAPI},
+		{"graphql", capmodel.SpecFormatGraphQL},
+		{"wsdl", capmodel.SpecFormatWSDL},
+		{"bogus", ""},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.apiType, func(t *testing.T) {
+			assert.Equal(t, tc.want, specFormatForAPIType(tc.apiType))
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// IsRejectedWSDLStatus
 // ---------------------------------------------------------------------------
 
 func TestIsRejectedWSDLStatus(t *testing.T) {
@@ -808,7 +823,7 @@ func TestIsRejectedWSDLStatus(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, isRejectedWSDLStatus(tt.status))
+			assert.Equal(t, tt.want, IsRejectedWSDLStatus(tt.status))
 		})
 	}
 }
@@ -1634,7 +1649,7 @@ func TestBuildWSDLProbeURL(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := buildWSDLProbeURL(tc.input)
+			got, err := BuildWSDLProbeURL(tc.input)
 			if tc.wantErr {
 				require.Error(t, err)
 				return

@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -50,18 +51,6 @@ func specFormatForAPIType(apiType string) string {
 		return ""
 	}
 }
-
-// validateProbeURLFunc is the SSRF guard used by probeWSDLDocument. Stored as
-// a package var so tests can swap in a permissive validator when exercising
-// the HTTP integration against an httptest server on loopback. Production
-// code paths leave this untouched.
-var validateProbeURLFunc = probe.ValidateProbeURL
-
-// dialContextForWSDLProbe is the dialer used by the probeWSDLDocument
-// http.Transport. Stored as a package var so tests can swap in a vanilla
-// dialer to reach an httptest loopback server. Production callers leave
-// this untouched.
-var dialContextForWSDLProbe = probe.SSRFSafeDialContext
 
 // Capability implements capability.Capability[capmodel.WebApplication] for
 // running Vespasian's API discovery pipeline as a Chariot platform capability.
@@ -357,7 +346,9 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 		resolvedAPIType = DetectAPIType(requests, p.confidence)
 	}
 
-	spec, err := ClassifyProbeGenerate(genCtx, requests, resolvedAPIType, p.confidence, p.deduplicate, p.enableProbe)
+	// probeErrs are intentionally discarded here: capability.ExecutionContext does not
+	// currently expose a logger sink. Future ExecutionContext logger support should surface these warnings.
+	spec, _, err := ClassifyProbeGenerate(genCtx, requests, resolvedAPIType, p.confidence, p.deduplicate, p.enableProbe)
 	if err != nil {
 		return fmt.Errorf("generate spec: %w", err)
 	}
@@ -394,10 +385,12 @@ func resolveAPITypeWithWSDLProbe(ctx context.Context, apiType, primaryURL string
 		return apiType, nil
 	}
 	wsdlDoc := probeFn(ctx, primaryURL)
+	// When api_type=wsdl and the probe fails, no synthetic request is injected
+	// and generation proceeds from crawl traffic alone.
 	if wsdlDoc == nil {
 		return apiType, nil
 	}
-	wsdlURL, err := buildWSDLProbeURL(primaryURL)
+	wsdlURL, err := BuildWSDLProbeURL(primaryURL)
 	if err != nil {
 		return apiType, nil
 	}
@@ -413,11 +406,12 @@ func resolveAPITypeWithWSDLProbe(ctx context.Context, apiType, primaryURL string
 	return "wsdl", syntheticReq
 }
 
-// buildWSDLProbeURL constructs the URL used to probe for a WSDL document by
+// BuildWSDLProbeURL constructs the URL used to probe for a WSDL document by
 // adding "wsdl" as a query parameter while preserving any existing query string.
 // Both probeWSDLDocument and resolveAPITypeWithWSDLProbe use this helper so that
 // the synthetic ObservedRequest URL always matches the URL actually probed.
-func buildWSDLProbeURL(targetURL string) (string, error) {
+// Exported so cmd/vespasian/main.go shares the same construction logic.
+func BuildWSDLProbeURL(targetURL string) (string, error) {
 	parsedURL, err := url.Parse(targetURL)
 	if err != nil {
 		return "", err
@@ -443,8 +437,9 @@ func buildWSDLProbeURL(targetURL string) (string, error) {
 //   - deduplicate: whether to deduplicate classified endpoints before generation
 //   - probeEnabled: whether to run active endpoint probing
 //
-// Returns the generated spec bytes (OpenAPI YAML, GraphQL SDL, or WSDL XML) or an error.
-func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest, apiType string, confidence float64, deduplicate bool, probeEnabled bool) ([]byte, error) {
+// Returns the generated spec bytes (OpenAPI YAML, GraphQL SDL, or WSDL XML), a slice
+// of non-fatal probe warnings (callers may surface or discard), and a fatal error.
+func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest, apiType string, confidence float64, deduplicate bool, probeEnabled bool) ([]byte, []error, error) {
 	resolvedAPIType := apiType
 	if resolvedAPIType == "auto" {
 		resolvedAPIType = DetectAPIType(requests, confidence)
@@ -452,7 +447,7 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 
 	classifiers := ClassifiersForType(resolvedAPIType)
 	if classifiers == nil {
-		return nil, fmt.Errorf("unsupported API type: %q", resolvedAPIType)
+		return nil, nil, fmt.Errorf("unsupported API type: %q", resolvedAPIType)
 	}
 
 	classified := classify.RunClassifiers(classifiers, requests, confidence)
@@ -460,10 +455,12 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 		classified = classify.Deduplicate(classified)
 	}
 
+	var probeErrs []error
 	if probeEnabled {
 		cfg := probe.DefaultConfig()
 		strategies := ProbeStrategiesForType(resolvedAPIType, cfg)
-		enriched, _ := probe.RunStrategies(ctx, strategies, classified)
+		enriched, errs := probe.RunStrategies(ctx, strategies, classified)
+		probeErrs = errs
 		// Match the CLI behavior in cmd/vespasian/main.go: a probe failure
 		// should not discard successful classification. Only adopt the
 		// probe-enriched slice when it has results; otherwise keep the
@@ -475,10 +472,11 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 
 	gen, err := generate.Get(resolvedAPIType)
 	if err != nil {
-		return nil, fmt.Errorf("get generator for %q: %w", resolvedAPIType, err)
+		return nil, probeErrs, fmt.Errorf("get generator for %q: %w", resolvedAPIType, err)
 	}
 
-	return gen.Generate(classified)
+	spec, err := gen.Generate(classified)
+	return spec, probeErrs, err
 }
 
 // DetectAPIType runs all three classifiers and returns the winning API type.
@@ -544,12 +542,13 @@ func ProbeStrategiesForType(apiType string, cfg probe.Config) []probe.ProbeStrat
 	}
 }
 
-// isRejectedWSDLStatus reports whether the HTTP status code should cause
+// IsRejectedWSDLStatus reports whether the HTTP status code should cause
 // probeWSDLDocument to reject the response without attempting to parse.
 // Anything ≥300 is rejected: 3xx responses reach us because CheckRedirect
 // returns ErrUseLastResponse (not a final WSDL response), and 4xx/5xx
 // indicate the endpoint does not serve WSDL.
-func isRejectedWSDLStatus(status int) bool {
+// Exported so cmd/vespasian/main.go shares the same rejection logic.
+func IsRejectedWSDLStatus(status int) bool {
 	return status >= 300
 }
 
@@ -574,30 +573,40 @@ func isAcceptableWSDLContentType(header string) bool {
 //
 // NOTE: Silent failures are intentional — this is a best-effort probe.
 //
-// NOTE: probeWSDLDocument enforces SSRF gates (validateProbeURLFunc and
-// dialContextForWSDLProbe) that reject private/loopback hosts. Match
+// NOTE: probeWSDLDocument enforces SSRF gates (probe.ValidateProbeURL and
+// probe.SSRFSafeDialContext) that reject private/loopback hosts. Match
 // intentionally accepts such hosts under the Chariot trusted-seed model, so
 // a private-IP PrimaryURL will silently fail this probe and auto-detection
 // will fall through to REST/GraphQL. To probe a private-IP SOAP target,
 // use the CLI with --dangerous-allow-private instead.
+//
+// This is a thin wrapper over probeWSDLDocumentWith that supplies the production
+// validator and dialer. The wsdlProbeFn field on Capability uses this wrapper.
 func probeWSDLDocument(ctx context.Context, targetURL string) []byte {
+	return probeWSDLDocumentWith(ctx, targetURL, probe.ValidateProbeURL, probe.SSRFSafeDialContext)
+}
+
+// probeWSDLDocumentWith is the testable implementation of probeWSDLDocument.
+// The validate and dialer parameters allow tests to supply their own validator
+// and dialer without swapping package-level vars.
+func probeWSDLDocumentWith(ctx context.Context, targetURL string, validate func(string) error, dialer func(context.Context, string, string) (net.Conn, error)) []byte {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	wsdlURL, err := buildWSDLProbeURL(targetURL)
+	wsdlURL, err := BuildWSDLProbeURL(targetURL)
 	if err != nil {
 		return nil
 	}
 
-	if err := validateProbeURLFunc(wsdlURL); err != nil {
+	if err := validate(wsdlURL); err != nil {
 		return nil
 	}
 
 	client := &http.Client{
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
-			DialContext:           dialContextForWSDLProbe,
+			DialContext:           dialer,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: 10 * time.Second,
 		},
@@ -635,7 +644,7 @@ func probeWSDLDocument(ctx context.Context, targetURL string) []byte {
 //
 // The caller owns resp.Body and must close it.
 func decodeWSDLResponse(resp *http.Response) []byte {
-	if isRejectedWSDLStatus(resp.StatusCode) {
+	if IsRejectedWSDLStatus(resp.StatusCode) {
 		return nil
 	}
 	if !isAcceptableWSDLContentType(resp.Header.Get("Content-Type")) {

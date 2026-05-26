@@ -309,8 +309,8 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10MB upload cap
-	if err := r.ParseMultipartForm(10 << 20); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)        // 10MB upload cap
+	if err := r.ParseMultipartForm(10 << 20); err != nil { //nolint:gosec // body already capped by MaxBytesReader above
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid multipart"})
 		return
 	}

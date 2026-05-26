@@ -1897,7 +1897,7 @@ func TestProbeWSDLDocument_ValidWSDL(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	doc := probeWSDLDocument(ts.URL+"/calculator.asmx", true, false)
+	doc := probeWSDLDocument(context.Background(), ts.URL+"/calculator.asmx", true, false)
 	if doc == nil {
 		t.Fatal("probeWSDLDocument returned nil for valid WSDL endpoint")
 	}
@@ -1915,7 +1915,7 @@ func TestProbeWSDLDocument_NoWSDL(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	doc := probeWSDLDocument(ts.URL, true, false)
+	doc := probeWSDLDocument(context.Background(), ts.URL, true, false)
 	if doc != nil {
 		t.Errorf("probeWSDLDocument should return nil for non-WSDL endpoint, got %d bytes", len(doc))
 	}
@@ -1929,7 +1929,7 @@ func TestProbeWSDLDocument_404(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	doc := probeWSDLDocument(ts.URL, true, false)
+	doc := probeWSDLDocument(context.Background(), ts.URL, true, false)
 	if doc != nil {
 		t.Error("probeWSDLDocument should return nil for 404 response")
 	}
@@ -1986,7 +1986,7 @@ func TestScanPipeline_WSDLDiscoveryProbe(t *testing.T) {
 	}
 
 	// Active probe discovers the WSDL document
-	wsdlDoc := probeWSDLDocument(ts.URL+"/calculator.asmx", true, false)
+	wsdlDoc := probeWSDLDocument(context.Background(), ts.URL+"/calculator.asmx", true, false)
 	if wsdlDoc == nil {
 		t.Fatal("probeWSDLDocument should find the WSDL document")
 	}
@@ -2037,7 +2037,7 @@ func TestProbeWSDLDocument_URLConstruction(t *testing.T) {
 		{
 			name:      "URL with existing query",
 			inputPath: "/service?foo=bar",
-			wantQuery: "wsdl",
+			wantQuery: "foo=bar&wsdl",
 		},
 		{
 			name:      "URL with trailing question mark",
@@ -2059,7 +2059,7 @@ func TestProbeWSDLDocument_URLConstruction(t *testing.T) {
 			var gotQuery string
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				gotQuery = r.URL.RawQuery
-				if r.URL.RawQuery == "wsdl" {
+				if strings.Contains(r.URL.RawQuery, "wsdl") {
 					w.Header().Set("Content-Type", "text/xml")
 					w.Write([]byte(validWSDL)) //nolint:gosec // G104: test code
 					return
@@ -2068,7 +2068,7 @@ func TestProbeWSDLDocument_URLConstruction(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			probeWSDLDocument(ts.URL+tt.inputPath, true, false)
+			probeWSDLDocument(context.Background(), ts.URL+tt.inputPath, true, false)
 
 			if gotQuery != tt.wantQuery {
 				t.Errorf("probeWSDLDocument(%q) sent query %q, want %q", tt.inputPath, gotQuery, tt.wantQuery)

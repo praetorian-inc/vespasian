@@ -619,7 +619,7 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	// browser GETs so crawl traffic rarely contains WSDL signals — active
 	// probing is the reliable discovery method.
 	if shouldProbeWSDL(c.APIType) {
-		wsdlDoc := probeWSDLDocument(c.URL, c.DangerousAllowPrivate, c.Verbose)
+		wsdlDoc := probeWSDLDocument(bs.ctx, c.URL, c.DangerousAllowPrivate, c.Verbose)
 		if wsdlDoc != nil {
 			apiType = apiTypeWSDL
 			if c.Verbose {
@@ -627,15 +627,19 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 			}
 			// Inject a synthetic request carrying the WSDL document so
 			// the generator's Phase 1 can return it directly.
-			requests = append(requests, crawl.ObservedRequest{
-				Method: "GET",
-				URL:    c.URL + "?wsdl",
-				Response: crawl.ObservedResponse{
-					StatusCode:  200,
-					ContentType: "text/xml",
-					Body:        wsdlDoc,
-				},
-			})
+			// Use sdk.BuildWSDLProbeURL so the URL matches what was actually probed.
+			syntheticURL, urlErr := sdk.BuildWSDLProbeURL(c.URL)
+			if urlErr == nil {
+				requests = append(requests, crawl.ObservedRequest{
+					Method: "GET",
+					URL:    syntheticURL,
+					Response: crawl.ObservedResponse{
+						StatusCode:  200,
+						ContentType: "text/xml",
+						Body:        wsdlDoc,
+					},
+				})
+			}
 		}
 	}
 
@@ -754,7 +758,9 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts ge
 				fmt.Fprintf(os.Stderr, "probe warning: %v\n", e)
 			}
 		}
-		classified = enriched
+		if len(enriched) > 0 {
+			classified = enriched
+		}
 	}
 
 	gen, err := generate.Get(opts.APIType)
@@ -770,21 +776,77 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts ge
 	return spec, nil
 }
 
+// buildWSDLProbeClient builds the http.Client used by probeWSDLDocument.
+// When allowPrivate is true the SSRF-safe dialer is omitted, allowing
+// connections to private/localhost targets (e.g., internal SOAP services).
+func buildWSDLProbeClient(allowPrivate bool) *http.Client {
+	transport := &http.Transport{
+		DialContext:           probe.SSRFSafeDialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+	}
+	if allowPrivate {
+		transport = &http.Transport{
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 10 * time.Second,
+		}
+	}
+	return &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// fetchWSDLBody performs the HTTP GET for wsdlURL using client, reads the
+// response body (capped at 2 MB), and validates that the content is a
+// well-formed WSDL document. Returns the raw bytes on success, or an error
+// describing why the fetch was rejected.
+func fetchWSDLBody(ctx context.Context, client *http.Client, wsdlURL string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wsdlURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("request construction failed: %w", err)
+	}
+	resp, err := client.Do(req) //nolint:gosec // URL validated by ValidateProbeURL before this call
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer func() {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // best-effort drain
+		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close
+	}()
+
+	if sdk.IsRejectedWSDLStatus(resp.StatusCode) {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20)) // 2 MB limit
+	if err != nil {
+		return nil, fmt.Errorf("reading body: %w", err)
+	}
+
+	if _, parseErr := wsdlgen.ParseWSDL(body); parseErr != nil {
+		return nil, fmt.Errorf("response is not valid WSDL: %w", parseErr)
+	}
+
+	return body, nil
+}
+
 // probeWSDLDocument attempts to fetch a WSDL document from targetURL?wsdl.
 // Returns the raw WSDL bytes if the response is a valid WSDL document, or nil
 // if the probe fails or returns non-WSDL content. This is the primary WSDL
 // discovery mechanism for the scan pipeline because headless browser crawls
 // of SOAP endpoints typically capture HTML, not XML.
-func probeWSDLDocument(targetURL string, allowPrivate bool, verbose bool) []byte {
-	parsedURL, err := url.Parse(targetURL)
+func probeWSDLDocument(ctx context.Context, targetURL string, allowPrivate bool, verbose bool) []byte {
+	wsdlURL, err := sdk.BuildWSDLProbeURL(targetURL)
 	if err != nil {
 		if verbose {
 			fmt.Fprintf(os.Stderr, "wsdl discovery: invalid URL %q: %v\n", targetURL, err) //nolint:errcheck,gosec // best-effort status message
 		}
 		return nil
 	}
-	parsedURL.RawQuery = "wsdl"
-	wsdlURL := parsedURL.String()
 
 	if verbose {
 		fmt.Fprintf(os.Stderr, "wsdl discovery: probing %s\n", wsdlURL)
@@ -799,48 +861,11 @@ func probeWSDLDocument(targetURL string, allowPrivate bool, verbose bool) []byte
 		}
 	}
 
-	transport := &http.Transport{
-		DialContext: probe.SSRFSafeDialContext,
-	}
-	if allowPrivate {
-		transport = &http.Transport{}
-	}
-	client := &http.Client{
-		Timeout:   15 * time.Second,
-		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-
-	resp, err := client.Get(wsdlURL)
+	client := buildWSDLProbeClient(allowPrivate)
+	body, err := fetchWSDLBody(ctx, client, wsdlURL)
 	if err != nil {
 		if verbose {
-			fmt.Fprintf(os.Stderr, "wsdl discovery: request failed: %v\n", err)
-		}
-		return nil
-	}
-	defer func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // best-effort drain
-		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close
-	}()
-
-	if resp.StatusCode >= 400 {
-		if verbose {
-			fmt.Fprintf(os.Stderr, "wsdl discovery: %s returned HTTP %d\n", wsdlURL, resp.StatusCode)
-		}
-		return nil
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20)) // 2MB limit
-	if err != nil {
-		return nil
-	}
-
-	// Validate the response is actually a WSDL document
-	if _, parseErr := wsdlgen.ParseWSDL(body); parseErr != nil {
-		if verbose {
-			fmt.Fprintf(os.Stderr, "wsdl discovery: response is not valid WSDL: %v\n", parseErr)
+			fmt.Fprintf(os.Stderr, "wsdl discovery: %s: %v\n", wsdlURL, err)
 		}
 		return nil
 	}

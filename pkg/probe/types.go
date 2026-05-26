@@ -69,7 +69,7 @@ func (cfg Config) withDefaults() Config {
 				return http.ErrUseLastResponse
 			},
 			Transport: &http.Transport{
-				DialContext:           ssrfSafeDialContext,
+				DialContext:           SSRFSafeDialContext,
 				TLSHandshakeTimeout:   10 * time.Second,
 				ResponseHeaderTimeout: 10 * time.Second,
 				IdleConnTimeout:       90 * time.Second,
