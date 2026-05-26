@@ -820,3 +820,31 @@ func TestInferredParam_HasType(t *testing.T) {
 		})
 	}
 }
+
+// shouldUpgradeWith() pins the first-with-type-wins predicate that
+// centralizes the upgrade rule used by walkOperation, walkParam, and merge.
+func TestInferredParam_ShouldUpgradeWith(t *testing.T) {
+	typed := &inferredParam{XSDType: "xsd:int"}
+	empty := &inferredParam{}
+	complex := &inferredParam{IsComplex: true}
+	otherTyped := &inferredParam{XSDType: "xsd:string"}
+
+	tests := []struct {
+		name      string
+		existing  *inferredParam
+		candidate *inferredParam
+		want      bool
+	}{
+		{"empty upgraded by typed", empty, typed, true},
+		{"empty upgraded by complex", empty, complex, true},
+		{"typed not downgraded by empty", typed, empty, false},
+		{"typed not replaced by other typed (first wins)", typed, otherTyped, false},
+		{"complex not replaced by typed", complex, typed, false},
+		{"empty stays empty when candidate is empty", empty, empty, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.existing.shouldUpgradeWith(tt.candidate))
+		})
+	}
+}

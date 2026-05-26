@@ -83,6 +83,16 @@ func (p *inferredParam) hasType() bool {
 	return p.IsComplex || p.XSDType != ""
 }
 
+// shouldUpgradeWith reports whether p (the existing observation) should be
+// replaced by candidate. True iff p carries no type info and candidate does.
+// This is the first-with-type-wins rule used by walkOperation (sibling
+// elements with the same name), walkParam (repeated child elements), and
+// merge (cross-observation aggregation). Centralizing the predicate keeps
+// the invariant in one place so future tweaks edit a single site.
+func (p *inferredParam) shouldUpgradeWith(candidate *inferredParam) bool {
+	return !p.hasType() && candidate.hasType()
+}
+
 // extractSOAPParameters walks a SOAP envelope and extracts typed parameters
 // from the operation element in the Body. Returns nil on failure or empty body.
 func extractSOAPParameters(body []byte) *soapBodyInfo {
@@ -141,11 +151,9 @@ func walkOperation(decoder *xml.Decoder, opStart xml.StartElement, depth int) *s
 				info.Params[param.Name] = param
 				continue
 			}
-			// Same-name sibling (XML arrays / repeated elements): first
-			// observation with type info wins. Upgrade only if the prior
-			// observation was untyped and the new one has type info; never
-			// overwrite a typed param with an empty one.
-			if !existing.hasType() && param.hasType() {
+			// Same-name sibling (XML arrays / repeated elements): apply
+			// first-with-type-wins (see inferredParam.shouldUpgradeWith).
+			if existing.shouldUpgradeWith(param) {
 				info.Params[param.Name] = param
 			}
 		}
@@ -199,9 +207,9 @@ func walkParam(decoder *xml.Decoder, paramStart xml.StartElement, depth int) *in
 				p.Children.Params[child.Name] = child
 				continue
 			}
-			// Same-name sibling under a parent: first-with-type wins (see
-			// walkOperation for the same rule).
-			if !existing.hasType() && child.hasType() {
+			// Same-name sibling under a parent: first-with-type-wins (see
+			// inferredParam.shouldUpgradeWith).
+			if existing.shouldUpgradeWith(child) {
 				p.Children.Params[child.Name] = child
 			}
 		}
@@ -315,10 +323,11 @@ func (a *soapBodyInfo) merge(b *soapBodyInfo) {
 			a.Params[k] = bParam
 			continue
 		}
-		// Upgrade: existing was empty (no type, not complex) and the new
-		// observation has type info. Required for the <status/> then
-		// <status>active</status> sequence across captures.
-		if !existing.hasType() && bParam.hasType() {
+		// Upgrade: existing was empty and the new observation has type info.
+		// Required for the <status/> then <status>active</status> sequence
+		// across captures (first-with-type-wins; see
+		// inferredParam.shouldUpgradeWith).
+		if existing.shouldUpgradeWith(bParam) {
 			a.Params[k] = bParam
 			continue
 		}
