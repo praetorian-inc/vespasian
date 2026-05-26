@@ -153,15 +153,18 @@ func TestRunJSAnalysisStage_Verbose_LogsStats(t *testing.T) {
 	}
 }
 
-// TestAugmentationOrder_FormsBeforeJSStatic pins the QUAL-001 alignment fix:
-// ScanCmd, CrawlCmd, and GenerateCmd all run augmentWithStaticForms BEFORE
-// runJSAnalysisStage. We verify by feeding a fixture with both an HTML page
-// (carrying a <form action="/api/…">) and a JS bundle (with a fetch call)
-// through the same two stages in the order each command applies, and
-// asserting the synthesized output contains the static:html entry before any
-// static:js entry. Pre-alignment, ScanCmd ran js-then-forms — a regression
-// to that order would interleave static:js before static:html and fail.
-func TestAugmentationOrder_FormsBeforeJSStatic(t *testing.T) {
+// TestAugmentAll_FormsBeforeJSStatic pins the order contract enforced by the
+// augmentAll helper — the single shared entry point that both ScanCmd.Run and
+// GenerateCmd.Run call. A regression that flipped the order inside augmentAll
+// (or, in either Run method, bypassed augmentAll and re-ordered the stages)
+// would cause static:js entries to appear before static:html in the output.
+//
+// Why this pins both commands: ScanCmd and GenerateCmd both call augmentAll
+// (verified by grep — the only call sites of augmentAll). If a future Run
+// re-implements the two stages inline in the wrong order, the order regression
+// would surface during integration testing rather than this unit test, but
+// the helper itself stays correct because this test exercises it directly.
+func TestAugmentAll_FormsBeforeJSStatic(t *testing.T) {
 	captured := []crawl.ObservedRequest{
 		{
 			Method: "GET",
@@ -189,15 +192,14 @@ func TestAugmentationOrder_FormsBeforeJSStatic(t *testing.T) {
 		},
 	}
 
-	// Apply stages in the order ALL three commands now use.
-	enriched := augmentWithStaticForms(captured)
-	enriched = runJSAnalysisStage(context.Background(), enriched, jsAnalysisArgs{
+	// Call augmentAll directly — the shared helper used by both ScanCmd.Run
+	// and GenerateCmd.Run. A regression inside augmentAll that swaps the two
+	// stages would propagate to BOTH commands and fail this test.
+	enriched := augmentAll(context.Background(), captured, jsAnalysisArgs{
 		enabled:      true,
 		allowPrivate: true,
 	})
 
-	// Find first static:html and first static:js positions. Forms must
-	// precede js — pre-fix order (js first) would invert this.
 	firstHTML, firstJS := -1, -1
 	for i, r := range enriched {
 		if firstHTML == -1 && r.Source == "static:html" {
@@ -214,8 +216,38 @@ func TestAugmentationOrder_FormsBeforeJSStatic(t *testing.T) {
 		t.Fatalf("expected at least one static:js entry; got sources: %v", sourcesOf(enriched))
 	}
 	if firstHTML >= firstJS {
-		t.Errorf("expected static:html (idx %d) BEFORE static:js (idx %d) — forms-before-jsstatic order broken",
+		t.Errorf("augmentAll order broken: static:html (idx %d) must precede static:js (idx %d)",
 			firstHTML, firstJS)
+	}
+}
+
+// TestAugmentAll_DisabledJS_KeepsHTMLAugmentation verifies that augmentAll
+// still runs static-HTML augmentation when JS analysis is disabled. Pre-fix
+// it was possible for a Run method to call only one of the two stages; the
+// helper now guarantees forms ALWAYS run regardless of the JS flag.
+func TestAugmentAll_DisabledJS_KeepsHTMLAugmentation(t *testing.T) {
+	captured := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/login",
+			Source: "katana",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<form method="POST" action="/api/login"><input name="email"></form>`),
+			},
+		},
+	}
+	enriched := augmentAll(context.Background(), captured, jsAnalysisArgs{enabled: false})
+	var sawHTML bool
+	for _, r := range enriched {
+		if r.Source == "static:html" {
+			sawHTML = true
+			break
+		}
+	}
+	if !sawHTML {
+		t.Errorf("expected static:html augmentation even with JS analysis disabled; got sources: %v", sourcesOf(enriched))
 	}
 }
 

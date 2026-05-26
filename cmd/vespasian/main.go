@@ -541,15 +541,14 @@ func (c *GenerateCmd) Run() (err error) {
 		fmt.Fprintf(os.Stderr, "loaded %d captured requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
-	// Augment with static-HTML form observations so captures produced by
-	// crawl/import (which don't run form extraction) get the same treatment
-	// as captures produced by scan.
-	requests = augmentWithStaticForms(requests)
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	requests = runJSAnalysisStage(ctx, requests, jsAnalysisArgs{
+	// Augment captured requests with static-HTML form analysis + JS bundle
+	// static analysis in the canonical forms-then-jsstatic order (see
+	// augmentAll). Captures produced by crawl/import (which don't run form
+	// extraction inline) get the same treatment as captures produced by scan.
+	requests = augmentAll(ctx, requests, jsAnalysisArgs{
 		enabled:         c.AnalyzeJS,
 		fetchSourcemaps: c.FetchSourcemaps,
 		allowPrivate:    c.DangerousAllowPrivate,
@@ -624,11 +623,11 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
-	// Augmentation order: static-HTML forms first, then JS-bundle static
-	// analysis. This matches GenerateCmd.Run (see the augmentWithStaticForms
-	// doc comment for why both run before auto-detection / classification).
-	requests = augmentWithStaticForms(requests)
-	requests = runJSAnalysisStage(bs.ctx, requests, jsAnalysisArgs{
+	// Augment captured requests with static-HTML form analysis + JS bundle
+	// static analysis in the canonical forms-then-jsstatic order (see
+	// augmentAll). Same helper used by GenerateCmd.Run — the order contract
+	// is centralized to prevent the two commands from silently diverging.
+	requests = augmentAll(bs.ctx, requests, jsAnalysisArgs{
 		enabled:         c.AnalyzeJS,
 		fetchSourcemaps: c.FetchSourcemaps,
 		allowPrivate:    c.DangerousAllowPrivate,
@@ -738,6 +737,22 @@ type generateSpecOptions struct {
 // regardless of whether the capture came from scan, crawl, or import.
 func augmentWithStaticForms(requests []crawl.ObservedRequest) []crawl.ObservedRequest {
 	return append(requests, analyze.ExtractForms(requests)...)
+}
+
+// augmentAll runs the captured-request augmentation stages in the canonical
+// order: static-HTML forms first, then JS-bundle static analysis. Both
+// ScanCmd.Run and GenerateCmd.Run call this helper rather than open-coding the
+// two stage calls — the shared helper pins the order contract so a regression
+// in one command cannot silently re-emerge in the other. CrawlCmd does NOT
+// call this; its output is raw capture.json that augmentation is applied to
+// downstream at generate time. The order matters for downstream determinism:
+// static:html entries appear before static:js entries in the result, so
+// classify.Deduplicate first-write-wins keeps the form-derived signals when
+// they collide with bundle-derived ones on the same endpoint key.
+func augmentAll(ctx context.Context, requests []crawl.ObservedRequest, js jsAnalysisArgs) []crawl.ObservedRequest {
+	requests = augmentWithStaticForms(requests)
+	requests = runJSAnalysisStage(ctx, requests, js)
+	return requests
 }
 
 // generateSpec runs the classify → probe → generate pipeline. It trusts its

@@ -269,6 +269,51 @@ func TestSafeAnalyzeOne_PanicRecovery(t *testing.T) {
 	}
 }
 
+// TestAnalyze_BundlePanic_IncrementsBundlesSkipped is the positive regression
+// test for the bundle-path panic-recovery in extractWithTimeout. When the
+// extraction goroutine panics while parsing the bundle body, the recover()
+// must (a) prevent the panic from unwinding Analyze, (b) return extractPanic
+// status, and (c) cause analyzeOne to increment BundlesSkipped (NOT
+// BundlesAnalyzed). Together with the sourcemap-panic test below, this
+// exercises all three loc values that testInjectPanic supports.
+func TestAnalyze_BundlePanic_IncrementsBundlesSkipped(t *testing.T) {
+	testInjectPanic = func(loc string) {
+		if loc == "bundle" {
+			panic("forced bundle-extraction panic for regression test")
+		}
+	}
+	defer func() { testInjectPanic = nil }()
+
+	captured := []crawl.ObservedRequest{
+		makeJSCapture("https://h/app.js", `fetch("/api/x")`),
+	}
+	res, err := Analyze(context.Background(), captured, Options{})
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if res.Stats.BundlesSkipped != 1 {
+		t.Errorf("BundlesSkipped = %d, want 1 (bundle-path panic must be counted as skipped)",
+			res.Stats.BundlesSkipped)
+	}
+	if res.Stats.BundlesAnalyzed != 0 {
+		t.Errorf("BundlesAnalyzed = %d, want 0 (panic short-circuits before BundlesAnalyzed++)",
+			res.Stats.BundlesAnalyzed)
+	}
+	// Bundle-path panic must NOT escape to the outer safeAnalyzeOne recover
+	// (extractWithTimeout's goroutine recovers first), so AnalyzeOnePanics
+	// stays at zero.
+	if res.Stats.AnalyzeOnePanics != 0 {
+		t.Errorf("AnalyzeOnePanics = %d, want 0 (bundle panic is caught by extractWithTimeout, not safeAnalyzeOne)",
+			res.Stats.AnalyzeOnePanics)
+	}
+	// Output preserves the original captured entry — no synthesized requests
+	// because extraction never returned a successful result.
+	if len(res.Requests) != len(captured) {
+		t.Errorf("Requests length = %d, want %d (input passes through on bundle panic)",
+			len(res.Requests), len(captured))
+	}
+}
+
 // TestAnalyze_SourcemapSourcePanic_IncrementsPanicCounter is the positive
 // regression test for the SourcemapSourcePanics counter (QUAL-002 split).
 // Forces a panic inside the extraction goroutine when processing a recovered
