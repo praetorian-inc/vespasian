@@ -384,6 +384,17 @@ var servicePrefixPattern = regexp.MustCompile(
 // The receiver must be a string literal — chained-method or computed
 // receivers (e.g. `obj.url.concat(...)`) would require an AST and are
 // intentionally out of scope.
+//
+// The receiver character class includes `?=&%~` in addition to the
+// path-only chars used by concatPlusHeadPattern. The asymmetry is
+// intentional: a `.concat()` receiver in real SPAs is sometimes a
+// URL fragment with embedded query syntax (e.g. `"/api/users?id=".concat(uid)`),
+// whereas a `+`-chain head is almost always a clean path because the
+// chain itself is being used to add the query/path tail. The post-hoc
+// `hasAPIIndicator` filter in emit() drops any reconstructed path that
+// doesn't contain an API marker, so the wider receiver class doesn't
+// produce false positives — only widens the input pool the post-filter
+// sees.
 var concatMethodPattern = regexp.MustCompile(
 	`["']` +
 		`(/?[a-zA-Z0-9/_{}.:?=&%~-]*)` +
@@ -427,13 +438,19 @@ const concatPathSentinel = "0"
 const maxConcatChainOperands = 16
 
 // maxConcatChainSpan bounds the total byte span parsePlusChain will walk
-// from the start of the chain. A hostile JS bundle can place a few-byte
-// `"/api/" + ` anchor in front of a megabytes-long bracketed sub-expression
-// whose operand-terminators (`+`, `;`, `,`, newline, `)`) only appear near
-// the end of the bundle; without this cap, scanIdentifierOperand would walk
-// the whole span per match. 1024 bytes is comfortably larger than any
-// realistic URL-construction chain and small enough to bound aggregate
-// O(N*16*1024) work across all chain matches in a 10MiB body.
+// from the start of the chain. parsePlusChain enforces it by clamping its
+// working slice to jsBody[:start+maxConcatChainSpan], so every per-operand
+// scan (scanStringLiteral, scanIdentifierOperand) is physically bounded
+// regardless of bracket depth or operand shape. Without this cap a hostile
+// JS bundle could place a few-byte `"/api/" + ` anchor in front of a
+// megabytes-long bracketed sub-expression whose operand-terminators
+// (`+`, `;`, `,`, newline, `)`) only appear near end-of-bundle, forcing
+// scanIdentifierOperand to walk the whole span per match.
+//
+// 1024 bytes is comfortably larger than any realistic URL-construction
+// chain and small enough to bound aggregate worst-case parser work at
+// O(M * maxConcatChainOperands * maxConcatChainSpan) =
+// O(M * 16 * 1024) bytes across all M chain matches in a 10MiB body.
 const maxConcatChainSpan = 1024
 
 // maxConcatArgList is the maximum size of the raw argument list
@@ -956,10 +973,12 @@ func reconstructTemplateLiteral(segment []byte) (string, bool) {
 // reconstructed path is a valid HTTP path that the prober can issue. The
 // downstream REST normalizer turns the sentinel into a named {param}.
 //
-// Pure literal+literal concatenations (no identifier) are also accepted by
-// the method form and emitted with the literals joined verbatim; the +
-// form requires at least one non-literal operand because literal+literal
-// `+` chains are already handled by servicePrefixPattern + apiPathPattern.
+// Pure literal+literal concatenations are accepted by BOTH forms — neither
+// regex requires a non-literal operand to match. When the chain happens to
+// be all literals (e.g. `"/api/" + "users"`), the path reconstructs the
+// same way and is emitted; servicePrefixPattern + apiPathPattern may also
+// match the same source, but the seen-map in emit() deduplicates collisions
+// so no double-emission occurs.
 func extractConcatPaths(jsBody []byte) []string {
 	seen := make(map[string]bool)
 	var paths []string
@@ -989,10 +1008,10 @@ func extractConcatPaths(jsBody []byte) []string {
 		if argEnd < 0 {
 			continue
 		}
+		// findConcatArgListEnd caps its scan at match[1]+maxConcatArgList,
+		// so argEnd-match[1] is already <= maxConcatArgList — no second
+		// post-check needed.
 		argList := string(jsBody[match[1]:argEnd])
-		if len(argList) > maxConcatArgList {
-			continue
-		}
 		emit(receiver + parseConcatArgs(argList))
 	}
 
@@ -1186,28 +1205,41 @@ func stringLiteralValue(s string) (string, bool) {
 // Walks at most maxConcatChainOperands operands AND at most
 // maxConcatChainSpan bytes from start; bails immediately on a malformed
 // operand, a missing connecting `+`, or any unexpected character. The
-// byte-span cap prevents a hostile bundle from amplifying parser work by
-// placing a `"/api/"+` anchor in front of an arbitrarily long bracketed
-// expression whose operand-terminators only appear near end-of-file.
-// Trailing whitespace and the final operand are tolerated.
+// byte-span cap is enforced by clamping the working slice to
+// jsBody[:start+maxConcatChainSpan] BEFORE any per-operand scan, so it
+// applies uniformly to iteration 0 (the first-operand walk) as well as
+// to later iterations. Without the slice clamp, a hostile bundle could
+// place a `"/api/"+` anchor in front of an arbitrarily long bracketed
+// sub-expression and force scanIdentifierOperand to walk to end-of-body
+// looking for a depth-0 operand terminator. Trailing whitespace and the
+// final operand are tolerated.
 func parsePlusChain(jsBody []byte, start int) string {
+	// Clamp working slice: any helper (scanStringLiteral,
+	// scanIdentifierOperand) that loops on `i < len(body)` is now
+	// physically bounded at start+maxConcatChainSpan, regardless of
+	// bracket depth or operand shape. This is strictly cheaper than
+	// a per-iteration counter because it cannot be bypassed by adding
+	// new operand types in the future.
+	limit := start + maxConcatChainSpan
+	if limit > len(jsBody) {
+		limit = len(jsBody)
+	}
+	body := jsBody[:limit]
+
 	var b strings.Builder
 	pos := start
 	for op := 0; op < maxConcatChainOperands; op++ {
-		if pos-start > maxConcatChainSpan {
+		pos = skipPlusChainWhitespace(body, pos)
+		if pos >= len(body) {
 			return b.String()
 		}
-		pos = skipPlusChainWhitespace(jsBody, pos)
-		if pos >= len(jsBody) {
-			return b.String()
-		}
-		lit, end, ok := readChainOperand(jsBody, pos)
+		lit, end, ok := readChainOperand(body, pos)
 		if !ok {
 			return b.String()
 		}
 		b.WriteString(lit)
-		pos = skipPlusChainWhitespace(jsBody, end)
-		if pos >= len(jsBody) || jsBody[pos] != '+' {
+		pos = skipPlusChainWhitespace(body, end)
+		if pos >= len(body) || body[pos] != '+' {
 			return b.String()
 		}
 		pos++

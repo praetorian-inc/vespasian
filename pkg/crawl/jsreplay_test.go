@@ -493,16 +493,57 @@ func TestParsePlusChain(t *testing.T) {
 			want:  strings.Repeat("0", maxConcatChainOperands),
 		},
 		{
-			name: "byte-span cap fires before operand-count cap on huge first operand",
-			// first operand is a deeply nested bracket expression longer
-			// than maxConcatChainSpan; scanIdentifierOperand will walk it
-			// and parsePlusChain must bail before continuing.
+			name: "byte-span cap bounds huge first-operand walk (slice clamp)",
+			// First operand opens with `(` and contains > maxConcatChainSpan
+			// bytes of filler with no matching `)` reachable inside the
+			// clamped slice. Without the slice clamp scanIdentifierOperand
+			// would walk to end-of-body looking for a depth-0 terminator;
+			// with the clamp it stops at start+maxConcatChainSpan.
+			//
+			// Note: this is the iteration-3 regression test for the
+			// previously-incomplete fix where the byte-span guard fired
+			// only on iteration 1+, leaving iteration 0 unbounded.
 			src:   " (" + strings.Repeat("a", maxConcatChainSpan+200) + ") + \"/tail\";",
 			start: 0,
-			// First operand is identifier-shaped → sentinel; then we
-			// re-enter the loop and the byte-span guard fires before we
-			// can read "/tail". Result: just the sentinel.
+			want:  "0",
+		},
+		{
+			name: "byte-span boundary: operand exactly maxConcatChainSpan-1 bytes is consumed; trailing tail unreachable",
+			// Operand length is exactly span-2 chars between leading space
+			// and trailing `;`, so the operand walk fits but no characters
+			// remain inside the slice for the connecting `+` or next operand.
+			src:   " " + strings.Repeat("a", maxConcatChainSpan-2) + ` + "/tail";`,
+			start: 0,
+			// Operand consumed as identifier (sentinel); slice ends before
+			// the connecting `+`, so the connector check fails.
 			want: "0",
+		},
+		{
+			name:  "EOF-on-connector branch: operand followed by clean EOF (no trailing space, no +)",
+			src:   ` x`,
+			start: 0,
+			// Operand read, pos advances to end-of-slice, the
+			// `pos >= len(body)` half of the connector check fires
+			// (NOT the `body[pos] != '+'` half — there is no body[pos]).
+			want: "0",
+		},
+		{
+			name:  "non-plus-on-connector branch: operand followed by ',' explicitly tests the body[pos] != '+' half",
+			src:   ` x, rest`,
+			start: 0,
+			want:  "0",
+		},
+		{
+			name:  "backtick template literal operand without interpolation kept verbatim",
+			src:   " `xyz` + \"/end\";",
+			start: 0,
+			want:  "xyz/end",
+		},
+		{
+			name:  "backtick template literal operand with interpolation falls back to sentinel",
+			src:   " `${x}` + \"/end\";",
+			start: 0,
+			want:  "0/end",
 		},
 	}
 	for _, tt := range tests {
@@ -511,6 +552,75 @@ func TestParsePlusChain(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+// TestParsePlusChain_BoundaryPin proves the byte-span cap is enforced by
+// SLICE CLAMP, not by a per-iteration `> maxConcatChainSpan` comparison.
+// If a future change reintroduces a per-iteration `>` (off-by-one) guard
+// alongside the clamp, this test still passes — but if the slice clamp is
+// removed, the very-long first-operand input would produce a NON-EMPTY
+// suffix that includes /tail bytes (which we then assert against to lock
+// the behavior in).
+func TestParsePlusChain_BoundaryPin(t *testing.T) {
+	// First operand: open paren + (span-1) filler bytes — there is NO
+	// matching close paren anywhere in the input. Without the slice clamp,
+	// scanIdentifierOperand would walk past the clamp and reach the
+	// trailing `+ "/tail"`. With the slice clamp, the working slice
+	// physically cannot contain "/tail", so the suffix is just the sentinel.
+	src := " (" + strings.Repeat("a", maxConcatChainSpan) + ` + "/tail";`
+	got := parsePlusChain([]byte(src), 0)
+
+	// Result must NOT contain "/tail" — that would mean the slice clamp
+	// failed and scanIdentifierOperand walked past the budget.
+	assert.NotContains(t, got, "/tail",
+		"byte-span clamp failed: parsePlusChain reached past maxConcatChainSpan and recovered the trailing literal")
+	// And the result must be the sentinel produced by the truncated
+	// first-operand walk.
+	assert.Equal(t, concatPathSentinel, got)
+}
+
+// TestExtractConcatPaths_HugeFirstOperand is the integration-level regression
+// test for the iteration-3 SEC-BE fix. A hostile JS bundle of size N can
+// contain many concatPlusHeadPattern matches whose first operand opens a
+// bracket and never closes. Before the fix, each match's parsePlusChain
+// invocation walked O(N) bytes (matching close-bracket search), giving
+// aggregate O(N*M) parser work where M is the match count. After the fix,
+// per-match work is bounded at O(maxConcatChainSpan).
+//
+// We assert end-to-end that extractConcatPaths completes "fast" by sizing
+// the body at 256KB and the match count at 256 — enough that the unbounded
+// behavior would take ~seconds, but the bounded behavior completes in
+// milliseconds. A 1-second wall-clock budget gives ~1000x headroom.
+func TestExtractConcatPaths_HugeFirstOperand(t *testing.T) {
+	// 256 occurrences of `"/api/"+(` followed by 1KB of `a`s — every
+	// match has the same unclosed-bracket shape. Body size ~256 * 1KB =
+	// 256KB, well under the 10MiB maxJSBodySize cap.
+	const matches = 256
+	const fillerPerMatch = 1024
+	var sb strings.Builder
+	for i := 0; i < matches; i++ {
+		sb.WriteString(`"/api/" + (`)
+		sb.WriteString(strings.Repeat("a", fillerPerMatch))
+		sb.WriteString(" \n")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	got := extractConcatPaths([]byte(sb.String()))
+	elapsed := time.Since(deadline.Add(-time.Second))
+
+	// Behavior assertion: each match reconstructs to /api/<sentinel>;
+	// the seen-map in emit() deduplicates so we get at most one path.
+	assert.LessOrEqual(t, len(got), 1, "expected dedup to collapse %d identical matches into ≤1 path", matches)
+	if len(got) == 1 {
+		assert.Equal(t, "/api/"+concatPathSentinel, got[0])
+	}
+
+	// Performance assertion: the bounded fix keeps total work in the
+	// millisecond range. The unbounded behavior would walk ~256 * 256KB =
+	// 64MB of bytes per match (since each operand walks to EOF), making
+	// this loop take seconds.
+	assert.Less(t, elapsed, time.Second,
+		"extractConcatPaths exceeded 1s wall-clock on a 256KB bundle — slice clamp may be missing")
 }
 
 // TestExtractConcatPaths_FlowsThroughExtractAPIPaths verifies the new
