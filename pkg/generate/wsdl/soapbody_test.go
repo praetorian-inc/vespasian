@@ -1,0 +1,668 @@
+// Copyright 2026 Praetorian Security, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package wsdl
+
+import (
+	"encoding/xml"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// T002: RED — value-based type inference tests.
+func TestInferTypeFromValue(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+		name  string
+	}{
+		// Rule 3: empty / whitespace-only → "" (skip marker)
+		{"", "", "empty string"},
+		{"   ", "", "whitespace only"},
+		{"\t\n", "", "tab newline"},
+
+		// Rule 4: boolean (case-sensitive: only true/false)
+		{"true", "xsd:boolean", "true"},
+		{"false", "xsd:boolean", "false"},
+		// These fall through to xsd:string (not canonical booleans)
+		{"TRUE", "xsd:string", "TRUE not boolean"},
+		{"False", "xsd:string", "False not boolean"},
+
+		// Rule 5: integer
+		{"42", "xsd:int", "positive integer"},
+		{"-7", "xsd:int", "negative integer"},
+		{"0", "xsd:int", "zero"},
+
+		// Rule 6: decimal
+		{"3.14", "xsd:decimal", "positive decimal"},
+		{"-0.5", "xsd:decimal", "negative decimal"},
+
+		// Rule 7: date
+		{"2026-05-25", "xsd:date", "ISO date"},
+
+		// Rule 8: dateTime variants
+		{"2026-05-25T10:30:00", "xsd:dateTime", "bare dateTime"},
+		{"2026-05-25T10:30:00Z", "xsd:dateTime", "dateTime with Z"},
+		{"2026-05-25T10:30:00+02:00", "xsd:dateTime", "dateTime with offset"},
+		{"2026-05-25T10:30:00.123Z", "xsd:dateTime", "dateTime with fractional seconds"},
+
+		// Rule 9: string fallback
+		{"hello world", "xsd:string", "string fallback"},
+		{"123abc", "xsd:string", "alphanumeric"},
+		{"2026-13-99", "xsd:string", "invalid date falls to string"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := inferTypeFromValue(strings.TrimSpace(tt.input))
+			assert.Equal(t, tt.want, got, "inferTypeFromValue(%q)", tt.input)
+		})
+	}
+}
+
+// T004: RED — extractSOAPParameters envelope detection tests.
+func TestExtractSOAPParameters_EnvelopeDetection(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantNil bool
+	}{
+		{
+			name: "SOAP 1.1 with soap: prefix",
+			body: `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><Ping/></soap:Body></soap:Envelope>`,
+		},
+		{
+			name: "SOAP 1.1 with SOAP-ENV: prefix",
+			body: `<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"><SOAP-ENV:Body><Ping/></SOAP-ENV:Body></SOAP-ENV:Envelope>`,
+		},
+		{
+			name: "SOAP 1.2 with env: prefix",
+			body: `<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"><env:Body><Ping/></env:Body></env:Envelope>`,
+		},
+		{
+			name: "SOAP 1.2 default namespace",
+			body: `<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Body><Ping/></Body></Envelope>`,
+		},
+		{
+			name:    "plain Body without envelope namespace → nil",
+			body:    `<Envelope><Body><Ping/></Body></Envelope>`,
+			wantNil: true,
+		},
+		{
+			name:    "empty body → nil",
+			body:    ``,
+			wantNil: true,
+		},
+		{
+			name:    "malformed XML → nil (no panic)",
+			body:    `<not valid xml`,
+			wantNil: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractSOAPParameters([]byte(tt.body))
+			if tt.wantNil {
+				assert.Nil(t, result)
+			} else {
+				assert.NotNil(t, result)
+			}
+		})
+	}
+}
+
+// T006: RED — operation element + scalar parameter tests.
+func TestExtractSOAPParameters_ScalarParams(t *testing.T) {
+	t.Run("single scalar param with namespace", func(t *testing.T) {
+		body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><tns:GetUserRequest xmlns:tns="http://localhost/soap"><id>1</id></tns:GetUserRequest></soap:Body></soap:Envelope>`
+		result := extractSOAPParameters([]byte(body))
+		require.NotNil(t, result)
+		assert.Equal(t, []string{"id"}, result.OrderedKeys)
+		require.Contains(t, result.Params, "id")
+		assert.Equal(t, "xsd:int", result.Params["id"].XSDType)
+		assert.Equal(t, "http://localhost/soap", result.OpNamespace)
+	})
+
+	t.Run("multiple scalars", func(t *testing.T) {
+		body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><Add><a>5</a><b>7</b></Add></soap:Body></soap:Envelope>`
+		result := extractSOAPParameters([]byte(body))
+		require.NotNil(t, result)
+		assert.Equal(t, []string{"a", "b"}, result.OrderedKeys)
+	})
+
+	t.Run("empty operation element", func(t *testing.T) {
+		body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><Ping/></soap:Body></soap:Envelope>`
+		result := extractSOAPParameters([]byte(body))
+		require.NotNil(t, result)
+		assert.Empty(t, result.OrderedKeys)
+		assert.Empty(t, result.Params)
+	})
+
+	t.Run("mixed types", func(t *testing.T) {
+		body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><X><n>3</n><flag>true</flag><name>alice</name></X></soap:Body></soap:Envelope>`
+		result := extractSOAPParameters([]byte(body))
+		require.NotNil(t, result)
+		assert.Equal(t, "xsd:int", result.Params["n"].XSDType)
+		assert.Equal(t, "xsd:boolean", result.Params["flag"].XSDType)
+		assert.Equal(t, "xsd:string", result.Params["name"].XSDType)
+	})
+
+	// NT007: inferredParam.Namespace is populated from the element xml.Name.Space.
+	t.Run("param Namespace is preserved from element xml.Name.Space", func(t *testing.T) {
+		// The <p:id> element is bound to xmlns:p="http://params/" so its
+		// xml.Name.Space will be "http://params/" in the decoded token.
+		body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+			`<soap:Body>` +
+			`<tns:GetUserRequest xmlns:tns="http://localhost/soap" xmlns:p="http://params/">` +
+			`<p:id>1</p:id>` +
+			`</tns:GetUserRequest>` +
+			`</soap:Body></soap:Envelope>`
+		result := extractSOAPParameters([]byte(body))
+		require.NotNil(t, result)
+		require.Contains(t, result.Params, "id")
+		assert.Equal(t, "http://params/", result.Params["id"].Namespace,
+			"inferredParam.Namespace must equal the element's xml.Name.Space URI")
+	})
+}
+
+// T008: RED — nested complex-type tests.
+func TestExtractSOAPParameters_NestedComplex(t *testing.T) {
+	t.Run("one-deep nesting", func(t *testing.T) {
+		body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><CreateUser><user><name>alice</name><age>30</age></user></CreateUser></soap:Body></soap:Envelope>`
+		result := extractSOAPParameters([]byte(body))
+		require.NotNil(t, result)
+		require.Contains(t, result.Params, "user")
+		assert.True(t, result.Params["user"].IsComplex)
+		require.NotNil(t, result.Params["user"].Children)
+		assert.Equal(t, []string{"name", "age"}, result.Params["user"].Children.OrderedKeys)
+		assert.Equal(t, "xsd:string", result.Params["user"].Children.Params["name"].XSDType)
+		assert.Equal(t, "xsd:int", result.Params["user"].Children.Params["age"].XSDType)
+	})
+
+	t.Run("two-deep nesting", func(t *testing.T) {
+		body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><A><B><C><x>1</x></C></B></A></soap:Body></soap:Envelope>`
+		result := extractSOAPParameters([]byte(body))
+		require.NotNil(t, result)
+		require.Contains(t, result.Params, "B")
+		assert.True(t, result.Params["B"].IsComplex)
+		require.NotNil(t, result.Params["B"].Children)
+		require.Contains(t, result.Params["B"].Children.Params, "C")
+		assert.True(t, result.Params["B"].Children.Params["C"].IsComplex)
+	})
+
+	// NT010: mixed text and children in same param: IsComplex wins, text is dropped.
+	t.Run("mixed text and children promotes to complex", func(t *testing.T) {
+		// The <user> element interleaves text ("noise") with a child element (<name>alice</name>).
+		// walkParam collects text AND recurses into children; at "done:" IsComplex=true wins
+		// and the scalar text is discarded (soapbody.go:168-170).
+		body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+			`<soap:Body><Op><user>noise<name>alice</name></user></Op></soap:Body></soap:Envelope>`
+		result := extractSOAPParameters([]byte(body))
+		require.NotNil(t, result)
+		require.Contains(t, result.Params, "user")
+		user := result.Params["user"]
+		assert.True(t, user.IsComplex, "user must be promoted to complex type")
+		assert.Equal(t, "", user.XSDType, "XSDType must be empty for complex params")
+		require.NotNil(t, user.Children)
+		require.Contains(t, user.Children.Params, "name")
+		assert.Equal(t, "xsd:string", user.Children.Params["name"].XSDType)
+	})
+
+	t.Run("depth cap does not panic", func(t *testing.T) {
+		// Build XML deeper than maxBodyDepth
+		var sb strings.Builder
+		sb.WriteString(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><Root>`)
+		// maxBodyDepth = 32; walkOperation starts at depth=1 for first params
+		// Add 35 levels of nesting to exceed the cap
+		for i := 0; i < 35; i++ {
+			fmt.Fprintf(&sb, "<L%d>", i)
+		}
+		sb.WriteString("<leaf>value</leaf>")
+		for i := 34; i >= 0; i-- {
+			fmt.Fprintf(&sb, "</L%d>", i)
+		}
+		sb.WriteString(`</Root></soap:Body></soap:Envelope>`)
+		// Must not panic and must complete
+		result := extractSOAPParameters([]byte(sb.String()))
+		require.NotNil(t, result)
+		// The outermost parameter (L0) is within depth, so it should be recorded
+		// Deeper elements are skipped by the depth cap
+		assert.NotEmpty(t, result.Params)
+	})
+}
+
+// T010: RED — xsi:type tests.
+func TestExtractSOAPParameters_XSIType(t *testing.T) {
+	const xsiDecl = `xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"`
+	const xsdDecl = `xmlns:xsd="http://www.w3.org/2001/XMLSchema"`
+	const xsDecl = `xmlns:xs="http://www.w3.org/2001/XMLSchema"`
+
+	t.Run("xsd:int via xsi:type", func(t *testing.T) {
+		body := fmt.Sprintf(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><Op %s %s><a xsi:type="xsd:int">5</a></Op></soap:Body></soap:Envelope>`, xsiDecl, xsdDecl)
+		result := extractSOAPParameters([]byte(body))
+		require.NotNil(t, result)
+		require.Contains(t, result.Params, "a")
+		assert.Equal(t, "xsd:int", result.Params["a"].XSDType)
+	})
+
+	t.Run("xs: prefix variant normalized to xsd:", func(t *testing.T) {
+		body := fmt.Sprintf(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><Op %s %s><a xsi:type="xs:boolean">true</a></Op></soap:Body></soap:Envelope>`, xsiDecl, xsDecl)
+		result := extractSOAPParameters([]byte(body))
+		require.NotNil(t, result)
+		require.Contains(t, result.Params, "a")
+		assert.Equal(t, "xsd:boolean", result.Params["a"].XSDType)
+	})
+
+	t.Run("unknown prefix becomes tns:", func(t *testing.T) {
+		body := fmt.Sprintf(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><Op %s><a xsi:type="ns0:CustomType">irrelevant</a></Op></soap:Body></soap:Envelope>`, xsiDecl)
+		result := extractSOAPParameters([]byte(body))
+		require.NotNil(t, result)
+		require.Contains(t, result.Params, "a")
+		assert.Equal(t, "tns:CustomType", result.Params["a"].XSDType)
+	})
+
+	t.Run("empty element with xsi:type is typed not skipped", func(t *testing.T) {
+		body := fmt.Sprintf(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><Op %s %s><a xsi:type="xsd:int"/></Op></soap:Body></soap:Envelope>`, xsiDecl, xsdDecl)
+		result := extractSOAPParameters([]byte(body))
+		require.NotNil(t, result)
+		require.Contains(t, result.Params, "a")
+		assert.Equal(t, "xsd:int", result.Params["a"].XSDType)
+	})
+
+	// NT009: xsi:type matched by URI even when a non-canonical prefix is used.
+	// findXSIType (soapbody.go:178-185) matches by Name.Space == xsiNS, not by prefix.
+	t.Run("non-canonical xsi prefix still matched by URI", func(t *testing.T) {
+		// xmlns:foo is bound to the xsi URI; foo:type should be recognized as xsi:type.
+		body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+			`<soap:Body>` +
+			`<Op xmlns:foo="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">` +
+			`<a foo:type="xsd:int">5</a>` +
+			`</Op>` +
+			`</soap:Body></soap:Envelope>`
+		result := extractSOAPParameters([]byte(body))
+		require.NotNil(t, result)
+		require.Contains(t, result.Params, "a")
+		assert.Equal(t, "xsd:int", result.Params["a"].XSDType,
+			"type must be resolved by namespace URI, not by prefix string")
+	})
+}
+
+// T012: RED — merge (aggregation / union) tests.
+func TestSoapBodyInfo_Merge(t *testing.T) {
+	t.Run("merge adds new params from B", func(t *testing.T) {
+		a := &soapBodyInfo{
+			OrderedKeys: []string{"id"},
+			Params: map[string]*inferredParam{
+				"id": {Name: "id", XSDType: "xsd:int"},
+			},
+		}
+		b := &soapBodyInfo{
+			OrderedKeys: []string{"id", "name"},
+			Params: map[string]*inferredParam{
+				"id":   {Name: "id", XSDType: "xsd:int"},
+				"name": {Name: "name", XSDType: "xsd:string"},
+			},
+		}
+		a.merge(b)
+		assert.Equal(t, []string{"id", "name"}, a.OrderedKeys)
+		require.Contains(t, a.Params, "name")
+		assert.Equal(t, "xsd:string", a.Params["name"].XSDType)
+	})
+
+	t.Run("first-observed type wins on conflict", func(t *testing.T) {
+		a := &soapBodyInfo{
+			OrderedKeys: []string{"id"},
+			Params: map[string]*inferredParam{
+				"id": {Name: "id", XSDType: "xsd:int"},
+			},
+		}
+		b := &soapBodyInfo{
+			OrderedKeys: []string{"id"},
+			Params: map[string]*inferredParam{
+				"id": {Name: "id", XSDType: "xsd:string"},
+			},
+		}
+		a.merge(b)
+		// First-observed (xsd:int) wins
+		assert.Equal(t, "xsd:int", a.Params["id"].XSDType)
+	})
+
+	t.Run("nested merge adds child params", func(t *testing.T) {
+		aUser := &soapBodyInfo{
+			OrderedKeys: []string{"name"},
+			Params:      map[string]*inferredParam{"name": {Name: "name", XSDType: "xsd:string"}},
+		}
+		a := &soapBodyInfo{
+			OrderedKeys: []string{"user"},
+			Params: map[string]*inferredParam{
+				"user": {Name: "user", IsComplex: true, Children: aUser},
+			},
+		}
+		bUser := &soapBodyInfo{
+			OrderedKeys: []string{"name", "age"},
+			Params: map[string]*inferredParam{
+				"name": {Name: "name", XSDType: "xsd:string"},
+				"age":  {Name: "age", XSDType: "xsd:int"},
+			},
+		}
+		b := &soapBodyInfo{
+			OrderedKeys: []string{"user"},
+			Params: map[string]*inferredParam{
+				"user": {Name: "user", IsComplex: true, Children: bUser},
+			},
+		}
+		a.merge(b)
+		require.Contains(t, a.Params["user"].Children.Params, "age")
+		assert.Equal(t, []string{"name", "age"}, a.Params["user"].Children.OrderedKeys)
+	})
+
+	t.Run("merge from empty A gains all B params", func(t *testing.T) {
+		a := &soapBodyInfo{
+			OrderedKeys: nil,
+			Params:      map[string]*inferredParam{},
+		}
+		b := &soapBodyInfo{
+			OrderedKeys: []string{"x", "y", "z"},
+			Params: map[string]*inferredParam{
+				"x": {Name: "x", XSDType: "xsd:int"},
+				"y": {Name: "y", XSDType: "xsd:string"},
+				"z": {Name: "z", XSDType: "xsd:boolean"},
+			},
+		}
+		a.merge(b)
+		assert.Equal(t, []string{"x", "y", "z"}, a.OrderedKeys)
+		assert.Len(t, a.Params, 3)
+	})
+
+	// NT004: OpNamespace propagation from b to empty a.
+	t.Run("OpNamespace propagates when a is empty and b is set", func(t *testing.T) {
+		a := &soapBodyInfo{
+			OpNamespace: "",
+			Params:      map[string]*inferredParam{},
+		}
+		b := &soapBodyInfo{
+			OpNamespace: "http://x/",
+			Params:      map[string]*inferredParam{},
+		}
+		a.merge(b)
+		assert.Equal(t, "http://x/", a.OpNamespace)
+	})
+
+	// NT011: merge does not overwrite an already-set OpNamespace; b empty leaves a empty.
+	t.Run("OpNamespace is not overwritten and not propagated from empty b", func(t *testing.T) {
+		t.Run("a already set is not overwritten by b", func(t *testing.T) {
+			a := &soapBodyInfo{
+				OpNamespace: "http://first/",
+				Params:      map[string]*inferredParam{},
+			}
+			b := &soapBodyInfo{
+				OpNamespace: "http://second/",
+				Params:      map[string]*inferredParam{},
+			}
+			a.merge(b)
+			assert.Equal(t, "http://first/", a.OpNamespace,
+				"first-observed OpNamespace must not be overwritten")
+		})
+
+		t.Run("b empty leaves a empty", func(t *testing.T) {
+			a := &soapBodyInfo{
+				OpNamespace: "",
+				Params:      map[string]*inferredParam{},
+			}
+			b := &soapBodyInfo{
+				OpNamespace: "",
+				Params:      map[string]*inferredParam{},
+			}
+			a.merge(b)
+			assert.Equal(t, "", a.OpNamespace,
+				"both empty: a's OpNamespace must remain empty")
+		})
+	})
+}
+
+// NT001: walkOperation truncated envelope returns partial info.
+func TestWalkOperation_TruncatedEnvelopeReturnsPartial(t *testing.T) {
+	// Build a SOAP envelope whose XML stream terminates inside the operation
+	// element after one complete parameter (<a>1</a>) and after the opening
+	// tag of a second parameter (<b>) whose content and close tag are missing.
+	// The XML decoder emits StartElement "b" before hitting EOF, so walkParam
+	// is invoked for "b" and it is registered with an empty XSDType (rule 3
+	// skip marker). The partial-read path at soapbody.go:98-99 returns the
+	// partially-collected info rather than nil — this is the best-effort
+	// behavior the test pins.
+	body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+		`<soap:Body><Op><a>1</a><b>`
+	// truncated mid-element — no closing tags
+
+	result := extractSOAPParameters([]byte(body))
+	// Partial read path at soapbody.go:98-99 returns info, not nil.
+	require.NotNil(t, result, "truncated envelope must return partial info, not nil")
+	// "a" was fully parsed and must be present with its inferred type.
+	require.Contains(t, result.Params, "a")
+	assert.Equal(t, "xsd:int", result.Params["a"].XSDType)
+	// "b"'s StartElement was emitted before EOF, so it appears in OrderedKeys
+	// with an empty XSDType (the rule-3 skip marker for empty-text params).
+	// This pins the actual best-effort behavior: both keys are present, "a"
+	// is typed and "b" is untyped due to the truncation.
+	require.Contains(t, result.Params, "b")
+	assert.Equal(t, "", result.Params["b"].XSDType,
+		"incomplete param b must have empty XSDType (rule-3 skip marker)")
+	assert.False(t, result.Params["b"].IsComplex,
+		"incomplete param b must not be flagged as complex")
+}
+
+// NT001b: walkOperation depth cap branch — called directly at depth == maxBodyDepth
+// so that the depth >= maxBodyDepth guard in walkOperation (soapbody.go:107) is exercised.
+// This path is unreachable via extractSOAPParameters (always called at depth=1), but
+// is coverable by calling walkOperation directly from within the package test.
+func TestWalkOperation_DepthCap(t *testing.T) {
+	// Construct a SOAP body where the first child of the operation element is a nested
+	// element. We call walkOperation at depth == maxBodyDepth so the guard fires.
+	body := `<Op><child>value</child></Op>`
+	decoder := xml.NewDecoder(strings.NewReader(body))
+	// Advance past the <Op> StartElement.
+	tok, err := decoder.Token()
+	require.NoError(t, err)
+	opStart, ok := tok.(xml.StartElement)
+	require.True(t, ok)
+	require.Equal(t, "Op", opStart.Name.Local)
+
+	// Call walkOperation at the depth cap — the <child> StartElement will be skipped.
+	result := walkOperation(decoder, opStart, maxBodyDepth)
+	require.NotNil(t, result)
+	// The child was skipped by the depth cap guard; no params should be recorded.
+	assert.Empty(t, result.OrderedKeys,
+		"params at or beyond depth cap must be skipped")
+}
+
+// NT002: resolveXSIType direct unit test covering all branches including no-colon.
+func TestResolveXSIType(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+		name  string
+	}{
+		{"xsd:int", "xsd:int", "xsd prefix passthrough"},
+		{"xs:boolean", "xsd:boolean", "xs prefix normalized to xsd"},
+		{"ns0:Custom", "tns:Custom", "unknown prefix becomes tns"},
+		{"boolean", "xsd:boolean", "no-colon prepends xsd"},
+		{"", "xsd:", "empty no-colon edge case"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveXSIType(tt.input)
+			assert.Equal(t, tt.want, got, "resolveXSIType(%q)", tt.input)
+		})
+	}
+}
+
+// NT003: isPlausibleDate covering the len != 10 defensive guard.
+func TestIsPlausibleDate(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+		name  string
+	}{
+		{"2026-05-25", true, "valid date"},
+		{"2026-13-25", false, "month > 12"},
+		{"2026-05-32", false, "day > 31"},
+		{"2026-00-15", false, "month = 00"},
+		{"2026-05-00", false, "day = 00"},
+		{"", false, "empty string len != 10"},
+		{"2026-05-2", false, "len = 9"},
+		{"2026-05-255", false, "len = 11"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isPlausibleDate(tt.input)
+			assert.Equal(t, tt.want, got, "isPlausibleDate(%q)", tt.input)
+		})
+	}
+}
+
+// T014: RED — inferTypesFromObservations tests.
+func TestInferTypesFromObservations(t *testing.T) {
+	t.Run("single operation with scalar params", func(t *testing.T) {
+		obs := map[string]*soapBodyInfo{
+			"GetUser": {
+				OpNamespace: "http://localhost/soap",
+				OrderedKeys: []string{"id"},
+				Params:      map[string]*inferredParam{"id": {Name: "id", XSDType: "xsd:int"}},
+			},
+		}
+		ops := []string{"GetUser"}
+		types := inferTypesFromObservations(ops, obs, "http://localhost/")
+		require.NotNil(t, types)
+		require.Len(t, types.Schemas, 1)
+		assert.Equal(t, "http://localhost/", types.Schemas[0].TargetNS)
+		require.Len(t, types.Schemas[0].Elements, 1)
+		el := types.Schemas[0].Elements[0]
+		assert.Equal(t, "GetUser", el.Name)
+		require.NotNil(t, el.ComplexType)
+		require.Len(t, el.ComplexType.Sequence, 1)
+		assert.Equal(t, "id", el.ComplexType.Sequence[0].Name)
+		assert.Equal(t, "xsd:int", el.ComplexType.Sequence[0].Type)
+	})
+
+	t.Run("two operations", func(t *testing.T) {
+		obs := map[string]*soapBodyInfo{
+			"GetUser":   {OrderedKeys: []string{"id"}, Params: map[string]*inferredParam{"id": {XSDType: "xsd:int"}}},
+			"ListUsers": {OrderedKeys: []string{"filter"}, Params: map[string]*inferredParam{"filter": {XSDType: "xsd:string"}}},
+		}
+		ops := []string{"GetUser", "ListUsers"}
+		types := inferTypesFromObservations(ops, obs, "http://localhost/")
+		require.NotNil(t, types)
+		require.Len(t, types.Schemas[0].Elements, 2)
+		assert.Equal(t, "GetUser", types.Schemas[0].Elements[0].Name)
+		assert.Equal(t, "ListUsers", types.Schemas[0].Elements[1].Name)
+	})
+
+	t.Run("nested complex param", func(t *testing.T) {
+		childInfo := &soapBodyInfo{
+			OrderedKeys: []string{"name", "age"},
+			Params: map[string]*inferredParam{
+				"name": {Name: "name", XSDType: "xsd:string"},
+				"age":  {Name: "age", XSDType: "xsd:int"},
+			},
+		}
+		obs := map[string]*soapBodyInfo{
+			"CreateUser": {
+				OrderedKeys: []string{"user"},
+				Params: map[string]*inferredParam{
+					"user": {Name: "user", IsComplex: true, Children: childInfo},
+				},
+			},
+		}
+		ops := []string{"CreateUser"}
+		types := inferTypesFromObservations(ops, obs, "http://localhost/")
+		require.NotNil(t, types)
+		el := types.Schemas[0].Elements[0]
+		require.Len(t, el.ComplexType.Sequence, 1)
+		userEl := el.ComplexType.Sequence[0]
+		assert.Equal(t, "user", userEl.Name)
+		require.NotNil(t, userEl.ComplexType)
+		assert.Len(t, userEl.ComplexType.Sequence, 2)
+
+		// Smoke-check: must produce valid XML
+		_, err := xml.MarshalIndent(types, "", "  ")
+		assert.NoError(t, err)
+	})
+
+	t.Run("empty observations returns nil", func(t *testing.T) {
+		types := inferTypesFromObservations(nil, map[string]*soapBodyInfo{}, "http://localhost/")
+		assert.Nil(t, types)
+	})
+
+	// NT005a: all operations missing from observations — observations non-empty
+	// but no op in the operations slice exists in the map → elements stays empty
+	// → second nil-return path at soapbody.go:286-288.
+	t.Run("all operations missing from observations returns nil", func(t *testing.T) {
+		// observations has an entry, but it is not referenced by operations.
+		obs := map[string]*soapBodyInfo{
+			"OtherOp": {OrderedKeys: []string{"x"}, Params: map[string]*inferredParam{"x": {XSDType: "xsd:int"}}},
+		}
+		ops := []string{"GetUser", "ListUsers"} // neither is in obs
+		types := inferTypesFromObservations(ops, obs, "http://localhost/")
+		assert.Nil(t, types,
+			"all operations absent from observations → elements empty → nil return")
+	})
+
+	// NT005: operations not present in observations are silently skipped.
+	t.Run("operations not in observations are silently skipped", func(t *testing.T) {
+		obs := map[string]*soapBodyInfo{
+			"GetUser":   {OrderedKeys: []string{"id"}, Params: map[string]*inferredParam{"id": {XSDType: "xsd:int"}}},
+			"ListUsers": {OrderedKeys: []string{"filter"}, Params: map[string]*inferredParam{"filter": {XSDType: "xsd:string"}}},
+		}
+		// MissingOp is in operations slice but not in observations map.
+		ops := []string{"GetUser", "MissingOp", "ListUsers"}
+		types := inferTypesFromObservations(ops, obs, "http://localhost/")
+		require.NotNil(t, types)
+		require.Len(t, types.Schemas[0].Elements, 2, "MissingOp should be silently skipped")
+		assert.Equal(t, "GetUser", types.Schemas[0].Elements[0].Name)
+		assert.Equal(t, "ListUsers", types.Schemas[0].Elements[1].Name)
+		for _, el := range types.Schemas[0].Elements {
+			assert.NotEqual(t, "MissingOp", el.Name, "MissingOp must not appear in output")
+		}
+	})
+
+	// NT006: all-skipped params (empty XSDType, not complex) yields ComplexType with nil Sequence.
+	t.Run("all-skipped params yields empty complex type", func(t *testing.T) {
+		// Parameters with XSDType=="" and IsComplex==false trigger the skip at soapbody.go:305-307.
+		// This simulates e.g. <flag></flag> elements where text is empty.
+		obs := map[string]*soapBodyInfo{
+			"Ping": {
+				OrderedKeys: []string{"flag", "note"},
+				Params: map[string]*inferredParam{
+					"flag": {Name: "flag", XSDType: "", IsComplex: false},
+					"note": {Name: "note", XSDType: "", IsComplex: false},
+				},
+			},
+		}
+		ops := []string{"Ping"}
+		types := inferTypesFromObservations(ops, obs, "http://localhost/")
+		require.NotNil(t, types, "result must be non-nil even when all params are skipped")
+		require.Len(t, types.Schemas[0].Elements, 1)
+		el := types.Schemas[0].Elements[0]
+		assert.Equal(t, "Ping", el.Name)
+		require.NotNil(t, el.ComplexType)
+		assert.Empty(t, el.ComplexType.Sequence, "all-skipped params yields empty sequence")
+	})
+}

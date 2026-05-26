@@ -21,6 +21,20 @@
 //     WSDL operations from observed SOAPAction headers and SOAP envelope
 //     structures in the captured traffic.
 //
+// In inference mode, the package also extracts typed parameters from observed
+// SOAP request bodies and populates the generated WSDL's <types> section with
+// inferred XSD element definitions for each operation.
+//
+// Type inference applies rules in this order: (1) xsi:type attribute wins;
+// (2) nested child elements produce a complex type; (3) empty text is skipped;
+// (4–8) value heuristics match boolean, integer, decimal, date, and dateTime;
+// (9) anything else falls back to xsd:string.
+//
+// When the same operation appears in multiple captures, parameter observations
+// are unioned: new parameters are appended, and the first-observed XSD type
+// wins on conflict. Recursion is capped at maxBodyDepth = 32 levels to prevent
+// pathological inputs from causing unbounded stack growth.
+//
 // The package also provides [ParseWSDL] for parsing and validating WSDL XML
 // documents, and type definitions for WSDL XML unmarshaling.
 package wsdl

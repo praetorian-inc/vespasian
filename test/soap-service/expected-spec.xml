@@ -1,5 +1,30 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <definitions name="soap" targetNamespace="http://localhost:8991/" xmlns="http://schemas.xmlsoap.org/wsdl/" xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/" xmlns:tns="http://localhost:8991/" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <types>
+    <schema targetNamespace="http://localhost:8991/" xmlns="http://www.w3.org/2001/XMLSchema">
+      <element name="GetUser">
+        <complexType>
+          <sequence>
+            <element name="id" type="xsd:int"></element>
+          </sequence>
+        </complexType>
+      </element>
+      <element name="ListUsers">
+        <complexType>
+          <sequence>
+            <element name="id" type="xsd:int"></element>
+          </sequence>
+        </complexType>
+      </element>
+      <element name="CreateUser">
+        <complexType>
+          <sequence>
+            <element name="id" type="xsd:int"></element>
+          </sequence>
+        </complexType>
+      </element>
+    </schema>
+  </types>
   <message name="GetUserRequest">
     <part name="parameters" element="tns:GetUser"></part>
   </message>

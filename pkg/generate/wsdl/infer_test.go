@@ -249,3 +249,164 @@ func TestInferWSDL_StructureComplete(t *testing.T) {
 	require.NotNil(t, defs.Services[0].Ports[0].SOAPAddress)
 	assert.Equal(t, "http://example.com/calculator", defs.Services[0].Ports[0].SOAPAddress.Location)
 }
+
+// T016: RED — wire-up test: body parameters are extracted and placed into Types.
+func TestInferWSDL_BodyParametersIntoTypes(t *testing.T) {
+	body := []byte(`<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><tns:GetUserRequest xmlns:tns="http://x/"><id>1</id></tns:GetUserRequest></soap:Body></soap:Envelope>`)
+	endpoints := []classify.ClassifiedRequest{{
+		ObservedRequest: crawl.ObservedRequest{
+			Method:  "POST",
+			URL:     "http://example.com/service",
+			Headers: map[string]string{"SOAPAction": `"urn:GetUser"`},
+			Body:    body,
+		},
+	}}
+
+	defs, err := InferWSDL(endpoints)
+	require.NoError(t, err)
+	require.NotNil(t, defs.Types, "Types should be non-nil when body params observed")
+	require.Len(t, defs.Types.Schemas, 1)
+	require.Len(t, defs.Types.Schemas[0].Elements, 1)
+	el := defs.Types.Schemas[0].Elements[0]
+	assert.Equal(t, "GetUser", el.Name)
+	require.NotNil(t, el.ComplexType)
+	require.Len(t, el.ComplexType.Sequence, 1)
+	assert.Equal(t, "id", el.ComplexType.Sequence[0].Name)
+	assert.Equal(t, "xsd:int", el.ComplexType.Sequence[0].Type)
+}
+
+// NT008: End-to-end SOAP 1.2 + xsi:type RPC/encoded round-trips through InferWSDL.
+// Mirrors architecture §10 Example B exactly.
+// Confirms: SOAP 1.2 envelope path, RPC/encoded shape (operation element directly
+// under Body with xsi:typed scalars), and no-SOAPAction body-element fallback all
+// work end-to-end.
+func TestInferWSDL_SOAP12_RPCEncoded_xsiType(t *testing.T) {
+	// SOAP 1.2 envelope with two xsi:typed parameters; no SOAPAction header.
+	// The operation name ("Add") is resolved from the body element name.
+	body := []byte(
+		`<?xml version="1.0"?>` +
+			`<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"` +
+			` xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"` +
+			` xmlns:xsd="http://www.w3.org/2001/XMLSchema">` +
+			`<env:Body>` +
+			`<Add>` +
+			`<a xsi:type="xsd:int">3</a>` +
+			`<b xsi:type="xsd:int">7</b>` +
+			`</Add>` +
+			`</env:Body>` +
+			`</env:Envelope>`,
+	)
+
+	endpoints := []classify.ClassifiedRequest{{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: "POST",
+			URL:    "http://example.com/calculator",
+			Body:   body,
+		},
+	}}
+
+	defs, err := InferWSDL(endpoints)
+	require.NoError(t, err)
+
+	// Operation extracted from body element name (no SOAPAction).
+	require.Len(t, defs.PortTypes, 1)
+	require.Len(t, defs.PortTypes[0].Operations, 1)
+	assert.Equal(t, "Add", defs.PortTypes[0].Operations[0].Name)
+
+	// Types section populated from xsi:typed parameters.
+	require.NotNil(t, defs.Types, "Types must be non-nil for RPC/encoded xsi:type body")
+	require.Len(t, defs.Types.Schemas, 1)
+	require.Len(t, defs.Types.Schemas[0].Elements, 1)
+	el := defs.Types.Schemas[0].Elements[0]
+	assert.Equal(t, "Add", el.Name)
+	require.NotNil(t, el.ComplexType)
+	require.Len(t, el.ComplexType.Sequence, 2, "sequence must contain a and b")
+	assert.Equal(t, "a", el.ComplexType.Sequence[0].Name)
+	assert.Equal(t, "xsd:int", el.ComplexType.Sequence[0].Type)
+	assert.Equal(t, "b", el.ComplexType.Sequence[1].Name)
+	assert.Equal(t, "xsd:int", el.ComplexType.Sequence[1].Type)
+}
+
+// T016: RED — union test: multiple bodies for same op are merged into one element.
+func TestInferWSDL_BodyParametersUnion(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "http://example.com/service",
+				Headers: map[string]string{"SOAPAction": `"urn:CreateUser"`},
+				Body:    []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><CreateUserRequest><name>alice</name></CreateUserRequest></soap:Body></soap:Envelope>`),
+			},
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "http://example.com/service",
+				Headers: map[string]string{"SOAPAction": `"urn:CreateUser"`},
+				Body:    []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><CreateUserRequest><name>bob</name><age>30</age></CreateUserRequest></soap:Body></soap:Envelope>`),
+			},
+		},
+	}
+
+	defs, err := InferWSDL(endpoints)
+	require.NoError(t, err)
+	require.NotNil(t, defs.Types)
+	require.Len(t, defs.Types.Schemas[0].Elements, 1)
+	el := defs.Types.Schemas[0].Elements[0]
+	assert.Equal(t, "CreateUser", el.Name)
+	require.NotNil(t, el.ComplexType)
+	require.Len(t, el.ComplexType.Sequence, 2, "union should have both name and age")
+	assert.Equal(t, "name", el.ComplexType.Sequence[0].Name)
+	assert.Equal(t, "xsd:string", el.ComplexType.Sequence[0].Type)
+	assert.Equal(t, "age", el.ComplexType.Sequence[1].Name)
+	assert.Equal(t, "xsd:int", el.ComplexType.Sequence[1].Type)
+}
+
+// NT012: Duplicate operation across endpoints; second body contributes no new params.
+// Exercises the merge-on-duplicate-op path at infer.go:48-55 where extractSOAPParameters
+// succeeds but the second observation has an empty operation element (no OrderedKeys).
+// Verifies the first observation is preserved and not corrupted.
+func TestInferWSDL_BodyParametersUnion_SecondObservationEmpty(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		{
+			// First observation: op with one parameter.
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "http://example.com/service",
+				Headers: map[string]string{"SOAPAction": `"urn:GetUser"`},
+				Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+					`<soap:Body><GetUserRequest><id>1</id></GetUserRequest></soap:Body></soap:Envelope>`),
+			},
+		},
+		{
+			// Second observation: same SOAPAction, but body has empty operation element.
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "http://example.com/service",
+				Headers: map[string]string{"SOAPAction": `"urn:GetUser"`},
+				Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+					`<soap:Body><GetUserRequest/></soap:Body></soap:Envelope>`),
+			},
+		},
+	}
+
+	defs, err := InferWSDL(endpoints)
+	require.NoError(t, err)
+
+	// Should produce exactly one operation.
+	require.Len(t, defs.PortTypes[0].Operations, 1)
+	assert.Equal(t, "GetUser", defs.PortTypes[0].Operations[0].Name)
+
+	// Types must be present (from the first observation).
+	require.NotNil(t, defs.Types, "Types must be non-nil — first observation had params")
+	require.Len(t, defs.Types.Schemas[0].Elements, 1)
+	el := defs.Types.Schemas[0].Elements[0]
+	assert.Equal(t, "GetUser", el.Name)
+	require.NotNil(t, el.ComplexType)
+
+	// The empty second observation must not corrupt the first: exactly one param.
+	require.Len(t, el.ComplexType.Sequence, 1,
+		"second empty observation must not add or remove params")
+	assert.Equal(t, "id", el.ComplexType.Sequence[0].Name)
+	assert.Equal(t, "xsd:int", el.ComplexType.Sequence[0].Type)
+}

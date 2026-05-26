@@ -39,16 +39,30 @@ func InferWSDL(endpoints []classify.ClassifiedRequest) (*Definitions, error) {
 	var operations []string
 	soapActions := make(map[string]string) // operation name -> SOAPAction URI
 	seen := make(map[string]bool)
+	observations := make(map[string]*soapBodyInfo)
 
 	for _, ep := range endpoints {
 		opName, soapAction := extractOperation(ep)
 		if opName == "" || seen[opName] {
+			// Even for duplicate ops, merge any new param observations.
+			if opName != "" && len(ep.Body) > 0 {
+				if info := extractSOAPParameters(ep.Body); info != nil {
+					if existing := observations[opName]; existing != nil {
+						existing.merge(info)
+					} else {
+						observations[opName] = info
+					}
+				}
+			}
 			continue
 		}
 		seen[opName] = true
 		operations = append(operations, opName)
 		if soapAction != "" {
 			soapActions[opName] = soapAction
+		}
+		if info := extractSOAPParameters(ep.Body); info != nil {
+			observations[opName] = info
 		}
 	}
 
@@ -104,6 +118,11 @@ func InferWSDL(endpoints []classify.ClassifiedRequest) (*Definitions, error) {
 	}
 
 	defs.Messages = messages
+
+	if len(observations) > 0 {
+		defs.Types = inferTypesFromObservations(operations, observations, targetNS)
+	}
+
 	defs.PortTypes = []PortType{{
 		Name:       portTypeName,
 		Operations: ptOps,
