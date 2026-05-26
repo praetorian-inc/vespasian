@@ -34,10 +34,11 @@ const (
 // Package-level regexes compiled once to avoid per-call overhead.
 var (
 	boolRe = regexp.MustCompile(`^(true|false)$`)
-	// intRe matches signed integers without leading zeros (except "0" itself
-	// and "-0"). Leading-zero strings like "0123" are typically identifiers
-	// (ZIP codes, version segments, padded IDs) and would be misinterpreted
-	// by an XSD xs:int parser, so they fall through to xsd:string.
+	// intRe matches signed integer literals. "0" and "-0" match; any other
+	// number with a leading zero (e.g. "0123") does NOT match and falls
+	// through to xsd:string. Leading-zero strings are typically identifiers
+	// (ZIP codes, version segments, padded IDs) that an XSD xs:int parser
+	// would silently corrupt.
 	intRe      = regexp.MustCompile(`^-?(0|[1-9]\d*)$`)
 	decimalRe  = regexp.MustCompile(`^-?\d+\.\d+$`)
 	dateRe     = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
@@ -46,10 +47,16 @@ var (
 
 // soapBodyInfo is the per-request extraction result. nil for failures.
 type soapBodyInfo struct {
-	// OpNamespace records the operation element's XML namespace URI.
-	// Captured for diagnostic use and merge propagation; not threaded into
-	// the emitted XSD because the schema's targetNamespace is URL-derived
-	// for consistency with the WSDL Messages wiring (architecture §11).
+	// OpNamespace records the namespace URI of the element whose contents this
+	// soapBodyInfo represents. At the top-level result of extractSOAPParameters,
+	// that element is the operation element. In nested Children subtrees built
+	// by walkParam, OpNamespace holds the parent parameter element's namespace,
+	// not the operation's — the field is "parent element namespace" in the
+	// general case; the operation-namespace reading is correct only at the
+	// outermost level.
+	// Captured for diagnostic use and merge propagation; not threaded into the
+	// emitted XSD because the schema's targetNamespace is URL-derived for
+	// consistency with the WSDL Messages wiring (architecture §11).
 	OpNamespace string
 	OrderedKeys []string
 	Params      map[string]*inferredParam
