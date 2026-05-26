@@ -410,3 +410,60 @@ func TestInferWSDL_BodyParametersUnion_SecondObservationEmpty(t *testing.T) {
 	assert.Equal(t, "id", el.ComplexType.Sequence[0].Name)
 	assert.Equal(t, "xsd:int", el.ComplexType.Sequence[0].Type)
 }
+
+// TEST-001: end-to-end InferWSDL when the SOAP body has an empty operation
+// element. Verifies the operation is still inferred (via SOAPAction or body
+// child name) and Types contains an element with an empty sequence.
+func TestInferWSDL_EmptyOperationElement(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{{
+		ObservedRequest: crawl.ObservedRequest{
+			Method:  "POST",
+			URL:     "http://example.com/svc",
+			Headers: map[string]string{"SOAPAction": `"urn:Ping"`},
+			Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+				`<soap:Body><tns:Ping xmlns:tns="http://example.com/svc/"/></soap:Body></soap:Envelope>`),
+		},
+	}}
+
+	defs, err := InferWSDL(endpoints)
+	require.NoError(t, err)
+	require.Len(t, defs.PortTypes[0].Operations, 1)
+	assert.Equal(t, "Ping", defs.PortTypes[0].Operations[0].Name)
+
+	// Types is populated even when the operation element has zero params —
+	// the operation element itself produces a complexType with an empty sequence.
+	require.NotNil(t, defs.Types)
+	require.Len(t, defs.Types.Schemas, 1)
+	require.Len(t, defs.Types.Schemas[0].Elements, 1)
+	require.NotNil(t, defs.Types.Schemas[0].Elements[0].ComplexType)
+	assert.Empty(t, defs.Types.Schemas[0].Elements[0].ComplexType.Sequence,
+		"empty operation element produces an empty parameter sequence")
+}
+
+// TEST-004: assert that the schema's targetNamespace is preserved from the
+// service URL through inferTargetNamespace and into the emitted XSD Schema —
+// the namespace identity declared in <element name="X"> is queryable.
+func TestInferWSDL_SchemaTargetNamespacePreserved(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{{
+		ObservedRequest: crawl.ObservedRequest{
+			Method:  "POST",
+			URL:     "http://api.example.com:8443/soap",
+			Headers: map[string]string{"SOAPAction": `"urn:GetUser"`},
+			Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+				`<soap:Body><tns:GetUserRequest xmlns:tns="http://different/ns/"><id>1</id></tns:GetUserRequest></soap:Body></soap:Envelope>`),
+		},
+	}}
+
+	defs, err := InferWSDL(endpoints)
+	require.NoError(t, err)
+	require.NotNil(t, defs.Types)
+	require.Len(t, defs.Types.Schemas, 1)
+
+	// Schema targetNamespace = URL-derived (matches Definitions.TargetNS),
+	// keeping tns: references consistent with Messages wiring. Architecture §11.
+	expected := "http://api.example.com:8443/"
+	assert.Equal(t, expected, defs.Types.Schemas[0].TargetNS,
+		"schema targetNamespace must match URL-derived target ns")
+	assert.Equal(t, expected, defs.TargetNS,
+		"definitions.targetNamespace must match for tns: consistency")
+}

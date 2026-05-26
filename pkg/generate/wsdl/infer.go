@@ -209,7 +209,10 @@ func extractNameFromURI(uri string) string {
 	return uri
 }
 
-// extractFirstBodyElement extracts the first child element name from within soap:Body.
+// extractFirstBodyElement extracts the first child element name from within
+// the SOAP Body. Matches Body by namespace URI (SOAP 1.1 or 1.2), not just
+// local name, to avoid treating an unrelated <Body> element (e.g., HTML
+// embedded in a SOAP fault detail) as the envelope's Body.
 func extractFirstBodyElement(body []byte) string {
 	decoder := xml.NewDecoder(bytes.NewReader(body))
 	inBody := false
@@ -219,13 +222,13 @@ func extractFirstBodyElement(body []byte) string {
 			return ""
 		}
 		if t, ok := tok.(xml.StartElement); ok {
-			local := t.Name.Local
-			if strings.EqualFold(local, "body") {
+			if strings.EqualFold(t.Name.Local, "body") &&
+				(t.Name.Space == soapNS11 || t.Name.Space == soapNS12) {
 				inBody = true
 				continue
 			}
 			if inBody {
-				return local
+				return t.Name.Local
 			}
 		}
 	}

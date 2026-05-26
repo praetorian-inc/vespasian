@@ -43,10 +43,17 @@ func TestInferTypeFromValue(t *testing.T) {
 		{"TRUE", "xsd:string", "TRUE not boolean"},
 		{"False", "xsd:string", "False not boolean"},
 
-		// Rule 5: integer
+		// Rule 5: integer (leading zeros excluded — likely identifiers/ZIP codes)
 		{"42", "xsd:int", "positive integer"},
 		{"-7", "xsd:int", "negative integer"},
 		{"0", "xsd:int", "zero"},
+		// Leading-zero strings fall through to xsd:string (ZIP codes, version
+		// segments, padded IDs) — guards against misclassifying identifiers
+		// that an xs:int parser would silently corrupt.
+		{"0123", "xsd:string", "leading-zero ZIP-like falls to string"},
+		{"02115", "xsd:string", "leading-zero numeric ZIP code"},
+		{"-007", "xsd:string", "leading-zero negative falls to string"},
+		{"1.2.3", "xsd:string", "version-like falls to string (multiple dots)"},
 
 		// Rule 6: decimal
 		{"3.14", "xsd:decimal", "positive decimal"},
@@ -101,6 +108,16 @@ func TestExtractSOAPParameters_EnvelopeDetection(t *testing.T) {
 		{
 			name:    "plain Body without envelope namespace → nil",
 			body:    `<Envelope><Body><Ping/></Body></Envelope>`,
+			wantNil: true,
+		},
+		{
+			name:    "well-formed envelope with no Body → nil",
+			body:    `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Header><Auth>x</Auth></soap:Header></soap:Envelope>`,
+			wantNil: true,
+		},
+		{
+			name:    "envelope with HTML-like body element (no SOAP ns) → nil",
+			body:    `<html><body><div>nope</div></body></html>`,
 			wantNil: true,
 		},
 		{
@@ -502,7 +519,7 @@ func TestResolveXSIType(t *testing.T) {
 		{"xs:boolean", "xsd:boolean", "xs prefix normalized to xsd"},
 		{"ns0:Custom", "tns:Custom", "unknown prefix becomes tns"},
 		{"boolean", "xsd:boolean", "no-colon prepends xsd"},
-		{"", "xsd:", "empty no-colon edge case"},
+		{"", "xsd:string", "empty falls back to xsd:string"},
 	}
 
 	for _, tt := range tests {

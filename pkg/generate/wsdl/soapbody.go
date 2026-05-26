@@ -33,8 +33,12 @@ const (
 
 // Package-level regexes compiled once to avoid per-call overhead.
 var (
-	boolRe     = regexp.MustCompile(`^(true|false)$`)
-	intRe      = regexp.MustCompile(`^-?\d+$`)
+	boolRe = regexp.MustCompile(`^(true|false)$`)
+	// intRe matches signed integers without leading zeros (except "0" itself
+	// and "-0"). Leading-zero strings like "0123" are typically identifiers
+	// (ZIP codes, version segments, padded IDs) and would be misinterpreted
+	// by an XSD xs:int parser, so they fall through to xsd:string.
+	intRe      = regexp.MustCompile(`^-?(0|[1-9]\d*)$`)
 	decimalRe  = regexp.MustCompile(`^-?\d+\.\d+$`)
 	dateRe     = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
 	datetimeRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$`)
@@ -187,7 +191,11 @@ func findXSIType(attrs []xml.Attr) string {
 // resolveXSIType maps an xsi:type value to an XSD type string.
 // Simple fallback: only "xsd" and "xs" prefixes map to XSD built-ins;
 // all other prefixes are treated as tns: user-defined types.
+// An empty value falls back to xsd:string (the rule-9 default).
 func resolveXSIType(value string) string {
+	if value == "" {
+		return "xsd:string"
+	}
 	idx := strings.Index(value, ":")
 	if idx < 0 {
 		return "xsd:" + value
