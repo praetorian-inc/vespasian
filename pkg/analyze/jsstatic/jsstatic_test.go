@@ -306,6 +306,19 @@ func TestAnalyze_BundlePanic_IncrementsBundlesSkipped(t *testing.T) {
 		t.Errorf("AnalyzeOnePanics = %d, want 0 (bundle panic is caught by extractWithTimeout, not safeAnalyzeOne)",
 			res.Stats.AnalyzeOnePanics)
 	}
+	// Cross-counter isolation: a bundle-path panic must NOT bleed into the
+	// sourcemap-path counters. Pre-QUAL-002 split, all three causes shared
+	// one counter; this assertion pins the new isolation contract.
+	if res.Stats.SourcemapSourcePanics != 0 {
+		t.Errorf("SourcemapSourcePanics = %d, want 0 (bundle panic must not increment sourcemap-path counter)",
+			res.Stats.SourcemapSourcePanics)
+	}
+	if res.Stats.SourcemapSourceTimeouts != 0 {
+		t.Errorf("SourcemapSourceTimeouts = %d, want 0", res.Stats.SourcemapSourceTimeouts)
+	}
+	if res.Stats.SourcemapSourcesOversized != 0 {
+		t.Errorf("SourcemapSourcesOversized = %d, want 0", res.Stats.SourcemapSourcesOversized)
+	}
 	// Output preserves the original captured entry — no synthesized requests
 	// because extraction never returned a successful result.
 	if len(res.Requests) != len(captured) {

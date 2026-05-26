@@ -743,12 +743,22 @@ func augmentWithStaticForms(requests []crawl.ObservedRequest) []crawl.ObservedRe
 // order: static-HTML forms first, then JS-bundle static analysis. Both
 // ScanCmd.Run and GenerateCmd.Run call this helper rather than open-coding the
 // two stage calls — the shared helper pins the order contract so a regression
-// in one command cannot silently re-emerge in the other. CrawlCmd does NOT
-// call this; its output is raw capture.json that augmentation is applied to
-// downstream at generate time. The order matters for downstream determinism:
-// static:html entries appear before static:js entries in the result, so
-// classify.Deduplicate first-write-wins keeps the form-derived signals when
-// they collide with bundle-derived ones on the same endpoint key.
+// in one command cannot silently re-emerge in the other.
+//
+// CrawlCmd does NOT call this helper. CrawlCmd already runs the JS-bundle
+// stage (runJSAnalysisStage) inline before writing capture.json, so the
+// produced capture already carries static:js entries; the HTML-form stage is
+// deferred until generate time. The split is intentional: form extraction
+// runs on a freshly-loaded capture (where classify needs the synthetic
+// entries) but JS analysis is cheap to do once at crawl time so capture.json
+// readers don't need to repeat it. Callers consuming capture.json should
+// still call augmentWithStaticForms before classification, which is exactly
+// what GenerateCmd.Run does via augmentAll.
+//
+// The order matters for downstream determinism: static:html entries appear
+// before static:js entries in the result, so classify.Deduplicate
+// first-write-wins keeps the form-derived signals when they collide with
+// bundle-derived ones on the same endpoint key.
 func augmentAll(ctx context.Context, requests []crawl.ObservedRequest, js jsAnalysisArgs) []crawl.ObservedRequest {
 	requests = augmentWithStaticForms(requests)
 	requests = runJSAnalysisStage(ctx, requests, js)
@@ -756,9 +766,10 @@ func augmentAll(ctx context.Context, requests []crawl.ObservedRequest, js jsAnal
 }
 
 // generateSpec runs the classify → probe → generate pipeline. It trusts its
-// caller to have already augmented requests with static-HTML form observations
-// (both ScanCmd and GenerateCmd call augmentWithStaticForms before invoking
-// this function).
+// caller to have already augmented requests with static-HTML form
+// observations AND JS-bundle static analysis — both ScanCmd and GenerateCmd
+// call augmentAll (which performs both stages in order) before invoking this
+// function.
 func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts generateSpecOptions) ([]byte, error) {
 	classifiers := classifiersForType(opts.APIType)
 	if classifiers == nil {

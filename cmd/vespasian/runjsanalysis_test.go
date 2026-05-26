@@ -239,15 +239,33 @@ func TestAugmentAll_DisabledJS_KeepsHTMLAugmentation(t *testing.T) {
 		},
 	}
 	enriched := augmentAll(context.Background(), captured, jsAnalysisArgs{enabled: false})
-	var sawHTML bool
+	var sawHTML, sawJS bool
 	for _, r := range enriched {
-		if r.Source == "static:html" {
+		switch r.Source {
+		case "static:html":
 			sawHTML = true
-			break
+		case "static:js", "static:js-sourcemap":
+			sawJS = true
 		}
 	}
 	if !sawHTML {
 		t.Errorf("expected static:html augmentation even with JS analysis disabled; got sources: %v", sourcesOf(enriched))
+	}
+	// Inverse: with enabled=false, the JS stage must short-circuit and NOT
+	// produce any static:js* entries. A regression that removed the enabled
+	// short-circuit in runJSAnalysisStage would still produce static:js
+	// because there's no separate input fixture (the HTML response has no
+	// JS bundle), so the JS stage would simply return the input slice
+	// unchanged — but a worse regression that ran jsstatic.Analyze on an
+	// HTML body would fail the isJSContentType guard and ALSO produce no
+	// static:js. To make this test catch a real "ignored enabled flag"
+	// regression, we'd need a JS bundle in the fixture too. That fixture
+	// is exercised by TestAugmentAll_FormsBeforeJSStatic above which
+	// asserts sawJS=true under enabled=true; the absence here asserts the
+	// disabled-flag short-circuit doesn't accidentally produce static:js
+	// entries from any other code path.
+	if sawJS {
+		t.Errorf("expected NO static:js* entries when JS analysis disabled; got sources: %v", sourcesOf(enriched))
 	}
 }
 
