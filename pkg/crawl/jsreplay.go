@@ -449,8 +449,12 @@ const maxConcatChainOperands = 16
 //
 // 1024 bytes is comfortably larger than any realistic URL-construction
 // chain and small enough to bound aggregate worst-case parser work at
-// O(M * maxConcatChainOperands * maxConcatChainSpan) =
-// O(M * 16 * 1024) bytes across all M chain matches in a 10MiB body.
+// O(M * maxConcatChainSpan) = O(M * 1024) bytes across all M chain
+// matches in a 10MiB body. The maxConcatChainOperands cap does NOT
+// multiply the span — all operand walks in a single parsePlusChain
+// invocation share the same clamped slice and `pos` advances
+// monotonically within it, so per-invocation work is bounded by the
+// slice length, not by operand count.
 const maxConcatChainSpan = 1024
 
 // maxConcatArgList is the maximum size of the raw argument list
@@ -960,9 +964,9 @@ func reconstructTemplateLiteral(segment []byte) (string, bool) {
 	return candidate, true
 }
 
-// extractConcatPaths scans for API paths built by JS string concatenation
-// involving at least one non-literal operand (identifier, expression, ...).
-// Two forms are recognized:
+// extractConcatPaths scans for API paths built by JS string concatenation —
+// either a String.prototype.concat call or a `+`-operator chain — including
+// chains where every operand is a string literal. Two forms are recognized:
 //
 //  1. String.prototype.concat method form:
 //     "/api/posts/".concat(id, "/comment") -> /api/posts/0/comment
@@ -984,6 +988,26 @@ func extractConcatPaths(jsBody []byte) []string {
 	var paths []string
 
 	emit := func(p string) {
+		// Collapse `//` runs introduced by literal+literal concatenations
+		// where the head literal ends in `/` and the next literal begins
+		// with `/` (e.g. `"/api/posts/" + "/comment"` → `"/api/posts//comment"`).
+		// addPath downstream only trims leading/trailing slashes, not
+		// internal runs, and the REST normalizer treats `//{id}` as a
+		// distinct (malformed) path segment.
+		//
+		// Preserve the `://` scheme separator in full URLs: collapse only
+		// the path-side of the URL (or the whole string if no scheme is
+		// present). Looping until stable handles rare ≥3-slash runs.
+		if scheme, rest, hasScheme := strings.Cut(p, "://"); hasScheme {
+			for strings.Contains(rest, "//") {
+				rest = strings.ReplaceAll(rest, "//", "/")
+			}
+			p = scheme + "://" + rest
+		} else {
+			for strings.Contains(p, "//") {
+				p = strings.ReplaceAll(p, "//", "/")
+			}
+		}
 		if p == "" || !hasAPIIndicator(p) {
 			return
 		}
@@ -1067,11 +1091,19 @@ func findConcatArgListEnd(jsBody []byte, start int) int { //nolint:gocyclo // sm
 	if limit > len(jsBody) {
 		limit = len(jsBody)
 	}
+	// Clamp the slice handed to per-byte helpers so any string-literal scan
+	// (including backtick template literals routed through
+	// findTemplateLiteralEnd, which has no newline termination) is
+	// physically bounded at `limit`. Mirrors the slice-clamp pattern used
+	// by parsePlusChain — without this, a backtick opening near `limit`
+	// could force scanStringLiteral to walk megabytes looking for the
+	// matching backtick.
+	body := jsBody[:limit]
 	for i := start; i < limit; i++ {
-		c := jsBody[i]
+		c := body[i]
 		switch c {
 		case '"', '\'', '`':
-			end := scanStringLiteral(jsBody, i)
+			end := scanStringLiteral(body, i)
 			if end < 0 {
 				return -1
 			}

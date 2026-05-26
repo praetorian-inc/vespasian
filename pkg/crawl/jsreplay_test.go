@@ -373,22 +373,32 @@ func TestExtractConcatPaths(t *testing.T) {
 			want: nil,
 		},
 		{
-			name: "plus chain capped at maxConcatChainOperands",
-			js: `var u = "/api/posts/" + a + "/" + b + "/" + c + "/" + d + "/" +
-				e + "/" + f + "/" + g + "/" + h + "/" + i + "/" + j + "/" +
-				k + "/" + l + "/" + m + "/" + n + "/end";`,
-			// 16 operands consumed before bail; reconstruction is bounded but
-			// the exact tail is implementation-defined. We assert prefix-only.
-			want: nil, // see prefix assertion in dedicated test below
+			// LAB-1368 iteration-4 regression: literal+literal +-chain where
+			// the head literal ends in `/` and the next literal begins with
+			// `/`. emit() must collapse the `//` so probes don't issue
+			// malformed `/api/posts//comment` requests and the REST
+			// normalizer doesn't produce `//{postId}` segments.
+			name: "double-slash from literal+literal +-chain is collapsed in emit",
+			js:   `fetch("/api/posts/" + "/comment");`,
+			want: []string{"/api/posts/comment"},
 		},
+		{
+			// Confirm the collapse preserves the `://` scheme separator.
+			// A receiver containing https:// must not have its scheme
+			// flattened to `https:/`.
+			name: "double-slash collapse preserves URL scheme separator",
+			js:   `fetch("https://api.example.com/api/posts/".concat("/x"));`,
+			want: []string{"https://api.example.com/api/posts/x"},
+		},
+		// Note: the operand-count cap is exercised in its own dedicated
+		// test, TestExtractConcatPaths_PlusChainCap, which pins the
+		// constant by name. A skip-shim row used to live here as a
+		// placeholder; it was removed in iteration-4 since the dedicated
+		// test is the canonical lock.
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.want == nil && strings.Contains(tt.name, "capped") {
-				// Asserted in TestExtractConcatPaths_PlusChainCap.
-				return
-			}
 			got := extractConcatPaths([]byte(tt.js))
 			sort.Strings(got)
 			sort.Strings(tt.want)
@@ -555,72 +565,58 @@ func TestParsePlusChain(t *testing.T) {
 }
 
 // TestParsePlusChain_BoundaryPin proves the byte-span cap is enforced by
-// SLICE CLAMP, not by a per-iteration `> maxConcatChainSpan` comparison.
-// If a future change reintroduces a per-iteration `>` (off-by-one) guard
-// alongside the clamp, this test still passes — but if the slice clamp is
-// removed, the very-long first-operand input would produce a NON-EMPTY
-// suffix that includes /tail bytes (which we then assert against to lock
-// the behavior in).
+// SLICE CLAMP at the parsePlusChain entry point. The test input uses a
+// CLOSED bracket `(aaa...a)` whose matching `)` sits PAST the clamp; the
+// bracket is followed by `+ "/tail"` — a literal that the parser would
+// recover into the suffix if (and only if) the scan was permitted to
+// walk past the clamp to find the `)`.
+//
+// Mutation check: comment out the `body := jsBody[:limit]` line in
+// parsePlusChain and re-run. Without the clamp, scanIdentifierOperand
+// walks past the matching `)`, hits the `+` after it, the chain
+// continues, and `/tail` is recovered → assertion fails. This is what
+// the iteration-3 test was missing (it used an UNCLOSED bracket, where
+// scanIdentifierOperand walks to EOF either way and the test passes
+// trivially with or without the clamp).
 func TestParsePlusChain_BoundaryPin(t *testing.T) {
-	// First operand: open paren + (span-1) filler bytes — there is NO
-	// matching close paren anywhere in the input. Without the slice clamp,
-	// scanIdentifierOperand would walk past the clamp and reach the
-	// trailing `+ "/tail"`. With the slice clamp, the working slice
-	// physically cannot contain "/tail", so the suffix is just the sentinel.
-	src := " (" + strings.Repeat("a", maxConcatChainSpan) + ` + "/tail";`
+	// Bracket length: maxConcatChainSpan+100 bytes; `(` at position 1 and
+	// `)` at position span+101 (well past the clamp at position span).
+	// Followed by ` + "/tail";`. Total src length ~ span+114 bytes.
+	src := " (" + strings.Repeat("a", maxConcatChainSpan+100) + `) + "/tail";`
 	got := parsePlusChain([]byte(src), 0)
 
-	// Result must NOT contain "/tail" — that would mean the slice clamp
-	// failed and scanIdentifierOperand walked past the budget.
-	assert.NotContains(t, got, "/tail",
-		"byte-span clamp failed: parsePlusChain reached past maxConcatChainSpan and recovered the trailing literal")
-	// And the result must be the sentinel produced by the truncated
-	// first-operand walk.
-	assert.Equal(t, concatPathSentinel, got)
+	// With clamp: scan stops at slice end (inside bracket) → sentinel only.
+	// Without clamp: scan walks past `)`, consumes `+`, reads `"/tail"` →
+	// suffix is "0/tail".
+	assert.Equal(t, concatPathSentinel, got,
+		"slice-clamp regression: removing `body := jsBody[:limit]` lets the "+
+			"chain walk past the bracket boundary and recover /tail")
 }
 
-// TestExtractConcatPaths_HugeFirstOperand is the integration-level regression
-// test for the iteration-3 SEC-BE fix. A hostile JS bundle of size N can
-// contain many concatPlusHeadPattern matches whose first operand opens a
-// bracket and never closes. Before the fix, each match's parsePlusChain
-// invocation walked O(N) bytes (matching close-bracket search), giving
-// aggregate O(N*M) parser work where M is the match count. After the fix,
-// per-match work is bounded at O(maxConcatChainSpan).
+// TestExtractConcatPaths_FirstOperandBoundedAtChainSpan is the
+// integration-level regression test for the slice clamp. Same
+// closed-bracket-past-clamp pattern as the BoundaryPin test above, but
+// going through the full extractConcatPaths entry point so the assertion
+// also covers the head-literal + parsePlusChain wiring + emit() filter.
 //
-// We assert end-to-end that extractConcatPaths completes "fast" by sizing
-// the body at 256KB and the match count at 256 — enough that the unbounded
-// behavior would take ~seconds, but the bounded behavior completes in
-// milliseconds. A 1-second wall-clock budget gives ~1000x headroom.
-func TestExtractConcatPaths_HugeFirstOperand(t *testing.T) {
-	// 256 occurrences of `"/api/"+(` followed by 1KB of `a`s — every
-	// match has the same unclosed-bracket shape. Body size ~256 * 1KB =
-	// 256KB, well under the 10MiB maxJSBodySize cap.
-	const matches = 256
-	const fillerPerMatch = 1024
-	var sb strings.Builder
-	for i := 0; i < matches; i++ {
-		sb.WriteString(`"/api/" + (`)
-		sb.WriteString(strings.Repeat("a", fillerPerMatch))
-		sb.WriteString(" \n")
-	}
+// Mutation check: remove the slice clamp from parsePlusChain and re-run.
+// Without the clamp, the suffix recovers "/tail" and the emitted path
+// changes from "/api/users/0" to "/api/users/0/tail" → assertion fails.
+//
+// Renamed from TestExtractConcatPaths_HugeFirstOperand (which used a
+// wall-clock budget too generous to catch the regression, per iteration-4
+// review feedback). The behavioral assertion here is strictly tighter
+// and CI-portable.
+func TestExtractConcatPaths_FirstOperandBoundedAtChainSpan(t *testing.T) {
+	// Closed bracket overflowing the clamp, followed by `+ "/tail"`.
+	bracket := "(" + strings.Repeat("a", maxConcatChainSpan+100) + ")"
+	src := `"/api/users/" + ` + bracket + ` + "/tail";`
 
-	deadline := time.Now().Add(time.Second)
-	got := extractConcatPaths([]byte(sb.String()))
-	elapsed := time.Since(deadline.Add(-time.Second))
+	got := extractConcatPaths([]byte(src))
 
-	// Behavior assertion: each match reconstructs to /api/<sentinel>;
-	// the seen-map in emit() deduplicates so we get at most one path.
-	assert.LessOrEqual(t, len(got), 1, "expected dedup to collapse %d identical matches into ≤1 path", matches)
-	if len(got) == 1 {
-		assert.Equal(t, "/api/"+concatPathSentinel, got[0])
-	}
-
-	// Performance assertion: the bounded fix keeps total work in the
-	// millisecond range. The unbounded behavior would walk ~256 * 256KB =
-	// 64MB of bytes per match (since each operand walks to EOF), making
-	// this loop take seconds.
-	assert.Less(t, elapsed, time.Second,
-		"extractConcatPaths exceeded 1s wall-clock on a 256KB bundle — slice clamp may be missing")
+	assert.Equal(t, []string{"/api/users/" + concatPathSentinel}, got,
+		"slice-clamp regression: extractConcatPaths recovered the literal "+
+			"after the bracket — the per-operand scan walked past the clamp")
 }
 
 // TestExtractConcatPaths_FlowsThroughExtractAPIPaths verifies the new
