@@ -426,10 +426,23 @@ const concatPathSentinel = "0"
 // noise in unrelated expressions and stopping limits worst-case work.
 const maxConcatChainOperands = 16
 
-// maxConcatArgList is the maximum size of the raw argument list passed to
-// parseConcatArgs. Mirrors the {0,500} cap baked into concatMethodPattern;
-// kept as a named constant for documentation and to keep both call sites
-// agreeing on the bound.
+// maxConcatChainSpan bounds the total byte span parsePlusChain will walk
+// from the start of the chain. A hostile JS bundle can place a few-byte
+// `"/api/" + ` anchor in front of a megabytes-long bracketed sub-expression
+// whose operand-terminators (`+`, `;`, `,`, newline, `)`) only appear near
+// the end of the bundle; without this cap, scanIdentifierOperand would walk
+// the whole span per match. 1024 bytes is comfortably larger than any
+// realistic URL-construction chain and small enough to bound aggregate
+// O(N*16*1024) work across all chain matches in a 10MiB body.
+const maxConcatChainSpan = 1024
+
+// maxConcatArgList is the maximum size of the raw argument list
+// findConcatArgListEnd will scan inside a `.concat(...)` call. Bounds the
+// per-call work of the paren-aware scan against pathological bundles that
+// pack many nested brackets or long quoted strings into one argument list.
+// 500 bytes is comfortably wider than any real argument list (the LAB-1368
+// extractor only cares about literal segments and identifier-shaped
+// operands, which together fit well under that cap).
 const maxConcatArgList = 500
 
 // apiIndicatorPattern matches the path segments that signal an API endpoint.
@@ -1170,13 +1183,20 @@ func stringLiteralValue(s string) (string, bool) {
 // substituting concatPathSentinel for any other operand. Returns the
 // reconstructed suffix.
 //
-// Walks at most maxConcatChainOperands operands; bails immediately on a
-// malformed operand, a missing connecting `+`, or any unexpected
-// character. Trailing whitespace and the final operand are tolerated.
+// Walks at most maxConcatChainOperands operands AND at most
+// maxConcatChainSpan bytes from start; bails immediately on a malformed
+// operand, a missing connecting `+`, or any unexpected character. The
+// byte-span cap prevents a hostile bundle from amplifying parser work by
+// placing a `"/api/"+` anchor in front of an arbitrarily long bracketed
+// expression whose operand-terminators only appear near end-of-file.
+// Trailing whitespace and the final operand are tolerated.
 func parsePlusChain(jsBody []byte, start int) string {
 	var b strings.Builder
 	pos := start
 	for op := 0; op < maxConcatChainOperands; op++ {
+		if pos-start > maxConcatChainSpan {
+			return b.String()
+		}
 		pos = skipPlusChainWhitespace(jsBody, pos)
 		if pos >= len(jsBody) {
 			return b.String()
@@ -1419,10 +1439,12 @@ func extractAPIPaths(jsBody []byte, requests []ObservedRequest) []string { //nol
 		}
 	}
 
-	// Strategy 4: String.prototype.concat() and +-chain with identifiers
+	// Strategy 5: String.prototype.concat() and +-chain with identifiers
 	// (LAB-1368). Reconstructed paths use a numeric sentinel for non-literal
 	// operands so the REST normalizer can parameterize them. Run last so the
 	// more-precise strategies above win the dedup race when both match.
+	// (Strategy 4 — literal+literal service-prefix concatenation — runs
+	// implicitly above via extractServicePrefixes + addPath fan-out.)
 	for _, p := range extractConcatPaths(jsBody) {
 		addPath(p)
 	}

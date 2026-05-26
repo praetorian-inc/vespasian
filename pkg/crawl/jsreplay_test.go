@@ -398,17 +398,119 @@ func TestExtractConcatPaths(t *testing.T) {
 }
 
 // TestExtractConcatPaths_PlusChainCap asserts that a `+`-chain longer than
-// maxConcatChainOperands is bounded (we walk a prefix and stop) rather than
-// blowing past the cap or panicking.
+// maxConcatChainOperands is bounded — we walk EXACTLY maxConcatChainOperands
+// operands and stop, regardless of how many `+` segments the bundle contains.
+//
+// The chain length and the expected sentinel count are derived from
+// maxConcatChainOperands by name so the test re-pins automatically if the
+// constant is tuned. Operand count > maxConcatChainOperands forces the cap
+// to be exercised (we cannot prove the cap fired by asserting on the
+// prefix alone — an off-by-one regression or a relaxed cap would still
+// produce a "/api/posts/0/..." prefix).
 func TestExtractConcatPaths_PlusChainCap(t *testing.T) {
-	js := `var u = "/api/posts/" + a + "/" + b + "/" + c + "/" + d + "/" +
-		e + "/" + f + "/" + g + "/" + h + "/" + i + "/" + j + "/" +
-		k + "/" + l + "/" + m + "/" + n + "/end";`
+	// Build a `+`-chain with twice as many identifier operands as the cap
+	// allows. Each operand is a single-character identifier so it produces
+	// exactly one sentinel byte and total span stays well under
+	// maxConcatChainSpan — this isolates the operand-count cap from the
+	// byte-span cap (which is exercised separately by TestParsePlusChain).
+	operands := maxConcatChainOperands * 2
+	var sb strings.Builder
+	sb.WriteString(`var u = "/api/posts/"`)
+	for i := 0; i < operands; i++ {
+		sb.WriteString(` + x`)
+	}
+	sb.WriteString(`;`)
 
-	got := extractConcatPaths([]byte(js))
+	got := extractConcatPaths([]byte(sb.String()))
 	assert.Len(t, got, 1, "should still emit one bounded path")
-	assert.True(t, strings.HasPrefix(got[0], "/api/posts/0/0/"),
-		"prefix should be reconstructed, got %q", got[0])
+
+	// With only identifier operands, every walked operand contributes
+	// exactly one sentinel byte. After the head literal "/api/posts/" and
+	// trailing-slash trim by addPath, the reconstructed path is
+	//   /api/posts/ + concatPathSentinel * maxConcatChainOperands
+	// regardless of how many extra `+ x` segments the bundle contained.
+	want := "/api/posts/" + strings.Repeat(concatPathSentinel, maxConcatChainOperands)
+	assert.Equal(t, want, got[0],
+		"cap should have stopped the walk at exactly maxConcatChainOperands operands")
+}
+
+// TestParsePlusChain exercises parsePlusChain directly across every
+// termination branch + the new byte-span cap. parsePlusChain is reached
+// only via the package-level extractConcatPaths path in production, but
+// each termination mode is worth pinning so a future change to the loop
+// shape cannot silently shrink the recovered suffix.
+func TestParsePlusChain(t *testing.T) {
+	tests := []struct {
+		name string
+		// input format: caller passes the byte index *after* the head
+		// literal + first `+`; we set start to the position right after
+		// the leading `<HEAD> +` (mimicking the extractConcatPaths call site).
+		src   string
+		start int
+		want  string
+	}{
+		{
+			name:  "happy path: ident + literal",
+			src:   ` x + "/end";`,
+			start: 0,
+			want:  "0/end",
+		},
+		{
+			name:  "trailing + at EOF bails on next operand",
+			src:   ` x +`,
+			start: 0,
+			want:  "0",
+		},
+		{
+			name:  "missing connecting + after first operand",
+			src:   ` x ; rest`,
+			start: 0,
+			want:  "0",
+		},
+		{
+			name:  "malformed operand at start returns empty",
+			src:   ` ; ; ;`,
+			start: 0,
+			want:  "",
+		},
+		{
+			name:  "EOF after head + (start past end of buffer)",
+			src:   ``,
+			start: 0,
+			want:  "",
+		},
+		{
+			name: "operand-count cap hits at maxConcatChainOperands",
+			// build operands = cap + 1 so we know the cap is hit
+			src: func() string {
+				var sb strings.Builder
+				for i := 0; i <= maxConcatChainOperands; i++ {
+					sb.WriteString(` x +`)
+				}
+				return sb.String()
+			}(),
+			start: 0,
+			want:  strings.Repeat("0", maxConcatChainOperands),
+		},
+		{
+			name: "byte-span cap fires before operand-count cap on huge first operand",
+			// first operand is a deeply nested bracket expression longer
+			// than maxConcatChainSpan; scanIdentifierOperand will walk it
+			// and parsePlusChain must bail before continuing.
+			src:   " (" + strings.Repeat("a", maxConcatChainSpan+200) + ") + \"/tail\";",
+			start: 0,
+			// First operand is identifier-shaped → sentinel; then we
+			// re-enter the loop and the byte-span guard fires before we
+			// can read "/tail". Result: just the sentinel.
+			want: "0",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parsePlusChain([]byte(tt.src), tt.start)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 // TestExtractConcatPaths_FlowsThroughExtractAPIPaths verifies the new
