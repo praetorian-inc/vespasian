@@ -127,19 +127,29 @@ type Stats struct {
 	SourcemapFetchFails int // sourceMappingURL comments seen but fetch failed.
 	EndpointsFound      int // endpoints emitted by ExtractFromBundle, before MaxEndpointsPerBundle cap and toRequests synthesis.
 	EndpointsKept       int // endpoints that survived the cap and synthesis and made it into Requests.
-	// SourcemapSourceTimeouts counts individual sourcemap source extractions
-	// that were skipped. Increments on per-source PerBundleTimeout, on a
-	// goroutine panic recovered during extraction, AND when an individual
-	// sourcesContent string exceeds MaxBundleSize (an oversize is treated as
-	// "this source would have to be skipped anyway"). Despite the name,
-	// "timeouts" here means "skipped extractions" — readers that need to
-	// distinguish causes should inspect the logger output, which records the
-	// reason for every increment.
+	// SourcemapSourceTimeouts counts sourcemap source extractions that hit
+	// PerBundleTimeout. Each increment corresponds to a "parse timeout"
+	// logger.Warn record. Sourcemap sources skipped for OTHER reasons
+	// (oversized, panic) get their own counters below.
 	SourcemapSourceTimeouts int
+	// SourcemapSourcesOversized counts sourcemap source entries skipped
+	// because their sourcesContent string is larger than Options.MaxBundleSize.
+	// Such sources are never handed to jsluice.
+	SourcemapSourcesOversized int
+	// SourcemapSourcePanics counts sourcemap source extractions where the
+	// goroutine recovered a panic (typically from jsluice on malformed input).
+	// Each increment corresponds to a "jsluice panic" logger.Error record.
+	SourcemapSourcePanics int
 	// BundlesAbandonedOnCancel counts bundles that were still in workCh when
 	// Analyze observed ctx cancellation. They are not analyzed and not counted
 	// in BundlesAnalyzed or BundlesSkipped. Always 0 on a clean run.
 	BundlesAbandonedOnCancel int
+	// AnalyzeOnePanics counts cases where a worker recovered a panic from
+	// inside analyzeOne (i.e. NOT inside the per-extraction goroutine, but
+	// elsewhere in the bundle pipeline). Always 0 on a clean run. Surfacing
+	// this prevents a panic in toRequests / synthesize / accounting code from
+	// silently understating bundle counts.
+	AnalyzeOnePanics int
 }
 
 // ExtractedEndpoint is the analyser's intermediate representation. It is the
@@ -170,40 +180,85 @@ func isJSContentType(ct string) bool {
 		lower == "application/x-js"
 }
 
+// extractStatus is the outcome of one extractWithTimeout call. extractOK means
+// jsluice returned (possibly with an error that was logged); extractTimeout
+// means PerBundleTimeout fired before jsluice returned; extractPanic means the
+// extraction goroutine panicked and was recovered.
+type extractStatus int
+
+const (
+	extractOK extractStatus = iota
+	extractTimeout
+	extractPanic
+)
+
 // extractWithTimeout runs ExtractFromBundle in a goroutine with a per-source
-// PerBundleTimeout and panic recovery. Returns (endpoints, timedOut). On a
-// recovered panic the goroutine logs and treats the result as empty. The kind
-// argument ("bundle" or "sourcemap-source") tags log records so an operator
-// reading logs can tell which extraction phase produced an event.
-func extractWithTimeout(ctx context.Context, source []byte, sourceURL, kind string, opts Options) ([]ExtractedEndpoint, bool) {
-	ch := make(chan []ExtractedEndpoint, 1)
+// PerBundleTimeout, panic recovery, and a status signal so the caller can
+// account for each outcome separately. The kind argument ("bundle" or
+// "sourcemap-source") tags log records so an operator reading logs can tell
+// which extraction phase produced an event.
+//
+// Goroutine-leak bound on extractTimeout: when PerBundleTimeout fires, the
+// orchestrator returns and the goroutine keeps running until jsluice finishes
+// (jsluice is not context-aware). The channel is buffered to capacity 1 so the
+// late send never blocks and the goroutine exits when ExtractFromBundle returns.
+// Worst-case in-flight goroutines per Analyze call: Concurrency × 2 (one
+// bundle extraction + one sourcemap-source extraction per worker). If jsluice's
+// underlying tree-sitter parser ever genuinely deadlocks on adversarial input,
+// the goroutine would remain blocked indefinitely — pkg/probe-style process
+// isolation would be the fix, intentionally out of scope here.
+func extractWithTimeout(ctx context.Context, source []byte, sourceURL, kind string, opts Options) (eps []ExtractedEndpoint, status extractStatus) {
+	type result struct {
+		eps      []ExtractedEndpoint
+		panicked bool
+	}
+	ch := make(chan result, 1)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
 				opts.Logger.Error("jsluice panic", "kind", kind, "source", sourceURL, "panic", r)
-				ch <- nil
+				ch <- result{nil, true}
 			}
 		}()
 		eps, err := ExtractFromBundle(source, sourceURL)
 		if err != nil {
 			opts.Logger.Warn("extract error", "kind", kind, "source", sourceURL, "err", err)
 		}
-		ch <- eps
+		ch <- result{eps, false}
 	}()
 	timeoutCtx, cancel := context.WithTimeout(ctx, opts.PerBundleTimeout)
 	defer cancel()
 	select {
-	case eps := <-ch:
-		return eps, false
+	case r := <-ch:
+		if r.panicked {
+			return nil, extractPanic
+		}
+		return r.eps, extractOK
 	case <-timeoutCtx.Done():
 		opts.Logger.Warn("parse timeout", "kind", kind, "source", sourceURL)
-		return nil, true
+		return nil, extractTimeout
 	}
 }
 
 // analyzeOne analyzes a single captured JS bundle. It runs sourcemap recovery
 // and extractor extraction, then synthesizes requests. The function is safe to
 // call from goroutines; it has no shared mutable state.
+// safeAnalyzeOne wraps analyzeOne with a recover() so that a panic outside the
+// per-extraction goroutines (e.g. in toRequests, normalize, or the accounting
+// logic) cannot leave the worker pool's resultCh without a value. Without this
+// shield, a panic in analyzeOne would unwind through the worker goroutine and
+// the orchestrator's workerProcessed count would understate the actual bundle
+// count, masking the bug as a context-cancel partial result.
+func safeAnalyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) (result perBundleResult) {
+	defer func() {
+		if r := recover(); r != nil {
+			opts.Logger.Error("analyzeOne panic", "bundle", req.URL, "panic", r)
+			result = perBundleResult{stats: Stats{AnalyzeOnePanics: 1}}
+		}
+	}()
+	return analyzeOne(ctx, req, opts)
+}
+
 func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) perBundleResult {
 	var result perBundleResult
 	body := req.Response.Body
@@ -214,14 +269,21 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	result.stats.SourcemapsRecovered += smStats.SourcemapsRecovered
 
 	// Extract endpoints from the bundle body with per-bundle timeout.
-	bundleEps, timedOut := extractWithTimeout(ctx, body, req.URL, "bundle", opts)
-	if timedOut {
+	bundleEps, status := extractWithTimeout(ctx, body, req.URL, "bundle", opts)
+	if status != extractOK {
+		// Timeout OR panic: skip this bundle. The bundle pipeline does not
+		// distinguish timeout vs panic at the BundlesSkipped granularity;
+		// the logger.Warn / Error record carries the cause.
 		result.stats.BundlesSkipped++
 		return result
 	}
 
 	result.stats.BundlesAnalyzed++
 	result.stats.EndpointsFound += len(bundleEps)
+	// MaxEndpointsPerBundle caps the TOTAL endpoints we keep from one
+	// bundle, counting both the bundle body and any recovered sourcemap
+	// sources. The cap is applied first to the bundle body and then
+	// re-evaluated as remaining-budget on each sourcemap source below.
 	if len(bundleEps) > opts.MaxEndpointsPerBundle {
 		bundleEps = bundleEps[:opts.MaxEndpointsPerBundle]
 	}
@@ -235,17 +297,32 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	// Process each recovered sourcemap source. Each uses the same timeout +
 	// recover pattern; oversized sources are skipped without extraction.
 	for _, src := range smSources {
+		// Budget check: once the cap is hit, stop processing further
+		// sourcemap sources for this bundle entirely. Without this, one
+		// pathological sourcemap could push the bundle's total kept
+		// endpoints far past MaxEndpointsPerBundle (CodeRabbit CR-1).
+		remaining := opts.MaxEndpointsPerBundle - result.stats.EndpointsKept
+		if remaining <= 0 {
+			break
+		}
 		if len(src) > opts.MaxBundleSize {
-			result.stats.SourcemapSourceTimeouts++
+			result.stats.SourcemapSourcesOversized++
 			opts.Logger.Warn("sourcemap source oversized, skipping", "bundle", req.URL, "size", len(src))
 			continue
 		}
-		smEps, timedOut := extractWithTimeout(ctx, []byte(src), req.URL, "sourcemap-source", opts)
-		if timedOut {
+		smEps, status := extractWithTimeout(ctx, []byte(src), req.URL, "sourcemap-source", opts)
+		switch status {
+		case extractTimeout:
 			result.stats.SourcemapSourceTimeouts++
+			continue
+		case extractPanic:
+			result.stats.SourcemapSourcePanics++
 			continue
 		}
 		result.stats.EndpointsFound += len(smEps)
+		if len(smEps) > remaining {
+			smEps = smEps[:remaining]
+		}
 		for i := range smEps {
 			smEps[i].SourceTag = SourceSourcemap
 		}
@@ -320,8 +397,7 @@ func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options
 					return
 				default:
 				}
-				r := analyzeOne(ctx, req, opts)
-				resultCh <- r
+				resultCh <- safeAnalyzeOne(ctx, req, opts)
 			}
 		}()
 	}
@@ -348,10 +424,13 @@ func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options
 		stats.SourcemapsRecovered += r.stats.SourcemapsRecovered
 		stats.SourcemapFetchFails += r.stats.SourcemapFetchFails
 		stats.SourcemapSourceTimeouts += r.stats.SourcemapSourceTimeouts
+		stats.SourcemapSourcesOversized += r.stats.SourcemapSourcesOversized
+		stats.SourcemapSourcePanics += r.stats.SourcemapSourcePanics
+		stats.AnalyzeOnePanics += r.stats.AnalyzeOnePanics
 		stats.EndpointsFound += r.stats.EndpointsFound
 		stats.EndpointsKept += r.stats.EndpointsKept
 		synthesized = append(synthesized, r.requests...)
-		workerProcessed += r.stats.BundlesAnalyzed + r.stats.BundlesSkipped
+		workerProcessed += r.stats.BundlesAnalyzed + r.stats.BundlesSkipped + r.stats.AnalyzeOnePanics
 	}
 	if abandoned := len(bundles) - workerProcessed; abandoned > 0 {
 		stats.BundlesAbandonedOnCancel = abandoned

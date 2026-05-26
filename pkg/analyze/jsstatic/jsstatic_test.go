@@ -223,6 +223,11 @@ func TestAnalyze_NonPositiveOptionsResolveToDefaults(t *testing.T) {
 		t.Errorf("expected BundlesAbandonedOnCancel=0 on clean run with negative-Concurrency input, got %d",
 			res.Stats.BundlesAbandonedOnCancel)
 	}
+	// QUAL-004 panic-safe wrapper: on a clean run, the recover() in
+	// safeAnalyzeOne must NOT fire, so AnalyzeOnePanics stays at zero.
+	if res.Stats.AnalyzeOnePanics != 0 {
+		t.Errorf("expected AnalyzeOnePanics=0 on clean run, got %d", res.Stats.AnalyzeOnePanics)
+	}
 }
 
 func TestAnalyze_DefaultOptionsAreSane(t *testing.T) {
@@ -233,6 +238,47 @@ func TestAnalyze_DefaultOptionsAreSane(t *testing.T) {
 		t.Fatalf("Analyze error with zero Options: %v", err)
 	}
 	_ = res // just checking no panic
+}
+
+// Regression for CodeRabbit CR-1: MaxEndpointsPerBundle must cap the TOTAL
+// endpoints kept per bundle, counting both bundle-body endpoints and any
+// endpoints recovered from sourcemap sources. Pre-fix, the cap applied only to
+// the bundle body, so a sourcemap could push EndpointsKept arbitrarily high.
+func TestAnalyze_MaxEndpointsPerBundle_AppliesToSourcemapToo(t *testing.T) {
+	// Bundle body has 3 distinct endpoints.
+	var bundleBody strings.Builder
+	for i := 0; i < 3; i++ {
+		fmt.Fprintf(&bundleBody, "fetch(\"/api/b%d\");\n", i)
+	}
+	// Sourcemap source has 20 more endpoints — well over the cap.
+	var smContent strings.Builder
+	for i := 0; i < 20; i++ {
+		fmt.Fprintf(&smContent, "fetch(\"/api/sm%d\");\n", i)
+	}
+	smDoc := fmt.Sprintf(`{"sources":["src/x.js"],"sourcesContent":[%s]}`,
+		func() string { b, _ := json.Marshal(smContent.String()); return string(b) }())
+	encoded := base64.StdEncoding.EncodeToString([]byte(smDoc))
+	dataURI := "data:application/json;base64," + encoded
+	bundleBody.WriteString("\n//# sourceMappingURL=" + dataURI + "\n")
+
+	bundle := makeJSCapture("https://h/app.js", bundleBody.String())
+	res, err := Analyze(context.Background(), []crawl.ObservedRequest{bundle}, Options{
+		MaxEndpointsPerBundle: 5,
+	})
+	if err != nil {
+		t.Fatalf("Analyze error: %v", err)
+	}
+	// EndpointsKept (bundle-body + sourcemap-source combined) must not exceed
+	// the cap. Pre-fix this would have been 3 + 20 = 23.
+	if res.Stats.EndpointsKept > 5 {
+		t.Errorf("EndpointsKept = %d, want <= 5 (MaxEndpointsPerBundle)", res.Stats.EndpointsKept)
+	}
+	// Synthesized request count (excluding the original captured bundle) must
+	// also obey the cap.
+	synthCount := len(res.Requests) - 1 // -1 for the original bundle request
+	if synthCount > 5 {
+		t.Errorf("synthesized request count = %d, want <= 5", synthCount)
+	}
 }
 
 func TestAnalyze_SourcemapAndBundleEmissions(t *testing.T) {

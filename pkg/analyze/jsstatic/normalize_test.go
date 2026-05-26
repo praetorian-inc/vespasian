@@ -19,10 +19,7 @@ import (
 )
 
 func TestNormalizeEXPRPath_NamedSegments(t *testing.T) {
-	got, err := NormalizeEXPRPath("/users/EXPR/posts/EXPR", []string{"userId", "postId"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	got := NormalizeEXPRPath("/users/EXPR/posts/EXPR", []string{"userId", "postId"})
 	want := "/users/{userId}/posts/{postId}"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -30,10 +27,7 @@ func TestNormalizeEXPRPath_NamedSegments(t *testing.T) {
 }
 
 func TestNormalizeEXPRPath_UnnamedFallback(t *testing.T) {
-	got, err := NormalizeEXPRPath("/items/EXPR", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	got := NormalizeEXPRPath("/items/EXPR", nil)
 	want := "/items/{param}"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -41,10 +35,7 @@ func TestNormalizeEXPRPath_UnnamedFallback(t *testing.T) {
 }
 
 func TestNormalizeEXPRPath_QueryAndFragmentPreserved(t *testing.T) {
-	got, err := NormalizeEXPRPath("/x/EXPR?a=1#b", []string{"id"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	got := NormalizeEXPRPath("/x/EXPR?a=1#b", []string{"id"})
 	want := "/x/{id}?a=1#b"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -52,10 +43,7 @@ func TestNormalizeEXPRPath_QueryAndFragmentPreserved(t *testing.T) {
 }
 
 func TestNormalizeEXPRPath_NoEXPR(t *testing.T) {
-	got, err := NormalizeEXPRPath("/abc", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	got := NormalizeEXPRPath("/abc", nil)
 	want := "/abc"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -63,10 +51,7 @@ func TestNormalizeEXPRPath_NoEXPR(t *testing.T) {
 }
 
 func TestNormalizeEXPRPath_AbsoluteURL(t *testing.T) {
-	got, err := NormalizeEXPRPath("https://h/api/EXPR", []string{"id"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	got := NormalizeEXPRPath("https://h/api/EXPR", []string{"id"})
 	want := "https://h/api/{id}"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -74,10 +59,7 @@ func TestNormalizeEXPRPath_AbsoluteURL(t *testing.T) {
 }
 
 func TestNormalizeEXPRPath_MultipleUnnamed(t *testing.T) {
-	got, err := NormalizeEXPRPath("/a/EXPR/b/EXPR", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	got := NormalizeEXPRPath("/a/EXPR/b/EXPR", nil)
 	want := "/a/{param}/b/{param1}"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -85,10 +67,7 @@ func TestNormalizeEXPRPath_MultipleUnnamed(t *testing.T) {
 }
 
 func TestNormalizeEXPRPath_TokensFewerThanEXPR(t *testing.T) {
-	got, err := NormalizeEXPRPath("/a/EXPR/b/EXPR", []string{"id"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	got := NormalizeEXPRPath("/a/EXPR/b/EXPR", []string{"id"})
 	want := "/a/{id}/b/{param}"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)

@@ -213,10 +213,7 @@ func extractTemplateLiteralFetches(analyzer *jsluice.Analyzer, baseURL string) [
 			return
 		}
 
-		normalized, err := NormalizeEXPRPath(rawURL, tokens)
-		if err != nil {
-			normalized = rawURL
-		}
+		normalized := NormalizeEXPRPath(rawURL, tokens)
 
 		// Extract method from second argument options object.
 		method := "GET"
@@ -436,8 +433,8 @@ func normalizedURLFromLiteral(n *jsluice.Node) (string, bool) {
 	if rawURL == "" || filterURL(rawURL) || isExprOnly(rawURL) {
 		return "", false
 	}
-	normalized, err := NormalizeEXPRPath(rawURL, tokens)
-	if err != nil || normalized == "" {
+	normalized := NormalizeEXPRPath(rawURL, tokens)
+	if normalized == "" {
 		normalized = rawURL
 	}
 	return normalized, true
@@ -502,10 +499,8 @@ func fetchBodyFromCall(n *jsluice.Node) (endpointKey, []string, bool) {
 	if rawURL == "" {
 		return k, nil, false
 	}
-	// NormalizeEXPRPath errors only on malformed URLs; on error, fall through
-	// to the raw URL.
-	normalized, normErr := NormalizeEXPRPath(rawURL, tokens)
-	if normErr != nil || normalized == "" {
+	normalized := NormalizeEXPRPath(rawURL, tokens)
+	if normalized == "" {
 		normalized = rawURL
 	}
 
@@ -629,8 +624,8 @@ func jsluiceURLToEndpoint(
 	// implemented (only the template-literal walker in extractTemplateLiteralFetches
 	// has the AST context to do it). Pass nil; NormalizeEXPRPath falls back to
 	// {param}, {param1}, ... numbering.
-	normalized, err := NormalizeEXPRPath(raw, nil)
-	if err != nil || normalized == "" {
+	normalized := NormalizeEXPRPath(raw, nil)
+	if normalized == "" {
 		normalized = raw
 	}
 

@@ -1644,6 +1644,70 @@ func TestComputeSourceTag_MixedEmptyAndStaticInGroup_ResolvesDynamic(t *testing.
 	}
 }
 
+// Regression for CR-2: a non-JS "static:*" source (e.g. static:html from
+// pkg/analyze form analysis) must NOT gate or surface in the x-vespasian-source
+// extension. The extension is scoped to JS bundle / sourcemap recovery only.
+func TestOpenAPI_XVespasianSource_StaticHtmlIgnored(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "static:html"),
+		makeClassified("POST", "https://h/api/y", "static:html"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	// Walk every operation; the extension must be absent everywhere when only
+	// non-JS static sources are present in the input.
+	for _, pathVal := range paths {
+		pathItem := pathVal.(map[string]interface{})
+		for _, opVal := range pathItem {
+			op, ok := opVal.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if _, has := op["x-vespasian-source"]; has {
+				t.Errorf("x-vespasian-source must be absent when only static:html (non-JS) is present; op: %v", op)
+			}
+		}
+	}
+}
+
+// Regression for CR-2: a group that mixes a JS static source with a non-JS
+// static source must resolve to "dynamic", not "js-bundle" or "html".
+func TestComputeSourceTag_StaticHtmlMixedWithJS_ResolvesDynamic(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "static:html"),
+		makeClassified("GET", "https://h/api/x", "static:js"),
+		// Unrelated JS-static entry so anyStaticSource gates the extension on.
+		makeClassified("GET", "https://h/api/z", "static:js"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	ext, ok := getOp["x-vespasian-source"]
+	if !ok {
+		t.Fatal("expected x-vespasian-source to be present for mixed group")
+	}
+	if ext != "dynamic" {
+		t.Errorf("expected x-vespasian-source=dynamic when group mixes static:html and static:js, got %v", ext)
+	}
+}
+
 // mixed static-only groups (static:js + static:js-sourcemap) must resolve to "dynamic".
 func TestComputeSourceTag_MixedStaticGroups(t *testing.T) {
 	gen := &OpenAPIGenerator{}

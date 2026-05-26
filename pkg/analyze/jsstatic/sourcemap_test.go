@@ -25,6 +25,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
 // makeSourcemapDataURI encodes a sourcesContent map as a data URI.
@@ -158,6 +160,51 @@ func TestSourcemap_RemoteSourcesContent(t *testing.T) {
 	}
 	if stats.SourcemapsRecovered != 1 {
 		t.Errorf("expected 1 recovered, got %d", stats.SourcemapsRecovered)
+	}
+}
+
+// Regression for QUAL-002: a sourcemap source whose decoded sourcesContent
+// string exceeds MaxBundleSize must increment SourcemapSourcesOversized, NOT
+// SourcemapSourceTimeouts. The two counters were conflated pre-fix.
+func TestAnalyze_OversizedSourcemapSource_IncrementsOversizedCounter(t *testing.T) {
+	largeSrc := strings.Repeat("// pad\n", 1500) // ~10.5 KB
+	body := makeSourcemapJSON([]string{largeSrc})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	mapURL := srv.URL + "/app.js.map"
+	bundleURL := srv.URL + "/app.js"
+	bundle := []byte(fmt.Sprintf("fetch(\"/api/x\");\n//# sourceMappingURL=%s\n", mapURL))
+
+	res, err := Analyze(context.Background(), []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    bundleURL,
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/javascript",
+				Body:        bundle,
+			},
+		},
+	}, Options{
+		MaxBundleSize:   4096, // 4 KB — bundle (~80 B) fits, source (~10.5 KB) does not
+		FetchSourcemaps: true,
+		AllowPrivate:    true,
+		HTTPClient:      srv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if res.Stats.SourcemapSourcesOversized != 1 {
+		t.Errorf("SourcemapSourcesOversized = %d, want 1", res.Stats.SourcemapSourcesOversized)
+	}
+	if res.Stats.SourcemapSourceTimeouts != 0 {
+		t.Errorf("SourcemapSourceTimeouts = %d, want 0 (oversized must NOT count as timeout)",
+			res.Stats.SourcemapSourceTimeouts)
 	}
 }
 

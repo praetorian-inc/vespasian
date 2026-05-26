@@ -27,7 +27,13 @@ const exprPlaceholder = "EXPR"
 // segment's identifier cannot be resolved, it is replaced with {param},
 // {param1}, {param2}, … in left-to-right order. Query string and fragment are
 // preserved unchanged.
-func NormalizeEXPRPath(rawURL string, tokens []string) (string, error) {
+//
+// This function never fails — every input string is normalized to some output.
+// (Earlier revisions exposed an error return that was always nil; callers had
+// dead error-handling branches.) Malformed URLs are returned with their EXPR
+// segments rewritten on a best-effort basis; absolute URLs without a path are
+// returned unchanged.
+func NormalizeEXPRPath(rawURL string, tokens []string) string {
 	// Split off fragment first (it comes after #).
 	fragment := ""
 	if idx := strings.Index(rawURL, "#"); idx != -1 {
@@ -54,7 +60,7 @@ func NormalizeEXPRPath(rawURL string, tokens []string) (string, error) {
 			path = rawURL[i+3+slashIdx:]
 		} else {
 			// No path component — nothing to normalize.
-			return rawURL + query + fragment, nil
+			return rawURL + query + fragment
 		}
 	}
 
@@ -80,5 +86,5 @@ func NormalizeEXPRPath(rawURL string, tokens []string) (string, error) {
 		}
 	}
 
-	return prefix + strings.Join(segments, "/") + query + fragment, nil
+	return prefix + strings.Join(segments, "/") + query + fragment
 }

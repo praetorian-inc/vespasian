@@ -171,13 +171,23 @@ func groupEndpoints(endpoints []classify.ClassifiedRequest) map[endpointKey][]cl
 	return endpointGroups
 }
 
-// anyStaticSource returns true if any request in endpoints has a Source that
-// starts with "static:". This is used to gate the x-vespasian-source extension:
-// when no static sources are present in the entire input the extension is omitted
-// so output remains byte-identical to pre-LAB-2108 behavior.
+// isJSStaticSource returns true iff the Source value is one of the JS-bundle
+// static-analysis sources owned by LAB-2108. Other "static:*" sources (e.g.
+// "static:html" from pkg/analyze form analysis) are deliberately rejected here
+// — they have their own provenance and should not flow into the
+// x-vespasian-source extension, which is scoped to JS bundle / sourcemap
+// recovery only.
+func isJSStaticSource(source string) bool {
+	return source == "static:js" || source == "static:js-sourcemap"
+}
+
+// anyStaticSource returns true if any request in endpoints carries a JS-bundle
+// static-analysis source. The x-vespasian-source extension is gated on this so
+// that flag-off output (and inputs from sources outside LAB-2108) stay
+// byte-identical to pre-LAB-2108 behavior. Non-JS static sources do not gate.
 func anyStaticSource(endpoints []classify.ClassifiedRequest) bool {
 	for _, ep := range endpoints {
-		if strings.HasPrefix(ep.Source, "static:") {
+		if isJSStaticSource(ep.Source) {
 			return true
 		}
 	}
@@ -186,31 +196,31 @@ func anyStaticSource(endpoints []classify.ClassifiedRequest) bool {
 
 // computeSourceTag derives the x-vespasian-source value for an operation group.
 // Mapping (architecture.md §7):
-//   - any request with Source not starting "static:" (including empty Source from
-//     pre-LAB-2108 captures or untagged dynamic entries) → "dynamic"
+//   - any request with Source not in {"static:js", "static:js-sourcemap"}
+//     (including empty Source from pre-LAB-2108 captures, untagged dynamic
+//     entries, AND non-JS static sources like "static:html") → "dynamic"
 //   - all requests Source == "static:js"             → "js-bundle"
 //   - all requests Source == "static:js-sourcemap"   → "js-sourcemap"
-//   - mixed static prefixes within a group           → "dynamic"
+//   - mixed JS-static prefixes within a group        → "dynamic"
 //
-// Empty Source is treated as a dynamic signal so that a group containing both
-// dynamic (untagged) and static entries resolves to "dynamic" rather than
-// inheriting the static tag from the static-only subset.
+// This is intentionally a closed allow-list rather than a strings.TrimPrefix
+// open list — a new "static:foo" source must NOT silently surface as
+// x-vespasian-source: foo because the extension consumer contract names only
+// the three values above.
 func computeSourceTag(group []classify.ClassifiedRequest) string {
 	var tag string
 	for _, ep := range group {
-		if !strings.HasPrefix(ep.Source, "static:") {
-			// Any dynamic source (including the empty/untagged case) wins immediately.
+		if !isJSStaticSource(ep.Source) {
+			// Any non-JS-static source (dynamic, empty, or static:html etc.)
+			// wins immediately.
 			return "dynamic"
 		}
-		// Static source: map to friendly name.
 		var friendly string
 		switch ep.Source {
 		case "static:js":
 			friendly = "js-bundle"
 		case "static:js-sourcemap":
 			friendly = "js-sourcemap"
-		default:
-			friendly = strings.TrimPrefix(ep.Source, "static:")
 		}
 		if tag == "" {
 			tag = friendly

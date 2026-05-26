@@ -614,13 +614,6 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		return err
 	}
 
-	requests = runJSAnalysisStage(bs.ctx, requests, jsAnalysisArgs{
-		enabled:         c.AnalyzeJS,
-		fetchSourcemaps: c.FetchSourcemaps,
-		allowPrivate:    c.DangerousAllowPrivate,
-		verbose:         c.Verbose,
-	})
-
 	if c.Verbose {
 		if bs.requestID != "" {
 			fmt.Fprintf(os.Stderr, "request-id: %s\n", bs.requestID)
@@ -628,8 +621,16 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
-	// Augment BEFORE auto-detection (see augmentWithStaticForms doc comment).
+	// Augmentation order: static-HTML forms first, then JS-bundle static
+	// analysis. This matches GenerateCmd.Run (see the augmentWithStaticForms
+	// doc comment for why both run before auto-detection / classification).
 	requests = augmentWithStaticForms(requests)
+	requests = runJSAnalysisStage(bs.ctx, requests, jsAnalysisArgs{
+		enabled:         c.AnalyzeJS,
+		fetchSourcemaps: c.FetchSourcemaps,
+		allowPrivate:    c.DangerousAllowPrivate,
+		verbose:         c.Verbose,
+	})
 
 	apiType := c.APIType
 	if apiType == apiTypeAuto {
@@ -889,16 +890,26 @@ func probeWSDLDocument(targetURL string, allowPrivate bool, verbose bool) []byte
 		}
 	}
 
+	// Per-stage timeouts in addition to the overall 15s Client.Timeout, so a
+	// slow TLS handshake or response-header phase can't burn the whole budget
+	// on one stage. Both branches share the same per-stage caps — the only
+	// real difference is the dialer (SSRF-safe vs permissive).
+	const stageTimeout = 10 * time.Second
 	transport := &http.Transport{
-		DialContext: probe.SSRFSafeDialContext,
+		DialContext:           probe.SSRFSafeDialContext,
+		TLSHandshakeTimeout:   stageTimeout,
+		ResponseHeaderTimeout: stageTimeout,
 	}
 	if allowPrivate {
-		transport = &http.Transport{}
+		transport = &http.Transport{
+			TLSHandshakeTimeout:   stageTimeout,
+			ResponseHeaderTimeout: stageTimeout,
+		}
 	}
 	client := &http.Client{
 		Timeout:   15 * time.Second,
 		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}

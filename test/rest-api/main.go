@@ -433,7 +433,8 @@ func handleMixedContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	randomBytes := make([]byte, 64)
-	rand.Read(randomBytes) //nolint:errcheck,gosec // test server best-effort, error ignored intentionally
+	// #nosec G104 -- test server best-effort: crypto/rand failures here would be a noisy false positive in CI.
+	rand.Read(randomBytes) //nolint:errcheck // test server best-effort, error ignored intentionally
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"id":     1,
 		"name":   "binary-test",
