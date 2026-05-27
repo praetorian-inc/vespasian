@@ -92,7 +92,8 @@ Options:
                         Valid targets:
                           Live:       rest-api, soap-service, graphql-server
                           Generate:   generate-rest, generate-wsdl,
-                                      generate-graphql, generate-graphql-imports
+                                      generate-graphql, generate-graphql-imports,
+                                      generate-js-static
                           Import:     import-burp, import-har, import-base64,
                                       import-mitmproxy, import-unicode,
                                       import-duplicates, import-malformed,
@@ -167,6 +168,9 @@ Results are saved to `test/.results/` with one subdirectory per test:
 ├── generate-graphql-imports/
 │   ├── burp-spec.graphql   # SDL from Burp import
 │   └── har-spec.graphql    # SDL from HAR import
+├── generate-js-static/
+│   ├── spec-on.yaml        # OpenAPI from a JS bundle (--analyze-js)
+│   └── spec-off.yaml       # Same capture with --analyze-js=false (opt-out)
 ├── import-burp/
 │   └── imported.json       # Imported from Burp XML
 ├── import-har/
@@ -201,7 +205,7 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 ## Expected Results
 
-All 21 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest).
+All 22 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest).
 
 ```
   TARGET                      STATUS    ENDPOINTS   EXPECTED   DURATION
@@ -212,6 +216,7 @@ All 21 tests should pass. Order is non-deterministic and durations vary by machi
   edge-cases                  PASS      -           -          193s
   generate-graphql            PASS      8           8          0s
   generate-graphql-imports    PASS      2           2          0s
+  generate-js-static          PASS      3           3          1s
   generate-rest               PASS      8           8          0s
   generate-wsdl               PASS      3           3          1s
   graphql-server              PASS      8           8          1s
@@ -228,7 +233,7 @@ All 21 tests should pass. Order is non-deterministic and durations vary by machi
   soap-service                PASS      3           3          51s
   spec-edge                   PASS      -           -          0s
 
-  Total: 21 passed, 0 failed, 0 skipped
+  Total: 22 passed, 0 failed, 0 skipped
 ```
 
 Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are informational and do not cause failures.
