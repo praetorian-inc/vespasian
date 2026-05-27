@@ -171,7 +171,7 @@ func TestExtractAPIPaths(t *testing.T) {
 				// "/api/posts/" (concat receiver) and "/api/users/" (+-chain
 				// head literal) are both picked up by Strategy 1 as plain
 				// quoted strings; the reconstructed concat/plus paths are
-				// the new contribution from Strategy 4. Both forms coexist.
+				// the new contribution from Strategy 5. Both forms coexist.
 				"/api/posts",
 				"/api/posts/0/comment",
 				"/api/users",
@@ -648,7 +648,7 @@ func TestExtractConcatPaths_FirstOperandBoundedAtChainSpan(t *testing.T) {
 // (apiPathPattern), so the orchestrator emits both the literal receiver
 // AND the reconstructed concat path — this is intentional: the literal
 // form might exist as a real endpoint, and the reconstructed form is the
-// new contribution from Strategy 4.
+// new contribution from Strategy 5.
 func TestExtractConcatPaths_FlowsThroughExtractAPIPaths(t *testing.T) {
 	js := `
 		fetch("/api/posts/".concat(id, "/comment"));
