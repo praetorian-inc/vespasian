@@ -1906,6 +1906,38 @@ func TestProbeWSDLDocument_ValidWSDL(t *testing.T) {
 	}
 }
 
+// TestProbeWSDLDocument_RejectsWSDLBodyWithHTMLContentType verifies that the CLI
+// probe gates on Content-Type identically to the SDK's decodeWSDLResponse: a body
+// that parses as WSDL but is served with Content-Type: text/html is rejected
+// (QUAL-002 — closes a latent CLI/SDK parity divergence in fetchWSDLBody).
+func TestProbeWSDLDocument_RejectsWSDLBodyWithHTMLContentType(t *testing.T) {
+	const wsdlBody = `<?xml version="1.0"?>
+<definitions name="Calculator"
+  xmlns="http://schemas.xmlsoap.org/wsdl/"
+  xmlns:tns="http://example.com/"
+  targetNamespace="http://example.com/">
+  <message name="AddRequest"><part name="parameters" element="tns:Add"/></message>
+  <message name="AddResponse"><part name="parameters" element="tns:AddResponse"/></message>
+  <portType name="CalculatorPortType">
+    <operation name="Add">
+      <input message="tns:AddRequest"/>
+      <output message="tns:AddResponse"/>
+    </operation>
+  </portType>
+</definitions>`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Valid WSDL body, but served with a non-WSDL Content-Type.
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(wsdlBody)) //nolint:gosec // G104: test code
+	}))
+	defer ts.Close()
+
+	doc := probeWSDLDocument(context.Background(), ts.URL+"/calculator.asmx", true, false)
+	if doc != nil {
+		t.Errorf("probeWSDLDocument should reject WSDL served as text/html, got %d bytes", len(doc))
+	}
+}
+
 // TestProbeWSDLDocument_NoWSDL verifies that probeWSDLDocument returns nil
 // when the endpoint doesn't serve WSDL.
 func TestProbeWSDLDocument_NoWSDL(t *testing.T) {

@@ -19,7 +19,7 @@
 //
 // Exported surface: [Capability] (implements capability.Capability), [ClassifyProbeGenerate],
 // [DetectAPIType], [ClassifiersForType], [BuildWSDLProbeClient], [BuildWSDLProbeURL],
-// [IsRejectedWSDLStatus], and [ProbeStrategiesForType].
+// [IsRejectedWSDLStatus], [IsAcceptableWSDLContentType], and [ProbeStrategiesForType].
 //
 // SSRF note: The SDK enforces fail-closed SSRF protection for both the crawl
 // frontier and the WSDL probe. Private/loopback targets (e.g., 127.0.0.1,

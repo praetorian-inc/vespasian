@@ -550,6 +550,10 @@ func ClassifiersForType(apiType string) []classify.APIClassifier {
 
 // ProbeStrategiesForType returns the appropriate probe strategies for the given API type,
 // or nil if the API type is not recognized.
+//
+// Consumed both by cmd/vespasian/main.go's generateSpec (the standalone CLI probe
+// path) and internally by ClassifyProbeGenerate (the SDK probe pipeline); changing
+// the strategy set here affects both the CLI and the Chariot capability.
 func ProbeStrategiesForType(apiType string, cfg probe.Config) []probe.ProbeStrategy {
 	switch apiType {
 	case "rest":
@@ -576,11 +580,12 @@ func IsRejectedWSDLStatus(status int) bool {
 	return status >= 300
 }
 
-// isAcceptableWSDLContentType reports whether a response's Content-Type
+// IsAcceptableWSDLContentType reports whether a response's Content-Type
 // header value is one the WSDL probe will accept. An empty content type is
 // allowed because some WSDL endpoints omit it; the parser is then the
 // authority. Any other value short-circuits the probe.
-func isAcceptableWSDLContentType(header string) bool {
+// Exported so cmd/vespasian/main.go's fetchWSDLBody shares the same content-type gate.
+func IsAcceptableWSDLContentType(header string) bool {
 	ct := strings.ToLower(strings.TrimSpace(strings.Split(header, ";")[0]))
 	switch ct {
 	case "", "text/xml", "application/xml", "application/wsdl+xml":
@@ -656,7 +661,7 @@ func decodeWSDLResponse(resp *http.Response) []byte {
 	if IsRejectedWSDLStatus(resp.StatusCode) {
 		return nil
 	}
-	if !isAcceptableWSDLContentType(resp.Header.Get("Content-Type")) {
+	if !IsAcceptableWSDLContentType(resp.Header.Get("Content-Type")) {
 		return nil
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))

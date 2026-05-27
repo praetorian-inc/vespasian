@@ -830,7 +830,7 @@ func TestIsRejectedWSDLStatus(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// isAcceptableWSDLContentType
+// IsAcceptableWSDLContentType
 // ---------------------------------------------------------------------------
 
 func TestIsAcceptableWSDLContentType(t *testing.T) {
@@ -855,7 +855,7 @@ func TestIsAcceptableWSDLContentType(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, isAcceptableWSDLContentType(tt.header))
+			assert.Equal(t, tt.want, IsAcceptableWSDLContentType(tt.header))
 		})
 	}
 }
@@ -1082,7 +1082,7 @@ func TestDecodeWSDLResponse_UnparseableBody(t *testing.T) {
 }
 
 // TestDecodeWSDLResponse_EmptyContentTypeAccepted exercises the empty-string
-// branch inside isAcceptableWSDLContentType when called
+// branch inside IsAcceptableWSDLContentType when called
 // end-to-end through decodeWSDLResponse. An empty Content-Type is intentionally
 // permitted because some WSDL endpoints omit it; the parser is then the authority.
 func TestDecodeWSDLResponse_EmptyContentTypeAccepted(t *testing.T) {

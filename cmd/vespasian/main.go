@@ -809,6 +809,10 @@ func fetchWSDLBody(ctx context.Context, client *http.Client, wsdlURL string) ([]
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
+	if !sdk.IsAcceptableWSDLContentType(resp.Header.Get("Content-Type")) {
+		return nil, fmt.Errorf("unexpected content-type %q", resp.Header.Get("Content-Type"))
+	}
+
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20)) // 2 MB limit
 	if err != nil {
 		return nil, fmt.Errorf("reading body: %w", err)
