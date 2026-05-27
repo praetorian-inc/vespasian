@@ -639,14 +639,9 @@ func probeWSDLDocumentWith(ctx context.Context, targetURL string, validate func(
 	if err != nil {
 		return nil
 	}
-	defer func() {
-		// Drain up to 2 MiB so the connection can return to the keep-alive
-		// pool, then close. Both errors are unrecoverable here — the return
-		// value is already decided by decodeWSDLResponse below — so they are
-		// intentionally discarded via explicit _ assignment.
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 2<<20)) //nolint:errcheck
-		_ = resp.Body.Close()                                        //nolint:errcheck
-	}()
+	// Single-use client (CloseIdleConnections deferred above); the connection
+	// is never reused, so close the body without draining.
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
 
 	return decodeWSDLResponse(resp)
 }

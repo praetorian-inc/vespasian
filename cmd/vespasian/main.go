@@ -801,10 +801,9 @@ func fetchWSDLBody(ctx context.Context, client *http.Client, wsdlURL string) ([]
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
-	defer func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // best-effort drain
-		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close
-	}()
+	// Single-use client; the connection is never reused, so close the body
+	// without draining (no keep-alive pool to return it to).
+	defer resp.Body.Close() //nolint:errcheck,gosec // best-effort close
 
 	if sdk.IsRejectedWSDLStatus(resp.StatusCode) {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
