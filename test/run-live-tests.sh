@@ -896,10 +896,12 @@ title_case() { printf '%s%s' "$(printf '%s' "$1" | cut -c1 | tr '[:lower:]' '[:u
 #   - Method matrix: the generator writes "summary: <Method> <path>" per
 #     operation, so we assert that line exists for every expected method on
 #     methods_path (e.g. both "Get /api/users" and "Post /api/users").
-#   - Body fields: request-body schema properties live under the top-level
-#     "components:" section; param names (e.g. "name: itemId") live earlier in
-#     "paths:", so scoping to components disambiguates. A property key renders
-#     as "<indent><field>:" with the value on the following line.
+#   - Body fields: a request-body schema property key renders as a bare
+#     "<indent><field>:" (value on the following lines), whereas a path-level
+#     parameter renders the same identifier inline as "<indent>name: itemId".
+#     The end-anchor (\s*$) is the disambiguator — it matches the bare property
+#     key but not the inline param form — so the whole spec can be scanned
+#     without slicing out the paths: section.
 # Returns 0 on match, 1 (with details on stderr) otherwise.
 # Usage: assert_js_static_details <spec.yaml> <expected-paths.json>
 assert_js_static_details() {
