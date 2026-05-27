@@ -23,6 +23,8 @@
 //     data/errors keys in response JSON.
 //   - WSDL/SOAP: detected via SOAPAction header, SOAP envelope in body, and
 //     ?wsdl URL parameter.
+//   - gRPC: detected via application/grpc* content-type, grpc-status /
+//     grpc-message response headers, or POST + /<pkg.Service>/<Method> path.
 //
 // [RunClassifiers] applies one or more classifiers to a slice of observed
 // requests, returning only those that exceed the confidence threshold.

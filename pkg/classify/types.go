@@ -49,6 +49,10 @@ type ClassifiedRequest struct {
 	// GraphQLSchema holds the parsed introspection result for GraphQL endpoints.
 	// Nil means introspection was not attempted or failed.
 	GraphQLSchema *GraphQLIntrospection `json:"graphql_schema,omitempty"`
+
+	// GRPCSchema holds the parsed server-reflection result for gRPC endpoints.
+	// Nil means reflection was not attempted or failed.
+	GRPCSchema *GRPCReflectionResult `json:"grpc_schema,omitempty"`
 }
 
 // GraphQLIntrospection holds parsed GraphQL introspection results.
@@ -108,4 +112,40 @@ type GraphQLTypeRef struct {
 	Name   *string         `json:"name"`
 	Kind   string          `json:"kind"`
 	OfType *GraphQLTypeRef `json:"ofType,omitempty"`
+}
+
+// GRPCReflectionResult holds parsed gRPC server-reflection results.
+type GRPCReflectionResult struct {
+	// ReflectionEnabled indicates whether the server responded to reflection.
+	ReflectionEnabled bool `json:"reflection_enabled"`
+	// ReflectionUnavailableReason is the gRPC status code name when
+	// ReflectionEnabled is false and the probe distinguished why reflection
+	// did not work — e.g., "Unimplemented" (service not registered),
+	// "Unauthenticated" or "PermissionDenied" (auth-gated). Empty when
+	// ReflectionEnabled is true or the failure cause was indistinguishable
+	// from "not a gRPC server" (in which case the probe returns nil).
+	ReflectionUnavailableReason string `json:"reflection_unavailable_reason,omitempty"`
+	// Services lists discovered services and their methods. Populated even when
+	// FileDescriptors are unavailable so capture readers see the service shape
+	// without protobuf tooling.
+	Services []GRPCService `json:"services,omitempty"`
+	// FileDescriptors maps .proto filename to its FileDescriptorProto wire bytes.
+	// Holds the transitive closure (service files + every import). Excluded from
+	// JSON: binary protobuf bloats captures and corrupts on round-trip.
+	FileDescriptors map[string][]byte `json:"-"`
+}
+
+// GRPCService represents a single gRPC service discovered via reflection.
+type GRPCService struct {
+	Name    string       `json:"name"`
+	Methods []GRPCMethod `json:"methods,omitempty"`
+}
+
+// GRPCMethod represents a single RPC method on a gRPC service.
+type GRPCMethod struct {
+	Name            string `json:"name"`
+	InputType       string `json:"input_type"`
+	OutputType      string `json:"output_type"`
+	ClientStreaming bool   `json:"client_streaming,omitempty"`
+	ServerStreaming bool   `json:"server_streaming,omitempty"`
 }
