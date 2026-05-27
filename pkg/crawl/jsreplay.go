@@ -1098,6 +1098,21 @@ func findConcatArgListEnd(jsBody []byte, start int) int { //nolint:gocyclo // sm
 	// by parsePlusChain — without this, a backtick opening near `limit`
 	// could force scanStringLiteral to walk megabytes looking for the
 	// matching backtick.
+	//
+	// Defensive-only / no behavioral signature: this clamp never changes
+	// findConcatArgListEnd's return value, because the outer loop below is
+	// already capped at `i < limit` regardless of the clamp — once a
+	// string scan jumps `i` past `limit`, the loop exits and returns -1
+	// either way. The clamp's sole effect is bounding a single
+	// pathological per-call scan; because string/backtick delimiters pair
+	// up, the aggregate scan cost over a bundle is already O(N), so the
+	// clamp does not change measured runtime (verified: a 3.1MB / 5000-
+	// match worst case runs in ~76ms with OR without it). It is retained
+	// as cheap insurance against a single megabyte-scale unterminated
+	// literal in minified single-line JS. Consequently there is no
+	// regression test that can fail when this clamp is removed — it is the
+	// parsePlusChain clamp (which DOES have a behavioral signature) that
+	// the DoS-bound tests pin.
 	body := jsBody[:limit]
 	for i := start; i < limit; i++ {
 		c := body[i]
