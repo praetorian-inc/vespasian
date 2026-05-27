@@ -95,9 +95,9 @@ Options:
                                       generate-graphql, generate-graphql-imports,
                                       generate-js-static
                           Import:     import-burp, import-har, import-base64,
-                                      import-mitmproxy, import-unicode,
-                                      import-duplicates, import-malformed,
-                                      import-empty
+                                      import-mitmproxy, import-mitmproxy-native,
+                                      import-unicode, import-duplicates,
+                                      import-malformed, import-empty
                           Crawl:      crawl-depth, crawl-unreachable
                           Edge cases: edge-cases, classifier-edge, spec-edge
   --verbose             Enable verbose vespasian output
