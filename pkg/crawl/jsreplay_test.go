@@ -277,6 +277,29 @@ func TestExtractConcatPaths(t *testing.T) {
 			want: nil,
 		},
 		{
+			// Pins the query-syntax receiver class — concatMethodPattern's
+			// receiver allows `?=&%~` (unlike concatPlusHeadPattern's head),
+			// the sole behavioral difference between the two regexes. Without
+			// this test a regex change narrowing the receiver class would
+			// silently drop query-bearing .concat() endpoints with the rest
+			// of the suite still green.
+			name: "concat receiver with query syntax is preserved",
+			js:   `fetch("/api/users?id=".concat(uid));`,
+			want: []string{"/api/users?id=0"},
+		},
+		{
+			// Indicator-in-argument: receiver has NO API marker but an
+			// argument does. concatMethodPattern intentionally does NOT
+			// anchor the receiver on an API indicator so this case is
+			// still recovered (the post-hoc hasAPIIndicator filter in emit()
+			// passes because the reconstructed path contains "api/").
+			name: "concat with API indicator only in argument is kept",
+			js:   `fetch("svc/".concat("api/v2/items"));`,
+			// extractConcatPaths emits the raw reconstruction; the leading
+			// slash is added later by addPath in extractAPIPaths.
+			want: []string{"svc/api/v2/items"},
+		},
+		{
 			name: "concat with empty arg list — receiver lacking API indicator dropped",
 			js:   `"foo".concat();`,
 			want: nil,
