@@ -873,12 +873,16 @@ test_generate_graphql_imports() {
 }
 
 # json_array prints the elements of a top-level JSON array field, one per line.
-# Stdlib only (no PyYAML/jq dependency). Usage: json_array <file> <key>
+# Stdlib only (no PyYAML/jq dependency). Like its sibling json_field, a missing
+# key or malformed JSON is a hard error: python exits non-zero and the trailing
+# `|| echo "?"` emits a visible "?" sentinel, so a broken fixture surfaces as a
+# failed assertion downstream rather than a silent zero-element (vacuous) pass.
+# Usage: json_array <file> <key>
 json_array() {
-    python3 - "$1" "$2" << 'PYEOF' 2>/dev/null
+    python3 - "$1" "$2" << 'PYEOF' 2>/dev/null || echo "?"
 import json, sys
 with open(sys.argv[1]) as f:
-    for v in json.load(f).get(sys.argv[2], []):
+    for v in json.load(f)[sys.argv[2]]:
         print(v)
 PYEOF
 }
@@ -913,15 +917,17 @@ assert_js_static_details() {
         fi
     done < <(json_array "$expected" methods)
 
-    # Scope body-field checks to the components: section so path-level param
-    # names ("name: itemId") don't false-match a body field key.
-    local components
-    components=$(sed -n '/^components:/,$p' "$spec")
+    # Body-field property keys render as a bare "<indent><field>:" (the value
+    # is the nested schema on following lines). Path-level parameters render
+    # the same identifiers inline as "<indent>name: itemId" / "name: orderId".
+    # The end-anchor (\s*$) is what disambiguates: it matches the bare property
+    # key but NOT the inline param form, so we can scan the whole spec without
+    # needing to slice out the paths: section. Keep the anchor on any refactor.
     local field
     while IFS= read -r field; do
         [ -z "$field" ] && continue
-        if ! printf '%s\n' "$components" | grep -qE "^\s+${field}:\s*\$"; then
-            echo "  detail: request-body field '${field}' not found as a schema property in components" >&2
+        if ! grep -qE "^\s+${field}:\s*\$" "$spec"; then
+            echo "  detail: request-body field '${field}' not found as a schema property" >&2
             rc=1
         fi
     done < <(json_array "$expected" body_fields)
