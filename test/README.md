@@ -29,7 +29,6 @@ End-to-end live tests that spin up intentionally simple target applications, run
 | rest-api | REST | Custom API with users, products, orders endpoints | Go binary |
 | soap-service | SOAP/WSDL | Custom SOAP service with GetUser, ListUsers, CreateUser | Go binary |
 | graphql-server | GraphQL | Apollo Server with queries, mutations, enums, unions, nested types | Node.js |
-| generate-js-static | REST (offline) | JS bundle static analysis (LAB-2108): fixed capture with a `fetch`/`axios`/template-literal bundle → OpenAPI with `x-vespasian-source: js-bundle` | None (fixture) |
 
 ## What the Test Runner Does
 
