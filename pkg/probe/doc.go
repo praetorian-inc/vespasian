@@ -22,6 +22,13 @@
 //   - [WSDLProbe]: fetches ?wsdl documents from SOAP service URLs.
 //   - [GraphQLProbe]: runs tiered introspection queries (3 tiers for WAF bypass)
 //     and falls back to traffic-based inference when introspection is disabled.
+//   - [GRPCProbe]: enumerates services, methods, and message types via the
+//     gRPC Server Reflection Protocol (v1 with v1alpha fallback), capturing the
+//     transitive FileDescriptorProto closure for downstream .proto generation.
+//     When the server is reachable but reflection is not registered (gRPC
+//     Unimplemented), the probe returns a structured GRPCReflectionResult
+//     with ReflectionEnabled=false to distinguish "probed but disabled" from
+//     "not probed at all" (which is signaled by a nil result).
 //
 // SSRF protection is built in: [ValidateProbeURL] blocks requests to private
 // and loopback addresses (RFC 1918, RFC 4193, link-local) with DNS rebinding

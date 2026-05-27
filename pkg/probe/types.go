@@ -15,6 +15,8 @@
 package probe
 
 import (
+	"context"
+	"net"
 	"net/http"
 	"time"
 )
@@ -40,6 +42,12 @@ type Config struct {
 	// MaxEndpoints limits the number of unique URLs probed per strategy.
 	// If zero, defaults to DefaultMaxEndpoints.
 	MaxEndpoints int
+
+	// Dialer is used by probes that establish their own connections (e.g., the
+	// gRPC reflection probe, which cannot reuse the http.Client). If nil, the
+	// default SSRF-safe dialer is used. Tests targeting loopback should set a
+	// plain net.Dialer.
+	Dialer func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // DefaultMaxEndpoints is the default limit on unique URLs probed per strategy.
@@ -62,6 +70,9 @@ func (cfg Config) withDefaults() Config {
 	}
 	if cfg.MaxEndpoints == 0 {
 		cfg.MaxEndpoints = DefaultMaxEndpoints
+	}
+	if cfg.Dialer == nil {
+		cfg.Dialer = ssrfSafeDialContext
 	}
 	if cfg.Client == nil {
 		cfg.Client = &http.Client{
