@@ -98,6 +98,7 @@ func TestGraphQLProbe_SuccessfulIntrospection(t *testing.T) {
 	schema := result[0].GraphQLSchema
 	if schema == nil {
 		t.Fatal("GraphQLSchema should not be nil")
+		return
 	}
 	if !schema.IntrospectionEnabled {
 		t.Error("IntrospectionEnabled should be true")
@@ -148,6 +149,7 @@ func TestGraphQLProbe_IntrospectionDisabled(t *testing.T) {
 	schema := result[0].GraphQLSchema
 	if schema == nil {
 		t.Fatal("GraphQLSchema should not be nil when introspection is disabled")
+		return
 	}
 	if schema.IntrospectionEnabled {
 		t.Error("IntrospectionEnabled should be false")
@@ -329,6 +331,7 @@ func TestGraphQLProbe_MalformedJSON(t *testing.T) {
 	schema := result[0].GraphQLSchema
 	if schema == nil {
 		t.Fatal("GraphQLSchema should not be nil for malformed JSON")
+		return
 	}
 	if schema.IntrospectionEnabled {
 		t.Error("IntrospectionEnabled should be false for malformed JSON")
@@ -568,6 +571,7 @@ func TestGraphQLProbe_FullIntrospectionParsing(t *testing.T) {
 	schema := result[0].GraphQLSchema
 	if schema == nil {
 		t.Fatal("GraphQLSchema should not be nil")
+		return
 	}
 	if !schema.IntrospectionEnabled {
 		t.Fatal("IntrospectionEnabled should be true")
@@ -680,6 +684,7 @@ func TestGraphQLProbe_TieredFallback(t *testing.T) {
 	schema := result[0].GraphQLSchema
 	if schema == nil {
 		t.Fatal("GraphQLSchema should not be nil after tier 3 fallback")
+		return
 	}
 	if !schema.IntrospectionEnabled {
 		t.Error("IntrospectionEnabled should be true after successful tier 3")
@@ -716,6 +721,7 @@ func TestGraphQLProbe_Tier1SucceedsImmediately(t *testing.T) {
 	schema := result[0].GraphQLSchema
 	if schema == nil {
 		t.Fatal("GraphQLSchema should not be nil")
+		return
 	}
 	if schema.QueryTypeName != "Query" {
 		t.Errorf("QueryTypeName = %q, want %q", schema.QueryTypeName, "Query")
