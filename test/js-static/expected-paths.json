@@ -1,0 +1,17 @@
+{
+  "description": "Expected paths recovered by static JS bundle analysis (LAB-2108) from reference-capture.json. The capture contains one HTML page and one JS bundle with a fetch POST (body fields), an axios GET (numeric path id), and a template-literal GET (path param). Generated with --analyze-js --confidence 0.1. Param names may vary across versions; the test asserts path count + the x-vespasian-source marker, not exact names.",
+  "paths": {
+    "/api/users": [
+      "GET",
+      "POST"
+    ],
+    "/api/items/{id}": [
+      "GET"
+    ],
+    "/api/orders/{id}/status": [
+      "GET"
+    ]
+  },
+  "total_paths": 3,
+  "source_marker": "js-bundle"
+}

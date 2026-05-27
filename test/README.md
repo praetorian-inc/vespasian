@@ -29,6 +29,7 @@ End-to-end live tests that spin up intentionally simple target applications, run
 | rest-api | REST | Custom API with users, products, orders endpoints | Go binary |
 | soap-service | SOAP/WSDL | Custom SOAP service with GetUser, ListUsers, CreateUser | Go binary |
 | graphql-server | GraphQL | Apollo Server with queries, mutations, enums, unions, nested types | Node.js |
+| generate-js-static | REST (offline) | JS bundle static analysis (LAB-2108): fixed capture with a `fetch`/`axios`/template-literal bundle → OpenAPI with `x-vespasian-source: js-bundle` | None (fixture) |
 
 ## What the Test Runner Does
 
@@ -55,6 +56,12 @@ For deterministic GraphQL tests (`generate-graphql`, `generate-graphql-imports`)
 
 1. **Generate** SDL from fixed reference capture or imported Burp/HAR files
 2. **Diff** against expected SDL (byte-identical comparison)
+
+For the JS bundle static-analysis test (`generate-js-static`, offline — no server or browser):
+
+1. **Generate** an OpenAPI spec from `js-static/reference-capture.json` (one HTML page + one JS bundle containing a `fetch` POST with a JSON body, an `axios` GET, and a template-literal GET) with `--analyze-js --confidence 0.1 --probe=false`
+2. **Assert** the recovered path count matches `js-static/expected-paths.json` and every operation carries `x-vespasian-source: js-bundle`
+3. **Assert opt-out** — re-generating with `--analyze-js=false` yields zero `/api` paths and no `x-vespasian-source` extension
 
 For importer tests:
 

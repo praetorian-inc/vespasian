@@ -1,0 +1,23 @@
+[
+  {
+    "method": "GET",
+    "url": "https://shop.example.com/",
+    "source": "katana",
+    "response": {
+      "status_code": 200,
+      "content_type": "text/html",
+      "body": "PGh0bWw+PGhlYWQ+PHNjcmlwdCBzcmM9Ii9zdGF0aWMvYXBwLmpzIj48L3NjcmlwdD48L2hlYWQ+PGJvZHk+U1BBPC9ib2R5PjwvaHRtbD4="
+    }
+  },
+  {
+    "method": "GET",
+    "url": "https://shop.example.com/static/app.js",
+    "source": "katana",
+    "page_url": "https://shop.example.com/",
+    "response": {
+      "status_code": 200,
+      "content_type": "application/javascript",
+      "body": "Ly8gTWluaWZpZWQtc3R5bGUgU1BBIGJ1bmRsZSBleGVyY2lzaW5nIExBQi0yMTA4IGV4dHJhY3Rpb24uCmNvbnN0IG9yZGVySWQgPSBnZXRPcmRlcklkKCk7CmZldGNoKCIvYXBpL3VzZXJzIiwgeyBtZXRob2Q6ICJQT1NUIiwgYm9keTogSlNPTi5zdHJpbmdpZnkoeyBuYW1lOiAiYWxpY2UiLCBlbWFpbDogImFAYi5jb20iIH0pIH0pOwpheGlvcy5nZXQoIi9hcGkvaXRlbXMvMTIzIik7CmZldGNoKGAvYXBpL29yZGVycy8ke29yZGVySWR9L3N0YXR1c2ApOwo="
+    }
+  }
+]
