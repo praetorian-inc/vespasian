@@ -86,6 +86,14 @@ and probes the discovered URLs with raw HTTP requests. Wrong combinations
 (typically caused by the regex matching unrelated string literals) come back
 404 and are dropped.
 
+The extractor also reconstructs paths built by runtime string concatenation —
+both `String.prototype.concat` (`"/api/posts/".concat(id, "/comment")`) and the
+`+` operator (`"/api/users/" + uid + "/profile"`). Operands that are not string
+literals (identifiers, function calls, expressions) are replaced with a numeric
+placeholder, so `"/api/posts/".concat(id, "/comment")` becomes the probeable
+path `/api/posts/0/comment`, which the OpenAPI generator then parameterizes to
+`/api/posts/{postId}/comment`.
+
 By default this step:
 
 - only probes URLs whose origin matches the scan target — cross-origin URLs
