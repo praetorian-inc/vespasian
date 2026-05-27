@@ -872,6 +872,63 @@ test_generate_graphql_imports() {
     fi
 }
 
+# json_array prints the elements of a top-level JSON array field, one per line.
+# Stdlib only (no PyYAML/jq dependency). Usage: json_array <file> <key>
+json_array() {
+    python3 - "$1" "$2" << 'PYEOF' 2>/dev/null
+import json, sys
+with open(sys.argv[1]) as f:
+    for v in json.load(f).get(sys.argv[2], []):
+        print(v)
+PYEOF
+}
+
+# title_case upper-cases the first letter of a word ("post" -> "Post").
+title_case() { printf '%s%s' "$(printf '%s' "$1" | cut -c1 | tr '[:lower:]' '[:upper:]')" "$(printf '%s' "$1" | cut -c2-)"; }
+
+# assert_js_static_details validates the method matrix and request-body fields
+# of the generated OpenAPI spec against expected-paths.json, using stdlib-only
+# checks (the suite avoids a PyYAML dependency; the generator emits YAML).
+#   - Method matrix: the generator writes "summary: <Method> <path>" per
+#     operation, so we assert that line exists for every expected method on
+#     methods_path (e.g. both "Get /api/users" and "Post /api/users").
+#   - Body fields: request-body schema properties live under the top-level
+#     "components:" section; param names (e.g. "name: itemId") live earlier in
+#     "paths:", so scoping to components disambiguates. A property key renders
+#     as "<indent><field>:" with the value on the following line.
+# Returns 0 on match, 1 (with details on stderr) otherwise.
+# Usage: assert_js_static_details <spec.yaml> <expected-paths.json>
+assert_js_static_details() {
+    local spec=$1 expected=$2
+    local rc=0
+    local mp
+    mp=$(json_field "$expected" methods_path)
+
+    local m
+    while IFS= read -r m; do
+        [ -z "$m" ] && continue
+        if ! grep -qE "summary: $(title_case "$m") ${mp}\$" "$spec"; then
+            echo "  detail: ${mp} missing ${m} operation (no 'summary: $(title_case "$m") ${mp}')" >&2
+            rc=1
+        fi
+    done < <(json_array "$expected" methods)
+
+    # Scope body-field checks to the components: section so path-level param
+    # names ("name: itemId") don't false-match a body field key.
+    local components
+    components=$(sed -n '/^components:/,$p' "$spec")
+    local field
+    while IFS= read -r field; do
+        [ -z "$field" ] && continue
+        if ! printf '%s\n' "$components" | grep -qE "^\s+${field}:\s*\$"; then
+            echo "  detail: request-body field '${field}' not found as a schema property in components" >&2
+            rc=1
+        fi
+    done < <(json_array "$expected" body_fields)
+
+    return $rc
+}
+
 test_generate_js_static() {
     local target_dir="${RESULTS_DIR}/generate-js-static"
     local input_capture="${SCRIPT_DIR}/js-static/reference-capture.json"
@@ -949,10 +1006,24 @@ test_generate_js_static() {
         fi
     done
 
+    # Make the rich fixture load-bearing (not just count + stems):
+    #   - methods_path must carry every method in `methods` (e.g. /api/users has
+    #     BOTH the fetch-derived POST and the jsluice-derived GET — a regression
+    #     collapsing them would keep count==3 and pass the checks above).
+    #   - body_fields (LAB-2108 AC#3) must surface as request-body schema
+    #     properties — the only CLI-level exercise of body recovery on the
+    #     generate path.
+    if assert_js_static_details "$spec_on" "$expected"; then
+        log_ok "method matrix + body fields match expected-paths.json"
+    else
+        failures=$((failures + 1))
+    fi
+
     # ── analyze-js OFF (opt-out): the JS bundle must contribute nothing ──
     # No /api paths (the capture has only an HTML page + a JS bundle) and no
     # x-vespasian-source extension. Guards the --analyze-js=false escape hatch.
     log_info "Generating with --analyze-js=false (opt-out)..."
+    local optout_failures=0
     if ! "$VESPASIAN" generate rest "$input_capture" \
         -o "$spec_off" \
         --analyze-js=false \
@@ -960,18 +1031,22 @@ test_generate_js_static() {
         --probe=false \
         $verbose_flag 2>&1; then
         log_fail "Generate (analyze-js off) failed"
-        failures=$((failures + 1))
+        optout_failures=$((optout_failures + 1))
     else
         if grep -qE '^\s+/api' "$spec_off"; then
             log_fail "--analyze-js=false still produced /api paths (opt-out broken)"
-            failures=$((failures + 1))
+            optout_failures=$((optout_failures + 1))
         fi
         if grep -q 'x-vespasian-source' "$spec_off"; then
             log_fail "--analyze-js=false still emitted x-vespasian-source (opt-out broken)"
-            failures=$((failures + 1))
+            optout_failures=$((optout_failures + 1))
         fi
-        [ $failures -eq 0 ] && log_ok "opt-out clean: no /api paths, no x-vespasian-source"
+        # Key the success log off THIS branch's own counter, not the cumulative
+        # $failures — otherwise an earlier (analyze-js ON) failure would suppress
+        # an accurate "opt-out clean" message even when the opt-out path passed.
+        [ $optout_failures -eq 0 ] && log_ok "opt-out clean: no /api paths, no x-vespasian-source"
     fi
+    failures=$((failures + optout_failures))
 
     local duration=$((SECONDS - start))
     if [ $failures -eq 0 ]; then

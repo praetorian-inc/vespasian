@@ -28,6 +28,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 )
 
@@ -178,7 +179,7 @@ func groupEndpoints(endpoints []classify.ClassifiedRequest) map[endpointKey][]cl
 // x-vespasian-source extension, which is scoped to JS bundle / sourcemap
 // recovery only.
 func isJSStaticSource(source string) bool {
-	return source == "static:js" || source == "static:js-sourcemap"
+	return source == crawl.SourceStaticJS || source == crawl.SourceStaticJSSourcemap
 }
 
 // anyStaticSource returns true if any request in endpoints carries a JS-bundle
@@ -222,9 +223,9 @@ func computeSourceTag(group []classify.ClassifiedRequest) string {
 		}
 		var friendly string
 		switch ep.Source {
-		case "static:js":
+		case crawl.SourceStaticJS:
 			friendly = "js-bundle"
-		case "static:js-sourcemap":
+		case crawl.SourceStaticJSSourcemap:
 			friendly = "js-sourcemap"
 		}
 		if tag == "" {

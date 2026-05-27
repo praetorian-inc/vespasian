@@ -37,6 +37,19 @@ type ObservedRequest struct {
 	PageURL   string `json:"page_url,omitempty"`
 }
 
+// Canonical Source values for static-analysis-derived requests. These live in
+// pkg/crawl because Source is a field of ObservedRequest (defined here) and the
+// values form a shared vocabulary across packages: pkg/analyze/jsstatic writes
+// them and pkg/generate/rest reads them to derive the x-vespasian-source
+// OpenAPI extension. Defining them here keeps the producer and consumer in
+// sync without either package having to import the other.
+const (
+	// SourceStaticJS marks a request synthesized from static analysis of a JS bundle.
+	SourceStaticJS = "static:js"
+	// SourceStaticJSSourcemap marks a request synthesized from a recovered .js.map source.
+	SourceStaticJSSourcemap = "static:js-sourcemap"
+)
+
 // ObservedResponse represents a captured HTTP response.
 type ObservedResponse struct {
 	StatusCode  int               `json:"status_code"`

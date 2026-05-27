@@ -13,5 +13,14 @@
     ]
   },
   "total_paths": 3,
-  "source_marker": "js-bundle"
+  "source_marker": "js-bundle",
+  "methods_path": "/api/users",
+  "methods": [
+    "get",
+    "post"
+  ],
+  "body_fields": [
+    "name",
+    "email"
+  ]
 }

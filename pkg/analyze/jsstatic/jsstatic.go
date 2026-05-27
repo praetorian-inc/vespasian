@@ -26,9 +26,11 @@ import (
 )
 
 // Source values that this package writes to crawl.ObservedRequest.Source.
+// Aliased to the canonical crawl constants so the producer (here) and the
+// consumer (pkg/generate/rest) share one definition.
 const (
-	SourceJS        = "static:js"
-	SourceSourcemap = "static:js-sourcemap"
+	SourceJS        = crawl.SourceStaticJS
+	SourceSourcemap = crawl.SourceStaticJSSourcemap
 )
 
 // Default tuning bounds. Mirrored on Options when zero.
