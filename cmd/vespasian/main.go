@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -780,24 +781,11 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts ge
 // When allowPrivate is true the SSRF-safe dialer is omitted, allowing
 // connections to private/localhost targets (e.g., internal SOAP services).
 func buildWSDLProbeClient(allowPrivate bool) *http.Client {
-	transport := &http.Transport{
-		DialContext:           probe.SSRFSafeDialContext,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second,
+	var dialer func(context.Context, string, string) (net.Conn, error)
+	if !allowPrivate {
+		dialer = probe.SSRFSafeDialContext
 	}
-	if allowPrivate {
-		transport = &http.Transport{
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 10 * time.Second,
-		}
-	}
-	return &http.Client{
-		Timeout:   15 * time.Second,
-		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
+	return sdk.BuildWSDLProbeClient(dialer)
 }
 
 // fetchWSDLBody performs the HTTP GET for wsdlURL using client, reads the

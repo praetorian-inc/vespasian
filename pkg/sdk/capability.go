@@ -39,6 +39,7 @@ import (
 // for unknown types; in the Invoke path this is unreachable because Invoke
 // pre-resolves "auto" via resolveAPITypeWithWSDLProbe + DetectAPIType before
 // reaching emit.
+// Callers outside Invoke must pre-validate apiType against the known set; an unknown type yields an empty SpecFormat.
 func specFormatForAPIType(apiType string) string {
 	switch apiType {
 	case "rest":
@@ -380,6 +381,7 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 // is not overridden by the probe result).
 // Returns the resolved API type and a synthetic ObservedRequest carrying the WSDL
 // body when the probe succeeds, or (apiType, nil) when no probe is needed or fails.
+// For api_type=auto this returns "auto" unchanged when the probe finds no WSDL document; the caller then resolves the concrete type via DetectAPIType.
 func resolveAPITypeWithWSDLProbe(ctx context.Context, apiType, primaryURL string, probeFn func(context.Context, string) []byte) (string, *crawl.ObservedRequest) {
 	if apiType != "auto" && apiType != "wsdl" {
 		return apiType, nil
@@ -404,6 +406,28 @@ func resolveAPITypeWithWSDLProbe(ctx context.Context, apiType, primaryURL string
 		},
 	}
 	return "wsdl", syntheticReq
+}
+
+// BuildWSDLProbeClient builds the single-use http.Client used to fetch a WSDL
+// document. dialer is installed as the transport's DialContext when non-nil
+// (the SSRF-safe dialer in production); pass nil to allow private/localhost
+// targets (the CLI --dangerous-allow-private path). Shared by the CLI WSDL probe
+// and probeWSDLDocumentWith so the transport configuration lives in one place.
+func BuildWSDLProbeClient(dialer func(context.Context, string, string) (net.Conn, error)) *http.Client {
+	transport := &http.Transport{
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+	}
+	if dialer != nil {
+		transport.DialContext = dialer
+	}
+	return &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
 // BuildWSDLProbeURL constructs the URL used to probe for a WSDL document by
@@ -603,17 +627,7 @@ func probeWSDLDocumentWith(ctx context.Context, targetURL string, validate func(
 		return nil
 	}
 
-	client := &http.Client{
-		Timeout: 15 * time.Second,
-		Transport: &http.Transport{
-			DialContext:           dialer,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 10 * time.Second,
-		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
+	client := BuildWSDLProbeClient(dialer)
 	defer client.CloseIdleConnections()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wsdlURL, nil)
@@ -708,7 +722,9 @@ func parseHeaderString(raw string) map[string]string {
 			// Whitespace-only fragments (e.g., from ", ,") are silently skipped.
 			entries[len(entries)-1].val += "," + fragment
 		}
-		// Fragments with no colon-prefixed key and no prior entry, or whitespace-only, are silently ignored.
+		// Two kinds of fragment are intentionally dropped here:
+		//   1. A fragment before the first colon-bearing entry (no prior entry to attach to).
+		//   2. A whitespace-only fragment between valid entries (e.g. from ", ,").
 	}
 
 	headers := make(map[string]string)

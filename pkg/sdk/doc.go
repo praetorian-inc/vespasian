@@ -16,4 +16,14 @@
 // It implements the [capability.Capability] interface for [capmodel.WebApplication]
 // inputs, bridging the headless-browser crawl → classify → probe → generate
 // pipeline with the Chariot capability execution model.
+//
+// Exported surface: [Capability] (implements capability.Capability), [ClassifyProbeGenerate],
+// [DetectAPIType], [ClassifiersForType], [BuildWSDLProbeClient], [BuildWSDLProbeURL],
+// [IsRejectedWSDLStatus], and [ProbeStrategiesForType].
+//
+// SSRF note: The SDK enforces fail-closed SSRF protection for both the crawl
+// frontier and the WSDL probe. Private/loopback targets (e.g., 127.0.0.1,
+// RFC1918 addresses) are rejected even though [Capability.Match] accepts them
+// under the Chariot trusted-seed model. To scan a private or internal SOAP
+// service, use the CLI with --dangerous-allow-private instead of this package.
 package sdk

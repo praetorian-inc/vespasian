@@ -43,7 +43,7 @@ import (
 // Match (url.Parse failure branch)
 // ---------------------------------------------------------------------------
 
-// TestMatch_URLParseError covers the url.Parse failure branch (capability.go:97-99)
+// TestMatch_URLParseError covers the url.Parse failure branch in Match
 // which is the one branch not covered by the black-box tests in capability_test.go.
 // A URL with a space in the host causes url.Parse to return an error on Go 1.12+.
 func TestMatch_URLParseError(t *testing.T) {
@@ -524,7 +524,8 @@ func TestParseHeaderString_MalformedEntry(t *testing.T) {
 }
 
 func TestParseHeaderString_ValueWithColon(t *testing.T) {
-	// SplitN(..., 2) means the first colon is the separator; rest is the value.
+	// The comma-continuation parser uses strings.Index(trimmed, ":") to find the
+	// first colon; everything after is the value, so "Bearer foo:bar" is preserved.
 	result := parseHeaderString("Authorization: Bearer foo:bar")
 	require.Len(t, result, 1)
 	assert.Equal(t, "Bearer foo:bar", result["Authorization"])
@@ -695,7 +696,7 @@ func TestClassifyProbeGenerate_AllProbesFailedFallback(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestProbeWSDLDocument_NilContext verifies that passing a nil context does not
-// panic. The nil-context guard at capability.go:392-394 replaces nil with
+// panic. The nil-context guard in probeWSDLDocumentWith replaces nil with
 // context.Background() before reaching http.NewRequestWithContext.
 // A loopback URL guarantees ValidateProbeURL rejects before any network call.
 func TestProbeWSDLDocument_NilContext(t *testing.T) {
@@ -863,7 +864,7 @@ func TestIsAcceptableWSDLContentType(t *testing.T) {
 // for the auto-resolution gap: when api_type=auto and the WSDL probe returns
 // nil, Invoke must still emit a concrete SpecFormat (matching the actual
 // classifier-detected type), never the empty string. Before the fix at
-// capability.go:368-373, this path emitted SpecFormat="" because
+// this path emitted SpecFormat="" because
 // resolveAPITypeWithWSDLProbe only resolves auto→wsdl, not auto→rest/graphql.
 func TestInvoke_AutoResolvesNonWSDLToConcreteSpecFormat(t *testing.T) {
 	cap := &Capability{
@@ -892,7 +893,7 @@ func TestInvoke_AutoResolvesNonWSDLToConcreteSpecFormat(t *testing.T) {
 
 // TestInvoke_AutoResolvesGraphQLToGraphQLSpecFormat is the GraphQL twin of
 // TestInvoke_AutoResolvesNonWSDLToConcreteSpecFormat. It pins the second
-// reachable arm of the auto-resolution block at capability.go:368-373: when
+// reachable arm of the auto-resolution block in Invoke: when
 // api_type=auto, the WSDL probe returns nil, and the classifier detects
 // GraphQL traffic, the emitted SpecFormat must be capmodel.SpecFormatGraphQL,
 // never empty and never the REST fallback. A regression that hardcoded "rest"
@@ -931,7 +932,7 @@ func TestInvoke_AutoResolvesGraphQLToGraphQLSpecFormat(t *testing.T) {
 
 // TestParseHeaderString_WhitespaceOnlyInteriorEntry exercises the
 // `if hdr == "" { continue }` branch in parseHeaderString
-// (capability.go:528-530). After trimming, the interior blank segment
+// After trimming, the interior blank segment
 // produced by ", ," becomes an empty string and must be skipped so that
 // only the two valid headers survive.
 func TestParseHeaderString_WhitespaceOnlyInteriorEntry(t *testing.T) {
@@ -941,9 +942,8 @@ func TestParseHeaderString_WhitespaceOnlyInteriorEntry(t *testing.T) {
 	assert.Equal(t, "2", result["X-B"])
 }
 
-// TestParseHeaderString_EmptyValue exercises the path through the
-// SplitN branch (capability.go:531-533) where the value after the colon
-// is absent, resulting in an empty string being stored. This documents
+// TestParseHeaderString_EmptyValue exercises the path where the value after
+// the colon is absent, resulting in an empty string being stored. This documents
 // that an entry like "X-Empty:" is accepted and stored as an empty value.
 func TestParseHeaderString_EmptyValue(t *testing.T) {
 	result := parseHeaderString("X-Empty:, X-Set: ok")
@@ -1034,7 +1034,7 @@ func makeWSDLResponse(status int, contentType string, body []byte) *http.Respons
 }
 
 // TestDecodeWSDLResponse_ValidWSDL exercises the happy path through all gates
-// in decodeWSDLResponse (capability.go:507-522): 200 status passes the status
+// in decodeWSDLResponse: 200 status passes the status
 // gate, text/xml passes the content-type gate, and validWSDL passes ParseWSDL.
 func TestDecodeWSDLResponse_ValidWSDL(t *testing.T) {
 	resp := makeWSDLResponse(200, "text/xml", []byte(validWSDL))
@@ -1043,7 +1043,7 @@ func TestDecodeWSDLResponse_ValidWSDL(t *testing.T) {
 }
 
 // TestDecodeWSDLResponse_RejectedContentType exercises the content-type gate
-// (capability.go:511-513). Even though the body is a valid WSDL, text/html
+// Even though the body is a valid WSDL, text/html
 // is rejected before the body is read.
 func TestDecodeWSDLResponse_RejectedContentType(t *testing.T) {
 	resp := makeWSDLResponse(200, "text/html", []byte(validWSDL))
@@ -1052,7 +1052,7 @@ func TestDecodeWSDLResponse_RejectedContentType(t *testing.T) {
 }
 
 // TestDecodeWSDLResponse_RejectedStatus exercises the status gate
-// (capability.go:508-510). The status check fires before content-type,
+// The status check fires before content-type,
 // so all non-2xx codes return nil regardless of body content.
 func TestDecodeWSDLResponse_RejectedStatus(t *testing.T) {
 	cases := []struct {
@@ -1073,7 +1073,7 @@ func TestDecodeWSDLResponse_RejectedStatus(t *testing.T) {
 }
 
 // TestDecodeWSDLResponse_UnparseableBody exercises the ParseWSDL gate
-// (capability.go:518-520). Status and content-type pass, but the body is
+// Status and content-type pass, but the body is
 // not valid XML so wsdlgen.ParseWSDL rejects it and nil is returned.
 func TestDecodeWSDLResponse_UnparseableBody(t *testing.T) {
 	resp := makeWSDLResponse(200, "text/xml", []byte("not-valid-xml"))
@@ -1082,7 +1082,7 @@ func TestDecodeWSDLResponse_UnparseableBody(t *testing.T) {
 }
 
 // TestDecodeWSDLResponse_EmptyContentTypeAccepted exercises the empty-string
-// branch inside isAcceptableWSDLContentType (capability.go:444) when called
+// branch inside isAcceptableWSDLContentType when called
 // end-to-end through decodeWSDLResponse. An empty Content-Type is intentionally
 // permitted because some WSDL endpoints omit it; the parser is then the authority.
 func TestDecodeWSDLResponse_EmptyContentTypeAccepted(t *testing.T) {
@@ -1098,7 +1098,7 @@ type errReader struct{}
 func (errReader) Read(_ []byte) (int, error) { return 0, errors.New("read failure") }
 
 // TestDecodeWSDLResponse_BodyReadError exercises the io.ReadAll error branch
-// (capability.go:515-517) that guards against mid-read body errors such as a
+// that guards against mid-read body errors such as a
 // TLS abort after headers or a truncated chunked response.
 func TestDecodeWSDLResponse_BodyReadError(t *testing.T) {
 	resp := &http.Response{
@@ -1182,7 +1182,7 @@ func TestInvoke_EmitsWebApplicationPreservingInputFields(t *testing.T) {
 }
 
 // TestInvoke_WSDLProbeSynthesizesRequest exercises the WSDL probe branch in
-// Invoke (capability.go:283-296): when wsdlProbeFn returns non-nil bytes the
+// Invoke: when wsdlProbeFn returns non-nil bytes the
 // resolved API type becomes "wsdl" and a synthetic ObservedRequest carrying
 // the WSDL body is injected into the pipeline.
 func TestInvoke_WSDLProbeSynthesizesRequest(t *testing.T) {
@@ -1354,11 +1354,11 @@ func TestInvoke_RESTAPITypeSkipsWSDLProbe(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestInvoke_GraphQLAPITypeSkipsWSDLProbe verifies that the api_type=graphql branch
-// never invokes wsdlProbeFn. The WSDL probe is guarded at capability.go:283 by
-// resolvedAPIType == "auto" || resolvedAPIType == "wsdl" || resolvedAPIType == "rest",
-// which excludes "graphql". The test fails if wsdlProbeCalled is true after Invoke.
+// never invokes wsdlProbeFn. The WSDL probe runs only for api_type "auto" or "wsdl";
+// both "rest" and "graphql" are excluded by resolveAPITypeWithWSDLProbe.
+// The test fails if wsdlProbeCalled is true after Invoke.
 // The emitted spec must contain the inferred-SDL marker "# Inferred from observed traffic"
-// written by pkg/generate/graphql/infer.go:85 when no introspection schema is present.
+// written by pkg/generate/graphql/infer.go when no introspection schema is present.
 func TestInvoke_GraphQLAPITypeSkipsWSDLProbe(t *testing.T) {
 	wsdlProbeCalled := false
 
@@ -1397,9 +1397,9 @@ func TestInvoke_GraphQLAPITypeSkipsWSDLProbe(t *testing.T) {
 
 // TestInvoke_GenerateErrorPropagates mirrors TestInvoke_CrawlErrorPropagates but
 // for the generate-spec path. Setting api_type=bogus forces ClassifyProbeGenerate
-// to return "unsupported API type: \"bogus\"" (capability.go:333-335).
-// The WSDL probe branch at capability.go:283 is skipped because "bogus" is not
-// "auto", "wsdl", or "rest". The emitter must never be called.
+// to return "unsupported API type: \"bogus\"".
+// The WSDL probe is skipped because "bogus" is not "auto" or "wsdl".
+// The emitter must never be called.
 func TestInvoke_GenerateErrorPropagates(t *testing.T) {
 	cap := &Capability{
 		crawlFn: func(_ context.Context, _ string, _ invokeParams) ([]crawl.ObservedRequest, error) {

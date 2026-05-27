@@ -2077,6 +2077,23 @@ func TestProbeWSDLDocument_URLConstruction(t *testing.T) {
 	}
 }
 
+// TestProbeWSDLDocument_SSRFDefaultBlocksLoopback verifies the secure default
+// (allowPrivate=false) rejects a loopback target via SSRF protection, exercising
+// the buildWSDLProbeClient(false) branch the other probe tests (all allowPrivate=true)
+// never reach.
+func TestProbeWSDLDocument_SSRFDefaultBlocksLoopback(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/xml")
+		w.Write([]byte(`<definitions/>`)) //nolint:gosec // test code
+	}))
+	defer ts.Close()
+
+	doc := probeWSDLDocument(context.Background(), ts.URL, false /*allowPrivate*/, false)
+	if doc != nil {
+		t.Errorf("probeWSDLDocument(allowPrivate=false) must reject the loopback target via SSRF protection, got %d bytes", len(doc))
+	}
+}
+
 // TestAPITypeDisplayName verifies display name mapping for verbose output.
 func TestAPITypeDisplayName(t *testing.T) {
 	tests := []struct {

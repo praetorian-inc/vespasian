@@ -319,7 +319,9 @@ pkg/sdk/                Chariot capability integration (embedded usage)
 
 ### SDK / Embedded Usage
 
-In addition to the CLI, Vespasian ships an SDK in [`pkg/sdk`](pkg/sdk) that implements `capability.Capability[capmodel.WebApplication]` from `github.com/praetorian-inc/capability-sdk`. This lets the Praetorian Chariot platform (and any other capability-sdk consumer) run Vespasian's classify-probe-generate pipeline in-process without re-implementing it. The exported helpers `ClassifyProbeGenerate`, `DetectAPIType`, and `ClassifiersForType` are also reusable directly.
+In addition to the CLI, Vespasian ships an SDK in [`pkg/sdk`](pkg/sdk) that implements `capability.Capability[capmodel.WebApplication]` from `github.com/praetorian-inc/capability-sdk`. This lets the Praetorian Chariot platform (and any other capability-sdk consumer) run Vespasian's classify-probe-generate pipeline in-process without re-implementing it. The exported helpers `ClassifyProbeGenerate`, `DetectAPIType`, `ClassifiersForType`, and `BuildWSDLProbeClient` are also reusable directly.
+
+**SSRF protection in the SDK path:** The SDK enforces fail-closed SSRF protection for both the headless crawl frontier and the WSDL probe. Private/loopback targets (e.g., `127.0.0.1`, RFC1918 addresses) will be rejected by the crawl frontier and will silently return no WSDL document, even though `Match` accepts them under the Chariot trusted-seed model. If you need to scan a private or internal SOAP service, use the CLI with `--dangerous-allow-private` instead of the SDK/Chariot path.
 
 ## Frequently Asked Questions
 
