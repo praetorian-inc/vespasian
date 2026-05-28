@@ -12,12 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package grpcwire parses the gRPC length-prefixed framing and the protobuf
-// wire format used inside it. Used by the classifier (confidence boost when
-// observed bodies parse as valid framed protobuf) and by the gRPC generator
-// (traffic-based RPC inference when reflection is unavailable).
-//
-// Reference: https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md
 package grpcwire
 
 import (
@@ -105,6 +99,12 @@ func ParseVarint(b []byte) (uint64, int, error) {
 		if i >= maxVarintBytes {
 			return 0, 0, errors.New("grpcwire: varint exceeds 10 bytes")
 		}
+		// The 10th byte can contribute at most 1 useful bit (9*7=63 bits
+		// already accumulated). Any value above 0x01 in the low bits would
+		// overflow uint64.
+		if i == maxVarintBytes-1 && b[i] > 0x01 {
+			return 0, 0, errors.New("grpcwire: varint overflows uint64")
+		}
 		v |= uint64(b[i]&0x7F) << shift
 		if b[i]&0x80 == 0 {
 			return v, i + 1, nil
@@ -115,14 +115,19 @@ func ParseVarint(b []byte) (uint64, int, error) {
 }
 
 // ParseTag decodes a protobuf field tag (field number + wire type) from the
-// head of b.
+// head of b. Returns an error if the field number is 0, which is reserved
+// and therefore malformed input per the protobuf spec.
 func ParseTag(b []byte) (Tag, int, error) {
 	v, n, err := ParseVarint(b)
 	if err != nil {
 		return Tag{}, 0, err
 	}
+	fieldNum := v >> 3
+	if fieldNum == 0 {
+		return Tag{}, 0, errors.New("grpcwire: invalid field number 0")
+	}
 	return Tag{
-		FieldNumber: int(v >> 3),
+		FieldNumber: int(fieldNum),
 		WireType:    WireType(v & 0x07),
 	}, n, nil
 }

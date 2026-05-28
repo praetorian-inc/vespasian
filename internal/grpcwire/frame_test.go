@@ -128,6 +128,20 @@ func TestParseVarint_Overflow(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestParseVarint_OverflowOn10thByte(t *testing.T) {
+	// 9 continuation bytes plus a 10th byte whose payload exceeds 1 bit
+	// would overflow uint64 if applied.
+	b := []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02}
+	_, _, err := ParseVarint(b)
+	assert.Error(t, err)
+}
+
+func TestParseTag_FieldNumberZero(t *testing.T) {
+	// Tag 0 (field=0, wire=0) is invalid per the protobuf spec.
+	_, _, err := ParseTag([]byte{0x00})
+	assert.Error(t, err)
+}
+
 func TestParseTag(t *testing.T) {
 	tests := []struct {
 		name     string
