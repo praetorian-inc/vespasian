@@ -98,6 +98,11 @@ preflight_test_host() {
             _probe_target_host "${GRAPHQL_SERVER_PORT:-}" "/" "graphql-server" || failed=1
             ;;
     esac
+    case ",${targets}," in
+        *,concat-spa,*)
+            _probe_target_host "${CONCAT_SPA_PORT:-}" "/healthz" "concat-spa" || failed=1
+            ;;
+    esac
     [ $failed -eq 0 ] && return 0
     if [ "$TEST_HOST" = "localhost" ]; then
         log_info "Is ./test/setup-live-targets.sh running? Check the failing URL on this host."
@@ -246,6 +251,88 @@ test_rest_api() {
     else
         set_test_result "rest-api" "FAIL" "$endpoint_count" "$expected_count" "$duration"
         log_fail "rest-api: ${failures} check(s) failed (${duration}s)"
+    fi
+}
+
+test_concat_spa() {
+    local port="${CONCAT_SPA_PORT:-8993}"
+    local base_url="http://${TEST_HOST}:${port}"
+    local target_dir="${RESULTS_DIR}/concat-spa"
+    local capture_file="${target_dir}/capture.json"
+    local spec_file="${target_dir}/spec.yaml"
+    local expected="${SCRIPT_DIR}/concat-spa/expected-paths.json"
+    local verbose_flag=""
+
+    [ "${VERBOSE:-false}" = true ] && verbose_flag="-v"
+
+    mkdir -p "$target_dir"
+    init_test_status "concat-spa"
+
+    local start=$SECONDS
+    local failures=0
+
+    log_header "Testing: concat-spa (${base_url})"
+
+    # Step 1: Crawl. The index page has no API links; the endpoints exist only
+    # as String.prototype.concat / +-string concatenations inside app.js, so
+    # they can be discovered solely by the post-crawl JS-replay concat
+    # extractor (LAB-1368 Strategy 5), which probes the reconstructed paths.
+    log_info "Crawling ${base_url}..."
+    if ! "$VESPASIAN" crawl "$base_url" \
+        -o "$capture_file" \
+        --depth 2 \
+        --max-pages 50 \
+        --timeout 2m \
+        --dangerous-allow-private \
+        $verbose_flag 2>&1; then
+        log_fail "Crawl failed"
+        set_test_result "concat-spa" "FAIL" "?" "?" "$((SECONDS - start))"
+        return 1
+    fi
+
+    # Step 2: Validate capture has at least the two concat-derived requests.
+    if ! validate_capture "$capture_file" 2; then
+        failures=$((failures + 1))
+    fi
+
+    # Step 3: Generate OpenAPI spec (paths already probed during the crawl).
+    log_info "Generating OpenAPI spec..."
+    if ! "$VESPASIAN" generate rest "$capture_file" \
+        -o "$spec_file" \
+        --probe=false \
+        $verbose_flag 2>&1; then
+        log_fail "Generate failed"
+        set_test_result "concat-spa" "FAIL" "?" "?" "$((SECONDS - start))"
+        return 1
+    fi
+
+    # Step 4: Validate spec. The concat-derived endpoints must be present;
+    # this is the assertion that proves Strategy 5 discovered them. The
+    # receiver literals and the 404 control must NOT survive (they 404 and
+    # are filtered) — validate_path_coverage checks expected ⊆ spec, and the
+    # expected set is exactly the two concat endpoints.
+    if ! validate_openapi_structure "$spec_file"; then
+        failures=$((failures + 1))
+    fi
+    if ! validate_path_coverage "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+    if ! validate_no_static_assets "$spec_file"; then
+        failures=$((failures + 1))
+    fi
+
+    local endpoint_count
+    endpoint_count=$(count_spec_endpoints "$spec_file")
+    local expected_count
+    expected_count=$(json_field "$expected" total_paths)
+
+    local duration=$((SECONDS - start))
+    if [ $failures -eq 0 ]; then
+        set_test_result "concat-spa" "PASS" "$endpoint_count" "$expected_count" "$duration"
+        log_ok "concat-spa: ALL CHECKS PASSED (${duration}s)"
+    else
+        set_test_result "concat-spa" "FAIL" "$endpoint_count" "$expected_count" "$duration"
+        log_fail "concat-spa: ${failures} check(s) failed (${duration}s)"
     fi
 }
 
@@ -2060,7 +2147,7 @@ main() {
 
     # Default targets from config
     if [ -z "$targets" ]; then
-        targets="${TARGETS_SETUP:-rest-api,soap-service,graphql-server}"
+        targets="${TARGETS_SETUP:-rest-api,soap-service,graphql-server,concat-spa}"
         # Always include importer tests
         targets="${targets},import-burp,import-har,import-base64,import-mitmproxy,import-mitmproxy-native,import-unicode,import-duplicates,import-malformed,import-empty"
         targets="${targets},generate-rest,generate-wsdl,generate-graphql,generate-graphql-imports"
@@ -2096,6 +2183,7 @@ main() {
             rest-api)      test_rest_api ;;
             soap-service)    test_soap_service ;;
             graphql-server)  test_graphql_server ;;
+            concat-spa)      test_concat_spa ;;
             import-burp)        test_import_burp ;;
             import-har)         test_import_har ;;
             import-base64)      test_import_base64 ;;
