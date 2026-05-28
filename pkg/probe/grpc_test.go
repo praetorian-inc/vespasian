@@ -246,6 +246,7 @@ func TestGRPCProbe_Probe_SkipsNonGRPCEndpoints(t *testing.T) {
 
 	result, err := probe.Probe(ctx, endpoints)
 	require.NoError(t, err)
+	require.Len(t, result, 1)
 	assert.Nil(t, result[0].GRPCSchema, "non-gRPC endpoints should not be probed")
 }
 
@@ -266,6 +267,7 @@ func TestGRPCProbe_Probe_FailsClosedOnValidator(t *testing.T) {
 
 	result, err := probe.Probe(ctx, endpoints)
 	require.NoError(t, err)
+	require.Len(t, result, 1)
 	assert.Nil(t, result[0].GRPCSchema, "blocked target should not produce a schema")
 }
 

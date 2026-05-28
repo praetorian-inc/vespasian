@@ -69,8 +69,11 @@ func (p *GRPCProbe) Name() string {
 // are deduplicated — reflection is called once per server, and the resulting
 // schema is applied to every endpoint matching that target.
 func (p *GRPCProbe) Probe(ctx context.Context, endpoints []classify.ClassifiedRequest) ([]classify.ClassifiedRequest, error) {
-	schemasByTarget := make(map[string]*classify.GRPCReflectionResult)
-	seen := make(map[string]bool)
+	// Key by the full grpcTargetInfo (hostPort + useTLS), not hostPort alone:
+	// http://h:443 and https://h:443 share a host:port but must not share a
+	// reflection probe result.
+	schemasByTarget := make(map[grpcTargetInfo]*classify.GRPCReflectionResult)
+	seen := make(map[grpcTargetInfo]bool)
 
 	for _, ep := range endpoints {
 		if ep.APIType != "grpc" {
@@ -81,15 +84,15 @@ func (p *GRPCProbe) Probe(ctx context.Context, endpoints []classify.ClassifiedRe
 			slog.DebugContext(ctx, "grpc probe: target derivation failed", "url", ep.URL, "error", err)
 			continue
 		}
-		if seen[target.hostPort] {
+		if seen[target] {
 			continue
 		}
 		if len(seen) >= p.config.MaxEndpoints {
 			break
 		}
-		seen[target.hostPort] = true
+		seen[target] = true
 
-		schemasByTarget[target.hostPort] = p.probeTarget(ctx, target)
+		schemasByTarget[target] = p.probeTarget(ctx, target)
 	}
 
 	// Copy endpoints to avoid mutating the caller's slice.
@@ -104,7 +107,7 @@ func (p *GRPCProbe) Probe(ctx context.Context, endpoints []classify.ClassifiedRe
 		if err != nil {
 			continue
 		}
-		if schema, ok := schemasByTarget[target.hostPort]; ok && schema != nil {
+		if schema, ok := schemasByTarget[target]; ok && schema != nil {
 			result[i].GRPCSchema = schema
 		}
 	}
