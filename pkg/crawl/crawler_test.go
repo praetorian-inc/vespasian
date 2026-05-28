@@ -112,11 +112,11 @@ func TestMapResult_Normal(t *testing.T) {
 	if len(observed.QueryParams) != 2 {
 		t.Errorf("QueryParams length = %d, want 2", len(observed.QueryParams))
 	}
-	if observed.QueryParams["foo"] != "bar" {
-		t.Errorf("QueryParams[foo] = %q, want %q", observed.QueryParams["foo"], "bar")
+	if len(observed.QueryParams["foo"]) == 0 || observed.QueryParams["foo"][0] != "bar" {
+		t.Errorf("QueryParams[foo] = %v, want [bar]", observed.QueryParams["foo"])
 	}
-	if observed.QueryParams["baz"] != "qux" {
-		t.Errorf("QueryParams[baz] = %q, want %q", observed.QueryParams["baz"], "qux")
+	if len(observed.QueryParams["baz"]) == 0 || observed.QueryParams["baz"][0] != "qux" {
+		t.Errorf("QueryParams[baz] = %v, want [qux]", observed.QueryParams["baz"])
 	}
 
 	// Check response
@@ -219,6 +219,25 @@ func TestMapResult_InvalidURL(t *testing.T) {
 
 	if observed.QueryParams != nil {
 		t.Errorf("QueryParams = %v, want nil (failed parse)", observed.QueryParams)
+	}
+}
+
+// TestMapResult_MultiValueQueryParam tests MapResult preserves multi-value query params.
+func TestMapResult_MultiValueQueryParam(t *testing.T) {
+	result := output.Result{
+		Request: &navigation.Request{
+			Method: "GET",
+			URL:    "https://x.test?tag=a&tag=b",
+		},
+	}
+
+	observed := MapResult(result)
+
+	if len(observed.QueryParams["tag"]) != 2 {
+		t.Errorf("QueryParams[tag] length = %d, want 2", len(observed.QueryParams["tag"]))
+	}
+	if observed.QueryParams["tag"][0] != "a" || observed.QueryParams["tag"][1] != "b" {
+		t.Errorf("QueryParams[tag] = %v, want [a b]", observed.QueryParams["tag"])
 	}
 }
 
