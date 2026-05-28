@@ -299,7 +299,7 @@ test_concat_spa() {
     local capture_missing=0
     local concat_url
     for concat_url in "/api/users/0/orders" "/api/products/0/reviews"; do
-        if ! jq -e --arg s "$concat_url" 'any(.[]; (.URL // "") | endswith($s))' "$capture_file" >/dev/null 2>&1; then
+        if ! jq -e --arg s "$concat_url" 'any(.[]; (.url // "") | endswith($s))' "$capture_file" >/dev/null 2>&1; then
             log_fail "concat-spa: capture missing concat-derived request ${concat_url}"
             capture_missing=1
         fi
