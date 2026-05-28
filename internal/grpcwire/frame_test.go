@@ -136,6 +136,15 @@ func TestParseVarint_OverflowOn10thByte(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestParseTag_FieldNumberExceedsMax(t *testing.T) {
+	// Field number 2^29 (one past the protobuf maximum) → tag value
+	// (2^29 << 3) = 2^32, encoded as a multi-byte varint.
+	tagValue := uint64(1<<29) << 3
+	b := varint(tagValue)
+	_, _, err := ParseTag(b)
+	assert.Error(t, err)
+}
+
 func TestParseTag_FieldNumberZero(t *testing.T) {
 	// Tag 0 (field=0, wire=0) is invalid per the protobuf spec.
 	_, _, err := ParseTag([]byte{0x00})

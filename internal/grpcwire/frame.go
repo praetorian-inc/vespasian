@@ -47,7 +47,7 @@ func ParseFrame(b []byte) (Frame, int, error) {
 	return Frame{
 		Compressed: b[0] != 0,
 		Message:    b[FrameHeaderLen:end],
-	}, int(end), nil //nolint:gosec // G115: end was checked against uint64(len(b)) above
+	}, int(end), nil // #nosec G115 -- end was checked against uint64(len(b)); len returns int
 }
 
 // ParseFrames walks b, returning every frame found. Stops on the first parse
@@ -66,8 +66,9 @@ func ParseFrames(b []byte) ([]Frame, error) {
 }
 
 // WireType is the 3-bit suffix of each protobuf tag, identifying how the
-// value bytes are encoded.
-type WireType int
+// value bytes are encoded. The underlying type is uint64 so that
+// `WireType(v & 0x07)` in ParseTag is a no-op cast (no narrowing).
+type WireType uint64
 
 // Wire-format constants as defined in the protobuf encoding spec.
 const (
@@ -114,9 +115,14 @@ func ParseVarint(b []byte) (uint64, int, error) {
 	return 0, 0, errors.New("grpcwire: varint truncated")
 }
 
+// maxProtoFieldNumber is the largest valid protobuf field number per the
+// wire-format spec (2^29 - 1). Bounds the value returned by ParseTag so the
+// subsequent int(fieldNum) conversion is provably safe on any platform.
+const maxProtoFieldNumber = (1 << 29) - 1
+
 // ParseTag decodes a protobuf field tag (field number + wire type) from the
-// head of b. Returns an error if the field number is 0, which is reserved
-// and therefore malformed input per the protobuf spec.
+// head of b. Returns an error if the field number is 0 (reserved) or
+// exceeds the protobuf-spec maximum (2^29 - 1).
 func ParseTag(b []byte) (Tag, int, error) {
 	v, n, err := ParseVarint(b)
 	if err != nil {
@@ -125,6 +131,9 @@ func ParseTag(b []byte) (Tag, int, error) {
 	fieldNum := v >> 3
 	if fieldNum == 0 {
 		return Tag{}, 0, errors.New("grpcwire: invalid field number 0")
+	}
+	if fieldNum > maxProtoFieldNumber {
+		return Tag{}, 0, errors.New("grpcwire: field number exceeds protobuf maximum (2^29-1)")
 	}
 	return Tag{
 		FieldNumber: int(fieldNum),
