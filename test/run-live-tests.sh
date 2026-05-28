@@ -258,7 +258,6 @@ test_concat_spa() {
     local port="${CONCAT_SPA_PORT:-8993}"
     local base_url="http://${TEST_HOST}:${port}"
     local target_dir="${RESULTS_DIR}/concat-spa"
-    local capture_file="${target_dir}/capture.json"
     local spec_file="${target_dir}/spec.yaml"
     local expected="${SCRIPT_DIR}/concat-spa/expected-paths.json"
     local verbose_flag=""
@@ -273,51 +272,30 @@ test_concat_spa() {
 
     log_header "Testing: concat-spa (${base_url})"
 
-    # Step 1: Crawl. The index page has no API links; the endpoints exist only
-    # as String.prototype.concat / +-string concatenations inside app.js, so
-    # they can be discovered solely by the post-crawl JS-replay concat
-    # extractor (LAB-1368 Strategy 5), which probes the reconstructed paths.
-    log_info "Crawling ${base_url}..."
-    if ! "$VESPASIAN" crawl "$base_url" \
-        -o "$capture_file" \
+    # Single-stage scan (NOT the two-stage crawl+generate the other targets
+    # use). The LAB-1368 concat extraction lives in the post-crawl JS-replay
+    # step (ReplayJSExtracted), which is invoked ONLY by `scan` — `crawl`
+    # produces a passive browser capture without ever running JS-replay, so
+    # the concat-derived endpoints would never enter the capture. The other
+    # live targets pass with `crawl` because their endpoints are href-linked
+    # and the browser captures them directly; concat-spa's endpoints exist
+    # only via concat() / +-string expressions in app.js, which only
+    # JS-replay discovers.
+    log_info "Scanning ${base_url} (single-stage: crawl + JS-replay + generate)..."
+    if ! "$VESPASIAN" scan "$base_url" \
+        -o "$spec_file" \
+        --api-type rest \
         --depth 2 \
         --max-pages 50 \
         --timeout 2m \
         --dangerous-allow-private \
         $verbose_flag 2>&1; then
-        log_fail "Crawl failed"
+        log_fail "Scan failed"
         set_test_result "concat-spa" "FAIL" "?" "?" "$((SECONDS - start))"
         return 1
     fi
 
-    # Step 2: Validate capture. Coarse min-count gate, plus pin the two
-    # concat-derived request URLs by name so a regression that drops one is
-    # caught here (not only at spec level).
-    if ! validate_capture "$capture_file" 2; then
-        failures=$((failures + 1))
-    fi
-    local capture_missing=0
-    local concat_url
-    for concat_url in "/api/users/0/orders" "/api/products/0/reviews"; do
-        if ! jq -e --arg s "$concat_url" 'any(.[]; (.url // "") | endswith($s))' "$capture_file" >/dev/null 2>&1; then
-            log_fail "concat-spa: capture missing concat-derived request ${concat_url}"
-            capture_missing=1
-        fi
-    done
-    [ $capture_missing -eq 0 ] || failures=$((failures + 1))
-
-    # Step 3: Generate OpenAPI spec (paths already probed during the crawl).
-    log_info "Generating OpenAPI spec..."
-    if ! "$VESPASIAN" generate rest "$capture_file" \
-        -o "$spec_file" \
-        --probe=false \
-        $verbose_flag 2>&1; then
-        log_fail "Generate failed"
-        set_test_result "concat-spa" "FAIL" "?" "?" "$((SECONDS - start))"
-        return 1
-    fi
-
-    # Step 4: Validate spec. Three layers make this a real 404-filter
+    # Validate spec. Three layers make this a real 404-filter
     # regression guard, not just a "did we find the endpoints" check:
     #   (a) validate_path_coverage  — the two concat endpoints are PRESENT
     #       (proves Strategy-5 discovery reached the spec);
