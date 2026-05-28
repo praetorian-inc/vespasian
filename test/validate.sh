@@ -550,3 +550,69 @@ for line in content.split("\n"):
 print(count)
 PYEOF
 }
+
+# validate_paths_absent fails if any forbidden path appears as a top-level
+# key in the OpenAPI spec. Matching convention per forbidden value F:
+#   - F ending in "/"  → SUBTREE match: flags the root and any descendant
+#                        (e.g. "/api/missing/" flags "/api/missing" and
+#                        "/api/missing/{id}/gone").
+#   - F without "/"    → EXACT match only (e.g. "/api/users" flags the bare
+#                        receiver literal but NOT "/api/users/{id}/orders").
+# Used to assert that paths which must be filtered out (404 controls, bare
+# receiver literals) did not leak into the generated spec.
+# Usage: validate_paths_absent <spec_file> <forbidden_path>...
+validate_paths_absent() {
+    local spec_file=$1
+    shift
+    local result
+    result=$(python3 - "$spec_file" "$@" << 'PYEOF'
+import sys, re
+
+spec_file = sys.argv[1]
+forbidden = sys.argv[2:]
+
+with open(spec_file) as f:
+    content = f.read()
+
+keys = []
+in_paths = False
+paths_indent = None
+for line in content.split("\n"):
+    stripped = line.rstrip()
+    if re.match(r"^paths:\s*$", stripped):
+        in_paths = True
+        continue
+    if in_paths:
+        if stripped and not stripped[0].isspace():
+            break
+        m = re.match(r'^(\s+)(?:"(/[^"]*)"|\'(/[^\']*)\'|(/[^:"\']*)):', stripped)
+        if m:
+            indent = m.group(1)
+            if paths_indent is None:
+                paths_indent = indent
+            if indent == paths_indent:
+                keys.append(m.group(2) or m.group(3) or m.group(4))
+
+
+def is_forbidden(k, fb):
+    if fb.endswith("/"):
+        root = fb.rstrip("/")
+        return k == root or k.startswith(root + "/")
+    return k == fb
+
+
+bad = sorted({k for k in keys for fb in forbidden if is_forbidden(k, fb)})
+if bad:
+    print("LEAKED: " + ", ".join(bad))
+    sys.exit(1)
+print("OK: none of %d forbidden path(s) present" % len(forbidden))
+PYEOF
+    )
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        log_fail "Forbidden paths present in spec: ${result#LEAKED: }"
+        return 1
+    fi
+    log_ok "${result}"
+    return 0
+}

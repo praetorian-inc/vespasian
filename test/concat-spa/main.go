@@ -82,6 +82,11 @@ func main() {
 	}
 }
 
+// indexHTML references app.js via an absolute path (/app.js) so the script
+// URL resolves identically regardless of the crawl's seed path. (The
+// in-process TestReplayJSExtracted_ConcatStyle_EndToEnd uses a relative
+// "app.js" to exercise relative resolution; this live target deliberately
+// covers the absolute form.)
 const indexHTML = `<!doctype html><html><head>
 <script src="/app.js"></script>
 </head><body><h1>Concat SPA</h1></body></html>`

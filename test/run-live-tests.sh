@@ -290,10 +290,21 @@ test_concat_spa() {
         return 1
     fi
 
-    # Step 2: Validate capture has at least the two concat-derived requests.
+    # Step 2: Validate capture. Coarse min-count gate, plus pin the two
+    # concat-derived request URLs by name so a regression that drops one is
+    # caught here (not only at spec level).
     if ! validate_capture "$capture_file" 2; then
         failures=$((failures + 1))
     fi
+    local capture_missing=0
+    local concat_url
+    for concat_url in "/api/users/0/orders" "/api/products/0/reviews"; do
+        if ! jq -e --arg s "$concat_url" 'any(.[]; (.URL // "") | endswith($s))' "$capture_file" >/dev/null 2>&1; then
+            log_fail "concat-spa: capture missing concat-derived request ${concat_url}"
+            capture_missing=1
+        fi
+    done
+    [ $capture_missing -eq 0 ] || failures=$((failures + 1))
 
     # Step 3: Generate OpenAPI spec (paths already probed during the crawl).
     log_info "Generating OpenAPI spec..."
@@ -306,11 +317,23 @@ test_concat_spa() {
         return 1
     fi
 
-    # Step 4: Validate spec. The concat-derived endpoints must be present;
-    # this is the assertion that proves Strategy 5 discovered them. The
-    # receiver literals and the 404 control must NOT survive (they 404 and
-    # are filtered) — validate_path_coverage checks expected ⊆ spec, and the
-    # expected set is exactly the two concat endpoints.
+    # Step 4: Validate spec. Three layers make this a real 404-filter
+    # regression guard, not just a "did we find the endpoints" check:
+    #   (a) validate_path_coverage  — the two concat endpoints are PRESENT
+    #       (proves Strategy-5 discovery reached the spec);
+    #   (b) exact-count assertion   — the spec has EXACTLY total_paths (2),
+    #       so nothing extra leaked;
+    #   (c) validate_paths_absent   — the receiver literals (/api/users,
+    #       /api/products) and the 404 control (/api/missing) are explicitly
+    #       NOT present, with a precise message if the 404 filter regresses.
+    # (b)+(c) together enforce the "must NOT appear" half of the contract that
+    # the previous version only documented but never checked.
+    #
+    # Strategy provenance — that these paths came from the concat extractor
+    # specifically rather than another strategy — is owned by the in-process
+    # mutation test TestReplayJSExtracted_ConcatStyle_EndToEnd. This live
+    # target proves the integrated binary + Chrome-crawl pipeline discovers
+    # them end-to-end.
     if ! validate_openapi_structure "$spec_file"; then
         failures=$((failures + 1))
     fi
@@ -320,11 +343,23 @@ test_concat_spa() {
     if ! validate_no_static_assets "$spec_file"; then
         failures=$((failures + 1))
     fi
+    # /api/users and /api/products are EXACT (bare receiver literals that must
+    # not survive); /api/missing/ is a SUBTREE (the 404 control endpoint).
+    if ! validate_paths_absent "$spec_file" "/api/users" "/api/products" "/api/missing/"; then
+        failures=$((failures + 1))
+    fi
 
     local endpoint_count
     endpoint_count=$(count_spec_endpoints "$spec_file")
     local expected_count
     expected_count=$(json_field "$expected" total_paths)
+
+    # Exact-count: any path beyond the two concat endpoints means a receiver
+    # literal or the control leaked through the 404 filter.
+    if [ "$endpoint_count" != "$expected_count" ]; then
+        log_fail "concat-spa: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
+        failures=$((failures + 1))
+    fi
 
     local duration=$((SECONDS - start))
     if [ $failures -eq 0 ]; then
