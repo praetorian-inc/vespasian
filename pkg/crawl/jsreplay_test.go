@@ -1670,6 +1670,76 @@ func TestReplayJSExtracted_HTMLScriptDiscovery(t *testing.T) {
 	assert.Contains(t, apiURLs, srv.URL+"/rest/user/login")
 }
 
+// TestReplayJSExtracted_ConcatStyle_EndToEnd is the end-to-end (real HTTP,
+// no Chrome) regression test for the LAB-1368 concat extraction. The replay
+// step discovers an external app.js from the captured HTML, fetches it over
+// HTTP, reconstructs paths that exist ONLY as String.prototype.concat and
+// +-operator concatenations (the dynamic operand is a real identifier, so no
+// other extraction strategy can produce the full path), probes them, and
+// keeps the 200s while dropping the 404 control. This exercises the same
+// fetch → extract → probe → 404-filter pipeline that the other strategies'
+// _EndToEnd tests cover, but for Strategy 5.
+func TestReplayJSExtracted_ConcatStyle_EndToEnd(t *testing.T) {
+	// .concat() form, +-chain form, and a concat form whose reconstructed
+	// path 404s (control for the filter). None of the full paths appear as
+	// quoted literals — only the concat extractor can reconstruct them.
+	const appJS = `
+		function loadOrders(uid)  { return fetch("/api/users/".concat(uid, "/orders")); }
+		function loadReviews(pid) { var u = "/api/products/" + pid + "/reviews"; return fetch(u); }
+		function loadGone(x)      { return fetch("/api/missing/".concat(x, "/gone")); }
+	`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			w.Write([]byte(appJS)) //nolint:errcheck,gosec // test handler
+		case "/api/users/0/orders":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"orders":[]}`)) //nolint:errcheck,gosec // test handler
+		case "/api/products/0/reviews":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"reviews":[]}`)) //nolint:errcheck,gosec // test handler
+		// /api/missing/0/gone falls through to the 404 default.
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	// Capture: an HTML page referencing the external app.js (mirrors a real
+	// crawl). The replay step fetches app.js from the live server itself.
+	requests := []ObservedRequest{
+		{
+			Method: "GET",
+			URL:    srv.URL + "/",
+			Source: "katana",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<!DOCTYPE html><html><head><script src="app.js"></script></head></html>`),
+			},
+		},
+	}
+
+	cfg := allowLocal(srv)
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	var jsExtracted []string
+	for _, r := range result {
+		if r.Source == "js-extract" {
+			jsExtracted = append(jsExtracted, r.URL)
+		}
+	}
+	// Both reconstructed concat paths are probed and kept (200).
+	assert.Contains(t, jsExtracted, srv.URL+"/api/users/0/orders",
+		"String.prototype.concat path must be reconstructed, probed, and kept")
+	assert.Contains(t, jsExtracted, srv.URL+"/api/products/0/reviews",
+		"+-chain path must be reconstructed, probed, and kept")
+	// The reconstructed concat path that 404s must be dropped by the filter.
+	assert.NotContains(t, jsExtracted, srv.URL+"/api/missing/0/gone",
+		"a reconstructed concat path that 404s must be dropped")
+}
+
 func TestAddPath_RejectsURLCredentials(t *testing.T) {
 	// SEC-BE-003: full URLs with embedded credentials must be dropped.
 	js := []byte(`"http://user:pass@evil.example.com/api/v1/exfil"`)
