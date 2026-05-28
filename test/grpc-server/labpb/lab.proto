@@ -1,0 +1,61 @@
+// Copyright 2026 Praetorian Security, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+
+syntax = "proto3";
+
+package lab.v1;
+
+option go_package = "github.com/praetorian-inc/vespasian/test/grpc-server/labpb";
+
+message User {
+  string id = 1;
+  string name = 2;
+  string email = 3;
+}
+
+message GetUserRequest {
+  string id = 1;
+}
+
+message ListUsersRequest {}
+
+message Order {
+  string id = 1;
+  string user_id = 2;
+  string product = 3;
+  double total = 4;
+}
+
+message GetOrderRequest {
+  string id = 1;
+}
+
+message Account {
+  string id = 1;
+  string holder = 2;
+  double balance = 3;
+}
+
+message GetAccountRequest {
+  string id = 1;
+}
+
+service UserService {
+  rpc GetUser(GetUserRequest) returns (User);
+  // ListUsers is server-streaming so the test target exercises the streaming
+  // codepath that GRPCProbe.extractService renders with `stream` in proto3.
+  rpc ListUsers(ListUsersRequest) returns (stream User);
+}
+
+service OrderService {
+  rpc GetOrder(GetOrderRequest) returns (Order);
+}
+
+service AccountService {
+  rpc GetAccount(GetAccountRequest) returns (Account);
+}

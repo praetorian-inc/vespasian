@@ -29,6 +29,7 @@ End-to-end live tests that spin up intentionally simple target applications, run
 | rest-api | REST | Custom API with users, products, orders endpoints | Go binary |
 | soap-service | SOAP/WSDL | Custom SOAP service with GetUser, ListUsers, CreateUser | Go binary |
 | graphql-server | GraphQL | Apollo Server with queries, mutations, enums, unions, nested types | Node.js |
+| grpc-server | gRPC | Three reflectable gRPC services (UserService, OrderService, AccountService) | Go binary |
 
 ## What the Test Runner Does
 
@@ -70,7 +71,7 @@ For importer tests:
 
 Options:
   --targets <list>   Comma-separated targets (default: all)
-                     Valid: rest-api,soap-service,graphql-server
+                     Valid: rest-api,soap-service,graphql-server,grpc-server
   --skip-start       Only build, don't start services
   --teardown         Stop all running targets and clean up
   --help             Show this help message
@@ -84,7 +85,8 @@ Options:
 Options:
   --targets <list>      Comma-separated targets to test (default: all)
                         Valid targets:
-                          Live:       rest-api, soap-service, graphql-server
+                          Live:       rest-api, soap-service, graphql-server,
+                                      grpc-server
                           Generate:   generate-rest, generate-wsdl,
                                       generate-graphql, generate-graphql-imports
                           Import:     import-burp, import-har, import-base64,
@@ -123,7 +125,8 @@ The setup script writes `.live-test-config` with resolved ports:
 REST_API_PORT=8990
 SOAP_SERVICE_PORT=8991
 GRAPHQL_SERVER_PORT=8992
-TARGETS_SETUP=rest-api,soap-service,graphql-server
+GRPC_SERVER_PORT=50051
+TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server
 ```
 
 ### Default Ports
@@ -133,6 +136,7 @@ TARGETS_SETUP=rest-api,soap-service,graphql-server
 | rest-api | 8990 |
 | soap-service | 8991 |
 | graphql-server | 8992 |
+| grpc-server | 50051 |
 
 Ports are auto-resolved if the default is in use (searches up to 20 ports ahead).
 
@@ -195,7 +199,7 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 ## Expected Results
 
-All 21 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest).
+All 22 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest).
 
 ```
   TARGET                      STATUS    ENDPOINTS   EXPECTED   DURATION
@@ -209,6 +213,7 @@ All 21 tests should pass. Order is non-deterministic and durations vary by machi
   generate-rest               PASS      8           8          0s
   generate-wsdl               PASS      3           3          1s
   graphql-server              PASS      8           8          1s
+  grpc-server                 PASS      3           3          1s
   import-base64               PASS      2           2          0s
   import-burp                 PASS      5           5          0s
   import-duplicates           PASS      2           2          0s
@@ -222,7 +227,7 @@ All 21 tests should pass. Order is non-deterministic and durations vary by machi
   soap-service                PASS      3           3          51s
   spec-edge                   PASS      -           -          0s
 
-  Total: 21 passed, 0 failed, 0 skipped
+  Total: 22 passed, 0 failed, 0 skipped
 ```
 
 Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are informational and do not cause failures.
@@ -255,6 +260,10 @@ test/
 │   ├── test-traffic.har     # HAR import test data
 │   ├── expected-paths.json  # Expected operations for validation
 │   └── expected-spec.graphql  # Expected SDL for exact comparison
+│
+├── grpc-server/
+│   ├── main.go              # gRPC server (UserService, OrderService, AccountService)
+│   └── expected-paths.json  # Expected services/methods for validation
 │
 └── fixtures/
     ├── sample-burp-export.xml            # Burp XML (standard)
