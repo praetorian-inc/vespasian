@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions name="calc" targetNamespace="http://soap.example.com/" xmlns="http://schemas.xmlsoap.org/wsdl/" xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/" xmlns:tns="http://soap.example.com/" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <types>
+    <schema targetNamespace="http://soap.example.com/" xmlns="http://www.w3.org/2001/XMLSchema">
+      <element name="Add">
+        <complexType>
+          <sequence>
+            <element name="a" type="xsd:int"></element>
+            <element name="b" type="xsd:int"></element>
+          </sequence>
+        </complexType>
+      </element>
+      <element name="Register">
+        <complexType>
+          <sequence>
+            <element name="name" type="xsd:string"></element>
+            <element name="active" type="xsd:boolean"></element>
+            <element name="born" type="xsd:date"></element>
+            <element name="score" type="xsd:decimal"></element>
+          </sequence>
+        </complexType>
+      </element>
+      <element name="CreateOrder">
+        <complexType>
+          <sequence>
+            <element name="order">
+              <complexType>
+                <sequence>
+                  <element name="itemId" type="xsd:int"></element>
+                  <element name="qty" type="xsd:int"></element>
+                </sequence>
+              </complexType>
+            </element>
+          </sequence>
+        </complexType>
+      </element>
+    </schema>
+  </types>
+  <message name="AddRequest">
+    <part name="parameters" element="tns:Add"></part>
+  </message>
+  <message name="AddResponse">
+    <part name="parameters" element="tns:AddResponse"></part>
+  </message>
+  <message name="RegisterRequest">
+    <part name="parameters" element="tns:Register"></part>
+  </message>
+  <message name="RegisterResponse">
+    <part name="parameters" element="tns:RegisterResponse"></part>
+  </message>
+  <message name="CreateOrderRequest">
+    <part name="parameters" element="tns:CreateOrder"></part>
+  </message>
+  <message name="CreateOrderResponse">
+    <part name="parameters" element="tns:CreateOrderResponse"></part>
+  </message>
+  <portType name="calcPortType">
+    <operation name="Add">
+      <input message="tns:AddRequest"></input>
+      <output message="tns:AddResponse"></output>
+    </operation>
+    <operation name="Register">
+      <input message="tns:RegisterRequest"></input>
+      <output message="tns:RegisterResponse"></output>
+    </operation>
+    <operation name="CreateOrder">
+      <input message="tns:CreateOrderRequest"></input>
+      <output message="tns:CreateOrderResponse"></output>
+    </operation>
+  </portType>
+  <binding name="calcBinding" type="tns:calcPortType">
+    <binding xmlns="http://schemas.xmlsoap.org/wsdl/soap/" style="document" transport="http://schemas.xmlsoap.org/soap/http"></binding>
+    <operation name="Add">
+      <operation xmlns="http://schemas.xmlsoap.org/wsdl/soap/" soapAction="urn:Add"></operation>
+    </operation>
+    <operation name="Register">
+      <operation xmlns="http://schemas.xmlsoap.org/wsdl/soap/" soapAction="urn:Register"></operation>
+    </operation>
+    <operation name="CreateOrder">
+      <operation xmlns="http://schemas.xmlsoap.org/wsdl/soap/" soapAction="urn:CreateOrder"></operation>
+    </operation>
+  </binding>
+  <service name="calc">
+    <port name="calcPort" binding="tns:calcBinding">
+      <address xmlns="http://schemas.xmlsoap.org/wsdl/soap/" location="http://soap.example.com/calc"></address>
+    </port>
+  </service>
+</definitions>

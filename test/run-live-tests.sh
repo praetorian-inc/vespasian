@@ -594,6 +594,67 @@ test_generate_wsdl() {
     fi
 }
 
+# test_generate_wsdl_matrix exercises the SOAP body parameter-extraction
+# matrix added in LAB-2111: SOAP 1.2 RPC/encoded with xsi:type, SOAP 1.1
+# document/literal with value-inferred scalar types, and a nested complex
+# parameter. The capture has no probed WSDLDocument and --probe=false is
+# set, so this also covers the missing-WSDL fallback path end-to-end.
+# Deterministic (port-less host) — golden compared byte-for-byte.
+test_generate_wsdl_matrix() {
+    local target_dir="${RESULTS_DIR}/generate-wsdl-matrix"
+    local input_capture="${SCRIPT_DIR}/soap-service/matrix-capture.json"
+    local spec_file="${target_dir}/spec.xml"
+    local expected_spec="${SCRIPT_DIR}/soap-service/matrix-expected-spec.xml"
+    local verbose_flag=""
+
+    [ "${VERBOSE:-false}" = true ] && verbose_flag="-v"
+
+    mkdir -p "$target_dir"
+    init_test_status "generate-wsdl-matrix"
+
+    local start=$SECONDS
+    local failures=0
+
+    log_header "Testing: generate-wsdl-matrix (SOAP param-extraction matrix)"
+
+    if [ ! -f "$input_capture" ]; then
+        log_fail "Input capture not found: ${input_capture}"
+        set_test_result "generate-wsdl-matrix" "FAIL" "?" "?" "$((SECONDS - start))"
+        return 1
+    fi
+
+    log_info "Generating WSDL spec from matrix capture (SOAP 1.1/1.2, RPC + doc/literal)..."
+    if ! "$VESPASIAN" generate wsdl "$input_capture" \
+        -o "$spec_file" \
+        --probe=false \
+        $verbose_flag 2>&1; then
+        log_fail "WSDL matrix generate failed"
+        set_test_result "generate-wsdl-matrix" "FAIL" "?" "?" "$((SECONDS - start))"
+        return 1
+    fi
+
+    local expected_ops="${SCRIPT_DIR}/soap-service/matrix-expected-paths.json"
+    if ! validate_soap_operations "$spec_file" "$expected_ops"; then
+        failures=$((failures + 1))
+    fi
+
+    if ! compare_files "$spec_file" "$expected_spec" "generate-wsdl-matrix spec" --normalize-ports; then
+        failures=$((failures + 1))
+    fi
+
+    local expected_count
+    expected_count=$(json_field "$expected_ops" total_operations)
+
+    local duration=$((SECONDS - start))
+    if [ $failures -eq 0 ]; then
+        set_test_result "generate-wsdl-matrix" "PASS" "3" "$expected_count" "$duration"
+        log_ok "generate-wsdl-matrix: PASSED (${duration}s)"
+    else
+        set_test_result "generate-wsdl-matrix" "FAIL" "?" "$expected_count" "$duration"
+        log_fail "generate-wsdl-matrix: FAILED (${duration}s)"
+    fi
+}
+
 test_graphql_server() {
     local port="${GRAPHQL_SERVER_PORT:-8992}"
     local base_url="http://${TEST_HOST}:${port}"
@@ -1997,7 +2058,7 @@ usage() {
     echo "  --targets <list>      Comma-separated targets to test (default: all)"
     echo "                        Valid targets:"
     echo "                          Live:       rest-api, soap-service, graphql-server"
-    echo "                          Generate:   generate-rest, generate-wsdl,"
+    echo "                          Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,"
     echo "                                      generate-graphql, generate-graphql-imports"
     echo "                          Import:     import-burp, import-har, import-base64,"
     echo "                                      import-mitmproxy, import-mitmproxy-native,"
@@ -2063,7 +2124,7 @@ main() {
         targets="${TARGETS_SETUP:-rest-api,soap-service,graphql-server}"
         # Always include importer tests
         targets="${targets},import-burp,import-har,import-base64,import-mitmproxy,import-mitmproxy-native,import-unicode,import-duplicates,import-malformed,import-empty"
-        targets="${targets},generate-rest,generate-wsdl,generate-graphql,generate-graphql-imports"
+        targets="${targets},generate-rest,generate-wsdl,generate-wsdl-matrix,generate-graphql,generate-graphql-imports"
         targets="${targets},edge-cases,crawl-depth,crawl-unreachable"
         targets="${targets},classifier-edge,spec-edge"
     fi
@@ -2107,6 +2168,7 @@ main() {
             import-empty)       test_import_empty ;;
             generate-rest)      test_generate_rest ;;
             generate-wsdl)      test_generate_wsdl ;;
+            generate-wsdl-matrix) test_generate_wsdl_matrix ;;
             generate-graphql)   test_generate_graphql ;;
             generate-graphql-imports) test_generate_graphql_imports ;;
             edge-cases)         test_edge_cases ;;
