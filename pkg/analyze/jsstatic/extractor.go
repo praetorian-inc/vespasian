@@ -350,8 +350,10 @@ func extractAxiosMemberCall(fn, args *jsluice.Node, baseURL string) (ExtractedEn
 		return ExtractedEndpoint{}, false
 	}
 	if httpMethod == "" {
-		// axios.request(config) — pick up method from config.
-		httpMethod = methodFromFirstObjectArg(args)
+		// axios.request(config) — URL, method, and body all come from the
+		// config object (the first positional arg), not from positional URL
+		// args. Delegate to the shared config-object parser.
+		return endpointFromAxiosConfigObject(args.NamedChild(0), baseURL)
 	}
 
 	urlArg := args.NamedChild(0)
@@ -385,7 +387,13 @@ func extractAxiosConfigCall(fn, args *jsluice.Node, baseURL string) (ExtractedEn
 	if fn.Content() != "axios" {
 		return ExtractedEndpoint{}, false
 	}
-	configArg := args.NamedChild(0)
+	return endpointFromAxiosConfigObject(args.NamedChild(0), baseURL)
+}
+
+// endpointFromAxiosConfigObject builds an endpoint from an axios config object
+// literal ({url, method, data, ...}). Shared by the axios({config}) identifier
+// form and the axios.request({config}) member form.
+func endpointFromAxiosConfigObject(configArg *jsluice.Node, baseURL string) (ExtractedEndpoint, bool) {
 	if configArg == nil || configArg.Type() != "object" {
 		return ExtractedEndpoint{}, false
 	}
@@ -438,19 +446,6 @@ func normalizedURLFromLiteral(n *jsluice.Node) (string, bool) {
 		normalized = rawURL
 	}
 	return normalized, true
-}
-
-// methodFromFirstObjectArg reads the HTTP method from the first config-object
-// argument of an axios.request(config) call. Falls back to "GET".
-func methodFromFirstObjectArg(args *jsluice.Node) string {
-	configArg := args.NamedChild(0)
-	if configArg == nil || configArg.Type() != "object" {
-		return "GET"
-	}
-	if m := extractMethodFromOptions(configArg); m != "" {
-		return m
-	}
-	return "GET"
 }
 
 // axiosMethodHasBody reports whether the named axios method may carry a body.
@@ -583,8 +578,22 @@ func ExtractFromBundle(jsSource []byte, baseURL string) ([]ExtractedEndpoint, er
 	}
 
 	// 4. Collect endpoints from jsluice's built-in URL matchers.
-	for _, u := range analyzer.GetURLs() {
-		ep, ok := jsluiceURLToEndpoint(u, baseURL, fetchBodyFields, seen)
+	//
+	// jsluice emits a redundant method-less "fetch" match alongside every
+	// method-bearing "fetch" match for the same URL. Keeping the method-less
+	// duplicate defaults it to GET and synthesizes a phantom GET endpoint for
+	// any non-GET fetch (e.g. fetch(u,{method:"POST"}) would yield BOTH POST
+	// and a GET that never occurs). Pre-scan the method-bearing fetch URLs so
+	// jsluiceURLToEndpoint can drop the redundant companion.
+	jsluiceURLs := analyzer.GetURLs()
+	fetchURLsWithMethod := make(map[string]bool)
+	for _, u := range jsluiceURLs {
+		if u.Type == "fetch" && u.Method != "" {
+			fetchURLsWithMethod[strings.TrimSpace(u.URL)] = true
+		}
+	}
+	for _, u := range jsluiceURLs {
+		ep, ok := jsluiceURLToEndpoint(u, baseURL, fetchBodyFields, seen, fetchURLsWithMethod)
 		if !ok {
 			continue
 		}
@@ -606,6 +615,7 @@ func jsluiceURLToEndpoint(
 	baseURL string,
 	fetchBodyFields map[endpointKey][]string,
 	seen map[endpointKey]bool,
+	fetchURLsWithMethod map[string]bool,
 ) (ExtractedEndpoint, bool) {
 	// Skip jsluice's axios matches — our extractAxiosCalls handles these with
 	// higher fidelity. Skip stringLiteral matches — they are low-fidelity
@@ -617,6 +627,15 @@ func jsluiceURLToEndpoint(
 
 	raw := strings.TrimSpace(u.URL)
 	if raw == "" || filterURL(raw) || isExprOnly(raw) {
+		return ExtractedEndpoint{}, false
+	}
+
+	// Drop jsluice's redundant method-less "fetch" duplicate when a
+	// method-bearing fetch match exists for the same URL (see ExtractFromBundle
+	// step 4). This prevents a phantom GET for non-GET fetches while preserving
+	// a lone method-less fetch (kept as GET) and genuine multi-method URLs
+	// (each method-bearing match survives on its own (method, url) dedup key).
+	if u.Type == "fetch" && u.Method == "" && fetchURLsWithMethod[raw] {
 		return ExtractedEndpoint{}, false
 	}
 

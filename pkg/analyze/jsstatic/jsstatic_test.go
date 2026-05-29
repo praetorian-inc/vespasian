@@ -781,9 +781,3 @@ func TestAnalyze_SinglePassOversizedCount(t *testing.T) {
 		t.Errorf("expected at least 3 requests, got %d", len(res.Requests))
 	}
 }
-
-// keep imports honest
-var _ = bytes.NewReader
-var _ = base64.StdEncoding
-var _ = json.Marshal
-var _ = classify.Deduplicate

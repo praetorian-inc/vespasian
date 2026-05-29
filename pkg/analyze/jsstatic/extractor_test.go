@@ -363,6 +363,66 @@ func TestCollapseTemplateLiteral_NestedBraces(t *testing.T) {
 	}
 }
 
+// Regression for review finding 001: jsluice emits a redundant method-less
+// "fetch" match alongside the method-bearing one. A non-GET fetch must NOT
+// surface a phantom GET for the same URL.
+func TestExtractFromBundle_PostFetch_NoPhantomGet(t *testing.T) {
+	src := []byte(`fetch("/api/users", {method: "POST"})`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var methods []string
+	for _, ep := range endpoints {
+		if ep.URL == "/api/users" {
+			methods = append(methods, ep.Method)
+		}
+	}
+	if len(methods) != 1 || methods[0] != "POST" {
+		t.Errorf("expected exactly [POST] for /api/users (no phantom GET), got %v", methods)
+	}
+}
+
+// A bundle that genuinely calls BOTH GET and POST on the same URL must keep
+// both — the phantom-GET fix must not collapse a real bare-GET fetch.
+func TestExtractFromBundle_FetchGetAndPost_BothSurvive(t *testing.T) {
+	src := []byte(`fetch("/api/users"); fetch("/api/users", {method: "POST"});`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := map[string]bool{}
+	for _, ep := range endpoints {
+		if ep.URL == "/api/users" {
+			got[ep.Method] = true
+		}
+	}
+	if !got["GET"] || !got["POST"] {
+		t.Errorf("expected both GET and POST for /api/users, got %v", got)
+	}
+}
+
+// Regression for review finding 002: axios.request({url, method, data}) must be
+// extracted (the URL/method/body all come from the config object, not a
+// positional URL arg).
+func TestExtractFromBundle_AxiosRequestConfig(t *testing.T) {
+	src := []byte(`axios.request({url:"/api/req", method:"DELETE", data:{a, b}})`)
+	endpoints, err := ExtractFromBundle(src, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	ep := findEndpoint(endpoints, "/api/req")
+	if ep == nil {
+		t.Fatalf("expected endpoint /api/req, got: %v", endpoints)
+	}
+	if ep.Method != "DELETE" {
+		t.Errorf("Method = %q, want DELETE", ep.Method)
+	}
+	if len(ep.BodyFields) != 2 || ep.BodyFields[0] != "a" || ep.BodyFields[1] != "b" {
+		t.Errorf("BodyFields = %v, want [a b]", ep.BodyFields)
+	}
+}
+
 func TestExtractFromBundle_EmptyInput(t *testing.T) {
 	endpoints, err := ExtractFromBundle(nil, "")
 	if err != nil {
