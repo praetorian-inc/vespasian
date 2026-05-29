@@ -161,9 +161,6 @@ func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.O
 	// from <primaryURL>?wsdl. SOAP services often return HTML for browser GETs,
 	// so active probing is the reliable discovery method.
 	if apiType == pipeline.APITypeWSDL || apiType == pipeline.APITypeREST {
-		// TODO(LAB-XXXX-todo): once capability-sdk's ExecutionContext exposes
-		// a context.Context, thread it through here, ProbeAndAppendWSDLRequest,
-		// and ClassifyProbeGenerate so the host's cancel/timeout is effective.
 		var foundWSDL bool
 		requests, foundWSDL, _ = pipeline.ProbeAndAppendWSDLRequest(context.Background(), input.PrimaryURL, requests, false, nil)
 		if foundWSDL {

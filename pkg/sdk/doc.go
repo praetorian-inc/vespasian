@@ -21,4 +21,13 @@
 // hook (e.g. chariot's registries.RegisterSDKCapability). The standalone
 // vespasian CLI does not import this package; it remains the
 // authoritative end-user surface and is unaffected by changes here.
+//
+// Note: capability-sdk's ExecutionContext does not currently expose a
+// context.Context, so capabilities cannot honor host-driven cooperative
+// cancel. The Guard runtime cancels in-flight capabilities by exiting
+// the worker process (os.Exit), which terminates the capability
+// goroutine and any child processes without running deferred cleanup.
+// Vespasian relies on its own internal limits for soft self-bounding:
+// Capability.Timeout() (30 min worst-case), crawl.CrawlerOptions.Timeout
+// (600s default), and ProbeWSDLDocument's http.Client.Timeout (15s).
 package sdk
