@@ -228,10 +228,9 @@ func TestInvoke_ScanMode_ExplicitGraphQLTypeEmitsGraphQLSpec(t *testing.T) {
 	_, webApps, err := collect(t, c, ctx, seedApp("https://x.com"))
 
 	require.NoError(t, err)
-	// If a WebApplication is emitted, its SpecFormat must be graphql.
-	for _, wa := range webApps {
-		assert.Equal(t, capmodel.SpecFormatGraphQL, wa.SpecFormat)
-	}
+	require.Len(t, webApps, 1)
+	assert.NotEmpty(t, webApps[0].Spec)
+	assert.Equal(t, capmodel.SpecFormatGraphQL, webApps[0].SpecFormat)
 }
 
 func TestInvoke_ScanMode_InvalidScopeReturnsError(t *testing.T) {
