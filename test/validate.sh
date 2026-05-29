@@ -564,7 +564,7 @@ PYEOF
 validate_paths_absent() {
     local spec_file=$1
     shift
-    local result
+    local result rc=0
     result=$(python3 - "$spec_file" "$@" << 'PYEOF'
 import sys, re
 
@@ -607,8 +607,7 @@ if bad:
     sys.exit(1)
 print("OK: none of %d forbidden path(s) present" % len(forbidden))
 PYEOF
-    )
-    local rc=$?
+    ) || rc=$?
     if [ $rc -ne 0 ]; then
         log_fail "Forbidden paths present in spec: ${result#LEAKED: }"
         return 1
