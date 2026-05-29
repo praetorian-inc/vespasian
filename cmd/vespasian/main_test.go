@@ -852,7 +852,9 @@ func TestDangerousAllowPrivate_PrivateIPProbe(t *testing.T) {
 }
 
 // TestDangerousAllowPrivate_WarningOnlyWhenProbing verifies the SSRF warning
-// is only printed when both allowPrivate and probe are true.
+// is only printed when both DangerousAllowPrivate and Probe are true.
+// Drives GenerateCmd.Run (the actual code path where the warning is emitted)
+// and covers both branches of the conditional at main.go:525-527.
 func TestDangerousAllowPrivate_WarningOnlyWhenProbing(t *testing.T) {
 	requests := []crawl.ObservedRequest{
 		{
@@ -868,26 +870,81 @@ func TestDangerousAllowPrivate_WarningOnlyWhenProbing(t *testing.T) {
 		},
 	}
 
-	// Capture stderr
-	oldStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
+	t.Run("Probe=false, no warning", func(t *testing.T) {
+		capturePath := filepath.Join(t.TempDir(), "capture.json")
+		f, err := os.Create(capturePath) //nolint:gosec // G304: test file
+		if err != nil {
+			t.Fatalf("failed to create temp capture file: %v", err)
+		}
+		if writeErr := crawl.WriteCapture(f, requests); writeErr != nil {
+			_ = f.Close()
+			t.Fatalf("failed to write capture: %v", writeErr)
+		}
+		_ = f.Close()
 
-	_, _ = pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
-		APIType:      "rest",
-		Confidence:   0.5,
-		Probe:        false,
-		AllowPrivate: true,
+		oldStderr := os.Stderr
+		r, w, _ := os.Pipe()
+		os.Stderr = w
+		defer func() { os.Stderr = oldStderr }()
+
+		cmd := &GenerateCmd{
+			APIType:               "rest",
+			Capture:               capturePath,
+			Output:                filepath.Join(t.TempDir(), "spec.json"),
+			Probe:                 false,
+			DangerousAllowPrivate: true,
+		}
+		if err := cmd.Run(); err != nil {
+			t.Errorf("GenerateCmd.Run() unexpected error: %v", err)
+		}
+
+		w.Close() //nolint:gosec // G104: test code
+		var buf bytes.Buffer
+		io.Copy(&buf, r) //nolint:gosec // G104: test code
+		os.Stderr = oldStderr
+
+		if strings.Contains(buf.String(), "WARNING") {
+			t.Errorf("SSRF warning should not be printed when probe is disabled; stderr: %q", buf.String())
+		}
 	})
 
-	w.Close() //nolint:gosec // G104: test code
-	var buf bytes.Buffer
-	io.Copy(&buf, r) //nolint:gosec // G104: test code
-	os.Stderr = oldStderr
+	t.Run("Probe=true, warning printed", func(t *testing.T) {
+		capturePath := filepath.Join(t.TempDir(), "capture.json")
+		f, err := os.Create(capturePath) //nolint:gosec // G304: test file
+		if err != nil {
+			t.Fatalf("failed to create temp capture file: %v", err)
+		}
+		if writeErr := crawl.WriteCapture(f, requests); writeErr != nil {
+			_ = f.Close()
+			t.Fatalf("failed to write capture: %v", writeErr)
+		}
+		_ = f.Close()
 
-	if strings.Contains(buf.String(), "WARNING") {
-		t.Error("SSRF warning should not be printed when probe is disabled")
-	}
+		oldStderr := os.Stderr
+		r, w, _ := os.Pipe()
+		os.Stderr = w
+		defer func() { os.Stderr = oldStderr }()
+
+		cmd := &GenerateCmd{
+			APIType:               "rest",
+			Capture:               capturePath,
+			Output:                filepath.Join(t.TempDir(), "spec.json"),
+			Probe:                 true,
+			DangerousAllowPrivate: true,
+		}
+		if err := cmd.Run(); err != nil {
+			t.Errorf("GenerateCmd.Run() unexpected error: %v", err)
+		}
+
+		w.Close() //nolint:gosec // G104: test code
+		var buf bytes.Buffer
+		io.Copy(&buf, r) //nolint:gosec // G104: test code
+		os.Stderr = oldStderr
+
+		if !strings.Contains(buf.String(), "WARNING") {
+			t.Errorf("SSRF warning should be printed when probe is enabled; stderr: %q", buf.String())
+		}
+	})
 }
 
 // TestDoCrawl_ProxyIgnoredWithoutHeadless verifies that doCrawl warns and clears
