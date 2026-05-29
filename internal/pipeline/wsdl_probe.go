@@ -22,8 +22,8 @@ import (
 	"net/url"
 	"time"
 
-	wsdlgen "github.com/praetorian-inc/vespasian/pkg/generate/wsdl"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	wsdlgen "github.com/praetorian-inc/vespasian/pkg/generate/wsdl"
 	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
 
@@ -120,7 +120,7 @@ func ProbeWSDLDocument(ctx context.Context, targetURL string, allowPrivate bool,
 //
 // This helper is the single source of truth for WSDL discovery shared by
 // ScanCmd.Run (cmd/vespasian/main.go) and Capability.runScan (pkg/sdk).
-func ProbeAndAppendWSDLRequest(ctx context.Context, targetURL string, requests []crawl.ObservedRequest, allowPrivate bool, status io.Writer) (augmented []crawl.ObservedRequest, foundWSDL bool, resolvedAPIType string) {
+func ProbeAndAppendWSDLRequest(ctx context.Context, targetURL string, requests []crawl.ObservedRequest, allowPrivate bool, status io.Writer) ([]crawl.ObservedRequest, bool, string) {
 	wsdlDoc := ProbeWSDLDocument(ctx, targetURL, allowPrivate, status)
 	if wsdlDoc == nil {
 		return requests, false, ""
@@ -135,7 +135,7 @@ func ProbeAndAppendWSDLRequest(ctx context.Context, targetURL string, requests [
 	parsedURL.RawQuery = "wsdl"
 	wsdlURL := parsedURL.String()
 
-	augmented = append(requests, crawl.ObservedRequest{
+	requests = append(requests, crawl.ObservedRequest{
 		Method: "GET",
 		URL:    wsdlURL,
 		Response: crawl.ObservedResponse{
@@ -144,5 +144,5 @@ func ProbeAndAppendWSDLRequest(ctx context.Context, targetURL string, requests [
 			Body:        wsdlDoc,
 		},
 	})
-	return augmented, true, APITypeWSDL
+	return requests, true, APITypeWSDL
 }
