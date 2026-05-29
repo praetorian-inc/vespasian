@@ -72,6 +72,12 @@ func TestInferTypeFromValue(t *testing.T) {
 		{"hello world", "xsd:string", "string fallback"},
 		{"123abc", "xsd:string", "alphanumeric"},
 		{"2026-13-99", "xsd:string", "invalid date falls to string"},
+		// Calendar-impossible date/time values match the regex shape but are
+		// not valid xs:date/xs:dateTime, so they must fall to xsd:string rather
+		// than be mistyped (a consumer would reject them against the schema).
+		{"2026-02-31", "xsd:string", "Feb 31 is not a real date"},
+		{"2023-02-29", "xsd:string", "Feb 29 in a non-leap year"},
+		{"2026-05-25T99:99:99", "xsd:string", "out-of-range clock fields"},
 	}
 
 	for _, tt := range tests {
@@ -488,30 +494,6 @@ func TestWalkOperation_TruncatedEnvelopeReturnsPartial(t *testing.T) {
 		"incomplete param b must not be flagged as complex")
 }
 
-// NT001b: walkOperation depth cap branch — called directly at depth == maxBodyDepth
-// so that the depth >= maxBodyDepth guard in walkOperation (soapbody.go:107) is exercised.
-// This path is unreachable via extractSOAPParameters (always called at depth=1), but
-// is coverable by calling walkOperation directly from within the package test.
-func TestWalkOperation_DepthCap(t *testing.T) {
-	// Construct a SOAP body where the first child of the operation element is a nested
-	// element. We call walkOperation at depth == maxBodyDepth so the guard fires.
-	body := `<Op><child>value</child></Op>`
-	decoder := xml.NewDecoder(strings.NewReader(body))
-	// Advance past the <Op> StartElement.
-	tok, err := decoder.Token()
-	require.NoError(t, err)
-	opStart, ok := tok.(xml.StartElement)
-	require.True(t, ok)
-	require.Equal(t, "Op", opStart.Name.Local)
-
-	// Call walkOperation at the depth cap — the <child> StartElement will be skipped.
-	result := walkOperation(decoder, opStart, maxBodyDepth)
-	require.NotNil(t, result)
-	// The child was skipped by the depth cap guard; no params should be recorded.
-	assert.Empty(t, result.OrderedKeys,
-		"params at or beyond depth cap must be skipped")
-}
-
 // NT002: resolveXSIType direct unit test covering all branches including no-colon.
 func TestResolveXSIType(t *testing.T) {
 	tests := []struct {
@@ -541,7 +523,9 @@ func TestResolveXSIType(t *testing.T) {
 	}
 }
 
-// NT003: isPlausibleDate covering the len != 10 defensive guard.
+// NT003: isPlausibleDate covers the len != 10 defensive guard plus calendar
+// validation — impossible day/month combinations and non-leap Feb 29 are
+// rejected; a leap-year Feb 29 is accepted.
 func TestIsPlausibleDate(t *testing.T) {
 	tests := []struct {
 		input string
@@ -556,12 +540,45 @@ func TestIsPlausibleDate(t *testing.T) {
 		{"", false, "empty string len != 10"},
 		{"2026-05-2", false, "len = 9"},
 		{"2026-05-255", false, "len = 11"},
+		// Calendar validity (regex shape is valid; the date is not).
+		{"2026-02-31", false, "Feb 31 impossible"},
+		{"2026-04-31", false, "Apr has 30 days"},
+		{"2026-02-30", false, "Feb 30 impossible"},
+		{"2023-02-29", false, "Feb 29 in non-leap year"},
+		{"2024-02-29", true, "Feb 29 in leap year"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := isPlausibleDate(tt.input)
 			assert.Equal(t, tt.want, got, "isPlausibleDate(%q)", tt.input)
+		})
+	}
+}
+
+// isPlausibleDateTime covers the valid dateTime shapes (bare, Z, numeric
+// offset, fractional seconds) and rejects out-of-range clock fields that the
+// datetimeRe \d{2} classes would otherwise accept.
+func TestIsPlausibleDateTime(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+		name  string
+	}{
+		{"2026-05-25T10:30:00", true, "bare dateTime"},
+		{"2026-05-25T10:30:00Z", true, "with Z"},
+		{"2026-05-25T10:30:00+02:00", true, "with numeric offset"},
+		{"2026-05-25T10:30:00.123Z", true, "fractional seconds with Z"},
+		{"2026-05-25T10:30:00.123", true, "fractional seconds, no zone"},
+		{"2026-05-25T99:99:99", false, "hour/min/sec out of range"},
+		{"2026-05-25T24:00:00", false, "hour 24 out of range"},
+		{"2026-13-25T10:30:00", false, "month 13 out of range"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isPlausibleDateTime(tt.input)
+			assert.Equal(t, tt.want, got, "isPlausibleDateTime(%q)", tt.input)
 		})
 	}
 }
@@ -742,6 +759,23 @@ func TestWalkParam_FirstTypedChildWins(t *testing.T) {
 	require.Contains(t, result.Params["wrapper"].Children.Params, "value")
 	assert.Equal(t, "xsd:decimal", result.Params["wrapper"].Children.Params["value"].XSDType,
 		"nested same-name sibling: first-typed-wins")
+}
+
+// QUAL-002 upgrade direction for walkParam's children loop: an empty first
+// observation of a nested same-name child must be upgraded by a later typed
+// sibling. Mirrors the walkOperation-level "empty then typed" case and covers
+// the same-name-sibling upgrade branch inside walkParam's children loop.
+func TestWalkParam_EmptyThenTypedChildUpgrades(t *testing.T) {
+	body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+		`<soap:Body><Op><wrapper><value></value><value>3.14</value></wrapper></Op></soap:Body></soap:Envelope>`
+	result := extractSOAPParameters([]byte(body))
+	require.NotNil(t, result)
+	require.Contains(t, result.Params, "wrapper")
+	require.True(t, result.Params["wrapper"].IsComplex)
+	require.NotNil(t, result.Params["wrapper"].Children)
+	require.Contains(t, result.Params["wrapper"].Children.Params, "value")
+	assert.Equal(t, "xsd:decimal", result.Params["wrapper"].Children.Params["value"].XSDType,
+		"nested same-name sibling: empty first observation must be upgraded by a later typed sibling")
 }
 
 // QUAL-003 fix: merge upgrades an empty-typed parameter when a later

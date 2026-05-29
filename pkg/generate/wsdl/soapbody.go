@@ -22,6 +22,7 @@ import (
 	"encoding/xml"
 	"regexp"
 	"strings"
+	"time"
 )
 
 const (
@@ -118,13 +119,17 @@ func extractSOAPParameters(body []byte) *soapBodyInfo {
 			continue
 		}
 		if inBody {
-			return walkOperation(decoder, t, 1)
+			return walkOperation(decoder, t)
 		}
 	}
 }
 
 // walkOperation walks the operation element and its parameter children.
-func walkOperation(decoder *xml.Decoder, opStart xml.StartElement, depth int) *soapBodyInfo {
+// It is non-recursive and invoked exactly once per envelope (the operation
+// element is the Body's first child, conceptual depth 1), so it needs no
+// depth cap of its own; the operation's direct parameters start at depth 2,
+// and the recursion bound lives in walkParam.
+func walkOperation(decoder *xml.Decoder, opStart xml.StartElement) *soapBodyInfo {
 	info := &soapBodyInfo{
 		OpNamespace: opStart.Name.Space,
 		Params:      make(map[string]*inferredParam),
@@ -140,11 +145,7 @@ func walkOperation(decoder *xml.Decoder, opStart xml.StartElement, depth int) *s
 				return info
 			}
 		case xml.StartElement:
-			if depth >= maxBodyDepth {
-				_ = decoder.Skip() //nolint:errcheck // best-effort subtree discard; errors here are non-fatal
-				continue
-			}
-			param := walkParam(decoder, t, depth+1)
+			param := walkParam(decoder, t, 2)
 			existing, seen := info.Params[param.Name]
 			if !seen {
 				info.OrderedKeys = append(info.OrderedKeys, param.Name)
@@ -265,16 +266,37 @@ func resolveXSIType(value string) string {
 	return "xsd:string"
 }
 
-// isPlausibleDate does a basic range check for YYYY-MM-DD strings already
-// matched by dateRe. Month must be 01–12 and day 01–31.
+// isPlausibleDate reports whether text is a real calendar date. The lexical
+// shape (YYYY-MM-DD, 10 chars) is already gated by dateRe; the length guard
+// keeps this helper safe when called directly. time.Parse then rejects
+// calendar-impossible values a simple range check would accept — 2026-02-31,
+// 2026-04-31, or a Feb-29 in a non-leap year — none of which validate against
+// xs:date, so they must fall through to xsd:string rather than be mistyped.
 func isPlausibleDate(text string) bool {
-	// text is already validated by dateRe: YYYY-MM-DD (10 chars)
 	if len(text) != 10 {
 		return false
 	}
-	mm := text[5:7]
-	dd := text[8:10]
-	return mm >= "01" && mm <= "12" && dd >= "01" && dd <= "31"
+	_, err := time.Parse("2006-01-02", text)
+	return err == nil
+}
+
+// isPlausibleDateTime reports whether text is a real calendar date-time.
+// datetimeRe has already gated the lexical shape; time.Parse additionally
+// rejects out-of-range clock fields (e.g. 99:99:99) that the regex's \d{2}
+// classes accept. Two layouts cover the datetimeRe variants — without and with
+// an explicit zone (Z or numeric offset). Go's parser accepts an optional
+// fractional second after the seconds field for both layouts, so the
+// ".123"/".123Z" forms need no separate layout.
+func isPlausibleDateTime(text string) bool {
+	for _, layout := range []string{
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04:05Z07:00",
+	} {
+		if _, err := time.Parse(layout, text); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // inferTypeFromValue infers an XSD type from a string value.
@@ -299,8 +321,8 @@ func inferTypeFromValue(text string) string {
 	if dateRe.MatchString(text) && isPlausibleDate(text) {
 		return "xsd:date"
 	}
-	// Rule 8: dateTime
-	if datetimeRe.MatchString(text) {
+	// Rule 8: dateTime (also reject out-of-range clock fields like 99:99:99)
+	if datetimeRe.MatchString(text) && isPlausibleDateTime(text) {
 		return "xsd:dateTime"
 	}
 	// Rule 9: string fallback
