@@ -23,6 +23,7 @@ import (
 	"time"
 
 	wsdlgen "github.com/praetorian-inc/vespasian/pkg/generate/wsdl"
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
 
@@ -104,4 +105,44 @@ func ProbeWSDLDocument(ctx context.Context, targetURL string, allowPrivate bool,
 	}
 
 	return body
+}
+
+// ProbeAndAppendWSDLRequest probes targetURL?wsdl for a WSDL document. On
+// success it appends a synthetic ObservedRequest (Method=GET, URL=<targetURL>?wsdl,
+// Response={200, text/xml, body}) to requests and returns the augmented slice
+// along with foundWSDL=true and resolvedAPIType=APITypeWSDL. When the probe
+// finds no valid WSDL the original requests slice and the caller-supplied
+// apiType are returned unchanged.
+//
+// The URL for the synthetic request is built via url.URL.RawQuery to avoid the
+// double-query-separator bug that occurs when targetURL already carries a query
+// string (e.g. https://x.com/svc?foo=1 + "?wsdl" → https://x.com/svc?wsdl).
+//
+// This helper is the single source of truth for WSDL discovery shared by
+// ScanCmd.Run (cmd/vespasian/main.go) and Capability.runScan (pkg/sdk).
+func ProbeAndAppendWSDLRequest(ctx context.Context, targetURL string, requests []crawl.ObservedRequest, allowPrivate bool, status io.Writer) (augmented []crawl.ObservedRequest, foundWSDL bool, resolvedAPIType string) {
+	wsdlDoc := ProbeWSDLDocument(ctx, targetURL, allowPrivate, status)
+	if wsdlDoc == nil {
+		return requests, false, ""
+	}
+
+	parsedURL, err := url.Parse(targetURL)
+	if err != nil {
+		// ProbeWSDLDocument already succeeded, so URL is valid; this branch
+		// should be unreachable in practice.
+		return requests, false, ""
+	}
+	parsedURL.RawQuery = "wsdl"
+	wsdlURL := parsedURL.String()
+
+	augmented = append(requests, crawl.ObservedRequest{
+		Method: "GET",
+		URL:    wsdlURL,
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "text/xml",
+			Body:        wsdlDoc,
+		},
+	})
+	return augmented, true, APITypeWSDL
 }

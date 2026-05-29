@@ -612,28 +612,18 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	genCtx, genStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer genStop()
 
-	// When auto-detection or explicit WSDL mode is active, try fetching a
-	// WSDL document from <targetURL>?wsdl. SOAP services return HTML for
-	// browser GETs so crawl traffic rarely contains WSDL signals — active
-	// probing is the reliable discovery method.
-	if apiType == pipeline.APITypeAuto || apiType == pipeline.APITypeWSDL || apiType == pipeline.APITypeREST {
-		wsdlDoc := pipeline.ProbeWSDLDocument(genCtx, c.URL, c.DangerousAllowPrivate, statusWriter(c.Verbose))
-		if wsdlDoc != nil {
+	// When explicit WSDL/REST mode is active, try fetching a WSDL document
+	// from <targetURL>?wsdl. SOAP services return HTML for browser GETs so
+	// crawl traffic rarely contains WSDL signals — active probing is the
+	// reliable discovery method.
+	if apiType == pipeline.APITypeWSDL || apiType == pipeline.APITypeREST {
+		var foundWSDL bool
+		requests, foundWSDL, _ = pipeline.ProbeAndAppendWSDLRequest(genCtx, c.URL, requests, c.DangerousAllowPrivate, statusWriter(c.Verbose))
+		if foundWSDL {
 			apiType = pipeline.APITypeWSDL
 			if c.Verbose {
 				fmt.Fprintf(os.Stderr, "discovered WSDL document at %s?wsdl\n", c.URL)
 			}
-			// Inject a synthetic request carrying the WSDL document so
-			// the generator's Phase 1 can return it directly.
-			requests = append(requests, crawl.ObservedRequest{
-				Method: "GET",
-				URL:    c.URL + "?wsdl",
-				Response: crawl.ObservedResponse{
-					StatusCode:  200,
-					ContentType: "text/xml",
-					Body:        wsdlDoc,
-				},
-			})
 		}
 	}
 
