@@ -70,7 +70,7 @@ func (c *Capability) Parameters() []capability.Parameter {
 		capability.Int("max_pages", "Maximum pages to crawl").WithDefault("100"),
 		capability.Int("depth", "Maximum crawl depth").WithDefault("3"),
 		capability.String("scope", "Crawl scope: same-origin or same-domain").WithDefault("same-origin").WithOptions("same-origin", "same-domain"),
-		capability.String("headers", "Comma-separated auth headers (e.g. Authorization: Bearer tok)"),
+		capability.String("headers", "Comma-separated auth headers (e.g. 'Authorization: Bearer tok, X-Key: abc'). Header values containing commas are not supported."),
 		capability.String("confidence", "Minimum classification confidence 0-1").WithDefault("0.5"),
 		capability.Bool("probe", "Enable endpoint probing").WithDefault("true"),
 	}
@@ -347,6 +347,8 @@ func toMultiValueHeaders(headers map[string]string) map[string][]string {
 
 // parseHeaders parses a comma-separated "Key: Value, K2: V2" string.
 // Whitespace around keys and values is trimmed. Returns nil for empty input.
+// Note: parseHeaders does not support header values containing commas; a value
+// like "Accept: text/html, application/xhtml+xml" will be split at the comma.
 func parseHeaders(raw string) map[string]string {
 	if raw == "" {
 		return nil
