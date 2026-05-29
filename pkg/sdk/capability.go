@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strings"
 	"time"
 
@@ -79,7 +80,8 @@ func (c *Capability) Match(_ capability.ExecutionContext, input capmodel.WebAppl
 	if input.PrimaryURL == "" {
 		return fmt.Errorf("primary_url is required")
 	}
-	if !strings.HasPrefix(input.PrimaryURL, "http") {
+	u, err := url.Parse(input.PrimaryURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return fmt.Errorf("vespasian requires HTTP/HTTPS URL, got %q", input.PrimaryURL)
 	}
 	if !input.Seed {
