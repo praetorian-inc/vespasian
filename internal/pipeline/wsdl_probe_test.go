@@ -1,0 +1,164 @@
+// Copyright 2026 Praetorian Security, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package pipeline_test
+
+import (
+	"bytes"
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/praetorian-inc/vespasian/internal/pipeline"
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
+)
+
+// validWSDLDocument is a minimal well-formed WSDL document accepted by ParseWSDL.
+const validWSDLDocument = `<?xml version="1.0"?>
+<definitions name="Calculator"
+  xmlns="http://schemas.xmlsoap.org/wsdl/"
+  xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"
+  xmlns:tns="http://example.com/"
+  targetNamespace="http://example.com/">
+  <message name="AddRequest"><part name="parameters" element="tns:Add"/></message>
+  <message name="AddResponse"><part name="parameters" element="tns:AddResponse"/></message>
+  <portType name="CalculatorPortType">
+    <operation name="Add">
+      <input message="tns:AddRequest"/>
+      <output message="tns:AddResponse"/>
+    </operation>
+  </portType>
+</definitions>`
+
+// wsdlServer starts an httptest.Server that serves validWSDLDocument at ?wsdl
+// and plain HTML for all other requests.
+func wsdlServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.RawQuery == "wsdl" {
+			w.Header().Set("Content-Type", "text/xml")
+			w.Write([]byte(validWSDLDocument)) //nolint:gosec // G104: test code
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte("<html><body>Service</body></html>")) //nolint:gosec // G104: test code
+	}))
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// ---------------------------------------------------------------------------
+// TEST-004: happy-path tests for ProbeWSDLDocument
+// ---------------------------------------------------------------------------
+
+func TestProbeWSDLDocument_HappyPath(t *testing.T) {
+	ts := wsdlServer(t)
+
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/service.asmx", true, nil)
+	require.NotNil(t, doc, "expected non-nil WSDL bytes for valid endpoint")
+	assert.True(t, strings.Contains(string(doc), "Calculator"), "expected Calculator service in WSDL")
+}
+
+func TestProbeWSDLDocument_NotWSDLReturnsNil(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte("<html>not wsdl</html>")) //nolint:gosec // G104: test code
+	}))
+	t.Cleanup(ts.Close)
+
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL, true, nil)
+	assert.Nil(t, doc)
+}
+
+func TestProbeWSDLDocument_StatusWriterRecordsProgress(t *testing.T) {
+	ts := wsdlServer(t)
+
+	var buf bytes.Buffer
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL, true, &buf)
+	require.NotNil(t, doc)
+	assert.Contains(t, buf.String(), "wsdl discovery")
+}
+
+// ---------------------------------------------------------------------------
+// ProbeAndAppendWSDLRequest — happy-path and URL-correctness tests
+// ---------------------------------------------------------------------------
+
+func TestProbeAndAppendWSDLRequest_AppendsOnSuccess(t *testing.T) {
+	ts := wsdlServer(t)
+
+	initial := []crawl.ObservedRequest{
+		{Method: "GET", URL: ts.URL + "/", Response: crawl.ObservedResponse{StatusCode: 200}},
+	}
+
+	augmented, foundWSDL, resolvedType := pipeline.ProbeAndAppendWSDLRequest(
+		context.Background(), ts.URL, initial, true, nil,
+	)
+
+	assert.True(t, foundWSDL)
+	assert.Equal(t, pipeline.APITypeWSDL, resolvedType)
+	require.Len(t, augmented, 2, "expected one synthetic WSDL request appended")
+	synthetic := augmented[1]
+	assert.Equal(t, "GET", synthetic.Method)
+	assert.Equal(t, "text/xml", synthetic.Response.ContentType)
+	assert.Equal(t, 200, synthetic.Response.StatusCode)
+
+	// Verify URL is well-formed (no double ? separator).
+	assert.False(t, strings.Count(synthetic.URL, "?") > 1,
+		"synthetic URL must not contain more than one '?': %s", synthetic.URL)
+	assert.True(t, strings.HasSuffix(synthetic.URL, "?wsdl") || strings.Contains(synthetic.URL, "wsdl"),
+		"synthetic URL must reference ?wsdl: %s", synthetic.URL)
+}
+
+func TestProbeAndAppendWSDLRequest_NoWSDLReturnsOriginal(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte("<html>not soap</html>")) //nolint:gosec // G104: test code
+	}))
+	t.Cleanup(ts.Close)
+
+	initial := []crawl.ObservedRequest{{Method: "GET", URL: ts.URL + "/"}}
+	augmented, foundWSDL, resolvedType := pipeline.ProbeAndAppendWSDLRequest(
+		context.Background(), ts.URL, initial, true, nil,
+	)
+
+	assert.False(t, foundWSDL)
+	assert.Empty(t, resolvedType)
+	assert.Equal(t, initial, augmented, "original slice must be returned unchanged")
+}
+
+func TestProbeAndAppendWSDLRequest_URLWithExistingQuery(t *testing.T) {
+	// When targetURL already has a query string, the synthetic URL must use
+	// RawQuery = "wsdl" (not string concatenation) so there is no double ?.
+	ts := wsdlServer(t)
+	targetURL := ts.URL + "/service?version=2"
+
+	augmented, foundWSDL, _ := pipeline.ProbeAndAppendWSDLRequest(
+		context.Background(), targetURL, nil, true, nil,
+	)
+
+	require.True(t, foundWSDL)
+	require.Len(t, augmented, 1)
+
+	syntheticURL := augmented[0].URL
+	questionCount := strings.Count(syntheticURL, "?")
+	assert.Equal(t, 1, questionCount,
+		"synthetic URL must have exactly one '?', got %q", syntheticURL)
+	assert.True(t, strings.HasSuffix(syntheticURL, "?wsdl"),
+		"synthetic URL must end with ?wsdl, got %q", syntheticURL)
+}
