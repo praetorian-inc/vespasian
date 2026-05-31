@@ -12,25 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package crawl drives a headless Chrome browser to capture HTTP traffic from
-// web applications. It intercepts all outbound requests—including XHR, fetch,
-// and dynamically constructed calls from JavaScript—and records them as
-// [ObservedRequest] values.
+// Package crawl captures HTTP traffic from web applications and exposes it as
+// [ObservedRequest] values. Two crawler backends are available, selected via
+// [CrawlerOptions.Headless]:
 //
-// In headless mode (default), the package uses [go-rod] directly to run
-// concurrent browser tabs, overlapping DOM stability waits for significantly
-// faster crawls. In non-headless mode (--headless=false), it falls back to
-// [Katana]'s standard HTTP engine.
+// Headless mode ([RodCrawler], default): uses [go-rod] to drive concurrent
+// Chrome tabs. All outbound requests—XHR, fetch, dynamically constructed
+// JavaScript calls—are intercepted via Chrome DevTools Protocol network
+// listeners. This is the correct choice for single-page applications and any
+// site that requires JavaScript execution. External .js bundles are fetched by
+// the browser itself; this path does not perform separate JS file retrieval.
+//
+// Non-headless mode ([HTTPCrawler]): uses the Go stdlib net/http client with a
+// depth-first search frontier, 150 req/s rate limiter, and a 10 MB per-page
+// read cap. HTML pages are parsed with goquery using the same link selectors as
+// the headless path; inline <script> blocks are analysed with jsluice to surface
+// additional endpoints. Redirect chains are validated by a scope+SSRF guard:
+// redirects that leave the crawl scope or target private/link-local addresses
+// (e.g. 169.254.169.254) are blocked before the request is issued.
 //
 // The package also defines the capture file format: a JSON array of
 // ObservedRequest structs that serves as the interchange format between the
 // capture stage (crawl or import) and the generation stage.
 //
 // Key types:
-//   - [Crawler] orchestrates a browser crawl with configurable depth,
-//     page limits, timeouts, concurrency, and scope restrictions.
+//   - [Crawler] is the common interface satisfied by [RodCrawler], [HTTPCrawler],
+//     and [FakeCrawler]. Use [NewCrawler] to obtain the right implementation.
+//   - [RodCrawler] is the headless go-rod backend (Chrome required).
+//   - [HTTPCrawler] is the non-headless stdlib net/http backend (DFS, 150 rps,
+//     10 MB read cap, scope+SSRF redirect guard).
+//   - [FakeCrawler] is a test double that returns a pre-configured slice of
+//     [ObservedRequest] values with no network activity.
 //   - [BrowserManager] manages Chrome process lifecycle, including proxy
-//     configuration and graceful shutdown.
+//     configuration and graceful shutdown (headless path only).
 //   - [ObservedRequest] and [ObservedResponse] represent captured HTTP traffic.
 //
 // Session-cookie helpers (LAB-2222) let callers bootstrap Chrome's cookie
@@ -46,5 +60,4 @@
 //     and scheme. Rejects non-http(s) or hostless target URLs.
 //
 // [go-rod]: https://github.com/go-rod/rod
-// [Katana]: https://github.com/projectdiscovery/katana
 package crawl
