@@ -75,7 +75,7 @@ func main() {
 	})
 
 	addr := ":" + port
-	log.Printf("concat-spa listening on http://localhost%s/", addr)
+	log.Printf("concat-spa listening on http://localhost%s/", addr)     //nolint:gosec // G706: local test target; port is a controlled PORT env/default, not attacker input
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 0} //nolint:gosec // local test target, no timeout needed
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
