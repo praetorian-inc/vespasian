@@ -354,6 +354,43 @@ func TestSourcemap_AllowPrivateGate(t *testing.T) {
 	}
 }
 
+// SSRF overlay on a CALLER-SUPPLIED HTTPClient: even when the caller passes
+// their own client (whose Transport would happily dial loopback), recoverSourcemap
+// must overlay an SSRF-safe Transport when AllowPrivate=false so the loopback
+// sourcemap host is refused — and must NOT mutate the caller's original client.
+// Without the overlay (pre-fix), srv.Client() would dial 127.0.0.1 and recover
+// the source, so this fails on the unfixed code.
+func TestSourcemap_CallerClient_SSRFOverlayEnforced(t *testing.T) {
+	body := makeSourcemapJSON([]string{"var z = 3;"})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	mapURL := srv.URL + "/app.js.map"
+	bundleURL := srv.URL + "/app.js"
+	bundle := []byte(fmt.Sprintf("console.log(1);\n//# sourceMappingURL=%s\n", mapURL))
+
+	callerClient := srv.Client() // its Transport would dial 127.0.0.1 fine
+	origTransport := callerClient.Transport
+
+	opts := Options{
+		FetchSourcemaps: true,
+		AllowPrivate:    false, // overlay must install probe.SSRFSafeDialContext
+		HTTPClient:      callerClient,
+	}
+	sources, stats := recoverSourcemap(context.Background(), bundle, bundleURL, opts)
+	if len(sources) != 0 {
+		t.Errorf("AllowPrivate=false on caller client: SSRF overlay should block the loopback host; got %d sources", len(sources))
+	}
+	if stats.SourcemapFetchFails != 1 {
+		t.Errorf("expected 1 fetch fail from the blocked dial, got %d", stats.SourcemapFetchFails)
+	}
+	if callerClient.Transport != origTransport {
+		t.Error("caller's original client.Transport was mutated; overlay must apply to a shallow copy only")
+	}
+}
+
 // F12a: redirect to a different host must be blocked (CheckRedirect).
 func TestSourcemap_RedirectToDifferentHostBlocked(t *testing.T) {
 	// origin server redirects to a different host.

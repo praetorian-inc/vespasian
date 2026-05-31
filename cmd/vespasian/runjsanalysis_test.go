@@ -85,6 +85,40 @@ func TestRunJSAnalysisStage_Enabled_AppendsStaticEntries(t *testing.T) {
 	}
 }
 
+// Idempotency guard: when the input capture already carries a static:js entry
+// (e.g. a capture that `crawl --analyze-js` already produced and `generate` is
+// now reading), runJSAnalysisStage must skip re-analysis and return the slice
+// unchanged even with enabled=true. This keeps `crawl | generate` byte-identical
+// to a single `scan`. Regression test for the AnyStaticSource guard — without
+// it, the JS bundle below would be re-analyzed and a second static:js entry
+// appended, growing the slice.
+func TestRunJSAnalysisStage_AlreadyAnalyzed_SkipsReanalysis(t *testing.T) {
+	captured := append(jsFixtureCapture(), crawl.ObservedRequest{
+		Method: "GET",
+		URL:    "https://example.com/api/v1/users",
+		Source: crawl.SourceStaticJS,
+	})
+	out := runJSAnalysisStage(context.Background(), captured, jsAnalysisArgs{
+		enabled:         true,
+		fetchSourcemaps: false,
+		allowPrivate:    true,
+	})
+	if len(out) != len(captured) {
+		t.Fatalf("idempotency guard should skip re-analysis: got %d entries, want %d (unchanged)", len(out), len(captured))
+	}
+	// Exactly the one pre-seeded static entry — the guard must prevent the
+	// JS bundle from being re-analyzed into additional static:js entries.
+	staticCount := 0
+	for _, r := range out {
+		if crawl.IsJSStaticSource(r.Source) {
+			staticCount++
+		}
+	}
+	if staticCount != 1 {
+		t.Errorf("expected exactly 1 static entry (the pre-seeded one); got %d — guard failed to skip re-analysis", staticCount)
+	}
+}
+
 // Enabled=false short-circuits and returns the input slice unchanged.
 func TestRunJSAnalysisStage_Disabled_ShortCircuits(t *testing.T) {
 	captured := jsFixtureCapture()
