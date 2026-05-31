@@ -100,21 +100,6 @@ func NewCrawler(opts CrawlerOptions) Crawler {
 	return &HTTPCrawler{opts: opts}
 }
 
-// Crawl is a temporary stub delegating to crawlStandard until T007 replaces it.
-func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRequest, error) {
-	maxPages, err := validateCrawlInputs(c.opts, targetURL)
-	if err != nil {
-		return nil, err
-	}
-	if ctx.Err() != nil {
-		if c.opts.Stderr != nil {
-			fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n") //nolint:errcheck // best-effort status message
-		}
-		return nil, ctx.Err()
-	}
-	return crawlStandard(c.opts, ctx, targetURL, maxPages)
-}
-
 // validateCrawlInputs validates the crawl options and target URL, returning the
 // effective maxPages and any validation error. The error strings are stable and
 // asserted by tests.
