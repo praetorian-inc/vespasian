@@ -42,7 +42,7 @@ Vespasian takes a different approach: it observes actual network traffic at the 
 | **GraphQL API Discovery** | Detects GraphQL endpoints, runs tiered introspection queries, and generates GraphQL SDL schemas |
 | **WSDL/SOAP Discovery** | Identifies SOAP services via SOAPAction headers and envelope detection; fetches and parses WSDL documents |
 | **API Type Auto-Detection** | Automatically determines API type (REST, GraphQL, WSDL) from captured traffic without manual selection |
-| **Headless Browser Crawling** | Drives a headless Chrome browser with full JavaScript execution for SPA support, powered by [Katana](https://github.com/projectdiscovery/katana) |
+| **Browser Crawling** | Two backends: headless mode drives Chrome via [go-rod](https://github.com/go-rod/rod) for full JavaScript/SPA support; non-headless mode uses a stdlib net/http engine (DFS, 150 rps, scope+SSRF redirect guard) for lightweight crawls |
 | **Static Form Extraction** | Statically parses `<form>` elements in captured HTML responses — including login, search, and admin forms — to surface submission endpoints and parameters that dynamic crawling may never trigger |
 | **Traffic Import** | Import existing captures from Burp Suite XML, HAR 1.2 files, and mitmproxy dumps |
 | **Active Probing** | OPTIONS discovery, JSON schema inference, WSDL document fetching, and GraphQL introspection |
@@ -295,7 +295,7 @@ vespasian generate <api-type> <capture-file> [flags]
 
 | Component | Purpose | Supported Types |
 |-----------|---------|-----------------|
-| **Crawler** | Drives a headless browser to capture HTTP traffic, powered by [Katana](https://github.com/projectdiscovery/katana) | Protocol-agnostic |
+| **Crawler** | Two backends: go-rod headless Chrome (JavaScript/SPA support) and stdlib net/http (lightweight, DFS, 150 rps, SSRF guard) | Protocol-agnostic |
 | **Importers** | Convert Burp Suite XML, HAR, and mitmproxy traffic to capture format | All three formats |
 | **Classifier** | Separates API calls from static assets using heuristics | REST, GraphQL, WSDL |
 | **Prober** | Enriches endpoints via active requests | OPTIONS, JSON schema, WSDL fetch, GraphQL introspection |
