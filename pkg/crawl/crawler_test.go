@@ -25,299 +25,39 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/projectdiscovery/katana/pkg/navigation"
-	"github.com/projectdiscovery/katana/pkg/output"
 )
 
-// TestMapScope tests the MapScope function with table-driven tests
-func TestMapScope(t *testing.T) {
-	tests := []struct {
-		name  string
-		scope string
-		want  string
-	}{
-		{
-			name:  "same-origin maps to fqdn",
-			scope: "same-origin",
-			want:  "fqdn",
-		},
-		{
-			name:  "same-domain maps to rdn",
-			scope: "same-domain",
-			want:  "rdn",
-		},
-		{
-			name:  "empty string defaults to fqdn",
-			scope: "",
-			want:  "fqdn",
-		},
-		{
-			name:  "unknown scope defaults to fqdn",
-			scope: "unknown",
-			want:  "fqdn",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := MapScope(tt.scope)
-			if got != tt.want {
-				t.Errorf("MapScope(%q) = %q, want %q", tt.scope, got, tt.want)
-			}
-		})
+// TestMaxHTTPBodySize verifies the MaxHTTPBodySize constant value.
+func TestMaxHTTPBodySize(t *testing.T) {
+	if MaxHTTPBodySize != 10*1024*1024 {
+		t.Errorf("MaxHTTPBodySize = %d, want 10 MiB", MaxHTTPBodySize)
 	}
 }
 
-// TestMapResult_Normal tests MapResult with a normal result
-func TestMapResult_Normal(t *testing.T) {
-	result := output.Result{
-		Request: &navigation.Request{
-			Method: "POST",
-			URL:    "https://example.com/api?foo=bar&baz=qux",
-			Body:   "request body",
-			Headers: map[string]string{
-				"Content-Type": "application/json",
-			},
-			Source: "crawler",
-		},
-		Response: &navigation.Response{
-			StatusCode: 200,
-			Headers: navigation.Headers{
-				"Content-Type": "text/html",
-			},
-			Body: "response body",
-		},
+// TestValidateCrawlInputs tests the shared validateCrawlInputs helper.
+func TestValidateCrawlInputs(t *testing.T) {
+	if _, err := validateCrawlInputs(CrawlerOptions{Depth: -1}, "https://e.com"); err == nil ||
+		!strings.Contains(err.Error(), "depth must be non-negative") {
+		t.Errorf("negative depth: %v", err)
 	}
-
-	observed := MapResult(result)
-
-	if observed.Method != "POST" {
-		t.Errorf("Method = %q, want %q", observed.Method, "POST")
+	if _, err := validateCrawlInputs(CrawlerOptions{}, ""); err == nil ||
+		!strings.Contains(err.Error(), "invalid target URL") {
+		t.Errorf("empty url: %v", err)
 	}
-	if observed.URL != "https://example.com/api?foo=bar&baz=qux" {
-		t.Errorf("URL = %q, want %q", observed.URL, "https://example.com/api?foo=bar&baz=qux")
-	}
-	if string(observed.Body) != "request body" {
-		t.Errorf("Body = %q, want %q", string(observed.Body), "request body")
-	}
-	if observed.Source != "crawler" {
-		t.Errorf("Source = %q, want %q", observed.Source, "crawler")
-	}
-	if observed.Headers["Content-Type"] != "application/json" {
-		t.Errorf("Headers[Content-Type] = %q, want %q", observed.Headers["Content-Type"], "application/json")
-	}
-
-	// Check query params
-	if len(observed.QueryParams) != 2 {
-		t.Errorf("QueryParams length = %d, want 2", len(observed.QueryParams))
-	}
-	if len(observed.QueryParams["foo"]) == 0 || observed.QueryParams["foo"][0] != "bar" {
-		t.Errorf("QueryParams[foo] = %v, want [bar]", observed.QueryParams["foo"])
-	}
-	if len(observed.QueryParams["baz"]) == 0 || observed.QueryParams["baz"][0] != "qux" {
-		t.Errorf("QueryParams[baz] = %v, want [qux]", observed.QueryParams["baz"])
-	}
-
-	// Check response
-	if observed.Response.StatusCode != 200 {
-		t.Errorf("Response.StatusCode = %d, want 200", observed.Response.StatusCode)
-	}
-	if observed.Response.ContentType != "text/html" {
-		t.Errorf("Response.ContentType = %q, want %q", observed.Response.ContentType, "text/html")
-	}
-	if string(observed.Response.Body) != "response body" {
-		t.Errorf("Response.Body = %q, want %q", string(observed.Response.Body), "response body")
+	if mp, err := validateCrawlInputs(CrawlerOptions{MaxPages: 0}, "https://e.com"); err != nil || mp != DefaultMaxPages {
+		t.Errorf("default maxpages: mp=%d err=%v", mp, err)
 	}
 }
 
-// TestMapResult_EmptyMethod tests MapResult defaults to GET when method is empty
-func TestMapResult_EmptyMethod(t *testing.T) {
-	result := output.Result{
-		Request: &navigation.Request{
-			Method: "",
-			URL:    "https://example.com",
-		},
+// TestNewCrawler_ReturnsInterface verifies NewCrawler returns the correct concrete type.
+func TestNewCrawler_ReturnsInterface(t *testing.T) {
+	h := NewCrawler(CrawlerOptions{Headless: true})
+	if _, ok := h.(*RodCrawler); !ok {
+		t.Fatalf("Headless:true → got %T, want *RodCrawler", h)
 	}
-
-	observed := MapResult(result)
-
-	if observed.Method != "GET" {
-		t.Errorf("Method = %q, want %q", observed.Method, "GET")
-	}
-}
-
-// TestMapResult_NilRequest tests MapResult handles nil Request pointer
-func TestMapResult_NilRequest(t *testing.T) {
-	result := output.Result{
-		Request: nil,
-		Response: &navigation.Response{
-			StatusCode: 200,
-		},
-	}
-
-	// Should not panic
-	observed := MapResult(result)
-
-	if observed.Method != "GET" {
-		t.Errorf("Method = %q, want %q (default)", observed.Method, "GET")
-	}
-	if observed.Source != "katana" {
-		t.Errorf("Source = %q, want %q (default)", observed.Source, "katana")
-	}
-	if observed.Response.StatusCode != 200 {
-		t.Errorf("Response.StatusCode = %d, want 200", observed.Response.StatusCode)
-	}
-}
-
-// TestMapResult_NilResponse tests MapResult handles nil Response pointer
-func TestMapResult_NilResponse(t *testing.T) {
-	result := output.Result{
-		Request: &navigation.Request{
-			Method: "GET",
-			URL:    "https://example.com",
-		},
-		Response: nil,
-	}
-
-	// Should not panic
-	observed := MapResult(result)
-
-	if observed.Method != "GET" {
-		t.Errorf("Method = %q, want %q", observed.Method, "GET")
-	}
-	if observed.Response.StatusCode != 0 {
-		t.Errorf("Response.StatusCode = %d, want 0 (zero value)", observed.Response.StatusCode)
-	}
-}
-
-// TestMapResult_URLWithoutQueryParams tests MapResult with URL without query params
-func TestMapResult_URLWithoutQueryParams(t *testing.T) {
-	result := output.Result{
-		Request: &navigation.Request{
-			URL: "https://example.com/path",
-		},
-	}
-
-	observed := MapResult(result)
-
-	if len(observed.QueryParams) != 0 {
-		t.Errorf("QueryParams length = %d, want 0", len(observed.QueryParams))
-	}
-}
-
-// TestMapResult_InvalidURL tests MapResult with invalid URL
-func TestMapResult_InvalidURL(t *testing.T) {
-	result := output.Result{
-		Request: &navigation.Request{
-			URL: "://invalid-url",
-		},
-	}
-
-	// Should not panic, query params just won't be parsed
-	observed := MapResult(result)
-
-	if observed.QueryParams != nil {
-		t.Errorf("QueryParams = %v, want nil (failed parse)", observed.QueryParams)
-	}
-}
-
-// TestMapResult_MultiValueQueryParam tests MapResult preserves multi-value query params.
-func TestMapResult_MultiValueQueryParam(t *testing.T) {
-	result := output.Result{
-		Request: &navigation.Request{
-			Method: "GET",
-			URL:    "https://x.test?tag=a&tag=b",
-		},
-	}
-
-	observed := MapResult(result)
-
-	if len(observed.QueryParams["tag"]) != 2 {
-		t.Errorf("QueryParams[tag] length = %d, want 2", len(observed.QueryParams["tag"]))
-	}
-	if observed.QueryParams["tag"][0] != "a" || observed.QueryParams["tag"][1] != "b" {
-		t.Errorf("QueryParams[tag] = %v, want [a b]", observed.QueryParams["tag"])
-	}
-}
-
-// TestToStringSlice tests ToStringSlice conversion
-func TestToStringSlice(t *testing.T) {
-	tests := []struct {
-		name    string
-		headers map[string]string
-		wantLen int
-	}{
-		{
-			name: "single header",
-			headers: map[string]string{
-				"Authorization": "Bearer token123",
-			},
-			wantLen: 1,
-		},
-		{
-			name: "multiple headers",
-			headers: map[string]string{
-				"Content-Type":  "application/json",
-				"Authorization": "Bearer token123",
-				"User-Agent":    "vespasian/1.0",
-			},
-			wantLen: 3,
-		},
-		{
-			name:    "nil map",
-			headers: nil,
-			wantLen: 0,
-		},
-		{
-			name:    "empty map",
-			headers: map[string]string{},
-			wantLen: 0,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := ToStringSlice(tt.headers)
-
-			if len(result) != tt.wantLen {
-				t.Errorf("ToStringSlice() length = %d, want %d", len(result), tt.wantLen)
-			}
-
-			// Verify format for non-empty results
-			if tt.wantLen > 0 {
-				// Build a map to check all headers are present
-				found := make(map[string]bool)
-				for _, header := range result {
-					found[header] = true
-				}
-
-				for key, value := range tt.headers {
-					expected := key + ": " + value
-					if !found[expected] {
-						t.Errorf("ToStringSlice() missing header %q", expected)
-					}
-				}
-			}
-		})
-	}
-}
-
-// TestToStringSlice_Format verifies the exact format of header strings
-func TestToStringSlice_Format(t *testing.T) {
-	headers := map[string]string{
-		"Content-Type": "application/json",
-	}
-
-	result := ToStringSlice(headers)
-
-	if len(result) != 1 {
-		t.Fatalf("ToStringSlice() length = %d, want 1", len(result))
-	}
-
-	// goflags.StringSlice is a []string
-	if result[0] != "Content-Type: application/json" {
-		t.Errorf("ToStringSlice()[0] = %q, want %q", result[0], "Content-Type: application/json")
+	s := NewCrawler(CrawlerOptions{Headless: false})
+	if _, ok := s.(*HTTPCrawler); !ok {
+		t.Fatalf("Headless:false → got %T, want *HTTPCrawler", s)
 	}
 }
 
@@ -465,248 +205,6 @@ func TestCrawl_InvalidSchemeReturnsError(t *testing.T) {
 	}
 }
 
-// TestMapResult_TruncatesLargeResponseBody tests that response bodies exceeding MaxResponseBodySize get truncated
-func TestMapResult_TruncatesLargeResponseBody(t *testing.T) {
-	largeBody := make([]byte, MaxResponseBodySize+1000) // 1000 bytes over limit
-	for i := range largeBody {
-		largeBody[i] = byte('A')
-	}
-
-	result := output.Result{
-		Request: &navigation.Request{
-			Method: "GET",
-			URL:    "https://example.com",
-		},
-		Response: &navigation.Response{
-			StatusCode: 200,
-			Body:       string(largeBody),
-		},
-	}
-
-	observed := MapResult(result)
-
-	if len(observed.Response.Body) != MaxResponseBodySize {
-		t.Errorf("Response body length = %d, want %d (truncated)", len(observed.Response.Body), MaxResponseBodySize)
-	}
-
-	// Verify all bytes are 'A' (no corruption during truncation)
-	for i, b := range observed.Response.Body {
-		if b != byte('A') {
-			t.Errorf("Response body[%d] = %c, want 'A' (truncation corrupted data)", i, b)
-			break
-		}
-	}
-}
-
-// TestMapResult_TruncatesLargeRequestBody tests that request bodies exceeding MaxResponseBodySize get truncated
-func TestMapResult_TruncatesLargeRequestBody(t *testing.T) {
-	largeBody := make([]byte, MaxResponseBodySize+500) // 500 bytes over limit
-	for i := range largeBody {
-		largeBody[i] = byte('B')
-	}
-
-	result := output.Result{
-		Request: &navigation.Request{
-			Method: "POST",
-			URL:    "https://example.com",
-			Body:   string(largeBody),
-		},
-	}
-
-	observed := MapResult(result)
-
-	if len(observed.Body) != MaxResponseBodySize {
-		t.Errorf("Request body length = %d, want %d (truncated)", len(observed.Body), MaxResponseBodySize)
-	}
-
-	// Verify all bytes are 'B' (no corruption during truncation)
-	for i, b := range observed.Body {
-		if b != byte('B') {
-			t.Errorf("Request body[%d] = %c, want 'B' (truncation corrupted data)", i, b)
-			break
-		}
-	}
-}
-
-// TestMapResult_SmallBodyNotTruncated tests that bodies under the limit are preserved
-func TestMapResult_SmallBodyNotTruncated(t *testing.T) {
-	smallRequestBody := []byte("small request body")
-	smallResponseBody := []byte("small response body")
-
-	result := output.Result{
-		Request: &navigation.Request{
-			Method: "POST",
-			URL:    "https://example.com",
-			Body:   string(smallRequestBody),
-		},
-		Response: &navigation.Response{
-			StatusCode: 200,
-			Body:       string(smallResponseBody),
-		},
-	}
-
-	observed := MapResult(result)
-
-	if string(observed.Body) != string(smallRequestBody) {
-		t.Errorf("Request body = %q, want %q (should not be truncated)", string(observed.Body), string(smallRequestBody))
-	}
-
-	if string(observed.Response.Body) != string(smallResponseBody) {
-		t.Errorf("Response body = %q, want %q (should not be truncated)", string(observed.Response.Body), string(smallResponseBody))
-	}
-}
-
-// TestMapResult_JsluiceTagAndAttribute tests that jsluice Tag and Attribute fields are propagated
-func TestMapResult_JsluiceTagAndAttribute(t *testing.T) {
-	tests := []struct {
-		name      string
-		tag       string
-		attribute string
-	}{
-		{
-			name:      "jsluice fetch endpoint",
-			tag:       "script",
-			attribute: "jsluice-fetch",
-		},
-		{
-			name:      "jsluice xhr endpoint",
-			tag:       "script",
-			attribute: "jsluice-xhr",
-		},
-		{
-			name:      "htmx hx-get attribute",
-			tag:       "div",
-			attribute: "hx-get",
-		},
-		{
-			name:      "htmx hx-post attribute",
-			tag:       "form",
-			attribute: "hx-post",
-		},
-		{
-			name:      "empty tag and attribute",
-			tag:       "",
-			attribute: "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := output.Result{
-				Request: &navigation.Request{
-					Method:    "GET",
-					URL:       "https://example.com/api/endpoint",
-					Source:    "crawler",
-					Tag:       tt.tag,
-					Attribute: tt.attribute,
-				},
-				Response: &navigation.Response{
-					StatusCode: 200,
-				},
-			}
-
-			observed := MapResult(result)
-			if observed.Tag != tt.tag {
-				t.Errorf("Tag = %q, want %q", observed.Tag, tt.tag)
-			}
-			if observed.Attribute != tt.attribute {
-				t.Errorf("Attribute = %q, want %q", observed.Attribute, tt.attribute)
-			}
-		})
-	}
-}
-
-// TestMapResult_LowercaseContentType tests that MapResult extracts ContentType
-// from lowercase header keys, as Katana normalizes response headers to lowercase.
-func TestMapResult_LowercaseContentType(t *testing.T) {
-	tests := []struct {
-		name            string
-		headers         navigation.Headers
-		wantContentType string
-	}{
-		{
-			name:            "lowercase content-type from Katana",
-			headers:         navigation.Headers{"content-type": "application/json"},
-			wantContentType: "application/json",
-		},
-		{
-			name:            "title-case Content-Type",
-			headers:         navigation.Headers{"Content-Type": "text/html"},
-			wantContentType: "text/html",
-		},
-		{
-			name:            "uppercase CONTENT-TYPE",
-			headers:         navigation.Headers{"CONTENT-TYPE": "application/xml"},
-			wantContentType: "application/xml",
-		},
-		{
-			name:            "no content-type header",
-			headers:         navigation.Headers{"X-Custom": "value"},
-			wantContentType: "",
-		},
-		{
-			name:            "empty headers",
-			headers:         navigation.Headers{},
-			wantContentType: "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := output.Result{
-				Request: &navigation.Request{
-					Method: "GET",
-					URL:    "https://example.com/api/data",
-				},
-				Response: &navigation.Response{
-					StatusCode: 200,
-					Headers:    tt.headers,
-					Body:       "response",
-				},
-			}
-
-			observed := MapResult(result)
-			if observed.Response.ContentType != tt.wantContentType {
-				t.Errorf("ContentType = %q, want %q", observed.Response.ContentType, tt.wantContentType)
-			}
-		})
-	}
-}
-
-// TestMaxHTTPBodySize verifies the MaxHTTPBodySize constant value.
-func TestMaxHTTPBodySize(t *testing.T) {
-	if MaxHTTPBodySize != 10*1024*1024 {
-		t.Errorf("MaxHTTPBodySize = %d, want 10 MiB", MaxHTTPBodySize)
-	}
-}
-
-// TestValidateCrawlInputs tests the shared validateCrawlInputs helper.
-func TestValidateCrawlInputs(t *testing.T) {
-	if _, err := validateCrawlInputs(CrawlerOptions{Depth: -1}, "https://e.com"); err == nil ||
-		!strings.Contains(err.Error(), "depth must be non-negative") {
-		t.Errorf("negative depth: %v", err)
-	}
-	if _, err := validateCrawlInputs(CrawlerOptions{}, ""); err == nil ||
-		!strings.Contains(err.Error(), "invalid target URL") {
-		t.Errorf("empty url: %v", err)
-	}
-	if mp, err := validateCrawlInputs(CrawlerOptions{MaxPages: 0}, "https://e.com"); err != nil || mp != DefaultMaxPages {
-		t.Errorf("default maxpages: mp=%d err=%v", mp, err)
-	}
-}
-
-// TestNewCrawler_ReturnsInterface verifies NewCrawler returns the correct concrete type.
-func TestNewCrawler_ReturnsInterface(t *testing.T) {
-	h := NewCrawler(CrawlerOptions{Headless: true})
-	if _, ok := h.(*RodCrawler); !ok {
-		t.Fatalf("Headless:true → got %T, want *RodCrawler", h)
-	}
-	s := NewCrawler(CrawlerOptions{Headless: false})
-	if _, ok := s.(*HTTPCrawler); !ok {
-		t.Fatalf("Headless:false → got %T, want *HTTPCrawler", s)
-	}
-}
-
 // TestCrawl_SignalPath_ReturnsContextCanceled verifies that when the parent
 // context is canceled (simulating SIGINT/SIGTERM), Crawl() returns
 // context.Canceled and writes an interrupt message to Stderr.
@@ -723,11 +221,12 @@ func TestCrawl_SignalPath_ReturnsContextCanceled(t *testing.T) {
 	var stderr bytes.Buffer
 
 	crawler := NewCrawler(CrawlerOptions{
-		Depth:    1,
-		MaxPages: 100,
-		Timeout:  30 * time.Second,
-		Headless: false,
-		Stderr:   &stderr,
+		Depth:        1,
+		MaxPages:     100,
+		Timeout:      30 * time.Second,
+		Headless:     false,
+		Stderr:       &stderr,
+		AllowPrivate: true,
 	})
 
 	// Cancel context immediately to trigger signal path.
@@ -755,11 +254,12 @@ func TestCrawl_SignalPath_NilStderr(t *testing.T) {
 	cancel()
 
 	crawler := NewCrawler(CrawlerOptions{
-		Depth:    1,
-		MaxPages: 100,
-		Timeout:  30 * time.Second,
-		Headless: false,
-		Stderr:   nil, // explicitly nil
+		Depth:        1,
+		MaxPages:     100,
+		Timeout:      30 * time.Second,
+		Headless:     false,
+		Stderr:       nil, // explicitly nil
+		AllowPrivate: true,
 	})
 
 	_, err := crawler.Crawl(ctx, srv.URL)
@@ -787,10 +287,11 @@ func TestCrawl_MaxPagesPath_ReturnsNoError(t *testing.T) {
 	defer srv.Close()
 
 	crawler := NewCrawler(CrawlerOptions{
-		Depth:    10,
-		MaxPages: 2,
-		Timeout:  30 * time.Second,
-		Headless: false,
+		Depth:        10,
+		MaxPages:     2,
+		Timeout:      30 * time.Second,
+		Headless:     false,
+		AllowPrivate: true,
 	})
 
 	results, err := crawler.Crawl(context.Background(), srv.URL)
