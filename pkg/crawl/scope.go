@@ -72,7 +72,7 @@ func isPrivateHost(hostname string) bool {
 	}
 
 	// Resolve and check all addresses.
-	addrs, err := net.LookupHost(hostname)
+	addrs, err := net.LookupHost(hostname) //nolint:gosec // G704: intentional SSRF protection — taint flows to isPrivateHost check below
 	if err != nil {
 		// DNS failure — reject to be safe.
 		return true

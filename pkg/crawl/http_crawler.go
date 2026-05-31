@@ -88,45 +88,11 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	var wg sync.WaitGroup
 	for i := range n {
 		wg.Add(1)
-		go func(id int) {
+		go func() {
 			defer wg.Done()
-			for {
-				if crawlCtx.Err() != nil {
-					return
-				}
-
-				entry, ok := frontier.Pop()
-				if !ok {
-					return
-				}
-				frontier.MarkActive()
-
-				observed, links := c.fetchPage(crawlCtx, client, limiter, entry)
-
-				if observed != nil {
-					mu.Lock()
-					if pageCount < maxPages {
-						pageCount++
-						results = append(results, *observed)
-						if pageCount >= maxPages {
-							crawlCancel()
-						}
-					}
-					mu.Unlock()
-				}
-
-				if len(links) > 0 {
-					entries := make([]urlEntry, len(links))
-					for i, link := range links {
-						entries[i] = urlEntry{URL: link, Depth: entry.Depth + 1}
-					}
-					frontier.Push(entries)
-				}
-
-				frontier.MarkIdle()
-				_ = id
-			}
-		}(i)
+			c.runWorker(crawlCtx, crawlCancel, client, limiter, frontier, &mu, &results, &pageCount, maxPages)
+		}()
+		_ = i
 	}
 
 	wg.Wait()
@@ -148,6 +114,56 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	copy(snapshot, results)
 	mu.Unlock()
 	return snapshot, nil
+}
+
+// runWorker is the per-goroutine crawl loop. It pops entries from the frontier,
+// fetches pages, records results, and pushes discovered links back.
+func (c *HTTPCrawler) runWorker(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	client *http.Client,
+	limiter *rate.Limiter,
+	frontier *urlFrontier,
+	mu *sync.Mutex,
+	results *[]ObservedRequest,
+	pageCount *int,
+	maxPages int,
+) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		entry, ok := frontier.Pop()
+		if !ok {
+			return
+		}
+		frontier.MarkActive()
+
+		observed, links := c.fetchPage(ctx, client, limiter, entry)
+
+		if observed != nil {
+			mu.Lock()
+			if *pageCount < maxPages {
+				*pageCount++
+				*results = append(*results, *observed)
+				if *pageCount >= maxPages {
+					cancel()
+				}
+			}
+			mu.Unlock()
+		}
+
+		if len(links) > 0 {
+			entries := make([]urlEntry, len(links))
+			for i, link := range links {
+				entries[i] = urlEntry{URL: link, Depth: entry.Depth + 1}
+			}
+			frontier.Push(entries)
+		}
+
+		frontier.MarkIdle()
+	}
 }
 
 // fetchPage performs a single HTTP GET for the given entry. It applies a
@@ -187,8 +203,8 @@ func (c *HTTPCrawler) fetchPage(ctx context.Context, client *http.Client, limite
 	}
 	defer resp.Body.Close() //nolint:errcheck // best-effort
 
-	// Read up to MaxHTTPBodySize (DoS cap).
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPBodySize))
+	// Read up to MaxHTTPBodySize (DoS cap). Partial reads are intentional.
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPBodySize)) //nolint:errcheck // best-effort; partial body is acceptable
 
 	observed := buildObservedRequest(req, resp, body)
 	links := c.extractLinks(observed, entry.URL)

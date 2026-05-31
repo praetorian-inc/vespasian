@@ -29,9 +29,9 @@ func TestExtractFromHTML_UsesLinkSelectors(t *testing.T) {
     </body></html>`)
 	got := extractFromHTML(body, "https://e.com/")
 	want := map[string]bool{
-		"https://e.com/page1":      true,
-		"https://e.com/submit":     true,
-		"https://e.com/frame":      true,
+		"https://e.com/page1":     true,
+		"https://e.com/submit":    true,
+		"https://e.com/frame":     true,
 		"https://other.example/x": true, // scope is enforced by frontier, not here
 	}
 	for _, u := range got {

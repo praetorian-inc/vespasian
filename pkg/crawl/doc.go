@@ -26,7 +26,7 @@
 // Non-headless mode ([HTTPCrawler]): uses the Go stdlib net/http client with a
 // depth-first search frontier, 150 req/s rate limiter, and a 10 MB per-page
 // read cap. HTML pages are parsed with goquery using the same link selectors as
-// the headless path; inline <script> blocks are analysed with jsluice to surface
+// the headless path; inline <script> blocks are analyzed with jsluice to surface
 // additional endpoints. Redirect chains are validated by a scope+SSRF guard:
 // redirects that leave the crawl scope or target private/link-local addresses
 // (e.g. 169.254.169.254) are blocked before the request is issued.

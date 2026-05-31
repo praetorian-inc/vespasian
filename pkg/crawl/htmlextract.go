@@ -25,7 +25,7 @@ import (
 // attribute value is resolved against baseURL and filtered through isLikelyPage
 // (dropping JS bundles, images, etc.). Scope enforcement is left to the frontier.
 //
-// This is the goquery analogue of extractLinks (links.go:68) — same selectors
+// This is the goquery analog of extractLinks (links.go:68) — same selectors
 // and filters, no *rod.Page dependency.
 func extractFromHTML(body []byte, baseURL string) []string {
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
@@ -65,7 +65,7 @@ func extractFromHTML(body []byte, baseURL string) []string {
 
 // extractInlineScripts finds all inline <script> tags (those without a src
 // attribute) in the HTML body and runs jsluice on each one. This is the goquery
-// analogue of extractURLsFromInlineScripts (jsextract.go:82) — same filtering,
+// analog of extractURLsFromInlineScripts (jsextract.go:82) — same filtering,
 // no *rod.Page dependency.
 func extractInlineScripts(body []byte) []jsExtractedURL {
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))

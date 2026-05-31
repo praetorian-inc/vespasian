@@ -79,7 +79,7 @@ func TestHTTPCrawler_BodyCap(t *testing.T) {
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
-		w.Write(bigBody) //nolint:errcheck
+		_, _ = w.Write(bigBody)
 	}))
 	defer srv.Close()
 	c := &HTTPCrawler{opts: CrawlerOptions{Depth: 1, MaxPages: 1, Timeout: 10 * time.Second, AllowPrivate: true}}
@@ -160,9 +160,10 @@ func TestHTTPCrawler_InlineScriptExtraction(t *testing.T) {
 	var inlineCount int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
-		if r.URL.Path == "/" {
+		switch r.URL.Path {
+		case "/":
 			fmt.Fprint(w, `<script>fetch("/api/x")</script><a href="/api/x">x</a>`)
-		} else if r.URL.Path == "/api/x" {
+		case "/api/x":
 			mu.Lock()
 			inlineCount++
 			mu.Unlock()
@@ -186,7 +187,7 @@ func TestHTTPCrawler_InlineScriptExtraction(t *testing.T) {
 func TestHTTPCrawler_RedirectScopeBlocked(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
-			http.Redirect(w, r, "http://169.254.169.254/latest/meta-data/", 302)
+			http.Redirect(w, r, "http://169.254.169.254/latest/meta-data/", http.StatusFound)
 			return
 		}
 	}))
