@@ -204,8 +204,11 @@ const (
 // orchestrator returns and the goroutine keeps running until jsluice finishes
 // (jsluice is not context-aware). The channel is buffered to capacity 1 so the
 // late send never blocks and the goroutine exits when ExtractFromBundle returns.
-// Worst-case in-flight goroutines per Analyze call: Concurrency × 2 (one
-// bundle extraction + one sourcemap-source extraction per worker). If jsluice's
+// Worst-case in-flight goroutines per Analyze call: Concurrency × (1 + N),
+// where N is the number of sourcesContent entries in a recovered sourcemap
+// (each entry is dispatched to a separate extractWithTimeout call). In the
+// common case N is small; for a pathological sourcemap with many sources,
+// all N per-source goroutines may be in-flight simultaneously. If jsluice's
 // underlying tree-sitter parser ever genuinely deadlocks on adversarial input,
 // the goroutine would remain blocked indefinitely — pkg/probe-style process
 // isolation would be the fix, intentionally out of scope here.
@@ -214,6 +217,11 @@ func extractWithTimeout(ctx context.Context, source []byte, sourceURL, kind stri
 		eps      []ExtractedEndpoint
 		panicked bool
 	}
+	// Capture hook values on the calling goroutine before spawning, so the
+	// goroutine closure does not race against a test's defer that sets the
+	// package-level hook variables to nil after the timeout fires.
+	panicHook := testInjectPanic
+	delayHook := testInjectDelay
 	ch := make(chan result, 1)
 	go func() {
 		defer func() {
@@ -222,8 +230,11 @@ func extractWithTimeout(ctx context.Context, source []byte, sourceURL, kind stri
 				ch <- result{nil, true}
 			}
 		}()
-		if testInjectPanic != nil {
-			testInjectPanic(kind)
+		if panicHook != nil {
+			panicHook(kind)
+		}
+		if delayHook != nil {
+			delayHook(kind)
 		}
 		eps, err := ExtractFromBundle(source, sourceURL)
 		if err != nil {
@@ -256,6 +267,16 @@ func extractWithTimeout(ctx context.Context, source []byte, sourceURL, kind stri
 // regression coverage of the recover/counter contracts (QUAL-004 and the
 // SourcemapSourcePanics counter introduced for QUAL-002).
 var testInjectPanic func(loc string)
+
+// testInjectDelay is a delay-fault-injection point used by jsstatic's
+// per-source timeout regression tests. When non-nil, the hook is called
+// inside the extraction goroutine in extractWithTimeout (after the panic
+// hook) with the same loc string ("bundle" or "sourcemap-source"). A test
+// can sleep for longer than PerBundleTimeout to force a deterministic
+// timeout on a specific extraction kind without relying on large JS inputs
+// or timing assumptions. Production builds leave it nil; the runtime cost
+// is one nil-check at each call site.
+var testInjectDelay func(loc string)
 
 // safeAnalyzeOne wraps analyzeOne with a recover() so that a panic outside the
 // per-extraction goroutines (e.g. in toRequests, normalize, or the accounting

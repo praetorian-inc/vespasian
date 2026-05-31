@@ -167,9 +167,17 @@ func TestExtractFromBundle_AxiosGet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	ep := findEndpoint(endpoints, "/api/items")
-	if ep == nil {
-		t.Fatalf("expected endpoint /api/items, got: %v", endpoints)
+	// TEST-002: assert exactly one matching endpoint.
+	count := 0
+	var ep *ExtractedEndpoint
+	for i := range endpoints {
+		if endpoints[i].URL == "/api/items" {
+			count++
+			ep = &endpoints[i]
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 endpoint at /api/items, got %d (endpoints: %v)", count, endpoints)
 	}
 	if ep.Method != "GET" {
 		t.Errorf("Method = %q, want GET", ep.Method)
@@ -182,9 +190,17 @@ func TestExtractFromBundle_AxiosPost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	ep := findEndpoint(endpoints, "/api/x")
-	if ep == nil {
-		t.Fatalf("expected endpoint /api/x, got: %v", endpoints)
+	// TEST-002: assert exactly one matching endpoint.
+	count := 0
+	var ep *ExtractedEndpoint
+	for i := range endpoints {
+		if endpoints[i].URL == "/api/x" {
+			count++
+			ep = &endpoints[i]
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 endpoint at /api/x, got %d (endpoints: %v)", count, endpoints)
 	}
 	if ep.Method != "POST" {
 		t.Errorf("Method = %q, want POST", ep.Method)
@@ -200,9 +216,17 @@ func TestExtractFromBundle_AxiosConfigObject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	ep := findEndpoint(endpoints, "/api/x")
-	if ep == nil {
-		t.Fatalf("expected endpoint /api/x, got: %v", endpoints)
+	// TEST-002: assert exactly one matching endpoint.
+	count := 0
+	var ep *ExtractedEndpoint
+	for i := range endpoints {
+		if endpoints[i].URL == "/api/x" {
+			count++
+			ep = &endpoints[i]
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 endpoint at /api/x, got %d (endpoints: %v)", count, endpoints)
 	}
 	if ep.Method != "PUT" {
 		t.Errorf("Method = %q, want PUT", ep.Method)
@@ -286,9 +310,17 @@ func TestExtractFromBundle_FetchTemplateLiteralWithBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	ep := findEndpoint(endpoints, "/users/{id}")
-	if ep == nil {
-		t.Fatalf("expected endpoint /users/{id}, got: %v", endpoints)
+	// TEST-002: assert exactly one matching endpoint.
+	count := 0
+	var ep *ExtractedEndpoint
+	for i := range endpoints {
+		if endpoints[i].URL == "/users/{id}" {
+			count++
+			ep = &endpoints[i]
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 endpoint at /users/{id}, got %d (endpoints: %v)", count, endpoints)
 	}
 	if ep.Method != "POST" {
 		t.Errorf("Method = %q, want POST", ep.Method)
@@ -305,9 +337,17 @@ func TestExtractFromBundle_AxiosTemplateLiteral(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	ep := findEndpoint(endpoints, "/users/{id}")
-	if ep == nil {
-		t.Fatalf("expected endpoint /users/{id}, got: %v", endpoints)
+	// TEST-002: assert exactly one matching endpoint.
+	count := 0
+	var ep *ExtractedEndpoint
+	for i := range endpoints {
+		if endpoints[i].URL == "/users/{id}" {
+			count++
+			ep = &endpoints[i]
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 endpoint at /users/{id}, got %d (endpoints: %v)", count, endpoints)
 	}
 	if ep.Method != "GET" {
 		t.Errorf("Method = %q, want GET", ep.Method)
@@ -430,5 +470,111 @@ func TestExtractFromBundle_EmptyInput(t *testing.T) {
 	}
 	if endpoints != nil {
 		t.Errorf("expected nil endpoints for empty input, got: %v", endpoints)
+	}
+}
+
+// TEST-001: axios.put must extract body fields from the second positional arg.
+func TestExtractFromBundle_AxiosPut(t *testing.T) {
+	src := []byte(`axios.put("/api/users/1", {name, email})`)
+	endpoints, err := ExtractFromBundle(src, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	count := 0
+	var ep *ExtractedEndpoint
+	for i := range endpoints {
+		if endpoints[i].URL == "/api/users/1" {
+			count++
+			ep = &endpoints[i]
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 endpoint at /api/users/1, got %d (endpoints: %v)", count, endpoints)
+	}
+	if ep.Method != "PUT" {
+		t.Errorf("Method = %q, want PUT", ep.Method)
+	}
+	if len(ep.BodyFields) != 2 || ep.BodyFields[0] != "email" || ep.BodyFields[1] != "name" {
+		t.Errorf("BodyFields = %v, want [email name]", ep.BodyFields)
+	}
+}
+
+// TEST-001: axios.patch must extract body fields from the second positional arg.
+func TestExtractFromBundle_AxiosPatch(t *testing.T) {
+	src := []byte(`axios.patch("/api/users/1", {role})`)
+	endpoints, err := ExtractFromBundle(src, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	count := 0
+	var ep *ExtractedEndpoint
+	for i := range endpoints {
+		if endpoints[i].URL == "/api/users/1" {
+			count++
+			ep = &endpoints[i]
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 endpoint at /api/users/1, got %d (endpoints: %v)", count, endpoints)
+	}
+	if ep.Method != "PATCH" {
+		t.Errorf("Method = %q, want PATCH", ep.Method)
+	}
+	if len(ep.BodyFields) != 1 || ep.BodyFields[0] != "role" {
+		t.Errorf("BodyFields = %v, want [role]", ep.BodyFields)
+	}
+}
+
+// TEST-001: axios.delete second arg is CONFIG (not body); config keys must NOT
+// become body fields.
+func TestExtractFromBundle_AxiosDeleteConfigNotBody(t *testing.T) {
+	src := []byte(`axios.delete("/api/users/1", {headers: {Authorization: "x"}})`)
+	endpoints, err := ExtractFromBundle(src, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	count := 0
+	var ep *ExtractedEndpoint
+	for i := range endpoints {
+		if endpoints[i].URL == "/api/users/1" {
+			count++
+			ep = &endpoints[i]
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 endpoint at /api/users/1, got %d (endpoints: %v)", count, endpoints)
+	}
+	if ep.Method != "DELETE" {
+		t.Errorf("Method = %q, want DELETE", ep.Method)
+	}
+	// Config object keys (headers, Authorization) must NOT appear as body fields.
+	if len(ep.BodyFields) != 0 {
+		t.Errorf("BodyFields = %v, want [] (config keys must not become body fields)", ep.BodyFields)
+	}
+}
+
+// TEST-001: axios.delete body is in config.data — extract those keys only.
+func TestExtractFromBundle_AxiosDeleteWithDataBody(t *testing.T) {
+	src := []byte(`axios.delete("/api/users/1", {data: {reason}})`)
+	endpoints, err := ExtractFromBundle(src, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	count := 0
+	var ep *ExtractedEndpoint
+	for i := range endpoints {
+		if endpoints[i].URL == "/api/users/1" {
+			count++
+			ep = &endpoints[i]
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 endpoint at /api/users/1, got %d (endpoints: %v)", count, endpoints)
+	}
+	if ep.Method != "DELETE" {
+		t.Errorf("Method = %q, want DELETE", ep.Method)
+	}
+	if len(ep.BodyFields) != 1 || ep.BodyFields[0] != "reason" {
+		t.Errorf("BodyFields = %v, want [reason]", ep.BodyFields)
 	}
 }

@@ -236,6 +236,15 @@ func extractTemplateLiteralFetches(analyzer *jsluice.Analyzer, baseURL string) [
 }
 
 // axiosMethods maps axios.<method> names to HTTP methods.
+//
+// Special cases handled outside the axiosMethodHasBody data-arg path:
+//   - "request": httpMethod=="", so extractAxiosMemberCall delegates to
+//     endpointFromAxiosConfigObject — URL, method, and body all come from
+//     the first positional config object.
+//   - "delete": in axios v1.x, axios.delete(url, config) — the second
+//     positional arg is a CONFIG object (keys like headers/params/data), NOT
+//     a body. Body lives in config.data. Handled by a dedicated branch in
+//     extractAxiosMemberCall so config keys are never misreported as body fields.
 var axiosMethods = map[string]string{
 	"get":     "GET",
 	"post":    "POST",
@@ -365,12 +374,18 @@ func extractAxiosMemberCall(fn, args *jsluice.Node, baseURL string) (ExtractedEn
 		return ExtractedEndpoint{}, false
 	}
 
-	// Collect body fields from second argument (data object) for body methods.
+	// Collect body fields.
+	//   - post/put/patch: second arg IS the body object; collect its keys directly.
+	//   - delete: second arg is a CONFIG object (headers/params/data/…); body lives
+	//     in config.data only. Collecting the config object's own keys would
+	//     misreport "headers", "params", etc. as body field names.
 	var bodyFields []string
 	if axiosMethodHasBody(methodName) {
 		if dataArg := args.NamedChild(1); dataArg != nil && dataArg.Type() == "object" {
 			bodyFields = collectObjectKeys(dataArg)
 		}
+	} else if methodName == "delete" {
+		bodyFields = axiosDeleteBodyFields(args)
 	}
 
 	return ExtractedEndpoint{
@@ -448,13 +463,33 @@ func normalizedURLFromLiteral(n *jsluice.Node) (string, bool) {
 	return normalized, true
 }
 
-// axiosMethodHasBody reports whether the named axios method may carry a body.
+// axiosMethodHasBody reports whether the named axios method passes the body as
+// the second positional argument (the data-arg pattern). True for post/put/patch
+// only. delete is excluded because axios.delete(url, config) takes a CONFIG
+// object as its second arg, not a body — body lives in config.data and is
+// handled by a separate branch in extractAxiosMemberCall.
 func axiosMethodHasBody(methodName string) bool {
 	switch methodName {
-	case "post", "put", "patch", "delete":
+	case "post", "put", "patch":
 		return true
 	}
 	return false
+}
+
+// axiosDeleteBodyFields extracts body field names from the axios.delete(url, config)
+// call's config argument. In axios v1.x the second positional arg is a CONFIG
+// object whose own keys (headers, params, …) must NOT become body fields; the
+// actual body lives in config.data. Returns nil when no data key is present.
+func axiosDeleteBodyFields(args *jsluice.Node) []string {
+	configArg := args.NamedChild(1)
+	if configArg == nil || configArg.Type() != "object" {
+		return nil
+	}
+	dataNode := configArg.AsObject().GetNode("data")
+	if dataNode == nil || !dataNode.IsValid() || dataNode.Type() != "object" {
+		return nil
+	}
+	return collectObjectKeys(dataNode)
 }
 
 // augmentFetchBodyFields walks the AST for fetch(url, {body: JSON.stringify({...})}) calls

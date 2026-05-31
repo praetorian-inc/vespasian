@@ -697,47 +697,60 @@ func TestAnalyze_SourcemapSourceTimeout(t *testing.T) {
 }
 
 // TestAnalyze_SourcemapSourcePerSourceTimeout verifies that when the bundle parse
-// is fast (BundlesAnalyzed==1) but a sourcemap source extraction hangs, the
-// per-source timeout is triggered and Stats.SourcemapSourceTimeouts is incremented.
-// This pins the per-source extraction timeout path distinctly from the bundle-level path.
+// succeeds (BundlesAnalyzed==1) but a sourcemap-source extraction is delayed past
+// PerBundleTimeout, Stats.SourcemapSourceTimeouts is incremented unconditionally.
+//
+// TEST-003: uses the testInjectDelay hook (analogous to testInjectPanic) so the
+// bundle-body extraction always completes while only the sourcemap-source
+// extraction sleeps past the timeout. This eliminates the race between the bundle
+// parse time and PerBundleTimeout that made the previous fallback assertion
+// necessary.
 func TestAnalyze_SourcemapSourcePerSourceTimeout(t *testing.T) {
-	// Build a tiny bundle (fast parse) with an embedded sourcemap whose
-	// sourcesContent is a large, complex JS blob (slow parse).
-	var sb strings.Builder
-	for i := 0; i < 500; i++ {
-		fmt.Fprintf(&sb, "fetch(\"/api/src%d\");\n", i)
+	// Inject a delay ONLY for sourcemap-source extractions. The delay is 50ms,
+	// much longer than the 10ms PerBundleTimeout set below but short enough for
+	// a real test run.
+	testInjectDelay = func(loc string) {
+		if loc == "sourcemap-source" {
+			time.Sleep(50 * time.Millisecond)
+		}
 	}
-	largeSource := sb.String()
+	defer func() { testInjectDelay = nil }()
 
+	// Bundle body is a single tiny fetch (fast parse; no delay injected for
+	// kind="bundle") with an embedded inline sourcemap carrying one source entry.
+	srcContent := `fetch("/api/from-sourcemap")`
 	smDoc := fmt.Sprintf(`{"sources":["src/x.js"],"sourcesContent":[%s]}`,
-		func() string { b, _ := json.Marshal(largeSource); return string(b) }())
+		func() string { b, _ := json.Marshal(srcContent); return string(b) }())
 	encoded := base64.StdEncoding.EncodeToString([]byte(smDoc))
 	dataURI := "data:application/json;base64," + encoded
-
-	// Bundle body is tiny so the bundle-level parse succeeds quickly.
 	bundleBody := `fetch("/api/from-bundle")` + "\n//# sourceMappingURL=" + dataURI
 	cap := makeJSCapture("https://h/app.js", bundleBody)
 
-	// Use a very short timeout. On fast machines the bundle itself may finish
-	// under 1ns; in that case fall back to validating BundlesSkipped.
+	// PerBundleTimeout=10ms: gives the tiny bundle parse (typically <1ms on any
+	// supported platform) plenty of margin to complete, while remaining far shorter
+	// than the 50ms delay injected for sourcemap-source extractions. The 5:1 ratio
+	// makes the test robust against slow CI environments.
 	res, err := Analyze(context.Background(), []crawl.ObservedRequest{cap}, Options{
-		PerBundleTimeout: 1, // 1 nanosecond
+		PerBundleTimeout: 10 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("Analyze error: %v", err)
 	}
 
-	if res.Stats.BundlesAnalyzed == 1 {
-		// Bundle parse succeeded; per-source extraction must have timed out.
-		if res.Stats.SourcemapSourceTimeouts < 1 {
-			t.Errorf("bundle parsed but SourcemapSourceTimeouts=%d, expected >= 1",
-				res.Stats.SourcemapSourceTimeouts)
-		}
-	} else {
-		// Bundle-level timeout fired first — still valid, just less specific.
-		if res.Stats.BundlesSkipped < 1 {
-			t.Errorf("expected BundlesSkipped >= 1 (bundle-level timeout), got %d", res.Stats.BundlesSkipped)
-		}
+	// Bundle parse must have succeeded (the delay is only for sourcemap-source).
+	if res.Stats.BundlesAnalyzed != 1 {
+		t.Errorf("BundlesAnalyzed = %d, want 1 (bundle parse must succeed with 10ms timeout)", res.Stats.BundlesAnalyzed)
+	}
+	// The sourcemap-source extraction must have timed out.
+	if res.Stats.SourcemapSourceTimeouts != 1 {
+		t.Errorf("SourcemapSourceTimeouts = %d, want 1", res.Stats.SourcemapSourceTimeouts)
+	}
+	// Sanity: no panics, no oversized counts.
+	if res.Stats.SourcemapSourcePanics != 0 {
+		t.Errorf("SourcemapSourcePanics = %d, want 0", res.Stats.SourcemapSourcePanics)
+	}
+	if res.Stats.SourcemapSourcesOversized != 0 {
+		t.Errorf("SourcemapSourcesOversized = %d, want 0", res.Stats.SourcemapSourcesOversized)
 	}
 }
 

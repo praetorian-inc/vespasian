@@ -343,6 +343,10 @@ Yes. Vespasian uses a tiered introspection strategy. If the full introspection q
 
 Vespasian's crawl stage drives a browser and follows links, which is read-only. The probing stage sends OPTIONS requests, fetches `?wsdl` documents, and runs GraphQL introspection queries, all of which are read-only operations. However, always coordinate with the target owner and prefer staging environments during security assessments.
 
+### Security limitations of --analyze-js on untrusted bundles
+
+When analyzing JavaScript bundles served by an attacker-controlled application, `--analyze-js` carries a bounded resource-exhaustion risk. The underlying tree-sitter/jsluice parser is not context-cancellable: a bundle crafted to hang the parser will keep the per-bundle goroutine alive until the parser returns or the process exits. Per-bundle timeouts (default 5 s, configurable) bound the wait per bundle, but a genuine parser deadlock leaks that goroutine for the lifetime of the process. In the worst case the number of leaked goroutines is the worker concurrency × (1 + N) where N is the number of sourcesContent entries in any recovered sourcemap. For long-running processes or automated pipelines that analyze untrusted targets, the recommended mitigation is process isolation: run vespasian with a wall-clock timeout (`--timeout`) per target so leaked goroutines are bounded by the process lifetime.
+
 ## Development
 
 ### Prerequisites

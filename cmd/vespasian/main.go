@@ -435,6 +435,11 @@ func (c *CrawlCmd) Run() error {
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
+	// NOTE: running `crawl` (with --analyze-js) followed by `generate` (also
+	// with --analyze-js, which is the default) re-analyzes the same JS bundles
+	// twice. This is wasted CPU but does not affect correctness: the synthesized
+	// static:js entries produced on both runs are deterministically identical, and
+	// classify.Deduplicate collapses the duplicates so the output spec is unchanged.
 	requests = runJSAnalysisStage(bs.ctx, requests, jsAnalysisArgs{
 		enabled:         c.AnalyzeJS,
 		fetchSourcemaps: c.FetchSourcemaps,
@@ -1034,8 +1039,9 @@ func runJSAnalysisStage(ctx context.Context, requests []crawl.ObservedRequest, a
 		return requests
 	}
 	if args.verbose {
-		fmt.Fprintf(os.Stderr, "js-static: bundles=%d, sourcemaps=%d, endpoints=%d\n", //nolint:gosec // G705: writing to stderr, not web response
-			res.Stats.BundlesAnalyzed, res.Stats.SourcemapsRecovered, res.Stats.EndpointsKept)
+		fmt.Fprintf(os.Stderr, "js-static: bundles=%d skipped=%d panics=%d, sourcemaps=%d, endpoints=%d\n", //nolint:gosec // G705: writing to stderr, not web response
+			res.Stats.BundlesAnalyzed, res.Stats.BundlesSkipped, res.Stats.AnalyzeOnePanics,
+			res.Stats.SourcemapsRecovered, res.Stats.EndpointsKept)
 	}
 	return res.Requests
 }

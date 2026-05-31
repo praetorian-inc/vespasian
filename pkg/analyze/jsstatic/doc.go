@@ -39,4 +39,19 @@
 // when emitting the x-vespasian-source extension on each operation
 // ("static:js" -> "js-bundle", "static:js-sourcemap" -> "js-sourcemap";
 // any dynamic-source group resolves to "dynamic", which wins on mixed groups).
+//
+// # Security and Operator Considerations
+//
+// When analyzing attacker-controlled JavaScript bundles (i.e., when the crawled
+// application serves malicious content), enabling --analyze-js carries a bounded
+// resource-exhaustion risk. The underlying jsluice/tree-sitter parser is not
+// context-aware: if it hangs on adversarial input, the per-bundle goroutine will
+// remain in-flight until jsluice returns (it cannot be canceled). Per-bundle and
+// per-source timeouts (PerBundleTimeout, default 5s) bound wait time per input,
+// but a bundle that causes the parser to deadlock will leak that goroutine for
+// the duration of the process. The worst-case number of leaked goroutines is
+// Concurrency × (1 + N) where N is the number of sourcesContent entries in
+// a recovered sourcemap. Operators analyzing untrusted bundles in long-running
+// processes should be aware of this residual risk; process isolation (running
+// vespasian per-target with a wall-clock timeout) is the recommended mitigation.
 package jsstatic

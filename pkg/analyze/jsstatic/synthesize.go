@@ -98,12 +98,14 @@ func resolveURL(rawURL string, base *url.URL) string {
 // synthBody marshals a map of field-name → nil into a JSON object byte slice.
 // Returns nil when fields is empty.
 //
-// Output determinism: encoding/json marshals map[string]T by iterating keys in
-// sorted order ("Map values encode as JSON objects. The map's key type must
-// either be a string, an integer type, or implement encoding.TextMarshaler.
-// The map keys are sorted and used as JSON object keys" — see
-// https://pkg.go.dev/encoding/json#Marshal). So the same input slice always
-// produces the same byte output, without an explicit pre-sort.
+// Input contract: the fields slice is expected to be pre-sorted lexicographically
+// by the caller (collectObjectKeys always returns sorted keys). encoding/json
+// then marshals the intermediate map[string]interface{} in sorted-key order
+// ("Map values encode as JSON objects. The map's key type must either be a
+// string, an integer type, or implement encoding.TextMarshaler. The map keys
+// are sorted and used as JSON object keys" — see
+// https://pkg.go.dev/encoding/json#Marshal). Together these two guarantees
+// ensure the same input slice always produces the same byte output.
 func synthBody(fields []string) []byte {
 	if len(fields) == 0 {
 		return nil
