@@ -397,7 +397,7 @@ var servicePrefixPattern = regexp.MustCompile(
 // sees.
 var concatMethodPattern = regexp.MustCompile(
 	`["']` +
-		`(/?[a-zA-Z0-9/_{}.:?=&%~-]*)` +
+		`(/?[a-zA-Z0-9/_{}.:?=&%~-]+)` +
 		`["']\.concat\(`,
 )
 
@@ -465,6 +465,12 @@ const maxConcatChainSpan = 1024
 // extractor only cares about literal segments and identifier-shaped
 // operands, which together fit well under that cap).
 const maxConcatArgList = 500
+
+// maxConcatPathsPerBundle caps the number of reconstructed concat paths
+// emitted from a single JS bundle. Complements the cross-bundle
+// MaxEndpoints backstop (default 500) by bounding pre-probe fan-out on a
+// hostile bundle densely packed with API-indicator concat anchors.
+const maxConcatPathsPerBundle = 256
 
 // apiIndicatorPattern matches the path segments that signal an API endpoint.
 // Sourced from apiIndicatorAlternation so it is impossible for it to drift
@@ -983,11 +989,14 @@ func reconstructTemplateLiteral(segment []byte) (string, bool) {
 // same way and is emitted; servicePrefixPattern + apiPathPattern may also
 // match the same source, but the seen-map in emit() deduplicates collisions
 // so no double-emission occurs.
-func extractConcatPaths(jsBody []byte) []string {
+func extractConcatPaths(jsBody []byte) []string { //nolint:gocyclo // emit() state machine (slash-collapse + indicator filter + dedup + per-bundle cap); splitting hurts readability and matches the sibling parser convention in this file
 	seen := make(map[string]bool)
 	var paths []string
 
 	emit := func(p string) {
+		if len(paths) >= maxConcatPathsPerBundle {
+			return
+		}
 		// Collapse `//` runs introduced by literal+literal concatenations
 		// where the head literal ends in `/` and the next literal begins
 		// with `/` (e.g. `"/api/posts/" + "/comment"` → `"/api/posts//comment"`).
@@ -1152,29 +1161,29 @@ func findConcatArgListEnd(jsBody []byte, start int) int { //nolint:gocyclo // sm
 // splitConcatArgs splits argList on top-level commas, ignoring commas
 // inside matched quotes, backticks, brackets, braces, or parentheses.
 // Returns the raw argument strings (whitespace not trimmed).
+//
+// String/backtick scanning is delegated to scanStringLiteral so that
+// backtick template literals (including those with nested ${} blocks) are
+// handled consistently with the rest of the file.
 func splitConcatArgs(argList string) []string { //nolint:gocyclo // small string-state machine; splitting hurts readability
+	data := []byte(argList)
 	var args []string
 	var b strings.Builder
 	depthRound, depthSquare, depthCurly := 0, 0, 0
-	var quote byte // 0 when not in a string, else the opening byte
-	for i := 0; i < len(argList); i++ {
-		c := argList[i]
-		if quote != 0 {
-			b.WriteByte(c)
-			if c == '\\' && i+1 < len(argList) {
-				b.WriteByte(argList[i+1])
-				i++
-				continue
-			}
-			if c == quote {
-				quote = 0
-			}
-			continue
-		}
+	for i := 0; i < len(data); i++ {
+		c := data[i]
 		switch c {
 		case '"', '\'', '`':
-			quote = c
-			b.WriteByte(c)
+			end := scanStringLiteral(data, i)
+			if end < 0 {
+				// Unterminated/malformed literal: append the remainder
+				// verbatim and stop so stray commas in the tail don't
+				// produce spurious extra arguments.
+				b.Write(data[i:])
+				goto done
+			}
+			b.Write(data[i : end+1])
+			i = end
 		case '(':
 			depthRound++
 			b.WriteByte(c)
@@ -1210,6 +1219,7 @@ func splitConcatArgs(argList string) []string { //nolint:gocyclo // small string
 			b.WriteByte(c)
 		}
 	}
+done:
 	if b.Len() > 0 {
 		args = append(args, b.String())
 	}

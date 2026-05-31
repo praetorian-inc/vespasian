@@ -412,6 +412,7 @@ main() {
     log_header "Starting Services"
 
     local start_failed=0
+    REST_API_PORT="" SOAP_SERVICE_PORT="" GRAPHQL_SERVER_PORT="" CONCAT_SPA_PORT=""
     for target in "${TARGET_ARRAY[@]}"; do
         case "$target" in
             rest-api)

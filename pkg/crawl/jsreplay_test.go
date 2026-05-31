@@ -1983,6 +1983,104 @@ func TestJSReplayConfig_WithDefaults_AllowPrivateBypassesDialer(t *testing.T) {
 	}
 }
 
+// TestSplitConcatArgs_NestedBacktick verifies that a backtick template
+// literal whose ${} interpolation itself contains a backtick-quoted string
+// is treated as a single top-level argument and is not split at the inner
+// backtick or at any comma inside the ${} block.
+func TestSplitConcatArgs_NestedBacktick(t *testing.T) {
+	// argList represents the raw argument list (between the outer parens) of:
+	//   str.concat(`${fn(`inner`)}`, "/x")
+	// The inner backtick inside ${...} must not close the outer template
+	// literal prematurely.
+	argList := "`${fn(`inner`)}`, \"/x\""
+	got := splitConcatArgs(argList)
+	require.Len(t, got, 2, "template literal with nested backtick must be a single top-level arg")
+	assert.Equal(t, "`${fn(`inner`)}`", got[0], "first arg must be the whole template literal")
+	assert.Equal(t, " \"/x\"", got[1], "second arg must be the path literal")
+}
+
+// TestExtractConcatPaths_PerBundleCap verifies that extractConcatPaths
+// emits at most maxConcatPathsPerBundle paths from a single JS bundle,
+// even when the bundle contains far more distinct concat-built API paths.
+func TestExtractConcatPaths_PerBundleCap(t *testing.T) {
+	// Build a bundle with maxConcatPathsPerBundle*2 distinct concat paths.
+	var sb strings.Builder
+	total := maxConcatPathsPerBundle * 2
+	for i := 0; i < total; i++ {
+		fmt.Fprintf(&sb, `"/api/endpoint%d/".concat(x);`, i)
+	}
+	got := extractConcatPaths([]byte(sb.String()))
+	assert.Equal(t, maxConcatPathsPerBundle, len(got),
+		"extractConcatPaths must not exceed maxConcatPathsPerBundle per bundle")
+}
+
+// TestExtractConcatPaths_ConcatArgListCap verifies that a .concat() call
+// whose raw argument list exceeds maxConcatArgList bytes is skipped
+// entirely (findConcatArgListEnd returns -1). A control call with a
+// normal in-cap argument list in the same bundle must still be
+// reconstructed, proving the test exercises the cap boundary rather than
+// mere absence of any concat path.
+func TestExtractConcatPaths_ConcatArgListCap(t *testing.T) {
+	// Over-cap call: argument list exceeds maxConcatArgList bytes.
+	// Pad with a long identifier that prevents findConcatArgListEnd from
+	// finding the closing ')' within the cap window.
+	overCapArg := strings.Repeat("x", maxConcatArgList+10)
+	overCapCall := fmt.Sprintf(`"/api/x/".concat(%s)`, overCapArg)
+
+	// Control call: normal in-cap argument that must be reconstructed.
+	controlCall := `"/api/control/".concat("segment")`
+
+	body := []byte(overCapCall + ";\n" + controlCall)
+	got := extractConcatPaths(body)
+
+	// The over-cap call must produce no reconstructed path containing "/api/x/".
+	for _, p := range got {
+		assert.NotContains(t, p, "/api/x/",
+			"over-cap .concat() call must not produce a reconstructed path")
+	}
+
+	// The control call must be reconstructed.
+	found := false
+	for _, p := range got {
+		if strings.Contains(p, "/api/control/") {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "in-cap .concat() call must be reconstructed as a control")
+}
+
+// BenchmarkExtractConcatPaths_HostileBundle measures extraction CPU on a
+// dense worst-case bundle containing many concat anchors plus pathological
+// shapes (unclosed brackets, long operands). It does not assert a threshold;
+// it pins the cost so future regressions are measurable.
+func BenchmarkExtractConcatPaths_HostileBundle(b *testing.B) {
+	var sb strings.Builder
+	// Dense method-form matches.
+	for i := 0; i < 5000; i++ {
+		fmt.Fprintf(&sb, `"/api/x/".concat(a,b,"/end%d");`, i)
+	}
+	// Dense plus-chain matches.
+	for i := 0; i < 5000; i++ {
+		fmt.Fprintf(&sb, `"/api/y/" + a + "/seg%d" + b;`, i)
+	}
+	// Pathological: unclosed bracket after API anchor.
+	for i := 0; i < 1000; i++ {
+		fmt.Fprintf(&sb, `"/api/z/".concat(foo(a,b,`)
+	}
+	// Pathological: long non-literal operand (forces scanIdentifierOperand walk).
+	longIdent := strings.Repeat("a", 512)
+	for i := 0; i < 500; i++ {
+		fmt.Fprintf(&sb, `"/api/w/".concat(%s);`, longIdent)
+	}
+	body := []byte(sb.String())
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		_ = extractConcatPaths(body)
+	}
+}
+
 func TestJSReplayConfig_WithDefaults_WrapsCallerSuppliedClient(t *testing.T) {
 	// Even when the caller supplies their own *http.Client, withDefaults must
 	// install ssrf.SafeDialContext on that client's transport so the dial-time
