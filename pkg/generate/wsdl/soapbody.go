@@ -48,14 +48,12 @@ var (
 
 // soapBodyInfo is the per-request extraction result. nil for failures.
 type soapBodyInfo struct {
-	// Namespace is the XML namespace URI of the element whose contents this
-	// soapBodyInfo represents. At the top-level result of extractSOAPParameters
-	// that element is the operation element, so the top-level Namespace is the
-	// operation's namespace; in nested Children subtrees built by walkParam it
-	// is the parent parameter element's namespace. InferWSDL reads the
-	// top-level value (via typesNamespace) to set the generated WSDL/XSD
-	// targetNamespace, so the service's observed namespace is preserved in the
-	// emitted output.
+	// Namespace is the XML namespace URI of the operation element. It is set
+	// only on the top-level result of extractSOAPParameters (walkOperation);
+	// nested Children subtrees leave it empty because leaf parameters are
+	// emitted unqualified. InferWSDL reads this top-level value (via
+	// typesNamespace) to set the generated WSDL/XSD targetNamespace, so the
+	// service's observed namespace is preserved in the emitted output.
 	Namespace   string
 	OrderedKeys []string
 	Params      map[string]*inferredParam
@@ -201,8 +199,7 @@ collect:
 			}
 			if p.Children == nil {
 				p.Children = &soapBodyInfo{
-					Namespace: paramStart.Name.Space,
-					Params:    make(map[string]*inferredParam),
+					Params: make(map[string]*inferredParam),
 				}
 			}
 			// Same-name children collapse via first-with-type-wins.

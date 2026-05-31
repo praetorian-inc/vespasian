@@ -517,6 +517,20 @@ func TestTypesNamespace(t *testing.T) {
 		}
 		assert.Equal(t, urlNS, typesNamespace([]string{"A", "B"}, obs, urlNS))
 	})
+	// Common capture shape: one request carried an operation namespace, another
+	// did not. A single observed namespace must survive an empty/absent sibling
+	// rather than triggering the disagreement fallback.
+	t.Run("one observed namespace survives an empty sibling", func(t *testing.T) {
+		obs := map[string]*soapBodyInfo{
+			"A": {Namespace: "http://observed/"},
+			"B": {Namespace: ""},
+		}
+		assert.Equal(t, "http://observed/", typesNamespace([]string{"A", "B"}, obs, urlNS))
+	})
+	t.Run("one observed namespace survives a sibling absent from the map", func(t *testing.T) {
+		obs := map[string]*soapBodyInfo{"A": {Namespace: "http://observed/"}}
+		assert.Equal(t, "http://observed/", typesNamespace([]string{"A", "B"}, obs, urlNS))
+	})
 }
 
 // TEST-001 (round-2 blocker fix): regression test for the namespace-aware

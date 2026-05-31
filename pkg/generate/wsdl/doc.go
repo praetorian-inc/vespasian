@@ -35,6 +35,10 @@
 // wins on conflict. Recursion is capped at maxBodyDepth = 32 levels to prevent
 // pathological inputs from causing unbounded stack growth.
 //
+// Extraction is best-effort on malformed input: when an XML stream is truncated
+// mid-envelope, the parameters collected before the truncation are preserved
+// rather than discarded, so a partial body still contributes what it observed.
+//
 // The generated WSDL's targetNamespace (shared by the definitions element, the
 // tns prefix, and the embedded XSD schema) is taken from the namespace observed
 // on the SOAP operation elements, so the service's real namespace is preserved
