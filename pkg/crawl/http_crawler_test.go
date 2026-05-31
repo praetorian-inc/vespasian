@@ -200,3 +200,71 @@ func TestHTTPCrawler_RedirectScopeBlocked(t *testing.T) {
 		}
 	}
 }
+
+func TestApplyHeaders_SetsHeadersOnRequest(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "https://example.com/", nil)
+	applyHeaders(req, map[string]string{
+		"X-Custom-Header": "value1",
+		"User-Agent":      "TestAgent/1.0",
+	})
+	if got := req.Header.Get("X-Custom-Header"); got != "value1" {
+		t.Errorf("X-Custom-Header = %q, want value1", got)
+	}
+	if got := req.Header.Get("User-Agent"); got != "TestAgent/1.0" {
+		t.Errorf("User-Agent = %q, want TestAgent/1.0", got)
+	}
+}
+
+func TestApplyHeaders_NilHeaders(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "https://example.com/", nil)
+	// applyHeaders with nil headers must not panic.
+	applyHeaders(req, nil)
+}
+
+func TestRedirectScopeGuard_TooManyRedirects(t *testing.T) {
+	guard := redirectScopeGuard(nil)
+	// Simulate 10 previous redirects — guard must return an error.
+	via := make([]*http.Request, 10)
+	req, _ := http.NewRequest(http.MethodGet, "https://example.com/", nil)
+	err := guard(req, via)
+	if err == nil {
+		t.Error("expected error for 10+ redirects, got nil")
+	}
+	if !strings.Contains(err.Error(), "10 redirects") {
+		t.Errorf("error = %q, want '10 redirects'", err.Error())
+	}
+}
+
+func TestRedirectScopeGuard_AllowsInScopeRedirect(t *testing.T) {
+	// A nil scopeFn means no scope checking — all redirects allowed.
+	guard := redirectScopeGuard(nil)
+	via := []*http.Request{}
+	req, _ := http.NewRequest(http.MethodGet, "https://example.com/other", nil)
+	if err := guard(req, via); err != nil {
+		t.Errorf("in-scope redirect rejected: %v", err)
+	}
+}
+
+func TestHTTPCrawler_SendsCustomHeaders(t *testing.T) {
+	var receivedAgent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAgent = r.Header.Get("X-Test-Header")
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `ok`)
+	}))
+	defer srv.Close()
+	c := &HTTPCrawler{opts: CrawlerOptions{
+		Depth:        1,
+		MaxPages:     1,
+		Timeout:      10 * time.Second,
+		AllowPrivate: true,
+		Headers:      map[string]string{"X-Test-Header": "sentinel"},
+	}}
+	_, err := c.Crawl(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receivedAgent != "sentinel" {
+		t.Errorf("X-Test-Header = %q, want sentinel", receivedAgent)
+	}
+}

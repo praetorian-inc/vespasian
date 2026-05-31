@@ -63,3 +63,35 @@ func TestExtractInlineScripts_RunsJsluice(t *testing.T) {
 		t.Errorf("inline jsluice URL not found in %v", got)
 	}
 }
+
+func TestExtractFromHTML_EmptyBody(t *testing.T) {
+	// Empty body should return nil/empty without panicking.
+	got := extractFromHTML([]byte{}, "https://example.com/")
+	if len(got) != 0 {
+		t.Errorf("empty body: got %v, want []", got)
+	}
+}
+
+func TestExtractFromHTML_NoLinks(t *testing.T) {
+	body := []byte(`<html><body><p>no links here</p></body></html>`)
+	got := extractFromHTML(body, "https://example.com/")
+	if len(got) != 0 {
+		t.Errorf("no-link page: got %v, want []", got)
+	}
+}
+
+func TestExtractInlineScripts_NoInlineScripts(t *testing.T) {
+	// Only external scripts — nothing to extract from inline.
+	body := []byte(`<html><script src="/external.js"></script></html>`)
+	got := extractInlineScripts(body)
+	if len(got) != 0 {
+		t.Errorf("external-only scripts: got %v, want []", got)
+	}
+}
+
+func TestExtractInlineScripts_EmptyBody(t *testing.T) {
+	got := extractInlineScripts([]byte{})
+	if len(got) != 0 {
+		t.Errorf("empty body: got %v, want []", got)
+	}
+}
