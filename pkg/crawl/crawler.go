@@ -46,6 +46,10 @@ const (
 	// crawl goroutine to exit. Prevents goroutine leaks when the engine is slow
 	// to shut down.
 	DrainTimeout = 500 * time.Millisecond
+	// MaxHTTPBodySize is the maximum body size to read per HTTP response in the
+	// HTTPCrawler (10 MB DoS cap). Distinct from MaxResponseBodySize (1 MB
+	// retention cap) — both serve different purposes.
+	MaxHTTPBodySize = 10 * 1024 * 1024
 )
 
 // CrawlerOptions configures the crawler behavior.
