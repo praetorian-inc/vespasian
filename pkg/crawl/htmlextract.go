@@ -22,15 +22,24 @@ import (
 
 // extractFromHTML parses an HTML body and returns all navigable URLs discovered
 // via the same linkSelectors set used by the rod-based extractLinks. Each raw
-// attribute value is resolved against baseURL and filtered through isLikelyPage
-// (dropping JS bundles, images, etc.). Scope enforcement is left to the frontier.
+// attribute value is resolved against the effective base URL — the <base href>
+// tag when present (matching the rod path's effectiveBaseURL call), otherwise
+// pageURL — and filtered through isLikelyPage (dropping JS bundles, images,
+// etc.). Scope enforcement is left to the frontier.
 //
 // This is the goquery analog of extractLinks (links.go:68) — same selectors
 // and filters, no *rod.Page dependency.
-func extractFromHTML(body []byte, baseURL string) []string {
+func extractFromHTML(body []byte, pageURL string) []string {
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
 	if err != nil {
 		return nil
+	}
+
+	// Resolve the effective base URL: honor <base href> when present, applying
+	// the same scheme-downgrade and cross-host guards as effectiveBaseURLFrom.
+	base := pageURL
+	if href, exists := doc.Find("base[href]").First().Attr("href"); exists {
+		base = effectiveBaseURLFrom(href, pageURL)
 	}
 
 	seen := make(map[string]bool)
@@ -43,7 +52,7 @@ func extractFromHTML(body []byte, baseURL string) []string {
 				return
 			}
 
-			resolved, err := resolveURL(baseURL, raw)
+			resolved, err := resolveURL(base, raw)
 			if err != nil {
 				return
 			}
@@ -61,6 +70,23 @@ func extractFromHTML(body []byte, baseURL string) []string {
 	}
 
 	return links
+}
+
+// extractEffectiveBase parses body for a <base href> element and returns the
+// effective base URL for the page (applying the same scheme-downgrade and
+// cross-host guards as effectiveBaseURLFrom). Returns pageURL when no valid
+// <base href> is present. This is the pure-HTML analog of effectiveBaseURL
+// (links.go), allowing callers to obtain the same base without re-parsing.
+func extractEffectiveBase(body []byte, pageURL string) string {
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	if err != nil {
+		return pageURL
+	}
+	href, exists := doc.Find("base[href]").First().Attr("href")
+	if !exists {
+		return pageURL
+	}
+	return effectiveBaseURLFrom(href, pageURL)
 }
 
 // extractInlineScripts finds all inline <script> tags (those without a src

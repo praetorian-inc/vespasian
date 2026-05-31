@@ -133,6 +133,12 @@ func TestHTTPCrawler_PerPageTimeoutSurfaced(t *testing.T) {
 	// overall context expires.
 	_, _ = c.Crawl(ctx, srv.URL)
 	// Test passes if we reach here (no panic, crawl returns).
+
+	// Verify that the timeout/error was surfaced to Stderr, not silently dropped.
+	stderrOut := stderr.String()
+	if stderrOut == "" {
+		t.Error("expected timeout or error message on Stderr; got empty output")
+	}
 }
 
 func TestHTTPCrawler_ClampConcurrency(t *testing.T) {
@@ -244,6 +250,39 @@ func TestRedirectScopeGuard_AllowsInScopeRedirect(t *testing.T) {
 	if err := guard(req, via); err != nil {
 		t.Errorf("in-scope redirect rejected: %v", err)
 	}
+}
+
+// TestHTTPCrawler_SSRFRedirectBlocked verifies that when AllowPrivate is false
+// and Scope is "same-origin", a 302 redirect to a private IP (127.0.0.1) is
+// blocked by the redirect scope guard. No result entry for that host should
+// appear and the crawl must not panic.
+func TestHTTPCrawler_SSRFRedirectBlocked(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			// Redirect to a private IP — must be blocked by the scope guard.
+			http.Redirect(w, r, "http://127.0.0.1:1/secret", http.StatusFound)
+			return
+		}
+	}))
+	defer srv.Close()
+
+	var stderr bytes.Buffer
+	c := &HTTPCrawler{opts: CrawlerOptions{
+		Depth:        1,
+		MaxPages:     5,
+		Timeout:      5 * time.Second,
+		Stderr:       &stderr,
+		AllowPrivate: false,
+		Scope:        "same-origin",
+	}}
+
+	got, _ := c.Crawl(context.Background(), srv.URL)
+	for _, r := range got {
+		if strings.Contains(r.URL, "127.0.0.1") {
+			t.Errorf("crawler followed redirect to private IP; result URL = %s", r.URL)
+		}
+	}
+	// Crawl must not panic and must return (no hang).
 }
 
 func TestHTTPCrawler_SendsCustomHeaders(t *testing.T) {

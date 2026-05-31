@@ -95,3 +95,71 @@ func TestExtractInlineScripts_EmptyBody(t *testing.T) {
 		t.Errorf("empty body: got %v, want []", got)
 	}
 }
+
+// TestExtractEffectiveBase_NoBaseTag verifies that extractEffectiveBase returns
+// pageURL when the HTML contains no <base href> element.
+func TestExtractEffectiveBase_NoBaseTag(t *testing.T) {
+	body := []byte(`<html><body><a href="/x">x</a></body></html>`)
+	got := extractEffectiveBase(body, "https://example.com/page")
+	if got != "https://example.com/page" {
+		t.Errorf("extractEffectiveBase (no base tag) = %q, want %q", got, "https://example.com/page")
+	}
+}
+
+// TestExtractEffectiveBase_WithBaseTag verifies that extractEffectiveBase returns
+// the resolved base URL when a valid <base href> element is present.
+func TestExtractEffectiveBase_WithBaseTag(t *testing.T) {
+	body := []byte(`<html><head><base href="/app/"></head><body></body></html>`)
+	got := extractEffectiveBase(body, "https://example.com/page")
+	want := "https://example.com/app/"
+	if got != want {
+		t.Errorf("extractEffectiveBase = %q, want %q", got, want)
+	}
+}
+
+// TestExtractFromHTML_BaseHref verifies that a <base href="/app/"> tag causes
+// relative links to resolve against the base, not the raw pageURL.
+func TestExtractFromHTML_BaseHref(t *testing.T) {
+	// <base href="/app/"> is an absolute-path reference: resolves to https://host/app/.
+	// The relative <a href="x"> should therefore resolve to https://host/app/x.
+	body := []byte(`<html><head><base href="/app/"></head><body><a href="x">page</a></body></html>`)
+	got := extractFromHTML(body, "https://host/other/page")
+	want := "https://host/app/x"
+	found := false
+	for _, u := range got {
+		if u == want {
+			found = true
+		}
+		// Must NOT resolve relative to original pageURL (/other/page).
+		if u == "https://host/other/x" {
+			t.Errorf("relative link resolved against pageURL instead of <base href>: got %s", u)
+		}
+	}
+	if !found {
+		t.Errorf("expected %q in results %v", want, got)
+	}
+}
+
+// TestExtractFromHTML_BaseHrefCrossHostRejected verifies that a cross-host
+// <base href> is rejected and pageURL is used as fallback (cross-host guard).
+func TestExtractFromHTML_BaseHrefCrossHostRejected(t *testing.T) {
+	// attacker.com base must be rejected; relative link resolves against pageURL.
+	body := []byte(`<html><head><base href="https://attacker.com/evil/"></head><body><a href="x">page</a></body></html>`)
+	got := extractFromHTML(body, "https://target.com/app/")
+	for _, u := range got {
+		if strings.Contains(u, "attacker.com") {
+			t.Errorf("cross-host <base href> was NOT rejected; got %s", u)
+		}
+	}
+	// The relative "x" should resolve against pageURL → https://target.com/app/x
+	want := "https://target.com/app/x"
+	found := false
+	for _, u := range got {
+		if u == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected fallback resolution %q in results %v", want, got)
+	}
+}

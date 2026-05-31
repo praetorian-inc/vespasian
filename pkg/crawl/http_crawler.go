@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/time/rate"
 )
@@ -86,13 +87,12 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 
 	n := clampConcurrency(c.opts.Concurrency)
 	var wg sync.WaitGroup
-	for i := range n {
+	for range n {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			c.runWorker(crawlCtx, crawlCancel, client, limiter, frontier, &mu, &results, &pageCount, maxPages)
 		}()
-		_ = i
 	}
 
 	wg.Wait()
@@ -171,7 +171,7 @@ func (c *HTTPCrawler) runWorker(
 // returns the observed request and discovered links. On error it logs to Stderr
 // (if set) and returns (nil, nil) so the worker can continue.
 func (c *HTTPCrawler) fetchPage(ctx context.Context, client *http.Client, limiter *rate.Limiter, entry urlEntry) (*ObservedRequest, []string) {
-	pageCtx, cancel := context.WithTimeout(ctx, PageTimeout*1e9) // PageTimeout seconds
+	pageCtx, cancel := context.WithTimeout(ctx, time.Duration(PageTimeout)*time.Second)
 	defer cancel()
 
 	// Rate-limit before fetching. A limiter.Wait error (context canceled or
@@ -215,22 +215,22 @@ func (c *HTTPCrawler) fetchPage(ctx context.Context, client *http.Client, limite
 // extractLinks discovers navigable URLs from an observed request using HTML
 // parsing (goquery) and jsluice. It handles both HTML pages and JavaScript
 // response bodies.
+//
+// For HTML responses, extractFromHTML reads the <base href> tag (if present)
+// and resolves relative links against it, exactly matching the rod path's
+// effectiveBaseURL behavior. Inline-script URLs are resolved against the same
+// base so that jsluice-extracted paths honor the page's declared base.
 func (c *HTTPCrawler) extractLinks(observed ObservedRequest, pageURL string) []string {
 	var links []string
 
 	ct := strings.ToLower(observed.Response.ContentType)
 	if isHTMLContentType(ct) {
-		baseURL := effectiveBaseURLFrom("", pageURL) // no base href parsing here; use pageURL as base
-		// Try to extract base href from body for more accurate resolution.
-		if len(observed.Response.Body) > 0 {
-			// Pass the raw body to see if there's a <base href="...">.
-			// effectiveBaseURLFrom already handles this correctly if we
-			// re-parse; for simplicity, let htmlextract handle the actual
-			// resolution against pageURL.
-			baseURL = pageURL
-		}
-		links = append(links, extractFromHTML(observed.Response.Body, baseURL)...)
-		links = append(links, jsExtractedToLinks(extractInlineScripts(observed.Response.Body), baseURL)...)
+		// extractFromHTML resolves <base href> internally; pass pageURL as
+		// the fallback base. Derive the same effective base for inline scripts
+		// so both extraction paths are consistent.
+		links = append(links, extractFromHTML(observed.Response.Body, pageURL)...)
+		base := extractEffectiveBase(observed.Response.Body, pageURL)
+		links = append(links, jsExtractedToLinks(extractInlineScripts(observed.Response.Body), base)...)
 	}
 
 	links = append(links, jsExtractedToLinks(extractURLsFromResponses([]ObservedRequest{observed}), pageURL)...)
