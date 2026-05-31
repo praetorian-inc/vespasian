@@ -507,9 +507,9 @@ func augmentFetchBodyFields(analyzer *jsluice.Analyzer) map[endpointKey][]string
 }
 
 // fetchBodyFromCall extracts the (key, body fields) pair for a fetch() call
-// node. Returns ok=false if the node is not a fetch with a body-bearing
-// options object. Splitting this out keeps augmentFetchBodyFields below the
-// gocyclo budget.
+// node. It returns the (method, normalized-URL) key and the top-level keys
+// of the JSON.stringify({...}) body object. Returns ok=false if the node is
+// not a fetch() call, has no options object, or has no JSON.stringify body.
 func fetchBodyFromCall(n *jsluice.Node) (endpointKey, []string, bool) {
 	var k endpointKey
 	fn := n.ChildByFieldName("function")

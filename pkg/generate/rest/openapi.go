@@ -172,23 +172,18 @@ func groupEndpoints(endpoints []classify.ClassifiedRequest) map[endpointKey][]cl
 	return endpointGroups
 }
 
-// isJSStaticSource returns true iff the Source value is one of the JS-bundle
-// static-analysis sources owned by LAB-2108. Other "static:*" sources (e.g.
-// "static:html" from pkg/analyze form analysis) are deliberately rejected here
-// — they have their own provenance and should not flow into the
-// x-vespasian-source extension, which is scoped to JS bundle / sourcemap
-// recovery only.
-func isJSStaticSource(source string) bool {
-	return source == crawl.SourceStaticJS || source == crawl.SourceStaticJSSourcemap
-}
-
 // anyStaticSource returns true if any request in endpoints carries a JS-bundle
 // static-analysis source. The x-vespasian-source extension is gated on this so
 // that flag-off output (and inputs from sources outside LAB-2108) stay
 // byte-identical to pre-LAB-2108 behavior. Non-JS static sources do not gate.
+//
+// The per-element check is delegated to crawl.IsJSStaticSource, which owns the
+// canonical definition of the JS-static Source vocabulary. The local wrapper
+// exists only to accept []classify.ClassifiedRequest (which embeds
+// crawl.ObservedRequest) rather than []crawl.ObservedRequest.
 func anyStaticSource(endpoints []classify.ClassifiedRequest) bool {
 	for _, ep := range endpoints {
-		if isJSStaticSource(ep.Source) {
+		if crawl.IsJSStaticSource(ep.Source) {
 			return true
 		}
 	}
@@ -222,7 +217,7 @@ func computeSourceTag(group []classify.ClassifiedRequest) string {
 	}
 	var tag string
 	for _, ep := range group {
-		if !isJSStaticSource(ep.Source) {
+		if !crawl.IsJSStaticSource(ep.Source) {
 			// Any non-JS-static source (dynamic, empty, or static:html etc.)
 			// wins immediately.
 			return "dynamic"

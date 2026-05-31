@@ -51,12 +51,14 @@ const (
 type Options struct {
 	// HTTPClient is the client used for sourcemap fetches.
 	//
-	// When set, the caller is responsible for configuring an SSRF-safe Transport
-	// (typically by using probe.SSRFSafeDialContext on the DialContext) and any
-	// proxy/TLS/mTLS settings. Analyze overlays a noFollowRedirects CheckRedirect
-	// on a shallow copy of the supplied client at fetch time so a same-host
-	// .js.map URL cannot 302 to a different host and bypass the sameHost
-	// pre-flight check; this overlay does not mutate the caller's client.
+	// When set, Analyze wraps the caller's client in a shallow copy that overlays
+	// both noFollowRedirects (so a .js.map URL cannot 302 to an attacker host and
+	// bypass the sameHost pre-flight check) and an SSRF-safe DialContext matching
+	// the posture of the default client (probe.SSRFSafeDialContext, or a
+	// permissive dialer when AllowPrivate is true). The caller's original client
+	// is not mutated. The caller may supply additional Transport settings (e.g.
+	// mTLS, proxy, custom TLS config) via a custom Transport; those are replaced
+	// by the safe transport overlay at fetch time.
 	HTTPClient *http.Client
 
 	// FetchSourcemaps enables remote .js.map fetching when a sourceMappingURL
@@ -106,6 +108,8 @@ func (o Options) withDefaults() Options {
 	if o.Concurrency <= 0 {
 		o.Concurrency = DefaultConcurrency
 	}
+	// Logger is an interface, so == nil is the correct zero-value check here
+	// (not <= 0 as used for the numeric fields above).
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
@@ -208,10 +212,14 @@ const (
 // where N is the number of sourcesContent entries in a recovered sourcemap
 // (each entry is dispatched to a separate extractWithTimeout call). In the
 // common case N is small; for a pathological sourcemap with many sources,
-// all N per-source goroutines may be in-flight simultaneously. If jsluice's
-// underlying tree-sitter parser ever genuinely deadlocks on adversarial input,
-// the goroutine would remain blocked indefinitely — pkg/probe-style process
-// isolation would be the fix, intentionally out of scope here.
+// all N per-source goroutines may be in-flight simultaneously.
+//
+// Known, bounded limitation: if jsluice's underlying tree-sitter parser ever
+// genuinely deadlocks on adversarial input, the goroutine would remain blocked
+// indefinitely (for the lifetime of the Analyze call). The complete fix is
+// pkg/probe-style process isolation; that is intentionally out of scope here
+// because it requires a subprocess harness comparable in size to the entire
+// jsstatic package.
 func extractWithTimeout(ctx context.Context, source []byte, sourceURL, kind string, opts Options) (eps []ExtractedEndpoint, status extractStatus) {
 	type result struct {
 		eps      []ExtractedEndpoint
@@ -256,16 +264,29 @@ func extractWithTimeout(ctx context.Context, source []byte, sourceURL, kind stri
 	}
 }
 
+// testInjectPanic and testInjectDelay are unexported test-only seams that
+// live in this production file because the production code paths that consult
+// them (safeAnalyzeOne and the extraction goroutine in extractWithTimeout)
+// must compile in non-test binaries. Variables declared in *_test.go files
+// are not visible to production code, so they cannot be used here.
+//
+// Both are nil by default (zero value for a func type), which means each
+// call site is a single nil-check with no allocation and no side effects in
+// production builds.
+//
+// Dependency-injecting these hooks through Options would expose test seams as
+// part of the public API surface, which violates KISS for what amounts to two
+// conditional nil-checks. The package-level variable pattern is the accepted
+// Go idiom for this pattern and predates this PR.
+
 // testInjectPanic is a panic-fault-injection point used by jsstatic's
 // panic-recovery regression tests. The hook is consulted at exactly two
 // call sites — the top of safeAnalyzeOne (loc="analyzeOne") and inside the
 // extraction goroutine in extractWithTimeout (loc="bundle" or
-// loc="sourcemap-source"). Production builds leave it nil; the runtime cost
-// is one nil-check at each call site. The hook exists because neither
-// safeAnalyzeOne's body nor the goroutine's body has a naturally-panicking
-// path that an external test can reliably trigger, and we want positive
-// regression coverage of the recover/counter contracts (QUAL-004 and the
-// SourcemapSourcePanics counter introduced for QUAL-002).
+// loc="sourcemap-source"). The hook exists because neither safeAnalyzeOne's
+// body nor the goroutine's body has a naturally-panicking path that an
+// external test can reliably trigger, and we want positive regression
+// coverage of the recover/counter contracts.
 var testInjectPanic func(loc string)
 
 // testInjectDelay is a delay-fault-injection point used by jsstatic's
@@ -274,8 +295,7 @@ var testInjectPanic func(loc string)
 // hook) with the same loc string ("bundle" or "sourcemap-source"). A test
 // can sleep for longer than PerBundleTimeout to force a deterministic
 // timeout on a specific extraction kind without relying on large JS inputs
-// or timing assumptions. Production builds leave it nil; the runtime cost
-// is one nil-check at each call site.
+// or timing assumptions.
 var testInjectDelay func(loc string)
 
 // safeAnalyzeOne wraps analyzeOne with a recover() so that a panic outside the
@@ -386,11 +406,12 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 // canceled). Per-bundle parse failures are logged and counted in Stats but
 // do not abort the analysis.
 //
-// Length rationale: this function intentionally exceeds the project's ~60-line
-// guideline. Its body is the orchestration shape of the package — pre-loop
-// classification, worker-pool fan-out, fan-in with Stats merge, output slice
-// build, and post-run cancellation check. Splitting the merge or fan-out
-// into helpers would force them to expose Stats, work channels, and the
+// Length rationale: this function's body is the orchestration shape of the
+// package — pre-loop classification, worker-pool fan-out, fan-in with Stats
+// merge, output slice build, and post-run cancellation check. These phases
+// are cohesive: each step reads the output of the previous one and the
+// control flow is sequential. Splitting the merge or fan-out into helpers
+// would force them to expose Stats, work channels, and the
 // abandoned-on-cancel accounting as parameters, which would obscure rather
 // than clarify the orchestration.
 func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options) (Result, error) {
@@ -471,6 +492,18 @@ func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options
 		stats.EndpointsFound += r.stats.EndpointsFound
 		stats.EndpointsKept += r.stats.EndpointsKept
 		synthesized = append(synthesized, r.requests...)
+		// Each bundle a worker picks up contributes exactly 1 to exactly one
+		// of: BundlesAnalyzed (successfully extracted), BundlesSkipped
+		// (oversized at pre-loop, OR timeout/panic on the bundle-body
+		// extractWithTimeout call), or AnalyzeOnePanics (panic outside
+		// extractWithTimeout, e.g. in toRequests or accounting code).
+		//
+		// SourcemapSourcePanics are NOT included here because they are
+		// sub-events that occur inside the sourcemap-source loop AFTER the
+		// bundle has already been counted in BundlesAnalyzed (line
+		// `result.stats.BundlesAnalyzed++` in analyzeOne runs before the
+		// sourcemap loop). Including SourcemapSourcePanics would double-count
+		// the containing bundle.
 		workerProcessed += r.stats.BundlesAnalyzed + r.stats.BundlesSkipped + r.stats.AnalyzeOnePanics
 	}
 	if abandoned := len(bundles) - workerProcessed; abandoned > 0 {

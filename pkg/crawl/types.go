@@ -50,6 +50,26 @@ const (
 	SourceStaticJSSourcemap = "static:js-sourcemap"
 )
 
+// IsJSStaticSource returns true iff source is one of the JS-bundle
+// static-analysis Source values (SourceStaticJS or SourceStaticJSSourcemap).
+// Other "static:*" sources (e.g. "static:html" from HTML form analysis) are
+// intentionally excluded — they have separate provenance.
+func IsJSStaticSource(source string) bool {
+	return source == SourceStaticJS || source == SourceStaticJSSourcemap
+}
+
+// AnyStaticSource reports whether any ObservedRequest in reqs carries a
+// JS-bundle static-analysis Source value. Useful as a gate to avoid emitting
+// JS-specific metadata (e.g. x-vespasian-source) when no JS analysis ran.
+func AnyStaticSource(reqs []ObservedRequest) bool {
+	for _, r := range reqs {
+		if IsJSStaticSource(r.Source) {
+			return true
+		}
+	}
+	return false
+}
+
 // ObservedResponse represents a captured HTTP response.
 type ObservedResponse struct {
 	StatusCode  int               `json:"status_code"`

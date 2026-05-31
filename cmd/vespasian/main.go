@@ -436,10 +436,10 @@ func (c *CrawlCmd) Run() error {
 	}
 
 	// NOTE: running `crawl` (with --analyze-js) followed by `generate` (also
-	// with --analyze-js, which is the default) re-analyzes the same JS bundles
-	// twice. This is wasted CPU but does not affect correctness: the synthesized
-	// static:js entries produced on both runs are deterministically identical, and
-	// classify.Deduplicate collapses the duplicates so the output spec is unchanged.
+	// with --analyze-js, the default) does NOT re-analyze the same JS bundles.
+	// runJSAnalysisStage's idempotency guard (crawl.AnyStaticSource) detects the
+	// static:js entries this stage writes into the capture and short-circuits the
+	// second analysis, so `crawl | generate` is byte-identical to a single `scan`.
 	requests = runJSAnalysisStage(bs.ctx, requests, jsAnalysisArgs{
 		enabled:         c.AnalyzeJS,
 		fetchSourcemaps: c.FetchSourcemaps,
@@ -1014,6 +1014,14 @@ func validateURL(rawURL string) error {
 
 // jsAnalysisArgs bundles the flag values that drive jsstatic.Analyze. Used by
 // runJSAnalysisStage so each *Cmd.Run only has to assemble these fields once.
+//
+// The three call sites (CrawlCmd.Run, GenerateCmd.Run, ScanCmd.Run) each
+// build this value inline from their own flag struct (CrawlOptions,
+// GenerateCmd, ScanCmd). No shared constructor is provided because the source
+// structs are unrelated types: forcing a shared builder would require either
+// a dependency on all three command types or extra indirection that obscures
+// rather than simplifies the four-field assembly. Keeping the literal at each
+// call site is intentional.
 type jsAnalysisArgs struct {
 	enabled         bool
 	fetchSourcemaps bool
@@ -1025,8 +1033,21 @@ type jsAnalysisArgs struct {
 // (possibly enriched) request slice. When args.enabled is false, returns
 // requests unchanged. Errors from Analyze are logged and treated as a no-op
 // (best-effort enrichment must never fail the surrounding pipeline).
+//
+// Idempotency guard: if any input request already carries a static:js or
+// static:js-sourcemap Source value, the bundles were already analyzed by a
+// prior stage (e.g. crawl --analyze-js wrote the capture and generate is now
+// reading it). In that case we skip the analysis and return requests unchanged
+// to avoid double-counting and redundant work. The guard also ensures that
+// running crawl | generate pipelines is byte-identical to running scan
+// directly when --analyze-js is set on both commands.
 func runJSAnalysisStage(ctx context.Context, requests []crawl.ObservedRequest, args jsAnalysisArgs) []crawl.ObservedRequest {
 	if !args.enabled {
+		return requests
+	}
+	// Skip if any request already carries a JS-static source — this capture
+	// was produced by a stage that already ran jsstatic.Analyze.
+	if crawl.AnyStaticSource(requests) {
 		return requests
 	}
 	aopts := jsstatic.Options{

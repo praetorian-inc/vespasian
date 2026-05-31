@@ -95,13 +95,27 @@ func recoverSourcemap(ctx context.Context, bundle []byte, bundleURL string, opts
 	if client == nil {
 		client = defaultSourcemapClient(opts.AllowPrivate)
 	} else {
-		// Caller-supplied client: enforce noFollowRedirects on a shallow copy so
-		// a same-host .js.map URL cannot 302 to an attacker host and bypass the
-		// sameHost pre-flight check above. We do not mutate the caller's client.
-		// The caller remains responsible for SSRF-safe dialing on the underlying
-		// Transport — see Options.HTTPClient doc.
+		// Caller-supplied client: enforce both noFollowRedirects and an SSRF-safe
+		// DialContext on a shallow-copy so neither mutation touches the caller's
+		// original client.
+		//
+		// noFollowRedirects: a same-host .js.map URL that 302s to an attacker
+		// host would bypass the sameHost pre-flight check above.
+		//
+		// SSRFSafeDialContext (or permissive dialer when AllowPrivate is true):
+		// the caller's Transport may not be SSRF-safe. We overlay it to match the
+		// posture of defaultSourcemapClient, mirroring how the probe stage defends
+		// against DNS-rebinding attacks regardless of how the caller configured the
+		// Transport. We do NOT mutate the caller's Transport — a new *http.Transport
+		// is constructed so that AllowPrivate semantics are respected.
 		clientCopy := *client
 		clientCopy.CheckRedirect = noFollowRedirects
+		clientCopy.Transport = ssrfSafeTransport(opts.AllowPrivate)
+		// Enforce the same overall deadline as the default client so a slow-drip
+		// body read is bounded even when the caller's client left Timeout unset
+		// (zero == no limit). http.Client.Timeout covers the full exchange,
+		// including the response-body read.
+		clientCopy.Timeout = 10 * time.Second
 		client = &clientCopy
 	}
 
@@ -226,33 +240,38 @@ func noFollowRedirects(_ *http.Request, _ []*http.Request) error {
 	return http.ErrUseLastResponse
 }
 
+// ssrfSafeTransport returns a new *http.Transport with the appropriate
+// DialContext for sourcemap fetches. When allowPrivate is false, the SSRF-safe
+// dial context from pkg/probe is used. When allowPrivate is true, a permissive
+// dialer is used instead. Used by both defaultSourcemapClient (nil HTTPClient
+// path) and the caller-supplied HTTPClient path in recoverSourcemap.
+func ssrfSafeTransport(allowPrivate bool) *http.Transport {
+	timeout := 10 * time.Second
+	if allowPrivate {
+		return &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout: timeout,
+			}).DialContext,
+			TLSHandshakeTimeout:   timeout,
+			ResponseHeaderTimeout: timeout,
+		}
+	}
+	return &http.Transport{
+		DialContext:           probe.SSRFSafeDialContext,
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+	}
+}
+
 // defaultSourcemapClient builds an http.Client for sourcemap fetches.
 // When allowPrivate is false, the SSRF-safe dial context from pkg/probe is
 // used. When allowPrivate is true, a permissive dialer is used instead.
 // Redirects are disabled unconditionally to prevent host-redirect bypass.
 func defaultSourcemapClient(allowPrivate bool) *http.Client {
-	timeout := 10 * time.Second
-	if allowPrivate {
-		return &http.Client{
-			Timeout:       timeout,
-			CheckRedirect: noFollowRedirects,
-			Transport: &http.Transport{
-				DialContext: (&net.Dialer{
-					Timeout: timeout,
-				}).DialContext,
-				TLSHandshakeTimeout:   timeout,
-				ResponseHeaderTimeout: timeout,
-			},
-		}
-	}
 	return &http.Client{
-		Timeout:       timeout,
+		Timeout:       10 * time.Second,
 		CheckRedirect: noFollowRedirects,
-		Transport: &http.Transport{
-			DialContext:           probe.SSRFSafeDialContext,
-			TLSHandshakeTimeout:   timeout,
-			ResponseHeaderTimeout: timeout,
-		},
+		Transport:     ssrfSafeTransport(allowPrivate),
 	}
 }
 
@@ -282,7 +301,12 @@ func fetchRemoteSourcemap(ctx context.Context, client *http.Client, mapURL strin
 		return nil, fmt.Errorf("sourcemap fetch: HTTP %d for %s", resp.StatusCode, mapURL)
 	}
 
-	// Limit response body size.
+	// Read the body with a size cap. No separate read deadline is needed:
+	// http.Client.Timeout (set to 10 s on the sourcemap client) covers the
+	// entire exchange including the response-body read, so a slow-drip sender
+	// is already bounded to 10 s. The LimitReader (+1) caps memory use at
+	// maxSourcemapResponseSize (10 MB) and the len check below rejects
+	// exactly-at-limit responses cleanly.
 	limited := io.LimitReader(resp.Body, int64(maxSourcemapResponseSize)+1)
 	body, err := io.ReadAll(limited)
 	if err != nil {

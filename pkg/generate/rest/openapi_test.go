@@ -1693,7 +1693,7 @@ func TestComputeSourceTag_StaticHtmlOnlyGroupInJSCorpus_ResolvesDynamic(t *testi
 		makeClassified("GET", "https://h/api/x", "static:html"),
 		makeClassified("GET", "https://h/api/x", "static:html"),
 		// Unrelated static:js entry forces anyStaticSource to fire (true under
-		// both pre-fix HasPrefix("static:") AND post-fix isJSStaticSource).
+		// both pre-fix HasPrefix("static:") AND post-fix crawl.IsJSStaticSource).
 		makeClassified("GET", "https://h/api/z", "static:js"),
 	}
 	spec, err := gen.Generate(endpoints)
