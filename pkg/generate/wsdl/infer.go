@@ -84,10 +84,11 @@ func InferWSDL(endpoints []classify.ClassifiedRequest) (*Definitions, error) {
 	// to the URL-derived namespace when traffic carried none or disagreed.
 	// definitions, tns, and the XSD schema all share this one namespace so the
 	// tns: references stay resolvable. The service address still uses serviceURL.
-	// schemaNS can only differ from targetNS when at least one operation carried
-	// an observed namespace, which is exactly when Types is emitted below; with
-	// no observations typesNamespace returns targetNS, so assigning it to
-	// TargetNS/XMLNSTNS unconditionally is safe even though Types stays nil.
+	// schemaNS differs from targetNS only when an operation element carried an
+	// observed namespace; with none observed, typesNamespace returns targetNS.
+	// So schemaNS == targetNS whenever no namespace was observed (regardless of
+	// whether Types is emitted), making the unconditional assignment to
+	// TargetNS/XMLNSTNS safe.
 	schemaNS := typesNamespace(operations, observations, targetNS)
 
 	defs := &Definitions{

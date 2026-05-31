@@ -488,6 +488,47 @@ func TestInferWSDL_SchemaTargetNamespacePreserved(t *testing.T) {
 		"URL-derived namespace must not leak into the emitted namespaces")
 }
 
+// End-to-end mirror of the mixed shape: one operation carries an observed
+// namespace, a sibling carries none. The observed namespace must survive all
+// the way into the marshaled WSDL (targetNamespace + xmlns:tns), not fall back.
+func TestInferWSDL_MixedNamespace_ObservedSurvivesEndToEnd(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "http://api.example.com/soap",
+				Headers: map[string]string{"SOAPAction": `"urn:WithNS"`},
+				Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+					`<soap:Body><tns:WithNS xmlns:tns="http://observed/"><id>1</id></tns:WithNS></soap:Body></soap:Envelope>`),
+			},
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:  "POST",
+				URL:     "http://api.example.com/soap",
+				Headers: map[string]string{"SOAPAction": `"urn:NoNS"`},
+				Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+					`<soap:Body><NoNS><id>1</id></NoNS></soap:Body></soap:Envelope>`),
+			},
+		},
+	}
+
+	defs, err := InferWSDL(endpoints)
+	require.NoError(t, err)
+
+	const observedNS = "http://observed/"
+	assert.Equal(t, observedNS, defs.TargetNS, "observed namespace must survive an unnamespaced sibling")
+	assert.Equal(t, observedNS, defs.XMLNSTNS)
+	require.NotNil(t, defs.Types)
+	require.Len(t, defs.Types.Schemas, 1)
+	assert.Equal(t, observedNS, defs.Types.Schemas[0].TargetNS)
+
+	out, err := xml.MarshalIndent(defs, "", "  ")
+	require.NoError(t, err)
+	assert.Contains(t, string(out), `targetNamespace="`+observedNS+`"`)
+	assert.Contains(t, string(out), `xmlns:tns="`+observedNS+`"`)
+}
+
 // typesNamespace prefers the observed operation namespace and falls back to the
 // URL-derived one only when traffic carried none or operations disagreed.
 func TestTypesNamespace(t *testing.T) {

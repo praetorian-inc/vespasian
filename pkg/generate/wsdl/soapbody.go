@@ -334,6 +334,9 @@ func (a *soapBodyInfo) merge(b *soapBodyInfo) {
 		if existing, ok := a.Params[k]; ok &&
 			existing.IsComplex && bParam.IsComplex &&
 			existing.Children != nil && bParam.Children != nil {
+			// The Namespace propagation at the top of merge is a no-op here:
+			// nested Children.Namespace is always empty (only the top-level
+			// operation namespace is recorded). Recursion just unions children.
 			existing.Children.merge(bParam.Children)
 			continue
 		}

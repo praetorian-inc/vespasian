@@ -28,7 +28,9 @@
 // Type inference applies rules in this order: (1) xsi:type attribute wins;
 // (2) nested child elements produce a complex type; (3) empty text is skipped;
 // (4–8) value heuristics match boolean, integer, decimal, date, and dateTime;
-// (9) anything else falls back to xsd:string.
+// (9) anything else falls back to xsd:string. Rules 1–2 are structural and are
+// applied in walkParam; rules 3–9 are value heuristics applied in
+// inferTypeFromValue.
 //
 // When the same operation appears in multiple captures, parameter observations
 // are unioned: new parameters are appended, and the first-observed XSD type
