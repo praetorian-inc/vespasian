@@ -673,6 +673,21 @@ func TestMapResult_LowercaseContentType(t *testing.T) {
 	}
 }
 
+// TestValidateCrawlInputs tests the shared validateCrawlInputs helper.
+func TestValidateCrawlInputs(t *testing.T) {
+	if _, err := validateCrawlInputs(CrawlerOptions{Depth: -1}, "https://e.com"); err == nil ||
+		!strings.Contains(err.Error(), "depth must be non-negative") {
+		t.Errorf("negative depth: %v", err)
+	}
+	if _, err := validateCrawlInputs(CrawlerOptions{}, ""); err == nil ||
+		!strings.Contains(err.Error(), "invalid target URL") {
+		t.Errorf("empty url: %v", err)
+	}
+	if mp, err := validateCrawlInputs(CrawlerOptions{MaxPages: 0}, "https://e.com"); err != nil || mp != DefaultMaxPages {
+		t.Errorf("default maxpages: mp=%d err=%v", mp, err)
+	}
+}
+
 // TestNewCrawler_ReturnsInterface verifies NewCrawler returns the correct concrete type.
 func TestNewCrawler_ReturnsInterface(t *testing.T) {
 	h := NewCrawler(CrawlerOptions{Headless: true})
