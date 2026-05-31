@@ -70,136 +70,71 @@ type CrawlerOptions struct {
 	BrowserMgr *BrowserManager
 }
 
-// Crawler performs web crawling to capture HTTP traffic.
-type Crawler struct {
-	opts CrawlerOptions
+// Crawler is the interface for web crawling to capture HTTP traffic.
+// There are two implementations: RodCrawler (headless go-rod engine) and
+// HTTPCrawler (stdlib net/http engine).
+type Crawler interface {
+	Crawl(ctx context.Context, targetURL string) ([]ObservedRequest, error)
 }
+
+// RodCrawler implements Crawler using the go-rod headless browser engine.
+// The Crawl method lives in rod_crawler.go.
+type RodCrawler struct{ opts CrawlerOptions }
+
+// HTTPCrawler implements Crawler using the stdlib net/http engine.
+// See http_crawler.go for the full implementation.
+// NOTE: Until T007, this struct temporarily delegates to crawlStandard (Katana).
+type HTTPCrawler struct{ opts CrawlerOptions }
 
 // NewCrawler creates a new crawler with the given options.
-func NewCrawler(opts CrawlerOptions) *Crawler {
-	return &Crawler{opts: opts}
+// When opts.Headless is true, it returns a RodCrawler (headless go-rod engine).
+// Otherwise it returns an HTTPCrawler (stdlib net/http engine).
+func NewCrawler(opts CrawlerOptions) Crawler {
+	if opts.Headless {
+		return &RodCrawler{opts: opts}
+	}
+	return &HTTPCrawler{opts: opts}
 }
 
-// Crawl crawls the target URL and returns observed requests.
-func (c *Crawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRequest, error) {
-	maxPages := c.opts.MaxPages
-	if maxPages <= 0 {
-		maxPages = DefaultMaxPages
+// Crawl is a temporary stub delegating to crawlStandard until T007 replaces it.
+func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRequest, error) {
+	maxPages, err := validateCrawlInputs(c.opts, targetURL)
+	if err != nil {
+		return nil, err
 	}
-
-	if c.opts.Depth < 0 {
-		return nil, fmt.Errorf("depth must be non-negative, got %d", c.opts.Depth)
-	}
-
-	u, err := url.Parse(targetURL)
-	if err != nil || targetURL == "" || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return nil, fmt.Errorf("invalid target URL: %q", targetURL)
-	}
-
-	// Early return if the parent context is already canceled.
 	if ctx.Err() != nil {
 		if c.opts.Stderr != nil {
 			fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n") //nolint:errcheck // best-effort status message
 		}
 		return nil, ctx.Err()
 	}
-
-	// Use caller-provided browser or launch Chrome under vespasian's control.
-	var browserMgr *BrowserManager
-	if c.opts.BrowserMgr != nil {
-		browserMgr = c.opts.BrowserMgr
-	} else if c.opts.Headless {
-		browserMgr, err = NewBrowserManager(BrowserOptions{Headless: true, Proxy: c.opts.Proxy})
-		if err != nil {
-			return nil, fmt.Errorf("launch browser: %w", err)
-		}
-		defer browserMgr.Close()
-	}
-
-	if c.opts.Headless {
-		return c.crawlHeadless(ctx, targetURL, maxPages, browserMgr)
-	}
-	return c.crawlStandard(ctx, targetURL, maxPages, browserMgr)
+	return crawlStandard(c.opts, ctx, targetURL, maxPages)
 }
 
-// crawlHeadless runs a concurrent headless crawl using go-rod directly,
-// bypassing Katana's serial hybrid engine. This enables overlapping DOM
-// stability waits across multiple browser tabs for significantly faster crawls.
-func (c *Crawler) crawlHeadless(ctx context.Context, targetURL string, maxPages int, browserMgr *BrowserManager) ([]ObservedRequest, error) {
-	// Apply the overall crawl timeout if configured.
-	if c.opts.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, c.opts.Timeout)
-		defer cancel()
+// validateCrawlInputs validates the crawl options and target URL, returning the
+// effective maxPages and any validation error. The error strings are stable and
+// asserted by tests.
+func validateCrawlInputs(opts CrawlerOptions, targetURL string) (int, error) {
+	maxPages := opts.MaxPages
+	if maxPages <= 0 {
+		maxPages = DefaultMaxPages
 	}
 
-	scopeFn, err := scopeChecker(targetURL, c.opts.Scope, c.opts.AllowPrivate)
-	if err != nil {
-		return nil, fmt.Errorf("scope setup: %w", err)
+	if opts.Depth < 0 {
+		return 0, fmt.Errorf("depth must be non-negative, got %d", opts.Depth)
 	}
 
-	// LAB-2222: a Cookie value passed via --header must be injected into
-	// Chrome's cookie store (Storage.setCookies), not attached as an extra
-	// HTTP header. Extra headers set via Network.setExtraHTTPHeaders don't
-	// survive server-side redirects (e.g., Spring Security's 302→/login on
-	// WebGoat strips the JSESSIONID, breaking session auth). Cookies in
-	// Chrome's own store persist across redirects, new tabs, and fetches.
-	// See ApplyCookieHeader for the extract/parse/inject pipeline and
-	// cookies_test.go for the wiring coverage.
-	extraHeaders, err := ApplyCookieHeader(c.opts.Headers, targetURL, browserMgr.SetCookies)
-	if err != nil {
-		return nil, err
+	u, err := url.Parse(targetURL)
+	if err != nil || targetURL == "" || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return 0, fmt.Errorf("invalid target URL: %q", targetURL)
 	}
 
-	engine, err := newRodEngine(browserMgr.wsURL(), engineOptions{
-		Concurrency:   c.opts.Concurrency,
-		MaxPages:      maxPages,
-		MaxDepth:      c.opts.Depth,
-		PageTimeout:   time.Duration(PageTimeout) * time.Second,
-		StableTimeout: DefaultStableWait,
-		Headers:       extraHeaders,
-		ScopeCheck:    scopeFn,
-		Stderr:        c.opts.Stderr,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create engine: %w", err)
-	}
-	defer engine.Close() //nolint:errcheck // best-effort cleanup
-
-	results := make([]ObservedRequest, 0, min(maxPages, 1000))
-	var mu sync.Mutex
-
-	err = engine.Crawl(ctx, targetURL, func(req ObservedRequest) {
-		mu.Lock()
-		results = append(results, req)
-		mu.Unlock()
-	})
-
-	// On signal, kill Chrome immediately to stop all outbound requests.
-	if ctx.Err() != nil {
-		if c.opts.Stderr != nil {
-			fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n") //nolint:errcheck // best-effort status message
-		}
-		if browserMgr != nil {
-			browserMgr.Kill()
-		}
-	}
-
-	mu.Lock()
-	snapshot := make([]ObservedRequest, len(results))
-	copy(snapshot, results)
-	mu.Unlock()
-
-	if err != nil && ctx.Err() == nil {
-		return snapshot, err
-	}
-	return snapshot, ctx.Err()
+	return maxPages, nil
 }
 
 // crawlStandard runs the non-headless crawl using Katana's standard HTTP engine.
-// This path is unchanged from the original implementation and will be removed
-// when Katana is fully replaced in a separate ticket.
-func (c *Crawler) crawlStandard(ctx context.Context, targetURL string, maxPages int, browserMgr *BrowserManager) ([]ObservedRequest, error) { //nolint:gocyclo // legacy Katana orchestration
+// This path will be removed when Katana is fully replaced in T007.
+func crawlStandard(opts CrawlerOptions, ctx context.Context, targetURL string, maxPages int) ([]ObservedRequest, error) { //nolint:gocyclo // legacy Katana orchestration
 	crawlCtx, crawlCancel := context.WithCancel(ctx)
 	defer crawlCancel()
 
@@ -208,12 +143,12 @@ func (c *Crawler) crawlStandard(ctx context.Context, targetURL string, maxPages 
 	pageCount := 0
 
 	katanaOpts := &types.Options{
-		MaxDepth:               c.opts.Depth,
+		MaxDepth:               opts.Depth,
 		Timeout:                PageTimeout,
-		CrawlDuration:          c.opts.Timeout,
-		FieldScope:             MapScope(c.opts.Scope),
+		CrawlDuration:          opts.Timeout,
+		FieldScope:             MapScope(opts.Scope),
 		Headless:               false,
-		CustomHeaders:          ToStringSlice(c.opts.Headers),
+		CustomHeaders:          ToStringSlice(opts.Headers),
 		Strategy:               "depth-first",
 		BodyReadSize:           10 * 1024 * 1024,
 		Concurrency:            10,
@@ -239,10 +174,6 @@ func (c *Crawler) crawlStandard(ctx context.Context, targetURL string, maxPages 
 				crawlCancel()
 			}
 		},
-	}
-
-	if browserMgr != nil {
-		katanaOpts.ChromeWSUrl = browserMgr.wsURL()
 	}
 
 	crawlerOpts, err := types.NewCrawlerOptions(katanaOpts)
@@ -275,12 +206,8 @@ func (c *Crawler) crawlStandard(ctx context.Context, targetURL string, maxPages 
 		}
 	case <-crawlCtx.Done():
 		if ctx.Err() != nil {
-			if c.opts.Stderr != nil {
-				fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n") //nolint:errcheck // best-effort status message
-			}
-
-			if browserMgr != nil {
-				browserMgr.Kill()
+			if opts.Stderr != nil {
+				fmt.Fprintf(opts.Stderr, "\ninterrupt received, stopping crawl...\n") //nolint:errcheck // best-effort status message
 			}
 
 			timer := time.NewTimer(ShutdownGracePeriod)

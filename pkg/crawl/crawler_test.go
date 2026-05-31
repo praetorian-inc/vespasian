@@ -323,40 +323,17 @@ func TestToStringSlice_Format(t *testing.T) {
 
 // TestNewCrawler tests the constructor
 func TestNewCrawler(t *testing.T) {
-	opts := CrawlerOptions{
-		Depth:    5,
-		MaxPages: 100,
-		Scope:    "same-domain",
-		Headless: true,
-		Proxy:    "http://127.0.0.1:8080",
-		Headers: map[string]string{
-			"User-Agent": "test",
-		},
+	opts := CrawlerOptions{Depth: 5, MaxPages: 100, Scope: "same-domain", Headless: true,
+		Proxy: "http://127.0.0.1:8080", Headers: map[string]string{"User-Agent": "test"}}
+	c := NewCrawler(opts)
+	rc, ok := c.(*RodCrawler)
+	if !ok {
+		t.Fatalf("Headless:true → %T, want *RodCrawler", c)
 	}
-
-	crawler := NewCrawler(opts)
-
-	if crawler == nil {
-		t.Fatal("NewCrawler() returned nil")
-	}
-
-	if crawler.opts.Depth != 5 {
-		t.Errorf("crawler.opts.Depth = %d, want 5", crawler.opts.Depth)
-	}
-	if crawler.opts.MaxPages != 100 {
-		t.Errorf("crawler.opts.MaxPages = %d, want 100", crawler.opts.MaxPages)
-	}
-	if crawler.opts.Scope != "same-domain" {
-		t.Errorf("crawler.opts.Scope = %q, want %q", crawler.opts.Scope, "same-domain")
-	}
-	if !crawler.opts.Headless {
-		t.Errorf("crawler.opts.Headless = false, want true")
-	}
-	if crawler.opts.Proxy != "http://127.0.0.1:8080" {
-		t.Errorf("crawler.opts.Proxy = %q, want %q", crawler.opts.Proxy, "http://127.0.0.1:8080")
-	}
-	if crawler.opts.Headers["User-Agent"] != "test" {
-		t.Errorf("crawler.opts.Headers[User-Agent] = %q, want %q", crawler.opts.Headers["User-Agent"], "test")
+	if rc.opts.Depth != 5 || rc.opts.MaxPages != 100 || rc.opts.Scope != "same-domain" ||
+		!rc.opts.Headless || rc.opts.Proxy != "http://127.0.0.1:8080" ||
+		rc.opts.Headers["User-Agent"] != "test" {
+		t.Errorf("opts not stored: %+v", rc.opts)
 	}
 }
 
@@ -693,6 +670,18 @@ func TestMapResult_LowercaseContentType(t *testing.T) {
 				t.Errorf("ContentType = %q, want %q", observed.Response.ContentType, tt.wantContentType)
 			}
 		})
+	}
+}
+
+// TestNewCrawler_ReturnsInterface verifies NewCrawler returns the correct concrete type.
+func TestNewCrawler_ReturnsInterface(t *testing.T) {
+	h := NewCrawler(CrawlerOptions{Headless: true})
+	if _, ok := h.(*RodCrawler); !ok {
+		t.Fatalf("Headless:true → got %T, want *RodCrawler", h)
+	}
+	s := NewCrawler(CrawlerOptions{Headless: false})
+	if _, ok := s.(*HTTPCrawler); !ok {
+		t.Fatalf("Headless:false → got %T, want *HTTPCrawler", s)
 	}
 }
 
