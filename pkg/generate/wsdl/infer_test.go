@@ -15,6 +15,7 @@
 package wsdl
 
 import (
+	"encoding/xml"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -440,9 +441,12 @@ func TestInferWSDL_EmptyOperationElement(t *testing.T) {
 		"empty operation element produces an empty parameter sequence")
 }
 
-// TEST-004: assert that the schema's targetNamespace is preserved from the
-// service URL through inferTargetNamespace and into the emitted XSD Schema —
-// the namespace identity declared in <element name="X"> is queryable.
+// TEST-004 (LAB-2111 AC3): the namespace observed on the SOAP operation
+// element is preserved into the generated output — not just on the in-memory
+// structs but in the marshaled WSDL. The service URL here ("http://different/ns/"
+// observed vs. URL-derived "http://api.example.com:8443/") makes the distinction
+// observable: emission must carry the observed namespace, and tns: references
+// must stay resolvable because definitions/tns/schema all share it.
 func TestInferWSDL_SchemaTargetNamespacePreserved(t *testing.T) {
 	endpoints := []classify.ClassifiedRequest{{
 		ObservedRequest: crawl.ObservedRequest{
@@ -459,13 +463,60 @@ func TestInferWSDL_SchemaTargetNamespacePreserved(t *testing.T) {
 	require.NotNil(t, defs.Types)
 	require.Len(t, defs.Types.Schemas, 1)
 
-	// Schema targetNamespace = URL-derived (matches Definitions.TargetNS),
-	// keeping tns: references consistent with Messages wiring. Architecture §11.
-	expected := "http://api.example.com:8443/"
-	assert.Equal(t, expected, defs.Types.Schemas[0].TargetNS,
-		"schema targetNamespace must match URL-derived target ns")
-	assert.Equal(t, expected, defs.TargetNS,
-		"definitions.targetNamespace must match for tns: consistency")
+	const observedNS = "http://different/ns/"
+	// Struct-level: the observed namespace drives every namespace slot so tns:
+	// references (messages -> schema elements, portType -> messages, etc.) all
+	// resolve under a single namespace.
+	assert.Equal(t, observedNS, defs.Types.Schemas[0].TargetNS,
+		"schema targetNamespace must be the observed operation namespace")
+	assert.Equal(t, observedNS, defs.TargetNS, "definitions.targetNamespace must match for tns: consistency")
+	assert.Equal(t, observedNS, defs.XMLNSTNS, "tns prefix must bind to the observed namespace")
+	// Service address is unaffected by the namespace change.
+	require.NotNil(t, defs.Services[0].Ports[0].SOAPAddress)
+	assert.Equal(t, "http://api.example.com:8443/soap", defs.Services[0].Ports[0].SOAPAddress.Location)
+
+	// Emitted-output: the observed namespace must actually appear in the
+	// marshaled WSDL (the gap the earlier struct-only assertion missed).
+	out, err := xml.MarshalIndent(defs, "", "  ")
+	require.NoError(t, err)
+	xmlStr := string(out)
+	assert.Contains(t, xmlStr, `targetNamespace="`+observedNS+`"`,
+		"observed namespace must be emitted as targetNamespace")
+	assert.Contains(t, xmlStr, `xmlns:tns="`+observedNS+`"`,
+		"observed namespace must be emitted as the tns binding")
+	assert.NotContains(t, xmlStr, "http://api.example.com:8443/\"",
+		"URL-derived namespace must not leak into the emitted namespaces")
+}
+
+// typesNamespace prefers the observed operation namespace and falls back to the
+// URL-derived one only when traffic carried none or operations disagreed.
+func TestTypesNamespace(t *testing.T) {
+	const urlNS = "http://url-derived/"
+	t.Run("single observed namespace is used", func(t *testing.T) {
+		obs := map[string]*soapBodyInfo{"Op": {Namespace: "http://observed/"}}
+		assert.Equal(t, "http://observed/", typesNamespace([]string{"Op"}, obs, urlNS))
+	})
+	t.Run("no observed namespace falls back to URL-derived", func(t *testing.T) {
+		obs := map[string]*soapBodyInfo{"Op": {Namespace: ""}}
+		assert.Equal(t, urlNS, typesNamespace([]string{"Op"}, obs, urlNS))
+	})
+	t.Run("missing observation falls back to URL-derived", func(t *testing.T) {
+		assert.Equal(t, urlNS, typesNamespace([]string{"Op"}, map[string]*soapBodyInfo{}, urlNS))
+	})
+	t.Run("agreeing namespaces across operations are used", func(t *testing.T) {
+		obs := map[string]*soapBodyInfo{
+			"A": {Namespace: "http://same/"},
+			"B": {Namespace: "http://same/"},
+		}
+		assert.Equal(t, "http://same/", typesNamespace([]string{"A", "B"}, obs, urlNS))
+	})
+	t.Run("disagreeing namespaces fall back to URL-derived", func(t *testing.T) {
+		obs := map[string]*soapBodyInfo{
+			"A": {Namespace: "http://one/"},
+			"B": {Namespace: "http://two/"},
+		}
+		assert.Equal(t, urlNS, typesNamespace([]string{"A", "B"}, obs, urlNS))
+	})
 }
 
 // TEST-001 (round-2 blocker fix): regression test for the namespace-aware

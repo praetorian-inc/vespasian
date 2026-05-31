@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<definitions name="calc" targetNamespace="http://soap.example.com/" xmlns="http://schemas.xmlsoap.org/wsdl/" xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/" xmlns:tns="http://soap.example.com/" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+<definitions name="calc" targetNamespace="http://calc/" xmlns="http://schemas.xmlsoap.org/wsdl/" xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/" xmlns:tns="http://calc/" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <types>
-    <schema targetNamespace="http://soap.example.com/" xmlns="http://www.w3.org/2001/XMLSchema">
+    <schema targetNamespace="http://calc/" xmlns="http://www.w3.org/2001/XMLSchema">
       <element name="Add">
         <complexType>
           <sequence>

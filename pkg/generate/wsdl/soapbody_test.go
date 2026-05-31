@@ -159,7 +159,7 @@ func TestExtractSOAPParameters_ScalarParams(t *testing.T) {
 		assert.Equal(t, []string{"id"}, result.OrderedKeys)
 		require.Contains(t, result.Params, "id")
 		assert.Equal(t, "xsd:int", result.Params["id"].XSDType)
-		assert.Equal(t, "http://localhost/soap", result.OpNamespace)
+		assert.Equal(t, "http://localhost/soap", result.Namespace)
 	})
 
 	t.Run("multiple scalars", func(t *testing.T) {
@@ -184,23 +184,6 @@ func TestExtractSOAPParameters_ScalarParams(t *testing.T) {
 		assert.Equal(t, "xsd:int", result.Params["n"].XSDType)
 		assert.Equal(t, "xsd:boolean", result.Params["flag"].XSDType)
 		assert.Equal(t, "xsd:string", result.Params["name"].XSDType)
-	})
-
-	// NT007: inferredParam.Namespace is populated from the element xml.Name.Space.
-	t.Run("param Namespace is preserved from element xml.Name.Space", func(t *testing.T) {
-		// The <p:id> element is bound to xmlns:p="http://params/" so its
-		// xml.Name.Space will be "http://params/" in the decoded token.
-		body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
-			`<soap:Body>` +
-			`<tns:GetUserRequest xmlns:tns="http://localhost/soap" xmlns:p="http://params/">` +
-			`<p:id>1</p:id>` +
-			`</tns:GetUserRequest>` +
-			`</soap:Body></soap:Envelope>`
-		result := extractSOAPParameters([]byte(body))
-		require.NotNil(t, result)
-		require.Contains(t, result.Params, "id")
-		assert.Equal(t, "http://params/", result.Params["id"].Namespace,
-			"inferredParam.Namespace must equal the element's xml.Name.Space URI")
 	})
 }
 
@@ -247,12 +230,15 @@ func TestExtractSOAPParameters_NestedComplex(t *testing.T) {
 		assert.Equal(t, "xsd:string", user.Children.Params["name"].XSDType)
 	})
 
-	t.Run("depth cap does not panic", func(t *testing.T) {
-		// Build XML deeper than maxBodyDepth
+	t.Run("depth cap retains the chain up to the bound and skips beyond it", func(t *testing.T) {
+		// Build XML deeper than maxBodyDepth (= 32). The operation element
+		// <Root> is depth 1; its direct child L0 is walked at depth 2, so Ln is
+		// walked at depth n+2. walkParam stops recursing into children once its
+		// own depth reaches maxBodyDepth, i.e. element at depth 32 (L30) skips
+		// its children. Concretely: L0..L30 are recorded as a nested chain;
+		// L31.. and the innermost <leaf> are discarded.
 		var sb strings.Builder
 		sb.WriteString(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><Root>`)
-		// maxBodyDepth = 32; walkOperation starts at depth=1 for first params
-		// Add 35 levels of nesting to exceed the cap
 		for i := 0; i < 35; i++ {
 			fmt.Fprintf(&sb, "<L%d>", i)
 		}
@@ -261,12 +247,33 @@ func TestExtractSOAPParameters_NestedComplex(t *testing.T) {
 			fmt.Fprintf(&sb, "</L%d>", i)
 		}
 		sb.WriteString(`</Root></soap:Body></soap:Envelope>`)
-		// Must not panic and must complete
 		result := extractSOAPParameters([]byte(sb.String()))
 		require.NotNil(t, result)
-		// The outermost parameter (L0) is within depth, so it should be recorded
-		// Deeper elements are skipped by the depth cap
-		assert.NotEmpty(t, result.Params)
+
+		// Walk the recorded chain L0 -> L1 -> ... and assert exactly where it
+		// stops. lastDepth is the depth (n+2) of the deepest element walked.
+		require.Equal(t, []string{"L0"}, result.OrderedKeys)
+		node := result
+		lastIdx := -1
+		for i := 0; ; i++ {
+			name := fmt.Sprintf("L%d", i)
+			param, ok := node.Params[name]
+			if !ok {
+				break
+			}
+			lastIdx = i
+			if param.Children == nil {
+				break
+			}
+			node = param.Children
+		}
+		// L30 is the deepest retained element (walked at depth 32 = maxBodyDepth).
+		assert.Equal(t, 30, lastIdx, "chain must retain exactly L0..L30")
+		require.Contains(t, node.Params, "L30")
+		assert.Nil(t, node.Params["L30"].Children,
+			"L30 is at the depth cap, so its children must be skipped")
+		assert.NotContains(t, node.Params, "L31", "elements beyond the cap must be skipped")
+		assert.NotContains(t, node.Params, "leaf", "innermost element beyond the cap must be skipped")
 	})
 }
 
@@ -417,48 +424,48 @@ func TestSoapBodyInfo_Merge(t *testing.T) {
 		assert.Len(t, a.Params, 3)
 	})
 
-	// NT004: OpNamespace propagation from b to empty a.
-	t.Run("OpNamespace propagates when a is empty and b is set", func(t *testing.T) {
+	// NT004: Namespace propagation from b to empty a.
+	t.Run("Namespace propagates when a is empty and b is set", func(t *testing.T) {
 		a := &soapBodyInfo{
-			OpNamespace: "",
-			Params:      map[string]*inferredParam{},
+			Namespace: "",
+			Params:    map[string]*inferredParam{},
 		}
 		b := &soapBodyInfo{
-			OpNamespace: "http://x/",
-			Params:      map[string]*inferredParam{},
+			Namespace: "http://x/",
+			Params:    map[string]*inferredParam{},
 		}
 		a.merge(b)
-		assert.Equal(t, "http://x/", a.OpNamespace)
+		assert.Equal(t, "http://x/", a.Namespace)
 	})
 
-	// NT011: merge does not overwrite an already-set OpNamespace; b empty leaves a empty.
-	t.Run("OpNamespace is not overwritten and not propagated from empty b", func(t *testing.T) {
+	// NT011: merge does not overwrite an already-set Namespace; b empty leaves a empty.
+	t.Run("Namespace is not overwritten and not propagated from empty b", func(t *testing.T) {
 		t.Run("a already set is not overwritten by b", func(t *testing.T) {
 			a := &soapBodyInfo{
-				OpNamespace: "http://first/",
-				Params:      map[string]*inferredParam{},
+				Namespace: "http://first/",
+				Params:    map[string]*inferredParam{},
 			}
 			b := &soapBodyInfo{
-				OpNamespace: "http://second/",
-				Params:      map[string]*inferredParam{},
+				Namespace: "http://second/",
+				Params:    map[string]*inferredParam{},
 			}
 			a.merge(b)
-			assert.Equal(t, "http://first/", a.OpNamespace,
-				"first-observed OpNamespace must not be overwritten")
+			assert.Equal(t, "http://first/", a.Namespace,
+				"first-observed Namespace must not be overwritten")
 		})
 
 		t.Run("b empty leaves a empty", func(t *testing.T) {
 			a := &soapBodyInfo{
-				OpNamespace: "",
-				Params:      map[string]*inferredParam{},
+				Namespace: "",
+				Params:    map[string]*inferredParam{},
 			}
 			b := &soapBodyInfo{
-				OpNamespace: "",
-				Params:      map[string]*inferredParam{},
+				Namespace: "",
+				Params:    map[string]*inferredParam{},
 			}
 			a.merge(b)
-			assert.Equal(t, "", a.OpNamespace,
-				"both empty: a's OpNamespace must remain empty")
+			assert.Equal(t, "", a.Namespace,
+				"both empty: a's Namespace must remain empty")
 		})
 	})
 }
@@ -588,7 +595,7 @@ func TestInferTypesFromObservations(t *testing.T) {
 	t.Run("single operation with scalar params", func(t *testing.T) {
 		obs := map[string]*soapBodyInfo{
 			"GetUser": {
-				OpNamespace: "http://localhost/soap",
+				Namespace:   "http://localhost/soap",
 				OrderedKeys: []string{"id"},
 				Params:      map[string]*inferredParam{"id": {Name: "id", XSDType: "xsd:int"}},
 			},

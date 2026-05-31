@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<definitions name="soap" targetNamespace="http://localhost:8991/" xmlns="http://schemas.xmlsoap.org/wsdl/" xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/" xmlns:tns="http://localhost:8991/" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+<definitions name="soap" targetNamespace="http://localhost/soap" xmlns="http://schemas.xmlsoap.org/wsdl/" xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/" xmlns:tns="http://localhost/soap" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <types>
-    <schema targetNamespace="http://localhost:8991/" xmlns="http://www.w3.org/2001/XMLSchema">
+    <schema targetNamespace="http://localhost/soap" xmlns="http://www.w3.org/2001/XMLSchema">
       <element name="GetUser">
         <complexType>
           <sequence>

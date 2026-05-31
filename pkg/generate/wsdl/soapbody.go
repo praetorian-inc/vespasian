@@ -48,29 +48,27 @@ var (
 
 // soapBodyInfo is the per-request extraction result. nil for failures.
 type soapBodyInfo struct {
-	// OpNamespace records the namespace URI of the element whose contents this
-	// soapBodyInfo represents. At the top-level result of extractSOAPParameters,
-	// that element is the operation element. In nested Children subtrees built
-	// by walkParam, OpNamespace holds the parent parameter element's namespace,
-	// not the operation's — the field is "parent element namespace" in the
-	// general case; the operation-namespace reading is correct only at the
-	// outermost level.
-	// Captured for diagnostic use and merge propagation; not threaded into the
-	// emitted XSD because the schema's targetNamespace is URL-derived for
-	// consistency with the WSDL Messages wiring (architecture §11).
-	OpNamespace string
+	// Namespace is the XML namespace URI of the element whose contents this
+	// soapBodyInfo represents. At the top-level result of extractSOAPParameters
+	// that element is the operation element, so the top-level Namespace is the
+	// operation's namespace; in nested Children subtrees built by walkParam it
+	// is the parent parameter element's namespace. InferWSDL reads the
+	// top-level value (via typesNamespace) to set the generated WSDL/XSD
+	// targetNamespace, so the service's observed namespace is preserved in the
+	// emitted output.
+	Namespace   string
 	OrderedKeys []string
 	Params      map[string]*inferredParam
 }
 
 // inferredParam is one observed parameter under the operation element.
 // Leaf params have XSDType set; complex params have Children populated.
+// The parameter element's own namespace is intentionally not recorded: the
+// generated schema is document/literal with the default unqualified element
+// form, so leaf parameters are emitted without a namespace prefix and only the
+// enclosing operation/schema namespace is preserved.
 type inferredParam struct {
-	Name string
-	// Namespace records the observed parameter element's XML namespace URI.
-	// Captured for diagnostic use; not threaded into the emitted XSD for the
-	// same reason as soapBodyInfo.OpNamespace (architecture §11).
-	Namespace string
+	Name      string
 	XSDType   string
 	IsComplex bool
 	Children  *soapBodyInfo
@@ -92,6 +90,23 @@ func (p *inferredParam) hasType() bool {
 // the invariant in one place so future tweaks edit a single site.
 func (p *inferredParam) shouldUpgradeWith(candidate *inferredParam) bool {
 	return !p.hasType() && candidate.hasType()
+}
+
+// addOrUpgrade records param under its element name. A first observation is
+// appended in document order; a later same-name sibling replaces the stored
+// one only under first-with-type-wins (see inferredParam.shouldUpgradeWith).
+// Centralizes the insert/upgrade step shared by walkOperation, walkParam, and
+// merge so the ordered-key bookkeeping lives in one place.
+func (info *soapBodyInfo) addOrUpgrade(param *inferredParam) {
+	existing, seen := info.Params[param.Name]
+	if !seen {
+		info.OrderedKeys = append(info.OrderedKeys, param.Name)
+		info.Params[param.Name] = param
+		return
+	}
+	if existing.shouldUpgradeWith(param) {
+		info.Params[param.Name] = param
+	}
 }
 
 // extractSOAPParameters walks a SOAP envelope and extracts typed parameters
@@ -131,8 +146,8 @@ func extractSOAPParameters(body []byte) *soapBodyInfo {
 // and the recursion bound lives in walkParam.
 func walkOperation(decoder *xml.Decoder, opStart xml.StartElement) *soapBodyInfo {
 	info := &soapBodyInfo{
-		OpNamespace: opStart.Name.Space,
-		Params:      make(map[string]*inferredParam),
+		Namespace: opStart.Name.Space,
+		Params:    make(map[string]*inferredParam),
 	}
 	for {
 		tok, err := decoder.Token()
@@ -145,28 +160,16 @@ func walkOperation(decoder *xml.Decoder, opStart xml.StartElement) *soapBodyInfo
 				return info
 			}
 		case xml.StartElement:
-			param := walkParam(decoder, t, 2)
-			existing, seen := info.Params[param.Name]
-			if !seen {
-				info.OrderedKeys = append(info.OrderedKeys, param.Name)
-				info.Params[param.Name] = param
-				continue
-			}
-			// Same-name sibling (XML arrays / repeated elements): apply
-			// first-with-type-wins (see inferredParam.shouldUpgradeWith).
-			if existing.shouldUpgradeWith(param) {
-				info.Params[param.Name] = param
-			}
+			// Same-name siblings (XML arrays / repeated elements) collapse via
+			// first-with-type-wins inside addOrUpgrade.
+			info.addOrUpgrade(walkParam(decoder, t, 2))
 		}
 	}
 }
 
 // walkParam extracts type information from a single parameter element.
 func walkParam(decoder *xml.Decoder, paramStart xml.StartElement, depth int) *inferredParam {
-	p := &inferredParam{
-		Name:      paramStart.Name.Local,
-		Namespace: paramStart.Name.Space,
-	}
+	p := &inferredParam{Name: paramStart.Name.Local}
 
 	// Rule 1: xsi:type wins
 	if xsiType := findXSIType(paramStart.Attr); xsiType != "" {
@@ -176,8 +179,9 @@ func walkParam(decoder *xml.Decoder, paramStart xml.StartElement, depth int) *in
 		return p
 	}
 
-	// Collect text and children until the matching end element
+	// Collect text and children until the matching end element.
 	var text strings.Builder
+collect:
 	for {
 		tok, err := decoder.Token()
 		if err != nil {
@@ -186,7 +190,7 @@ func walkParam(decoder *xml.Decoder, paramStart xml.StartElement, depth int) *in
 		switch t := tok.(type) {
 		case xml.EndElement:
 			if t.Name == paramStart.Name {
-				goto done
+				break collect
 			}
 		case xml.CharData:
 			text.Write(t)
@@ -197,25 +201,14 @@ func walkParam(decoder *xml.Decoder, paramStart xml.StartElement, depth int) *in
 			}
 			if p.Children == nil {
 				p.Children = &soapBodyInfo{
-					OpNamespace: paramStart.Name.Space,
-					Params:      make(map[string]*inferredParam),
+					Namespace: paramStart.Name.Space,
+					Params:    make(map[string]*inferredParam),
 				}
 			}
-			child := walkParam(decoder, t, depth+1)
-			existing, seen := p.Children.Params[child.Name]
-			if !seen {
-				p.Children.OrderedKeys = append(p.Children.OrderedKeys, child.Name)
-				p.Children.Params[child.Name] = child
-				continue
-			}
-			// Same-name sibling under a parent: first-with-type-wins (see
-			// inferredParam.shouldUpgradeWith).
-			if existing.shouldUpgradeWith(child) {
-				p.Children.Params[child.Name] = child
-			}
+			// Same-name children collapse via first-with-type-wins.
+			p.Children.addOrUpgrade(walkParam(decoder, t, depth+1))
 		}
 	}
-done:
 	if p.Children != nil {
 		p.IsComplex = true
 		return p
@@ -333,31 +326,56 @@ func inferTypeFromValue(text string) string {
 // a later observation can upgrade an empty-typed parameter, but never
 // overwrite a typed one with an empty one.
 func (a *soapBodyInfo) merge(b *soapBodyInfo) {
-	if a.OpNamespace == "" && b.OpNamespace != "" {
-		a.OpNamespace = b.OpNamespace
+	if a.Namespace == "" && b.Namespace != "" {
+		a.Namespace = b.Namespace
 	}
 	for _, k := range b.OrderedKeys {
 		bParam := b.Params[k]
-		existing, ok := a.Params[k]
-		if !ok {
-			// New parameter — add it
-			a.OrderedKeys = append(a.OrderedKeys, k)
-			a.Params[k] = bParam
-			continue
-		}
-		// Upgrade: existing was empty and the new observation has type info.
-		// Required for the <status/> then <status>active</status> sequence
-		// across captures (first-with-type-wins; see
-		// inferredParam.shouldUpgradeWith).
-		if existing.shouldUpgradeWith(bParam) {
-			a.Params[k] = bParam
-			continue
-		}
-		// Both have type info: first wins; recurse for complex children.
-		if existing.IsComplex && bParam.IsComplex && existing.Children != nil && bParam.Children != nil {
+		// Both observations are already typed-complex: first wins, but recurse
+		// so nested children union too (e.g. <user><name/></user> then
+		// <user><age/></user> across captures).
+		if existing, ok := a.Params[k]; ok &&
+			existing.IsComplex && bParam.IsComplex &&
+			existing.Children != nil && bParam.Children != nil {
 			existing.Children.merge(bParam.Children)
+			continue
+		}
+		// New parameter, or an empty existing one upgraded by a typed
+		// observation (first-with-type-wins; see inferredParam.shouldUpgradeWith).
+		// Required for the <status/> then <status>active</status> sequence
+		// across captures.
+		a.addOrUpgrade(bParam)
+	}
+}
+
+// typesNamespace chooses the XML namespace for the generated WSDL and its
+// embedded XSD schema. It prefers the namespace observed on the operation
+// elements in the SOAP traffic, so the generated schema reflects the service's
+// real namespace rather than a URL-derived guess. It falls back to urlDerived
+// when no operation carried a namespace, or when operations disagreed: a single
+// WSDL targetNamespace cannot represent several at once, and splitting into
+// per-namespace schemas is deferred (architecture §11). Using one namespace for
+// definitions, tns, and schema keeps every tns: reference resolvable.
+func typesNamespace(operations []string, observations map[string]*soapBodyInfo, urlDerived string) string {
+	observed := ""
+	for _, opName := range operations {
+		info := observations[opName]
+		if info == nil || info.Namespace == "" {
+			continue
+		}
+		switch observed {
+		case "":
+			observed = info.Namespace
+		case info.Namespace:
+			// same namespace again — still unambiguous
+		default:
+			return urlDerived // operations disagree; fall back
 		}
 	}
+	if observed == "" {
+		return urlDerived
+	}
+	return observed
 }
 
 // inferTypesFromObservations builds a *Types from the aggregated parameter observations.

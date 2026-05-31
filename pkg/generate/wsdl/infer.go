@@ -80,12 +80,18 @@ func InferWSDL(endpoints []classify.ClassifiedRequest) (*Definitions, error) {
 		return nil, errors.New("no SOAP operations found in traffic")
 	}
 
+	// Preserve the namespace observed on the SOAP operation elements; fall back
+	// to the URL-derived namespace when traffic carried none or disagreed.
+	// definitions, tns, and the XSD schema all share this one namespace so the
+	// tns: references stay resolvable. The service address still uses serviceURL.
+	schemaNS := typesNamespace(operations, observations, targetNS)
+
 	defs := &Definitions{
 		Name:      serviceName,
-		TargetNS:  targetNS,
+		TargetNS:  schemaNS,
 		XMLNS:     "http://schemas.xmlsoap.org/wsdl/",
 		XMLNSSOAP: "http://schemas.xmlsoap.org/wsdl/soap/",
-		XMLNSTNS:  targetNS,
+		XMLNSTNS:  schemaNS,
 		XMLNSXSD:  "http://www.w3.org/2001/XMLSchema",
 	}
 
@@ -130,7 +136,7 @@ func InferWSDL(endpoints []classify.ClassifiedRequest) (*Definitions, error) {
 	defs.Messages = messages
 
 	if len(observations) > 0 {
-		defs.Types = inferTypesFromObservations(operations, observations, targetNS)
+		defs.Types = inferTypesFromObservations(operations, observations, schemaNS)
 	}
 
 	defs.PortTypes = []PortType{{

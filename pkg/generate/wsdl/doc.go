@@ -35,6 +35,12 @@
 // wins on conflict. Recursion is capped at maxBodyDepth = 32 levels to prevent
 // pathological inputs from causing unbounded stack growth.
 //
+// The generated WSDL's targetNamespace (shared by the definitions element, the
+// tns prefix, and the embedded XSD schema) is taken from the namespace observed
+// on the SOAP operation elements, so the service's real namespace is preserved
+// in the output. It falls back to a URL-derived namespace when the traffic
+// carried no operation namespace or when different operations disagreed.
+//
 // The package also provides [ParseWSDL] for parsing and validating WSDL XML
 // documents, and type definitions for WSDL XML unmarshaling.
 package wsdl
