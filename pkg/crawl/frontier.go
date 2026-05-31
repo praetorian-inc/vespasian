@@ -22,10 +22,11 @@ type urlEntry struct {
 	Depth int
 }
 
-// urlFrontier is a thread-safe FIFO queue of URLs to visit, with deduplication,
+// urlFrontier is a thread-safe queue of URLs to visit, with deduplication,
 // scope filtering, and depth tracking. Workers call Pop to get the next URL and
 // Push to enqueue discovered links. The frontier detects completion when the
 // queue is empty and no workers are actively processing a page.
+// By default the queue is FIFO (BFS). Call SetDFS(true) to switch to LIFO (DFS).
 type urlFrontier struct {
 	mu       sync.Mutex
 	cond     *sync.Cond
@@ -35,6 +36,7 @@ type urlFrontier struct {
 	scopeFn  func(string) bool
 	active   int  // workers currently navigating a page
 	closed   bool // set by Close(); prevents new pushes
+	dfs      bool // when true, Pop uses LIFO order (depth-first)
 }
 
 // newURLFrontier creates a frontier with the given max depth and scope filter.
@@ -93,24 +95,42 @@ func (f *urlFrontier) Push(entries []urlEntry) int {
 	return added
 }
 
+// SetDFS switches the frontier to depth-first (LIFO) pop order when v is true,
+// or back to breadth-first (FIFO) when v is false. This is safe to call before
+// the first Push; calling it after workers have started is a data race.
+func (f *urlFrontier) SetDFS(v bool) {
+	f.mu.Lock()
+	f.dfs = v
+	f.mu.Unlock()
+}
+
 // Pop returns the next URL to visit. It blocks until a URL is available or
 // the frontier is done (empty queue, no active workers, or closed). Returns
 // (entry, true) on success or (urlEntry{}, false) when the frontier is exhausted.
+// When SetDFS(true) has been called, Pop returns the last-pushed entry (LIFO).
 func (f *urlFrontier) Pop() (urlEntry, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	for {
 		if len(f.queue) > 0 {
-			entry := f.queue[0]
-			f.queue = f.queue[1:]
-			// Compact the backing array when it's 4x larger than needed.
-			// Without this, consumed slots hold stale entries that can't
-			// be GC'd — a memory concern on large crawls.
-			if cap(f.queue) > 4*len(f.queue) && len(f.queue) > 0 {
-				compact := make([]urlEntry, len(f.queue))
-				copy(compact, f.queue)
-				f.queue = compact
+			var entry urlEntry
+			if f.dfs {
+				// LIFO: take the last element.
+				entry = f.queue[len(f.queue)-1]
+				f.queue = f.queue[:len(f.queue)-1]
+			} else {
+				// FIFO: take the first element.
+				entry = f.queue[0]
+				f.queue = f.queue[1:]
+				// Compact the backing array when it's 4x larger than needed.
+				// Without this, consumed slots hold stale entries that can't
+				// be GC'd — a memory concern on large crawls.
+				if cap(f.queue) > 4*len(f.queue) && len(f.queue) > 0 {
+					compact := make([]urlEntry, len(f.queue))
+					copy(compact, f.queue)
+					f.queue = compact
+				}
 			}
 			return entry, true
 		}

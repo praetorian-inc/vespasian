@@ -240,6 +240,23 @@ func TestFrontier_ConcurrentAccess(t *testing.T) {
 	}
 }
 
+func TestFrontier_DFSPopOrder(t *testing.T) {
+	f := newURLFrontier(10, nil)
+	f.SetDFS(true)
+	f.Push([]urlEntry{{URL: "https://e.com/a", Depth: 0}})
+	f.Push([]urlEntry{{URL: "https://e.com/b", Depth: 0}})
+	f.MarkActive() // keep frontier "live" for Pop
+	e1, _ := f.Pop()
+	if e1.URL != "https://e.com/b" {
+		t.Errorf("DFS pop1 = %s, want .../b", e1.URL)
+	}
+	e2, _ := f.Pop()
+	if e2.URL != "https://e.com/a" {
+		t.Errorf("DFS pop2 = %s, want .../a", e2.URL)
+	}
+	f.MarkIdle()
+}
+
 func TestFrontier_ActiveWorkerPreventsEarlyDone(t *testing.T) {
 	f := newURLFrontier(10, nil)
 
