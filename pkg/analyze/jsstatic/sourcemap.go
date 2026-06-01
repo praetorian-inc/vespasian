@@ -361,11 +361,11 @@ func parseDataURISourcemap(uri string) ([]string, error) {
 		raw = []byte(unescaped)
 	}
 
-	// Explicit size cap mirroring the remote-fetch limit. The trailing-window
-	// scan (trailingWindowSize = 2 KB) bounds the raw data: URI string that
-	// arrives here, but an attacker can embed a heavily compressed payload that
-	// expands well beyond 2 KB after base64/URL decoding. Rejecting oversized
-	// decoded payloads prevents memory exhaustion from adversarial inline maps.
+	// Defense-in-depth size cap. The trailing-window scan (trailingWindowSize =
+	// 2 KB) already bounds the data: URI string that reaches here, and base64/URL
+	// decoding only shrinks it, so decoded `raw` is < 2 KB today and this branch
+	// is not reached. The cap only becomes load-bearing if trailingWindowSize is
+	// ever raised; it mirrors the remote-fetch limit so both paths stay consistent.
 	if len(raw) > maxSourcemapResponseSize {
 		return nil, fmt.Errorf("sourcemap: inline data URI decoded payload too large (>%d bytes)", maxSourcemapResponseSize)
 	}
