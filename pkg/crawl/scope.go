@@ -92,8 +92,8 @@ func isPrivateHost(hostname string) bool {
 // to prevent SSRF attacks when the crawl engine runs as a service component.
 //
 // Scope policies:
-//   - "same-origin": exact scheme + host + port match (equivalent to Katana's fqdn)
-//   - "same-domain": registered domain match, allowing subdomains (equivalent to Katana's rdn)
+//   - "same-origin": exact scheme + host + port match
+//   - "same-domain": registered domain match, allowing subdomains
 func scopeChecker(seedURL string, scope string, allowPrivate bool) (func(string) bool, error) {
 	seed, err := url.Parse(seedURL)
 	if err != nil {

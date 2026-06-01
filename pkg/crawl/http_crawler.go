@@ -35,8 +35,8 @@ import (
 // reassigns it. NOT safe to mutate concurrently with a running crawl.
 var httpPageTimeout = time.Duration(PageTimeout) * time.Second
 
-// Crawl runs the non-headless crawl using the stdlib net/http engine.
-// It replaces the previous Katana-based crawlStandard.
+// Crawl runs the non-headless crawl using the stdlib net/http engine — the
+// HTTP-only path used when --headless=false.
 func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRequest, error) {
 	maxPages, err := validateCrawlInputs(c.opts, targetURL)
 	if err != nil {

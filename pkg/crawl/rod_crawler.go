@@ -52,9 +52,10 @@ func (c *RodCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReq
 	return c.crawlHeadless(ctx, targetURL, maxPages, browserMgr)
 }
 
-// crawlHeadless runs a concurrent headless crawl using go-rod directly,
-// bypassing Katana's serial hybrid engine. This enables overlapping DOM
-// stability waits across multiple browser tabs for significantly faster crawls.
+// crawlHeadless runs a concurrent headless crawl using go-rod directly. It
+// drives multiple browser tabs in parallel so DOM-stability waits overlap
+// across pages, making crawls significantly faster than a serial page-by-page
+// visit.
 func (c *RodCrawler) crawlHeadless(ctx context.Context, targetURL string, maxPages int, browserMgr *BrowserManager) ([]ObservedRequest, error) {
 	// Apply the overall crawl timeout if configured.
 	if c.opts.Timeout > 0 {
