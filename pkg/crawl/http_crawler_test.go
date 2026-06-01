@@ -97,15 +97,22 @@ func TestHTTPCrawler_BodyCap(t *testing.T) {
 }
 
 func TestHTTPCrawler_PerPageTimeoutSurfaced(t *testing.T) {
-	// Server that holds the connection open until the client gives up.
-	// Use a channel to unblock it when the test ends.
+	// Set a very short per-page timeout via the injectable package var so we
+	// exercise the per-page timeout path, not the overall-context path (TEST-005).
+	// Restore the original value when the test ends.
+	orig := httpPageTimeout
+	httpPageTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { httpPageTimeout = orig })
+
+	// Server that holds the connection open well beyond the per-page timeout.
+	// The seed page returns quickly and links to /slow.
 	unblock := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/slow" {
-			// Block until unblocked or the test ends.
+			// Block for much longer than the per-page timeout.
 			select {
 			case <-unblock:
-			case <-time.After(60 * time.Second):
+			case <-time.After(30 * time.Second):
 			}
 			return
 		}
@@ -123,21 +130,20 @@ func TestHTTPCrawler_PerPageTimeoutSurfaced(t *testing.T) {
 		MaxPages:     5,
 		Stderr:       &stderr,
 		AllowPrivate: true,
+		// Timeout is intentionally large (or zero) so the crawl is terminated
+		// by the per-page timeout, not the overall context.
+		Timeout: 10 * time.Second,
 	}}
 
-	// Use a short overall context so the crawl terminates quickly.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	// Crawl should return (the /slow page is skipped on timeout) without panic.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
-	// Crawl should return without panicking even when a page times out or the
-	// overall context expires.
 	_, _ = c.Crawl(ctx, srv.URL)
-	// Test passes if we reach here (no panic, crawl returns).
 
-	// Verify that the timeout/error was surfaced to Stderr, not silently dropped.
+	// The per-page timeout for /slow must have surfaced a "fetch:" error on Stderr.
 	stderrOut := stderr.String()
-	if stderrOut == "" {
-		t.Error("expected timeout or error message on Stderr; got empty output")
+	if !strings.Contains(stderrOut, "fetch:") {
+		t.Errorf("expected per-page timeout to surface 'fetch:' message on Stderr; got: %q", stderrOut)
 	}
 }
 
@@ -424,7 +430,7 @@ func TestHTTPCrawler_SSRFDialGuardRejectsPrivateIP(t *testing.T) {
 	defer cancel()
 	conn, err := ssrfSafeDialContext(ctx, "tcp", "127.0.0.1:80")
 	if err == nil {
-		conn.Close()
+		_ = conn.Close()
 		t.Error("ssrfSafeDialContext: expected error for private IP 127.0.0.1, got nil")
 	}
 	if err != nil && !strings.Contains(err.Error(), "private") && !strings.Contains(err.Error(), "blocked") {

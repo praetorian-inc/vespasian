@@ -28,6 +28,13 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// httpPageTimeout is the per-page fetch timeout for the HTTP engine. It defaults
+// to PageTimeout seconds and is a package var (not a const) solely so tests can
+// shrink it to exercise the per-page-timeout path without a multi-second sleep —
+// the same test-seam pattern used by mergeEnrichedLinksFn. Production never
+// reassigns it. NOT safe to mutate concurrently with a running crawl.
+var httpPageTimeout = time.Duration(PageTimeout) * time.Second
+
 // Crawl runs the non-headless crawl using the stdlib net/http engine.
 // It replaces the previous Katana-based crawlStandard.
 func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRequest, error) {
@@ -186,7 +193,7 @@ func (c *HTTPCrawler) runWorker(
 // returns the observed request and discovered links. On error it logs to Stderr
 // (if set) and returns (nil, nil) so the worker can continue.
 func (c *HTTPCrawler) fetchPage(ctx context.Context, client *http.Client, limiter *rate.Limiter, entry urlEntry) (*ObservedRequest, []string) {
-	pageCtx, cancel := context.WithTimeout(ctx, time.Duration(PageTimeout)*time.Second)
+	pageCtx, cancel := context.WithTimeout(ctx, httpPageTimeout)
 	defer cancel()
 
 	// Rate-limit before fetching. A limiter.Wait error (context canceled or
