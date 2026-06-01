@@ -141,6 +141,27 @@ func TestInvoke_CrawlMode_EmitsWebpagesFiltersStaticAssets(t *testing.T) {
 	assert.Empty(t, webApps, "crawl mode must not emit WebApplication")
 }
 
+// TEST-007: pins the grouping contract — multiple requests sharing a PageURL
+// collapse into one Webpage with N WebpageRequests, and empty-URL requests
+// are skipped.
+func TestInvoke_CrawlMode_GroupsRequestsByParentPage(t *testing.T) {
+	stubCrawl(t, []crawl.ObservedRequest{
+		{Method: "GET", URL: "https://x.com/api/users", PageURL: "https://x.com/dashboard", Response: crawl.ObservedResponse{StatusCode: 200}},
+		{Method: "POST", URL: "https://x.com/api/orders", PageURL: "https://x.com/dashboard", Response: crawl.ObservedResponse{StatusCode: 201}},
+		{Method: "GET", URL: "https://x.com/api/info", PageURL: "https://x.com/dashboard", Response: crawl.ObservedResponse{StatusCode: 200}},
+		{Method: "GET", URL: "", PageURL: "https://x.com/dashboard"},
+	}, nil)
+
+	c := &Capability{}
+	ctx := ctxWithParams("mode", "crawl")
+	webpages, _, err := collect(t, c, ctx, seedApp("https://x.com"))
+
+	require.NoError(t, err)
+	require.Len(t, webpages, 1, "three XHRs from one page must collapse to one Webpage")
+	assert.Equal(t, "https://x.com/dashboard", webpages[0].URL)
+	require.Len(t, webpages[0].Requests, 3, "expected three WebpageRequests under the parent page")
+}
+
 func TestInvoke_CrawlMode_NoTrafficEmitsNothing(t *testing.T) {
 	stubCrawl(t, nil, nil)
 
@@ -322,6 +343,18 @@ func TestParseHeaders_Multiple(t *testing.T) {
 	assert.Equal(t, "val", got["X-Custom"])
 }
 
+func TestParseHeaders_SkipsMissingColon(t *testing.T) {
+	// Malformed entries (no colon) are silently dropped — well-formed entries
+	// on either side are still parsed.
+	got := parseHeaders("Authorization: Bearer tok, bad-entry, X-Foo: v")
+	require.NotNil(t, got)
+	assert.Len(t, got, 2)
+	assert.Equal(t, "Bearer tok", got["Authorization"])
+	assert.Equal(t, "v", got["X-Foo"])
+	_, exists := got["bad-entry"]
+	assert.False(t, exists, "malformed entry must not be present as a key")
+}
+
 // ---------------------------------------------------------------------------
 // 8. parseConfidence and specFormatForType (internal helpers)
 // ---------------------------------------------------------------------------
@@ -338,6 +371,24 @@ func TestParseConfidence_OutOfRangeReturnsDefault(t *testing.T) {
 	params := capability.Parameters{capability.String("confidence", "").WithDefault("1.5")}
 	got := parseConfidence(params)
 	assert.Equal(t, 0.5, got)
+}
+
+func TestParseConfidence_ValidValueParsed(t *testing.T) {
+	params := capability.Parameters{capability.String("confidence", "").WithDefault("0.7")}
+	got := parseConfidence(params)
+	assert.InDelta(t, 0.7, got, 1e-9)
+}
+
+func TestParseConfidence_BoundaryZero(t *testing.T) {
+	params := capability.Parameters{capability.String("confidence", "").WithDefault("0.0")}
+	got := parseConfidence(params)
+	assert.Equal(t, 0.0, got)
+}
+
+func TestParseConfidence_BoundaryOne(t *testing.T) {
+	params := capability.Parameters{capability.String("confidence", "").WithDefault("1.0")}
+	got := parseConfidence(params)
+	assert.Equal(t, 1.0, got)
 }
 
 func TestSpecFormatForType_WSDL(t *testing.T) {
@@ -359,4 +410,35 @@ func TestIsStaticAssetURL_HTML(t *testing.T) {
 func TestIsStaticAssetURL_QueryStringDoesNotMatch(t *testing.T) {
 	// Path is "/api" — the .js appears only in the query string, not the path.
 	assert.False(t, pipeline.IsStaticAssetURL("https://example.com/api?cb=x.js"))
+}
+
+// ---------------------------------------------------------------------------
+// 9. crawlOptsFromCtx — defaults + overrides
+// ---------------------------------------------------------------------------
+
+func TestCrawlOptsFromCtx_DefaultsApplied(t *testing.T) {
+	opts, err := crawlOptsFromCtx(ctxWithParams())
+	require.NoError(t, err)
+	assert.Equal(t, "same-origin", opts.Scope)
+	assert.Equal(t, 600*time.Second, opts.Timeout)
+	assert.Equal(t, 100, opts.MaxPages)
+	assert.Equal(t, 3, opts.Depth)
+}
+
+func TestCrawlOptsFromCtx_OverridesApplied(t *testing.T) {
+	opts, err := crawlOptsFromCtx(ctxWithParams(
+		"timeout", "30",
+		"max_pages", "42",
+		"depth", "7",
+		"scope", "same-domain",
+		"headers", "Authorization: Bearer x, X-Tenant: acme",
+	))
+	require.NoError(t, err)
+	assert.Equal(t, 30*time.Second, opts.Timeout)
+	assert.Equal(t, 42, opts.MaxPages)
+	assert.Equal(t, 7, opts.Depth)
+	assert.Equal(t, "same-domain", opts.Scope)
+	require.NotNil(t, opts.Headers)
+	assert.Equal(t, "Bearer x", opts.Headers["Authorization"])
+	assert.Equal(t, "acme", opts.Headers["X-Tenant"])
 }
