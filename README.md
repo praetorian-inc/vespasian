@@ -48,7 +48,7 @@ Vespasian takes a different approach: it observes actual network traffic at the 
 | **Active Probing** | OPTIONS discovery, JSON schema inference, WSDL document fetching, and GraphQL introspection |
 | **Path Normalization** | `/users/42` and `/users/87` become `/users/{id}` with known literal preservation (`/me`, `/self`) |
 | **SSRF Protection** | Blocks crawling and probing of private and loopback addresses by default. Pass `--dangerous-allow-private` to test internal targets (localhost, 127.0.0.1, RFC1918, link-local); the flag is required when the seed URL is itself a private host. |
-| **JS Bundle Static Analysis** | Statically analyses captured JavaScript bundles to recover API endpoints, path parameters, and request-body fields missed by dynamic crawling. Enabled by default via `--analyze-js`; sourcemap recovery can be enabled with `--fetch-sourcemaps`. |
+| **JS Bundle Static Analysis** | Statically analyses captured JavaScript bundles to recover API endpoints, path parameters, and request-body fields missed by dynamic crawling. Enabled by default via `--analyze-js`; sourcemap recovery is controlled by `--fetch-sourcemaps` (default: `true` for `scan`/`crawl`, `false` for `generate`). |
 | **Proxy Support** | Route headless browser traffic through Burp Suite or other intercepting proxies |
 | **Two-Stage Pipeline** | Capture once, generate many: separate capture and generation steps for maximum flexibility |
 
