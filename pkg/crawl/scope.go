@@ -195,9 +195,20 @@ func ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, e
 		}
 	}
 
-	// Dial the first validated address directly to prevent a TOCTOU re-resolve.
+	// Dial validated addresses directly (by IP, never re-resolving the host) to
+	// prevent a TOCTOU re-resolve. Try each validated IP in order, preserving
+	// Go's normal multi-IP fallback so a single dead A/AAAA record does not fail
+	// the dial when another validated address would connect.
 	dialer := &net.Dialer{}
-	return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+	var lastErr error
+	for _, ip := range ips {
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.IP.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
 }
 
 // normalizeURL normalizes a URL for deduplication by lowercasing the scheme

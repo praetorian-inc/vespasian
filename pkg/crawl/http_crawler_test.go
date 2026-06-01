@@ -234,6 +234,43 @@ func TestApplyHeaders_NilHeaders(t *testing.T) {
 	applyHeaders(req, nil)
 }
 
+// TestHTTPCrawler_RelativeLinksResolvedAgainstFinalURL verifies that relative
+// links are resolved against the FINAL (post-redirect) response URL, not the
+// queued seed URL. The seed "/start" redirects to "/app/" whose page links to
+// a relative "next"; the crawler must fetch "/app/next", not "/next".
+func TestHTTPCrawler_RelativeLinksResolvedAgainstFinalURL(t *testing.T) {
+	var hitAppNext, hitBadNext atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/start":
+			http.Redirect(w, r, "/app/", http.StatusFound)
+		case "/app/":
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, `<a href="next">next</a>`)
+		case "/app/next":
+			hitAppNext.Store(true)
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, `ok`)
+		case "/next":
+			hitBadNext.Store(true)
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, `wrong`)
+		}
+	}))
+	defer srv.Close()
+
+	c := &HTTPCrawler{opts: CrawlerOptions{Depth: 3, MaxPages: 20, Timeout: 10 * time.Second, AllowPrivate: true}}
+	if _, err := c.Crawl(context.Background(), srv.URL+"/start"); err != nil {
+		t.Fatalf("Crawl: %v", err)
+	}
+	if !hitAppNext.Load() {
+		t.Error("expected /app/next to be crawled (relative link resolved against final URL)")
+	}
+	if hitBadNext.Load() {
+		t.Error("/next was crawled — relative link wrongly resolved against the seed URL, not the post-redirect URL")
+	}
+}
+
 func TestRedirectScopeGuard_TooManyRedirects(t *testing.T) {
 	guard := redirectScopeGuard(nil)
 	// Simulate 10 previous redirects — guard must return an error.

@@ -123,9 +123,13 @@ func (f *urlFrontier) Pop() (urlEntry, bool) {
 		if len(f.queue) > 0 {
 			var entry urlEntry
 			if f.dfs {
-				// LIFO: take the last element.
-				entry = f.queue[len(f.queue)-1]
-				f.queue = f.queue[:len(f.queue)-1]
+				// LIFO: take the last element. Clear the popped slot before
+				// reslicing so the backing array does not retain the entry
+				// (GC concern on large DFS crawls — mirrors the FIFO path).
+				last := len(f.queue) - 1
+				entry = f.queue[last]
+				f.queue[last] = urlEntry{}
+				f.queue = f.queue[:last]
 			} else {
 				// FIFO: take the first element.
 				entry = f.queue[0]

@@ -123,15 +123,12 @@ type rodEngine struct {
 // newRodEngine connects to the Chrome instance at wsURL and returns a crawl
 // engine ready to start. The caller must call Close() when done.
 func newRodEngine(wsURL string, opts engineOptions) (*rodEngine, error) {
-	if opts.Concurrency <= 0 {
-		opts.Concurrency = DefaultConcurrency
+	if opts.Concurrency > MaxConcurrency && opts.Stderr != nil {
+		fmt.Fprintf(opts.Stderr, "warning: --concurrency %d exceeds maximum (%d), capping\n", opts.Concurrency, MaxConcurrency) //nolint:errcheck // best-effort
 	}
-	if opts.Concurrency > MaxConcurrency {
-		if opts.Stderr != nil {
-			fmt.Fprintf(opts.Stderr, "warning: --concurrency %d exceeds maximum (%d), capping\n", opts.Concurrency, MaxConcurrency) //nolint:errcheck // best-effort
-		}
-		opts.Concurrency = MaxConcurrency
-	}
+	// clampConcurrency (http_crawler.go) is the shared clamp: 0 → DefaultConcurrency,
+	// > MaxConcurrency → MaxConcurrency. The warning above is rod-specific.
+	opts.Concurrency = clampConcurrency(opts.Concurrency)
 	if opts.PageTimeout <= 0 {
 		opts.PageTimeout = time.Duration(PageTimeout) * time.Second
 	}

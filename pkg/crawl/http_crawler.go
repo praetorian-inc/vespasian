@@ -238,7 +238,10 @@ func (c *HTTPCrawler) fetchPage(ctx context.Context, client *http.Client, limite
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPBodySize)) //nolint:errcheck // best-effort; partial body is acceptable
 
 	observed := buildObservedRequest(req, resp, body)
-	links := c.extractLinks(observed, entry.URL)
+	// Resolve discovered links against the FINAL response URL (observed.URL,
+	// post-redirect), not the queued entry.URL — otherwise a redirect from
+	// /start to /app/ would resolve href="next" as /next instead of /app/next.
+	links := c.extractLinks(observed, observed.URL)
 
 	return &observed, links
 }
@@ -256,11 +259,12 @@ func (c *HTTPCrawler) extractLinks(observed ObservedRequest, pageURL string) []s
 
 	ct := strings.ToLower(observed.Response.ContentType)
 	if isHTMLContentType(ct) {
-		// extractFromHTML resolves <base href> internally; pass pageURL as
-		// the fallback base. Derive the same effective base for inline scripts
-		// so both extraction paths are consistent.
-		links = append(links, extractFromHTML(observed.Response.Body, pageURL)...)
-		base := extractEffectiveBase(observed.Response.Body, pageURL)
+		// extractFromHTML parses the body once and returns both the discovered
+		// links and the effective <base href>-aware base. Reuse that base to
+		// resolve inline-script endpoints so both paths are consistent and the
+		// body is parsed only once.
+		htmlLinks, base := extractFromHTML(observed.Response.Body, pageURL)
+		links = append(links, htmlLinks...)
 		links = append(links, jsExtractedToLinks(extractInlineScripts(observed.Response.Body), base)...)
 	}
 

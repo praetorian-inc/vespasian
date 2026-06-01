@@ -20,19 +20,23 @@ import (
 	"github.com/PuerkitoBio/goquery"
 )
 
-// extractFromHTML parses an HTML body and returns all navigable URLs discovered
-// via the same linkSelectors set used by the rod-based extractLinks. Each raw
-// attribute value is resolved against the effective base URL — the <base href>
-// tag when present (matching the rod path's effectiveBaseURL call), otherwise
-// pageURL — and filtered through isLikelyPage (dropping JS bundles, images,
-// etc.). Scope enforcement is left to the frontier.
+// extractFromHTML parses an HTML body once and returns (links, base): all
+// navigable URLs discovered via the same linkSelectors set used by the
+// rod-based extractLinks, plus the effective base URL it resolved them against.
+// The base is the <base href> tag when present (matching the rod path's
+// effectiveBaseURL call, applying the same scheme-downgrade and cross-host
+// guards via effectiveBaseURLFrom), otherwise pageURL. Links are filtered
+// through isLikelyPage (dropping JS bundles, images, etc.); scope enforcement
+// is left to the frontier. Returning the base lets callers resolve other
+// page-relative URLs (e.g. inline-script endpoints) against the same base
+// without re-parsing the body.
 //
 // This is the goquery analog of extractLinks (links.go:68) — same selectors
 // and filters, no *rod.Page dependency.
-func extractFromHTML(body []byte, pageURL string) []string {
+func extractFromHTML(body []byte, pageURL string) ([]string, string) {
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
 	if err != nil {
-		return nil
+		return nil, pageURL
 	}
 
 	// Resolve the effective base URL: honor <base href> when present, applying
@@ -69,24 +73,7 @@ func extractFromHTML(body []byte, pageURL string) []string {
 		})
 	}
 
-	return links
-}
-
-// extractEffectiveBase parses body for a <base href> element and returns the
-// effective base URL for the page (applying the same scheme-downgrade and
-// cross-host guards as effectiveBaseURLFrom). Returns pageURL when no valid
-// <base href> is present. This is the pure-HTML analog of effectiveBaseURL
-// (links.go), allowing callers to obtain the same base without re-parsing.
-func extractEffectiveBase(body []byte, pageURL string) string {
-	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
-	if err != nil {
-		return pageURL
-	}
-	href, exists := doc.Find("base[href]").First().Attr("href")
-	if !exists {
-		return pageURL
-	}
-	return effectiveBaseURLFrom(href, pageURL)
+	return links, base
 }
 
 // extractInlineScripts finds all inline <script> tags (those without a src

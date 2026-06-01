@@ -99,7 +99,7 @@ func validateCrawlInputs(opts CrawlerOptions, targetURL string) (int, error) {
 
 	u, err := url.Parse(targetURL)
 	if err != nil || targetURL == "" || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return 0, fmt.Errorf("invalid target URL: %q", targetURL)
+		return 0, fmt.Errorf("invalid target URL: %q", redactSeedURL(targetURL))
 	}
 
 	return maxPages, nil

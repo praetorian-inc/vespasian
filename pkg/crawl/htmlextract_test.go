@@ -27,7 +27,7 @@ func TestExtractFromHTML_UsesLinkSelectors(t *testing.T) {
       <a href="/bundle.js">js</a>
       <a href="https://other.example/x">off</a>
     </body></html>`)
-	got := extractFromHTML(body, "https://e.com/")
+	got, _ := extractFromHTML(body, "https://e.com/")
 	want := map[string]bool{
 		"https://e.com/page1":     true,
 		"https://e.com/submit":    true,
@@ -66,7 +66,7 @@ func TestExtractInlineScripts_RunsJsluice(t *testing.T) {
 
 func TestExtractFromHTML_EmptyBody(t *testing.T) {
 	// Empty body should return nil/empty without panicking.
-	got := extractFromHTML([]byte{}, "https://example.com/")
+	got, _ := extractFromHTML([]byte{}, "https://example.com/")
 	if len(got) != 0 {
 		t.Errorf("empty body: got %v, want []", got)
 	}
@@ -74,7 +74,7 @@ func TestExtractFromHTML_EmptyBody(t *testing.T) {
 
 func TestExtractFromHTML_NoLinks(t *testing.T) {
 	body := []byte(`<html><body><p>no links here</p></body></html>`)
-	got := extractFromHTML(body, "https://example.com/")
+	got, _ := extractFromHTML(body, "https://example.com/")
 	if len(got) != 0 {
 		t.Errorf("no-link page: got %v, want []", got)
 	}
@@ -96,24 +96,24 @@ func TestExtractInlineScripts_EmptyBody(t *testing.T) {
 	}
 }
 
-// TestExtractEffectiveBase_NoBaseTag verifies that extractEffectiveBase returns
-// pageURL when the HTML contains no <base href> element.
-func TestExtractEffectiveBase_NoBaseTag(t *testing.T) {
+// TestExtractFromHTML_BaseReturnedNoBaseTag verifies extractFromHTML returns
+// pageURL as the base when the HTML contains no <base href> element.
+func TestExtractFromHTML_BaseReturnedNoBaseTag(t *testing.T) {
 	body := []byte(`<html><body><a href="/x">x</a></body></html>`)
-	got := extractEffectiveBase(body, "https://example.com/page")
-	if got != "https://example.com/page" {
-		t.Errorf("extractEffectiveBase (no base tag) = %q, want %q", got, "https://example.com/page")
+	_, base := extractFromHTML(body, "https://example.com/page")
+	if base != "https://example.com/page" {
+		t.Errorf("extractFromHTML base (no base tag) = %q, want %q", base, "https://example.com/page")
 	}
 }
 
-// TestExtractEffectiveBase_WithBaseTag verifies that extractEffectiveBase returns
+// TestExtractFromHTML_BaseReturnedWithBaseTag verifies extractFromHTML returns
 // the resolved base URL when a valid <base href> element is present.
-func TestExtractEffectiveBase_WithBaseTag(t *testing.T) {
+func TestExtractFromHTML_BaseReturnedWithBaseTag(t *testing.T) {
 	body := []byte(`<html><head><base href="/app/"></head><body></body></html>`)
-	got := extractEffectiveBase(body, "https://example.com/page")
+	_, base := extractFromHTML(body, "https://example.com/page")
 	want := "https://example.com/app/"
-	if got != want {
-		t.Errorf("extractEffectiveBase = %q, want %q", got, want)
+	if base != want {
+		t.Errorf("extractFromHTML base = %q, want %q", base, want)
 	}
 }
 
@@ -123,7 +123,7 @@ func TestExtractFromHTML_BaseHref(t *testing.T) {
 	// <base href="/app/"> is an absolute-path reference: resolves to https://host/app/.
 	// The relative <a href="x"> should therefore resolve to https://host/app/x.
 	body := []byte(`<html><head><base href="/app/"></head><body><a href="x">page</a></body></html>`)
-	got := extractFromHTML(body, "https://host/other/page")
+	got, _ := extractFromHTML(body, "https://host/other/page")
 	want := "https://host/app/x"
 	found := false
 	for _, u := range got {
@@ -145,7 +145,7 @@ func TestExtractFromHTML_BaseHref(t *testing.T) {
 func TestExtractFromHTML_BaseHrefCrossHostRejected(t *testing.T) {
 	// attacker.com base must be rejected; relative link resolves against pageURL.
 	body := []byte(`<html><head><base href="https://attacker.com/evil/"></head><body><a href="x">page</a></body></html>`)
-	got := extractFromHTML(body, "https://target.com/app/")
+	got, _ := extractFromHTML(body, "https://target.com/app/")
 	for _, u := range got {
 		if strings.Contains(u, "attacker.com") {
 			t.Errorf("cross-host <base href> was NOT rejected; got %s", u)
