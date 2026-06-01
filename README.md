@@ -305,7 +305,7 @@ vespasian generate <api-type> <capture-file> [flags]
 
 ```
 cmd/vespasian/          CLI entry point
-pkg/crawl/              Headless browser crawler + capture format
+pkg/crawl/              Crawler (headless go-rod + net/http backends) + capture format
 pkg/importer/           Traffic importers (Burp, HAR, mitmproxy)
 pkg/analyze/            Static HTML form extraction from captured response bodies
 pkg/classify/           API classification (REST, GraphQL, WSDL)
