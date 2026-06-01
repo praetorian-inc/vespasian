@@ -58,7 +58,7 @@ Vespasian uses a two-stage pipeline that separates traffic capture from specific
 ```mermaid
 flowchart LR
     subgraph Capture
-        A["Headless Browser Crawler<br/>JS execution, auth injection"] --> C["capture.json<br/>ObservedRequest array"]
+        A["Crawler<br/>headless go-rod or net/http"] --> C["capture.json<br/>ObservedRequest array"]
         B["Traffic Importers<br/>Burp Suite XML, HAR, mitmproxy"] --> C
     end
     subgraph Generate
@@ -221,7 +221,7 @@ vespasian scan <url> [flags]
   --max-pages        Max pages to visit (default: 100)
   --timeout          Maximum duration for the entire scan (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
-  --headless         Browser mode (default: true)
+  --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine
   --proxy            Proxy URL for headless browser (e.g., http://127.0.0.1:8080)
   --confidence       Min classification confidence (default: 0.5)
   --probe            Enable active probing (default: true)
@@ -238,7 +238,7 @@ vespasian scan <url> [flags]
 
 ### `vespasian crawl`
 
-Captures HTTP traffic by driving a headless browser through the target application.
+Captures HTTP traffic from the target application. By default it drives a headless Chrome browser (go-rod) for full JavaScript/SPA support; with `--headless=false` it uses a dependency-free stdlib net/http engine (no Chrome required).
 
 ```
 vespasian crawl <url> [flags]
@@ -248,7 +248,7 @@ vespasian crawl <url> [flags]
   --max-pages        Max pages to visit (default: 100)
   --timeout          Maximum duration for the entire crawl (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
-  --headless         Browser mode (default: true)
+  --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine
   --proxy            Proxy URL for headless browser (e.g., http://127.0.0.1:8080)
   --dangerous-allow-private  Disable SSRF protection for crawling, allowing
                      private/localhost targets (localhost, 127.0.0.1, RFC1918,
