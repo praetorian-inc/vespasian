@@ -238,7 +238,9 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		if !ok {
 			return // frontier exhausted
 		}
-		e.frontier.MarkActive()
+		// MarkActive is NOT called here: Pop atomically increments the active
+		// counter before returning, making dequeue+activate a single critical
+		// section. Callers only need MarkIdle() after processing completes.
 
 		requests, links, err := e.visitPage(ctx, entry)
 		if err != nil {

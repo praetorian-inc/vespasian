@@ -104,10 +104,17 @@ func (f *urlFrontier) SetDFS(v bool) {
 	f.mu.Unlock()
 }
 
-// Pop returns the next URL to visit. It blocks until a URL is available or
-// the frontier is done (empty queue, no active workers, or closed). Returns
-// (entry, true) on success or (urlEntry{}, false) when the frontier is exhausted.
+// Pop returns the next URL to visit, atomically marking the entry as active.
+// It blocks until a URL is available or the frontier is done (empty queue, no
+// active workers, or closed). Returns (entry, true) on success or
+// (urlEntry{}, false) when the frontier is exhausted.
 // When SetDFS(true) has been called, Pop returns the last-pushed entry (LIFO).
+//
+// Active tracking is incremented inside Pop's critical section before the
+// mutex is released, making dequeue+activate atomic. This closes the TOCTOU
+// window where a concurrent Pop could observe an empty queue with active==0
+// while another worker holds an entry but has not yet called MarkActive.
+// Callers MUST call MarkIdle() exactly once when done processing the entry.
 func (f *urlFrontier) Pop() (urlEntry, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -132,6 +139,9 @@ func (f *urlFrontier) Pop() (urlEntry, bool) {
 					f.queue = compact
 				}
 			}
+			// Atomically mark this worker as active so concurrent Pop calls
+			// block instead of returning false when the queue drains.
+			f.active++
 			return entry, true
 		}
 
@@ -144,14 +154,6 @@ func (f *urlFrontier) Pop() (urlEntry, bool) {
 		// Wait for Push or MarkIdle to signal.
 		f.cond.Wait()
 	}
-}
-
-// MarkActive increments the active-worker counter. Call this when a worker
-// receives a URL from Pop and begins processing it.
-func (f *urlFrontier) MarkActive() {
-	f.mu.Lock()
-	f.active++
-	f.mu.Unlock()
 }
 
 // MarkIdle decrements the active-worker counter. Call this when a worker

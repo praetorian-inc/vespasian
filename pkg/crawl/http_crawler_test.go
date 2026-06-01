@@ -252,14 +252,25 @@ func TestRedirectScopeGuard_AllowsInScopeRedirect(t *testing.T) {
 	}
 }
 
-// TestHTTPCrawler_SSRFRedirectBlocked verifies that when AllowPrivate is false
-// and Scope is "same-origin", a 302 redirect to a private IP (127.0.0.1) is
-// blocked by the redirect scope guard. No result entry for that host should
-// appear and the crawl must not panic.
+// TestHTTPCrawler_SSRFRedirectBlocked verifies that a 302 redirect to a
+// private IP (127.0.0.1 on a different port) is blocked by the redirect
+// scope guard. No result entry for the redirected host/port should appear,
+// the guard must have fired (evidenced by stderr), and the crawl must not
+// panic.
+//
+// AllowPrivate is set to true so the test server (also on loopback) is
+// reachable. The redirect is blocked because it targets a different origin
+// (different port) from the seed, not solely because it is a private IP.
+// The DialContext SSRF guard (SEC-BE-002 fix) provides the additional
+// defense-in-depth layer for DNS-rebinding scenarios.
 func TestHTTPCrawler_SSRFRedirectBlocked(t *testing.T) {
+	// Track how many times the seed was hit to confirm the redirect was attempted.
+	var seedHits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
-			// Redirect to a private IP — must be blocked by the scope guard.
+			seedHits.Add(1)
+			// Redirect to a different origin (port 1 — blocked by scope guard
+			// and also a private-IP target for the SSRF DialContext guard).
 			http.Redirect(w, r, "http://127.0.0.1:1/secret", http.StatusFound)
 			return
 		}
@@ -272,17 +283,108 @@ func TestHTTPCrawler_SSRFRedirectBlocked(t *testing.T) {
 		MaxPages:     5,
 		Timeout:      5 * time.Second,
 		Stderr:       &stderr,
-		AllowPrivate: false,
+		AllowPrivate: true, // allow test server on loopback
 		Scope:        "same-origin",
 	}}
 
 	got, _ := c.Crawl(context.Background(), srv.URL)
+
+	// Negative assertion: no result should contain port 1 (the redirect target).
 	for _, r := range got {
-		if strings.Contains(r.URL, "127.0.0.1") {
-			t.Errorf("crawler followed redirect to private IP; result URL = %s", r.URL)
+		if strings.Contains(r.URL, ":1/") || strings.HasSuffix(r.URL, ":1") {
+			t.Errorf("crawler followed redirect to blocked host; result URL = %s", r.URL)
 		}
 	}
+
+	// Positive assertion: the redirect was attempted (seed was hit) and the guard
+	// fired — evidenced by an error message on stderr (fetch error or scope block).
+	if seedHits.Load() == 0 {
+		t.Error("seed URL was never requested; redirect guard test is vacuous")
+	}
+	stderrOut := stderr.String()
+	if !strings.Contains(stderrOut, "fetch:") && !strings.Contains(stderrOut, "blocked") && !strings.Contains(stderrOut, "redirect") {
+		t.Errorf("expected guard to surface error on stderr (fetch/blocked/redirect), got: %q", stderrOut)
+	}
 	// Crawl must not panic and must return (no hang).
+}
+
+// TestHTTPCrawler_ConcurrentWorkers proves that with a single seed URL and
+// Concurrency>1, multiple workers actually run in parallel. The seed page
+// links to N children; each child blocks until K concurrent in-flight requests
+// are observed simultaneously, then releases. If the crawl is silently
+// single-threaded (the startup race described in QUAL-003/TEST-004), the barrier
+// is never reached and the test times out via ctx.
+func TestHTTPCrawler_ConcurrentWorkers(t *testing.T) {
+	const (
+		numChildren = 5
+		minParallel = 3 // require at least 3 simultaneous in-flight fetches
+	)
+
+	var (
+		inFlight    atomic.Int32
+		maxParallel atomic.Int32
+		barrier     = make(chan struct{}) // closed when minParallel are in-flight
+		barrierOnce sync.Once
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		switch r.URL.Path {
+		case "/":
+			// Seed page: link to all children.
+			var links strings.Builder
+			for i := range numChildren {
+				fmt.Fprintf(&links, `<a href="/c%d">child</a>`, i)
+			}
+			fmt.Fprint(w, links.String())
+		default:
+			// Child page: track concurrency and block until minParallel are in-flight.
+			cur := inFlight.Add(1)
+			defer inFlight.Add(-1)
+
+			// Update max-in-flight high-water mark.
+			for {
+				old := maxParallel.Load()
+				if cur <= old || maxParallel.CompareAndSwap(old, cur) {
+					break
+				}
+			}
+
+			// Once minParallel goroutines are here simultaneously, open the barrier.
+			if cur >= minParallel {
+				barrierOnce.Do(func() { close(barrier) })
+			}
+
+			// Block until the barrier opens (or 5s safety timeout).
+			select {
+			case <-barrier:
+			case <-time.After(5 * time.Second):
+			}
+
+			fmt.Fprint(w, "ok")
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	c := &HTTPCrawler{opts: CrawlerOptions{
+		Depth:        2,
+		MaxPages:     50,
+		Concurrency:  5,
+		AllowPrivate: true,
+	}}
+
+	_, err := c.Crawl(ctx, srv.URL)
+	if err != nil && ctx.Err() != nil {
+		t.Fatalf("crawl timed out — workers likely collapsed to single-threaded (ctx: %v)", ctx.Err())
+	}
+
+	if got := maxParallel.Load(); got < minParallel {
+		t.Errorf("max concurrent in-flight workers = %d, want >= %d; "+
+			"crawler may be running single-threaded due to Pop/MarkActive race", got, minParallel)
+	}
 }
 
 func TestHTTPCrawler_SendsCustomHeaders(t *testing.T) {

@@ -33,7 +33,8 @@ func TestFrontier_BasicPushPop(t *testing.T) {
 		t.Fatalf("Push returned %d, want 3", added)
 	}
 
-	// FIFO order
+	// FIFO order. Each Pop atomically marks this worker active; MarkIdle signals
+	// that the worker finished processing (no new links discovered).
 	for _, want := range urls {
 		got, ok := f.Pop()
 		if !ok {
@@ -42,9 +43,10 @@ func TestFrontier_BasicPushPop(t *testing.T) {
 		if got.URL != want.URL {
 			t.Errorf("Pop URL = %q, want %q", got.URL, want.URL)
 		}
+		f.MarkIdle() // worker done; active counter decremented
 	}
 
-	// Queue empty, no active workers → Pop returns false
+	// Queue empty, no active workers → Pop returns false immediately.
 	got, ok := f.Pop()
 	if ok {
 		t.Errorf("Pop returned true with URL %q, expected false (empty frontier)", got.URL)
@@ -130,19 +132,41 @@ func TestFrontier_Close(t *testing.T) {
 func TestFrontier_PopBlocksUntilPush(t *testing.T) {
 	f := newURLFrontier(10, nil)
 
-	// Simulate an active worker so Pop blocks instead of returning false immediately
-	f.MarkActive()
+	// Seed one URL so worker 1 can Pop it and keep the frontier alive (active>0).
+	// Worker 2 then blocks because the queue is empty but active>0.
+	f.Push([]urlEntry{{URL: "https://example.com/seed", Depth: 0}})
 
+	// Worker 1: Pop the seed entry. Pop atomically sets active=1.
+	worker1Ready := make(chan struct{})
+	worker1Done := make(chan struct{})
+	go func() {
+		e, ok := f.Pop()
+		if !ok || e.URL == "" {
+			return // test will fail via worker2 check
+		}
+		close(worker1Ready)
+		// Hold the entry (keep active=1) until worker 2 has pushed something.
+		<-worker1Done
+		f.MarkIdle()
+	}()
+
+	// Wait for worker 1 to have popped (active=1).
+	select {
+	case <-worker1Ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker 1 did not pop seed in time")
+	}
+
+	// Worker 2: Pop blocks (queue empty, active=1).
 	var got urlEntry
 	var ok bool
 	done := make(chan struct{})
-
 	go func() {
 		got, ok = f.Pop()
 		close(done)
 	}()
 
-	// Give the goroutine time to block
+	// Give worker 2 time to block.
 	time.Sleep(50 * time.Millisecond)
 
 	select {
@@ -151,7 +175,7 @@ func TestFrontier_PopBlocksUntilPush(t *testing.T) {
 	default:
 	}
 
-	// Push a URL to unblock
+	// Push a URL to unblock worker 2.
 	f.Push([]urlEntry{{URL: "https://example.com/unblock", Depth: 0}})
 
 	select {
@@ -167,15 +191,38 @@ func TestFrontier_PopBlocksUntilPush(t *testing.T) {
 		t.Errorf("Pop URL = %q, want %q", got.URL, "https://example.com/unblock")
 	}
 
+	// Release worker 1 to call MarkIdle; worker 2's MarkIdle.
+	close(worker1Done)
 	f.MarkIdle()
 }
 
 func TestFrontier_PopUnblocksOnMarkIdle(t *testing.T) {
 	f := newURLFrontier(10, nil)
 
-	// One active worker, empty queue → Pop should block
-	f.MarkActive()
+	// Seed one URL. Worker 1 pops it (active=1), keeping the frontier alive.
+	// Worker 2 blocks on Pop (queue empty, active=1). When worker 1 calls
+	// MarkIdle (active→0, queue still empty), worker 2 unblocks with false.
+	f.Push([]urlEntry{{URL: "https://example.com/seed", Depth: 0}})
 
+	// Worker 1 holds its entry until we signal it to call MarkIdle.
+	release := make(chan struct{})
+	w1ready := make(chan struct{})
+	go func() {
+		e, _ := f.Pop() // active becomes 1
+		_ = e
+		close(w1ready)
+		<-release
+		f.MarkIdle() // active goes 0, queue empty → unblocks worker 2
+	}()
+
+	// Wait for worker 1 to have popped.
+	select {
+	case <-w1ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker 1 did not pop in time")
+	}
+
+	// Worker 2: Pop should block (queue empty, active=1).
 	done := make(chan bool, 1)
 	go func() {
 		_, ok := f.Pop()
@@ -184,8 +231,8 @@ func TestFrontier_PopUnblocksOnMarkIdle(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Mark idle with empty queue → frontier is exhausted → Pop returns false
-	f.MarkIdle()
+	// Release worker 1 to call MarkIdle → frontier exhausted → Pop returns false.
+	close(release)
 
 	select {
 	case ok := <-done:
@@ -210,7 +257,8 @@ func TestFrontier_ConcurrentAccess(t *testing.T) {
 	}
 	f.Push(initial)
 
-	// Concurrent consumers
+	// Concurrent consumers. Each Pop atomically marks the worker active; MarkIdle
+	// must be called after processing so the frontier knows when work is done.
 	var wg sync.WaitGroup
 	consumed := make(chan string, 200)
 
@@ -224,6 +272,7 @@ func TestFrontier_ConcurrentAccess(t *testing.T) {
 					return
 				}
 				consumed <- entry.URL
+				f.MarkIdle() // signal that this worker finished processing
 			}
 		}()
 	}
@@ -245,28 +294,87 @@ func TestFrontier_DFSPopOrder(t *testing.T) {
 	f.SetDFS(true)
 	f.Push([]urlEntry{{URL: "https://e.com/a", Depth: 0}})
 	f.Push([]urlEntry{{URL: "https://e.com/b", Depth: 0}})
-	f.MarkActive() // keep frontier "live" for Pop
-	e1, _ := f.Pop()
+	// With the atomic-Pop fix, Pop increments active internally; no separate
+	// MarkActive call is needed to keep the frontier "live" during the second Pop.
+	e1, ok1 := f.Pop()
+	if !ok1 {
+		t.Fatal("DFS pop1 returned false, want true")
+	}
 	if e1.URL != "https://e.com/b" {
 		t.Errorf("DFS pop1 = %s, want .../b", e1.URL)
 	}
-	e2, _ := f.Pop()
+	e2, ok2 := f.Pop()
+	if !ok2 {
+		t.Fatal("DFS pop2 returned false, want true")
+	}
 	if e2.URL != "https://e.com/a" {
 		t.Errorf("DFS pop2 = %s, want .../a", e2.URL)
 	}
+	f.MarkIdle()
+	f.MarkIdle()
+}
+
+// TestFrontier_SingleSeedBlocksOtherWorkers verifies the atomicity invariant:
+// after one Pop with a single seed, other concurrent Pop calls must BLOCK
+// (not return false) because the popped worker is still active. This is the
+// regression guard for the empty-queue+active==0 collapse described in QUAL-003.
+func TestFrontier_SingleSeedBlocksOtherWorkers(t *testing.T) {
+	f := newURLFrontier(10, nil)
+	f.Push([]urlEntry{{URL: "https://example.com/seed", Depth: 0}})
+
+	// Worker 1 pops the only entry. With the atomic fix, Pop increments active
+	// before returning, so other workers see active>0 and block.
+	entry, ok := f.Pop()
+	if !ok {
+		t.Fatal("first Pop returned false, expected seed entry")
+	}
+	if entry.URL != "https://example.com/seed" {
+		t.Errorf("first Pop URL = %q, want seed", entry.URL)
+	}
+
+	// Worker 2 tries to Pop concurrently. The queue is empty but active>0 (worker 1
+	// is still processing). Worker 2 must block, not return false.
+	done := make(chan bool, 1)
+	go func() {
+		_, popOk := f.Pop()
+		done <- popOk
+	}()
+
+	// Confirm worker 2 is blocking (not immediately returning false).
+	select {
+	case result := <-done:
+		t.Fatalf("second Pop returned immediately with ok=%v, want it to block (queue empty but worker active)", result)
+	case <-time.After(100 * time.Millisecond):
+		// Expected: worker 2 is blocked.
+	}
+
+	// Worker 1 pushes a child URL, then marks idle.
+	f.Push([]urlEntry{{URL: "https://example.com/child", Depth: 1}})
+	f.MarkIdle()
+
+	// Worker 2 should now unblock with the child URL.
+	select {
+	case popOk := <-done:
+		if !popOk {
+			t.Error("second Pop returned false after child pushed, want true")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Pop did not unblock after child URL pushed + MarkIdle")
+	}
+	// Worker 2 consumed the child; frontier now idle.
 	f.MarkIdle()
 }
 
 func TestFrontier_ActiveWorkerPreventsEarlyDone(t *testing.T) {
 	f := newURLFrontier(10, nil)
 
-	// Push one URL, pop it, mark active
+	// Push one URL; Pop atomically marks this worker active — no separate MarkActive needed.
 	f.Push([]urlEntry{{URL: "https://example.com/start", Depth: 0}})
 	_, ok := f.Pop()
 	if !ok {
 		t.Fatal("Pop returned false, expected URL")
 	}
-	f.MarkActive()
+	// active==1 here because Pop incremented it atomically.
 
 	// Another goroutine tries to Pop — should block because a worker is active
 	done := make(chan bool, 1)
@@ -279,7 +387,7 @@ func TestFrontier_ActiveWorkerPreventsEarlyDone(t *testing.T) {
 
 	// Active worker discovers a new URL
 	f.Push([]urlEntry{{URL: "https://example.com/discovered", Depth: 1}})
-	f.MarkIdle()
+	f.MarkIdle() // worker 1 done (active goes 1→0, but Push unblocked worker 2 already)
 
 	select {
 	case popOk := <-done:
@@ -289,4 +397,6 @@ func TestFrontier_ActiveWorkerPreventsEarlyDone(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Pop did not return after worker pushed URL and marked idle")
 	}
+	// Worker 2 consumed the discovered URL (active incremented by its Pop).
+	f.MarkIdle()
 }

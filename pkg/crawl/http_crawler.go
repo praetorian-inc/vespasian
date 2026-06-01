@@ -138,7 +138,9 @@ func (c *HTTPCrawler) runWorker(
 		if !ok {
 			return
 		}
-		frontier.MarkActive()
+		// MarkActive is NOT called here: Pop atomically increments the active
+		// counter before returning, making dequeue+activate a single critical
+		// section. Callers only need MarkIdle() after processing completes.
 
 		observed, links := c.fetchPage(ctx, client, limiter, entry)
 
