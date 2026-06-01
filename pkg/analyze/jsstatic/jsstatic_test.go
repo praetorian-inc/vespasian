@@ -706,12 +706,12 @@ func TestAnalyze_SourcemapSourceTimeout(t *testing.T) {
 // parse time and PerBundleTimeout that made the previous fallback assertion
 // necessary.
 func TestAnalyze_SourcemapSourcePerSourceTimeout(t *testing.T) {
-	// Inject a delay ONLY for sourcemap-source extractions. The delay is 50ms,
-	// much longer than the 10ms PerBundleTimeout set below but short enough for
+	// Inject a delay ONLY for sourcemap-source extractions. The delay is 500ms,
+	// much longer than the 100ms PerBundleTimeout set below but short enough for
 	// a real test run.
 	testInjectDelay = func(loc string) {
 		if loc == "sourcemap-source" {
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(500 * time.Millisecond)
 		}
 	}
 	defer func() { testInjectDelay = nil }()
@@ -726,12 +726,13 @@ func TestAnalyze_SourcemapSourcePerSourceTimeout(t *testing.T) {
 	bundleBody := `fetch("/api/from-bundle")` + "\n//# sourceMappingURL=" + dataURI
 	cap := makeJSCapture("https://h/app.js", bundleBody)
 
-	// PerBundleTimeout=10ms: gives the tiny bundle parse (typically <1ms on any
-	// supported platform) plenty of margin to complete, while remaining far shorter
-	// than the 50ms delay injected for sourcemap-source extractions. The 5:1 ratio
-	// makes the test robust against slow CI environments.
+	// PerBundleTimeout=100ms: gives the tiny bundle parse (typically <1ms on any
+	// supported platform, but far slower under -race on a loaded CI runner) plenty
+	// of margin to complete, while remaining far shorter than the 500ms delay
+	// injected for sourcemap-source extractions. The 5:1 ratio makes the test
+	// robust against slow CI environments.
 	res, err := Analyze(context.Background(), []crawl.ObservedRequest{cap}, Options{
-		PerBundleTimeout: 10 * time.Millisecond,
+		PerBundleTimeout: 100 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("Analyze error: %v", err)
