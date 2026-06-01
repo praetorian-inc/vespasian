@@ -258,6 +258,32 @@ func TestRedirectScopeGuard_AllowsInScopeRedirect(t *testing.T) {
 	}
 }
 
+// TestRedirectScopeGuard_ScopeFnDecides directly exercises the security branch
+// (scopeFn != nil): an out-of-scope redirect target must be rejected, while an
+// in-scope target must be allowed. The other guard tests use a nil scopeFn, so
+// without this the reject branch (http_crawler.go) was never asserted (TEST-001).
+func TestRedirectScopeGuard_ScopeFnDecides(t *testing.T) {
+	// scopeFn allows only example.com.
+	scopeFn := func(raw string) bool { return strings.Contains(raw, "example.com") }
+	guard := redirectScopeGuard(scopeFn)
+
+	// Out-of-scope target → rejected.
+	offReq, _ := http.NewRequest(http.MethodGet, "https://attacker.test/x", nil)
+	err := guard(offReq, []*http.Request{})
+	if err == nil {
+		t.Fatal("expected off-scope redirect to be blocked, got nil")
+	}
+	if !strings.Contains(err.Error(), "out-of-scope") {
+		t.Errorf("error = %q, want 'out-of-scope'", err.Error())
+	}
+
+	// In-scope target → allowed.
+	inReq, _ := http.NewRequest(http.MethodGet, "https://example.com/y", nil)
+	if err := guard(inReq, []*http.Request{}); err != nil {
+		t.Errorf("in-scope redirect rejected by scopeFn guard: %v", err)
+	}
+}
+
 // TestHTTPCrawler_SSRFRedirectBlocked verifies that a 302 redirect to a
 // private IP (127.0.0.1 on a different port) is blocked by the redirect
 // scope guard. No result entry for the redirected host/port should appear,
@@ -393,51 +419,25 @@ func TestHTTPCrawler_ConcurrentWorkers(t *testing.T) {
 	}
 }
 
-// TestHTTPCrawler_SSRFDialGuardRejectsPrivateIP verifies that when
-// AllowPrivate is false, the DialContext SSRF guard rejects connections whose
-// host resolves to a private IP at dial time — even if the upfront scope check
-// is bypassed (DNS-rebinding TOCTOU). We exercise the private-IP rejection by
-// pointing directly at 127.0.0.1, which is a loopback address.
+// TestHTTPCrawler_SSRFDialGuardRejectsPrivateIP verifies that the DialContext
+// SSRF guard rejects connections whose host resolves to a private IP at dial
+// time — even if the upfront scope check is bypassed (DNS-rebinding TOCTOU).
+// The assertion is specific: it requires the guard's own "blocked: ... private
+// IP" error, so the test FAILS (rather than passing on a connection-refused) if
+// the guard is ever removed (TEST-002).
 func TestHTTPCrawler_SSRFDialGuardRejectsPrivateIP(t *testing.T) {
-	// A server on a private IP (127.0.0.1) that we will try to reach.
-	victim := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, "should not be reached")
-	}))
-	defer victim.Close()
-
-	// The seed page is served on the same test server; it will link to the victim.
-	// The victim URL uses 127.0.0.1 explicitly (private IP).
-	var stderr bytes.Buffer
-	c := &HTTPCrawler{opts: CrawlerOptions{
-		Depth:        2,
-		MaxPages:     5,
-		Timeout:      5 * time.Second,
-		Stderr:       &stderr,
-		AllowPrivate: false, // SSRF guard active
-	}}
-
-	// Attempt to crawl the victim's 127.0.0.1 URL directly. The frontier scope
-	// check will also block it, so this tests both the upfront and dial-time
-	// checks. The seed itself resolves to a private IP so it will be rejected.
-	_, _ = c.Crawl(context.Background(), victim.URL)
-
-	// No result should contain the private-IP host.
-	// The crawl should return without panic and without visiting the victim.
-	// (The seed is rejected, stderr may or may not have output depending on path.)
-
-	// Now test the SSRF dial guard function directly with a private IP address.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
+
 	conn, err := ssrfSafeDialContext(ctx, "tcp", "127.0.0.1:80")
 	if err == nil {
 		_ = conn.Close()
-		t.Error("ssrfSafeDialContext: expected error for private IP 127.0.0.1, got nil")
+		t.Fatal("ssrfSafeDialContext: expected error for private IP 127.0.0.1, got nil")
 	}
-	if err != nil && !strings.Contains(err.Error(), "private") && !strings.Contains(err.Error(), "blocked") {
-		// Accept any error that indicates the dial was rejected for SSRF reasons.
-		// A connection refused error would also indicate the guard is not the problem.
-		// Only fail if the connection succeeded (handled above).
-		t.Logf("ssrfSafeDialContext returned error (expected): %v", err)
+	// Must be the guard's rejection, NOT a generic dial/connection-refused error —
+	// otherwise the test would pass even if the SSRF guard were deleted.
+	if !strings.Contains(err.Error(), "blocked") || !strings.Contains(err.Error(), "private IP") {
+		t.Errorf("expected SSRF guard rejection ('blocked: ... private IP'), got: %v", err)
 	}
 }
 

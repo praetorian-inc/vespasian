@@ -77,11 +77,20 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	// mis-wired on a future code path (SEC-BE-001).
 	transport := http.DefaultTransport
 	if !c.opts.AllowPrivate {
-		// Wire a custom Transport whose DialContext re-resolves and re-validates
-		// IPs at connect time, closing the DNS-rebinding TOCTOU window (SEC-BE-002).
-		transport = &http.Transport{
-			DialContext: ssrfSafeDialContext,
+		// Clone DefaultTransport and override only DialContext so we keep its
+		// TLS, keep-alive, HTTP/2, proxy, and idle-connection tunings while
+		// re-resolving and re-validating IPs at connect time, closing the
+		// DNS-rebinding TOCTOU window (SEC-BE-002).
+		base, ok := http.DefaultTransport.(*http.Transport)
+		if !ok {
+			// Defensive: stdlib always sets *http.Transport, but if a future
+			// runtime changes that, fall back to a fresh transport rather than
+			// silently dropping the SSRF dial guard.
+			base = &http.Transport{}
 		}
+		t := base.Clone()
+		t.DialContext = ssrfSafeDialContext
+		transport = t
 	}
 	client := &http.Client{
 		CheckRedirect: redirectScopeGuard(scopeFn),
