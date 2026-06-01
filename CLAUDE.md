@@ -66,7 +66,7 @@ The CLI (`cmd/vespasian`) uses Kong for argument parsing. Each command (crawl, i
 ### Key Packages
 
 - **cmd/vespasian**: CLI entry point, command definitions, signal handling, browser lifecycle management
-- **pkg/crawl**: Headless browser crawling via Katana, capture file I/O (`ObservedRequest` JSON format), browser manager with Chrome lifecycle, and the post-crawl JS-replay step (`ReplayJSExtracted`) that rescans captured JS bundles for API paths and probes them with raw HTTP under same-origin and SSRF protections
+- **pkg/crawl**: Headless browser crawling via Katana, capture file I/O (`ObservedRequest` JSON format), browser manager with Chrome lifecycle, and the post-crawl JS-replay step (`ReplayJSExtracted`) that rescans captured JS bundles for API paths and probes them with raw HTTP under same-origin and SSRF protections. The extractor reconstructs paths from quoted strings, template literals, full URLs, service-prefix concatenation, and `String.prototype.concat`/`+`-string concatenation (substituting a numeric sentinel for non-literal operands so the path stays probeable and parameterizable)
 - **pkg/ssrf**: Leaf package providing `ValidateURL` and `SafeDialContext` for SSRF protection (rejects private/loopback/link-local destinations and re-resolves at connect time to defeat DNS rebinding); imported by both `pkg/probe` and `pkg/crawl`
 - **pkg/analyze**: Static analysis of captured HTML response bodies; extracts `<form>` endpoints and parameter names as synthetic `ObservedRequest` entries (`Source="static:html"`) to surface form-based APIs not triggered during crawl
 - **pkg/classify**: Request classification engine with confidence-based heuristics; classifiers for REST, GraphQL, and WSDL; deduplication

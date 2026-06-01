@@ -162,6 +162,23 @@ func TestExtractAPIPaths(t *testing.T) {
 			},
 		},
 		{
+			name: "concat with identifier (LAB-1368)",
+			js: `
+				fetch("/api/posts/".concat(id, "/comment"));
+				fetch("/api/users/" + uid + "/profile");
+			`,
+			want: []string{
+				// "/api/posts/" (concat receiver) and "/api/users/" (+-chain
+				// head literal) are both picked up by Strategy 1 as plain
+				// quoted strings; the reconstructed concat/plus paths are
+				// the new contribution from Strategy 5. Both forms coexist.
+				"/api/posts",
+				"/api/posts/0/comment",
+				"/api/users",
+				"/api/users/0/profile",
+			},
+		},
+		{
 			name: "mixed strategies",
 			js: `
 				"identity/"+"api/auth/login"
@@ -206,6 +223,645 @@ func TestExtractAPIPaths_TemplateLiteralInterpolation(t *testing.T) {
 		"/api/users/{param}/profile",
 		"/api/v2/items/{param}/comments/{param}",
 	}, got)
+}
+
+func TestExtractConcatPaths(t *testing.T) {
+	tests := []struct {
+		name string
+		js   string
+		want []string
+	}{
+		{
+			name: "ticket example: concat with identifier",
+			js:   `fetch("/api/posts/".concat(id, "/comment"));`,
+			want: []string{"/api/posts/0/comment"},
+		},
+		{
+			name: "concat with multiple identifiers",
+			js:   `axios.get("/api/posts/".concat(postId, "/comments/", commentId));`,
+			want: []string{"/api/posts/0/comments/0"},
+		},
+		{
+			name: "concat with leading identifier",
+			js:   `fetch("/api/v1/users/".concat(id));`,
+			want: []string{"/api/v1/users/0"},
+		},
+		{
+			name: "concat with template literal arg (no interp)",
+			js:   "fetch(\"/api/posts/\".concat(id, `/comment`));",
+			want: []string{"/api/posts/0/comment"},
+		},
+		{
+			name: "concat with template literal containing interp falls back to sentinel",
+			js:   "fetch(\"/api/posts/\".concat(`${id}`, \"/comment\"));",
+			want: []string{"/api/posts/0/comment"},
+		},
+		{
+			name: "pure literal concat is kept",
+			js:   `fetch("/api/posts/".concat("recent"));`,
+			want: []string{"/api/posts/recent"},
+		},
+		{
+			name: "concat with method call argument",
+			js:   `fetch("/api/v2/users/".concat(getUserId(), "/profile"));`,
+			want: []string{"/api/v2/users/0/profile"},
+		},
+		{
+			name: "concat with expression argument (ternary)",
+			js:   `fetch("/api/items/".concat(active ? a : b, "/x"));`,
+			want: []string{"/api/items/0/x"},
+		},
+		{
+			name: "concat with no API indicator dropped",
+			js:   `"foo".concat(bar, "/baz");`,
+			want: nil,
+		},
+		{
+			// Pins the query-syntax receiver class — concatMethodPattern's
+			// receiver allows `?=&%~` (unlike concatPlusHeadPattern's head),
+			// the sole behavioral difference between the two regexes. Without
+			// this test a regex change narrowing the receiver class would
+			// silently drop query-bearing .concat() endpoints with the rest
+			// of the suite still green.
+			name: "concat receiver with query syntax is preserved",
+			js:   `fetch("/api/users?id=".concat(uid));`,
+			want: []string{"/api/users?id=0"},
+		},
+		{
+			// Indicator-in-argument: receiver has NO API marker but an
+			// argument does. concatMethodPattern intentionally does NOT
+			// anchor the receiver on an API indicator so this case is
+			// still recovered (the post-hoc hasAPIIndicator filter in emit()
+			// passes because the reconstructed path contains "api/").
+			name: "concat with API indicator only in argument is kept",
+			js:   `fetch("svc/".concat("api/v2/items"));`,
+			// extractConcatPaths emits the raw reconstruction; the leading
+			// slash is added later by addPath in extractAPIPaths.
+			want: []string{"svc/api/v2/items"},
+		},
+		{
+			name: "concat with empty arg list — receiver lacking API indicator dropped",
+			js:   `"foo".concat();`,
+			want: nil,
+		},
+		{
+			name: "concat with empty arg list keeps API-indicator receiver",
+			js:   `"/api/v2/users".concat();`,
+			want: []string{"/api/v2/users"},
+		},
+		{
+			name: "plus chain with identifier",
+			js:   `fetch("/api/users/" + id + "/posts");`,
+			want: []string{"/api/users/0/posts"},
+		},
+		{
+			name: "plus chain with multiple identifiers",
+			js:   `fetch("/api/users/" + uid + "/posts/" + pid + "/likes");`,
+			want: []string{"/api/users/0/posts/0/likes"},
+		},
+		{
+			name: "plus chain head without API indicator ignored",
+			js:   `fetch("foo/" + id + "/bar");`,
+			want: nil,
+		},
+		{
+			name: "plus chain stops at semicolon",
+			js:   `var u = "/api/v2/posts/" + id; doOther();`,
+			want: []string{"/api/v2/posts/0"},
+		},
+		{
+			name: "plus chain stops at newline without trailing +",
+			js:   "var u = \"/api/v2/posts/\" + id\nvar v = 1;\n",
+			want: []string{"/api/v2/posts/0"},
+		},
+		{
+			name: "plus chain continues across newline after +",
+			js:   "var u = \"/api/v2/posts/\" + id +\n  \"/comment\";\n",
+			want: []string{"/api/v2/posts/0/comment"},
+		},
+		{
+			name: "plus chain with method-call operand",
+			js:   `var u = "/api/v2/posts/" + post.getId() + "/comment";`,
+			want: []string{"/api/v2/posts/0/comment"},
+		},
+		{
+			name: "concat and plus together (dedup across forms)",
+			js: `
+				fetch("/api/posts/".concat(id, "/comment"));
+				var p = "/api/posts/" + id + "/comment";
+			`,
+			want: []string{"/api/posts/0/comment"},
+		},
+		{
+			name: "both forms in one file emit different paths",
+			js: `
+				fetch("/api/posts/".concat(id, "/comment"));
+				var p = "/api/users/" + uid + "/profile";
+			`,
+			want: []string{"/api/posts/0/comment", "/api/users/0/profile"},
+		},
+		{
+			name: "minified concat",
+			js:   `function r(i){return"/api/posts/".concat(i,"/comment")}`,
+			want: []string{"/api/posts/0/comment"},
+		},
+		{
+			name: "minified plus",
+			js:   `function r(i){return"/api/posts/"+i+"/comment"}`,
+			want: []string{"/api/posts/0/comment"},
+		},
+		{
+			name: "concat receiver is non-literal (member access) ignored",
+			js:   `obj.url.concat(id, "/x");`,
+			want: nil,
+		},
+		{
+			name: "no concatenation expressions present",
+			js:   `fetch("/api/v2/users");`,
+			want: nil,
+		},
+		{
+			name: "concat with nested call containing comma",
+			js:   `fetch("/api/posts/".concat(foo(a, b), "/x"));`,
+			want: []string{"/api/posts/0/x"},
+		},
+		{
+			name: "concat with array literal arg containing comma",
+			js:   `fetch("/api/posts/".concat([a, b].join("/"), "/x"));`,
+			want: []string{"/api/posts/0/x"},
+		},
+		{
+			name: "concat path with whitespace inside literal reconstruction is dropped",
+			js:   `fetch("/api/posts/".concat(id, " /comment"));`,
+			want: nil,
+		},
+		{
+			// LAB-1368 iteration-4 regression: literal+literal +-chain where
+			// the head literal ends in `/` and the next literal begins with
+			// `/`. emit() must collapse the `//` so probes don't issue
+			// malformed `/api/posts//comment` requests and the REST
+			// normalizer doesn't produce `//{postId}` segments.
+			name: "double-slash from literal+literal +-chain is collapsed in emit",
+			js:   `fetch("/api/posts/" + "/comment");`,
+			want: []string{"/api/posts/comment"},
+		},
+		{
+			// Confirm the collapse preserves the `://` scheme separator.
+			// A receiver containing https:// must not have its scheme
+			// flattened to `https:/`.
+			name: "double-slash collapse preserves URL scheme separator",
+			js:   `fetch("https://api.example.com/api/posts/".concat("/x"));`,
+			want: []string{"https://api.example.com/api/posts/x"},
+		},
+		// Note: the operand-count cap is exercised in its own dedicated
+		// test, TestExtractConcatPaths_PlusChainCap, which pins the
+		// constant by name. A skip-shim row used to live here as a
+		// placeholder; it was removed in iteration-4 since the dedicated
+		// test is the canonical lock.
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractConcatPaths([]byte(tt.js))
+			sort.Strings(got)
+			sort.Strings(tt.want)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestExtractConcatPaths_PlusChainCap asserts that a `+`-chain longer than
+// maxConcatChainOperands is bounded — we walk EXACTLY maxConcatChainOperands
+// operands and stop, regardless of how many `+` segments the bundle contains.
+//
+// The chain length and the expected sentinel count are derived from
+// maxConcatChainOperands by name so the test re-pins automatically if the
+// constant is tuned. Operand count > maxConcatChainOperands forces the cap
+// to be exercised (we cannot prove the cap fired by asserting on the
+// prefix alone — an off-by-one regression or a relaxed cap would still
+// produce a "/api/posts/0/..." prefix).
+func TestExtractConcatPaths_PlusChainCap(t *testing.T) {
+	// Build a `+`-chain with twice as many identifier operands as the cap
+	// allows. Each operand is a single-character identifier so it produces
+	// exactly one sentinel byte and total span stays well under
+	// maxConcatChainSpan — this isolates the operand-count cap from the
+	// byte-span cap (which is exercised separately by TestParsePlusChain).
+	operands := maxConcatChainOperands * 2
+	var sb strings.Builder
+	sb.WriteString(`var u = "/api/posts/"`)
+	for i := 0; i < operands; i++ {
+		sb.WriteString(` + x`)
+	}
+	sb.WriteString(`;`)
+
+	got := extractConcatPaths([]byte(sb.String()))
+	assert.Len(t, got, 1, "should still emit one bounded path")
+
+	// With only identifier operands, every walked operand contributes
+	// exactly one sentinel byte. After the head literal "/api/posts/" and
+	// trailing-slash trim by addPath, the reconstructed path is
+	//   /api/posts/ + concatPathSentinel * maxConcatChainOperands
+	// regardless of how many extra `+ x` segments the bundle contained.
+	want := "/api/posts/" + strings.Repeat(concatPathSentinel, maxConcatChainOperands)
+	assert.Equal(t, want, got[0],
+		"cap should have stopped the walk at exactly maxConcatChainOperands operands")
+}
+
+// TestParsePlusChain exercises parsePlusChain directly across every
+// termination branch + the new byte-span cap. parsePlusChain is reached
+// only via the package-level extractConcatPaths path in production, but
+// each termination mode is worth pinning so a future change to the loop
+// shape cannot silently shrink the recovered suffix.
+func TestParsePlusChain(t *testing.T) {
+	tests := []struct {
+		name string
+		// input format: caller passes the byte index *after* the head
+		// literal + first `+`; we set start to the position right after
+		// the leading `<HEAD> +` (mimicking the extractConcatPaths call site).
+		src   string
+		start int
+		want  string
+	}{
+		{
+			name:  "happy path: ident + literal",
+			src:   ` x + "/end";`,
+			start: 0,
+			want:  "0/end",
+		},
+		{
+			name:  "trailing + at EOF bails on next operand",
+			src:   ` x +`,
+			start: 0,
+			want:  "0",
+		},
+		{
+			name:  "missing connecting + after first operand",
+			src:   ` x ; rest`,
+			start: 0,
+			want:  "0",
+		},
+		{
+			name:  "malformed operand at start returns empty",
+			src:   ` ; ; ;`,
+			start: 0,
+			want:  "",
+		},
+		{
+			name:  "EOF after head + (start past end of buffer)",
+			src:   ``,
+			start: 0,
+			want:  "",
+		},
+		{
+			name: "operand-count cap hits at maxConcatChainOperands",
+			// build operands = cap + 1 so we know the cap is hit
+			src: func() string {
+				var sb strings.Builder
+				for i := 0; i <= maxConcatChainOperands; i++ {
+					sb.WriteString(` x +`)
+				}
+				return sb.String()
+			}(),
+			start: 0,
+			want:  strings.Repeat("0", maxConcatChainOperands),
+		},
+		{
+			name: "byte-span cap bounds huge first-operand walk (slice clamp)",
+			// First operand opens with `(` and contains > maxConcatChainSpan
+			// bytes of filler with no matching `)` reachable inside the
+			// clamped slice. Without the slice clamp scanIdentifierOperand
+			// would walk to end-of-body looking for a depth-0 terminator;
+			// with the clamp it stops at start+maxConcatChainSpan.
+			//
+			// Note: this is the iteration-3 regression test for the
+			// previously-incomplete fix where the byte-span guard fired
+			// only on iteration 1+, leaving iteration 0 unbounded.
+			src:   " (" + strings.Repeat("a", maxConcatChainSpan+200) + ") + \"/tail\";",
+			start: 0,
+			want:  "0",
+		},
+		{
+			name: "byte-span boundary: operand exactly maxConcatChainSpan-1 bytes is consumed; trailing tail unreachable",
+			// Operand length is exactly span-2 chars between leading space
+			// and trailing `;`, so the operand walk fits but no characters
+			// remain inside the slice for the connecting `+` or next operand.
+			src:   " " + strings.Repeat("a", maxConcatChainSpan-2) + ` + "/tail";`,
+			start: 0,
+			// Operand consumed as identifier (sentinel); slice ends before
+			// the connecting `+`, so the connector check fails.
+			want: "0",
+		},
+		{
+			name:  "EOF-on-connector branch: operand followed by clean EOF (no trailing space, no +)",
+			src:   ` x`,
+			start: 0,
+			// Operand read, pos advances to end-of-slice, the
+			// `pos >= len(body)` half of the connector check fires
+			// (NOT the `body[pos] != '+'` half — there is no body[pos]).
+			want: "0",
+		},
+		{
+			name:  "non-plus-on-connector branch: operand followed by ',' explicitly tests the body[pos] != '+' half",
+			src:   ` x, rest`,
+			start: 0,
+			want:  "0",
+		},
+		{
+			name:  "backtick template literal operand without interpolation kept verbatim",
+			src:   " `xyz` + \"/end\";",
+			start: 0,
+			want:  "xyz/end",
+		},
+		{
+			name:  "backtick template literal operand with interpolation falls back to sentinel",
+			src:   " `${x}` + \"/end\";",
+			start: 0,
+			want:  "0/end",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parsePlusChain([]byte(tt.src), tt.start)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestParsePlusChain_BoundaryPin proves the byte-span cap is enforced by
+// SLICE CLAMP at the parsePlusChain entry point. The test input uses a
+// CLOSED bracket `(aaa...a)` whose matching `)` sits PAST the clamp; the
+// bracket is followed by `+ "/tail"` — a literal that the parser would
+// recover into the suffix if (and only if) the scan was permitted to
+// walk past the clamp to find the `)`.
+//
+// Mutation check: comment out the `body := jsBody[:limit]` line in
+// parsePlusChain and re-run. Without the clamp, scanIdentifierOperand
+// walks past the matching `)`, hits the `+` after it, the chain
+// continues, and `/tail` is recovered → assertion fails. This is what
+// the iteration-3 test was missing (it used an UNCLOSED bracket, where
+// scanIdentifierOperand walks to EOF either way and the test passes
+// trivially with or without the clamp).
+func TestParsePlusChain_BoundaryPin(t *testing.T) {
+	// Bracket length: maxConcatChainSpan+100 bytes; `(` at position 1 and
+	// `)` at position span+101 (well past the clamp at position span).
+	// Followed by ` + "/tail";`. Total src length ~ span+114 bytes.
+	src := " (" + strings.Repeat("a", maxConcatChainSpan+100) + `) + "/tail";`
+	got := parsePlusChain([]byte(src), 0)
+
+	// With clamp: scan stops at slice end (inside bracket) → sentinel only.
+	// Without clamp: scan walks past `)`, consumes `+`, reads `"/tail"` →
+	// suffix is "0/tail".
+	assert.Equal(t, concatPathSentinel, got,
+		"slice-clamp regression: removing `body := jsBody[:limit]` lets the "+
+			"chain walk past the bracket boundary and recover /tail")
+}
+
+// TestExtractConcatPaths_FirstOperandBoundedAtChainSpan is the
+// integration-level regression test for the slice clamp. Same
+// closed-bracket-past-clamp pattern as the BoundaryPin test above, but
+// going through the full extractConcatPaths entry point so the assertion
+// also covers the head-literal + parsePlusChain wiring + emit() filter.
+//
+// Mutation check: remove the slice clamp from parsePlusChain and re-run.
+// Without the clamp, the suffix recovers "/tail" and the emitted path
+// changes from "/api/users/0" to "/api/users/0/tail" → assertion fails.
+//
+// Renamed from TestExtractConcatPaths_HugeFirstOperand (which used a
+// wall-clock budget too generous to catch the regression, per iteration-4
+// review feedback). The behavioral assertion here is strictly tighter
+// and CI-portable.
+func TestExtractConcatPaths_FirstOperandBoundedAtChainSpan(t *testing.T) {
+	// Closed bracket overflowing the clamp, followed by `+ "/tail"`.
+	bracket := "(" + strings.Repeat("a", maxConcatChainSpan+100) + ")"
+	src := `"/api/users/" + ` + bracket + ` + "/tail";`
+
+	got := extractConcatPaths([]byte(src))
+
+	assert.Equal(t, []string{"/api/users/" + concatPathSentinel}, got,
+		"slice-clamp regression: extractConcatPaths recovered the literal "+
+			"after the bracket — the per-operand scan walked past the clamp")
+}
+
+// TestExtractConcatPaths_FlowsThroughExtractAPIPaths verifies the new
+// strategy is wired into the orchestrator. The literal receiver of the
+// .concat() call ("/api/posts/") is independently picked up by Strategy 1
+// (apiPathPattern), so the orchestrator emits both the literal receiver
+// AND the reconstructed concat path — this is intentional: the literal
+// form might exist as a real endpoint, and the reconstructed form is the
+// new contribution from Strategy 5.
+func TestExtractConcatPaths_FlowsThroughExtractAPIPaths(t *testing.T) {
+	js := `
+		fetch("/api/posts/".concat(id, "/comment"));
+		fetch("/api/posts/recent");
+	`
+	got := extractAPIPaths([]byte(js), nil)
+	sort.Strings(got)
+	assert.Equal(t, []string{
+		"/api/posts",
+		"/api/posts/0/comment",
+		"/api/posts/recent",
+	}, got)
+}
+
+func TestFindConcatArgListEnd(t *testing.T) {
+	// Caller passes the index immediately after `(`; result is the index
+	// of the matching `)` or -1.
+	tests := []struct {
+		name string
+		src  string
+		// position of `)` we expect; if -1, scan should fail
+		want int
+	}{
+		{"empty args", `)`, 0},
+		{"simple args", `id, "/x")`, 8},
+		{"nested call", `foo(a, b), "/x")`, 15},
+		{"nested array", `[a, b], "/x")`, 12},
+		{"nested object", `{a: 1}, "/x")`, 12},
+		{"paren inside string", `")(", x)`, 7},
+		{"escaped quote", `"a\"b", x)`, 9},
+		{"unterminated string", `"a`, -1},
+		{"missing close", `id, "/x"`, -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := findConcatArgListEnd([]byte(tt.src), 0)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestFindConcatArgListEnd_BoundedByMaxConcatArgList(t *testing.T) {
+	// Build an arg list whose closing `)` sits past maxConcatArgList — the
+	// scanner must bail with -1 rather than walking the whole buffer.
+	huge := strings.Repeat("a, ", (maxConcatArgList/3)+10) + ")"
+	got := findConcatArgListEnd([]byte(huge), 0)
+	assert.Equal(t, -1, got, "should bail when matching ) is past the cap")
+}
+
+func TestScanStringLiteral(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		want int // index of closing quote, or -1
+	}{
+		{"double quote", `"abc"`, 4},
+		{"single quote", `'abc'`, 4},
+		{"backtick", "`abc`", 4},
+		{"escape", `"a\"b"`, 5},
+		{"unterminated double", `"abc`, -1},
+		{"newline terminates double", "\"abc\nrest", -1},
+		{"unterminated single", `'abc`, -1},
+		{"backtick with interp", "`a${x}b`", 7},
+		{"backtick unterminated", "`abc", -1},
+		{"empty input", ``, -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := scanStringLiteral([]byte(tt.src), 0)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestScanIdentifierOperand(t *testing.T) {
+	// Returns the end index (exclusive) of the operand starting at 0.
+	tests := []struct {
+		name string
+		src  string
+		want int
+	}{
+		{"plain ident", `id+`, 2},
+		{"ident with dot", `obj.id+`, 6},
+		{"call", `foo()+`, 5},
+		{"call with comma", `foo(a, b)+`, 9},
+		{"index expr", `arr[i]+`, 6},
+		{"object expr", `{k: 1}+`, 6},
+		{"string literal in operand", `x("/a")+`, 7},
+		{"backtick literal in operand", "x(`a`)+", 6},
+		{"terminate semicolon", `id;`, 2},
+		{"terminate comma", `id,`, 2},
+		{"terminate newline", "id\n", 2},
+		{"terminate cr", "id\r", 2},
+		{"terminate close paren outside depth", `id)`, 2},
+		{"terminate close bracket outside depth", `id]`, 2},
+		{"terminate close brace outside depth", `id}`, 2},
+		// Unterminated string inside operand: scan bails at the offending
+		// quote position rather than walking off the end of input.
+		{"unterminated string bails", `x("`, 2},
+		{"all the way to EOF", `idEOF`, 5},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := scanIdentifierOperand([]byte(tt.src), 0)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestReadChainOperand_StringLiteralPaths(t *testing.T) {
+	// String literal operand → unquoted text; non-literal → sentinel.
+	got, end, ok := readChainOperand([]byte(`"abc"+`), 0)
+	assert.True(t, ok)
+	assert.Equal(t, "abc", got)
+	assert.Equal(t, 5, end)
+
+	got, _, ok = readChainOperand([]byte(`id+`), 0)
+	assert.True(t, ok)
+	assert.Equal(t, concatPathSentinel, got)
+
+	// Backtick with interpolation → sentinel (not unquoted).
+	got, _, ok = readChainOperand([]byte("`${x}`+"), 0)
+	assert.True(t, ok)
+	assert.Equal(t, concatPathSentinel, got)
+
+	// Empty input → not ok.
+	_, _, ok = readChainOperand(nil, 0)
+	assert.False(t, ok)
+
+	// Unterminated string at start → not ok.
+	_, _, ok = readChainOperand([]byte(`"abc`), 0)
+	assert.False(t, ok)
+}
+
+func TestParseConcatArgs(t *testing.T) {
+	tests := []struct {
+		name    string
+		argList string
+		want    string
+	}{
+		{"single ident", "id", "0"},
+		{"single literal", `"abc"`, "abc"},
+		{"single literal single-quoted", `'abc'`, "abc"},
+		{"single backtick literal", "`abc`", "abc"},
+		{"backtick with interp falls back", "`${x}`", "0"},
+		{"ident then literal", `id, "/x"`, "0/x"},
+		{"literal then ident", `"/a", id`, "/a0"},
+		{"three args mixed", `a, "/b/", c`, "0/b/0"},
+		{"trailing whitespace ok", ` id , "/x" `, "0/x"},
+		{"empty arg list", ``, ""},
+		{"only commas drops empties", `,,,`, ""},
+		{"function call arg", `foo(a, b)`, "0"},
+		{"array arg", `[a, b]`, "0"},
+		{"object arg", `{a: 1}`, "0"},
+		{"nested literal inside function arg", `foo("/x")`, "0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseConcatArgs(tt.argList)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestStringLiteralValue(t *testing.T) {
+	tests := []struct {
+		in       string
+		wantText string
+		wantOK   bool
+	}{
+		{`"abc"`, "abc", true},
+		{`'abc'`, "abc", true},
+		{"`abc`", "abc", true},
+		{"`a${x}b`", "", false},
+		{"abc", "", false},
+		{`"unterminated`, "", false},
+		{``, "", false},
+		{`"`, "", false},
+		{`""`, "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			got, ok := stringLiteralValue(tt.in)
+			assert.Equal(t, tt.wantOK, ok)
+			if ok {
+				assert.Equal(t, tt.wantText, got)
+			}
+		})
+	}
+}
+
+func TestSplitConcatArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"empty", "", nil},
+		{"single", `"a"`, []string{`"a"`}},
+		{"two", `"a", b`, []string{`"a"`, ` b`}},
+		{"comma in string", `"a, b", c`, []string{`"a, b"`, ` c`}},
+		{"comma in parens", `foo(a, b), c`, []string{`foo(a, b)`, ` c`}},
+		{"comma in array", `[a, b], c`, []string{`[a, b]`, ` c`}},
+		{"comma in object", `{a: 1, b: 2}, c`, []string{`{a: 1, b: 2}`, ` c`}},
+		{"escape in string", `"a\"b", c`, []string{`"a\"b"`, ` c`}},
+		{"backtick comma", "`a,b`, c", []string{"`a,b`", ` c`}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := splitConcatArgs(tt.in)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 func TestExtractServicePrefixes(t *testing.T) {
@@ -1014,6 +1670,76 @@ func TestReplayJSExtracted_HTMLScriptDiscovery(t *testing.T) {
 	assert.Contains(t, apiURLs, srv.URL+"/rest/user/login")
 }
 
+// TestReplayJSExtracted_ConcatStyle_EndToEnd is the end-to-end (real HTTP,
+// no Chrome) regression test for the LAB-1368 concat extraction. The replay
+// step discovers an external app.js from the captured HTML, fetches it over
+// HTTP, reconstructs paths that exist ONLY as String.prototype.concat and
+// +-operator concatenations (the dynamic operand is a real identifier, so no
+// other extraction strategy can produce the full path), probes them, and
+// keeps the 200s while dropping the 404 control. This exercises the same
+// fetch → extract → probe → 404-filter pipeline that the other strategies'
+// _EndToEnd tests cover, but for Strategy 5.
+func TestReplayJSExtracted_ConcatStyle_EndToEnd(t *testing.T) {
+	// .concat() form, +-chain form, and a concat form whose reconstructed
+	// path 404s (control for the filter). None of the full paths appear as
+	// quoted literals — only the concat extractor can reconstruct them.
+	const appJS = `
+		function loadOrders(uid)  { return fetch("/api/users/".concat(uid, "/orders")); }
+		function loadReviews(pid) { var u = "/api/products/" + pid + "/reviews"; return fetch(u); }
+		function loadGone(x)      { return fetch("/api/missing/".concat(x, "/gone")); }
+	`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			w.Write([]byte(appJS)) //nolint:errcheck,gosec // test handler
+		case "/api/users/0/orders":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"orders":[]}`)) //nolint:errcheck,gosec // test handler
+		case "/api/products/0/reviews":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"reviews":[]}`)) //nolint:errcheck,gosec // test handler
+		// /api/missing/0/gone falls through to the 404 default.
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	// Capture: an HTML page referencing the external app.js (mirrors a real
+	// crawl). The replay step fetches app.js from the live server itself.
+	requests := []ObservedRequest{
+		{
+			Method: "GET",
+			URL:    srv.URL + "/",
+			Source: "katana",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<!DOCTYPE html><html><head><script src="app.js"></script></head></html>`),
+			},
+		},
+	}
+
+	cfg := allowLocal(srv)
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	var jsExtracted []string
+	for _, r := range result {
+		if r.Source == "js-extract" {
+			jsExtracted = append(jsExtracted, r.URL)
+		}
+	}
+	// Both reconstructed concat paths are probed and kept (200).
+	assert.Contains(t, jsExtracted, srv.URL+"/api/users/0/orders",
+		"String.prototype.concat path must be reconstructed, probed, and kept")
+	assert.Contains(t, jsExtracted, srv.URL+"/api/products/0/reviews",
+		"+-chain path must be reconstructed, probed, and kept")
+	// The reconstructed concat path that 404s must be dropped by the filter.
+	assert.NotContains(t, jsExtracted, srv.URL+"/api/missing/0/gone",
+		"a reconstructed concat path that 404s must be dropped")
+}
+
 func TestAddPath_RejectsURLCredentials(t *testing.T) {
 	// SEC-BE-003: full URLs with embedded credentials must be dropped.
 	js := []byte(`"http://user:pass@evil.example.com/api/v1/exfil"`)
@@ -1254,6 +1980,104 @@ func TestJSReplayConfig_WithDefaults_AllowPrivateBypassesDialer(t *testing.T) {
 	if err != nil {
 		assert.NotContains(t, err.Error(), "blocked private",
 			"AllowPrivate=true must not produce SSRF blocking errors")
+	}
+}
+
+// TestSplitConcatArgs_NestedBacktick verifies that a backtick template
+// literal whose ${} interpolation itself contains a backtick-quoted string
+// is treated as a single top-level argument and is not split at the inner
+// backtick or at any comma inside the ${} block.
+func TestSplitConcatArgs_NestedBacktick(t *testing.T) {
+	// argList represents the raw argument list (between the outer parens) of:
+	//   str.concat(`${fn(`inner`)}`, "/x")
+	// The inner backtick inside ${...} must not close the outer template
+	// literal prematurely.
+	argList := "`${fn(`inner`)}`, \"/x\""
+	got := splitConcatArgs(argList)
+	require.Len(t, got, 2, "template literal with nested backtick must be a single top-level arg")
+	assert.Equal(t, "`${fn(`inner`)}`", got[0], "first arg must be the whole template literal")
+	assert.Equal(t, " \"/x\"", got[1], "second arg must be the path literal")
+}
+
+// TestExtractConcatPaths_PerBundleCap verifies that extractConcatPaths
+// emits at most maxConcatPathsPerBundle paths from a single JS bundle,
+// even when the bundle contains far more distinct concat-built API paths.
+func TestExtractConcatPaths_PerBundleCap(t *testing.T) {
+	// Build a bundle with maxConcatPathsPerBundle*2 distinct concat paths.
+	var sb strings.Builder
+	total := maxConcatPathsPerBundle * 2
+	for i := 0; i < total; i++ {
+		fmt.Fprintf(&sb, `"/api/endpoint%d/".concat(x);`, i)
+	}
+	got := extractConcatPaths([]byte(sb.String()))
+	assert.Equal(t, maxConcatPathsPerBundle, len(got),
+		"extractConcatPaths must not exceed maxConcatPathsPerBundle per bundle")
+}
+
+// TestExtractConcatPaths_ConcatArgListCap verifies that a .concat() call
+// whose raw argument list exceeds maxConcatArgList bytes is skipped
+// entirely (findConcatArgListEnd returns -1). A control call with a
+// normal in-cap argument list in the same bundle must still be
+// reconstructed, proving the test exercises the cap boundary rather than
+// mere absence of any concat path.
+func TestExtractConcatPaths_ConcatArgListCap(t *testing.T) {
+	// Over-cap call: argument list exceeds maxConcatArgList bytes.
+	// Pad with a long identifier that prevents findConcatArgListEnd from
+	// finding the closing ')' within the cap window.
+	overCapArg := strings.Repeat("x", maxConcatArgList+10)
+	overCapCall := fmt.Sprintf(`"/api/x/".concat(%s)`, overCapArg)
+
+	// Control call: normal in-cap argument that must be reconstructed.
+	controlCall := `"/api/control/".concat("segment")`
+
+	body := []byte(overCapCall + ";\n" + controlCall)
+	got := extractConcatPaths(body)
+
+	// The over-cap call must produce no reconstructed path containing "/api/x/".
+	for _, p := range got {
+		assert.NotContains(t, p, "/api/x/",
+			"over-cap .concat() call must not produce a reconstructed path")
+	}
+
+	// The control call must be reconstructed.
+	found := false
+	for _, p := range got {
+		if strings.Contains(p, "/api/control/") {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "in-cap .concat() call must be reconstructed as a control")
+}
+
+// BenchmarkExtractConcatPaths_HostileBundle measures extraction CPU on a
+// dense worst-case bundle containing many concat anchors plus pathological
+// shapes (unclosed brackets, long operands). It does not assert a threshold;
+// it pins the cost so future regressions are measurable.
+func BenchmarkExtractConcatPaths_HostileBundle(b *testing.B) {
+	var sb strings.Builder
+	// Dense method-form matches.
+	for i := 0; i < 5000; i++ {
+		fmt.Fprintf(&sb, `"/api/x/".concat(a,b,"/end%d");`, i)
+	}
+	// Dense plus-chain matches.
+	for i := 0; i < 5000; i++ {
+		fmt.Fprintf(&sb, `"/api/y/" + a + "/seg%d" + b;`, i)
+	}
+	// Pathological: unclosed bracket after API anchor.
+	for i := 0; i < 1000; i++ {
+		fmt.Fprintf(&sb, `"/api/z/".concat(foo(a,b,`)
+	}
+	// Pathological: long non-literal operand (forces scanIdentifierOperand walk).
+	longIdent := strings.Repeat("a", 512)
+	for i := 0; i < 500; i++ {
+		fmt.Fprintf(&sb, `"/api/w/".concat(%s);`, longIdent)
+	}
+	body := []byte(sb.String())
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		_ = extractConcatPaths(body)
 	}
 }
 

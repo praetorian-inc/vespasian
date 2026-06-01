@@ -32,7 +32,12 @@
 // that the headless browser cannot exercise (paths gated behind user
 // interactions or built from runtime string concatenations) and bypasses
 // SPA catch-all routing that would otherwise return index.html instead of
-// API responses.
+// API responses. The extractor recognizes quoted-string paths, template
+// literals, full URLs, literal+literal `+` service-prefix concatenations,
+// and identifier-bearing concatenations using either String.prototype.concat
+// or the `+` operator (LAB-1368) — the last form reconstructs a path by
+// substituting a numeric sentinel for non-literal operands so the result is
+// probeable and the REST normalizer can parameterize it.
 //
 // Key types:
 //   - [Crawler] orchestrates a browser crawl with configurable depth,
