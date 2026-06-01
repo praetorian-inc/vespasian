@@ -337,3 +337,85 @@ func TestGenerator_Phase1_FirstValidWins(t *testing.T) {
 		t.Error("expected first valid WSDL to be returned")
 	}
 }
+
+// T018: RED — end-to-end test: generator emits <types> with extracted parameters.
+func TestGenerator_Phase2_EmitsTypesWithParameters(t *testing.T) {
+	g := &Generator{}
+	body := []byte(`<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><tns:GetUserRequest xmlns:tns="http://x/"><id>1</id></tns:GetUserRequest></soap:Body></soap:Envelope>`)
+	endpoints := []classify.ClassifiedRequest{{
+		ObservedRequest: crawl.ObservedRequest{
+			Method:  "POST",
+			URL:     "http://example.com/service",
+			Headers: map[string]string{"SOAPAction": `"urn:GetUser"`},
+			Body:    body,
+		},
+		APIType: "wsdl",
+	}}
+
+	result, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	defs, err := ParseWSDL(result)
+	if err != nil {
+		t.Fatalf("ParseWSDL() error: %v", err)
+	}
+
+	if defs.Types == nil {
+		t.Fatal("expected Types to be non-nil")
+	}
+	if len(defs.Types.Schemas) != 1 {
+		t.Fatalf("expected 1 schema, got %d", len(defs.Types.Schemas))
+	}
+	if len(defs.Types.Schemas[0].Elements) != 1 {
+		t.Fatalf("expected 1 element, got %d", len(defs.Types.Schemas[0].Elements))
+	}
+	el := defs.Types.Schemas[0].Elements[0]
+	if el.Name != "GetUser" {
+		t.Errorf("element name = %q, want GetUser", el.Name)
+	}
+	if el.ComplexType == nil || len(el.ComplexType.Sequence) != 1 {
+		t.Fatalf("expected 1 sequence element in complexType")
+	}
+	if el.ComplexType.Sequence[0].Name != "id" {
+		t.Errorf("sequence[0].Name = %q, want id", el.ComplexType.Sequence[0].Name)
+	}
+	if el.ComplexType.Sequence[0].Type != "xsd:int" {
+		t.Errorf("sequence[0].Type = %q, want xsd:int", el.ComplexType.Sequence[0].Type)
+	}
+}
+
+// T018: RED — Phase 1 passthrough is byte-identical when WSDLDocument is present.
+func TestGenerator_Phase1_NoParameterExtraction(t *testing.T) {
+	validWSDL := []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<definitions name="TestService" xmlns="http://schemas.xmlsoap.org/wsdl/">
+  <message name="GetUserRequest"><part name="parameters" element="tns:GetUser"/></message>
+  <portType name="TestPortType">
+    <operation name="GetUser"/>
+  </portType>
+</definitions>`)
+
+	body := []byte(`<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><tns:GetUserRequest xmlns:tns="http://x/"><id>1</id></tns:GetUserRequest></soap:Body></soap:Envelope>`)
+
+	g := &Generator{}
+	endpoints := []classify.ClassifiedRequest{{
+		ObservedRequest: crawl.ObservedRequest{
+			Method:  "POST",
+			URL:     "http://example.com/service",
+			Headers: map[string]string{"SOAPAction": `"urn:GetUser"`},
+			Body:    body,
+		},
+		WSDLDocument: validWSDL,
+		APIType:      "wsdl",
+	}}
+
+	result, err := g.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+	// Phase 1 must return the probed document byte-identical — no types injection.
+	if string(result) != string(validWSDL) {
+		t.Errorf("Phase 1 must return WSDLDocument byte-identical; got different output")
+	}
+}

@@ -91,7 +91,7 @@ Options:
   --targets <list>      Comma-separated targets to test (default: all)
                         Valid targets:
                           Live:       rest-api, soap-service, graphql-server
-                          Generate:   generate-rest, generate-wsdl,
+                          Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,
                                       generate-graphql, generate-graphql-imports,
                                       generate-js-static
                           Import:     import-burp, import-har, import-base64,
@@ -163,6 +163,8 @@ Results are saved to `test/.results/` with one subdirectory per test:
 │   └── spec.yaml           # OpenAPI spec from reference capture
 ├── generate-wsdl/
 │   └── spec.xml            # WSDL from reference capture
+├── generate-wsdl-matrix/
+│   └── spec.xml            # WSDL param-extraction matrix (SOAP 1.1/1.2, RPC + doc/literal)
 ├── generate-graphql/
 │   └── spec.graphql        # Deterministic SDL from reference capture
 ├── generate-graphql-imports/
