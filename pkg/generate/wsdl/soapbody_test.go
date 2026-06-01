@@ -215,8 +215,8 @@ func TestExtractSOAPParameters_NestedComplex(t *testing.T) {
 	// NT010: mixed text and children in same param: IsComplex wins, text is dropped.
 	t.Run("mixed text and children promotes to complex", func(t *testing.T) {
 		// The <user> element interleaves text ("noise") with a child element (<name>alice</name>).
-		// walkParam collects text AND recurses into children; at "done:" IsComplex=true wins
-		// and the scalar text is discarded (soapbody.go:168-170).
+		// walkParam collects text AND recurses into children; after the collect
+		// loop, IsComplex=true wins and the scalar text is discarded (walkParam).
 		body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
 			`<soap:Body><Op><user>noise<name>alice</name></user></Op></soap:Body></soap:Envelope>`
 		result := extractSOAPParameters([]byte(body))
@@ -320,7 +320,7 @@ func TestExtractSOAPParameters_XSIType(t *testing.T) {
 	})
 
 	// NT009: xsi:type matched by URI even when a non-canonical prefix is used.
-	// findXSIType (soapbody.go:178-185) matches by Name.Space == xsiNS, not by prefix.
+	// findXSIType matches by Name.Space == xsiNS, not by prefix.
 	t.Run("non-canonical xsi prefix still matched by URI", func(t *testing.T) {
 		// xmlns:foo is bound to the xsi URI; foo:type should be recognized as xsi:type.
 		body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
@@ -477,15 +477,15 @@ func TestWalkOperation_TruncatedEnvelopeReturnsPartial(t *testing.T) {
 	// tag of a second parameter (<b>) whose content and close tag are missing.
 	// The XML decoder emits StartElement "b" before hitting EOF, so walkParam
 	// is invoked for "b" and it is registered with an empty XSDType (rule 3
-	// skip marker). The partial-read path at soapbody.go:98-99 returns the
-	// partially-collected info rather than nil — this is the best-effort
-	// behavior the test pins.
+	// skip marker). The partial-read path in walkOperation (the err != nil
+	// return) returns the partially-collected info rather than nil — this is
+	// the best-effort behavior the test pins.
 	body := `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
 		`<soap:Body><Op><a>1</a><b>`
 	// truncated mid-element — no closing tags
 
 	result := extractSOAPParameters([]byte(body))
-	// Partial read path at soapbody.go:98-99 returns info, not nil.
+	// Partial read path in walkOperation returns info, not nil.
 	require.NotNil(t, result, "truncated envelope must return partial info, not nil")
 	// "a" was fully parsed and must be present with its inferred type.
 	require.Contains(t, result.Params, "a")
@@ -665,7 +665,7 @@ func TestInferTypesFromObservations(t *testing.T) {
 
 	// NT005a: all operations missing from observations — observations non-empty
 	// but no op in the operations slice exists in the map → elements stays empty
-	// → second nil-return path at soapbody.go:286-288.
+	// → second nil-return path in inferTypesFromObservations (len(elements) == 0).
 	t.Run("all operations missing from observations returns nil", func(t *testing.T) {
 		// observations has an entry, but it is not referenced by operations.
 		obs := map[string]*soapBodyInfo{
@@ -697,7 +697,7 @@ func TestInferTypesFromObservations(t *testing.T) {
 
 	// NT006: all-skipped params (empty XSDType, not complex) yields ComplexType with nil Sequence.
 	t.Run("all-skipped params yields empty complex type", func(t *testing.T) {
-		// Parameters with XSDType=="" and IsComplex==false trigger the skip at soapbody.go:305-307.
+		// Parameters with XSDType=="" and IsComplex==false trigger the skip in buildComplexType.
 		// This simulates e.g. <flag></flag> elements where text is empty.
 		obs := map[string]*soapBodyInfo{
 			"Ping": {

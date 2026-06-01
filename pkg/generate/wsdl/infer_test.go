@@ -364,7 +364,7 @@ func TestInferWSDL_BodyParametersUnion(t *testing.T) {
 }
 
 // NT012: Duplicate operation across endpoints; second body contributes no new params.
-// Exercises the merge-on-duplicate-op path at infer.go:48-55 where extractSOAPParameters
+// Exercises the merge-on-duplicate-op path in InferWSDL's record closure where extractSOAPParameters
 // succeeds but the second observation has an empty operation element (no OrderedKeys).
 // Verifies the first observation is preserved and not corrupted.
 func TestInferWSDL_BodyParametersUnion_SecondObservationEmpty(t *testing.T) {
