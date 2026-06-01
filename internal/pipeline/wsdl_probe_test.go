@@ -162,3 +162,35 @@ func TestProbeAndAppendWSDLRequest_URLWithExistingQuery(t *testing.T) {
 	assert.True(t, strings.HasSuffix(syntheticURL, "?wsdl"),
 		"synthetic URL must end with ?wsdl, got %q", syntheticURL)
 }
+
+// ---------------------------------------------------------------------------
+// TEST-003: SSRF gate — when allowPrivate=false, ProbeWSDLDocument must reject
+// private URLs via probe.ValidateProbeURL. This is the SDK's call path
+// (pkg/sdk/capability.go forwards allowPrivate=false).
+// ---------------------------------------------------------------------------
+
+func TestProbeWSDLDocument_SSRFRejectsPrivateURL(t *testing.T) {
+	var buf bytes.Buffer
+	doc := pipeline.ProbeWSDLDocument(context.Background(), "http://127.0.0.1:1/svc", false, &buf)
+	assert.Nil(t, doc, "expected nil bytes for SSRF-rejected URL")
+	assert.Contains(t, buf.String(), "SSRF protection")
+}
+
+// ---------------------------------------------------------------------------
+// TEST-004: HTTP >= 400 gate — server-error responses must be rejected before
+// ParseWSDL is called.
+// ---------------------------------------------------------------------------
+
+func TestProbeWSDLDocument_RejectsHTTPErrorStatus(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/xml")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(validWSDLDocument))
+	}))
+	t.Cleanup(ts.Close)
+
+	var buf bytes.Buffer
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/svc", true, &buf)
+	assert.Nil(t, doc, "expected nil bytes for HTTP 404")
+	assert.Contains(t, buf.String(), "returned HTTP 404")
+}

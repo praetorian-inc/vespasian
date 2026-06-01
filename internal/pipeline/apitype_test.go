@@ -149,3 +149,29 @@ func TestClassifiersForType_KnownTypes(t *testing.T) {
 func TestClassifiersForType_UnknownReturnsNil(t *testing.T) {
 	assert.Nil(t, pipeline.ClassifiersForType("unknown"))
 }
+
+// ---------------------------------------------------------------------------
+// TEST-001: WSDL-wins branch of DetectAPIType — pin both the `wsdlCount > 0`
+// guard and the `wsdlCount >= restCount` tie-breaker via a single SOAP request
+// that fires both WSDL (envelope, conf 0.90) and REST (text/xml + POST, conf
+// 0.80) classifiers at threshold 0.5, producing wsdlCount=1 and restCount=1.
+// The `>=` tie-breaker is what makes WSDL win in that case.
+// ---------------------------------------------------------------------------
+
+func TestDetectAPIType_PrefersWSDL(t *testing.T) {
+	requests := []crawl.ObservedRequest{
+		{
+			Method:  "POST",
+			URL:     "https://x.com/service.asmx",
+			Headers: map[string]string{"Content-Type": "text/xml"},
+			Body:    []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><GetUser/></soap:Body></soap:Envelope>`),
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/xml",
+				Body:        []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><GetUserResponse/></soap:Body></soap:Envelope>`),
+			},
+		},
+	}
+	got := pipeline.DetectAPIType(requests, 0.5)
+	assert.Equal(t, pipeline.APITypeWSDL, got)
+}

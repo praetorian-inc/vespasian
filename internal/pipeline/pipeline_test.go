@@ -17,6 +17,8 @@ package pipeline_test
 import (
 	"bytes"
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -108,4 +110,44 @@ func TestClassifyProbeGenerate_UnknownTypeErrors(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported API type")
+}
+
+// ---------------------------------------------------------------------------
+// TEST-002: Probe-enabled path — pin that the AllowPrivate http.Client
+// construction and strategies execution run end-to-end without error and
+// still produce a spec. OptionsProbe and SchemaProbe swallow individual
+// request failures internally and never surface to probeErrs, so the
+// "probe warning:" forwarding loop in pipeline.go is unreachable for REST
+// mode and is intentionally not exercised here.
+// ---------------------------------------------------------------------------
+
+func TestClassifyProbeGenerate_ProbeEnabledEmitsSpec(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(ts.Close)
+
+	requests := []crawl.ObservedRequest{
+		{
+			Method:  "GET",
+			URL:     ts.URL + "/api/v1/users",
+			Headers: map[string]string{"Content-Type": "application/json"},
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Headers:     map[string]string{"Content-Type": "application/json"},
+				Body:        []byte(`[{"id":1}]`),
+			},
+		},
+	}
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Deduplicate:  true,
+	})
+	require.NoError(t, err)
+	assert.NotEmpty(t, spec, "expected non-empty OpenAPI spec when Probe=true")
 }
