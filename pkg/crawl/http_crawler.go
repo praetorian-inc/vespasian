@@ -210,7 +210,7 @@ func (c *HTTPCrawler) fetchPage(ctx context.Context, client *http.Client, limite
 	// log to Stderr and skip this page.
 	if err := limiter.Wait(pageCtx); err != nil {
 		if c.opts.Stderr != nil {
-			fmt.Fprintf(c.opts.Stderr, "rate limiter: %s: %v\n", entry.URL, err) //nolint:errcheck // best-effort
+			fmt.Fprintf(c.opts.Stderr, "rate limiter: %s: %v\n", redactSeedURL(entry.URL), err) //nolint:errcheck // best-effort
 		}
 		return nil, nil
 	}
@@ -218,7 +218,7 @@ func (c *HTTPCrawler) fetchPage(ctx context.Context, client *http.Client, limite
 	req, err := http.NewRequestWithContext(pageCtx, http.MethodGet, entry.URL, nil)
 	if err != nil {
 		if c.opts.Stderr != nil {
-			fmt.Fprintf(c.opts.Stderr, "build request: %s: %v\n", entry.URL, err) //nolint:errcheck // best-effort
+			fmt.Fprintf(c.opts.Stderr, "build request: %s: %v\n", redactSeedURL(entry.URL), err) //nolint:errcheck // best-effort
 		}
 		return nil, nil
 	}
@@ -228,7 +228,7 @@ func (c *HTTPCrawler) fetchPage(ctx context.Context, client *http.Client, limite
 	resp, err := client.Do(req)
 	if err != nil {
 		if c.opts.Stderr != nil {
-			fmt.Fprintf(c.opts.Stderr, "fetch: %s: %v\n", entry.URL, err) //nolint:errcheck // best-effort
+			fmt.Fprintf(c.opts.Stderr, "fetch: %s: %v\n", redactSeedURL(entry.URL), err) //nolint:errcheck // best-effort
 		}
 		return nil, nil
 	}
@@ -257,18 +257,23 @@ func (c *HTTPCrawler) fetchPage(ctx context.Context, client *http.Client, limite
 func (c *HTTPCrawler) extractLinks(observed ObservedRequest, pageURL string) []string {
 	var links []string
 
+	// base is the <base href>-aware base for HTML pages, else the (final,
+	// post-redirect) pageURL. All jsluice-derived URLs resolve against it so the
+	// inline-script and JS-response paths stay consistent with the DOM links.
+	base := pageURL
+
 	ct := strings.ToLower(observed.Response.ContentType)
 	if isHTMLContentType(ct) {
 		// extractFromHTML parses the body once and returns both the discovered
-		// links and the effective <base href>-aware base. Reuse that base to
-		// resolve inline-script endpoints so both paths are consistent and the
-		// body is parsed only once.
-		htmlLinks, base := extractFromHTML(observed.Response.Body, pageURL)
+		// links and the effective base. Reuse that base for inline scripts so
+		// the body is parsed only once.
+		var htmlLinks []string
+		htmlLinks, base = extractFromHTML(observed.Response.Body, pageURL)
 		links = append(links, htmlLinks...)
 		links = append(links, jsExtractedToLinks(extractInlineScripts(observed.Response.Body), base)...)
 	}
 
-	links = append(links, jsExtractedToLinks(extractURLsFromResponses([]ObservedRequest{observed}), pageURL)...)
+	links = append(links, jsExtractedToLinks(extractURLsFromResponses([]ObservedRequest{observed}), base)...)
 	return links
 }
 

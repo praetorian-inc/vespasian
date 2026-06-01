@@ -131,8 +131,11 @@ func (f *urlFrontier) Pop() (urlEntry, bool) {
 				f.queue[last] = urlEntry{}
 				f.queue = f.queue[:last]
 			} else {
-				// FIFO: take the first element.
+				// FIFO: take the first element. Zero the dequeued slot before
+				// advancing so the backing array does not retain it between
+				// compactions (same GC concern handled in the DFS branch).
 				entry = f.queue[0]
+				f.queue[0] = urlEntry{}
 				f.queue = f.queue[1:]
 				// Compact the backing array when it's 4x larger than needed.
 				// Without this, consumed slots hold stale entries that can't
