@@ -145,10 +145,6 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 // runScan runs the classify → probe → generate phase and emits a WebApplication
 // with the spec if one is produced. Returns (hasSpec, resolvedAPIType).
 func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.ObservedRequest, input capmodel.WebApplication, output capability.Emitter) (bool, string) {
-	if len(requests) == 0 {
-		return false, pipeline.APITypeREST
-	}
-
 	confidence := parseConfidence(ctx.Parameters)
 	probeEnabled := parseProbeEnabled(ctx.Parameters)
 
@@ -277,17 +273,23 @@ func emitWebpages(requests []crawl.ObservedRequest, parent capmodel.WebApplicati
 	byURL := make(map[string][]capmodel.WebpageRequest)
 	var order []string
 	for _, req := range requests {
-		pageURL := req.URL
-		if pageURL == "" {
+		if req.URL == "" {
 			continue
 		}
-		if pipeline.IsStaticAssetURL(pageURL) {
+		if pipeline.IsStaticAssetURL(req.URL) {
 			continue
 		}
-		if _, seen := byURL[pageURL]; !seen {
-			order = append(order, pageURL)
+		pageKey := req.PageURL
+		if pageKey == "" {
+			pageKey = req.URL
 		}
-		byURL[pageURL] = append(byURL[pageURL], toWebpageRequest(req))
+		if pipeline.IsStaticAssetURL(pageKey) {
+			continue
+		}
+		if _, seen := byURL[pageKey]; !seen {
+			order = append(order, pageKey)
+		}
+		byURL[pageKey] = append(byURL[pageKey], toWebpageRequest(req))
 	}
 
 	count := 0
