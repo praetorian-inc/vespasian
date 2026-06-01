@@ -1,0 +1,44 @@
+[
+  {
+    "method": "POST",
+    "url": "http://soap.example.com/calc",
+    "headers": {
+      "Content-Type": "application/soap+xml",
+      "SOAPAction": "urn:Add"
+    },
+    "body": "PD94bWwgdmVyc2lvbj0iMS4wIj8+PGVudjpFbnZlbG9wZSB4bWxuczplbnY9Imh0dHA6Ly93d3cudzMub3JnLzIwMDMvMDUvc29hcC1lbnZlbG9wZSI+PGVudjpCb2R5PjxtOkFkZCB4bWxuczptPSJodHRwOi8vY2FsYy8iIHhtbG5zOnhzaT0iaHR0cDovL3d3dy53My5vcmcvMjAwMS9YTUxTY2hlbWEtaW5zdGFuY2UiIHhtbG5zOnhzZD0iaHR0cDovL3d3dy53My5vcmcvMjAwMS9YTUxTY2hlbWEiPjxhIHhzaTp0eXBlPSJ4c2Q6aW50Ij41PC9hPjxiIHhzaTp0eXBlPSJ4c2Q6aW50Ij43PC9iPjwvbTpBZGQ+PC9lbnY6Qm9keT48L2VudjpFbnZlbG9wZT4=",
+    "response": {
+      "status_code": 200,
+      "content_type": "application/soap+xml",
+      "body": ""
+    }
+  },
+  {
+    "method": "POST",
+    "url": "http://soap.example.com/calc",
+    "headers": {
+      "Content-Type": "text/xml",
+      "SOAPAction": "urn:Register"
+    },
+    "body": "PD94bWwgdmVyc2lvbj0iMS4wIj8+PHNvYXA6RW52ZWxvcGUgeG1sbnM6c29hcD0iaHR0cDovL3NjaGVtYXMueG1sc29hcC5vcmcvc29hcC9lbnZlbG9wZS8iPjxzb2FwOkJvZHk+PFJlZ2lzdGVyIHhtbG5zPSJodHRwOi8vY2FsYy8iPjxuYW1lPmFsaWNlPC9uYW1lPjxhY3RpdmU+dHJ1ZTwvYWN0aXZlPjxib3JuPjE5OTAtMDQtMTI8L2Jvcm4+PHNjb3JlPjMuMTQ8L3Njb3JlPjwvUmVnaXN0ZXI+PC9zb2FwOkJvZHk+PC9zb2FwOkVudmVsb3BlPg==",
+    "response": {
+      "status_code": 200,
+      "content_type": "text/xml",
+      "body": ""
+    }
+  },
+  {
+    "method": "POST",
+    "url": "http://soap.example.com/calc",
+    "headers": {
+      "Content-Type": "text/xml",
+      "SOAPAction": "urn:CreateOrder"
+    },
+    "body": "PD94bWwgdmVyc2lvbj0iMS4wIj8+PHNvYXA6RW52ZWxvcGUgeG1sbnM6c29hcD0iaHR0cDovL3NjaGVtYXMueG1sc29hcC5vcmcvc29hcC9lbnZlbG9wZS8iPjxzb2FwOkJvZHk+PENyZWF0ZU9yZGVyIHhtbG5zPSJodHRwOi8vY2FsYy8iPjxvcmRlcj48aXRlbUlkPjQyPC9pdGVtSWQ+PHF0eT4zPC9xdHk+PC9vcmRlcj48L0NyZWF0ZU9yZGVyPjwvc29hcDpCb2R5Pjwvc29hcDpFbnZlbG9wZT4=",
+    "response": {
+      "status_code": 200,
+      "content_type": "text/xml",
+      "body": ""
+    }
+  }
+]
