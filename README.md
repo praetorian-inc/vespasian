@@ -305,6 +305,8 @@ vespasian generate <api-type> <capture-file> [flags]
 
 ```
 cmd/vespasian/          CLI entry point
+internal/pipeline/      Shared crawl/classify/probe/generate orchestration (CLI + SDK)
+pkg/sdk/                capability-sdk Capability adapter (used by Guard hosts)
 pkg/crawl/              Headless browser crawler + capture format
 pkg/importer/           Traffic importers (Burp, HAR, mitmproxy)
 pkg/analyze/            Static HTML form extraction from captured response bodies
