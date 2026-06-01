@@ -15,6 +15,7 @@
 package crawl
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/url"
@@ -160,6 +161,43 @@ func registeredDomain(host string) (string, error) {
 		return "", err
 	}
 	return domain, nil
+}
+
+// ssrfSafeDialContext is a net.Dialer DialContext replacement that re-resolves
+// the target host and rejects the connection if any resolved IP is private or
+// internal (SSRF protection). By performing the IP check at dial time — not
+// only in the upfront scope/SSRF check — it closes the DNS-rebinding TOCTOU
+// window: a short-TTL domain that resolves to a public IP during the scope
+// check can be re-resolved to 127.0.0.1 or another private address by the
+// time client.Do actually dials the connection.
+//
+// It mirrors probe.SSRFSafeDialContext but lives in pkg/crawl to avoid an
+// import cycle, and reuses this package's own isPrivateIP so the CIDR list
+// is the single source of truth within pkg/crawl.
+func ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid address %q: %w", addr, err)
+	}
+
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("DNS lookup failed for %q: %w", host, err)
+	}
+
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("DNS lookup for %q returned no addresses", host)
+	}
+
+	for _, ip := range ips {
+		if isPrivateIP(ip.IP) {
+			return nil, fmt.Errorf("blocked: %s resolves to private IP %s", host, ip.IP)
+		}
+	}
+
+	// Dial the first validated address directly to prevent a TOCTOU re-resolve.
+	dialer := &net.Dialer{}
+	return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
 }
 
 // normalizeURL normalizes a URL for deduplication by lowercasing the scheme

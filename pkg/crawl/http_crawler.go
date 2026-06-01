@@ -64,9 +64,22 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	// Shared rate limiter at 150 rps.
 	limiter := rate.NewLimiter(rate.Limit(150), 150)
 
-	// HTTP client with redirect scope guard.
+	// HTTP client with redirect scope guard and bounded timeout.
+	// The per-page context (PageTimeout) already cancels hung fetches, but an
+	// explicit Client.Timeout provides defense-in-depth if the context is ever
+	// mis-wired on a future code path (SEC-BE-001).
+	transport := http.DefaultTransport
+	if !c.opts.AllowPrivate {
+		// Wire a custom Transport whose DialContext re-resolves and re-validates
+		// IPs at connect time, closing the DNS-rebinding TOCTOU window (SEC-BE-002).
+		transport = &http.Transport{
+			DialContext: ssrfSafeDialContext,
+		}
+	}
 	client := &http.Client{
 		CheckRedirect: redirectScopeGuard(scopeFn),
+		Transport:     transport,
+		Timeout:       time.Duration(PageTimeout) * time.Second,
 	}
 
 	// Seed the frontier. Reject if the seed itself doesn't pass scope/SSRF.
