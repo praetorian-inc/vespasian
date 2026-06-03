@@ -264,9 +264,10 @@ func (c *HTTPCrawler) extractLinks(observed ObservedRequest, pageURL string) []s
 
 	ct := strings.ToLower(observed.Response.ContentType)
 	if isHTMLContentType(ct) {
-		// extractFromHTML parses the body once and returns both the discovered
-		// links and the effective base. Reuse that base for inline scripts so
-		// the body is parsed only once.
+		// extractFromHTML parses the body and returns both the discovered links
+		// and the effective base. extractInlineScripts parses the body a second
+		// time to find inline <script> blocks; reusing the base returned here only
+		// avoids recomputing the effective base, not the second parse.
 		var htmlLinks []string
 		htmlLinks, base = extractFromHTML(observed.Response.Body, pageURL)
 		links = append(links, htmlLinks...)

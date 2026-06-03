@@ -479,9 +479,12 @@ func TestHTTPCrawler_SSRFDialGuardRejectsPrivateIP(t *testing.T) {
 }
 
 func TestHTTPCrawler_SendsCustomHeaders(t *testing.T) {
+	var mu sync.Mutex
 	var receivedAgent string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		receivedAgent = r.Header.Get("X-Test-Header")
+		mu.Unlock()
 		w.Header().Set("Content-Type", "text/html")
 		fmt.Fprint(w, `ok`)
 	}))
@@ -497,7 +500,10 @@ func TestHTTPCrawler_SendsCustomHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if receivedAgent != "sentinel" {
-		t.Errorf("X-Test-Header = %q, want sentinel", receivedAgent)
+	mu.Lock()
+	got := receivedAgent
+	mu.Unlock()
+	if got != "sentinel" {
+		t.Errorf("X-Test-Header = %q, want sentinel", got)
 	}
 }
