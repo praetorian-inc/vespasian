@@ -26,11 +26,13 @@ var privateNetworks []*net.IPNet
 
 func init() {
 	cidrs := []string{
+		"0.0.0.0/8",      // RFC 1122 "this host on this network" (0.x can address localhost on Linux)
 		"127.0.0.0/8",    // IPv4 loopback
 		"10.0.0.0/8",     // RFC 1918
+		"100.64.0.0/10",  // RFC 6598 CGNAT / shared address space (carrier & cloud internal)
 		"172.16.0.0/12",  // RFC 1918
 		"192.168.0.0/16", // RFC 1918
-		"169.254.0.0/16", // link-local
+		"169.254.0.0/16", // link-local (includes cloud metadata 169.254.169.254)
 		"::1/128",        // IPv6 loopback
 		"fe80::/10",      // IPv6 link-local
 		"fc00::/7",       // IPv6 ULA

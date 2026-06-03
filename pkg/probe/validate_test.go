@@ -34,6 +34,8 @@ func TestValidateProbeURL_BlocksPrivateIPs(t *testing.T) {
 		{"rfc1918-10", "http://10.0.0.1/api"},
 		{"rfc1918-172", "http://172.16.0.1/api"},
 		{"rfc1918-192", "http://192.168.1.1/api"},
+		{"cgnat-100.64", "http://100.64.0.1/api"},
+		{"this-network-0.x", "http://0.1.2.3/api"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

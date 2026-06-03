@@ -238,23 +238,34 @@ func (c *HTTPCrawler) fetchPage(ctx context.Context, client *http.Client, limite
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPBodySize)) //nolint:errcheck // best-effort; partial body is acceptable
 
 	observed := buildObservedRequest(req, resp, body)
+	// Extract links from the full read body (up to MaxHTTPBodySize / 10 MB), NOT
+	// from observed.Response.Body, which buildObservedRequest truncates to the 1 MB
+	// retention cap. Using the stored body here would silently drop every endpoint
+	// that appears past the first 1 MB of a large HTML/JS page even though we paid
+	// to read up to 10 MB.
+	//
 	// Resolve discovered links against the FINAL response URL (observed.URL,
 	// post-redirect), not the queued entry.URL — otherwise a redirect from
 	// /start to /app/ would resolve href="next" as /next instead of /app/next.
-	links := c.extractLinks(observed, observed.URL)
+	links := c.extractLinks(observed, body, observed.URL)
 
 	return &observed, links
 }
 
-// extractLinks discovers navigable URLs from an observed request using HTML
-// parsing (goquery) and jsluice. It handles both HTML pages and JavaScript
-// response bodies.
+// extractLinks discovers navigable URLs from a fetched page using HTML parsing
+// (goquery) and jsluice. It handles both HTML pages and JavaScript response
+// bodies.
+//
+// fullBody is the body as read from the wire (capped only by MaxHTTPBodySize),
+// which is what link discovery operates on. observed carries the content type,
+// final URL, and the 1 MB-retention-capped body used for storage; its Body field
+// is deliberately NOT used for extraction (see fetchPage).
 //
 // For HTML responses, extractFromHTML reads the <base href> tag (if present)
 // and resolves relative links against it, exactly matching the rod path's
 // effectiveBaseURL behavior. Inline-script URLs are resolved against the same
 // base so that jsluice-extracted paths honor the page's declared base.
-func (c *HTTPCrawler) extractLinks(observed ObservedRequest, pageURL string) []string {
+func (c *HTTPCrawler) extractLinks(observed ObservedRequest, fullBody []byte, pageURL string) []string {
 	var links []string
 
 	// base is the <base href>-aware base for HTML pages, else the (final,
@@ -269,12 +280,17 @@ func (c *HTTPCrawler) extractLinks(observed ObservedRequest, pageURL string) []s
 		// time to find inline <script> blocks; reusing the base returned here only
 		// avoids recomputing the effective base, not the second parse.
 		var htmlLinks []string
-		htmlLinks, base = extractFromHTML(observed.Response.Body, pageURL)
+		htmlLinks, base = extractFromHTML(fullBody, pageURL)
 		links = append(links, htmlLinks...)
-		links = append(links, jsExtractedToLinks(extractInlineScripts(observed.Response.Body), base)...)
+		links = append(links, jsExtractedToLinks(extractInlineScripts(fullBody), base)...)
 	}
 
-	links = append(links, jsExtractedToLinks(extractURLsFromResponses([]ObservedRequest{observed}), base)...)
+	// extractURLsFromResponses keys off the response body, so feed it a view of
+	// the observed request that carries the full (read-capped) body rather than
+	// the 1 MB-retention-capped stored body.
+	full := observed
+	full.Response.Body = fullBody
+	links = append(links, jsExtractedToLinks(extractURLsFromResponses([]ObservedRequest{full}), base)...)
 	return links
 }
 

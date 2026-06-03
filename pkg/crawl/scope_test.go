@@ -216,6 +216,11 @@ func TestIsPrivateIP(t *testing.T) {
 		{"public IP", "93.184.215.14", false},
 		{"public IP 2", "8.8.8.8", false},
 		{"unspecified v4", "0.0.0.0", true},
+		{"this-network 0.x", "0.1.2.3", true},
+		{"CGNAT 100.64.x", "100.64.0.1", true},
+		{"CGNAT 100.127.x", "100.127.255.254", true},
+		{"public near-CGNAT 100.63.x", "100.63.255.255", false},
+		{"public near-CGNAT 100.128.x", "100.128.0.0", false},
 	}
 
 	for _, tt := range tests {

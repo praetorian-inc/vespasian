@@ -53,6 +53,37 @@ func TestHTTPCrawler_FollowsLinks(t *testing.T) {
 	}
 }
 
+// TestHTTPCrawler_LinksPastRetentionCap verifies link discovery operates on the
+// full read body (up to MaxHTTPBodySize), not the 1 MB retention-capped body that
+// buildObservedRequest stores. A link placed AFTER MaxResponseBodySize bytes must
+// still be crawled — otherwise endpoints on large pages are silently lost even
+// though the bytes were read off the wire.
+func TestHTTPCrawler_LinksPastRetentionCap(t *testing.T) {
+	var hitDeep atomic.Bool
+	// Padding larger than the 1 MB retention cap (but well under the 10 MB read
+	// cap), followed by a link that only the full-body extraction can reach.
+	filler := strings.Repeat("A", MaxResponseBodySize+100_000)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		switch r.URL.Path {
+		case "/":
+			fmt.Fprintf(w, "<html><body>%s<a href=\"/deep\">deep</a></body></html>", filler)
+		case "/deep":
+			hitDeep.Store(true)
+			fmt.Fprint(w, "ok")
+		}
+	}))
+	defer srv.Close()
+	c := &HTTPCrawler{opts: CrawlerOptions{Depth: 2, MaxPages: 10, Timeout: 10 * time.Second, AllowPrivate: true}}
+	if _, err := c.Crawl(context.Background(), srv.URL); err != nil {
+		t.Fatal(err)
+	}
+	if !hitDeep.Load() {
+		t.Error("/deep (link past the 1 MB retention cap) was not discovered; " +
+			"link extraction is using the truncated stored body instead of the full read body")
+	}
+}
+
 func TestHTTPCrawler_RespectsMaxPages(t *testing.T) {
 	var count atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
