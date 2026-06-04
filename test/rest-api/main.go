@@ -310,7 +310,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)        // 10MB upload cap
-	if err := r.ParseMultipartForm(10 << 20); err != nil { //nolint:gosec // G120: body already bounded by MaxBytesReader above
+	if err := r.ParseMultipartForm(10 << 20); err != nil { //nolint:gosec // G120: 10MB cap enforced via MaxBytesReader above
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid multipart"})
 		return
 	}
@@ -433,7 +433,8 @@ func handleMixedContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	randomBytes := make([]byte, 64)
-	rand.Read(randomBytes) //nolint:errcheck // test server best-effort
+	// #nosec G104 -- test server best-effort: crypto/rand failures here would be a noisy false positive in CI.
+	rand.Read(randomBytes) //nolint:errcheck // test server best-effort, error ignored intentionally
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"id":     1,
 		"name":   "binary-test",

@@ -594,6 +594,67 @@ test_generate_wsdl() {
     fi
 }
 
+# test_generate_wsdl_matrix exercises the SOAP body parameter-extraction
+# matrix added in LAB-2111: SOAP 1.2 RPC/encoded with xsi:type, SOAP 1.1
+# document/literal with value-inferred scalar types, and a nested complex
+# parameter. The capture has no probed WSDLDocument and --probe=false is
+# set, so this also covers the missing-WSDL fallback path end-to-end.
+# Deterministic (port-less host) — golden compared byte-for-byte.
+test_generate_wsdl_matrix() {
+    local target_dir="${RESULTS_DIR}/generate-wsdl-matrix"
+    local input_capture="${SCRIPT_DIR}/soap-service/matrix-capture.json"
+    local spec_file="${target_dir}/spec.xml"
+    local expected_spec="${SCRIPT_DIR}/soap-service/matrix-expected-spec.xml"
+    local verbose_flag=""
+
+    [ "${VERBOSE:-false}" = true ] && verbose_flag="-v"
+
+    mkdir -p "$target_dir"
+    init_test_status "generate-wsdl-matrix"
+
+    local start=$SECONDS
+    local failures=0
+
+    log_header "Testing: generate-wsdl-matrix (SOAP param-extraction matrix)"
+
+    if [ ! -f "$input_capture" ]; then
+        log_fail "Input capture not found: ${input_capture}"
+        set_test_result "generate-wsdl-matrix" "FAIL" "?" "?" "$((SECONDS - start))"
+        return 1
+    fi
+
+    log_info "Generating WSDL spec from matrix capture (SOAP 1.1/1.2, RPC + doc/literal)..."
+    if ! "$VESPASIAN" generate wsdl "$input_capture" \
+        -o "$spec_file" \
+        --probe=false \
+        $verbose_flag 2>&1; then
+        log_fail "WSDL matrix generate failed"
+        set_test_result "generate-wsdl-matrix" "FAIL" "?" "?" "$((SECONDS - start))"
+        return 1
+    fi
+
+    local expected_ops="${SCRIPT_DIR}/soap-service/matrix-expected-paths.json"
+    if ! validate_soap_operations "$spec_file" "$expected_ops"; then
+        failures=$((failures + 1))
+    fi
+
+    if ! compare_files "$spec_file" "$expected_spec" "generate-wsdl-matrix spec" --normalize-ports; then
+        failures=$((failures + 1))
+    fi
+
+    local expected_count
+    expected_count=$(json_field "$expected_ops" total_operations)
+
+    local duration=$((SECONDS - start))
+    if [ $failures -eq 0 ]; then
+        set_test_result "generate-wsdl-matrix" "PASS" "3" "$expected_count" "$duration"
+        log_ok "generate-wsdl-matrix: PASSED (${duration}s)"
+    else
+        set_test_result "generate-wsdl-matrix" "FAIL" "?" "$expected_count" "$duration"
+        log_fail "generate-wsdl-matrix: FAILED (${duration}s)"
+    fi
+}
+
 test_graphql_server() {
     local port="${GRAPHQL_SERVER_PORT:-8992}"
     local base_url="http://${TEST_HOST}:${port}"
@@ -869,6 +930,200 @@ test_generate_graphql_imports() {
     else
         set_test_result "generate-graphql-imports" "FAIL" "?" "2" "$duration"
         log_fail "generate-graphql-imports: FAILED (${duration}s)"
+    fi
+}
+
+# json_array prints the elements of a top-level JSON array field, one per line.
+# Stdlib only (no PyYAML/jq dependency). Like its sibling json_field, a missing
+# key or malformed JSON is a hard error: python exits non-zero and the trailing
+# `|| echo "?"` emits a visible "?" sentinel, so a broken fixture surfaces as a
+# failed assertion downstream rather than a silent zero-element (vacuous) pass.
+# Usage: json_array <file> <key>
+json_array() {
+    python3 - "$1" "$2" << 'PYEOF' 2>/dev/null || echo "?"
+import json, sys
+with open(sys.argv[1]) as f:
+    for v in json.load(f)[sys.argv[2]]:
+        print(v)
+PYEOF
+}
+
+# title_case upper-cases the first letter of a word ("post" -> "Post").
+title_case() { printf '%s%s' "$(printf '%s' "$1" | cut -c1 | tr '[:lower:]' '[:upper:]')" "$(printf '%s' "$1" | cut -c2-)"; }
+
+# assert_js_static_details validates the method matrix and request-body fields
+# of the generated OpenAPI spec against expected-paths.json, using stdlib-only
+# checks (the suite avoids a PyYAML dependency; the generator emits YAML).
+#   - Method matrix: the generator writes "summary: <Method> <path>" per
+#     operation, so we assert that line exists for every expected method on
+#     methods_path (e.g. both "Get /api/users" and "Post /api/users").
+#   - Body fields: a request-body schema property key renders as a bare
+#     "<indent><field>:" (value on the following lines), whereas a path-level
+#     parameter renders the same identifier inline as "<indent>name: itemId".
+#     The end-anchor (\s*$) is the disambiguator — it matches the bare property
+#     key but not the inline param form — so the whole spec can be scanned
+#     without slicing out the paths: section.
+# Returns 0 on match, 1 (with details on stderr) otherwise.
+# Usage: assert_js_static_details <spec.yaml> <expected-paths.json>
+assert_js_static_details() {
+    local spec=$1 expected=$2
+    local rc=0
+    local mp
+    mp=$(json_field "$expected" methods_path)
+
+    local m
+    while IFS= read -r m; do
+        [ -z "$m" ] && continue
+        if ! grep -qE "summary: $(title_case "$m") ${mp}\$" "$spec"; then
+            echo "  detail: ${mp} missing ${m} operation (no 'summary: $(title_case "$m") ${mp}')" >&2
+            rc=1
+        fi
+    done < <(json_array "$expected" methods)
+
+    # Body-field property keys render as a bare "<indent><field>:" (the value
+    # is the nested schema on following lines). Path-level parameters render
+    # the same identifiers inline as "<indent>name: itemId" / "name: orderId".
+    # The end-anchor (\s*$) is what disambiguates: it matches the bare property
+    # key but NOT the inline param form, so we can scan the whole spec without
+    # needing to slice out the paths: section. Keep the anchor on any refactor.
+    local field
+    while IFS= read -r field; do
+        [ -z "$field" ] && continue
+        if ! grep -qE "^\s+${field}:\s*\$" "$spec"; then
+            echo "  detail: request-body field '${field}' not found as a schema property" >&2
+            rc=1
+        fi
+    done < <(json_array "$expected" body_fields)
+
+    return $rc
+}
+
+test_generate_js_static() {
+    local target_dir="${RESULTS_DIR}/generate-js-static"
+    local input_capture="${SCRIPT_DIR}/js-static/reference-capture.json"
+    local expected="${SCRIPT_DIR}/js-static/expected-paths.json"
+    local spec_on="${target_dir}/spec-on.yaml"
+    local spec_off="${target_dir}/spec-off.yaml"
+    local verbose_flag=""
+
+    [ "${VERBOSE:-false}" = true ] && verbose_flag="-v"
+
+    mkdir -p "$target_dir"
+    init_test_status "generate-js-static"
+
+    local start=$SECONDS
+    local failures=0
+
+    log_header "Testing: generate-js-static (LAB-2108 JS bundle → API discovery)"
+
+    if [ ! -f "$input_capture" ]; then
+        log_fail "Input capture not found: ${input_capture}"
+        set_test_result "generate-js-static" "FAIL" "?" "?" "$((SECONDS - start))"
+        return 1
+    fi
+
+    local expected_count
+    expected_count=$(json_field "$expected" total_paths)
+    local marker
+    marker=$(json_field "$expected" source_marker)
+
+    # ── analyze-js ON: the JS bundle must contribute API endpoints ──
+    # Low confidence surfaces signal-light GET endpoints (axios/template-literal
+    # calls carry no response body); the high-signal fetch POST would pass at the
+    # default threshold too. --probe=false keeps the test offline/deterministic.
+    log_info "Generating with --analyze-js (confidence 0.1)..."
+    if ! "$VESPASIAN" generate rest "$input_capture" \
+        -o "$spec_on" \
+        --analyze-js \
+        --confidence 0.1 \
+        --probe=false \
+        $verbose_flag 2>&1; then
+        log_fail "Generate (analyze-js on) failed"
+        set_test_result "generate-js-static" "FAIL" "?" "$expected_count" "$((SECONDS - start))"
+        return 1
+    fi
+
+    if ! validate_openapi_structure "$spec_on"; then
+        failures=$((failures + 1))
+    fi
+
+    local endpoint_count
+    endpoint_count=$(count_spec_endpoints "$spec_on")
+    if [ "$endpoint_count" != "$expected_count" ]; then
+        log_fail "Expected ${expected_count} statically-discovered paths, got ${endpoint_count}"
+        failures=$((failures + 1))
+    else
+        log_ok "Recovered ${endpoint_count} paths from the JS bundle"
+    fi
+
+    # Every operation derived from the bundle must carry the x-vespasian-source
+    # extension with the js-bundle marker — the core LAB-2108 provenance signal.
+    if grep -q "x-vespasian-source: ${marker}" "$spec_on"; then
+        log_ok "x-vespasian-source: ${marker} present"
+    else
+        log_fail "x-vespasian-source: ${marker} annotation missing from generated spec"
+        failures=$((failures + 1))
+    fi
+
+    # Spot-check the three recovered route shapes (param names may vary, so match
+    # on stable path stems, not exact {param} identifiers).
+    local stem
+    for stem in "/api/users" "/api/items/" "/api/orders/"; do
+        if ! grep -qE "^\s+${stem}" "$spec_on"; then
+            log_fail "Expected a path under ${stem} in the generated spec"
+            failures=$((failures + 1))
+        fi
+    done
+
+    # Make the rich fixture load-bearing (not just count + stems):
+    #   - methods_path must carry every method in `methods` (e.g. /api/users has
+    #     BOTH the fetch-derived POST and the jsluice-derived GET — a regression
+    #     collapsing them would keep count==3 and pass the checks above).
+    #   - body_fields (LAB-2108 AC#3) must surface as request-body schema
+    #     properties — the only CLI-level exercise of body recovery on the
+    #     generate path.
+    if assert_js_static_details "$spec_on" "$expected"; then
+        log_ok "method matrix + body fields match expected-paths.json"
+    else
+        failures=$((failures + 1))
+    fi
+
+    # ── analyze-js OFF (opt-out): the JS bundle must contribute nothing ──
+    # No /api paths (the capture has only an HTML page + a JS bundle) and no
+    # x-vespasian-source extension. Guards the --analyze-js=false escape hatch.
+    log_info "Generating with --analyze-js=false (opt-out)..."
+    local optout_failures=0
+    if ! "$VESPASIAN" generate rest "$input_capture" \
+        -o "$spec_off" \
+        --analyze-js=false \
+        --confidence 0.1 \
+        --probe=false \
+        $verbose_flag 2>&1; then
+        log_fail "Generate (analyze-js off) failed"
+        optout_failures=$((optout_failures + 1))
+    else
+        if grep -qE '^\s+/api' "$spec_off"; then
+            log_fail "--analyze-js=false still produced /api paths (opt-out broken)"
+            optout_failures=$((optout_failures + 1))
+        fi
+        if grep -q 'x-vespasian-source' "$spec_off"; then
+            log_fail "--analyze-js=false still emitted x-vespasian-source (opt-out broken)"
+            optout_failures=$((optout_failures + 1))
+        fi
+        # Key the success log off THIS branch's own counter, not the cumulative
+        # $failures — otherwise an earlier (analyze-js ON) failure would suppress
+        # an accurate "opt-out clean" message even when the opt-out path passed.
+        [ $optout_failures -eq 0 ] && log_ok "opt-out clean: no /api paths, no x-vespasian-source"
+    fi
+    failures=$((failures + optout_failures))
+
+    local duration=$((SECONDS - start))
+    if [ $failures -eq 0 ]; then
+        set_test_result "generate-js-static" "PASS" "$endpoint_count" "$expected_count" "$duration"
+        log_ok "generate-js-static: PASSED (${duration}s)"
+    else
+        set_test_result "generate-js-static" "FAIL" "$endpoint_count" "$expected_count" "$duration"
+        log_fail "generate-js-static: ${failures} check(s) failed (${duration}s)"
     fi
 }
 
@@ -1997,8 +2252,9 @@ usage() {
     echo "  --targets <list>      Comma-separated targets to test (default: all)"
     echo "                        Valid targets:"
     echo "                          Live:       rest-api, soap-service, graphql-server"
-    echo "                          Generate:   generate-rest, generate-wsdl,"
-    echo "                                      generate-graphql, generate-graphql-imports"
+    echo "                          Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,"
+    echo "                                      generate-graphql, generate-graphql-imports,"
+    echo "                                      generate-js-static"
     echo "                          Import:     import-burp, import-har, import-base64,"
     echo "                                      import-mitmproxy, import-mitmproxy-native,"
     echo "                                      import-unicode, import-duplicates,"
@@ -2063,7 +2319,7 @@ main() {
         targets="${TARGETS_SETUP:-rest-api,soap-service,graphql-server}"
         # Always include importer tests
         targets="${targets},import-burp,import-har,import-base64,import-mitmproxy,import-mitmproxy-native,import-unicode,import-duplicates,import-malformed,import-empty"
-        targets="${targets},generate-rest,generate-wsdl,generate-graphql,generate-graphql-imports"
+        targets="${targets},generate-rest,generate-wsdl,generate-wsdl-matrix,generate-graphql,generate-graphql-imports,generate-js-static"
         targets="${targets},edge-cases,crawl-depth,crawl-unreachable"
         targets="${targets},classifier-edge,spec-edge"
     fi
@@ -2107,8 +2363,10 @@ main() {
             import-empty)       test_import_empty ;;
             generate-rest)      test_generate_rest ;;
             generate-wsdl)      test_generate_wsdl ;;
+            generate-wsdl-matrix) test_generate_wsdl_matrix ;;
             generate-graphql)   test_generate_graphql ;;
             generate-graphql-imports) test_generate_graphql_imports ;;
+            generate-js-static) test_generate_js_static ;;
             edge-cases)         test_edge_cases ;;
             crawl-depth)        test_crawl_depth ;;
             crawl-unreachable)  test_crawl_unreachable ;;

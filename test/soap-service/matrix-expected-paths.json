@@ -1,0 +1,10 @@
+{
+  "description": "Expected SOAP operations for the LAB-2111 parameter-extraction matrix fixture (SOAP 1.1/1.2, RPC + doc/literal, xsi:type + value inference, nested complex)",
+  "operations": [
+    "Add",
+    "Register",
+    "CreateOrder"
+  ],
+  "total_operations": 3,
+  "soap_endpoint": "/calc"
+}

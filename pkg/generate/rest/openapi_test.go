@@ -1495,6 +1495,294 @@ func TestOpenAPIGenerator_NonHTTPScheme(t *testing.T) {
 	}
 }
 
+// --- x-vespasian-source extension tests ---
+
+func makeClassified(method, rawURL, source string) classify.ClassifiedRequest {
+	return classify.ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: method,
+			URL:    rawURL,
+			Source: source,
+		},
+		IsAPI:      true,
+		Confidence: 0.9,
+		APIType:    "rest",
+	}
+}
+
+func TestOpenAPI_XVespasianSource_DynamicWins(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "katana"),
+		makeClassified("GET", "https://h/api/x", "static:js"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	ext, ok := getOp["x-vespasian-source"]
+	if !ok {
+		t.Fatal("expected x-vespasian-source extension to be present")
+	}
+	if ext != "dynamic" {
+		t.Errorf("expected x-vespasian-source=dynamic, got %v", ext)
+	}
+}
+
+func TestOpenAPI_XVespasianSource_JSBundleOnly(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "static:js"),
+		makeClassified("GET", "https://h/api/x", "static:js"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	ext, ok := getOp["x-vespasian-source"]
+	if !ok {
+		t.Fatal("expected x-vespasian-source extension to be present")
+	}
+	if ext != "js-bundle" {
+		t.Errorf("expected x-vespasian-source=js-bundle, got %v", ext)
+	}
+}
+
+func TestOpenAPI_XVespasianSource_JSSourcemap(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "static:js-sourcemap"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	ext, ok := getOp["x-vespasian-source"]
+	if !ok {
+		t.Fatal("expected x-vespasian-source extension to be present")
+	}
+	if ext != "js-sourcemap" {
+		t.Errorf("expected x-vespasian-source=js-sourcemap, got %v", ext)
+	}
+}
+
+func TestOpenAPI_XVespasianSource_OmittedForEmptySource(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	// No static: source anywhere in the input.
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", ""),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	if _, ok := getOp["x-vespasian-source"]; ok {
+		t.Error("expected x-vespasian-source to be absent when source is empty")
+	}
+}
+
+// Regression for QUAL-005: a group that mixes untagged (Source=="") dynamic
+// entries with static:js entries must resolve to "dynamic", not "js-bundle".
+// The presence of at least one static:* in the overall input still triggers
+// the extension via anyStaticSource(); within the group, an empty Source is a
+// dynamic signal and must not be skipped.
+func TestComputeSourceTag_MixedEmptyAndStaticInGroup_ResolvesDynamic(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		// Untagged dynamic entry for /api/x (pre-LAB-2108 capture style).
+		makeClassified("GET", "https://h/api/x", ""),
+		// Static entry for the same endpoint key.
+		makeClassified("GET", "https://h/api/x", "static:js"),
+		// Unrelated static entry so anyStaticSource gates the extension on.
+		makeClassified("GET", "https://h/api/y", "static:js"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	ext, ok := getOp["x-vespasian-source"]
+	if !ok {
+		t.Fatal("expected x-vespasian-source extension to be present for mixed group")
+	}
+	if ext != "dynamic" {
+		t.Errorf("expected x-vespasian-source=dynamic when group mixes empty Source and static:js, got %v", ext)
+	}
+}
+
+// Regression for CR-2: a non-JS "static:*" source (e.g. static:html from
+// pkg/analyze form analysis) must NOT gate or surface in the x-vespasian-source
+// extension. The extension is scoped to JS bundle / sourcemap recovery only.
+func TestOpenAPI_XVespasianSource_StaticHtmlIgnored(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "static:html"),
+		makeClassified("POST", "https://h/api/y", "static:html"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	// Walk every operation; the extension must be absent everywhere when only
+	// non-JS static sources are present in the input.
+	for _, pathVal := range paths {
+		pathItem := pathVal.(map[string]interface{})
+		for _, opVal := range pathItem {
+			op, ok := opVal.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if _, has := op["x-vespasian-source"]; has {
+				t.Errorf("x-vespasian-source must be absent when only static:html (non-JS) is present; op: %v", op)
+			}
+		}
+	}
+}
+
+// Regression for CR-2: a group containing ONLY static:html, in a corpus where
+// another group has static:js (so anyStaticSource gates the extension on),
+// must resolve to "dynamic" — not "html". Pre-fix this test would have failed:
+// computeSourceTag's strings.TrimPrefix default would have emitted
+// x-vespasian-source: "html" for the /api/x group. Post-fix the JS-only
+// allow-list early-returns "dynamic" for any non-JS static source. This is
+// the only single-group composition that distinguishes pre-fix from post-fix
+// behavior; the StaticHtmlIgnored test above covers the corpus-gate case.
+func TestComputeSourceTag_StaticHtmlOnlyGroupInJSCorpus_ResolvesDynamic(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		// /api/x has ONLY static:html — pre-fix would emit "html" here.
+		makeClassified("GET", "https://h/api/x", "static:html"),
+		makeClassified("GET", "https://h/api/x", "static:html"),
+		// Unrelated static:js entry forces anyStaticSource to fire (true under
+		// both pre-fix HasPrefix("static:") AND post-fix crawl.IsJSStaticSource).
+		makeClassified("GET", "https://h/api/z", "static:js"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	ext, ok := getOp["x-vespasian-source"]
+	if !ok {
+		t.Fatal("expected x-vespasian-source extension to be present (anyStaticSource fires from /api/z)")
+	}
+	if ext != "dynamic" {
+		t.Errorf("expected x-vespasian-source=dynamic for static:html-only group, got %v (a 'html' or other non-allowed value means the allow-list regressed)", ext)
+	}
+}
+
+// mixed static-only groups (static:js + static:js-sourcemap) must resolve to "dynamic".
+func TestComputeSourceTag_MixedStaticGroups(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	// Two entries for the same endpoint: one from js bundle, one from sourcemap.
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "static:js"),
+		makeClassified("GET", "https://h/api/x", "static:js-sourcemap"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	ext, ok := getOp["x-vespasian-source"]
+	if !ok {
+		t.Fatal("expected x-vespasian-source extension to be present")
+	}
+	if ext != "dynamic" {
+		t.Errorf("expected x-vespasian-source=dynamic for mixed static group, got %v", ext)
+	}
+}
+
+func TestOpenAPI_XVespasianSource_NoStaticPresent_ByteCompat(t *testing.T) {
+	// When no static: sources exist anywhere in input, generate twice with
+	// identical inputs and assert output is identical (byte compat).
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "katana"),
+		makeClassified("POST", "https://h/api/y", "browser"),
+	}
+
+	spec1, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate (run 1) failed: %v", err)
+	}
+	spec2, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate (run 2) failed: %v", err)
+	}
+	if string(spec1) != string(spec2) {
+		t.Error("Generate output is not deterministic / byte-compatible across runs")
+	}
+
+	// Also verify extension is absent on every operation.
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec1, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	for _, pathVal := range paths {
+		pathItem := pathVal.(map[string]interface{})
+		for _, opVal := range pathItem {
+			if op, ok := opVal.(map[string]interface{}); ok {
+				if _, hasExt := op["x-vespasian-source"]; hasExt {
+					t.Error("expected x-vespasian-source to be absent when no static sources in input")
+				}
+			}
+		}
+	}
+}
+
 // TestBuildOperation_EmptyValuesQueryParam is a regression test for D2: a query
 // parameter with an empty observed-values slice must be silently omitted from
 // the generated Operation. Prior to the D2 fix, buildOperation would panic
@@ -1517,7 +1805,7 @@ func TestBuildOperation_EmptyValuesQueryParam(t *testing.T) {
 	key := endpointKey{path: "/items", method: "get"}
 
 	// Must not panic.
-	op := buildOperation(key, group)
+	op := buildOperation(key, group, false)
 
 	// "foo" must be absent — no observed values means we cannot document it.
 	for _, paramRef := range op.Parameters {
@@ -1553,7 +1841,7 @@ func TestBuildOperation_ScalarQueryParam(t *testing.T) {
 		},
 	}
 	key := endpointKey{path: "/items", method: "get"}
-	op := buildOperation(key, group)
+	op := buildOperation(key, group, false)
 
 	require.Len(t, op.Parameters, 1)
 	param := op.Parameters[0].Value
@@ -1583,7 +1871,7 @@ func TestBuildOperation_MultiValueQueryParam_AllInts(t *testing.T) {
 		},
 	}
 	key := endpointKey{path: "/items", method: "get"}
-	op := buildOperation(key, group)
+	op := buildOperation(key, group, false)
 
 	require.Len(t, op.Parameters, 1)
 	param := op.Parameters[0].Value
@@ -1617,7 +1905,7 @@ func TestBuildOperation_MultiValueQueryParam_Mixed(t *testing.T) {
 		},
 	}
 	key := endpointKey{path: "/items", method: "get"}
-	op := buildOperation(key, group)
+	op := buildOperation(key, group, false)
 
 	require.Len(t, op.Parameters, 1)
 	param := op.Parameters[0].Value
@@ -1639,7 +1927,7 @@ func TestBuildOperation_MultiValueQueryParam_AllBool(t *testing.T) {
 		},
 	}
 	key := endpointKey{path: "/flags", method: "get"}
-	op := buildOperation(key, group)
+	op := buildOperation(key, group, false)
 
 	require.Len(t, op.Parameters, 1)
 	param := op.Parameters[0].Value
@@ -1692,7 +1980,7 @@ func TestBuildOperation_ScalarQueryParam_OrderIndependence(t *testing.T) {
 			QueryParams: map[string][]string{"limit": {"1.5"}},
 		}},
 	}
-	op := buildOperation(endpointKey{path: "/items", method: "get"}, group)
+	op := buildOperation(endpointKey{path: "/items", method: "get"}, group, false)
 	require.NotNil(t, op)
 	require.Len(t, op.Parameters, 1)
 	p := op.Parameters[0].Value
@@ -1728,7 +2016,7 @@ func TestBuildOperation_PostDedupScalarNotOverWidened(t *testing.T) {
 			MultiValueQueryKeys: map[string]bool{}, // empty: page was scalar in both contributing obs
 		},
 	}
-	op := buildOperation(endpointKey{path: "/items", method: "get"}, group)
+	op := buildOperation(endpointKey{path: "/items", method: "get"}, group, false)
 	require.NotNil(t, op)
 	require.Len(t, op.Parameters, 1)
 	p := op.Parameters[0].Value
@@ -1756,7 +2044,7 @@ func TestBuildOperation_PostDedupArrayStillDetected(t *testing.T) {
 			MultiValueQueryKeys: map[string]bool{"tag": true},
 		},
 	}
-	op := buildOperation(endpointKey{path: "/items", method: "get"}, group)
+	op := buildOperation(endpointKey{path: "/items", method: "get"}, group, false)
 	require.NotNil(t, op)
 	require.Len(t, op.Parameters, 1)
 	p := op.Parameters[0].Value
