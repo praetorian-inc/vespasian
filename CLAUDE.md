@@ -68,8 +68,8 @@ The CLI (`cmd/vespasian`) uses Kong for argument parsing. Each command (crawl, i
 - **cmd/vespasian**: CLI entry point, command definitions, signal handling, browser lifecycle management
 - **pkg/crawl**: Headless browser crawling via Katana, capture file I/O (`ObservedRequest` JSON format), browser manager with Chrome lifecycle
 - **pkg/analyze**: Static analysis of captured HTML response bodies; extracts `<form>` endpoints and parameter names as synthetic `ObservedRequest` entries (`Source="static:html"`) to surface form-based APIs not triggered during crawl
-- **pkg/classify**: Request classification engine with confidence-based heuristics; classifiers for REST, GraphQL, and WSDL; deduplication
-- **pkg/probe**: Active endpoint probing strategies (OPTIONS discovery, JSON schema inference, WSDL document fetching, GraphQL introspection with 3-tier WAF bypass); SSRF protection with DNS rebinding mitigation
+- **pkg/classify**: Request classification engine with confidence-based heuristics; classifiers for REST, GraphQL, WSDL, and gRPC; deduplication
+- **pkg/probe**: Active endpoint probing strategies (OPTIONS discovery, JSON schema inference, WSDL document fetching, GraphQL introspection with 3-tier WAF bypass, gRPC server reflection); SSRF protection with DNS rebinding mitigation (also applied to gRPC dial via a configurable `Config.Dialer`)
 - **pkg/generate**: Spec generation interface and registry; delegates to sub-packages by API type
 - **pkg/generate/rest**: OpenAPI 3.0 generation, path normalization (UUID detection, context-aware parameter naming), JSON schema inference, form-encoded and multipart request-body inference
 - **pkg/generate/graphql**: GraphQL SDL generation from introspection results or traffic-based inference
@@ -77,11 +77,12 @@ The CLI (`cmd/vespasian`) uses Kong for argument parsing. Each command (crawl, i
 - **pkg/analyze/jsstatic**: Static analysis of captured JavaScript bundles using BishopFox/jsluice. Sits between the capture stage and classify/generate stages. Recovers API endpoints, HTTP methods, path parameters (via EXPR→{param} normalisation), and request-body field names (from `fetch`/`axios` object literals). Synthesises `crawl.ObservedRequest` entries with `Source="static:js"` or `"static:js-sourcemap"` and appends them after dynamic entries so `classify.Deduplicate` keeps dynamic observations on ties. Enabled by default; opt out with `--analyze-js=false`.
 - **pkg/importer**: Traffic importers for Burp Suite XML, HAR 1.2, and mitmproxy dumps (including mitmproxy's native tnetstring `.mitm` format); format registry with layered safety caps — 500 MB per file, 64 MB per tnetstring element, 1 M entries per list/dict, 500 K flows per native stream
 - **pkg/mediatype**: Shared media-type canonicalization (lowercase + parameter strip). Used by classify and generate/rest where an import cycle prevents direct sharing.
+- **internal/grpcwire**: gRPC length-prefixed framing + protobuf wire-format parser (ParseFrame, ParseVarint, ParseTag, WalkFields). Consumed by classify/probe and intended for the traffic-inference path in a future gRPC generator.
 
 ### Key Patterns
 
 - **Registry pattern**: Both `pkg/importer` and `pkg/generate` use a registry map to look up implementations by name (`Get()` function)
-- **Strategy pattern**: `pkg/probe` defines `ProbeStrategy` interface; each probe type (Options, Schema, WSDL, GraphQL) is a separate implementation
+- **Strategy pattern**: `pkg/probe` defines `ProbeStrategy` interface; each probe type (Options, Schema, WSDL, GraphQL, gRPC reflection) is a separate implementation
 - **Classifier interface**: `pkg/classify` defines `APIClassifier` interface; each API type has its own classifier with heuristic rules and confidence scores
 
 ### Capture Format
