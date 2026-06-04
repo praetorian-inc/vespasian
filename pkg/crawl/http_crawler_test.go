@@ -266,8 +266,10 @@ func TestHTTPCrawler_InlineScriptExtraction(t *testing.T) {
 }
 
 func TestHTTPCrawler_RedirectScopeBlocked(t *testing.T) {
+	var seedHits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
+			seedHits.Add(1)
 			http.Redirect(w, r, "http://169.254.169.254/latest/meta-data/", http.StatusFound)
 			return
 		}
@@ -280,6 +282,13 @@ func TestHTTPCrawler_RedirectScopeBlocked(t *testing.T) {
 		if strings.Contains(r.URL, "169.254.169.254") {
 			t.Error("crawler followed redirect to cloud metadata host")
 		}
+	}
+	if seedHits.Load() == 0 {
+		t.Error("seed URL was never requested; redirect guard test is vacuous")
+	}
+	stderrOut := stderr.String()
+	if !strings.Contains(stderrOut, "fetch:") && !strings.Contains(stderrOut, "blocked") && !strings.Contains(stderrOut, "redirect") {
+		t.Errorf("expected guard error on stderr, got: %q", stderrOut)
 	}
 }
 
