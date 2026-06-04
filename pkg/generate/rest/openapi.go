@@ -28,6 +28,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 )
 
@@ -171,6 +172,74 @@ func groupEndpoints(endpoints []classify.ClassifiedRequest) map[endpointKey][]cl
 	return endpointGroups
 }
 
+// anyStaticSource returns true if any request in endpoints carries a JS-bundle
+// static-analysis source. The x-vespasian-source extension is gated on this so
+// that flag-off output (and inputs from sources outside LAB-2108) stay
+// byte-identical to pre-LAB-2108 behavior. Non-JS static sources do not gate.
+//
+// The per-element check is delegated to crawl.IsJSStaticSource, which owns the
+// canonical definition of the JS-static Source vocabulary. The local wrapper
+// exists only to accept []classify.ClassifiedRequest (which embeds
+// crawl.ObservedRequest) rather than []crawl.ObservedRequest.
+func anyStaticSource(endpoints []classify.ClassifiedRequest) bool {
+	for _, ep := range endpoints {
+		if crawl.IsJSStaticSource(ep.Source) {
+			return true
+		}
+	}
+	return false
+}
+
+// computeSourceTag derives the x-vespasian-source value for an operation group.
+// Mapping (architecture.md §7):
+//   - any request with Source not in {"static:js", "static:js-sourcemap"}
+//     (including empty Source from pre-LAB-2108 captures, untagged dynamic
+//     entries, AND non-JS static sources like "static:html") → "dynamic"
+//   - all requests Source == "static:js"             → "js-bundle"
+//   - all requests Source == "static:js-sourcemap"   → "js-sourcemap"
+//   - mixed JS-static prefixes within a group        → "dynamic"
+//   - empty group (len(group) == 0)                  → "" (no extension emitted)
+//
+// For non-empty input the function always returns one of: "dynamic",
+// "js-bundle", or "js-sourcemap".
+//
+// The empty-group case is unreachable in current usage because groupEndpoints
+// only creates a key when at least one ClassifiedRequest matches; this contract
+// is documented for defense-in-depth so future callers can rely on it.
+//
+// This is intentionally a closed allow-list rather than a strings.TrimPrefix
+// open list — a new "static:foo" source must NOT silently surface as
+// x-vespasian-source: foo because the extension consumer contract names only
+// the three non-empty values above.
+func computeSourceTag(group []classify.ClassifiedRequest) string {
+	if len(group) == 0 {
+		return ""
+	}
+	var tag string
+	for _, ep := range group {
+		if !crawl.IsJSStaticSource(ep.Source) {
+			// Any non-JS-static source (dynamic, empty, or static:html etc.)
+			// wins immediately.
+			return "dynamic"
+		}
+		var friendly string
+		switch ep.Source {
+		case crawl.SourceStaticJS:
+			friendly = "js-bundle"
+		case crawl.SourceStaticJSSourcemap:
+			friendly = "js-sourcemap"
+		}
+		if tag == "" {
+			tag = friendly
+			continue
+		}
+		if tag != friendly {
+			return "dynamic"
+		}
+	}
+	return tag
+}
+
 // mergeJSONBodies infers and merges JSON schemas from multiple body observations.
 func mergeJSONBodies(bodies [][]byte) *openapi3.SchemaRef {
 	var merged *openapi3.SchemaRef
@@ -191,7 +260,10 @@ func mergeJSONBodies(bodies [][]byte) *openapi3.SchemaRef {
 }
 
 // buildOperation builds a single OpenAPI operation from a group of classified requests.
-func buildOperation(key endpointKey, group []classify.ClassifiedRequest) *openapi3.Operation { //nolint:gocyclo // OpenAPI operation builder
+// emitSource controls whether the x-vespasian-source extension is set on the operation.
+// It should be true only when at least one request in the entire Generate input carries
+// a "static:*" Source value (so flag-off output stays byte-identical to pre-LAB-2108).
+func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSource bool) *openapi3.Operation { //nolint:gocyclo // OpenAPI operation builder
 	operation := &openapi3.Operation{
 		Summary:   capitalizeFirst(key.method) + " " + key.path,
 		Responses: &openapi3.Responses{},
@@ -441,6 +513,18 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest) *openap
 		}
 	}
 
+	// LAB-2108: x-vespasian-source extension.
+	// Only emit when the overall Generate input contained at least one static: source
+	// (emitSource=true), preventing any change to output for flag-off/legacy captures.
+	if emitSource {
+		if src := computeSourceTag(group); src != "" {
+			if operation.Extensions == nil {
+				operation.Extensions = map[string]any{}
+			}
+			operation.Extensions["x-vespasian-source"] = src
+		}
+	}
+
 	return operation
 }
 
@@ -467,6 +551,11 @@ func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]b
 	// Group and sort endpoints
 	endpointGroups := groupEndpoints(endpoints)
 
+	// Determine whether to emit x-vespasian-source extensions.
+	// Only emitted when at least one input request has a "static:" Source so that
+	// output is byte-identical to pre-LAB-2108 when --analyze-js is not in use.
+	staticPresent := anyStaticSource(endpoints)
+
 	// Sort endpoint keys for deterministic output
 	keys := make([]endpointKey, 0, len(endpointGroups))
 	for k := range endpointGroups {
@@ -489,7 +578,7 @@ func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]b
 		}
 
 		// Build operation from group
-		operation := buildOperation(key, group)
+		operation := buildOperation(key, group, staticPresent)
 
 		// Set operation for the method
 		switch key.method {
