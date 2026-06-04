@@ -96,8 +96,11 @@ func (f *urlFrontier) Push(entries []urlEntry) int {
 }
 
 // SetDFS switches the frontier to depth-first (LIFO) pop order when v is true,
-// or back to breadth-first (FIFO) when v is false. This is safe to call before
-// the first Push; calling it after workers have started is a data race.
+// or back to breadth-first (FIFO) when v is false. The mutation is
+// mutex-protected and is therefore safe from data races. However, SetDFS is
+// intended to be called before the first Push: calling it after workers have
+// started produces a non-deterministic mid-crawl traversal-order change (a
+// logical race), not a data race.
 func (f *urlFrontier) SetDFS(v bool) {
 	f.mu.Lock()
 	f.dfs = v

@@ -27,6 +27,43 @@ import (
 	"time"
 )
 
+// TestNewHTTPClient_SSRFGuard exercises the newHTTPClient helper (TEST-002).
+// When allowPrivate=false the returned client's Transport must be a *http.Transport
+// whose DialContext is non-nil and distinct from http.DefaultTransport (proving
+// the SSRF dial guard is wired in). When allowPrivate=true the Transport must be
+// http.DefaultTransport itself (no override).
+func TestNewHTTPClient_SSRFGuard(t *testing.T) {
+	t.Run("allowPrivate=false uses guarded transport", func(t *testing.T) {
+		c := newHTTPClient(nil, false, 30*time.Second)
+		if c == nil {
+			t.Fatal("newHTTPClient returned nil")
+		}
+		// Transport must be a *http.Transport (not http.DefaultTransport directly).
+		tr, ok := c.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("Transport = %T, want *http.Transport", c.Transport)
+		}
+		if tr == http.DefaultTransport {
+			t.Error("Transport must not be http.DefaultTransport (want a clone with DialContext set)")
+		}
+		// DialContext must be non-nil — that is the SSRF dial guard.
+		if tr.DialContext == nil {
+			t.Error("Transport.DialContext = nil, want non-nil (ssrfSafeDialContext)")
+		}
+	})
+
+	t.Run("allowPrivate=true uses DefaultTransport", func(t *testing.T) {
+		c := newHTTPClient(nil, true, 30*time.Second)
+		if c == nil {
+			t.Fatal("newHTTPClient returned nil")
+		}
+		if c.Transport != http.DefaultTransport {
+			t.Errorf("Transport = %T (%p), want http.DefaultTransport (%p)",
+				c.Transport, c.Transport, http.DefaultTransport)
+		}
+	})
+}
+
 func TestHTTPCrawler_FollowsLinks(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
@@ -128,12 +165,10 @@ func TestHTTPCrawler_BodyCap(t *testing.T) {
 }
 
 func TestHTTPCrawler_PerPageTimeoutSurfaced(t *testing.T) {
-	// Set a very short per-page timeout via the injectable package var so we
+	// Use a very short per-page timeout via the pageTimeout field so we
 	// exercise the per-page timeout path, not the overall-context path (TEST-005).
-	// Restore the original value when the test ends.
-	orig := httpPageTimeout
-	httpPageTimeout = 50 * time.Millisecond
-	t.Cleanup(func() { httpPageTimeout = orig })
+	// The pageTimeout field is the test seam replacing the former httpPageTimeout
+	// package-level variable (QUAL-004).
 
 	// Server that holds the connection open well beyond the per-page timeout.
 	// The seed page returns quickly and links to /slow.
@@ -156,15 +191,18 @@ func TestHTTPCrawler_PerPageTimeoutSurfaced(t *testing.T) {
 	}()
 
 	var stderr bytes.Buffer
-	c := &HTTPCrawler{opts: CrawlerOptions{
-		Depth:        2,
-		MaxPages:     5,
-		Stderr:       &stderr,
-		AllowPrivate: true,
-		// Timeout is intentionally large (or zero) so the crawl is terminated
-		// by the per-page timeout, not the overall context.
-		Timeout: 10 * time.Second,
-	}}
+	c := &HTTPCrawler{
+		opts: CrawlerOptions{
+			Depth:        2,
+			MaxPages:     5,
+			Stderr:       &stderr,
+			AllowPrivate: true,
+			// Timeout is intentionally large (or zero) so the crawl is terminated
+			// by the per-page timeout, not the overall context.
+			Timeout: 10 * time.Second,
+		},
+		pageTimeout: 50 * time.Millisecond,
+	}
 
 	// Crawl should return (the /slow page is skipped on timeout) without panic.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

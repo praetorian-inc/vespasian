@@ -19,44 +19,15 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+
+	"github.com/praetorian-inc/vespasian/internal/netutil"
 )
 
-// privateNetworks defines CIDR ranges that are considered private or internal.
-var privateNetworks []*net.IPNet
-
-func init() {
-	cidrs := []string{
-		"0.0.0.0/8",      // RFC 1122 "this host on this network" (0.x can address localhost on Linux)
-		"127.0.0.0/8",    // IPv4 loopback
-		"10.0.0.0/8",     // RFC 1918
-		"100.64.0.0/10",  // RFC 6598 CGNAT / shared address space (carrier & cloud internal)
-		"172.16.0.0/12",  // RFC 1918
-		"192.168.0.0/16", // RFC 1918
-		"169.254.0.0/16", // link-local (includes cloud metadata 169.254.169.254)
-		"::1/128",        // IPv6 loopback
-		"fe80::/10",      // IPv6 link-local
-		"fc00::/7",       // IPv6 ULA
-	}
-	for _, cidr := range cidrs {
-		_, network, err := net.ParseCIDR(cidr)
-		if err != nil {
-			panic("invalid CIDR in privateNetworks: " + cidr)
-		}
-		privateNetworks = append(privateNetworks, network)
-	}
-}
-
 // isPrivateIP reports whether ip falls within a private or internal network range.
+// It delegates to internal/netutil.IsPrivateIP, which is the single source of
+// truth for the CIDR list shared by the crawl and probe stages.
 func isPrivateIP(ip net.IP) bool {
-	if ip.IsUnspecified() {
-		return true
-	}
-	for _, network := range privateNetworks {
-		if network.Contains(ip) {
-			return true
-		}
-	}
-	return false
+	return netutil.IsPrivateIP(ip)
 }
 
 // ValidateProbeURL checks that rawURL is safe to probe. It rejects non-HTTP(S)
@@ -110,28 +81,9 @@ func SSRFSafeDialContext(ctx context.Context, network, addr string) (net.Conn, e
 }
 
 // ssrfSafeDialContext is the internal implementation of SSRFSafeDialContext.
+// It delegates to internal/netutil.SSRFSafeDialContext, which uses the multi-IP
+// fallback version (tries each validated IP in order) so a single dead A/AAAA
+// record does not fail the dial when another validated address would connect.
 func ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid address %q: %w", addr, err)
-	}
-
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-	if err != nil {
-		return nil, fmt.Errorf("DNS lookup failed for %q: %w", host, err)
-	}
-
-	if len(ips) == 0 {
-		return nil, fmt.Errorf("DNS lookup for %q returned no addresses", host)
-	}
-
-	for _, ip := range ips {
-		if isPrivateIP(ip.IP) {
-			return nil, fmt.Errorf("blocked: %s resolves to private IP %s", host, ip.IP)
-		}
-	}
-
-	// Dial the first resolved address.
-	dialer := &net.Dialer{}
-	return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+	return netutil.SSRFSafeDialContext(ctx, network, addr)
 }

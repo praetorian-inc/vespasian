@@ -25,11 +25,18 @@
 //
 // Non-headless mode ([HTTPCrawler]): uses the Go stdlib net/http client with a
 // depth-first search frontier, 150 req/s rate limiter, and a 10 MB per-page
-// read cap. HTML pages are parsed with goquery using the same link selectors as
-// the headless path; inline <script> blocks are analyzed with jsluice to surface
-// additional endpoints. Redirect chains are validated by a scope+SSRF guard:
-// redirects that leave the crawl scope or target private/link-local addresses
-// (e.g. 169.254.169.254) are blocked before the request is issued.
+// read cap. HTML pages are parsed with goquery (single parse per page) using
+// the same link selectors as the headless path; inline <script> blocks are
+// analyzed with jsluice to surface additional endpoints. Redirect chains are
+// validated by a scope+SSRF guard (redirectScopeGuard, defense-in-depth) and
+// the authoritative DNS-rebinding control is ssrfSafeDialContext, which
+// re-resolves the host at connect time: redirects and connections that target
+// private/link-local addresses (e.g. 169.254.169.254) are blocked.
+//
+// The headless ([RodCrawler]) path relies on Chrome's own networking stack for
+// DNS resolution and does NOT have a Go dial-time IP pin. The upfront
+// scopeChecker SSRF check applies, but Chrome-resolved addresses are not
+// re-validated at dial time (known limitation; see crawlHeadless).
 //
 // The package also defines the capture file format: a JSON array of
 // ObservedRequest structs that serves as the interchange format between the

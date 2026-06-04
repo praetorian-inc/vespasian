@@ -56,6 +56,12 @@ func (c *RodCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReq
 // drives multiple browser tabs in parallel so DOM-stability waits overlap
 // across pages, making crawls significantly faster than a serial page-by-page
 // visit.
+//
+// SSRF note: the headless backend relies on Chrome's own networking stack and
+// the upfront scopeChecker SSRF check. It does NOT have a Go dial-time IP pin
+// (ssrfSafeDialContext) equivalent — Chrome's DNS resolution is outside Go's
+// net.Dialer. This is a known limitation; the HTTPCrawler path uses
+// ssrfSafeDialContext as the authoritative DNS-rebinding control.
 func (c *RodCrawler) crawlHeadless(ctx context.Context, targetURL string, maxPages int, browserMgr *BrowserManager) ([]ObservedRequest, error) {
 	// Apply the overall crawl timeout if configured.
 	if c.opts.Timeout > 0 {

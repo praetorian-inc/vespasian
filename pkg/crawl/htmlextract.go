@@ -38,7 +38,16 @@ func extractFromHTML(body []byte, pageURL string) ([]string, string) {
 	if err != nil {
 		return nil, pageURL
 	}
+	links, base := extractFromHTMLDoc(doc, pageURL)
+	return links, base
+}
 
+// extractFromHTMLDoc extracts navigable links and the effective base URL from
+// an already-parsed *goquery.Document. It is the single-parse core shared by
+// extractFromHTML and extractHTMLAndInlineScripts. Callers that need both links
+// and inline-script results should use extractHTMLAndInlineScripts to avoid
+// parsing the document twice.
+func extractFromHTMLDoc(doc *goquery.Document, pageURL string) ([]string, string) {
 	// Resolve the effective base URL: honor <base href> when present, applying
 	// the same scheme-downgrade and cross-host guards as effectiveBaseURLFrom.
 	base := pageURL
@@ -76,6 +85,21 @@ func extractFromHTML(body []byte, pageURL string) ([]string, string) {
 	return links, base
 }
 
+// extractHTMLAndInlineScripts parses the HTML body exactly once and returns
+// both the navigable links (with the effective base URL) and any jsluice
+// results from inline <script> tags. This avoids the double parse that would
+// occur if extractFromHTML and extractInlineScripts were called separately on
+// the same body (QUAL-002).
+func extractHTMLAndInlineScripts(body []byte, pageURL string) (links []string, base string, inlineScripts []jsExtractedURL) {
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	if err != nil {
+		return nil, pageURL, nil
+	}
+	links, base = extractFromHTMLDoc(doc, pageURL)
+	inlineScripts = extractInlineScriptsFromDoc(doc)
+	return links, base, inlineScripts
+}
+
 // extractInlineScripts finds all inline <script> tags (those without a src
 // attribute) in the HTML body and runs jsluice on each one. This is the goquery
 // analog of extractURLsFromInlineScripts (jsextract.go:82) — same filtering,
@@ -85,7 +109,14 @@ func extractInlineScripts(body []byte) []jsExtractedURL {
 	if err != nil {
 		return nil
 	}
+	return extractInlineScriptsFromDoc(doc)
+}
 
+// extractInlineScriptsFromDoc runs jsluice on all inline <script> tags (those
+// without a src attribute) in an already-parsed *goquery.Document. Callers
+// that hold a doc from a prior parse should call this directly to avoid
+// re-parsing the body.
+func extractInlineScriptsFromDoc(doc *goquery.Document) []jsExtractedURL {
 	var results []jsExtractedURL
 	doc.Find("script:not([src])").Each(func(_ int, s *goquery.Selection) {
 		text := s.Text()

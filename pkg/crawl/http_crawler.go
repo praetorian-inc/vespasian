@@ -28,16 +28,46 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// httpPageTimeout is the per-page fetch timeout for the HTTP engine. It defaults
-// to PageTimeout seconds and is a package var (not a const) solely so tests can
-// shrink it to exercise the per-page-timeout path without a multi-second sleep —
-// the same test-seam pattern used by mergeEnrichedLinksFn. Production never
-// reassigns it. NOT safe to mutate concurrently with a running crawl.
-var httpPageTimeout = time.Duration(PageTimeout) * time.Second
+// newHTTPClient builds an *http.Client for the HTTPCrawler. When allowPrivate
+// is false, the transport is a clone of http.DefaultTransport with DialContext
+// wired to ssrfSafeDialContext so the DNS-rebinding TOCTOU window is closed at
+// connect time (SEC-BE-002). When allowPrivate is true, http.DefaultTransport
+// is used unchanged. The client's CheckRedirect is always set to
+// redirectScopeGuard(scopeFn).
+func newHTTPClient(scopeFn func(string) bool, allowPrivate bool, timeout time.Duration) *http.Client {
+	transport := http.RoundTripper(http.DefaultTransport)
+	if !allowPrivate {
+		// Clone DefaultTransport and override only DialContext so we keep its
+		// TLS, keep-alive, HTTP/2, proxy, and idle-connection tunings while
+		// re-resolving and re-validating IPs at connect time, closing the
+		// DNS-rebinding TOCTOU window (SEC-BE-002).
+		base, ok := http.DefaultTransport.(*http.Transport)
+		if !ok {
+			// Defensive: stdlib always sets *http.Transport, but if a future
+			// runtime changes that, fall back to a fresh transport rather than
+			// silently dropping the SSRF dial guard.
+			base = &http.Transport{}
+		}
+		t := base.Clone()
+		t.DialContext = ssrfSafeDialContext
+		transport = t
+	}
+	return &http.Client{
+		CheckRedirect: redirectScopeGuard(scopeFn),
+		Transport:     transport,
+		Timeout:       timeout,
+	}
+}
 
 // Crawl runs the non-headless crawl using the stdlib net/http engine — the
 // HTTP-only path used when --headless=false.
 func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRequest, error) {
+	// Apply default per-page timeout when the struct was constructed directly
+	// (bypassing NewCrawler) and pageTimeout was left at zero.
+	if c.pageTimeout == 0 {
+		c.pageTimeout = time.Duration(PageTimeout) * time.Second
+	}
+
 	maxPages, err := validateCrawlInputs(c.opts, targetURL)
 	if err != nil {
 		return nil, err
@@ -72,31 +102,11 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	limiter := rate.NewLimiter(rate.Limit(150), 150)
 
 	// HTTP client with redirect scope guard and bounded timeout.
-	// The per-page context (PageTimeout) already cancels hung fetches, but an
+	// The per-page context (c.pageTimeout) already cancels hung fetches, but an
 	// explicit Client.Timeout provides defense-in-depth if the context is ever
-	// mis-wired on a future code path (SEC-BE-001).
-	transport := http.DefaultTransport
-	if !c.opts.AllowPrivate {
-		// Clone DefaultTransport and override only DialContext so we keep its
-		// TLS, keep-alive, HTTP/2, proxy, and idle-connection tunings while
-		// re-resolving and re-validating IPs at connect time, closing the
-		// DNS-rebinding TOCTOU window (SEC-BE-002).
-		base, ok := http.DefaultTransport.(*http.Transport)
-		if !ok {
-			// Defensive: stdlib always sets *http.Transport, but if a future
-			// runtime changes that, fall back to a fresh transport rather than
-			// silently dropping the SSRF dial guard.
-			base = &http.Transport{}
-		}
-		t := base.Clone()
-		t.DialContext = ssrfSafeDialContext
-		transport = t
-	}
-	client := &http.Client{
-		CheckRedirect: redirectScopeGuard(scopeFn),
-		Transport:     transport,
-		Timeout:       time.Duration(PageTimeout) * time.Second,
-	}
+	// mis-wired on a future code path (SEC-BE-001). Both use c.pageTimeout so
+	// they track the same source (QUAL-004).
+	client := newHTTPClient(scopeFn, c.opts.AllowPrivate, c.pageTimeout)
 
 	// Seed the frontier. Reject if the seed itself doesn't pass scope/SSRF.
 	if frontier.Push([]urlEntry{{URL: targetURL, Depth: 0}}) == 0 {
@@ -202,7 +212,7 @@ func (c *HTTPCrawler) runWorker(
 // returns the observed request and discovered links. On error it logs to Stderr
 // (if set) and returns (nil, nil) so the worker can continue.
 func (c *HTTPCrawler) fetchPage(ctx context.Context, client *http.Client, limiter *rate.Limiter, entry urlEntry) (*ObservedRequest, []string) {
-	pageCtx, cancel := context.WithTimeout(ctx, httpPageTimeout)
+	pageCtx, cancel := context.WithTimeout(ctx, c.pageTimeout)
 	defer cancel()
 
 	// Rate-limit before fetching. A limiter.Wait error (context canceled or
@@ -275,14 +285,15 @@ func (c *HTTPCrawler) extractLinks(observed ObservedRequest, fullBody []byte, pa
 
 	ct := strings.ToLower(observed.Response.ContentType)
 	if isHTMLContentType(ct) {
-		// extractFromHTML parses the body and returns both the discovered links
-		// and the effective base. extractInlineScripts parses the body a second
-		// time to find inline <script> blocks; reusing the base returned here only
-		// avoids recomputing the effective base, not the second parse.
+		// extractHTMLAndInlineScripts parses the body exactly once, returning
+		// both the navigable links and inline-script jsluice results. Previously
+		// extractFromHTML and extractInlineScripts each called
+		// goquery.NewDocumentFromReader separately (QUAL-002 double-parse fix).
 		var htmlLinks []string
-		htmlLinks, base = extractFromHTML(fullBody, pageURL)
+		var inlineScripts []jsExtractedURL
+		htmlLinks, base, inlineScripts = extractHTMLAndInlineScripts(fullBody, pageURL)
 		links = append(links, htmlLinks...)
-		links = append(links, jsExtractedToLinks(extractInlineScripts(fullBody), base)...)
+		links = append(links, jsExtractedToLinks(inlineScripts, base)...)
 	}
 
 	// extractURLsFromResponses keys off the response body, so feed it a view of
@@ -374,13 +385,19 @@ func clampConcurrency(n int) int {
 // redirectScopeGuard returns a CheckRedirect function that blocks redirects
 // to out-of-scope or private (SSRF) hosts. It mirrors the stdlib default of
 // refusing more than 10 redirects.
+//
+// This is a defense-in-depth scope confinement layer: it prevents the HTTP
+// client from following redirects that leave the crawl scope or target
+// private/link-local addresses. The authoritative DNS-rebinding control on
+// the HTTP path is ssrfSafeDialContext (wired into the transport's DialContext),
+// which re-resolves the host at connect time, closing the TOCTOU window.
 func redirectScopeGuard(scopeFn func(string) bool) func(*http.Request, []*http.Request) error {
 	return func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 10 {
 			return errors.New("stopped after 10 redirects")
 		}
 		if scopeFn != nil && !scopeFn(req.URL.String()) {
-			return fmt.Errorf("redirect to out-of-scope/private host blocked: %s", req.URL.Host)
+			return fmt.Errorf("redirect to out-of-scope/private host blocked: %s", redactSeedURL(req.URL.String()))
 		}
 		return nil
 	}

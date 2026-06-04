@@ -72,7 +72,10 @@ type RodCrawler struct{ opts CrawlerOptions }
 
 // HTTPCrawler implements Crawler using the stdlib net/http engine.
 // The Crawl method lives in http_crawler.go.
-type HTTPCrawler struct{ opts CrawlerOptions }
+type HTTPCrawler struct {
+	opts        CrawlerOptions
+	pageTimeout time.Duration // per-page fetch timeout; defaults to PageTimeout seconds when zero
+}
 
 // NewCrawler creates a new crawler with the given options.
 // When opts.Headless is true, it returns a RodCrawler (headless go-rod engine).
@@ -81,7 +84,11 @@ func NewCrawler(opts CrawlerOptions) Crawler {
 	if opts.Headless {
 		return &RodCrawler{opts: opts}
 	}
-	return &HTTPCrawler{opts: opts}
+	c := &HTTPCrawler{opts: opts}
+	if c.pageTimeout == 0 {
+		c.pageTimeout = time.Duration(PageTimeout) * time.Second
+	}
+	return c
 }
 
 // validateCrawlInputs validates the crawl options and target URL, returning the

@@ -27,13 +27,6 @@ import (
 	"time"
 )
 
-// TestMaxHTTPBodySize verifies the MaxHTTPBodySize constant value.
-func TestMaxHTTPBodySize(t *testing.T) {
-	if MaxHTTPBodySize != 10*1024*1024 {
-		t.Errorf("MaxHTTPBodySize = %d, want 10 MiB", MaxHTTPBodySize)
-	}
-}
-
 // TestValidateCrawlInputs tests the shared validateCrawlInputs helper.
 func TestValidateCrawlInputs(t *testing.T) {
 	if _, err := validateCrawlInputs(CrawlerOptions{Depth: -1}, "https://e.com"); err == nil ||
