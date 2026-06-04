@@ -263,9 +263,9 @@ func parseProbeEnabled(params capability.Parameters) bool {
 
 func specFormatForType(apiType string) string {
 	switch apiType {
-	case "graphql":
+	case pipeline.APITypeGraphQL:
 		return capmodel.SpecFormatGraphQL
-	case "wsdl":
+	case pipeline.APITypeWSDL:
 		return capmodel.SpecFormatWSDL
 	default:
 		return capmodel.SpecFormatOpenAPI

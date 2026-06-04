@@ -36,15 +36,25 @@ func writeStatus(w io.Writer, format string, args ...any) {
 	fmt.Fprintf(w, format, args...) //nolint:errcheck,gosec // best-effort status output
 }
 
+// wsdlStageTimeout caps each connection phase (TLS handshake, response header)
+// independently of the overall Client.Timeout, so a slow or malicious target
+// can't burn the whole budget on a single stage. Both transport branches share
+// this cap — the only real difference is the dialer (SSRF-safe vs permissive).
+const wsdlStageTimeout = 10 * time.Second
+
 // buildWSDLProbeClient constructs the HTTP client used by ProbeWSDLDocument.
 // When allowPrivate is false the transport uses SSRF-safe dialing; when true
 // it mirrors the timeouts applied to AllowPrivate probes elsewhere.
 func buildWSDLProbeClient(allowPrivate bool) *http.Client {
-	transport := &http.Transport{DialContext: probe.SSRFSafeDialContext}
+	transport := &http.Transport{
+		DialContext:           probe.SSRFSafeDialContext,
+		TLSHandshakeTimeout:   wsdlStageTimeout,
+		ResponseHeaderTimeout: wsdlStageTimeout,
+	}
 	if allowPrivate {
 		transport = &http.Transport{
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 10 * time.Second,
+			TLSHandshakeTimeout:   wsdlStageTimeout,
+			ResponseHeaderTimeout: wsdlStageTimeout,
 		}
 	}
 	return &http.Client{

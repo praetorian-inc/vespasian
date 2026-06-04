@@ -198,6 +198,57 @@ func TestInvoke_CrawlMode_GroupsRequestsByParentPage(t *testing.T) {
 	require.Len(t, webpages[0].Requests, 3, "expected three WebpageRequests under the parent page")
 }
 
+// TEST-002: pins the WebpageRequest field mapping performed by
+// toWebpageRequest / toMultiValueHeaders, including the conditional Response
+// block (capability.go:324). The populated request must carry a non-nil
+// Response with multi-value headers; the request lacking response data must
+// have a nil Response.
+func TestInvoke_CrawlMode_MapsWebpageRequestFields(t *testing.T) {
+	stubCrawl(t, []crawl.ObservedRequest{
+		{
+			Method:  "POST",
+			URL:     "https://x.com/api/orders",
+			PageURL: "https://x.com/dashboard",
+			Headers: map[string]string{"Content-Type": "application/json"},
+			Body:    []byte(`{"x":1}`),
+			Response: crawl.ObservedResponse{
+				StatusCode: 201,
+				Headers:    map[string]string{"Content-Type": "application/json"},
+				Body:       []byte(`{"id":1}`),
+			},
+		},
+		{Method: "GET", URL: "https://x.com/api/ping", PageURL: "https://x.com/dashboard"},
+	}, nil)
+
+	c := &Capability{}
+	ctx := ctxWithParams("mode", "crawl")
+	webpages, _, err := collect(t, c, ctx, seedApp("https://x.com"))
+
+	require.NoError(t, err)
+	require.Len(t, webpages, 1, "both requests share one parent page")
+	require.Len(t, webpages[0].Requests, 2)
+
+	byURL := make(map[string]capmodel.WebpageRequest, len(webpages[0].Requests))
+	for _, r := range webpages[0].Requests {
+		byURL[r.RequestedURL] = r
+	}
+
+	populated, ok := byURL["https://x.com/api/orders"]
+	require.True(t, ok, "expected the populated request to be emitted")
+	assert.Equal(t, "https://x.com/api/orders", populated.RequestedURL)
+	assert.Equal(t, "POST", populated.Method)
+	assert.Equal(t, `{"x":1}`, populated.Body)
+	assert.Equal(t, map[string][]string{"Content-Type": {"application/json"}}, populated.Headers)
+	require.NotNil(t, populated.Response, "request with response data must carry a Response")
+	assert.Equal(t, 201, populated.Response.StatusCode)
+	assert.Equal(t, map[string][]string{"Content-Type": {"application/json"}}, populated.Response.Headers)
+	assert.Equal(t, `{"id":1}`, populated.Response.Body)
+
+	noResponse, ok := byURL["https://x.com/api/ping"]
+	require.True(t, ok, "expected the no-response request to be emitted")
+	assert.Nil(t, noResponse.Response, "request without response data must have a nil Response")
+}
+
 func TestInvoke_CrawlMode_NoTrafficEmitsNothing(t *testing.T) {
 	stubCrawl(t, nil, nil)
 
@@ -482,6 +533,25 @@ func TestParseConfidence_BoundaryOne(t *testing.T) {
 
 func TestSpecFormatForType_WSDL(t *testing.T) {
 	assert.Equal(t, capmodel.SpecFormatWSDL, specFormatForType("wsdl"))
+}
+
+// TEST-001: parseProbeEnabled defaults to true (probing on) when the probe
+// param is absent or unparseable, and otherwise returns the parsed bool.
+func TestParseProbeEnabled(t *testing.T) {
+	tests := []struct {
+		name   string
+		params capability.Parameters
+		want   bool
+	}{
+		{"absent param defaults to true", capability.Parameters{}, true},
+		{"explicit true", capability.Parameters{capability.Bool("probe", "").WithDefault("true")}, true},
+		{"explicit false", capability.Parameters{capability.Bool("probe", "").WithDefault("false")}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, parseProbeEnabled(tt.params))
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------
