@@ -35,6 +35,17 @@ const (
 	// HTTPCrawler (10 MB DoS cap). Distinct from MaxResponseBodySize (1 MB
 	// retention cap) — both serve different purposes.
 	MaxHTTPBodySize = 10 * 1024 * 1024
+
+	// interruptMessage is printed to Stderr when the crawl is stopped by a
+	// canceled context (e.g., SIGINT). Shared by HTTPCrawler and RodCrawler.
+	interruptMessage = "\ninterrupt received, stopping crawl...\n"
+
+	// DefaultConcurrency is the default number of concurrent browser tabs / HTTP workers.
+	DefaultConcurrency = 10
+	// MaxConcurrency is the upper bound on concurrent browser tabs / HTTP workers. Each
+	// tab consumes significant Chrome process memory (~50 MB), so unbounded values
+	// could exhaust system resources.
+	MaxConcurrency = 50
 )
 
 // CrawlerOptions configures the crawler behavior.
@@ -84,11 +95,20 @@ func NewCrawler(opts CrawlerOptions) Crawler {
 	if opts.Headless {
 		return &RodCrawler{opts: opts}
 	}
-	c := &HTTPCrawler{opts: opts}
-	if c.pageTimeout == 0 {
-		c.pageTimeout = time.Duration(PageTimeout) * time.Second
+	return &HTTPCrawler{opts: opts}
+}
+
+// clampConcurrency returns the effective worker concurrency for both the HTTP
+// and headless backends. Zero maps to DefaultConcurrency; values above
+// MaxConcurrency are capped.
+func clampConcurrency(n int) int {
+	if n <= 0 {
+		return DefaultConcurrency
 	}
-	return c
+	if n > MaxConcurrency {
+		return MaxConcurrency
+	}
+	return n
 }
 
 // validateCrawlInputs validates the crawl options and target URL, returning the

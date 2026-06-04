@@ -76,7 +76,7 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	// Early return if context is already canceled.
 	if ctx.Err() != nil {
 		if c.opts.Stderr != nil {
-			fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n") //nolint:errcheck // best-effort
+			fmt.Fprint(c.opts.Stderr, interruptMessage) //nolint:errcheck // best-effort
 		}
 		return nil, ctx.Err()
 	}
@@ -139,7 +139,7 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 
 	if ctx.Err() != nil {
 		if c.opts.Stderr != nil {
-			fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n") //nolint:errcheck // best-effort
+			fmt.Fprint(c.opts.Stderr, interruptMessage) //nolint:errcheck // best-effort
 		}
 		mu.Lock()
 		snapshot := make([]ObservedRequest, len(results))
@@ -367,19 +367,6 @@ func applyHeaders(req *http.Request, headers map[string]string) {
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-}
-
-// clampConcurrency returns the effective worker concurrency, mirroring
-// engine.go:126-134. Zero maps to DefaultConcurrency; values above
-// MaxConcurrency are capped.
-func clampConcurrency(n int) int {
-	if n <= 0 {
-		return DefaultConcurrency
-	}
-	if n > MaxConcurrency {
-		return MaxConcurrency
-	}
-	return n
 }
 
 // redirectScopeGuard returns a CheckRedirect function that blocks redirects

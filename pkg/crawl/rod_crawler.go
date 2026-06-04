@@ -32,7 +32,7 @@ func (c *RodCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReq
 	// Early return if the parent context is already canceled.
 	if ctx.Err() != nil {
 		if c.opts.Stderr != nil {
-			fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n") //nolint:errcheck // best-effort status message
+			fmt.Fprint(c.opts.Stderr, interruptMessage) //nolint:errcheck // best-effort status message
 		}
 		return nil, ctx.Err()
 	}
@@ -115,7 +115,7 @@ func (c *RodCrawler) crawlHeadless(ctx context.Context, targetURL string, maxPag
 	// On signal, kill Chrome immediately to stop all outbound requests.
 	if ctx.Err() != nil {
 		if c.opts.Stderr != nil {
-			fmt.Fprintf(c.opts.Stderr, "\ninterrupt received, stopping crawl...\n") //nolint:errcheck // best-effort status message
+			fmt.Fprint(c.opts.Stderr, interruptMessage) //nolint:errcheck // best-effort status message
 		}
 		if browserMgr != nil {
 			browserMgr.Kill()
