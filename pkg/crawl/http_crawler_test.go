@@ -287,8 +287,12 @@ func TestHTTPCrawler_RedirectScopeBlocked(t *testing.T) {
 		t.Error("seed URL was never requested; redirect guard test is vacuous")
 	}
 	stderrOut := stderr.String()
-	if !strings.Contains(stderrOut, "fetch:") && !strings.Contains(stderrOut, "blocked") && !strings.Contains(stderrOut, "redirect") {
-		t.Errorf("expected guard error on stderr, got: %q", stderrOut)
+	// Require the redirect guard's specific message, not a generic "fetch:" error:
+	// with the guard removed, the redirect is followed and the unreachable host
+	// times out, which ALSO produces a "fetch:" error — so a loose match would
+	// pass even with the guard gone. This substring fails closed if the guard is removed.
+	if !strings.Contains(stderrOut, "out-of-scope/private host blocked") {
+		t.Errorf("expected redirect scope-guard block on stderr, got: %q", stderrOut)
 	}
 }
 
@@ -449,8 +453,12 @@ func TestHTTPCrawler_SSRFRedirectBlocked(t *testing.T) {
 		t.Error("seed URL was never requested; redirect guard test is vacuous")
 	}
 	stderrOut := stderr.String()
-	if !strings.Contains(stderrOut, "fetch:") && !strings.Contains(stderrOut, "blocked") && !strings.Contains(stderrOut, "redirect") {
-		t.Errorf("expected guard to surface error on stderr (fetch/blocked/redirect), got: %q", stderrOut)
+	// Require the guard's specific block message, not a generic "fetch:" error:
+	// with the guard removed the redirect is followed and the refused/unreachable
+	// target ALSO yields a "fetch:" error, so a loose match would pass without the
+	// guard. This substring fails closed if the scope/redirect guard is removed.
+	if !strings.Contains(stderrOut, "out-of-scope/private host blocked") {
+		t.Errorf("expected redirect scope-guard block on stderr, got: %q", stderrOut)
 	}
 	// Crawl must not panic and must return (no hang).
 }
