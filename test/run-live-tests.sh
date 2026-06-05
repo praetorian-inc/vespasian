@@ -177,9 +177,13 @@ crawl_backend() {
 }
 
 # chrome_available returns 0 if Chrome is likely reachable, 1 otherwise.
-# Uses the same heuristics as the Go skipIfNoChrome probe: binary presence or
-# rod's cached Chromium. A non-zero rod-crawl exit is treated as log_warn +
-# skip (not failures++) so unlaunchable-Chrome environments degrade gracefully.
+# This is a best-effort shell heuristic (binary presence or rod's cached
+# Chromium directory) and may diverge from the Go skipIfNoChrome probe, which
+# actually attempts to launch a headless browser via NewBrowserManager. A false
+# positive here (chrome_available returns 0 but Chrome fails to launch) degrades
+# to a log_warn + skip, never a hard failure. A false negative causes the rod
+# backend to be skipped even when Chrome is present; re-run with an explicit
+# Chrome binary on PATH if rod skips unexpectedly.
 chrome_available() {
     command -v google-chrome >/dev/null 2>&1 || \
     command -v chromium >/dev/null 2>&1 || \
@@ -239,10 +243,9 @@ test_rest_api() {
         fi
     done
 
-    # Use the http capture for spec generation (primary artifact).
-    if [ ! -f "$capture_file" ]; then
-        cp "${target_dir}/capture-false.json" "$capture_file" 2>/dev/null || true
-    fi
+    # Use the http capture for spec generation (primary artifact). Copy
+    # unconditionally so a stale capture.json from a prior run is never used.
+    cp "${target_dir}/capture-false.json" "$capture_file" 2>/dev/null || true
 
     # Step 2: Generate OpenAPI spec from http capture
     log_info "Generating OpenAPI spec..."
@@ -847,23 +850,30 @@ PYEOF
             log_warn "graphql-server[rod-spa]: crawl failed (Chrome may be unlaunchable), skipping SPA assertion"
             rod_ok=false
         fi
-        if [ "$rod_ok" = true ] && [ -f "$rod_capture" ]; then
-            local rod_n; rod_n=$(json_len "$rod_capture")
-            log_info "graphql-server[headless=true]: ${rod_n} requests captured"
-            # Assert /graphql POST is present (SPA fetch captured by rod).
-            local found_graphql; found_graphql=$(python3 - "$rod_capture" << 'PYEOF'
+        if [ "$rod_ok" = true ]; then
+            if [ ! -f "$rod_capture" ]; then
+                # Crawl reported success but wrote no capture file — count as failure
+                # so the missing assertion is not silently skipped.
+                log_fail "graphql-server[rod-spa]: rod crawl succeeded but capture file absent: ${rod_capture}"
+                failures=$((failures + 1))
+            else
+                local rod_n; rod_n=$(json_len "$rod_capture")
+                log_info "graphql-server[headless=true]: ${rod_n} requests captured"
+                # Assert /graphql POST is present (SPA fetch captured by rod).
+                local found_graphql; found_graphql=$(python3 - "$rod_capture" << 'PYEOF'
 import json, sys
 with open(sys.argv[1]) as f:
     reqs = json.load(f)
 found = any(r.get("method","").upper()=="POST" and r.get("url","").endswith("/graphql") for r in reqs)
 print("yes" if found else "no")
 PYEOF
-            )
-            if [ "$found_graphql" = "yes" ]; then
-                log_ok "graphql-server[rod-spa]: /graphql POST captured (LAB-1535 confirmed)"
-            else
-                log_warn "graphql-server[rod-spa]: /graphql POST NOT captured in rod crawl (SPA fetch missed)"
-                failures=$((failures + 1))
+                )
+                if [ "$found_graphql" = "yes" ]; then
+                    log_ok "graphql-server[rod-spa]: /graphql POST captured (LAB-1535 confirmed)"
+                else
+                    log_warn "graphql-server[rod-spa]: /graphql POST NOT captured in rod crawl (SPA fetch missed)"
+                    failures=$((failures + 1))
+                fi
             fi
         fi
     fi

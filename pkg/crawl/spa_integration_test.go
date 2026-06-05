@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
+	"net/url"
 	"testing"
 	"time"
 )
@@ -99,18 +99,32 @@ fetch("/graphql",{
 		Headless:     false,
 		AllowPrivate: true,
 	})
-	httpGot, _ := httpCrawler.Crawl(context.Background(), srv.URL)
+	httpGot, httpErr := httpCrawler.Crawl(context.Background(), srv.URL)
+	if httpErr != nil {
+		t.Fatalf("HTTP crawl error: %v", httpErr)
+	}
+	if len(httpGot) < 1 {
+		t.Fatalf("HTTP crawl returned no results — cannot assert negative (gap assumption test vacuous)")
+	}
 	if hasGraphQLPost(httpGot) {
 		t.Errorf("HTTPCrawler unexpectedly captured a runtime fetch POST — capability gap assumption changed; update docs/benchmarks/crawler-comparison.md")
 	}
 }
 
-// hasGraphQLPost reports whether any captured request is a POST to a path
-// ending with "/graphql". It is method+path agnostic w.r.t. Source so it
-// works for both "http" and "browser" source values.
+// hasGraphQLPost reports whether any captured request is a POST to the path
+// "/graphql". It uses net/url.Parse to match the exact path, avoiding false
+// positives from query strings or trailing slashes (e.g. "/graphql?foo" or
+// "/graphql/"). Works for both "http" and "browser" source values.
 func hasGraphQLPost(reqs []ObservedRequest) bool {
 	for _, r := range reqs {
-		if r.Method == "POST" && strings.HasSuffix(r.URL, "/graphql") {
+		if r.Method != "POST" {
+			continue
+		}
+		u, err := url.Parse(r.URL)
+		if err != nil {
+			continue
+		}
+		if u.Path == "/graphql" {
 			return true
 		}
 	}

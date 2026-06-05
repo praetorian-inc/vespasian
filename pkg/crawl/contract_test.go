@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -103,7 +104,6 @@ func runCrawlerContract(
 ) {
 	t.Helper()
 	for _, bc := range crawlerBackends() {
-		bc := bc // capture range variable
 		t.Run(bc.name, func(t *testing.T) {
 			if bc.headless {
 				skipIfNoChrome(t)
@@ -159,16 +159,37 @@ func TestCrawlerContract_FollowsLinks(t *testing.T) {
 	)
 }
 
-// TestCrawlerContract_RespectsMaxPages asserts that both backends stop after
-// crawling at most MaxPages pages. The fixture serves 50 inter-linked pages;
-// limiting to 5 must cap results well below 50.
+// TestCrawlerContract_RespectsMaxPages asserts that both backends stop actual
+// crawl WORK after at most MaxPages pages. The fixture serves 50 inter-linked
+// pages; with MaxPages=5 the server must receive at most maxPages+2 page-path
+// requests (a small margin accounts for in-flight requests that were already
+// dispatched before the cap triggers with Concurrency:1).
+//
+// The server-side counter is the critical assertion: counting URLs in the
+// result slice only tests capping of stored results, not actual fetch work
+// (both backends already cap the result slice by construction). The counter
+// verifies that the crawler stops dispatching requests after the limit, not
+// just stops storing them.
 func TestCrawlerContract_RespectsMaxPages(t *testing.T) {
 	const totalPages = 50
 	const maxPages = 5
+	// margin: with Concurrency=1 there is at most 1 in-flight request beyond
+	// the cap trigger. Allow 2 to accommodate any final in-flight request that
+	// completes after cancel() is called but before the worker loop exits.
+	const fetchMargin = 2
+
+	var serverPageFetches atomic.Int64
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Count server-side page hits: "/" (seed) and "/p<digits>" (leaves).
+		// Sub-resources (favicon, about:blank, CDP internal) are excluded so
+		// the counter is comparable across both http and rod backends.
+		p := r.URL.Path
+		if p == "/" || isPagePath(p) {
+			serverPageFetches.Add(1)
+		}
 		w.Header().Set("Content-Type", "text/html")
-		if r.URL.Path == "/" {
+		if p == "/" {
 			var b strings.Builder
 			for i := range totalPages {
 				fmt.Fprintf(&b, `<a href="/p%d">p%d</a>`, i, i)
@@ -177,7 +198,7 @@ func TestCrawlerContract_RespectsMaxPages(t *testing.T) {
 			return
 		}
 		for i := range totalPages {
-			if r.URL.Path == fmt.Sprintf("/p%d", i) {
+			if p == fmt.Sprintf("/p%d", i) {
 				fmt.Fprint(w, `<html><body><p>leaf</p></body></html>`)
 				return
 			}
@@ -185,23 +206,47 @@ func TestCrawlerContract_RespectsMaxPages(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	runCrawlerContract(t, srv,
-		func(headless bool) CrawlerOptions {
-			return CrawlerOptions{
-				Depth: 5, MaxPages: maxPages, Timeout: 30 * time.Second,
-				AllowPrivate: true, Headless: headless,
+	for _, bc := range crawlerBackends() {
+		t.Run(bc.name, func(t *testing.T) {
+			if bc.headless {
+				skipIfNoChrome(t)
 			}
-		},
-		func(t *testing.T, got []ObservedRequest, err error) {
-			t.Helper()
+			// Reset the server counter for each backend sub-test.
+			serverPageFetches.Store(0)
+
+			// Concurrency:1 bounds in-flight overshoot to at most 1 extra
+			// page request beyond the cap trigger, making the margin tight.
+			c := NewCrawler(CrawlerOptions{
+				Depth: 5, MaxPages: maxPages, Timeout: 30 * time.Second,
+				AllowPrivate: true, Headless: bc.headless, Concurrency: 1,
+			})
+			got, err := c.Crawl(context.Background(), srv.URL)
 			if err != nil {
 				t.Fatalf("Crawl error: %v", err)
 			}
-			// Count only distinct page URLs — those whose path is "/" or matches
-			// "/p<digits>" (the fixture's page set). Sub-resource and browser-
-			// internal captures (favicon, about:blank, CDP targets) have paths
-			// that do not match the fixture pattern and are excluded so the bound
-			// holds for both the http and rod backends.
+
+			// Sanity: the seed must have been crawled.
+			if len(got) == 0 {
+				t.Fatal("crawl returned zero results — seed was not crawled")
+			}
+
+			// Primary assertion: the SERVER received at most maxPages+fetchMargin
+			// page requests. This verifies MaxPages bounds actual crawl work, not
+			// just result storage.
+			fetches := int(serverPageFetches.Load())
+			if fetches > maxPages+fetchMargin {
+				t.Errorf("server received %d page fetches, want ≤%d (maxPages=%d + margin=%d) — MaxPages does not bound crawl work",
+					fetches, maxPages+fetchMargin, maxPages, fetchMargin)
+			}
+			// Guard: the crawler stopped far short of totalPages, confirming the
+			// limit is real and not just rounding against a near-totalPages run.
+			if fetches >= totalPages {
+				t.Errorf("server received %d page fetches — as many as totalPages=%d; MaxPages limit had no effect",
+					fetches, totalPages)
+			}
+
+			// Count distinct result page URLs for the result-slice sanity check
+			// (kept as a secondary assertion alongside the server counter).
 			pageURLs := make(map[string]struct{})
 			for _, r := range got {
 				u, err := url.Parse(r.URL)
@@ -209,17 +254,16 @@ func TestCrawlerContract_RespectsMaxPages(t *testing.T) {
 					continue
 				}
 				p := u.Path
-				isPage := p == "/" || isPagePath(p)
-				if isPage {
+				if p == "/" || isPagePath(p) {
 					pageURLs[r.URL] = struct{}{}
 				}
 			}
 			if len(pageURLs) > maxPages {
-				t.Errorf("got %d distinct page URLs, want ≤%d — MaxPages not respected",
+				t.Errorf("result slice has %d distinct page URLs, want ≤%d — MaxPages not respected in results",
 					len(pageURLs), maxPages)
 			}
-		},
-	)
+		})
+	}
 }
 
 // TestCrawlerContract_SendsCustomHeaders asserts that both backends inject
@@ -229,23 +273,35 @@ func TestCrawlerContract_SendsCustomHeaders(t *testing.T) {
 	const headerName = "X-Contract-Test"
 	const headerVal = "hello-from-contract"
 
-	var sawHeader string
+	// sawHeader: header value received on ANY request (seed or followed).
+	// sawHeaderOnP2: header value received specifically on the followed /p2 request.
+	// This ensures the header is injected on followed requests, not only the seed.
+	var sawHeader, sawHeaderOnP2 string
 	var mu sync.Mutex
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		if v := r.Header.Get(headerName); v != "" {
 			sawHeader = v
+			if r.URL.Path == "/p2" {
+				sawHeaderOnP2 = v
+			}
 		}
 		mu.Unlock()
 		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprint(w, `<html><body>ok</body></html>`)
+		switch r.URL.Path {
+		case "/":
+			// Seed links to /p2 so the crawler follows at least one link.
+			fmt.Fprint(w, `<html><body><a href="/p2">page 2</a></body></html>`)
+		default:
+			fmt.Fprint(w, `<html><body>ok</body></html>`)
+		}
 	}))
 	defer srv.Close()
 
 	runCrawlerContract(t, srv,
 		func(headless bool) CrawlerOptions {
 			return CrawlerOptions{
-				Depth: 1, MaxPages: 5, Timeout: 30 * time.Second,
+				Depth: 2, MaxPages: 5, Timeout: 30 * time.Second,
 				AllowPrivate: true, Headless: headless,
 				Headers: map[string]string{headerName: headerVal},
 			}
@@ -257,10 +313,17 @@ func TestCrawlerContract_SendsCustomHeaders(t *testing.T) {
 			}
 			mu.Lock()
 			v := sawHeader
+			v2 := sawHeaderOnP2
 			mu.Unlock()
 			if v != headerVal {
 				t.Errorf("custom header %s not received by server: got %q, want %q",
 					headerName, v, headerVal)
+			}
+			// Assert the header was also received on the followed /p2 request
+			// (not only on the seed), verifying header injection on non-seed pages.
+			if v2 != headerVal {
+				t.Errorf("custom header %s not received on followed /p2 request: got %q, want %q",
+					headerName, v2, headerVal)
 			}
 		},
 	)
@@ -337,9 +400,10 @@ func TestCrawlerContract_RelativeLinksResolvedAgainstFinalURL(t *testing.T) {
 	defer srv.Close()
 
 	// Use a custom server URL with /start suffix so the redirect happens.
+	// runCrawlerContract is not used here because it always seeds with server.URL;
+	// this test requires a non-root seed URL (/start) to exercise redirect resolution.
 	startURL := srv.URL + "/start"
 	for _, bc := range crawlerBackends() {
-		bc := bc
 		t.Run(bc.name, func(t *testing.T) {
 			if bc.headless {
 				skipIfNoChrome(t)
@@ -408,11 +472,34 @@ func TestCrawlerContract_DepthLimit(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Crawl error: %v", err)
 			}
-			// /d3 and /d4 are at depth >2 and must not appear.
+			// Depth semantics: seed "/" is depth 0; each hop increments by 1.
+			// With Depth=2:
+			//   depth 0: /       ← must be visited (seed)
+			//   depth 1: /d1     ← must be visited (one hop from seed)
+			//   depth 2: /d2     ← must be visited (exactly at limit)
+			//   depth 3: /d3     ← must NOT be visited (one beyond limit)
+			//   depth 4: /d4     ← must NOT be visited (two beyond limit)
+			var foundD2, foundD3, foundD4 bool
 			for _, r := range got {
-				if strings.Contains(r.URL, "/d3") || strings.Contains(r.URL, "/d4") {
-					t.Errorf("depth limit breached — URL beyond depth=2 crawled: %s", r.URL)
+				switch {
+				case strings.Contains(r.URL, "/d2"):
+					foundD2 = true
+				case strings.Contains(r.URL, "/d3"):
+					foundD3 = true
+				case strings.Contains(r.URL, "/d4"):
+					foundD4 = true
 				}
+			}
+			// /d2 is exactly at the depth limit and must be reachable.
+			if !foundD2 {
+				t.Error("/d2 (depth=2, at limit) was not crawled — depth limit too aggressive")
+			}
+			// /d3 and /d4 are beyond the depth limit and must not appear.
+			if foundD3 {
+				t.Error("depth limit breached — /d3 (depth=3, beyond limit=2) was crawled")
+			}
+			if foundD4 {
+				t.Error("depth limit breached — /d4 (depth=4, beyond limit=2) was crawled")
 			}
 		},
 	)

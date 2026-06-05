@@ -15,7 +15,7 @@ environment.
   pages), no randomness or time-based content. Index page links to 20 leaf pages; each leaf
   links to the next (ring) and back to the index.
 - **Command:**
-  ```
+  ```text
   go test -run '^$' -bench 'Benchmark.*Crawl' -benchmem ./pkg/crawl/
   ```
 - **Environment:** linux/arm64 (12-core), Go runtime benchmarking framework (`testing.B`).
@@ -34,7 +34,7 @@ environment.
 
 Benchmark run on 2026-06-05. Raw output:
 
-```
+```text
 goos: linux
 goarch: arm64
 pkg: github.com/praetorian-inc/vespasian/pkg/crawl
@@ -69,7 +69,9 @@ cold-start cost. Rod's per-page crawl latency is not captured separately here.
 | RodCrawler  | ~6.8 MB      | ~6.8 MB | ~113,907  |
 
 `heapbytes/op` = `TotalAlloc` delta / `b.N`. Rod's higher allocation count
-reflects Chrome subprocess I/O, CDP protocol parsing, and network event handling.
+reflects CDP protocol parsing and go-rod library allocations within the Go process.
+`TotalAlloc` measures only Go heap allocations; Chrome subprocess memory and I/O
+are not included in this metric.
 
 ### 4. Race Safety
 

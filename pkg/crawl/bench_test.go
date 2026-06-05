@@ -44,7 +44,6 @@ func newBenchFixture(pages int) *httptest.Server {
 		fmt.Fprintf(w, "<html><body>%s</body></html>", b.String())
 	})
 	for i := range pages {
-		i := i // capture range variable
 		mux.HandleFunc(fmt.Sprintf("/p%d", i), func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/html")
 			fmt.Fprintf(w, `<html><body><a href="/p%d">next</a></body></html>`, (i+1)%pages)
@@ -86,7 +85,7 @@ func BenchmarkHTTPCrawl(b *testing.B) {
 //
 // Note: run without -race when Chrome+race proves flaky in your environment
 // (go-rod spawns CDP goroutines; race instrumentation can cause false positives
-// on the Chrome subprocess I/O pipes). HTTP benchmark always runs with -race.
+// on the CDP goroutines communicating with Chrome). HTTP benchmark always runs with -race.
 func BenchmarkRodCrawl(b *testing.B) {
 	if err := probeChromeForBench(); err != nil {
 		b.Skipf("Chrome unavailable: %v", err)
@@ -138,6 +137,8 @@ func benchCrawl(b *testing.B, srv *httptest.Server, headless bool) {
 	b.StopTimer()
 	runtime.ReadMemStats(&m1)
 
+	// lastCount == every-iteration count: fixture is deterministic, so the
+	// per-iteration captured count is constant (using last is equivalent to first).
 	b.ReportMetric(float64(lastCount), "captured/op")
 	b.ReportMetric(float64(m1.TotalAlloc-m0.TotalAlloc)/float64(b.N), "heapbytes/op")
 }
