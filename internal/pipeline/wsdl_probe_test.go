@@ -201,3 +201,116 @@ func TestProbeWSDLDocument_RejectsHTTPErrorStatus(t *testing.T) {
 	assert.Nil(t, doc, "expected nil bytes for HTTP 404")
 	assert.Contains(t, buf.String(), "returned HTTP 404")
 }
+
+// ---------------------------------------------------------------------------
+// ResolveWSDLType — gate function tests
+// ---------------------------------------------------------------------------
+
+// TestResolveWSDLType_ProbeDisabledIsNoOp verifies that when probe=false the
+// function returns the original requests and apiType unchanged without making
+// any network connection (the target URL is deliberately unreachable so any
+// accidental probe would produce a detectable error via the status writer).
+func TestResolveWSDLType_ProbeDisabledIsNoOp(t *testing.T) {
+	initial := []crawl.ObservedRequest{
+		{Method: "GET", URL: "http://127.0.0.1:1/svc"},
+	}
+
+	var buf bytes.Buffer
+	got, resolvedType, found := pipeline.ResolveWSDLType(
+		context.Background(),
+		"http://127.0.0.1:1/svc",
+		pipeline.APITypeWSDL,
+		initial,
+		false, // probe disabled
+		true,
+		&buf,
+	)
+
+	assert.False(t, found, "probe disabled must return found=false")
+	assert.Equal(t, pipeline.APITypeWSDL, resolvedType, "apiType must be returned unchanged on a miss")
+	assert.Equal(t, initial, got, "requests slice must be returned unchanged when probe is disabled")
+	assert.Empty(t, buf.String(), "no status output expected when probe is disabled")
+}
+
+// TestResolveWSDLType_NonWSDLRestTypeIsNoOp verifies that when apiType is
+// neither APITypeWSDL nor APITypeREST the probe is skipped even when
+// probe=true, returning the original requests and apiType unchanged.
+func TestResolveWSDLType_NonWSDLRestTypeIsNoOp(t *testing.T) {
+	initial := []crawl.ObservedRequest{
+		{Method: "POST", URL: "http://127.0.0.1:1/graphql"},
+	}
+
+	var buf bytes.Buffer
+	got, resolvedType, found := pipeline.ResolveWSDLType(
+		context.Background(),
+		"http://127.0.0.1:1/graphql",
+		pipeline.APITypeGraphQL,
+		initial,
+		true, // probe enabled — but apiType is graphql, so must be skipped
+		true,
+		&buf,
+	)
+
+	assert.False(t, found, "graphql apiType must not be probed")
+	assert.Equal(t, pipeline.APITypeGraphQL, resolvedType, "apiType must be returned unchanged on a miss")
+	assert.Equal(t, initial, got, "requests slice must be returned unchanged for non-WSDL/REST types")
+	assert.Empty(t, buf.String(), "no status output expected when gate skips the probe")
+}
+
+// TestResolveWSDLType_ProbeSuccessReturnsWSDL verifies that when probe=true,
+// apiType is eligible (REST), and the server responds with a valid WSDL
+// document, the function returns the augmented slice, APITypeWSDL, and
+// found=true. Mirrors the success-path setup from
+// TestProbeAndAppendWSDLRequest_AppendsOnSuccess.
+func TestResolveWSDLType_ProbeSuccessReturnsWSDL(t *testing.T) {
+	ts := wsdlServer(t)
+
+	initial := []crawl.ObservedRequest{
+		{Method: "GET", URL: ts.URL + "/", Response: crawl.ObservedResponse{StatusCode: 200}},
+	}
+
+	augmented, resolvedType, found := pipeline.ResolveWSDLType(
+		context.Background(),
+		ts.URL,
+		pipeline.APITypeREST,
+		initial,
+		true, // probe enabled
+		true,
+		nil,
+	)
+
+	assert.True(t, found, "expected found=true when server serves a valid WSDL")
+	assert.Equal(t, pipeline.APITypeWSDL, resolvedType, "apiType must be promoted to wsdl on success")
+	require.Len(t, augmented, 2, "one synthetic WSDL request must be appended to original slice")
+	assert.Equal(t, "GET", augmented[1].Method)
+	assert.Equal(t, "text/xml", augmented[1].Response.ContentType)
+}
+
+// TestResolveWSDLType_ProbeFailureRetainsInputType verifies that when
+// probe=true but the server does not serve a valid WSDL document, the original
+// requests slice and input apiType are returned unchanged and found=false.
+func TestResolveWSDLType_ProbeFailureRetainsInputType(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html>not soap</html>"))
+	}))
+	t.Cleanup(ts.Close)
+
+	initial := []crawl.ObservedRequest{
+		{Method: "GET", URL: ts.URL + "/"},
+	}
+
+	got, resolvedType, found := pipeline.ResolveWSDLType(
+		context.Background(),
+		ts.URL,
+		pipeline.APITypeREST,
+		initial,
+		true, // probe enabled
+		true,
+		nil,
+	)
+
+	assert.False(t, found, "probe finding no WSDL must return found=false")
+	assert.Equal(t, pipeline.APITypeREST, resolvedType, "input apiType must be preserved when no WSDL found")
+	assert.Equal(t, initial, got, "original requests slice must be returned unchanged")
+}

@@ -66,19 +66,25 @@ func stubCrawl(t *testing.T, requests []crawl.ObservedRequest, err error) {
 	t.Cleanup(func() { crawlFunc = orig })
 }
 
-// stubWSDLProbe replaces wsdlProbeFunc and registers Cleanup to restore it.
+// stubWSDLProbe replaces wsdlResolveFunc and registers Cleanup to restore it.
 // When augmented is non-nil it is returned as the augmented request slice;
-// otherwise the original request slice is passed through.
+// otherwise the original request slice is passed through. Mirrors
+// ResolveWSDLType's contract: on a miss (foundWSDL=false) the input apiType is
+// returned unchanged; on a hit the supplied resolvedType is returned.
 func stubWSDLProbe(t *testing.T, augmented []crawl.ObservedRequest, foundWSDL bool, resolvedType string) {
 	t.Helper()
-	orig := wsdlProbeFunc
-	wsdlProbeFunc = func(_ context.Context, _ string, requests []crawl.ObservedRequest, _ bool, _ io.Writer) ([]crawl.ObservedRequest, bool, string) {
-		if augmented != nil {
-			return augmented, foundWSDL, resolvedType
+	orig := wsdlResolveFunc
+	wsdlResolveFunc = func(_ context.Context, _, apiType string, requests []crawl.ObservedRequest, _, _ bool, _ io.Writer) ([]crawl.ObservedRequest, string, bool) {
+		if !foundWSDL {
+			return requests, apiType, false
 		}
-		return requests, foundWSDL, resolvedType
+		out := requests
+		if augmented != nil {
+			out = augmented
+		}
+		return out, resolvedType, true
 	}
-	t.Cleanup(func() { wsdlProbeFunc = orig })
+	t.Cleanup(func() { wsdlResolveFunc = orig })
 }
 
 func collect(t *testing.T, c *Capability, ctx capability.ExecutionContext, input capmodel.WebApplication) (webpages []capmodel.Webpage, webApps []capmodel.WebApplication, err error) {
@@ -196,6 +202,25 @@ func TestInvoke_CrawlMode_GroupsRequestsByParentPage(t *testing.T) {
 	require.Len(t, webpages, 1, "three XHRs from one page must collapse to one Webpage")
 	assert.Equal(t, "https://x.com/dashboard", webpages[0].URL)
 	require.Len(t, webpages[0].Requests, 3, "expected three WebpageRequests under the parent page")
+}
+
+// TestInvoke_EmitError_Propagates pins that a failing emitter surfaces as an
+// Invoke error rather than being silently swallowed. Matches the guard house
+// convention (sibling SDK capabilities propagate Emit errors); the prior code
+// dropped them via `_ = output.Emit(...)`.
+func TestInvoke_EmitError_Propagates(t *testing.T) {
+	stubCrawl(t, []crawl.ObservedRequest{
+		{Method: "GET", URL: "https://x.com/api", Response: crawl.ObservedResponse{StatusCode: 200}},
+	}, nil)
+
+	emitter := capability.EmitterFunc(func(_ ...any) error {
+		return errors.New("emit boom")
+	})
+
+	c := &Capability{}
+	err := c.Invoke(ctxWithParams("mode", "crawl"), seedApp("https://x.com"), emitter)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "emit webpage")
 }
 
 // TEST-002: pins the WebpageRequest field mapping performed by

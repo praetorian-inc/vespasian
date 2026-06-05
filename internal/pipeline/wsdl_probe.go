@@ -129,8 +129,8 @@ func ProbeWSDLDocument(ctx context.Context, targetURL string, allowPrivate bool,
 // success it appends a synthetic ObservedRequest (Method=GET, URL=<targetURL>?wsdl,
 // Response={200, text/xml, body}) to requests and returns the augmented slice
 // along with foundWSDL=true and resolvedAPIType=APITypeWSDL. When the probe
-// finds no valid WSDL the original requests slice and the caller-supplied
-// apiType are returned unchanged.
+// finds no valid WSDL the original requests slice is returned unchanged,
+// foundWSDL=false, and resolvedAPIType="".
 //
 // The URL for the synthetic request is built via url.URL.RawQuery to avoid the
 // double-query-separator bug that occurs when targetURL already carries a query
@@ -163,4 +163,24 @@ func ProbeAndAppendWSDLRequest(ctx context.Context, targetURL string, requests [
 		},
 	})
 	return requests, true, APITypeWSDL
+}
+
+// ResolveWSDLType is the single gating point for active WSDL discovery shared by
+// ScanCmd.Run (cmd/vespasian) and Capability.runScan (pkg/sdk). It probes
+// targetURL?wsdl and promotes the API type to WSDL only when probing is enabled
+// and the resolved type is WSDL or REST (SOAP services often return HTML to
+// browser GETs, so crawl traffic rarely carries WSDL signals — active probing is
+// the reliable discovery method). When the probe is skipped or finds nothing, the
+// original requests slice and apiType are returned unchanged. It returns the
+// (possibly augmented) requests, the resolved API type, and whether a WSDL
+// document was found.
+func ResolveWSDLType(ctx context.Context, targetURL, apiType string, requests []crawl.ObservedRequest, probe, allowPrivate bool, status io.Writer) ([]crawl.ObservedRequest, string, bool) {
+	if !probe || (apiType != APITypeWSDL && apiType != APITypeREST) {
+		return requests, apiType, false
+	}
+	augmented, foundWSDL, _ := ProbeAndAppendWSDLRequest(ctx, targetURL, requests, allowPrivate, status)
+	if foundWSDL {
+		return augmented, APITypeWSDL, true
+	}
+	return requests, apiType, false
 }

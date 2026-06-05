@@ -615,15 +615,10 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	// from <targetURL>?wsdl. SOAP services return HTML for browser GETs so
 	// crawl traffic rarely contains WSDL signals — active probing is the
 	// reliable discovery method.
-	if apiType == pipeline.APITypeWSDL || apiType == pipeline.APITypeREST {
-		var foundWSDL bool
-		requests, foundWSDL, _ = pipeline.ProbeAndAppendWSDLRequest(genCtx, c.URL, requests, c.DangerousAllowPrivate, statusWriter(c.Verbose))
-		if foundWSDL {
-			apiType = pipeline.APITypeWSDL
-			if c.Verbose {
-				fmt.Fprintf(os.Stderr, "discovered WSDL document at %s?wsdl\n", c.URL)
-			}
-		}
+	var foundWSDL bool
+	requests, apiType, foundWSDL = pipeline.ResolveWSDLType(genCtx, c.URL, apiType, requests, c.Probe, c.DangerousAllowPrivate, statusWriter(c.Verbose))
+	if foundWSDL && c.Verbose {
+		fmt.Fprintf(os.Stderr, "discovered WSDL document at %s?wsdl\n", c.URL)
 	}
 
 	if c.Verbose {

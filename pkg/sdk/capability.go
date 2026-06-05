@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"math"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,6 +31,7 @@ import (
 
 	"github.com/praetorian-inc/vespasian/internal/pipeline"
 	"github.com/praetorian-inc/vespasian/pkg/analyze"
+	"github.com/praetorian-inc/vespasian/pkg/analyze/jsstatic"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
@@ -40,9 +42,14 @@ var _ capability.Capability[capmodel.WebApplication] = (*Capability)(nil)
 // real browser. Signature matches defaultCrawl; tests replace it with a stub.
 var crawlFunc func(ctx context.Context, opts crawl.CrawlerOptions, target string) ([]crawl.ObservedRequest, error) = defaultCrawl
 
-// wsdlProbeFunc is a package-level seam that tests can swap to avoid making a
-// real network call when exercising the WSDL-discovery branch in runScan.
-var wsdlProbeFunc func(ctx context.Context, targetURL string, requests []crawl.ObservedRequest, allowPrivate bool, status io.Writer) ([]crawl.ObservedRequest, bool, string) = pipeline.ProbeAndAppendWSDLRequest
+// wsdlResolveFunc is a package-level seam that tests can swap to avoid making a
+// real network call when exercising the WSDL-discovery branch in runScan. It
+// wraps pipeline.ResolveWSDLType, which gates the probe on the probe flag.
+var wsdlResolveFunc func(ctx context.Context, targetURL, apiType string, requests []crawl.ObservedRequest, probe, allowPrivate bool, status io.Writer) ([]crawl.ObservedRequest, string, bool) = pipeline.ResolveWSDLType
+
+// jsAnalyzeFunc is a package-level seam that tests can swap to avoid network
+// I/O when exercising the JS-static-analysis augmentation in Invoke.
+var jsAnalyzeFunc func(ctx context.Context, requests []crawl.ObservedRequest) []crawl.ObservedRequest = defaultJSAnalyze
 
 // Capability implements capability.Capability[capmodel.WebApplication] and
 // exposes the vespasian crawl → classify → probe → generate pipeline through
@@ -115,12 +122,17 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 		return fmt.Errorf("vespasian: crawl failed: %w", err)
 	}
 
-	// Augment with static HTML form analysis (mirrors CLI pipeline).
+	// Augment with static HTML form analysis, then JS bundle analysis
+	// (mirrors the CLI scan pipeline's forms-then-jsstatic order).
 	requests = append(requests, analyze.ExtractForms(requests)...)
+	requests = jsAnalyzeFunc(context.Background(), requests)
 
 	// Group requests by page URL and emit Webpage entries (filter static assets).
 	parent := capmodel.WebApplication{PrimaryURL: input.PrimaryURL, Name: input.Name}
-	emittedPages := emitWebpages(requests, parent, output)
+	emittedPages, err := emitWebpages(requests, parent, output)
+	if err != nil {
+		return err
+	}
 
 	if mode == "crawl" {
 		slog.Info("vespasian crawl completed",
@@ -133,7 +145,7 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 		return nil
 	}
 
-	hasSpec, apiType := c.runScan(ctx, requests, input, output)
+	hasSpec, apiType, scanErr := c.runScan(ctx, requests, input, output)
 
 	slog.Info("vespasian scan completed",
 		"target", input.PrimaryURL,
@@ -144,12 +156,12 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 		"has_spec", hasSpec,
 		"api_type", apiType,
 	)
-	return nil
+	return scanErr
 }
 
 // runScan runs the classify → probe → generate phase and emits a WebApplication
 // with the spec if one is produced. Returns (hasSpec, resolvedAPIType).
-func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.ObservedRequest, input capmodel.WebApplication, output capability.Emitter) (bool, string) {
+func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.ObservedRequest, input capmodel.WebApplication, output capability.Emitter) (bool, string, error) {
 	confidence := parseConfidence(ctx.Parameters)
 	probeEnabled := parseProbeEnabled(ctx.Parameters)
 
@@ -158,16 +170,11 @@ func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.O
 		apiType = pipeline.DetectAPIType(requests, confidence)
 	}
 
-	// When the resolved API type is WSDL or REST, try fetching a WSDL document
-	// from <primaryURL>?wsdl. SOAP services often return HTML for browser GETs,
-	// so active probing is the reliable discovery method.
-	if apiType == pipeline.APITypeWSDL || apiType == pipeline.APITypeREST {
-		var foundWSDL bool
-		requests, foundWSDL, _ = wsdlProbeFunc(context.Background(), input.PrimaryURL, requests, false, nil)
-		if foundWSDL {
-			apiType = pipeline.APITypeWSDL
-		}
-	}
+	// Conditionally probe <primaryURL>?wsdl and promote the API type to WSDL on
+	// success. Gated by the probe flag; SSRF protection stays on (allowPrivate
+	// is forced false). SOAP services often return HTML for browser GETs, so
+	// active probing is the reliable discovery method.
+	requests, apiType, _ = wsdlResolveFunc(context.Background(), input.PrimaryURL, apiType, requests, probeEnabled, false, nil)
 
 	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:      apiType,
@@ -179,18 +186,20 @@ func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.O
 	})
 	if err != nil {
 		slog.Warn("vespasian: classify/generate failed", "target", input.PrimaryURL, "error", err)
-		return false, apiType
+		return false, apiType, nil
 	}
 
 	if len(bytes.TrimSpace(spec)) == 0 {
-		return false, apiType
+		return false, apiType, nil
 	}
 
 	webApp := input
 	webApp.Spec = string(spec)
 	webApp.SpecFormat = specFormatForType(apiType)
-	_ = output.Emit(webApp) //nolint:errcheck // emitter errors are non-fatal; logged by host
-	return true, apiType
+	if err := output.Emit(webApp); err != nil {
+		return false, apiType, fmt.Errorf("vespasian: emit spec: %w", err)
+	}
+	return true, apiType, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +209,28 @@ func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.O
 func defaultCrawl(ctx context.Context, opts crawl.CrawlerOptions, target string) ([]crawl.ObservedRequest, error) {
 	c := crawl.NewCrawler(opts)
 	return c.Crawl(ctx, target)
+}
+
+// defaultJSAnalyze runs jsstatic.Analyze as a best-effort augmentation,
+// mirroring the CLI scan pipeline (cmd/vespasian runJSAnalysisStage): it
+// recovers API endpoints from captured JS bundles and their sourcemaps.
+// Errors are non-fatal — best-effort enrichment must never fail the pipeline.
+// Re-analysis is skipped when the capture already carries JS-static sources.
+// SSRF protection stays enabled (AllowPrivate:false) to match the SDK's
+// hard-coded posture; sourcemap fetching mirrors the CLI scan default (true).
+func defaultJSAnalyze(ctx context.Context, requests []crawl.ObservedRequest) []crawl.ObservedRequest {
+	if crawl.AnyStaticSource(requests) {
+		return requests
+	}
+	res, err := jsstatic.Analyze(ctx, requests, jsstatic.Options{
+		FetchSourcemaps: true,
+		AllowPrivate:    false,
+	})
+	if err != nil {
+		slog.Warn("vespasian: js-static analysis failed", "error", err)
+		return requests
+	}
+	return res.Requests
 }
 
 // crawlOptsFromCtx extracts and validates crawl options from the execution context.
@@ -243,8 +274,8 @@ func parseConfidence(params capability.Parameters) float64 {
 	if !ok || cf == "" {
 		return 0.5
 	}
-	var v float64
-	if _, err := fmt.Sscanf(cf, "%f", &v); err != nil {
+	v, err := strconv.ParseFloat(cf, 64)
+	if err != nil {
 		return 0.5
 	}
 	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 1 {
@@ -277,8 +308,9 @@ func specFormatForType(apiType string) string {
 // ---------------------------------------------------------------------------
 
 // emitWebpages groups requests by page URL, filters static assets, and emits
-// one capmodel.Webpage per unique non-static URL. Returns the number emitted.
-func emitWebpages(requests []crawl.ObservedRequest, parent capmodel.WebApplication, output capability.Emitter) int {
+// one capmodel.Webpage per unique non-static URL. Returns the number
+// successfully emitted and the first emit error encountered, if any.
+func emitWebpages(requests []crawl.ObservedRequest, parent capmodel.WebApplication, output capability.Emitter) (int, error) {
 	byURL := make(map[string][]capmodel.WebpageRequest)
 	var order []string
 	for _, req := range requests {
@@ -301,14 +333,18 @@ func emitWebpages(requests []crawl.ObservedRequest, parent capmodel.WebApplicati
 		byURL[pageKey] = append(byURL[pageKey], toWebpageRequest(req))
 	}
 
+	emitted := 0
 	for _, u := range order {
-		_ = output.Emit(capmodel.Webpage{ //nolint:errcheck // emitter errors are non-fatal; logged by host
+		if err := output.Emit(capmodel.Webpage{
 			URL:      u,
 			Requests: byURL[u],
 			Parent:   parent,
-		})
+		}); err != nil {
+			return emitted, fmt.Errorf("vespasian: emit webpage %q: %w", u, err)
+		}
+		emitted++
 	}
-	return len(order)
+	return emitted, nil
 }
 
 // toWebpageRequest converts a crawl.ObservedRequest to capmodel.WebpageRequest,
