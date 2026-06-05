@@ -601,3 +601,9 @@ func TestCrawlOptsFromCtx_OverridesApplied(t *testing.T) {
 	assert.Equal(t, "Bearer x", opts.Headers["Authorization"])
 	assert.Equal(t, "acme", opts.Headers["X-Tenant"])
 }
+
+func TestCrawlOptsFromCtx_InvalidHeaderReturnsError(t *testing.T) {
+	_, err := crawlOptsFromCtx(ctxWithParams("headers", "no-colon-here"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "vespasian:")
+}

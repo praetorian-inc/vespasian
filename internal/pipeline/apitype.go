@@ -60,8 +60,8 @@ func DetectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
 	if graphqlCount > 0 && graphqlCount >= wsdlCount && graphqlCount >= restCount {
 		return APITypeGraphQL
 	}
-	// WSDL wins only when it has matches and they represent the majority
-	// of classified traffic (or there are no REST matches at all).
+	// WSDL wins when it has at least one match and at least as many as REST
+	// (ties favor WSDL). GraphQL is already resolved above.
 	if wsdlCount > 0 && wsdlCount >= restCount {
 		return APITypeWSDL
 	}

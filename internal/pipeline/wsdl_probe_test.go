@@ -86,6 +86,13 @@ func TestProbeWSDLDocument_NotWSDLReturnsNil(t *testing.T) {
 	assert.Nil(t, doc)
 }
 
+func TestProbeWSDLDocument_InvalidURLReturnsNil(t *testing.T) {
+	var buf bytes.Buffer
+	doc := pipeline.ProbeWSDLDocument(context.Background(), "://bad", true, &buf)
+	assert.Nil(t, doc, "expected nil bytes when url.Parse fails")
+	assert.Contains(t, buf.String(), "invalid URL")
+}
+
 func TestProbeWSDLDocument_StatusWriterRecordsProgress(t *testing.T) {
 	ts := wsdlServer(t)
 

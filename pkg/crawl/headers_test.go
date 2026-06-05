@@ -57,3 +57,10 @@ func TestParseHeader_RejectsNUL(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid characters")
 }
+
+func TestParseHeader_ErrorOmitsValue(t *testing.T) {
+	_, _, err := ParseHeader("Authorization: Bearer\r\nleaked-token-value")
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "leaked-token-value")
+	assert.Contains(t, err.Error(), "Authorization")
+}

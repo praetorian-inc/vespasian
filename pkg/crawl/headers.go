@@ -22,21 +22,24 @@ import (
 // ParseHeader parses a single "Key: Value" string, validating that the name is
 // an RFC 7230 token and the value contains no CR, LF, or NUL. Whitespace around
 // the name and value is trimmed.
+//
+// Validation errors deliberately never include the header value (only the
+// name), to avoid leaking secrets such as auth tokens carried in header values.
 func ParseHeader(raw string) (name, value string, err error) {
 	parts := strings.SplitN(raw, ":", 2)
 	if len(parts) != 2 {
-		return "", "", fmt.Errorf("invalid header format (expected 'Key: Value'): %q", raw)
+		return "", "", fmt.Errorf("invalid header format (expected 'Key: Value')")
 	}
 	name = strings.TrimSpace(parts[0])
 	value = strings.TrimSpace(parts[1])
 	if name == "" {
-		return "", "", fmt.Errorf("header has empty name: %q", raw)
+		return "", "", fmt.Errorf("header has empty name")
 	}
 	if !isValidHeaderName(name) {
-		return "", "", fmt.Errorf("header name contains invalid characters (RFC 7230): %q", raw)
+		return "", "", fmt.Errorf("header name contains invalid characters (RFC 7230): %q", name)
 	}
 	if strings.ContainsAny(value, "\r\n\x00") {
-		return "", "", fmt.Errorf("header value contains invalid characters: %q", raw)
+		return "", "", fmt.Errorf("header %q value contains invalid characters", name)
 	}
 	return name, value, nil
 }
