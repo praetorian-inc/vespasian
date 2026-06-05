@@ -77,9 +77,12 @@ func BenchmarkHTTPCrawl(b *testing.B) {
 }
 
 // BenchmarkRodCrawl measures the go-rod headless crawler against the same
-// deterministic fixture. Skips when Chrome is unavailable. Chrome cold-start
-// (~1-3 s/op) dominates wall time; treat rod numbers as relative to HTTP, not
-// as micro-optimization targets.
+// deterministic fixture. Skips when Chrome is unavailable.
+//
+// Each iteration relaunches Chrome, so b.N effectively stays at 1 and ns/op is
+// a single cold-start sample (~1-3 s) dominated by Chrome launch overhead. Use
+// these numbers for RELATIVE comparison vs BenchmarkHTTPCrawl, not as absolute
+// per-page latency measurements. A shared BrowserMgr optimisation is deferred.
 //
 // Note: run without -race when Chrome+race proves flaky in your environment
 // (go-rod spawns CDP goroutines; race instrumentation can cause false positives

@@ -21,11 +21,31 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// isPagePath reports whether path matches the fixture's page pattern "/p<digits>".
+// Used by TestCrawlerContract_RespectsMaxPages to distinguish crawled page URLs
+// from sub-resources (favicon, about:blank, CDP targets, etc.).
+func isPagePath(path string) bool {
+	if !strings.HasPrefix(path, "/p") {
+		return false
+	}
+	rest := path[2:]
+	if len(rest) == 0 {
+		return false
+	}
+	for _, c := range rest {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
 
 // chromeOnce guards a single Chrome availability probe shared across all
 // contract test rows. Probing once avoids launching multiple Chrome processes
@@ -177,16 +197,26 @@ func TestCrawlerContract_RespectsMaxPages(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Crawl error: %v", err)
 			}
-			// MaxPages bounds the pages crawled, not necessarily each request
-			// (rod may capture sub-resources). The key invariant: far fewer than
-			// totalPages(50) distinct page URLs observed.
-			uniqueURLs := make(map[string]struct{})
+			// Count only distinct page URLs — those whose path is "/" or matches
+			// "/p<digits>" (the fixture's page set). Sub-resource and browser-
+			// internal captures (favicon, about:blank, CDP targets) have paths
+			// that do not match the fixture pattern and are excluded so the bound
+			// holds for both the http and rod backends.
+			pageURLs := make(map[string]struct{})
 			for _, r := range got {
-				uniqueURLs[r.URL] = struct{}{}
+				u, err := url.Parse(r.URL)
+				if err != nil {
+					continue
+				}
+				p := u.Path
+				isPage := p == "/" || isPagePath(p)
+				if isPage {
+					pageURLs[r.URL] = struct{}{}
+				}
 			}
-			if len(uniqueURLs) > totalPages/2 {
-				t.Errorf("got %d unique URLs, want ≤%d — MaxPages not respected",
-					len(uniqueURLs), totalPages/2)
+			if len(pageURLs) > maxPages {
+				t.Errorf("got %d distinct page URLs, want ≤%d — MaxPages not respected",
+					len(pageURLs), maxPages)
 			}
 		},
 	)
