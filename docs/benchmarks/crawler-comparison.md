@@ -15,7 +15,7 @@ environment.
   pages), no randomness or time-based content. Index page links to 20 leaf pages; each leaf
   links to the next (ring) and back to the index.
 - **Command:**
-  ```text
+  ```shell
   go test -run '^$' -bench 'Benchmark.*Crawl' -benchmem ./pkg/crawl/
   ```
 - **Environment:** linux/arm64 (12-core), Go runtime benchmarking framework (`testing.B`).
