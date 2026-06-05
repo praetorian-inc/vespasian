@@ -862,9 +862,11 @@ PYEOF
                 # Assert /graphql POST is present (SPA fetch captured by rod).
                 local found_graphql; found_graphql=$(python3 - "$rod_capture" << 'PYEOF'
 import json, sys
+from urllib.parse import urlparse
 with open(sys.argv[1]) as f:
     reqs = json.load(f)
-found = any(r.get("method","").upper()=="POST" and r.get("url","").endswith("/graphql") for r in reqs)
+# Exact path match (parity with Go hasGraphQLPost) — avoids /api/graphql or query-string variants.
+found = any(r.get("method","").upper()=="POST" and urlparse(r.get("url","")).path=="/graphql" for r in reqs)
 print("yes" if found else "no")
 PYEOF
                 )
