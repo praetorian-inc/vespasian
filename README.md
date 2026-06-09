@@ -317,6 +317,8 @@ pkg/generate/
   └── wsdl/             WSDL generation, SOAP operation extraction
 ```
 
+For a deeper reference on the crawler — interface, backends, options, SSRF model, and how to add a new backend — see [docs/crawler.md](docs/crawler.md).
+
 ## Frequently Asked Questions
 
 ### What types of APIs can Vespasian discover?
