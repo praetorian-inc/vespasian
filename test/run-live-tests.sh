@@ -342,7 +342,9 @@ test_soap_service() {
         local n; n=$(json_len "$cap")
         log_info "soap-service[headless=${hl}]: ${n} requests captured"
     done
-    # Use http capture as the crawl artifact for subsequent steps.
+    # Retain the http capture as this target's crawl artifact (parity with the
+    # other targets / manual inspection). WSDL generation below does NOT use it —
+    # it uses the synthetic $soap_capture built next.
     if [ -f "${target_dir}/capture-false.json" ]; then
         cp "${target_dir}/capture-false.json" "$capture_file"
     fi
@@ -860,7 +862,12 @@ PYEOF
                 local rod_n; rod_n=$(json_len "$rod_capture")
                 log_info "graphql-server[headless=true]: ${rod_n} requests captured"
                 # Assert /graphql POST is present (SPA fetch captured by rod).
-                local found_graphql; found_graphql=$(python3 - "$rod_capture" << 'PYEOF'
+                # `|| echo "error"` keeps this on the file's defensive convention
+                # (cf. json_field/json_len): without it, a python failure (e.g. an
+                # empty capture serialized as JSON `null`, which is not iterable)
+                # would abort the whole suite under `set -e` instead of failing the
+                # assertion.
+                local found_graphql; found_graphql=$(python3 - "$rod_capture" << 'PYEOF' || echo "error"
 import json, sys
 from urllib.parse import urlparse
 with open(sys.argv[1]) as f:
@@ -872,6 +879,9 @@ PYEOF
                 )
                 if [ "$found_graphql" = "yes" ]; then
                     log_ok "graphql-server[rod-spa]: /graphql POST captured (LAB-1535 confirmed)"
+                elif [ "$found_graphql" = "error" ]; then
+                    log_fail "graphql-server[rod-spa]: could not parse rod capture for /graphql POST assertion"
+                    failures=$((failures + 1))
                 else
                     log_warn "graphql-server[rod-spa]: /graphql POST NOT captured in rod crawl (SPA fetch missed)"
                     failures=$((failures + 1))
