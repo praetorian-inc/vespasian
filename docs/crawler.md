@@ -35,9 +35,10 @@ func NewCrawler(opts CrawlerOptions) Crawler {
 }
 ```
 
-`NewCrawler` is the only way callers should construct a crawler. Constructing
-`RodCrawler` or `HTTPCrawler` directly bypasses the shared
-`validateCrawlInputs` path and leaves `pageTimeout` at its zero value.
+`NewCrawler` is the recommended constructor: it selects the backend from
+`opts.Headless` and applies option defaults. (Both backends also run
+`validateCrawlInputs` at the start of `Crawl`, so direct construction still
+validates inputs.)
 
 ## Backends
 
@@ -96,7 +97,7 @@ that only executes after user interaction or a framework's boot sequence.
 traffic via CDP network listeners.
 
 For a quantitative comparison of endpoint coverage between the two backends,
-see [docs/benchmarks/crawler-comparison.md](benchmarks/crawler-comparison.md).
+see [benchmarks/crawler-comparison.md](benchmarks/crawler-comparison.md).
 
 ## SSRF model
 
