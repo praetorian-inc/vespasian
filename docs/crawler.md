@@ -36,9 +36,9 @@ func NewCrawler(opts CrawlerOptions) Crawler {
 ```
 
 `NewCrawler` is the recommended constructor: it selects the backend from
-`opts.Headless` and applies option defaults. (Both backends also run
-`validateCrawlInputs` at the start of `Crawl`, so direct construction still
-validates inputs.)
+`opts.Headless`. Option defaults (e.g. `MaxPages`, `Concurrency`) and input
+validation are applied at the start of `Crawl` — via `validateCrawlInputs` and
+`clampConcurrency` — not in `NewCrawler`.
 
 ## Backends
 
