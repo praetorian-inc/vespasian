@@ -66,6 +66,7 @@ The CLI (`cmd/vespasian`) uses Kong for argument parsing. Each command (crawl, i
 ### Key Packages
 
 - **cmd/vespasian**: CLI entry point, command definitions, signal handling, browser lifecycle management
+- **internal/pipeline**: Shared crawl/classify/probe/generate orchestration consumed by both the CLI (`cmd/vespasian`) and the SDK (`pkg/sdk`). Exports `DetectAPIType`, `ClassifiersForType`, `StrategiesForType`, `ClassifyProbeGenerate`, `ProbeAndAppendWSDLRequest`, `ProbeWSDLDocument`, and `IsStaticAssetURL`.
 - **pkg/crawl**: Two crawler backends — headless mode uses go-rod to drive Chrome tabs (full JS/SPA support); non-headless mode uses a stdlib net/http engine with DFS frontier, 150 rps rate limiter, and scope+SSRF redirect guard. Both produce `ObservedRequest` values. Also owns capture file I/O and browser manager lifecycle.
 - **pkg/analyze**: Static analysis of captured HTML response bodies; extracts `<form>` endpoints and parameter names as synthetic `ObservedRequest` entries (`Source="static:html"`) to surface form-based APIs not triggered during crawl
 - **pkg/classify**: Request classification engine with confidence-based heuristics; classifiers for REST, GraphQL, and WSDL; deduplication
@@ -74,9 +75,10 @@ The CLI (`cmd/vespasian`) uses Kong for argument parsing. Each command (crawl, i
 - **pkg/generate/rest**: OpenAPI 3.0 generation, path normalization (UUID detection, context-aware parameter naming), JSON schema inference, form-encoded and multipart request-body inference
 - **pkg/generate/graphql**: GraphQL SDL generation from introspection results or traffic-based inference
 - **pkg/generate/wsdl**: WSDL generation from SOAP traffic, WSDL document parsing, type inference from SOAP envelopes
-- **pkg/analyze/jsstatic**: Static analysis of captured JavaScript bundles using BishopFox/jsluice. Sits between the capture stage and classify/generate stages. Recovers API endpoints, HTTP methods, path parameters (via EXPR→{param} normalisation), and request-body field names (from `fetch`/`axios` object literals). Synthesises `crawl.ObservedRequest` entries with `Source="static:js"` or `"static:js-sourcemap"` and appends them after dynamic entries so `classify.Deduplicate` keeps dynamic observations on ties. Enabled by default; opt out with `--analyze-js=false`.
+- **pkg/analyze/jsstatic**: Static analysis of captured JavaScript bundles using BishopFox/jsluice. Sits between the capture stage and classify/generate stages. Recovers API endpoints, HTTP methods, path parameters (via EXPR→{param} normalization), and request-body field names (from `fetch`/`axios` object literals). Synthesises `crawl.ObservedRequest` entries with `Source="static:js"` or `"static:js-sourcemap"` and appends them after dynamic entries so `classify.Deduplicate` keeps dynamic observations on ties. Enabled by default; opt out with `--analyze-js=false`.
 - **pkg/importer**: Traffic importers for Burp Suite XML, HAR 1.2, and mitmproxy dumps (including mitmproxy's native tnetstring `.mitm` format); format registry with layered safety caps — 500 MB per file, 64 MB per tnetstring element, 1 M entries per list/dict, 500 K flows per native stream
 - **pkg/mediatype**: Shared media-type canonicalization (lowercase + parameter strip). Used by classify and generate/rest where an import cycle prevents direct sharing.
+- **pkg/sdk**: Implements the capability-sdk `Capability[capmodel.WebApplication]` interface, exposing the vespasian pipeline to chariot/Guard hosts. The standalone CLI does not import this package.
 
 ### Key Patterns
 

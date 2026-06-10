@@ -19,6 +19,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/praetorian-inc/vespasian/internal/pipeline"
 	"github.com/praetorian-inc/vespasian/pkg/analyze/jsstatic"
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
@@ -63,7 +64,7 @@ func runSmokePipeline(t *testing.T, captured []crawl.ObservedRequest, opts jssta
 		t.Fatalf("jsstatic.Analyze error: %v", err)
 	}
 
-	classifiers := classifiersForType("rest")
+	classifiers := pipeline.ClassifiersForType("rest")
 	classified := classify.RunClassifiers(classifiers, res.Requests, 0.5)
 	deduped := classify.Deduplicate(classified)
 
@@ -117,7 +118,7 @@ func TestScanPipeline_AnalyzeJS_SmokeFixture(t *testing.T) {
 // endpoints and this test would fail — making the flag wiring tamper-evident.
 func TestScanPipeline_AnalyzeJS_OffMatchesBaseAndOnDoesNot(t *testing.T) {
 	captured := smokeFixture()
-	classifiers := classifiersForType("rest")
+	classifiers := pipeline.ClassifiersForType("rest")
 	gen := &restgen.OpenAPIGenerator{}
 
 	// Baseline: classify+dedup+generate against raw captured (no Analyze invoked).

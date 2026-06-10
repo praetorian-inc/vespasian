@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -32,14 +31,11 @@ import (
 
 	"github.com/alecthomas/kong"
 
+	"github.com/praetorian-inc/vespasian/internal/pipeline"
 	"github.com/praetorian-inc/vespasian/pkg/analyze"
 	"github.com/praetorian-inc/vespasian/pkg/analyze/jsstatic"
-	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
-	"github.com/praetorian-inc/vespasian/pkg/generate"
-	wsdlgen "github.com/praetorian-inc/vespasian/pkg/generate/wsdl"
 	"github.com/praetorian-inc/vespasian/pkg/importer"
-	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
 
 // Build-time variables injected via ldflags.
@@ -100,59 +96,26 @@ func injectRequestID(headers map[string]string, disabled bool) (string, error) {
 	return id, nil
 }
 
-// parseHeaders converts "Key: Value" strings to a map, validating header names
-// against RFC 7230 token production and header values against CRLF injection.
+// parseHeaders converts "Key: Value" strings to a map. Validation is delegated
+// to crawl.ParseHeader (RFC 7230 names; no CR/LF/NUL in values).
 func parseHeaders(raw []string) (map[string]string, error) {
 	headers := make(map[string]string)
 	for _, h := range raw {
-		parts := strings.SplitN(h, ":", 2)
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("invalid header format (expected 'Key: Value'): %q", h)
-		}
-		name := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-		if name == "" {
-			return nil, fmt.Errorf("header has empty name: %q", h)
-		}
-		if !isValidHeaderName(name) {
-			return nil, fmt.Errorf("header name contains invalid characters (RFC 7230): %q", h)
-		}
-		if strings.ContainsAny(value, "\r\n\x00") {
-			return nil, fmt.Errorf("header value contains invalid characters: %q", h)
+		name, value, err := crawl.ParseHeader(h)
+		if err != nil {
+			return nil, err
 		}
 		headers[name] = value
 	}
 	return headers, nil
 }
 
-// isValidHeaderName checks that name consists only of RFC 7230 token characters.
-// tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
-//
-//	"^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
-func isValidHeaderName(name string) bool {
-	for i := 0; i < len(name); i++ {
-		if !isTokenChar(name[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-// isTokenChar returns true if c is a valid RFC 7230 tchar.
-func isTokenChar(c byte) bool { //nolint:gocyclo // character-class lookup table
-	switch {
-	case c >= 'A' && c <= 'Z':
-		return true
-	case c >= 'a' && c <= 'z':
-		return true
-	case c >= '0' && c <= '9':
-		return true
-	case c == '!' || c == '#' || c == '$' || c == '%' || c == '&' ||
-		c == '\'' || c == '*' || c == '+' || c == '-' || c == '.' ||
-		c == '^' || c == '_' || c == '`' || c == '|' || c == '~':
-		return true
-	default:
-		return false
+// warnSSRFDisabled writes the SSRF-protection warning to stderr when both
+// allowPrivate and probe are enabled. The combination means active probes may
+// reach private/internal hosts.
+func warnSSRFDisabled(allowPrivate, probe bool) {
+	if allowPrivate && probe {
+		fmt.Fprintf(os.Stderr, "WARNING: SSRF protection disabled — probes may target private/internal networks\n") //nolint:errcheck // best-effort warning
 	}
 }
 
@@ -505,14 +468,6 @@ type GenerateCmd struct {
 	FetchSourcemaps       bool    `name:"fetch-sourcemaps" default:"false" help:"When --analyze-js is set, fetch .js.map sourcemaps referenced via //# sourceMappingURL= comments. Default false on generate (offline-friendly)."`
 }
 
-// API type constants used for classification routing and generation.
-const (
-	apiTypeAuto    = "auto"
-	apiTypeREST    = "rest"
-	apiTypeWSDL    = "wsdl"
-	apiTypeGraphQL = "graphql"
-)
-
 // maxCaptureSize is the maximum capture file size (100MB).
 const maxCaptureSize = 100 * 1024 * 1024
 
@@ -560,13 +515,15 @@ func (c *GenerateCmd) Run() (err error) {
 		verbose:         c.Verbose,
 	})
 
-	spec, err := generateSpec(ctx, requests, generateSpecOptions{
+	warnSSRFDisabled(c.DangerousAllowPrivate, c.Probe)
+
+	spec, err := pipeline.ClassifyProbeGenerate(ctx, requests, pipeline.Options{
 		APIType:      c.APIType,
 		Confidence:   c.Confidence,
 		Probe:        c.Probe,
 		Deduplicate:  c.Deduplicate,
 		AllowPrivate: c.DangerousAllowPrivate,
-		Verbose:      c.Verbose,
+		Status:       statusWriter(c.Verbose),
 	})
 	if err != nil {
 		return err
@@ -640,56 +597,43 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	})
 
 	apiType := c.APIType
-	if apiType == apiTypeAuto {
-		apiType = detectAPIType(requests, c.Confidence)
+	if apiType == pipeline.APITypeAuto {
+		apiType = pipeline.DetectAPIType(requests, c.Confidence)
 		if c.Verbose {
 			fmt.Fprintf(os.Stderr, "detected API type: %s\n", apiType) //nolint:gosec // G705: writing to stderr, not web response
 		}
 	}
 
-	// When auto-detection or explicit WSDL mode is active, try fetching a
-	// WSDL document from <targetURL>?wsdl. SOAP services return HTML for
-	// browser GETs so crawl traffic rarely contains WSDL signals — active
-	// probing is the reliable discovery method.
-	if apiType == apiTypeAuto || apiType == apiTypeWSDL || apiType == apiTypeREST {
-		wsdlDoc := probeWSDLDocument(c.URL, c.DangerousAllowPrivate, c.Verbose)
-		if wsdlDoc != nil {
-			apiType = apiTypeWSDL
-			if c.Verbose {
-				fmt.Fprintf(os.Stderr, "discovered WSDL document at %s?wsdl\n", c.URL)
-			}
-			// Inject a synthetic request carrying the WSDL document so
-			// the generator's Phase 1 can return it directly.
-			requests = append(requests, crawl.ObservedRequest{
-				Method: "GET",
-				URL:    c.URL + "?wsdl",
-				Response: crawl.ObservedResponse{
-					StatusCode:  200,
-					ContentType: "text/xml",
-					Body:        wsdlDoc,
-				},
-			})
-		}
+	// Create a fresh signal context for the generate phase. If a signal
+	// interrupted the crawl, bs.ctx is already canceled — doCrawl swallowed
+	// the error and returned partial results. Using the canceled context
+	// would cause ClassifyProbeGenerate's probing (and WSDL probing) to bail out immediately.
+	genCtx, genStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer genStop()
+
+	// When the resolved API type is WSDL or REST, try fetching a WSDL document
+	// from <targetURL>?wsdl. SOAP services return HTML for browser GETs so
+	// crawl traffic rarely contains WSDL signals — active probing is the
+	// reliable discovery method.
+	var foundWSDL bool
+	requests, apiType, foundWSDL = pipeline.ResolveWSDLType(genCtx, c.URL, apiType, requests, c.Probe, c.DangerousAllowPrivate, statusWriter(c.Verbose))
+	if foundWSDL && c.Verbose {
+		fmt.Fprintf(os.Stderr, "discovered WSDL document at %s?wsdl\n", c.URL)
 	}
 
 	if c.Verbose {
 		fmt.Fprintf(os.Stderr, "generating %s spec\n", apiTypeDisplayName(apiType)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
-	// Create a fresh signal context for the generate phase. If a signal
-	// interrupted the crawl, bs.ctx is already canceled — doCrawl swallowed
-	// the error and returned partial results. Using the canceled context
-	// would cause generateSpec's probing to bail out immediately.
-	genCtx, genStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer genStop()
+	warnSSRFDisabled(c.DangerousAllowPrivate, c.Probe)
 
-	spec, err := generateSpec(genCtx, requests, generateSpecOptions{
+	spec, err := pipeline.ClassifyProbeGenerate(genCtx, requests, pipeline.Options{
 		APIType:      apiType,
 		Confidence:   c.Confidence,
 		Probe:        c.Probe,
 		Deduplicate:  c.Deduplicate,
 		AllowPrivate: c.DangerousAllowPrivate,
-		Verbose:      c.Verbose,
+		Status:       statusWriter(c.Verbose),
 	})
 	if err != nil {
 		return err
@@ -721,17 +665,6 @@ func main() {
 	}
 	err := ctx.Run()
 	ctx.FatalIfErrorf(err)
-}
-
-// generateSpecOptions holds parameters for generateSpec, avoiding consecutive
-// bool arguments that are easy to transpose at call sites.
-type generateSpecOptions struct {
-	APIType      string
-	Confidence   float64
-	Probe        bool
-	Deduplicate  bool
-	AllowPrivate bool
-	Verbose      bool
 }
 
 // augmentWithStaticForms appends synthetic ObservedRequests parsed from HTML
@@ -770,231 +703,27 @@ func augmentAll(ctx context.Context, requests []crawl.ObservedRequest, js jsAnal
 	return requests
 }
 
-// generateSpec runs the classify → probe → generate pipeline. It trusts its
-// caller to have already augmented requests with static-HTML form
-// observations AND JS-bundle static analysis — both ScanCmd and GenerateCmd
-// call augmentAll (which performs both stages in order) before invoking this
-// function.
-func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts generateSpecOptions) ([]byte, error) {
-	classifiers := classifiersForType(opts.APIType)
-	if classifiers == nil {
-		return nil, fmt.Errorf("unsupported API type: %q", opts.APIType)
-	}
-	classified := classify.RunClassifiers(classifiers, requests, opts.Confidence)
-	if opts.Deduplicate {
-		classified = classify.Deduplicate(classified)
-	}
-
-	if opts.Verbose {
-		fmt.Fprintf(os.Stderr, "classified %d API requests (threshold=%.2f)\n", len(classified), opts.Confidence) //nolint:gosec // G705: writing to stderr, not web response
-	}
-
-	if opts.AllowPrivate && opts.Probe {
-		fmt.Fprintf(os.Stderr, "WARNING: SSRF protection disabled — probes may target private/internal networks\n")
-	}
-
-	if opts.Probe {
-		cfg := probe.DefaultConfig()
-		if opts.AllowPrivate {
-			cfg.URLValidator = func(string) error { return nil }
-			cfg.Client = &http.Client{
-				CheckRedirect: func(req *http.Request, via []*http.Request) error {
-					return http.ErrUseLastResponse
-				},
-				Transport: &http.Transport{
-					TLSHandshakeTimeout:   10 * time.Second,
-					ResponseHeaderTimeout: 10 * time.Second,
-				},
-			}
-		}
-		var strategies []probe.ProbeStrategy
-		switch opts.APIType {
-		case apiTypeWSDL:
-			strategies = []probe.ProbeStrategy{probe.NewWSDLProbe(cfg)}
-		case apiTypeGraphQL:
-			strategies = []probe.ProbeStrategy{probe.NewGraphQLProbe(cfg)}
-		default:
-			strategies = []probe.ProbeStrategy{
-				probe.NewOptionsProbe(cfg),
-				probe.NewSchemaProbe(cfg),
-			}
-		}
-		enriched, probeErrs := probe.RunStrategies(ctx, strategies, classified)
-		if opts.Verbose {
-			for _, e := range probeErrs {
-				fmt.Fprintf(os.Stderr, "probe warning: %v\n", e)
-			}
-		}
-		classified = enriched
-	}
-
-	gen, err := generate.Get(opts.APIType)
-	if err != nil {
-		return nil, err
-	}
-
-	spec, err := gen.Generate(classified)
-	if err != nil {
-		return nil, fmt.Errorf("generate failed: %w", err)
-	}
-
-	return spec, nil
-}
-
-// classifiersForType returns the appropriate classifiers for the given API type.
-func classifiersForType(apiType string) []classify.APIClassifier {
-	switch apiType {
-	case apiTypeREST:
-		return []classify.APIClassifier{&classify.RESTClassifier{}}
-	case apiTypeWSDL:
-		return []classify.APIClassifier{&classify.WSDLClassifier{}}
-	case apiTypeGraphQL:
-		return []classify.APIClassifier{&classify.GraphQLClassifier{}}
-	default:
-		return nil
-	}
-}
-
-// detectAPIType runs both WSDL and REST classifiers against captured traffic
-// and returns the API type with the most matches. For WSDL to win, it must
-// have at least one match AND represent the majority of classified traffic.
-// When WSDL matches exist but are the minority (mixed REST+SOAP), REST is
-// returned to avoid losing REST endpoint discovery.
-//
-// Note: this performs a lightweight classification pass separate from the full
-// RunClassifiers call inside generateSpec. The duplication is intentional —
-// detectAPIType only needs to answer "which generator?", while generateSpec's
-// pass produces the full ClassifiedRequest slice needed for generation.
-func detectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
-	wsdlClassifier := &classify.WSDLClassifier{}
-	restClassifier := &classify.RESTClassifier{}
-	graphqlClassifier := &classify.GraphQLClassifier{}
-
-	var wsdlCount, restCount, graphqlCount int
-	for _, req := range requests {
-		if isAPI, confidence := wsdlClassifier.Classify(req); isAPI && confidence >= threshold {
-			wsdlCount++
-		}
-		if isAPI, confidence := restClassifier.Classify(req); isAPI && confidence >= threshold {
-			restCount++
-		}
-		if isAPI, confidence := graphqlClassifier.Classify(req); isAPI && confidence >= threshold {
-			graphqlCount++
-		}
-	}
-
-	// GraphQL wins when it has matches and at least as many as both others.
-	if graphqlCount > 0 && graphqlCount >= wsdlCount && graphqlCount >= restCount {
-		return apiTypeGraphQL
-	}
-	// WSDL wins only when it has matches and they represent the majority
-	// of classified traffic (or there are no REST matches at all).
-	if wsdlCount > 0 && wsdlCount >= restCount {
-		return apiTypeWSDL
-	}
-	return apiTypeREST
-}
-
-// probeWSDLDocument attempts to fetch a WSDL document from targetURL?wsdl.
-// Returns the raw WSDL bytes if the response is a valid WSDL document, or nil
-// if the probe fails or returns non-WSDL content. This is the primary WSDL
-// discovery mechanism for the scan pipeline because headless browser crawls
-// of SOAP endpoints typically capture HTML, not XML.
-func probeWSDLDocument(targetURL string, allowPrivate bool, verbose bool) []byte {
-	parsedURL, err := url.Parse(targetURL)
-	if err != nil {
-		if verbose {
-			fmt.Fprintf(os.Stderr, "wsdl discovery: invalid URL %q: %v\n", targetURL, err) //nolint:errcheck,gosec // best-effort status message
-		}
-		return nil
-	}
-	parsedURL.RawQuery = "wsdl"
-	wsdlURL := parsedURL.String()
-
-	if verbose {
-		fmt.Fprintf(os.Stderr, "wsdl discovery: probing %s\n", wsdlURL)
-	}
-
-	if !allowPrivate {
-		if err := probe.ValidateProbeURL(wsdlURL); err != nil {
-			if verbose {
-				fmt.Fprintf(os.Stderr, "wsdl discovery: skipping %s (SSRF protection: %v)\n", wsdlURL, err)
-			}
-			return nil
-		}
-	}
-
-	// Per-stage timeouts in addition to the overall 15s Client.Timeout, so a
-	// slow TLS handshake or response-header phase can't burn the whole budget
-	// on one stage. Both branches share the same per-stage caps — the only
-	// real difference is the dialer (SSRF-safe vs permissive).
-	const stageTimeout = 10 * time.Second
-	transport := &http.Transport{
-		DialContext:           probe.SSRFSafeDialContext,
-		TLSHandshakeTimeout:   stageTimeout,
-		ResponseHeaderTimeout: stageTimeout,
-	}
-	if allowPrivate {
-		transport = &http.Transport{
-			TLSHandshakeTimeout:   stageTimeout,
-			ResponseHeaderTimeout: stageTimeout,
-		}
-	}
-	client := &http.Client{
-		Timeout:   15 * time.Second,
-		Transport: transport,
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-
-	resp, err := client.Get(wsdlURL)
-	if err != nil {
-		if verbose {
-			fmt.Fprintf(os.Stderr, "wsdl discovery: request failed: %v\n", err)
-		}
-		return nil
-	}
-	defer func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // best-effort drain
-		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close
-	}()
-
-	if resp.StatusCode >= 400 {
-		if verbose {
-			fmt.Fprintf(os.Stderr, "wsdl discovery: %s returned HTTP %d\n", wsdlURL, resp.StatusCode)
-		}
-		return nil
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20)) // 2MB limit
-	if err != nil {
-		return nil
-	}
-
-	// Validate the response is actually a WSDL document
-	if _, parseErr := wsdlgen.ParseWSDL(body); parseErr != nil {
-		if verbose {
-			fmt.Fprintf(os.Stderr, "wsdl discovery: response is not valid WSDL: %v\n", parseErr)
-		}
-		return nil
-	}
-
-	return body
-}
-
 // apiTypeDisplayName returns a human-readable display name for an API type.
 func apiTypeDisplayName(apiType string) string {
 	switch apiType {
-	case apiTypeREST:
+	case pipeline.APITypeREST:
 		return "REST"
-	case apiTypeWSDL:
+	case pipeline.APITypeWSDL:
 		return "WSDL"
-	case apiTypeGraphQL:
+	case pipeline.APITypeGraphQL:
 		return "GraphQL"
 	default:
 		return apiType
 	}
+}
+
+// statusWriter returns os.Stderr when verbose is true, otherwise nil.
+// Used to forward verbose progress output to the pipeline package.
+func statusWriter(verbose bool) io.Writer {
+	if verbose {
+		return os.Stderr
+	}
+	return nil
 }
 
 // validateURL checks that the given string is a valid URL with scheme and host.
