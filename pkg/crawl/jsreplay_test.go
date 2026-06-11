@@ -855,6 +855,12 @@ func TestSplitConcatArgs(t *testing.T) {
 		{"comma in object", `{a: 1, b: 2}, c`, []string{`{a: 1, b: 2}`, ` c`}},
 		{"escape in string", `"a\"b", c`, []string{`"a\"b"`, ` c`}},
 		{"backtick comma", "`a,b`, c", []string{"`a,b`", ` c`}},
+		// Unterminated top-level literal: scanStringLiteral returns -1, so the
+		// remainder is written verbatim and scanning stops (the `break scan`
+		// branch). A top-level comma in the unterminated tail must NOT split.
+		// A regression to a bare `break` would keep scanning and split here.
+		{"unterminated double-quote stops scan", `"a, b`, []string{`"a, b`}},
+		{"unterminated backtick stops scan", "`a, b", []string{"`a, b"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
