@@ -23,14 +23,14 @@ import (
 
 	"golang.org/x/net/publicsuffix"
 
-	"github.com/praetorian-inc/vespasian/internal/netutil"
+	"github.com/praetorian-inc/vespasian/pkg/ssrf"
 )
 
 // isPrivateIP reports whether ip falls within a private or internal network.
-// It delegates to internal/netutil.IsPrivateIP, which is the single source of
-// truth for the CIDR list shared by the crawl and probe stages.
+// It delegates to pkg/ssrf.IsPrivateIP, which is the single source of truth
+// for the CIDR list shared by the crawl and probe stages.
 func isPrivateIP(ip net.IP) bool {
-	return netutil.IsPrivateIP(ip)
+	return ssrf.IsPrivateIP(ip)
 }
 
 // isPrivateHost resolves a hostname via DNS and returns true if any of the
@@ -142,10 +142,10 @@ func registeredDomain(host string) (string, error) {
 // check can be re-resolved to 127.0.0.1 or another private address by the
 // time client.Do actually dials the connection.
 //
-// It delegates to internal/netutil.SSRFSafeDialContext, which is the shared
-// implementation used by both pkg/crawl and pkg/probe.
+// It delegates to pkg/ssrf.SafeDialContext, which is the shared implementation
+// used by both pkg/crawl and pkg/probe.
 func ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	return netutil.SSRFSafeDialContext(ctx, network, addr)
+	return ssrf.SafeDialContext(ctx, network, addr)
 }
 
 // normalizeURL normalizes a URL for deduplication by lowercasing the scheme

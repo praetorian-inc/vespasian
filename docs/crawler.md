@@ -109,11 +109,11 @@ The two backends differ in **where** the final DNS-rebinding TOCTOU protection
 is applied:
 
 **`HTTPCrawler` path** — authoritative dial-time pin via `ssrfSafeDialContext`
-(`pkg/crawl/scope.go` → `internal/netutil.SSRFSafeDialContext`). The transport
+(`pkg/crawl/scope.go` → `ssrf.SafeDialContext`). The transport
 for `newHTTPClient` is cloned from `http.DefaultTransport` with `DialContext`
-replaced. At connect time, `SSRFSafeDialContext` re-resolves the host via DNS
+replaced. At connect time, `SafeDialContext` re-resolves the host via DNS
 and rejects the connection if any returned IP is private (see
-`internal/netutil/netutil.go`). This closes the DNS-rebinding TOCTOU window: a
+`pkg/ssrf/ssrf.go`). This closes the DNS-rebinding TOCTOU window: a
 domain could resolve to a public IP during the upfront scope check and
 re-resolve to `127.0.0.1` or `169.254.169.254` by the time the dialer
 connects. The `redirectScopeGuard` (`http_crawler.go`) provides a second
@@ -167,7 +167,7 @@ func NewCrawler(opts CrawlerOptions) Crawler {
 3. Reuse the shared helpers:
    - `scopeChecker` — scope + SSRF upfront check (required)
    - `validateCrawlInputs` — input validation and `maxPages` resolution (required)
-   - `internal/netutil.SSRFSafeDialContext` — dial-time IP pin (HTTP-based backends)
+   - `ssrf.SafeDialContext` — dial-time IP pin (HTTP-based backends)
    - `newURLFrontier` — DFS/BFS URL queue with depth tracking
 
 4. Register the backend in the parameterized contract suite

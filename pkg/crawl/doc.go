@@ -42,6 +42,19 @@
 // ObservedRequest structs that serves as the interchange format between the
 // capture stage (crawl or import) and the generation stage.
 //
+// After the headless crawl, the package runs a post-crawl JS extraction
+// step that scans response bodies of JavaScript bundles for API path
+// strings and probes them with raw HTTP requests. This recovers endpoints
+// that the headless browser cannot exercise (paths gated behind user
+// interactions or built from runtime string concatenations) and bypasses
+// SPA catch-all routing that would otherwise return index.html instead of
+// API responses. The extractor recognizes quoted-string paths, template
+// literals, full URLs, literal+literal `+` service-prefix concatenations,
+// and identifier-bearing concatenations using either String.prototype.concat
+// or the `+` operator (LAB-1368) — the last form reconstructs a path by
+// substituting a numeric sentinel for non-literal operands so the result is
+// probeable and the REST normalizer can parameterize it.
+//
 // Key types:
 //   - [Crawler] is the common interface satisfied by [RodCrawler], [HTTPCrawler],
 //     and [FakeCrawler]. Use [NewCrawler] to obtain the right implementation.
@@ -53,6 +66,12 @@
 //   - [BrowserManager] manages Chrome process lifecycle, including proxy
 //     configuration and graceful shutdown (headless path only).
 //   - [ObservedRequest] and [ObservedResponse] represent captured HTTP traffic.
+//   - [JSReplayConfig] and [ReplayJSExtracted] implement the post-crawl JS
+//     bundle scanning step. The replay step enforces a same-origin gate
+//     (auth headers and probes are restricted to the scan target's origin
+//     by default) and uses [github.com/praetorian-inc/vespasian/pkg/ssrf]
+//     for SSRF protection unless the operator explicitly opts out via
+//     AllowPrivate.
 //
 // Session-cookie helpers (LAB-2222) let callers bootstrap Chrome's cookie
 // store from a user-supplied Cookie header so subsequent navigations are
