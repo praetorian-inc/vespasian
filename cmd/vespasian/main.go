@@ -497,7 +497,7 @@ type GenerateCmd struct {
 	Capture               string  `arg:"" help:"Capture file path"`
 	Output                string  `short:"o" help:"Output file path"`
 	Confidence            float64 `default:"0.5" help:"Minimum confidence threshold"`
-	Probe                 bool    `default:"true" help:"Enable endpoint probing"`
+	Probe                 bool    `default:"true" help:"Enable active probing of classified endpoints (OPTIONS/schema/WSDL-fetch/GraphQL introspection). Note: JS-bundle replay extraction runs only in 'scan', which has a live target URL to re-fetch bundles from; 'generate' works offline from an existing capture and cannot run it."`
 	Deduplicate           bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
 	DangerousAllowPrivate bool    `help:"Disable SSRF protection on the probe path (OPTIONS/schema/WSDL-fetch/GraphQL introspection) for private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 	Verbose               bool    `short:"v" help:"Enable verbose logging"`

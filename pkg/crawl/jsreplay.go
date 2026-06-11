@@ -844,6 +844,11 @@ func addStandaloneCandidates(jsBody []byte, add func(string), seen map[string]bo
 	}
 	candidates := make([]cand, 0, len(freq))
 	for name, n := range freq {
+		// standalonePrefixMinFrequency is currently 1, so this admits every
+		// candidate that appeared at least once (n is >= 1 by construction).
+		// The guard is retained as the single tuning point: raise the constant
+		// to drop one-off literals if real-world noise ever demands it. See the
+		// constant's doc comment for why 1 is the right default today.
 		if n < standalonePrefixMinFrequency {
 			continue
 		}
@@ -1201,6 +1206,7 @@ func splitConcatArgs(argList string) []string { //nolint:gocyclo // small string
 	var args []string
 	var b strings.Builder
 	depthRound, depthSquare, depthCurly := 0, 0, 0
+scan:
 	for i := 0; i < len(data); i++ {
 		c := data[i]
 		switch c {
@@ -1209,9 +1215,10 @@ func splitConcatArgs(argList string) []string { //nolint:gocyclo // small string
 			if end < 0 {
 				// Unterminated/malformed literal: append the remainder
 				// verbatim and stop so stray commas in the tail don't
-				// produce spurious extra arguments.
+				// produce spurious extra arguments. Labeled break exits the
+				// for loop (a bare break would only exit the switch).
 				b.Write(data[i:])
-				goto done
+				break scan
 			}
 			b.Write(data[i : end+1])
 			i = end
@@ -1250,7 +1257,6 @@ func splitConcatArgs(argList string) []string { //nolint:gocyclo // small string
 			b.WriteByte(c)
 		}
 	}
-done:
 	if b.Len() > 0 {
 		args = append(args, b.String())
 	}
@@ -1533,6 +1539,17 @@ func extractAPIPaths(jsBody []byte, requests []ObservedRequest) []string { //nol
 		}
 	}
 
+	// Caller-side extraction strategies (this function's 1-5 numbering is
+	// independent of the internal 1/2/3 sub-numbering inside
+	// extractServicePrefixes):
+	//   Strategy 1  — single/double-quoted API paths      (apiPathPattern)
+	//   Strategy 2a — template literals with ${...}        (extractTemplateLiteralPaths)
+	//   Strategy 2b — simple template-literal fallback     (templateLiteralPattern)
+	//   Strategy 3  — full URLs                            (fullURLPattern)
+	//   Strategy 4  — literal+literal service-prefix concat (implicit, via
+	//                 extractServicePrefixes + the addPath fan-out above)
+	//   Strategy 5  — .concat()/+-chain with identifiers   (extractConcatPaths)
+
 	// Strategy 1: Single/double-quoted API paths.
 	for _, match := range apiPathPattern.FindAllSubmatch(jsBody, -1) {
 		if len(match) >= 2 {
@@ -1748,6 +1765,10 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		// Compute the same-origin verdict once per iteration; it is reused
 		// both by the cross-origin gate below and the header-recording check
 		// further down (the URL and target origin do not change in between).
+		// doRequest independently re-derives this for its header-forwarding
+		// gate — that recomputation is deliberate (defense in depth: header
+		// leakage must stay impossible regardless of how this loop evolves),
+		// not an oversight. Keep both in sync if same-origin semantics change.
 		sameOrigin := isSameOrigin(fullURL, targetOrigin)
 
 		// Same-origin gate: by default, drop URLs whose origin doesn't
@@ -1847,7 +1868,10 @@ func doRequest(ctx context.Context, cfg JSReplayConfig, rawURL, targetOrigin str
 	// Same-origin gate for header forwarding: never send Authorization /
 	// Cookie / X-API-Key to an off-target host, even when AllowCrossOrigin
 	// permits the probe. Header forwarding is strictly tied to host
-	// equality, not to whether the probe was allowed.
+	// equality, not to whether the probe was allowed. This re-derives
+	// same-origin independently of any caller-computed verdict on purpose:
+	// header leakage must be impossible regardless of how callers gate the
+	// request, so doRequest never trusts a passed-in bool for this decision.
 	if isSameOrigin(rawURL, targetOrigin) {
 		for k, v := range cfg.Headers {
 			req.Header.Set(k, v)
@@ -1890,6 +1914,9 @@ const maxJSRedirects = 5
 // re-validated against the same-origin gate and SSRF checks so a malicious
 // JS URL cannot redirect into a private destination or off-target host.
 func fetchJSBody(ctx context.Context, cfg JSReplayConfig, rawURL, targetOrigin string) []byte {
+	// hop 0 is the initial fetch; hops 1..maxJSRedirects follow 3xx redirects.
+	// The <= bound therefore permits one initial request plus maxJSRedirects
+	// redirect follows.
 	for hop := 0; hop <= maxJSRedirects; hop++ {
 		if !canFetchURL(ctx, cfg, rawURL, targetOrigin) {
 			return nil
