@@ -2094,6 +2094,42 @@ func TestJSReplayConfig_WithDefaults_WrapsCallerSuppliedClient(t *testing.T) {
 	require.Error(t, err, "wrapped DialContext must reject loopback")
 }
 
+// recordingRoundTripper records whether RoundTrip was reached.
+type recordingRoundTripper struct{ called bool }
+
+func (r *recordingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	r.called = true
+	return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+}
+
+func TestJSReplayConfig_WithDefaults_WrapsOpaqueTransport(t *testing.T) {
+	// A caller-supplied client whose Transport is NOT *http.Transport cannot
+	// receive a dial-time SafeDialContext. withDefaults must instead wrap it in
+	// ssrfValidatingRoundTripper so private/internal destinations are still
+	// rejected at request time (SEC-BE-002).
+	base := &recordingRoundTripper{}
+	caller := &http.Client{Transport: base}
+	cfg := JSReplayConfig{Client: caller, Stderr: io.Discard}.withDefaults()
+
+	rt, ok := cfg.Client.Transport.(ssrfValidatingRoundTripper)
+	require.True(t, ok, "opaque transport must be wrapped in ssrfValidatingRoundTripper")
+
+	// A loopback request must be rejected before reaching the base transport.
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://127.0.0.1/api", nil)
+	require.NoError(t, err)
+	_, err = rt.RoundTrip(req)
+	require.Error(t, err, "request-time SSRF validation must reject loopback")
+	require.False(t, base.called, "base transport must not be reached for a blocked URL")
+
+	// A public request passes validation and reaches the base transport.
+	pubReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://8.8.8.8/api", nil)
+	require.NoError(t, err)
+	resp, err := rt.RoundTrip(pubReq)
+	require.NoError(t, err)
+	require.Equal(t, 200, resp.StatusCode)
+	require.True(t, base.called, "base transport must be reached for an allowed URL")
+}
+
 // --- TEST-002: isHTMLResponse content-type coverage ---
 
 func TestIsHTMLResponse(t *testing.T) {
@@ -2437,6 +2473,7 @@ func TestFetchJSBody_RedirectLoopBounded(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
 		// Always redirect to itself: should bail out after maxJSRedirects.
+		//nolint:gosec // G710: intentional self-redirect in a test server to exercise the redirect-loop bound; not production code.
 		http.Redirect(w, r, r.URL.Path, http.StatusFound)
 	}))
 	defer srv.Close()

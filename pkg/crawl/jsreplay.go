@@ -44,6 +44,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 	"github.com/praetorian-inc/vespasian/pkg/ssrf"
 )
 
@@ -193,15 +194,43 @@ func wrapClientWithSSRF(caller *http.Client, timeout time.Duration, stderr io.Wr
 		// the no-client case.
 		clone.Transport = newSSRFSafeClient(timeout, false).Transport
 	default:
+		// We cannot install a SafeDialContext on an opaque RoundTripper, so
+		// fall back to request-time validation: wrap the caller's transport
+		// so every request URL is re-checked against the SSRF blocklist
+		// immediately before it is sent. This is weaker than dial-time
+		// pinning (the wrapped transport still does its own DNS resolution,
+		// leaving a narrow TOCTOU window) but strictly stronger than letting
+		// the request through with only a warning.
 		fmt.Fprintf(stderr, //nolint:errcheck // best-effort warning
 			"js-extract: warning: caller-supplied http.Client.Transport is %T (not *http.Transport); "+
-				"dial-time SSRF protection cannot be installed and DNS rebinding remains possible. "+
-				"pre-dial ssrf.ValidateURLContext still blocks the default attack path.\n", t)
+				"dial-time SSRF pinning cannot be installed (a narrow DNS-rebinding window remains). "+
+				"Falling back to request-time ssrf.ValidateURLContext on every request.\n", t)
+		clone.Transport = ssrfValidatingRoundTripper{base: caller.Transport}
 	}
 	if clone.Timeout == 0 {
 		clone.Timeout = timeout
 	}
 	return &clone
+}
+
+// ssrfValidatingRoundTripper wraps an opaque http.RoundTripper (one we cannot
+// install a dial-time SafeDialContext on) and re-validates every request URL
+// against the SSRF blocklist immediately before delegating. It is the fallback
+// used by wrapClientWithSSRF when a caller supplies a custom transport, so a
+// custom-transport client (e.g. one routed through a proxy) still cannot be
+// steered at a private/internal destination.
+type ssrfValidatingRoundTripper struct {
+	base http.RoundTripper
+}
+
+// RoundTrip validates req.URL against the SSRF blocklist before delegating to
+// the wrapped transport, returning an error (without sending the request) when
+// the destination resolves to a private/internal address.
+func (rt ssrfValidatingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := ssrf.ValidateURLContext(req.Context(), req.URL.String()); err != nil {
+		return nil, fmt.Errorf("js-extract: SSRF validation rejected %s: %w", req.URL.Redacted(), err)
+	}
+	return rt.base.RoundTrip(req)
 }
 
 // newSSRFSafeClient builds the default *http.Client used by ReplayJSExtracted.
@@ -249,11 +278,11 @@ var htmlContentTypes = []string{
 
 // matchesContentType reports whether contentType (with optional ;charset
 // parameters) matches any entry in types. Comparison is case-insensitive.
+// Canonicalization (parameter strip + lowercase) is delegated to
+// mediatype.Base so the crawl, classify, and generate stages share one
+// implementation.
 func matchesContentType(contentType string, types []string) bool {
-	ct := strings.ToLower(contentType)
-	if idx := strings.Index(ct, ";"); idx != -1 {
-		ct = strings.TrimSpace(ct[:idx])
-	}
+	ct := mediatype.Base(contentType)
 	for _, t := range types {
 		if ct == t {
 			return true
@@ -508,10 +537,12 @@ var standalonePrefixPattern = regexp.MustCompile(
 // service prefix exactly once as a runtime constant (`const SVC_X = "x/"`)
 // and reference it via the variable thereafter — a literal-match count >= 2
 // would reject these legitimate prefixes. Noise control is delegated to
-// (a) the API-indicator filter, (b) the per-bundle cap of 8, and (c) the
-// downstream 404 filter that drops wrong-prefix probe combinations. Together
-// these bound the amplification cost of false-positive prefixes without
-// trading away recall on real-world bundles.
+// (a) the API-indicator filter, (b) the per-bundle cap of 8, (c) the
+// downstream 404 filter that drops wrong-prefix probe combinations, and
+// (d) the global cfg.MaxEndpoints probe budget that hard-caps the total
+// number of prefix×path combinations ever probed. Together these bound the
+// amplification cost of false-positive prefixes without trading away recall
+// on real-world bundles.
 const standalonePrefixMinFrequency = 1
 
 // maxBundlePrefixCap caps the TOTAL number of service prefixes
@@ -1714,6 +1745,11 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 			fullURL = targetOrigin + path
 		}
 
+		// Compute the same-origin verdict once per iteration; it is reused
+		// both by the cross-origin gate below and the header-recording check
+		// further down (the URL and target origin do not change in between).
+		sameOrigin := isSameOrigin(fullURL, targetOrigin)
+
 		// Same-origin gate: by default, drop URLs whose origin doesn't
 		// match the scan target. This prevents the JS bundle from using
 		// Vespasian as a request reflector and stops auth-header leaks
@@ -1721,7 +1757,7 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		// MaxEndpoints budget — otherwise an attacker could salt the
 		// bundle with cross-origin URLs to suppress legitimate API
 		// discovery.
-		if !cfg.AllowCrossOrigin && !isSameOrigin(fullURL, targetOrigin) {
+		if !cfg.AllowCrossOrigin && !sameOrigin {
 			warnf("js-extract: skipping cross-origin URL %s (use AllowCrossOrigin to allow)\n",
 				sanitizeForLog(fullURL))
 			continue
@@ -1760,7 +1796,7 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		// headers track what the wire actually carried — empty for
 		// cross-origin probes (see header-forwarding gate above).
 		var recorded map[string]string
-		if isSameOrigin(fullURL, targetOrigin) {
+		if sameOrigin {
 			recorded = copyHeaders(cfg.Headers)
 		}
 
@@ -1783,10 +1819,10 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 
 // --- HTTP helpers ---
 
-// jsReplayUserAgent identifies probe requests as coming from Vespasian's
+// jsExtractUserAgent identifies probe requests as coming from Vespasian's
 // JS-replay step so cross-origin destinations can attribute the traffic.
 // No version is included so the constant doesn't drift from the binary.
-const jsReplayUserAgent = "vespasian-js-extract"
+const jsExtractUserAgent = "vespasian-js-extract"
 
 // doRequest builds and executes an HTTP GET against rawURL using cfg.Client.
 // Headers from cfg.Headers are attached only when rawURL is same-origin with
@@ -1806,7 +1842,7 @@ func doRequest(ctx context.Context, cfg JSReplayConfig, rawURL, targetOrigin str
 	// traffic to a Vespasian scan rather than attribute it to a generic
 	// Go-http-client. Same-origin Headers (set below) can override this
 	// if the operator passes their own User-Agent via --header.
-	req.Header.Set("User-Agent", jsReplayUserAgent)
+	req.Header.Set("User-Agent", jsExtractUserAgent)
 
 	// Same-origin gate for header forwarding: never send Authorization /
 	// Cookie / X-API-Key to an off-target host, even when AllowCrossOrigin
