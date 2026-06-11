@@ -39,29 +39,64 @@ func InferWSDL(endpoints []classify.ClassifiedRequest) (*Definitions, error) {
 	var operations []string
 	soapActions := make(map[string]string) // operation name -> SOAPAction URI
 	seen := make(map[string]bool)
+	observations := make(map[string]*soapBodyInfo)
+
+	// record consolidates per-endpoint bookkeeping that applies whether the
+	// op is being seen for the first time or as a duplicate: backfill
+	// SOAPAction binding metadata if missing, and union body-derived
+	// parameter observations into the per-op aggregator. First-observed
+	// SOAPAction wins; param merging follows first-with-type-wins.
+	record := func(opName, soapAction string, body []byte) {
+		if soapAction != "" && soapActions[opName] == "" {
+			soapActions[opName] = soapAction
+		}
+		if len(body) == 0 {
+			return
+		}
+		info := extractSOAPParameters(body)
+		if info == nil {
+			return
+		}
+		if existing := observations[opName]; existing != nil {
+			existing.merge(info)
+			return
+		}
+		observations[opName] = info
+	}
 
 	for _, ep := range endpoints {
 		opName, soapAction := extractOperation(ep)
-		if opName == "" || seen[opName] {
+		if opName == "" {
 			continue
 		}
-		seen[opName] = true
-		operations = append(operations, opName)
-		if soapAction != "" {
-			soapActions[opName] = soapAction
+		if !seen[opName] {
+			seen[opName] = true
+			operations = append(operations, opName)
 		}
+		record(opName, soapAction, ep.Body)
 	}
 
 	if len(operations) == 0 {
 		return nil, errors.New("no SOAP operations found in traffic")
 	}
 
+	// Preserve the namespace observed on the SOAP operation elements; fall back
+	// to the URL-derived namespace when traffic carried none or disagreed.
+	// definitions, tns, and the XSD schema all share this one namespace so the
+	// tns: references stay resolvable. The service address still uses serviceURL.
+	// schemaNS differs from targetNS only when an operation element carried an
+	// observed namespace; with none observed, typesNamespace returns targetNS.
+	// So schemaNS == targetNS whenever no namespace was observed (regardless of
+	// whether Types is emitted), making the unconditional assignment to
+	// TargetNS/XMLNSTNS safe.
+	schemaNS := typesNamespace(operations, observations, targetNS)
+
 	defs := &Definitions{
 		Name:      serviceName,
-		TargetNS:  targetNS,
+		TargetNS:  schemaNS,
 		XMLNS:     "http://schemas.xmlsoap.org/wsdl/",
 		XMLNSSOAP: "http://schemas.xmlsoap.org/wsdl/soap/",
-		XMLNSTNS:  targetNS,
+		XMLNSTNS:  schemaNS,
 		XMLNSXSD:  "http://www.w3.org/2001/XMLSchema",
 	}
 
@@ -104,6 +139,11 @@ func InferWSDL(endpoints []classify.ClassifiedRequest) (*Definitions, error) {
 	}
 
 	defs.Messages = messages
+
+	if len(observations) > 0 {
+		defs.Types = inferTypesFromObservations(operations, observations, schemaNS)
+	}
+
 	defs.PortTypes = []PortType{{
 		Name:       portTypeName,
 		Operations: ptOps,
@@ -190,7 +230,10 @@ func extractNameFromURI(uri string) string {
 	return uri
 }
 
-// extractFirstBodyElement extracts the first child element name from within soap:Body.
+// extractFirstBodyElement extracts the first child element name from within
+// the SOAP Body. Matches Body by namespace URI (SOAP 1.1 or 1.2), not just
+// local name, to avoid treating an unrelated <Body> element (e.g., HTML
+// embedded in a SOAP fault detail) as the envelope's Body.
 func extractFirstBodyElement(body []byte) string {
 	decoder := xml.NewDecoder(bytes.NewReader(body))
 	inBody := false
@@ -200,13 +243,13 @@ func extractFirstBodyElement(body []byte) string {
 			return ""
 		}
 		if t, ok := tok.(xml.StartElement); ok {
-			local := t.Name.Local
-			if strings.EqualFold(local, "body") {
+			if strings.EqualFold(t.Name.Local, "body") &&
+				(t.Name.Space == soapNS11 || t.Name.Space == soapNS12) {
 				inBody = true
 				continue
 			}
 			if inBody {
-				return local
+				return t.Name.Local
 			}
 		}
 	}

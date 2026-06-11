@@ -33,6 +33,7 @@ import (
 	"github.com/alecthomas/kong"
 
 	"github.com/praetorian-inc/vespasian/pkg/analyze"
+	"github.com/praetorian-inc/vespasian/pkg/analyze/jsstatic"
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/generate"
@@ -268,17 +269,19 @@ func writeOutput(path string, fn func(io.Writer) error) error {
 
 // CrawlOptions holds the shared crawl configuration fields used by CrawlCmd and ScanCmd.
 type CrawlOptions struct {
-	Header      []string      `short:"H" help:"Custom headers (repeatable)"`
-	Output      string        `short:"o" help:"Output file path"`
-	Depth       int           `default:"3" help:"Maximum crawl depth"`
-	MaxPages    int           `default:"100" help:"Maximum pages to crawl"`
-	Timeout     time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
-	Scope       string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
-	Headless    bool          `default:"true" help:"Use headless browser"`
-	Proxy       string        `help:"Proxy address for headless browser (e.g., http://127.0.0.1:8080). Note: TLS certificate verification is disabled during crawls."`
-	Concurrency int           `default:"10" help:"Number of concurrent browser tabs for headless crawling"`
-	NoRequestID bool          `name:"no-request-id" help:"Disable automatic X-Vespasian-Request-Id header"`
-	Verbose     bool          `short:"v" help:"Enable verbose logging"`
+	Header          []string      `short:"H" help:"Custom headers (repeatable)"`
+	Output          string        `short:"o" help:"Output file path"`
+	Depth           int           `default:"3" help:"Maximum crawl depth"`
+	MaxPages        int           `default:"100" help:"Maximum pages to crawl"`
+	Timeout         time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
+	Scope           string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
+	Headless        bool          `default:"true" help:"Use headless browser"`
+	Proxy           string        `help:"Proxy address for headless browser (e.g., http://127.0.0.1:8080). Note: TLS certificate verification is disabled during crawls."`
+	Concurrency     int           `default:"10" help:"Number of concurrent browser tabs for headless crawling"`
+	NoRequestID     bool          `name:"no-request-id" help:"Disable automatic X-Vespasian-Request-Id header"`
+	Verbose         bool          `short:"v" help:"Enable verbose logging"`
+	AnalyzeJS       bool          `name:"analyze-js"      default:"true"  help:"Statically analyze captured JS bundles to discover API endpoints, parameters, and request bodies."`
+	FetchSourcemaps bool          `name:"fetch-sourcemaps" default:"true"  help:"When --analyze-js is set, fetch .js.map sourcemaps referenced via //# sourceMappingURL= comments to recover original sources."`
 }
 
 // setupForceExitHandler spawns a goroutine that waits for the first signal
@@ -426,8 +429,23 @@ func (c *CrawlCmd) Run() error {
 		if bs.requestID != "" {
 			fmt.Fprintf(os.Stderr, "request-id: %s\n", bs.requestID)
 		}
+		// Log the captured count BEFORE augmentation/JS analysis so the number
+		// reflects what the crawler observed, not the post-static-analysis
+		// total. Matches ScanCmd.Run's ordering.
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
+
+	// NOTE: running `crawl` (with --analyze-js) followed by `generate` (also
+	// with --analyze-js, the default) does NOT re-analyze the same JS bundles.
+	// runJSAnalysisStage's idempotency guard (crawl.AnyStaticSource) detects the
+	// static:js entries this stage writes into the capture and short-circuits the
+	// second analysis, so `crawl | generate` is byte-identical to a single `scan`.
+	requests = runJSAnalysisStage(bs.ctx, requests, jsAnalysisArgs{
+		enabled:         c.AnalyzeJS,
+		fetchSourcemaps: c.FetchSourcemaps,
+		allowPrivate:    c.DangerousAllowPrivate,
+		verbose:         c.Verbose,
+	})
 
 	return writeOutput(c.Output, func(w io.Writer) error {
 		return crawl.WriteCapture(w, requests)
@@ -483,6 +501,8 @@ type GenerateCmd struct {
 	Deduplicate           bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
 	DangerousAllowPrivate bool    `help:"Disable SSRF protection on the probe path (OPTIONS/schema/WSDL-fetch/GraphQL introspection) for private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 	Verbose               bool    `short:"v" help:"Enable verbose logging"`
+	AnalyzeJS             bool    `name:"analyze-js"       default:"true"  help:"Statically analyze JS bundles in the imported capture (when present)."`
+	FetchSourcemaps       bool    `name:"fetch-sourcemaps" default:"false" help:"When --analyze-js is set, fetch .js.map sourcemaps referenced via //# sourceMappingURL= comments. Default false on generate (offline-friendly)."`
 }
 
 // API type constants used for classification routing and generation.
@@ -526,13 +546,19 @@ func (c *GenerateCmd) Run() (err error) {
 		fmt.Fprintf(os.Stderr, "loaded %d captured requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
-	// Augment with static-HTML form observations so captures produced by
-	// crawl/import (which don't run form extraction) get the same treatment
-	// as captures produced by scan.
-	requests = augmentWithStaticForms(requests)
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Augment captured requests with static-HTML form analysis + JS bundle
+	// static analysis in the canonical forms-then-jsstatic order (see
+	// augmentAll). Captures produced by crawl/import (which don't run form
+	// extraction inline) get the same treatment as captures produced by scan.
+	requests = augmentAll(ctx, requests, jsAnalysisArgs{
+		enabled:         c.AnalyzeJS,
+		fetchSourcemaps: c.FetchSourcemaps,
+		allowPrivate:    c.DangerousAllowPrivate,
+		verbose:         c.Verbose,
+	})
 
 	spec, err := generateSpec(ctx, requests, generateSpecOptions{
 		APIType:      c.APIType,
@@ -602,8 +628,16 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
-	// Augment BEFORE auto-detection (see augmentWithStaticForms doc comment).
-	requests = augmentWithStaticForms(requests)
+	// Augment captured requests with static-HTML form analysis + JS bundle
+	// static analysis in the canonical forms-then-jsstatic order (see
+	// augmentAll). Same helper used by GenerateCmd.Run — the order contract
+	// is centralized to prevent the two commands from silently diverging.
+	requests = augmentAll(bs.ctx, requests, jsAnalysisArgs{
+		enabled:         c.AnalyzeJS,
+		fetchSourcemaps: c.FetchSourcemaps,
+		allowPrivate:    c.DangerousAllowPrivate,
+		verbose:         c.Verbose,
+	})
 
 	apiType := c.APIType
 	if apiType == apiTypeAuto {
@@ -740,10 +774,37 @@ func augmentWithStaticForms(requests []crawl.ObservedRequest) []crawl.ObservedRe
 	return append(requests, analyze.ExtractForms(requests)...)
 }
 
+// augmentAll runs the captured-request augmentation stages in the canonical
+// order: static-HTML forms first, then JS-bundle static analysis. Both
+// ScanCmd.Run and GenerateCmd.Run call this helper rather than open-coding the
+// two stage calls — the shared helper pins the order contract so a regression
+// in one command cannot silently re-emerge in the other.
+//
+// CrawlCmd does NOT call this helper. CrawlCmd already runs the JS-bundle
+// stage (runJSAnalysisStage) inline before writing capture.json, so the
+// produced capture already carries static:js entries; the HTML-form stage is
+// deferred until generate time. The split is intentional: form extraction
+// runs on a freshly-loaded capture (where classify needs the synthetic
+// entries) but JS analysis is cheap to do once at crawl time so capture.json
+// readers don't need to repeat it. Callers consuming capture.json should
+// still call augmentWithStaticForms before classification, which is exactly
+// what GenerateCmd.Run does via augmentAll.
+//
+// The order matters for downstream determinism: static:html entries appear
+// before static:js entries in the result, so classify.Deduplicate
+// first-write-wins keeps the form-derived signals when they collide with
+// bundle-derived ones on the same endpoint key.
+func augmentAll(ctx context.Context, requests []crawl.ObservedRequest, js jsAnalysisArgs) []crawl.ObservedRequest {
+	requests = augmentWithStaticForms(requests)
+	requests = runJSAnalysisStage(ctx, requests, js)
+	return requests
+}
+
 // generateSpec runs the classify → probe → generate pipeline. It trusts its
-// caller to have already augmented requests with static-HTML form observations
-// (both ScanCmd and GenerateCmd call augmentWithStaticForms before invoking
-// this function).
+// caller to have already augmented requests with static-HTML form
+// observations AND JS-bundle static analysis — both ScanCmd and GenerateCmd
+// call augmentAll (which performs both stages in order) before invoking this
+// function.
 func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts generateSpecOptions) ([]byte, error) {
 	classifiers := classifiersForType(opts.APIType)
 	if classifiers == nil {
@@ -893,16 +954,26 @@ func probeWSDLDocument(targetURL string, allowPrivate bool, verbose bool) []byte
 		}
 	}
 
+	// Per-stage timeouts in addition to the overall 15s Client.Timeout, so a
+	// slow TLS handshake or response-header phase can't burn the whole budget
+	// on one stage. Both branches share the same per-stage caps — the only
+	// real difference is the dialer (SSRF-safe vs permissive).
+	const stageTimeout = 10 * time.Second
 	transport := &http.Transport{
-		DialContext: probe.SSRFSafeDialContext,
+		DialContext:           probe.SSRFSafeDialContext,
+		TLSHandshakeTimeout:   stageTimeout,
+		ResponseHeaderTimeout: stageTimeout,
 	}
 	if allowPrivate {
-		transport = &http.Transport{}
+		transport = &http.Transport{
+			TLSHandshakeTimeout:   stageTimeout,
+			ResponseHeaderTimeout: stageTimeout,
+		}
 	}
 	client := &http.Client{
 		Timeout:   15 * time.Second,
 		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
@@ -969,4 +1040,59 @@ func validateURL(rawURL string) error {
 		return fmt.Errorf("invalid URL %q: scheme must be http or https", rawURL)
 	}
 	return nil
+}
+
+// jsAnalysisArgs bundles the flag values that drive jsstatic.Analyze. Used by
+// runJSAnalysisStage so each *Cmd.Run only has to assemble these fields once.
+//
+// The three call sites (CrawlCmd.Run, GenerateCmd.Run, ScanCmd.Run) each
+// build this value inline from their own flag struct (CrawlOptions,
+// GenerateCmd, ScanCmd). No shared constructor is provided because the source
+// structs are unrelated types: forcing a shared builder would require either
+// a dependency on all three command types or extra indirection that obscures
+// rather than simplifies the four-field assembly. Keeping the literal at each
+// call site is intentional.
+type jsAnalysisArgs struct {
+	enabled         bool
+	fetchSourcemaps bool
+	allowPrivate    bool
+	verbose         bool
+}
+
+// runJSAnalysisStage runs jsstatic.Analyze on requests and returns the
+// (possibly enriched) request slice. When args.enabled is false, returns
+// requests unchanged. Errors from Analyze are logged and treated as a no-op
+// (best-effort enrichment must never fail the surrounding pipeline).
+//
+// Idempotency guard: if any input request already carries a static:js or
+// static:js-sourcemap Source value, the bundles were already analyzed by a
+// prior stage (e.g. crawl --analyze-js wrote the capture and generate is now
+// reading it). In that case we skip the analysis and return requests unchanged
+// to avoid double-counting and redundant work. The guard also ensures that
+// running crawl | generate pipelines is byte-identical to running scan
+// directly when --analyze-js is set on both commands.
+func runJSAnalysisStage(ctx context.Context, requests []crawl.ObservedRequest, args jsAnalysisArgs) []crawl.ObservedRequest {
+	if !args.enabled {
+		return requests
+	}
+	// Skip if any request already carries a JS-static source — this capture
+	// was produced by a stage that already ran jsstatic.Analyze.
+	if crawl.AnyStaticSource(requests) {
+		return requests
+	}
+	aopts := jsstatic.Options{
+		FetchSourcemaps: args.fetchSourcemaps,
+		AllowPrivate:    args.allowPrivate,
+	}
+	res, err := jsstatic.Analyze(ctx, requests, aopts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: js-static analysis failed: %v\n", err) //nolint:errcheck // best-effort status message
+		return requests
+	}
+	if args.verbose {
+		fmt.Fprintf(os.Stderr, "js-static: bundles=%d skipped=%d panics=%d, sourcemaps=%d, endpoints=%d\n", //nolint:gosec // G705: writing to stderr, not web response
+			res.Stats.BundlesAnalyzed, res.Stats.BundlesSkipped, res.Stats.AnalyzeOnePanics,
+			res.Stats.SourcemapsRecovered, res.Stats.EndpointsKept)
+	}
+	return res.Requests
 }

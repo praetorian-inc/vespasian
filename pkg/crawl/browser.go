@@ -93,9 +93,9 @@ func NewBrowserManager(opts BrowserOptions) (*BrowserManager, error) {
 	}, nil
 }
 
-// wsURL returns the Chrome DevTools Protocol WebSocket URL. Pass this to
-// Katana's ChromeWSUrl option so it connects to our browser instead of
-// launching its own.
+// wsURL returns the Chrome DevTools Protocol WebSocket URL. The headless crawl
+// engine (go-rod) connects to this URL instead of launching its own browser,
+// so vespasian owns the Chrome process lifecycle.
 //
 // Security: this URL grants full control of the browser session. Do not
 // log it or expose it to untrusted callers.

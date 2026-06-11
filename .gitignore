@@ -39,6 +39,9 @@ Thumbs.db
 # .claude
 .claude/
 
+# Capability development workflow artifacts (agent outputs, process records)
+.capability-development/
+
 # Live test artifacts
 test/.live-test-config
 test/.results/

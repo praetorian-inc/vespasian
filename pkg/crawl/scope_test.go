@@ -15,7 +15,9 @@
 package crawl
 
 import (
+	"context"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -216,6 +218,11 @@ func TestIsPrivateIP(t *testing.T) {
 		{"public IP", "93.184.215.14", false},
 		{"public IP 2", "8.8.8.8", false},
 		{"unspecified v4", "0.0.0.0", true},
+		{"this-network 0.x", "0.1.2.3", true},
+		{"CGNAT 100.64.x", "100.64.0.1", true},
+		{"CGNAT 100.127.x", "100.127.255.254", true},
+		{"public near-CGNAT 100.63.x", "100.63.255.255", false},
+		{"public near-CGNAT 100.128.x", "100.128.0.0", false},
 	}
 
 	for _, tt := range tests {
@@ -286,3 +293,47 @@ func TestScopeChecker_SSRFProtection_RejectsMetadataIP(t *testing.T) {
 		t.Error("expected SSRF protection to reject cloud metadata IP")
 	}
 }
+
+// TestSSRFSafeDialContext_NoPort exercises the SplitHostPort error branch when
+// the address has no port component (TEST-004).
+func TestSSRFSafeDialContext_NoPort(t *testing.T) {
+	ctx := context.Background()
+	_, err := ssrfSafeDialContext(ctx, "tcp", "nohost")
+	if err == nil {
+		t.Fatal("expected error for address with no port, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid address") {
+		t.Errorf("expected 'invalid address' in error, got: %v", err)
+	}
+}
+
+// TestSSRFSafeDialContext_PrivateIPRejected exercises the private-IP rejection
+// branch using a loopback address (TEST-004).
+func TestSSRFSafeDialContext_PrivateIPRejected(t *testing.T) {
+	ctx := context.Background()
+	_, err := ssrfSafeDialContext(ctx, "tcp", "127.0.0.1:80")
+	if err == nil {
+		t.Fatal("expected error for private IP 127.0.0.1, got nil")
+	}
+	if !strings.Contains(err.Error(), "resolves to private IP") {
+		t.Errorf("expected 'resolves to private IP' in error, got: %v", err)
+	}
+}
+
+// TestSSRFSafeDialContext_DNSFailure exercises the DNS-failure branch using a
+// guaranteed-NXDOMAIN hostname (.invalid is reserved by RFC 2606) (TEST-004).
+func TestSSRFSafeDialContext_DNSFailure(t *testing.T) {
+	ctx := context.Background()
+	_, err := ssrfSafeDialContext(ctx, "tcp", "no-such-host.invalid:80")
+	if err == nil {
+		t.Fatal("expected error for NXDOMAIN host, got nil")
+	}
+	if !strings.Contains(err.Error(), "DNS lookup failed") {
+		t.Errorf("expected 'DNS lookup failed' in error, got: %v", err)
+	}
+}
+
+// Note: the dial-success path (public IP that actually connects) and the
+// multi-IP fallback path require a reachable public endpoint and are therefore
+// not unit-testable here — loopback is blocked by the SSRF guard itself.
+// Those paths are covered by live/integration tests.
