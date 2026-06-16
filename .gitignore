@@ -45,4 +45,5 @@ test/.results/
 test/.*.pid
 test/rest-api/rest-api
 test/soap-service/soap-service
+test/grpc-server/grpc-server
 test/graphql-server/node_modules/

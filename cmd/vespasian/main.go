@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -37,6 +38,7 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/generate"
+	grpcgen "github.com/praetorian-inc/vespasian/pkg/generate/grpc"
 	wsdlgen "github.com/praetorian-inc/vespasian/pkg/generate/wsdl"
 	"github.com/praetorian-inc/vespasian/pkg/importer"
 	"github.com/praetorian-inc/vespasian/pkg/probe"
@@ -56,6 +58,7 @@ var CLI struct {
 	Import   ImportCmd   `cmd:"" help:"Import traffic capture from external sources"`
 	Generate GenerateCmd `cmd:"" help:"Generate API specifications from captured traffic"`
 	Scan     ScanCmd     `cmd:"" help:"Full pipeline: crawl, classify, and generate specs"`
+	Probe    ProbeCmd    `cmd:"" help:"Run a single discovery probe directly against a target"`
 	Version  VersionCmd  `cmd:"" help:"Show version information"`
 }
 
@@ -493,7 +496,7 @@ func (c *ImportCmd) Run() error {
 
 // GenerateCmd generates API specifications from captured traffic.
 type GenerateCmd struct {
-	APIType               string  `arg:"" enum:"rest,wsdl,graphql" help:"API type to generate (rest, wsdl, graphql)"`
+	APIType               string  `arg:"" enum:"rest,wsdl,graphql,grpc" help:"API type to generate (rest, wsdl, graphql, grpc)"`
 	Capture               string  `arg:"" help:"Capture file path"`
 	Output                string  `short:"o" help:"Output file path"`
 	Confidence            float64 `default:"0.5" help:"Minimum confidence threshold"`
@@ -511,6 +514,7 @@ const (
 	apiTypeREST    = "rest"
 	apiTypeWSDL    = "wsdl"
 	apiTypeGraphQL = "graphql"
+	apiTypeGRPC    = "grpc"
 )
 
 // maxCaptureSize is the maximum capture file size (100MB).
@@ -581,7 +585,7 @@ func (c *GenerateCmd) Run() (err error) {
 // ScanCmd runs the full pipeline: crawl, classify, and generate.
 type ScanCmd struct {
 	URL                   string  `arg:"" help:"Target URL to scan"`
-	APIType               string  `default:"auto" enum:"auto,rest,wsdl,graphql" help:"API type to generate (auto detects from traffic)" name:"api-type"`
+	APIType               string  `default:"auto" enum:"auto,rest,wsdl,graphql,grpc" help:"API type to generate (auto detects from traffic; grpc requires explicit selection)" name:"api-type"`
 	Confidence            float64 `default:"0.5" help:"Minimum confidence threshold"`
 	Probe                 bool    `default:"true" help:"Enable endpoint probing"`
 	Deduplicate           bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
@@ -701,6 +705,91 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	})
 }
 
+// ProbeCmd groups protocol-specific discovery probes.
+type ProbeCmd struct {
+	GRPC GRPCProbeCmd `cmd:"" name:"grpc" help:"gRPC discovery probes"`
+}
+
+// GRPCProbeCmd groups gRPC-specific discovery techniques.
+type GRPCProbeCmd struct {
+	Reflection GRPCReflectionProbeCmd `cmd:"" name:"reflection" help:"Enumerate services via the gRPC Server Reflection Protocol"`
+}
+
+// GRPCReflectionProbeCmd runs the Server Reflection probe against a single
+// target and writes the rendered .proto to stdout (or -o file).
+type GRPCReflectionProbeCmd struct {
+	URL                   string        `arg:"" help:"Target URL (e.g., https://grpc.example.com:443)"`
+	Output                string        `short:"o" help:"Output .proto file path"`
+	Timeout               time.Duration `default:"10s" help:"Per-request timeout"`
+	DangerousAllowPrivate bool          `help:"Disable SSRF protection for private/localhost targets (localhost, 127.0.0.1, RFC1918, link-local). WARNING: Do not use on production systems." name:"dangerous-allow-private"`
+	Verbose               bool          `short:"v" help:"Enable verbose logging"`
+}
+
+// Run executes the gRPC reflection probe against the target URL and emits
+// the rendered .proto file. Composable with `vespasian generate grpc` only
+// indirectly — this command short-circuits to the spec for the common case
+// of "I just want the .proto from a reflection-enabled server".
+func (c *GRPCReflectionProbeCmd) Run() error {
+	if err := validateURL(c.URL); err != nil {
+		return err
+	}
+
+	cfg := probe.DefaultConfig()
+	cfg.Timeout = c.Timeout
+	if c.DangerousAllowPrivate {
+		fmt.Fprintf(os.Stderr, "WARNING: SSRF protection disabled — probe may target private/internal networks\n")
+		cfg.URLValidator = func(string) error { return nil }
+		cfg.Dialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		}
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	req := classify.ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: http.MethodPost,
+			URL:    c.URL,
+		},
+		APIType: apiTypeGRPC,
+	}
+
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "probing %s for gRPC reflection\n", c.URL)
+	}
+
+	enriched, err := probe.NewGRPCProbe(cfg).Probe(ctx, []classify.ClassifiedRequest{req})
+	if err != nil {
+		return fmt.Errorf("reflection probe failed: %w", err)
+	}
+
+	if len(enriched) == 0 || enriched[0].GRPCSchema == nil {
+		return fmt.Errorf("reflection not available on %s", c.URL)
+	}
+	if !enriched[0].GRPCSchema.ReflectionEnabled {
+		if reason := enriched[0].GRPCSchema.ReflectionUnavailableReason; reason != "" {
+			return fmt.Errorf("reflection not available on %s (gRPC %s)", c.URL, reason)
+		}
+		return fmt.Errorf("reflection not available on %s", c.URL)
+	}
+
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "discovered %d service(s)\n", len(enriched[0].GRPCSchema.Services))
+	}
+
+	spec, err := (&grpcgen.Generator{}).Generate(enriched)
+	if err != nil {
+		return fmt.Errorf("generate failed: %w", err)
+	}
+
+	return writeOutput(c.Output, func(w io.Writer) error {
+		_, writeErr := w.Write(spec)
+		return writeErr
+	})
+}
+
 // VersionCmd shows version information.
 type VersionCmd struct{}
 
@@ -806,6 +895,10 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts ge
 					ResponseHeaderTimeout: 10 * time.Second,
 				},
 			}
+			cfg.Dialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, addr)
+			}
 		}
 		var strategies []probe.ProbeStrategy
 		switch opts.APIType {
@@ -813,6 +906,8 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts ge
 			strategies = []probe.ProbeStrategy{probe.NewWSDLProbe(cfg)}
 		case apiTypeGraphQL:
 			strategies = []probe.ProbeStrategy{probe.NewGraphQLProbe(cfg)}
+		case apiTypeGRPC:
+			strategies = []probe.ProbeStrategy{probe.NewGRPCProbe(cfg)}
 		default:
 			strategies = []probe.ProbeStrategy{
 				probe.NewOptionsProbe(cfg),
@@ -850,6 +945,8 @@ func classifiersForType(apiType string) []classify.APIClassifier {
 		return []classify.APIClassifier{&classify.WSDLClassifier{}}
 	case apiTypeGraphQL:
 		return []classify.APIClassifier{&classify.GraphQLClassifier{}}
+	case apiTypeGRPC:
+		return []classify.APIClassifier{&classify.GRPCClassifier{}}
 	default:
 		return nil
 	}
@@ -992,6 +1089,8 @@ func apiTypeDisplayName(apiType string) string {
 		return "WSDL"
 	case apiTypeGraphQL:
 		return "GraphQL"
+	case apiTypeGRPC:
+		return "gRPC"
 	default:
 		return apiType
 	}

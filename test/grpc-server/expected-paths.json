@@ -1,0 +1,12 @@
+{
+  "description": "Expected gRPC services and methods exposed by the grpc-server test target via Server Reflection.",
+  "services": {
+    "lab.v1.UserService": ["GetUser", "ListUsers"],
+    "lab.v1.OrderService": ["GetOrder"],
+    "lab.v1.AccountService": ["GetAccount"]
+  },
+  "total_services": 3,
+  "total_methods": 4,
+  "streaming_methods": ["lab.v1.UserService/ListUsers"],
+  "reflection_enabled": true
+}

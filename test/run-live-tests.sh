@@ -98,6 +98,28 @@ preflight_test_host() {
             _probe_target_host "${GRAPHQL_SERVER_PORT:-}" "/" "graphql-server" || failed=1
             ;;
     esac
+    case ",${targets}," in
+        *,grpc-server,*)
+            local grpc_port="${GRPC_SERVER_PORT:-}"
+            if [ -n "$grpc_port" ]; then
+                if command -v grpcurl >/dev/null 2>&1; then
+                    if grpcurl -plaintext "${TEST_HOST}:${grpc_port}" list >/dev/null 2>&1; then
+                        log_ok "grpc-server reachable at ${TEST_HOST}:${grpc_port}"
+                    else
+                        log_fail "grpc-server is unreachable at ${TEST_HOST}:${grpc_port}"
+                        failed=1
+                    fi
+                elif nc -z "${TEST_HOST}" "${grpc_port}" 2>/dev/null; then
+                    log_ok "grpc-server reachable at ${TEST_HOST}:${grpc_port} (nc)"
+                elif (echo >/dev/tcp/"${TEST_HOST}"/"${grpc_port}") 2>/dev/null; then
+                    log_ok "grpc-server reachable at ${TEST_HOST}:${grpc_port} (/dev/tcp)"
+                else
+                    log_fail "grpc-server is unreachable at ${TEST_HOST}:${grpc_port}"
+                    failed=1
+                fi
+            fi
+            ;;
+    esac
     [ $failed -eq 0 ] && return 0
     if [ "$TEST_HOST" = "localhost" ]; then
         log_info "Is ./test/setup-live-targets.sh running? Check the failing URL on this host."
@@ -375,6 +397,101 @@ PYEOF
     else
         set_test_result "soap-service" "FAIL" "?" "$expected_count" "$duration"
         log_fail "soap-service: ${failures} check(s) failed (${duration}s)"
+    fi
+}
+
+test_grpc_server() {
+    local port="${GRPC_SERVER_PORT:-50051}"
+    local base_url="http://${TEST_HOST}:${port}"
+    local target_dir="${RESULTS_DIR}/grpc-server"
+    local spec_file="${target_dir}/spec.proto"
+    local expected="${SCRIPT_DIR}/grpc-server/expected-paths.json"
+    local verbose_flag=""
+
+    [ "${VERBOSE:-false}" = true ] && verbose_flag="-v"
+
+    mkdir -p "$target_dir"
+    init_test_status "grpc-server"
+
+    local start=$SECONDS
+    local failures=0
+
+    log_header "Testing: grpc-server (${base_url})"
+
+    # Run gRPC reflection probe — vespasian writes a proto3 .proto file
+    log_info "Probing gRPC reflection at ${base_url}..."
+    if ! "$VESPASIAN" probe grpc reflection "$base_url" \
+        --dangerous-allow-private \
+        -o "$spec_file" \
+        ${verbose_flag:+"$verbose_flag"} 2>&1; then
+        log_fail "gRPC reflection probe failed"
+        set_test_result "grpc-server" "FAIL" "?" "?" "$((SECONDS - start))"
+        return 1
+    fi
+
+    # Validate spec file exists and is non-empty
+    if [ ! -s "$spec_file" ]; then
+        log_fail "Proto spec file missing or empty: ${spec_file}"
+        set_test_result "grpc-server" "FAIL" "?" "?" "$((SECONDS - start))"
+        return 1
+    fi
+    log_ok "Proto spec written: ${spec_file}"
+
+    # Validate expected services and methods are present
+    local validation_result rc=0
+    validation_result=$(python3 - "$spec_file" "$expected" << 'PYEOF'
+import json, sys, re
+
+spec_path = sys.argv[1]
+expected_path = sys.argv[2]
+
+with open(spec_path) as f:
+    spec = f.read()
+
+with open(expected_path) as f:
+    expected = json.load(f)
+
+errors = []
+
+# Check each expected service by short name (vespasian uses short names, not FQNs)
+for fqn, methods in expected["services"].items():
+    short_name = fqn.split(".")[-1]
+    pattern = r'service\s+' + re.escape(short_name) + r'\s*\{'
+    if not re.search(pattern, spec):
+        errors.append("Missing service: %s (short name: %s)" % (fqn, short_name))
+    for method in methods:
+        rpc_pattern = r'rpc\s+' + re.escape(method) + r'\s*\('
+        if not re.search(rpc_pattern, spec):
+            errors.append("Missing rpc: %s in %s" % (method, short_name))
+
+if errors:
+    for e in errors:
+        print("FAIL: " + e)
+    sys.exit(1)
+
+total_services = expected["total_services"]
+print("OK: found %d services with all expected methods" % total_services)
+PYEOF
+    ) || rc=$?
+
+    if [ $rc -ne 0 ]; then
+        log_fail "Proto validation failed:"
+        echo "$validation_result" >&2
+        failures=$((failures + 1))
+    else
+        log_ok "Proto validation: $validation_result"
+    fi
+
+    local expected_count
+    expected_count=$(json_field "$expected" total_services)
+
+    local duration=$((SECONDS - start))
+    if [ $failures -eq 0 ]; then
+        set_test_result "grpc-server" "PASS" "$expected_count" "$expected_count" "$duration"
+        log_ok "grpc-server: ALL CHECKS PASSED (${duration}s)"
+    else
+        set_test_result "grpc-server" "FAIL" "?" "$expected_count" "$duration"
+        log_fail "grpc-server: ${failures} check(s) failed (${duration}s)"
     fi
 }
 
@@ -2316,7 +2433,7 @@ main() {
 
     # Default targets from config
     if [ -z "$targets" ]; then
-        targets="${TARGETS_SETUP:-rest-api,soap-service,graphql-server}"
+        targets="${TARGETS_SETUP:-rest-api,soap-service,graphql-server,grpc-server}"
         # Always include importer tests
         targets="${targets},import-burp,import-har,import-base64,import-mitmproxy,import-mitmproxy-native,import-unicode,import-duplicates,import-malformed,import-empty"
         targets="${targets},generate-rest,generate-wsdl,generate-wsdl-matrix,generate-graphql,generate-graphql-imports,generate-js-static"
@@ -2352,6 +2469,7 @@ main() {
             rest-api)      test_rest_api ;;
             soap-service)    test_soap_service ;;
             graphql-server)  test_graphql_server ;;
+            grpc-server)     test_grpc_server ;;
             import-burp)        test_import_burp ;;
             import-har)         test_import_har ;;
             import-base64)      test_import_base64 ;;
