@@ -68,7 +68,7 @@ Note: `detectAPIType` (auto mode) runs only the REST/WSDL/GraphQL classifiers â€
 ### Key Packages
 
 - **cmd/vespasian**: CLI entry point, command definitions, signal handling, browser lifecycle management
-- **pkg/crawl**: Headless browser crawling via Katana, capture file I/O (`ObservedRequest` JSON format), browser manager with Chrome lifecycle
+- **pkg/crawl**: Two crawler backends â€” headless mode uses go-rod to drive Chrome tabs (full JS/SPA support); non-headless mode uses a stdlib net/http engine with DFS frontier, 150 rps rate limiter, and scope+SSRF redirect guard. Both produce `ObservedRequest` values. Also owns capture file I/O and browser manager lifecycle.
 - **pkg/analyze**: Static analysis of captured HTML response bodies; extracts `<form>` endpoints and parameter names as synthetic `ObservedRequest` entries (`Source="static:html"`) to surface form-based APIs not triggered during crawl
 - **pkg/classify**: Request classification engine with confidence-based heuristics; classifiers for REST, GraphQL, WSDL, and gRPC; deduplication
 - **pkg/probe**: Active endpoint probing strategies (OPTIONS discovery, JSON schema inference, WSDL document fetching, GraphQL introspection with 3-tier WAF bypass, gRPC server reflection); SSRF protection with DNS rebinding mitigation (also applied to gRPC dial via a configurable `Config.Dialer`)

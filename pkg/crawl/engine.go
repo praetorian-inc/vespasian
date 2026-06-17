@@ -28,14 +28,6 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 )
 
-// DefaultConcurrency is the default number of concurrent browser tabs.
-const DefaultConcurrency = 10
-
-// MaxConcurrency is the upper bound on concurrent browser tabs. Each tab
-// consumes significant Chrome process memory (~50 MB), so unbounded values
-// could exhaust system resources.
-const MaxConcurrency = 50
-
 // DefaultStableWait is the default DOM stability wait duration.
 const DefaultStableWait = 3 * time.Second
 
@@ -123,15 +115,12 @@ type rodEngine struct {
 // newRodEngine connects to the Chrome instance at wsURL and returns a crawl
 // engine ready to start. The caller must call Close() when done.
 func newRodEngine(wsURL string, opts engineOptions) (*rodEngine, error) {
-	if opts.Concurrency <= 0 {
-		opts.Concurrency = DefaultConcurrency
+	if opts.Concurrency > MaxConcurrency && opts.Stderr != nil {
+		fmt.Fprintf(opts.Stderr, "warning: --concurrency %d exceeds maximum (%d), capping\n", opts.Concurrency, MaxConcurrency) //nolint:errcheck // best-effort
 	}
-	if opts.Concurrency > MaxConcurrency {
-		if opts.Stderr != nil {
-			fmt.Fprintf(opts.Stderr, "warning: --concurrency %d exceeds maximum (%d), capping\n", opts.Concurrency, MaxConcurrency) //nolint:errcheck // best-effort
-		}
-		opts.Concurrency = MaxConcurrency
-	}
+	// clampConcurrency (crawler.go) is the shared clamp: 0 → DefaultConcurrency,
+	// > MaxConcurrency → MaxConcurrency. The warning above is rod-specific.
+	opts.Concurrency = clampConcurrency(opts.Concurrency)
 	if opts.PageTimeout <= 0 {
 		opts.PageTimeout = time.Duration(PageTimeout) * time.Second
 	}
@@ -238,7 +227,9 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		if !ok {
 			return // frontier exhausted
 		}
-		e.frontier.MarkActive()
+		// MarkActive is NOT called here: Pop atomically increments the active
+		// counter before returning, making dequeue+activate a single critical
+		// section. Callers only need MarkIdle() after processing completes.
 
 		requests, links, err := e.visitPage(ctx, entry)
 		if err != nil {

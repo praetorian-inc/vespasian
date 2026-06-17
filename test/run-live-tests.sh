@@ -186,6 +186,33 @@ with open(sys.argv[1]) as f:
 PYEOF
 }
 
+# crawl_backend runs one crawl with an explicit --headless value and writes
+# output to <out>. Only the backend-invariant flags (--headless,
+# --dangerous-allow-private) are fixed here; the caller passes --depth,
+# --max-pages, --timeout, etc. so there are no duplicated/overridden flags.
+# Usage: crawl_backend <base_url> <out_capture> <headless:true|false> <crawl flags...>
+crawl_backend() {
+    local base_url=$1 out=$2 headless=$3; shift 3
+    "$VESPASIAN" crawl "$base_url" -o "$out" \
+        --headless="$headless" \
+        --dangerous-allow-private "$@" 2>&1
+}
+
+# chrome_available returns 0 if Chrome is likely reachable, 1 otherwise.
+# This is a best-effort shell heuristic (binary presence or rod's cached
+# Chromium directory) and may diverge from the Go skipIfNoChrome probe, which
+# actually attempts to launch a headless browser via NewBrowserManager. A false
+# positive here (chrome_available returns 0 but Chrome fails to launch) degrades
+# to a log_warn + skip, never a hard failure. A false negative causes the rod
+# backend to be skipped even when Chrome is present; re-run with an explicit
+# Chrome binary on PATH if rod skips unexpectedly.
+chrome_available() {
+    command -v google-chrome >/dev/null 2>&1 || \
+    command -v chromium >/dev/null 2>&1 || \
+    command -v chromium-browser >/dev/null 2>&1 || \
+    [ -d "$HOME/.cache/rod/browser" ]
+}
+
 # ──────────────────────────────────────────────────────────────
 # Test functions
 # ──────────────────────────────────────────────────────────────
@@ -209,26 +236,40 @@ test_rest_api() {
 
     log_header "Testing: rest-api (${base_url})"
 
-    # Step 1: Crawl
-    log_info "Crawling ${base_url}..."
-    if ! "$VESPASIAN" crawl "$base_url" \
-        -o "$capture_file" \
-        --depth 2 \
-        --max-pages 50 \
-        --timeout 2m \
-        --dangerous-allow-private \
-        $verbose_flag 2>&1; then
-        log_fail "Crawl failed"
-        set_test_result "rest-api" "FAIL" "?" "?" "$((SECONDS - start))"
-        return 1
-    fi
+    # Step 1: Crawl — both backends (http and rod).
+    # The http backend (headless=false) is the primary capture used downstream
+    # for spec generation. The rod backend (headless=true) adds a parity check.
+    for hl in false true; do
+        local cap="${target_dir}/capture-${hl}.json"
+        if [ "$hl" = "true" ]; then
+            if ! chrome_available; then
+                log_warn "rest-api[headless=true]: Chrome unavailable, skipping rod backend"
+                continue
+            fi
+        fi
+        log_info "Crawling ${base_url} (headless=${hl})..."
+        if ! crawl_backend "$base_url" "$cap" "$hl" --depth 2 --max-pages 50 --timeout 2m $verbose_flag; then
+            if [ "$hl" = "true" ]; then
+                # Rod crawl failure degrades gracefully — Chrome may be unlaunchable.
+                log_warn "rest-api[headless=true]: crawl failed (Chrome may be unlaunchable), skipping rod backend"
+                continue
+            fi
+            log_fail "Crawl failed (headless=${hl})"
+            set_test_result "rest-api" "FAIL" "?" "?" "$((SECONDS - start))"
+            return 1
+        fi
+        local n; n=$(json_len "$cap")
+        log_info "rest-api[headless=${hl}]: ${n} requests captured"
+        if ! validate_capture "$cap" 3; then
+            failures=$((failures + 1))
+        fi
+    done
 
-    # Step 2: Validate capture
-    if ! validate_capture "$capture_file" 3; then
-        failures=$((failures + 1))
-    fi
+    # Use the http capture for spec generation (primary artifact). Copy
+    # unconditionally so a stale capture.json from a prior run is never used.
+    cp "${target_dir}/capture-false.json" "$capture_file" 2>/dev/null || true
 
-    # Step 3: Generate OpenAPI spec
+    # Step 2: Generate OpenAPI spec from http capture
     log_info "Generating OpenAPI spec..."
     if ! "$VESPASIAN" generate rest "$capture_file" \
         -o "$spec_file" \
@@ -239,7 +280,7 @@ test_rest_api() {
         return 1
     fi
 
-    # Step 4: Validate spec
+    # Step 3: Validate spec
     if ! validate_openapi_structure "$spec_file"; then
         failures=$((failures + 1))
     fi
@@ -303,16 +344,31 @@ test_soap_service() {
             -o /dev/null 2>/dev/null || true
     done
 
-    # Crawl the service (will capture the WSDL page and index)
-    log_info "Crawling ${base_url}..."
-    if ! "$VESPASIAN" crawl "$base_url" \
-        -o "$capture_file" \
-        --depth 2 \
-        --max-pages 20 \
-        --timeout 1m \
-        --dangerous-allow-private \
-        $verbose_flag 2>&1; then
-        log_warn "Crawl returned non-zero (may still have partial results)"
+    # Crawl the service — both backends for parity.
+    for hl in false true; do
+        local cap="${target_dir}/capture-${hl}.json"
+        if [ "$hl" = "true" ]; then
+            if ! chrome_available; then
+                log_warn "soap-service[headless=true]: Chrome unavailable, skipping rod backend"
+                continue
+            fi
+        fi
+        log_info "Crawling ${base_url} (headless=${hl})..."
+        if ! crawl_backend "$base_url" "$cap" "$hl" --depth 2 --max-pages 20 --timeout 1m $verbose_flag; then
+            if [ "$hl" = "true" ]; then
+                log_warn "soap-service[headless=true]: crawl failed (Chrome may be unlaunchable), skipping rod backend"
+                continue
+            fi
+            log_warn "Crawl returned non-zero (may still have partial results)"
+        fi
+        local n; n=$(json_len "$cap")
+        log_info "soap-service[headless=${hl}]: ${n} requests captured"
+    done
+    # Retain the http capture as this target's crawl artifact (parity with the
+    # other targets / manual inspection). WSDL generation below does NOT use it —
+    # it uses the synthetic $soap_capture built next.
+    if [ -f "${target_dir}/capture-false.json" ]; then
+        cp "${target_dir}/capture-false.json" "$capture_file"
     fi
 
     # Also import the SOAP traffic directly if crawl didn't capture it.
@@ -899,6 +955,56 @@ PYEOF
         # Not a hard failure — inference fallback is valid behavior
     else
         log_ok "Introspection check: $introspection_check"
+    fi
+
+    # Step 7: Rod crawl of / — assert SPA /graphql POST is captured (LAB-1535).
+    # The http backend is expected to miss runtime fetch() calls; rod captures them.
+    log_info "Rod crawl of ${base_url}/ (SPA fetch capture — LAB-1535)..."
+    if ! chrome_available; then
+        log_warn "graphql-server[rod-spa]: Chrome unavailable, skipping SPA fetch assertion"
+    else
+        local rod_capture="${target_dir}/capture-rod.json"
+        local rod_ok=true
+        if ! crawl_backend "$base_url" "$rod_capture" true --depth 2 --max-pages 20 --timeout 1m $verbose_flag; then
+            log_warn "graphql-server[rod-spa]: crawl failed (Chrome may be unlaunchable), skipping SPA assertion"
+            rod_ok=false
+        fi
+        if [ "$rod_ok" = true ]; then
+            if [ ! -f "$rod_capture" ]; then
+                # Crawl reported success but wrote no capture file — count as failure
+                # so the missing assertion is not silently skipped.
+                log_fail "graphql-server[rod-spa]: rod crawl succeeded but capture file absent: ${rod_capture}"
+                failures=$((failures + 1))
+            else
+                local rod_n; rod_n=$(json_len "$rod_capture")
+                log_info "graphql-server[headless=true]: ${rod_n} requests captured"
+                # Assert /graphql POST is present (SPA fetch captured by rod).
+                # `|| echo "error"` keeps this on the file's defensive convention
+                # (cf. json_field/json_len): without it, a python failure (e.g. an
+                # empty capture serialized as JSON `null`, which is not iterable)
+                # would abort the whole suite under `set -e` instead of failing the
+                # assertion.
+                local found_graphql; found_graphql=$(python3 - "$rod_capture" << 'PYEOF' || echo "error"
+import json, sys
+from urllib.parse import urlparse
+with open(sys.argv[1]) as f:
+    reqs = json.load(f)
+# Exact path match (parity with Go hasGraphQLPost) — avoids /api/graphql or query-string variants.
+found = any(r.get("method","").upper()=="POST" and urlparse(r.get("url","")).path=="/graphql" for r in reqs)
+print("yes" if found else "no")
+PYEOF
+                )
+                if [ "$found_graphql" = "yes" ]; then
+                    log_ok "graphql-server[rod-spa]: /graphql POST captured (LAB-1535 confirmed)"
+                elif [ "$found_graphql" = "error" ]; then
+                    log_fail "graphql-server[rod-spa]: could not parse rod capture for /graphql POST assertion"
+                    failures=$((failures + 1))
+                else
+                    log_warn "graphql-server[rod-spa]: /graphql POST NOT captured in rod crawl (SPA fetch missed)"
+                    failures=$((failures + 1))
+                fi
+            fi
+        fi
     fi
 
     local expected_count

@@ -43,7 +43,7 @@ Vespasian takes a different approach: it observes actual network traffic at the 
 | **WSDL/SOAP Discovery** | Identifies SOAP services via SOAPAction headers and envelope detection; fetches and parses WSDL documents |
 | **gRPC API Discovery** | Classifies gRPC and gRPC-Web traffic via content-type, trailer headers, and path shape; enumerates services and methods through the Server Reflection Protocol and generates `.proto` schemas |
 | **API Type Auto-Detection** | Automatically determines API type (REST, GraphQL, WSDL) from captured traffic without manual selection. gRPC is opt-in via `--api-type grpc` — its binary HTTP/2 framing is not auto-detected |
-| **Headless Browser Crawling** | Drives a headless Chrome browser with full JavaScript execution for SPA support, powered by [Katana](https://github.com/projectdiscovery/katana) |
+| **Browser Crawling** | Two backends: headless mode drives Chrome via [go-rod](https://github.com/go-rod/rod) for full JavaScript/SPA support; non-headless mode uses a stdlib net/http engine (DFS, 150 rps, scope+SSRF redirect guard) for lightweight crawls |
 | **Static Form Extraction** | Statically parses `<form>` elements in captured HTML responses — including login, search, and admin forms — to surface submission endpoints and parameters that dynamic crawling may never trigger |
 | **Traffic Import** | Import existing captures from Burp Suite XML, HAR 1.2 files, and mitmproxy dumps |
 | **Active Probing** | OPTIONS discovery, JSON schema inference, WSDL document fetching, GraphQL introspection, and gRPC server reflection |
@@ -60,7 +60,7 @@ Vespasian uses a two-stage pipeline that separates traffic capture from specific
 ```mermaid
 flowchart LR
     subgraph Capture
-        A["Headless Browser Crawler<br/>JS execution, auth injection"] --> C["capture.json<br/>ObservedRequest array"]
+        A["Crawler<br/>headless go-rod or net/http"] --> C["capture.json<br/>ObservedRequest array"]
         B["Traffic Importers<br/>Burp Suite XML, HAR, mitmproxy"] --> C
     end
     subgraph Generate
@@ -245,7 +245,7 @@ vespasian scan <url> [flags]
   --max-pages        Max pages to visit (default: 100)
   --timeout          Maximum duration for the entire scan (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
-  --headless         Browser mode (default: true)
+  --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine
   --proxy            Proxy URL for headless browser (e.g., http://127.0.0.1:8080)
   --confidence       Min classification confidence (default: 0.5)
   --probe            Enable active probing (default: true)
@@ -262,7 +262,7 @@ vespasian scan <url> [flags]
 
 ### `vespasian crawl`
 
-Captures HTTP traffic by driving a headless browser through the target application.
+Captures HTTP traffic from the target application. By default it drives a headless Chrome browser (go-rod) for full JavaScript/SPA support; with `--headless=false` it uses a dependency-free stdlib net/http engine (no Chrome required).
 
 ```
 vespasian crawl <url> [flags]
@@ -272,7 +272,7 @@ vespasian crawl <url> [flags]
   --max-pages        Max pages to visit (default: 100)
   --timeout          Maximum duration for the entire crawl (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
-  --headless         Browser mode (default: true)
+  --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine
   --proxy            Proxy URL for headless browser (e.g., http://127.0.0.1:8080)
   --dangerous-allow-private  Disable SSRF protection for crawling, allowing
                      private/localhost targets (localhost, 127.0.0.1, RFC1918,
@@ -347,7 +347,7 @@ If reflection is disabled or gated, the command exits with the gRPC status reaso
 
 | Component | Purpose | Supported Types |
 |-----------|---------|-----------------|
-| **Crawler** | Drives a headless browser to capture HTTP traffic, powered by [Katana](https://github.com/projectdiscovery/katana) | Protocol-agnostic |
+| **Crawler** | Two backends: go-rod headless Chrome (JavaScript/SPA support) and stdlib net/http (lightweight, DFS, 150 rps, SSRF guard) | Protocol-agnostic |
 | **Importers** | Convert Burp Suite XML, HAR, and mitmproxy traffic to capture format | All three formats |
 | **Classifier** | Separates API calls from static assets using heuristics | REST, GraphQL, WSDL, gRPC |
 | **Prober** | Enriches endpoints via active requests | OPTIONS, JSON schema, WSDL fetch, GraphQL introspection, gRPC reflection |
@@ -357,7 +357,7 @@ If reflection is disabled or gated, the command exits with the gRPC status reaso
 
 ```
 cmd/vespasian/          CLI entry point
-pkg/crawl/              Headless browser crawler + capture format
+pkg/crawl/              Crawler (headless go-rod + net/http backends) + capture format
 pkg/importer/           Traffic importers (Burp, HAR, mitmproxy)
 pkg/analyze/            Static HTML form extraction from captured response bodies
 pkg/classify/           API classification (REST, GraphQL, WSDL, gRPC)
@@ -369,6 +369,8 @@ pkg/generate/
   └── grpc/             .proto generation from gRPC reflection descriptors
 internal/grpcwire/      gRPC length-prefix framing + protobuf wire-format parser
 ```
+
+For a deeper reference on the crawler — interface, backends, options, SSRF model, and how to add a new backend — see [docs/crawler.md](docs/crawler.md).
 
 ## Frequently Asked Questions
 

@@ -15,50 +15,22 @@
 package crawl
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/url"
 	"strings"
 
 	"golang.org/x/net/publicsuffix"
+
+	"github.com/praetorian-inc/vespasian/internal/netutil"
 )
 
-// privateNetworks defines CIDR ranges considered private or internal.
-// This mirrors the list in pkg/probe/validate.go to provide consistent
-// SSRF protection across both the crawl and probe stages.
-var privateNetworks []*net.IPNet
-
-func init() {
-	cidrs := []string{
-		"127.0.0.0/8",    // IPv4 loopback
-		"10.0.0.0/8",     // RFC 1918
-		"172.16.0.0/12",  // RFC 1918
-		"192.168.0.0/16", // RFC 1918
-		"169.254.0.0/16", // link-local (includes cloud metadata 169.254.169.254)
-		"::1/128",        // IPv6 loopback
-		"fe80::/10",      // IPv6 link-local
-		"fc00::/7",       // IPv6 ULA
-	}
-	for _, cidr := range cidrs {
-		_, network, err := net.ParseCIDR(cidr)
-		if err != nil {
-			panic("invalid CIDR in privateNetworks: " + cidr)
-		}
-		privateNetworks = append(privateNetworks, network)
-	}
-}
-
 // isPrivateIP reports whether ip falls within a private or internal network.
+// It delegates to internal/netutil.IsPrivateIP, which is the single source of
+// truth for the CIDR list shared by the crawl and probe stages.
 func isPrivateIP(ip net.IP) bool {
-	if ip.IsUnspecified() {
-		return true
-	}
-	for _, network := range privateNetworks {
-		if network.Contains(ip) {
-			return true
-		}
-	}
-	return false
+	return netutil.IsPrivateIP(ip)
 }
 
 // isPrivateHost resolves a hostname via DNS and returns true if any of the
@@ -72,7 +44,7 @@ func isPrivateHost(hostname string) bool {
 	}
 
 	// Resolve and check all addresses.
-	addrs, err := net.LookupHost(hostname)
+	addrs, err := net.LookupHost(hostname) //nolint:gosec // G704: intentional SSRF protection — taint flows to isPrivateHost check below
 	if err != nil {
 		// DNS failure — reject to be safe.
 		return true
@@ -91,8 +63,8 @@ func isPrivateHost(hostname string) bool {
 // to prevent SSRF attacks when the crawl engine runs as a service component.
 //
 // Scope policies:
-//   - "same-origin": exact scheme + host + port match (equivalent to Katana's fqdn)
-//   - "same-domain": registered domain match, allowing subdomains (equivalent to Katana's rdn)
+//   - "same-origin": exact scheme + host + port match
+//   - "same-domain": registered domain match, allowing subdomains
 func scopeChecker(seedURL string, scope string, allowPrivate bool) (func(string) bool, error) {
 	seed, err := url.Parse(seedURL)
 	if err != nil {
@@ -160,6 +132,20 @@ func registeredDomain(host string) (string, error) {
 		return "", err
 	}
 	return domain, nil
+}
+
+// ssrfSafeDialContext is a net.Dialer DialContext replacement that re-resolves
+// the target host and rejects the connection if any resolved IP is private or
+// internal (SSRF protection). By performing the IP check at dial time — not
+// only in the upfront scope/SSRF check — it closes the DNS-rebinding TOCTOU
+// window: a short-TTL domain that resolves to a public IP during the scope
+// check can be re-resolved to 127.0.0.1 or another private address by the
+// time client.Do actually dials the connection.
+//
+// It delegates to internal/netutil.SSRFSafeDialContext, which is the shared
+// implementation used by both pkg/crawl and pkg/probe.
+func ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return netutil.SSRFSafeDialContext(ctx, network, addr)
 }
 
 // normalizeURL normalizes a URL for deduplication by lowercasing the scheme
