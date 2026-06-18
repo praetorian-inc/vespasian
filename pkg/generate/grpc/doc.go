@@ -21,4 +21,11 @@
 // Phase 2: Traffic-only inference is not supported — gRPC's wire format strips
 // field names, so reconstructing .proto from observed traffic alone is not
 // reliable. Generate returns an error when no reflection data is present.
+//
+// Name-only entry point: FileDescriptorsFromServices synthesizes
+// FileDescriptorProto wire bytes from service/method/type names recovered by
+// reflection-off techniques (gRPC-Web JS bindings, grpc-gateway OpenAPI), which
+// recover names and streaming flags but not message fields. The synthesized
+// descriptors (empty message stubs) flow through the same Generate/renderProto
+// path so all techniques produce byte-identical formatting.
 package grpc

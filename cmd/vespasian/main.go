@@ -713,6 +713,8 @@ type ProbeCmd struct {
 // GRPCProbeCmd groups gRPC-specific discovery techniques.
 type GRPCProbeCmd struct {
 	Reflection GRPCReflectionProbeCmd `cmd:"" name:"reflection" help:"Enumerate services via the gRPC Server Reflection Protocol"`
+	Gateway    GRPCGatewayProbeCmd    `cmd:"" name:"gateway" help:"Recover services from a grpc-gateway/Envoy OpenAPI document"`
+	Bindings   GRPCBindingsProbeCmd   `cmd:"" name:"bindings" help:"Recover services from gRPC-Web JS bundles in a capture file"`
 }
 
 // GRPCReflectionProbeCmd runs the Server Reflection probe against a single
@@ -780,6 +782,169 @@ func (c *GRPCReflectionProbeCmd) Run() error {
 	}
 
 	spec, err := (&grpcgen.Generator{}).Generate(enriched)
+	if err != nil {
+		return fmt.Errorf("generate failed: %w", err)
+	}
+
+	return writeOutput(c.Output, func(w io.Writer) error {
+		_, writeErr := w.Write(spec)
+		return writeErr
+	})
+}
+
+// applyAllowPrivate disables SSRF protection on cfg for probing
+// private/localhost targets. It swaps the URL validator to a no-op and both
+// the HTTP Client and Dialer to permissive transports. Both must be swapped:
+// HTTP probes (gateway) dial via cfg.Client, while the gRPC reflection probe
+// dials via cfg.Dialer. Shared by GRPCGatewayProbeCmd and generateSpec so the
+// allow-private posture cannot drift between the two call sites.
+func applyAllowPrivate(cfg *probe.Config) {
+	cfg.URLValidator = func(string) error { return nil }
+	cfg.Client = &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Transport: &http.Transport{
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 10 * time.Second,
+		},
+	}
+	cfg.Dialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, addr)
+	}
+}
+
+// GRPCGatewayProbeCmd recovers gRPC services from a grpc-gateway/Envoy OpenAPI
+// document served by the target and writes the rendered .proto to stdout (or
+// -o file).
+type GRPCGatewayProbeCmd struct {
+	URL                   string        `arg:"" help:"Target base URL (e.g., https://gw.example.com)"`
+	Output                string        `short:"o" help:"Output .proto file path"`
+	Timeout               time.Duration `default:"10s" help:"Per-request timeout"`
+	DangerousAllowPrivate bool          `help:"Disable SSRF protection for private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
+	Verbose               bool          `short:"v" help:"Enable verbose logging"`
+}
+
+// Run executes the grpc-gateway OpenAPI probe against the target URL and emits
+// the rendered .proto file.
+func (c *GRPCGatewayProbeCmd) Run() error {
+	if err := validateURL(c.URL); err != nil {
+		return err
+	}
+
+	cfg := probe.DefaultConfig()
+	cfg.Timeout = c.Timeout
+	if c.DangerousAllowPrivate {
+		fmt.Fprintf(os.Stderr, "WARNING: SSRF protection disabled — probe may target private/internal networks\n")
+		applyAllowPrivate(&cfg)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	req := classify.ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: http.MethodPost,
+			URL:    c.URL,
+		},
+		APIType: apiTypeGRPC,
+	}
+
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "probing %s for grpc-gateway OpenAPI document\n", c.URL)
+	}
+
+	enriched, err := probe.NewGRPCGatewayProbe(cfg).Probe(ctx, []classify.ClassifiedRequest{req})
+	if err != nil {
+		return fmt.Errorf("gateway probe failed: %w", err)
+	}
+
+	if len(enriched) == 0 || enriched[0].GRPCSchema == nil || len(enriched[0].GRPCSchema.Services) == 0 {
+		return fmt.Errorf("no grpc-gateway OpenAPI document found at %s", c.URL)
+	}
+
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "recovered %d service(s)\n", len(enriched[0].GRPCSchema.Services))
+	}
+
+	spec, err := (&grpcgen.Generator{}).Generate(enriched)
+	if err != nil {
+		return fmt.Errorf("generate failed: %w", err)
+	}
+
+	return writeOutput(c.Output, func(w io.Writer) error {
+		_, writeErr := w.Write(spec)
+		return writeErr
+	})
+}
+
+// GRPCBindingsProbeCmd recovers gRPC services from gRPC-Web JS bundles in a
+// capture file and writes the rendered .proto to stdout (or -o file). B1 has
+// no network surface — it operates purely on the local capture.
+type GRPCBindingsProbeCmd struct {
+	Capture string `arg:"" help:"Capture file path (capture.json from crawl/import)"`
+	Output  string `short:"o" help:"Output .proto file path"`
+	Verbose bool   `short:"v" help:"Enable verbose logging"`
+}
+
+// Run reads the capture, extracts gRPC-Web bindings, synthesizes descriptors,
+// and emits the rendered .proto file.
+func (c *GRPCBindingsProbeCmd) Run() (err error) {
+	f, err := os.Open(c.Capture)
+	if err != nil {
+		return fmt.Errorf("open capture file: %w", err)
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("closing capture file: %w", cerr)
+		}
+	}()
+
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat capture file: %w", err)
+	}
+	if info.Size() > maxCaptureSize {
+		return fmt.Errorf("capture file too large: %d bytes (max %d)", info.Size(), maxCaptureSize)
+	}
+
+	requests, err := crawl.ReadCapture(f)
+	if err != nil {
+		return fmt.Errorf("read capture file: %w", err)
+	}
+
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "loaded %d captured requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
+	}
+
+	services, err := analyze.ExtractGRPCWebBindings(requests)
+	if err != nil {
+		return fmt.Errorf("extract gRPC-Web bindings: %w", err)
+	}
+	if len(services) == 0 {
+		return fmt.Errorf("no gRPC-Web bindings found in %s", c.Capture)
+	}
+
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "recovered %d service(s) from gRPC-Web bundles\n", len(services)) //nolint:gosec // G705: writing to stderr, not web response
+	}
+
+	fds, err := grpcgen.FileDescriptorsFromServices(services)
+	if err != nil {
+		return fmt.Errorf("synthesize descriptors: %w", err)
+	}
+
+	req := classify.ClassifiedRequest{
+		APIType: apiTypeGRPC,
+		GRPCSchema: &classify.GRPCReflectionResult{
+			ReflectionEnabled: true,
+			Services:          services,
+			FileDescriptors:   fds,
+		},
+	}
+
+	spec, err := (&grpcgen.Generator{}).Generate([]classify.ClassifiedRequest{req})
 	if err != nil {
 		return fmt.Errorf("generate failed: %w", err)
 	}
@@ -859,6 +1024,30 @@ func augmentAll(ctx context.Context, requests []crawl.ObservedRequest, js jsAnal
 	return requests
 }
 
+// probeStrategiesForType returns the probe strategies for the given API type.
+// The gRPC path chains reflection (richest — real message fields) then the
+// gateway OpenAPI probe (names only) in priority order; gRPC-Web JS bindings
+// are applied separately by enrichGRPCFromBindings since they read the capture
+// rather than the network.
+func probeStrategiesForType(apiType string, cfg probe.Config) []probe.ProbeStrategy {
+	switch apiType {
+	case apiTypeWSDL:
+		return []probe.ProbeStrategy{probe.NewWSDLProbe(cfg)}
+	case apiTypeGraphQL:
+		return []probe.ProbeStrategy{probe.NewGraphQLProbe(cfg)}
+	case apiTypeGRPC:
+		return []probe.ProbeStrategy{
+			probe.NewGRPCProbe(cfg),
+			probe.NewGRPCGatewayProbe(cfg),
+		}
+	default:
+		return []probe.ProbeStrategy{
+			probe.NewOptionsProbe(cfg),
+			probe.NewSchemaProbe(cfg),
+		}
+	}
+}
+
 // generateSpec runs the classify → probe → generate pipeline. It trusts its
 // caller to have already augmented requests with static-HTML form
 // observations AND JS-bundle static analysis — both ScanCmd and GenerateCmd
@@ -885,40 +1074,19 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts ge
 	if opts.Probe {
 		cfg := probe.DefaultConfig()
 		if opts.AllowPrivate {
-			cfg.URLValidator = func(string) error { return nil }
-			cfg.Client = &http.Client{
-				CheckRedirect: func(req *http.Request, via []*http.Request) error {
-					return http.ErrUseLastResponse
-				},
-				Transport: &http.Transport{
-					TLSHandshakeTimeout:   10 * time.Second,
-					ResponseHeaderTimeout: 10 * time.Second,
-				},
-			}
-			cfg.Dialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, network, addr)
-			}
+			applyAllowPrivate(&cfg)
 		}
-		var strategies []probe.ProbeStrategy
-		switch opts.APIType {
-		case apiTypeWSDL:
-			strategies = []probe.ProbeStrategy{probe.NewWSDLProbe(cfg)}
-		case apiTypeGraphQL:
-			strategies = []probe.ProbeStrategy{probe.NewGraphQLProbe(cfg)}
-		case apiTypeGRPC:
-			strategies = []probe.ProbeStrategy{probe.NewGRPCProbe(cfg)}
-		default:
-			strategies = []probe.ProbeStrategy{
-				probe.NewOptionsProbe(cfg),
-				probe.NewSchemaProbe(cfg),
-			}
-		}
+		strategies := probeStrategiesForType(opts.APIType, cfg)
 		enriched, probeErrs := probe.RunStrategies(ctx, strategies, classified)
 		if opts.Verbose {
 			for _, e := range probeErrs {
 				fmt.Fprintf(os.Stderr, "probe warning: %v\n", e)
 			}
+		}
+		// B1: lowest-priority gRPC-Web JS binding recovery from the capture.
+		// Fills only endpoints that reflection/gateway did not cover.
+		if opts.APIType == apiTypeGRPC {
+			enriched = enrichGRPCFromBindings(requests, enriched, opts.Verbose)
 		}
 		classified = enriched
 	}
@@ -934,6 +1102,65 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts ge
 	}
 
 	return spec, nil
+}
+
+// enrichGRPCFromBindings recovers gRPC services from gRPC-Web JS bundles in the
+// full augmented capture and applies them with the lowest precedence in the
+// reflection > gateway > bindings chain. It never overwrites an endpoint that
+// already carries usable descriptors (reflection or gateway). When no grpc
+// endpoint exists at all — common for a pure gRPC-Web SPA where only JS was
+// captured — a single synthetic grpc endpoint is appended so the generator has
+// something to render.
+//
+// B1 reads JS bodies from the capture rather than the network, so it is not a
+// ProbeStrategy: the classified/deduped endpoints handed to probes are API
+// endpoints, not the JS bundles (which are filtered out before probing). Only
+// generateSpec's caller context holds the full capture B1 needs.
+func enrichGRPCFromBindings(requests []crawl.ObservedRequest, enriched []classify.ClassifiedRequest, verbose bool) []classify.ClassifiedRequest {
+	services, err := analyze.ExtractGRPCWebBindings(requests)
+	if err != nil || len(services) == 0 {
+		return enriched
+	}
+
+	fds, err := grpcgen.FileDescriptorsFromServices(services)
+	if err != nil {
+		return enriched
+	}
+
+	if verbose {
+		fmt.Fprintf(os.Stderr, "recovered %d service(s) from gRPC-Web bundles\n", len(services)) //nolint:gosec // G705: writing to stderr, not web response
+	}
+
+	schema := func() *classify.GRPCReflectionResult {
+		return &classify.GRPCReflectionResult{
+			ReflectionEnabled: true,
+			Services:          services,
+			FileDescriptors:   fds,
+		}
+	}
+
+	applied := false
+	for i := range enriched {
+		if enriched[i].APIType != apiTypeGRPC {
+			continue
+		}
+		// Skip endpoints already covered by reflection or gateway.
+		if s := enriched[i].GRPCSchema; s != nil && s.ReflectionEnabled && len(s.FileDescriptors) > 0 {
+			continue
+		}
+		enriched[i].GRPCSchema = schema()
+		applied = true
+	}
+
+	// No grpc endpoint to attach to: append a synthetic one.
+	if !applied {
+		enriched = append(enriched, classify.ClassifiedRequest{
+			APIType:    apiTypeGRPC,
+			GRPCSchema: schema(),
+		})
+	}
+
+	return enriched
 }
 
 // classifiersForType returns the appropriate classifiers for the given API type.

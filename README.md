@@ -229,6 +229,15 @@ The probe enumerates a target's services, methods, and message types via the [gR
 - **Generator requirement**: `.proto` generation requires reflection descriptors; traffic-only inference is not yet supported, so a reflection-disabled target yields no spec.
 - **SSRF protection**: the dial target is validated before connecting and re-checked at connect time (closing the DNS-rebinding TOCTOU window), the same as the HTTP probe path.
 
+### Reflection-off gRPC discovery
+
+When reflection is disabled, two name-only techniques recover service/method names and streaming flags (but not message fields, which the wire format strips):
+
+- **grpc-gateway OpenAPI** (`probe grpc gateway <url>`): fetches a bounded set of well-known swagger/OpenAPI paths over HTTP, recognizes grpc-gateway/protoc-gen-openapiv2 documents by their `operationId`/`tags` shape, and maps each operation back to `<Service>/<Method>`. SSRF-gated like the other HTTP probes; use `--dangerous-allow-private` for localhost targets.
+- **gRPC-Web JS bindings** (`probe grpc bindings <capture>`): runs static analysis over the JavaScript bundles in a capture file to recover generated gRPC-Web/Connect-ES client artifacts (connect-es service objects, `*_pb_service.js` stubs, `*_grpc_web_pb.js` MethodDescriptors). No network access — it reads the local capture.
+
+Both feed the same generator path as reflection via synthesized `FileDescriptorProto`s (empty message stubs), so they emit byte-identical `.proto` formatting. Under `scan --api-type grpc` all three techniques are chained in precedence order — reflection > gateway > bindings — and the name-only techniques never overwrite richer reflection descriptors.
+
 ## CLI Reference
 
 ### `vespasian scan`

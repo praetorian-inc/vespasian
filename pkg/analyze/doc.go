@@ -24,4 +24,11 @@
 //
 // Synthetic requests are tagged with Source="static:html" so downstream
 // consumers can distinguish them from live captures.
+//
+// ExtractGRPCWebBindings runs jsluice over captured JavaScript bodies to
+// recover gRPC service/method/type names and streaming flags from generated
+// gRPC-Web and Connect-ES client artifacts (connect-es service objects,
+// *_pb_service.js stubs, *_grpc_web_pb.js MethodDescriptors). It returns
+// []classify.GRPCService for the reflection-off gRPC discovery path; message
+// fields are not recovered (names only).
 package analyze
