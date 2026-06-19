@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -38,7 +39,6 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/generate"
-	grpcgen "github.com/praetorian-inc/vespasian/pkg/generate/grpc"
 	wsdlgen "github.com/praetorian-inc/vespasian/pkg/generate/wsdl"
 	"github.com/praetorian-inc/vespasian/pkg/importer"
 	"github.com/praetorian-inc/vespasian/pkg/probe"
@@ -705,26 +705,56 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 }
 
 // applyAllowPrivate disables SSRF protection on cfg for probing
-// private/localhost targets. It swaps the URL validator to a no-op and both
-// the HTTP Client and Dialer to permissive transports. Both must be swapped:
-// HTTP probes (gateway) dial via cfg.Client, while the gRPC reflection probe
-// dials via cfg.Dialer. Used by generateSpec when --dangerous-allow-private
-// is set so probes can reach private/internal targets.
+// private/localhost targets. It swaps the URL validator to a no-op and
+// overrides the dial path (HTTP transport + cfg.Dialer) with a permissive
+// dialer. Both must be overridden: HTTP probes (gateway) dial via cfg.Client,
+// while the gRPC reflection probe dials via cfg.Dialer. Used by generateSpec
+// when --dangerous-allow-private is set so probes can reach private/internal
+// targets.
+//
+// The existing *http.Transport is cloned and only its DialContext is replaced,
+// preserving proxy/TLS/CA/timeout settings the caller may have configured. If
+// cfg.Client.Transport is not an *http.Transport (e.g. a custom RoundTripper),
+// its SSRF behavior cannot be safely preserved, so http.DefaultTransport is
+// cloned instead.
 func applyAllowPrivate(cfg *probe.Config) {
 	cfg.URLValidator = func(string) error { return nil }
-	cfg.Client = &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-		Transport: &http.Transport{
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 10 * time.Second,
-		},
-	}
-	cfg.Dialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
+
+	permissiveDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		var d net.Dialer
 		return d.DialContext(ctx, network, addr)
 	}
+
+	tr := clonePermissiveTransport(cfg.Client)
+	tr.DialContext = permissiveDial
+
+	if cfg.Client == nil {
+		cfg.Client = &http.Client{
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+	}
+	cfg.Client.Transport = tr
+
+	cfg.Dialer = permissiveDial
+}
+
+// clonePermissiveTransport returns a clone of client's *http.Transport so its
+// DialContext can be overridden without mutating shared transport state.
+// Preserves proxy/TLS/CA/timeout settings. Falls back to cloning
+// http.DefaultTransport when client (or its transport) is nil or is a custom
+// RoundTripper whose SSRF behavior cannot be safely preserved.
+func clonePermissiveTransport(client *http.Client) *http.Transport {
+	if client != nil {
+		if t, ok := client.Transport.(*http.Transport); ok && t != nil {
+			return t.Clone()
+		}
+	}
+	if def, ok := http.DefaultTransport.(*http.Transport); ok && def != nil {
+		return def.Clone()
+	}
+	return &http.Transport{}
 }
 
 // VersionCmd shows version information.
@@ -849,6 +879,15 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts ge
 			applyAllowPrivate(&cfg)
 		}
 		strategies := probeStrategiesForType(opts.APIType, cfg)
+		// Pure grpc-gateway traffic is REST/JSON, so the gRPC classifier never
+		// marks it APIType=="grpc" and the gRPC/gateway probes (which only
+		// iterate grpc endpoints) get no targets. Seed one synthetic grpc
+		// endpoint per distinct host so reflection and the gateway probe have
+		// something to reach. SSRF protection still applies via the probes'
+		// URLValidator/Dialer.
+		if opts.APIType == apiTypeGRPC {
+			classified = seedGRPCHostEndpoints(requests, classified, probe.DefaultMaxEndpoints)
+		}
 		enriched, probeErrs := probe.RunStrategies(ctx, strategies, classified)
 		if opts.Verbose {
 			for _, e := range probeErrs {
@@ -894,38 +933,49 @@ func enrichGRPCFromBindings(requests []crawl.ObservedRequest, enriched []classif
 		return enriched
 	}
 
-	fds, err := grpcgen.FileDescriptorsFromServices(services)
-	if err != nil {
+	// Dedupe bindings services against every service already recovered across
+	// all endpoints (by any technique). Reflection > gateway > bindings: a FQN
+	// already recovered by a higher-precedence technique is not re-attached.
+	filtered := filterUncoveredServices(services, enriched)
+	if len(filtered) == 0 {
 		return enriched
 	}
 
 	if verbose {
-		fmt.Fprintf(os.Stderr, "recovered %d service(s) from gRPC-Web bundles\n", len(services)) //nolint:gosec // G705: writing to stderr, not web response
+		fmt.Fprintf(os.Stderr, "recovered %d service(s) from gRPC-Web bundles\n", len(filtered)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
+	// Store recovered service names only. Descriptor synthesis is centralized
+	// in the generator. ReflectionEnabled is false: JS bindings are not a
+	// reflection response.
 	schema := func() *classify.GRPCReflectionResult {
 		return &classify.GRPCReflectionResult{
-			ReflectionEnabled: true,
-			Services:          services,
-			FileDescriptors:   fds,
+			ReflectionEnabled: false,
+			Services:          filtered,
 		}
 	}
 
-	applied := false
+	// "Covered" for bindings purposes means the endpoint already carries usable
+	// descriptors or recovered service names (reflection or gateway).
+	hasCoverage := func(s *classify.GRPCReflectionResult) bool {
+		return s != nil && (len(s.FileDescriptors) > 0 || len(s.Services) > 0)
+	}
+
+	grpcEndpointExists := false
 	for i := range enriched {
 		if enriched[i].APIType != apiTypeGRPC {
 			continue
 		}
-		// Skip endpoints already covered by reflection or gateway.
-		if s := enriched[i].GRPCSchema; s != nil && s.ReflectionEnabled && len(s.FileDescriptors) > 0 {
+		grpcEndpointExists = true
+		if hasCoverage(enriched[i].GRPCSchema) {
 			continue
 		}
 		enriched[i].GRPCSchema = schema()
-		applied = true
 	}
 
-	// No grpc endpoint to attach to: append a synthetic one.
-	if !applied {
+	// Append a synthetic grpc endpoint only when no grpc endpoint exists at all
+	// — common for a pure gRPC-Web SPA where only JS was captured.
+	if !grpcEndpointExists {
 		enriched = append(enriched, classify.ClassifiedRequest{
 			APIType:    apiTypeGRPC,
 			GRPCSchema: schema(),
@@ -933,6 +983,88 @@ func enrichGRPCFromBindings(requests []crawl.ObservedRequest, enriched []classif
 	}
 
 	return enriched
+}
+
+// filterUncoveredServices returns the subset of services whose FQN is not
+// already recovered (in GRPCSchema.Services) by any endpoint in enriched.
+// Leading dots are stripped before comparison so ".pkg.S" and "pkg.S" match.
+func filterUncoveredServices(services []classify.GRPCService, enriched []classify.ClassifiedRequest) []classify.GRPCService {
+	covered := map[string]bool{}
+	for i := range enriched {
+		if s := enriched[i].GRPCSchema; s != nil {
+			for _, svc := range s.Services {
+				covered[strings.TrimPrefix(svc.Name, ".")] = true
+			}
+		}
+	}
+	filtered := services[:0:0]
+	for _, svc := range services {
+		if covered[strings.TrimPrefix(svc.Name, ".")] {
+			continue
+		}
+		filtered = append(filtered, svc)
+	}
+	return filtered
+}
+
+// seedGRPCHostEndpoints returns classified plus one synthetic grpc-typed
+// ClassifiedRequest per distinct host (scheme://host[:port]) observed in
+// requests that is not already represented among classified grpc endpoints.
+// Hosts are deduped, sorted for deterministic output, and capped at maxHosts.
+// The synthetic endpoints give the reflection and grpc-gateway probes targets
+// even when classification never marked the (REST/JSON) gateway traffic grpc.
+// SSRF protection is unaffected: seeding only constructs URLs; the probes still
+// run URLValidator/Dialer.
+func seedGRPCHostEndpoints(requests []crawl.ObservedRequest, classified []classify.ClassifiedRequest, maxHosts int) []classify.ClassifiedRequest {
+	// Hosts already represented among classified grpc endpoints are not re-seeded.
+	existing := map[string]bool{}
+	for i := range classified {
+		if classified[i].APIType != apiTypeGRPC {
+			continue
+		}
+		if host := grpcHostKey(classified[i].URL); host != "" {
+			existing[host] = true
+		}
+	}
+
+	seen := map[string]bool{}
+	var hosts []string
+	for _, req := range requests {
+		host := grpcHostKey(req.URL)
+		if host == "" || existing[host] || seen[host] {
+			continue
+		}
+		seen[host] = true
+		hosts = append(hosts, host)
+	}
+
+	sort.Strings(hosts)
+	if maxHosts > 0 && len(hosts) > maxHosts {
+		hosts = hosts[:maxHosts]
+	}
+
+	for _, host := range hosts {
+		classified = append(classified, classify.ClassifiedRequest{
+			ObservedRequest: crawl.ObservedRequest{URL: host},
+			APIType:         apiTypeGRPC,
+		})
+	}
+	return classified
+}
+
+// grpcHostKey returns the scheme://host[:port] key for a request URL, or ""
+// when the URL cannot be parsed or carries no host. The original scheme is
+// preserved; the probes themselves map grpc/grpcs↔http/https as needed.
+func grpcHostKey(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	scheme := u.Scheme
+	if scheme == "" {
+		scheme = "https"
+	}
+	return scheme + "://" + u.Host
 }
 
 // classifiersForType returns the appropriate classifiers for the given API type.

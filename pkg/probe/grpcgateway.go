@@ -25,8 +25,6 @@ import (
 	"sort"
 	"strings"
 
-	grpcgen "github.com/praetorian-inc/vespasian/pkg/generate/grpc"
-
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 )
 
@@ -61,7 +59,8 @@ var operationIDPattern = regexp.MustCompile(`^([A-Za-z0-9_.]+)_([A-Za-z0-9]+)$`)
 
 // GRPCGatewayProbe recovers gRPC service/method names from a grpc-gateway or
 // Envoy OpenAPI document exposed alongside the HTTP/JSON transcoding gateway.
-// It enriches matching gRPC endpoints with synthesized descriptors.
+// It records recovered service names on matching gRPC endpoints; descriptor
+// synthesis is centralized in the generator.
 type GRPCGatewayProbe struct {
 	config Config
 }
@@ -75,11 +74,12 @@ func NewGRPCGatewayProbe(cfg Config) *GRPCGatewayProbe {
 func (p *GRPCGatewayProbe) Name() string { return "grpc-gateway" }
 
 // Probe attempts well-known OpenAPI paths for each unique grpc endpoint host
-// and, on finding a grpc-gateway swagger document, enriches the matching
-// endpoints' GRPCSchema with services synthesized from the document. Only
-// endpoints with APIType=="grpc" are probed. Deduplicated by host (one swagger
-// fetch sequence per host). Failures are non-fatal: returns (endpoints, nil)
-// even when nothing is found, so RunStrategies isolation is preserved.
+// and, on finding a grpc-gateway swagger document, records the recovered
+// service names on the matching endpoints' GRPCSchema.Services (with
+// ReflectionEnabled=false). Only endpoints with APIType=="grpc" are probed.
+// Deduplicated by host (one swagger fetch sequence per host). Failures are
+// non-fatal: returns (endpoints, nil) even when nothing is found, so
+// RunStrategies isolation is preserved.
 func (p *GRPCGatewayProbe) Probe(ctx context.Context, endpoints []classify.ClassifiedRequest) ([]classify.ClassifiedRequest, error) {
 	// Map probed host base URL → recovered services (nil when nothing found).
 	servicesByHost := make(map[string][]classify.GRPCService)
@@ -114,8 +114,9 @@ func (p *GRPCGatewayProbe) Probe(ctx context.Context, endpoints []classify.Class
 		}
 		// Precedence: never overwrite a reflection result that already carries
 		// real FileDescriptors (reflection wins — it has true message fields).
-		if existing := result[i].GRPCSchema; existing != nil &&
-			existing.ReflectionEnabled && len(existing.FileDescriptors) > 0 {
+		// Keyed on descriptor presence, not ReflectionEnabled, since name-only
+		// techniques set ReflectionEnabled=false but never carry descriptors.
+		if existing := result[i].GRPCSchema; existing != nil && len(existing.FileDescriptors) > 0 {
 			continue
 		}
 		base := openAPIBaseURL(result[i].URL)
@@ -123,15 +124,13 @@ func (p *GRPCGatewayProbe) Probe(ctx context.Context, endpoints []classify.Class
 		if len(svcs) == 0 {
 			continue
 		}
-		fds, err := grpcgen.FileDescriptorsFromServices(svcs)
-		if err != nil {
-			slog.DebugContext(ctx, "grpc-gateway probe: descriptor synthesis failed", "url", result[i].URL, "error", err)
-			continue
-		}
+		// Store recovered service names only. Descriptor synthesis is
+		// centralized in the generator (generate/grpc.Generate), which unions
+		// services across techniques and synthesizes once. ReflectionEnabled is
+		// false: the gateway document is not a reflection response.
 		result[i].GRPCSchema = &classify.GRPCReflectionResult{
-			ReflectionEnabled: true,
+			ReflectionEnabled: false,
 			Services:          svcs,
-			FileDescriptors:   fds,
 		}
 	}
 
@@ -314,6 +313,7 @@ func buildGatewayServices(byService map[string]map[string]bool) []classify.GRPCS
 // grpc-gateway/protoc-gen-openapiv2 document rather than a hand-written or
 // generic REST swagger document.
 func isGRPCGatewayDoc(doc *openAPIDoc) bool {
+	// Strong signal: an FQN-shaped service title or tag.
 	if looksLikeServiceFQN(doc.Info.Title) {
 		return true
 	}
@@ -322,18 +322,35 @@ func isGRPCGatewayDoc(doc *openAPIDoc) bool {
 			return true
 		}
 	}
+	// Primary signal: any operationId with the grpc-gateway <Service>_<Method>
+	// shape (both Upper-initial). This distinguishes Greeter_SayHello (accept)
+	// from plain REST swagger such as listUsers or user_list (reject), without
+	// requiring an accompanying FQN-shaped tag.
 	for _, ops := range doc.Paths {
 		for _, op := range ops {
-			if operationIDPattern.MatchString(op.OperationID) {
-				for _, t := range op.Tags {
-					if looksLikeServiceFQN(t) {
-						return true
-					}
-				}
+			if looksLikeServiceMethodOpID(op.OperationID) {
+				return true
 			}
 		}
 	}
 	return false
+}
+
+// looksLikeServiceMethodOpID reports whether opID has the grpc-gateway
+// <Service>_<Method> shape where both Service and Method are Upper-initial.
+// This rejects camelCase REST operationIds (listUsers) and lowercase-method
+// forms (user_list, orders_v1_create).
+func looksLikeServiceMethodOpID(opID string) bool {
+	m := operationIDPattern.FindStringSubmatch(opID)
+	if m == nil {
+		return false
+	}
+	return isUpperInitial(m[1]) && isUpperInitial(m[2])
+}
+
+// isUpperInitial reports whether s begins with an ASCII uppercase letter.
+func isUpperInitial(s string) bool {
+	return s != "" && s[0] >= 'A' && s[0] <= 'Z'
 }
 
 // looksLikeServiceFQN reports whether s has a protobuf service FQN shape: it

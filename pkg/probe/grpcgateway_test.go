@@ -101,6 +101,11 @@ func TestGRPCGatewayProbe_ImplementsProbeStrategy(t *testing.T) {
 // TestGRPCGatewayProbe_PositiveDetection verifies that serving a protoc-gen-
 // openapiv2-style swagger.json at /swagger.json enriches the gRPC endpoint with
 // a non-nil GRPCSchema containing at least one service.
+//
+// After the review-fix (LAB-3864 Part B), the gateway probe stores only
+// recovered service names (Services), not pre-synthesized FileDescriptors.
+// ReflectionEnabled is false because the document is not a reflection response.
+// Descriptor synthesis is centralized in generate/grpc.Generate.
 func TestGRPCGatewayProbe_PositiveDetection(t *testing.T) {
 	body := readTestdata(t, "swagger.json")
 	srv := serveSingle(body, "/swagger.json")
@@ -115,9 +120,12 @@ func TestGRPCGatewayProbe_PositiveDetection(t *testing.T) {
 
 	schema := result[0].GRPCSchema
 	require.NotNil(t, schema, "GRPCSchema must be set after positive detection")
-	assert.True(t, schema.ReflectionEnabled, "ReflectionEnabled must be true for synthesized descriptors")
+	// T-flag: gateway probe now stores service names only; descriptor synthesis
+	// moved to the generator. ReflectionEnabled is false (document is not a
+	// reflection response). FileDescriptors are empty (no pre-synthesis).
+	assert.False(t, schema.ReflectionEnabled, "ReflectionEnabled must be false: gateway doc is not a reflection response")
 	assert.NotEmpty(t, schema.Services, "at least one service must be recovered")
-	assert.NotEmpty(t, schema.FileDescriptors, "FileDescriptors must be synthesized")
+	assert.Empty(t, schema.FileDescriptors, "FileDescriptors must be empty: synthesis is centralized in the generator")
 }
 
 // TestGRPCGatewayProbe_RecoveredServiceFQN verifies the recovered service name

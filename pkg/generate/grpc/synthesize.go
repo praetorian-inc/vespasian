@@ -41,6 +41,11 @@ const syntheticFileSuffix = "synthetic.proto"
 // .proto filename and is suitable for classify.GRPCReflectionResult.FileDescriptors
 // (and therefore for Generator.Generate via the existing renderProto path).
 //
+// The caller must ensure no duplicate service FQNs are present in services;
+// duplicates emit duplicate symbols (two ServiceDescriptorProto with the same
+// name in one file). Generate dedupes by FQN (via unionRecoveredServices)
+// before calling, so this function performs no internal dedup.
+//
 // Returns an error if services is empty or a service/method name is malformed.
 func FileDescriptorsFromServices(services []classify.GRPCService) (map[string][]byte, error) {
 	if len(services) == 0 {
