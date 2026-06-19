@@ -233,8 +233,8 @@ The probe enumerates a target's services, methods, and message types via the [gR
 
 When reflection is disabled, two name-only techniques recover service/method names and streaming flags (but not message fields, which the wire format strips):
 
-- **grpc-gateway OpenAPI** (`probe grpc gateway <url>`): fetches a bounded set of well-known swagger/OpenAPI paths over HTTP, recognizes grpc-gateway/protoc-gen-openapiv2 documents by their `operationId`/`tags` shape, and maps each operation back to `<Service>/<Method>`. SSRF-gated like the other HTTP probes; use `--dangerous-allow-private` for localhost targets.
-- **gRPC-Web JS bindings** (`probe grpc bindings <capture>`): runs static analysis over the JavaScript bundles in a capture file to recover generated gRPC-Web/Connect-ES client artifacts (connect-es service objects, `*_pb_service.js` stubs, `*_grpc_web_pb.js` MethodDescriptors). No network access — it reads the local capture.
+- **grpc-gateway OpenAPI**: fetches a bounded set of well-known swagger/OpenAPI paths over HTTP, recognizes grpc-gateway/protoc-gen-openapiv2 documents by their `operationId`/`tags` shape, and maps each operation back to `<Service>/<Method>`. SSRF-gated like the other HTTP probes; use `--dangerous-allow-private` for localhost targets.
+- **gRPC-Web JS bindings**: runs static analysis over the JavaScript bundles in the capture to recover generated gRPC-Web/Connect-ES client artifacts (connect-es service objects, `*_pb_service.js` stubs, `*_grpc_web_pb.js` MethodDescriptors). No network access — it reads the captured JS.
 
 Both feed the same generator path as reflection via synthesized `FileDescriptorProto`s (empty message stubs), so they emit byte-identical `.proto` formatting. Under `scan --api-type grpc` all three techniques are chained in precedence order — reflection > gateway > bindings — and the name-only techniques never overwrite richer reflection descriptors.
 
@@ -324,52 +324,6 @@ vespasian generate <api-type> <capture-file> [flags]
   -v, --verbose      Show discovered endpoints
 ```
 
-### `vespasian probe`
-
-Runs a single gRPC discovery technique directly and writes the rendered `.proto` to `-o` (default: stdout). Each subcommand is a standalone equivalent of one stage that `scan --api-type grpc` runs automatically — use them to target one technique without the full pipeline. The `probe` verb is gRPC-specific; REST/GraphQL/WSDL are discovered through the `scan`/`generate` pipeline, not standalone probes.
-
-```
-vespasian probe grpc <technique> <target> [flags]
-  Techniques:
-    reflection <url>           Enumerate via the gRPC Server Reflection Protocol
-    gateway    <url>           Recover services from a grpc-gateway/Envoy OpenAPI doc
-    bindings   <capture-file>  Recover services from gRPC-Web JS bundles in a capture
-```
-
-**`probe grpc reflection <url>`** — asks the server to describe itself (the richest source when reflection is enabled).
-
-```
-  <url>              Target URL (e.g., https://grpc.example.com:443). Port is
-                     required for non-standard gRPC ports such as :50051.
-  -o, --output       Output .proto file path (default: stdout)
-  --timeout          Per-request timeout (default: 10s)
-  --dangerous-allow-private  Disable SSRF protection for private/localhost
-                     targets. WARNING: Do not use on production systems.
-  -v, --verbose      Enable verbose logging
-```
-
-```bash
-vespasian probe grpc reflection https://grpc.example.com:443 -o api.proto
-vespasian probe grpc reflection http://localhost:50051 --dangerous-allow-private -o api.proto
-```
-
-If reflection is disabled or gated, the command exits with the gRPC status reason (e.g. `reflection not available on <url> (gRPC Unimplemented)`) — fall back to `gateway` or `bindings`.
-
-**`probe grpc gateway <url>`** — scrapes a [grpc-gateway](https://github.com/grpc-ecosystem/grpc-gateway)/Envoy OpenAPI document (well-known paths like `/swagger.json`, `/openapiv2/*.swagger.json`) and maps its operations back to RPCs. Works when reflection is off but the service is exposed via JSON transcoding. Same `-o`, `--timeout`, `--dangerous-allow-private`, `-v` flags as `reflection`.
-
-```bash
-vespasian probe grpc gateway https://gw.example.com -o api.proto
-```
-
-**`probe grpc bindings <capture-file>`** — offline; reads an existing capture and recovers service definitions from gRPC-Web JavaScript bundles (`*_connect.js`, `*_pb_service.js`, `*_grpc_web_pb.js`) inside it. No network access, so it has **no `--timeout`/`--dangerous-allow-private`** — capture the traffic first, then scrape it.
-
-```bash
-vespasian crawl https://app.example.com -o capture.json
-vespasian probe grpc bindings capture.json -o api.proto
-```
-
-For end-to-end discovery, prefer `vespasian scan <url> --api-type grpc`, which runs reflection → gateway → bindings together (highest-confidence result wins) instead of invoking these individually.
-
 ## Architecture
 
 ### Pipeline Components
@@ -409,7 +363,7 @@ Vespasian discovers **REST APIs** (generating OpenAPI 3.0 specs), **GraphQL APIs
 
 ### How does Vespasian discover gRPC services?
 
-gRPC services are enumerated through the [Server Reflection Protocol](https://github.com/grpc/grpc/blob/master/doc/server-reflection.md): Vespasian asks the server to describe its own services, methods, and message types, then reconstructs a proto3 `.proto` from the returned descriptors. Run it with `vespasian probe grpc reflection <url>` for a one-shot probe, or `--api-type grpc` in the `scan`/`generate` pipeline. If a server has reflection **disabled or auth-gated**, Vespasian reports the gRPC status reason (`Unimplemented`, `Unauthenticated`, `PermissionDenied`) rather than failing silently — but cannot reconstruct the schema, since `.proto` generation currently requires reflection descriptors.
+gRPC services are enumerated through the [Server Reflection Protocol](https://github.com/grpc/grpc/blob/master/doc/server-reflection.md): Vespasian asks the server to describe its own services, methods, and message types, then reconstructs a proto3 `.proto` from the returned descriptors. Run it via `--api-type grpc` in the `scan`/`generate` pipeline. If a server has reflection **disabled or auth-gated**, Vespasian reports the gRPC status reason (`Unimplemented`, `Unauthenticated`, `PermissionDenied`) rather than failing silently — but cannot reconstruct the schema, since `.proto` generation currently requires reflection descriptors.
 
 ### How is Vespasian different from running a web crawler?
 

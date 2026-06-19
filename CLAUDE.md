@@ -63,7 +63,7 @@ The CLI (`cmd/vespasian`) uses Kong for argument parsing. Each command (crawl, i
 6. Probe endpoints via `probe.RunStrategies()` (OPTIONS, schema, WSDL fetch, GraphQL introspection, gRPC reflection, gRPC-gateway OpenAPI)
 7. Generate spec via `generate.Get(apiType).Generate()`
 
-Note: `detectAPIType` (auto mode) runs only the REST/WSDL/GraphQL classifiers — gRPC is never auto-selected and requires explicit `--api-type grpc`. Under `--api-type grpc`, three reflection-off-capable techniques are chained in priority order: server reflection (richest — real message fields) → grpc-gateway OpenAPI scrape → gRPC-Web JS-binding recovery from the capture. The first two are `ProbeStrategy` implementations run by `RunStrategies`; the binding recovery is applied afterward (`enrichGRPCFromBindings`) because it reads JS bodies from the full capture rather than the network. Reflection results are never overwritten by the name-only techniques. Standalone `vespasian probe grpc {reflection|gateway|bindings}` commands run a single technique and emit `.proto` directly.
+Note: `detectAPIType` (auto mode) runs only the REST/WSDL/GraphQL classifiers — gRPC is never auto-selected and requires explicit `--api-type grpc`. Under `--api-type grpc`, three reflection-off-capable techniques are chained in priority order: server reflection (richest — real message fields) → grpc-gateway OpenAPI scrape → gRPC-Web JS-binding recovery from the capture. The first two are `ProbeStrategy` implementations run by `RunStrategies`; the binding recovery is applied afterward (`enrichGRPCFromBindings`) because it reads JS bodies from the full capture rather than the network. Reflection results are never overwritten by the name-only techniques. All three run only inside the `scan`/`generate` pipeline — there is no standalone `probe` CLI command.
 
 ### Key Packages
 
@@ -102,7 +102,6 @@ The `query_params` field is `map[string][]string` (multi-value). Capture files g
 | `crawl`   | Capture traffic via headless browser → capture.json. Flags: `--analyze-js` (default true), `--fetch-sourcemaps` (default true) |
 | `import`  | Convert Burp XML / HAR / mitmproxy → capture.json |
 | `generate` | Produce spec from capture.json (REST→OpenAPI, GraphQL→SDL, WSDL→WSDL, gRPC→`.proto`). Flags: `--analyze-js` (default true), `--fetch-sourcemaps` (default false). `grpc` must be passed explicitly and needs reflection descriptors in the capture. |
-| `probe`   | Run a single gRPC discovery technique and emit `.proto`. Subcommands: `probe grpc reflection <url>` enumerates services via Server Reflection; `probe grpc gateway <url>` recovers services from a grpc-gateway/Envoy OpenAPI document (HTTP scrape, SSRF-gated, `--dangerous-allow-private` to target localhost); `probe grpc bindings <capture>` recovers services from gRPC-Web JS bundles in a capture file (no network). The reflection/gateway commands take a URL; bindings takes a capture file. |
 | `version` | Show version information |
 
 ## Test Infrastructure
