@@ -596,6 +596,11 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		verbose:         c.Verbose,
 	})
 
+	// Resolve the API type up front (when auto) so the verbose "detected API
+	// type" line reflects the traffic-derived type *before* any WSDL promotion,
+	// matching the pre-refactor ordering. The resolved type is then passed
+	// explicitly into ResolveAndGenerate, which skips re-detection for a
+	// non-auto type.
 	apiType := c.APIType
 	if apiType == pipeline.APITypeAuto {
 		apiType = pipeline.DetectAPIType(requests, c.Confidence)
@@ -613,47 +618,44 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 
 	// Emit the SSRF-disabled warning before any active probing so the notice
 	// always precedes outbound requests to private/internal networks. The WSDL
-	// probe below is the first such activity in the scan phase, so the warning
-	// must come first (matching GenerateCmd.Run, which warns before probing).
+	// probe inside ResolveAndGenerate is the first such activity in the scan
+	// phase, so the warning must come first (matching GenerateCmd.Run, which
+	// warns before probing).
 	warnSSRFDisabled(c.DangerousAllowPrivate, c.Probe)
 
-	// When the resolved API type is WSDL or REST, try fetching a WSDL document
-	// from <targetURL>?wsdl. SOAP services return HTML for browser GETs so
-	// crawl traffic rarely contains WSDL signals — active probing is the
-	// reliable discovery method.
-	var foundWSDL bool
-	requests, apiType, foundWSDL = pipeline.ResolveWSDLType(genCtx, c.URL, apiType, requests, c.Probe, c.DangerousAllowPrivate, statusWriter(c.Verbose))
-	if foundWSDL && c.Verbose {
-		fmt.Fprintf(os.Stderr, "discovered WSDL document at %s?wsdl\n", c.URL)
-	}
-
-	if c.Verbose {
-		fmt.Fprintf(os.Stderr, "generating %s spec\n", apiTypeDisplayName(apiType)) //nolint:gosec // G705: writing to stderr, not web response
-	}
-
-	// Replay JS-extracted URLs with raw HTTP to bypass SPA catch-all routing.
-	// URLs extracted from JavaScript bundles are visited by the headless browser,
-	// which gets the SPA shell (index.html) instead of the API response. Re-fetching
-	// them with a direct HTTP request reaches the actual API backend. Gated on
-	// c.Probe so --probe=false stays passive (see maybeReplayJSExtracted).
-	requests = maybeReplayJSExtracted(genCtx, requests, c.Probe, crawl.JSReplayConfig{
-		Headers:      bs.opts.Headers,
+	// Run the shared detect → wsdl-resolve → (JS-replay) → classify/probe/generate
+	// sequence. The afterWSDL hook keeps JS-replay in its CLI-specific position:
+	// after WSDL resolution and before classification. JS-replay re-fetches
+	// bundle-extracted URLs with raw HTTP to bypass SPA catch-all routing; it is
+	// gated on c.Probe so --probe=false stays passive (see maybeReplayJSExtracted)
+	// and is CLI-only (the SDK passes a nil AfterWSDL hook).
+	spec, apiType, foundWSDL, _, err := pipeline.ResolveAndGenerate(genCtx, requests, pipeline.ScanOptions{
 		TargetURL:    c.URL,
-		AllowPrivate: c.DangerousAllowPrivate,
-		Verbose:      c.Verbose,
-		Stderr:       os.Stderr,
-	})
-
-	spec, err := pipeline.ClassifyProbeGenerate(genCtx, requests, pipeline.Options{
 		APIType:      apiType,
 		Confidence:   c.Confidence,
 		Probe:        c.Probe,
 		Deduplicate:  c.Deduplicate,
 		AllowPrivate: c.DangerousAllowPrivate,
 		Status:       statusWriter(c.Verbose),
+		AfterWSDL: func(ctx context.Context, reqs []crawl.ObservedRequest) []crawl.ObservedRequest {
+			return maybeReplayJSExtracted(ctx, reqs, c.Probe, crawl.JSReplayConfig{
+				Headers:      bs.opts.Headers,
+				TargetURL:    c.URL,
+				AllowPrivate: c.DangerousAllowPrivate,
+				Verbose:      c.Verbose,
+				Stderr:       os.Stderr,
+			})
+		},
 	})
 	if err != nil {
 		return err
+	}
+
+	if foundWSDL && c.Verbose {
+		fmt.Fprintf(os.Stderr, "discovered WSDL document at %s?wsdl\n", c.URL)
+	}
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "generating %s spec\n", apiTypeDisplayName(apiType)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
 	return writeOutput(c.Output, func(w io.Writer) error {

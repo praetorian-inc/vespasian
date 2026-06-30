@@ -17,7 +17,6 @@ package sdk
 import (
 	"context"
 	"errors"
-	"io"
 	"testing"
 
 	"time"
@@ -66,37 +65,16 @@ func stubCrawl(t *testing.T, requests []crawl.ObservedRequest, err error) {
 	t.Cleanup(func() { crawlFunc = orig })
 }
 
-// stubWSDLProbe replaces wsdlResolveFunc and registers Cleanup to restore it.
-// When augmented is non-nil it is returned as the augmented request slice;
-// otherwise the original request slice is passed through. Mirrors
-// ResolveWSDLType's contract: on a miss (foundWSDL=false) the input apiType is
-// returned unchanged; on a hit the supplied resolvedType is returned.
-func stubWSDLProbe(t *testing.T, augmented []crawl.ObservedRequest, foundWSDL bool, resolvedType string) {
+// stubGenerate replaces generateFunc and registers Cleanup to restore it.
+// The stub returns the provided spec, apiType, foundWSDL, and err values
+// without performing any network I/O or classification work.
+func stubGenerate(t *testing.T, spec []byte, apiType string, foundWSDL bool, err error) {
 	t.Helper()
-	orig := wsdlResolveFunc
-	wsdlResolveFunc = func(_ context.Context, _, apiType string, requests []crawl.ObservedRequest, _, _ bool, _ io.Writer) ([]crawl.ObservedRequest, string, bool) {
-		if !foundWSDL {
-			return requests, apiType, false
-		}
-		out := requests
-		if augmented != nil {
-			out = augmented
-		}
-		return out, resolvedType, true
+	orig := generateFunc
+	generateFunc = func(_ context.Context, _ []crawl.ObservedRequest, _ pipeline.ScanOptions) ([]byte, string, bool, []crawl.ObservedRequest, error) {
+		return spec, apiType, foundWSDL, nil, err
 	}
-	t.Cleanup(func() { wsdlResolveFunc = orig })
-}
-
-// stubJSAnalyze replaces jsAnalyzeFunc and registers Cleanup to restore it.
-// The supplied fn receives the request slice passed to the seam and returns
-// the (possibly augmented) slice that the pipeline should continue with.
-func stubJSAnalyze(t *testing.T, fn func(requests []crawl.ObservedRequest) []crawl.ObservedRequest) {
-	t.Helper()
-	orig := jsAnalyzeFunc
-	jsAnalyzeFunc = func(_ context.Context, requests []crawl.ObservedRequest) []crawl.ObservedRequest {
-		return fn(requests)
-	}
-	t.Cleanup(func() { jsAnalyzeFunc = orig })
+	t.Cleanup(func() { generateFunc = orig })
 }
 
 func collect(t *testing.T, c *Capability, ctx capability.ExecutionContext, input capmodel.WebApplication) (webpages []capmodel.Webpage, webApps []capmodel.WebApplication, err error) {
@@ -310,22 +288,25 @@ func TestInvoke_CrawlMode_ErrorPropagation(t *testing.T) {
 	assert.Contains(t, err.Error(), "connection refused")
 }
 
-// TEST-001: the jsAnalyzeFunc seam is wired into Invoke — its output (not the
-// pre-augmentation slice) is what flows downstream to webpage emission. The
-// stub injects a synthetic request and we assert it surfaces as a Webpage.
-func TestInvoke_CrawlMode_AppliesJSAnalyzeSeam(t *testing.T) {
+// TEST-001: pipeline.Augment's idempotency guard — when crawlFunc returns a
+// request with Source=SourceStaticJS, AnyStaticSource is true so the JS
+// analysis stage is skipped entirely. The pre-seeded request must still flow
+// downstream and be emitted as a Webpage (the JS augmentation path inside
+// Invoke does not erase existing static-js requests).
+func TestInvoke_CrawlMode_JSStaticSourceFlowsThroughAugment(t *testing.T) {
+	// Seed crawl with a request that already carries a JS-static source.
+	// Augment's idempotency guard (crawl.AnyStaticSource) will skip jsstatic.Analyze,
+	// so no network I/O occurs. The request must still be emitted as a Webpage.
 	stubCrawl(t, []crawl.ObservedRequest{
 		{Method: "GET", URL: "https://x.com/index", PageURL: "https://x.com/index", Response: crawl.ObservedResponse{StatusCode: 200}},
-	}, nil)
-	stubJSAnalyze(t, func(requests []crawl.ObservedRequest) []crawl.ObservedRequest {
-		return append(requests, crawl.ObservedRequest{
+		{
 			Method:   "GET",
 			URL:      "https://x.com/api/from-js",
 			PageURL:  "https://x.com/api/from-js",
 			Source:   crawl.SourceStaticJS,
 			Response: crawl.ObservedResponse{StatusCode: 200},
-		})
-	})
+		},
+	}, nil)
 
 	c := &Capability{}
 	webpages, _, err := collect(t, c, ctxWithParams("mode", "crawl"), seedApp("https://x.com"))
@@ -335,17 +316,22 @@ func TestInvoke_CrawlMode_AppliesJSAnalyzeSeam(t *testing.T) {
 	for _, w := range webpages {
 		urls = append(urls, w.URL)
 	}
-	assert.Contains(t, urls, "https://x.com/api/from-js", "seam-injected request must flow into emitted webpages")
+	assert.Contains(t, urls, "https://x.com/api/from-js", "JS-static-sourced request must flow through Augment and be emitted as a Webpage")
 }
 
-// TEST-001: defaultJSAnalyze short-circuits (no network, returns input
-// unchanged) when the capture already carries JS-static sources.
-func TestDefaultJSAnalyze_ShortCircuitsOnExistingStaticSource(t *testing.T) {
+// TEST-001: pipeline.AnalyzeJS short-circuits (returns input unchanged) when
+// the capture already carries a JS-static source — the idempotency guard means
+// running crawl | generate is byte-identical to running scan directly.
+func TestAugment_SkipsJSAnalysisWhenStaticSourcePresent(t *testing.T) {
 	in := []crawl.ObservedRequest{
 		{Method: "GET", URL: "https://x.com/api", Source: crawl.SourceStaticJS, Response: crawl.ObservedResponse{StatusCode: 200}},
 	}
-	out := defaultJSAnalyze(context.Background(), in)
-	assert.Equal(t, in, out, "must return the input unchanged when a JS-static source is already present")
+	out := pipeline.AnalyzeJS(context.Background(), in, pipeline.AugmentOptions{
+		AnalyzeJS:       true,
+		FetchSourcemaps: false,
+		AllowPrivate:    false,
+	})
+	assert.Equal(t, in, out, "AnalyzeJS must return the input unchanged when a JS-static source is already present")
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +343,7 @@ func TestInvoke_ScanMode_RESTTrafficEmitsOpenAPISpec(t *testing.T) {
 		{
 			Method: "GET",
 			URL:    "https://x.com/api/v1/users",
+			Source: crawl.SourceStaticJS, // idempotency guard: skip jsstatic.Analyze
 			Response: crawl.ObservedResponse{
 				StatusCode:  200,
 				ContentType: "application/json",
@@ -365,7 +352,7 @@ func TestInvoke_ScanMode_RESTTrafficEmitsOpenAPISpec(t *testing.T) {
 			},
 		},
 	}, nil)
-	stubWSDLProbe(t, nil, false, "")
+	stubGenerate(t, []byte(`openapi: "3.0"`), pipeline.APITypeREST, false, nil)
 
 	c := &Capability{}
 	ctx := ctxWithParams("mode", "scan", "api_type", "rest", "probe", "false")
@@ -378,28 +365,12 @@ func TestInvoke_ScanMode_RESTTrafficEmitsOpenAPISpec(t *testing.T) {
 }
 
 func TestInvoke_ScanMode_WSDLPromotionFromREST(t *testing.T) {
-	wsdlBody := []byte(`<?xml version="1.0"?>
-<definitions name="Calculator"
-  xmlns="http://schemas.xmlsoap.org/wsdl/"
-  xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"
-  xmlns:tns="http://example.com/"
-  targetNamespace="http://example.com/">
-  <message name="AddRequest"><part name="parameters" element="tns:Add"/></message>
-  <message name="AddResponse"><part name="parameters" element="tns:AddResponse"/></message>
-  <portType name="CalculatorPortType">
-    <operation name="Add">
-      <input message="tns:AddRequest"/>
-      <output message="tns:AddResponse"/>
-    </operation>
-  </portType>
-</definitions>`)
 	stubCrawl(t, []crawl.ObservedRequest{
-		{Method: "GET", URL: "https://x.com/api", Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte("{}")}},
+		{Method: "GET", URL: "https://x.com/api", Source: crawl.SourceStaticJS, Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte("{}")}},
 	}, nil)
-	stubWSDLProbe(t, []crawl.ObservedRequest{
-		{Method: "GET", URL: "https://x.com/api", Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte("{}")}},
-		{Method: "GET", URL: "https://x.com/?wsdl", Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "text/xml", Body: wsdlBody}},
-	}, true, pipeline.APITypeWSDL)
+	// generateFunc stub returns apiType=WSDL and a non-empty spec to simulate
+	// the REST→WSDL promotion path inside ResolveAndGenerate.
+	stubGenerate(t, []byte(`<?xml version="1.0"?><definitions/>`), pipeline.APITypeWSDL, true, nil)
 
 	c := &Capability{}
 	ctx := ctxWithParams("mode", "scan", "api_type", "rest", "probe", "false")
@@ -425,11 +396,14 @@ func TestInvoke_ScanMode_NoTrafficEmitsNoWebApplication(t *testing.T) {
 
 func TestInvoke_ScanMode_PipelineErrorReturnsNoSpec(t *testing.T) {
 	stubCrawl(t, []crawl.ObservedRequest{
-		{Method: "GET", URL: "https://x.com/api", Response: crawl.ObservedResponse{StatusCode: 200}},
+		{Method: "GET", URL: "https://x.com/api", PageURL: "https://x.com/api", Source: crawl.SourceStaticJS, Response: crawl.ObservedResponse{StatusCode: 200}},
 	}, nil)
+	// Stub generateFunc to return an error — runScan must swallow it (logs a
+	// warning), emit no WebApplication, and return nil from Invoke.
+	stubGenerate(t, nil, "rest", false, errors.New("classify failed"))
 
 	c := &Capability{}
-	ctx := ctxWithParams("mode", "scan", "api_type", "frobnitz", "probe", "false")
+	ctx := ctxWithParams("mode", "scan", "api_type", "rest", "probe", "false")
 	webpages, webApps, err := collect(t, c, ctx, seedApp("https://x.com"))
 
 	require.NoError(t, err)
@@ -442,6 +416,7 @@ func TestInvoke_ScanMode_ExplicitGraphQLTypeEmitsGraphQLSpec(t *testing.T) {
 		{
 			Method: "POST",
 			URL:    "https://x.com/graphql",
+			Source: crawl.SourceStaticJS, // idempotency guard: skip jsstatic.Analyze
 			Headers: map[string]string{
 				"Content-Type": "application/json",
 			},
@@ -454,6 +429,7 @@ func TestInvoke_ScanMode_ExplicitGraphQLTypeEmitsGraphQLSpec(t *testing.T) {
 			},
 		},
 	}, nil)
+	stubGenerate(t, []byte(`type Query { user(id: ID!): User }`), pipeline.APITypeGraphQL, false, nil)
 
 	c := &Capability{}
 	ctx := ctxWithParams("mode", "scan", "api_type", "graphql", "probe", "false")

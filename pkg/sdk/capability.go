@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 	"net/url"
@@ -30,8 +29,6 @@ import (
 	"github.com/praetorian-inc/capability-sdk/pkg/capmodel"
 
 	"github.com/praetorian-inc/vespasian/internal/pipeline"
-	"github.com/praetorian-inc/vespasian/pkg/analyze"
-	"github.com/praetorian-inc/vespasian/pkg/analyze/jsstatic"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
@@ -42,14 +39,11 @@ var _ capability.Capability[capmodel.WebApplication] = (*Capability)(nil)
 // real browser. Signature matches defaultCrawl; tests replace it with a stub.
 var crawlFunc func(ctx context.Context, opts crawl.CrawlerOptions, target string) ([]crawl.ObservedRequest, error) = defaultCrawl
 
-// wsdlResolveFunc is a package-level seam that tests can swap to avoid making a
-// real network call when exercising the WSDL-discovery branch in runScan. It
-// wraps pipeline.ResolveWSDLType, which gates the probe on the probe flag.
-var wsdlResolveFunc func(ctx context.Context, targetURL, apiType string, requests []crawl.ObservedRequest, probe, allowPrivate bool, status io.Writer) ([]crawl.ObservedRequest, string, bool) = pipeline.ResolveWSDLType
-
-// jsAnalyzeFunc is a package-level seam that tests can swap to avoid network
-// I/O when exercising the JS-static-analysis augmentation in Invoke.
-var jsAnalyzeFunc func(ctx context.Context, requests []crawl.ObservedRequest) []crawl.ObservedRequest = defaultJSAnalyze
+// generateFunc is a package-level seam that tests can swap to avoid network I/O
+// when exercising the classify → probe → generate phase in runScan. It wraps
+// pipeline.ResolveAndGenerate, which detects the API type, resolves WSDL, and
+// produces the spec.
+var generateFunc = pipeline.ResolveAndGenerate
 
 // Capability implements capability.Capability[capmodel.WebApplication] and
 // exposes the vespasian crawl → classify → probe → generate pipeline through
@@ -132,8 +126,12 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 
 	// Augment with static HTML form analysis, then JS bundle analysis
 	// (mirrors the CLI scan pipeline's forms-then-jsstatic order).
-	requests = append(requests, analyze.ExtractForms(requests)...)
-	requests = jsAnalyzeFunc(context.Background(), requests)
+	requests = pipeline.Augment(context.Background(), requests, pipeline.AugmentOptions{
+		AnalyzeJS:       true,
+		FetchSourcemaps: true,
+		AllowPrivate:    false,
+		// Status nil — SDK stays quiet (matches prior behavior; best-effort).
+	})
 
 	// Group requests by page URL and emit Webpage entries (filter static assets).
 	parent := capmodel.WebApplication{PrimaryURL: input.PrimaryURL, Name: input.Name}
@@ -174,27 +172,26 @@ func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.O
 	probeEnabled := parseProbeEnabled(ctx.Parameters)
 
 	apiType, _ := ctx.Parameters.GetString("api_type")
-	if apiType == "" || apiType == pipeline.APITypeAuto {
-		apiType = pipeline.DetectAPIType(requests, confidence)
-	}
 
-	// Conditionally probe <primaryURL>?wsdl and promote the API type to WSDL on
-	// success. Gated by the probe flag; SSRF protection stays on (allowPrivate
-	// is forced false). SOAP services often return HTML for browser GETs, so
-	// active probing is the reliable discovery method.
+	// ResolveAndGenerate detects the API type (when apiType is "" or "auto"),
+	// conditionally probes <primaryURL>?wsdl and promotes to WSDL on success,
+	// then classifies, probes, and generates the spec. WSDL discovery is gated
+	// by the probe flag; SSRF protection stays on (allowPrivate forced false).
+	// SOAP services often return HTML for browser GETs, so active probing is the
+	// reliable discovery method.
 	//
 	// TODO: propagate ctx from ExecutionContext once capability-sdk exposes a
-	// context.Context (see doc.go) — wsdlResolveFunc and ClassifyProbeGenerate
-	// below run on context.Background() and cannot be canceled cooperatively.
-	requests, apiType, _ = wsdlResolveFunc(context.Background(), input.PrimaryURL, apiType, requests, probeEnabled, false, nil)
-
-	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+	// context.Context (see doc.go) — generateFunc below runs on
+	// context.Background() and cannot be canceled cooperatively.
+	spec, apiType, _, _, err := generateFunc(context.Background(), requests, pipeline.ScanOptions{
+		TargetURL:    input.PrimaryURL,
 		APIType:      apiType,
 		Confidence:   confidence,
 		Probe:        probeEnabled,
 		Deduplicate:  true,
 		AllowPrivate: false,
 		Status:       nil,
+		AfterWSDL:    nil,
 	})
 	if err != nil {
 		slog.Warn("vespasian: classify/generate failed", "target", input.PrimaryURL, "error", err)
@@ -221,28 +218,6 @@ func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.O
 func defaultCrawl(ctx context.Context, opts crawl.CrawlerOptions, target string) ([]crawl.ObservedRequest, error) {
 	c := crawl.NewCrawler(opts)
 	return c.Crawl(ctx, target)
-}
-
-// defaultJSAnalyze runs jsstatic.Analyze as a best-effort augmentation,
-// mirroring the CLI scan pipeline (cmd/vespasian runJSAnalysisStage): it
-// recovers API endpoints from captured JS bundles and their sourcemaps.
-// Errors are non-fatal — best-effort enrichment must never fail the pipeline.
-// Re-analysis is skipped when the capture already carries JS-static sources.
-// SSRF protection stays enabled (AllowPrivate:false) to match the SDK's
-// hard-coded posture; sourcemap fetching mirrors the CLI scan default (true).
-func defaultJSAnalyze(ctx context.Context, requests []crawl.ObservedRequest) []crawl.ObservedRequest {
-	if crawl.AnyStaticSource(requests) {
-		return requests
-	}
-	res, err := jsstatic.Analyze(ctx, requests, jsstatic.Options{
-		FetchSourcemaps: true,
-		AllowPrivate:    false,
-	})
-	if err != nil {
-		slog.Warn("vespasian: js-static analysis failed", "error", err)
-		return requests
-	}
-	return res.Requests
 }
 
 // crawlOptsFromCtx extracts and validates crawl options from the execution context.
