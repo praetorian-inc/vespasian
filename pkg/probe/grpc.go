@@ -147,7 +147,7 @@ func grpcTarget(rawURL string) (grpcTargetInfo, error) {
 		}
 	}
 	if !explicitPort {
-		slog.Debug("grpc target: no explicit port, assuming default", "scheme", u.Scheme, "port", port, "url", rawURL) //nolint:gosec // G706: debug diagnostic of capture-derived URL; not a security-sensitive sink
+		slog.Debug("grpc target: no explicit port, assuming default", "scheme", u.Scheme, "port", port, "url", rawURL) // #nosec G706 -- debug diagnostic of capture-derived URL; not a security-sensitive sink
 	}
 	return grpcTargetInfo{hostPort: net.JoinHostPort(host, port), useTLS: useTLS}, nil
 }
@@ -215,7 +215,7 @@ func (p *GRPCProbe) dialGRPC(t grpcTargetInfo) (*grpc.ClientConn, error) {
 	if t.useTLS {
 		creds = credentials.NewTLS(&tls.Config{
 			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: p.config.GRPCInsecureSkipVerify, //nolint:gosec // G402: opt-in only (default verifies); SSRF is enforced by the Dialer
+			InsecureSkipVerify: p.config.GRPCInsecureSkipVerify, // #nosec G402 -- opt-in only (default verifies); SSRF is enforced by the Dialer
 		})
 	} else {
 		creds = insecure.NewCredentials()
