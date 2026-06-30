@@ -133,6 +133,68 @@ func TestGenerateSpec_MergeSlugsWiring(t *testing.T) {
 	require.Contains(t, onStr, "/api/users/{userId}")
 }
 
+// TestValidateSlugThreshold covers the wsdl/graphql exemption and the
+// apiType x mergeSlugs x threshold matrix for the slug-threshold guard.
+func TestValidateSlugThreshold(t *testing.T) {
+	tests := []struct {
+		name          string
+		apiType       string
+		mergeSlugs    bool
+		slugThreshold int
+		wantErr       bool
+	}{
+		{"rest merge threshold 1 rejected", apiTypeREST, true, 1, true},
+		{"rest merge threshold 0 rejected", apiTypeREST, true, 0, true},
+		{"rest merge threshold 2 ok", apiTypeREST, true, 2, false},
+		{"rest merge off threshold 1 ignored", apiTypeREST, false, 1, false},
+		{"auto merge threshold 1 rejected (avoids wasted crawl)", apiTypeAuto, true, 1, true},
+		{"wsdl merge threshold 1 exempt", apiTypeWSDL, true, 1, false},
+		{"graphql merge threshold 1 exempt", apiTypeGraphQL, true, 1, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSlugThreshold(tt.apiType, tt.mergeSlugs, tt.slugThreshold)
+			if tt.wantErr {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "--slug-threshold must be >= 2")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestGenerateCmdRun_RejectsSlugThresholdBeforeFileIO proves the slug-threshold
+// guard fires before the capture file is opened: the missing file never
+// produces an open error because validation rejects the flag first.
+func TestGenerateCmdRun_RejectsSlugThresholdBeforeFileIO(t *testing.T) {
+	cmd := &GenerateCmd{
+		APIType:     apiTypeREST,
+		Capture:     filepath.Join(t.TempDir(), "does-not-exist.json"),
+		SlugOptions: SlugOptions{MergeSlugs: true, SlugThreshold: 1},
+	}
+	err := cmd.Run()
+	require.Error(t, err)
+	// Early-validation contract: fail on the flag before touching the (missing) file.
+	require.Contains(t, err.Error(), "--slug-threshold must be >= 2")
+	require.NotContains(t, err.Error(), "open capture file")
+}
+
+// TestScanCmdRun_RejectsSlugThresholdBeforeCrawl proves the slug-threshold
+// guard fires before any browser/crawl. The URL is valid, so validateURL
+// passes; a valid URL ordered after the crawl would attempt a real crawl
+// instead of returning the slug error fast.
+func TestScanCmdRun_RejectsSlugThresholdBeforeCrawl(t *testing.T) {
+	cmd := &ScanCmd{
+		URL:         "https://example.com",
+		APIType:     apiTypeAuto,
+		SlugOptions: SlugOptions{MergeSlugs: true, SlugThreshold: 1},
+	}
+	err := cmd.Run()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "--slug-threshold must be >= 2")
+}
+
 func TestValidateURL(t *testing.T) {
 	tests := []struct {
 		name    string
