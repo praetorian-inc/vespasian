@@ -38,21 +38,22 @@ import (
 // siblingSlugRequests returns two sibling REST requests whose only varying
 // path segment looks like a content slug. Default normalization keeps both
 // paths; --merge-slugs collapses them to /api/posts/{postSlug}.
-func siblingSlugRequests() []crawl.ObservedRequest {
-	mk := func(url string) crawl.ObservedRequest {
-		return crawl.ObservedRequest{
-			Method:  "GET",
-			URL:     url,
-			Headers: map[string]string{"Content-Type": "application/json"},
-			Response: crawl.ObservedResponse{
-				StatusCode:  200,
-				ContentType: "application/json",
-			},
-		}
+func jsonGetRequest(url string) crawl.ObservedRequest {
+	return crawl.ObservedRequest{
+		Method:  "GET",
+		URL:     url,
+		Headers: map[string]string{"Content-Type": "application/json"},
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "application/json",
+		},
 	}
+}
+
+func siblingSlugRequests() []crawl.ObservedRequest {
 	return []crawl.ObservedRequest{
-		mk("https://example.com/api/posts/hello-world"),
-		mk("https://example.com/api/posts/my-trip"),
+		jsonGetRequest("https://example.com/api/posts/hello-world"),
+		jsonGetRequest("https://example.com/api/posts/my-trip"),
 	}
 }
 
@@ -87,8 +88,14 @@ func TestGenerateSpec_SlugThresholdValidation(t *testing.T) {
 // TestGenerateSpec_MergeSlugsWiring proves the --merge-slugs flag flows
 // cmd -> generateSpec -> GetWithOptions -> generator and changes the output.
 func TestGenerateSpec_MergeSlugsWiring(t *testing.T) {
-	requests := siblingSlugRequests()
+	// Include numeric-ID siblings to prove regex ID normalization is always
+	// on, independent of --merge-slugs, through the full CLI wiring.
+	requests := append(siblingSlugRequests(),
+		jsonGetRequest("https://example.com/api/users/42"),
+		jsonGetRequest("https://example.com/api/users/99"),
+	)
 
+	// SlugThreshold intentionally omitted: it is ignored when MergeSlugs is false.
 	off, err := generateSpec(context.Background(), requests, generateSpecOptions{
 		APIType:     "rest",
 		Confidence:  0.5,
@@ -101,6 +108,7 @@ func TestGenerateSpec_MergeSlugsWiring(t *testing.T) {
 	require.Contains(t, offStr, "/api/posts/hello-world")
 	require.Contains(t, offStr, "/api/posts/my-trip")
 	require.NotContains(t, offStr, "{postSlug}")
+	require.Contains(t, offStr, "/api/users/{userId}")
 
 	on, err := generateSpec(context.Background(), requests, generateSpecOptions{
 		APIType:       "rest",
