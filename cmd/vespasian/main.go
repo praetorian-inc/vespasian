@@ -498,7 +498,7 @@ type GenerateCmd struct {
 	Capture               string  `arg:"" help:"Capture file path"`
 	Output                string  `short:"o" help:"Output file path"`
 	Confidence            float64 `default:"0.5" help:"Minimum confidence threshold"`
-	Probe                 bool    `default:"true" help:"Enable endpoint probing"`
+	Probe                 bool    `default:"true" help:"Enable active probing of classified endpoints (OPTIONS/schema/WSDL-fetch/GraphQL introspection). Note: JS-bundle replay extraction runs only in 'scan', which has a live target URL to re-fetch bundles from; 'generate' works offline from an existing capture and cannot run it."`
 	Deduplicate           bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
 	DangerousAllowPrivate bool    `help:"Disable SSRF protection on the probe path (OPTIONS/schema/WSDL-fetch/GraphQL introspection) for private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 	Verbose               bool    `short:"v" help:"Enable verbose logging"`
@@ -685,6 +685,19 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	genCtx, genStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer genStop()
 
+	// Replay JS-extracted URLs with raw HTTP to bypass SPA catch-all routing.
+	// URLs extracted from JavaScript bundles are visited by the headless browser,
+	// which gets the SPA shell (index.html) instead of the API response. Re-fetching
+	// them with a direct HTTP request reaches the actual API backend. Gated on
+	// c.Probe so --probe=false stays passive (see maybeReplayJSExtracted).
+	requests = maybeReplayJSExtracted(genCtx, requests, c.Probe, crawl.JSReplayConfig{
+		Headers:      bs.opts.Headers,
+		TargetURL:    c.URL,
+		AllowPrivate: c.DangerousAllowPrivate,
+		Verbose:      c.Verbose,
+		Stderr:       os.Stderr,
+	})
+
 	spec, err := generateSpec(genCtx, requests, generateSpecOptions{
 		APIType:      apiType,
 		Confidence:   c.Confidence,
@@ -723,6 +736,23 @@ func main() {
 	}
 	err := ctx.Run()
 	ctx.FatalIfErrorf(err)
+}
+
+// maybeReplayJSExtracted is the probe-gated wrapper around
+// crawl.ReplayJSExtracted. When probe is false, it returns requests unchanged
+// without making any outbound HTTP — preserving the user's --probe=false
+// expectation that the scan stays passive (capture-only). When probe is true,
+// it forwards to crawl.ReplayJSExtracted with the supplied config.
+//
+// Pulled out of ScanCmd.Run so the gate's contract is unit-testable without
+// standing up a headless browser. A regression that calls
+// crawl.ReplayJSExtracted directly (bypassing this gate) would re-introduce
+// the surprise outbound HTTP behavior CodeRabbit flagged in iter-12 (CR-1).
+func maybeReplayJSExtracted(ctx context.Context, requests []crawl.ObservedRequest, probe bool, cfg crawl.JSReplayConfig) []crawl.ObservedRequest {
+	if !probe {
+		return requests
+	}
+	return crawl.ReplayJSExtracted(ctx, requests, cfg)
 }
 
 // generateSpecOptions holds parameters for generateSpec, avoiding consecutive
