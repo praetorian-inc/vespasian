@@ -13,9 +13,9 @@
 // limitations under the License.
 
 // Package grpcwire parses the gRPC length-prefixed framing and the protobuf
-// wire format used inside it. Used by the classifier (confidence boost when
-// observed bodies parse as valid framed protobuf) and by the gRPC generator
-// (traffic-based RPC inference when reflection is unavailable).
+// wire format used inside it. It is foundation for a future traffic-based
+// RPC inference path and is not yet wired into the classifier, probe, or
+// generator, which currently rely on server-reflection descriptors.
 //
 // Reference: https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md
 package grpcwire

@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 )
 
 // Confidence scores for gRPC classification signals.
@@ -110,14 +111,7 @@ func (c *GRPCClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 // (application/grpc, application/grpc+proto, application/grpc+json,
 // application/grpc-web, application/grpc-web+proto, ...).
 func hasGRPCContentType(ct string) bool {
-	if ct == "" {
-		return false
-	}
-	lower := strings.ToLower(ct)
-	if idx := strings.Index(lower, ";"); idx != -1 {
-		lower = strings.TrimSpace(lower[:idx])
-	}
-	return strings.HasPrefix(lower, "application/grpc")
+	return strings.HasPrefix(mediatype.Base(ct), "application/grpc")
 }
 
 // hasGRPCTrailerHeader reports whether headers contain grpc-status or
