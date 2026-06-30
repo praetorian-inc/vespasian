@@ -133,6 +133,7 @@ func grpcTarget(rawURL string) (grpcTargetInfo, error) {
 		return grpcTargetInfo{}, fmt.Errorf("empty host in URL %q", rawURL)
 	}
 	port := u.Port()
+	explicitPort := port != ""
 	var useTLS bool
 	switch u.Scheme {
 	case "https", "grpcs":
@@ -144,6 +145,9 @@ func grpcTarget(rawURL string) (grpcTargetInfo, error) {
 		if port == "" {
 			port = "80"
 		}
+	}
+	if !explicitPort {
+		slog.Debug("grpc target: no explicit port, assuming default", "scheme", u.Scheme, "port", port, "url", rawURL) //nolint:gosec // G706: debug diagnostic of capture-derived URL; not a security-sensitive sink
 	}
 	return grpcTargetInfo{hostPort: net.JoinHostPort(host, port), useTLS: useTLS}, nil
 }
@@ -187,17 +191,31 @@ func (p *GRPCProbe) probeTarget(ctx context.Context, t grpcTargetInfo) *classify
 		return nil
 	}
 
+	reqCtx, cancel := context.WithTimeout(ctx, p.config.Timeout)
+	defer cancel()
+
+	conn, err := p.dialGRPC(t)
+	if err != nil {
+		slog.DebugContext(ctx, "grpc probe: dial setup failed", "target", t.hostPort, "error", err)
+		return nil
+	}
+	defer conn.Close() //nolint:errcheck // best-effort close
+
+	client := grpcreflect.NewClientAuto(reqCtx, conn)
+	defer client.Reset()
+
+	return runReflection(ctx, client, t)
+}
+
+// dialGRPC builds transport credentials (TLS honoring the configured
+// GRPCInsecureSkipVerify, or cleartext) wrapped with the SSRF-safe Dialer, and
+// returns a grpc.NewClient connection for the target.
+func (p *GRPCProbe) dialGRPC(t grpcTargetInfo) (*grpc.ClientConn, error) {
 	var creds credentials.TransportCredentials
 	if t.useTLS {
-		// Enumeration probe: internal/self-hosted gRPC services routinely
-		// present self-signed or internal-CA certificates. Verifying the
-		// trust chain adds no enumeration value and would silently drop those
-		// targets. SSRF protection is enforced separately by the configured
-		// Dialer (re-resolves and re-checks the IP at connect time), not by
-		// the TLS trust chain.
 		creds = credentials.NewTLS(&tls.Config{
 			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: true, //nolint:gosec // G402: enumeration probe; trust chain is not the control, SSRF is handled by the Dialer
+			InsecureSkipVerify: p.config.GRPCInsecureSkipVerify, //nolint:gosec // G402: opt-in only (default verifies); SSRF is enforced by the Dialer
 		})
 	} else {
 		creds = insecure.NewCredentials()
@@ -210,22 +228,17 @@ func (p *GRPCProbe) probeTarget(ctx context.Context, t grpcTargetInfo) *classify
 		return p.config.Dialer(ctx, "tcp", addr)
 	}
 
-	reqCtx, cancel := context.WithTimeout(ctx, p.config.Timeout)
-	defer cancel()
-
-	conn, err := grpc.NewClient(t.hostPort,
+	return grpc.NewClient(t.hostPort,
 		grpc.WithTransportCredentials(creds),
 		grpc.WithContextDialer(dialer),
 	)
-	if err != nil {
-		slog.DebugContext(ctx, "grpc probe: dial setup failed", "target", t.hostPort, "error", err)
-		return nil
-	}
-	defer conn.Close() //nolint:errcheck // best-effort close
+}
 
-	client := grpcreflect.NewClientAuto(reqCtx, conn)
-	defer client.Reset()
-
+// runReflection lists the target's services and walks each one's file
+// descriptors. It preserves probeTarget's three-outcome contract: nil (no gRPC
+// signal), ReflectionEnabled=false with a reason (structured unavailable), or
+// ReflectionEnabled=true with the discovered services and descriptors.
+func runReflection(ctx context.Context, client *grpcreflect.Client, t grpcTargetInfo) *classify.GRPCReflectionResult {
 	services, err := client.ListServices()
 	if err != nil {
 		slog.DebugContext(ctx, "grpc probe: list services failed", "target", t.hostPort, "error", err)

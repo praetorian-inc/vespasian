@@ -12,20 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package main provides a simple gRPC server for live testing of vespasian.
-//
-// Registers three reflectable services — UserService (with one server-stream),
-// OrderService, and AccountService — defined in lab.proto. Server Reflection
-// is enabled so vespasian's GRPCProbe can enumerate everything end-to-end.
-//
-// Usage:
-//
-//	go run ./test/grpc-server                # listens on :50051 (or $GRPC_PORT)
-//	./grpc-server -port 8993                 # override port via flag
-//
-// Validate with:
-//
-//	vespasian probe grpc reflection http://127.0.0.1:50051 --dangerous-allow-private
 package main
 
 import (

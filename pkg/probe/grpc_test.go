@@ -203,9 +203,10 @@ func TestGRPCProbe_Probe_SelfSignedTLS(t *testing.T) {
 	defer stop()
 
 	cfg := Config{
-		Timeout:      5 * time.Second,
-		URLValidator: func(string) error { return nil },
-		Dialer:       loopbackDialer,
+		Timeout:                5 * time.Second,
+		URLValidator:           func(string) error { return nil },
+		Dialer:                 loopbackDialer,
+		GRPCInsecureSkipVerify: true, // self-signed cert: opt in to skip trust-chain verification
 	}
 	probe := NewGRPCProbe(cfg)
 
@@ -360,6 +361,84 @@ func TestGRPCProbe_Probe_FailsClosedOnValidator(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, result, 1)
 	assert.Nil(t, result[0].GRPCSchema, "blocked target should not produce a schema")
+}
+
+// TestGRPCProbe_Probe_DedupsByTarget verifies that multiple endpoints sharing
+// the same host:port produce a single reflection call and that all matching
+// endpoints receive the SAME *classify.GRPCReflectionResult pointer (pointer
+// identity proves reflection ran once per target and the result was fanned out).
+func TestGRPCProbe_Probe_DedupsByTarget(t *testing.T) {
+	addr, stop := startTestGRPCServer(t)
+	defer stop()
+
+	cfg := Config{
+		Timeout:      5 * time.Second,
+		URLValidator: func(string) error { return nil },
+		Dialer:       loopbackDialer,
+	}
+	probe := NewGRPCProbe(cfg)
+
+	// Two endpoints on the same host:port but different URL paths.
+	endpoints := []classify.ClassifiedRequest{
+		{APIType: "grpc"},
+		{APIType: "grpc"},
+	}
+	endpoints[0].URL = "http://" + addr + "/lab.v1.UserService/GetUser"
+	endpoints[1].URL = "http://" + addr + "/lab.v1.OrderService/GetOrder"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := probe.Probe(ctx, endpoints)
+	require.NoError(t, err)
+	require.Len(t, result, 2)
+
+	schema0 := result[0].GRPCSchema
+	schema1 := result[1].GRPCSchema
+
+	require.NotNil(t, schema0, "first endpoint must have a GRPCSchema")
+	require.NotNil(t, schema1, "second endpoint must have a GRPCSchema")
+	assert.True(t, schema0.ReflectionEnabled, "reflection must be enabled")
+	assert.True(t, schema1.ReflectionEnabled, "reflection must be enabled")
+
+	// Pointer identity: both endpoints share the exact same result object,
+	// proving reflection ran once and the result was fanned out to all
+	// endpoints matching that target.
+	assert.Same(t, schema0, schema1, "both endpoints must share the same *GRPCReflectionResult pointer (reflection ran once)")
+}
+
+// TestGRPCProbe_Probe_TLSVerifiedByDefault verifies that a gRPC server
+// presenting a self-signed certificate is NOT enumerated when
+// GRPCInsecureSkipVerify is left at its default (false). The TLS handshake
+// fails certificate verification and the endpoint's GRPCSchema remains nil.
+// This is the secure-by-default complement to TestGRPCProbe_Probe_SelfSignedTLS.
+func TestGRPCProbe_Probe_TLSVerifiedByDefault(t *testing.T) {
+	addr, stop := startTestGRPCServerTLS(t)
+	defer stop()
+
+	// No GRPCInsecureSkipVerify set — defaults to false (verify certificate).
+	cfg := Config{
+		Timeout:      5 * time.Second,
+		URLValidator: func(string) error { return nil },
+		Dialer:       loopbackDialer,
+	}
+	probe := NewGRPCProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{APIType: "grpc"},
+	}
+	endpoints[0].URL = "https://" + addr + "/grpc.health.v1.Health/Check"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := probe.Probe(ctx, endpoints)
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+
+	// Self-signed cert fails verification: schema must be nil, documenting
+	// that the server was not enumerated.
+	assert.Nil(t, result[0].GRPCSchema, "self-signed cert must block enumeration when GRPCInsecureSkipVerify is false")
 }
 
 func TestGRPCTarget(t *testing.T) {

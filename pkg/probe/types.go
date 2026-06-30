@@ -50,6 +50,12 @@ type Config struct {
 	// default SSRF-safe dialer is used. Tests targeting loopback should set a
 	// plain net.Dialer.
 	Dialer func(ctx context.Context, network, addr string) (net.Conn, error)
+
+	// GRPCInsecureSkipVerify disables TLS certificate verification when the
+	// gRPC reflection probe dials a TLS target. Default false (verify). Enable
+	// only to enumerate self-signed/internal-CA targets you trust; SSRF is
+	// still enforced by the Dialer regardless.
+	GRPCInsecureSkipVerify bool
 }
 
 // DefaultMaxEndpoints is the default limit on unique URLs probed per strategy.

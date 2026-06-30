@@ -572,13 +572,28 @@ test_grpc_server() {
 
     log_header "Testing: grpc-server (${base_url})"
 
-    # Run gRPC reflection probe — vespasian writes a proto3 .proto file
-    log_info "Probing gRPC reflection at ${base_url}..."
-    if ! "$VESPASIAN" probe grpc reflection "$base_url" \
+    # Build a minimal synthetic capture so the classifier tags the request as
+    # gRPC and the reflection probe dials the correct host:port.
+    local capture_file="${target_dir}/capture.json"
+    cat > "$capture_file" << EOF
+[
+  {
+    "method": "POST",
+    "url": "${base_url}/lab.v1.UserService/GetUser",
+    "headers": { "content-type": "application/grpc" },
+    "response": { "status_code": 0, "content_type": "application/grpc" }
+  }
+]
+EOF
+
+    # Run generate grpc — vespasian classifies the capture, runs reflection,
+    # and writes a proto3 .proto file.
+    log_info "Generating gRPC .proto via reflection at ${base_url}..."
+    if ! "$VESPASIAN" generate grpc "$capture_file" \
         --dangerous-allow-private \
         -o "$spec_file" \
         ${verbose_flag:+"$verbose_flag"} 2>&1; then
-        log_fail "gRPC reflection probe failed"
+        log_fail "gRPC reflection generate failed"
         set_test_result "grpc-server" "FAIL" "?" "?" "$((SECONDS - start))"
         return 1
     fi

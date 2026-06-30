@@ -281,3 +281,152 @@ func TestGenerator_Generate_AllUnresolvableErrors(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "build descriptor graph")
 }
+
+// ordersFileDescriptorBytes builds a minimal FileDescriptorProto for a
+// DISJOINT file from fileDescriptorBytes: name "orders.proto", package
+// "orders.v1", messages GetOrderRequest/GetOrderResponse, and service
+// "OrderService" with rpc "GetOrder". Returns wire-format bytes.
+func ordersFileDescriptorBytes(t *testing.T) []byte {
+	t.Helper()
+	fdp := &descriptorpb.FileDescriptorProto{
+		Name:    proto.String("orders.proto"),
+		Package: proto.String("orders.v1"),
+		Syntax:  proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{
+			{
+				Name: proto.String("GetOrderRequest"),
+				Field: []*descriptorpb.FieldDescriptorProto{
+					{
+						Name:     proto.String("order_id"),
+						Number:   proto.Int32(1),
+						Type:     descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
+						Label:    descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+						JsonName: proto.String("orderId"),
+					},
+				},
+			},
+			{
+				Name: proto.String("GetOrderResponse"),
+				Field: []*descriptorpb.FieldDescriptorProto{
+					{
+						Name:     proto.String("status"),
+						Number:   proto.Int32(1),
+						Type:     descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
+						Label:    descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+						JsonName: proto.String("status"),
+					},
+				},
+			},
+		},
+		Service: []*descriptorpb.ServiceDescriptorProto{
+			{
+				Name: proto.String("OrderService"),
+				Method: []*descriptorpb.MethodDescriptorProto{
+					{
+						Name:       proto.String("GetOrder"),
+						InputType:  proto.String(".orders.v1.GetOrderRequest"),
+						OutputType: proto.String(".orders.v1.GetOrderResponse"),
+					},
+				},
+			},
+		},
+	}
+	raw, err := proto.Marshal(fdp)
+	require.NoError(t, err)
+	return raw
+}
+
+// TestGenerator_Generate_AggregatesAcrossEndpoints verifies that descriptors
+// from multiple endpoints are merged into a single output. Endpoint A carries
+// users.proto (UserService); endpoint B carries orders.proto (OrderService).
+// Both must appear in the generated .proto.
+func TestGenerator_Generate_AggregatesAcrossEndpoints(t *testing.T) {
+	g := &Generator{}
+	usersRaw := fileDescriptorBytes(t)
+	ordersRaw := ordersFileDescriptorBytes(t)
+
+	endpoints := []classify.ClassifiedRequest{
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors:   map[string][]byte{"users.proto": usersRaw},
+			},
+		},
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors:   map[string][]byte{"orders.proto": ordersRaw},
+			},
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	require.NoError(t, err)
+	output := string(out)
+
+	assert.Contains(t, output, "service UserService", "users.proto descriptor must be in output")
+	assert.Contains(t, output, "service OrderService", "orders.proto descriptor must be in output")
+}
+
+// TestGenerator_Generate_ConflictingDescriptorsError verifies that two
+// endpoints carrying the same filename but different bytes are rejected with a
+// "conflicting file descriptors" error.
+func TestGenerator_Generate_ConflictingDescriptorsError(t *testing.T) {
+	g := &Generator{}
+	usersRaw := fileDescriptorBytes(t)
+	ordersRaw := ordersFileDescriptorBytes(t)
+
+	// Both endpoints key their descriptor under "users.proto", but the bytes
+	// differ (endpoint B uses the orders descriptor under that name).
+	endpoints := []classify.ClassifiedRequest{
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors:   map[string][]byte{"users.proto": usersRaw},
+			},
+		},
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors:   map[string][]byte{"users.proto": ordersRaw},
+			},
+		},
+	}
+
+	_, err := g.Generate(endpoints)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "conflicting file descriptors")
+}
+
+// TestGenerator_Generate_IdenticalDescriptorsDedup verifies that two endpoints
+// carrying the same filename with identical bytes do not trigger a conflict —
+// the generator deduplicates them and produces valid output.
+func TestGenerator_Generate_IdenticalDescriptorsDedup(t *testing.T) {
+	g := &Generator{}
+	raw := fileDescriptorBytes(t)
+
+	endpoints := []classify.ClassifiedRequest{
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors:   map[string][]byte{"users.proto": raw},
+			},
+		},
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors:   map[string][]byte{"users.proto": raw},
+			},
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), "service UserService")
+}

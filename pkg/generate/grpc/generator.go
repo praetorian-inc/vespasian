@@ -141,59 +141,61 @@ func renderProto(fileDescriptors map[string][]byte) ([]byte, error) {
 // to skip, rather than discarding the entire result. Only when nothing
 // links does it surface the original strict error.
 func buildDescriptorGraph(fdProtos []*descriptorpb.FileDescriptorProto) (map[string]*desc.FileDescriptor, []string, error) {
-	if fds, err := desc.CreateFileDescriptorsFromSet(&descriptorpb.FileDescriptorSet{File: fdProtos}); err == nil {
+	fds, strictErr := desc.CreateFileDescriptorsFromSet(&descriptorpb.FileDescriptorSet{File: fdProtos})
+	if strictErr == nil {
 		return fds, nil, nil
-	} else {
-		strictErr := err
+	}
 
-		files := make(map[string]*descriptorpb.FileDescriptorProto, len(fdProtos))
-		for _, fdp := range fdProtos {
-			files[fdp.GetName()] = fdp
-		}
+	// Strict resolution failed (e.g. the probe truncated a large import graph
+	// and left a dangling import). Degrade to resolving each file
+	// independently.
+	files := make(map[string]*descriptorpb.FileDescriptorProto, len(fdProtos))
+	for _, fdp := range fdProtos {
+		files[fdp.GetName()] = fdp
+	}
 
-		resolved := map[string]*desc.FileDescriptor{}
-		var resolve func(name string, stack map[string]bool) (*desc.FileDescriptor, error)
-		resolve = func(name string, stack map[string]bool) (*desc.FileDescriptor, error) {
-			if fd, ok := resolved[name]; ok {
-				return fd, nil
-			}
-			if stack[name] {
-				return nil, fmt.Errorf("cyclic import involving %q", name)
-			}
-			fdp, ok := files[name]
-			if !ok {
-				return nil, fmt.Errorf("missing dependency %q", name)
-			}
-			stack[name] = true
-			deps := make([]*desc.FileDescriptor, 0, len(fdp.GetDependency()))
-			for _, dep := range fdp.GetDependency() {
-				d, err := resolve(dep, stack)
-				if err != nil {
-					delete(stack, name)
-					return nil, err
-				}
-				deps = append(deps, d)
-			}
-			delete(stack, name)
-			fd, err := desc.CreateFileDescriptor(fdp, deps...)
-			if err != nil {
-				return nil, err
-			}
-			resolved[name] = fd
+	resolved := map[string]*desc.FileDescriptor{}
+	var resolve func(name string, stack map[string]bool) (*desc.FileDescriptor, error)
+	resolve = func(name string, stack map[string]bool) (*desc.FileDescriptor, error) {
+		if fd, ok := resolved[name]; ok {
 			return fd, nil
 		}
-
-		var skipped []string
-		for name := range files {
-			if _, err := resolve(name, map[string]bool{}); err != nil {
-				skipped = append(skipped, name)
+		if stack[name] {
+			return nil, fmt.Errorf("cyclic import involving %q", name)
+		}
+		fdp, ok := files[name]
+		if !ok {
+			return nil, fmt.Errorf("missing dependency %q", name)
+		}
+		stack[name] = true
+		deps := make([]*desc.FileDescriptor, 0, len(fdp.GetDependency()))
+		for _, dep := range fdp.GetDependency() {
+			d, err := resolve(dep, stack)
+			if err != nil {
+				delete(stack, name)
+				return nil, err
 			}
+			deps = append(deps, d)
 		}
-		sort.Strings(skipped)
-
-		if len(resolved) == 0 {
-			return nil, nil, fmt.Errorf("build descriptor graph: %w", strictErr)
+		delete(stack, name)
+		fd, err := desc.CreateFileDescriptor(fdp, deps...)
+		if err != nil {
+			return nil, err
 		}
-		return resolved, skipped, nil
+		resolved[name] = fd
+		return fd, nil
 	}
+
+	var skipped []string
+	for name := range files {
+		if _, err := resolve(name, map[string]bool{}); err != nil {
+			skipped = append(skipped, name)
+		}
+	}
+	sort.Strings(skipped)
+
+	if len(resolved) == 0 {
+		return nil, nil, fmt.Errorf("build descriptor graph: %w", strictErr)
+	}
+	return resolved, skipped, nil
 }
