@@ -731,6 +731,19 @@ func TestCrawlOptions_Embedded(t *testing.T) {
 	}
 }
 
+// TestSlugOptions_Embedded verifies GenerateCmd and ScanCmd expose the embedded
+// SlugOptions fields directly, the promotion their Run() methods rely on to
+// forward c.MergeSlugs / c.SlugThreshold into generateSpec.
+func TestSlugOptions_Embedded(t *testing.T) {
+	g := &GenerateCmd{SlugOptions: SlugOptions{MergeSlugs: true, SlugThreshold: 4}}
+	require.True(t, g.MergeSlugs)
+	require.Equal(t, 4, g.SlugThreshold)
+
+	s := &ScanCmd{SlugOptions: SlugOptions{MergeSlugs: true, SlugThreshold: 7}}
+	require.True(t, s.MergeSlugs)
+	require.Equal(t, 7, s.SlugThreshold)
+}
+
 // TestDangerousAllowPrivate_GenerateSpec tests generateSpec with allowPrivate=true.
 func TestDangerousAllowPrivate_GenerateSpec(t *testing.T) {
 	requests := []crawl.ObservedRequest{
