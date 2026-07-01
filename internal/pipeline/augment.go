@@ -40,6 +40,12 @@ type AugmentOptions struct {
 	// Status is an optional io.Writer for the verbose js-static stats line.
 	// Pass nil to suppress.
 	Status io.Writer
+
+	// WarnError is an optional io.Writer for the (non-verbose-gated) js-static
+	// failure warning. It is written on analysis error regardless of verbosity,
+	// separate from Status (which carries the verbose success-stats line). Pass
+	// nil to stay fully quiet (e.g. the SDK).
+	WarnError io.Writer
 }
 
 // Augment runs the captured-request augmentation stages in the canonical order:
@@ -68,8 +74,11 @@ func Augment(ctx context.Context, requests []crawl.ObservedRequest, opts Augment
 // (possibly enriched) slice. When opts.AnalyzeJS is false, returns requests
 // unchanged. When the capture already carries a JS-static source, the analysis
 // is skipped (idempotency guard) so running crawl | generate is byte-identical
-// to running scan directly. Analysis errors are logged to opts.Status and
-// treated as a no-op (best-effort enrichment must never fail the pipeline).
+// to running scan directly. Analysis errors are treated as a no-op (best-effort
+// enrichment must never fail the pipeline); on error the failure warning is
+// written to opts.WarnError (regardless of verbosity), while the verbose
+// success-stats line is written to opts.Status. Both writers may be nil to
+// stay fully quiet (e.g. the SDK passes both nil).
 //
 // This is exposed separately from Augment because CrawlCmd runs only the JS
 // stage at crawl time, deferring static-HTML form extraction to generate time.
@@ -87,7 +96,7 @@ func AnalyzeJS(ctx context.Context, requests []crawl.ObservedRequest, opts Augme
 		AllowPrivate:    opts.AllowPrivate,
 	})
 	if err != nil {
-		writeStatus(opts.Status, "warning: js-static analysis failed: %v\n", err)
+		writeStatus(opts.WarnError, "warning: js-static analysis failed: %v\n", err)
 		return requests
 	}
 	writeStatus(opts.Status, "js-static: bundles=%d skipped=%d panics=%d, sourcemaps=%d, endpoints=%d\n",

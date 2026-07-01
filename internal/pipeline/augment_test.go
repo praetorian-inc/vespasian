@@ -167,3 +167,162 @@ func TestAugment_JSErrorIsNonFatal(t *testing.T) {
 		assert.False(t, crawl.IsJSStaticSource(r.Source), "no JS-static entries expected when analysis errors")
 	}
 }
+
+// jsOnlyCapture returns one HTML page and one JS bundle exercising fetch, with
+// no <form> element — so only the JS-static stage produces synthetic entries.
+// Used by the AnalyzeJS-direct tests (migrated from the CLI helper tests).
+func jsOnlyCapture() []crawl.ObservedRequest {
+	return []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/",
+			Source: "katana",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<html></html>`),
+			},
+		},
+		{
+			Method: "GET",
+			URL:    "https://example.com/app.js",
+			Source: "katana",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/javascript",
+				Body:        []byte(`fetch("/api/v1/users")`),
+			},
+		},
+	}
+}
+
+// TestAnalyzeJS_Enabled_AppendsStaticEntries verifies that AnalyzeJS (the
+// JS-only stage CrawlCmd runs at crawl time) hands the captured slice to
+// jsstatic.Analyze and returns an enriched slice with static:js entries
+// appended after the dynamic prefix (classify.Deduplicate relies on
+// first-write-wins, so dynamic entries must stay first). Migrated from the CLI
+// runJSAnalysisStage test.
+func TestAnalyzeJS_Enabled_AppendsStaticEntries(t *testing.T) {
+	captured := jsOnlyCapture()
+	out := pipeline.AnalyzeJS(context.Background(), captured, pipeline.AugmentOptions{
+		AnalyzeJS:    true,
+		AllowPrivate: true,
+	})
+
+	require.Greater(t, len(out), len(captured), "expected enriched slice longer than input")
+
+	var sawStatic bool
+	for i, r := range out {
+		if i < len(captured) {
+			assert.NotEqual(t, "static:js", r.Source, "static entry inside dynamic prefix at index %d", i)
+			continue
+		}
+		if r.Source == "static:js" {
+			sawStatic = true
+		}
+	}
+	assert.True(t, sawStatic, "expected at least one static:js entry appended after dynamic prefix")
+}
+
+// TestAnalyzeJS_Disabled_ShortCircuits verifies AnalyzeJS returns the input
+// slice unchanged when AnalyzeJS is false. Migrated from the CLI test.
+func TestAnalyzeJS_Disabled_ShortCircuits(t *testing.T) {
+	captured := jsOnlyCapture()
+	out := pipeline.AnalyzeJS(context.Background(), captured, pipeline.AugmentOptions{AnalyzeJS: false})
+
+	require.Len(t, out, len(captured), "expected unchanged slice")
+	for i := range out {
+		assert.Equal(t, captured[i].URL, out[i].URL, "entry %d URL mismatch", i)
+	}
+}
+
+// TestAnalyzeJS_AlreadyAnalyzed_SkipsReanalysis verifies the AnyStaticSource
+// idempotency guard at the AnalyzeJS-direct level: when the input already
+// carries a static:js entry, the stage must skip re-analysis and return the
+// slice unchanged even with AnalyzeJS=true, keeping crawl | generate
+// byte-identical to a single scan. Migrated from the CLI test.
+func TestAnalyzeJS_AlreadyAnalyzed_SkipsReanalysis(t *testing.T) {
+	captured := append(jsOnlyCapture(), crawl.ObservedRequest{
+		Method: "GET",
+		URL:    "https://example.com/api/v1/users",
+		Source: crawl.SourceStaticJS,
+	})
+	out := pipeline.AnalyzeJS(context.Background(), captured, pipeline.AugmentOptions{
+		AnalyzeJS:    true,
+		AllowPrivate: true,
+	})
+
+	require.Len(t, out, len(captured), "idempotency guard should skip re-analysis")
+	staticCount := 0
+	for _, r := range out {
+		if crawl.IsJSStaticSource(r.Source) {
+			staticCount++
+		}
+	}
+	assert.Equal(t, 1, staticCount, "expected exactly the pre-seeded static entry; guard failed to skip re-analysis")
+}
+
+// TestAnalyzeJS_ErrorPath_WarnErrorContract pins the exact warn-sink contract
+// this change builds. On JS-analysis error (pre-canceled ctx) AnalyzeJS returns
+// the ORIGINAL slice; the failure warning goes to WarnError (not Status) so the
+// CLI can warn-always while the SDK stays silent:
+//
+//   - WarnError set, Status nil (CLI quiet mode): warning IS written to WarnError.
+//   - Status set, WarnError nil: nothing written to Status on error (the failure
+//     warning no longer routes through the verbose Status writer).
+//   - Both nil (the SDK config): NOTHING written anywhere — SDK stays quiet.
+//
+// Migrated and extended from the CLI runJSAnalysisStage error-path test.
+func TestAnalyzeJS_ErrorPath_WarnErrorContract(t *testing.T) {
+	newCanceledCtx := func() context.Context {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return ctx
+	}
+
+	t.Run("WarnErrorSet_StatusNil_WritesWarningToWarnError", func(t *testing.T) {
+		var warn bytes.Buffer
+		captured := jsOnlyCapture()
+		out := pipeline.AnalyzeJS(newCanceledCtx(), captured, pipeline.AugmentOptions{
+			AnalyzeJS:    true,
+			AllowPrivate: true,
+			Status:       nil,
+			WarnError:    &warn,
+		})
+
+		require.Len(t, out, len(captured), "expected original slice on error")
+		for i := range out {
+			assert.Equal(t, captured[i].URL, out[i].URL, "entry %d URL mismatch", i)
+		}
+		assert.Contains(t, warn.String(), "warning: js-static analysis failed",
+			"failure warning must be written to WarnError even when Status is nil")
+	})
+
+	t.Run("StatusSet_WarnErrorNil_StatusStaysQuietOnError", func(t *testing.T) {
+		var status bytes.Buffer
+		out := pipeline.AnalyzeJS(newCanceledCtx(), jsOnlyCapture(), pipeline.AugmentOptions{
+			AnalyzeJS:    true,
+			AllowPrivate: true,
+			Status:       &status,
+			WarnError:    nil,
+		})
+
+		require.Len(t, out, len(jsOnlyCapture()), "expected original slice on error")
+		assert.NotContains(t, status.String(), "warning: js-static analysis failed",
+			"failure warning must NOT route through Status; it belongs on WarnError")
+	})
+
+	t.Run("BothNil_SDKConfig_NothingWrittenOnError", func(t *testing.T) {
+		// The SDK passes Status=nil and WarnError=nil. On error it must emit
+		// NOTHING. This asserts no panic and the original slice is returned;
+		// with both sinks nil there is nowhere for output to go.
+		captured := jsOnlyCapture()
+		out := pipeline.AnalyzeJS(newCanceledCtx(), captured, pipeline.AugmentOptions{
+			AnalyzeJS:    true,
+			AllowPrivate: true,
+			Status:       nil,
+			WarnError:    nil,
+		})
+		require.Len(t, out, len(captured), "expected original slice on error (SDK quiet config)")
+	})
+}

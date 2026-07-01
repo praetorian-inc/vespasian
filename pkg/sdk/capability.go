@@ -311,7 +311,7 @@ func emitWebpages(requests []crawl.ObservedRequest, parent capmodel.WebApplicati
 		if pageKey == "" {
 			pageKey = req.URL
 		}
-		if pipeline.IsStaticAssetURL(pageKey) {
+		if pageKey != req.URL && pipeline.IsStaticAssetURL(pageKey) {
 			continue
 		}
 		if _, seen := byURL[pageKey]; !seen {

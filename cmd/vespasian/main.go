@@ -32,8 +32,6 @@ import (
 	"github.com/alecthomas/kong"
 
 	"github.com/praetorian-inc/vespasian/internal/pipeline"
-	"github.com/praetorian-inc/vespasian/pkg/analyze"
-	"github.com/praetorian-inc/vespasian/pkg/analyze/jsstatic"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/importer"
 )
@@ -400,14 +398,15 @@ func (c *CrawlCmd) Run() error {
 
 	// NOTE: running `crawl` (with --analyze-js) followed by `generate` (also
 	// with --analyze-js, the default) does NOT re-analyze the same JS bundles.
-	// runJSAnalysisStage's idempotency guard (crawl.AnyStaticSource) detects the
+	// AnalyzeJS's idempotency guard (crawl.AnyStaticSource) detects the
 	// static:js entries this stage writes into the capture and short-circuits the
 	// second analysis, so `crawl | generate` is byte-identical to a single `scan`.
-	requests = runJSAnalysisStage(bs.ctx, requests, jsAnalysisArgs{
-		enabled:         c.AnalyzeJS,
-		fetchSourcemaps: c.FetchSourcemaps,
-		allowPrivate:    c.DangerousAllowPrivate,
-		verbose:         c.Verbose,
+	requests = pipeline.AnalyzeJS(bs.ctx, requests, pipeline.AugmentOptions{
+		AnalyzeJS:       c.AnalyzeJS,
+		FetchSourcemaps: c.FetchSourcemaps,
+		AllowPrivate:    c.DangerousAllowPrivate,
+		Status:          statusWriter(c.Verbose),
+		WarnError:       os.Stderr,
 	})
 
 	return writeOutput(c.Output, func(w io.Writer) error {
@@ -506,13 +505,14 @@ func (c *GenerateCmd) Run() (err error) {
 
 	// Augment captured requests with static-HTML form analysis + JS bundle
 	// static analysis in the canonical forms-then-jsstatic order (see
-	// augmentAll). Captures produced by crawl/import (which don't run form
+	// pipeline.Augment). Captures produced by crawl/import (which don't run form
 	// extraction inline) get the same treatment as captures produced by scan.
-	requests = augmentAll(ctx, requests, jsAnalysisArgs{
-		enabled:         c.AnalyzeJS,
-		fetchSourcemaps: c.FetchSourcemaps,
-		allowPrivate:    c.DangerousAllowPrivate,
-		verbose:         c.Verbose,
+	requests = pipeline.Augment(ctx, requests, pipeline.AugmentOptions{
+		AnalyzeJS:       c.AnalyzeJS,
+		FetchSourcemaps: c.FetchSourcemaps,
+		AllowPrivate:    c.DangerousAllowPrivate,
+		Status:          statusWriter(c.Verbose),
+		WarnError:       os.Stderr,
 	})
 
 	warnSSRFDisabled(c.DangerousAllowPrivate, c.Probe)
@@ -587,13 +587,15 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 
 	// Augment captured requests with static-HTML form analysis + JS bundle
 	// static analysis in the canonical forms-then-jsstatic order (see
-	// augmentAll). Same helper used by GenerateCmd.Run — the order contract
-	// is centralized to prevent the two commands from silently diverging.
-	requests = augmentAll(bs.ctx, requests, jsAnalysisArgs{
-		enabled:         c.AnalyzeJS,
-		fetchSourcemaps: c.FetchSourcemaps,
-		allowPrivate:    c.DangerousAllowPrivate,
-		verbose:         c.Verbose,
+	// pipeline.Augment). Same helper used by GenerateCmd.Run — the order
+	// contract is centralized to prevent the two commands from silently
+	// diverging.
+	requests = pipeline.Augment(bs.ctx, requests, pipeline.AugmentOptions{
+		AnalyzeJS:       c.AnalyzeJS,
+		FetchSourcemaps: c.FetchSourcemaps,
+		AllowPrivate:    c.DangerousAllowPrivate,
+		Status:          statusWriter(c.Verbose),
+		WarnError:       os.Stderr,
 	})
 
 	// Resolve the API type up front (when auto) so the verbose "detected API
@@ -627,8 +629,9 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	// sequence. The afterWSDL hook keeps JS-replay in its CLI-specific position:
 	// after WSDL resolution and before classification. JS-replay re-fetches
 	// bundle-extracted URLs with raw HTTP to bypass SPA catch-all routing; it is
-	// gated on c.Probe so --probe=false stays passive (see maybeReplayJSExtracted)
-	// and is CLI-only (the SDK passes a nil AfterWSDL hook).
+	// gated on both c.AnalyzeJS (so --analyze-js=false suppresses the JS-bundle
+	// rescan) and c.Probe (so --probe=false stays passive — see
+	// maybeReplayJSExtracted), and is CLI-only (the SDK passes a nil AfterWSDL hook).
 	spec, apiType, foundWSDL, _, err := pipeline.ResolveAndGenerate(genCtx, requests, pipeline.ScanOptions{
 		TargetURL:    c.URL,
 		APIType:      apiType,
@@ -638,7 +641,7 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		AllowPrivate: c.DangerousAllowPrivate,
 		Status:       statusWriter(c.Verbose),
 		AfterWSDL: func(ctx context.Context, reqs []crawl.ObservedRequest) []crawl.ObservedRequest {
-			return maybeReplayJSExtracted(ctx, reqs, c.Probe, crawl.JSReplayConfig{
+			return maybeReplayJSExtracted(ctx, reqs, c.Probe && c.AnalyzeJS, crawl.JSReplayConfig{
 				Headers:      bs.opts.Headers,
 				TargetURL:    c.URL,
 				AllowPrivate: c.DangerousAllowPrivate,
@@ -703,42 +706,6 @@ func maybeReplayJSExtracted(ctx context.Context, requests []crawl.ObservedReques
 	return crawl.ReplayJSExtracted(ctx, requests, cfg)
 }
 
-// augmentWithStaticForms appends synthetic ObservedRequests parsed from HTML
-// response bodies (see analyze.ExtractForms) so that <form action="/api/…">
-// landing-page signals feed classification, deduplication, and probing.
-// Both ScanCmd (before auto-detection) and GenerateCmd (after loading the
-// capture) call this so the two-stage pipeline is behaviorally equivalent
-// regardless of whether the capture came from scan, crawl, or import.
-func augmentWithStaticForms(requests []crawl.ObservedRequest) []crawl.ObservedRequest {
-	return append(requests, analyze.ExtractForms(requests)...)
-}
-
-// augmentAll runs the captured-request augmentation stages in the canonical
-// order: static-HTML forms first, then JS-bundle static analysis. Both
-// ScanCmd.Run and GenerateCmd.Run call this helper rather than open-coding the
-// two stage calls — the shared helper pins the order contract so a regression
-// in one command cannot silently re-emerge in the other.
-//
-// CrawlCmd does NOT call this helper. CrawlCmd already runs the JS-bundle
-// stage (runJSAnalysisStage) inline before writing capture.json, so the
-// produced capture already carries static:js entries; the HTML-form stage is
-// deferred until generate time. The split is intentional: form extraction
-// runs on a freshly-loaded capture (where classify needs the synthetic
-// entries) but JS analysis is cheap to do once at crawl time so capture.json
-// readers don't need to repeat it. Callers consuming capture.json should
-// still call augmentWithStaticForms before classification, which is exactly
-// what GenerateCmd.Run does via augmentAll.
-//
-// The order matters for downstream determinism: static:html entries appear
-// before static:js entries in the result, so classify.Deduplicate
-// first-write-wins keeps the form-derived signals when they collide with
-// bundle-derived ones on the same endpoint key.
-func augmentAll(ctx context.Context, requests []crawl.ObservedRequest, js jsAnalysisArgs) []crawl.ObservedRequest {
-	requests = augmentWithStaticForms(requests)
-	requests = runJSAnalysisStage(ctx, requests, js)
-	return requests
-}
-
 // apiTypeDisplayName returns a human-readable display name for an API type.
 func apiTypeDisplayName(apiType string) string {
 	switch apiType {
@@ -775,59 +742,4 @@ func validateURL(rawURL string) error {
 		return fmt.Errorf("invalid URL %q: scheme must be http or https", rawURL)
 	}
 	return nil
-}
-
-// jsAnalysisArgs bundles the flag values that drive jsstatic.Analyze. Used by
-// runJSAnalysisStage so each *Cmd.Run only has to assemble these fields once.
-//
-// The three call sites (CrawlCmd.Run, GenerateCmd.Run, ScanCmd.Run) each
-// build this value inline from their own flag struct (CrawlOptions,
-// GenerateCmd, ScanCmd). No shared constructor is provided because the source
-// structs are unrelated types: forcing a shared builder would require either
-// a dependency on all three command types or extra indirection that obscures
-// rather than simplifies the four-field assembly. Keeping the literal at each
-// call site is intentional.
-type jsAnalysisArgs struct {
-	enabled         bool
-	fetchSourcemaps bool
-	allowPrivate    bool
-	verbose         bool
-}
-
-// runJSAnalysisStage runs jsstatic.Analyze on requests and returns the
-// (possibly enriched) request slice. When args.enabled is false, returns
-// requests unchanged. Errors from Analyze are logged and treated as a no-op
-// (best-effort enrichment must never fail the surrounding pipeline).
-//
-// Idempotency guard: if any input request already carries a static:js or
-// static:js-sourcemap Source value, the bundles were already analyzed by a
-// prior stage (e.g. crawl --analyze-js wrote the capture and generate is now
-// reading it). In that case we skip the analysis and return requests unchanged
-// to avoid double-counting and redundant work. The guard also ensures that
-// running crawl | generate pipelines is byte-identical to running scan
-// directly when --analyze-js is set on both commands.
-func runJSAnalysisStage(ctx context.Context, requests []crawl.ObservedRequest, args jsAnalysisArgs) []crawl.ObservedRequest {
-	if !args.enabled {
-		return requests
-	}
-	// Skip if any request already carries a JS-static source — this capture
-	// was produced by a stage that already ran jsstatic.Analyze.
-	if crawl.AnyStaticSource(requests) {
-		return requests
-	}
-	aopts := jsstatic.Options{
-		FetchSourcemaps: args.fetchSourcemaps,
-		AllowPrivate:    args.allowPrivate,
-	}
-	res, err := jsstatic.Analyze(ctx, requests, aopts)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: js-static analysis failed: %v\n", err) //nolint:errcheck // best-effort status message
-		return requests
-	}
-	if args.verbose {
-		fmt.Fprintf(os.Stderr, "js-static: bundles=%d skipped=%d panics=%d, sourcemaps=%d, endpoints=%d\n", //nolint:gosec // G705: writing to stderr, not web response
-			res.Stats.BundlesAnalyzed, res.Stats.BundlesSkipped, res.Stats.AnalyzeOnePanics,
-			res.Stats.SourcemapsRecovered, res.Stats.EndpointsKept)
-	}
-	return res.Requests
 }

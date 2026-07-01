@@ -2398,66 +2398,6 @@ func TestGenerateSpec_ExtractsGETFormParametersIntoOpenAPI(t *testing.T) {
 	}
 }
 
-// --- TEST-001: augmentWithStaticForms unit tests ---
-
-// TestAugmentWithStaticForms tests the augmentWithStaticForms helper introduced
-// in the ScanCmd refactor (TEST-001 source change).
-func TestAugmentWithStaticForms(t *testing.T) {
-	t.Run("AppendsSyntheticAfterOriginal", func(t *testing.T) {
-		htmlBody := `<form action="/x"><input name="q"></form>`
-		requests := []crawl.ObservedRequest{
-			{
-				Method: "GET",
-				URL:    "https://host/page",
-				Response: crawl.ObservedResponse{
-					StatusCode:  200,
-					ContentType: "text/html",
-					Body:        []byte(htmlBody),
-				},
-			},
-		}
-		out := augmentWithStaticForms(requests)
-		if len(out) != len(requests)+1 {
-			t.Fatalf("len(out) = %d, want %d", len(out), len(requests)+1)
-		}
-		synth := out[len(requests)]
-		if synth.Source != analyze.SourceStaticHTML {
-			t.Errorf("out[%d].Source = %q, want %q", len(requests), synth.Source, analyze.SourceStaticHTML)
-		}
-		if !strings.Contains(synth.URL, "/x") {
-			t.Errorf("out[%d].URL = %q, want URL containing /x", len(requests), synth.URL)
-		}
-	})
-
-	t.Run("EmptyInputReturnsEmpty", func(t *testing.T) {
-		if out := augmentWithStaticForms(nil); len(out) != 0 {
-			t.Errorf("augmentWithStaticForms(nil) len = %d, want 0", len(out))
-		}
-		if out := augmentWithStaticForms([]crawl.ObservedRequest{}); len(out) != 0 {
-			t.Errorf("augmentWithStaticForms([]) len = %d, want 0", len(out))
-		}
-	})
-
-	t.Run("NonHTMLRequestUnchanged", func(t *testing.T) {
-		requests := []crawl.ObservedRequest{
-			{
-				Method: "GET",
-				URL:    "https://host/api/data",
-				Response: crawl.ObservedResponse{
-					StatusCode:  200,
-					ContentType: "application/json",
-					Body:        []byte(`{"key":"value"}`),
-				},
-			},
-		}
-		out := augmentWithStaticForms(requests)
-		// No HTML body → ExtractForms produces nothing → out == original slice
-		if len(out) != 1 {
-			t.Errorf("len(out) = %d, want 1 (non-HTML request produces no synth)", len(out))
-		}
-	})
-}
-
 // --- QUAL-001: synthetic-only GET form does not create a path in the spec ---
 
 // TestGenerateSpec_SyntheticOnlyGETFormYieldsNoPath verifies that a synthetic
