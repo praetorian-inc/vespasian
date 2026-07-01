@@ -62,6 +62,12 @@ For the JS bundle static-analysis test (`generate-js-static`, offline — no ser
 2. **Assert** the recovered path count matches `js-static/expected-paths.json` and every operation carries `x-vespasian-source: js-bundle`
 3. **Assert opt-out** — re-generating with `--analyze-js=false` yields zero `/api` paths and no `x-vespasian-source` extension
 
+For the slug-merging test (`generate-merge-slugs`, offline — no server or browser):
+
+1. **Generate** an OpenAPI spec from `fixtures/merge-slugs-capture.json` (two slug siblings `/api/posts/hello-world`, `/api/posts/my-trip` plus numeric-ID siblings `/api/users/42`, `/api/users/99`) with `--probe=false`
+2. **Assert default (off)** — both `/api/posts/*` siblings survive as distinct paths (the LAB-4107 regression guard) while `/api/users/{userId}` is still ID-normalized
+3. **Assert `--merge-slugs`** — the slug siblings collapse to `/api/posts/{postSlug}` and `/api/users/{userId}` normalization is unaffected
+
 For importer tests:
 
 1. **Import** — `vespasian import burp fixtures/sample-burp-export.xml -o imported.json`
@@ -93,7 +99,7 @@ Options:
                           Live:       rest-api, soap-service, graphql-server
                           Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,
                                       generate-graphql, generate-graphql-imports,
-                                      generate-js-static
+                                      generate-js-static, generate-merge-slugs
                           Import:     import-burp, import-har, import-base64,
                                       import-mitmproxy, import-mitmproxy-native,
                                       import-unicode, import-duplicates,
@@ -173,6 +179,9 @@ Results are saved to `test/.results/` with one subdirectory per test:
 ├── generate-js-static/
 │   ├── spec-on.yaml        # OpenAPI from a JS bundle (--analyze-js)
 │   └── spec-off.yaml       # Same capture with --analyze-js=false (opt-out)
+├── generate-merge-slugs/
+│   ├── spec-default.yaml   # Slug siblings preserved (merge off, LAB-4107 default)
+│   └── spec-merge.yaml     # Same capture with --merge-slugs (collapsed to {postSlug})
 ├── import-burp/
 │   └── imported.json       # Imported from Burp XML
 ├── import-har/
@@ -207,7 +216,7 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 ## Expected Results
 
-All 22 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest).
+All 23 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest).
 
 ```
   TARGET                      STATUS    ENDPOINTS   EXPECTED   DURATION
@@ -219,6 +228,7 @@ All 22 tests should pass. Order is non-deterministic and durations vary by machi
   generate-graphql            PASS      8           8          0s
   generate-graphql-imports    PASS      2           2          0s
   generate-js-static          PASS      3           3          1s
+  generate-merge-slugs        PASS      3           3          0s
   generate-rest               PASS      8           8          0s
   generate-wsdl               PASS      3           3          1s
   graphql-server              PASS      8           8          1s

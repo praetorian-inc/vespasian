@@ -1333,6 +1333,109 @@ test_generate_js_static() {
     fi
 }
 
+# test_generate_merge_slugs guards the LAB-4107 regression end-to-end: the
+# --merge-slugs CLI flag, threaded through generate.GetWithOptions ->
+# OpenAPIGenerator -> path normalization, must collapse slug siblings ONLY when
+# requested, while numeric-ID siblings normalize regardless. Offline: no
+# server/browser, --probe=false.
+test_generate_merge_slugs() {
+    local target_dir="${RESULTS_DIR}/generate-merge-slugs"
+    local input_capture="${SCRIPT_DIR}/fixtures/merge-slugs-capture.json"
+    local spec_default="${target_dir}/spec-default.yaml"
+    local spec_merge="${target_dir}/spec-merge.yaml"
+    local verbose_flag=""
+
+    [ "${VERBOSE:-false}" = true ] && verbose_flag="-v"
+
+    mkdir -p "$target_dir"
+    init_test_status "generate-merge-slugs"
+
+    local start=$SECONDS
+    local failures=0
+
+    log_header "Testing: generate-merge-slugs (LAB-4107 opt-in slug merging)"
+
+    if [ ! -f "$input_capture" ]; then
+        log_fail "Input capture not found: ${input_capture}"
+        set_test_result "generate-merge-slugs" "FAIL" "?" "3" "$((SECONDS - start))"
+        return 1
+    fi
+
+    # ── default (merge OFF): distinct slug siblings must BOTH survive ──
+    log_info "Generating with defaults (merge off)..."
+    if ! "$VESPASIAN" generate rest "$input_capture" \
+        -o "$spec_default" \
+        --probe=false \
+        $verbose_flag 2>&1; then
+        log_fail "Generate (default) failed"
+        set_test_result "generate-merge-slugs" "FAIL" "?" "3" "$((SECONDS - start))"
+        return 1
+    fi
+
+    validate_openapi_structure "$spec_default" || failures=$((failures + 1))
+
+    local stem
+    for stem in "/api/posts/hello-world" "/api/posts/my-trip"; do
+        if grep -qE "^[[:space:]]+${stem}:" "$spec_default"; then
+            log_ok "default preserved ${stem}"
+        else
+            log_fail "default dropped ${stem} (regression: distinct endpoint lost)"
+            failures=$((failures + 1))
+        fi
+    done
+    if grep -qE "^[[:space:]]+/api/posts/\{[A-Za-z]+\}:" "$spec_default"; then
+        log_fail "default collapsed /api/posts into a {slug} param (merge must be opt-in)"
+        failures=$((failures + 1))
+    fi
+    if grep -qE "^[[:space:]]+/api/users/\{[A-Za-z]+\}:" "$spec_default"; then
+        log_ok "default normalized numeric IDs to /api/users/{param}"
+    else
+        log_fail "default did not normalize /api/users numeric IDs"
+        failures=$((failures + 1))
+    fi
+
+    # ── --merge-slugs (opt-in): slug siblings collapse to one {slug} ──
+    log_info "Generating with --merge-slugs..."
+    if ! "$VESPASIAN" generate rest "$input_capture" \
+        -o "$spec_merge" \
+        --merge-slugs \
+        --probe=false \
+        $verbose_flag 2>&1; then
+        log_fail "Generate (--merge-slugs) failed"
+        failures=$((failures + 1))
+    else
+        if grep -qE "^[[:space:]]+/api/posts/\{[A-Za-z]+\}:" "$spec_merge"; then
+            log_ok "--merge-slugs collapsed /api/posts siblings to a {slug} param"
+        else
+            log_fail "--merge-slugs did not collapse /api/posts siblings"
+            failures=$((failures + 1))
+        fi
+        for stem in "/api/posts/hello-world" "/api/posts/my-trip"; do
+            if grep -qE "^[[:space:]]+${stem}:" "$spec_merge"; then
+                log_fail "--merge-slugs left ${stem} uncollapsed"
+                failures=$((failures + 1))
+            fi
+        done
+        if grep -qE "^[[:space:]]+/api/users/\{[A-Za-z]+\}:" "$spec_merge"; then
+            log_ok "--merge-slugs kept numeric-ID normalization for /api/users"
+        else
+            log_fail "--merge-slugs lost /api/users numeric-ID normalization"
+            failures=$((failures + 1))
+        fi
+    fi
+
+    local endpoint_count
+    endpoint_count=$(count_spec_endpoints "$spec_default")
+    local duration=$((SECONDS - start))
+    if [ $failures -eq 0 ]; then
+        set_test_result "generate-merge-slugs" "PASS" "$endpoint_count" "3" "$duration"
+        log_ok "generate-merge-slugs: PASSED (${duration}s)"
+    else
+        set_test_result "generate-merge-slugs" "FAIL" "$endpoint_count" "3" "$duration"
+        log_fail "generate-merge-slugs: ${failures} check(s) failed (${duration}s)"
+    fi
+}
+
 # ──────────────────────────────────────────────────────────────
 # Edge case tests
 # ──────────────────────────────────────────────────────────────
@@ -2460,7 +2563,7 @@ usage() {
     echo "                          Live:       rest-api, soap-service, graphql-server"
     echo "                          Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,"
     echo "                                      generate-graphql, generate-graphql-imports,"
-    echo "                                      generate-js-static"
+    echo "                                      generate-js-static, generate-merge-slugs"
     echo "                          Import:     import-burp, import-har, import-base64,"
     echo "                                      import-mitmproxy, import-mitmproxy-native,"
     echo "                                      import-unicode, import-duplicates,"
@@ -2525,7 +2628,7 @@ main() {
         targets="${TARGETS_SETUP:-rest-api,soap-service,graphql-server,concat-spa}"
         # Always include importer tests
         targets="${targets},import-burp,import-har,import-base64,import-mitmproxy,import-mitmproxy-native,import-unicode,import-duplicates,import-malformed,import-empty"
-        targets="${targets},generate-rest,generate-wsdl,generate-wsdl-matrix,generate-graphql,generate-graphql-imports,generate-js-static"
+        targets="${targets},generate-rest,generate-wsdl,generate-wsdl-matrix,generate-graphql,generate-graphql-imports,generate-js-static,generate-merge-slugs"
         targets="${targets},edge-cases,crawl-depth,crawl-unreachable"
         targets="${targets},classifier-edge,spec-edge"
     fi
@@ -2574,6 +2677,7 @@ main() {
             generate-graphql)   test_generate_graphql ;;
             generate-graphql-imports) test_generate_graphql_imports ;;
             generate-js-static) test_generate_js_static ;;
+            generate-merge-slugs) test_generate_merge_slugs ;;
             edge-cases)         test_edge_cases ;;
             crawl-depth)        test_crawl_depth ;;
             crawl-unreachable)  test_crawl_unreachable ;;

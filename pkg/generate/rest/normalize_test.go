@@ -19,7 +19,11 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
+
+func mergeOpts() NormalizeOptions { return NormalizeOptions{MergeSlugs: true} }
 
 func TestNormalizePath_UUID(t *testing.T) {
 	tests := []struct {
@@ -469,7 +473,7 @@ func TestNormalizePathsWithNames_SlugObservation(t *testing.T) {
 		"/articles/my-second-post",
 		"/articles/yet-another-post",
 	}
-	got := NormalizePathsWithNames(paths)
+	got := NormalizePathsWithNames(paths, mergeOpts())
 
 	// All three slug-style observations should collapse to a single
 	// parameterized path because the position varies across observations.
@@ -494,7 +498,7 @@ func TestNormalizePathsWithNames_LiteralNotPromotedAcrossPositions(t *testing.T)
 		"/users/jane/profile",
 		"/users/bob/profile",
 	}
-	got := NormalizePathsWithNames(paths)
+	got := NormalizePathsWithNames(paths, mergeOpts())
 
 	// `me` is a known literal and must not be parameterized even though
 	// `jane` and `bob` vary at the same position. The two non-literal
@@ -520,7 +524,7 @@ func TestNormalizePathsWithNames_RootResourceNeverPromoted(t *testing.T) {
 		"/articles",
 		"/sessions",
 	}
-	got := NormalizePathsWithNames(paths)
+	got := NormalizePathsWithNames(paths, mergeOpts())
 	for _, p := range paths {
 		if got[p] != p {
 			t.Errorf("root resource %q was promoted: got %q", p, got[p])
@@ -542,7 +546,7 @@ func TestNormalizePathsWithNames_ResourceTypeBehindPathPrefixNeverPromoted(t *te
 		{"/rest/users", "/rest/posts"},
 	}
 	for _, paths := range groups {
-		got := NormalizePathsWithNames(paths)
+		got := NormalizePathsWithNames(paths, mergeOpts())
 		for _, p := range paths {
 			if got[p] != p {
 				t.Errorf("scaffold-prefixed resource %q was promoted: got %q", p, got[p])
@@ -559,7 +563,7 @@ func TestNormalizePathsWithNames_VersionPrefixBoundary(t *testing.T) {
 	// still suppress promotion of the immediately-following resource segment.
 	t.Run("v0 is not a scaffold so users segment is observable", func(t *testing.T) {
 		paths := []string{"/v0/users/alice", "/v0/users/bob", "/v0/users/carol"}
-		got := NormalizePathsWithNames(paths)
+		got := NormalizePathsWithNames(paths, mergeOpts())
 		for _, p := range paths {
 			if got[p] != "/v0/users/{userSlug}" {
 				t.Errorf("path %q normalized to %q, want /v0/users/{userSlug}", p, got[p])
@@ -568,7 +572,7 @@ func TestNormalizePathsWithNames_VersionPrefixBoundary(t *testing.T) {
 	})
 	t.Run("v01 with leading zero is not a scaffold", func(t *testing.T) {
 		paths := []string{"/v01/users/alice", "/v01/users/bob", "/v01/users/carol"}
-		got := NormalizePathsWithNames(paths)
+		got := NormalizePathsWithNames(paths, mergeOpts())
 		for _, p := range paths {
 			if got[p] != "/v01/users/{userSlug}" {
 				t.Errorf("path %q normalized to %q, want /v01/users/{userSlug}", p, got[p])
@@ -577,7 +581,7 @@ func TestNormalizePathsWithNames_VersionPrefixBoundary(t *testing.T) {
 	})
 	t.Run("v001 with multiple leading zeros is not a scaffold", func(t *testing.T) {
 		paths := []string{"/v001/items/foo", "/v001/items/bar", "/v001/items/baz"}
-		got := NormalizePathsWithNames(paths)
+		got := NormalizePathsWithNames(paths, mergeOpts())
 		for _, p := range paths {
 			if got[p] != "/v001/items/{itemSlug}" {
 				t.Errorf("path %q normalized to %q, want /v001/items/{itemSlug}", p, got[p])
@@ -589,7 +593,7 @@ func TestNormalizePathsWithNames_VersionPrefixBoundary(t *testing.T) {
 		// ResourceTypeBehindPathPrefixNeverPromoted, but worth a direct
 		// contrast against the v0 case to make the boundary explicit).
 		paths := []string{"/v1/users", "/v1/posts", "/v1/articles"}
-		got := NormalizePathsWithNames(paths)
+		got := NormalizePathsWithNames(paths, mergeOpts())
 		for _, p := range paths {
 			if got[p] != p {
 				t.Errorf("v1 scaffold path %q was promoted: got %q", p, got[p])
@@ -607,7 +611,7 @@ func TestNormalizePathsWithNames_PromotesAfterPathPrefix(t *testing.T) {
 		"/api/users/bob",
 		"/api/users/carol",
 	}
-	got := NormalizePathsWithNames(paths)
+	got := NormalizePathsWithNames(paths, mergeOpts())
 	for _, p := range paths {
 		if got[p] != "/api/users/{userSlug}" {
 			t.Errorf("path %q normalized to %q, want /api/users/{userSlug}", p, got[p])
@@ -626,7 +630,7 @@ func TestNormalizePathsWithNames_MultiVaryingPositionsWithOverlap(t *testing.T) 
 		"/repos/bob/proj1",
 		"/repos/bob/proj2",
 	}
-	got := NormalizePathsWithNames(paths)
+	got := NormalizePathsWithNames(paths, mergeOpts())
 	for _, p := range paths {
 		want := "/repos/{repoSlug}/{repoSlug2}"
 		if got[p] != want {
@@ -646,7 +650,7 @@ func TestNormalizePathsWithNames_DiagonalObservationsLimitation(t *testing.T) {
 		"/repos/bob/proj2",
 		"/repos/carol/proj3",
 	}
-	got := NormalizePathsWithNames(paths)
+	got := NormalizePathsWithNames(paths, mergeOpts())
 	for _, p := range paths {
 		if got[p] != p {
 			t.Errorf("diagonal-only observation %q unexpectedly promoted to %q (algorithm limitation expected)", p, got[p])
@@ -658,7 +662,7 @@ func TestNormalizePathsWithNames_SinglePathNoSlug(t *testing.T) {
 	// One observation cannot demonstrate variation, so the literal segment
 	// must be preserved.
 	paths := []string{"/articles/my-only-post"}
-	got := NormalizePathsWithNames(paths)
+	got := NormalizePathsWithNames(paths, mergeOpts())
 	if got["/articles/my-only-post"] != "/articles/my-only-post" {
 		t.Errorf("single observation parameterized: %v", got)
 	}
@@ -679,7 +683,7 @@ func TestNormalizePathsWithNames_MixedKindsUnifyAcrossAllRegexKinds(t *testing.T
 		"/articles/AbCdEf12",                             // short hex (uppercase + digit)
 		"/articles/42",                                   // numeric
 	}
-	got := NormalizePathsWithNames(paths)
+	got := NormalizePathsWithNames(paths, mergeOpts())
 	const want = "/articles/{articleSlug}"
 	for _, p := range paths {
 		if got[p] != want {
@@ -699,7 +703,7 @@ func TestNormalizePathsWithNames_SlugOnlyNoOpUnification(t *testing.T) {
 		"/items/bar-2",
 		"/items/baz-3",
 	}
-	got := NormalizePathsWithNames(paths)
+	got := NormalizePathsWithNames(paths, mergeOpts())
 	for _, p := range paths {
 		if got[p] != "/items/{itemSlug}" {
 			t.Errorf("path %q normalized to %q, want /items/{itemSlug}", p, got[p])
@@ -715,7 +719,7 @@ func TestNormalizePathsWithNames_RegressionUUIDAndNumeric(t *testing.T) {
 		"/posts/1",
 		"/posts/2",
 	}
-	got := NormalizePathsWithNames(paths)
+	got := NormalizePathsWithNames(paths, mergeOpts())
 	want := map[string]string{
 		"/users/42": "/users/{userId}",
 		"/users/43": "/users/{userId}",
@@ -745,7 +749,7 @@ func TestNormalizePathsWithNames_MixedKinds(t *testing.T) {
 		"/articles/507f1f77bcf86cd799439011", // ObjectID
 		"/articles/another-post",
 	}
-	got := NormalizePathsWithNames(paths)
+	got := NormalizePathsWithNames(paths, mergeOpts())
 	want := map[string]string{
 		"/articles/my-first-post":            "/articles/{articleSlug}",
 		"/articles/507f1f77bcf86cd799439011": "/articles/{articleSlug}",
@@ -770,7 +774,7 @@ func TestNormalizePathsWithNames_MixedKindsWithoutSlugObservation(t *testing.T) 
 		"/articles/my-only-post",             // 1 literal observation, not promoted
 		"/articles/507f1f77bcf86cd799439011", // ObjectID, regex-classified
 	}
-	got := NormalizePathsWithNames(paths)
+	got := NormalizePathsWithNames(paths, mergeOpts())
 	want := map[string]string{
 		"/articles/my-only-post":             "/articles/my-only-post",
 		"/articles/507f1f77bcf86cd799439011": "/articles/{articleId}",
@@ -795,7 +799,7 @@ func TestNormalizePathsWithNames_DifferentShapesNotConflated(t *testing.T) {
 		"/users/me",
 		"/users/baz",
 	}
-	got := NormalizePathsWithNames(paths)
+	got := NormalizePathsWithNames(paths, mergeOpts())
 
 	// /articles position has two distinct values -> slug.
 	if got["/articles/foo"] != "/articles/{articleSlug}" {
@@ -815,12 +819,12 @@ func TestNormalizePathsWithNames_DifferentShapesNotConflated(t *testing.T) {
 }
 
 func TestNormalizePathsWithNames_EmptyAndDuplicateInputs(t *testing.T) {
-	if got := NormalizePathsWithNames(nil); len(got) != 0 {
-		t.Errorf("NormalizePathsWithNames(nil) = %v, want empty map", got)
+	if got := NormalizePathsWithNames(nil, mergeOpts()); len(got) != 0 {
+		t.Errorf("NormalizePathsWithNames(nil, mergeOpts()) = %v, want empty map", got)
 	}
 
 	dupPaths := []string{"/users/42", "/users/42", "/users/43"}
-	got := NormalizePathsWithNames(dupPaths)
+	got := NormalizePathsWithNames(dupPaths, mergeOpts())
 	if len(got) != 2 {
 		// Sort for stable error output
 		keys := make([]string, 0, len(got))
@@ -932,7 +936,7 @@ func TestNormalizePathsWithNames_DeepPathsAcrossPositions(t *testing.T) {
 		"/repos/bob/proj1/issues/1",
 		"/repos/bob/proj2/issues/2",
 	}
-	got := NormalizePathsWithNames(paths)
+	got := NormalizePathsWithNames(paths, mergeOpts())
 	const want = "/repos/{repoSlug}/{repoSlug2}/issues/{issueId}"
 	for _, p := range paths {
 		if got[p] != want {
@@ -969,7 +973,7 @@ func TestNormalizePathsWithNames_FixedPointIterationRequired(t *testing.T) {
 		"/repos/bob/proj-a",
 		"/repos/bob/proj-c",
 	}
-	got := NormalizePathsWithNames(paths)
+	got := NormalizePathsWithNames(paths, mergeOpts())
 	const want = "/repos/{repoSlug}/{repoSlug2}"
 	for _, p := range paths {
 		if got[p] != want {
@@ -994,7 +998,7 @@ func TestNormalizePathsWithNames_IntraRoundAdjacentPositionPromotion(t *testing.
 		"/x/d/y/b", // anchors position 2's /y/b suffix bucket
 		"/x/d/y/c", // anchors position 2's /y/c suffix bucket and position 4's /x/d/y prefix bucket
 	}
-	got := NormalizePathsWithNames(paths)
+	got := NormalizePathsWithNames(paths, mergeOpts())
 	const want = "/x/{xSlug}/y/{ySlug}"
 	if len(got) != len(paths) {
 		t.Fatalf("got %d entries, want %d: %#v", len(got), len(paths), got)
@@ -1076,7 +1080,7 @@ func TestNormalizePathsWithNames_MaxPromotionRoundsCap(t *testing.T) {
 			"/repos/bob/proj-a",
 			"/repos/bob/proj-c",
 		}
-		got := NormalizePathsWithNames(paths)
+		got := NormalizePathsWithNames(paths, mergeOpts())
 
 		// Invariant: every input path appears as a key.
 		if len(got) != len(paths) {
@@ -1126,7 +1130,7 @@ func TestNormalizePathsWithNames_MaxPromotionRoundsCap(t *testing.T) {
 			"/articles/my-second-post",        // ditto
 			"/posts/507f1f77bcf86cd799439011", // ObjectID → {postId} (regex)
 		}
-		got := NormalizePathsWithNames(paths)
+		got := NormalizePathsWithNames(paths, mergeOpts())
 
 		want := map[string]string{
 			"/users/42":                       "/users/{userId}",
@@ -1156,7 +1160,7 @@ func TestNormalizePathsWithNames_MaxPromotionRoundsCap(t *testing.T) {
 			"/repos/bob/proj-a",
 			"/repos/bob/proj-c",
 		}
-		got := NormalizePathsWithNames(paths)
+		got := NormalizePathsWithNames(paths, mergeOpts())
 		const want = "/repos/{repoSlug}/{repoSlug2}"
 		for _, p := range paths {
 			if got[p] != want {
@@ -1185,7 +1189,7 @@ func TestNormalizePathsWithNames_MaxPromotionRoundsCap(t *testing.T) {
 			}
 		}
 
-		got := NormalizePathsWithNames(paths)
+		got := NormalizePathsWithNames(paths, mergeOpts())
 
 		for _, p := range paths {
 			out, ok := got[p]
@@ -1201,4 +1205,44 @@ func TestNormalizePathsWithNames_MaxPromotionRoundsCap(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestNormalizePathsWithNames_MergeDisabledByDefault verifies that with
+// mergeSlugs off, distinct sibling pages are preserved (no slug collapse),
+// while regex-based ID normalization still applies. Reproduces LAB-4107.
+func TestNormalizePathsWithNames_MergeDisabledByDefault(t *testing.T) {
+	paths := []string{
+		"/navigation/source/info.php",
+		"/navigation/source/low.php",
+	}
+	got := NormalizePathsWithNames(paths, NormalizeOptions{})
+	require.Equal(t, "/navigation/source/info.php", got["/navigation/source/info.php"])
+	require.Equal(t, "/navigation/source/low.php", got["/navigation/source/low.php"])
+
+	// Regex ID detection is unaffected by mergeSlugs.
+	ids := NormalizePathsWithNames([]string{"/users/42", "/users/99"}, NormalizeOptions{})
+	require.Equal(t, "/users/{userId}", ids["/users/42"])
+	require.Equal(t, "/users/{userId}", ids["/users/99"])
+}
+
+// TestNormalizePathsWithNames_SlugThreshold verifies the threshold gates how
+// many distinct values are needed before a position is promoted to a slug.
+func TestNormalizePathsWithNames_SlugThreshold(t *testing.T) {
+	twoVals := []string{"/posts/a", "/posts/b"}
+	got := NormalizePathsWithNames(twoVals, NormalizeOptions{MergeSlugs: true, SlugThreshold: 3})
+	require.Equal(t, "/posts/a", got["/posts/a"], "2 values must not merge at threshold 3")
+	require.Equal(t, "/posts/b", got["/posts/b"])
+
+	threeVals := []string{"/posts/a", "/posts/b", "/posts/c"}
+	got = NormalizePathsWithNames(threeVals, NormalizeOptions{MergeSlugs: true, SlugThreshold: 3})
+	require.Equal(t, "/posts/{postSlug}", got["/posts/a"], "3 values must merge at threshold 3")
+}
+
+// TestNormalizePathsWithNames_SlugThresholdClamped verifies the defensive
+// SlugThreshold < 2 clamp inside NormalizePathsWithNames: a threshold of 1
+// must behave as 2, so two distinct values still merge.
+func TestNormalizePathsWithNames_SlugThresholdClamped(t *testing.T) {
+	got := NormalizePathsWithNames([]string{"/posts/a", "/posts/b"}, NormalizeOptions{MergeSlugs: true, SlugThreshold: 1})
+	require.Equal(t, "/posts/{postSlug}", got["/posts/a"])
+	require.Equal(t, "/posts/{postSlug}", got["/posts/b"])
 }

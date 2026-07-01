@@ -17,7 +17,21 @@ package generate
 import (
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/praetorian-inc/vespasian/pkg/generate/rest"
 )
+
+func TestGetWithOptions_PropagatesToREST(t *testing.T) {
+	gen, err := GetWithOptions("rest", Options{MergeSlugs: true, SlugThreshold: 5})
+	require.NoError(t, err)
+
+	rg, ok := gen.(*rest.OpenAPIGenerator)
+	require.True(t, ok)
+	require.True(t, rg.MergeSlugs)
+	require.Equal(t, 5, rg.SlugThreshold)
+}
 
 func TestGet(t *testing.T) {
 	tests := []struct {

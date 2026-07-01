@@ -1,0 +1,30 @@
+[
+  {
+    "method": "GET",
+    "url": "https://app.example.com/api/posts/hello-world",
+    "headers": {"Content-Type": "application/json"},
+    "source": "import:merge-slugs-fixture",
+    "response": {"status_code": 200, "content_type": "application/json"}
+  },
+  {
+    "method": "GET",
+    "url": "https://app.example.com/api/posts/my-trip",
+    "headers": {"Content-Type": "application/json"},
+    "source": "import:merge-slugs-fixture",
+    "response": {"status_code": 200, "content_type": "application/json"}
+  },
+  {
+    "method": "GET",
+    "url": "https://app.example.com/api/users/42",
+    "headers": {"Content-Type": "application/json"},
+    "source": "import:merge-slugs-fixture",
+    "response": {"status_code": 200, "content_type": "application/json"}
+  },
+  {
+    "method": "GET",
+    "url": "https://app.example.com/api/users/99",
+    "headers": {"Content-Type": "application/json"},
+    "source": "import:merge-slugs-fixture",
+    "response": {"status_code": 200, "content_type": "application/json"}
+  }
+]
