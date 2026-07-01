@@ -609,6 +609,56 @@ func TestOpenAPIGenerator_SlugObservation(t *testing.T) {
 	}
 }
 
+// TestOpenAPIGenerator_DefaultPreservesDistinctSiblings locks in the LAB-4107
+// default at the Generate() seam: a zero-value generator (MergeSlugs unset)
+// must keep slug-shaped siblings as distinct paths. A wiring bug that ignored
+// g.MergeSlugs, or a default flip to merge-on, would collapse them and fail
+// here even though the cmd/unit/E2E layers pass. Mirrors
+// TestOpenAPIGenerator_SlugObservation with merging off.
+func TestOpenAPIGenerator_DefaultPreservesDistinctSiblings(t *testing.T) {
+	gen := &OpenAPIGenerator{} // MergeSlugs defaults off
+
+	endpoints := []classify.ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:   "GET",
+				URL:      "https://api.example.com/articles/my-first-post",
+				Response: crawl.ObservedResponse{StatusCode: 200, Body: []byte(`{"title": "first"}`)},
+			},
+			IsAPI: true,
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:   "GET",
+				URL:      "https://api.example.com/articles/another-post",
+				Response: crawl.ObservedResponse{StatusCode: 200, Body: []byte(`{"title": "another"}`)},
+			},
+			IsAPI: true,
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:   "GET",
+				URL:      "https://api.example.com/articles/yet-another-post",
+				Response: crawl.ObservedResponse{StatusCode: 200, Body: []byte(`{"title": "yet another"}`)},
+			},
+			IsAPI: true,
+		},
+	}
+
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err)
+
+	doc, err := openapi3.NewLoader().LoadFromData(spec)
+	require.NoError(t, err)
+
+	// Merge off: all three siblings survive as distinct paths, none collapsed.
+	require.Equal(t, 3, doc.Paths.Len(), "distinct siblings must be preserved; got %v", doc.Paths.InMatchingOrder())
+	for _, p := range []string{"/articles/my-first-post", "/articles/another-post", "/articles/yet-another-post"} {
+		assert.NotNil(t, doc.Paths.Find(p), "expected preserved path %q", p)
+	}
+	assert.Nil(t, doc.Paths.Find("/articles/{articleSlug}"), "must not collapse into a slug param when merge is off")
+}
+
 func TestP0Fixes_ActualStatusCodes(t *testing.T) {
 	gen := &OpenAPIGenerator{}
 
