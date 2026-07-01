@@ -287,7 +287,7 @@ type CrawlOptions struct {
 // SlugOptions holds the path-normalization flags shared by GenerateCmd and ScanCmd.
 type SlugOptions struct {
 	MergeSlugs    bool `name:"merge-slugs" help:"Enable slug-based path merging (off by default). See README for when to use this vs. distinct endpoint preservation."`
-	SlugThreshold int  `name:"slug-threshold" default:"2" help:"How many distinct values must appear at a path position before --merge-slugs collapses it into a {slug} parameter. Higher = more conservative (needs more samples before merging), which helps on sparse captures. Ignored unless --merge-slugs is set. Minimum 2."`
+	SlugThreshold int  `name:"slug-threshold" default:"2" help:"Distinct values required at a path position before --merge-slugs collapses it; higher is more conservative (minimum 2). See README."`
 }
 
 // setupForceExitHandler spawns a goroutine that waits for the first signal
