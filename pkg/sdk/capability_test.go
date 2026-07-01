@@ -608,6 +608,48 @@ func TestParseProbeEnabled(t *testing.T) {
 	}
 }
 
+// TestParseSlugThreshold pins the clamping and passthrough behavior of
+// parseSlugThreshold: any value below 2 (including absent) is clamped up to 2;
+// values ≥ 2 are returned unchanged.
+func TestParseSlugThreshold(t *testing.T) {
+	tests := []struct {
+		name   string
+		params capability.Parameters
+		want   int
+	}{
+		{"absent param defaults to 2", capability.Parameters{}, 2},
+		{"explicit 1 clamped to 2", capability.Parameters{capability.Int("slug_threshold", "").WithDefault("1")}, 2},
+		{"explicit 0 clamped to 2", capability.Parameters{capability.Int("slug_threshold", "").WithDefault("0")}, 2},
+		{"explicit -5 clamped to 2", capability.Parameters{capability.Int("slug_threshold", "").WithDefault("-5")}, 2},
+		{"explicit 2 boundary passthrough", capability.Parameters{capability.Int("slug_threshold", "").WithDefault("2")}, 2},
+		{"explicit 5 passthrough", capability.Parameters{capability.Int("slug_threshold", "").WithDefault("5")}, 5},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, parseSlugThreshold(tt.params))
+		})
+	}
+}
+
+// TestParseMergeSlugs pins the boolean parsing of parseMergeSlugs: absent
+// defaults to false; explicit values are returned as-is.
+func TestParseMergeSlugs(t *testing.T) {
+	tests := []struct {
+		name   string
+		params capability.Parameters
+		want   bool
+	}{
+		{"absent param defaults to false", capability.Parameters{}, false},
+		{"explicit true", capability.Parameters{capability.Bool("merge_slugs", "").WithDefault("true")}, true},
+		{"explicit false", capability.Parameters{capability.Bool("merge_slugs", "").WithDefault("false")}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, parseMergeSlugs(tt.params))
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 6. isStaticAssetURL (optional)
 // ---------------------------------------------------------------------------
