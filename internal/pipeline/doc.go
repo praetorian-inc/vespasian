@@ -22,7 +22,12 @@
 //
 //   - DetectAPIType, ClassifiersForType, StrategiesForType — classification
 //     routing helpers keyed by API type.
-//   - ClassifyProbeGenerate — the classify → probe → generate step.
+//   - ClassifyProbeGenerate — the classify → probe → generate step. Honors the
+//     REST slug-merging options (MergeSlugs/SlugThreshold) via
+//     generate.GetWithOptions.
+//   - ValidateSlugThreshold — shared source of truth rejecting --slug-threshold
+//     < 2 when --merge-slugs is on (REST only). Enforced by both the CLI (early,
+//     before crawl) and the SDK, and re-checked inside ClassifyProbeGenerate.
 //   - ResolveWSDLType, ProbeWSDLDocument, ProbeAndAppendWSDLRequest — active
 //     WSDL discovery shared by both surfaces.
 //   - Augment / AnalyzeJS — captured-request augmentation. Augment runs the

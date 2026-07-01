@@ -28,12 +28,175 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
 	"github.com/praetorian-inc/vespasian/internal/pipeline"
 	"github.com/praetorian-inc/vespasian/pkg/analyze"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
+
+// jsonGetRequest builds a minimal GET ObservedRequest for the given URL with a
+// JSON response.
+func jsonGetRequest(url string) crawl.ObservedRequest {
+	return crawl.ObservedRequest{
+		Method:  "GET",
+		URL:     url,
+		Headers: map[string]string{"Content-Type": "application/json"},
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "application/json",
+		},
+	}
+}
+
+// siblingSlugRequests returns two sibling REST requests whose only varying
+// path segment looks like a content slug. Default normalization keeps both
+// paths; --merge-slugs collapses them to /api/posts/{postSlug}.
+func siblingSlugRequests() []crawl.ObservedRequest {
+	return []crawl.ObservedRequest{
+		jsonGetRequest("https://example.com/api/posts/hello-world"),
+		jsonGetRequest("https://example.com/api/posts/my-trip"),
+	}
+}
+
+// TestGenerateSpec_SlugThresholdValidation covers the CLI-boundary guard in
+// pipeline.ClassifyProbeGenerate: --slug-threshold < 2 is rejected when merging is on, and
+// ignored when merging is off.
+func TestGenerateSpec_SlugThresholdValidation(t *testing.T) {
+	requests := siblingSlugRequests()
+
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:       "rest",
+		Confidence:    0.5,
+		Probe:         false,
+		Deduplicate:   true,
+		MergeSlugs:    true,
+		SlugThreshold: 1,
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "--slug-threshold must be >= 2")
+
+	off, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:       "rest",
+		Confidence:    0.5,
+		Probe:         false,
+		Deduplicate:   true,
+		MergeSlugs:    false,
+		SlugThreshold: 1,
+	})
+	require.NoError(t, err)
+	// threshold=1 is ignored when merging is off: both siblings survive, no collapse.
+	offStr := string(off)
+	require.Contains(t, offStr, "/api/posts/hello-world")
+	require.Contains(t, offStr, "/api/posts/my-trip")
+	require.NotContains(t, offStr, "{postSlug}")
+}
+
+// TestGenerateSpec_MergeSlugsWiring proves the --merge-slugs flag flows
+// cmd -> pipeline.ClassifyProbeGenerate -> GetWithOptions -> generator and changes the output.
+func TestGenerateSpec_MergeSlugsWiring(t *testing.T) {
+	// Include numeric-ID siblings to prove regex ID normalization is always
+	// on, independent of --merge-slugs, through the full CLI wiring.
+	requests := append(siblingSlugRequests(),
+		jsonGetRequest("https://example.com/api/users/42"),
+		jsonGetRequest("https://example.com/api/users/99"),
+	)
+
+	// SlugThreshold intentionally omitted: it is ignored when MergeSlugs is false.
+	off, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:     "rest",
+		Confidence:  0.5,
+		Probe:       false,
+		Deduplicate: true,
+		MergeSlugs:  false,
+	})
+	require.NoError(t, err)
+	offStr := string(off)
+	require.Contains(t, offStr, "/api/posts/hello-world")
+	require.Contains(t, offStr, "/api/posts/my-trip")
+	require.NotContains(t, offStr, "{postSlug}")
+	require.Contains(t, offStr, "/api/users/{userId}")
+
+	on, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:       "rest",
+		Confidence:    0.5,
+		Probe:         false,
+		Deduplicate:   true,
+		MergeSlugs:    true,
+		SlugThreshold: 2,
+	})
+	require.NoError(t, err)
+	onStr := string(on)
+	require.Contains(t, onStr, "/api/posts/{postSlug}")
+	require.NotContains(t, onStr, "/api/posts/hello-world")
+	require.NotContains(t, onStr, "/api/posts/my-trip")
+	require.Contains(t, onStr, "/api/users/{userId}")
+}
+
+// TestValidateSlugThreshold covers the wsdl/graphql exemption and the
+// apiType x mergeSlugs x threshold matrix for the slug-threshold guard.
+func TestValidateSlugThreshold(t *testing.T) {
+	tests := []struct {
+		name          string
+		apiType       string
+		mergeSlugs    bool
+		slugThreshold int
+		wantErr       bool
+	}{
+		{"rest merge threshold 1 rejected", pipeline.APITypeREST, true, 1, true},
+		{"rest merge threshold 0 rejected", pipeline.APITypeREST, true, 0, true},
+		{"rest merge threshold 2 ok", pipeline.APITypeREST, true, 2, false},
+		{"rest merge off threshold 1 ignored", pipeline.APITypeREST, false, 1, false},
+		{"auto merge threshold 1 rejected (avoids wasted crawl)", pipeline.APITypeAuto, true, 1, true},
+		{"wsdl merge threshold 1 exempt", pipeline.APITypeWSDL, true, 1, false},
+		{"graphql merge threshold 1 exempt", pipeline.APITypeGraphQL, true, 1, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSlugThreshold(tt.apiType, tt.mergeSlugs, tt.slugThreshold)
+			if tt.wantErr {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "--slug-threshold must be >= 2")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestGenerateCmdRun_RejectsSlugThresholdBeforeFileIO proves the slug-threshold
+// guard fires before the capture file is opened: the missing file never
+// produces an open error because validation rejects the flag first.
+func TestGenerateCmdRun_RejectsSlugThresholdBeforeFileIO(t *testing.T) {
+	cmd := &GenerateCmd{
+		APIType:     pipeline.APITypeREST,
+		Capture:     filepath.Join(t.TempDir(), "does-not-exist.json"),
+		SlugOptions: SlugOptions{MergeSlugs: true, SlugThreshold: 1},
+	}
+	err := cmd.Run()
+	require.Error(t, err)
+	// Early-validation contract: fail on the flag before touching the (missing) file.
+	require.Contains(t, err.Error(), "--slug-threshold must be >= 2")
+	require.NotContains(t, err.Error(), "open capture file")
+}
+
+// TestScanCmdRun_RejectsSlugThresholdBeforeCrawl proves the slug-threshold
+// guard fires before any browser/crawl. A malformed header would make
+// setupBrowserAndSignals (which runs AFTER the guard, before the crawl) fail
+// with a distinct "invalid header" error; asserting the error is EXACTLY the
+// slug error proves the guard short-circuited first. If the early guard were
+// removed, the header error would surface instead. No network/Chrome needed.
+func TestScanCmdRun_RejectsSlugThresholdBeforeCrawl(t *testing.T) {
+	cmd := &ScanCmd{
+		URL:          "https://example.com",
+		APIType:      pipeline.APITypeAuto,
+		CrawlOptions: CrawlOptions{Header: []string{"no-colon-header"}},
+		SlugOptions:  SlugOptions{MergeSlugs: true, SlugThreshold: 1},
+	}
+	err := cmd.Run()
+	require.EqualError(t, err, "--slug-threshold must be >= 2")
+}
 
 func TestValidateURL(t *testing.T) {
 	tests := []struct {
@@ -639,6 +802,19 @@ func TestCrawlOptions_Embedded(t *testing.T) {
 	if !s.Headless {
 		t.Error("ScanCmd.Headless = false, want true")
 	}
+}
+
+// TestSlugOptions_Embedded verifies GenerateCmd and ScanCmd expose the embedded
+// SlugOptions fields directly, the promotion their Run() methods rely on to
+// forward c.MergeSlugs / c.SlugThreshold into generateSpec.
+func TestSlugOptions_Embedded(t *testing.T) {
+	g := &GenerateCmd{SlugOptions: SlugOptions{MergeSlugs: true, SlugThreshold: 4}}
+	require.True(t, g.MergeSlugs)
+	require.Equal(t, 4, g.SlugThreshold)
+
+	s := &ScanCmd{SlugOptions: SlugOptions{MergeSlugs: true, SlugThreshold: 7}}
+	require.True(t, s.MergeSlugs)
+	require.Equal(t, 7, s.SlugThreshold)
 }
 
 // TestDangerousAllowPrivate_GenerateSpec tests generateSpec with allowPrivate=true.

@@ -466,8 +466,8 @@ func TestCapability_Parameters(t *testing.T) {
 	c := &Capability{}
 	params := c.Parameters()
 
-	// Exactly 9 declared parameters.
-	require.Len(t, params, 9)
+	// Exactly 11 declared parameters.
+	require.Len(t, params, 11)
 
 	// Build a name -> Parameter map for convenient field assertions.
 	byName := make(map[string]capability.Parameter, len(params))
@@ -479,6 +479,7 @@ func TestCapability_Parameters(t *testing.T) {
 	for _, name := range []string{
 		"mode", "api_type", "timeout", "max_pages", "depth",
 		"scope", "headers", "confidence", "probe",
+		"merge_slugs", "slug_threshold",
 	} {
 		assert.Contains(t, byName, name, "missing parameter %q", name)
 	}
@@ -489,6 +490,8 @@ func TestCapability_Parameters(t *testing.T) {
 	assert.Equal(t, "same-origin", byName["scope"].Default)
 	assert.Equal(t, "0.5", byName["confidence"].Default)
 	assert.Equal(t, "true", byName["probe"].Default)
+	assert.Equal(t, "false", byName["merge_slugs"].Default)
+	assert.Equal(t, "2", byName["slug_threshold"].Default)
 
 	// WithOptions enum sets for the parameters that have them.
 	assert.ElementsMatch(t, []string{"scan", "crawl"}, byName["mode"].Options)

@@ -42,6 +42,15 @@ type ScanOptions struct {
 	// AllowPrivate disables SSRF protection on probes (allow private/internal IPs).
 	AllowPrivate bool
 
+	// MergeSlugs enables observation-based slug merging in REST path
+	// normalization. Ignored by the wsdl/graphql generators.
+	MergeSlugs bool
+
+	// SlugThreshold is the minimum distinct values at a path position before
+	// --merge-slugs collapses it. Must be >=2 when MergeSlugs is set. Ignored
+	// unless MergeSlugs is set.
+	SlugThreshold int
+
 	// Status is an optional io.Writer for verbose status messages.
 	// Pass nil to suppress.
 	Status io.Writer
@@ -78,12 +87,14 @@ func ResolveAndGenerate(ctx context.Context, requests []crawl.ObservedRequest, o
 	}
 
 	spec, err = ClassifyProbeGenerate(ctx, requests, Options{
-		APIType:      apiType,
-		Confidence:   opts.Confidence,
-		Probe:        opts.Probe,
-		Deduplicate:  opts.Deduplicate,
-		AllowPrivate: opts.AllowPrivate,
-		Status:       opts.Status,
+		APIType:       apiType,
+		Confidence:    opts.Confidence,
+		Probe:         opts.Probe,
+		Deduplicate:   opts.Deduplicate,
+		AllowPrivate:  opts.AllowPrivate,
+		MergeSlugs:    opts.MergeSlugs,
+		SlugThreshold: opts.SlugThreshold,
+		Status:        opts.Status,
 	})
 	return spec, apiType, foundWSDL, requests, err
 }

@@ -245,6 +245,12 @@ type CrawlOptions struct {
 	FetchSourcemaps bool          `name:"fetch-sourcemaps" default:"true"  help:"When --analyze-js is set, fetch .js.map sourcemaps referenced via //# sourceMappingURL= comments to recover original sources."`
 }
 
+// SlugOptions holds the path-normalization flags shared by GenerateCmd and ScanCmd.
+type SlugOptions struct {
+	MergeSlugs    bool `name:"merge-slugs" help:"Enable slug-based path merging (off by default). See README for when to use this vs. distinct endpoint preservation."`
+	SlugThreshold int  `name:"slug-threshold" default:"2" help:"Distinct values required at a path position before --merge-slugs collapses it; higher is more conservative (minimum 2). See README."`
+}
+
 // setupForceExitHandler spawns a goroutine that waits for the first signal
 // to be handled (ctx.Done), then registers for a second SIGINT/SIGTERM and
 // force-exits the process. This avoids a race where both the graceful handler
@@ -465,6 +471,8 @@ type GenerateCmd struct {
 	Verbose               bool    `short:"v" help:"Enable verbose logging"`
 	AnalyzeJS             bool    `name:"analyze-js"       default:"true"  help:"Statically analyze JS bundles in the imported capture (when present)."`
 	FetchSourcemaps       bool    `name:"fetch-sourcemaps" default:"false" help:"When --analyze-js is set, fetch .js.map sourcemaps referenced via //# sourceMappingURL= comments. Default false on generate (offline-friendly)."`
+
+	SlugOptions
 }
 
 // maxCaptureSize is the maximum capture file size (100MB).
@@ -472,6 +480,10 @@ const maxCaptureSize = 100 * 1024 * 1024
 
 // Run executes the generate command.
 func (c *GenerateCmd) Run() (err error) {
+	if err := validateSlugThreshold(c.APIType, c.MergeSlugs, c.SlugThreshold); err != nil {
+		return err
+	}
+
 	f, err := os.Open(c.Capture)
 	if err != nil {
 		return fmt.Errorf("open capture file: %w", err)
@@ -518,12 +530,14 @@ func (c *GenerateCmd) Run() (err error) {
 	warnSSRFDisabled(c.DangerousAllowPrivate, c.Probe)
 
 	spec, err := pipeline.ClassifyProbeGenerate(ctx, requests, pipeline.Options{
-		APIType:      c.APIType,
-		Confidence:   c.Confidence,
-		Probe:        c.Probe,
-		Deduplicate:  c.Deduplicate,
-		AllowPrivate: c.DangerousAllowPrivate,
-		Status:       statusWriter(c.Verbose),
+		APIType:       c.APIType,
+		Confidence:    c.Confidence,
+		Probe:         c.Probe,
+		Deduplicate:   c.Deduplicate,
+		AllowPrivate:  c.DangerousAllowPrivate,
+		MergeSlugs:    c.MergeSlugs,
+		SlugThreshold: c.SlugThreshold,
+		Status:        statusWriter(c.Verbose),
 	})
 	if err != nil {
 		return err
@@ -545,11 +559,16 @@ type ScanCmd struct {
 	DangerousAllowPrivate bool    `help:"Disable SSRF protection for crawling and probes, allowing private/localhost targets (localhost, 127.0.0.1, RFC1918, link-local). Required when the seed URL is a private host, otherwise the crawl exits with an error and captures nothing. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 
 	CrawlOptions
+	SlugOptions
 }
 
 // Run executes the scan command (crawl + generate pipeline).
 func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	if err := validateURL(c.URL); err != nil {
+		return err
+	}
+
+	if err := validateSlugThreshold(c.APIType, c.MergeSlugs, c.SlugThreshold); err != nil {
 		return err
 	}
 
@@ -633,13 +652,15 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	// rescan) and c.Probe (so --probe=false stays passive — see
 	// maybeReplayJSExtracted), and is CLI-only (the SDK passes a nil AfterWSDL hook).
 	spec, apiType, foundWSDL, _, err := pipeline.ResolveAndGenerate(genCtx, requests, pipeline.ScanOptions{
-		TargetURL:    c.URL,
-		APIType:      apiType,
-		Confidence:   c.Confidence,
-		Probe:        c.Probe,
-		Deduplicate:  c.Deduplicate,
-		AllowPrivate: c.DangerousAllowPrivate,
-		Status:       statusWriter(c.Verbose),
+		TargetURL:     c.URL,
+		APIType:       apiType,
+		Confidence:    c.Confidence,
+		Probe:         c.Probe,
+		Deduplicate:   c.Deduplicate,
+		AllowPrivate:  c.DangerousAllowPrivate,
+		MergeSlugs:    c.MergeSlugs,
+		SlugThreshold: c.SlugThreshold,
+		Status:        statusWriter(c.Verbose),
 		AfterWSDL: func(ctx context.Context, reqs []crawl.ObservedRequest) []crawl.ObservedRequest {
 			return maybeReplayJSExtracted(ctx, reqs, c.Probe && c.AnalyzeJS, crawl.JSReplayConfig{
 				Headers:      bs.opts.Headers,
@@ -704,6 +725,15 @@ func maybeReplayJSExtracted(ctx context.Context, requests []crawl.ObservedReques
 		return requests
 	}
 	return crawl.ReplayJSExtracted(ctx, requests, cfg)
+}
+
+// validateSlugThreshold rejects --slug-threshold < 2 when --merge-slugs is on.
+// It runs early in GenerateCmd.Run and ScanCmd.Run so crawl/file I/O never
+// starts on an invalid flag combination. It delegates to
+// pipeline.ValidateSlugThreshold — the shared source of truth also enforced
+// inside the pipeline for SDK/direct callers.
+func validateSlugThreshold(apiType string, mergeSlugs bool, slugThreshold int) error {
+	return pipeline.ValidateSlugThreshold(apiType, mergeSlugs, slugThreshold)
 }
 
 // apiTypeDisplayName returns a human-readable display name for an API type.

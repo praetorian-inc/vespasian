@@ -79,6 +79,8 @@ func (c *Capability) Parameters() []capability.Parameter {
 		capability.String("headers", "Comma-separated auth headers (e.g. 'Authorization: Bearer tok, X-Key: abc'). Header values containing commas are not supported."),
 		capability.String("confidence", "Minimum classification confidence 0-1").WithDefault("0.5"),
 		capability.Bool("probe", "Enable endpoint probing").WithDefault("true"),
+		capability.Bool("merge_slugs", "Merge sibling slug paths into one templated REST path (off by default; REST only)").WithDefault("false"),
+		capability.Int("slug_threshold", "Distinct values at a path position before merge_slugs collapses it (minimum 2)").WithDefault("2"),
 	}
 }
 
@@ -170,6 +172,8 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.ObservedRequest, input capmodel.WebApplication, output capability.Emitter) (bool, string, error) {
 	confidence := parseConfidence(ctx.Parameters)
 	probeEnabled := parseProbeEnabled(ctx.Parameters)
+	mergeSlugs := parseMergeSlugs(ctx.Parameters)
+	slugThreshold := parseSlugThreshold(ctx.Parameters)
 
 	apiType, _ := ctx.Parameters.GetString("api_type")
 
@@ -184,14 +188,16 @@ func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.O
 	// context.Context (see doc.go) — generateFunc below runs on
 	// context.Background() and cannot be canceled cooperatively.
 	spec, apiType, _, _, err := generateFunc(context.Background(), requests, pipeline.ScanOptions{
-		TargetURL:    input.PrimaryURL,
-		APIType:      apiType,
-		Confidence:   confidence,
-		Probe:        probeEnabled,
-		Deduplicate:  true,
-		AllowPrivate: false,
-		Status:       nil,
-		AfterWSDL:    nil,
+		TargetURL:     input.PrimaryURL,
+		APIType:       apiType,
+		Confidence:    confidence,
+		Probe:         probeEnabled,
+		Deduplicate:   true,
+		AllowPrivate:  false,
+		MergeSlugs:    mergeSlugs,
+		SlugThreshold: slugThreshold,
+		Status:        nil,
+		AfterWSDL:     nil,
 	})
 	if err != nil {
 		slog.Warn("vespasian: classify/generate failed", "target", input.PrimaryURL, "error", err)
@@ -277,6 +283,28 @@ func parseProbeEnabled(params capability.Parameters) bool {
 		return true
 	}
 	return p
+}
+
+func parseMergeSlugs(params capability.Parameters) bool {
+	b, ok := params.GetBool("merge_slugs")
+	if !ok {
+		return false
+	}
+	return b
+}
+
+// parseSlugThreshold returns the slug-merge threshold, defaulting to 2 and
+// clamping any value below 2 up to 2. SDK parameters are advisory (not
+// host-validated), so an out-of-range value is corrected rather than rejected
+// — this mirrors the rest generator's own clamp and guarantees merge_slugs
+// never produces the invalid combination that pipeline.ValidateSlugThreshold
+// rejects for the CLI.
+func parseSlugThreshold(params capability.Parameters) int {
+	v, ok := params.GetInt("slug_threshold")
+	if !ok || v < 2 {
+		return 2
+	}
+	return v
 }
 
 func specFormatForType(apiType string) string {

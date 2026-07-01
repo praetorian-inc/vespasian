@@ -44,9 +44,33 @@ type Options struct {
 	// AllowPrivate disables SSRF protection on probes (allow private/internal IPs).
 	AllowPrivate bool
 
+	// MergeSlugs enables observation-based slug merging in REST path
+	// normalization. Ignored by the wsdl/graphql generators.
+	MergeSlugs bool
+
+	// SlugThreshold is the minimum distinct values at a path position before
+	// --merge-slugs collapses it. Must be >=2 when MergeSlugs is set (enforced
+	// by ValidateSlugThreshold). Ignored unless MergeSlugs is set.
+	SlugThreshold int
+
 	// Status is an optional io.Writer for verbose status messages.
 	// Pass nil or io.Discard to suppress.
 	Status io.Writer
+}
+
+// ValidateSlugThreshold rejects a --slug-threshold < 2 when --merge-slugs is
+// on. wsdl/graphql ignore slug options, so they are exempt to avoid a
+// misleading error. It is the single source of truth shared by the CLI
+// (cmd/vespasian), the SDK (pkg/sdk), and ClassifyProbeGenerate itself so a
+// bad flag combination is rejected consistently regardless of entry point.
+func ValidateSlugThreshold(apiType string, mergeSlugs bool, slugThreshold int) error {
+	if apiType == APITypeWSDL || apiType == APITypeGraphQL {
+		return nil
+	}
+	if mergeSlugs && slugThreshold < 2 {
+		return fmt.Errorf("--slug-threshold must be >= 2")
+	}
+	return nil
 }
 
 // ClassifyProbeGenerate runs the classify → probe → generate pipeline and
@@ -55,6 +79,14 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 	classifiers := ClassifiersForType(opts.APIType)
 	if classifiers == nil {
 		return nil, fmt.Errorf("unsupported API type: %q", opts.APIType)
+	}
+
+	// REST-scoped: wsdl/graphql ignore slug options (see ValidateSlugThreshold).
+	// The rest generator additionally clamps SlugThreshold <2 to 2, but we reject
+	// it here so direct callers (SDK, tests) get the same explicit error the CLI
+	// surfaces early, rather than silent clamping.
+	if err := ValidateSlugThreshold(opts.APIType, opts.MergeSlugs, opts.SlugThreshold); err != nil {
+		return nil, err
 	}
 
 	classified := classify.RunClassifiers(classifiers, requests, opts.Confidence)
@@ -87,7 +119,10 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 		classified = enriched
 	}
 
-	gen, err := generate.Get(opts.APIType)
+	gen, err := generate.GetWithOptions(opts.APIType, generate.Options{
+		MergeSlugs:    opts.MergeSlugs,
+		SlugThreshold: opts.SlugThreshold,
+	})
 	if err != nil {
 		return nil, err
 	}

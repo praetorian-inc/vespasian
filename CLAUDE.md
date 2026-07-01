@@ -97,10 +97,10 @@ The `query_params` field is `map[string][]string` (multi-value). Capture files g
 
 | Command   | Purpose |
 |-----------|---------|
-| `scan`    | Full pipeline: crawl + classify + probe + generate. Flags: `--analyze-js` (default true), `--fetch-sourcemaps` (default true) |
+| `scan`    | Full pipeline: crawl + classify + probe + generate. Flags: `--analyze-js` (default true), `--fetch-sourcemaps` (default true), `--merge-slugs` (default false), `--slug-threshold` (default 2) |
 | `crawl`   | Capture traffic via headless browser → capture.json. Flags: `--analyze-js` (default true), `--fetch-sourcemaps` (default true) |
 | `import`  | Convert Burp XML / HAR / mitmproxy → capture.json |
-| `generate` | Produce spec from capture.json (REST→OpenAPI, GraphQL→SDL, WSDL→WSDL). Flags: `--analyze-js` (default true), `--fetch-sourcemaps` (default false) |
+| `generate` | Produce spec from capture.json (REST→OpenAPI, GraphQL→SDL, WSDL→WSDL). Flags: `--analyze-js` (default true), `--fetch-sourcemaps` (default false), `--merge-slugs` (default false), `--slug-threshold` (default 2) |
 | `version` | Show version information |
 
 ## Test Infrastructure
