@@ -31,6 +31,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	"github.com/praetorian-inc/vespasian/internal/pipeline"
 	"github.com/praetorian-inc/vespasian/pkg/analyze"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
@@ -60,12 +61,12 @@ func siblingSlugRequests() []crawl.ObservedRequest {
 }
 
 // TestGenerateSpec_SlugThresholdValidation covers the CLI-boundary guard in
-// generateSpec: --slug-threshold < 2 is rejected when merging is on, and
+// pipeline.ClassifyProbeGenerate: --slug-threshold < 2 is rejected when merging is on, and
 // ignored when merging is off.
 func TestGenerateSpec_SlugThresholdValidation(t *testing.T) {
 	requests := siblingSlugRequests()
 
-	_, err := generateSpec(context.Background(), requests, generateSpecOptions{
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:       "rest",
 		Confidence:    0.5,
 		Probe:         false,
@@ -76,7 +77,7 @@ func TestGenerateSpec_SlugThresholdValidation(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "--slug-threshold must be >= 2")
 
-	off, err := generateSpec(context.Background(), requests, generateSpecOptions{
+	off, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:       "rest",
 		Confidence:    0.5,
 		Probe:         false,
@@ -93,7 +94,7 @@ func TestGenerateSpec_SlugThresholdValidation(t *testing.T) {
 }
 
 // TestGenerateSpec_MergeSlugsWiring proves the --merge-slugs flag flows
-// cmd -> generateSpec -> GetWithOptions -> generator and changes the output.
+// cmd -> pipeline.ClassifyProbeGenerate -> GetWithOptions -> generator and changes the output.
 func TestGenerateSpec_MergeSlugsWiring(t *testing.T) {
 	// Include numeric-ID siblings to prove regex ID normalization is always
 	// on, independent of --merge-slugs, through the full CLI wiring.
@@ -103,7 +104,7 @@ func TestGenerateSpec_MergeSlugsWiring(t *testing.T) {
 	)
 
 	// SlugThreshold intentionally omitted: it is ignored when MergeSlugs is false.
-	off, err := generateSpec(context.Background(), requests, generateSpecOptions{
+	off, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:     "rest",
 		Confidence:  0.5,
 		Probe:       false,
@@ -117,7 +118,7 @@ func TestGenerateSpec_MergeSlugsWiring(t *testing.T) {
 	require.NotContains(t, offStr, "{postSlug}")
 	require.Contains(t, offStr, "/api/users/{userId}")
 
-	on, err := generateSpec(context.Background(), requests, generateSpecOptions{
+	on, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:       "rest",
 		Confidence:    0.5,
 		Probe:         false,
@@ -143,13 +144,13 @@ func TestValidateSlugThreshold(t *testing.T) {
 		slugThreshold int
 		wantErr       bool
 	}{
-		{"rest merge threshold 1 rejected", apiTypeREST, true, 1, true},
-		{"rest merge threshold 0 rejected", apiTypeREST, true, 0, true},
-		{"rest merge threshold 2 ok", apiTypeREST, true, 2, false},
-		{"rest merge off threshold 1 ignored", apiTypeREST, false, 1, false},
-		{"auto merge threshold 1 rejected (avoids wasted crawl)", apiTypeAuto, true, 1, true},
-		{"wsdl merge threshold 1 exempt", apiTypeWSDL, true, 1, false},
-		{"graphql merge threshold 1 exempt", apiTypeGraphQL, true, 1, false},
+		{"rest merge threshold 1 rejected", pipeline.APITypeREST, true, 1, true},
+		{"rest merge threshold 0 rejected", pipeline.APITypeREST, true, 0, true},
+		{"rest merge threshold 2 ok", pipeline.APITypeREST, true, 2, false},
+		{"rest merge off threshold 1 ignored", pipeline.APITypeREST, false, 1, false},
+		{"auto merge threshold 1 rejected (avoids wasted crawl)", pipeline.APITypeAuto, true, 1, true},
+		{"wsdl merge threshold 1 exempt", pipeline.APITypeWSDL, true, 1, false},
+		{"graphql merge threshold 1 exempt", pipeline.APITypeGraphQL, true, 1, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -169,7 +170,7 @@ func TestValidateSlugThreshold(t *testing.T) {
 // produces an open error because validation rejects the flag first.
 func TestGenerateCmdRun_RejectsSlugThresholdBeforeFileIO(t *testing.T) {
 	cmd := &GenerateCmd{
-		APIType:     apiTypeREST,
+		APIType:     pipeline.APITypeREST,
 		Capture:     filepath.Join(t.TempDir(), "does-not-exist.json"),
 		SlugOptions: SlugOptions{MergeSlugs: true, SlugThreshold: 1},
 	}
@@ -189,7 +190,7 @@ func TestGenerateCmdRun_RejectsSlugThresholdBeforeFileIO(t *testing.T) {
 func TestScanCmdRun_RejectsSlugThresholdBeforeCrawl(t *testing.T) {
 	cmd := &ScanCmd{
 		URL:          "https://example.com",
-		APIType:      apiTypeAuto,
+		APIType:      pipeline.APITypeAuto,
 		CrawlOptions: CrawlOptions{Header: []string{"no-colon-header"}},
 		SlugOptions:  SlugOptions{MergeSlugs: true, SlugThreshold: 1},
 	}
@@ -518,9 +519,9 @@ func TestClassifiersForType(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			classifiers := classifiersForType(tt.apiType)
+			classifiers := pipeline.ClassifiersForType(tt.apiType)
 			if len(classifiers) != tt.wantLen {
-				t.Errorf("classifiersForType(%q) got %d classifiers, want %d", tt.apiType, len(classifiers), tt.wantLen)
+				t.Errorf("pipeline.ClassifiersForType(%q) got %d classifiers, want %d", tt.apiType, len(classifiers), tt.wantLen)
 			}
 		})
 	}
@@ -649,12 +650,12 @@ func TestGenerateSpec(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := generateSpec(context.Background(), requests, generateSpecOptions{
+			_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 				APIType:     tt.apiType,
 				Confidence:  0.5,
 				Probe:       tt.probe,
 				Deduplicate: tt.deduplicate,
-				Verbose:     tt.verbose,
+				Status:      statusWriter(tt.verbose),
 			})
 			if tt.wantErr {
 				if err == nil {
@@ -675,13 +676,13 @@ func TestGenerateSpec(t *testing.T) {
 // so the generator returns nil spec with no error.
 func TestGenerateSpec_EmptyRequests(t *testing.T) {
 
-	spec, err := generateSpec(context.Background(), []crawl.ObservedRequest{}, generateSpecOptions{
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), []crawl.ObservedRequest{}, pipeline.Options{
 		APIType:     "rest",
 		Confidence:  0.5,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec() unexpected error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate() unexpected error: %v", err)
 	}
 	// Empty input produces nil or empty spec — no endpoints found.
 	if len(spec) > 0 {
@@ -851,7 +852,7 @@ func TestDangerousAllowPrivate_GenerateSpec(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := generateSpec(context.Background(), requests, generateSpecOptions{
+			_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 				APIType:      "rest",
 				Confidence:   0.5,
 				Probe:        tt.probe,
@@ -859,7 +860,7 @@ func TestDangerousAllowPrivate_GenerateSpec(t *testing.T) {
 				AllowPrivate: true,
 			})
 			if (err != nil) != tt.wantErr {
-				t.Errorf("generateSpec() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("pipeline.ClassifyProbeGenerate() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
@@ -942,17 +943,17 @@ func TestDangerousAllowPrivate_SameOutputForPublicURLs(t *testing.T) {
 		},
 	}
 
-	specWithout, err := generateSpec(context.Background(), requests, generateSpecOptions{
+	specWithout, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:     "rest",
 		Confidence:  0.5,
 		Probe:       true,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(allowPrivate=false) unexpected error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(allowPrivate=false) unexpected error: %v", err)
 	}
 
-	specWith, err := generateSpec(context.Background(), requests, generateSpecOptions{
+	specWith, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:      "rest",
 		Confidence:   0.5,
 		Probe:        true,
@@ -960,7 +961,7 @@ func TestDangerousAllowPrivate_SameOutputForPublicURLs(t *testing.T) {
 		AllowPrivate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(allowPrivate=true) unexpected error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(allowPrivate=true) unexpected error: %v", err)
 	}
 
 	if string(specWithout) != string(specWith) {
@@ -998,7 +999,7 @@ func TestDangerousAllowPrivate_PrivateIPProbe(t *testing.T) {
 	}
 
 	// With allowPrivate=true, probes should reach the loopback server.
-	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:      "rest",
 		Confidence:   0.5,
 		Probe:        true,
@@ -1006,28 +1007,30 @@ func TestDangerousAllowPrivate_PrivateIPProbe(t *testing.T) {
 		AllowPrivate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(allowPrivate=true, probe=true) on loopback: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(allowPrivate=true, probe=true) on loopback: %v", err)
 	}
 	if len(spec) == 0 {
-		t.Error("generateSpec returned empty spec for loopback server with allowPrivate=true")
+		t.Error("pipeline.ClassifyProbeGenerate returned empty spec for loopback server with allowPrivate=true")
 	}
 
 	// Without allowPrivate, probes to loopback should be blocked by SSRF protection.
-	// generateSpec still succeeds (probe errors are non-fatal), but we verify it
+	// pipeline.ClassifyProbeGenerate still succeeds (probe errors are non-fatal), but we verify it
 	// doesn't crash.
-	_, err = generateSpec(context.Background(), requests, generateSpecOptions{
+	_, err = pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:     "rest",
 		Confidence:  0.5,
 		Probe:       true,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(allowPrivate=false, probe=true) on loopback: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(allowPrivate=false, probe=true) on loopback: %v", err)
 	}
 }
 
 // TestDangerousAllowPrivate_WarningOnlyWhenProbing verifies the SSRF warning
-// is only printed when both allowPrivate and probe are true.
+// is only printed when both DangerousAllowPrivate and Probe are true.
+// Drives GenerateCmd.Run (the actual code path where the warning is emitted)
+// and covers both branches of the conditional at main.go:525-527.
 func TestDangerousAllowPrivate_WarningOnlyWhenProbing(t *testing.T) {
 	requests := []crawl.ObservedRequest{
 		{
@@ -1043,26 +1046,81 @@ func TestDangerousAllowPrivate_WarningOnlyWhenProbing(t *testing.T) {
 		},
 	}
 
-	// Capture stderr
-	oldStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
+	t.Run("Probe=false, no warning", func(t *testing.T) {
+		capturePath := filepath.Join(t.TempDir(), "capture.json")
+		f, err := os.Create(capturePath) //nolint:gosec // G304: test file
+		if err != nil {
+			t.Fatalf("failed to create temp capture file: %v", err)
+		}
+		if writeErr := crawl.WriteCapture(f, requests); writeErr != nil {
+			_ = f.Close()
+			t.Fatalf("failed to write capture: %v", writeErr)
+		}
+		_ = f.Close()
 
-	_, _ = generateSpec(context.Background(), requests, generateSpecOptions{
-		APIType:      "rest",
-		Confidence:   0.5,
-		Probe:        false,
-		AllowPrivate: true,
+		oldStderr := os.Stderr
+		r, w, _ := os.Pipe()
+		os.Stderr = w
+		defer func() { os.Stderr = oldStderr }()
+
+		cmd := &GenerateCmd{
+			APIType:               "rest",
+			Capture:               capturePath,
+			Output:                filepath.Join(t.TempDir(), "spec.json"),
+			Probe:                 false,
+			DangerousAllowPrivate: true,
+		}
+		if err := cmd.Run(); err != nil {
+			t.Errorf("GenerateCmd.Run() unexpected error: %v", err)
+		}
+
+		w.Close() //nolint:gosec // G104: test code
+		var buf bytes.Buffer
+		io.Copy(&buf, r) //nolint:gosec // G104: test code
+		os.Stderr = oldStderr
+
+		if strings.Contains(buf.String(), "WARNING") {
+			t.Errorf("SSRF warning should not be printed when probe is disabled; stderr: %q", buf.String())
+		}
 	})
 
-	w.Close() //nolint:gosec // G104: test code
-	var buf bytes.Buffer
-	io.Copy(&buf, r) //nolint:gosec // G104: test code
-	os.Stderr = oldStderr
+	t.Run("Probe=true, warning printed", func(t *testing.T) {
+		capturePath := filepath.Join(t.TempDir(), "capture.json")
+		f, err := os.Create(capturePath) //nolint:gosec // G304: test file
+		if err != nil {
+			t.Fatalf("failed to create temp capture file: %v", err)
+		}
+		if writeErr := crawl.WriteCapture(f, requests); writeErr != nil {
+			_ = f.Close()
+			t.Fatalf("failed to write capture: %v", writeErr)
+		}
+		_ = f.Close()
 
-	if strings.Contains(buf.String(), "WARNING") {
-		t.Error("SSRF warning should not be printed when probe is disabled")
-	}
+		oldStderr := os.Stderr
+		r, w, _ := os.Pipe()
+		os.Stderr = w
+		defer func() { os.Stderr = oldStderr }()
+
+		cmd := &GenerateCmd{
+			APIType:               "rest",
+			Capture:               capturePath,
+			Output:                filepath.Join(t.TempDir(), "spec.json"),
+			Probe:                 true,
+			DangerousAllowPrivate: true,
+		}
+		if err := cmd.Run(); err != nil {
+			t.Errorf("GenerateCmd.Run() unexpected error: %v", err)
+		}
+
+		w.Close() //nolint:gosec // G104: test code
+		var buf bytes.Buffer
+		io.Copy(&buf, r) //nolint:gosec // G104: test code
+		os.Stderr = oldStderr
+
+		if !strings.Contains(buf.String(), "WARNING") {
+			t.Errorf("SSRF warning should be printed when probe is enabled; stderr: %q", buf.String())
+		}
+	})
 }
 
 // TestDoCrawl_ProxyIgnoredWithoutHeadless verifies that doCrawl warns and clears
@@ -1453,7 +1511,7 @@ func TestDetectAPIType(t *testing.T) {
 			name:      "empty requests defaults to rest",
 			requests:  nil,
 			threshold: 0.5,
-			want:      apiTypeREST,
+			want:      pipeline.APITypeREST,
 		},
 		{
 			name: "REST JSON requests returns rest",
@@ -1471,7 +1529,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      apiTypeREST,
+			want:      pipeline.APITypeREST,
 		},
 		{
 			name: "SOAP request with SOAPAction header returns wsdl",
@@ -1487,7 +1545,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      apiTypeWSDL,
+			want:      pipeline.APITypeWSDL,
 		},
 		{
 			name: "WSDL URL query param returns wsdl",
@@ -1501,7 +1559,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      apiTypeWSDL,
+			want:      pipeline.APITypeWSDL,
 		},
 		{
 			name: "SOAP envelope in body returns wsdl",
@@ -1516,7 +1574,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      apiTypeWSDL,
+			want:      pipeline.APITypeWSDL,
 		},
 		{
 			name: "majority SOAP traffic returns wsdl",
@@ -1541,7 +1599,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      apiTypeWSDL,
+			want:      pipeline.APITypeWSDL,
 		},
 		{
 			name: "minority SOAP in mostly REST traffic returns rest",
@@ -1583,7 +1641,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      apiTypeREST,
+			want:      pipeline.APITypeREST,
 		},
 		{
 			name: "SOAP below threshold returns rest",
@@ -1602,7 +1660,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.90,
-			want:      apiTypeREST,
+			want:      pipeline.APITypeREST,
 		},
 		{
 			name: "GraphQL POST to /graphql returns graphql",
@@ -1622,7 +1680,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      apiTypeGraphQL,
+			want:      pipeline.APITypeGraphQL,
 		},
 		{
 			name: "majority GraphQL traffic returns graphql",
@@ -1666,7 +1724,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      apiTypeGraphQL,
+			want:      pipeline.APITypeGraphQL,
 		},
 		{
 			name: "minority GraphQL in mostly REST traffic returns rest",
@@ -1710,15 +1768,15 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      apiTypeREST,
+			want:      pipeline.APITypeREST,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := detectAPIType(tt.requests, tt.threshold)
+			got := pipeline.DetectAPIType(tt.requests, tt.threshold)
 			if got != tt.want {
-				t.Errorf("detectAPIType() = %q, want %q", got, tt.want)
+				t.Errorf("pipeline.DetectAPIType() = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -1739,14 +1797,14 @@ func TestGenerateSpec_WSDLType(t *testing.T) {
 		},
 	}
 
-	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
-		APIType:     apiTypeWSDL,
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:     pipeline.APITypeWSDL,
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(wsdl) unexpected error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(wsdl) unexpected error: %v", err)
 	}
 	if len(spec) == 0 {
 		t.Fatal("generateSpec(wsdl) returned empty spec for SOAP traffic")
@@ -1780,20 +1838,20 @@ func TestScanPipeline_WSDLDetection(t *testing.T) {
 	}
 
 	// Step 1: Detect API type (this is the new logic)
-	apiType := detectAPIType(soapRequests, 0.5)
-	if apiType != apiTypeWSDL {
-		t.Fatalf("detectAPIType() = %q for SOAP traffic, want %q", apiType, apiTypeWSDL)
+	apiType := pipeline.DetectAPIType(soapRequests, 0.5)
+	if apiType != pipeline.APITypeWSDL {
+		t.Fatalf("pipeline.DetectAPIType() = %q for SOAP traffic, want %q", apiType, pipeline.APITypeWSDL)
 	}
 
 	// Step 2: Generate spec with detected type
-	spec, err := generateSpec(context.Background(), soapRequests, generateSpecOptions{
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), soapRequests, pipeline.Options{
 		APIType:     apiType,
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(%s) error: %v", apiType, err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(%s) error: %v", apiType, err)
 	}
 	if len(spec) == 0 {
 		t.Fatal("scan pipeline produced empty output for SOAP traffic")
@@ -1827,21 +1885,21 @@ func TestDetectAPIType_ExplicitOverride(t *testing.T) {
 	}
 
 	// With auto, should detect WSDL
-	autoType := detectAPIType(soapRequests, 0.5)
-	if autoType != apiTypeWSDL {
-		t.Fatalf("auto detection = %q, want %q", autoType, apiTypeWSDL)
+	autoType := pipeline.DetectAPIType(soapRequests, 0.5)
+	if autoType != pipeline.APITypeWSDL {
+		t.Fatalf("auto detection = %q, want %q", autoType, pipeline.APITypeWSDL)
 	}
 
-	// With explicit REST override, generateSpec should produce REST output
+	// With explicit REST override, pipeline.ClassifyProbeGenerate should produce REST output
 	// (even though the traffic is SOAP — user explicitly chose REST)
-	spec, err := generateSpec(context.Background(), soapRequests, generateSpecOptions{
-		APIType:     apiTypeREST,
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), soapRequests, pipeline.Options{
+		APIType:     pipeline.APITypeREST,
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(rest override) error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(rest override) error: %v", err)
 	}
 	// REST classifier won't match SOAP traffic, so spec should be empty/nil
 	if len(spec) > 0 && strings.Contains(string(spec), "definitions") {
@@ -1875,17 +1933,17 @@ func TestGenerateSpec_WSDLFromResponseBody(t *testing.T) {
 		},
 	}
 
-	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
-		APIType:     apiTypeWSDL,
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:     pipeline.APITypeWSDL,
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(wsdl, response-body traffic) unexpected error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(wsdl, response-body traffic) unexpected error: %v", err)
 	}
 	if len(spec) == 0 {
-		t.Fatal("generateSpec(wsdl, response-body traffic) returned empty spec")
+		t.Fatal("pipeline.ClassifyProbeGenerate(wsdl, response-body traffic) returned empty spec")
 	}
 	specStr := string(spec)
 	if !strings.Contains(specStr, "definitions") {
@@ -1928,17 +1986,17 @@ func TestGenerateSpec_WSDLFromCrawledWSDLDocument(t *testing.T) {
 		},
 	}
 
-	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
-		APIType:     apiTypeWSDL,
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:     pipeline.APITypeWSDL,
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(wsdl, crawled ?wsdl doc) unexpected error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(wsdl, crawled ?wsdl doc) unexpected error: %v", err)
 	}
 	if len(spec) == 0 {
-		t.Fatal("generateSpec(wsdl, crawled ?wsdl doc) returned empty spec")
+		t.Fatal("pipeline.ClassifyProbeGenerate(wsdl, crawled ?wsdl doc) returned empty spec")
 	}
 	// Should return the original WSDL document via Phase 1
 	if !strings.Contains(string(spec), "TestService") {
@@ -1965,20 +2023,20 @@ func TestScanPipeline_RealisticCrawlTraffic(t *testing.T) {
 	}
 
 	// Step 1: Auto-detect should identify WSDL
-	apiType := detectAPIType(crawlTraffic, 0.5)
-	if apiType != apiTypeWSDL {
-		t.Fatalf("detectAPIType() = %q, want %q", apiType, apiTypeWSDL)
+	apiType := pipeline.DetectAPIType(crawlTraffic, 0.5)
+	if apiType != pipeline.APITypeWSDL {
+		t.Fatalf("pipeline.DetectAPIType() = %q, want %q", apiType, pipeline.APITypeWSDL)
 	}
 
 	// Step 2: Generate should produce WSDL output
-	spec, err := generateSpec(context.Background(), crawlTraffic, generateSpecOptions{
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), crawlTraffic, pipeline.Options{
 		APIType:     apiType,
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(%s) error: %v", apiType, err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(%s) error: %v", apiType, err)
 	}
 	if len(spec) == 0 {
 		t.Fatal("scan pipeline produced empty output for realistic crawl SOAP traffic")
@@ -2010,8 +2068,8 @@ func TestGenerateSpec_WSDLEmptyBodyNoResponse(t *testing.T) {
 		},
 	}
 
-	_, err := generateSpec(context.Background(), requests, generateSpecOptions{
-		APIType:     apiTypeWSDL,
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:     pipeline.APITypeWSDL,
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
@@ -2052,7 +2110,7 @@ func TestProbeWSDLDocument_ValidWSDL(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	doc := probeWSDLDocument(ts.URL+"/calculator.asmx", true, false)
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/calculator.asmx", true, nil)
 	if doc == nil {
 		t.Fatal("probeWSDLDocument returned nil for valid WSDL endpoint")
 	}
@@ -2070,7 +2128,7 @@ func TestProbeWSDLDocument_NoWSDL(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	doc := probeWSDLDocument(ts.URL, true, false)
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL, true, nil)
 	if doc != nil {
 		t.Errorf("probeWSDLDocument should return nil for non-WSDL endpoint, got %d bytes", len(doc))
 	}
@@ -2084,7 +2142,7 @@ func TestProbeWSDLDocument_404(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	doc := probeWSDLDocument(ts.URL, true, false)
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL, true, nil)
 	if doc != nil {
 		t.Error("probeWSDLDocument should return nil for 404 response")
 	}
@@ -2135,13 +2193,13 @@ func TestScanPipeline_WSDLDiscoveryProbe(t *testing.T) {
 	}
 
 	// Passive detection sees no WSDL — but active probe finds it
-	passiveType := detectAPIType(crawlTraffic, 0.5)
-	if passiveType != apiTypeREST {
+	passiveType := pipeline.DetectAPIType(crawlTraffic, 0.5)
+	if passiveType != pipeline.APITypeREST {
 		t.Fatalf("passive detection should return REST for HTML, got %q", passiveType)
 	}
 
 	// Active probe discovers the WSDL document
-	wsdlDoc := probeWSDLDocument(ts.URL+"/calculator.asmx", true, false)
+	wsdlDoc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/calculator.asmx", true, nil)
 	if wsdlDoc == nil {
 		t.Fatal("probeWSDLDocument should find the WSDL document")
 	}
@@ -2158,14 +2216,14 @@ func TestScanPipeline_WSDLDiscoveryProbe(t *testing.T) {
 	})
 
 	// Generate WSDL spec
-	spec, err := generateSpec(context.Background(), crawlTraffic, generateSpecOptions{
-		APIType:     apiTypeWSDL,
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), crawlTraffic, pipeline.Options{
+		APIType:     pipeline.APITypeWSDL,
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate error: %v", err)
 	}
 	if len(spec) == 0 {
 		t.Fatal("pipeline produced empty output")
@@ -2223,7 +2281,7 @@ func TestProbeWSDLDocument_URLConstruction(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			probeWSDLDocument(ts.URL+tt.inputPath, true, false)
+			pipeline.ProbeWSDLDocument(context.Background(), ts.URL+tt.inputPath, true, nil)
 
 			if gotQuery != tt.wantQuery {
 				t.Errorf("probeWSDLDocument(%q) sent query %q, want %q", tt.inputPath, gotQuery, tt.wantQuery)
@@ -2238,9 +2296,9 @@ func TestAPITypeDisplayName(t *testing.T) {
 		input string
 		want  string
 	}{
-		{apiTypeREST, "REST"},
-		{apiTypeWSDL, "WSDL"},
-		{apiTypeGraphQL, "GraphQL"},
+		{pipeline.APITypeREST, "REST"},
+		{pipeline.APITypeWSDL, "WSDL"},
+		{pipeline.APITypeGraphQL, "GraphQL"},
 		{"unknown", "unknown"},
 	}
 	for _, tt := range tests {
@@ -2346,19 +2404,18 @@ func TestGenerateSpec_ExtractsFormParametersIntoOpenAPI(t *testing.T) {
 	requests := []crawl.ObservedRequest{req}
 	requests = append(requests, analyze.ExtractForms(requests)...)
 
-	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:     "rest",
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
-		Verbose:     false,
 	})
 
 	if err != nil {
-		t.Fatalf("generateSpec() unexpected error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate() unexpected error: %v", err)
 	}
 	if len(spec) == 0 {
-		t.Fatal("generateSpec() returned empty spec; expected OpenAPI YAML with /login path")
+		t.Fatal("pipeline.ClassifyProbeGenerate() returned empty spec; expected OpenAPI YAML with /login path")
 	}
 
 	// Unmarshal into a generic map so we can navigate without importing kin-openapi.
@@ -2441,19 +2498,18 @@ func TestGenerateSpec_ExtractsGETFormParametersIntoOpenAPI(t *testing.T) {
 
 	requests = append(requests, analyze.ExtractForms(requests)...)
 
-	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:     "rest",
 		Confidence:  0.0, // See function comment: synthetic GET form requests score 0 confidence.
 		Probe:       false,
 		Deduplicate: true,
-		Verbose:     false,
 	})
 
 	if err != nil {
-		t.Fatalf("generateSpec() unexpected error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate() unexpected error: %v", err)
 	}
 	if len(spec) == 0 {
-		t.Fatal("generateSpec() returned empty spec; expected OpenAPI YAML with /search path")
+		t.Fatal("pipeline.ClassifyProbeGenerate() returned empty spec; expected OpenAPI YAML with /search path")
 	}
 
 	// Unmarshal into a generic map so we can navigate without importing kin-openapi.
@@ -2518,66 +2574,6 @@ func TestGenerateSpec_ExtractsGETFormParametersIntoOpenAPI(t *testing.T) {
 	}
 }
 
-// --- TEST-001: augmentWithStaticForms unit tests ---
-
-// TestAugmentWithStaticForms tests the augmentWithStaticForms helper introduced
-// in the ScanCmd refactor (TEST-001 source change).
-func TestAugmentWithStaticForms(t *testing.T) {
-	t.Run("AppendsSyntheticAfterOriginal", func(t *testing.T) {
-		htmlBody := `<form action="/x"><input name="q"></form>`
-		requests := []crawl.ObservedRequest{
-			{
-				Method: "GET",
-				URL:    "https://host/page",
-				Response: crawl.ObservedResponse{
-					StatusCode:  200,
-					ContentType: "text/html",
-					Body:        []byte(htmlBody),
-				},
-			},
-		}
-		out := augmentWithStaticForms(requests)
-		if len(out) != len(requests)+1 {
-			t.Fatalf("len(out) = %d, want %d", len(out), len(requests)+1)
-		}
-		synth := out[len(requests)]
-		if synth.Source != analyze.SourceStaticHTML {
-			t.Errorf("out[%d].Source = %q, want %q", len(requests), synth.Source, analyze.SourceStaticHTML)
-		}
-		if !strings.Contains(synth.URL, "/x") {
-			t.Errorf("out[%d].URL = %q, want URL containing /x", len(requests), synth.URL)
-		}
-	})
-
-	t.Run("EmptyInputReturnsEmpty", func(t *testing.T) {
-		if out := augmentWithStaticForms(nil); len(out) != 0 {
-			t.Errorf("augmentWithStaticForms(nil) len = %d, want 0", len(out))
-		}
-		if out := augmentWithStaticForms([]crawl.ObservedRequest{}); len(out) != 0 {
-			t.Errorf("augmentWithStaticForms([]) len = %d, want 0", len(out))
-		}
-	})
-
-	t.Run("NonHTMLRequestUnchanged", func(t *testing.T) {
-		requests := []crawl.ObservedRequest{
-			{
-				Method: "GET",
-				URL:    "https://host/api/data",
-				Response: crawl.ObservedResponse{
-					StatusCode:  200,
-					ContentType: "application/json",
-					Body:        []byte(`{"key":"value"}`),
-				},
-			},
-		}
-		out := augmentWithStaticForms(requests)
-		// No HTML body → ExtractForms produces nothing → out == original slice
-		if len(out) != 1 {
-			t.Errorf("len(out) = %d, want 1 (non-HTML request produces no synth)", len(out))
-		}
-	})
-}
-
 // --- QUAL-001: synthetic-only GET form does not create a path in the spec ---
 
 // TestGenerateSpec_SyntheticOnlyGETFormYieldsNoPath verifies that a synthetic
@@ -2607,15 +2603,14 @@ func TestGenerateSpec_SyntheticOnlyGETFormYieldsNoPath(t *testing.T) {
 
 	// Use the default confidence threshold (0.5). Synthetic static:html GET
 	// form requests score 0 confidence, so they will not pass this gate.
-	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:     "rest",
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
-		Verbose:     false,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec() unexpected error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate() unexpected error: %v", err)
 	}
 
 	// Spec may be empty or contain paths for high-confidence endpoints — either
@@ -2649,7 +2644,7 @@ func TestGenerateSpec_SyntheticOnlyGETFormYieldsNoPath(t *testing.T) {
 // synthesizes the POST observation. A regression that reverts the ScanCmd.Run
 // reorder would silently fall through here.
 func TestDetectAPIType_StaticHTMLPostFormDrivesREST(t *testing.T) {
-	// A SOAP request anchors the raw set to WSDL so that rawType != apiTypeREST.
+	// A SOAP request anchors the raw set to WSDL so that rawType != pipeline.APITypeREST.
 	// Without this, detectAPIType falls back to REST even with zero signals,
 	// making it impossible to observe the change ExtractForms causes.
 	soapAnchor := crawl.ObservedRequest{
@@ -2683,14 +2678,14 @@ func TestDetectAPIType_StaticHTMLPostFormDrivesREST(t *testing.T) {
 	}
 
 	raw := []crawl.ObservedRequest{soapAnchor, landingPage}
-	rawType := detectAPIType(raw, 0.5)
+	rawType := pipeline.DetectAPIType(raw, 0.5)
 
 	augmented := append([]crawl.ObservedRequest{}, raw...)
 	augmented = append(augmented, analyze.ExtractForms(raw)...)
-	augType := detectAPIType(augmented, 0.5)
+	augType := pipeline.DetectAPIType(augmented, 0.5)
 
-	if augType != apiTypeREST {
-		t.Errorf("detectAPIType(augmented) = %q, want %q", augType, apiTypeREST)
+	if augType != pipeline.APITypeREST {
+		t.Errorf("pipeline.DetectAPIType(augmented) = %q, want %q", augType, pipeline.APITypeREST)
 	}
 	if rawType == augType {
 		t.Errorf("ExtractForms must change classification: raw=%q augmented=%q (both same — pipeline reorder isn't load-bearing)", rawType, augType)
