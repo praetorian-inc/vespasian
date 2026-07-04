@@ -10,7 +10,7 @@ require (
 	github.com/go-rod/rod v0.116.2
 	github.com/praetorian-inc/capability-sdk v0.0.0-20260521173605-4b0d5a7320ae
 	github.com/stretchr/testify v1.11.1
-	github.com/vektah/gqlparser/v2 v2.5.35
+	github.com/vektah/gqlparser/v2 v2.5.36
 	github.com/ysmood/gson v0.7.3
 	golang.org/x/net v0.56.0
 	golang.org/x/time v0.15.0
