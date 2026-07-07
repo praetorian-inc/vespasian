@@ -15,6 +15,7 @@
 package grpc
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -405,6 +406,61 @@ func TestGenerator_Generate_ConflictingDescriptorsError(t *testing.T) {
 // TestGenerator_Generate_IdenticalDescriptorsDedup verifies that two endpoints
 // carrying the same filename with identical bytes do not trigger a conflict —
 // the generator deduplicates them and produces valid output.
+// TestGenerator_Generate_TooManyDescriptorsErrors verifies that Generate
+// rejects a merged descriptor set exceeding maxGRPCFileDescriptors before it
+// ever attempts to unmarshal the (arbitrary, non-descriptor) bytes.
+func TestGenerator_Generate_TooManyDescriptorsErrors(t *testing.T) {
+	g := &Generator{}
+
+	fileDescriptors := make(map[string][]byte, maxGRPCFileDescriptors+1)
+	for i := 0; i < maxGRPCFileDescriptors+1; i++ {
+		fileDescriptors[fmt.Sprintf("f%d.proto", i)] = []byte{0x00}
+	}
+
+	endpoints := []classify.ClassifiedRequest{
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors:   fileDescriptors,
+			},
+		},
+	}
+
+	spec, err := g.Generate(endpoints)
+	require.Error(t, err)
+	assert.Empty(t, spec)
+	assert.Contains(t, err.Error(), "too many")
+}
+
+// TestGenerator_Generate_DescriptorsExceedByteCapErrors verifies that Generate
+// rejects a merged descriptor set whose aggregate byte size exceeds
+// maxGRPCDescriptorBytes. The count stays at one entry so execution reaches
+// the byte-cap check (which runs after the count check).
+func TestGenerator_Generate_DescriptorsExceedByteCapErrors(t *testing.T) {
+	g := &Generator{}
+
+	// The ~64 MiB allocation below is intentional: it's the smallest way to
+	// exercise the aggregate-byte guard, and it's transient (freed once the
+	// test returns).
+	oversized := make([]byte, maxGRPCDescriptorBytes+1)
+
+	endpoints := []classify.ClassifiedRequest{
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors:   map[string][]byte{"huge.proto": oversized},
+			},
+		},
+	}
+
+	spec, err := g.Generate(endpoints)
+	require.Error(t, err)
+	assert.Empty(t, spec)
+	assert.Contains(t, err.Error(), "too large")
+}
+
 func TestGenerator_Generate_IdenticalDescriptorsDedup(t *testing.T) {
 	g := &Generator{}
 	raw := fileDescriptorBytes(t)

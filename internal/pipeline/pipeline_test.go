@@ -335,6 +335,8 @@ func TestClassifyProbeGenerate_GRPCInsecureSkipVerify(t *testing.T) {
 			GRPCInsecureSkipVerify: false,
 		})
 		require.Error(t, err)
+		assert.Contains(t, err.Error(), "reflection",
+			"verify-by-default must fail because reflection never ran (no descriptors), not some unrelated error")
 		assert.Empty(t, spec)
 	})
 }
