@@ -1123,20 +1123,47 @@ func TestDangerousAllowPrivate_WarningOnlyWhenProbing(t *testing.T) {
 	})
 }
 
-// TestDoCrawl_ProxyIgnoredWithoutHeadless verifies that doCrawl warns and clears
-// the proxy option when headless mode is disabled.
-func TestDoCrawl_ProxyIgnoredWithoutHeadless(t *testing.T) {
+// TestDoCrawl_ProxyHonoredWithoutHeadless verifies the HTTP backend no longer
+// warns-and-clears --proxy when headless mode is disabled (LAB-4011). The proxy
+// (loopback, nothing listening) makes the fetch fail, but the crawl returns
+// gracefully; the key assertion is that the old warn-and-clear message is gone.
+func TestDoCrawl_ProxyHonoredWithoutHeadless(t *testing.T) {
 	var buf bytes.Buffer
 	opts := crawl.CrawlerOptions{
 		Headless: false,
 		Proxy:    "http://127.0.0.1:8080",
+		Timeout:  5 * time.Second,
 	}
-	// doCrawl will warn and clear proxy before creating the crawler.
-	// It will then fail on the actual crawl (no valid URL), but we only
-	// care about the warning message.
 	_, _ = doCrawl(context.Background(), &buf, "https://example.com", opts)
-	if !strings.Contains(buf.String(), "warning: --proxy is only supported with headless browser mode") {
-		t.Errorf("expected proxy warning on stderr, got %q", buf.String())
+	if strings.Contains(buf.String(), "only supported with headless browser mode") {
+		t.Errorf("stderr still carries the removed warn-and-clear message: %q", buf.String())
+	}
+}
+
+// TestDoCrawl_InvalidProxyRejected verifies doCrawl validates --proxy via
+// ValidateProxyAddr BEFORE printing it, so an invalid, credential-bearing proxy
+// is rejected with an error and the credentials never reach stderr (LAB-4011).
+// The credential string is assembled at runtime to avoid a hardcoded-credential
+// lint false positive on a deliberate test fixture.
+func TestDoCrawl_InvalidProxyRejected(t *testing.T) {
+	var buf bytes.Buffer
+	badProxy := "http://" + "admin:s3cret" + "@127.0.0.1" // no port + embedded creds
+	opts := crawl.CrawlerOptions{
+		Headless: false,
+		Proxy:    badProxy,
+		Timeout:  5 * time.Second,
+	}
+	_, err := doCrawl(context.Background(), &buf, "https://example.com", opts)
+	if err == nil {
+		t.Fatal("expected error for proxy with embedded credentials, got nil")
+	}
+	if !strings.Contains(err.Error(), "embedded credentials") {
+		t.Errorf("error = %q, want containing %q", err.Error(), "embedded credentials")
+	}
+	// The credentials must not leak to stderr (the port-less warning that would
+	// have printed opts.Proxy must never run for an invalid proxy).
+	if strings.Contains(buf.String(), "s3cret") || strings.Contains(err.Error(), "s3cret") {
+		t.Errorf("credentials leaked: stderr=%q err=%v", buf.String(), err)
 	}
 }
 

@@ -18,8 +18,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,7 +37,7 @@ import (
 // http.DefaultTransport itself (no override).
 func TestNewHTTPClient_SSRFGuard(t *testing.T) {
 	t.Run("allowPrivate=false uses guarded transport", func(t *testing.T) {
-		c := newHTTPClient(nil, false, 30*time.Second)
+		c := newHTTPClient(nil, false, 30*time.Second, nil)
 		if c == nil {
 			t.Fatal("newHTTPClient returned nil")
 		}
@@ -50,10 +53,14 @@ func TestNewHTTPClient_SSRFGuard(t *testing.T) {
 		if tr.DialContext == nil {
 			t.Error("Transport.DialContext = nil, want non-nil (ssrfSafeDialContext)")
 		}
+		// No proxy configured: TLS verification must NOT be disabled.
+		if tr.TLSClientConfig != nil && tr.TLSClientConfig.InsecureSkipVerify {
+			t.Error("InsecureSkipVerify must be false when no proxy is set")
+		}
 	})
 
 	t.Run("allowPrivate=true uses DefaultTransport", func(t *testing.T) {
-		c := newHTTPClient(nil, true, 30*time.Second)
+		c := newHTTPClient(nil, true, 30*time.Second, nil)
 		if c == nil {
 			t.Fatal("newHTTPClient returned nil")
 		}
@@ -62,6 +69,142 @@ func TestNewHTTPClient_SSRFGuard(t *testing.T) {
 				c.Transport, c.Transport, http.DefaultTransport)
 		}
 	})
+}
+
+// TestNewHTTPClient_Proxy verifies that when a proxy URL is provided the
+// returned client's transport routes through it, disables TLS verification (for
+// intercepting proxies), and does NOT install the SSRF dial guard — so a
+// loopback proxy is reachable (LAB-4011).
+func TestNewHTTPClient_Proxy(t *testing.T) {
+	proxyURL, err := url.Parse("http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("parse proxy: %v", err)
+	}
+
+	c := newHTTPClient(nil, false, 30*time.Second, proxyURL)
+	if c == nil {
+		t.Fatal("newHTTPClient returned nil")
+	}
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport = %T, want *http.Transport", c.Transport)
+	}
+
+	// Proxy func must be set and resolve to the configured proxy for any request.
+	if tr.Proxy == nil {
+		t.Fatal("Transport.Proxy = nil, want configured proxy func")
+	}
+	req, _ := http.NewRequest(http.MethodGet, "https://example.com/", nil)
+	got, err := tr.Proxy(req)
+	if err != nil {
+		t.Fatalf("Transport.Proxy(req) error = %v", err)
+	}
+	if got == nil || got.String() != proxyURL.String() {
+		t.Errorf("Transport.Proxy(req) = %v, want %s", got, proxyURL)
+	}
+
+	// TLS verification must be disabled for the proxy MITM case.
+	if tr.TLSClientConfig == nil || !tr.TLSClientConfig.InsecureSkipVerify {
+		t.Error("InsecureSkipVerify = false, want true when proxy is set")
+	}
+
+	// The SSRF dial guard must NOT be installed even with allowPrivate=false,
+	// otherwise a loopback proxy would be blocked. The cloned DefaultTransport
+	// keeps a plain dialer, so dialing a listening loopback socket must succeed;
+	// ssrfSafeDialContext would reject it. This positively proves the guard is
+	// skipped when proxied (func identity can't be compared directly in Go).
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen loopback: %v", err)
+	}
+	defer ln.Close() //nolint:errcheck // test cleanup
+	if tr.DialContext == nil {
+		t.Fatal("Transport.DialContext = nil, want the default dialer for the proxy connection")
+	}
+	conn, err := tr.DialContext(context.Background(), "tcp", ln.Addr().String())
+	if err != nil {
+		t.Errorf("proxy-branch DialContext rejected loopback dial (ssrf guard not skipped): %v", err)
+	} else {
+		conn.Close() //nolint:gosec // test cleanup
+	}
+}
+
+// TestHTTPCrawler_RoutesThroughProxy is an end-to-end check that the HTTP
+// backend sends its requests through the configured proxy. The proxy runs on
+// loopback, which the SSRF dial guard would reject — so a successful crawl
+// proves the guard is correctly skipped when --proxy is set (LAB-4011).
+func TestHTTPCrawler_RoutesThroughProxy(t *testing.T) {
+	// Origin server the proxy will forward to.
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<html><body>ok</body></html>")
+	}))
+	defer origin.Close()
+
+	// A minimal forwarding proxy on loopback. It records that it was used and
+	// proxies the (plain http) request to the origin.
+	var proxied atomic.Int64
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxied.Add(1)
+		outReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.RequestURI, nil) //nolint:gosec // test proxy forwards the received request URI
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		resp, err := http.DefaultTransport.RoundTrip(outReq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close() //nolint:errcheck // test cleanup
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body) //nolint:gosec // test best-effort
+	}))
+	defer proxy.Close()
+
+	c := &HTTPCrawler{opts: CrawlerOptions{
+		Depth:    0,
+		MaxPages: 1,
+		Timeout:  10 * time.Second,
+		Proxy:    proxy.URL, // loopback proxy — blocked by ssrf dial guard unless skipped
+		// AllowPrivate lets the loopback httptest origin pass the upfront scope
+		// check (which is independent of --proxy: proxy relaxes only the
+		// dial-time IP pin, not URL scope). The proxy branch is still exercised.
+		AllowPrivate: true,
+	}}
+
+	results, err := c.Crawl(context.Background(), origin.URL)
+	if err != nil {
+		t.Fatalf("Crawl error = %v", err)
+	}
+	if proxied.Load() == 0 {
+		t.Error("proxy was not used; request did not route through --proxy")
+	}
+	if len(results) == 0 {
+		t.Error("expected at least one observed request routed via the proxy")
+	}
+}
+
+// TestHTTPCrawler_InvalidProxyRejected verifies that an invalid proxy address
+// is rejected by Crawl on the HTTP path via the shared ValidateProxyAddr,
+// before any network activity (LAB-4011). Credential redaction itself is
+// covered by TestValidateProxyAddr; here an unsupported scheme is enough to
+// prove the validation is wired into Crawl and the error propagates.
+func TestHTTPCrawler_InvalidProxyRejected(t *testing.T) {
+	c := &HTTPCrawler{opts: CrawlerOptions{
+		Depth:    0,
+		MaxPages: 1,
+		Timeout:  10 * time.Second,
+		Proxy:    "ftp://127.0.0.1:21",
+	}}
+
+	_, err := c.Crawl(context.Background(), "http://example.com/")
+	if err == nil {
+		t.Fatal("expected error for unsupported proxy scheme, got nil")
+	}
+	if !strings.Contains(err.Error(), "scheme must be") {
+		t.Errorf("error = %q, want containing %q", err.Error(), "scheme must be")
+	}
 }
 
 func TestHTTPCrawler_FollowsLinks(t *testing.T) {

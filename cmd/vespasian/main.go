@@ -138,16 +138,16 @@ const shutdownBackstop = 10 * time.Second
 func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl.CrawlerOptions) ([]crawl.ObservedRequest, error) {
 	opts.Stderr = stderr
 
-	if opts.Proxy != "" && !opts.Headless {
-		fmt.Fprintf(stderr, "warning: --proxy is only supported with headless browser mode; ignoring proxy setting\n") //nolint:errcheck // best-effort warning
-		opts.Proxy = ""
-	}
-
-	// Safety: opts.Proxy is printed below. All current callers (CrawlCmd.Run,
-	// ScanCmd.Run) validate via setupBrowserAndSignals → validateProxyAddr first,
-	// which rejects embedded credentials. If adding a new caller, ensure
-	// validateProxyAddr runs before reaching this point.
+	// --proxy is honored on both backends: the headless path routes Chrome via
+	// --proxy-server, the HTTP path routes the net/http transport (LAB-4011).
+	// Validate here BEFORE opts.Proxy is printed below so an invalid or
+	// credential-bearing address is rejected (and never logged). The backends
+	// re-validate (NewBrowserManager for headless, HTTPCrawler.Crawl for HTTP),
+	// so library/SDK callers are covered independently of this CLI check.
 	if opts.Proxy != "" {
+		if err := crawl.ValidateProxyAddr(opts.Proxy); err != nil {
+			return nil, err
+		}
 		if u, err := url.Parse(opts.Proxy); err == nil && u.Port() == "" {
 			fmt.Fprintf(stderr, "warning: --proxy address %q has no explicit port; most proxies require one (e.g., :8080)\n", opts.Proxy) //nolint:errcheck // best-effort warning
 		}
@@ -237,7 +237,7 @@ type CrawlOptions struct {
 	Timeout         time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
 	Scope           string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
 	Headless        bool          `default:"true" help:"Use headless browser"`
-	Proxy           string        `help:"Proxy address for headless browser (e.g., http://127.0.0.1:8080). Note: TLS certificate verification is disabled during crawls."`
+	Proxy           string        `help:"Proxy address for both crawler backends (e.g., http://127.0.0.1:8080); http/https/socks5. Routes Chrome (headless) or the net/http transport (--headless=false). TLS certificate verification is disabled during proxy crawls (for intercepting proxies like Burp/mitmproxy). With --proxy the dial-time SSRF IP pin is skipped for the proxy connection; URL scope is still enforced, so private targets still require --dangerous-allow-private."`
 	Concurrency     int           `default:"10" help:"Number of concurrent browser tabs for headless crawling"`
 	NoRequestID     bool          `name:"no-request-id" help:"Disable automatic X-Vespasian-Request-Id header"`
 	Verbose         bool          `short:"v" help:"Enable verbose logging"`

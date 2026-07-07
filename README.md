@@ -50,7 +50,7 @@ Vespasian takes a different approach: it observes actual network traffic at the 
 | **Path Normalization** | `/users/42` and `/users/87` become `/users/{id}` with known literal preservation (`/me`, `/self`) |
 | **SSRF Protection** | Blocks crawling and probing of private and loopback addresses by default. Pass `--dangerous-allow-private` to test internal targets (localhost, 127.0.0.1, RFC1918, link-local); the flag is required when the seed URL is itself a private host. |
 | **JS Bundle Static Analysis** | Statically analyses captured JavaScript bundles to recover API endpoints, path parameters, and request-body fields missed by dynamic crawling. Enabled by default via `--analyze-js`; sourcemap recovery is controlled by `--fetch-sourcemaps` (default: `true` for `scan`/`crawl`, `false` for `generate`). |
-| **Proxy Support** | Route headless browser traffic through Burp Suite or other intercepting proxies |
+| **Proxy Support** | Route traffic through Burp Suite or other intercepting proxies on both backends (headless Chrome and `--headless=false` net/http); http/https/socks5 |
 | **Two-Stage Pipeline** | Capture once, generate many: separate capture and generation steps for maximum flexibility |
 
 ## How It Works
@@ -178,8 +178,11 @@ vespasian generate wsdl capture.json -o service.wsdl
 ### Common Options
 
 ```bash
-# Route crawl traffic through Burp Suite
+# Route crawl traffic through Burp Suite (headless backend)
 vespasian scan https://app.example.com --proxy http://127.0.0.1:8080 -o api.yaml
+
+# Route the dependency-free net/http backend through a proxy (no Chrome needed)
+vespasian crawl https://app.example.com --headless=false --proxy http://127.0.0.1:8080 -o capture.json
 
 # Scan a local/private target (bypasses SSRF protection)
 vespasian scan http://localhost:3000 --dangerous-allow-private -o api.yaml
@@ -268,7 +271,10 @@ vespasian scan <url> [flags]
   --timeout          Maximum duration for the entire scan (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine
-  --proxy            Proxy URL for headless browser (e.g., http://127.0.0.1:8080)
+  --proxy            Proxy URL for both backends (e.g., http://127.0.0.1:8080); http/https/socks5.
+                     TLS verification is disabled during proxy crawls (for intercepting proxies).
+                     Private targets still require --dangerous-allow-private (proxy relaxes only the
+                     dial-time SSRF pin, not URL scope).
   --confidence       Min classification confidence (default: 0.5)
   --probe            Enable active probing (default: true)
   --deduplicate      Deduplicate endpoints before probing (default: true)
@@ -295,7 +301,10 @@ vespasian crawl <url> [flags]
   --timeout          Maximum duration for the entire crawl (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine
-  --proxy            Proxy URL for headless browser (e.g., http://127.0.0.1:8080)
+  --proxy            Proxy URL for both backends (e.g., http://127.0.0.1:8080); http/https/socks5.
+                     TLS verification is disabled during proxy crawls (for intercepting proxies).
+                     Private targets still require --dangerous-allow-private (proxy relaxes only the
+                     dial-time SSRF pin, not URL scope).
   --dangerous-allow-private  Disable SSRF protection for crawling, allowing
                      private/localhost targets (localhost, 127.0.0.1, RFC1918,
                      link-local). Required when the seed URL is a private

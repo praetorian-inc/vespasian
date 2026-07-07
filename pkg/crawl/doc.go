@@ -33,6 +33,20 @@
 // re-resolves the host at connect time: redirects and connections that target
 // private/link-local addresses (e.g. 169.254.169.254) are blocked.
 //
+// Proxy support (LAB-4011): both backends honor [CrawlerOptions.Proxy]
+// (http/https/socks5), validated by [ValidateProxyAddr]. On the HTTP path the
+// proxy is wired into the transport via http.ProxyURL. Two consequences follow
+// from routing through an intercepting proxy (Burp, mitmproxy):
+//   - TLS certificate verification is disabled (InsecureSkipVerify) so the
+//     proxy's own MITM certificates are accepted, matching the headless path.
+//   - The dial-time SSRF pin (ssrfSafeDialContext) is NOT installed for proxy
+//     connections: the client dials the proxy (commonly loopback), not the
+//     target, so pinning the dialed IP would block the proxy and gives no
+//     target protection. The upfront scopeChecker SSRF check and
+//     redirectScopeGuard still confine targets at the URL level, so crawling a
+//     private target through a proxy still requires AllowPrivate. DNS-rebinding
+//     protection at the target is delegated to the trusted proxy.
+//
 // The headless ([RodCrawler]) path relies on Chrome's own networking stack for
 // DNS resolution and does NOT have a Go dial-time IP pin. The upfront
 // scopeChecker SSRF check applies, but Chrome-resolved addresses are not
@@ -65,6 +79,8 @@
 //     [ObservedRequest] values with no network activity.
 //   - [BrowserManager] manages Chrome process lifecycle, including proxy
 //     configuration and graceful shutdown (headless path only).
+//   - [ValidateProxyAddr] validates a proxy address (http/https/socks5, host
+//     required, no embedded credentials) for both backends.
 //   - [ObservedRequest] and [ObservedResponse] represent captured HTTP traffic.
 //   - [JSReplayConfig] and [ReplayJSExtracted] implement the post-crawl JS
 //     bundle scanning step. The replay step enforces a same-origin gate

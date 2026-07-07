@@ -16,6 +16,7 @@ package crawl
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -28,15 +29,41 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// newHTTPClient builds an *http.Client for the HTTPCrawler. When allowPrivate
-// is false, the transport is a clone of http.DefaultTransport with DialContext
-// wired to ssrfSafeDialContext so the DNS-rebinding TOCTOU window is closed at
-// connect time (SEC-BE-002). When allowPrivate is true, http.DefaultTransport
-// is used unchanged. The client's CheckRedirect is always set to
-// redirectScopeGuard(scopeFn).
-func newHTTPClient(scopeFn func(string) bool, allowPrivate bool, timeout time.Duration) *http.Client {
+// newHTTPClient builds an *http.Client for the HTTPCrawler. Its transport is
+// selected in three branches; the client's CheckRedirect is always set to
+// redirectScopeGuard(scopeFn):
+//
+//   - proxyURL != nil: a clone of http.DefaultTransport with Proxy set to the
+//     given URL. TLS certificate verification is disabled because intercepting
+//     proxies (Burp, mitmproxy) present their own CA for HTTPS MITM, and the
+//     dial-time SSRF guard (ssrfSafeDialContext) is deliberately NOT installed:
+//     with a proxy the client dials the proxy (commonly loopback), not the
+//     target, so pinning the dialed IP would block the proxy and offers no
+//     target protection. Target scope stays enforced at the URL level by the
+//     upfront scope/SSRF check and redirectScopeGuard. (LAB-4011.)
+//   - proxyURL == nil, allowPrivate false: a clone of http.DefaultTransport
+//     with DialContext wired to ssrfSafeDialContext so the DNS-rebinding TOCTOU
+//     window is closed at connect time (SEC-BE-002).
+//   - proxyURL == nil, allowPrivate true: http.DefaultTransport unchanged.
+func newHTTPClient(scopeFn func(string) bool, allowPrivate bool, timeout time.Duration, proxyURL *url.URL) *http.Client {
 	transport := http.RoundTripper(http.DefaultTransport)
-	if !allowPrivate {
+	switch {
+	case proxyURL != nil:
+		// Clone DefaultTransport and route through the proxy, keeping its
+		// keep-alive, HTTP/2, and idle-connection tunings.
+		base, ok := http.DefaultTransport.(*http.Transport)
+		if !ok {
+			base = &http.Transport{}
+		}
+		t := base.Clone()
+		t.Proxy = http.ProxyURL(proxyURL)
+		// Intercepting proxies present their own CA for HTTPS MITM; the operator
+		// opted into routing through a trusted intermediary via --proxy, so
+		// disable verification to let the proxy's certificates through. Matches
+		// the headless (Chrome) path's proxy behavior.
+		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // G402: intentional for proxy MITM (see doc comment)
+		transport = t
+	case !allowPrivate:
 		// Clone DefaultTransport and override only DialContext so we keep its
 		// TLS, keep-alive, HTTP/2, proxy, and idle-connection tunings while
 		// re-resolving and re-validating IPs at connect time, closing the
@@ -73,6 +100,21 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 		return nil, err
 	}
 
+	// Validate and parse the proxy on the HTTP path. The CLI validates too
+	// (cmd/vespasian doCrawl), but this guards library/SDK callers that build
+	// an HTTPCrawler directly. A nil proxyURL means "no proxy" (default path).
+	var proxyURL *url.URL
+	if c.opts.Proxy != "" {
+		if err := ValidateProxyAddr(c.opts.Proxy); err != nil {
+			return nil, err
+		}
+		// ValidateProxyAddr already parsed the address; re-parse for the URL.
+		proxyURL, err = url.Parse(c.opts.Proxy)
+		if err != nil {
+			return nil, fmt.Errorf("parse proxy address: %w", err)
+		}
+	}
+
 	// Early return if context is already canceled.
 	if ctx.Err() != nil {
 		if c.opts.Stderr != nil {
@@ -106,7 +148,7 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	// explicit Client.Timeout provides defense-in-depth if the context is ever
 	// mis-wired on a future code path (SEC-BE-001). Both use c.pageTimeout so
 	// they track the same source (QUAL-004).
-	client := newHTTPClient(scopeFn, c.opts.AllowPrivate, c.pageTimeout)
+	client := newHTTPClient(scopeFn, c.opts.AllowPrivate, c.pageTimeout, proxyURL)
 
 	// Seed the frontier. Reject if the seed itself doesn't pass scope/SSRF.
 	if frontier.Push([]urlEntry{{URL: targetURL, Depth: 0}}) == 0 {
