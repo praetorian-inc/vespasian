@@ -26,6 +26,14 @@ linters:
         linters:
           - errcheck
           - gocyclo
+      # staticcheck SA5011 (possible nil deref) is a false positive in tests
+      # that guard with `if x == nil { t.Fatal(...) }` before dereferencing:
+      # t.Fatal terminates the test, so the deref is never reached with nil.
+      # Excluded in _test.go only; production nil-deref checks stay enforced.
+      - path: _test\.go
+        text: SA5011
+        linters:
+          - staticcheck
     paths:
       - third_party$
       - builtin$
