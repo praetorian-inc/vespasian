@@ -237,7 +237,7 @@ type CrawlOptions struct {
 	Timeout         time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
 	Scope           string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
 	Headless        bool          `default:"true" help:"Use headless browser"`
-	Proxy           string        `help:"Proxy address for both crawler backends (e.g., http://127.0.0.1:8080); http/https/socks5. Routes Chrome (headless) or the net/http transport (--headless=false). TLS certificate verification is disabled during proxy crawls (for intercepting proxies like Burp/mitmproxy). With --proxy the dial-time SSRF IP pin is skipped for the proxy connection; URL scope is still enforced, so private targets still require --dangerous-allow-private."`
+	Proxy           string        `help:"Proxy address for the crawl stage (e.g., http://127.0.0.1:8080); http/https/socks5. Routes crawl traffic through the proxy on both crawler backends: Chrome (headless) or the net/http transport (--headless=false). Probe and JS-replay traffic is not proxied. On the net/http backend, TLS verification is disabled for http/https intercepting proxies (Burp/mitmproxy) so their MITM certificate is accepted; socks5 tunnels keep normal verification. With --proxy the dial-time SSRF IP pin is skipped for the proxy connection; URL scope is still enforced, so private targets still require --dangerous-allow-private."`
 	Concurrency     int           `default:"10" help:"Number of concurrent browser tabs for headless crawling"`
 	NoRequestID     bool          `name:"no-request-id" help:"Disable automatic X-Vespasian-Request-Id header"`
 	Verbose         bool          `short:"v" help:"Enable verbose logging"`

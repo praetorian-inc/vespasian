@@ -57,11 +57,19 @@ func newHTTPClient(scopeFn func(string) bool, allowPrivate bool, timeout time.Du
 		}
 		t := base.Clone()
 		t.Proxy = http.ProxyURL(proxyURL)
-		// Intercepting proxies present their own CA for HTTPS MITM; the operator
-		// opted into routing through a trusted intermediary via --proxy, so
-		// disable verification to let the proxy's certificates through. Matches
-		// the headless (Chrome) path's proxy behavior.
-		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // G402: intentional for proxy MITM (see doc comment)
+		// http/https intercepting proxies (Burp, mitmproxy) terminate TLS and
+		// present their own CA for the target, so verification must be disabled
+		// for that substitute certificate to be accepted. Unlike Chrome on the
+		// headless path (which validates against the OS trust store and so
+		// requires the operator to trust the proxy CA out-of-band), the Go
+		// client has no trust store to fall back on, so this is the only way to
+		// let intercepted HTTPS through. socks5 is a transparent TCP tunnel: the
+		// Go client performs TLS directly with the real target through the
+		// tunnel and no substitute CA is involved, so normal verification is
+		// kept for socks5.
+		if proxyURL.Scheme == "http" || proxyURL.Scheme == "https" {
+			t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // G402: intentional for http/https proxy MITM (see doc comment)
+		}
 		transport = t
 	case !allowPrivate:
 		// Clone DefaultTransport and override only DialContext so we keep its

@@ -129,6 +129,37 @@ func TestNewHTTPClient_Proxy(t *testing.T) {
 	}
 }
 
+// TestNewHTTPClient_SOCKS5Proxy verifies that a socks5 proxy keeps normal TLS
+// verification. socks5 is a transparent TCP tunnel, so the Go client does TLS
+// directly with the real target through the tunnel and no substitute CA is
+// involved; disabling verification would remove real protection for no benefit
+// (finding 002).
+func TestNewHTTPClient_SOCKS5Proxy(t *testing.T) {
+	proxyURL, err := url.Parse("socks5://127.0.0.1:1080")
+	if err != nil {
+		t.Fatalf("parse proxy: %v", err)
+	}
+
+	c := newHTTPClient(nil, false, 30*time.Second, proxyURL)
+	if c == nil {
+		t.Fatal("newHTTPClient returned nil")
+	}
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport = %T, want *http.Transport", c.Transport)
+	}
+
+	// Proxy func must still route through the socks5 proxy.
+	if tr.Proxy == nil {
+		t.Fatal("Transport.Proxy = nil, want configured proxy func")
+	}
+
+	// TLS verification must NOT be disabled for socks5 (no MITM CA involved).
+	if tr.TLSClientConfig != nil && tr.TLSClientConfig.InsecureSkipVerify {
+		t.Error("InsecureSkipVerify = true for socks5 proxy, want normal verification kept")
+	}
+}
+
 // TestHTTPCrawler_RoutesThroughProxy is an end-to-end check that the HTTP
 // backend sends its requests through the configured proxy. The proxy runs on
 // loopback, which the SSRF dial guard would reject — so a successful crawl
