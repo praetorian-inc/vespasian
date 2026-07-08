@@ -43,6 +43,7 @@ func TestGet(t *testing.T) {
 	}{
 		{"rest", "rest", "rest", false, ""},
 		{"graphql", "graphql", "graphql", false, ""},
+		{"grpc", "grpc", "grpc", false, ""},
 		{"empty", "", "", true, "unsupported API type"},
 	}
 

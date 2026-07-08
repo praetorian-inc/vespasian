@@ -180,6 +180,33 @@ func TestClassifiersForType_UnknownReturnsNil(t *testing.T) {
 // The `>=` tie-breaker is what makes WSDL win in that case.
 // ---------------------------------------------------------------------------
 
+// TestDetectAPIType_NeverAutoSelectsGRPC pins the opt-in invariant: gRPC is
+// never auto-selected by DetectAPIType, even when a request scores 0.99 on
+// classify.GRPCClassifier (gRPC content-type + trailer header). Callers must
+// pass --api-type grpc explicitly.
+func TestDetectAPIType_NeverAutoSelectsGRPC(t *testing.T) {
+	req := crawl.ObservedRequest{
+		Method:  "POST",
+		URL:     "https://x.com/pkg.Service/Method",
+		Headers: map[string]string{"Content-Type": "application/grpc"},
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "application/grpc",
+			Headers:     map[string]string{"grpc-status": "0"},
+		},
+	}
+
+	// Confirm the request actually scores 0.99 on the gRPC classifier, so the
+	// test is exercising the intended gRPC-shaped signal.
+	isAPI, confidence := (&classify.GRPCClassifier{}).Classify(req)
+	require.True(t, isAPI)
+	require.InDelta(t, 0.99, confidence, 0.0001)
+
+	got := pipeline.DetectAPIType([]crawl.ObservedRequest{req}, 0.5)
+	assert.Equal(t, pipeline.APITypeREST, got)
+	assert.NotEqual(t, pipeline.APITypeGRPC, got)
+}
+
 func TestDetectAPIType_PrefersWSDL(t *testing.T) {
 	requests := []crawl.ObservedRequest{
 		{

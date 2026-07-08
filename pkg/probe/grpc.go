@@ -58,8 +58,10 @@ var reflectionServices = map[string]bool{
 }
 
 // GRPCProbe enumerates gRPC services via the Server Reflection Protocol.
-// Uses grpcreflect.NewClientAuto, which tries v1 first then falls back to
-// v1alpha on Unimplemented.
+// Uses grpcreflect.NewClientAuto, which negotiates the reflection API
+// version with the server (v1, with a library-internal fallback to the
+// legacy v1alpha service). The fallback path is handled entirely inside
+// grpcreflect and is not separately exercised by vespasian's tests.
 type GRPCProbe struct {
 	config Config
 }

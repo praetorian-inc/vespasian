@@ -26,9 +26,11 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jhump/protoreflect/desc" //nolint:staticcheck // SA1019: protoreflect/desc is the only API protoprint and grpcreflect.Client expose
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -38,6 +40,8 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/descriptorpb"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/test/grpc-server/labpb"
@@ -409,6 +413,60 @@ func TestGRPCProbe_Probe_DedupsByTarget(t *testing.T) {
 	assert.Same(t, schema0, schema1, "both endpoints must share the same *GRPCReflectionResult pointer (reflection ran once)")
 }
 
+// TestGRPCProbe_Probe_MaxEndpointsRespected verifies that the
+// `if len(seen) >= p.config.MaxEndpoints { break }` guard in Probe caps the
+// number of distinct gRPC targets that get reflected against. Three
+// distinct in-process servers stand in for three distinct grpcTargetInfo
+// targets; with MaxEndpoints=2, only the first two should be dialed and
+// receive a populated GRPCSchema.
+func TestGRPCProbe_Probe_MaxEndpointsRespected(t *testing.T) {
+	addr1, stop1 := startTestGRPCServer(t)
+	defer stop1()
+	addr2, stop2 := startTestGRPCServer(t)
+	defer stop2()
+	addr3, stop3 := startTestGRPCServer(t)
+	defer stop3()
+
+	var dialCount atomic.Int32
+	countingDialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialCount.Add(1)
+		return loopbackDialer(ctx, network, addr)
+	}
+
+	cfg := Config{
+		Timeout:      5 * time.Second,
+		URLValidator: func(string) error { return nil },
+		Dialer:       countingDialer,
+		MaxEndpoints: 2,
+	}
+	probe := NewGRPCProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{APIType: "grpc"},
+		{APIType: "grpc"},
+		{APIType: "grpc"},
+	}
+	endpoints[0].URL = "http://" + addr1 + "/grpc.health.v1.Health/Check"
+	endpoints[1].URL = "http://" + addr2 + "/grpc.health.v1.Health/Check"
+	endpoints[2].URL = "http://" + addr3 + "/grpc.health.v1.Health/Check"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := probe.Probe(ctx, endpoints)
+	require.NoError(t, err)
+	require.Len(t, result, 3)
+
+	var withSchema int
+	for _, r := range result {
+		if r.GRPCSchema != nil {
+			withSchema++
+		}
+	}
+	assert.Equal(t, 2, withSchema, "MaxEndpoints=2 should cap the number of distinct targets that receive a GRPCSchema")
+	assert.LessOrEqual(t, int(dialCount.Load()), 2, "at most 2 reflection dials should occur when MaxEndpoints=2")
+}
+
 // TestGRPCProbe_Probe_TLSVerifiedByDefault verifies that a gRPC server
 // presenting a self-signed certificate is NOT enumerated when
 // GRPCInsecureSkipVerify is left at its default (false). The TLS handshake
@@ -566,4 +624,65 @@ func TestGRPCTarget(t *testing.T) {
 			assert.Equal(t, tt.wantTLS, info.useTLS)
 		})
 	}
+}
+
+// testFileDescriptor builds a minimal, valid *desc.FileDescriptor named
+// "x.proto" for exercising walkFileDescriptors' cap/dedup guards directly.
+func testFileDescriptor(t *testing.T) *desc.FileDescriptor {
+	t.Helper()
+	fd, err := desc.CreateFileDescriptor(&descriptorpb.FileDescriptorProto{
+		Name:   proto.String("x.proto"),
+		Syntax: proto.String("proto3"),
+	})
+	require.NoError(t, err)
+	return fd
+}
+
+// TestWalkFileDescriptors_CountCap pins the maxGRPCFileDescriptors guard:
+// once fetched already holds the cap's worth of distinct entries,
+// walkFileDescriptors must not add the new file to out.
+func TestWalkFileDescriptors_CountCap(t *testing.T) {
+	fd := testFileDescriptor(t)
+
+	fetched := make(map[string]bool, maxGRPCFileDescriptors)
+	for i := range maxGRPCFileDescriptors {
+		fetched[fmt.Sprintf("seed-%d.proto", i)] = true
+	}
+	out := map[string][]byte{}
+	totalBytes := 0
+
+	walkFileDescriptors(fd, fetched, out, &totalBytes)
+
+	assert.Empty(t, out, "count-cap guard should prevent any new descriptor from being added")
+}
+
+// TestWalkFileDescriptors_ByteCap pins the maxGRPCDescriptorBytes guard: once
+// totalBytes already meets the cap, walkFileDescriptors must not add the new
+// file to out even though the count cap has not been reached.
+func TestWalkFileDescriptors_ByteCap(t *testing.T) {
+	fd := testFileDescriptor(t)
+
+	fetched := map[string]bool{}
+	out := map[string][]byte{}
+	totalBytes := maxGRPCDescriptorBytes
+
+	walkFileDescriptors(fd, fetched, out, &totalBytes)
+
+	assert.Empty(t, out, "byte-cap guard should prevent any new descriptor from being added")
+	assert.Equal(t, maxGRPCDescriptorBytes, totalBytes, "totalBytes should be unchanged")
+}
+
+// TestWalkFileDescriptors_DedupSkipsSeen pins the dedup guard: a file whose
+// name is already present in fetched must be skipped, leaving out empty.
+func TestWalkFileDescriptors_DedupSkipsSeen(t *testing.T) {
+	fd := testFileDescriptor(t)
+
+	fetched := map[string]bool{"x.proto": true}
+	out := map[string][]byte{}
+	totalBytes := 0
+
+	walkFileDescriptors(fd, fetched, out, &totalBytes)
+
+	assert.Empty(t, out, "dedup guard should prevent re-fetching an already-seen descriptor")
+	assert.Zero(t, totalBytes, "totalBytes should be unchanged")
 }

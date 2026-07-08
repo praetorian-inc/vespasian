@@ -296,6 +296,18 @@ func TestWalkFields_TruncatedFixed32(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestWalkFields_TruncatedTag(t *testing.T) {
+	msg := []byte{0x80}
+	err := WalkFields(msg, func(Tag, []byte) bool { return true })
+	assert.Error(t, err)
+}
+
+func TestWalkFields_TruncatedVarintValue(t *testing.T) {
+	msg := append(tag(1, WireVarint), 0x80)
+	err := WalkFields(msg, func(Tag, []byte) bool { return true })
+	assert.Error(t, err)
+}
+
 func TestWalkFields_EmptyMessage(t *testing.T) {
 	called := false
 	err := WalkFields(nil, func(Tag, []byte) bool {

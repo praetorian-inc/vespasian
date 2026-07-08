@@ -2299,6 +2299,7 @@ func TestAPITypeDisplayName(t *testing.T) {
 		{pipeline.APITypeREST, "REST"},
 		{pipeline.APITypeWSDL, "WSDL"},
 		{pipeline.APITypeGraphQL, "GraphQL"},
+		{pipeline.APITypeGRPC, "gRPC"},
 		{"unknown", "unknown"},
 	}
 	for _, tt := range tests {
