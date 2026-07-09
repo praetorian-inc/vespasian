@@ -32,10 +32,11 @@ import (
 // operationId with both Service and Method starting with an uppercase letter is
 // accepted as a grpc-gateway shape.
 //
-// Note: the prefix must start with an uppercase letter. A fully-qualified
-// prefix like "greet.v1.Greeter" starts with lowercase 'g' and is therefore
-// rejected — the operationId pattern used in practice by protoc-gen-openapiv2
-// uses just the service name (e.g. "Greeter_SayHello"), not the full FQN.
+// Note: the Upper-initial check applies to the last dot-separated segment of
+// the prefix (the service name), not the whole prefix. A package-qualified
+// prefix like "greet.v1.Greeter" is therefore still accepted — its last
+// segment "Greeter" is upper-initial — alongside the unqualified form used in
+// practice by protoc-gen-openapiv2 (e.g. "Greeter_SayHello").
 func TestLooksLikeServiceMethodOpID_AcceptsUpperInitialBoth(t *testing.T) {
 	cases := []string{
 		"Greeter_SayHello",
@@ -291,5 +292,100 @@ func TestIsGRPCGatewayDoc_LowercaseMethodRejected(t *testing.T) {
 	doc.Info.Title = "Users API"
 	if isGRPCGatewayDoc(doc) {
 		t.Error("isGRPCGatewayDoc: lowercase-method operationId user_list must not be accepted")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// QUAL-002 regression — fqn-naming-strategy operationId recovery
+// (serviceSegment)
+// ---------------------------------------------------------------------------
+
+// TestServicesFromOpenAPI_FQNNamingStrategyOperationIDRecoversFullServiceName
+// pins the QUAL-002 fix: protoc-gen-openapiv2's fqn naming strategy emits
+// operationIds of the shape "<package>.<Service>_<Method>" (e.g.
+// "greet.v1.Greeter_SayHello", prefix "greet.v1.Greeter"), where the prefix as
+// a whole starts with a lowercase package segment ("greet"). Before the fix,
+// the service-name check applied isUpperInitial to the whole prefix, so this
+// operationId shape was rejected outright — the fqn-naming-strategy
+// combination never recovered a service. serviceSegment now extracts the last
+// dot-segment ("Greeter") for the Upper-initial check, while the recovered
+// service name returned to the caller stays the FULL FQN ("greet.v1.Greeter"),
+// not just "Greeter".
+func TestServicesFromOpenAPI_FQNNamingStrategyOperationIDRecoversFullServiceName(t *testing.T) {
+	// info.title is itself FQN-shaped (carries a ".vN." version segment), so
+	// isGRPCGatewayDoc also recognizes this document via the strong-signal
+	// title/tag branch, not only via the operationId primary signal.
+	body := []byte(`{
+		"swagger": "2.0",
+		"info": {"title": "greet.v1.Greeter", "version": "1.0"},
+		"paths": {
+			"/v1/greet": {
+				"post": {
+					"operationId": "greet.v1.Greeter_SayHello",
+					"responses": {"200": {"description": "OK"}}
+				}
+			}
+		}
+	}`)
+
+	svcs := servicesFromOpenAPI(body)
+	if len(svcs) == 0 {
+		t.Fatal("servicesFromOpenAPI: expected at least one service from the fqn-naming-strategy operationId greet.v1.Greeter_SayHello, got none")
+	}
+
+	var found bool
+	for _, s := range svcs {
+		if s.Name != "greet.v1.Greeter" {
+			continue
+		}
+		found = true
+		var hasMethod bool
+		for _, m := range s.Methods {
+			if m.Name == "SayHello" {
+				hasMethod = true
+			}
+		}
+		if !hasMethod {
+			t.Errorf("service greet.v1.Greeter: SayHello not found among methods %+v", s.Methods)
+		}
+	}
+	if !found {
+		var names []string
+		for _, s := range svcs {
+			names = append(names, s.Name)
+		}
+		t.Errorf("servicesFromOpenAPI: full FQN service name %q not found in recovered services %v (got just the last segment, or nothing)", "greet.v1.Greeter", names)
+	}
+}
+
+// TestIsGRPCGatewayDoc_FQNLowercaseLastSegmentRejected verifies the
+// serviceSegment fix does not over-loosen detection: an operationId prefix
+// whose LAST dot-segment is lowercase (e.g. "foo.bar.widget_List", last
+// segment "widget") must still be rejected, matching the existing
+// unqualified-name rule that "widget" is not a service name.
+func TestIsGRPCGatewayDoc_FQNLowercaseLastSegmentRejected(t *testing.T) {
+	doc := &openAPIDoc{
+		Paths: map[string]map[string]struct {
+			OperationID string   `json:"operationId"`
+			Tags        []string `json:"tags"`
+		}{
+			"/v1/widgets": {
+				"get": {OperationID: "foo.bar.widget_List"},
+			},
+		},
+	}
+	// Plain title, not FQN-shaped (no ".vN." segment, no *Service suffix), so
+	// only the operationId signal is in play.
+	doc.Info.Title = "Widgets API"
+	if isGRPCGatewayDoc(doc) {
+		t.Error("isGRPCGatewayDoc: fqn-style operationId with lowercase last segment (foo.bar.widget_List) must not be accepted")
+	}
+
+	body, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal doc: %v", err)
+	}
+	if svcs := servicesFromOpenAPI(body); svcs != nil {
+		t.Errorf("servicesFromOpenAPI: expected nil for foo.bar.widget_List (lowercase last segment), got %v", svcs)
 	}
 }

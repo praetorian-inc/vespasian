@@ -342,6 +342,111 @@ func TestEnrichGRPCFromBindings_PipelineGlueNoCollisionWithGateway(t *testing.T)
 }
 
 // ---------------------------------------------------------------------------
+// QUAL-001 regression — single-host gateway-covered + streaming-only bindings
+// must not be dropped
+// ---------------------------------------------------------------------------
+
+// TestEnrichGRPCFromBindings_SingleHostGatewayCoveredPlusStreamingOnlyBindingsSurvives
+// pins the QUAL-001 fix on the real single-host shape: exactly ONE grpc
+// endpoint exists and it is already fully covered by the grpc-gateway probe
+// (GRPCSchema.ReflectionEnabled=false, Services=[greet.v1.Greeter] — as
+// GRPCGatewayProbe leaves a seeded single endpoint after recovering an
+// OpenAPI document). A captured gRPC-Web JS bundle recovers both
+// greet.v1.Greeter (already covered) and greet.v1.Farewell, a streaming-only
+// service the OpenAPI/JSON-transcoding gateway cannot expose at all.
+//
+// Before the fix: the fill loop's `grpcEndpointExists` flag was set for any
+// grpc endpoint regardless of coverage, so the append branch's
+// `if !grpcEndpointExists` never fired here (one grpc endpoint exists), and
+// the fill loop itself skipped the covered endpoint (hasCoverage == true) —
+// greet.v1.Farewell was recovered by ExtractGRPCWebBindings and then silently
+// discarded. This test's load-bearing assertion (foundFarewell) fails against
+// that old behavior; see the `attached` fix in enrichGRPCFromBindings, which
+// appends a synthetic endpoint whenever no existing endpoint was actually
+// attached to (as opposed to merely "exists").
+func TestEnrichGRPCFromBindings_SingleHostGatewayCoveredPlusStreamingOnlyBindingsSurvives(t *testing.T) {
+	// Real Connect-ES gRPC-Web bundle recovering two services in the same
+	// package: Greeter (unary, overlaps the gateway-covered name) and
+	// Farewell (server-streaming, invisible to the OpenAPI/JSON-transcoding
+	// gateway and therefore uncovered).
+	bindingsJS := []byte(`
+		export const Greeter = {
+		  typeName: "greet.v1.Greeter",
+		  methods: {
+		    sayHello: {
+		      name: "SayHello",
+		      I: HelloRequest,
+		      O: HelloResponse,
+		      kind: MethodKind.Unary,
+		    },
+		  },
+		};
+
+		export const Farewell = {
+		  typeName: "greet.v1.Farewell",
+		  methods: {
+		    sayBye: {
+		      name: "SayBye",
+		      I: ByeRequest,
+		      O: ByeResponse,
+		      kind: MethodKind.ServerStreaming,
+		    },
+		  },
+		};
+	`)
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/greet_connect.js",
+			Response: crawl.ObservedResponse{
+				ContentType: "application/javascript",
+				Body:        bindingsJS,
+			},
+		},
+	}
+
+	// The single grpc endpoint, already fully covered by the gateway probe.
+	gatewaySchema := &classify.GRPCReflectionResult{
+		ReflectionEnabled: false,
+		Services: []classify.GRPCService{
+			{Name: "greet.v1.Greeter", Methods: []classify.GRPCMethod{
+				{Name: "SayHello", InputType: "HelloRequest", OutputType: "HelloResponse"},
+			}},
+		},
+	}
+	enriched := []classify.ClassifiedRequest{grpcClassifiedRequest(gatewaySchema)}
+
+	result := enrichGRPCFromBindings(requests, enriched, io.Discard)
+
+	if len(result) != 2 {
+		t.Fatalf("enrichGRPCFromBindings: got %d endpoints, want 2 (gateway-covered endpoint preserved + a synthetic endpoint appended carrying the uncovered streaming-only service)", len(result))
+	}
+
+	// Reflection/gateway precedence: the covered endpoint's schema pointer and
+	// Services must be left completely untouched.
+	if result[0].GRPCSchema != gatewaySchema {
+		t.Error("enrichGRPCFromBindings: gateway-covered endpoint's GRPCSchema pointer must be left untouched (reflection/gateway > bindings precedence)")
+	}
+	if names := grpcServiceNames(result[0].GRPCSchema); len(names) != 1 || names[0] != "greet.v1.Greeter" {
+		t.Errorf("enrichGRPCFromBindings: gateway-covered endpoint services = %v, want [greet.v1.Greeter]", names)
+	}
+
+	// Load-bearing assertion: greet.v1.Farewell must appear somewhere in the
+	// result. Fails against the pre-fix behavior, which dropped it entirely.
+	var foundFarewell bool
+	for _, ep := range result {
+		for _, name := range grpcServiceNames(ep.GRPCSchema) {
+			if name == "greet.v1.Farewell" {
+				foundFarewell = true
+			}
+		}
+	}
+	if !foundFarewell {
+		t.Fatal("enrichGRPCFromBindings: greet.v1.Farewell (uncovered, streaming-only) must not be dropped when the only grpc endpoint is already gateway-covered")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // T4 — filterUncoveredServices: dedupes bindings services against recovered
 // ---------------------------------------------------------------------------
 

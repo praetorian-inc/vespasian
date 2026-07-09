@@ -255,7 +255,7 @@ func servicesFromOpenAPI(body []byte) []classify.GRPCService {
 			// list_users) that must not be turned into a junk service/method.
 			// Evaluate operationIDPattern once and reuse the captures.
 			m := operationIDPattern.FindStringSubmatch(op.OperationID)
-			if m == nil || !isUpperInitial(m[1]) || !isUpperInitial(m[2]) {
+			if m == nil || !isUpperInitial(serviceSegment(m[1])) || !isUpperInitial(m[2]) {
 				continue
 			}
 			method := m[2]
@@ -354,12 +354,26 @@ func looksLikeServiceMethodOpID(opID string) bool {
 	if m == nil {
 		return false
 	}
-	return isUpperInitial(m[1]) && isUpperInitial(m[2])
+	return isUpperInitial(serviceSegment(m[1])) && isUpperInitial(m[2])
 }
 
 // isUpperInitial reports whether s begins with an ASCII uppercase letter.
 func isUpperInitial(s string) bool {
 	return s != "" && s[0] >= 'A' && s[0] <= 'Z'
+}
+
+// serviceSegment returns the last dot-separated segment of an operationId
+// prefix — the actual service name. For a package-qualified FQN prefix such as
+// "greet.v1.Greeter" it returns "Greeter"; for an unqualified prefix such as
+// "Greeter" it returns "Greeter" unchanged. This lets the Upper-initial service
+// check pass for fqn-naming-strategy operationIds (whose prefix begins with a
+// lowercase package segment) while the recovered service name stays the full
+// FQN prefix.
+func serviceSegment(prefix string) string {
+	if i := strings.LastIndex(prefix, "."); i >= 0 {
+		return prefix[i+1:]
+	}
+	return prefix
 }
 
 // looksLikeServiceFQN reports whether s has a protobuf service FQN shape: it

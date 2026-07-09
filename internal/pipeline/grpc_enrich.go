@@ -130,21 +130,26 @@ func enrichGRPCFromBindings(requests []crawl.ObservedRequest, enriched []classif
 		return s != nil && (len(s.FileDescriptors) > 0 || len(s.Services) > 0)
 	}
 
-	grpcEndpointExists := false
+	attached := false
 	for i := range enriched {
 		if enriched[i].APIType != APITypeGRPC {
 			continue
 		}
-		grpcEndpointExists = true
 		if hasCoverage(enriched[i].GRPCSchema) {
 			continue
 		}
 		enriched[i].GRPCSchema = schema()
+		attached = true
 	}
 
-	// Append a synthetic grpc endpoint only when no grpc endpoint exists at all
-	// — common for a pure gRPC-Web SPA where only JS was captured.
-	if !grpcEndpointExists {
+	// Append a synthetic grpc endpoint carrying the recovered services when they
+	// were not attached to any existing bare endpoint — either no grpc endpoint
+	// exists (pure gRPC-Web SPA), OR all existing grpc endpoints are already
+	// covered by a higher-precedence technique (single-host gateway+bindings,
+	// where bindings-only services like streaming RPCs the gateway can't
+	// transcode would otherwise be dropped). `filtered` is already deduped
+	// against all coverage, so this never duplicates a higher-precedence service.
+	if !attached {
 		enriched = append(enriched, classify.ClassifiedRequest{
 			APIType:    APITypeGRPC,
 			GRPCSchema: schema(),
