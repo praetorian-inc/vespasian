@@ -68,7 +68,7 @@ func NewBrowserManager(opts BrowserOptions) (*BrowserManager, error) {
 		l = l.Bin(opts.ChromePath)
 	}
 	if opts.Proxy != "" {
-		if err := validateProxyAddr(opts.Proxy); err != nil {
+		if err := ValidateProxyAddr(opts.Proxy); err != nil {
 			return nil, err
 		}
 		l = l.Set("proxy-server", opts.Proxy)
@@ -146,10 +146,13 @@ func (b *BrowserManager) PID() int {
 	return b.launcher.PID()
 }
 
-// validateProxyAddr checks that the proxy address is a valid HTTP/HTTPS URL
-// with a host and port. This prevents typos from producing confusing Chrome
-// launch errors and ensures no credentials are embedded in the URL.
-func validateProxyAddr(addr string) error {
+// ValidateProxyAddr checks that the proxy address is a valid http/https/socks5
+// URL with a host and no embedded credentials. It is used by both crawler
+// backends: the headless path (NewBrowserManager, for the Chrome
+// --proxy-server flag) and the HTTP path (HTTPCrawler.Crawl and the CLI's
+// doCrawl, before opts.Proxy is printed) so a bad or credential-bearing proxy
+// is rejected before any network activity or logging.
+func ValidateProxyAddr(addr string) error {
 	u, err := url.Parse(addr)
 	if err != nil {
 		return fmt.Errorf("invalid proxy address: %w", err)
