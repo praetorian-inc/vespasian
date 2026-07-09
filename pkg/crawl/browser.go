@@ -32,7 +32,8 @@ type BrowserOptions struct {
 	// NoSandbox disables Chrome's OS-level sandbox. This removes a primary
 	// exploit mitigation barrier and should only be set in containerized or
 	// CI environments where the sandbox cannot be enabled (e.g., Docker
-	// without --cap-add SYS_ADMIN).
+	// without --cap-add SYS_ADMIN). The sandbox is also disabled when the
+	// VESPASIAN_NO_SANDBOX environment variable is set to "true".
 	NoSandbox bool
 
 	// ChromePath overrides the Chrome binary used by the launcher. This value
