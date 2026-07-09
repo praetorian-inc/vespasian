@@ -119,6 +119,9 @@ preflight_test_host() {
                 fi
             fi
             ;;
+        *,concat-spa,*)
+            _probe_target_host "${CONCAT_SPA_PORT:-}" "/healthz" "concat-spa" || failed=1
+            ;;
     esac
     [ $failed -eq 0 ] && return 0
     if [ "$TEST_HOST" = "localhost" ]; then
@@ -312,6 +315,101 @@ test_rest_api() {
     fi
 }
 
+test_concat_spa() {
+    local port="${CONCAT_SPA_PORT:-8993}"
+    local base_url="http://${TEST_HOST}:${port}"
+    local target_dir="${RESULTS_DIR}/concat-spa"
+    local spec_file="${target_dir}/spec.yaml"
+    local expected="${SCRIPT_DIR}/concat-spa/expected-paths.json"
+    local verbose_flag=""
+
+    [ "${VERBOSE:-false}" = true ] && verbose_flag="-v"
+
+    mkdir -p "$target_dir"
+    init_test_status "concat-spa"
+
+    local start=$SECONDS
+    local failures=0
+
+    log_header "Testing: concat-spa (${base_url})"
+
+    # Single-stage scan (NOT the two-stage crawl+generate the other targets
+    # use). The LAB-1368 concat extraction lives in the post-crawl JS-replay
+    # step (ReplayJSExtracted), which is invoked ONLY by `scan` — `crawl`
+    # produces a passive browser capture without ever running JS-replay, so
+    # the concat-derived endpoints would never enter the capture. The other
+    # live targets pass with `crawl` because their endpoints are href-linked
+    # and the browser captures them directly; concat-spa's endpoints exist
+    # only via concat() / +-string expressions in app.js, which only
+    # JS-replay discovers.
+    log_info "Scanning ${base_url} (single-stage: crawl + JS-replay + generate)..."
+    if ! "$VESPASIAN" scan "$base_url" \
+        -o "$spec_file" \
+        --api-type rest \
+        --depth 2 \
+        --max-pages 50 \
+        --timeout 2m \
+        --dangerous-allow-private \
+        $verbose_flag 2>&1; then
+        log_fail "Scan failed"
+        set_test_result "concat-spa" "FAIL" "?" "?" "$((SECONDS - start))"
+        return 1
+    fi
+
+    # Validate spec. Three layers make this a real 404-filter
+    # regression guard, not just a "did we find the endpoints" check:
+    #   (a) validate_path_coverage  — the two concat endpoints are PRESENT
+    #       (proves Strategy-5 discovery reached the spec);
+    #   (b) exact-count assertion   — the spec has EXACTLY total_paths (2),
+    #       so nothing extra leaked;
+    #   (c) validate_paths_absent   — the receiver literals (/api/users,
+    #       /api/products) and the 404 control (/api/missing) are explicitly
+    #       NOT present, with a precise message if the 404 filter regresses.
+    # (b)+(c) together enforce the "must NOT appear" half of the contract that
+    # the previous version only documented but never checked.
+    #
+    # Strategy provenance — that these paths came from the concat extractor
+    # specifically rather than another strategy — is owned by the in-process
+    # mutation test TestReplayJSExtracted_ConcatStyle_EndToEnd. This live
+    # target proves the integrated binary + Chrome-crawl pipeline discovers
+    # them end-to-end.
+    if ! validate_openapi_structure "$spec_file"; then
+        failures=$((failures + 1))
+    fi
+    if ! validate_path_coverage "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+    if ! validate_no_static_assets "$spec_file"; then
+        failures=$((failures + 1))
+    fi
+    # /api/users and /api/products are EXACT (bare receiver literals that must
+    # not survive); /api/missing/ is a SUBTREE (the 404 control endpoint).
+    if ! validate_paths_absent "$spec_file" "/api/users" "/api/products" "/api/missing/"; then
+        failures=$((failures + 1))
+    fi
+
+    local endpoint_count
+    endpoint_count=$(count_spec_endpoints "$spec_file")
+    local expected_count
+    expected_count=$(json_field "$expected" total_paths)
+
+    # Exact-count: any path beyond the two concat endpoints means a receiver
+    # literal or the control leaked through the 404 filter.
+    if [ "$endpoint_count" != "$expected_count" ]; then
+        log_fail "concat-spa: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
+        failures=$((failures + 1))
+    fi
+
+    local duration=$((SECONDS - start))
+    if [ $failures -eq 0 ]; then
+        set_test_result "concat-spa" "PASS" "$endpoint_count" "$expected_count" "$duration"
+        log_ok "concat-spa: ALL CHECKS PASSED (${duration}s)"
+    else
+        set_test_result "concat-spa" "FAIL" "$endpoint_count" "$expected_count" "$duration"
+        log_fail "concat-spa: ${failures} check(s) failed (${duration}s)"
+    fi
+}
+
 test_soap_service() {
     local port="${SOAP_SERVICE_PORT:-8991}"
     local base_url="http://${TEST_HOST}:${port}"
@@ -474,13 +572,28 @@ test_grpc_server() {
 
     log_header "Testing: grpc-server (${base_url})"
 
-    # Run gRPC reflection probe — vespasian writes a proto3 .proto file
-    log_info "Probing gRPC reflection at ${base_url}..."
-    if ! "$VESPASIAN" probe grpc reflection "$base_url" \
+    # Build a minimal synthetic capture so the classifier tags the request as
+    # gRPC and the reflection probe dials the correct host:port.
+    local capture_file="${target_dir}/capture.json"
+    cat > "$capture_file" << EOF
+[
+  {
+    "method": "POST",
+    "url": "${base_url}/lab.v1.UserService/GetUser",
+    "headers": { "content-type": "application/grpc" },
+    "response": { "status_code": 0, "content_type": "application/grpc" }
+  }
+]
+EOF
+
+    # Run generate grpc — vespasian classifies the capture, runs reflection,
+    # and writes a proto3 .proto file.
+    log_info "Generating gRPC .proto via reflection at ${base_url}..."
+    if ! "$VESPASIAN" generate grpc "$capture_file" \
         --dangerous-allow-private \
         -o "$spec_file" \
         ${verbose_flag:+"$verbose_flag"} 2>&1; then
-        log_fail "gRPC reflection probe failed"
+        log_fail "gRPC reflection generate failed"
         set_test_result "grpc-server" "FAIL" "?" "?" "$((SECONDS - start))"
         return 1
     fi
@@ -557,6 +670,27 @@ PYEOF
         failures=$((failures + 1))
     else
         log_ok "Proto validation: $validation_result"
+    fi
+
+    # AC4 (LAB-2778): prove the emitted .proto actually compiles with protoc,
+    # not just that it matches the expected service/method shapes textually.
+    if command -v protoc >/dev/null 2>&1; then
+        if grep -q '^// ---$' "$spec_file"; then
+            # renderProto concatenates multiple reflection files into one output
+            # separated by "// ---"; protoc cannot compile a multi-file blob from a
+            # single input. The lab target emits a single file, so this branch is
+            # only a guard for future multi-file targets.
+            log_info "Skipping protoc compile: emitted spec is multi-file (concatenated)"
+        elif protoc --proto_path="$target_dir" --descriptor_set_out=/dev/null \
+            "$(basename "$spec_file")" 2>/tmp/protoc-grpc.err; then
+            log_ok "protoc compiled emitted .proto successfully"
+        else
+            log_fail "protoc failed to compile emitted .proto:"
+            cat /tmp/protoc-grpc.err >&2
+            failures=$((failures + 1))
+        fi
+    else
+        log_info "protoc not installed — skipping .proto compile check (AC4)"
     fi
 
     local expected_count
@@ -1368,6 +1502,109 @@ test_generate_js_static() {
     else
         set_test_result "generate-js-static" "FAIL" "$endpoint_count" "$expected_count" "$duration"
         log_fail "generate-js-static: ${failures} check(s) failed (${duration}s)"
+    fi
+}
+
+# test_generate_merge_slugs guards the LAB-4107 regression end-to-end: the
+# --merge-slugs CLI flag, threaded through generate.GetWithOptions ->
+# OpenAPIGenerator -> path normalization, must collapse slug siblings ONLY when
+# requested, while numeric-ID siblings normalize regardless. Offline: no
+# server/browser, --probe=false.
+test_generate_merge_slugs() {
+    local target_dir="${RESULTS_DIR}/generate-merge-slugs"
+    local input_capture="${SCRIPT_DIR}/fixtures/merge-slugs-capture.json"
+    local spec_default="${target_dir}/spec-default.yaml"
+    local spec_merge="${target_dir}/spec-merge.yaml"
+    local verbose_flag=""
+
+    [ "${VERBOSE:-false}" = true ] && verbose_flag="-v"
+
+    mkdir -p "$target_dir"
+    init_test_status "generate-merge-slugs"
+
+    local start=$SECONDS
+    local failures=0
+
+    log_header "Testing: generate-merge-slugs (LAB-4107 opt-in slug merging)"
+
+    if [ ! -f "$input_capture" ]; then
+        log_fail "Input capture not found: ${input_capture}"
+        set_test_result "generate-merge-slugs" "FAIL" "?" "3" "$((SECONDS - start))"
+        return 1
+    fi
+
+    # ── default (merge OFF): distinct slug siblings must BOTH survive ──
+    log_info "Generating with defaults (merge off)..."
+    if ! "$VESPASIAN" generate rest "$input_capture" \
+        -o "$spec_default" \
+        --probe=false \
+        $verbose_flag 2>&1; then
+        log_fail "Generate (default) failed"
+        set_test_result "generate-merge-slugs" "FAIL" "?" "3" "$((SECONDS - start))"
+        return 1
+    fi
+
+    validate_openapi_structure "$spec_default" || failures=$((failures + 1))
+
+    local stem
+    for stem in "/api/posts/hello-world" "/api/posts/my-trip"; do
+        if grep -qE "^[[:space:]]+${stem}:" "$spec_default"; then
+            log_ok "default preserved ${stem}"
+        else
+            log_fail "default dropped ${stem} (regression: distinct endpoint lost)"
+            failures=$((failures + 1))
+        fi
+    done
+    if grep -qE "^[[:space:]]+/api/posts/\{[A-Za-z]+\}:" "$spec_default"; then
+        log_fail "default collapsed /api/posts into a {slug} param (merge must be opt-in)"
+        failures=$((failures + 1))
+    fi
+    if grep -qE "^[[:space:]]+/api/users/\{[A-Za-z]+\}:" "$spec_default"; then
+        log_ok "default normalized numeric IDs to /api/users/{param}"
+    else
+        log_fail "default did not normalize /api/users numeric IDs"
+        failures=$((failures + 1))
+    fi
+
+    # ── --merge-slugs (opt-in): slug siblings collapse to one {slug} ──
+    log_info "Generating with --merge-slugs..."
+    if ! "$VESPASIAN" generate rest "$input_capture" \
+        -o "$spec_merge" \
+        --merge-slugs \
+        --probe=false \
+        $verbose_flag 2>&1; then
+        log_fail "Generate (--merge-slugs) failed"
+        failures=$((failures + 1))
+    else
+        if grep -qE "^[[:space:]]+/api/posts/\{[A-Za-z]+\}:" "$spec_merge"; then
+            log_ok "--merge-slugs collapsed /api/posts siblings to a {slug} param"
+        else
+            log_fail "--merge-slugs did not collapse /api/posts siblings"
+            failures=$((failures + 1))
+        fi
+        for stem in "/api/posts/hello-world" "/api/posts/my-trip"; do
+            if grep -qE "^[[:space:]]+${stem}:" "$spec_merge"; then
+                log_fail "--merge-slugs left ${stem} uncollapsed"
+                failures=$((failures + 1))
+            fi
+        done
+        if grep -qE "^[[:space:]]+/api/users/\{[A-Za-z]+\}:" "$spec_merge"; then
+            log_ok "--merge-slugs kept numeric-ID normalization for /api/users"
+        else
+            log_fail "--merge-slugs lost /api/users numeric-ID normalization"
+            failures=$((failures + 1))
+        fi
+    fi
+
+    local endpoint_count
+    endpoint_count=$(count_spec_endpoints "$spec_default")
+    local duration=$((SECONDS - start))
+    if [ $failures -eq 0 ]; then
+        set_test_result "generate-merge-slugs" "PASS" "$endpoint_count" "3" "$duration"
+        log_ok "generate-merge-slugs: PASSED (${duration}s)"
+    else
+        set_test_result "generate-merge-slugs" "FAIL" "$endpoint_count" "3" "$duration"
+        log_fail "generate-merge-slugs: ${failures} check(s) failed (${duration}s)"
     fi
 }
 
@@ -2498,7 +2735,7 @@ usage() {
     echo "                          Live:       rest-api, soap-service, graphql-server, grpc-server"
     echo "                          Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,"
     echo "                                      generate-graphql, generate-graphql-imports,"
-    echo "                                      generate-js-static"
+    echo "                                      generate-js-static, generate-merge-slugs"
     echo "                          Import:     import-burp, import-har, import-base64,"
     echo "                                      import-mitmproxy, import-mitmproxy-native,"
     echo "                                      import-unicode, import-duplicates,"
@@ -2560,10 +2797,10 @@ main() {
 
     # Default targets from config
     if [ -z "$targets" ]; then
-        targets="${TARGETS_SETUP:-rest-api,soap-service,graphql-server,grpc-server}"
+        targets="${TARGETS_SETUP:-rest-api,soap-service,graphql-server,grpc-server,concat-spa}"
         # Always include importer tests
         targets="${targets},import-burp,import-har,import-base64,import-mitmproxy,import-mitmproxy-native,import-unicode,import-duplicates,import-malformed,import-empty"
-        targets="${targets},generate-rest,generate-wsdl,generate-wsdl-matrix,generate-graphql,generate-graphql-imports,generate-js-static"
+        targets="${targets},generate-rest,generate-wsdl,generate-wsdl-matrix,generate-graphql,generate-graphql-imports,generate-js-static,generate-merge-slugs"
         targets="${targets},edge-cases,crawl-depth,crawl-unreachable"
         targets="${targets},classifier-edge,spec-edge"
     fi
@@ -2597,6 +2834,7 @@ main() {
             soap-service)    test_soap_service ;;
             graphql-server)  test_graphql_server ;;
             grpc-server)     test_grpc_server ;;
+            concat-spa)      test_concat_spa ;;
             import-burp)        test_import_burp ;;
             import-har)         test_import_har ;;
             import-base64)      test_import_base64 ;;
@@ -2612,6 +2850,7 @@ main() {
             generate-graphql)   test_generate_graphql ;;
             generate-graphql-imports) test_generate_graphql_imports ;;
             generate-js-static) test_generate_js_static ;;
+            generate-merge-slugs) test_generate_merge_slugs ;;
             edge-cases)         test_edge_cases ;;
             crawl-depth)        test_crawl_depth ;;
             crawl-unreachable)  test_crawl_unreachable ;;

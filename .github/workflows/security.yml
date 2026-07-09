@@ -30,4 +30,12 @@ jobs:
       pull-requests: read     # go-sec.yml preflight reads PR files + repo tree
       security-events: write
       actions: read           # required by codeql-action/upload-sarif for run metadata
+    with:
+      # Skip machine-generated files (those carrying the standard
+      # `// Code generated ... DO NOT EDIT.` marker, e.g. test/grpc-server/labpb/*.pb.go).
+      # Their unsafe.Pointer fast-paths are protoc-gen-go boilerplate, not
+      # hand-written code, so gosec's G103 "audit unsafe" alerts on them are
+      # noise. Mirrors golangci-lint's `exclusions.generated: lax`. The rest of
+      # the args match the reusable workflow's default (observe-only + SARIF).
+      gosec-args: "-no-fail -exclude-generated -fmt sarif -out gosec-results.sarif ./..."
     secrets: inherit

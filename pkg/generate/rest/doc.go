@@ -23,7 +23,8 @@
 //     accepts a population of observed paths and returns a map of input path
 //     to template path, performing both single-path regex detection (UUIDs,
 //     MongoDB ObjectIDs, numeric IDs, short hex hashes, base64/base64url
-//     tokens) and observation-based slug detection across the population.
+//     tokens) and, when opt-in slug detection is enabled via options
+//     (mergeSlugs), observation-based slug detection across the population.
 //     Known literals (`me`, `current`, `self`, `new`, `list`, `search`) are
 //     preserved against all forms of parameterization.
 //   - [NormalizePathWithNames] is a single-path convenience that performs

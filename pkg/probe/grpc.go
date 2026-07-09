@@ -37,7 +37,17 @@ import (
 // maxGRPCFileDescriptors caps the number of FileDescriptorProtos fetched per
 // target. Defensive guard against pathological servers with cyclic or deeply
 // nested import graphs.
-const maxGRPCFileDescriptors = 1000
+const maxGRPCFileDescriptors = classify.MaxGRPCFileDescriptors
+
+// maxReflectionRecvBytes caps a single reflection response message. Set
+// explicitly (rather than relying on gRPC's 4 MiB default) so per-message
+// memory from a hostile target is intentional and visible.
+const maxReflectionRecvBytes = 4 << 20 // 4 MiB
+
+// maxGRPCDescriptorBytes caps the aggregate serialized descriptor bytes
+// retained per target, bounding total memory even when many files stay
+// under the file-count cap. Guards against reflection memory-amplification.
+const maxGRPCDescriptorBytes = classify.MaxGRPCDescriptorBytes
 
 // reflectionServices are the gRPC reflection service names themselves; filtered
 // out of the discovered service list since they describe the reflection API,
@@ -48,8 +58,10 @@ var reflectionServices = map[string]bool{
 }
 
 // GRPCProbe enumerates gRPC services via the Server Reflection Protocol.
-// Uses grpcreflect.NewClientAuto, which tries v1 first then falls back to
-// v1alpha on Unimplemented.
+// Uses grpcreflect.NewClientAuto, which negotiates the reflection API
+// version with the server (v1, with a library-internal fallback to the
+// legacy v1alpha service). The fallback path is handled entirely inside
+// grpcreflect and is not separately exercised by vespasian's tests.
 type GRPCProbe struct {
 	config Config
 }
@@ -133,6 +145,7 @@ func grpcTarget(rawURL string) (grpcTargetInfo, error) {
 		return grpcTargetInfo{}, fmt.Errorf("empty host in URL %q", rawURL)
 	}
 	port := u.Port()
+	explicitPort := port != ""
 	var useTLS bool
 	switch u.Scheme {
 	case "https", "grpcs":
@@ -144,6 +157,9 @@ func grpcTarget(rawURL string) (grpcTargetInfo, error) {
 		if port == "" {
 			port = "80"
 		}
+	}
+	if !explicitPort {
+		slog.Debug("grpc target: no explicit port, assuming default", "scheme", u.Scheme, "port", port, "url", rawURL) // #nosec G706 -- debug diagnostic of capture-derived URL; not a security-sensitive sink
 	}
 	return grpcTargetInfo{hostPort: net.JoinHostPort(host, port), useTLS: useTLS}, nil
 }
@@ -187,9 +203,32 @@ func (p *GRPCProbe) probeTarget(ctx context.Context, t grpcTargetInfo) *classify
 		return nil
 	}
 
+	reqCtx, cancel := context.WithTimeout(ctx, p.config.Timeout)
+	defer cancel()
+
+	conn, err := p.dialGRPC(t)
+	if err != nil {
+		slog.DebugContext(ctx, "grpc probe: dial setup failed", "target", t.hostPort, "error", err)
+		return nil
+	}
+	defer conn.Close() //nolint:errcheck // best-effort close
+
+	client := grpcreflect.NewClientAuto(reqCtx, conn)
+	defer client.Reset()
+
+	return p.runReflection(ctx, client, t)
+}
+
+// dialGRPC builds transport credentials (TLS honoring the configured
+// GRPCInsecureSkipVerify, or cleartext) wrapped with the SSRF-safe Dialer, and
+// returns a grpc.NewClient connection for the target.
+func (p *GRPCProbe) dialGRPC(t grpcTargetInfo) (*grpc.ClientConn, error) {
 	var creds credentials.TransportCredentials
 	if t.useTLS {
-		creds = credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12})
+		creds = credentials.NewTLS(&tls.Config{
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: p.config.GRPCInsecureSkipVerify, // #nosec G402 -- opt-in only (default verifies); SSRF is enforced by the Dialer
+		})
 	} else {
 		creds = insecure.NewCredentials()
 	}
@@ -201,22 +240,18 @@ func (p *GRPCProbe) probeTarget(ctx context.Context, t grpcTargetInfo) *classify
 		return p.config.Dialer(ctx, "tcp", addr)
 	}
 
-	reqCtx, cancel := context.WithTimeout(ctx, p.config.Timeout)
-	defer cancel()
-
-	conn, err := grpc.NewClient(t.hostPort,
+	return grpc.NewClient(t.hostPort,
 		grpc.WithTransportCredentials(creds),
 		grpc.WithContextDialer(dialer),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxReflectionRecvBytes)),
 	)
-	if err != nil {
-		slog.DebugContext(ctx, "grpc probe: dial setup failed", "target", t.hostPort, "error", err)
-		return nil
-	}
-	defer conn.Close() //nolint:errcheck // best-effort close
+}
 
-	client := grpcreflect.NewClientAuto(reqCtx, conn)
-	defer client.Reset()
-
+// runReflection lists the target's services and walks each one's file
+// descriptors. It preserves probeTarget's three-outcome contract: nil (no gRPC
+// signal), ReflectionEnabled=false with a reason (structured unavailable), or
+// ReflectionEnabled=true with the discovered services and descriptors.
+func (p *GRPCProbe) runReflection(ctx context.Context, client *grpcreflect.Client, t grpcTargetInfo) *classify.GRPCReflectionResult {
 	services, err := client.ListServices()
 	if err != nil {
 		slog.DebugContext(ctx, "grpc probe: list services failed", "target", t.hostPort, "error", err)
@@ -237,17 +272,36 @@ func (p *GRPCProbe) probeTarget(ctx context.Context, t grpcTargetInfo) *classify
 		FileDescriptors:   map[string][]byte{},
 	}
 	fetched := map[string]bool{}
+	totalBytes := 0
+	maxFiles := p.config.MaxReflectionDescriptors
+	maxBytes := p.config.MaxReflectionDescriptorBytes
 
 	for _, svcName := range services {
 		if reflectionServices[svcName] {
 			continue
+		}
+		// ListServices() output is attacker-controlled: a hostile reflection
+		// server can advertise an unbounded number of distinct services. Once
+		// the retained-descriptor budget is spent, stop issuing further
+		// FileContainingSymbol RPCs so the many-services amplification vector is
+		// bounded by the count/byte caps. This bounds the number of services
+		// enumerated and the descriptor bytes RETAINED — it does NOT bound the
+		// transient peak of a single FileContainingSymbol call: grpcreflect
+		// eagerly resolves a symbol's full transitive file closure (recursive
+		// fetches) before walkFileDescriptors applies any cap, so one
+		// pathological deep/wide closure is bounded only by MaxCallRecvMsgSize
+		// (4 MiB per message) times what completes within the reflection timeout.
+		if len(fetched) >= maxFiles || totalBytes >= maxBytes {
+			slog.DebugContext(ctx, "grpc probe: descriptor budget exhausted; stopping service enumeration",
+				"target", t.hostPort, "services_discovered", len(result.Services))
+			break
 		}
 		fd, err := client.FileContainingSymbol(svcName)
 		if err != nil {
 			slog.DebugContext(ctx, "grpc probe: FileContainingSymbol failed", "service", svcName, "error", err)
 			continue
 		}
-		walkFileDescriptors(fd, fetched, result.FileDescriptors)
+		walkFileDescriptors(fd, fetched, result.FileDescriptors, &totalBytes)
 
 		if gs, ok := extractService(fd, svcName); ok {
 			result.Services = append(result.Services, gs)
@@ -258,10 +312,11 @@ func (p *GRPCProbe) probeTarget(ctx context.Context, t grpcTargetInfo) *classify
 }
 
 // walkFileDescriptors recursively serializes fd and its transitive
-// dependencies into the output map, keyed by .proto filename. Bounded by
-// maxGRPCFileDescriptors.
-func walkFileDescriptors(fd *desc.FileDescriptor, fetched map[string]bool, out map[string][]byte) {
-	if fd == nil || len(fetched) >= maxGRPCFileDescriptors {
+// dependencies into out, keyed by .proto filename. Bounded by both
+// maxGRPCFileDescriptors (count) and maxGRPCDescriptorBytes (aggregate
+// serialized bytes) to cap memory from hostile reflection responses.
+func walkFileDescriptors(fd *desc.FileDescriptor, fetched map[string]bool, out map[string][]byte, totalBytes *int) {
+	if fd == nil || len(fetched) >= maxGRPCFileDescriptors || *totalBytes >= maxGRPCDescriptorBytes {
 		return
 	}
 	name := fd.GetName()
@@ -270,12 +325,18 @@ func walkFileDescriptors(fd *desc.FileDescriptor, fetched map[string]bool, out m
 	}
 	fetched[name] = true
 
-	if raw, err := proto.Marshal(fd.AsFileDescriptorProto()); err == nil {
+	// QUAL-002: a marshal failure intentionally omits this one descriptor
+	// (non-fatal — buildDescriptorGraph degrades downstream); log so the
+	// root cause isn't invisible.
+	if raw, err := proto.Marshal(fd.AsFileDescriptorProto()); err != nil {
+		slog.Debug("grpc probe: marshal file descriptor failed; omitting", "file", name, "error", err)
+	} else {
 		out[name] = raw
+		*totalBytes += len(raw)
 	}
 
 	for _, dep := range fd.GetDependencies() {
-		walkFileDescriptors(dep, fetched, out)
+		walkFileDescriptors(dep, fetched, out, totalBytes)
 	}
 }
 

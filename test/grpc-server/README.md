@@ -8,7 +8,7 @@ Live test target for Vespasian's gRPC discovery. Registers three reflectable ser
 | `lab.v1.OrderService` | `GetOrder` | Unary |
 | `lab.v1.AccountService` | `GetAccount` | Unary |
 
-Server Reflection (v1 + v1alpha) is enabled, so `vespasian probe grpc reflection` enumerates the full surface end-to-end.
+Server Reflection (v1 + v1alpha) is enabled, so `vespasian generate grpc` enumerates the full surface end-to-end via the reflection probe (which runs inside the `generate`/`scan` pipeline — there is no standalone `probe` command).
 
 ## Run
 
@@ -39,8 +39,19 @@ grpcurl -plaintext localhost:50051 list
 # Build vespasian
 make build
 
-# Probe and emit .proto
-./bin/vespasian probe grpc reflection http://127.0.0.1:50051 \
+# Build a one-line capture pointing at a gRPC method on the server, then
+# generate the .proto (the reflection probe runs inside `generate`).
+cat > /tmp/grpc-capture.json <<'JSON'
+[
+  {
+    "method": "POST",
+    "url": "http://127.0.0.1:50051/lab.v1.UserService/GetUser",
+    "headers": { "content-type": "application/grpc" },
+    "response": { "status_code": 0, "content_type": "application/grpc" }
+  }
+]
+JSON
+./bin/vespasian generate grpc /tmp/grpc-capture.json \
     --dangerous-allow-private -o /tmp/lab.proto
 
 # Round-trip through protoc
@@ -65,8 +76,9 @@ Requires `protoc`, `protoc-gen-go`, and `protoc-gen-go-grpc` on `$PATH`.
 
 Wired into `setup-live-targets.sh` and `run-live-tests.sh` as the `grpc-server`
 target. Unlike the HTTP targets it is not crawled (browsers cannot speak gRPC);
-instead the harness runs `vespasian probe grpc reflection` against it and
-validates the emitted `.proto` against `expected-paths.json`.
+instead the harness runs `vespasian generate grpc` against a synthetic capture
+(which triggers the reflection probe) and validates the emitted `.proto`
+against `expected-paths.json`.
 
 ```bash
 ./test/setup-live-targets.sh --targets grpc-server   # build + start on :50051

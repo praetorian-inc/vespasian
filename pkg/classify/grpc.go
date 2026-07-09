@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 )
 
 // Confidence scores for gRPC classification signals.
@@ -28,6 +29,16 @@ const (
 	GRPCTrailerConfidence            = 0.80 // grpc-status or grpc-message response header
 	GRPCPathConfidence               = 0.60 // POST + /<pkg.Service>/<Method> path shape
 	GRPCContentTypeTrailerConfidence = 0.99 // gRPC content-type AND trailer (HTTP/2-style)
+)
+
+// Reflection descriptor caps shared by the probe (live reflection walk)
+// and generator (offline capture) paths so both bound descriptor memory
+// identically. Enforcement lives in pkg/probe (walkFileDescriptors) and
+// pkg/generate/grpc (Generate); this is the single source of truth for the
+// values so retuning one place updates both.
+const (
+	MaxGRPCFileDescriptors = 1000
+	MaxGRPCDescriptorBytes = 64 << 20 // 64 MiB
 )
 
 // grpcPathRE matches the gRPC convention /<pkg.qualified.Service>/<MethodName>.
@@ -81,6 +92,8 @@ func (c *GRPCClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 
 	hasPath := false
 	if strings.EqualFold(req.Method, "POST") {
+		// A malformed URL just skips the path-shape heuristic (fail-open, no
+		// confidence penalty) — content-type/trailer signals still apply.
 		if parsed, err := url.Parse(req.URL); err == nil && grpcPathRE.MatchString(parsed.Path) {
 			signals = append(signals, "grpc-path-shape")
 			hasPath = true
@@ -101,6 +114,13 @@ func (c *GRPCClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 		confidence = GRPCTrailerConfidence
 	case hasPath:
 		confidence = GRPCPathConfidence
+	default:
+		// Unreachable today: the len(signals)==0 guard above guarantees at
+		// least one of hasContentType/hasTrailer/hasPath is set. Kept as a
+		// safety floor so a future signal added without its own case can't
+		// silently return (true, 0.0) — it defaults to the lowest positive
+		// confidence instead of a filtered-out zero.
+		confidence = GRPCPathConfidence
 	}
 
 	return true, confidence, strings.Join(signals, "+")
@@ -110,14 +130,7 @@ func (c *GRPCClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 // (application/grpc, application/grpc+proto, application/grpc+json,
 // application/grpc-web, application/grpc-web+proto, ...).
 func hasGRPCContentType(ct string) bool {
-	if ct == "" {
-		return false
-	}
-	lower := strings.ToLower(ct)
-	if idx := strings.Index(lower, ";"); idx != -1 {
-		lower = strings.TrimSpace(lower[:idx])
-	}
-	return strings.HasPrefix(lower, "application/grpc")
+	return strings.HasPrefix(mediatype.Base(ct), "application/grpc")
 }
 
 // hasGRPCTrailerHeader reports whether headers contain grpc-status or

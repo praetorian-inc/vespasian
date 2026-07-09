@@ -28,14 +28,175 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	"github.com/praetorian-inc/vespasian/internal/pipeline"
 	"github.com/praetorian-inc/vespasian/pkg/analyze"
-	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
-	"github.com/praetorian-inc/vespasian/pkg/generate"
-	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
+
+// jsonGetRequest builds a minimal GET ObservedRequest for the given URL with a
+// JSON response.
+func jsonGetRequest(url string) crawl.ObservedRequest {
+	return crawl.ObservedRequest{
+		Method:  "GET",
+		URL:     url,
+		Headers: map[string]string{"Content-Type": "application/json"},
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "application/json",
+		},
+	}
+}
+
+// siblingSlugRequests returns two sibling REST requests whose only varying
+// path segment looks like a content slug. Default normalization keeps both
+// paths; --merge-slugs collapses them to /api/posts/{postSlug}.
+func siblingSlugRequests() []crawl.ObservedRequest {
+	return []crawl.ObservedRequest{
+		jsonGetRequest("https://example.com/api/posts/hello-world"),
+		jsonGetRequest("https://example.com/api/posts/my-trip"),
+	}
+}
+
+// TestGenerateSpec_SlugThresholdValidation covers the CLI-boundary guard in
+// pipeline.ClassifyProbeGenerate: --slug-threshold < 2 is rejected when merging is on, and
+// ignored when merging is off.
+func TestGenerateSpec_SlugThresholdValidation(t *testing.T) {
+	requests := siblingSlugRequests()
+
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:       "rest",
+		Confidence:    0.5,
+		Probe:         false,
+		Deduplicate:   true,
+		MergeSlugs:    true,
+		SlugThreshold: 1,
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "--slug-threshold must be >= 2")
+
+	off, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:       "rest",
+		Confidence:    0.5,
+		Probe:         false,
+		Deduplicate:   true,
+		MergeSlugs:    false,
+		SlugThreshold: 1,
+	})
+	require.NoError(t, err)
+	// threshold=1 is ignored when merging is off: both siblings survive, no collapse.
+	offStr := string(off)
+	require.Contains(t, offStr, "/api/posts/hello-world")
+	require.Contains(t, offStr, "/api/posts/my-trip")
+	require.NotContains(t, offStr, "{postSlug}")
+}
+
+// TestGenerateSpec_MergeSlugsWiring proves the --merge-slugs flag flows
+// cmd -> pipeline.ClassifyProbeGenerate -> GetWithOptions -> generator and changes the output.
+func TestGenerateSpec_MergeSlugsWiring(t *testing.T) {
+	// Include numeric-ID siblings to prove regex ID normalization is always
+	// on, independent of --merge-slugs, through the full CLI wiring.
+	requests := append(siblingSlugRequests(),
+		jsonGetRequest("https://example.com/api/users/42"),
+		jsonGetRequest("https://example.com/api/users/99"),
+	)
+
+	// SlugThreshold intentionally omitted: it is ignored when MergeSlugs is false.
+	off, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:     "rest",
+		Confidence:  0.5,
+		Probe:       false,
+		Deduplicate: true,
+		MergeSlugs:  false,
+	})
+	require.NoError(t, err)
+	offStr := string(off)
+	require.Contains(t, offStr, "/api/posts/hello-world")
+	require.Contains(t, offStr, "/api/posts/my-trip")
+	require.NotContains(t, offStr, "{postSlug}")
+	require.Contains(t, offStr, "/api/users/{userId}")
+
+	on, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:       "rest",
+		Confidence:    0.5,
+		Probe:         false,
+		Deduplicate:   true,
+		MergeSlugs:    true,
+		SlugThreshold: 2,
+	})
+	require.NoError(t, err)
+	onStr := string(on)
+	require.Contains(t, onStr, "/api/posts/{postSlug}")
+	require.NotContains(t, onStr, "/api/posts/hello-world")
+	require.NotContains(t, onStr, "/api/posts/my-trip")
+	require.Contains(t, onStr, "/api/users/{userId}")
+}
+
+// TestValidateSlugThreshold covers the wsdl/graphql exemption and the
+// apiType x mergeSlugs x threshold matrix for the slug-threshold guard.
+func TestValidateSlugThreshold(t *testing.T) {
+	tests := []struct {
+		name          string
+		apiType       string
+		mergeSlugs    bool
+		slugThreshold int
+		wantErr       bool
+	}{
+		{"rest merge threshold 1 rejected", pipeline.APITypeREST, true, 1, true},
+		{"rest merge threshold 0 rejected", pipeline.APITypeREST, true, 0, true},
+		{"rest merge threshold 2 ok", pipeline.APITypeREST, true, 2, false},
+		{"rest merge off threshold 1 ignored", pipeline.APITypeREST, false, 1, false},
+		{"auto merge threshold 1 rejected (avoids wasted crawl)", pipeline.APITypeAuto, true, 1, true},
+		{"wsdl merge threshold 1 exempt", pipeline.APITypeWSDL, true, 1, false},
+		{"graphql merge threshold 1 exempt", pipeline.APITypeGraphQL, true, 1, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSlugThreshold(tt.apiType, tt.mergeSlugs, tt.slugThreshold)
+			if tt.wantErr {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "--slug-threshold must be >= 2")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestGenerateCmdRun_RejectsSlugThresholdBeforeFileIO proves the slug-threshold
+// guard fires before the capture file is opened: the missing file never
+// produces an open error because validation rejects the flag first.
+func TestGenerateCmdRun_RejectsSlugThresholdBeforeFileIO(t *testing.T) {
+	cmd := &GenerateCmd{
+		APIType:     pipeline.APITypeREST,
+		Capture:     filepath.Join(t.TempDir(), "does-not-exist.json"),
+		SlugOptions: SlugOptions{MergeSlugs: true, SlugThreshold: 1},
+	}
+	err := cmd.Run()
+	require.Error(t, err)
+	// Early-validation contract: fail on the flag before touching the (missing) file.
+	require.Contains(t, err.Error(), "--slug-threshold must be >= 2")
+	require.NotContains(t, err.Error(), "open capture file")
+}
+
+// TestScanCmdRun_RejectsSlugThresholdBeforeCrawl proves the slug-threshold
+// guard fires before any browser/crawl. A malformed header would make
+// setupBrowserAndSignals (which runs AFTER the guard, before the crawl) fail
+// with a distinct "invalid header" error; asserting the error is EXACTLY the
+// slug error proves the guard short-circuited first. If the early guard were
+// removed, the header error would surface instead. No network/Chrome needed.
+func TestScanCmdRun_RejectsSlugThresholdBeforeCrawl(t *testing.T) {
+	cmd := &ScanCmd{
+		URL:          "https://example.com",
+		APIType:      pipeline.APITypeAuto,
+		CrawlOptions: CrawlOptions{Header: []string{"no-colon-header"}},
+		SlugOptions:  SlugOptions{MergeSlugs: true, SlugThreshold: 1},
+	}
+	err := cmd.Run()
+	require.EqualError(t, err, "--slug-threshold must be >= 2")
+}
 
 func TestValidateURL(t *testing.T) {
 	tests := []struct {
@@ -358,9 +519,9 @@ func TestClassifiersForType(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			classifiers := classifiersForType(tt.apiType)
+			classifiers := pipeline.ClassifiersForType(tt.apiType)
 			if len(classifiers) != tt.wantLen {
-				t.Errorf("classifiersForType(%q) got %d classifiers, want %d", tt.apiType, len(classifiers), tt.wantLen)
+				t.Errorf("pipeline.ClassifiersForType(%q) got %d classifiers, want %d", tt.apiType, len(classifiers), tt.wantLen)
 			}
 		})
 	}
@@ -489,12 +650,12 @@ func TestGenerateSpec(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := generateSpec(context.Background(), requests, generateSpecOptions{
+			_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 				APIType:     tt.apiType,
 				Confidence:  0.5,
 				Probe:       tt.probe,
 				Deduplicate: tt.deduplicate,
-				Verbose:     tt.verbose,
+				Status:      statusWriter(tt.verbose),
 			})
 			if tt.wantErr {
 				if err == nil {
@@ -515,13 +676,13 @@ func TestGenerateSpec(t *testing.T) {
 // so the generator returns nil spec with no error.
 func TestGenerateSpec_EmptyRequests(t *testing.T) {
 
-	spec, err := generateSpec(context.Background(), []crawl.ObservedRequest{}, generateSpecOptions{
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), []crawl.ObservedRequest{}, pipeline.Options{
 		APIType:     "rest",
 		Confidence:  0.5,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec() unexpected error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate() unexpected error: %v", err)
 	}
 	// Empty input produces nil or empty spec — no endpoints found.
 	if len(spec) > 0 {
@@ -643,6 +804,19 @@ func TestCrawlOptions_Embedded(t *testing.T) {
 	}
 }
 
+// TestSlugOptions_Embedded verifies GenerateCmd and ScanCmd expose the embedded
+// SlugOptions fields directly, the promotion their Run() methods rely on to
+// forward c.MergeSlugs / c.SlugThreshold into generateSpec.
+func TestSlugOptions_Embedded(t *testing.T) {
+	g := &GenerateCmd{SlugOptions: SlugOptions{MergeSlugs: true, SlugThreshold: 4}}
+	require.True(t, g.MergeSlugs)
+	require.Equal(t, 4, g.SlugThreshold)
+
+	s := &ScanCmd{SlugOptions: SlugOptions{MergeSlugs: true, SlugThreshold: 7}}
+	require.True(t, s.MergeSlugs)
+	require.Equal(t, 7, s.SlugThreshold)
+}
+
 // TestDangerousAllowPrivate_GenerateSpec tests generateSpec with allowPrivate=true.
 func TestDangerousAllowPrivate_GenerateSpec(t *testing.T) {
 	requests := []crawl.ObservedRequest{
@@ -678,7 +852,7 @@ func TestDangerousAllowPrivate_GenerateSpec(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := generateSpec(context.Background(), requests, generateSpecOptions{
+			_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 				APIType:      "rest",
 				Confidence:   0.5,
 				Probe:        tt.probe,
@@ -686,7 +860,7 @@ func TestDangerousAllowPrivate_GenerateSpec(t *testing.T) {
 				AllowPrivate: true,
 			})
 			if (err != nil) != tt.wantErr {
-				t.Errorf("generateSpec() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("pipeline.ClassifyProbeGenerate() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
@@ -769,17 +943,17 @@ func TestDangerousAllowPrivate_SameOutputForPublicURLs(t *testing.T) {
 		},
 	}
 
-	specWithout, err := generateSpec(context.Background(), requests, generateSpecOptions{
+	specWithout, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:     "rest",
 		Confidence:  0.5,
 		Probe:       true,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(allowPrivate=false) unexpected error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(allowPrivate=false) unexpected error: %v", err)
 	}
 
-	specWith, err := generateSpec(context.Background(), requests, generateSpecOptions{
+	specWith, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:      "rest",
 		Confidence:   0.5,
 		Probe:        true,
@@ -787,7 +961,7 @@ func TestDangerousAllowPrivate_SameOutputForPublicURLs(t *testing.T) {
 		AllowPrivate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(allowPrivate=true) unexpected error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(allowPrivate=true) unexpected error: %v", err)
 	}
 
 	if string(specWithout) != string(specWith) {
@@ -825,7 +999,7 @@ func TestDangerousAllowPrivate_PrivateIPProbe(t *testing.T) {
 	}
 
 	// With allowPrivate=true, probes should reach the loopback server.
-	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:      "rest",
 		Confidence:   0.5,
 		Probe:        true,
@@ -833,28 +1007,30 @@ func TestDangerousAllowPrivate_PrivateIPProbe(t *testing.T) {
 		AllowPrivate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(allowPrivate=true, probe=true) on loopback: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(allowPrivate=true, probe=true) on loopback: %v", err)
 	}
 	if len(spec) == 0 {
-		t.Error("generateSpec returned empty spec for loopback server with allowPrivate=true")
+		t.Error("pipeline.ClassifyProbeGenerate returned empty spec for loopback server with allowPrivate=true")
 	}
 
 	// Without allowPrivate, probes to loopback should be blocked by SSRF protection.
-	// generateSpec still succeeds (probe errors are non-fatal), but we verify it
+	// pipeline.ClassifyProbeGenerate still succeeds (probe errors are non-fatal), but we verify it
 	// doesn't crash.
-	_, err = generateSpec(context.Background(), requests, generateSpecOptions{
+	_, err = pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:     "rest",
 		Confidence:  0.5,
 		Probe:       true,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(allowPrivate=false, probe=true) on loopback: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(allowPrivate=false, probe=true) on loopback: %v", err)
 	}
 }
 
 // TestDangerousAllowPrivate_WarningOnlyWhenProbing verifies the SSRF warning
-// is only printed when both allowPrivate and probe are true.
+// is only printed when both DangerousAllowPrivate and Probe are true.
+// Drives GenerateCmd.Run (the actual code path where the warning is emitted)
+// and covers both branches of the conditional at main.go:525-527.
 func TestDangerousAllowPrivate_WarningOnlyWhenProbing(t *testing.T) {
 	requests := []crawl.ObservedRequest{
 		{
@@ -870,26 +1046,81 @@ func TestDangerousAllowPrivate_WarningOnlyWhenProbing(t *testing.T) {
 		},
 	}
 
-	// Capture stderr
-	oldStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
+	t.Run("Probe=false, no warning", func(t *testing.T) {
+		capturePath := filepath.Join(t.TempDir(), "capture.json")
+		f, err := os.Create(capturePath) //nolint:gosec // G304: test file
+		if err != nil {
+			t.Fatalf("failed to create temp capture file: %v", err)
+		}
+		if writeErr := crawl.WriteCapture(f, requests); writeErr != nil {
+			_ = f.Close()
+			t.Fatalf("failed to write capture: %v", writeErr)
+		}
+		_ = f.Close()
 
-	_, _ = generateSpec(context.Background(), requests, generateSpecOptions{
-		APIType:      "rest",
-		Confidence:   0.5,
-		Probe:        false,
-		AllowPrivate: true,
+		oldStderr := os.Stderr
+		r, w, _ := os.Pipe()
+		os.Stderr = w
+		defer func() { os.Stderr = oldStderr }()
+
+		cmd := &GenerateCmd{
+			APIType:               "rest",
+			Capture:               capturePath,
+			Output:                filepath.Join(t.TempDir(), "spec.json"),
+			Probe:                 false,
+			DangerousAllowPrivate: true,
+		}
+		if err := cmd.Run(); err != nil {
+			t.Errorf("GenerateCmd.Run() unexpected error: %v", err)
+		}
+
+		w.Close() //nolint:gosec // G104: test code
+		var buf bytes.Buffer
+		io.Copy(&buf, r) //nolint:gosec // G104: test code
+		os.Stderr = oldStderr
+
+		if strings.Contains(buf.String(), "WARNING") {
+			t.Errorf("SSRF warning should not be printed when probe is disabled; stderr: %q", buf.String())
+		}
 	})
 
-	w.Close() //nolint:gosec // G104: test code
-	var buf bytes.Buffer
-	io.Copy(&buf, r) //nolint:gosec // G104: test code
-	os.Stderr = oldStderr
+	t.Run("Probe=true, warning printed", func(t *testing.T) {
+		capturePath := filepath.Join(t.TempDir(), "capture.json")
+		f, err := os.Create(capturePath) //nolint:gosec // G304: test file
+		if err != nil {
+			t.Fatalf("failed to create temp capture file: %v", err)
+		}
+		if writeErr := crawl.WriteCapture(f, requests); writeErr != nil {
+			_ = f.Close()
+			t.Fatalf("failed to write capture: %v", writeErr)
+		}
+		_ = f.Close()
 
-	if strings.Contains(buf.String(), "WARNING") {
-		t.Error("SSRF warning should not be printed when probe is disabled")
-	}
+		oldStderr := os.Stderr
+		r, w, _ := os.Pipe()
+		os.Stderr = w
+		defer func() { os.Stderr = oldStderr }()
+
+		cmd := &GenerateCmd{
+			APIType:               "rest",
+			Capture:               capturePath,
+			Output:                filepath.Join(t.TempDir(), "spec.json"),
+			Probe:                 true,
+			DangerousAllowPrivate: true,
+		}
+		if err := cmd.Run(); err != nil {
+			t.Errorf("GenerateCmd.Run() unexpected error: %v", err)
+		}
+
+		w.Close() //nolint:gosec // G104: test code
+		var buf bytes.Buffer
+		io.Copy(&buf, r) //nolint:gosec // G104: test code
+		os.Stderr = oldStderr
+
+		if !strings.Contains(buf.String(), "WARNING") {
+			t.Errorf("SSRF warning should be printed when probe is enabled; stderr: %q", buf.String())
+		}
+	})
 }
 
 // TestDoCrawl_ProxyIgnoredWithoutHeadless verifies that doCrawl warns and clears
@@ -1280,7 +1511,7 @@ func TestDetectAPIType(t *testing.T) {
 			name:      "empty requests defaults to rest",
 			requests:  nil,
 			threshold: 0.5,
-			want:      apiTypeREST,
+			want:      pipeline.APITypeREST,
 		},
 		{
 			name: "REST JSON requests returns rest",
@@ -1298,7 +1529,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      apiTypeREST,
+			want:      pipeline.APITypeREST,
 		},
 		{
 			name: "SOAP request with SOAPAction header returns wsdl",
@@ -1314,7 +1545,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      apiTypeWSDL,
+			want:      pipeline.APITypeWSDL,
 		},
 		{
 			name: "WSDL URL query param returns wsdl",
@@ -1328,7 +1559,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      apiTypeWSDL,
+			want:      pipeline.APITypeWSDL,
 		},
 		{
 			name: "SOAP envelope in body returns wsdl",
@@ -1343,7 +1574,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      apiTypeWSDL,
+			want:      pipeline.APITypeWSDL,
 		},
 		{
 			name: "majority SOAP traffic returns wsdl",
@@ -1368,7 +1599,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      apiTypeWSDL,
+			want:      pipeline.APITypeWSDL,
 		},
 		{
 			name: "minority SOAP in mostly REST traffic returns rest",
@@ -1410,7 +1641,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      apiTypeREST,
+			want:      pipeline.APITypeREST,
 		},
 		{
 			name: "SOAP below threshold returns rest",
@@ -1429,7 +1660,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.90,
-			want:      apiTypeREST,
+			want:      pipeline.APITypeREST,
 		},
 		{
 			name: "GraphQL POST to /graphql returns graphql",
@@ -1449,7 +1680,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      apiTypeGraphQL,
+			want:      pipeline.APITypeGraphQL,
 		},
 		{
 			name: "majority GraphQL traffic returns graphql",
@@ -1493,7 +1724,7 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      apiTypeGraphQL,
+			want:      pipeline.APITypeGraphQL,
 		},
 		{
 			name: "minority GraphQL in mostly REST traffic returns rest",
@@ -1537,15 +1768,15 @@ func TestDetectAPIType(t *testing.T) {
 				},
 			},
 			threshold: 0.5,
-			want:      apiTypeREST,
+			want:      pipeline.APITypeREST,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := detectAPIType(tt.requests, tt.threshold)
+			got := pipeline.DetectAPIType(tt.requests, tt.threshold)
 			if got != tt.want {
-				t.Errorf("detectAPIType() = %q, want %q", got, tt.want)
+				t.Errorf("pipeline.DetectAPIType() = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -1566,14 +1797,14 @@ func TestGenerateSpec_WSDLType(t *testing.T) {
 		},
 	}
 
-	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
-		APIType:     apiTypeWSDL,
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:     pipeline.APITypeWSDL,
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(wsdl) unexpected error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(wsdl) unexpected error: %v", err)
 	}
 	if len(spec) == 0 {
 		t.Fatal("generateSpec(wsdl) returned empty spec for SOAP traffic")
@@ -1607,20 +1838,20 @@ func TestScanPipeline_WSDLDetection(t *testing.T) {
 	}
 
 	// Step 1: Detect API type (this is the new logic)
-	apiType := detectAPIType(soapRequests, 0.5)
-	if apiType != apiTypeWSDL {
-		t.Fatalf("detectAPIType() = %q for SOAP traffic, want %q", apiType, apiTypeWSDL)
+	apiType := pipeline.DetectAPIType(soapRequests, 0.5)
+	if apiType != pipeline.APITypeWSDL {
+		t.Fatalf("pipeline.DetectAPIType() = %q for SOAP traffic, want %q", apiType, pipeline.APITypeWSDL)
 	}
 
 	// Step 2: Generate spec with detected type
-	spec, err := generateSpec(context.Background(), soapRequests, generateSpecOptions{
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), soapRequests, pipeline.Options{
 		APIType:     apiType,
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(%s) error: %v", apiType, err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(%s) error: %v", apiType, err)
 	}
 	if len(spec) == 0 {
 		t.Fatal("scan pipeline produced empty output for SOAP traffic")
@@ -1654,21 +1885,21 @@ func TestDetectAPIType_ExplicitOverride(t *testing.T) {
 	}
 
 	// With auto, should detect WSDL
-	autoType := detectAPIType(soapRequests, 0.5)
-	if autoType != apiTypeWSDL {
-		t.Fatalf("auto detection = %q, want %q", autoType, apiTypeWSDL)
+	autoType := pipeline.DetectAPIType(soapRequests, 0.5)
+	if autoType != pipeline.APITypeWSDL {
+		t.Fatalf("auto detection = %q, want %q", autoType, pipeline.APITypeWSDL)
 	}
 
-	// With explicit REST override, generateSpec should produce REST output
+	// With explicit REST override, pipeline.ClassifyProbeGenerate should produce REST output
 	// (even though the traffic is SOAP — user explicitly chose REST)
-	spec, err := generateSpec(context.Background(), soapRequests, generateSpecOptions{
-		APIType:     apiTypeREST,
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), soapRequests, pipeline.Options{
+		APIType:     pipeline.APITypeREST,
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(rest override) error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(rest override) error: %v", err)
 	}
 	// REST classifier won't match SOAP traffic, so spec should be empty/nil
 	if len(spec) > 0 && strings.Contains(string(spec), "definitions") {
@@ -1702,17 +1933,17 @@ func TestGenerateSpec_WSDLFromResponseBody(t *testing.T) {
 		},
 	}
 
-	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
-		APIType:     apiTypeWSDL,
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:     pipeline.APITypeWSDL,
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(wsdl, response-body traffic) unexpected error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(wsdl, response-body traffic) unexpected error: %v", err)
 	}
 	if len(spec) == 0 {
-		t.Fatal("generateSpec(wsdl, response-body traffic) returned empty spec")
+		t.Fatal("pipeline.ClassifyProbeGenerate(wsdl, response-body traffic) returned empty spec")
 	}
 	specStr := string(spec)
 	if !strings.Contains(specStr, "definitions") {
@@ -1755,17 +1986,17 @@ func TestGenerateSpec_WSDLFromCrawledWSDLDocument(t *testing.T) {
 		},
 	}
 
-	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
-		APIType:     apiTypeWSDL,
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:     pipeline.APITypeWSDL,
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(wsdl, crawled ?wsdl doc) unexpected error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(wsdl, crawled ?wsdl doc) unexpected error: %v", err)
 	}
 	if len(spec) == 0 {
-		t.Fatal("generateSpec(wsdl, crawled ?wsdl doc) returned empty spec")
+		t.Fatal("pipeline.ClassifyProbeGenerate(wsdl, crawled ?wsdl doc) returned empty spec")
 	}
 	// Should return the original WSDL document via Phase 1
 	if !strings.Contains(string(spec), "TestService") {
@@ -1792,20 +2023,20 @@ func TestScanPipeline_RealisticCrawlTraffic(t *testing.T) {
 	}
 
 	// Step 1: Auto-detect should identify WSDL
-	apiType := detectAPIType(crawlTraffic, 0.5)
-	if apiType != apiTypeWSDL {
-		t.Fatalf("detectAPIType() = %q, want %q", apiType, apiTypeWSDL)
+	apiType := pipeline.DetectAPIType(crawlTraffic, 0.5)
+	if apiType != pipeline.APITypeWSDL {
+		t.Fatalf("pipeline.DetectAPIType() = %q, want %q", apiType, pipeline.APITypeWSDL)
 	}
 
 	// Step 2: Generate should produce WSDL output
-	spec, err := generateSpec(context.Background(), crawlTraffic, generateSpecOptions{
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), crawlTraffic, pipeline.Options{
 		APIType:     apiType,
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec(%s) error: %v", apiType, err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate(%s) error: %v", apiType, err)
 	}
 	if len(spec) == 0 {
 		t.Fatal("scan pipeline produced empty output for realistic crawl SOAP traffic")
@@ -1837,8 +2068,8 @@ func TestGenerateSpec_WSDLEmptyBodyNoResponse(t *testing.T) {
 		},
 	}
 
-	_, err := generateSpec(context.Background(), requests, generateSpecOptions{
-		APIType:     apiTypeWSDL,
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:     pipeline.APITypeWSDL,
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
@@ -1879,7 +2110,7 @@ func TestProbeWSDLDocument_ValidWSDL(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	doc := probeWSDLDocument(ts.URL+"/calculator.asmx", true, false)
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/calculator.asmx", true, nil)
 	if doc == nil {
 		t.Fatal("probeWSDLDocument returned nil for valid WSDL endpoint")
 	}
@@ -1897,7 +2128,7 @@ func TestProbeWSDLDocument_NoWSDL(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	doc := probeWSDLDocument(ts.URL, true, false)
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL, true, nil)
 	if doc != nil {
 		t.Errorf("probeWSDLDocument should return nil for non-WSDL endpoint, got %d bytes", len(doc))
 	}
@@ -1911,7 +2142,7 @@ func TestProbeWSDLDocument_404(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	doc := probeWSDLDocument(ts.URL, true, false)
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL, true, nil)
 	if doc != nil {
 		t.Error("probeWSDLDocument should return nil for 404 response")
 	}
@@ -1962,13 +2193,13 @@ func TestScanPipeline_WSDLDiscoveryProbe(t *testing.T) {
 	}
 
 	// Passive detection sees no WSDL — but active probe finds it
-	passiveType := detectAPIType(crawlTraffic, 0.5)
-	if passiveType != apiTypeREST {
+	passiveType := pipeline.DetectAPIType(crawlTraffic, 0.5)
+	if passiveType != pipeline.APITypeREST {
 		t.Fatalf("passive detection should return REST for HTML, got %q", passiveType)
 	}
 
 	// Active probe discovers the WSDL document
-	wsdlDoc := probeWSDLDocument(ts.URL+"/calculator.asmx", true, false)
+	wsdlDoc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/calculator.asmx", true, nil)
 	if wsdlDoc == nil {
 		t.Fatal("probeWSDLDocument should find the WSDL document")
 	}
@@ -1985,14 +2216,14 @@ func TestScanPipeline_WSDLDiscoveryProbe(t *testing.T) {
 	})
 
 	// Generate WSDL spec
-	spec, err := generateSpec(context.Background(), crawlTraffic, generateSpecOptions{
-		APIType:     apiTypeWSDL,
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), crawlTraffic, pipeline.Options{
+		APIType:     pipeline.APITypeWSDL,
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate error: %v", err)
 	}
 	if len(spec) == 0 {
 		t.Fatal("pipeline produced empty output")
@@ -2050,7 +2281,7 @@ func TestProbeWSDLDocument_URLConstruction(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			probeWSDLDocument(ts.URL+tt.inputPath, true, false)
+			pipeline.ProbeWSDLDocument(context.Background(), ts.URL+tt.inputPath, true, nil)
 
 			if gotQuery != tt.wantQuery {
 				t.Errorf("probeWSDLDocument(%q) sent query %q, want %q", tt.inputPath, gotQuery, tt.wantQuery)
@@ -2065,9 +2296,10 @@ func TestAPITypeDisplayName(t *testing.T) {
 		input string
 		want  string
 	}{
-		{apiTypeREST, "REST"},
-		{apiTypeWSDL, "WSDL"},
-		{apiTypeGraphQL, "GraphQL"},
+		{pipeline.APITypeREST, "REST"},
+		{pipeline.APITypeWSDL, "WSDL"},
+		{pipeline.APITypeGraphQL, "GraphQL"},
+		{pipeline.APITypeGRPC, "gRPC"},
 		{"unknown", "unknown"},
 	}
 	for _, tt := range tests {
@@ -2076,6 +2308,70 @@ func TestAPITypeDisplayName(t *testing.T) {
 			t.Errorf("apiTypeDisplayName(%q) = %q, want %q", tt.input, got, tt.want)
 		}
 	}
+}
+
+// TestMaybeReplayJSExtracted_GatesOnProbe is the regression test for CR-1
+// (CodeRabbit review #4215872430). The gate's job: --probe=false must NOT
+// trigger any outbound HTTP from the JS-replay step. A silent removal of
+// the gate (or moving the ReplayJSExtracted call outside it) would fail
+// here.
+func TestMaybeReplayJSExtracted_GatesOnProbe(t *testing.T) {
+	// Server records every inbound path so we can assert exactly how many
+	// HTTP requests the JS-replay step made under each probe setting.
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	// Capture containing a JS bundle whose extracted paths would trigger
+	// probes IF the gate is open.
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    srv.URL + "/static/js/main.js",
+			Source: "katana",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/javascript",
+				Body:        []byte(`var u = "/api/v1/users"; var v = "/api/v1/items";`),
+			},
+		},
+	}
+
+	cfg := crawl.JSReplayConfig{
+		Client:       srv.Client(),
+		TargetURL:    srv.URL,
+		AllowPrivate: true,
+	}
+
+	t.Run("Probe=false suppresses JS replay (no outbound HTTP)", func(t *testing.T) {
+		hits = 0
+		got := maybeReplayJSExtracted(context.Background(), requests, false, cfg)
+		if hits != 0 {
+			t.Errorf("Probe=false: expected 0 server hits, got %d", hits)
+		}
+		if len(got) != len(requests) {
+			t.Errorf("Probe=false: expected requests passed through unchanged, got len=%d want %d", len(got), len(requests))
+		}
+		if got[0].URL != requests[0].URL {
+			t.Errorf("Probe=false: first request URL changed: got %q want %q", got[0].URL, requests[0].URL)
+		}
+	})
+
+	t.Run("Probe=true triggers JS replay (outbound HTTP fires)", func(t *testing.T) {
+		hits = 0
+		got := maybeReplayJSExtracted(context.Background(), requests, true, cfg)
+		if hits == 0 {
+			t.Errorf("Probe=true: expected ≥1 server hit, got 0 — gate may have flipped wrong")
+		}
+		// JS-extracted probes are appended to the input slice.
+		if len(got) <= len(requests) {
+			t.Errorf("Probe=true: expected probed requests appended, got len=%d (input was %d)", len(got), len(requests))
+		}
+	})
 }
 
 // TestGenerateSpec_ExtractsFormParametersIntoOpenAPI verifies the end-to-end promise of the
@@ -2109,19 +2405,18 @@ func TestGenerateSpec_ExtractsFormParametersIntoOpenAPI(t *testing.T) {
 	requests := []crawl.ObservedRequest{req}
 	requests = append(requests, analyze.ExtractForms(requests)...)
 
-	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:     "rest",
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
-		Verbose:     false,
 	})
 
 	if err != nil {
-		t.Fatalf("generateSpec() unexpected error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate() unexpected error: %v", err)
 	}
 	if len(spec) == 0 {
-		t.Fatal("generateSpec() returned empty spec; expected OpenAPI YAML with /login path")
+		t.Fatal("pipeline.ClassifyProbeGenerate() returned empty spec; expected OpenAPI YAML with /login path")
 	}
 
 	// Unmarshal into a generic map so we can navigate without importing kin-openapi.
@@ -2204,19 +2499,18 @@ func TestGenerateSpec_ExtractsGETFormParametersIntoOpenAPI(t *testing.T) {
 
 	requests = append(requests, analyze.ExtractForms(requests)...)
 
-	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:     "rest",
 		Confidence:  0.0, // See function comment: synthetic GET form requests score 0 confidence.
 		Probe:       false,
 		Deduplicate: true,
-		Verbose:     false,
 	})
 
 	if err != nil {
-		t.Fatalf("generateSpec() unexpected error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate() unexpected error: %v", err)
 	}
 	if len(spec) == 0 {
-		t.Fatal("generateSpec() returned empty spec; expected OpenAPI YAML with /search path")
+		t.Fatal("pipeline.ClassifyProbeGenerate() returned empty spec; expected OpenAPI YAML with /search path")
 	}
 
 	// Unmarshal into a generic map so we can navigate without importing kin-openapi.
@@ -2281,66 +2575,6 @@ func TestGenerateSpec_ExtractsGETFormParametersIntoOpenAPI(t *testing.T) {
 	}
 }
 
-// --- TEST-001: augmentWithStaticForms unit tests ---
-
-// TestAugmentWithStaticForms tests the augmentWithStaticForms helper introduced
-// in the ScanCmd refactor (TEST-001 source change).
-func TestAugmentWithStaticForms(t *testing.T) {
-	t.Run("AppendsSyntheticAfterOriginal", func(t *testing.T) {
-		htmlBody := `<form action="/x"><input name="q"></form>`
-		requests := []crawl.ObservedRequest{
-			{
-				Method: "GET",
-				URL:    "https://host/page",
-				Response: crawl.ObservedResponse{
-					StatusCode:  200,
-					ContentType: "text/html",
-					Body:        []byte(htmlBody),
-				},
-			},
-		}
-		out := augmentWithStaticForms(requests)
-		if len(out) != len(requests)+1 {
-			t.Fatalf("len(out) = %d, want %d", len(out), len(requests)+1)
-		}
-		synth := out[len(requests)]
-		if synth.Source != analyze.SourceStaticHTML {
-			t.Errorf("out[%d].Source = %q, want %q", len(requests), synth.Source, analyze.SourceStaticHTML)
-		}
-		if !strings.Contains(synth.URL, "/x") {
-			t.Errorf("out[%d].URL = %q, want URL containing /x", len(requests), synth.URL)
-		}
-	})
-
-	t.Run("EmptyInputReturnsEmpty", func(t *testing.T) {
-		if out := augmentWithStaticForms(nil); len(out) != 0 {
-			t.Errorf("augmentWithStaticForms(nil) len = %d, want 0", len(out))
-		}
-		if out := augmentWithStaticForms([]crawl.ObservedRequest{}); len(out) != 0 {
-			t.Errorf("augmentWithStaticForms([]) len = %d, want 0", len(out))
-		}
-	})
-
-	t.Run("NonHTMLRequestUnchanged", func(t *testing.T) {
-		requests := []crawl.ObservedRequest{
-			{
-				Method: "GET",
-				URL:    "https://host/api/data",
-				Response: crawl.ObservedResponse{
-					StatusCode:  200,
-					ContentType: "application/json",
-					Body:        []byte(`{"key":"value"}`),
-				},
-			},
-		}
-		out := augmentWithStaticForms(requests)
-		// No HTML body → ExtractForms produces nothing → out == original slice
-		if len(out) != 1 {
-			t.Errorf("len(out) = %d, want 1 (non-HTML request produces no synth)", len(out))
-		}
-	})
-}
-
 // --- QUAL-001: synthetic-only GET form does not create a path in the spec ---
 
 // TestGenerateSpec_SyntheticOnlyGETFormYieldsNoPath verifies that a synthetic
@@ -2370,15 +2604,14 @@ func TestGenerateSpec_SyntheticOnlyGETFormYieldsNoPath(t *testing.T) {
 
 	// Use the default confidence threshold (0.5). Synthetic static:html GET
 	// form requests score 0 confidence, so they will not pass this gate.
-	spec, err := generateSpec(context.Background(), requests, generateSpecOptions{
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
 		APIType:     "rest",
 		Confidence:  0.5,
 		Probe:       false,
 		Deduplicate: true,
-		Verbose:     false,
 	})
 	if err != nil {
-		t.Fatalf("generateSpec() unexpected error: %v", err)
+		t.Fatalf("pipeline.ClassifyProbeGenerate() unexpected error: %v", err)
 	}
 
 	// Spec may be empty or contain paths for high-confidence endpoints — either
@@ -2412,7 +2645,7 @@ func TestGenerateSpec_SyntheticOnlyGETFormYieldsNoPath(t *testing.T) {
 // synthesizes the POST observation. A regression that reverts the ScanCmd.Run
 // reorder would silently fall through here.
 func TestDetectAPIType_StaticHTMLPostFormDrivesREST(t *testing.T) {
-	// A SOAP request anchors the raw set to WSDL so that rawType != apiTypeREST.
+	// A SOAP request anchors the raw set to WSDL so that rawType != pipeline.APITypeREST.
 	// Without this, detectAPIType falls back to REST even with zero signals,
 	// making it impossible to observe the change ExtractForms causes.
 	soapAnchor := crawl.ObservedRequest{
@@ -2446,612 +2679,16 @@ func TestDetectAPIType_StaticHTMLPostFormDrivesREST(t *testing.T) {
 	}
 
 	raw := []crawl.ObservedRequest{soapAnchor, landingPage}
-	rawType := detectAPIType(raw, 0.5)
+	rawType := pipeline.DetectAPIType(raw, 0.5)
 
 	augmented := append([]crawl.ObservedRequest{}, raw...)
 	augmented = append(augmented, analyze.ExtractForms(raw)...)
-	augType := detectAPIType(augmented, 0.5)
+	augType := pipeline.DetectAPIType(augmented, 0.5)
 
-	if augType != apiTypeREST {
-		t.Errorf("detectAPIType(augmented) = %q, want %q", augType, apiTypeREST)
+	if augType != pipeline.APITypeREST {
+		t.Errorf("pipeline.DetectAPIType(augmented) = %q, want %q", augType, pipeline.APITypeREST)
 	}
 	if rawType == augType {
 		t.Errorf("ExtractForms must change classification: raw=%q augmented=%q (both same — pipeline reorder isn't load-bearing)", rawType, augType)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// T3 — enrichGRPCFromBindings: driven with a real gRPC-Web JS bundle so
-// ExtractGRPCWebBindings actually recovers a non-empty service set (the
-// previous versions of these tests passed an empty []crawl.ObservedRequest{},
-// so ExtractGRPCWebBindings returned nothing and enrichGRPCFromBindings
-// returned early before exercising the append/fill/drop logic at all).
-// ---------------------------------------------------------------------------
-
-// grpcClassifiedRequest is a helper to build a gRPC ClassifiedRequest with
-// optional schema.
-func grpcClassifiedRequest(schema *classify.GRPCReflectionResult) classify.ClassifiedRequest {
-	return classify.ClassifiedRequest{
-		ObservedRequest: crawl.ObservedRequest{Method: "POST", URL: "https://example.com/grpc"},
-		APIType:         apiTypeGRPC,
-		GRPCSchema:      schema,
-	}
-}
-
-// grpcWebJSRequest builds an ObservedRequest whose response body is the real
-// Connect-ES gRPC-Web JS bundle fixture shared with pkg/analyze's own tests
-// (pkg/analyze/testdata/grpc_web/users_connect.js, service
-// "users.v1.UserService"). Reusing the real fixture — rather than a
-// hand-rolled snippet — exercises the same jsluice detection path
-// ExtractGRPCWebBindings uses in production.
-func grpcWebJSRequest(t *testing.T) crawl.ObservedRequest {
-	t.Helper()
-	body, err := os.ReadFile(filepath.Join("..", "..", "pkg", "analyze", "testdata", "grpc_web", "users_connect.js"))
-	if err != nil {
-		t.Fatalf("read users_connect.js fixture: %v", err)
-	}
-	return crawl.ObservedRequest{
-		Method: "GET",
-		URL:    "https://example.com/users_connect.js",
-		Response: crawl.ObservedResponse{
-			ContentType: "application/javascript",
-			Body:        body,
-		},
-	}
-}
-
-// grpcServiceNames extracts the sorted service names carried by a
-// GRPCReflectionResult, or nil when schema is nil.
-func grpcServiceNames(schema *classify.GRPCReflectionResult) []string {
-	if schema == nil {
-		return nil
-	}
-	names := make([]string, 0, len(schema.Services))
-	for _, s := range schema.Services {
-		names = append(names, s.Name)
-	}
-	return names
-}
-
-// TestEnrichGRPCFromBindings_AppendsSyntheticEndpointWhenNoGRPCEndpoints
-// (T3 Case B, real bindings): enriched has zero grpc endpoints; the real
-// users_connect.js bundle recovers users.v1.UserService, so exactly one
-// synthetic grpc endpoint must be appended carrying that service.
-func TestEnrichGRPCFromBindings_AppendsSyntheticEndpointWhenNoGRPCEndpoints(t *testing.T) {
-	requests := []crawl.ObservedRequest{grpcWebJSRequest(t)}
-	enriched := []classify.ClassifiedRequest{
-		{
-			ObservedRequest: crawl.ObservedRequest{Method: "GET", URL: "https://example.com/api"},
-			APIType:         "rest",
-		},
-	}
-
-	result := enrichGRPCFromBindings(requests, enriched, false)
-
-	var grpcEPs []classify.ClassifiedRequest
-	for _, ep := range result {
-		if ep.APIType == apiTypeGRPC {
-			grpcEPs = append(grpcEPs, ep)
-		}
-	}
-	if len(grpcEPs) != 1 {
-		t.Fatalf("enrichGRPCFromBindings: got %d synthetic grpc endpoints, want exactly 1", len(grpcEPs))
-	}
-	names := grpcServiceNames(grpcEPs[0].GRPCSchema)
-	if len(names) == 0 || names[0] != "users.v1.UserService" {
-		t.Errorf("enrichGRPCFromBindings: synthetic endpoint services = %v, want [users.v1.UserService]", names)
-	}
-}
-
-// TestEnrichGRPCFromBindings_FillsBareEndpointInPlace (T3 Case C): a bare grpc
-// endpoint (nil GRPCSchema) is present alongside the real users_connect.js
-// bundle. The uncovered recovered service must be filled onto the existing
-// endpoint, and no endpoint must be appended.
-func TestEnrichGRPCFromBindings_FillsBareEndpointInPlace(t *testing.T) {
-	requests := []crawl.ObservedRequest{grpcWebJSRequest(t)}
-	enriched := []classify.ClassifiedRequest{grpcClassifiedRequest(nil)}
-
-	result := enrichGRPCFromBindings(requests, enriched, false)
-
-	if len(result) != 1 {
-		t.Fatalf("enrichGRPCFromBindings: got %d endpoints, want 1 (fill in place, no append)", len(result))
-	}
-	names := grpcServiceNames(result[0].GRPCSchema)
-	if len(names) == 0 || names[0] != "users.v1.UserService" {
-		t.Errorf("enrichGRPCFromBindings: bare endpoint services after fill = %v, want [users.v1.UserService]", names)
-	}
-}
-
-// TestEnrichGRPCFromBindings_DropsAlreadyCoveredFQN (T3 Case A, real
-// bindings): enriched has one grpc endpoint that already carries the same
-// service FQN (users.v1.UserService) recovered by the real bindings bundle,
-// via reflection/gateway. This pins the "no re-attachment" outcome: no
-// endpoint is appended and the existing GRPCSchema pointer is left untouched
-// (not replaced, not duplicated) when a grpc endpoint already covers the
-// recovered FQN.
-//
-// Note: this single-endpoint scenario does not, by itself, isolate WHICH
-// guard produces that outcome — filterUncoveredServices dropping the FQN
-// (triggering enrichGRPCFromBindings' early "len(filtered) == 0" return) and
-// the hasCoverage skip-fill branch in the fill loop would both leave this
-// endpoint's schema pointer unchanged, since the endpoint's Services is
-// already non-empty either way. See
-// TestEnrichGRPCFromBindings_FilterDropsRecoveredFQNLeavesBareEndpointUnfilled
-// below for a variant where filtering — not hasCoverage — is the sole reason
-// no fill occurs, using a second, bare endpoint that hasCoverage would
-// otherwise fill.
-func TestEnrichGRPCFromBindings_DropsAlreadyCoveredFQN(t *testing.T) {
-	requests := []crawl.ObservedRequest{grpcWebJSRequest(t)}
-
-	existingSchema := &classify.GRPCReflectionResult{
-		ReflectionEnabled: true,
-		Services: []classify.GRPCService{
-			{Name: "users.v1.UserService", Methods: []classify.GRPCMethod{{Name: "GetUser"}}},
-		},
-	}
-	enriched := []classify.ClassifiedRequest{grpcClassifiedRequest(existingSchema)}
-
-	result := enrichGRPCFromBindings(requests, enriched, false)
-
-	if len(result) != 1 {
-		t.Fatalf("enrichGRPCFromBindings: got %d endpoints, want 1 (no append when FQN already covered)", len(result))
-	}
-	if result[0].GRPCSchema != existingSchema {
-		t.Error("enrichGRPCFromBindings: existing schema must be left untouched when its FQN is already covered")
-	}
-	count := 0
-	for _, s := range result[0].GRPCSchema.Services {
-		if s.Name == "users.v1.UserService" {
-			count++
-		}
-	}
-	if count != 1 {
-		t.Errorf("enrichGRPCFromBindings: users.v1.UserService count = %d, want 1 (not re-attached)", count)
-	}
-}
-
-// TestEnrichGRPCFromBindings_FilterDropsRecoveredFQNLeavesBareEndpointUnfilled
-// isolates filterUncoveredServices as the sole reason no fill occurs (TEST-001
-// fix): a bare grpc endpoint (nil GRPCSchema, hasCoverage false — the fill
-// loop would fill it if it ever ran with a non-empty recovered set) sits
-// alongside a second endpoint that already covers the bindings-recovered FQN
-// (users.v1.UserService). filterUncoveredServices must remove that FQN as the
-// only recovered service, so enrichGRPCFromBindings returns early before the
-// fill loop runs at all — leaving the bare endpoint's schema nil and
-// appending no endpoint. Unlike TestEnrichGRPCFromBindings_DropsAlreadyCoveredFQN,
-// the bare endpoint here has hasCoverage == false, so if filtering did NOT
-// drop the FQN, this endpoint would be filled — proving filtering, not
-// hasCoverage, is what leaves it untouched.
-func TestEnrichGRPCFromBindings_FilterDropsRecoveredFQNLeavesBareEndpointUnfilled(t *testing.T) {
-	requests := []crawl.ObservedRequest{grpcWebJSRequest(t)}
-
-	coveredEP := grpcClassifiedRequest(&classify.GRPCReflectionResult{
-		ReflectionEnabled: true,
-		Services: []classify.GRPCService{
-			{Name: "users.v1.UserService", Methods: []classify.GRPCMethod{{Name: "GetUser"}}},
-		},
-	})
-	bareEP := grpcClassifiedRequest(nil)
-
-	result := enrichGRPCFromBindings(requests, []classify.ClassifiedRequest{coveredEP, bareEP}, false)
-
-	if len(result) != 2 {
-		t.Fatalf("enrichGRPCFromBindings: got %d endpoints, want 2 (no append when filtering removes the only recovered service)", len(result))
-	}
-	if result[1].GRPCSchema != nil {
-		t.Errorf("enrichGRPCFromBindings: bare endpoint schema = %+v, want nil (filterUncoveredServices must remove the only recovered FQN before the fill loop runs)", result[1].GRPCSchema)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TEST-001 E2E — pipeline glue: enrichGRPCFromBindings feeding Generate
-// ---------------------------------------------------------------------------
-
-// TestEnrichGRPCFromBindings_PipelineGlueNoCollisionWithGateway pins the
-// multi-technique collision scenario (LAB-3864 review bug) at the pipeline
-// boundary generateSpec's grpc path drives: a grpc-gateway-derived endpoint
-// (greet.v1.Greeter, already covered — as GRPCGatewayProbe would leave it)
-// sits alongside a second, still-bare grpc endpoint; a captured gRPC-Web JS
-// bundle recovers greet.v1.Farewell — same package, different service — via
-// gRPC-Web bindings. enrichGRPCFromBindings must fill only the bare endpoint,
-// and feeding the combined result into the exact Generate call generateSpec
-// uses (generate.Get("grpc").Generate) must produce neither a "conflicting
-// file descriptors" nor a duplicate-symbol error, and a non-empty .proto. The
-// generator-level collision tests in pkg/generate/grpc/generator_test.go
-// cover Generate in isolation with hand-built ClassifiedRequests; this test
-// additionally exercises the enrichGRPCFromBindings glue that produces that
-// input in the real pipeline.
-func TestEnrichGRPCFromBindings_PipelineGlueNoCollisionWithGateway(t *testing.T) {
-	farewellJS := []byte(`
-		export const Farewell = {
-		  typeName: "greet.v1.Farewell",
-		  methods: {
-		    sayBye: {
-		      name: "SayBye",
-		      I: ByeRequest,
-		      O: ByeResponse,
-		      kind: MethodKind.Unary,
-		    },
-		  },
-		};
-	`)
-	requests := []crawl.ObservedRequest{
-		{
-			Method: "GET",
-			URL:    "https://example.com/farewell_connect.js",
-			Response: crawl.ObservedResponse{
-				ContentType: "application/javascript",
-				Body:        farewellJS,
-			},
-		},
-	}
-
-	// Endpoint A: already covered — as the grpc-gateway probe would leave it
-	// after recovering greet.v1.Greeter from an OpenAPI document.
-	gatewayEP := grpcClassifiedRequest(&classify.GRPCReflectionResult{
-		ReflectionEnabled: false,
-		Services: []classify.GRPCService{
-			{Name: "greet.v1.Greeter", Methods: []classify.GRPCMethod{
-				{Name: "SayHello", InputType: "HelloRequest", OutputType: "HelloResponse"},
-			}},
-		},
-	})
-	// Endpoint B: a second grpc endpoint with no coverage yet — e.g. a host
-	// the gateway probe found no OpenAPI document for.
-	bareEP := grpcClassifiedRequest(nil)
-
-	enriched := enrichGRPCFromBindings(requests, []classify.ClassifiedRequest{gatewayEP, bareEP}, false)
-
-	if len(enriched) != 2 {
-		t.Fatalf("enrichGRPCFromBindings: got %d endpoints, want 2 (fill bare endpoint in place, no append)", len(enriched))
-	}
-	if names := grpcServiceNames(enriched[1].GRPCSchema); len(names) == 0 || names[0] != "greet.v1.Farewell" {
-		t.Fatalf("enrichGRPCFromBindings: bare endpoint services = %v, want [greet.v1.Farewell]", names)
-	}
-
-	// Feed the combined result through the exact Generate call generateSpec's
-	// grpc path uses.
-	gen, err := generate.Get(apiTypeGRPC)
-	if err != nil {
-		t.Fatalf("generate.Get(%q): %v", apiTypeGRPC, err)
-	}
-	spec, err := gen.Generate(enriched)
-	if err != nil {
-		t.Fatalf("Generate must not return a conflicting file descriptors or duplicate symbol error: %v", err)
-	}
-	if len(spec) == 0 {
-		t.Fatal("Generate returned an empty .proto for a valid gateway+bindings capture")
-	}
-
-	specStr := string(spec)
-	if !strings.Contains(specStr, "service Greeter") {
-		t.Errorf("expected .proto to contain service Greeter, got:\n%s", specStr)
-	}
-	if !strings.Contains(specStr, "service Farewell") {
-		t.Errorf("expected .proto to contain service Farewell, got:\n%s", specStr)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// T4 — filterUncoveredServices: dedupes bindings services against recovered
-// ---------------------------------------------------------------------------
-
-// TestFilterUncoveredServices_DropsAlreadyCoveredFQNs (T4):
-// enriched grpc endpoint has gateway Services [Greeter]; bindings recover
-// [Greeter, Farewell]. Only Farewell should be returned.
-func TestFilterUncoveredServices_DropsAlreadyCoveredFQNs(t *testing.T) {
-	enriched := []classify.ClassifiedRequest{
-		grpcClassifiedRequest(&classify.GRPCReflectionResult{
-			Services: []classify.GRPCService{
-				{Name: "Greeter"},
-			},
-		}),
-	}
-	bindingsSvcs := []classify.GRPCService{
-		{Name: "Greeter"},  // already covered
-		{Name: "Farewell"}, // new
-	}
-
-	filtered := filterUncoveredServices(bindingsSvcs, enriched)
-	if len(filtered) != 1 {
-		t.Fatalf("filterUncoveredServices: got %d services, want 1", len(filtered))
-	}
-	if filtered[0].Name != "Farewell" {
-		t.Errorf("filterUncoveredServices: got %q, want Farewell", filtered[0].Name)
-	}
-}
-
-// TestFilterUncoveredServices_LeadingDotStripped verifies that ".pkg.S" and
-// "pkg.S" are considered the same FQN (leading dot stripped).
-func TestFilterUncoveredServices_LeadingDotStripped(t *testing.T) {
-	enriched := []classify.ClassifiedRequest{
-		grpcClassifiedRequest(&classify.GRPCReflectionResult{
-			Services: []classify.GRPCService{
-				{Name: "pkg.S"}, // without leading dot
-			},
-		}),
-	}
-	bindingsSvcs := []classify.GRPCService{
-		{Name: ".pkg.S"}, // with leading dot — same FQN
-	}
-
-	filtered := filterUncoveredServices(bindingsSvcs, enriched)
-	if len(filtered) != 0 {
-		t.Errorf("filterUncoveredServices: expected 0 uncovered services (leading dot stripped), got %d: %v", len(filtered), filtered)
-	}
-}
-
-// TestFilterUncoveredServices_AllNew verifies all services are returned when
-// none overlap with already-covered FQNs.
-func TestFilterUncoveredServices_AllNew(t *testing.T) {
-	enriched := []classify.ClassifiedRequest{
-		grpcClassifiedRequest(&classify.GRPCReflectionResult{
-			Services: []classify.GRPCService{{Name: "OtherService"}},
-		}),
-	}
-	bindingsSvcs := []classify.GRPCService{
-		{Name: "Alpha"},
-		{Name: "Beta"},
-	}
-
-	filtered := filterUncoveredServices(bindingsSvcs, enriched)
-	if len(filtered) != 2 {
-		t.Errorf("filterUncoveredServices: got %d, want 2", len(filtered))
-	}
-}
-
-// TestFilterUncoveredServices_EmptyEnriched verifies all services are returned
-// when no endpoints exist.
-func TestFilterUncoveredServices_EmptyEnriched(t *testing.T) {
-	bindingsSvcs := []classify.GRPCService{
-		{Name: "Alpha"},
-	}
-	filtered := filterUncoveredServices(bindingsSvcs, nil)
-	if len(filtered) != 1 {
-		t.Errorf("filterUncoveredServices with nil enriched: got %d, want 1", len(filtered))
-	}
-}
-
-// ---------------------------------------------------------------------------
-// T5 — seedGRPCHostEndpoints: host dedup, ordering, cap, excludes existing
-// ---------------------------------------------------------------------------
-
-// TestSeedGRPCHostEndpoints_DeduplicatesAndOrders (T5 core):
-// REST requests across 2 distinct hosts + many paths → exactly 2 synthetic
-// grpc endpoints, deterministic (sorted) order.
-func TestSeedGRPCHostEndpoints_DeduplicatesAndOrders(t *testing.T) {
-	// 50 paths across 2 hosts: host A and host B.
-	requests := make([]crawl.ObservedRequest, 0, 50)
-	for i := 0; i < 25; i++ {
-		requests = append(requests, crawl.ObservedRequest{
-			Method: "GET",
-			URL:    fmt.Sprintf("https://alpha.example.com/api/path%d", i),
-		})
-		requests = append(requests, crawl.ObservedRequest{
-			Method: "GET",
-			URL:    fmt.Sprintf("https://beta.example.com/api/path%d", i),
-		})
-	}
-
-	classified := []classify.ClassifiedRequest{} // no pre-existing grpc endpoints
-	result := seedGRPCHostEndpoints(requests, classified, 500)
-
-	// Should have exactly 2 synthetic grpc endpoints.
-	var grpcEPs []classify.ClassifiedRequest
-	for _, ep := range result {
-		if ep.APIType == apiTypeGRPC {
-			grpcEPs = append(grpcEPs, ep)
-		}
-	}
-	if len(grpcEPs) != 2 {
-		t.Fatalf("seedGRPCHostEndpoints: got %d grpc endpoints, want 2", len(grpcEPs))
-	}
-
-	// Deterministic order: alpha before beta.
-	if grpcEPs[0].URL != "https://alpha.example.com" {
-		t.Errorf("first synthetic endpoint URL = %q, want %q", grpcEPs[0].URL, "https://alpha.example.com")
-	}
-	if grpcEPs[1].URL != "https://beta.example.com" {
-		t.Errorf("second synthetic endpoint URL = %q, want %q", grpcEPs[1].URL, "https://beta.example.com")
-	}
-}
-
-// TestSeedGRPCHostEndpoints_ExcludesExistingGRPCHosts verifies that hosts
-// already covered by classified grpc endpoints are not re-seeded.
-func TestSeedGRPCHostEndpoints_ExcludesExistingGRPCHosts(t *testing.T) {
-	requests := []crawl.ObservedRequest{
-		{Method: "GET", URL: "https://api.example.com/v1/users"},
-		{Method: "GET", URL: "https://grpc.example.com/SomeService/Method"},
-	}
-	classified := []classify.ClassifiedRequest{
-		{
-			ObservedRequest: crawl.ObservedRequest{URL: "https://grpc.example.com/SomeService/Method"},
-			APIType:         apiTypeGRPC,
-		},
-	}
-
-	result := seedGRPCHostEndpoints(requests, classified, 500)
-
-	// grpc.example.com is already present; only api.example.com should be seeded.
-	var newEPs []classify.ClassifiedRequest
-	for _, ep := range result {
-		if ep.APIType == apiTypeGRPC && ep.URL != "https://grpc.example.com/SomeService/Method" {
-			newEPs = append(newEPs, ep)
-		}
-	}
-	if len(newEPs) != 1 {
-		t.Fatalf("seedGRPCHostEndpoints: got %d new grpc endpoints, want 1", len(newEPs))
-	}
-	if newEPs[0].URL != "https://api.example.com" {
-		t.Errorf("new endpoint URL = %q, want %q", newEPs[0].URL, "https://api.example.com")
-	}
-}
-
-// TestSeedGRPCHostEndpoints_RespectsMaxHostsCap verifies the cap is honored.
-func TestSeedGRPCHostEndpoints_RespectsMaxHostsCap(t *testing.T) {
-	requests := make([]crawl.ObservedRequest, 10)
-	for i := range requests {
-		requests[i] = crawl.ObservedRequest{
-			Method: "GET",
-			URL:    fmt.Sprintf("https://host%02d.example.com/api", i),
-		}
-	}
-	const cap = 3
-	result := seedGRPCHostEndpoints(requests, nil, cap)
-
-	var grpcEPs []classify.ClassifiedRequest
-	for _, ep := range result {
-		if ep.APIType == apiTypeGRPC {
-			grpcEPs = append(grpcEPs, ep)
-		}
-	}
-	if len(grpcEPs) != cap {
-		t.Errorf("seedGRPCHostEndpoints with cap=%d: got %d grpc endpoints, want %d", cap, len(grpcEPs), cap)
-	}
-}
-
-// TestSeedGRPCHostEndpoints_UnparsableURLsSkipped verifies that malformed URLs
-// in requests do not panic and are simply skipped.
-func TestSeedGRPCHostEndpoints_UnparsableURLsSkipped(t *testing.T) {
-	requests := []crawl.ObservedRequest{
-		{Method: "GET", URL: "://invalid"},
-		{Method: "GET", URL: "https://valid.example.com/api"},
-	}
-	result := seedGRPCHostEndpoints(requests, nil, 500)
-
-	var grpcEPs []classify.ClassifiedRequest
-	for _, ep := range result {
-		if ep.APIType == apiTypeGRPC {
-			grpcEPs = append(grpcEPs, ep)
-		}
-	}
-	if len(grpcEPs) != 1 {
-		t.Errorf("expected 1 grpc endpoint (invalid URL skipped), got %d", len(grpcEPs))
-	}
-}
-
-// TestGRPCHostKey_Basic verifies grpcHostKey extracts scheme://host correctly.
-func TestGRPCHostKey_Basic(t *testing.T) {
-	tests := []struct {
-		rawURL string
-		want   string
-	}{
-		{"https://example.com/grpc/path", "https://example.com"},
-		{"http://example.com:8080/api", "http://example.com:8080"},
-		{"grpc://example.com:9090", "grpc://example.com:9090"},
-		{"://invalid", ""},
-		{"https://", ""}, // no host
-	}
-	for _, tt := range tests {
-		got := grpcHostKey(tt.rawURL)
-		if got != tt.want {
-			t.Errorf("grpcHostKey(%q) = %q, want %q", tt.rawURL, got, tt.want)
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// T7 — applyAllowPrivate / clonePermissiveTransport preserve transport fields
-// ---------------------------------------------------------------------------
-
-// TestApplyAllowPrivate_PreservesCustomTransportFields (T7):
-// Sets cfg.Client with a custom *http.Transport that has MaxIdleConns=123 and
-// ResponseHeaderTimeout=7s, calls applyAllowPrivate, and asserts that those
-// fields are preserved while DialContext is overridden and URLValidator allows
-// any URL.
-func TestApplyAllowPrivate_PreservesCustomTransportFields(t *testing.T) {
-	const wantMaxIdleConns = 123
-	wantTimeout := 7 * time.Second
-
-	cfg := probe.DefaultConfig()
-	cfg.Client = &http.Client{
-		Transport: &http.Transport{
-			MaxIdleConns:          wantMaxIdleConns,
-			ResponseHeaderTimeout: wantTimeout,
-		},
-	}
-
-	applyAllowPrivate(&cfg)
-
-	// URLValidator must now allow any URL (SSRF disabled).
-	if err := cfg.URLValidator("http://127.0.0.1"); err != nil {
-		t.Errorf("applyAllowPrivate URLValidator rejected loopback: %v", err)
-	}
-
-	tr, ok := cfg.Client.Transport.(*http.Transport)
-	if !ok {
-		t.Fatalf("cfg.Client.Transport is %T, want *http.Transport", cfg.Client.Transport)
-	}
-
-	// Custom field preservation.
-	if tr.MaxIdleConns != wantMaxIdleConns {
-		t.Errorf("MaxIdleConns = %d, want %d (should be preserved)", tr.MaxIdleConns, wantMaxIdleConns)
-	}
-	if tr.ResponseHeaderTimeout != wantTimeout {
-		t.Errorf("ResponseHeaderTimeout = %v, want %v (should be preserved)", tr.ResponseHeaderTimeout, wantTimeout)
-	}
-
-	// DialContext must be overridden (permissive dial).
-	if tr.DialContext == nil {
-		t.Error("DialContext must be set (permissive dialer) after applyAllowPrivate")
-	}
-}
-
-// TestApplyAllowPrivate_NilClientCreatesNewTransport verifies that when
-// cfg.Client is nil, applyAllowPrivate creates a new http.Client with a
-// transport cloned from http.DefaultTransport and overrides DialContext.
-func TestApplyAllowPrivate_NilClientCreatesNewTransport(t *testing.T) {
-	cfg := probe.DefaultConfig()
-	// DefaultConfig leaves Client nil.
-	if cfg.Client != nil {
-		t.Skip("DefaultConfig unexpectedly set Client; skip")
-	}
-
-	applyAllowPrivate(&cfg)
-
-	if cfg.Client == nil {
-		t.Fatal("applyAllowPrivate must create cfg.Client when it was nil")
-	}
-	tr, ok := cfg.Client.Transport.(*http.Transport)
-	if !ok {
-		t.Fatalf("cfg.Client.Transport is %T, want *http.Transport", cfg.Client.Transport)
-	}
-	if tr.DialContext == nil {
-		t.Error("DialContext must be set after applyAllowPrivate")
-	}
-	if cfg.Dialer == nil {
-		t.Error("cfg.Dialer must be set (gRPC reflection path) after applyAllowPrivate")
-	}
-}
-
-// TestClonePermissiveTransport_ClonesExistingTransport verifies that a non-nil
-// *http.Transport is cloned (not aliased) so mutations to the clone don't
-// affect the original.
-func TestClonePermissiveTransport_ClonesExistingTransport(t *testing.T) {
-	const wantConns = 42
-	orig := &http.Transport{MaxIdleConns: wantConns}
-	client := &http.Client{Transport: orig}
-
-	clone := clonePermissiveTransport(client)
-	if clone == orig {
-		t.Error("clonePermissiveTransport must return a new transport, not the same pointer")
-	}
-	if clone.MaxIdleConns != wantConns {
-		t.Errorf("clone.MaxIdleConns = %d, want %d", clone.MaxIdleConns, wantConns)
-	}
-
-	// Mutate clone — original must be unaffected.
-	clone.MaxIdleConns = 999
-	if orig.MaxIdleConns != wantConns {
-		t.Errorf("original.MaxIdleConns mutated to %d; Clone did not isolate", orig.MaxIdleConns)
-	}
-}
-
-// TestClonePermissiveTransport_NilClientFallsBackToDefault verifies that a nil
-// client causes fallback to http.DefaultTransport.
-func TestClonePermissiveTransport_NilClientFallsBackToDefault(t *testing.T) {
-	clone := clonePermissiveTransport(nil)
-	if clone == nil {
-		t.Fatal("clonePermissiveTransport(nil) returned nil")
 	}
 }

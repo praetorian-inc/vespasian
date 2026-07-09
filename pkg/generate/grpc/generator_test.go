@@ -15,6 +15,7 @@
 package grpc
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -405,4 +406,332 @@ func TestUnionRecoveredServices_NilSchemaSkipped(t *testing.T) {
 	}
 	result := unionRecoveredServices([]classify.ClassifiedRequest{ep}, nil)
 	assert.Empty(t, result)
+}
+
+// danglingImportFileBytes builds a FileDescriptorProto that depends on a file
+// ("missing.proto") which is NOT present in the descriptor set, so its import
+// cannot be resolved. Used to exercise the partial-resolution path.
+func danglingImportFileBytes(t *testing.T) []byte {
+	t.Helper()
+	fdp := &descriptorpb.FileDescriptorProto{
+		Name:       proto.String("broken.proto"),
+		Package:    proto.String("broken.v1"),
+		Syntax:     proto.String("proto3"),
+		Dependency: []string{"missing.proto"},
+		MessageType: []*descriptorpb.DescriptorProto{
+			{
+				Name: proto.String("BrokenMessage"),
+				Field: []*descriptorpb.FieldDescriptorProto{
+					{
+						Name:     proto.String("value"),
+						Number:   proto.Int32(1),
+						Type:     descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
+						Label:    descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+						JsonName: proto.String("value"),
+					},
+				},
+			},
+		},
+	}
+	raw, err := proto.Marshal(fdp)
+	require.NoError(t, err)
+	return raw
+}
+
+func TestGenerator_Generate_PartialResolutionSkipsBrokenFile(t *testing.T) {
+	g := &Generator{}
+
+	endpoints := []classify.ClassifiedRequest{
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors: map[string][]byte{
+					"users.proto":  fileDescriptorBytes(t),
+					"broken.proto": danglingImportFileBytes(t),
+				},
+			},
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	require.NoError(t, err)
+	output := string(out)
+
+	// users.proto survived and was emitted.
+	assert.Contains(t, output, "service UserService")
+	assert.Contains(t, output, "message GetUserRequest")
+
+	// broken.proto was skipped and reported.
+	assert.Contains(t, output, "WARNING")
+	assert.Contains(t, output, "broken.proto")
+}
+
+func TestGenerator_Generate_AllUnresolvableErrors(t *testing.T) {
+	g := &Generator{}
+
+	endpoints := []classify.ClassifiedRequest{
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors: map[string][]byte{
+					"broken.proto": danglingImportFileBytes(t),
+				},
+			},
+		},
+	}
+
+	_, err := g.Generate(endpoints)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "build descriptor graph")
+}
+
+// ordersFileDescriptorBytes builds a minimal FileDescriptorProto for a
+// DISJOINT file from fileDescriptorBytes: name "orders.proto", package
+// "orders.v1", messages GetOrderRequest/GetOrderResponse, and service
+// "OrderService" with rpc "GetOrder". Returns wire-format bytes.
+func ordersFileDescriptorBytes(t *testing.T) []byte {
+	t.Helper()
+	fdp := &descriptorpb.FileDescriptorProto{
+		Name:    proto.String("orders.proto"),
+		Package: proto.String("orders.v1"),
+		Syntax:  proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{
+			{
+				Name: proto.String("GetOrderRequest"),
+				Field: []*descriptorpb.FieldDescriptorProto{
+					{
+						Name:     proto.String("order_id"),
+						Number:   proto.Int32(1),
+						Type:     descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
+						Label:    descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+						JsonName: proto.String("orderId"),
+					},
+				},
+			},
+			{
+				Name: proto.String("GetOrderResponse"),
+				Field: []*descriptorpb.FieldDescriptorProto{
+					{
+						Name:     proto.String("status"),
+						Number:   proto.Int32(1),
+						Type:     descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
+						Label:    descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+						JsonName: proto.String("status"),
+					},
+				},
+			},
+		},
+		Service: []*descriptorpb.ServiceDescriptorProto{
+			{
+				Name: proto.String("OrderService"),
+				Method: []*descriptorpb.MethodDescriptorProto{
+					{
+						Name:       proto.String("GetOrder"),
+						InputType:  proto.String(".orders.v1.GetOrderRequest"),
+						OutputType: proto.String(".orders.v1.GetOrderResponse"),
+					},
+				},
+			},
+		},
+	}
+	raw, err := proto.Marshal(fdp)
+	require.NoError(t, err)
+	return raw
+}
+
+// TestGenerator_Generate_AggregatesAcrossEndpoints verifies that descriptors
+// from multiple endpoints are merged into a single output. Endpoint A carries
+// users.proto (UserService); endpoint B carries orders.proto (OrderService).
+// Both must appear in the generated .proto.
+func TestGenerator_Generate_AggregatesAcrossEndpoints(t *testing.T) {
+	g := &Generator{}
+	usersRaw := fileDescriptorBytes(t)
+	ordersRaw := ordersFileDescriptorBytes(t)
+
+	endpoints := []classify.ClassifiedRequest{
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors:   map[string][]byte{"users.proto": usersRaw},
+			},
+		},
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors:   map[string][]byte{"orders.proto": ordersRaw},
+			},
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	require.NoError(t, err)
+	output := string(out)
+
+	assert.Contains(t, output, "service UserService", "users.proto descriptor must be in output")
+	assert.Contains(t, output, "service OrderService", "orders.proto descriptor must be in output")
+}
+
+// TestGenerator_Generate_ConflictingDescriptorsError verifies that two
+// endpoints carrying the same filename but different bytes are rejected with a
+// "conflicting file descriptors" error.
+func TestGenerator_Generate_ConflictingDescriptorsError(t *testing.T) {
+	g := &Generator{}
+	usersRaw := fileDescriptorBytes(t)
+	ordersRaw := ordersFileDescriptorBytes(t)
+
+	// Both endpoints key their descriptor under "users.proto", but the bytes
+	// differ (endpoint B uses the orders descriptor under that name).
+	endpoints := []classify.ClassifiedRequest{
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors:   map[string][]byte{"users.proto": usersRaw},
+			},
+		},
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors:   map[string][]byte{"users.proto": ordersRaw},
+			},
+		},
+	}
+
+	_, err := g.Generate(endpoints)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "conflicting file descriptors")
+}
+
+// TestGenerator_Generate_TooManyDescriptorsErrors verifies that Generate
+// rejects a merged descriptor set exceeding maxGRPCFileDescriptors before it
+// ever attempts to unmarshal the (arbitrary, non-descriptor) bytes.
+func TestGenerator_Generate_TooManyDescriptorsErrors(t *testing.T) {
+	g := &Generator{}
+
+	fileDescriptors := make(map[string][]byte, maxGRPCFileDescriptors+1)
+	for i := 0; i < maxGRPCFileDescriptors+1; i++ {
+		fileDescriptors[fmt.Sprintf("f%d.proto", i)] = []byte{0x00}
+	}
+
+	endpoints := []classify.ClassifiedRequest{
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors:   fileDescriptors,
+			},
+		},
+	}
+
+	spec, err := g.Generate(endpoints)
+	require.Error(t, err)
+	assert.Empty(t, spec)
+	assert.Contains(t, err.Error(), "too many")
+}
+
+// TestGenerator_Generate_DescriptorsExceedByteCapErrors verifies that Generate
+// rejects a merged descriptor set whose aggregate byte size exceeds
+// maxGRPCDescriptorBytes. The count stays at one entry so execution reaches
+// the byte-cap check (which runs after the count check).
+func TestGenerator_Generate_DescriptorsExceedByteCapErrors(t *testing.T) {
+	g := &Generator{}
+
+	// The ~64 MiB allocation below is intentional: it's the smallest way to
+	// exercise the aggregate-byte guard, and it's transient (freed once the
+	// test returns).
+	oversized := make([]byte, maxGRPCDescriptorBytes+1)
+
+	endpoints := []classify.ClassifiedRequest{
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors:   map[string][]byte{"huge.proto": oversized},
+			},
+		},
+	}
+
+	spec, err := g.Generate(endpoints)
+	require.Error(t, err)
+	assert.Empty(t, spec)
+	assert.Contains(t, err.Error(), "too large")
+}
+
+// TestGenerator_Generate_MalformedDescriptorErrors verifies that Generate
+// surfaces a proto.Unmarshal failure on a descriptor blob that is non-empty and
+// within both the count and byte caps but is not valid protobuf wire format.
+// This pins the "unmarshal file descriptor" error branch in renderProto, which
+// is reachable from the offline `generate` command when a capture carries
+// corrupt/truncated descriptor bytes.
+func TestGenerator_Generate_MalformedDescriptorErrors(t *testing.T) {
+	g := &Generator{}
+	// 0x0A = field 1, wire type 2 (length-delimited); the 0x05 length prefix
+	// promises 5 payload bytes that are absent, so proto.Unmarshal fails while
+	// the 2-byte blob still passes the count and aggregate-byte caps.
+	endpoints := []classify.ClassifiedRequest{
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors:   map[string][]byte{"broken.proto": {0x0A, 0x05}},
+			},
+		},
+	}
+	spec, err := g.Generate(endpoints)
+	require.Error(t, err)
+	assert.Empty(t, spec)
+	assert.Contains(t, err.Error(), "unmarshal file descriptor")
+}
+
+// TestSanitizeComment verifies control chars (notably CR/LF), Unicode line/
+// paragraph separators (U+2028/U+2029), C1 controls (U+0085 NEL), and format/
+// bidi controls (U+202E, category Cf) are stripped so a hostile descriptor
+// filename cannot inject or reorder lines in a // comment — while ordinary
+// characters, including ASCII space, pass through unchanged.
+func TestSanitizeComment(t *testing.T) {
+	assert.Equal(t, "evil.protoINJECTED", sanitizeComment("evil.proto\nINJECTED"))
+	assert.Equal(t, "abc", sanitizeComment("a\r\nb\tc"))
+	assert.Equal(t, "clean.proto", sanitizeComment("clean.proto"))
+	// Unicode separators / format controls, built from code points to keep the
+	// source pure ASCII.
+	assert.Equal(t, "ab", sanitizeComment("a"+string(rune(0x2028))+"b"), "U+2028 line separator must be stripped")
+	assert.Equal(t, "ab", sanitizeComment("a"+string(rune(0x2029))+"b"), "U+2029 paragraph separator must be stripped")
+	assert.Equal(t, "ab", sanitizeComment("a"+string(rune(0x0085))+"b"), "U+0085 NEL must be stripped")
+	assert.Equal(t, "ab", sanitizeComment("a"+string(rune(0x202E))+"b"), "U+202E bidi override (Cf) must be stripped")
+	// Ordinary ASCII space and printable chars are preserved.
+	assert.Equal(t, "a b.proto", sanitizeComment("a b.proto"))
+}
+
+// TestGenerator_Generate_IdenticalDescriptorsDedup verifies that two endpoints
+// carrying the same filename with identical bytes do not trigger a conflict —
+// the generator deduplicates them and produces valid output.
+func TestGenerator_Generate_IdenticalDescriptorsDedup(t *testing.T) {
+	g := &Generator{}
+	raw := fileDescriptorBytes(t)
+
+	endpoints := []classify.ClassifiedRequest{
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors:   map[string][]byte{"users.proto": raw},
+			},
+		},
+		{
+			APIType: "grpc",
+			GRPCSchema: &classify.GRPCReflectionResult{
+				ReflectionEnabled: true,
+				FileDescriptors:   map[string][]byte{"users.proto": raw},
+			},
+		},
+	}
+
+	out, err := g.Generate(endpoints)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), "service UserService")
 }

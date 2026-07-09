@@ -16,21 +16,35 @@ package probe
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
+	"fmt"
+	"math/big"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jhump/protoreflect/desc" //nolint:staticcheck // SA1019: protoreflect/desc is the only API protoprint and grpcreflect.Client expose
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	grpccodes "google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/descriptorpb"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
+	"github.com/praetorian-inc/vespasian/test/grpc-server/labpb"
 )
 
 // startTestGRPCServer brings up an in-process gRPC server on 127.0.0.1:0
@@ -66,6 +80,57 @@ func startTestGRPCServerNoReflection(t *testing.T) (string, func()) {
 	s := grpc.NewServer()
 	healthpb.RegisterHealthServer(s, health.NewServer())
 	// reflection.Register(s) intentionally omitted
+
+	go func() {
+		_ = s.Serve(lis)
+	}()
+
+	cleanup := func() {
+		s.GracefulStop()
+	}
+	return lis.Addr().String(), cleanup
+}
+
+// selfSignedTLSConfig builds a *tls.Config carrying a freshly generated,
+// in-memory self-signed certificate valid for 127.0.0.1. It mirrors the kind
+// of certificate an internal/self-hosted gRPC service typically presents.
+func selfSignedTLSConfig(t *testing.T) *tls.Config {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	require.NoError(t, err)
+
+	cert := tls.Certificate{
+		Certificate: [][]byte{der},
+		PrivateKey:  key,
+	}
+	return &tls.Config{Certificates: []tls.Certificate{cert}} //nolint:gosec // test server cert
+}
+
+// startTestGRPCServerTLS brings up an in-process gRPC server on 127.0.0.1:0
+// served over TLS with a self-signed certificate, with the health service and
+// reflection registered. Returns the address and a cleanup function.
+func startTestGRPCServerTLS(t *testing.T) (string, func()) {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	s := grpc.NewServer(grpc.Creds(credentials.NewTLS(selfSignedTLSConfig(t))))
+	healthpb.RegisterHealthServer(s, health.NewServer())
+	reflection.Register(s)
 
 	go func() {
 		_ = s.Serve(lis)
@@ -133,6 +198,39 @@ func TestGRPCProbe_Probe_DiscoversHealthService(t *testing.T) {
 
 	// FileDescriptors should be populated with at least the health proto.
 	assert.NotEmpty(t, schema.FileDescriptors, "expected FileDescriptors to be populated")
+}
+
+// TestGRPCProbe_Probe_SelfSignedTLS proves that a gRPC server presenting a
+// self-signed certificate is still enumerated: the probe disables trust-chain
+// verification (SSRF is handled separately by the Dialer), so the self-signed
+// cert must NOT block reflection.
+func TestGRPCProbe_Probe_SelfSignedTLS(t *testing.T) {
+	addr, stop := startTestGRPCServerTLS(t)
+	defer stop()
+
+	cfg := Config{
+		Timeout:                5 * time.Second,
+		URLValidator:           func(string) error { return nil },
+		Dialer:                 loopbackDialer,
+		GRPCInsecureSkipVerify: true, // self-signed cert: opt in to skip trust-chain verification
+	}
+	probe := NewGRPCProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{APIType: "grpc"},
+	}
+	endpoints[0].URL = "https://" + addr + "/grpc.health.v1.Health/Check"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := probe.Probe(ctx, endpoints)
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+
+	schema := result[0].GRPCSchema
+	require.NotNil(t, schema, "GRPCSchema should be populated despite the self-signed certificate")
+	assert.True(t, schema.ReflectionEnabled, "self-signed cert must not block enumeration")
 }
 
 func TestGRPCProbe_Probe_FiltersReflectionServiceItself(t *testing.T) {
@@ -271,6 +369,339 @@ func TestGRPCProbe_Probe_FailsClosedOnValidator(t *testing.T) {
 	assert.Nil(t, result[0].GRPCSchema, "blocked target should not produce a schema")
 }
 
+// TestGRPCProbe_Probe_NilSchemaOnUnreachableTarget pins the nil-return branch of
+// runReflection: an endpoint classified as gRPC whose target passes the URL
+// validator but is NOT a live gRPC server (here a closed loopback port) must
+// yield GRPCSchema==nil and no error — no false schema, no crash. Unlike
+// TestGRPCProbe_Probe_FailsClosedOnValidator (returns before dialing) and
+// TestGRPCProbe_Probe_SkipsNonGRPCEndpoints (never dials), this drives the
+// dial/reflection path and asserts the ambiguous-network-error -> nil outcome.
+func TestGRPCProbe_Probe_NilSchemaOnUnreachableTarget(t *testing.T) {
+	// Bind then immediately close a loopback listener to obtain a routable but
+	// guaranteed-closed port (nothing listening).
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := lis.Addr().String()
+	require.NoError(t, lis.Close())
+
+	cfg := Config{
+		Timeout:      2 * time.Second,
+		URLValidator: func(string) error { return nil }, // passes SSRF preflight
+		Dialer:       loopbackDialer,                    // real dial to the closed port
+	}
+	probe := NewGRPCProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{APIType: "grpc"},
+	}
+	endpoints[0].URL = "http://" + addr + "/lab.v1.UserService/GetUser"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	result, err := probe.Probe(ctx, endpoints)
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	assert.Nil(t, result[0].GRPCSchema, "a reachable-but-non-gRPC / unreachable target must yield a nil schema and no error")
+}
+
+// TestGRPCProbe_Probe_ReflectionBudgetStopsEnumeration pins the SEC-BE-002
+// loop-break guard in runReflection: once the (injectable) descriptor budget is
+// spent, the probe stops enumerating further services instead of issuing a
+// FileContainingSymbol RPC per advertised service. Two non-reflection services
+// are registered (Health + lab.v1.UserService) and MaxReflectionDescriptors is
+// set to 1, so exactly one service is enumerated before the break fires —
+// proving the loop terminates early rather than walking every advertised service.
+func TestGRPCProbe_Probe_ReflectionBudgetStopsEnumeration(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	s := grpc.NewServer()
+	healthpb.RegisterHealthServer(s, health.NewServer())
+	labpb.RegisterUserServiceServer(s, labpb.UnimplementedUserServiceServer{})
+	reflection.Register(s)
+	go func() {
+		_ = s.Serve(lis)
+	}()
+	defer s.Stop()
+
+	cfg := Config{
+		Timeout:                  5 * time.Second,
+		URLValidator:             func(string) error { return nil },
+		Dialer:                   loopbackDialer,
+		MaxReflectionDescriptors: 1, // trip the budget break after the first service
+	}
+	probe := NewGRPCProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{APIType: "grpc"},
+	}
+	endpoints[0].URL = "http://" + lis.Addr().String() + "/grpc.health.v1.Health/Check"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := probe.Probe(ctx, endpoints)
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+
+	schema := result[0].GRPCSchema
+	require.NotNil(t, schema, "GRPCSchema should be populated")
+	require.True(t, schema.ReflectionEnabled, "reflection must be enabled")
+
+	// Two non-reflection services are registered, but the descriptor budget cap
+	// of 1 stops enumeration after the first service is processed (the loop-top
+	// break trips on the second iteration), so exactly one service is extracted.
+	assert.Equal(t, 1, len(schema.Services), "budget break must stop enumeration after the cap is hit")
+}
+
+// TestGRPCProbe_Probe_ReflectionByteBudgetStopsEnumeration pins the byte-cap
+// half of the SEC-BE-002 loop-break in runReflection (the count half is pinned
+// by TestGRPCProbe_Probe_ReflectionBudgetStopsEnumeration). It registers two
+// non-reflection services and sets MaxReflectionDescriptorBytes to 1, so once
+// the first service's descriptors push totalBytes past the 1-byte budget the
+// loop breaks on the next iteration and exactly one service is enumerated.
+func TestGRPCProbe_Probe_ReflectionByteBudgetStopsEnumeration(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	s := grpc.NewServer()
+	healthpb.RegisterHealthServer(s, health.NewServer())
+	labpb.RegisterUserServiceServer(s, labpb.UnimplementedUserServiceServer{})
+	reflection.Register(s)
+	go func() {
+		_ = s.Serve(lis)
+	}()
+	defer s.Stop()
+
+	cfg := Config{
+		Timeout:                      5 * time.Second,
+		URLValidator:                 func(string) error { return nil },
+		Dialer:                       loopbackDialer,
+		MaxReflectionDescriptorBytes: 1, // trip the byte-budget break after the first service
+	}
+	probe := NewGRPCProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{APIType: "grpc"},
+	}
+	endpoints[0].URL = "http://" + lis.Addr().String() + "/grpc.health.v1.Health/Check"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := probe.Probe(ctx, endpoints)
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+
+	schema := result[0].GRPCSchema
+	require.NotNil(t, schema, "GRPCSchema should be populated")
+	require.True(t, schema.ReflectionEnabled, "reflection must be enabled")
+
+	// Two non-reflection services are registered, but the 1-byte descriptor
+	// budget stops enumeration after the first service's descriptors are
+	// retained, so exactly one service is extracted.
+	assert.Equal(t, 1, len(schema.Services), "byte-budget break must stop enumeration after the cap is hit")
+}
+
+// TestGRPCProbe_Probe_DedupsByTarget verifies that multiple endpoints sharing
+// the same host:port produce a single reflection call and that all matching
+// endpoints receive the SAME *classify.GRPCReflectionResult pointer (pointer
+// identity proves reflection ran once per target and the result was fanned out).
+func TestGRPCProbe_Probe_DedupsByTarget(t *testing.T) {
+	addr, stop := startTestGRPCServer(t)
+	defer stop()
+
+	cfg := Config{
+		Timeout:      5 * time.Second,
+		URLValidator: func(string) error { return nil },
+		Dialer:       loopbackDialer,
+	}
+	probe := NewGRPCProbe(cfg)
+
+	// Two endpoints on the same host:port but different URL paths.
+	endpoints := []classify.ClassifiedRequest{
+		{APIType: "grpc"},
+		{APIType: "grpc"},
+	}
+	endpoints[0].URL = "http://" + addr + "/lab.v1.UserService/GetUser"
+	endpoints[1].URL = "http://" + addr + "/lab.v1.OrderService/GetOrder"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := probe.Probe(ctx, endpoints)
+	require.NoError(t, err)
+	require.Len(t, result, 2)
+
+	schema0 := result[0].GRPCSchema
+	schema1 := result[1].GRPCSchema
+
+	require.NotNil(t, schema0, "first endpoint must have a GRPCSchema")
+	require.NotNil(t, schema1, "second endpoint must have a GRPCSchema")
+	assert.True(t, schema0.ReflectionEnabled, "reflection must be enabled")
+	assert.True(t, schema1.ReflectionEnabled, "reflection must be enabled")
+
+	// Pointer identity: both endpoints share the exact same result object,
+	// proving reflection ran once and the result was fanned out to all
+	// endpoints matching that target.
+	assert.Same(t, schema0, schema1, "both endpoints must share the same *GRPCReflectionResult pointer (reflection ran once)")
+}
+
+// TestGRPCProbe_Probe_MaxEndpointsRespected verifies that the
+// `if len(seen) >= p.config.MaxEndpoints { break }` guard in Probe caps the
+// number of distinct gRPC targets that get reflected against. Three
+// distinct in-process servers stand in for three distinct grpcTargetInfo
+// targets; with MaxEndpoints=2, only the first two should be dialed and
+// receive a populated GRPCSchema.
+func TestGRPCProbe_Probe_MaxEndpointsRespected(t *testing.T) {
+	addr1, stop1 := startTestGRPCServer(t)
+	defer stop1()
+	addr2, stop2 := startTestGRPCServer(t)
+	defer stop2()
+	addr3, stop3 := startTestGRPCServer(t)
+	defer stop3()
+
+	var dialCount atomic.Int32
+	countingDialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialCount.Add(1)
+		return loopbackDialer(ctx, network, addr)
+	}
+
+	cfg := Config{
+		Timeout:      5 * time.Second,
+		URLValidator: func(string) error { return nil },
+		Dialer:       countingDialer,
+		MaxEndpoints: 2,
+	}
+	probe := NewGRPCProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{APIType: "grpc"},
+		{APIType: "grpc"},
+		{APIType: "grpc"},
+	}
+	endpoints[0].URL = "http://" + addr1 + "/grpc.health.v1.Health/Check"
+	endpoints[1].URL = "http://" + addr2 + "/grpc.health.v1.Health/Check"
+	endpoints[2].URL = "http://" + addr3 + "/grpc.health.v1.Health/Check"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := probe.Probe(ctx, endpoints)
+	require.NoError(t, err)
+	require.Len(t, result, 3)
+
+	var withSchema int
+	for _, r := range result {
+		if r.GRPCSchema != nil {
+			withSchema++
+		}
+	}
+	assert.Equal(t, 2, withSchema, "MaxEndpoints=2 should cap the number of distinct targets that receive a GRPCSchema")
+	assert.LessOrEqual(t, int(dialCount.Load()), 2, "at most 2 reflection dials should occur when MaxEndpoints=2")
+}
+
+// TestGRPCProbe_Probe_TLSVerifiedByDefault verifies that a gRPC server
+// presenting a self-signed certificate is NOT enumerated when
+// GRPCInsecureSkipVerify is left at its default (false). The TLS handshake
+// fails certificate verification and the endpoint's GRPCSchema remains nil.
+// This is the secure-by-default complement to TestGRPCProbe_Probe_SelfSignedTLS.
+func TestGRPCProbe_Probe_TLSVerifiedByDefault(t *testing.T) {
+	addr, stop := startTestGRPCServerTLS(t)
+	defer stop()
+
+	// No GRPCInsecureSkipVerify set — defaults to false (verify certificate).
+	cfg := Config{
+		Timeout:      5 * time.Second,
+		URLValidator: func(string) error { return nil },
+		Dialer:       loopbackDialer,
+	}
+	probe := NewGRPCProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{APIType: "grpc"},
+	}
+	endpoints[0].URL = "https://" + addr + "/grpc.health.v1.Health/Check"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := probe.Probe(ctx, endpoints)
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+
+	// Self-signed cert fails verification: schema must be nil, documenting
+	// that the server was not enumerated.
+	assert.Nil(t, result[0].GRPCSchema, "self-signed cert must block enumeration when GRPCInsecureSkipVerify is false")
+}
+
+// TestGRPCProbe_Probe_DiscoversServerStreaming pins the ServerStreaming==true
+// branch of extractService. It starts an in-process gRPC server with the
+// lab.v1.UserService registered (which has a server-streaming ListUsers RPC)
+// and asserts that the probe correctly reports ServerStreaming=true and
+// ClientStreaming=false for that method.
+func TestGRPCProbe_Probe_DiscoversServerStreaming(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	s := grpc.NewServer()
+	labpb.RegisterUserServiceServer(s, labpb.UnimplementedUserServiceServer{})
+	reflection.Register(s)
+	go func() {
+		_ = s.Serve(lis)
+	}()
+	defer s.Stop()
+
+	port := lis.Addr().(*net.TCPAddr).Port
+
+	cfg := Config{
+		Timeout:      5 * time.Second,
+		URLValidator: func(string) error { return nil },
+		Dialer:       loopbackDialer,
+	}
+	probe := NewGRPCProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{APIType: "grpc"},
+	}
+	endpoints[0].URL = fmt.Sprintf("http://127.0.0.1:%d/lab.v1.UserService/ListUsers", port)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := probe.Probe(ctx, endpoints)
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+
+	schema := result[0].GRPCSchema
+	require.NotNil(t, schema, "GRPCSchema should be populated")
+	require.True(t, schema.ReflectionEnabled, "reflection must be enabled")
+
+	// Locate the lab.v1.UserService in the discovered services.
+	var userSvc *classify.GRPCService
+	for i, svc := range schema.Services {
+		if svc.Name == "lab.v1.UserService" {
+			userSvc = &schema.Services[i]
+			break
+		}
+	}
+	require.NotNil(t, userSvc, "expected lab.v1.UserService in discovered services")
+
+	// Locate the ListUsers method on the service.
+	var listUsersMethod *classify.GRPCMethod
+	for i, m := range userSvc.Methods {
+		if m.Name == "ListUsers" {
+			listUsersMethod = &userSvc.Methods[i]
+			break
+		}
+	}
+	require.NotNil(t, listUsersMethod, "expected ListUsers method on lab.v1.UserService")
+
+	assert.True(t, listUsersMethod.ServerStreaming, "ListUsers must have ServerStreaming=true")
+	assert.False(t, listUsersMethod.ClientStreaming, "ListUsers must have ClientStreaming=false (unary client side)")
+}
+
 func TestGRPCTarget(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -328,4 +759,65 @@ func TestGRPCTarget(t *testing.T) {
 			assert.Equal(t, tt.wantTLS, info.useTLS)
 		})
 	}
+}
+
+// testFileDescriptor builds a minimal, valid *desc.FileDescriptor named
+// "x.proto" for exercising walkFileDescriptors' cap/dedup guards directly.
+func testFileDescriptor(t *testing.T) *desc.FileDescriptor {
+	t.Helper()
+	fd, err := desc.CreateFileDescriptor(&descriptorpb.FileDescriptorProto{
+		Name:   proto.String("x.proto"),
+		Syntax: proto.String("proto3"),
+	})
+	require.NoError(t, err)
+	return fd
+}
+
+// TestWalkFileDescriptors_CountCap pins the maxGRPCFileDescriptors guard:
+// once fetched already holds the cap's worth of distinct entries,
+// walkFileDescriptors must not add the new file to out.
+func TestWalkFileDescriptors_CountCap(t *testing.T) {
+	fd := testFileDescriptor(t)
+
+	fetched := make(map[string]bool, maxGRPCFileDescriptors)
+	for i := range maxGRPCFileDescriptors {
+		fetched[fmt.Sprintf("seed-%d.proto", i)] = true
+	}
+	out := map[string][]byte{}
+	totalBytes := 0
+
+	walkFileDescriptors(fd, fetched, out, &totalBytes)
+
+	assert.Empty(t, out, "count-cap guard should prevent any new descriptor from being added")
+}
+
+// TestWalkFileDescriptors_ByteCap pins the maxGRPCDescriptorBytes guard: once
+// totalBytes already meets the cap, walkFileDescriptors must not add the new
+// file to out even though the count cap has not been reached.
+func TestWalkFileDescriptors_ByteCap(t *testing.T) {
+	fd := testFileDescriptor(t)
+
+	fetched := map[string]bool{}
+	out := map[string][]byte{}
+	totalBytes := maxGRPCDescriptorBytes
+
+	walkFileDescriptors(fd, fetched, out, &totalBytes)
+
+	assert.Empty(t, out, "byte-cap guard should prevent any new descriptor from being added")
+	assert.Equal(t, maxGRPCDescriptorBytes, totalBytes, "totalBytes should be unchanged")
+}
+
+// TestWalkFileDescriptors_DedupSkipsSeen pins the dedup guard: a file whose
+// name is already present in fetched must be skipped, leaving out empty.
+func TestWalkFileDescriptors_DedupSkipsSeen(t *testing.T) {
+	fd := testFileDescriptor(t)
+
+	fetched := map[string]bool{"x.proto": true}
+	out := map[string][]byte{}
+	totalBytes := 0
+
+	walkFileDescriptors(fd, fetched, out, &totalBytes)
+
+	assert.Empty(t, out, "dedup guard should prevent re-fetching an already-seen descriptor")
+	assert.Zero(t, totalBytes, "totalBytes should be unchanged")
 }

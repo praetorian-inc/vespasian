@@ -1,0 +1,9 @@
+{
+  "description": "Expected API paths from a live crawl of the concat-spa target (LAB-1368). These endpoints exist ONLY as String.prototype.concat and +-string concatenations inside the external app.js bundle - never as href links or plain string literals - so they can be discovered solely by the post-crawl JS-replay concat extractor (Strategy 5). The receiver literals (/api/users/, /api/products/) and the control path (/api/missing/0/gone) return 404 and are filtered out, so they must NOT appear. Parameter names may vary ({id} vs {userId}).",
+  "paths": {
+    "/api/users/{id}/orders": ["GET"],
+    "/api/products/{id}/reviews": ["GET"]
+  },
+  "total_paths": 2,
+  "excluded_patterns": [".js", ".css", ".png", ".ico", ".svg", ".woff"]
+}

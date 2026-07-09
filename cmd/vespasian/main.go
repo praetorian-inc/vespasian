@@ -22,26 +22,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/alecthomas/kong"
 
-	"github.com/praetorian-inc/vespasian/pkg/analyze"
-	"github.com/praetorian-inc/vespasian/pkg/analyze/jsstatic"
-	"github.com/praetorian-inc/vespasian/pkg/classify"
+	"github.com/praetorian-inc/vespasian/internal/pipeline"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
-	"github.com/praetorian-inc/vespasian/pkg/generate"
-	wsdlgen "github.com/praetorian-inc/vespasian/pkg/generate/wsdl"
 	"github.com/praetorian-inc/vespasian/pkg/importer"
-	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
 
 // Build-time variables injected via ldflags.
@@ -102,59 +94,26 @@ func injectRequestID(headers map[string]string, disabled bool) (string, error) {
 	return id, nil
 }
 
-// parseHeaders converts "Key: Value" strings to a map, validating header names
-// against RFC 7230 token production and header values against CRLF injection.
+// parseHeaders converts "Key: Value" strings to a map. Validation is delegated
+// to crawl.ParseHeader (RFC 7230 names; no CR/LF/NUL in values).
 func parseHeaders(raw []string) (map[string]string, error) {
 	headers := make(map[string]string)
 	for _, h := range raw {
-		parts := strings.SplitN(h, ":", 2)
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("invalid header format (expected 'Key: Value'): %q", h)
-		}
-		name := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-		if name == "" {
-			return nil, fmt.Errorf("header has empty name: %q", h)
-		}
-		if !isValidHeaderName(name) {
-			return nil, fmt.Errorf("header name contains invalid characters (RFC 7230): %q", h)
-		}
-		if strings.ContainsAny(value, "\r\n\x00") {
-			return nil, fmt.Errorf("header value contains invalid characters: %q", h)
+		name, value, err := crawl.ParseHeader(h)
+		if err != nil {
+			return nil, err
 		}
 		headers[name] = value
 	}
 	return headers, nil
 }
 
-// isValidHeaderName checks that name consists only of RFC 7230 token characters.
-// tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
-//
-//	"^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
-func isValidHeaderName(name string) bool {
-	for i := 0; i < len(name); i++ {
-		if !isTokenChar(name[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-// isTokenChar returns true if c is a valid RFC 7230 tchar.
-func isTokenChar(c byte) bool { //nolint:gocyclo // character-class lookup table
-	switch {
-	case c >= 'A' && c <= 'Z':
-		return true
-	case c >= 'a' && c <= 'z':
-		return true
-	case c >= '0' && c <= '9':
-		return true
-	case c == '!' || c == '#' || c == '$' || c == '%' || c == '&' ||
-		c == '\'' || c == '*' || c == '+' || c == '-' || c == '.' ||
-		c == '^' || c == '_' || c == '`' || c == '|' || c == '~':
-		return true
-	default:
-		return false
+// warnSSRFDisabled writes the SSRF-protection warning to stderr when both
+// allowPrivate and probe are enabled. The combination means active probes may
+// reach private/internal hosts.
+func warnSSRFDisabled(allowPrivate, probe bool) {
+	if allowPrivate && probe {
+		fmt.Fprintf(os.Stderr, "WARNING: SSRF protection disabled — probes may target private/internal networks\n") //nolint:errcheck // best-effort warning
 	}
 }
 
@@ -284,6 +243,12 @@ type CrawlOptions struct {
 	Verbose         bool          `short:"v" help:"Enable verbose logging"`
 	AnalyzeJS       bool          `name:"analyze-js"      default:"true"  help:"Statically analyze captured JS bundles to discover API endpoints, parameters, and request bodies."`
 	FetchSourcemaps bool          `name:"fetch-sourcemaps" default:"true"  help:"When --analyze-js is set, fetch .js.map sourcemaps referenced via //# sourceMappingURL= comments to recover original sources."`
+}
+
+// SlugOptions holds the path-normalization flags shared by GenerateCmd and ScanCmd.
+type SlugOptions struct {
+	MergeSlugs    bool `name:"merge-slugs" help:"Enable slug-based path merging (off by default). See README for when to use this vs. distinct endpoint preservation."`
+	SlugThreshold int  `name:"slug-threshold" default:"2" help:"Distinct values required at a path position before --merge-slugs collapses it; higher is more conservative (minimum 2). See README."`
 }
 
 // setupForceExitHandler spawns a goroutine that waits for the first signal
@@ -439,14 +404,15 @@ func (c *CrawlCmd) Run() error {
 
 	// NOTE: running `crawl` (with --analyze-js) followed by `generate` (also
 	// with --analyze-js, the default) does NOT re-analyze the same JS bundles.
-	// runJSAnalysisStage's idempotency guard (crawl.AnyStaticSource) detects the
+	// AnalyzeJS's idempotency guard (crawl.AnyStaticSource) detects the
 	// static:js entries this stage writes into the capture and short-circuits the
 	// second analysis, so `crawl | generate` is byte-identical to a single `scan`.
-	requests = runJSAnalysisStage(bs.ctx, requests, jsAnalysisArgs{
-		enabled:         c.AnalyzeJS,
-		fetchSourcemaps: c.FetchSourcemaps,
-		allowPrivate:    c.DangerousAllowPrivate,
-		verbose:         c.Verbose,
+	requests = pipeline.AnalyzeJS(bs.ctx, requests, pipeline.AugmentOptions{
+		AnalyzeJS:       c.AnalyzeJS,
+		FetchSourcemaps: c.FetchSourcemaps,
+		AllowPrivate:    c.DangerousAllowPrivate,
+		Status:          statusWriter(c.Verbose),
+		WarnError:       os.Stderr,
 	})
 
 	return writeOutput(c.Output, func(w io.Writer) error {
@@ -495,32 +461,30 @@ func (c *ImportCmd) Run() error {
 
 // GenerateCmd generates API specifications from captured traffic.
 type GenerateCmd struct {
-	APIType               string  `arg:"" enum:"rest,wsdl,graphql,grpc" help:"API type to generate (rest, wsdl, graphql, grpc)"`
-	Capture               string  `arg:"" help:"Capture file path"`
-	Output                string  `short:"o" help:"Output file path"`
-	Confidence            float64 `default:"0.5" help:"Minimum confidence threshold"`
-	Probe                 bool    `default:"true" help:"Enable endpoint probing"`
-	Deduplicate           bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
-	DangerousAllowPrivate bool    `help:"Disable SSRF protection on the probe path (OPTIONS/schema/WSDL-fetch/GraphQL introspection) for private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
-	Verbose               bool    `short:"v" help:"Enable verbose logging"`
-	AnalyzeJS             bool    `name:"analyze-js"       default:"true"  help:"Statically analyze JS bundles in the imported capture (when present)."`
-	FetchSourcemaps       bool    `name:"fetch-sourcemaps" default:"false" help:"When --analyze-js is set, fetch .js.map sourcemaps referenced via //# sourceMappingURL= comments. Default false on generate (offline-friendly)."`
-}
+	APIType                string  `arg:"" enum:"rest,wsdl,graphql,grpc" help:"API type to generate (rest, wsdl, graphql, grpc)"`
+	Capture                string  `arg:"" help:"Capture file path"`
+	Output                 string  `short:"o" help:"Output file path"`
+	Confidence             float64 `default:"0.5" help:"Minimum confidence threshold"`
+	Probe                  bool    `default:"true" help:"Enable active probing of classified endpoints (OPTIONS/schema/WSDL-fetch/GraphQL introspection). Note: JS-bundle replay extraction runs only in 'scan', which has a live target URL to re-fetch bundles from; 'generate' works offline from an existing capture and cannot run it."`
+	Deduplicate            bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
+	DangerousAllowPrivate  bool    `help:"Disable SSRF protection on the probe path (OPTIONS/schema/WSDL-fetch/GraphQL introspection) for private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
+	GRPCInsecureSkipVerify bool    `help:"Skip TLS certificate verification when probing gRPC server reflection over TLS (for self-signed/internal-CA targets). Default: verify." name:"grpc-insecure-skip-verify"`
+	Verbose                bool    `short:"v" help:"Enable verbose logging"`
+	AnalyzeJS              bool    `name:"analyze-js"       default:"true"  help:"Statically analyze JS bundles in the imported capture (when present)."`
+	FetchSourcemaps        bool    `name:"fetch-sourcemaps" default:"false" help:"When --analyze-js is set, fetch .js.map sourcemaps referenced via //# sourceMappingURL= comments. Default false on generate (offline-friendly)."`
 
-// API type constants used for classification routing and generation.
-const (
-	apiTypeAuto    = "auto"
-	apiTypeREST    = "rest"
-	apiTypeWSDL    = "wsdl"
-	apiTypeGraphQL = "graphql"
-	apiTypeGRPC    = "grpc"
-)
+	SlugOptions
+}
 
 // maxCaptureSize is the maximum capture file size (100MB).
 const maxCaptureSize = 100 * 1024 * 1024
 
 // Run executes the generate command.
 func (c *GenerateCmd) Run() (err error) {
+	if err := validateSlugThreshold(c.APIType, c.MergeSlugs, c.SlugThreshold); err != nil {
+		return err
+	}
+
 	f, err := os.Open(c.Capture)
 	if err != nil {
 		return fmt.Errorf("open capture file: %w", err)
@@ -554,22 +518,28 @@ func (c *GenerateCmd) Run() (err error) {
 
 	// Augment captured requests with static-HTML form analysis + JS bundle
 	// static analysis in the canonical forms-then-jsstatic order (see
-	// augmentAll). Captures produced by crawl/import (which don't run form
+	// pipeline.Augment). Captures produced by crawl/import (which don't run form
 	// extraction inline) get the same treatment as captures produced by scan.
-	requests = augmentAll(ctx, requests, jsAnalysisArgs{
-		enabled:         c.AnalyzeJS,
-		fetchSourcemaps: c.FetchSourcemaps,
-		allowPrivate:    c.DangerousAllowPrivate,
-		verbose:         c.Verbose,
+	requests = pipeline.Augment(ctx, requests, pipeline.AugmentOptions{
+		AnalyzeJS:       c.AnalyzeJS,
+		FetchSourcemaps: c.FetchSourcemaps,
+		AllowPrivate:    c.DangerousAllowPrivate,
+		Status:          statusWriter(c.Verbose),
+		WarnError:       os.Stderr,
 	})
 
-	spec, err := generateSpec(ctx, requests, generateSpecOptions{
-		APIType:      c.APIType,
-		Confidence:   c.Confidence,
-		Probe:        c.Probe,
-		Deduplicate:  c.Deduplicate,
-		AllowPrivate: c.DangerousAllowPrivate,
-		Verbose:      c.Verbose,
+	warnSSRFDisabled(c.DangerousAllowPrivate, c.Probe)
+
+	spec, err := pipeline.ClassifyProbeGenerate(ctx, requests, pipeline.Options{
+		APIType:                c.APIType,
+		Confidence:             c.Confidence,
+		Probe:                  c.Probe,
+		Deduplicate:            c.Deduplicate,
+		AllowPrivate:           c.DangerousAllowPrivate,
+		GRPCInsecureSkipVerify: c.GRPCInsecureSkipVerify,
+		MergeSlugs:             c.MergeSlugs,
+		SlugThreshold:          c.SlugThreshold,
+		Status:                 statusWriter(c.Verbose),
 	})
 	if err != nil {
 		return err
@@ -583,19 +553,25 @@ func (c *GenerateCmd) Run() (err error) {
 
 // ScanCmd runs the full pipeline: crawl, classify, and generate.
 type ScanCmd struct {
-	URL                   string  `arg:"" help:"Target URL to scan"`
-	APIType               string  `default:"auto" enum:"auto,rest,wsdl,graphql,grpc" help:"API type to generate (auto detects from traffic; grpc requires explicit selection)" name:"api-type"`
-	Confidence            float64 `default:"0.5" help:"Minimum confidence threshold"`
-	Probe                 bool    `default:"true" help:"Enable endpoint probing"`
-	Deduplicate           bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
-	DangerousAllowPrivate bool    `help:"Disable SSRF protection for crawling and probes, allowing private/localhost targets (localhost, 127.0.0.1, RFC1918, link-local). Required when the seed URL is a private host, otherwise the crawl exits with an error and captures nothing. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
+	URL                    string  `arg:"" help:"Target URL to scan"`
+	APIType                string  `default:"auto" enum:"auto,rest,wsdl,graphql,grpc" help:"API type to generate (auto detects from traffic; grpc requires explicit selection)" name:"api-type"`
+	Confidence             float64 `default:"0.5" help:"Minimum confidence threshold"`
+	Probe                  bool    `default:"true" help:"Enable endpoint probing"`
+	Deduplicate            bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
+	DangerousAllowPrivate  bool    `help:"Disable SSRF protection for crawling and probes, allowing private/localhost targets (localhost, 127.0.0.1, RFC1918, link-local). Required when the seed URL is a private host, otherwise the crawl exits with an error and captures nothing. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
+	GRPCInsecureSkipVerify bool    `help:"Skip TLS certificate verification when probing gRPC server reflection over TLS (for self-signed/internal-CA targets). Default: verify." name:"grpc-insecure-skip-verify"`
 
 	CrawlOptions
+	SlugOptions
 }
 
 // Run executes the scan command (crawl + generate pipeline).
 func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	if err := validateURL(c.URL); err != nil {
+		return err
+	}
+
+	if err := validateSlugThreshold(c.APIType, c.MergeSlugs, c.SlugThreshold); err != nil {
 		return err
 	}
 
@@ -633,128 +609,89 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 
 	// Augment captured requests with static-HTML form analysis + JS bundle
 	// static analysis in the canonical forms-then-jsstatic order (see
-	// augmentAll). Same helper used by GenerateCmd.Run — the order contract
-	// is centralized to prevent the two commands from silently diverging.
-	requests = augmentAll(bs.ctx, requests, jsAnalysisArgs{
-		enabled:         c.AnalyzeJS,
-		fetchSourcemaps: c.FetchSourcemaps,
-		allowPrivate:    c.DangerousAllowPrivate,
-		verbose:         c.Verbose,
+	// pipeline.Augment). Same helper used by GenerateCmd.Run — the order
+	// contract is centralized to prevent the two commands from silently
+	// diverging.
+	requests = pipeline.Augment(bs.ctx, requests, pipeline.AugmentOptions{
+		AnalyzeJS:       c.AnalyzeJS,
+		FetchSourcemaps: c.FetchSourcemaps,
+		AllowPrivate:    c.DangerousAllowPrivate,
+		Status:          statusWriter(c.Verbose),
+		WarnError:       os.Stderr,
 	})
 
+	// Resolve the API type up front (when auto) so the verbose "detected API
+	// type" line reflects the traffic-derived type *before* any WSDL promotion,
+	// matching the pre-refactor ordering. The resolved type is then passed
+	// explicitly into ResolveAndGenerate, which skips re-detection for a
+	// non-auto type. Passing the resolved (non-auto) type is precisely what
+	// prevents a second DetectAPIType pass inside ResolveAndGenerate — the two
+	// detection sites are coupled, so keep them in sync if either changes.
 	apiType := c.APIType
-	if apiType == apiTypeAuto {
-		apiType = detectAPIType(requests, c.Confidence)
+	if apiType == pipeline.APITypeAuto {
+		apiType = pipeline.DetectAPIType(requests, c.Confidence)
 		if c.Verbose {
 			fmt.Fprintf(os.Stderr, "detected API type: %s\n", apiType) //nolint:gosec // G705: writing to stderr, not web response
 		}
 	}
 
-	// When auto-detection or explicit WSDL mode is active, try fetching a
-	// WSDL document from <targetURL>?wsdl. SOAP services return HTML for
-	// browser GETs so crawl traffic rarely contains WSDL signals — active
-	// probing is the reliable discovery method.
-	if apiType == apiTypeAuto || apiType == apiTypeWSDL || apiType == apiTypeREST {
-		wsdlDoc := probeWSDLDocument(c.URL, c.DangerousAllowPrivate, c.Verbose)
-		if wsdlDoc != nil {
-			apiType = apiTypeWSDL
-			if c.Verbose {
-				fmt.Fprintf(os.Stderr, "discovered WSDL document at %s?wsdl\n", c.URL)
-			}
-			// Inject a synthetic request carrying the WSDL document so
-			// the generator's Phase 1 can return it directly.
-			requests = append(requests, crawl.ObservedRequest{
-				Method: "GET",
-				URL:    c.URL + "?wsdl",
-				Response: crawl.ObservedResponse{
-					StatusCode:  200,
-					ContentType: "text/xml",
-					Body:        wsdlDoc,
-				},
-			})
-		}
-	}
-
-	if c.Verbose {
-		fmt.Fprintf(os.Stderr, "generating %s spec\n", apiTypeDisplayName(apiType)) //nolint:gosec // G705: writing to stderr, not web response
-	}
-
 	// Create a fresh signal context for the generate phase. If a signal
 	// interrupted the crawl, bs.ctx is already canceled — doCrawl swallowed
 	// the error and returned partial results. Using the canceled context
-	// would cause generateSpec's probing to bail out immediately.
+	// would cause ClassifyProbeGenerate's probing (and WSDL probing) to bail out immediately.
 	genCtx, genStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer genStop()
 
-	spec, err := generateSpec(genCtx, requests, generateSpecOptions{
-		APIType:      apiType,
-		Confidence:   c.Confidence,
-		Probe:        c.Probe,
-		Deduplicate:  c.Deduplicate,
-		AllowPrivate: c.DangerousAllowPrivate,
-		Verbose:      c.Verbose,
+	// Emit the SSRF-disabled warning before any active probing so the notice
+	// always precedes outbound requests to private/internal networks. The WSDL
+	// probe inside ResolveAndGenerate is the first such activity in the scan
+	// phase, so the warning must come first (matching GenerateCmd.Run, which
+	// warns before probing).
+	warnSSRFDisabled(c.DangerousAllowPrivate, c.Probe)
+
+	// Run the shared detect → wsdl-resolve → (JS-replay) → classify/probe/generate
+	// sequence. The afterWSDL hook keeps JS-replay in its CLI-specific position:
+	// after WSDL resolution and before classification. JS-replay re-fetches
+	// bundle-extracted URLs with raw HTTP to bypass SPA catch-all routing; it is
+	// gated on both c.AnalyzeJS (so --analyze-js=false suppresses the JS-bundle
+	// rescan) and c.Probe (so --probe=false stays passive — see
+	// maybeReplayJSExtracted), and is CLI-only (the SDK passes a nil AfterWSDL hook).
+	spec, apiType, foundWSDL, _, err := pipeline.ResolveAndGenerate(genCtx, requests, pipeline.ScanOptions{
+		TargetURL:              c.URL,
+		APIType:                apiType,
+		Confidence:             c.Confidence,
+		Probe:                  c.Probe,
+		Deduplicate:            c.Deduplicate,
+		AllowPrivate:           c.DangerousAllowPrivate,
+		GRPCInsecureSkipVerify: c.GRPCInsecureSkipVerify,
+		MergeSlugs:             c.MergeSlugs,
+		SlugThreshold:          c.SlugThreshold,
+		Status:                 statusWriter(c.Verbose),
+		AfterWSDL: func(ctx context.Context, reqs []crawl.ObservedRequest) []crawl.ObservedRequest {
+			return maybeReplayJSExtracted(ctx, reqs, c.Probe && c.AnalyzeJS, crawl.JSReplayConfig{
+				Headers:      bs.opts.Headers,
+				TargetURL:    c.URL,
+				AllowPrivate: c.DangerousAllowPrivate,
+				Verbose:      c.Verbose,
+				Stderr:       os.Stderr,
+			})
+		},
 	})
 	if err != nil {
 		return err
+	}
+
+	if foundWSDL && c.Verbose {
+		fmt.Fprintf(os.Stderr, "discovered WSDL document at %s?wsdl\n", c.URL)
+	}
+	if c.Verbose {
+		fmt.Fprintf(os.Stderr, "generating %s spec\n", apiTypeDisplayName(apiType)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
 	return writeOutput(c.Output, func(w io.Writer) error {
 		_, writeErr := w.Write(spec)
 		return writeErr
 	})
-}
-
-// applyAllowPrivate disables SSRF protection on cfg for probing
-// private/localhost targets. It swaps the URL validator to a no-op and
-// overrides the dial path (HTTP transport + cfg.Dialer) with a permissive
-// dialer. Both must be overridden: HTTP probes (gateway) dial via cfg.Client,
-// while the gRPC reflection probe dials via cfg.Dialer. Used by generateSpec
-// when --dangerous-allow-private is set so probes can reach private/internal
-// targets.
-//
-// The existing *http.Transport is cloned and only its DialContext is replaced,
-// preserving proxy/TLS/CA/timeout settings the caller may have configured. If
-// cfg.Client.Transport is not an *http.Transport (e.g. a custom RoundTripper),
-// its SSRF behavior cannot be safely preserved, so http.DefaultTransport is
-// cloned instead.
-func applyAllowPrivate(cfg *probe.Config) {
-	cfg.URLValidator = func(string) error { return nil }
-
-	permissiveDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		var d net.Dialer
-		return d.DialContext(ctx, network, addr)
-	}
-
-	tr := clonePermissiveTransport(cfg.Client)
-	tr.DialContext = permissiveDial
-
-	if cfg.Client == nil {
-		cfg.Client = &http.Client{
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}
-	}
-	cfg.Client.Transport = tr
-
-	cfg.Dialer = permissiveDial
-}
-
-// clonePermissiveTransport returns a clone of client's *http.Transport so its
-// DialContext can be overridden without mutating shared transport state.
-// Preserves proxy/TLS/CA/timeout settings. Falls back to cloning
-// http.DefaultTransport when client (or its transport) is nil or is a custom
-// RoundTripper whose SSRF behavior cannot be safely preserved.
-func clonePermissiveTransport(client *http.Client) *http.Transport {
-	if client != nil {
-		if t, ok := client.Transport.(*http.Transport); ok && t != nil {
-			return t.Clone()
-		}
-	}
-	if def, ok := http.DefaultTransport.(*http.Transport); ok && def != nil {
-		return def.Clone()
-	}
-	return &http.Transport{}
 }
 
 // VersionCmd shows version information.
@@ -779,452 +716,55 @@ func main() {
 	ctx.FatalIfErrorf(err)
 }
 
-// generateSpecOptions holds parameters for generateSpec, avoiding consecutive
-// bool arguments that are easy to transpose at call sites.
-type generateSpecOptions struct {
-	APIType      string
-	Confidence   float64
-	Probe        bool
-	Deduplicate  bool
-	AllowPrivate bool
-	Verbose      bool
-}
-
-// augmentWithStaticForms appends synthetic ObservedRequests parsed from HTML
-// response bodies (see analyze.ExtractForms) so that <form action="/api/…">
-// landing-page signals feed classification, deduplication, and probing.
-// Both ScanCmd (before auto-detection) and GenerateCmd (after loading the
-// capture) call this so the two-stage pipeline is behaviorally equivalent
-// regardless of whether the capture came from scan, crawl, or import.
-func augmentWithStaticForms(requests []crawl.ObservedRequest) []crawl.ObservedRequest {
-	return append(requests, analyze.ExtractForms(requests)...)
-}
-
-// augmentAll runs the captured-request augmentation stages in the canonical
-// order: static-HTML forms first, then JS-bundle static analysis. Both
-// ScanCmd.Run and GenerateCmd.Run call this helper rather than open-coding the
-// two stage calls — the shared helper pins the order contract so a regression
-// in one command cannot silently re-emerge in the other.
+// maybeReplayJSExtracted is the probe-gated wrapper around
+// crawl.ReplayJSExtracted. When probe is false, it returns requests unchanged
+// without making any outbound HTTP — preserving the user's --probe=false
+// expectation that the scan stays passive (capture-only). When probe is true,
+// it forwards to crawl.ReplayJSExtracted with the supplied config.
 //
-// CrawlCmd does NOT call this helper. CrawlCmd already runs the JS-bundle
-// stage (runJSAnalysisStage) inline before writing capture.json, so the
-// produced capture already carries static:js entries; the HTML-form stage is
-// deferred until generate time. The split is intentional: form extraction
-// runs on a freshly-loaded capture (where classify needs the synthetic
-// entries) but JS analysis is cheap to do once at crawl time so capture.json
-// readers don't need to repeat it. Callers consuming capture.json should
-// still call augmentWithStaticForms before classification, which is exactly
-// what GenerateCmd.Run does via augmentAll.
-//
-// The order matters for downstream determinism: static:html entries appear
-// before static:js entries in the result, so classify.Deduplicate
-// first-write-wins keeps the form-derived signals when they collide with
-// bundle-derived ones on the same endpoint key.
-func augmentAll(ctx context.Context, requests []crawl.ObservedRequest, js jsAnalysisArgs) []crawl.ObservedRequest {
-	requests = augmentWithStaticForms(requests)
-	requests = runJSAnalysisStage(ctx, requests, js)
-	return requests
+// Pulled out of ScanCmd.Run so the gate's contract is unit-testable without
+// standing up a headless browser. A regression that calls
+// crawl.ReplayJSExtracted directly (bypassing this gate) would re-introduce
+// the surprise outbound HTTP behavior CodeRabbit flagged in iter-12 (CR-1).
+func maybeReplayJSExtracted(ctx context.Context, requests []crawl.ObservedRequest, probe bool, cfg crawl.JSReplayConfig) []crawl.ObservedRequest {
+	if !probe {
+		return requests
+	}
+	return crawl.ReplayJSExtracted(ctx, requests, cfg)
 }
 
-// probeStrategiesForType returns the probe strategies for the given API type.
-// The gRPC path chains reflection (richest — real message fields) then the
-// gateway OpenAPI probe (names only) in priority order; gRPC-Web JS bindings
-// are applied separately by enrichGRPCFromBindings since they read the capture
-// rather than the network.
-func probeStrategiesForType(apiType string, cfg probe.Config) []probe.ProbeStrategy {
-	switch apiType {
-	case apiTypeWSDL:
-		return []probe.ProbeStrategy{probe.NewWSDLProbe(cfg)}
-	case apiTypeGraphQL:
-		return []probe.ProbeStrategy{probe.NewGraphQLProbe(cfg)}
-	case apiTypeGRPC:
-		return []probe.ProbeStrategy{
-			probe.NewGRPCProbe(cfg),
-			probe.NewGRPCGatewayProbe(cfg),
-		}
-	default:
-		return []probe.ProbeStrategy{
-			probe.NewOptionsProbe(cfg),
-			probe.NewSchemaProbe(cfg),
-		}
-	}
-}
-
-// generateSpec runs the classify → probe → generate pipeline. It trusts its
-// caller to have already augmented requests with static-HTML form
-// observations AND JS-bundle static analysis — both ScanCmd and GenerateCmd
-// call augmentAll (which performs both stages in order) before invoking this
-// function.
-func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts generateSpecOptions) ([]byte, error) {
-	classifiers := classifiersForType(opts.APIType)
-	if classifiers == nil {
-		return nil, fmt.Errorf("unsupported API type: %q", opts.APIType)
-	}
-	classified := classify.RunClassifiers(classifiers, requests, opts.Confidence)
-	if opts.Deduplicate {
-		classified = classify.Deduplicate(classified)
-	}
-
-	if opts.Verbose {
-		fmt.Fprintf(os.Stderr, "classified %d API requests (threshold=%.2f)\n", len(classified), opts.Confidence) //nolint:gosec // G705: writing to stderr, not web response
-	}
-
-	if opts.AllowPrivate && opts.Probe {
-		fmt.Fprintf(os.Stderr, "WARNING: SSRF protection disabled — probes may target private/internal networks\n")
-	}
-
-	if opts.Probe {
-		cfg := probe.DefaultConfig()
-		if opts.AllowPrivate {
-			applyAllowPrivate(&cfg)
-		}
-		strategies := probeStrategiesForType(opts.APIType, cfg)
-		// Pure grpc-gateway traffic is REST/JSON, so the gRPC classifier never
-		// marks it APIType=="grpc" and the gRPC/gateway probes (which only
-		// iterate grpc endpoints) get no targets. Seed one synthetic grpc
-		// endpoint per distinct host so reflection and the gateway probe have
-		// something to reach. SSRF protection still applies via the probes'
-		// URLValidator/Dialer.
-		if opts.APIType == apiTypeGRPC {
-			classified = seedGRPCHostEndpoints(requests, classified, probe.DefaultMaxEndpoints)
-		}
-		enriched, probeErrs := probe.RunStrategies(ctx, strategies, classified)
-		if opts.Verbose {
-			for _, e := range probeErrs {
-				fmt.Fprintf(os.Stderr, "probe warning: %v\n", e)
-			}
-		}
-		// B1: lowest-priority gRPC-Web JS binding recovery from the capture.
-		// Fills only endpoints that reflection/gateway did not cover.
-		if opts.APIType == apiTypeGRPC {
-			enriched = enrichGRPCFromBindings(requests, enriched, opts.Verbose)
-		}
-		classified = enriched
-	}
-
-	gen, err := generate.Get(opts.APIType)
-	if err != nil {
-		return nil, err
-	}
-
-	spec, err := gen.Generate(classified)
-	if err != nil {
-		return nil, fmt.Errorf("generate failed: %w", err)
-	}
-
-	return spec, nil
-}
-
-// enrichGRPCFromBindings recovers gRPC services from gRPC-Web JS bundles in the
-// full augmented capture and applies them with the lowest precedence in the
-// reflection > gateway > bindings chain. It never overwrites an endpoint that
-// already carries usable descriptors (reflection or gateway). When no grpc
-// endpoint exists at all — common for a pure gRPC-Web SPA where only JS was
-// captured — a single synthetic grpc endpoint is appended so the generator has
-// something to render.
-//
-// B1 reads JS bodies from the capture rather than the network, so it is not a
-// ProbeStrategy: the classified/deduped endpoints handed to probes are API
-// endpoints, not the JS bundles (which are filtered out before probing). Only
-// generateSpec's caller context holds the full capture B1 needs.
-func enrichGRPCFromBindings(requests []crawl.ObservedRequest, enriched []classify.ClassifiedRequest, verbose bool) []classify.ClassifiedRequest {
-	services := analyze.ExtractGRPCWebBindings(requests)
-	if len(services) == 0 {
-		return enriched
-	}
-
-	// Dedupe bindings services against every service already recovered across
-	// all endpoints (by any technique). Reflection > gateway > bindings: a FQN
-	// already recovered by a higher-precedence technique is not re-attached.
-	filtered := filterUncoveredServices(services, enriched)
-	if len(filtered) == 0 {
-		return enriched
-	}
-
-	if verbose {
-		fmt.Fprintf(os.Stderr, "recovered %d service(s) from gRPC-Web bundles\n", len(filtered)) //nolint:gosec // G705: writing to stderr, not web response
-	}
-
-	// Store recovered service names only. Descriptor synthesis is centralized
-	// in the generator. ReflectionEnabled is false: JS bindings are not a
-	// reflection response.
-	schema := func() *classify.GRPCReflectionResult {
-		return &classify.GRPCReflectionResult{
-			ReflectionEnabled: false,
-			Services:          filtered,
-		}
-	}
-
-	// "Covered" for bindings purposes means the endpoint already carries usable
-	// descriptors or recovered service names (reflection or gateway).
-	hasCoverage := func(s *classify.GRPCReflectionResult) bool {
-		return s != nil && (len(s.FileDescriptors) > 0 || len(s.Services) > 0)
-	}
-
-	grpcEndpointExists := false
-	for i := range enriched {
-		if enriched[i].APIType != apiTypeGRPC {
-			continue
-		}
-		grpcEndpointExists = true
-		if hasCoverage(enriched[i].GRPCSchema) {
-			continue
-		}
-		enriched[i].GRPCSchema = schema()
-	}
-
-	// Append a synthetic grpc endpoint only when no grpc endpoint exists at all
-	// — common for a pure gRPC-Web SPA where only JS was captured.
-	if !grpcEndpointExists {
-		enriched = append(enriched, classify.ClassifiedRequest{
-			APIType:    apiTypeGRPC,
-			GRPCSchema: schema(),
-		})
-	}
-
-	return enriched
-}
-
-// filterUncoveredServices returns the subset of services whose FQN is not
-// already recovered (in GRPCSchema.Services) by any endpoint in enriched.
-// Leading dots are stripped before comparison so ".pkg.S" and "pkg.S" match.
-func filterUncoveredServices(services []classify.GRPCService, enriched []classify.ClassifiedRequest) []classify.GRPCService {
-	covered := map[string]bool{}
-	for i := range enriched {
-		if s := enriched[i].GRPCSchema; s != nil {
-			for _, svc := range s.Services {
-				covered[strings.TrimPrefix(svc.Name, ".")] = true
-			}
-		}
-	}
-	filtered := services[:0:0]
-	for _, svc := range services {
-		if covered[strings.TrimPrefix(svc.Name, ".")] {
-			continue
-		}
-		filtered = append(filtered, svc)
-	}
-	return filtered
-}
-
-// seedGRPCHostEndpoints returns classified plus one synthetic grpc-typed
-// ClassifiedRequest per distinct host (scheme://host[:port]) observed in
-// requests that is not already represented among classified grpc endpoints.
-// Hosts are deduped, sorted for deterministic output, and capped at maxHosts.
-// The synthetic endpoints give the reflection and grpc-gateway probes targets
-// even when classification never marked the (REST/JSON) gateway traffic grpc.
-// SSRF protection is unaffected: seeding only constructs URLs; the probes still
-// run URLValidator/Dialer.
-func seedGRPCHostEndpoints(requests []crawl.ObservedRequest, classified []classify.ClassifiedRequest, maxHosts int) []classify.ClassifiedRequest {
-	// Hosts already represented among classified grpc endpoints are not re-seeded.
-	existing := map[string]bool{}
-	for i := range classified {
-		if classified[i].APIType != apiTypeGRPC {
-			continue
-		}
-		if host := grpcHostKey(classified[i].URL); host != "" {
-			existing[host] = true
-		}
-	}
-
-	seen := map[string]bool{}
-	var hosts []string
-	for _, req := range requests {
-		host := grpcHostKey(req.URL)
-		if host == "" || existing[host] || seen[host] {
-			continue
-		}
-		seen[host] = true
-		hosts = append(hosts, host)
-	}
-
-	sort.Strings(hosts)
-	if maxHosts > 0 && len(hosts) > maxHosts {
-		hosts = hosts[:maxHosts]
-	}
-
-	for _, host := range hosts {
-		classified = append(classified, classify.ClassifiedRequest{
-			ObservedRequest: crawl.ObservedRequest{URL: host},
-			APIType:         apiTypeGRPC,
-		})
-	}
-	return classified
-}
-
-// grpcHostKey returns the scheme://host[:port] key for a request URL, or ""
-// when the URL cannot be parsed or carries no host. The original scheme is
-// preserved; the probes themselves map grpc/grpcs↔http/https as needed.
-func grpcHostKey(rawURL string) string {
-	u, err := url.Parse(rawURL)
-	if err != nil || u.Host == "" {
-		return ""
-	}
-	scheme := u.Scheme
-	if scheme == "" {
-		scheme = "https"
-	}
-	return scheme + "://" + u.Host
-}
-
-// classifiersForType returns the appropriate classifiers for the given API type.
-func classifiersForType(apiType string) []classify.APIClassifier {
-	switch apiType {
-	case apiTypeREST:
-		return []classify.APIClassifier{&classify.RESTClassifier{}}
-	case apiTypeWSDL:
-		return []classify.APIClassifier{&classify.WSDLClassifier{}}
-	case apiTypeGraphQL:
-		return []classify.APIClassifier{&classify.GraphQLClassifier{}}
-	case apiTypeGRPC:
-		return []classify.APIClassifier{&classify.GRPCClassifier{}}
-	default:
-		return nil
-	}
-}
-
-// detectAPIType runs both WSDL and REST classifiers against captured traffic
-// and returns the API type with the most matches. For WSDL to win, it must
-// have at least one match AND represent the majority of classified traffic.
-// When WSDL matches exist but are the minority (mixed REST+SOAP), REST is
-// returned to avoid losing REST endpoint discovery.
-//
-// Note: this performs a lightweight classification pass separate from the full
-// RunClassifiers call inside generateSpec. The duplication is intentional —
-// detectAPIType only needs to answer "which generator?", while generateSpec's
-// pass produces the full ClassifiedRequest slice needed for generation.
-func detectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
-	wsdlClassifier := &classify.WSDLClassifier{}
-	restClassifier := &classify.RESTClassifier{}
-	graphqlClassifier := &classify.GraphQLClassifier{}
-
-	var wsdlCount, restCount, graphqlCount int
-	for _, req := range requests {
-		if isAPI, confidence := wsdlClassifier.Classify(req); isAPI && confidence >= threshold {
-			wsdlCount++
-		}
-		if isAPI, confidence := restClassifier.Classify(req); isAPI && confidence >= threshold {
-			restCount++
-		}
-		if isAPI, confidence := graphqlClassifier.Classify(req); isAPI && confidence >= threshold {
-			graphqlCount++
-		}
-	}
-
-	// GraphQL wins when it has matches and at least as many as both others.
-	if graphqlCount > 0 && graphqlCount >= wsdlCount && graphqlCount >= restCount {
-		return apiTypeGraphQL
-	}
-	// WSDL wins only when it has matches and they represent the majority
-	// of classified traffic (or there are no REST matches at all).
-	if wsdlCount > 0 && wsdlCount >= restCount {
-		return apiTypeWSDL
-	}
-	return apiTypeREST
-}
-
-// probeWSDLDocument attempts to fetch a WSDL document from targetURL?wsdl.
-// Returns the raw WSDL bytes if the response is a valid WSDL document, or nil
-// if the probe fails or returns non-WSDL content. This is the primary WSDL
-// discovery mechanism for the scan pipeline because headless browser crawls
-// of SOAP endpoints typically capture HTML, not XML.
-func probeWSDLDocument(targetURL string, allowPrivate bool, verbose bool) []byte {
-	parsedURL, err := url.Parse(targetURL)
-	if err != nil {
-		if verbose {
-			fmt.Fprintf(os.Stderr, "wsdl discovery: invalid URL %q: %v\n", targetURL, err) //nolint:errcheck,gosec // best-effort status message
-		}
-		return nil
-	}
-	parsedURL.RawQuery = "wsdl"
-	wsdlURL := parsedURL.String()
-
-	if verbose {
-		fmt.Fprintf(os.Stderr, "wsdl discovery: probing %s\n", wsdlURL)
-	}
-
-	if !allowPrivate {
-		if err := probe.ValidateProbeURL(wsdlURL); err != nil {
-			if verbose {
-				fmt.Fprintf(os.Stderr, "wsdl discovery: skipping %s (SSRF protection: %v)\n", wsdlURL, err)
-			}
-			return nil
-		}
-	}
-
-	// Per-stage timeouts in addition to the overall 15s Client.Timeout, so a
-	// slow TLS handshake or response-header phase can't burn the whole budget
-	// on one stage. Both branches share the same per-stage caps — the only
-	// real difference is the dialer (SSRF-safe vs permissive).
-	const stageTimeout = 10 * time.Second
-	transport := &http.Transport{
-		DialContext:           probe.SSRFSafeDialContext,
-		TLSHandshakeTimeout:   stageTimeout,
-		ResponseHeaderTimeout: stageTimeout,
-	}
-	if allowPrivate {
-		transport = &http.Transport{
-			TLSHandshakeTimeout:   stageTimeout,
-			ResponseHeaderTimeout: stageTimeout,
-		}
-	}
-	client := &http.Client{
-		Timeout:   15 * time.Second,
-		Transport: transport,
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-
-	resp, err := client.Get(wsdlURL)
-	if err != nil {
-		if verbose {
-			fmt.Fprintf(os.Stderr, "wsdl discovery: request failed: %v\n", err)
-		}
-		return nil
-	}
-	defer func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // best-effort drain
-		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close
-	}()
-
-	if resp.StatusCode >= 400 {
-		if verbose {
-			fmt.Fprintf(os.Stderr, "wsdl discovery: %s returned HTTP %d\n", wsdlURL, resp.StatusCode)
-		}
-		return nil
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20)) // 2MB limit
-	if err != nil {
-		return nil
-	}
-
-	// Validate the response is actually a WSDL document
-	if _, parseErr := wsdlgen.ParseWSDL(body); parseErr != nil {
-		if verbose {
-			fmt.Fprintf(os.Stderr, "wsdl discovery: response is not valid WSDL: %v\n", parseErr)
-		}
-		return nil
-	}
-
-	return body
+// validateSlugThreshold rejects --slug-threshold < 2 when --merge-slugs is on.
+// It runs early in GenerateCmd.Run and ScanCmd.Run so crawl/file I/O never
+// starts on an invalid flag combination. It delegates to
+// pipeline.ValidateSlugThreshold — the shared source of truth also enforced
+// inside the pipeline for SDK/direct callers.
+func validateSlugThreshold(apiType string, mergeSlugs bool, slugThreshold int) error {
+	return pipeline.ValidateSlugThreshold(apiType, mergeSlugs, slugThreshold)
 }
 
 // apiTypeDisplayName returns a human-readable display name for an API type.
 func apiTypeDisplayName(apiType string) string {
 	switch apiType {
-	case apiTypeREST:
+	case pipeline.APITypeREST:
 		return "REST"
-	case apiTypeWSDL:
+	case pipeline.APITypeWSDL:
 		return "WSDL"
-	case apiTypeGraphQL:
+	case pipeline.APITypeGraphQL:
 		return "GraphQL"
-	case apiTypeGRPC:
+	case pipeline.APITypeGRPC:
 		return "gRPC"
 	default:
 		return apiType
 	}
+}
+
+// statusWriter returns os.Stderr when verbose is true, otherwise nil.
+// Used to forward verbose progress output to the pipeline package.
+func statusWriter(verbose bool) io.Writer {
+	if verbose {
+		return os.Stderr
+	}
+	return nil
 }
 
 // validateURL checks that the given string is a valid URL with scheme and host.
@@ -1240,59 +780,4 @@ func validateURL(rawURL string) error {
 		return fmt.Errorf("invalid URL %q: scheme must be http or https", rawURL)
 	}
 	return nil
-}
-
-// jsAnalysisArgs bundles the flag values that drive jsstatic.Analyze. Used by
-// runJSAnalysisStage so each *Cmd.Run only has to assemble these fields once.
-//
-// The three call sites (CrawlCmd.Run, GenerateCmd.Run, ScanCmd.Run) each
-// build this value inline from their own flag struct (CrawlOptions,
-// GenerateCmd, ScanCmd). No shared constructor is provided because the source
-// structs are unrelated types: forcing a shared builder would require either
-// a dependency on all three command types or extra indirection that obscures
-// rather than simplifies the four-field assembly. Keeping the literal at each
-// call site is intentional.
-type jsAnalysisArgs struct {
-	enabled         bool
-	fetchSourcemaps bool
-	allowPrivate    bool
-	verbose         bool
-}
-
-// runJSAnalysisStage runs jsstatic.Analyze on requests and returns the
-// (possibly enriched) request slice. When args.enabled is false, returns
-// requests unchanged. Errors from Analyze are logged and treated as a no-op
-// (best-effort enrichment must never fail the surrounding pipeline).
-//
-// Idempotency guard: if any input request already carries a static:js or
-// static:js-sourcemap Source value, the bundles were already analyzed by a
-// prior stage (e.g. crawl --analyze-js wrote the capture and generate is now
-// reading it). In that case we skip the analysis and return requests unchanged
-// to avoid double-counting and redundant work. The guard also ensures that
-// running crawl | generate pipelines is byte-identical to running scan
-// directly when --analyze-js is set on both commands.
-func runJSAnalysisStage(ctx context.Context, requests []crawl.ObservedRequest, args jsAnalysisArgs) []crawl.ObservedRequest {
-	if !args.enabled {
-		return requests
-	}
-	// Skip if any request already carries a JS-static source — this capture
-	// was produced by a stage that already ran jsstatic.Analyze.
-	if crawl.AnyStaticSource(requests) {
-		return requests
-	}
-	aopts := jsstatic.Options{
-		FetchSourcemaps: args.fetchSourcemaps,
-		AllowPrivate:    args.allowPrivate,
-	}
-	res, err := jsstatic.Analyze(ctx, requests, aopts)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: js-static analysis failed: %v\n", err) //nolint:errcheck // best-effort status message
-		return requests
-	}
-	if args.verbose {
-		fmt.Fprintf(os.Stderr, "js-static: bundles=%d skipped=%d panics=%d, sourcemaps=%d, endpoints=%d\n", //nolint:gosec // G705: writing to stderr, not web response
-			res.Stats.BundlesAnalyzed, res.Stats.BundlesSkipped, res.Stats.AnalyzeOnePanics,
-			res.Stats.SourcemapsRecovered, res.Stats.EndpointsKept)
-	}
-	return res.Requests
 }

@@ -19,6 +19,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/praetorian-inc/vespasian/internal/pipeline"
 	"github.com/praetorian-inc/vespasian/pkg/analyze/jsstatic"
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
@@ -63,7 +64,7 @@ func runSmokePipeline(t *testing.T, captured []crawl.ObservedRequest, opts jssta
 		t.Fatalf("jsstatic.Analyze error: %v", err)
 	}
 
-	classifiers := classifiersForType("rest")
+	classifiers := pipeline.ClassifiersForType("rest")
 	classified := classify.RunClassifiers(classifiers, res.Requests, 0.5)
 	deduped := classify.Deduplicate(classified)
 
@@ -102,22 +103,22 @@ func TestScanPipeline_AnalyzeJS_SmokeFixture(t *testing.T) {
 }
 
 // TestScanPipeline_AnalyzeJS_OffMatchesBaseAndOnDoesNot exercises the actual
-// --analyze-js flag-wiring path through `runJSAnalysisStage` (the same helper
+// --analyze-js flag-wiring path through `pipeline.AnalyzeJS` (the same helper
 // used by ScanCmd.Run / GenerateCmd.Run / CrawlCmd.Run). It runs two distinct
 // pipelines:
-//   - "ON" path:  runJSAnalysisStage(enabled=true) → Analyze runs, requests grow.
-//   - "OFF" path: runJSAnalysisStage(enabled=false) → no-op, requests unchanged.
+//   - "ON" path:  pipeline.AnalyzeJS(AnalyzeJS=true) → Analyze runs, requests grow.
+//   - "OFF" path: pipeline.AnalyzeJS(AnalyzeJS=false) → no-op, requests unchanged.
 //
 // Assertions:
 //  1. ON path produces a spec that differs from the OFF path (extra endpoints discovered).
 //  2. OFF path produces a spec byte-identical to a third independent baseline run.
 //
-// If a future change breaks the `if !args.enabled { return requests }` guard
-// in runJSAnalysisStage, the OFF spec would suddenly contain static:js
+// If a future change breaks the `if !opts.AnalyzeJS { return requests }` guard
+// in pipeline.AnalyzeJS, the OFF spec would suddenly contain static:js
 // endpoints and this test would fail — making the flag wiring tamper-evident.
 func TestScanPipeline_AnalyzeJS_OffMatchesBaseAndOnDoesNot(t *testing.T) {
 	captured := smokeFixture()
-	classifiers := classifiersForType("rest")
+	classifiers := pipeline.ClassifiersForType("rest")
 	gen := &restgen.OpenAPIGenerator{}
 
 	// Baseline: classify+dedup+generate against raw captured (no Analyze invoked).
@@ -128,9 +129,9 @@ func TestScanPipeline_AnalyzeJS_OffMatchesBaseAndOnDoesNot(t *testing.T) {
 		t.Fatalf("baseline Generate error: %v", err)
 	}
 
-	// OFF path: invoke the actual production helper with enabled=false.
-	offRequests := runJSAnalysisStage(context.Background(), captured, jsAnalysisArgs{
-		enabled: false,
+	// OFF path: invoke the actual production helper with AnalyzeJS=false.
+	offRequests := pipeline.AnalyzeJS(context.Background(), captured, pipeline.AugmentOptions{
+		AnalyzeJS: false,
 	})
 	if len(offRequests) != len(captured) {
 		t.Fatalf("AnalyzeJS=false: helper must return captured unchanged; got len=%d, want %d",
@@ -143,12 +144,12 @@ func TestScanPipeline_AnalyzeJS_OffMatchesBaseAndOnDoesNot(t *testing.T) {
 		t.Fatalf("OFF Generate error: %v", err)
 	}
 	if string(offSpec) != string(baseSpec) {
-		t.Error("AnalyzeJS=false: spec must be byte-identical to baseline; runJSAnalysisStage(enabled=false) altered behavior")
+		t.Error("AnalyzeJS=false: spec must be byte-identical to baseline; pipeline.AnalyzeJS(AnalyzeJS=false) altered behavior")
 	}
 
-	// ON path: invoke the helper with enabled=true.
-	onRequests := runJSAnalysisStage(context.Background(), captured, jsAnalysisArgs{
-		enabled: true,
+	// ON path: invoke the helper with AnalyzeJS=true.
+	onRequests := pipeline.AnalyzeJS(context.Background(), captured, pipeline.AugmentOptions{
+		AnalyzeJS: true,
 	})
 	if len(onRequests) <= len(captured) {
 		t.Fatalf("AnalyzeJS=true: helper must append synthesized requests; got len=%d, want >%d",

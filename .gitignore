@@ -49,6 +49,7 @@ test/.*.pid
 test/rest-api/rest-api
 test/soap-service/soap-service
 test/grpc-server/grpc-server
+test/concat-spa/concat-spa
 test/graphql-server/node_modules/
 
 # go build artifact when run at repo root
