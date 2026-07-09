@@ -33,6 +33,7 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/analyze"
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/generate"
 	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
 
@@ -2460,7 +2461,11 @@ func TestDetectAPIType_StaticHTMLPostFormDrivesREST(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// T3 — enrichGRPCFromBindings: append fires only when zero grpc endpoints exist
+// T3 — enrichGRPCFromBindings: driven with a real gRPC-Web JS bundle so
+// ExtractGRPCWebBindings actually recovers a non-empty service set (the
+// previous versions of these tests passed an empty []crawl.ObservedRequest{},
+// so ExtractGRPCWebBindings returned nothing and enrichGRPCFromBindings
+// returned early before exercising the append/fill/drop logic at all).
 // ---------------------------------------------------------------------------
 
 // grpcClassifiedRequest is a helper to build a gRPC ClassifiedRequest with
@@ -2473,60 +2478,212 @@ func grpcClassifiedRequest(schema *classify.GRPCReflectionResult) classify.Class
 	}
 }
 
-// TestEnrichGRPCFromBindings_NoAppendWhenEndpointCoveredSameFQN (T3 Case A):
-// enriched has one grpc endpoint that already carries the same service FQN
-// recovered by bindings. No synthetic endpoint must be appended and no
-// duplicate FQN should be introduced.
-func TestEnrichGRPCFromBindings_NoAppendWhenEndpointCoveredSameFQN(t *testing.T) {
-	const fqn = "pkg.GreeterService"
-
-	existingSchema := &classify.GRPCReflectionResult{
-		ReflectionEnabled: false,
-		Services: []classify.GRPCService{
-			{Name: fqn, Methods: []classify.GRPCMethod{{Name: "SayHello"}}},
+// grpcWebJSRequest builds an ObservedRequest whose response body is the real
+// Connect-ES gRPC-Web JS bundle fixture shared with pkg/analyze's own tests
+// (pkg/analyze/testdata/grpc_web/users_connect.js, service
+// "users.v1.UserService"). Reusing the real fixture — rather than a
+// hand-rolled snippet — exercises the same jsluice detection path
+// ExtractGRPCWebBindings uses in production.
+func grpcWebJSRequest(t *testing.T) crawl.ObservedRequest {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join("..", "..", "pkg", "analyze", "testdata", "grpc_web", "users_connect.js"))
+	if err != nil {
+		t.Fatalf("read users_connect.js fixture: %v", err)
+	}
+	return crawl.ObservedRequest{
+		Method: "GET",
+		URL:    "https://example.com/users_connect.js",
+		Response: crawl.ObservedResponse{
+			ContentType: "application/javascript",
+			Body:        body,
 		},
 	}
-	enriched := []classify.ClassifiedRequest{grpcClassifiedRequest(existingSchema)}
-
-	// Build a capture with a JS bundle that exposes the same FQN.
-	// analyze.ExtractGRPCWebBindings reads JS bodies, so we fabricate a
-	// request with a JS body that contains the gRPC-Web service definition.
-	// If the bindings extractor finds no data (as expected for an empty body)
-	// we need to craft real bundle data or mock the function.  Because
-	// enrichGRPCFromBindings is the function under test (not
-	// ExtractGRPCWebBindings), and the plan says to test enrichment behavior,
-	// we call it with a capture that produces no bindings (returns early) so
-	// we can unit-test the append/dedup logic by using a capture designed so
-	// ExtractGRPCWebBindings returns our chosen service.
-	//
-	// The simplest approach: use an empty requests slice so ExtractGRPCWebBindings
-	// returns an empty list, verify enriched is unchanged.  Then verify via
-	// filterUncoveredServices (the dedup helper) for the interesting cases.
-	requests := []crawl.ObservedRequest{}
-	result := enrichGRPCFromBindings(requests, enriched, false)
-	// No bindings found → enriched returned unchanged.
-	if len(result) != 1 {
-		t.Errorf("enrichGRPCFromBindings with no bindings: got %d endpoints, want 1", len(result))
-	}
-	_ = fqn // referenced above
 }
 
-// TestEnrichGRPCFromBindings_AppendWhenZeroGRPCEndpoints (T3 Case B):
-// enriched has zero grpc endpoints; after enrichment with bindings services,
-// exactly one synthetic endpoint must be appended.
-func TestEnrichGRPCFromBindings_AppendWhenZeroGRPCEndpoints(t *testing.T) {
-	// enriched has only a non-grpc endpoint.
+// grpcServiceNames extracts the sorted service names carried by a
+// GRPCReflectionResult, or nil when schema is nil.
+func grpcServiceNames(schema *classify.GRPCReflectionResult) []string {
+	if schema == nil {
+		return nil
+	}
+	names := make([]string, 0, len(schema.Services))
+	for _, s := range schema.Services {
+		names = append(names, s.Name)
+	}
+	return names
+}
+
+// TestEnrichGRPCFromBindings_AppendsSyntheticEndpointWhenNoGRPCEndpoints
+// (T3 Case B, real bindings): enriched has zero grpc endpoints; the real
+// users_connect.js bundle recovers users.v1.UserService, so exactly one
+// synthetic grpc endpoint must be appended carrying that service.
+func TestEnrichGRPCFromBindings_AppendsSyntheticEndpointWhenNoGRPCEndpoints(t *testing.T) {
+	requests := []crawl.ObservedRequest{grpcWebJSRequest(t)}
 	enriched := []classify.ClassifiedRequest{
 		{
 			ObservedRequest: crawl.ObservedRequest{Method: "GET", URL: "https://example.com/api"},
 			APIType:         "rest",
 		},
 	}
-	requests := []crawl.ObservedRequest{}
+
 	result := enrichGRPCFromBindings(requests, enriched, false)
-	// No bindings data available → returns early, unchanged.
+
+	var grpcEPs []classify.ClassifiedRequest
+	for _, ep := range result {
+		if ep.APIType == apiTypeGRPC {
+			grpcEPs = append(grpcEPs, ep)
+		}
+	}
+	if len(grpcEPs) != 1 {
+		t.Fatalf("enrichGRPCFromBindings: got %d synthetic grpc endpoints, want exactly 1", len(grpcEPs))
+	}
+	names := grpcServiceNames(grpcEPs[0].GRPCSchema)
+	if len(names) == 0 || names[0] != "users.v1.UserService" {
+		t.Errorf("enrichGRPCFromBindings: synthetic endpoint services = %v, want [users.v1.UserService]", names)
+	}
+}
+
+// TestEnrichGRPCFromBindings_FillsBareEndpointInPlace (T3 Case C): a bare grpc
+// endpoint (nil GRPCSchema) is present alongside the real users_connect.js
+// bundle. The uncovered recovered service must be filled onto the existing
+// endpoint, and no endpoint must be appended.
+func TestEnrichGRPCFromBindings_FillsBareEndpointInPlace(t *testing.T) {
+	requests := []crawl.ObservedRequest{grpcWebJSRequest(t)}
+	enriched := []classify.ClassifiedRequest{grpcClassifiedRequest(nil)}
+
+	result := enrichGRPCFromBindings(requests, enriched, false)
+
 	if len(result) != 1 {
-		t.Errorf("enrichGRPCFromBindings with no grpc endpoints and no bindings: got %d, want 1", len(result))
+		t.Fatalf("enrichGRPCFromBindings: got %d endpoints, want 1 (fill in place, no append)", len(result))
+	}
+	names := grpcServiceNames(result[0].GRPCSchema)
+	if len(names) == 0 || names[0] != "users.v1.UserService" {
+		t.Errorf("enrichGRPCFromBindings: bare endpoint services after fill = %v, want [users.v1.UserService]", names)
+	}
+}
+
+// TestEnrichGRPCFromBindings_DropsAlreadyCoveredFQN (T3 Case A, real
+// bindings): enriched has one grpc endpoint that already carries the same
+// service FQN (users.v1.UserService) recovered by the real bindings bundle,
+// via reflection/gateway. filterUncoveredServices must drop that FQN, so
+// enrichGRPCFromBindings returns early: no endpoint appended, and the
+// existing schema is left untouched (not duplicated).
+func TestEnrichGRPCFromBindings_DropsAlreadyCoveredFQN(t *testing.T) {
+	requests := []crawl.ObservedRequest{grpcWebJSRequest(t)}
+
+	existingSchema := &classify.GRPCReflectionResult{
+		ReflectionEnabled: true,
+		Services: []classify.GRPCService{
+			{Name: "users.v1.UserService", Methods: []classify.GRPCMethod{{Name: "GetUser"}}},
+		},
+	}
+	enriched := []classify.ClassifiedRequest{grpcClassifiedRequest(existingSchema)}
+
+	result := enrichGRPCFromBindings(requests, enriched, false)
+
+	if len(result) != 1 {
+		t.Fatalf("enrichGRPCFromBindings: got %d endpoints, want 1 (no append when FQN already covered)", len(result))
+	}
+	if result[0].GRPCSchema != existingSchema {
+		t.Error("enrichGRPCFromBindings: existing schema must be left untouched when its FQN is already covered")
+	}
+	count := 0
+	for _, s := range result[0].GRPCSchema.Services {
+		if s.Name == "users.v1.UserService" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("enrichGRPCFromBindings: users.v1.UserService count = %d, want 1 (not re-attached)", count)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TEST-001 E2E — pipeline glue: enrichGRPCFromBindings feeding Generate
+// ---------------------------------------------------------------------------
+
+// TestEnrichGRPCFromBindings_PipelineGlueNoCollisionWithGateway pins the
+// multi-technique collision scenario (LAB-3864 review bug) at the pipeline
+// boundary generateSpec's grpc path drives: a grpc-gateway-derived endpoint
+// (greet.v1.Greeter, already covered — as GRPCGatewayProbe would leave it)
+// sits alongside a second, still-bare grpc endpoint; a captured gRPC-Web JS
+// bundle recovers greet.v1.Farewell — same package, different service — via
+// gRPC-Web bindings. enrichGRPCFromBindings must fill only the bare endpoint,
+// and feeding the combined result into the exact Generate call generateSpec
+// uses (generate.Get("grpc").Generate) must produce neither a "conflicting
+// file descriptors" nor a duplicate-symbol error, and a non-empty .proto. The
+// generator-level collision tests in pkg/generate/grpc/generator_test.go
+// cover Generate in isolation with hand-built ClassifiedRequests; this test
+// additionally exercises the enrichGRPCFromBindings glue that produces that
+// input in the real pipeline.
+func TestEnrichGRPCFromBindings_PipelineGlueNoCollisionWithGateway(t *testing.T) {
+	farewellJS := []byte(`
+		export const Farewell = {
+		  typeName: "greet.v1.Farewell",
+		  methods: {
+		    sayBye: {
+		      name: "SayBye",
+		      I: ByeRequest,
+		      O: ByeResponse,
+		      kind: MethodKind.Unary,
+		    },
+		  },
+		};
+	`)
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/farewell_connect.js",
+			Response: crawl.ObservedResponse{
+				ContentType: "application/javascript",
+				Body:        farewellJS,
+			},
+		},
+	}
+
+	// Endpoint A: already covered — as the grpc-gateway probe would leave it
+	// after recovering greet.v1.Greeter from an OpenAPI document.
+	gatewayEP := grpcClassifiedRequest(&classify.GRPCReflectionResult{
+		ReflectionEnabled: false,
+		Services: []classify.GRPCService{
+			{Name: "greet.v1.Greeter", Methods: []classify.GRPCMethod{
+				{Name: "SayHello", InputType: "HelloRequest", OutputType: "HelloResponse"},
+			}},
+		},
+	})
+	// Endpoint B: a second grpc endpoint with no coverage yet — e.g. a host
+	// the gateway probe found no OpenAPI document for.
+	bareEP := grpcClassifiedRequest(nil)
+
+	enriched := enrichGRPCFromBindings(requests, []classify.ClassifiedRequest{gatewayEP, bareEP}, false)
+
+	if len(enriched) != 2 {
+		t.Fatalf("enrichGRPCFromBindings: got %d endpoints, want 2 (fill bare endpoint in place, no append)", len(enriched))
+	}
+	if names := grpcServiceNames(enriched[1].GRPCSchema); len(names) == 0 || names[0] != "greet.v1.Farewell" {
+		t.Fatalf("enrichGRPCFromBindings: bare endpoint services = %v, want [greet.v1.Farewell]", names)
+	}
+
+	// Feed the combined result through the exact Generate call generateSpec's
+	// grpc path uses.
+	gen, err := generate.Get(apiTypeGRPC)
+	if err != nil {
+		t.Fatalf("generate.Get(%q): %v", apiTypeGRPC, err)
+	}
+	spec, err := gen.Generate(enriched)
+	if err != nil {
+		t.Fatalf("Generate must not return a conflicting file descriptors or duplicate symbol error: %v", err)
+	}
+	if len(spec) == 0 {
+		t.Fatal("Generate returned an empty .proto for a valid gateway+bindings capture")
+	}
+
+	specStr := string(spec)
+	if !strings.Contains(specStr, "service Greeter") {
+		t.Errorf("expected .proto to contain service Greeter, got:\n%s", specStr)
+	}
+	if !strings.Contains(specStr, "service Farewell") {
+		t.Errorf("expected .proto to contain service Farewell, got:\n%s", specStr)
 	}
 }
 

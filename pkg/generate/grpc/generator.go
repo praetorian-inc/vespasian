@@ -85,14 +85,19 @@ func (g *Generator) Generate(endpoints []classify.ClassifiedRequest) ([]byte, er
 
 	// Collect the FQNs already defined by the merged reflection descriptors so
 	// name-only techniques never re-synthesize (and re-declare) the same
-	// service in a separate synthetic file — that would be a duplicate symbol.
+	// service or message in a separate synthetic file — that would be a
+	// duplicate symbol. Services are deduped by dropping covered FQNs entirely;
+	// messages are deduped by importing the reflection file that declares them
+	// instead of emitting a duplicate stub.
 	reflectedFQNs := map[string]bool{}
+	reflectedMsgs := map[string]string{}
 	if len(merged) > 0 {
 		reflectedFDs, err := parseDescriptorSet(merged)
 		if err != nil {
 			return nil, err
 		}
 		reflectedFQNs = reflectedServiceFQNs(reflectedFDs)
+		reflectedMsgs = reflectedMessageFQNs(reflectedFDs)
 	}
 
 	// Union the name-only recovered Services across all endpoints, deduped by
@@ -100,7 +105,7 @@ func (g *Generator) Generate(endpoints []classify.ClassifiedRequest) ([]byte, er
 	// in a single call. Synthetic filenames are namespaced (synthetic.proto)
 	// and cannot key-collide with reflection filenames.
 	if synthServices := unionRecoveredServices(endpoints, reflectedFQNs); len(synthServices) > 0 {
-		synthFDs, err := FileDescriptorsFromServices(synthServices)
+		synthFDs, err := FileDescriptorsFromServices(synthServices, reflectedMsgs)
 		if err != nil {
 			return nil, err
 		}
@@ -124,6 +129,27 @@ func reflectedServiceFQNs(fds map[string]*desc.FileDescriptor) map[string]bool {
 		for _, sd := range fd.GetServices() {
 			out[sd.GetFullyQualifiedName()] = true
 		}
+	}
+	return out
+}
+
+// reflectedMessageFQNs maps every message FQN declared by the given parsed
+// reflection descriptors (including nested messages, package-qualified) to the
+// name of the .proto file that declares it. Synthesis consults this map so a
+// referenced message already provided by reflection is imported from its
+// reflection file rather than re-declared as a duplicate stub.
+func reflectedMessageFQNs(fds map[string]*desc.FileDescriptor) map[string]string {
+	out := map[string]string{}
+	for _, fd := range fds {
+		fileName := fd.GetName()
+		var walk func(msgs []*desc.MessageDescriptor)
+		walk = func(msgs []*desc.MessageDescriptor) {
+			for _, md := range msgs {
+				out[md.GetFullyQualifiedName()] = fileName
+				walk(md.GetNestedMessageTypes())
+			}
+		}
+		walk(fd.GetMessageTypes())
 	}
 	return out
 }

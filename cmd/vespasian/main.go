@@ -928,8 +928,8 @@ func generateSpec(ctx context.Context, requests []crawl.ObservedRequest, opts ge
 // endpoints, not the JS bundles (which are filtered out before probing). Only
 // generateSpec's caller context holds the full capture B1 needs.
 func enrichGRPCFromBindings(requests []crawl.ObservedRequest, enriched []classify.ClassifiedRequest, verbose bool) []classify.ClassifiedRequest {
-	services, err := analyze.ExtractGRPCWebBindings(requests)
-	if err != nil || len(services) == 0 {
+	services := analyze.ExtractGRPCWebBindings(requests)
+	if len(services) == 0 {
 		return enriched
 	}
 

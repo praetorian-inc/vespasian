@@ -245,10 +245,14 @@ func servicesFromOpenAPI(body []byte) []classify.GRPCService {
 
 	for _, ops := range doc.Paths {
 		for _, op := range ops {
-			m := operationIDPattern.FindStringSubmatch(op.OperationID)
-			if m == nil {
+			// Extract only operations that satisfy the same strict predicate the
+			// doc-recognition gate uses (both segments Upper-initial). A
+			// recognized doc can still carry lowercase/camel operationIds (e.g.
+			// list_users) that must not be turned into a junk service/method.
+			if !looksLikeServiceMethodOpID(op.OperationID) {
 				continue
 			}
+			m := operationIDPattern.FindStringSubmatch(op.OperationID)
 			method := m[2]
 			svc := serviceFromOperation(op.Tags, doc.Info.Title, m[1])
 			addMethod(svc, method)
@@ -355,7 +359,10 @@ func isUpperInitial(s string) bool {
 
 // looksLikeServiceFQN reports whether s has a protobuf service FQN shape: it
 // matches the *Service suffix pattern, or carries a ".vN." version segment
-// (a strong grpc-gateway signal even without the Service suffix).
+// (a strong grpc-gateway signal even without the Service suffix). The version
+// branch additionally requires s to be a valid dotted proto identifier so a
+// matching string can never carry control chars, newlines, or braces that
+// would later be treated as a service name.
 func looksLikeServiceFQN(s string) bool {
 	if s == "" {
 		return false
@@ -363,7 +370,26 @@ func looksLikeServiceFQN(s string) bool {
 	if serviceFQNPattern.MatchString(s) {
 		return true
 	}
-	return versionSegmentPattern.MatchString(s) && strings.Contains(s, ".")
+	return versionSegmentPattern.MatchString(s) && isDottedProtoIdent(s)
+}
+
+// protoIdentSegmentPattern matches a single proto identifier segment.
+var protoIdentSegmentPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// isDottedProtoIdent reports whether s is a dotted proto identifier: every
+// '.'-separated segment matches [A-Za-z_][A-Za-z0-9_]*. Empty is invalid. This
+// rejects strings carrying control chars, newlines, braces, or other injected
+// content that would be unsafe to treat as a service name.
+func isDottedProtoIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, seg := range strings.Split(s, ".") {
+		if !protoIdentSegmentPattern.MatchString(seg) {
+			return false
+		}
+	}
+	return true
 }
 
 // openAPIBaseURL derives the scheme://host[:port] base used to fetch OpenAPI

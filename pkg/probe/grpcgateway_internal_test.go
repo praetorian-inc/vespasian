@@ -191,6 +191,18 @@ func TestIsGRPCGatewayDoc_FQNShapedTitle(t *testing.T) {
 	}
 }
 
+// TestIsGRPCGatewayDoc_VersionSegmentWithoutServiceSuffix verifies the ".vN."
+// version-segment branch of looksLikeServiceFQN: a title that does not end in
+// "Service" but carries a ".vN." segment (e.g. "orders.v1.Fetcher") is still
+// accepted as a grpc-gateway doc.
+func TestIsGRPCGatewayDoc_VersionSegmentWithoutServiceSuffix(t *testing.T) {
+	doc := &openAPIDoc{}
+	doc.Info.Title = "orders.v1.Fetcher"
+	if !isGRPCGatewayDoc(doc) {
+		t.Error("isGRPCGatewayDoc: version-segment title without Service suffix (orders.v1.Fetcher) should be accepted")
+	}
+}
+
 // TestIsGRPCGatewayDoc_UpperInitialOperationID verifies that a doc with no
 // FQN-shaped title or tags but an Upper-initial operationId is now accepted.
 func TestIsGRPCGatewayDoc_UpperInitialOperationID(t *testing.T) {

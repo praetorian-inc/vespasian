@@ -83,8 +83,7 @@ func TestExtractGRPCWebBindings_ConnectES_ServiceFQN(t *testing.T) {
 	body := readFixture(t, "users_connect.js")
 	captured := []crawl.ObservedRequest{makeJSRequest("https://example.com/users_connect.js", body)}
 
-	services, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
+	services := ExtractGRPCWebBindings(captured)
 
 	svc := findService(services, "users.v1.UserService")
 	assert.NotNil(t, svc, "expected service users.v1.UserService, got %v", services)
@@ -96,8 +95,7 @@ func TestExtractGRPCWebBindings_ConnectES_Methods(t *testing.T) {
 	body := readFixture(t, "users_connect.js")
 	captured := []crawl.ObservedRequest{makeJSRequest("https://example.com/users_connect.js", body)}
 
-	services, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
+	services := ExtractGRPCWebBindings(captured)
 
 	svc := findService(services, "users.v1.UserService")
 	require.NotNil(t, svc)
@@ -115,8 +113,7 @@ func TestExtractGRPCWebBindings_ConnectES_UnaryMethod(t *testing.T) {
 	body := readFixture(t, "users_connect.js")
 	captured := []crawl.ObservedRequest{makeJSRequest("https://example.com/users_connect.js", body)}
 
-	services, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
+	services := ExtractGRPCWebBindings(captured)
 
 	svc := findService(services, "users.v1.UserService")
 	require.NotNil(t, svc)
@@ -133,8 +130,7 @@ func TestExtractGRPCWebBindings_ConnectES_ServerStreamingMethod(t *testing.T) {
 	body := readFixture(t, "users_connect.js")
 	captured := []crawl.ObservedRequest{makeJSRequest("https://example.com/users_connect.js", body)}
 
-	services, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
+	services := ExtractGRPCWebBindings(captured)
 
 	svc := findService(services, "users.v1.UserService")
 	require.NotNil(t, svc)
@@ -145,14 +141,48 @@ func TestExtractGRPCWebBindings_ConnectES_ServerStreamingMethod(t *testing.T) {
 	assert.False(t, m.ClientStreaming, "WatchUsers must not be client-streaming")
 }
 
+// TestExtractGRPCWebBindings_ConnectES_ClientStreamingMethod verifies SendUpdates
+// has ClientStreaming:true as encoded in the Connect-ES MethodKind.ClientStreaming.
+func TestExtractGRPCWebBindings_ConnectES_ClientStreamingMethod(t *testing.T) {
+	body := readFixture(t, "users_connect.js")
+	captured := []crawl.ObservedRequest{makeJSRequest("https://example.com/users_connect.js", body)}
+
+	services := ExtractGRPCWebBindings(captured)
+
+	svc := findService(services, "users.v1.UserService")
+	require.NotNil(t, svc)
+	m := findMethod(svc.Methods, "SendUpdates")
+	require.NotNil(t, m)
+
+	assert.True(t, m.ClientStreaming, "SendUpdates must be client-streaming")
+	assert.False(t, m.ServerStreaming, "SendUpdates must not be server-streaming")
+}
+
+// TestExtractGRPCWebBindings_ConnectES_BiDiStreamingMethod verifies Chat has
+// both ClientStreaming and ServerStreaming true as encoded in the Connect-ES
+// MethodKind.BiDiStreaming.
+func TestExtractGRPCWebBindings_ConnectES_BiDiStreamingMethod(t *testing.T) {
+	body := readFixture(t, "users_connect.js")
+	captured := []crawl.ObservedRequest{makeJSRequest("https://example.com/users_connect.js", body)}
+
+	services := ExtractGRPCWebBindings(captured)
+
+	svc := findService(services, "users.v1.UserService")
+	require.NotNil(t, svc)
+	m := findMethod(svc.Methods, "Chat")
+	require.NotNil(t, m)
+
+	assert.True(t, m.ClientStreaming, "Chat must be client-streaming (BiDi)")
+	assert.True(t, m.ServerStreaming, "Chat must be server-streaming (BiDi)")
+}
+
 // TestExtractGRPCWebBindings_ConnectES_InputOutputTypes verifies that input and
 // output types are recovered (non-empty) from the Connect-ES fixture.
 func TestExtractGRPCWebBindings_ConnectES_InputOutputTypes(t *testing.T) {
 	body := readFixture(t, "users_connect.js")
 	captured := []crawl.ObservedRequest{makeJSRequest("https://example.com/users_connect.js", body)}
 
-	services, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
+	services := ExtractGRPCWebBindings(captured)
 
 	svc := findService(services, "users.v1.UserService")
 	require.NotNil(t, svc)
@@ -173,8 +203,7 @@ func TestExtractGRPCWebBindings_PBService_ServiceFQN(t *testing.T) {
 	body := readFixture(t, "users_pb_service.js")
 	captured := []crawl.ObservedRequest{makeJSRequest("https://example.com/users_pb_service.js", body)}
 
-	services, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
+	services := ExtractGRPCWebBindings(captured)
 
 	svc := findService(services, "users.v1.UserService")
 	assert.NotNil(t, svc, "expected service users.v1.UserService, got %v", services)
@@ -186,8 +215,7 @@ func TestExtractGRPCWebBindings_PBService_UnaryMethod(t *testing.T) {
 	body := readFixture(t, "users_pb_service.js")
 	captured := []crawl.ObservedRequest{makeJSRequest("https://example.com/users_pb_service.js", body)}
 
-	services, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
+	services := ExtractGRPCWebBindings(captured)
 
 	svc := findService(services, "users.v1.UserService")
 	require.NotNil(t, svc)
@@ -204,8 +232,7 @@ func TestExtractGRPCWebBindings_PBService_ClientStreamingMethod(t *testing.T) {
 	body := readFixture(t, "users_pb_service.js")
 	captured := []crawl.ObservedRequest{makeJSRequest("https://example.com/users_pb_service.js", body)}
 
-	services, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
+	services := ExtractGRPCWebBindings(captured)
 
 	svc := findService(services, "users.v1.UserService")
 	require.NotNil(t, svc)
@@ -226,8 +253,7 @@ func TestExtractGRPCWebBindings_GRPCWebPB_ServiceFQN(t *testing.T) {
 	body := readFixture(t, "users_grpc_web_pb.js")
 	captured := []crawl.ObservedRequest{makeJSRequest("https://example.com/users_grpc_web_pb.js", body)}
 
-	services, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
+	services := ExtractGRPCWebBindings(captured)
 
 	svc := findService(services, "users.v1.UserService")
 	assert.NotNil(t, svc, "expected service users.v1.UserService from MethodDescriptor path, got %v", services)
@@ -239,8 +265,7 @@ func TestExtractGRPCWebBindings_GRPCWebPB_UnaryMethod(t *testing.T) {
 	body := readFixture(t, "users_grpc_web_pb.js")
 	captured := []crawl.ObservedRequest{makeJSRequest("https://example.com/users_grpc_web_pb.js", body)}
 
-	services, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
+	services := ExtractGRPCWebBindings(captured)
 
 	svc := findService(services, "users.v1.UserService")
 	require.NotNil(t, svc)
@@ -256,8 +281,7 @@ func TestExtractGRPCWebBindings_GRPCWebPB_ServerStreamingMethod(t *testing.T) {
 	body := readFixture(t, "users_grpc_web_pb.js")
 	captured := []crawl.ObservedRequest{makeJSRequest("https://example.com/users_grpc_web_pb.js", body)}
 
-	services, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
+	services := ExtractGRPCWebBindings(captured)
 
 	svc := findService(services, "users.v1.UserService")
 	require.NotNil(t, svc)
@@ -287,20 +311,17 @@ func TestExtractGRPCWebBindings_NonJSContentType(t *testing.T) {
 		},
 	}
 
-	services, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
+	services := ExtractGRPCWebBindings(captured)
 	assert.Empty(t, services, "non-JS content type must produce no services")
 }
 
 // TestExtractGRPCWebBindings_EmptyCapture verifies an empty capture slice
 // returns a nil/empty slice without error.
 func TestExtractGRPCWebBindings_EmptyCapture(t *testing.T) {
-	services, err := ExtractGRPCWebBindings(nil)
-	require.NoError(t, err)
+	services := ExtractGRPCWebBindings(nil)
 	assert.Empty(t, services)
 
-	services, err = ExtractGRPCWebBindings([]crawl.ObservedRequest{})
-	require.NoError(t, err)
+	services = ExtractGRPCWebBindings([]crawl.ObservedRequest{})
 	assert.Empty(t, services)
 }
 
@@ -310,8 +331,7 @@ func TestExtractGRPCWebBindings_GarbageJSBody(t *testing.T) {
 	garbage := []byte("\x00\x01\x02 not valid javascript {{{{")
 	captured := []crawl.ObservedRequest{makeJSRequest("https://example.com/bundle.js", garbage)}
 
-	services, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
+	services := ExtractGRPCWebBindings(captured)
 	assert.Empty(t, services, "garbage JS must produce no services")
 }
 
@@ -320,8 +340,7 @@ func TestExtractGRPCWebBindings_GarbageJSBody(t *testing.T) {
 func TestExtractGRPCWebBindings_EmptyJSBody(t *testing.T) {
 	captured := []crawl.ObservedRequest{makeJSRequest("https://example.com/empty.js", []byte{})}
 
-	services, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
+	services := ExtractGRPCWebBindings(captured)
 	assert.Empty(t, services)
 }
 
@@ -335,8 +354,7 @@ func TestExtractGRPCWebBindings_PlainJSNoBindings(t *testing.T) {
 	`)
 	captured := []crawl.ObservedRequest{makeJSRequest("https://example.com/app.js", plain)}
 
-	services, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
+	services := ExtractGRPCWebBindings(captured)
 	assert.Empty(t, services, "plain (non-grpc) JS must produce no services")
 }
 
@@ -351,8 +369,7 @@ func TestExtractGRPCWebBindings_OversizedBodySkipped(t *testing.T) {
 
 	captured := []crawl.ObservedRequest{makeJSRequest("https://example.com/huge.js", large)}
 
-	services, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
+	services := ExtractGRPCWebBindings(captured)
 	// Oversized body is skipped → no services regardless of content.
 	assert.Empty(t, services, "oversized bundle must be skipped")
 }
@@ -370,8 +387,7 @@ func TestExtractGRPCWebBindings_DeduplicatesAcrossBundles(t *testing.T) {
 		makeJSRequest("https://example.com/users_pb_service.js", pbBody),
 	}
 
-	services, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
+	services := ExtractGRPCWebBindings(captured)
 
 	count := 0
 	for _, s := range services {
@@ -388,10 +404,8 @@ func TestExtractGRPCWebBindings_DeterministicOutput(t *testing.T) {
 	body := readFixture(t, "users_connect.js")
 	captured := []crawl.ObservedRequest{makeJSRequest("https://example.com/users_connect.js", body)}
 
-	svcs1, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
-	svcs2, err := ExtractGRPCWebBindings(captured)
-	require.NoError(t, err)
+	svcs1 := ExtractGRPCWebBindings(captured)
+	svcs2 := ExtractGRPCWebBindings(captured)
 
 	require.Equal(t, len(svcs1), len(svcs2))
 	for i := range svcs1 {

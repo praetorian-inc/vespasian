@@ -27,7 +27,7 @@ import (
 // ClassifiedRequest, and drives the Generator to get the rendered .proto text.
 func roundTripProto(t *testing.T, services []classify.GRPCService) string {
 	t.Helper()
-	fds, err := FileDescriptorsFromServices(services)
+	fds, err := FileDescriptorsFromServices(services, nil)
 	require.NoError(t, err)
 	require.NotEmpty(t, fds)
 
@@ -138,7 +138,7 @@ func TestFileDescriptorsFromServices_BidiStreamingMethod(t *testing.T) {
 		},
 	}
 
-	fds, err := FileDescriptorsFromServices(services)
+	fds, err := FileDescriptorsFromServices(services, nil)
 	require.NoError(t, err)
 	require.NotEmpty(t, fds)
 	// Both flags set → descriptor should encode them.
@@ -167,7 +167,7 @@ func TestFileDescriptorsFromServices_BareTypeNamesQualified(t *testing.T) {
 	}
 
 	// Must not error — bare types are qualified with "users.v1".
-	fds, err := FileDescriptorsFromServices(services)
+	fds, err := FileDescriptorsFromServices(services, nil)
 	require.NoError(t, err)
 	require.NotEmpty(t, fds)
 
@@ -217,7 +217,7 @@ func TestFileDescriptorsFromServices_CrossPackageTypes(t *testing.T) {
 		},
 	}
 
-	fds, err := FileDescriptorsFromServices(services)
+	fds, err := FileDescriptorsFromServices(services, nil)
 	require.NoError(t, err)
 	// Should have at least two files: one for orders.v1, one for common.v1.
 	assert.GreaterOrEqual(t, len(fds), 2)
@@ -243,7 +243,7 @@ func TestFileDescriptorsFromServices_NoPackageService(t *testing.T) {
 		},
 	}
 
-	fds, err := FileDescriptorsFromServices(services)
+	fds, err := FileDescriptorsFromServices(services, nil)
 	require.NoError(t, err)
 	// File should exist.
 	require.NotEmpty(t, fds)
@@ -271,7 +271,7 @@ func TestFileDescriptorsFromServices_MultipleServices(t *testing.T) {
 		},
 	}
 
-	fds, err := FileDescriptorsFromServices(services)
+	fds, err := FileDescriptorsFromServices(services, nil)
 	require.NoError(t, err)
 	// Both services share the same package → grouped into one synthetic file.
 	assert.Len(t, fds, 1)
@@ -284,25 +284,29 @@ func TestFileDescriptorsFromServices_MultipleServices(t *testing.T) {
 // TestFileDescriptorsFromServices_EmptyServicesError verifies that an empty
 // input slice returns a non-nil error.
 func TestFileDescriptorsFromServices_EmptyServicesError(t *testing.T) {
-	_, err := FileDescriptorsFromServices(nil)
+	_, err := FileDescriptorsFromServices(nil, nil)
 	assert.Error(t, err)
 
-	_, err = FileDescriptorsFromServices([]classify.GRPCService{})
+	_, err = FileDescriptorsFromServices([]classify.GRPCService{}, nil)
 	assert.Error(t, err)
 }
 
 // TestFileDescriptorsFromServices_MalformedServiceName tests that a service
-// whose name is empty or otherwise malformed returns an error.
+// whose name is malformed (trailing dot → empty local name) is dropped rather
+// than failing the whole render: no error, no descriptor emitted (per the
+// "untrusted names" contract documented on FileDescriptorsFromServices).
 func TestFileDescriptorsFromServices_MalformedServiceName(t *testing.T) {
 	services := []classify.GRPCService{
 		{Name: "users.v1."}, // trailing dot → empty local name
 	}
-	_, err := FileDescriptorsFromServices(services)
-	assert.Error(t, err)
+	fds, err := FileDescriptorsFromServices(services, nil)
+	require.NoError(t, err)
+	assert.Empty(t, fds, "malformed service name must be dropped, producing no descriptor")
 }
 
 // TestFileDescriptorsFromServices_EmptyMethodName tests that a method with an
-// empty Name returns an error (the generator requires non-empty names).
+// empty Name is dropped; since it is the service's only method, the service
+// is left with no valid methods and produces no descriptor (no error).
 func TestFileDescriptorsFromServices_EmptyMethodName(t *testing.T) {
 	services := []classify.GRPCService{
 		{
@@ -312,8 +316,9 @@ func TestFileDescriptorsFromServices_EmptyMethodName(t *testing.T) {
 			},
 		},
 	}
-	_, err := FileDescriptorsFromServices(services)
-	assert.Error(t, err)
+	fds, err := FileDescriptorsFromServices(services, nil)
+	require.NoError(t, err)
+	assert.Empty(t, fds, "service with no valid methods must produce no descriptor")
 }
 
 // TestFileDescriptorsFromServices_Determinism verifies that two calls to
@@ -348,7 +353,7 @@ func TestFileDescriptorsFromServices_SyntheticFilename(t *testing.T) {
 		},
 	}
 
-	fds, err := FileDescriptorsFromServices(services)
+	fds, err := FileDescriptorsFromServices(services, nil)
 	require.NoError(t, err)
 	for name := range fds {
 		assert.Contains(t, name, "synthetic.proto", "all synthetic filenames must end with synthetic.proto")
@@ -367,7 +372,7 @@ func TestFileDescriptorsFromServices_ReturnedMapNotEmpty(t *testing.T) {
 		},
 	}
 
-	fds, err := FileDescriptorsFromServices(services)
+	fds, err := FileDescriptorsFromServices(services, nil)
 	require.NoError(t, err)
 	assert.NotEmpty(t, fds)
 }
@@ -393,7 +398,7 @@ func TestSyntheticFileName_PackageToPath(t *testing.T) {
 					Methods: []classify.GRPCMethod{{Name: "M", InputType: "Req", OutputType: "Resp"}},
 				},
 			}
-			fds, err := FileDescriptorsFromServices(services)
+			fds, err := FileDescriptorsFromServices(services, nil)
 			require.NoError(t, err)
 			_, ok := fds[tc.wantKeyPart]
 			assert.True(t, ok, "expected map key %q, got %v", tc.wantKeyPart, fds)
