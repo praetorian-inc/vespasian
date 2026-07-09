@@ -57,12 +57,13 @@ type BrowserManager struct {
 }
 
 // configureLauncher applies BrowserOptions to a new launcher without
-// launching Chrome. Extracted for testability of the CI auto-detection logic.
+// launching Chrome. Disables the sandbox when opts.NoSandbox is set or
+// when the VESPASIAN_NO_SANDBOX env var is "true" (set by CI workflows).
 func configureLauncher(opts BrowserOptions) (*launcher.Launcher, error) {
 	l := launcher.New().
 		Headless(opts.Headless)
 
-	if opts.NoSandbox || os.Getenv("CI") != "" {
+	if opts.NoSandbox || os.Getenv("VESPASIAN_NO_SANDBOX") == "true" {
 		l = l.NoSandbox(true)
 	}
 	if opts.ChromePath != "" {
