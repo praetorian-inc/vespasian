@@ -56,16 +56,13 @@ type BrowserManager struct {
 	cleanupOnce sync.Once
 }
 
-// NewBrowserManager launches a Chrome instance with the given options and
-// returns a manager that owns its lifecycle.
-func NewBrowserManager(opts BrowserOptions) (*BrowserManager, error) {
+// configureLauncher applies BrowserOptions to a new launcher without
+// launching Chrome. Extracted for testability of the CI auto-detection logic.
+func configureLauncher(opts BrowserOptions) (*launcher.Launcher, error) {
 	l := launcher.New().
 		Headless(opts.Headless)
 
-	if opts.NoSandbox {
-		l = l.NoSandbox(true)
-	}
-	if !opts.NoSandbox && os.Getenv("CI") != "" {
+	if opts.NoSandbox || os.Getenv("CI") != "" {
 		l = l.NoSandbox(true)
 	}
 	if opts.ChromePath != "" {
@@ -76,6 +73,17 @@ func NewBrowserManager(opts BrowserOptions) (*BrowserManager, error) {
 			return nil, err
 		}
 		l = l.Set("proxy-server", opts.Proxy)
+	}
+
+	return l, nil
+}
+
+// NewBrowserManager launches a Chrome instance with the given options and
+// returns a manager that owns its lifecycle.
+func NewBrowserManager(opts BrowserOptions) (*BrowserManager, error) {
+	l, err := configureLauncher(opts)
+	if err != nil {
+		return nil, err
 	}
 
 	wsURL, err := l.Launch()

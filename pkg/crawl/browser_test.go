@@ -51,3 +51,34 @@ func TestBrowserManager_SetCookies_NilReceiverReturnsError(t *testing.T) {
 		t.Errorf("error message %q should contain 'not connected'", err.Error())
 	}
 }
+
+func TestConfigureLauncher_CIAutoDetectsNoSandbox(t *testing.T) {
+	tests := []struct {
+		name      string
+		noSandbox bool
+		ciEnv     string
+		wantFlag  bool
+	}{
+		{"explicit NoSandbox", true, "", true},
+		{"explicit NoSandbox with CI", true, "true", true},
+		{"no flags no CI", false, "", false},
+		{"CI auto-detects NoSandbox", false, "true", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.ciEnv != "" {
+				t.Setenv("CI", tt.ciEnv)
+			} else {
+				t.Setenv("CI", "")
+			}
+			l, err := configureLauncher(BrowserOptions{NoSandbox: tt.noSandbox})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			got := l.Has("no-sandbox")
+			if got != tt.wantFlag {
+				t.Errorf("Has(no-sandbox) = %v, want %v", got, tt.wantFlag)
+			}
+		})
+	}
+}
