@@ -36,7 +36,7 @@ const maxGRPCWebBundleSize = 5 * 1024 * 1024 // 5 MB
 // entry's Response.Body, runs jsluice over JS-content-type bodies, and returns
 // the recovered services deduplicated by fully-qualified service name.
 //
-// Returns an empty slice when no bindings are found.
+// Returns nil when no bindings are found.
 func ExtractGRPCWebBindings(captured []crawl.ObservedRequest) []classify.GRPCService {
 	// Accumulate methods per service FQN; a service may be split across bundles.
 	byService := map[string]map[string]classify.GRPCMethod{}

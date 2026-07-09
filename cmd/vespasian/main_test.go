@@ -2565,9 +2565,21 @@ func TestEnrichGRPCFromBindings_FillsBareEndpointInPlace(t *testing.T) {
 // TestEnrichGRPCFromBindings_DropsAlreadyCoveredFQN (T3 Case A, real
 // bindings): enriched has one grpc endpoint that already carries the same
 // service FQN (users.v1.UserService) recovered by the real bindings bundle,
-// via reflection/gateway. filterUncoveredServices must drop that FQN, so
-// enrichGRPCFromBindings returns early: no endpoint appended, and the
-// existing schema is left untouched (not duplicated).
+// via reflection/gateway. This pins the "no re-attachment" outcome: no
+// endpoint is appended and the existing GRPCSchema pointer is left untouched
+// (not replaced, not duplicated) when a grpc endpoint already covers the
+// recovered FQN.
+//
+// Note: this single-endpoint scenario does not, by itself, isolate WHICH
+// guard produces that outcome — filterUncoveredServices dropping the FQN
+// (triggering enrichGRPCFromBindings' early "len(filtered) == 0" return) and
+// the hasCoverage skip-fill branch in the fill loop would both leave this
+// endpoint's schema pointer unchanged, since the endpoint's Services is
+// already non-empty either way. See
+// TestEnrichGRPCFromBindings_FilterDropsRecoveredFQNLeavesBareEndpointUnfilled
+// below for a variant where filtering — not hasCoverage — is the sole reason
+// no fill occurs, using a second, bare endpoint that hasCoverage would
+// otherwise fill.
 func TestEnrichGRPCFromBindings_DropsAlreadyCoveredFQN(t *testing.T) {
 	requests := []crawl.ObservedRequest{grpcWebJSRequest(t)}
 
@@ -2595,6 +2607,39 @@ func TestEnrichGRPCFromBindings_DropsAlreadyCoveredFQN(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("enrichGRPCFromBindings: users.v1.UserService count = %d, want 1 (not re-attached)", count)
+	}
+}
+
+// TestEnrichGRPCFromBindings_FilterDropsRecoveredFQNLeavesBareEndpointUnfilled
+// isolates filterUncoveredServices as the sole reason no fill occurs (TEST-001
+// fix): a bare grpc endpoint (nil GRPCSchema, hasCoverage false — the fill
+// loop would fill it if it ever ran with a non-empty recovered set) sits
+// alongside a second endpoint that already covers the bindings-recovered FQN
+// (users.v1.UserService). filterUncoveredServices must remove that FQN as the
+// only recovered service, so enrichGRPCFromBindings returns early before the
+// fill loop runs at all — leaving the bare endpoint's schema nil and
+// appending no endpoint. Unlike TestEnrichGRPCFromBindings_DropsAlreadyCoveredFQN,
+// the bare endpoint here has hasCoverage == false, so if filtering did NOT
+// drop the FQN, this endpoint would be filled — proving filtering, not
+// hasCoverage, is what leaves it untouched.
+func TestEnrichGRPCFromBindings_FilterDropsRecoveredFQNLeavesBareEndpointUnfilled(t *testing.T) {
+	requests := []crawl.ObservedRequest{grpcWebJSRequest(t)}
+
+	coveredEP := grpcClassifiedRequest(&classify.GRPCReflectionResult{
+		ReflectionEnabled: true,
+		Services: []classify.GRPCService{
+			{Name: "users.v1.UserService", Methods: []classify.GRPCMethod{{Name: "GetUser"}}},
+		},
+	})
+	bareEP := grpcClassifiedRequest(nil)
+
+	result := enrichGRPCFromBindings(requests, []classify.ClassifiedRequest{coveredEP, bareEP}, false)
+
+	if len(result) != 2 {
+		t.Fatalf("enrichGRPCFromBindings: got %d endpoints, want 2 (no append when filtering removes the only recovered service)", len(result))
+	}
+	if result[1].GRPCSchema != nil {
+		t.Errorf("enrichGRPCFromBindings: bare endpoint schema = %+v, want nil (filterUncoveredServices must remove the only recovered FQN before the fill loop runs)", result[1].GRPCSchema)
 	}
 }
 

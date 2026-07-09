@@ -17,6 +17,7 @@
 package probe
 
 import (
+	"encoding/json"
 	"testing"
 )
 
@@ -200,6 +201,58 @@ func TestIsGRPCGatewayDoc_VersionSegmentWithoutServiceSuffix(t *testing.T) {
 	doc.Info.Title = "orders.v1.Fetcher"
 	if !isGRPCGatewayDoc(doc) {
 		t.Error("isGRPCGatewayDoc: version-segment title without Service suffix (orders.v1.Fetcher) should be accepted")
+	}
+}
+
+// TestLooksLikeServiceFQN_RejectsVersionSegmentWithInjectedContent pins the
+// SEC-BE-001 injection guard on the ".vN." version-segment branch of
+// looksLikeServiceFQN: a string that satisfies versionSegmentPattern (it
+// contains ".v1.") but is NOT a valid dotted proto identifier — here because
+// a segment carries a newline and braces — must be rejected. If the
+// "&& isDottedProtoIdent(s)" anchor were removed from looksLikeServiceFQN,
+// versionSegmentPattern alone would match this string and the test would
+// fail.
+func TestLooksLikeServiceFQN_RejectsVersionSegmentWithInjectedContent(t *testing.T) {
+	malformed := "orders.v1.Fetcher\n{injected}"
+	if looksLikeServiceFQN(malformed) {
+		t.Errorf("looksLikeServiceFQN(%q) = true, want false: version-segment match without a valid dotted proto identifier must be rejected (SEC-BE-001 guard)", malformed)
+	}
+}
+
+// TestServicesFromOpenAPI_RejectsInjectedTagAsServiceName pins the
+// SEC-BE-001 guard end-to-end through the public entry point servicesFromOpenAPI:
+// an operation tag that matches versionSegmentPattern but carries injected
+// content (newline + braces) must never be emitted as the recovered
+// GRPCService.Name. serviceFromOperation must fall through to the
+// operationId prefix instead. If the isDottedProtoIdent anchor were removed,
+// the malformed tag would satisfy looksLikeServiceFQN and be returned
+// verbatim as the service name.
+func TestServicesFromOpenAPI_RejectsInjectedTagAsServiceName(t *testing.T) {
+	doc := openAPIDoc{}
+	doc.Info.Title = "Orders"
+	doc.Paths = map[string]map[string]struct {
+		OperationID string   `json:"operationId"`
+		Tags        []string `json:"tags"`
+	}{
+		"/v1/orders": {
+			"get": {OperationID: "Orders_Fetch", Tags: []string{"orders.v1.Fetcher\n{injected}"}},
+		},
+	}
+	body, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal doc: %v", err)
+	}
+
+	svcs := servicesFromOpenAPI(body)
+
+	if len(svcs) != 1 {
+		t.Fatalf("servicesFromOpenAPI: got %d services, want 1: %v", len(svcs), svcs)
+	}
+	if svcs[0].Name == "orders.v1.Fetcher\n{injected}" {
+		t.Errorf("servicesFromOpenAPI: recovered malformed tag %q as service name (SEC-BE-001 guard bypassed)", svcs[0].Name)
+	}
+	if svcs[0].Name != "Orders" {
+		t.Errorf("servicesFromOpenAPI: service name = %q, want %q (operationId prefix fallback)", svcs[0].Name, "Orders")
 	}
 }
 

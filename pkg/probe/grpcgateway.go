@@ -249,10 +249,11 @@ func servicesFromOpenAPI(body []byte) []classify.GRPCService {
 			// doc-recognition gate uses (both segments Upper-initial). A
 			// recognized doc can still carry lowercase/camel operationIds (e.g.
 			// list_users) that must not be turned into a junk service/method.
-			if !looksLikeServiceMethodOpID(op.OperationID) {
+			// Evaluate operationIDPattern once and reuse the captures.
+			m := operationIDPattern.FindStringSubmatch(op.OperationID)
+			if m == nil || !isUpperInitial(m[1]) || !isUpperInitial(m[2]) {
 				continue
 			}
-			m := operationIDPattern.FindStringSubmatch(op.OperationID)
 			method := m[2]
 			svc := serviceFromOperation(op.Tags, doc.Info.Title, m[1])
 			addMethod(svc, method)
