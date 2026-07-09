@@ -105,13 +105,13 @@ func TestValidateProxyAddr(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateProxyAddr(tt.addr)
+			err := ValidateProxyAddr(tt.addr)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("validateProxyAddr(%q) error = %v, wantErr %v", tt.addr, err, tt.wantErr)
+				t.Errorf("ValidateProxyAddr(%q) error = %v, wantErr %v", tt.addr, err, tt.wantErr)
 			}
 			if tt.wantErr && tt.errMsg != "" && err != nil {
 				if !strings.Contains(err.Error(), tt.errMsg) {
-					t.Errorf("validateProxyAddr(%q) error = %q, want containing %q", tt.addr, err.Error(), tt.errMsg)
+					t.Errorf("ValidateProxyAddr(%q) error = %q, want containing %q", tt.addr, err.Error(), tt.errMsg)
 				}
 			}
 		})
@@ -129,7 +129,7 @@ func TestValidateProxyAddr(t *testing.T) {
 	}
 	for _, tt := range credentialLeakCases {
 		t.Run("redacted/"+tt.name, func(t *testing.T) {
-			err := validateProxyAddr(tt.addr)
+			err := ValidateProxyAddr(tt.addr)
 			if err == nil {
 				t.Fatal("expected error for embedded credentials")
 			}

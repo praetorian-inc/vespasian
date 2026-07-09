@@ -50,16 +50,17 @@ const (
 
 // CrawlerOptions configures the crawler behavior.
 type CrawlerOptions struct {
-	Depth        int
-	MaxPages     int
-	Timeout      time.Duration
-	Scope        string
-	Headless     bool
-	Headers      map[string]string
-	Proxy        string    // optional: proxy address for Chrome (e.g., "http://127.0.0.1:8080")
-	Concurrency  int       // headless tab concurrency; 0 uses DefaultConcurrency (10)
-	AllowPrivate bool      // disable SSRF protection, allowing private/internal targets
-	Stderr       io.Writer // user-facing status messages; nil disables output
+	Depth         int
+	MaxPages      int
+	Timeout       time.Duration
+	Scope         string
+	Headless      bool
+	Headers       map[string]string
+	Proxy         string    // optional: proxy address for the crawler backend (e.g., "http://127.0.0.1:8080")
+	ProxyInsecure bool      // net/http backend only: disable TLS verification for an http/https intercepting proxy (Burp/mitmproxy MITM). Off by default; no effect on the headless backend or on socks5.
+	Concurrency   int       // headless tab concurrency; 0 uses DefaultConcurrency (10)
+	AllowPrivate  bool      // disable SSRF protection, allowing private/internal targets
+	Stderr        io.Writer // user-facing status messages; nil disables output
 
 	// BrowserMgr provides a caller-owned Chrome instance. When set, Crawl()
 	// connects to this browser instead of launching its own. Callers who want
