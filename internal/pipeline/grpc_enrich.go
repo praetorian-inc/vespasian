@@ -86,12 +86,27 @@ func grpcHostKey(rawURL string) string {
 }
 
 // enrichGRPCFromBindings recovers gRPC services from gRPC-Web JS bundles in the
-// full augmented capture and applies them with the lowest precedence in the
-// reflection > gateway > bindings chain. It never overwrites an endpoint that
-// already carries usable descriptors (reflection or gateway). When no grpc
-// endpoint exists at all — common for a pure gRPC-Web SPA where only JS was
-// captured — a single synthetic grpc endpoint is appended so the generator has
-// something to render.
+// full augmented capture and surfaces them with the lowest precedence in the
+// reflection > gateway > bindings chain. Precedence is enforced at method
+// granularity by the generator's per-FQN method union, not by dropping whole
+// services here: a service only PARTIALLY covered by grpc-gateway (its
+// transcodable unary methods) still contributes its bindings-only methods
+// (e.g. client-streaming/bidi RPCs the gateway cannot transcode).
+//
+// Recovered services are split three ways by how their FQN is already covered:
+//   - uncovered (by any technique): filled onto a bare grpc endpoint in place,
+//     or appended when none exists (pure gRPC-Web SPA);
+//   - covered ONLY by a name-only technique (grpc-gateway): appended on a
+//     trailing endpoint — never filled onto a pre-existing endpoint — so the
+//     gateway endpoint always precedes it and the generator's method union
+//     keeps the gateway's method definitions while adding the bindings-only
+//     ones;
+//   - covered by reflection: dropped here (reflection is authoritative and its
+//     real FileDescriptors are never grafted with synthetic method stubs); the
+//     generator also drops reflected FQNs as a backstop.
+//
+// It never overwrites an endpoint that already carries usable descriptors
+// (reflection or gateway).
 //
 // Bindings recovery reads JS bodies from the capture rather than the network,
 // so it is not a ProbeStrategy: the classified/deduped endpoints handed to
@@ -104,55 +119,60 @@ func enrichGRPCFromBindings(requests []crawl.ObservedRequest, enriched []classif
 		return enriched
 	}
 
-	// Dedupe bindings services against every service already recovered across
-	// all endpoints (by any technique). Reflection > gateway > bindings: a FQN
-	// already recovered by a higher-precedence technique is not re-attached.
-	filtered := filterUncoveredServices(services, enriched)
-	if len(filtered) == 0 {
+	uncovered := filterUncoveredServices(services, enriched)
+	nameOnlyExtra := nameOnlyCoveredServices(services, enriched)
+	if len(uncovered) == 0 && len(nameOnlyExtra) == 0 {
 		return enriched
 	}
 
-	writeStatus(status, "recovered %d service(s) from gRPC-Web bundles\n", len(filtered))
+	writeStatus(status, "recovered %d service(s) from gRPC-Web bundles\n", len(uncovered)+len(nameOnlyExtra))
 
 	// Store recovered service names only. Descriptor synthesis is centralized
 	// in the generator. ReflectionEnabled is false: JS bindings are not a
 	// reflection response.
-	schema := func() *classify.GRPCReflectionResult {
+	grpcSchema := func(svcs []classify.GRPCService) *classify.GRPCReflectionResult {
 		return &classify.GRPCReflectionResult{
 			ReflectionEnabled: false,
-			Services:          filtered,
+			Services:          svcs,
 		}
 	}
 
-	// "Covered" for bindings purposes means the endpoint already carries usable
+	// "Covered" for fill purposes means the endpoint already carries usable
 	// descriptors or recovered service names (reflection or gateway).
 	hasCoverage := func(s *classify.GRPCReflectionResult) bool {
 		return s != nil && (len(s.FileDescriptors) > 0 || len(s.Services) > 0)
 	}
 
+	// Fill genuinely-new (uncovered) services onto every bare grpc endpoint in
+	// place. An uncovered FQN appears on no existing endpoint, so filling it
+	// cannot invert gateway > bindings precedence.
 	attached := false
-	for i := range enriched {
-		if enriched[i].APIType != APITypeGRPC {
-			continue
+	if len(uncovered) > 0 {
+		for i := range enriched {
+			if enriched[i].APIType != APITypeGRPC {
+				continue
+			}
+			if hasCoverage(enriched[i].GRPCSchema) {
+				continue
+			}
+			enriched[i].GRPCSchema = grpcSchema(uncovered)
+			attached = true
 		}
-		if hasCoverage(enriched[i].GRPCSchema) {
-			continue
-		}
-		enriched[i].GRPCSchema = schema()
-		attached = true
 	}
 
-	// Append a synthetic grpc endpoint carrying the recovered services when they
-	// were not attached to any existing bare endpoint — either no grpc endpoint
-	// exists (pure gRPC-Web SPA), OR all existing grpc endpoints are already
-	// covered by a higher-precedence technique (single-host gateway+bindings,
-	// where bindings-only services like streaming RPCs the gateway can't
-	// transcode would otherwise be dropped). `filtered` is already deduped
-	// against all coverage, so this never duplicates a higher-precedence service.
-	if !attached {
+	// Build the trailing endpoint. name-only-covered services are always
+	// appended (never filled) so their gateway endpoint precedes them and the
+	// generator's method union keeps the gateway definitions. Uncovered
+	// services ride along only when no bare endpoint accepted them.
+	var trailing []classify.GRPCService
+	if len(uncovered) > 0 && !attached {
+		trailing = append(trailing, uncovered...)
+	}
+	trailing = append(trailing, nameOnlyExtra...)
+	if len(trailing) > 0 {
 		enriched = append(enriched, classify.ClassifiedRequest{
 			APIType:    APITypeGRPC,
-			GRPCSchema: schema(),
+			GRPCSchema: grpcSchema(trailing),
 		})
 	}
 
@@ -179,4 +199,48 @@ func filterUncoveredServices(services []classify.GRPCService, enriched []classif
 		filtered = append(filtered, svc)
 	}
 	return filtered
+}
+
+// nameOnlyCoveredServices returns the subset of services whose FQN is already
+// recovered by a NAME-ONLY endpoint (grpc-gateway: ReflectionEnabled=false and
+// no FileDescriptors) but is NOT covered by reflection. These are carried — on
+// a trailing endpoint — so the generator's per-method union can add the
+// bindings-only methods (e.g. client-streaming/bidi RPCs grpc-gateway cannot
+// transcode) to a service the gateway only partially covered, while the
+// gateway's method definitions win.
+//
+// Reflection-covered FQNs are excluded: reflection is authoritative and its
+// real FileDescriptors are never augmented with synthetic method stubs
+// (invariant preserved here and again as a backstop in the generator's union).
+// Leading dots are stripped before comparison so ".pkg.S" and "pkg.S" match.
+func nameOnlyCoveredServices(services []classify.GRPCService, enriched []classify.ClassifiedRequest) []classify.GRPCService {
+	reflectionFQNs := map[string]bool{}
+	nameOnlyFQNs := map[string]bool{}
+	for i := range enriched {
+		s := enriched[i].GRPCSchema
+		if s == nil {
+			continue
+		}
+		reflected := s.ReflectionEnabled || len(s.FileDescriptors) > 0
+		for _, svc := range s.Services {
+			fqn := strings.TrimPrefix(svc.Name, ".")
+			if reflected {
+				reflectionFQNs[fqn] = true
+			} else {
+				nameOnlyFQNs[fqn] = true
+			}
+		}
+	}
+
+	extra := services[:0:0]
+	for _, svc := range services {
+		fqn := strings.TrimPrefix(svc.Name, ".")
+		if reflectionFQNs[fqn] {
+			continue
+		}
+		if nameOnlyFQNs[fqn] {
+			extra = append(extra, svc)
+		}
+	}
+	return extra
 }

@@ -16,6 +16,7 @@ package grpc
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -334,17 +335,100 @@ func TestGenerator_Generate_TwoServicesOnePackageBothPresent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// T3 — Gateway partial coverage + bindings streaming method, through Generate
+// ---------------------------------------------------------------------------
+
+// TestGenerator_Generate_GreeterGatewayPrecedenceOverBindingsStreamingChat
+// pins gateway>bindings precedence at METHOD granularity through Generate: a
+// grpc-gateway-style endpoint (name-only, ReflectionEnabled=false) recovers
+// Greeter.SayHello as a unary method; a separate bindings-recovered endpoint
+// independently recovers the SAME Greeter FQN with a method of the SAME name
+// (SayHello) but a DIFFERENT (streaming) definition, plus a bindings-only
+// method (Chat) that grpc-gateway cannot transcode. The generated .proto must
+// contain BOTH SayHello and Chat on Greeter, with SayHello rendered using the
+// gateway's unary definition — proving precedence is resolved per-method
+// (method union), not by dropping or fully overwriting the service.
+func TestGenerator_Generate_GreeterGatewayPrecedenceOverBindingsStreamingChat(t *testing.T) {
+	gatewayEP := classify.ClassifiedRequest{
+		APIType: "grpc",
+		GRPCSchema: &classify.GRPCReflectionResult{
+			ReflectionEnabled: false,
+			Services: []classify.GRPCService{
+				{Name: "greet.v1.Greeter", Methods: []classify.GRPCMethod{
+					{Name: "SayHello", InputType: "HelloRequest", OutputType: "HelloResponse"},
+				}},
+			},
+		},
+	}
+	bindingsEP := classify.ClassifiedRequest{
+		APIType: "grpc",
+		GRPCSchema: &classify.GRPCReflectionResult{
+			ReflectionEnabled: false,
+			Services: []classify.GRPCService{
+				{Name: "greet.v1.Greeter", Methods: []classify.GRPCMethod{
+					// Same method name as the gateway's SayHello, but declared
+					// client-streaming here — a conflicting definition. The
+					// gateway's (higher-precedence) definition must win.
+					{Name: "SayHello", InputType: "HelloRequest", OutputType: "HelloResponse", ClientStreaming: true},
+					// Bindings-only method: grpc-gateway cannot transcode a
+					// client-streaming RPC, so only bindings recover it.
+					{Name: "Chat", InputType: "ChatRequest", OutputType: "ChatResponse", ClientStreaming: true},
+				}},
+			},
+		},
+	}
+
+	g := &Generator{}
+	// gatewayEP precedes bindingsEP, mirroring enrichGRPCFromBindings appending
+	// bindings on a trailing endpoint after the gateway's: reflection > gateway
+	// > bindings ordering, so the gateway's SayHello definition must win.
+	out, err := g.Generate([]classify.ClassifiedRequest{gatewayEP, bindingsEP})
+	require.NoError(t, err)
+
+	output := string(out)
+	assert.Contains(t, output, "service Greeter")
+	assert.Contains(t, output, "rpc SayHello", "SayHello (gateway-recovered) must be present")
+	assert.Contains(t, output, "rpc Chat", "Chat (bindings-only method) must be present in addition to SayHello")
+
+	// Prove gateway precedence at method granularity: SayHello must render
+	// unary (gateway's definition), while Chat (bindings-only, no gateway
+	// counterpart) keeps its streaming keyword.
+	sayHello := extractRPCSignature(t, output, "SayHello")
+	assert.NotContains(t, sayHello, "stream", "SayHello must keep the GATEWAY's unary definition, not bindings' conflicting streaming one")
+
+	chat := extractRPCSignature(t, output, "Chat")
+	assert.Contains(t, chat, "stream", "Chat (bindings-only) must carry its streaming keyword")
+}
+
+// extractRPCSignature returns the `rpc <method>(...) returns (...)` signature
+// text for method from a rendered .proto, so a test can assert on the
+// presence/absence of the `stream` keyword scoped to one specific method
+// (rather than anywhere in the file).
+func extractRPCSignature(t *testing.T, output, method string) string {
+	t.Helper()
+	re := regexp.MustCompile(`(?s)rpc\s+` + regexp.QuoteMeta(method) + `\s*\([^)]*\)\s*returns\s*\([^)]*\)`)
+	m := re.FindString(output)
+	require.NotEmpty(t, m, "rpc %s signature not found in output:\n%s", method, output)
+	return m
+}
+
+// ---------------------------------------------------------------------------
 // unionRecoveredServices unit tests (T-coverage: dedup-by-FQN + reflection-drop)
 // ---------------------------------------------------------------------------
 
-// TestUnionRecoveredServices_DedupesByFQN verifies that when two endpoints
-// carry the same service FQN, only the first occurrence is kept (first wins).
-func TestUnionRecoveredServices_DedupesByFQN(t *testing.T) {
+// TestUnionRecoveredServices_MergesMethodsAcrossSameFQN verifies that when two
+// endpoints carry the same service FQN, the union keeps BOTH endpoints'
+// distinctly-named methods (method-level union), and that on a method NAME
+// collision the first (higher-precedence) endpoint's method definition wins
+// rather than the later one's.
+func TestUnionRecoveredServices_MergesMethodsAcrossSameFQN(t *testing.T) {
 	ep1 := classify.ClassifiedRequest{
 		APIType: "grpc",
 		GRPCSchema: &classify.GRPCReflectionResult{
 			Services: []classify.GRPCService{
-				{Name: "pkg.Alpha", Methods: []classify.GRPCMethod{{Name: "M1"}}},
+				{Name: "pkg.Alpha", Methods: []classify.GRPCMethod{
+					{Name: "M1", InputType: "M1Request"},
+				}},
 			},
 		},
 	}
@@ -352,14 +436,21 @@ func TestUnionRecoveredServices_DedupesByFQN(t *testing.T) {
 		APIType: "grpc",
 		GRPCSchema: &classify.GRPCReflectionResult{
 			Services: []classify.GRPCService{
-				{Name: "pkg.Alpha", Methods: []classify.GRPCMethod{{Name: "M2"}}}, // duplicate FQN
+				{Name: "pkg.Alpha", Methods: []classify.GRPCMethod{
+					// Same method NAME as ep1's M1, but a DIFFERENT definition
+					// (different InputType, and streaming where ep1's is not).
+					// The merge must keep ep1's (first/higher-precedence) M1,
+					// not this one.
+					{Name: "M1", InputType: "M1RequestStream", ClientStreaming: true},
+					{Name: "M2"}, // new method name: must be added
+				}},
 				{Name: "pkg.Beta", Methods: []classify.GRPCMethod{{Name: "M3"}}},
 			},
 		},
 	}
 
 	result := unionRecoveredServices([]classify.ClassifiedRequest{ep1, ep2}, nil)
-	require.Len(t, result, 2, "should have Alpha (deduped) and Beta")
+	require.Len(t, result, 2, "should have Alpha (method-unioned) and Beta")
 
 	var names []string
 	for _, s := range result {
@@ -367,12 +458,25 @@ func TestUnionRecoveredServices_DedupesByFQN(t *testing.T) {
 	}
 	assert.Contains(t, names, "pkg.Alpha")
 	assert.Contains(t, names, "pkg.Beta")
-	// Alpha from ep1 wins (M1 kept, M2 dropped).
+
 	for _, s := range result {
-		if s.Name == "pkg.Alpha" {
-			require.Len(t, s.Methods, 1)
-			assert.Equal(t, "M1", s.Methods[0].Name, "first-occurrence methods win on FQN tie")
+		if s.Name != "pkg.Alpha" {
+			continue
 		}
+		require.Len(t, s.Methods, 2, "Alpha must contain both M1 and M2 (method union, not whole-service drop)")
+
+		var methodNames []string
+		byName := map[string]classify.GRPCMethod{}
+		for _, m := range s.Methods {
+			methodNames = append(methodNames, m.Name)
+			byName[m.Name] = m
+		}
+		assert.Contains(t, methodNames, "M1")
+		assert.Contains(t, methodNames, "M2", "M2 (new method name from ep2) must be added")
+
+		m1 := byName["M1"]
+		assert.Equal(t, "M1Request", m1.InputType, "merged Alpha.M1 must keep ep1's (first/higher-precedence) definition")
+		assert.False(t, m1.ClientStreaming, "merged Alpha.M1 must not pick up ep2's streaming flag")
 	}
 }
 

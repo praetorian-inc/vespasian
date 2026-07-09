@@ -58,9 +58,10 @@ func (g *Generator) DefaultExtension() string {
 // descriptors (endpoints carrying FileDescriptors) are merged first; the
 // service FQNs they define are recorded. Name-only techniques (grpc-gateway,
 // gRPC-Web bindings) contribute GRPCSchema.Services across all endpoints; their
-// union is deduped by FQN, FQNs already covered by reflection are dropped, and
-// the remainder is synthesized into descriptors in one pass. The combined set
-// is rendered via protoprint.
+// union merges methods per service FQN (higher-precedence endpoints seen first
+// win each method definition), FQNs already covered by reflection are dropped,
+// and the remainder is synthesized into descriptors in one pass. The combined
+// set is rendered via protoprint.
 func (g *Generator) Generate(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 	if len(endpoints) == 0 {
 		return nil, errors.New("no endpoints provided")
@@ -142,14 +143,17 @@ func enforceDescriptorCaps(merged map[string][]byte) error {
 
 // mergeRecoveredServices parses the merged reflection descriptors to collect the
 // service and message FQNs they already define, unions the name-only recovered
-// Services across all endpoints (deduped by FQN with reflection-covered FQNs
+// Services across all endpoints at method granularity (reflection-covered FQNs
 // dropped), synthesizes the remainder in a single pass, and merges the synthetic
 // descriptors into merged.
 //
 // Reflection-defined FQNs are collected so name-only techniques never
 // re-synthesize (and re-declare) the same service or message in a separate
-// synthetic file — that would be a duplicate symbol. Services are deduped by
-// dropping covered FQNs entirely; messages are deduped by importing the
+// synthetic file — that would be a duplicate symbol. Reflection-covered service
+// FQNs are dropped entirely (not augmented with synthetic methods); the
+// remaining name-only FQNs are method-unioned across endpoints so a service
+// only partially covered by one name-only technique still surfaces methods a
+// lower-precedence technique recovered. Messages are deduped by importing the
 // reflection file that declares them instead of emitting a duplicate stub.
 // Synthetic filenames are namespaced (synthetic.proto) and cannot key-collide
 // with reflection filenames.
@@ -212,13 +216,28 @@ func reflectedMessageFQNs(fds map[string]*desc.FileDescriptor) map[string]string
 	return out
 }
 
-// unionRecoveredServices collects Services across all endpoints, dedupes by FQN
-// (first occurrence in endpoint order wins), and drops any FQN already defined
-// by the reflection descriptors. Methods are not merged across duplicate FQNs:
-// the first service definition for an FQN is kept (gateway/bindings methods for
-// the same FQN are name-only duplicates).
+// unionRecoveredServices collects Services across all endpoints and unions them
+// at METHOD granularity per service FQN. An FQN already defined by the
+// reflection descriptors is dropped entirely: reflection is authoritative and
+// its real FileDescriptors are never augmented with synthetic method stubs, so
+// the union applies only to the name-only (grpc-gateway + gRPC-Web bindings)
+// path.
+//
+// For a name-only FQN, the first endpoint that carries it establishes the
+// service and its method set; a later endpoint carrying the same FQN
+// contributes only the methods whose Name is not already present — the
+// first-seen definition of a method wins. Endpoint iteration order places
+// higher-precedence gateway-probed endpoints before the appended
+// lower-precedence bindings endpoint, so a method the gateway transcoded keeps
+// the gateway's definition while bindings-only methods (e.g. client-streaming
+// or bidi RPCs the gateway cannot transcode) are added rather than dropped.
+//
+// Method order within a merged service is first-seen and therefore
+// deterministic given deterministic endpoint order (protoprint additionally
+// sorts elements on output).
 func unionRecoveredServices(endpoints []classify.ClassifiedRequest, reflectedFQNs map[string]bool) []classify.GRPCService {
-	seen := map[string]bool{}
+	index := map[string]int{}                  // FQN -> position in out
+	methodSeen := map[string]map[string]bool{} // FQN -> set of method names already present
 	var out []classify.GRPCService
 	for _, ep := range endpoints {
 		if ep.GRPCSchema == nil {
@@ -226,14 +245,51 @@ func unionRecoveredServices(endpoints []classify.ClassifiedRequest, reflectedFQN
 		}
 		for _, svc := range ep.GRPCSchema.Services {
 			fqn := strings.TrimPrefix(svc.Name, ".")
-			if reflectedFQNs[fqn] || seen[fqn] {
+			if reflectedFQNs[fqn] {
 				continue
 			}
-			seen[fqn] = true
-			out = append(out, svc)
+			pos, ok := index[fqn]
+			if !ok {
+				index[fqn] = len(out)
+				out = append(out, copyServiceWithMethods(svc))
+				methodSeen[fqn] = methodNameSet(svc.Methods)
+				continue
+			}
+			// Repeat FQN: merge in only the methods not already present.
+			out[pos].Methods = mergeNewMethods(out[pos].Methods, methodSeen[fqn], svc.Methods)
 		}
 	}
 	return out
+}
+
+// copyServiceWithMethods returns a copy of svc that owns its own Methods slice,
+// so later in-place method merges never mutate the caller's backing array.
+func copyServiceWithMethods(svc classify.GRPCService) classify.GRPCService {
+	svc.Methods = append([]classify.GRPCMethod(nil), svc.Methods...)
+	return svc
+}
+
+// methodNameSet returns the set of method names present in methods.
+func methodNameSet(methods []classify.GRPCMethod) map[string]bool {
+	seen := make(map[string]bool, len(methods))
+	for _, m := range methods {
+		seen[m.Name] = true
+	}
+	return seen
+}
+
+// mergeNewMethods appends every method from extra whose Name is not yet in seen
+// to dst, recording newly added names in seen. Methods whose name is already
+// present are skipped (first-seen, higher-precedence definition wins).
+func mergeNewMethods(dst []classify.GRPCMethod, seen map[string]bool, extra []classify.GRPCMethod) []classify.GRPCMethod {
+	for _, m := range extra {
+		if seen[m.Name] {
+			continue
+		}
+		seen[m.Name] = true
+		dst = append(dst, m)
+	}
+	return dst
 }
 
 // renderProto reconstructs the descriptor graph from wire bytes and emits
