@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 jobs:
-  # Gate: skip PR runs unless the 'live-tests' label is present.
+  # Gate: run by default; skip PR runs only when 'skip-live-tests' label is present.
   # Push-to-main and workflow_dispatch always run.
   check-label:
     runs-on: ubuntu-24.04
@@ -28,11 +28,11 @@ jobs:
         run: |
           if [[ "${{ github.event_name }}" != "pull_request" ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ contains(github.event.pull_request.labels.*.name, 'live-tests') }}" == "true" ]]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
+          elif [[ "${{ contains(github.event.pull_request.labels.*.name, 'skip-live-tests') }}" == "true" ]]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Skipping live tests — add the 'live-tests' label to run them on this PR."
+            echo "::notice::Skipping live tests — 'skip-live-tests' label is present."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
   # Offline tests: imports, deterministic generates, classifier/spec edge cases.
