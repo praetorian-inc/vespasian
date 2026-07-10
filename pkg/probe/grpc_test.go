@@ -602,6 +602,56 @@ func TestGRPCProbe_Probe_MaxEndpointsRespected(t *testing.T) {
 	assert.LessOrEqual(t, int(dialCount.Load()), 2, "at most 2 reflection dials should occur when MaxEndpoints=2")
 }
 
+// TestGRPCProbe_Probe_AggregateDescriptorBudgetStopsTargets verifies the
+// GLOBAL aggregate descriptor budget (Config.MaxTotalReflectionDescriptorBytes)
+// in Probe: after probing each target, retained descriptor bytes accumulate
+// into totalRetained, and once totalRetained crosses the configured ceiling,
+// Probe stops dialing SUBSEQUENT targets. The target that crosses the
+// threshold is still retained (the break happens after storing its schema),
+// so with MaxTotalReflectionDescriptorBytes=1, server A's descriptors (>0
+// bytes) trip the budget but A's own schema is kept; server B is never dialed.
+func TestGRPCProbe_Probe_AggregateDescriptorBudgetStopsTargets(t *testing.T) {
+	addrA, stopA := startTestGRPCServer(t)
+	defer stopA()
+	addrB, stopB := startTestGRPCServer(t)
+	defer stopB()
+
+	var dialCount atomic.Int32
+	countingDialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialCount.Add(1)
+		return loopbackDialer(ctx, network, addr)
+	}
+
+	cfg := Config{
+		Timeout:                           5 * time.Second,
+		URLValidator:                      func(string) error { return nil },
+		Dialer:                            countingDialer,
+		MaxTotalReflectionDescriptorBytes: 1, // trip the aggregate budget after the first target
+	}
+	probe := NewGRPCProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{APIType: "grpc"},
+		{APIType: "grpc"},
+	}
+	endpoints[0].URL = "http://" + addrA + "/grpc.health.v1.Health/Check"
+	endpoints[1].URL = "http://" + addrB + "/grpc.health.v1.Health/Check"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := probe.Probe(ctx, endpoints)
+	require.NoError(t, err)
+	require.Len(t, result, 2)
+
+	require.NotNil(t, result[0].GRPCSchema, "first target crosses the aggregate budget but must still be retained before the break")
+	assert.True(t, result[0].GRPCSchema.ReflectionEnabled, "first target's reflection result must be enabled")
+
+	assert.Nil(t, result[1].GRPCSchema, "second target must never be probed once the aggregate budget is exhausted")
+
+	assert.Equal(t, int32(1), dialCount.Load(), "exactly one target (server A) should be dialed; server B must never be dialed")
+}
+
 // TestGRPCProbe_Probe_TLSVerifiedByDefault verifies that a gRPC server
 // presenting a self-signed certificate is NOT enumerated when
 // GRPCInsecureSkipVerify is left at its default (false). The TLS handshake

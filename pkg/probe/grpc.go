@@ -86,6 +86,7 @@ func (p *GRPCProbe) Probe(ctx context.Context, endpoints []classify.ClassifiedRe
 	// reflection probe result.
 	schemasByTarget := make(map[grpcTargetInfo]*classify.GRPCReflectionResult)
 	seen := make(map[grpcTargetInfo]bool)
+	totalRetained := 0
 
 	for _, ep := range endpoints {
 		if ep.APIType != "grpc" {
@@ -104,7 +105,14 @@ func (p *GRPCProbe) Probe(ctx context.Context, endpoints []classify.ClassifiedRe
 		}
 		seen[target] = true
 
-		schemasByTarget[target] = p.probeTarget(ctx, target)
+		res := p.probeTarget(ctx, target)
+		schemasByTarget[target] = res
+		totalRetained += reflectionRetainedBytes(res)
+		if totalRetained >= p.config.MaxTotalReflectionDescriptorBytes {
+			slog.DebugContext(ctx, "grpc probe: aggregate descriptor budget exhausted; stopping target enumeration",
+				"targets_probed", len(seen), "retained_bytes", totalRetained)
+			break
+		}
 	}
 
 	// Copy endpoints to avoid mutating the caller's slice.
@@ -360,4 +368,20 @@ func extractService(fd *desc.FileDescriptor, fqn string) (classify.GRPCService, 
 		return gs, true
 	}
 	return classify.GRPCService{}, false
+}
+
+// reflectionRetainedBytes returns the total serialized descriptor bytes a
+// reflection result retains (0 for a nil result or a result without
+// descriptors — e.g. reflection-unavailable or unreachable targets, which
+// therefore never advance the aggregate budget). Used by Probe to enforce
+// Config.MaxTotalReflectionDescriptorBytes across targets.
+func reflectionRetainedBytes(r *classify.GRPCReflectionResult) int {
+	if r == nil {
+		return 0
+	}
+	total := 0
+	for _, b := range r.FileDescriptors {
+		total += len(b)
+	}
+	return total
 }
