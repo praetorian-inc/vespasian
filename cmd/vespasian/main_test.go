@@ -927,6 +927,70 @@ func TestDangerousAllowPrivate_ScanCmd(t *testing.T) {
 	}
 }
 
+// TestGRPCInsecureSkipVerify_Embedded pins that GenerateCmd and ScanCmd both
+// expose the GRPCInsecureSkipVerify kong field, catching a field removal or
+// rename on either struct. It does NOT exercise Run() and cannot catch a
+// dropped assignment of the field into pipeline.Options inside Run() (see
+// main.go:541 and main.go:669) — that semantic wiring is covered by
+// internal/pipeline's TestClassifyProbeGenerate_GRPCInsecureSkipVerify.
+func TestGRPCInsecureSkipVerify_Embedded(t *testing.T) {
+	g := &GenerateCmd{GRPCInsecureSkipVerify: true}
+	require.True(t, g.GRPCInsecureSkipVerify)
+
+	gDefault := &GenerateCmd{}
+	require.False(t, gDefault.GRPCInsecureSkipVerify)
+
+	s := &ScanCmd{GRPCInsecureSkipVerify: true}
+	require.True(t, s.GRPCInsecureSkipVerify)
+
+	sDefault := &ScanCmd{}
+	require.False(t, sDefault.GRPCInsecureSkipVerify)
+}
+
+// TestGRPCInsecureSkipVerify_GenerateCmd is a smoke test proving
+// GenerateCmd.Run() accepts GRPCInsecureSkipVerify without erroring on a
+// non-gRPC (REST) capture. It does NOT prove the flag is forwarded into
+// pipeline.Options inside Run() — a REST capture never reaches the gRPC
+// probe path that consumes it, and pipeline.Options is built inline with no
+// inspectable seam. That semantic behavior is covered by internal/pipeline's
+// TestClassifyProbeGenerate_GRPCInsecureSkipVerify.
+func TestGRPCInsecureSkipVerify_GenerateCmd(t *testing.T) {
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/api/users",
+			Headers: map[string]string{
+				"Content-Type": "application/json",
+			},
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+			},
+		},
+	}
+
+	capturePath := filepath.Join(t.TempDir(), "capture.json")
+	f, err := os.Create(capturePath) //nolint:gosec // G304: test file
+	if err != nil {
+		t.Fatalf("failed to create temp capture file: %v", err)
+	}
+	if writeErr := crawl.WriteCapture(f, requests); writeErr != nil {
+		_ = f.Close()
+		t.Fatalf("failed to write capture: %v", writeErr)
+	}
+	_ = f.Close()
+
+	cmd := &GenerateCmd{
+		APIType:                "rest",
+		Capture:                capturePath,
+		Probe:                  true,
+		GRPCInsecureSkipVerify: true,
+	}
+	if err := cmd.Run(); err != nil {
+		t.Errorf("GenerateCmd.Run() with GRPCInsecureSkipVerify unexpected error: %v", err)
+	}
+}
+
 // TestDangerousAllowPrivate_SameOutputForPublicURLs verifies that allowPrivate=true
 // and allowPrivate=false produce identical specs when all targets are public.
 func TestDangerousAllowPrivate_SameOutputForPublicURLs(t *testing.T) {
