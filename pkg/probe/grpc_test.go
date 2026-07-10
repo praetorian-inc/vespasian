@@ -652,6 +652,67 @@ func TestGRPCProbe_Probe_AggregateDescriptorBudgetStopsTargets(t *testing.T) {
 	assert.Equal(t, int32(1), dialCount.Load(), "exactly one target (server A) should be dialed; server B must never be dialed")
 }
 
+// TestGRPCProbe_Probe_ZeroByteTargetDoesNotAdvanceBudget pins the complementary
+// invariant to TestGRPCProbe_Probe_AggregateDescriptorBudgetStopsTargets: a nil
+// / reflection-unavailable / unreachable target retains 0 descriptor bytes
+// (reflectionRetainedBytes(nil) == 0) and therefore must NOT advance
+// totalRetained in Probe. The first endpoint targets an unreachable (closed)
+// port — probeTarget returns nil for it — so it must not trip the aggregate
+// budget and prematurely stop probing of the second, legitimate endpoint. If
+// reflectionRetainedBytes(nil) wrongly returned a large value instead of 0,
+// totalRetained would already be >= the budget after endpoint[0], the break
+// would fire, and endpoint[1] would never be dialed — failing assertion #2
+// below.
+func TestGRPCProbe_Probe_ZeroByteTargetDoesNotAdvanceBudget(t *testing.T) {
+	// endpoint[0]: bind then immediately close a loopback listener to obtain a
+	// routable but guaranteed-closed port (nothing listening) — mirrors
+	// TestGRPCProbe_Probe_NilSchemaOnUnreachableTarget.
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	unreachableAddr := lis.Addr().String()
+	require.NoError(t, lis.Close())
+
+	// endpoint[1]: a real in-process reflection server, which retains >0
+	// descriptor bytes once probed.
+	reachableAddr, stop := startTestGRPCServer(t)
+	defer stop()
+
+	var dialCount atomic.Int32
+	countingDialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialCount.Add(1)
+		return loopbackDialer(ctx, network, addr)
+	}
+
+	cfg := Config{
+		Timeout:                           5 * time.Second,
+		URLValidator:                      func(string) error { return nil },
+		Dialer:                            countingDialer,
+		MaxTotalReflectionDescriptorBytes: 1, // deliberately tiny — trips as soon as ANY bytes are retained
+	}
+	probe := NewGRPCProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{APIType: "grpc"},
+		{APIType: "grpc"},
+	}
+	endpoints[0].URL = "http://" + unreachableAddr + "/lab.v1.UserService/GetUser"
+	endpoints[1].URL = "http://" + reachableAddr + "/grpc.health.v1.Health/Check"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := probe.Probe(ctx, endpoints)
+	require.NoError(t, err)
+	require.Len(t, result, 2)
+
+	assert.Nil(t, result[0].GRPCSchema, "unreachable first target must yield a nil schema")
+
+	require.NotNil(t, result[1].GRPCSchema, "the 0-byte first target must not advance the aggregate budget, so the second target must still be probed")
+	assert.True(t, result[1].GRPCSchema.ReflectionEnabled, "second target's reflection result must be enabled")
+
+	assert.Equal(t, int32(2), dialCount.Load(), "both targets should be dialed: the closed port (fails) and the real server (succeeds)")
+}
+
 // TestGRPCProbe_Probe_TLSVerifiedByDefault verifies that a gRPC server
 // presenting a self-signed certificate is NOT enumerated when
 // GRPCInsecureSkipVerify is left at its default (false). The TLS handshake
