@@ -68,10 +68,28 @@ type Config struct {
 	// means use the package default (maxGRPCDescriptorBytes). Overridable
 	// primarily for tests.
 	MaxReflectionDescriptorBytes int
+
+	// MaxTotalReflectionDescriptorBytes caps the AGGREGATE retained descriptor
+	// bytes summed across ALL probed targets. Once cumulative retained bytes reach
+	// this ceiling, Probe stops dialing further targets — bounding total memory
+	// even when many distinct hostile targets each stay under the per-target cap.
+	// Zero means use the package default (DefaultMaxTotalReflectionDescriptorBytes).
+	// Overridable primarily for tests.
+	MaxTotalReflectionDescriptorBytes int
 }
 
 // DefaultMaxEndpoints is the default limit on unique URLs probed per strategy.
 const DefaultMaxEndpoints = 500
+
+// DefaultMaxTotalReflectionDescriptorBytes is the default aggregate cross-target
+// retained-descriptor budget. Set to a small multiple (4x) of the per-target
+// maxGRPCDescriptorBytes cap (= 256 MiB), so worst-case retained memory is
+// bounded to ~256 MiB (plus at most one in-flight target's ≤64 MiB, since the
+// target that crosses the threshold is fully retained before Probe breaks),
+// versus the unbounded ~32 GiB (MaxEndpoints × 64 MiB) without this ceiling.
+// Generous enough not to affect real scans (typical targets retain KB),
+// aggressive enough to stop a pathological many-hostile-target capture.
+const DefaultMaxTotalReflectionDescriptorBytes = 4 * maxGRPCDescriptorBytes
 
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
@@ -117,6 +135,9 @@ func (cfg Config) withDefaults() Config {
 	}
 	if cfg.MaxReflectionDescriptorBytes == 0 {
 		cfg.MaxReflectionDescriptorBytes = maxGRPCDescriptorBytes
+	}
+	if cfg.MaxTotalReflectionDescriptorBytes == 0 {
+		cfg.MaxTotalReflectionDescriptorBytes = DefaultMaxTotalReflectionDescriptorBytes
 	}
 	if cfg.Client == nil {
 		cfg.Client = &http.Client{
