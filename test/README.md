@@ -237,7 +237,7 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 All 26 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest); the durations below are representative, not exact.
 
-```
+```text
   TARGET                      STATUS    ENDPOINTS   EXPECTED   DURATION
   --------------------------  --------  ----------  ---------  --------
   classifier-edge             PASS      -           -          0s
@@ -349,9 +349,9 @@ test/
 ```
 
 > **Reading the `expected-*-capture.json` fixtures:** the `query_params` field is
-> multi-value (`map[string][]string`) since LAB-2110, so every value is a JSON
+> multi-value (`map[string][]string`) from LAB-2110 onward, so every value is a JSON
 > array — e.g. `"sort": ["price", "name"]` and single-value params as
-> `"category": ["electronics"]`. Capture files from versions ≤ LAB-2110 used the
+> `"category": ["electronics"]`. Capture files produced before LAB-2110 used the
 > old single-value `map[string]string` shape and are not comparable byte-for-byte.
 
 ## Troubleshooting
