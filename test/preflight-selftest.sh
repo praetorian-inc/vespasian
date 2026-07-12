@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Copyright 2026 Praetorian Security, Inc.
+#
+# Regression self-test for the Chrome/Chromium preflight probe in
+# setup-live-targets.sh (LAB-3893). Plain bash, no test framework: creates
+# fake browser binaries, overrides CHROME_CANDIDATES, sources the setup
+# script (the BASH_SOURCE guard means main() does not run), then exercises
+# detect_chrome_binary against each scenario.
+#
+# Usage: bash test/preflight-selftest.sh
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SETUP_SCRIPT="${SCRIPT_DIR}/setup-live-targets.sh"
+
+pass_count=0
+fail_count=0
+
+assert_eq() {
+    local desc=$1 expected=$2 actual=$3
+    if [ "$expected" = "$actual" ]; then
+        echo "PASS: ${desc}"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: ${desc} (expected [${expected}], got [${actual}])"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+# ── Fixture setup ──────────────────────────────────────────────
+FIXTURE_DIR=$(mktemp -d)
+trap 'rm -rf "${FIXTURE_DIR}"' EXIT
+
+# A working "browser": prints a version string and exits 0.
+mkdir -p "${FIXTURE_DIR}/bin"
+WORKING_BROWSER="${FIXTURE_DIR}/bin/google-chrome"
+cat > "${WORKING_BROWSER}" <<'EOF'
+#!/usr/bin/env bash
+echo "Fake Chrome 999.0.0.0"
+exit 0
+EOF
+chmod +x "${WORKING_BROWSER}"
+
+# A snap-stub "browser": present, executable, but fails at runtime — path
+# contains /snap/ so it matches the snap-hint case in check_prerequisites.
+mkdir -p "${FIXTURE_DIR}/snap/bin"
+SNAP_STUB="${FIXTURE_DIR}/snap/bin/chromium-browser"
+cat > "${SNAP_STUB}" <<'EOF'
+#!/usr/bin/env bash
+echo "chromium-browser requires the chromium snap to be installed" >&2
+exit 1
+EOF
+chmod +x "${SNAP_STUB}"
+
+# NOTE: setup-live-targets.sh assigns CHROME_CANDIDATES unconditionally at
+# top level (not inside main()), so any override must happen AFTER sourcing
+# — sourcing first, then overriding, then calling detect_chrome_binary.
+
+# ── Case a: working browser present ────────────────────────────
+result=$(
+    (
+        # shellcheck source=setup-live-targets.sh
+        source "${SETUP_SCRIPT}"
+        # shellcheck disable=SC2034  # consumed by detect_chrome_binary from the sourced script
+        CHROME_CANDIDATES=("${WORKING_BROWSER}" "${SNAP_STUB}")
+        set +e
+        out=$(detect_chrome_binary)
+        rc=$?
+        printf '%s\n%s\n' "${rc}" "${out}"
+    )
+)
+rc_a=$(echo "${result}" | sed -n '1p')
+out_a=$(echo "${result}" | sed -n '2p')
+assert_eq "case a: working browser exit code is 0" "0" "${rc_a}"
+assert_eq "case a: working browser path echoed" "${WORKING_BROWSER}" "${out_a}"
+
+# ── Case b: only a snap-stub present ───────────────────────────
+result=$(
+    (
+        # shellcheck source=setup-live-targets.sh
+        source "${SETUP_SCRIPT}"
+        # shellcheck disable=SC2034  # consumed by detect_chrome_binary from the sourced script
+        CHROME_CANDIDATES=("${SNAP_STUB}")
+        set +e
+        out=$(detect_chrome_binary)
+        rc=$?
+        printf '%s\n%s\n' "${rc}" "${out}"
+    )
+)
+rc_b=$(echo "${result}" | sed -n '1p')
+out_b=$(echo "${result}" | sed -n '2p')
+assert_eq "case b: snap-stub exit code is 2" "2" "${rc_b}"
+assert_eq "case b: snap-stub path echoed" "${SNAP_STUB}" "${out_b}"
+
+# case b (continued): assert the stub path matches the snap-hint pattern
+# used by check_prerequisites' case statement, so message selection is
+# covered without duplicating check_prerequisites' full log output.
+case "${out_b}" in
+    */snap/*|*/chromium-browser|*/chromium)
+        echo "PASS: case b: stub path matches snap-hint case pattern"
+        pass_count=$((pass_count + 1))
+        ;;
+    *)
+        echo "FAIL: case b: stub path does NOT match snap-hint case pattern"
+        fail_count=$((fail_count + 1))
+        ;;
+esac
+
+# ── Case c: nothing runnable (all candidates missing) ──────────
+result=$(
+    (
+        # shellcheck source=setup-live-targets.sh
+        source "${SETUP_SCRIPT}"
+        # shellcheck disable=SC2034  # consumed by detect_chrome_binary from the sourced script
+        CHROME_CANDIDATES=("${FIXTURE_DIR}/bin/does-not-exist" "${FIXTURE_DIR}/nope")
+        set +e
+        out=$(detect_chrome_binary)
+        rc=$?
+        printf '%s\n%s\n' "${rc}" "${out}"
+    )
+)
+rc_c=$(echo "${result}" | sed -n '1p')
+out_c=$(echo "${result}" | sed -n '2p')
+assert_eq "case c: nothing found exit code is 1" "1" "${rc_c}"
+assert_eq "case c: nothing found stdout is empty" "" "${out_c}"
+
+# ── Summary ─────────────────────────────────────────────────────
+echo ""
+echo "preflight-selftest: ${pass_count} passed, ${fail_count} failed"
+[ "${fail_count}" -eq 0 ]

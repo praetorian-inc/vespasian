@@ -333,6 +333,20 @@ sudo apt install chromium-browser
 brew install --cask google-chrome
 ```
 
+**Found but not runnable:** on recent Ubuntu / WSL2 (and many CI base images),
+`/usr/bin/chromium-browser` is a snap *stub* — a launcher that satisfies
+`command -v` / `-x` but fails at runtime with "requires the chromium snap to
+be installed". `setup-live-targets.sh` probes each candidate binary with
+`--version` before accepting it, so this now fails preflight with `Found
+<path> but it is not runnable` instead of failing later during `vespasian
+crawl`. Fix with `snap install chromium`, or install `google-chrome` instead.
+
+**macOS note:** the runnability probe uses `timeout` (falling back to
+`gtimeout` from Homebrew coreutils) to guard against a hanging binary. Stock
+macOS ships neither, so on an unpatched macOS install the probe runs without a
+timeout — a binary that hangs on `--version` would block preflight rather
+than failing fast.
+
 ### Crawl produces empty capture
 
 Ensure the target service is running and healthy. Run the check from the host that started the services (`setup-live-targets.sh` binds to localhost there):

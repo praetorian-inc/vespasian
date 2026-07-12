@@ -16,6 +16,23 @@ permissions:
   contents: read
 
 jobs:
+  # Regression self-test for the preflight Chrome/Chromium detection logic
+  # (LAB-3893). Not label-gated — runs on every push/PR so the harness's own
+  # bash logic is validated even when the live-tests label isn't applied.
+  preflight-selftest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Syntax check
+        run: bash -n test/setup-live-targets.sh
+
+      - name: Run preflight self-test
+        run: bash test/preflight-selftest.sh
+
   # Gate: skip PR runs unless the 'live-tests' label is present.
   # Push-to-main and workflow_dispatch always run.
   check-label:
