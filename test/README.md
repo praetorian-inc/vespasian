@@ -30,6 +30,7 @@ End-to-end live tests that spin up intentionally simple target applications, run
 | soap-service | SOAP/WSDL | Custom SOAP service with GetUser, ListUsers, CreateUser | Go binary |
 | graphql-server | GraphQL | Apollo Server with queries, mutations, enums, unions, nested types | Node.js |
 | grpc-server | gRPC | Three reflectable gRPC services (UserService, OrderService, AccountService) | Go binary |
+| concat-spa | REST | SPA whose two API paths exist only as JS string concatenations in an external bundle — reachable only by the post-crawl JS-replay concat extractor (LAB-1368) | Go binary |
 
 ## What the Test Runner Does
 
@@ -44,6 +45,12 @@ For each target:
 7. **Print summary** — Pass/fail status with endpoint counts and durations
 
 > **Why `--dangerous-allow-private`?** All live targets run on `localhost`, which the crawler's SSRF gate treats as a private host. The flag is required on every `vespasian crawl` invocation in this suite; running without it will exit non-zero with `seed URL rejected by frontier ...`. The flag name reflects production-risk semantics — pass it only when you intend to crawl a known-private host (e.g., this suite, or an internal-network assessment).
+
+For the concatenated-URL SPA test (`concat-spa`, live crawl):
+
+1. **Crawl** the SPA whose two API endpoints (`/api/users/{id}/orders`, `/api/products/{id}/reviews`) appear only as `String.prototype.concat` / `+`-string expressions inside an external JS bundle — never as href links or plain string literals
+2. **Reconstruct** the paths via the post-crawl JS-replay concat extractor (Strategy 5) and probe them (LAB-1368)
+3. **Assert** exactly `total_paths` (2) paths are recovered; the receiver literals and the never-referenced control path (`/api/missing/0/gone`, 404) must NOT appear
 
 For the GraphQL live test (`graphql-server`):
 
@@ -83,7 +90,7 @@ For importer tests:
 
 Options:
   --targets <list>   Comma-separated targets (default: all)
-                     Valid: rest-api,soap-service,graphql-server,grpc-server
+                     Valid: rest-api,soap-service,graphql-server,grpc-server,concat-spa
   --skip-start       Only build, don't start services
   --teardown         Stop all running targets and clean up
   --help             Show this help message
@@ -98,7 +105,7 @@ Options:
   --targets <list>      Comma-separated targets to test (default: all)
                         Valid targets:
                           Live:       rest-api, soap-service, graphql-server,
-                                      grpc-server
+                                      grpc-server, concat-spa
                           Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,
                                       generate-graphql, generate-graphql-imports,
                                       generate-js-static, generate-merge-slugs
@@ -139,7 +146,8 @@ REST_API_PORT=8990
 SOAP_SERVICE_PORT=8991
 GRAPHQL_SERVER_PORT=8992
 GRPC_SERVER_PORT=50051
-TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server
+CONCAT_SPA_PORT=8993
+TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server,concat-spa
 ```
 
 ### Default Ports
@@ -150,6 +158,7 @@ TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server
 | soap-service | 8991 |
 | graphql-server | 8992 |
 | grpc-server | 50051 |
+| concat-spa | 8993 |
 
 Ports are auto-resolved if the default is in use (searches up to 20 ports ahead).
 
@@ -169,6 +178,12 @@ Results are saved to `test/.results/` with one subdirectory per test:
 ├── graphql-server/
 │   ├── capture.json        # Live GraphQL traffic
 │   └── spec.graphql        # Generated GraphQL SDL
+├── grpc-server/
+│   ├── capture.json        # Synthetic capture seeding the reflection probe
+│   └── spec.proto          # Generated proto3 (.proto) from reflection
+├── concat-spa/
+│   ├── capture.json        # Crawl output (JS-replay concat extraction)
+│   └── spec.yaml           # OpenAPI spec (2 concat-derived paths)
 ├── generate-rest/
 │   └── spec.yaml           # OpenAPI spec from reference capture
 ├── generate-wsdl/
@@ -220,12 +235,13 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 ## Expected Results
 
-All 23 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest).
+All 26 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest); the durations below are representative, not exact.
 
 ```
   TARGET                      STATUS    ENDPOINTS   EXPECTED   DURATION
   --------------------------  --------  ----------  ---------  --------
   classifier-edge             PASS      -           -          0s
+  concat-spa                  PASS      2           2          45s
   crawl-depth                 PASS      -           -          188s
   crawl-unreachable           PASS      0           0          39s
   edge-cases                  PASS      -           -          193s
@@ -233,8 +249,9 @@ All 23 tests should pass. Order is non-deterministic and durations vary by machi
   generate-graphql-imports    PASS      2           2          0s
   generate-js-static          PASS      3           3          1s
   generate-merge-slugs        PASS      3           3          0s
-  generate-rest               PASS      8           8          0s
+  generate-rest               PASS      10          10         0s
   generate-wsdl               PASS      3           3          1s
+  generate-wsdl-matrix        PASS      3           3          1s
   graphql-server              PASS      8           8          1s
   grpc-server                 PASS      3           3          1s
   import-base64               PASS      2           2          0s
@@ -246,12 +263,19 @@ All 23 tests should pass. Order is non-deterministic and durations vary by machi
   import-mitmproxy            PASS      3           3          0s
   import-mitmproxy-native     PASS      3           3          1s
   import-unicode              PASS      3           3          0s
-  rest-api                    PASS      8           8          79s
+  rest-api                    PASS      10          10         79s
   soap-service                PASS      3           3          51s
   spec-edge                   PASS      -           -          0s
 
-  Total: 23 passed, 0 failed, 0 skipped
+  Total: 26 passed, 0 failed, 0 skipped
 ```
+
+> The `rest-api` and `generate-rest` targets expect **10** paths: the eight GET
+> endpoints plus the two JS-`fetch`-driven form POSTs `/api/login`
+> (`application/x-www-form-urlencoded`) and `/api/upload` (`multipart/form-data`),
+> added with form-body parameter parsing (LAB-2106) and HTML-form extraction
+> (LAB-2109). The count lives in `rest-api/expected-paths.json`
+> (`total_paths: 10`).
 
 Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are informational and do not cause failures.
 
@@ -273,6 +297,11 @@ test/
 ├── soap-service/
 │   ├── main.go              # SOAP service server
 │   ├── service.wsdl         # WSDL definition
+│   ├── reference-capture.json    # Fixed capture for generate-wsdl
+│   ├── expected-spec.xml         # Expected WSDL for generate-wsdl
+│   ├── matrix-capture.json       # Param-extraction matrix capture (SOAP 1.1/1.2, RPC + doc/literal)
+│   ├── matrix-expected-paths.json  # Expected ops for generate-wsdl-matrix
+│   ├── matrix-expected-spec.xml    # Expected WSDL for generate-wsdl-matrix
 │   └── expected-paths.json  # Expected operations for validation
 │
 ├── graphql-server/
@@ -286,7 +315,16 @@ test/
 │
 ├── grpc-server/
 │   ├── main.go              # gRPC server (UserService, OrderService, AccountService)
+│   ├── labpb/               # Generated protobuf/gRPC stubs
 │   └── expected-paths.json  # Expected services/methods for validation
+│
+├── concat-spa/
+│   ├── main.go              # SPA whose API paths exist only as JS string concatenations (LAB-1368)
+│   └── expected-paths.json  # Expected concat-derived paths for validation
+│
+├── js-static/
+│   ├── reference-capture.json  # HTML page + JS bundle for offline generate-js-static
+│   └── expected-paths.json  # Expected JS-bundle-derived paths
 │
 └── fixtures/
     ├── sample-burp-export.xml            # Burp XML (standard)
@@ -309,6 +347,12 @@ test/
     ├── expected-mitmproxy-capture.json   # Expected: mitmproxy capture
     └── expected-empty-capture.json       # Expected: empty capture
 ```
+
+> **Reading the `expected-*-capture.json` fixtures:** the `query_params` field is
+> multi-value (`map[string][]string`) since LAB-2110, so every value is a JSON
+> array — e.g. `"sort": ["price", "name"]` and single-value params as
+> `"category": ["electronics"]`. Capture files from versions ≤ LAB-2110 used the
+> old single-value `map[string]string` shape and are not comparable byte-for-byte.
 
 ## Troubleshooting
 
