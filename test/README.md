@@ -89,6 +89,24 @@ Options:
   --help             Show this help message
 ```
 
+The script is resilient to repeated runs: every started PID is recorded (per
+service, appended across runs), so `--teardown` kills **every** generation, not
+just the most recent. Running setup again without a teardown first detects and
+kills the stale processes from the previous run (logged as `Killing stale
+process …`) before starting fresh, so orphans never accumulate and exhaust the
+port range. If the pid logs are lost, teardown also sweeps orphans by executable
+name (Go targets) or listening port (the `node`-based graphql-server).
+
+Shortcut escape hatch for orphaned services:
+
+```bash
+make live-test-clean        # == ./test/setup-live-targets.sh --teardown
+```
+
+A regression test (`test/setup-live-targets_test.sh`) covers the
+teardown/sweep/port-exhaustion behavior with lightweight stand-ins and needs no
+live services — run it directly: `./test/setup-live-targets_test.sh`.
+
 ### run-live-tests.sh
 
 ```bash
@@ -314,7 +332,9 @@ test/
 
 ### Port conflicts
 
-If setup fails with port errors, use `--teardown` first, then retry:
+If setup fails with a "Cannot find available port" error, it now prints the
+processes holding the port window so you can see what to stop. Use `--teardown`
+(or `make live-test-clean`) first, then retry:
 
 ```bash
 ./test/setup-live-targets.sh --teardown

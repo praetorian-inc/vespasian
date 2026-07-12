@@ -6,7 +6,7 @@ GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 LDFLAGS   := -s -w -X main.version=$(VERSION) -X main.gitCommit=$(GIT_COMMIT) -X main.buildDate=$(BUILD_DATE)
 
-.PHONY: build test lint fmt vet check coverage clean deps
+.PHONY: build test lint fmt vet check coverage clean deps live-test-clean
 
 build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/vespasian
@@ -35,3 +35,8 @@ deps:
 
 clean:
 	rm -rf $(BUILD_DIR) dist coverage.out
+
+# Escape hatch for orphaned live-test services: stops every recorded generation
+# and sweeps any orphans left by a setup run that never tore down.
+live-test-clean:
+	./test/setup-live-targets.sh --teardown

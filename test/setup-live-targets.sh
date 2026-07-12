@@ -16,8 +16,14 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# SCRIPT_DIR may be pre-set by the regression test to isolate PID/state files in
+# a temp dir; default to the directory this script lives in.
+SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Services managed by this script. Kept in one place so teardown, stale-state
+# cleanup, and orphan sweeps all iterate the same set.
+MANAGED_SERVICES="rest-api soap-service graphql-server grpc-server concat-spa"
 CONFIG_FILE="${SCRIPT_DIR}/.live-test-config"
 
 # Default ports
@@ -59,6 +65,22 @@ find_available_port() {
         fi
     done
     echo "$port"
+}
+
+# Print the processes holding the port window [base, base+20] so an exhausted
+# range points the engineer straight at the offending orphans.
+show_port_holders() {
+    local base=$1
+    local end=$((base + 20))
+    log_info "Listening processes on TCP ${base}-${end}:"
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"${base}-${end}" -sTCP:LISTEN 2>/dev/null | sed 's/^/    /' || true
+    elif command -v ss >/dev/null 2>&1; then
+        ss -ltnH 2>/dev/null | awk -v b="$base" -v e="$end" \
+            '{ n = split($4, a, ":"); p = a[n]; if (p >= b && p <= e) print "    " $0 }' || true
+    else
+        log_info "    (install lsof or ss to list port holders)"
+    fi
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -195,13 +217,62 @@ wait_for_http() {
     done
 }
 
+# Append a started PID to the service's pid log. Every generation is recorded
+# (append, not overwrite) so teardown can kill them all, not just the latest.
+record_pid() {
+    local name=$1 pid=$2
+    echo "$pid" >> "${SCRIPT_DIR}/.${name}.pids"
+}
+
+# Kill a PID if it is alive: TERM, brief grace period, then KILL. Works for
+# processes started by a *previous* setup run (not children of this shell), so
+# it polls for exit instead of relying on `wait`. Returns 0 if the PID was
+# alive (and is now signalled), 1 if it was already gone.
+kill_pid() {
+    local pid=$1
+    kill -0 "$pid" 2>/dev/null || return 1
+    kill "$pid" 2>/dev/null || true
+    local _
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.2
+    done
+    kill -9 "$pid" 2>/dev/null || true
+    return 0
+}
+
+# Exact process basename to sweep for a service, or empty when it must be swept
+# by port instead. graphql-server runs as `node server.js`, so sweeping it by
+# name would kill unrelated node processes — it is swept by port in stop_service.
+service_binary() {
+    case "$1" in
+        rest-api)     echo "rest-api" ;;
+        soap-service) echo "soap-service" ;;
+        concat-spa)   echo "concat-spa" ;;
+        grpc-server)  echo "grpc-server" ;;
+        *)            echo "" ;;
+    esac
+}
+
+# Default base port for a service, used for port-based orphan sweeps.
+service_default_port() {
+    case "$1" in
+        rest-api)       echo "$DEFAULT_REST_API_PORT" ;;
+        soap-service)   echo "$DEFAULT_SOAP_SERVICE_PORT" ;;
+        graphql-server) echo "$DEFAULT_GRAPHQL_SERVER_PORT" ;;
+        grpc-server)    echo "$DEFAULT_GRPC_SERVER_PORT" ;;
+        concat-spa)     echo "$DEFAULT_CONCAT_SPA_PORT" ;;
+        *)              echo "" ;;
+    esac
+}
+
 start_rest_api() {
     local port=$1
     log_info "Starting rest-api on port ${port}..."
     cd "${SCRIPT_DIR}/rest-api"
     PORT="$port" ./rest-api &
     local pid=$!
-    echo "$pid" > "${SCRIPT_DIR}/.rest-api.pid"
+    record_pid rest-api "$pid"
 
     if wait_for_http "http://localhost:${port}/api/health" 15; then
         log_ok "rest-api started (PID: ${pid}, port: ${port})"
@@ -218,7 +289,7 @@ start_concat_spa() {
     cd "${SCRIPT_DIR}/concat-spa"
     PORT="$port" ./concat-spa &
     local pid=$!
-    echo "$pid" > "${SCRIPT_DIR}/.concat-spa.pid"
+    record_pid concat-spa "$pid"
 
     if wait_for_http "http://localhost:${port}/healthz" 15; then
         log_ok "concat-spa started (PID: ${pid}, port: ${port})"
@@ -235,7 +306,7 @@ start_soap_service() {
     cd "${SCRIPT_DIR}/soap-service"
     PORT="$port" WSDL_PATH="${SCRIPT_DIR}/soap-service/service.wsdl" ./soap-service &
     local pid=$!
-    echo "$pid" > "${SCRIPT_DIR}/.soap-service.pid"
+    record_pid soap-service "$pid"
 
     if wait_for_http "http://localhost:${port}/service.wsdl" 15; then
         log_ok "soap-service started (PID: ${pid}, port: ${port})"
@@ -252,7 +323,7 @@ start_graphql_server() {
     cd "${SCRIPT_DIR}/graphql-server"
     PORT="$port" node server.js > "${SCRIPT_DIR}/.graphql-server.log" 2>&1 &
     local pid=$!
-    echo "$pid" > "${SCRIPT_DIR}/.graphql-server.pid"
+    record_pid graphql-server "$pid"
 
     if wait_for_http "http://localhost:${port}/" 15; then
         log_ok "graphql-server started (PID: ${pid}, port: ${port})"
@@ -296,7 +367,7 @@ start_grpc_server() {
     cd "${SCRIPT_DIR}/grpc-server"
     GRPC_PORT="$port" ./grpc-server &
     local pid=$!
-    echo "$pid" > "${SCRIPT_DIR}/.grpc-server.pid"
+    record_pid grpc-server "$pid"
 
     if wait_for_grpc "localhost" "${port}" 15; then
         log_ok "grpc-server started (PID: ${pid}, port: ${port})"
@@ -307,24 +378,94 @@ start_grpc_server() {
     fi
 }
 
+# Kill every PID recorded for a service, across all setup generations, then
+# sweep any orphans whose pid log was lost. Idempotent.
 stop_service() {
     local name=$1
-    local pidfile="${SCRIPT_DIR}/.${name}.pid"
+    local stopped=0
+    local pidfile pid
 
-    if [ -f "$pidfile" ]; then
-        local pid
-        pid=$(cat "$pidfile")
-        if kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-            log_ok "Stopped ${name} (PID: ${pid})"
-        else
-            log_info "${name} already stopped"
-        fi
+    # 1. Kill every recorded generation. Read both the append-log (.pids, current
+    #    format) and any legacy single-PID file (.pid) left by older setups.
+    for pidfile in "${SCRIPT_DIR}/.${name}.pids" "${SCRIPT_DIR}/.${name}.pid"; do
+        [ -f "$pidfile" ] || continue
+        while read -r pid || [ -n "$pid" ]; do
+            [ -n "${pid//[[:space:]]/}" ] || continue
+            if kill_pid "$pid"; then
+                log_ok "Stopped ${name} (PID: ${pid})"
+                stopped=$((stopped + 1))
+            fi
+        done < "$pidfile"
         rm -f "$pidfile"
+    done
+
+    # 2. Belt-and-suspenders sweep for orphans not covered by a pid log.
+    stopped=$((stopped + $(sweep_orphans "$name")))
+
+    if [ "$stopped" -eq 0 ]; then
+        log_info "${name}: no running processes found"
+    fi
+}
+
+# Kill orphaned processes for a service that are not tracked in a pid log.
+# Go services have unique executable names and are swept by exact basename
+# (current user only). graphql-server runs as `node`, so it is swept by its
+# listening-port window instead — sweeping `node` by name is unsafe.
+# Echoes the number of processes killed.
+sweep_orphans() {
+    local name=$1
+    local killed=0
+    local binary pid
+    binary=$(service_binary "$name")
+
+    if [ -n "$binary" ] && command -v pgrep >/dev/null 2>&1; then
+        for pid in $(pgrep -x -U "$(id -u)" "$binary" 2>/dev/null || true); do
+            if kill_pid "$pid"; then
+                log_warn "Swept orphan ${name} (PID: ${pid}, matched '${binary}')" >&2
+                killed=$((killed + 1))
+            fi
+        done
     else
-        # Try pkill as fallback
-        pkill -f "${SCRIPT_DIR}/${name}" 2>/dev/null && log_ok "Stopped ${name} via pkill" || true
+        # Port-based sweep across the window setup could have used (base..base+20).
+        local base port
+        base=$(service_default_port "$name")
+        if [ -n "$base" ] && command -v lsof >/dev/null 2>&1; then
+            for port in $(seq "$base" $((base + 20))); do
+                for pid in $(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true); do
+                    if kill_pid "$pid"; then
+                        log_warn "Swept orphan ${name} (PID: ${pid}, port ${port})" >&2
+                        killed=$((killed + 1))
+                    fi
+                done
+            done
+        fi
+    fi
+
+    echo "$killed"
+}
+
+# Detect and kill processes left behind by a previous setup that did not tear
+# down (e.g. "ran setup twice"). Logs an explicit line per stale process so the
+# accidental-double-setup case is no longer silent.
+cleanup_stale_state() {
+    local found=0
+    local name pidfile pid
+    for name in $MANAGED_SERVICES; do
+        for pidfile in "${SCRIPT_DIR}/.${name}.pids" "${SCRIPT_DIR}/.${name}.pid"; do
+            [ -f "$pidfile" ] || continue
+            while read -r pid || [ -n "$pid" ]; do
+                [ -n "${pid//[[:space:]]/}" ] || continue
+                if kill -0 "$pid" 2>/dev/null; then
+                    log_warn "Killing stale process ${name} (PID: ${pid}) from a previous setup"
+                    kill_pid "$pid" || true
+                    found=1
+                fi
+            done < "$pidfile"
+            rm -f "$pidfile"
+        done
+    done
+    if [ "$found" -eq 1 ]; then
+        log_ok "Cleared stale processes from a previous run"
     fi
 }
 
@@ -335,20 +476,17 @@ stop_service() {
 do_teardown() {
     log_header "Tearing Down Live Targets"
 
-    stop_service "rest-api"
-    stop_service "soap-service"
-    stop_service "graphql-server"
-    stop_service "grpc-server"
-    stop_service "concat-spa"
+    local name
+    for name in $MANAGED_SERVICES; do
+        stop_service "$name"
+    done
 
-    # Clean up config and PID files
+    # Clean up config, PID logs (both formats), and other state.
     rm -f "${CONFIG_FILE}"
-    rm -f "${SCRIPT_DIR}/.rest-api.pid"
-    rm -f "${SCRIPT_DIR}/.soap-service.pid"
-    rm -f "${SCRIPT_DIR}/.graphql-server.pid"
-    rm -f "${SCRIPT_DIR}/.concat-spa.pid"
+    for name in $MANAGED_SERVICES; do
+        rm -f "${SCRIPT_DIR}/.${name}.pid" "${SCRIPT_DIR}/.${name}.pids"
+    done
     rm -f "${SCRIPT_DIR}/.graphql-server.log"
-    rm -f "${SCRIPT_DIR}/.grpc-server.pid"
     rm -rf "${SCRIPT_DIR}/.results"
 
     log_ok "Teardown complete"
@@ -463,6 +601,10 @@ main() {
         exit 0
     fi
 
+    # ── Clear any leftovers from a previous setup that never tore down ──
+    # Frees ports held by stale orphans before we probe for availability.
+    cleanup_stale_state
+
     # ── Resolve ports and start services ──
     # Each port is resolved immediately before starting that service so the
     # next service's port check sees the previous one as occupied.
@@ -473,45 +615,52 @@ main() {
     for target in "${TARGET_ARRAY[@]}"; do
         case "$target" in
             rest-api)
-                REST_API_PORT=$(find_available_port "$DEFAULT_REST_API_PORT")
+                # `|| true` disarms `set -e` for this substitution so the
+                # `[ -z ]` check below runs instead of the script dying silently.
+                REST_API_PORT=$(find_available_port "$DEFAULT_REST_API_PORT") || true
                 if [ -z "$REST_API_PORT" ]; then
                     log_fail "Cannot find available port for rest-api (tried ${DEFAULT_REST_API_PORT}-$((DEFAULT_REST_API_PORT + 20)))"
+                    show_port_holders "$DEFAULT_REST_API_PORT"
                     exit 1
                 fi
                 log_ok "rest-api: port ${REST_API_PORT}"
                 start_rest_api "$REST_API_PORT" || start_failed=1
                 ;;
             soap-service)
-                SOAP_SERVICE_PORT=$(find_available_port "$DEFAULT_SOAP_SERVICE_PORT")
+                SOAP_SERVICE_PORT=$(find_available_port "$DEFAULT_SOAP_SERVICE_PORT") || true
                 if [ -z "$SOAP_SERVICE_PORT" ]; then
                     log_fail "Cannot find available port for soap-service (tried ${DEFAULT_SOAP_SERVICE_PORT}-$((DEFAULT_SOAP_SERVICE_PORT + 20)))"
+                    show_port_holders "$DEFAULT_SOAP_SERVICE_PORT"
                     exit 1
                 fi
                 log_ok "soap-service: port ${SOAP_SERVICE_PORT}"
                 start_soap_service "$SOAP_SERVICE_PORT" || start_failed=1
                 ;;
             graphql-server)
-                GRAPHQL_SERVER_PORT=$(find_available_port "$DEFAULT_GRAPHQL_SERVER_PORT")
+                GRAPHQL_SERVER_PORT=$(find_available_port "$DEFAULT_GRAPHQL_SERVER_PORT") || true
                 if [ -z "$GRAPHQL_SERVER_PORT" ]; then
                     log_fail "Cannot find available port for graphql-server (tried ${DEFAULT_GRAPHQL_SERVER_PORT}-$((DEFAULT_GRAPHQL_SERVER_PORT + 20)))"
+                    show_port_holders "$DEFAULT_GRAPHQL_SERVER_PORT"
                     exit 1
                 fi
                 log_ok "graphql-server: port ${GRAPHQL_SERVER_PORT}"
                 start_graphql_server "$GRAPHQL_SERVER_PORT" || start_failed=1
                 ;;
             grpc-server)
-                GRPC_SERVER_PORT=$(find_available_port "$DEFAULT_GRPC_SERVER_PORT")
+                GRPC_SERVER_PORT=$(find_available_port "$DEFAULT_GRPC_SERVER_PORT") || true
                 if [ -z "$GRPC_SERVER_PORT" ]; then
                     log_fail "Cannot find available port for grpc-server (tried ${DEFAULT_GRPC_SERVER_PORT}-$((DEFAULT_GRPC_SERVER_PORT + 20)))"
+                    show_port_holders "$DEFAULT_GRPC_SERVER_PORT"
                     exit 1
                 fi
                 log_ok "grpc-server: port ${GRPC_SERVER_PORT}"
                 start_grpc_server "$GRPC_SERVER_PORT" || start_failed=1
                 ;;
             concat-spa)
-                CONCAT_SPA_PORT=$(find_available_port "$DEFAULT_CONCAT_SPA_PORT")
+                CONCAT_SPA_PORT=$(find_available_port "$DEFAULT_CONCAT_SPA_PORT") || true
                 if [ -z "$CONCAT_SPA_PORT" ]; then
                     log_fail "Cannot find available port for concat-spa (tried ${DEFAULT_CONCAT_SPA_PORT}-$((DEFAULT_CONCAT_SPA_PORT + 20)))"
+                    show_port_holders "$DEFAULT_CONCAT_SPA_PORT"
                     exit 1
                 fi
                 log_ok "concat-spa: port ${CONCAT_SPA_PORT}"
@@ -533,4 +682,8 @@ main() {
     log_info "Tear down with: ./test/setup-live-targets.sh --teardown"
 }
 
-main "$@"
+# Run main only when executed directly. When sourced (by the regression test)
+# the functions are defined but main does not run.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
