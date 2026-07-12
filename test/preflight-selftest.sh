@@ -36,7 +36,7 @@ trap 'rm -rf "${FIXTURE_DIR}"' EXIT
 mkdir -p "${FIXTURE_DIR}/bin"
 WORKING_BROWSER="${FIXTURE_DIR}/bin/google-chrome"
 cat > "${WORKING_BROWSER}" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo "Fake Chrome 999.0.0.0"
 exit 0
 EOF
@@ -47,11 +47,22 @@ chmod +x "${WORKING_BROWSER}"
 mkdir -p "${FIXTURE_DIR}/snap/bin"
 SNAP_STUB="${FIXTURE_DIR}/snap/bin/chromium-browser"
 cat > "${SNAP_STUB}" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo "chromium-browser requires the chromium snap to be installed" >&2
 exit 1
 EOF
 chmod +x "${SNAP_STUB}"
+
+# A generically-broken "browser": present, executable, fails at runtime, but
+# its path matches NONE of the snap-hint globs (not under /snap/, not named
+# chromium*). Exercises the generic "failed to run" arm of check_prerequisites.
+GENERIC_BROKEN="${FIXTURE_DIR}/bin/broken-chrome"
+cat > "${GENERIC_BROKEN}" <<'EOF'
+#!/bin/bash
+echo "broken-chrome: error while loading shared libraries" >&2
+exit 127
+EOF
+chmod +x "${GENERIC_BROKEN}"
 
 # NOTE: setup-live-targets.sh assigns CHROME_CANDIDATES unconditionally at
 # top level (not inside main()), so any override must happen AFTER sourcing
@@ -157,6 +168,51 @@ rc_d=$(echo "${result}" | sed -n '1p')
 out_d=$(echo "${result}" | sed -n '2p')
 assert_eq "case d: stub-before-working exit code is 0" "0" "${rc_d}"
 assert_eq "case d: stub-before-working selects the working browser" "${WORKING_BROWSER}" "${out_d}"
+
+# ── Case e: present-but-broken NON-snap binary → generic hint ──
+# Complements case b: a broken binary whose path matches none of the snap
+# globs must get the generic "failed to run" hint, NOT the snap-stub hint.
+# Guards the `*)` arm of check_prerequisites' case statement.
+msg_out=$(
+    (
+        # shellcheck source=setup-live-targets.sh
+        source "${SETUP_SCRIPT}"
+        # shellcheck disable=SC2034  # consumed by detect_chrome_binary from the sourced script
+        CHROME_CANDIDATES=("${GENERIC_BROKEN}")
+        set +e
+        check_prerequisites 2>&1
+    )
+) || true   # check_prerequisites exits 1 (chrome broken); we only want its output
+if printf '%s' "${msg_out}" | grep -q "failed to run" && ! printf '%s' "${msg_out}" | grep -q "snap stub"; then
+    echo "PASS: case e: non-snap broken binary gets the generic hint (not the snap hint)"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case e: expected the generic 'failed to run' hint without snap-stub text"
+    fail_count=$((fail_count + 1))
+fi
+
+# ── Case f: no timeout/gtimeout on PATH → bare-probe fallback ──
+# Exercises chrome_runnable's degrade path (stock macOS ships neither
+# timeout nor gtimeout). Restrict PATH to the fixture bin dir — which holds
+# no timeout binary — so command -v timeout/gtimeout both miss and the bare
+# `"$1" --version` branch runs. A working browser must still be detected.
+result=$(
+    (
+        # shellcheck source=setup-live-targets.sh
+        source "${SETUP_SCRIPT}"
+        # shellcheck disable=SC2034  # consumed by detect_chrome_binary from the sourced script
+        CHROME_CANDIDATES=("${WORKING_BROWSER}")
+        PATH="${FIXTURE_DIR}/bin"   # no timeout/gtimeout here → force the fallback
+        set +e
+        out=$(detect_chrome_binary)
+        rc=$?
+        printf '%s\n%s\n' "${rc}" "${out}"
+    )
+)
+rc_f=$(echo "${result}" | sed -n '1p')
+out_f=$(echo "${result}" | sed -n '2p')
+assert_eq "case f: no-timeout fallback still detects a working browser (rc 0)" "0" "${rc_f}"
+assert_eq "case f: no-timeout fallback returns the working browser path" "${WORKING_BROWSER}" "${out_f}"
 
 # ── Summary ─────────────────────────────────────────────────────
 echo ""
