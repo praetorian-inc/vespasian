@@ -93,19 +93,29 @@ out_b=$(echo "${result}" | sed -n '2p')
 assert_eq "case b: snap-stub exit code is 2" "2" "${rc_b}"
 assert_eq "case b: snap-stub path echoed" "${SNAP_STUB}" "${out_b}"
 
-# case b (continued): assert the stub path matches the snap-hint pattern
-# used by check_prerequisites' case statement, so message selection is
-# covered without duplicating check_prerequisites' full log output.
-case "${out_b}" in
-    */snap/*|*/chromium-browser|*/chromium)
-        echo "PASS: case b: stub path matches snap-hint case pattern"
-        pass_count=$((pass_count + 1))
-        ;;
-    *)
-        echo "FAIL: case b: stub path does NOT match snap-hint case pattern"
-        fail_count=$((fail_count + 1))
-        ;;
-esac
+# case b (continued): exercise check_prerequisites' ACTUAL message selection.
+# Run it with only the stub candidate and confirm it emits the snap-stub hint
+# (not the generic "failed to run" message). This drives the real case
+# statement, so a regression that narrows/reorders the snap pattern or swaps
+# in the generic hint would fail here. Runs in a subshell because
+# check_prerequisites calls `exit 1` when a prerequisite is missing.
+msg_out=$(
+    (
+        # shellcheck source=setup-live-targets.sh
+        source "${SETUP_SCRIPT}"
+        # shellcheck disable=SC2034  # consumed by detect_chrome_binary from the sourced script
+        CHROME_CANDIDATES=("${SNAP_STUB}")
+        set +e
+        check_prerequisites 2>&1
+    )
+) || true   # check_prerequisites exits 1 (chrome missing); we only want its output
+if printf '%s' "${msg_out}" | grep -q "snap stub"; then
+    echo "PASS: case b: check_prerequisites emits the snap-stub hint"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case b: check_prerequisites did not emit the snap-stub hint"
+    fail_count=$((fail_count + 1))
+fi
 
 # ── Case c: nothing runnable (all candidates missing) ──────────
 result=$(
@@ -124,6 +134,29 @@ rc_c=$(echo "${result}" | sed -n '1p')
 out_c=$(echo "${result}" | sed -n '2p')
 assert_eq "case c: nothing found exit code is 1" "1" "${rc_c}"
 assert_eq "case c: nothing found stdout is empty" "" "${out_c}"
+
+# ── Case d: broken candidate ordered BEFORE a working one ──────
+# The real snap-stub scenario: `command -v` resolves the stub first and a
+# working browser is only found later in the candidate list. Proves the loop
+# SKIPS the non-runnable candidate and returns the later runnable one (rc 0),
+# rather than stopping at the stub (rc 2). This is the branch case a cannot
+# cover, since case a lists the working browser first.
+result=$(
+    (
+        # shellcheck source=setup-live-targets.sh
+        source "${SETUP_SCRIPT}"
+        # shellcheck disable=SC2034  # consumed by detect_chrome_binary from the sourced script
+        CHROME_CANDIDATES=("${SNAP_STUB}" "${WORKING_BROWSER}")
+        set +e
+        out=$(detect_chrome_binary)
+        rc=$?
+        printf '%s\n%s\n' "${rc}" "${out}"
+    )
+)
+rc_d=$(echo "${result}" | sed -n '1p')
+out_d=$(echo "${result}" | sed -n '2p')
+assert_eq "case d: stub-before-working exit code is 0" "0" "${rc_d}"
+assert_eq "case d: stub-before-working selects the working browser" "${WORKING_BROWSER}" "${out_d}"
 
 # ── Summary ─────────────────────────────────────────────────────
 echo ""
