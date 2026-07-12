@@ -77,30 +77,47 @@ check_prerequisites() {
         failed=1
     fi
 
-    # Chrome/Chromium
+    # Chrome/Chromium — presence alone is not enough. On recent Ubuntu / WSL2 /
+    # many CI base images, /usr/bin/chromium-browser is a snap *stub*: a launcher
+    # that satisfies `command -v` / `-x` but fails at runtime with "requires the
+    # chromium snap to be installed". Probe each candidate for actual runnability
+    # so preflight fails loudly here instead of during `vespasian crawl`.
+    chrome_runnable() {
+        # --version is fast and needs no X / DBus; timeout guards a hanging stub.
+        # timeout is not installed by default on macOS, so degrade gracefully.
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 2 "$1" --version >/dev/null 2>&1
+        else
+            "$1" --version >/dev/null 2>&1
+        fi
+    }
+
     local chrome_found=0
-    for browser in google-chrome chromium-browser chromium chrome; do
-        if command -v "$browser" >/dev/null 2>&1; then
-            log_ok "Browser: $browser"
+    local chrome_stub=""
+    for browser in google-chrome chromium-browser chromium chrome \
+                   /usr/bin/google-chrome /usr/bin/chromium-browser /usr/bin/chromium \
+                   /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+                   /snap/bin/chromium; do
+        # Resolve names and absolute paths alike to an executable path, or skip.
+        local bin
+        bin=$(command -v "$browser" 2>/dev/null) || continue
+        if chrome_runnable "$bin"; then
+            log_ok "Browser: $bin"
             chrome_found=1
             break
+        else
+            # Remember the first present-but-broken binary for a better message.
+            [ -z "$chrome_stub" ] && chrome_stub="$bin"
         fi
     done
-    # Also check common installation paths
     if [ $chrome_found -eq 0 ]; then
-        for path in /usr/bin/google-chrome /usr/bin/chromium-browser /usr/bin/chromium \
-                    /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-                    /snap/bin/chromium; do
-            if [ -x "$path" ]; then
-                log_ok "Browser: $path"
-                chrome_found=1
-                break
-            fi
-        done
-    fi
-    if [ $chrome_found -eq 0 ]; then
-        log_fail "Chrome/Chromium not found. Required for headless crawling."
-        log_info "Install: https://www.google.com/chrome/ or 'apt install chromium-browser'"
+        if [ -n "$chrome_stub" ]; then
+            log_fail "Found ${chrome_stub} but it is not runnable"
+            log_info "(looks like the Ubuntu snap stub — install the chromium snap: 'snap install chromium', or use google-chrome)."
+        else
+            log_fail "Chrome/Chromium not found. Required for headless crawling."
+            log_info "Install: https://www.google.com/chrome/ or 'apt install chromium-browser'"
+        fi
         failed=1
     fi
 
