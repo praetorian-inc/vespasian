@@ -2803,6 +2803,7 @@ usage() {
     echo "                                      import-malformed, import-empty"
     echo "                          Crawl:      crawl-depth, crawl-unreachable"
     echo "                          Edge cases: edge-cases, classifier-edge, spec-edge"
+    echo "                          Smoke:      smoke-check"
     echo "  --verbose             Enable verbose vespasian output"
     echo "  --no-build            Skip building vespasian and target binaries"
     echo "  --no-start            Don't start/stop services (assume already running)"
@@ -2876,7 +2877,7 @@ main() {
                 # Always include both defined groups. Config may prepend extra
                 # live targets (e.g. grpc-server); deduplicate so overlapping
                 # targets don't run their test function twice.
-                targets="$(join_targets "${LIVE_TARGETS[@]}"),$(join_targets "${OFFLINE_TARGETS[@]}")"
+                targets="$(join_targets "${OFFLINE_TARGETS[@]}"),$(join_targets "${LIVE_TARGETS[@]}")"
                 if [ -n "${TARGETS_SETUP:-}" ]; then
                     targets="${TARGETS_SETUP},${targets}"
                     targets="$(echo "$targets" | tr ',' '\n' | awk '!s[$0]++' | paste -sd, -)"

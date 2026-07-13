@@ -66,7 +66,7 @@ echo ""
 echo "=== Target group construction ==="
 
 # --group all includes every group member without duplicates.
-all="$(join_targets "${LIVE_TARGETS[@]}"),$(join_targets "${OFFLINE_TARGETS[@]}")"
+all="$(join_targets "${OFFLINE_TARGETS[@]}"),$(join_targets "${LIVE_TARGETS[@]}")"
 dup_count=$(echo "$all" | tr ',' '\n' | sort | uniq -d | wc -l | tr -d ' ')
 if [[ "$dup_count" -eq 0 ]]; then
     pass "--group all: no duplicates"
@@ -113,15 +113,36 @@ fi
 echo ""
 echo "=== Argument validation ==="
 
-# Invalid --group value exits non-zero.
+# Invalid --group value exits non-zero with the expected error message.
 tmpconfig=$(mktemp)
 echo "TARGETS_SETUP=" > "$tmpconfig"
-if env CONFIG_FILE="$tmpconfig" bash -c "
-    source '$RUNNER' --group bogus 2>/dev/null
-" 2>/dev/null; then
-    fail "Invalid --group should exit non-zero"
+invalid_output=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --group bogus" 2>&1 || true)
+if [[ "$invalid_output" == *"Unknown group"* ]]; then
+    pass "Invalid --group: rejected with 'Unknown group' message"
 else
-    pass "Invalid --group exits non-zero"
+    fail "Invalid --group: expected 'Unknown group' in output, got: $invalid_output"
+fi
+rm -f "$tmpconfig"
+
+# --group without a value exits non-zero with the expected error message.
+tmpconfig=$(mktemp)
+echo "TARGETS_SETUP=" > "$tmpconfig"
+novalue_output=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --group" 2>&1 || true)
+if [[ "$novalue_output" == *"--group requires a value"* ]]; then
+    pass "--group (no value): rejected with '--group requires a value'"
+else
+    fail "--group (no value): expected '--group requires a value' in output, got: $novalue_output"
+fi
+rm -f "$tmpconfig"
+
+# --targets without a value exits non-zero with the expected error message.
+tmpconfig=$(mktemp)
+echo "TARGETS_SETUP=" > "$tmpconfig"
+novalue_output=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --targets" 2>&1 || true)
+if [[ "$novalue_output" == *"--targets requires a value"* ]]; then
+    pass "--targets (no value): rejected with '--targets requires a value'"
+else
+    fail "--targets (no value): expected '--targets requires a value' in output, got: $novalue_output"
 fi
 rm -f "$tmpconfig"
 
