@@ -1000,6 +1000,24 @@ func TestGRPCInsecureSkipVerify_GenerateCmd(t *testing.T) {
 	}
 }
 
+// TestGRPCInsecureSkipVerify_ReachesOptions closes the AC3 boundary gap: it
+// asserts that c.GRPCInsecureSkipVerify actually reaches pipeline.Options
+// (via GenerateCmd.options()) and pipeline.ScanOptions (via
+// ScanCmd.scanOptions()) at the CLI boundary, so a dropped assignment inside
+// either method is caught — unlike TestGRPCInsecureSkipVerify_Embedded
+// (field-exposure only) and TestGRPCInsecureSkipVerify_GenerateCmd (a
+// hermetic Run() smoke test that never reaches pipeline.Options
+// construction on a REST capture).
+func TestGRPCInsecureSkipVerify_ReachesOptions(t *testing.T) {
+	require.True(t, (&GenerateCmd{GRPCInsecureSkipVerify: true}).options().GRPCInsecureSkipVerify,
+		"GenerateCmd flag must reach pipeline.Options")
+	require.False(t, (&GenerateCmd{GRPCInsecureSkipVerify: false}).options().GRPCInsecureSkipVerify)
+
+	require.True(t, (&ScanCmd{GRPCInsecureSkipVerify: true}).scanOptions("rest", nil).GRPCInsecureSkipVerify,
+		"ScanCmd flag must reach pipeline.ScanOptions")
+	require.False(t, (&ScanCmd{GRPCInsecureSkipVerify: false}).scanOptions("rest", nil).GRPCInsecureSkipVerify)
+}
+
 // TestDangerousAllowPrivate_SameOutputForPublicURLs verifies that allowPrivate=true
 // and allowPrivate=false produce identical specs when all targets are public.
 func TestDangerousAllowPrivate_SameOutputForPublicURLs(t *testing.T) {

@@ -481,6 +481,23 @@ type GenerateCmd struct {
 // maxCaptureSize is the maximum capture file size (100MB).
 const maxCaptureSize = 100 * 1024 * 1024
 
+// options builds the pipeline.Options for this command from its flags. Extracted
+// so a CLI-boundary test can assert each flag reaches pipeline.Options (catching a
+// dropped assignment) without executing Run().
+func (c *GenerateCmd) options() pipeline.Options {
+	return pipeline.Options{
+		APIType:                c.APIType,
+		Confidence:             c.Confidence,
+		Probe:                  c.Probe,
+		Deduplicate:            c.Deduplicate,
+		AllowPrivate:           c.DangerousAllowPrivate,
+		GRPCInsecureSkipVerify: c.GRPCInsecureSkipVerify,
+		MergeSlugs:             c.MergeSlugs,
+		SlugThreshold:          c.SlugThreshold,
+		Status:                 statusWriter(c.Verbose),
+	}
+}
+
 // Run executes the generate command.
 func (c *GenerateCmd) Run() (err error) {
 	if err := validateSlugThreshold(c.APIType, c.MergeSlugs, c.SlugThreshold); err != nil {
@@ -532,17 +549,7 @@ func (c *GenerateCmd) Run() (err error) {
 
 	warnSSRFDisabled(c.DangerousAllowPrivate, c.Probe)
 
-	spec, err := pipeline.ClassifyProbeGenerate(ctx, requests, pipeline.Options{
-		APIType:                c.APIType,
-		Confidence:             c.Confidence,
-		Probe:                  c.Probe,
-		Deduplicate:            c.Deduplicate,
-		AllowPrivate:           c.DangerousAllowPrivate,
-		GRPCInsecureSkipVerify: c.GRPCInsecureSkipVerify,
-		MergeSlugs:             c.MergeSlugs,
-		SlugThreshold:          c.SlugThreshold,
-		Status:                 statusWriter(c.Verbose),
-	})
+	spec, err := pipeline.ClassifyProbeGenerate(ctx, requests, c.options())
 	if err != nil {
 		return err
 	}
@@ -565,6 +572,28 @@ type ScanCmd struct {
 
 	CrawlOptions
 	SlugOptions
+}
+
+// scanOptions builds the pipeline.ScanOptions for this command. The c-derived
+// fields (incl. GRPCInsecureSkipVerify) are collected here so a CLI-boundary test
+// can assert each flag reaches pipeline.ScanOptions (catching a dropped assignment)
+// without executing Run(). The two runtime-derived inputs — the resolved apiType
+// and the AfterWSDL closure (which captures bs.opts.Headers/c/c.URL) — are passed
+// in by Run().
+func (c *ScanCmd) scanOptions(apiType string, afterWSDL func(ctx context.Context, reqs []crawl.ObservedRequest) []crawl.ObservedRequest) pipeline.ScanOptions {
+	return pipeline.ScanOptions{
+		TargetURL:              c.URL,
+		APIType:                apiType,
+		Confidence:             c.Confidence,
+		Probe:                  c.Probe,
+		Deduplicate:            c.Deduplicate,
+		AllowPrivate:           c.DangerousAllowPrivate,
+		GRPCInsecureSkipVerify: c.GRPCInsecureSkipVerify,
+		MergeSlugs:             c.MergeSlugs,
+		SlugThreshold:          c.SlugThreshold,
+		Status:                 statusWriter(c.Verbose),
+		AfterWSDL:              afterWSDL,
+	}
 }
 
 // Run executes the scan command (crawl + generate pipeline).
@@ -659,27 +688,16 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	// gated on both c.AnalyzeJS (so --analyze-js=false suppresses the JS-bundle
 	// rescan) and c.Probe (so --probe=false stays passive — see
 	// maybeReplayJSExtracted), and is CLI-only (the SDK passes a nil AfterWSDL hook).
-	spec, apiType, foundWSDL, _, err := pipeline.ResolveAndGenerate(genCtx, requests, pipeline.ScanOptions{
-		TargetURL:              c.URL,
-		APIType:                apiType,
-		Confidence:             c.Confidence,
-		Probe:                  c.Probe,
-		Deduplicate:            c.Deduplicate,
-		AllowPrivate:           c.DangerousAllowPrivate,
-		GRPCInsecureSkipVerify: c.GRPCInsecureSkipVerify,
-		MergeSlugs:             c.MergeSlugs,
-		SlugThreshold:          c.SlugThreshold,
-		Status:                 statusWriter(c.Verbose),
-		AfterWSDL: func(ctx context.Context, reqs []crawl.ObservedRequest) []crawl.ObservedRequest {
-			return maybeReplayJSExtracted(ctx, reqs, c.Probe && c.AnalyzeJS, crawl.JSReplayConfig{
-				Headers:      bs.opts.Headers,
-				TargetURL:    c.URL,
-				AllowPrivate: c.DangerousAllowPrivate,
-				Verbose:      c.Verbose,
-				Stderr:       os.Stderr,
-			})
-		},
-	})
+	afterWSDL := func(ctx context.Context, reqs []crawl.ObservedRequest) []crawl.ObservedRequest {
+		return maybeReplayJSExtracted(ctx, reqs, c.Probe && c.AnalyzeJS, crawl.JSReplayConfig{
+			Headers:      bs.opts.Headers,
+			TargetURL:    c.URL,
+			AllowPrivate: c.DangerousAllowPrivate,
+			Verbose:      c.Verbose,
+			Stderr:       os.Stderr,
+		})
+	}
+	spec, apiType, foundWSDL, _, err := pipeline.ResolveAndGenerate(genCtx, requests, c.scanOptions(apiType, afterWSDL))
 	if err != nil {
 		return err
 	}
