@@ -2763,6 +2763,14 @@ print_summary() {
     return 0
 }
 
+test_ungrouped_poc() {
+    init_test_status "ungrouped-poc"
+    local start=$SECONDS
+    log_header "Testing: ungrouped-poc (deliberate drift test)"
+    set_test_result "ungrouped-poc" "PASS" "-" "-" "$((SECONDS - start))"
+    log_ok "ungrouped-poc: PASSED (0s)"
+}
+
 test_smoke_check() {
     init_test_status "smoke-check"
     local start=$SECONDS
@@ -2941,6 +2949,7 @@ main() {
             classifier-edge)    test_classifier_edge_cases ;;
             spec-edge)          test_spec_edge_cases ;;
             smoke-check)        test_smoke_check ;;
+            ungrouped-poc)      test_ungrouped_poc ;;
             *)
                 log_fail "Unknown target: $target"
                 init_test_status "$target"
