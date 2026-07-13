@@ -8,7 +8,8 @@
 #   ./test/run-live-tests.sh [options]
 #
 # Options:
-#   --targets <list>      Comma-separated targets to test (default: all from config)
+#   --group <name>        Run a predefined target group: offline, live, or all (default: all)
+#   --targets <list>      Comma-separated targets to test (overrides --group)
 #   --verbose             Enable verbose vespasian output
 #   --no-build            Skip building vespasian and target binaries
 #   --no-start            Don't start/stop services (assume already running)
@@ -27,6 +28,45 @@ VESPASIAN="${PROJECT_ROOT}/bin/vespasian"
 # devcontainer's detected host gateway) when the harness runs inside a
 # devcontainer while the target services run on the Docker host.
 TEST_HOST="${TEST_HOST:-localhost}"
+
+# ──────────────────────────────────────────────────────────────
+# Target groups (single source of truth — CI references these
+# via --group instead of maintaining its own target lists)
+# ──────────────────────────────────────────────────────────────
+
+OFFLINE_TARGETS=(
+    import-burp
+    import-har
+    import-base64
+    import-mitmproxy
+    import-mitmproxy-native
+    import-unicode
+    import-duplicates
+    import-malformed
+    import-empty
+    generate-rest
+    generate-wsdl
+    generate-wsdl-matrix
+    generate-graphql
+    generate-graphql-imports
+    generate-js-static
+    generate-merge-slugs
+    crawl-unreachable
+    classifier-edge
+    spec-edge
+)
+
+LIVE_TARGETS=(
+    rest-api
+    soap-service
+    graphql-server
+    concat-spa
+    edge-cases
+    crawl-depth
+)
+
+# join_targets prints array elements as a comma-separated string.
+join_targets() { local IFS=','; echo "$*"; }
 
 # Source shared colors, logging, and validation functions
 # shellcheck source=common.sh
@@ -2730,9 +2770,12 @@ usage() {
     echo "Usage: $0 [options]"
     echo ""
     echo "Options:"
-    echo "  --targets <list>      Comma-separated targets to test (default: all)"
+    echo "  --group <name>        Run a predefined target group: offline, live, or all (default: all)"
+    echo "  --targets <list>      Comma-separated targets to test (overrides --group)"
     echo "                        Valid targets:"
-    echo "                          Live:       rest-api, soap-service, graphql-server, grpc-server"
+    echo "                          Live:       rest-api, soap-service, graphql-server, concat-spa,"
+    echo "                                      edge-cases, crawl-depth"
+    echo "                          Config:     grpc-server (included via TARGETS_SETUP when set up)"
     echo "                          Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,"
     echo "                                      generate-graphql, generate-graphql-imports,"
     echo "                                      generate-js-static, generate-merge-slugs"
@@ -2756,13 +2799,20 @@ usage() {
 
 main() {
     local targets=""
+    local group=""
     local no_build=false
     local no_start=false
     VERBOSE=false
 
     while [ $# -gt 0 ]; do
         case "$1" in
+            --group)
+                if [[ $# -lt 2 ]]; then log_fail "--group requires a value"; usage; exit 1; fi
+                group="$2"
+                shift 2
+                ;;
             --targets)
+                if [[ $# -lt 2 ]]; then log_fail "--targets requires a value"; usage; exit 1; fi
                 targets="$2"
                 shift 2
                 ;;
@@ -2795,14 +2845,30 @@ main() {
     # Load config
     load_config
 
-    # Default targets from config
+    # --targets takes precedence over --group; --group defaults to "all".
     if [ -z "$targets" ]; then
-        targets="${TARGETS_SETUP:-rest-api,soap-service,graphql-server,grpc-server,concat-spa}"
-        # Always include importer tests
-        targets="${targets},import-burp,import-har,import-base64,import-mitmproxy,import-mitmproxy-native,import-unicode,import-duplicates,import-malformed,import-empty"
-        targets="${targets},generate-rest,generate-wsdl,generate-wsdl-matrix,generate-graphql,generate-graphql-imports,generate-js-static,generate-merge-slugs"
-        targets="${targets},edge-cases,crawl-depth,crawl-unreachable"
-        targets="${targets},classifier-edge,spec-edge"
+        case "${group:-all}" in
+            offline)
+                targets="$(join_targets "${OFFLINE_TARGETS[@]}")"
+                ;;
+            live)
+                targets="$(join_targets "${LIVE_TARGETS[@]}")"
+                ;;
+            all)
+                # Always include both defined groups. Config may prepend extra
+                # live targets (e.g. grpc-server); deduplicate so overlapping
+                # targets don't run their test function twice.
+                targets="$(join_targets "${LIVE_TARGETS[@]}"),$(join_targets "${OFFLINE_TARGETS[@]}")"
+                if [ -n "${TARGETS_SETUP:-}" ]; then
+                    targets="${TARGETS_SETUP},${targets}"
+                    targets="$(echo "$targets" | tr ',' '\n' | awk '!s[$0]++' | paste -sd, -)"
+                fi
+                ;;
+            *)
+                log_fail "Unknown group: ${group} (valid: offline, live, all)"
+                exit 1
+                ;;
+        esac
     fi
 
     preflight_test_host "$targets"
