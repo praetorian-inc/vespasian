@@ -63,6 +63,11 @@ _port_sweep_pid=""
 orphan_pids_by_name() { [ -n "$_name_sweep_pid" ] && echo "$_name_sweep_pid"; return 0; }
 orphan_pids_by_port() { [ -n "$_port_sweep_pid" ] && echo "$_port_sweep_pid"; return 0; }
 
+# SWEEP_ORPHANS is defined by the sourced script and read by stop_service; tests
+# toggle it to gate the opt-in sweep. Marked exported so shellcheck sees it as
+# consumed externally (the reader is in the sourced file, not this one).
+export SWEEP_ORPHANS
+
 # ── Test harness ──────────────────────────────────────────────────────────
 PASS=0
 FAIL=0
@@ -157,17 +162,19 @@ stop_service rest-api >/dev/null 2>&1
 assert_alive "$imposter" "process whose comm != service basename is spared"
 kill -9 "$imposter" 2>/dev/null || true
 
-# ── Test 4: untracked orphan swept by basename (Go service) ─────────────────
-echo "Test 4: untracked orphan swept by basename"
+# ── Test 4: untracked orphan swept by basename under --sweep (Go service) ────
+echo "Test 4: untracked orphan swept by basename when --sweep is enabled"
 spawn_named grpc-server; p=$REPLY   # comm == grpc-server, no pid log recorded
 _name_sweep_pid="$p"                 # sandbox: sweep sees only this stand-in
+SWEEP_ORPHANS=true                   # opt in to the fallback sweep
 assert_alive "$p" "orphan running before sweep"
 stop_service grpc-server >/dev/null 2>&1
-assert_dead "$p" "orphan swept via name seam (no pid log present)"
+assert_dead "$p" "orphan swept via name seam (no pid log, --sweep on)"
+SWEEP_ORPHANS=false
 _name_sweep_pid=""
 
-# ── Test 5: graphql orphan swept by port seam, never by pkill node ──────────
-echo "Test 5: graphql orphan swept by listening-port seam"
+# ── Test 5: graphql orphan swept by port seam under --sweep, never pkill node ─
+echo "Test 5: graphql orphan swept by listening-port seam when --sweep is enabled"
 if command -v python3 >/dev/null 2>&1; then
     port="$(free_port)"
     python3 -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1 &
@@ -175,9 +182,11 @@ if command -v python3 >/dev/null 2>&1; then
     SPAWNED_PIDS+=("$p")
     disown "$p" 2>/dev/null || true
     _port_sweep_pid="$p"             # sandbox: sweep sees only this stand-in
+    SWEEP_ORPHANS=true               # opt in to the fallback sweep
     assert_alive "$p" "port listener running before sweep"
     stop_service graphql-server >/dev/null 2>&1
-    assert_dead "$p" "listener swept via port seam (no pid log present)"
+    assert_dead "$p" "listener swept via port seam (no pid log, --sweep on)"
+    SWEEP_ORPHANS=false
     _port_sweep_pid=""
 else
     echo "  skip - python3 unavailable"
@@ -273,6 +282,16 @@ disown "$stubborn" 2>/dev/null || true
 record_pid concat-spa "$stubborn"
 stop_service concat-spa >/dev/null 2>&1
 assert_dead "$stubborn" "SIGTERM-ignoring process force-killed via SIGKILL escalation"
+
+# ── Test 12: default teardown does NOT sweep untracked processes ────────────
+echo "Test 12: without --sweep, an untracked same-named process is left alone"
+spawn_named grpc-server; safe=$REPLY   # comm == grpc-server, NO pid log recorded
+_name_sweep_pid="$safe"                # if the sweep ran, this is what it would kill
+# SWEEP_ORPHANS is false here (default) — the sweep must NOT run.
+stop_service grpc-server >/dev/null 2>&1
+assert_alive "$safe" "untracked process spared when --sweep is off (footgun closed by default)"
+_name_sweep_pid=""
+kill -9 "$safe" 2>/dev/null || true
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 echo ""

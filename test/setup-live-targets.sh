@@ -12,6 +12,8 @@
 #                      Valid: rest-api,soap-service,graphql-server,concat-spa
 #   --skip-start       Only build, don't start services
 #   --teardown         Stop all running targets and clean up
+#   --sweep            With --teardown, also sweep untracked orphans by name/port
+#                      (off by default; can match unrelated processes)
 #   --help             Show this help message
 
 set -euo pipefail
@@ -32,6 +34,14 @@ STATE_DIR="${SETUP_LIVE_TARGETS_STATE_DIR:-$SCRIPT_DIR}"
 # cleanup, and orphan sweeps all iterate the same set.
 MANAGED_SERVICES="rest-api soap-service graphql-server grpc-server concat-spa"
 CONFIG_FILE="${STATE_DIR}/.live-test-config"
+
+# Whether teardown may fall back to the broad orphan sweep (kill by executable
+# basename / listening port) for a service that has no pid log. OFF by default:
+# the pid log records every started generation, so a normal teardown never needs
+# it, and the sweep can match UNRELATED processes — a developer's own same-named
+# service, or any `node` listening in the graphql port window. Enable explicitly
+# with `--sweep` for the rare pre-existing-orphan / lost-pid-log case.
+SWEEP_ORPHANS=false
 
 # Default ports
 DEFAULT_REST_API_PORT=8990
@@ -476,8 +486,9 @@ orphan_pids_by_port() {
 # Kill orphaned processes for a service whose pid log was lost. Go services have
 # unique executable names and are swept by exact basename; graphql-server runs
 # as `node`, so it is swept by its listening-port window. Echoes the number of
-# processes killed. Called by stop_service ONLY when no pid log existed — the
-# pid log is the primary, reliable mechanism; this is the fallback.
+# processes killed. Called by stop_service ONLY under --sweep AND when no pid log
+# existed — the pid log is the primary, reliable mechanism; this opt-in fallback
+# can match unrelated processes, so it is never run by default.
 sweep_orphans() {
     local name=$1 killed=0 binary base pid
     binary="$(service_binary "$name")"
@@ -521,9 +532,10 @@ stop_service() {
     done < <(recorded_pids "$name")
     clear_recorded_pids "$name"
 
-    # Belt-and-suspenders: the broad orphan sweep runs only when the pid log was
-    # lost. A normal teardown after setup has the log and never reaches here.
-    if [ "$no_log" -ne 0 ]; then
+    # Fallback orphan sweep: opt-in (--sweep) AND only when this service has no
+    # pid log. Off by default because the sweep matches by name/port and can hit
+    # unrelated processes; the pid log already covers every normal teardown.
+    if [ "$no_log" -ne 0 ] && [ "$SWEEP_ORPHANS" = true ]; then
         stopped=$((stopped + $(sweep_orphans "$name")))
     fi
 
@@ -620,12 +632,15 @@ usage() {
     echo "                     Valid: rest-api,soap-service,graphql-server,grpc-server,concat-spa"
     echo "  --skip-start       Only build, don't start services"
     echo "  --teardown         Stop all running targets and clean up"
+    echo "  --sweep            With --teardown, also sweep untracked orphans by"
+    echo "                     name/port (off by default; can match unrelated processes)"
     echo "  --help             Show this help message"
     echo ""
     echo "Examples:"
     echo "  $0                              # Build and start all targets"
     echo "  $0 --targets rest-api           # Only set up rest-api"
     echo "  $0 --teardown                   # Stop everything and clean up"
+    echo "  $0 --teardown --sweep           # Also sweep untracked orphans (last resort)"
 }
 
 main() {
@@ -645,6 +660,10 @@ main() {
                 ;;
             --teardown)
                 teardown=true
+                shift
+                ;;
+            --sweep)
+                SWEEP_ORPHANS=true
                 shift
                 ;;
             --help)
