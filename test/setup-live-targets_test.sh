@@ -7,11 +7,14 @@
 #   * Teardown kills EVERY started generation, not just the most recent
 #     (orphan-PID accumulation across repeated setup runs).
 #   * Legacy single-PID files (.<name>.pid) are still honoured.
+#   * Recorded/stale PIDs are killed only when they still belong to the service
+#     (identity check), so a recycled PID is never killed.
 #   * Orphans with no pid log are swept by basename (Go services) and by
 #     listening port (node/graphql), never by pkill-ing `node` by name.
 #   * Stale processes are cleaned up on setup startup.
-#   * Port exhaustion is detected (find_available_port returns empty) so the
-#     caller's failure message runs instead of a silent `set -e` exit.
+#   * Port exhaustion is detected AND the caller's failure path runs under
+#     `set -e` (Bug 2) instead of a silent exit.
+#   * show_port_holders lists the processes holding an exhausted range (AC2).
 #
 # No Go build, Node, or Chrome required — the test spawns lightweight stand-ins,
 # so it runs in the offline CI job. Run directly:
@@ -23,9 +26,10 @@ set -uo pipefail
 THIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_UNDER_TEST="${THIS_DIR}/setup-live-targets.sh"
 
-# Isolate all PID/state files in a temp dir so we never touch the real test/ tree.
+# Isolate all PID/state files in a temp dir so we never touch the real test/
+# tree. This uses the dedicated state-dir override, NOT SCRIPT_DIR — the script
+# always resolves SCRIPT_DIR from its own location and sources common.sh there.
 STATE_DIR="$(mktemp -d)"
-cp "${THIS_DIR}/common.sh" "${STATE_DIR}/common.sh"
 
 # Track every PID we spawn so cleanup is guaranteed even if an assertion fails.
 SPAWNED_PIDS=()
@@ -39,15 +43,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Source the script with an overridden SCRIPT_DIR. The main() guard means only
-# the functions load — nothing is started.
-export SCRIPT_DIR="${STATE_DIR}"
+# Source the script with the state dir redirected to our temp dir. The main()
+# guard means only the functions load — nothing is started.
+export SETUP_LIVE_TARGETS_STATE_DIR="${STATE_DIR}"
 # shellcheck source=/dev/null
 source "${SCRIPT_UNDER_TEST}"
 
 # The sourced script enables `set -euo pipefail`; relax it so assertions that
 # probe for dead processes (expected non-zero exits) don't abort the harness.
 set +e +u
+
+# Sandbox the orphan-discovery seams for the entire run so a sweep can NEVER
+# reach the developer's real process table (`pgrep -x rest-api` / an lsof port
+# scan would otherwise match a dev's own service). Each test that exercises a
+# sweep sets the matching _sweep_* variable to its OWN stand-in PID; the real
+# pgrep/lsof discovery in the seams is intentionally not exercised offline.
+_name_sweep_pid=""
+_port_sweep_pid=""
+orphan_pids_by_name() { [ -n "$_name_sweep_pid" ] && echo "$_name_sweep_pid"; return 0; }
+orphan_pids_by_port() { [ -n "$_port_sweep_pid" ] && echo "$_port_sweep_pid"; return 0; }
 
 # ── Test harness ──────────────────────────────────────────────────────────
 PASS=0
@@ -80,27 +94,43 @@ assert_eq() {
     if [ "$1" = "$2" ]; then ok "$3"; else fail "$3 (expected '$2', got '$1')"; fi
 }
 
-# Spawn a long-lived background process; sets REPLY to its PID and records it.
-spawn_sleep() {
-    sleep 600 &
-    REPLY=$!
-    SPAWNED_PIDS+=("$REPLY")
+assert_contains() {
+    case "$1" in
+        *"$2"*) ok "$3" ;;
+        *)      fail "$3 (missing '$2' in output)" ;;
+    esac
 }
 
-# Spawn a long-lived process whose executable basename is $1 (so `pgrep -x`
-# matches it, mirroring a real compiled Go target). Copies the real `sleep`.
+# Spawn a long-lived process whose executable basename is $1, so both `pgrep -x`
+# and the pid_matches_service identity check see it as that service (mirrors a
+# real compiled Go target). Copies the real `sleep`. Sets REPLY to its PID.
 spawn_named() {
-    cp "$(command -v sleep)" "${STATE_DIR}/$1"
+    # Reuse an existing stand-in binary — copying over one that is still running
+    # fails with "Text file busy" and is unnecessary (same bytes).
+    [ -x "${STATE_DIR}/$1" ] || cp "$(command -v sleep)" "${STATE_DIR}/$1"
     "${STATE_DIR}/$1" 600 &
     REPLY=$!
     SPAWNED_PIDS+=("$REPLY")
+    disown "$REPLY" 2>/dev/null || true   # silence async "Killed" job notices
+}
+
+# Find a free localhost TCP port for a test listener (independent of any stub of
+# port_in_use later in the file).
+free_port() {
+    python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
 }
 
 # ── Test 1: teardown kills every generation (append-log) ────────────────────
 echo "Test 1: teardown kills every started generation"
-spawn_sleep; p1=$REPLY
-spawn_sleep; p2=$REPLY
-spawn_sleep; p3=$REPLY
+spawn_named rest-api; p1=$REPLY
+spawn_named rest-api; p2=$REPLY
+spawn_named rest-api; p3=$REPLY
 record_pid rest-api "$p1"
 record_pid rest-api "$p2"
 record_pid rest-api "$p3"
@@ -112,48 +142,53 @@ assert_no_file "${STATE_DIR}/.rest-api.pids" "pid log removed after teardown"
 
 # ── Test 2: legacy single-PID file is honoured ──────────────────────────────
 echo "Test 2: legacy .pid file is still killed"
-spawn_sleep; p=$REPLY
+spawn_named soap-service; p=$REPLY
 echo "$p" > "${STATE_DIR}/.soap-service.pid"
 stop_service soap-service >/dev/null 2>&1
 assert_dead "$p" "legacy-pidfile process killed"
 assert_no_file "${STATE_DIR}/.soap-service.pid" "legacy pid file removed"
 
-# ── Test 3: orphan with no pid log swept by basename (Go service) ───────────
-echo "Test 3: untracked orphan swept by basename"
-if command -v pgrep >/dev/null 2>&1; then
-    spawn_named grpc-server; p=$REPLY   # comm == grpc-server, no pid log recorded
-    assert_alive "$p" "orphan running before sweep"
-    stop_service grpc-server >/dev/null 2>&1
-    assert_dead "$p" "orphan swept by exact basename"
-else
-    echo "  skip - pgrep not available"
-fi
+# ── Test 3: recorded PID that is NOT the service is spared (recycled PID) ────
+echo "Test 3: recycled PID (identity mismatch) is not killed"
+spawn_sleep_pid() { sleep 600 & REPLY=$!; SPAWNED_PIDS+=("$REPLY"); disown "$REPLY" 2>/dev/null || true; }
+spawn_sleep_pid; imposter=$REPLY   # comm == 'sleep', not 'rest-api'
+record_pid rest-api "$imposter"
+stop_service rest-api >/dev/null 2>&1
+assert_alive "$imposter" "process whose comm != service basename is spared"
+kill -9 "$imposter" 2>/dev/null || true
 
-# ── Test 4: graphql orphan swept by port, never by pkill node ───────────────
-echo "Test 4: graphql orphan swept by listening port (not by killing node)"
-if command -v lsof >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 \
-   && ! port_in_use "$DEFAULT_GRAPHQL_SERVER_PORT"; then
-    python3 -m http.server "$DEFAULT_GRAPHQL_SERVER_PORT" --bind 127.0.0.1 >/dev/null 2>&1 &
+# ── Test 4: untracked orphan swept by basename (Go service) ─────────────────
+echo "Test 4: untracked orphan swept by basename"
+spawn_named grpc-server; p=$REPLY   # comm == grpc-server, no pid log recorded
+_name_sweep_pid="$p"                 # sandbox: sweep sees only this stand-in
+assert_alive "$p" "orphan running before sweep"
+stop_service grpc-server >/dev/null 2>&1
+assert_dead "$p" "orphan swept via name seam (no pid log present)"
+_name_sweep_pid=""
+
+# ── Test 5: graphql orphan swept by port seam, never by pkill node ──────────
+echo "Test 5: graphql orphan swept by listening-port seam"
+if command -v python3 >/dev/null 2>&1; then
+    port="$(free_port)"
+    python3 -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1 &
     p=$!
     SPAWNED_PIDS+=("$p")
-    # Wait for the listener to bind.
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        if port_in_use "$DEFAULT_GRAPHQL_SERVER_PORT"; then break; fi
-        sleep 0.2
-    done
+    disown "$p" 2>/dev/null || true
+    _port_sweep_pid="$p"             # sandbox: sweep sees only this stand-in
     assert_alive "$p" "port listener running before sweep"
     stop_service graphql-server >/dev/null 2>&1
-    assert_dead "$p" "listener swept by port"
+    assert_dead "$p" "listener swept via port seam (no pid log present)"
+    _port_sweep_pid=""
 else
-    echo "  skip - lsof/python3 unavailable or default graphql port busy"
+    echo "  skip - python3 unavailable"
 fi
 
-# ── Test 5: setup → setup → teardown leaves zero processes (acceptance) ──────
-echo "Test 5: two setup generations accumulate, teardown kills all"
+# ── Test 6: setup → setup → teardown leaves zero processes (acceptance) ──────
+echo "Test 6: two setup generations accumulate, teardown kills all"
 gen_pids=()
 for _round in 1 2; do
     for svc in rest-api soap-service concat-spa; do
-        spawn_sleep
+        spawn_named "$svc"
         record_pid "$svc" "$REPLY"
         gen_pids+=("$REPLY")
     done
@@ -165,26 +200,79 @@ for gp in "${gen_pids[@]}"; do
 done
 assert_eq "$all_dead" "1" "all 6 processes across 2 generations killed"
 
-# ── Test 6: stale-state cleanup on setup startup ────────────────────────────
-echo "Test 6: cleanup_stale_state kills leftovers and clears pid logs"
-spawn_sleep; p=$REPLY
+# ── Test 7: stale-state cleanup on setup startup ────────────────────────────
+echo "Test 7: cleanup_stale_state kills leftovers and clears pid logs"
+spawn_named rest-api; p=$REPLY
 record_pid rest-api "$p"
-cleanup_stale_state >/dev/null 2>&1
+out="$(cleanup_stale_state 2>&1)"
 assert_dead "$p" "stale process killed at startup"
+assert_contains "$out" "Killing stale process rest-api" "explicit stale-kill log line (AC3)"
 assert_no_file "${STATE_DIR}/.rest-api.pids" "stale pid log cleared at startup"
 
-# ── Test 7: port exhaustion is detectable (Bug 2) ───────────────────────────
-echo "Test 7: find_available_port returns empty when the window is exhausted"
-# Force every probed port to look occupied.
+# ── Test 8: show_port_holders lists processes holding the range (AC2) ────────
+echo "Test 8: show_port_holders reports listeners on the port window"
+if command -v python3 >/dev/null 2>&1 \
+   && { command -v lsof >/dev/null 2>&1 || command -v ss >/dev/null 2>&1; }; then
+    hp="$(free_port)"
+    python3 -m http.server "$hp" --bind 127.0.0.1 >/dev/null 2>&1 &
+    lp=$!
+    SPAWNED_PIDS+=("$lp")
+    disown "$lp" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if lsof -nP -iTCP:"$hp" -sTCP:LISTEN >/dev/null 2>&1 \
+           || ss -ltnH 2>/dev/null | grep -q ":$hp "; then break; fi
+        sleep 0.2
+    done
+    out="$(show_port_holders "$hp" 2>&1)"
+    assert_contains "$out" "Listening processes on TCP ${hp}-$((hp + 20))" "prints the scanned window header"
+    assert_contains "$out" ":${hp}" "lists the listener holding the base port"
+    kill -9 "$lp" 2>/dev/null || true
+else
+    echo "  skip - python3 and (lsof or ss) required"
+fi
+
+# ── Test 9: find_available_port increments past busy ports to the next free ──
+echo "Test 9: find_available_port returns the first free port in the window"
+# Busy for 19000..19002, free from 19003 on.
 # shellcheck disable=SC2317  # invoked indirectly by find_available_port
-port_in_use() { return 0; }
+port_in_use() { [ "$1" -lt 19003 ]; }
 result=$(find_available_port 19000) || true
-assert_eq "$result" "" "exhausted range yields empty string (caller check runs)"
-# And the happy path still returns the base port when free.
+assert_eq "$result" "19003" "skips 3 busy ports, returns base+3"
+# Busy across the whole 21-port window (19000..19020); free only at base+21.
 # shellcheck disable=SC2317  # invoked indirectly by find_available_port
-port_in_use() { return 1; }
+port_in_use() { [ "$1" -le 19020 ]; }
 result=$(find_available_port 19000) || true
-assert_eq "$result" "19000" "free base port returned"
+assert_eq "$result" "" "does not overrun the window edge (base+20)"
+
+# ── Test 10: exhaustion failure path runs under set -e (Bug 2 regression) ────
+echo "Test 10: resolve_port_or_die logs and exits 1 under set -e (not silent)"
+# Simulate an exhausted range. This must FAIL if the `|| true` in
+# resolve_port_or_die is removed: set -e would then abort the command
+# substitution before log_fail runs, so no message would be printed.
+# shellcheck disable=SC2317  # invoked indirectly by resolve_port_or_die
+find_available_port() { echo ""; return 1; }
+out="$( set -e; resolve_port_or_die rest-api 19000 2>&1 )"
+rc=$?
+# NOTE: rc==1 alone does NOT prove the fix — with `|| true` removed, set -e also
+# aborts the subshell with status 1. The discriminating (red-green) guard is the
+# message assertion below: reverting `|| true` makes set -e exit BEFORE log_fail,
+# so the message disappears and this assertion fails.
+assert_eq "$rc" "1" "exits 1 on exhaustion"
+assert_contains "$out" "Cannot find available port for rest-api" "prints failure message instead of dying silently"
+
+# ── Test 11: kill_pid escalates to SIGKILL when SIGTERM is ignored ──────────
+echo "Test 11: a SIGTERM-ignoring process is force-killed (SIGKILL escalation)"
+# A copy of bash named 'concat-spa' (so pid_matches_service accepts it) that
+# traps and ignores SIGTERM — only kill_pid's SIGKILL fallback can end it.
+rm -f "${STATE_DIR}/concat-spa"
+cp "$(command -v bash)" "${STATE_DIR}/concat-spa"
+"${STATE_DIR}/concat-spa" -c "trap '' TERM; while :; do sleep 1; done" &
+stubborn=$!
+SPAWNED_PIDS+=("$stubborn")
+disown "$stubborn" 2>/dev/null || true
+record_pid concat-spa "$stubborn"
+stop_service concat-spa >/dev/null 2>&1
+assert_dead "$stubborn" "SIGTERM-ignoring process force-killed via SIGKILL escalation"
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 echo ""

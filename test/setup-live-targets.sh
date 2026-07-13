@@ -16,15 +16,22 @@
 
 set -euo pipefail
 
-# SCRIPT_DIR may be pre-set by the regression test to isolate PID/state files in
-# a temp dir; default to the directory this script lives in.
-SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+# Directory this script lives in. Resolved from BASH_SOURCE only — never trusted
+# from the environment, since it decides where common.sh is sourced from and
+# where the service binaries are executed.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Directory for mutable state: PID logs, config, service logs. Defaults to
+# SCRIPT_DIR. The regression test points this at a temp dir (via the dedicated
+# SETUP_LIVE_TARGETS_STATE_DIR override) to isolate state, without redirecting
+# where the script sources code from.
+STATE_DIR="${SETUP_LIVE_TARGETS_STATE_DIR:-$SCRIPT_DIR}"
 
 # Services managed by this script. Kept in one place so teardown, stale-state
 # cleanup, and orphan sweeps all iterate the same set.
 MANAGED_SERVICES="rest-api soap-service graphql-server grpc-server concat-spa"
-CONFIG_FILE="${SCRIPT_DIR}/.live-test-config"
+CONFIG_FILE="${STATE_DIR}/.live-test-config"
 
 # Default ports
 DEFAULT_REST_API_PORT=8990
@@ -80,6 +87,25 @@ show_port_holders() {
             '{ n = split($4, a, ":"); p = a[n]; if (p >= b && p <= e) print "    " $0 }' || true
     else
         log_info "    (install lsof or ss to list port holders)"
+    fi
+}
+
+# Resolve an available port for a service, or exit 1 after logging a diagnostic
+# that names the processes holding the range. On success sets RESOLVED_PORT.
+#
+# Callers MUST invoke this as a statement, never inside `$(...)`: `exit` in a
+# command substitution kills only the subshell, so the script would carry on
+# with an empty port. The `|| true` disarms `set -e` for the command
+# substitution so the `[ -z ]` check runs instead of the script dying silently
+# on an exhausted range (LAB-2893 Bug 2).
+RESOLVED_PORT=""
+resolve_port_or_die() {
+    local name=$1 default_port=$2
+    RESOLVED_PORT="$(find_available_port "$default_port")" || true
+    if [ -z "$RESOLVED_PORT" ]; then
+        log_fail "Cannot find available port for ${name} (tried ${default_port}-$((default_port + 20)))"
+        show_port_holders "$default_port"
+        exit 1
     fi
 }
 
@@ -221,7 +247,7 @@ wait_for_http() {
 # (append, not overwrite) so teardown can kill them all, not just the latest.
 record_pid() {
     local name=$1 pid=$2
-    echo "$pid" >> "${SCRIPT_DIR}/.${name}.pids"
+    echo "$pid" >> "${STATE_DIR}/.${name}.pids"
 }
 
 # Kill a PID if it is alive: TERM, brief grace period, then KILL. Works for
@@ -264,6 +290,22 @@ service_default_port() {
         concat-spa)     echo "$DEFAULT_CONCAT_SPA_PORT" ;;
         *)              echo "" ;;
     esac
+}
+
+# True if $pid is alive AND its command matches the identity expected for service
+# $name — the Go binary basename, or `node` for the node-based graphql-server.
+# PID logs and PID files can outlive a reboot, after which the OS may recycle a
+# recorded PID onto an unrelated process; this guard stops us from killing that
+# innocent process. `comm` is compared by basename to tolerate macOS returning a
+# full path where Linux returns the bare (≤15 char) name.
+pid_matches_service() {
+    local pid=$1 name=$2 comm binary
+    comm="$(ps -p "$pid" -o comm= 2>/dev/null)"
+    comm="$(basename "$comm" 2>/dev/null)"
+    [ -n "$comm" ] || return 1
+    binary="$(service_binary "$name")"
+    [ -n "$binary" ] || binary="node"
+    [ "$comm" = "$binary" ]
 }
 
 start_rest_api() {
@@ -321,7 +363,7 @@ start_graphql_server() {
     local port=$1
     log_info "Starting graphql-server on port ${port}..."
     cd "${SCRIPT_DIR}/graphql-server"
-    PORT="$port" node server.js > "${SCRIPT_DIR}/.graphql-server.log" 2>&1 &
+    PORT="$port" node server.js > "${STATE_DIR}/.graphql-server.log" 2>&1 &
     local pid=$!
     record_pid graphql-server "$pid"
 
@@ -378,65 +420,83 @@ start_grpc_server() {
     fi
 }
 
-# Kill every PID recorded for a service, across all setup generations, then
-# sweep any orphans whose pid log was lost. Idempotent.
-stop_service() {
-    local name=$1
-    local stopped=0
-    local pidfile pid
-
-    # 1. Kill every recorded generation. Read both the append-log (.pids, current
-    #    format) and any legacy single-PID file (.pid) left by older setups.
-    for pidfile in "${SCRIPT_DIR}/.${name}.pids" "${SCRIPT_DIR}/.${name}.pid"; do
+# Echo every PID recorded for a service, one per line, skipping blanks. Reads
+# both the append-log (.pids, current format) and any legacy single-PID file
+# (.pid) left by older setups. Read-only — the caller decides when to clear.
+recorded_pids() {
+    local name=$1 pidfile pid
+    for pidfile in "${STATE_DIR}/.${name}.pids" "${STATE_DIR}/.${name}.pid"; do
         [ -f "$pidfile" ] || continue
         while read -r pid || [ -n "$pid" ]; do
             [ -n "${pid//[[:space:]]/}" ] || continue
-            if kill_pid "$pid"; then
-                log_ok "Stopped ${name} (PID: ${pid})"
-                stopped=$((stopped + 1))
-            fi
+            echo "$pid"
         done < "$pidfile"
-        rm -f "$pidfile"
     done
-
-    # 2. Belt-and-suspenders sweep for orphans not covered by a pid log.
-    stopped=$((stopped + $(sweep_orphans "$name")))
-
-    if [ "$stopped" -eq 0 ]; then
-        log_info "${name}: no running processes found"
-    fi
 }
 
-# Kill orphaned processes for a service that are not tracked in a pid log.
-# Go services have unique executable names and are swept by exact basename
-# (current user only). graphql-server runs as `node`, so it is swept by its
-# listening-port window instead — sweeping `node` by name is unsafe.
-# Echoes the number of processes killed.
-sweep_orphans() {
+# Remove both pid-log formats for a service.
+clear_recorded_pids() {
     local name=$1
-    local killed=0
-    local binary pid
-    binary=$(service_binary "$name")
+    rm -f "${STATE_DIR}/.${name}.pids" "${STATE_DIR}/.${name}.pid"
+}
 
-    if [ -n "$binary" ] && command -v pgrep >/dev/null 2>&1; then
-        for pid in $(pgrep -x -U "$(id -u)" "$binary" 2>/dev/null || true); do
+# True if a pid log (either format) exists for a service.
+has_recorded_pids() {
+    local name=$1
+    [ -f "${STATE_DIR}/.${name}.pids" ] || [ -f "${STATE_DIR}/.${name}.pid" ]
+}
+
+# Orphan-discovery seams. Overridable when the script is sourced: the regression
+# test stubs these so its sweeps stay confined to the test's own stand-ins and
+# never touch the developer's real process table.
+#
+# By exact executable basename, current user only. `pgrep -x` matches the whole
+# name (not a substring), so only a process actually named "$1" is returned.
+orphan_pids_by_name() {
+    command -v pgrep >/dev/null 2>&1 || return 0
+    pgrep -x -U "$(id -u)" "$1" 2>/dev/null || true
+}
+
+# By listening-port window [base, base+20], restricted to `node` processes: the
+# graphql-server runs as `node`, and the identity filter avoids killing an
+# unrelated service that merely listens in the same range. `-nP` skips the
+# reverse-DNS / port-name lookups that could otherwise hang teardown.
+orphan_pids_by_port() {
+    local base=$1
+    local end=$((base + 20)) port pid comm
+    command -v lsof >/dev/null 2>&1 || return 0
+    for port in $(seq "$base" "$end"); do
+        for pid in $(lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true); do
+            comm="$(ps -p "$pid" -o comm= 2>/dev/null)"
+            [ "$(basename "$comm" 2>/dev/null)" = "node" ] && echo "$pid"
+        done
+    done
+}
+
+# Kill orphaned processes for a service whose pid log was lost. Go services have
+# unique executable names and are swept by exact basename; graphql-server runs
+# as `node`, so it is swept by its listening-port window. Echoes the number of
+# processes killed. Called by stop_service ONLY when no pid log existed — the
+# pid log is the primary, reliable mechanism; this is the fallback.
+sweep_orphans() {
+    local name=$1 killed=0 binary base pid
+    binary="$(service_binary "$name")"
+
+    if [ -n "$binary" ]; then
+        for pid in $(orphan_pids_by_name "$binary"); do
             if kill_pid "$pid"; then
                 log_warn "Swept orphan ${name} (PID: ${pid}, matched '${binary}')" >&2
                 killed=$((killed + 1))
             fi
         done
     else
-        # Port-based sweep across the window setup could have used (base..base+20).
-        local base port
-        base=$(service_default_port "$name")
-        if [ -n "$base" ] && command -v lsof >/dev/null 2>&1; then
-            for port in $(seq "$base" $((base + 20))); do
-                for pid in $(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true); do
-                    if kill_pid "$pid"; then
-                        log_warn "Swept orphan ${name} (PID: ${pid}, port ${port})" >&2
-                        killed=$((killed + 1))
-                    fi
-                done
+        base="$(service_default_port "$name")"
+        if [ -n "$base" ]; then
+            for pid in $(orphan_pids_by_port "$base"); do
+                if kill_pid "$pid"; then
+                    log_warn "Swept orphan ${name} (PID: ${pid}, node in port window)" >&2
+                    killed=$((killed + 1))
+                fi
             done
         fi
     fi
@@ -444,25 +504,56 @@ sweep_orphans() {
     echo "$killed"
 }
 
+# Kill every PID recorded for a service across all setup generations, then — only
+# if no pid log was found — sweep orphans left by a run whose log was lost. Every
+# recorded PID is identity-checked before signalling (see pid_matches_service),
+# so a recycled PID is skipped rather than killed. Idempotent.
+stop_service() {
+    local name=$1 stopped=0 pid no_log=1
+    has_recorded_pids "$name" && no_log=0
+
+    while read -r pid; do
+        pid_matches_service "$pid" "$name" || continue
+        if kill_pid "$pid"; then
+            log_ok "Stopped ${name} (PID: ${pid})"
+            stopped=$((stopped + 1))
+        fi
+    done < <(recorded_pids "$name")
+    clear_recorded_pids "$name"
+
+    # Belt-and-suspenders: the broad orphan sweep runs only when the pid log was
+    # lost. A normal teardown after setup has the log and never reaches here.
+    if [ "$no_log" -ne 0 ]; then
+        stopped=$((stopped + $(sweep_orphans "$name")))
+    fi
+
+    if [ "$stopped" -eq 0 ]; then
+        log_info "${name}: no running processes found"
+    fi
+}
+
 # Detect and kill processes left behind by a previous setup that did not tear
 # down (e.g. "ran setup twice"). Logs an explicit line per stale process so the
-# accidental-double-setup case is no longer silent.
+# accidental-double-setup case is no longer silent. Each recorded PID is
+# identity-checked first, so a recycled PID is skipped rather than killed.
+#
+# By design this relies solely on the pid log — it deliberately does NOT run the
+# broad basename/port orphan sweep that stop_service uses. Keeping the aggressive
+# sweep confined to the explicit teardown escape hatch avoids killing unrelated
+# processes on every routine setup. If a prior run's pid log was lost while its
+# process still holds a port, find_available_port simply steps past the occupied
+# port, and a truly exhausted range is reported by show_port_holders — so a fresh
+# setup still proceeds. Run `--teardown` to reap such an orphan.
 cleanup_stale_state() {
-    local found=0
-    local name pidfile pid
+    local found=0 name pid
     for name in $MANAGED_SERVICES; do
-        for pidfile in "${SCRIPT_DIR}/.${name}.pids" "${SCRIPT_DIR}/.${name}.pid"; do
-            [ -f "$pidfile" ] || continue
-            while read -r pid || [ -n "$pid" ]; do
-                [ -n "${pid//[[:space:]]/}" ] || continue
-                if kill -0 "$pid" 2>/dev/null; then
-                    log_warn "Killing stale process ${name} (PID: ${pid}) from a previous setup"
-                    kill_pid "$pid" || true
-                    found=1
-                fi
-            done < "$pidfile"
-            rm -f "$pidfile"
-        done
+        while read -r pid; do
+            pid_matches_service "$pid" "$name" || continue
+            log_warn "Killing stale process ${name} (PID: ${pid}) from a previous setup"
+            kill_pid "$pid" || true
+            found=1
+        done < <(recorded_pids "$name")
+        clear_recorded_pids "$name"
     done
     if [ "$found" -eq 1 ]; then
         log_ok "Cleared stale processes from a previous run"
@@ -484,10 +575,10 @@ do_teardown() {
     # Clean up config, PID logs (both formats), and other state.
     rm -f "${CONFIG_FILE}"
     for name in $MANAGED_SERVICES; do
-        rm -f "${SCRIPT_DIR}/.${name}.pid" "${SCRIPT_DIR}/.${name}.pids"
+        clear_recorded_pids "$name"
     done
-    rm -f "${SCRIPT_DIR}/.graphql-server.log"
-    rm -rf "${SCRIPT_DIR}/.results"
+    rm -f "${STATE_DIR}/.graphql-server.log"
+    rm -rf "${STATE_DIR}/.results"
 
     log_ok "Teardown complete"
 }
@@ -615,54 +706,32 @@ main() {
     for target in "${TARGET_ARRAY[@]}"; do
         case "$target" in
             rest-api)
-                # `|| true` disarms `set -e` for this substitution so the
-                # `[ -z ]` check below runs instead of the script dying silently.
-                REST_API_PORT=$(find_available_port "$DEFAULT_REST_API_PORT") || true
-                if [ -z "$REST_API_PORT" ]; then
-                    log_fail "Cannot find available port for rest-api (tried ${DEFAULT_REST_API_PORT}-$((DEFAULT_REST_API_PORT + 20)))"
-                    show_port_holders "$DEFAULT_REST_API_PORT"
-                    exit 1
-                fi
+                resolve_port_or_die rest-api "$DEFAULT_REST_API_PORT"
+                REST_API_PORT=$RESOLVED_PORT
                 log_ok "rest-api: port ${REST_API_PORT}"
                 start_rest_api "$REST_API_PORT" || start_failed=1
                 ;;
             soap-service)
-                SOAP_SERVICE_PORT=$(find_available_port "$DEFAULT_SOAP_SERVICE_PORT") || true
-                if [ -z "$SOAP_SERVICE_PORT" ]; then
-                    log_fail "Cannot find available port for soap-service (tried ${DEFAULT_SOAP_SERVICE_PORT}-$((DEFAULT_SOAP_SERVICE_PORT + 20)))"
-                    show_port_holders "$DEFAULT_SOAP_SERVICE_PORT"
-                    exit 1
-                fi
+                resolve_port_or_die soap-service "$DEFAULT_SOAP_SERVICE_PORT"
+                SOAP_SERVICE_PORT=$RESOLVED_PORT
                 log_ok "soap-service: port ${SOAP_SERVICE_PORT}"
                 start_soap_service "$SOAP_SERVICE_PORT" || start_failed=1
                 ;;
             graphql-server)
-                GRAPHQL_SERVER_PORT=$(find_available_port "$DEFAULT_GRAPHQL_SERVER_PORT") || true
-                if [ -z "$GRAPHQL_SERVER_PORT" ]; then
-                    log_fail "Cannot find available port for graphql-server (tried ${DEFAULT_GRAPHQL_SERVER_PORT}-$((DEFAULT_GRAPHQL_SERVER_PORT + 20)))"
-                    show_port_holders "$DEFAULT_GRAPHQL_SERVER_PORT"
-                    exit 1
-                fi
+                resolve_port_or_die graphql-server "$DEFAULT_GRAPHQL_SERVER_PORT"
+                GRAPHQL_SERVER_PORT=$RESOLVED_PORT
                 log_ok "graphql-server: port ${GRAPHQL_SERVER_PORT}"
                 start_graphql_server "$GRAPHQL_SERVER_PORT" || start_failed=1
                 ;;
             grpc-server)
-                GRPC_SERVER_PORT=$(find_available_port "$DEFAULT_GRPC_SERVER_PORT") || true
-                if [ -z "$GRPC_SERVER_PORT" ]; then
-                    log_fail "Cannot find available port for grpc-server (tried ${DEFAULT_GRPC_SERVER_PORT}-$((DEFAULT_GRPC_SERVER_PORT + 20)))"
-                    show_port_holders "$DEFAULT_GRPC_SERVER_PORT"
-                    exit 1
-                fi
+                resolve_port_or_die grpc-server "$DEFAULT_GRPC_SERVER_PORT"
+                GRPC_SERVER_PORT=$RESOLVED_PORT
                 log_ok "grpc-server: port ${GRPC_SERVER_PORT}"
                 start_grpc_server "$GRPC_SERVER_PORT" || start_failed=1
                 ;;
             concat-spa)
-                CONCAT_SPA_PORT=$(find_available_port "$DEFAULT_CONCAT_SPA_PORT") || true
-                if [ -z "$CONCAT_SPA_PORT" ]; then
-                    log_fail "Cannot find available port for concat-spa (tried ${DEFAULT_CONCAT_SPA_PORT}-$((DEFAULT_CONCAT_SPA_PORT + 20)))"
-                    show_port_holders "$DEFAULT_CONCAT_SPA_PORT"
-                    exit 1
-                fi
+                resolve_port_or_die concat-spa "$DEFAULT_CONCAT_SPA_PORT"
+                CONCAT_SPA_PORT=$RESOLVED_PORT
                 log_ok "concat-spa: port ${CONCAT_SPA_PORT}"
                 start_concat_spa "$CONCAT_SPA_PORT" || start_failed=1
                 ;;
