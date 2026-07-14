@@ -717,6 +717,7 @@ parse_args() {
     PARSED_TARGETS="$ALL_TARGETS"
     PARSED_SKIP_START=false
     PARSED_TEARDOWN=false
+    SWEEP_ORPHANS=false   # reset with the other parsed flags so parse_args is idempotent
 
     while [ $# -gt 0 ]; do
         case "$1" in

@@ -15,6 +15,12 @@
 #   * Port exhaustion is detected AND the caller's failure path runs under
 #     `set -e` (Bug 2) instead of a silent exit.
 #   * show_port_holders lists the processes holding an exhausted range (AC2).
+#   * graphql-server (node) is matched only when node AND listening in its port
+#     window; kill_pid escalates SIGTERM -> SIGKILL.
+#   * parse_args maps the CLI flags (esp. --sweep -> SWEEP_ORPHANS, default off).
+#   * An already-dead recorded PID is handled gracefully (not counted stopped).
+#   * The real orphan-discovery seams filter by node-in-port-window and by exact
+#     basename + current user.
 #
 # No Go build, Node, or Chrome required — the test spawns lightweight stand-ins,
 # so it runs in the offline CI job. Run directly:
@@ -365,14 +371,23 @@ assert_eq "$PARSED_TARGETS" "rest-api,soap-service" "--targets captures the list
 assert_eq "$rc" "1" "unknown option exits 1"
 SWEEP_ORPHANS=false
 
-# ── Test 15: a recorded PID that already exited is declined cleanly ──────────
-echo "Test 15: an already-dead recorded PID is skipped, not errored on"
+# ── Test 15: a recorded PID from a generation that already exited is handled ──
+echo "Test 15: an already-dead recorded PID is handled gracefully, not counted as stopped"
+# A generation that exited on its own leaves its PID in the log. stop_service
+# must decline it (identity check yields empty comm), so it is NOT reported as a
+# process it stopped, it clears the log, and it does not error under set -euo
+# pipefail. (The recycled-PID guarantee — a LIVE PID whose comm mismatches — is
+# pinned separately by Tests 3 and 13.)
 spawn_sleep_pid; dead=$REPLY
 kill -9 "$dead" 2>/dev/null || true
 for _ in 1 2 3 4 5 6 7 8 9 10; do is_alive "$dead" || break; sleep 0.2; done
 record_pid rest-api "$dead"
 out="$(stop_service rest-api 2>&1)"
-assert_contains "$out" "no running processes found" "dead recorded PID declined (empty-comm branch)"
+assert_contains "$out" "no running processes found" "dead recorded PID: nothing reported stopped"
+case "$out" in
+    *"Stopped rest-api"*) fail "dead recorded PID must not be counted as stopped" ;;
+    *)                    ok "dead recorded PID not counted as stopped" ;;
+esac
 assert_no_file "${STATE_DIR}/.rest-api.pids" "pid log cleared after declining a dead PID"
 
 # ── Test 16: real orphan_pids_by_port keeps the node-only port-window filter ──
@@ -393,17 +408,24 @@ if command -v lsof >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
 
     # A node-named listener in the window must be RETURNED. Copy the python
     # interpreter to a binary literally named 'node' so its comm == 'node'.
-    cp "$(command -v python3)" "${STATE_DIR}/node"
-    nport="$(free_port)"
-    "${STATE_DIR}/node" -m http.server "$nport" --bind 127.0.0.1 >/dev/null 2>&1 &
-    np=$!; SPAWNED_PIDS+=("$np"); disown "$np" 2>/dev/null || true
-    for _ in 1 2 3 4 5 6 7 8 9 10; do lsof -nP -iTCP:"$nport" -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 0.2; done
-    got="$(real_orphan_pids_by_port "$nport")"
-    case " $got " in
-        *" $np "*) ok "node listener in window is returned" ;;
-        *)         fail "node listener in window is returned (got '$got')" ;;
-    esac
-    kill -9 "$np" 2>/dev/null || true
+    # rm -f first: a prior 'node' copy (Test 13) may still be exiting, and cp
+    # over a running executable fails "Text file busy"; unlinking then creating a
+    # fresh file avoids that. Skip the sub-case if the copy cannot be made.
+    rm -f "${STATE_DIR}/node"
+    if ! cp "$(command -v python3)" "${STATE_DIR}/node"; then
+        fail "could not stage node stand-in (cp failed)"
+    else
+        nport="$(free_port)"
+        "${STATE_DIR}/node" -m http.server "$nport" --bind 127.0.0.1 >/dev/null 2>&1 &
+        np=$!; SPAWNED_PIDS+=("$np"); disown "$np" 2>/dev/null || true
+        for _ in 1 2 3 4 5 6 7 8 9 10; do lsof -nP -iTCP:"$nport" -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 0.2; done
+        got="$(real_orphan_pids_by_port "$nport")"
+        case " $got " in
+            *" $np "*) ok "node listener in window is returned" ;;
+            *)         fail "node listener in window is returned (got '$got')" ;;
+        esac
+        kill -9 "$np" 2>/dev/null || true
+    fi
 else
     echo "  skip - lsof and python3 required"
 fi
