@@ -38,6 +38,9 @@ make deps                     # go mod download && go mod tidy
 
 # Clean
 make clean                    # Remove bin/, dist/, coverage.out
+
+# Live test services
+make live-test-clean          # Stop live test services (escape hatch for orphaned processes)
 ```
 
 ## Architecture
