@@ -303,19 +303,40 @@ service_default_port() {
 }
 
 # True if $pid is alive AND its command matches the identity expected for service
-# $name — the Go binary basename, or `node` for the node-based graphql-server.
-# PID logs and PID files can outlive a reboot, after which the OS may recycle a
-# recorded PID onto an unrelated process; this guard stops us from killing that
-# innocent process. `comm` is compared by basename to tolerate macOS returning a
-# full path where Linux returns the bare (≤15 char) name.
+# $name. PID logs and PID files can outlive a reboot, after which the OS may
+# recycle a recorded PID onto an unrelated process; this guard stops us from
+# killing that innocent process. `comm` is compared by basename to tolerate macOS
+# returning a full path where Linux returns the bare (≤15 char) name.
+#
+# Services with a unique executable (the Go targets) match by exact basename.
+# graphql-server has no unique name — it runs as `node server.js`, and `comm` for
+# any node process is just `node` — so an exact-name match alone would accept ANY
+# of the user's node processes onto which the recorded PID may have been recycled.
+# For it we additionally require the PID to be listening in the service's port
+# window, reusing the same node-in-window identity filter as the orphan sweep
+# (orphan_pids_by_port). If that check cannot run (e.g. lsof unavailable) we
+# decline the match rather than kill an unverified node process.
 pid_matches_service() {
-    local pid=$1 name=$2 comm binary
+    local pid=$1 name=$2 comm binary base wpid
     comm="$(ps -p "$pid" -o comm= 2>/dev/null)"
     comm="$(basename "$comm" 2>/dev/null)"
     [ -n "$comm" ] || return 1
+
     binary="$(service_binary "$name")"
-    [ -n "$binary" ] || binary="node"
-    [ "$comm" = "$binary" ]
+    if [ -n "$binary" ]; then
+        [ "$comm" = "$binary" ]
+        return
+    fi
+
+    # No unique binary → node-based graphql-server: require node AND a listening
+    # socket in the service's port window before treating it as a match.
+    [ "$comm" = "node" ] || return 1
+    base="$(service_default_port "$name")"
+    [ -n "$base" ] || return 1
+    for wpid in $(orphan_pids_by_port "$base"); do
+        [ "$wpid" = "$pid" ] && return 0
+    done
+    return 1
 }
 
 start_rest_api() {

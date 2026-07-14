@@ -37,6 +37,7 @@ clean:
 	rm -rf $(BUILD_DIR) dist coverage.out
 
 # Escape hatch for orphaned live-test services: stops every recorded generation
-# and sweeps any orphans left by a setup run that never tore down.
+# (kills recorded PIDs only, which is safe). For untracked orphans whose pid log
+# was lost, run ./test/setup-live-targets.sh --teardown --sweep directly.
 live-test-clean:
 	./test/setup-live-targets.sh --teardown

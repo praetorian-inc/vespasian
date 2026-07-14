@@ -194,9 +194,13 @@ fi
 
 # ── Test 6: setup → setup → teardown leaves zero processes (acceptance) ──────
 echo "Test 6: two setup generations accumulate, teardown kills all"
+# All Go-style services (unique executable basename) share the identical
+# do_teardown loop, so covering four of them exercises the accumulation path.
+# graphql-server is intentionally omitted here: its identity check requires a
+# node-named process listening in its port window (covered dedicated in Test 13).
 gen_pids=()
 for _round in 1 2; do
-    for svc in rest-api soap-service concat-spa; do
+    for svc in rest-api soap-service concat-spa grpc-server; do
         spawn_named "$svc"
         record_pid "$svc" "$REPLY"
         gen_pids+=("$REPLY")
@@ -207,7 +211,7 @@ all_dead=1
 for gp in "${gen_pids[@]}"; do
     if is_alive "$gp"; then all_dead=0; fi
 done
-assert_eq "$all_dead" "1" "all 6 processes across 2 generations killed"
+assert_eq "$all_dead" "1" "all 8 processes across 2 generations killed"
 
 # ── Test 7: stale-state cleanup on setup startup ────────────────────────────
 echo "Test 7: cleanup_stale_state kills leftovers and clears pid logs"
@@ -242,25 +246,36 @@ fi
 
 # ── Test 9: find_available_port increments past busy ports to the next free ──
 echo "Test 9: find_available_port returns the first free port in the window"
+# The port_in_use overrides are scoped to the command-substitution subshells so
+# they never leak into later tests (test isolation); the assertions run in the
+# parent shell so the PASS/FAIL counters persist.
 # Busy for 19000..19002, free from 19003 on.
-# shellcheck disable=SC2317  # invoked indirectly by find_available_port
-port_in_use() { [ "$1" -lt 19003 ]; }
-result=$(find_available_port 19000) || true
+result=$(
+    # shellcheck disable=SC2317,SC2329  # invoked indirectly by find_available_port
+    port_in_use() { [ "$1" -lt 19003 ]; }
+    find_available_port 19000
+) || true
 assert_eq "$result" "19003" "skips 3 busy ports, returns base+3"
 # Busy across the whole 21-port window (19000..19020); free only at base+21.
-# shellcheck disable=SC2317  # invoked indirectly by find_available_port
-port_in_use() { [ "$1" -le 19020 ]; }
-result=$(find_available_port 19000) || true
+result=$(
+    # shellcheck disable=SC2317,SC2329  # invoked indirectly by find_available_port
+    port_in_use() { [ "$1" -le 19020 ]; }
+    find_available_port 19000
+) || true
 assert_eq "$result" "" "does not overrun the window edge (base+20)"
 
 # ── Test 10: exhaustion failure path runs under set -e (Bug 2 regression) ────
 echo "Test 10: resolve_port_or_die logs and exits 1 under set -e (not silent)"
 # Simulate an exhausted range. This must FAIL if the `|| true` in
 # resolve_port_or_die is removed: set -e would then abort the command
-# substitution before log_fail runs, so no message would be printed.
-# shellcheck disable=SC2317  # invoked indirectly by resolve_port_or_die
-find_available_port() { echo ""; return 1; }
-out="$( set -e; resolve_port_or_die rest-api 19000 2>&1 )"
+# substitution before log_fail runs, so no message would be printed. The
+# find_available_port override is scoped to the subshell so it does not leak.
+out="$(
+    # shellcheck disable=SC2317,SC2329  # invoked indirectly by resolve_port_or_die
+    find_available_port() { echo ""; return 1; }
+    set -e
+    resolve_port_or_die rest-api 19000 2>&1
+)"
 rc=$?
 # NOTE: rc==1 alone does NOT prove the fix — with `|| true` removed, set -e also
 # aborts the subshell with status 1. The discriminating (red-green) guard is the
@@ -292,6 +307,37 @@ stop_service grpc-server >/dev/null 2>&1
 assert_alive "$safe" "untracked process spared when --sweep is off (footgun closed by default)"
 _name_sweep_pid=""
 kill -9 "$safe" 2>/dev/null || true
+
+# ── Test 13: graphql-server node fallback identity check ────────────────────
+echo "Test 13: graphql-server recorded PID matched only as node AND in its window"
+# graphql-server has no unique binary; pid_matches_service accepts a recorded PID
+# only when comm == 'node' AND it holds a port in the service window. The window
+# check reuses orphan_pids_by_port, stubbed above to echo $_port_sweep_pid.
+
+# (a) node process listening in the window → identity-verified → killed.
+spawn_named node; gqp=$REPLY            # comm == 'node'
+_port_sweep_pid="$gqp"                  # stub: this node PID holds a window port
+record_pid graphql-server "$gqp"
+stop_service graphql-server >/dev/null 2>&1
+assert_dead "$gqp" "node PID listening in the graphql window is matched and killed"
+_port_sweep_pid=""
+
+# (b) node process NOT in the window → recycled-PID guard spares it.
+spawn_named node; nowin=$REPLY          # comm == 'node' but not in the window
+_port_sweep_pid=""                      # stub: no window listeners
+record_pid graphql-server "$nowin"
+stop_service graphql-server >/dev/null 2>&1
+assert_alive "$nowin" "node PID not in the graphql window is spared"
+kill -9 "$nowin" 2>/dev/null || true
+
+# (c) non-node process recorded as graphql-server → comm mismatch → spared.
+spawn_sleep_pid; notnode=$REPLY         # comm == 'sleep'
+_port_sweep_pid="$notnode"              # even if it "held" a port, comm != node
+record_pid graphql-server "$notnode"
+stop_service graphql-server >/dev/null 2>&1
+assert_alive "$notnode" "non-node PID recorded as graphql-server is spared"
+_port_sweep_pid=""
+kill -9 "$notnode" 2>/dev/null || true
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 echo ""
