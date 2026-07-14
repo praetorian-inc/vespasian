@@ -123,6 +123,49 @@ resolve_port_or_die() {
 # Prerequisites
 # ──────────────────────────────────────────────────────────────
 
+# Candidate browsers, in priority order. Overridable by tests.
+CHROME_CANDIDATES=(
+    google-chrome chromium-browser chromium chrome
+    /usr/bin/google-chrome /usr/bin/chromium-browser /usr/bin/chromium
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    /snap/bin/chromium
+)
+
+# Probe a candidate for actual runnability. --version is fast and needs no X/DBus.
+chrome_runnable() {
+    local t=""
+    if command -v timeout >/dev/null 2>&1; then
+        t=timeout
+    elif command -v gtimeout >/dev/null 2>&1; then   # macOS + coreutils
+        t=gtimeout
+    fi
+    if [ -n "$t" ]; then
+        "$t" 2 "$1" --version >/dev/null 2>&1
+    else
+        # No timeout available (e.g. stock macOS): probe directly. A binary that
+        # hangs on --version would block here — known limitation, documented in
+        # test/README.md.
+        "$1" --version >/dev/null 2>&1
+    fi
+}
+
+# Resolve + probe candidates. On success: echo the runnable binary, return 0.
+# On "present but not runnable": echo the first broken binary, return 2.
+# On "nothing found": echo nothing, return 1.
+detect_chrome_binary() {
+    local browser bin stub=""
+    for browser in "${CHROME_CANDIDATES[@]}"; do
+        bin=$(command -v "$browser" 2>/dev/null) || continue
+        if chrome_runnable "$bin"; then
+            printf '%s\n' "$bin"
+            return 0
+        fi
+        [ -z "$stub" ] && stub="$bin"
+    done
+    [ -n "$stub" ] && { printf '%s\n' "$stub"; return 2; }
+    return 1
+}
+
 check_prerequisites() {
     log_header "Checking Prerequisites"
     local failed=0
@@ -135,28 +178,29 @@ check_prerequisites() {
         failed=1
     fi
 
-    # Chrome/Chromium
-    local chrome_found=0
-    for browser in google-chrome chromium-browser chromium chrome; do
-        if command -v "$browser" >/dev/null 2>&1; then
-            log_ok "Browser: $browser"
-            chrome_found=1
-            break
-        fi
-    done
-    # Also check common installation paths
-    if [ $chrome_found -eq 0 ]; then
-        for path in /usr/bin/google-chrome /usr/bin/chromium-browser /usr/bin/chromium \
-                    /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-                    /snap/bin/chromium; do
-            if [ -x "$path" ]; then
-                log_ok "Browser: $path"
-                chrome_found=1
-                break
-            fi
-        done
-    fi
-    if [ $chrome_found -eq 0 ]; then
+    # Chrome/Chromium — presence alone is not enough (snap stubs satisfy
+    # command -v / -x but fail at runtime). detect_chrome_binary probes
+    # runnability so preflight fails loudly here, not during `vespasian crawl`.
+    # Note: `chrome_bin=$(detect_chrome_binary) || rc=$?` (not `; rc=$?`) — under
+    # this script's `set -e`, a bare `chrome_bin=$(cmd); rc=$?` would abort the
+    # script the instant detect_chrome_binary returns non-zero, before rc=$?
+    # ever ran, and the elif/else branches below would never execute.
+    local chrome_bin rc=0
+    chrome_bin=$(detect_chrome_binary) || rc=$?
+    if [ $rc -eq 0 ]; then
+        log_ok "Browser: $chrome_bin"
+    elif [ $rc -eq 2 ]; then
+        log_fail "Found ${chrome_bin} but it is not runnable"
+        case "$chrome_bin" in
+            */snap/*|*/chromium-browser|*/chromium)
+                log_info "(looks like the Ubuntu snap stub — install the chromium snap: 'snap install chromium', or use google-chrome)."
+                ;;
+            *)
+                log_info "(the binary exists but failed to run — check permissions, missing shared libraries, or reinstall the browser)."
+                ;;
+        esac
+        failed=1
+    else
         log_fail "Chrome/Chromium not found. Required for headless crawling."
         log_info "Install: https://www.google.com/chrome/ or 'apt install chromium-browser'"
         failed=1

@@ -2857,7 +2857,9 @@ main() {
             classifier-edge)    test_classifier_edge_cases ;;
             spec-edge)          test_spec_edge_cases ;;
             *)
-                log_warn "Unknown target: $target (skipping)"
+                log_fail "Unknown target: $target"
+                init_test_status "$target"
+                set_test_result "$target" "FAIL" "-" "-" "0"
                 ;;
         esac
     done

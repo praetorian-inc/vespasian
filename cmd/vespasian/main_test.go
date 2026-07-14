@@ -898,6 +898,7 @@ func TestDangerousAllowPrivate_GenerateCmd(t *testing.T) {
 	cmd := &GenerateCmd{
 		APIType:               "rest",
 		Capture:               capturePath,
+		Output:                filepath.Join(t.TempDir(), "spec.json"),
 		Probe:                 true,
 		DangerousAllowPrivate: true,
 	}
@@ -925,6 +926,96 @@ func TestDangerousAllowPrivate_ScanCmd(t *testing.T) {
 	if cmd.URL != "https://example.com" {
 		t.Errorf("ScanCmd.URL = %q, want %q", cmd.URL, "https://example.com")
 	}
+}
+
+// TestGRPCInsecureSkipVerify_Embedded pins that GenerateCmd and ScanCmd both
+// expose the GRPCInsecureSkipVerify kong field, catching a field removal or
+// rename on either struct. It does NOT exercise Run() and cannot catch a
+// dropped assignment of the field into pipeline.Options inside Run() (see
+// main.go:541 and main.go:669) — that semantic wiring is covered by
+// internal/pipeline's TestClassifyProbeGenerate_GRPCInsecureSkipVerify.
+func TestGRPCInsecureSkipVerify_Embedded(t *testing.T) {
+	g := &GenerateCmd{GRPCInsecureSkipVerify: true}
+	require.True(t, g.GRPCInsecureSkipVerify)
+
+	gDefault := &GenerateCmd{}
+	require.False(t, gDefault.GRPCInsecureSkipVerify)
+
+	s := &ScanCmd{GRPCInsecureSkipVerify: true}
+	require.True(t, s.GRPCInsecureSkipVerify)
+
+	sDefault := &ScanCmd{}
+	require.False(t, sDefault.GRPCInsecureSkipVerify)
+}
+
+// TestGRPCInsecureSkipVerify_GenerateCmd is a smoke test proving
+// GenerateCmd.Run() accepts GRPCInsecureSkipVerify without erroring on a
+// non-gRPC (REST) capture. It does NOT prove the flag is forwarded into
+// pipeline.Options inside Run() — a REST capture never reaches the gRPC
+// probe path that consumes it, and pipeline.Options is built inline with no
+// inspectable seam. That semantic behavior is covered by internal/pipeline's
+// TestClassifyProbeGenerate_GRPCInsecureSkipVerify. Probe stays false (see
+// below) since this test never exercises the gRPC probe path anyway.
+func TestGRPCInsecureSkipVerify_GenerateCmd(t *testing.T) {
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://example.com/api/users",
+			Headers: map[string]string{
+				"Content-Type": "application/json",
+			},
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+			},
+		},
+	}
+
+	capturePath := filepath.Join(t.TempDir(), "capture.json")
+	f, err := os.Create(capturePath) //nolint:gosec // G304: test file
+	if err != nil {
+		t.Fatalf("failed to create temp capture file: %v", err)
+	}
+	if writeErr := crawl.WriteCapture(f, requests); writeErr != nil {
+		_ = f.Close()
+		t.Fatalf("failed to write capture: %v", writeErr)
+	}
+	_ = f.Close()
+
+	cmd := &GenerateCmd{
+		APIType: "rest",
+		Capture: capturePath,
+		// Output goes to a temp file so a successful Run() doesn't write the
+		// generated spec to stdout during the test.
+		Output: filepath.Join(t.TempDir(), "spec.json"),
+		// Probe stays false: GRPCInsecureSkipVerify is consumed only by the
+		// gRPC reflection probe, which this REST capture never reaches, so
+		// Probe:true would add zero coverage of the flag while making a live
+		// network call to example.com. Keep this smoke test hermetic.
+		Probe:                  false,
+		GRPCInsecureSkipVerify: true,
+	}
+	if err := cmd.Run(); err != nil {
+		t.Errorf("GenerateCmd.Run() with GRPCInsecureSkipVerify unexpected error: %v", err)
+	}
+}
+
+// TestGRPCInsecureSkipVerify_ReachesOptions closes the AC3 boundary gap: it
+// asserts that c.GRPCInsecureSkipVerify actually reaches pipeline.Options
+// (via GenerateCmd.options()) and pipeline.ScanOptions (via
+// ScanCmd.scanOptions()) at the CLI boundary, so a dropped assignment inside
+// either method is caught — unlike TestGRPCInsecureSkipVerify_Embedded
+// (field-exposure only) and TestGRPCInsecureSkipVerify_GenerateCmd (a
+// hermetic Run() smoke test that never reaches pipeline.Options
+// construction on a REST capture).
+func TestGRPCInsecureSkipVerify_ReachesOptions(t *testing.T) {
+	require.True(t, (&GenerateCmd{GRPCInsecureSkipVerify: true}).options().GRPCInsecureSkipVerify,
+		"GenerateCmd flag must reach pipeline.Options")
+	require.False(t, (&GenerateCmd{GRPCInsecureSkipVerify: false}).options().GRPCInsecureSkipVerify)
+
+	require.True(t, (&ScanCmd{GRPCInsecureSkipVerify: true}).scanOptions("rest", nil).GRPCInsecureSkipVerify,
+		"ScanCmd flag must reach pipeline.ScanOptions")
+	require.False(t, (&ScanCmd{GRPCInsecureSkipVerify: false}).scanOptions("rest", nil).GRPCInsecureSkipVerify)
 }
 
 // TestDangerousAllowPrivate_SameOutputForPublicURLs verifies that allowPrivate=true
