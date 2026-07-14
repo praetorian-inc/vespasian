@@ -50,9 +50,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Drift guard (target groups vs dispatch)
-        run: bash test/test-runner-args.sh
-
       - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
         with:
           go-version-file: go.mod
@@ -63,6 +60,9 @@ jobs:
 
       - name: Build vespasian
         run: go build -o bin/vespasian ./cmd/vespasian
+
+      - name: Drift guard (target groups vs dispatch)
+        run: bash test/test-runner-args.sh
 
       - name: Write stub config for offline tests
         run: |
