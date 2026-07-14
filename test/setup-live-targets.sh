@@ -538,13 +538,13 @@ orphan_pids_by_name() {
 # reverse-DNS / port-name lookups that could otherwise hang teardown.
 orphan_pids_by_port() {
     local base=$1
-    local end=$((base + 20)) port pid comm
+    local end=$((base + 20)) pid comm
     command -v lsof >/dev/null 2>&1 || return 0
-    for port in $(seq "$base" "$end"); do
-        for pid in $(lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true); do
-            comm="$(ps -p "$pid" -o comm= 2>/dev/null)"
-            [ "$(basename "$comm" 2>/dev/null)" = "node" ] && echo "$pid"
-        done
+    # One ranged lsof call (mirrors show_port_holders) instead of 21 per-port
+    # invocations; -t yields de-duplicated PIDs, which we then filter to node.
+    for pid in $(lsof -nP -tiTCP:"${base}-${end}" -sTCP:LISTEN 2>/dev/null || true); do
+        comm="$(ps -p "$pid" -o comm= 2>/dev/null)"
+        [ "$(basename "$comm" 2>/dev/null)" = "node" ] && echo "$pid"
     done
 }
 
@@ -750,6 +750,10 @@ parse_args() {
     done
 }
 
+# Pipeline orchestrator: parse args → teardown? → prereqs → build → stale
+# cleanup → resolve ports + start → write config. Intentionally longer than the
+# ~60-line guideline: each stage is a distinct sequential step that delegates to
+# a helper, with no shared state worth extracting into further functions.
 main() {
     parse_args "$@"
     local targets="$PARSED_TARGETS"

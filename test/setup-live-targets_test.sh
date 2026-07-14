@@ -85,9 +85,13 @@ export SWEEP_ORPHANS
 # ── Test harness ──────────────────────────────────────────────────────────
 PASS=0
 FAIL=0
+SKIP=0
 
 ok()   { echo "  ok   - $1"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL - $1"; FAIL=$((FAIL + 1)); }
+# Tool-prerequisite skips are counted so the summary can surface dropped coverage
+# (a bare "Passed: N Failed: 0" would otherwise hide silently skipped tests).
+skip() { echo "  skip - $1"; SKIP=$((SKIP + 1)); }
 
 is_alive() { kill -0 "$1" 2>/dev/null; }
 
@@ -203,7 +207,7 @@ if command -v python3 >/dev/null 2>&1; then
     SWEEP_ORPHANS=false
     _port_sweep_pid=""
 else
-    echo "  skip - python3 unavailable"
+    skip "python3 unavailable"
 fi
 
 # ── Test 6: setup → setup → teardown leaves zero processes (acceptance) ──────
@@ -255,7 +259,7 @@ if command -v python3 >/dev/null 2>&1 \
     assert_contains "$out" ":${hp}" "lists the listener holding the base port"
     kill -9 "$lp" 2>/dev/null || true
 else
-    echo "  skip - python3 and (lsof or ss) required"
+    skip "python3 and (lsof or ss) required"
 fi
 
 # ── Test 9: find_available_port increments past busy ports to the next free ──
@@ -429,7 +433,7 @@ if command -v lsof >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
         kill -9 "$np" 2>/dev/null || true
     fi
 else
-    echo "  skip - lsof and python3 required"
+    skip "lsof and python3 required"
 fi
 
 # ── Test 17: real orphan_pids_by_name matches by exact basename, current user ─
@@ -450,12 +454,12 @@ if command -v pgrep >/dev/null 2>&1; then
     assert_eq "$got" "" "a non-matching name returns nothing"
     kill -9 "$up" 2>/dev/null || true
 else
-    echo "  skip - pgrep required"
+    skip "pgrep required"
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "──────────────────────────────────────────"
-echo "Passed: ${PASS}   Failed: ${FAIL}"
+echo "Passed: ${PASS}   Skipped: ${SKIP}   Failed: ${FAIL}"
 echo "──────────────────────────────────────────"
 [ "$FAIL" -eq 0 ]
