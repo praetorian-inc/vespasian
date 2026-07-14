@@ -431,6 +431,20 @@ if command -v lsof >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
             *)         fail "node listener in window is returned (got '$got')" ;;
         esac
         kill -9 "$np" 2>/dev/null || true
+
+        # A node listener OFF the base port (mid-window) must also be returned.
+        # This pins the range SPAN: collapsing the query back to only the base
+        # port (dropping the `-${end}`) would miss this and fail here.
+        offport="$(free_port)"
+        "${STATE_DIR}/node" -m http.server "$offport" --bind 127.0.0.1 >/dev/null 2>&1 &
+        op=$!; SPAWNED_PIDS+=("$op"); disown "$op" 2>/dev/null || true
+        for _ in 1 2 3 4 5 6 7 8 9 10; do lsof -nP -iTCP:"$offport" -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 0.2; done
+        got="$(real_orphan_pids_by_port "$((offport - 5))")"   # listener sits at base+5
+        case " $got " in
+            *" $op "*) ok "node listener mid-window (base+5) is returned (range span)" ;;
+            *)         fail "node listener mid-window (base+5) is returned (got '$got')" ;;
+        esac
+        kill -9 "$op" 2>/dev/null || true
     fi
 else
     skip "lsof and python3 required"
