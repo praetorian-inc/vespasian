@@ -664,23 +664,28 @@ usage() {
     echo "  $0 --teardown --sweep           # Also sweep untracked orphans (last resort)"
 }
 
-main() {
-    local targets="$ALL_TARGETS"
-    local skip_start=false
-    local teardown=false
+# Parse CLI arguments into globals, separated from main() so the flag→variable
+# wiring (notably --sweep → SWEEP_ORPHANS) is unit-testable without running the
+# side-effecting setup/teardown main() performs. Sets PARSED_TARGETS,
+# PARSED_SKIP_START, PARSED_TEARDOWN and (on --sweep) SWEEP_ORPHANS. Exits on
+# --help (0) and unknown option (1), matching the original inline behaviour.
+parse_args() {
+    PARSED_TARGETS="$ALL_TARGETS"
+    PARSED_SKIP_START=false
+    PARSED_TEARDOWN=false
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --targets)
-                targets="$2"
+                PARSED_TARGETS="$2"
                 shift 2
                 ;;
             --skip-start)
-                skip_start=true
+                PARSED_SKIP_START=true
                 shift
                 ;;
             --teardown)
-                teardown=true
+                PARSED_TEARDOWN=true
                 shift
                 ;;
             --sweep)
@@ -698,6 +703,13 @@ main() {
                 ;;
         esac
     done
+}
+
+main() {
+    parse_args "$@"
+    local targets="$PARSED_TARGETS"
+    local skip_start="$PARSED_SKIP_START"
+    local teardown="$PARSED_TEARDOWN"
 
     if [ "$teardown" = true ]; then
         do_teardown

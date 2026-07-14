@@ -53,11 +53,19 @@ source "${SCRIPT_UNDER_TEST}"
 # probe for dead processes (expected non-zero exits) don't abort the harness.
 set +e +u
 
+# Preserve the REAL seam implementations before we sandbox them, under aliased
+# names, so Tests 16-17 can exercise the actual node-in-port-window and
+# exact-name/user filters (the security-relevant guards) instead of the stub.
+# `declare -f` renders the sourced function body; prefixing renames the copy.
+eval "real_$(declare -f orphan_pids_by_port)"
+eval "real_$(declare -f orphan_pids_by_name)"
+
 # Sandbox the orphan-discovery seams for the entire run so a sweep can NEVER
 # reach the developer's real process table (`pgrep -x rest-api` / an lsof port
 # scan would otherwise match a dev's own service). Each test that exercises a
 # sweep sets the matching _sweep_* variable to its OWN stand-in PID; the real
-# pgrep/lsof discovery in the seams is intentionally not exercised offline.
+# pgrep/lsof discovery in the seams is exercised only by Tests 16-17, each
+# confined to a stand-in the harness spawns itself.
 _name_sweep_pid=""
 _port_sweep_pid=""
 orphan_pids_by_name() { [ -n "$_name_sweep_pid" ] && echo "$_name_sweep_pid"; return 0; }
@@ -338,6 +346,88 @@ stop_service graphql-server >/dev/null 2>&1
 assert_alive "$notnode" "non-node PID recorded as graphql-server is spared"
 _port_sweep_pid=""
 kill -9 "$notnode" 2>/dev/null || true
+
+# ── Test 14: parse_args wires the CLI flags (esp. --sweep → SWEEP_ORPHANS) ───
+echo "Test 14: parse_args maps CLI flags to their variables"
+# main()'s arg parsing lives in parse_args() so the flag→variable contract is
+# testable without running the side-effecting setup/teardown (or the real sweep).
+SWEEP_ORPHANS=false; parse_args --teardown
+assert_eq "$PARSED_TEARDOWN" "true" "--teardown sets teardown"
+assert_eq "$SWEEP_ORPHANS" "false" "teardown alone leaves the sweep OFF (footgun stays closed)"
+SWEEP_ORPHANS=false; parse_args --teardown --sweep
+assert_eq "$SWEEP_ORPHANS" "true" "--sweep opts into the orphan sweep"
+SWEEP_ORPHANS=false; parse_args --skip-start
+assert_eq "$PARSED_SKIP_START" "true" "--skip-start sets skip_start"
+SWEEP_ORPHANS=false; parse_args --targets rest-api,soap-service
+assert_eq "$PARSED_TARGETS" "rest-api,soap-service" "--targets captures the list"
+# Unknown option exits 1 (run in a subshell so the exit does not abort the harness).
+( parse_args --bogus >/dev/null 2>&1 ); rc=$?
+assert_eq "$rc" "1" "unknown option exits 1"
+SWEEP_ORPHANS=false
+
+# ── Test 15: a recorded PID that already exited is declined cleanly ──────────
+echo "Test 15: an already-dead recorded PID is skipped, not errored on"
+spawn_sleep_pid; dead=$REPLY
+kill -9 "$dead" 2>/dev/null || true
+for _ in 1 2 3 4 5 6 7 8 9 10; do is_alive "$dead" || break; sleep 0.2; done
+record_pid rest-api "$dead"
+out="$(stop_service rest-api 2>&1)"
+assert_contains "$out" "no running processes found" "dead recorded PID declined (empty-comm branch)"
+assert_no_file "${STATE_DIR}/.rest-api.pids" "pid log cleared after declining a dead PID"
+
+# ── Test 16: real orphan_pids_by_port keeps the node-only port-window filter ──
+echo "Test 16: real orphan_pids_by_port returns node listeners, excludes non-node"
+if command -v lsof >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    # A non-node listener in the window must be EXCLUDED (the guard against
+    # killing an unrelated service that merely listens in the range).
+    nnport="$(free_port)"
+    python3 -m http.server "$nnport" --bind 127.0.0.1 >/dev/null 2>&1 &
+    nn=$!; SPAWNED_PIDS+=("$nn"); disown "$nn" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do lsof -nP -iTCP:"$nnport" -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 0.2; done
+    got="$(real_orphan_pids_by_port "$nnport")"
+    case " $got " in
+        *" $nn "*) fail "non-node listener excluded by node filter (got '$got')" ;;
+        *)         ok "non-node listener excluded by node filter" ;;
+    esac
+    kill -9 "$nn" 2>/dev/null || true
+
+    # A node-named listener in the window must be RETURNED. Copy the python
+    # interpreter to a binary literally named 'node' so its comm == 'node'.
+    cp "$(command -v python3)" "${STATE_DIR}/node"
+    nport="$(free_port)"
+    "${STATE_DIR}/node" -m http.server "$nport" --bind 127.0.0.1 >/dev/null 2>&1 &
+    np=$!; SPAWNED_PIDS+=("$np"); disown "$np" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do lsof -nP -iTCP:"$nport" -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 0.2; done
+    got="$(real_orphan_pids_by_port "$nport")"
+    case " $got " in
+        *" $np "*) ok "node listener in window is returned" ;;
+        *)         fail "node listener in window is returned (got '$got')" ;;
+    esac
+    kill -9 "$np" 2>/dev/null || true
+else
+    echo "  skip - lsof and python3 required"
+fi
+
+# ── Test 17: real orphan_pids_by_name matches by exact basename, current user ─
+echo "Test 17: real orphan_pids_by_name returns only the exact-named stand-in"
+if command -v pgrep >/dev/null 2>&1; then
+    # Improbable name so the real pgrep can never match a developer's process.
+    # Kept <=15 chars: `pgrep -x` matches the truncated comm, not the full argv.
+    uniq="zzcap$$"
+    cp "$(command -v sleep)" "${STATE_DIR}/${uniq}"
+    "${STATE_DIR}/${uniq}" 600 &
+    up=$!; SPAWNED_PIDS+=("$up"); disown "$up" 2>/dev/null || true
+    got="$(real_orphan_pids_by_name "$uniq")"
+    case " $got " in
+        *" $up "*) ok "exact-named stand-in returned by name seam" ;;
+        *)         fail "exact-named stand-in returned (got '$got')" ;;
+    esac
+    got="$(real_orphan_pids_by_name "${uniq}-nope")"
+    assert_eq "$got" "" "a non-matching name returns nothing"
+    kill -9 "$up" 2>/dev/null || true
+else
+    echo "  skip - pgrep required"
+fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 echo ""
