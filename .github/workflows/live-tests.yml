@@ -62,7 +62,7 @@ jobs:
         run: go build -o bin/vespasian ./cmd/vespasian
 
       - name: Drift guard (target groups vs dispatch)
-        run: bash test/test-runner-args.sh
+        run: ./test/test-runner-args.sh
 
       - name: Write stub config for offline tests
         run: |

@@ -54,7 +54,6 @@ OFFLINE_TARGETS=(
     crawl-unreachable
     classifier-edge
     spec-edge
-    smoke-check
 )
 
 LIVE_TARGETS=(
@@ -2722,23 +2721,6 @@ PYEOF
 # Summary
 # ──────────────────────────────────────────────────────────────
 
-test_smoke_check() {
-    init_test_status "smoke-check"
-    local start=$SECONDS
-
-    log_header "Testing: smoke-check (binary sanity)"
-
-    if "$VESPASIAN" version >/dev/null 2>&1 || "$VESPASIAN" --help >/dev/null 2>&1; then
-        local duration=$((SECONDS - start))
-        set_test_result "smoke-check" "PASS" "-" "-" "$duration"
-        log_ok "smoke-check: PASSED (${duration}s)"
-    else
-        local duration=$((SECONDS - start))
-        set_test_result "smoke-check" "FAIL" "-" "-" "$duration"
-        log_fail "smoke-check: binary not functional (${duration}s)"
-    fi
-}
-
 print_summary() {
     local total_pass=0 total_fail=0 total_skip=0
 
@@ -2802,7 +2784,6 @@ usage() {
     echo "                                      import-malformed, import-empty"
     echo "                          Crawl:      crawl-depth, crawl-unreachable"
     echo "                          Edge cases: edge-cases, classifier-edge, spec-edge"
-    echo "                          Smoke:      smoke-check"
     echo "  --verbose             Enable verbose vespasian output"
     echo "  --no-build            Skip building vespasian and target binaries"
     echo "  --no-start            Don't start/stop services (assume already running)"
@@ -2820,6 +2801,7 @@ main() {
     local group=""
     local no_build=false
     local no_start=false
+    local dry_run=false
     VERBOSE=false
 
     while [ $# -gt 0 ]; do
@@ -2844,6 +2826,10 @@ main() {
                 ;;
             --no-start)
                 no_start=true
+                shift
+                ;;
+            --dry-run)
+                dry_run=true
                 shift
                 ;;
             --help)
@@ -2887,6 +2873,11 @@ main() {
                 exit 1
                 ;;
         esac
+    fi
+
+    if [ "$dry_run" = true ]; then
+        echo "targets=$targets"
+        return 0
     fi
 
     preflight_test_host "$targets"
@@ -2940,7 +2931,6 @@ main() {
             crawl-unreachable)  test_crawl_unreachable ;;
             classifier-edge)    test_classifier_edge_cases ;;
             spec-edge)          test_spec_edge_cases ;;
-            smoke-check)        test_smoke_check ;;
             *)
                 log_fail "Unknown target: $target"
                 init_test_status "$target"

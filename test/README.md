@@ -95,10 +95,11 @@ Options:
 ./test/run-live-tests.sh [options]
 
 Options:
-  --targets <list>      Comma-separated targets to test (default: all)
+  --group <name>        Run a predefined target group: offline, live, or all (default: all)
+  --targets <list>      Comma-separated targets to test (overrides --group)
                         Valid targets:
-                          Live:       rest-api, soap-service, graphql-server,
-                                      grpc-server
+                          Service:    rest-api, soap-service, graphql-server, concat-spa
+                          Config:     grpc-server (included via TARGETS_SETUP when set up)
                           Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,
                                       generate-graphql, generate-graphql-imports,
                                       generate-js-static, generate-merge-slugs
