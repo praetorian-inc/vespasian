@@ -357,9 +357,11 @@ kill -9 "$notnode" 2>/dev/null || true
 echo "Test 14: parse_args maps CLI flags to their variables"
 # main()'s arg parsing lives in parse_args() so the flag→variable contract is
 # testable without running the side-effecting setup/teardown (or the real sweep).
-SWEEP_ORPHANS=false; parse_args --teardown
+# Seed SWEEP_ORPHANS=true first so this discriminates the reset: parse_args must
+# clear it back to false when --sweep is absent (deleting that reset fails here).
+SWEEP_ORPHANS=true; parse_args --teardown
 assert_eq "$PARSED_TEARDOWN" "true" "--teardown sets teardown"
-assert_eq "$SWEEP_ORPHANS" "false" "teardown alone leaves the sweep OFF (footgun stays closed)"
+assert_eq "$SWEEP_ORPHANS" "false" "parse_args resets SWEEP_ORPHANS off when --sweep absent (footgun stays closed)"
 SWEEP_ORPHANS=false; parse_args --teardown --sweep
 assert_eq "$SWEEP_ORPHANS" "true" "--sweep opts into the orphan sweep"
 SWEEP_ORPHANS=false; parse_args --skip-start
