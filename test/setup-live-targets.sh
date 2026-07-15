@@ -529,7 +529,16 @@ main() {
     write_config "${REST_API_PORT:-}" "${SOAP_SERVICE_PORT:-}" "${GRAPHQL_SERVER_PORT:-}" "${GRPC_SERVER_PORT:-}" "${CONCAT_SPA_PORT:-}" "$targets"
 
     log_header "Setup Complete"
-    log_info "Run tests with: ./test/run-live-tests.sh"
+    # A bare `run-live-tests.sh` resolves the full "all" group; TARGETS_SETUP is
+    # additive (it only pulls in config-only targets like grpc-server) and does
+    # not narrow the run. Steer a partial setup to --targets so it does not probe
+    # services that were never started.
+    if [ "$targets" = "$ALL_TARGETS" ]; then
+        log_info "Run tests with: ./test/run-live-tests.sh"
+    else
+        log_info "Run the targets you set up: ./test/run-live-tests.sh --targets ${targets}"
+        log_info "Offline-only checks (no services needed): ./test/run-live-tests.sh --group offline"
+    fi
     log_info "Tear down with: ./test/setup-live-targets.sh --teardown"
 }
 

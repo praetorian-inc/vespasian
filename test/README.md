@@ -144,6 +144,14 @@ GRPC_SERVER_PORT=50051
 TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server
 ```
 
+> **`TARGETS_SETUP` is additive, not restrictive.** A bare `./test/run-live-tests.sh`
+> resolves the full `all` group (every `OFFLINE_TARGETS` + `LIVE_TARGETS`).
+> `TARGETS_SETUP` only *adds* config-only targets such as `grpc-server` to that run —
+> it does **not** narrow it. To run only the targets you set up, pass
+> `--targets <list>` (or use `--group offline` / `--group live`). After a partial
+> `setup-live-targets.sh --targets <subset>`, the setup script prints the exact
+> `--targets` command to use.
+
 ### Default Ports
 
 | Target | Default Port |

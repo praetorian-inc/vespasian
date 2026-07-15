@@ -59,6 +59,16 @@ undispatched_group_members() {
 echo "=== Drift guard: groups vs case dispatch ==="
 drift_fail_before=$FAIL
 
+# Fidelity check: the guard is only as good as this extraction. A known target
+# that always exists is the cheapest sentinel — it catches both an empty scrape
+# and a regex that matches the wrong lines, either of which would let real drift
+# pass unseen.
+if printf '%s\n' "${DISPATCH_TARGETS[@]}" | grep -qx 'rest-api'; then
+    pass "DISPATCH_TARGETS extraction captured case-block targets (sentinel: rest-api)"
+else
+    fail "DISPATCH_TARGETS extraction is broken/empty (sentinel 'rest-api' missing)"
+fi
+
 # Every group member must have a case-dispatch entry.
 while IFS= read -r target; do
     [[ -z "$target" ]] && continue
@@ -156,6 +166,37 @@ else
     fail "TARGETS_SETUP merge: expected leading 'grpc-server,rest-api,', got '$setup_output'"
 fi
 
+# --group all is ADDITIVE, never restrictive: a subset-looking TARGETS_SETUP
+# (e.g. a single service) must NOT narrow the resolved live set — every
+# LIVE_TARGETS member is still present. Pins the LAB-4773 decision that subset
+# selection is done via --targets, not TARGETS_SETUP.
+tmpconfig_subset=$(mktemp)
+echo "TARGETS_SETUP=rest-api" > "$tmpconfig_subset"
+subset_output=$(env CONFIG_FILE="$tmpconfig_subset" bash -c "source '$RUNNER' --group all --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//')
+rm -f "$tmpconfig_subset"
+missing_live=""
+for t in "${LIVE_TARGETS[@]}"; do
+    printf '%s\n' "$subset_output" | tr ',' '\n' | grep -qx "$t" || missing_live="$missing_live $t"
+done
+if [[ -z "$missing_live" ]]; then
+    pass "--group all: TARGETS_SETUP is additive (subset value does not drop live targets)"
+else
+    fail "--group all: subset TARGETS_SETUP dropped live target(s):$missing_live"
+fi
+
+# TARGETS_SETUP applies ONLY to the "all" group. --group offline / --group live
+# must ignore it entirely (no config-only targets leak in).
+tmpconfig_scoped=$(mktemp)
+echo "TARGETS_SETUP=grpc-server" > "$tmpconfig_scoped"
+scoped_offline=$(env CONFIG_FILE="$tmpconfig_scoped" bash -c "source '$RUNNER' --group offline --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//')
+scoped_live=$(env CONFIG_FILE="$tmpconfig_scoped" bash -c "source '$RUNNER' --group live --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//')
+rm -f "$tmpconfig_scoped"
+if [[ "$scoped_offline" == "$(join_targets "${OFFLINE_TARGETS[@]}")" && "$scoped_live" == "$(join_targets "${LIVE_TARGETS[@]}")" ]]; then
+    pass "TARGETS_SETUP ignored for --group offline/live (grpc-server absent)"
+else
+    fail "TARGETS_SETUP leaked into --group offline/live: offline='$scoped_offline' live='$scoped_live'"
+fi
+
 echo ""
 echo "=== join_targets helper ==="
 
@@ -181,7 +222,7 @@ echo "=== Argument validation ==="
 tmpconfig=$(mktemp)
 echo "TARGETS_SETUP=" > "$tmpconfig"
 invalid_output=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --group bogus" 2>&1) && rc=0 || rc=$?
-if [[ "$invalid_output" == *"Unknown group"* && "$rc" -ne 0 ]]; then
+if [[ "$invalid_output" == *"Unknown group"* && "$invalid_output" == *"Usage:"* && "$rc" -ne 0 ]]; then
     pass "Invalid --group: rejected non-zero with 'Unknown group' message"
 else
     fail "Invalid --group: expected non-zero exit + 'Unknown group' (rc=$rc), got: $invalid_output"
