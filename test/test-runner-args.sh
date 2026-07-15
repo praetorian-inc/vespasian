@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Tests for run-live-tests.sh target group consistency and --group flag.
-# Does NOT run actual live tests — only validates that the group arrays
-# stay in sync with the case dispatch block, and that --group resolves
-# the correct target set (via --dry-run, no binary required).
+# Tests for run-live-tests.sh target group consistency and the --group flag,
+# plus the setup-live-targets.sh run-guidance selector. Does NOT run actual live
+# tests — only validates that the group arrays stay in sync with the case
+# dispatch block, that --group resolves the correct target set (via --dry-run,
+# no binary required), and that setup-complete guidance steers full vs partial
+# setups correctly.
 
 set -euo pipefail
 
@@ -19,6 +21,14 @@ fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1" >&2; }
 source <(sed -n '/^OFFLINE_TARGETS=(/,/^)/p' "$RUNNER")
 source <(sed -n '/^LIVE_TARGETS=(/,/^)/p' "$RUNNER")
 source <(grep '^join_targets()' "$RUNNER")
+
+# ── Source the setup-complete guidance selector from setup-live-targets.sh ──
+# Extract ONLY ALL_TARGETS and run_tests_guidance() — never source the whole
+# script, whose `main "$@"` at EOF would start live services. Mirrors the
+# array/function extraction above and keeps the test hermetic.
+SETUP="$SCRIPT_DIR/setup-live-targets.sh"
+source <(grep '^ALL_TARGETS=' "$SETUP")
+source <(sed -n '/^run_tests_guidance()/,/^}/p' "$SETUP")
 
 # ── Extract case-dispatch targets from the runner ────────────────
 # Capture every arm label inside the dispatch block (case "$target" in … esac),
@@ -383,6 +393,44 @@ if [[ "$nc_rc" -ne 0 && "$nc_all" == *"Config file not found"* ]]; then
     pass "--group all --dry-run: still requires config (TARGETS_SETUP is config-driven)"
 else
     fail "--group all --dry-run (no config): expected non-zero + 'Config file not found', rc=$nc_rc"
+fi
+
+echo ""
+echo "=== Setup-complete guidance (setup-live-targets.sh) ==="
+
+# Drive the REAL run_tests_guidance selector (sourced above, not a copy) for
+# both arms. This is the one behavior in setup-live-targets.sh that steers a
+# user away from a bare `all` run after a partial setup; nothing else exercises
+# it. Assert both the presence of the correct steering AND the absence of the
+# wrong arm's line, so a swapped/broken branch trips loudly.
+
+# Fidelity sentinel: an empty/broken extraction would make every assertion below
+# vacuous, so prove the function was actually sourced before trusting it.
+if declare -F run_tests_guidance >/dev/null; then
+    pass "run_tests_guidance sourced from setup-live-targets.sh"
+else
+    fail "run_tests_guidance was not sourced (extraction broken/empty)"
+fi
+
+# Full setup (targets == ALL_TARGETS): bare run, and NO --targets/--group steering.
+full_guidance="$(run_tests_guidance "$ALL_TARGETS")"
+if [[ "$full_guidance" == *"Run tests with: ./test/run-live-tests.sh"* ]] \
+   && [[ "$full_guidance" != *"--targets"* ]] \
+   && [[ "$full_guidance" != *"--group offline"* ]]; then
+    pass "guidance (full setup): bare run, no --targets/--group steering"
+else
+    fail "guidance (full setup): expected bare run only, got: $full_guidance"
+fi
+
+# Partial setup (a subset): steer to an explicit --targets run for exactly that
+# subset plus the offline hint, and do NOT print the bare-run line.
+partial_guidance="$(run_tests_guidance "rest-api")"
+if [[ "$partial_guidance" == *"--targets rest-api"* ]] \
+   && [[ "$partial_guidance" == *"--group offline"* ]] \
+   && [[ "$partial_guidance" != *"Run tests with: ./test/run-live-tests.sh"* ]]; then
+    pass "guidance (partial setup): steers to --targets rest-api + offline hint, no bare run"
+else
+    fail "guidance (partial setup): expected --targets steering, got: $partial_guidance"
 fi
 
 echo ""

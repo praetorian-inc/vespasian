@@ -399,6 +399,26 @@ usage() {
     echo "  $0 --teardown                   # Stop everything and clean up"
 }
 
+# run_tests_guidance echoes the "how to run what you just set up" lines for a
+# completed setup, one command hint per line. It is intentionally side-effect
+# free (echo only, no service calls) so test/test-runner-args.sh can assert the
+# guidance without starting any target — the same testability pattern
+# run-live-tests.sh uses for resolve_targets via --dry-run.
+#
+# A full setup (targets == ALL_TARGETS) steers to a bare run. A partial setup
+# steers to an explicit --targets run so it does not probe services that were
+# never started: TARGETS_SETUP is additive, not restrictive (see
+# run-live-tests.sh), so a bare run would resolve the full "all" group.
+run_tests_guidance() {
+    local targets="$1"
+    if [ "$targets" = "$ALL_TARGETS" ]; then
+        echo "Run tests with: ./test/run-live-tests.sh"
+    else
+        echo "Run the targets you set up: ./test/run-live-tests.sh --targets ${targets}"
+        echo "Offline-only checks (no services needed): ./test/run-live-tests.sh --group offline"
+    fi
+}
+
 main() {
     local targets="$ALL_TARGETS"
     local skip_start=false
@@ -529,16 +549,12 @@ main() {
     write_config "${REST_API_PORT:-}" "${SOAP_SERVICE_PORT:-}" "${GRAPHQL_SERVER_PORT:-}" "${GRPC_SERVER_PORT:-}" "${CONCAT_SPA_PORT:-}" "$targets"
 
     log_header "Setup Complete"
-    # A bare `run-live-tests.sh` resolves the full "all" group; TARGETS_SETUP is
-    # additive (it only pulls in config-only targets like grpc-server) and does
-    # not narrow the run. Steer a partial setup to --targets so it does not probe
-    # services that were never started.
-    if [ "$targets" = "$ALL_TARGETS" ]; then
-        log_info "Run tests with: ./test/run-live-tests.sh"
-    else
-        log_info "Run the targets you set up: ./test/run-live-tests.sh --targets ${targets}"
-        log_info "Offline-only checks (no services needed): ./test/run-live-tests.sh --group offline"
-    fi
+    # Emit the run guidance (full vs partial setup) via the shared, testable
+    # selector; log_info each line so output matches the previous inline form.
+    local guidance_line
+    while IFS= read -r guidance_line; do
+        log_info "$guidance_line"
+    done < <(run_tests_guidance "$targets")
     log_info "Tear down with: ./test/setup-live-targets.sh --teardown"
 }
 
