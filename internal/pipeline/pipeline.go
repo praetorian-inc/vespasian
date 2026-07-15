@@ -20,6 +20,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"sort"
+	"strings"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
@@ -100,6 +103,7 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 	}
 
 	writeStatus(opts.Status, "classified %d API requests (threshold=%.2f)\n", len(classified), opts.Confidence)
+	logClassificationReasons(opts.Status, classified)
 
 	if opts.Probe {
 		cfg := probe.DefaultConfig()
@@ -170,4 +174,33 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 	}
 
 	return spec, nil
+}
+
+// logClassificationReasons writes one line per classified endpoint to the
+// verbose status writer, making the REST-vs-not decision explainable for a
+// given input (LAB-4678). Output is deterministic — lines are sorted by
+// method+path and each Reason is a pure function of the request — so the same
+// input always produces the same explanation. It is a no-op when w is nil (the
+// status writer is non-nil only under -v), so default artifacts are unchanged.
+func logClassificationReasons(w io.Writer, classified []classify.ClassifiedRequest) {
+	if w == nil || len(classified) == 0 {
+		return
+	}
+	lines := make([]string, 0, len(classified))
+	for _, c := range classified {
+		path := c.URL
+		if u, err := url.Parse(c.URL); err == nil && u.Path != "" {
+			path = u.Path
+		}
+		reason := c.Reason
+		if reason == "" {
+			reason = "-"
+		}
+		lines = append(lines, fmt.Sprintf("  %-6s %s [type=%s confidence=%.2f reason=%s]",
+			strings.ToUpper(c.Method), path, c.APIType, c.Confidence, reason))
+	}
+	sort.Strings(lines)
+	for _, ln := range lines {
+		writeStatus(w, "%s\n", ln)
+	}
 }

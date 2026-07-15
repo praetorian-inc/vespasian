@@ -189,8 +189,77 @@ func TestDeduplicate_MergesSameEndpoint(t *testing.T) {
 	require.Len(t, result, 1)
 	// Highest confidence kept.
 	assert.InDelta(t, 0.85, result[0].Confidence, 0.001)
-	// First occurrence's body preserved.
-	assert.Equal(t, `[{"id":1}]`, string(result[0].Response.Body))
+	// LAB-4678: the retained response is selected deterministically (both are
+	// populated here, so a stable fingerprint decides), NOT by first-seen order.
+	// Assert order-independence rather than a specific body: swapping the input
+	// order must yield the identical retained response.
+	swapped := Deduplicate([]ClassifiedRequest{classified[1], classified[0]})
+	require.Len(t, swapped, 1)
+	assert.Equal(t, string(result[0].Response.Body), string(swapped[0].Response.Body),
+		"retained response must not depend on observation order")
+}
+
+func TestDeduplicate_ResponseSelection_PrefersPopulated(t *testing.T) {
+	// Same METHOD:path observed twice: one populated response and one empty
+	// (half-captured — no status/content-type/body). The populated response must
+	// always be retained, regardless of input order (LAB-4678, A4). Previously
+	// the first-seen observation's response was kept, so a half-captured
+	// observation arriving first would blank out the documented response.
+	populated := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: "GET",
+			URL:    "https://example.com/api/items",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Body:        []byte(`[{"id":1}]`),
+			},
+		},
+		IsAPI: true, Confidence: 0.8, APIType: "rest",
+	}
+	empty := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method:   "GET",
+			URL:      "https://example.com/api/items",
+			Response: crawl.ObservedResponse{}, // half-captured
+		},
+		IsAPI: true, Confidence: 0.15, APIType: "rest",
+	}
+
+	forward := Deduplicate([]ClassifiedRequest{populated, empty})
+	reverse := Deduplicate([]ClassifiedRequest{empty, populated})
+
+	require.Len(t, forward, 1)
+	require.Len(t, reverse, 1)
+	assert.Equal(t, `[{"id":1}]`, string(forward[0].Response.Body),
+		"populated response must be retained when it is seen first")
+	assert.Equal(t, `[{"id":1}]`, string(reverse[0].Response.Body),
+		"populated response must be retained even when the empty one is seen first")
+}
+
+func TestDeduplicate_ResponseSelection_TwoPopulatedOrderIndependent(t *testing.T) {
+	// Two distinct populated responses on the same endpoint collapse to one
+	// entry; the retained response is chosen by a stable fingerprint, so it is
+	// identical regardless of input order (LAB-4678, A4 tie-break).
+	a := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: "GET", URL: "https://example.com/api/items",
+			Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`{"a":1}`)},
+		}, IsAPI: true, Confidence: 0.8, APIType: "rest",
+	}
+	b := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: "GET", URL: "https://example.com/api/items",
+			Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`{"b":2}`)},
+		}, IsAPI: true, Confidence: 0.8, APIType: "rest",
+	}
+
+	fwd := Deduplicate([]ClassifiedRequest{a, b})
+	rev := Deduplicate([]ClassifiedRequest{b, a})
+	require.Len(t, fwd, 1)
+	require.Len(t, rev, 1)
+	assert.Equal(t, string(fwd[0].Response.Body), string(rev[0].Response.Body),
+		"fingerprint tie-break must be independent of observation order")
 }
 
 func TestDeduplicate_MergesQueryParams(t *testing.T) {

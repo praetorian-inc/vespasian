@@ -164,41 +164,32 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 			"pass %s", redactSeedURL(seedURL), flagDangerousAllowPrivate)
 	}
 
-	// Track page count for MaxPages enforcement. The onResult callback in
-	// Crawler.crawlHeadless also tracks this, but we need our own counter
-	// here to stop launching new pages.
+	// Track pages VISITED for MaxPages enforcement (LAB-4678, A1). The budget
+	// counts pages (URLs visited), not captured requests: a single SPA page can
+	// fire dozens of XHR/fetch calls, so counting requests truncated the crawl
+	// far earlier than "max pages" implies, and hard-canceling the shared
+	// context when the count was hit abandoned in-flight tabs mid-capture —
+	// dropping part of a page's surface and varying the emitted set run-to-run.
+	// Workers now reserve a page slot under this mutex before visiting and stop
+	// taking new pages once the budget is reached, so pages already in flight
+	// finalize and emit all of their captured requests, and the crawl is no
+	// longer canceled mid-page.
 	var (
 		mu        sync.Mutex
 		pageCount int
 	)
 
+	// crawlCtx still derives from ctx so the parent's timeout/cancellation
+	// propagates to the workers; the budget no longer cancels it.
 	crawlCtx, crawlCancel := context.WithCancel(ctx)
 	defer crawlCancel()
-
-	// wrappedOnResult passes results to the caller and tracks page count.
-	wrappedOnResult := func(req ObservedRequest) {
-		mu.Lock()
-		if e.opts.MaxPages > 0 && pageCount >= e.opts.MaxPages {
-			mu.Unlock()
-			return
-		}
-		pageCount++
-		hitMax := e.opts.MaxPages > 0 && pageCount >= e.opts.MaxPages
-		mu.Unlock()
-
-		onResult(req)
-
-		if hitMax {
-			crawlCancel()
-		}
-	}
 
 	var wg sync.WaitGroup
 	for i := range e.opts.Concurrency {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			e.worker(crawlCtx, id, wrappedOnResult)
+			e.worker(crawlCtx, id, onResult, &mu, &pageCount, e.opts.MaxPages)
 		}(i)
 	}
 
@@ -216,12 +207,21 @@ func (e *rodEngine) Close() error {
 // worker is the per-tab goroutine. It takes URLs from the frontier, visits
 // each one in a fresh tab, captures network events, extracts links, and pushes
 // discovered URLs back to the frontier.
-func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRequest)) {
+func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRequest), mu *sync.Mutex, pageCount *int, maxPages int) {
 	for {
 		// Check context before blocking on Pop.
 		if ctx.Err() != nil {
 			return
 		}
+
+		// Stop taking new pages once the page budget is reached. Pages already
+		// being visited by other workers still finalize below.
+		mu.Lock()
+		if maxPages > 0 && *pageCount >= maxPages {
+			mu.Unlock()
+			return
+		}
+		mu.Unlock()
 
 		entry, ok := e.frontier.Pop()
 		if !ok {
@@ -230,6 +230,21 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		// MarkActive is NOT called here: Pop atomically increments the active
 		// counter before returning, making dequeue+activate a single critical
 		// section. Callers only need MarkIdle() after processing completes.
+
+		// Reserve this page's budget slot before visiting. Another worker may
+		// have reached the budget while we were blocked in Pop waiting for a
+		// link; if so, release the entry without visiting so the crawl never
+		// exceeds MaxPages. Reserving before the visit (rather than counting
+		// after) keeps the cap exact instead of overshooting by up to
+		// Concurrency pages.
+		mu.Lock()
+		if maxPages > 0 && *pageCount >= maxPages {
+			mu.Unlock()
+			e.frontier.MarkIdle()
+			return
+		}
+		*pageCount++
+		mu.Unlock()
 
 		requests, links, err := e.visitPage(ctx, entry)
 		if err != nil {

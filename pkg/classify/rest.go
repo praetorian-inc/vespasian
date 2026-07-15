@@ -49,6 +49,13 @@ const (
 	PathHeuristicBoost    = 0.15 // Rule 3: API path segment boost.
 	HTTPMethodConfidence  = 0.7  // Rule 4: Non-GET HTTP method signal.
 	JSONBodyConfidence    = 0.85 // Rule 5: JSON response structure.
+	// RequestSignalConfidence is assigned by Rule 6 when a request shows API
+	// intent (an API path together with a JSON/XML Accept or request
+	// content-type) even if no response was captured. It is deliberately set at
+	// or above DefaultConfidenceThreshold so a JSON API reached by GET whose
+	// response arrived too late to capture still classifies — the REST-vs-not
+	// verdict then depends on the request, not on response timing (LAB-4678, B2).
+	RequestSignalConfidence = 0.6
 )
 
 // RESTClassifier classifies REST API requests using ordered heuristic rules.
@@ -155,6 +162,57 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 			}
 			if reason == "" {
 				reason = "response-structure:json"
+			}
+		}
+	}
+
+	// Rule 6: Request-side API signal (LAB-4678, B2).
+	// Rules 2 and 5 need a fully-arrived response, so a JSON API reached by GET
+	// whose response was captured half-finished (empty content-type and body)
+	// falls to the path boost alone (0.15) and is dropped — making the
+	// REST-vs-not verdict a function of response timing rather than a property
+	// of the app. When the request itself shows API intent on an API path,
+	// classify it regardless of whether the response was captured, so the
+	// verdict is stable for a given input. Non-GET methods are already covered
+	// by Rule 4 (0.7) independent of response timing; this rule closes the
+	// GET-with-JSON-intent gap. The API-path match alone is NOT sufficient (that
+	// stays at the Rule 3 boost) to avoid classifying plain navigations under
+	// api-like paths.
+	pathIsAPI := false
+	for _, seg := range apiPathSegments {
+		if strings.Contains(lowerPath, seg) {
+			pathIsAPI = true
+			break
+		}
+	}
+	if pathIsAPI {
+		signal := ""
+		if accept := strings.ToLower(getHeader(req.Headers, "accept")); accept != "" {
+			for _, apiCT := range apiContentTypes {
+				if strings.Contains(accept, apiCT) {
+					signal = "accept:" + apiCT
+					break
+				}
+			}
+		}
+		if signal == "" {
+			reqCT := strings.ToLower(getHeader(req.Headers, "content-type"))
+			if idx := strings.Index(reqCT, ";"); idx != -1 {
+				reqCT = strings.TrimSpace(reqCT[:idx])
+			}
+			for _, apiCT := range apiContentTypes {
+				if reqCT == apiCT {
+					signal = "content-type:" + apiCT
+					break
+				}
+			}
+		}
+		if signal != "" && confidence < RequestSignalConfidence {
+			confidence = RequestSignalConfidence
+			if reason == "" {
+				reason = "request-signal:" + signal
+			} else {
+				reason += "+request-signal:" + signal
 			}
 		}
 	}
