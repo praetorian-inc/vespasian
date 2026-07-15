@@ -21,10 +21,30 @@ source <(sed -n '/^LIVE_TARGETS=(/,/^)/p' "$RUNNER")
 source <(grep '^join_targets()' "$RUNNER")
 
 # ── Extract case-dispatch targets from the runner ────────────────
-# Matches lines like:  rest-api)      test_rest_api ;;
+# Capture every arm label inside the dispatch block (case "$target" in … esac),
+# independent of where the test_* body sits. The previous approach required the
+# label and its test_* call on the SAME line, so a multi-line arm —
+#     new-target)
+#         test_new_target
+#         ;;
+# a common bash style — was silently dropped from DISPATCH_TARGETS. That let an
+# ungrouped multi-line target slip past the "every dispatch target is grouped"
+# check below: the exact silent coverage drift this file exists to prevent.
+# Anchoring on the dispatch case block captures the label whether the body is
+# inline or on following lines. Uses only POSIX awk (2-arg match/substr/gsub/sub)
+# so it behaves identically under BSD awk (dev macOS) and gawk (CI ubuntu).
 
 mapfile -t DISPATCH_TARGETS < <(
-    sed -nE 's/^[[:space:]]+([^)]+)\)[[:space:]]+test_.*/\1/p' "$RUNNER" | sort
+    awk '
+        /^[[:space:]]*case[[:space:]]+"?[$]target"?[[:space:]]+in/ { in_dispatch = 1; next }
+        in_dispatch && /^[[:space:]]*esac/ { in_dispatch = 0; next }
+        in_dispatch && match($0, /^[[:space:]]*[A-Za-z0-9_-]+\)/) {
+            label = substr($0, RSTART, RLENGTH)
+            gsub(/[[:space:]]/, "", label)
+            sub(/\)$/, "", label)
+            print label
+        }
+    ' "$RUNNER" | sort
 )
 
 # Targets that are intentionally not in either group (config-driven).
@@ -56,6 +76,27 @@ undispatched_group_members() {
     done
 }
 
+# report_undispatched_group_members and report_ungrouped_dispatch_targets wrap
+# each detection helper with the fail-emitting loop, so the drift guard AND its
+# negative self-tests drive the SAME loop→fail() wiring rather than a copy. A
+# regression that breaks that path (e.g. a dropped `fail` call) then trips the
+# self-tests too, instead of leaving them green on a silently disabled guard.
+report_undispatched_group_members() {
+    local target
+    while IFS= read -r target; do
+        [[ -z "$target" ]] && continue
+        fail "Group member '$target' has no case-dispatch entry in run-live-tests.sh"
+    done < <(undispatched_group_members "$@")
+}
+
+report_ungrouped_dispatch_targets() {
+    local target
+    while IFS= read -r target; do
+        [[ -z "$target" ]] && continue
+        fail "Dispatch target '$target' is not in OFFLINE_TARGETS, LIVE_TARGETS, or CONFIG_ONLY"
+    done < <(ungrouped_dispatch_targets "$@")
+}
+
 echo "=== Drift guard: groups vs case dispatch ==="
 drift_fail_before=$FAIL
 
@@ -69,17 +110,11 @@ else
     fail "DISPATCH_TARGETS extraction is broken/empty (sentinel 'rest-api' missing)"
 fi
 
-# Every group member must have a case-dispatch entry.
-while IFS= read -r target; do
-    [[ -z "$target" ]] && continue
-    fail "Group member '$target' has no case-dispatch entry in run-live-tests.sh"
-done < <(undispatched_group_members "${OFFLINE_TARGETS[@]}" "${LIVE_TARGETS[@]}")
+# Every group member must have a case-dispatch entry (direction a).
+report_undispatched_group_members "${OFFLINE_TARGETS[@]}" "${LIVE_TARGETS[@]}"
 
-# Every dispatch target must be in a group or in CONFIG_ONLY.
-while IFS= read -r target; do
-    [[ -z "$target" ]] && continue
-    fail "Dispatch target '$target' is not in OFFLINE_TARGETS, LIVE_TARGETS, or CONFIG_ONLY"
-done < <(ungrouped_dispatch_targets "${DISPATCH_TARGETS[@]}")
+# Every dispatch target must be in a group or in CONFIG_ONLY (direction b).
+report_ungrouped_dispatch_targets "${DISPATCH_TARGETS[@]}"
 
 # No target should appear in both groups.
 for target in "${OFFLINE_TARGETS[@]}"; do
@@ -91,6 +126,15 @@ done
 group_count=$(( ${#OFFLINE_TARGETS[@]} + ${#LIVE_TARGETS[@]} ))
 dispatch_count=${#DISPATCH_TARGETS[@]}
 config_count=${#CONFIG_ONLY[@]}
+
+# Belt-and-suspenders count assertion: with robust extraction the arm count must
+# equal grouped + config-only. This catches drift the per-target loops cannot —
+# e.g. an accidental duplicate arm, or a target both grouped and extracted but
+# miscounted — by comparing totals directly instead of per-target membership.
+if [[ $(( group_count + config_count )) -ne "$dispatch_count" ]]; then
+    fail "Coverage count mismatch: groups (${group_count}) + config-only (${config_count}) != dispatch (${dispatch_count})"
+fi
+
 if [[ "$FAIL" -eq "$drift_fail_before" ]]; then
     pass "Groups (${group_count}) + config-only (${config_count}) cover all dispatch targets (${dispatch_count})"
 fi
@@ -98,24 +142,25 @@ fi
 echo ""
 echo "=== Drift guard self-test (negative case) ==="
 
-# Feed the REAL coverage check (ungrouped_dispatch_targets, used by the guard
-# above) a synthetic dispatch list containing a target absent from every
-# group. Because this drives the production function instead of a copy of the
-# loop, a regression that silently breaks the guard also fails this test.
-phantom_result="$(ungrouped_dispatch_targets "${DISPATCH_TARGETS[@]}" "phantom-target")"
-if printf '%s\n' "$phantom_result" | grep -qx "phantom-target"; then
-    pass "Drift guard detects ungrouped dispatch target (phantom-target)"
+# Drive the REAL guard loop (report_*), not just the detection helper, against a
+# synthetic input containing a target absent from every group. This exercises
+# the full loop→fail() wiring the guard relies on, so a regression that breaks
+# it (a dropped `fail`, a deleted loop) also fails here instead of leaving the
+# guard silently disabled. Run in $(...) so the synthetic fail() increments the
+# subshell's FAIL, not the real counter; assert on the captured output.
+phantom_dispatch_output="$(report_ungrouped_dispatch_targets "${DISPATCH_TARGETS[@]}" "phantom-target" 2>&1)"
+if printf '%s\n' "$phantom_dispatch_output" | grep -q "phantom-target"; then
+    pass "Drift guard loop fails on ungrouped dispatch target (phantom-target)"
 else
-    fail "Drift guard did NOT detect ungrouped dispatch target"
+    fail "Drift guard loop did NOT fail on ungrouped dispatch target"
 fi
 
-# Direction (a): feed the REAL check a synthetic group member with no dispatch
-# entry and confirm it is detected (mirrors the direction-(b) proof above).
-phantom_member_result="$(undispatched_group_members "${OFFLINE_TARGETS[@]}" "phantom-group-member")"
-if printf '%s\n' "$phantom_member_result" | grep -qx "phantom-group-member"; then
-    pass "Drift guard detects group member without a dispatch entry (phantom-group-member)"
+# Direction (a): same, for a group member with no dispatch entry.
+phantom_member_output="$(report_undispatched_group_members "${OFFLINE_TARGETS[@]}" "phantom-group-member" 2>&1)"
+if printf '%s\n' "$phantom_member_output" | grep -q "phantom-group-member"; then
+    pass "Drift guard loop fails on group member without a dispatch entry (phantom-group-member)"
 else
-    fail "Drift guard did NOT detect group member without a dispatch entry"
+    fail "Drift guard loop did NOT fail on group member without a dispatch entry"
 fi
 
 echo ""
