@@ -2266,3 +2266,44 @@ func TestGenerate_DeterministicUnderInputShuffle(t *testing.T) {
 			"shuffle seed %d produced a different spec — non-determinism detected", seed)
 	}
 }
+
+// TestGenerate_ResponseSchema_SurvivesEmptyBaseObservation covers review finding
+// 002: when a status code is observed both half-captured (empty response) and
+// populated on the same endpoint, the populated response schema must survive
+// regardless of which observation the deterministic group sort places first.
+func TestGenerate_ResponseSchema_SurvivesEmptyBaseObservation(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	empty := classify.ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method:   "POST",
+			URL:      "https://api.example.com/api/users",
+			Headers:  map[string]string{"Content-Type": "application/json"},
+			Body:     []byte(`{"a":1}`),
+			Response: crawl.ObservedResponse{StatusCode: 201}, // half-captured
+		},
+		IsAPI: true,
+	}
+	populated := classify.ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method:  "POST",
+			URL:     "https://api.example.com/api/users",
+			Headers: map[string]string{"Content-Type": "application/json"},
+			Body:    []byte(`{"b":2}`),
+			Response: crawl.ObservedResponse{
+				StatusCode:  201,
+				ContentType: "application/json",
+				Body:        []byte(`{"id":1,"name":"x"}`),
+			},
+		},
+		IsAPI: true,
+	}
+
+	for _, order := range [][]classify.ClassifiedRequest{{empty, populated}, {populated, empty}} {
+		spec, err := gen.Generate(order)
+		require.NoError(t, err)
+		// "name" appears only in the populated 201 response body, so its presence
+		// proves the response schema was not dropped by an empty base.
+		assert.Contains(t, string(spec), "name",
+			"populated 201 response schema must survive regardless of observation order")
+	}
+}
