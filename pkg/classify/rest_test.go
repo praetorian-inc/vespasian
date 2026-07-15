@@ -606,6 +606,24 @@ func TestRESTClassifier_RequestSideSignal(t *testing.T) {
 	}
 }
 
+// TestRESTClassifier_ReasonListsAllSignals verifies the classification reason
+// records every contributing signal and matches the confidence, rather than
+// attributing the score to whichever rule set the reason first. A POST on an
+// /api/ path gets its confidence from the method rule (0.70) but also matches
+// the path heuristic; the reason must name both (regression for the -v
+// mislabeling surfaced by LAB-4678 live validation).
+func TestRESTClassifier_ReasonListsAllSignals(t *testing.T) {
+	c := &RESTClassifier{}
+	_, conf, reason := c.ClassifyDetail(crawl.ObservedRequest{
+		Method: "POST",
+		URL:    "https://example.com/api/apps",
+		// no response captured — mirrors the live lab observation
+	})
+	assert.InDelta(t, HTTPMethodConfidence, conf, 0.001, "POST confidence comes from the method rule")
+	assert.Contains(t, reason, "path-heuristic", "reason must record the path signal")
+	assert.Contains(t, reason, "method:POST", "reason must record the method signal that set the confidence")
+}
+
 // TestRESTClassifier_Deterministic verifies ClassifyDetail is a pure function of
 // its input: the same request yields identical (isAPI, confidence, reason) every
 // call, which is what makes the REST-vs-not verdict stable for a given input

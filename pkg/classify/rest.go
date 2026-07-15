@@ -120,7 +120,7 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	for _, apiCT := range apiContentTypes {
 		if ct == apiCT {
 			confidence = ContentTypeConfidence
-			reason = "content-type:" + apiCT
+			reason = appendReason(reason, "content-type:"+apiCT)
 			break
 		}
 	}
@@ -132,24 +132,23 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 			if confidence > 1.0 {
 				confidence = 1.0
 			}
-			if reason == "" {
-				reason = "path-heuristic"
-			} else {
-				reason += "+path-heuristic"
-			}
+			reason = appendReason(reason, "path-heuristic")
 			break
 		}
 	}
 
 	// Rule 4: HTTP method signal.
+	// Every rule that detects its signal appends to the reason (not only when
+	// the reason is still empty) so the reason lists ALL contributing signals
+	// and matches the final confidence. Otherwise a POST on an /api/ path would
+	// report reason=path-heuristic (0.15) while confidence is 0.70 from this
+	// rule — attributing the score to the wrong signal.
 	upper := strings.ToUpper(req.Method)
 	if upper == "POST" || upper == "PUT" || upper == "PATCH" || upper == "DELETE" {
 		if confidence < HTTPMethodConfidence {
 			confidence = HTTPMethodConfidence
 		}
-		if reason == "" {
-			reason = "method:" + upper
-		}
+		reason = appendReason(reason, "method:"+upper)
 	}
 
 	// Rule 5: Response structure (JSON body).
@@ -160,9 +159,7 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 			if confidence < JSONBodyConfidence {
 				confidence = JSONBodyConfidence
 			}
-			if reason == "" {
-				reason = "response-structure:json"
-			}
+			reason = appendReason(reason, "response-structure:json")
 		}
 	}
 
@@ -202,17 +199,25 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 				}
 			}
 		}
-		if signal != "" && confidence < RequestSignalConfidence {
-			confidence = RequestSignalConfidence
-			if reason == "" {
-				reason = "request-signal:" + signal
-			} else {
-				reason += "+request-signal:" + signal
+		if signal != "" {
+			if confidence < RequestSignalConfidence {
+				confidence = RequestSignalConfidence
 			}
+			reason = appendReason(reason, "request-signal:"+signal)
 		}
 	}
 
 	return confidence > 0, confidence, reason
+}
+
+// appendReason joins classification signal tags with "+" so the reason string
+// records every signal that contributed, in rule order. An empty existing
+// reason yields the tag alone.
+func appendReason(existing, sig string) string {
+	if existing == "" {
+		return sig
+	}
+	return existing + "+" + sig
 }
 
 // acceptSignalsAPI parses an Accept header and returns the API media type the
