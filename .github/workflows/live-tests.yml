@@ -58,11 +58,11 @@ jobs:
         with:
           node-version: 20
 
-      - name: Build vespasian
-        run: go build -o bin/vespasian ./cmd/vespasian
-
       - name: Drift guard (target groups vs dispatch)
         run: ./test/test-runner-args.sh
+
+      - name: Build vespasian
+        run: go build -o bin/vespasian ./cmd/vespasian
 
       - name: Write stub config for offline tests
         run: |

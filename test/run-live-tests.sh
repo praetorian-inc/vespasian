@@ -33,6 +33,11 @@ TEST_HOST="${TEST_HOST:-localhost}"
 # ──────────────────────────────────────────────────────────────
 # Target groups (single source of truth — CI references these
 # via --group instead of maintaining its own target lists)
+#
+# Some dispatchable targets (e.g. grpc-server) are intentionally NOT in
+# either group: they are config-only and run only when TARGETS_SETUP (or an
+# explicit --targets) selects them. test/test-runner-args.sh tracks these in
+# its CONFIG_ONLY array so the drift guard does not flag them.
 # ──────────────────────────────────────────────────────────────
 
 OFFLINE_TARGETS=(
@@ -68,6 +73,39 @@ LIVE_TARGETS=(
 
 # join_targets prints array elements as a comma-separated string.
 join_targets() { local IFS=','; echo "$*"; }
+
+# resolve_targets prints the comma-separated target list for a group name.
+# Usage: resolve_targets <offline|live|all>
+# For the "all" group it honors TARGETS_SETUP (prepend + dedup). Returns
+# non-zero on an unknown group so the caller can report the error. Keeping
+# this as a standalone function lets the drift-guard test invoke the real
+# resolver instead of scraping and re-implementing it.
+resolve_targets() {
+    local group="$1"
+    local resolved
+    case "$group" in
+        offline)
+            resolved="$(join_targets "${OFFLINE_TARGETS[@]}")"
+            ;;
+        live)
+            resolved="$(join_targets "${LIVE_TARGETS[@]}")"
+            ;;
+        all)
+            # Always include both defined groups. Config may prepend extra
+            # live targets (e.g. grpc-server); deduplicate so overlapping
+            # targets don't run their test function twice.
+            resolved="$(join_targets "${OFFLINE_TARGETS[@]}"),$(join_targets "${LIVE_TARGETS[@]}")"
+            if [ -n "${TARGETS_SETUP:-}" ]; then
+                resolved="${TARGETS_SETUP},${resolved}"
+                resolved="$(echo "$resolved" | tr ',' '\n' | awk '!s[$0]++' | paste -sd, -)"
+            fi
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    printf '%s\n' "$resolved"
+}
 
 # Source shared colors, logging, and validation functions
 # shellcheck source=common.sh
@@ -2810,12 +2848,12 @@ main() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --group)
-                if [[ $# -lt 2 ]]; then log_fail "--group requires a value"; usage; exit 1; fi
+                if [ $# -lt 2 ]; then log_fail "--group requires a value"; usage; exit 1; fi
                 group="$2"
                 shift 2
                 ;;
             --targets)
-                if [[ $# -lt 2 ]]; then log_fail "--targets requires a value"; usage; exit 1; fi
+                if [ $# -lt 2 ]; then log_fail "--targets requires a value"; usage; exit 1; fi
                 targets="$2"
                 shift 2
                 ;;
@@ -2854,28 +2892,11 @@ main() {
 
     # --targets takes precedence over --group; --group defaults to "all".
     if [ -z "$targets" ]; then
-        case "${group:-all}" in
-            offline)
-                targets="$(join_targets "${OFFLINE_TARGETS[@]}")"
-                ;;
-            live)
-                targets="$(join_targets "${LIVE_TARGETS[@]}")"
-                ;;
-            all)
-                # Always include both defined groups. Config may prepend extra
-                # live targets (e.g. grpc-server); deduplicate so overlapping
-                # targets don't run their test function twice.
-                targets="$(join_targets "${OFFLINE_TARGETS[@]}"),$(join_targets "${LIVE_TARGETS[@]}")"
-                if [ -n "${TARGETS_SETUP:-}" ]; then
-                    targets="${TARGETS_SETUP},${targets}"
-                    targets="$(echo "$targets" | tr ',' '\n' | awk '!s[$0]++' | paste -sd, -)"
-                fi
-                ;;
-            *)
-                log_fail "Unknown group: ${group} (valid: offline, live, all)"
-                exit 1
-                ;;
-        esac
+        if ! targets="$(resolve_targets "${group:-all}")"; then
+            log_fail "Unknown group: ${group} (valid: offline, live, all)"
+            usage
+            exit 1
+        fi
     fi
 
     if [ "$dry_run" = true ]; then

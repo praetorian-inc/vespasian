@@ -30,27 +30,46 @@ mapfile -t DISPATCH_TARGETS < <(
 # Targets that are intentionally not in either group (config-driven).
 CONFIG_ONLY=(grpc-server)
 
+# ungrouped_dispatch_targets prints any of the given targets that are absent
+# from OFFLINE_TARGETS, LIVE_TARGETS, and CONFIG_ONLY. This is the real
+# coverage check shared by the drift guard and its negative self-test, so a
+# regression here trips both — not just a hand-written copy of the loop.
+ungrouped_dispatch_targets() {
+    local grouped=("${OFFLINE_TARGETS[@]}" "${LIVE_TARGETS[@]}" "${CONFIG_ONLY[@]}")
+    local target
+    for target in "$@"; do
+        if ! printf '%s\n' "${grouped[@]}" | grep -qx "$target"; then
+            printf '%s\n' "$target"
+        fi
+    done
+}
+
+# undispatched_group_members prints any of the given group members that have no
+# case-dispatch entry in the runner. Shared by the drift guard's direction-(a)
+# check and its negative self-test, so a regression trips both.
+undispatched_group_members() {
+    local target
+    for target in "$@"; do
+        if ! printf '%s\n' "${DISPATCH_TARGETS[@]}" | grep -qx "$target"; then
+            printf '%s\n' "$target"
+        fi
+    done
+}
+
 echo "=== Drift guard: groups vs case dispatch ==="
 drift_fail_before=$FAIL
 
 # Every group member must have a case-dispatch entry.
-for target in "${OFFLINE_TARGETS[@]}" "${LIVE_TARGETS[@]}"; do
-    if printf '%s\n' "${DISPATCH_TARGETS[@]}" | grep -qx "$target"; then
-        : # ok
-    else
-        fail "Group member '$target' has no case-dispatch entry in run-live-tests.sh"
-    fi
-done
+while IFS= read -r target; do
+    [[ -z "$target" ]] && continue
+    fail "Group member '$target' has no case-dispatch entry in run-live-tests.sh"
+done < <(undispatched_group_members "${OFFLINE_TARGETS[@]}" "${LIVE_TARGETS[@]}")
 
 # Every dispatch target must be in a group or in CONFIG_ONLY.
-all_grouped=("${OFFLINE_TARGETS[@]}" "${LIVE_TARGETS[@]}" "${CONFIG_ONLY[@]}")
-for target in "${DISPATCH_TARGETS[@]}"; do
-    if printf '%s\n' "${all_grouped[@]}" | grep -qx "$target"; then
-        : # ok
-    else
-        fail "Dispatch target '$target' is not in OFFLINE_TARGETS, LIVE_TARGETS, or CONFIG_ONLY"
-    fi
-done
+while IFS= read -r target; do
+    [[ -z "$target" ]] && continue
+    fail "Dispatch target '$target' is not in OFFLINE_TARGETS, LIVE_TARGETS, or CONFIG_ONLY"
+done < <(ungrouped_dispatch_targets "${DISPATCH_TARGETS[@]}")
 
 # No target should appear in both groups.
 for target in "${OFFLINE_TARGETS[@]}"; do
@@ -69,28 +88,38 @@ fi
 echo ""
 echo "=== Drift guard self-test (negative case) ==="
 
-# Verify the guard actually catches a missing target by feeding it a
-# synthetic DISPATCH_TARGETS that includes an entry absent from all groups.
-synthetic_dispatch=("${DISPATCH_TARGETS[@]}" "phantom-target")
-guard_caught=false
-all_grouped_with_config=("${OFFLINE_TARGETS[@]}" "${LIVE_TARGETS[@]}" "${CONFIG_ONLY[@]}")
-for target in "${synthetic_dispatch[@]}"; do
-    if ! printf '%s\n' "${all_grouped_with_config[@]}" | grep -qx "$target"; then
-        guard_caught=true
-        break
-    fi
-done
-if [[ "$guard_caught" == true ]]; then
+# Feed the REAL coverage check (ungrouped_dispatch_targets, used by the guard
+# above) a synthetic dispatch list containing a target absent from every
+# group. Because this drives the production function instead of a copy of the
+# loop, a regression that silently breaks the guard also fails this test.
+phantom_result="$(ungrouped_dispatch_targets "${DISPATCH_TARGETS[@]}" "phantom-target")"
+if printf '%s\n' "$phantom_result" | grep -qx "phantom-target"; then
     pass "Drift guard detects ungrouped dispatch target (phantom-target)"
 else
     fail "Drift guard did NOT detect ungrouped dispatch target"
 fi
 
+# Direction (a): feed the REAL check a synthetic group member with no dispatch
+# entry and confirm it is detected (mirrors the direction-(b) proof above).
+phantom_member_result="$(undispatched_group_members "${OFFLINE_TARGETS[@]}" "phantom-group-member")"
+if printf '%s\n' "$phantom_member_result" | grep -qx "phantom-group-member"; then
+    pass "Drift guard detects group member without a dispatch entry (phantom-group-member)"
+else
+    fail "Drift guard did NOT detect group member without a dispatch entry"
+fi
+
 echo ""
 echo "=== Target group construction ==="
 
-# --group all includes every group member without duplicates.
-all="$(join_targets "${OFFLINE_TARGETS[@]}"),$(join_targets "${LIVE_TARGETS[@]}")"
+# --group all must resolve to a duplicate-free list. Drive the REAL runner via
+# --dry-run (not a local reconstruction) so this guards the production all)
+# path. With TARGETS_SETUP empty the runner does not dedup, so an accidental
+# repeated entry within OFFLINE_TARGETS/LIVE_TARGETS would surface here — the
+# one duplicate case the disjoint-groups and behavioral-all checks cannot see.
+tmpconfig_all=$(mktemp)
+echo "TARGETS_SETUP=" > "$tmpconfig_all"
+all=$(env CONFIG_FILE="$tmpconfig_all" bash -c "source '$RUNNER' --group all --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//')
+rm -f "$tmpconfig_all"
 dup_count=$(echo "$all" | tr ',' '\n' | sort | uniq -d | wc -l | tr -d ' ')
 if [[ "$dup_count" -eq 0 ]]; then
     pass "--group all: no duplicates"
@@ -118,6 +147,15 @@ else
     fail "TARGETS_SETUP merge: rest-api count=$rest_count, expected 1"
 fi
 
+# Order matters (AC#3): TARGETS_SETUP is prepended and dedup keeps the first
+# occurrence, so the resolved list must START with the setup targets in order.
+# Counts alone would miss an append-instead-of-prepend or keep-last regression.
+if [[ "$setup_output" == "grpc-server,rest-api,"* ]]; then
+    pass "TARGETS_SETUP merge: setup targets prepended in order"
+else
+    fail "TARGETS_SETUP merge: expected leading 'grpc-server,rest-api,', got '$setup_output'"
+fi
+
 echo ""
 echo "=== join_targets helper ==="
 
@@ -142,33 +180,33 @@ echo "=== Argument validation ==="
 # Invalid --group value exits non-zero with the expected error message.
 tmpconfig=$(mktemp)
 echo "TARGETS_SETUP=" > "$tmpconfig"
-invalid_output=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --group bogus" 2>&1 || true)
-if [[ "$invalid_output" == *"Unknown group"* ]]; then
-    pass "Invalid --group: rejected with 'Unknown group' message"
+invalid_output=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --group bogus" 2>&1) && rc=0 || rc=$?
+if [[ "$invalid_output" == *"Unknown group"* && "$rc" -ne 0 ]]; then
+    pass "Invalid --group: rejected non-zero with 'Unknown group' message"
 else
-    fail "Invalid --group: expected 'Unknown group' in output, got: $invalid_output"
+    fail "Invalid --group: expected non-zero exit + 'Unknown group' (rc=$rc), got: $invalid_output"
 fi
 rm -f "$tmpconfig"
 
 # --group without a value exits non-zero with the expected error message.
 tmpconfig=$(mktemp)
 echo "TARGETS_SETUP=" > "$tmpconfig"
-novalue_output=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --group" 2>&1 || true)
-if [[ "$novalue_output" == *"--group requires a value"* ]]; then
-    pass "--group (no value): rejected with '--group requires a value'"
+novalue_output=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --group" 2>&1) && rc=0 || rc=$?
+if [[ "$novalue_output" == *"--group requires a value"* && "$rc" -ne 0 ]]; then
+    pass "--group (no value): rejected non-zero with '--group requires a value'"
 else
-    fail "--group (no value): expected '--group requires a value' in output, got: $novalue_output"
+    fail "--group (no value): expected non-zero exit + '--group requires a value' (rc=$rc), got: $novalue_output"
 fi
 rm -f "$tmpconfig"
 
 # --targets without a value exits non-zero with the expected error message.
 tmpconfig=$(mktemp)
 echo "TARGETS_SETUP=" > "$tmpconfig"
-novalue_output=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --targets" 2>&1 || true)
-if [[ "$novalue_output" == *"--targets requires a value"* ]]; then
-    pass "--targets (no value): rejected with '--targets requires a value'"
+novalue_output=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --targets" 2>&1) && rc=0 || rc=$?
+if [[ "$novalue_output" == *"--targets requires a value"* && "$rc" -ne 0 ]]; then
+    pass "--targets (no value): rejected non-zero with '--targets requires a value'"
 else
-    fail "--targets (no value): expected '--targets requires a value' in output, got: $novalue_output"
+    fail "--targets (no value): expected non-zero exit + '--targets requires a value' (rc=$rc), got: $novalue_output"
 fi
 rm -f "$tmpconfig"
 
