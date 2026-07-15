@@ -15,6 +15,7 @@
 package rest
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -134,6 +135,12 @@ func extractServers(endpoints []classify.ClassifiedRequest) (openapi3.Servers, s
 			servers = append(servers, &openapi3.Server{URL: baseURL})
 		}
 	}
+
+	// Sort servers so the list order and the derived title are independent of
+	// the crawl's capture order (LAB-4678). Same-origin scans have a single
+	// server (a no-op sort); same-domain scans can observe several hosts whose
+	// first-seen order would otherwise vary run-to-run.
+	sort.Slice(servers, func(i, j int) bool { return servers[i].URL < servers[j].URL })
 
 	if len(servers) > 0 {
 		// Use first server's host for title
@@ -279,6 +286,37 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 	if len(group) == 0 {
 		return operation
 	}
+
+	// Order the group deterministically before any first-seen-wins logic below
+	// (LAB-4678, M3). A group holds every observation that normalized to this
+	// path+method, including multiple dedup entries with distinct request
+	// bodies, each carrying its own response. The response merge (per status
+	// code) keeps the first-seen response as the base, and the query-param and
+	// body unions consume the group in order. The group arrives in the crawl's
+	// capture order — nondeterministic — so without this sort the documented
+	// response (and any conflict tie-break) could differ run-to-run for a fixed
+	// input. Each entry's response was already selected deterministically in
+	// classify.Deduplicate; ordering the entries makes their combination
+	// deterministic too. Key: URL, method, request body, then response fields.
+	sort.SliceStable(group, func(i, j int) bool {
+		a, b := group[i], group[j]
+		if a.URL != b.URL {
+			return a.URL < b.URL
+		}
+		if a.Method != b.Method {
+			return a.Method < b.Method
+		}
+		if c := bytes.Compare(a.Body, b.Body); c != 0 {
+			return c < 0
+		}
+		if a.Response.StatusCode != b.Response.StatusCode {
+			return a.Response.StatusCode < b.Response.StatusCode
+		}
+		if a.Response.ContentType != b.Response.ContentType {
+			return a.Response.ContentType < b.Response.ContentType
+		}
+		return bytes.Compare(a.Response.Body, b.Response.Body) < 0
+	})
 
 	// --- Query parameters: collect union from all endpoints, track frequency, values, and multi-value ---
 	type queryParamInfo struct {

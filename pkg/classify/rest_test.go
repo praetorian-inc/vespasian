@@ -505,3 +505,106 @@ func TestClassifyDetail_FallbackToHeaders(t *testing.T) {
 		})
 	}
 }
+
+// TestRESTClassifier_RequestSideSignal covers Rule 6 (LAB-4678, B2): a JSON API
+// reached by GET whose response was not captured (empty content-type and body)
+// must still classify as REST when the request itself shows API intent on an
+// API path, so the REST-vs-not verdict does not flip with response timing.
+func TestRESTClassifier_RequestSideSignal(t *testing.T) {
+	c := &RESTClassifier{}
+
+	tests := []struct {
+		name          string
+		req           crawl.ObservedRequest
+		wantIsAPI     bool
+		wantMinConf   float64
+		wantReasonSub string
+	}{
+		{
+			name: "JSON GET on api path with Accept:json, no response",
+			req: crawl.ObservedRequest{
+				Method:  "GET",
+				URL:     "https://example.com/api/users",
+				Headers: map[string]string{"Accept": "application/json, text/plain, */*"},
+				// no Response captured (half-captured)
+			},
+			wantIsAPI:     true,
+			wantMinConf:   RequestSignalConfidence,
+			wantReasonSub: "request-signal:accept",
+		},
+		{
+			name: "GET on api path, Accept:*/* only, no response -> not enough",
+			req: crawl.ObservedRequest{
+				Method:  "GET",
+				URL:     "https://example.com/api/users",
+				Headers: map[string]string{"Accept": "*/*"},
+			},
+			// Only the path boost (0.15) applies — must stay below threshold so
+			// plain navigations under /api/ are not over-classified.
+			wantIsAPI:   true, // confidence 0.15 > 0, but...
+			wantMinConf: 0,
+		},
+		{
+			name: "GET on api path with json request content-type, no response",
+			req: crawl.ObservedRequest{
+				Method:  "GET",
+				URL:     "https://example.com/api/users",
+				Headers: map[string]string{"Content-Type": "application/json; charset=utf-8"},
+			},
+			wantIsAPI:     true,
+			wantMinConf:   RequestSignalConfidence,
+			wantReasonSub: "request-signal:content-type",
+		},
+		{
+			name: "non-api path with Accept:json -> request signal does NOT fire",
+			req: crawl.ObservedRequest{
+				Method:  "GET",
+				URL:     "https://example.com/dashboard",
+				Headers: map[string]string{"Accept": "application/json"},
+			},
+			wantIsAPI:   false,
+			wantMinConf: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isAPI, confidence, reason := c.ClassifyDetail(tt.req)
+			assert.Equal(t, tt.wantIsAPI, isAPI, "isAPI")
+			assert.GreaterOrEqual(t, confidence, tt.wantMinConf, "confidence lower bound")
+			if tt.wantReasonSub != "" {
+				assert.Contains(t, reason, tt.wantReasonSub, "reason")
+			}
+		})
+	}
+
+	// The Accept:*/* case must specifically NOT clear the default threshold, or
+	// the request signal would over-classify.
+	_, conf, _ := c.ClassifyDetail(crawl.ObservedRequest{
+		Method:  "GET",
+		URL:     "https://example.com/api/users",
+		Headers: map[string]string{"Accept": "*/*"},
+	})
+	assert.Less(t, conf, DefaultConfidenceThreshold,
+		"api-path + Accept:*/* must stay below threshold (path boost only)")
+}
+
+// TestRESTClassifier_Deterministic verifies ClassifyDetail is a pure function of
+// its input: the same request yields identical (isAPI, confidence, reason) every
+// call, which is what makes the REST-vs-not verdict stable for a given input
+// (LAB-4678).
+func TestRESTClassifier_Deterministic(t *testing.T) {
+	c := &RESTClassifier{}
+	req := crawl.ObservedRequest{
+		Method:  "GET",
+		URL:     "https://example.com/api/users",
+		Headers: map[string]string{"Accept": "application/json"},
+	}
+	isAPI0, conf0, reason0 := c.ClassifyDetail(req)
+	for i := 0; i < 20; i++ {
+		isAPI, conf, reason := c.ClassifyDetail(req)
+		assert.Equal(t, isAPI0, isAPI)
+		assert.Equal(t, conf0, conf)
+		assert.Equal(t, reason0, reason)
+	}
+}

@@ -17,6 +17,7 @@ package rest
 import (
 	"bytes"
 	"encoding/json"
+	"math/rand"
 	"mime/multipart"
 	"net/textproto"
 	"strings"
@@ -2189,5 +2190,79 @@ func TestExtractComponents_Deterministic(t *testing.T) {
 		out, err := gen.Generate(endpoints)
 		require.NoError(t, err, "Generate call %d failed", i)
 		assert.Equal(t, first, out, "Generate run %d produced different output than run 1 — non-determinism detected", i)
+	}
+}
+
+// newDetEndpoint is a helper for TestGenerate_DeterministicUnderInputShuffle.
+func newDetEndpoint(method, url string, body []byte, status int, respBody, respCT string) classify.ClassifiedRequest {
+	ep := classify.ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method:   method,
+			URL:      url,
+			Response: crawl.ObservedResponse{StatusCode: status},
+		},
+		IsAPI: true, Confidence: 0.9, APIType: "rest",
+	}
+	if len(body) > 0 {
+		ep.Body = body
+		ep.Headers = map[string]string{"Content-Type": "application/json"}
+	}
+	if len(respBody) > 0 {
+		ep.Response.Body = []byte(respBody)
+	}
+	if respCT != "" {
+		ep.Response.ContentType = respCT
+	}
+	return ep
+}
+
+// TestGenerate_DeterministicUnderInputShuffle is the headline LAB-4678
+// guarantee: a fixed set of observations, fed in ANY order through Deduplicate +
+// Generate, must produce a byte-identical spec. This is the property that makes
+// Guard's runs consistent for identical input traffic. It exercises the two
+// order-sensitive spots the fix addresses: the dedup response selection (A4,
+// where GET /api/users is observed twice with different responses under one
+// dedup key) and the per-group ordering lock in buildOperation (M3, where POST
+// /api/users has two distinct request bodies that share a generate group).
+func TestGenerate_DeterministicUnderInputShuffle(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+
+	base := []classify.ClassifiedRequest{
+		newDetEndpoint("GET", "https://api.example.com/api/users", nil, 200, `{"users":[{"id":1}]}`, "application/json"),
+		newDetEndpoint("GET", "https://api.example.com/api/users", nil, 200, `{"users":[{"id":2},{"id":3}]}`, "application/json"),
+		newDetEndpoint("POST", "https://api.example.com/api/users", []byte(`{"name":"a"}`), 201, `{"id":1}`, "application/json"),
+		newDetEndpoint("POST", "https://api.example.com/api/users", []byte(`{"email":"b@x.io"}`), 201, `{"id":2}`, "application/json"),
+		newDetEndpoint("GET", "https://api.example.com/api/orders", nil, 200, `{"orders":[]}`, "application/json"),
+		newDetEndpoint("GET", "https://api.example.com/api/items/42", nil, 200, `{"id":42}`, "application/json"),
+		newDetEndpoint("DELETE", "https://api.example.com/api/items/42", nil, 204, "", ""),
+	}
+
+	specFrom := func(order []classify.ClassifiedRequest) []byte {
+		in := make([]classify.ClassifiedRequest, len(order))
+		copy(in, order)
+		deduped := classify.Deduplicate(in)
+		out, err := gen.Generate(deduped)
+		require.NoError(t, err)
+		return out
+	}
+
+	want := specFrom(base)
+	require.NotEmpty(t, want)
+
+	// Reversed input.
+	rev := make([]classify.ClassifiedRequest, len(base))
+	for i := range base {
+		rev[i] = base[len(base)-1-i]
+	}
+	assert.Equal(t, string(want), string(specFrom(rev)), "reversed input produced a different spec")
+
+	// Several seeded shuffles.
+	for _, seed := range []int64{1, 7, 42, 1000, 99999} {
+		r := rand.New(rand.NewSource(seed)) //nolint:gosec // deterministic test shuffle, not security-sensitive
+		shuffled := make([]classify.ClassifiedRequest, len(base))
+		copy(shuffled, base)
+		r.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
+		assert.Equal(t, string(want), string(specFrom(shuffled)),
+			"shuffle seed %d produced a different spec — non-determinism detected", seed)
 	}
 }

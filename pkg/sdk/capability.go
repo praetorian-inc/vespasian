@@ -29,6 +29,7 @@ import (
 	"github.com/praetorian-inc/capability-sdk/pkg/capmodel"
 
 	"github.com/praetorian-inc/vespasian/internal/pipeline"
+	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
@@ -266,14 +267,14 @@ func crawlOptsFromCtx(ctx capability.ExecutionContext) (crawl.CrawlerOptions, er
 func parseConfidence(params capability.Parameters) float64 {
 	cf, ok := params.GetString("confidence")
 	if !ok || cf == "" {
-		return 0.5
+		return classify.DefaultConfidenceThreshold
 	}
 	v, err := strconv.ParseFloat(cf, 64)
 	if err != nil {
-		return 0.5
+		return classify.DefaultConfidenceThreshold
 	}
 	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 1 {
-		return 0.5
+		return classify.DefaultConfidenceThreshold
 	}
 	return v
 }

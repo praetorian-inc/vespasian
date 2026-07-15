@@ -255,6 +255,9 @@ Vespasian classifies and generates specifications for four API types:
 3. **Path heuristics**: `/api/`, `/v1/`, `/v2/`, `/v3/`, `/rest/`, `/rpc/` paths boost confidence
 4. **HTTP method**: POST/PUT/PATCH/DELETE to non-page URLs
 5. **Response structure**: JSON object or array bodies (not HTML)
+6. **Request-side signal**: an API path plus a JSON/XML `Accept` (or request content-type) classifies the endpoint even when its response was not captured, so the REST-vs-not verdict does not depend on response timing
+
+The classification signals above are content-based and deterministic: identical input traffic yields the same endpoint set, the same classification, and a byte-identical spec every run. Run with `-v` to see the per-endpoint classification reason.
 
 ### GraphQL Classification Heuristics
 
