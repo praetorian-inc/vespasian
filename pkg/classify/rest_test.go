@@ -587,6 +587,23 @@ func TestRESTClassifier_RequestSideSignal(t *testing.T) {
 	})
 	assert.Less(t, conf, DefaultConfidenceThreshold,
 		"api-path + Accept:*/* must stay below threshold (path boost only)")
+
+	// A standard browser document-navigation Accept header contains
+	// application/xml (with a q-value) AND text/html. A crawled HTML page under
+	// an api-like path (e.g. a Swagger UI at /api/docs) must NOT be classified
+	// as a REST API by the request-side signal (review finding 001).
+	const navAccept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+	for _, p := range []string{"/api/docs", "/graphql", "/v2/dashboard"} {
+		_, navConf, navReason := c.ClassifyDetail(crawl.ObservedRequest{
+			Method:  "GET",
+			URL:     "https://example.com" + p,
+			Headers: map[string]string{"Accept": navAccept},
+		})
+		assert.Less(t, navConf, DefaultConfidenceThreshold,
+			"browser navigation to %s must stay below threshold", p)
+		assert.NotContains(t, navReason, "request-signal",
+			"navigation to %s must not fire the request-side signal", p)
+	}
 }
 
 // TestRESTClassifier_Deterministic verifies ClassifyDetail is a pure function of

@@ -498,14 +498,25 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 		}
 
 		if existing, ok := seenStatus[statusCode]; ok {
-			// Merge response body schema if both are objects
-			if len(ep.Response.Body) > 0 && existing.Value != nil && existing.Value.Content != nil {
+			// Merge response body schema if this observation has a JSON body.
+			// The base (first observation of this status in the deterministically
+			// sorted group) may itself be a half-captured empty response, so we
+			// must also ADOPT a populated schema when the base has none — not
+			// only union into an already-populated base. Otherwise a populated
+			// observation is silently dropped whenever an empty one sorts first
+			// (review finding 002).
+			if len(ep.Response.Body) > 0 && existing.Value != nil {
 				// Only infer JSON schema for JSON-compatible content types
 				ct := strings.ToLower(ep.Response.ContentType)
 				if ct == "" || strings.Contains(ct, "json") {
 					newSchema := InferSchema(ep.Response.Body)
 					if newSchema != nil && newSchema.Value != nil && newSchema.Value.Properties != nil {
-						if mt := existing.Value.Content["application/json"]; mt != nil && mt.Schema != nil &&
+						if existing.Value.Content == nil {
+							// Base had no body; adopt this populated schema.
+							existing.Value.Content = openapi3.Content{
+								"application/json": &openapi3.MediaType{Schema: newSchema},
+							}
+						} else if mt := existing.Value.Content["application/json"]; mt != nil && mt.Schema != nil &&
 							mt.Schema.Value != nil && mt.Schema.Value.Properties != nil {
 							for propName, propSchema := range newSchema.Value.Properties {
 								if _, exists := mt.Schema.Value.Properties[propName]; !exists {

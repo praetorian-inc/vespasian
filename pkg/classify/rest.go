@@ -187,13 +187,8 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	}
 	if pathIsAPI {
 		signal := ""
-		if accept := strings.ToLower(getHeader(req.Headers, "accept")); accept != "" {
-			for _, apiCT := range apiContentTypes {
-				if strings.Contains(accept, apiCT) {
-					signal = "accept:" + apiCT
-					break
-				}
-			}
+		if apiCT := acceptSignalsAPI(getHeader(req.Headers, "accept")); apiCT != "" {
+			signal = "accept:" + apiCT
 		}
 		if signal == "" {
 			reqCT := strings.ToLower(getHeader(req.Headers, "content-type"))
@@ -218,6 +213,43 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	}
 
 	return confidence > 0, confidence, reason
+}
+
+// acceptSignalsAPI parses an Accept header and returns the API media type the
+// client is explicitly asking for, or "" if none. It splits into media ranges,
+// ignores q-parameters and the "*/*" wildcard, and exact-matches against
+// apiContentTypes. Crucially, a header that accepts text/html or
+// application/xhtml+xml is treated as a document navigation, NOT API intent —
+// browsers always send those on page loads, and the standard navigation Accept
+// header also contains application/xml (which would otherwise substring-match).
+// This keeps Rule 6 from classifying plain HTML pages under api-like paths
+// (e.g. a Swagger UI at /api/docs or a /graphql playground) as REST APIs.
+func acceptSignalsAPI(accept string) string {
+	if accept == "" {
+		return ""
+	}
+	match := ""
+	for _, part := range strings.Split(accept, ",") {
+		mt := part
+		if i := strings.Index(mt, ";"); i != -1 {
+			mt = mt[:i]
+		}
+		mt = strings.ToLower(strings.TrimSpace(mt))
+		if mt == "text/html" || mt == "application/xhtml+xml" {
+			// A document-navigation marker anywhere in the header disqualifies
+			// the whole request as API intent.
+			return ""
+		}
+		if match == "" {
+			for _, apiCT := range apiContentTypes {
+				if mt == apiCT {
+					match = apiCT
+					break
+				}
+			}
+		}
+	}
+	return match
 }
 
 // firstNonSpace returns the first non-ASCII-whitespace byte in b.
