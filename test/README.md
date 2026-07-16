@@ -86,8 +86,33 @@ Options:
                      Valid: rest-api,soap-service,graphql-server,grpc-server
   --skip-start       Only build, don't start services
   --teardown         Stop all running targets and clean up
+  --sweep            With --teardown, also sweep untracked orphans by name/port
   --help             Show this help message
 ```
+
+The script is resilient to repeated runs: every started PID is recorded (per
+service, appended across runs), so `--teardown` kills **every** generation, not
+just the most recent. Running setup again without a teardown first detects and
+kills the stale processes from the previous run (logged as `Killing stale
+process …`) before starting fresh, so orphans never accumulate and exhaust the
+port range.
+
+Because every generation is recorded, normal teardown never needs to guess which
+processes are ours. The broad orphan sweep — killing by executable basename (Go
+targets) or any `node` listening in the graphql port window — is therefore
+**opt-in** via `--sweep`, and off by default: it matches purely by name/port and
+could otherwise kill an unrelated process (a developer's own same-named service,
+or any `node` on those ports). Reach for it only to recover a pre-existing orphan
+whose pid log was lost:
+
+```bash
+make live-test-clean                        # == --teardown; kills recorded PIDs only (safe)
+./test/setup-live-targets.sh --teardown --sweep   # also sweep untracked orphans (last resort)
+```
+
+A regression test (`test/setup-live-targets_test.sh`) covers the
+teardown/sweep/port-exhaustion behavior with lightweight stand-ins and needs no
+live services — run it directly: `./test/setup-live-targets_test.sh`.
 
 ### run-live-tests.sh
 
@@ -324,7 +349,9 @@ test/
 
 ### Port conflicts
 
-If setup fails with port errors, use `--teardown` first, then retry:
+If setup fails with a "Cannot find available port" error, it now prints the
+processes holding the port window so you can see what to stop. Use `--teardown`
+(or `make live-test-clean`) first, then retry:
 
 ```bash
 ./test/setup-live-targets.sh --teardown
@@ -342,6 +369,20 @@ sudo apt install chromium-browser
 # macOS
 brew install --cask google-chrome
 ```
+
+**Found but not runnable:** on recent Ubuntu / WSL2 (and many CI base images),
+`/usr/bin/chromium-browser` is a snap *stub* — a launcher that satisfies
+`command -v` / `-x` but fails at runtime with "requires the chromium snap to
+be installed". `setup-live-targets.sh` probes each candidate binary with
+`--version` before accepting it, so this now fails preflight with `Found
+<path> but it is not runnable` instead of failing later during `vespasian
+crawl`. Fix with `snap install chromium`, or install `google-chrome` instead.
+
+**macOS note:** the runnability probe uses `timeout` (falling back to
+`gtimeout` from Homebrew coreutils) to guard against a hanging binary. Stock
+macOS ships neither, so on an unpatched macOS install the probe runs without a
+timeout — a binary that hangs on `--version` would block preflight rather
+than failing fast.
 
 ### Crawl produces empty capture
 

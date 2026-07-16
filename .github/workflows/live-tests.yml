@@ -16,6 +16,23 @@ permissions:
   contents: read
 
 jobs:
+  # Fast, un-gated regression self-test for the preflight Chrome/Chromium
+  # detection logic (LAB-3893). Independent of the check-label gate, so it runs
+  # on every push/PR even when the full suite is skipped via 'skip-live-tests'.
+  preflight-selftest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Syntax check
+        run: bash -n test/setup-live-targets.sh
+
+      - name: Run preflight self-test
+        run: bash test/preflight-selftest.sh
+
   # Gate: run by default; skip PR runs only when 'skip-live-tests' label is present.
   # Push-to-main and workflow_dispatch always run.
   check-label:
@@ -49,6 +66,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           persist-credentials: false
+
+      - name: Drift guard (target groups vs dispatch)
+        run: bash test/test-runner-args.sh
 
       - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
         with:

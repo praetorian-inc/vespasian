@@ -60,6 +60,7 @@ OFFLINE_TARGETS=(
     crawl-unreachable
     classifier-edge
     spec-edge
+    smoke-check
 )
 
 LIVE_TARGETS=(
@@ -2801,6 +2802,23 @@ print_summary() {
     return 0
 }
 
+test_smoke_check() {
+    init_test_status "smoke-check"
+    local start=$SECONDS
+
+    log_header "Testing: smoke-check (binary sanity)"
+
+    if "$VESPASIAN" version >/dev/null 2>&1 || "$VESPASIAN" --help >/dev/null 2>&1; then
+        local duration=$((SECONDS - start))
+        set_test_result "smoke-check" "PASS" "-" "-" "$duration"
+        log_ok "smoke-check: PASSED (${duration}s)"
+    else
+        local duration=$((SECONDS - start))
+        set_test_result "smoke-check" "FAIL" "-" "-" "$duration"
+        log_fail "smoke-check: binary not functional (${duration}s)"
+    fi
+}
+
 # ──────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────
@@ -2963,6 +2981,7 @@ main() {
             crawl-unreachable)  test_crawl_unreachable ;;
             classifier-edge)    test_classifier_edge_cases ;;
             spec-edge)          test_spec_edge_cases ;;
+            smoke-check)        test_smoke_check ;;
             *)
                 log_fail "Unknown target: $target"
                 init_test_status "$target"
