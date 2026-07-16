@@ -56,8 +56,9 @@ type JSReplayConfig struct {
 	Headers map[string]string
 
 	// TargetURL is the scan's intended target. It is used to derive the
-	// same-origin host for header forwarding and probe filtering. If
-	// empty, the first non-empty request URL is used as a fallback.
+	// same-origin host for header forwarding and probe filtering. If empty,
+	// the origin is derived from the capture: the first request whose response
+	// is HTML (the app page), falling back to the first non-empty request URL.
 	TargetURL string
 
 	// AllowPrivate disables SSRF protection (ValidateProbeURL and
@@ -637,6 +638,27 @@ func originOf(rawURL string) string {
 		return scheme + "://" + host
 	}
 	return scheme + "://" + host + ":" + port
+}
+
+// firstHTMLOrigin returns the origin of the first request whose response is
+// HTML (by content type or sniffed body), or "" if none is found. It lets
+// ReplayJSExtracted bind to the real app page rather than an arbitrary first
+// capture entry, which may be a third-party asset in imported/mixed-origin
+// captures (see ReplayJSExtracted). Reuses the same HTML detection as the
+// <script> discovery loop so the two stay consistent.
+func firstHTMLOrigin(requests []ObservedRequest) string {
+	for _, req := range requests {
+		if req.URL == "" {
+			continue
+		}
+		if !isHTMLResponse(req.Response.ContentType) && !looksLikeHTML(req.Response.Body) {
+			continue
+		}
+		if origin := originOf(req.URL); origin != "" {
+			return origin
+		}
+	}
+	return ""
 }
 
 // isSameOrigin reports whether rawURL has the same origin as targetOrigin.
@@ -1616,8 +1638,18 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		fmt.Fprintf(cfg.Stderr, format, args...) //nolint:errcheck // operator-facing warning
 	}
 
-	// Determine the target origin from cfg.TargetURL or the first request.
+	// Determine the target origin. Priority: explicit cfg.TargetURL, then the
+	// origin of the first request whose RESPONSE is HTML (the real app page),
+	// then the first non-empty request URL. Preferring the HTML page matters for
+	// mixed-origin / imported captures (HAR/Burp) whose first entry may be a
+	// third-party asset (CDN font, analytics beacon): binding replay to that
+	// asset's origin leaves the app's same-origin bundles cross-origin and skips
+	// them entirely (LAB-3892 review). Single-origin crawl captures are
+	// unaffected — their first entry is the HTML page anyway.
 	targetOrigin := originOf(cfg.TargetURL)
+	if targetOrigin == "" {
+		targetOrigin = firstHTMLOrigin(requests)
+	}
 	if targetOrigin == "" {
 		for _, req := range requests {
 			if req.URL != "" {

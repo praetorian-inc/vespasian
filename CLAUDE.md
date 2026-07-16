@@ -140,4 +140,4 @@ See `test/README.md` for how to run the suite, including the `TEST_HOST` overrid
 GitHub Actions runs on push to main and PRs:
 
 - **ci.yml**: Build, test (`go test -race`, 80% coverage threshold), lint (golangci-lint v2), and format check. Runs on all pushes and PRs.
-- **live-tests.yml**: A single **test** job runs all 25 targets (offline imports/generates/classifier/spec-edge + live crawl-based tests), using the stable Chrome shipped with the ubuntu-24.04 runner. Offline targets run first so a live-setup failure cannot mask deterministic coverage. Runs on every PR by default; add the `skip-live-tests` label to bypass. Always runs on push to `main` and `workflow_dispatch`.
+- **live-tests.yml**: A single **test** job runs all 26 targets (offline imports/generates/classifier/spec-edge + live crawl-based tests), using the stable Chrome shipped with the ubuntu-24.04 runner. Offline targets run first so a live-setup failure cannot mask deterministic coverage. Runs on every PR by default; add the `skip-live-tests` label to bypass. Always runs on push to `main` and `workflow_dispatch`.

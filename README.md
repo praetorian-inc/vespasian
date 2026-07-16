@@ -100,6 +100,13 @@ must still be reachable when `generate` runs; the origin is taken from the
 capture. The `crawl` command alone stays passive — it records a browser
 capture without running JS-replay.
 
+`generate`'s replay accepts the same `--header`/`-H` flag as `scan`, forwarding
+those headers (e.g. `Authorization`) to same-origin bundle fetches and probes so
+authenticated SPAs can be recovered in the two-stage flow. Since captures don't
+preserve the crawl origin for imported/mixed-origin sources, `--target-url`
+overrides the capture-derived origin (which otherwise defaults to the capture's
+first HTML page).
+
 The extractor also reconstructs paths built by runtime string concatenation —
 both `String.prototype.concat` (`"/api/posts/".concat(id, "/comment")`) and the
 `+` operator (`"/api/users/" + uid + "/profile"`). Operands that are not string

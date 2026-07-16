@@ -2831,3 +2831,76 @@ func TestExtractServicePrefixes_Strategy3_TotalBundleCapRespectsPriorStrategies(
 		}
 	})
 }
+
+// TestReplayJSExtracted_PrefersHTMLPageOrigin pins the LAB-3892 review fix (R2):
+// when no explicit TargetURL is given, the replay origin must be derived from
+// the first request whose RESPONSE is HTML (the real app page), not from an
+// arbitrary first capture entry. Mixed-origin / imported captures (HAR/Burp)
+// can list a third-party asset (CDN font, analytics beacon) as their first
+// entry; binding to that origin would leave the app's same-origin bundle
+// cross-origin and skip it entirely. The capture below puts a cross-origin,
+// non-HTML asset FIRST and the HTML app page SECOND. Recovering the concat-only
+// endpoint (which lives in the app's app.js and is probed against the derived
+// origin) proves the replay bound to the app page's origin, not the asset's.
+func TestReplayJSExtracted_PrefersHTMLPageOrigin(t *testing.T) {
+	const appJS = `function loadOrders(uid) { return fetch("/api/users/".concat(uid, "/orders")); }`
+
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(appJS))
+		case "/api/users/0/orders":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"orders":[]}`))
+		default:
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<!DOCTYPE html><html><head><script src="app.js"></script></head></html>`))
+		}
+	}))
+	defer app.Close()
+
+	requests := []ObservedRequest{
+		// FIRST entry: a cross-origin, non-HTML asset (a CDN image). Under the
+		// old "first non-empty URL" rule this origin would have been chosen,
+		// making the app's app.js cross-origin and unreachable.
+		{
+			Method: "GET",
+			URL:    "http://cdn.example.invalid/logo.png",
+			Source: "burp",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "image/png",
+				Body:        []byte("\x89PNG\r\n"),
+			},
+		},
+		// SECOND entry: the real HTML app page referencing app.js.
+		{
+			Method: "GET",
+			URL:    app.URL + "/",
+			Source: "burp",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<!DOCTYPE html><html><head><script src="app.js"></script></head></html>`),
+			},
+		},
+	}
+
+	// No TargetURL: force origin derivation. AllowPrivate so the loopback app
+	// server is probeable; Client from the app server so its TLS/transport is used.
+	cfg := JSReplayConfig{
+		Client:       app.Client(),
+		AllowPrivate: true,
+	}
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	var apiURLs []string
+	for _, r := range result {
+		if r.Source == "js-extract" {
+			apiURLs = append(apiURLs, r.URL)
+		}
+	}
+	assert.Contains(t, apiURLs, app.URL+"/api/users/0/orders",
+		"replay must bind to the first HTML page's origin (the app), not the first non-HTML asset's origin")
+}

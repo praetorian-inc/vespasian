@@ -469,11 +469,14 @@ type GenerateCmd struct {
 	Confidence             float64 `default:"0.5" help:"Minimum confidence threshold"`
 	Probe                  bool    `default:"true" help:"Enable active probing of classified endpoints (OPTIONS/schema/WSDL-fetch/GraphQL introspection) and JS-bundle replay extraction. Replay re-fetches capture-referenced bundles over HTTP (origin taken from the capture), so the target must still be reachable; combine with --analyze-js (default on) to recover SPA endpoints in the two-stage crawl→generate flow."`
 	Deduplicate            bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
-	DangerousAllowPrivate  bool    `help:"Disable SSRF protection on the probe path (OPTIONS/schema/WSDL-fetch/GraphQL introspection) for private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
+	DangerousAllowPrivate  bool    `help:"Disable SSRF protection on the probe path (OPTIONS/schema/WSDL-fetch/GraphQL introspection) and the JS-replay bundle-fetch/probe path for private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 	GRPCInsecureSkipVerify bool    `help:"Skip TLS certificate verification when probing gRPC server reflection over TLS (for self-signed/internal-CA targets). Default: verify." name:"grpc-insecure-skip-verify"`
 	Verbose                bool    `short:"v" help:"Enable verbose logging"`
 	AnalyzeJS              bool    `name:"analyze-js"       default:"true"  help:"Statically analyze JS bundles in the imported capture (when present)."`
 	FetchSourcemaps        bool    `name:"fetch-sourcemaps" default:"false" help:"When --analyze-js is set, fetch .js.map sourcemaps referenced via //# sourceMappingURL= comments. Default false on generate (offline-friendly)."`
+
+	Header    []string `short:"H" help:"Custom headers (repeatable, \"Key: Value\") forwarded to same-origin JS-replay bundle fetches and probes (e.g. Authorization). Mirrors scan's -H; needed to recover endpoints behind auth in the two-stage crawl→generate flow. Never forwarded cross-origin."`
+	TargetURL string   `name:"target-url" help:"Origin to run JS-replay against (scheme://host[:port]). Overrides the default heuristic of deriving the origin from the capture's first HTML page. Use for imported/mixed-origin captures (HAR/Burp) whose first entry may be a third-party host."`
 
 	SlugOptions
 }
@@ -501,6 +504,17 @@ func (c *GenerateCmd) options() pipeline.Options {
 // Run executes the generate command.
 func (c *GenerateCmd) Run() (err error) {
 	if err := validateSlugThreshold(c.APIType, c.MergeSlugs, c.SlugThreshold); err != nil {
+		return err
+	}
+
+	// Parse --header early so an invalid header fails fast, before any file I/O.
+	// These are forwarded to the same-origin JS-replay fetches/probes below.
+	headers, err := parseHeaders(c.Header)
+	if err != nil {
+		return fmt.Errorf("invalid --header: %w", err)
+	}
+
+	if err := validateTargetURL(c.TargetURL); err != nil {
 		return err
 	}
 
@@ -556,15 +570,13 @@ func (c *GenerateCmd) Run() (err error) {
 	// service-prefix forms need the active re-fetch to be reconstructed and
 	// confirmed. Gated on c.Probe && c.AnalyzeJS — the same gate scan uses — so
 	// --probe=false or --analyze-js=false keeps generate passive (see
-	// maybeReplayJSExtracted). The capture carries the crawled origin, so
-	// ReplayJSExtracted derives the target origin from the first request when
-	// TargetURL is empty; captures don't preserve the seed's headers, so
-	// Headers is left nil.
-	requests = maybeReplayJSExtracted(ctx, requests, c.Probe && c.AnalyzeJS, crawl.JSReplayConfig{
-		AllowPrivate: c.DangerousAllowPrivate,
-		Verbose:      c.Verbose,
-		Stderr:       os.Stderr,
-	})
+	// maybeReplayJSExtracted). --header/-H supplies the auth headers the capture
+	// can't preserve (forwarded only to same-origin fetches/probes), and
+	// --target-url can pin the replay origin; when it is empty ReplayJSExtracted
+	// derives the origin from the capture's first HTML page, so the target must
+	// still be reachable at generate time.
+	requests = maybeReplayJSExtracted(ctx, requests, c.Probe && c.AnalyzeJS,
+		jsReplayConfig(headers, c.TargetURL, c.DangerousAllowPrivate, c.Verbose))
 
 	spec, err := pipeline.ClassifyProbeGenerate(ctx, requests, c.options())
 	if err != nil {
@@ -706,13 +718,8 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	// rescan) and c.Probe (so --probe=false stays passive — see
 	// maybeReplayJSExtracted), and is CLI-only (the SDK passes a nil AfterWSDL hook).
 	afterWSDL := func(ctx context.Context, reqs []crawl.ObservedRequest) []crawl.ObservedRequest {
-		return maybeReplayJSExtracted(ctx, reqs, c.Probe && c.AnalyzeJS, crawl.JSReplayConfig{
-			Headers:      bs.opts.Headers,
-			TargetURL:    c.URL,
-			AllowPrivate: c.DangerousAllowPrivate,
-			Verbose:      c.Verbose,
-			Stderr:       os.Stderr,
-		})
+		return maybeReplayJSExtracted(ctx, reqs, c.Probe && c.AnalyzeJS,
+			jsReplayConfig(bs.opts.Headers, c.URL, c.DangerousAllowPrivate, c.Verbose))
 	}
 	spec, apiType, foundWSDL, _, err := pipeline.ResolveAndGenerate(genCtx, requests, c.scanOptions(apiType, afterWSDL))
 	if err != nil {
@@ -764,6 +771,36 @@ func main() {
 // standing up a headless browser. A regression that calls
 // crawl.ReplayJSExtracted directly (bypassing this gate) would re-introduce
 // the surprise outbound HTTP behavior CodeRabbit flagged in iter-12 (CR-1).
+// jsReplayConfig builds the JSReplayConfig shared by GenerateCmd.Run and
+// ScanCmd.Run's afterWSDL hook. Both construct the identical config for the same
+// post-crawl JS-replay step, so centralizing it keeps the two sites in lockstep
+// (header forwarding, SSRF opt-out, verbosity, and the stderr sink). The callers
+// differ only in where the origin comes from: generate passes --target-url (may
+// be empty, in which case ReplayJSExtracted derives it from the capture's first
+// HTML page), scan passes the crawl's seed URL.
+// validateTargetURL rejects a non-empty --target-url that is not an absolute
+// URL. A typo would otherwise silently fall back to the capture-derived origin
+// heuristic, reintroducing the wrong-origin footgun --target-url prevents.
+func validateTargetURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	if u, err := url.Parse(raw); err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("invalid --target-url %q: want an absolute URL like https://host[:port]", raw)
+	}
+	return nil
+}
+
+func jsReplayConfig(headers map[string]string, targetURL string, allowPrivate, verbose bool) crawl.JSReplayConfig {
+	return crawl.JSReplayConfig{
+		Headers:      headers,
+		TargetURL:    targetURL,
+		AllowPrivate: allowPrivate,
+		Verbose:      verbose,
+		Stderr:       os.Stderr,
+	}
+}
+
 func maybeReplayJSExtracted(ctx context.Context, requests []crawl.ObservedRequest, probe bool, cfg crawl.JSReplayConfig) []crawl.ObservedRequest {
 	if !probe {
 		return requests

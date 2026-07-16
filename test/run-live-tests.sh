@@ -315,6 +315,58 @@ test_rest_api() {
     fi
 }
 
+# validate_concat_spec runs the shared concat-spa validation battery against a
+# generated spec. It is called identically by test_concat_spa (single-stage
+# scan) and test_concat_spa_two_stage (two-stage crawl+generate) so the two
+# tests stay directly comparable while the battery lives in one place
+# (LAB-3892 review, TEST-001). The four checks + exact-count assertion are
+# preserved exactly; see test_concat_spa for what each layer proves.
+#
+# It follows the existing resolve_port_or_die convention of returning multiple
+# values via caller-read globals rather than set_test_result itself, so each
+# test keeps its own PASS/FAIL reporting:
+#   VALIDATE_CONCAT_FAILURES        number of failed checks
+#   VALIDATE_CONCAT_ENDPOINT_COUNT  paths found in the spec
+#   VALIDATE_CONCAT_EXPECTED_COUNT  expected total_paths from the fixture
+# Args: $1 test_name (for the exact-count message), $2 spec_file, $3 expected_json
+validate_concat_spec() {
+    local test_name=$1
+    local spec_file=$2
+    local expected=$3
+    local failures=0
+
+    if ! validate_openapi_structure "$spec_file"; then
+        failures=$((failures + 1))
+    fi
+    if ! validate_path_coverage "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+    if ! validate_no_static_assets "$spec_file"; then
+        failures=$((failures + 1))
+    fi
+    # /api/users and /api/products are EXACT (bare receiver literals that must
+    # not survive); /api/missing/ is a SUBTREE (the 404 control endpoint).
+    if ! validate_paths_absent "$spec_file" "/api/users" "/api/products" "/api/missing/"; then
+        failures=$((failures + 1))
+    fi
+
+    local endpoint_count
+    endpoint_count=$(count_spec_endpoints "$spec_file")
+    local expected_count
+    expected_count=$(json_field "$expected" total_paths)
+
+    # Exact-count: any path beyond the two concat endpoints means a receiver
+    # literal or the control leaked through the 404 filter.
+    if [ "$endpoint_count" != "$expected_count" ]; then
+        log_fail "${test_name}: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
+        failures=$((failures + 1))
+    fi
+
+    VALIDATE_CONCAT_FAILURES=$failures
+    VALIDATE_CONCAT_ENDPOINT_COUNT=$endpoint_count
+    VALIDATE_CONCAT_EXPECTED_COUNT=$expected_count
+}
+
 test_concat_spa() {
     local port="${CONCAT_SPA_PORT:-8993}"
     local base_url="http://${TEST_HOST}:${port}"
@@ -373,32 +425,10 @@ test_concat_spa() {
     # mutation test TestReplayJSExtracted_ConcatStyle_EndToEnd. This live
     # target proves the integrated binary + Chrome-crawl pipeline discovers
     # them end-to-end.
-    if ! validate_openapi_structure "$spec_file"; then
-        failures=$((failures + 1))
-    fi
-    if ! validate_path_coverage "$spec_file" "$expected"; then
-        failures=$((failures + 1))
-    fi
-    if ! validate_no_static_assets "$spec_file"; then
-        failures=$((failures + 1))
-    fi
-    # /api/users and /api/products are EXACT (bare receiver literals that must
-    # not survive); /api/missing/ is a SUBTREE (the 404 control endpoint).
-    if ! validate_paths_absent "$spec_file" "/api/users" "/api/products" "/api/missing/"; then
-        failures=$((failures + 1))
-    fi
-
-    local endpoint_count
-    endpoint_count=$(count_spec_endpoints "$spec_file")
-    local expected_count
-    expected_count=$(json_field "$expected" total_paths)
-
-    # Exact-count: any path beyond the two concat endpoints means a receiver
-    # literal or the control leaked through the 404 filter.
-    if [ "$endpoint_count" != "$expected_count" ]; then
-        log_fail "concat-spa: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
-        failures=$((failures + 1))
-    fi
+    validate_concat_spec "concat-spa" "$spec_file" "$expected"
+    failures=$VALIDATE_CONCAT_FAILURES
+    local endpoint_count=$VALIDATE_CONCAT_ENDPOINT_COUNT
+    local expected_count=$VALIDATE_CONCAT_EXPECTED_COUNT
 
     local duration=$((SECONDS - start))
     if [ $failures -eq 0 ]; then
@@ -469,32 +499,10 @@ test_concat_spa_two_stage() {
 
     # Step 3: Validate spec — same battery as test_concat_spa (see its
     # comments for what each layer proves).
-    if ! validate_openapi_structure "$spec_file"; then
-        failures=$((failures + 1))
-    fi
-    if ! validate_path_coverage "$spec_file" "$expected"; then
-        failures=$((failures + 1))
-    fi
-    if ! validate_no_static_assets "$spec_file"; then
-        failures=$((failures + 1))
-    fi
-    # /api/users and /api/products are EXACT (bare receiver literals that must
-    # not survive); /api/missing/ is a SUBTREE (the 404 control endpoint).
-    if ! validate_paths_absent "$spec_file" "/api/users" "/api/products" "/api/missing/"; then
-        failures=$((failures + 1))
-    fi
-
-    local endpoint_count
-    endpoint_count=$(count_spec_endpoints "$spec_file")
-    local expected_count
-    expected_count=$(json_field "$expected" total_paths)
-
-    # Exact-count: any path beyond the two concat endpoints means a receiver
-    # literal or the control leaked through the 404 filter.
-    if [ "$endpoint_count" != "$expected_count" ]; then
-        log_fail "concat-spa-two-stage: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
-        failures=$((failures + 1))
-    fi
+    validate_concat_spec "concat-spa-two-stage" "$spec_file" "$expected"
+    failures=$VALIDATE_CONCAT_FAILURES
+    local endpoint_count=$VALIDATE_CONCAT_ENDPOINT_COUNT
+    local expected_count=$VALIDATE_CONCAT_EXPECTED_COUNT
 
     local duration=$((SECONDS - start))
     if [ $failures -eq 0 ]; then

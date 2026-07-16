@@ -3038,3 +3038,205 @@ func TestGenerateCmdRun_TwoStageRecoversConcatEndpoints(t *testing.T) {
 	require.True(t, productsReviewsFound, "+-chain path /api/products/.../reviews must be reconstructed, probed, kept, and appear in generated spec paths: %v", paths)
 	require.False(t, missingFound, "reconstructed concat path that 404s (/api/missing/...) must be dropped from generated spec paths: %v", paths)
 }
+
+// TestGenerateCmdRun_ForwardsHeaderToJSReplay pins LAB-3892 review R1: the
+// generate command's --header/-H values must be forwarded to the same-origin
+// JS-replay bundle fetches and probes, mirroring scan. The test server gates
+// EVERY request behind a required auth header, so app.js (whose concat-only
+// endpoint exists nowhere else) can only be fetched — and the endpoint only
+// recovered — when the header is supplied.
+func TestGenerateCmdRun_ForwardsHeaderToJSReplay(t *testing.T) {
+	const appJS = `function loadOrders(uid) { return fetch("/api/users/".concat(uid, "/orders")); }`
+	const authName = "X-Auth"
+	const authValue = "s3kr3t"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(authName) != authValue {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/app.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(appJS))
+		case "/api/users/0/orders":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"orders":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	// Capture: one HTML entry referencing the external app.js. The replay step
+	// discovers and fetches app.js itself (which needs the auth header).
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    srv.URL + "/",
+			Source: "katana",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<!DOCTYPE html><html><head><script src="app.js"></script></head></html>`),
+			},
+		},
+	}
+
+	capturePath := filepath.Join(t.TempDir(), "capture.json")
+	f, err := os.Create(capturePath) //nolint:gosec // G304: test file
+	require.NoError(t, err)
+	require.NoError(t, crawl.WriteCapture(f, requests))
+	require.NoError(t, f.Close())
+
+	runGenerate := func(t *testing.T, headers []string) string {
+		t.Helper()
+		outputPath := filepath.Join(t.TempDir(), "spec.yaml")
+		cmd := &GenerateCmd{
+			APIType:               "rest",
+			Capture:               capturePath,
+			Output:                outputPath,
+			Probe:                 true,
+			AnalyzeJS:             true,
+			Deduplicate:           true,
+			DangerousAllowPrivate: true,
+			Header:                headers,
+		}
+		require.NoError(t, cmd.Run())
+		specBytes, err := os.ReadFile(outputPath) //nolint:gosec // G304: test file
+		require.NoError(t, err)
+		return string(specBytes)
+	}
+
+	t.Run("without_header_cannot_recover", func(t *testing.T) {
+		spec := runGenerate(t, nil)
+		require.NotContains(t, spec, "/orders",
+			"without --header the auth-gated app.js is a 401, so the concat endpoint must not be recovered")
+	})
+
+	t.Run("with_header_recovers", func(t *testing.T) {
+		spec := runGenerate(t, []string{authName + ": " + authValue})
+		require.Contains(t, spec, "/api/users/",
+			"--header must be forwarded to the same-origin app.js fetch so the concat endpoint is recovered")
+		require.Contains(t, spec, "/orders",
+			"--header must be forwarded to the same-origin probe so the concat endpoint reaches the spec")
+	})
+}
+
+// TestGenerateCmdRun_TargetURLOverridesOrigin pins LAB-3892 review R1/R2: the
+// generate command's --target-url must override the capture-derived origin that
+// JS-replay probes against. The only capture entry is a JS bundle recorded at a
+// bogus third-party origin (as happens with imported/mixed-origin captures), so
+// the default derivation would probe the concat endpoint against the wrong,
+// unreachable host. --target-url pins the reachable origin, recovering it.
+func TestGenerateCmdRun_TargetURLOverridesOrigin(t *testing.T) {
+	const appJS = `function loadOrders(uid) { return fetch("/api/users/".concat(uid, "/orders")); }`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/users/0/orders":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"orders":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	// The bundle is captured inline at a bogus origin, so replay processes its
+	// body without fetching. The extracted /api/users/0/orders is RELATIVE and
+	// gets probed against the derived origin — bogus by default, srv via override.
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "http://cdn.example.invalid/app.js",
+			Source: "burp",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/javascript",
+				Body:        []byte(appJS),
+			},
+		},
+	}
+
+	capturePath := filepath.Join(t.TempDir(), "capture.json")
+	f, err := os.Create(capturePath) //nolint:gosec // G304: test file
+	require.NoError(t, err)
+	require.NoError(t, crawl.WriteCapture(f, requests))
+	require.NoError(t, f.Close())
+
+	runGenerate := func(t *testing.T, targetURL string) string {
+		t.Helper()
+		outputPath := filepath.Join(t.TempDir(), "spec.yaml")
+		cmd := &GenerateCmd{
+			APIType:               "rest",
+			Capture:               capturePath,
+			Output:                outputPath,
+			Probe:                 true,
+			AnalyzeJS:             true,
+			Deduplicate:           true,
+			DangerousAllowPrivate: true,
+			TargetURL:             targetURL,
+		}
+		require.NoError(t, cmd.Run())
+		specBytes, err := os.ReadFile(outputPath) //nolint:gosec // G304: test file
+		require.NoError(t, err)
+		return string(specBytes)
+	}
+
+	t.Run("without_target_url_probes_wrong_origin", func(t *testing.T) {
+		spec := runGenerate(t, "")
+		require.NotContains(t, spec, "/orders",
+			"without --target-url the endpoint is probed against the capture's bogus origin and must not be recovered")
+	})
+
+	t.Run("with_target_url_recovers", func(t *testing.T) {
+		spec := runGenerate(t, srv.URL)
+		require.Contains(t, spec, "/api/users/",
+			"--target-url must pin the reachable origin so the concat endpoint is probed there and recovered")
+		require.Contains(t, spec, "/orders",
+			"--target-url must pin the reachable origin so the concat endpoint reaches the spec")
+	})
+}
+
+// TestGenerateCmdRun_RejectsMalformedTargetURL pins the fail-fast guard: a
+// non-empty but malformed --target-url must error rather than silently fall
+// back to the capture-derived origin heuristic (which would reintroduce the
+// wrong-origin footgun --target-url exists to prevent).
+func TestGenerateCmdRun_RejectsMalformedTargetURL(t *testing.T) {
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "http://app.example.test/",
+			Source: "katana",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<!DOCTYPE html><html></html>`),
+			},
+		},
+	}
+	capturePath := filepath.Join(t.TempDir(), "capture.json")
+	f, err := os.Create(capturePath) //nolint:gosec // G304: test file
+	require.NoError(t, err)
+	require.NoError(t, crawl.WriteCapture(f, requests))
+	require.NoError(t, f.Close())
+
+	for _, bad := range []string{"host-only-no-scheme:8080", "://missing-scheme", "not a url"} {
+		t.Run(bad, func(t *testing.T) {
+			cmd := &GenerateCmd{
+				APIType:               "rest",
+				Capture:               capturePath,
+				Output:                filepath.Join(t.TempDir(), "spec.yaml"),
+				Probe:                 true,
+				AnalyzeJS:             true,
+				Deduplicate:           true,
+				DangerousAllowPrivate: true,
+				TargetURL:             bad,
+			}
+			err := cmd.Run()
+			require.Error(t, err, "malformed --target-url must be rejected, not silently ignored")
+			require.Contains(t, err.Error(), "invalid --target-url")
+		})
+	}
+}

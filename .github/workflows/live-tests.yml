@@ -97,7 +97,7 @@ jobs:
         run: ./test/setup-live-targets.sh
 
       - name: Run live tests
-        run: ./test/run-live-tests.sh --no-build --targets rest-api,soap-service,graphql-server,concat-spa,edge-cases,crawl-depth
+        run: ./test/run-live-tests.sh --no-build --targets rest-api,soap-service,graphql-server,concat-spa,concat-spa-two-stage,edge-cases,crawl-depth
 
       - name: Upload results
         if: always()
