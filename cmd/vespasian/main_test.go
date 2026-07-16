@@ -3240,3 +3240,45 @@ func TestGenerateCmdRun_RejectsMalformedTargetURL(t *testing.T) {
 		})
 	}
 }
+
+// TestGenerateCmdRun_RejectsMalformedHeader pins the fail-fast guard: a
+// malformed --header value must be rejected by parseHeaders and surfaced as
+// an "invalid --header" error, not silently ignored or passed through to the
+// JS-replay fetches/probes.
+func TestGenerateCmdRun_RejectsMalformedHeader(t *testing.T) {
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "http://app.example.test/",
+			Source: "katana",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<!DOCTYPE html><html></html>`),
+			},
+		},
+	}
+	capturePath := filepath.Join(t.TempDir(), "capture.json")
+	f, err := os.Create(capturePath) //nolint:gosec // G304: test file
+	require.NoError(t, err)
+	require.NoError(t, crawl.WriteCapture(f, requests))
+	require.NoError(t, f.Close())
+
+	for _, bad := range []string{"NoColonHeader", "", "  : emptyname"} {
+		t.Run(bad, func(t *testing.T) {
+			cmd := &GenerateCmd{
+				APIType:               "rest",
+				Capture:               capturePath,
+				Output:                filepath.Join(t.TempDir(), "spec.yaml"),
+				Probe:                 true,
+				AnalyzeJS:             true,
+				Deduplicate:           true,
+				DangerousAllowPrivate: true,
+				Header:                []string{bad},
+			}
+			err := cmd.Run()
+			require.Error(t, err, "malformed --header must be rejected, not silently ignored")
+			require.Contains(t, err.Error(), "invalid --header")
+		})
+	}
+}

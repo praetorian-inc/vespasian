@@ -761,23 +761,6 @@ func main() {
 	ctx.FatalIfErrorf(err)
 }
 
-// maybeReplayJSExtracted is the probe-gated wrapper around
-// crawl.ReplayJSExtracted. When probe is false, it returns requests unchanged
-// without making any outbound HTTP — preserving the user's --probe=false
-// expectation that the scan stays passive (capture-only). When probe is true,
-// it forwards to crawl.ReplayJSExtracted with the supplied config.
-//
-// Pulled out of ScanCmd.Run so the gate's contract is unit-testable without
-// standing up a headless browser. A regression that calls
-// crawl.ReplayJSExtracted directly (bypassing this gate) would re-introduce
-// the surprise outbound HTTP behavior CodeRabbit flagged in iter-12 (CR-1).
-// jsReplayConfig builds the JSReplayConfig shared by GenerateCmd.Run and
-// ScanCmd.Run's afterWSDL hook. Both construct the identical config for the same
-// post-crawl JS-replay step, so centralizing it keeps the two sites in lockstep
-// (header forwarding, SSRF opt-out, verbosity, and the stderr sink). The callers
-// differ only in where the origin comes from: generate passes --target-url (may
-// be empty, in which case ReplayJSExtracted derives it from the capture's first
-// HTML page), scan passes the crawl's seed URL.
 // validateTargetURL rejects a non-empty --target-url that is not an absolute
 // URL. A typo would otherwise silently fall back to the capture-derived origin
 // heuristic, reintroducing the wrong-origin footgun --target-url prevents.
@@ -791,6 +774,13 @@ func validateTargetURL(raw string) error {
 	return nil
 }
 
+// jsReplayConfig builds the JSReplayConfig shared by GenerateCmd.Run and
+// ScanCmd.Run's afterWSDL hook. Both construct the identical config for the same
+// post-crawl JS-replay step, so centralizing it keeps the two sites in lockstep
+// (header forwarding, SSRF opt-out, verbosity, and the stderr sink). The callers
+// differ only in where the origin comes from: generate passes --target-url (may
+// be empty, in which case ReplayJSExtracted derives it from the capture's first
+// HTML page), scan passes the crawl's seed URL.
 func jsReplayConfig(headers map[string]string, targetURL string, allowPrivate, verbose bool) crawl.JSReplayConfig {
 	return crawl.JSReplayConfig{
 		Headers:      headers,
@@ -801,6 +791,16 @@ func jsReplayConfig(headers map[string]string, targetURL string, allowPrivate, v
 	}
 }
 
+// maybeReplayJSExtracted is the probe-gated wrapper around
+// crawl.ReplayJSExtracted. When probe is false, it returns requests unchanged
+// without making any outbound HTTP — preserving the user's --probe=false
+// expectation that the scan stays passive (capture-only). When probe is true,
+// it forwards to crawl.ReplayJSExtracted with the supplied config.
+//
+// Pulled out of ScanCmd.Run so the gate's contract is unit-testable without
+// standing up a headless browser. A regression that calls
+// crawl.ReplayJSExtracted directly (bypassing this gate) would re-introduce
+// the surprise outbound HTTP behavior CodeRabbit flagged in iter-12 (CR-1).
 func maybeReplayJSExtracted(ctx context.Context, requests []crawl.ObservedRequest, probe bool, cfg crawl.JSReplayConfig) []crawl.ObservedRequest {
 	if !probe {
 		return requests
