@@ -105,7 +105,7 @@ report_undispatched_group_members() {
     local target
     while IFS= read -r target; do
         [[ -z "$target" ]] && continue
-        fail "Group member '$target' has no case-dispatch entry in run-live-tests.sh"
+        fail "Grouped/config-only target '$target' has no case-dispatch entry in run-live-tests.sh"
     done < <(undispatched_group_members "$@")
 }
 
@@ -130,8 +130,11 @@ else
     fail "DISPATCH_TARGETS extraction is broken/empty (sentinel 'rest-api' missing)"
 fi
 
-# Every group member must have a case-dispatch entry (direction a).
-report_undispatched_group_members "${OFFLINE_TARGETS[@]}" "${LIVE_TARGETS[@]}"
+# Every group member AND config-only target must have a case-dispatch entry
+# (direction a). Including CONFIG_ONLY means grpc-server cannot silently lose its
+# dispatch arm while staying config-only — which would send `--targets grpc-server`
+# to the unknown-target path.
+report_undispatched_group_members "${OFFLINE_TARGETS[@]}" "${LIVE_TARGETS[@]}" "${CONFIG_ONLY[@]}"
 
 # Every dispatch target must be in a group or in CONFIG_ONLY (direction b).
 report_ungrouped_dispatch_targets "${DISPATCH_TARGETS[@]}"
@@ -459,6 +462,43 @@ if [[ "$partial_guidance" == *"--targets rest-api"* ]] \
     pass "guidance (partial setup): steers to --targets rest-api + offline hint, no bare run"
 else
     fail "guidance (partial setup): expected --targets steering, got: $partial_guidance"
+fi
+
+echo ""
+echo "=== load_config key allowlist (security hardening) ==="
+
+# load_config must apply only allowlisted keys and skip anything else, so a
+# crafted/edited config cannot rebind security-relevant globals (VESPASIAN, PATH,
+# RESULTS_DIR, TEST_HOST). Drive the REAL load_config from the runner (with
+# common.sh sourced for its log_* helpers) inside a subshell — its `declare -g`
+# assignments stay in that subshell — and echo the resulting values to assert on.
+allowlist_cfg=$(new_tmp)
+printf '%s\n' "REST_API_PORT=8990" "VESPASIAN=/tmp/evil" "TARGETS_SETUP=" > "$allowlist_cfg"
+allowlist_out=$(
+    source "$SCRIPT_DIR/common.sh"
+    source <(sed -n '/^load_config()/,/^}/p' "$RUNNER")
+    VESPASIAN="__sentinel__"
+    REST_API_PORT="__unset__"
+    CONFIG_FILE="$allowlist_cfg"
+    load_config 2>&1 || true
+    echo "RESULT_VESPASIAN=$VESPASIAN"
+    echo "RESULT_REST_API_PORT=$REST_API_PORT"
+) || true
+
+if printf '%s\n' "$allowlist_out" | grep -q "Skipping unexpected config key: VESPASIAN"; then
+    pass "load_config: disallowed key VESPASIAN skipped with warning"
+else
+    fail "load_config: expected 'Skipping unexpected config key: VESPASIAN', got: $allowlist_out"
+fi
+if printf '%s\n' "$allowlist_out" | grep -qx "RESULT_VESPASIAN=__sentinel__"; then
+    pass "load_config: disallowed key VESPASIAN not applied (sentinel preserved)"
+else
+    fail "load_config: VESPASIAN was rebound by config (expected __sentinel__): $allowlist_out"
+fi
+if printf '%s\n' "$allowlist_out" | grep -qx "RESULT_REST_API_PORT=8990"; then
+    pass "load_config: allowed key REST_API_PORT applied"
+else
+    fail "load_config: allowed key REST_API_PORT not applied (expected 8990): $allowlist_out"
 fi
 
 echo ""

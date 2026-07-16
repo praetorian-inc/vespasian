@@ -20,6 +20,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# Path to the resolved-ports config written by setup-live-targets.sh. Overridable
+# via the CONFIG_FILE env var (used by test/test-runner-args.sh --dry-run runs).
 CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/.live-test-config}"
 RESULTS_DIR="${SCRIPT_DIR}/.results"
 VESPASIAN="${PROJECT_ROOT}/bin/vespasian"

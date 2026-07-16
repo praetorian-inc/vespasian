@@ -157,6 +157,10 @@ For Linux devcontainers without Docker Desktop, use the detected host gateway (e
 
 `setup-live-targets.sh` does not read `TEST_HOST` — run it on the host that actually runs the target binaries.
 
+### `CONFIG_FILE` (optional)
+
+`run-live-tests.sh` reads resolved ports and `TARGETS_SETUP` from `CONFIG_FILE`, which defaults to `test/.live-test-config` (written by `setup-live-targets.sh`). Override it with the `CONFIG_FILE` environment variable — an internal test-harness knob that `test/test-runner-args.sh` uses to point `--dry-run` invocations at a throwaway stub config, so the group-resolution tests need no real setup. Only an allowlisted set of keys (the `*_PORT` values and `TARGETS_SETUP`) is honored from the file.
+
 ### `.live-test-config`
 
 The setup script writes `.live-test-config` with resolved ports:
