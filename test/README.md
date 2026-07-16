@@ -120,10 +120,12 @@ live services — run it directly: `./test/setup-live-targets_test.sh`.
 ./test/run-live-tests.sh [options]
 
 Options:
-  --targets <list>      Comma-separated targets to test (default: all)
+  --group <name>        Run a predefined target group: offline, live, or all (default: all)
+  --targets <list>      Comma-separated targets to test (overrides --group)
                         Valid targets:
-                          Live:       rest-api, soap-service, graphql-server,
-                                      grpc-server, concat-spa-two-stage
+                          Service:    rest-api, soap-service, graphql-server, concat-spa,
+                                      concat-spa-two-stage
+                          Config:     grpc-server (included via TARGETS_SETUP when set up)
                           Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,
                                       generate-graphql, generate-graphql-imports,
                                       generate-js-static, generate-merge-slugs
@@ -136,6 +138,7 @@ Options:
   --verbose             Enable verbose vespasian output
   --no-build            Skip building vespasian and target binaries
   --no-start            Don't start/stop services (assume already running)
+  --dry-run             Print resolved target list and exit (no build/test)
   --help                Show this help message
 ```
 
@@ -155,6 +158,10 @@ For Linux devcontainers without Docker Desktop, use the detected host gateway (e
 
 `setup-live-targets.sh` does not read `TEST_HOST` — run it on the host that actually runs the target binaries.
 
+### `CONFIG_FILE` (optional)
+
+`run-live-tests.sh` reads resolved ports and `TARGETS_SETUP` from `CONFIG_FILE`, which defaults to `test/.live-test-config` (written by `setup-live-targets.sh`). Override it with the `CONFIG_FILE` environment variable — an internal test-harness knob that `test/test-runner-args.sh` uses to point `--dry-run` invocations at a throwaway stub config, so the group-resolution tests need no real setup. Only an allowlisted set of keys (the `*_PORT` values and `TARGETS_SETUP`) is honored from the file.
+
 ### `.live-test-config`
 
 The setup script writes `.live-test-config` with resolved ports:
@@ -166,6 +173,14 @@ GRAPHQL_SERVER_PORT=8992
 GRPC_SERVER_PORT=50051
 TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server
 ```
+
+> **`TARGETS_SETUP` is additive, not restrictive.** A bare `./test/run-live-tests.sh`
+> resolves the full `all` group (every `OFFLINE_TARGETS` + `LIVE_TARGETS`).
+> `TARGETS_SETUP` only *adds* config-only targets such as `grpc-server` to that run —
+> it does **not** narrow it. To run only the targets you set up, pass
+> `--targets <list>` (or use `--group offline` / `--group live`). After a partial
+> `setup-live-targets.sh --targets <subset>`, the setup script prints the exact
+> `--targets` command to use.
 
 ### Default Ports
 

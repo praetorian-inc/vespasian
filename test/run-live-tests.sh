@@ -8,17 +8,21 @@
 #   ./test/run-live-tests.sh [options]
 #
 # Options:
-#   --targets <list>      Comma-separated targets to test (default: all from config)
+#   --group <name>        Run a predefined target group: offline, live, or all (default: all)
+#   --targets <list>      Comma-separated targets to test (overrides --group)
 #   --verbose             Enable verbose vespasian output
 #   --no-build            Skip building vespasian and target binaries
 #   --no-start            Don't start/stop services (assume already running)
+#   --dry-run             Print resolved target list and exit (no build/test)
 #   --help                Show this help message
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CONFIG_FILE="${SCRIPT_DIR}/.live-test-config"
+# Path to the resolved-ports config written by setup-live-targets.sh. Overridable
+# via the CONFIG_FILE env var (used by test/test-runner-args.sh --dry-run runs).
+CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/.live-test-config}"
 RESULTS_DIR="${SCRIPT_DIR}/.results"
 VESPASIAN="${PROJECT_ROOT}/bin/vespasian"
 
@@ -27,6 +31,84 @@ VESPASIAN="${PROJECT_ROOT}/bin/vespasian"
 # devcontainer's detected host gateway) when the harness runs inside a
 # devcontainer while the target services run on the Docker host.
 TEST_HOST="${TEST_HOST:-localhost}"
+
+# ──────────────────────────────────────────────────────────────
+# Target groups (single source of truth — CI references these
+# via --group instead of maintaining its own target lists)
+#
+# Some dispatchable targets (e.g. grpc-server) are intentionally NOT in
+# either group: they are config-only and run only when TARGETS_SETUP (or an
+# explicit --targets) selects them. test/test-runner-args.sh tracks these in
+# its CONFIG_ONLY array so the drift guard does not flag them.
+# ──────────────────────────────────────────────────────────────
+
+OFFLINE_TARGETS=(
+    import-burp
+    import-har
+    import-base64
+    import-mitmproxy
+    import-mitmproxy-native
+    import-unicode
+    import-duplicates
+    import-malformed
+    import-empty
+    generate-rest
+    generate-wsdl
+    generate-wsdl-matrix
+    generate-graphql
+    generate-graphql-imports
+    generate-js-static
+    generate-merge-slugs
+    crawl-unreachable
+    classifier-edge
+    spec-edge
+)
+
+LIVE_TARGETS=(
+    rest-api
+    soap-service
+    graphql-server
+    concat-spa
+    concat-spa-two-stage
+    edge-cases
+    crawl-depth
+)
+
+# join_targets prints array elements as a comma-separated string.
+join_targets() { local IFS=','; echo "$*"; }
+
+# resolve_targets prints the comma-separated target list for a group name.
+# Usage: resolve_targets <offline|live|all>
+# For the "all" group it honors TARGETS_SETUP (prepend + dedup). Returns
+# non-zero on an unknown group so the caller can report the error. Keeping
+# this as a standalone function lets the drift-guard test invoke the real
+# resolver instead of scraping and re-implementing it.
+resolve_targets() {
+    local group="$1"
+    local resolved
+    case "$group" in
+        offline)
+            resolved="$(join_targets "${OFFLINE_TARGETS[@]}")"
+            ;;
+        live)
+            resolved="$(join_targets "${LIVE_TARGETS[@]}")"
+            ;;
+        all)
+            # Always include both defined groups. Config may prepend extra
+            # live targets (e.g. grpc-server); deduplicate so overlapping
+            # targets don't run their test function twice.
+            resolved="$(join_targets "${OFFLINE_TARGETS[@]}"),$(join_targets "${LIVE_TARGETS[@]}")"
+            if [ -n "${TARGETS_SETUP:-}" ]; then
+                resolved="${TARGETS_SETUP},${resolved}"
+                resolved="$(echo "$resolved" | tr ',' '\n' | awk '!s[$0]++' | paste -sd, -)"
+            fi
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    printf '%s\n' "$resolved"
+}
 
 # Source shared colors, logging, and validation functions
 # shellcheck source=common.sh
@@ -45,12 +127,23 @@ load_config() {
         exit 1
     fi
 
+    # Only these keys may be set from the config file. An explicit allowlist
+    # (rather than any KEY=VALUE) ensures a crafted or hand-edited config can
+    # never rebind security-relevant globals such as VESPASIAN, PATH,
+    # RESULTS_DIR, or TEST_HOST.
+    local allowed_keys=" REST_API_PORT SOAP_SERVICE_PORT GRAPHQL_SERVER_PORT GRPC_SERVER_PORT CONCAT_SPA_PORT TARGETS_SETUP "
+
     # Safety: only allow safe KEY=VALUE lines
     while IFS= read -r line; do
         # Skip comments and blank lines
         [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
         # Validate format
         if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@,+\"\ -]*$ ]]; then
+            local key="${line%%=*}"
+            if [[ "$allowed_keys" != *" ${key} "* ]]; then
+                log_warn "Skipping unexpected config key: ${key}"
+                continue
+            fi
             declare -g "$line"
         else
             log_warn "Skipping invalid config line: $line"
@@ -2834,9 +2927,11 @@ usage() {
     echo "Usage: $0 [options]"
     echo ""
     echo "Options:"
-    echo "  --targets <list>      Comma-separated targets to test (default: all)"
+    echo "  --group <name>        Run a predefined target group: offline, live, or all (default: all)"
+    echo "  --targets <list>      Comma-separated targets to test (overrides --group)"
     echo "                        Valid targets:"
-    echo "                          Live:       rest-api, soap-service, graphql-server, grpc-server"
+    echo "                          Service:    rest-api, soap-service, graphql-server, concat-spa"
+    echo "                          Config:     grpc-server (included via TARGETS_SETUP when set up)"
     echo "                          Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,"
     echo "                                      generate-graphql, generate-graphql-imports,"
     echo "                                      generate-js-static, generate-merge-slugs"
@@ -2849,10 +2944,12 @@ usage() {
     echo "  --verbose             Enable verbose vespasian output"
     echo "  --no-build            Skip building vespasian and target binaries"
     echo "  --no-start            Don't start/stop services (assume already running)"
+    echo "  --dry-run             Print resolved target list and exit (no build/test)"
     echo "  --help                Show this help message"
     echo ""
     echo "Examples:"
     echo "  $0                                    # Run all tests"
+    echo "  $0 --group offline --no-build         # Only offline targets, skip build"
     echo "  $0 --targets rest-api                 # Only test rest-api"
     echo "  $0 --targets import-burp,import-har   # Only run importer tests"
     echo "  $0 --verbose --no-build               # Verbose output, skip build"
@@ -2860,13 +2957,21 @@ usage() {
 
 main() {
     local targets=""
+    local group=""
     local no_build=false
     local no_start=false
+    local dry_run=false
     VERBOSE=false
 
     while [ $# -gt 0 ]; do
         case "$1" in
+            --group)
+                if [ $# -lt 2 ]; then log_fail "--group requires a value"; usage; exit 1; fi
+                group="$2"
+                shift 2
+                ;;
             --targets)
+                if [ $# -lt 2 ]; then log_fail "--targets requires a value"; usage; exit 1; fi
                 targets="$2"
                 shift 2
                 ;;
@@ -2880,6 +2985,10 @@ main() {
                 ;;
             --no-start)
                 no_start=true
+                shift
+                ;;
+            --dry-run)
+                dry_run=true
                 shift
                 ;;
             --help)
@@ -2896,17 +3005,29 @@ main() {
 
     log_header "Vespasian Live Test Runner"
 
-    # Load config
-    load_config
+    # Load config only when it is actually needed. A real run always needs it
+    # (TEST_HOST and service ports for preflight and the tests). A --dry-run
+    # needs it only to resolve the "all" group, whose config-driven
+    # TARGETS_SETUP folds in config-only targets like grpc-server. The offline
+    # and live groups — and an explicit --targets list — resolve purely from the
+    # in-script arrays, so requiring a config there would make --dry-run fail on
+    # a fresh checkout for no reason.
+    if [ "$dry_run" != true ] || { [ -z "$targets" ] && [ "${group:-all}" = all ]; }; then
+        load_config
+    fi
 
-    # Default targets from config
+    # --targets takes precedence over --group; --group defaults to "all".
     if [ -z "$targets" ]; then
-        targets="${TARGETS_SETUP:-rest-api,soap-service,graphql-server,grpc-server,concat-spa,concat-spa-two-stage}"
-        # Always include importer tests
-        targets="${targets},import-burp,import-har,import-base64,import-mitmproxy,import-mitmproxy-native,import-unicode,import-duplicates,import-malformed,import-empty"
-        targets="${targets},generate-rest,generate-wsdl,generate-wsdl-matrix,generate-graphql,generate-graphql-imports,generate-js-static,generate-merge-slugs"
-        targets="${targets},edge-cases,crawl-depth,crawl-unreachable"
-        targets="${targets},classifier-edge,spec-edge"
+        if ! targets="$(resolve_targets "${group:-all}")"; then
+            log_fail "Unknown group: ${group} (valid: offline, live, all)"
+            usage
+            exit 1
+        fi
+    fi
+
+    if [ "$dry_run" = true ]; then
+        echo "targets=$targets"
+        return 0
     fi
 
     preflight_test_host "$targets"
