@@ -750,10 +750,6 @@ parse_args() {
     done
 }
 
-# Pipeline orchestrator: parse args → teardown? → prereqs → build → stale
-# cleanup → resolve ports + start → write config. Intentionally longer than the
-# ~60-line guideline: each stage is a distinct sequential step that delegates to
-# a helper, with no shared state worth extracting into further functions.
 # run_tests_guidance echoes the "how to run what you just set up" lines for a
 # completed setup, one command hint per line. It is intentionally side-effect
 # free (echo only, no service calls) so test/test-runner-args.sh can assert the
@@ -774,6 +770,10 @@ run_tests_guidance() {
     fi
 }
 
+# Pipeline orchestrator: parse args → teardown? → prereqs → build → stale
+# cleanup → resolve ports + start → write config. Intentionally longer than the
+# ~60-line guideline: each stage is a distinct sequential step that delegates to
+# a helper, with no shared state worth extracting into further functions.
 main() {
     parse_args "$@"
     local targets="$PARSED_TARGETS"

@@ -16,6 +16,16 @@ FAIL=0
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1" >&2; }
 
+# All temp configs live under one directory removed by a single EXIT trap, so
+# they are cleaned up no matter where the script exits (including a `set -e`
+# abort mid-assertion). A directory — not an in-shell array — is used precisely
+# because new_tmp is called via command substitution ($(new_tmp)), whose
+# subshell would discard any array registration; a filesystem dir created in the
+# parent and torn down by the trap has no such scoping problem.
+TMPDIR_T="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR_T"' EXIT
+new_tmp() { mktemp "$TMPDIR_T/cfg.XXXXXX"; }
+
 # ── Source the target arrays and helper from the runner ──────────
 
 source <(sed -n '/^OFFLINE_TARGETS=(/,/^)/p' "$RUNNER")
@@ -150,6 +160,30 @@ if [[ "$FAIL" -eq "$drift_fail_before" ]]; then
 fi
 
 echo ""
+echo "=== Absolute group-size anchors (AC#3: 19 offline + 6 live = 25) ==="
+
+# Pin concrete group sizes as literals, independent of the sourced arrays. The
+# behavioral --group tests derive expected from the same OFFLINE_TARGETS/
+# LIVE_TARGETS under test, so a coordinated silent target drop shrinks expected
+# and actual in lockstep and passes green. These literals encode the LAB-4773
+# AC#3 contract ("all 25 targets still run") so any such drop trips here.
+if [[ "${#OFFLINE_TARGETS[@]}" -eq 19 ]]; then
+    pass "OFFLINE_TARGETS has exactly 19 members"
+else
+    fail "OFFLINE_TARGETS count drifted: expected 19, got ${#OFFLINE_TARGETS[@]}"
+fi
+if [[ "${#LIVE_TARGETS[@]}" -eq 6 ]]; then
+    pass "LIVE_TARGETS has exactly 6 members"
+else
+    fail "LIVE_TARGETS count drifted: expected 6, got ${#LIVE_TARGETS[@]}"
+fi
+if [[ "$group_count" -eq 25 ]]; then
+    pass "Grouped targets total 25 (AC#3: all 25 targets still run)"
+else
+    fail "Grouped-target total drifted: expected 25, got $group_count"
+fi
+
+echo ""
 echo "=== Drift guard self-test (negative case) ==="
 
 # Drive the REAL guard loop (report_*), not just the detection helper, against a
@@ -181,10 +215,9 @@ echo "=== Target group construction ==="
 # path. With TARGETS_SETUP empty the runner does not dedup, so an accidental
 # repeated entry within OFFLINE_TARGETS/LIVE_TARGETS would surface here — the
 # one duplicate case the disjoint-groups and behavioral-all checks cannot see.
-tmpconfig_all=$(mktemp)
+tmpconfig_all=$(new_tmp)
 echo "TARGETS_SETUP=" > "$tmpconfig_all"
-all=$(env CONFIG_FILE="$tmpconfig_all" bash -c "source '$RUNNER' --group all --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//')
-rm -f "$tmpconfig_all"
+all=$(env CONFIG_FILE="$tmpconfig_all" bash -c "source '$RUNNER' --group all --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
 dup_count=$(echo "$all" | tr ',' '\n' | sort | uniq -d | wc -l | tr -d ' ')
 if [[ "$dup_count" -eq 0 ]]; then
     pass "--group all: no duplicates"
@@ -193,10 +226,9 @@ else
 fi
 
 # TARGETS_SETUP merge deduplicates correctly (behavioral via --dry-run).
-tmpconfig_setup=$(mktemp)
+tmpconfig_setup=$(new_tmp)
 echo "TARGETS_SETUP=grpc-server,rest-api" > "$tmpconfig_setup"
-setup_output=$(env CONFIG_FILE="$tmpconfig_setup" bash -c "source '$RUNNER' --group all --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//')
-rm -f "$tmpconfig_setup"
+setup_output=$(env CONFIG_FILE="$tmpconfig_setup" bash -c "source '$RUNNER' --group all --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
 
 grpc_count=$(echo "$setup_output" | tr ',' '\n' | grep -cx 'grpc-server')
 if [[ "$grpc_count" -eq 1 ]]; then
@@ -225,10 +257,9 @@ fi
 # (e.g. a single service) must NOT narrow the resolved live set — every
 # LIVE_TARGETS member is still present. Pins the LAB-4773 decision that subset
 # selection is done via --targets, not TARGETS_SETUP.
-tmpconfig_subset=$(mktemp)
+tmpconfig_subset=$(new_tmp)
 echo "TARGETS_SETUP=rest-api" > "$tmpconfig_subset"
-subset_output=$(env CONFIG_FILE="$tmpconfig_subset" bash -c "source '$RUNNER' --group all --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//')
-rm -f "$tmpconfig_subset"
+subset_output=$(env CONFIG_FILE="$tmpconfig_subset" bash -c "source '$RUNNER' --group all --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
 missing_live=""
 for t in "${LIVE_TARGETS[@]}"; do
     printf '%s\n' "$subset_output" | tr ',' '\n' | grep -qx "$t" || missing_live="$missing_live $t"
@@ -241,11 +272,10 @@ fi
 
 # TARGETS_SETUP applies ONLY to the "all" group. --group offline / --group live
 # must ignore it entirely (no config-only targets leak in).
-tmpconfig_scoped=$(mktemp)
+tmpconfig_scoped=$(new_tmp)
 echo "TARGETS_SETUP=grpc-server" > "$tmpconfig_scoped"
-scoped_offline=$(env CONFIG_FILE="$tmpconfig_scoped" bash -c "source '$RUNNER' --group offline --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//')
-scoped_live=$(env CONFIG_FILE="$tmpconfig_scoped" bash -c "source '$RUNNER' --group live --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//')
-rm -f "$tmpconfig_scoped"
+scoped_offline=$(env CONFIG_FILE="$tmpconfig_scoped" bash -c "source '$RUNNER' --group offline --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
+scoped_live=$(env CONFIG_FILE="$tmpconfig_scoped" bash -c "source '$RUNNER' --group live --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
 if [[ "$scoped_offline" == "$(join_targets "${OFFLINE_TARGETS[@]}")" && "$scoped_live" == "$(join_targets "${LIVE_TARGETS[@]}")" ]]; then
     pass "TARGETS_SETUP ignored for --group offline/live (grpc-server absent)"
 else
@@ -274,7 +304,7 @@ echo ""
 echo "=== Argument validation ==="
 
 # Invalid --group value exits non-zero with the expected error message.
-tmpconfig=$(mktemp)
+tmpconfig=$(new_tmp)
 echo "TARGETS_SETUP=" > "$tmpconfig"
 invalid_output=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --group bogus" 2>&1) && rc=0 || rc=$?
 if [[ "$invalid_output" == *"Unknown group"* && "$invalid_output" == *"Usage:"* && "$rc" -ne 0 ]]; then
@@ -282,10 +312,9 @@ if [[ "$invalid_output" == *"Unknown group"* && "$invalid_output" == *"Usage:"* 
 else
     fail "Invalid --group: expected non-zero exit + 'Unknown group' (rc=$rc), got: $invalid_output"
 fi
-rm -f "$tmpconfig"
 
 # --group without a value exits non-zero with the expected error message.
-tmpconfig=$(mktemp)
+tmpconfig=$(new_tmp)
 echo "TARGETS_SETUP=" > "$tmpconfig"
 novalue_output=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --group" 2>&1) && rc=0 || rc=$?
 if [[ "$novalue_output" == *"--group requires a value"* && "$rc" -ne 0 ]]; then
@@ -293,10 +322,9 @@ if [[ "$novalue_output" == *"--group requires a value"* && "$rc" -ne 0 ]]; then
 else
     fail "--group (no value): expected non-zero exit + '--group requires a value' (rc=$rc), got: $novalue_output"
 fi
-rm -f "$tmpconfig"
 
 # --targets without a value exits non-zero with the expected error message.
-tmpconfig=$(mktemp)
+tmpconfig=$(new_tmp)
 echo "TARGETS_SETUP=" > "$tmpconfig"
 novalue_output=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --targets" 2>&1) && rc=0 || rc=$?
 if [[ "$novalue_output" == *"--targets requires a value"* && "$rc" -ne 0 ]]; then
@@ -304,7 +332,6 @@ if [[ "$novalue_output" == *"--targets requires a value"* && "$rc" -ne 0 ]]; the
 else
     fail "--targets (no value): expected non-zero exit + '--targets requires a value' (rc=$rc), got: $novalue_output"
 fi
-rm -f "$tmpconfig"
 
 echo ""
 echo "=== Behavioral --group resolution (via --dry-run) ==="
@@ -312,12 +339,12 @@ echo "=== Behavioral --group resolution (via --dry-run) ==="
 # These tests invoke the runner with --dry-run to verify the actual
 # group-resolution code path without requiring a binary or running tests.
 
-tmpconfig=$(mktemp)
+tmpconfig=$(new_tmp)
 echo "TARGETS_SETUP=" > "$tmpconfig"
 
 # --group offline resolves to exactly OFFLINE_TARGETS.
 expected_offline="$(join_targets "${OFFLINE_TARGETS[@]}")"
-actual_offline=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --group offline --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//')
+actual_offline=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --group offline --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
 if [[ "$actual_offline" == "$expected_offline" ]]; then
     pass "--group offline resolves to OFFLINE_TARGETS (${#OFFLINE_TARGETS[@]} targets)"
 else
@@ -326,7 +353,7 @@ fi
 
 # --group live resolves to exactly LIVE_TARGETS.
 expected_live="$(join_targets "${LIVE_TARGETS[@]}")"
-actual_live=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --group live --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//')
+actual_live=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --group live --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
 if [[ "$actual_live" == "$expected_live" ]]; then
     pass "--group live resolves to LIVE_TARGETS (${#LIVE_TARGETS[@]} targets)"
 else
@@ -335,7 +362,7 @@ fi
 
 # --group all (default) resolves to OFFLINE + LIVE.
 expected_all="$(join_targets "${OFFLINE_TARGETS[@]}"),$(join_targets "${LIVE_TARGETS[@]}")"
-actual_all=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//')
+actual_all=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
 if [[ "$actual_all" == "$expected_all" ]]; then
     pass "--group all resolves to OFFLINE + LIVE ($(echo "$expected_all" | tr ',' '\n' | wc -l | tr -d ' ') targets)"
 else
@@ -343,14 +370,13 @@ else
 fi
 
 # --targets overrides --group.
-actual_override=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --targets rest-api --group offline --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//')
+actual_override=$(env CONFIG_FILE="$tmpconfig" bash -c "source '$RUNNER' --targets rest-api --group offline --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
 if [[ "$actual_override" == "rest-api" ]]; then
     pass "--targets overrides --group: resolved to 'rest-api' only"
 else
     fail "--targets overrides --group: expected 'rest-api', got '$actual_override'"
 fi
 
-rm -f "$tmpconfig"
 
 echo ""
 echo "=== --dry-run needs no config for offline/live/--targets ==="
