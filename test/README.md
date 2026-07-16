@@ -123,7 +123,7 @@ Options:
   --targets <list>      Comma-separated targets to test (default: all)
                         Valid targets:
                           Live:       rest-api, soap-service, graphql-server,
-                                      grpc-server
+                                      grpc-server, concat-spa-two-stage
                           Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,
                                       generate-graphql, generate-graphql-imports,
                                       generate-js-static, generate-merge-slugs
@@ -245,12 +245,13 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 ## Expected Results
 
-All 23 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest).
+All 25 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest).
 
 ```
   TARGET                      STATUS    ENDPOINTS   EXPECTED   DURATION
   --------------------------  --------  ----------  ---------  --------
   classifier-edge             PASS      -           -          0s
+  concat-spa-two-stage        PASS      2           2          92s
   crawl-depth                 PASS      -           -          188s
   crawl-unreachable           PASS      0           0          39s
   edge-cases                  PASS      -           -          193s
@@ -275,7 +276,7 @@ All 23 tests should pass. Order is non-deterministic and durations vary by machi
   soap-service                PASS      3           3          51s
   spec-edge                   PASS      -           -          0s
 
-  Total: 23 passed, 0 failed, 0 skipped
+  Total: 25 passed, 0 failed, 0 skipped
 ```
 
 Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are informational and do not cause failures.
