@@ -467,7 +467,7 @@ type GenerateCmd struct {
 	Capture                string  `arg:"" help:"Capture file path"`
 	Output                 string  `short:"o" help:"Output file path"`
 	Confidence             float64 `default:"0.5" help:"Minimum confidence threshold"`
-	Probe                  bool    `default:"true" help:"Enable active probing of classified endpoints (OPTIONS/schema/WSDL-fetch/GraphQL introspection). Note: JS-bundle replay extraction runs only in 'scan', which has a live target URL to re-fetch bundles from; 'generate' works offline from an existing capture and cannot run it."`
+	Probe                  bool    `default:"true" help:"Enable active probing of classified endpoints (OPTIONS/schema/WSDL-fetch/GraphQL introspection) and JS-bundle replay extraction. Replay re-fetches capture-referenced bundles over HTTP (origin taken from the capture), so the target must still be reachable; combine with --analyze-js (default on) to recover SPA endpoints in the two-stage crawl→generate flow."`
 	Deduplicate            bool    `default:"true" help:"Deduplicate classified endpoints before probing"`
 	DangerousAllowPrivate  bool    `help:"Disable SSRF protection on the probe path (OPTIONS/schema/WSDL-fetch/GraphQL introspection) for private/localhost targets. WARNING: Do not use on production systems." name:"dangerous-allow-private"`
 	GRPCInsecureSkipVerify bool    `help:"Skip TLS certificate verification when probing gRPC server reflection over TLS (for self-signed/internal-CA targets). Default: verify." name:"grpc-insecure-skip-verify"`
@@ -548,6 +548,23 @@ func (c *GenerateCmd) Run() (err error) {
 	})
 
 	warnSSRFDisabled(c.DangerousAllowPrivate, c.Probe)
+
+	// Replay JS-extracted URLs with raw HTTP so the two-stage crawl→generate
+	// workflow recovers SPA endpoints that exist only inside JS bundles (e.g.
+	// concat-style paths), matching what scan does (LAB-3892). Static JS
+	// analysis (pipeline.Augment above) surfaces literal paths, but concat /
+	// service-prefix forms need the active re-fetch to be reconstructed and
+	// confirmed. Gated on c.Probe && c.AnalyzeJS — the same gate scan uses — so
+	// --probe=false or --analyze-js=false keeps generate passive (see
+	// maybeReplayJSExtracted). The capture carries the crawled origin, so
+	// ReplayJSExtracted derives the target origin from the first request when
+	// TargetURL is empty; captures don't preserve the seed's headers, so
+	// Headers is left nil.
+	requests = maybeReplayJSExtracted(ctx, requests, c.Probe && c.AnalyzeJS, crawl.JSReplayConfig{
+		AllowPrivate: c.DangerousAllowPrivate,
+		Verbose:      c.Verbose,
+		Stderr:       os.Stderr,
+	})
 
 	spec, err := pipeline.ClassifyProbeGenerate(ctx, requests, c.options())
 	if err != nil {

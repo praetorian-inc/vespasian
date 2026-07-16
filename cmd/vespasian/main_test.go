@@ -2853,3 +2853,188 @@ func TestDetectAPIType_StaticHTMLPostFormDrivesREST(t *testing.T) {
 		t.Errorf("ExtractForms must change classification: raw=%q augmented=%q (both same — pipeline reorder isn't load-bearing)", rawType, augType)
 	}
 }
+
+// TestGenerateCmdRun_JSReplayGatedOnProbe proves that GenerateCmd.Run's
+// LAB-3892 JS-replay step (crawl.ReplayJSExtracted, invoked via
+// maybeReplayJSExtracted) is gated on BOTH c.Probe and c.AnalyzeJS. app.js
+// reconstructs its one API path only via String.prototype.concat — the path
+// never appears as a quoted literal — so static JS analysis
+// (pipeline.Augment, gated by --analyze-js alone) cannot recover it from the
+// capture (which does not carry app.js's body at all); only the active
+// JS-replay step, which fetches app.js over HTTP and reconstructs the concat
+// path, can produce it. This isolates the "&& c.AnalyzeJS" half of the gate:
+// with --probe=true and --analyze-js=false, the gate must stay closed even
+// though probing alone is enabled.
+func TestGenerateCmdRun_JSReplayGatedOnProbe(t *testing.T) {
+	const appJS = `function loadOrders(uid) { return fetch("/api/users/".concat(uid, "/orders")); }`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(appJS))
+		case "/api/users/0/orders":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"orders":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	// Capture: a single HTML entry referencing the external app.js, mirroring
+	// a real crawl. The replay step discovers and fetches app.js itself.
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    srv.URL + "/",
+			Source: "katana",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<!DOCTYPE html><html><head><script src="app.js"></script></head></html>`),
+			},
+		},
+	}
+
+	capturePath := filepath.Join(t.TempDir(), "capture.json")
+	f, err := os.Create(capturePath) //nolint:gosec // G304: test file
+	require.NoError(t, err)
+	require.NoError(t, crawl.WriteCapture(f, requests))
+	require.NoError(t, f.Close())
+
+	// runGenerate drives GenerateCmd.Run() with the given gate settings and
+	// returns the generated spec read back from the Output file (not
+	// stdout).
+	runGenerate := func(t *testing.T, probe, analyzeJS bool) string {
+		t.Helper()
+		outputPath := filepath.Join(t.TempDir(), "spec.yaml")
+		cmd := &GenerateCmd{
+			APIType:               "rest",
+			Capture:               capturePath,
+			Output:                outputPath,
+			Probe:                 probe,
+			AnalyzeJS:             analyzeJS,
+			Deduplicate:           true,
+			DangerousAllowPrivate: true,
+		}
+		require.NoError(t, cmd.Run())
+		specBytes, err := os.ReadFile(outputPath) //nolint:gosec // G304: test file
+		require.NoError(t, err)
+		return string(specBytes)
+	}
+
+	t.Run("probe_and_analyze_recovers", func(t *testing.T) {
+		spec := runGenerate(t, true, true)
+		require.Contains(t, spec, "/api/users/", "concat-reconstructed path's prefix must reach the generated spec when both --probe and --analyze-js are true")
+		require.Contains(t, spec, "/orders", "concat-reconstructed path's suffix must reach the generated spec when both --probe and --analyze-js are true")
+	})
+
+	t.Run("probe_false_skips", func(t *testing.T) {
+		spec := runGenerate(t, false, true)
+		require.NotContains(t, spec, "/orders", "with --probe=false, JS-replay must not run and the concat-reconstructed path must be absent")
+	})
+
+	t.Run("analyze_false_skips", func(t *testing.T) {
+		spec := runGenerate(t, true, false)
+		require.NotContains(t, spec, "/orders", "with --analyze-js=false, JS-replay must not run (gate is c.Probe && c.AnalyzeJS) and the concat-reconstructed path must be absent")
+	})
+}
+
+// TestGenerateCmdRun_TwoStageRecoversConcatEndpoints mirrors pkg/crawl's
+// TestReplayJSExtracted_ConcatStyle_EndToEnd, but drives the full two-stage
+// crawl->generate workflow through GenerateCmd.Run instead of calling
+// crawl.ReplayJSExtracted directly. It pins LAB-3892 acceptance criterion #1:
+// the two-stage crawl | generate workflow recovers SPA endpoints that exist
+// only inside JS bundles as concat-style strings — both the
+// String.prototype.concat form and the +-operator chain form — while a
+// reconstructed concat path that 404s is filtered out of the generated spec.
+func TestGenerateCmdRun_TwoStageRecoversConcatEndpoints(t *testing.T) {
+	// .concat() form, +-chain form, and a concat form whose reconstructed
+	// path 404s (control for the filter). None of the full paths appear as
+	// quoted literals — only the concat extractor can reconstruct them.
+	const appJS = `
+		function loadOrders(uid)  { return fetch("/api/users/".concat(uid, "/orders")); }
+		function loadReviews(pid) { var u = "/api/products/" + pid + "/reviews"; return fetch(u); }
+		function loadGone(x)      { return fetch("/api/missing/".concat(x, "/gone")); }
+	`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(appJS))
+		case "/api/users/0/orders":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"orders":[]}`))
+		case "/api/products/0/reviews":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"reviews":[]}`))
+		// /api/missing/0/gone falls through to the 404 default.
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    srv.URL + "/",
+			Source: "katana",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<!DOCTYPE html><html><head><script src="app.js"></script></head></html>`),
+			},
+		},
+	}
+
+	capturePath := filepath.Join(t.TempDir(), "capture.json")
+	f, err := os.Create(capturePath) //nolint:gosec // G304: test file
+	require.NoError(t, err)
+	require.NoError(t, crawl.WriteCapture(f, requests))
+	require.NoError(t, f.Close())
+
+	outputPath := filepath.Join(t.TempDir(), "spec.yaml")
+	cmd := &GenerateCmd{
+		APIType:               "rest",
+		Capture:               capturePath,
+		Output:                outputPath,
+		Probe:                 true,
+		AnalyzeJS:             true,
+		Deduplicate:           true,
+		DangerousAllowPrivate: true,
+	}
+	require.NoError(t, cmd.Run())
+
+	specBytes, err := os.ReadFile(outputPath) //nolint:gosec // G304: test file
+	require.NoError(t, err)
+
+	// Parse the spec structurally instead of substring-matching, so the
+	// assertions are robust to whatever normalized parameter name the REST
+	// generator picks (e.g. {userId} vs {id}).
+	var parsed map[string]interface{}
+	require.NoError(t, yaml.Unmarshal(specBytes, &parsed))
+
+	pathsRaw, ok := parsed["paths"]
+	require.True(t, ok, "spec missing 'paths' key")
+	paths, ok := pathsRaw.(map[string]interface{})
+	require.True(t, ok, "'paths' is not a map, got %T", pathsRaw)
+
+	var usersOrdersFound, productsReviewsFound, missingFound bool
+	for p := range paths {
+		if strings.HasPrefix(p, "/api/users/") && strings.HasSuffix(p, "/orders") {
+			usersOrdersFound = true
+		}
+		if strings.HasPrefix(p, "/api/products/") && strings.HasSuffix(p, "/reviews") {
+			productsReviewsFound = true
+		}
+		if strings.HasPrefix(p, "/api/missing") {
+			missingFound = true
+		}
+	}
+
+	require.True(t, usersOrdersFound, "String.prototype.concat path /api/users/.../orders must be reconstructed, probed, kept, and appear in generated spec paths: %v", paths)
+	require.True(t, productsReviewsFound, "+-chain path /api/products/.../reviews must be reconstructed, probed, kept, and appear in generated spec paths: %v", paths)
+	require.False(t, missingFound, "reconstructed concat path that 404s (/api/missing/...) must be dropped from generated spec paths: %v", paths)
+}

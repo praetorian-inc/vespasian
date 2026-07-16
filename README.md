@@ -92,6 +92,14 @@ and probes the discovered URLs with raw HTTP requests. Wrong combinations
 (typically caused by the regex matching unrelated string literals) come back
 404 and are dropped.
 
+This step runs in both the single-stage `scan` command and the two-stage
+`generate` command (gated on `--probe` and `--analyze-js`, both on by
+default), so the `crawl` → `generate` workflow recovers these JS-bundle-only
+endpoints too. Because replay re-fetches the bundles over HTTP, the target
+must still be reachable when `generate` runs; the origin is taken from the
+capture. The `crawl` command alone stays passive — it records a browser
+capture without running JS-replay.
+
 The extractor also reconstructs paths built by runtime string concatenation —
 both `String.prototype.concat` (`"/api/posts/".concat(id, "/comment")`) and the
 `+` operator (`"/api/users/" + uid + "/profile"`). Operands that are not string
