@@ -25,6 +25,12 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 )
 
+// browserLookPath resolves the system browser binary. It is a package var so
+// tests can exercise the no-browser-found path deterministically regardless of
+// what is installed on the host (go-rod uses the same "interface for testing"
+// idiom for its own exec calls). Production code always uses launcher.LookPath.
+var browserLookPath = launcher.LookPath
+
 // BrowserOptions configures Chrome launch parameters.
 type BrowserOptions struct {
 	Headless bool
@@ -40,6 +46,16 @@ type BrowserOptions struct {
 	// is passed directly to exec.Command — it must be a trusted, hardcoded
 	// path. Never populate from user-controlled input.
 	ChromePath string
+
+	// AllowBrowserDownload permits go-rod to download a managed Chromium from
+	// its third-party mirror hosts (Google Storage, npmmirror, Playwright CDN)
+	// when no system browser is found and ChromePath is unset. It is OFF by
+	// default: configureLauncher pins the system browser via launcher.LookPath()
+	// and errors when none is found, so a security crawl never pulls a browser
+	// binary over the network (supply-chain hardening, LAB-4999). Enable it — or
+	// set VESPASIAN_ALLOW_BROWSER_DOWNLOAD=true — only for local dev on platforms
+	// without a system Chrome (e.g. arm64 Linux, where Google Chrome has no build).
+	AllowBrowserDownload bool
 
 	// Proxy sets the Chrome --proxy-server flag, routing all browser traffic
 	// through the given address (e.g., "http://127.0.0.1:8080" for Burp Suite).
@@ -67,9 +83,10 @@ func configureLauncher(opts BrowserOptions) (*launcher.Launcher, error) {
 	if opts.NoSandbox || os.Getenv("VESPASIAN_NO_SANDBOX") == "true" {
 		l = l.NoSandbox(true)
 	}
-	if opts.ChromePath != "" {
-		l = l.Bin(opts.ChromePath)
+	if err := pinBrowserBinary(l, opts); err != nil {
+		return nil, err
 	}
+	disableChromeTelemetry(l)
 	if opts.Proxy != "" {
 		if err := ValidateProxyAddr(opts.Proxy); err != nil {
 			return nil, err
@@ -78,6 +95,56 @@ func configureLauncher(opts BrowserOptions) (*launcher.Launcher, error) {
 	}
 
 	return l, nil
+}
+
+// pinBrowserBinary sets the launcher's browser binary so go-rod uses a local
+// Chrome and never auto-downloads one (Finding 1, LAB-4999). By default go-rod
+// leaves the binary unset and, at launch, downloads a managed Chromium from
+// third-party mirror hosts (storage.googleapis.com, registry.npmmirror.com,
+// playwright.*) — a supply-chain risk and a source of nondeterministic CI
+// egress. go-rod does NOT auto-discover a system Chrome; LookPath() is a
+// separate helper the launcher never calls on its own.
+//
+// Resolution order:
+//  1. opts.ChromePath, if set, is used verbatim.
+//  2. otherwise the system browser is resolved via launcher.LookPath() (whose
+//     Linux candidates include /usr/bin/google-chrome-stable, the CI runner's
+//     Chrome).
+//  3. if none is found, return an error rather than let go-rod download —
+//     UNLESS downloads are explicitly opted in via opts.AllowBrowserDownload or
+//     VESPASIAN_ALLOW_BROWSER_DOWNLOAD=true, in which case the binary is left
+//     unset so go-rod falls back to its managed download (keeps local dev
+//     working on platforms with no system Chrome, e.g. arm64 Linux).
+func pinBrowserBinary(l *launcher.Launcher, opts BrowserOptions) error {
+	if opts.ChromePath != "" {
+		l.Bin(opts.ChromePath)
+		return nil
+	}
+	if path, found := browserLookPath(); found {
+		l.Bin(path)
+		return nil
+	}
+	if opts.AllowBrowserDownload || os.Getenv("VESPASIAN_ALLOW_BROWSER_DOWNLOAD") == "true" {
+		// Leave the binary unset so go-rod downloads a managed browser.
+		return nil
+	}
+	return fmt.Errorf("no system Chrome/Chromium found in standard paths: set BrowserOptions.ChromePath, install a browser, or set VESPASIAN_ALLOW_BROWSER_DOWNLOAD=true to allow go-rod to download one")
+}
+
+// disableChromeTelemetry adds launch flags that stop Chrome from phoning home
+// to Google during a crawl (Finding 2, LAB-4999). go-rod's defaults already
+// set --disable-background-networking and --disable-sync, but Chrome still
+// reaches component-update, domain-reliability, optimization-hints and autofill
+// endpoints — including dynamically-sharded *.gvt1.com hosts that make a CI
+// egress allowlist brittle. These flags suppress that chatter without affecting
+// the crawl.
+func disableChromeTelemetry(l *launcher.Launcher) {
+	l.Set("disable-component-update")
+	l.Set("disable-domain-reliability")
+	l.Set("no-pings")
+	// Append, not Set: go-rod seeds disable-features with site-per-process and
+	// TranslateUI (see launcher.New), which must be preserved.
+	l.Append("disable-features", "OptimizationHints", "AutofillServerCommunication")
 }
 
 // NewBrowserManager launches a Chrome instance with the given options and

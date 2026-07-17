@@ -17,6 +17,8 @@ package crawl
 import (
 	"strings"
 	"testing"
+
+	"github.com/go-rod/rod/lib/launcher/flags"
 )
 
 // TEST-001 regression: SetCookies on a BrowserManager whose browser field
@@ -104,6 +106,9 @@ func TestConfigureLauncher(t *testing.T) {
 	})
 
 	t.Run("chrome path", func(t *testing.T) {
+		// Explicit ChromePath wins and LookPath is never consulted, even when
+		// LookPath would resolve a different binary.
+		stubLookPath(t, "/should/not/be/used", true)
 		l, err := configureLauncher(BrowserOptions{ChromePath: "/usr/bin/chromium"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -112,6 +117,106 @@ func TestConfigureLauncher(t *testing.T) {
 			t.Errorf("Get(rod-bin) = %q, want /usr/bin/chromium", got)
 		}
 	})
+
+	// Finding 1 (LAB-4999): when ChromePath is unset the launcher pins the
+	// system browser via LookPath and never falls through to go-rod's
+	// third-party-mirror download unless downloads are explicitly opted in.
+	t.Run("browser binary pinning", func(t *testing.T) {
+		t.Run("LookPath found pins that binary", func(t *testing.T) {
+			stubLookPath(t, "/opt/google/chrome/chrome", true)
+			l, err := configureLauncher(BrowserOptions{})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := l.Get("rod-bin"); got != "/opt/google/chrome/chrome" {
+				t.Errorf("Get(rod-bin) = %q, want /opt/google/chrome/chrome", got)
+			}
+		})
+
+		t.Run("no browser and no opt-in errors without pinning", func(t *testing.T) {
+			t.Setenv("VESPASIAN_ALLOW_BROWSER_DOWNLOAD", "")
+			stubLookPath(t, "", false)
+			l, err := configureLauncher(BrowserOptions{})
+			if err == nil {
+				t.Fatal("expected error when no system browser is found, got nil")
+			}
+			if !strings.Contains(err.Error(), "VESPASIAN_ALLOW_BROWSER_DOWNLOAD") {
+				t.Errorf("error %q should name the opt-in env var", err.Error())
+			}
+			if l != nil {
+				t.Error("expected nil launcher on error")
+			}
+		})
+
+		t.Run("no browser with field opt-in allows download", func(t *testing.T) {
+			t.Setenv("VESPASIAN_ALLOW_BROWSER_DOWNLOAD", "")
+			stubLookPath(t, "", false)
+			l, err := configureLauncher(BrowserOptions{AllowBrowserDownload: true})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			// Binary left unset so go-rod performs its managed download.
+			if got := l.Get("rod-bin"); got != "" {
+				t.Errorf("Get(rod-bin) = %q, want empty (download fallback)", got)
+			}
+		})
+
+		t.Run("no browser with env opt-in allows download", func(t *testing.T) {
+			t.Setenv("VESPASIAN_ALLOW_BROWSER_DOWNLOAD", "true")
+			stubLookPath(t, "", false)
+			l, err := configureLauncher(BrowserOptions{})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := l.Get("rod-bin"); got != "" {
+				t.Errorf("Get(rod-bin) = %q, want empty (download fallback)", got)
+			}
+		})
+	})
+
+	// Finding 2 (LAB-4999): telemetry/phone-home-disabling flags are always
+	// applied, and disable-features is appended to (preserving go-rod's own
+	// site-per-process / TranslateUI defaults) rather than overwritten.
+	t.Run("telemetry flags", func(t *testing.T) {
+		stubLookPath(t, "/usr/bin/chromium", true)
+		l, err := configureLauncher(BrowserOptions{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		for _, flag := range []flags.Flag{"disable-component-update", "disable-domain-reliability", "no-pings"} {
+			if !l.Has(flag) {
+				t.Errorf("expected launcher to have flag %q", flag)
+			}
+		}
+		feats, ok := l.GetFlags("disable-features")
+		if !ok {
+			t.Fatal("expected disable-features flag to be set")
+		}
+		for _, want := range []string{"site-per-process", "TranslateUI", "OptimizationHints", "AutofillServerCommunication"} {
+			if !containsStr(feats, want) {
+				t.Errorf("disable-features %v should contain %q", feats, want)
+			}
+		}
+	})
+}
+
+// stubLookPath swaps the package-level browserLookPath for the duration of a
+// test so the no-browser-found and found paths can be exercised regardless of
+// what is installed on the host. The original is restored via t.Cleanup.
+func stubLookPath(t *testing.T, path string, found bool) {
+	t.Helper()
+	orig := browserLookPath
+	browserLookPath = func() (string, bool) { return path, found }
+	t.Cleanup(func() { browserLookPath = orig })
+}
+
+func containsStr(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestNewBrowserManager_InvalidProxyReturnsError(t *testing.T) {
