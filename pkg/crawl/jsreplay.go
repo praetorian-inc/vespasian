@@ -56,8 +56,9 @@ type JSReplayConfig struct {
 	Headers map[string]string
 
 	// TargetURL is the scan's intended target. It is used to derive the
-	// same-origin host for header forwarding and probe filtering. If
-	// empty, the first non-empty request URL is used as a fallback.
+	// same-origin host for header forwarding and probe filtering. If empty,
+	// the origin is derived from the capture: the first request whose response
+	// is HTML (the app page), falling back to the first non-empty request URL.
 	TargetURL string
 
 	// AllowPrivate disables SSRF protection (ValidateProbeURL and
@@ -639,6 +640,27 @@ func originOf(rawURL string) string {
 	return scheme + "://" + host + ":" + port
 }
 
+// firstHTMLOrigin returns the origin of the first request whose response is
+// HTML (by content type or sniffed body), or "" if none is found. It lets
+// ReplayJSExtracted bind to the real app page rather than an arbitrary first
+// capture entry, which may be a third-party asset in imported/mixed-origin
+// captures (see ReplayJSExtracted). Reuses the same HTML detection as the
+// <script> discovery loop so the two stay consistent.
+func firstHTMLOrigin(requests []ObservedRequest) string {
+	for _, req := range requests {
+		if req.URL == "" {
+			continue
+		}
+		if !isHTMLResponse(req.Response.ContentType) && !looksLikeHTML(req.Response.Body) {
+			continue
+		}
+		if origin := originOf(req.URL); origin != "" {
+			return origin
+		}
+	}
+	return ""
+}
+
 // isSameOrigin reports whether rawURL has the same origin as targetOrigin.
 // Both sides are normalized via originOf so default-port-vs-explicit-port
 // pairs (e.g., https://example.com and https://example.com:443) compare equal.
@@ -659,6 +681,22 @@ func sanitizeForLog(s string) string {
 	// strconv.Quote escapes control chars, non-printable bytes, and quotes;
 	// it returns a Go-quoted string, which is safe to render verbatim.
 	return strconv.Quote(s)
+}
+
+// warnDerivedOrigin emits the interim origin-disclosure mitigation warning (see LAB-4998):
+// when --target-url is unset, the JS-replay origin is derived from the capture
+// rather than explicitly chosen, so this always (not gated on Verbose) surfaces
+// the derived origin and, when credential headers are present, that they will be
+// forwarded there. targetOrigin is run through sanitizeForLog for parity with
+// this file's other URL logging. Extracted from ReplayJSExtracted so the two
+// branches are independently testable. Deeper redesign tracked in LAB-4998.
+func warnDerivedOrigin(w io.Writer, targetOrigin string, hasHeaders bool) {
+	origin := sanitizeForLog(targetOrigin)
+	if hasHeaders {
+		fmt.Fprintf(w, "WARNING: --target-url not set; JS-replay derived origin %s from the capture — requests AND your --header credentials will be sent there. Pass --target-url to pin it.\n", origin) //nolint:errcheck // operator-facing warning
+		return
+	}
+	fmt.Fprintf(w, "WARNING: --target-url not set; JS-replay derived origin %s from the capture — requests will be sent there. Pass --target-url to pin it.\n", origin) //nolint:errcheck // operator-facing warning
 }
 
 // copyHeaders returns a defensive copy of h to avoid sharing the caller's
@@ -1616,8 +1654,18 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		fmt.Fprintf(cfg.Stderr, format, args...) //nolint:errcheck // operator-facing warning
 	}
 
-	// Determine the target origin from cfg.TargetURL or the first request.
+	// Determine the target origin. Priority: explicit cfg.TargetURL, then the
+	// origin of the first request whose RESPONSE is HTML (the real app page),
+	// then the first non-empty request URL. Preferring the HTML page matters for
+	// mixed-origin / imported captures (HAR/Burp) whose first entry may be a
+	// third-party asset (CDN font, analytics beacon): binding replay to that
+	// asset's origin leaves the app's same-origin bundles cross-origin and skips
+	// them entirely (LAB-3892 review). Single-origin crawl captures are
+	// unaffected — their first entry is the HTML page anyway.
 	targetOrigin := originOf(cfg.TargetURL)
+	if targetOrigin == "" {
+		targetOrigin = firstHTMLOrigin(requests)
+	}
 	if targetOrigin == "" {
 		for _, req := range requests {
 			if req.URL != "" {
@@ -1630,6 +1678,14 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	}
 	if targetOrigin == "" {
 		return requests
+	}
+
+	// Interim origin-disclosure mitigation: an empty --target-url means
+	// targetOrigin was *derived* from the capture rather than explicitly
+	// chosen, so surface that fact loudly (see warnDerivedOrigin). Deeper
+	// origin-derivation redesign is tracked in LAB-4998.
+	if cfg.TargetURL == "" {
+		warnDerivedOrigin(cfg.Stderr, targetOrigin, len(cfg.Headers) > 0)
 	}
 
 	// Apply a wall-clock deadline to bound the whole step regardless of how
