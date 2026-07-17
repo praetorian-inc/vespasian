@@ -260,12 +260,13 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 ## Expected Results
 
-All 25 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest).
+All 26 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest). The sample below is a default `--group all` run (19 offline + 7 live targets); the config-only `grpc-server` target runs additionally only when `TARGETS_SETUP` is configured.
 
 ```
   TARGET                      STATUS    ENDPOINTS   EXPECTED   DURATION
   --------------------------  --------  ----------  ---------  --------
   classifier-edge             PASS      -           -          0s
+  concat-spa                  PASS      2           2          90s
   concat-spa-two-stage        PASS      2           2          92s
   crawl-depth                 PASS      -           -          188s
   crawl-unreachable           PASS      0           0          39s
@@ -276,8 +277,8 @@ All 25 tests should pass. Order is non-deterministic and durations vary by machi
   generate-merge-slugs        PASS      3           3          0s
   generate-rest               PASS      8           8          0s
   generate-wsdl               PASS      3           3          1s
+  generate-wsdl-matrix        PASS      3           3          1s
   graphql-server              PASS      8           8          1s
-  grpc-server                 PASS      3           3          1s
   import-base64               PASS      2           2          0s
   import-burp                 PASS      5           5          0s
   import-duplicates           PASS      2           2          0s
@@ -291,7 +292,7 @@ All 25 tests should pass. Order is non-deterministic and durations vary by machi
   soap-service                PASS      3           3          51s
   spec-edge                   PASS      -           -          0s
 
-  Total: 25 passed, 0 failed, 0 skipped
+  Total: 26 passed, 0 failed, 0 skipped
 ```
 
 Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are informational and do not cause failures.
