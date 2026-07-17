@@ -683,7 +683,7 @@ func sanitizeForLog(s string) string {
 	return strconv.Quote(s)
 }
 
-// warnDerivedOrigin emits the SEC-BE-001/SEC-BE-002 interim mitigation warning:
+// warnDerivedOrigin emits the interim origin-disclosure mitigation warning (see LAB-4998):
 // when --target-url is unset, the JS-replay origin is derived from the capture
 // rather than explicitly chosen, so this always (not gated on Verbose) surfaces
 // the derived origin and, when credential headers are present, that they will be
@@ -1680,7 +1680,7 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		return requests
 	}
 
-	// SEC-BE-001/SEC-BE-002 interim mitigation: an empty --target-url means
+	// Interim origin-disclosure mitigation: an empty --target-url means
 	// targetOrigin was *derived* from the capture rather than explicitly
 	// chosen, so surface that fact loudly (see warnDerivedOrigin). Deeper
 	// origin-derivation redesign is tracked in LAB-4998.
