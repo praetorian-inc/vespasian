@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -2980,4 +2981,37 @@ func TestReplayJSExtracted_DetectsHTMLByBodySniff(t *testing.T) {
 	}
 	assert.Contains(t, apiURLs, app.URL+"/api/users/0/orders",
 		"replay must bind to the app page's origin via body-sniff HTML detection (empty Content-Type), not the first non-HTML asset's origin")
+}
+
+// TestWarnDerivedOrigin covers the SEC-BE-001/SEC-BE-002 interim mitigation
+// warning emitted by ReplayJSExtracted when --target-url is unset. It asserts
+// both branches (with/without credential headers), that the derived origin is
+// run through sanitizeForLog, and that no header VALUES are ever printed.
+func TestWarnDerivedOrigin(t *testing.T) {
+	const origin = "https://evil.example.com"
+	quoted := strconv.Quote(origin) // what sanitizeForLog(origin) produces
+
+	t.Run("no headers: names sanitized origin, no credential warning", func(t *testing.T) {
+		var buf bytes.Buffer
+		warnDerivedOrigin(&buf, origin, false)
+		out := buf.String()
+		require.Contains(t, out, "--target-url not set")
+		require.Contains(t, out, quoted, "origin must pass through sanitizeForLog (strconv.Quote)")
+		require.Contains(t, out, "requests will be sent there")
+		require.NotContains(t, out, "credentials", "with no headers, the credential warning must not appear")
+	})
+
+	t.Run("with headers: warns credentials will be forwarded", func(t *testing.T) {
+		var buf bytes.Buffer
+		warnDerivedOrigin(&buf, origin, true)
+		out := buf.String()
+		require.Contains(t, out, quoted)
+		require.Contains(t, out, "--header credentials will be sent there")
+	})
+
+	t.Run("sanitizeForLog neutralizes control bytes in the origin", func(t *testing.T) {
+		var buf bytes.Buffer
+		warnDerivedOrigin(&buf, "https://evil\r\nInjected: x", false)
+		require.NotContains(t, buf.String(), "\r\n", "control bytes must be escaped, not emitted raw")
+	})
 }

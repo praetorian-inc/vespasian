@@ -507,7 +507,7 @@ func (c *GenerateCmd) options() pipeline.Options {
 // validation, both of which must happen before any capture file I/O) lives
 // in one cohesive function instead of inline in Run, reducing Run's length
 // and cyclomatic complexity.
-func resolveJSReplayConfig(c *GenerateCmd) (crawl.JSReplayConfig, error) {
+func (c *GenerateCmd) resolveJSReplayConfig() (crawl.JSReplayConfig, error) {
 	// Parse --header early so an invalid header fails fast, before any file I/O.
 	// These are forwarded to the same-origin JS-replay fetches/probes below.
 	headers, err := parseHeaders(c.Header)
@@ -530,7 +530,7 @@ func (c *GenerateCmd) Run() (err error) {
 
 	// Resolves --header/--target-url and fails fast (before any capture file
 	// I/O) on an invalid value, mirroring the previous inline ordering.
-	jsReplayCfg, err := resolveJSReplayConfig(c)
+	jsReplayCfg, err := c.resolveJSReplayConfig()
 	if err != nil {
 		return err
 	}

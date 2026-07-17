@@ -683,6 +683,22 @@ func sanitizeForLog(s string) string {
 	return strconv.Quote(s)
 }
 
+// warnDerivedOrigin emits the SEC-BE-001/SEC-BE-002 interim mitigation warning:
+// when --target-url is unset, the JS-replay origin is derived from the capture
+// rather than explicitly chosen, so this always (not gated on Verbose) surfaces
+// the derived origin and, when credential headers are present, that they will be
+// forwarded there. targetOrigin is run through sanitizeForLog for parity with
+// this file's other URL logging. Extracted from ReplayJSExtracted so the two
+// branches are independently testable. Deeper redesign tracked in LAB-4998.
+func warnDerivedOrigin(w io.Writer, targetOrigin string, hasHeaders bool) {
+	origin := sanitizeForLog(targetOrigin)
+	if hasHeaders {
+		fmt.Fprintf(w, "WARNING: --target-url not set; JS-replay derived origin %s from the capture — requests AND your --header credentials will be sent there. Pass --target-url to pin it.\n", origin) //nolint:errcheck // operator-facing warning
+		return
+	}
+	fmt.Fprintf(w, "WARNING: --target-url not set; JS-replay derived origin %s from the capture — requests will be sent there. Pass --target-url to pin it.\n", origin) //nolint:errcheck // operator-facing warning
+}
+
 // copyHeaders returns a defensive copy of h to avoid sharing the caller's
 // map across recorded ObservedRequest values.
 func copyHeaders(h map[string]string) map[string]string {
@@ -1664,19 +1680,12 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		return requests
 	}
 
-	// SEC-BE-001/SEC-BE-002 interim mitigation: when the operator did not pin
-	// --target-url, targetOrigin above was *derived* from the capture rather
-	// than explicitly chosen, so surface that fact loudly — unconditionally,
-	// not gated on Verbose — naming the derived origin and warning that
-	// requests (and any cfg.Headers credentials) will be sent there. This is
-	// on-record hardening only; the deeper redesign (making the origin
-	// explicit/required in more cases) is tracked in LAB-4998.
+	// SEC-BE-001/SEC-BE-002 interim mitigation: an empty --target-url means
+	// targetOrigin was *derived* from the capture rather than explicitly
+	// chosen, so surface that fact loudly (see warnDerivedOrigin). Deeper
+	// origin-derivation redesign is tracked in LAB-4998.
 	if cfg.TargetURL == "" {
-		if len(cfg.Headers) > 0 {
-			warnf("WARNING: --target-url not set; JS-replay derived origin %s from the capture — requests AND your --header credentials will be sent there. Pass --target-url to pin it.\n", targetOrigin)
-		} else {
-			warnf("WARNING: --target-url not set; JS-replay derived origin %s from the capture — requests will be sent there. Pass --target-url to pin it.\n", targetOrigin)
-		}
+		warnDerivedOrigin(cfg.Stderr, targetOrigin, len(cfg.Headers) > 0)
 	}
 
 	// Apply a wall-clock deadline to bound the whole step regardless of how
