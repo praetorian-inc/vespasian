@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alecthomas/kong"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
@@ -2533,6 +2534,66 @@ func TestMaybeReplayJSExtracted_GatesOnProbe(t *testing.T) {
 			t.Errorf("Probe=true: expected probed requests appended, got len=%d (input was %d)", len(got), len(requests))
 		}
 	})
+}
+
+// TestMaybeReplayJSExtracted_DefaultGateOpen pins the AC1 zero-flag default
+// (TEST-001): when --probe and --analyze-js are both left at their kong CLI
+// defaults (true), GenerateCmd.Run's JS-replay gate (c.Probe && c.AnalyzeJS)
+// is open, so maybeReplayJSExtracted must forward to crawl.ReplayJSExtracted
+// instead of short-circuiting. Modeled on
+// TestMaybeReplayJSExtracted_GatesOnProbe (same direct-call, no-capture-file,
+// no-browser shape) but derives the gate boolean from a GenerateCmd struct
+// populated with the flags' documented true defaults, rather than a bare
+// literal, so a future default flip would be caught here.
+func TestMaybeReplayJSExtracted_DefaultGateOpen(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    srv.URL + "/static/js/main.js",
+			Source: "katana",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/javascript",
+				Body:        []byte(`var u = "/api/v1/users";`),
+			},
+		},
+	}
+
+	cfg := crawl.JSReplayConfig{
+		Client:       srv.Client(),
+		TargetURL:    srv.URL,
+		AllowPrivate: true,
+	}
+
+	// Zero-flag two-stage default: parse `generate` with no flags so kong
+	// applies the `default:"true"` tags to --probe and --analyze-js, and derive
+	// the gate from the *parsed* struct rather than hardcoded literals. This is
+	// what makes the test non-tautological: a future flip of either flag's
+	// default to false makes the parsed value false, the gate closed, and this
+	// test fail.
+	var cli struct {
+		Generate GenerateCmd `cmd:"" name:"generate"`
+	}
+	p := kong.Must(&cli, kong.Name("vespasian"))
+	_, err := p.Parse([]string{"generate", "rest", "capture.json"})
+	require.NoError(t, err, "parsing generate with no flags")
+	require.True(t, cli.Generate.Probe, "--probe must default to true")
+	require.True(t, cli.Generate.AnalyzeJS, "--analyze-js must default to true")
+
+	gate := cli.Generate.Probe && cli.Generate.AnalyzeJS
+	require.True(t, gate, "gate boolean (c.Probe && c.AnalyzeJS) must be open when both flags are at their documented true defaults")
+
+	got := maybeReplayJSExtracted(context.Background(), requests, gate, cfg)
+	require.NotZero(t, hits, "with the default gate open, maybeReplayJSExtracted must forward to crawl.ReplayJSExtracted and fire outbound HTTP")
+	require.Greater(t, len(got), len(requests), "JS-replay must append the recovered endpoint to the requests slice when the default gate is open")
 }
 
 // TestGenerateSpec_ExtractsFormParametersIntoOpenAPI verifies the end-to-end promise of the

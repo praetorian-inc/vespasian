@@ -1664,6 +1664,21 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		return requests
 	}
 
+	// SEC-BE-001/SEC-BE-002 interim mitigation: when the operator did not pin
+	// --target-url, targetOrigin above was *derived* from the capture rather
+	// than explicitly chosen, so surface that fact loudly — unconditionally,
+	// not gated on Verbose — naming the derived origin and warning that
+	// requests (and any cfg.Headers credentials) will be sent there. This is
+	// on-record hardening only; the deeper redesign (making the origin
+	// explicit/required in more cases) is tracked in LAB-4998.
+	if cfg.TargetURL == "" {
+		if len(cfg.Headers) > 0 {
+			warnf("WARNING: --target-url not set; JS-replay derived origin %s from the capture — requests AND your --header credentials will be sent there. Pass --target-url to pin it.\n", targetOrigin)
+		} else {
+			warnf("WARNING: --target-url not set; JS-replay derived origin %s from the capture — requests will be sent there. Pass --target-url to pin it.\n", targetOrigin)
+		}
+	}
+
 	// Apply a wall-clock deadline to bound the whole step regardless of how
 	// many slow endpoints the JS bundle contains.
 	loopCtx, cancel := context.WithTimeout(ctx, cfg.MaxTotalTime)

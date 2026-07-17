@@ -501,20 +501,37 @@ func (c *GenerateCmd) options() pipeline.Options {
 	}
 }
 
+// resolveJSReplayConfig parses --header and validates --target-url, then
+// builds the JSReplayConfig for GenerateCmd.Run's JS-replay step. Extracted
+// from Run (QUAL-001) so the fail-fast validation (header parse + target-url
+// validation, both of which must happen before any capture file I/O) lives
+// in one cohesive function instead of inline in Run, reducing Run's length
+// and cyclomatic complexity.
+func resolveJSReplayConfig(c *GenerateCmd) (crawl.JSReplayConfig, error) {
+	// Parse --header early so an invalid header fails fast, before any file I/O.
+	// These are forwarded to the same-origin JS-replay fetches/probes below.
+	headers, err := parseHeaders(c.Header)
+	if err != nil {
+		return crawl.JSReplayConfig{}, fmt.Errorf("invalid --header: %w", err)
+	}
+
+	if err := validateTargetURL(c.TargetURL); err != nil {
+		return crawl.JSReplayConfig{}, err
+	}
+
+	return buildJSReplayConfig(headers, c.TargetURL, c.DangerousAllowPrivate, c.Verbose), nil
+}
+
 // Run executes the generate command.
 func (c *GenerateCmd) Run() (err error) {
 	if err := validateSlugThreshold(c.APIType, c.MergeSlugs, c.SlugThreshold); err != nil {
 		return err
 	}
 
-	// Parse --header early so an invalid header fails fast, before any file I/O.
-	// These are forwarded to the same-origin JS-replay fetches/probes below.
-	headers, err := parseHeaders(c.Header)
+	// Resolves --header/--target-url and fails fast (before any capture file
+	// I/O) on an invalid value, mirroring the previous inline ordering.
+	jsReplayCfg, err := resolveJSReplayConfig(c)
 	if err != nil {
-		return fmt.Errorf("invalid --header: %w", err)
-	}
-
-	if err := validateTargetURL(c.TargetURL); err != nil {
 		return err
 	}
 
@@ -575,8 +592,7 @@ func (c *GenerateCmd) Run() (err error) {
 	// --target-url can pin the replay origin; when it is empty ReplayJSExtracted
 	// derives the origin from the capture's first HTML page, so the target must
 	// still be reachable at generate time.
-	requests = maybeReplayJSExtracted(ctx, requests, c.Probe && c.AnalyzeJS,
-		jsReplayConfig(headers, c.TargetURL, c.DangerousAllowPrivate, c.Verbose))
+	requests = maybeReplayJSExtracted(ctx, requests, c.Probe && c.AnalyzeJS, jsReplayCfg)
 
 	spec, err := pipeline.ClassifyProbeGenerate(ctx, requests, c.options())
 	if err != nil {
@@ -719,7 +735,7 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	// maybeReplayJSExtracted), and is CLI-only (the SDK passes a nil AfterWSDL hook).
 	afterWSDL := func(ctx context.Context, reqs []crawl.ObservedRequest) []crawl.ObservedRequest {
 		return maybeReplayJSExtracted(ctx, reqs, c.Probe && c.AnalyzeJS,
-			jsReplayConfig(bs.opts.Headers, c.URL, c.DangerousAllowPrivate, c.Verbose))
+			buildJSReplayConfig(bs.opts.Headers, c.URL, c.DangerousAllowPrivate, c.Verbose))
 	}
 	spec, apiType, foundWSDL, _, err := pipeline.ResolveAndGenerate(genCtx, requests, c.scanOptions(apiType, afterWSDL))
 	if err != nil {
@@ -764,24 +780,27 @@ func main() {
 // validateTargetURL rejects a non-empty --target-url that is not an absolute
 // URL. A typo would otherwise silently fall back to the capture-derived origin
 // heuristic, reintroducing the wrong-origin footgun --target-url prevents.
+// Delegates the parse/scheme/host check to validateURL (QUAL-002) so the two
+// validators can't drift; this also means --target-url now requires http/https
+// like the crawl/scan target URL does.
 func validateTargetURL(raw string) error {
 	if raw == "" {
 		return nil
 	}
-	if u, err := url.Parse(raw); err != nil || u.Scheme == "" || u.Host == "" {
+	if err := validateURL(raw); err != nil {
 		return fmt.Errorf("invalid --target-url %q: want an absolute URL like https://host[:port]", raw)
 	}
 	return nil
 }
 
-// jsReplayConfig builds the JSReplayConfig shared by GenerateCmd.Run and
+// buildJSReplayConfig builds the JSReplayConfig shared by GenerateCmd.Run and
 // ScanCmd.Run's afterWSDL hook. Both construct the identical config for the same
 // post-crawl JS-replay step, so centralizing it keeps the two sites in lockstep
 // (header forwarding, SSRF opt-out, verbosity, and the stderr sink). The callers
 // differ only in where the origin comes from: generate passes --target-url (may
 // be empty, in which case ReplayJSExtracted derives it from the capture's first
 // HTML page), scan passes the crawl's seed URL.
-func jsReplayConfig(headers map[string]string, targetURL string, allowPrivate, verbose bool) crawl.JSReplayConfig {
+func buildJSReplayConfig(headers map[string]string, targetURL string, allowPrivate, verbose bool) crawl.JSReplayConfig {
 	return crawl.JSReplayConfig{
 		Headers:      headers,
 		TargetURL:    targetURL,
