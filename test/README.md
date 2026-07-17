@@ -262,7 +262,7 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 All 26 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest). The sample below is a default `--group all` run (19 offline + 7 live targets); the config-only `grpc-server` target runs additionally only when `TARGETS_SETUP` is configured.
 
-```
+```text
   TARGET                      STATUS    ENDPOINTS   EXPECTED   DURATION
   --------------------------  --------  ----------  ---------  --------
   classifier-edge             PASS      -           -          0s
