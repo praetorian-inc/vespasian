@@ -3015,3 +3015,92 @@ func TestWarnDerivedOrigin(t *testing.T) {
 		require.NotContains(t, buf.String(), "\r\n", "control bytes must be escaped, not emitted raw")
 	})
 }
+
+// TestFirstHTMLOrigin_NoHTMLReturnsEmpty pins firstHTMLOrigin's empty-return
+// branch: a capture with no HTML response (by content type or body sniff) must
+// yield "", which is what forces ReplayJSExtracted's origin derivation to fall
+// through to its first-non-empty-URL fallback (see
+// TestReplayJSExtracted_NoHTMLFallsBackToFirstURL).
+func TestFirstHTMLOrigin_NoHTMLReturnsEmpty(t *testing.T) {
+	requests := []ObservedRequest{
+		{
+			URL:      "http://cdn.example.test/app.js",
+			Response: ObservedResponse{ContentType: "application/javascript", Body: []byte(`var x = 1;`)},
+		},
+		{
+			URL:      "http://api.example.test/v1/items",
+			Response: ObservedResponse{ContentType: "application/json", Body: []byte(`{"ok":true}`)},
+		},
+	}
+	assert.Equal(t, "", firstHTMLOrigin(requests),
+		"a capture with no HTML response must return no origin so ReplayJSExtracted falls back to the first-non-empty URL")
+}
+
+// TestReplayJSExtracted_NoHTMLFallsBackToFirstURL pins the final arm of
+// ReplayJSExtracted's origin-derivation chain (explicit TargetURL ->
+// firstHTMLOrigin -> first-non-empty request URL). When no TargetURL is given
+// AND the capture has NO HTML response, firstHTMLOrigin returns "" and the
+// origin must fall back to the first non-empty request URL. This path is
+// reachable for an imported pure-API capture (HAR/Burp with no HTML page) fed
+// to two-stage generate. The capture below is a JS bundle followed by a JSON
+// response (no HTML); recovering the concat-only endpoint — which is relative
+// and probed against the derived origin — proves replay bound to the first
+// request's origin via the fallback.
+func TestReplayJSExtracted_NoHTMLFallsBackToFirstURL(t *testing.T) {
+	const appJS = `function loadOrders(uid) { return fetch("/api/users/".concat(uid, "/orders")); }`
+
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/users/0/orders":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"orders":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer app.Close()
+
+	requests := []ObservedRequest{
+		// FIRST entry: a JS bundle (inline body) at the app origin. With no HTML
+		// in the capture, firstHTMLOrigin returns "" and this entry's origin is
+		// chosen by the first-non-empty-URL fallback.
+		{
+			Method: "GET",
+			URL:    app.URL + "/app.js",
+			Source: "burp",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/javascript",
+				Body:        []byte(appJS),
+			},
+		},
+		// A plain JSON API response — makes this a realistic pure-API capture
+		// and confirms no HTML is present to derive an origin from.
+		{
+			Method: "GET",
+			URL:    app.URL + "/api/existing",
+			Source: "burp",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Body:        []byte(`{"ok":true}`),
+			},
+		},
+	}
+
+	// No TargetURL: force origin derivation through the no-HTML fallback.
+	cfg := JSReplayConfig{
+		Client:       app.Client(),
+		AllowPrivate: true,
+	}
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	var apiURLs []string
+	for _, r := range result {
+		if r.Source == "js-extract" {
+			apiURLs = append(apiURLs, r.URL)
+		}
+	}
+	assert.Contains(t, apiURLs, app.URL+"/api/users/0/orders",
+		"with no HTML response and no TargetURL, replay must bind to the first non-empty request's origin (the JS bundle's)")
+}

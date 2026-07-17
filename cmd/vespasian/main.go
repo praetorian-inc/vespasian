@@ -788,7 +788,7 @@ func validateTargetURL(raw string) error {
 		return nil
 	}
 	if err := validateURL(raw); err != nil {
-		return fmt.Errorf("invalid --target-url %q: want an absolute URL like https://host[:port]", raw)
+		return fmt.Errorf("invalid --target-url %q: %w", raw, err)
 	}
 	return nil
 }
