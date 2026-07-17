@@ -2993,11 +2993,16 @@ func TestGenerateCmdRun_JSReplayGatedOnProbe(t *testing.T) {
 
 	t.Run("probe_false_skips", func(t *testing.T) {
 		spec := runGenerate(t, false, true)
+		// Positive anchor: the spec must still be a well-formed OpenAPI
+		// document, so NotContains below can't pass vacuously on a degenerate
+		// or empty spec produced by an unrelated generation failure.
+		require.Contains(t, spec, "openapi:", "gate-closed generation must still emit a valid OpenAPI spec")
 		require.NotContains(t, spec, "/orders", "with --probe=false, JS-replay must not run and the concat-reconstructed path must be absent")
 	})
 
 	t.Run("analyze_false_skips", func(t *testing.T) {
 		spec := runGenerate(t, true, false)
+		require.Contains(t, spec, "openapi:", "gate-closed generation must still emit a valid OpenAPI spec")
 		require.NotContains(t, spec, "/orders", "with --analyze-js=false, JS-replay must not run (gate is c.Probe && c.AnalyzeJS) and the concat-reconstructed path must be absent")
 	})
 }

@@ -503,7 +503,7 @@ func (c *GenerateCmd) options() pipeline.Options {
 
 // resolveJSReplayConfig parses --header and validates --target-url, then
 // builds the JSReplayConfig for GenerateCmd.Run's JS-replay step. Extracted
-// from Run (QUAL-001) so the fail-fast validation (header parse + target-url
+// from Run so the fail-fast validation (header parse + target-url
 // validation, both of which must happen before any capture file I/O) lives
 // in one cohesive function instead of inline in Run, reducing Run's length
 // and cyclomatic complexity.
@@ -780,7 +780,7 @@ func main() {
 // validateTargetURL rejects a non-empty --target-url that is not an absolute
 // URL. A typo would otherwise silently fall back to the capture-derived origin
 // heuristic, reintroducing the wrong-origin footgun --target-url prevents.
-// Delegates the parse/scheme/host check to validateURL (QUAL-002) so the two
+// Delegates the parse/scheme/host check to validateURL so the two
 // validators can't drift; this also means --target-url now requires http/https
 // like the crawl/scan target URL does.
 func validateTargetURL(raw string) error {
