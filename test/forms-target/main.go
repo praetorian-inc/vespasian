@@ -43,8 +43,10 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"time"
 )
 
 func main() {
@@ -85,9 +87,16 @@ func main() {
 		fmt.Fprint(w, `{"results":[],"query":""}`) //nolint:errcheck // test target best-effort
 	})
 
-	addr := ":" + port
-	log.Printf("forms-target listening on http://localhost%s/", addr)   //nolint:gosec // G706: local test target; port is a controlled PORT env/default, not attacker input
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 0} //nolint:gosec // local test target, no timeout needed
+	// Bind loopback by default. The devcontainer flow (a crawler inside a
+	// container reaching this host via TEST_HOST=host.docker.internal) needs a
+	// wider bind; setup-live-targets.sh opts into that explicitly via BIND_HOST.
+	host := os.Getenv("BIND_HOST")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	addr := net.JoinHostPort(host, port)
+	log.Printf("forms-target listening on http://%s/", addr) //nolint:gosec // G706: host/port come from controlled BIND_HOST/PORT env vars for a local test target, not attacker input
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}

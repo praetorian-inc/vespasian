@@ -431,7 +431,10 @@ start_forms_target() {
     local port=$1
     log_info "Starting forms-target on port ${port}..."
     cd "${SCRIPT_DIR}/forms-target"
-    PORT="$port" ./forms-target &
+    # forms-target binds loopback by default; bind all interfaces so a
+    # devcontainer crawler (TEST_HOST=host.docker.internal) can reach the host.
+    # Override with FORMS_TARGET_BIND_HOST=127.0.0.1 for host-only local runs.
+    PORT="$port" BIND_HOST="${FORMS_TARGET_BIND_HOST:-0.0.0.0}" ./forms-target &
     local pid=$!
     record_pid forms-target "$pid"
 
