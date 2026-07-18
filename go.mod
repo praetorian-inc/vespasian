@@ -6,7 +6,7 @@ require (
 	github.com/BishopFox/jsluice v0.0.0-20240110145140-0ddfab153e06
 	github.com/PuerkitoBio/goquery v1.12.0
 	github.com/alecthomas/kong v1.15.0
-	github.com/getkin/kin-openapi v0.141.0
+	github.com/getkin/kin-openapi v0.142.0
 	github.com/go-rod/rod v0.116.2
 	github.com/jhump/protoreflect v1.18.0
 	github.com/praetorian-inc/capability-sdk v0.0.0-20260521173605-4b0d5a7320ae
