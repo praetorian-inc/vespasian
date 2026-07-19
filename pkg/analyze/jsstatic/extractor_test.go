@@ -578,3 +578,65 @@ func TestExtractFromBundle_AxiosDeleteWithDataBody(t *testing.T) {
 		t.Errorf("BodyFields = %v, want [reason]", ep.BodyFields)
 	}
 }
+
+// LAB-4992: the fully-offline analyzer must reconstruct API paths that exist
+// only as JS string concatenations — String.prototype.concat, +-string chains,
+// and literal+literal service-prefix concatenation — which jsluice's AST
+// analysis cannot resolve. These flow through the shared crawl extractor
+// (crawl.ExtractStaticConcatPaths) so the offline static path recovers the same
+// forms as the active JS-replay path. Non-literal operands become the numeric
+// sentinel "0" (parameterized later by pkg/generate/rest).
+func TestExtractFromBundle_ConcatReconstruction(t *testing.T) {
+	// Mirrors test/concat-spa/app.js plus a literal+literal service prefix.
+	src := []byte(`
+function loadOrders(uid)  { return fetch("/api/users/".concat(uid, "/orders")); }
+function loadReviews(pid) { var u = "/api/products/" + pid + "/reviews"; return fetch(u); }
+var LOGIN = "identity/" + "api/auth/login";
+`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Each form must reconstruct its concrete candidate path.
+	for _, want := range []string{
+		"/api/users/0/orders",      // String.prototype.concat form
+		"/api/products/0/reviews",  // +-string chain form
+		"/identity/api/auth/login", // literal+literal service-prefix form
+	} {
+		ep := findEndpoint(endpoints, want)
+		if ep == nil {
+			t.Errorf("expected reconstructed endpoint %q, got: %v", want, endpoints)
+			continue
+		}
+		if ep.Method != "GET" {
+			t.Errorf("%s: Method = %q, want GET (bare path carries no method)", want, ep.Method)
+		}
+		if ep.SourceTag != SourceJS {
+			t.Errorf("%s: SourceTag = %q, want %q", want, ep.SourceTag, SourceJS)
+		}
+	}
+}
+
+// LAB-4992 dedup guard: a concat reconstruction whose URL collides with a URL
+// jsluice already recovered (with a real method) must NOT gain a phantom GET
+// companion. Here axios.post gives jsluice POST /api/users/5, and the literal
+// +-chain "/api/users/" + "5" reconstructs to the SAME /api/users/5 — so the
+// astURLs guard must suppress the GET candidate. (Deleting the guard makes this
+// test fail with a phantom [POST GET].)
+func TestExtractFromBundle_ConcatNoPhantomForKnownURL(t *testing.T) {
+	src := []byte(`axios.post("/api/users/5", {a}); var u = "/api/users/" + "5";`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var methods []string
+	for _, ep := range endpoints {
+		if ep.URL == "/api/users/5" {
+			methods = append(methods, ep.Method)
+		}
+	}
+	if len(methods) != 1 || methods[0] != "POST" {
+		t.Errorf("expected exactly [POST] for /api/users/5 (no phantom GET), got %v", methods)
+	}
+}

@@ -95,6 +95,11 @@
 //     by default) and uses [github.com/praetorian-inc/vespasian/pkg/ssrf]
 //     for SSRF protection unless the operator explicitly opts out via
 //     AllowPrivate.
+//   - [ExtractStaticConcatPaths] is the network-free subset of the concat /
+//     service-prefix reconstruction, shared with pkg/analyze/jsstatic (LAB-4992)
+//     so the fully-offline static analyzer reconstructs these forms identically
+//     to the active replay path. It performs no probing and no speculative
+//     service-prefix fan-out (which is only safe when 404-filtered by probing).
 //
 // Session-cookie helpers (LAB-2222) let callers bootstrap Chrome's cookie
 // store from a user-supplied Cookie header so subsequent navigations are

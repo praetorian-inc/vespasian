@@ -21,7 +21,7 @@
 // appended (Source = "static:js" or "static:js-sourcemap").
 //
 // The analyser is a thin wrapper over BishopFox/jsluice's tree-sitter URL
-// matchers, with two extensions over the upstream library:
+// matchers, with three extensions over the upstream library:
 //
 //   - "EXPR" placeholders in URL paths are normalised to OpenAPI {param}
 //     form using the names of the original template-literal identifiers when
@@ -31,6 +31,17 @@
 //     captured as body parameter names. They are emitted as a synthesized
 //     JSON body ({"a": null, "b": null}) so the existing
 //     pkg/generate/rest.InferSchema produces an object schema downstream.
+//   - Paths built by JS string concatenation that jsluice's AST analysis
+//     cannot resolve — String.prototype.concat, "+"-operator chains, and
+//     literal service-prefix "+"-concatenation — are reconstructed via the
+//     shared crawl.ExtractStaticConcatPaths extractor (LAB-4992), with a numeric
+//     sentinel ("0") substituted for non-literal operands so the REST normalizer
+//     can parameterize them (e.g. /api/users/0/orders -> /api/users/{userId}/orders).
+//     This makes fully-offline `generate` recover concat/service-prefix SPA
+//     endpoints without a reachable target — the same forms the active,
+//     network-bound crawl.ReplayJSExtracted path probes. Emitted as GET
+//     candidates (a bare path carries no method) and deduped against the URLs
+//     the AST walkers already recovered so no phantom-GET companions appear.
 //
 // # Source tagging
 //

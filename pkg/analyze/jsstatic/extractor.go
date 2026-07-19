@@ -19,6 +19,8 @@ import (
 	"strings"
 
 	"github.com/BishopFox/jsluice"
+
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
 // assetExtensions are file-like URL suffixes that indicate non-API resources.
@@ -627,6 +629,7 @@ func ExtractFromBundle(jsSource []byte, baseURL string) ([]ExtractedEndpoint, er
 			fetchURLsWithMethod[strings.TrimSpace(u.URL)] = true
 		}
 	}
+	astURLs := make(map[string]bool)
 	for _, u := range jsluiceURLs {
 		ep, ok := jsluiceURLToEndpoint(u, baseURL, fetchBodyFields, seen, fetchURLsWithMethod)
 		if !ok {
@@ -634,11 +637,68 @@ func ExtractFromBundle(jsSource []byte, baseURL string) ([]ExtractedEndpoint, er
 		}
 		endpoints = append(endpoints, ep)
 	}
+	// Record every URL the AST walkers emitted, method-agnostic, so step 5 can
+	// suppress phantom endpoints for URLs already recovered with a known method.
+	for _, ep := range endpoints {
+		astURLs[ep.URL] = true
+	}
+
+	// 5. Reconstruct concat / +-chain / service-prefix paths that jsluice's AST
+	//    analysis cannot resolve (LAB-4992). Shares crawl's extractor so the
+	//    fully-offline static path recovers the same forms as the active
+	//    JS-replay path. Non-literal concat operands arrive as the numeric
+	//    sentinel "0" (e.g. /api/users/0/orders); pkg/generate/rest turns those
+	//    numeric segments into named params downstream.
+	endpoints = append(endpoints, extractConcatEndpoints(jsSource, baseURL, seen, astURLs)...)
 
 	if len(endpoints) == 0 {
 		return nil, nil
 	}
 	return endpoints, nil
+}
+
+// extractConcatEndpoints reconstructs concat / +-chain / service-prefix API
+// paths from the raw bundle bytes via crawl.ExtractStaticConcatPaths and
+// converts each surviving path into a GET ExtractedEndpoint. A bare path string
+// carries no HTTP method, so these candidates default to GET.
+//
+// crawl returns raw reconstructions, so relative paths get a leading slash here
+// before filtering (mirroring addPath in the active crawl path). Two dedup
+// guards keep this additive rather than noisy:
+//   - astURLs: skip any path the AST walkers already emitted for ANY method, so
+//     a concat reconstruction that collides with a jsluice-recovered URL does
+//     not synthesize a phantom GET companion (mirrors the method-less fetch
+//     guard in jsluiceURLToEndpoint).
+//   - seen: skip exact (GET, url) duplicates and register survivors.
+func extractConcatEndpoints(jsSource []byte, baseURL string, seen map[endpointKey]bool, astURLs map[string]bool) []ExtractedEndpoint {
+	var endpoints []ExtractedEndpoint
+	for _, raw := range crawl.ExtractStaticConcatPaths(jsSource) {
+		p := strings.TrimSpace(raw)
+		if p == "" {
+			continue
+		}
+		// Relative reconstructions arrive without a leading slash (e.g.
+		// "identity/api/auth/login"); normalize so they resolve as
+		// document-root paths rather than bundle-relative ones.
+		if !strings.HasPrefix(p, "http://") && !strings.HasPrefix(p, "https://") && !strings.HasPrefix(p, "/") {
+			p = "/" + p
+		}
+		if filterURL(p) || isExprOnly(p) || astURLs[p] {
+			continue
+		}
+		k := endpointKey{"GET", p}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		endpoints = append(endpoints, ExtractedEndpoint{
+			Method:       "GET",
+			URL:          p,
+			SourceTag:    SourceJS,
+			OriginBundle: baseURL,
+		})
+	}
+	return endpoints
 }
 
 // jsluiceURLToEndpoint converts a single jsluice.URL into an ExtractedEndpoint,

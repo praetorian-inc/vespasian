@@ -1071,33 +1071,8 @@ func extractConcatPaths(jsBody []byte) []string { //nolint:gocyclo // emit() sta
 		if len(paths) >= maxConcatPathsPerBundle {
 			return
 		}
-		// Collapse `//` runs introduced by literal+literal concatenations
-		// where the head literal ends in `/` and the next literal begins
-		// with `/` (e.g. `"/api/posts/" + "/comment"` → `"/api/posts//comment"`).
-		// addPath downstream only trims leading/trailing slashes, not
-		// internal runs, and the REST normalizer treats `//{id}` as a
-		// distinct (malformed) path segment.
-		//
-		// Preserve the `://` scheme separator in full URLs: collapse only
-		// the path-side of the URL (or the whole string if no scheme is
-		// present). Looping until stable handles rare ≥3-slash runs.
-		if scheme, rest, hasScheme := strings.Cut(p, "://"); hasScheme {
-			for strings.Contains(rest, "//") {
-				rest = strings.ReplaceAll(rest, "//", "/")
-			}
-			p = scheme + "://" + rest
-		} else {
-			for strings.Contains(p, "//") {
-				p = strings.ReplaceAll(p, "//", "/")
-			}
-		}
-		if p == "" || !hasAPIIndicator(p) {
-			return
-		}
-		if strings.ContainsAny(p, " \t\r\n") {
-			return
-		}
-		if seen[p] {
+		p = cleanConcatPath(p)
+		if p == "" || seen[p] {
 			return
 		}
 		seen[p] = true
@@ -1625,6 +1600,115 @@ func extractAPIPaths(jsBody []byte, requests []ObservedRequest) []string { //nol
 	}
 
 	return paths
+}
+
+// cleanConcatPath collapses `//` runs in a reconstructed concat path (preserving
+// a `://` scheme separator) and rejects the path — returning "" — when it is
+// empty, carries no API indicator, or contains whitespace. Shared by
+// extractConcatPaths' emit() and servicePrefixPlusPaths so both concat
+// reconstruction forms filter and canonicalize identically.
+//
+// `//` runs arise from literal+literal concatenations where the head literal
+// ends in `/` and the next literal begins with `/` (e.g. `"/api/posts/" +
+// "/comment"`). The REST normalizer treats `//{id}` as a distinct (malformed)
+// segment, so collapsing here keeps reconstructed paths well-formed. Looping
+// until stable handles rare >=3-slash runs.
+func cleanConcatPath(p string) string {
+	if scheme, rest, hasScheme := strings.Cut(p, "://"); hasScheme {
+		for strings.Contains(rest, "//") {
+			rest = strings.ReplaceAll(rest, "//", "/")
+		}
+		p = scheme + "://" + rest
+	} else {
+		for strings.Contains(p, "//") {
+			p = strings.ReplaceAll(p, "//", "/")
+		}
+	}
+	if p == "" || !hasAPIIndicator(p) {
+		return ""
+	}
+	if strings.ContainsAny(p, " \t\r\n") {
+		return ""
+	}
+	return p
+}
+
+// servicePrefixPlusHeadPattern matches the head of a `+`-concat chain whose
+// first operand is a quoted service-prefix literal — a short slash-terminated
+// segment that does NOT itself have to contain an API indicator (e.g.
+// "identity/", "svc/"). It is the service-prefix analog of
+// concatPlusHeadPattern, which requires the head to contain an API indicator
+// and therefore misses the literal+literal service-prefix form
+// `"identity/" + "api/auth/login"`.
+//
+// The head must start with a letter (no leading slash) so this pattern does not
+// re-match the leading-slash heads already handled by concatPlusHeadPattern.
+// cleanConcatPath's hasAPIIndicator post-filter drops any assembled chain that
+// never reaches an API path, so a bare `"assets/" + x` produces nothing.
+var servicePrefixPlusHeadPattern = regexp.MustCompile(
+	`["']([a-zA-Z][a-zA-Z0-9_-]{1,30}/)["']\s*\+`,
+)
+
+// servicePrefixPlusPaths reconstructs concrete `+`-concat chains whose head is a
+// service-prefix literal (`"identity/" + "api/auth/login"` -> identity/api/auth/login,
+// `"identity/" + id + "/api/x"` -> identity/0/api/x). It reuses parsePlusChain
+// for the tail walk (same numeric sentinel for non-literal operands) and
+// cleanConcatPath for the API-indicator filter, so it reconstructs identically
+// to the other concat forms. Bounded by maxConcatPathsPerBundle.
+func servicePrefixPlusPaths(jsBody []byte) []string {
+	var paths []string
+	seen := make(map[string]bool)
+	for _, match := range servicePrefixPlusHeadPattern.FindAllSubmatchIndex(jsBody, -1) {
+		if len(paths) >= maxConcatPathsPerBundle {
+			break
+		}
+		if len(match) < 4 || match[2] < 0 {
+			continue
+		}
+		head := string(jsBody[match[2]:match[3]])
+		suffix := parsePlusChain(jsBody, match[1])
+		p := cleanConcatPath(head + suffix)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		paths = append(paths, p)
+	}
+	return paths
+}
+
+// ExtractStaticConcatPaths reconstructs API paths built by JS string
+// concatenation from a single JS bundle body, using only network-free logic:
+// String.prototype.concat, `+`-operator chains, and literal service-prefix
+// `+`-concatenation. Non-literal operands are replaced with the numeric sentinel
+// ("0") so the reconstructed path stays parameterizable by the REST normalizer.
+//
+// It is the offline-safe entry point shared with pkg/analyze/jsstatic (LAB-4992)
+// so the fully-offline static analyzer reconstructs concat / service-prefix SPA
+// endpoints identically to the active ReplayJSExtracted path — which additionally
+// re-fetches the bundles and probes the reconstructed paths. Unlike the active
+// extractAPIPaths, it deliberately does NOT perform speculative service-prefix
+// fan-out (combining a discovered prefix with every bare path): those
+// combinations are only safe when probed and 404-filtered, which the offline
+// path cannot do. Returns raw reconstructions (deduped); the caller adds the
+// leading slash and resolves relative paths.
+func ExtractStaticConcatPaths(jsBody []byte) []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(p string) {
+		if p == "" || seen[p] {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	for _, p := range extractConcatPaths(jsBody) {
+		add(p)
+	}
+	for _, p := range servicePrefixPlusPaths(jsBody) {
+		add(p)
+	}
+	return out
 }
 
 // --- Main pipeline ---

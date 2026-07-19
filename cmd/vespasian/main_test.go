@@ -3198,9 +3198,14 @@ func TestGenerateCmdRun_ForwardsHeaderToJSReplay(t *testing.T) {
 func TestGenerateCmdRun_TargetURLOverridesOrigin(t *testing.T) {
 	const appJS = `function loadOrders(uid) { return fetch("/api/users/".concat(uid, "/orders")); }`
 
+	// probeHits counts active JS-replay probes that actually reach the real
+	// server, so the tests can observe WHERE --target-url sends the probe
+	// independently of whether the endpoint reaches the spec.
+	var probeHits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/users/0/orders":
+			atomic.AddInt32(&probeHits, 1)
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"orders":[]}`))
 		default:
@@ -3209,9 +3214,12 @@ func TestGenerateCmdRun_TargetURLOverridesOrigin(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// The bundle is captured inline at a bogus origin, so replay processes its
-	// body without fetching. The extracted /api/users/0/orders is RELATIVE and
-	// gets probed against the derived origin — bogus by default, srv via override.
+	// The bundle is captured inline at a bogus origin. The concat endpoint
+	// /api/users/0/orders exists ONLY as a JS string concatenation, so:
+	//   - the fully-offline static analyzer (--analyze-js) reconstructs it as a
+	//     candidate regardless of origin reachability (LAB-4992), and
+	//   - the active JS-replay probe is sent to the derived origin (bogus by
+	//     default, srv when --target-url pins it).
 	requests := []crawl.ObservedRequest{
 		{
 			Method: "GET",
@@ -3233,6 +3241,7 @@ func TestGenerateCmdRun_TargetURLOverridesOrigin(t *testing.T) {
 
 	runGenerate := func(t *testing.T, targetURL string) string {
 		t.Helper()
+		atomic.StoreInt32(&probeHits, 0)
 		outputPath := filepath.Join(t.TempDir(), "spec.yaml")
 		cmd := &GenerateCmd{
 			APIType:               "rest",
@@ -3250,18 +3259,27 @@ func TestGenerateCmdRun_TargetURLOverridesOrigin(t *testing.T) {
 		return string(specBytes)
 	}
 
-	t.Run("without_target_url_probes_wrong_origin", func(t *testing.T) {
+	// LAB-4992: without --target-url the derived origin is unreachable, so the
+	// active probe never reaches the real server — yet the concat endpoint is
+	// still recovered offline as a static candidate (the capture-once /
+	// generate-many guarantee). The probe going to the bogus origin (not srv) is
+	// what --target-url exists to fix.
+	t.Run("without_target_url_recovers_offline_probes_wrong_origin", func(t *testing.T) {
 		spec := runGenerate(t, "")
-		require.NotContains(t, spec, "/orders",
-			"without --target-url the endpoint is probed against the capture's bogus origin and must not be recovered")
+		require.Contains(t, spec, "/api/users/{userId}/orders",
+			"LAB-4992: concat endpoint must be recovered offline as a static candidate even when the origin is unreachable")
+		require.Zero(t, atomic.LoadInt32(&probeHits),
+			"without --target-url the active probe must target the capture's bogus origin, not the real server")
 	})
 
-	t.Run("with_target_url_recovers", func(t *testing.T) {
+	// --target-url pins the reachable origin, so the active JS-replay probe is
+	// sent there (probeHits > 0) in addition to the offline static recovery.
+	t.Run("with_target_url_pins_probe_origin", func(t *testing.T) {
 		spec := runGenerate(t, srv.URL)
-		require.Contains(t, spec, "/api/users/",
-			"--target-url must pin the reachable origin so the concat endpoint is probed there and recovered")
-		require.Contains(t, spec, "/orders",
-			"--target-url must pin the reachable origin so the concat endpoint reaches the spec")
+		require.Contains(t, spec, "/api/users/{userId}/orders",
+			"--target-url must still surface the concat endpoint")
+		require.NotZero(t, atomic.LoadInt32(&probeHits),
+			"--target-url must pin the reachable origin so the concat endpoint is actively probed there")
 	})
 }
 

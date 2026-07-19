@@ -3104,3 +3104,62 @@ func TestReplayJSExtracted_NoHTMLFallsBackToFirstURL(t *testing.T) {
 	assert.Contains(t, apiURLs, app.URL+"/api/users/0/orders",
 		"with no HTML response and no TargetURL, replay must bind to the first non-empty request's origin (the JS bundle's)")
 }
+
+// TestExtractStaticConcatPaths pins the network-free concat / +-chain /
+// service-prefix reconstruction shared with pkg/analyze/jsstatic (LAB-4992).
+// It must reconstruct the same concrete forms extractConcatPaths does, PLUS the
+// literal service-prefix `+`-form that extractConcatPaths misses (its +-head
+// anchor requires an API indicator), and must NOT do speculative service-prefix
+// fan-out (only safe when 404-filtered by probing). Non-literal operands become
+// the numeric sentinel "0".
+func TestExtractStaticConcatPaths(t *testing.T) {
+	tests := []struct {
+		name string
+		js   string
+		want []string
+	}{
+		{
+			name: "concat method form",
+			js:   `fetch("/api/users/".concat(uid, "/orders"));`,
+			want: []string{"/api/users/0/orders"},
+		},
+		{
+			name: "plus chain form",
+			js:   `var u = "/api/products/" + pid + "/reviews";`,
+			want: []string{"/api/products/0/reviews"},
+		},
+		{
+			name: "literal service-prefix plus form",
+			js:   `var l = "identity/" + "api/auth/login";`,
+			want: []string{"identity/api/auth/login"},
+		},
+		{
+			name: "service-prefix plus with dynamic middle operand",
+			js:   `var u = "identity/" + id + "/api/orders";`,
+			want: []string{"identity/0/api/orders"},
+		},
+		{
+			name: "service-prefix head without API indicator dropped",
+			js:   `var u = "assets/" + name + "/logo";`,
+			want: nil,
+		},
+		{
+			name: "no concatenation present",
+			js:   `fetch("/api/v2/users");`,
+			want: nil,
+		},
+		{
+			name: "dedup across forms and repeats",
+			js:   `"identity/"+"api/x"; "identity/"+"api/x"; fetch("/api/p/".concat(id));`,
+			want: []string{"/api/p/0", "identity/api/x"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractStaticConcatPaths([]byte(tt.js))
+			sort.Strings(got)
+			sort.Strings(tt.want)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}

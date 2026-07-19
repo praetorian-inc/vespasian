@@ -795,3 +795,37 @@ func TestAnalyze_SinglePassOversizedCount(t *testing.T) {
 		t.Errorf("expected at least 3 requests, got %d", len(res.Requests))
 	}
 }
+
+// LAB-4992 end-to-end: a fully-offline capture whose API endpoints exist ONLY
+// as JS-bundle concatenations must surface those endpoints as synthesized
+// candidate requests. Analyze performs no network I/O for concat reconstruction
+// (it operates on the captured bundle body), so this proves the offline
+// "capture once, generate many" path recovers concat SPA endpoints.
+func TestAnalyze_OfflineConcatReconstruction(t *testing.T) {
+	appJS := `
+function loadOrders(uid)  { return fetch("/api/users/".concat(uid, "/orders")); }
+function loadReviews(pid) { var u = "/api/products/" + pid + "/reviews"; return fetch(u); }
+`
+	captured := []crawl.ObservedRequest{makeJSCapture("https://shop.example.com/app.js", appJS)}
+
+	res, err := Analyze(context.Background(), captured, Options{})
+	if err != nil {
+		t.Fatalf("Analyze error: %v", err)
+	}
+
+	// Collect synthesized (static:js) request URLs.
+	got := map[string]bool{}
+	for _, req := range res.Requests {
+		if req.Source == SourceJS {
+			got[req.URL] = true
+		}
+	}
+	for _, want := range []string{
+		"https://shop.example.com/api/users/0/orders",
+		"https://shop.example.com/api/products/0/reviews",
+	} {
+		if !got[want] {
+			t.Errorf("expected offline-reconstructed candidate %q; got %v", want, got)
+		}
+	}
+}
