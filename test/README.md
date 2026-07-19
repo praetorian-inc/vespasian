@@ -299,7 +299,7 @@ All 27 tests should pass. Order is non-deterministic and durations vary by machi
   soap-service                PASS      3           3          51s
   spec-edge                   PASS      -           -          0s
 
-  Total: 26 passed, 0 failed, 0 skipped
+  Total: 27 passed, 0 failed, 0 skipped
 ```
 
 Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are informational and do not cause failures.
