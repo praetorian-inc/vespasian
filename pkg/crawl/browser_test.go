@@ -71,6 +71,10 @@ func TestConfigureLauncher(t *testing.T) {
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
+				// Pin a fake system browser so these cases assert sandbox flags
+				// without depending on a Chrome being installed on the host
+				// (e.g. arm64 dev machines); pinning is covered separately below.
+				stubLookPath(t, "/usr/bin/chromium", true)
 				t.Setenv("VESPASIAN_NO_SANDBOX", tt.envVal)
 				l, err := configureLauncher(BrowserOptions{NoSandbox: tt.noSandbox})
 				if err != nil {
@@ -86,6 +90,7 @@ func TestConfigureLauncher(t *testing.T) {
 
 	t.Run("proxy", func(t *testing.T) {
 		t.Run("valid proxy sets flag", func(t *testing.T) {
+			stubLookPath(t, "/usr/bin/chromium", true)
 			l, err := configureLauncher(BrowserOptions{Proxy: "http://127.0.0.1:8080"})
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)

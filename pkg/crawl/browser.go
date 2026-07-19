@@ -83,16 +83,22 @@ func configureLauncher(opts BrowserOptions) (*launcher.Launcher, error) {
 	if opts.NoSandbox || os.Getenv("VESPASIAN_NO_SANDBOX") == "true" {
 		l = l.NoSandbox(true)
 	}
-	if err := pinBrowserBinary(l, opts); err != nil {
-		return nil, err
-	}
-	disableChromeTelemetry(l)
+	// Validate the proxy before resolving the browser binary. Proxy validation
+	// is a deterministic check on caller input; pinning depends on what is
+	// installed on the host. Ordering validation first keeps error behavior
+	// host-independent — a bad proxy is always reported as a proxy error, even
+	// on a machine without a system Chrome — instead of masking it behind a
+	// "no system browser" error (LAB-4999 review feedback).
 	if opts.Proxy != "" {
 		if err := ValidateProxyAddr(opts.Proxy); err != nil {
 			return nil, err
 		}
 		l = l.Set("proxy-server", opts.Proxy)
 	}
+	if err := pinBrowserBinary(l, opts); err != nil {
+		return nil, err
+	}
+	disableChromeTelemetry(l)
 
 	return l, nil
 }
