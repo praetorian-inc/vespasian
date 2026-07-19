@@ -17,6 +17,8 @@ package crawl
 import (
 	"strings"
 	"testing"
+
+	"github.com/go-rod/rod/lib/launcher"
 )
 
 // TEST-001 regression: SetCookies on a BrowserManager whose browser field
@@ -54,11 +56,23 @@ func TestBrowserManager_SetCookies_NilReceiverReturnsError(t *testing.T) {
 
 func TestConfigureLauncher(t *testing.T) {
 	t.Run("sandbox", func(t *testing.T) {
+		// go-rod's launcher.New() adds --no-sandbox by default when it
+		// detects a container (launcher sets defaultFlags[NoSandbox] when
+		// inContainer), so l.Has("no-sandbox") reflects that default in
+		// Docker/dev-containers regardless of Vespasian's own logic. Assert
+		// on Vespasian's *contribution* relative to this baseline instead of
+		// the absolute flag: the flag must be present whenever
+		// configureLauncher opts in, and otherwise must match the launcher
+		// default (Vespasian must not add it on its own). This stays
+		// deterministic on CI's VM runner (no container -> baseline absent)
+		// and in dev-containers (baseline present) for both uid 0 and uid != 0.
+		baselineNoSandbox := launcher.New().Has("no-sandbox")
+
 		tests := []struct {
-			name      string
-			noSandbox bool
-			envVal    string
-			wantFlag  bool
+			name        string
+			noSandbox   bool
+			envVal      string
+			vespasianOn bool // whether configureLauncher itself enables no-sandbox
 		}{
 			{"explicit NoSandbox", true, "", true},
 			{"explicit NoSandbox with env", true, "true", true},
@@ -74,9 +88,12 @@ func TestConfigureLauncher(t *testing.T) {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
+				// Vespasian forcing the flag on is authoritative; when it does
+				// not, the flag should equal the launcher's baseline default.
+				want := tt.vespasianOn || baselineNoSandbox
 				got := l.Has("no-sandbox")
-				if got != tt.wantFlag {
-					t.Errorf("Has(no-sandbox) = %v, want %v", got, tt.wantFlag)
+				if got != want {
+					t.Errorf("Has(no-sandbox) = %v, want %v (vespasianOn=%v, baseline=%v)", got, want, tt.vespasianOn, baselineNoSandbox)
 				}
 			})
 		}
