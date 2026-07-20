@@ -831,3 +831,37 @@ function loadReviews(pid) { var u = "/api/products/" + pid + "/reviews"; return 
 		}
 	}
 }
+
+// LAB-4992 / SEC-BE-001: a concat reconstruction recovered from a SOURCEMAP
+// source must keep the distinct SourceJSConcat tag — the sourcemap override loop
+// (analyzeOne) must preserve it rather than force SourceSourcemap. Pins the
+// sourcemap branch of the tag-preservation guard (the bundle-body branch is
+// pinned by TestAnalyze_OfflineConcatReconstruction).
+func TestAnalyze_SourcemapConcatKeepsConcatSource(t *testing.T) {
+	srcContent := `var u = "/api/sm-users/" + id + "/orders"; fetch(u);`
+	smDoc := fmt.Sprintf(`{"sources":["src/index.js"],"sourcesContent":[%s]}`,
+		func() string { b, _ := json.Marshal(srcContent); return string(b) }())
+	encoded := base64.StdEncoding.EncodeToString([]byte(smDoc))
+	dataURI := "data:application/json;base64," + encoded
+	// Bundle body itself has no concat — the concat lives only in the sourcemap
+	// source, so a hit proves the sourcemap path produced it.
+	bundleBody := `fetch("/api/from-bundle")` + "\n//# sourceMappingURL=" + dataURI + "\n"
+
+	captured := []crawl.ObservedRequest{makeJSCapture("https://h/app.js", bundleBody)}
+	res, err := Analyze(context.Background(), captured, Options{})
+	if err != nil {
+		t.Fatalf("Analyze error: %v", err)
+	}
+	var src string
+	for _, req := range res.Requests {
+		if req.URL == "https://h/api/sm-users/0/orders" {
+			src = req.Source
+		}
+	}
+	if src == "" {
+		t.Fatalf("sourcemap concat candidate https://h/api/sm-users/0/orders not recovered; got %v", res.Requests)
+	}
+	if src != SourceJSConcat {
+		t.Errorf("sourcemap concat candidate Source = %q, want %q (must not be forced to SourceSourcemap)", src, SourceJSConcat)
+	}
+}

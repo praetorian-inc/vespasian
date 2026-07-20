@@ -710,3 +710,42 @@ func TestExtractFromBundle_ConcatConcreteSegmentNotOverMerged(t *testing.T) {
 		t.Errorf("concrete concat path /api/items/5 was over-merged/suppressed; must survive alongside the param path; got %v", endpoints)
 	}
 }
+
+// LAB-4992 dedup guard, absolute-vs-relative same-origin case: an AST walker
+// recovers a FULL same-origin URL (fetch("https://example.com/api/v1/webhook"))
+// while the +-chain reconstructs the same path relatively ("/api/v1/" +
+// "webhook"). concatDedupKey strips scheme+host and origin-scopes the key to the
+// bundle host, so the relative concat candidate collapses onto the absolute AST
+// URL and its phantom GET companion is suppressed.
+func TestExtractFromBundle_ConcatNoPhantomForSameOriginAbsoluteURL(t *testing.T) {
+	src := []byte(`fetch("https://example.com/api/v1/webhook"); var u = "/api/v1/" + "webhook"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/v1/webhook"); ep != nil {
+		t.Errorf("phantom relative concat companion /api/v1/webhook emitted alongside same-origin absolute AST URL; got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "https://example.com/api/v1/webhook"); ep == nil {
+		t.Errorf("expected AST-recovered absolute https://example.com/api/v1/webhook, got %v", endpoints)
+	}
+}
+
+// LAB-4992 dedup guard, cross-host case (regression from the origin-scoping fix):
+// an AST-recovered absolute URL to a DIFFERENT host must NOT suppress a
+// same-origin concat candidate that merely shares its path — they are genuinely
+// distinct endpoints. Here axios.post targets beacon.other.com/api/track while
+// the concat reconstructs same-origin /api/track; both must survive.
+func TestExtractFromBundle_ConcatCrossHostNotSuppressed(t *testing.T) {
+	src := []byte(`axios.post("https://beacon.other.com/api/track", {a}); var u = "/api/" + "track"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/track"); ep == nil {
+		t.Errorf("same-origin concat /api/track was wrongly suppressed by a cross-host AST URL sharing the path; got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "https://beacon.other.com/api/track"); ep == nil {
+		t.Errorf("expected cross-host AST POST https://beacon.other.com/api/track, got %v", endpoints)
+	}
+}
