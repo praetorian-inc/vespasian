@@ -1082,7 +1082,9 @@ test_forms_target() {
     # Step 1: Crawl — both backends (http and rod), mirroring rest-api. The http
     # backend (headless=false) is the capture used for spec generation; forms are
     # static HTML so the http body is all analyze.ExtractForms needs. The rod
-    # backend is a parity check that degrades gracefully without Chrome.
+    # backend is a crash/reachability smoke check only (asserts at least 1
+    # request captured, not form-extraction parity) and degrades gracefully
+    # without Chrome.
     for hl in false true; do
         local cap="${target_dir}/capture-${hl}.json"
         if [ "$hl" = "true" ]; then
