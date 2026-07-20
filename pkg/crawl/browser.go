@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/go-rod/rod"
@@ -144,6 +145,12 @@ func pinBrowserBinary(l *launcher.Launcher, opts BrowserOptions) error {
 // endpoints — including dynamically-sharded *.gvt1.com hosts that make a CI
 // egress allowlist brittle. These flags suppress that chatter without affecting
 // the crawl.
+//
+// Tradeoff: --disable-component-update also stops in-crawl CRLSet and
+// Safe-Browsing list refreshes, so Chrome relies on the build-time CRLSet for
+// the crawl's duration. Accepted for short-lived, operator-initiated crawls —
+// full TLS chain verification against the OS trust store and the SSRF/scope
+// guards remain in force (LAB-4999).
 func disableChromeTelemetry(l *launcher.Launcher) {
 	l.Set("disable-component-update")
 	l.Set("disable-domain-reliability")
@@ -244,14 +251,14 @@ func ValidateProxyAddr(addr string) error {
 	if err != nil {
 		return fmt.Errorf("invalid proxy address: %w", err)
 	}
-	// Check credentials first — later error messages include the address,
-	// so we must reject (and redact) credentials before reaching them.
-	if u.User != nil {
-		// Redact credentials manually — u.Redacted() preserves the username
-		// and shows the password as "xxxxx", but we want both fully masked
-		// so neither leaks into logs, CI output, or terminal scrollback.
-		u.User = url.UserPassword("xxxxx", "xxxxx")
-		return fmt.Errorf("invalid proxy address %q: embedded credentials are not supported (they would be visible in process listing); configure authentication in your proxy instead", u.String())
+	// Check credentials first — later error messages echo the address, so we
+	// must reject (and redact) credentials before reaching them. url.Parse only
+	// populates u.User when a scheme is present (http://user:pass@host); a
+	// scheme-less "user:pass@host" leaves u.User nil and would otherwise fall
+	// through to the scheme error below, which prints the raw address and leaks
+	// the password. redactProxyUserinfo catches both forms from the raw string.
+	if redacted, ok := redactProxyUserinfo(addr); ok {
+		return fmt.Errorf("invalid proxy address %q: embedded credentials are not supported (they would be visible in process listing); configure authentication in your proxy instead", redacted)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "socks5" {
 		return fmt.Errorf("invalid proxy address %q: scheme must be http, https, or socks5", addr)
@@ -260,4 +267,27 @@ func ValidateProxyAddr(addr string) error {
 		return fmt.Errorf("invalid proxy address %q: missing host", addr)
 	}
 	return nil
+}
+
+// redactProxyUserinfo replaces any embedded userinfo (user:pass@) in a proxy
+// address with a fixed placeholder and reports whether any was present. It
+// handles both scheme-qualified (http://user:pass@host) and scheme-less
+// (user:pass@host) forms — url.Parse only exposes u.User for the former, so a
+// raw-string scan is needed to keep credentials out of error messages for the
+// latter. Only the authority (after an optional "scheme://", up to the first
+// "/") is inspected, so an "@" in a path or query is not misread as credentials.
+func redactProxyUserinfo(addr string) (string, bool) {
+	rest, prefix := addr, ""
+	if i := strings.Index(rest, "://"); i >= 0 {
+		prefix, rest = rest[:i+3], rest[i+3:]
+	}
+	authEnd := len(rest)
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		authEnd = i
+	}
+	at := strings.LastIndexByte(rest[:authEnd], '@')
+	if at < 0 {
+		return addr, false
+	}
+	return prefix + "xxxxx:xxxxx@" + rest[at+1:], true
 }

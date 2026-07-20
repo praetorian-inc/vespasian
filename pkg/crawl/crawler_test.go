@@ -101,6 +101,7 @@ func TestValidateProxyAddr(t *testing.T) {
 		{"empty host", "http://", true, "missing host"},
 		{"embedded credentials", "http://user:pass@127.0.0.1:8080", true, "embedded credentials"},
 		{"embedded user only", "http://user@127.0.0.1:8080", true, "embedded credentials"},
+		{"scheme-less credentials", "user:pass@127.0.0.1:8080", true, "embedded credentials"},
 	}
 
 	for _, tt := range tests {
@@ -126,6 +127,7 @@ func TestValidateProxyAddr(t *testing.T) {
 		{"http with creds", "http://admin:s3cret@proxy:8080"},
 		{"wrong scheme with creds", "ftp://admin:s3cret@proxy:21"},
 		{"user only", "http://admin@proxy:8080"},
+		{"scheme-less creds", "admin:s3cret@127.0.0.1:8080"},
 	}
 	for _, tt := range credentialLeakCases {
 		t.Run("redacted/"+tt.name, func(t *testing.T) {
