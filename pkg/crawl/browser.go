@@ -75,8 +75,20 @@ type BrowserManager struct {
 }
 
 // configureLauncher applies BrowserOptions to a new launcher without
-// launching Chrome. Disables the sandbox when opts.NoSandbox is set or
-// when the VESPASIAN_NO_SANDBOX env var is "true" (set by CI workflows).
+// launching Chrome. In order, it:
+//
+//  1. Disables the sandbox when opts.NoSandbox is set or when the
+//     VESPASIAN_NO_SANDBOX env var is "true" (set by CI workflows).
+//  2. Validates opts.Proxy (when set) via ValidateProxyAddr before touching
+//     the browser binary, so a bad proxy is always reported as a proxy error
+//     independent of what Chrome is installed on the host.
+//  3. Pins the browser binary via pinBrowserBinary, which returns a "no system
+//     Chrome/Chromium found" error when no browser is resolvable — unless
+//     downloads are opted in via opts.AllowBrowserDownload or
+//     VESPASIAN_ALLOW_BROWSER_DOWNLOAD=true (Finding 1, LAB-4999). This is a
+//     new failure mode unrelated to the sandbox.
+//  4. Applies telemetry/phone-home-disabling launch flags via
+//     disableChromeTelemetry (Finding 2, LAB-4999).
 func configureLauncher(opts BrowserOptions) (*launcher.Launcher, error) {
 	l := launcher.New().
 		Headless(opts.Headless)

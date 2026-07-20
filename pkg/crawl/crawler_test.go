@@ -111,6 +111,7 @@ func TestValidateProxyAddr(t *testing.T) {
 		{"at in path rejected", "http://127.0.0.1:8080/callback@handler", true, "embedded credentials"},
 		{"creds with slash in password", "http://user:pa/ss@127.0.0.1:8080", true, "embedded credentials"},
 		{"creds with question in password", "http://user:pa?ss@127.0.0.1:8080", true, "embedded credentials"},
+		{"creds with hash in password", "http://user:pa#ss@127.0.0.1:8080", true, "embedded credentials"},
 	}
 
 	for _, tt := range tests {
