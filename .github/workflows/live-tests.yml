@@ -23,6 +23,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      # Defense-in-depth (LAB-4732 / SEC-BE-002): monitor and record all
+      # outbound network traffic. Audit mode is non-blocking — it logs egress
+      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
+      # 'block' with an allowed-endpoints list once telemetry confirms the set.
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           persist-credentials: false
@@ -63,6 +73,18 @@ jobs:
     env:
       VESPASIAN_NO_SANDBOX: "true"
     steps:
+      # Defense-in-depth (LAB-4732 / SEC-BE-002): monitor and record all
+      # outbound network traffic. Audit mode is non-blocking — it logs egress
+      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
+      # 'block' with an allowed-endpoints list once telemetry confirms the set
+      # (expected: github.com, proxy.golang.org, sum.golang.org,
+      # storage.googleapis.com, objects.githubusercontent.com, registry.npmjs.org).
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           persist-credentials: false

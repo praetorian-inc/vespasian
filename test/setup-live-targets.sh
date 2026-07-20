@@ -904,7 +904,13 @@ main() {
     fi
 
     # ── Write config ──
-    write_config "${REST_API_PORT:-}" "${SOAP_SERVICE_PORT:-}" "${GRAPHQL_SERVER_PORT:-}" "${GRPC_SERVER_PORT:-}" "${CONCAT_SPA_PORT:-}" "${FORMS_TARGET_PORT:-}" "$targets"
+    # concat-spa-two-stage is a TEST (crawl+generate) that REUSES the concat-spa
+    # SERVER/port — it is intentionally NOT a build/start target (not in the case
+    # blocks above), so the concat-spa binary stays single-instance. We only
+    # append it to the RUN-LIST written to TARGETS_SETUP, right after concat-spa,
+    # so a no-arg run-live-tests.sh exercises the two-stage flow too (LAB-3892).
+    local run_targets="${targets/concat-spa/concat-spa,concat-spa-two-stage}"
+    write_config "${REST_API_PORT:-}" "${SOAP_SERVICE_PORT:-}" "${GRAPHQL_SERVER_PORT:-}" "${GRPC_SERVER_PORT:-}" "${CONCAT_SPA_PORT:-}" "${FORMS_TARGET_PORT:-}" "$run_targets"
 
     log_header "Setup Complete"
     # Emit the run guidance (full vs partial setup) via the shared, testable

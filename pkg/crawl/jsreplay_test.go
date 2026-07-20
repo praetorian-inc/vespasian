@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -2830,4 +2831,276 @@ func TestExtractServicePrefixes_Strategy3_TotalBundleCapRespectsPriorStrategies(
 				"Strategy 3 must add nothing once Strategies 1+2 saturate the cap; got %q", p)
 		}
 	})
+}
+
+// TestReplayJSExtracted_PrefersHTMLPageOrigin pins the LAB-3892 review fix (R2):
+// when no explicit TargetURL is given, the replay origin must be derived from
+// the first request whose RESPONSE is HTML (the real app page), not from an
+// arbitrary first capture entry. Mixed-origin / imported captures (HAR/Burp)
+// can list a third-party asset (CDN font, analytics beacon) as their first
+// entry; binding to that origin would leave the app's same-origin bundle
+// cross-origin and skip it entirely. The capture below puts a cross-origin,
+// non-HTML asset FIRST and the HTML app page SECOND. Recovering the concat-only
+// endpoint (which lives in the app's app.js and is probed against the derived
+// origin) proves the replay bound to the app page's origin, not the asset's.
+func TestReplayJSExtracted_PrefersHTMLPageOrigin(t *testing.T) {
+	const appJS = `function loadOrders(uid) { return fetch("/api/users/".concat(uid, "/orders")); }`
+
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(appJS))
+		case "/api/users/0/orders":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"orders":[]}`))
+		default:
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<!DOCTYPE html><html><head><script src="app.js"></script></head></html>`))
+		}
+	}))
+	defer app.Close()
+
+	requests := []ObservedRequest{
+		// FIRST entry: a cross-origin, non-HTML asset (a CDN image). Under the
+		// old "first non-empty URL" rule this origin would have been chosen,
+		// making the app's app.js cross-origin and unreachable.
+		{
+			Method: "GET",
+			URL:    "http://cdn.example.invalid/logo.png",
+			Source: "burp",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "image/png",
+				Body:        []byte("\x89PNG\r\n"),
+			},
+		},
+		// SECOND entry: the real HTML app page referencing app.js.
+		{
+			Method: "GET",
+			URL:    app.URL + "/",
+			Source: "burp",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<!DOCTYPE html><html><head><script src="app.js"></script></head></html>`),
+			},
+		},
+	}
+
+	// No TargetURL: force origin derivation. AllowPrivate so the loopback app
+	// server is probeable; Client from the app server so its TLS/transport is used.
+	cfg := JSReplayConfig{
+		Client:       app.Client(),
+		AllowPrivate: true,
+	}
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	var apiURLs []string
+	for _, r := range result {
+		if r.Source == "js-extract" {
+			apiURLs = append(apiURLs, r.URL)
+		}
+	}
+	assert.Contains(t, apiURLs, app.URL+"/api/users/0/orders",
+		"replay must bind to the first HTML page's origin (the app), not the first non-HTML asset's origin")
+}
+
+// TestReplayJSExtracted_DetectsHTMLByBodySniff pins the body-sniff arm of
+// firstHTMLOrigin: the app page below has NO Content-Type header at all, so
+// isHTMLResponse cannot recognize it as HTML. The ONLY way firstHTMLOrigin can
+// still identify it as the app page is looksLikeHTML sniffing the body's
+// "<!DOCTYPE html>" prefix. If that arm were missing (or broken), the replay
+// would fall through to the first entry's origin (the cross-origin CDN asset)
+// and the app's same-origin app.js would never be fetched, so the
+// reconstructed endpoint below would never be recovered.
+func TestReplayJSExtracted_DetectsHTMLByBodySniff(t *testing.T) {
+	const appJS = `function loadOrders(uid) { return fetch("/api/users/".concat(uid, "/orders")); }`
+
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(appJS))
+		case "/api/users/0/orders":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"orders":[]}`))
+		default:
+			// Unused by this test: the captured page response below is
+			// supplied inline (not re-fetched from the server), kept only
+			// for symmetry with the mirror test's server.
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<!DOCTYPE html><html><head><script src="app.js"></script></head></html>`))
+		}
+	}))
+	defer app.Close()
+
+	requests := []ObservedRequest{
+		// FIRST entry: a cross-origin, non-HTML asset. If the body-sniff arm
+		// of firstHTMLOrigin were missing, replay would bind here instead of
+		// the app's origin.
+		{
+			Method: "GET",
+			URL:    "http://cdn.example.invalid/logo.png",
+			Source: "burp",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "image/png",
+				Body:        []byte("\x89PNG\r\n"),
+			},
+		},
+		// SECOND entry: the real app page, recognizable as HTML ONLY by
+		// sniffing its body — ContentType is deliberately empty so
+		// isHTMLResponse returns false and looksLikeHTML is the sole path
+		// that can identify this as the HTML app page.
+		{
+			Method: "GET",
+			URL:    app.URL + "/",
+			Source: "burp",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "",
+				Body:        []byte(`<!DOCTYPE html><html><head><script src="app.js"></script></head></html>`),
+			},
+		},
+	}
+
+	// No TargetURL: force origin derivation. AllowPrivate so the loopback app
+	// server is probeable; Client from the app server so its TLS/transport is used.
+	cfg := JSReplayConfig{
+		Client:       app.Client(),
+		AllowPrivate: true,
+	}
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	var apiURLs []string
+	for _, r := range result {
+		if r.Source == "js-extract" {
+			apiURLs = append(apiURLs, r.URL)
+		}
+	}
+	assert.Contains(t, apiURLs, app.URL+"/api/users/0/orders",
+		"replay must bind to the app page's origin via body-sniff HTML detection (empty Content-Type), not the first non-HTML asset's origin")
+}
+
+// TestWarnDerivedOrigin covers the SEC-BE-001/SEC-BE-002 interim mitigation
+// warning emitted by ReplayJSExtracted when --target-url is unset. It asserts
+// both branches (with/without credential headers), that the derived origin is
+// run through sanitizeForLog, and that no header VALUES are ever printed.
+func TestWarnDerivedOrigin(t *testing.T) {
+	const origin = "https://evil.example.com"
+	quoted := strconv.Quote(origin) // what sanitizeForLog(origin) produces
+
+	t.Run("no headers: names sanitized origin, no credential warning", func(t *testing.T) {
+		var buf bytes.Buffer
+		warnDerivedOrigin(&buf, origin, false)
+		out := buf.String()
+		require.Contains(t, out, "--target-url not set")
+		require.Contains(t, out, quoted, "origin must pass through sanitizeForLog (strconv.Quote)")
+		require.Contains(t, out, "requests will be sent there")
+		require.NotContains(t, out, "credentials", "with no headers, the credential warning must not appear")
+	})
+
+	t.Run("with headers: warns credentials will be forwarded", func(t *testing.T) {
+		var buf bytes.Buffer
+		warnDerivedOrigin(&buf, origin, true)
+		out := buf.String()
+		require.Contains(t, out, quoted)
+		require.Contains(t, out, "--header credentials will be sent there")
+	})
+
+	t.Run("sanitizeForLog neutralizes control bytes in the origin", func(t *testing.T) {
+		var buf bytes.Buffer
+		warnDerivedOrigin(&buf, "https://evil\r\nInjected: x", false)
+		require.NotContains(t, buf.String(), "\r\n", "control bytes must be escaped, not emitted raw")
+	})
+}
+
+// TestFirstHTMLOrigin_NoHTMLReturnsEmpty pins firstHTMLOrigin's empty-return
+// branch: a capture with no HTML response (by content type or body sniff) must
+// yield "", which is what forces ReplayJSExtracted's origin derivation to fall
+// through to its first-non-empty-URL fallback (see
+// TestReplayJSExtracted_NoHTMLFallsBackToFirstURL).
+func TestFirstHTMLOrigin_NoHTMLReturnsEmpty(t *testing.T) {
+	requests := []ObservedRequest{
+		{
+			URL:      "http://cdn.example.test/app.js",
+			Response: ObservedResponse{ContentType: "application/javascript", Body: []byte(`var x = 1;`)},
+		},
+		{
+			URL:      "http://api.example.test/v1/items",
+			Response: ObservedResponse{ContentType: "application/json", Body: []byte(`{"ok":true}`)},
+		},
+	}
+	assert.Equal(t, "", firstHTMLOrigin(requests),
+		"a capture with no HTML response must return no origin so ReplayJSExtracted falls back to the first-non-empty URL")
+}
+
+// TestReplayJSExtracted_NoHTMLFallsBackToFirstURL pins the final arm of
+// ReplayJSExtracted's origin-derivation chain (explicit TargetURL ->
+// firstHTMLOrigin -> first-non-empty request URL). When no TargetURL is given
+// AND the capture has NO HTML response, firstHTMLOrigin returns "" and the
+// origin must fall back to the first non-empty request URL. This path is
+// reachable for an imported pure-API capture (HAR/Burp with no HTML page) fed
+// to two-stage generate. The capture below is a JS bundle followed by a JSON
+// response (no HTML); recovering the concat-only endpoint — which is relative
+// and probed against the derived origin — proves replay bound to the first
+// request's origin via the fallback.
+func TestReplayJSExtracted_NoHTMLFallsBackToFirstURL(t *testing.T) {
+	const appJS = `function loadOrders(uid) { return fetch("/api/users/".concat(uid, "/orders")); }`
+
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/users/0/orders":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"orders":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer app.Close()
+
+	requests := []ObservedRequest{
+		// FIRST entry: a JS bundle (inline body) at the app origin. With no HTML
+		// in the capture, firstHTMLOrigin returns "" and this entry's origin is
+		// chosen by the first-non-empty-URL fallback.
+		{
+			Method: "GET",
+			URL:    app.URL + "/app.js",
+			Source: "burp",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/javascript",
+				Body:        []byte(appJS),
+			},
+		},
+		// A plain JSON API response — makes this a realistic pure-API capture
+		// and confirms no HTML is present to derive an origin from.
+		{
+			Method: "GET",
+			URL:    app.URL + "/api/existing",
+			Source: "burp",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Body:        []byte(`{"ok":true}`),
+			},
+		},
+	}
+
+	// No TargetURL: force origin derivation through the no-HTML fallback.
+	cfg := JSReplayConfig{
+		Client:       app.Client(),
+		AllowPrivate: true,
+	}
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	var apiURLs []string
+	for _, r := range result {
+		if r.Source == "js-extract" {
+			apiURLs = append(apiURLs, r.URL)
+		}
+	}
+	assert.Contains(t, apiURLs, app.URL+"/api/users/0/orders",
+		"with no HTML response and no TargetURL, replay must bind to the first non-empty request's origin (the JS bundle's)")
 }

@@ -69,6 +69,7 @@ LIVE_TARGETS=(
     soap-service
     graphql-server
     concat-spa
+    concat-spa-two-stage
     edge-cases
     crawl-depth
     forms-target
@@ -212,7 +213,7 @@ preflight_test_host() {
                 fi
             fi
             ;;
-        *,concat-spa,*)
+        *,concat-spa,*|*,concat-spa-two-stage,*)
             _probe_target_host "${CONCAT_SPA_PORT:-}" "/healthz" "concat-spa" || failed=1
             ;;
     esac
@@ -413,6 +414,58 @@ test_rest_api() {
     fi
 }
 
+# validate_concat_spec runs the shared concat-spa validation battery against a
+# generated spec. It is called identically by test_concat_spa (single-stage
+# scan) and test_concat_spa_two_stage (two-stage crawl+generate) so the two
+# tests stay directly comparable while the battery lives in one place
+# (LAB-3892 review, TEST-001). The four checks + exact-count assertion are
+# preserved exactly; see test_concat_spa for what each layer proves.
+#
+# It follows the existing resolve_port_or_die convention of returning multiple
+# values via caller-read globals rather than set_test_result itself, so each
+# test keeps its own PASS/FAIL reporting:
+#   VALIDATE_CONCAT_FAILURES        number of failed checks
+#   VALIDATE_CONCAT_ENDPOINT_COUNT  paths found in the spec
+#   VALIDATE_CONCAT_EXPECTED_COUNT  expected total_paths from the fixture
+# Args: $1 test_name (for the exact-count message), $2 spec_file, $3 expected_json
+validate_concat_spec() {
+    local test_name=$1
+    local spec_file=$2
+    local expected=$3
+    local failures=0
+
+    if ! validate_openapi_structure "$spec_file"; then
+        failures=$((failures + 1))
+    fi
+    if ! validate_path_coverage "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+    if ! validate_no_static_assets "$spec_file"; then
+        failures=$((failures + 1))
+    fi
+    # /api/users and /api/products are EXACT (bare receiver literals that must
+    # not survive); /api/missing/ is a SUBTREE (the 404 control endpoint).
+    if ! validate_paths_absent "$spec_file" "/api/users" "/api/products" "/api/missing/"; then
+        failures=$((failures + 1))
+    fi
+
+    local endpoint_count
+    endpoint_count=$(count_spec_endpoints "$spec_file")
+    local expected_count
+    expected_count=$(json_field "$expected" total_paths)
+
+    # Exact-count: any path beyond the two concat endpoints means a receiver
+    # literal or the control leaked through the 404 filter.
+    if [ "$endpoint_count" != "$expected_count" ]; then
+        log_fail "${test_name}: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
+        failures=$((failures + 1))
+    fi
+
+    VALIDATE_CONCAT_FAILURES=$failures
+    VALIDATE_CONCAT_ENDPOINT_COUNT=$endpoint_count
+    VALIDATE_CONCAT_EXPECTED_COUNT=$expected_count
+}
+
 test_concat_spa() {
     local port="${CONCAT_SPA_PORT:-8993}"
     local base_url="http://${TEST_HOST}:${port}"
@@ -471,32 +524,10 @@ test_concat_spa() {
     # mutation test TestReplayJSExtracted_ConcatStyle_EndToEnd. This live
     # target proves the integrated binary + Chrome-crawl pipeline discovers
     # them end-to-end.
-    if ! validate_openapi_structure "$spec_file"; then
-        failures=$((failures + 1))
-    fi
-    if ! validate_path_coverage "$spec_file" "$expected"; then
-        failures=$((failures + 1))
-    fi
-    if ! validate_no_static_assets "$spec_file"; then
-        failures=$((failures + 1))
-    fi
-    # /api/users and /api/products are EXACT (bare receiver literals that must
-    # not survive); /api/missing/ is a SUBTREE (the 404 control endpoint).
-    if ! validate_paths_absent "$spec_file" "/api/users" "/api/products" "/api/missing/"; then
-        failures=$((failures + 1))
-    fi
-
-    local endpoint_count
-    endpoint_count=$(count_spec_endpoints "$spec_file")
-    local expected_count
-    expected_count=$(json_field "$expected" total_paths)
-
-    # Exact-count: any path beyond the two concat endpoints means a receiver
-    # literal or the control leaked through the 404 filter.
-    if [ "$endpoint_count" != "$expected_count" ]; then
-        log_fail "concat-spa: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
-        failures=$((failures + 1))
-    fi
+    validate_concat_spec "concat-spa" "$spec_file" "$expected"
+    failures=$VALIDATE_CONCAT_FAILURES
+    local endpoint_count=$VALIDATE_CONCAT_ENDPOINT_COUNT
+    local expected_count=$VALIDATE_CONCAT_EXPECTED_COUNT
 
     local duration=$((SECONDS - start))
     if [ $failures -eq 0 ]; then
@@ -508,16 +539,80 @@ test_concat_spa() {
     fi
 }
 
-# assert_form_query_params verifies the GET <form>'s query parameters were
-# extracted and merged onto /api/search's GET operation SPECIFICALLY - not
-# merely present somewhere in the spec. It reads form_query_params_path +
-# form_query_params from expected-paths.json and asserts each expected parameter
-# is an `in: query` parameter under that path's GET operation, pairing name/in
-# per parameter item. This closes the false-pass gap of the previous whole-file
-# `grep "name: <p>"`: a parameter that leaked onto a different path/operation, a
-# same-named schema property elsewhere, or an unanchored substring match (e.g.
-# single-char `q` matching `username: q`) no longer satisfies the check.
-# Usage: assert_form_query_params <spec.yaml> <expected-paths.json>
+# test_concat_spa_two_stage is the LAB-3892 counterpart to test_concat_spa: it
+# drives the two-stage `crawl` + `generate` workflow instead of the
+# single-stage `scan` test_concat_spa uses. `crawl` stays passive (it only
+# captures the index page referencing app.js and never runs JS-replay);
+# `generate`'s post-crawl JS-replay step (crawl.ReplayJSExtracted, gated on
+# --probe && --analyze-js, both default true) re-fetches app.js from the
+# capture's recorded origin and reconstructs/probes the concat endpoints.
+# This proves the two-stage workflow now recovers the same SPA-only endpoints
+# `scan` always could, closing the gap LAB-3892 fixed. Uses the same target
+# server, expected-paths fixture, and validation battery as test_concat_spa,
+# so the two tests can be compared directly; test_concat_spa itself is left
+# unmodified.
+test_concat_spa_two_stage() {
+    local port="${CONCAT_SPA_PORT:-8993}"
+    local base_url="http://${TEST_HOST}:${port}"
+    local target_dir="${RESULTS_DIR}/concat-spa-two-stage"
+    local capture_file="${target_dir}/capture.json"
+    local spec_file="${target_dir}/spec.yaml"
+    local expected="${SCRIPT_DIR}/concat-spa/expected-paths.json"
+    local verbose_flag=""
+
+    [ "${VERBOSE:-false}" = true ] && verbose_flag="-v"
+
+    mkdir -p "$target_dir"
+    init_test_status "concat-spa-two-stage"
+
+    local start=$SECONDS
+    local failures=0
+
+    log_header "Testing: concat-spa-two-stage (${base_url})"
+
+    # Step 1: Crawl — passive capture only, no JS-replay runs here.
+    log_info "Crawling ${base_url} (passive capture only)..."
+    if ! "$VESPASIAN" crawl "$base_url" \
+        -o "$capture_file" \
+        --depth 2 \
+        --max-pages 50 \
+        --timeout 2m \
+        --dangerous-allow-private \
+        $verbose_flag 2>&1; then
+        log_fail "Crawl failed"
+        set_test_result "concat-spa-two-stage" "FAIL" "?" "?" "$((SECONDS - start))"
+        return 1
+    fi
+
+    # Step 2: Generate — default --probe/--analyze-js recover the concat
+    # endpoints via the JS-replay step this ticket added to `generate`.
+    log_info "Generating OpenAPI spec (crawl+generate, default --probe/--analyze-js)..."
+    if ! "$VESPASIAN" generate rest "$capture_file" \
+        -o "$spec_file" \
+        --dangerous-allow-private \
+        $verbose_flag 2>&1; then
+        log_fail "Generate failed"
+        set_test_result "concat-spa-two-stage" "FAIL" "?" "?" "$((SECONDS - start))"
+        return 1
+    fi
+
+    # Step 3: Validate spec — same battery as test_concat_spa (see its
+    # comments for what each layer proves).
+    validate_concat_spec "concat-spa-two-stage" "$spec_file" "$expected"
+    failures=$VALIDATE_CONCAT_FAILURES
+    local endpoint_count=$VALIDATE_CONCAT_ENDPOINT_COUNT
+    local expected_count=$VALIDATE_CONCAT_EXPECTED_COUNT
+
+    local duration=$((SECONDS - start))
+    if [ $failures -eq 0 ]; then
+        set_test_result "concat-spa-two-stage" "PASS" "$endpoint_count" "$expected_count" "$duration"
+        log_ok "concat-spa-two-stage: ALL CHECKS PASSED (${duration}s)"
+    else
+        set_test_result "concat-spa-two-stage" "FAIL" "$endpoint_count" "$expected_count" "$duration"
+        log_fail "concat-spa-two-stage: ${failures} check(s) failed (${duration}s)"
+    fi
+}
+
 assert_form_query_params() {
     local spec=$1 expected=$2
     local result rc=0
@@ -1116,6 +1211,7 @@ test_forms_target() {
         log_fail "forms-target: ${failures} check(s) failed (${duration}s)"
     fi
 }
+
 
 test_soap_service() {
     local port="${SOAP_SERVICE_PORT:-8991}"
@@ -3440,7 +3536,8 @@ usage() {
     echo "  --group <name>        Run a predefined target group: offline, live, or all (default: all)"
     echo "  --targets <list>      Comma-separated targets to test (overrides --group)"
     echo "                        Valid targets:"
-    echo "                          Service:    rest-api, soap-service, graphql-server, concat-spa"
+    echo "                          Service:    rest-api, soap-service, graphql-server, concat-spa,"
+    echo "                                      concat-spa-two-stage"
     echo "                          Config:     grpc-server (included via TARGETS_SETUP when set up)"
     echo "                          Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,"
     echo "                                      generate-graphql, generate-graphql-imports,"
@@ -3570,6 +3667,7 @@ main() {
             graphql-server)  test_graphql_server ;;
             grpc-server)     test_grpc_server ;;
             concat-spa)      test_concat_spa ;;
+            concat-spa-two-stage) test_concat_spa_two_stage ;;
             forms-target)    test_forms_target ;;
             import-burp)        test_import_burp ;;
             import-har)         test_import_har ;;
