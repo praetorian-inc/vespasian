@@ -84,10 +84,23 @@ func TestConfigureLauncher(t *testing.T) {
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				t.Setenv("VESPASIAN_NO_SANDBOX", tt.envVal)
+
+				// Assert Vespasian's own opt-in decision directly via the pure
+				// helper. Unlike the launcher-baseline check below, this does not
+				// observe go-rod's container default, so it stays deterministic in
+				// every environment: the negative cases still catch a regression
+				// that unconditionally enables the sandbox flag, even in
+				// dev-containers where launcher.New() adds --no-sandbox by default
+				// (LAB-4994).
+				if got := vespasianEnablesNoSandbox(BrowserOptions{NoSandbox: tt.noSandbox}); got != tt.vespasianOn {
+					t.Errorf("vespasianEnablesNoSandbox = %v, want %v", got, tt.vespasianOn)
+				}
+
 				l, err := configureLauncher(BrowserOptions{NoSandbox: tt.noSandbox})
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
+				// Launcher-baseline check, retained for go-rod compatibility:
 				// Vespasian forcing the flag on is authoritative; when it does
 				// not, the flag should equal the launcher's baseline default.
 				want := tt.vespasianOn || baselineNoSandbox
