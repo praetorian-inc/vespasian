@@ -103,11 +103,14 @@ func TestValidateProxyAddr(t *testing.T) {
 		{"embedded user only", "http://user@127.0.0.1:8080", true, "embedded credentials"},
 		{"scheme-less credentials", "user:pass@127.0.0.1:8080", true, "embedded credentials"},
 		{"ipv6 with credentials", "http://user:pass@[::1]:8080", true, "embedded credentials"},
-		// @ outside the authority (path/query/fragment) must NOT be read as
-		// credentials — pins redactProxyUserinfo's authority boundary.
-		{"at in path not credentials", "http://127.0.0.1:8080/oauth/callback@handler", false, ""},
-		{"at in query not credentials", "http://127.0.0.1:8080?next=user@host", false, ""},
 		{"ipv6 host no credentials", "http://[::1]:8080", false, ""},
+		// A proxy address has no legitimate userinfo, so ANY '@' is rejected as
+		// embedded credentials — including forms where the userinfo contains a
+		// '/', '?' or '#' that a boundary-limited scan would miss (and that also
+		// make the URL unparseable, so a parse-error echo could leak the secret).
+		{"at in path rejected", "http://127.0.0.1:8080/callback@handler", true, "embedded credentials"},
+		{"creds with slash in password", "http://user:pa/ss@127.0.0.1:8080", true, "embedded credentials"},
+		{"creds with question in password", "http://user:pa?ss@127.0.0.1:8080", true, "embedded credentials"},
 	}
 
 	for _, tt := range tests {
@@ -137,6 +140,10 @@ func TestValidateProxyAddr(t *testing.T) {
 		// Credentials must be scrubbed even when the address also fails
 		// url.Parse (bad port) — the credential check runs before parsing.
 		{"bad port with creds", "http://admin:s3cret@127.0.0.1:8o80"},
+		// ...and when the password contains a '/' or '?' that would shift an
+		// RFC-authority boundary and re-leak through the parse/scheme error.
+		{"slash in password", "http://admin:s3cret/x@proxy:8080"},
+		{"question in password", "http://admin:s3cret?x@proxy:8080"},
 	}
 	for _, tt := range credentialLeakCases {
 		t.Run("redacted/"+tt.name, func(t *testing.T) {
