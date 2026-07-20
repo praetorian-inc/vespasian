@@ -49,6 +49,11 @@ const (
 	PathHeuristicBoost    = 0.15 // Rule 3: API path segment boost.
 	HTTPMethodConfidence  = 0.7  // Rule 4: Non-GET HTTP method signal.
 	JSONBodyConfidence    = 0.85 // Rule 5: JSON response structure.
+	// StaticJSConfidence is the floor for an offline JS-static candidate whose
+	// path carries an API indicator (Rule 6). It equals the default --confidence
+	// threshold (0.5) so these unprobed candidates survive fully-offline
+	// generation instead of being dropped at Rule 3's 0.15 (LAB-4992).
+	StaticJSConfidence = 0.5
 )
 
 // RESTClassifier classifies REST API requests using ordered heuristic rules.
@@ -119,8 +124,10 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	}
 
 	// Rule 3: Path heuristics.
+	pathMatched := false
 	for _, seg := range apiPathSegments {
 		if strings.Contains(lowerPath, seg) {
+			pathMatched = true
 			confidence += PathHeuristicBoost
 			if confidence > 1.0 {
 				confidence = 1.0
@@ -156,6 +163,23 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 			if reason == "" {
 				reason = "response-structure:json"
 			}
+		}
+	}
+
+	// Rule 6: Offline JS-static candidate floor (LAB-4992). A path reconstructed
+	// from a JS bundle carries an API indicator but, when generated fully
+	// offline, has no probed response — Rules 2/4/5 never fire and Rule 3 alone
+	// (0.15) leaves it below the default 0.5 threshold, silently dropping the
+	// very concat/service-prefix endpoints jsstatic recovered. Floor such
+	// candidates to StaticJSConfidence so they survive default-confidence
+	// generation as unprobed candidates. Gated on the path heuristic so
+	// non-API-looking static:js entries are not promoted.
+	if pathMatched && confidence < StaticJSConfidence && crawl.IsJSStaticSource(req.Source) {
+		confidence = StaticJSConfidence
+		if reason == "" {
+			reason = "static-js-candidate"
+		} else {
+			reason += "+static-js-candidate"
 		}
 	}
 

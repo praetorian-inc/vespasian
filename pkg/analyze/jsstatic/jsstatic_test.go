@@ -813,10 +813,12 @@ function loadReviews(pid) { var u = "/api/products/" + pid + "/reviews"; return 
 		t.Fatalf("Analyze error: %v", err)
 	}
 
-	// Collect synthesized (static:js) request URLs.
+	// Collect synthesized concat-reconstruction request URLs. Concat
+	// reconstructions carry the distinct SourceJSConcat tag (LAB-4992 /
+	// SEC-BE-001), not the plain SourceJS used for AST-recovered literals.
 	got := map[string]bool{}
 	for _, req := range res.Requests {
-		if req.Source == SourceJS {
+		if req.Source == SourceJSConcat {
 			got[req.URL] = true
 		}
 	}

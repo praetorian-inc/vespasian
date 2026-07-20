@@ -98,8 +98,12 @@
 //   - [ExtractStaticConcatPaths] is the network-free subset of the concat /
 //     service-prefix reconstruction, shared with pkg/analyze/jsstatic (LAB-4992)
 //     so the fully-offline static analyzer reconstructs these forms identically
-//     to the active replay path. It performs no probing and no speculative
-//     service-prefix fan-out (which is only safe when 404-filtered by probing).
+//     to the active replay path. The active path (extractAPIPaths) runs the same
+//     underlying extractors — extractConcatPaths AND servicePrefixPlusPaths — so
+//     both paths recover the concat/+-chain and literal service-prefix forms
+//     identically; the active path additionally probes them and does a
+//     speculative service-prefix fan-out that the offline path omits (that
+//     fan-out is only safe when 404-filtered by probing).
 //
 // Session-cookie helpers (LAB-2222) let callers bootstrap Chrome's cookie
 // store from a user-supplied Cookie header so subsequent navigations are

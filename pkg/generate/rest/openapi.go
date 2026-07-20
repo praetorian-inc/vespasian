@@ -199,16 +199,19 @@ func anyStaticSource(endpoints []classify.ClassifiedRequest) bool {
 
 // computeSourceTag derives the x-vespasian-source value for an operation group.
 // Mapping (architecture.md §7):
-//   - any request with Source not in {"static:js", "static:js-sourcemap"}
-//     (including empty Source from pre-LAB-2108 captures, untagged dynamic
-//     entries, AND non-JS static sources like "static:html") → "dynamic"
+//   - any request with Source not in the JS-static set (including empty Source
+//     from pre-LAB-2108 captures, untagged dynamic entries, AND non-JS static
+//     sources like "static:html")                    → "dynamic"
 //   - all requests Source == "static:js"             → "js-bundle"
 //   - all requests Source == "static:js-sourcemap"   → "js-sourcemap"
+//   - all requests Source == "static:js-concat"      → "js-bundle-concat"
 //   - mixed JS-static prefixes within a group        → "dynamic"
 //   - empty group (len(group) == 0)                  → "" (no extension emitted)
 //
 // For non-empty input the function always returns one of: "dynamic",
-// "js-bundle", or "js-sourcemap".
+// "js-bundle", "js-sourcemap", or "js-bundle-concat". The "js-bundle-concat"
+// value (LAB-4992 / SEC-BE-001) flags never-probed concat/service-prefix
+// reconstructions so consumers can weight them below AST-recovered literals.
 //
 // The empty-group case is unreachable in current usage because groupEndpoints
 // only creates a key when at least one ClassifiedRequest matches; this contract
@@ -235,6 +238,8 @@ func computeSourceTag(group []classify.ClassifiedRequest) string {
 			friendly = "js-bundle"
 		case crawl.SourceStaticJSSourcemap:
 			friendly = "js-sourcemap"
+		case crawl.SourceStaticJSConcat:
+			friendly = "js-bundle-concat"
 		}
 		if tag == "" {
 			tag = friendly

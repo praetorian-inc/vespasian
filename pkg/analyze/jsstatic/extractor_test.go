@@ -612,8 +612,8 @@ var LOGIN = "identity/" + "api/auth/login";
 		if ep.Method != "GET" {
 			t.Errorf("%s: Method = %q, want GET (bare path carries no method)", want, ep.Method)
 		}
-		if ep.SourceTag != SourceJS {
-			t.Errorf("%s: SourceTag = %q, want %q", want, ep.SourceTag, SourceJS)
+		if ep.SourceTag != SourceJSConcat {
+			t.Errorf("%s: SourceTag = %q, want %q", want, ep.SourceTag, SourceJSConcat)
 		}
 	}
 }
@@ -624,6 +624,10 @@ var LOGIN = "identity/" + "api/auth/login";
 // +-chain "/api/users/" + "5" reconstructs to the SAME /api/users/5 — so the
 // astURLs guard must suppress the GET candidate. (Deleting the guard makes this
 // test fail with a phantom [POST GET].)
+//
+// This case pins only the ABSOLUTE-LITERAL collision. The two tests below pin
+// the harder cases the original guard silently missed: a dynamic operand
+// (sentinel "0" vs AST {param}) and a relative operand (leading-slash mismatch).
 func TestExtractFromBundle_ConcatNoPhantomForKnownURL(t *testing.T) {
 	src := []byte(`axios.post("/api/users/5", {a}); var u = "/api/users/" + "5";`)
 	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
@@ -638,5 +642,50 @@ func TestExtractFromBundle_ConcatNoPhantomForKnownURL(t *testing.T) {
 	}
 	if len(methods) != 1 || methods[0] != "POST" {
 		t.Errorf("expected exactly [POST] for /api/users/5 (no phantom GET), got %v", methods)
+	}
+}
+
+// LAB-4992 dedup guard, dynamic-operand case (was QUAL-002): the AST walker
+// recovers the template literal fetch(`/api/users/${uid}/orders`) as
+// /api/users/{uid}/orders, while the +-chain "/api/users/" + uid + "/orders"
+// reconstructs to /api/users/0/orders (numeric sentinel for the non-literal
+// operand). These are the SAME logical endpoint, so the concat GET candidate
+// must be suppressed. Before concatDedupKey normalized "0" and {param} segments
+// to a common token, the raw string compare never matched and a phantom
+// /api/users/0/orders GET slipped through.
+func TestExtractFromBundle_ConcatNoPhantomForDynamicSegment(t *testing.T) {
+	src := []byte("function f(uid){ return fetch(`/api/users/${uid}/orders`); }\n" +
+		`var u = "/api/users/" + uid + "/orders"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/users/0/orders"); ep != nil {
+		t.Errorf("phantom concat companion /api/users/0/orders emitted alongside AST-recovered param path; got %v", endpoints)
+	}
+	// The AST-recovered parameterized form must still be present.
+	if ep := findEndpoint(endpoints, "/api/users/{uid}/orders"); ep == nil {
+		t.Errorf("expected AST-recovered /api/users/{uid}/orders, got %v", endpoints)
+	}
+}
+
+// LAB-4992 dedup guard, relative-operand case (was QUAL-003): the AST walker
+// recovers fetch("api/users/5") as the relative URL "api/users/5" (no leading
+// slash), while the +-chain "api/users/" + "5" reconstructs to "api/users/5"
+// and extractConcatEndpoints prepends a leading slash → "/api/users/5". These
+// are the SAME endpoint, so the concat GET candidate must be suppressed. Before
+// concatDedupKey normalized the leading slash on both sides, the slash mismatch
+// bypassed the guard and a phantom "/api/users/5" slipped through.
+func TestExtractFromBundle_ConcatNoPhantomForRelativeURL(t *testing.T) {
+	src := []byte(`fetch("api/users/5"); var u = "api/users/" + "5"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/users/5"); ep != nil {
+		t.Errorf("phantom concat companion /api/users/5 emitted alongside AST-recovered relative path; got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "api/users/5"); ep == nil {
+		t.Errorf("expected AST-recovered relative api/users/5, got %v", endpoints)
 	}
 }

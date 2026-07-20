@@ -43,6 +43,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 	"github.com/praetorian-inc/vespasian/pkg/ssrf"
@@ -1593,9 +1594,21 @@ func extractAPIPaths(jsBody []byte, requests []ObservedRequest) []string { //nol
 	// (LAB-1368). Reconstructed paths use a numeric sentinel for non-literal
 	// operands so the REST normalizer can parameterize them. Run last so the
 	// more-precise strategies above win the dedup race when both match.
-	// (Strategy 4 — literal+literal service-prefix concatenation — runs
+	// (Strategy 4 — literal+literal service-prefix concatenation — also runs
 	// implicitly above via extractServicePrefixes + addPath fan-out.)
 	for _, p := range extractConcatPaths(jsBody) {
+		addPath(p)
+	}
+
+	// Strategy 5b: literal service-prefix +-concat (LAB-4992). Shares
+	// servicePrefixPlusPaths with the fully-offline static path (via
+	// ExtractStaticConcatPaths) so both reconstruct the
+	// `"identity/" + "api/auth/login"` form identically; replay additionally
+	// probes and 404-filters the reconstructions. Without this the "share one
+	// extractor / reconstruct identically" contract held only for the offline
+	// path — extractConcatPaths above misses the literal+literal service-prefix
+	// head that servicePrefixPlusPaths recovers.
+	for _, p := range servicePrefixPlusPaths(jsBody) {
 		addPath(p)
 	}
 
@@ -1613,21 +1626,37 @@ func extractAPIPaths(jsBody []byte, requests []ObservedRequest) []string { //nol
 // "/comment"`). The REST normalizer treats `//{id}` as a distinct (malformed)
 // segment, so collapsing here keeps reconstructed paths well-formed. Looping
 // until stable handles rare >=3-slash runs.
+//
+// The `//`-collapse and `://` scheme detection operate only on the path portion:
+// a query string / fragment is split off first so a relative path whose query
+// carries an absolute URL (e.g. `"/api//proxy?url=https://x"`) is not mistaken
+// for a scheme-bearing URL, and `//` inside a query value is preserved.
 func cleanConcatPath(p string) string {
-	if scheme, rest, hasScheme := strings.Cut(p, "://"); hasScheme {
+	path, suffix := p, ""
+	if i := strings.IndexAny(p, "?#"); i >= 0 {
+		path, suffix = p[:i], p[i:]
+	}
+
+	if scheme, rest, hasScheme := strings.Cut(path, "://"); hasScheme {
 		for strings.Contains(rest, "//") {
 			rest = strings.ReplaceAll(rest, "//", "/")
 		}
-		p = scheme + "://" + rest
+		path = scheme + "://" + rest
 	} else {
-		for strings.Contains(p, "//") {
-			p = strings.ReplaceAll(p, "//", "/")
+		for strings.Contains(path, "//") {
+			path = strings.ReplaceAll(path, "//", "/")
 		}
 	}
+	p = path + suffix
+
 	if p == "" || !hasAPIIndicator(p) {
 		return ""
 	}
-	if strings.ContainsAny(p, " \t\r\n") {
+	// Reject a space or any non-printable/control byte. A crafted bundle literal
+	// can embed raw C0/C1 control bytes (NUL, VT, FF, DEL, …) that a
+	// whitespace-only check would let survive into a candidate path;
+	// unicode.IsControl covers tab/CR/LF and every other control byte.
+	if strings.IndexFunc(p, func(r rune) bool { return r == ' ' || unicode.IsControl(r) }) >= 0 {
 		return ""
 	}
 	return p
@@ -1646,7 +1675,7 @@ func cleanConcatPath(p string) string {
 // cleanConcatPath's hasAPIIndicator post-filter drops any assembled chain that
 // never reaches an API path, so a bare `"assets/" + x` produces nothing.
 var servicePrefixPlusHeadPattern = regexp.MustCompile(
-	`["']([a-zA-Z][a-zA-Z0-9_-]{1,30}/)["']\s*\+`,
+	`["']([a-zA-Z][a-zA-Z0-9_-]{0,30}/)["']\s*\+`,
 )
 
 // servicePrefixPlusPaths reconstructs concrete `+`-concat chains whose head is a

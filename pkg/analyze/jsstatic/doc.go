@@ -40,16 +40,31 @@
 //     This makes fully-offline `generate` recover concat/service-prefix SPA
 //     endpoints without a reachable target — the same forms the active,
 //     network-bound crawl.ReplayJSExtracted path probes. Emitted as GET
-//     candidates (a bare path carries no method) and deduped against the URLs
-//     the AST walkers already recovered so no phantom-GET companions appear.
+//     candidates (a bare path carries no method) and deduped, via a
+//     representation-agnostic key (numeric sentinel "0" and {param} placeholders
+//     both normalized), against the URLs the AST walkers already recovered so no
+//     phantom-GET companions appear for a path recovered both ways.
 //
 // # Source tagging
 //
-// Each synthesized [crawl.ObservedRequest] carries Source = "static:js" or
-// "static:js-sourcemap". The OpenAPI generator strips the "static:" prefix
-// when emitting the x-vespasian-source extension on each operation
-// ("static:js" -> "js-bundle", "static:js-sourcemap" -> "js-sourcemap";
-// any dynamic-source group resolves to "dynamic", which wins on mixed groups).
+// Each synthesized [crawl.ObservedRequest] carries Source = "static:js"
+// (AST-recovered literal), "static:js-sourcemap" (recovered from a .js.map
+// source), or "static:js-concat" (a never-probed concat/+-chain/service-prefix
+// reconstruction — LAB-4992). The OpenAPI generator maps these to the
+// x-vespasian-source extension on each operation ("static:js" -> "js-bundle",
+// "static:js-sourcemap" -> "js-sourcemap", "static:js-concat" ->
+// "js-bundle-concat"; any dynamic-source group resolves to "dynamic", which
+// wins on mixed groups). The distinct "static:js-concat" tag lets consumers
+// weight speculative reconstructions below directly-observed literals.
+//
+// # Confidence at generation
+//
+// A concat/literal candidate reaches the generated spec only after
+// classification. Fully offline it has no probed response, so it scores only the
+// REST classifier's path heuristic; RESTClassifier Rule 6 floors any JS-static
+// candidate whose path carries an API indicator to the default --confidence
+// threshold (0.5) so these offline candidates survive default-confidence
+// generation instead of being silently dropped.
 //
 // # Security and Operator Considerations
 //

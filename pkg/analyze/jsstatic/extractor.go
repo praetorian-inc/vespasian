@@ -639,8 +639,12 @@ func ExtractFromBundle(jsSource []byte, baseURL string) ([]ExtractedEndpoint, er
 	}
 	// Record every URL the AST walkers emitted, method-agnostic, so step 5 can
 	// suppress phantom endpoints for URLs already recovered with a known method.
+	// Keys are canonicalized (concatDedupKey) so a concat reconstruction that
+	// substitutes the numeric sentinel "0" for a dynamic operand, or omits the
+	// leading slash on a relative path, still matches the AST form of the same
+	// endpoint ({param} placeholders, host-relative paths).
 	for _, ep := range endpoints {
-		astURLs[ep.URL] = true
+		astURLs[concatDedupKey(ep.URL)] = true
 	}
 
 	// 5. Reconstruct concat / +-chain / service-prefix paths that jsluice's AST
@@ -668,7 +672,9 @@ func ExtractFromBundle(jsSource []byte, baseURL string) ([]ExtractedEndpoint, er
 //   - astURLs: skip any path the AST walkers already emitted for ANY method, so
 //     a concat reconstruction that collides with a jsluice-recovered URL does
 //     not synthesize a phantom GET companion (mirrors the method-less fetch
-//     guard in jsluiceURLToEndpoint).
+//     guard in jsluiceURLToEndpoint). The lookup is keyed on concatDedupKey so
+//     the sentinel-"0"/{param} and relative-slash representation gaps between the
+//     two extractors do not defeat the guard.
 //   - seen: skip exact (GET, url) duplicates and register survivors.
 func extractConcatEndpoints(jsSource []byte, baseURL string, seen map[endpointKey]bool, astURLs map[string]bool) []ExtractedEndpoint {
 	var endpoints []ExtractedEndpoint
@@ -683,7 +689,7 @@ func extractConcatEndpoints(jsSource []byte, baseURL string, seen map[endpointKe
 		if !strings.HasPrefix(p, "http://") && !strings.HasPrefix(p, "https://") && !strings.HasPrefix(p, "/") {
 			p = "/" + p
 		}
-		if filterURL(p) || isExprOnly(p) || astURLs[p] {
+		if filterURL(p) || isExprOnly(p) || astURLs[concatDedupKey(p)] {
 			continue
 		}
 		k := endpointKey{"GET", p}
@@ -692,13 +698,56 @@ func extractConcatEndpoints(jsSource []byte, baseURL string, seen map[endpointKe
 		}
 		seen[k] = true
 		endpoints = append(endpoints, ExtractedEndpoint{
-			Method:       "GET",
-			URL:          p,
-			SourceTag:    SourceJS,
+			Method: "GET",
+			URL:    p,
+			// Distinct source: these are speculative, never-probed concat
+			// reconstructions (LAB-4992 / SEC-BE-001), tagged apart from
+			// AST-recovered literals so consumers can weight them.
+			SourceTag:    SourceJSConcat,
 			OriginBundle: baseURL,
 		})
 	}
 	return endpoints
+}
+
+// concatDedupKey canonicalizes a URL/path so the concat extractor's
+// reconstructions compare equal to the AST walkers' output for the same logical
+// endpoint. The two extractors describe dynamic and relative paths differently:
+// concat substitutes the numeric sentinel "0" for non-literal operands and
+// always carries a leading slash, whereas the AST walkers emit {param}-style
+// placeholders (NormalizeEXPRPath) and leave relative paths without a leading
+// slash. Both collapse to one key here: query/fragment dropped, scheme+host
+// stripped, leading slash ensured, and every dynamic segment (the sentinel "0"
+// or a {...} placeholder) rewritten to a single "{}" token. Concrete literal
+// segments are left intact, so distinct concrete paths are NOT over-merged
+// (e.g. "/api/items/5" stays distinct from "/api/items/{param}").
+//
+// The sentinel value mirrors pkg/crawl's unexported concatPathSentinel ("0");
+// keep the two in sync if that ever changes.
+func concatDedupKey(u string) string {
+	// Drop query string and fragment.
+	if i := strings.IndexAny(u, "?#"); i >= 0 {
+		u = u[:i]
+	}
+	// Strip scheme://host, keeping the path component.
+	if i := strings.Index(u, "://"); i >= 0 {
+		rest := u[i+3:]
+		if j := strings.Index(rest, "/"); j >= 0 {
+			u = rest[j:]
+		} else {
+			u = "/"
+		}
+	}
+	if !strings.HasPrefix(u, "/") {
+		u = "/" + u
+	}
+	segments := strings.Split(u, "/")
+	for i, seg := range segments {
+		if seg == "0" || (len(seg) >= 2 && strings.HasPrefix(seg, "{") && strings.HasSuffix(seg, "}")) {
+			segments[i] = "{}"
+		}
+	}
+	return strings.Join(segments, "/")
 }
 
 // jsluiceURLToEndpoint converts a single jsluice.URL into an ExtractedEndpoint,

@@ -31,6 +31,7 @@ import (
 const (
 	SourceJS        = crawl.SourceStaticJS
 	SourceSourcemap = crawl.SourceStaticJSSourcemap
+	SourceJSConcat  = crawl.SourceStaticJSConcat
 )
 
 // Default tuning bounds. Mirrored on Options when zero.
@@ -349,7 +350,11 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 		bundleEps = bundleEps[:opts.MaxEndpointsPerBundle]
 	}
 	for i := range bundleEps {
-		bundleEps[i].SourceTag = SourceJS
+		// Preserve the distinct concat reconstruction tag; force everything else
+		// from the bundle body to the plain JS-bundle source.
+		if bundleEps[i].SourceTag != SourceJSConcat {
+			bundleEps[i].SourceTag = SourceJS
+		}
 	}
 	synth := toRequests(bundleEps, req.URL)
 	result.requests = append(result.requests, synth...)
@@ -385,7 +390,11 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 			smEps = smEps[:remaining]
 		}
 		for i := range smEps {
-			smEps[i].SourceTag = SourceSourcemap
+			// Preserve the distinct concat reconstruction tag; force everything
+			// else recovered from the sourcemap to the sourcemap source.
+			if smEps[i].SourceTag != SourceJSConcat {
+				smEps[i].SourceTag = SourceSourcemap
+			}
 		}
 		smSynth := toRequests(smEps, req.URL)
 		result.requests = append(result.requests, smSynth...)

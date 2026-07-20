@@ -409,6 +409,81 @@ func TestRESTClassifier_ImplementsDetailedClassifier(t *testing.T) {
 // TestClassifyDetail_FallbackToHeaders verifies the classifier falls back to
 // Response.Headers when ContentType is empty, as happens when headers have
 // non-standard casing and ContentType wasn't populated by the crawler.
+// TestClassifyDetail_StaticJSCandidateFloor pins Rule 6 (LAB-4992): an unprobed
+// JS-static candidate whose path carries an API indicator is floored to
+// StaticJSConfidence (0.5) so it survives default-confidence generation instead
+// of being dropped at Rule 3's 0.15. Only fires for JS-static sources with a
+// matching path heuristic — plain dynamic GETs and non-API static:js entries
+// are unaffected.
+func TestClassifyDetail_StaticJSCandidateFloor(t *testing.T) {
+	c := &RESTClassifier{}
+
+	tests := []struct {
+		name      string
+		req       crawl.ObservedRequest
+		wantIsAPI bool
+		wantConf  float64
+	}{
+		{
+			name: "static:js concat GET with API path floored to 0.5",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/api/users/0/orders",
+				Source: crawl.SourceStaticJSConcat,
+			},
+			wantIsAPI: true,
+			wantConf:  StaticJSConfidence,
+		},
+		{
+			name: "static:js literal GET with API path floored to 0.5",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/api/items",
+				Source: crawl.SourceStaticJS,
+			},
+			wantIsAPI: true,
+			wantConf:  StaticJSConfidence,
+		},
+		{
+			name: "static:js GET WITHOUT API indicator is not floored",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/dashboard/home",
+				Source: crawl.SourceStaticJS,
+			},
+			wantIsAPI: false,
+			wantConf:  0,
+		},
+		{
+			name: "dynamic (non-static-js) GET with API path keeps 0.15",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/api/users",
+				Source: "katana",
+			},
+			wantIsAPI: true,
+			wantConf:  PathHeuristicBoost,
+		},
+		{
+			name: "static:js POST with API path keeps its stronger method score",
+			req: crawl.ObservedRequest{
+				Method: "POST",
+				URL:    "https://example.com/api/users",
+				Source: crawl.SourceStaticJS,
+			},
+			wantIsAPI: true,
+			wantConf:  HTTPMethodConfidence,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isAPI, conf, _ := c.ClassifyDetail(tt.req)
+			assert.Equal(t, tt.wantIsAPI, isAPI)
+			assert.InDelta(t, tt.wantConf, conf, 1e-9)
+		})
+	}
+}
+
 func TestClassifyDetail_FallbackToHeaders(t *testing.T) {
 	c := &RESTClassifier{}
 

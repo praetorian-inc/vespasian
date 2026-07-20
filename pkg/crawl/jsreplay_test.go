@@ -210,6 +210,21 @@ func TestExtractAPIPaths(t *testing.T) {
 	}
 }
 
+// QUAL-004: extractAPIPaths (the active replay path) must run the shared
+// servicePrefixPlusPaths extractor, not only extractConcatPaths — otherwise the
+// "share one extractor / reconstruct identically" contract with the offline
+// static path holds for concat/+-chain forms but NOT the literal service-prefix
+// form. Here "billing/" is a prefix that appears ONLY as a literal+literal
+// service-prefix concat, so it is recoverable exclusively via
+// servicePrefixPlusPaths; extractConcatPaths' head anchor (which requires an
+// API indicator in the head) misses it.
+func TestExtractAPIPaths_ServicePrefixPlusWired(t *testing.T) {
+	js := []byte(`var invoices = "billing/" + "api/invoices";`)
+	got := extractAPIPaths(js, nil)
+	assert.Contains(t, got, "/billing/api/invoices",
+		"extractAPIPaths must surface literal service-prefix concat via the shared servicePrefixPlusPaths extractor")
+}
+
 func TestExtractAPIPaths_TemplateLiteralInterpolation(t *testing.T) {
 	// Regression test for REQ-001: template literals with ${...} interpolations
 	// must reconstruct the literal segments after the placeholder, not stop
@@ -3139,6 +3154,15 @@ func TestExtractStaticConcatPaths(t *testing.T) {
 			want: []string{"identity/0/api/orders"},
 		},
 		{
+			// QUAL-006: single-character service prefixes ("v/") must match —
+			// servicePrefixPlusHeadPattern's quantifier is {0,30} so the head
+			// can be a lone letter + slash. cleanConcatPath's API-indicator
+			// filter still gates the assembled chain.
+			name: "single-character service prefix",
+			js:   `var u = "v/" + "api/users";`,
+			want: []string{"v/api/users"},
+		},
+		{
 			name: "service-prefix head without API indicator dropped",
 			js:   `var u = "assets/" + name + "/logo";`,
 			want: nil,
@@ -3160,6 +3184,65 @@ func TestExtractStaticConcatPaths(t *testing.T) {
 			sort.Strings(got)
 			sort.Strings(tt.want)
 			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestCleanConcatPath(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "collapses double slash in path",
+			in:   "/api/posts//comment",
+			want: "/api/posts/comment",
+		},
+		{
+			name: "preserves scheme separator",
+			in:   "https://h//api//x",
+			want: "https://h/api/x",
+		},
+		{
+			// QUAL-005: a `://` inside a query value must NOT be treated as a
+			// scheme separator, and `//` inside the query must be preserved —
+			// only the path portion is slash-collapsed.
+			name: "query-string scheme is not mistaken for path scheme",
+			in:   "/api//proxy?url=https://a//b",
+			want: "/api/proxy?url=https://a//b",
+		},
+		{
+			// SEC-BE-002: a raw control byte (here NUL) in the path must be
+			// rejected, not just ASCII whitespace.
+			name: "rejects embedded NUL control byte",
+			in:   "/api/\x00x",
+			want: "",
+		},
+		{
+			name: "rejects vertical tab control byte",
+			in:   "/api/\x0bx",
+			want: "",
+		},
+		{
+			name: "rejects DEL control byte",
+			in:   "/api/\x7fx",
+			want: "",
+		},
+		{
+			name: "rejects space",
+			in:   "/api/ x",
+			want: "",
+		},
+		{
+			name: "drops path without API indicator",
+			in:   "/static/logo",
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, cleanConcatPath(tt.in))
 		})
 	}
 }
