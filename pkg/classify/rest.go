@@ -16,6 +16,7 @@ package classify
 
 import (
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
@@ -38,10 +39,21 @@ var apiContentTypes = []string{
 	"application/vnd.api+json", "application/hal+json",
 }
 
-// apiPathSegments lists path segments that indicate API endpoints.
+// apiPathSegments lists literal path segments that indicate API endpoints.
+// Versioned segments (/v1/, /v2/, …) are matched separately by
+// apiVersionPathPattern so any version number is recognized, not a fixed few.
 var apiPathSegments = []string{
-	"/api/", "/v1/", "/v2/", "/v3/", "/rest/", "/rpc/", "/graphql",
+	"/api/", "/rest/", "/rpc/", "/graphql",
 }
+
+// apiVersionPathPattern matches a versioned API path segment for ANY version
+// number (/v1/, /v2/, …/v4/…/v12/). It mirrors the v[1-9][0-9]*/ alternation in
+// crawl.apiIndicatorAlternation so the classifier's API-indicator recognition
+// does not drift below the extraction side — otherwise offline concat/service-
+// prefix candidates on /v4+/ paths (which crawl extracts) would fail Rule 3,
+// so Rule 6's static-JS floor would never fire and they would be dropped at the
+// default confidence (LAB-4992).
+var apiVersionPathPattern = regexp.MustCompile(`/v[1-9][0-9]*/`)
 
 // Confidence scores assigned by each heuristic rule.
 const (
@@ -128,16 +140,21 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	for _, seg := range apiPathSegments {
 		if strings.Contains(lowerPath, seg) {
 			pathMatched = true
-			confidence += PathHeuristicBoost
-			if confidence > 1.0 {
-				confidence = 1.0
-			}
-			if reason == "" {
-				reason = "path-heuristic"
-			} else {
-				reason += "+path-heuristic"
-			}
 			break
+		}
+	}
+	if !pathMatched && apiVersionPathPattern.MatchString(lowerPath) {
+		pathMatched = true
+	}
+	if pathMatched {
+		confidence += PathHeuristicBoost
+		if confidence > 1.0 {
+			confidence = 1.0
+		}
+		if reason == "" {
+			reason = "path-heuristic"
+		} else {
+			reason += "+path-heuristic"
 		}
 	}
 

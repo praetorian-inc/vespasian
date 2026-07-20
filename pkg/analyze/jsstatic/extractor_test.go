@@ -689,3 +689,24 @@ func TestExtractFromBundle_ConcatNoPhantomForRelativeURL(t *testing.T) {
 		t.Errorf("expected AST-recovered relative api/users/5, got %v", endpoints)
 	}
 }
+
+// LAB-4992 dedup guard, must-survive direction: concatDedupKey must NOT
+// over-merge distinct CONCRETE paths. A concat reconstruction with a concrete
+// (non-sentinel) segment that only shares a prefix with an AST-recovered param
+// path is a genuinely different endpoint and must survive. Here the AST recovers
+// /api/items/{x} from the template literal and the +-chain reconstructs the
+// concrete /api/items/5 — both must appear (5 canonicalizes to "5", not "{}").
+func TestExtractFromBundle_ConcatConcreteSegmentNotOverMerged(t *testing.T) {
+	src := []byte("function f(x){ return fetch(`/api/items/${x}`); }\n" +
+		`var u = "/api/items/" + "5"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/items/{x}"); ep == nil {
+		t.Errorf("expected AST-recovered /api/items/{x}, got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "/api/items/5"); ep == nil {
+		t.Errorf("concrete concat path /api/items/5 was over-merged/suppressed; must survive alongside the param path; got %v", endpoints)
+	}
+}

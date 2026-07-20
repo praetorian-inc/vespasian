@@ -213,16 +213,22 @@ func TestExtractAPIPaths(t *testing.T) {
 // QUAL-004: extractAPIPaths (the active replay path) must run the shared
 // servicePrefixPlusPaths extractor, not only extractConcatPaths — otherwise the
 // "share one extractor / reconstruct identically" contract with the offline
-// static path holds for concat/+-chain forms but NOT the literal service-prefix
-// form. Here "billing/" is a prefix that appears ONLY as a literal+literal
-// service-prefix concat, so it is recoverable exclusively via
-// servicePrefixPlusPaths; extractConcatPaths' head anchor (which requires an
-// API indicator in the head) misses it.
+// static path holds for concat/+-chain forms but NOT the service-prefix form.
+//
+// The distinguishing input is a service-prefix head with a NON-LITERAL middle
+// operand: "billing/" + id + "/api/invoices" reconstructs (via
+// servicePrefixPlusPaths + parsePlusChain) to /billing/0/api/invoices with the
+// numeric sentinel. The pre-existing extractServicePrefixes + addPath fan-out
+// CANNOT produce this — it only combines discovered prefixes with bare literal
+// paths, never a sentinel-bearing chain — and extractConcatPaths' head anchor
+// requires an API indicator in the head ("billing/" has none). So the sentinel
+// form is recoverable EXCLUSIVELY via the Strategy 5b wiring; deleting that
+// block makes this assertion fail (the test is non-vacuous).
 func TestExtractAPIPaths_ServicePrefixPlusWired(t *testing.T) {
-	js := []byte(`var invoices = "billing/" + "api/invoices";`)
+	js := []byte(`var invoices = "billing/" + id + "/api/invoices";`)
 	got := extractAPIPaths(js, nil)
-	assert.Contains(t, got, "/billing/api/invoices",
-		"extractAPIPaths must surface literal service-prefix concat via the shared servicePrefixPlusPaths extractor")
+	assert.Contains(t, got, "/billing/0/api/invoices",
+		"extractAPIPaths must surface the sentinel-bearing service-prefix chain via the shared servicePrefixPlusPaths extractor (Strategy 5b)")
 }
 
 func TestExtractAPIPaths_TemplateLiteralInterpolation(t *testing.T) {

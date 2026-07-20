@@ -1637,6 +1637,59 @@ func TestOpenAPI_XVespasianSource_JSSourcemap(t *testing.T) {
 	}
 }
 
+// LAB-4992 / SEC-BE-001: a group whose only source is the concat reconstruction
+// tag (static:js-concat) must surface x-vespasian-source "js-bundle-concat" so
+// consumers can weight never-probed reconstructions below observed literals.
+func TestOpenAPI_XVespasianSource_JSBundleConcat(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "static:js-concat"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	ext, ok := getOp["x-vespasian-source"]
+	if !ok {
+		t.Fatal("expected x-vespasian-source extension to be present")
+	}
+	if ext != "js-bundle-concat" {
+		t.Errorf("expected x-vespasian-source=js-bundle-concat, got %v", ext)
+	}
+}
+
+// A group mixing the concat tag with the plain js-bundle tag must resolve to
+// "dynamic" (the closed allow-list treats any mixed JS-static prefixes as
+// dynamic), pinning that concat is a distinct member of the allow-list.
+func TestOpenAPI_XVespasianSource_MixedConcatAndBundle(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "static:js-concat"),
+		makeClassified("GET", "https://h/api/x", "static:js"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	if ext := getOp["x-vespasian-source"]; ext != "dynamic" {
+		t.Errorf("expected x-vespasian-source=dynamic for mixed js-concat+js-bundle group, got %v", ext)
+	}
+}
+
 func TestOpenAPI_XVespasianSource_OmittedForEmptySource(t *testing.T) {
 	gen := &OpenAPIGenerator{}
 	// No static: source anywhere in the input.

@@ -454,13 +454,19 @@ var concatPlusHeadPattern = regexp.MustCompile(
 		`["']\s*\+`,
 )
 
+// ConcatPathSentinel is the exported form of concatPathSentinel. It is the
+// single source of truth for the sentinel value across packages —
+// pkg/analyze/jsstatic references it from concatDedupKey so its dedup
+// canonicalization cannot drift from the value this package substitutes.
+const ConcatPathSentinel = "0"
+
 // concatPathSentinel is what we substitute for any non-literal concat
 // argument or +-chain operand. A pure numeric segment so the REST
 // generator's NormalizePathWithNames turns it into a named {param} (see
 // pkg/generate/rest/normalize.go). Using "0" rather than "{}" keeps the
 // reconstructed path a syntactically valid HTTP path that the prober can
 // actually issue a request against.
-const concatPathSentinel = "0"
+const concatPathSentinel = ConcatPathSentinel
 
 // maxConcatChainOperands bounds the length of a `+`-concat chain
 // parsePlusChain will walk before bailing out. Real URL chains rarely

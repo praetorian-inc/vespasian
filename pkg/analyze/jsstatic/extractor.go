@@ -717,13 +717,21 @@ func extractConcatEndpoints(jsSource []byte, baseURL string, seen map[endpointKe
 // always carries a leading slash, whereas the AST walkers emit {param}-style
 // placeholders (NormalizeEXPRPath) and leave relative paths without a leading
 // slash. Both collapse to one key here: query/fragment dropped, scheme+host
-// stripped, leading slash ensured, and every dynamic segment (the sentinel "0"
-// or a {...} placeholder) rewritten to a single "{}" token. Concrete literal
-// segments are left intact, so distinct concrete paths are NOT over-merged
-// (e.g. "/api/items/5" stays distinct from "/api/items/{param}").
+// stripped, leading slash ensured, and every dynamic segment (the concat
+// sentinel or a {...} placeholder) rewritten to a single "{}" token. Concrete
+// literal segments other than the sentinel are left intact, so distinct
+// concrete paths are NOT over-merged (e.g. "/api/items/5" stays distinct from
+// "/api/items/{param}").
 //
-// The sentinel value mirrors pkg/crawl's unexported concatPathSentinel ("0");
-// keep the two in sync if that ever changes.
+// One deliberate exception: a literal segment equal to the sentinel value
+// (crawl.ConcatPathSentinel, "0") is indistinguishable offline from a dynamic
+// operand the concat extractor substituted, so "/api/items/0" DOES collapse
+// onto "/api/items/{param}". This is intentional for dedup — treating a lone
+// "0" segment as dynamic errs toward suppressing a phantom companion, which is
+// the safe direction for this guard.
+//
+// The sentinel is sourced from crawl.ConcatPathSentinel (not a local literal)
+// so the two packages cannot drift.
 func concatDedupKey(u string) string {
 	// Drop query string and fragment.
 	if i := strings.IndexAny(u, "?#"); i >= 0 {
@@ -743,7 +751,7 @@ func concatDedupKey(u string) string {
 	}
 	segments := strings.Split(u, "/")
 	for i, seg := range segments {
-		if seg == "0" || (len(seg) >= 2 && strings.HasPrefix(seg, "{") && strings.HasSuffix(seg, "}")) {
+		if seg == crawl.ConcatPathSentinel || (len(seg) >= 2 && strings.HasPrefix(seg, "{") && strings.HasSuffix(seg, "}")) {
 			segments[i] = "{}"
 		}
 	}

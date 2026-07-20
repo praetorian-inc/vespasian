@@ -445,6 +445,19 @@ func TestClassifyDetail_StaticJSCandidateFloor(t *testing.T) {
 			wantConf:  StaticJSConfidence,
 		},
 		{
+			// HIGH fix: version segments beyond the old literal list (v1-v3)
+			// must still match Rule 3 (apiVersionPathPattern) so Rule 6 fires —
+			// otherwise crawl-extracted /v4+/ concat candidates are dropped.
+			name: "static:js GET on /v4/ path floored to 0.5 (version beyond literal list)",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/v4/users/0",
+				Source: crawl.SourceStaticJSConcat,
+			},
+			wantIsAPI: true,
+			wantConf:  StaticJSConfidence,
+		},
+		{
 			name: "static:js GET WITHOUT API indicator is not floored",
 			req: crawl.ObservedRequest{
 				Method: "GET",
