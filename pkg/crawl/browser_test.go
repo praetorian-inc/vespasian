@@ -92,11 +92,12 @@ func TestConfigureLauncher(t *testing.T) {
 				// that unconditionally enables the sandbox flag, even in
 				// dev-containers where launcher.New() adds --no-sandbox by default
 				// (LAB-4994).
-				if got := vespasianEnablesNoSandbox(BrowserOptions{NoSandbox: tt.noSandbox}); got != tt.vespasianOn {
+				opts := BrowserOptions{NoSandbox: tt.noSandbox}
+				if got := vespasianEnablesNoSandbox(opts); got != tt.vespasianOn {
 					t.Errorf("vespasianEnablesNoSandbox = %v, want %v", got, tt.vespasianOn)
 				}
 
-				l, err := configureLauncher(BrowserOptions{NoSandbox: tt.noSandbox})
+				l, err := configureLauncher(opts)
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}

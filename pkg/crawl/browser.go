@@ -70,8 +70,8 @@ func vespasianEnablesNoSandbox(opts BrowserOptions) bool {
 }
 
 // configureLauncher applies BrowserOptions to a new launcher without
-// launching Chrome. Disables the sandbox when opts.NoSandbox is set or
-// when the VESPASIAN_NO_SANDBOX env var is "true" (set by CI workflows).
+// launching Chrome. Disables the sandbox when vespasianEnablesNoSandbox opts
+// in (see its doc for the exact condition).
 func configureLauncher(opts BrowserOptions) (*launcher.Launcher, error) {
 	l := launcher.New().
 		Headless(opts.Headless)
