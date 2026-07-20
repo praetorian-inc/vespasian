@@ -749,3 +749,24 @@ func TestExtractFromBundle_ConcatCrossHostNotSuppressed(t *testing.T) {
 		t.Errorf("expected cross-host AST POST https://beacon.other.com/api/track, got %v", endpoints)
 	}
 }
+
+// LAB-4992 dedup guard, sentinel-"0" exception: concatDedupKey deliberately
+// treats a lone literal "0" segment as dynamic (it is indistinguishable offline
+// from a substituted sentinel), so a concat "/api/items/" + "0" -> /api/items/0
+// collapses onto the AST-recovered param path /api/items/{x} and its phantom GET
+// companion is suppressed. This pins the documented exception (the opposite of
+// the non-sentinel "5" case in ConcatConcreteSegmentNotOverMerged).
+func TestExtractFromBundle_ConcatSentinelZeroCollapsesOntoParam(t *testing.T) {
+	src := []byte("function f(x){ return fetch(`/api/items/${x}`); }\n" +
+		`var u = "/api/items/" + "0"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/items/{x}"); ep == nil {
+		t.Errorf("expected AST-recovered /api/items/{x}, got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "/api/items/0"); ep != nil {
+		t.Errorf("literal-0 concat companion /api/items/0 must collapse onto the param path (documented sentinel exception); got %v", endpoints)
+	}
+}

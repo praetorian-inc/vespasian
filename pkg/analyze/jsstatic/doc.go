@@ -41,9 +41,11 @@
 //     endpoints without a reachable target — the same forms the active,
 //     network-bound crawl.ReplayJSExtracted path probes. Emitted as GET
 //     candidates (a bare path carries no method) and deduped, via a
-//     representation-agnostic key (numeric sentinel "0" and {param} placeholders
-//     both normalized), against the URLs the AST walkers already recovered so no
-//     phantom-GET companions appear for a path recovered both ways.
+//     representation-agnostic AND origin-scoped key (numeric sentinel "0" and
+//     {param} placeholders both normalized; key prefixed with the endpoint's
+//     host so a same-path endpoint on a DIFFERENT host is never suppressed),
+//     against the URLs the AST walkers already recovered so no phantom-GET
+//     companions appear for a path recovered both ways on the same origin.
 //
 // # Source tagging
 //

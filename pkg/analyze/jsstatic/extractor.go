@@ -743,25 +743,28 @@ func extractConcatEndpoints(jsSource []byte, baseURL, baseHost string, seen map[
 //
 // The sentinel is sourced from crawl.ConcatPathSentinel (not a local literal)
 // so the two packages cannot drift.
+//
+// Host and path are extracted with net/url.Parse — the same routine hostOfURL
+// uses for baseHost — so the two host extractions cannot disagree (url.Host
+// excludes userinfo, so "https://u:p@h/x" and a relative path on host "h" agree).
+// The host is lower-cased because hostnames are case-insensitive.
 func concatDedupKey(u, baseHost string) string {
-	// Drop query string and fragment.
-	if i := strings.IndexAny(u, "?#"); i >= 0 {
-		u = u[:i]
-	}
-	// Split scheme://host from the path. A relative URL keeps baseHost (it is
-	// same-origin by construction); an absolute URL uses its own host.
+	// A relative URL keeps baseHost (it is same-origin by construction); an
+	// absolute URL uses its own host. url.Parse also drops query/fragment
+	// (parsed.Path excludes them) and tolerates {param} placeholders in the path.
 	host := baseHost
 	path := u
-	if i := strings.Index(u, "://"); i >= 0 {
-		rest := u[i+3:]
-		if j := strings.Index(rest, "/"); j >= 0 {
-			host = rest[:j]
-			path = rest[j:]
-		} else {
-			host = rest
-			path = "/"
+	if parsed, err := url.Parse(u); err == nil {
+		if parsed.Host != "" {
+			host = parsed.Host
 		}
+		path = parsed.Path
+	} else if i := strings.IndexAny(u, "?#"); i >= 0 {
+		// Defensive: url.Parse effectively never fails on these inputs, but if it
+		// did, still strip query/fragment before keying.
+		path = u[:i]
 	}
+	host = strings.ToLower(host)
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
@@ -774,8 +777,8 @@ func concatDedupKey(u, baseHost string) string {
 	return host + "|" + strings.Join(segments, "/")
 }
 
-// hostOfURL returns the host component of rawURL, or "" when it has none or is
-// unparseable (e.g. a relative or empty base). Used to origin-scope
+// hostOfURL returns the lower-cased host component of rawURL, or "" when it has
+// none or is unparseable (e.g. a relative or empty base). Used to origin-scope
 // concatDedupKey.
 func hostOfURL(rawURL string) string {
 	if rawURL == "" {
@@ -785,7 +788,7 @@ func hostOfURL(rawURL string) string {
 	if err != nil {
 		return ""
 	}
-	return u.Host
+	return strings.ToLower(u.Host)
 }
 
 // jsluiceURLToEndpoint converts a single jsluice.URL into an ExtractedEndpoint,
