@@ -1409,6 +1409,62 @@ func TestReplayJSExtracted_Filters404(t *testing.T) {
 		"only the 200-returning path should be appended")
 }
 
+// LAB-4992 regression: when JS-replay reaches the target, its probe verdict is
+// authoritative, so the passive offline concat mirror (SourceStaticJSConcat,
+// emitted by pkg/analyze/jsstatic) must be dropped for every reached path — a
+// 404'd decoy must NOT survive via the mirror. Candidates for paths JS-replay
+// never probed (fully offline / not in the bundle) must be preserved. Without
+// this, the classifier's static-JS confidence floor (Rule 6) would re-admit the
+// decoy, inflating the live concat-spa spec from 2 paths to 3.
+func TestReplayJSExtracted_DropsOfflineConcatMirrorForReachedPaths(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/orders") {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"ok":true}`)) //nolint:errcheck,gosec // test handler
+			return
+		}
+		w.WriteHeader(http.StatusNotFound) // /api/missing/0/gone decoy
+	}))
+	defer srv.Close()
+
+	// Bundle references two concat forms: a real one (200) and a decoy (404).
+	jsBody := []byte(`fetch("/api/users/".concat(uid,"/orders")); fetch("/api/missing/".concat(x,"/gone"));`)
+	requests := []ObservedRequest{
+		{
+			Method:   "GET",
+			URL:      srv.URL + "/app.js",
+			Source:   "katana",
+			Response: ObservedResponse{StatusCode: 200, ContentType: "application/javascript", Body: jsBody},
+		},
+		// Passive offline mirror emitted by jsstatic for the same reconstructions.
+		{Method: "GET", URL: srv.URL + "/api/users/0/orders", Source: SourceStaticJSConcat},
+		{Method: "GET", URL: srv.URL + "/api/missing/0/gone", Source: SourceStaticJSConcat},
+		// A concat candidate for a path NOT in the bundle — JS-replay never probes
+		// it, so it must be preserved (offline fallback).
+		{Method: "GET", URL: srv.URL + "/api/offline/0/thing", Source: SourceStaticJSConcat},
+	}
+
+	result := ReplayJSExtracted(context.Background(), requests, allowLocal(srv))
+
+	var concatMirror, jsExtract []string
+	for _, r := range result {
+		switch r.Source {
+		case SourceStaticJSConcat:
+			concatMirror = append(concatMirror, r.URL)
+		case "js-extract":
+			jsExtract = append(jsExtract, r.URL)
+		}
+	}
+	// Reached paths (200 orders + 404 gone) dropped from the mirror; the
+	// unreached offline candidate survives.
+	assert.Equal(t, []string{srv.URL + "/api/offline/0/thing"}, concatMirror,
+		"only the unreached offline concat candidate should survive; reached ones (incl. the 404 decoy) are superseded by the probe")
+	assert.Contains(t, jsExtract, srv.URL+"/api/users/0/orders",
+		"the 200 path should be re-added as a probed js-extract observation")
+	assert.NotContains(t, jsExtract, srv.URL+"/api/missing/0/gone",
+		"the 404 decoy must not be present as js-extract either")
+}
+
 // errRoundTripper always returns the configured error from RoundTrip.
 type errRoundTripper struct{ err error }
 

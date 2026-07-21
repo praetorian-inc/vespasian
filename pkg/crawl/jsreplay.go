@@ -1924,6 +1924,16 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	result := make([]ObservedRequest, len(requests))
 	copy(result, requests)
 
+	// reached records every full URL the target answered for (any status,
+	// including 404). For those paths JS-replay is authoritative, so the passive
+	// offline concat mirror (SourceStaticJSConcat, emitted by pkg/analyze/jsstatic)
+	// is dropped after the loop — a 404'd decoy must not survive via the mirror,
+	// and a confirmed path is already re-added below as a richer js-extract
+	// observation. Paths the target never answered (connection failures / fully
+	// offline) are absent here, so their offline candidates are preserved
+	// (LAB-4992 AC1).
+	reached := make(map[string]bool)
+
 	probed := 0
 	for _, path := range sortedPaths {
 		if probed >= cfg.MaxEndpoints {
@@ -1977,6 +1987,9 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		if resp == nil {
 			continue
 		}
+		// The target answered (200 or 404), so JS-replay is authoritative for
+		// this reconstructed path — record it so the offline mirror is dropped.
+		reached[fullURL] = true
 
 		// Skip 404 responses — these are typically wrong service prefix
 		// combinations (e.g., /identity/api/shop/products when the correct
@@ -2008,6 +2021,22 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	if probed >= cfg.MaxEndpoints && len(sortedPaths) > cfg.MaxEndpoints {
 		warnf("js-extract: warning: probed %d/%d discovered paths (MaxEndpoints limit reached; raise MaxEndpoints to scan more)\n",
 			probed, len(sortedPaths))
+	}
+
+	// Drop the passive offline concat mirror for every path the live probe
+	// reached: JS-replay's verdict (200 -> js-extract above; 404 -> excluded)
+	// supersedes the unprobed SourceStaticJSConcat candidate, so a decoy the
+	// target 404s does not leak back into the spec via the offline mirror.
+	// Candidates for unreached paths are untouched (offline fallback, LAB-4992).
+	if len(reached) > 0 {
+		filtered := result[:0]
+		for _, r := range result {
+			if r.Source == SourceStaticJSConcat && reached[r.URL] {
+				continue
+			}
+			filtered = append(filtered, r)
+		}
+		result = filtered
 	}
 
 	return result
