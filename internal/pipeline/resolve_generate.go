@@ -19,6 +19,7 @@ import (
 	"io"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 )
 
 // ScanOptions configures ResolveAndGenerate.
@@ -84,7 +85,7 @@ func ResolveAndGenerate(ctx context.Context, requests []crawl.ObservedRequest, o
 		apiType = DetectAPIType(requests, opts.Confidence)
 	}
 
-	requests, apiType, foundWSDL = ResolveWSDLType(ctx, opts.TargetURL, apiType, requests, opts.Probe, opts.AllowPrivate, opts.Status)
+	requests, apiType, foundWSDL = ResolveWSDLType(ctx, opts.TargetURL, apiType, requests, opts.Probe, opts.AllowPrivate, httpx.ProxyConfig{}, opts.Status)
 
 	if opts.AfterWSDL != nil {
 		requests = opts.AfterWSDL(ctx, requests)

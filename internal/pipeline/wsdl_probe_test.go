@@ -17,9 +17,12 @@ package pipeline_test
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -27,6 +30,7 @@ import (
 
 	"github.com/praetorian-inc/vespasian/internal/pipeline"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 )
 
 // validWSDLDocument is a minimal well-formed WSDL document accepted by ParseWSDL.
@@ -70,7 +74,7 @@ func wsdlServer(t *testing.T) *httptest.Server {
 func TestProbeWSDLDocument_HappyPath(t *testing.T) {
 	ts := wsdlServer(t)
 
-	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/service.asmx", true, nil)
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/service.asmx", true, httpx.ProxyConfig{}, nil)
 	require.NotNil(t, doc, "expected non-nil WSDL bytes for valid endpoint")
 	assert.True(t, strings.Contains(string(doc), "Calculator"), "expected Calculator service in WSDL")
 }
@@ -82,13 +86,13 @@ func TestProbeWSDLDocument_NotWSDLReturnsNil(t *testing.T) {
 	}))
 	t.Cleanup(ts.Close)
 
-	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL, true, nil)
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL, true, httpx.ProxyConfig{}, nil)
 	assert.Nil(t, doc)
 }
 
 func TestProbeWSDLDocument_InvalidURLReturnsNil(t *testing.T) {
 	var buf bytes.Buffer
-	doc := pipeline.ProbeWSDLDocument(context.Background(), "://bad", true, &buf)
+	doc := pipeline.ProbeWSDLDocument(context.Background(), "://bad", true, httpx.ProxyConfig{}, &buf)
 	assert.Nil(t, doc, "expected nil bytes when url.Parse fails")
 	assert.Contains(t, buf.String(), "invalid URL")
 }
@@ -97,7 +101,7 @@ func TestProbeWSDLDocument_StatusWriterRecordsProgress(t *testing.T) {
 	ts := wsdlServer(t)
 
 	var buf bytes.Buffer
-	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL, true, &buf)
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL, true, httpx.ProxyConfig{}, &buf)
 	require.NotNil(t, doc)
 	assert.Contains(t, buf.String(), "wsdl discovery")
 }
@@ -114,7 +118,7 @@ func TestProbeAndAppendWSDLRequest_AppendsOnSuccess(t *testing.T) {
 	}
 
 	augmented, foundWSDL, resolvedType := pipeline.ProbeAndAppendWSDLRequest(
-		context.Background(), ts.URL, initial, true, nil,
+		context.Background(), ts.URL, initial, true, httpx.ProxyConfig{}, nil,
 	)
 
 	assert.True(t, foundWSDL)
@@ -141,7 +145,7 @@ func TestProbeAndAppendWSDLRequest_NoWSDLReturnsOriginal(t *testing.T) {
 
 	initial := []crawl.ObservedRequest{{Method: "GET", URL: ts.URL + "/"}}
 	augmented, foundWSDL, resolvedType := pipeline.ProbeAndAppendWSDLRequest(
-		context.Background(), ts.URL, initial, true, nil,
+		context.Background(), ts.URL, initial, true, httpx.ProxyConfig{}, nil,
 	)
 
 	assert.False(t, foundWSDL)
@@ -156,7 +160,7 @@ func TestProbeAndAppendWSDLRequest_URLWithExistingQuery(t *testing.T) {
 	targetURL := ts.URL + "/service?version=2"
 
 	augmented, foundWSDL, _ := pipeline.ProbeAndAppendWSDLRequest(
-		context.Background(), targetURL, nil, true, nil,
+		context.Background(), targetURL, nil, true, httpx.ProxyConfig{}, nil,
 	)
 
 	require.True(t, foundWSDL)
@@ -178,7 +182,7 @@ func TestProbeAndAppendWSDLRequest_URLWithExistingQuery(t *testing.T) {
 
 func TestProbeWSDLDocument_SSRFRejectsPrivateURL(t *testing.T) {
 	var buf bytes.Buffer
-	doc := pipeline.ProbeWSDLDocument(context.Background(), "http://127.0.0.1:1/svc", false, &buf)
+	doc := pipeline.ProbeWSDLDocument(context.Background(), "http://127.0.0.1:1/svc", false, httpx.ProxyConfig{}, &buf)
 	assert.Nil(t, doc, "expected nil bytes for SSRF-rejected URL")
 	assert.Contains(t, buf.String(), "SSRF protection")
 }
@@ -197,7 +201,7 @@ func TestProbeWSDLDocument_RejectsHTTPErrorStatus(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	var buf bytes.Buffer
-	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/svc", true, &buf)
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/svc", true, httpx.ProxyConfig{}, &buf)
 	assert.Nil(t, doc, "expected nil bytes for HTTP 404")
 	assert.Contains(t, buf.String(), "returned HTTP 404")
 }
@@ -223,6 +227,7 @@ func TestResolveWSDLType_ProbeDisabledIsNoOp(t *testing.T) {
 		initial,
 		false, // probe disabled
 		true,
+		httpx.ProxyConfig{},
 		&buf,
 	)
 
@@ -248,6 +253,7 @@ func TestResolveWSDLType_NonWSDLRestTypeIsNoOp(t *testing.T) {
 		initial,
 		true, // probe enabled — but apiType is graphql, so must be skipped
 		true,
+		httpx.ProxyConfig{},
 		&buf,
 	)
 
@@ -276,6 +282,7 @@ func TestResolveWSDLType_ProbeSuccessReturnsWSDL(t *testing.T) {
 		initial,
 		true, // probe enabled
 		true,
+		httpx.ProxyConfig{},
 		nil,
 	)
 
@@ -307,6 +314,7 @@ func TestResolveWSDLType_ProbeFailureRetainsInputType(t *testing.T) {
 		initial,
 		true, // probe enabled
 		true,
+		httpx.ProxyConfig{},
 		nil,
 	)
 
@@ -335,10 +343,51 @@ func TestResolveWSDLType_SSRFGate_AllowPrivateFalse(t *testing.T) {
 		initial,
 		true,  // probe enabled
 		false, // allowPrivate=false — SSRF protection ON (SDK config)
+		httpx.ProxyConfig{},
 		&buf,
 	)
 
 	assert.False(t, found, "SSRF gate must reject a private target as a probe miss")
 	assert.Equal(t, pipeline.APITypeREST, resolvedType, "apiType must be preserved when the SSRF gate blocks the probe")
 	assert.Equal(t, initial, got, "requests slice must be returned unchanged when the probe is blocked")
+}
+
+// ---------------------------------------------------------------------------
+// Task 6: WSDL discovery client honors proxy (LAB-4993)
+// ---------------------------------------------------------------------------
+
+// TestProbeWSDLDocument_RoutesThroughProxy is the AC-1 proof for WSDL
+// discovery: end-to-end, modeled on pkg/crawl/http_crawler_test.go:195
+// (recording forwarding proxy). A valid WSDL document is served from the
+// origin, and only reachable because the proxied client's dial-time SSRF pin
+// is skipped for the (loopback) proxy connection.
+func TestProbeWSDLDocument_RoutesThroughProxy(t *testing.T) {
+	ts := wsdlServer(t)
+
+	var proxied atomic.Int64
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxied.Add(1)
+		outReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.RequestURI, nil) //nolint:gosec // test proxy forwards the received request URI
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		resp, err := http.DefaultTransport.RoundTrip(outReq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close() //nolint:errcheck // test cleanup
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body) //nolint:errcheck,gosec // test best-effort
+	}))
+	defer proxy.Close()
+
+	proxyURL, err := url.Parse(proxy.URL)
+	require.NoError(t, err)
+
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/svc", true, httpx.ProxyConfig{URL: proxyURL}, nil)
+	require.NotNil(t, doc, "expected non-nil WSDL bytes when fetched through the proxy")
+	assert.True(t, strings.Contains(string(doc), "Calculator"))
+	assert.NotZero(t, proxied.Load(), "WSDL fetch must route through the configured proxy")
 }
