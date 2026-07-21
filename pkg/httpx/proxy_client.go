@@ -81,7 +81,8 @@ func BuildHTTPClient(p ProxyConfig, timeout time.Duration,
 	// socks5 tunnels TCP transparently — TLS runs directly against the real target
 	// through the tunnel — so verification is always kept for socks5.
 	if p.Insecure && p.URL != nil && (p.URL.Scheme == "http" || p.URL.Scheme == "https") {
-		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // G402: opt-in via --proxy-insecure for http/https proxy MITM (see doc comment)
+		// #nosec G402 -- opt-in via --proxy-insecure for http/https proxy MITM; socks5 always verifies (see package doc)
+		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 	return &http.Client{
 		Transport:     t,
@@ -150,6 +151,7 @@ func connectDialer(p ProxyConfig) func(ctx context.Context, addr string) (net.Co
 		// it does not leak into the tunneled traffic that follows.
 		if dl, ok := ctx.Deadline(); ok {
 			if err := conn.SetDeadline(dl); err != nil {
+				// #nosec G104 -- best-effort cleanup; the conn is discarded on this error path, so a close error is unactionable.
 				conn.Close() //nolint:errcheck,gosec // best-effort cleanup on deadline-set failure
 				return nil, fmt.Errorf("httpx: setting proxy CONNECT deadline: %w", err)
 			}
@@ -157,6 +159,7 @@ func connectDialer(p ProxyConfig) func(ctx context.Context, addr string) (net.Co
 
 		req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", addr, addr)
 		if _, err := conn.Write([]byte(req)); err != nil {
+			// #nosec G104 -- best-effort cleanup; the conn is discarded on this error path, so a close error is unactionable.
 			conn.Close() //nolint:errcheck,gosec // best-effort cleanup on write failure
 			return nil, fmt.Errorf("httpx: writing CONNECT to proxy: %w", err)
 		}
@@ -164,17 +167,21 @@ func connectDialer(p ProxyConfig) func(ctx context.Context, addr string) (net.Co
 		br := bufio.NewReader(conn)
 		resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
 		if err != nil {
+			// #nosec G104 -- best-effort cleanup; the conn is discarded on this error path, so a close error is unactionable.
 			conn.Close() //nolint:errcheck,gosec // best-effort cleanup on read failure
 			return nil, fmt.Errorf("httpx: reading CONNECT response: %w", err)
 		}
+		// #nosec G104 -- CONNECT response has no body; closing an empty body cannot fail meaningfully.
 		resp.Body.Close() //nolint:errcheck,gosec // CONNECT response has no body
 		if resp.StatusCode != http.StatusOK {
+			// #nosec G104 -- best-effort cleanup; the conn is discarded on this error path, so a close error is unactionable.
 			conn.Close() //nolint:errcheck,gosec // best-effort cleanup on non-200
 			return nil, fmt.Errorf("httpx: proxy CONNECT to %s failed: %s", addr, resp.Status)
 		}
 
 		// Clear the handshake deadline so it does not apply to tunneled traffic.
 		if err := conn.SetDeadline(time.Time{}); err != nil {
+			// #nosec G104 -- best-effort cleanup; the conn is discarded on this error path, so a close error is unactionable.
 			conn.Close() //nolint:errcheck,gosec // best-effort cleanup on deadline-clear failure
 			return nil, fmt.Errorf("httpx: clearing proxy CONNECT deadline: %w", err)
 		}
@@ -194,7 +201,8 @@ func dialProxy(ctx context.Context, p ProxyConfig) (net.Conn, error) {
 	if p.URL.Scheme == "https" {
 		tlsCfg := &tls.Config{ServerName: p.URL.Hostname()}
 		if p.Insecure {
-			tlsCfg.InsecureSkipVerify = true //nolint:gosec // G402: opt-in via --proxy-insecure for https proxy MITM
+			// #nosec G402 -- opt-in via --proxy-insecure for https proxy MITM
+			tlsCfg.InsecureSkipVerify = true
 		}
 		d := &tls.Dialer{Config: tlsCfg}
 		conn, err := d.DialContext(ctx, "tcp", p.URL.Host)
