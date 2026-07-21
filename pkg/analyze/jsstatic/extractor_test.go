@@ -770,3 +770,21 @@ func TestExtractFromBundle_ConcatSentinelZeroCollapsesOntoParam(t *testing.T) {
 		t.Errorf("literal-0 concat companion /api/items/0 must collapse onto the param path (documented sentinel exception); got %v", endpoints)
 	}
 }
+
+// LAB-4992 dedup guard, case-insensitive host: hostnames are case-insensitive,
+// so concatDedupKey/hostOfURL lower-case them. An AST absolute URL on
+// "EXAMPLE.com" and a same-origin relative concat on the "example.com" bundle
+// must be recognized as the same origin, suppressing the phantom companion.
+func TestExtractFromBundle_ConcatDedupHostCaseInsensitive(t *testing.T) {
+	src := []byte(`fetch("https://EXAMPLE.com/api/ping"); var u = "/api/" + "ping"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/ping"); ep != nil {
+		t.Errorf("relative concat /api/ping must dedup against the differently-cased same-origin AST URL; got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "https://EXAMPLE.com/api/ping"); ep == nil {
+		t.Errorf("expected AST-recovered https://EXAMPLE.com/api/ping, got %v", endpoints)
+	}
+}
