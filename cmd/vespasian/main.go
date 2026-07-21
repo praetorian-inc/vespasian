@@ -640,14 +640,11 @@ type ScanCmd struct {
 // scanOptions builds the pipeline.ScanOptions for this command. The c-derived
 // fields (incl. GRPCInsecureSkipVerify) are collected here so a CLI-boundary test
 // can assert each flag reaches pipeline.ScanOptions (catching a dropped assignment)
-// without executing Run(). The two runtime-derived inputs — the resolved apiType
-// and the AfterWSDL closure (which captures bs.opts.Headers/c/c.URL) — are passed
-// in by Run().
-func (c *ScanCmd) scanOptions(apiType string, afterWSDL func(ctx context.Context, reqs []crawl.ObservedRequest) []crawl.ObservedRequest) pipeline.ScanOptions {
-	// --proxy (from the embedded CrawlOptions) is validated fail-fast by doCrawl
-	// during the crawl stage before scanOptions() is reached; parseProxyConfigOrEmpty
-	// falls back to no proxy on the (unreachable) error.
-	proxy := parseProxyConfigOrEmpty(c.Proxy, c.ProxyInsecure)
+// without executing Run(). The three runtime-derived inputs — the resolved apiType,
+// the AfterWSDL closure (which captures bs.opts.Headers/c/c.URL), and the parsed
+// proxy — are passed in by Run(), which parses --proxy once (parseProxyConfigOrEmpty)
+// and reuses it across the crawl, sourcemap, JS-replay, and probe stages.
+func (c *ScanCmd) scanOptions(apiType string, afterWSDL func(ctx context.Context, reqs []crawl.ObservedRequest) []crawl.ObservedRequest, proxy httpx.ProxyConfig) pipeline.ScanOptions {
 	return pipeline.ScanOptions{
 		TargetURL:              c.URL,
 		APIType:                apiType,
@@ -768,7 +765,7 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		return maybeReplayJSExtracted(ctx, reqs, c.Probe && c.AnalyzeJS,
 			buildJSReplayConfig(bs.opts.Headers, c.URL, c.DangerousAllowPrivate, c.Verbose, scanProxy))
 	}
-	spec, apiType, foundWSDL, _, err := pipeline.ResolveAndGenerate(genCtx, requests, c.scanOptions(apiType, afterWSDL))
+	spec, apiType, foundWSDL, _, err := pipeline.ResolveAndGenerate(genCtx, requests, c.scanOptions(apiType, afterWSDL, scanProxy))
 	if err != nil {
 		return err
 	}

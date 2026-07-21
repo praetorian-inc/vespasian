@@ -1016,9 +1016,9 @@ func TestGRPCInsecureSkipVerify_ReachesOptions(t *testing.T) {
 		"GenerateCmd flag must reach pipeline.Options")
 	require.False(t, (&GenerateCmd{GRPCInsecureSkipVerify: false}).options().GRPCInsecureSkipVerify)
 
-	require.True(t, (&ScanCmd{GRPCInsecureSkipVerify: true}).scanOptions("rest", nil).GRPCInsecureSkipVerify,
+	require.True(t, (&ScanCmd{GRPCInsecureSkipVerify: true}).scanOptions("rest", nil, httpx.ProxyConfig{}).GRPCInsecureSkipVerify,
 		"ScanCmd flag must reach pipeline.ScanOptions")
-	require.False(t, (&ScanCmd{GRPCInsecureSkipVerify: false}).scanOptions("rest", nil).GRPCInsecureSkipVerify)
+	require.False(t, (&ScanCmd{GRPCInsecureSkipVerify: false}).scanOptions("rest", nil, httpx.ProxyConfig{}).GRPCInsecureSkipVerify)
 }
 
 // TestDangerousAllowPrivate_SameOutputForPublicURLs verifies that allowPrivate=true
@@ -3443,6 +3443,7 @@ func TestGenerateCmd_Options_CarriesProxy(t *testing.T) {
 // scanOptions().
 func TestScanCmd_ScanOptions_CarriesProxy(t *testing.T) {
 	cmd := &ScanCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080"}}
-	opts := cmd.scanOptions("rest", nil)
-	require.NotNil(t, opts.Proxy.URL, "ScanCmd.Proxy must reach pipeline.ScanOptions.Proxy")
+	proxy := parseProxyConfigOrEmpty(cmd.Proxy, cmd.ProxyInsecure)
+	opts := cmd.scanOptions("rest", nil, proxy)
+	require.NotNil(t, opts.Proxy.URL, "scanOptions must carry the passed proxy into pipeline.ScanOptions.Proxy")
 }
