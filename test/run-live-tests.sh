@@ -178,7 +178,7 @@ preflight_test_host() {
     local targets=$1
     local failed=0
     case ",${targets}," in
-        *,rest-api,*|*,edge-cases,*|*,crawl-depth,*)
+        *,rest-api,*|*,edge-cases,*|*,crawl-depth,*|*,no-download,*)
             _probe_target_host "${REST_API_PORT:-}" "/api/health" "rest-api" || failed=1
             ;;
     esac
@@ -2942,14 +2942,23 @@ test_no_download() {
     # fetch a managed Chromium, but fetchup's FastestURL() finds no reachable
     # mirror, returns ErrNoURLs, and Download() (the only cache-writing code) is
     # never reached — so the cache stays empty and the crawl fails. Detection 1
-    # alone would mask this as a SKIP. These markers are emitted ONLY when go-rod
-    # takes the auto-download path (i.e. .Bin was empty = pin regressed): the
-    # Download() error wrap, fetchup's ErrNoURLs, go-rod's download logger prefix,
-    # and the third-party mirror hosts. None appear on a normal pinned crawl.
-    if grep -qiE "can't find a browser binary for your OS|Not able to find a valid URL to download|\[launcher\.Browser\]|storage\.googleapis\.com|registry\.npmmirror\.com|playwright\.(azureedge\.net|download)" "$crawl_log"; then
+    # alone would mask this as a SKIP. These markers appear ONLY when go-rod takes
+    # the auto-download path (.Bin empty = pin regressed); which ones show depends
+    # on egress mode, and the guard matches any:
+    #   - "can't find a browser binary for your OS" — go-rod Download() error wrap
+    #     (block egress: the download failed).
+    #   - "Not able to find a valid URL to download" — fetchup ErrNoURLs; its
+    #     message embeds the mirror-host URL list, so the host markers below also
+    #     appear here (block egress).
+    #   - "[launcher.Browser]" — go-rod's download-logger prefix (audit egress,
+    #     where the download proceeds).
+    #   - the three go-rod mirror hosts (HostGoogle/HostNPM/HostPlaywright).
+    # None appear on a normal pinned crawl, which never enters the download path.
+    local dl_markers="can't find a browser binary for your OS|Not able to find a valid URL to download|\[launcher\.Browser\]|storage\.googleapis\.com|registry\.npmmirror\.com|playwright\.azureedge\.net"
+    if grep -qiE "$dl_markers" "$crawl_log"; then
         log_fail "go-rod attempted a browser download during the crawl — LAB-4999 pin regressed (download blocked by egress policy)"
         log_info "matching crawl output:"
-        grep -iE "can't find a browser binary for your OS|Not able to find a valid URL to download|\[launcher\.Browser\]|storage\.googleapis\.com|registry\.npmmirror\.com|playwright\.(azureedge\.net|download)" "$crawl_log" | head -5
+        grep -iE "$dl_markers" "$crawl_log" | head -5
         set_test_result "no-download" "FAIL" "-" "-" "$((SECONDS - start))"
         return 1
     fi
