@@ -1989,7 +1989,11 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		}
 		// The target answered (200 or 404), so JS-replay is authoritative for
 		// this reconstructed path — record it so the offline mirror is dropped.
-		reached[fullURL] = true
+		// Keyed on a normalized form (lower-cased host, trailing slash trimmed)
+		// so the match survives host-case / trailing-slash differences between
+		// the target origin used here and the capture origin jsstatic resolved
+		// the mirror against.
+		reached[probeMatchKey(fullURL)] = true
 
 		// Skip 404 responses — these are typically wrong service prefix
 		// combinations (e.g., /identity/api/shop/products when the correct
@@ -2028,10 +2032,15 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	// supersedes the unprobed SourceStaticJSConcat candidate, so a decoy the
 	// target 404s does not leak back into the spec via the offline mirror.
 	// Candidates for unreached paths are untouched (offline fallback, LAB-4992).
+	//
+	// Residual limitation: paths beyond cfg.MaxEndpoints are never probed, so
+	// they never enter `reached` and their offline mirror is retained — a decoy
+	// past the cap can still surface. This matches the pre-existing MaxEndpoints
+	// truncation semantics (the warn above) and is bounded by that cap.
 	if len(reached) > 0 {
 		filtered := result[:0]
 		for _, r := range result {
-			if r.Source == SourceStaticJSConcat && reached[r.URL] {
+			if r.Source == SourceStaticJSConcat && reached[probeMatchKey(r.URL)] {
 				continue
 			}
 			filtered = append(filtered, r)
@@ -2040,6 +2049,26 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	}
 
 	return result
+}
+
+// probeMatchKey normalizes a URL so the live-probe reached-set matches the
+// offline concat mirror despite cosmetic differences. jsstatic resolves the
+// mirror URL against the capture origin (via url.ResolveReference, which does
+// not lower-case the host) while JS-replay builds its probe URL from the target
+// origin; a host-case or trailing-slash difference would otherwise make the
+// mirror-drop silently no-op and re-open the 404-decoy leak. Normalization:
+// lower-case the host, trim a trailing slash from the path. Unparseable URLs
+// fall back to the raw string.
+func probeMatchKey(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	u.Host = strings.ToLower(u.Host)
+	if u.Path != "/" {
+		u.Path = strings.TrimRight(u.Path, "/")
+	}
+	return u.String()
 }
 
 // --- HTTP helpers ---

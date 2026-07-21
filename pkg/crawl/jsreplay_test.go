@@ -1439,6 +1439,9 @@ func TestReplayJSExtracted_DropsOfflineConcatMirrorForReachedPaths(t *testing.T)
 		// Passive offline mirror emitted by jsstatic for the same reconstructions.
 		{Method: "GET", URL: srv.URL + "/api/users/0/orders", Source: SourceStaticJSConcat},
 		{Method: "GET", URL: srv.URL + "/api/missing/0/gone", Source: SourceStaticJSConcat},
+		// A mirror whose URL differs only by a trailing slash from the probed
+		// URL — probeMatchKey normalization must still drop it.
+		{Method: "GET", URL: srv.URL + "/api/missing/0/gone/", Source: SourceStaticJSConcat},
 		// A concat candidate for a path NOT in the bundle — JS-replay never probes
 		// it, so it must be preserved (offline fallback).
 		{Method: "GET", URL: srv.URL + "/api/offline/0/thing", Source: SourceStaticJSConcat},
@@ -1463,6 +1466,27 @@ func TestReplayJSExtracted_DropsOfflineConcatMirrorForReachedPaths(t *testing.T)
 		"the 200 path should be re-added as a probed js-extract observation")
 	assert.NotContains(t, jsExtract, srv.URL+"/api/missing/0/gone",
 		"the 404 decoy must not be present as js-extract either")
+}
+
+// TestProbeMatchKey pins the reached-set normalization that lets the offline
+// concat mirror match the live probe URL despite cosmetic differences: the host
+// is lower-cased and a trailing slash is trimmed. Without this the mirror-drop
+// would silently no-op when jsstatic (which resolves against the capture origin,
+// preserving host case) and JS-replay (which builds from the target origin)
+// disagree on host case or a trailing slash, re-opening the 404-decoy leak.
+func TestProbeMatchKey(t *testing.T) {
+	tests := []struct{ a, b string }{
+		{"http://Example.COM/api/x", "http://example.com/api/x"},            // host case
+		{"http://example.com/api/x/", "http://example.com/api/x"},           // trailing slash
+		{"http://Example.com:8080/api/x/", "http://example.com:8080/api/x"}, // both + port
+	}
+	for _, tt := range tests {
+		assert.Equal(t, probeMatchKey(tt.a), probeMatchKey(tt.b),
+			"expected %q and %q to normalize to the same key", tt.a, tt.b)
+	}
+	// Genuinely different paths/hosts must NOT collapse.
+	assert.NotEqual(t, probeMatchKey("http://example.com/api/x"), probeMatchKey("http://example.com/api/y"))
+	assert.NotEqual(t, probeMatchKey("http://a.com/api/x"), probeMatchKey("http://b.com/api/x"))
 }
 
 // errRoundTripper always returns the configured error from RoundTrip.
