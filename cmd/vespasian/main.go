@@ -403,6 +403,12 @@ func (c *CrawlCmd) Run() error {
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
+	// c.Proxy was validated fail-fast by doCrawl above, so a parse error here is
+	// unreachable in the normal flow; fall back to no proxy defensively.
+	crawlProxy, err := parseProxyConfig(c.Proxy, c.ProxyInsecure)
+	if err != nil {
+		crawlProxy = httpx.ProxyConfig{}
+	}
 	// NOTE: running `crawl` (with --analyze-js) followed by `generate` (also
 	// with --analyze-js, the default) does NOT re-analyze the same JS bundles.
 	// AnalyzeJS's idempotency guard (crawl.AnyStaticSource) detects the
@@ -414,6 +420,7 @@ func (c *CrawlCmd) Run() error {
 		AllowPrivate:    c.DangerousAllowPrivate,
 		Status:          statusWriter(c.Verbose),
 		WarnError:       os.Stderr,
+		Proxy:           crawlProxy,
 	})
 
 	return writeOutput(c.Output, func(w io.Writer) error {
@@ -592,6 +599,7 @@ func (c *GenerateCmd) Run() (err error) {
 		AllowPrivate:    c.DangerousAllowPrivate,
 		Status:          statusWriter(c.Verbose),
 		WarnError:       os.Stderr,
+		Proxy:           jsReplayCfg.Proxy,
 	})
 
 	warnSSRFDisabled(c.DangerousAllowPrivate, c.Probe)
@@ -708,6 +716,14 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
+	// c.Proxy was validated fail-fast by doCrawl above (crawl stage), so a parse
+	// error here is unreachable in the normal flow; fall back to no proxy. Reused
+	// for both the sourcemap-fetch (Augment) and JS-replay (afterWSDL) stages.
+	scanProxy, err := parseProxyConfig(c.Proxy, c.ProxyInsecure)
+	if err != nil {
+		scanProxy = httpx.ProxyConfig{}
+	}
+
 	// Augment captured requests with static-HTML form analysis + JS bundle
 	// static analysis in the canonical forms-then-jsstatic order (see
 	// pipeline.Augment). Same helper used by GenerateCmd.Run — the order
@@ -719,6 +735,7 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		AllowPrivate:    c.DangerousAllowPrivate,
 		Status:          statusWriter(c.Verbose),
 		WarnError:       os.Stderr,
+		Proxy:           scanProxy,
 	})
 
 	// Resolve the API type up front (when auto) so the verbose "detected API
@@ -757,12 +774,7 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	// gated on both c.AnalyzeJS (so --analyze-js=false suppresses the JS-bundle
 	// rescan) and c.Probe (so --probe=false stays passive — see
 	// maybeReplayJSExtracted), and is CLI-only (the SDK passes a nil AfterWSDL hook).
-	// c.Proxy was validated fail-fast by doCrawl above (crawl stage), so a parse
-	// error here is unreachable in the normal flow; fall back to no proxy.
-	scanProxy, err := parseProxyConfig(c.Proxy, c.ProxyInsecure)
-	if err != nil {
-		scanProxy = httpx.ProxyConfig{}
-	}
+	// scanProxy (parsed above, before Augment) is reused here for JS-replay.
 	afterWSDL := func(ctx context.Context, reqs []crawl.ObservedRequest) []crawl.ObservedRequest {
 		return maybeReplayJSExtracted(ctx, reqs, c.Probe && c.AnalyzeJS,
 			buildJSReplayConfig(bs.opts.Headers, c.URL, c.DangerousAllowPrivate, c.Verbose, scanProxy))
