@@ -62,9 +62,10 @@ type BrowserManager struct {
 // BrowserOptions.NoSandbox or via the VESPASIAN_NO_SANDBOX env var (set by CI
 // workflows). It is the single source of truth for that decision; both
 // configureLauncher and browser_test.go consult it. Keeping the decision in a
-// self-contained helper lets the test assert Vespasian's contribution directly, which
-// stays deterministic even where go-rod's launcher.New() adds --no-sandbox by
-// default in containers and masks the launcher-observed flag (LAB-4994).
+// self-contained helper lets the test assert Vespasian's contribution
+// directly, which stays deterministic even where go-rod's launcher.New() adds
+// --no-sandbox by default in containers and masks the launcher-observed flag
+// (LAB-4994).
 func vespasianEnablesNoSandbox(opts BrowserOptions) bool {
 	return opts.NoSandbox || os.Getenv("VESPASIAN_NO_SANDBOX") == "true"
 }

@@ -85,13 +85,13 @@ func TestConfigureLauncher(t *testing.T) {
 			t.Run(tt.name, func(t *testing.T) {
 				t.Setenv("VESPASIAN_NO_SANDBOX", tt.envVal)
 
-				// Assert Vespasian's own opt-in decision directly via the pure
-				// helper. Unlike the launcher-baseline check below, this does not
-				// observe go-rod's container default, so it stays deterministic in
-				// every environment: the negative cases still catch a regression
-				// that unconditionally enables the sandbox flag, even in
-				// dev-containers where launcher.New() adds --no-sandbox by default
-				// (LAB-4994).
+				// Assert Vespasian's own opt-in decision directly via the
+				// self-contained helper. Unlike the launcher-baseline check
+				// below, this does not observe go-rod's container default, so it
+				// stays deterministic in every environment: the negative cases
+				// still catch a regression that unconditionally enables the
+				// sandbox flag, even in dev-containers where launcher.New() adds
+				// --no-sandbox by default (LAB-4994).
 				opts := BrowserOptions{NoSandbox: tt.noSandbox}
 				if got := vespasianEnablesNoSandbox(opts); got != tt.vespasianOn {
 					t.Errorf("vespasianEnablesNoSandbox = %v, want %v", got, tt.vespasianOn)
@@ -104,6 +104,15 @@ func TestConfigureLauncher(t *testing.T) {
 				// Launcher-baseline check, retained for go-rod compatibility:
 				// Vespasian forcing the flag on is authoritative; when it does
 				// not, the flag should equal the launcher's baseline default.
+				//
+				// Load-bearing assumption: this sub-assertion only exercises the
+				// configureLauncher wiring on a non-container runner, where
+				// baselineNoSandbox is false (e.g. CI's ubuntu-24.04 VM). In a
+				// container baselineNoSandbox is true, so want is unconditionally
+				// true and this check is vacuous — the environment-independent
+				// regression guard is the vespasianEnablesNoSandbox assertion
+				// above. If CI ever moves to a containerized runner, restore
+				// container-independent coverage of the configureLauncher wiring.
 				want := tt.vespasianOn || baselineNoSandbox
 				got := l.Has("no-sandbox")
 				if got != want {
