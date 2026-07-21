@@ -2054,21 +2054,30 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 // probeMatchKey normalizes a URL so the live-probe reached-set matches the
 // offline concat mirror despite cosmetic differences. jsstatic resolves the
 // mirror URL against the capture origin (via url.ResolveReference, which does
-// not lower-case the host) while JS-replay builds its probe URL from the target
-// origin; a host-case or trailing-slash difference would otherwise make the
-// mirror-drop silently no-op and re-open the 404-decoy leak. Normalization:
-// lower-case the host, trim a trailing slash from the path. Unparseable URLs
+// not lower-case the host and keeps an explicit default port) while JS-replay
+// builds its probe URL from the target origin; a host-case, default-port, or
+// trailing-slash difference would otherwise make the mirror-drop silently no-op
+// and re-open the 404-decoy leak.
+//
+// The origin is canonicalized via originOf (the same helper isSameOrigin uses:
+// lower-cased scheme+host, default port filled in) so "example.com" and
+// "example.com:80" match while a non-default port (":8080") stays distinct; the
+// path is appended with a trailing slash trimmed. Unparseable / host-less URLs
 // fall back to the raw string.
 func probeMatchKey(rawURL string) string {
+	origin := originOf(rawURL)
+	if origin == "" {
+		return rawURL
+	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return rawURL
 	}
-	u.Host = strings.ToLower(u.Host)
-	if u.Path != "/" {
-		u.Path = strings.TrimRight(u.Path, "/")
+	path := u.EscapedPath()
+	if path != "/" {
+		path = strings.TrimRight(path, "/")
 	}
-	return u.String()
+	return origin + path
 }
 
 // --- HTTP helpers ---

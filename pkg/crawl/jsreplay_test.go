@@ -1478,15 +1478,21 @@ func TestProbeMatchKey(t *testing.T) {
 	tests := []struct{ a, b string }{
 		{"http://Example.COM/api/x", "http://example.com/api/x"},            // host case
 		{"http://example.com/api/x/", "http://example.com/api/x"},           // trailing slash
-		{"http://Example.com:8080/api/x/", "http://example.com:8080/api/x"}, // both + port
+		{"http://example.com/api/x", "http://example.com:80/api/x"},         // default http port
+		{"https://example.com/api/x", "https://example.com:443/api/x"},      // default https port
+		{"http://Example.com:8080/api/x/", "http://example.com:8080/api/x"}, // host case + trailing slash on a non-default port
 	}
 	for _, tt := range tests {
 		assert.Equal(t, probeMatchKey(tt.a), probeMatchKey(tt.b),
 			"expected %q and %q to normalize to the same key", tt.a, tt.b)
 	}
-	// Genuinely different paths/hosts must NOT collapse.
+	// Genuinely different paths/hosts/ports must NOT collapse.
 	assert.NotEqual(t, probeMatchKey("http://example.com/api/x"), probeMatchKey("http://example.com/api/y"))
 	assert.NotEqual(t, probeMatchKey("http://a.com/api/x"), probeMatchKey("http://b.com/api/x"))
+	// A non-default port is a distinct origin from no port (catches a regression
+	// that dropped the port entirely), and two different non-default ports differ.
+	assert.NotEqual(t, probeMatchKey("http://example.com/api/x"), probeMatchKey("http://example.com:8080/api/x"))
+	assert.NotEqual(t, probeMatchKey("http://example.com:8080/api/x"), probeMatchKey("http://example.com:9090/api/x"))
 }
 
 // errRoundTripper always returns the configured error from RoundTrip.
