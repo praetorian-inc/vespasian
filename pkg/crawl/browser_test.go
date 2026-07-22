@@ -18,6 +18,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/launcher/flags"
 )
 
@@ -56,11 +57,23 @@ func TestBrowserManager_SetCookies_NilReceiverReturnsError(t *testing.T) {
 
 func TestConfigureLauncher(t *testing.T) {
 	t.Run("sandbox", func(t *testing.T) {
+		// go-rod's launcher.New() adds --no-sandbox by default when it
+		// detects a container (launcher sets defaultFlags[NoSandbox] when
+		// inContainer), so l.Has("no-sandbox") reflects that default in
+		// Docker/dev-containers regardless of Vespasian's own logic. Assert
+		// on Vespasian's *contribution* relative to this baseline instead of
+		// the absolute flag: the flag must be present whenever
+		// configureLauncher opts in, and otherwise must match the launcher
+		// default (Vespasian must not add it on its own). This stays
+		// deterministic on CI's VM runner (no container -> baseline absent)
+		// and in dev-containers (baseline present) for both uid 0 and uid != 0.
+		baselineNoSandbox := launcher.New().Has("no-sandbox")
+
 		tests := []struct {
-			name      string
-			noSandbox bool
-			envVal    string
-			wantFlag  bool
+			name        string
+			noSandbox   bool
+			envVal      string
+			vespasianOn bool // whether configureLauncher itself enables no-sandbox
 		}{
 			{"explicit NoSandbox", true, "", true},
 			{"explicit NoSandbox with env", true, "true", true},
@@ -76,13 +89,39 @@ func TestConfigureLauncher(t *testing.T) {
 				// (e.g. arm64 dev machines); pinning is covered separately below.
 				stubLookPath(t, "/usr/bin/chromium", true)
 				t.Setenv("VESPASIAN_NO_SANDBOX", tt.envVal)
-				l, err := configureLauncher(BrowserOptions{NoSandbox: tt.noSandbox})
+
+				// Assert Vespasian's own opt-in decision directly via the
+				// self-contained helper. Unlike the launcher-baseline check
+				// below, this does not observe go-rod's container default, so it
+				// stays deterministic in every environment: the negative cases
+				// still catch a regression that unconditionally enables the
+				// sandbox flag, even in dev-containers where launcher.New() adds
+				// --no-sandbox by default (LAB-4994).
+				opts := BrowserOptions{NoSandbox: tt.noSandbox}
+				if got := vespasianEnablesNoSandbox(opts); got != tt.vespasianOn {
+					t.Errorf("vespasianEnablesNoSandbox = %v, want %v", got, tt.vespasianOn)
+				}
+
+				l, err := configureLauncher(opts)
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
+				// Launcher-baseline check, retained for go-rod compatibility:
+				// Vespasian forcing the flag on is authoritative; when it does
+				// not, the flag should equal the launcher's baseline default.
+				//
+				// Load-bearing assumption: this sub-assertion only exercises the
+				// configureLauncher wiring on a non-container runner, where
+				// baselineNoSandbox is false (e.g. CI's ubuntu-24.04 VM). In a
+				// container baselineNoSandbox is true, so want is unconditionally
+				// true and this check is vacuous — the environment-independent
+				// regression guard is the vespasianEnablesNoSandbox assertion
+				// above. If CI ever moves to a containerized runner, restore
+				// container-independent coverage of the configureLauncher wiring.
+				want := tt.vespasianOn || baselineNoSandbox
 				got := l.Has("no-sandbox")
-				if got != tt.wantFlag {
-					t.Errorf("Has(no-sandbox) = %v, want %v", got, tt.wantFlag)
+				if got != want {
+					t.Errorf("Has(no-sandbox) = %v, want %v (vespasianOn=%v, baseline=%v)", got, want, tt.vespasianOn, baselineNoSandbox)
 				}
 			})
 		}

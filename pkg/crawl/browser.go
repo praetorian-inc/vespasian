@@ -80,11 +80,26 @@ type BrowserManager struct {
 	cleanupOnce sync.Once
 }
 
+// vespasianEnablesNoSandbox reports whether Vespasian's own configuration opts
+// into disabling Chrome's OS-level sandbox — either explicitly via
+// BrowserOptions.NoSandbox or via the VESPASIAN_NO_SANDBOX env var (set by CI
+// workflows). It is the single source of truth for that decision; both
+// configureLauncher and browser_test.go consult it. Keeping the decision in a
+// self-contained helper lets the test assert Vespasian's contribution
+// directly, which stays deterministic even where go-rod's launcher.New() adds
+// --no-sandbox by default in containers and masks the launcher-observed flag
+// (LAB-4994).
+func vespasianEnablesNoSandbox(opts BrowserOptions) bool {
+	return opts.NoSandbox || os.Getenv("VESPASIAN_NO_SANDBOX") == "true"
+}
+
 // configureLauncher applies BrowserOptions to a new launcher without
 // launching Chrome. In order, it:
 //
-//  1. Disables the sandbox when opts.NoSandbox is set or when the
-//     VESPASIAN_NO_SANDBOX env var is "true" (set by CI workflows).
+//  1. Disables the sandbox when vespasianEnablesNoSandbox opts in — i.e.
+//     opts.NoSandbox is set or VESPASIAN_NO_SANDBOX is "true" (see that
+//     helper's doc for the exact condition, incl. go-rod's container default;
+//     LAB-4994).
 //  2. Validates opts.Proxy (when set) via ValidateProxyAddr before touching
 //     the browser binary, so a bad proxy is always reported as a proxy error
 //     independent of what Chrome is installed on the host.
@@ -99,7 +114,7 @@ func configureLauncher(opts BrowserOptions) (*launcher.Launcher, error) {
 	l := launcher.New().
 		Headless(opts.Headless)
 
-	if opts.NoSandbox || os.Getenv("VESPASIAN_NO_SANDBOX") == "true" {
+	if vespasianEnablesNoSandbox(opts) {
 		l = l.NoSandbox(true)
 	}
 	// Validate the proxy before resolving the browser binary. Proxy validation

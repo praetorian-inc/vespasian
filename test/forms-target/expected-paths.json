@@ -1,0 +1,18 @@
+{
+  "description": "Expected API paths recovered by static HTML <form> extraction (analyze.ExtractForms, LAB-2109) from a live crawl+generate of the forms target. The three POST endpoints (/api/login, /api/register, /api/feedback) are reachable ONLY by parsing <form action=... method=post> markup - no link or fetch targets them and the crawler's GET probes of those actions 404 and are filtered out at the default 0.5 confidence - so their presence proves ExtractForms ran end-to-end through crawl -> classify -> generate. The urlencoded POST forms also surface their input names as request-body schema properties, asserted per owning endpoint (post_form_body_fields_by_path) so a field attributed to the wrong operation fails the guard - /api/feedback is multipart, whose body schema is not inferred, so it is intentionally omitted from that map. /api/search is crawled directly via an <a href> link (so it appears at 0.5); the co-located GET search form contributes its query parameters (q, category), which the runner validates from a second generate pass at --confidence 0 scoped to /api/search's GET operation (form_query_params). Parameter names in path templates may vary.",
+  "paths": {
+    "/api/login": ["POST"],
+    "/api/register": ["POST"],
+    "/api/feedback": ["POST"],
+    "/api/search": ["GET"]
+  },
+  "total_paths": 4,
+  "post_form_paths": ["/api/login", "/api/register", "/api/feedback"],
+  "post_form_body_fields_by_path": {
+    "/api/login": ["username", "password", "csrf_token"],
+    "/api/register": ["username", "email", "password", "subscribe", "plan", "role", "bio", "_token"]
+  },
+  "form_query_params_path": "/api/search",
+  "form_query_params": ["q", "category"],
+  "excluded_patterns": [".js", ".css", ".png", ".ico", ".svg", ".woff"]
+}

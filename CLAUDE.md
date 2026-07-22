@@ -118,6 +118,8 @@ The `test/` directory contains live test targets:
 - **test/soap-service/**: Go HTTP server exposing SOAP/WSDL endpoints
 - **test/graphql-server/**: Node.js GraphQL server with Apollo
 - **test/grpc-server/**: Go gRPC server with Server Reflection enabled (sample User/Order/Account services, including a streaming method) for reflection-probe testing
+- **test/concat-spa/**: Go HTTP server serving a single-page app whose API endpoints exist only as concatenated strings in an external JS bundle (discovered via post-crawl JS-replay)
+- **test/forms-target/**: Go HTTP server serving an HTML `<form>` page whose POST endpoints are recovered by static form extraction (`analyze.ExtractForms`); a co-located GET search form contributes query parameters to a crawl-linked endpoint
 
 See `test/README.md` for how to run the suite, including the `TEST_HOST` override for devcontainer setups.
 

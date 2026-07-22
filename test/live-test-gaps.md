@@ -39,6 +39,7 @@ Updated as part of LAB-4012 (live tests in GitHub Actions).
 | concat-spa | JS concat/plus-chain extraction, exact path count, forbidden path absence |
 | edge-cases | Large responses, URL encoding, redirects, HTTP errors, binary exclusion |
 | crawl-depth | Depth limiting, max-pages, infinite loop detection |
+| forms-target | HTML `<form>` extraction (LAB-2109): POST form endpoints recovered via `analyze.ExtractForms`, GET form query params merged into the spec |
 
 ## Known gaps
 

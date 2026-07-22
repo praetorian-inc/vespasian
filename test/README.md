@@ -30,6 +30,7 @@ End-to-end live tests that spin up intentionally simple target applications, run
 | soap-service | SOAP/WSDL | Custom SOAP service with GetUser, ListUsers, CreateUser | Go binary |
 | graphql-server | GraphQL | Apollo Server with queries, mutations, enums, unions, nested types | Node.js |
 | grpc-server | gRPC | Three reflectable gRPC services (UserService, OrderService, AccountService) | Go binary |
+| forms-target | REST (HTML forms) | Static HTML page whose POST/GET `<form>` endpoints are recovered by `analyze.ExtractForms` (LAB-2109) | Go binary |
 
 ## What the Test Runner Does
 
@@ -62,6 +63,13 @@ For the JS bundle static-analysis test (`generate-js-static`, offline — no ser
 1. **Generate** an OpenAPI spec from `js-static/reference-capture.json` (one HTML page + one JS bundle containing a `fetch` POST with a JSON body, an `axios` GET, and a template-literal GET) with `--analyze-js --confidence 0.1 --probe=false`
 2. **Assert** the recovered path count matches `js-static/expected-paths.json` and every operation carries `x-vespasian-source: js-bundle`
 3. **Assert opt-out** — re-generating with `--analyze-js=false` yields zero `/api` paths and no `x-vespasian-source` extension
+
+For the HTML form-extraction live test (`forms-target`):
+
+1. **Crawl** the running server (both backends) — it serves one HTML page with POST forms (`/api/login`, `/api/register`, `/api/feedback`) and a GET search form, none of the POST actions backed by a real handler or reachable via a link/fetch
+2. **Generate** at the default confidence — the POST `<form>` endpoints reach the spec ONLY because `analyze.ExtractForms` (LAB-2109) parsed the captured HTML, so their presence is an end-to-end regression guard; `/api/search` is captured directly via its `<a href>` link
+3. **Assert** the form-derived paths in `forms-target/expected-paths.json` are present, each POST endpoint carries a `post` operation, and each urlencoded POST form's input names (`username`, `password`, `csrf_token`, …) surface as request-body schema properties
+4. **Re-generate with `--confidence 0`** and assert the GET search form's query parameters (`q`, `category`) merge onto `/api/search` — a GET form scores 0 confidence and is filtered out at the default threshold, so it needs the lower threshold to surface (multipart/form-data body-field schemas are not inferred, so `/api/feedback`'s fields are intentionally not asserted)
 
 For the slug-merging test (`generate-merge-slugs`, offline — no server or browser):
 
@@ -164,6 +172,14 @@ For Linux devcontainers without Docker Desktop, use the detected host gateway (e
 
 `setup-live-targets.sh` does not read `TEST_HOST` — run it on the host that actually runs the target binaries.
 
+### `FORMS_TARGET_BIND_HOST` (optional)
+
+The `forms-target` server binds `127.0.0.1` by default (via its `BIND_HOST` env var). `setup-live-targets.sh` starts it with `BIND_HOST=${FORMS_TARGET_BIND_HOST:-0.0.0.0}` so a crawler running inside a devcontainer (reaching the host via `TEST_HOST=host.docker.internal`) can connect. For host-only local runs, pin it back to loopback:
+
+```bash
+FORMS_TARGET_BIND_HOST=127.0.0.1 ./test/setup-live-targets.sh --targets forms-target
+```
+
 ### `CONFIG_FILE` (optional)
 
 `run-live-tests.sh` reads resolved ports and `TARGETS_SETUP` from `CONFIG_FILE`, which defaults to `test/.live-test-config` (written by `setup-live-targets.sh`). Override it with the `CONFIG_FILE` environment variable — an internal test-harness knob that `test/test-runner-args.sh` uses to point `--dry-run` invocations at a throwaway stub config, so the group-resolution tests need no real setup. Only an allowlisted set of keys (the `*_PORT` values and `TARGETS_SETUP`) is honored from the file.
@@ -196,6 +212,7 @@ TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server
 | soap-service | 8991 |
 | graphql-server | 8992 |
 | grpc-server | 50051 |
+| forms-target | 8994 |
 
 Ports are auto-resolved if the default is in use (searches up to 20 ports ahead).
 
@@ -277,6 +294,7 @@ All 27 tests should pass. Order is non-deterministic and durations vary by machi
   crawl-depth                 PASS      -           -          188s
   crawl-unreachable           PASS      0           0          39s
   edge-cases                  PASS      -           -          193s
+  forms-target                PASS      4           4          55s
   generate-graphql            PASS      8           8          0s
   generate-graphql-imports    PASS      2           2          0s
   generate-js-static          PASS      3           3          1s
@@ -336,6 +354,10 @@ test/
 ├── grpc-server/
 │   ├── main.go              # gRPC server (UserService, OrderService, AccountService)
 │   └── expected-paths.json  # Expected services/methods for validation
+│
+├── forms-target/
+│   ├── main.go              # HTML forms server (POST/GET <form> endpoints)
+│   └── expected-paths.json  # Expected form-derived paths + query params for validation
 │
 └── fixtures/
     ├── sample-burp-export.xml            # Burp XML (standard)
