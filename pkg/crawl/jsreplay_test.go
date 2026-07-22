@@ -1534,7 +1534,12 @@ func TestReachedPathKey(t *testing.T) {
 	// TEST-002: fallback branches. An unparseable URL (control byte breaks
 	// url.Parse) falls back to the raw string verbatim.
 	assert.Equal(t, "not a url\x7f", reachedPathKey("not a url\x7f"))
-	// A URL with no path component (empty string) also falls back verbatim.
+	// A URL that parses but has an empty path component falls back to the raw
+	// string verbatim. This input pins the `path == ""` guard load-bearingly:
+	// without it, EscapedPath() == "" would flow through the trailing-slash
+	// trim and collapse to "", colliding every path-less origin on one key.
+	assert.Equal(t, "http://example.com", reachedPathKey("http://example.com"))
+	// The empty string likewise round-trips verbatim.
 	assert.Equal(t, "", reachedPathKey(""))
 }
 

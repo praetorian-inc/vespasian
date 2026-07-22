@@ -18,7 +18,8 @@
 // It is invoked between the capture stage (pkg/crawl, pkg/importer) and the
 // classify/generate stages (pkg/classify, pkg/generate). It returns the input
 // captures unchanged, with newly synthesized [crawl.ObservedRequest] entries
-// appended (Source = "static:js" or "static:js-sourcemap").
+// appended (Source = "static:js", "static:js-sourcemap", or
+// "static:js-concat").
 //
 // The analyser is a thin wrapper over BishopFox/jsluice's tree-sitter URL
 // matchers, with three extensions over the upstream library:

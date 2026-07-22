@@ -31,6 +31,7 @@ type ObservedRequest struct {
 	//   - "static:html"                  (static analysis of HTML <form> elements, pkg/analyze)
 	//   - "static:js"                    (static analysis of JS bundles, pkg/analyze/jsstatic)
 	//   - "static:js-sourcemap"          (recovered via .js.map sourcesContent)
+	//   - "static:js-concat"             (concat / +-chain / service-prefix reconstruction, LAB-4992)
 	Source    string `json:"source"`
 	Tag       string `json:"tag,omitempty"`
 	Attribute string `json:"attribute,omitempty"`
