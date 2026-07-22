@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
 
@@ -91,9 +92,24 @@ func recoverSourcemap(ctx context.Context, bundle []byte, bundleURL string, opts
 		return nil, stats
 	}
 
+	// URL-level SSRF validation (SEC-BE-001): reject a private/internal mapURL
+	// unless the operator opted in via --dangerous-allow-private. This is the
+	// only SSRF gate on the proxied path — defaultSourcemapClient's proxy branch
+	// clears the dial-time pin (it dials the proxy, not the target) — so without
+	// this a proxied fetch could reach an internal host. Runs before any client
+	// construction/network I/O so it covers BOTH the nil-HTTPClient (default/
+	// proxied) and caller-supplied paths, mirroring the probe/WSDL/JS-replay
+	// stages (see internal/pipeline/wsdl_probe.go).
+	if !opts.AllowPrivate {
+		if err := probe.ValidateProbeURL(mappingURL); err != nil {
+			stats.SourcemapFetchFails++
+			return nil, stats
+		}
+	}
+
 	client := opts.HTTPClient
 	if client == nil {
-		client = defaultSourcemapClient(opts.AllowPrivate)
+		client = defaultSourcemapClient(opts.AllowPrivate, opts.Proxy)
 	} else {
 		// Caller-supplied client: enforce both noFollowRedirects and an SSRF-safe
 		// DialContext on a shallow-copy so neither mutation touches the caller's
@@ -267,7 +283,18 @@ func ssrfSafeTransport(allowPrivate bool) *http.Transport {
 // When allowPrivate is false, the SSRF-safe dial context from pkg/probe is
 // used. When allowPrivate is true, a permissive dialer is used instead.
 // Redirects are disabled unconditionally to prevent host-redirect bypass.
-func defaultSourcemapClient(allowPrivate bool) *http.Client {
+func defaultSourcemapClient(allowPrivate bool, proxy httpx.ProxyConfig) *http.Client {
+	if proxy.Enabled() {
+		// Route through the proxy: no dial-time SSRF pin (we dial the proxy, not
+		// the target). This is the production path (pipeline leaves HTTPClient
+		// nil); an injected HTTPClient opts out of Proxy — recoverSourcemap
+		// overwrites its Transport with ssrfSafeTransport, which would clobber a
+		// proxied dialer. Redirects are refused (noFollowRedirects, same as the
+		// non-proxy branch): the sameHost check only vets the initial URL and the
+		// dial-pin is dropped when proxied, so following a cross-host 302 would be
+		// an SSRF backstop gap.
+		return httpx.BuildHTTPClient(proxy, 10*time.Second, noFollowRedirects)
+	}
 	return &http.Client{
 		Timeout:       10 * time.Second,
 		CheckRedirect: noFollowRedirects,

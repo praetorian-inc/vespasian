@@ -34,6 +34,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 	"github.com/praetorian-inc/vespasian/pkg/ssrf"
 )
 
@@ -3103,4 +3104,120 @@ func TestReplayJSExtracted_NoHTMLFallsBackToFirstURL(t *testing.T) {
 	}
 	assert.Contains(t, apiURLs, app.URL+"/api/users/0/orders",
 		"with no HTML response and no TargetURL, replay must bind to the first non-empty request's origin (the JS bundle's)")
+}
+
+// ---------------------------------------------------------------------------
+// Task 5: JSReplayConfig.Proxy field + proxied client in withDefaults (LAB-4993)
+// ---------------------------------------------------------------------------
+
+// TestJSReplayConfig_WithDefaults_ProxyClient verifies that when Proxy is
+// enabled and Client is nil, withDefaults builds a proxied client: transport
+// routes through the proxy, has no SSRF dial pin (we dial the proxy, not the
+// target), and keeps the replay step's noRedirect policy.
+func TestJSReplayConfig_WithDefaults_ProxyClient(t *testing.T) {
+	proxyURL, err := url.Parse("http://127.0.0.1:8080")
+	require.NoError(t, err)
+
+	cfg := JSReplayConfig{Proxy: httpx.ProxyConfig{URL: proxyURL}}.withDefaults()
+
+	require.NotNil(t, cfg.Client)
+	tr, ok := cfg.Client.Transport.(*http.Transport)
+	require.True(t, ok, "Transport must be *http.Transport, got %T", cfg.Client.Transport)
+	assert.NotNil(t, tr.Proxy, "proxied client must set Transport.Proxy")
+	assert.Nil(t, tr.DialContext, "proxied client must NOT install the SSRF dial pin")
+
+	require.NotNil(t, cfg.Client.CheckRedirect)
+	gotErr := cfg.Client.CheckRedirect(nil, nil)
+	assert.True(t, errors.Is(gotErr, http.ErrUseLastResponse),
+		"proxied client must keep the replay step's noRedirect policy")
+}
+
+// TestJSReplayConfig_WithDefaults_NoProxyUnchanged verifies that a zero-value
+// Proxy leaves the existing newSSRFSafeClient construction untouched (the
+// default client still installs the SSRF-safe dial guard when !AllowPrivate).
+func TestJSReplayConfig_WithDefaults_NoProxyUnchanged(t *testing.T) {
+	cfg := JSReplayConfig{}.withDefaults()
+
+	require.NotNil(t, cfg.Client)
+	tr, ok := cfg.Client.Transport.(*http.Transport)
+	require.True(t, ok, "Transport must be *http.Transport, got %T", cfg.Client.Transport)
+	require.NotNil(t, tr.DialContext, "unproxied default client must keep the SSRF-safe dial guard")
+	_, dialErr := tr.DialContext(context.Background(), "tcp", "127.0.0.1:1")
+	require.Error(t, dialErr, "DialContext must reject loopback under SSRF protection")
+	assert.Contains(t, dialErr.Error(), "private")
+}
+
+// TestReplayJSExtracted_RoutesThroughProxy is the AC-1 proof for JS-replay:
+// end-to-end, modeled on pkg/crawl/http_crawler_test.go:195 (recording
+// forwarding proxy) and TestReplayJSExtracted_HTMLScriptDiscovery (HTML page
+// referencing an external JS bundle that must be fetched over the network).
+// The config deliberately leaves Client nil so withDefaults' proxied branch is
+// exercised — an injected Client would opt out of Proxy (see architecture.md
+// §1 hazard).
+func TestReplayJSExtracted_RoutesThroughProxy(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/main.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			w.Write([]byte(`var api = "/api/v1/products";`)) //nolint:errcheck,gosec // test handler
+		case "/api/v1/products":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"data":[]}`)) //nolint:errcheck,gosec // test handler
+		default:
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte(`<!DOCTYPE html><html><head><script src="main.js"></script></head></html>`)) //nolint:errcheck,gosec // test handler
+		}
+	}))
+	defer origin.Close()
+
+	var proxied atomic.Int64
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxied.Add(1)
+		outReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.RequestURI, nil) //nolint:gosec // test proxy forwards the received request URI
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		resp, err := http.DefaultTransport.RoundTrip(outReq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close() //nolint:errcheck // test cleanup
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body) //nolint:errcheck,gosec // test best-effort
+	}))
+	defer proxy.Close()
+
+	proxyURL, err := url.Parse(proxy.URL)
+	require.NoError(t, err)
+
+	requests := []ObservedRequest{
+		{
+			Method: "GET",
+			URL:    origin.URL + "/",
+			Source: "katana",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<!DOCTYPE html><html><head><script src="main.js"></script></head></html>`),
+			},
+		},
+	}
+
+	cfg := JSReplayConfig{
+		Proxy:        httpx.ProxyConfig{URL: proxyURL},
+		AllowPrivate: true,
+		TargetURL:    origin.URL,
+	}
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	var apiURLs []string
+	for _, r := range result {
+		if r.Source == "js-extract" {
+			apiURLs = append(apiURLs, r.URL)
+		}
+	}
+	assert.Contains(t, apiURLs, origin.URL+"/api/v1/products")
+	assert.NotZero(t, proxied.Load(), "JS-replay must route its fetches through the configured proxy")
 }

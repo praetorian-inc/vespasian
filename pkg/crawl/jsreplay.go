@@ -44,6 +44,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 	"github.com/praetorian-inc/vespasian/pkg/ssrf"
 )
@@ -91,6 +92,14 @@ type JSReplayConfig struct {
 	// SSRF-safe transport when !AllowPrivate.
 	Client *http.Client
 
+	// Proxy routes replay traffic through an intercepting proxy when set. It is
+	// honored ONLY when Client is nil (the production path — buildJSReplayConfig
+	// never sets Client): an injected Client owns its transport, and
+	// wrapClientWithSSRF would clobber a proxied dialer (see architecture.md §1).
+	// The proxied client installs no dial-time SSRF pin (we dial the proxy, not
+	// the target); URL-level scope (ValidateProbeURL/canFetchURL) is unchanged.
+	Proxy httpx.ProxyConfig
+
 	// Verbose enables debug logging to Stderr.
 	Verbose bool
 
@@ -132,7 +141,15 @@ func (cfg JSReplayConfig) withDefaults() JSReplayConfig {
 		cfg.Stderr = io.Discard
 	}
 	if cfg.Client == nil {
-		cfg.Client = newSSRFSafeClient(cfg.Timeout, cfg.AllowPrivate)
+		if cfg.Proxy.Enabled() {
+			// Route through the proxy: no dial-time SSRF pin (we dial the proxy,
+			// not the target). This is the production path; an injected Client
+			// deliberately opts out of Proxy (wrapClientWithSSRF would clobber a
+			// proxied dialer — architecture.md §1).
+			cfg.Client = httpx.BuildHTTPClient(cfg.Proxy, cfg.Timeout, noRedirect)
+		} else {
+			cfg.Client = newSSRFSafeClient(cfg.Timeout, cfg.AllowPrivate)
+		}
 	} else {
 		// Caller supplied a client. SSRF-wrap when AllowPrivate is false,
 		// and always enforce our redirect policy: probeURL records the

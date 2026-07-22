@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 	"github.com/praetorian-inc/vespasian/pkg/ssrf"
 )
 
@@ -28,6 +29,14 @@ type Config struct {
 	// Client is the HTTP client used for probe requests.
 	// If nil, a default client with the Timeout is created.
 	Client *http.Client
+
+	// Proxy routes probe traffic through an intercepting proxy when set. It is
+	// honored only when Client is nil (the production path); an injected Client
+	// owns its own transport. When enabled, withDefaults builds a proxied client
+	// (no dial-time SSRF pin — we dial the proxy, not the target) and dialGRPC
+	// tunnels the reflection dial through the proxy. URL-level scope validation
+	// (URLValidator) is unchanged, so a private target still needs allow-private.
+	Proxy httpx.ProxyConfig
 
 	// Timeout is the per-request timeout for probe HTTP calls.
 	// Defaults to 10 seconds if zero.
@@ -140,12 +149,25 @@ func (cfg Config) withDefaults() Config {
 		cfg.MaxTotalReflectionDescriptorBytes = DefaultMaxTotalReflectionDescriptorBytes
 	}
 	if cfg.Client == nil {
-		cfg.Client = &http.Client{
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-			Transport: DefaultTransport(),
+		if cfg.Proxy.Enabled() {
+			// Route through the proxy: no dial-time SSRF pin (we dial the proxy,
+			// not the target). A client-level Timeout stands in for the stage
+			// timeouts that DefaultTransport() carries but a cloned
+			// DefaultTransport does not (mirrors the crawl proxy client).
+			cfg.Client = httpx.BuildHTTPClient(cfg.Proxy, cfg.Timeout, probeRedirectPolicy)
+		} else {
+			cfg.Client = &http.Client{
+				CheckRedirect: probeRedirectPolicy,
+				Transport:     DefaultTransport(),
+			}
 		}
 	}
 	return cfg
+}
+
+// probeRedirectPolicy is the redirect policy shared by probe HTTP clients: stop
+// at the first response (return ErrUseLastResponse) rather than following
+// redirects, so probes observe the target's own status/headers.
+func probeRedirectPolicy(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
 }

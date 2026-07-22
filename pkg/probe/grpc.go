@@ -32,6 +32,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 )
 
 // maxGRPCFileDescriptors caps the number of FileDescriptorProtos fetched per
@@ -228,24 +229,35 @@ func (p *GRPCProbe) probeTarget(ctx context.Context, t grpcTargetInfo) *classify
 }
 
 // dialGRPC builds transport credentials (TLS honoring the configured
-// GRPCInsecureSkipVerify, or cleartext) wrapped with the SSRF-safe Dialer, and
-// returns a grpc.NewClient connection for the target.
+// GRPCInsecureSkipVerify, or cleartext) and a context dialer, then returns a
+// grpc.NewClient connection for the target. When Config.Proxy is enabled the
+// dial tunnels through the proxy (HTTP CONNECT or SOCKS5); otherwise it uses the
+// configured SSRF-safe Dialer.
 func (p *GRPCProbe) dialGRPC(t grpcTargetInfo) (*grpc.ClientConn, error) {
+	// --proxy-insecure skips TLS verification of the target ONLY for an
+	// http/https (MITM) proxy that substitutes its own CA; socks5 is a
+	// transparent tunnel so verification is always kept for it — mirrors
+	// httpx.BuildHTTPClient / crawl's proxy TLS gating.
+	insecureSkip := p.config.GRPCInsecureSkipVerify
+	if p.config.Proxy.Enabled() && p.config.Proxy.Insecure {
+		if s := p.config.Proxy.URL.Scheme; s == "http" || s == "https" {
+			insecureSkip = true
+		}
+	}
+
 	var creds credentials.TransportCredentials
 	if t.useTLS {
 		creds = credentials.NewTLS(&tls.Config{
 			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: p.config.GRPCInsecureSkipVerify, // #nosec G402 -- opt-in only (default verifies); SSRF is enforced by the Dialer
+			InsecureSkipVerify: insecureSkip, // #nosec G402 -- opt-in only (default verifies); SSRF is enforced by the URLValidator preflight + Dialer
 		})
 	} else {
 		creds = insecure.NewCredentials()
 	}
 
-	// The configured Dialer re-resolves and re-checks IPs at connect time
-	// (default: ssrfSafeDialContext), closing the TOCTOU window between the
-	// URLValidator pre-flight and the actual TCP handshake.
-	dialer := func(ctx context.Context, addr string) (net.Conn, error) {
-		return p.config.Dialer(ctx, "tcp", addr)
+	dialer, err := p.grpcDialer()
+	if err != nil {
+		return nil, err
 	}
 
 	return grpc.NewClient(t.hostPort,
@@ -253,6 +265,25 @@ func (p *GRPCProbe) dialGRPC(t grpcTargetInfo) (*grpc.ClientConn, error) {
 		grpc.WithContextDialer(dialer),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxReflectionRecvBytes)),
 	)
+}
+
+// grpcDialer selects the context dialer for the reflection dial. When proxied it
+// tunnels through the proxy (HTTP CONNECT or SOCKS5) with a plain proxy dial (no
+// SSRF pin — we dial the proxy, not the target; URL scope stays enforced by the
+// probeTarget URLValidator preflight). Otherwise it wraps the configured Dialer
+// (default: ssrfSafeDialContext), which re-resolves and re-checks IPs at connect
+// time, closing the TOCTOU window between the preflight and the TCP handshake.
+func (p *GRPCProbe) grpcDialer() (func(ctx context.Context, addr string) (net.Conn, error), error) {
+	if p.config.Proxy.Enabled() {
+		proxyDial, err := httpx.ProxyDialer(p.config.Proxy)
+		if err != nil {
+			return nil, fmt.Errorf("grpc probe: building proxy dialer: %w", err)
+		}
+		return proxyDial, nil
+	}
+	return func(ctx context.Context, addr string) (net.Conn, error) {
+		return p.config.Dialer(ctx, "tcp", addr)
+	}, nil
 }
 
 // runReflection lists the target's services and walks each one's file

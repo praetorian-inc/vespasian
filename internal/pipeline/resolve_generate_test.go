@@ -16,6 +16,7 @@ package pipeline_test
 
 import (
 	"context"
+	"net/url"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/praetorian-inc/vespasian/internal/pipeline"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 )
 
 // TestResolveAndGenerate_AutoDetectsREST verifies that an empty APIType triggers
@@ -201,4 +203,46 @@ func TestResolveAndGenerate_UnknownTypeErrors(t *testing.T) {
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported API type")
+}
+
+// TestResolveAndGenerate_ForwardsProxy verifies that ScanOptions.Proxy is
+// forwarded both to ResolveWSDLType (the WSDL discovery fetch) and to
+// Options (the subsequent classify/probe/generate stage) — the recording
+// proxy must see traffic from both stages (LAB-4993).
+func TestResolveAndGenerate_ForwardsProxy(t *testing.T) {
+	ts := wsdlServer(t)
+
+	proxy, hits := newRecordingProxy(t, true)
+
+	proxyURL, err := url.Parse(proxy.URL)
+	require.NoError(t, err)
+
+	in := []crawl.ObservedRequest{
+		{Method: "GET", URL: ts.URL + "/", Response: crawl.ObservedResponse{StatusCode: 200}},
+	}
+
+	spec, apiType, foundWSDL, _, err := pipeline.ResolveAndGenerate(
+		context.Background(),
+		in,
+		pipeline.ScanOptions{
+			TargetURL:    ts.URL,
+			APIType:      pipeline.APITypeREST,
+			Confidence:   0.5,
+			Probe:        true,
+			Deduplicate:  true,
+			AllowPrivate: true,
+			Proxy:        httpx.ProxyConfig{URL: proxyURL},
+		},
+	)
+	require.NoError(t, err)
+	assert.True(t, foundWSDL, "valid WSDL document must be discovered through the proxy")
+	assert.Equal(t, pipeline.APITypeWSDL, apiType)
+	assert.NotEmpty(t, spec)
+
+	// The proxy must have seen traffic from BOTH the WSDL discovery fetch
+	// (ResolveWSDLType) and the subsequent probe stage (Options); either stage
+	// silently skipping the proxy would leave hits unexpectedly low, so this
+	// asserts more than one hit rather than merely non-zero.
+	assert.GreaterOrEqual(t, hits.Load(), int64(2),
+		"proxy must be forwarded to both ResolveWSDLType and the ClassifyProbeGenerate probe stage")
 }

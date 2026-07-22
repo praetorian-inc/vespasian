@@ -23,10 +23,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,6 +43,7 @@ import (
 
 	"github.com/praetorian-inc/vespasian/internal/pipeline"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 )
 
 // ---------------------------------------------------------------------------
@@ -339,4 +343,140 @@ func TestClassifyProbeGenerate_GRPCInsecureSkipVerify(t *testing.T) {
 			"verify-by-default must fail because reflection never ran (no descriptors), not some unrelated error")
 		assert.Empty(t, spec)
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Task 7: Options.Proxy threading (LAB-4993)
+// ---------------------------------------------------------------------------
+
+// restRequestsForOrigin returns a minimal REST-like request slice targeting a
+// caller-supplied origin, structured like restRequests() but pointed at a
+// loopback httptest server so the proxy tests below can exercise real network
+// probing rather than the fixed x.com host restRequests() uses.
+func restRequestsForOrigin(origin string) []crawl.ObservedRequest {
+	return []crawl.ObservedRequest{
+		{
+			Method:  "GET",
+			URL:     origin + "/api/v1/users",
+			Headers: map[string]string{"Content-Type": "application/json"},
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Headers:     map[string]string{"Content-Type": "application/json"},
+				Body:        []byte(`[{"id":1}]`),
+			},
+		},
+	}
+}
+
+// newRecordingProxy starts a forwarding httptest proxy that increments a
+// counter for every request it forwards. Modeled on
+// pkg/crawl/http_crawler_test.go:195.
+//
+// When forwardBody is false, only the upstream status code is relayed (the
+// original behavior: sufficient for callers that just assert hits > 0 or
+// need a valid status/spec from the probe stage). When forwardBody is true,
+// response headers and the response body are also copied through — required
+// by callers (e.g. WSDL discovery) that must actually read proxied content.
+func newRecordingProxy(t *testing.T, forwardBody bool) (proxy *httptest.Server, hits *atomic.Int64) {
+	t.Helper()
+	hits = &atomic.Int64{}
+	proxy = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		outReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.RequestURI, nil) //nolint:gosec // test proxy forwards the received request URI
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		resp, err := http.DefaultTransport.RoundTrip(outReq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close() //nolint:errcheck // test cleanup
+		if forwardBody {
+			for k, vs := range resp.Header {
+				for _, v := range vs {
+					w.Header().Add(k, v)
+				}
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		if forwardBody {
+			_, _ = io.Copy(w, resp.Body) //nolint:errcheck,gosec // test proxy
+		}
+	}))
+	t.Cleanup(proxy.Close)
+	return proxy, hits
+}
+
+// optionsOrigin starts an httptest server answering OPTIONS with an Allow
+// header (and a plain JSON body otherwise), suitable for the OPTIONS probe
+// strategy that ClassifyProbeGenerate runs for REST.
+func optionsOrigin(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Allow", "GET, POST")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestClassifyProbeGenerate_ProxyReachesProbe is the AC-1 + threading proof
+// for pipeline.Options.Proxy: with Probe enabled and a configured proxy, the
+// probe stage's HTTP client must route through it (the loopback proxy would
+// be rejected by the SSRF dial guard unless the proxy path correctly skips
+// it). Modeled on the recording-proxy pattern from
+// pkg/crawl/http_crawler_test.go:195 and TestClassifyProbeGenerate_GRPCInsecureSkipVerify.
+func TestClassifyProbeGenerate_ProxyReachesProbe(t *testing.T) {
+	origin := optionsOrigin(t)
+	proxy, hits := newRecordingProxy(t, false)
+
+	proxyURL, err := url.Parse(proxy.URL)
+	require.NoError(t, err)
+
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), restRequestsForOrigin(origin.URL), pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Proxy:        httpx.ProxyConfig{URL: proxyURL},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, spec)
+
+	assert.NotZero(t, hits.Load(), "probe stage must route through the configured proxy")
+}
+
+// TestClassifyProbeGenerate_ProxyAndAllowPrivate_ProxyWins pins the precedence
+// contract from architecture.md §3: when both Proxy and AllowPrivate are set,
+// the proxy transport must still be used (AllowPrivate only relaxes the
+// URL-level validator, it must NOT skip the proxied-client construction). If
+// the AllowPrivate branch built its own permissive client instead of leaving
+// Client nil for the proxy path, this loopback origin would still be reached
+// directly and the recording proxy would see zero hits.
+func TestClassifyProbeGenerate_ProxyAndAllowPrivate_ProxyWins(t *testing.T) {
+	origin := optionsOrigin(t)
+	proxy, hits := newRecordingProxy(t, false)
+
+	proxyURL, err := url.Parse(proxy.URL)
+	require.NoError(t, err)
+
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), restRequestsForOrigin(origin.URL), pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true, // private/loopback target — must still be reachable
+		Proxy:        httpx.ProxyConfig{URL: proxyURL},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, spec, "the private (loopback) target must be reachable with AllowPrivate=true")
+
+	assert.NotZero(t, hits.Load(), "proxy must win over AllowPrivate's permissive-client branch")
 }

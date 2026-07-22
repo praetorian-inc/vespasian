@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +37,7 @@ import (
 	"github.com/praetorian-inc/vespasian/internal/pipeline"
 	"github.com/praetorian-inc/vespasian/pkg/analyze"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 )
 
 // jsonGetRequest builds a minimal GET ObservedRequest for the given URL with a
@@ -1010,13 +1012,13 @@ func TestGRPCInsecureSkipVerify_GenerateCmd(t *testing.T) {
 // hermetic Run() smoke test that never reaches pipeline.Options
 // construction on a REST capture).
 func TestGRPCInsecureSkipVerify_ReachesOptions(t *testing.T) {
-	require.True(t, (&GenerateCmd{GRPCInsecureSkipVerify: true}).options().GRPCInsecureSkipVerify,
+	require.True(t, (&GenerateCmd{GRPCInsecureSkipVerify: true}).options(httpx.ProxyConfig{}).GRPCInsecureSkipVerify,
 		"GenerateCmd flag must reach pipeline.Options")
-	require.False(t, (&GenerateCmd{GRPCInsecureSkipVerify: false}).options().GRPCInsecureSkipVerify)
+	require.False(t, (&GenerateCmd{GRPCInsecureSkipVerify: false}).options(httpx.ProxyConfig{}).GRPCInsecureSkipVerify)
 
-	require.True(t, (&ScanCmd{GRPCInsecureSkipVerify: true}).scanOptions("rest", nil).GRPCInsecureSkipVerify,
+	require.True(t, (&ScanCmd{GRPCInsecureSkipVerify: true}).scanOptions("rest", nil, httpx.ProxyConfig{}).GRPCInsecureSkipVerify,
 		"ScanCmd flag must reach pipeline.ScanOptions")
-	require.False(t, (&ScanCmd{GRPCInsecureSkipVerify: false}).scanOptions("rest", nil).GRPCInsecureSkipVerify)
+	require.False(t, (&ScanCmd{GRPCInsecureSkipVerify: false}).scanOptions("rest", nil, httpx.ProxyConfig{}).GRPCInsecureSkipVerify)
 }
 
 // TestDangerousAllowPrivate_SameOutputForPublicURLs verifies that allowPrivate=true
@@ -2272,7 +2274,7 @@ func TestProbeWSDLDocument_ValidWSDL(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/calculator.asmx", true, nil)
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/calculator.asmx", true, httpx.ProxyConfig{}, nil)
 	if doc == nil {
 		t.Fatal("probeWSDLDocument returned nil for valid WSDL endpoint")
 	}
@@ -2290,7 +2292,7 @@ func TestProbeWSDLDocument_NoWSDL(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL, true, nil)
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL, true, httpx.ProxyConfig{}, nil)
 	if doc != nil {
 		t.Errorf("probeWSDLDocument should return nil for non-WSDL endpoint, got %d bytes", len(doc))
 	}
@@ -2304,7 +2306,7 @@ func TestProbeWSDLDocument_404(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL, true, nil)
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL, true, httpx.ProxyConfig{}, nil)
 	if doc != nil {
 		t.Error("probeWSDLDocument should return nil for 404 response")
 	}
@@ -2361,7 +2363,7 @@ func TestScanPipeline_WSDLDiscoveryProbe(t *testing.T) {
 	}
 
 	// Active probe discovers the WSDL document
-	wsdlDoc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/calculator.asmx", true, nil)
+	wsdlDoc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/calculator.asmx", true, httpx.ProxyConfig{}, nil)
 	if wsdlDoc == nil {
 		t.Fatal("probeWSDLDocument should find the WSDL document")
 	}
@@ -2443,7 +2445,7 @@ func TestProbeWSDLDocument_URLConstruction(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			pipeline.ProbeWSDLDocument(context.Background(), ts.URL+tt.inputPath, true, nil)
+			pipeline.ProbeWSDLDocument(context.Background(), ts.URL+tt.inputPath, true, httpx.ProxyConfig{}, nil)
 
 			if gotQuery != tt.wantQuery {
 				t.Errorf("probeWSDLDocument(%q) sent query %q, want %q", tt.inputPath, gotQuery, tt.wantQuery)
@@ -3347,4 +3349,102 @@ func TestGenerateCmdRun_RejectsMalformedHeader(t *testing.T) {
 			require.Contains(t, err.Error(), "invalid --header")
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 9/10: CLI proxy plumbing (LAB-4993)
+// ---------------------------------------------------------------------------
+
+// TestBuildJSReplayConfig_SetsProxy verifies that buildJSReplayConfig's
+// trailing proxy parameter reaches the returned JSReplayConfig.Proxy field.
+func TestBuildJSReplayConfig_SetsProxy(t *testing.T) {
+	proxyURL, err := url.Parse("http://127.0.0.1:8080")
+	require.NoError(t, err)
+
+	cfg := buildJSReplayConfig(map[string]string{}, "https://example.com", false, false, httpx.ProxyConfig{URL: proxyURL})
+	require.NotNil(t, cfg.Proxy.URL, "buildJSReplayConfig must set JSReplayConfig.Proxy from the proxy argument")
+	require.Equal(t, proxyURL, cfg.Proxy.URL)
+}
+
+// TestParseProxyConfig_ValidatesAndParses verifies parseProxyConfig parses a
+// valid proxy address into httpx.ProxyConfig, rejects embedded credentials
+// and unsupported schemes (via crawl.ValidateProxyAddr), and carries the
+// insecure flag through.
+func TestParseProxyConfig_ValidatesAndParses(t *testing.T) {
+	t.Run("valid http proxy", func(t *testing.T) {
+		cfg, err := parseProxyConfig("http://127.0.0.1:8080", false)
+		require.NoError(t, err)
+		require.NotNil(t, cfg.URL)
+		require.Equal(t, "127.0.0.1:8080", cfg.URL.Host)
+		require.False(t, cfg.Insecure)
+	})
+
+	t.Run("rejects embedded credentials", func(t *testing.T) {
+		_, err := parseProxyConfig("http://user:pw@127.0.0.1:8080", false)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "embedded credentials")
+	})
+
+	t.Run("rejects unsupported scheme", func(t *testing.T) {
+		_, err := parseProxyConfig("ftp://127.0.0.1:21", false)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "scheme must be")
+	})
+
+	t.Run("insecure flag carried through", func(t *testing.T) {
+		cfg, err := parseProxyConfig("http://127.0.0.1:8080", true)
+		require.NoError(t, err)
+		require.True(t, cfg.Insecure)
+	})
+}
+
+// TestWarnProxyNoPort verifies the extracted warnProxyNoPort helper: it warns
+// when the proxy address has no explicit port, and stays silent when a port
+// is present. Mirrors the pre-extraction behavior pinned by
+// TestDoCrawl_ProxyPortlessWarning.
+func TestWarnProxyNoPort(t *testing.T) {
+	t.Run("no port warns", func(t *testing.T) {
+		var buf bytes.Buffer
+		warnProxyNoPort(&buf, "http://proxy.local")
+		require.Contains(t, buf.String(), "has no explicit port")
+	})
+
+	t.Run("with port stays silent", func(t *testing.T) {
+		var buf bytes.Buffer
+		warnProxyNoPort(&buf, "http://proxy.local:8080")
+		require.Empty(t, buf.String())
+	})
+}
+
+// TestGenerateCmd_ProxyFlagsParse verifies that `generate` accepts
+// --proxy/--proxy-insecure via Kong.
+func TestGenerateCmd_ProxyFlagsParse(t *testing.T) {
+	var cli struct {
+		Generate GenerateCmd `cmd:"" name:"generate"`
+	}
+	p := kong.Must(&cli, kong.Name("vespasian"))
+	_, err := p.Parse([]string{"generate", "--proxy", "http://127.0.0.1:8080", "--proxy-insecure", "rest", "cap.json"})
+	require.NoError(t, err, "parsing generate --proxy/--proxy-insecure")
+	require.Equal(t, "http://127.0.0.1:8080", cli.Generate.Proxy)
+	require.True(t, cli.Generate.ProxyInsecure)
+}
+
+// TestGenerateCmd_Options_CarriesProxy closes the CLI-boundary gap: it asserts
+// c.Proxy actually reaches pipeline.Options (via GenerateCmd.options()),
+// mirroring TestGRPCInsecureSkipVerify_ReachesOptions.
+func TestGenerateCmd_Options_CarriesProxy(t *testing.T) {
+	cmd := &GenerateCmd{Proxy: "http://127.0.0.1:8080"}
+	proxy := parseProxyConfigOrEmpty(cmd.Proxy, cmd.ProxyInsecure)
+	opts := cmd.options(proxy)
+	require.NotNil(t, opts.Proxy.URL, "GenerateCmd.Proxy must reach pipeline.Options.Proxy")
+}
+
+// TestScanCmd_ScanOptions_CarriesProxy verifies that ScanCmd's proxy (set via
+// the embedded CrawlOptions.Proxy) reaches pipeline.ScanOptions.Proxy via
+// scanOptions().
+func TestScanCmd_ScanOptions_CarriesProxy(t *testing.T) {
+	cmd := &ScanCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080"}}
+	proxy := parseProxyConfigOrEmpty(cmd.Proxy, cmd.ProxyInsecure)
+	opts := cmd.scanOptions("rest", nil, proxy)
+	require.NotNil(t, opts.Proxy.URL, "scanOptions must carry the passed proxy into pipeline.ScanOptions.Proxy")
 }

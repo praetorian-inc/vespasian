@@ -51,7 +51,7 @@ Vespasian takes a different approach: it observes actual network traffic at the 
 | **Path Normalization** | `/users/42` and `/users/87` become `/users/{id}` with known literal preservation (`/me`, `/self`) |
 | **SSRF Protection** | Blocks crawling and probing of private and loopback addresses by default. Pass `--dangerous-allow-private` to test internal targets (localhost, 127.0.0.1, RFC1918, link-local); the flag is required when the seed URL is itself a private host. |
 | **JS Bundle Static Analysis** | Statically analyses captured JavaScript bundles to recover API endpoints, path parameters, and request-body fields missed by dynamic crawling. Enabled by default via `--analyze-js`; sourcemap recovery is controlled by `--fetch-sourcemaps` (default: `true` for `scan`/`crawl`, `false` for `generate`). |
-| **Proxy Support** | Route crawl traffic through Burp Suite or other intercepting proxies on both crawler backends (headless Chrome and `--headless=false` net/http); http/https/socks5. Probe and JS-replay traffic is not proxied. |
+| **Proxy Support** | Route traffic through Burp Suite or other intercepting proxies; http/https/socks5. Covers the crawl stage on both backends (headless Chrome and `--headless=false` net/http) plus the post-crawl active stages — probe (OPTIONS/schema/WSDL-fetch/GraphQL introspection/gRPC reflection), JS-replay, and jsstatic sourcemap fetches. socks5 always verifies TLS; `--proxy-insecure` (http/https only) accepts a MITM proxy's certificate. |
 | **Two-Stage Pipeline** | Capture once, generate many: separate capture and generation steps for maximum flexibility |
 
 ## How It Works
@@ -322,10 +322,11 @@ vespasian scan <url> [flags]
   --timeout          Maximum duration for the entire scan (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine
-  --proxy            Proxy URL for the crawl stage (e.g., http://127.0.0.1:8080); http/https/socks5.
-                     Routes crawl traffic on both backends; probe and JS-replay traffic is not proxied.
-                     TLS verification stays on by default. Private targets still require
-                     --dangerous-allow-private (proxy relaxes only the dial-time SSRF pin, not URL scope).
+  --proxy            Proxy URL (e.g., http://127.0.0.1:8080); http/https/socks5.
+                     Routes crawl, probe (OPTIONS/schema/WSDL-fetch/GraphQL introspection/gRPC
+                     reflection), JS-replay, and jsstatic sourcemap-fetch traffic through the proxy.
+                     TLS verification stays on by default (socks5 always verifies). Private targets still
+                     require --dangerous-allow-private (proxy relaxes only the dial-time SSRF pin, not URL scope).
   --proxy-insecure   Disable TLS certificate verification for an http/https intercepting proxy
                      (Burp/mitmproxy MITM) on the net/http backend (--headless=false). Off by default;
                      no effect on socks5 or the headless backend (trust the proxy CA via the OS store).
@@ -355,10 +356,11 @@ vespasian crawl <url> [flags]
   --timeout          Maximum duration for the entire crawl (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine
-  --proxy            Proxy URL for the crawl stage (e.g., http://127.0.0.1:8080); http/https/socks5.
-                     Routes crawl traffic on both backends; probe and JS-replay traffic is not proxied.
-                     TLS verification stays on by default. Private targets still require
-                     --dangerous-allow-private (proxy relaxes only the dial-time SSRF pin, not URL scope).
+  --proxy            Proxy URL (e.g., http://127.0.0.1:8080); http/https/socks5.
+                     Routes crawl traffic on both backends plus jsstatic sourcemap fetches through the
+                     proxy (socks5 always verifies TLS). TLS verification stays on by default. Private
+                     targets still require --dangerous-allow-private (proxy relaxes only the dial-time
+                     SSRF pin, not URL scope).
   --proxy-insecure   Disable TLS certificate verification for an http/https intercepting proxy
                      (Burp/mitmproxy MITM) on the net/http backend (--headless=false). Off by default;
                      no effect on socks5 or the headless backend (trust the proxy CA via the OS store).

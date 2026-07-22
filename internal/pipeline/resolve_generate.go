@@ -19,6 +19,7 @@ import (
 	"io"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 )
 
 // ScanOptions configures ResolveAndGenerate.
@@ -64,6 +65,11 @@ type ScanOptions struct {
 	// returning the slice to classify. The CLI uses this to keep its JS-replay
 	// step in its current pipeline position; the SDK passes nil.
 	AfterWSDL func(ctx context.Context, requests []crawl.ObservedRequest) []crawl.ObservedRequest
+
+	// Proxy routes probe and WSDL-discovery traffic through an intercepting
+	// proxy when set. ResolveAndGenerate forwards it to both ResolveWSDLType and
+	// the probe path (Options.Proxy).
+	Proxy httpx.ProxyConfig
 }
 
 // ResolveAndGenerate runs the detect → wsdl-resolve → (AfterWSDL hook) →
@@ -84,7 +90,7 @@ func ResolveAndGenerate(ctx context.Context, requests []crawl.ObservedRequest, o
 		apiType = DetectAPIType(requests, opts.Confidence)
 	}
 
-	requests, apiType, foundWSDL = ResolveWSDLType(ctx, opts.TargetURL, apiType, requests, opts.Probe, opts.AllowPrivate, opts.Status)
+	requests, apiType, foundWSDL = ResolveWSDLType(ctx, opts.TargetURL, apiType, requests, opts.Probe, opts.AllowPrivate, opts.Proxy, opts.Status)
 
 	if opts.AfterWSDL != nil {
 		requests = opts.AfterWSDL(ctx, requests)
@@ -100,6 +106,7 @@ func ResolveAndGenerate(ctx context.Context, requests []crawl.ObservedRequest, o
 		MergeSlugs:             opts.MergeSlugs,
 		SlugThreshold:          opts.SlugThreshold,
 		Status:                 opts.Status,
+		Proxy:                  opts.Proxy,
 	})
 	return spec, apiType, foundWSDL, requests, err
 }

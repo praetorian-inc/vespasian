@@ -1,0 +1,284 @@
+// Copyright 2026 Praetorian Security, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package httpx
+
+import (
+	"bufio"
+	"context"
+	"crypto/tls"
+	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/net/proxy"
+)
+
+// ProxyConfig carries a parsed, validated proxy target and its TLS posture. The
+// zero value (URL == nil) means "no proxy", so structs and params that embed it
+// default to today's unproxied behavior without any caller change.
+type ProxyConfig struct {
+	URL      *url.URL // scheme http|https|socks5, host required, no embedded creds
+	Insecure bool     // --proxy-insecure; honored ONLY for http/https (MITM); ignored for socks5
+}
+
+// Enabled reports whether a proxy target is configured.
+func (p ProxyConfig) Enabled() bool { return p.URL != nil }
+
+// BuildHTTPClient returns an *http.Client whose transport routes through p.URL,
+// mirroring pkg/crawl.newHTTPClient's proxy branch:
+//
+//   - clones http.DefaultTransport (keeps keep-alive / HTTP2 / idle tunings)
+//   - sets Transport.Proxy = http.ProxyURL(p.URL) (stdlib tunnels http/https/socks5)
+//   - clears Transport.DialContext: no dial-time SSRF pin is installed because we
+//     dial the proxy, not the target; URL-level scope stays the caller's job
+//   - sets TLSClientConfig.InsecureSkipVerify only when p.Insecure && the proxy
+//     scheme is http/https (an intercepting MITM proxy presenting its own CA).
+//     socks5 is a transparent TCP tunnel, so verification always stays on for it.
+//
+// Precondition: p.Enabled(). Callers gate on p.Enabled() and keep their existing
+// non-proxy builder for the unproxied path (zero regression to proven paths).
+//
+// Cross-reference: pkg/crawl.newHTTPClient's proxy branch encodes the SAME
+// security-sensitive TLS-verify gate (InsecureSkipVerify only when
+// Insecure && scheme ∈ {http,https}); keep the two in lockstep if that gate ever
+// changes. They are intentionally NOT merged: this builder additionally pins
+// MinVersion TLS 1.2 and clears DialContext, whereas crawl keeps DefaultTransport's
+// dialer for the proxy connection (its tests assert a non-nil proxy-branch
+// DialContext), so delegating here would regress that proven path.
+func BuildHTTPClient(p ProxyConfig, timeout time.Duration,
+	checkRedirect func(*http.Request, []*http.Request) error) *http.Client {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		// Defensive: stdlib always sets *http.Transport, but fall back to a
+		// fresh transport rather than panic if a future runtime changes that.
+		base = &http.Transport{}
+	}
+	t := base.Clone()
+	t.Proxy = http.ProxyURL(p.URL)
+	// Drop the cloned default dialer: with a proxy we dial the proxy, not the
+	// target, so the SSRF dial pin is neither installed nor needed here.
+	t.DialContext = nil
+	// TLS verification stays on by default. It is disabled only when the operator
+	// explicitly opts in via --proxy-insecure AND the proxy is http/https: an
+	// intercepting proxy (Burp, mitmproxy) terminates TLS and presents its own CA,
+	// so verification must be off for that substitute certificate to be accepted.
+	// socks5 tunnels TCP transparently — TLS runs directly against the real target
+	// through the tunnel — so verification is always kept for socks5.
+	if p.Insecure && p.URL != nil && (p.URL.Scheme == "http" || p.URL.Scheme == "https") {
+		// #nosec G402 -- opt-in via --proxy-insecure for http/https proxy MITM; socks5 always verifies (see package doc)
+		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}
+	}
+	return &http.Client{
+		Transport:     t,
+		Timeout:       timeout,
+		CheckRedirect: checkRedirect,
+	}
+}
+
+// ProxyDialer returns a dial function that establishes a raw TCP connection to
+// the target THROUGH p.URL, for callers that cannot use http.Transport.Proxy
+// (the gRPC reflection probe). http/https proxies use an HTTP CONNECT tunnel;
+// socks5 uses golang.org/x/net/proxy. The proxy itself is dialed with a plain
+// dialer (we contact the proxy, not the target), so it is not SSRF-pinned —
+// consistent with the http.Transport proxy path. The returned conn is plaintext
+// TCP; the caller layers TLS (e.g. gRPC transport credentials) on top. Returns
+// an error for an unsupported scheme (unreachable after crawl.ValidateProxyAddr).
+func ProxyDialer(p ProxyConfig) (func(ctx context.Context, addr string) (net.Conn, error), error) {
+	if p.URL == nil {
+		return nil, fmt.Errorf("httpx: proxy dialer requires a non-nil proxy URL")
+	}
+	switch p.URL.Scheme {
+	case "http", "https":
+		return connectDialer(p), nil
+	case "socks5":
+		dialer, err := proxy.SOCKS5("tcp", p.URL.Host, nil, proxy.Direct)
+		if err != nil {
+			return nil, fmt.Errorf("httpx: building socks5 dialer: %w", err)
+		}
+		ctxDialer, ok := dialer.(proxy.ContextDialer)
+		if !ok {
+			return nil, fmt.Errorf("httpx: socks5 dialer does not support context dialing")
+		}
+		return func(ctx context.Context, addr string) (net.Conn, error) {
+			return ctxDialer.DialContext(ctx, "tcp", addr)
+		}, nil
+	default:
+		return nil, fmt.Errorf("httpx: unsupported proxy scheme %q", p.URL.Scheme)
+	}
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+// connectDialer returns a dial function that tunnels to addr through an
+// http/https CONNECT proxy. For an https-scheme proxy the connection to the
+// proxy is itself TLS (verified unless p.Insecure); the CONNECT payload and
+// tunneled bytes are plaintext to the caller.
+func connectDialer(p ProxyConfig) func(ctx context.Context, addr string) (net.Conn, error) {
+	return func(ctx context.Context, addr string) (net.Conn, error) {
+		// Reject CR/LF in the target before it reaches the CONNECT request line:
+		// otherwise an attacker-influenced addr could smuggle extra header lines
+		// or a second request into the bytes written to the proxy. net.SplitHostPort
+		// does NOT catch this (the payload splits cleanly), so check explicitly.
+		if strings.ContainsAny(addr, "\r\n") {
+			return nil, fmt.Errorf("httpx: invalid proxy target address %q: contains CR or LF", addr)
+		}
+
+		conn, err := dialProxy(ctx, p)
+		if err != nil {
+			return nil, err
+		}
+
+		// Interruptible handshake: a cancel-only context (context.WithCancel, no
+		// deadline) has no Deadline() for SetDeadline to bound, so without this a
+		// stalled Write/ReadResponse against a silent proxy would hang past
+		// cancellation. A watcher goroutine closes the conn on ctx.Done() to unblock
+		// an IN-FLIGHT handshake. It is made mutually exclusive with the success
+		// handoff by mu+handshakeDone: the mainline marks the handshake complete
+		// (under mu) BEFORE close(watcherStopped), so once that flag is set the
+		// watcher can no longer close the conn. The guarantee is therefore precise —
+		// the watcher interrupts only a still-running handshake, never the conn
+		// returned to the caller. A cancel that races a just-completed handshake is
+		// handled explicitly below: we return ctx.Err() rather than a live-but-closed
+		// conn (never success + a closed conn). SetDeadline (inside connectHandshake)
+		// still gives clean deadline errors when the caller's context has a deadline.
+		var mu sync.Mutex
+		handshakeDone := false
+		watcherStopped := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				mu.Lock()
+				if !handshakeDone {
+					// #nosec G104 -- best-effort interrupt of the in-flight handshake; the dial fails below.
+					conn.Close() //nolint:errcheck,gosec // unblock the in-flight handshake on cancellation
+				}
+				mu.Unlock()
+			case <-watcherStopped:
+			}
+		}()
+
+		br, handshakeErr := connectHandshake(ctx, conn, addr)
+
+		mu.Lock()
+		handshakeDone = true
+		mu.Unlock()
+		close(watcherStopped)
+
+		if handshakeErr != nil {
+			// #nosec G104 -- best-effort cleanup; the conn is discarded on this error path (handshake failed or ctx canceled).
+			conn.Close() //nolint:errcheck,gosec // discard the conn on handshake failure
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("httpx: proxy CONNECT canceled: %w", ctx.Err())
+			}
+			return nil, handshakeErr
+		}
+
+		// Handshake succeeded. If ctx was canceled (possibly after the watcher
+		// already closed conn in the tiny success-vs-cancel window), return the
+		// cancellation error rather than handing back a maybe-closed conn.
+		if ctx.Err() != nil {
+			// #nosec G104 -- best-effort cleanup; the conn is discarded on this cancel-after-success path.
+			conn.Close() //nolint:errcheck,gosec // discard the conn: cancel raced a successful handshake
+			return nil, fmt.Errorf("httpx: proxy CONNECT canceled after handshake: %w", ctx.Err())
+		}
+
+		// Preserve any bytes the proxy pipelined past the CONNECT reply so the
+		// caller's TLS handshake does not lose them. NOTE: resp.Body is
+		// deliberately NOT closed on the 200 path — matching net/http's Transport,
+		// which never closes the body of a successful CONNECT: a hostile or
+		// misconfigured proxy that declares a body would otherwise have Close()'s
+		// drain (io.Copy) consume the caller's first tunneled bytes (SEC-BE-003).
+		if br.Buffered() > 0 {
+			return &bufferedConn{r: br, Conn: conn}, nil
+		}
+		return conn, nil
+	}
+}
+
+// connectHandshake performs the CONNECT request/response exchange on conn (an
+// already-dialed proxy connection) and returns the buffered reader positioned
+// just past the "200 Connection established" reply. When the caller's context
+// carries a deadline it bounds the exchange via conn.SetDeadline (clean deadline
+// errors) and clears it on success so it does not leak into tunneled traffic;
+// cancellation of a deadline-less context is handled by the ctx.Done() watcher
+// in connectDialer. resp.Body is intentionally left unclosed (see connectDialer)
+// so a declared-body reply cannot drain the tunnel.
+func connectHandshake(ctx context.Context, conn net.Conn, addr string) (*bufio.Reader, error) {
+	if dl, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(dl); err != nil {
+			return nil, fmt.Errorf("httpx: setting proxy CONNECT deadline: %w", err)
+		}
+	}
+
+	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", addr, addr)
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return nil, fmt.Errorf("httpx: writing CONNECT to proxy: %w", err)
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		return nil, fmt.Errorf("httpx: reading CONNECT response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("httpx: proxy CONNECT to %s failed: %s", addr, resp.Status)
+	}
+
+	// Clear the handshake deadline so it does not apply to tunneled traffic.
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		return nil, fmt.Errorf("httpx: clearing proxy CONNECT deadline: %w", err)
+	}
+	return br, nil
+}
+
+// dialProxy opens the transport connection to the proxy itself: TLS for an
+// https-scheme proxy (cert verified unless p.Insecure), plain TCP otherwise.
+func dialProxy(ctx context.Context, p ProxyConfig) (net.Conn, error) {
+	if p.URL.Scheme == "https" {
+		tlsCfg := &tls.Config{ServerName: p.URL.Hostname(), MinVersion: tls.VersionTLS12}
+		if p.Insecure {
+			// #nosec G402 -- opt-in via --proxy-insecure for https proxy MITM
+			tlsCfg.InsecureSkipVerify = true
+		}
+		d := &tls.Dialer{Config: tlsCfg}
+		conn, err := d.DialContext(ctx, "tcp", p.URL.Host)
+		if err != nil {
+			return nil, fmt.Errorf("httpx: dialing https proxy: %w", err)
+		}
+		return conn, nil
+	}
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "tcp", p.URL.Host)
+	if err != nil {
+		return nil, fmt.Errorf("httpx: dialing proxy: %w", err)
+	}
+	return conn, nil
+}
+
+// bufferedConn drains bytes already buffered by the CONNECT-response reader
+// before falling through to the underlying connection. Writes go directly to
+// the embedded net.Conn.
+type bufferedConn struct {
+	r *bufio.Reader
+	net.Conn
+}
+
+func (c *bufferedConn) Read(b []byte) (int, error) { return c.r.Read(b) }

@@ -24,6 +24,7 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/generate"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
 
@@ -61,6 +62,12 @@ type Options struct {
 	// Status is an optional io.Writer for verbose status messages.
 	// Pass nil or io.Discard to suppress.
 	Status io.Writer
+
+	// Proxy routes probe traffic through an intercepting proxy when set. It is
+	// forwarded to probe.Config.Proxy. When enabled it takes precedence over the
+	// AllowPrivate permissive-client branch: the proxied client is built (via
+	// withDefaults), while AllowPrivate still relaxes only the URL-level validator.
+	Proxy httpx.ProxyConfig
 }
 
 // ValidateSlugThreshold rejects a --slug-threshold < 2 when --merge-slugs is
@@ -104,29 +111,34 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 	if opts.Probe {
 		cfg := probe.DefaultConfig()
 		cfg.GRPCInsecureSkipVerify = opts.GRPCInsecureSkipVerify
+		cfg.Proxy = opts.Proxy
 		if opts.AllowPrivate {
-			// allow-private disables ONLY SSRF protection (URLValidator +
-			// DialContext re-resolution). Clone probe's default transport and
-			// override just DialContext with a plain net.Dialer so every other
-			// default (TLS/idle timeouts, and any future proxy/CA settings) is
-			// preserved rather than dropped by a hand-rolled bare transport. The
-			// client otherwise mirrors probe's default client (CheckRedirect only).
+			// allow-private disables ONLY SSRF protection (the URL-level
+			// validator, and — absent a proxy — the DialContext re-resolution).
 			cfg.URLValidator = func(string) error { return nil }
-			transport := probe.DefaultTransport()
-			transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, network, addr)
+			if !opts.Proxy.Enabled() {
+				// No proxy: clone probe's default transport and override just
+				// DialContext with a plain net.Dialer so every other default
+				// (TLS/idle timeouts, and any future CA settings) is preserved
+				// rather than dropped by a hand-rolled bare transport. The client
+				// otherwise mirrors probe's default client (CheckRedirect only).
+				transport := probe.DefaultTransport()
+				transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					var d net.Dialer
+					return d.DialContext(ctx, network, addr)
+				}
+				cfg.Client = &http.Client{
+					CheckRedirect: noFollowRedirects,
+					Transport:     transport,
+				}
+				cfg.Dialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					var d net.Dialer
+					return d.DialContext(ctx, network, addr)
+				}
 			}
-			cfg.Client = &http.Client{
-				CheckRedirect: func(req *http.Request, via []*http.Request) error {
-					return http.ErrUseLastResponse
-				},
-				Transport: transport,
-			}
-			cfg.Dialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, network, addr)
-			}
+			// When proxied, leave cfg.Client/cfg.Dialer nil so probe.withDefaults
+			// builds the proxied client (proxy transport wins) and dialGRPC uses
+			// the proxy dialer — AllowPrivate above only relaxed the URL validator.
 		}
 		// Pure grpc-gateway traffic is REST/JSON, so the gRPC classifier never
 		// marks it APIType=="grpc" and the gRPC/gateway probes (which only
