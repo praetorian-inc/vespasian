@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -657,4 +658,80 @@ func TestMergeEnrichedLinks_NilScopeKeepsCaptured(t *testing.T) {
 	if len(got) != 2 {
 		t.Errorf("nil scopeFn kept %d, want 2 (no filtering)", len(got))
 	}
+}
+
+// TestBudgetReached covers the two crawl budgets (LAB-4678 Phase 3): a 0 budget
+// is unlimited for that dimension, and either dimension hitting its bound stops
+// the crawl from starting a new page.
+func TestBudgetReached(t *testing.T) {
+	cases := []struct {
+		name                                   string
+		pageCount, maxPages, reqCount, maxReqs int
+		want                                   bool
+	}{
+		{"both unlimited", 100, 0, 100, 0, false},
+		{"pages under cap", 1, 5, 0, 0, false},
+		{"pages at cap", 5, 5, 0, 0, true},
+		{"requests at cap", 1, 0, 50, 50, true},
+		{"requests under cap", 1, 0, 49, 50, false},
+		{"pages ok, requests over", 2, 100, 500, 200, true},
+		{"requests ok, pages over", 100, 50, 10, 1000, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			pages, reqs := tc.pageCount, tc.reqCount
+			if got := budgetReached(&mu, &pages, tc.maxPages, &reqs, tc.maxReqs, false); got != tc.want {
+				t.Errorf("budgetReached(pages=%d/%d, reqs=%d/%d) = %v, want %v",
+					tc.pageCount, tc.maxPages, tc.reqCount, tc.maxReqs, got, tc.want)
+			}
+			// The pre-Pop early-out must never consume a page slot.
+			if pages != tc.pageCount {
+				t.Errorf("check-only call changed pageCount: %d -> %d", tc.pageCount, pages)
+			}
+			if reqs != tc.reqCount {
+				t.Errorf("check-only call changed reqCount: %d -> %d", tc.reqCount, reqs)
+			}
+		})
+	}
+}
+
+// TestBudgetReached_Reserve pins the reserve semantics that keep the page cap
+// exact under concurrency: a reserving call consumes exactly one page slot when
+// it admits the page, and consumes none when it reports a budget reached — for
+// either dimension. Compare and increment share one critical section, so a
+// separate check-then-increment cannot race workers past MaxPages.
+func TestBudgetReached_Reserve(t *testing.T) {
+	t.Run("admits and consumes one slot", func(t *testing.T) {
+		var mu sync.Mutex
+		pages, reqs := 3, 0
+		if budgetReached(&mu, &pages, 5, &reqs, 0, true) {
+			t.Fatal("reported budget reached at 3/5 pages")
+		}
+		if pages != 4 {
+			t.Errorf("reserve did not consume a slot: pageCount = %d, want 4", pages)
+		}
+	})
+
+	t.Run("page cap reached consumes nothing", func(t *testing.T) {
+		var mu sync.Mutex
+		pages, reqs := 5, 0
+		if !budgetReached(&mu, &pages, 5, &reqs, 0, true) {
+			t.Fatal("did not report budget reached at 5/5 pages")
+		}
+		if pages != 5 {
+			t.Errorf("reserve consumed a slot past the page cap: pageCount = %d, want 5", pages)
+		}
+	})
+
+	t.Run("request cap reached consumes no page slot", func(t *testing.T) {
+		var mu sync.Mutex
+		pages, reqs := 1, 50
+		if !budgetReached(&mu, &pages, 100, &reqs, 50, true) {
+			t.Fatal("did not report budget reached at 50/50 requests")
+		}
+		if pages != 1 {
+			t.Errorf("reserve consumed a page slot when the request budget stopped the crawl: pageCount = %d, want 1", pages)
+		}
+	})
 }

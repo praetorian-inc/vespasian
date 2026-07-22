@@ -111,6 +111,7 @@ func redactSeedURL(raw string) string {
 type engineOptions struct {
 	Concurrency   int               // concurrent tabs (0 → DefaultConcurrency)
 	MaxPages      int               // max pages to visit (0 → unlimited)
+	MaxRequests   int               // max captured requests before stopping (0 → unlimited); a rate/politeness bound distinct from MaxPages
 	MaxDepth      int               // max crawl depth
 	PageTimeout   time.Duration     // per-page navigation timeout (0 → 30s)
 	StableTimeout time.Duration     // DOM stability wait (0 → DefaultStableWait)
@@ -204,9 +205,17 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 	// taking new pages once the budget is reached, so pages already in flight
 	// finalize and emit all of their captured requests, and the crawl is no
 	// longer canceled mid-page.
+	//
+	// MaxRequests (LAB-4678 Phase 3) is a second, independent budget: a
+	// rate/politeness bound on the total number of captured requests, distinct
+	// from the crawl-breadth MaxPages. It stops enqueuing new pages once the
+	// captured-request count reaches the bound; like MaxPages it is graceful —
+	// pages already in flight finish and emit their requests, so the final count
+	// can slightly exceed the bound rather than cutting a page mid-capture.
 	var (
 		mu        sync.Mutex
 		pageCount int
+		reqCount  int
 	)
 
 	// Workers run under ctx directly. The page budget no longer cancels the
@@ -218,7 +227,7 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			e.worker(ctx, id, onResult, &mu, &pageCount, e.opts.MaxPages)
+			e.worker(ctx, id, onResult, &mu, &pageCount, &reqCount)
 		}(i)
 	}
 
@@ -233,17 +242,23 @@ func (e *rodEngine) Close() error {
 	return e.browser.Close()
 }
 
-// pageBudgetReached reports whether the visited-page budget is exhausted,
-// taking mu for the duration of the check. maxPages <= 0 means unlimited. When
-// reserve is true and the budget is not yet reached, it consumes one page slot
-// before returning false — the compare and the increment happen in a single
-// critical section so concurrent workers cannot overshoot the cap (a separate
-// check-then-increment would race). Pass reserve=false for the pre-Pop
-// early-out that must not consume a slot.
-func pageBudgetReached(mu *sync.Mutex, pageCount *int, maxPages int, reserve bool) bool {
+// budgetReached reports whether either crawl budget is exhausted: the page
+// budget (pages visited) or the request budget (captured requests). A budget of
+// 0 means unlimited for that dimension. It takes mu for the duration of the
+// check, so callers must NOT hold it. When reserve is true and neither budget is
+// reached, it consumes one page slot before returning false — the compare and
+// the increment happen in a single critical section so concurrent workers cannot
+// overshoot the page cap (a separate check-then-increment would race). Pass
+// reserve=false for the pre-Pop early-out that must not consume a slot. Both
+// budgets are graceful: this gates only the start of a new page; pages already
+// in flight finish and emit their requests.
+func budgetReached(mu *sync.Mutex, pageCount *int, maxPages int, reqCount *int, maxRequests int, reserve bool) bool {
 	mu.Lock()
 	defer mu.Unlock()
 	if maxPages > 0 && *pageCount >= maxPages {
+		return true
+	}
+	if maxRequests > 0 && *reqCount >= maxRequests {
 		return true
 	}
 	if reserve {
@@ -255,17 +270,19 @@ func pageBudgetReached(mu *sync.Mutex, pageCount *int, maxPages int, reserve boo
 // worker is the per-tab goroutine. It takes URLs from the frontier, visits
 // each one in a fresh tab, captures network events, extracts links, and pushes
 // discovered URLs back to the frontier.
-func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRequest), mu *sync.Mutex, pageCount *int, maxPages int) {
+func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRequest), mu *sync.Mutex, pageCount, reqCount *int) {
+	maxPages := e.opts.MaxPages
+	maxRequests := e.opts.MaxRequests
 	for {
 		// Check context before blocking on Pop.
 		if ctx.Err() != nil {
 			return
 		}
 
-		// Stop taking new pages once the page budget is reached. Pages already
+		// Stop taking new pages once either budget is reached. Pages already
 		// being visited by other workers still finalize below. Check-only (no
 		// reservation): we have not popped an entry yet.
-		if pageBudgetReached(mu, pageCount, maxPages, false) {
+		if budgetReached(mu, pageCount, maxPages, reqCount, maxRequests, false) {
 			return
 		}
 
@@ -278,12 +295,12 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		// section. Callers only need MarkIdle() after processing completes.
 
 		// Reserve this page's budget slot before visiting. Another worker may
-		// have reached the budget while we were blocked in Pop waiting for a
+		// have reached a budget while we were blocked in Pop waiting for a
 		// link; if so, release the entry without visiting so the crawl never
-		// exceeds MaxPages. Reserving before the visit (rather than counting
-		// after) keeps the cap exact instead of overshooting by up to
-		// Concurrency pages.
-		if pageBudgetReached(mu, pageCount, maxPages, true) {
+		// starts a page past a budget. Reserving before the visit (rather than
+		// counting after) keeps the page cap exact instead of overshooting by
+		// up to Concurrency pages.
+		if budgetReached(mu, pageCount, maxPages, reqCount, maxRequests, true) {
 			e.frontier.MarkIdle()
 			return
 		}
@@ -301,13 +318,18 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 			continue
 		}
 
-		// Emit captured requests.
+		// Emit captured requests and count them toward the MaxRequests budget.
+		// Counting emitted requests (not just page loads) is what makes the
+		// budget a request-rate bound distinct from MaxPages.
 		for _, req := range requests {
 			if ctx.Err() != nil {
 				e.frontier.MarkIdle()
 				return
 			}
 			onResult(req)
+			mu.Lock()
+			*reqCount++
+			mu.Unlock()
 		}
 
 		// Push discovered links at depth+1.

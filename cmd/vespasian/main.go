@@ -234,6 +234,7 @@ type CrawlOptions struct {
 	Output          string        `short:"o" help:"Output file path"`
 	Depth           int           `default:"3" help:"Maximum crawl depth"`
 	MaxPages        int           `default:"100" help:"Maximum number of pages (URLs visited) to crawl; pages already in flight when the limit is reached still finish"`
+	MaxRequests     int           `name:"max-requests" default:"0" help:"Maximum captured requests before the crawl stops enqueuing new pages (0 = unlimited). A rate/politeness bound distinct from --max-pages; pages already in flight when the limit is reached still finish."`
 	Timeout         time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
 	Scope           string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
 	Headless        bool          `default:"true" help:"Use headless browser"`
@@ -371,6 +372,7 @@ func (c *CrawlCmd) Run() error {
 	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions, crawl.CrawlerOptions{
 		Depth:         c.Depth,
 		MaxPages:      c.MaxPages,
+		MaxRequests:   c.MaxRequests,
 		Timeout:       c.Timeout,
 		Scope:         c.Scope,
 		Headless:      c.Headless,
@@ -654,6 +656,7 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions, crawl.CrawlerOptions{
 		Depth:         c.Depth,
 		MaxPages:      c.MaxPages,
+		MaxRequests:   c.MaxRequests,
 		Timeout:       c.Timeout,
 		Scope:         c.Scope,
 		Headless:      c.Headless,

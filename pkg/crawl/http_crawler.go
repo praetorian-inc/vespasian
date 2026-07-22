@@ -108,6 +108,11 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	if err != nil {
 		return nil, err
 	}
+	// The net/http backend records exactly one request per visited page, so the
+	// request budget reduces to a page cap here (LAB-4678 Phase 3). The headless
+	// engine, where one page fires many requests, enforces MaxRequests as a
+	// distinct running count.
+	maxPages = httpPageCap(maxPages, c.opts.MaxRequests)
 
 	// Validate and parse the proxy on the HTTP path. The CLI validates too
 	// (cmd/vespasian doCrawl), but this guards library/SDK callers that build
@@ -204,6 +209,18 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	copy(snapshot, results)
 	mu.Unlock()
 	return snapshot, nil
+}
+
+// httpPageCap folds the request budget into the page cap for the net/http
+// backend: that backend records one request per page, so a MaxRequests bound
+// (maxRequests > 0) reduces to a page cap. A zero maxRequests leaves maxPages
+// unchanged. Kept as a helper so HTTPCrawler.Crawl stays under the cyclomatic
+// complexity gate.
+func httpPageCap(maxPages, maxRequests int) int {
+	if maxRequests > 0 && maxRequests < maxPages {
+		return maxRequests
+	}
+	return maxPages
 }
 
 // runWorker is the per-goroutine crawl loop. It pops entries from the frontier,
