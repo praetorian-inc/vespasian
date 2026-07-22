@@ -46,6 +46,11 @@
 //     host so a same-path endpoint on a DIFFERENT host is never suppressed),
 //     against the URLs the AST walkers already recovered so no phantom-GET
 //     companions appear for a path recovered both ways on the same origin.
+//     An absolute reconstruction (a bundle literal that concatenates a full
+//     http(s) URL) is only emitted when its host matches the bundle's own
+//     host (SEC-BE-001, LAB-4992); a cross-origin absolute reconstruction is
+//     dropped so a hostile bundle literal cannot smuggle an
+//     attacker-controlled host into the offline candidate set.
 //
 // # Source tagging
 //

@@ -406,9 +406,6 @@ func TestRESTClassifier_ImplementsDetailedClassifier(t *testing.T) {
 	assert.Implements(t, (*DetailedClassifier)(nil), c)
 }
 
-// TestClassifyDetail_FallbackToHeaders verifies the classifier falls back to
-// Response.Headers when ContentType is empty, as happens when headers have
-// non-standard casing and ContentType wasn't populated by the crawler.
 // TestClassifyDetail_StaticJSCandidateFloor pins Rule 6 (LAB-4992): an unprobed
 // JS-static candidate whose path carries an API indicator is floored to
 // StaticJSConfidence (0.5) so it survives default-confidence generation instead
@@ -497,6 +494,9 @@ func TestClassifyDetail_StaticJSCandidateFloor(t *testing.T) {
 	}
 }
 
+// TestClassifyDetail_FallbackToHeaders verifies the classifier falls back to
+// Response.Headers when ContentType is empty, as happens when headers have
+// non-standard casing and ContentType wasn't populated by the crawler.
 func TestClassifyDetail_FallbackToHeaders(t *testing.T) {
 	c := &RESTClassifier{}
 

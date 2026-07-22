@@ -1440,7 +1440,7 @@ func TestReplayJSExtracted_DropsOfflineConcatMirrorForReachedPaths(t *testing.T)
 		{Method: "GET", URL: srv.URL + "/api/users/0/orders", Source: SourceStaticJSConcat},
 		{Method: "GET", URL: srv.URL + "/api/missing/0/gone", Source: SourceStaticJSConcat},
 		// A mirror whose URL differs only by a trailing slash from the probed
-		// URL — probeMatchKey normalization must still drop it.
+		// URL — reachedPathKey normalization must still drop it.
 		{Method: "GET", URL: srv.URL + "/api/missing/0/gone/", Source: SourceStaticJSConcat},
 		// A concat candidate for a path NOT in the bundle — JS-replay never probes
 		// it, so it must be preserved (offline fallback).
@@ -1468,31 +1468,74 @@ func TestReplayJSExtracted_DropsOfflineConcatMirrorForReachedPaths(t *testing.T)
 		"the 404 decoy must not be present as js-extract either")
 }
 
-// TestProbeMatchKey pins the reached-set normalization that lets the offline
-// concat mirror match the live probe URL despite cosmetic differences: the host
-// is lower-cased and a trailing slash is trimmed. Without this the mirror-drop
-// would silently no-op when jsstatic (which resolves against the capture origin,
-// preserving host case) and JS-replay (which builds from the target origin)
-// disagree on host case or a trailing slash, re-opening the 404-decoy leak.
-func TestProbeMatchKey(t *testing.T) {
+// LAB-4992 QUAL-001 regression: jsstatic resolves the offline concat mirror
+// against the BUNDLE origin (e.g. a CDN hosting the JS, or an operator-pinned
+// --target-url that differs from the bundle host), while JS-replay always
+// probes against the TARGET origin. The mirror-drop must therefore match on
+// path alone, not origin+path, or a bundle hosted on a different host than
+// the probe target would leave the 404-decoy mirror in place. This is the
+// cross-host counterpart to TestReplayJSExtracted_DropsOfflineConcatMirrorForReachedPaths,
+// which only covers the same-origin case.
+func TestReplayJSExtracted_DropsOfflineConcatMirrorAcrossHosts(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound) // the target 404s the reconstructed path
+	}))
+	defer srv.Close()
+
+	jsBody := []byte(`fetch("/api/missing/".concat(x,"/gone"));`)
+	requests := []ObservedRequest{
+		{
+			Method:   "GET",
+			URL:      srv.URL + "/app.js",
+			Source:   "katana",
+			Response: ObservedResponse{StatusCode: 200, ContentType: "application/javascript", Body: jsBody},
+		},
+		// Offline mirror resolved by jsstatic against a DIFFERENT (bundle/CDN)
+		// origin than the probe target (srv.URL) — same path, different host.
+		{Method: "GET", URL: "https://cdn.example.com/api/missing/0/gone", Source: SourceStaticJSConcat},
+	}
+
+	result := ReplayJSExtracted(context.Background(), requests, allowLocal(srv))
+
+	for _, r := range result {
+		if r.Source == SourceStaticJSConcat {
+			t.Fatalf("expected cross-host offline concat mirror %q to be dropped once the target 404s the reconstructed path, got it retained", r.URL)
+		}
+	}
+}
+
+// TestReachedPathKey pins the reached-set normalization that lets the offline
+// concat mirror match the live probe URL despite cosmetic AND host
+// differences: only the (trailing-slash-trimmed) path is compared, so a
+// bundle mirror resolved against the CDN/bundle origin still matches a probe
+// built against the target origin (QUAL-001). It also pins the raw-string
+// fallback branches (TEST-002): an unparseable URL and a URL with no path
+// component both return their input verbatim rather than colliding on "".
+func TestReachedPathKey(t *testing.T) {
 	tests := []struct{ a, b string }{
-		{"http://Example.COM/api/x", "http://example.com/api/x"},            // host case
+		{"http://Example.COM/api/x", "http://example.com/api/x"},            // host case (path-only, host is irrelevant anyway)
 		{"http://example.com/api/x/", "http://example.com/api/x"},           // trailing slash
-		{"http://example.com/api/x", "http://example.com:80/api/x"},         // default http port
+		{"http://example.com/api/x", "http://example.com:80/api/x"},         // default http port (path-only, port is irrelevant anyway)
 		{"https://example.com/api/x", "https://example.com:443/api/x"},      // default https port
 		{"http://Example.com:8080/api/x/", "http://example.com:8080/api/x"}, // host case + trailing slash on a non-default port
+		// QUAL-001: same path, entirely different host/scheme — the mirror-drop
+		// must be host-agnostic since jsstatic resolves the mirror against the
+		// bundle/CDN origin while JS-replay probes against the target origin.
+		{"https://cdn.example.com/api/missing/0/gone", "http://127.0.0.1:9999/api/missing/0/gone"},
 	}
 	for _, tt := range tests {
-		assert.Equal(t, probeMatchKey(tt.a), probeMatchKey(tt.b),
+		assert.Equal(t, reachedPathKey(tt.a), reachedPathKey(tt.b),
 			"expected %q and %q to normalize to the same key", tt.a, tt.b)
 	}
-	// Genuinely different paths/hosts/ports must NOT collapse.
-	assert.NotEqual(t, probeMatchKey("http://example.com/api/x"), probeMatchKey("http://example.com/api/y"))
-	assert.NotEqual(t, probeMatchKey("http://a.com/api/x"), probeMatchKey("http://b.com/api/x"))
-	// A non-default port is a distinct origin from no port (catches a regression
-	// that dropped the port entirely), and two different non-default ports differ.
-	assert.NotEqual(t, probeMatchKey("http://example.com/api/x"), probeMatchKey("http://example.com:8080/api/x"))
-	assert.NotEqual(t, probeMatchKey("http://example.com:8080/api/x"), probeMatchKey("http://example.com:9090/api/x"))
+	// Genuinely different paths must NOT collapse.
+	assert.NotEqual(t, reachedPathKey("http://example.com/api/x"), reachedPathKey("http://example.com/api/y"))
+	assert.NotEqual(t, reachedPathKey("http://a.com/api/x"), reachedPathKey("http://a.com/api/y"))
+
+	// TEST-002: fallback branches. An unparseable URL (control byte breaks
+	// url.Parse) falls back to the raw string verbatim.
+	assert.Equal(t, "not a url\x7f", reachedPathKey("not a url\x7f"))
+	// A URL with no path component (empty string) also falls back verbatim.
+	assert.Equal(t, "", reachedPathKey(""))
 }
 
 // errRoundTripper always returns the configured error from RoundTrip.
@@ -2126,6 +2169,34 @@ func TestExtractConcatPaths_PerBundleCap(t *testing.T) {
 	got := extractConcatPaths([]byte(sb.String()))
 	assert.Equal(t, maxConcatPathsPerBundle, len(got),
 		"extractConcatPaths must not exceed maxConcatPathsPerBundle per bundle")
+}
+
+// TestServicePrefixPlusPaths_PerBundleCap (TEST-003) verifies that
+// servicePrefixPlusPaths — which has its own maxConcatPathsPerBundle guard,
+// separate from extractConcatPaths' — is itself capped when a bundle contains
+// far more distinct literal service-prefix `+`-chains than the limit. Reached
+// via ExtractStaticConcatPaths, the offline entry point that fans out to both
+// extractors.
+func TestServicePrefixPlusPaths_PerBundleCap(t *testing.T) {
+	// Build a bundle with maxConcatPathsPerBundle*2 distinct service-prefix
+	// `+`-concat chains, each with a unique prefix and suffix so none collide
+	// in the seen-dedup map.
+	var sb strings.Builder
+	total := maxConcatPathsPerBundle * 2
+	for i := 0; i < total; i++ {
+		fmt.Fprintf(&sb, `var svc%d = "svc%d/" + "api/endpoint%d";`, i, i, i)
+	}
+	jsBody := []byte(sb.String())
+
+	got := servicePrefixPlusPaths(jsBody)
+	assert.Equal(t, maxConcatPathsPerBundle, len(got),
+		"servicePrefixPlusPaths must not exceed maxConcatPathsPerBundle per bundle")
+
+	// The cap must also be visible through the offline entry point that both
+	// extractConcatPaths and servicePrefixPlusPaths feed into.
+	all := ExtractStaticConcatPaths(jsBody)
+	assert.LessOrEqual(t, len(all), 2*maxConcatPathsPerBundle,
+		"ExtractStaticConcatPaths must not exceed the combined per-extractor caps")
 }
 
 // TestExtractConcatPaths_ConcatArgListCap verifies that a .concat() call
@@ -3329,6 +3400,15 @@ func TestCleanConcatPath(t *testing.T) {
 		{
 			name: "drops path without API indicator",
 			in:   "/static/logo",
+			want: "",
+		},
+		{
+			// SEC-BE-002: a lone non-UTF-8 high byte (0x80-0x9F) decodes to
+			// utf8.RuneError, for which unicode.IsControl is false — a
+			// rune-based-only scan would let it survive. It must still be
+			// rejected as an invalid/unprintable byte.
+			name: "rejects raw non-UTF-8 high byte",
+			in:   "/api/\x85x",
 			want: "",
 		},
 	}

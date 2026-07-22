@@ -44,6 +44,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 	"github.com/praetorian-inc/vespasian/pkg/ssrf"
@@ -1658,12 +1659,21 @@ func cleanConcatPath(p string) string {
 	if p == "" || !hasAPIIndicator(p) {
 		return ""
 	}
-	// Reject a space or any non-printable/control byte. A crafted bundle literal
-	// can embed raw C0/C1 control bytes (NUL, VT, FF, DEL, …) that a
-	// whitespace-only check would let survive into a candidate path;
-	// unicode.IsControl covers tab/CR/LF and every other control byte.
-	if strings.IndexFunc(p, func(r rune) bool { return r == ' ' || unicode.IsControl(r) }) >= 0 {
-		return ""
+	// Reject a space, any non-printable/control byte, or a raw byte that is not
+	// valid UTF-8. A crafted bundle literal can embed raw C0/C1 control bytes
+	// (NUL, VT, FF, DEL, …) that a whitespace-only check would let survive into
+	// a candidate path; unicode.IsControl covers tab/CR/LF and every other
+	// control byte. A lone non-UTF-8 high byte (0x80-0x9F) decodes to
+	// utf8.RuneError, for which unicode.IsControl is false — strings.IndexFunc
+	// alone (which decodes runes the same way) would let it through, so this
+	// scans bytes directly and additionally rejects any width-1 RuneError
+	// decode (SEC-BE-002).
+	for i := 0; i < len(p); {
+		r, size := utf8.DecodeRuneInString(p[i:])
+		if r == ' ' || unicode.IsControl(r) || (r == utf8.RuneError && size == 1) {
+			return ""
+		}
+		i += size
 	}
 	return p
 }
@@ -1924,14 +1934,22 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	result := make([]ObservedRequest, len(requests))
 	copy(result, requests)
 
-	// reached records every full URL the target answered for (any status,
-	// including 404). For those paths JS-replay is authoritative, so the passive
-	// offline concat mirror (SourceStaticJSConcat, emitted by pkg/analyze/jsstatic)
-	// is dropped after the loop — a 404'd decoy must not survive via the mirror,
-	// and a confirmed path is already re-added below as a richer js-extract
-	// observation. Paths the target never answered (connection failures / fully
-	// offline) are absent here, so their offline candidates are preserved
-	// (LAB-4992 AC1).
+	// reached records the reachedPathKey of every full URL the target answered
+	// for (any status, including 404). For those paths JS-replay is
+	// authoritative, so the passive offline concat mirror (SourceStaticJSConcat,
+	// emitted by pkg/analyze/jsstatic) is dropped after the loop — a 404'd decoy
+	// must not survive via the mirror, and a confirmed path is already re-added
+	// below as a richer js-extract observation. Paths the target never answered
+	// (connection failures / fully offline) are absent here, so their offline
+	// candidates are preserved (LAB-4992 AC1).
+	//
+	// Keyed path-only (QUAL-001), not origin+path: jsstatic resolves the mirror
+	// URL against the bundle/capture origin (which may be a CDN hosting the JS,
+	// or differ from an operator-pinned --target-url), while this loop always
+	// probes against the target origin. An origin-qualified key would silently
+	// no-op the drop whenever the bundle host differs from the target host,
+	// re-opening the 404-decoy leak. Matching on path alone drops the mirror
+	// regardless of which host either side resolved the URL against.
 	reached := make(map[string]bool)
 
 	probed := 0
@@ -1989,11 +2007,11 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		}
 		// The target answered (200 or 404), so JS-replay is authoritative for
 		// this reconstructed path — record it so the offline mirror is dropped.
-		// Keyed on a normalized form (lower-cased host, trailing slash trimmed)
-		// so the match survives host-case / trailing-slash differences between
-		// the target origin used here and the capture origin jsstatic resolved
-		// the mirror against.
-		reached[probeMatchKey(fullURL)] = true
+		// Keyed path-only (see reached's doc comment above) so the match
+		// survives host-case / trailing-slash / bundle-vs-target host
+		// differences between this probe URL and the mirror URL jsstatic
+		// resolved against the bundle origin.
+		reached[reachedPathKey(fullURL)] = true
 
 		// Skip 404 responses — these are typically wrong service prefix
 		// combinations (e.g., /identity/api/shop/products when the correct
@@ -2032,6 +2050,9 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	// supersedes the unprobed SourceStaticJSConcat candidate, so a decoy the
 	// target 404s does not leak back into the spec via the offline mirror.
 	// Candidates for unreached paths are untouched (offline fallback, LAB-4992).
+	// Matching is host-agnostic (path-only, QUAL-001): the mirror is dropped
+	// whether or not the bundle it was reconstructed against shares a host
+	// with the probe target.
 	//
 	// Residual limitation: paths beyond cfg.MaxEndpoints are never probed, so
 	// they never enter `reached` and their offline mirror is retained — a decoy
@@ -2040,7 +2061,7 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	if len(reached) > 0 {
 		filtered := result[:0]
 		for _, r := range result {
-			if r.Source == SourceStaticJSConcat && reached[probeMatchKey(r.URL)] {
+			if r.Source == SourceStaticJSConcat && reached[reachedPathKey(r.URL)] {
 				continue
 			}
 			filtered = append(filtered, r)
@@ -2051,33 +2072,33 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	return result
 }
 
-// probeMatchKey normalizes a URL so the live-probe reached-set matches the
-// offline concat mirror despite cosmetic differences. jsstatic resolves the
-// mirror URL against the capture origin (via url.ResolveReference, which does
-// not lower-case the host and keeps an explicit default port) while JS-replay
-// builds its probe URL from the target origin; a host-case, default-port, or
-// trailing-slash difference would otherwise make the mirror-drop silently no-op
-// and re-open the 404-decoy leak.
+// reachedPathKey normalizes rawURL to a path-only key so the live-probe
+// reached-set matches the offline concat mirror regardless of which origin
+// each side resolved the URL against (LAB-4992 QUAL-001). jsstatic resolves
+// the mirror URL against the bundle/capture origin — which may be a CDN
+// hosting the JS, or differ from an operator-pinned --target-url — while
+// JS-replay always builds its probe URL from the target origin. Keying on
+// origin+path (the previous approach) silently no-ops the mirror-drop
+// whenever those origins differ, re-opening the 404-decoy leak; matching on
+// path alone (trailing slash trimmed, consistent with the rest of this
+// file's normalization) drops the mirror host-agnostically.
 //
-// The origin is canonicalized via originOf (the same helper isSameOrigin uses:
-// lower-cased scheme+host, default port filled in) so "example.com" and
-// "example.com:80" match while a non-default port (":8080") stays distinct; the
-// path is appended with a trailing slash trimmed. Unparseable / host-less URLs
-// fall back to the raw string.
-func probeMatchKey(rawURL string) string {
-	origin := originOf(rawURL)
-	if origin == "" {
-		return rawURL
-	}
+// Unparseable URLs and URLs with no path component fall back to the raw
+// string so a malformed input degrades to an exact (narrower, still safe)
+// match rather than silently colliding with every other empty-path URL.
+func reachedPathKey(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return rawURL
 	}
 	path := u.EscapedPath()
+	if path == "" {
+		return rawURL
+	}
 	if path != "/" {
 		path = strings.TrimRight(path, "/")
 	}
-	return origin + path
+	return path
 }
 
 // --- HTTP helpers ---

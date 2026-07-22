@@ -191,6 +191,20 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	// candidates to StaticJSConfidence so they survive default-confidence
 	// generation as unprobed candidates. Gated on the path heuristic so
 	// non-API-looking static:js entries are not promoted.
+	//
+	// QUAL-002: this floor applies to EVERY IsJSStaticSource candidate — the
+	// AST-literal source (SourceStaticJS), sourcemap-recovered source, AND
+	// concat/service-prefix reconstructions (SourceStaticJSConcat) alike. Only
+	// SourceStaticJSConcat is ever superseded by the reached-filter in
+	// ReplayJSExtracted (which drops a concat mirror once the live probe 404s
+	// the same reconstructed path); a plain SourceStaticJS AST literal has no
+	// such supersession and stays floored even if a probe elsewhere 404s it.
+	// This is deliberate, not an oversight: an AST literal is recovered from a
+	// real call site in the bundle (fetch/axios/etc.), so a 404 there is more
+	// likely auth/param-gated than a wrong-guess decoy, unlike an unvalidated
+	// concat/service-prefix combinatorial reconstruction. Do not extend the
+	// concat reached-filter supersession to plain static:js literals without
+	// revisiting this reasoning.
 	if pathMatched && confidence < StaticJSConfidence && crawl.IsJSStaticSource(req.Source) {
 		confidence = StaticJSConfidence
 		if reason == "" {

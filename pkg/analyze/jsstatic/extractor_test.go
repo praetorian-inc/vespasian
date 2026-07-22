@@ -788,3 +788,51 @@ func TestExtractFromBundle_ConcatDedupHostCaseInsensitive(t *testing.T) {
 		t.Errorf("expected AST-recovered https://EXAMPLE.com/api/ping, got %v", endpoints)
 	}
 }
+
+// TEST-001: extractConcatEndpoints' emit guard is
+// `if filterURL(p) || isExprOnly(p) || astURLs[...] { continue }` — this pins
+// the filterURL/isExprOnly half, which previously had zero coverage. A concat
+// reconstruction that carries an API indicator (satisfying hasAPIIndicator in
+// cleanConcatPath, via "api/") but reconstructs to an asset URL (".js") must
+// still be dropped by filterURL before it is ever emitted as an
+// ExtractedEndpoint.
+func TestExtractFromBundle_ConcatFilteredAsAsset(t *testing.T) {
+	src := []byte(`var u = "/api/" + "bundle.js"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/bundle.js"); ep != nil {
+		t.Errorf("concat reconstruction /api/bundle.js must be dropped by filterURL (asset extension), got %v", endpoints)
+	}
+}
+
+// SEC-BE-001: the concat receiver form must not emit an absolute,
+// cross-origin reconstruction. A hostile bundle literal like
+// "https://attacker.example/api/x".concat(id) would otherwise reconstruct to
+// an absolute URL on an attacker-chosen host and be emitted as an unprobed
+// static:js-concat candidate — Rule 6 (pkg/classify) would floor it to
+// default confidence, and the live probe stage has no same-origin gate of
+// its own, so the attacker host would be probed (SSRF-reflector /
+// scope-escape via a fully offline analysis path). A relative reconstruction
+// and a same-host absolute reconstruction must still be emitted.
+func TestExtractFromBundle_ConcatCrossOriginGate(t *testing.T) {
+	src := []byte(`
+var cross = "https://attacker.example/api/".concat("x");
+var same = "https://example.com/api/".concat("y");
+var rel = "/api/".concat("z");
+`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "https://attacker.example/api/x"); ep != nil {
+		t.Errorf("cross-origin concat reconstruction must NOT be emitted; got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "https://example.com/api/y"); ep == nil {
+		t.Errorf("same-host absolute concat reconstruction must still be emitted, got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "/api/z"); ep == nil {
+		t.Errorf("relative concat reconstruction must still be emitted, got %v", endpoints)
+	}
+}

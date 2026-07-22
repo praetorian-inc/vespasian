@@ -690,8 +690,22 @@ func extractConcatEndpoints(jsSource []byte, baseURL, baseHost string, seen map[
 		// Relative reconstructions arrive without a leading slash (e.g.
 		// "identity/api/auth/login"); normalize so they resolve as
 		// document-root paths rather than bundle-relative ones.
-		if !strings.HasPrefix(p, "http://") && !strings.HasPrefix(p, "https://") && !strings.HasPrefix(p, "/") {
+		absolute := strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://")
+		if !absolute && !strings.HasPrefix(p, "/") {
 			p = "/" + p
+		}
+		// SEC-BE-001 (LAB-4992): drop an absolute reconstruction whose host
+		// differs from the bundle's own host. The concat receiver form (e.g.
+		// "https://attacker.example/api/x".concat(id)) has no origin/scheme
+		// gate of its own — a hostile bundle literal can reconstruct to an
+		// absolute cross-origin URL, which would otherwise be emitted as an
+		// unprobed static:js-concat candidate, floored to default confidence
+		// by classify Rule 6, and then probed against the attacker-chosen
+		// host by the live probe stage (no same-origin gate there either) —
+		// an SSRF-reflector / scope-escape via a fully offline analysis path.
+		// Relative reconstructions and same-host absolute ones are unaffected.
+		if absolute && hostOfURL(p) != baseHost {
+			continue
 		}
 		if filterURL(p) || isExprOnly(p) || astURLs[concatDedupKey(p, baseHost)] {
 			continue
