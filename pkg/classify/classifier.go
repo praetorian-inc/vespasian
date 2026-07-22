@@ -33,6 +33,13 @@ import (
 // scattered across entry points (LAB-4678).
 const DefaultConfidenceThreshold = 0.5
 
+// NearMissFloor is the minimum confidence a dropped request must reach to be
+// reported as a below-threshold near-miss under -v (LAB-4678 Phase 1). It is
+// above zero so static assets and zero-signal requests (which score 0) are not
+// logged as noise, but low enough to surface an endpoint that showed real signal
+// (e.g. the path heuristic alone, 0.15) yet fell under the API threshold.
+const NearMissFloor = 0.1
+
 // APIClassifier determines if a request is an API call.
 type APIClassifier interface {
 	// Name returns the classifier name (e.g., "rest", "graphql").
@@ -99,6 +106,66 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 	return results
 }
 
+// NearMisses returns requests that classified with floor <= confidence <
+// threshold: endpoints dropped for being below the API threshold but that still
+// showed some signal. It is used only for -v near-miss logging so an operator
+// can see why an expected endpoint is MISSING from the spec (LAB-4678 Phase 1).
+// Selection mirrors RunClassifiers (highest-confidence classifier wins) but keeps
+// the sub-threshold band instead of discarding it; requests scoring below floor
+// (static assets, zero-signal) are excluded.
+func NearMisses(classifiers []APIClassifier, requests []crawl.ObservedRequest, floor, threshold float64) []ClassifiedRequest {
+	var results []ClassifiedRequest
+	for _, req := range requests {
+		var best ClassifiedRequest
+		best.ObservedRequest = req
+
+		for _, classifier := range classifiers {
+			var isAPI bool
+			var confidence float64
+			var reason string
+
+			if dc, ok := classifier.(DetailedClassifier); ok {
+				isAPI, confidence, reason = dc.ClassifyDetail(req)
+			} else {
+				isAPI, confidence = classifier.Classify(req)
+				reason = "classified by " + classifier.Name()
+			}
+
+			if confidence > best.Confidence {
+				best.IsAPI = isAPI
+				best.Confidence = confidence
+				best.APIType = classifier.Name()
+				best.Reason = reason
+			}
+		}
+
+		if best.Confidence >= floor && best.Confidence < threshold {
+			results = append(results, best)
+		}
+	}
+	return results
+}
+
+// canonicalHost returns u's host lowercased with a default port (80 for http,
+// 443 for https) stripped, so the dedup key treats example.com,
+// EXAMPLE.com:443, and example.com as the same host. Mirrors the host handling
+// in crawl.normalizeURL.
+func canonicalHost(u *url.URL) string {
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return ""
+	}
+	port := u.Port()
+	if port == "" {
+		return host
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		return host
+	}
+	return host + ":" + port
+}
+
 // Deduplicate removes duplicate classified requests, keeping the highest confidence.
 // The deduplication key is METHOD:path (query params and fragments stripped).
 // Multi-value QueryParams from duplicate observations are merged with union-of-values,
@@ -127,11 +194,16 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest { //nolint:
 			continue
 		}
 
-		// Dedup key intentionally omits host: the crawl layer's scope
-		// restrictions (same-origin / same-domain) make cross-host
-		// duplicates unlikely, and consolidating by path is the desired
-		// behavior for single-target scans.
-		key := req.Method + ":" + parsedURL.Path
+		// Dedup key includes a canonical host (LAB-4678 Phase 1). Omitting it
+		// (the prior behavior) rested on a now-false "cross-host duplicates are
+		// unlikely" assumption: a same-domain scan legitimately observes several
+		// in-scope hosts (e.g. api.example.com and www.example.com), and merging
+		// their identical paths dropped one host's response and query params.
+		// Same-origin scans have a single host, so the key is unchanged for them.
+		// The OpenAPI generator groups by path (host-blind) and lists hosts as
+		// servers, so keeping per-host observations distinct here only makes the
+		// downstream union more complete.
+		key := req.Method + ":" + canonicalHost(parsedURL) + ":" + parsedURL.Path
 
 		// For SOAP endpoints, include SOAPAction in the dedup key so distinct
 		// operations on the same URL path are preserved.

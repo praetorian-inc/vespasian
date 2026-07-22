@@ -22,6 +22,12 @@
 // listeners. This is the correct choice for single-page applications and any
 // site that requires JavaScript execution. External .js bundles are fetched by
 // the browser itself; this path does not perform separate JS file retrieval.
+// After DOM stability the crawl waits for the network to go quiet (bounded by
+// [DefaultNetworkIdleFloor], [DefaultNetworkQuietPeriod], [DefaultPerRequestTimeout],
+// and the per-page timeout) rather than a fixed settle window, so late and
+// dynamic requests are captured. Passively captured requests are scope-filtered
+// like frontier links, and the frontier treats URLs differing only in query
+// parameters as one page.
 //
 // Non-headless mode ([HTTPCrawler]): uses the Go stdlib net/http client with a
 // depth-first search frontier, 150 req/s rate limiter, and a 10 MB per-page

@@ -337,3 +337,33 @@ func TestSSRFSafeDialContext_DNSFailure(t *testing.T) {
 // multi-IP fallback path require a reachable public endpoint and are therefore
 // not unit-testable here — loopback is blocked by the SSRF guard itself.
 // Those paths are covered by live/integration tests.
+
+// TestFrontierKey verifies the frontier dedup key strips the query (and
+// fragment) while keeping scheme/host/path canonicalization, so query-only
+// variants share a key but distinct paths do not (LAB-4678 Phase 1).
+func TestFrontierKey(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"https://example.com/p?id=1", "https://example.com/p"},
+		{"https://example.com/p?id=2&ref=x", "https://example.com/p"},
+		{"https://EXAMPLE.com:443/p?id=1#frag", "https://example.com/p"},
+		{"https://example.com/other?id=1", "https://example.com/other"},
+	}
+	got := map[string]string{}
+	for _, tc := range cases {
+		k := frontierKey(tc.in)
+		if k != tc.want {
+			t.Errorf("frontierKey(%q) = %q, want %q", tc.in, k, tc.want)
+		}
+		got[tc.in] = k
+	}
+	// The two /p query variants must share a key; /other must differ.
+	if got["https://example.com/p?id=1"] != got["https://example.com/p?id=2&ref=x"] {
+		t.Errorf("query variants of /p produced different keys")
+	}
+	if got["https://example.com/p?id=1"] == got["https://example.com/other?id=1"] {
+		t.Errorf("distinct paths collapsed to the same key")
+	}
+}

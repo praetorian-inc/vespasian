@@ -1252,3 +1252,76 @@ func BenchmarkDeduplicate(b *testing.B) {
 		})
 	}
 }
+
+// --- LAB-4678 Phase 1 ---
+
+// TestDeduplicate_KeepsDistinctHosts verifies that the same METHOD:path on two
+// different in-scope hosts (a same-domain scan can observe several) survives
+// deduplication instead of collapsing and losing one host's observation.
+func TestDeduplicate_KeepsDistinctHosts(t *testing.T) {
+	classified := []ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:   "GET",
+				URL:      "https://api.example.com/v1/users",
+				Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`{"a":1}`)},
+			},
+			IsAPI: true, Confidence: 0.9, APIType: "rest",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:   "GET",
+				URL:      "https://www.example.com/v1/users",
+				Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`{"b":2}`)},
+			},
+			IsAPI: true, Confidence: 0.9, APIType: "rest",
+		},
+	}
+
+	result := Deduplicate(classified)
+	assert.Len(t, result, 2, "same path on distinct hosts must not merge")
+}
+
+// TestDeduplicate_SameHostDefaultPortCollapses verifies the host in the dedup
+// key is canonicalized: an explicit :443 on https collapses with the bare host,
+// so a default-port variation does not create a spurious duplicate endpoint.
+func TestDeduplicate_SameHostDefaultPortCollapses(t *testing.T) {
+	classified := []ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{Method: "GET", URL: "https://example.com/v1/users"},
+			IsAPI:           true, Confidence: 0.9, APIType: "rest",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{Method: "GET", URL: "https://example.com:443/v1/users"},
+			IsAPI:           true, Confidence: 0.9, APIType: "rest",
+		},
+	}
+
+	result := Deduplicate(classified)
+	assert.Len(t, result, 1, "https default port :443 must canonicalize to the bare host")
+}
+
+// TestNearMisses returns only endpoints in the [floor, threshold) band: an
+// endpoint with real-but-weak signal (path heuristic alone) is a near-miss,
+// a static asset (0 confidence) is excluded, and a strong API (>= threshold)
+// is excluded because it is emitted, not a miss.
+func TestNearMisses(t *testing.T) {
+	classifiers := []APIClassifier{&RESTClassifier{}}
+	requests := []crawl.ObservedRequest{
+		// Path heuristic only (0.15): below threshold but a real near-miss.
+		{Method: "GET", URL: "https://ex.com/api/thing"},
+		// Static asset: Rule 1 excludes -> confidence 0, below floor.
+		{Method: "GET", URL: "https://ex.com/static/app.css"},
+		// Strong API (JSON response, 0.85): at/above threshold, emitted not missed.
+		{
+			Method: "GET", URL: "https://ex.com/api/data",
+			Response: crawl.ObservedResponse{ContentType: "application/json", Body: []byte(`{"x":1}`)},
+		},
+	}
+
+	nm := NearMisses(classifiers, requests, NearMissFloor, DefaultConfidenceThreshold)
+	require.Len(t, nm, 1, "only the weak-signal endpoint is a near-miss")
+	assert.Contains(t, nm[0].URL, "/api/thing")
+	assert.GreaterOrEqual(t, nm[0].Confidence, NearMissFloor)
+	assert.Less(t, nm[0].Confidence, DefaultConfidenceThreshold)
+}

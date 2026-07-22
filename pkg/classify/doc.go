@@ -32,6 +32,9 @@
 //
 // [RunClassifiers] applies one or more classifiers to a slice of observed
 // requests, returning only those that exceed the confidence threshold.
+// [NearMisses] returns the complementary band — requests scoring at or above
+// [NearMissFloor] but below the threshold — so verbose callers can explain why
+// an expected endpoint was dropped rather than emitted.
 // [Deduplicate] removes duplicate endpoints based on method, normalized URL,
 // and (for non-empty bodies) Content-Type plus an 8-byte body fingerprint.
 // Bodyless requests still collapse by method and path. Distinct request body

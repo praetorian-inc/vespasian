@@ -257,7 +257,7 @@ Vespasian classifies and generates specifications for four API types:
 5. **Response structure**: JSON object or array bodies (not HTML)
 6. **Request-side signal**: an API path plus a JSON/XML `Accept` (or request content-type) classifies the endpoint even when its response was not captured, so the REST-vs-not verdict does not depend on response timing
 
-The classification signals above are content-based and deterministic: identical input traffic yields the same endpoint set, the same classification, and a byte-identical spec every run. Run with `-v` to see the per-endpoint classification reason.
+The classification signals above are content-based and deterministic: identical input traffic yields the same endpoint set, the same classification, and a byte-identical spec every run. Run with `-v` to see the per-endpoint classification reason, including near-miss endpoints that fell just below the threshold and were not emitted (so `-v` explains a missing endpoint, not only a present one).
 
 ### GraphQL Classification Heuristics
 

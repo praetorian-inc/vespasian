@@ -31,6 +31,22 @@ import (
 // DefaultStableWait is the default DOM stability wait duration.
 const DefaultStableWait = 3 * time.Second
 
+// Completion-driven capture bounds (LAB-4678 Phase 1). After DOM stability the
+// crawl waits for the network to go quiet instead of a fixed settle window, so
+// late and dynamic XHR/fetch calls are captured. The wait is bounded by:
+//   - a floor: a minimum wait even when the network already looks idle,
+//   - a quiet period: how long the network must be idle before stopping,
+//   - a per-request timeout: the age after which a still-pending request no
+//     longer counts as in-flight, so one hung request cannot stall the wait.
+//
+// The ceiling is the per-page PageTimeout, already applied to the page.
+const (
+	DefaultNetworkIdleFloor   = 500 * time.Millisecond
+	DefaultNetworkQuietPeriod = 500 * time.Millisecond
+	DefaultPerRequestTimeout  = 10 * time.Second
+	networkIdlePollInterval   = 100 * time.Millisecond
+)
+
 // ---- operator-message helpers ----
 
 // flagDangerousAllowPrivate is the CLI flag name that disables SSRF protection
@@ -101,6 +117,11 @@ type engineOptions struct {
 	Headers       map[string]string // custom headers injected into every page
 	ScopeCheck    func(string) bool // returns true if a URL is in scope
 	Stderr        io.Writer         // user-facing status messages
+
+	// Completion-driven capture bounds (0 → the Default* above).
+	NetworkIdleFloor   time.Duration // minimum wait after DOM stability
+	NetworkQuietPeriod time.Duration // idle duration required before stopping
+	PerRequestTimeout  time.Duration // age after which a pending request stops counting in-flight
 }
 
 // rodEngine implements a concurrent headless crawl using go-rod. It connects
@@ -126,6 +147,15 @@ func newRodEngine(wsURL string, opts engineOptions) (*rodEngine, error) {
 	}
 	if opts.StableTimeout <= 0 {
 		opts.StableTimeout = DefaultStableWait
+	}
+	if opts.NetworkIdleFloor <= 0 {
+		opts.NetworkIdleFloor = DefaultNetworkIdleFloor
+	}
+	if opts.NetworkQuietPeriod <= 0 {
+		opts.NetworkQuietPeriod = DefaultNetworkQuietPeriod
+	}
+	if opts.PerRequestTimeout <= 0 {
+		opts.PerRequestTimeout = DefaultPerRequestTimeout
 	}
 
 	browser := rod.New().ControlURL(wsURL)
@@ -347,21 +377,55 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 		}
 	}
 
-	// Give network events a brief moment to settle after DOM stability.
-	// This catches late XHR/fetch calls triggered by mutation observers
-	// or intersection observers that fire during DOM stabilization.
-	settle := time.NewTimer(200 * time.Millisecond)
-	select {
-	case <-settle.C:
-	case <-ctx.Done():
-		settle.Stop()
-		return capture.Results(), nil, nil
-	}
+	// Wait for the network to go quiet instead of a fixed settle window, so
+	// late and dynamic XHR/fetch calls (mutation/intersection observers, delayed
+	// data loads) are captured rather than dropped (LAB-4678 Phase 1). Bounded by
+	// a floor, a quiet period, a per-request timeout, and the page ceiling; see
+	// waitForNetworkIdle. Returns whatever was captured so far if ctx is canceled.
+	capturedResults := e.waitForNetworkIdle(ctx, capture)
 
 	// Extract links, run jsluice, and discover forms from the stabilized page.
-	capturedResults := capture.Results()
 	results, links := enrichFromPage(page, capturedResults, target.URL, e.opts.Stderr, e.opts.ScopeCheck)
 	return results, links, nil
+}
+
+// waitForNetworkIdle blocks until the page's network goes quiet or a bound is
+// hit, then returns the captured requests (LAB-4678 Phase 1). It replaces the
+// previous fixed 200ms settle so late/dynamic requests are captured. It stops
+// when the elapsed wait reaches the ceiling (PageTimeout); or, once past the
+// floor, when no requests are in flight and the network has been quiet for the
+// quiet period; or when ctx is canceled (returning whatever was captured so far).
+func (e *rodEngine) waitForNetworkIdle(ctx context.Context, capture *pageNetworkCapture) []ObservedRequest {
+	start := time.Now()
+	ticker := time.NewTicker(networkIdlePollInterval)
+	defer ticker.Stop()
+	for {
+		now := time.Now()
+		inFlight, sinceActivity := capture.networkState(e.opts.PerRequestTimeout, now)
+		if networkIdleReached(inFlight, sinceActivity, now.Sub(start),
+			e.opts.NetworkIdleFloor, e.opts.PageTimeout, e.opts.NetworkQuietPeriod) {
+			return capture.Results()
+		}
+		select {
+		case <-ctx.Done():
+			return capture.Results()
+		case <-ticker.C:
+		}
+	}
+}
+
+// networkIdleReached is the pure stop decision for waitForNetworkIdle, split out
+// so it is unit-testable without a browser. Stop when the ceiling is reached, or
+// once past the floor with nothing in flight and a quiet period since the last
+// network activity.
+func networkIdleReached(inFlight int, sinceActivity, elapsed, floor, ceiling, quiet time.Duration) bool {
+	if elapsed >= ceiling {
+		return true
+	}
+	if elapsed < floor {
+		return false
+	}
+	return inFlight == 0 && sinceActivity >= quiet
 }
 
 // enrichFromPage extracts links from the DOM, runs jsluice on JS sources and
@@ -471,6 +535,23 @@ func mergeEnrichedLinks(
 	pageURL, baseURL string,
 	scopeFn func(string) bool,
 ) ([]ObservedRequest, []string) {
+	// Scope-filter passively captured network requests (LAB-4678 Phase 1). The
+	// browser fires requests to third-party hosts (analytics, CDNs, external
+	// APIs) that are out of the crawl scope; without this they flow into the
+	// capture and surface as endpoints and OpenAPI `servers`. Frontier links and
+	// form actions are already scope-checked (Push, and the form loop below);
+	// this closes the corresponding gap on the passively-captured requests. A
+	// nil scopeFn means no filtering, matching the form-action convention.
+	if scopeFn != nil {
+		inScope := make([]ObservedRequest, 0, len(captured))
+		for _, r := range captured {
+			if scopeFn(r.URL) {
+				inScope = append(inScope, r)
+			}
+		}
+		captured = inScope
+	}
+
 	links := slices.Clone(domLinks)
 
 	if len(jsFromResponses) > 0 {

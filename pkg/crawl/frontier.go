@@ -71,7 +71,10 @@ func (f *urlFrontier) Push(entries []urlEntry) int {
 			continue
 		}
 
-		normalized := normalizeURL(e.URL)
+		// Dedup on the frontier key (query stripped) so URLs differing only in
+		// query parameters are treated as one page and visited once (LAB-4678
+		// Phase 1); the original e.URL is still what gets queued and fetched.
+		normalized := frontierKey(e.URL)
 		if normalized == "" {
 			continue
 		}
