@@ -221,7 +221,24 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest { //nolint:
 			// orthogonal concerns, and both are chosen order-independently so a
 			// fixed capture yields the same result regardless of the order in
 			// which duplicate observations were captured.
-			if req.Confidence > existing.req.Confidence {
+			//
+			// On equal confidence, break the tie deterministically on
+			// (APIType, Reason). Two observations of the same endpoint can reach
+			// the same confidence via different signals (e.g. a POST on /api/x
+			// scores 0.7 from the method rule whether or not a request-side
+			// signal also fired), so without a tie-break the retained
+			// Reason/APIType would depend on the nondeterministic observation
+			// order and the -v explanation would vary run-to-run (Gemini
+			// review). The lexicographically greater (APIType, Reason) pair wins.
+			better := req.Confidence > existing.req.Confidence
+			if !better && req.Confidence == existing.req.Confidence {
+				if req.APIType != existing.req.APIType {
+					better = req.APIType > existing.req.APIType
+				} else {
+					better = req.Reason > existing.req.Reason
+				}
+			}
+			if better {
 				existing.req.Confidence = req.Confidence
 				existing.req.Reason = req.Reason
 				existing.req.APIType = req.APIType
@@ -250,8 +267,16 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest { //nolint:
 // A half-captured response (the request was recorded on NetworkRequestWillBeSent
 // but its NetworkLoadingFinished had not fired when the crawl read results) has
 // a zero status and empty content-type/body; such a response documents nothing.
+//
+// A positive StatusCode alone is sufficient: a completed bodyless response
+// (e.g. a DELETE returning 204 No Content, or a 304) legitimately has no body
+// or content-type, yet it documents the endpoint's real status. Requiring a
+// body/content-type here would treat such a response as unpopulated and let the
+// fingerprint tie-break in preferredResponse retain a zero-status placeholder
+// instead, after which OpenAPI generation defaults the missing status to 200 —
+// documenting the wrong status code (Codex review).
 func responsePopulated(r crawl.ObservedResponse) bool {
-	return r.StatusCode > 0 && (len(r.Body) > 0 || r.ContentType != "")
+	return r.StatusCode > 0 || len(r.Body) > 0 || r.ContentType != ""
 }
 
 // responseFingerprint returns a stable content hash of a response over its
@@ -261,7 +286,7 @@ func responsePopulated(r crawl.ObservedResponse) bool {
 func responseFingerprint(r crawl.ObservedResponse) [sha256.Size]byte {
 	h := sha256.New()
 	var status [8]byte
-	binary.BigEndian.PutUint64(status[:], uint64(r.StatusCode)) //nolint:gosec // status is a small non-negative HTTP code; wrap is irrelevant to a hash key
+	binary.BigEndian.PutUint64(status[:], uint64(r.StatusCode)) // #nosec G115 -- status is a small non-negative HTTP code; wrap is irrelevant to a hash key
 	h.Write(status[:])
 	h.Write([]byte{0})
 	h.Write([]byte(r.ContentType))

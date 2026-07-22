@@ -189,14 +189,17 @@ func TestRodEngine_MaxPages(t *testing.T) {
 		mu.Unlock()
 	})
 
-	// Context should have been canceled by MaxPages.
+	// The crawl stops once the page budget (MaxPages) is reached. The budget no
+	// longer cancels the shared browser context (LAB-4678): workers reserve a
+	// page slot before visiting and stop taking new pages at the budget, while
+	// pages already in flight finalize and emit their captured requests.
 	mu.Lock()
 	count := pageVisits
 	mu.Unlock()
 
-	// Due to concurrency, we may get slightly more than MaxPages results
-	// (workers that were already navigating when cancel fired). But it
-	// should be bounded.
+	// count tallies emitted requests, not pages; a single page can emit several
+	// (document + subresources), so this only asserts the crawl produced output
+	// and terminated. Exact page-cap enforcement is covered separately.
 	t.Logf("Got %d results with MaxPages=5", count)
 	if count == 0 {
 		t.Error("Got 0 results, expected at least 1")

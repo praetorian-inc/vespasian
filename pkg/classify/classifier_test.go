@@ -262,6 +262,66 @@ func TestDeduplicate_ResponseSelection_TwoPopulatedOrderIndependent(t *testing.T
 		"fingerprint tie-break must be independent of observation order")
 }
 
+func TestDeduplicate_ResponseSelection_PrefersCompletedBodylessStatus(t *testing.T) {
+	// A completed bodyless response (e.g. DELETE -> 204 No Content) has a
+	// positive status but no body or content-type, and must still be preferred
+	// over a half-captured zero-status placeholder for the same endpoint,
+	// regardless of order (Codex review). Otherwise the zero-status response is
+	// retained and OpenAPI generation defaults the missing status to 200,
+	// documenting the wrong status code.
+	completed := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method:   "DELETE",
+			URL:      "https://example.com/api/items/42",
+			Response: crawl.ObservedResponse{StatusCode: 204},
+		},
+		IsAPI: true, Confidence: 0.7, APIType: "rest",
+	}
+	halfCaptured := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method:   "DELETE",
+			URL:      "https://example.com/api/items/42",
+			Response: crawl.ObservedResponse{}, // status 0, no body/CT
+		},
+		IsAPI: true, Confidence: 0.7, APIType: "rest",
+	}
+
+	forward := Deduplicate([]ClassifiedRequest{completed, halfCaptured})
+	reverse := Deduplicate([]ClassifiedRequest{halfCaptured, completed})
+
+	require.Len(t, forward, 1)
+	require.Len(t, reverse, 1)
+	assert.Equal(t, 204, forward[0].Response.StatusCode,
+		"completed 204 must be retained when it is seen first")
+	assert.Equal(t, 204, reverse[0].Response.StatusCode,
+		"completed 204 must be retained even when the half-captured placeholder is seen first")
+}
+
+func TestDeduplicate_ReasonSelection_DeterministicOnEqualConfidence(t *testing.T) {
+	// Two observations of the same endpoint reach the same confidence via
+	// different signals, producing different Reason strings. The retained Reason
+	// must be a deterministic function of the observations, not of their order
+	// (Gemini review) — otherwise the -v classification explanation varies
+	// run-to-run for identical input.
+	a := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{Method: "POST", URL: "https://example.com/api/x"},
+		IsAPI:           true, Confidence: 0.7, APIType: "rest",
+		Reason: "path-heuristic+method:POST",
+	}
+	b := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{Method: "POST", URL: "https://example.com/api/x"},
+		IsAPI:           true, Confidence: 0.7, APIType: "rest",
+		Reason: "path-heuristic+method:POST+request-signal:accept:application/json",
+	}
+
+	fwd := Deduplicate([]ClassifiedRequest{a, b})
+	rev := Deduplicate([]ClassifiedRequest{b, a})
+	require.Len(t, fwd, 1)
+	require.Len(t, rev, 1)
+	assert.Equal(t, fwd[0].Reason, rev[0].Reason,
+		"retained Reason must not depend on observation order")
+}
+
 func TestDeduplicate_MergesQueryParams(t *testing.T) {
 	classified := []ClassifiedRequest{
 		{

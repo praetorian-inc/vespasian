@@ -59,6 +59,16 @@
 // scopeChecker SSRF check applies, but Chrome-resolved addresses are not
 // re-validated at dial time (known limitation; see crawlHeadless).
 //
+// Page budget (LAB-4678): [CrawlerOptions.MaxPages] limits the number of pages
+// (distinct URLs visited), not captured requests — a single SPA page can fire
+// dozens of XHR/fetch calls, so counting requests truncated the crawl far
+// earlier than "max pages" implies. Each worker reserves a page slot under a
+// mutex before navigating, so the cap is exact and the crawl never overshoots
+// MaxPages. Reaching the budget does NOT cancel the shared browser context:
+// workers stop taking new pages, while pages already in flight complete their
+// normal bounded visit and emit all of their captured requests, rather than
+// being killed mid-capture.
+//
 // The package also defines the capture file format: a JSON array of
 // ObservedRequest structs that serves as the interchange format between the
 // capture stage (crawl or import) and the generation stage.

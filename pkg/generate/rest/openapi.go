@@ -510,17 +510,28 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 				ct := strings.ToLower(ep.Response.ContentType)
 				if ct == "" || strings.Contains(ct, "json") {
 					newSchema := InferSchema(ep.Response.Body)
-					if newSchema != nil && newSchema.Value != nil && newSchema.Value.Properties != nil {
+					if newSchema != nil && newSchema.Value != nil {
 						if existing.Value.Content == nil {
 							// Base had no body; adopt this populated schema.
+							// Accept ANY inferred schema, not only objects: a JSON
+							// array or scalar body has nil Properties, so gating on
+							// Properties!=nil here dropped populated array/scalar
+							// responses whenever an empty base sorted first. This
+							// mirrors the base-creation path below, which adopts any
+							// non-nil schema (Codex/CodeRabbit review).
 							existing.Value.Content = openapi3.Content{
 								"application/json": &openapi3.MediaType{Schema: newSchema},
 							}
-						} else if mt := existing.Value.Content["application/json"]; mt != nil && mt.Schema != nil &&
-							mt.Schema.Value != nil && mt.Schema.Value.Properties != nil {
-							for propName, propSchema := range newSchema.Value.Properties {
-								if _, exists := mt.Schema.Value.Properties[propName]; !exists {
-									mt.Schema.Value.Properties[propName] = propSchema
+						} else if newSchema.Value.Properties != nil {
+							// Union additional object properties into an existing
+							// object base. Array/scalar schemas have no properties
+							// to union, so they leave the populated base unchanged.
+							if mt := existing.Value.Content["application/json"]; mt != nil && mt.Schema != nil &&
+								mt.Schema.Value != nil && mt.Schema.Value.Properties != nil {
+								for propName, propSchema := range newSchema.Value.Properties {
+									if _, exists := mt.Schema.Value.Properties[propName]; !exists {
+										mt.Schema.Value.Properties[propName] = propSchema
+									}
 								}
 							}
 						}
