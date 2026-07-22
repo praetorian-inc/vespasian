@@ -318,19 +318,21 @@ func safeAnalyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options
 	return analyzeOne(ctx, req, opts)
 }
 
-// capBundleEndpoints truncates eps to max entries WITHOUT letting AST-recovered
-// endpoints starve concat/service-prefix candidates (QUAL-001, LAB-4992).
-// ExtractFromBundle appends concat reconstructions (SourceJSConcat) after all
-// AST-recovered endpoints, so a naive `eps[:max]` prefix truncation drops every
-// concat candidate whenever the AST portion alone reaches max.
+// capBundleEndpoints truncates eps to budget entries WITHOUT letting
+// AST-recovered endpoints starve concat/service-prefix candidates (QUAL-001,
+// LAB-4992). ExtractFromBundle appends concat reconstructions (SourceJSConcat)
+// after all AST-recovered endpoints, so a naive `eps[:budget]` prefix
+// truncation drops every concat candidate whenever the AST portion alone
+// reaches budget.
 //
-// Instead, each source is capped independently against a fair share of the
-// budget: concat gets up to half of max (or fewer, if it doesn't need that
-// many), and AST gets whatever remains. This mirrors the remaining-budget
-// pattern analyzeOne already uses for sourcemap sources, just computed
-// up-front across the two sources within a single bundle instead of
-// iteratively across sourcemap sources.
-func capBundleEndpoints(eps []ExtractedEndpoint, max int) []ExtractedEndpoint {
+// Instead, concat is guaranteed a floor of min(len(concat), budget/2) so AST
+// endpoints cannot starve it, then AST is given whatever budget remains after
+// that floor. Concat then reclaims any budget AST did not actually use (concat
+// may exceed the floor when AST is scarce), so the total kept is always
+// min(len(ast)+len(concat), budget) — the cap is never under-filled the way a
+// hard max/2 split on concat alone would leave it when AST is small
+// (QUAL-002).
+func capBundleEndpoints(eps []ExtractedEndpoint, budget int) []ExtractedEndpoint {
 	var ast, concat []ExtractedEndpoint
 	for _, ep := range eps {
 		if ep.SourceTag == SourceJSConcat {
@@ -340,17 +342,22 @@ func capBundleEndpoints(eps []ExtractedEndpoint, max int) []ExtractedEndpoint {
 		}
 	}
 
-	concatBudget := max / 2
-	if len(concat) < concatBudget {
-		concatBudget = len(concat)
+	// Reserve a floor for concat so AST endpoints cannot starve concat
+	// reconstructions (QUAL-001), but let AST use the rest and then let
+	// concat reclaim any budget AST did not need, so the total cap is
+	// fully utilized (concat may exceed the floor when AST is scarce).
+	concatFloor := len(concat)
+	if concatFloor > budget/2 {
+		concatFloor = budget / 2
 	}
-	if len(concat) > concatBudget {
-		concat = concat[:concatBudget]
-	}
-
-	astBudget := max - len(concat)
+	astBudget := budget - concatFloor
 	if len(ast) > astBudget {
 		ast = ast[:astBudget]
+	}
+
+	concatBudget := budget - len(ast)
+	if len(concat) > concatBudget {
+		concat = concat[:concatBudget]
 	}
 
 	return append(ast, concat...)

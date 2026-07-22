@@ -197,6 +197,18 @@ func anyStaticSource(endpoints []classify.ClassifiedRequest) bool {
 	return false
 }
 
+// jsStaticSourceRank orders the JS-static friendly tags from most to least
+// confident: a directly AST-recovered literal is most confident, a sourcemap
+// recovery is next (recovered from original source, not the served bundle),
+// and a concat/service-prefix reconstruction is least confident (never
+// probed, speculative). computeSourceTag uses this so a group mixing distinct
+// JS-static tags resolves to the LEAST-CONFIDENT member, not "dynamic".
+var jsStaticSourceRank = map[string]int{
+	"js-bundle":        0,
+	"js-sourcemap":     1,
+	"js-bundle-concat": 2,
+}
+
 // computeSourceTag derives the x-vespasian-source value for an operation group.
 // Mapping (architecture.md §7):
 //   - any request with Source not in the JS-static set (including empty Source
@@ -230,18 +242,6 @@ func anyStaticSource(endpoints []classify.ClassifiedRequest) bool {
 // open list — a new "static:foo" source must NOT silently surface as
 // x-vespasian-source: foo because the extension consumer contract names only
 // the three non-empty values above.
-// jsStaticSourceRank orders the JS-static friendly tags from most to least
-// confident: a directly AST-recovered literal is most confident, a sourcemap
-// recovery is next (recovered from original source, not the served bundle),
-// and a concat/service-prefix reconstruction is least confident (never
-// probed, speculative). computeSourceTag uses this so a group mixing distinct
-// JS-static tags resolves to the LEAST-CONFIDENT member, not "dynamic".
-var jsStaticSourceRank = map[string]int{
-	"js-bundle":        0,
-	"js-sourcemap":     1,
-	"js-bundle-concat": 2,
-}
-
 func computeSourceTag(group []classify.ClassifiedRequest) string {
 	if len(group) == 0 {
 		return ""

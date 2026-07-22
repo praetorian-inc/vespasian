@@ -561,6 +561,45 @@ func TestAnalyze_MaxEndpointsPerBundle_PreservesConcatEndpoint(t *testing.T) {
 	}
 }
 
+// TestCapBundleEndpoints_ConcatAbundantFullyUtilizesBudget is a regression for
+// QUAL-002 (LAB-4992): capBundleEndpoints previously reserved a hard `max/2`
+// slice for concat candidates and gave AST the remainder, so whenever AST did
+// not need its entire share the leftover budget went unused instead of being
+// reclaimed by concat — under-filling the total cap below min(len(ast)+
+// len(concat), budget). This is the concat-ABUNDANT counterpart to
+// TestAnalyze_MaxEndpointsPerBundle_PreservesConcatEndpoint above, which only
+// covers the concat-scarce direction. Here AST supplies a few endpoints (but
+// fewer than half the budget) while concat reconstructions are abundant
+// (well over half the budget), so the old hard split under-fills while the
+// new floor-then-reclaim split does not.
+func TestCapBundleEndpoints_ConcatAbundantFullyUtilizesBudget(t *testing.T) {
+	const budget = 10
+
+	var eps []ExtractedEndpoint
+	for i := 0; i < 4; i++ {
+		eps = append(eps, ExtractedEndpoint{URL: fmt.Sprintf("/api/ast%d", i)})
+	}
+	for i := 0; i < 15; i++ {
+		eps = append(eps, ExtractedEndpoint{URL: fmt.Sprintf("/api/concat%d", i), SourceTag: SourceJSConcat})
+	}
+
+	got := capBundleEndpoints(eps, budget)
+
+	if len(got) != budget {
+		t.Fatalf("capBundleEndpoints kept %d endpoints, want %d (budget must be fully utilized, not under-filled)", len(got), budget)
+	}
+
+	var concatKept int
+	for _, ep := range got {
+		if ep.SourceTag == SourceJSConcat {
+			concatKept++
+		}
+	}
+	if want := budget / 2; concatKept < want {
+		t.Errorf("concat endpoints kept = %d, want >= %d (concat floor must be honored)", concatKept, want)
+	}
+}
+
 // TestExtractFromBundle_MinifiedBundleSmoke confirms that extraction works on a
 // single-line minified-style bundle with multiple fetches concatenated together.
 func TestExtractFromBundle_MinifiedBundleSmoke(t *testing.T) {
