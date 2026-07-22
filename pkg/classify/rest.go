@@ -16,6 +16,7 @@ package classify
 
 import (
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
@@ -38,10 +39,21 @@ var apiContentTypes = []string{
 	"application/vnd.api+json", "application/hal+json",
 }
 
-// apiPathSegments lists path segments that indicate API endpoints.
+// apiPathSegments lists literal path segments that indicate API endpoints.
+// Versioned segments (/v1/, /v2/, …) are matched separately by
+// apiVersionPathPattern so any version number is recognized, not a fixed few.
 var apiPathSegments = []string{
-	"/api/", "/v1/", "/v2/", "/v3/", "/rest/", "/rpc/", "/graphql",
+	"/api/", "/rest/", "/rpc/", "/graphql",
 }
+
+// apiVersionPathPattern matches a versioned API path segment for ANY version
+// number (/v1/, /v2/, …/v4/…/v12/). It mirrors the v[1-9][0-9]*/ alternation in
+// crawl.apiIndicatorAlternation so the classifier's API-indicator recognition
+// does not drift below the extraction side — otherwise offline concat/service-
+// prefix candidates on /v4+/ paths (which crawl extracts) would fail Rule 3,
+// so Rule 6's static-JS floor would never fire and they would be dropped at the
+// default confidence (LAB-4992).
+var apiVersionPathPattern = regexp.MustCompile(`/v[1-9][0-9]*/`)
 
 // Confidence scores assigned by each heuristic rule.
 const (
@@ -49,6 +61,11 @@ const (
 	PathHeuristicBoost    = 0.15 // Rule 3: API path segment boost.
 	HTTPMethodConfidence  = 0.7  // Rule 4: Non-GET HTTP method signal.
 	JSONBodyConfidence    = 0.85 // Rule 5: JSON response structure.
+	// StaticJSConfidence is the floor for an offline JS-static candidate whose
+	// path carries an API indicator (Rule 6). It equals the default --confidence
+	// threshold (0.5) so these unprobed candidates survive fully-offline
+	// generation instead of being dropped at Rule 3's 0.15 (LAB-4992).
+	StaticJSConfidence = 0.5
 )
 
 // RESTClassifier classifies REST API requests using ordered heuristic rules.
@@ -73,6 +90,7 @@ func (c *RESTClassifier) Classify(req crawl.ObservedRequest) (bool, float64) {
 //  3. Path heuristics → boost +0.15 (cap 1.0)
 //  4. HTTP method signal → confidence max(current, 0.7)
 //  5. Response structure → confidence max(current, 0.85)
+//  6. Offline JS-static candidate floor → confidence max(current, StaticJSConfidence) when the path carries an API indicator
 func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float64, string) { //nolint:gocyclo // multi-signal heuristic classifier
 	parsedURL, err := url.Parse(req.URL)
 	if err != nil {
@@ -119,18 +137,25 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	}
 
 	// Rule 3: Path heuristics.
+	pathMatched := false
 	for _, seg := range apiPathSegments {
 		if strings.Contains(lowerPath, seg) {
-			confidence += PathHeuristicBoost
-			if confidence > 1.0 {
-				confidence = 1.0
-			}
-			if reason == "" {
-				reason = "path-heuristic"
-			} else {
-				reason += "+path-heuristic"
-			}
+			pathMatched = true
 			break
+		}
+	}
+	if !pathMatched && apiVersionPathPattern.MatchString(lowerPath) {
+		pathMatched = true
+	}
+	if pathMatched {
+		confidence += PathHeuristicBoost
+		if confidence > 1.0 {
+			confidence = 1.0
+		}
+		if reason == "" {
+			reason = "path-heuristic"
+		} else {
+			reason += "+path-heuristic"
 		}
 	}
 
@@ -159,7 +184,45 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 		}
 	}
 
+	// Rule 6: Offline JS-static candidate floor.
+	confidence, reason = staticJSFloor(req, pathMatched, confidence, reason)
+
 	return confidence > 0, confidence, reason
+}
+
+// staticJSFloor implements Rule 6 (LAB-4992): the offline JS-static confidence
+// floor. A path reconstructed from a JS bundle carries an API indicator but,
+// when generated fully offline, has no probed response — Rules 2/4/5 never
+// fire and Rule 3 alone (0.15) leaves it below the default 0.5 threshold,
+// silently dropping the very concat/service-prefix endpoints jsstatic
+// recovered. Floor such candidates to StaticJSConfidence so they survive
+// default-confidence generation as unprobed candidates. Gated on the path
+// heuristic (pathMatched) so non-API-looking static:js entries are not
+// promoted.
+//
+// QUAL-002: this floor applies to EVERY IsJSStaticSource candidate — the
+// AST-literal source (SourceStaticJS), sourcemap-recovered source, AND
+// concat/service-prefix reconstructions (SourceStaticJSConcat) alike. Only
+// SourceStaticJSConcat is ever superseded by the reached-filter in
+// ReplayJSExtracted (which drops a concat mirror once the live probe 404s
+// the same reconstructed path); a plain SourceStaticJS AST literal has no
+// such supersession and stays floored even if a probe elsewhere 404s it.
+// This is deliberate, not an oversight: an AST literal is recovered from a
+// real call site in the bundle (fetch/axios/etc.), so a 404 there is more
+// likely auth/param-gated than a wrong-guess decoy, unlike an unvalidated
+// concat/service-prefix combinatorial reconstruction. Do not extend the
+// concat reached-filter supersession to plain static:js literals without
+// revisiting this reasoning.
+func staticJSFloor(req crawl.ObservedRequest, pathMatched bool, confidence float64, reason string) (float64, string) {
+	if pathMatched && confidence < StaticJSConfidence && crawl.IsJSStaticSource(req.Source) {
+		confidence = StaticJSConfidence
+		if reason == "" {
+			reason = "static-js-candidate"
+		} else {
+			reason += "+static-js-candidate"
+		}
+	}
+	return confidence, reason
 }
 
 // firstNonSpace returns the first non-ASCII-whitespace byte in b.

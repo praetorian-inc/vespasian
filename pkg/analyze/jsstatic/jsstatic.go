@@ -31,6 +31,7 @@ import (
 const (
 	SourceJS        = crawl.SourceStaticJS
 	SourceSourcemap = crawl.SourceStaticJSSourcemap
+	SourceJSConcat  = crawl.SourceStaticJSConcat
 )
 
 // Default tuning bounds. Mirrored on Options when zero.
@@ -317,6 +318,51 @@ func safeAnalyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options
 	return analyzeOne(ctx, req, opts)
 }
 
+// capBundleEndpoints truncates eps to budget entries WITHOUT letting
+// AST-recovered endpoints starve concat/service-prefix candidates (QUAL-001,
+// LAB-4992). ExtractFromBundle appends concat reconstructions (SourceJSConcat)
+// after all AST-recovered endpoints, so a naive `eps[:budget]` prefix
+// truncation drops every concat candidate whenever the AST portion alone
+// reaches budget.
+//
+// Instead, concat is guaranteed a floor of min(len(concat), budget/2) so AST
+// endpoints cannot starve it, then AST is given whatever budget remains after
+// that floor. Concat then reclaims any budget AST did not actually use (concat
+// may exceed the floor when AST is scarce), so the total kept is always
+// min(len(ast)+len(concat), budget) — the cap is never under-filled the way a
+// hard max/2 split on concat alone would leave it when AST is small
+// (QUAL-002).
+func capBundleEndpoints(eps []ExtractedEndpoint, budget int) []ExtractedEndpoint {
+	var ast, concat []ExtractedEndpoint
+	for _, ep := range eps {
+		if ep.SourceTag == SourceJSConcat {
+			concat = append(concat, ep)
+		} else {
+			ast = append(ast, ep)
+		}
+	}
+
+	// Reserve a floor for concat so AST endpoints cannot starve concat
+	// reconstructions (QUAL-001), but let AST use the rest and then let
+	// concat reclaim any budget AST did not need, so the total cap is
+	// fully utilized (concat may exceed the floor when AST is scarce).
+	concatFloor := len(concat)
+	if concatFloor > budget/2 {
+		concatFloor = budget / 2
+	}
+	astBudget := budget - concatFloor
+	if len(ast) > astBudget {
+		ast = ast[:astBudget]
+	}
+
+	concatBudget := budget - len(ast)
+	if len(concat) > concatBudget {
+		concat = concat[:concatBudget]
+	}
+
+	return append(ast, concat...)
+}
+
 // analyzeOne analyzes a single captured JS bundle. It runs sourcemap recovery
 // and extractor extraction, then synthesizes requests. The function is safe to
 // call from goroutines; it has no shared mutable state.
@@ -345,11 +391,24 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	// bundle, counting both the bundle body and any recovered sourcemap
 	// sources. The cap is applied first to the bundle body and then
 	// re-evaluated as remaining-budget on each sourcemap source below.
+	//
+	// QUAL-001 (LAB-4992): a plain prefix truncation here would keep only the
+	// first MaxEndpointsPerBundle entries of bundleEps. Because
+	// ExtractFromBundle appends concat/service-prefix reconstructions AFTER
+	// all AST-recovered endpoints, any bundle whose AST endpoint count alone
+	// reaches the cap would silently drop every concat candidate — undermining
+	// the acceptance criterion that offline generate must surface concat
+	// endpoints. capBundleEndpoints reserves a fair share of the budget for
+	// concat candidates instead of truncating the combined slice blindly.
 	if len(bundleEps) > opts.MaxEndpointsPerBundle {
-		bundleEps = bundleEps[:opts.MaxEndpointsPerBundle]
+		bundleEps = capBundleEndpoints(bundleEps, opts.MaxEndpointsPerBundle)
 	}
 	for i := range bundleEps {
-		bundleEps[i].SourceTag = SourceJS
+		// Preserve the distinct concat reconstruction tag; force everything else
+		// from the bundle body to the plain JS-bundle source.
+		if bundleEps[i].SourceTag != SourceJSConcat {
+			bundleEps[i].SourceTag = SourceJS
+		}
 	}
 	synth := toRequests(bundleEps, req.URL)
 	result.requests = append(result.requests, synth...)
@@ -385,7 +444,11 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 			smEps = smEps[:remaining]
 		}
 		for i := range smEps {
-			smEps[i].SourceTag = SourceSourcemap
+			// Preserve the distinct concat reconstruction tag; force everything
+			// else recovered from the sourcemap to the sourcemap source.
+			if smEps[i].SourceTag != SourceJSConcat {
+				smEps[i].SourceTag = SourceSourcemap
+			}
 		}
 		smSynth := toRequests(smEps, req.URL)
 		result.requests = append(result.requests, smSynth...)

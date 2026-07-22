@@ -50,7 +50,7 @@ Vespasian takes a different approach: it observes actual network traffic at the 
 | **Active Probing** | OPTIONS discovery, JSON schema inference, WSDL document fetching, GraphQL introspection, and gRPC server reflection |
 | **Path Normalization** | `/users/42` and `/users/87` become `/users/{id}` with known literal preservation (`/me`, `/self`) |
 | **SSRF Protection** | Blocks crawling and probing of private and loopback addresses by default. Pass `--dangerous-allow-private` to test internal targets (localhost, 127.0.0.1, RFC1918, link-local); the flag is required when the seed URL is itself a private host. |
-| **JS Bundle Static Analysis** | Statically analyses captured JavaScript bundles to recover API endpoints, path parameters, and request-body fields missed by dynamic crawling. Enabled by default via `--analyze-js`; sourcemap recovery is controlled by `--fetch-sourcemaps` (default: `true` for `scan`/`crawl`, `false` for `generate`). |
+| **JS Bundle Static Analysis** | Statically analyses captured JavaScript bundles to recover API endpoints, path parameters, and request-body fields missed by dynamic crawling. Also reconstructs concat / `+`-chain / literal service-prefix forms (e.g. `"/api/posts/".concat(id, "/comment")`, `"identity/" + "api/auth/login"`) fully offline as unprobed candidates, with no network access required — non-literal operands become a numeric sentinel, parameterized downstream. Enabled by default via `--analyze-js`; sourcemap recovery is controlled by `--fetch-sourcemaps` (default: `true` for `scan`/`crawl`, `false` for `generate`). |
 | **Proxy Support** | Route crawl traffic through Burp Suite or other intercepting proxies on both crawler backends (headless Chrome and `--headless=false` net/http); http/https/socks5. Probe and JS-replay traffic is not proxied. |
 | **Two-Stage Pipeline** | Capture once, generate many: separate capture and generation steps for maximum flexibility |
 
@@ -114,6 +114,15 @@ literals (identifiers, function calls, expressions) are replaced with a numeric
 placeholder, so `"/api/posts/".concat(id, "/comment")` becomes the probeable
 path `/api/posts/0/comment`, which the OpenAPI generator then parameterizes to
 `/api/posts/{postId}/comment`.
+
+These concat / `+`-chain / service-prefix paths are also recovered by a
+second, fully-offline static analysis pass (see "JS Bundle Static Analysis"
+above) that needs no reachable target at all — it emits them as unprobed
+candidates directly from the captured bundle bytes. Live JS-replay,
+described in this section, additionally re-fetches and probes those same
+reconstructions over HTTP, drops 404 decoys, and performs a speculative
+service-prefix fan-out that the offline pass deliberately omits (fan-out
+combinations are only safe once probed and 404-filtered).
 
 By default this step:
 

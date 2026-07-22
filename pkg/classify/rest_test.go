@@ -406,6 +406,161 @@ func TestRESTClassifier_ImplementsDetailedClassifier(t *testing.T) {
 	assert.Implements(t, (*DetailedClassifier)(nil), c)
 }
 
+// TestClassifyDetail_StaticJSCandidateFloor pins Rule 6 (LAB-4992): an unprobed
+// JS-static candidate whose path carries an API indicator is floored to
+// StaticJSConfidence (0.5) so it survives default-confidence generation instead
+// of being dropped at Rule 3's 0.15. Only fires for JS-static sources with a
+// matching path heuristic — plain dynamic GETs and non-API static:js entries
+// are unaffected.
+func TestClassifyDetail_StaticJSCandidateFloor(t *testing.T) {
+	c := &RESTClassifier{}
+
+	tests := []struct {
+		name      string
+		req       crawl.ObservedRequest
+		wantIsAPI bool
+		wantConf  float64
+	}{
+		{
+			name: "static:js concat GET with API path floored to 0.5",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/api/users/0/orders",
+				Source: crawl.SourceStaticJSConcat,
+			},
+			wantIsAPI: true,
+			wantConf:  StaticJSConfidence,
+		},
+		{
+			name: "static:js literal GET with API path floored to 0.5",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/api/items",
+				Source: crawl.SourceStaticJS,
+			},
+			wantIsAPI: true,
+			wantConf:  StaticJSConfidence,
+		},
+		{
+			// HIGH fix: version segments beyond the old literal list (v1-v3)
+			// must still match Rule 3 (apiVersionPathPattern) so Rule 6 fires —
+			// otherwise crawl-extracted /v4+/ concat candidates are dropped.
+			name: "static:js GET on /v4/ path floored to 0.5 (version beyond literal list)",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/v4/users/0",
+				Source: crawl.SourceStaticJSConcat,
+			},
+			wantIsAPI: true,
+			wantConf:  StaticJSConfidence,
+		},
+		{
+			name: "static:js GET WITHOUT API indicator is not floored",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/dashboard/home",
+				Source: crawl.SourceStaticJS,
+			},
+			wantIsAPI: false,
+			wantConf:  0,
+		},
+		{
+			name: "dynamic (non-static-js) GET with API path keeps 0.15",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/api/users",
+				Source: "katana",
+			},
+			wantIsAPI: true,
+			wantConf:  PathHeuristicBoost,
+		},
+		{
+			name: "static:js POST with API path keeps its stronger method score",
+			req: crawl.ObservedRequest{
+				Method: "POST",
+				URL:    "https://example.com/api/users",
+				Source: crawl.SourceStaticJS,
+			},
+			wantIsAPI: true,
+			wantConf:  HTTPMethodConfidence,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isAPI, conf, _ := c.ClassifyDetail(tt.req)
+			assert.Equal(t, tt.wantIsAPI, isAPI)
+			assert.InDelta(t, tt.wantConf, conf, 1e-9)
+		})
+	}
+}
+
+// TestStaticJSFloor pins the extracted Rule 6 helper (QUAL-003) directly,
+// independent of ClassifyDetail's other rules.
+func TestStaticJSFloor(t *testing.T) {
+	tests := []struct {
+		name           string
+		req            crawl.ObservedRequest
+		pathMatched    bool
+		inConfidence   float64
+		inReason       string
+		wantConfidence float64
+		wantReason     string
+	}{
+		{
+			name:           "floors a low-confidence static:js candidate with matched path",
+			req:            crawl.ObservedRequest{Source: crawl.SourceStaticJSConcat},
+			pathMatched:    true,
+			inConfidence:   PathHeuristicBoost,
+			inReason:       "path-heuristic",
+			wantConfidence: StaticJSConfidence,
+			wantReason:     "path-heuristic+static-js-candidate",
+		},
+		{
+			name:           "sets reason from scratch when no prior reason",
+			req:            crawl.ObservedRequest{Source: crawl.SourceStaticJS},
+			pathMatched:    true,
+			inConfidence:   0,
+			inReason:       "",
+			wantConfidence: StaticJSConfidence,
+			wantReason:     "static-js-candidate",
+		},
+		{
+			name:           "does not floor when path did not match",
+			req:            crawl.ObservedRequest{Source: crawl.SourceStaticJS},
+			pathMatched:    false,
+			inConfidence:   0,
+			inReason:       "",
+			wantConfidence: 0,
+			wantReason:     "",
+		},
+		{
+			name:           "does not floor a non-JS-static source",
+			req:            crawl.ObservedRequest{Source: "katana"},
+			pathMatched:    true,
+			inConfidence:   PathHeuristicBoost,
+			inReason:       "path-heuristic",
+			wantConfidence: PathHeuristicBoost,
+			wantReason:     "path-heuristic",
+		},
+		{
+			name:           "leaves an already-higher confidence untouched",
+			req:            crawl.ObservedRequest{Source: crawl.SourceStaticJS},
+			pathMatched:    true,
+			inConfidence:   HTTPMethodConfidence,
+			inReason:       "method:POST",
+			wantConfidence: HTTPMethodConfidence,
+			wantReason:     "method:POST",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotConf, gotReason := staticJSFloor(tt.req, tt.pathMatched, tt.inConfidence, tt.inReason)
+			assert.InDelta(t, tt.wantConfidence, gotConf, 1e-9)
+			assert.Equal(t, tt.wantReason, gotReason)
+		})
+	}
+}
+
 // TestClassifyDetail_FallbackToHeaders verifies the classifier falls back to
 // Response.Headers when ContentType is empty, as happens when headers have
 // non-standard casing and ContentType wasn't populated by the crawler.

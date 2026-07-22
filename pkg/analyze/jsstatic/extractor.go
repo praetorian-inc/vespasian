@@ -15,10 +15,13 @@
 package jsstatic
 
 import (
+	"net/url"
 	"sort"
 	"strings"
 
 	"github.com/BishopFox/jsluice"
+
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
 // assetExtensions are file-like URL suffixes that indicate non-API resources.
@@ -627,6 +630,7 @@ func ExtractFromBundle(jsSource []byte, baseURL string) ([]ExtractedEndpoint, er
 			fetchURLsWithMethod[strings.TrimSpace(u.URL)] = true
 		}
 	}
+	astURLs := make(map[string]bool)
 	for _, u := range jsluiceURLs {
 		ep, ok := jsluiceURLToEndpoint(u, baseURL, fetchBodyFields, seen, fetchURLsWithMethod)
 		if !ok {
@@ -634,11 +638,195 @@ func ExtractFromBundle(jsSource []byte, baseURL string) ([]ExtractedEndpoint, er
 		}
 		endpoints = append(endpoints, ep)
 	}
+	// Record every URL the AST walkers emitted, method-agnostic, so step 5 can
+	// suppress phantom endpoints for URLs already recovered with a known method.
+	// Keys are canonicalized (concatDedupKey) so a concat reconstruction that
+	// substitutes the numeric sentinel "0" for a dynamic operand, or omits the
+	// leading slash on a relative path, still matches the AST form of the same
+	// endpoint ({param} placeholders, host-relative paths). The key is
+	// origin-scoped (see concatDedupKey) so a cross-host AST URL that merely
+	// shares a path cannot suppress a same-origin concat candidate.
+	baseHost := hostOfURL(baseURL)
+	for _, ep := range endpoints {
+		astURLs[concatDedupKey(ep.URL, baseHost)] = true
+	}
+
+	// 5. Reconstruct concat / +-chain / service-prefix paths that jsluice's AST
+	//    analysis cannot resolve (LAB-4992). Shares crawl's extractor so the
+	//    fully-offline static path recovers the same forms as the active
+	//    JS-replay path. Non-literal concat operands arrive as the numeric
+	//    sentinel "0" (e.g. /api/users/0/orders); pkg/generate/rest turns those
+	//    numeric segments into named params downstream.
+	endpoints = append(endpoints, extractConcatEndpoints(jsSource, baseURL, baseHost, seen, astURLs)...)
 
 	if len(endpoints) == 0 {
 		return nil, nil
 	}
 	return endpoints, nil
+}
+
+// extractConcatEndpoints reconstructs concat / +-chain / service-prefix API
+// paths from the raw bundle bytes via crawl.ExtractStaticConcatPaths and
+// converts each surviving path into a GET ExtractedEndpoint. A bare path string
+// carries no HTTP method, so these candidates default to GET.
+//
+// crawl returns raw reconstructions, so relative paths get a leading slash here
+// before filtering (mirroring addPath in the active crawl path). Two dedup
+// guards keep this additive rather than noisy:
+//   - astURLs: skip any path the AST walkers already emitted for ANY method, so
+//     a concat reconstruction that collides with a jsluice-recovered URL does
+//     not synthesize a phantom GET companion (mirrors the method-less fetch
+//     guard in jsluiceURLToEndpoint). The lookup is keyed on concatDedupKey so
+//     the sentinel-"0"/{param} and relative-slash representation gaps between the
+//     two extractors do not defeat the guard.
+//   - seen: skip exact (GET, url) duplicates and register survivors.
+func extractConcatEndpoints(jsSource []byte, baseURL, baseHost string, seen map[endpointKey]bool, astURLs map[string]bool) []ExtractedEndpoint {
+	var endpoints []ExtractedEndpoint
+	for _, raw := range crawl.ExtractStaticConcatPaths(jsSource) {
+		p := strings.TrimSpace(raw)
+		if p == "" {
+			continue
+		}
+		// QUAL-002 (LAB-4992): run the scheme/asset filter against the RAW,
+		// un-prefixed reconstruction first. filterURL's scheme blocklist
+		// (javascript:, data:, blob:, mailto:, tel:, chrome-extension:) matches
+		// via strings.HasPrefix, and would otherwise be defeated by the
+		// leading-slash normalization below: a hostile receiver like
+		// "javascript:/api/".concat("y") reconstructs to "javascript:/api/y",
+		// which is non-absolute and gets a '/' prepended -> "/javascript:/api/y"
+		// -- no longer HasPrefix("javascript:"), so the blocklist would
+		// silently miss it. Checking here, before normalization, closes that
+		// gap while leaving legitimate relative paths (no scheme) unaffected.
+		if filterURL(p) {
+			continue
+		}
+		// Relative reconstructions arrive without a leading slash (e.g.
+		// "identity/api/auth/login"); normalize so they resolve as
+		// document-root paths rather than bundle-relative ones.
+		absolute := strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://")
+		if !absolute && !strings.HasPrefix(p, "/") {
+			p = "/" + p
+		}
+		// SEC-BE-001 (LAB-4992): drop an absolute reconstruction whose host
+		// differs from the bundle's own host. The concat receiver form (e.g.
+		// "https://attacker.example/api/x".concat(id)) has no origin/scheme
+		// gate of its own — a hostile bundle literal can reconstruct to an
+		// absolute cross-origin URL, which would otherwise be emitted as an
+		// unprobed static:js-concat candidate, floored to default confidence
+		// by classify Rule 6, and then probed against the attacker-chosen
+		// host by the live probe stage (no same-origin gate there either) —
+		// an SSRF-reflector / scope-escape via a fully offline analysis path.
+		// Relative reconstructions and same-host absolute ones are unaffected.
+		if absolute && hostOfURL(p) != baseHost {
+			continue
+		}
+		if filterURL(p) || isExprOnly(p) || astURLs[concatDedupKey(p, baseHost)] {
+			continue
+		}
+		k := endpointKey{"GET", p}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		endpoints = append(endpoints, ExtractedEndpoint{
+			Method: "GET",
+			URL:    p,
+			// Distinct source: these are speculative, never-probed concat
+			// reconstructions (LAB-4992 / SEC-BE-001), tagged apart from
+			// AST-recovered literals so consumers can weight them.
+			SourceTag:    SourceJSConcat,
+			OriginBundle: baseURL,
+		})
+	}
+	return endpoints
+}
+
+// concatDedupKey canonicalizes a URL/path into an origin-scoped key so the
+// concat extractor's reconstructions compare equal to the AST walkers' output
+// for the same logical endpoint — and ONLY for the same origin. The two
+// extractors describe dynamic and relative paths differently: concat substitutes
+// the numeric sentinel "0" for non-literal operands and always carries a leading
+// slash, whereas the AST walkers emit {param}-style placeholders
+// (NormalizeEXPRPath) and leave relative paths without a leading slash. Both
+// collapse to one key here: query/fragment dropped, leading slash ensured,
+// trailing slash trimmed (root "/" excepted), and every dynamic segment (the
+// concat sentinel or a {...} placeholder) rewritten to a single "{}" token.
+// Concrete literal segments other than the sentinel are left intact, so
+// distinct concrete paths are NOT over-merged (e.g. "/api/items/5" stays
+// distinct from "/api/items/{param}").
+//
+// The key is prefixed with the endpoint's origin (host): an absolute URL uses
+// its own host; a relative URL (no scheme+host) is same-origin by construction
+// and uses baseHost (the bundle's host). This prevents a cross-host AST URL that
+// merely shares a path (e.g. "https://beacon.other.com/api/track") from
+// suppressing a same-origin concat candidate ("/api/track" on the bundle host) —
+// they are genuinely different endpoints and must both survive.
+//
+// One deliberate exception: a literal segment equal to the sentinel value
+// (crawl.ConcatPathSentinel, "0") is indistinguishable offline from a dynamic
+// operand the concat extractor substituted, so "/api/items/0" DOES collapse
+// onto "/api/items/{param}" on the same origin. This is intentional for dedup —
+// treating a lone "0" segment as dynamic errs toward suppressing a phantom
+// companion, the safe direction for this guard.
+//
+// The sentinel is sourced from crawl.ConcatPathSentinel (not a local literal)
+// so the two packages cannot drift.
+//
+// Host and path are extracted with net/url.Parse — the same routine hostOfURL
+// uses for baseHost — so the two host extractions cannot disagree (url.Host
+// excludes userinfo, so "https://u:p@h/x" and a relative path on host "h" agree).
+// The host is lower-cased because hostnames are case-insensitive.
+func concatDedupKey(u, baseHost string) string {
+	// A relative URL keeps baseHost (it is same-origin by construction); an
+	// absolute URL uses its own host. url.Parse also drops query/fragment
+	// (parsed.Path excludes them) and tolerates {param} placeholders in the path.
+	host := baseHost
+	path := u
+	if parsed, err := url.Parse(u); err == nil {
+		if parsed.Host != "" {
+			host = parsed.Host
+		}
+		path = parsed.Path
+	} else if i := strings.IndexAny(u, "?#"); i >= 0 {
+		// Defensive: url.Parse effectively never fails on these inputs, but if it
+		// did, still strip query/fragment before keying.
+		path = u[:i]
+	}
+	host = strings.ToLower(host)
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	// Normalize a trailing slash so a concat reconstruction (which never trims
+	// one — cleanConcatPath leaves it intact) keys identically to an
+	// AST-recovered form without one, matching the active JS-replay path's
+	// addPath (strings.TrimRight(raw, "/")). The bare root "/" is preserved:
+	// trimming it down to "" would key root endpoints under the empty path.
+	if path != "/" {
+		if trimmed := strings.TrimRight(path, "/"); trimmed != "" {
+			path = trimmed
+		}
+	}
+	segments := strings.Split(path, "/")
+	for i, seg := range segments {
+		if seg == crawl.ConcatPathSentinel || (len(seg) >= 2 && strings.HasPrefix(seg, "{") && strings.HasSuffix(seg, "}")) {
+			segments[i] = "{}"
+		}
+	}
+	return host + "|" + strings.Join(segments, "/")
+}
+
+// hostOfURL returns the lower-cased host component of rawURL, or "" when it has
+// none or is unparseable (e.g. a relative or empty base). Used to origin-scope
+// concatDedupKey.
+func hostOfURL(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Host)
 }
 
 // jsluiceURLToEndpoint converts a single jsluice.URL into an ExtractedEndpoint,

@@ -578,3 +578,340 @@ func TestExtractFromBundle_AxiosDeleteWithDataBody(t *testing.T) {
 		t.Errorf("BodyFields = %v, want [reason]", ep.BodyFields)
 	}
 }
+
+// LAB-4992: the fully-offline analyzer must reconstruct API paths that exist
+// only as JS string concatenations — String.prototype.concat, +-string chains,
+// and literal+literal service-prefix concatenation — which jsluice's AST
+// analysis cannot resolve. These flow through the shared crawl extractor
+// (crawl.ExtractStaticConcatPaths) so the offline static path recovers the same
+// forms as the active JS-replay path. Non-literal operands become the numeric
+// sentinel "0" (parameterized later by pkg/generate/rest).
+func TestExtractFromBundle_ConcatReconstruction(t *testing.T) {
+	// Mirrors test/concat-spa/app.js plus a literal+literal service prefix.
+	src := []byte(`
+function loadOrders(uid)  { return fetch("/api/users/".concat(uid, "/orders")); }
+function loadReviews(pid) { var u = "/api/products/" + pid + "/reviews"; return fetch(u); }
+var LOGIN = "identity/" + "api/auth/login";
+`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Each form must reconstruct its concrete candidate path.
+	for _, want := range []string{
+		"/api/users/0/orders",      // String.prototype.concat form
+		"/api/products/0/reviews",  // +-string chain form
+		"/identity/api/auth/login", // literal+literal service-prefix form
+	} {
+		ep := findEndpoint(endpoints, want)
+		if ep == nil {
+			t.Errorf("expected reconstructed endpoint %q, got: %v", want, endpoints)
+			continue
+		}
+		if ep.Method != "GET" {
+			t.Errorf("%s: Method = %q, want GET (bare path carries no method)", want, ep.Method)
+		}
+		if ep.SourceTag != SourceJSConcat {
+			t.Errorf("%s: SourceTag = %q, want %q", want, ep.SourceTag, SourceJSConcat)
+		}
+	}
+}
+
+// LAB-4992 dedup guard: a concat reconstruction whose URL collides with a URL
+// jsluice already recovered (with a real method) must NOT gain a phantom GET
+// companion. Here axios.post gives jsluice POST /api/users/5, and the literal
+// +-chain "/api/users/" + "5" reconstructs to the SAME /api/users/5 — so the
+// astURLs guard must suppress the GET candidate. (Deleting the guard makes this
+// test fail with a phantom [POST GET].)
+//
+// This case pins only the ABSOLUTE-LITERAL collision. The two tests below pin
+// the harder cases the original guard silently missed: a dynamic operand
+// (sentinel "0" vs AST {param}) and a relative operand (leading-slash mismatch).
+func TestExtractFromBundle_ConcatNoPhantomForKnownURL(t *testing.T) {
+	src := []byte(`axios.post("/api/users/5", {a}); var u = "/api/users/" + "5";`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var methods []string
+	for _, ep := range endpoints {
+		if ep.URL == "/api/users/5" {
+			methods = append(methods, ep.Method)
+		}
+	}
+	if len(methods) != 1 || methods[0] != "POST" {
+		t.Errorf("expected exactly [POST] for /api/users/5 (no phantom GET), got %v", methods)
+	}
+}
+
+// LAB-4992 dedup guard, dynamic-operand case (was QUAL-002): the AST walker
+// recovers the template literal fetch(`/api/users/${uid}/orders`) as
+// /api/users/{uid}/orders, while the +-chain "/api/users/" + uid + "/orders"
+// reconstructs to /api/users/0/orders (numeric sentinel for the non-literal
+// operand). These are the SAME logical endpoint, so the concat GET candidate
+// must be suppressed. Before concatDedupKey normalized "0" and {param} segments
+// to a common token, the raw string compare never matched and a phantom
+// /api/users/0/orders GET slipped through.
+func TestExtractFromBundle_ConcatNoPhantomForDynamicSegment(t *testing.T) {
+	src := []byte("function f(uid){ return fetch(`/api/users/${uid}/orders`); }\n" +
+		`var u = "/api/users/" + uid + "/orders"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/users/0/orders"); ep != nil {
+		t.Errorf("phantom concat companion /api/users/0/orders emitted alongside AST-recovered param path; got %v", endpoints)
+	}
+	// The AST-recovered parameterized form must still be present.
+	if ep := findEndpoint(endpoints, "/api/users/{uid}/orders"); ep == nil {
+		t.Errorf("expected AST-recovered /api/users/{uid}/orders, got %v", endpoints)
+	}
+}
+
+// LAB-4992 dedup guard, relative-operand case (was QUAL-003): the AST walker
+// recovers fetch("api/users/5") as the relative URL "api/users/5" (no leading
+// slash), while the +-chain "api/users/" + "5" reconstructs to "api/users/5"
+// and extractConcatEndpoints prepends a leading slash → "/api/users/5". These
+// are the SAME endpoint, so the concat GET candidate must be suppressed. Before
+// concatDedupKey normalized the leading slash on both sides, the slash mismatch
+// bypassed the guard and a phantom "/api/users/5" slipped through.
+func TestExtractFromBundle_ConcatNoPhantomForRelativeURL(t *testing.T) {
+	src := []byte(`fetch("api/users/5"); var u = "api/users/" + "5"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/users/5"); ep != nil {
+		t.Errorf("phantom concat companion /api/users/5 emitted alongside AST-recovered relative path; got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "api/users/5"); ep == nil {
+		t.Errorf("expected AST-recovered relative api/users/5, got %v", endpoints)
+	}
+}
+
+// LAB-4992 dedup guard, must-survive direction: concatDedupKey must NOT
+// over-merge distinct CONCRETE paths. A concat reconstruction with a concrete
+// (non-sentinel) segment that only shares a prefix with an AST-recovered param
+// path is a genuinely different endpoint and must survive. Here the AST recovers
+// /api/items/{x} from the template literal and the +-chain reconstructs the
+// concrete /api/items/5 — both must appear (5 canonicalizes to "5", not "{}").
+func TestExtractFromBundle_ConcatConcreteSegmentNotOverMerged(t *testing.T) {
+	src := []byte("function f(x){ return fetch(`/api/items/${x}`); }\n" +
+		`var u = "/api/items/" + "5"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/items/{x}"); ep == nil {
+		t.Errorf("expected AST-recovered /api/items/{x}, got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "/api/items/5"); ep == nil {
+		t.Errorf("concrete concat path /api/items/5 was over-merged/suppressed; must survive alongside the param path; got %v", endpoints)
+	}
+}
+
+// LAB-4992 dedup guard, absolute-vs-relative same-origin case: an AST walker
+// recovers a FULL same-origin URL (fetch("https://example.com/api/v1/webhook"))
+// while the +-chain reconstructs the same path relatively ("/api/v1/" +
+// "webhook"). concatDedupKey strips scheme+host and origin-scopes the key to the
+// bundle host, so the relative concat candidate collapses onto the absolute AST
+// URL and its phantom GET companion is suppressed.
+func TestExtractFromBundle_ConcatNoPhantomForSameOriginAbsoluteURL(t *testing.T) {
+	src := []byte(`fetch("https://example.com/api/v1/webhook"); var u = "/api/v1/" + "webhook"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/v1/webhook"); ep != nil {
+		t.Errorf("phantom relative concat companion /api/v1/webhook emitted alongside same-origin absolute AST URL; got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "https://example.com/api/v1/webhook"); ep == nil {
+		t.Errorf("expected AST-recovered absolute https://example.com/api/v1/webhook, got %v", endpoints)
+	}
+}
+
+// LAB-4992 dedup guard, cross-host case (regression from the origin-scoping fix):
+// an AST-recovered absolute URL to a DIFFERENT host must NOT suppress a
+// same-origin concat candidate that merely shares its path — they are genuinely
+// distinct endpoints. Here axios.post targets beacon.other.com/api/track while
+// the concat reconstructs same-origin /api/track; both must survive.
+func TestExtractFromBundle_ConcatCrossHostNotSuppressed(t *testing.T) {
+	src := []byte(`axios.post("https://beacon.other.com/api/track", {a}); var u = "/api/" + "track"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/track"); ep == nil {
+		t.Errorf("same-origin concat /api/track was wrongly suppressed by a cross-host AST URL sharing the path; got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "https://beacon.other.com/api/track"); ep == nil {
+		t.Errorf("expected cross-host AST POST https://beacon.other.com/api/track, got %v", endpoints)
+	}
+}
+
+// LAB-4992 dedup guard, sentinel-"0" exception: concatDedupKey deliberately
+// treats a lone literal "0" segment as dynamic (it is indistinguishable offline
+// from a substituted sentinel), so a concat "/api/items/" + "0" -> /api/items/0
+// collapses onto the AST-recovered param path /api/items/{x} and its phantom GET
+// companion is suppressed. This pins the documented exception (the opposite of
+// the non-sentinel "5" case in ConcatConcreteSegmentNotOverMerged).
+func TestExtractFromBundle_ConcatSentinelZeroCollapsesOntoParam(t *testing.T) {
+	src := []byte("function f(x){ return fetch(`/api/items/${x}`); }\n" +
+		`var u = "/api/items/" + "0"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/items/{x}"); ep == nil {
+		t.Errorf("expected AST-recovered /api/items/{x}, got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "/api/items/0"); ep != nil {
+		t.Errorf("literal-0 concat companion /api/items/0 must collapse onto the param path (documented sentinel exception); got %v", endpoints)
+	}
+}
+
+// LAB-4992 dedup guard, case-insensitive host: hostnames are case-insensitive,
+// so concatDedupKey/hostOfURL lower-case them. An AST absolute URL on
+// "EXAMPLE.com" and a same-origin relative concat on the "example.com" bundle
+// must be recognized as the same origin, suppressing the phantom companion.
+func TestExtractFromBundle_ConcatDedupHostCaseInsensitive(t *testing.T) {
+	src := []byte(`fetch("https://EXAMPLE.com/api/ping"); var u = "/api/" + "ping"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/ping"); ep != nil {
+		t.Errorf("relative concat /api/ping must dedup against the differently-cased same-origin AST URL; got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "https://EXAMPLE.com/api/ping"); ep == nil {
+		t.Errorf("expected AST-recovered https://EXAMPLE.com/api/ping, got %v", endpoints)
+	}
+}
+
+// TEST-001: extractConcatEndpoints' emit guard is
+// `if filterURL(p) || isExprOnly(p) || astURLs[...] { continue }` — this pins
+// the filterURL/isExprOnly half, which previously had zero coverage. A concat
+// reconstruction that carries an API indicator (satisfying hasAPIIndicator in
+// cleanConcatPath, via "api/") but reconstructs to an asset URL (".js") must
+// still be dropped by filterURL before it is ever emitted as an
+// ExtractedEndpoint.
+func TestExtractFromBundle_ConcatFilteredAsAsset(t *testing.T) {
+	src := []byte(`var u = "/api/" + "bundle.js"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/bundle.js"); ep != nil {
+		t.Errorf("concat reconstruction /api/bundle.js must be dropped by filterURL (asset extension), got %v", endpoints)
+	}
+}
+
+// SEC-BE-001: the concat receiver form must not emit an absolute,
+// cross-origin reconstruction. A hostile bundle literal like
+// "https://attacker.example/api/x".concat(id) would otherwise reconstruct to
+// an absolute URL on an attacker-chosen host and be emitted as an unprobed
+// static:js-concat candidate — Rule 6 (pkg/classify) would floor it to
+// default confidence, and the live probe stage has no same-origin gate of
+// its own, so the attacker host would be probed (SSRF-reflector /
+// scope-escape via a fully offline analysis path). A relative reconstruction
+// and a same-host absolute reconstruction must still be emitted.
+func TestExtractFromBundle_ConcatCrossOriginGate(t *testing.T) {
+	src := []byte(`
+var cross = "https://attacker.example/api/".concat("x");
+var same = "https://example.com/api/".concat("y");
+var rel = "/api/".concat("z");
+`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "https://attacker.example/api/x"); ep != nil {
+		t.Errorf("cross-origin concat reconstruction must NOT be emitted; got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "https://example.com/api/y"); ep == nil {
+		t.Errorf("same-host absolute concat reconstruction must still be emitted, got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "/api/z"); ep == nil {
+		t.Errorf("relative concat reconstruction must still be emitted, got %v", endpoints)
+	}
+}
+
+// QUAL-002: extractConcatEndpoints must not let a leading-slash normalization
+// defeat filterURL's scheme blocklist. filterURL matches filtered schemes
+// (javascript:, data:, blob:, mailto:, tel:, chrome-extension:) via
+// strings.HasPrefix. Before this fix, a non-absolute reconstruction beginning
+// with one of these schemes (e.g. "javascript:/api/".concat("y") ->
+// "javascript:/api/y") had a leading '/' prepended BEFORE the filterURL call,
+// producing "/javascript:/api/y" — which no longer HasPrefix("javascript:"),
+// so the scheme blocklist silently failed to drop it. The raw, un-prefixed
+// reconstruction must still be scheme-checked. A legitimate relative concat
+// (no scheme) must still be emitted.
+func TestExtractFromBundle_ConcatRawSchemeFilter(t *testing.T) {
+	src := []byte(`
+var evilJS = "javascript:/api/".concat("y");
+var evilData = "data:/api/".concat("z");
+var legit = "identity/" + "api/auth/login";
+`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, dropped := range []string{
+		"/javascript:/api/y",
+		"javascript:/api/y",
+		"/data:/api/z",
+		"data:/api/z",
+	} {
+		if ep := findEndpoint(endpoints, dropped); ep != nil {
+			t.Errorf("scheme-prefixed concat reconstruction must be dropped; got endpoint for %q: %v", dropped, endpoints)
+		}
+	}
+	if ep := findEndpoint(endpoints, "/identity/api/auth/login"); ep == nil {
+		t.Errorf("expected legitimate relative concat reconstruction /identity/api/auth/login to survive, got: %v", endpoints)
+	}
+}
+
+// QUAL-001: concatDedupKey must normalize a trailing slash so a trailing-slash
+// concat reconstruction dedupes against an AST form that has none — matching
+// the active JS-replay path's addPath, which does strings.TrimRight(raw, "/").
+// Here the AST walker recovers the template literal fetch(`/api/posts/${id}/comment`)
+// with no trailing slash, while the +-chain "/api/posts/" + id + "/comment/"
+// reconstructs WITH a trailing slash (cleanConcatPath never trims it). Before
+// concatDedupKey trimmed the trailing slash, these hashed to different keys
+// ("host|/api/posts/{}/comment" vs "host|/api/posts/{}/comment/") and the
+// astURLs guard missed, emitting a phantom GET companion.
+func TestExtractFromBundle_ConcatNoPhantomForTrailingSlash(t *testing.T) {
+	src := []byte("function f(id){ return fetch(`/api/posts/${id}/comment`); }\n" +
+		`var u = "/api/posts/" + id + "/comment/"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/posts/0/comment/"); ep != nil {
+		t.Errorf("phantom trailing-slash concat companion /api/posts/0/comment/ emitted alongside AST-recovered param path; got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "/api/posts/{id}/comment"); ep == nil {
+		t.Errorf("expected AST-recovered /api/posts/{id}/comment, got %v", endpoints)
+	}
+}
+
+// QUAL-001: concatDedupKey must preserve the root "/" case — trimming the
+// trailing slash must not turn "/" into "", which would silently key root
+// endpoints under the empty path instead of "/".
+func TestConcatDedupKey_RootSlashPreserved(t *testing.T) {
+	if got := concatDedupKey("/", "example.com"); got != "example.com|/" {
+		t.Errorf("concatDedupKey(%q, %q) = %q, want %q", "/", "example.com", got, "example.com|/")
+	}
+}
+
+// QUAL-001: concatDedupKey must collapse a trailing-slash key onto its
+// non-trailing-slash counterpart directly (unit-level pin, complementing the
+// end-to-end TestExtractFromBundle_ConcatNoPhantomForTrailingSlash above).
+func TestConcatDedupKey_TrailingSlashNormalized(t *testing.T) {
+	withSlash := concatDedupKey("/api/posts/{id}/comment/", "example.com")
+	withoutSlash := concatDedupKey("/api/posts/{id}/comment", "example.com")
+	if withSlash != withoutSlash {
+		t.Errorf("concatDedupKey with trailing slash = %q, without = %q, want equal", withSlash, withoutSlash)
+	}
+}

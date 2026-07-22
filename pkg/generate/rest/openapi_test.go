@@ -1637,6 +1637,64 @@ func TestOpenAPI_XVespasianSource_JSSourcemap(t *testing.T) {
 	}
 }
 
+// LAB-4992 / SEC-BE-001: a group whose only source is the concat reconstruction
+// tag (static:js-concat) must surface x-vespasian-source "js-bundle-concat" so
+// consumers can weight never-probed reconstructions below observed literals.
+func TestOpenAPI_XVespasianSource_JSBundleConcat(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "static:js-concat"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	ext, ok := getOp["x-vespasian-source"]
+	if !ok {
+		t.Fatal("expected x-vespasian-source extension to be present")
+	}
+	if ext != "js-bundle-concat" {
+		t.Errorf("expected x-vespasian-source=js-bundle-concat, got %v", ext)
+	}
+}
+
+// QUAL-003: a group mixing static:js-concat and static:js (both all-JS-static)
+// must resolve to the least-confident member, "js-bundle-concat" — not
+// "dynamic" (the pre-fix behavior; the closed allow-list still treats a
+// genuinely non-JS-static source as dynamic, but an all-JS-static mixed group
+// now resolves to its least-confident member instead). Pins that concat is a
+// distinct, lowest-confidence member of the allow-list. See
+// TestComputeSourceTag_MixedJSStaticGroups for the full confidence-ordering
+// table.
+func TestOpenAPI_XVespasianSource_MixedConcatAndBundle(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "static:js-concat"),
+		makeClassified("GET", "https://h/api/x", "static:js"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	if ext := getOp["x-vespasian-source"]; ext != "js-bundle-concat" {
+		t.Errorf("expected x-vespasian-source=js-bundle-concat (least-confident of js-bundle/js-bundle-concat) for mixed group, got %v", ext)
+	}
+}
+
 func TestOpenAPI_XVespasianSource_OmittedForEmptySource(t *testing.T) {
 	gen := &OpenAPIGenerator{}
 	// No static: source anywhere in the input.
@@ -1766,7 +1824,15 @@ func TestComputeSourceTag_StaticHtmlOnlyGroupInJSCorpus_ResolvesDynamic(t *testi
 	}
 }
 
-// mixed static-only groups (static:js + static:js-sourcemap) must resolve to "dynamic".
+// QUAL-003: a group mixing distinct JS-static friendly tags (static:js +
+// static:js-sourcemap, both all-JS-static — no genuinely dynamic/non-JS-static
+// source present) must resolve to the LEAST-CONFIDENT member ("js-sourcemap"),
+// NOT "dynamic". "dynamic" is the highest-confidence label and must be
+// reserved for groups containing a real non-JS-static source; see
+// TestComputeSourceTag_MixedJSStaticGroups for the full confidence-ordering
+// table and TestComputeSourceTag_MixedEmptyAndStaticInGroup_ResolvesDynamic /
+// TestComputeSourceTag_StaticHtmlOnlyGroupInJSCorpus_ResolvesDynamic for the
+// cases that must still resolve to "dynamic".
 func TestComputeSourceTag_MixedStaticGroups(t *testing.T) {
 	gen := &OpenAPIGenerator{}
 	// Two entries for the same endpoint: one from js bundle, one from sourcemap.
@@ -1789,8 +1855,52 @@ func TestComputeSourceTag_MixedStaticGroups(t *testing.T) {
 	if !ok {
 		t.Fatal("expected x-vespasian-source extension to be present")
 	}
-	if ext != "dynamic" {
-		t.Errorf("expected x-vespasian-source=dynamic for mixed static group, got %v", ext)
+	if ext != "js-sourcemap" {
+		t.Errorf("expected x-vespasian-source=js-sourcemap (least-confident of js-bundle/js-sourcemap) for mixed all-JS-static group, got %v", ext)
+	}
+}
+
+// QUAL-003: computeSourceTag confidence-ordering table (most → least
+// confident: js-bundle > js-sourcemap > js-bundle-concat). An all-JS-static
+// mixed group resolves to the least-confident member present; "dynamic" is
+// reserved for a group containing a genuinely non-JS-static source.
+func TestComputeSourceTag_MixedJSStaticGroups(t *testing.T) {
+	tests := []struct {
+		name    string
+		sources []string
+		want    string
+	}{
+		{
+			name:    "js-bundle + js-bundle-concat -> js-bundle-concat (least confident)",
+			sources: []string{"static:js", "static:js-concat"},
+			want:    "js-bundle-concat",
+		},
+		{
+			name:    "js-sourcemap + js-bundle-concat -> js-bundle-concat (least confident)",
+			sources: []string{"static:js-sourcemap", "static:js-concat"},
+			want:    "js-bundle-concat",
+		},
+		{
+			name:    "js-bundle + js-sourcemap -> js-sourcemap (least confident of the two)",
+			sources: []string{"static:js", "static:js-sourcemap"},
+			want:    "js-sourcemap",
+		},
+		{
+			name:    "js-static mixed with a genuinely non-JS-static source -> dynamic",
+			sources: []string{"static:js", "static:html"},
+			want:    "dynamic",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var group []classify.ClassifiedRequest
+			for _, src := range tt.sources {
+				group = append(group, makeClassified("GET", "https://h/api/x", src))
+			}
+			if got := computeSourceTag(group); got != tt.want {
+				t.Errorf("computeSourceTag(%v) = %q, want %q", tt.sources, got, tt.want)
+			}
+		})
 	}
 }
 

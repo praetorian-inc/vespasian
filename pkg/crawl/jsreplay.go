@@ -43,6 +43,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 	"github.com/praetorian-inc/vespasian/pkg/ssrf"
@@ -453,13 +455,19 @@ var concatPlusHeadPattern = regexp.MustCompile(
 		`["']\s*\+`,
 )
 
+// ConcatPathSentinel is the exported form of concatPathSentinel. It is the
+// single source of truth for the sentinel value across packages —
+// pkg/analyze/jsstatic references it from concatDedupKey so its dedup
+// canonicalization cannot drift from the value this package substitutes.
+const ConcatPathSentinel = "0"
+
 // concatPathSentinel is what we substitute for any non-literal concat
 // argument or +-chain operand. A pure numeric segment so the REST
 // generator's NormalizePathWithNames turns it into a named {param} (see
 // pkg/generate/rest/normalize.go). Using "0" rather than "{}" keeps the
 // reconstructed path a syntactically valid HTTP path that the prober can
 // actually issue a request against.
-const concatPathSentinel = "0"
+const concatPathSentinel = ConcatPathSentinel
 
 // maxConcatChainOperands bounds the length of a `+`-concat chain
 // parsePlusChain will walk before bailing out. Real URL chains rarely
@@ -1071,33 +1079,8 @@ func extractConcatPaths(jsBody []byte) []string { //nolint:gocyclo // emit() sta
 		if len(paths) >= maxConcatPathsPerBundle {
 			return
 		}
-		// Collapse `//` runs introduced by literal+literal concatenations
-		// where the head literal ends in `/` and the next literal begins
-		// with `/` (e.g. `"/api/posts/" + "/comment"` → `"/api/posts//comment"`).
-		// addPath downstream only trims leading/trailing slashes, not
-		// internal runs, and the REST normalizer treats `//{id}` as a
-		// distinct (malformed) path segment.
-		//
-		// Preserve the `://` scheme separator in full URLs: collapse only
-		// the path-side of the URL (or the whole string if no scheme is
-		// present). Looping until stable handles rare ≥3-slash runs.
-		if scheme, rest, hasScheme := strings.Cut(p, "://"); hasScheme {
-			for strings.Contains(rest, "//") {
-				rest = strings.ReplaceAll(rest, "//", "/")
-			}
-			p = scheme + "://" + rest
-		} else {
-			for strings.Contains(p, "//") {
-				p = strings.ReplaceAll(p, "//", "/")
-			}
-		}
-		if p == "" || !hasAPIIndicator(p) {
-			return
-		}
-		if strings.ContainsAny(p, " \t\r\n") {
-			return
-		}
-		if seen[p] {
+		p = cleanConcatPath(p)
+		if p == "" || seen[p] {
 			return
 		}
 		seen[p] = true
@@ -1618,13 +1601,159 @@ func extractAPIPaths(jsBody []byte, requests []ObservedRequest) []string { //nol
 	// (LAB-1368). Reconstructed paths use a numeric sentinel for non-literal
 	// operands so the REST normalizer can parameterize them. Run last so the
 	// more-precise strategies above win the dedup race when both match.
-	// (Strategy 4 — literal+literal service-prefix concatenation — runs
+	// (Strategy 4 — literal+literal service-prefix concatenation — also runs
 	// implicitly above via extractServicePrefixes + addPath fan-out.)
 	for _, p := range extractConcatPaths(jsBody) {
 		addPath(p)
 	}
 
+	// Strategy 5b: literal service-prefix +-concat (LAB-4992). Shares
+	// servicePrefixPlusPaths with the fully-offline static path (via
+	// ExtractStaticConcatPaths) so both reconstruct the
+	// `"identity/" + "api/auth/login"` form identically; replay additionally
+	// probes and 404-filters the reconstructions. Without this the "share one
+	// extractor / reconstruct identically" contract held only for the offline
+	// path — extractConcatPaths above misses the literal+literal service-prefix
+	// head that servicePrefixPlusPaths recovers.
+	for _, p := range servicePrefixPlusPaths(jsBody) {
+		addPath(p)
+	}
+
 	return paths
+}
+
+// cleanConcatPath collapses `//` runs in a reconstructed concat path (preserving
+// a `://` scheme separator) and rejects the path — returning "" — when it is
+// empty, carries no API indicator, or contains whitespace. Shared by
+// extractConcatPaths' emit() and servicePrefixPlusPaths so both concat
+// reconstruction forms filter and canonicalize identically.
+//
+// `//` runs arise from literal+literal concatenations where the head literal
+// ends in `/` and the next literal begins with `/` (e.g. `"/api/posts/" +
+// "/comment"`). The REST normalizer treats `//{id}` as a distinct (malformed)
+// segment, so collapsing here keeps reconstructed paths well-formed. Looping
+// until stable handles rare >=3-slash runs.
+//
+// The `//`-collapse and `://` scheme detection operate only on the path portion:
+// a query string / fragment is split off first so a relative path whose query
+// carries an absolute URL (e.g. `"/api//proxy?url=https://x"`) is not mistaken
+// for a scheme-bearing URL, and `//` inside a query value is preserved.
+func cleanConcatPath(p string) string {
+	path, suffix := p, ""
+	if i := strings.IndexAny(p, "?#"); i >= 0 {
+		path, suffix = p[:i], p[i:]
+	}
+
+	if scheme, rest, hasScheme := strings.Cut(path, "://"); hasScheme {
+		for strings.Contains(rest, "//") {
+			rest = strings.ReplaceAll(rest, "//", "/")
+		}
+		path = scheme + "://" + rest
+	} else {
+		for strings.Contains(path, "//") {
+			path = strings.ReplaceAll(path, "//", "/")
+		}
+	}
+	p = path + suffix
+
+	if p == "" || !hasAPIIndicator(p) {
+		return ""
+	}
+	// Reject a space, any non-printable/control byte, or a raw byte that is not
+	// valid UTF-8. A crafted bundle literal can embed raw C0/C1 control bytes
+	// (NUL, VT, FF, DEL, …) that a whitespace-only check would let survive into
+	// a candidate path; unicode.IsControl covers tab/CR/LF and every other
+	// control byte. A lone non-UTF-8 high byte (0x80-0x9F) decodes to
+	// utf8.RuneError, for which unicode.IsControl is false — strings.IndexFunc
+	// alone (which decodes runes the same way) would let it through, so this
+	// scans bytes directly and additionally rejects any width-1 RuneError
+	// decode (SEC-BE-002).
+	for i := 0; i < len(p); {
+		r, size := utf8.DecodeRuneInString(p[i:])
+		if r == ' ' || unicode.IsControl(r) || (r == utf8.RuneError && size == 1) {
+			return ""
+		}
+		i += size
+	}
+	return p
+}
+
+// servicePrefixPlusHeadPattern matches the head of a `+`-concat chain whose
+// first operand is a quoted service-prefix literal — a short slash-terminated
+// segment that does NOT itself have to contain an API indicator (e.g.
+// "identity/", "svc/"). It is the service-prefix analog of
+// concatPlusHeadPattern, which requires the head to contain an API indicator
+// and therefore misses the literal+literal service-prefix form
+// `"identity/" + "api/auth/login"`.
+//
+// The head must start with a letter (no leading slash) so this pattern does not
+// re-match the leading-slash heads already handled by concatPlusHeadPattern.
+// cleanConcatPath's hasAPIIndicator post-filter drops any assembled chain that
+// never reaches an API path, so a bare `"assets/" + x` produces nothing.
+var servicePrefixPlusHeadPattern = regexp.MustCompile(
+	`["']([a-zA-Z][a-zA-Z0-9_-]{0,30}/)["']\s*\+`,
+)
+
+// servicePrefixPlusPaths reconstructs concrete `+`-concat chains whose head is a
+// service-prefix literal (`"identity/" + "api/auth/login"` -> identity/api/auth/login,
+// `"identity/" + id + "/api/x"` -> identity/0/api/x). It reuses parsePlusChain
+// for the tail walk (same numeric sentinel for non-literal operands) and
+// cleanConcatPath for the API-indicator filter, so it reconstructs identically
+// to the other concat forms. Bounded by maxConcatPathsPerBundle.
+func servicePrefixPlusPaths(jsBody []byte) []string {
+	var paths []string
+	seen := make(map[string]bool)
+	for _, match := range servicePrefixPlusHeadPattern.FindAllSubmatchIndex(jsBody, -1) {
+		if len(paths) >= maxConcatPathsPerBundle {
+			break
+		}
+		if len(match) < 4 || match[2] < 0 {
+			continue
+		}
+		head := string(jsBody[match[2]:match[3]])
+		suffix := parsePlusChain(jsBody, match[1])
+		p := cleanConcatPath(head + suffix)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		paths = append(paths, p)
+	}
+	return paths
+}
+
+// ExtractStaticConcatPaths reconstructs API paths built by JS string
+// concatenation from a single JS bundle body, using only network-free logic:
+// String.prototype.concat, `+`-operator chains, and literal service-prefix
+// `+`-concatenation. Non-literal operands are replaced with the numeric sentinel
+// ("0") so the reconstructed path stays parameterizable by the REST normalizer.
+//
+// It is the offline-safe entry point shared with pkg/analyze/jsstatic (LAB-4992)
+// so the fully-offline static analyzer reconstructs concat / service-prefix SPA
+// endpoints identically to the active ReplayJSExtracted path — which additionally
+// re-fetches the bundles and probes the reconstructed paths. Unlike the active
+// extractAPIPaths, it deliberately does NOT perform speculative service-prefix
+// fan-out (combining a discovered prefix with every bare path): those
+// combinations are only safe when probed and 404-filtered, which the offline
+// path cannot do. Returns raw reconstructions (deduped); the caller adds the
+// leading slash and resolves relative paths.
+func ExtractStaticConcatPaths(jsBody []byte) []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(p string) {
+		if p == "" || seen[p] {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	for _, p := range extractConcatPaths(jsBody) {
+		add(p)
+	}
+	for _, p := range servicePrefixPlusPaths(jsBody) {
+		add(p)
+	}
+	return out
 }
 
 // --- Main pipeline ---
@@ -1805,6 +1934,24 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	result := make([]ObservedRequest, len(requests))
 	copy(result, requests)
 
+	// reached records the reachedPathKey of every full URL the target answered
+	// for (any status, including 404). For those paths JS-replay is
+	// authoritative, so the passive offline concat mirror (SourceStaticJSConcat,
+	// emitted by pkg/analyze/jsstatic) is dropped after the loop — a 404'd decoy
+	// must not survive via the mirror, and a confirmed path is already re-added
+	// below as a richer js-extract observation. Paths the target never answered
+	// (connection failures / fully offline) are absent here, so their offline
+	// candidates are preserved (LAB-4992 AC1).
+	//
+	// Keyed path-only (QUAL-001), not origin+path: jsstatic resolves the mirror
+	// URL against the bundle/capture origin (which may be a CDN hosting the JS,
+	// or differ from an operator-pinned --target-url), while this loop always
+	// probes against the target origin. An origin-qualified key would silently
+	// no-op the drop whenever the bundle host differs from the target host,
+	// re-opening the 404-decoy leak. Matching on path alone drops the mirror
+	// regardless of which host either side resolved the URL against.
+	reached := make(map[string]bool)
+
 	probed := 0
 	for _, path := range sortedPaths {
 		if probed >= cfg.MaxEndpoints {
@@ -1858,6 +2005,13 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		if resp == nil {
 			continue
 		}
+		// The target answered (200 or 404), so JS-replay is authoritative for
+		// this reconstructed path — record it so the offline mirror is dropped.
+		// Keyed path-only (see reached's doc comment above) so the match
+		// survives host-case / trailing-slash / bundle-vs-target host
+		// differences between this probe URL and the mirror URL jsstatic
+		// resolved against the bundle origin.
+		reached[reachedPathKey(fullURL)] = true
 
 		// Skip 404 responses — these are typically wrong service prefix
 		// combinations (e.g., /identity/api/shop/products when the correct
@@ -1891,7 +2045,60 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 			probed, len(sortedPaths))
 	}
 
+	// Drop the passive offline concat mirror for every path the live probe
+	// reached: JS-replay's verdict (200 -> js-extract above; 404 -> excluded)
+	// supersedes the unprobed SourceStaticJSConcat candidate, so a decoy the
+	// target 404s does not leak back into the spec via the offline mirror.
+	// Candidates for unreached paths are untouched (offline fallback, LAB-4992).
+	// Matching is host-agnostic (path-only, QUAL-001): the mirror is dropped
+	// whether or not the bundle it was reconstructed against shares a host
+	// with the probe target.
+	//
+	// Residual limitation: paths beyond cfg.MaxEndpoints are never probed, so
+	// they never enter `reached` and their offline mirror is retained — a decoy
+	// past the cap can still surface. This matches the pre-existing MaxEndpoints
+	// truncation semantics (the warn above) and is bounded by that cap.
+	if len(reached) > 0 {
+		filtered := result[:0]
+		for _, r := range result {
+			if r.Source == SourceStaticJSConcat && reached[reachedPathKey(r.URL)] {
+				continue
+			}
+			filtered = append(filtered, r)
+		}
+		result = filtered
+	}
+
 	return result
+}
+
+// reachedPathKey normalizes rawURL to a path-only key so the live-probe
+// reached-set matches the offline concat mirror regardless of which origin
+// each side resolved the URL against (LAB-4992 QUAL-001). jsstatic resolves
+// the mirror URL against the bundle/capture origin — which may be a CDN
+// hosting the JS, or differ from an operator-pinned --target-url — while
+// JS-replay always builds its probe URL from the target origin. Keying on
+// origin+path (the previous approach) silently no-ops the mirror-drop
+// whenever those origins differ, re-opening the 404-decoy leak; matching on
+// path alone (trailing slash trimmed, consistent with the rest of this
+// file's normalization) drops the mirror host-agnostically.
+//
+// Unparseable URLs and URLs with no path component fall back to the raw
+// string so a malformed input degrades to an exact (narrower, still safe)
+// match rather than silently colliding with every other empty-path URL.
+func reachedPathKey(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	path := u.EscapedPath()
+	if path == "" {
+		return rawURL
+	}
+	if path != "/" {
+		path = strings.TrimRight(path, "/")
+	}
+	return path
 }
 
 // --- HTTP helpers ---

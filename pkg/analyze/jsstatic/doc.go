@@ -18,10 +18,11 @@
 // It is invoked between the capture stage (pkg/crawl, pkg/importer) and the
 // classify/generate stages (pkg/classify, pkg/generate). It returns the input
 // captures unchanged, with newly synthesized [crawl.ObservedRequest] entries
-// appended (Source = "static:js" or "static:js-sourcemap").
+// appended (Source = "static:js", "static:js-sourcemap", or
+// "static:js-concat").
 //
 // The analyser is a thin wrapper over BishopFox/jsluice's tree-sitter URL
-// matchers, with two extensions over the upstream library:
+// matchers, with three extensions over the upstream library:
 //
 //   - "EXPR" placeholders in URL paths are normalised to OpenAPI {param}
 //     form using the names of the original template-literal identifiers when
@@ -31,14 +32,47 @@
 //     captured as body parameter names. They are emitted as a synthesized
 //     JSON body ({"a": null, "b": null}) so the existing
 //     pkg/generate/rest.InferSchema produces an object schema downstream.
+//   - Paths built by JS string concatenation that jsluice's AST analysis
+//     cannot resolve — String.prototype.concat, "+"-operator chains, and
+//     literal service-prefix "+"-concatenation — are reconstructed via the
+//     shared crawl.ExtractStaticConcatPaths extractor (LAB-4992), with a numeric
+//     sentinel ("0") substituted for non-literal operands so the REST normalizer
+//     can parameterize them (e.g. /api/users/0/orders -> /api/users/{userId}/orders).
+//     This makes fully-offline `generate` recover concat/service-prefix SPA
+//     endpoints without a reachable target — the same forms the active,
+//     network-bound crawl.ReplayJSExtracted path probes. Emitted as GET
+//     candidates (a bare path carries no method) and deduped, via a
+//     representation-agnostic AND origin-scoped key (numeric sentinel "0" and
+//     {param} placeholders both normalized; key prefixed with the endpoint's
+//     host so a same-path endpoint on a DIFFERENT host is never suppressed),
+//     against the URLs the AST walkers already recovered so no phantom-GET
+//     companions appear for a path recovered both ways on the same origin.
+//     An absolute reconstruction (a bundle literal that concatenates a full
+//     http(s) URL) is only emitted when its host matches the bundle's own
+//     host (SEC-BE-001, LAB-4992); a cross-origin absolute reconstruction is
+//     dropped so a hostile bundle literal cannot smuggle an
+//     attacker-controlled host into the offline candidate set.
 //
 // # Source tagging
 //
-// Each synthesized [crawl.ObservedRequest] carries Source = "static:js" or
-// "static:js-sourcemap". The OpenAPI generator strips the "static:" prefix
-// when emitting the x-vespasian-source extension on each operation
-// ("static:js" -> "js-bundle", "static:js-sourcemap" -> "js-sourcemap";
-// any dynamic-source group resolves to "dynamic", which wins on mixed groups).
+// Each synthesized [crawl.ObservedRequest] carries Source = "static:js"
+// (AST-recovered literal), "static:js-sourcemap" (recovered from a .js.map
+// source), or "static:js-concat" (a never-probed concat/+-chain/service-prefix
+// reconstruction — LAB-4992). The OpenAPI generator maps these to the
+// x-vespasian-source extension on each operation ("static:js" -> "js-bundle",
+// "static:js-sourcemap" -> "js-sourcemap", "static:js-concat" ->
+// "js-bundle-concat"; any dynamic-source group resolves to "dynamic", which
+// wins on mixed groups). The distinct "static:js-concat" tag lets consumers
+// weight speculative reconstructions below directly-observed literals.
+//
+// # Confidence at generation
+//
+// A concat/literal candidate reaches the generated spec only after
+// classification. Fully offline it has no probed response, so it scores only the
+// REST classifier's path heuristic; RESTClassifier Rule 6 floors any JS-static
+// candidate whose path carries an API indicator to the default --confidence
+// threshold (0.5) so these offline candidates survive default-confidence
+// generation instead of being silently dropped.
 //
 // # Security and Operator Considerations
 //

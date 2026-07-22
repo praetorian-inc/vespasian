@@ -197,18 +197,42 @@ func anyStaticSource(endpoints []classify.ClassifiedRequest) bool {
 	return false
 }
 
+// jsStaticSourceRank orders the JS-static friendly tags from most to least
+// confident: a directly AST-recovered literal is most confident, a sourcemap
+// recovery is next (recovered from original source, not the served bundle),
+// and a concat/service-prefix reconstruction is least confident (never
+// probed, speculative). computeSourceTag uses this so a group mixing distinct
+// JS-static tags resolves to the LEAST-CONFIDENT member, not "dynamic".
+var jsStaticSourceRank = map[string]int{
+	"js-bundle":        0,
+	"js-sourcemap":     1,
+	"js-bundle-concat": 2,
+}
+
 // computeSourceTag derives the x-vespasian-source value for an operation group.
 // Mapping (architecture.md §7):
-//   - any request with Source not in {"static:js", "static:js-sourcemap"}
-//     (including empty Source from pre-LAB-2108 captures, untagged dynamic
-//     entries, AND non-JS static sources like "static:html") → "dynamic"
+//   - any request with Source not in the JS-static set (including empty Source
+//     from pre-LAB-2108 captures, untagged dynamic entries, AND non-JS static
+//     sources like "static:html")                    → "dynamic"
 //   - all requests Source == "static:js"             → "js-bundle"
 //   - all requests Source == "static:js-sourcemap"   → "js-sourcemap"
-//   - mixed JS-static prefixes within a group        → "dynamic"
+//   - all requests Source == "static:js-concat"      → "js-bundle-concat"
+//   - mixed JS-static tags within a group (all requests JS-static, but not all
+//     the SAME friendly tag) → the LEAST-CONFIDENT member present (confidence
+//     order, most → least: js-bundle > js-sourcemap > js-bundle-concat), e.g.
+//     js-bundle + js-bundle-concat → "js-bundle-concat"
+//   - any request with a genuinely non-JS-static source in the group          → "dynamic"
 //   - empty group (len(group) == 0)                  → "" (no extension emitted)
 //
 // For non-empty input the function always returns one of: "dynamic",
-// "js-bundle", or "js-sourcemap".
+// "js-bundle", "js-sourcemap", or "js-bundle-concat". The "js-bundle-concat"
+// value (LAB-4992 / SEC-BE-001) flags never-probed concat/service-prefix
+// reconstructions so consumers can weight them below AST-recovered literals.
+// "dynamic" is reserved strictly for a group containing a real non-JS-static
+// source (dynamic / static:html / empty) — an all-JS-static group, even when
+// it mixes distinct JS-static tags, must never resolve to "dynamic", since
+// that is the HIGHEST-confidence label and would make a group recovered
+// entirely from offline JS analysis look directly observed (QUAL-003).
 //
 // The empty-group case is unreachable in current usage because groupEndpoints
 // only creates a key when at least one ClassifiedRequest matches; this contract
@@ -222,7 +246,8 @@ func computeSourceTag(group []classify.ClassifiedRequest) string {
 	if len(group) == 0 {
 		return ""
 	}
-	var tag string
+	leastConfident := ""
+	leastConfidentRank := -1
 	for _, ep := range group {
 		if !crawl.IsJSStaticSource(ep.Source) {
 			// Any non-JS-static source (dynamic, empty, or static:html etc.)
@@ -235,16 +260,15 @@ func computeSourceTag(group []classify.ClassifiedRequest) string {
 			friendly = "js-bundle"
 		case crawl.SourceStaticJSSourcemap:
 			friendly = "js-sourcemap"
+		case crawl.SourceStaticJSConcat:
+			friendly = "js-bundle-concat"
 		}
-		if tag == "" {
-			tag = friendly
-			continue
-		}
-		if tag != friendly {
-			return "dynamic"
+		if r := jsStaticSourceRank[friendly]; r > leastConfidentRank {
+			leastConfidentRank = r
+			leastConfident = friendly
 		}
 	}
-	return tag
+	return leastConfident
 }
 
 // mergeJSONBodies infers and merges JSON schemas from multiple body observations.

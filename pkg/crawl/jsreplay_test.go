@@ -210,6 +210,27 @@ func TestExtractAPIPaths(t *testing.T) {
 	}
 }
 
+// QUAL-004: extractAPIPaths (the active replay path) must run the shared
+// servicePrefixPlusPaths extractor, not only extractConcatPaths — otherwise the
+// "share one extractor / reconstruct identically" contract with the offline
+// static path holds for concat/+-chain forms but NOT the service-prefix form.
+//
+// The distinguishing input is a service-prefix head with a NON-LITERAL middle
+// operand: "billing/" + id + "/api/invoices" reconstructs (via
+// servicePrefixPlusPaths + parsePlusChain) to /billing/0/api/invoices with the
+// numeric sentinel. The pre-existing extractServicePrefixes + addPath fan-out
+// CANNOT produce this — it only combines discovered prefixes with bare literal
+// paths, never a sentinel-bearing chain — and extractConcatPaths' head anchor
+// requires an API indicator in the head ("billing/" has none). So the sentinel
+// form is recoverable EXCLUSIVELY via the Strategy 5b wiring; deleting that
+// block makes this assertion fail (the test is non-vacuous).
+func TestExtractAPIPaths_ServicePrefixPlusWired(t *testing.T) {
+	js := []byte(`var invoices = "billing/" + id + "/api/invoices";`)
+	got := extractAPIPaths(js, nil)
+	assert.Contains(t, got, "/billing/0/api/invoices",
+		"extractAPIPaths must surface the sentinel-bearing service-prefix chain via the shared servicePrefixPlusPaths extractor (Strategy 5b)")
+}
+
 func TestExtractAPIPaths_TemplateLiteralInterpolation(t *testing.T) {
 	// Regression test for REQ-001: template literals with ${...} interpolations
 	// must reconstruct the literal segments after the placeholder, not stop
@@ -1388,6 +1409,140 @@ func TestReplayJSExtracted_Filters404(t *testing.T) {
 		"only the 200-returning path should be appended")
 }
 
+// LAB-4992 regression: when JS-replay reaches the target, its probe verdict is
+// authoritative, so the passive offline concat mirror (SourceStaticJSConcat,
+// emitted by pkg/analyze/jsstatic) must be dropped for every reached path — a
+// 404'd decoy must NOT survive via the mirror. Candidates for paths JS-replay
+// never probed (fully offline / not in the bundle) must be preserved. Without
+// this, the classifier's static-JS confidence floor (Rule 6) would re-admit the
+// decoy, inflating the live concat-spa spec from 2 paths to 3.
+func TestReplayJSExtracted_DropsOfflineConcatMirrorForReachedPaths(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/orders") {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"ok":true}`)) //nolint:errcheck,gosec // test handler
+			return
+		}
+		w.WriteHeader(http.StatusNotFound) // /api/missing/0/gone decoy
+	}))
+	defer srv.Close()
+
+	// Bundle references two concat forms: a real one (200) and a decoy (404).
+	jsBody := []byte(`fetch("/api/users/".concat(uid,"/orders")); fetch("/api/missing/".concat(x,"/gone"));`)
+	requests := []ObservedRequest{
+		{
+			Method:   "GET",
+			URL:      srv.URL + "/app.js",
+			Source:   "katana",
+			Response: ObservedResponse{StatusCode: 200, ContentType: "application/javascript", Body: jsBody},
+		},
+		// Passive offline mirror emitted by jsstatic for the same reconstructions.
+		{Method: "GET", URL: srv.URL + "/api/users/0/orders", Source: SourceStaticJSConcat},
+		{Method: "GET", URL: srv.URL + "/api/missing/0/gone", Source: SourceStaticJSConcat},
+		// A mirror whose URL differs only by a trailing slash from the probed
+		// URL — reachedPathKey normalization must still drop it.
+		{Method: "GET", URL: srv.URL + "/api/missing/0/gone/", Source: SourceStaticJSConcat},
+		// A concat candidate for a path NOT in the bundle — JS-replay never probes
+		// it, so it must be preserved (offline fallback).
+		{Method: "GET", URL: srv.URL + "/api/offline/0/thing", Source: SourceStaticJSConcat},
+	}
+
+	result := ReplayJSExtracted(context.Background(), requests, allowLocal(srv))
+
+	var concatMirror, jsExtract []string
+	for _, r := range result {
+		switch r.Source {
+		case SourceStaticJSConcat:
+			concatMirror = append(concatMirror, r.URL)
+		case "js-extract":
+			jsExtract = append(jsExtract, r.URL)
+		}
+	}
+	// Reached paths (200 orders + 404 gone) dropped from the mirror; the
+	// unreached offline candidate survives.
+	assert.Equal(t, []string{srv.URL + "/api/offline/0/thing"}, concatMirror,
+		"only the unreached offline concat candidate should survive; reached ones (incl. the 404 decoy) are superseded by the probe")
+	assert.Contains(t, jsExtract, srv.URL+"/api/users/0/orders",
+		"the 200 path should be re-added as a probed js-extract observation")
+	assert.NotContains(t, jsExtract, srv.URL+"/api/missing/0/gone",
+		"the 404 decoy must not be present as js-extract either")
+}
+
+// LAB-4992 QUAL-001 regression: jsstatic resolves the offline concat mirror
+// against the BUNDLE origin (e.g. a CDN hosting the JS, or an operator-pinned
+// --target-url that differs from the bundle host), while JS-replay always
+// probes against the TARGET origin. The mirror-drop must therefore match on
+// path alone, not origin+path, or a bundle hosted on a different host than
+// the probe target would leave the 404-decoy mirror in place. This is the
+// cross-host counterpart to TestReplayJSExtracted_DropsOfflineConcatMirrorForReachedPaths,
+// which only covers the same-origin case.
+func TestReplayJSExtracted_DropsOfflineConcatMirrorAcrossHosts(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound) // the target 404s the reconstructed path
+	}))
+	defer srv.Close()
+
+	jsBody := []byte(`fetch("/api/missing/".concat(x,"/gone"));`)
+	requests := []ObservedRequest{
+		{
+			Method:   "GET",
+			URL:      srv.URL + "/app.js",
+			Source:   "katana",
+			Response: ObservedResponse{StatusCode: 200, ContentType: "application/javascript", Body: jsBody},
+		},
+		// Offline mirror resolved by jsstatic against a DIFFERENT (bundle/CDN)
+		// origin than the probe target (srv.URL) — same path, different host.
+		{Method: "GET", URL: "https://cdn.example.com/api/missing/0/gone", Source: SourceStaticJSConcat},
+	}
+
+	result := ReplayJSExtracted(context.Background(), requests, allowLocal(srv))
+
+	for _, r := range result {
+		if r.Source == SourceStaticJSConcat {
+			t.Fatalf("expected cross-host offline concat mirror %q to be dropped once the target 404s the reconstructed path, got it retained", r.URL)
+		}
+	}
+}
+
+// TestReachedPathKey pins the reached-set normalization that lets the offline
+// concat mirror match the live probe URL despite cosmetic AND host
+// differences: only the (trailing-slash-trimmed) path is compared, so a
+// bundle mirror resolved against the CDN/bundle origin still matches a probe
+// built against the target origin (QUAL-001). It also pins the raw-string
+// fallback branches (TEST-002): an unparseable URL and a URL with no path
+// component both return their input verbatim rather than colliding on "".
+func TestReachedPathKey(t *testing.T) {
+	tests := []struct{ a, b string }{
+		{"http://Example.COM/api/x", "http://example.com/api/x"},            // host case (path-only, host is irrelevant anyway)
+		{"http://example.com/api/x/", "http://example.com/api/x"},           // trailing slash
+		{"http://example.com/api/x", "http://example.com:80/api/x"},         // default http port (path-only, port is irrelevant anyway)
+		{"https://example.com/api/x", "https://example.com:443/api/x"},      // default https port
+		{"http://Example.com:8080/api/x/", "http://example.com:8080/api/x"}, // host case + trailing slash on a non-default port
+		// QUAL-001: same path, entirely different host/scheme — the mirror-drop
+		// must be host-agnostic since jsstatic resolves the mirror against the
+		// bundle/CDN origin while JS-replay probes against the target origin.
+		{"https://cdn.example.com/api/missing/0/gone", "http://127.0.0.1:9999/api/missing/0/gone"},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, reachedPathKey(tt.a), reachedPathKey(tt.b),
+			"expected %q and %q to normalize to the same key", tt.a, tt.b)
+	}
+	// Genuinely different paths must NOT collapse.
+	assert.NotEqual(t, reachedPathKey("http://example.com/api/x"), reachedPathKey("http://example.com/api/y"))
+	assert.NotEqual(t, reachedPathKey("http://a.com/api/x"), reachedPathKey("http://a.com/api/y"))
+
+	// TEST-002: fallback branches. An unparseable URL (control byte breaks
+	// url.Parse) falls back to the raw string verbatim.
+	assert.Equal(t, "not a url\x7f", reachedPathKey("not a url\x7f"))
+	// A URL that parses but has an empty path component falls back to the raw
+	// string verbatim. This input pins the `path == ""` guard load-bearingly:
+	// without it, EscapedPath() == "" would flow through the trailing-slash
+	// trim and collapse to "", colliding every path-less origin on one key.
+	assert.Equal(t, "http://example.com", reachedPathKey("http://example.com"))
+	// The empty string likewise round-trips verbatim.
+	assert.Equal(t, "", reachedPathKey(""))
+}
+
 // errRoundTripper always returns the configured error from RoundTrip.
 type errRoundTripper struct{ err error }
 
@@ -2019,6 +2174,34 @@ func TestExtractConcatPaths_PerBundleCap(t *testing.T) {
 	got := extractConcatPaths([]byte(sb.String()))
 	assert.Equal(t, maxConcatPathsPerBundle, len(got),
 		"extractConcatPaths must not exceed maxConcatPathsPerBundle per bundle")
+}
+
+// TestServicePrefixPlusPaths_PerBundleCap (TEST-003) verifies that
+// servicePrefixPlusPaths — which has its own maxConcatPathsPerBundle guard,
+// separate from extractConcatPaths' — is itself capped when a bundle contains
+// far more distinct literal service-prefix `+`-chains than the limit. Reached
+// via ExtractStaticConcatPaths, the offline entry point that fans out to both
+// extractors.
+func TestServicePrefixPlusPaths_PerBundleCap(t *testing.T) {
+	// Build a bundle with maxConcatPathsPerBundle*2 distinct service-prefix
+	// `+`-concat chains, each with a unique prefix and suffix so none collide
+	// in the seen-dedup map.
+	var sb strings.Builder
+	total := maxConcatPathsPerBundle * 2
+	for i := 0; i < total; i++ {
+		fmt.Fprintf(&sb, `var svc%d = "svc%d/" + "api/endpoint%d";`, i, i, i)
+	}
+	jsBody := []byte(sb.String())
+
+	got := servicePrefixPlusPaths(jsBody)
+	assert.Equal(t, maxConcatPathsPerBundle, len(got),
+		"servicePrefixPlusPaths must not exceed maxConcatPathsPerBundle per bundle")
+
+	// The cap must also be visible through the offline entry point that both
+	// extractConcatPaths and servicePrefixPlusPaths feed into.
+	all := ExtractStaticConcatPaths(jsBody)
+	assert.LessOrEqual(t, len(all), 2*maxConcatPathsPerBundle,
+		"ExtractStaticConcatPaths must not exceed the combined per-extractor caps")
 }
 
 // TestExtractConcatPaths_ConcatArgListCap verifies that a .concat() call
@@ -3103,4 +3286,140 @@ func TestReplayJSExtracted_NoHTMLFallsBackToFirstURL(t *testing.T) {
 	}
 	assert.Contains(t, apiURLs, app.URL+"/api/users/0/orders",
 		"with no HTML response and no TargetURL, replay must bind to the first non-empty request's origin (the JS bundle's)")
+}
+
+// TestExtractStaticConcatPaths pins the network-free concat / +-chain /
+// service-prefix reconstruction shared with pkg/analyze/jsstatic (LAB-4992).
+// It must reconstruct the same concrete forms extractConcatPaths does, PLUS the
+// literal service-prefix `+`-form that extractConcatPaths misses (its +-head
+// anchor requires an API indicator), and must NOT do speculative service-prefix
+// fan-out (only safe when 404-filtered by probing). Non-literal operands become
+// the numeric sentinel "0".
+func TestExtractStaticConcatPaths(t *testing.T) {
+	tests := []struct {
+		name string
+		js   string
+		want []string
+	}{
+		{
+			name: "concat method form",
+			js:   `fetch("/api/users/".concat(uid, "/orders"));`,
+			want: []string{"/api/users/0/orders"},
+		},
+		{
+			name: "plus chain form",
+			js:   `var u = "/api/products/" + pid + "/reviews";`,
+			want: []string{"/api/products/0/reviews"},
+		},
+		{
+			name: "literal service-prefix plus form",
+			js:   `var l = "identity/" + "api/auth/login";`,
+			want: []string{"identity/api/auth/login"},
+		},
+		{
+			name: "service-prefix plus with dynamic middle operand",
+			js:   `var u = "identity/" + id + "/api/orders";`,
+			want: []string{"identity/0/api/orders"},
+		},
+		{
+			// QUAL-006: single-character service prefixes ("v/") must match —
+			// servicePrefixPlusHeadPattern's quantifier is {0,30} so the head
+			// can be a lone letter + slash. cleanConcatPath's API-indicator
+			// filter still gates the assembled chain.
+			name: "single-character service prefix",
+			js:   `var u = "v/" + "api/users";`,
+			want: []string{"v/api/users"},
+		},
+		{
+			name: "service-prefix head without API indicator dropped",
+			js:   `var u = "assets/" + name + "/logo";`,
+			want: nil,
+		},
+		{
+			name: "no concatenation present",
+			js:   `fetch("/api/v2/users");`,
+			want: nil,
+		},
+		{
+			name: "dedup across forms and repeats",
+			js:   `"identity/"+"api/x"; "identity/"+"api/x"; fetch("/api/p/".concat(id));`,
+			want: []string{"/api/p/0", "identity/api/x"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractStaticConcatPaths([]byte(tt.js))
+			sort.Strings(got)
+			sort.Strings(tt.want)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestCleanConcatPath(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "collapses double slash in path",
+			in:   "/api/posts//comment",
+			want: "/api/posts/comment",
+		},
+		{
+			name: "preserves scheme separator",
+			in:   "https://h//api//x",
+			want: "https://h/api/x",
+		},
+		{
+			// QUAL-005: a `://` inside a query value must NOT be treated as a
+			// scheme separator, and `//` inside the query must be preserved —
+			// only the path portion is slash-collapsed.
+			name: "query-string scheme is not mistaken for path scheme",
+			in:   "/api//proxy?url=https://a//b",
+			want: "/api/proxy?url=https://a//b",
+		},
+		{
+			// SEC-BE-002: a raw control byte (here NUL) in the path must be
+			// rejected, not just ASCII whitespace.
+			name: "rejects embedded NUL control byte",
+			in:   "/api/\x00x",
+			want: "",
+		},
+		{
+			name: "rejects vertical tab control byte",
+			in:   "/api/\x0bx",
+			want: "",
+		},
+		{
+			name: "rejects DEL control byte",
+			in:   "/api/\x7fx",
+			want: "",
+		},
+		{
+			name: "rejects space",
+			in:   "/api/ x",
+			want: "",
+		},
+		{
+			name: "drops path without API indicator",
+			in:   "/static/logo",
+			want: "",
+		},
+		{
+			// SEC-BE-002: a lone non-UTF-8 high byte (0x80-0x9F) decodes to
+			// utf8.RuneError, for which unicode.IsControl is false — a
+			// rune-based-only scan would let it survive. It must still be
+			// rejected as an invalid/unprintable byte.
+			name: "rejects raw non-UTF-8 high byte",
+			in:   "/api/\x85x",
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, cleanConcatPath(tt.in))
+		})
+	}
 }
