@@ -78,7 +78,8 @@ func (c *Capability) Parameters() []capability.Parameter {
 		capability.Int("depth", "Maximum crawl depth").WithDefault("3"),
 		capability.String("scope", "Crawl scope: same-origin or same-domain").WithDefault("same-origin").WithOptions("same-origin", "same-domain"),
 		capability.String("headers", "Comma-separated auth headers (e.g. 'Authorization: Bearer tok, X-Key: abc'). Header values containing commas are not supported."),
-		capability.String("confidence", "Minimum classification confidence 0-1").WithDefault("0.5"),
+		capability.String("confidence", "Minimum classification confidence 0-1").
+			WithDefault(strconv.FormatFloat(classify.DefaultConfidenceThreshold, 'g', -1, 64)),
 		capability.Bool("probe", "Enable endpoint probing").WithDefault("true"),
 		capability.Bool("merge_slugs", "Merge sibling slug paths into one templated REST path (off by default; REST only)").WithDefault("false"),
 		capability.Int("slug_threshold", "Distinct values at a path position before merge_slugs collapses it (minimum 2)").WithDefault("2"),

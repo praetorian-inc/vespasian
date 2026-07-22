@@ -2307,3 +2307,42 @@ func TestGenerate_ResponseSchema_SurvivesEmptyBaseObservation(t *testing.T) {
 			"populated 201 response schema must survive regardless of observation order")
 	}
 }
+
+// TestGenerate_ResponseSchema_ArraySurvivesEmptyBaseObservation covers the
+// array/scalar case of review finding 002: a populated JSON array response has
+// nil schema Properties, so adopting it into an empty base must not be gated on
+// Properties!=nil. When an empty (half-captured) observation of the same status
+// sorts first, the array response schema must still survive regardless of order
+// (Codex/CodeRabbit review).
+func TestGenerate_ResponseSchema_ArraySurvivesEmptyBaseObservation(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	empty := classify.ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method:   "GET",
+			URL:      "https://api.example.com/api/items",
+			Response: crawl.ObservedResponse{StatusCode: 200}, // half-captured
+		},
+		IsAPI: true,
+	}
+	populated := classify.ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: "GET",
+			URL:    "https://api.example.com/api/items",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Body:        []byte(`[{"id":1}]`),
+			},
+		},
+		IsAPI: true,
+	}
+
+	for _, order := range [][]classify.ClassifiedRequest{{empty, populated}, {populated, empty}} {
+		spec, err := gen.Generate(order)
+		require.NoError(t, err)
+		// An array response schema serializes with "type: array"; its presence
+		// proves the populated array response was not dropped by an empty base.
+		assert.Contains(t, string(spec), "array",
+			"populated array response schema must survive regardless of observation order")
+	}
+}
