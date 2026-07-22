@@ -27,7 +27,9 @@
 // and the per-page timeout) rather than a fixed settle window, so late and
 // dynamic requests are captured. Passively captured requests are scope-filtered
 // like frontier links, and the frontier treats URLs differing only in query
-// parameters as one page.
+// parameters as one page. An opt-in interaction pass ([CrawlerOptions.Interact],
+// headless only, off by default) clicks a bounded set of non-destructive buttons
+// per page to surface endpoints that only fire on interaction.
 //
 // Non-headless mode ([HTTPCrawler]): uses the Go stdlib net/http client with a
 // depth-first search frontier, 150 req/s rate limiter, and a 10 MB per-page

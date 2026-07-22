@@ -323,6 +323,7 @@ vespasian scan <url> [flags]
   --depth            Max crawl depth (default: 3)
   --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100)
   --max-requests     Max captured requests before stopping (0 = unlimited); rate/politeness bound distinct from --max-pages
+  --interact         Click non-destructive buttons to surface interaction-only endpoints (headless only; off by default; skips delete/logout controls)
   --timeout          Maximum duration for the entire scan (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine
@@ -357,6 +358,7 @@ vespasian crawl <url> [flags]
   --depth            Max crawl depth (default: 3)
   --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100)
   --max-requests     Max captured requests before stopping (0 = unlimited); rate/politeness bound distinct from --max-pages
+  --interact         Click non-destructive buttons to surface interaction-only endpoints (headless only; off by default; skips delete/logout controls)
   --timeout          Maximum duration for the entire crawl (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine

@@ -92,6 +92,7 @@ func (c *RodCrawler) crawlHeadless(ctx context.Context, targetURL string, maxPag
 		Concurrency:   c.opts.Concurrency,
 		MaxPages:      maxPages,
 		MaxRequests:   c.opts.MaxRequests,
+		Interact:      c.opts.Interact,
 		MaxDepth:      c.opts.Depth,
 		PageTimeout:   time.Duration(PageTimeout) * time.Second,
 		StableTimeout: DefaultStableWait,

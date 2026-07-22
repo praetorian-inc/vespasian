@@ -123,6 +123,11 @@ type engineOptions struct {
 	NetworkIdleFloor   time.Duration // minimum wait after DOM stability
 	NetworkQuietPeriod time.Duration // idle duration required before stopping
 	PerRequestTimeout  time.Duration // age after which a pending request stops counting in-flight
+
+	// Interact enables the opt-in interaction pass (clicks / client-side route
+	// changes) to surface interaction-only endpoints. Off by default — clicking
+	// can mutate state, so it must be explicitly requested (LAB-4678 Phase 2).
+	Interact bool
 }
 
 // rodEngine implements a concurrent headless crawl using go-rod. It connects
@@ -413,7 +418,16 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 	// data loads) are captured rather than dropped (LAB-4678 Phase 1). Bounded by
 	// a floor, a quiet period, a per-request timeout, and the page ceiling; see
 	// waitForNetworkIdle. Returns whatever was captured so far if ctx is canceled.
-	capturedResults := e.waitForNetworkIdle(ctx, capture)
+	e.waitForNetworkIdle(ctx, capture)
+
+	// Optionally exercise the page (clicks / client-side route changes) to
+	// surface endpoints that only fire on interaction, then snapshot everything
+	// captured — baseline plus interaction-triggered (LAB-4678 Phase 2). Opt-in,
+	// off by default.
+	if e.opts.Interact {
+		e.interactPage(ctx, page, capture)
+	}
+	capturedResults := capture.Results()
 
 	// Extract links, run jsluice, and discover forms from the stabilized page.
 	results, links := enrichFromPage(page, capturedResults, target.URL, e.opts.Stderr, e.opts.ScopeCheck)
