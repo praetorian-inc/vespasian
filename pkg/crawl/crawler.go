@@ -52,6 +52,7 @@ const (
 type CrawlerOptions struct {
 	Depth         int
 	MaxPages      int
+	MaxRequests   int // max captured requests before stopping (0 → unlimited); rate/politeness bound distinct from MaxPages
 	Timeout       time.Duration
 	Scope         string
 	Headless      bool

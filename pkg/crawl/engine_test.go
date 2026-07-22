@@ -658,3 +658,30 @@ func TestMergeEnrichedLinks_NilScopeKeepsCaptured(t *testing.T) {
 		t.Errorf("nil scopeFn kept %d, want 2 (no filtering)", len(got))
 	}
 }
+
+// TestBudgetReached covers the two crawl budgets (LAB-4678 Phase 3): a 0 budget
+// is unlimited for that dimension, and either dimension hitting its bound stops
+// the crawl from starting a new page.
+func TestBudgetReached(t *testing.T) {
+	cases := []struct {
+		name                                   string
+		pageCount, maxPages, reqCount, maxReqs int
+		want                                   bool
+	}{
+		{"both unlimited", 100, 0, 100, 0, false},
+		{"pages under cap", 1, 5, 0, 0, false},
+		{"pages at cap", 5, 5, 0, 0, true},
+		{"requests at cap", 1, 0, 50, 50, true},
+		{"requests under cap", 1, 0, 49, 50, false},
+		{"pages ok, requests over", 2, 100, 500, 200, true},
+		{"requests ok, pages over", 100, 50, 10, 1000, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := budgetReached(tc.pageCount, tc.maxPages, tc.reqCount, tc.maxReqs); got != tc.want {
+				t.Errorf("budgetReached(pages=%d/%d, reqs=%d/%d) = %v, want %v",
+					tc.pageCount, tc.maxPages, tc.reqCount, tc.maxReqs, got, tc.want)
+			}
+		})
+	}
+}
