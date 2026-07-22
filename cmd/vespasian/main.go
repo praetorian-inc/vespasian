@@ -236,7 +236,7 @@ type CrawlOptions struct {
 	Timeout         time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
 	Scope           string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
 	Headless        bool          `default:"true" help:"Use headless browser"`
-	Proxy           string        `help:"Proxy address for the scan (e.g., http://127.0.0.1:8080); http/https/socks5. Routes crawl, probe, WSDL-discovery, JS-replay, gRPC-reflection, and jsstatic sourcemap-fetch traffic through the proxy (crawl uses Chrome headless or the net/http transport; the post-crawl stages use net/http). TLS verification stays on by default; use --proxy-insecure to accept an http/https intercepting proxy's MITM certificate (socks5 always verifies). With --proxy the dial-time SSRF IP pin is skipped for the proxy connection; URL scope is still enforced, so private targets still require --dangerous-allow-private."`
+	Proxy           string        `help:"Proxy address for the scan (e.g., http://127.0.0.1:8080); http/https/socks5. Routes crawl, probe, WSDL-discovery, JS-replay, gRPC-reflection, and jsstatic sourcemap-fetch traffic through the proxy (crawl uses Chrome headless or the net/http transport; the post-crawl stages use net/http). TLS verification stays on by default; use --proxy-insecure to accept an http/https intercepting proxy's MITM certificate (socks5 always verifies). With --proxy the dial-time SSRF IP pin is skipped for the proxy connection; URL scope is still enforced against the target's initial hostname resolution, so private targets still require --dangerous-allow-private — but this guard is best-effort and does NOT survive DNS rebinding through the proxy (the proxy re-resolves the host when it dials)."`
 	ProxyInsecure   bool          `name:"proxy-insecure" help:"Disable TLS certificate verification for an http/https intercepting proxy (Burp/mitmproxy MITM) on the net/http backend (--headless=false). Off by default; no effect on socks5 or the headless backend (there, trust the proxy CA via the OS trust store instead)."`
 	Concurrency     int           `default:"10" help:"Number of concurrent browser tabs for headless crawling"`
 	NoRequestID     bool          `name:"no-request-id" help:"Disable automatic X-Vespasian-Request-Id header"`
@@ -481,7 +481,7 @@ type GenerateCmd struct {
 	Header    []string `short:"H" help:"Custom headers (repeatable, \"Key: Value\") forwarded to same-origin JS-replay bundle fetches and probes (e.g. Authorization). Mirrors scan's -H; needed to recover endpoints behind auth in the two-stage crawl→generate flow. Never forwarded cross-origin."`
 	TargetURL string   `name:"target-url" help:"Origin to run JS-replay against (scheme://host[:port]). Overrides the default heuristic of deriving the origin from the capture's first HTML page. Use for imported/mixed-origin captures (HAR/Burp) whose first entry may be a third-party host."`
 
-	Proxy         string `help:"Proxy address (e.g., http://127.0.0.1:8080); http/https/socks5. Routes the probe (OPTIONS/schema/WSDL-fetch/GraphQL introspection/gRPC reflection), JS-replay, and jsstatic sourcemap-fetch traffic through the proxy. TLS verification stays on by default; use --proxy-insecure to accept an http/https intercepting proxy's MITM certificate (socks5 always verifies). The dial-time SSRF IP pin is skipped for the proxy connection; URL scope is still enforced, so private targets still require --dangerous-allow-private."`
+	Proxy         string `help:"Proxy address (e.g., http://127.0.0.1:8080); http/https/socks5. Routes the probe (OPTIONS/schema/WSDL-fetch/GraphQL introspection/gRPC reflection), JS-replay, and jsstatic sourcemap-fetch traffic through the proxy. TLS verification stays on by default; use --proxy-insecure to accept an http/https intercepting proxy's MITM certificate (socks5 always verifies). The dial-time SSRF IP pin is skipped for the proxy connection; URL scope is still enforced against the target's initial hostname resolution, so private targets still require --dangerous-allow-private — but this guard is best-effort and does NOT survive DNS rebinding through the proxy (the proxy re-resolves the host when it dials)."`
 	ProxyInsecure bool   `name:"proxy-insecure" help:"Disable TLS certificate verification for an http/https intercepting proxy (Burp/mitmproxy MITM). Off by default; no effect on socks5 (a transparent tunnel that always verifies the real target)."`
 
 	SlugOptions
@@ -490,14 +490,12 @@ type GenerateCmd struct {
 // maxCaptureSize is the maximum capture file size (100MB).
 const maxCaptureSize = 100 * 1024 * 1024
 
-// options builds the pipeline.Options for this command from its flags. Extracted
-// so a CLI-boundary test can assert each flag reaches pipeline.Options (catching a
-// dropped assignment) without executing Run().
-func (c *GenerateCmd) options() pipeline.Options {
-	// --proxy is validated fail-fast in Run (via resolveJSReplayConfig) before
-	// options() is reached; parseProxyConfigOrEmpty falls back to no proxy on the
-	// (unreachable) error.
-	proxy := parseProxyConfigOrEmpty(c.Proxy, c.ProxyInsecure)
+// options builds the pipeline.Options for this command from its flags plus the
+// already-parsed proxy config threaded in by Run (from resolveJSReplayConfig,
+// which fail-fast validates --proxy). Accepting proxy here means GenerateCmd
+// parses --proxy exactly once. Extracted so a CLI-boundary test can assert each
+// flag reaches pipeline.Options (catching a dropped assignment) without Run().
+func (c *GenerateCmd) options(proxy httpx.ProxyConfig) pipeline.Options {
 	return pipeline.Options{
 		APIType:                c.APIType,
 		Confidence:             c.Confidence,
@@ -612,7 +610,7 @@ func (c *GenerateCmd) Run() (err error) {
 	// still be reachable at generate time.
 	requests = maybeReplayJSExtracted(ctx, requests, c.Probe && c.AnalyzeJS, jsReplayCfg)
 
-	spec, err := pipeline.ClassifyProbeGenerate(ctx, requests, c.options())
+	spec, err := pipeline.ClassifyProbeGenerate(ctx, requests, c.options(jsReplayCfg.Proxy))
 	if err != nil {
 		return err
 	}

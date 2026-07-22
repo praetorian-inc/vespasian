@@ -1012,9 +1012,9 @@ func TestGRPCInsecureSkipVerify_GenerateCmd(t *testing.T) {
 // hermetic Run() smoke test that never reaches pipeline.Options
 // construction on a REST capture).
 func TestGRPCInsecureSkipVerify_ReachesOptions(t *testing.T) {
-	require.True(t, (&GenerateCmd{GRPCInsecureSkipVerify: true}).options().GRPCInsecureSkipVerify,
+	require.True(t, (&GenerateCmd{GRPCInsecureSkipVerify: true}).options(httpx.ProxyConfig{}).GRPCInsecureSkipVerify,
 		"GenerateCmd flag must reach pipeline.Options")
-	require.False(t, (&GenerateCmd{GRPCInsecureSkipVerify: false}).options().GRPCInsecureSkipVerify)
+	require.False(t, (&GenerateCmd{GRPCInsecureSkipVerify: false}).options(httpx.ProxyConfig{}).GRPCInsecureSkipVerify)
 
 	require.True(t, (&ScanCmd{GRPCInsecureSkipVerify: true}).scanOptions("rest", nil, httpx.ProxyConfig{}).GRPCInsecureSkipVerify,
 		"ScanCmd flag must reach pipeline.ScanOptions")
@@ -3434,7 +3434,8 @@ func TestGenerateCmd_ProxyFlagsParse(t *testing.T) {
 // mirroring TestGRPCInsecureSkipVerify_ReachesOptions.
 func TestGenerateCmd_Options_CarriesProxy(t *testing.T) {
 	cmd := &GenerateCmd{Proxy: "http://127.0.0.1:8080"}
-	opts := cmd.options()
+	proxy := parseProxyConfigOrEmpty(cmd.Proxy, cmd.ProxyInsecure)
+	opts := cmd.options(proxy)
 	require.NotNil(t, opts.Proxy.URL, "GenerateCmd.Proxy must reach pipeline.Options.Proxy")
 }
 
