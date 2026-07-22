@@ -1,0 +1,18 @@
+{
+  "description": "Expected API paths from a single-stage `vespasian scan` of the REST API target (LAB-3890 T2, gap A1). Unlike rest-api (two-stage crawl+generate), this exercises the scan command's full pipeline end-to-end. /api/subscribe is served ONLY as a static HTML <form> action (never linked or fetched), so its presence proves the analyze.ExtractForms augmentation ran inside scan. Parameter names may vary ({userId} vs {id}); validate_path_coverage matches params positionally.",
+  "paths": {
+    "/api/subscribe": ["POST"],
+    "/api/health": ["GET"],
+    "/api/users": ["GET"],
+    "/api/users/{id}": ["GET"],
+    "/api/users/{id}/email-address": ["GET"],
+    "/api/products": ["GET"],
+    "/api/products/{id}": ["GET"],
+    "/api/orders": ["GET"],
+    "/api/orders/{id}": ["GET"],
+    "/api/login": ["POST"],
+    "/api/upload": ["POST"]
+  },
+  "total_paths": 11,
+  "excluded_patterns": [".js", ".css", ".png", ".ico", ".svg", ".woff"]
+}

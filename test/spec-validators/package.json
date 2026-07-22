@@ -1,0 +1,16 @@
+{
+  "name": "vespasian-spec-validators",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hermetic real-parser validators for the vespasian live-test suite (LAB-3890 T1). Offline once installed; the only network is `npm ci` from registry.npmjs.org.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "bin": {
+    "validate-openapi": "validate-openapi.mjs",
+    "validate-graphql": "validate-graphql.mjs"
+  },
+  "dependencies": {
+    "@apidevtools/swagger-parser": "12.1.0",
+    "graphql": "16.13.1"
+  }
+}

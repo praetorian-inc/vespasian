@@ -50,6 +50,20 @@ components:
                 price:
                     type: number
             type: object
+        UpdateUserRequest:
+            properties:
+                email:
+                    type: string
+                id:
+                    type: integer
+                name:
+                    type: string
+            type: object
+        UpdateUserRequest2:
+            properties:
+                email:
+                    type: string
+            type: object
         UserResponse:
             properties:
                 email:
@@ -196,6 +210,17 @@ paths:
                     description: OK
             summary: Get /api/users
     /api/users/{userId}:
+        delete:
+            parameters:
+                - in: path
+                  name: userId
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "204":
+                    description: No Content
+            summary: Delete /api/users/{userId}
         get:
             parameters:
                 - in: path
@@ -211,6 +236,46 @@ paths:
                                 $ref: '#/components/schemas/UserResponse'
                     description: OK
             summary: Get /api/users/{userId}
+        patch:
+            parameters:
+                - in: path
+                  name: userId
+                  required: true
+                  schema:
+                    type: string
+            requestBody:
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/UpdateUserRequest2'
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/UserResponse'
+                    description: OK
+            summary: Patch /api/users/{userId}
+        put:
+            parameters:
+                - in: path
+                  name: userId
+                  required: true
+                  schema:
+                    type: string
+            requestBody:
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/UpdateUserRequest'
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/UserResponse'
+                    description: OK
+            summary: Put /api/users/{userId}
     /api/users/{userId}/email-address:
         get:
             parameters:

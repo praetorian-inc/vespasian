@@ -242,14 +242,18 @@ Results are saved to `test/.results/` with one subdirectory per test:
 │   └── (empty on success)  # Validates graceful failure on bad input
 ├── import-empty/
 │   └── imported.json       # Imported from empty Burp/HAR
+├── auth-capture/
+│   └── imported.json       # Authorization header preserved through import (LAB-3890 A5)
 ├── edge-cases/
-│   └── (crawl artifacts)   # Timeout, error handling, auth header tests
+│   └── (crawl artifacts)   # Timeout, redirects, HTTP errors, encoding
 ├── crawl-depth/
 │   ├── shallow.json        # Depth-limited crawl
 │   ├── limited.json        # Max-pages-limited crawl
 │   └── loop.json           # Infinite loop detection
 ├── crawl-unreachable/
 │   └── capture.json        # Crawl of unreachable host
+├── ssrf-rejection/
+│   └── (no artifact)       # Asserts SSRF gate rejects a private target (LAB-3890 A4)
 ├── classifier-edge/
 │   ├── capture.json        # Synthetic edge case requests
 │   └── spec.yaml           # Spec from classifier edge cases

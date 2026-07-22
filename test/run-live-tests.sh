@@ -62,10 +62,13 @@ OFFLINE_TARGETS=(
     crawl-unreachable
     classifier-edge
     spec-edge
+    ssrf-rejection
+    auth-capture
 )
 
 LIVE_TARGETS=(
     rest-api
+    scan-rest
     soap-service
     graphql-server
     concat-spa
@@ -405,6 +408,87 @@ test_rest_api() {
     else
         set_test_result "rest-api" "FAIL" "$endpoint_count" "$expected_count" "$duration"
         log_fail "rest-api: ${failures} check(s) failed (${duration}s)"
+    fi
+}
+
+# test_scan_rest drives the single-stage `scan` command (crawl + augment +
+# classify + generate in ONE invocation) against the rest-api target. It is the
+# only live target that exercises the scan command's full pipeline INCLUDING the
+# analyze.ExtractForms augmentation (LAB-3890 T2, gap A1). The rest-api index
+# serves a static HTML <form action="/api/subscribe"> that is never linked or
+# fetched, so /api/subscribe appearing in the generated spec proves ExtractForms
+# synthesized it inside the scan pipeline. Uses the same rest-api server as
+# test_rest_api (which drives the two-stage crawl+generate flow), so the two
+# tests can be compared directly.
+test_scan_rest() {
+    local port="${REST_API_PORT:-8990}"
+    local base_url="http://${TEST_HOST}:${port}"
+    local target_dir="${RESULTS_DIR}/scan-rest"
+    local spec_file="${target_dir}/spec.yaml"
+    local expected="${SCRIPT_DIR}/rest-api/scan-expected-paths.json"
+    local verbose_flag=""
+
+    [ "${VERBOSE:-false}" = true ] && verbose_flag="-v"
+
+    mkdir -p "$target_dir"
+    init_test_status "scan-rest"
+
+    local start=$SECONDS
+    local failures=0
+
+    log_header "Testing: scan-rest (${base_url})"
+
+    log_info "Scanning ${base_url} (single-stage: crawl + augment + generate)..."
+    if ! "$VESPASIAN" scan "$base_url" \
+        -o "$spec_file" \
+        --api-type rest \
+        --depth 2 \
+        --max-pages 50 \
+        --timeout 2m \
+        --dangerous-allow-private \
+        $verbose_flag 2>&1; then
+        log_fail "Scan failed"
+        set_test_result "scan-rest" "FAIL" "?" "?" "$((SECONDS - start))"
+        return 1
+    fi
+
+    # Layer 1: real OpenAPI validation (LAB-3890 T1 parser-backed validator).
+    if ! validate_openapi_structure "$spec_file"; then
+        failures=$((failures + 1))
+    fi
+
+    # Layer 2: full path coverage (incl. /api/subscribe) — param-tolerant.
+    if ! validate_path_coverage "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+
+    # Layer 3: no static assets leaked into the spec.
+    if ! validate_no_static_assets "$spec_file"; then
+        failures=$((failures + 1))
+    fi
+
+    # Layer 4: explicit ExtractForms proof with an actionable message. The only
+    # source of /api/subscribe is the static HTML form (not linked/fetched), so
+    # its absence means scan's ExtractForms augmentation did not run.
+    if grep -q "/api/subscribe" "$spec_file"; then
+        log_ok "scan-rest: /api/subscribe present (ExtractForms augmentation ran)"
+    else
+        log_fail "scan-rest: /api/subscribe absent — scan's ExtractForms augmentation did not run"
+        failures=$((failures + 1))
+    fi
+
+    local endpoint_count
+    endpoint_count=$(count_spec_endpoints "$spec_file")
+    local expected_count
+    expected_count=$(json_field "$expected" total_paths)
+
+    local duration=$((SECONDS - start))
+    if [ $failures -eq 0 ]; then
+        set_test_result "scan-rest" "PASS" "$endpoint_count" "$expected_count" "$duration"
+        log_ok "scan-rest: ALL CHECKS PASSED (${duration}s)"
+    else
+        set_test_result "scan-rest" "FAIL" "$endpoint_count" "$expected_count" "$duration"
+        log_fail "scan-rest: ${failures} check(s) failed (${duration}s)"
     fi
 }
 
@@ -1817,6 +1901,19 @@ test_import_malformed() {
 
     log_header "Testing: import-malformed (graceful handling of bad input)"
 
+    # check_panic fails the test if an import's combined output contains a Go
+    # panic / goroutine stack trace. A panic is a crash, NOT graceful handling,
+    # so it must never be accepted as a "graceful" non-zero exit (LAB-3890 T3,
+    # gap B3). Defined here so it shares this function's `failures` via bash
+    # dynamic scoping.
+    check_panic() {
+        local label=$1 output=$2
+        if printf '%s' "$output" | grep -qiE 'panic:|goroutine [0-9]+ \[running\]'; then
+            log_fail "${label}: PANICKED (not graceful): $(printf '%s' "$output" | grep -iE 'panic:' | head -1)"
+            failures=$((failures + 1))
+        fi
+    }
+
     # Test 1: Truncated/broken XML — should fail gracefully (non-zero exit, no crash)
     log_info "Importing truncated Burp XML..."
     local truncated_burp="${RESULTS_DIR}/import-malformed/truncated-burp.xml"
@@ -1829,6 +1926,7 @@ test_import_malformed() {
     } || {
         log_ok "Truncated Burp XML: rejected gracefully (exit non-zero)"
     }
+    check_panic "Truncated Burp XML" "$burp_err"
 
     # Test 2: Completely invalid XML — should fail gracefully
     log_info "Importing invalid Burp XML..."
@@ -1841,6 +1939,7 @@ test_import_malformed() {
     } || {
         log_ok "Invalid Burp XML: rejected gracefully"
     }
+    check_panic "Invalid Burp XML" "$burp_err2"
 
     # Test 3: Sparse Burp data (valid XML, empty/missing fields)
     log_info "Importing sparse Burp XML..."
@@ -1850,6 +1949,7 @@ test_import_malformed() {
     } || {
         log_ok "Sparse Burp XML: rejected gracefully"
     }
+    check_panic "Sparse Burp XML" "$sparse_burp_err"
 
     # Test 4: Completely invalid JSON — should fail gracefully
     log_info "Importing invalid HAR JSON..."
@@ -1862,6 +1962,7 @@ test_import_malformed() {
     } || {
         log_ok "Invalid HAR JSON: rejected gracefully"
     }
+    check_panic "Invalid HAR JSON" "$har_err"
 
     # Test 5: Sparse HAR data (valid JSON, empty/invalid fields)
     log_info "Importing sparse HAR JSON..."
@@ -1871,6 +1972,7 @@ test_import_malformed() {
     } || {
         log_ok "Sparse HAR JSON: rejected gracefully"
     }
+    check_panic "Sparse HAR JSON" "$sparse_har_err"
 
     local duration=$((SECONDS - start))
     if [ $failures -eq 0 ]; then
@@ -1879,6 +1981,83 @@ test_import_malformed() {
     else
         set_test_result "import-malformed" "FAIL" "?" "0" "$duration"
         log_fail "import-malformed: FAILED (${duration}s)"
+    fi
+}
+
+test_ssrf_rejection() {
+    init_test_status "ssrf-rejection"
+    local start=$SECONDS
+    local failures=0
+
+    log_header "Testing: ssrf-rejection (private target rejected without --dangerous-allow-private)"
+
+    # The SSRF frontier gate must REJECT a private/loopback seed when
+    # --dangerous-allow-private is absent. Every other crawl/scan target passes
+    # that bypass flag, so this is the only place the gate is asserted to
+    # actually reject (LAB-3890 T4, gap A4). No server needed — rejection
+    # happens before any connection.
+    local private_url="http://127.0.0.1:9"
+    local out
+    if out=$("$VESPASIAN" crawl "$private_url" -o /dev/null 2>&1); then
+        log_fail "SSRF gate: crawl of ${private_url} succeeded WITHOUT --dangerous-allow-private (gate did not reject)"
+        failures=$((failures + 1))
+    elif printf '%s' "$out" | grep -qiE 'ssrf|private|rejected by frontier|dangerous-allow-private'; then
+        log_ok "SSRF gate: private target correctly rejected"
+    else
+        log_fail "SSRF gate: crawl failed but not via the SSRF gate: $(printf '%s' "$out" | head -1)"
+        failures=$((failures + 1))
+    fi
+
+    local duration=$((SECONDS - start))
+    if [ $failures -eq 0 ]; then
+        set_test_result "ssrf-rejection" "PASS" "-" "-" "$duration"
+        log_ok "ssrf-rejection: PASSED (${duration}s)"
+    else
+        set_test_result "ssrf-rejection" "FAIL" "-" "-" "$duration"
+        log_fail "ssrf-rejection: FAILED (${duration}s)"
+    fi
+}
+
+test_auth_capture() {
+    local target_dir="${RESULTS_DIR}/auth-capture"
+    local imported_file="${target_dir}/imported.json"
+    local fixture="${SCRIPT_DIR}/fixtures/sample-auth.har"
+
+    mkdir -p "$target_dir"
+    init_test_status "auth-capture"
+    local start=$SECONDS
+    local failures=0
+
+    log_header "Testing: auth-capture (Authorization header captured & preserved through import)"
+
+    if ! "$VESPASIAN" import har "$fixture" -o "$imported_file" 2>&1; then
+        log_fail "auth-capture: import of ${fixture} failed"
+        set_test_result "auth-capture" "FAIL" "?" "1" "$((SECONDS - start))"
+        return 1
+    fi
+
+    # The captured request must retain its Authorization header — auth must not
+    # be silently dropped by the pipeline (LAB-3890 T4, gap A5).
+    if grep -q '"Authorization"' "$imported_file" && grep -q 'Bearer test-token-abc123' "$imported_file"; then
+        log_ok "auth-capture: Authorization header preserved in capture"
+    else
+        log_fail "auth-capture: Authorization header missing from imported capture"
+        failures=$((failures + 1))
+    fi
+
+    # KNOWN GAP (LAB-3890 T4 / A5): the generator does not yet emit OpenAPI
+    # securitySchemes from captured auth. Asserting captured-auth -> securitySchemes
+    # requires that generator feature (tracked separately); this target asserts
+    # only that auth is captured/preserved.
+    log_info "auth-capture: NOTE — securitySchemes generation from captured auth is not yet implemented (separate feature)."
+
+    local duration=$((SECONDS - start))
+    if [ $failures -eq 0 ]; then
+        set_test_result "auth-capture" "PASS" "1" "1" "$duration"
+        log_ok "auth-capture: PASSED (${duration}s)"
+    else
+        set_test_result "auth-capture" "FAIL" "?" "1" "$duration"
+        log_fail "auth-capture: FAILED (${duration}s)"
     fi
 }
 
@@ -2421,7 +2600,7 @@ test_crawl_depth() {
 
     log_header "Testing: crawl-depth (deep links and max-pages limit)"
 
-    # Test 1: Crawl with depth=2 should NOT reach level 3+
+    # Test 1: Crawl with depth=2 should NOT reach beyond depth 2
     log_info "Crawling deep links with depth=2..."
     local shallow_capture="${target_dir}/shallow.json"
     if "$VESPASIAN" crawl "${base_url}/api/deep/1" \
@@ -2432,20 +2611,24 @@ test_crawl_depth() {
         --dangerous-allow-private \
         $verbose_flag 2>&1; then
 
-        # Should have levels 1-2, but not 3+
-        local has_deep
-        has_deep=$(python3 - "$shallow_capture" << 'PYEOF' 2>/dev/null || echo "?"
+        # The seed /api/deep/1 is depth 0, so --depth 2 may legitimately reach
+        # /deep/3 (depth 2) but MUST NOT reach /deep/4+ (depth 3+). The old check
+        # flagged /deep/3 and only warned; it now hard-fails on any hop beyond
+        # the requested depth (LAB-3890 T3, gap B2).
+        local beyond_depth
+        beyond_depth=$(python3 - "$shallow_capture" << 'PYEOF' 2>/dev/null || echo "?"
 import json, sys
 data = json.load(open(sys.argv[1]))
 urls = [r['url'] for r in data]
-deep = [u for u in urls if '/deep/3' in u or '/deep/4' in u or '/deep/5' in u]
-print(len(deep))
+beyond = [u for u in urls if '/deep/4' in u or '/deep/5' in u or '/deep/6' in u]
+print(len(beyond))
 PYEOF
         )
-        if [ "$has_deep" = "0" ]; then
-            log_ok "Depth limit: correctly stopped at depth 2"
+        if [ "$beyond_depth" = "0" ]; then
+            log_ok "Depth limit: correctly stopped within depth 2 (no /deep/4+)"
         else
-            log_warn "Depth limit: found ${has_deep} URLs beyond depth 2 (may vary by crawler)"
+            log_fail "Depth limit: found ${beyond_depth} URL(s) beyond depth 2 (/deep/4+) — --depth not enforced"
+            failures=$((failures + 1))
         fi
     else
         log_fail "Shallow crawl failed"
@@ -2465,11 +2648,14 @@ PYEOF
 
         local page_count
         page_count=$(json_len "$limited_capture")
-        # Should be capped around max-pages
+        # max-pages=10 must be enforced. A small margin tolerates in-flight
+        # concurrency, but a broken cap (the many-links page exposes 20 links) is
+        # now a hard failure, not a warning (LAB-3890 T3, gap B2).
         if [ "$page_count" != "?" ] && [ "$page_count" -le 15 ]; then
             log_ok "Max-pages limit: captured ${page_count} requests (limit=10)"
         else
-            log_warn "Max-pages limit: captured ${page_count} requests (expected <=15)"
+            log_fail "Max-pages limit: captured ${page_count} requests (expected <=15) — --max-pages not enforced"
+            failures=$((failures + 1))
         fi
     else
         log_fail "Limited crawl failed"
@@ -2930,8 +3116,8 @@ usage() {
     echo "  --group <name>        Run a predefined target group: offline, live, or all (default: all)"
     echo "  --targets <list>      Comma-separated targets to test (overrides --group)"
     echo "                        Valid targets:"
-    echo "                          Service:    rest-api, soap-service, graphql-server, concat-spa,"
-    echo "                                      concat-spa-two-stage"
+    echo "                          Service:    rest-api, scan-rest, soap-service, graphql-server,"
+    echo "                                      concat-spa, concat-spa-two-stage"
     echo "                          Config:     grpc-server (included via TARGETS_SETUP when set up)"
     echo "                          Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,"
     echo "                                      generate-graphql, generate-graphql-imports,"
@@ -2939,8 +3125,8 @@ usage() {
     echo "                          Import:     import-burp, import-har, import-base64,"
     echo "                                      import-mitmproxy, import-mitmproxy-native,"
     echo "                                      import-unicode, import-duplicates,"
-    echo "                                      import-malformed, import-empty"
-    echo "                          Crawl:      crawl-depth, crawl-unreachable"
+    echo "                                      import-malformed, import-empty, auth-capture"
+    echo "                          Crawl:      crawl-depth, crawl-unreachable, ssrf-rejection"
     echo "                          Edge cases: edge-cases, classifier-edge, spec-edge"
     echo "  --verbose             Enable verbose vespasian output"
     echo "  --no-build            Skip building vespasian and target binaries"
@@ -3057,6 +3243,7 @@ main() {
     for target in "${TARGET_ARRAY[@]}"; do
         case "$target" in
             rest-api)      test_rest_api ;;
+            scan-rest)     test_scan_rest ;;
             soap-service)    test_soap_service ;;
             graphql-server)  test_graphql_server ;;
             grpc-server)     test_grpc_server ;;
@@ -3083,6 +3270,8 @@ main() {
             crawl-unreachable)  test_crawl_unreachable ;;
             classifier-edge)    test_classifier_edge_cases ;;
             spec-edge)          test_spec_edge_cases ;;
+            ssrf-rejection)     test_ssrf_rejection ;;
+            auth-capture)       test_auth_capture ;;
             *)
                 log_fail "Unknown target: $target"
                 init_test_status "$target"

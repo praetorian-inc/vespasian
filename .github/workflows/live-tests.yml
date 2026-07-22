@@ -100,6 +100,19 @@ jobs:
         with:
           node-version: 20
 
+      # LAB-3890 T1: the offline generate-{rest,graphql,wsdl} targets validate
+      # output with real parsers (swagger-parser + graphql-js) instead of grep.
+      # Deps are hermetic once installed; the only egress is registry.npmjs.org
+      # (already in the anticipated harden-runner allowlist above).
+      - name: Install spec validators
+        working-directory: test/spec-validators
+        run: npm ci
+
+      # Fast regression proving the validators reject malformed specs (no grep
+      # false-pass). Needs the validators above + xmllint; no Go build required.
+      - name: Validator regression test
+        run: ./test/validate_test.sh
+
       - name: Build vespasian
         run: go build -o bin/vespasian ./cmd/vespasian
 

@@ -4,6 +4,21 @@
 # Shared validation functions for vespasian live tests.
 # Source this file from run-live-tests.sh.
 
+# Directory containing this script, used to locate the Node spec-validators
+# package (LAB-3890 T1). validate.sh is sourced, so resolve from BASH_SOURCE.
+VALIDATE_SH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SPEC_VALIDATORS_DIR="${VALIDATE_SH_DIR}/spec-validators"
+
+# _ensure_spec_validators fails with an actionable message if the Node
+# validator dependencies have not been installed.
+_ensure_spec_validators() {
+    if [ ! -d "${SPEC_VALIDATORS_DIR}/node_modules" ]; then
+        log_fail "spec-validators deps missing — run: (cd ${SPEC_VALIDATORS_DIR} && npm ci)"
+        return 1
+    fi
+    return 0
+}
+
 # validate_path_coverage checks that all expected paths exist in a generated OpenAPI spec.
 # Usage: validate_path_coverage <spec_file> <expected_paths_json>
 # Returns 0 if all paths found, 1 otherwise.
@@ -92,7 +107,10 @@ PYEOF
     return 0
 }
 
-# validate_openapi_structure checks that the spec file has required OpenAPI fields.
+# validate_openapi_structure validates an OpenAPI document with a real parser.
+# LAB-3890 T1: replaces the old grep-for-top-level-keys check (which passed any
+# file merely containing "openapi:"/"info:"/"paths:"). Uses swagger-parser,
+# which validates against the OpenAPI 3.0 schema and resolves $refs.
 # Usage: validate_openapi_structure <spec_file>
 validate_openapi_structure() {
     local spec_file=$1
@@ -101,28 +119,10 @@ validate_openapi_structure() {
         log_fail "Spec file not found: $spec_file"
         return 1
     fi
+    _ensure_spec_validators || return 1
 
     local result rc=0
-    result=$(python3 - "$spec_file" << 'PYEOF'
-import sys, re
-
-with open(sys.argv[1]) as f:
-    content = f.read()
-
-# Check for required top-level YAML keys (not indented, not in comments)
-required = ["openapi", "info", "paths"]
-missing = []
-for key in required:
-    # Match key at start of line (no leading whitespace), not in a comment
-    if not re.search(r'^' + re.escape(key) + r'\s*:', content, re.MULTILINE):
-        missing.append(key + ":")
-
-if missing:
-    print("MISSING fields: " + ", ".join(missing))
-    sys.exit(1)
-print("OK: valid OpenAPI structure")
-PYEOF
-    ) || rc=$?
+    result=$(node "${SPEC_VALIDATORS_DIR}/validate-openapi.mjs" "$spec_file" 2>&1) || rc=$?
 
     if [ $rc -ne 0 ]; then
         log_fail "OpenAPI structure: $result"
@@ -265,7 +265,11 @@ PYEOF
     return 0
 }
 
-# validate_soap_operations checks that WSDL output contains expected operations.
+# validate_soap_operations validates a WSDL with a real XML parser and checks
+# that the expected operations are present as EXACT portType operation names.
+# LAB-3890 T1: replaces the old substring check (`GetUser` false-passed on
+# `GetUserList`, and names in comments false-passed). Uses xmllint for
+# well-formedness + exact operation-name extraction, jq to read expected ops.
 # Usage: validate_soap_operations <wsdl_file> <expected_json>
 validate_soap_operations() {
     local wsdl_file=$1
@@ -276,34 +280,37 @@ validate_soap_operations() {
         return 1
     fi
 
-    local result rc=0
-    result=$(python3 - "$wsdl_file" "$expected_json" << 'PYEOF'
-import json, sys
-
-with open(sys.argv[1]) as f:
-    content = f.read()
-
-with open(sys.argv[2]) as f:
-    expected = json.load(f)
-
-missing = []
-for op in expected["operations"]:
-    if op not in content:
-        missing.append(op)
-
-if missing:
-    print("MISSING operations: " + ", ".join(missing))
-    sys.exit(1)
-
-print("OK: all %d operations found" % len(expected["operations"]))
-PYEOF
-    ) || rc=$?
-
-    if [ $rc -ne 0 ]; then
-        log_fail "SOAP operations: $result"
+    # Real XML parse: reject WSDL that is not well-formed.
+    if ! xmllint --noout "$wsdl_file" 2>/dev/null; then
+        log_fail "SOAP operations: WSDL is not well-formed XML"
         return 1
     fi
-    log_ok "SOAP operations: $result"
+
+    # Exact set of portType operation names (namespace-agnostic via local-name).
+    local actual_ops
+    actual_ops=$(xmllint --xpath \
+        '//*[local-name()="portType"]/*[local-name()="operation"]/@name' \
+        "$wsdl_file" 2>/dev/null \
+        | grep -oE 'name="[^"]*"' | sed -E 's/name="([^"]*)"/\1/' | sort -u)
+
+    local missing=()
+    local op
+    while IFS= read -r op; do
+        [ -z "$op" ] && continue
+        if ! grep -qxF -- "$op" <<< "$actual_ops"; then
+            missing+=("$op")
+        fi
+    done < <(jq -r '.operations[]' "$expected_json")
+
+    if [ ${#missing[@]} -ne 0 ]; then
+        local IFS=", "
+        log_fail "SOAP operations: MISSING operations: ${missing[*]}"
+        return 1
+    fi
+
+    local total
+    total=$(jq -r '.operations | length' "$expected_json")
+    log_ok "SOAP operations: all ${total} operations found (exact match)"
     return 0
 }
 
@@ -355,7 +362,9 @@ PYEOF
     return 0
 }
 
-# validate_graphql_structure checks that a GraphQL SDL file has basic structural validity.
+# validate_graphql_structure validates a GraphQL SDL file with a real parser.
+# LAB-3890 T1: replaces the old check for the literals "type Query {" + "}".
+# Uses graphql-js buildSchema + validateSchema.
 # Usage: validate_graphql_structure <sdl_file>
 validate_graphql_structure() {
     local sdl_file=$1
@@ -364,28 +373,10 @@ validate_graphql_structure() {
         log_fail "SDL file not found: $sdl_file"
         return 1
     fi
+    _ensure_spec_validators || return 1
 
     local result rc=0
-    result=$(python3 - "$sdl_file" << 'PYEOF'
-import sys
-
-with open(sys.argv[1]) as f:
-    content = f.read()
-
-checks = []
-if "type Query {" not in content:
-    checks.append("missing 'type Query'")
-if "}" not in content:
-    checks.append("missing closing braces")
-if len(content.strip()) < 50:
-    checks.append("suspiciously short (%d chars)" % len(content.strip()))
-
-if checks:
-    print("INVALID: " + ", ".join(checks))
-    sys.exit(1)
-print("OK: valid GraphQL SDL structure")
-PYEOF
-    ) || rc=$?
+    result=$(node "${SPEC_VALIDATORS_DIR}/validate-graphql.mjs" "$sdl_file" 2>&1) || rc=$?
 
     if [ $rc -ne 0 ]; then
         log_fail "GraphQL structure: $result"
