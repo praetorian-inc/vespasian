@@ -795,3 +795,74 @@ func TestAnalyze_SinglePassOversizedCount(t *testing.T) {
 		t.Errorf("expected at least 3 requests, got %d", len(res.Requests))
 	}
 }
+
+// TestAnalyze_DeterministicSynthesizedOrder verifies that Analyze emits the
+// synthesized static:js entries in a stable, capture-determined order across
+// runs (LAB-4678 Phase 2), despite the worker pool fanning results in in
+// non-deterministic completion order. Multiple bundles with literal fetch
+// paths give the pool real work to reorder.
+func TestAnalyze_DeterministicSynthesizedOrder(t *testing.T) {
+	mkBundle := func(url, body string) crawl.ObservedRequest {
+		return crawl.ObservedRequest{
+			Method: "GET", URL: url,
+			Response: crawl.ObservedResponse{
+				StatusCode: 200, ContentType: "application/javascript", Body: []byte(body),
+			},
+		}
+	}
+	captured := []crawl.ObservedRequest{
+		mkBundle("https://ex.com/a.js", `fetch("/api/alpha");fetch("/api/bravo")`),
+		mkBundle("https://ex.com/b.js", `fetch("/api/charlie");fetch("/api/delta")`),
+		mkBundle("https://ex.com/c.js", `fetch("/api/echo");fetch("/api/foxtrot")`),
+		mkBundle("https://ex.com/d.js", `fetch("/api/golf");fetch("/api/hotel")`),
+	}
+
+	extractOrder := func() []string {
+		res, err := Analyze(context.Background(), captured, Options{Concurrency: 4})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var urls []string
+		for _, r := range res.Requests[len(captured):] { // synthesized tail only
+			urls = append(urls, r.Method+" "+r.URL)
+		}
+		return urls
+	}
+
+	first := extractOrder()
+	if len(first) == 0 {
+		t.Fatal("expected synthesized endpoints, got none")
+	}
+	// Repeated runs must produce byte-identical ordering.
+	for i := 0; i < 8; i++ {
+		got := extractOrder()
+		if !stringsEqual(first, got) {
+			t.Fatalf("synthesized order not deterministic across runs:\n first=%v\n run%d=%v", first, i, got)
+		}
+	}
+	// And that order must be the sorted order (URL, then method).
+	if !sortedByURLMethod(first) {
+		t.Errorf("synthesized entries not in sorted order: %v", first)
+	}
+}
+
+func stringsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sortedByURLMethod(xs []string) bool {
+	for i := 1; i < len(xs); i++ {
+		if xs[i-1] > xs[i] {
+			return false
+		}
+	}
+	return true
+}
