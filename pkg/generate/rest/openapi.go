@@ -15,6 +15,7 @@
 package rest
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -134,6 +135,12 @@ func extractServers(endpoints []classify.ClassifiedRequest) (openapi3.Servers, s
 			servers = append(servers, &openapi3.Server{URL: baseURL})
 		}
 	}
+
+	// Sort servers so the list order and the derived title are independent of
+	// the crawl's capture order (LAB-4678). Same-origin scans have a single
+	// server (a no-op sort); same-domain scans can observe several hosts whose
+	// first-seen order would otherwise vary run-to-run.
+	sort.Slice(servers, func(i, j int) bool { return servers[i].URL < servers[j].URL })
 
 	if len(servers) > 0 {
 		// Use first server's host for title
@@ -270,6 +277,36 @@ func mergeJSONBodies(bodies [][]byte) *openapi3.SchemaRef {
 // emitSource controls whether the x-vespasian-source extension is set on the operation.
 // It should be true only when at least one request in the entire Generate input carries
 // a "static:*" Source value (so flag-off output stays byte-identical to pre-LAB-2108).
+// maxSchemaUnionDepth bounds the recursion in unionSchemaProperties against a
+// pathological or deeply-nested inferred schema.
+const maxSchemaUnionDepth = 12
+
+// unionSchemaProperties merges src's object properties into dst additively
+// (LAB-4678 Phase 3): a property present in src but missing from dst is added,
+// and a property present in both whose value is itself an object is merged
+// recursively, so fields observed in only some responses of the same
+// endpoint+status are preserved rather than dropped after the first observation.
+// It never removes or retypes an existing property, so it cannot narrow the
+// documented schema. depth bounds the recursion.
+func unionSchemaProperties(dst, src *openapi3.Schema, depth int) {
+	if dst == nil || src == nil || depth <= 0 {
+		return
+	}
+	if dst.Properties == nil || src.Properties == nil {
+		return
+	}
+	for name, srcRef := range src.Properties {
+		dstRef, exists := dst.Properties[name]
+		if !exists {
+			dst.Properties[name] = srcRef
+			continue
+		}
+		if dstRef != nil && dstRef.Value != nil && srcRef != nil && srcRef.Value != nil {
+			unionSchemaProperties(dstRef.Value, srcRef.Value, depth-1)
+		}
+	}
+}
+
 func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSource bool) *openapi3.Operation { //nolint:gocyclo // OpenAPI operation builder
 	operation := &openapi3.Operation{
 		Summary:   capitalizeFirst(key.method) + " " + key.path,
@@ -279,6 +316,37 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 	if len(group) == 0 {
 		return operation
 	}
+
+	// Order the group deterministically before any first-seen-wins logic below
+	// (LAB-4678, M3). A group holds every observation that normalized to this
+	// path+method, including multiple dedup entries with distinct request
+	// bodies, each carrying its own response. The response merge (per status
+	// code) keeps the first-seen response as the base, and the query-param and
+	// body unions consume the group in order. The group arrives in the crawl's
+	// capture order — nondeterministic — so without this sort the documented
+	// response (and any conflict tie-break) could differ run-to-run for a fixed
+	// input. Each entry's response was already selected deterministically in
+	// classify.Deduplicate; ordering the entries makes their combination
+	// deterministic too. Key: URL, method, request body, then response fields.
+	sort.SliceStable(group, func(i, j int) bool {
+		a, b := group[i], group[j]
+		if a.URL != b.URL {
+			return a.URL < b.URL
+		}
+		if a.Method != b.Method {
+			return a.Method < b.Method
+		}
+		if c := bytes.Compare(a.Body, b.Body); c != 0 {
+			return c < 0
+		}
+		if a.Response.StatusCode != b.Response.StatusCode {
+			return a.Response.StatusCode < b.Response.StatusCode
+		}
+		if a.Response.ContentType != b.Response.ContentType {
+			return a.Response.ContentType < b.Response.ContentType
+		}
+		return bytes.Compare(a.Response.Body, b.Response.Body) < 0
+	})
 
 	// --- Query parameters: collect union from all endpoints, track frequency, values, and multi-value ---
 	type queryParamInfo struct {
@@ -460,20 +528,31 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 		}
 
 		if existing, ok := seenStatus[statusCode]; ok {
-			// Merge response body schema if both are objects
-			if len(ep.Response.Body) > 0 && existing.Value != nil && existing.Value.Content != nil {
+			// Merge response body schema if this observation has a JSON body.
+			// The base (first observation of this status in the deterministically
+			// sorted group) may itself be a half-captured empty response, so we
+			// must also ADOPT a populated schema when the base has none — not
+			// only union into an already-populated base. Otherwise a populated
+			// observation is silently dropped whenever an empty one sorts first
+			// (review finding 002).
+			if len(ep.Response.Body) > 0 && existing.Value != nil {
 				// Only infer JSON schema for JSON-compatible content types
 				ct := strings.ToLower(ep.Response.ContentType)
 				if ct == "" || strings.Contains(ct, "json") {
 					newSchema := InferSchema(ep.Response.Body)
 					if newSchema != nil && newSchema.Value != nil && newSchema.Value.Properties != nil {
-						if mt := existing.Value.Content["application/json"]; mt != nil && mt.Schema != nil &&
-							mt.Schema.Value != nil && mt.Schema.Value.Properties != nil {
-							for propName, propSchema := range newSchema.Value.Properties {
-								if _, exists := mt.Schema.Value.Properties[propName]; !exists {
-									mt.Schema.Value.Properties[propName] = propSchema
-								}
+						if existing.Value.Content == nil {
+							// Base had no body; adopt this populated schema.
+							existing.Value.Content = openapi3.Content{
+								"application/json": &openapi3.MediaType{Schema: newSchema},
 							}
+						} else if mt := existing.Value.Content["application/json"]; mt != nil && mt.Schema != nil &&
+							mt.Schema.Value != nil && mt.Schema.Value.Properties != nil {
+							// Union additively and recursively (LAB-4678 Phase 3):
+							// a field seen in only some observations of this
+							// endpoint+status is preserved even when nested under a
+							// shared parent object, not just at the top level.
+							unionSchemaProperties(mt.Schema.Value, newSchema.Value, maxSchemaUnionDepth)
 						}
 					}
 				}

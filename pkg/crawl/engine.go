@@ -31,6 +31,22 @@ import (
 // DefaultStableWait is the default DOM stability wait duration.
 const DefaultStableWait = 3 * time.Second
 
+// Completion-driven capture bounds (LAB-4678 Phase 1). After DOM stability the
+// crawl waits for the network to go quiet instead of a fixed settle window, so
+// late and dynamic XHR/fetch calls are captured. The wait is bounded by:
+//   - a floor: a minimum wait even when the network already looks idle,
+//   - a quiet period: how long the network must be idle before stopping,
+//   - a per-request timeout: the age after which a still-pending request no
+//     longer counts as in-flight, so one hung request cannot stall the wait.
+//
+// The ceiling is the per-page PageTimeout, already applied to the page.
+const (
+	DefaultNetworkIdleFloor   = 500 * time.Millisecond
+	DefaultNetworkQuietPeriod = 500 * time.Millisecond
+	DefaultPerRequestTimeout  = 10 * time.Second
+	networkIdlePollInterval   = 100 * time.Millisecond
+)
+
 // ---- operator-message helpers ----
 
 // flagDangerousAllowPrivate is the CLI flag name that disables SSRF protection
@@ -95,12 +111,23 @@ func redactSeedURL(raw string) string {
 type engineOptions struct {
 	Concurrency   int               // concurrent tabs (0 → DefaultConcurrency)
 	MaxPages      int               // max pages to visit (0 → unlimited)
+	MaxRequests   int               // max captured requests before stopping (0 → unlimited); a rate/politeness bound distinct from MaxPages
 	MaxDepth      int               // max crawl depth
 	PageTimeout   time.Duration     // per-page navigation timeout (0 → 30s)
 	StableTimeout time.Duration     // DOM stability wait (0 → DefaultStableWait)
 	Headers       map[string]string // custom headers injected into every page
 	ScopeCheck    func(string) bool // returns true if a URL is in scope
 	Stderr        io.Writer         // user-facing status messages
+
+	// Completion-driven capture bounds (0 → the Default* above).
+	NetworkIdleFloor   time.Duration // minimum wait after DOM stability
+	NetworkQuietPeriod time.Duration // idle duration required before stopping
+	PerRequestTimeout  time.Duration // age after which a pending request stops counting in-flight
+
+	// Interact enables the opt-in interaction pass (clicks / client-side route
+	// changes) to surface interaction-only endpoints. Off by default — clicking
+	// can mutate state, so it must be explicitly requested (LAB-4678 Phase 2).
+	Interact bool
 }
 
 // rodEngine implements a concurrent headless crawl using go-rod. It connects
@@ -126,6 +153,15 @@ func newRodEngine(wsURL string, opts engineOptions) (*rodEngine, error) {
 	}
 	if opts.StableTimeout <= 0 {
 		opts.StableTimeout = DefaultStableWait
+	}
+	if opts.NetworkIdleFloor <= 0 {
+		opts.NetworkIdleFloor = DefaultNetworkIdleFloor
+	}
+	if opts.NetworkQuietPeriod <= 0 {
+		opts.NetworkQuietPeriod = DefaultNetworkQuietPeriod
+	}
+	if opts.PerRequestTimeout <= 0 {
+		opts.PerRequestTimeout = DefaultPerRequestTimeout
 	}
 
 	browser := rod.New().ControlURL(wsURL)
@@ -164,41 +200,40 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 			"pass %s", redactSeedURL(seedURL), flagDangerousAllowPrivate)
 	}
 
-	// Track page count for MaxPages enforcement. The onResult callback in
-	// Crawler.crawlHeadless also tracks this, but we need our own counter
-	// here to stop launching new pages.
+	// Track pages VISITED for MaxPages enforcement (LAB-4678, A1). The budget
+	// counts pages (URLs visited), not captured requests: a single SPA page can
+	// fire dozens of XHR/fetch calls, so counting requests truncated the crawl
+	// far earlier than "max pages" implies, and hard-canceling the shared
+	// context when the count was hit abandoned in-flight tabs mid-capture —
+	// dropping part of a page's surface and varying the emitted set run-to-run.
+	// Workers now reserve a page slot under this mutex before visiting and stop
+	// taking new pages once the budget is reached, so pages already in flight
+	// finalize and emit all of their captured requests, and the crawl is no
+	// longer canceled mid-page.
+	//
+	// MaxRequests (LAB-4678 Phase 3) is a second, independent budget: a
+	// rate/politeness bound on the total number of captured requests, distinct
+	// from the crawl-breadth MaxPages. It stops enqueuing new pages once the
+	// captured-request count reaches the bound; like MaxPages it is graceful —
+	// pages already in flight finish and emit their requests, so the final count
+	// can slightly exceed the bound rather than cutting a page mid-capture.
 	var (
 		mu        sync.Mutex
 		pageCount int
+		reqCount  int
 	)
 
+	// crawlCtx still derives from ctx so the parent's timeout/cancellation
+	// propagates to the workers; the budget no longer cancels it.
 	crawlCtx, crawlCancel := context.WithCancel(ctx)
 	defer crawlCancel()
-
-	// wrappedOnResult passes results to the caller and tracks page count.
-	wrappedOnResult := func(req ObservedRequest) {
-		mu.Lock()
-		if e.opts.MaxPages > 0 && pageCount >= e.opts.MaxPages {
-			mu.Unlock()
-			return
-		}
-		pageCount++
-		hitMax := e.opts.MaxPages > 0 && pageCount >= e.opts.MaxPages
-		mu.Unlock()
-
-		onResult(req)
-
-		if hitMax {
-			crawlCancel()
-		}
-	}
 
 	var wg sync.WaitGroup
 	for i := range e.opts.Concurrency {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			e.worker(crawlCtx, id, wrappedOnResult)
+			e.worker(crawlCtx, id, onResult, &mu, &pageCount, &reqCount)
 		}(i)
 	}
 
@@ -213,15 +248,41 @@ func (e *rodEngine) Close() error {
 	return e.browser.Close()
 }
 
+// budgetReached reports whether either crawl budget has been hit: the page
+// budget (pages visited) or the request budget (captured requests). A budget of
+// 0 means unlimited for that dimension. Callers must hold the shared mutex that
+// guards pageCount and reqCount. Both budgets are graceful — this gates only the
+// start of a new page; pages already in flight finish and emit their requests.
+func budgetReached(pageCount, maxPages, reqCount, maxRequests int) bool {
+	if maxPages > 0 && pageCount >= maxPages {
+		return true
+	}
+	if maxRequests > 0 && reqCount >= maxRequests {
+		return true
+	}
+	return false
+}
+
 // worker is the per-tab goroutine. It takes URLs from the frontier, visits
 // each one in a fresh tab, captures network events, extracts links, and pushes
 // discovered URLs back to the frontier.
-func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRequest)) {
+func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRequest), mu *sync.Mutex, pageCount, reqCount *int) {
+	maxPages := e.opts.MaxPages
+	maxRequests := e.opts.MaxRequests
 	for {
 		// Check context before blocking on Pop.
 		if ctx.Err() != nil {
 			return
 		}
+
+		// Stop taking new pages once either budget is reached. Pages already
+		// being visited by other workers still finalize below.
+		mu.Lock()
+		if budgetReached(*pageCount, maxPages, *reqCount, maxRequests) {
+			mu.Unlock()
+			return
+		}
+		mu.Unlock()
 
 		entry, ok := e.frontier.Pop()
 		if !ok {
@@ -230,6 +291,21 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		// MarkActive is NOT called here: Pop atomically increments the active
 		// counter before returning, making dequeue+activate a single critical
 		// section. Callers only need MarkIdle() after processing completes.
+
+		// Reserve this page's budget slot before visiting. Another worker may
+		// have reached a budget while we were blocked in Pop waiting for a
+		// link; if so, release the entry without visiting so the crawl never
+		// starts a page past a budget. Reserving before the visit (rather than
+		// counting after) keeps the page cap exact instead of overshooting by
+		// up to Concurrency pages.
+		mu.Lock()
+		if budgetReached(*pageCount, maxPages, *reqCount, maxRequests) {
+			mu.Unlock()
+			e.frontier.MarkIdle()
+			return
+		}
+		*pageCount++
+		mu.Unlock()
 
 		requests, links, err := e.visitPage(ctx, entry)
 		if err != nil {
@@ -244,13 +320,18 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 			continue
 		}
 
-		// Emit captured requests.
+		// Emit captured requests and count them toward the MaxRequests budget.
+		// Counting emitted requests (not just page loads) is what makes the
+		// budget a request-rate bound distinct from MaxPages.
 		for _, req := range requests {
 			if ctx.Err() != nil {
 				e.frontier.MarkIdle()
 				return
 			}
 			onResult(req)
+			mu.Lock()
+			*reqCount++
+			mu.Unlock()
 		}
 
 		// Push discovered links at depth+1.
@@ -332,21 +413,64 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 		}
 	}
 
-	// Give network events a brief moment to settle after DOM stability.
-	// This catches late XHR/fetch calls triggered by mutation observers
-	// or intersection observers that fire during DOM stabilization.
-	settle := time.NewTimer(200 * time.Millisecond)
-	select {
-	case <-settle.C:
-	case <-ctx.Done():
-		settle.Stop()
-		return capture.Results(), nil, nil
+	// Wait for the network to go quiet instead of a fixed settle window, so
+	// late and dynamic XHR/fetch calls (mutation/intersection observers, delayed
+	// data loads) are captured rather than dropped (LAB-4678 Phase 1). Bounded by
+	// a floor, a quiet period, a per-request timeout, and the page ceiling; see
+	// waitForNetworkIdle. Returns whatever was captured so far if ctx is canceled.
+	e.waitForNetworkIdle(ctx, capture)
+
+	// Optionally exercise the page (clicks / client-side route changes) to
+	// surface endpoints that only fire on interaction, then snapshot everything
+	// captured — baseline plus interaction-triggered (LAB-4678 Phase 2). Opt-in,
+	// off by default.
+	if e.opts.Interact {
+		e.interactPage(ctx, page, capture)
 	}
+	capturedResults := capture.Results()
 
 	// Extract links, run jsluice, and discover forms from the stabilized page.
-	capturedResults := capture.Results()
 	results, links := enrichFromPage(page, capturedResults, target.URL, e.opts.Stderr, e.opts.ScopeCheck)
 	return results, links, nil
+}
+
+// waitForNetworkIdle blocks until the page's network goes quiet or a bound is
+// hit, then returns the captured requests (LAB-4678 Phase 1). It replaces the
+// previous fixed 200ms settle so late/dynamic requests are captured. It stops
+// when the elapsed wait reaches the ceiling (PageTimeout); or, once past the
+// floor, when no requests are in flight and the network has been quiet for the
+// quiet period; or when ctx is canceled (returning whatever was captured so far).
+func (e *rodEngine) waitForNetworkIdle(ctx context.Context, capture *pageNetworkCapture) []ObservedRequest {
+	start := time.Now()
+	ticker := time.NewTicker(networkIdlePollInterval)
+	defer ticker.Stop()
+	for {
+		now := time.Now()
+		inFlight, sinceActivity := capture.networkState(e.opts.PerRequestTimeout, now)
+		if networkIdleReached(inFlight, sinceActivity, now.Sub(start),
+			e.opts.NetworkIdleFloor, e.opts.PageTimeout, e.opts.NetworkQuietPeriod) {
+			return capture.Results()
+		}
+		select {
+		case <-ctx.Done():
+			return capture.Results()
+		case <-ticker.C:
+		}
+	}
+}
+
+// networkIdleReached is the pure stop decision for waitForNetworkIdle, split out
+// so it is unit-testable without a browser. Stop when the ceiling is reached, or
+// once past the floor with nothing in flight and a quiet period since the last
+// network activity.
+func networkIdleReached(inFlight int, sinceActivity, elapsed, floor, ceiling, quiet time.Duration) bool {
+	if elapsed >= ceiling {
+		return true
+	}
+	if elapsed < floor {
+		return false
+	}
+	return inFlight == 0 && sinceActivity >= quiet
 }
 
 // enrichFromPage extracts links from the DOM, runs jsluice on JS sources and
@@ -456,6 +580,23 @@ func mergeEnrichedLinks(
 	pageURL, baseURL string,
 	scopeFn func(string) bool,
 ) ([]ObservedRequest, []string) {
+	// Scope-filter passively captured network requests (LAB-4678 Phase 1). The
+	// browser fires requests to third-party hosts (analytics, CDNs, external
+	// APIs) that are out of the crawl scope; without this they flow into the
+	// capture and surface as endpoints and OpenAPI `servers`. Frontier links and
+	// form actions are already scope-checked (Push, and the form loop below);
+	// this closes the corresponding gap on the passively-captured requests. A
+	// nil scopeFn means no filtering, matching the form-action convention.
+	if scopeFn != nil {
+		inScope := make([]ObservedRequest, 0, len(captured))
+		for _, r := range captured {
+			if scopeFn(r.URL) {
+				inScope = append(inScope, r)
+			}
+		}
+		captured = inScope
+	}
+
 	links := slices.Clone(domLinks)
 
 	if len(jsFromResponses) > 0 {

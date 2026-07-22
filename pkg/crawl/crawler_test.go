@@ -298,3 +298,40 @@ func TestCrawl_MaxPagesPath_ReturnsNoError(t *testing.T) {
 		t.Errorf("Crawl() returned %d results, want at most 2 (MaxPages)", len(results))
 	}
 }
+
+// TestCrawl_MaxRequests_HTTPBackend verifies the request budget bounds the
+// net/http backend (LAB-4678 Phase 3). That backend records one request per
+// page, so MaxRequests caps the captured-request count just as MaxPages would.
+func TestCrawl_MaxRequests_HTTPBackend(t *testing.T) {
+	var requestCount int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requestCount++
+		n := requestCount
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<html><body><a href="/page%d">next</a></body></html>`, n+1)
+	}))
+	defer srv.Close()
+
+	crawler := NewCrawler(CrawlerOptions{
+		Depth:        10,
+		MaxPages:     1000, // high, so MaxRequests is the binding bound
+		MaxRequests:  3,
+		Timeout:      30 * time.Second,
+		Headless:     false,
+		AllowPrivate: true,
+	})
+
+	results, err := crawler.Crawl(context.Background(), srv.URL)
+	if err != nil {
+		t.Errorf("Crawl() unexpected error: %v", err)
+	}
+	if len(results) == 0 {
+		t.Error("Crawl() returned 0 results, want at least 1")
+	}
+	if len(results) > 3 {
+		t.Errorf("Crawl() returned %d results, want at most 3 (MaxRequests)", len(results))
+	}
+}

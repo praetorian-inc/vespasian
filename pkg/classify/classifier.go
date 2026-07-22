@@ -17,6 +17,7 @@ package classify
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"mime"
 	"net/url"
@@ -25,6 +26,19 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 )
+
+// DefaultConfidenceThreshold is the default minimum confidence for a request to
+// be classified as an API. It is single-sourced here and referenced by the SDK
+// and CLI defaults so the threshold is documented rather than a bare literal
+// scattered across entry points (LAB-4678).
+const DefaultConfidenceThreshold = 0.5
+
+// NearMissFloor is the minimum confidence a dropped request must reach to be
+// reported as a below-threshold near-miss under -v (LAB-4678 Phase 1). It is
+// above zero so static assets and zero-signal requests (which score 0) are not
+// logged as noise, but low enough to surface an endpoint that showed real signal
+// (e.g. the path heuristic alone, 0.15) yet fell under the API threshold.
+const NearMissFloor = 0.1
 
 // APIClassifier determines if a request is an API call.
 type APIClassifier interface {
@@ -92,6 +106,66 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 	return results
 }
 
+// NearMisses returns requests that classified with floor <= confidence <
+// threshold: endpoints dropped for being below the API threshold but that still
+// showed some signal. It is used only for -v near-miss logging so an operator
+// can see why an expected endpoint is MISSING from the spec (LAB-4678 Phase 1).
+// Selection mirrors RunClassifiers (highest-confidence classifier wins) but keeps
+// the sub-threshold band instead of discarding it; requests scoring below floor
+// (static assets, zero-signal) are excluded.
+func NearMisses(classifiers []APIClassifier, requests []crawl.ObservedRequest, floor, threshold float64) []ClassifiedRequest {
+	var results []ClassifiedRequest
+	for _, req := range requests {
+		var best ClassifiedRequest
+		best.ObservedRequest = req
+
+		for _, classifier := range classifiers {
+			var isAPI bool
+			var confidence float64
+			var reason string
+
+			if dc, ok := classifier.(DetailedClassifier); ok {
+				isAPI, confidence, reason = dc.ClassifyDetail(req)
+			} else {
+				isAPI, confidence = classifier.Classify(req)
+				reason = "classified by " + classifier.Name()
+			}
+
+			if confidence > best.Confidence {
+				best.IsAPI = isAPI
+				best.Confidence = confidence
+				best.APIType = classifier.Name()
+				best.Reason = reason
+			}
+		}
+
+		if best.Confidence >= floor && best.Confidence < threshold {
+			results = append(results, best)
+		}
+	}
+	return results
+}
+
+// canonicalHost returns u's host lowercased with a default port (80 for http,
+// 443 for https) stripped, so the dedup key treats example.com,
+// EXAMPLE.com:443, and example.com as the same host. Mirrors the host handling
+// in crawl.normalizeURL.
+func canonicalHost(u *url.URL) string {
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return ""
+	}
+	port := u.Port()
+	if port == "" {
+		return host
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		return host
+	}
+	return host + ":" + port
+}
+
 // Deduplicate removes duplicate classified requests, keeping the highest confidence.
 // The deduplication key is METHOD:path (query params and fragments stripped).
 // Multi-value QueryParams from duplicate observations are merged with union-of-values,
@@ -120,11 +194,16 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest { //nolint:
 			continue
 		}
 
-		// Dedup key intentionally omits host: the crawl layer's scope
-		// restrictions (same-origin / same-domain) make cross-host
-		// duplicates unlikely, and consolidating by path is the desired
-		// behavior for single-target scans.
-		key := req.Method + ":" + parsedURL.Path
+		// Dedup key includes a canonical host (LAB-4678 Phase 1). Omitting it
+		// (the prior behavior) rested on a now-false "cross-host duplicates are
+		// unlikely" assumption: a same-domain scan legitimately observes several
+		// in-scope hosts (e.g. api.example.com and www.example.com), and merging
+		// their identical paths dropped one host's response and query params.
+		// Same-origin scans have a single host, so the key is unchanged for them.
+		// The OpenAPI generator groups by path (host-blind) and lists hosts as
+		// servers, so keeping per-host observations distinct here only makes the
+		// downstream union more complete.
+		key := req.Method + ":" + canonicalHost(parsedURL) + ":" + parsedURL.Path
 
 		// For SOAP endpoints, include SOAPAction in the dedup key so distinct
 		// operations on the same URL path are preserved.
@@ -208,12 +287,27 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest { //nolint:
 			// that's the regression this tracking exists to prevent.)
 			existing.req.MultiValueQueryKeys = mergeMultiValueKeys(existing.req.MultiValueQueryKeys, req.MultiValueQueryKeys)
 
-			// Keep highest confidence, but preserve first occurrence's body/response.
+			// Keep highest confidence. Confidence/reason selection is
+			// independent of response selection below: whether the endpoint is
+			// an API (confidence) and which captured response documents it are
+			// orthogonal concerns, and both are chosen order-independently so a
+			// fixed capture yields the same result regardless of the order in
+			// which duplicate observations were captured.
 			if req.Confidence > existing.req.Confidence {
 				existing.req.Confidence = req.Confidence
 				existing.req.Reason = req.Reason
 				existing.req.APIType = req.APIType
 			}
+
+			// Select the retained response deterministically (LAB-4678, A4).
+			// Previously the first-seen observation's response was kept, but the
+			// input order is the crawl's capture order — a nondeterministic Go
+			// map iteration (pkg/crawl/network.go Results()) — so the documented
+			// response schema could differ run-to-run even when the endpoint set
+			// was identical. preferredResponse is order-free: it prefers a
+			// populated response over an empty (half-captured) one and breaks
+			// ties on a stable content fingerprint.
+			existing.req.Response = preferredResponse(existing.req.Response, req.Response)
 		}
 	}
 
@@ -222,6 +316,56 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest { //nolint:
 		results = append(results, seen[key].req)
 	}
 	return results
+}
+
+// responsePopulated reports whether an observed response carries usable content.
+// A half-captured response (the request was recorded on NetworkRequestWillBeSent
+// but its NetworkLoadingFinished had not fired when the crawl read results) has
+// a zero status and empty content-type/body; such a response documents nothing.
+func responsePopulated(r crawl.ObservedResponse) bool {
+	return r.StatusCode > 0 && (len(r.Body) > 0 || r.ContentType != "")
+}
+
+// responseFingerprint returns a stable content hash of a response over its
+// status, content-type, and body. It is used only as an order-independent
+// tie-break in preferredResponse; the field separators keep distinct splits
+// from colliding.
+func responseFingerprint(r crawl.ObservedResponse) [sha256.Size]byte {
+	h := sha256.New()
+	var status [8]byte
+	binary.BigEndian.PutUint64(status[:], uint64(r.StatusCode)) //nolint:gosec // status is a small non-negative HTTP code; wrap is irrelevant to a hash key
+	h.Write(status[:])
+	h.Write([]byte{0})
+	h.Write([]byte(r.ContentType))
+	h.Write([]byte{0})
+	h.Write(r.Body)
+	var sum [sha256.Size]byte
+	copy(sum[:], h.Sum(nil))
+	return sum
+}
+
+// preferredResponse deterministically selects which of two responses observed
+// for the same deduplicated endpoint should be retained. Selection is
+// independent of argument order so a fixed capture yields the same documented
+// response regardless of the (nondeterministic) order in which the crawl
+// captured the duplicate observations (LAB-4678, A4):
+//  1. A populated response beats an unpopulated (half-captured) one — a real
+//     response documents the endpoint better than an empty placeholder.
+//  2. When both are populated (or both empty), the response with the smaller
+//     content fingerprint wins, an order-free tie-break.
+func preferredResponse(a, b crawl.ObservedResponse) crawl.ObservedResponse {
+	ap, bp := responsePopulated(a), responsePopulated(b)
+	if ap != bp {
+		if bp {
+			return b
+		}
+		return a
+	}
+	fa, fb := responseFingerprint(a), responseFingerprint(b)
+	if bytes.Compare(fb[:], fa[:]) < 0 {
+		return b
+	}
+	return a
 }
 
 // MergeUniqueOrdered returns a new slice containing the values of a followed
@@ -305,12 +449,18 @@ func getSoapAction(headers map[string]string) string {
 	return ""
 }
 
-// getContentType returns the Content-Type header value, case-insensitively.
-func getContentType(headers map[string]string) string {
+// getHeader returns the value of the named header, matched case-insensitively.
+// Returns "" if absent.
+func getHeader(headers map[string]string, name string) string {
 	for k, v := range headers {
-		if strings.EqualFold(k, "content-type") {
+		if strings.EqualFold(k, name) {
 			return v
 		}
 	}
 	return ""
+}
+
+// getContentType returns the Content-Type header value, case-insensitively.
+func getContentType(headers map[string]string) string {
+	return getHeader(headers, "content-type")
 }

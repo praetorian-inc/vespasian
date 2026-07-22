@@ -255,6 +255,9 @@ Vespasian classifies and generates specifications for four API types:
 3. **Path heuristics**: `/api/`, `/v1/`, `/v2/`, `/v3/`, `/rest/`, `/rpc/` paths boost confidence
 4. **HTTP method**: POST/PUT/PATCH/DELETE to non-page URLs
 5. **Response structure**: JSON object or array bodies (not HTML)
+6. **Request-side signal**: an explicit JSON/XML `Accept` (or request content-type) classifies the endpoint on any path, even when its response was not captured — so the REST-vs-not verdict does not depend on response timing and is not limited to hardcoded API paths. Browser navigation (`text/html`) and non-committal (`*/*`) requests are excluded to avoid over-classification
+
+The classification signals above are content-based and deterministic: identical input traffic yields the same endpoint set, the same classification, and a byte-identical spec every run. Run with `-v` to see the per-endpoint classification reason, including near-miss endpoints that fell just below the threshold and were not emitted (so `-v` explains a missing endpoint, not only a present one).
 
 ### GraphQL Classification Heuristics
 
@@ -318,7 +321,9 @@ vespasian scan <url> [flags]
   -H, --header       Auth headers to inject (repeatable)
   -o, --output       Output spec file (default: stdout)
   --depth            Max crawl depth (default: 3)
-  --max-pages        Max pages to visit (default: 100)
+  --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100)
+  --max-requests     Max captured requests before stopping (0 = unlimited); rate/politeness bound distinct from --max-pages
+  --interact         Click non-destructive buttons to surface interaction-only endpoints (headless only; off by default; skips delete/logout controls)
   --timeout          Maximum duration for the entire scan (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine
@@ -351,7 +356,9 @@ vespasian crawl <url> [flags]
   -H, --header       Auth headers to inject (repeatable)
   -o, --output       Capture output file (default: stdout)
   --depth            Max crawl depth (default: 3)
-  --max-pages        Max pages to visit (default: 100)
+  --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100)
+  --max-requests     Max captured requests before stopping (0 = unlimited); rate/politeness bound distinct from --max-pages
+  --interact         Click non-destructive buttons to surface interaction-only endpoints (headless only; off by default; skips delete/logout controls)
   --timeout          Maximum duration for the entire crawl (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine

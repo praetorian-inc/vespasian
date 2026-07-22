@@ -49,6 +49,13 @@ const (
 	PathHeuristicBoost    = 0.15 // Rule 3: API path segment boost.
 	HTTPMethodConfidence  = 0.7  // Rule 4: Non-GET HTTP method signal.
 	JSONBodyConfidence    = 0.85 // Rule 5: JSON response structure.
+	// RequestSignalConfidence is assigned by Rule 6 when a request shows API
+	// intent (an API path together with a JSON/XML Accept or request
+	// content-type) even if no response was captured. It is deliberately set at
+	// or above DefaultConfidenceThreshold so a JSON API reached by GET whose
+	// response arrived too late to capture still classifies — the REST-vs-not
+	// verdict then depends on the request, not on response timing (LAB-4678, B2).
+	RequestSignalConfidence = 0.6
 )
 
 // RESTClassifier classifies REST API requests using ordered heuristic rules.
@@ -113,7 +120,7 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	for _, apiCT := range apiContentTypes {
 		if ct == apiCT {
 			confidence = ContentTypeConfidence
-			reason = "content-type:" + apiCT
+			reason = appendReason(reason, "content-type:"+apiCT)
 			break
 		}
 	}
@@ -125,24 +132,23 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 			if confidence > 1.0 {
 				confidence = 1.0
 			}
-			if reason == "" {
-				reason = "path-heuristic"
-			} else {
-				reason += "+path-heuristic"
-			}
+			reason = appendReason(reason, "path-heuristic")
 			break
 		}
 	}
 
 	// Rule 4: HTTP method signal.
+	// Every rule that detects its signal appends to the reason (not only when
+	// the reason is still empty) so the reason lists ALL contributing signals
+	// and matches the final confidence. Otherwise a POST on an /api/ path would
+	// report reason=path-heuristic (0.15) while confidence is 0.70 from this
+	// rule — attributing the score to the wrong signal.
 	upper := strings.ToUpper(req.Method)
 	if upper == "POST" || upper == "PUT" || upper == "PATCH" || upper == "DELETE" {
 		if confidence < HTTPMethodConfidence {
 			confidence = HTTPMethodConfidence
 		}
-		if reason == "" {
-			reason = "method:" + upper
-		}
+		reason = appendReason(reason, "method:"+upper)
 	}
 
 	// Rule 5: Response structure (JSON body).
@@ -153,13 +159,98 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 			if confidence < JSONBodyConfidence {
 				confidence = JSONBodyConfidence
 			}
-			if reason == "" {
-				reason = "response-structure:json"
-			}
+			reason = appendReason(reason, "response-structure:json")
 		}
 	}
 
+	// Rule 6: Request-side API signal (LAB-4678, B2 + Phase 3 "beyond allowlists").
+	// Rules 2 and 5 need a fully-arrived response, so a JSON API reached by GET
+	// whose response was captured half-finished (empty content-type and body)
+	// falls to the path boost alone (0.15) and is dropped — making the
+	// REST-vs-not verdict a function of response timing rather than a property
+	// of the app.
+	//
+	// An EXPLICIT API media type in the request itself — a JSON/XML Accept the
+	// client asked for, or a JSON/XML request Content-Type it sent — is API
+	// intent on ANY path, not only allowlisted ones (Phase 3). The hardcoded
+	// apiPathSegments are not exhaustive, so gating this signal on them was
+	// blind by construction to APIs on non-standard paths. Dropping the path
+	// gate is guarded against over-classification: acceptSignalsAPI treats
+	// text/html and application/xhtml+xml as navigation and never matches the
+	// */* wildcard, so plain page loads and non-committal fetches contribute
+	// nothing here. Non-GET methods are already covered by Rule 4 (0.7); this
+	// closes the GET-with-explicit-JSON-intent gap regardless of path.
+	signal := ""
+	if apiCT := acceptSignalsAPI(getHeader(req.Headers, "accept")); apiCT != "" {
+		signal = "accept:" + apiCT
+	}
+	if signal == "" {
+		reqCT := strings.ToLower(getHeader(req.Headers, "content-type"))
+		if idx := strings.Index(reqCT, ";"); idx != -1 {
+			reqCT = strings.TrimSpace(reqCT[:idx])
+		}
+		for _, apiCT := range apiContentTypes {
+			if reqCT == apiCT {
+				signal = "content-type:" + apiCT
+				break
+			}
+		}
+	}
+	if signal != "" {
+		if confidence < RequestSignalConfidence {
+			confidence = RequestSignalConfidence
+		}
+		reason = appendReason(reason, "request-signal:"+signal)
+	}
+
 	return confidence > 0, confidence, reason
+}
+
+// appendReason joins classification signal tags with "+" so the reason string
+// records every signal that contributed, in rule order. An empty existing
+// reason yields the tag alone.
+func appendReason(existing, sig string) string {
+	if existing == "" {
+		return sig
+	}
+	return existing + "+" + sig
+}
+
+// acceptSignalsAPI parses an Accept header and returns the API media type the
+// client is explicitly asking for, or "" if none. It splits into media ranges,
+// ignores q-parameters and the "*/*" wildcard, and exact-matches against
+// apiContentTypes. Crucially, a header that accepts text/html or
+// application/xhtml+xml is treated as a document navigation, NOT API intent —
+// browsers always send those on page loads, and the standard navigation Accept
+// header also contains application/xml (which would otherwise substring-match).
+// This keeps Rule 6 from classifying plain HTML pages under api-like paths
+// (e.g. a Swagger UI at /api/docs or a /graphql playground) as REST APIs.
+func acceptSignalsAPI(accept string) string {
+	if accept == "" {
+		return ""
+	}
+	match := ""
+	for _, part := range strings.Split(accept, ",") {
+		mt := part
+		if i := strings.Index(mt, ";"); i != -1 {
+			mt = mt[:i]
+		}
+		mt = strings.ToLower(strings.TrimSpace(mt))
+		if mt == "text/html" || mt == "application/xhtml+xml" {
+			// A document-navigation marker anywhere in the header disqualifies
+			// the whole request as API intent.
+			return ""
+		}
+		if match == "" {
+			for _, apiCT := range apiContentTypes {
+				if mt == apiCT {
+					match = apiCT
+					break
+				}
+			}
+		}
+	}
+	return match
 }
 
 // firstNonSpace returns the first non-ASCII-whitespace byte in b.

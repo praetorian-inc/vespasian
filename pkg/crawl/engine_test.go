@@ -620,3 +620,68 @@ func TestRedactSeedURL(t *testing.T) {
 		})
 	}
 }
+
+// TestMergeEnrichedLinks_ScopeFiltersCapturedRequests verifies that passively
+// captured network requests to out-of-scope hosts are dropped (LAB-4678 Phase 1),
+// so third-party XHR/CDN hosts do not become endpoints or spec servers. In-scope
+// captured requests and scoped form actions are retained.
+func TestMergeEnrichedLinks_ScopeFiltersCapturedRequests(t *testing.T) {
+	scopeFn := func(u string) bool { return strings.Contains(u, "ex.com") }
+	captured := []ObservedRequest{
+		{Method: "GET", URL: "https://ex.com/"},
+		{Method: "GET", URL: "https://ex.com/api/users"},
+		{Method: "GET", URL: "https://analytics.thirdparty.com/collect"},
+		{Method: "POST", URL: "https://cdn.other.net/beacon"},
+	}
+
+	got, _ := mergeEnrichedLinks(captured, nil, nil, nil, nil, "https://ex.com/", "https://ex.com/", scopeFn)
+
+	for _, r := range got {
+		if !strings.Contains(r.URL, "ex.com") {
+			t.Errorf("out-of-scope captured request survived: %s", r.URL)
+		}
+	}
+	if len(got) != 2 {
+		t.Errorf("kept %d captured requests, want 2 (in-scope only): %v", len(got), got)
+	}
+}
+
+// TestMergeEnrichedLinks_NilScopeKeepsCaptured verifies a nil scopeFn applies no
+// filtering to captured requests (matching the form-action convention).
+func TestMergeEnrichedLinks_NilScopeKeepsCaptured(t *testing.T) {
+	captured := []ObservedRequest{
+		{Method: "GET", URL: "https://ex.com/"},
+		{Method: "GET", URL: "https://third.party/x"},
+	}
+	got, _ := mergeEnrichedLinks(captured, nil, nil, nil, nil, "https://ex.com/", "https://ex.com/", nil)
+	if len(got) != 2 {
+		t.Errorf("nil scopeFn kept %d, want 2 (no filtering)", len(got))
+	}
+}
+
+// TestBudgetReached covers the two crawl budgets (LAB-4678 Phase 3): a 0 budget
+// is unlimited for that dimension, and either dimension hitting its bound stops
+// the crawl from starting a new page.
+func TestBudgetReached(t *testing.T) {
+	cases := []struct {
+		name                                   string
+		pageCount, maxPages, reqCount, maxReqs int
+		want                                   bool
+	}{
+		{"both unlimited", 100, 0, 100, 0, false},
+		{"pages under cap", 1, 5, 0, 0, false},
+		{"pages at cap", 5, 5, 0, 0, true},
+		{"requests at cap", 1, 0, 50, 50, true},
+		{"requests under cap", 1, 0, 49, 50, false},
+		{"pages ok, requests over", 2, 100, 500, 200, true},
+		{"requests ok, pages over", 100, 50, 10, 1000, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := budgetReached(tc.pageCount, tc.maxPages, tc.reqCount, tc.maxReqs); got != tc.want {
+				t.Errorf("budgetReached(pages=%d/%d, reqs=%d/%d) = %v, want %v",
+					tc.pageCount, tc.maxPages, tc.reqCount, tc.maxReqs, got, tc.want)
+			}
+		})
+	}
+}

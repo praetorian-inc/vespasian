@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
@@ -31,6 +32,11 @@ type pendingRequest struct {
 	url     string
 	headers map[string]string
 	body    string
+
+	// startedAt is when NetworkRequestWillBeSent fired for this request. Used by
+	// networkState to age out a request that never completes so it stops
+	// counting toward network-idle after the per-request timeout (LAB-4678 Phase 1).
+	startedAt time.Time
 
 	// Filled by responseReceived:
 	statusCode  int
@@ -50,6 +56,12 @@ type pageNetworkCapture struct {
 	pending map[proto.NetworkRequestID]*pendingRequest
 	pageURL string
 	page    *rod.Page
+
+	// lastActivity is the time of the most recent network event (request sent,
+	// response received, loading finished/failed). Seeded at construction so it
+	// is never zero, so a page that fires no requests still reads as idle after
+	// the floor rather than waiting to the ceiling (LAB-4678 Phase 1).
+	lastActivity time.Time
 }
 
 // newPageNetworkCapture creates a capture session and wires up CDP event
@@ -58,9 +70,10 @@ type pageNetworkCapture struct {
 // processed.
 func newPageNetworkCapture(page *rod.Page, pageURL string) (*pageNetworkCapture, func()) {
 	c := &pageNetworkCapture{
-		pending: make(map[proto.NetworkRequestID]*pendingRequest),
-		pageURL: pageURL,
-		page:    page,
+		pending:      make(map[proto.NetworkRequestID]*pendingRequest),
+		pageURL:      pageURL,
+		page:         page,
+		lastActivity: time.Now(),
 	}
 	wait := c.setupListeners(page)
 	return c, wait
@@ -74,16 +87,20 @@ func (c *pageNetworkCapture) setupListeners(page *rod.Page) func() {
 		func(e *proto.NetworkRequestWillBeSent) {
 			c.mu.Lock()
 			defer c.mu.Unlock()
+			now := time.Now()
 			c.pending[e.RequestID] = &pendingRequest{
-				method:  e.Request.Method,
-				url:     e.Request.URL,
-				headers: flattenNetworkHeaders(e.Request.Headers),
-				body:    string(truncateBody([]byte(e.Request.PostData))),
+				method:    e.Request.Method,
+				url:       e.Request.URL,
+				headers:   flattenNetworkHeaders(e.Request.Headers),
+				body:      string(truncateBody([]byte(e.Request.PostData))),
+				startedAt: now,
 			}
+			c.lastActivity = now
 		},
 		func(e *proto.NetworkResponseReceived) {
 			c.mu.Lock()
 			defer c.mu.Unlock()
+			c.lastActivity = time.Now()
 			req, ok := c.pending[e.RequestID]
 			if !ok {
 				return
@@ -92,8 +109,21 @@ func (c *pageNetworkCapture) setupListeners(page *rod.Page) func() {
 			req.respHeaders = flattenNetworkHeaders(e.Response.Headers)
 			req.contentType = e.Response.MIMEType
 		},
+		func(e *proto.NetworkLoadingFailed) {
+			// A request that errored (blocked, aborted, DNS/TLS failure) will
+			// never fire LoadingFinished. Mark it complete so it stops counting
+			// as in-flight — otherwise network-idle is never reached and every
+			// such page waits to the ceiling (LAB-4678 Phase 1).
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.lastActivity = time.Now()
+			if req, ok := c.pending[e.RequestID]; ok {
+				req.complete = true
+			}
+		},
 		func(e *proto.NetworkLoadingFinished) {
 			c.mu.Lock()
+			c.lastActivity = time.Now()
 			req, ok := c.pending[e.RequestID]
 			if !ok || req.complete {
 				// Not found or already finalized — skip to prevent
@@ -145,6 +175,23 @@ func (c *pageNetworkCapture) Results() []ObservedRequest {
 		results = append(results, mapNetworkToObservedRequest(req, c.pageURL))
 	}
 	return results
+}
+
+// networkState reports how many requests are still in flight and how long it has
+// been since the last network activity, as of now. A request counts as in flight
+// only while it has not completed AND its age is under perReqTimeout, so a single
+// hung or never-finishing request stops blocking network-idle after perReqTimeout
+// rather than pinning the crawl to the page ceiling. Drives the engine's
+// completion-driven wait (LAB-4678 Phase 1).
+func (c *pageNetworkCapture) networkState(perReqTimeout time.Duration, now time.Time) (inFlight int, sinceLastActivity time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, req := range c.pending {
+		if !req.complete && now.Sub(req.startedAt) < perReqTimeout {
+			inFlight++
+		}
+	}
+	return inFlight, now.Sub(c.lastActivity)
 }
 
 // mapNetworkToObservedRequest converts a captured network exchange to an

@@ -22,6 +22,14 @@
 // listeners. This is the correct choice for single-page applications and any
 // site that requires JavaScript execution. External .js bundles are fetched by
 // the browser itself; this path does not perform separate JS file retrieval.
+// After DOM stability the crawl waits for the network to go quiet (bounded by
+// [DefaultNetworkIdleFloor], [DefaultNetworkQuietPeriod], [DefaultPerRequestTimeout],
+// and the per-page timeout) rather than a fixed settle window, so late and
+// dynamic requests are captured. Passively captured requests are scope-filtered
+// like frontier links, and the frontier treats URLs differing only in query
+// parameters as one page. An opt-in interaction pass ([CrawlerOptions.Interact],
+// headless only, off by default) clicks a bounded set of non-destructive buttons
+// per page to surface endpoints that only fire on interaction.
 //
 // Non-headless mode ([HTTPCrawler]): uses the Go stdlib net/http client with a
 // depth-first search frontier, 150 req/s rate limiter, and a 10 MB per-page
@@ -107,6 +115,15 @@
 //   - [ParseCookiesToParams] converts a Cookie header value into CDP
 //     [proto.NetworkCookieParam] entries scoped to the target URL's host
 //     and scheme. Rejects non-http(s) or hostless target URLs.
+//
+// Cross-run resume primitives (LAB-4678 Phase 4, vespasian side) let coverage
+// accumulate across separate crawls: [Checkpoint] serializes the frontier's
+// pending queue and seen-set, gated by [ComputeConfigFingerprint] (target/scope/
+// depth) and a staleness bound ([Checkpoint.Usable], [DefaultCheckpointMaxAge]);
+// [urlFrontier.Snapshot] produces that state after a crawl and
+// [urlFrontier.Restore] loads it before one. Storing and passing the checkpoint
+// between runs, and wiring resume through the crawler entry paths, is coordinated
+// with the host (Guard) and is not built here.
 //
 // [go-rod]: https://github.com/go-rod/rod
 package crawl

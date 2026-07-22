@@ -15,9 +15,11 @@
 package jsstatic
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -395,6 +397,22 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	return result
 }
 
+// synthesizedLess is the deterministic ordering for synthesized static:js
+// entries (LAB-4678 Phase 2): URL, then method, then source tag, then request
+// body. Kept as a named helper so Analyze stays under the cyclomatic gate.
+func synthesizedLess(a, b crawl.ObservedRequest) bool {
+	if a.URL != b.URL {
+		return a.URL < b.URL
+	}
+	if a.Method != b.Method {
+		return a.Method < b.Method
+	}
+	if a.Source != b.Source {
+		return a.Source < b.Source
+	}
+	return bytes.Compare(a.Body, b.Body) < 0
+}
+
 // Analyze runs static analysis on every JS body in captured. It returns a
 // Result whose Requests slice is captured with synthesized [crawl.ObservedRequest]
 // entries APPENDED at the end (so classify.Deduplicate keeps dynamic entries
@@ -509,6 +527,18 @@ func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options
 	if abandoned := len(bundles) - workerProcessed; abandoned > 0 {
 		stats.BundlesAbandonedOnCancel = abandoned
 	}
+
+	// Sort the synthesized entries into a deterministic order (LAB-4678 Phase 2).
+	// The worker pool fans results into resultCh in completion order, which is
+	// non-deterministic across runs, so without this the appended static:js
+	// entries would be ordered by worker scheduling. Downstream dedup/generate
+	// are order-independent for the retained data, but ordering the synthesized
+	// block here makes jsstatic's own output a deterministic function of the
+	// capture rather than relying on those downstream sorts. Key: URL, method,
+	// source tag, then request body.
+	sort.SliceStable(synthesized, func(i, j int) bool {
+		return synthesizedLess(synthesized[i], synthesized[j])
+	})
 
 	// Build result: original captured first, synthesized appended after.
 	out := make([]crawl.ObservedRequest, len(captured), len(captured)+len(synthesized))

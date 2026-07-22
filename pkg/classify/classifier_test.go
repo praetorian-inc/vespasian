@@ -189,8 +189,77 @@ func TestDeduplicate_MergesSameEndpoint(t *testing.T) {
 	require.Len(t, result, 1)
 	// Highest confidence kept.
 	assert.InDelta(t, 0.85, result[0].Confidence, 0.001)
-	// First occurrence's body preserved.
-	assert.Equal(t, `[{"id":1}]`, string(result[0].Response.Body))
+	// LAB-4678: the retained response is selected deterministically (both are
+	// populated here, so a stable fingerprint decides), NOT by first-seen order.
+	// Assert order-independence rather than a specific body: swapping the input
+	// order must yield the identical retained response.
+	swapped := Deduplicate([]ClassifiedRequest{classified[1], classified[0]})
+	require.Len(t, swapped, 1)
+	assert.Equal(t, string(result[0].Response.Body), string(swapped[0].Response.Body),
+		"retained response must not depend on observation order")
+}
+
+func TestDeduplicate_ResponseSelection_PrefersPopulated(t *testing.T) {
+	// Same METHOD:path observed twice: one populated response and one empty
+	// (half-captured — no status/content-type/body). The populated response must
+	// always be retained, regardless of input order (LAB-4678, A4). Previously
+	// the first-seen observation's response was kept, so a half-captured
+	// observation arriving first would blank out the documented response.
+	populated := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: "GET",
+			URL:    "https://example.com/api/items",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Body:        []byte(`[{"id":1}]`),
+			},
+		},
+		IsAPI: true, Confidence: 0.8, APIType: "rest",
+	}
+	empty := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method:   "GET",
+			URL:      "https://example.com/api/items",
+			Response: crawl.ObservedResponse{}, // half-captured
+		},
+		IsAPI: true, Confidence: 0.15, APIType: "rest",
+	}
+
+	forward := Deduplicate([]ClassifiedRequest{populated, empty})
+	reverse := Deduplicate([]ClassifiedRequest{empty, populated})
+
+	require.Len(t, forward, 1)
+	require.Len(t, reverse, 1)
+	assert.Equal(t, `[{"id":1}]`, string(forward[0].Response.Body),
+		"populated response must be retained when it is seen first")
+	assert.Equal(t, `[{"id":1}]`, string(reverse[0].Response.Body),
+		"populated response must be retained even when the empty one is seen first")
+}
+
+func TestDeduplicate_ResponseSelection_TwoPopulatedOrderIndependent(t *testing.T) {
+	// Two distinct populated responses on the same endpoint collapse to one
+	// entry; the retained response is chosen by a stable fingerprint, so it is
+	// identical regardless of input order (LAB-4678, A4 tie-break).
+	a := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: "GET", URL: "https://example.com/api/items",
+			Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`{"a":1}`)},
+		}, IsAPI: true, Confidence: 0.8, APIType: "rest",
+	}
+	b := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: "GET", URL: "https://example.com/api/items",
+			Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`{"b":2}`)},
+		}, IsAPI: true, Confidence: 0.8, APIType: "rest",
+	}
+
+	fwd := Deduplicate([]ClassifiedRequest{a, b})
+	rev := Deduplicate([]ClassifiedRequest{b, a})
+	require.Len(t, fwd, 1)
+	require.Len(t, rev, 1)
+	assert.Equal(t, string(fwd[0].Response.Body), string(rev[0].Response.Body),
+		"fingerprint tie-break must be independent of observation order")
 }
 
 func TestDeduplicate_MergesQueryParams(t *testing.T) {
@@ -1182,4 +1251,77 @@ func BenchmarkDeduplicate(b *testing.B) {
 			}
 		})
 	}
+}
+
+// --- LAB-4678 Phase 1 ---
+
+// TestDeduplicate_KeepsDistinctHosts verifies that the same METHOD:path on two
+// different in-scope hosts (a same-domain scan can observe several) survives
+// deduplication instead of collapsing and losing one host's observation.
+func TestDeduplicate_KeepsDistinctHosts(t *testing.T) {
+	classified := []ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:   "GET",
+				URL:      "https://api.example.com/v1/users",
+				Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`{"a":1}`)},
+			},
+			IsAPI: true, Confidence: 0.9, APIType: "rest",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:   "GET",
+				URL:      "https://www.example.com/v1/users",
+				Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`{"b":2}`)},
+			},
+			IsAPI: true, Confidence: 0.9, APIType: "rest",
+		},
+	}
+
+	result := Deduplicate(classified)
+	assert.Len(t, result, 2, "same path on distinct hosts must not merge")
+}
+
+// TestDeduplicate_SameHostDefaultPortCollapses verifies the host in the dedup
+// key is canonicalized: an explicit :443 on https collapses with the bare host,
+// so a default-port variation does not create a spurious duplicate endpoint.
+func TestDeduplicate_SameHostDefaultPortCollapses(t *testing.T) {
+	classified := []ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{Method: "GET", URL: "https://example.com/v1/users"},
+			IsAPI:           true, Confidence: 0.9, APIType: "rest",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{Method: "GET", URL: "https://example.com:443/v1/users"},
+			IsAPI:           true, Confidence: 0.9, APIType: "rest",
+		},
+	}
+
+	result := Deduplicate(classified)
+	assert.Len(t, result, 1, "https default port :443 must canonicalize to the bare host")
+}
+
+// TestNearMisses returns only endpoints in the [floor, threshold) band: an
+// endpoint with real-but-weak signal (path heuristic alone) is a near-miss,
+// a static asset (0 confidence) is excluded, and a strong API (>= threshold)
+// is excluded because it is emitted, not a miss.
+func TestNearMisses(t *testing.T) {
+	classifiers := []APIClassifier{&RESTClassifier{}}
+	requests := []crawl.ObservedRequest{
+		// Path heuristic only (0.15): below threshold but a real near-miss.
+		{Method: "GET", URL: "https://ex.com/api/thing"},
+		// Static asset: Rule 1 excludes -> confidence 0, below floor.
+		{Method: "GET", URL: "https://ex.com/static/app.css"},
+		// Strong API (JSON response, 0.85): at/above threshold, emitted not missed.
+		{
+			Method: "GET", URL: "https://ex.com/api/data",
+			Response: crawl.ObservedResponse{ContentType: "application/json", Body: []byte(`{"x":1}`)},
+		},
+	}
+
+	nm := NearMisses(classifiers, requests, NearMissFloor, DefaultConfidenceThreshold)
+	require.Len(t, nm, 1, "only the weak-signal endpoint is a near-miss")
+	assert.Contains(t, nm[0].URL, "/api/thing")
+	assert.GreaterOrEqual(t, nm[0].Confidence, NearMissFloor)
+	assert.Less(t, nm[0].Confidence, DefaultConfidenceThreshold)
 }
