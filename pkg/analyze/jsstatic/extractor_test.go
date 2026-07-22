@@ -836,3 +836,47 @@ var rel = "/api/".concat("z");
 		t.Errorf("relative concat reconstruction must still be emitted, got %v", endpoints)
 	}
 }
+
+// QUAL-001: concatDedupKey must normalize a trailing slash so a trailing-slash
+// concat reconstruction dedupes against an AST form that has none — matching
+// the active JS-replay path's addPath, which does strings.TrimRight(raw, "/").
+// Here the AST walker recovers the template literal fetch(`/api/posts/${id}/comment`)
+// with no trailing slash, while the +-chain "/api/posts/" + id + "/comment/"
+// reconstructs WITH a trailing slash (cleanConcatPath never trims it). Before
+// concatDedupKey trimmed the trailing slash, these hashed to different keys
+// ("host|/api/posts/{}/comment" vs "host|/api/posts/{}/comment/") and the
+// astURLs guard missed, emitting a phantom GET companion.
+func TestExtractFromBundle_ConcatNoPhantomForTrailingSlash(t *testing.T) {
+	src := []byte("function f(id){ return fetch(`/api/posts/${id}/comment`); }\n" +
+		`var u = "/api/posts/" + id + "/comment/"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/posts/0/comment/"); ep != nil {
+		t.Errorf("phantom trailing-slash concat companion /api/posts/0/comment/ emitted alongside AST-recovered param path; got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "/api/posts/{id}/comment"); ep == nil {
+		t.Errorf("expected AST-recovered /api/posts/{id}/comment, got %v", endpoints)
+	}
+}
+
+// QUAL-001: concatDedupKey must preserve the root "/" case — trimming the
+// trailing slash must not turn "/" into "", which would silently key root
+// endpoints under the empty path instead of "/".
+func TestConcatDedupKey_RootSlashPreserved(t *testing.T) {
+	if got := concatDedupKey("/", "example.com"); got != "example.com|/" {
+		t.Errorf("concatDedupKey(%q, %q) = %q, want %q", "/", "example.com", got, "example.com|/")
+	}
+}
+
+// QUAL-001: concatDedupKey must collapse a trailing-slash key onto its
+// non-trailing-slash counterpart directly (unit-level pin, complementing the
+// end-to-end TestExtractFromBundle_ConcatNoPhantomForTrailingSlash above).
+func TestConcatDedupKey_TrailingSlashNormalized(t *testing.T) {
+	withSlash := concatDedupKey("/api/posts/{id}/comment/", "example.com")
+	withoutSlash := concatDedupKey("/api/posts/{id}/comment", "example.com")
+	if withSlash != withoutSlash {
+		t.Errorf("concatDedupKey with trailing slash = %q, without = %q, want equal", withSlash, withoutSlash)
+	}
+}

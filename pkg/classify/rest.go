@@ -90,6 +90,7 @@ func (c *RESTClassifier) Classify(req crawl.ObservedRequest) (bool, float64) {
 //  3. Path heuristics → boost +0.15 (cap 1.0)
 //  4. HTTP method signal → confidence max(current, 0.7)
 //  5. Response structure → confidence max(current, 0.85)
+//  6. Offline JS-static candidate floor → confidence max(current, StaticJSConfidence) when the path carries an API indicator
 func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float64, string) { //nolint:gocyclo // multi-signal heuristic classifier
 	parsedURL, err := url.Parse(req.URL)
 	if err != nil {

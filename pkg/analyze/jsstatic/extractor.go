@@ -735,11 +735,12 @@ func extractConcatEndpoints(jsSource []byte, baseURL, baseHost string, seen map[
 // the numeric sentinel "0" for non-literal operands and always carries a leading
 // slash, whereas the AST walkers emit {param}-style placeholders
 // (NormalizeEXPRPath) and leave relative paths without a leading slash. Both
-// collapse to one key here: query/fragment dropped, leading slash ensured, and
-// every dynamic segment (the concat sentinel or a {...} placeholder) rewritten
-// to a single "{}" token. Concrete literal segments other than the sentinel are
-// left intact, so distinct concrete paths are NOT over-merged (e.g.
-// "/api/items/5" stays distinct from "/api/items/{param}").
+// collapse to one key here: query/fragment dropped, leading slash ensured,
+// trailing slash trimmed (root "/" excepted), and every dynamic segment (the
+// concat sentinel or a {...} placeholder) rewritten to a single "{}" token.
+// Concrete literal segments other than the sentinel are left intact, so
+// distinct concrete paths are NOT over-merged (e.g. "/api/items/5" stays
+// distinct from "/api/items/{param}").
 //
 // The key is prefixed with the endpoint's origin (host): an absolute URL uses
 // its own host; a relative URL (no scheme+host) is same-origin by construction
@@ -781,6 +782,16 @@ func concatDedupKey(u, baseHost string) string {
 	host = strings.ToLower(host)
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
+	}
+	// Normalize a trailing slash so a concat reconstruction (which never trims
+	// one — cleanConcatPath leaves it intact) keys identically to an
+	// AST-recovered form without one, matching the active JS-replay path's
+	// addPath (strings.TrimRight(raw, "/")). The bare root "/" is preserved:
+	// trimming it down to "" would key root endpoints under the empty path.
+	if path != "/" {
+		if trimmed := strings.TrimRight(path, "/"); trimmed != "" {
+			path = trimmed
+		}
 	}
 	segments := strings.Split(path, "/")
 	for i, seg := range segments {
