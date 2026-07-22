@@ -620,3 +620,41 @@ func TestRedactSeedURL(t *testing.T) {
 		})
 	}
 }
+
+// TestMergeEnrichedLinks_ScopeFiltersCapturedRequests verifies that passively
+// captured network requests to out-of-scope hosts are dropped (LAB-4678 Phase 1),
+// so third-party XHR/CDN hosts do not become endpoints or spec servers. In-scope
+// captured requests and scoped form actions are retained.
+func TestMergeEnrichedLinks_ScopeFiltersCapturedRequests(t *testing.T) {
+	scopeFn := func(u string) bool { return strings.Contains(u, "ex.com") }
+	captured := []ObservedRequest{
+		{Method: "GET", URL: "https://ex.com/"},
+		{Method: "GET", URL: "https://ex.com/api/users"},
+		{Method: "GET", URL: "https://analytics.thirdparty.com/collect"},
+		{Method: "POST", URL: "https://cdn.other.net/beacon"},
+	}
+
+	got, _ := mergeEnrichedLinks(captured, nil, nil, nil, nil, "https://ex.com/", "https://ex.com/", scopeFn)
+
+	for _, r := range got {
+		if !strings.Contains(r.URL, "ex.com") {
+			t.Errorf("out-of-scope captured request survived: %s", r.URL)
+		}
+	}
+	if len(got) != 2 {
+		t.Errorf("kept %d captured requests, want 2 (in-scope only): %v", len(got), got)
+	}
+}
+
+// TestMergeEnrichedLinks_NilScopeKeepsCaptured verifies a nil scopeFn applies no
+// filtering to captured requests (matching the form-action convention).
+func TestMergeEnrichedLinks_NilScopeKeepsCaptured(t *testing.T) {
+	captured := []ObservedRequest{
+		{Method: "GET", URL: "https://ex.com/"},
+		{Method: "GET", URL: "https://third.party/x"},
+	}
+	got, _ := mergeEnrichedLinks(captured, nil, nil, nil, nil, "https://ex.com/", "https://ex.com/", nil)
+	if len(got) != 2 {
+		t.Errorf("nil scopeFn kept %d, want 2 (no filtering)", len(got))
+	}
+}

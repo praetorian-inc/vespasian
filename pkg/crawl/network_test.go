@@ -17,6 +17,7 @@ package crawl
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/ysmood/gson"
@@ -218,5 +219,60 @@ func TestMapNetworkToObservedRequest_MultiValueQueryParam(t *testing.T) {
 	}
 	if obs.QueryParams["tag"][0] != "a" || obs.QueryParams["tag"][1] != "b" {
 		t.Errorf("QueryParams[tag] = %v, want [a b]", obs.QueryParams["tag"])
+	}
+}
+
+// --- LAB-4678 Phase 1: completion-driven capture ---
+
+func TestNetworkIdleReached(t *testing.T) {
+	const floor = 500 * time.Millisecond
+	const ceiling = 30 * time.Second
+	const quiet = 500 * time.Millisecond
+
+	cases := []struct {
+		name          string
+		inFlight      int
+		sinceActivity time.Duration
+		elapsed       time.Duration
+		want          bool
+	}{
+		{"ceiling wins even with requests in flight", 3, 0, ceiling, true},
+		{"ceiling wins past deadline", 3, 0, ceiling + time.Second, true},
+		{"before floor never idle even if quiet", 0, time.Second, floor - time.Millisecond, false},
+		{"past floor, idle and quiet -> stop", 0, quiet, floor, true},
+		{"past floor but requests in flight -> wait", 2, quiet, floor + time.Second, false},
+		{"past floor, idle but not quiet yet -> wait", 0, quiet - time.Millisecond, floor + time.Second, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := networkIdleReached(tc.inFlight, tc.sinceActivity, tc.elapsed, floor, ceiling, quiet)
+			if got != tc.want {
+				t.Errorf("networkIdleReached(inFlight=%d, since=%v, elapsed=%v) = %v, want %v",
+					tc.inFlight, tc.sinceActivity, tc.elapsed, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNetworkState_InFlightCounting(t *testing.T) {
+	now := time.Now()
+	const perReq = 10 * time.Second
+	c := &pageNetworkCapture{
+		pending:      make(map[proto.NetworkRequestID]*pendingRequest),
+		lastActivity: now.Add(-2 * time.Second),
+	}
+	// Completed request: never in flight.
+	c.pending["done"] = &pendingRequest{startedAt: now.Add(-time.Second), complete: true}
+	// Recent, incomplete: in flight.
+	c.pending["live"] = &pendingRequest{startedAt: now.Add(-time.Second)}
+	// Incomplete but older than perReq: aged out, not in flight.
+	c.pending["hung"] = &pendingRequest{startedAt: now.Add(-perReq - time.Second)}
+
+	inFlight, since := c.networkState(perReq, now)
+	if inFlight != 1 {
+		t.Errorf("inFlight = %d, want 1 (only the recent incomplete request counts)", inFlight)
+	}
+	if since != 2*time.Second {
+		t.Errorf("sinceLastActivity = %v, want 2s", since)
 	}
 }

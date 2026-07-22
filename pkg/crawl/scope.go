@@ -152,11 +152,35 @@ func ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, e
 // and host, stripping fragments, and removing default ports.
 // It returns the empty string for unparseable URLs.
 func normalizeURL(rawURL string) string {
+	return canonicalizeURL(rawURL, false)
+}
+
+// frontierKey returns the crawl-frontier dedup key for rawURL: the canonicalized
+// URL with its query string removed (LAB-4678 Phase 1). Two links differing only
+// in query parameters (e.g. /product?id=1 and /product?id=2) collapse to one
+// key, so the crawler visits the page template once instead of spending the page
+// budget on near-duplicate variants — a driver of run-to-run truncation
+// variance. The queued entry keeps the original URL, so the first variant is
+// still fetched with its parameters, and passive capture still records every
+// distinct-parameter request for classification; only re-crawling of the same
+// template is suppressed. Tradeoff: paginated query templates (?page=N) are
+// visited once.
+func frontierKey(rawURL string) string {
+	return canonicalizeURL(rawURL, true)
+}
+
+// canonicalizeURL lowercases scheme and host, strips the fragment and any
+// default port, and — when stripQuery is set — removes the query string.
+// Returns "" on a parse error.
+func canonicalizeURL(rawURL string, stripQuery bool) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return ""
 	}
 	u.Fragment = ""
+	if stripQuery {
+		u.RawQuery = ""
+	}
 	u.Host = strings.ToLower(u.Host)
 	u.Scheme = strings.ToLower(u.Scheme)
 

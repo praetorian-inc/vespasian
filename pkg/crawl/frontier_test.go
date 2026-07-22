@@ -400,3 +400,32 @@ func TestFrontier_ActiveWorkerPreventsEarlyDone(t *testing.T) {
 	// Worker 2 consumed the discovered URL (active incremented by its Pop).
 	f.MarkIdle()
 }
+
+// TestFrontier_DedupQueryVariants verifies URLs differing only in query params
+// collapse to one frontier entry, so the crawler visits the page template once
+// rather than spending the page budget on near-duplicate variants (LAB-4678
+// Phase 1). Distinct paths remain distinct.
+func TestFrontier_DedupQueryVariants(t *testing.T) {
+	f := newURLFrontier(10, nil)
+
+	f.Push([]urlEntry{{URL: "https://example.com/product?id=1", Depth: 0}})
+	added := f.Push([]urlEntry{{URL: "https://example.com/product?id=2&ref=x", Depth: 0}})
+	if added != 0 {
+		t.Errorf("Push returned %d, want 0 (query-only difference must dedup)", added)
+	}
+	if f.Len() != 1 {
+		t.Errorf("Len = %d, want 1", f.Len())
+	}
+
+	// A genuinely different path is still enqueued.
+	added = f.Push([]urlEntry{{URL: "https://example.com/category?id=1", Depth: 0}})
+	if added != 1 {
+		t.Errorf("Push returned %d, want 1 (distinct path)", added)
+	}
+
+	// The first-seen variant (with its query) is what gets queued/fetched.
+	entry, ok := f.Pop()
+	if !ok || entry.URL != "https://example.com/product?id=1" {
+		t.Errorf("Pop = %q (ok=%v), want the first-seen variant with its query", entry.URL, ok)
+	}
+}
