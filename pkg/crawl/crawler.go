@@ -52,7 +52,8 @@ const (
 type CrawlerOptions struct {
 	Depth         int
 	MaxPages      int
-	MaxRequests   int // max captured requests before stopping (0 → unlimited); rate/politeness bound distinct from MaxPages
+	MaxRequests   int  // max captured requests before stopping (0 → unlimited); rate/politeness bound distinct from MaxPages
+	Interact      bool // opt-in: click non-destructive elements to surface interaction-only endpoints (headless backend only)
 	Timeout       time.Duration
 	Scope         string
 	Headless      bool

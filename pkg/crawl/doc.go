@@ -27,7 +27,9 @@
 // and the per-page timeout) rather than a fixed settle window, so late and
 // dynamic requests are captured. Passively captured requests are scope-filtered
 // like frontier links, and the frontier treats URLs differing only in query
-// parameters as one page.
+// parameters as one page. An opt-in interaction pass ([CrawlerOptions.Interact],
+// headless only, off by default) clicks a bounded set of non-destructive buttons
+// per page to surface endpoints that only fire on interaction.
 //
 // Browser binary (LAB-4999): the headless path pins a local Chrome via
 // [BrowserOptions.ChromePath] when set, otherwise the system browser resolved

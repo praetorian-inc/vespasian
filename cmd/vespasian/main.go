@@ -235,6 +235,7 @@ type CrawlOptions struct {
 	Depth           int           `default:"3" help:"Maximum crawl depth"`
 	MaxPages        int           `default:"100" help:"Maximum number of pages (URLs visited) to crawl; pages already in flight when the limit is reached still finish"`
 	MaxRequests     int           `name:"max-requests" default:"0" help:"Maximum captured requests before the crawl stops enqueuing new pages (0 = unlimited). A rate/politeness bound distinct from --max-pages; pages already in flight when the limit is reached still finish."`
+	Interact        bool          `name:"interact" help:"Click non-destructive page elements (buttons) to surface endpoints that only fire on interaction. Headless backend only; skips delete/logout-style controls. Off by default (clicking can mutate state)."`
 	Timeout         time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
 	Scope           string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
 	Headless        bool          `default:"true" help:"Use headless browser"`
@@ -373,6 +374,7 @@ func (c *CrawlCmd) Run() error {
 		Depth:         c.Depth,
 		MaxPages:      c.MaxPages,
 		MaxRequests:   c.MaxRequests,
+		Interact:      c.Interact,
 		Timeout:       c.Timeout,
 		Scope:         c.Scope,
 		Headless:      c.Headless,
@@ -657,6 +659,7 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		Depth:         c.Depth,
 		MaxPages:      c.MaxPages,
 		MaxRequests:   c.MaxRequests,
+		Interact:      c.Interact,
 		Timeout:       c.Timeout,
 		Scope:         c.Scope,
 		Headless:      c.Headless,
