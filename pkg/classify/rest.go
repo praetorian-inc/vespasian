@@ -184,28 +184,36 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 		}
 	}
 
-	// Rule 6: Offline JS-static candidate floor (LAB-4992). A path reconstructed
-	// from a JS bundle carries an API indicator but, when generated fully
-	// offline, has no probed response — Rules 2/4/5 never fire and Rule 3 alone
-	// (0.15) leaves it below the default 0.5 threshold, silently dropping the
-	// very concat/service-prefix endpoints jsstatic recovered. Floor such
-	// candidates to StaticJSConfidence so they survive default-confidence
-	// generation as unprobed candidates. Gated on the path heuristic so
-	// non-API-looking static:js entries are not promoted.
-	//
-	// QUAL-002: this floor applies to EVERY IsJSStaticSource candidate — the
-	// AST-literal source (SourceStaticJS), sourcemap-recovered source, AND
-	// concat/service-prefix reconstructions (SourceStaticJSConcat) alike. Only
-	// SourceStaticJSConcat is ever superseded by the reached-filter in
-	// ReplayJSExtracted (which drops a concat mirror once the live probe 404s
-	// the same reconstructed path); a plain SourceStaticJS AST literal has no
-	// such supersession and stays floored even if a probe elsewhere 404s it.
-	// This is deliberate, not an oversight: an AST literal is recovered from a
-	// real call site in the bundle (fetch/axios/etc.), so a 404 there is more
-	// likely auth/param-gated than a wrong-guess decoy, unlike an unvalidated
-	// concat/service-prefix combinatorial reconstruction. Do not extend the
-	// concat reached-filter supersession to plain static:js literals without
-	// revisiting this reasoning.
+	// Rule 6: Offline JS-static candidate floor.
+	confidence, reason = staticJSFloor(req, pathMatched, confidence, reason)
+
+	return confidence > 0, confidence, reason
+}
+
+// staticJSFloor implements Rule 6 (LAB-4992): the offline JS-static confidence
+// floor. A path reconstructed from a JS bundle carries an API indicator but,
+// when generated fully offline, has no probed response — Rules 2/4/5 never
+// fire and Rule 3 alone (0.15) leaves it below the default 0.5 threshold,
+// silently dropping the very concat/service-prefix endpoints jsstatic
+// recovered. Floor such candidates to StaticJSConfidence so they survive
+// default-confidence generation as unprobed candidates. Gated on the path
+// heuristic (pathMatched) so non-API-looking static:js entries are not
+// promoted.
+//
+// QUAL-002: this floor applies to EVERY IsJSStaticSource candidate — the
+// AST-literal source (SourceStaticJS), sourcemap-recovered source, AND
+// concat/service-prefix reconstructions (SourceStaticJSConcat) alike. Only
+// SourceStaticJSConcat is ever superseded by the reached-filter in
+// ReplayJSExtracted (which drops a concat mirror once the live probe 404s
+// the same reconstructed path); a plain SourceStaticJS AST literal has no
+// such supersession and stays floored even if a probe elsewhere 404s it.
+// This is deliberate, not an oversight: an AST literal is recovered from a
+// real call site in the bundle (fetch/axios/etc.), so a 404 there is more
+// likely auth/param-gated than a wrong-guess decoy, unlike an unvalidated
+// concat/service-prefix combinatorial reconstruction. Do not extend the
+// concat reached-filter supersession to plain static:js literals without
+// revisiting this reasoning.
+func staticJSFloor(req crawl.ObservedRequest, pathMatched bool, confidence float64, reason string) (float64, string) {
 	if pathMatched && confidence < StaticJSConfidence && crawl.IsJSStaticSource(req.Source) {
 		confidence = StaticJSConfidence
 		if reason == "" {
@@ -214,8 +222,7 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 			reason += "+static-js-candidate"
 		}
 	}
-
-	return confidence > 0, confidence, reason
+	return confidence, reason
 }
 
 // firstNonSpace returns the first non-ASCII-whitespace byte in b.

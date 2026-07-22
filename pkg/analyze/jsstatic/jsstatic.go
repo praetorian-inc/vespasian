@@ -318,6 +318,44 @@ func safeAnalyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options
 	return analyzeOne(ctx, req, opts)
 }
 
+// capBundleEndpoints truncates eps to max entries WITHOUT letting AST-recovered
+// endpoints starve concat/service-prefix candidates (QUAL-001, LAB-4992).
+// ExtractFromBundle appends concat reconstructions (SourceJSConcat) after all
+// AST-recovered endpoints, so a naive `eps[:max]` prefix truncation drops every
+// concat candidate whenever the AST portion alone reaches max.
+//
+// Instead, each source is capped independently against a fair share of the
+// budget: concat gets up to half of max (or fewer, if it doesn't need that
+// many), and AST gets whatever remains. This mirrors the remaining-budget
+// pattern analyzeOne already uses for sourcemap sources, just computed
+// up-front across the two sources within a single bundle instead of
+// iteratively across sourcemap sources.
+func capBundleEndpoints(eps []ExtractedEndpoint, max int) []ExtractedEndpoint {
+	var ast, concat []ExtractedEndpoint
+	for _, ep := range eps {
+		if ep.SourceTag == SourceJSConcat {
+			concat = append(concat, ep)
+		} else {
+			ast = append(ast, ep)
+		}
+	}
+
+	concatBudget := max / 2
+	if len(concat) < concatBudget {
+		concatBudget = len(concat)
+	}
+	if len(concat) > concatBudget {
+		concat = concat[:concatBudget]
+	}
+
+	astBudget := max - len(concat)
+	if len(ast) > astBudget {
+		ast = ast[:astBudget]
+	}
+
+	return append(ast, concat...)
+}
+
 // analyzeOne analyzes a single captured JS bundle. It runs sourcemap recovery
 // and extractor extraction, then synthesizes requests. The function is safe to
 // call from goroutines; it has no shared mutable state.
@@ -346,8 +384,17 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	// bundle, counting both the bundle body and any recovered sourcemap
 	// sources. The cap is applied first to the bundle body and then
 	// re-evaluated as remaining-budget on each sourcemap source below.
+	//
+	// QUAL-001 (LAB-4992): a plain prefix truncation here would keep only the
+	// first MaxEndpointsPerBundle entries of bundleEps. Because
+	// ExtractFromBundle appends concat/service-prefix reconstructions AFTER
+	// all AST-recovered endpoints, any bundle whose AST endpoint count alone
+	// reaches the cap would silently drop every concat candidate — undermining
+	// the acceptance criterion that offline generate must surface concat
+	// endpoints. capBundleEndpoints reserves a fair share of the budget for
+	// concat candidates instead of truncating the combined slice blindly.
 	if len(bundleEps) > opts.MaxEndpointsPerBundle {
-		bundleEps = bundleEps[:opts.MaxEndpointsPerBundle]
+		bundleEps = capBundleEndpoints(bundleEps, opts.MaxEndpointsPerBundle)
 	}
 	for i := range bundleEps {
 		// Preserve the distinct concat reconstruction tag; force everything else

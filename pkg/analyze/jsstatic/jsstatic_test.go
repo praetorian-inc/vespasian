@@ -524,6 +524,43 @@ func TestExtractFromBundle_HonorsMaxEndpoints(t *testing.T) {
 	}
 }
 
+// TestAnalyze_MaxEndpointsPerBundle_PreservesConcatEndpoint is a regression for
+// QUAL-001 (LAB-4992): ExtractFromBundle appends concat/service-prefix
+// reconstructions AFTER all AST-recovered endpoints, and the truncation in
+// analyzeOne kept only the slice PREFIX (`bundleEps[:opts.MaxEndpointsPerBundle]`).
+// A bundle whose AST-recovered endpoint count alone reaches the cap therefore
+// silently dropped every concat candidate — directly undermining LAB-4992's
+// acceptance criterion that offline generate must surface concat endpoints.
+// Here 10 AST-literal fetch() calls exceed a cap of 5, plus one genuine
+// service-prefix concat reconstruction; the concat endpoint must still survive.
+func TestAnalyze_MaxEndpointsPerBundle_PreservesConcatEndpoint(t *testing.T) {
+	var sb strings.Builder
+	for i := 0; i < 10; i++ {
+		fmt.Fprintf(&sb, "fetch(\"/api/r%d\");\n", i)
+	}
+	// Literal+literal service-prefix form, recovered only by extractConcatEndpoints
+	// (crawl.ExtractStaticConcatPaths), never by jsluice's AST walkers.
+	sb.WriteString(`var svc = "identity/" + "api/auth/login";` + "\n")
+	cap := makeJSCapture("https://example.com/app.js", sb.String())
+
+	res, err := Analyze(context.Background(), []crawl.ObservedRequest{cap}, Options{
+		MaxEndpointsPerBundle: 5,
+	})
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	var sawConcat bool
+	for _, r := range res.Requests {
+		if r.Source == SourceJSConcat {
+			sawConcat = true
+			break
+		}
+	}
+	if !sawConcat {
+		t.Errorf("expected a %s endpoint to survive truncation when AST endpoints alone exceed MaxEndpointsPerBundle (5); got requests: %v", SourceJSConcat, res.Requests)
+	}
+}
+
 // TestExtractFromBundle_MinifiedBundleSmoke confirms that extraction works on a
 // single-line minified-style bundle with multiple fetches concatenated together.
 func TestExtractFromBundle_MinifiedBundleSmoke(t *testing.T) {

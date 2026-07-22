@@ -687,6 +687,19 @@ func extractConcatEndpoints(jsSource []byte, baseURL, baseHost string, seen map[
 		if p == "" {
 			continue
 		}
+		// QUAL-002 (LAB-4992): run the scheme/asset filter against the RAW,
+		// un-prefixed reconstruction first. filterURL's scheme blocklist
+		// (javascript:, data:, blob:, mailto:, tel:, chrome-extension:) matches
+		// via strings.HasPrefix, and would otherwise be defeated by the
+		// leading-slash normalization below: a hostile receiver like
+		// "javascript:/api/".concat("y") reconstructs to "javascript:/api/y",
+		// which is non-absolute and gets a '/' prepended -> "/javascript:/api/y"
+		// -- no longer HasPrefix("javascript:"), so the blocklist would
+		// silently miss it. Checking here, before normalization, closes that
+		// gap while leaving legitimate relative paths (no scheme) unaffected.
+		if filterURL(p) {
+			continue
+		}
 		// Relative reconstructions arrive without a leading slash (e.g.
 		// "identity/api/auth/login"); normalize so they resolve as
 		// document-root paths rather than bundle-relative ones.

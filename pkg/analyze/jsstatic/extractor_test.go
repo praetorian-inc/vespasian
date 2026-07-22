@@ -837,6 +837,41 @@ var rel = "/api/".concat("z");
 	}
 }
 
+// QUAL-002: extractConcatEndpoints must not let a leading-slash normalization
+// defeat filterURL's scheme blocklist. filterURL matches filtered schemes
+// (javascript:, data:, blob:, mailto:, tel:, chrome-extension:) via
+// strings.HasPrefix. Before this fix, a non-absolute reconstruction beginning
+// with one of these schemes (e.g. "javascript:/api/".concat("y") ->
+// "javascript:/api/y") had a leading '/' prepended BEFORE the filterURL call,
+// producing "/javascript:/api/y" — which no longer HasPrefix("javascript:"),
+// so the scheme blocklist silently failed to drop it. The raw, un-prefixed
+// reconstruction must still be scheme-checked. A legitimate relative concat
+// (no scheme) must still be emitted.
+func TestExtractFromBundle_ConcatRawSchemeFilter(t *testing.T) {
+	src := []byte(`
+var evilJS = "javascript:/api/".concat("y");
+var evilData = "data:/api/".concat("z");
+var legit = "identity/" + "api/auth/login";
+`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, dropped := range []string{
+		"/javascript:/api/y",
+		"javascript:/api/y",
+		"/data:/api/z",
+		"data:/api/z",
+	} {
+		if ep := findEndpoint(endpoints, dropped); ep != nil {
+			t.Errorf("scheme-prefixed concat reconstruction must be dropped; got endpoint for %q: %v", dropped, endpoints)
+		}
+	}
+	if ep := findEndpoint(endpoints, "/identity/api/auth/login"); ep == nil {
+		t.Errorf("expected legitimate relative concat reconstruction /identity/api/auth/login to survive, got: %v", endpoints)
+	}
+}
+
 // QUAL-001: concatDedupKey must normalize a trailing slash so a trailing-slash
 // concat reconstruction dedupes against an AST form that has none — matching
 // the active JS-replay path's addPath, which does strings.TrimRight(raw, "/").

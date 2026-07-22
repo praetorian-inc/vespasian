@@ -494,6 +494,73 @@ func TestClassifyDetail_StaticJSCandidateFloor(t *testing.T) {
 	}
 }
 
+// TestStaticJSFloor pins the extracted Rule 6 helper (QUAL-003) directly,
+// independent of ClassifyDetail's other rules.
+func TestStaticJSFloor(t *testing.T) {
+	tests := []struct {
+		name           string
+		req            crawl.ObservedRequest
+		pathMatched    bool
+		inConfidence   float64
+		inReason       string
+		wantConfidence float64
+		wantReason     string
+	}{
+		{
+			name:           "floors a low-confidence static:js candidate with matched path",
+			req:            crawl.ObservedRequest{Source: crawl.SourceStaticJSConcat},
+			pathMatched:    true,
+			inConfidence:   PathHeuristicBoost,
+			inReason:       "path-heuristic",
+			wantConfidence: StaticJSConfidence,
+			wantReason:     "path-heuristic+static-js-candidate",
+		},
+		{
+			name:           "sets reason from scratch when no prior reason",
+			req:            crawl.ObservedRequest{Source: crawl.SourceStaticJS},
+			pathMatched:    true,
+			inConfidence:   0,
+			inReason:       "",
+			wantConfidence: StaticJSConfidence,
+			wantReason:     "static-js-candidate",
+		},
+		{
+			name:           "does not floor when path did not match",
+			req:            crawl.ObservedRequest{Source: crawl.SourceStaticJS},
+			pathMatched:    false,
+			inConfidence:   0,
+			inReason:       "",
+			wantConfidence: 0,
+			wantReason:     "",
+		},
+		{
+			name:           "does not floor a non-JS-static source",
+			req:            crawl.ObservedRequest{Source: "katana"},
+			pathMatched:    true,
+			inConfidence:   PathHeuristicBoost,
+			inReason:       "path-heuristic",
+			wantConfidence: PathHeuristicBoost,
+			wantReason:     "path-heuristic",
+		},
+		{
+			name:           "leaves an already-higher confidence untouched",
+			req:            crawl.ObservedRequest{Source: crawl.SourceStaticJS},
+			pathMatched:    true,
+			inConfidence:   HTTPMethodConfidence,
+			inReason:       "method:POST",
+			wantConfidence: HTTPMethodConfidence,
+			wantReason:     "method:POST",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotConf, gotReason := staticJSFloor(tt.req, tt.pathMatched, tt.inConfidence, tt.inReason)
+			assert.InDelta(t, tt.wantConfidence, gotConf, 1e-9)
+			assert.Equal(t, tt.wantReason, gotReason)
+		})
+	}
+}
+
 // TestClassifyDetail_FallbackToHeaders verifies the classifier falls back to
 // Response.Headers when ContentType is empty, as happens when headers have
 // non-standard casing and ContentType wasn't populated by the crawler.
