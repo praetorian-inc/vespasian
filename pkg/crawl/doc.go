@@ -116,5 +116,14 @@
 //     [proto.NetworkCookieParam] entries scoped to the target URL's host
 //     and scheme. Rejects non-http(s) or hostless target URLs.
 //
+// Cross-run resume primitives (LAB-4678 Phase 4, vespasian side) let coverage
+// accumulate across separate crawls: [Checkpoint] serializes the frontier's
+// pending queue and seen-set, gated by [ComputeConfigFingerprint] (target/scope/
+// depth) and a staleness bound ([Checkpoint.Usable], [DefaultCheckpointMaxAge]);
+// [urlFrontier.Snapshot] produces that state after a crawl and
+// [urlFrontier.Restore] loads it before one. Storing and passing the checkpoint
+// between runs, and wiring resume through the crawler entry paths, is coordinated
+// with the host (Guard) and is not built here.
+//
 // [go-rod]: https://github.com/go-rod/rod
 package crawl
