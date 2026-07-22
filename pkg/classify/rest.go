@@ -50,9 +50,10 @@ const (
 	PathHeuristicBoost    = 0.15 // Rule 3: API path segment boost.
 	HTTPMethodConfidence  = 0.7  // Rule 4: Non-GET HTTP method signal.
 	JSONBodyConfidence    = 0.85 // Rule 5: JSON response structure.
-	// RequestSignalConfidence is assigned by Rule 6 when a request shows API
-	// intent (an API path together with a JSON/XML Accept or request
-	// content-type) even if no response was captured. It is deliberately set at
+	// RequestSignalConfidence is assigned by Rule 6 when a request shows explicit
+	// API intent — a JSON/XML Accept or request content-type — even if no response
+	// was captured, and regardless of whether the path is in apiPathSegments
+	// (Phase 3 un-gated this from the path allowlist). It is deliberately set at
 	// or above DefaultConfidenceThreshold so a JSON API reached by GET whose
 	// response arrived too late to capture still classifies — the REST-vs-not
 	// verdict then depends on the request, not on response timing (LAB-4678, B2).
@@ -117,9 +118,10 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 		reason = appendReason(reason, "content-type:"+rule2CT)
 	}
 
-	// pathIsAPI is computed once here and reused by Rule 3 (confidence boost)
-	// and Rule 6 (request-side signal gate) so the API-path scan runs once
-	// rather than twice in the same call (QUAL-003).
+	// pathIsAPI drives Rule 3's confidence boost. It is computed once here rather
+	// than inline so the API-path scan runs once per call (QUAL-003). Rule 6 no
+	// longer consults it: Phase 3 deliberately un-gated the request-side signal
+	// from the path allowlist (see Rule 6).
 	pathIsAPI := false
 	for _, seg := range apiPathSegments {
 		if strings.Contains(lowerPath, seg) {
@@ -163,38 +165,41 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 		}
 	}
 
-	// Rule 6: Request-side API signal (LAB-4678, B2).
+	// Rule 6: Request-side API signal (LAB-4678, B2 + Phase 3 "beyond allowlists").
 	// Rules 2 and 5 need a fully-arrived response, so a JSON API reached by GET
 	// whose response was captured half-finished (empty content-type and body)
 	// falls to the path boost alone (0.15) and is dropped — making the
 	// REST-vs-not verdict a function of response timing rather than a property
-	// of the app. When the request itself shows API intent on an API path,
-	// classify it regardless of whether the response was captured, so the
-	// verdict is stable for a given input. Non-GET methods are already covered
-	// by Rule 4 (0.7) independent of response timing; this rule closes the
-	// GET-with-JSON-intent gap. The API-path match alone is NOT sufficient (that
-	// stays at the Rule 3 boost) to avoid classifying plain navigations under
-	// api-like paths.
-	if pathIsAPI {
-		signal := ""
-		if apiCT := acceptSignalsAPI(mediatype.Header(req.Headers, "accept")); apiCT != "" {
-			signal = "accept:" + apiCT
+	// of the app.
+	//
+	// An EXPLICIT API media type in the request itself — a JSON/XML Accept the
+	// client asked for, or a JSON/XML request Content-Type it sent — is API
+	// intent on ANY path, not only allowlisted ones (Phase 3). The hardcoded
+	// apiPathSegments are not exhaustive, so gating this signal on them was
+	// blind by construction to APIs on non-standard paths. Dropping the path
+	// gate is guarded against over-classification: acceptSignalsAPI treats
+	// text/html and application/xhtml+xml as navigation and never matches the
+	// */* wildcard, so plain page loads and non-committal fetches contribute
+	// nothing here. Non-GET methods are already covered by Rule 4 (0.7); this
+	// closes the GET-with-explicit-JSON-intent gap regardless of path.
+	signal := ""
+	if apiCT := acceptSignalsAPI(mediatype.Header(req.Headers, "accept")); apiCT != "" {
+		signal = "accept:" + apiCT
+	}
+	if signal == "" {
+		// Only surface a request content-type signal that Rule 2 did not
+		// already record for the same media type; otherwise the -v reason
+		// would carry both "content-type:X" and "request-signal:content-type:X",
+		// which convey the same fact (QUAL-005).
+		if apiCT := matchAPIContentType(mediatype.Header(req.Headers, "content-type")); apiCT != "" && apiCT != rule2CT {
+			signal = "content-type:" + apiCT
 		}
-		if signal == "" {
-			// Only surface a request content-type signal that Rule 2 did not
-			// already record for the same media type; otherwise the -v reason
-			// would carry both "content-type:X" and "request-signal:content-type:X",
-			// which convey the same fact (QUAL-005).
-			if apiCT := matchAPIContentType(mediatype.Header(req.Headers, "content-type")); apiCT != "" && apiCT != rule2CT {
-				signal = "content-type:" + apiCT
-			}
+	}
+	if signal != "" {
+		if confidence < RequestSignalConfidence {
+			confidence = RequestSignalConfidence
 		}
-		if signal != "" {
-			if confidence < RequestSignalConfidence {
-				confidence = RequestSignalConfidence
-			}
-			reason = appendReason(reason, "request-signal:"+signal)
-		}
+		reason = appendReason(reason, "request-signal:"+signal)
 	}
 
 	return confidence > 0, confidence, reason

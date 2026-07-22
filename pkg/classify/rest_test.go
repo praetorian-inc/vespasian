@@ -556,14 +556,19 @@ func TestRESTClassifier_RequestSideSignal(t *testing.T) {
 			wantReasonSub: "request-signal:content-type",
 		},
 		{
-			name: "non-api path with Accept:json -> request signal does NOT fire",
+			// LAB-4678 Phase 3: an explicit JSON Accept is API intent on ANY
+			// path, not only allowlisted ones, so a JSON API on a non-standard
+			// path is no longer blind-spotted. The text/html and */* guards
+			// (asserted below) keep this from over-classifying navigations.
+			name: "non-allowlist path with explicit Accept:json -> request signal fires",
 			req: crawl.ObservedRequest{
 				Method:  "GET",
 				URL:     "https://example.com/dashboard",
 				Headers: map[string]string{"Accept": "application/json"},
 			},
-			wantIsAPI:   false,
-			wantMinConf: 0,
+			wantIsAPI:     true,
+			wantMinConf:   RequestSignalConfidence,
+			wantReasonSub: "request-signal:accept",
 		},
 	}
 
@@ -593,7 +598,10 @@ func TestRESTClassifier_RequestSideSignal(t *testing.T) {
 	// an api-like path (e.g. a Swagger UI at /api/docs) must NOT be classified
 	// as a REST API by the request-side signal (review finding 001).
 	const navAccept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
-	for _, p := range []string{"/api/docs", "/graphql", "/v2/dashboard"} {
+	// Includes non-allowlist paths (/dashboard, /profile): now that the request
+	// signal is path-independent (Phase 3), the navigation guard must hold there
+	// too — a browser page load must not classify regardless of path.
+	for _, p := range []string{"/api/docs", "/graphql", "/v2/dashboard", "/dashboard", "/profile"} {
 		_, navConf, navReason := c.ClassifyDetail(crawl.ObservedRequest{
 			Method:  "GET",
 			URL:     "https://example.com" + p,
