@@ -163,48 +163,44 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 		}
 	}
 
-	// Rule 6: Request-side API signal (LAB-4678, B2).
+	// Rule 6: Request-side API signal (LAB-4678, B2 + Phase 3 "beyond allowlists").
 	// Rules 2 and 5 need a fully-arrived response, so a JSON API reached by GET
 	// whose response was captured half-finished (empty content-type and body)
 	// falls to the path boost alone (0.15) and is dropped — making the
 	// REST-vs-not verdict a function of response timing rather than a property
-	// of the app. When the request itself shows API intent on an API path,
-	// classify it regardless of whether the response was captured, so the
-	// verdict is stable for a given input. Non-GET methods are already covered
-	// by Rule 4 (0.7) independent of response timing; this rule closes the
-	// GET-with-JSON-intent gap. The API-path match alone is NOT sufficient (that
-	// stays at the Rule 3 boost) to avoid classifying plain navigations under
-	// api-like paths.
-	pathIsAPI := false
-	for _, seg := range apiPathSegments {
-		if strings.Contains(lowerPath, seg) {
-			pathIsAPI = true
-			break
+	// of the app.
+	//
+	// An EXPLICIT API media type in the request itself — a JSON/XML Accept the
+	// client asked for, or a JSON/XML request Content-Type it sent — is API
+	// intent on ANY path, not only allowlisted ones (Phase 3). The hardcoded
+	// apiPathSegments are not exhaustive, so gating this signal on them was
+	// blind by construction to APIs on non-standard paths. Dropping the path
+	// gate is guarded against over-classification: acceptSignalsAPI treats
+	// text/html and application/xhtml+xml as navigation and never matches the
+	// */* wildcard, so plain page loads and non-committal fetches contribute
+	// nothing here. Non-GET methods are already covered by Rule 4 (0.7); this
+	// closes the GET-with-explicit-JSON-intent gap regardless of path.
+	signal := ""
+	if apiCT := acceptSignalsAPI(getHeader(req.Headers, "accept")); apiCT != "" {
+		signal = "accept:" + apiCT
+	}
+	if signal == "" {
+		reqCT := strings.ToLower(getHeader(req.Headers, "content-type"))
+		if idx := strings.Index(reqCT, ";"); idx != -1 {
+			reqCT = strings.TrimSpace(reqCT[:idx])
+		}
+		for _, apiCT := range apiContentTypes {
+			if reqCT == apiCT {
+				signal = "content-type:" + apiCT
+				break
+			}
 		}
 	}
-	if pathIsAPI {
-		signal := ""
-		if apiCT := acceptSignalsAPI(getHeader(req.Headers, "accept")); apiCT != "" {
-			signal = "accept:" + apiCT
+	if signal != "" {
+		if confidence < RequestSignalConfidence {
+			confidence = RequestSignalConfidence
 		}
-		if signal == "" {
-			reqCT := strings.ToLower(getHeader(req.Headers, "content-type"))
-			if idx := strings.Index(reqCT, ";"); idx != -1 {
-				reqCT = strings.TrimSpace(reqCT[:idx])
-			}
-			for _, apiCT := range apiContentTypes {
-				if reqCT == apiCT {
-					signal = "content-type:" + apiCT
-					break
-				}
-			}
-		}
-		if signal != "" {
-			if confidence < RequestSignalConfidence {
-				confidence = RequestSignalConfidence
-			}
-			reason = appendReason(reason, "request-signal:"+signal)
-		}
+		reason = appendReason(reason, "request-signal:"+signal)
 	}
 
 	return confidence > 0, confidence, reason

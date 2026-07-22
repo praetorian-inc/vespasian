@@ -255,7 +255,7 @@ Vespasian classifies and generates specifications for four API types:
 3. **Path heuristics**: `/api/`, `/v1/`, `/v2/`, `/v3/`, `/rest/`, `/rpc/` paths boost confidence
 4. **HTTP method**: POST/PUT/PATCH/DELETE to non-page URLs
 5. **Response structure**: JSON object or array bodies (not HTML)
-6. **Request-side signal**: an API path plus a JSON/XML `Accept` (or request content-type) classifies the endpoint even when its response was not captured, so the REST-vs-not verdict does not depend on response timing
+6. **Request-side signal**: an explicit JSON/XML `Accept` (or request content-type) classifies the endpoint on any path, even when its response was not captured — so the REST-vs-not verdict does not depend on response timing and is not limited to hardcoded API paths. Browser navigation (`text/html`) and non-committal (`*/*`) requests are excluded to avoid over-classification
 
 The classification signals above are content-based and deterministic: identical input traffic yields the same endpoint set, the same classification, and a byte-identical spec every run. Run with `-v` to see the per-endpoint classification reason, including near-miss endpoints that fell just below the threshold and were not emitted (so `-v` explains a missing endpoint, not only a present one).
 

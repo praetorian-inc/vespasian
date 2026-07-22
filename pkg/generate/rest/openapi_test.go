@@ -2307,3 +2307,50 @@ func TestGenerate_ResponseSchema_SurvivesEmptyBaseObservation(t *testing.T) {
 			"populated 201 response schema must survive regardless of observation order")
 	}
 }
+
+// TestUnionSchemaProperties_RecursiveAdditive verifies the Phase 3 response
+// schema union (LAB-4678): fields present in only one observation are preserved
+// both at the top level and nested under a shared object, and existing fields
+// are never removed or retyped.
+func TestUnionSchemaProperties_RecursiveAdditive(t *testing.T) {
+	strSchema := func() *openapi3.SchemaRef {
+		return &openapi3.SchemaRef{Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}}
+	}
+	objSchema := func(props map[string]*openapi3.SchemaRef) *openapi3.Schema {
+		return &openapi3.Schema{Type: &openapi3.Types{"object"}, Properties: props}
+	}
+
+	// dst: {id, user:{name}}   src: {email, user:{age}}
+	dst := objSchema(map[string]*openapi3.SchemaRef{
+		"id":   strSchema(),
+		"user": {Value: objSchema(map[string]*openapi3.SchemaRef{"name": strSchema()})},
+	})
+	src := objSchema(map[string]*openapi3.SchemaRef{
+		"email": strSchema(),
+		"user":  {Value: objSchema(map[string]*openapi3.SchemaRef{"age": strSchema()})},
+	})
+
+	unionSchemaProperties(dst, src, maxSchemaUnionDepth)
+
+	// Top-level union: id (dst-only) and email (src-only) both present.
+	assert.Contains(t, dst.Properties, "id")
+	assert.Contains(t, dst.Properties, "email")
+	// Nested union under the shared "user": both name and age present.
+	user := dst.Properties["user"].Value
+	require.NotNil(t, user)
+	assert.Contains(t, user.Properties, "name", "existing nested field retained")
+	assert.Contains(t, user.Properties, "age", "src-only nested field added")
+}
+
+// TestUnionSchemaProperties_DepthGuard verifies recursion stops at depth 0
+// without panicking (guards against pathological/cyclic inferred schemas).
+func TestUnionSchemaProperties_DepthGuard(t *testing.T) {
+	obj := &openapi3.Schema{Type: &openapi3.Types{"object"}, Properties: map[string]*openapi3.SchemaRef{
+		"a": {Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}},
+	}}
+	src := &openapi3.Schema{Type: &openapi3.Types{"object"}, Properties: map[string]*openapi3.SchemaRef{
+		"b": {Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}},
+	}}
+	unionSchemaProperties(obj, src, 0) // depth 0 -> no-op
+	assert.NotContains(t, obj.Properties, "b", "depth 0 must not merge")
+}

@@ -34,6 +34,17 @@ const (
 // both others. WSDL wins when it has matches and at least as many as REST.
 // Otherwise REST is returned.
 //
+// The count-comparison is deliberate: it selects the DOMINANT surface, so a
+// mostly-REST app with one incidental SOAP/GraphQL-looking request is still
+// typed REST (and a weak signal like a lone text/xml response cannot flip the
+// whole capture). A prior LAB-4678 Phase 3 attempt to make GraphQL/WSDL win on
+// presence alone was reverted: it flipped the type on weak/minority signals and
+// discarded the dominant REST surface for mixed apps. The run-to-run verdict
+// instability the ticket targets comes from capture-count variance upstream,
+// which the Phase 0/1 determinism work addresses; there is no
+// DetectAPIType-level change that improves stability without breaking
+// dominant-surface selection.
+//
 // Note: this performs a lightweight classification pass separate from the full
 // RunClassifiers call inside ClassifyProbeGenerate. The duplication is
 // intentional — DetectAPIType only needs to answer "which generator?", while
