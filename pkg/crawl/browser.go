@@ -221,11 +221,16 @@ const chromeEgressSink = "https://vespasian-blocked.invalid"
 //     kDefaultRegistrationURL; switches defined in
 //     google_apis/gcm/engine/gservices_switches.cc).
 //   - --gcm-mcs-endpoint redirects the GCM Mobile Connection Server's
-//     persistent connection, normally mtalk.google.com:5228 (same files:
-//     kDefaultMCSHostname/kDefaultMCSMainSecurePort). Setting this switch also
-//     suppresses the fallback endpoint that would otherwise be tried
-//     (GServicesSettings::GetMCSFallbackEndpoint returns empty once the
-//     switch is present).
+//     persistent connection, normally mtalk.google.com:5228. The switch value
+//     is parsed as a full URL, not a bare host:port: GServicesSettings::
+//     GetMCSMainEndpoint returns GURL(GetSwitchValueASCII(kGCMMCSEndpoint))
+//     verbatim (google_apis/gcm/engine/gservices_settings.cc), matching
+//     Chrome's own default which is built from kMCSEnpointTemplate "https://%s:%d"
+//     in the same file — so "https://…:5228" is the correct form, a present
+//     switch is always honored, and there is no code path that falls back to
+//     mtalk on a malformed value. Setting the switch also suppresses the
+//     fallback endpoint that would otherwise be tried
+//     (GServicesSettings::GetMCSFallbackEndpoint).
 //   - --apps-gallery-update-url redirects the Chrome Web Store extension
 //     update check away from clients2.google.com/service/update2/crx
 //     (extension_urls::GetDefaultWebstoreUpdateUrl, overridden by
@@ -244,7 +249,16 @@ const chromeEgressSink = "https://vespasian-blocked.invalid"
 //     proto definitions). Tradeoff: disables Safe Browsing's privacy-preserving
 //     real-time hash-prefix lookups for the crawl's duration; the standard
 //     locally-cached hash-prefix list (unaffected) still provides baseline
-//     protection.
+//     protection. Applied to every crawl, not just CI — this is deliberate: an
+//     automated headless crawler has no human to phish, must not let Safe-
+//     Browsing interstitials interrupt assessment of intentionally-hostile
+//     targets, and should not leak hashed target URLs to Google. Together with
+//     the --disable-component-update CRLSet/list-refresh tradeoff above, the
+//     reduced defense-in-depth is a reviewed, accepted posture (capability-pr-
+//     review SEC-BE-001) tracked under LAB-4732's block-mode flip; it is
+//     bounded by the retained TLS chain verification against the OS trust
+//     store, the cached hash-prefix list, the SSRF/scope guards, and the
+//     short-lived, operator-initiated nature of a crawl.
 //
 // Investigated and rejected: --safebrowsing-disable-auto-update was removed
 // from Chromium in November 2017 and no longer exists — it would be silently
@@ -253,10 +267,10 @@ const chromeEgressSink = "https://vespasian-blocked.invalid"
 // Known gap: no reliable CLI switch was found for www.google.com. The one
 // candidate, --google-url, defaults to "google.com" (not "www.google.com")
 // and has a single low-confidence production consumer
-// (google_apis/gaia/gaia_urls.cc), so it is not added here. Suppressing that
-// host, if still observed in a live audit, needs an egress-allowlist entry or
-// an AC2 revision rather than a launch flag (tracked under LAB-4732's
-// block-mode flip).
+// (google_apis/gaia/gaia_urls.cc), so it is not added here. Per the LAB-4999
+// review (REQ-001), if a live audit still shows this host it is handled as a
+// justified egress-allowlist entry in LAB-4732 (the ticket that owns the
+// block-mode flip), not by a launch flag.
 //
 // This change has not been re-validated against a live step-security/harden-runner
 // audit of branded Chrome — that verification is tracked under LAB-4732's

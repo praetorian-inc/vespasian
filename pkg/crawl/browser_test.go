@@ -284,6 +284,17 @@ func TestConfigureLauncher(t *testing.T) {
 			}
 		}
 
+		// The URL-override suppression below is only meaningful if the sink
+		// itself never resolves. Assert that property independently of the
+		// shared chromeEgressSink constant: a regression repointing the
+		// constant at a resolving host (e.g. https://accounts.google.com)
+		// would move prod and the per-flag value checks together and still
+		// pass, silently re-enabling the egress. RFC 2606 reserves the
+		// .invalid TLD as guaranteed-non-resolvable.
+		if !strings.HasSuffix(chromeEgressSink, ".invalid") {
+			t.Errorf("chromeEgressSink %q must use the non-resolving .invalid TLD (RFC 2606)", chromeEgressSink)
+		}
+
 		// URL-override switches (accounts.google.com, GCM, extension update):
 		// each must be set AND point at the non-resolving sink, not merely be
 		// present (a present-but-wrong-value flag would be as ineffective as a
