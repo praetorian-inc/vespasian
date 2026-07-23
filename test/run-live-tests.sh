@@ -73,6 +73,7 @@ LIVE_TARGETS=(
     edge-cases
     crawl-depth
     forms-target
+    no-download
 )
 
 # join_targets prints array elements as a comma-separated string.
@@ -178,7 +179,7 @@ preflight_test_host() {
     local targets=$1
     local failed=0
     case ",${targets}," in
-        *,rest-api,*|*,edge-cases,*|*,crawl-depth,*)
+        *,rest-api,*|*,edge-cases,*|*,crawl-depth,*|*,no-download,*)
             _probe_target_host "${REST_API_PORT:-}" "/api/health" "rest-api" || failed=1
             ;;
     esac
@@ -3486,6 +3487,108 @@ PYEOF
 # Summary
 # ──────────────────────────────────────────────────────────────
 
+# test_no_download regresses LAB-4999 Finding 1 at the live layer: a real
+# headless crawl must use the system browser and NOT trigger go-rod's managed
+# browser download. go-rod only populates its cache dir
+# (<HOME>/.cache/rod/browser/chromium-<rev>) when no binary is pinned; with the
+# LookPath pin in place that directory is never written. We wipe and recreate a
+# temporary HOME so go-rod's cache starts guaranteed-empty, run the crawl under
+# it, and fail if the cache is non-empty afterwards. launcher.LookPath resolves
+# the *system* Chrome from PATH/standard locations independently of HOME, so a
+# correct pin still finds it (no download); only a regressed pin downloads into
+# the empty cache. Starting from a freshly-wiped cache (rather than diffing a
+# shared or reused one) closes the gap where a browser left at the current pinned
+# revision by a prior run would let a regression reuse it without writing a new
+# entry — a false pass a before/after diff could not catch.
+test_no_download() {
+    local port="${REST_API_PORT:-8990}"
+    local base_url="http://${TEST_HOST}:${port}"
+    local target_dir="${RESULTS_DIR}/no-download"
+    local iso_home="${target_dir}/home"
+    local rod_cache="${iso_home}/.cache/rod/browser"
+
+    # Wipe the isolated cache so it starts empty regardless of prior local runs
+    # (a chromium-<rev> left by an earlier regressed or opt-in-download run would
+    # otherwise mask a still-regressed pin).
+    rm -rf "$iso_home"
+    mkdir -p "$target_dir" "$iso_home"
+    init_test_status "no-download"
+    local start=$SECONDS
+
+    log_header "Testing: no-download (${base_url})"
+
+    if ! chrome_available; then
+        log_warn "no-download: Chrome unavailable, skipping (no headless launch to exercise)"
+        set_test_result "no-download" "SKIP" "-" "-" "$((SECONDS - start))"
+        return 0
+    fi
+
+    log_info "Running headless crawl to assert no browser download..."
+    # Capture merged stdout+stderr (crawl_backend already does 2>&1) so the
+    # skip-vs-fail decision below can inspect what go-rod actually did, not just
+    # whether the crawl exited zero.
+    local crawl_log="${target_dir}/crawl.log"
+    local crawl_ok=true
+    if ! ( export HOME="$iso_home"; crawl_backend "$base_url" "${target_dir}/capture.json" true --depth 1 --max-pages 5 --timeout 2m ) >"$crawl_log" 2>&1; then
+        crawl_ok=false
+    fi
+
+    # Detection 1 — audit egress (download succeeds): go-rod writes the managed
+    # Chromium into the freshly-wiped isolated cache. A correct system-Chrome pin
+    # never writes it; any chromium-<rev> means go-rod downloaded a browser.
+    local downloaded
+    downloaded=$(ls -A "$rod_cache" 2>/dev/null || true)
+    if [ -n "$downloaded" ]; then
+        log_fail "go-rod downloaded a browser into ${rod_cache} during the crawl — LAB-4999 pin regressed"
+        log_info "rod cache contents: [${downloaded}]"
+        set_test_result "no-download" "FAIL" "-" "-" "$((SECONDS - start))"
+        return 1
+    fi
+
+    # Detection 2 — block egress (download blocked): under the LAB-4732
+    # egress-policy: block this PR unblocks, a regressed pin makes go-rod TRY to
+    # fetch a managed Chromium, but fetchup's FastestURL() finds no reachable
+    # mirror, returns ErrNoURLs, and Download() (the only cache-writing code) is
+    # never reached — so the cache stays empty and the crawl fails. Detection 1
+    # alone would mask this as a SKIP. These markers appear ONLY when go-rod takes
+    # the auto-download path (.Bin empty = pin regressed); which ones show depends
+    # on egress mode, and the guard matches any:
+    #   - "can't find a browser binary for your OS" — go-rod Download() error wrap
+    #     (block egress: the download failed).
+    #   - "Not able to find a valid URL to download" — fetchup ErrNoURLs; its
+    #     message embeds the mirror-host URL list, so the host markers below also
+    #     appear here (block egress).
+    #   - "[launcher.Browser]" — go-rod's download-logger prefix (audit egress,
+    #     where the download proceeds).
+    #   - the three go-rod mirror hosts (HostGoogle/HostNPM/HostPlaywright).
+    # None appear on a normal pinned crawl, which never enters the download path.
+    local dl_markers="can't find a browser binary for your OS|Not able to find a valid URL to download|\[launcher\.Browser\]|storage\.googleapis\.com|registry\.npmmirror\.com|playwright\.azureedge\.net"
+    if grep -qiE "$dl_markers" "$crawl_log"; then
+        log_fail "go-rod attempted a browser download during the crawl — LAB-4999 pin regressed (download blocked by egress policy)"
+        log_info "matching crawl output:"
+        grep -iE "$dl_markers" "$crawl_log" | head -5
+        set_test_result "no-download" "FAIL" "-" "-" "$((SECONDS - start))"
+        return 1
+    fi
+
+    # Neither detection tripped: the cache is empty AND go-rod never took the
+    # download path. A crawl failure here is a genuine launch failure (Chrome
+    # unlaunchable in this environment, or the correct "no system Chrome" refusal
+    # when no browser is installed), not a pin regression — degrade to skip,
+    # matching the other rod targets.
+    if [ "$crawl_ok" = false ]; then
+        log_warn "no-download: headless crawl failed with no download attempt (Chrome may be unlaunchable), skipping"
+        log_info "crawl output tail:"
+        tail -n 5 "$crawl_log" 2>/dev/null || true
+        set_test_result "no-download" "SKIP" "-" "-" "$((SECONDS - start))"
+        return 0
+    fi
+
+    log_ok "No browser download detected; system Chrome was used"
+    set_test_result "no-download" "PASS" "-" "-" "$((SECONDS - start))"
+    return 0
+}
+
 print_summary() {
     local total_pass=0 total_fail=0 total_skip=0
 
@@ -3548,7 +3651,7 @@ usage() {
     echo "                                      import-mitmproxy, import-mitmproxy-native,"
     echo "                                      import-unicode, import-duplicates,"
     echo "                                      import-malformed, import-empty"
-    echo "                          Crawl:      crawl-depth, crawl-unreachable"
+    echo "                          Crawl:      crawl-depth, crawl-unreachable, no-download"
     echo "                          Edge cases: edge-cases, classifier-edge, spec-edge"
     echo "  --verbose             Enable verbose vespasian output"
     echo "  --no-build            Skip building vespasian and target binaries"
@@ -3690,6 +3793,7 @@ main() {
             edge-cases)         test_edge_cases ;;
             crawl-depth)        test_crawl_depth ;;
             crawl-unreachable)  test_crawl_unreachable ;;
+            no-download)        test_no_download ;;
             classifier-edge)    test_classifier_edge_cases ;;
             spec-edge)          test_spec_edge_cases ;;
             *)

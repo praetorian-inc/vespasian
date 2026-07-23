@@ -163,27 +163,29 @@ if [[ "$FAIL" -eq "$drift_fail_before" ]]; then
 fi
 
 echo ""
-echo "=== Absolute group-size anchors (AC#3: 19 offline + 8 live = 27) ==="
+echo "=== Absolute group-size anchors (AC#3: 19 offline + 9 live = 28) ==="
 
 # Pin concrete group sizes as literals, independent of the sourced arrays. The
 # behavioral --group tests derive expected from the same OFFLINE_TARGETS/
 # LIVE_TARGETS under test, so a coordinated silent target drop shrinks expected
 # and actual in lockstep and passes green. These literals encode the LAB-4773
-# AC#3 contract ("all 27 targets still run") so any such drop trips here.
+# AC#3 contract ("all 28 targets still run") so any such drop trips here.
+# (LAB-3269 added `forms-target` and LAB-4999 added the live-only `no-download`
+# egress guard: 7 -> 9 live, 26 -> 28 total.)
 if [[ "${#OFFLINE_TARGETS[@]}" -eq 19 ]]; then
     pass "OFFLINE_TARGETS has exactly 19 members"
 else
     fail "OFFLINE_TARGETS count drifted: expected 19, got ${#OFFLINE_TARGETS[@]}"
 fi
-if [[ "${#LIVE_TARGETS[@]}" -eq 8 ]]; then
-    pass "LIVE_TARGETS has exactly 8 members"
+if [[ "${#LIVE_TARGETS[@]}" -eq 9 ]]; then
+    pass "LIVE_TARGETS has exactly 9 members"
 else
-    fail "LIVE_TARGETS count drifted: expected 8, got ${#LIVE_TARGETS[@]}"
+    fail "LIVE_TARGETS count drifted: expected 9, got ${#LIVE_TARGETS[@]}"
 fi
-if [[ "$group_count" -eq 27 ]]; then
-    pass "Grouped targets total 27 (AC#3: all 27 targets still run)"
+if [[ "$group_count" -eq 28 ]]; then
+    pass "Grouped targets total 28 (AC#3: all 28 targets still run)"
 else
-    fail "Grouped-target total drifted: expected 27, got $group_count"
+    fail "Grouped-target total drifted: expected 28, got $group_count"
 fi
 
 echo ""

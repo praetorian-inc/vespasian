@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/launcher/flags"
 )
 
 // TEST-001 regression: SetCookies on a BrowserManager whose browser field
@@ -83,6 +84,10 @@ func TestConfigureLauncher(t *testing.T) {
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
+				// Pin a fake system browser so these cases assert sandbox flags
+				// without depending on a Chrome being installed on the host
+				// (e.g. arm64 dev machines); pinning is covered separately below.
+				stubLookPath(t, "/usr/bin/chromium", true)
 				t.Setenv("VESPASIAN_NO_SANDBOX", tt.envVal)
 
 				// Assert Vespasian's own opt-in decision directly via the
@@ -124,6 +129,7 @@ func TestConfigureLauncher(t *testing.T) {
 
 	t.Run("proxy", func(t *testing.T) {
 		t.Run("valid proxy sets flag", func(t *testing.T) {
+			stubLookPath(t, "/usr/bin/chromium", true)
 			l, err := configureLauncher(BrowserOptions{Proxy: "http://127.0.0.1:8080"})
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -141,9 +147,30 @@ func TestConfigureLauncher(t *testing.T) {
 				t.Errorf("error %q should mention proxy", err.Error())
 			}
 		})
+		// Pin the proxy-validation-before-binary-pinning ordering deterministically:
+		// with NO system browser resolvable, an invalid proxy must still surface as a
+		// proxy error, not a "no system Chrome" error. Without stubbing LookPath this
+		// guard would be host-dependent (a host with Chrome installed would let a
+		// reverted pin-first ordering pass anyway). See configureLauncher's ordering note.
+		t.Run("invalid proxy errors before binary pinning even with no browser", func(t *testing.T) {
+			stubLookPath(t, "", false)
+			_, err := configureLauncher(BrowserOptions{Proxy: "not a valid proxy"})
+			if err == nil {
+				t.Fatal("expected error for invalid proxy, got nil")
+			}
+			if !strings.Contains(err.Error(), "proxy") {
+				t.Errorf("error %q should be the proxy-validation error", err.Error())
+			}
+			if strings.Contains(err.Error(), "system Chrome") {
+				t.Errorf("proxy validation must run before binary pinning; got binary-pin error: %v", err)
+			}
+		})
 	})
 
 	t.Run("chrome path", func(t *testing.T) {
+		// Explicit ChromePath wins and LookPath is never consulted, even when
+		// LookPath would resolve a different binary.
+		stubLookPath(t, "/should/not/be/used", true)
 		l, err := configureLauncher(BrowserOptions{ChromePath: "/usr/bin/chromium"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -152,6 +179,164 @@ func TestConfigureLauncher(t *testing.T) {
 			t.Errorf("Get(rod-bin) = %q, want /usr/bin/chromium", got)
 		}
 	})
+
+	// Finding 1 (LAB-4999): when ChromePath is unset the launcher pins the
+	// system browser via LookPath and never falls through to go-rod's
+	// third-party-mirror download unless downloads are explicitly opted in.
+	t.Run("browser binary pinning", func(t *testing.T) {
+		t.Run("LookPath found pins that binary", func(t *testing.T) {
+			stubLookPath(t, "/opt/google/chrome/chrome", true)
+			l, err := configureLauncher(BrowserOptions{})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := l.Get("rod-bin"); got != "/opt/google/chrome/chrome" {
+				t.Errorf("Get(rod-bin) = %q, want /opt/google/chrome/chrome", got)
+			}
+		})
+
+		t.Run("no browser and no opt-in errors without pinning", func(t *testing.T) {
+			t.Setenv("VESPASIAN_ALLOW_BROWSER_DOWNLOAD", "")
+			stubLookPath(t, "", false)
+			l, err := configureLauncher(BrowserOptions{})
+			if err == nil {
+				t.Fatal("expected error when no system browser is found, got nil")
+			}
+			if !strings.Contains(err.Error(), "VESPASIAN_ALLOW_BROWSER_DOWNLOAD") {
+				t.Errorf("error %q should name the opt-in env var", err.Error())
+			}
+			if l != nil {
+				t.Error("expected nil launcher on error")
+			}
+		})
+
+		t.Run("no browser with field opt-in allows download", func(t *testing.T) {
+			t.Setenv("VESPASIAN_ALLOW_BROWSER_DOWNLOAD", "")
+			stubLookPath(t, "", false)
+			l, err := configureLauncher(BrowserOptions{AllowBrowserDownload: true})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			// Binary left unset so go-rod performs its managed download.
+			if got := l.Get("rod-bin"); got != "" {
+				t.Errorf("Get(rod-bin) = %q, want empty (download fallback)", got)
+			}
+		})
+
+		t.Run("no browser with env opt-in allows download", func(t *testing.T) {
+			t.Setenv("VESPASIAN_ALLOW_BROWSER_DOWNLOAD", "true")
+			stubLookPath(t, "", false)
+			l, err := configureLauncher(BrowserOptions{})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := l.Get("rod-bin"); got != "" {
+				t.Errorf("Get(rod-bin) = %q, want empty (download fallback)", got)
+			}
+		})
+
+		t.Run("no browser with arbitrary env value still errors", func(t *testing.T) {
+			// Default-deny: only the exact string "true" opts in. Any other
+			// non-empty value must still error rather than allow a download —
+			// mirrors the NoSandbox "env false"/"env arbitrary value" cases and
+			// guards against a truthy-parsing regression.
+			stubLookPath(t, "", false)
+			for _, v := range []string{"1", "false", "TRUE", "yes"} {
+				t.Setenv("VESPASIAN_ALLOW_BROWSER_DOWNLOAD", v)
+				l, err := configureLauncher(BrowserOptions{})
+				if err == nil {
+					t.Errorf("env %q: expected no-system-Chrome error, got nil", v)
+				} else if !strings.Contains(err.Error(), "VESPASIAN_ALLOW_BROWSER_DOWNLOAD") {
+					// Pin the default-deny guard to the pin-refusal error (which
+					// names the opt-in env var), matching the sibling opt-in
+					// subtest, so a future unrelated early error can't mask a
+					// truthy-parsing regression.
+					t.Errorf("env %q: error %q should name the opt-in env var", v, err.Error())
+				}
+				if l != nil {
+					t.Errorf("env %q: expected nil launcher on error", v)
+				}
+			}
+		})
+	})
+
+	// Finding 2 (LAB-4999): telemetry/phone-home-disabling flags are always
+	// applied, and disable-features is appended to (preserving go-rod's own
+	// site-per-process / TranslateUI defaults) rather than overwritten.
+	t.Run("telemetry flags", func(t *testing.T) {
+		stubLookPath(t, "/usr/bin/chromium", true)
+		l, err := configureLauncher(BrowserOptions{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		for _, flag := range []flags.Flag{"disable-component-update", "disable-domain-reliability", "no-pings"} {
+			if !l.Has(flag) {
+				t.Errorf("expected launcher to have flag %q", flag)
+			}
+		}
+		feats, ok := l.GetFlags("disable-features")
+		if !ok {
+			t.Fatal("expected disable-features flag to be set")
+		}
+		for _, want := range []string{"site-per-process", "TranslateUI", "OptimizationHints", "AutofillServerCommunication", "SafeBrowsingHashPrefixRealTimeLookups"} {
+			if !containsStr(feats, want) {
+				t.Errorf("disable-features %v should contain %q", feats, want)
+			}
+		}
+
+		// The URL-override suppression below is only meaningful if the sink
+		// itself never resolves. Assert that property independently of the
+		// shared chromeEgressSink constant: a regression repointing the
+		// constant at a resolving host (e.g. https://accounts.google.com)
+		// would move prod and the per-flag value checks together and still
+		// pass, silently re-enabling the egress. RFC 2606 reserves the
+		// .invalid TLD as guaranteed-non-resolvable.
+		if !strings.HasSuffix(chromeEgressSink, ".invalid") {
+			t.Errorf("chromeEgressSink %q must use the non-resolving .invalid TLD (RFC 2606)", chromeEgressSink)
+		}
+
+		// URL-override switches (accounts.google.com, GCM, extension update):
+		// each must be set AND point at the non-resolving sink, not merely be
+		// present (a present-but-wrong-value flag would be as ineffective as a
+		// missing one).
+		for _, tc := range []struct {
+			flag flags.Flag
+			want string
+		}{
+			{"gaia-url", chromeEgressSink},
+			{"gcm-checkin-url", chromeEgressSink + "/checkin"},
+			{"gcm-registration-url", chromeEgressSink + "/register"},
+			{"gcm-mcs-endpoint", chromeEgressSink + ":5228"},
+			{"apps-gallery-update-url", chromeEgressSink + "/no-extension-updates"},
+		} {
+			if !l.Has(tc.flag) {
+				t.Errorf("expected launcher to have flag %q", tc.flag)
+				continue
+			}
+			if got := l.Get(tc.flag); got != tc.want {
+				t.Errorf("flag %q = %q, want %q", tc.flag, got, tc.want)
+			}
+		}
+	})
+}
+
+// stubLookPath swaps the package-level browserLookPath for the duration of a
+// test so the no-browser-found and found paths can be exercised regardless of
+// what is installed on the host. The original is restored via t.Cleanup.
+func stubLookPath(t *testing.T, path string, found bool) {
+	t.Helper()
+	orig := browserLookPath
+	browserLookPath = func() (string, bool) { return path, found }
+	t.Cleanup(func() { browserLookPath = orig })
+}
+
+func containsStr(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestNewBrowserManager_InvalidProxyReturnsError(t *testing.T) {
@@ -164,5 +349,95 @@ func TestNewBrowserManager_InvalidProxyReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "proxy") {
 		t.Errorf("error %q should mention proxy", err.Error())
+	}
+}
+
+// TestValidateProxyAddr tests the proxy address validation.
+func TestValidateProxyAddr(t *testing.T) {
+	tests := []struct {
+		name    string
+		addr    string
+		wantErr bool
+		errMsg  string
+	}{
+		{"valid http", "http://127.0.0.1:8080", false, ""},
+		{"valid https", "https://proxy.example.com:8443", false, ""},
+		{"valid socks5", "socks5://127.0.0.1:1080", false, ""},
+		{"valid http no port", "http://proxy.local", false, ""},
+		{"missing scheme", "127.0.0.1:8080", true, "invalid proxy address"},
+		{"ftp scheme", "ftp://proxy:21", true, "scheme must be"},
+		{"empty host", "http://", true, "missing host"},
+		// url.Parse failure with no '@': exercises the parse-error branch the
+		// credential-'@' rewrite now sits in front of. The "address:" (colon
+		// immediately after "address") substring appears only in the parse-error
+		// message, not the quoted scheme/host ones, so it pins that branch.
+		{"unparseable url no creds", "http://[::1", true, "invalid proxy address:"},
+		{"embedded credentials", "http://user:pass@127.0.0.1:8080", true, "embedded credentials"},
+		{"embedded user only", "http://user@127.0.0.1:8080", true, "embedded credentials"},
+		{"scheme-less credentials", "user:pass@127.0.0.1:8080", true, "embedded credentials"},
+		{"ipv6 with credentials", "http://user:pass@[::1]:8080", true, "embedded credentials"},
+		{"ipv6 host no credentials", "http://[::1]:8080", false, ""},
+		// A proxy address has no legitimate userinfo, so ANY '@' is rejected as
+		// embedded credentials — including forms where the userinfo contains a
+		// '/', '?' or '#' that a boundary-limited scan would miss (and that also
+		// make the URL unparseable, so a parse-error echo could leak the secret).
+		{"at in path rejected", "http://127.0.0.1:8080/callback@handler", true, "embedded credentials"},
+		{"creds with slash in password", "http://user:pa/ss@127.0.0.1:8080", true, "embedded credentials"},
+		{"creds with question in password", "http://user:pa?ss@127.0.0.1:8080", true, "embedded credentials"},
+		{"creds with hash in password", "http://user:pa#ss@127.0.0.1:8080", true, "embedded credentials"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateProxyAddr(tt.addr)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateProxyAddr(%q) error = %v, wantErr %v", tt.addr, err, tt.wantErr)
+			}
+			if tt.wantErr && tt.errMsg != "" && err != nil {
+				if !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("ValidateProxyAddr(%q) error = %q, want containing %q", tt.addr, err.Error(), tt.errMsg)
+				}
+			}
+		})
+	}
+
+	// Verify credentials are never echoed in error messages, even when
+	// other validation (e.g., scheme) would also fail.
+	credentialLeakCases := []struct {
+		name string
+		addr string
+	}{
+		{"http with creds", "http://admin:s3cret@proxy:8080"},
+		{"wrong scheme with creds", "ftp://admin:s3cret@proxy:21"},
+		{"user only", "http://admin@proxy:8080"},
+		{"scheme-less creds", "admin:s3cret@127.0.0.1:8080"},
+		// Credentials must be scrubbed even when the address also fails
+		// url.Parse (bad port) — the credential check runs before parsing.
+		{"bad port with creds", "http://admin:s3cret@127.0.0.1:8o80"},
+		// ...and when the password contains a '/' or '?' that would shift an
+		// RFC-authority boundary and re-leak through the parse/scheme error.
+		{"slash in password", "http://admin:s3cret/x@proxy:8080"},
+		{"question in password", "http://admin:s3cret?x@proxy:8080"},
+		// ...and when it contains a literal '://' (would fool a scheme-prefix
+		// scan) or an extra '@'. The middle segment repeats "s3cret" so the
+		// leak assertion below fails if the mask keys off the FIRST '@' (which
+		// would echo "...@s3cret@...") instead of the LAST.
+		{"scheme marker in password", "admin:s3cret://@proxy.local:8080"},
+		{"extra at in credentials", "admin:s3cret@s3cret@proxy:8080"},
+	}
+	for _, tt := range credentialLeakCases {
+		t.Run("redacted/"+tt.name, func(t *testing.T) {
+			err := ValidateProxyAddr(tt.addr)
+			if err == nil {
+				t.Fatal("expected error for embedded credentials")
+			}
+			msg := err.Error()
+			if strings.Contains(msg, "admin") || strings.Contains(msg, "s3cret") {
+				t.Errorf("error message leaks credentials: %s", msg)
+			}
+			if !strings.Contains(msg, "xxxxx") {
+				t.Errorf("error message should contain redacted placeholder 'xxxxx': %s", msg)
+			}
+		})
 	}
 }
