@@ -203,6 +203,25 @@ func (e *rodEngine) Close() error {
 	return e.browser.Close()
 }
 
+// pageBudgetReached reports whether the visited-page budget is exhausted,
+// taking mu for the duration of the check. maxPages <= 0 means unlimited. When
+// reserve is true and the budget is not yet reached, it consumes one page slot
+// before returning false — the compare and the increment happen in a single
+// critical section so concurrent workers cannot overshoot the cap (a separate
+// check-then-increment would race). Pass reserve=false for the pre-Pop
+// early-out that must not consume a slot.
+func pageBudgetReached(mu *sync.Mutex, pageCount *int, maxPages int, reserve bool) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	if maxPages > 0 && *pageCount >= maxPages {
+		return true
+	}
+	if reserve {
+		*pageCount++
+	}
+	return false
+}
+
 // worker is the per-tab goroutine. It takes URLs from the frontier, visits
 // each one in a fresh tab, captures network events, extracts links, and pushes
 // discovered URLs back to the frontier.
@@ -214,13 +233,11 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		}
 
 		// Stop taking new pages once the page budget is reached. Pages already
-		// being visited by other workers still finalize below.
-		mu.Lock()
-		if maxPages > 0 && *pageCount >= maxPages {
-			mu.Unlock()
+		// being visited by other workers still finalize below. Check-only (no
+		// reservation): we have not popped an entry yet.
+		if pageBudgetReached(mu, pageCount, maxPages, false) {
 			return
 		}
-		mu.Unlock()
 
 		entry, ok := e.frontier.Pop()
 		if !ok {
@@ -236,14 +253,10 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		// exceeds MaxPages. Reserving before the visit (rather than counting
 		// after) keeps the cap exact instead of overshooting by up to
 		// Concurrency pages.
-		mu.Lock()
-		if maxPages > 0 && *pageCount >= maxPages {
-			mu.Unlock()
+		if pageBudgetReached(mu, pageCount, maxPages, true) {
 			e.frontier.MarkIdle()
 			return
 		}
-		*pageCount++
-		mu.Unlock()
 
 		requests, links, err := e.visitPage(ctx, entry)
 		if err != nil {

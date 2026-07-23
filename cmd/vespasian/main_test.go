@@ -35,6 +35,7 @@ import (
 
 	"github.com/praetorian-inc/vespasian/internal/pipeline"
 	"github.com/praetorian-inc/vespasian/pkg/analyze"
+	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
@@ -2594,6 +2595,35 @@ func TestMaybeReplayJSExtracted_DefaultGateOpen(t *testing.T) {
 	got := maybeReplayJSExtracted(context.Background(), requests, gate, cfg)
 	require.NotZero(t, hits, "with the default gate open, maybeReplayJSExtracted must forward to crawl.ReplayJSExtracted and fire outbound HTTP")
 	require.Greater(t, len(got), len(requests), "JS-replay must append the recovered endpoint to the requests slice when the default gate is open")
+}
+
+// TestCLIConfidenceDefaultMatchesConstant pins the doc contract on
+// classify.DefaultConfidenceThreshold (QUAL-001). Kong `default:` tags must be
+// string literals, so the scan/generate --confidence fields carry the literal
+// 0.5 rather than referencing the constant. This test parses each command with
+// no --confidence flag and asserts the applied default equals the constant, so
+// CI fails if the CLI literal and the constant ever drift apart.
+func TestCLIConfidenceDefaultMatchesConstant(t *testing.T) {
+	t.Run("generate", func(t *testing.T) {
+		var cli struct {
+			Generate GenerateCmd `cmd:"" name:"generate"`
+		}
+		p := kong.Must(&cli, kong.Name("vespasian"))
+		_, err := p.Parse([]string{"generate", "rest", "capture.json"})
+		require.NoError(t, err, "parsing generate with no --confidence")
+		require.Equal(t, classify.DefaultConfidenceThreshold, cli.Generate.Confidence,
+			"generate --confidence default must equal classify.DefaultConfidenceThreshold")
+	})
+	t.Run("scan", func(t *testing.T) {
+		var cli struct {
+			Scan ScanCmd `cmd:"" name:"scan"`
+		}
+		p := kong.Must(&cli, kong.Name("vespasian"))
+		_, err := p.Parse([]string{"scan", "https://example.com"})
+		require.NoError(t, err, "parsing scan with no --confidence")
+		require.Equal(t, classify.DefaultConfidenceThreshold, cli.Scan.Confidence,
+			"scan --confidence default must equal classify.DefaultConfidenceThreshold")
+	})
 }
 
 // TestGenerateSpec_ExtractsFormParametersIntoOpenAPI verifies the end-to-end promise of the

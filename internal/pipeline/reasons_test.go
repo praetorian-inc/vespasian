@@ -100,6 +100,38 @@ func TestLogClassificationReasons_UnparseablePathFallback(t *testing.T) {
 	}
 }
 
+// TestLogClassificationReasons_SanitizesTerminalEscapes verifies that control
+// and escape bytes in the untrusted path and method are neutralized before the
+// -v line is written to the operator's terminal (SEC-BE-001). A crawled/imported
+// target can carry percent-decoded control bytes in its path (url.Parse decodes
+// %1b into a raw ESC), which would otherwise inject ANSI sequences or split the
+// log line.
+func TestLogClassificationReasons_SanitizesTerminalEscapes(t *testing.T) {
+	var buf bytes.Buffer
+	logClassificationReasons(&buf, []classify.ClassifiedRequest{
+		// Path carries a raw ESC (0x1b) + CSI clear-screen and an embedded
+		// newline; method carries a raw ESC. Neither may reach the terminal raw.
+		cr("GET\x1b[31m", "https://example.com/api/\x1b[2J\nitems", "rest", "path-heuristic", 0.6),
+	})
+	out := buf.String()
+	if strings.ContainsRune(out, '\x1b') {
+		t.Errorf("raw ESC byte reached terminal output: %q", out)
+	}
+	// The embedded newline in the path must be escaped, not emitted as a real
+	// line break — the whole record must remain a single line (plus the trailing
+	// newline the writer appends).
+	if strings.Count(strings.TrimRight(out, "\n"), "\n") != 0 {
+		t.Errorf("path newline was not neutralized (log-splitting): %q", out)
+	}
+	// The escaped form is present and the surrounding printable text survives.
+	if !strings.Contains(out, `\x1b`) {
+		t.Errorf("control byte should be escaped as \\x1b: %q", out)
+	}
+	if !strings.Contains(out, "items") {
+		t.Errorf("printable path text should survive sanitization: %q", out)
+	}
+}
+
 // TestLogClassificationReasons_NoOutput verifies the no-op guards: a nil writer
 // must not panic, and an empty slice produces no output.
 func TestLogClassificationReasons_NoOutput(t *testing.T) {

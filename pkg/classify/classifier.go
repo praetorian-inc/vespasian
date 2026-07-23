@@ -27,9 +27,12 @@ import (
 )
 
 // DefaultConfidenceThreshold is the default minimum confidence for a request to
-// be classified as an API. It is single-sourced here and referenced by the SDK
-// and CLI defaults so the threshold is documented rather than a bare literal
-// scattered across entry points (LAB-4678).
+// be classified as an API. The SDK (pkg/sdk) references this constant directly
+// for its parameter default. The CLI (cmd/vespasian) cannot: Kong `default:`
+// struct tags must be literals, so it carries the literal 0.5 and a test
+// (TestCLIConfidenceDefaultMatchesConstant) asserts the two never drift. Keeping
+// the value here documents it rather than leaving a bare literal unexplained at
+// each entry point (LAB-4678, QUAL-001).
 const DefaultConfidenceThreshold = 0.5
 
 // APIClassifier determines if a request is an API call.
