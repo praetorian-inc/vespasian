@@ -164,41 +164,31 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 			"pass %s", redactSeedURL(seedURL), flagDangerousAllowPrivate)
 	}
 
-	// Track page count for MaxPages enforcement. The onResult callback in
-	// Crawler.crawlHeadless also tracks this, but we need our own counter
-	// here to stop launching new pages.
+	// Track pages VISITED for MaxPages enforcement (LAB-4678, A1). The budget
+	// counts pages (URLs visited), not captured requests: a single SPA page can
+	// fire dozens of XHR/fetch calls, so counting requests truncated the crawl
+	// far earlier than "max pages" implies, and hard-canceling the shared
+	// context when the count was hit abandoned in-flight tabs mid-capture —
+	// dropping part of a page's surface and varying the emitted set run-to-run.
+	// Workers now reserve a page slot under this mutex before visiting and stop
+	// taking new pages once the budget is reached, so pages already in flight
+	// finalize and emit all of their captured requests, and the crawl is no
+	// longer canceled mid-page.
 	var (
 		mu        sync.Mutex
 		pageCount int
 	)
 
-	crawlCtx, crawlCancel := context.WithCancel(ctx)
-	defer crawlCancel()
-
-	// wrappedOnResult passes results to the caller and tracks page count.
-	wrappedOnResult := func(req ObservedRequest) {
-		mu.Lock()
-		if e.opts.MaxPages > 0 && pageCount >= e.opts.MaxPages {
-			mu.Unlock()
-			return
-		}
-		pageCount++
-		hitMax := e.opts.MaxPages > 0 && pageCount >= e.opts.MaxPages
-		mu.Unlock()
-
-		onResult(req)
-
-		if hitMax {
-			crawlCancel()
-		}
-	}
-
+	// Workers run under ctx directly. The page budget no longer cancels the
+	// crawl (it just stops workers from taking new pages under the mutex), so
+	// the former context.WithCancel wrapper served no purpose beyond ctx's own
+	// parent cancellation and was removed (QUAL-006).
 	var wg sync.WaitGroup
 	for i := range e.opts.Concurrency {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			e.worker(crawlCtx, id, wrappedOnResult)
+			e.worker(ctx, id, onResult, &mu, &pageCount, e.opts.MaxPages)
 		}(i)
 	}
 
@@ -213,13 +203,39 @@ func (e *rodEngine) Close() error {
 	return e.browser.Close()
 }
 
+// pageBudgetReached reports whether the visited-page budget is exhausted,
+// taking mu for the duration of the check. maxPages <= 0 means unlimited. When
+// reserve is true and the budget is not yet reached, it consumes one page slot
+// before returning false — the compare and the increment happen in a single
+// critical section so concurrent workers cannot overshoot the cap (a separate
+// check-then-increment would race). Pass reserve=false for the pre-Pop
+// early-out that must not consume a slot.
+func pageBudgetReached(mu *sync.Mutex, pageCount *int, maxPages int, reserve bool) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	if maxPages > 0 && *pageCount >= maxPages {
+		return true
+	}
+	if reserve {
+		*pageCount++
+	}
+	return false
+}
+
 // worker is the per-tab goroutine. It takes URLs from the frontier, visits
 // each one in a fresh tab, captures network events, extracts links, and pushes
 // discovered URLs back to the frontier.
-func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRequest)) {
+func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRequest), mu *sync.Mutex, pageCount *int, maxPages int) {
 	for {
 		// Check context before blocking on Pop.
 		if ctx.Err() != nil {
+			return
+		}
+
+		// Stop taking new pages once the page budget is reached. Pages already
+		// being visited by other workers still finalize below. Check-only (no
+		// reservation): we have not popped an entry yet.
+		if pageBudgetReached(mu, pageCount, maxPages, false) {
 			return
 		}
 
@@ -230,6 +246,17 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		// MarkActive is NOT called here: Pop atomically increments the active
 		// counter before returning, making dequeue+activate a single critical
 		// section. Callers only need MarkIdle() after processing completes.
+
+		// Reserve this page's budget slot before visiting. Another worker may
+		// have reached the budget while we were blocked in Pop waiting for a
+		// link; if so, release the entry without visiting so the crawl never
+		// exceeds MaxPages. Reserving before the visit (rather than counting
+		// after) keeps the cap exact instead of overshooting by up to
+		// Concurrency pages.
+		if pageBudgetReached(mu, pageCount, maxPages, true) {
+			e.frontier.MarkIdle()
+			return
+		}
 
 		requests, links, err := e.visitPage(ctx, entry)
 		if err != nil {

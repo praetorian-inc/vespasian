@@ -18,7 +18,11 @@
 //
 // Supported API types:
 //   - REST: detected via content-type, path patterns (/api/, /v1/), HTTP
-//     methods, and response structure. Static assets are excluded.
+//     methods, and response structure. A request-side signal (an API path plus
+//     a JSON/XML Accept or request content-type) also classifies an endpoint
+//     whose response was not captured, so the verdict does not depend on
+//     response timing. Static assets are excluded. [DefaultConfidenceThreshold]
+//     is the default minimum confidence.
 //   - GraphQL: detected via /graphql path, query syntax in POST body, and
 //     data/errors keys in response JSON.
 //   - WSDL/SOAP: detected via SOAPAction header, SOAP envelope in body, and
@@ -32,7 +36,11 @@
 // and (for non-empty bodies) Content-Type plus an 8-byte body fingerprint.
 // Bodyless requests still collapse by method and path. Distinct request body
 // shapes on the same endpoint+content-type survive as separate entries so
-// downstream merge logic can union their fields.
+// downstream merge logic can union their fields. When duplicate observations
+// carry different responses, the retained response is selected deterministically
+// (a populated response is preferred over a half-captured empty one, with a
+// stable content-fingerprint tie-break) so a fixed capture yields the same
+// documented response regardless of observation order.
 //
 // [MergeUniqueOrdered] provides an order-preserving set-union for []string
 // slices, capped at [crawl.MaxQueryParamValues] entries; it is used by

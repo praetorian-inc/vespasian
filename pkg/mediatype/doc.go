@@ -12,9 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package mediatype provides shared helpers for parsing HTTP Content-Type
-// headers. Both pkg/classify and pkg/generate/rest need the same media-type
-// canonicalization, and they cannot import each other directly (generate/rest
-// imports classify would be fine, but the reverse would create a cycle), so
-// the helper lives in its own leaf package.
+// Package mediatype provides shared helpers for parsing HTTP headers. Both
+// pkg/classify and pkg/generate/rest need the same media-type canonicalization
+// and case-insensitive header lookup, and they cannot import each other
+// directly (generate/rest importing classify would be fine, but the reverse
+// would create a cycle), so the helpers live in their own leaf package.
+//
+// Base canonicalizes a Content-Type value to its lowercased media type with any
+// charset/parameter suffix stripped. Header performs a deterministic,
+// case-insensitive lookup of a named header, tolerating the casing differences
+// between browser-captured (lowercased) and Burp/HAR-imported (title-cased)
+// headers.
 package mediatype

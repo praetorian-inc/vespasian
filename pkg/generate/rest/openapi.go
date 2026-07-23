@@ -15,6 +15,7 @@
 package rest
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -134,6 +135,12 @@ func extractServers(endpoints []classify.ClassifiedRequest) (openapi3.Servers, s
 			servers = append(servers, &openapi3.Server{URL: baseURL})
 		}
 	}
+
+	// Sort servers so the list order and the derived title are independent of
+	// the crawl's capture order (LAB-4678). Same-origin scans have a single
+	// server (a no-op sort); same-domain scans can observe several hosts whose
+	// first-seen order would otherwise vary run-to-run.
+	sort.Slice(servers, func(i, j int) bool { return servers[i].URL < servers[j].URL })
 
 	if len(servers) > 0 {
 		// Use first server's host for title
@@ -280,6 +287,31 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 		return operation
 	}
 
+	// Order the group deterministically before any first-seen-wins logic below
+	// (LAB-4678, M3). A group holds every observation that normalized to this
+	// path+method, including multiple dedup entries with distinct request
+	// bodies, each carrying its own response. The response merge (per status
+	// code) keeps the first-seen response as the base, and the query-param and
+	// body unions consume the group in order. The group arrives in the crawl's
+	// capture order — nondeterministic — so without this sort the documented
+	// response (and any conflict tie-break) could differ run-to-run for a fixed
+	// input. Each entry's response was already selected deterministically in
+	// classify.Deduplicate; ordering the entries makes their combination
+	// deterministic too. Key: URL, method, request body, then response fields.
+	sort.SliceStable(group, func(i, j int) bool {
+		a, b := group[i], group[j]
+		if a.URL != b.URL {
+			return a.URL < b.URL
+		}
+		if a.Method != b.Method {
+			return a.Method < b.Method
+		}
+		if c := bytes.Compare(a.Body, b.Body); c != 0 {
+			return c < 0
+		}
+		return classify.CompareResponses(a.Response, b.Response) < 0
+	})
+
 	// --- Query parameters: collect union from all endpoints, track frequency, values, and multi-value ---
 	type queryParamInfo struct {
 		count          int      // # of endpoints observing this param (for `required`)
@@ -401,7 +433,7 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 			if len(ep.Body) == 0 {
 				continue
 			}
-			ct := getHeader(ep.Headers, "content-type")
+			ct := mediatype.Header(ep.Headers, "content-type")
 			baseType := "application/json"
 			if ct != "" {
 				if t := mediatype.Base(ct); t != "" {
@@ -460,18 +492,40 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 		}
 
 		if existing, ok := seenStatus[statusCode]; ok {
-			// Merge response body schema if both are objects
-			if len(ep.Response.Body) > 0 && existing.Value != nil && existing.Value.Content != nil {
+			// Merge response body schema if this observation has a JSON body.
+			// The base (first observation of this status in the deterministically
+			// sorted group) may itself be a half-captured empty response, so we
+			// must also ADOPT a populated schema when the base has none — not
+			// only union into an already-populated base. Otherwise a populated
+			// observation is silently dropped whenever an empty one sorts first
+			// (review finding 002).
+			if len(ep.Response.Body) > 0 && existing.Value != nil {
 				// Only infer JSON schema for JSON-compatible content types
 				ct := strings.ToLower(ep.Response.ContentType)
 				if ct == "" || strings.Contains(ct, "json") {
 					newSchema := InferSchema(ep.Response.Body)
-					if newSchema != nil && newSchema.Value != nil && newSchema.Value.Properties != nil {
-						if mt := existing.Value.Content["application/json"]; mt != nil && mt.Schema != nil &&
-							mt.Schema.Value != nil && mt.Schema.Value.Properties != nil {
-							for propName, propSchema := range newSchema.Value.Properties {
-								if _, exists := mt.Schema.Value.Properties[propName]; !exists {
-									mt.Schema.Value.Properties[propName] = propSchema
+					if newSchema != nil && newSchema.Value != nil {
+						if existing.Value.Content == nil {
+							// Base had no body; adopt this populated schema.
+							// Accept ANY inferred schema, not only objects: a JSON
+							// array or scalar body has nil Properties, so gating on
+							// Properties!=nil here dropped populated array/scalar
+							// responses whenever an empty base sorted first. This
+							// mirrors the base-creation path below, which adopts any
+							// non-nil schema (Codex/CodeRabbit review).
+							existing.Value.Content = openapi3.Content{
+								"application/json": &openapi3.MediaType{Schema: newSchema},
+							}
+						} else if newSchema.Value.Properties != nil {
+							// Union additional object properties into an existing
+							// object base. Array/scalar schemas have no properties
+							// to union, so they leave the populated base unchanged.
+							if mt := existing.Value.Content["application/json"]; mt != nil && mt.Schema != nil &&
+								mt.Schema.Value != nil && mt.Schema.Value.Properties != nil {
+								for propName, propSchema := range newSchema.Value.Properties {
+									if _, exists := mt.Schema.Value.Properties[propName]; !exists {
+										mt.Schema.Value.Properties[propName] = propSchema
+									}
 								}
 							}
 						}

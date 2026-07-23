@@ -722,17 +722,6 @@ func TestMergeURLEncodedBodies_ConflictingTypes(t *testing.T) {
 	}
 }
 
-func TestGetHeader_CaseInsensitiveFallback(t *testing.T) {
-	// The map uses title-case "Content-Type" as the stored key.
-	// Querying with lowercase "content-type" must fall through to the
-	// scan loop and still return the value.
-	headers := map[string]string{
-		"Content-Type": "application/json",
-	}
-	got := getHeader(headers, "content-type")
-	assert.Equal(t, "application/json", got, "getHeader case-insensitive fallback: got %q, want %q", got, "application/json")
-}
-
 func TestExtractBoundary(t *testing.T) {
 	t.Run("valid content-type with boundary", func(t *testing.T) {
 		ct := `multipart/form-data; boundary=----WebKitFormBoundaryABC123`

@@ -255,6 +255,9 @@ Vespasian classifies and generates specifications for four API types:
 3. **Path heuristics**: `/api/`, `/v1/`, `/v2/`, `/v3/`, `/rest/`, `/rpc/` paths boost confidence
 4. **HTTP method**: POST/PUT/PATCH/DELETE to non-page URLs
 5. **Response structure**: JSON object or array bodies (not HTML)
+6. **Request-side signal**: an API path plus a JSON/XML `Accept` (or request content-type) classifies the endpoint even when its response was not captured, so the REST-vs-not verdict does not depend on response timing
+
+The classification signals above are content-based and deterministic: identical input traffic yields the same endpoint set, the same classification, and a byte-identical spec every run. Run with `-v` to see the per-endpoint classification reason.
 
 ### GraphQL Classification Heuristics
 
@@ -318,7 +321,7 @@ vespasian scan <url> [flags]
   -H, --header       Auth headers to inject (repeatable)
   -o, --output       Output spec file (default: stdout)
   --depth            Max crawl depth (default: 3)
-  --max-pages        Max pages to visit (default: 100)
+  --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100)
   --timeout          Maximum duration for the entire scan (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine
@@ -351,7 +354,7 @@ vespasian crawl <url> [flags]
   -H, --header       Auth headers to inject (repeatable)
   -o, --output       Capture output file (default: stdout)
   --depth            Max crawl depth (default: 3)
-  --max-pages        Max pages to visit (default: 100)
+  --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100)
   --timeout          Maximum duration for the entire crawl (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine
