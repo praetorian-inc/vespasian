@@ -250,12 +250,11 @@ func acceptSignalsAPI(accept string) string {
 			return ""
 		}
 		if match == "" {
-			for _, apiCT := range apiContentTypes {
-				if mt == apiCT {
-					match = apiCT
-					break
-				}
-			}
+			// mt is already lowercased and stripped of parameters above, so
+			// matchAPIContentType's mediatype.Base is a no-op on it; sharing the
+			// helper keeps Rule 2, Rule 6, and this Accept branch on one matching
+			// rule (QUAL-003).
+			match = matchAPIContentType(mt)
 		}
 	}
 	return match

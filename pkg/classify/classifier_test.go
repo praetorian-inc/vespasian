@@ -262,6 +262,40 @@ func TestDeduplicate_ResponseSelection_TwoPopulatedOrderIndependent(t *testing.T
 		"CompareResponses tie-break must be independent of observation order")
 }
 
+// TestCompareResponses pins the ordering contract of the exported comparator
+// directly (QUAL-002): StatusCode, then ContentType, then Body via
+// bytes.Compare, returning -1/0/+1. pkg/generate/rest.buildOperation relies on
+// this for its group sort, so the rule is exercised here rather than only
+// indirectly through preferredResponse's outcome.
+func TestCompareResponses(t *testing.T) {
+	resp := func(status int, ct, body string) crawl.ObservedResponse {
+		return crawl.ObservedResponse{StatusCode: status, ContentType: ct, Body: []byte(body)}
+	}
+	tests := []struct {
+		name string
+		a, b crawl.ObservedResponse
+		want int
+	}{
+		{"lower status sorts first", resp(200, "", ""), resp(204, "", ""), -1},
+		{"higher status sorts last", resp(500, "", ""), resp(200, "", ""), 1},
+		{"status dominates content-type", resp(200, "text/xml", ""), resp(500, "application/json", ""), -1},
+		{"equal status, content-type breaks tie", resp(200, "application/json", ""), resp(200, "text/xml", ""), -1},
+		{"equal status, content-type breaks tie (reverse)", resp(200, "text/xml", ""), resp(200, "application/json", ""), 1},
+		{"equal status+ct, body breaks tie", resp(200, "application/json", `{"a":1}`), resp(200, "application/json", `{"b":2}`), -1},
+		{"equal status+ct, empty body sorts before non-empty", resp(200, "application/json", ""), resp(200, "application/json", "x"), -1},
+		{"fully equal returns 0", resp(200, "application/json", `{"a":1}`), resp(200, "application/json", `{"a":1}`), 0},
+		{"two zero values return 0", crawl.ObservedResponse{}, crawl.ObservedResponse{}, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, CompareResponses(tt.a, tt.b), "CompareResponses(a,b)")
+			// Antisymmetry: swapping arguments must negate the result, which is
+			// the property preferredResponse and sort.SliceStable rely on.
+			assert.Equal(t, -tt.want, CompareResponses(tt.b, tt.a), "CompareResponses(b,a) must negate")
+		})
+	}
+}
+
 func TestDeduplicate_ResponseSelection_PrefersCompletedBodylessStatus(t *testing.T) {
 	// A completed bodyless response (e.g. DELETE -> 204 No Content) has a
 	// positive status but no body or content-type, and must still be preferred
