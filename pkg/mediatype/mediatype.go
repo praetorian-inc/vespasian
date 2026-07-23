@@ -34,11 +34,25 @@ func Base(ct string) string {
 // a case-insensitive header lookup (capture headers arrive lowercased from the
 // browser but title-cased from Burp/HAR imports) and an import cycle prevents
 // sharing it directly between those packages.
+//
+// The lookup is deterministic: an exact key match wins, and if only
+// differently-cased variants exist (e.g. both "Content-Type" and
+// "content-type" after merging capture sources) the lexicographically smallest
+// matching key is chosen rather than whichever Go map iteration happens to
+// yield first.
 func Header(headers map[string]string, name string) string {
-	for k, v := range headers {
-		if strings.EqualFold(k, name) {
-			return v
+	if v, ok := headers[name]; ok {
+		return v
+	}
+	match := ""
+	found := false
+	for k := range headers {
+		if strings.EqualFold(k, name) && (!found || k < match) {
+			match, found = k, true
 		}
 	}
-	return ""
+	if !found {
+		return ""
+	}
+	return headers[match]
 }
