@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 )
 
 // staticExtensions lists file extensions that indicate static assets.
@@ -103,38 +104,37 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	var confidence float64
 	var reason string
 
-	// Rule 2: Content-type filter.
-	ct := strings.ToLower(req.Response.ContentType)
-	if ct == "" {
-		for k, v := range req.Response.Headers {
-			if strings.EqualFold(k, "content-type") {
-				ct = strings.ToLower(v)
-				break
-			}
-		}
+	// Rule 2: Content-type filter. rule2CT records the API media type matched
+	// on the response so Rule 6 can avoid re-reporting the same content type as
+	// a request-side signal (QUAL-005).
+	respCT := req.Response.ContentType
+	if respCT == "" {
+		respCT = mediatype.Header(req.Response.Headers, "content-type")
 	}
-	// Strip charset parameters (e.g., "application/json; charset=utf-8").
-	if idx := strings.Index(ct, ";"); idx != -1 {
-		ct = strings.TrimSpace(ct[:idx])
+	rule2CT := matchAPIContentType(respCT)
+	if rule2CT != "" {
+		confidence = ContentTypeConfidence
+		reason = appendReason(reason, "content-type:"+rule2CT)
 	}
-	for _, apiCT := range apiContentTypes {
-		if ct == apiCT {
-			confidence = ContentTypeConfidence
-			reason = appendReason(reason, "content-type:"+apiCT)
+
+	// pathIsAPI is computed once here and reused by Rule 3 (confidence boost)
+	// and Rule 6 (request-side signal gate) so the API-path scan runs once
+	// rather than twice in the same call (QUAL-003).
+	pathIsAPI := false
+	for _, seg := range apiPathSegments {
+		if strings.Contains(lowerPath, seg) {
+			pathIsAPI = true
 			break
 		}
 	}
 
 	// Rule 3: Path heuristics.
-	for _, seg := range apiPathSegments {
-		if strings.Contains(lowerPath, seg) {
-			confidence += PathHeuristicBoost
-			if confidence > 1.0 {
-				confidence = 1.0
-			}
-			reason = appendReason(reason, "path-heuristic")
-			break
+	if pathIsAPI {
+		confidence += PathHeuristicBoost
+		if confidence > 1.0 {
+			confidence = 1.0
 		}
+		reason = appendReason(reason, "path-heuristic")
 	}
 
 	// Rule 4: HTTP method signal.
@@ -175,28 +175,18 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	// GET-with-JSON-intent gap. The API-path match alone is NOT sufficient (that
 	// stays at the Rule 3 boost) to avoid classifying plain navigations under
 	// api-like paths.
-	pathIsAPI := false
-	for _, seg := range apiPathSegments {
-		if strings.Contains(lowerPath, seg) {
-			pathIsAPI = true
-			break
-		}
-	}
 	if pathIsAPI {
 		signal := ""
-		if apiCT := acceptSignalsAPI(getHeader(req.Headers, "accept")); apiCT != "" {
+		if apiCT := acceptSignalsAPI(mediatype.Header(req.Headers, "accept")); apiCT != "" {
 			signal = "accept:" + apiCT
 		}
 		if signal == "" {
-			reqCT := strings.ToLower(getHeader(req.Headers, "content-type"))
-			if idx := strings.Index(reqCT, ";"); idx != -1 {
-				reqCT = strings.TrimSpace(reqCT[:idx])
-			}
-			for _, apiCT := range apiContentTypes {
-				if reqCT == apiCT {
-					signal = "content-type:" + apiCT
-					break
-				}
+			// Only surface a request content-type signal that Rule 2 did not
+			// already record for the same media type; otherwise the -v reason
+			// would carry both "content-type:X" and "request-signal:content-type:X",
+			// which convey the same fact (QUAL-005).
+			if apiCT := matchAPIContentType(mediatype.Header(req.Headers, "content-type")); apiCT != "" && apiCT != rule2CT {
+				signal = "content-type:" + apiCT
 			}
 		}
 		if signal != "" {
@@ -218,6 +208,20 @@ func appendReason(existing, sig string) string {
 		return sig
 	}
 	return existing + "+" + sig
+}
+
+// matchAPIContentType canonicalizes ct (lowercase + charset/parameter strip via
+// mediatype.Base) and returns the matching apiContentTypes entry, or "" if none
+// matches. Shared by Rule 2 (response content-type) and Rule 6 (request
+// content-type) so both apply one matching rule (QUAL-004).
+func matchAPIContentType(ct string) string {
+	base := mediatype.Base(ct)
+	for _, apiCT := range apiContentTypes {
+		if base == apiCT {
+			return apiCT
+		}
+	}
+	return ""
 }
 
 // acceptSignalsAPI parses an Accept header and returns the API media type the

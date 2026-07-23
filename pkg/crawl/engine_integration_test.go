@@ -158,22 +158,48 @@ func TestRodEngine_Concurrency(t *testing.T) {
 	t.Logf("Crawl completed in %v with %d results", elapsed, len(results))
 }
 
+// TestRodEngine_MaxPages pins AC12 (LAB-4678): a saturated concurrent crawl
+// visits EXACTLY --max-pages distinct pages (no overshoot from the
+// reserve-before-visit accounting, no undershoot), and pages already in flight
+// when the budget is reached still finalize and emit their captured requests
+// (the in-flight drain) rather than being canceled mid-capture.
 func TestRodEngine_MaxPages(t *testing.T) {
+	const (
+		maxPages = 5
+		// xhrMarker identifies the delayed XHR each page fires; its presence,
+		// tagged with the page's PageURL, is the in-flight-drain signal.
+		xhrMarker = "/drain-probe"
+	)
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, xhrMarker) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"ok":true}`)
+			return
+		}
 		w.Header().Set("Content-Type", "text/html")
-		// Each page links to the next — infinite chain.
-		fmt.Fprintf(w, `<html><body><a href="%s/next%d">next</a></body></html>`,
-			r.URL.Path, time.Now().UnixNano())
+		// Fan out to more unique child pages than the budget so the frontier is
+		// always saturated (the cap, not exhaustion, must stop the crawl), and
+		// fire a delayed XHR so we can assert in-flight pages drained.
+		base := strings.TrimRight(r.URL.Path, "/")
+		var b strings.Builder
+		b.WriteString("<html><body>")
+		for i := 0; i < 6; i++ {
+			fmt.Fprintf(&b, `<a href="%s/c%d">child</a>`, base, i)
+		}
+		fmt.Fprintf(&b, `<script>setTimeout(function(){fetch(%q)},30)</script>`, xhrMarker)
+		b.WriteString("</body></html>")
+		fmt.Fprint(w, b.String())
 	}))
 	defer srv.Close()
 
 	bm := launchTestBrowser(t)
 	engine, err := newRodEngine(bm.wsURL(), engineOptions{
-		Concurrency:   2,
-		MaxPages:      5,
+		Concurrency:   3, // > 1: exercises the concurrent reserve-before-visit cap.
+		MaxPages:      maxPages,
 		MaxDepth:      100,
 		PageTimeout:   10 * time.Second,
-		StableTimeout: 500 * time.Millisecond,
+		StableTimeout: 1 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("newRodEngine: %v", err)
@@ -181,28 +207,47 @@ func TestRodEngine_MaxPages(t *testing.T) {
 	defer engine.Close()
 
 	var mu sync.Mutex
-	var pageVisits int
+	// PageURL is set to the page each request was captured on, so distinct
+	// PageURL values == distinct pages visited (dedupes document + subresource
+	// requests down to one entry per page). Pages that fired their drain XHR are
+	// tracked separately.
+	visitedPages := make(map[string]bool)
+	drainedPages := make(map[string]bool)
 
 	err = engine.Crawl(context.Background(), srv.URL+"/", func(req ObservedRequest) {
 		mu.Lock()
-		pageVisits++
+		if req.PageURL != "" {
+			visitedPages[req.PageURL] = true
+			if strings.Contains(req.URL, xhrMarker) {
+				drainedPages[req.PageURL] = true
+			}
+		}
 		mu.Unlock()
 	})
+	if err != nil {
+		t.Fatalf("Crawl error: %v", err)
+	}
 
-	// The crawl stops once the page budget (MaxPages) is reached. The budget no
-	// longer cancels the shared browser context (LAB-4678): workers reserve a
-	// page slot before visiting and stop taking new pages at the budget, while
-	// pages already in flight finalize and emit their captured requests.
 	mu.Lock()
-	count := pageVisits
-	mu.Unlock()
+	defer mu.Unlock()
 
-	// count tallies emitted requests, not pages; a single page can emit several
-	// (document + subresources), so this only asserts the crawl produced output
-	// and terminated. Exact page-cap enforcement is covered separately.
-	t.Logf("Got %d results with MaxPages=5", count)
-	if count == 0 {
-		t.Error("Got 0 results, expected at least 1")
+	// Exact cap: no overshoot (reserve-before-visit) and no undershoot (frontier
+	// stayed saturated), so exactly maxPages distinct pages were visited.
+	if len(visitedPages) != maxPages {
+		pages := make([]string, 0, len(visitedPages))
+		for p := range visitedPages {
+			pages = append(pages, p)
+		}
+		t.Errorf("visited %d distinct pages, want exactly %d. Pages: %v", len(visitedPages), maxPages, pages)
+	}
+
+	// In-flight drain: every visited page — including the one(s) in flight when
+	// the budget was reached — finalized and emitted its delayed XHR. If the
+	// budget canceled in-flight pages mid-capture, some page would be missing
+	// its drain probe and this count would be short.
+	if len(drainedPages) != len(visitedPages) {
+		t.Errorf("%d of %d visited pages emitted their in-flight XHR; every visited page must drain",
+			len(drainedPages), len(visitedPages))
 	}
 }
 

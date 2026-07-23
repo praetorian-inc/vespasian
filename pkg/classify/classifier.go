@@ -17,7 +17,6 @@ package classify
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"mime"
 	"net/url"
@@ -279,22 +278,26 @@ func responsePopulated(r crawl.ObservedResponse) bool {
 	return r.StatusCode > 0 || len(r.Body) > 0 || r.ContentType != ""
 }
 
-// responseFingerprint returns a stable content hash of a response over its
-// status, content-type, and body. It is used only as an order-independent
-// tie-break in preferredResponse; the field separators keep distinct splits
-// from colliding.
-func responseFingerprint(r crawl.ObservedResponse) [sha256.Size]byte {
-	h := sha256.New()
-	var status [8]byte
-	binary.BigEndian.PutUint64(status[:], uint64(r.StatusCode)) // #nosec G115 -- status is a small non-negative HTTP code; wrap is irrelevant to a hash key
-	h.Write(status[:])
-	h.Write([]byte{0})
-	h.Write([]byte(r.ContentType))
-	h.Write([]byte{0})
-	h.Write(r.Body)
-	var sum [sha256.Size]byte
-	copy(sum[:], h.Sum(nil))
-	return sum
+// CompareResponses is the single deterministic ordering rule for observed
+// responses, shared by preferredResponse (this package) and buildOperation's
+// group sort (pkg/generate/rest). It returns -1, 0, or +1 comparing a to b by
+// StatusCode, then ContentType, then Body bytes. Keeping one comparator means a
+// future tie-break field is added in exactly one place instead of silently
+// diverging between the two determinism call sites (LAB-4678).
+func CompareResponses(a, b crawl.ObservedResponse) int {
+	if a.StatusCode != b.StatusCode {
+		if a.StatusCode < b.StatusCode {
+			return -1
+		}
+		return 1
+	}
+	if a.ContentType != b.ContentType {
+		if a.ContentType < b.ContentType {
+			return -1
+		}
+		return 1
+	}
+	return bytes.Compare(a.Body, b.Body)
 }
 
 // preferredResponse deterministically selects which of two responses observed
@@ -304,8 +307,8 @@ func responseFingerprint(r crawl.ObservedResponse) [sha256.Size]byte {
 // captured the duplicate observations (LAB-4678, A4):
 //  1. A populated response beats an unpopulated (half-captured) one — a real
 //     response documents the endpoint better than an empty placeholder.
-//  2. When both are populated (or both empty), the response with the smaller
-//     content fingerprint wins, an order-free tie-break.
+//  2. When both are populated (or both empty), the response that sorts first
+//     under CompareResponses wins, an order-free tie-break.
 func preferredResponse(a, b crawl.ObservedResponse) crawl.ObservedResponse {
 	ap, bp := responsePopulated(a), responsePopulated(b)
 	if ap != bp {
@@ -314,8 +317,7 @@ func preferredResponse(a, b crawl.ObservedResponse) crawl.ObservedResponse {
 		}
 		return a
 	}
-	fa, fb := responseFingerprint(a), responseFingerprint(b)
-	if bytes.Compare(fb[:], fa[:]) < 0 {
+	if CompareResponses(b, a) < 0 {
 		return b
 	}
 	return a
@@ -402,18 +404,7 @@ func getSoapAction(headers map[string]string) string {
 	return ""
 }
 
-// getHeader returns the value of the named header, matched case-insensitively.
-// Returns "" if absent.
-func getHeader(headers map[string]string, name string) string {
-	for k, v := range headers {
-		if strings.EqualFold(k, name) {
-			return v
-		}
-	}
-	return ""
-}
-
 // getContentType returns the Content-Type header value, case-insensitively.
 func getContentType(headers map[string]string) string {
-	return getHeader(headers, "content-type")
+	return mediatype.Header(headers, "content-type")
 }

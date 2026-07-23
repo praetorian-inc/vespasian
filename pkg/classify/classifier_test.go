@@ -190,7 +190,7 @@ func TestDeduplicate_MergesSameEndpoint(t *testing.T) {
 	// Highest confidence kept.
 	assert.InDelta(t, 0.85, result[0].Confidence, 0.001)
 	// LAB-4678: the retained response is selected deterministically (both are
-	// populated here, so a stable fingerprint decides), NOT by first-seen order.
+	// populated here, so CompareResponses decides), NOT by first-seen order.
 	// Assert order-independence rather than a specific body: swapping the input
 	// order must yield the identical retained response.
 	swapped := Deduplicate([]ClassifiedRequest{classified[1], classified[0]})
@@ -239,7 +239,7 @@ func TestDeduplicate_ResponseSelection_PrefersPopulated(t *testing.T) {
 
 func TestDeduplicate_ResponseSelection_TwoPopulatedOrderIndependent(t *testing.T) {
 	// Two distinct populated responses on the same endpoint collapse to one
-	// entry; the retained response is chosen by a stable fingerprint, so it is
+	// entry; the retained response is chosen by CompareResponses, so it is
 	// identical regardless of input order (LAB-4678, A4 tie-break).
 	a := ClassifiedRequest{
 		ObservedRequest: crawl.ObservedRequest{
@@ -259,7 +259,7 @@ func TestDeduplicate_ResponseSelection_TwoPopulatedOrderIndependent(t *testing.T
 	require.Len(t, fwd, 1)
 	require.Len(t, rev, 1)
 	assert.Equal(t, string(fwd[0].Response.Body), string(rev[0].Response.Body),
-		"fingerprint tie-break must be independent of observation order")
+		"CompareResponses tie-break must be independent of observation order")
 }
 
 func TestDeduplicate_ResponseSelection_PrefersCompletedBodylessStatus(t *testing.T) {
