@@ -28,3 +28,17 @@ func Base(ct string) string {
 	}
 	return strings.ToLower(strings.TrimSpace(ct))
 }
+
+// Header returns the value of the named header, matched case-insensitively,
+// or "" if absent. It lives here because both classify and generate/rest need
+// a case-insensitive header lookup (capture headers arrive lowercased from the
+// browser but title-cased from Burp/HAR imports) and an import cycle prevents
+// sharing it directly between those packages.
+func Header(headers map[string]string, name string) string {
+	for k, v := range headers {
+		if strings.EqualFold(k, name) {
+			return v
+		}
+	}
+	return ""
+}

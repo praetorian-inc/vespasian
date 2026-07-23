@@ -78,3 +78,45 @@ func TestBase(t *testing.T) {
 		})
 	}
 }
+
+func TestHeader(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers map[string]string
+		lookup  string
+		want    string
+	}{
+		{
+			name:    "exact lowercase match (browser-captured)",
+			headers: map[string]string{"content-type": "application/json"},
+			lookup:  "content-type",
+			want:    "application/json",
+		},
+		{
+			name:    "case-insensitive fallback (Burp/HAR title-case)",
+			headers: map[string]string{"Content-Type": "application/json"},
+			lookup:  "content-type",
+			want:    "application/json",
+		},
+		{
+			name:    "absent header returns empty",
+			headers: map[string]string{"Accept": "*/*"},
+			lookup:  "content-type",
+			want:    "",
+		},
+		{
+			name:    "nil map returns empty",
+			headers: nil,
+			lookup:  "content-type",
+			want:    "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Header(tt.headers, tt.lookup)
+			if got != tt.want {
+				t.Errorf("Header(%v, %q) = %q, want %q", tt.headers, tt.lookup, got, tt.want)
+			}
+		})
+	}
+}

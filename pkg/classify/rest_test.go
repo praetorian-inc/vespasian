@@ -604,6 +604,32 @@ func TestRESTClassifier_RequestSideSignal(t *testing.T) {
 		assert.NotContains(t, navReason, "request-signal",
 			"navigation to %s must not fire the request-side signal", p)
 	}
+
+	// QUAL-005: when Rule 2 already recorded a content-type signal for a media
+	// type, Rule 6 must NOT re-report the same media type as a request-side
+	// content-type signal — the two tags convey the same fact and only add
+	// noise to the -v reason.
+	_, _, dupReason := c.ClassifyDetail(crawl.ObservedRequest{
+		Method:   "GET",
+		URL:      "https://example.com/api/items",
+		Headers:  map[string]string{"Content-Type": "application/json"},
+		Response: crawl.ObservedResponse{ContentType: "application/json"},
+	})
+	assert.Contains(t, dupReason, "content-type:application/json",
+		"Rule 2 response content-type signal must be recorded")
+	assert.NotContains(t, dupReason, "request-signal:content-type",
+		"Rule 6 must not duplicate Rule 2's content-type signal for the same media type")
+
+	// A request content-type that differs from the response content-type is a
+	// genuinely distinct signal and must still be surfaced by Rule 6.
+	_, _, xmlReason := c.ClassifyDetail(crawl.ObservedRequest{
+		Method:   "GET",
+		URL:      "https://example.com/api/items",
+		Headers:  map[string]string{"Content-Type": "application/xml"},
+		Response: crawl.ObservedResponse{ContentType: "application/json"},
+	})
+	assert.Contains(t, xmlReason, "request-signal:content-type:application/xml",
+		"a request content-type distinct from the response content-type must still fire Rule 6")
 }
 
 // TestRESTClassifier_ReasonListsAllSignals verifies the classification reason

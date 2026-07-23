@@ -309,13 +309,7 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 		if c := bytes.Compare(a.Body, b.Body); c != 0 {
 			return c < 0
 		}
-		if a.Response.StatusCode != b.Response.StatusCode {
-			return a.Response.StatusCode < b.Response.StatusCode
-		}
-		if a.Response.ContentType != b.Response.ContentType {
-			return a.Response.ContentType < b.Response.ContentType
-		}
-		return bytes.Compare(a.Response.Body, b.Response.Body) < 0
+		return classify.CompareResponses(a.Response, b.Response) < 0
 	})
 
 	// --- Query parameters: collect union from all endpoints, track frequency, values, and multi-value ---
@@ -439,7 +433,7 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 			if len(ep.Body) == 0 {
 				continue
 			}
-			ct := getHeader(ep.Headers, "content-type")
+			ct := mediatype.Header(ep.Headers, "content-type")
 			baseType := "application/json"
 			if ct != "" {
 				if t := mediatype.Base(ct); t != "" {

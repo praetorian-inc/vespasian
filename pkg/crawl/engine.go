@@ -179,17 +179,16 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 		pageCount int
 	)
 
-	// crawlCtx still derives from ctx so the parent's timeout/cancellation
-	// propagates to the workers; the budget no longer cancels it.
-	crawlCtx, crawlCancel := context.WithCancel(ctx)
-	defer crawlCancel()
-
+	// Workers run under ctx directly. The page budget no longer cancels the
+	// crawl (it just stops workers from taking new pages under the mutex), so
+	// the former context.WithCancel wrapper served no purpose beyond ctx's own
+	// parent cancellation and was removed (QUAL-006).
 	var wg sync.WaitGroup
 	for i := range e.opts.Concurrency {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			e.worker(crawlCtx, id, onResult, &mu, &pageCount, e.opts.MaxPages)
+			e.worker(ctx, id, onResult, &mu, &pageCount, e.opts.MaxPages)
 		}(i)
 	}
 
