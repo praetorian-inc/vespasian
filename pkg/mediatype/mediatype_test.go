@@ -110,6 +110,12 @@ func TestHeader(t *testing.T) {
 			lookup:  "content-type",
 			want:    "",
 		},
+		{
+			name:    "exact match wins over cased variant",
+			headers: map[string]string{"content-type": "exact", "Content-Type": "cased"},
+			lookup:  "content-type",
+			want:    "exact",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -118,5 +124,23 @@ func TestHeader(t *testing.T) {
 				t.Errorf("Header(%v, %q) = %q, want %q", tt.headers, tt.lookup, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestHeaderCollisionDeterministic pins the deterministic case-insensitive
+// fallback: when only differently-cased variants of the looked-up name exist
+// (no exact match), the same key must be chosen on every call regardless of Go
+// map iteration order. Without the lexicographic tie-break this returned an
+// arbitrary value run-to-run. The lookup name here ("CONTENT-TYPE") matches
+// neither stored key exactly, so both go through the fallback path.
+func TestHeaderCollisionDeterministic(t *testing.T) {
+	headers := map[string]string{"Content-Type": "title", "content-type": "lower"}
+	// "Content-Type" < "content-type" byte-wise (uppercase precedes lowercase),
+	// so the title-cased value is the stable choice.
+	const want = "title"
+	for i := 0; i < 100; i++ {
+		if got := Header(headers, "CONTENT-TYPE"); got != want {
+			t.Fatalf("iteration %d: Header = %q, want %q (must be deterministic)", i, got, want)
+		}
 	}
 }
