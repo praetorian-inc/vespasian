@@ -171,6 +171,15 @@ func pinBrowserBinary(l *launcher.Launcher, opts BrowserOptions) error {
 	return fmt.Errorf("no system Chrome/Chromium found in standard paths: set BrowserOptions.ChromePath, install a browser, or set VESPASIAN_ALLOW_BROWSER_DOWNLOAD=true to allow go-rod to download one")
 }
 
+// chromeEgressSink is a destination for launch flags that redirect a Chrome
+// subsystem's endpoint rather than toggle a boolean switch. It resolves to
+// nothing: ".invalid" is reserved by RFC 2606 and is guaranteed to never
+// resolve on the public Internet, so pointing a Google-service URL override
+// here fails fast (NXDOMAIN, no TCP/TLS handshake) instead of reaching any
+// real host. Distinct path/port suffixes below are cosmetic (readability of
+// any dropped-connection diagnostics), not functionally required.
+const chromeEgressSink = "https://vespasian-blocked.invalid"
+
 // disableChromeTelemetry adds launch flags that stop Chrome from phoning home
 // to Google during a crawl (Finding 2, LAB-4999). go-rod's defaults already
 // set --disable-background-networking and --disable-sync, but Chrome still
@@ -184,13 +193,87 @@ func pinBrowserBinary(l *launcher.Launcher, opts BrowserOptions) error {
 // the crawl's duration. Accepted for short-lived, operator-initiated crawls —
 // full TLS chain verification against the OS trust store and the SSRF/scope
 // guards remain in force (LAB-4999).
+//
+// A live step-security/harden-runner egress audit of branded google-chrome-stable
+// (LAB-4999 review) found the flags above insufficient: even with them set,
+// branded Chrome still phoned home to accounts.google.com (13x — the primary
+// target below), www.google.com, clients2.google.com,
+// android.clients.google.com, mtalk.google.com:5228, and
+// safebrowsingohttpgateway.googleapis.com. The flags below target each of
+// those hosts individually. Unlike the boolean switches above, most of these
+// are URL-override switches: Chrome's C++ browser-process code builds a
+// request against a compiled-in default host, and reading a command-line
+// switch to override that default is the only verified lever for that
+// subsystem. Redirecting to chromeEgressSink (see above) suppresses the
+// egress without a boolean "disable" existing for that host. These only
+// affect Chrome's own browser-process requests — not renderer-initiated
+// requests a crawled page's own JavaScript makes to accounts.google.com
+// (e.g. a real "Sign in with Google" button), which the crawler must still
+// observe.
+//
+//   - --gaia-url redirects accounts.google.com, Chrome's own GAIA/account-
+//     consistency origin (google_apis/gaia/gaia_urls.cc: kDefaultGaiaUrl is
+//     "https://accounts.google.com", overridden via switches::kGaiaUrl when
+//     the switch is set — google_apis/gaia/gaia_switches.cc).
+//   - --gcm-checkin-url and --gcm-registration-url redirect
+//     android.clients.google.com's /checkin and /c2dm/register3 endpoints
+//     (google_apis/gcm/engine/gservices_settings.cc: kDefaultCheckinURL,
+//     kDefaultRegistrationURL; switches defined in
+//     google_apis/gcm/engine/gservices_switches.cc).
+//   - --gcm-mcs-endpoint redirects the GCM Mobile Connection Server's
+//     persistent connection, normally mtalk.google.com:5228 (same files:
+//     kDefaultMCSHostname/kDefaultMCSMainSecurePort). Setting this switch also
+//     suppresses the fallback endpoint that would otherwise be tried
+//     (GServicesSettings::GetMCSFallbackEndpoint returns empty once the
+//     switch is present).
+//   - --apps-gallery-update-url redirects the Chrome Web Store extension
+//     update check away from clients2.google.com/service/update2/crx
+//     (extension_urls::GetDefaultWebstoreUpdateUrl, overridden by
+//     chrome/common/extensions/chrome_extensions_client.cc when
+//     switches::kAppsGalleryUpdateURL, declared in
+//     chrome/common/chrome_switches.cc, is set). This is a different
+//     subsystem from Omaha component update (already covered above by
+//     --disable-component-update), which is why clients2.google.com egress
+//     persisted despite that flag.
+//   - disable-features=SafeBrowsingHashPrefixRealTimeLookups turns off a
+//     feature that is FEATURE_ENABLED_BY_DEFAULT
+//     (components/safe_browsing/core/common/features.cc) and gates the OHTTP
+//     key service (components/safe_browsing/core/browser/hashprefix_realtime/
+//     ohttp_key_service.cc) that talks to safebrowsingohttpgateway.googleapis.com
+//     (confirmed as that API's default_host in the public googleapis/googleapis
+//     proto definitions). Tradeoff: disables Safe Browsing's privacy-preserving
+//     real-time hash-prefix lookups for the crawl's duration; the standard
+//     locally-cached hash-prefix list (unaffected) still provides baseline
+//     protection.
+//
+// Investigated and rejected: --safebrowsing-disable-auto-update was removed
+// from Chromium in November 2017 and no longer exists — it would be silently
+// ignored by current Chrome.
+//
+// Known gap: no reliable CLI switch was found for www.google.com. The one
+// candidate, --google-url, defaults to "google.com" (not "www.google.com")
+// and has a single low-confidence production consumer
+// (google_apis/gaia/gaia_urls.cc), so it is not added here. Suppressing that
+// host, if still observed in a live audit, needs an egress-allowlist entry or
+// an AC2 revision rather than a launch flag (tracked under LAB-4732's
+// block-mode flip).
+//
+// This change has not been re-validated against a live step-security/harden-runner
+// audit of branded Chrome — that verification is tracked under LAB-4732's
+// block-mode flip, same as the flags above it.
 func disableChromeTelemetry(l *launcher.Launcher) {
 	l.Set("disable-component-update")
 	l.Set("disable-domain-reliability")
 	l.Set("no-pings")
 	// Append, not Set: go-rod seeds disable-features with site-per-process and
 	// TranslateUI (see launcher.New), which must be preserved.
-	l.Append("disable-features", "OptimizationHints", "AutofillServerCommunication")
+	l.Append("disable-features", "OptimizationHints", "AutofillServerCommunication", "SafeBrowsingHashPrefixRealTimeLookups")
+
+	l.Set("gaia-url", chromeEgressSink)
+	l.Set("gcm-checkin-url", chromeEgressSink+"/checkin")
+	l.Set("gcm-registration-url", chromeEgressSink+"/register")
+	l.Set("gcm-mcs-endpoint", chromeEgressSink+":5228")
+	l.Set("apps-gallery-update-url", chromeEgressSink+"/no-extension-updates")
 }
 
 // NewBrowserManager launches a Chrome instance with the given options and

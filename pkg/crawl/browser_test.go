@@ -278,9 +278,32 @@ func TestConfigureLauncher(t *testing.T) {
 		if !ok {
 			t.Fatal("expected disable-features flag to be set")
 		}
-		for _, want := range []string{"site-per-process", "TranslateUI", "OptimizationHints", "AutofillServerCommunication"} {
+		for _, want := range []string{"site-per-process", "TranslateUI", "OptimizationHints", "AutofillServerCommunication", "SafeBrowsingHashPrefixRealTimeLookups"} {
 			if !containsStr(feats, want) {
 				t.Errorf("disable-features %v should contain %q", feats, want)
+			}
+		}
+
+		// URL-override switches (accounts.google.com, GCM, extension update):
+		// each must be set AND point at the non-resolving sink, not merely be
+		// present (a present-but-wrong-value flag would be as ineffective as a
+		// missing one).
+		for _, tc := range []struct {
+			flag flags.Flag
+			want string
+		}{
+			{"gaia-url", chromeEgressSink},
+			{"gcm-checkin-url", chromeEgressSink + "/checkin"},
+			{"gcm-registration-url", chromeEgressSink + "/register"},
+			{"gcm-mcs-endpoint", chromeEgressSink + ":5228"},
+			{"apps-gallery-update-url", chromeEgressSink + "/no-extension-updates"},
+		} {
+			if !l.Has(tc.flag) {
+				t.Errorf("expected launcher to have flag %q", tc.flag)
+				continue
+			}
+			if got := l.Get(tc.flag); got != tc.want {
+				t.Errorf("flag %q = %q, want %q", tc.flag, got, tc.want)
 			}
 		}
 	})
