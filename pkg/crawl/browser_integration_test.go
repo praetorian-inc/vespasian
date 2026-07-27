@@ -22,6 +22,9 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/launcher/flags"
 )
 
 // processAlive checks if a process with the given PID is running.
@@ -126,4 +129,35 @@ func TestBrowserManager_CloseIdempotent(t *testing.T) {
 	// Second close should not panic — both Kill and cleanup are
 	// protected by sync.Once.
 	mgr.Close()
+}
+
+// TestConfigureLauncher_PinsSystemBrowser is the dynamic counterpart to the
+// unit tests: exercising the REAL launcher.LookPath (no stub) against the host
+// filesystem, it verifies that when ChromePath is unset, configureLauncher pins
+// .Bin to an existing system browser rather than leaving it empty — the empty
+// case is exactly what makes go-rod download a Chromium from third-party
+// mirrors at launch (LAB-4999 Finding 1). Reverting the pinning code makes
+// .Bin empty and fails this test, so it guards the regression against a real
+// environment, not a stub.
+//
+// Unlike the launch/kill tests it does not start Chrome, so it runs even where
+// the browser cannot be launched (it only needs a browser binary to exist on
+// disk). Skips cleanly when the host has no system browser at all.
+func TestConfigureLauncher_PinsSystemBrowser(t *testing.T) {
+	if _, found := launcher.LookPath(); !found {
+		t.Skip("no system browser on this host; LAB-4999 pinning assertion N/A")
+	}
+
+	l, err := configureLauncher(BrowserOptions{Headless: true})
+	if err != nil {
+		t.Fatalf("configureLauncher: %v", err)
+	}
+
+	bin := l.Get(flags.Bin)
+	if bin == "" {
+		t.Fatal("Bin is empty — go-rod would auto-download a browser; LAB-4999 pin regressed")
+	}
+	if _, statErr := os.Stat(bin); statErr != nil {
+		t.Errorf("pinned Bin %q is not an existing file on disk: %v", bin, statErr)
+	}
 }

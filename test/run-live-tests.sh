@@ -72,6 +72,8 @@ LIVE_TARGETS=(
     concat-spa-two-stage
     edge-cases
     crawl-depth
+    forms-target
+    no-download
 )
 
 # join_targets prints array elements as a comma-separated string.
@@ -131,7 +133,7 @@ load_config() {
     # (rather than any KEY=VALUE) ensures a crafted or hand-edited config can
     # never rebind security-relevant globals such as VESPASIAN, PATH,
     # RESULTS_DIR, or TEST_HOST.
-    local allowed_keys=" REST_API_PORT SOAP_SERVICE_PORT GRAPHQL_SERVER_PORT GRPC_SERVER_PORT CONCAT_SPA_PORT TARGETS_SETUP "
+    local allowed_keys=" REST_API_PORT SOAP_SERVICE_PORT GRAPHQL_SERVER_PORT GRPC_SERVER_PORT CONCAT_SPA_PORT FORMS_TARGET_PORT TARGETS_SETUP "
 
     # Safety: only allow safe KEY=VALUE lines
     while IFS= read -r line; do
@@ -177,7 +179,7 @@ preflight_test_host() {
     local targets=$1
     local failed=0
     case ",${targets}," in
-        *,rest-api,*|*,edge-cases,*|*,crawl-depth,*)
+        *,rest-api,*|*,edge-cases,*|*,crawl-depth,*|*,no-download,*)
             _probe_target_host "${REST_API_PORT:-}" "/api/health" "rest-api" || failed=1
             ;;
     esac
@@ -214,6 +216,11 @@ preflight_test_host() {
             ;;
         *,concat-spa,*|*,concat-spa-two-stage,*)
             _probe_target_host "${CONCAT_SPA_PORT:-}" "/healthz" "concat-spa" || failed=1
+            ;;
+    esac
+    case ",${targets}," in
+        *,forms-target,*)
+            _probe_target_host "${FORMS_TARGET_PORT:-}" "/healthz" "forms-target" || failed=1
             ;;
     esac
     [ $failed -eq 0 ] && return 0
@@ -606,6 +613,608 @@ test_concat_spa_two_stage() {
         log_fail "concat-spa-two-stage: ${failures} check(s) failed (${duration}s)"
     fi
 }
+
+assert_form_query_params() {
+    local spec=$1 expected=$2
+    local result rc=0
+    result=$(python3 - "$spec" "$expected" << 'PYEOF'
+import sys, json, re
+
+# Scoped GET-form query-parameter check. argv[1]=spec.yaml argv[2]=expected-paths.json.
+spec_file = sys.argv[1]
+expected_json = sys.argv[2]
+
+with open(expected_json) as f:
+    exp = json.load(f)
+target_path = exp["form_query_params_path"]
+expected = exp["form_query_params"]
+
+with open(spec_file) as f:
+    lines = f.read().split("\n")
+
+
+def ind(s):
+    return len(s) - len(s.lstrip(" "))
+
+
+def fail(detail):
+    sys.stderr.write("  detail: " + detail + "\n")
+    print("Form query params: missing/mislocated expected parameter(s) on %s" % target_path)
+    sys.exit(1)
+
+
+# Locate the paths: section and the target path's block.
+in_paths = False
+paths_indent = None
+path_start = None
+path_indent = None
+for i, line in enumerate(lines):
+    st = line.rstrip()
+    if re.match(r"^paths:\s*$", st):
+        in_paths = True
+        continue
+    if in_paths:
+        if st and not st[0].isspace():
+            break
+        m = re.match(r'^(\s+)(?:"(/[^"]*)"|\'(/[^\']*)\'|(/[^:"\']*)):\s*$', st)
+        if m:
+            k_indent = len(m.group(1))
+            if paths_indent is None:
+                paths_indent = k_indent
+            if k_indent == paths_indent:
+                key = m.group(2) or m.group(3) or m.group(4)
+                if key == target_path:
+                    path_start = i
+                    path_indent = k_indent
+                    break
+
+if path_start is None:
+    fail("path %s not found in spec" % target_path)
+
+# Path block: contiguous lines more-indented than the path key.
+p_end = len(lines)
+for j in range(path_start + 1, len(lines)):
+    if lines[j].strip() and ind(lines[j]) <= path_indent:
+        p_end = j
+        break
+pblock = lines[path_start + 1:p_end]
+
+# Find the GET operation block within the path block.
+get_start = None
+get_indent = None
+for k, line in enumerate(pblock):
+    if re.match(r"^\s+get:\s*$", line):
+        get_start = k
+        get_indent = ind(line)
+        break
+if get_start is None:
+    fail("%s has no GET operation" % target_path)
+g_end = len(pblock)
+for j in range(get_start + 1, len(pblock)):
+    if pblock[j].strip() and ind(pblock[j]) <= get_indent:
+        g_end = j
+        break
+gblock = pblock[get_start + 1:g_end]
+
+# Find the parameters: list within the GET operation; pair name/in per item.
+params_start = None
+params_indent = None
+for k, line in enumerate(gblock):
+    if re.match(r"^\s+parameters:\s*$", line):
+        params_start = k
+        params_indent = ind(line)
+        break
+
+query_names = set()
+if params_start is not None:
+    items = []
+    cur = {}
+    for line in gblock[params_start + 1:]:
+        if line.strip() and ind(line) <= params_indent:
+            break
+        st = line.strip()
+        if st.startswith("- "):
+            if cur:
+                items.append(cur)
+            cur = {}
+            st = st[2:].strip()
+        m = re.match(r"(name|in):\s*(\S+)", st)
+        if m:
+            cur[m.group(1)] = m.group(2)
+    if cur:
+        items.append(cur)
+    query_names = {it["name"] for it in items if it.get("in") == "query" and "name" in it}
+
+missing = [p for p in expected if p not in query_names]
+if missing:
+    sys.stderr.write("  detail: found query params on %s GET: %s\n"
+                     % (target_path, ", ".join(sorted(query_names)) or "none"))
+    fail("%s GET operation missing query param(s): %s" % (target_path, ", ".join(missing)))
+print("Form query params: %s GET exposes all expected form-derived parameters (%s)"
+      % (target_path, ", ".join(expected)))
+sys.exit(0)
+PYEOF
+    ) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log_fail "${result:-Form query params: check failed}"
+        return 1
+    fi
+    log_ok "${result}"
+    return 0
+}
+
+# assert_form_body_fields verifies each urlencoded POST <form>'s input names
+# surface as request-body schema properties UNDER THAT FORM'S OWN ENDPOINT. It
+# reads post_form_body_fields_by_path {path: [fields...]} from
+# expected-paths.json, resolves each path's POST requestBody schema (a $ref into
+# components/schemas, or an inline properties block) and asserts every expected
+# field is a property of THAT schema. This closes the false-pass gap of the
+# previous whole-file `grep "^<indent><field>:"`: a field attributed to the
+# wrong operation (e.g. all names collapsing onto one path), or masked by a
+# same-named property shared across forms (username/password in both login and
+# register), or matched from an unrelated schema property, no longer satisfies
+# the check. multipart (/api/feedback) has no inferred body schema and is
+# intentionally absent from the map.
+# Usage: assert_form_body_fields <spec.yaml> <expected-paths.json>
+assert_form_body_fields() {
+    local spec=$1 expected=$2
+    local result rc=0
+    result=$(python3 - "$spec" "$expected" << 'PYEOF'
+import sys, json, re
+
+# Scoped POST-form body-field check. argv[1]=spec.yaml argv[2]=expected-paths.json.
+spec_file = sys.argv[1]
+expected_json = sys.argv[2]
+
+with open(expected_json) as f:
+    exp = json.load(f)
+by_path = exp["post_form_body_fields_by_path"]
+
+with open(spec_file) as f:
+    lines = f.read().split("\n")
+
+
+def ind(s):
+    return len(s) - len(s.lstrip(" "))
+
+
+def section_block(name_regex, start=0, end=None):
+    if end is None:
+        end = len(lines)
+    for i in range(start, end):
+        if re.match(name_regex, lines[i]):
+            base = ind(lines[i])
+            b_end = end
+            for j in range(i + 1, end):
+                if lines[j].strip() and ind(lines[j]) <= base:
+                    b_end = j
+                    break
+            return i, base, lines[i + 1:b_end]
+    return None, None, None
+
+
+def find_path_block(path):
+    in_paths = False
+    paths_indent = None
+    for i, line in enumerate(lines):
+        st = line.rstrip()
+        if re.match(r"^paths:\s*$", st):
+            in_paths = True
+            continue
+        if in_paths:
+            if st and not st[0].isspace():
+                break
+            m = re.match(r'^(\s+)(?:"(/[^"]*)"|\'(/[^\']*)\'|(/[^:"\']*)):\s*$', st)
+            if m:
+                k_indent = len(m.group(1))
+                if paths_indent is None:
+                    paths_indent = k_indent
+                if k_indent == paths_indent:
+                    key = m.group(2) or m.group(3) or m.group(4)
+                    if key == path:
+                        p_end = len(lines)
+                        for j in range(i + 1, len(lines)):
+                            if lines[j].strip() and ind(lines[j]) <= k_indent:
+                                p_end = j
+                                break
+                        return lines[i + 1:p_end]
+    return None
+
+
+def schema_properties(schema_name):
+    ci = None
+    for i, line in enumerate(lines):
+        if re.match(r"^components:\s*$", line):
+            ci = i
+            break
+    if ci is None:
+        return None
+    _, _, sblock = section_block(r'^\s+%s:\s*$' % re.escape(schema_name), start=ci)
+    if sblock is None:
+        return None
+    props = []
+    in_props = False
+    props_indent = None
+    child_indent = None
+    for line in sblock:
+        if re.match(r"^\s+properties:\s*$", line):
+            in_props = True
+            props_indent = ind(line)
+            continue
+        if in_props:
+            if line.strip() and ind(line) <= props_indent:
+                break
+            m = re.match(r"^(\s+)([A-Za-z0-9_.$-]+):\s*$", line)
+            if m:
+                lvl = len(m.group(1))
+                if child_indent is None:
+                    child_indent = lvl
+                if lvl == child_indent:
+                    props.append(m.group(2))
+    return props
+
+
+def body_fields_for_path(path):
+    pblock = find_path_block(path)
+    if pblock is None:
+        return None, None, "path not found"
+    post_start = None
+    post_indent = None
+    for k, line in enumerate(pblock):
+        if re.match(r"^\s+post:\s*$", line):
+            post_start = k
+            post_indent = ind(line)
+            break
+    if post_start is None:
+        return None, None, "no POST operation"
+    p_end = len(pblock)
+    for j in range(post_start + 1, len(pblock)):
+        if pblock[j].strip() and ind(pblock[j]) <= post_indent:
+            p_end = j
+            break
+    postblock = pblock[post_start + 1:p_end]
+    rb_start = None
+    rb_indent = None
+    for k, line in enumerate(postblock):
+        if re.match(r"^\s+requestBody:\s*$", line):
+            rb_start = k
+            rb_indent = ind(line)
+            break
+    if rb_start is None:
+        return None, None, "no requestBody"
+    r_end = len(postblock)
+    for j in range(rb_start + 1, len(postblock)):
+        if postblock[j].strip() and ind(postblock[j]) <= rb_indent:
+            r_end = j
+            break
+    rbblock = postblock[rb_start + 1:r_end]
+    for line in rbblock:
+        m = re.search(r"\$ref:\s*'?#/components/schemas/([A-Za-z0-9_.-]+)'?", line)
+        if m:
+            props = schema_properties(m.group(1))
+            if props is None:
+                return None, None, "schema %s not found" % m.group(1)
+            return set(props), "ref:" + m.group(1), None
+    in_props = False
+    props_indent = None
+    child_indent = None
+    props = []
+    for line in rbblock:
+        if re.match(r"^\s+properties:\s*$", line):
+            in_props = True
+            props_indent = ind(line)
+            continue
+        if in_props:
+            if line.strip() and ind(line) <= props_indent:
+                break
+            m = re.match(r"^(\s+)([A-Za-z0-9_.$-]+):\s*$", line)
+            if m:
+                lvl = len(m.group(1))
+                if child_indent is None:
+                    child_indent = lvl
+                if lvl == child_indent:
+                    props.append(m.group(2))
+    if props:
+        return set(props), "inline:" + path, None
+    return None, None, "no request-body schema properties"
+
+
+failures = 0
+schema_by_path = {}
+for path in sorted(by_path):
+    fields = by_path[path]
+    got, schema_id, err = body_fields_for_path(path)
+    if got is None:
+        sys.stderr.write("  detail: %s: %s\n" % (path, err))
+        failures += 1
+        continue
+    schema_by_path[path] = schema_id
+    missing = [f for f in fields if f not in got]
+    if missing:
+        sys.stderr.write("  detail: %s request-body missing field(s): %s (found: %s)\n"
+                         % (path, ", ".join(missing), ", ".join(sorted(got))))
+        failures += 1
+
+# Distinctness guard (TEST-002a): each POST form must resolve to its OWN
+# request-body schema. A shared/union $ref referenced by more than one path could
+# mask per-endpoint field loss for names common to both forms (username/password),
+# so two paths resolving to the same schema identity is a failure.
+seen = {}
+for path in sorted(schema_by_path):
+    sid = schema_by_path[path]
+    if sid in seen:
+        sys.stderr.write("  detail: %s and %s share request-body schema '%s' (schemas must be distinct per endpoint)\n"
+                         % (seen[sid], path, sid))
+        failures += 1
+    else:
+        seen[sid] = path
+
+if failures:
+    print("POST-form body fields: %d issue(s) - missing field(s) or a request-body schema shared across endpoints" % failures)
+    sys.exit(1)
+print("POST-form body fields: every form's input names present under its own distinct request-body schema")
+sys.exit(0)
+PYEOF
+    ) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log_fail "${result:-POST-form body fields: check failed}"
+        return 1
+    fi
+    log_ok "${result}"
+    return 0
+}
+
+# assert_post_get_operations verifies, for each POST-only form action, that the
+# generated spec has a POST operation AND no GET operation UNDER THAT EXACT PATH
+# (scoped to the path block, not a whole-file summary grep). The GET-absence half
+# is load-bearing for the "must NOT appear" contract: the crawler's GET probes of
+# the POST form actions 404 and are filtered at the default 0.5 confidence, so a
+# 404/confidence-filter regression would surface as a GET operation on a POST-only
+# action. Reads post_form_paths from expected-paths.json.
+# Usage: assert_post_get_operations <spec.yaml> <expected-paths.json>
+assert_post_get_operations() {
+    local spec=$1 expected=$2
+    local result rc=0
+    result=$(python3 - "$spec" "$expected" << 'PYEOF'
+import sys, json, re
+
+spec_file = sys.argv[1]
+expected_json = sys.argv[2]
+
+with open(expected_json) as f:
+    exp = json.load(f)
+paths = exp["post_form_paths"]
+
+with open(spec_file) as f:
+    lines = f.read().split("\n")
+
+
+def ind(s):
+    return len(s) - len(s.lstrip(" "))
+
+
+def path_operations(target):
+    in_paths = False
+    paths_indent = None
+    for i, line in enumerate(lines):
+        st = line.rstrip()
+        if re.match(r"^paths:\s*$", st):
+            in_paths = True
+            continue
+        if in_paths:
+            if st and not st[0].isspace():
+                break
+            m = re.match(r'^(\s+)(?:"(/[^"]*)"|\'(/[^\']*)\'|(/[^:"\']*)):\s*$', st)
+            if m:
+                k_indent = len(m.group(1))
+                if paths_indent is None:
+                    paths_indent = k_indent
+                if k_indent == paths_indent:
+                    key = m.group(2) or m.group(3) or m.group(4)
+                    if key == target:
+                        ops = set()
+                        child_indent = None
+                        for j in range(i + 1, len(lines)):
+                            if lines[j].strip() and ind(lines[j]) <= k_indent:
+                                break
+                            mo = re.match(r"^(\s+)([a-z]+):\s*$", lines[j])
+                            if mo:
+                                lvl = len(mo.group(1))
+                                if child_indent is None:
+                                    child_indent = lvl
+                                if lvl == child_indent and mo.group(2) in (
+                                    "get", "post", "put", "patch", "delete", "head", "options"
+                                ):
+                                    ops.add(mo.group(2))
+                        return ops
+    return None
+
+
+failures = 0
+for p in paths:
+    ops = path_operations(p)
+    if ops is None:
+        sys.stderr.write("  detail: %s: path not present in spec\n" % p)
+        failures += 1
+        continue
+    if "post" not in ops:
+        sys.stderr.write("  detail: %s: expected POST operation, found: %s\n"
+                         % (p, ", ".join(sorted(ops)) or "none"))
+        failures += 1
+    if "get" in ops:
+        sys.stderr.write("  detail: %s: unexpected GET operation on POST-only action (404/confidence filter regressed?)\n" % p)
+        failures += 1
+
+if failures:
+    print("POST/GET operations: %d issue(s) on form action paths" % failures)
+    sys.exit(1)
+print("POST/GET operations: every POST action has a post op and no get op, scoped to its path")
+sys.exit(0)
+PYEOF
+    ) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log_fail "${result:-POST/GET operations: check failed}"
+        return 1
+    fi
+    log_ok "${result}"
+    return 0
+}
+
+test_forms_target() {
+    local port="${FORMS_TARGET_PORT:-8994}"
+    local base_url="http://${TEST_HOST}:${port}"
+    local target_dir="${RESULTS_DIR}/forms-target"
+    local capture_file="${target_dir}/capture.json"
+    local spec_file="${target_dir}/spec.yaml"
+    local spec_fields_file="${target_dir}/spec-fields.yaml"
+    local expected="${SCRIPT_DIR}/forms-target/expected-paths.json"
+    local verbose_flag=""
+
+    [ "${VERBOSE:-false}" = true ] && verbose_flag="-v"
+
+    mkdir -p "$target_dir"
+    init_test_status "forms-target"
+
+    local start=$SECONDS
+    local failures=0
+
+    log_header "Testing: forms-target (${base_url})"
+
+    # Step 1: Crawl — both backends (http and rod), mirroring rest-api. The http
+    # backend (headless=false) is the capture used for spec generation; forms are
+    # static HTML so the http body is all analyze.ExtractForms needs. The rod
+    # backend is a crash/reachability smoke check only (asserts at least 1
+    # request captured, not form-extraction parity) and degrades gracefully
+    # without Chrome.
+    for hl in false true; do
+        local cap="${target_dir}/capture-${hl}.json"
+        if [ "$hl" = "true" ]; then
+            if ! chrome_available; then
+                log_warn "forms-target[headless=true]: Chrome unavailable, skipping rod backend"
+                continue
+            fi
+        fi
+        log_info "Crawling ${base_url} (headless=${hl})..."
+        if ! crawl_backend "$base_url" "$cap" "$hl" --depth 2 --max-pages 50 --timeout 2m $verbose_flag; then
+            if [ "$hl" = "true" ]; then
+                log_warn "forms-target[headless=true]: crawl failed (Chrome may be unlaunchable), skipping rod backend"
+                continue
+            fi
+            log_fail "Crawl failed (headless=${hl})"
+            set_test_result "forms-target" "FAIL" "?" "?" "$((SECONDS - start))"
+            return 1
+        fi
+        local n; n=$(json_len "$cap")
+        log_info "forms-target[headless=${hl}]: ${n} requests captured"
+        if ! validate_capture "$cap" 1; then
+            failures=$((failures + 1))
+        fi
+    done
+
+    cp "${target_dir}/capture-false.json" "$capture_file" 2>/dev/null || true
+
+    # Step 2: Generate at the default 0.5 confidence. POST forms score 0.7
+    # (non-GET method) and appear standalone; /api/search is captured directly
+    # via its <a href> link. /api/login, /api/register and /api/feedback have NO
+    # real handler and are never linked or fetched, so they reach the spec ONLY
+    # via analyze.ExtractForms — the core end-to-end regression guard.
+    log_info "Generating OpenAPI spec (default confidence)..."
+    if ! "$VESPASIAN" generate rest "$capture_file" \
+        -o "$spec_file" \
+        --probe=false \
+        $verbose_flag 2>&1; then
+        log_fail "Generate failed"
+        set_test_result "forms-target" "FAIL" "?" "?" "$((SECONDS - start))"
+        return 1
+    fi
+
+    # Step 3: Validate the form-derived endpoints.
+    if ! validate_openapi_structure "$spec_file"; then
+        failures=$((failures + 1))
+    fi
+    if ! validate_path_coverage "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+    if ! validate_no_static_assets "$spec_file"; then
+        failures=$((failures + 1))
+    fi
+    # Each POST form action must carry a POST operation and NO GET operation,
+    # scoped to its own path block (TEST-003: assert_post_get_operations walks the
+    # spec per exact path key instead of whole-file grepping a summary line). This
+    # covers both the "POST present" half (extraction/classification reached the
+    # spec) and the "GET absent" half (the crawler's 404 GET probes were filtered).
+    if ! assert_post_get_operations "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+
+    # Each urlencoded POST form's input names must surface as request-body schema
+    # properties UNDER THAT FORM'S OWN ENDPOINT (assert_form_body_fields resolves
+    # each path's requestBody $ref and checks that schema's properties). This is
+    # the strongest form-extraction signal: it proves ExtractForms recovered the
+    # <input>/<select>/<textarea> names AND attached them to the right operation,
+    # not merely that the names appear somewhere in the spec. multipart
+    # (/api/feedback) body schemas are not inferred, so it is intentionally
+    # absent from post_form_body_fields_by_path.
+    if ! assert_form_body_fields "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+
+    # Step 4: GET-form field validation. A GET form scores 0 confidence (no body,
+    # no API content-type) so it is filtered out at the default 0.5 threshold;
+    # re-generate at --confidence 0 so the synthetic GET-form request survives
+    # classification and Deduplicate merges its query params onto /api/search.
+    log_info "Generating OpenAPI spec (--confidence 0) for GET-form field validation..."
+    if "$VESPASIAN" generate rest "$capture_file" \
+        -o "$spec_fields_file" \
+        --confidence 0 \
+        --probe=false \
+        $verbose_flag 2>&1; then
+        if ! assert_form_query_params "$spec_fields_file" "$expected"; then
+            failures=$((failures + 1))
+        fi
+    else
+        log_fail "Generate (--confidence 0) failed"
+        failures=$((failures + 1))
+    fi
+
+    # Value-blanking guard (TEST-001): ExtractForms blanks hidden/password/CSRF
+    # field VALUES while keeping their names. The fixture seeds distinctive
+    # sentinels on the hidden fields (test/forms-target/main.go: csrf_token,
+    # _token); assert neither leaks into either generated spec. A regression that
+    # emitted static hidden values (e.g. as example/default schema values) would,
+    # for an API-enumeration tool, leak a captured CSRF/session-token seed.
+    local secret
+    for secret in live-test-csrf live-test-token; do
+        if grep -qF "$secret" "$spec_file" "$spec_fields_file" 2>/dev/null; then
+            log_fail "forms-target: hidden-field value '${secret}' leaked into generated spec (value-blanking regressed)"
+            failures=$((failures + 1))
+        fi
+    done
+
+    local endpoint_count
+    endpoint_count=$(count_spec_endpoints "$spec_file")
+    local expected_count
+    expected_count=$(json_field "$expected" total_paths)
+
+    # Exact-count guard: the default-confidence spec must contain EXACTLY the
+    # expected form-derived paths. A spurious extra path (a receiver literal or a
+    # crawl artifact that slipped the classifier) trips this. Mirrors the sibling
+    # test_concat_spa exact-count check.
+    if [ "$endpoint_count" != "$expected_count" ]; then
+        log_fail "forms-target: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
+        failures=$((failures + 1))
+    fi
+
+    local duration=$((SECONDS - start))
+    if [ $failures -eq 0 ]; then
+        set_test_result "forms-target" "PASS" "$endpoint_count" "$expected_count" "$duration"
+        log_ok "forms-target: ALL CHECKS PASSED (${duration}s)"
+    else
+        set_test_result "forms-target" "FAIL" "$endpoint_count" "$expected_count" "$duration"
+        log_fail "forms-target: ${failures} check(s) failed (${duration}s)"
+    fi
+}
+
 
 test_soap_service() {
     local port="${SOAP_SERVICE_PORT:-8991}"
@@ -2878,6 +3487,108 @@ PYEOF
 # Summary
 # ──────────────────────────────────────────────────────────────
 
+# test_no_download regresses LAB-4999 Finding 1 at the live layer: a real
+# headless crawl must use the system browser and NOT trigger go-rod's managed
+# browser download. go-rod only populates its cache dir
+# (<HOME>/.cache/rod/browser/chromium-<rev>) when no binary is pinned; with the
+# LookPath pin in place that directory is never written. We wipe and recreate a
+# temporary HOME so go-rod's cache starts guaranteed-empty, run the crawl under
+# it, and fail if the cache is non-empty afterwards. launcher.LookPath resolves
+# the *system* Chrome from PATH/standard locations independently of HOME, so a
+# correct pin still finds it (no download); only a regressed pin downloads into
+# the empty cache. Starting from a freshly-wiped cache (rather than diffing a
+# shared or reused one) closes the gap where a browser left at the current pinned
+# revision by a prior run would let a regression reuse it without writing a new
+# entry — a false pass a before/after diff could not catch.
+test_no_download() {
+    local port="${REST_API_PORT:-8990}"
+    local base_url="http://${TEST_HOST}:${port}"
+    local target_dir="${RESULTS_DIR}/no-download"
+    local iso_home="${target_dir}/home"
+    local rod_cache="${iso_home}/.cache/rod/browser"
+
+    # Wipe the isolated cache so it starts empty regardless of prior local runs
+    # (a chromium-<rev> left by an earlier regressed or opt-in-download run would
+    # otherwise mask a still-regressed pin).
+    rm -rf "$iso_home"
+    mkdir -p "$target_dir" "$iso_home"
+    init_test_status "no-download"
+    local start=$SECONDS
+
+    log_header "Testing: no-download (${base_url})"
+
+    if ! chrome_available; then
+        log_warn "no-download: Chrome unavailable, skipping (no headless launch to exercise)"
+        set_test_result "no-download" "SKIP" "-" "-" "$((SECONDS - start))"
+        return 0
+    fi
+
+    log_info "Running headless crawl to assert no browser download..."
+    # Capture merged stdout+stderr (crawl_backend already does 2>&1) so the
+    # skip-vs-fail decision below can inspect what go-rod actually did, not just
+    # whether the crawl exited zero.
+    local crawl_log="${target_dir}/crawl.log"
+    local crawl_ok=true
+    if ! ( export HOME="$iso_home"; crawl_backend "$base_url" "${target_dir}/capture.json" true --depth 1 --max-pages 5 --timeout 2m ) >"$crawl_log" 2>&1; then
+        crawl_ok=false
+    fi
+
+    # Detection 1 — audit egress (download succeeds): go-rod writes the managed
+    # Chromium into the freshly-wiped isolated cache. A correct system-Chrome pin
+    # never writes it; any chromium-<rev> means go-rod downloaded a browser.
+    local downloaded
+    downloaded=$(ls -A "$rod_cache" 2>/dev/null || true)
+    if [ -n "$downloaded" ]; then
+        log_fail "go-rod downloaded a browser into ${rod_cache} during the crawl — LAB-4999 pin regressed"
+        log_info "rod cache contents: [${downloaded}]"
+        set_test_result "no-download" "FAIL" "-" "-" "$((SECONDS - start))"
+        return 1
+    fi
+
+    # Detection 2 — block egress (download blocked): under the LAB-4732
+    # egress-policy: block this PR unblocks, a regressed pin makes go-rod TRY to
+    # fetch a managed Chromium, but fetchup's FastestURL() finds no reachable
+    # mirror, returns ErrNoURLs, and Download() (the only cache-writing code) is
+    # never reached — so the cache stays empty and the crawl fails. Detection 1
+    # alone would mask this as a SKIP. These markers appear ONLY when go-rod takes
+    # the auto-download path (.Bin empty = pin regressed); which ones show depends
+    # on egress mode, and the guard matches any:
+    #   - "can't find a browser binary for your OS" — go-rod Download() error wrap
+    #     (block egress: the download failed).
+    #   - "Not able to find a valid URL to download" — fetchup ErrNoURLs; its
+    #     message embeds the mirror-host URL list, so the host markers below also
+    #     appear here (block egress).
+    #   - "[launcher.Browser]" — go-rod's download-logger prefix (audit egress,
+    #     where the download proceeds).
+    #   - the three go-rod mirror hosts (HostGoogle/HostNPM/HostPlaywright).
+    # None appear on a normal pinned crawl, which never enters the download path.
+    local dl_markers="can't find a browser binary for your OS|Not able to find a valid URL to download|\[launcher\.Browser\]|storage\.googleapis\.com|registry\.npmmirror\.com|playwright\.azureedge\.net"
+    if grep -qiE "$dl_markers" "$crawl_log"; then
+        log_fail "go-rod attempted a browser download during the crawl — LAB-4999 pin regressed (download blocked by egress policy)"
+        log_info "matching crawl output:"
+        grep -iE "$dl_markers" "$crawl_log" | head -5
+        set_test_result "no-download" "FAIL" "-" "-" "$((SECONDS - start))"
+        return 1
+    fi
+
+    # Neither detection tripped: the cache is empty AND go-rod never took the
+    # download path. A crawl failure here is a genuine launch failure (Chrome
+    # unlaunchable in this environment, or the correct "no system Chrome" refusal
+    # when no browser is installed), not a pin regression — degrade to skip,
+    # matching the other rod targets.
+    if [ "$crawl_ok" = false ]; then
+        log_warn "no-download: headless crawl failed with no download attempt (Chrome may be unlaunchable), skipping"
+        log_info "crawl output tail:"
+        tail -n 5 "$crawl_log" 2>/dev/null || true
+        set_test_result "no-download" "SKIP" "-" "-" "$((SECONDS - start))"
+        return 0
+    fi
+
+    log_ok "No browser download detected; system Chrome was used"
+    set_test_result "no-download" "PASS" "-" "-" "$((SECONDS - start))"
+    return 0
+}
+
 print_summary() {
     local total_pass=0 total_fail=0 total_skip=0
 
@@ -2940,7 +3651,7 @@ usage() {
     echo "                                      import-mitmproxy, import-mitmproxy-native,"
     echo "                                      import-unicode, import-duplicates,"
     echo "                                      import-malformed, import-empty"
-    echo "                          Crawl:      crawl-depth, crawl-unreachable"
+    echo "                          Crawl:      crawl-depth, crawl-unreachable, no-download"
     echo "                          Edge cases: edge-cases, classifier-edge, spec-edge"
     echo "  --verbose             Enable verbose vespasian output"
     echo "  --no-build            Skip building vespasian and target binaries"
@@ -3062,6 +3773,7 @@ main() {
             grpc-server)     test_grpc_server ;;
             concat-spa)      test_concat_spa ;;
             concat-spa-two-stage) test_concat_spa_two_stage ;;
+            forms-target)    test_forms_target ;;
             import-burp)        test_import_burp ;;
             import-har)         test_import_har ;;
             import-base64)      test_import_base64 ;;
@@ -3081,6 +3793,7 @@ main() {
             edge-cases)         test_edge_cases ;;
             crawl-depth)        test_crawl_depth ;;
             crawl-unreachable)  test_crawl_unreachable ;;
+            no-download)        test_no_download ;;
             classifier-edge)    test_classifier_edge_cases ;;
             spec-edge)          test_spec_edge_cases ;;
             *)
