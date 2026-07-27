@@ -789,13 +789,16 @@ func TestExtractFromBundle_ConcatDedupHostCaseInsensitive(t *testing.T) {
 	}
 }
 
-// TEST-001: extractConcatEndpoints' emit guard is
-// `if filterURL(p) || isExprOnly(p) || astURLs[...] { continue }` — this pins
-// the filterURL/isExprOnly half, which previously had zero coverage. A concat
-// reconstruction that carries an API indicator (satisfying hasAPIIndicator in
-// cleanConcatPath, via "api/") but reconstructs to an asset URL (".js") must
-// still be dropped by filterURL before it is ever emitted as an
+// TEST-001: pins extractConcatEndpoints' filterURL gate, which previously had
+// zero coverage. A concat reconstruction that carries an API indicator
+// (satisfying hasAPIIndicator in cleanConcatPath, via "api/") but reconstructs
+// to an asset URL (".js") must still be dropped before it is ever emitted as an
 // ExtractedEndpoint.
+//
+// QUAL-010 (LAB-4992): the drop is made by the single filterURL call on the RAW
+// reconstruction. A second, post-normalization filterURL/isExprOnly pair used to
+// sit in the astURLs guard below it; both were provably unreachable and were
+// removed, so this test now covers the raw-form call alone.
 func TestExtractFromBundle_ConcatFilteredAsAsset(t *testing.T) {
 	src := []byte(`var u = "/api/" + "bundle.js"; fetch(u);`)
 	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")

@@ -3345,6 +3345,21 @@ func TestExtractStaticConcatPaths(t *testing.T) {
 			js:   `"identity/"+"api/x"; "identity/"+"api/x"; fetch("/api/p/".concat(id));`,
 			want: []string{"/api/p/0", "identity/api/x"},
 		},
+		{
+			// TEST-009: pins the CROSS-EXTRACTOR arm of ExtractStaticConcatPaths'
+			// add() dedup (`seen[p]` already true). The case above only
+			// exercises intra-extractor repeats — "identity/" has no API
+			// indicator, so concatPlusHeadPattern never matches it and only
+			// servicePrefixPlusPaths emits it, whose own seen map absorbs the
+			// repeat. Here the single head literal "api/" matches BOTH
+			// concatPlusHeadPattern (it satisfies apiIndicatorAlternation) and
+			// servicePrefixPlusHeadPattern, so extractConcatPaths and
+			// servicePrefixPlusPaths each reconstruct "api/v2/users" and only
+			// add()'s shared seen map can collapse them to one entry.
+			name: "dedup across extractors for one input",
+			js:   `var u = "api/" + "v2/users";`,
+			want: []string{"api/v2/users"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

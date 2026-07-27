@@ -561,6 +561,64 @@ func TestAnalyze_MaxEndpointsPerBundle_PreservesConcatEndpoint(t *testing.T) {
 	}
 }
 
+// TestAnalyze_MaxEndpointsPerBundle_PreservesConcatEndpointFromSourcemap is a
+// regression for QUAL-011 (LAB-4992). The bundle-body truncation was routed
+// through capBundleEndpoints so AST endpoints could not starve concat
+// candidates, but the sourcemap-source path in the same function still took a
+// bare prefix slice (`smEps = smEps[:remaining]`). ExtractFromBundle runs the
+// identical step-5 concat extraction on every sourcemap source and appends
+// those reconstructions AFTER all AST-recovered endpoints, so any sourcemap
+// source whose AST endpoints alone consume the remaining budget silently
+// dropped every concat candidate it contained.
+//
+// Here the bundle body carries no API endpoints of its own (only the
+// sourceMappingURL comment), so the full budget of 5 is available to the
+// sourcemap source. That source supplies 10 AST-literal fetch() calls — twice
+// the budget — plus one literal service-prefix concat form recoverable only by
+// crawl.ExtractStaticConcatPaths. Pre-fix the prefix slice kept the first 5 AST
+// endpoints and the concat candidate was lost; capBundleEndpoints reserves a
+// floor for it instead.
+func TestAnalyze_MaxEndpointsPerBundle_PreservesConcatEndpointFromSourcemap(t *testing.T) {
+	var smContent strings.Builder
+	for i := 0; i < 10; i++ {
+		fmt.Fprintf(&smContent, "fetch(\"/api/sm%d\");\n", i)
+	}
+	// Literal+literal service-prefix form: recovered only by
+	// extractConcatEndpoints, never by jsluice's AST walkers.
+	smContent.WriteString(`var svc = "identity/" + "api/auth/login";` + "\n")
+
+	smDoc := fmt.Sprintf(`{"sources":["src/x.js"],"sourcesContent":[%s]}`,
+		func() string { b, _ := json.Marshal(smContent.String()); return string(b) }())
+	encoded := base64.StdEncoding.EncodeToString([]byte(smDoc))
+	// Bundle body deliberately contains no API endpoints, so the whole
+	// per-bundle budget is left to the sourcemap source.
+	bundleBody := "//# sourceMappingURL=data:application/json;base64," + encoded + "\n"
+
+	bundle := makeJSCapture("https://h/app.js", bundleBody)
+	res, err := Analyze(context.Background(), []crawl.ObservedRequest{bundle}, Options{
+		MaxEndpointsPerBundle: 5,
+	})
+	if err != nil {
+		t.Fatalf("Analyze error: %v", err)
+	}
+
+	var sawConcat bool
+	for _, r := range res.Requests {
+		if r.Source == SourceJSConcat {
+			sawConcat = true
+			break
+		}
+	}
+	if !sawConcat {
+		t.Errorf("expected a %s endpoint recovered from the sourcemap source to survive truncation when its AST endpoints alone exceed the remaining budget (5); got requests: %v", SourceJSConcat, res.Requests)
+	}
+	// The cap must still hold — the concat floor reserves budget, it does not
+	// expand it.
+	if res.Stats.EndpointsKept > 5 {
+		t.Errorf("EndpointsKept = %d, want <= 5 (MaxEndpointsPerBundle must still cap the total)", res.Stats.EndpointsKept)
+	}
+}
+
 // TestCapBundleEndpoints_ConcatAbundantFullyUtilizesBudget is a regression for
 // QUAL-002 (LAB-4992): capBundleEndpoints previously reserved a hard `max/2`
 // slice for concat candidates and gave AST the remainder, so whenever AST did

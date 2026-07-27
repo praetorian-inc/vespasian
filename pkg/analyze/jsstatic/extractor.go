@@ -670,9 +670,11 @@ func ExtractFromBundle(jsSource []byte, baseURL string) ([]ExtractedEndpoint, er
 // converts each surviving path into a GET ExtractedEndpoint. A bare path string
 // carries no HTTP method, so these candidates default to GET.
 //
-// crawl returns raw reconstructions, so relative paths get a leading slash here
-// before filtering (mirroring addPath in the active crawl path). Two dedup
-// guards keep this additive rather than noisy:
+// crawl returns raw reconstructions. The scheme/asset filter (filterURL) runs
+// first, on the raw form, because a leading-slash prepend would defeat its
+// HasPrefix scheme blocklist; relative paths then get their leading slash
+// (mirroring addPath in the active crawl path). Two dedup guards keep this
+// additive rather than noisy:
 //   - astURLs: skip any path the AST walkers already emitted for ANY method, so
 //     a concat reconstruction that collides with a jsluice-recovered URL does
 //     not synthesize a phantom GET companion (mirrors the method-less fetch
@@ -720,7 +722,22 @@ func extractConcatEndpoints(jsSource []byte, baseURL, baseHost string, seen map[
 		if absolute && hostOfURL(p) != baseHost {
 			continue
 		}
-		if filterURL(p) || isExprOnly(p) || astURLs[concatDedupKey(p, baseHost)] {
+		// QUAL-010 (LAB-4992): only the astURLs dedup is checked here. This
+		// guard used to also re-test filterURL(p) and isExprOnly(p), but both
+		// are unreachable at this point:
+		//   - filterURL already ran above on the RAW reconstruction, and the
+		//     only mutation of p since is a possible leading-'/' prepend. That
+		//     cannot make p empty, cannot change the asset-extension suffix,
+		//     and can only DESTROY a filtered-scheme HasPrefix match, never
+		//     create one — so a second call can never return true where the
+		//     first did not.
+		//   - isExprOnly looks for jsluice's EXPR placeholder, but the shared
+		//     crawl extractor substitutes the numeric sentinel "0" for
+		//     non-literal operands, and cleanConcatPath already requires an API
+		//     indicator, so a path reaching here is never EXPR-only.
+		// Retaining them implied this guard caught something the raw-form call
+		// misses, which it does not.
+		if astURLs[concatDedupKey(p, baseHost)] {
 			continue
 		}
 		k := endpointKey{"GET", p}

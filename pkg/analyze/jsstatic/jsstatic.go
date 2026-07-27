@@ -440,8 +440,16 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 			continue
 		}
 		result.stats.EndpointsFound += len(smEps)
+		// QUAL-011 (LAB-4992): route this through capBundleEndpoints, exactly
+		// like the bundle-body truncation above, rather than taking a bare
+		// prefix slice. ExtractFromBundle runs the same step-5 concat
+		// extraction on each sourcemap source and appends those
+		// reconstructions AFTER all AST-recovered endpoints, so a prefix slice
+		// silently drops every concat candidate from any sourcemap source
+		// whose AST endpoints alone consume the remaining budget — the precise
+		// failure mode capBundleEndpoints exists to prevent.
 		if len(smEps) > remaining {
-			smEps = smEps[:remaining]
+			smEps = capBundleEndpoints(smEps, remaining)
 		}
 		for i := range smEps {
 			// Preserve the distinct concat reconstruction tag; force everything
