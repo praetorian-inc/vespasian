@@ -15,6 +15,7 @@
 package crawl
 
 import (
+	"bytes"
 	"context"
 	"net"
 	"strings"
@@ -141,7 +142,10 @@ func TestScopeChecker_UnknownScopeDefaultsToSameOrigin(t *testing.T) {
 	}
 }
 
-func TestNormalizeURL(t *testing.T) {
+// TestCanonicalizeURL_KeepQuery covers canonicalizeURL in its query-preserving
+// mode. It used to test the normalizeURL wrapper, which was removed once
+// urlFrontier.Push switched to frontierKey and left it with no production caller.
+func TestCanonicalizeURL_KeepQuery(t *testing.T) {
 	tests := []struct {
 		name  string
 		input string
@@ -161,9 +165,9 @@ func TestNormalizeURL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := normalizeURL(tt.input)
+			got := canonicalizeURL(tt.input, false)
 			if got != tt.want {
-				t.Errorf("normalizeURL(%q) = %q, want %q", tt.input, got, tt.want)
+				t.Errorf("canonicalizeURL(%q, false) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
 	}
@@ -365,5 +369,101 @@ func TestFrontierKey(t *testing.T) {
 	}
 	if got["https://example.com/p?id=1"] == got["https://example.com/other?id=1"] {
 		t.Errorf("distinct paths collapsed to the same key")
+	}
+}
+
+// TestSeedScope_LearnsEffectiveOrigin is the unit-level pin for the
+// cross-origin-seed-redirect fix. With a same-origin policy, a URL on the origin
+// the seed actually resolved to must be in scope once that origin is learned, and
+// out of scope before — otherwise every request Chrome captures after following
+// the seed's redirect is discarded and the crawl yields an empty capture.
+func TestSeedScope_LearnsEffectiveOrigin(t *testing.T) {
+	var stderr bytes.Buffer
+	s, err := newSeedScope("http://example.com", "same-origin", true, &stderr)
+	if err != nil {
+		t.Fatalf("newSeedScope: %v", err)
+	}
+
+	const post = "https://www.example.com/api/users"
+	if s.Check(post) {
+		t.Fatal("post-redirect origin in scope before the redirect was observed")
+	}
+	if !s.Check("http://example.com/api/users") {
+		t.Fatal("seed origin not in scope")
+	}
+
+	s.LearnEffectiveOrigin("https://www.example.com/")
+
+	if !s.Check(post) {
+		t.Error("post-redirect origin still out of scope after LearnEffectiveOrigin")
+	}
+	// Widening is bounded to that one origin: nothing else is admitted.
+	for _, u := range []string{
+		"https://attacker.test/x",
+		"https://other.example.com/x", // a sibling host is NOT implied
+		"https://www.example.com:8443/x",
+	} {
+		if s.Check(u) {
+			t.Errorf("Check(%q) = true, want false (widening must add exactly one origin)", u)
+		}
+	}
+	// And it is announced, not silent.
+	if !strings.Contains(stderr.String(), "https://www.example.com") {
+		t.Errorf("scope widening not reported on stderr; got %q", stderr.String())
+	}
+}
+
+// TestSeedScope_LearnIsOneShot pins the containment bound: only the seed's FIRST
+// navigation may widen scope. A later call — a resumed depth-0 entry, a retry, or
+// any future caller — must not be able to add a second origin.
+func TestSeedScope_LearnIsOneShot(t *testing.T) {
+	s, err := newSeedScope("http://example.com", "same-origin", true, nil)
+	if err != nil {
+		t.Fatalf("newSeedScope: %v", err)
+	}
+	s.LearnEffectiveOrigin("https://www.example.com/")
+	s.LearnEffectiveOrigin("https://attacker.test/")
+	if s.Check("https://attacker.test/x") {
+		t.Error("a second LearnEffectiveOrigin call widened scope again")
+	}
+	if !s.Check("https://www.example.com/x") {
+		t.Error("the first learned origin was lost")
+	}
+}
+
+// TestSeedScope_LearnNoopOnSameOrigin verifies the common case adds nothing: a
+// seed that redirects within its own origin (or not at all) leaves the accepted
+// set exactly as configured, and says nothing on stderr.
+func TestSeedScope_LearnNoopOnSameOrigin(t *testing.T) {
+	var stderr bytes.Buffer
+	s, err := newSeedScope("https://example.com/start", "same-origin", true, &stderr)
+	if err != nil {
+		t.Fatalf("newSeedScope: %v", err)
+	}
+	// Same origin in explicit-port form: must be recognized as unchanged.
+	s.LearnEffectiveOrigin("https://example.com:443/app/")
+	if s.effOrigin != "" {
+		t.Errorf("effOrigin = %q, want empty (no widening for a same-origin redirect)", s.effOrigin)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+// TestSeedScope_RefusesPrivateEffectiveOrigin verifies the SSRF gate still holds
+// over the widened origin: a seed that redirects to a private host must not pull
+// that host into scope without --dangerous-allow-private.
+func TestSeedScope_RefusesPrivateEffectiveOrigin(t *testing.T) {
+	var stderr bytes.Buffer
+	s, err := newSeedScope("https://example.com", "same-origin", false, &stderr)
+	if err != nil {
+		t.Fatalf("newSeedScope: %v", err)
+	}
+	s.LearnEffectiveOrigin("http://127.0.0.1:8080/")
+	if s.Check("http://127.0.0.1:8080/admin") {
+		t.Error("private effective origin was admitted without --dangerous-allow-private")
+	}
+	if !strings.Contains(stderr.String(), "private origin") {
+		t.Errorf("private-origin refusal not reported; stderr = %q", stderr.String())
 	}
 }

@@ -235,7 +235,7 @@ type CrawlOptions struct {
 	Depth           int           `default:"3" help:"Maximum crawl depth"`
 	MaxPages        int           `default:"100" help:"Maximum number of pages (URLs visited) to crawl; pages already in flight when the limit is reached still finish"`
 	MaxRequests     int           `name:"max-requests" default:"0" help:"Maximum captured requests before the crawl stops enqueuing new pages (0 = unlimited). A rate/politeness bound distinct from --max-pages; pages already in flight when the limit is reached still finish."`
-	Interact        bool          `name:"interact" help:"Click non-destructive page elements (buttons) to surface endpoints that only fire on interaction. Headless backend only; skips delete/logout-style controls. Off by default (clicking can mutate state)."`
+	Interact        bool          `name:"interact" help:"Click page controls (buttons, [role=button], [onclick]) to surface endpoints that only fire on interaction. Includes form submit buttons, so it submits forms and can mutate state. Headless backend only. Skips destructive, session-ending, and payment-commit labels on a best-effort match. Off by default."`
 	Timeout         time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
 	Scope           string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
 	Headless        bool          `default:"true" help:"Use headless browser"`

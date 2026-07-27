@@ -41,7 +41,11 @@ func TestIsDestructiveLabel(t *testing.T) {
 	}
 }
 
-func TestSelectInteractionTargets(t *testing.T) {
+// TestNextInteractionTarget walks the selection the way interactPage does: pick
+// one target, mark it used, re-select. The sequence must skip destructive and
+// blank labels and never return a label already used (which is also what stops a
+// re-queried DOM from yielding the same control twice).
+func TestNextInteractionTarget(t *testing.T) {
 	labels := []string{
 		"Load more", // 0 keep
 		"Delete",    // 1 skip (destructive)
@@ -52,24 +56,65 @@ func TestSelectInteractionTargets(t *testing.T) {
 		"Sign out",  // 6 skip (destructive)
 		"Details",   // 7 keep
 	}
-	got := selectInteractionTargets(labels, maxInteractionsPerPage)
+	used := map[string]bool{}
+	var got []int
+	for {
+		idx := nextInteractionTarget(labels, used)
+		if idx < 0 {
+			break
+		}
+		got = append(got, idx)
+		used[normalizeLabel(labels[idx])] = true
+	}
 	want := []int{0, 3, 5, 7}
 	if !slices.Equal(got, want) {
-		t.Errorf("selectInteractionTargets = %v, want %v", got, want)
+		t.Errorf("nextInteractionTarget sequence = %v, want %v", got, want)
+	}
+	// Nothing selectable at all is -1, not a panic or index 0.
+	if idx := nextInteractionTarget([]string{"", "Delete"}, nil); idx != -1 {
+		t.Errorf("all-unselectable labels returned %d, want -1", idx)
 	}
 }
 
-func TestSelectInteractionTargets_Cap(t *testing.T) {
-	labels := []string{"a", "b", "c", "d", "e"}
-	got := selectInteractionTargets(labels, 3)
-	if len(got) != 3 {
-		t.Errorf("len = %d, want 3 (capped)", len(got))
+// TestClickAllowed pins the pre-click gate as FAIL CLOSED. An unreadable label
+// (ok == false) must be a skip: elementLabel returns "" when its reads fail, and
+// isDestructiveLabel("") is false, so a gate that consulted only the label would
+// permit the click in exactly the mid-re-render case the re-check exists for.
+func TestClickAllowed(t *testing.T) {
+	cases := []struct {
+		label string
+		ok    bool
+		want  bool
+	}{
+		{"Load more", true, true},
+		{"Delete account", true, false},
+		{"", false, false},          // read failed: no evidence either way -> skip
+		{"Load more", false, false}, // read failed even with a label present -> skip
+		{"", true, false},           // blank label -> skip, matching the up-front scan
 	}
-	if !slices.Equal(got, []int{0, 1, 2}) {
-		t.Errorf("got %v, want first 3 indices", got)
+	for _, c := range cases {
+		if got := clickAllowed(c.label, c.ok); got != c.want {
+			t.Errorf("clickAllowed(%q, %v) = %v, want %v", c.label, c.ok, got, c.want)
+		}
 	}
-	// A non-positive cap selects nothing.
-	if n := selectInteractionTargets(labels, 0); n != nil {
-		t.Errorf("max=0 selected %v, want nil", n)
+}
+
+// TestIsDestructiveLabel_IrreversibleCommits covers the labels added because their
+// consequences cannot be undone by re-running the crawl. Generic mutating verbs
+// (submit, save, search) are deliberately NOT skipped — see the tradeoff note on
+// destructiveLabelSubstrings — so they are asserted safe here to pin that choice.
+func TestIsDestructiveLabel_IrreversibleCommits(t *testing.T) {
+	for _, l := range []string{
+		"Pay now", "Submit payment", "Purchase", "Buy now",
+		"Place order", "Checkout", "Check out", "Withdraw funds", "Transfer funds",
+	} {
+		if !isDestructiveLabel(l) {
+			t.Errorf("isDestructiveLabel(%q) = false, want true (irreversible commit)", l)
+		}
+	}
+	for _, l := range []string{"Submit", "Save", "Send", "Apply", "Search", "Update", "Create"} {
+		if isDestructiveLabel(l) {
+			t.Errorf("isDestructiveLabel(%q) = true, want false (generic mutation is in scope for --interact)", l)
+		}
 	}
 }

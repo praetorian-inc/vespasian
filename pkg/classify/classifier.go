@@ -149,7 +149,7 @@ func NearMisses(classifiers []APIClassifier, requests []crawl.ObservedRequest, f
 // canonicalHost returns u's host lowercased with a default port (80 for http,
 // 443 for https) stripped, so the dedup key treats example.com,
 // EXAMPLE.com:443, and example.com as the same host. Mirrors the host handling
-// in crawl.normalizeURL.
+// in pkg/crawl's canonicalizeURL.
 func canonicalHost(u *url.URL) string {
 	host := strings.ToLower(u.Hostname())
 	if host == "" {
@@ -167,7 +167,9 @@ func canonicalHost(u *url.URL) string {
 }
 
 // Deduplicate removes duplicate classified requests, keeping the highest confidence.
-// The deduplication key is METHOD:path (query params and fragments stripped).
+// The deduplication key is METHOD:canonicalHost:path (query params and fragments
+// stripped), extended with SOAPAction and a content-type + body hash where those
+// are present — see the key construction below for why each part is there.
 // Multi-value QueryParams from duplicate observations are merged with union-of-values,
 // preserving first-seen order.
 //

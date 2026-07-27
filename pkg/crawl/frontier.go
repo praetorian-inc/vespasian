@@ -17,10 +17,13 @@ package crawl
 import "sync"
 
 // urlEntry represents a URL in the frontier with its crawl depth.
-type urlEntry struct {
-	URL   string
-	Depth int
-}
+//
+// It is an alias for the exported [PendingURL] rather than its own type: the same
+// value is both the frontier's internal queue element and the element type of
+// [Checkpoint.Pending], which an external host (Guard) must be able to construct
+// and inspect. One type keeps the frontier's short internal name at the call sites
+// that read best with it while leaving the checkpoint's wire type exported.
+type urlEntry = PendingURL
 
 // urlFrontier is a thread-safe queue of URLs to visit, with deduplication,
 // scope filtering, and depth tracking. Workers call Pop to get the next URL and
@@ -37,6 +40,14 @@ type urlFrontier struct {
 	active   int  // workers currently navigating a page
 	closed   bool // set by Close(); prevents new pushes
 	dfs      bool // when true, Pop uses LIFO order (depth-first)
+
+	// failed holds the dedup keys of pages that were VISITED AND FAILED
+	// transiently. They stay in `seen` so this run does not retry them (a
+	// persistently broken page linked from many pages would otherwise be
+	// re-attempted once per referrer and spend the page budget on it), but
+	// Snapshot excludes them from the checkpoint's seen-set so a later resumed run
+	// gets one more attempt. See [urlFrontier.MarkFailed].
+	failed map[string]bool
 }
 
 // newURLFrontier creates a frontier with the given max depth and scope filter.
@@ -46,6 +57,7 @@ func newURLFrontier(maxDepth int, scopeFn func(string) bool) *urlFrontier {
 	f := &urlFrontier{
 		queue:    make([]urlEntry, 0, 64),
 		seen:     make(map[string]bool),
+		failed:   make(map[string]bool),
 		maxDepth: maxDepth,
 		scopeFn:  scopeFn,
 	}
@@ -119,6 +131,29 @@ func (f *urlFrontier) Requeue(e urlEntry) {
 	}
 	f.queue = append(f.queue, e)
 	f.cond.Broadcast()
+}
+
+// MarkFailed records that the page at rawURL was attempted and failed for a
+// reason that is plausibly transient (navigation error, DNS blip, connection
+// reset, rate-limiter timeout) while the crawl itself was still healthy.
+//
+// The key deliberately STAYS in seen, so this run will not retry the page: a
+// broken page linked from many others would otherwise be re-attempted once per
+// referrer, and every attempt reserves a slot from the page budget. What changes is
+// the CHECKPOINT: [urlFrontier.Snapshot] omits failed keys from the persisted
+// seen-set, so the next resumed run treats the page as never covered and tries it
+// again. Without this, seen is cumulative across every resume cycle, so a single
+// one-off 503 blacklisted the page permanently for the life of the checkpoint.
+//
+// Callers must still call MarkIdle afterwards, exactly as after any Pop.
+func (f *urlFrontier) MarkFailed(rawURL string) {
+	key := frontierKey(rawURL)
+	if key == "" {
+		return
+	}
+	f.mu.Lock()
+	f.failed[key] = true
+	f.mu.Unlock()
 }
 
 // SetDFS switches the frontier to depth-first (LIFO) pop order when v is true,

@@ -2393,3 +2393,65 @@ func TestUnionSchemaProperties_DepthGuard(t *testing.T) {
 	unionSchemaProperties(obj, src, 0) // depth 0 -> no-op
 	assert.NotContains(t, obj.Properties, "b", "depth 0 must not merge")
 }
+
+// TestUnionSchemaProperties_ArrayItems covers the collection case, which is where
+// partial observations are most common. GET /users returning [{"id":1,"name":"a"}]
+// and later [{"id":2,"email":"b@x"}] must document all three item fields. The union
+// previously recursed only through Properties, and an array schema has none of its
+// own, so the item schema was never entered and every field after the first
+// observation was dropped.
+func TestUnionSchemaProperties_ArrayItems(t *testing.T) {
+	strSchema := func() *openapi3.SchemaRef {
+		return &openapi3.SchemaRef{Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}}
+	}
+	arrayOfObject := func(props map[string]*openapi3.SchemaRef) *openapi3.Schema {
+		return &openapi3.Schema{
+			Type: &openapi3.Types{"array"},
+			Items: &openapi3.SchemaRef{Value: &openapi3.Schema{
+				Type: &openapi3.Types{"object"}, Properties: props,
+			}},
+		}
+	}
+
+	dst := arrayOfObject(map[string]*openapi3.SchemaRef{"id": strSchema(), "name": strSchema()})
+	src := arrayOfObject(map[string]*openapi3.SchemaRef{"id": strSchema(), "email": strSchema()})
+
+	unionSchemaProperties(dst, src, maxSchemaUnionDepth)
+
+	items := dst.Items.Value
+	require.NotNil(t, items)
+	assert.Contains(t, items.Properties, "id")
+	assert.Contains(t, items.Properties, "name", "first observation's item field retained")
+	assert.Contains(t, items.Properties, "email", "second observation's item-only field must be unioned in")
+}
+
+// TestUnionSchemaProperties_NestedArrayOfObjects verifies the array recursion is
+// reachable through an object property too, and that Items consumes a depth level
+// like any other nesting step (so the existing bound still applies).
+func TestUnionSchemaProperties_NestedArrayOfObjects(t *testing.T) {
+	str := func() *openapi3.SchemaRef {
+		return &openapi3.SchemaRef{Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}}
+	}
+	withItems := func(props map[string]*openapi3.SchemaRef) *openapi3.Schema {
+		return &openapi3.Schema{Type: &openapi3.Types{"object"}, Properties: map[string]*openapi3.SchemaRef{
+			"rows": {Value: &openapi3.Schema{
+				Type:  &openapi3.Types{"array"},
+				Items: &openapi3.SchemaRef{Value: &openapi3.Schema{Type: &openapi3.Types{"object"}, Properties: props}},
+			}},
+		}}
+	}
+
+	dst := withItems(map[string]*openapi3.SchemaRef{"a": str()})
+	src := withItems(map[string]*openapi3.SchemaRef{"b": str()})
+	unionSchemaProperties(dst, src, maxSchemaUnionDepth)
+	rows := dst.Properties["rows"].Value.Items.Value
+	assert.Contains(t, rows.Properties, "a")
+	assert.Contains(t, rows.Properties, "b")
+
+	// depth 2 reaches the "rows" property (1) and its items (2), so the merge lands;
+	// depth 1 stops before the items and must not.
+	shallowDst := withItems(map[string]*openapi3.SchemaRef{"a": str()})
+	unionSchemaProperties(shallowDst, src, 1)
+	assert.NotContains(t, shallowDst.Properties["rows"].Value.Items.Value.Properties, "b",
+		"array items must consume a depth level")
+}

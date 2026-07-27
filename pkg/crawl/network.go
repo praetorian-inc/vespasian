@@ -57,6 +57,15 @@ type pageNetworkCapture struct {
 	pageURL string
 	page    *rod.Page
 
+	// order records request IDs in the sequence NetworkRequestWillBeSent first
+	// observed them, so Results can emit a stable per-page order instead of
+	// ranging the map (whose iteration order Go randomizes, making capture.json
+	// differ byte-for-byte between runs on identical input). An ID is appended
+	// only the first time it is seen: CDP reuses a request ID across a redirect
+	// chain, and the handler overwrites the pending entry for it, so appending
+	// unconditionally would emit that request more than once.
+	order []proto.NetworkRequestID
+
 	// lastActivity is the time of the most recent network event (request sent,
 	// response received, loading finished/failed). Seeded at construction so it
 	// is never zero, so a page that fires no requests still reads as idle after
@@ -88,6 +97,9 @@ func (c *pageNetworkCapture) setupListeners(page *rod.Page) func() {
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			now := time.Now()
+			if _, seen := c.pending[e.RequestID]; !seen {
+				c.order = append(c.order, e.RequestID)
+			}
 			c.pending[e.RequestID] = &pendingRequest{
 				method:    e.Request.Method,
 				url:       e.Request.URL,
@@ -164,14 +176,24 @@ func (c *pageNetworkCapture) setupListeners(page *rod.Page) func() {
 	)
 }
 
-// Results returns all captured network exchanges as ObservedRequest values.
-// Call this after navigation and DOM stability wait are complete.
+// Results returns all captured network exchanges as ObservedRequest values, in
+// the order the requests were first sent. Call this after navigation and DOM
+// stability wait are complete.
+//
+// The order matters beyond aesthetics: capture.json is the pipeline's
+// intermediate artifact and the README documents identical input as producing
+// identical output, so a per-page order taken from Go's randomized map iteration
+// made the artifact differ byte-for-byte between runs on the same target.
 func (c *pageNetworkCapture) Results() []ObservedRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	results := make([]ObservedRequest, 0, len(c.pending))
-	for _, req := range c.pending {
+	for _, id := range c.order {
+		req, ok := c.pending[id]
+		if !ok {
+			continue // defensive: order and pending are written together
+		}
 		results = append(results, mapNetworkToObservedRequest(req, c.pageURL))
 	}
 	return results

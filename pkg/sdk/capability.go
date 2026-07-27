@@ -255,6 +255,16 @@ func crawlOptsFromCtx(ctx capability.ExecutionContext) (crawl.CrawlerOptions, er
 	if d, ok := ctx.Parameters.GetInt("depth"); ok {
 		opts.Depth = d
 	}
+	// max_requests and interact are user-facing CLI flags, so they must also be
+	// reachable from the Guard-facing surface; without these two reads neither was.
+	// (ResumeFrom/OnCheckpoint stay unwired here on purpose — checkpoint storage and
+	// hand-back are the host's, see doc.go.)
+	if m, ok := ctx.Parameters.GetInt("max_requests"); ok {
+		opts.MaxRequests = m
+	}
+	if i, ok := ctx.Parameters.GetBool("interact"); ok {
+		opts.Interact = i
+	}
 	if h, ok := ctx.Parameters.GetString("headers"); ok && h != "" {
 		parsed, err := parseHeaders(h)
 		if err != nil {

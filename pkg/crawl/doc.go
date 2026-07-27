@@ -27,9 +27,19 @@
 // and the per-page timeout) rather than a fixed settle window, so late and
 // dynamic requests are captured. Passively captured requests are scope-filtered
 // like frontier links, and the frontier treats URLs differing only in query
-// parameters as one page. An opt-in interaction pass ([CrawlerOptions.Interact],
-// headless only, off by default) clicks a bounded set of non-destructive buttons
-// per page to surface endpoints that only fire on interaction.
+// parameters as one page. On the headless backend the scope predicate also learns
+// the seed's EFFECTIVE origin from the depth-0 navigation, so a seed that redirects
+// cross-origin (http -> https, apex -> www) does not discard every captured
+// request; the widening is one-shot, adds exactly the origin the seed resolved to,
+// still applies the SSRF gate, and is reported on Stderr.
+//
+// An opt-in interaction pass ([CrawlerOptions.Interact], headless only, off by
+// default; the net/http backend warns and ignores it) clicks a bounded set of
+// controls per page to surface endpoints that only fire on interaction. It matches
+// form submit buttons too, so it submits forms and can mutate state; destructive,
+// session-ending, and irreversible-commit labels are skipped on a best-effort
+// match, and a click that navigates returns the tab to the assigned page so no
+// surface is attributed to a document the worker was not assigned.
 //
 // Browser binary (LAB-4999): the headless path pins a local Chrome via
 // [BrowserOptions.ChromePath] when set, otherwise the system browser resolved
@@ -139,8 +149,10 @@
 //
 // Cross-run resume primitives (LAB-4678 Phase 4, vespasian side) let coverage
 // accumulate across separate crawls: [Checkpoint] serializes the frontier's
-// pending queue and seen-set, gated by [ComputeConfigFingerprint] (target/scope/
-// depth) and a staleness bound ([Checkpoint.Usable], [DefaultCheckpointMaxAge]);
+// pending queue ([]PendingURL) and seen-set, gated by [ComputeConfigFingerprint]
+// (target/scope/depth) and a staleness bound ([Checkpoint.Usable],
+// [DefaultCheckpointMaxAge]); a page whose visit failed transiently is omitted
+// from the persisted seen-set so a resumed run retries it;
 // resume is driven through [CrawlerOptions]: set ResumeFrom to continue a prior
 // crawl and OnCheckpoint to receive the state captured when this one stops
 // (including on budget truncation or cancellation, which is the case resume

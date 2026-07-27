@@ -76,10 +76,6 @@ func logClassificationReasons(w io.Writer, classified []classify.ClassifiedReque
 	}
 }
 
-// classificationLine formats one endpoint's verdict line for verbose output.
-// Shared by logClassificationReasons and logNearMisses so the emitted and
-// below-threshold lines have identical shape. The path is reduced to its URL
-// path component; an empty Reason renders as "-".
 // endpointPath reduces a request URL to its path component for display and for
 // near-miss endpoint identity, falling back to the full URL when it does not
 // parse or carries no path. Shared so the rendered line and the dedup key agree
@@ -91,6 +87,10 @@ func endpointPath(rawURL string) string {
 	return rawURL
 }
 
+// classificationLine formats one endpoint's verdict line for verbose output.
+// Shared by logClassificationReasons and logNearMisses so the emitted and
+// below-threshold lines have identical shape. The path is reduced to its URL
+// path component; an empty Reason renders as "-".
 func classificationLine(c classify.ClassifiedRequest) string {
 	path := endpointPath(c.URL)
 	reason := c.Reason

@@ -122,6 +122,14 @@ type engineOptions struct {
 	ScopeCheck    func(string) bool // returns true if a URL is in scope
 	Stderr        io.Writer         // user-facing status messages
 
+	// LearnEffectiveOrigin, when set, is called exactly once with the URL the
+	// SEED page actually resolved to after redirects. It lets the scope predicate
+	// treat the seed's effective origin as in scope, which is what makes an
+	// "http → https" or "apex → www" seed redirect crawlable instead of yielding
+	// an empty capture. Only the depth-0 visit calls it; see [seedScope] for the
+	// containment reasoning.
+	LearnEffectiveOrigin func(effectiveURL string)
+
 	// Completion-driven capture bounds (0 → the Default* above).
 	NetworkIdleFloor   time.Duration // minimum wait after DOM stability
 	NetworkQuietPeriod time.Duration // idle duration required before stopping
@@ -357,6 +365,12 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 			if e.opts.Stderr != nil {
 				fmt.Fprintf(e.opts.Stderr, "worker %d: error visiting %s: %v\n", id, entry.URL, err) //nolint:errcheck // best-effort
 			}
+			// The visit failed for a plausibly transient reason (navigation error,
+			// DNS blip, connection reset) with the crawl still healthy. Do not retry
+			// it in this run, but keep it out of the persisted seen-set so a resumed
+			// run can: seen is cumulative, so leaving it in would blacklist the page
+			// permanently after one bad response.
+			e.frontier.MarkFailed(entry.URL)
 			e.frontier.MarkIdle()
 			continue
 		}
@@ -453,6 +467,8 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 		}
 	}
 
+	e.learnSeedOrigin(page, target)
+
 	// Wait for DOM stability — the key optimization: these waits overlap
 	// across concurrent workers instead of serializing.
 	if err := page.WaitStable(e.opts.StableTimeout); err != nil {
@@ -474,14 +490,54 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 	// captured — baseline plus interaction-triggered (LAB-4678 Phase 2). Opt-in,
 	// off by default. Shares the page deadline, so interaction cannot extend the
 	// page past its budget.
+	navigated := false
 	if e.opts.Interact {
-		e.interactPage(ctx, page, capture, pageDeadline)
+		navigated = e.interactPage(ctx, page, capture, pageDeadline)
 	}
 	capturedResults := capture.Results()
 
 	// Extract links, run jsluice, and discover forms from the stabilized page.
-	results, links := enrichFromPage(page, capturedResults, target.URL, e.opts.Stderr, e.opts.ScopeCheck)
+	results, links := enrichFromPage(e.enrichTarget(page, navigated, target.URL), capturedResults, target.URL, e.opts.Stderr, e.opts.ScopeCheck)
 	return results, links, nil
+}
+
+// learnSeedOrigin hands the SEED's post-redirect URL to the scope predicate.
+// Redirects have been followed by the time the load event fires, so page.Info()
+// reports the document the seed actually resolved to.
+//
+// Only depth 0 — the seed itself — may widen scope, and the widening is one-shot
+// inside the predicate (see [seedScope]). It must run before the scope filter in
+// enrichFromPage, or a cross-origin seed redirect discards every captured request
+// and the crawl returns an empty capture with no diagnostic.
+func (e *rodEngine) learnSeedOrigin(page *rod.Page, target urlEntry) {
+	if target.Depth != 0 || e.opts.LearnEffectiveOrigin == nil {
+		return
+	}
+	info, err := page.Info()
+	if err != nil || info.URL == "" {
+		return
+	}
+	e.opts.LearnEffectiveOrigin(info.URL)
+}
+
+// enrichTarget returns the page enrichFromPage should read the DOM from: the page
+// itself normally, or nil when an interaction click navigated away and could not
+// be undone.
+//
+// In that case the live DOM is a document this worker was never assigned:
+// page.Info() reports the navigated-to URL, so reading it would extract that
+// page's links and forms, resolve them against its base URL, and push them into
+// the frontier without the intermediate page counting against --max-pages — while
+// the synthetic form requests would still be tagged with this page's URL. A nil
+// page limits enrichment to what was actually captured for the assigned page.
+func (e *rodEngine) enrichTarget(page *rod.Page, navigated bool, pageURL string) *rod.Page {
+	if !navigated {
+		return page
+	}
+	if e.opts.Stderr != nil {
+		fmt.Fprintf(e.opts.Stderr, "interact: a click navigated away from %s and the page could not be restored; skipping DOM enrichment for it\n", pageURL) //nolint:errcheck // best-effort
+	}
+	return nil
 }
 
 // waitForNetworkIdle blocks until the page's network goes quiet or a bound is
@@ -547,13 +603,15 @@ func networkIdleReached(inFlight int, sinceActivity, elapsed, floor, quiet time.
 // link-combining logic to [mergeEnrichedLinks], which is directly unit
 // tested.
 func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, stderr io.Writer, scopeFn func(string) bool) ([]ObservedRequest, []string) {
-	// Defensive: a nil page means there's nothing to read from the DOM.
-	// Route straight to the merger so any already-captured network requests
-	// are still returned. No production caller passes nil today — this
-	// guard exists so the merger-threading contract can be tested without
-	// standing up a real rod.Page (round-11 TEST-001).
+	// A nil page means the DOM must not (or cannot) be read. visitPage passes nil
+	// when an interaction click navigated away, so the live DOM belongs to a
+	// document this worker was never assigned; the merger-threading contract is
+	// also tested through this path without standing up a real rod.Page (round-11
+	// TEST-001). jsluice over the captured RESPONSE bodies is a pure function of
+	// `captured` and stays valid either way, so it still runs — only the
+	// DOM-sourced inputs (hrefs, inline scripts, forms) are dropped.
 	if page == nil {
-		captured, links := mergeEnrichedLinksFn(captured, nil, nil, nil, nil, pageURL, pageURL, scopeFn)
+		captured, links := mergeEnrichedLinksFn(captured, nil, extractURLsFromResponses(captured), nil, nil, pageURL, pageURL, scopeFn)
 		return captured, links
 	}
 

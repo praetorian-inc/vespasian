@@ -15,6 +15,8 @@
 package crawl
 
 import (
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -280,5 +282,65 @@ func TestNetworkState_InFlightCounting(t *testing.T) {
 	}
 	if since != 2*time.Second {
 		t.Errorf("sinceLastActivity = %v, want 2s", since)
+	}
+}
+
+// TestPageNetworkCapture_ResultsOrderIsStable pins per-page capture order to the
+// order requests were sent. Results used to range the pending map, so Go's
+// randomized map iteration reordered every page's requests run-to-run and
+// capture.json was not byte-stable for identical input.
+func TestPageNetworkCapture_ResultsOrderIsStable(t *testing.T) {
+	const n = 12 // enough that hitting the sent order by chance is not a concern
+	c := &pageNetworkCapture{
+		pending:      make(map[proto.NetworkRequestID]*pendingRequest),
+		pageURL:      "https://ex.com/",
+		lastActivity: time.Now(),
+	}
+	want := make([]string, 0, n)
+	for i := range n {
+		id := proto.NetworkRequestID(fmt.Sprintf("req-%02d", i))
+		u := fmt.Sprintf("https://ex.com/api/%02d", i)
+		c.pending[id] = &pendingRequest{method: "GET", url: u, complete: true}
+		c.order = append(c.order, id)
+		want = append(want, u)
+	}
+
+	for range 5 {
+		got := make([]string, 0, n)
+		for _, r := range c.Results() {
+			got = append(got, r.URL)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("Results order = %v, want send order %v", got, want)
+		}
+	}
+}
+
+// TestPageNetworkCapture_RedirectReusedIDEmittedOnce guards the ordering index
+// against double-counting: CDP reuses a request ID across a redirect chain and the
+// request handler overwrites the pending entry, so appending to the order index
+// unconditionally would emit that request more than once.
+func TestPageNetworkCapture_RedirectReusedIDEmittedOnce(t *testing.T) {
+	c := &pageNetworkCapture{
+		pending:      make(map[proto.NetworkRequestID]*pendingRequest),
+		pageURL:      "https://ex.com/",
+		lastActivity: time.Now(),
+	}
+	const id = proto.NetworkRequestID("shared")
+	// First send.
+	c.pending[id] = &pendingRequest{method: "GET", url: "https://ex.com/start", complete: true}
+	c.order = append(c.order, id)
+	// Redirect: same request ID, new target. Mirrors the handler's guard.
+	if _, seen := c.pending[id]; !seen {
+		c.order = append(c.order, id)
+	}
+	c.pending[id] = &pendingRequest{method: "GET", url: "https://ex.com/final", complete: true}
+
+	got := c.Results()
+	if len(got) != 1 {
+		t.Fatalf("got %d results for one reused request ID, want 1: %+v", len(got), got)
+	}
+	if got[0].URL != "https://ex.com/final" {
+		t.Errorf("URL = %q, want the post-redirect target", got[0].URL)
 	}
 }

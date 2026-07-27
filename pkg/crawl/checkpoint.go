@@ -58,11 +58,28 @@ const DefaultCheckpointMaxAge = 5 * 24 * time.Hour
 // time would re-crawl covered pages with no signal, which is worse than a loud
 // failure at read time.
 type Checkpoint struct {
-	Version           int        `json:"version"`
-	ConfigFingerprint string     `json:"config_fingerprint"`
-	CreatedAtUnix     int64      `json:"created_at_unix"`
-	Pending           []urlEntry `json:"pending"`
-	Seen              []string   `json:"seen"`
+	Version           int          `json:"version"`
+	ConfigFingerprint string       `json:"config_fingerprint"`
+	CreatedAtUnix     int64        `json:"created_at_unix"`
+	Pending           []PendingURL `json:"pending"`
+	Seen              []string     `json:"seen"`
+}
+
+// PendingURL is one queued-but-unvisited page carried by [Checkpoint.Pending]: a
+// URL and the crawl depth it was discovered at.
+//
+// It is exported because Phase 4's premise is that the HOST owns checkpoint
+// storage and hand-back. With an unexported element type, an external consumer
+// could round-trip a checkpoint as opaque JSON but could not construct one with
+// pending entries or handle them in a typed way, which blocks the intended
+// consumer.
+//
+// The JSON tags are the field names Go would have used for the previously
+// untagged struct, so the on-disk format is unchanged and a checkpoint written
+// before this type was exported still loads.
+type PendingURL struct {
+	URL   string `json:"URL"`
+	Depth int    `json:"Depth"`
 }
 
 // ComputeConfigFingerprint returns a stable hash of the crawl-defining inputs.
@@ -232,17 +249,26 @@ func (c *Checkpoint) Usable(fingerprint string, now time.Time, maxAge time.Durat
 	return true, ""
 }
 
-// Snapshot captures the frontier's current pending queue and full seen-set as a
+// Snapshot captures the frontier's current pending queue and seen-set as a
 // deterministic, resumable state. The seen keys are sorted so the serialized
 // checkpoint is byte-stable for a given frontier state. Safe to call after the
 // crawl's workers have stopped.
-func (f *urlFrontier) Snapshot() (pending []urlEntry, seen []string) {
+//
+// Pages recorded by [urlFrontier.MarkFailed] are OMITTED from seen: they were
+// attempted and failed transiently, and because seen accumulates across every
+// resume cycle, persisting them would make a one-off failure a permanent drop.
+// Omitting them costs nothing on a fresh crawl and gives the next resumed run one
+// more attempt at the page.
+func (f *urlFrontier) Snapshot() (pending []PendingURL, seen []string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	pending = make([]urlEntry, len(f.queue))
+	pending = make([]PendingURL, len(f.queue))
 	copy(pending, f.queue)
 	seen = make([]string, 0, len(f.seen))
 	for k := range f.seen {
+		if f.failed[k] {
+			continue
+		}
 		seen = append(seen, k)
 	}
 	sort.Strings(seen)

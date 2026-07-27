@@ -331,8 +331,18 @@ vespasian scan <url> [flags]
   -o, --output       Output spec file (default: stdout)
   --depth            Max crawl depth (default: 3)
   --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100)
-  --max-requests     Max captured requests before stopping (0 = unlimited); rate/politeness bound distinct from --max-pages
-  --interact         Click non-destructive buttons to surface interaction-only endpoints (headless only; off by default; skips delete/logout controls)
+  --max-requests     Captured-request budget (0 = unlimited); a rate/politeness bound distinct
+                     from --max-pages. Checked BETWEEN pages, not per request: the crawl stops
+                     taking new pages once the count is reached and lets in-flight pages finish,
+                     so the final count can exceed the bound by up to one page's worth of
+                     requests. It cannot bound below a single page's request count.
+  --interact         Click buttons to surface interaction-only endpoints (headless only; off by
+                     default). It matches every <button>, [role=button], and [onclick] control,
+                     INCLUDING form submit buttons, so it submits forms and can mutate state.
+                     Controls whose label looks destructive, session-ending, or an irreversible
+                     commit (delete/logout/reset/pay/place order/...) are skipped, matched on
+                     visible text plus aria-label/title/value. That is a best-effort label match,
+                     not a guarantee — treat --interact as an active, state-changing option.
   --timeout          Maximum duration for the entire scan (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine
@@ -366,8 +376,18 @@ vespasian crawl <url> [flags]
   -o, --output       Capture output file (default: stdout)
   --depth            Max crawl depth (default: 3)
   --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100)
-  --max-requests     Max captured requests before stopping (0 = unlimited); rate/politeness bound distinct from --max-pages
-  --interact         Click non-destructive buttons to surface interaction-only endpoints (headless only; off by default; skips delete/logout controls)
+  --max-requests     Captured-request budget (0 = unlimited); a rate/politeness bound distinct
+                     from --max-pages. Checked BETWEEN pages, not per request: the crawl stops
+                     taking new pages once the count is reached and lets in-flight pages finish,
+                     so the final count can exceed the bound by up to one page's worth of
+                     requests. It cannot bound below a single page's request count.
+  --interact         Click buttons to surface interaction-only endpoints (headless only; off by
+                     default). It matches every <button>, [role=button], and [onclick] control,
+                     INCLUDING form submit buttons, so it submits forms and can mutate state.
+                     Controls whose label looks destructive, session-ending, or an irreversible
+                     commit (delete/logout/reset/pay/place order/...) are skipped, matched on
+                     visible text plus aria-label/title/value. That is a best-effort label match,
+                     not a guarantee — treat --interact as an active, state-changing option.
   --timeout          Maximum duration for the entire crawl (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine

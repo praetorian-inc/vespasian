@@ -19,7 +19,6 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -400,14 +399,17 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 
 // synthesizedLess is the deterministic ordering for synthesized static:js
 // entries (LAB-4678 Phase 2): URL, then method, then source tag, then request
-// body, then canonical query string. Kept as a named helper so Analyze stays
+// body, then page URL, then headers. Kept as a named helper so Analyze stays
 // under the cyclomatic gate.
 //
-// The query comparison is the final tiebreaker that makes this a total order over
-// the fields synthesized entries can actually differ in. Without it, two entries
-// equal on the earlier keys compare equal and sort.SliceStable preserves their
-// worker-completion order, which is nondeterministic — leaving exactly the
-// ordering variance this sort exists to remove.
+// The keys are exactly the fields [toRequests] populates, which is what makes this
+// a total order over synthesized entries: any two distinct entries differ in at
+// least one of them. The final tiebreakers matter — without them, entries equal on
+// the earlier keys compare equal and sort.SliceStable preserves their
+// worker-completion order, which is nondeterministic, leaving exactly the ordering
+// variance this sort exists to remove. The previous final key was QueryParams,
+// which toRequests never sets, so PageURL- and Headers-only differences fell
+// through to worker order.
 func synthesizedLess(a, b crawl.ObservedRequest) bool {
 	if a.URL != b.URL {
 		return a.URL < b.URL
@@ -421,7 +423,32 @@ func synthesizedLess(a, b crawl.ObservedRequest) bool {
 	if c := bytes.Compare(a.Body, b.Body); c != 0 {
 		return c < 0
 	}
-	return url.Values(a.QueryParams).Encode() < url.Values(b.QueryParams).Encode()
+	if a.PageURL != b.PageURL {
+		return a.PageURL < b.PageURL
+	}
+	return headerKey(a.Headers) < headerKey(b.Headers)
+}
+
+// headerKey renders a header map as a canonical, comparable string: entries sorted
+// by name, joined as "name:value". Used only as a sort tiebreaker, so it needs to
+// be stable and total, not parseable.
+func headerKey(h map[string]string) string {
+	if len(h) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(h))
+	for k := range h {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, k := range names {
+		b.WriteString(k)
+		b.WriteByte(':')
+		b.WriteString(h[k])
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 // Analyze runs static analysis on every JS body in captured. It returns a

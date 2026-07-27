@@ -284,9 +284,19 @@ const maxSchemaUnionDepth = 12
 // endpoint+status are preserved rather than dropped after the first observation.
 // It never removes or retypes an existing property, so it cannot narrow the
 // documented schema. depth bounds the recursion.
+//
+// Array schemas are entered through Items. A collection endpoint is the common
+// case for partial observations — GET /users returning [{"id":1,"name":"a"}] and
+// later [{"id":2,"email":"b@x"}] — and because an array schema has no Properties
+// of its own, recursing only through Properties never reached the item schema and
+// the second observation's `email` was dropped. Items consumes one depth level,
+// same as a nested object, so the existing bound still holds.
 func unionSchemaProperties(dst, src *openapi3.Schema, depth int) {
 	if dst == nil || src == nil || depth <= 0 {
 		return
+	}
+	if dst.Items != nil && src.Items != nil {
+		unionSchemaProperties(dst.Items.Value, src.Items.Value, depth-1)
 	}
 	if dst.Properties == nil || src.Properties == nil {
 		return

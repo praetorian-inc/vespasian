@@ -638,6 +638,15 @@ func TestRodEngine_DepthLimit(t *testing.T) {
 // interactFixture serves a page whose only API calls fire on click, plus a
 // destructive control that must never be clicked. Returns the server and a
 // per-path hit recorder.
+//
+// The FIRST control is a plain <button> inside a <form>, i.e. an HTML-default
+// type=submit that performs a full navigation when clicked. That placement is the
+// point: with the interaction pass holding handles from a single pre-click scan,
+// this click invalidated every remaining handle, so the useful control behind it
+// was never exercised and the interaction-only endpoint was missed — coverage
+// depended on sibling order. The fixture previously served only bare
+// <button onclick="fetch(...)"> elements, the one shape in which that bug cannot
+// appear, which is why the test passed while the bug was live.
 func interactFixture(t *testing.T) (*httptest.Server, func(string) int) {
 	t.Helper()
 	var mu sync.Mutex
@@ -651,12 +660,23 @@ func interactFixture(t *testing.T) (*httptest.Server, func(string) int) {
 			fmt.Fprint(w, `{"ok":true}`)
 			return
 		}
+		if r.URL.Path == "/submitted" {
+			// The form's landing page. Its own form action is unique to it, and
+			// extractForms turns a discovered action into a synthetic
+			// ObservedRequest unconditionally (no frontier or depth involved), so
+			// its presence in the capture is direct proof that enrichment read a
+			// document this worker was never assigned.
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, `<html><body><form action="/wrong-attribution" method="post"><input name="q"></form></body></html>`)
+			return
+		}
 		w.Header().Set("Content-Type", "text/html")
-		// The endpoints below appear nowhere as a link or a literal fetch on load,
-		// so passive crawling and static JS analysis cannot reach them — only a
-		// real click can. The destructive controls carry their verb in different
+		// The /api endpoints below appear nowhere as a link or a literal fetch on
+		// load, so passive crawling and static JS analysis cannot reach them — only
+		// a real click can. The destructive controls carry their verb in different
 		// places (text, aria-label, title) to exercise every label source.
 		fmt.Fprint(w, `<html><body>
+<form action="/submitted" method="get"><button id="form-submit">Search</button></form>
 <button id="safe" onclick="fetch('/api/interaction-only')">Load more</button>
 <button id="danger-text" onclick="fetch('/api/destructive-text')">Delete account</button>
 <button id="danger-aria" aria-label="Delete item" onclick="fetch('/api/destructive-aria')">&times;</button>
@@ -757,5 +777,105 @@ func TestRodEngine_Interact_SkipsDestructiveControls(t *testing.T) {
 				t.Errorf("destructive endpoint appears in capture: %s", u)
 			}
 		}
+	}
+}
+
+// TestRodEngine_Interact_SubmitButtonDoesNotCostCoverage regresses the
+// interaction pass's handling of a click that NAVIGATES. The fixture's first
+// control is a form submit button, positioned ahead of the useful one; clicking it
+// performs a full navigation, which invalidated every element handle the pass had
+// scanned up front, so the interaction-only endpoint behind it was never reached.
+// Coverage must not depend on sibling order.
+//
+// It also pins the attribution rule: after the navigating click the crawler must
+// not extract from the navigated-to document. /submitted carries a form whose
+// action is unique to it, and form actions become synthetic ObservedRequests
+// unconditionally, so that action appearing in the capture means enrichment read a
+// page this worker was never assigned (and pushed its surface into the frontier
+// without the page counting against --max-pages).
+func TestRodEngine_Interact_SubmitButtonDoesNotCostCoverage(t *testing.T) {
+	srv, hits := interactFixture(t)
+
+	captured := runInteractCrawl(t, srv, true)
+
+	// The navigating control was in fact clicked — otherwise this test would pass
+	// simply because the submit button was skipped, proving nothing.
+	if hits("/submitted") == 0 {
+		t.Fatalf("the form submit button was never clicked, so this test proves nothing; captured: %v", captured)
+	}
+	// And the useful control behind it still fired.
+	if hits("/api/interaction-only") == 0 {
+		t.Errorf("interaction-only endpoint missed: a navigating control ahead of it cost the page's coverage; captured: %v", captured)
+	}
+	for _, u := range captured {
+		if strings.Contains(u, "/wrong-attribution") {
+			t.Errorf("capture contains a form action from the navigated-to document (%s): enrichment read a page this worker was not assigned", u)
+		}
+	}
+}
+
+// TestRodCrawler_CrossOriginSeedRedirect regresses the empty-capture bug: when the
+// seed URL redirects to a DIFFERENT origin (the shape of every http→https and
+// apex→www deployment), Chrome follows the redirect and every captured request
+// carries the post-redirect origin, which the exact same-origin predicate rejected
+// wholesale. The crawl returned zero requests with a zero exit status and no
+// diagnostic.
+//
+// The two httptest servers listen on different ports, so they are different
+// origins under the same-origin policy — the same condition as apex→www.
+func TestRodCrawler_CrossOriginSeedRedirect(t *testing.T) {
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/data" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"ok":true}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<html><body><h1>App</h1>
+<script>fetch('/api/data')</script>
+</body></html>`)
+	}))
+	defer app.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, app.URL+"/", http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	var stderr strings.Builder
+	bm := launchTestBrowser(t)
+	c := NewCrawler(CrawlerOptions{
+		Depth:        1,
+		MaxPages:     5,
+		Timeout:      60 * time.Second,
+		Scope:        "same-origin",
+		Headless:     true,
+		AllowPrivate: true,
+		BrowserMgr:   bm,
+		Stderr:       &stderr,
+	})
+
+	results, err := c.Crawl(context.Background(), redirector.URL+"/")
+	if err != nil {
+		t.Fatalf("Crawl error: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatalf("cross-origin seed redirect produced an empty capture; stderr:\n%s", stderr.String())
+	}
+
+	var sawAPI bool
+	seen := make([]string, 0, len(results))
+	for _, r := range results {
+		seen = append(seen, r.URL)
+		if r.URL == app.URL+"/api/data" {
+			sawAPI = true
+		}
+	}
+	if !sawAPI {
+		t.Errorf("did not capture %s after the seed redirect; captured: %v", app.URL+"/api/data", seen)
+	}
+	// The widened scope must be visible to the operator, not silent.
+	if !strings.Contains(stderr.String(), "redirected to") {
+		t.Errorf("scope widening was not reported on stderr; stderr:\n%s", stderr.String())
 	}
 }

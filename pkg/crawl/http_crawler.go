@@ -114,6 +114,8 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	// distinct running count.
 	maxPages = httpPageCap(maxPages, c.opts.MaxRequests)
 
+	warnInteractUnsupported(c.opts.Stderr, c.opts.Interact)
+
 	// Validate and parse the proxy on the HTTP path. The CLI validates too
 	// (cmd/vespasian doCrawl), but this guards library/SDK callers that build
 	// an HTTPCrawler directly. A nil proxyURL means "no proxy" (default path).
@@ -235,6 +237,18 @@ func (c *HTTPCrawler) restoreAndSeed(frontier *urlFrontier, targetURL string, re
 	return nil
 }
 
+// warnInteractUnsupported reports that --interact does nothing on the net/http
+// backend. That backend has no DOM to click, so the option is ignored; staying
+// silent left an operator who passed "--interact --headless=false" to conclude the
+// target had no interaction-only surface. Mirrors the concurrency-cap warning in
+// newRodEngine. No-op when the option was not requested or Stderr is nil.
+func warnInteractUnsupported(stderr io.Writer, interact bool) {
+	if !interact || stderr == nil {
+		return
+	}
+	fmt.Fprint(stderr, "warning: --interact requires the headless backend (it clicks DOM elements); ignoring it with --headless=false\n") //nolint:errcheck // best-effort
+}
+
 // httpPageCap folds the request budget into the page cap for the net/http
 // backend: that backend records one request per page, so a MaxRequests bound
 // (maxRequests > 0) reduces to a page cap. A zero maxRequests leaves maxPages
@@ -304,6 +318,17 @@ func (c *HTTPCrawler) runWorker(
 			frontier.Requeue(entry)
 			frontier.MarkIdle()
 			return
+		}
+
+		// fetchPage returns nil only on a transport-level failure (DNS, connection
+		// reset, rate-limiter or per-page timeout, request build) — an HTTP error
+		// STATUS still yields an observation. With the context alive that is a
+		// plausibly transient failure, so keep the page out of the persisted
+		// seen-set: Checkpoint.Seen accumulates across resume cycles, so leaving it
+		// there turned one bad fetch into a permanent drop. It is not requeued now,
+		// so this run does not retry it.
+		if observed == nil {
+			frontier.MarkFailed(entry.URL)
 		}
 
 		if observed != nil {

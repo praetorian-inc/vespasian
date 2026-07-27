@@ -16,6 +16,7 @@ package crawl
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -315,4 +316,86 @@ func TestLoadCheckpoint_Bounds(t *testing.T) {
 			t.Errorf("round-trip lost data: %+v", got)
 		}
 	})
+}
+
+// TestCheckpoint_PendingIsExternallyConstructible pins the Phase 4 premise that
+// the HOST owns checkpoint storage and hand-back. Checkpoint.Pending previously had
+// an unexported element type, so an external consumer could round-trip the artifact
+// as opaque JSON but could not build one with pending entries or handle them in a
+// typed way. This test is written the way such a consumer would have to write it —
+// it does not compile if the element type is unexported.
+func TestCheckpoint_PendingIsExternallyConstructible(t *testing.T) {
+	cp := &Checkpoint{
+		Version:           checkpointVersion,
+		ConfigFingerprint: "fp",
+		CreatedAtUnix:     time.Now().Unix(),
+		Pending: []PendingURL{
+			{URL: "https://ex.com/a", Depth: 1},
+			{URL: "https://ex.com/b", Depth: 2},
+		},
+		Seen: []string{"https://ex.com/"},
+	}
+	var buf bytes.Buffer
+	if err := cp.Save(&buf); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	got, err := LoadCheckpoint(&buf)
+	if err != nil {
+		t.Fatalf("LoadCheckpoint: %v", err)
+	}
+	if len(got.Pending) != 2 || got.Pending[1].URL != "https://ex.com/b" || got.Pending[1].Depth != 2 {
+		t.Errorf("Pending round-trip = %+v, want the two entries as written", got.Pending)
+	}
+}
+
+// TestLoadCheckpoint_LegacyPendingWireFormat verifies the on-disk format did not
+// change when the pending element type was exported: a checkpoint written before
+// that change (untagged struct, so "URL"/"Depth" keys) must still load.
+func TestLoadCheckpoint_LegacyPendingWireFormat(t *testing.T) {
+	legacy := `{
+  "version": 1,
+  "config_fingerprint": "abc",
+  "created_at_unix": 1700000000,
+  "pending": [
+    {"URL": "https://ex.com/queued", "Depth": 3}
+  ],
+  "seen": ["https://ex.com/"]
+}`
+	got, err := LoadCheckpoint(strings.NewReader(legacy))
+	if err != nil {
+		t.Fatalf("LoadCheckpoint on a pre-change artifact: %v", err)
+	}
+	if len(got.Pending) != 1 {
+		t.Fatalf("Pending = %+v, want 1 entry", got.Pending)
+	}
+	if got.Pending[0].URL != "https://ex.com/queued" || got.Pending[0].Depth != 3 {
+		t.Errorf("Pending[0] = %+v, want {https://ex.com/queued 3}", got.Pending[0])
+	}
+}
+
+// TestSnapshot_ExcludesTransientlyFailedPages covers the permanence of a transient
+// failure. Checkpoint.Seen is cumulative across every resume cycle, so a page
+// dropped after one 503 or DNS blip was blacklisted for the life of the checkpoint.
+// A failed page stays in the IN-RUN seen-set (no retry spin within a run) but must
+// be absent from the snapshot so the next resumed run tries it again.
+func TestSnapshot_ExcludesTransientlyFailedPages(t *testing.T) {
+	f := newURLFrontier(3, nil)
+	f.Push([]urlEntry{
+		{URL: "https://ex.com/ok", Depth: 0},
+		{URL: "https://ex.com/broken", Depth: 0},
+	})
+	f.MarkFailed("https://ex.com/broken")
+
+	_, seen := f.Snapshot()
+	if slices.Contains(seen, frontierKey("https://ex.com/broken")) {
+		t.Errorf("snapshot seen-set contains the failed page, making the drop permanent: %v", seen)
+	}
+	if !slices.Contains(seen, frontierKey("https://ex.com/ok")) {
+		t.Errorf("snapshot seen-set lost a successful page: %v", seen)
+	}
+
+	// Still deduped WITHIN this run: a second referrer must not re-enqueue it.
+	if n := f.Push([]urlEntry{{URL: "https://ex.com/broken", Depth: 1}}); n != 0 {
+		t.Errorf("failed page was re-enqueued in the same run (%d added); it would spend the page budget on retries", n)
+	}
 }

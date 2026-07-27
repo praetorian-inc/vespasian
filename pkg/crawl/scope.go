@@ -17,9 +17,11 @@ package crawl
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"strings"
+	"sync"
 
 	"golang.org/x/net/publicsuffix"
 
@@ -112,6 +114,136 @@ func scopeChecker(seedURL string, scope string, allowPrivate bool) (func(string)
 	}
 }
 
+// seedScope is the crawl's scope predicate plus a one-shot widening to the origin
+// the SEED URL actually resolved to after redirects.
+//
+// Why it exists: an operator who seeds http://example.com against a server that
+// 302s to https://example.com (or apex → www) gets a crawl where Chrome follows
+// the redirect and every CDP-captured request carries the POST-redirect origin.
+// The same-origin predicate compares "scheme://host" exactly, so it rejected all
+// of them and the run produced an empty capture with exit code 0 and no
+// diagnostic. Learning the seed's effective origin is what makes the common
+// "http → https" and "apex → www" deployments crawlable at all.
+//
+// CONTAINMENT. Scope is an engagement containment control, so the widening is
+// deliberately narrow and auditable:
+//
+//  1. Only the SEED's own navigation can widen scope. LearnEffectiveOrigin is
+//     called from the depth-0 page visit and nowhere else, so a redirect issued
+//     by some arbitrary page deeper in the crawl — which an attacker-controlled
+//     page could trigger at will — never widens anything.
+//  2. It is one-shot and adds exactly ONE origin: the scheme://host the seed
+//     resolved to. It is not a domain-level relaxation, and a second call (a
+//     resumed depth-0 entry, a retry) cannot add another origin.
+//  3. The SSRF gate still applies. A seed that redirects to 127.0.0.1,
+//     169.254.169.254, or any RFC1918 address is refused unless the operator
+//     passed --dangerous-allow-private, exactly as for the seed itself.
+//  4. The widening is announced on stderr, so the operator sees the effective
+//     scope of the run instead of silently getting a wider crawl.
+//
+// This applies to the headless backend only. On the net/http backend
+// redirectScopeGuard rejects the cross-origin redirect during the seed fetch and
+// the failure is already reported on stderr, so that path is loud rather than
+// silent; widening it would mean letting a redirect through the guard before the
+// guard has decided, which is a change to the control itself and out of scope here.
+type seedScope struct {
+	base         func(string) bool // policy predicate from scopeChecker (origin/domain match + SSRF)
+	allowPrivate bool
+	seedOrigin   string
+	stderr       io.Writer
+
+	mu        sync.RWMutex
+	learned   bool   // LearnEffectiveOrigin already ran (one-shot)
+	effOrigin string // the seed's post-redirect origin, "" when it matched seedOrigin
+}
+
+// newSeedScope builds the scope predicate for a crawl of seedURL. It wraps
+// [scopeChecker] with the seed-effective-origin widening documented on
+// [seedScope]. stderr may be nil to suppress the widening notice.
+func newSeedScope(seedURL, scope string, allowPrivate bool, stderr io.Writer) (*seedScope, error) {
+	base, err := scopeChecker(seedURL, scope, allowPrivate)
+	if err != nil {
+		return nil, err
+	}
+	// originOf (jsreplay.go) is the shared origin canonicalizer: lowercased
+	// scheme/host with the default port made explicit, so the implicit- and
+	// explicit-port forms of the same origin compare equal. scopeChecker already
+	// rejected a seed without a host, so this cannot be "".
+	seedOrigin := originOf(seedURL)
+	if seedOrigin == "" {
+		return nil, fmt.Errorf("seed URL has no origin: %q", redactSeedURL(seedURL))
+	}
+	return &seedScope{
+		base:         base,
+		allowPrivate: allowPrivate,
+		seedOrigin:   seedOrigin,
+		stderr:       stderr,
+	}, nil
+}
+
+// Check reports whether rawURL is in scope: either the configured policy accepts
+// it, or it is on the seed's learned effective origin and passes the SSRF gate.
+func (s *seedScope) Check(rawURL string) bool {
+	if s.base(rawURL) {
+		return true
+	}
+	s.mu.RLock()
+	eff := s.effOrigin
+	s.mu.RUnlock()
+	if eff == "" {
+		return false
+	}
+	u := parseHTTPURL(rawURL)
+	if u == nil {
+		return false
+	}
+	if originOf(rawURL) != eff {
+		return false
+	}
+	return s.allowPrivate || !isPrivateHost(u.Hostname())
+}
+
+// LearnEffectiveOrigin records the origin the seed page actually resolved to and,
+// when it differs from the seed's own origin, extends the accepted set by that one
+// origin. It is one-shot: every call after the first is ignored, so only the
+// seed's first navigation can widen the crawl. A private effective origin is
+// refused (and reported) unless the operator opted in with --dangerous-allow-private.
+func (s *seedScope) LearnEffectiveOrigin(effectiveURL string) {
+	u := parseHTTPURL(effectiveURL)
+	if u == nil {
+		return
+	}
+	origin := originOf(effectiveURL)
+
+	s.mu.Lock()
+	if s.learned {
+		s.mu.Unlock()
+		return
+	}
+	s.learned = true
+	if origin == s.seedOrigin {
+		s.mu.Unlock()
+		return
+	}
+	// The SSRF decision is taken before publishing the origin so the operator is
+	// never told the scope widened to a host the crawl will then refuse.
+	if !s.allowPrivate && isPrivateHost(u.Hostname()) {
+		s.mu.Unlock()
+		if s.stderr != nil {
+			fmt.Fprintf(s.stderr, "scope: seed redirected to private origin %s; not adding it to scope (pass %s to allow)\n", //nolint:errcheck // best-effort status
+				origin, flagDangerousAllowPrivate)
+		}
+		return
+	}
+	s.effOrigin = origin
+	s.mu.Unlock()
+
+	if s.stderr != nil {
+		fmt.Fprintf(s.stderr, "scope: seed %s redirected to %s; treating that origin as in scope for this crawl\n", //nolint:errcheck // best-effort status
+			s.seedOrigin, origin)
+	}
+}
+
 // parseHTTPURL parses a URL and returns nil if it is invalid or not HTTP(S).
 func parseHTTPURL(rawURL string) *url.URL {
 	u, err := url.Parse(rawURL)
@@ -146,13 +278,6 @@ func registeredDomain(host string) (string, error) {
 // used by both pkg/crawl and pkg/probe.
 func ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	return ssrf.SafeDialContext(ctx, network, addr)
-}
-
-// normalizeURL normalizes a URL for deduplication by lowercasing the scheme
-// and host, stripping fragments, and removing default ports.
-// It returns the empty string for unparseable URLs.
-func normalizeURL(rawURL string) string {
-	return canonicalizeURL(rawURL, false)
 }
 
 // frontierKey returns the crawl-frontier dedup key for rawURL: the canonicalized

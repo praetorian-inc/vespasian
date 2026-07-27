@@ -15,13 +15,12 @@
 package jsstatic
 
 import (
-	"slices"
-
 	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -800,7 +799,7 @@ func TestAnalyze_SinglePassOversizedCount(t *testing.T) {
 
 // TestAnalyze_DeterministicSynthesizedOrder verifies that Analyze emits the
 // synthesized static:js entries in a stable, capture-determined order across
-// runs (LAB-4678 Phase 2), despite the worker pool fanning results in in
+// runs (LAB-4678 Phase 2), despite the worker pool returning results in a
 // non-deterministic completion order. Multiple bundles with literal fetch
 // paths give the pool real work to reorder.
 func TestAnalyze_DeterministicSynthesizedOrder(t *testing.T) {

@@ -703,3 +703,29 @@ func TestCrawlOptsFromCtx_InvalidHeaderReturnsError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "vespasian:")
 }
+
+// TestCrawlOptsFromCtx_MaxRequestsAndInteract covers the two crawl options that
+// were unreachable from the Guard-facing surface: --max-requests and --interact are
+// both user-facing CLI flags, but crawlOptsFromCtx never read them, so a host had no
+// way to set either. (ResumeFrom/OnCheckpoint stay unwired on purpose — the host
+// owns checkpoint storage.)
+func TestCrawlOptsFromCtx_MaxRequestsAndInteract(t *testing.T) {
+	ctx := capability.ExecutionContext{Parameters: capability.Parameters{
+		capability.String("max_requests", "").WithDefault("25"),
+		capability.Bool("interact", "").WithDefault("true"),
+	}}
+	opts, err := crawlOptsFromCtx(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 25, opts.MaxRequests)
+	assert.True(t, opts.Interact)
+}
+
+// TestCrawlOptsFromCtx_MaxRequestsAndInteractDefaults pins the unset case: absent
+// parameters must leave both at their zero values (unlimited requests, no clicking),
+// so a host that does not opt in never gets interaction side effects.
+func TestCrawlOptsFromCtx_MaxRequestsAndInteractDefaults(t *testing.T) {
+	opts, err := crawlOptsFromCtx(ctxWithParams())
+	require.NoError(t, err)
+	assert.Equal(t, 0, opts.MaxRequests)
+	assert.False(t, opts.Interact)
+}
