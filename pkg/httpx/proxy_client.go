@@ -182,35 +182,45 @@ func connectDialer(p ProxyConfig) func(ctx context.Context, addr string) (net.Co
 		mu.Unlock()
 		close(watcherStopped)
 
-		if handshakeErr != nil {
-			// #nosec G104 -- best-effort cleanup; the conn is discarded on this error path (handshake failed or ctx canceled).
-			conn.Close() //nolint:errcheck,gosec // discard the conn on handshake failure
-			if ctx.Err() != nil {
-				return nil, fmt.Errorf("httpx: proxy CONNECT canceled: %w", ctx.Err())
-			}
-			return nil, handshakeErr
-		}
-
-		// Handshake succeeded. If ctx was canceled (possibly after the watcher
-		// already closed conn in the tiny success-vs-cancel window), return the
-		// cancellation error rather than handing back a maybe-closed conn.
-		if ctx.Err() != nil {
-			// #nosec G104 -- best-effort cleanup; the conn is discarded on this cancel-after-success path.
-			conn.Close() //nolint:errcheck,gosec // discard the conn: cancel raced a successful handshake
-			return nil, fmt.Errorf("httpx: proxy CONNECT canceled after handshake: %w", ctx.Err())
-		}
-
-		// Preserve any bytes the proxy pipelined past the CONNECT reply so the
-		// caller's TLS handshake does not lose them. NOTE: resp.Body is
-		// deliberately NOT closed on the 200 path — matching net/http's Transport,
-		// which never closes the body of a successful CONNECT: a hostile or
-		// misconfigured proxy that declares a body would otherwise have Close()'s
-		// drain (io.Copy) consume the caller's first tunneled bytes (SEC-BE-003).
-		if br.Buffered() > 0 {
-			return &bufferedConn{r: br, Conn: conn}, nil
-		}
-		return conn, nil
+		return resolveConnectResult(ctx, conn, br, handshakeErr)
 	}
+}
+
+// resolveConnectResult decides what connectDialer returns once the CONNECT
+// handshake has finished and the watcher is stopped. It centralizes the
+// cancel-vs-success contract: a canceled ctx yields ctx.Err() (closing conn),
+// never a live-but-maybe-closed conn returned as success. On a clean success it
+// returns the tunnel conn, wrapped in a *bufferedConn when the proxy pipelined
+// bytes past the CONNECT reply (deliberately preserved, not drained — SEC-BE-003).
+func resolveConnectResult(ctx context.Context, conn net.Conn, br *bufio.Reader, handshakeErr error) (net.Conn, error) {
+	if handshakeErr != nil {
+		// #nosec G104 -- best-effort cleanup; the conn is discarded on this error path (handshake failed or ctx canceled).
+		conn.Close() //nolint:errcheck,gosec // discard the conn on handshake failure
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("httpx: proxy CONNECT canceled: %w", ctx.Err())
+		}
+		return nil, handshakeErr
+	}
+
+	// Handshake succeeded. If ctx was canceled (possibly after the watcher
+	// already closed conn in the tiny success-vs-cancel window), return the
+	// cancellation error rather than handing back a maybe-closed conn.
+	if ctx.Err() != nil {
+		// #nosec G104 -- best-effort cleanup; the conn is discarded on this cancel-after-success path.
+		conn.Close() //nolint:errcheck,gosec // discard the conn: cancel raced a successful handshake
+		return nil, fmt.Errorf("httpx: proxy CONNECT canceled after handshake: %w", ctx.Err())
+	}
+
+	// Preserve any bytes the proxy pipelined past the CONNECT reply so the
+	// caller's TLS handshake does not lose them. NOTE: resp.Body is
+	// deliberately NOT closed on the 200 path — matching net/http's Transport,
+	// which never closes the body of a successful CONNECT: a hostile or
+	// misconfigured proxy that declares a body would otherwise have Close()'s
+	// drain (io.Copy) consume the caller's first tunneled bytes (SEC-BE-003).
+	if br.Buffered() > 0 {
+		return &bufferedConn{r: br, Conn: conn}, nil
+	}
+	return conn, nil
 }
 
 // connectHandshake performs the CONNECT request/response exchange on conn (an
