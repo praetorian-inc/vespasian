@@ -5,8 +5,8 @@ go 1.25.8
 require (
 	github.com/BishopFox/jsluice v0.0.0-20240110145140-0ddfab153e06
 	github.com/PuerkitoBio/goquery v1.12.0
-	github.com/alecthomas/kong v1.15.0
-	github.com/getkin/kin-openapi v0.141.0
+	github.com/alecthomas/kong v1.16.0
+	github.com/getkin/kin-openapi v0.144.0
 	github.com/go-rod/rod v0.116.2
 	github.com/jhump/protoreflect v1.18.0
 	github.com/praetorian-inc/capability-sdk v0.0.0-20260521173605-4b0d5a7320ae
@@ -15,7 +15,7 @@ require (
 	github.com/ysmood/gson v0.7.3
 	golang.org/x/net v0.57.0
 	golang.org/x/time v0.15.0
-	google.golang.org/grpc v1.82.0
+	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
 )

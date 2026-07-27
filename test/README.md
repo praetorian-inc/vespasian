@@ -77,6 +77,12 @@ For the slug-merging test (`generate-merge-slugs`, offline — no server or brow
 2. **Assert default (off)** — both `/api/posts/*` siblings survive as distinct paths (the LAB-4107 regression guard) while `/api/users/{userId}` is still ID-normalized
 3. **Assert `--merge-slugs`** — the slug siblings collapse to `/api/posts/{postSlug}` and `/api/users/{userId}` normalization is unaffected
 
+For the egress guard (`no-download`, LAB-4999 Finding 1):
+
+1. **Isolate** a fresh, empty go-rod browser cache under a temporary HOME (not the invoking shell's `$HOME`), so the check does not depend on a clean workspace
+2. **Crawl** the rest-api target headless (which must use the system Chrome)
+3. **Assert** the isolated cache is still empty — any `chromium-<rev>` directory means go-rod auto-downloaded a browser from a third-party mirror, i.e. the system-Chrome pin regressed. Skips cleanly when Chrome is unavailable.
+
 For importer tests:
 
 1. **Import** — `vespasian import burp fixtures/sample-burp-export.xml -o imported.json`
@@ -141,7 +147,7 @@ Options:
                                       import-mitmproxy, import-mitmproxy-native,
                                       import-unicode, import-duplicates,
                                       import-malformed, import-empty
-                          Crawl:      crawl-depth, crawl-unreachable
+                          Crawl:      crawl-depth, crawl-unreachable, no-download
                           Edge cases: edge-cases, classifier-edge, spec-edge
   --verbose             Enable verbose vespasian output
   --no-build            Skip building vespasian and target binaries
@@ -277,7 +283,7 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 ## Expected Results
 
-All 27 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest). The sample below is a default `--group all` run (19 offline + 8 live targets); the config-only `grpc-server` target runs additionally only when `TARGETS_SETUP` is configured.
+All 28 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest). The sample below is a default `--group all` run (19 offline + 9 live targets); the config-only `grpc-server` target runs additionally only when `TARGETS_SETUP` is configured.
 
 ```text
   TARGET                      STATUS    ENDPOINTS   EXPECTED   DURATION
@@ -306,11 +312,12 @@ All 27 tests should pass. Order is non-deterministic and durations vary by machi
   import-mitmproxy            PASS      3           3          0s
   import-mitmproxy-native     PASS      3           3          1s
   import-unicode              PASS      3           3          0s
+  no-download                 PASS      -           -          80s
   rest-api                    PASS      8           8          79s
   soap-service                PASS      3           3          51s
   spec-edge                   PASS      -           -          0s
 
-  Total: 27 passed, 0 failed, 0 skipped
+  Total: 28 passed, 0 failed, 0 skipped
 ```
 
 Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are informational and do not cause failures.
