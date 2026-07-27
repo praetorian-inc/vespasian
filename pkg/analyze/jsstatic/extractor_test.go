@@ -814,7 +814,7 @@ func TestExtractFromBundle_ConcatFilteredAsAsset(t *testing.T) {
 // cross-origin reconstruction. A hostile bundle literal like
 // "https://attacker.example/api/x".concat(id) would otherwise reconstruct to
 // an absolute URL on an attacker-chosen host and be emitted as an unprobed
-// static:js-concat candidate — Rule 6 (pkg/classify) would floor it to
+// static:js-concat candidate — Rule 7 (pkg/classify) would floor it to
 // default confidence, and the live probe stage has no same-origin gate of
 // its own, so the attacker host would be probed (SSRF-reflector /
 // scope-escape via a fully offline analysis path). A relative reconstruction

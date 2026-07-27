@@ -3281,7 +3281,7 @@ func TestGenerateCmdRun_TargetURLOverridesOrigin(t *testing.T) {
 			// AC1 requires the fully-offline concat endpoint to reach the spec at
 			// the real default — an unprobed bare-GET candidate scores only the
 			// 0.15 path heuristic and is dropped at 0.5 unless the classifier's
-			// static-JS floor (RESTClassifier Rule 6) promotes it. An earlier
+			// static-JS floor (RESTClassifier Rule 7) promotes it. An earlier
 			// revision left Confidence at 0, which hid that drop.
 			Confidence:            0.5,
 			Probe:                 true,

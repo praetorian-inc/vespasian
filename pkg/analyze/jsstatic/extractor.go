@@ -715,7 +715,7 @@ func extractConcatEndpoints(jsSource []byte, baseURL, baseHost string, seen map[
 		// gate of its own — a hostile bundle literal can reconstruct to an
 		// absolute cross-origin URL, which would otherwise be emitted as an
 		// unprobed static:js-concat candidate, floored to default confidence
-		// by classify Rule 6, and then probed against the attacker-chosen
+		// by classify Rule 7, and then probed against the attacker-chosen
 		// host by the live probe stage (no same-origin gate there either) —
 		// an SSRF-reflector / scope-escape via a fully offline analysis path.
 		// Relative reconstructions and same-host absolute ones are unaffected.

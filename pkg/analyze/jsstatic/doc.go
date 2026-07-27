@@ -69,7 +69,7 @@
 //
 // A concat/literal candidate reaches the generated spec only after
 // classification. Fully offline it has no probed response, so it scores only the
-// REST classifier's path heuristic; RESTClassifier Rule 6 floors any JS-static
+// REST classifier's path heuristic; RESTClassifier Rule 7 floors any JS-static
 // candidate whose path carries an API indicator to the default --confidence
 // threshold (0.5) so these offline candidates survive default-confidence
 // generation instead of being silently dropped.

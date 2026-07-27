@@ -443,8 +443,11 @@ func TestClassifyDetail_StaticJSCandidateFloor(t *testing.T) {
 		},
 		{
 			// HIGH fix: version segments beyond the old literal list (v1-v3)
-			// must still match Rule 3 (apiVersionPathPattern) so Rule 7 fires —
+			// must still satisfy apiVersionPathPattern so Rule 7 fires —
 			// otherwise crawl-extracted /v4+/ concat candidates are dropped.
+			// apiVersionPathPattern feeds the shared pathIsAPI computed BEFORE
+			// Rule 3 (not a Rule-3-local variable), so it now gates Rule 6 too
+			// — see TEST-010 in TestRESTClassifier_RequestSideSignal.
 			name: "static:js GET on /v4/ path floored to 0.5 (version beyond literal list)",
 			req: crawl.ObservedRequest{
 				Method: "GET",
@@ -500,7 +503,7 @@ func TestStaticJSFloor(t *testing.T) {
 	tests := []struct {
 		name           string
 		req            crawl.ObservedRequest
-		pathMatched    bool
+		pathIsAPI      bool
 		inConfidence   float64
 		inReason       string
 		wantConfidence float64
@@ -509,7 +512,7 @@ func TestStaticJSFloor(t *testing.T) {
 		{
 			name:           "floors a low-confidence static:js candidate with matched path",
 			req:            crawl.ObservedRequest{Source: crawl.SourceStaticJSConcat},
-			pathMatched:    true,
+			pathIsAPI:      true,
 			inConfidence:   PathHeuristicBoost,
 			inReason:       "path-heuristic",
 			wantConfidence: StaticJSConfidence,
@@ -518,7 +521,7 @@ func TestStaticJSFloor(t *testing.T) {
 		{
 			name:           "sets reason from scratch when no prior reason",
 			req:            crawl.ObservedRequest{Source: crawl.SourceStaticJS},
-			pathMatched:    true,
+			pathIsAPI:      true,
 			inConfidence:   0,
 			inReason:       "",
 			wantConfidence: StaticJSConfidence,
@@ -527,7 +530,7 @@ func TestStaticJSFloor(t *testing.T) {
 		{
 			name:           "does not floor when path did not match",
 			req:            crawl.ObservedRequest{Source: crawl.SourceStaticJS},
-			pathMatched:    false,
+			pathIsAPI:      false,
 			inConfidence:   0,
 			inReason:       "",
 			wantConfidence: 0,
@@ -536,7 +539,7 @@ func TestStaticJSFloor(t *testing.T) {
 		{
 			name:           "does not floor a non-JS-static source",
 			req:            crawl.ObservedRequest{Source: "katana"},
-			pathMatched:    true,
+			pathIsAPI:      true,
 			inConfidence:   PathHeuristicBoost,
 			inReason:       "path-heuristic",
 			wantConfidence: PathHeuristicBoost,
@@ -545,7 +548,7 @@ func TestStaticJSFloor(t *testing.T) {
 		{
 			name:           "leaves an already-higher confidence untouched",
 			req:            crawl.ObservedRequest{Source: crawl.SourceStaticJS},
-			pathMatched:    true,
+			pathIsAPI:      true,
 			inConfidence:   HTTPMethodConfidence,
 			inReason:       "method:POST",
 			wantConfidence: HTTPMethodConfidence,
@@ -554,7 +557,7 @@ func TestStaticJSFloor(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotConf, gotReason := staticJSFloor(tt.req, tt.pathMatched, tt.inConfidence, tt.inReason)
+			gotConf, gotReason := staticJSFloor(tt.req, tt.pathIsAPI, tt.inConfidence, tt.inReason)
 			assert.InDelta(t, tt.wantConfidence, gotConf, 1e-9)
 			assert.Equal(t, tt.wantReason, gotReason)
 		})
@@ -720,6 +723,27 @@ func TestRESTClassifier_RequestSideSignal(t *testing.T) {
 			wantIsAPI:   false,
 			wantMinConf: 0,
 		},
+		{
+			// TEST-010: pins the version-segment arm of the shared pathIsAPI gate
+			// for Rule 6. Before the LAB-4678 x LAB-4992 merge, apiPathSegments
+			// held the literals "/v1/", "/v2/", "/v3/", so a /v4+/ path was not
+			// a gate member at all and this request classified (false, 0, "").
+			// The merge replaced those literals with apiVersionPathPattern
+			// (/v[1-9][0-9]*/) and hoisted the result into the single pathIsAPI
+			// that Rule 6 also consumes, which widened Rule 6's admission set to
+			// EVERY version segment. That widening was previously unpinned in
+			// both directions — see the /v4/docs entry in the browser-navigation
+			// guard below for the negative arm.
+			name: "json GET on /v4 version-segment path, no response",
+			req: crawl.ObservedRequest{
+				Method:  "GET",
+				URL:     "https://example.com/v4/users",
+				Headers: map[string]string{"Accept": "application/json"},
+			},
+			wantIsAPI:     true,
+			wantMinConf:   RequestSignalConfidence,
+			wantReasonSub: "request-signal:accept",
+		},
 	}
 
 	for _, tt := range tests {
@@ -747,8 +771,14 @@ func TestRESTClassifier_RequestSideSignal(t *testing.T) {
 	// application/xml (with a q-value) AND text/html. A crawled HTML page under
 	// an api-like path (e.g. a Swagger UI at /api/docs) must NOT be classified
 	// as a REST API by the request-side signal (review finding 001).
+	//
+	// TEST-010: "/v4/docs" covers the apiVersionPathPattern arm of pathIsAPI.
+	// The other entries were already literal apiPathSegments members before the
+	// LAB-4678 x LAB-4992 merge; /v4+/ became a gate member only as a result of
+	// it, so without this entry an over-classification regression on a document
+	// navigation under a high version segment would ship silently.
 	const navAccept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
-	for _, p := range []string{"/api/docs", "/graphql", "/v2/dashboard"} {
+	for _, p := range []string{"/api/docs", "/graphql", "/v2/dashboard", "/v4/docs"} {
 		_, navConf, navReason := c.ClassifyDetail(crawl.ObservedRequest{
 			Method:  "GET",
 			URL:     "https://example.com" + p,

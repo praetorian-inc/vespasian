@@ -1414,7 +1414,7 @@ func TestReplayJSExtracted_Filters404(t *testing.T) {
 // emitted by pkg/analyze/jsstatic) must be dropped for every reached path — a
 // 404'd decoy must NOT survive via the mirror. Candidates for paths JS-replay
 // never probed (fully offline / not in the bundle) must be preserved. Without
-// this, the classifier's static-JS confidence floor (Rule 6) would re-admit the
+// this, the classifier's static-JS confidence floor (Rule 7) would re-admit the
 // decoy, inflating the live concat-spa spec from 2 paths to 3.
 func TestReplayJSExtracted_DropsOfflineConcatMirrorForReachedPaths(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

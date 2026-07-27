@@ -602,20 +602,26 @@ func TestAnalyze_MaxEndpointsPerBundle_PreservesConcatEndpointFromSourcemap(t *t
 		t.Fatalf("Analyze error: %v", err)
 	}
 
-	var sawConcat bool
+	// TEST-002: assert the concrete reconstructed URL, not just the presence of
+	// the tag — a regression that corrupted the path while keeping the tag would
+	// otherwise pass.
+	var concatURLs []string
 	for _, r := range res.Requests {
 		if r.Source == SourceJSConcat {
-			sawConcat = true
-			break
+			concatURLs = append(concatURLs, r.URL)
 		}
 	}
-	if !sawConcat {
-		t.Errorf("expected a %s endpoint recovered from the sourcemap source to survive truncation when its AST endpoints alone exceed the remaining budget (5); got requests: %v", SourceJSConcat, res.Requests)
+	if len(concatURLs) != 1 || concatURLs[0] != "https://h/identity/api/auth/login" {
+		t.Errorf("want exactly one %s request at https://h/identity/api/auth/login (the sourcemap-derived reconstruction surviving truncation when its AST endpoints alone exceed the remaining budget of 5); got %v (all requests: %v)",
+			SourceJSConcat, concatURLs, res.Requests)
 	}
-	// The cap must still hold — the concat floor reserves budget, it does not
-	// expand it.
-	if res.Stats.EndpointsKept > 5 {
-		t.Errorf("EndpointsKept = %d, want <= 5 (MaxEndpointsPerBundle must still cap the total)", res.Stats.EndpointsKept)
+	// TEST-002: pin the budget exactly rather than one-sidedly. The concat floor
+	// reserves budget without expanding it, so the cap must be fully utilized —
+	// under-filling this same budget was the historical bug capBundleEndpoints
+	// was introduced to fix, and this test is the only coverage of the sourcemap
+	// arm of that accounting.
+	if res.Stats.EndpointsKept != 5 {
+		t.Errorf("EndpointsKept = %d, want exactly 5 (MaxEndpointsPerBundle must be fully utilized, not exceeded and not under-filled)", res.Stats.EndpointsKept)
 	}
 }
 
