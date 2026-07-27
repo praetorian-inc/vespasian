@@ -275,6 +275,19 @@ validate_soap_operations() {
     local wsdl_file=$1
     local expected_json=$2
 
+    # LAB-3890 TEST-006: fail loud when a required parser is missing. A missing jq
+    # otherwise makes the expected-ops read below yield no input, so the
+    # missing-operations loop never runs and the check false-passes ("all
+    # operations found", return 0) regardless of the WSDL's contents.
+    if ! command -v xmllint >/dev/null 2>&1; then
+        log_fail "SOAP operations: xmllint not installed (install libxml2-utils)"
+        return 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        log_fail "SOAP operations: jq not installed"
+        return 1
+    fi
+
     if [ ! -f "$wsdl_file" ]; then
         log_fail "WSDL file not found: $wsdl_file"
         return 1
@@ -293,6 +306,19 @@ validate_soap_operations() {
         "$wsdl_file" 2>/dev/null \
         | grep -oE 'name="[^"]*"' | sed -E 's/name="([^"]*)"/\1/' | sort -u)
 
+    # Read the expected operation set explicitly so an empty or failed extraction
+    # (bad JSON, jq error) is a hard failure rather than a silent "nothing missing".
+    # A process substitution here would swallow jq's exit status.
+    local expected_ops
+    if ! expected_ops=$(jq -r '.operations[]' "$expected_json" 2>/dev/null); then
+        log_fail "SOAP operations: could not read expected operations from $expected_json"
+        return 1
+    fi
+    if [ -z "$expected_ops" ]; then
+        log_fail "SOAP operations: no expected operations listed in $expected_json"
+        return 1
+    fi
+
     local missing=()
     local op
     while IFS= read -r op; do
@@ -300,7 +326,7 @@ validate_soap_operations() {
         if ! grep -qxF -- "$op" <<< "$actual_ops"; then
             missing+=("$op")
         fi
-    done < <(jq -r '.operations[]' "$expected_json")
+    done <<< "$expected_ops"
 
     if [ ${#missing[@]} -ne 0 ]; then
         local IFS=", "
