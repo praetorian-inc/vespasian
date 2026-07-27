@@ -100,6 +100,7 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 	}
 
 	writeStatus(opts.Status, "classified %d API requests (threshold=%.2f)\n", len(classified), opts.Confidence)
+	logClassificationReasons(opts.Status, classified)
 
 	if opts.Probe {
 		cfg := probe.DefaultConfig()

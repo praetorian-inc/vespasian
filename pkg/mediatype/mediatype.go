@@ -28,3 +28,31 @@ func Base(ct string) string {
 	}
 	return strings.ToLower(strings.TrimSpace(ct))
 }
+
+// Header returns the value of the named header, matched case-insensitively,
+// or "" if absent. It lives here because both classify and generate/rest need
+// a case-insensitive header lookup (capture headers arrive lowercased from the
+// browser but title-cased from Burp/HAR imports) and an import cycle prevents
+// sharing it directly between those packages.
+//
+// The lookup is deterministic: an exact key match wins, and if only
+// differently-cased variants exist (e.g. both "Content-Type" and
+// "content-type" after merging capture sources) the lexicographically smallest
+// matching key is chosen rather than whichever Go map iteration happens to
+// yield first.
+func Header(headers map[string]string, name string) string {
+	if v, ok := headers[name]; ok {
+		return v
+	}
+	match := ""
+	found := false
+	for k := range headers {
+		if strings.EqualFold(k, name) && (!found || k < match) {
+			match, found = k, true
+		}
+	}
+	if !found {
+		return ""
+	}
+	return headers[match]
+}
