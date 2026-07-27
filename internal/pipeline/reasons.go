@@ -39,13 +39,15 @@ func sanitizeForTerminal(s string) string {
 	}
 	for _, r := range s {
 		if !unicode.IsPrint(r) {
+			// Rebuild from the start; the inner binding is named rr so it is not
+			// mistaken for the outer scan's r, which is unused from here on.
 			var b strings.Builder
 			b.Grow(len(s))
-			for _, r := range s {
-				if unicode.IsPrint(r) {
-					b.WriteRune(r)
+			for _, rr := range s {
+				if unicode.IsPrint(rr) {
+					b.WriteRune(rr)
 				} else {
-					fmt.Fprintf(&b, "\\x%02x", r)
+					fmt.Fprintf(&b, "\\x%02x", rr)
 				}
 			}
 			return b.String()
