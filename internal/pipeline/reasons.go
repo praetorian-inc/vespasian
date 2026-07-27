@@ -80,11 +80,19 @@ func logClassificationReasons(w io.Writer, classified []classify.ClassifiedReque
 // Shared by logClassificationReasons and logNearMisses so the emitted and
 // below-threshold lines have identical shape. The path is reduced to its URL
 // path component; an empty Reason renders as "-".
-func classificationLine(c classify.ClassifiedRequest) string {
-	path := c.URL
-	if u, err := url.Parse(c.URL); err == nil && u.Path != "" {
-		path = u.Path
+// endpointPath reduces a request URL to its path component for display and for
+// near-miss endpoint identity, falling back to the full URL when it does not
+// parse or carries no path. Shared so the rendered line and the dedup key agree
+// on what "the same endpoint" means.
+func endpointPath(rawURL string) string {
+	if u, err := url.Parse(rawURL); err == nil && u.Path != "" {
+		return u.Path
 	}
+	return rawURL
+}
+
+func classificationLine(c classify.ClassifiedRequest) string {
+	path := endpointPath(c.URL)
 	reason := c.Reason
 	if reason == "" {
 		reason = "-"
@@ -113,19 +121,24 @@ func logNearMisses(w io.Writer, classifiers []classify.APIClassifier, requests [
 	if len(nm) == 0 {
 		return
 	}
-	// Collapse identical lines. NearMisses works over raw requests rather than the
-	// deduplicated set, so a page firing the same below-threshold XHR repeatedly
-	// would otherwise print one line per occurrence and bury the signal — the
-	// classified half of this output is deduplicated, so this half must be too.
-	seen := make(map[string]bool, len(nm))
-	lines := make([]string, 0, len(nm))
+	// Collapse to one line per endpoint. NearMisses works over raw requests rather
+	// than the deduplicated set, so a page firing the same below-threshold XHR
+	// repeatedly would otherwise print one line per occurrence and bury the signal.
+	// The key is method+path — endpoint identity, matching how the classified half
+	// of this output is deduplicated (classify.Deduplicate) — rather than the
+	// rendered line, so the same endpoint seen with differing confidence still
+	// collapses. The highest-confidence observation wins as the most informative.
+	best := make(map[string]classify.ClassifiedRequest, len(nm))
 	for _, c := range nm {
-		line := classificationLine(c)
-		if seen[line] {
+		key := strings.ToUpper(c.Method) + " " + endpointPath(c.URL)
+		if prev, ok := best[key]; ok && prev.Confidence >= c.Confidence {
 			continue
 		}
-		seen[line] = true
-		lines = append(lines, line)
+		best[key] = c
+	}
+	lines := make([]string, 0, len(best))
+	for _, c := range best {
+		lines = append(lines, classificationLine(c))
 	}
 	sort.Strings(lines)
 	writeStatus(w, "near-miss endpoints (below threshold %.2f, not emitted):\n", threshold)

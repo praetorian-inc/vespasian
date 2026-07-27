@@ -132,6 +132,49 @@ func TestLogClassificationReasons_SanitizesTerminalEscapes(t *testing.T) {
 	}
 }
 
+// TestLogNearMisses_DedupsByEndpoint verifies near-miss output collapses to one
+// line per endpoint (method+path), matching how the classified half is
+// deduplicated, so repeated below-threshold traffic cannot bury the signal.
+//
+// Scope of what this pins: query-only variants of one endpoint collapse. It does
+// NOT distinguish endpoint-level from line-level dedup, because it cannot today —
+// the near-miss band is [NearMissFloor, threshold) and the only REST confidence
+// in that band is PathHeuristicBoost (0.15; the others are 0.6/0.7/0.8/0.85), so
+// every near-miss for a given method+path renders an identical line either way.
+// The key is endpoint identity so it stays correct if a future signal lands in
+// the band with a different score.
+func TestLogNearMisses_DedupsByEndpoint(t *testing.T) {
+	var buf bytes.Buffer
+	classifiers := []classify.APIClassifier{&classify.RESTClassifier{}}
+	// Three query-only variants of one endpoint, plus a second distinct endpoint.
+	requests := []crawl.ObservedRequest{
+		{Method: "GET", URL: "https://example.com/api/thing"},
+		{Method: "GET", URL: "https://example.com/api/thing?page=1"},
+		{Method: "GET", URL: "https://example.com/api/thing?page=2"},
+		{Method: "GET", URL: "https://example.com/api/other"},
+	}
+	logNearMisses(&buf, classifiers, requests, classify.DefaultConfidenceThreshold)
+
+	out := buf.String()
+	if out == "" {
+		t.Fatal("expected near-miss output")
+	}
+	// One header line plus one line per distinct endpoint (/api/thing, /api/other).
+	body := strings.Split(strings.TrimRight(out, "\n"), "\n")[1:]
+	if len(body) != 2 {
+		t.Errorf("got %d near-miss lines, want 2 (one per endpoint):\n%s", len(body), out)
+	}
+	var thing int
+	for _, ln := range body {
+		if strings.Contains(ln, "/api/thing") {
+			thing++
+		}
+	}
+	if thing != 1 {
+		t.Errorf("endpoint /api/thing produced %d lines, want 1:\n%s", thing, out)
+	}
+}
+
 // TestLogNearMisses_SanitizesTerminalEscapes verifies the near-miss -v output
 // neutralizes control bytes too. Near-miss lines render the same untrusted
 // crawled path as the classified lines, so both share classificationLine and

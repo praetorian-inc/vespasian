@@ -330,6 +330,14 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		// starts a page past a budget. Reserving before the visit (rather than
 		// counting after) keeps the page cap exact instead of overshooting by
 		// up to Concurrency pages.
+		// Note on the reservation below: the cancellation paths further down requeue
+		// their entry as uncovered WITHOUT releasing the slot this call consumed, so
+		// pageCount can transiently exceed the number of pages actually covered.
+		// That is deliberate. Releasing it would add a lock acquisition on a
+		// terminating path for no observable gain: pageCount is local to Crawl, is
+		// never persisted into the checkpoint, and every path that requeues has ctx
+		// already canceled, so any worker that reads the inflated count exits on
+		// its own ctx check first.
 		if budgetReached(mu, pageCount, maxPages, reqCount, maxRequests, true) {
 			// Return the entry to the queue: it was dequeued but never visited,
 			// so it must survive into resume state instead of being dropped.

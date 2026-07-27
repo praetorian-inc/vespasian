@@ -63,11 +63,6 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 	var results []ClassifiedRequest
 
 	for _, req := range requests {
-		var bestMatch ClassifiedRequest
-		bestMatch.ObservedRequest = req
-		bestMatch.IsAPI = false
-		bestMatch.Confidence = 0
-
 		// Capture per-observation multi-value-ness BEFORE Deduplicate can
 		// merge values across observations and obscure which keys were
 		// truly multi-value in any single request. Always non-nil so
@@ -80,7 +75,7 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 			}
 		}
 
-		bestMatch = bestClassification(classifiers, req, true)
+		bestMatch := bestClassification(classifiers, req, true)
 		bestMatch.MultiValueQueryKeys = multiValue
 
 		if bestMatch.Confidence >= threshold {

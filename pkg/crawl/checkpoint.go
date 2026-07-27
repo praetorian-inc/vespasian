@@ -47,6 +47,16 @@ const DefaultCheckpointMaxAge = 5 * 24 * time.Hour
 // Storing and passing the checkpoint between runs is the caller's concern (for
 // Guard, a platform piece coordinated separately); vespasian only produces,
 // serializes, validates, and consumes it.
+//
+// LIFECYCLE: Seen is cumulative, not per-run. Restore seeds it and Snapshot
+// writes it back, so it grows monotonically across every resume cycle — that
+// accumulation is what makes coverage carry forward, and nothing here prunes it.
+// The host owns that lifecycle: it must reset or prune periodically, because a
+// Seen set that grows past MaxCheckpointEntries makes the artifact permanently
+// unloadable by LoadCheckpoint and resume degrades to a full re-crawl. Producing
+// a checkpoint is deliberately not bounded — silently dropping seen keys at write
+// time would re-crawl covered pages with no signal, which is worse than a loud
+// failure at read time.
 type Checkpoint struct {
 	Version           int        `json:"version"`
 	ConfigFingerprint string     `json:"config_fingerprint"`
