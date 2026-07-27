@@ -16,6 +16,7 @@ package httpx
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -834,4 +835,132 @@ func TestProxyDialer_ConnectCancelAfterSuccessKeepsConnUsable(t *testing.T) {
 	assert.Equal(t, "hello", string(buf), "expected the echo server's reply through the tunnel after cancel")
 
 	require.NoError(t, conn.Close())
+}
+
+// fakeConn is a minimal net.Conn stub for TestResolveConnectResult: it tracks
+// Close() calls without a real network connection. Every other net.Conn
+// method is satisfied by the embedded (nil) net.Conn and is never invoked by
+// resolveConnectResult — on the pipelined-bytes path the returned
+// *bufferedConn.Read reads from its own *bufio.Reader, never from the
+// embedded conn, so a nil embed is safe here.
+type fakeConn struct {
+	net.Conn
+	closeCalls atomic.Int32
+}
+
+func (c *fakeConn) Close() error {
+	c.closeCalls.Add(1)
+	return nil
+}
+
+// TestResolveConnectResult is a deterministic, table-driven regression guard
+// for TEST-001: it calls the extracted resolveConnectResult directly (no
+// network, no timing) and pins the exact cancel-vs-success contract described
+// in its doc comment. Each case is a real behavior transition that a future
+// refactor of resolveConnectResult could silently break; unlike the
+// full-path TestProxyDialer_ConnectCancelAfterSuccessKeepsConnUsable (which
+// exercises a real race window and may or may not trigger it on a given run),
+// every subtest here forces its scenario directly, so it fails reliably if
+// the contract regresses.
+func TestResolveConnectResult(t *testing.T) {
+	errBoom := errors.New("boom")
+
+	tests := []struct {
+		name  string
+		setup func(t *testing.T) (ctx context.Context, conn *fakeConn, br *bufio.Reader, handshakeErr error)
+		check func(t *testing.T, conn *fakeConn, gotConn net.Conn, gotErr error)
+	}{
+		{
+			// The key guard: a ctx already canceled by the time the handshake
+			// finished successfully must NOT hand back the live conn — it must
+			// return ctx.Err() (wrapped) and close the conn. This fails if
+			// someone removes the post-success ctx.Err() check and returns the
+			// live conn unconditionally.
+			name: "cancel-after-success",
+			setup: func(t *testing.T) (context.Context, *fakeConn, *bufio.Reader, error) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, &fakeConn{}, bufio.NewReader(bytes.NewReader(nil)), nil
+			},
+			check: func(t *testing.T, conn *fakeConn, gotConn net.Conn, gotErr error) {
+				assert.Nil(t, gotConn)
+				require.Error(t, gotErr)
+				assert.ErrorIs(t, gotErr, context.Canceled)
+				assert.Equal(t, int32(1), conn.closeCalls.Load(), "conn must be closed on cancel-after-success")
+			},
+		},
+		{
+			name: "success, no buffered bytes",
+			setup: func(t *testing.T) (context.Context, *fakeConn, *bufio.Reader, error) {
+				return context.Background(), &fakeConn{}, bufio.NewReader(bytes.NewReader(nil)), nil
+			},
+			check: func(t *testing.T, conn *fakeConn, gotConn net.Conn, gotErr error) {
+				require.NoError(t, gotErr)
+				assert.Same(t, conn, gotConn, "expected the plain conn back (no bufferedConn wrap) when nothing was buffered")
+				assert.Equal(t, int32(0), conn.closeCalls.Load(), "conn must not be closed on success")
+			},
+		},
+		{
+			name: "success, pipelined bytes",
+			setup: func(t *testing.T) (context.Context, *fakeConn, *bufio.Reader, error) {
+				payload := []byte("PIPELINED-PAYLOAD")
+				br := bufio.NewReader(bytes.NewReader(payload))
+				// Peek (without consuming) to force the bufio.Reader to fill its
+				// internal buffer, so br.Buffered() > 0 exactly like a proxy that
+				// wrote the CONNECT reply and target bytes in one packet.
+				_, err := br.Peek(len(payload))
+				require.NoError(t, err)
+				return context.Background(), &fakeConn{}, br, nil
+			},
+			check: func(t *testing.T, conn *fakeConn, gotConn net.Conn, gotErr error) {
+				require.NoError(t, gotErr)
+				bc, ok := gotConn.(*bufferedConn)
+				require.True(t, ok, "expected a *bufferedConn when the reader has buffered bytes, got %T", gotConn)
+				buf := make([]byte, len("PIPELINED-PAYLOAD"))
+				_, err := io.ReadFull(bc, buf)
+				require.NoError(t, err)
+				assert.Equal(t, "PIPELINED-PAYLOAD", string(buf))
+				assert.Equal(t, int32(0), conn.closeCalls.Load(), "conn must not be closed on success")
+			},
+		},
+		{
+			name: "handshake error, live ctx",
+			setup: func(t *testing.T) (context.Context, *fakeConn, *bufio.Reader, error) {
+				return context.Background(), &fakeConn{}, bufio.NewReader(bytes.NewReader(nil)), errBoom
+			},
+			check: func(t *testing.T, conn *fakeConn, gotConn net.Conn, gotErr error) {
+				assert.Nil(t, gotConn)
+				require.Error(t, gotErr)
+				assert.ErrorIs(t, gotErr, errBoom)
+				assert.Equal(t, int32(1), conn.closeCalls.Load(), "conn must be closed on handshake error")
+			},
+		},
+		{
+			// When BOTH a handshake error and a canceled ctx are present, the
+			// cancellation wrap wins (matches connectHandshake/dialProxy
+			// returning ctx.Err()-flavored errors first when interrupted): the
+			// original handshakeErr is not part of the returned error chain.
+			name: "handshake error + canceled ctx",
+			setup: func(t *testing.T) (context.Context, *fakeConn, *bufio.Reader, error) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, &fakeConn{}, bufio.NewReader(bytes.NewReader(nil)), errBoom
+			},
+			check: func(t *testing.T, conn *fakeConn, gotConn net.Conn, gotErr error) {
+				assert.Nil(t, gotConn)
+				require.Error(t, gotErr)
+				assert.ErrorIs(t, gotErr, context.Canceled)
+				assert.NotErrorIs(t, gotErr, errBoom, "the cancel wrap must win over the handshake error")
+				assert.Equal(t, int32(1), conn.closeCalls.Load(), "conn must be closed on handshake error")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, conn, br, handshakeErr := tt.setup(t)
+			gotConn, gotErr := resolveConnectResult(ctx, conn, br, handshakeErr)
+			tt.check(t, conn, gotConn, gotErr)
+		})
+	}
 }
