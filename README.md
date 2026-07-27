@@ -398,6 +398,14 @@ vespasian generate <api-type> <capture-file> [flags]
   --confidence       Min classification confidence (default: 0.5)
   --probe            Enable active probing (default: true)
   --deduplicate      Deduplicate endpoints before probing (default: true)
+  --proxy            Proxy URL (e.g., http://127.0.0.1:8080); http/https/socks5.
+                     Routes the probe (OPTIONS/schema/WSDL-fetch/GraphQL introspection/gRPC
+                     reflection), JS-replay, and jsstatic sourcemap-fetch traffic through the proxy.
+                     TLS verification stays on by default (socks5 always verifies). Private targets still
+                     require --dangerous-allow-private (proxy relaxes only the dial-time SSRF pin, not URL scope).
+  --proxy-insecure   Disable TLS certificate verification for an http/https intercepting proxy
+                     (Burp/mitmproxy MITM). Off by default; no effect on socks5 (a transparent tunnel
+                     that always verifies the real target).
   --dangerous-allow-private  Disable SSRF protection on the probe path
                      (OPTIONS/schema/WSDL-fetch/GraphQL introspection) for
                      private/localhost targets. WARNING: Do not use on
