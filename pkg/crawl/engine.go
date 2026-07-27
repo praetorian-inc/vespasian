@@ -39,7 +39,10 @@ const DefaultStableWait = 3 * time.Second
 //   - a per-request timeout: the age after which a still-pending request no
 //     longer counts as in-flight, so one hung request cannot stall the wait.
 //
-// The ceiling is the per-page PageTimeout, already applied to the page.
+// The ceiling is a per-page deadline of PageTimeout, computed once in visitPage
+// and shared by the baseline wait and every interaction wait. It is enforced
+// explicitly rather than by the rod page timeout: these waits poll local capture
+// state and issue no CDP call, so the page timeout never fires inside them.
 const (
 	DefaultNetworkIdleFloor   = 500 * time.Millisecond
 	DefaultNetworkQuietPeriod = 500 * time.Millisecond
@@ -128,6 +131,10 @@ type engineOptions struct {
 	// changes) to surface interaction-only endpoints. Off by default — clicking
 	// can mutate state, so it must be explicitly requested (LAB-4678 Phase 2).
 	Interact bool
+
+	// Resume carries cross-run checkpoint wiring (LAB-4678 Phase 4). Zero value
+	// disables both restore and capture.
+	Resume resumeOptions
 }
 
 // rodEngine implements a concurrent headless crawl using go-rod. It connects
@@ -188,13 +195,25 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 	// the scope predicate's SSRF check rejects unless flagDangerousAllowPrivate
 	// is set). Without this guard the crawl silently returned zero captures
 	// with no error to help the operator diagnose (LAB-2438).
-	if e.frontier.Push([]urlEntry{{URL: seedURL, Depth: 0}}) == 0 {
+	// Restore resume state BEFORE seeding so already-covered pages are not
+	// re-crawled (LAB-4678 Phase 4).
+	resumed := resumeFrontier(e.frontier, e.opts.Resume, time.Now(), e.opts.Stderr)
+
+	// A resumed frontier has already seen the seed, so Push returns 0 for it —
+	// that is expected, not a rejection. Only fail when the seed was refused AND
+	// there is nothing queued to crawl, which preserves the LAB-2438 diagnostic
+	// for a genuinely unusable seed.
+	if e.frontier.Push([]urlEntry{{URL: seedURL, Depth: 0}}) == 0 && e.frontier.Len() == 0 {
 		// redactSeedURL strips userinfo (user[:password]) before echoing the
 		// seed URL to stderr. If an operator pastes a credentialed URL and
 		// forgets flagDangerousAllowPrivate, the error message still lands in
 		// shell history / CI logs / scrollback — without this we would emit
 		// the cleartext credentials. url.Parse errors return the raw string
 		// unchanged so the operator still sees an actionable message.
+		if resumed {
+			return fmt.Errorf("resumed checkpoint has no pending pages and seed URL %s "+
+				"was already covered; nothing to crawl", redactSeedURL(seedURL))
+		}
 		return fmt.Errorf("seed URL rejected by frontier (scope, SSRF, or parse): %s; "+
 			"if crawling a private host (localhost, 127.0.0.1, RFC1918, link-local), "+
 			"pass %s", redactSeedURL(seedURL), flagDangerousAllowPrivate)
@@ -238,6 +257,12 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 
 	wg.Wait()
 	e.frontier.Close()
+
+	// Capture resume state after the workers have stopped, on every exit path
+	// (frontier exhausted, budget reached, or ctx canceled) — a truncated crawl
+	// is exactly what the next run needs to continue from (LAB-4678 Phase 4).
+	captureCheckpoint(e.frontier, e.opts.Resume, time.Now())
+
 	return ctx.Err()
 }
 
@@ -306,6 +331,9 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		// counting after) keeps the page cap exact instead of overshooting by
 		// up to Concurrency pages.
 		if budgetReached(mu, pageCount, maxPages, reqCount, maxRequests, true) {
+			// Return the entry to the queue: it was dequeued but never visited,
+			// so it must survive into resume state instead of being dropped.
+			e.frontier.Requeue(entry)
 			e.frontier.MarkIdle()
 			return
 		}
@@ -313,6 +341,8 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		requests, links, err := e.visitPage(ctx, entry)
 		if err != nil {
 			if ctx.Err() != nil {
+				// Canceled mid-visit: the page was not covered, so requeue it.
+				e.frontier.Requeue(entry)
 				e.frontier.MarkIdle()
 				return
 			}
@@ -328,6 +358,9 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		// budget a request-rate bound distinct from MaxPages.
 		for _, req := range requests {
 			if ctx.Err() != nil {
+				// Canceled part-way through emitting this page's requests, so
+				// its surface is incomplete. Requeue it for the next run.
+				e.frontier.Requeue(entry)
 				e.frontier.MarkIdle()
 				return
 			}
@@ -362,8 +395,13 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 		page.Close() //nolint:errcheck,gosec // best-effort close; page may already be closed
 	}()
 
-	// Apply context and per-page timeout.
+	// Apply context and per-page timeout. pageDeadline mirrors that timeout as a
+	// wall-clock bound for the completion-driven waits below, which poll local
+	// capture state and so never trip the rod page timeout themselves. Every
+	// network-idle wait for this page — baseline and per-click — shares it, so
+	// the page's total wait cannot scale with the number of interactions.
 	page = page.Context(ctx).Timeout(e.opts.PageTimeout)
+	pageDeadline := time.Now().Add(e.opts.PageTimeout)
 
 	// Enable the Network domain for capturing requests.
 	enableNetwork := proto.NetworkEnable{}
@@ -421,14 +459,15 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 	// data loads) are captured rather than dropped (LAB-4678 Phase 1). Bounded by
 	// a floor, a quiet period, a per-request timeout, and the page ceiling; see
 	// waitForNetworkIdle. Returns whatever was captured so far if ctx is canceled.
-	e.waitForNetworkIdle(ctx, capture)
+	e.waitForNetworkIdle(ctx, capture, pageDeadline)
 
 	// Optionally exercise the page (clicks / client-side route changes) to
 	// surface endpoints that only fire on interaction, then snapshot everything
 	// captured — baseline plus interaction-triggered (LAB-4678 Phase 2). Opt-in,
-	// off by default.
+	// off by default. Shares the page deadline, so interaction cannot extend the
+	// page past its budget.
 	if e.opts.Interact {
-		e.interactPage(ctx, page, capture)
+		e.interactPage(ctx, page, capture, pageDeadline)
 	}
 	capturedResults := capture.Results()
 
@@ -439,11 +478,17 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 
 // waitForNetworkIdle blocks until the page's network goes quiet or a bound is
 // hit, then returns the captured requests (LAB-4678 Phase 1). It replaces the
-// previous fixed 200ms settle so late/dynamic requests are captured. It stops
-// when the elapsed wait reaches the ceiling (PageTimeout); or, once past the
-// floor, when no requests are in flight and the network has been quiet for the
-// quiet period; or when ctx is canceled (returning whatever was captured so far).
-func (e *rodEngine) waitForNetworkIdle(ctx context.Context, capture *pageNetworkCapture) []ObservedRequest {
+// previous fixed 200ms settle so late/dynamic requests are captured. It stops at
+// the page deadline; or, once past the floor, when no requests are in flight and
+// the network has been quiet for the quiet period; or when ctx is canceled
+// (returning whatever was captured so far).
+//
+// deadline is the WHOLE PAGE's ceiling, shared by the baseline wait and every
+// interaction wait, so a page cannot exceed its budget by calling this
+// repeatedly. The floor still applies per call, which is deliberate: each click
+// needs a minimum window for its requests to start, and the shared deadline caps
+// the total regardless.
+func (e *rodEngine) waitForNetworkIdle(ctx context.Context, capture *pageNetworkCapture, deadline time.Time) []ObservedRequest {
 	start := time.Now()
 	ticker := time.NewTicker(networkIdlePollInterval)
 	defer ticker.Stop()
@@ -451,7 +496,7 @@ func (e *rodEngine) waitForNetworkIdle(ctx context.Context, capture *pageNetwork
 		now := time.Now()
 		inFlight, sinceActivity := capture.networkState(e.opts.PerRequestTimeout, now)
 		if networkIdleReached(inFlight, sinceActivity, now.Sub(start),
-			e.opts.NetworkIdleFloor, e.opts.PageTimeout, e.opts.NetworkQuietPeriod) {
+			e.opts.NetworkIdleFloor, e.opts.NetworkQuietPeriod, !now.Before(deadline)) {
 			return capture.Results()
 		}
 		select {
@@ -463,11 +508,12 @@ func (e *rodEngine) waitForNetworkIdle(ctx context.Context, capture *pageNetwork
 }
 
 // networkIdleReached is the pure stop decision for waitForNetworkIdle, split out
-// so it is unit-testable without a browser. Stop when the ceiling is reached, or
-// once past the floor with nothing in flight and a quiet period since the last
-// network activity.
-func networkIdleReached(inFlight int, sinceActivity, elapsed, floor, ceiling, quiet time.Duration) bool {
-	if elapsed >= ceiling {
+// so it is unit-testable without a browser. Stop when the page deadline has been
+// reached, or once past the floor with nothing in flight and a quiet period since
+// the last network activity. deadlineReached is passed in rather than derived so
+// this stays a pure function of durations.
+func networkIdleReached(inFlight int, sinceActivity, elapsed, floor, quiet time.Duration, deadlineReached bool) bool {
+	if deadlineReached {
 		return true
 	}
 	if elapsed < floor {

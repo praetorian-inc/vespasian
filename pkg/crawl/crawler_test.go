@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -236,6 +237,146 @@ func TestCrawl_MaxPagesPath_ReturnsNoError(t *testing.T) {
 	}
 	if len(results) > 2 {
 		t.Errorf("Crawl() returned %d results, want at most 2 (MaxPages)", len(results))
+	}
+}
+
+// TestCrawl_ResumeSkipsCoveredPages drives the Phase 4 resume seam end to end
+// through the exported CrawlerOptions API (LAB-4678): a budget-truncated crawl
+// emits a checkpoint via OnCheckpoint, and feeding it back as ResumeFrom makes
+// the next run skip the pages already covered instead of re-crawling them.
+//
+// This also covers the seed-already-covered path: on resume the seed is in the
+// restored seen-set, so Push rejects it and the crawl must proceed from the
+// restored pending queue rather than failing "seed URL rejected".
+func TestCrawl_ResumeSkipsCoveredPages(t *testing.T) {
+	var mu sync.Mutex
+	served := map[string]int{}
+	var nextID int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		served[r.URL.Path]++
+		// Child paths come from a counter rather than the request path: echoing
+		// r.URL.Path back into the HTML is a reflection the linter flags, and the
+		// test only needs distinct pages, not path structure.
+		a, b := nextID+1, nextID+2
+		nextID += 2
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/html")
+		// Every page links to two more, so the frontier always has surplus pending
+		// entries when a small page budget truncates the run.
+		fmt.Fprintf(w, `<html><body><a href="/p%d">a</a><a href="/p%d">b</a></body></html>`, a, b)
+	}))
+	defer srv.Close()
+
+	var cp *Checkpoint
+	base := CrawlerOptions{
+		Depth:        5,
+		MaxPages:     3,
+		Timeout:      30 * time.Second,
+		Headless:     false,
+		AllowPrivate: true,
+		OnCheckpoint: func(c *Checkpoint) { cp = c },
+	}
+
+	first, err := NewCrawler(base).Crawl(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("first crawl: %v", err)
+	}
+	if len(first) == 0 {
+		t.Fatal("first crawl captured nothing")
+	}
+	if cp == nil {
+		t.Fatal("OnCheckpoint was never invoked")
+	}
+	if len(cp.Pending) == 0 {
+		t.Fatal("checkpoint carried no pending pages, so resume cannot continue")
+	}
+	if cp.ConfigFingerprint != ComputeConfigFingerprint(srv.URL, base.Scope, base.Depth, false) {
+		t.Error("checkpoint fingerprint does not match the crawl config")
+	}
+
+	// "Covered" means recorded in the results, not merely fetched: a page whose
+	// fetch completed after the budget filled has its result discarded, so it was
+	// NOT covered and the resumed run is right to fetch it again.
+	covered := map[string]int{}
+	for _, r := range first {
+		u, err := url.Parse(r.URL)
+		if err != nil {
+			t.Fatalf("unparseable result URL %q: %v", r.URL, err)
+		}
+		mu.Lock()
+		covered[u.Path] = served[u.Path]
+		mu.Unlock()
+	}
+	if len(covered) == 0 {
+		t.Fatal("no covered pages recorded in the first crawl")
+	}
+
+	// Resume with the same config. Pages covered by the first run must not be
+	// refetched, and the run must not fail on the already-seen seed.
+	resumeOpts := base
+	resumeOpts.ResumeFrom = cp
+	resumeOpts.OnCheckpoint = nil
+	if _, err := NewCrawler(resumeOpts).Crawl(context.Background(), srv.URL); err != nil {
+		t.Fatalf("resumed crawl: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for p, n := range covered {
+		if served[p] > n {
+			t.Errorf("resumed crawl refetched already-covered page %s (%d -> %d)", p, n, served[p])
+		}
+	}
+}
+
+// TestCrawl_ResumeRejectsForeignCheckpoint verifies a checkpoint from a
+// different config is ignored rather than honored: the crawl proceeds fresh and
+// re-covers the seed instead of skipping it as already-seen.
+func TestCrawl_ResumeRejectsForeignCheckpoint(t *testing.T) {
+	var mu sync.Mutex
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<html><body>ok</body></html>`)
+	}))
+	defer srv.Close()
+
+	// A checkpoint whose fingerprint belongs to another target, but which claims
+	// this target's seed is already covered. Honoring it would crawl nothing.
+	foreign := &Checkpoint{
+		Version:           checkpointVersion,
+		ConfigFingerprint: ComputeConfigFingerprint("https://elsewhere.example", "", 5, false),
+		CreatedAtUnix:     time.Now().Unix(),
+		Seen:              []string{frontierKey(srv.URL + "/")},
+	}
+
+	var stderr bytes.Buffer
+	results, err := NewCrawler(CrawlerOptions{
+		Depth:        5,
+		MaxPages:     3,
+		Timeout:      30 * time.Second,
+		Headless:     false,
+		AllowPrivate: true,
+		ResumeFrom:   foreign,
+		Stderr:       &stderr,
+	}).Crawl(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("crawl with foreign checkpoint: %v", err)
+	}
+	if len(results) == 0 {
+		t.Error("foreign checkpoint was honored: crawl captured nothing")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if hits == 0 {
+		t.Error("seed was never fetched, so the foreign seen-set was applied")
+	}
+	if !strings.Contains(stderr.String(), "ignoring checkpoint") {
+		t.Errorf("mismatch not reported to the operator: %q", stderr.String())
 	}
 }
 

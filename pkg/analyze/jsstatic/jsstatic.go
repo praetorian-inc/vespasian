@@ -19,6 +19,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -399,7 +400,14 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 
 // synthesizedLess is the deterministic ordering for synthesized static:js
 // entries (LAB-4678 Phase 2): URL, then method, then source tag, then request
-// body. Kept as a named helper so Analyze stays under the cyclomatic gate.
+// body, then canonical query string. Kept as a named helper so Analyze stays
+// under the cyclomatic gate.
+//
+// The query comparison is the final tiebreaker that makes this a total order over
+// the fields synthesized entries can actually differ in. Without it, two entries
+// equal on the earlier keys compare equal and sort.SliceStable preserves their
+// worker-completion order, which is nondeterministic — leaving exactly the
+// ordering variance this sort exists to remove.
 func synthesizedLess(a, b crawl.ObservedRequest) bool {
 	if a.URL != b.URL {
 		return a.URL < b.URL
@@ -410,7 +418,10 @@ func synthesizedLess(a, b crawl.ObservedRequest) bool {
 	if a.Source != b.Source {
 		return a.Source < b.Source
 	}
-	return bytes.Compare(a.Body, b.Body) < 0
+	if c := bytes.Compare(a.Body, b.Body); c != 0 {
+		return c < 0
+	}
+	return url.Values(a.QueryParams).Encode() < url.Values(b.QueryParams).Encode()
 }
 
 // Analyze runs static analysis on every JS body in captured. It returns a

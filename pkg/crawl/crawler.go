@@ -64,6 +64,26 @@ type CrawlerOptions struct {
 	AllowPrivate  bool      // disable SSRF protection, allowing private/internal targets
 	Stderr        io.Writer // user-facing status messages; nil disables output
 
+	// ResumeFrom carries cross-run resume state from a previous crawl so coverage
+	// accumulates instead of restarting (LAB-4678 Phase 4). The checkpoint is
+	// validated against the current config ([ComputeConfigFingerprint] over
+	// target, scope, depth, and backend) and CheckpointMaxAge before use; a
+	// mismatched or stale checkpoint is reported on Stderr and ignored, degrading
+	// to a full crawl rather than failing. Nil starts fresh. Honored by both
+	// backends.
+	ResumeFrom *Checkpoint
+
+	// OnCheckpoint, when set, receives the resume state captured after the crawl's
+	// workers stop — on every exit path, including budget truncation and
+	// cancellation, since truncation is the case resume exists for. Storing it is
+	// the caller's concern. Nil disables checkpoint production.
+	OnCheckpoint func(*Checkpoint)
+
+	// CheckpointMaxAge bounds how old a ResumeFrom checkpoint may be and still be
+	// reused. Non-positive uses DefaultCheckpointMaxAge; it does NOT disable the
+	// staleness check, so an unset field still gets protection.
+	CheckpointMaxAge time.Duration
+
 	// BrowserMgr provides a caller-owned Chrome instance. When set, Crawl()
 	// connects to this browser instead of launching its own. Callers who want
 	// immediate signal-based browser termination (force-exit killing Chrome on
@@ -78,6 +98,19 @@ type CrawlerOptions struct {
 // HTTPCrawler (stdlib net/http engine).
 type Crawler interface {
 	Crawl(ctx context.Context, targetURL string) ([]ObservedRequest, error)
+}
+
+// resume builds the shared resume wiring for a crawl of targetURL under these
+// options. The fingerprint is computed here (rather than by the caller) so both
+// backends bind the checkpoint to the same config identity, including which
+// backend produced it.
+func (o CrawlerOptions) resume(targetURL string) resumeOptions {
+	return resumeOptions{
+		From:        o.ResumeFrom,
+		On:          o.OnCheckpoint,
+		Fingerprint: ComputeConfigFingerprint(targetURL, o.Scope, o.Depth, o.Headless),
+		MaxAge:      o.CheckpointMaxAge,
+	}
 }
 
 // RodCrawler implements Crawler using the go-rod headless browser engine.

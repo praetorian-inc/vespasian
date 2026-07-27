@@ -62,13 +62,86 @@ type Checkpoint struct {
 // across incompatible configs. MaxPages/MaxRequests are intentionally excluded:
 // they bound a single run's budget, not what the crawl is allowed to cover, so a
 // larger budget on resume should continue the same coverage, not invalidate it.
-func ComputeConfigFingerprint(targetURL, scope string, depth int) string {
+//
+// headless is included because the two backends do not discover the same link
+// set: the headless engine executes JavaScript and captures every subresource
+// request, while the net/http backend records one request per page and sees only
+// links present in the served HTML. Resuming a headless checkpoint on the
+// net/http backend would mark JS-discovered pages as already covered and skip
+// them, permanently losing that surface — so a backend change invalidates the
+// checkpoint just like a scope change.
+func ComputeConfigFingerprint(targetURL, scope string, depth int, headless bool) string {
 	// Length-prefix each field so ("a","b") and ("ab","") cannot collide, then
 	// hash the assembled input in one shot.
 	field := func(s string) string { return strconv.Itoa(len(s)) + ":" + s }
-	input := field(targetURL) + field(scope) + field(strconv.Itoa(depth))
+	input := field(targetURL) + field(scope) + field(strconv.Itoa(depth)) +
+		field(strconv.FormatBool(headless))
 	sum := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(sum[:])
+}
+
+// resumeOptions carries the cross-run resume wiring shared by both crawl
+// backends. Fingerprint identifies the current crawl config (see
+// [ComputeConfigFingerprint]); MaxAge bounds checkpoint staleness, with a
+// non-positive value falling back to [DefaultCheckpointMaxAge].
+type resumeOptions struct {
+	From        *Checkpoint
+	On          func(*Checkpoint)
+	Fingerprint string
+	MaxAge      time.Duration
+}
+
+// maxAgeOrDefault resolves the staleness bound, treating a non-positive
+// configured value as "use the default" rather than "disable the check", so a
+// caller that leaves the field unset still gets staleness protection.
+func (r resumeOptions) maxAgeOrDefault() time.Duration {
+	if r.MaxAge <= 0 {
+		return DefaultCheckpointMaxAge
+	}
+	return r.MaxAge
+}
+
+// resumeFrontier applies r.From to f when that checkpoint is usable for the
+// current config, and reports whether it resumed. An absent checkpoint is not an
+// error (a fresh crawl), and an unusable one is a warning rather than a failure:
+// a stale or mismatched checkpoint should degrade to a full crawl, not abort it.
+// Both outcomes are announced on stderr so an operator can tell a resumed run
+// from a fresh one instead of silently getting different coverage.
+func resumeFrontier(f *urlFrontier, r resumeOptions, now time.Time, stderr io.Writer) bool {
+	if r.From == nil {
+		return false
+	}
+	if ok, why := r.From.Usable(r.Fingerprint, now, r.maxAgeOrDefault()); !ok {
+		if stderr != nil {
+			fmt.Fprintf(stderr, "resume: ignoring checkpoint (%s); starting a fresh crawl\n", why) //nolint:errcheck // best-effort status
+		}
+		return false
+	}
+	f.Restore(r.From.Pending, r.From.Seen)
+	if stderr != nil {
+		fmt.Fprintf(stderr, "resume: restored %d pending pages, %d URLs already covered\n", //nolint:errcheck // best-effort status
+			len(r.From.Pending), len(r.From.Seen))
+	}
+	return true
+}
+
+// captureCheckpoint snapshots f as a Checkpoint stamped with the current config
+// fingerprint and now, then hands it to r.On. It is a no-op without a callback.
+// Called after the crawl's workers have stopped, on every exit path including
+// budget truncation and cancellation — truncation is precisely the case resume
+// exists to carry forward.
+func captureCheckpoint(f *urlFrontier, r resumeOptions, now time.Time) {
+	if r.On == nil {
+		return
+	}
+	pending, seen := f.Snapshot()
+	r.On(&Checkpoint{
+		Version:           checkpointVersion,
+		ConfigFingerprint: r.Fingerprint,
+		CreatedAtUnix:     now.Unix(),
+		Pending:           pending,
+		Seen:              seen,
+	})
 }
 
 // Save writes the checkpoint as JSON to w.
@@ -81,15 +154,46 @@ func (c *Checkpoint) Save(w io.Writer) error {
 	return nil
 }
 
+// Layered bounds on a decoded checkpoint. A checkpoint is read back from host
+// storage rather than produced in-process, so it is parsed input and gets the
+// same treatment as the importers: a byte cap on the reader and an element cap on
+// each slice, so a corrupted or hostile artifact cannot exhaust memory.
+const (
+	// MaxCheckpointBytes bounds the encoded size accepted by LoadCheckpoint.
+	MaxCheckpointBytes = 64 * 1024 * 1024 // 64 MB
+	// MaxCheckpointEntries bounds Pending and Seen independently.
+	MaxCheckpointEntries = 1_000_000
+)
+
 // LoadCheckpoint decodes a checkpoint from r and rejects an unknown schema
-// version, so a format change fails closed rather than being misinterpreted.
+// version, so a format change fails closed rather than being misinterpreted. The
+// reader is capped at MaxCheckpointBytes and each slice at MaxCheckpointEntries;
+// exceeding either is an error rather than a silent truncation, since a truncated
+// seen-set would let the resumed crawl re-cover pages it should skip.
 func LoadCheckpoint(r io.Reader) (*Checkpoint, error) {
+	// Read under the cap first (+1 so a payload exactly at the cap is
+	// distinguishable from one over it), then unmarshal. Reading before decoding
+	// keeps the size check exact and unambiguous: a streaming decoder would have
+	// already consumed a prefix by the time the overflow is detectable.
+	data, err := io.ReadAll(io.LimitReader(r, MaxCheckpointBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read checkpoint: %w", err)
+	}
+	if len(data) > MaxCheckpointBytes {
+		return nil, fmt.Errorf("checkpoint exceeds %d bytes", MaxCheckpointBytes)
+	}
 	var c Checkpoint
-	if err := json.NewDecoder(r).Decode(&c); err != nil {
+	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, fmt.Errorf("decode checkpoint: %w", err)
 	}
 	if c.Version != checkpointVersion {
 		return nil, fmt.Errorf("checkpoint version %d unsupported (want %d)", c.Version, checkpointVersion)
+	}
+	if len(c.Pending) > MaxCheckpointEntries {
+		return nil, fmt.Errorf("checkpoint pending entries %d exceeds %d", len(c.Pending), MaxCheckpointEntries)
+	}
+	if len(c.Seen) > MaxCheckpointEntries {
+		return nil, fmt.Errorf("checkpoint seen entries %d exceeds %d", len(c.Seen), MaxCheckpointEntries)
 	}
 	return &c, nil
 }

@@ -141,10 +141,13 @@
 // accumulate across separate crawls: [Checkpoint] serializes the frontier's
 // pending queue and seen-set, gated by [ComputeConfigFingerprint] (target/scope/
 // depth) and a staleness bound ([Checkpoint.Usable], [DefaultCheckpointMaxAge]);
-// [urlFrontier.Snapshot] produces that state after a crawl and
-// [urlFrontier.Restore] loads it before one. Storing and passing the checkpoint
-// between runs, and wiring resume through the crawler entry paths, is coordinated
-// with the host (Guard) and is not built here.
+// resume is driven through [CrawlerOptions]: set ResumeFrom to continue a prior
+// crawl and OnCheckpoint to receive the state captured when this one stops
+// (including on budget truncation or cancellation, which is the case resume
+// exists for). A checkpoint whose fingerprint or age does not match is reported
+// on Stderr and ignored, so a config change costs a full re-crawl rather than a
+// failed run. Both backends honor it. Storing and passing the checkpoint between
+// runs is the host's (Guard's) concern and is not built here.
 //
 // [go-rod]: https://github.com/go-rod/rod
 package crawl

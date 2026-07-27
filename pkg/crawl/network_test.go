@@ -226,29 +226,35 @@ func TestMapNetworkToObservedRequest_MultiValueQueryParam(t *testing.T) {
 
 func TestNetworkIdleReached(t *testing.T) {
 	const floor = 500 * time.Millisecond
-	const ceiling = 30 * time.Second
 	const quiet = 500 * time.Millisecond
 
 	cases := []struct {
-		name          string
-		inFlight      int
-		sinceActivity time.Duration
-		elapsed       time.Duration
-		want          bool
+		name            string
+		inFlight        int
+		sinceActivity   time.Duration
+		elapsed         time.Duration
+		deadlineReached bool
+		want            bool
 	}{
-		{"ceiling wins even with requests in flight", 3, 0, ceiling, true},
-		{"ceiling wins past deadline", 3, 0, ceiling + time.Second, true},
-		{"before floor never idle even if quiet", 0, time.Second, floor - time.Millisecond, false},
-		{"past floor, idle and quiet -> stop", 0, quiet, floor, true},
-		{"past floor but requests in flight -> wait", 2, quiet, floor + time.Second, false},
-		{"past floor, idle but not quiet yet -> wait", 0, quiet - time.Millisecond, floor + time.Second, false},
+		// The page deadline outranks everything, including in-flight requests and
+		// the floor: it is the whole page's budget, shared across the baseline
+		// wait and every interaction wait, so it must be able to cut a wait short.
+		{"deadline wins even with requests in flight", 3, 0, time.Second, true, true},
+		{"deadline wins before the floor", 3, 0, 0, true, true},
+		{"before floor never idle even if quiet", 0, time.Second, floor - time.Millisecond, false, false},
+		{"past floor, idle and quiet -> stop", 0, quiet, floor, false, true},
+		{"past floor but requests in flight -> wait", 2, quiet, floor + time.Second, false, false},
+		{"past floor, idle but not quiet yet -> wait", 0, quiet - time.Millisecond, floor + time.Second, false, false},
+		// A long-running page that has not hit its deadline keeps waiting, so the
+		// stop decision never depends on elapsed time alone.
+		{"no deadline, long elapsed, still busy -> wait", 1, 0, time.Hour, false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := networkIdleReached(tc.inFlight, tc.sinceActivity, tc.elapsed, floor, ceiling, quiet)
+			got := networkIdleReached(tc.inFlight, tc.sinceActivity, tc.elapsed, floor, quiet, tc.deadlineReached)
 			if got != tc.want {
-				t.Errorf("networkIdleReached(inFlight=%d, since=%v, elapsed=%v) = %v, want %v",
-					tc.inFlight, tc.sinceActivity, tc.elapsed, got, tc.want)
+				t.Errorf("networkIdleReached(inFlight=%d, since=%v, elapsed=%v, deadlineReached=%v) = %v, want %v",
+					tc.inFlight, tc.sinceActivity, tc.elapsed, tc.deadlineReached, got, tc.want)
 			}
 		})
 	}

@@ -73,32 +73,15 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 		// truly multi-value in any single request. Always non-nil so
 		// downstream consumers can distinguish "RunClassifiers ran, no
 		// multi-value keys" from "ClassifiedRequest built directly".
-		bestMatch.MultiValueQueryKeys = make(map[string]bool)
+		multiValue := make(map[string]bool)
 		for k, vs := range req.QueryParams {
 			if len(vs) > 1 {
-				bestMatch.MultiValueQueryKeys[k] = true
+				multiValue[k] = true
 			}
 		}
 
-		for _, classifier := range classifiers {
-			var isAPI bool
-			var confidence float64
-			var reason string
-
-			if dc, ok := classifier.(DetailedClassifier); ok {
-				isAPI, confidence, reason = dc.ClassifyDetail(req)
-			} else {
-				isAPI, confidence = classifier.Classify(req)
-				reason = "classified by " + classifier.Name()
-			}
-
-			if isAPI && confidence > bestMatch.Confidence {
-				bestMatch.IsAPI = true
-				bestMatch.Confidence = confidence
-				bestMatch.APIType = classifier.Name()
-				bestMatch.Reason = reason
-			}
-		}
+		bestMatch = bestClassification(classifiers, req, true)
+		bestMatch.MultiValueQueryKeys = multiValue
 
 		if bestMatch.Confidence >= threshold {
 			results = append(results, bestMatch)
@@ -106,6 +89,45 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 	}
 
 	return results
+}
+
+// bestClassification runs every classifier over req and returns the
+// highest-confidence verdict, shared by [RunClassifiers] and [NearMisses] so the
+// two cannot drift apart in how they pick a winner.
+//
+// requireAPI is RunClassifiers' gate: when true, only a verdict the classifier
+// itself marked as an API can win, so a classifier reporting "not my type" with
+// residual confidence cannot claim the request and mislabel its APIType. Every
+// classifier today couples isAPI to confidence>0, so both modes agree — the flag
+// is explicit so a future classifier returning (false, >0) cannot silently change
+// which verdict wins.
+func bestClassification(classifiers []APIClassifier, req crawl.ObservedRequest, requireAPI bool) ClassifiedRequest {
+	var best ClassifiedRequest
+	best.ObservedRequest = req
+
+	for _, classifier := range classifiers {
+		var isAPI bool
+		var confidence float64
+		var reason string
+
+		if dc, ok := classifier.(DetailedClassifier); ok {
+			isAPI, confidence, reason = dc.ClassifyDetail(req)
+		} else {
+			isAPI, confidence = classifier.Classify(req)
+			reason = "classified by " + classifier.Name()
+		}
+
+		if requireAPI && !isAPI {
+			continue
+		}
+		if confidence > best.Confidence {
+			best.IsAPI = isAPI
+			best.Confidence = confidence
+			best.APIType = classifier.Name()
+			best.Reason = reason
+		}
+	}
+	return best
 }
 
 // NearMisses returns requests that classified with floor <= confidence <
@@ -118,28 +140,9 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 func NearMisses(classifiers []APIClassifier, requests []crawl.ObservedRequest, floor, threshold float64) []ClassifiedRequest {
 	var results []ClassifiedRequest
 	for _, req := range requests {
-		var best ClassifiedRequest
-		best.ObservedRequest = req
-
-		for _, classifier := range classifiers {
-			var isAPI bool
-			var confidence float64
-			var reason string
-
-			if dc, ok := classifier.(DetailedClassifier); ok {
-				isAPI, confidence, reason = dc.ClassifyDetail(req)
-			} else {
-				isAPI, confidence = classifier.Classify(req)
-				reason = "classified by " + classifier.Name()
-			}
-
-			if confidence > best.Confidence {
-				best.IsAPI = isAPI
-				best.Confidence = confidence
-				best.APIType = classifier.Name()
-				best.Reason = reason
-			}
-		}
+		// requireAPI=false: a near-miss is by definition a request no classifier
+		// claimed, so the strongest signal wins regardless of the isAPI verdict.
+		best := bestClassification(classifiers, req, false)
 
 		if best.Confidence >= floor && best.Confidence < threshold {
 			results = append(results, best)

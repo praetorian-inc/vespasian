@@ -98,6 +98,29 @@ func (f *urlFrontier) Push(entries []urlEntry) int {
 	return added
 }
 
+// Requeue returns a popped-but-unvisited entry to the queue so it is not lost.
+// Push cannot be used for this: the entry's key is already in seen, so Push
+// would reject it. The key deliberately STAYS in seen, so a link rediscovered
+// later still dedups against it — only this specific abandoned entry is
+// restored.
+//
+// Callers must still call MarkIdle after Requeue, exactly as after any Pop. Use
+// this whenever a worker gives up an entry without covering it (a crawl budget
+// was reached, or the context was canceled): the page is genuinely unvisited, so
+// it belongs in the pending queue for cross-run resume ([urlFrontier.Snapshot])
+// rather than silently dropped (LAB-4678 Phase 4). Dropping it made a
+// budget-truncated crawl lose its entire pending queue at default concurrency,
+// which is the exact case resume exists to carry forward.
+func (f *urlFrontier) Requeue(e urlEntry) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return
+	}
+	f.queue = append(f.queue, e)
+	f.cond.Broadcast()
+}
+
 // SetDFS switches the frontier to depth-first (LIFO) pop order when v is true,
 // or back to breadth-first (FIFO) when v is false. The mutation is
 // mutex-protected and is therefore safe from data races. However, SetDFS is

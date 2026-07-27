@@ -273,10 +273,6 @@ func mergeJSONBodies(bodies [][]byte) *openapi3.SchemaRef {
 	return merged
 }
 
-// buildOperation builds a single OpenAPI operation from a group of classified requests.
-// emitSource controls whether the x-vespasian-source extension is set on the operation.
-// It should be true only when at least one request in the entire Generate input carries
-// a "static:*" Source value (so flag-off output stays byte-identical to pre-LAB-2108).
 // maxSchemaUnionDepth bounds the recursion in unionSchemaProperties against a
 // pathological or deeply-nested inferred schema.
 const maxSchemaUnionDepth = 12
@@ -307,6 +303,10 @@ func unionSchemaProperties(dst, src *openapi3.Schema, depth int) {
 	}
 }
 
+// buildOperation builds a single OpenAPI operation from a group of classified requests.
+// emitSource controls whether the x-vespasian-source extension is set on the operation.
+// It should be true only when at least one request in the entire Generate input carries
+// a "static:*" Source value (so flag-off output stays byte-identical to pre-LAB-2108).
 func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSource bool) *openapi3.Operation { //nolint:gocyclo // OpenAPI operation builder
 	operation := &openapi3.Operation{
 		Summary:   capitalizeFirst(key.method) + " " + key.path,

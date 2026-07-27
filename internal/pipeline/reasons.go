@@ -113,9 +113,19 @@ func logNearMisses(w io.Writer, classifiers []classify.APIClassifier, requests [
 	if len(nm) == 0 {
 		return
 	}
+	// Collapse identical lines. NearMisses works over raw requests rather than the
+	// deduplicated set, so a page firing the same below-threshold XHR repeatedly
+	// would otherwise print one line per occurrence and bury the signal — the
+	// classified half of this output is deduplicated, so this half must be too.
+	seen := make(map[string]bool, len(nm))
 	lines := make([]string, 0, len(nm))
 	for _, c := range nm {
-		lines = append(lines, classificationLine(c))
+		line := classificationLine(c)
+		if seen[line] {
+			continue
+		}
+		seen[line] = true
+		lines = append(lines, line)
 	}
 	sort.Strings(lines)
 	writeStatus(w, "near-miss endpoints (below threshold %.2f, not emitted):\n", threshold)

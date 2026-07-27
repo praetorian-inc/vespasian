@@ -401,6 +401,57 @@ func TestFrontier_ActiveWorkerPreventsEarlyDone(t *testing.T) {
 	f.MarkIdle()
 }
 
+// TestFrontier_Requeue verifies an abandoned entry returns to the queue while
+// its key stays in seen. This is what keeps a budget-truncated crawl's pending
+// pages alive for cross-run resume: dropping them instead lost the entire
+// pending queue at default concurrency (LAB-4678 Phase 4).
+func TestFrontier_Requeue(t *testing.T) {
+	f := newURLFrontier(10, nil)
+	f.Push([]urlEntry{{URL: "https://ex.com/a", Depth: 1}})
+
+	entry, ok := f.Pop()
+	if !ok {
+		t.Fatal("Pop returned no entry")
+	}
+	if f.Len() != 0 {
+		t.Fatalf("queue len after Pop = %d, want 0", f.Len())
+	}
+
+	f.Requeue(entry)
+	f.MarkIdle()
+
+	if f.Len() != 1 {
+		t.Errorf("queue len after Requeue = %d, want 1", f.Len())
+	}
+	// The key must stay in seen so a rediscovered link still dedups.
+	if added := f.Push([]urlEntry{{URL: "https://ex.com/a", Depth: 1}}); added != 0 {
+		t.Errorf("Requeue cleared the seen key (Push added %d, want 0)", added)
+	}
+	// And the requeued entry is the one that comes back out.
+	got, ok := f.Pop()
+	if !ok || got.URL != "https://ex.com/a" || got.Depth != 1 {
+		t.Errorf("Pop after Requeue = %+v (ok=%v), want the requeued entry", got, ok)
+	}
+	// Snapshot must see a requeued entry as pending.
+	f.Requeue(got)
+	if pending, _ := f.Snapshot(); len(pending) != 1 {
+		t.Errorf("Snapshot pending = %d, want 1 (requeued entry must be resumable)", len(pending))
+	}
+}
+
+// TestFrontier_RequeueAfterClose verifies Requeue is a no-op once the frontier
+// is closed, so a late worker cannot resurrect the queue during shutdown.
+func TestFrontier_RequeueAfterClose(t *testing.T) {
+	f := newURLFrontier(10, nil)
+	f.Push([]urlEntry{{URL: "https://ex.com/a", Depth: 1}})
+	entry, _ := f.Pop()
+	f.Close()
+	f.Requeue(entry)
+	if f.Len() != 0 {
+		t.Errorf("Requeue after Close enqueued %d entries, want 0", f.Len())
+	}
+}
+
 // TestFrontier_DedupQueryVariants verifies URLs differing only in query params
 // collapse to one frontier entry, so the crawler visits the page template once
 // rather than spending the page budget on near-duplicate variants (LAB-4678

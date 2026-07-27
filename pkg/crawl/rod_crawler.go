@@ -99,6 +99,7 @@ func (c *RodCrawler) crawlHeadless(ctx context.Context, targetURL string, maxPag
 		Headers:       extraHeaders,
 		ScopeCheck:    scopeFn,
 		Stderr:        c.opts.Stderr,
+		Resume:        c.opts.resume(targetURL),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create engine: %w", err)

@@ -15,6 +15,8 @@
 package jsstatic
 
 import (
+	"slices"
+
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -824,7 +826,9 @@ func TestAnalyze_DeterministicSynthesizedOrder(t *testing.T) {
 		}
 		var urls []string
 		for _, r := range res.Requests[len(captured):] { // synthesized tail only
-			urls = append(urls, r.Method+" "+r.URL)
+			// URL first, then method: matches synthesizedLess's key order so a
+			// lexicographic check below is a valid test of the production order.
+			urls = append(urls, r.URL+" "+r.Method)
 		}
 		return urls
 	}
@@ -836,26 +840,15 @@ func TestAnalyze_DeterministicSynthesizedOrder(t *testing.T) {
 	// Repeated runs must produce byte-identical ordering.
 	for i := 0; i < 8; i++ {
 		got := extractOrder()
-		if !stringsEqual(first, got) {
+		if !slices.Equal(first, got) {
 			t.Fatalf("synthesized order not deterministic across runs:\n first=%v\n run%d=%v", first, i, got)
 		}
 	}
-	// And that order must be the sorted order (URL, then method).
+	// And that order must be ascending by (URL, method) — a necessary condition
+	// of synthesizedLess's ordering, checkable without reimplementing it.
 	if !sortedByURLMethod(first) {
 		t.Errorf("synthesized entries not in sorted order: %v", first)
 	}
-}
-
-func stringsEqual(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func sortedByURLMethod(xs []string) bool {

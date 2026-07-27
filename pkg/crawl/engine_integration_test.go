@@ -634,3 +634,128 @@ func TestRodEngine_DepthLimit(t *testing.T) {
 		t.Error("Got 0 results, expected at least 1")
 	}
 }
+
+// interactFixture serves a page whose only API calls fire on click, plus a
+// destructive control that must never be clicked. Returns the server and a
+// per-path hit recorder.
+func interactFixture(t *testing.T) (*httptest.Server, func(string) int) {
+	t.Helper()
+	var mu sync.Mutex
+	hits := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits[r.URL.Path]++
+		mu.Unlock()
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"ok":true}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		// The endpoints below appear nowhere as a link or a literal fetch on load,
+		// so passive crawling and static JS analysis cannot reach them — only a
+		// real click can. The destructive controls carry their verb in different
+		// places (text, aria-label, title) to exercise every label source.
+		fmt.Fprint(w, `<html><body>
+<button id="safe" onclick="fetch('/api/interaction-only')">Load more</button>
+<button id="danger-text" onclick="fetch('/api/destructive-text')">Delete account</button>
+<button id="danger-aria" aria-label="Delete item" onclick="fetch('/api/destructive-aria')">&times;</button>
+<button id="danger-title" title="Erase everything" onclick="fetch('/api/destructive-title')">!</button>
+</body></html>`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func(p string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return hits[p]
+	}
+}
+
+// runInteractCrawl crawls the fixture once with interaction on or off and
+// returns the captured request URLs.
+func runInteractCrawl(t *testing.T, srv *httptest.Server, interact bool) []string {
+	t.Helper()
+	bm := launchTestBrowser(t)
+	engine, err := newRodEngine(bm.wsURL(), engineOptions{
+		Concurrency:   1,
+		MaxPages:      2,
+		MaxDepth:      0,
+		PageTimeout:   20 * time.Second,
+		StableTimeout: 500 * time.Millisecond,
+		Interact:      interact,
+	})
+	if err != nil {
+		t.Fatalf("newRodEngine: %v", err)
+	}
+	defer engine.Close() //nolint:errcheck // test cleanup
+
+	var mu sync.Mutex
+	var urls []string
+	if err := engine.Crawl(context.Background(), srv.URL+"/", func(req ObservedRequest) {
+		mu.Lock()
+		urls = append(urls, req.URL)
+		mu.Unlock()
+	}); err != nil {
+		t.Fatalf("Crawl(interact=%v): %v", interact, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	return append([]string(nil), urls...)
+}
+
+// TestRodEngine_Interact_CapturesInteractionOnlyEndpoint is the end-to-end proof
+// that the opt-in interaction pass does what it claims (LAB-4678 Phase 2). The
+// fixture's endpoint fires only from a click handler, so it is unreachable by
+// passive capture — with --interact off it must be absent, and with it on it must
+// be captured. Without this the feature had no coverage at all beyond its two
+// pure helpers.
+func TestRodEngine_Interact_CapturesInteractionOnlyEndpoint(t *testing.T) {
+	srv, _ := interactFixture(t)
+
+	off := runInteractCrawl(t, srv, false)
+	for _, u := range off {
+		if strings.Contains(u, "/api/interaction-only") {
+			t.Fatalf("interaction-only endpoint captured with Interact=false: %v", off)
+		}
+	}
+
+	on := runInteractCrawl(t, srv, true)
+	var found bool
+	for _, u := range on {
+		if strings.Contains(u, "/api/interaction-only") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("Interact=true did not capture the interaction-only endpoint; captured: %v", on)
+	}
+}
+
+// TestRodEngine_Interact_SkipsDestructiveControls verifies the interaction pass
+// never fires a destructive control, whichever label source carries the verb:
+// visible text, aria-label, or title. A click here would delete data on a real
+// engagement target, so this is the safety property that makes the feature
+// usable at all.
+func TestRodEngine_Interact_SkipsDestructiveControls(t *testing.T) {
+	srv, hits := interactFixture(t)
+
+	captured := runInteractCrawl(t, srv, true)
+
+	// The safe control must have fired, otherwise this test would pass simply
+	// because no clicking happened at all.
+	if hits("/api/interaction-only") == 0 {
+		t.Fatalf("no interaction occurred, so the destructive assertions prove nothing; captured: %v", captured)
+	}
+
+	for _, p := range []string{"/api/destructive-text", "/api/destructive-aria", "/api/destructive-title"} {
+		if n := hits(p); n != 0 {
+			t.Errorf("destructive control was clicked: %s hit %d times", p, n)
+		}
+		for _, u := range captured {
+			if strings.Contains(u, p) {
+				t.Errorf("destructive endpoint appears in capture: %s", u)
+			}
+		}
+	}
+}

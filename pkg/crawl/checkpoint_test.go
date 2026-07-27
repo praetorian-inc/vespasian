@@ -16,32 +16,142 @@ package crawl
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 	"time"
 )
 
 func TestComputeConfigFingerprint(t *testing.T) {
-	base := ComputeConfigFingerprint("https://ex.com", "same-origin", 3)
+	base := ComputeConfigFingerprint("https://ex.com", "same-origin", 3, true)
 	if base == "" {
 		t.Fatal("empty fingerprint")
 	}
-	if base != ComputeConfigFingerprint("https://ex.com", "same-origin", 3) {
+	if base != ComputeConfigFingerprint("https://ex.com", "same-origin", 3, true) {
 		t.Error("fingerprint not stable for identical inputs")
 	}
-	// Each defining field changes the fingerprint.
+	// Each defining field changes the fingerprint, including the backend: the
+	// two backends discover different link sets, so a headless checkpoint must
+	// not be reusable by the net/http backend.
 	for _, fp := range []string{
-		ComputeConfigFingerprint("https://other.com", "same-origin", 3),
-		ComputeConfigFingerprint("https://ex.com", "same-domain", 3),
-		ComputeConfigFingerprint("https://ex.com", "same-origin", 5),
+		ComputeConfigFingerprint("https://other.com", "same-origin", 3, true),
+		ComputeConfigFingerprint("https://ex.com", "same-domain", 3, true),
+		ComputeConfigFingerprint("https://ex.com", "same-origin", 5, true),
+		ComputeConfigFingerprint("https://ex.com", "same-origin", 3, false),
 	} {
 		if fp == base {
 			t.Error("fingerprint did not change when a defining field changed")
 		}
 	}
 	// Length-prefixing prevents field-boundary collisions.
-	if ComputeConfigFingerprint("ab", "", 0) == ComputeConfigFingerprint("a", "b", 0) {
+	if ComputeConfigFingerprint("ab", "", 0, true) == ComputeConfigFingerprint("a", "b", 0, true) {
 		t.Error("field-boundary collision")
 	}
+}
+
+// TestResumeOptions_MaxAgeDefault verifies an unset MaxAge falls back to the
+// default rather than disabling the staleness check — an unset field must not
+// silently remove protection.
+func TestResumeOptions_MaxAgeDefault(t *testing.T) {
+	for _, v := range []time.Duration{0, -time.Hour} {
+		if got := (resumeOptions{MaxAge: v}).maxAgeOrDefault(); got != DefaultCheckpointMaxAge {
+			t.Errorf("maxAgeOrDefault(%v) = %v, want %v", v, got, DefaultCheckpointMaxAge)
+		}
+	}
+	if got := (resumeOptions{MaxAge: time.Minute}).maxAgeOrDefault(); got != time.Minute {
+		t.Errorf("explicit MaxAge not honored: %v", got)
+	}
+}
+
+// TestResumeFrontier verifies the restore gate: a usable checkpoint is applied,
+// and an absent or unusable one degrades to a fresh crawl rather than failing.
+func TestResumeFrontier(t *testing.T) {
+	now := time.Unix(100000, 0)
+	const fp = "fp"
+	mkCP := func(fingerprint string, created int64) *Checkpoint {
+		return &Checkpoint{
+			Version:           checkpointVersion,
+			ConfigFingerprint: fingerprint,
+			CreatedAtUnix:     created,
+			Pending:           []urlEntry{{URL: "https://ex.com/a", Depth: 1}},
+			Seen:              []string{"https://ex.com/", "https://ex.com/a"},
+		}
+	}
+
+	t.Run("usable checkpoint restores", func(t *testing.T) {
+		f := newURLFrontier(10, nil)
+		var out bytes.Buffer
+		if !resumeFrontier(f, resumeOptions{From: mkCP(fp, now.Unix()), Fingerprint: fp}, now, &out) {
+			t.Fatal("usable checkpoint was not applied")
+		}
+		if f.Len() != 1 {
+			t.Errorf("restored queue len = %d, want 1", f.Len())
+		}
+		if !strings.Contains(out.String(), "resume: restored") {
+			t.Errorf("restore not announced on stderr: %q", out.String())
+		}
+	})
+
+	t.Run("nil checkpoint is a fresh crawl", func(t *testing.T) {
+		f := newURLFrontier(10, nil)
+		var out bytes.Buffer
+		if resumeFrontier(f, resumeOptions{Fingerprint: fp}, now, &out) {
+			t.Error("nil checkpoint reported as resumed")
+		}
+		if out.Len() != 0 {
+			t.Errorf("nil checkpoint should be silent, got %q", out.String())
+		}
+	})
+
+	// A mismatched or stale checkpoint must warn and continue, never abort: a
+	// config change should cost a full re-crawl, not a failed run.
+	for _, tc := range []struct {
+		name string
+		cp   *Checkpoint
+	}{
+		{"fingerprint mismatch", mkCP("other", now.Unix())},
+		{"stale", mkCP(fp, now.Add(-DefaultCheckpointMaxAge-time.Hour).Unix())},
+	} {
+		t.Run(tc.name+" warns and starts fresh", func(t *testing.T) {
+			f := newURLFrontier(10, nil)
+			var out bytes.Buffer
+			if resumeFrontier(f, resumeOptions{From: tc.cp, Fingerprint: fp}, now, &out) {
+				t.Error("unusable checkpoint reported as resumed")
+			}
+			if f.Len() != 0 {
+				t.Errorf("unusable checkpoint still restored %d entries", f.Len())
+			}
+			if !strings.Contains(out.String(), "ignoring checkpoint") {
+				t.Errorf("no warning emitted: %q", out.String())
+			}
+		})
+	}
+}
+
+// TestCaptureCheckpoint verifies the produced checkpoint is stamped with the
+// current config identity and carries the frontier's unvisited state, and that
+// it is a no-op without a callback.
+func TestCaptureCheckpoint(t *testing.T) {
+	now := time.Unix(100000, 0)
+	f := newURLFrontier(10, nil)
+	f.Push([]urlEntry{{URL: "https://ex.com/a", Depth: 1}})
+
+	var got *Checkpoint
+	captureCheckpoint(f, resumeOptions{Fingerprint: "fp", On: func(c *Checkpoint) { got = c }}, now)
+	if got == nil {
+		t.Fatal("callback not invoked")
+	}
+	if got.Version != checkpointVersion || got.ConfigFingerprint != "fp" || got.CreatedAtUnix != now.Unix() {
+		t.Errorf("checkpoint not stamped correctly: %+v", got)
+	}
+	if len(got.Pending) != 1 || got.Pending[0].URL != "https://ex.com/a" {
+		t.Errorf("pending not captured: %+v", got.Pending)
+	}
+	if len(got.Seen) != 1 {
+		t.Errorf("seen = %v, want 1 entry", got.Seen)
+	}
+
+	// No callback: must not panic and must not snapshot.
+	captureCheckpoint(f, resumeOptions{Fingerprint: "fp"}, now)
 }
 
 func TestCheckpoint_SaveLoadRoundTrip(t *testing.T) {
@@ -136,4 +246,73 @@ func TestFrontier_SnapshotRestore(t *testing.T) {
 	if added := f2.Push([]urlEntry{{URL: "https://ex.com/c", Depth: 1}}); added != 1 {
 		t.Errorf("new URL not enqueued after restore (added=%d, want 1)", added)
 	}
+}
+
+// TestHTTPPageCap covers the budget fold for the net/http backend, including the
+// unlimited-pages sentinel: a request budget must still bind there rather than
+// being silently discarded.
+func TestHTTPPageCap(t *testing.T) {
+	cases := []struct {
+		name                  string
+		maxPages, maxRequests int
+		want                  int
+	}{
+		{"no request budget leaves pages alone", 100, 0, 100},
+		{"requests bind when lower", 100, 3, 3},
+		{"pages bind when lower", 5, 50, 5},
+		{"equal budgets", 10, 10, 10},
+		{"unlimited pages, request budget still binds", 0, 25, 25},
+		{"both unlimited", 0, 0, 0},
+		{"negative request budget ignored", 100, -1, 100},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := httpPageCap(tc.maxPages, tc.maxRequests); got != tc.want {
+				t.Errorf("httpPageCap(%d, %d) = %d, want %d", tc.maxPages, tc.maxRequests, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadCheckpoint_Bounds verifies the decode caps: a checkpoint is host-supplied
+// parsed input, so an oversized payload or an over-long slice is rejected rather
+// than decoded into memory or silently truncated.
+func TestLoadCheckpoint_Bounds(t *testing.T) {
+	t.Run("over-long seen slice rejected", func(t *testing.T) {
+		cp := &Checkpoint{Version: checkpointVersion, Seen: make([]string, MaxCheckpointEntries+1)}
+		var buf bytes.Buffer
+		if err := cp.Save(&buf); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadCheckpoint(&buf)
+		if err == nil || !strings.Contains(err.Error(), "seen entries") {
+			t.Errorf("expected seen-entries cap error, got %v", err)
+		}
+	})
+
+	t.Run("oversized payload rejected", func(t *testing.T) {
+		// A valid envelope followed by enough filler to pass the byte cap.
+		var buf bytes.Buffer
+		buf.WriteString(`{"version":1,"config_fingerprint":"`)
+		buf.Write(bytes.Repeat([]byte("a"), MaxCheckpointBytes+64))
+		buf.WriteString(`"}`)
+		if _, err := LoadCheckpoint(&buf); err == nil {
+			t.Error("expected oversized-payload error, got nil")
+		}
+	})
+
+	t.Run("normal checkpoint still loads", func(t *testing.T) {
+		cp := &Checkpoint{Version: checkpointVersion, ConfigFingerprint: "fp", Seen: []string{"a"}}
+		var buf bytes.Buffer
+		if err := cp.Save(&buf); err != nil {
+			t.Fatal(err)
+		}
+		got, err := LoadCheckpoint(&buf)
+		if err != nil {
+			t.Fatalf("well-formed checkpoint rejected: %v", err)
+		}
+		if got.ConfigFingerprint != "fp" {
+			t.Errorf("round-trip lost data: %+v", got)
+		}
+	})
 }

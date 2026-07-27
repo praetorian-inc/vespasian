@@ -164,11 +164,9 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	// they track the same source (QUAL-004).
 	client := newHTTPClient(scopeFn, c.opts.AllowPrivate, c.pageTimeout, proxyURL, c.opts.ProxyInsecure)
 
-	// Seed the frontier. Reject if the seed itself doesn't pass scope/SSRF.
-	if frontier.Push([]urlEntry{{URL: targetURL, Depth: 0}}) == 0 {
-		return nil, fmt.Errorf("seed URL rejected by frontier (scope, SSRF, or parse): %s; "+
-			"if crawling a private host (localhost, 127.0.0.1, RFC1918, link-local), "+
-			"pass %s", redactSeedURL(targetURL), flagDangerousAllowPrivate)
+	resumeCfg := c.opts.resume(targetURL)
+	if err := c.restoreAndSeed(frontier, targetURL, resumeCfg); err != nil {
+		return nil, err
 	}
 
 	var (
@@ -193,6 +191,10 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	wg.Wait()
 	frontier.Close()
 
+	// Capture resume state after the workers have stopped, on every exit path
+	// including budget truncation and cancellation (LAB-4678 Phase 4).
+	captureCheckpoint(frontier, resumeCfg, time.Now())
+
 	if ctx.Err() != nil {
 		if c.opts.Stderr != nil {
 			fmt.Fprint(c.opts.Stderr, interruptMessage) //nolint:errcheck // best-effort
@@ -211,16 +213,49 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	return snapshot, nil
 }
 
+// restoreAndSeed applies any resume state to the frontier and then seeds it with
+// the target, returning an error only when there is genuinely nothing to crawl.
+// Resume must be restored BEFORE seeding so already-covered pages are not
+// re-crawled (LAB-4678 Phase 4). A resumed frontier has already seen the seed, so
+// Push returns 0 for it — that is expected, not a rejection, which is why the
+// failure condition also requires an empty queue. Split out of Crawl to keep it
+// under the cyclomatic complexity gate.
+func (c *HTTPCrawler) restoreAndSeed(frontier *urlFrontier, targetURL string, resumeCfg resumeOptions) error {
+	resumed := resumeFrontier(frontier, resumeCfg, time.Now(), c.opts.Stderr)
+
+	if frontier.Push([]urlEntry{{URL: targetURL, Depth: 0}}) == 0 && frontier.Len() == 0 {
+		if resumed {
+			return fmt.Errorf("resumed checkpoint has no pending pages and seed URL %s "+
+				"was already covered; nothing to crawl", redactSeedURL(targetURL))
+		}
+		return fmt.Errorf("seed URL rejected by frontier (scope, SSRF, or parse): %s; "+
+			"if crawling a private host (localhost, 127.0.0.1, RFC1918, link-local), "+
+			"pass %s", redactSeedURL(targetURL), flagDangerousAllowPrivate)
+	}
+	return nil
+}
+
 // httpPageCap folds the request budget into the page cap for the net/http
 // backend: that backend records one request per page, so a MaxRequests bound
 // (maxRequests > 0) reduces to a page cap. A zero maxRequests leaves maxPages
 // unchanged. Kept as a helper so HTTPCrawler.Crawl stays under the cyclomatic
 // complexity gate.
+//
+// maxPages MUST already be resolved to a positive value — validateCrawlInputs
+// normalizes the "0 means unlimited" sentinel to DefaultMaxPages before this is
+// called. The guard below enforces that rather than trusting it: with maxPages
+// as an unlimited sentinel, a naive `maxRequests < maxPages` comparison is false
+// and the request budget would be silently discarded, failing a politeness
+// control open against a sensitive target.
 func httpPageCap(maxPages, maxRequests int) int {
-	if maxRequests > 0 && maxRequests < maxPages {
+	if maxRequests <= 0 {
+		return maxPages
+	}
+	if maxPages <= 0 {
+		// Unlimited pages: the request budget is the only bound left.
 		return maxRequests
 	}
-	return maxPages
+	return min(maxRequests, maxPages)
 }
 
 // runWorker is the per-goroutine crawl loop. It pops entries from the frontier,
@@ -249,18 +284,48 @@ func (c *HTTPCrawler) runWorker(
 		// counter before returning, making dequeue+activate a single critical
 		// section. Callers only need MarkIdle() after processing completes.
 
+		// The page cap cancels the shared context, so a worker blocked in Pop can
+		// wake up holding an entry it must not fetch. Return it to the queue
+		// instead of dropping it — with the default concurrency this path was
+		// draining the entire pending queue, leaving cross-run resume with
+		// nothing to continue from (LAB-4678 Phase 4).
+		if ctx.Err() != nil {
+			frontier.Requeue(entry)
+			frontier.MarkIdle()
+			return
+		}
+
 		observed, links := c.fetchPage(ctx, client, limiter, entry)
 
+		// Not covered: either the fetch was canceled, or the budget filled while
+		// it was in flight and the result is about to be discarded below. Either
+		// way the page still needs crawling, so requeue it.
+		if observed == nil && ctx.Err() != nil {
+			frontier.Requeue(entry)
+			frontier.MarkIdle()
+			return
+		}
+
 		if observed != nil {
+			recorded := false
 			mu.Lock()
 			if *pageCount < maxPages {
 				*pageCount++
 				*results = append(*results, *observed)
+				recorded = true
 				if *pageCount >= maxPages {
 					cancel()
 				}
 			}
 			mu.Unlock()
+			// The budget filled while this fetch was in flight, so its result was
+			// dropped. The URL is already in seen, so without a requeue the page
+			// would be permanently uncrawlable on resume.
+			if !recorded {
+				frontier.Requeue(entry)
+				frontier.MarkIdle()
+				return
+			}
 		}
 
 		if len(links) > 0 {
