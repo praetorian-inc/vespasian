@@ -189,8 +189,171 @@ func TestDeduplicate_MergesSameEndpoint(t *testing.T) {
 	require.Len(t, result, 1)
 	// Highest confidence kept.
 	assert.InDelta(t, 0.85, result[0].Confidence, 0.001)
-	// First occurrence's body preserved.
-	assert.Equal(t, `[{"id":1}]`, string(result[0].Response.Body))
+	// LAB-4678: the retained response is selected deterministically (both are
+	// populated here, so CompareResponses decides), NOT by first-seen order.
+	// Assert order-independence rather than a specific body: swapping the input
+	// order must yield the identical retained response.
+	swapped := Deduplicate([]ClassifiedRequest{classified[1], classified[0]})
+	require.Len(t, swapped, 1)
+	assert.Equal(t, string(result[0].Response.Body), string(swapped[0].Response.Body),
+		"retained response must not depend on observation order")
+}
+
+func TestDeduplicate_ResponseSelection_PrefersPopulated(t *testing.T) {
+	// Same METHOD:path observed twice: one populated response and one empty
+	// (half-captured — no status/content-type/body). The populated response must
+	// always be retained, regardless of input order (LAB-4678, A4). Previously
+	// the first-seen observation's response was kept, so a half-captured
+	// observation arriving first would blank out the documented response.
+	populated := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: "GET",
+			URL:    "https://example.com/api/items",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Body:        []byte(`[{"id":1}]`),
+			},
+		},
+		IsAPI: true, Confidence: 0.8, APIType: "rest",
+	}
+	empty := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method:   "GET",
+			URL:      "https://example.com/api/items",
+			Response: crawl.ObservedResponse{}, // half-captured
+		},
+		IsAPI: true, Confidence: 0.15, APIType: "rest",
+	}
+
+	forward := Deduplicate([]ClassifiedRequest{populated, empty})
+	reverse := Deduplicate([]ClassifiedRequest{empty, populated})
+
+	require.Len(t, forward, 1)
+	require.Len(t, reverse, 1)
+	assert.Equal(t, `[{"id":1}]`, string(forward[0].Response.Body),
+		"populated response must be retained when it is seen first")
+	assert.Equal(t, `[{"id":1}]`, string(reverse[0].Response.Body),
+		"populated response must be retained even when the empty one is seen first")
+}
+
+func TestDeduplicate_ResponseSelection_TwoPopulatedOrderIndependent(t *testing.T) {
+	// Two distinct populated responses on the same endpoint collapse to one
+	// entry; the retained response is chosen by CompareResponses, so it is
+	// identical regardless of input order (LAB-4678, A4 tie-break).
+	a := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: "GET", URL: "https://example.com/api/items",
+			Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`{"a":1}`)},
+		}, IsAPI: true, Confidence: 0.8, APIType: "rest",
+	}
+	b := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: "GET", URL: "https://example.com/api/items",
+			Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`{"b":2}`)},
+		}, IsAPI: true, Confidence: 0.8, APIType: "rest",
+	}
+
+	fwd := Deduplicate([]ClassifiedRequest{a, b})
+	rev := Deduplicate([]ClassifiedRequest{b, a})
+	require.Len(t, fwd, 1)
+	require.Len(t, rev, 1)
+	assert.Equal(t, string(fwd[0].Response.Body), string(rev[0].Response.Body),
+		"CompareResponses tie-break must be independent of observation order")
+}
+
+// TestCompareResponses pins the ordering contract of the exported comparator
+// directly (QUAL-002): StatusCode, then ContentType, then Body via
+// bytes.Compare, returning -1/0/+1. pkg/generate/rest.buildOperation relies on
+// this for its group sort, so the rule is exercised here rather than only
+// indirectly through preferredResponse's outcome.
+func TestCompareResponses(t *testing.T) {
+	resp := func(status int, ct, body string) crawl.ObservedResponse {
+		return crawl.ObservedResponse{StatusCode: status, ContentType: ct, Body: []byte(body)}
+	}
+	tests := []struct {
+		name string
+		a, b crawl.ObservedResponse
+		want int
+	}{
+		{"lower status sorts first", resp(200, "", ""), resp(204, "", ""), -1},
+		{"higher status sorts last", resp(500, "", ""), resp(200, "", ""), 1},
+		{"status dominates content-type", resp(200, "text/xml", ""), resp(500, "application/json", ""), -1},
+		{"equal status, content-type breaks tie", resp(200, "application/json", ""), resp(200, "text/xml", ""), -1},
+		{"equal status, content-type breaks tie (reverse)", resp(200, "text/xml", ""), resp(200, "application/json", ""), 1},
+		{"equal status+ct, body breaks tie", resp(200, "application/json", `{"a":1}`), resp(200, "application/json", `{"b":2}`), -1},
+		{"equal status+ct, empty body sorts before non-empty", resp(200, "application/json", ""), resp(200, "application/json", "x"), -1},
+		{"fully equal returns 0", resp(200, "application/json", `{"a":1}`), resp(200, "application/json", `{"a":1}`), 0},
+		{"two zero values return 0", crawl.ObservedResponse{}, crawl.ObservedResponse{}, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, CompareResponses(tt.a, tt.b), "CompareResponses(a,b)")
+			// Antisymmetry: swapping arguments must negate the result, which is
+			// the property preferredResponse and sort.SliceStable rely on.
+			assert.Equal(t, -tt.want, CompareResponses(tt.b, tt.a), "CompareResponses(b,a) must negate")
+		})
+	}
+}
+
+func TestDeduplicate_ResponseSelection_PrefersCompletedBodylessStatus(t *testing.T) {
+	// A completed bodyless response (e.g. DELETE -> 204 No Content) has a
+	// positive status but no body or content-type, and must still be preferred
+	// over a half-captured zero-status placeholder for the same endpoint,
+	// regardless of order (Codex review). Otherwise the zero-status response is
+	// retained and OpenAPI generation defaults the missing status to 200,
+	// documenting the wrong status code.
+	completed := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method:   "DELETE",
+			URL:      "https://example.com/api/items/42",
+			Response: crawl.ObservedResponse{StatusCode: 204},
+		},
+		IsAPI: true, Confidence: 0.7, APIType: "rest",
+	}
+	halfCaptured := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method:   "DELETE",
+			URL:      "https://example.com/api/items/42",
+			Response: crawl.ObservedResponse{}, // status 0, no body/CT
+		},
+		IsAPI: true, Confidence: 0.7, APIType: "rest",
+	}
+
+	forward := Deduplicate([]ClassifiedRequest{completed, halfCaptured})
+	reverse := Deduplicate([]ClassifiedRequest{halfCaptured, completed})
+
+	require.Len(t, forward, 1)
+	require.Len(t, reverse, 1)
+	assert.Equal(t, 204, forward[0].Response.StatusCode,
+		"completed 204 must be retained when it is seen first")
+	assert.Equal(t, 204, reverse[0].Response.StatusCode,
+		"completed 204 must be retained even when the half-captured placeholder is seen first")
+}
+
+func TestDeduplicate_ReasonSelection_DeterministicOnEqualConfidence(t *testing.T) {
+	// Two observations of the same endpoint reach the same confidence via
+	// different signals, producing different Reason strings. The retained Reason
+	// must be a deterministic function of the observations, not of their order
+	// (Gemini review) — otherwise the -v classification explanation varies
+	// run-to-run for identical input.
+	a := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{Method: "POST", URL: "https://example.com/api/x"},
+		IsAPI:           true, Confidence: 0.7, APIType: "rest",
+		Reason: "path-heuristic+method:POST",
+	}
+	b := ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{Method: "POST", URL: "https://example.com/api/x"},
+		IsAPI:           true, Confidence: 0.7, APIType: "rest",
+		Reason: "path-heuristic+method:POST+request-signal:accept:application/json",
+	}
+
+	fwd := Deduplicate([]ClassifiedRequest{a, b})
+	rev := Deduplicate([]ClassifiedRequest{b, a})
+	require.Len(t, fwd, 1)
+	require.Len(t, rev, 1)
+	assert.Equal(t, fwd[0].Reason, rev[0].Reason,
+		"retained Reason must not depend on observation order")
 }
 
 func TestDeduplicate_MergesQueryParams(t *testing.T) {
