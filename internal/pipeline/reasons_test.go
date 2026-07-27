@@ -132,6 +132,45 @@ func TestLogClassificationReasons_SanitizesTerminalEscapes(t *testing.T) {
 	}
 }
 
+// TestLogNearMisses_SanitizesTerminalEscapes verifies the near-miss -v output
+// neutralizes control bytes too. Near-miss lines render the same untrusted
+// crawled path as the classified lines, so both share classificationLine and
+// the near-miss path must not become a second, unsanitized route to the
+// operator's terminal (SEC-BE-001, extended to the Phase 1 near-miss output).
+func TestLogNearMisses_SanitizesTerminalEscapes(t *testing.T) {
+	var buf bytes.Buffer
+	classifiers := []classify.APIClassifier{&classify.RESTClassifier{}}
+	// A GET on an api-like path with no captured response and no API Accept
+	// header scores the path boost alone (0.15) — inside the near-miss band
+	// [NearMissFloor, threshold), so it is dropped from the spec but logged.
+	//
+	// The control bytes are percent-encoded, which is how they actually reach
+	// this code: url.Parse REJECTS raw ASCII control characters outright (so a
+	// raw-byte URL would never classify at all), but percent-DECODES %1b/%0a
+	// into raw ESC and newline in u.Path — the decoded form classificationLine
+	// must neutralize.
+	requests := []crawl.ObservedRequest{
+		{Method: "GET", URL: "https://example.com/api/%1b[2J%0aitems"},
+	}
+	logNearMisses(&buf, classifiers, requests, classify.DefaultConfidenceThreshold)
+
+	out := buf.String()
+	if out == "" {
+		t.Fatal("expected a near-miss line for a path-boost-only api-path GET")
+	}
+	if strings.ContainsRune(out, '\x1b') {
+		t.Errorf("raw ESC byte reached terminal output: %q", out)
+	}
+	if !strings.Contains(out, `\x1b`) {
+		t.Errorf("control byte should be escaped as \\x1b: %q", out)
+	}
+	// One header line plus one endpoint line; the path's embedded newline must
+	// not split the record into a third.
+	if got := strings.Count(strings.TrimRight(out, "\n"), "\n"); got != 1 {
+		t.Errorf("path newline was not neutralized (log-splitting), %d line breaks: %q", got, out)
+	}
+}
+
 // TestLogClassificationReasons_NoOutput verifies the no-op guards: a nil writer
 // must not panic, and an empty slice produces no output.
 func TestLogClassificationReasons_NoOutput(t *testing.T) {
