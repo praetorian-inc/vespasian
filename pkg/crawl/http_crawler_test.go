@@ -188,23 +188,18 @@ func TestNewHTTPClient_ProxySecureByDefault(t *testing.T) {
 	}
 }
 
-// TestHTTPCrawler_RoutesThroughProxy is an end-to-end check that the HTTP
-// backend sends its requests through the configured proxy. The proxy runs on
-// loopback, which the SSRF dial guard would reject — so a successful crawl
-// proves the guard is correctly skipped when --proxy is set (LAB-4011).
-func TestHTTPCrawler_RoutesThroughProxy(t *testing.T) {
-	// Origin server the proxy will forward to.
-	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprint(w, "<html><body>ok</body></html>")
-	}))
-	defer origin.Close()
-
-	// A minimal forwarding proxy on loopback. It records that it was used and
-	// proxies the (plain http) request to the origin.
-	var proxied atomic.Int64
+// newRecordingProxy starts a forwarding httptest proxy that increments a
+// counter for every request it forwards and copies the upstream response's
+// status code and body through (headers are not forwarded — neither current
+// caller needs them). Registers its own t.Cleanup, so callers don't need a
+// deferred stop. Shared by http_crawler_test.go and jsreplay_test.go
+// (TEST-007); mirrors internal/pipeline/pipeline_test.go's helper of the
+// same name.
+func newRecordingProxy(t *testing.T) (proxyURL *url.URL, hits *atomic.Int64) {
+	t.Helper()
+	hits = &atomic.Int64{}
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		proxied.Add(1)
+		hits.Add(1)
 		outReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.RequestURI, nil) //nolint:gosec // test proxy forwards the received request URI
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -217,15 +212,36 @@ func TestHTTPCrawler_RoutesThroughProxy(t *testing.T) {
 		}
 		defer resp.Body.Close() //nolint:errcheck // test cleanup
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body) //nolint:gosec // test best-effort
+		_, _ = io.Copy(w, resp.Body) //nolint:errcheck,gosec // test proxy
 	}))
-	defer proxy.Close()
+	t.Cleanup(proxy.Close)
+
+	u, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	return u, hits
+}
+
+// TestHTTPCrawler_RoutesThroughProxy is an end-to-end check that the HTTP
+// backend sends its requests through the configured proxy. The proxy runs on
+// loopback, which the SSRF dial guard would reject — so a successful crawl
+// proves the guard is correctly skipped when --proxy is set (LAB-4011).
+func TestHTTPCrawler_RoutesThroughProxy(t *testing.T) {
+	// Origin server the proxy will forward to.
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<html><body>ok</body></html>")
+	}))
+	defer origin.Close()
+
+	proxyURL, hits := newRecordingProxy(t)
 
 	c := &HTTPCrawler{opts: CrawlerOptions{
 		Depth:    0,
 		MaxPages: 1,
 		Timeout:  10 * time.Second,
-		Proxy:    proxy.URL, // loopback proxy — blocked by ssrf dial guard unless skipped
+		Proxy:    proxyURL.String(), // loopback proxy — blocked by ssrf dial guard unless skipped
 		// AllowPrivate lets the loopback httptest origin pass the upfront scope
 		// check (which is independent of --proxy: proxy relaxes only the
 		// dial-time IP pin, not URL scope). The proxy branch is still exercised.
@@ -236,7 +252,7 @@ func TestHTTPCrawler_RoutesThroughProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Crawl error = %v", err)
 	}
-	if proxied.Load() == 0 {
+	if hits.Load() == 0 {
 		t.Error("proxy was not used; request did not route through --proxy")
 	}
 	if len(results) == 0 {

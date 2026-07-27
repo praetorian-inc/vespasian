@@ -146,7 +146,7 @@ func (cfg JSReplayConfig) withDefaults() JSReplayConfig {
 			// not the target). This is the production path; an injected Client
 			// deliberately opts out of Proxy (wrapClientWithSSRF would clobber a
 			// proxied dialer — architecture.md §1).
-			cfg.Client = httpx.BuildHTTPClient(cfg.Proxy, cfg.Timeout, noRedirect)
+			cfg.Client = httpx.BuildHTTPClient(cfg.Proxy, cfg.Timeout, httpx.NoFollowRedirects)
 		} else {
 			cfg.Client = newSSRFSafeClient(cfg.Timeout, cfg.AllowPrivate)
 		}
@@ -167,17 +167,9 @@ func (cfg JSReplayConfig) withDefaults() JSReplayConfig {
 				cfg.Client.Timeout = cfg.Timeout
 			}
 		}
-		cfg.Client.CheckRedirect = noRedirect
+		cfg.Client.CheckRedirect = httpx.NoFollowRedirects
 	}
 	return cfg
-}
-
-// noRedirect is the redirect policy used by ReplayJSExtracted's HTTP client.
-// It causes Go's http.Client to return 3xx responses verbatim instead of
-// auto-following them; probeURL needs the actual response from the URL we
-// asked for, and fetchJSBody manages its own bounded redirect-follow loop.
-func noRedirect(*http.Request, []*http.Request) error {
-	return http.ErrUseLastResponse
 }
 
 // wrapClientWithSSRF returns a copy of caller with its transport replaced by
@@ -268,7 +260,7 @@ func newSSRFSafeClient(timeout time.Duration, allowPrivate bool) *http.Client {
 	return &http.Client{
 		Timeout:       timeout,
 		Transport:     transport,
-		CheckRedirect: noRedirect,
+		CheckRedirect: httpx.NoFollowRedirects,
 	}
 }
 

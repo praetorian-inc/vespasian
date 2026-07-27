@@ -3129,7 +3129,37 @@ func TestJSReplayConfig_WithDefaults_ProxyClient(t *testing.T) {
 	require.NotNil(t, cfg.Client.CheckRedirect)
 	gotErr := cfg.Client.CheckRedirect(nil, nil)
 	assert.True(t, errors.Is(gotErr, http.ErrUseLastResponse),
-		"proxied client must keep the replay step's noRedirect policy")
+		"proxied client must keep the replay step's httpx.NoFollowRedirects policy")
+
+	// TEST-011: Config.Proxy.Insecure must survive the
+	// withDefaults->BuildHTTPClient hop for an http/https proxy, but never for
+	// socks5 (a transparent TCP tunnel with no substitute CA to trust).
+	t.Run("http proxy Insecure=true", func(t *testing.T) {
+		insecureURL, err := url.Parse("http://127.0.0.1:8080")
+		require.NoError(t, err)
+
+		insecureCfg := JSReplayConfig{Proxy: httpx.ProxyConfig{URL: insecureURL, Insecure: true}}.withDefaults()
+
+		insecureTr, ok := insecureCfg.Client.Transport.(*http.Transport)
+		require.True(t, ok, "Transport must be *http.Transport, got %T", insecureCfg.Client.Transport)
+		require.NotNil(t, insecureTr.TLSClientConfig, "Insecure=true must install a TLSClientConfig")
+		assert.True(t, insecureTr.TLSClientConfig.InsecureSkipVerify,
+			"Config.Proxy.Insecure must survive the withDefaults->BuildHTTPClient hop for an http/https proxy")
+	})
+
+	t.Run("socks5 proxy Insecure=true stays verified", func(t *testing.T) {
+		socksURL, err := url.Parse("socks5://127.0.0.1:1080")
+		require.NoError(t, err)
+
+		socksCfg := JSReplayConfig{Proxy: httpx.ProxyConfig{URL: socksURL, Insecure: true}}.withDefaults()
+
+		socksTr, ok := socksCfg.Client.Transport.(*http.Transport)
+		require.True(t, ok, "Transport must be *http.Transport, got %T", socksCfg.Client.Transport)
+		if socksTr.TLSClientConfig != nil {
+			assert.False(t, socksTr.TLSClientConfig.InsecureSkipVerify,
+				"socks5 is a transparent tunnel; Insecure must never skip verification of the real target")
+		}
+	})
 }
 
 // TestJSReplayConfig_WithDefaults_NoProxyUnchanged verifies that a zero-value
@@ -3170,27 +3200,7 @@ func TestReplayJSExtracted_RoutesThroughProxy(t *testing.T) {
 	}))
 	defer origin.Close()
 
-	var proxied atomic.Int64
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		proxied.Add(1)
-		outReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.RequestURI, nil) //nolint:gosec // test proxy forwards the received request URI
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		resp, err := http.DefaultTransport.RoundTrip(outReq)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close() //nolint:errcheck // test cleanup
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body) //nolint:errcheck,gosec // test best-effort
-	}))
-	defer proxy.Close()
-
-	proxyURL, err := url.Parse(proxy.URL)
-	require.NoError(t, err)
+	proxyURL, hits := newRecordingProxy(t)
 
 	requests := []ObservedRequest{
 		{
@@ -3219,5 +3229,5 @@ func TestReplayJSExtracted_RoutesThroughProxy(t *testing.T) {
 		}
 	}
 	assert.Contains(t, apiURLs, origin.URL+"/api/v1/products")
-	assert.NotZero(t, proxied.Load(), "JS-replay must route its fetches through the configured proxy")
+	assert.NotZero(t, hits.Load(), "JS-replay must route its fetches through the configured proxy")
 }

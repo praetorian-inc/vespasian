@@ -17,12 +17,10 @@ package pipeline_test
 import (
 	"bytes"
 	"context"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -364,24 +362,7 @@ func TestResolveWSDLType_SSRFGate_AllowPrivateFalse(t *testing.T) {
 func TestProbeWSDLDocument_RoutesThroughProxy(t *testing.T) {
 	ts := wsdlServer(t)
 
-	var proxied atomic.Int64
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		proxied.Add(1)
-		outReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.RequestURI, nil) //nolint:gosec // test proxy forwards the received request URI
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		resp, err := http.DefaultTransport.RoundTrip(outReq)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close() //nolint:errcheck // test cleanup
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body) //nolint:errcheck,gosec // test best-effort
-	}))
-	defer proxy.Close()
+	proxy, hits := newRecordingProxy(t, true)
 
 	proxyURL, err := url.Parse(proxy.URL)
 	require.NoError(t, err)
@@ -389,5 +370,5 @@ func TestProbeWSDLDocument_RoutesThroughProxy(t *testing.T) {
 	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/svc", true, httpx.ProxyConfig{URL: proxyURL}, nil)
 	require.NotNil(t, doc, "expected non-nil WSDL bytes when fetched through the proxy")
 	assert.True(t, strings.Contains(string(doc), "Calculator"))
-	assert.NotZero(t, proxied.Load(), "WSDL fetch must route through the configured proxy")
+	assert.NotZero(t, hits.Load(), "WSDL fetch must route through the configured proxy")
 }

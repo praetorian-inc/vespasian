@@ -234,16 +234,12 @@ func (p *GRPCProbe) probeTarget(ctx context.Context, t grpcTargetInfo) *classify
 // dial tunnels through the proxy (HTTP CONNECT or SOCKS5); otherwise it uses the
 // configured SSRF-safe Dialer.
 func (p *GRPCProbe) dialGRPC(t grpcTargetInfo) (*grpc.ClientConn, error) {
-	// --proxy-insecure skips TLS verification of the target ONLY for an
-	// http/https (MITM) proxy that substitutes its own CA; socks5 is a
-	// transparent tunnel so verification is always kept for it — mirrors
-	// httpx.BuildHTTPClient / crawl's proxy TLS gating.
+	// Target-cert verification is governed SOLELY by --grpc-insecure-skip-verify.
+	// --proxy-insecure does NOT relax it (SEC-BE-004 decouple): the reflection
+	// dial still tunnels through the proxy (SSRF preflight + proxy dialer are
+	// unchanged via grpcDialer), but an intercepting proxy's --proxy-insecure
+	// never silently disables verification of the gRPC target's own certificate.
 	insecureSkip := p.config.GRPCInsecureSkipVerify
-	if p.config.Proxy.Enabled() && p.config.Proxy.Insecure {
-		if s := p.config.Proxy.URL.Scheme; s == "http" || s == "https" {
-			insecureSkip = true
-		}
-	}
 
 	var creds credentials.TransportCredentials
 	if t.useTLS {

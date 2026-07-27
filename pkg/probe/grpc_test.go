@@ -1130,16 +1130,19 @@ func TestGRPCProbe_RoutesThroughHTTPConnectProxy(t *testing.T) {
 	assert.Equal(t, addr, recordedTarget(), "proxy must have recorded a CONNECT to the gRPC target")
 }
 
-// TestGRPCProbe_ProxyInsecureTLSGating is the AC-2 proof for gRPC:
-// Proxy.Insecure skips TLS verification for the tunneled dial ONLY when the
-// proxy scheme is http/https (MITM proxy substitutes its own CA); a socks5
-// proxy is a transparent tunnel and must keep verification regardless of
-// Proxy.Insecure — only GRPCInsecureSkipVerify governs socks5.
+// TestGRPCProbe_ProxyInsecureTLSGating is the AC-2/SEC-BE-004 proof for gRPC:
+// target-certificate verification is governed SOLELY by
+// GRPCInsecureSkipVerify. Proxy.Insecure no longer relaxes it — even through
+// an http/https (MITM) proxy — because Proxy.Insecure's job is limited to the
+// intercepting proxy's OWN substituted CA (BuildHTTPClient's TLS posture
+// toward the proxy), not the gRPC target's certificate. socks5 is unaffected
+// either way: it is a transparent tunnel, so verification of the target was
+// never influenced by Proxy.Insecure for it.
 func TestGRPCProbe_ProxyInsecureTLSGating(t *testing.T) {
 	addr, stop := startTestGRPCServerTLS(t)
 	defer stop()
 
-	t.Run("http_proxy_insecure_skips_verify", func(t *testing.T) {
+	t.Run("http_proxy_insecure_alone_does_not_skip_verify", func(t *testing.T) {
 		proxyAddr, _, stopProxy := startRecordingCONNECTProxy(t, addr)
 		defer stopProxy()
 
@@ -1147,9 +1150,10 @@ func TestGRPCProbe_ProxyInsecureTLSGating(t *testing.T) {
 		require.NoError(t, err)
 
 		cfg := Config{
-			Timeout:      5 * time.Second,
-			URLValidator: func(string) error { return nil },
-			Proxy:        httpx.ProxyConfig{URL: proxyURL, Insecure: true},
+			Timeout:                5 * time.Second,
+			URLValidator:           func(string) error { return nil },
+			Proxy:                  httpx.ProxyConfig{URL: proxyURL, Insecure: true},
+			GRPCInsecureSkipVerify: false,
 		}
 		p := NewGRPCProbe(cfg)
 
@@ -1162,7 +1166,35 @@ func TestGRPCProbe_ProxyInsecureTLSGating(t *testing.T) {
 		result, err := p.Probe(ctx, endpoints)
 		require.NoError(t, err)
 		require.Len(t, result, 1)
-		require.NotNil(t, result[0].GRPCSchema, "http/https proxy with Insecure=true must skip verification of the self-signed cert")
+		assert.Nil(t, result[0].GRPCSchema,
+			"http/https proxy Insecure=true must NOT skip target verification on its own (SEC-BE-004 decouple); the self-signed cert must fail verification")
+	})
+
+	t.Run("grpc_insecure_skip_verify_skips_regardless_of_proxy", func(t *testing.T) {
+		proxyAddr, _, stopProxy := startRecordingCONNECTProxy(t, addr)
+		defer stopProxy()
+
+		proxyURL, err := url.Parse("http://" + proxyAddr)
+		require.NoError(t, err)
+
+		cfg := Config{
+			Timeout:                5 * time.Second,
+			URLValidator:           func(string) error { return nil },
+			Proxy:                  httpx.ProxyConfig{URL: proxyURL, Insecure: false},
+			GRPCInsecureSkipVerify: true,
+		}
+		p := NewGRPCProbe(cfg)
+
+		endpoints := []classify.ClassifiedRequest{{APIType: "grpc"}}
+		endpoints[0].URL = "https://" + addr + "/grpc.health.v1.Health/Check"
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		result, err := p.Probe(ctx, endpoints)
+		require.NoError(t, err)
+		require.Len(t, result, 1)
+		require.NotNil(t, result[0].GRPCSchema, "GRPCInsecureSkipVerify=true must skip verification of the self-signed cert regardless of Proxy.Insecure")
 		assert.True(t, result[0].GRPCSchema.ReflectionEnabled)
 	})
 

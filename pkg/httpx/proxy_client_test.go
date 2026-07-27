@@ -83,6 +83,11 @@ func TestBuildHTTPClient_InsecureOnlyForHTTPScheme(t *testing.T) {
 				"TLSClientConfig must be installed when Insecure=true for a %s proxy", scheme)
 			assert.True(t, tr.TLSClientConfig.InsecureSkipVerify,
 				"InsecureSkipVerify must be true for a %s proxy with Insecure=true", scheme)
+			// TEST-008: guards the GHAS MinVersion fix — InsecureSkipVerify must
+			// never come bundled with a permissive (or unset/zero) minimum TLS
+			// version.
+			assert.Equal(t, uint16(tls.VersionTLS12), tr.TLSClientConfig.MinVersion,
+				"MinVersion must be pinned to TLS 1.2 even when InsecureSkipVerify is true for a %s proxy", scheme)
 		})
 	}
 }
@@ -412,19 +417,20 @@ func TestProxyDialer_UnsupportedScheme(t *testing.T) {
 	assert.Error(t, err, "an unsupported proxy scheme must be rejected")
 }
 
-// TestProxyDialer_RejectsCRLFInAddr is a regression test for a CRLF-injection
-// gap (LAB-4993 review): connectDialer builds the CONNECT request via
-// fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", addr, addr) with no
-// validation that addr is free of "\r\n". An addr containing CRLF lets an
-// attacker inject extra header lines (or a second smuggled request) into the
-// bytes written to the proxy connection.
+// TestProxyDialer_RejectsCRLFInAddr is a regression guard for a
+// CRLF-injection gap (LAB-4993 review): connectDialer builds the CONNECT
+// request via fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", addr,
+// addr), so an addr containing "\r\n" could inject extra header lines (or a
+// second smuggled request) into the bytes written to the proxy connection.
+// The shipped guard (strings.ContainsAny(addr, "\r\n") in connectDialer,
+// proxy_client.go:153) rejects such an addr before it ever reaches the
+// CONNECT request line.
 //
 // The stub "proxy" below is deliberately naive: it replies "200 Connection
 // established" without inspecting the request at all. So a *successful*
-// ProxyDialer round-trip against it can only mean the client happily wrote
-// the CRLF-laden addr onto the wire — proving no client-side validation
-// exists. Once addr validation is added, ProxyDialer must reject the target
-// before ever dialing/writing, so the call fails locally instead.
+// ProxyDialer round-trip against it can only mean the client wrote the
+// CRLF-laden addr onto the wire unvalidated — if this guard is ever removed,
+// dialErr below would be nil and this test would fail.
 func TestProxyDialer_RejectsCRLFInAddr(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -454,23 +460,31 @@ func TestProxyDialer_RejectsCRLFInAddr(t *testing.T) {
 			"(the naive stub proxy accepts anything, so a nil error here proves the CRLF payload went out unvalidated)")
 }
 
-// TestProxyDialer_ConnectResponseRespectsContextDeadline is a regression test
-// for an unbounded-read gap (LAB-4993 review, LOW): connectDialer's read of
-// the CONNECT response (http.ReadResponse(br, ...)) is never wired to ctx —
-// no SetReadDeadline derived from ctx, no goroutine closing conn on
-// ctx.Done(). A proxy that completes the TCP handshake but never sends a
-// status line therefore hangs the dial indefinitely, ignoring the caller's
-// context deadline entirely.
+// TestProxyDialer_ConnectResponseRespectsContextDeadline is a regression
+// guard for an unbounded-read gap (LAB-4993 review, LOW): connectDialer's
+// read of the CONNECT response (http.ReadResponse(br, ...)) must not hang
+// past the caller's context. connectHandshake wires a ctx deadline into
+// conn.SetDeadline (proxy_client.go), and connectDialer's ctx.Done() watcher
+// goroutine closes conn to unblock an in-flight handshake for a deadline-less
+// cancel. A proxy that completes the TCP handshake but never sends a status
+// line must therefore still have its dial fail once ctx expires/cancels,
+// rather than hanging indefinitely.
 //
 // The stub "proxy" here accepts the connection and then sits silent past the
 // test's own bound, simulating exactly that. The dial call runs in a
-// goroutine so this test itself cannot hang forever even while the
-// production bug is present; the outer select's time.After is the test's own
+// goroutine so this test itself cannot hang forever even if the ctx wiring
+// were ever removed; the outer select's time.After is the test's own
 // deterministic ceiling, independent of whether ctx is honored.
 func TestProxyDialer_ConnectResponseRespectsContextDeadline(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer ln.Close() //nolint:errcheck // test cleanup
+
+	// stop, closed via t.Cleanup, bounds the stub proxy's lifetime to this
+	// test's own duration instead of a wall-clock sleep (TEST-010): no race
+	// against a fixed duration, and no leaked goroutine/fd past the test.
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
 
 	go func() {
 		conn, err := ln.Accept()
@@ -478,9 +492,9 @@ func TestProxyDialer_ConnectResponseRespectsContextDeadline(t *testing.T) {
 			return
 		}
 		defer conn.Close() //nolint:errcheck // test cleanup
-		// Deliberately never write a response; hold the connection open well
-		// past this test's own bound to simulate a slow/malicious proxy.
-		time.Sleep(5 * time.Second)
+		// Deliberately never write a response; hold the connection open until
+		// the test itself is done, to simulate a slow/malicious proxy.
+		<-stop
 	}()
 
 	proxyURL, err := url.Parse("http://" + ln.Addr().String())
@@ -685,6 +699,12 @@ func TestProxyDialer_ConnectHandshakeRespectsContextCancel(t *testing.T) {
 	// connection, so the test can cancel() deterministically right after the
 	// handshake is in flight instead of guessing a wall-clock sleep duration.
 	accepted := make(chan struct{})
+	// stop, closed via t.Cleanup, bounds the stub proxy's silence to this
+	// test's own duration (TEST-010): the old `<-make(chan struct{})` never
+	// closed, so the goroutine's `defer conn.Close()` never ran and both the
+	// goroutine and its fd leaked past the test.
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
 
 	go func() {
 		conn, err := ln.Accept()
@@ -694,7 +714,7 @@ func TestProxyDialer_ConnectHandshakeRespectsContextCancel(t *testing.T) {
 		close(accepted)
 		defer conn.Close() //nolint:errcheck // test cleanup
 		// Stay silent forever; never write a CONNECT response status line.
-		<-make(chan struct{})
+		<-stop
 	}()
 
 	proxyURL, err := url.Parse("http://" + ln.Addr().String())
@@ -742,6 +762,13 @@ func TestProxyDialer_ConnectPreservesPipelinedBytes(t *testing.T) {
 	require.NoError(t, err)
 	defer ln.Close() //nolint:errcheck // test cleanup
 
+	// stop, closed via t.Cleanup, keeps the stub proxy's connection open for
+	// this test's own duration instead of a fixed 200ms sleep (TEST-010):
+	// removes the race window where a slow reader could read past the sleep
+	// and see a closed conn, deterministically.
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -766,8 +793,9 @@ func TestProxyDialer_ConnectPreservesPipelinedBytes(t *testing.T) {
 		if _, err := conn.Write([]byte(reply)); err != nil {
 			return
 		}
-		// Keep the connection open briefly so the client can read before we exit.
-		time.Sleep(200 * time.Millisecond)
+		// Keep the connection open until the test itself is done, so the
+		// client can read at its own pace.
+		<-stop
 	}()
 
 	proxyURL, err := url.Parse("http://" + ln.Addr().String())
@@ -838,19 +866,34 @@ func TestProxyDialer_ConnectCancelAfterSuccessKeepsConnUsable(t *testing.T) {
 }
 
 // fakeConn is a minimal net.Conn stub for TestResolveConnectResult: it tracks
-// Close() calls without a real network connection. Every other net.Conn
+// Close() calls, and optionally serves canned bytes from Read/records bytes
+// passed to Write, without a real network connection. Every other net.Conn
 // method is satisfied by the embedded (nil) net.Conn and is never invoked by
-// resolveConnectResult — on the pipelined-bytes path the returned
-// *bufferedConn.Read reads from its own *bufio.Reader, never from the
-// embedded conn, so a nil embed is safe here.
+// resolveConnectResult.
 type fakeConn struct {
 	net.Conn
 	closeCalls atomic.Int32
+	readData   []byte // remaining bytes to hand back from Read, if any
+	written    []byte // bytes captured from Write calls
 }
 
 func (c *fakeConn) Close() error {
 	c.closeCalls.Add(1)
 	return nil
+}
+
+func (c *fakeConn) Read(b []byte) (int, error) {
+	if len(c.readData) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(b, c.readData)
+	c.readData = c.readData[n:]
+	return n, nil
+}
+
+func (c *fakeConn) Write(b []byte) (int, error) {
+	c.written = append(c.written, b...)
+	return len(b), nil
 }
 
 // TestResolveConnectResult is a deterministic, table-driven regression guard
@@ -890,14 +933,31 @@ func TestResolveConnectResult(t *testing.T) {
 			},
 		},
 		{
+			// SEC-BE-003: resolveConnectResult ALWAYS wraps the conn in a
+			// *bufferedConn now (transparent — never the raw conn), even when
+			// nothing was pipelined. br has nothing buffered yet (a freshly
+			// constructed bufio.Reader over conn), so a Read must fall through
+			// to conn.Read, and a Write must reach conn.Write directly (writes
+			// bypass br entirely — bufferedConn only overrides Read).
 			name: "success, no buffered bytes",
 			setup: func(t *testing.T) (context.Context, *fakeConn, *bufio.Reader, error) {
-				return context.Background(), &fakeConn{}, bufio.NewReader(bytes.NewReader(nil)), nil
+				conn := &fakeConn{readData: []byte("read-through-ok")}
+				return context.Background(), conn, bufio.NewReader(conn), nil
 			},
 			check: func(t *testing.T, conn *fakeConn, gotConn net.Conn, gotErr error) {
 				require.NoError(t, gotErr)
-				assert.Same(t, conn, gotConn, "expected the plain conn back (no bufferedConn wrap) when nothing was buffered")
+				bc, ok := gotConn.(*bufferedConn)
+				require.True(t, ok, "resolveConnectResult must always return a *bufferedConn, got %T", gotConn)
 				assert.Equal(t, int32(0), conn.closeCalls.Load(), "conn must not be closed on success")
+
+				buf := make([]byte, len("read-through-ok"))
+				n, err := bc.Read(buf)
+				require.NoError(t, err)
+				assert.Equal(t, "read-through-ok", string(buf[:n]), "Read must fall through br to the underlying conn")
+
+				_, err = bc.Write([]byte("write-through-ok"))
+				require.NoError(t, err)
+				assert.Equal(t, "write-through-ok", string(conn.written), "Write must reach the underlying conn directly")
 			},
 		},
 		{

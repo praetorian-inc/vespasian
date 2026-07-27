@@ -37,15 +37,6 @@ func writeStatus(w io.Writer, format string, args ...any) {
 	fmt.Fprintf(w, format, args...) //nolint:errcheck,gosec // best-effort status output
 }
 
-// noFollowRedirects is the pipeline package's shared redirect policy: return
-// http.ErrUseLastResponse so the caller sees the redirect response itself rather
-// than following it. Mirrors probe.probeRedirectPolicy; referenced by
-// buildWSDLProbeClient (both branches) and the ClassifyProbeGenerate
-// allow-private client so the WSDL/probe redirect posture lives in one place.
-func noFollowRedirects(*http.Request, []*http.Request) error {
-	return http.ErrUseLastResponse
-}
-
 // wsdlStageTimeout caps each connection phase (TLS handshake, response header)
 // independently of the overall Client.Timeout, so a slow or malicious target
 // can't burn the whole budget on a single stage. Both transport branches share
@@ -59,7 +50,7 @@ const wsdlStageTimeout = 10 * time.Second
 // AllowPrivate probes elsewhere.
 func buildWSDLProbeClient(allowPrivate bool, proxy httpx.ProxyConfig) *http.Client {
 	if proxy.Enabled() {
-		return httpx.BuildHTTPClient(proxy, 15*time.Second, noFollowRedirects)
+		return httpx.BuildHTTPClient(proxy, 15*time.Second, httpx.NoFollowRedirects)
 	}
 	transport := &http.Transport{
 		DialContext:           probe.SSRFSafeDialContext,
@@ -75,7 +66,7 @@ func buildWSDLProbeClient(allowPrivate bool, proxy httpx.ProxyConfig) *http.Clie
 	return &http.Client{
 		Timeout:       15 * time.Second,
 		Transport:     transport,
-		CheckRedirect: noFollowRedirects,
+		CheckRedirect: httpx.NoFollowRedirects,
 	}
 }
 
@@ -83,6 +74,11 @@ func buildWSDLProbeClient(allowPrivate bool, proxy httpx.ProxyConfig) *http.Clie
 // Returns the raw WSDL bytes on success, or nil if the probe fails or the
 // response is not a valid WSDL document. status is an optional io.Writer
 // for progress messages; pass nil or io.Discard to suppress them.
+//
+// proxy routes the WSDL fetch through an intercepting proxy when set (the zero
+// value means unproxied); the proxied client carries no dial-time SSRF pin (we
+// dial the proxy, not the target), so the URL-level ValidateProbeURL check above
+// remains the scope guard — mirroring probe.Config.Proxy.
 func ProbeWSDLDocument(ctx context.Context, targetURL string, allowPrivate bool, proxy httpx.ProxyConfig, status io.Writer) []byte {
 	parsedURL, err := url.Parse(targetURL)
 	if err != nil {
@@ -151,6 +147,10 @@ func ProbeWSDLDocument(ctx context.Context, targetURL string, allowPrivate bool,
 //
 // This helper is the single source of truth for WSDL discovery shared by
 // ScanCmd.Run (cmd/vespasian/main.go) and Capability.runScan (pkg/sdk).
+//
+// proxy routes the WSDL fetch through an intercepting proxy when set (the zero
+// value means unproxied); the proxied client carries no dial-time SSRF pin, so
+// URL-level validation remains the scope guard — mirroring probe.Config.Proxy.
 func ProbeAndAppendWSDLRequest(ctx context.Context, targetURL string, requests []crawl.ObservedRequest, allowPrivate bool, proxy httpx.ProxyConfig, status io.Writer) ([]crawl.ObservedRequest, bool, string) {
 	wsdlDoc := ProbeWSDLDocument(ctx, targetURL, allowPrivate, proxy, status)
 	if wsdlDoc == nil {
@@ -187,6 +187,10 @@ func ProbeAndAppendWSDLRequest(ctx context.Context, targetURL string, requests [
 // original requests slice and apiType are returned unchanged. It returns the
 // (possibly augmented) requests, the resolved API type, and whether a WSDL
 // document was found.
+//
+// proxy routes the WSDL fetch through an intercepting proxy when set (the zero
+// value means unproxied); the proxied client carries no dial-time SSRF pin, so
+// URL-level validation remains the scope guard — mirroring probe.Config.Proxy.
 func ResolveWSDLType(ctx context.Context, targetURL, apiType string, requests []crawl.ObservedRequest, probe, allowPrivate bool, proxy httpx.ProxyConfig, status io.Writer) ([]crawl.ObservedRequest, string, bool) {
 	if !probe || (apiType != APITypeWSDL && apiType != APITypeREST) {
 		return requests, apiType, false

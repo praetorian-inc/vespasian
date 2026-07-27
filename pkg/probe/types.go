@@ -154,20 +154,13 @@ func (cfg Config) withDefaults() Config {
 			// not the target). A client-level Timeout stands in for the stage
 			// timeouts that DefaultTransport() carries but a cloned
 			// DefaultTransport does not (mirrors the crawl proxy client).
-			cfg.Client = httpx.BuildHTTPClient(cfg.Proxy, cfg.Timeout, probeRedirectPolicy)
+			cfg.Client = httpx.BuildHTTPClient(cfg.Proxy, cfg.Timeout, httpx.NoFollowRedirects)
 		} else {
 			cfg.Client = &http.Client{
-				CheckRedirect: probeRedirectPolicy,
+				CheckRedirect: httpx.NoFollowRedirects,
 				Transport:     DefaultTransport(),
 			}
 		}
 	}
 	return cfg
-}
-
-// probeRedirectPolicy is the redirect policy shared by probe HTTP clients: stop
-// at the first response (return ErrUseLastResponse) rather than following
-// redirects, so probes observe the target's own status/headers.
-func probeRedirectPolicy(*http.Request, []*http.Request) error {
-	return http.ErrUseLastResponse
 }

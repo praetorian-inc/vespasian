@@ -53,7 +53,7 @@ type Options struct {
 	// HTTPClient is the client used for sourcemap fetches.
 	//
 	// When set, Analyze wraps the caller's client in a shallow copy that overlays
-	// both noFollowRedirects (so a .js.map URL cannot 302 to an attacker host and
+	// both httpx.NoFollowRedirects (so a .js.map URL cannot 302 to an attacker host and
 	// bypass the sameHost pre-flight check) and an SSRF-safe DialContext matching
 	// the posture of the default client (probe.SSRFSafeDialContext, or a
 	// permissive dialer when AllowPrivate is true). The caller's original client

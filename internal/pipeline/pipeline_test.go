@@ -454,29 +454,33 @@ func TestClassifyProbeGenerate_ProxyReachesProbe(t *testing.T) {
 	assert.NotZero(t, hits.Load(), "probe stage must route through the configured proxy")
 }
 
-// TestClassifyProbeGenerate_ProxyAndAllowPrivate_ProxyWins pins the precedence
-// contract from architecture.md §3: when both Proxy and AllowPrivate are set,
-// the proxy transport must still be used (AllowPrivate only relaxes the
-// URL-level validator, it must NOT skip the proxied-client construction). If
-// the AllowPrivate branch built its own permissive client instead of leaving
-// Client nil for the proxy path, this loopback origin would still be reached
-// directly and the recording proxy would see zero hits.
-func TestClassifyProbeGenerate_ProxyAndAllowPrivate_ProxyWins(t *testing.T) {
+// TestClassifyProbeGenerate_ProxiedLoopback_RequiresAllowPrivate is the
+// TEST-003 proof for the URL-level SSRF gate on the proxied probe path (the
+// AllowPrivate=true + Proxy combination is already covered by
+// TestClassifyProbeGenerate_ProxyReachesProbe above, so this covers the
+// previously-untested AllowPrivate=false side): buildProbeConfig leaves the
+// default URLValidator installed whenever AllowPrivate is false, proxied or
+// not — the proxied client itself carries no dial-time SSRF pin (we dial the
+// proxy, not the target), so that URL-level validator is the only remaining
+// scope guard for a private/loopback target. It must reject the target BEFORE
+// any request reaches the proxy — the recording proxy seeing zero hits is the
+// strongest proof the validator runs before any network I/O. Mirrors
+// TestSourcemap_ProxiedFetch_AllowPrivateGate (jsstatic package).
+func TestClassifyProbeGenerate_ProxiedLoopback_RequiresAllowPrivate(t *testing.T) {
 	origin := optionsOrigin(t)
 	proxy, hits := newRecordingProxy(t, false)
 
 	proxyURL, err := url.Parse(proxy.URL)
 	require.NoError(t, err)
 
-	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), restRequestsForOrigin(origin.URL), pipeline.Options{
+	_, err = pipeline.ClassifyProbeGenerate(context.Background(), restRequestsForOrigin(origin.URL), pipeline.Options{
 		APIType:      pipeline.APITypeREST,
 		Confidence:   0.5,
 		Probe:        true,
-		AllowPrivate: true, // private/loopback target — must still be reachable
+		AllowPrivate: false, // private/loopback target — the URL validator must reject it
 		Proxy:        httpx.ProxyConfig{URL: proxyURL},
 	})
-	require.NoError(t, err)
-	require.NotEmpty(t, spec, "the private (loopback) target must be reachable with AllowPrivate=true")
+	require.NoError(t, err, "a rejected probe target is a warning, not a whole-pipeline error")
 
-	assert.NotZero(t, hits.Load(), "proxy must win over AllowPrivate's permissive-client branch")
+	assert.Zero(t, hits.Load(), "the URL validator must reject the private-host target before the proxy is ever contacted")
 }

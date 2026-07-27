@@ -3394,6 +3394,19 @@ func TestBuildJSReplayConfig_SetsProxy(t *testing.T) {
 	cfg := buildJSReplayConfig(map[string]string{}, "https://example.com", false, false, httpx.ProxyConfig{URL: proxyURL})
 	require.NotNil(t, cfg.Proxy.URL, "buildJSReplayConfig must set JSReplayConfig.Proxy from the proxy argument")
 	require.Equal(t, proxyURL, cfg.Proxy.URL)
+
+	// TEST-002: the proxy argument's Insecure flag must reach
+	// JSReplayConfig.Proxy.Insecure too, both when set and when left at its
+	// false default (two-sided).
+	t.Run("Insecure=true reaches cfg.Proxy.Insecure", func(t *testing.T) {
+		insecureCfg := buildJSReplayConfig(map[string]string{}, "https://example.com", false, false, httpx.ProxyConfig{URL: proxyURL, Insecure: true})
+		require.True(t, insecureCfg.Proxy.Insecure, "buildJSReplayConfig must carry Proxy.Insecure=true into JSReplayConfig.Proxy.Insecure")
+	})
+
+	t.Run("Insecure=false reaches cfg.Proxy.Insecure", func(t *testing.T) {
+		secureCfg := buildJSReplayConfig(map[string]string{}, "https://example.com", false, false, httpx.ProxyConfig{URL: proxyURL, Insecure: false})
+		require.False(t, secureCfg.Proxy.Insecure, "buildJSReplayConfig must carry Proxy.Insecure=false into JSReplayConfig.Proxy.Insecure")
+	})
 }
 
 // TestParseProxyConfig_ValidatesAndParses verifies parseProxyConfig parses a
@@ -3425,6 +3438,15 @@ func TestParseProxyConfig_ValidatesAndParses(t *testing.T) {
 		cfg, err := parseProxyConfig("http://127.0.0.1:8080", true)
 		require.NoError(t, err)
 		require.True(t, cfg.Insecure)
+	})
+
+	// TEST-001: pins parseProxyConfigOrEmpty's fail-open contract — an invalid
+	// proxy address (rejected by parseProxyConfig, here an unsupported scheme)
+	// must yield a disabled ProxyConfig rather than propagating the error or
+	// leaving Insecure set.
+	t.Run("parseProxyConfigOrEmpty fails open on an invalid address", func(t *testing.T) {
+		cfg := parseProxyConfigOrEmpty("ftp://127.0.0.1:21", true)
+		require.False(t, cfg.Enabled(), "an invalid proxy address must fail open to a disabled ProxyConfig")
 	})
 }
 
@@ -3467,6 +3489,22 @@ func TestGenerateCmd_Options_CarriesProxy(t *testing.T) {
 	proxy := parseProxyConfigOrEmpty(cmd.Proxy, cmd.ProxyInsecure)
 	opts := cmd.options(proxy)
 	require.NotNil(t, opts.Proxy.URL, "GenerateCmd.Proxy must reach pipeline.Options.Proxy")
+
+	// TEST-002: ProxyInsecure must reach pipeline.Options.Proxy.Insecure too,
+	// both when set and when left at its false default (two-sided).
+	t.Run("ProxyInsecure=true reaches opts.Proxy.Insecure", func(t *testing.T) {
+		insecureCmd := &GenerateCmd{Proxy: "http://127.0.0.1:8080", ProxyInsecure: true}
+		insecureProxy := parseProxyConfigOrEmpty(insecureCmd.Proxy, insecureCmd.ProxyInsecure)
+		insecureOpts := insecureCmd.options(insecureProxy)
+		require.True(t, insecureOpts.Proxy.Insecure, "GenerateCmd.ProxyInsecure=true must reach pipeline.Options.Proxy.Insecure")
+	})
+
+	t.Run("ProxyInsecure=false reaches opts.Proxy.Insecure", func(t *testing.T) {
+		secureCmd := &GenerateCmd{Proxy: "http://127.0.0.1:8080", ProxyInsecure: false}
+		secureProxy := parseProxyConfigOrEmpty(secureCmd.Proxy, secureCmd.ProxyInsecure)
+		secureOpts := secureCmd.options(secureProxy)
+		require.False(t, secureOpts.Proxy.Insecure, "GenerateCmd.ProxyInsecure=false must reach pipeline.Options.Proxy.Insecure")
+	})
 }
 
 // TestScanCmd_ScanOptions_CarriesProxy verifies that ScanCmd's proxy (set via
@@ -3477,4 +3515,20 @@ func TestScanCmd_ScanOptions_CarriesProxy(t *testing.T) {
 	proxy := parseProxyConfigOrEmpty(cmd.Proxy, cmd.ProxyInsecure)
 	opts := cmd.scanOptions("rest", nil, proxy)
 	require.NotNil(t, opts.Proxy.URL, "scanOptions must carry the passed proxy into pipeline.ScanOptions.Proxy")
+
+	// TEST-002: ProxyInsecure must reach pipeline.ScanOptions.Proxy.Insecure
+	// too, both when set and when left at its false default (two-sided).
+	t.Run("ProxyInsecure=true reaches opts.Proxy.Insecure", func(t *testing.T) {
+		insecureCmd := &ScanCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080", ProxyInsecure: true}}
+		insecureProxy := parseProxyConfigOrEmpty(insecureCmd.Proxy, insecureCmd.ProxyInsecure)
+		insecureOpts := insecureCmd.scanOptions("rest", nil, insecureProxy)
+		require.True(t, insecureOpts.Proxy.Insecure, "ScanCmd.ProxyInsecure=true must reach pipeline.ScanOptions.Proxy.Insecure")
+	})
+
+	t.Run("ProxyInsecure=false reaches opts.Proxy.Insecure", func(t *testing.T) {
+		secureCmd := &ScanCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080", ProxyInsecure: false}}
+		secureProxy := parseProxyConfigOrEmpty(secureCmd.Proxy, secureCmd.ProxyInsecure)
+		secureOpts := secureCmd.scanOptions("rest", nil, secureProxy)
+		require.False(t, secureOpts.Proxy.Insecure, "ScanCmd.ProxyInsecure=false must reach pipeline.ScanOptions.Proxy.Insecure")
+	})
 }

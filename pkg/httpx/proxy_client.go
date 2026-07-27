@@ -16,9 +16,11 @@ package httpx
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -39,6 +41,17 @@ type ProxyConfig struct {
 
 // Enabled reports whether a proxy target is configured.
 func (p ProxyConfig) Enabled() bool { return p.URL != nil }
+
+// NoFollowRedirects is the shared http.Client.CheckRedirect policy for every
+// proxy-aware stage (probe, WSDL discovery, JS-replay, jsstatic sourcemap): it
+// returns http.ErrUseLastResponse so the client surfaces the 3xx response itself
+// instead of following it. Following a redirect would let a same-host URL that
+// 302s to another host slip past each stage's SSRF/same-origin checks, so every
+// stage refuses redirects identically. Pass it to BuildHTTPClient's checkRedirect
+// argument or assign it to http.Client.CheckRedirect.
+func NoFollowRedirects(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
+}
 
 // BuildHTTPClient returns an *http.Client whose transport routes through p.URL,
 // mirroring pkg/crawl.newHTTPClient's proxy branch:
@@ -140,6 +153,13 @@ func connectDialer(p ProxyConfig) func(ctx context.Context, addr string) (net.Co
 		if strings.ContainsAny(addr, "\r\n") {
 			return nil, fmt.Errorf("httpx: invalid proxy target address %q: contains CR or LF", addr)
 		}
+		// Positive check: require a bare host:port literal. This rejects anything
+		// that is not a clean target (schemes, paths, embedded spaces) before it
+		// reaches the CONNECT request line and Host header — CR/LF is caught above
+		// because net.SplitHostPort splits such payloads cleanly and would not.
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			return nil, fmt.Errorf("httpx: invalid proxy target address %q: %w", addr, err)
+		}
 
 		conn, err := dialProxy(ctx, p)
 		if err != nil {
@@ -211,26 +231,30 @@ func resolveConnectResult(ctx context.Context, conn net.Conn, br *bufio.Reader, 
 		return nil, fmt.Errorf("httpx: proxy CONNECT canceled after handshake: %w", ctx.Err())
 	}
 
-	// Preserve any bytes the proxy pipelined past the CONNECT reply so the
-	// caller's TLS handshake does not lose them. NOTE: resp.Body is
-	// deliberately NOT closed on the 200 path — matching net/http's Transport,
-	// which never closes the body of a successful CONNECT: a hostile or
-	// misconfigured proxy that declares a body would otherwise have Close()'s
-	// drain (io.Copy) consume the caller's first tunneled bytes (SEC-BE-003).
-	if br.Buffered() > 0 {
-		return &bufferedConn{r: br, Conn: conn}, nil
-	}
-	return conn, nil
+	// br chains any pipelined prefix (bytes the proxy sent immediately after the
+	// CONNECT reply) ahead of the RAW, uncapped conn — connectHandshake captured
+	// that prefix before discarding the header-capped reader (SEC-BE-003). Always
+	// wrap so the prefix is served first: bufferedConn.Read draws from br while
+	// writes go straight to conn. The reply body is never read or closed, so a
+	// declared-body reply cannot drain the tunnel.
+	return &bufferedConn{r: br, Conn: conn}, nil
 }
 
+// maxCONNECTHeaderBytes bounds the CONNECT reply's status line + headers so a
+// hostile or misbehaving proxy cannot stream unbounded header bytes into memory.
+// It does NOT bound the tunnel that follows (see connectHandshake).
+const maxCONNECTHeaderBytes = 64 << 10
+
 // connectHandshake performs the CONNECT request/response exchange on conn (an
-// already-dialed proxy connection) and returns the buffered reader positioned
-// just past the "200 Connection established" reply. When the caller's context
-// carries a deadline it bounds the exchange via conn.SetDeadline (clean deadline
-// errors) and clears it on success so it does not leak into tunneled traffic;
-// cancellation of a deadline-less context is handled by the ctx.Done() watcher
-// in connectDialer. resp.Body is intentionally left unclosed (see connectDialer)
-// so a declared-body reply cannot drain the tunnel.
+// already-dialed proxy connection) and returns a reader positioned just past the
+// "200 Connection established" reply. The reader serves any bytes the proxy
+// pipelined immediately after the reply and then the RAW, uncapped conn. When the
+// caller's context carries a deadline it bounds the exchange via conn.SetDeadline
+// (clean deadline errors) and clears it on success so it does not leak into
+// tunneled traffic; cancellation of a deadline-less context is handled by the
+// ctx.Done() watcher in connectDialer. The reply header read is capped at
+// maxCONNECTHeaderBytes (fails closed if exceeded); resp.Body is intentionally
+// left unread/unclosed so a declared-body reply cannot drain the tunnel.
 func connectHandshake(ctx context.Context, conn net.Conn, addr string) (*bufio.Reader, error) {
 	if dl, ok := ctx.Deadline(); ok {
 		if err := conn.SetDeadline(dl); err != nil {
@@ -243,7 +267,10 @@ func connectHandshake(ctx context.Context, conn net.Conn, addr string) (*bufio.R
 		return nil, fmt.Errorf("httpx: writing CONNECT to proxy: %w", err)
 	}
 
-	br := bufio.NewReader(conn)
+	// Bound the header read: a header block larger than the cap fails closed
+	// because the limited reader returns EOF mid-headers and ReadResponse errors.
+	limited := io.LimitReader(conn, maxCONNECTHeaderBytes)
+	br := bufio.NewReader(limited)
 	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
 	if err != nil {
 		return nil, fmt.Errorf("httpx: reading CONNECT response: %w", err)
@@ -252,11 +279,24 @@ func connectHandshake(ctx context.Context, conn net.Conn, addr string) (*bufio.R
 		return nil, fmt.Errorf("httpx: proxy CONNECT to %s failed: %s", addr, resp.Status)
 	}
 
+	// Capture any bytes bufio read past the CONNECT header terminator (a proxy may
+	// pipeline the first tunnel bytes right after the reply). They sit in br's
+	// buffer, sourced from the capped reader; drain them here so nothing is
+	// stranded when we discard that reader below.
+	pipelined := make([]byte, br.Buffered())
+	if _, err := io.ReadFull(br, pipelined); err != nil {
+		return nil, fmt.Errorf("httpx: reading pipelined proxy bytes: %w", err)
+	}
+
 	// Clear the handshake deadline so it does not apply to tunneled traffic.
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		return nil, fmt.Errorf("httpx: clearing proxy CONNECT deadline: %w", err)
 	}
-	return br, nil
+
+	// Resume the tunnel over the RAW, uncapped conn, serving any pipelined prefix
+	// first. The header-capped `limited` reader is intentionally discarded so the
+	// cap never truncates real tunneled traffic (SEC-BE-003).
+	return bufio.NewReader(io.MultiReader(bytes.NewReader(pipelined), conn)), nil
 }
 
 // dialProxy opens the transport connection to the proxy itself: TLS for an

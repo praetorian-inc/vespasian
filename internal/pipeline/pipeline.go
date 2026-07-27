@@ -190,7 +190,7 @@ func buildProbeConfig(opts Options) probe.Config {
 		return d.DialContext(ctx, network, addr)
 	}
 	cfg.Client = &http.Client{
-		CheckRedirect: noFollowRedirects,
+		CheckRedirect: httpx.NoFollowRedirects,
 		Transport:     transport,
 	}
 	cfg.Dialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
