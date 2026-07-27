@@ -23,6 +23,17 @@
 // site that requires JavaScript execution. External .js bundles are fetched by
 // the browser itself; this path does not perform separate JS file retrieval.
 //
+// Browser binary (LAB-4999): the headless path pins a local Chrome via
+// [BrowserOptions.ChromePath] when set, otherwise the system browser resolved
+// by go-rod's launcher.LookPath. It does not, by default, let go-rod
+// auto-download a Chromium from third-party mirrors (a supply-chain risk and a
+// source of nondeterministic egress). When no system browser is found it
+// errors, unless downloads are explicitly opted in via
+// [BrowserOptions.AllowBrowserDownload]
+// or the VESPASIAN_ALLOW_BROWSER_DOWNLOAD=true environment variable (intended
+// for local dev on platforms without a system Chrome). The launcher also sets
+// Chrome telemetry/phone-home-disabling flags so crawl egress stays minimal.
+//
 // Non-headless mode ([HTTPCrawler]): uses the Go stdlib net/http client with a
 // depth-first search frontier, 150 req/s rate limiter, and a 10 MB per-page
 // read cap. HTML pages are parsed with goquery (single parse per page) using
@@ -58,6 +69,16 @@
 // DNS resolution and does NOT have a Go dial-time IP pin. The upfront
 // scopeChecker SSRF check applies, but Chrome-resolved addresses are not
 // re-validated at dial time (known limitation; see crawlHeadless).
+//
+// Page budget (LAB-4678): [CrawlerOptions.MaxPages] limits the number of pages
+// (distinct URLs visited), not captured requests — a single SPA page can fire
+// dozens of XHR/fetch calls, so counting requests truncated the crawl far
+// earlier than "max pages" implies. Each worker reserves a page slot under a
+// mutex before navigating, so the cap is exact and the crawl never overshoots
+// MaxPages. Reaching the budget does NOT cancel the shared browser context:
+// workers stop taking new pages, while pages already in flight complete their
+// normal bounded visit and emit all of their captured requests, rather than
+// being killed mid-capture.
 //
 // The package also defines the capture file format: a JSON array of
 // ObservedRequest structs that serves as the interchange format between the

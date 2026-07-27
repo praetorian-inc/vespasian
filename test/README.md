@@ -30,6 +30,7 @@ End-to-end live tests that spin up intentionally simple target applications, run
 | soap-service | SOAP/WSDL | Custom SOAP service with GetUser, ListUsers, CreateUser | Go binary |
 | graphql-server | GraphQL | Apollo Server with queries, mutations, enums, unions, nested types | Node.js |
 | grpc-server | gRPC | Three reflectable gRPC services (UserService, OrderService, AccountService) | Go binary |
+| forms-target | REST (HTML forms) | Static HTML page whose POST/GET `<form>` endpoints are recovered by `analyze.ExtractForms` (LAB-2109) | Go binary |
 
 ## What the Test Runner Does
 
@@ -63,11 +64,24 @@ For the JS bundle static-analysis test (`generate-js-static`, offline — no ser
 2. **Assert** the recovered path count matches `js-static/expected-paths.json` and every operation carries `x-vespasian-source: js-bundle`
 3. **Assert opt-out** — re-generating with `--analyze-js=false` yields zero `/api` paths and no `x-vespasian-source` extension
 
+For the HTML form-extraction live test (`forms-target`):
+
+1. **Crawl** the running server (both backends) — it serves one HTML page with POST forms (`/api/login`, `/api/register`, `/api/feedback`) and a GET search form, none of the POST actions backed by a real handler or reachable via a link/fetch
+2. **Generate** at the default confidence — the POST `<form>` endpoints reach the spec ONLY because `analyze.ExtractForms` (LAB-2109) parsed the captured HTML, so their presence is an end-to-end regression guard; `/api/search` is captured directly via its `<a href>` link
+3. **Assert** the form-derived paths in `forms-target/expected-paths.json` are present, each POST endpoint carries a `post` operation, and each urlencoded POST form's input names (`username`, `password`, `csrf_token`, …) surface as request-body schema properties
+4. **Re-generate with `--confidence 0`** and assert the GET search form's query parameters (`q`, `category`) merge onto `/api/search` — a GET form scores 0 confidence and is filtered out at the default threshold, so it needs the lower threshold to surface (multipart/form-data body-field schemas are not inferred, so `/api/feedback`'s fields are intentionally not asserted)
+
 For the slug-merging test (`generate-merge-slugs`, offline — no server or browser):
 
 1. **Generate** an OpenAPI spec from `fixtures/merge-slugs-capture.json` (two slug siblings `/api/posts/hello-world`, `/api/posts/my-trip` plus numeric-ID siblings `/api/users/42`, `/api/users/99`) with `--probe=false`
 2. **Assert default (off)** — both `/api/posts/*` siblings survive as distinct paths (the LAB-4107 regression guard) while `/api/users/{userId}` is still ID-normalized
 3. **Assert `--merge-slugs`** — the slug siblings collapse to `/api/posts/{postSlug}` and `/api/users/{userId}` normalization is unaffected
+
+For the egress guard (`no-download`, LAB-4999 Finding 1):
+
+1. **Isolate** a fresh, empty go-rod browser cache under a temporary HOME (not the invoking shell's `$HOME`), so the check does not depend on a clean workspace
+2. **Crawl** the rest-api target headless (which must use the system Chrome)
+3. **Assert** the isolated cache is still empty — any `chromium-<rev>` directory means go-rod auto-downloaded a browser from a third-party mirror, i.e. the system-Chrome pin regressed. Skips cleanly when Chrome is unavailable.
 
 For importer tests:
 
@@ -133,7 +147,7 @@ Options:
                                       import-mitmproxy, import-mitmproxy-native,
                                       import-unicode, import-duplicates,
                                       import-malformed, import-empty
-                          Crawl:      crawl-depth, crawl-unreachable
+                          Crawl:      crawl-depth, crawl-unreachable, no-download
                           Edge cases: edge-cases, classifier-edge, spec-edge
   --verbose             Enable verbose vespasian output
   --no-build            Skip building vespasian and target binaries
@@ -157,6 +171,14 @@ TEST_HOST=host.docker.internal ./test/run-live-tests.sh --targets rest-api
 For Linux devcontainers without Docker Desktop, use the detected host gateway (e.g. the address of the `docker0` bridge or whatever name resolves to the host from inside the container).
 
 `setup-live-targets.sh` does not read `TEST_HOST` — run it on the host that actually runs the target binaries.
+
+### `FORMS_TARGET_BIND_HOST` (optional)
+
+The `forms-target` server binds `127.0.0.1` by default (via its `BIND_HOST` env var). `setup-live-targets.sh` starts it with `BIND_HOST=${FORMS_TARGET_BIND_HOST:-0.0.0.0}` so a crawler running inside a devcontainer (reaching the host via `TEST_HOST=host.docker.internal`) can connect. For host-only local runs, pin it back to loopback:
+
+```bash
+FORMS_TARGET_BIND_HOST=127.0.0.1 ./test/setup-live-targets.sh --targets forms-target
+```
 
 ### `CONFIG_FILE` (optional)
 
@@ -190,6 +212,7 @@ TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server
 | soap-service | 8991 |
 | graphql-server | 8992 |
 | grpc-server | 50051 |
+| forms-target | 8994 |
 
 Ports are auto-resolved if the default is in use (searches up to 20 ports ahead).
 
@@ -264,7 +287,7 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 ## Expected Results
 
-All 26 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest). The sample below is a default `--group all` run (19 offline + 7 live targets); the config-only `grpc-server` target runs additionally only when `TARGETS_SETUP` is configured.
+All 28 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest). The sample below is a default `--group all` run (19 offline + 9 live targets); the config-only `grpc-server` target runs additionally only when `TARGETS_SETUP` is configured.
 
 ```text
   TARGET                      STATUS    ENDPOINTS   EXPECTED   DURATION
@@ -275,6 +298,7 @@ All 26 tests should pass. Order is non-deterministic and durations vary by machi
   crawl-depth                 PASS      -           -          188s
   crawl-unreachable           PASS      0           0          39s
   edge-cases                  PASS      -           -          193s
+  forms-target                PASS      4           4          55s
   generate-graphql            PASS      8           8          0s
   generate-graphql-imports    PASS      2           2          0s
   generate-js-static          PASS      3           3          1s
@@ -292,11 +316,12 @@ All 26 tests should pass. Order is non-deterministic and durations vary by machi
   import-mitmproxy            PASS      3           3          0s
   import-mitmproxy-native     PASS      3           3          1s
   import-unicode              PASS      3           3          0s
+  no-download                 PASS      -           -          80s
   rest-api                    PASS      8           8          79s
   soap-service                PASS      3           3          51s
   spec-edge                   PASS      -           -          0s
 
-  Total: 26 passed, 0 failed, 0 skipped
+  Total: 28 passed, 0 failed, 0 skipped
 ```
 
 Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are informational and do not cause failures.
@@ -333,6 +358,10 @@ test/
 ├── grpc-server/
 │   ├── main.go              # gRPC server (UserService, OrderService, AccountService)
 │   └── expected-paths.json  # Expected services/methods for validation
+│
+├── forms-target/
+│   ├── main.go              # HTML forms server (POST/GET <form> endpoints)
+│   └── expected-paths.json  # Expected form-derived paths + query params for validation
 │
 └── fixtures/
     ├── sample-burp-export.xml            # Burp XML (standard)

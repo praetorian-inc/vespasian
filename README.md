@@ -43,7 +43,7 @@ Vespasian takes a different approach: it observes actual network traffic at the 
 | **WSDL/SOAP Discovery** | Identifies SOAP services via SOAPAction headers and envelope detection; fetches and parses WSDL documents |
 | **gRPC API Discovery** | Classifies gRPC and gRPC-Web traffic via content-type, trailer headers, and path shape; enumerates services and methods through the Server Reflection Protocol — with reflection-off fallbacks (grpc-gateway/Envoy OpenAPI scrape and gRPC-Web JS-binding recovery) — and generates `.proto` schemas |
 | **API Type Auto-Detection** | Automatically determines API type (REST, GraphQL, WSDL) from captured traffic without manual selection. gRPC is opt-in via `--api-type grpc` — its binary HTTP/2 framing is not auto-detected |
-| **Browser Crawling** | Two backends: headless mode drives Chrome via [go-rod](https://github.com/go-rod/rod) for full JavaScript/SPA support; non-headless mode uses a stdlib net/http engine (DFS, 150 rps, scope+SSRF redirect guard) for lightweight crawls |
+| **Browser Crawling** | Two backends: headless mode drives Chrome via [go-rod](https://github.com/go-rod/rod) for full JavaScript/SPA support; non-headless mode uses a stdlib net/http engine (DFS, 150 rps, scope+SSRF redirect guard) for lightweight crawls. The headless backend uses a configured or **system Chrome** by default and does not download a browser from third-party mirrors unless explicitly opted in (supply-chain hardening); it also disables Chrome telemetry so crawl egress stays minimal |
 | **SPA Bundle Extraction** | Post-crawl pass that scans JavaScript bundles for API path strings and probes them with raw HTTP, recovering endpoints the headless browser could not exercise |
 | **Static Form Extraction** | Statically parses `<form>` elements in captured HTML responses — including login, search, and admin forms — to surface submission endpoints and parameters that dynamic crawling may never trigger |
 | **Traffic Import** | Import existing captures from Burp Suite XML, HAR 1.2 files, and mitmproxy dumps |
@@ -210,6 +210,15 @@ vespasian scan https://app.example.com -v -o api.yaml
 vespasian --no-banner scan https://app.example.com -o api.yaml
 ```
 
+> **Headless crawling requires a system Chrome/Chromium by default.** The headless
+> backend resolves a locally installed browser and does not download one over the
+> network unless explicitly opted in. If no system browser is found the crawl
+> errors rather than fetching a Chromium from third-party mirrors. On platforms
+> without a system Chrome (e.g. arm64
+> Linux, where Google Chrome ships no build) either install Chromium, use the
+> `--headless=false` net/http backend, or set `VESPASIAN_ALLOW_BROWSER_DOWNLOAD=true`
+> to explicitly allow go-rod's managed download.
+
 #### Path normalization & `--merge-slugs`
 
 IDs (numeric, UUID, hashes like `/users/42`) are always normalized to parameters regardless of flags. Observation-based "slug" merging is opt-in via `--merge-slugs` (off by default):
@@ -255,6 +264,9 @@ Vespasian classifies and generates specifications for four API types:
 3. **Path heuristics**: `/api/`, `/v1/`, `/v2/`, `/v3/`, `/rest/`, `/rpc/` paths boost confidence
 4. **HTTP method**: POST/PUT/PATCH/DELETE to non-page URLs
 5. **Response structure**: JSON object or array bodies (not HTML)
+6. **Request-side signal**: an API path plus a JSON/XML `Accept` (or request content-type) classifies the endpoint even when its response was not captured, so the REST-vs-not verdict does not depend on response timing
+
+The classification signals above are content-based and deterministic: identical input traffic yields the same endpoint set, the same classification, and a byte-identical spec every run. Run with `-v` to see the per-endpoint classification reason.
 
 ### GraphQL Classification Heuristics
 
@@ -318,7 +330,7 @@ vespasian scan <url> [flags]
   -H, --header       Auth headers to inject (repeatable)
   -o, --output       Output spec file (default: stdout)
   --depth            Max crawl depth (default: 3)
-  --max-pages        Max pages to visit (default: 100)
+  --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100)
   --timeout          Maximum duration for the entire scan (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine
@@ -351,7 +363,7 @@ vespasian crawl <url> [flags]
   -H, --header       Auth headers to inject (repeatable)
   -o, --output       Capture output file (default: stdout)
   --depth            Max crawl depth (default: 3)
-  --max-pages        Max pages to visit (default: 100)
+  --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100)
   --timeout          Maximum duration for the entire crawl (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine

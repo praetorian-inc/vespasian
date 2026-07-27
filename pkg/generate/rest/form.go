@@ -36,24 +36,6 @@ const (
 	maxMultipartParts = 1000
 )
 
-// getHeader retrieves a header value case-insensitively. The exact-match
-// shortcut at the top is a performance optimization for the common path
-// (browser-lowercased "content-type"); the loop handles other casings such
-// as Burp/HAR's title-case "Content-Type". Both branches return semantically
-// identical results — the shortcut is not a behavioral distinction.
-func getHeader(headers map[string]string, name string) string {
-	if v, ok := headers[name]; ok {
-		return v
-	}
-	lower := strings.ToLower(name)
-	for k, v := range headers {
-		if strings.ToLower(k) == lower {
-			return v
-		}
-	}
-	return ""
-}
-
 // ParseURLEncodedForm parses an application/x-www-form-urlencoded body into an
 // OpenAPI SchemaRef (object with one property per field).
 func ParseURLEncodedForm(body []byte) *openapi3.SchemaRef {

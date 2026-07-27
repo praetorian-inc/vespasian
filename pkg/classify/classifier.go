@@ -26,6 +26,15 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 )
 
+// DefaultConfidenceThreshold is the default minimum confidence for a request to
+// be classified as an API. The SDK (pkg/sdk) references this constant directly
+// for its parameter default. The CLI (cmd/vespasian) cannot: Kong `default:`
+// struct tags must be literals, so it carries the literal 0.5 and a test
+// (TestCLIConfidenceDefaultMatchesConstant) asserts the two never drift. Keeping
+// the value here documents it rather than leaving a bare literal unexplained at
+// each entry point (LAB-4678, QUAL-001).
+const DefaultConfidenceThreshold = 0.5
+
 // APIClassifier determines if a request is an API call.
 type APIClassifier interface {
 	// Name returns the classifier name (e.g., "rest", "graphql").
@@ -208,12 +217,44 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest { //nolint:
 			// that's the regression this tracking exists to prevent.)
 			existing.req.MultiValueQueryKeys = mergeMultiValueKeys(existing.req.MultiValueQueryKeys, req.MultiValueQueryKeys)
 
-			// Keep highest confidence, but preserve first occurrence's body/response.
-			if req.Confidence > existing.req.Confidence {
+			// Keep highest confidence. Confidence/reason selection is
+			// independent of response selection below: whether the endpoint is
+			// an API (confidence) and which captured response documents it are
+			// orthogonal concerns, and both are chosen order-independently so a
+			// fixed capture yields the same result regardless of the order in
+			// which duplicate observations were captured.
+			//
+			// On equal confidence, break the tie deterministically on
+			// (APIType, Reason). Two observations of the same endpoint can reach
+			// the same confidence via different signals (e.g. a POST on /api/x
+			// scores 0.7 from the method rule whether or not a request-side
+			// signal also fired), so without a tie-break the retained
+			// Reason/APIType would depend on the nondeterministic observation
+			// order and the -v explanation would vary run-to-run (Gemini
+			// review). The lexicographically greater (APIType, Reason) pair wins.
+			better := req.Confidence > existing.req.Confidence
+			if !better && req.Confidence == existing.req.Confidence {
+				if req.APIType != existing.req.APIType {
+					better = req.APIType > existing.req.APIType
+				} else {
+					better = req.Reason > existing.req.Reason
+				}
+			}
+			if better {
 				existing.req.Confidence = req.Confidence
 				existing.req.Reason = req.Reason
 				existing.req.APIType = req.APIType
 			}
+
+			// Select the retained response deterministically (LAB-4678, A4).
+			// Previously the first-seen observation's response was kept, but the
+			// input order is the crawl's capture order — a nondeterministic Go
+			// map iteration (pkg/crawl/network.go Results()) — so the documented
+			// response schema could differ run-to-run even when the endpoint set
+			// was identical. preferredResponse is order-free: it prefers a
+			// populated response over an empty (half-captured) one and breaks
+			// ties on a stable content fingerprint.
+			existing.req.Response = preferredResponse(existing.req.Response, req.Response)
 		}
 	}
 
@@ -222,6 +263,67 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest { //nolint:
 		results = append(results, seen[key].req)
 	}
 	return results
+}
+
+// responsePopulated reports whether an observed response carries usable content.
+// A half-captured response (the request was recorded on NetworkRequestWillBeSent
+// but its NetworkLoadingFinished had not fired when the crawl read results) has
+// a zero status and empty content-type/body; such a response documents nothing.
+//
+// A positive StatusCode alone is sufficient: a completed bodyless response
+// (e.g. a DELETE returning 204 No Content, or a 304) legitimately has no body
+// or content-type, yet it documents the endpoint's real status. Requiring a
+// body/content-type here would treat such a response as unpopulated and let the
+// fingerprint tie-break in preferredResponse retain a zero-status placeholder
+// instead, after which OpenAPI generation defaults the missing status to 200 —
+// documenting the wrong status code (Codex review).
+func responsePopulated(r crawl.ObservedResponse) bool {
+	return r.StatusCode > 0 || len(r.Body) > 0 || r.ContentType != ""
+}
+
+// CompareResponses is the single deterministic ordering rule for observed
+// responses, shared by preferredResponse (this package) and buildOperation's
+// group sort (pkg/generate/rest). It returns -1, 0, or +1 comparing a to b by
+// StatusCode, then ContentType, then Body bytes. Keeping one comparator means a
+// future tie-break field is added in exactly one place instead of silently
+// diverging between the two determinism call sites (LAB-4678).
+func CompareResponses(a, b crawl.ObservedResponse) int {
+	if a.StatusCode != b.StatusCode {
+		if a.StatusCode < b.StatusCode {
+			return -1
+		}
+		return 1
+	}
+	if a.ContentType != b.ContentType {
+		if a.ContentType < b.ContentType {
+			return -1
+		}
+		return 1
+	}
+	return bytes.Compare(a.Body, b.Body)
+}
+
+// preferredResponse deterministically selects which of two responses observed
+// for the same deduplicated endpoint should be retained. Selection is
+// independent of argument order so a fixed capture yields the same documented
+// response regardless of the (nondeterministic) order in which the crawl
+// captured the duplicate observations (LAB-4678, A4):
+//  1. A populated response beats an unpopulated (half-captured) one — a real
+//     response documents the endpoint better than an empty placeholder.
+//  2. When both are populated (or both empty), the response that sorts first
+//     under CompareResponses wins, an order-free tie-break.
+func preferredResponse(a, b crawl.ObservedResponse) crawl.ObservedResponse {
+	ap, bp := responsePopulated(a), responsePopulated(b)
+	if ap != bp {
+		if bp {
+			return b
+		}
+		return a
+	}
+	if CompareResponses(b, a) < 0 {
+		return b
+	}
+	return a
 }
 
 // MergeUniqueOrdered returns a new slice containing the values of a followed
@@ -307,10 +409,5 @@ func getSoapAction(headers map[string]string) string {
 
 // getContentType returns the Content-Type header value, case-insensitively.
 func getContentType(headers map[string]string) string {
-	for k, v := range headers {
-		if strings.EqualFold(k, "content-type") {
-			return v
-		}
-	}
-	return ""
+	return mediatype.Header(headers, "content-type")
 }
