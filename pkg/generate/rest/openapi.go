@@ -269,6 +269,24 @@ func computeSourceTag(group []classify.ClassifiedRequest) string {
 			friendly = "js-sourcemap"
 		case crawl.SourceStaticJSConcat:
 			friendly = "js-bundle-concat"
+		default:
+			// QUAL-005: a JS-static source with no case above must still map to
+			// a real tag. Leaving friendly == "" made jsStaticSourceRank[""]
+			// return the zero value — which COLLIDES with "js-bundle"'s rank 0,
+			// the most-confident label. The unknown source would then win the
+			// first comparison (0 > -1), and a later genuine "js-bundle" would
+			// fail 0 > 0, so the function returned "" and suppressed the
+			// x-vespasian-source extension for the whole group, breaking the
+			// contract documented above. crawl.IsJSStaticSource (pkg/crawl) and
+			// this switch live in different packages and must be edited
+			// together, so the miss is reachable by a one-sided edit — this PR
+			// itself required exactly that two-site change.
+			//
+			// Resolve to the LEAST-confident known tag: an unrecognized
+			// JS-static source is still offline-derived, so understating
+			// provenance is the safe direction, and it can never suppress the
+			// extension or masquerade as "dynamic".
+			friendly = "js-bundle-concat"
 		}
 		if r := jsStaticSourceRank[friendly]; r > leastConfidentRank {
 			leastConfidentRank = r

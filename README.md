@@ -122,7 +122,16 @@ candidates directly from the captured bundle bytes. Live JS-replay,
 described in this section, additionally re-fetches and probes those same
 reconstructions over HTTP, drops 404 decoys, and performs a speculative
 service-prefix fan-out that the offline pass deliberately omits (fan-out
-combinations are only safe once probed and 404-filtered).
+combinations are only safe once probed and 404-filtered). Live replay is
+purely *additive*: only a 404 refutes an offline candidate, so pointing
+`generate` at a reachable target never yields fewer endpoints than running
+fully offline.
+
+> **Note:** a `capture.json` produced by a build predating this feature already
+> carries `static:js` entries, which makes `generate` skip the static pass
+> (the idempotency guard that keeps `crawl` → `generate` identical to `scan`).
+> Re-run the capture to recover concat/service-prefix endpoints from it.
+> Captures from `import` (Burp/HAR/mitmproxy) are unaffected.
 
 By default this step:
 

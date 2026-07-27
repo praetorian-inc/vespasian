@@ -27,11 +27,13 @@
 //   - "EXPR" placeholders in URL paths are normalised to OpenAPI {param}
 //     form using the names of the original template-literal identifiers when
 //     they can be recovered.
+//
 //   - For fetch(url, {body: JSON.stringify({a, b})}) and axios.<m>(url, {a, b})
 //     calls, the names of the top-level keys of the object literal are
 //     captured as body parameter names. They are emitted as a synthesized
 //     JSON body ({"a": null, "b": null}) so the existing
 //     pkg/generate/rest.InferSchema produces an object schema downstream.
+//
 //   - Paths built by JS string concatenation that jsluice's AST analysis
 //     cannot resolve — String.prototype.concat, "+"-operator chains, and
 //     literal service-prefix "+"-concatenation — are reconstructed via the
@@ -47,11 +49,35 @@
 //     host so a same-path endpoint on a DIFFERENT host is never suppressed),
 //     against the URLs the AST walkers already recovered so no phantom-GET
 //     companions appear for a path recovered both ways on the same origin.
+//
 //     An absolute reconstruction (a bundle literal that concatenates a full
-//     http(s) URL) is only emitted when its host matches the bundle's own
-//     host (SEC-BE-001, LAB-4992); a cross-origin absolute reconstruction is
-//     dropped so a hostile bundle literal cannot smuggle an
-//     attacker-controlled host into the offline candidate set.
+//     http(s) URL) is gated by crawl.ValidateFullURL — the same parse-time check
+//     the active path applies in addPath, rejecting embedded credentials,
+//     non-http(s) schemes and empty hosts — and then required to match the
+//     bundle's own host AND scheme (SEC-BE-001, LAB-4992). A cross-origin
+//     reconstruction, one that smuggles HTTP Basic credentials via userinfo
+//     (which net/url keeps in u.User, so a host-only comparison misses it), and
+//     one that downgrades https to http are all dropped, so a hostile bundle
+//     literal cannot steer the offline candidate set — or the probe stage that
+//     later consumes it — at an attacker-chosen host or credential.
+//
+//     Capture compatibility (QUAL-001, LAB-4992): this applies to captures whose
+//     JS bundles have not ALREADY been through an older jsstatic pass.
+//     pipeline.AnalyzeJS short-circuits on crawl.AnyStaticSource — "this capture
+//     was produced by a stage that already ran jsstatic.Analyze" — and CrawlCmd
+//     runs jsstatic at crawl time, writing static:js entries into the capture.
+//     That guard's premise ("already ran jsstatic" implies "has all jsstatic
+//     output") was version-independent before this change and no longer is: a
+//     capture written by any pre-LAB-4992 `crawl`/`scan` build carries static:js
+//     entries but NO static:js-concat entries, so `generate` skips the analysis
+//     entirely and recovers no concat endpoint. Re-run the capture to pick these
+//     up (documented in CLAUDE.md's Capture Format section alongside the
+//     LAB-2110 precedent). Re-running the analysis instead of re-capturing is not
+//     an option here: the guard is what makes `crawl | generate` byte-identical
+//     to `scan`, and re-running jsstatic over a capture that already contains its
+//     own output would duplicate entries. Captures from `import` (Burp/HAR/
+//     mitmproxy) carry no static:js source at all, so they always exercise this
+//     path regardless of the build that produced them.
 //
 // # Source tagging
 //

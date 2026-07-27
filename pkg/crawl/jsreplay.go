@@ -357,7 +357,7 @@ var apiPathPattern = regexp.MustCompile(
 	`["']` +
 		`(/?` +
 		`(?:[a-zA-Z0-9_-]+/)*` +
-		apiIndicatorAlternation +
+		APIIndicatorAlternation +
 		`[a-zA-Z0-9/_\{}.:-]*)` +
 		`["']`,
 )
@@ -370,7 +370,7 @@ var templateLiteralPattern = regexp.MustCompile(
 	"`" +
 		`(/?` +
 		`(?:[a-zA-Z0-9_-]+/)*` +
-		apiIndicatorAlternation +
+		APIIndicatorAlternation +
 		`[a-zA-Z0-9/_\{}.:-]*)` +
 		"`",
 )
@@ -381,17 +381,27 @@ var fullURLPattern = regexp.MustCompile(
 	`["'` + "`]" +
 		`(https?://[a-zA-Z0-9._-]+(?::[0-9]+)?` +
 		`/(?:[a-zA-Z0-9_-]+/)*` +
-		apiIndicatorAlternation +
+		APIIndicatorAlternation +
 		`[a-zA-Z0-9/_\{}.:-]*)` +
 		`["'` + "`]",
 )
 
-// apiIndicatorAlternation is the single source of truth for which path
+// APIIndicatorAlternation is the single source of truth for which path
 // segments signal an API endpoint. It is concatenated into every extraction
 // regex (apiPathPattern, templateLiteralPattern, fullURLPattern,
 // servicePrefixPattern) and into apiIndicatorPattern, so the set cannot
 // drift between extraction and classification.
-const apiIndicatorAlternation = `(?:api/|v[1-9][0-9]*/|rest/|rpc/|graphql)`
+//
+// Exported for pkg/classify (TEST-002, LAB-4992): the classifier's Rule 3
+// gate (apiPathSegments + apiVersionPathPattern) must recognize every
+// indicator this extractor can produce, or offline concat/service-prefix
+// candidates on an unrecognized indicator fail Rule 3, Rule 7's static-JS
+// floor never fires, and they are silently dropped at the default
+// confidence. That mirroring was previously asserted only in prose;
+// classify's TestAPIIndicatorParityWithCrawlExtraction now pins this exact
+// string, so widening the set here fails that test until the classifier's
+// gate is widened to match.
+const APIIndicatorAlternation = `(?:api/|v[1-9][0-9]*/|rest/|rpc/|graphql)`
 
 // servicePrefixPattern matches service prefix strings concatenated with API paths
 // using the `+` operator between two QUOTED string literals.
@@ -402,7 +412,7 @@ const apiIndicatorAlternation = `(?:api/|v[1-9][0-9]*/|rest/|rpc/|graphql)`
 // operands — e.g. "/api/posts/".concat(id, "/comment") or "/api/users/" + id
 // + "/posts" — is handled separately by extractConcatPaths (see LAB-1368).
 var servicePrefixPattern = regexp.MustCompile(
-	`["']([a-zA-Z][a-zA-Z0-9_-]{1,30}/)["']\s*\+\s*["']` + apiIndicatorAlternation,
+	`["']([a-zA-Z][a-zA-Z0-9_-]{1,30}/)["']\s*\+\s*["']` + APIIndicatorAlternation,
 )
 
 // concatMethodPattern matches a quoted string literal receiver followed by
@@ -450,7 +460,7 @@ var concatPlusHeadPattern = regexp.MustCompile(
 	`["']` +
 		`(/?` +
 		`(?:[a-zA-Z0-9_-]+/)*` +
-		apiIndicatorAlternation +
+		APIIndicatorAlternation +
 		`[a-zA-Z0-9/_{}.:-]*)` +
 		`["']\s*\+`,
 )
@@ -511,9 +521,9 @@ const maxConcatArgList = 500
 const maxConcatPathsPerBundle = 256
 
 // apiIndicatorPattern matches the path segments that signal an API endpoint.
-// Sourced from apiIndicatorAlternation so it is impossible for it to drift
+// Sourced from APIIndicatorAlternation so it is impossible for it to drift
 // from the extraction regexes.
-var apiIndicatorPattern = regexp.MustCompile(`(?i)` + apiIndicatorAlternation)
+var apiIndicatorPattern = regexp.MustCompile(`(?i)` + APIIndicatorAlternation)
 
 // standalonePrefixPattern matches bare service-prefix string literals like
 // "identity/", "workshop/", "community/" — short lowercase-alpha-with-dashes
@@ -720,13 +730,24 @@ func copyHeaders(h map[string]string) map[string]string {
 	return out
 }
 
-// validateFullURL is a parse-time canonicalization that rejects URLs with
+// ValidateFullURL is a parse-time canonicalization that rejects URLs with
 // embedded credentials, non-http(s) schemes, or empty hosts. It returns the
 // canonicalized URL on success. SSRF screening (blocklist + DNS) is layered
 // separately at probe time via ssrf.ValidateURL — callers MUST run that
-// before issuing any request, since validateFullURL alone does not reject
+// before issuing any request, since ValidateFullURL alone does not reject
 // URLs whose Host is a private IP literal.
-func validateFullURL(raw string) (string, bool) {
+//
+// Exported for pkg/analyze/jsstatic (SEC-BE-001, LAB-4992): the fully-offline
+// concat extractor emits absolute reconstructions too, and it MUST apply the
+// same parse-time gate as this file's addPath. A host-only comparison is not
+// sufficient — net/url puts userinfo in u.User, not u.Host, so
+// `"https://".concat("u:p@<bundlehost>/api/x")` has a host that equals the
+// bundle's own and would otherwise pass. Because probe.Config.AuthHeaders is
+// never populated by any non-test caller, net/http would then always derive
+// `Authorization: Basic <base64(userinfo)>` from req.URL.User and send
+// attacker-chosen credentials to the target on the operator's behalf. Sharing
+// this function keeps the offline and active paths from drifting apart again.
+func ValidateFullURL(raw string) (string, bool) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "", false
@@ -1509,7 +1530,7 @@ func extractAPIPaths(jsBody []byte, requests []ObservedRequest) []string { //nol
 		// defense-in-depth validation pass that rejects credentials,
 		// non-http(s) schemes, and empty hosts.
 		if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
-			cleaned, ok := validateFullURL(raw)
+			cleaned, ok := ValidateFullURL(raw)
 			if !ok {
 				return
 			}
@@ -1654,28 +1675,92 @@ func cleanConcatPath(p string) string {
 			path = strings.ReplaceAll(path, "//", "/")
 		}
 	}
+
+	// Trim trailing slashes so this extractor canonicalizes paths IDENTICALLY to
+	// addPath ("ensure leading slash, trim trailing slash"), which is the shared
+	// contract for every other extractor in this file (QUAL-002, LAB-4992).
+	// Previously only the leading slash was normalized downstream and no side
+	// trimmed here, so a reconstruction like `"/api/orders/" + id + "/"` emitted
+	// /api/orders/0/ while the active path's equivalent emitted /api/orders/0.
+	// Two consequences, both spec-visible:
+	//
+	//  1. NormalizePathWithNames splits and rejoins on '/', so the trailing empty
+	//     segment survives: the offline mirror produced the OpenAPI path
+	//     `/api/orders/{orderId}/` while the live js-extract entry for the same
+	//     reconstruction produced `/api/orders/{orderId}` — two distinct
+	//     groupEndpoints keys for one endpoint, and neither merged with a real
+	//     dynamic observation of GET /api/orders/5 (which normalizes unslashed).
+	//  2. reachedPathKey trims the trailing slash on BOTH sides, so a live probe
+	//     of the unslashed form superseded the correctly-slashed mirror. On a
+	//     trailing-slash-required API (Django/DRF, Flask strict_slashes) that
+	//     probe 404s, so the mirror was dropped and the endpoint lost outright.
+	//
+	// Canonicalizing here rather than at each emitter keeps the active and
+	// offline paths from drifting again, which is this change's design goal. The
+	// trim applies to the path portion only, so a trailing slash inside a query
+	// value is preserved (addPath trims the whole string; the difference only
+	// matters for query-bearing reconstructions, where trimming the path is the
+	// correct reading). A path that trims away entirely (e.g. "/") fails the
+	// hasAPIIndicator check below, as it did before.
+	path = strings.TrimRight(path, "/")
 	p = path + suffix
 
 	if p == "" || !hasAPIIndicator(p) {
 		return ""
 	}
-	// Reject a space, any non-printable/control byte, or a raw byte that is not
-	// valid UTF-8. A crafted bundle literal can embed raw C0/C1 control bytes
-	// (NUL, VT, FF, DEL, …) that a whitespace-only check would let survive into
-	// a candidate path; unicode.IsControl covers tab/CR/LF and every other
-	// control byte. A lone non-UTF-8 high byte (0x80-0x9F) decodes to
-	// utf8.RuneError, for which unicode.IsControl is false — strings.IndexFunc
-	// alone (which decodes runes the same way) would let it through, so this
-	// scans bytes directly and additionally rejects any width-1 RuneError
-	// decode (SEC-BE-002).
+	// Reject any whitespace, control, format or line/paragraph-separator rune, or
+	// a raw byte that is not valid UTF-8. A crafted bundle literal can embed
+	// these: parseConcatArgs / readChainOperand -> stringLiteralValue copy
+	// string-literal operand bytes VERBATIM with no character class, so whatever
+	// a hostile bundle puts inside a `.concat()` argument or `+`-chain operand
+	// lands in the reconstruction, and the ASCII `api/` elsewhere in the path
+	// still satisfies hasAPIIndicator.
+	//
+	// The predicate is deliberately broader than unicode.IsControl (SEC-BE-002,
+	// second pass). IsControl consults only the Latin-1 properties table and
+	// returns FALSE for every rune above U+00FF, so an earlier
+	// `r == ' ' || unicode.IsControl(r)` check — whose comment claimed to reject
+	// "any non-printable/control byte" — let the entire Cf, Zs, Zl and Zp
+	// categories through: U+202A-U+202E bidi embed/override, U+200B ZWSP,
+	// U+200E/U+200F LRM/RLM, U+2060 word joiner, U+FEFF BOM, U+00A0 NBSP and
+	// U+3000 ideographic space all survived into a candidate path. IsSpace now
+	// covers Zs (including NBSP and U+3000) plus ASCII whitespace, so the
+	// explicit ' ' test is subsumed; Cf covers the bidi controls, ZWSP, the
+	// directional marks, the word joiner and the BOM.
+	//
+	// The HTTP request path was never the exposure — net/url percent-encodes
+	// non-ASCII in EscapedPath(), so there is no request-splitting or
+	// header-injection vector. The sink is the operator-facing artifact: U+202E
+	// (E2 80 AE) satisfies gopkg.in/yaml.v3's is_printable check and is emitted
+	// RAW into the generated OpenAPI path key, so a scanned site could make a
+	// spec path RENDER differently from the bytes it contains (RTL override) or
+	// hide segments behind zero-width runes — report/deliverable spoofing during
+	// an assessment.
+	//
+	// A lone non-UTF-8 high byte (0x80-0x9F) decodes to utf8.RuneError, for which
+	// none of the category predicates are true — strings.IndexFunc alone (which
+	// decodes runes the same way) would let it through, so this scans bytes
+	// directly and additionally rejects any width-1 RuneError decode.
 	for i := 0; i < len(p); {
 		r, size := utf8.DecodeRuneInString(p[i:])
-		if r == ' ' || unicode.IsControl(r) || (r == utf8.RuneError && size == 1) {
+		if isRejectedPathRune(r) || (r == utf8.RuneError && size == 1) {
 			return ""
 		}
 		i += size
 	}
 	return p
+}
+
+// isRejectedPathRune reports whether r must never appear in a reconstructed
+// candidate path: whitespace (Zs + ASCII), control (Cc), format (Cf), or
+// line/paragraph separator (Zl/Zp). See cleanConcatPath's byte scan for why
+// unicode.IsControl alone is insufficient (SEC-BE-002).
+func isRejectedPathRune(r rune) bool {
+	return unicode.IsSpace(r) ||
+		unicode.IsControl(r) ||
+		unicode.Is(unicode.Cf, r) ||
+		unicode.Is(unicode.Zl, r) ||
+		unicode.Is(unicode.Zp, r)
 }
 
 // servicePrefixPlusHeadPattern matches the head of a `+`-concat chain whose
@@ -1934,14 +2019,38 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	result := make([]ObservedRequest, len(requests))
 	copy(result, requests)
 
-	// reached records the reachedPathKey of every full URL the target answered
-	// for (any status, including 404). For those paths JS-replay is
-	// authoritative, so the passive offline concat mirror (SourceStaticJSConcat,
-	// emitted by pkg/analyze/jsstatic) is dropped after the loop — a 404'd decoy
-	// must not survive via the mirror, and a confirmed path is already re-added
-	// below as a richer js-extract observation. Paths the target never answered
-	// (connection failures / fully offline) are absent here, so their offline
-	// candidates are preserved (LAB-4992 AC1).
+	// refuted records the reachedPathKey of every full URL the target answered
+	// 404 for. Those paths — and ONLY those — have a dispositive negative
+	// verdict, so the passive offline concat mirror (SourceStaticJSConcat,
+	// emitted by pkg/analyze/jsstatic) is dropped after the loop by
+	// supersedeConcatMirrors: a 404'd decoy must not survive via the mirror.
+	// Paths the target never answered (connection failures / fully offline) are
+	// absent here, so their offline candidates are preserved (LAB-4992 AC1).
+	//
+	// QUAL-004: this set was previously populated for ANY answered status, on the
+	// theory that JS-replay is "authoritative" for every path the target
+	// answered. It is not, and the consequence was that supplying a reachable
+	// --target-url produced STRICTLY LESS output than running fully offline —
+	// inverting the feature on exactly the deployment shape JS-replay exists for.
+	// probeURL returns a non-nil *ObservedResponse for every completed exchange
+	// regardless of status or content type, so a 200 text/html SPA catch-all
+	// (nginx try_files), a 204, an HTML-bodied 401/403, or a 302 -> /login (the
+	// usual auth-gated-API reply) all deleted the mirror. The replacement
+	// appended below carries Source "js-extract", which crawl.IsJSStaticSource
+	// does NOT match, so classify Rule 7's StaticJSConfidence floor never applies
+	// to it: such a replacement scores only Rule 3's 0.15 and is dropped at the
+	// 0.5 default threshold. Net effect, measured end-to-end: the spec went from
+	// one path to zero.
+	//
+	// Restricting the set to 404 keeps the decoy filter this exists for while
+	// making live replay purely ADDITIVE, as pkg/crawl/doc.go and README claim.
+	// A non-404 answer now leaves the mirror in place AND appends the richer
+	// js-extract observation; both describe the same endpoint, and since
+	// groupEndpoints keys on normalized path + method (host-agnostic) they
+	// collapse into a single OpenAPI operation rather than a duplicate path. The
+	// probed observation supplies the real status/content-type, so the operation
+	// is no worse off than before — it merely can no longer fall below the
+	// offline floor.
 	//
 	// Keyed path-only (QUAL-001), not origin+path: jsstatic resolves the mirror
 	// URL against the bundle/capture origin (which may be a CDN hosting the JS,
@@ -1950,7 +2059,7 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	// no-op the drop whenever the bundle host differs from the target host,
 	// re-opening the 404-decoy leak. Matching on path alone drops the mirror
 	// regardless of which host either side resolved the URL against.
-	reached := make(map[string]bool)
+	refuted := make(map[string]bool)
 
 	probed := 0
 	for _, path := range sortedPaths {
@@ -2005,19 +2114,19 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		if resp == nil {
 			continue
 		}
-		// The target answered (200 or 404), so JS-replay is authoritative for
-		// this reconstructed path — record it so the offline mirror is dropped.
-		// Keyed path-only (see reached's doc comment above) so the match
-		// survives host-case / trailing-slash / bundle-vs-target host
-		// differences between this probe URL and the mirror URL jsstatic
-		// resolved against the bundle origin.
-		reached[reachedPathKey(fullURL)] = true
-
 		// Skip 404 responses — these are typically wrong service prefix
 		// combinations (e.g., /identity/api/shop/products when the correct
 		// prefix is /workshop/). Keeping them would pollute the spec with
 		// endpoints that don't actually exist on that service.
+		//
+		// A 404 is also the only DISPOSITIVE verdict, so it is the only status
+		// that refutes the offline concat mirror for this path (QUAL-004 — see
+		// refuted's doc comment for why "any answered status" made live replay
+		// subtractive). Keyed path-only so the match survives host-case /
+		// trailing-slash / bundle-vs-target host differences between this probe
+		// URL and the mirror URL jsstatic resolved against the bundle origin.
 		if resp.StatusCode == http.StatusNotFound {
+			refuted[reachedPathKey(fullURL)] = true
 			continue
 		}
 
@@ -2045,31 +2154,47 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 			probed, len(sortedPaths))
 	}
 
-	// Drop the passive offline concat mirror for every path the live probe
-	// reached: JS-replay's verdict (200 -> js-extract above; 404 -> excluded)
-	// supersedes the unprobed SourceStaticJSConcat candidate, so a decoy the
-	// target 404s does not leak back into the spec via the offline mirror.
-	// Candidates for unreached paths are untouched (offline fallback, LAB-4992).
-	// Matching is host-agnostic (path-only, QUAL-001): the mirror is dropped
-	// whether or not the bundle it was reconstructed against shares a host
-	// with the probe target.
-	//
-	// Residual limitation: paths beyond cfg.MaxEndpoints are never probed, so
-	// they never enter `reached` and their offline mirror is retained — a decoy
-	// past the cap can still surface. This matches the pre-existing MaxEndpoints
-	// truncation semantics (the warn above) and is bounded by that cap.
-	if len(reached) > 0 {
-		filtered := result[:0]
-		for _, r := range result {
-			if r.Source == SourceStaticJSConcat && reached[reachedPathKey(r.URL)] {
-				continue
-			}
-			filtered = append(filtered, r)
-		}
-		result = filtered
-	}
+	return supersedeConcatMirrors(result, refuted)
+}
 
-	return result
+// supersedeConcatMirrors drops the passive offline concat mirror
+// (SourceStaticJSConcat, emitted by pkg/analyze/jsstatic) for every path the
+// live probe REFUTED with a 404, so a decoy the target 404s does not leak back
+// into the spec via the mirror. Candidates for paths that were never probed, or
+// that answered with any non-404 status, are left untouched — the offline
+// fallback (LAB-4992 AC1) and the additive-replay guarantee (QUAL-004)
+// respectively. Matching is host-agnostic (path-only, QUAL-001): the mirror is
+// dropped whether or not the bundle it was reconstructed against shares a host
+// with the probe target.
+//
+// Only SourceStaticJSConcat is superseded. Plain SourceStaticJS and
+// SourceStaticJSSourcemap mirrors survive a 404 deliberately: an AST literal is
+// recovered from a real call site in the bundle, so a 404 there is more likely
+// auth/param-gated than a wrong-guess decoy, unlike an unvalidated combinatorial
+// reconstruction. pkg/classify/rest.go's staticJSFloor documents the same
+// asymmetry from the classifier side; TestReplayJSExtracted_KeepsNonConcatMirrorsForRefutedPaths
+// pins it. Do not widen this predicate to crawl.IsJSStaticSource without
+// revisiting that reasoning.
+//
+// Residual limitation: paths beyond cfg.MaxEndpoints are never probed, so they
+// never enter refuted and their offline mirror is retained — a decoy past the cap
+// can still surface. This matches the pre-existing MaxEndpoints truncation
+// semantics and is bounded by that cap.
+//
+// Extracted from ReplayJSExtracted (QUAL-004) so probe I/O and result filtering
+// are separable and independently testable.
+func supersedeConcatMirrors(result []ObservedRequest, refuted map[string]bool) []ObservedRequest {
+	if len(refuted) == 0 {
+		return result
+	}
+	filtered := result[:0]
+	for _, r := range result {
+		if r.Source == SourceStaticJSConcat && refuted[reachedPathKey(r.URL)] {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	return filtered
 }
 
 // reachedPathKey normalizes rawURL to a path-only key so the live-probe

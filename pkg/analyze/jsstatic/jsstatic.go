@@ -42,6 +42,18 @@ const (
 	DefaultConcurrency           = 4
 )
 
+// concatMinReserve is the number of MaxEndpointsPerBundle slots capBundleEndpoints
+// guarantees to concat/service-prefix reconstructions when the cap binds, so
+// AST-recovered endpoints cannot starve them entirely (QUAL-001, LAB-4992).
+//
+// It is deliberately a small fixed reserve rather than a proportional share
+// (QUAL-003): concat candidates are speculative and never probed, so they must
+// not displace directly AST-recovered literals one-for-one. capBundleEndpoints
+// additionally clamps the reserve to budget/2 so it cannot invert and starve AST
+// on small budgets, and concat still reclaims any budget AST leaves unused — the
+// reserve is a floor, not a quota.
+const concatMinReserve = 16
+
 // Options configures Analyze. Zero values resolve to the Default* constants.
 //
 // HTTPClient is used only for sourcemap fetches (FetchSourcemaps must be true).
@@ -325,13 +337,27 @@ func safeAnalyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options
 // truncation drops every concat candidate whenever the AST portion alone
 // reaches budget.
 //
-// Instead, concat is guaranteed a floor of min(len(concat), budget/2) so AST
-// endpoints cannot starve it, then AST is given whatever budget remains after
-// that floor. Concat then reclaims any budget AST did not actually use (concat
-// may exceed the floor when AST is scarce), so the total kept is always
-// min(len(ast)+len(concat), budget) — the cap is never under-filled the way a
-// hard max/2 split on concat alone would leave it when AST is small
-// (QUAL-002).
+// Instead, concat is guaranteed a SMALL floor so AST endpoints cannot starve it
+// entirely, AST is then given whatever budget remains after that floor, and
+// concat finally reclaims any budget AST did not actually use — so the total
+// kept is always min(len(ast)+len(concat), budget) and the cap is never
+// under-filled the way a hard max/2 split on concat alone would leave it when
+// AST is small (QUAL-002).
+//
+// QUAL-003: the floor is deliberately small (concatMinReserve, additionally
+// capped at budget/2 so it can never invert and starve AST) rather than the
+// budget/2 reservation it replaced. That earlier reservation was UNCONDITIONAL,
+// so it taxed AST even when concat was abundant and low-value: with the default
+// budget of 500, a bundle yielding 600 AST endpoints and 300 concat
+// reconstructions kept only 250 AST, where a pre-LAB-4992 `eps[:budget]` kept
+// 500. That eviction was not an edge case — concat reconstructions exist in
+// essentially every SPA bundle, ExtractStaticConcatPaths composes two
+// independently capped producers (up to 512 candidates from one bundle), and
+// servicePrefixPlusHeadPattern matches any short quoted slash-terminated
+// literal followed by `+`, which is dense in minified output. Trading a
+// directly AST-recovered literal for an unprobed sentinel-substituted guess 1:1
+// is the wrong direction: concat candidates are speculative, so they get a
+// guaranteed toehold, not parity.
 func capBundleEndpoints(eps []ExtractedEndpoint, budget int) []ExtractedEndpoint {
 	var ast, concat []ExtractedEndpoint
 	for _, ep := range eps {
@@ -342,19 +368,27 @@ func capBundleEndpoints(eps []ExtractedEndpoint, budget int) []ExtractedEndpoint
 		}
 	}
 
-	// Reserve a floor for concat so AST endpoints cannot starve concat
-	// reconstructions (QUAL-001), but let AST use the rest and then let
-	// concat reclaim any budget AST did not need, so the total cap is
-	// fully utilized (concat may exceed the floor when AST is scarce).
+	// Reserve a small floor for concat so AST endpoints cannot starve concat
+	// reconstructions completely (QUAL-001), but keep it well below budget so
+	// abundant concat cannot displace high-fidelity AST literals (QUAL-003).
+	// The budget/2 clamp keeps the floor from exceeding the budget on small
+	// budgets, which would otherwise zero out AST.
 	concatFloor := len(concat)
+	if concatFloor > concatMinReserve {
+		concatFloor = concatMinReserve
+	}
 	if concatFloor > budget/2 {
 		concatFloor = budget / 2
 	}
+
+	// AST gets everything but the floor...
 	astBudget := budget - concatFloor
 	if len(ast) > astBudget {
 		ast = ast[:astBudget]
 	}
 
+	// ...and concat reclaims whatever AST did not use, so the cap stays fully
+	// utilized when AST is scarce.
 	concatBudget := budget - len(ast)
 	if len(concat) > concatBudget {
 		concat = concat[:concatBudget]

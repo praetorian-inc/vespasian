@@ -3277,13 +3277,18 @@ func TestGenerateCmdRun_TargetURLOverridesOrigin(t *testing.T) {
 			APIType: "rest",
 			Capture: capturePath,
 			Output:  outputPath,
-			// Pin the PRODUCTION default confidence (Kong default 0.5). LAB-4992
-			// AC1 requires the fully-offline concat endpoint to reach the spec at
-			// the real default — an unprobed bare-GET candidate scores only the
-			// 0.15 path heuristic and is dropped at 0.5 unless the classifier's
-			// static-JS floor (RESTClassifier Rule 7) promotes it. An earlier
-			// revision left Confidence at 0, which hid that drop.
-			Confidence:            0.5,
+			// Pin the PRODUCTION default confidence. LAB-4992 AC1 requires the
+			// fully-offline concat endpoint to reach the spec at the real default
+			// — an unprobed bare-GET candidate scores only the 0.15 path
+			// heuristic and is dropped unless the classifier's static-JS floor
+			// (RESTClassifier Rule 7) promotes it. An earlier revision left
+			// Confidence at 0, which hid that drop.
+			//
+			// TEST-001: reference the constant, not a 0.5 literal. Hardcoding it
+			// decoupled this guard from the value it exists to pin — moving the
+			// production default to 0.6 would leave this test running at a stale
+			// 0.5, so AC1 would re-break with a green suite.
+			Confidence:            classify.DefaultConfidenceThreshold,
 			Probe:                 true,
 			AnalyzeJS:             true,
 			Deduplicate:           true,
@@ -3318,6 +3323,105 @@ func TestGenerateCmdRun_TargetURLOverridesOrigin(t *testing.T) {
 		require.NotZero(t, atomic.LoadInt32(&probeHits),
 			"--target-url must pin the reachable origin so the concat endpoint is actively probed there")
 	})
+}
+
+// TestGenerateCmdRun_ReachableTargetIsNeverWorseThanOffline is the end-to-end
+// guard for QUAL-004 (LAB-4992): supplying a REACHABLE --target-url must never
+// produce less output than running fully offline.
+//
+// Before the fix, JS-replay recorded a path as "reached" for any answered status
+// and then deleted the offline static:js-concat mirror, replacing it with a
+// Source "js-extract" entry. js-extract is not a crawl.IsJSStaticSource, so
+// classify Rule 7's StaticJSConfidence floor never applied to it: the
+// replacement scored only Rule 3's 0.15 and was dropped at the 0.5 default
+// threshold. Against a target answering 200 text/html (the nginx/SPA try_files
+// catch-all), 204, an HTML-bodied 401/403, or 302 -> /login, the spec went from
+// one path to ZERO — while the same capture generated against an unreachable
+// target kept the endpoint. This asserts through the real classifier and
+// generator at the production confidence default, which the unit-level guards in
+// pkg/crawl cannot do.
+func TestGenerateCmdRun_ReachableTargetIsNeverWorseThanOffline(t *testing.T) {
+	const appJS = `function loadOrders(uid) { return fetch("/api/users/".concat(uid, "/orders")); }`
+
+	cases := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+	}{
+		{name: "spa_catch_all_200_html", status: 200, contentType: "text/html", body: "<!doctype html><html></html>"},
+		{name: "no_content_204", status: 204},
+		{name: "auth_gated_401_html", status: 401, contentType: "text/html", body: "<html>login</html>"},
+		{name: "auth_gated_403_html", status: 403, contentType: "text/html", body: "<html>denied</html>"},
+		{name: "redirect_302_to_login", status: 302, contentType: "text/html"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/app.js" {
+					w.Header().Set("Content-Type", "application/javascript")
+					_, _ = w.Write([]byte(appJS))
+					return
+				}
+				// Every other path (including the reconstructed concat endpoint)
+				// answers with a NON-404, non-dispositive status.
+				if tc.status == 302 {
+					w.Header().Set("Location", "/login")
+				}
+				if tc.contentType != "" {
+					w.Header().Set("Content-Type", tc.contentType)
+				}
+				w.WriteHeader(tc.status)
+				if tc.body != "" {
+					_, _ = w.Write([]byte(tc.body))
+				}
+			}))
+			defer srv.Close()
+
+			// Source "burp" so pipeline.AnalyzeJS's AnyStaticSource guard does not
+			// short-circuit the offline analysis (see QUAL-001 note in
+			// pkg/analyze/jsstatic/doc.go).
+			requests := []crawl.ObservedRequest{
+				{
+					Method: "GET",
+					URL:    srv.URL + "/app.js",
+					Source: "burp",
+					Response: crawl.ObservedResponse{
+						StatusCode:  200,
+						ContentType: "application/javascript",
+						Body:        []byte(appJS),
+					},
+				},
+			}
+
+			capturePath := filepath.Join(t.TempDir(), "capture.json")
+			f, err := os.Create(capturePath) //nolint:gosec // G304: test file
+			require.NoError(t, err)
+			require.NoError(t, crawl.WriteCapture(f, requests))
+			require.NoError(t, f.Close())
+
+			outputPath := filepath.Join(t.TempDir(), "spec.yaml")
+			cmd := &GenerateCmd{
+				APIType:               "rest",
+				Capture:               capturePath,
+				Output:                outputPath,
+				Confidence:            classify.DefaultConfidenceThreshold,
+				Probe:                 true,
+				AnalyzeJS:             true,
+				Deduplicate:           true,
+				DangerousAllowPrivate: true,
+				TargetURL:             srv.URL, // reachable
+			}
+			require.NoError(t, cmd.Run())
+
+			specBytes, err := os.ReadFile(outputPath) //nolint:gosec // G304: test file
+			require.NoError(t, err)
+
+			require.Contains(t, string(specBytes), "/api/users/{userId}/orders",
+				"a reachable target answering %d must not REMOVE the offline concat endpoint: only a 404 is a dispositive refutation, and the js-extract replacement receives no Rule 7 floor (QUAL-004)", tc.status)
+		})
+	}
 }
 
 // TestGenerateCmdRun_RejectsMalformedTargetURL pins the fail-fast guard: a

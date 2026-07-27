@@ -854,3 +854,76 @@ func TestRESTClassifier_Deterministic(t *testing.T) {
 		assert.Equal(t, reason0, reason)
 	}
 }
+
+// TestStaticJSFloorClearsDefaultThreshold pins the invariant Rule 7 depends on
+// (TEST-003, LAB-4992): the static-JS floor must be at least the default
+// confidence threshold, or every fully-offline concat/service-prefix candidate
+// is dropped by RunClassifiers.
+//
+// StaticJSConfidence is defined as DefaultConfidenceThreshold, so this holds by
+// construction today. The test exists because that binding is easy to undo:
+// re-inlining a 0.5 literal here (its previous form) restores a silent-drift
+// hazard where lowering the floor to 0.4 leaves every other Rule 7 test green
+// (they all assert against the StaticJSConfidence symbol, so they track the
+// constant whatever its value). RunClassifiers compares `>=`, so equality is
+// sufficient and the floor need not exceed the threshold.
+func TestStaticJSFloorClearsDefaultThreshold(t *testing.T) {
+	assert.GreaterOrEqual(t, StaticJSConfidence, DefaultConfidenceThreshold,
+		"Rule 7's static-JS floor must clear the default --confidence threshold or fully-offline concat candidates are dropped (LAB-4992 AC1)")
+}
+
+// TestAPIIndicatorParityWithCrawlExtraction closes the drift gap TEST-002
+// identified (LAB-4992): apiVersionPathPattern and apiPathSegments together
+// mirror crawl.APIIndicatorAlternation, and non-drift is the stated design
+// rationale for apiVersionPathPattern — but nothing enforced it, so widening
+// crawl's extraction set would produce candidates whose paths fail Rule 3.
+// Rule 7's floor is gated on pathIsAPI, so such a candidate scores 0 and is
+// silently dropped at the default confidence.
+//
+// Two assertions, deliberately paired:
+//  1. every indicator crawl can extract yields a Rule 7 floor here, and
+//  2. crawl's alternation is still exactly the set enumerated below.
+//
+// (2) is what makes this a guard rather than a snapshot: adding an indicator to
+// crawl (say `v0/` or `svc/`) fails this test until the classifier's gate and
+// this table are widened to match.
+func TestAPIIndicatorParityWithCrawlExtraction(t *testing.T) {
+	// Pinned so widening crawl's extraction set forces a matching widening of
+	// the classifier's Rule 3 gate. Update BOTH sides plus the table below.
+	assert.Equal(t, `(?:api/|v[1-9][0-9]*/|rest/|rpc/|graphql)`, crawl.APIIndicatorAlternation,
+		"crawl's API-indicator set changed: widen apiPathSegments/apiVersionPathPattern and this test's table so extracted candidates still satisfy Rule 3 (LAB-4992 TEST-002)")
+
+	// One path per arm of the alternation, in the slash-delimited form the
+	// concat extractor emits after cleanConcatPath (leading slash added by
+	// jsstatic's extractConcatEndpoints). The version arm is sampled across the
+	// single- and multi-digit boundary that motivated apiVersionPathPattern.
+	paths := []string{
+		"/api/users",      // api/
+		"/v1/users",       // v[1-9][0-9]*/  (single digit)
+		"/v4/users",       // v[1-9][0-9]*/  (beyond the old fixed v1-v3 set)
+		"/v12/users",      // v[1-9][0-9]*/  (multi digit)
+		"/rest/users",     // rest/
+		"/rpc/getUser",    // rpc/
+		"/graphql",        // graphql
+		"/identity/api/x", // service-prefix reconstruction
+		"/api/users/0",    // non-literal operand sentinel
+	}
+
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			c := &RESTClassifier{}
+			// An unprobed offline concat candidate: bare GET, no response, so
+			// only Rule 3 (+0.15) and Rule 7 can fire.
+			isAPI, confidence, reason := c.ClassifyDetail(crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com" + path,
+				Source: crawl.SourceStaticJSConcat,
+			})
+
+			assert.True(t, isAPI, "extracted indicator must classify as an API path")
+			assert.Contains(t, reason, "static-js-candidate", "Rule 7 must fire for an extractable indicator")
+			assert.GreaterOrEqual(t, confidence, DefaultConfidenceThreshold,
+				"candidate must survive default-confidence generation, got %v", confidence)
+		})
+	}
+}

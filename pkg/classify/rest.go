@@ -49,7 +49,7 @@ var apiPathSegments = []string{
 
 // apiVersionPathPattern matches a versioned API path segment for ANY version
 // number (/v1/, /v2/, …/v4/…/v12/). It mirrors the v[1-9][0-9]*/ alternation in
-// crawl.apiIndicatorAlternation so the classifier's API-indicator recognition
+// crawl.APIIndicatorAlternation so the classifier's API-indicator recognition
 // does not drift below the extraction side — otherwise offline concat/service-
 // prefix candidates on /v4+/ paths (which crawl extracts) would fail Rule 3,
 // so Rule 7's static-JS floor would never fire and they would be dropped at the
@@ -70,10 +70,19 @@ const (
 	// verdict then depends on the request, not on response timing (LAB-4678, B2).
 	RequestSignalConfidence = 0.6
 	// StaticJSConfidence is the floor for an offline JS-static candidate whose
-	// path carries an API indicator (Rule 7). It equals the default --confidence
-	// threshold (0.5) so these unprobed candidates survive fully-offline
+	// path carries an API indicator (Rule 7). It is DEFINED AS the default
+	// --confidence threshold so these unprobed candidates survive fully-offline
 	// generation instead of being dropped at Rule 3's 0.15 (LAB-4992).
-	StaticJSConfidence = 0.5
+	//
+	// TEST-003: this is deliberately an alias rather than a second 0.5 literal.
+	// The floor clears the threshold only because the two values are equal, and
+	// RunClassifiers compares with `>=` — so the invariant sits exactly on a
+	// knife edge. As independent literals, moving the default to 0.6 would
+	// silently drop every offline concat endpoint while every Rule 7 test
+	// (which asserts against this symbol) stayed green. Binding them here makes
+	// the invariant hold by construction; TestStaticJSFloorClearsDefaultThreshold
+	// guards against someone re-inlining a literal.
+	StaticJSConfidence = DefaultConfidenceThreshold
 )
 
 // RESTClassifier classifies REST API requests using ordered heuristic rules.

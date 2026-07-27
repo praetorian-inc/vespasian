@@ -1458,14 +1458,166 @@ func TestReplayJSExtracted_DropsOfflineConcatMirrorForReachedPaths(t *testing.T)
 			jsExtract = append(jsExtract, r.URL)
 		}
 	}
-	// Reached paths (200 orders + 404 gone) dropped from the mirror; the
-	// unreached offline candidate survives.
-	assert.Equal(t, []string{srv.URL + "/api/offline/0/thing"}, concatMirror,
-		"only the unreached offline concat candidate should survive; reached ones (incl. the 404 decoy) are superseded by the probe")
+	// QUAL-004: only the 404-REFUTED paths are superseded. The 200 path keeps its
+	// mirror as well as gaining the probed js-extract observation, because
+	// js-extract is not an IsJSStaticSource and so never receives Rule 7's
+	// confidence floor — dropping the mirror on a non-404 answer is what made
+	// live replay subtractive. The two entries describe one endpoint and
+	// groupEndpoints (normalized path + method, host-agnostic) collapses them
+	// into a single OpenAPI operation.
+	assert.ElementsMatch(t,
+		[]string{
+			srv.URL + "/api/users/0/orders",  // answered 200 -> mirror retained
+			srv.URL + "/api/offline/0/thing", // never probed -> offline fallback
+		},
+		concatMirror,
+		"only 404-refuted mirrors may be dropped; a 200-answered path keeps its mirror (live replay must be additive) and an unprobed path keeps its offline fallback")
+	assert.NotContains(t, concatMirror, srv.URL+"/api/missing/0/gone",
+		"the 404 decoy mirror must be superseded")
+	assert.NotContains(t, concatMirror, srv.URL+"/api/missing/0/gone/",
+		"reachedPathKey normalization must drop the trailing-slash variant of the 404 decoy too")
 	assert.Contains(t, jsExtract, srv.URL+"/api/users/0/orders",
-		"the 200 path should be re-added as a probed js-extract observation")
+		"the 200 path should also be added as a probed js-extract observation")
 	assert.NotContains(t, jsExtract, srv.URL+"/api/missing/0/gone",
 		"the 404 decoy must not be present as js-extract either")
+}
+
+// TestReplayJSExtracted_KeepsMirrorForNonDispositiveStatuses is the regression
+// guard for QUAL-004 (LAB-4992). Before the fix, `reached` was recorded for ANY
+// answered status, so each of the statuses below deleted the offline concat
+// mirror and replaced it with a Source "js-extract" entry — which
+// crawl.IsJSStaticSource does not match, so classify Rule 7's StaticJSConfidence
+// floor never applied and the replacement scored only Rule 3's 0.15, below the
+// 0.5 default threshold. The endpoint therefore vanished from the spec, meaning a
+// reachable --target-url produced strictly LESS output than running fully
+// offline.
+//
+// These are not exotic: 200 text/html is the nginx/SPA try_files catch-all,
+// 302 -> /login is the usual auth-gated-API reply, and 204 / HTML-bodied 401 and
+// 403 are ordinary API responses. Only a 404 may supersede the mirror.
+func TestReplayJSExtracted_KeepsMirrorForNonDispositiveStatuses(t *testing.T) {
+	cases := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+	}{
+		{name: "200 text/html SPA catch-all", status: 200, contentType: "text/html", body: "<!doctype html><html></html>"},
+		{name: "204 no content", status: 204, contentType: "", body: ""},
+		{name: "401 with html body", status: 401, contentType: "text/html", body: "<html>login</html>"},
+		{name: "403 with html body", status: 403, contentType: "text/html", body: "<html>denied</html>"},
+		{name: "302 redirect to login", status: 302, contentType: "text/html", body: ""},
+		{name: "500 server error", status: 500, contentType: "text/plain", body: "boom"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/app.js") {
+					w.Header().Set("Content-Type", "application/javascript")
+					w.Write([]byte(`fetch("/api/users/".concat(uid,"/orders"));`)) //nolint:errcheck,gosec // test handler
+					return
+				}
+				if tc.status == 302 {
+					w.Header().Set("Location", "/login")
+				}
+				if tc.contentType != "" {
+					w.Header().Set("Content-Type", tc.contentType)
+				}
+				w.WriteHeader(tc.status)
+				if tc.body != "" {
+					w.Write([]byte(tc.body)) //nolint:errcheck,gosec // test handler
+				}
+			}))
+			defer srv.Close()
+
+			jsBody := []byte(`fetch("/api/users/".concat(uid,"/orders"));`)
+			requests := []ObservedRequest{
+				{
+					Method:   "GET",
+					URL:      srv.URL + "/app.js",
+					Source:   "katana",
+					Response: ObservedResponse{StatusCode: 200, ContentType: "application/javascript", Body: jsBody},
+				},
+				{Method: "GET", URL: srv.URL + "/api/users/0/orders", Source: SourceStaticJSConcat},
+			}
+
+			result := ReplayJSExtracted(context.Background(), requests, allowLocal(srv))
+
+			var mirrorKept bool
+			for _, r := range result {
+				if r.Source == SourceStaticJSConcat && r.URL == srv.URL+"/api/users/0/orders" {
+					mirrorKept = true
+				}
+			}
+			assert.True(t, mirrorKept,
+				"status %d must NOT supersede the offline concat mirror: only a 404 is dispositive, and the js-extract replacement receives no Rule 7 floor, so dropping the mirror loses the endpoint entirely (QUAL-004)", tc.status)
+		})
+	}
+}
+
+// TestReplayJSExtracted_KeepsNonConcatMirrorsForRefutedPaths pins the asymmetry
+// supersedeConcatMirrors and pkg/classify/rest.go's staticJSFloor both document
+// in prose but nothing previously tested (TEST-004, LAB-4992): only
+// SourceStaticJSConcat is superseded by a 404. Plain SourceStaticJS and
+// SourceStaticJSSourcemap mirrors survive, because an AST literal comes from a
+// real call site in the bundle, so a 404 is more likely auth/param-gated than a
+// wrong-guess decoy.
+//
+// Without this test, a plausible "symmetry cleanup" widening the predicate to
+// crawl.IsJSStaticSource(r.Source) — which looks obviously correct given Rule 7
+// floors all three sources identically — passes the entire suite while silently
+// deleting AST-recovered literals that sit behind a 404. Both directions were
+// unprotected: no jsreplay test constructed a non-concat mirror at all.
+func TestReplayJSExtracted_KeepsNonConcatMirrorsForRefutedPaths(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/app.js") {
+			w.Header().Set("Content-Type", "application/javascript")
+			w.Write([]byte(`fetch("/api/gated/".concat(x,"/thing"));`)) //nolint:errcheck,gosec // test handler
+			return
+		}
+		w.WriteHeader(http.StatusNotFound) // refutes /api/gated/0/thing
+	}))
+	defer srv.Close()
+
+	jsBody := []byte(`fetch("/api/gated/".concat(x,"/thing"));`)
+	const path = "/api/gated/0/thing"
+	requests := []ObservedRequest{
+		{
+			Method:   "GET",
+			URL:      srv.URL + "/app.js",
+			Source:   "katana",
+			Response: ObservedResponse{StatusCode: 200, ContentType: "application/javascript", Body: jsBody},
+		},
+		// All three JS-static sources mirror the SAME 404'd path.
+		{Method: "GET", URL: srv.URL + path, Source: SourceStaticJSConcat},
+		{Method: "GET", URL: srv.URL + path, Source: SourceStaticJS},
+		{Method: "GET", URL: srv.URL + path, Source: SourceStaticJSSourcemap},
+	}
+
+	result := ReplayJSExtracted(context.Background(), requests, allowLocal(srv))
+
+	var sawConcat, sawAST, sawSourcemap bool
+	for _, r := range result {
+		if r.URL != srv.URL+path {
+			continue
+		}
+		switch r.Source {
+		case SourceStaticJSConcat:
+			sawConcat = true
+		case SourceStaticJS:
+			sawAST = true
+		case SourceStaticJSSourcemap:
+			sawSourcemap = true
+		}
+	}
+
+	assert.False(t, sawConcat,
+		"the 404-refuted static:js-concat mirror must be superseded (it is an unvalidated combinatorial reconstruction)")
+	assert.True(t, sawAST,
+		"a static:js AST literal must SURVIVE a 404 — it comes from a real call site, so the 404 is more likely auth/param-gated than a decoy; do not widen supersedeConcatMirrors to IsJSStaticSource")
+	assert.True(t, sawSourcemap,
+		"a static:js-sourcemap literal must SURVIVE a 404 for the same reason as static:js")
 }
 
 // LAB-4992 QUAL-001 regression: jsstatic resolves the offline concat mirror
@@ -1910,7 +2062,7 @@ func TestAddPath_RejectsURLCredentials(t *testing.T) {
 }
 
 func TestAddPath_RejectsNonHTTPScheme(t *testing.T) {
-	// validateFullURL must reject non-http(s) schemes when they sneak in
+	// ValidateFullURL must reject non-http(s) schemes when they sneak in
 	// via the full-URL pattern.
 	cases := []string{
 		"file:///etc/passwd",
@@ -1918,8 +2070,8 @@ func TestAddPath_RejectsNonHTTPScheme(t *testing.T) {
 		"javascript://api/v2/x",
 	}
 	for _, raw := range cases {
-		_, ok := validateFullURL(raw)
-		assert.False(t, ok, "validateFullURL must reject %s", raw)
+		_, ok := ValidateFullURL(raw)
+		assert.False(t, ok, "ValidateFullURL must reject %s", raw)
 	}
 }
 
@@ -2356,7 +2508,7 @@ func TestCopyHeaders(t *testing.T) {
 	})
 }
 
-// --- TEST-004: validateFullURL branches ---
+// --- TEST-004: ValidateFullURL branches ---
 
 func TestValidateFullURL(t *testing.T) {
 	cases := []struct {
@@ -2375,8 +2527,8 @@ func TestValidateFullURL(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, ok := validateFullURL(tc.in)
-			assert.Equal(t, tc.ok, ok, "validateFullURL(%q) ok=%v, want %v", tc.in, ok, tc.ok)
+			_, ok := ValidateFullURL(tc.in)
+			assert.Equal(t, tc.ok, ok, "ValidateFullURL(%q) ok=%v, want %v", tc.in, ok, tc.ok)
 		})
 	}
 }
@@ -3352,7 +3504,7 @@ func TestExtractStaticConcatPaths(t *testing.T) {
 			// indicator, so concatPlusHeadPattern never matches it and only
 			// servicePrefixPlusPaths emits it, whose own seen map absorbs the
 			// repeat. Here the single head literal "api/" matches BOTH
-			// concatPlusHeadPattern (it satisfies apiIndicatorAlternation) and
+			// concatPlusHeadPattern (it satisfies APIIndicatorAlternation) and
 			// servicePrefixPlusHeadPattern, so extractConcatPaths and
 			// servicePrefixPlusPaths each reconstruct "api/v2/users" and only
 			// add()'s shared seen map can collapse them to one entry.
@@ -3430,6 +3582,75 @@ func TestCleanConcatPath(t *testing.T) {
 			name: "rejects raw non-UTF-8 high byte",
 			in:   "/api/\x85x",
 			want: "",
+		},
+
+		// SEC-BE-002 (second pass): unicode.IsControl consults only the Latin-1
+		// table and returns false above U+00FF, so these all survived a
+		// `' ' || IsControl` predicate. They reach a candidate path because
+		// stringLiteralValue copies operand bytes verbatim, and the sink is the
+		// generated OpenAPI document — yaml.v3 emits them raw, so the rendered
+		// path can differ from the bytes it contains (bidi override) or hide
+		// segments (zero-width).
+		{
+			name: "rejects U+202E right-to-left override (Cf)",
+			in:   "/api/\u202Ex",
+			want: "",
+		},
+		{
+			name: "rejects U+200B zero-width space (Cf)",
+			in:   "/api/\u200Bx",
+			want: "",
+		},
+		{
+			name: "rejects U+FEFF byte-order mark (Cf)",
+			in:   "/api/\uFEFFx",
+			want: "",
+		},
+		{
+			name: "rejects U+00A0 non-breaking space (Zs)",
+			in:   "/api/\u00A0x",
+			want: "",
+		},
+		{
+			name: "rejects U+3000 ideographic space (Zs)",
+			in:   "/api/\u3000x",
+			want: "",
+		},
+		{
+			name: "rejects U+2028 line separator (Zl)",
+			in:   "/api/\u2028x",
+			want: "",
+		},
+
+		// QUAL-002: cleanConcatPath must canonicalize trailing slashes exactly as
+		// addPath does, so the offline mirror and the active js-extract entry for
+		// one reconstruction produce a single OpenAPI path rather than two.
+		{
+			name: "trims trailing slash",
+			in:   "/api/orders/",
+			want: "/api/orders",
+		},
+		{
+			name: "trims trailing slash after sentinel segment",
+			in:   "/api/orders/0/",
+			want: "/api/orders/0",
+		},
+		{
+			name: "trims repeated trailing slashes",
+			in:   "/api/orders///",
+			want: "/api/orders",
+		},
+		{
+			name: "trims trailing slash on absolute reconstruction",
+			in:   "https://h/api/x/",
+			want: "https://h/api/x",
+		},
+		{
+			// The trim applies to the path portion only, so a trailing slash
+			// inside a query value survives.
+			name: "preserves trailing slash inside query value",
+			in:   "/api/proxy?url=https://a/",
+			want: "/api/proxy?url=https://a/",
 		},
 	}
 	for _, tt := range tests {

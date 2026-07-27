@@ -709,18 +709,44 @@ func extractConcatEndpoints(jsSource []byte, baseURL, baseHost string, seen map[
 		if !absolute && !strings.HasPrefix(p, "/") {
 			p = "/" + p
 		}
-		// SEC-BE-001 (LAB-4992): drop an absolute reconstruction whose host
-		// differs from the bundle's own host. The concat receiver form (e.g.
-		// "https://attacker.example/api/x".concat(id)) has no origin/scheme
-		// gate of its own — a hostile bundle literal can reconstruct to an
-		// absolute cross-origin URL, which would otherwise be emitted as an
-		// unprobed static:js-concat candidate, floored to default confidence
-		// by classify Rule 7, and then probed against the attacker-chosen
-		// host by the live probe stage (no same-origin gate there either) —
-		// an SSRF-reflector / scope-escape via a fully offline analysis path.
-		// Relative reconstructions and same-host absolute ones are unaffected.
-		if absolute && hostOfURL(p) != baseHost {
-			continue
+		// SEC-BE-001 (LAB-4992): gate absolute reconstructions. The concat
+		// receiver form (e.g. "https://attacker.example/api/x".concat(id)) has
+		// no origin/scheme gate of its own — a hostile bundle literal can
+		// reconstruct to an absolute URL, which would otherwise be emitted as an
+		// unprobed static:js-concat candidate, floored to default confidence by
+		// classify Rule 7, and then probed against the attacker-chosen host by
+		// the live probe stage (no same-origin gate there either) — an
+		// SSRF-reflector / scope-escape via a fully offline analysis path.
+		// Relative reconstructions are unaffected.
+		//
+		// Three checks, because a host comparison alone is not enough:
+		//
+		//  1. crawl.ValidateFullURL — the SAME parse-time gate the active path
+		//     applies in addPath. Rejects embedded credentials, non-http(s)
+		//     schemes and empty hosts. The credential case is the one a
+		//     host-only comparison misses outright: net/url puts userinfo in
+		//     u.User, NOT u.Host, so `"https://".concat("u:p@<bundlehost>/api/x")`
+		//     reconstructs to a URL whose host EQUALS the bundle's own and
+		//     passes an equality test unchanged. net/http then derives
+		//     `Authorization: Basic <base64(userinfo)>` from req.URL.User
+		//     whenever no Authorization header is already set — and
+		//     probe.Config.AuthHeaders is populated by no non-test caller — so
+		//     the attacker-chosen credential would ALWAYS be sent, and would
+		//     also persist into capture.json and the generated spec.
+		//  2. host equality against the bundle's own host (the original gate).
+		//  3. scheme equality against the bundle's own scheme, so an https
+		//     bundle cannot force a cleartext http probe of its own host. Low
+		//     impact on its own, but ValidateFullURL permits either scheme, so
+		//     pinning it here is deliberate rather than incidental.
+		if absolute {
+			validated, ok := crawl.ValidateFullURL(p)
+			if !ok {
+				continue
+			}
+			p = validated
+			if hostOfURL(p) != baseHost || schemeOfURL(p) != schemeOfURL(baseURL) {
+				continue
+			}
 		}
 		// QUAL-010 (LAB-4992): only the astURLs dedup is checked here. This
 		// guard used to also re-test filterURL(p) and isExprOnly(p), but both
@@ -844,6 +870,20 @@ func hostOfURL(rawURL string) string {
 		return ""
 	}
 	return strings.ToLower(u.Host)
+}
+
+// schemeOfURL returns the lower-cased scheme of rawURL, or "" when it has none
+// or is unparseable. Used by extractConcatEndpoints to reject an absolute
+// reconstruction that downgrades the bundle's own scheme (SEC-BE-001).
+func schemeOfURL(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Scheme)
 }
 
 // jsluiceURLToEndpoint converts a single jsluice.URL into an ExtractedEndpoint,

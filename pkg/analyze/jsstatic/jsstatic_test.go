@@ -664,6 +664,91 @@ func TestCapBundleEndpoints_ConcatAbundantFullyUtilizesBudget(t *testing.T) {
 	}
 }
 
+// TestCapBundleEndpoints_ASTRetainedWhenConcatAbundant pins the direction the
+// other capBundleEndpoints tests never covered (QUAL-003, LAB-4992): they both
+// reason about AST starving concat, never about concat taxing AST.
+//
+// The previous implementation reserved min(len(concat), budget/2)
+// UNCONDITIONALLY, so whenever MaxEndpointsPerBundle actually bound, abundant
+// concat evicted high-fidelity AST literals in favor of unprobed
+// sentinel-substituted guesses 1:1 — at the production budget this case kept
+// only 250 of 600 AST endpoints, where a plain prefix truncation kept 500.
+// Reaching enough concat candidates to trigger it is easy: ExtractStaticConcatPaths
+// composes two producers each capped at maxConcatPathsPerBundle (256).
+//
+// The contract asserted here: AST keeps everything except the small concat
+// reserve, concat still gets its guaranteed toehold, and the budget stays fully
+// utilized.
+func TestCapBundleEndpoints_ASTRetainedWhenConcatAbundant(t *testing.T) {
+	const budget = 500
+
+	var eps []ExtractedEndpoint
+	for i := 0; i < 600; i++ {
+		eps = append(eps, ExtractedEndpoint{URL: fmt.Sprintf("/api/ast%d", i)})
+	}
+	for i := 0; i < 300; i++ {
+		eps = append(eps, ExtractedEndpoint{URL: fmt.Sprintf("/api/concat%d", i), SourceTag: SourceJSConcat})
+	}
+
+	got := capBundleEndpoints(eps, budget)
+
+	if len(got) != budget {
+		t.Fatalf("capBundleEndpoints kept %d endpoints, want %d (budget must be fully utilized)", len(got), budget)
+	}
+
+	var astKept, concatKept int
+	for _, ep := range got {
+		if ep.SourceTag == SourceJSConcat {
+			concatKept++
+		} else {
+			astKept++
+		}
+	}
+
+	// AST surrenders only the small reserve, not half the budget.
+	if want := budget - concatMinReserve; astKept != want {
+		t.Errorf("AST endpoints kept = %d, want %d (concat must not displace AST beyond its small reserve; the old budget/2 reservation kept only %d)",
+			astKept, want, budget/2)
+	}
+	if concatKept != concatMinReserve {
+		t.Errorf("concat endpoints kept = %d, want %d (concat keeps its guaranteed reserve)", concatKept, concatMinReserve)
+	}
+}
+
+// TestCapBundleEndpoints_SmallBudgetDoesNotStarveAST guards the clamp that keeps
+// the concat reserve from exceeding the budget (QUAL-003). Without the budget/2
+// clamp, a budget below concatMinReserve would make astBudget negative and zero
+// out AST entirely.
+func TestCapBundleEndpoints_SmallBudgetDoesNotStarveAST(t *testing.T) {
+	for _, budget := range []int{1, 2, 4, 10, concatMinReserve} {
+		t.Run(fmt.Sprintf("budget=%d", budget), func(t *testing.T) {
+			var eps []ExtractedEndpoint
+			for i := 0; i < 20; i++ {
+				eps = append(eps, ExtractedEndpoint{URL: fmt.Sprintf("/api/ast%d", i)})
+			}
+			for i := 0; i < 20; i++ {
+				eps = append(eps, ExtractedEndpoint{URL: fmt.Sprintf("/api/concat%d", i), SourceTag: SourceJSConcat})
+			}
+
+			got := capBundleEndpoints(eps, budget)
+
+			if len(got) != budget {
+				t.Fatalf("kept %d, want %d (budget must be fully utilized)", len(got), budget)
+			}
+			var astKept int
+			for _, ep := range got {
+				if ep.SourceTag != SourceJSConcat {
+					astKept++
+				}
+			}
+			// AST is never zeroed out while AST endpoints exist and budget > 0.
+			if astKept == 0 {
+				t.Errorf("AST endpoints kept = 0 at budget=%d; the concat reserve must never starve AST", budget)
+			}
+		})
+	}
+}
+
 // TestExtractFromBundle_MinifiedBundleSmoke confirms that extraction works on a
 // single-line minified-style bundle with multiple fetches concatenated together.
 func TestExtractFromBundle_MinifiedBundleSmoke(t *testing.T) {

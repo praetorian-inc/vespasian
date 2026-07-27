@@ -840,6 +840,64 @@ var rel = "/api/".concat("z");
 	}
 }
 
+// TestExtractFromBundle_ConcatCredentialGate covers the hole the host-only
+// version of the SEC-BE-001 gate left open (second pass). net/url places
+// userinfo in u.User, NOT u.Host, so an absolute reconstruction that embeds
+// credentials for the bundle's OWN host has a matching u.Host and passed
+// `hostOfURL(p) != baseHost` unchanged.
+//
+// That mattered because probe.Config.AuthHeaders is populated by no non-test
+// caller, so net/http always derives `Authorization: Basic <base64(userinfo)>`
+// from req.URL.User: a scanned site's bundle could make Vespasian issue
+// authenticated requests with attacker-chosen credentials to the target on the
+// operator's behalf (credential stuffing / lockout / audit-log poisoning
+// attributed to the operator), and persist the credential into capture.json and
+// the generated spec. `@` cannot come from the concat receiver character class,
+// but parseConcatArgs/stringLiteralValue copy `.concat()` string-literal
+// ARGUMENTS verbatim, so it arrives that way.
+//
+// The gate now delegates to crawl.ValidateFullURL — the same parse-time check
+// the active path applies in addPath, which has rejected u.User != nil all
+// along.
+func TestExtractFromBundle_ConcatCredentialGate(t *testing.T) {
+	src := []byte(`
+var creds = "https://".concat("u:p@example.com/api/x");
+var credsHostOnly = "https://".concat("attacker@example.com/api/w");
+var downgrade = "http://example.com/api/".concat("v");
+var same = "https://example.com/api/".concat("y");
+`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// No emitted endpoint may carry userinfo, however it is spelled.
+	for _, ep := range endpoints {
+		if strings.Contains(ep.URL, "@") {
+			t.Errorf("reconstruction with embedded credentials must NOT be emitted; got %q in %v", ep.URL, endpoints)
+		}
+	}
+	if ep := findEndpoint(endpoints, "https://u:p@example.com/api/x"); ep != nil {
+		t.Errorf("user:pass credential reconstruction must NOT be emitted; got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "https://attacker@example.com/api/w"); ep != nil {
+		t.Errorf("user-only credential reconstruction must NOT be emitted; got %v", endpoints)
+	}
+
+	// Scheme downgrade relative to the bundle's own scheme is pinned as
+	// dropped: ValidateFullURL permits either scheme, so an https bundle could
+	// otherwise force a cleartext probe of its own host.
+	if ep := findEndpoint(endpoints, "http://example.com/api/v"); ep != nil {
+		t.Errorf("scheme-downgraded reconstruction must NOT be emitted; got %v", endpoints)
+	}
+
+	// The gate must stay narrow — a clean same-origin absolute reconstruction
+	// is still emitted.
+	if ep := findEndpoint(endpoints, "https://example.com/api/y"); ep == nil {
+		t.Errorf("same-origin absolute concat reconstruction must still be emitted, got %v", endpoints)
+	}
+}
+
 // QUAL-002: extractConcatEndpoints must not let a leading-slash normalization
 // defeat filterURL's scheme blocklist. filterURL matches filtered schemes
 // (javascript:, data:, blob:, mailto:, tel:, chrome-extension:) via
