@@ -134,6 +134,8 @@ func TestClassifyProbeGenerate_SameOriginLoopbackRejectedWithoutAllowPrivate(t *
 func TestClassifyProbeGenerate_SameOriginUserinfoCredentialInjectionRejected(t *testing.T) {
 	target, hits := countingAPIServer(t)
 
+	// user:pass is synthetic test data, not a real secret; this fixture asserts
+	// REJECTION by the credential gate (see doc comment above).
 	userinfoURL := strings.Replace(target.URL, "://", "://user:pass@", 1) + "/api/v1/x"
 
 	requests := []crawl.ObservedRequest{apiRequest(userinfoURL)}

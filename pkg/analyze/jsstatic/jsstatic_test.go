@@ -1139,6 +1139,8 @@ func TestAnalyze_EndpointsKeptReflectsSynthesisDrops(t *testing.T) {
 	// Three API endpoints, two of which the gate must reject: one carrying
 	// credentials, one carrying a raw bidi override.
 	js := `fetch("/api/keep/one");` +
+		// u:p is synthetic; example.com is an RFC 2606 reserved domain. This
+		// fixture asserts the credential gate REJECTS it.
 		`fetch("https://u:p@example.com/api/drop/credential");` +
 		"fetch(\"/api/drop/\u202ebidi\");"
 
