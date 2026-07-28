@@ -557,14 +557,21 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 								"application/json": &openapi3.MediaType{Schema: newSchema},
 							}
 						} else if mt := existing.Value.Content["application/json"]; mt != nil && mt.Schema != nil &&
-							mt.Schema.Value != nil && mt.Schema.Value.Properties != nil {
+							mt.Schema.Value != nil &&
+							(mt.Schema.Value.Properties != nil || mt.Schema.Value.Items != nil) {
 							// Union additively and recursively (LAB-4678 Phase 3):
 							// a field seen in only some observations of this
 							// endpoint+status is preserved even when nested under a
 							// shared parent object, not just at the top level.
-							// Array/scalar schemas have no properties to union;
-							// unionSchemaProperties returns early on a nil src
-							// Properties map, so they leave the base unchanged.
+							//
+							// The Items arm of this guard is load-bearing. A top-level
+							// JSON array — the common collection endpoint, GET /users
+							// returning [{"id":1,"name":"a"}] then [{"id":2,"email":..}]
+							// — has nil Properties, since its fields live under Items.
+							// Gating on Properties alone made unionSchemaProperties'
+							// array recursion unreachable for exactly the case it was
+							// written for, silently dropping later observations' fields.
+							// Scalar schemas have neither and still skip the union.
 							unionSchemaProperties(mt.Schema.Value, newSchema.Value, maxSchemaUnionDepth)
 						}
 					}

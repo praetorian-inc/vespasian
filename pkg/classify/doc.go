@@ -18,11 +18,18 @@
 //
 // Supported API types:
 //   - REST: detected via content-type, path patterns (/api/, /v1/), HTTP
-//     methods, and response structure. A request-side signal (an API path plus
-//     a JSON/XML Accept or request content-type) also classifies an endpoint
-//     whose response was not captured, so the verdict does not depend on
-//     response timing. Static assets are excluded. [DefaultConfidenceThreshold]
-//     is the default minimum confidence.
+//     methods, and response structure. A request-side signal (a JSON/XML Accept
+//     or request content-type, on any path) also classifies an endpoint whose
+//     response was not captured, so the verdict does not depend on response
+//     timing. API media types are not limited to a hardcoded list: any RFC 6839
+//     application/*+json or application/*+xml structured syntax suffix counts,
+//     excluding application/xhtml+xml (a navigation) and application/soap+xml
+//     (owned by the WSDL classifier). An endpoint recovered from a
+//     framework-declared server route — currently a Next.js App Router
+//     route-handler chunk, [crawl.SourceNextRouteHandler] — classifies on that
+//     provenance alone; the corresponding page-route tag deliberately does not.
+//     Static assets are excluded. [DefaultConfidenceThreshold] is the default
+//     minimum confidence.
 //   - GraphQL: detected via /graphql path, query syntax in POST body, and
 //     data/errors keys in response JSON.
 //   - WSDL/SOAP: detected via SOAPAction header, SOAP envelope in body, and

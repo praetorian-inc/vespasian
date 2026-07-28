@@ -48,14 +48,27 @@ const (
 	SourceStaticJS = "static:js"
 	// SourceStaticJSSourcemap marks a request synthesized from a recovered .js.map source.
 	SourceStaticJSSourcemap = "static:js-sourcemap"
+	// SourceNextRouteHandler marks a request recovered from a Next.js App Router
+	// ROUTE HANDLER chunk URL (app/<route>/route-<hash>.js). A route handler is
+	// by definition a server-side HTTP endpoint declared by the framework, which
+	// is why RESTClassifier treats this source as an explicit API signal.
+	SourceNextRouteHandler = "static:js-nextroute"
+	// SourceNextPageRoute marks a request recovered from a Next.js App Router
+	// PAGE chunk URL (app/<route>/page-<hash>.js). A page route is navigational,
+	// not a REST endpoint, so it carries no API signal and is surfaced only as a
+	// near-miss under -v — matching how crawled HTML page routes are treated.
+	SourceNextPageRoute = "static:js-nextpage"
 )
 
 // IsJSStaticSource returns true iff source is one of the JS-bundle
-// static-analysis Source values (SourceStaticJS or SourceStaticJSSourcemap).
-// Other "static:*" sources (e.g. "static:html" from HTML form analysis) are
-// intentionally excluded — they have separate provenance.
+// static-analysis Source values. Other "static:*" sources (e.g. "static:html"
+// from HTML form analysis) are intentionally excluded — they have separate
+// provenance.
 func IsJSStaticSource(source string) bool {
-	return source == SourceStaticJS || source == SourceStaticJSSourcemap
+	return source == SourceStaticJS ||
+		source == SourceStaticJSSourcemap ||
+		source == SourceNextRouteHandler ||
+		source == SourceNextPageRoute
 }
 
 // AnyStaticSource reports whether any ObservedRequest in reqs carries a

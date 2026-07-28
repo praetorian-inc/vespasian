@@ -16,6 +16,7 @@ package classify
 
 import (
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
@@ -33,7 +34,10 @@ var staticPathSegments = []string{
 	"/static/", "/assets/", "/dist/", "/bundle/",
 }
 
-// apiContentTypes lists content types that indicate API responses.
+// apiContentTypes lists exact content types that indicate API responses. It is
+// the first matching tier only — matchAPIContentType also accepts any
+// application/*+json or application/*+xml structured syntax suffix, so this list
+// does not bound what classifies as an API media type.
 var apiContentTypes = []string{
 	"application/json", "application/xml", "text/xml", "application/problem+json",
 	"application/vnd.api+json", "application/hal+json",
@@ -58,6 +62,12 @@ const (
 	// response arrived too late to capture still classifies — the REST-vs-not
 	// verdict then depends on the request, not on response timing (LAB-4678, B2).
 	RequestSignalConfidence = 0.6
+	// FrameworkRouteConfidence is assigned by Rule 7 when the request was
+	// recovered from a framework artifact that declares a server route handler
+	// (currently a Next.js App Router route-handler chunk). The framework
+	// compiling a route handler for a path is direct evidence that the path is
+	// served, so this sits above DefaultConfidenceThreshold on its own.
+	FrameworkRouteConfidence = 0.8
 )
 
 // RESTClassifier classifies REST API requests using ordered heuristic rules.
@@ -82,6 +92,8 @@ func (c *RESTClassifier) Classify(req crawl.ObservedRequest) (bool, float64) {
 //  3. Path heuristics → boost +0.15 (cap 1.0)
 //  4. HTTP method signal → confidence max(current, 0.7)
 //  5. Response structure → confidence max(current, 0.85)
+//  6. Request-side API signal (Accept / request content-type) → max(current, 0.6)
+//  7. Framework-declared server route → max(current, 0.8)
 func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float64, string) { //nolint:gocyclo // multi-signal heuristic classifier
 	parsedURL, err := url.Parse(req.URL)
 	if err != nil {
@@ -202,6 +214,24 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 		reason = appendReason(reason, "request-signal:"+signal)
 	}
 
+	// Rule 7: framework-declared server route (LAB-4678 audit item 7).
+	// A Next.js App Router route handler (app/<route>/route.ts) is by definition
+	// a server-side HTTP endpoint — the framework only compiles that chunk for a
+	// path it will serve. That is stronger, more direct evidence of an API than
+	// any header heuristic above, so it stands on its own.
+	//
+	// Deliberately narrow. It fires only on crawl.SourceNextRouteHandler, which
+	// pkg/analyze/jsstatic sets only for a URL matching the route-handler chunk
+	// pattern. Page-route chunks get crawl.SourceNextPageRoute instead and are
+	// NOT matched here: a page is navigational, not a REST endpoint, and the
+	// pipeline already drops crawled HTML page routes for the same reason.
+	if req.Source == crawl.SourceNextRouteHandler {
+		if confidence < FrameworkRouteConfidence {
+			confidence = FrameworkRouteConfidence
+		}
+		reason = appendReason(reason, "framework-route:next-app-router")
+	}
+
 	return confidence > 0, confidence, reason
 }
 
@@ -215,16 +245,83 @@ func appendReason(existing, sig string) string {
 	return existing + "+" + sig
 }
 
+// Structured-syntax-suffix families (RFC 6839). Returned as the match token for
+// any application/<vendor>+json or +xml media type so the -v reason string stays
+// a fixed vocabulary instead of echoing an unbounded vendor type.
+const (
+	SuffixFamilyJSON = "application/*+json"
+	SuffixFamilyXML  = "application/*+xml"
+)
+
+// navigationContentTypes are document media types that must never count as an
+// API signal even though one of them carries a +xml structured suffix.
+// application/xhtml+xml is a page, not an API, and browsers send it on every
+// navigation; without this exclusion the suffix rule below would classify every
+// HTML page load as REST.
+var navigationContentTypes = []string{
+	"text/html", "application/xhtml+xml",
+}
+
+// soapContentTypes are SOAP media types that carry a +xml structured suffix but
+// belong to WSDLClassifier, not this one. Without this exclusion the suffix tier
+// would make every SOAP response count as REST as well as WSDL, inflating the
+// REST tally that DetectAPIType weighs against the WSDL tally and making a
+// genuinely SOAP-dominant capture unable to win its own type.
+//
+// text/xml is deliberately NOT here: it is a generic XML type shared by REST and
+// SOAP, it predates this rule as an exact apiContentTypes entry, and removing it
+// would change long-standing REST classification behavior.
+var soapContentTypes = []string{
+	"application/soap+xml",
+}
+
 // matchAPIContentType canonicalizes ct (lowercase + charset/parameter strip via
-// mediatype.Base) and returns the matching apiContentTypes entry, or "" if none
-// matches. Shared by Rule 2 (response content-type) and Rule 6 (request
-// content-type) so both apply one matching rule (QUAL-004).
+// mediatype.Base) and returns a stable token identifying the API media type, or
+// "" if it is not an API type. Shared by Rule 2 (response content-type) and
+// Rule 6 (request content-type) so both apply one matching rule (QUAL-004).
+//
+// Two tiers, in order:
+//  1. Exact match against apiContentTypes, returning the entry itself.
+//  2. RFC 6839 structured syntax suffix: any application/<vendor>+json or
+//     application/<vendor>+xml, returning the suffix family token.
+//
+// Tier 2 exists because apiContentTypes is a closed hand-maintained list and was
+// therefore blind by construction to the large open set of real API media types
+// built on the +json/+xml suffixes — application/ld+json, application/geo+json,
+// application/vnd.github+json, application/atom+xml and so on (LAB-4678: the
+// Success criterion is that classification is not limited to hardcoded
+// content-type allowlists). Matching the suffix rather than enumerating vendors
+// is what removes the hardcoding.
+//
+// The suffix tier is narrow on purpose: it requires the application/ top-level
+// type, so text/* and image/* cannot match, and navigationContentTypes is
+// excluded first so application/xhtml+xml stays a navigation.
 func matchAPIContentType(ct string) string {
 	base := mediatype.Base(ct)
+	if base == "" {
+		return ""
+	}
+	for _, nav := range navigationContentTypes {
+		if base == nav {
+			return ""
+		}
+	}
 	for _, apiCT := range apiContentTypes {
 		if base == apiCT {
 			return apiCT
 		}
+	}
+	if !strings.HasPrefix(base, "application/") {
+		return ""
+	}
+	if slices.Contains(soapContentTypes, base) {
+		return ""
+	}
+	switch {
+	case strings.HasSuffix(base, "+json"):
+		return SuffixFamilyJSON
+	case strings.HasSuffix(base, "+xml"):
+		return SuffixFamilyXML
 	}
 	return ""
 }
@@ -249,9 +346,13 @@ func acceptSignalsAPI(accept string) string {
 			mt = mt[:i]
 		}
 		mt = strings.ToLower(strings.TrimSpace(mt))
-		if mt == "text/html" || mt == "application/xhtml+xml" {
+		if slices.Contains(navigationContentTypes, mt) {
 			// A document-navigation marker anywhere in the header disqualifies
-			// the whole request as API intent.
+			// the whole request as API intent. This is stronger than
+			// matchAPIContentType's own exclusion, which only rejects the single
+			// type it is handed: here one navigation marker poisons the entire
+			// Accept header, so "text/html, application/json" is a page load
+			// rather than API intent. Both read the same list.
 			return ""
 		}
 		if match == "" {

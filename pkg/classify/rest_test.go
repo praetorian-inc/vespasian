@@ -677,3 +677,136 @@ func TestRESTClassifier_Deterministic(t *testing.T) {
 		assert.Equal(t, reason0, reason)
 	}
 }
+
+// TestMatchAPIContentType_StructuredSuffix pins the LAB-4678 audit item-4 fix:
+// classification must not be limited to the hardcoded apiContentTypes list.
+// Any RFC 6839 application/<vendor>+json or +xml structured syntax suffix is an
+// API media type, while navigation and non-application types are not.
+func TestMatchAPIContentType_StructuredSuffix(t *testing.T) {
+	tests := []struct {
+		name string
+		ct   string
+		want string
+	}{
+		// Tier 1: exact entries still return themselves, unchanged.
+		{"exact json", "application/json", "application/json"},
+		{"exact json with charset", "application/json; charset=utf-8", "application/json"},
+		{"exact text/xml", "text/xml", "text/xml"},
+		{"exact hal", "application/hal+json", "application/hal+json"},
+
+		// Tier 2: the open set the hardcoded list was blind to.
+		{"json-ld", "application/ld+json", SuffixFamilyJSON},
+		{"geo+json", "application/geo+json", SuffixFamilyJSON},
+		{"vendor github", "application/vnd.github+json", SuffixFamilyJSON},
+		{"vendor with params", "application/vnd.acme.v2+json; charset=utf-8", SuffixFamilyJSON},
+		{"atom+xml", "application/atom+xml", SuffixFamilyXML},
+		{"soap+xml belongs to WSDLClassifier", "application/soap+xml", ""},
+
+		// Excluded: navigation types, one of which carries a +xml suffix and
+		// would otherwise match tier 2 on every HTML page load.
+		{"xhtml is navigation", "application/xhtml+xml", ""},
+		{"html is navigation", "text/html", ""},
+
+		// Excluded: suffix rule requires the application/ top-level type.
+		{"text plus json is not application", "text/x-thing+json", ""},
+		{"image plus xml is not application", "image/svg+xml", ""},
+
+		// Excluded: no suffix, no exact match.
+		{"plain text", "text/plain", ""},
+		{"octet stream", "application/octet-stream", ""},
+		{"empty", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, matchAPIContentType(tt.ct))
+		})
+	}
+}
+
+// TestRESTClassifier_VendorJSONResponseClassifies pins the end-to-end effect of
+// the suffix tier: a real API returning a vendor JSON media type that is absent
+// from apiContentTypes now clears the confidence threshold instead of scoring 0.
+func TestRESTClassifier_VendorJSONResponseClassifies(t *testing.T) {
+	c := &RESTClassifier{}
+	req := crawl.ObservedRequest{
+		Method: "GET",
+		URL:    "https://example.com/widgets",
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "application/vnd.acme.widget+json",
+		},
+	}
+
+	isAPI, confidence, reason := c.ClassifyDetail(req)
+	assert.True(t, isAPI)
+	assert.GreaterOrEqual(t, confidence, DefaultConfidenceThreshold,
+		"a vendor +json response must clear the threshold on its content type alone")
+	assert.Contains(t, reason, "content-type:"+SuffixFamilyJSON,
+		"the reason must report the stable suffix family, not the unbounded vendor type")
+}
+
+// TestRESTClassifier_XHTMLNavigationStillNotAPI guards the suffix tier against
+// the over-classification it could have introduced: application/xhtml+xml ends
+// in +xml, and every browser page load carries it.
+func TestRESTClassifier_XHTMLNavigationStillNotAPI(t *testing.T) {
+	c := &RESTClassifier{}
+	req := crawl.ObservedRequest{
+		Method:   "GET",
+		URL:      "https://example.com/api/docs",
+		Headers:  map[string]string{"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+		Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/xhtml+xml"},
+	}
+
+	_, confidence, _ := c.ClassifyDetail(req)
+	assert.Less(t, confidence, DefaultConfidenceThreshold,
+		"an xhtml page load under an /api/ path must stay below the threshold")
+}
+
+// TestRESTClassifier_NextRouteHandlerIsAPI pins Rule 7 (LAB-4678 audit item 7):
+// an endpoint recovered from a Next.js App Router route-handler chunk is a
+// framework-declared server route and must classify as an API on that basis
+// alone, with no response body, content type, or Accept header to lean on.
+func TestRESTClassifier_NextRouteHandlerIsAPI(t *testing.T) {
+	c := &RESTClassifier{}
+	req := crawl.ObservedRequest{
+		Method: "GET",
+		URL:    "https://app.test/api/files",
+		Source: crawl.SourceNextRouteHandler,
+	}
+
+	isAPI, confidence, reason := c.ClassifyDetail(req)
+	assert.True(t, isAPI)
+	assert.GreaterOrEqual(t, confidence, DefaultConfidenceThreshold,
+		"a framework-declared route handler must clear the threshold unaided")
+	assert.Contains(t, reason, "framework-route:next-app-router")
+}
+
+// TestRESTClassifier_NextPageRouteIsNotAPI pins the other half of the item-7
+// design: a PAGE route is navigational, not a REST endpoint, so it must stay
+// below the threshold and out of the spec. Without this split, recovering
+// Next.js routes would fill the OpenAPI document with page navigations.
+func TestRESTClassifier_NextPageRouteIsNotAPI(t *testing.T) {
+	c := &RESTClassifier{}
+	req := crawl.ObservedRequest{
+		Method: "GET",
+		URL:    "https://app.test/vaults/{vaultId}",
+		Source: crawl.SourceNextPageRoute,
+	}
+
+	_, confidence, reason := c.ClassifyDetail(req)
+	assert.Less(t, confidence, DefaultConfidenceThreshold,
+		"a page route must not be classified as a REST endpoint")
+	assert.NotContains(t, reason, "framework-route")
+}
+
+// TestRESTClassifier_FrameworkRuleDoesNotFireOnOtherSources guards the narrow
+// scoping of Rule 7: no other Source value may trigger it.
+func TestRESTClassifier_FrameworkRuleDoesNotFireOnOtherSources(t *testing.T) {
+	c := &RESTClassifier{}
+	for _, src := range []string{"", crawl.SourceStaticJS, crawl.SourceStaticJSSourcemap, "static:html", "static:js-nextroute-x"} {
+		req := crawl.ObservedRequest{Method: "GET", URL: "https://app.test/files", Source: src}
+		_, _, reason := c.ClassifyDetail(req)
+		assert.NotContains(t, reason, "framework-route", "source %q must not trigger Rule 7", src)
+	}
+}

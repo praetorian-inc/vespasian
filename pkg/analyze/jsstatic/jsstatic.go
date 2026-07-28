@@ -326,6 +326,17 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	var result perBundleResult
 	body := req.Response.Body
 
+	// Next.js App Router route recovery (LAB-4678 audit item 7). Derived from the
+	// bundle URL, not its body, so it runs before body extraction and still
+	// applies to bundles whose parse times out or panics below. See nextroute.go
+	// for why the URL carries the route.
+	if ep := extractNextRoute(req.URL, req.PageURL); ep != nil {
+		result.stats.EndpointsFound++
+		synth := toRequests([]ExtractedEndpoint{*ep}, req.URL)
+		result.requests = append(result.requests, synth...)
+		result.stats.EndpointsKept += len(synth)
+	}
+
 	// Sourcemap recovery (ctx propagated for remote fetch cancellation).
 	smSources, smStats := recoverSourcemap(ctx, body, req.URL, opts)
 	result.stats.SourcemapFetchFails += smStats.SourcemapFetchFails

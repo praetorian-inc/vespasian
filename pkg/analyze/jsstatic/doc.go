@@ -32,13 +32,35 @@
 //     JSON body ({"a": null, "b": null}) so the existing
 //     pkg/generate/rest.InferSchema produces an object schema downstream.
 //
+// # Next.js App Router routes
+//
+// Body extraction only finds paths that exist as literals. React Server
+// Components and Server Actions build their request paths at runtime, so an RSC
+// bundle can contain no API path at all — a marker scan of one real 44-bundle
+// capture found zero.
+//
+// The route is still recoverable, because the App Router names each page and
+// route-handler chunk after the route's own directory:
+//
+//	/_next/static/chunks/app/vaults/%5BvaultId%5D/page-8ca1aac6111f15fc.js
+//	  -> /vaults/{vaultId}
+//
+// nextroute.go derives routes from those URLs independently of the body, so it
+// works on bundles that yield nothing to jsluice and on bundles whose parse
+// fails outright. Route groups, parallel-route slots, private folders and
+// intercepting prefixes are dropped; dynamic and catch-all segments become
+// OpenAPI {param} form. Server-action endpoints remain unrecoverable statically.
+//
 // # Source tagging
 //
-// Each synthesized [crawl.ObservedRequest] carries Source = "static:js" or
-// "static:js-sourcemap". The OpenAPI generator strips the "static:" prefix
-// when emitting the x-vespasian-source extension on each operation
-// ("static:js" -> "js-bundle", "static:js-sourcemap" -> "js-sourcemap";
-// any dynamic-source group resolves to "dynamic", which wins on mixed groups).
+// Each synthesized [crawl.ObservedRequest] carries one of Source = "static:js",
+// "static:js-sourcemap", "static:js-nextroute" (an App Router route handler,
+// which pkg/classify treats as a server endpoint) or "static:js-nextpage" (an
+// App Router page route, which is navigational and carries no API signal).
+// The OpenAPI generator strips the "static:" prefix when emitting the
+// x-vespasian-source extension on each operation ("static:js" -> "js-bundle",
+// "static:js-sourcemap" -> "js-sourcemap"; any dynamic-source group resolves to
+// "dynamic", which wins on mixed groups).
 //
 // # Security and Operator Considerations
 //

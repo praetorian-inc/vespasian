@@ -2455,3 +2455,109 @@ func TestUnionSchemaProperties_NestedArrayOfObjects(t *testing.T) {
 	assert.NotContains(t, shallowDst.Properties["rows"].Value.Items.Value.Properties, "b",
 		"array items must consume a depth level")
 }
+
+// jsonObservation builds one classified observation of the same endpoint with
+// the given status and JSON response body. Shared by the buildOperation-level
+// response-merge tests below.
+func jsonObservation(status int, body string) classify.ClassifiedRequest {
+	return classify.ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: "GET",
+			URL:    "https://api.test/users",
+			Response: crawl.ObservedResponse{
+				StatusCode:  status,
+				ContentType: "application/json",
+				Body:        []byte(body),
+			},
+		},
+		IsAPI:      true,
+		APIType:    "rest",
+		Confidence: 0.9,
+	}
+}
+
+// TestBuildOperation_TopLevelArrayResponseUnion pins the LAB-4678 audit item-10
+// fix END TO END through buildOperation, not by calling unionSchemaProperties
+// directly. The direct-call tests above all bypassed the caller guard in
+// buildOperation, which gated the union on Properties != nil — nil for a
+// top-level array — making the array recursion unreachable for exactly the
+// collection-endpoint case it was written for. Later observations' item fields
+// were silently dropped from the spec.
+func TestBuildOperation_TopLevelArrayResponseUnion(t *testing.T) {
+	group := []classify.ClassifiedRequest{
+		jsonObservation(200, `[{"id":1,"name":"a"}]`),
+		jsonObservation(200, `[{"id":2,"email":"b@x"}]`),
+	}
+
+	op := buildOperation(endpointKey{method: "GET", path: "/users"}, group, false)
+
+	resp := op.Responses.Value("200")
+	require.NotNil(t, resp)
+	require.NotNil(t, resp.Value)
+	mt := resp.Value.Content["application/json"]
+	require.NotNil(t, mt)
+	require.NotNil(t, mt.Schema)
+	require.NotNil(t, mt.Schema.Value)
+
+	schema := mt.Schema.Value
+	require.Nil(t, schema.Properties, "a top-level array schema must have nil Properties (the condition that broke the guard)")
+	require.NotNil(t, schema.Items, "top-level array response must expose Items")
+	require.NotNil(t, schema.Items.Value)
+
+	props := schema.Items.Value.Properties
+	assert.Contains(t, props, "id", "field common to both observations must survive")
+	assert.Contains(t, props, "name", "field from the first observation must survive")
+	assert.Contains(t, props, "email", "field from the SECOND observation must survive the union")
+}
+
+// TestBuildOperation_ArrayResponseUnionIsOrderIndependent pins that the array
+// union does not depend on which observation buildOperation sees first, so the
+// emitted spec stays a deterministic function of the observation set.
+func TestBuildOperation_ArrayResponseUnionIsOrderIndependent(t *testing.T) {
+	forward := []classify.ClassifiedRequest{
+		jsonObservation(200, `[{"id":1,"name":"a"}]`),
+		jsonObservation(200, `[{"id":2,"email":"b@x"}]`),
+	}
+	reversed := []classify.ClassifiedRequest{
+		jsonObservation(200, `[{"id":2,"email":"b@x"}]`),
+		jsonObservation(200, `[{"id":1,"name":"a"}]`),
+	}
+
+	itemProps := func(group []classify.ClassifiedRequest) map[string]*openapi3.SchemaRef {
+		op := buildOperation(endpointKey{method: "GET", path: "/users"}, group, false)
+		return op.Responses.Value("200").Value.Content["application/json"].Schema.Value.Items.Value.Properties
+	}
+
+	for _, name := range []string{"id", "name", "email"} {
+		assert.Contains(t, itemProps(forward), name, "forward order must union %q", name)
+		assert.Contains(t, itemProps(reversed), name, "reversed order must union %q", name)
+	}
+}
+
+// TestBuildOperation_PreservesRequestResponsePairingByStatus pins the pairing
+// half of LAB-4678's "spec preserves response fields and request/response
+// pairing across observations". OpenAPI expresses that correspondence only
+// through per-status response entries, so preserving it means two observations
+// of the same endpoint with different statuses keep two distinct response
+// schemas rather than collapsing into one merged shape.
+func TestBuildOperation_PreservesRequestResponsePairingByStatus(t *testing.T) {
+	group := []classify.ClassifiedRequest{
+		jsonObservation(200, `{"id":1,"name":"ok"}`),
+		jsonObservation(422, `{"error":"bad","field":"name"}`),
+	}
+
+	op := buildOperation(endpointKey{method: "GET", path: "/users"}, group, false)
+
+	okResp := op.Responses.Value("200")
+	errResp := op.Responses.Value("422")
+	require.NotNil(t, okResp, "200 observation must keep its own response entry")
+	require.NotNil(t, errResp, "422 observation must keep its own response entry")
+
+	okProps := okResp.Value.Content["application/json"].Schema.Value.Properties
+	errProps := errResp.Value.Content["application/json"].Schema.Value.Properties
+
+	assert.Contains(t, okProps, "name")
+	assert.NotContains(t, okProps, "error", "the 422 body must not leak into the 200 schema")
+	assert.Contains(t, errProps, "error")
+	assert.NotContains(t, errProps, "id", "the 200 body must not leak into the 422 schema")
+}

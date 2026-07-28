@@ -233,3 +233,131 @@ func TestDetectAPIType_PrefersWSDL(t *testing.T) {
 	got := pipeline.DetectAPIType(requests, 0.5)
 	assert.Equal(t, pipeline.APITypeWSDL, got)
 }
+
+// ---------------------------------------------------------------------------
+// LAB-4678 audit item 3: the API-type verdict must not turn on how many
+// endpoints happened to be emitted that run.
+// ---------------------------------------------------------------------------
+
+// restReq is a plain REST JSON request: REST-only signal.
+func restReq(n int) crawl.ObservedRequest {
+	return crawl.ObservedRequest{
+		Method:  "POST",
+		URL:     "https://x.com/api/users",
+		Headers: map[string]string{"Content-Type": "application/json"},
+		Body:    []byte(`{"name":"a"}`),
+		Response: crawl.ObservedResponse{
+			StatusCode: 200, ContentType: "application/json",
+			Body: []byte(`{"id":` + string(rune('0'+n%10)) + `}`),
+		},
+	}
+}
+
+// graphqlReq is a textbook GraphQL call. It also scores 0.95 on the REST
+// classifier, which is exactly why exclusive assignment is needed.
+func graphqlReq() crawl.ObservedRequest {
+	return crawl.ObservedRequest{
+		Method:  "POST",
+		URL:     "https://x.com/graphql",
+		Headers: map[string]string{"Content-Type": "application/json"},
+		Body:    []byte(`{"query":"{ user { id } }"}`),
+		Response: crawl.ObservedResponse{
+			StatusCode: 200, ContentType: "application/json",
+			Body: []byte(`{"data":{"user":{"id":"1"}}}`),
+		},
+	}
+}
+
+// strayXMLReq is the weak minority signal whose ability to retype a whole
+// capture caused the earlier presence-wins attempt to be reverted.
+func strayXMLReq() crawl.ObservedRequest {
+	return crawl.ObservedRequest{
+		Method:   "GET",
+		URL:      "https://x.com/feed",
+		Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "text/xml"},
+	}
+}
+
+func repeat(req func(int) crawl.ObservedRequest, n int) []crawl.ObservedRequest {
+	out := make([]crawl.ObservedRequest, 0, n)
+	for i := range n {
+		out = append(out, req(i))
+	}
+	return out
+}
+
+// TestDetectAPIType_StableAcrossNearTieCounts is the core item-3 assertion. The
+// old raw-count rule flipped the verdict between REST and GraphQL on a single
+// observation around the tie point. Sweeping the REST count across that region
+// must now produce one stable answer.
+func TestDetectAPIType_StableAcrossNearTieCounts(t *testing.T) {
+	const graphqlN = 10
+
+	var verdicts []string
+	for restN := 8; restN <= 12; restN++ {
+		reqs := repeat(restReq, restN)
+		for range graphqlN {
+			reqs = append(reqs, graphqlReq())
+		}
+		verdicts = append(verdicts, pipeline.DetectAPIType(reqs, 0.5))
+	}
+
+	for i, got := range verdicts {
+		assert.Equal(t, verdicts[0], got,
+			"verdict changed at restN=%d: the type must not turn on ±1 captured request", 8+i)
+	}
+}
+
+// TestDetectAPIType_StrayXMLCannotRetypeRESTApp pins the failure that caused the
+// earlier revert: one incidental text/xml response in a REST-dominant capture
+// must not produce a WSDL spec and discard the REST surface.
+func TestDetectAPIType_StrayXMLCannotRetypeRESTApp(t *testing.T) {
+	reqs := append(repeat(restReq, 20), strayXMLReq())
+	assert.Equal(t, pipeline.APITypeREST, pipeline.DetectAPIType(reqs, 0.5),
+		"a single stray text/xml must not retype a 20-request REST surface")
+}
+
+// TestDetectAPIType_DominantSurfaceStillWins pins that the stability rules did
+// not cost dominant-surface selection: a genuinely GraphQL-dominant capture is
+// still typed GraphQL.
+func TestDetectAPIType_DominantSurfaceStillWins(t *testing.T) {
+	reqs := repeat(restReq, 2)
+	for range 20 {
+		reqs = append(reqs, graphqlReq())
+	}
+	assert.Equal(t, pipeline.APITypeGraphQL, pipeline.DetectAPIType(reqs, 0.5),
+		"a 20-vs-2 GraphQL majority must still win the verdict")
+}
+
+// TestDetectAPIType_ExclusiveAssignment pins that a request votes once. A
+// GraphQL call scores 0.95 on BOTH the GraphQL and REST classifiers; under the
+// old double-counting model those 5 calls also produced restCount=5, so GraphQL
+// could never out-count a REST tally that already contained it.
+func TestDetectAPIType_ExclusiveAssignment(t *testing.T) {
+	var reqs []crawl.ObservedRequest
+	for range 5 {
+		reqs = append(reqs, graphqlReq())
+	}
+	assert.Equal(t, pipeline.APITypeGraphQL, pipeline.DetectAPIType(reqs, 0.5),
+		"GraphQL requests must not also count toward the REST tally")
+}
+
+// TestDetectAPIType_VerdictIndependentOfEmittedCount pins the criterion as
+// literally worded: scaling the capture up and down, holding the mix fixed,
+// must not change the verdict. This is the truncation case — a shorter run
+// emits fewer endpoints in the same proportions.
+func TestDetectAPIType_VerdictIndependentOfEmittedCount(t *testing.T) {
+	build := func(scale int) []crawl.ObservedRequest {
+		reqs := repeat(restReq, 1*scale)
+		for range 4 * scale {
+			reqs = append(reqs, graphqlReq())
+		}
+		return reqs
+	}
+
+	want := pipeline.DetectAPIType(build(1), 0.5)
+	for _, scale := range []int{2, 3, 5, 10} {
+		assert.Equal(t, want, pipeline.DetectAPIType(build(scale), 0.5),
+			"verdict must not depend on how many endpoints were emitted (scale=%d)", scale)
+	}
+}
