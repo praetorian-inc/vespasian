@@ -97,12 +97,21 @@ type PendingURL struct {
 // net/http backend would mark JS-discovered pages as already covered and skip
 // them, permanently losing that surface — so a backend change invalidates the
 // checkpoint just like a scope change.
-func ComputeConfigFingerprint(targetURL, scope string, depth int, headless bool) string {
+//
+// allowPrivate is included because it changes what the crawl is PERMITTED to
+// reach, not merely how much of it. A checkpoint recorded with private targets
+// allowed carries pending URLs and covered keys that the stricter config would
+// never have produced, so reusing it across that boundary is a policy change,
+// not resumed coverage. [urlFrontier.Restore] independently re-validates every
+// restored pending URL against the current scope predicate; this is the second
+// layer, so the two must both fail before a checkpoint can widen the crawl's
+// reach (Codex review, PR #189).
+func ComputeConfigFingerprint(targetURL, scope string, depth int, headless, allowPrivate bool) string {
 	// Length-prefix each field so ("a","b") and ("ab","") cannot collide, then
 	// hash the assembled input in one shot.
 	field := func(s string) string { return strconv.Itoa(len(s)) + ":" + s }
 	input := field(targetURL) + field(scope) + field(strconv.Itoa(depth)) +
-		field(strconv.FormatBool(headless))
+		field(strconv.FormatBool(headless)) + field(strconv.FormatBool(allowPrivate))
 	sum := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(sum[:])
 }

@@ -62,12 +62,6 @@ const (
 	// response arrived too late to capture still classifies — the REST-vs-not
 	// verdict then depends on the request, not on response timing (LAB-4678, B2).
 	RequestSignalConfidence = 0.6
-	// FrameworkRouteConfidence is assigned by Rule 7 when the request was
-	// recovered from a framework artifact that declares a server route handler
-	// (currently a Next.js App Router route-handler chunk). The framework
-	// compiling a route handler for a path is direct evidence that the path is
-	// served, so this sits above DefaultConfidenceThreshold on its own.
-	FrameworkRouteConfidence = 0.8
 )
 
 // RESTClassifier classifies REST API requests using ordered heuristic rules.
@@ -93,7 +87,6 @@ func (c *RESTClassifier) Classify(req crawl.ObservedRequest) (bool, float64) {
 //  4. HTTP method signal → confidence max(current, 0.7)
 //  5. Response structure → confidence max(current, 0.85)
 //  6. Request-side API signal (Accept / request content-type) → max(current, 0.6)
-//  7. Framework-declared server route → max(current, 0.8)
 func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float64, string) { //nolint:gocyclo // multi-signal heuristic classifier
 	parsedURL, err := url.Parse(req.URL)
 	if err != nil {
@@ -214,23 +207,17 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 		reason = appendReason(reason, "request-signal:"+signal)
 	}
 
-	// Rule 7: framework-declared server route (LAB-4678 audit item 7).
-	// A Next.js App Router route handler (app/<route>/route.ts) is by definition
-	// a server-side HTTP endpoint — the framework only compiles that chunk for a
-	// path it will serve. That is stronger, more direct evidence of an API than
-	// any header heuristic above, so it stands on its own.
-	//
-	// Deliberately narrow. It fires only on crawl.SourceNextRouteHandler, which
-	// pkg/analyze/jsstatic sets only for a URL matching the route-handler chunk
-	// pattern. Page-route chunks get crawl.SourceNextPageRoute instead and are
-	// NOT matched here: a page is navigational, not a REST endpoint, and the
-	// pipeline already drops crawled HTML page routes for the same reason.
-	if req.Source == crawl.SourceNextRouteHandler {
-		if confidence < FrameworkRouteConfidence {
-			confidence = FrameworkRouteConfidence
-		}
-		reason = appendReason(reason, "framework-route:next-app-router")
-	}
+	// There is deliberately no rule keyed on a Next.js route-handler Source.
+	// An App Router route-handler chunk URL proves the PATH is served but says
+	// nothing about which verbs the module exports. Classifying it as an API on
+	// provenance alone made the generator emit a `get` operation for a route that
+	// may export only POST, and nothing downstream corrects that: the OPTIONS
+	// probe records ClassifiedRequest.AllowedMethods, but pkg/generate/rest does
+	// not read it, so the invented verb survives into the spec (Codex review, PR
+	// #189). A recovered route is therefore surfaced as a sub-threshold near-miss
+	// under -v rather than documented as an operation that may not exist.
+	// Restoring it correctly means teaching the generator to emit operations from
+	// AllowedMethods, which is a separate change.
 
 	return confidence > 0, confidence, reason
 }

@@ -135,10 +135,16 @@ func scopeChecker(seedURL string, scope string, allowPrivate bool) (func(string)
 //  2. It is one-shot and adds exactly ONE origin: the scheme://host the seed
 //     resolved to. It is not a domain-level relaxation, and a second call (a
 //     resumed depth-0 entry, a retry) cannot add another origin.
-//  3. The SSRF gate still applies. A seed that redirects to 127.0.0.1,
+//  3. The learned origin must share the seed's REGISTRABLE DOMAIN. http→https and
+//     apex→www always do; an IdP hand-off, an open redirect on the seed, or any
+//     other foreign-domain target does not, and is refused. Without this the
+//     widening turned one redirect into crawl scope the operator never authorized,
+//     defeating --scope as a containment control (Codex review, PR #189).
+//  4. The SSRF gate still applies. A seed that redirects to 127.0.0.1,
 //     169.254.169.254, or any RFC1918 address is refused unless the operator
-//     passed --dangerous-allow-private, exactly as for the seed itself.
-//  4. The widening is announced on stderr, so the operator sees the effective
+//     passed --dangerous-allow-private, exactly as for the seed itself. The
+//     verdict is taken once, at learn time, not per URL.
+//  5. The widening is announced on stderr, so the operator sees the effective
 //     scope of the run instead of silently getting a wider crawl.
 //
 // This applies to the headless backend only. On the net/http backend
@@ -182,7 +188,8 @@ func newSeedScope(seedURL, scope string, allowPrivate bool, stderr io.Writer) (*
 }
 
 // Check reports whether rawURL is in scope: either the configured policy accepts
-// it, or it is on the seed's learned effective origin and passes the SSRF gate.
+// it, or it is on the seed's learned effective origin, which cleared the domain
+// and SSRF gates once at learn time.
 func (s *seedScope) Check(rawURL string) bool {
 	if s.base(rawURL) {
 		return true
@@ -193,14 +200,13 @@ func (s *seedScope) Check(rawURL string) bool {
 	if eff == "" {
 		return false
 	}
-	u := parseHTTPURL(rawURL)
-	if u == nil {
-		return false
-	}
-	if originOf(rawURL) != eff {
-		return false
-	}
-	return s.allowPrivate || !isPrivateHost(u.Hostname())
+	// A plain string comparison: the effective origin already cleared the domain
+	// and private-host gates in LearnEffectiveOrigin, and it is a single fixed
+	// host whose verdict cannot change within a run. Re-running isPrivateHost here
+	// re-did an unbounded, uncached net.LookupHost on the per-captured-request
+	// scope hot path, and s.base had already paid for one lookup before returning
+	// false (CodeRabbit review, PR #189).
+	return originOf(rawURL) == eff
 }
 
 // LearnEffectiveOrigin records the origin the seed page actually resolved to and,
@@ -215,26 +221,47 @@ func (s *seedScope) LearnEffectiveOrigin(effectiveURL string) {
 	}
 	origin := originOf(effectiveURL)
 
+	// Claim the one-shot under the lock, then RELEASE it before the domain and
+	// private-host checks. isPrivateHost is an unbounded, uncached net.LookupHost;
+	// holding the exclusive lock across it blocked every concurrent Check for the
+	// whole resolution. The learned flag already guarantees only one caller gets
+	// past here, so the checks need no lock — it is only reacquired to publish the
+	// result (CodeRabbit review, PR #189).
 	s.mu.Lock()
 	if s.learned {
 		s.mu.Unlock()
 		return
 	}
 	s.learned = true
+	s.mu.Unlock()
+
 	if origin == s.seedOrigin {
-		s.mu.Unlock()
+		return
+	}
+	// The widening exists for http→https and apex→www, which are always the SAME
+	// registrable domain. A redirect to a FOREIGN domain is a different thing: an
+	// IdP hand-off, an open redirect on the seed, or an attacker-controlled
+	// target. Admitting it would turn one redirect into crawl scope the operator
+	// never authorized, defeating --scope as a containment control. Constrain the
+	// learned origin to the seed's registrable domain before publishing it
+	// (Codex review, PR #189).
+	if !s.sameRegistrableDomain(u.Hostname()) {
+		if s.stderr != nil {
+			fmt.Fprintf(s.stderr, "scope: seed redirected to %s, a different domain than %s; not adding it to scope\n", //nolint:errcheck // best-effort status
+				origin, s.seedOrigin)
+		}
 		return
 	}
 	// The SSRF decision is taken before publishing the origin so the operator is
 	// never told the scope widened to a host the crawl will then refuse.
 	if !s.allowPrivate && isPrivateHost(u.Hostname()) {
-		s.mu.Unlock()
 		if s.stderr != nil {
 			fmt.Fprintf(s.stderr, "scope: seed redirected to private origin %s; not adding it to scope (pass %s to allow)\n", //nolint:errcheck // best-effort status
 				origin, flagDangerousAllowPrivate)
 		}
 		return
 	}
+	s.mu.Lock()
 	s.effOrigin = origin
 	s.mu.Unlock()
 
@@ -242,6 +269,31 @@ func (s *seedScope) LearnEffectiveOrigin(effectiveURL string) {
 		fmt.Fprintf(s.stderr, "scope: seed %s redirected to %s; treating that origin as in scope for this crawl\n", //nolint:errcheck // best-effort status
 			s.seedOrigin, origin)
 	}
+}
+
+// sameRegistrableDomain reports whether host shares the seed's registrable
+// domain, which is the bound on how far the seed-redirect widening may reach.
+//
+// It falls back to an exact hostname match when either side has no registrable
+// domain — an IP-literal or single-label seed such as http://127.0.0.1:8080 or
+// http://localhost. That still permits the scheme-only case the widening exists
+// for (http→https on the same host) while refusing to treat one bare host as
+// equivalent to any other. The seed hostname is read from seedOrigin rather than
+// stored separately so there is one source of truth for what the seed was.
+func (s *seedScope) sameRegistrableDomain(host string) bool {
+	seedHost := ""
+	if u := parseHTTPURL(s.seedOrigin); u != nil {
+		seedHost = u.Hostname()
+	}
+	if seedHost == "" || host == "" {
+		return false
+	}
+	seedDomain, seedErr := registeredDomain(seedHost)
+	hostDomain, hostErr := registeredDomain(host)
+	if seedErr != nil || hostErr != nil {
+		return strings.EqualFold(seedHost, host)
+	}
+	return strings.EqualFold(seedDomain, hostDomain)
 }
 
 // parseHTTPURL parses a URL and returns nil if it is invalid or not HTTP(S).

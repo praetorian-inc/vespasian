@@ -450,9 +450,13 @@ func TestSeedScope_LearnNoopOnSameOrigin(t *testing.T) {
 	}
 }
 
-// TestSeedScope_RefusesPrivateEffectiveOrigin verifies the SSRF gate still holds
-// over the widened origin: a seed that redirects to a private host must not pull
-// that host into scope without --dangerous-allow-private.
+// TestSeedScope_RefusesPrivateEffectiveOrigin verifies the gates still hold over
+// the widened origin: a seed that redirects to a private host on a DIFFERENT
+// domain must not pull that host into scope. Since the Codex review of PR #189
+// the domain constraint is checked first, so this is refused as a foreign domain
+// rather than as a private origin — either way it stays out of scope, and it is
+// now refused even with --dangerous-allow-private, because a cross-domain
+// redirect is not what the seed widening exists for.
 func TestSeedScope_RefusesPrivateEffectiveOrigin(t *testing.T) {
 	var stderr bytes.Buffer
 	s, err := newSeedScope("https://example.com", "same-origin", false, &stderr)
@@ -463,7 +467,74 @@ func TestSeedScope_RefusesPrivateEffectiveOrigin(t *testing.T) {
 	if s.Check("http://127.0.0.1:8080/admin") {
 		t.Error("private effective origin was admitted without --dangerous-allow-private")
 	}
-	if !strings.Contains(stderr.String(), "private origin") {
-		t.Errorf("private-origin refusal not reported; stderr = %q", stderr.String())
+	if !strings.Contains(stderr.String(), "different domain") {
+		t.Errorf("cross-domain refusal not reported; stderr = %q", stderr.String())
 	}
+}
+
+// TestSeedScope_RefusesPrivateSameDomainOrigin exercises the SSRF gate on the
+// path that now reaches it: the redirect target shares the seed's registrable
+// domain, so the domain constraint passes and the private-host check is what
+// refuses it. This is the case where the --dangerous-allow-private hint is the
+// useful diagnostic.
+func TestSeedScope_RefusesPrivateSameDomainOrigin(t *testing.T) {
+	var stderr bytes.Buffer
+	s, err := newSeedScope("https://intranet.example.com", "same-origin", false, &stderr)
+	if err != nil {
+		t.Fatalf("newSeedScope: %v", err)
+	}
+	// Same registrable domain (example.com), but the host resolves privately.
+	s.LearnEffectiveOrigin("https://localhost.example.com/")
+	if !strings.Contains(stderr.String(), "private origin") {
+		t.Skipf("host does not resolve privately in this environment; stderr = %q", stderr.String())
+	}
+	if s.Check("https://localhost.example.com/admin") {
+		t.Error("private same-domain origin was admitted without --dangerous-allow-private")
+	}
+}
+
+// TestSeedScope_RefusesForeignDomainRedirect is the containment case from the
+// Codex review: an IdP hand-off or an open redirect on the seed must not become
+// crawl scope. Before the fix the foreign origin was admitted after only the
+// private-host check, so any external redirect target joined the crawl.
+func TestSeedScope_RefusesForeignDomainRedirect(t *testing.T) {
+	var stderr bytes.Buffer
+	s, err := newSeedScope("https://target.example.com", "same-origin", false, &stderr)
+	if err != nil {
+		t.Fatalf("newSeedScope: %v", err)
+	}
+	s.LearnEffectiveOrigin("https://idp.attacker.test/authorize")
+	if s.Check("https://idp.attacker.test/anything") {
+		t.Error("a seed redirect to a foreign registrable domain widened the crawl scope")
+	}
+	if !strings.Contains(stderr.String(), "different domain") {
+		t.Errorf("cross-domain refusal not reported; stderr = %q", stderr.String())
+	}
+}
+
+// TestSeedScope_AllowsIntendedWidenings pins that the constraint does not break
+// the two deployments the widening exists for: http -> https on the same host,
+// and apex -> www on the same registrable domain.
+func TestSeedScope_AllowsIntendedWidenings(t *testing.T) {
+	t.Run("http to https", func(t *testing.T) {
+		s, err := newSeedScope("http://example.com", "same-origin", false, nil)
+		if err != nil {
+			t.Fatalf("newSeedScope: %v", err)
+		}
+		s.LearnEffectiveOrigin("https://example.com/")
+		if !s.Check("https://example.com/dashboard") {
+			t.Error("http -> https seed redirect must stay crawlable")
+		}
+	})
+
+	t.Run("apex to www", func(t *testing.T) {
+		s, err := newSeedScope("https://example.com", "same-origin", false, nil)
+		if err != nil {
+			t.Fatalf("newSeedScope: %v", err)
+		}
+		s.LearnEffectiveOrigin("https://www.example.com/")
+		if !s.Check("https://www.example.com/dashboard") {
+			t.Error("apex -> www seed redirect must stay crawlable")
+		}
+	})
 }

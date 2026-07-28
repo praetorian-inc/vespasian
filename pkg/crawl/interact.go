@@ -16,8 +16,10 @@ package crawl
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
@@ -41,7 +43,7 @@ var interactionSelectors = []string{
 	"[onclick]",
 }
 
-// destructiveLabelSubstrings are lowercase substrings that mark a control as
+// The destructive-label lists mark a control as
 // likely destructive, session-ending, or an irreversible commit. The interaction
 // pass skips these so a click does not delete data, drop the crawl's
 // authenticated session, or spend money. The list is deliberately conservative —
@@ -59,19 +61,38 @@ var interactionSelectors = []string{
 // losing the session, and financial commits. For those the coverage is never worth
 // the risk. Operators are told plainly in the README that --interact submits forms
 // and mutates state, since no label list can make clicking safe.
-var destructiveLabelSubstrings = []string{
+// destructiveLabelWords are single words that mark a control as destructive when
+// they appear as a WHOLE WORD in its label. Whole-word matching matters: a plain
+// substring test made "drop" match "Dropdown", "pay" match "Payment history",
+// "reset" match "Preset filters", and "wipe" match "Swipe" — all ordinary
+// navigation and filter controls, silently removed from the interaction pass
+// (CodeRabbit review, PR #189). Skipping a safe control is not free: it is
+// exactly the surface --interact exists to reach.
+var destructiveLabelWords = []string{
 	"delete", "remove", "destroy", "drop",
-	"logout", "log out", "sign out", "signout",
-	"deactivate", "deregister", "unsubscribe", "cancel subscription",
-	"reset", "wipe", "clear all", "revoke", "purge",
+	"logout", "signout",
+	"deactivate", "deregister", "unsubscribe",
+	"reset", "wipe", "revoke", "purge",
 	// Unambiguous destructive verbs. Bare "cancel" is deliberately NOT here: a
 	// dialog's Cancel button is safe and skipping it would lose real surface.
-	"trash", "discard", "erase", "terminate", "archive", "close account",
+	"trash", "discard", "erase", "terminate", "archive",
 	// Irreversible financial commits. A crawl that places an order or moves money
 	// cannot undo it, so these are skipped even though they are ordinary form
 	// submissions that would otherwise reveal endpoints.
-	"pay", "purchase", "buy now", "place order", "checkout",
-	"check out", "transfer funds", "send money", "withdraw",
+	// "payment"/"payments" are listed alongside "pay" because whole-word matching
+	// no longer reaches them through "pay", and "Submit payment" is exactly the
+	// control that must never be clicked. This deliberately also skips a read-only
+	// "Payment history" link: for irreversible financial actions the asymmetry is
+	// not close, so the false positive is accepted where "Dropdown" was not.
+	"pay", "payment", "payments", "purchase", "checkout", "withdraw",
+}
+
+// destructiveLabelPhrases are multi-word markers matched as substrings. A phrase
+// is specific enough that a substring test cannot collide the way a bare word can.
+var destructiveLabelPhrases = []string{
+	"log out", "sign out", "cancel subscription", "clear all",
+	"close account", "buy now", "place order", "check out",
+	"transfer funds", "send money",
 }
 
 // labelAttributes are attributes that carry a control's accessible or fallback
@@ -136,8 +157,18 @@ func isDestructiveLabel(label string) bool {
 	if l == "" {
 		return false
 	}
-	for _, sub := range destructiveLabelSubstrings {
-		if strings.Contains(l, sub) {
+	for _, phrase := range destructiveLabelPhrases {
+		if strings.Contains(l, phrase) {
+			return true
+		}
+	}
+	// Whole-word match for the single-word verbs. Splitting on every
+	// non-alphanumeric rune means punctuation and separators still delimit a word,
+	// so "Delete?" and "delete/remove" match while "Dropdown" and "Payment" do not.
+	for _, word := range strings.FieldsFunc(l, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if slices.Contains(destructiveLabelWords, word) {
 			return true
 		}
 	}
@@ -163,13 +194,22 @@ func normalizeLabel(label string) string {
 // element. Pure and unit-tested so the click policy is verifiable without a browser.
 func nextInteractionTarget(labels []string, used map[string]bool) int {
 	for i, label := range labels {
-		norm := normalizeLabel(label)
-		if norm == "" || isDestructiveLabel(label) || used[norm] {
-			continue
+		if interactionCandidate(label, used) {
+			return i
 		}
-		return i
 	}
 	return -1
+}
+
+// interactionCandidate is the per-label click policy: skip blanks (including
+// labels that failed to read), skip destructive or session-ending controls, and
+// skip a label already clicked on this page. Factored out of
+// nextInteractionTarget so collectInteractionElements can apply the identical
+// rule while reading labels lazily — two copies of this predicate would let the
+// eager and lazy paths disagree about what is clickable.
+func interactionCandidate(label string, used map[string]bool) bool {
+	norm := normalizeLabel(label)
+	return norm != "" && !isDestructiveLabel(label) && !used[norm]
 }
 
 // currentPageURL returns the page's current document URL, or "" when it cannot be
@@ -183,9 +223,22 @@ func currentPageURL(page *rod.Page) string {
 }
 
 // collectInteractionElements queries the page for every interaction selector and
-// returns the matched elements together with their labels. Element-query failures
-// are non-fatal (a selector may simply not match).
-func collectInteractionElements(page *rod.Page) (rod.Elements, []string) {
+// returns the matched elements, the labels it read, and the index of the first
+// element the click policy accepts (-1 when none does). Element-query failures are
+// non-fatal (a selector may simply not match).
+//
+// Labels are read LAZILY: the scan stops at the first acceptable element, so
+// labels after that index are left blank and were never fetched. Each
+// elementLabel is four CDP round trips (Text plus three Attribute reads), and
+// interactPage re-queries before every click, so eagerly labeling every match
+// cost maxInteractionsPerPage x matches x 4 round trips — on a page with 200
+// controls, roughly 6,400 round trips, all charged against that page's deadline
+// (CodeRabbit review, PR #189). The caller only ever uses labels[idx], so the
+// rest was work spent to be discarded.
+//
+// A label that cannot be read comes back blank, which interactionCandidate
+// rejects — the same fail-closed treatment clickAllowed applies.
+func collectInteractionElements(page *rod.Page, used map[string]bool) (rod.Elements, []string, int) {
 	var elements rod.Elements
 	for _, sel := range interactionSelectors {
 		els, err := page.Elements(sel)
@@ -196,11 +249,12 @@ func collectInteractionElements(page *rod.Page) (rod.Elements, []string) {
 	}
 	labels := make([]string, len(elements))
 	for i, el := range elements {
-		// A label that cannot be read is left blank, which nextInteractionTarget
-		// skips — the same fail-closed treatment clickAllowed applies.
 		labels[i], _ = elementLabel(el)
+		if interactionCandidate(labels[i], used) {
+			return elements, labels, i
+		}
 	}
-	return elements, labels
+	return elements, labels, -1
 }
 
 // interactPage clicks a bounded, non-destructive set of interactive elements on
@@ -222,7 +276,8 @@ func collectInteractionElements(page *rod.Page) (rod.Elements, []string) {
 //     errored and the remaining candidates were skipped — one navigating control
 //     positioned ahead of the useful ones cost the whole page's interaction
 //     coverage, making coverage depend on sibling order. Re-querying costs one CDP
-//     round trip per click and makes the handles valid by construction.
+//     round trip per selector plus the label reads up to the first clickable
+//     element, and makes the handles valid by construction.
 //   - A click that navigates is detected and the page is brought BACK to the
 //     assigned document before the pass continues. Returning is what preserves
 //     coverage regardless of where the navigating control sits, and it keeps every
@@ -266,8 +321,7 @@ func (e *rodEngine) interactPage(ctx context.Context, page *rod.Page, capture *p
 
 		// Re-query on every iteration: a previous click may have re-rendered or
 		// replaced nodes, which invalidates any handle held across it.
-		elements, labels := collectInteractionElements(page)
-		idx := nextInteractionTarget(labels, used)
+		elements, labels, idx := collectInteractionElements(page, used)
 		if idx < 0 {
 			return false // nothing left to click
 		}

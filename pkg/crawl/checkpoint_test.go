@@ -23,28 +23,28 @@ import (
 )
 
 func TestComputeConfigFingerprint(t *testing.T) {
-	base := ComputeConfigFingerprint("https://ex.com", "same-origin", 3, true)
+	base := ComputeConfigFingerprint("https://ex.com", "same-origin", 3, true, false)
 	if base == "" {
 		t.Fatal("empty fingerprint")
 	}
-	if base != ComputeConfigFingerprint("https://ex.com", "same-origin", 3, true) {
+	if base != ComputeConfigFingerprint("https://ex.com", "same-origin", 3, true, false) {
 		t.Error("fingerprint not stable for identical inputs")
 	}
 	// Each defining field changes the fingerprint, including the backend: the
 	// two backends discover different link sets, so a headless checkpoint must
 	// not be reusable by the net/http backend.
 	for _, fp := range []string{
-		ComputeConfigFingerprint("https://other.com", "same-origin", 3, true),
-		ComputeConfigFingerprint("https://ex.com", "same-domain", 3, true),
-		ComputeConfigFingerprint("https://ex.com", "same-origin", 5, true),
-		ComputeConfigFingerprint("https://ex.com", "same-origin", 3, false),
+		ComputeConfigFingerprint("https://other.com", "same-origin", 3, true, false),
+		ComputeConfigFingerprint("https://ex.com", "same-domain", 3, true, false),
+		ComputeConfigFingerprint("https://ex.com", "same-origin", 5, true, false),
+		ComputeConfigFingerprint("https://ex.com", "same-origin", 3, false, false),
 	} {
 		if fp == base {
 			t.Error("fingerprint did not change when a defining field changed")
 		}
 	}
 	// Length-prefixing prevents field-boundary collisions.
-	if ComputeConfigFingerprint("ab", "", 0, true) == ComputeConfigFingerprint("a", "b", 0, true) {
+	if ComputeConfigFingerprint("ab", "", 0, true, false) == ComputeConfigFingerprint("a", "b", 0, true, false) {
 		t.Error("field-boundary collision")
 	}
 }

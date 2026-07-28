@@ -768,51 +768,22 @@ func TestRESTClassifier_XHTMLNavigationStillNotAPI(t *testing.T) {
 		"an xhtml page load under an /api/ path must stay below the threshold")
 }
 
-// TestRESTClassifier_NextRouteHandlerIsAPI pins Rule 7 (LAB-4678 audit item 7):
-// an endpoint recovered from a Next.js App Router route-handler chunk is a
-// framework-declared server route and must classify as an API on that basis
-// alone, with no response body, content type, or Accept header to lean on.
-func TestRESTClassifier_NextRouteHandlerIsAPI(t *testing.T) {
+// TestRESTClassifier_NextRouteChunksCarryNoAPISignal pins the Codex review
+// outcome (PR #189): a route recovered from a Next.js App Router chunk URL must
+// NOT classify as an API on provenance alone. The chunk URL proves the path is
+// served but not which verbs the module exports, and jsstatic can only attach one
+// method to a synthesized request. Classifying it drove the generator to emit a
+// `get` operation for a route that may export only POST, with nothing downstream
+// to correct it. Both tags must stay sub-threshold.
+func TestRESTClassifier_NextRouteChunksCarryNoAPISignal(t *testing.T) {
 	c := &RESTClassifier{}
-	req := crawl.ObservedRequest{
-		Method: "GET",
-		URL:    "https://app.test/api/files",
-		Source: crawl.SourceNextRouteHandler,
-	}
-
-	isAPI, confidence, reason := c.ClassifyDetail(req)
-	assert.True(t, isAPI)
-	assert.GreaterOrEqual(t, confidence, DefaultConfidenceThreshold,
-		"a framework-declared route handler must clear the threshold unaided")
-	assert.Contains(t, reason, "framework-route:next-app-router")
-}
-
-// TestRESTClassifier_NextPageRouteIsNotAPI pins the other half of the item-7
-// design: a PAGE route is navigational, not a REST endpoint, so it must stay
-// below the threshold and out of the spec. Without this split, recovering
-// Next.js routes would fill the OpenAPI document with page navigations.
-func TestRESTClassifier_NextPageRouteIsNotAPI(t *testing.T) {
-	c := &RESTClassifier{}
-	req := crawl.ObservedRequest{
-		Method: "GET",
-		URL:    "https://app.test/vaults/{vaultId}",
-		Source: crawl.SourceNextPageRoute,
-	}
-
-	_, confidence, reason := c.ClassifyDetail(req)
-	assert.Less(t, confidence, DefaultConfidenceThreshold,
-		"a page route must not be classified as a REST endpoint")
-	assert.NotContains(t, reason, "framework-route")
-}
-
-// TestRESTClassifier_FrameworkRuleDoesNotFireOnOtherSources guards the narrow
-// scoping of Rule 7: no other Source value may trigger it.
-func TestRESTClassifier_FrameworkRuleDoesNotFireOnOtherSources(t *testing.T) {
-	c := &RESTClassifier{}
-	for _, src := range []string{"", crawl.SourceStaticJS, crawl.SourceStaticJSSourcemap, "static:html", "static:js-nextroute-x"} {
-		req := crawl.ObservedRequest{Method: "GET", URL: "https://app.test/files", Source: src}
-		_, _, reason := c.ClassifyDetail(req)
-		assert.NotContains(t, reason, "framework-route", "source %q must not trigger Rule 7", src)
+	for _, src := range []string{crawl.SourceNextRouteHandler, crawl.SourceNextPageRoute} {
+		req := crawl.ObservedRequest{Method: "GET", URL: "https://app.test/api/files", Source: src}
+		_, confidence, reason := c.ClassifyDetail(req)
+		assert.Less(t, confidence, DefaultConfidenceThreshold,
+			"source %q must not reach the API threshold on provenance alone", src)
+		assert.NotContains(t, reason, "framework-route",
+			"source %q must not contribute a framework-route signal", src)
 	}
 }
 

@@ -24,11 +24,11 @@
 //     timing. API media types are not limited to a hardcoded list: any RFC 6839
 //     application/*+json or application/*+xml structured syntax suffix counts,
 //     excluding application/xhtml+xml (a navigation) and application/soap+xml
-//     (owned by the WSDL classifier). An endpoint recovered from a
-//     framework-declared server route — currently a Next.js App Router
-//     route-handler chunk, [crawl.SourceNextRouteHandler] — classifies on that
-//     provenance alone; the corresponding page-route tag deliberately does not.
-//     Static assets are excluded. [DefaultConfidenceThreshold] is the default
+//     (owned by the WSDL classifier), and syndication feeds (application/rss+xml,
+//     application/atom+xml, application/feed+json), which are documents for feed
+//     readers rather than endpoints. Routes recovered from Next.js App Router
+//     chunk URLs carry provenance only and no API signal, because the chunk URL
+//     does not reveal which verbs the route exports. Static assets are excluded. [DefaultConfidenceThreshold] is the default
 //     minimum confidence.
 //   - GraphQL: detected via /graphql path, query syntax in POST body, and
 //     data/errors keys in response JSON.

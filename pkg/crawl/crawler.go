@@ -108,7 +108,7 @@ func (o CrawlerOptions) resume(targetURL string) resumeOptions {
 	return resumeOptions{
 		From:        o.ResumeFrom,
 		On:          o.OnCheckpoint,
-		Fingerprint: ComputeConfigFingerprint(targetURL, o.Scope, o.Depth, o.Headless),
+		Fingerprint: ComputeConfigFingerprint(targetURL, o.Scope, o.Depth, o.Headless, o.AllowPrivate),
 		MaxAge:      o.CheckpointMaxAge,
 	}
 }

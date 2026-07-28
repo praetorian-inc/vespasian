@@ -83,6 +83,12 @@ func (c *Capability) Parameters() []capability.Parameter {
 		capability.Bool("probe", "Enable endpoint probing").WithDefault("true"),
 		capability.Bool("merge_slugs", "Merge sibling slug paths into one templated REST path (off by default; REST only)").WithDefault("false"),
 		capability.Int("slug_threshold", "Distinct values at a path position before merge_slugs collapses it (minimum 2)").WithDefault("2"),
+		// Declared, not just read in crawlOptsFromCtx: hosts discover configurable
+		// inputs from this list, so a parameter the reader honors but this list
+		// omits is unreachable through the Guard-facing surface and settable only
+		// by a hand-built ExecutionContext (Codex review, PR #189).
+		capability.Int("max_requests", "Maximum captured requests before stopping (0 = unlimited); a rate bound distinct from max_pages").WithDefault("0"),
+		capability.Bool("interact", "Click a bounded set of page controls to surface interaction-only endpoints (headless only; mutates state)").WithDefault("false"),
 	}
 }
 

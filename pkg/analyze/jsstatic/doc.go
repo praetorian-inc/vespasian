@@ -54,9 +54,11 @@
 // # Source tagging
 //
 // Each synthesized [crawl.ObservedRequest] carries one of Source = "static:js",
-// "static:js-sourcemap", "static:js-nextroute" (an App Router route handler,
-// which pkg/classify treats as a server endpoint) or "static:js-nextpage" (an
-// App Router page route, which is navigational and carries no API signal).
+// "static:js-sourcemap", "static:js-nextroute" (an App Router route handler) or
+// "static:js-nextpage" (an App Router page route). Neither Next.js tag carries an
+// API signal: the chunk URL proves the path is served but not which verbs the
+// route exports, so recovered routes surface as sub-threshold near-misses under
+// -v rather than as invented operations in the spec.
 // The OpenAPI generator strips the "static:" prefix when emitting the
 // x-vespasian-source extension on each operation ("static:js" -> "js-bundle",
 // "static:js-sourcemap" -> "js-sourcemap"; any dynamic-source group resolves to

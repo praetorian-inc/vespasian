@@ -139,10 +139,15 @@ func normalizeNextRoute(dir string) string {
 // extractNextRoute returns the ExtractedEndpoint recovered from a chunk URL, or
 // nil when the URL is not an App Router page/route chunk.
 //
-// Method is GET for both kinds. A route handler may export POST/PUT/DELETE as
-// well, but the chunk URL does not say which verbs exist, and inventing them
-// would fabricate endpoints that may not be served. GET is the one request that
-// is safe to attribute, and the probe stage discovers the rest via OPTIONS.
+// Method is recorded as GET for both kinds purely because ObservedRequest needs
+// one; it is NOT a claim that the route answers GET. The chunk URL proves the
+// path is served but says nothing about which verbs the module exports, so
+// neither tag carries an API signal in pkg/classify and neither reaches the
+// generated spec as an operation. Recovered routes surface as sub-threshold
+// near-misses under -v instead. Emitting them as operations would document a
+// `get` for a route that may export only POST, and nothing downstream corrects
+// it: the OPTIONS probe fills ClassifiedRequest.AllowedMethods, but
+// pkg/generate/rest does not read that field (Codex review, PR #189).
 func extractNextRoute(bundleURL, pageURL string) *ExtractedEndpoint {
 	route, kind := nextRouteFromChunkURL(bundleURL)
 	if kind == nextRouteNone {
