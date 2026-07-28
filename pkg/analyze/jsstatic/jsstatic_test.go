@@ -1124,3 +1124,48 @@ func TestAnalyze_SourcemapConcatKeepsConcatSource(t *testing.T) {
 		t.Errorf("sourcemap concat candidate Source = %q, want %q (must not be forced to SourceSourcemap)", src, SourceJSConcat)
 	}
 }
+
+// TestAnalyze_EndpointsKeptReflectsSynthesisDrops pins Stats.EndpointsKept against
+// the POST-synthesis request count (TEST-003).
+//
+// toRequests now drops endpoints whose resolved URL fails specSafeURL, so the
+// synthesized slice can be shorter than the extracted one. EndpointsKept is
+// documented as "endpoints that survived the cap and synthesis and made it into
+// Requests" and is also used as the sourcemap budget
+// (remaining := MaxEndpointsPerBundle - EndpointsKept), so inflating it would
+// silently starve sourcemap extraction. Mutation-tested: changing the accumulator
+// to `+= len(bundleEps)` previously survived the entire suite.
+func TestAnalyze_EndpointsKeptReflectsSynthesisDrops(t *testing.T) {
+	// Three API endpoints, two of which the gate must reject: one carrying
+	// credentials, one carrying a raw bidi override.
+	js := `fetch("/api/keep/one");` +
+		`fetch("https://u:p@example.com/api/drop/credential");` +
+		"fetch(\"/api/drop/\u202ebidi\");"
+
+	res, err := Analyze(context.Background(), []crawl.ObservedRequest{
+		makeJSCapture("https://example.com/app.js", js),
+	}, Options{})
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+
+	var kept int
+	for _, r := range res.Requests {
+		if crawl.IsJSStaticSource(r.Source) {
+			kept++
+		}
+	}
+
+	if res.Stats.EndpointsKept != kept {
+		t.Errorf("Stats.EndpointsKept = %d, but %d JS-static requests were actually synthesized; "+
+			"EndpointsKept must count post-synthesis survivors, not extracted endpoints",
+			res.Stats.EndpointsKept, kept)
+	}
+	// Non-vacuous: the gate must actually have dropped something, otherwise this
+	// test would pass trivially even with the inflated accumulator.
+	if res.Stats.EndpointsFound <= res.Stats.EndpointsKept {
+		t.Errorf("expected the gate to drop at least one endpoint (Found=%d Kept=%d); "+
+			"without a drop this test cannot detect the desync",
+			res.Stats.EndpointsFound, res.Stats.EndpointsKept)
+	}
+}

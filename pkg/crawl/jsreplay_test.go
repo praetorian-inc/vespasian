@@ -3868,3 +3868,113 @@ func TestCleanConcatPathAllowList(t *testing.T) {
 		assert.Empty(t, cleanConcatPath(in), "must be rejected: %q", in)
 	}
 }
+
+// TestIsAbsoluteHTTPURLCallSites pins the REACHABLE call sites, not just the helper
+// (TEST-004).
+//
+// Two of the three rerouted sites are reachable with a mixed-case scheme and are
+// covered below. The third — the probe-URL construction in ReplayJSExtracted — is
+// NOT reachable that way and deliberately has no test here: fullURLPattern
+// requires a lowercase `https?://`, so an uppercase-scheme literal is never
+// extracted in the first place and never reaches that branch. A subtest for it
+// probed nothing and passed under the mutation, i.e. it was vacuous. That site is
+// defense-in-depth only; see the note at the branch itself. Mutation-tested previously: reverting ANY of the three rerouted sites
+// to a case-sensitive strings.HasPrefix left all 18 packages green, because
+// TestIsAbsoluteHTTPURL exercises the predicate in isolation and every other
+// fixture in the suite spells the scheme in lower case.
+//
+// Case matters because url.Parse lower-cases the scheme, so "HTTPS://h/x" is
+// absolute to every downstream consumer. A case-sensitive check routes it into path
+// resolution instead — which is how the scheme-relative shape that SEC-BE-001 was
+// about gets manufactured in the first place.
+func TestIsAbsoluteHTTPURLCallSites(t *testing.T) {
+	// Site 1 — template-literal reconstruction (jsreplay.go, the candidate trim).
+	// Mutated (case-sensitive) this yields "//example.com/api/users/{param}", i.e.
+	// a scheme-relative URL manufactured out of an absolute one.
+	t.Run("template_literal_reconstruction", func(t *testing.T) {
+		paths := extractAPIPaths([]byte("var u = `HTTPS://example.com/api/users/${id}`;"), nil)
+		for _, p := range paths {
+			assert.False(t, strings.HasPrefix(p, "//"),
+				"an uppercase-scheme literal must not be reduced to a scheme-relative path, got %q", p)
+		}
+	})
+
+	// Site 2 — addPath's full-URL branch. An uppercase-scheme cross-origin URL must
+	// go through ValidateFullURL and be kept absolute (not slash-prefixed into a
+	// bogus same-origin path).
+	t.Run("addPath_full_url_branch", func(t *testing.T) {
+		paths := extractAPIPaths([]byte(`var u = "HTTPS://other.example/api/items";`), nil)
+		for _, p := range paths {
+			assert.False(t, strings.HasPrefix(p, "/HTTPS:") || strings.HasPrefix(p, "//other.example"),
+				"uppercase-scheme URL must not be rewritten into a path, got %q", p)
+		}
+	})
+
+}
+
+// TestPercentEscapeValidation pins decodePercentEscape's contract directly
+// (TEST-005). Three mutants previously survived the whole suite because the
+// accepted-escape fixtures only ever used the hex digits {0, 2, F}:
+//   - `i += 2` -> `i += 3`, which skips validation of the byte AFTER an escape
+//   - deleting unhex's lowercase-hex arm, silently dropping %2f / %3d / %7e
+//   - narrowing the accepted decode range by one (> 0x7E -> > 0x7D)
+func TestPercentEscapeValidation(t *testing.T) {
+	// Lowercase AND uppercase hex must both decode (the deleted-arm mutant).
+	for _, in := range []string{
+		"/api/x%2fy", "/api/x%2Fy",
+		"/api/x%3dy", "/api/x%3Dy",
+		"/api/x%7ey", "/api/x%7Ey",
+		"/api/x%5by%5dz", "/api/x%5By%5Dz",
+	} {
+		assert.Equal(t, in, cleanConcatPath(in), "both hex cases must decode: %q", in)
+	}
+
+	// Boundary decodes: 0x20 (space) and 0x7E (~) are the inclusive edges, so the
+	// off-by-one mutants on either bound are caught.
+	assert.Equal(t, "/api/x%20y", cleanConcatPath("/api/x%20y"), "%20 (0x20) is the lower bound and must be accepted")
+	assert.Equal(t, "/api/x%7Ey", cleanConcatPath("/api/x%7Ey"), "%7E (0x7E) is the upper bound and must be accepted")
+	assert.Empty(t, cleanConcatPath("/api/x%1Fy"), "%1F (0x1F) is below the lower bound")
+	assert.Empty(t, cleanConcatPath("/api/x%7Fy"), "%7F (0x7F) is above the upper bound")
+
+	// The byte immediately AFTER an escape must still be validated — this is the
+	// `i += 3` mutant, which skipped exactly one byte of checking.
+	assert.Empty(t, cleanConcatPath("/api/x%20\x01y"), "control byte directly after an escape must be rejected")
+	assert.Empty(t, cleanConcatPath("/api/x%20\x7Fy"), "DEL directly after an escape must be rejected")
+	assert.Empty(t, cleanConcatPath("/api/x%20\xE2\x80\xAEy"), "non-ASCII directly after an escape must be rejected")
+
+	// Two adjacent escapes: the index must land on the second '%', not past it.
+	assert.Empty(t, cleanConcatPath("/api/x%20%00y"), "a bad escape immediately following a good one must be rejected")
+	assert.Equal(t, "/api/x%20%21y", cleanConcatPath("/api/x%20%21y"), "two adjacent valid escapes must both be accepted")
+}
+
+// TestIsPrintableASCIIURL pins the exported byte policy that specSafeURL applies
+// to every jsstatic producer (SEC-BE-002).
+func TestIsPrintableASCIIURL(t *testing.T) {
+	ok := []string{
+		"/api/users",
+		"https://example.com/api/users/{userId}",
+		"/api/items?filter[status]=open&q=a|b",
+		"/api/x%20y",
+		"/api/x%2Fy",
+	}
+	for _, in := range ok {
+		assert.True(t, IsPrintableASCIIURL(in), "must be accepted: %q", in)
+	}
+
+	bad := []string{
+		"/api/v1/\u202enimda",             // raw bidi override
+		"/api/us\u0435rs",                 // Cyrillic homoglyph
+		"/api/x\ufe0fy",                   // variation selector
+		"/api/x y",                        // literal space
+		"/api/x\x00y",                     // NUL
+		"/api/x\ty",                       // tab
+		"/api/x%E2%80%AEy",                // percent-encoded bidi override
+		"/api/x%00y",                      // percent-encoded NUL
+		"/api/x%",                         // truncated escape
+		"/api/x%ZZ",                       // non-hex escape
+		"https://\u202eexample.com/api/x", // bidi in the HOST (spec servers entry)
+	}
+	for _, in := range bad {
+		assert.False(t, IsPrintableASCIIURL(in), "must be rejected: %q", in)
+	}
+}

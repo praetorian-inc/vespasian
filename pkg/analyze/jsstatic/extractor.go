@@ -714,49 +714,33 @@ func extractConcatEndpoints(jsSource []byte, baseURL, baseHost string, seen map[
 		if !absolute && !strings.HasPrefix(p, "/") {
 			p = "/" + p
 		}
-		// SEC-BE-001 (LAB-4992): gate absolute reconstructions. The concat
-		// receiver form (e.g. "https://attacker.example/api/x".concat(id)) has
-		// no origin/scheme gate of its own — a hostile bundle literal can
-		// reconstruct to an absolute URL, which would otherwise be emitted as an
-		// unprobed static:js-concat candidate, floored to default confidence by
-		// classify Rule 7, and then probed against the attacker-chosen host by
-		// the live probe stage (no same-origin gate there either) — an
-		// SSRF-reflector / scope-escape via a fully offline analysis path.
-		// Relative reconstructions are unaffected.
+		// SEC-BE-001 (LAB-4992): gate absolute reconstructions to the bundle's OWN
+		// origin. A hostile bundle literal can reconstruct to an absolute URL on an
+		// attacker-chosen host, which would otherwise be emitted as an unprobed
+		// static:js-concat candidate, floored to default confidence by classify
+		// Rule 7, and then probed there (the probe stage has no origin gate of its
+		// own) — an SSRF-reflector / scope-escape via a fully offline analysis path.
 		//
-		// Three checks, because a host comparison alone is not enough:
+		// crawl.SameOrigin compares scheme, host AND port with default-port
+		// canonicalization, so an https bundle cannot force a cleartext http probe of
+		// its own host and `https://h:443/x` counts as same-origin as `https://h/`
+		// (QUAL-001, matching pkg/crawl's own probeMatchKey).
 		//
-		//  1. crawl.ValidateFullURL — the SAME parse-time gate the active path
-		//     applies in addPath. Rejects embedded credentials, non-http(s)
-		//     schemes and empty hosts. The credential case is the one a
-		//     host-only comparison misses outright: net/url puts userinfo in
-		//     u.User, NOT u.Host, so `"https://".concat("u:p@<bundlehost>/api/x")`
-		//     reconstructs to a URL whose host EQUALS the bundle's own and
-		//     passes an equality test unchanged. net/http then derives
-		//     `Authorization: Basic <base64(userinfo)>` from req.URL.User
-		//     whenever no Authorization header is already set — and
-		//     probe.Config.AuthHeaders is populated by no non-test caller — so
-		//     the attacker-chosen credential would ALWAYS be sent, and would
-		//     also persist into capture.json and the generated spec.
-		//  2. crawl.SameOrigin against the bundle's own URL — scheme, host AND
-		//     port must match, so an https bundle cannot force a cleartext http
-		//     probe of its own host (ValidateFullURL permits either scheme, so
-		//     pinning this is deliberate rather than incidental). QUAL-001: this
-		//     replaced an ad hoc hostOfURL/schemeOfURL comparison that did not
-		//     canonicalize default ports, so a reconstruction of
-		//     `https://h:443/api/x` from a bundle at `https://h/` was dropped as
-		//     cross-origin even though pkg/crawl's own probeMatchKey treats the
-		//     two as the same origin. Sharing crawl's comparison keeps the
-		//     offline and active paths from disagreeing.
-		if absolute {
-			validated, ok := crawl.ValidateFullURL(p)
-			if !ok {
-				continue
-			}
-			p = validated
-			if !crawl.SameOrigin(p, baseURL) {
-				continue
-			}
+		// This is the ONLY check here. Credential/scheme validity and the byte policy
+		// are enforced once for every producer by specSafeURL in toRequests — the
+		// synthesis choke point that sees the resolved URL. An earlier revision also
+		// called crawl.ValidateFullURL here, which duplicated that gate (QUAL-001) and
+		// gave the false impression that this site was load-bearing for credentials.
+		//
+		// Same-origin stays concat-ONLY. An AST literal is a real call site the bundle
+		// invokes, and a SPA calling https://api.example.com from
+		// https://app.example.com is routine, so gating those on same-origin would be a
+		// large recall regression. A concat reconstruction is a speculative
+		// recombination, so a cross-origin result is far more likely an artifact or a
+		// plant. TestExtractFromBundle_CrossOriginASTLiteralRetained pins the
+		// asymmetry in both directions.
+		if absolute && !crawl.SameOrigin(p, baseURL) {
+			continue
 		}
 		// QUAL-010 (LAB-4992): only the astURLs dedup is checked here. This
 		// guard used to also re-test filterURL(p) and isExprOnly(p), but both

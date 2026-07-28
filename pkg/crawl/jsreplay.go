@@ -34,6 +34,7 @@ package crawl
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -1805,36 +1806,85 @@ func allowedConcatBytes(s string, inSuffix bool) bool {
 			}
 			continue
 		}
-		// A `%` must be followed by exactly two hex digits decoding to printable
-		// ASCII. A truncated escape ("/api/x%" or "/api/x%E") is malformed and
-		// rejected rather than passed through.
-		if i+2 >= len(s) {
+		if _, ok := decodePercentEscape(s, i); !ok {
 			return false
 		}
-		hi, hiOK := unhex(s[i+1])
-		lo, loOK := unhex(s[i+2])
-		if !hiOK || !loOK {
-			return false
-		}
-		if decoded := hi<<4 | lo; decoded < 0x20 || decoded > 0x7E {
-			return false
-		}
+		// Skip the two hex digits; the loop's own i++ accounts for the '%'.
 		i += 2
 	}
 	return true
 }
 
-// unhex decodes a single hex digit.
-func unhex(c byte) (byte, bool) {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0', true
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10, true
-	case c >= 'A' && c <= 'F':
-		return c - 'A' + 10, true
+// decodePercentEscape decodes the escape starting at s[i] (which must be '%'),
+// returning the decoded byte. It reports ok=false when the escape is truncated
+// ("/api/x%", "/api/x%E"), contains a non-hex digit, or decodes to anything other
+// than printable ASCII (0x20-0x7E).
+//
+// The printable-ASCII requirement is the load-bearing part (SEC-BE-002): a
+// byte-wise allow-list that merely permits `%` is trivially routed around,
+// because the sink DECODES. url.Parse populates u.Path with the decoded bytes,
+// groupEndpoints keys the OpenAPI path on u.Path, and yaml.v3 emits a 0xE2 lead
+// byte raw — so `/api/x%E2%80%AEy` delivered a U+202E right-to-left override into
+// the generated spec path key. Rejecting non-printable decodes also covers
+// encoded controls (%00, %0A, %7F) in one predicate.
+//
+// Uses encoding/hex rather than a hand-rolled digit decoder so the accepted digit
+// set (both cases, exactly [0-9A-Fa-f]) is the standard library's rather than
+// something this file has to get right and keep right.
+func decodePercentEscape(s string, i int) (byte, bool) {
+	if i+2 >= len(s) {
+		return 0, false
 	}
-	return 0, false
+	buf, err := hex.DecodeString(s[i+1 : i+3])
+	if err != nil {
+		return 0, false
+	}
+	if buf[0] < 0x20 || buf[0] > 0x7E {
+		return 0, false
+	}
+	return buf[0], true
+}
+
+// IsPrintableASCIIURL reports whether raw is safe to place in an operator-facing
+// artifact: every literal byte is printable, non-space ASCII, and every
+// percent-escape decodes to printable ASCII.
+//
+// Exported so pkg/analyze/jsstatic can apply ONE byte policy to every producer at
+// its synthesis choke point (SEC-BE-002). Previously the policy lived only in
+// cleanConcatPath, which guards the concat/service-prefix reconstruction — so the
+// jsluice AST-literal producer, whose only filter (filterURL) checks schemes and
+// asset extensions, had no charset check at all. That mattered because classify
+// Rule 7 floors EVERY IsJSStaticSource candidate to the default --confidence, so
+// AST literals that previously died at 0.15 now survive: `fetch("/api/v1/<U+202E>nimda")`
+// reached the generated OpenAPI path key with the override intact, and the
+// absolute variant put a raw-bidi host in the spec's servers list and info.title.
+// pkg/generate/rest applies no printable-ASCII filter of its own.
+//
+// Space is excluded deliberately (0x21 lower bound): a literal space cannot occur
+// in a URL that survived extraction, so admitting one would only widen the set
+// for no gain. A percent-ENCODED space (%20) is still accepted, since that is how
+// real APIs spell it.
+//
+// Tradeoff, accepted and documented: a genuinely internationalized host or path
+// spelled in raw UTF-8 (an IDN like https://münchen.example/api) is rejected
+// rather than percent-encoded. That matches what cleanConcatPath has always done
+// to the concat path, keeps one policy across producers, and costs recall only for
+// non-ASCII APIs, which this extractor was never able to reconstruct reliably
+// anyway.
+func IsPrintableASCIIURL(raw string) bool {
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '%' {
+			if _, ok := decodePercentEscape(raw, i); !ok {
+				return false
+			}
+			i += 2
+			continue
+		}
+		if raw[i] < 0x21 || raw[i] > 0x7E {
+			return false
+		}
+	}
+	return true
 }
 
 // isAllowedConcatByte reports whether c may appear literally in a reconstructed
@@ -2178,6 +2228,12 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		// Full URLs are probed as-is; relative paths are resolved against
 		// the target origin.
 		fullURL := path
+		// Defense-in-depth only: IsAbsoluteHTTPURL is case-insensitive, but nothing
+		// reaches here with a mixed-case scheme today because fullURLPattern (and the
+		// other extraction regexes) require a lowercase `https?://`, so such a literal
+		// is never extracted. Kept case-insensitive anyway so this branch stays correct
+		// if extraction is ever widened — but it is NOT unit-tested for that input,
+		// because a test would be vacuous (see TestIsAbsoluteHTTPURLCallSites).
 		if !IsAbsoluteHTTPURL(path) {
 			fullURL = targetOrigin + path
 		}

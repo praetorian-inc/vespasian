@@ -843,160 +843,44 @@ var rel = "/api/".concat("z");
 	}
 }
 
-// TestExtractFromBundle_ConcatCredentialGate covers the hole the host-only
-// version of the SEC-BE-001 gate left open (second pass). net/url places
-// userinfo in u.User, NOT u.Host, so an absolute reconstruction that embeds
-// credentials for the bundle's OWN host has a matching u.Host and passed
-// `hostOfURL(p) != baseHost` unchanged.
+// TestExtractFromBundle_ConcatSameOriginGate covers what extractConcatEndpoints
+// still enforces on its own: an absolute concat reconstruction must share the
+// bundle's ORIGIN — scheme, host and port.
 //
-// That mattered because probe.Config.AuthHeaders is populated by no non-test
-// caller, so net/http always derives `Authorization: Basic <base64(userinfo)>`
-// from req.URL.User: a scanned site's bundle could make Vespasian issue
-// authenticated requests with attacker-chosen credentials to the target on the
-// operator's behalf (credential stuffing / lockout / audit-log poisoning
-// attributed to the operator), and persist the credential into capture.json and
-// the generated spec. `@` cannot come from the concat receiver character class,
-// but parseConcatArgs/stringLiteralValue copy `.concat()` string-literal
-// ARGUMENTS verbatim, so it arrives that way.
-//
-// The gate now delegates to crawl.ValidateFullURL — the same parse-time check
-// the active path applies in addPath, which has rejected u.User != nil all
-// along.
-func TestExtractFromBundle_ConcatCredentialGate(t *testing.T) {
+// Credential rejection is deliberately NOT asserted here any more. That check moved
+// to specSafeURL in toRequests, the synthesis choke point that sees the resolved
+// URL and covers every producer; asserting it at this level again would re-create
+// the duplicate gate (QUAL-001) and, worse, would pass while the real sink stayed
+// open — which is exactly how two bypasses shipped. TestAnalyze_AbsoluteCredentialGate
+// owns credentials, including the concat spellings.
+func TestExtractFromBundle_ConcatSameOriginGate(t *testing.T) {
 	src := []byte(`
-var creds = "https://".concat("u:p@example.com/api/x");
-var credsHostOnly = "https://".concat("attacker@example.com/api/w");
 var downgrade = "http://example.com/api/".concat("v");
+var crossHost = "https://attacker.example/api/".concat("w");
 var same = "https://example.com/api/".concat("y");
+var samePort = "https://example.com:443/api/".concat("z");
 `)
 	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// No emitted endpoint may carry userinfo, however it is spelled.
-	for _, ep := range endpoints {
-		if strings.Contains(ep.URL, "@") {
-			t.Errorf("reconstruction with embedded credentials must NOT be emitted; got %q in %v", ep.URL, endpoints)
-		}
-	}
-	if ep := findEndpoint(endpoints, "https://u:p@example.com/api/x"); ep != nil {
-		t.Errorf("user:pass credential reconstruction must NOT be emitted; got %v", endpoints)
-	}
-	if ep := findEndpoint(endpoints, "https://attacker@example.com/api/w"); ep != nil {
-		t.Errorf("user-only credential reconstruction must NOT be emitted; got %v", endpoints)
-	}
-
-	// Scheme downgrade relative to the bundle's own scheme is pinned as
-	// dropped: ValidateFullURL permits either scheme, so an https bundle could
-	// otherwise force a cleartext probe of its own host.
+	// Scheme downgrade relative to the bundle is dropped: an https bundle must not
+	// be able to force a cleartext probe of its own host.
 	if ep := findEndpoint(endpoints, "http://example.com/api/v"); ep != nil {
 		t.Errorf("scheme-downgraded reconstruction must NOT be emitted; got %v", endpoints)
 	}
-
-	// The gate must stay narrow — a clean same-origin absolute reconstruction
-	// is still emitted.
+	// Cross-host is dropped.
+	if ep := findEndpoint(endpoints, "https://attacker.example/api/w"); ep != nil {
+		t.Errorf("cross-host reconstruction must NOT be emitted; got %v", endpoints)
+	}
+	// Clean same-origin survives...
 	if ep := findEndpoint(endpoints, "https://example.com/api/y"); ep == nil {
 		t.Errorf("same-origin absolute concat reconstruction must still be emitted, got %v", endpoints)
 	}
-}
-
-// QUAL-002: extractConcatEndpoints must not let a leading-slash normalization
-// defeat filterURL's scheme blocklist. filterURL matches filtered schemes
-// (javascript:, data:, blob:, mailto:, tel:, chrome-extension:) via
-// strings.HasPrefix. Before this fix, a non-absolute reconstruction beginning
-// with one of these schemes (e.g. "javascript:/api/".concat("y") ->
-// "javascript:/api/y") had a leading '/' prepended BEFORE the filterURL call,
-// producing "/javascript:/api/y" — which no longer HasPrefix("javascript:"),
-// so the scheme blocklist silently failed to drop it. The raw, un-prefixed
-// reconstruction must still be scheme-checked. A legitimate relative concat
-// (no scheme) must still be emitted.
-func TestExtractFromBundle_ConcatRawSchemeFilter(t *testing.T) {
-	src := []byte(`
-var evilJS = "javascript:/api/".concat("y");
-var evilData = "data:/api/".concat("z");
-var legit = "identity/" + "api/auth/login";
-`)
-	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	for _, dropped := range []string{
-		"/javascript:/api/y",
-		"javascript:/api/y",
-		"/data:/api/z",
-		"data:/api/z",
-	} {
-		if ep := findEndpoint(endpoints, dropped); ep != nil {
-			t.Errorf("scheme-prefixed concat reconstruction must be dropped; got endpoint for %q: %v", dropped, endpoints)
-		}
-	}
-	if ep := findEndpoint(endpoints, "/identity/api/auth/login"); ep == nil {
-		t.Errorf("expected legitimate relative concat reconstruction /identity/api/auth/login to survive, got: %v", endpoints)
-	}
-}
-
-// QUAL-001: concatDedupKey must normalize a trailing slash so a trailing-slash
-// concat reconstruction dedupes against an AST form that has none — matching
-// the active JS-replay path's addPath, which does strings.TrimRight(raw, "/").
-// Here the AST walker recovers the template literal fetch(`/api/posts/${id}/comment`)
-// with no trailing slash, while the +-chain "/api/posts/" + id + "/comment/"
-// reconstructs WITH a trailing slash (cleanConcatPath never trims it). Before
-// concatDedupKey trimmed the trailing slash, these hashed to different keys
-// ("host|/api/posts/{}/comment" vs "host|/api/posts/{}/comment/") and the
-// astURLs guard missed, emitting a phantom GET companion.
-func TestExtractFromBundle_ConcatNoPhantomForTrailingSlash(t *testing.T) {
-	src := []byte("function f(id){ return fetch(`/api/posts/${id}/comment`); }\n" +
-		`var u = "/api/posts/" + id + "/comment/"; fetch(u);`)
-	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ep := findEndpoint(endpoints, "/api/posts/0/comment/"); ep != nil {
-		t.Errorf("phantom trailing-slash concat companion /api/posts/0/comment/ emitted alongside AST-recovered param path; got %v", endpoints)
-	}
-	if ep := findEndpoint(endpoints, "/api/posts/{id}/comment"); ep == nil {
-		t.Errorf("expected AST-recovered /api/posts/{id}/comment, got %v", endpoints)
-	}
-}
-
-// QUAL-001: concatDedupKey must preserve the root "/" case — trimming the
-// trailing slash must not turn "/" into "", which would silently key root
-// endpoints under the empty path instead of "/".
-func TestConcatDedupKey_RootSlashPreserved(t *testing.T) {
-	if got := concatDedupKey("/", "example.com"); got != "example.com|/" {
-		t.Errorf("concatDedupKey(%q, %q) = %q, want %q", "/", "example.com", got, "example.com|/")
-	}
-
-	// TEST-002: pin the inner `trimmed != ""` guard with inputs that actually
-	// REACH it. The previous attempt used "//" and "https://example.com/", neither
-	// of which gets there: url.Parse("//") yields Host="" Path="", so the
-	// leading-slash normalization makes path "/" and the OUTER `path != "/"` check
-	// short-circuits before the trailing-slash trim; "https://example.com/" yields
-	// Path="/" and short-circuits identically. Mutation-tested: with those cases,
-	// replacing the guarded trim with a bare strings.TrimRight left all 18 packages
-	// green, so the branch was still unpinned.
-	//
-	// These two inputs do reach the trim: Path="//" and Path="///" respectively.
-	// Behavior is pinned as OBSERVED — a slashes-only path is not something the
-	// extractors emit (cleanConcatPath collapses runs and then fails
-	// hasAPIIndicator), so the point is to detect a change in the branch, not to
-	// bless these keys as meaningful.
-	if got := concatDedupKey("https://example.com//", "example.com"); got != "example.com|//" {
-		t.Errorf("concatDedupKey(%q, %q) = %q, want %q",
-			"https://example.com//", "example.com", got, "example.com|//")
-	}
-	if got := concatDedupKey("///", "example.com"); got != "example.com|///" {
-		t.Errorf("concatDedupKey(%q, %q) = %q, want %q",
-			"///", "example.com", got, "example.com|///")
-	}
-}
-
-func TestConcatDedupKey_TrailingSlashNormalized(t *testing.T) {
-	withSlash := concatDedupKey("/api/posts/{id}/comment/", "example.com")
-	withoutSlash := concatDedupKey("/api/posts/{id}/comment", "example.com")
-	if withSlash != withoutSlash {
-		t.Errorf("concatDedupKey with trailing slash = %q, without = %q, want equal", withSlash, withoutSlash)
+	// ...including with an explicit default port (QUAL-001 default-port canonicalization).
+	if ep := findEndpoint(endpoints, "https://example.com:443/api/z"); ep == nil {
+		t.Errorf("explicit default port must count as same-origin, got %v", endpoints)
 	}
 }
 
@@ -1026,7 +910,15 @@ func TestAnalyze_AbsoluteCredentialGate(t *testing.T) {
 		`fetch("https://u:p@attacker.example/api/explicit");` +
 		`fetch("HTTPS://u:p@attacker.example/api/upper");` +
 		`axios.get("https://u:p@app.example.com/api/self");` +
-		"var t = fetch(`https://u:p@app.example.com/api/${id}/tpl`);"
+		"var t = fetch(`https://u:p@app.example.com/api/${id}/tpl`);" +
+		// Concat producer spellings: credential rejection is enforced here, at
+		// synthesis, for every producer — not per-producer.
+		`var c = "https://".concat("u:p@app.example.com/api/concat");` +
+		`var d = "//u:p@app.example.com/api/".concat("screl");` +
+		// POSITIVE CONTROL (TEST-002): a clean endpoint that MUST survive. Without
+		// it the assertion loop could iterate zero times, leaving the test green
+		// even if the gate rejected everything (e.g. toRequests returning nil).
+		`fetch("/api/legit/orders");`
 
 	res, err := Analyze(context.Background(), []crawl.ObservedRequest{{
 		Method: "GET", URL: "https://app.example.com/app.js", Source: "burp",
@@ -1038,13 +930,26 @@ func TestAnalyze_AbsoluteCredentialGate(t *testing.T) {
 		t.Fatalf("Analyze: %v", err)
 	}
 
+	var jsStatic int
+	var sawControl bool
 	for _, r := range res.Requests {
 		if !crawl.IsJSStaticSource(r.Source) {
 			continue
 		}
+		jsStatic++
 		if strings.Contains(r.URL, "@") {
 			t.Errorf("synthesized request carries embedded credentials: %q (source %q)", r.URL, r.Source)
 		}
+		if strings.HasSuffix(r.URL, "/api/legit/orders") {
+			sawControl = true
+		}
+	}
+
+	// Positive control: the gate must be discriminating, not blanket-rejecting.
+	// This is what makes the loop above non-vacuous (TEST-002).
+	if !sawControl {
+		t.Errorf("positive control /api/legit/orders was dropped — the gate is over-blocking, "+
+			"and the credential assertions above would have been vacuous (%d JS-static requests synthesized)", jsStatic)
 	}
 }
 
@@ -1092,5 +997,152 @@ func TestExtractFromBundle_ConcatDefaultPortSameOrigin(t *testing.T) {
 	}
 	if ep := findEndpoint(endpoints, "https://example.com:443/api/orders"); ep == nil {
 		t.Errorf("explicit default port must count as same-origin as the bundle: got %v", endpoints)
+	}
+}
+
+// QUAL-001: concatDedupKey must preserve the root "/" case — trimming the
+// trailing slash must not turn "/" into "", which would silently key root
+// endpoints under the empty path instead of "/".
+func TestConcatDedupKey_RootSlashPreserved(t *testing.T) {
+	if got := concatDedupKey("/", "example.com"); got != "example.com|/" {
+		t.Errorf("concatDedupKey(%q, %q) = %q, want %q", "/", "example.com", got, "example.com|/")
+	}
+
+	// TEST-002: pin the inner `trimmed != ""` guard with inputs that actually
+	// REACH it. The previous attempt used "//" and "https://example.com/", neither
+	// of which gets there: url.Parse("//") yields Host="" Path="", so the
+	// leading-slash normalization makes path "/" and the OUTER `path != "/"` check
+	// short-circuits before the trailing-slash trim; "https://example.com/" yields
+	// Path="/" and short-circuits identically. Mutation-tested: with those cases,
+	// replacing the guarded trim with a bare strings.TrimRight left all 18 packages
+	// green, so the branch was still unpinned.
+	//
+	// These two inputs do reach the trim: Path="//" and Path="///" respectively.
+	// Behavior is pinned as OBSERVED — a slashes-only path is not something the
+	// extractors emit (cleanConcatPath collapses runs and then fails
+	// hasAPIIndicator), so the point is to detect a change in the branch, not to
+	// bless these keys as meaningful.
+	if got := concatDedupKey("https://example.com//", "example.com"); got != "example.com|//" {
+		t.Errorf("concatDedupKey(%q, %q) = %q, want %q",
+			"https://example.com//", "example.com", got, "example.com|//")
+	}
+	if got := concatDedupKey("///", "example.com"); got != "example.com|///" {
+		t.Errorf("concatDedupKey(%q, %q) = %q, want %q",
+			"///", "example.com", got, "example.com|///")
+	}
+}
+
+func TestConcatDedupKey_TrailingSlashNormalized(t *testing.T) {
+	withSlash := concatDedupKey("/api/posts/{id}/comment/", "example.com")
+	withoutSlash := concatDedupKey("/api/posts/{id}/comment", "example.com")
+	if withSlash != withoutSlash {
+		t.Errorf("concatDedupKey with trailing slash = %q, without = %q, want equal", withSlash, withoutSlash)
+	}
+}
+
+// QUAL-001: concatDedupKey must normalize a trailing slash so a trailing-slash
+// concat reconstruction dedupes against an AST form that has none — matching
+// the active JS-replay path's addPath, which does strings.TrimRight(raw, "/").
+// Here the AST walker recovers the template literal fetch(`/api/posts/${id}/comment`)
+// with no trailing slash, while the +-chain "/api/posts/" + id + "/comment/"
+// reconstructs WITH a trailing slash (cleanConcatPath never trims it). Before
+// concatDedupKey trimmed the trailing slash, these hashed to different keys
+// ("host|/api/posts/{}/comment" vs "host|/api/posts/{}/comment/") and the
+// astURLs guard missed, emitting a phantom GET companion.
+func TestExtractFromBundle_ConcatNoPhantomForTrailingSlash(t *testing.T) {
+	src := []byte("function f(id){ return fetch(`/api/posts/${id}/comment`); }\n" +
+		`var u = "/api/posts/" + id + "/comment/"; fetch(u);`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "/api/posts/0/comment/"); ep != nil {
+		t.Errorf("phantom trailing-slash concat companion /api/posts/0/comment/ emitted alongside AST-recovered param path; got %v", endpoints)
+	}
+	if ep := findEndpoint(endpoints, "/api/posts/{id}/comment"); ep == nil {
+		t.Errorf("expected AST-recovered /api/posts/{id}/comment, got %v", endpoints)
+	}
+}
+
+// QUAL-002: extractConcatEndpoints must not let a leading-slash normalization
+// defeat filterURL's scheme blocklist. filterURL matches filtered schemes
+// (javascript:, data:, blob:, mailto:, tel:, chrome-extension:) via
+// strings.HasPrefix. Before this fix, a non-absolute reconstruction beginning
+// with one of these schemes (e.g. "javascript:/api/".concat("y") ->
+// "javascript:/api/y") had a leading '/' prepended BEFORE the filterURL call,
+// producing "/javascript:/api/y" — which no longer HasPrefix("javascript:"),
+// so the scheme blocklist silently failed to drop it. The raw, un-prefixed
+// reconstruction must still be scheme-checked. A legitimate relative concat
+// (no scheme) must still be emitted.
+func TestExtractFromBundle_ConcatRawSchemeFilter(t *testing.T) {
+	src := []byte(`
+var evilJS = "javascript:/api/".concat("y");
+var evilData = "data:/api/".concat("z");
+var legit = "identity/" + "api/auth/login";
+`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, dropped := range []string{
+		"/javascript:/api/y",
+		"javascript:/api/y",
+		"/data:/api/z",
+		"data:/api/z",
+	} {
+		if ep := findEndpoint(endpoints, dropped); ep != nil {
+			t.Errorf("scheme-prefixed concat reconstruction must be dropped; got endpoint for %q: %v", dropped, endpoints)
+		}
+	}
+	if ep := findEndpoint(endpoints, "/identity/api/auth/login"); ep == nil {
+		t.Errorf("expected legitimate relative concat reconstruction /identity/api/auth/login to survive, got: %v", endpoints)
+	}
+}
+
+// TestAnalyze_BytePolicyGate pins that specSafeURL applies crawl.IsPrintableASCIIURL
+// to EVERY producer, not just concat (SEC-BE-002).
+//
+// This exists because a mutation removing the byte-policy line from specSafeURL
+// survived the whole suite: the credential test only inspects "@", and the
+// EndpointsKept test only needs *some* endpoint dropped, which the credential
+// fixture alone satisfies. Nothing asserted that a non-ASCII AST literal is
+// rejected.
+//
+// It matters because classify Rule 7 floors every IsJSStaticSource candidate to
+// the default --confidence, and the jsluice AST producer has no charset filter of
+// its own (filterURL checks only schemes and asset extensions). So a raw bidi
+// override in an AST literal would reach the generated OpenAPI path key, where
+// yaml.v3 emits it verbatim — making the rendered path differ from its bytes.
+func TestAnalyze_BytePolicyGate(t *testing.T) {
+	js := `fetch("/api/v1/\u202enimda");` + // raw bidi override, AST producer
+		`fetch("/api/v1/us\u0435rs");` + // Cyrillic homoglyph
+		`fetch("/api/x%E2%80%AEy");` + // percent-encoded bidi override
+		`fetch("/api/v1/clean");` // positive control
+
+	res, err := Analyze(context.Background(), []crawl.ObservedRequest{{
+		Method: "GET", URL: "https://example.com/app.js", Source: "burp",
+		Response: crawl.ObservedResponse{
+			StatusCode: 200, ContentType: "application/javascript", Body: []byte(js),
+		},
+	}}, Options{})
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+
+	var sawClean bool
+	for _, r := range res.Requests {
+		if !crawl.IsJSStaticSource(r.Source) {
+			continue
+		}
+		if !crawl.IsPrintableASCIIURL(r.URL) {
+			t.Errorf("synthesized request violates the byte policy: %q (source %q)", r.URL, r.Source)
+		}
+		if strings.HasSuffix(r.URL, "/api/v1/clean") {
+			sawClean = true
+		}
+	}
+	// Positive control, so the loop above cannot be vacuous.
+	if !sawClean {
+		t.Error("positive control /api/v1/clean was dropped — the byte policy is over-blocking")
 	}
 }

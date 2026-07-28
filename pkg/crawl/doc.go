@@ -130,15 +130,23 @@
 //     identically; the active path additionally probes them and does a
 //     speculative service-prefix fan-out that the offline path omits (that
 //     fan-out is only safe when 404-filtered by probing).
-//   - [ValidateFullURL], [SameOrigin] and [APIIndicatorAlternation] are exported
-//     for the same reason as [ExtractStaticConcatPaths] — they are the shared
-//     definitions that keep the offline static path from drifting away from this
-//     one (LAB-4992). [ValidateFullURL] is the parse-time URL gate (rejects
-//     embedded credentials, non-http(s) schemes, empty hosts) that both paths
-//     apply before emitting or probing an absolute reconstruction; [SameOrigin]
-//     compares origins with default-port canonicalization, so the two paths agree
-//     on what counts as the bundle's own origin; [APIIndicatorAlternation] is the
-//     single source of truth for which path segments signal an API endpoint, and
+//   - [ValidateFullURL], [SameOrigin], [IsAbsoluteHTTPURL], [IsPrintableASCIIURL]
+//     and [APIIndicatorAlternation] are exported for the same reason as
+//     [ExtractStaticConcatPaths] — they are the shared definitions that keep the
+//     offline static path from drifting away from this one (LAB-4992).
+//     [ValidateFullURL] is the parse-time URL gate (rejects embedded credentials,
+//     non-http(s) schemes, empty hosts) applied before probing an absolute
+//     reconstruction; [SameOrigin] compares origins with default-port
+//     canonicalization, so the two paths agree on what counts as the bundle's own
+//     origin; [IsAbsoluteHTTPURL] answers "does this carry an http(s) scheme"
+//     case-insensitively, because url.Parse lower-cases the scheme and a
+//     case-sensitive prefix test would classify "HTTPS://h/x" as relative;
+//     [IsPrintableASCIIURL] is the byte policy for anything bound for an
+//     operator-facing artifact (no raw non-ASCII or control bytes, and no
+//     percent-escape decoding to them), which pkg/analyze/jsstatic applies at its
+//     synthesis choke point so every producer shares one rule rather than only the
+//     concat reconstruction being filtered; [APIIndicatorAlternation] is the single
+//     source of truth for which path segments signal an API endpoint, and
 //     pkg/classify pins its Rule 3 gate against it so the classifier cannot
 //     silently stop recognizing an indicator this package still extracts.
 //
