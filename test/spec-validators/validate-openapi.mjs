@@ -29,7 +29,13 @@ if (!existsSync(specFile)) {
 }
 
 try {
-  const api = await SwaggerParser.validate(specFile);
+  // Resolve internal $refs only. swagger-parser follows external http(s)/file
+  // $refs by default, which would let a spec under test trigger a network fetch
+  // or arbitrary file read in CI. All specs this validator sees are
+  // self-contained (PR #187 review finding SEC-BE-001).
+  const api = await SwaggerParser.validate(specFile, {
+    resolve: { external: false },
+  });
   const pathCount = api.paths ? Object.keys(api.paths).length : 0;
   const version = api.openapi || api.swagger || "unknown";
   console.log(`OK: valid OpenAPI ${version} spec (${pathCount} paths)`);

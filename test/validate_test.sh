@@ -154,6 +154,21 @@ printf 'type Query { a closing brace } but not valid graphql whatsoever here now
 assert_reject "junk text containing 'type Query {' and '}'" \
     validate_graphql_structure "${WORK_DIR}/junk.graphql"
 
+log_header "assert_no_panic"
+
+# Locks the panic-detection regex extracted from test_import_malformed (gap B3).
+# A broken pattern would silently downgrade the importer panic check to a no-op.
+assert_ok "clean graceful error output" \
+    assert_no_panic "graceful" "Error: failed to parse burp XML: unexpected EOF"
+assert_ok "empty output" \
+    assert_no_panic "empty" ""
+assert_reject "output containing a Go panic" \
+    assert_no_panic "panicked" "panic: runtime error: index out of range [3] with length 0"
+assert_reject "output containing a goroutine stack trace" \
+    assert_no_panic "stacktrace" "goroutine 1 [running]:
+main.main()
+	/src/main.go:42 +0x1d"
+
 # ──────────────────────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────────────────────

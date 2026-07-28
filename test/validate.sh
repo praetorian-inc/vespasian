@@ -266,7 +266,10 @@ PYEOF
 }
 
 # validate_soap_operations validates a WSDL with a real XML parser and checks
-# that the expected operations are present as EXACT portType operation names.
+# that every expected operation is present, using exact per-name matching
+# against portType operation names. This is an expected-subset check: extra
+# or unexpected operations in the WSDL are NOT flagged (PR #187 review finding
+# TEST-004).
 # LAB-3890 T1: replaces the old substring check (`GetUser` false-passed on
 # `GetUserList`, and names in comments false-passed). Uses xmllint for
 # well-formedness + exact operation-name extraction, jq to read expected ops.
@@ -336,7 +339,23 @@ validate_soap_operations() {
 
     local total
     total=$(jq -r '.operations | length' "$expected_json")
-    log_ok "SOAP operations: all ${total} operations found (exact match)"
+    log_ok "SOAP operations: all ${total} expected operations present (exact name match)"
+    return 0
+}
+
+# assert_no_panic checks that captured tool output contains no Go panic or
+# goroutine stack trace. A panic is a crash, NOT graceful handling, so it must
+# never be accepted as a "graceful" non-zero exit (LAB-3890 T3, gap B3).
+# Extracted from test_import_malformed's nested check_panic so the regex itself
+# is regression-tested by validate_test.sh (PR #187 review finding TEST-002).
+# Returns 0 when the output is panic-free, 1 when a panic/stack trace is found.
+# Usage: assert_no_panic <label> <output>
+assert_no_panic() {
+    local label=$1 output=$2
+    if printf '%s' "$output" | grep -qiE 'panic:|goroutine [0-9]+ \[running\]'; then
+        log_fail "${label}: PANICKED (not graceful): $(printf '%s' "$output" | grep -iE 'panic:' | head -1)"
+        return 1
+    fi
     return 0
 }
 

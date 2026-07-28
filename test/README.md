@@ -137,8 +137,8 @@ Options:
   --group <name>        Run a predefined target group: offline, live, or all (default: all)
   --targets <list>      Comma-separated targets to test (overrides --group)
                         Valid targets:
-                          Service:    rest-api, soap-service, graphql-server, concat-spa,
-                                      concat-spa-two-stage
+                          Service:    rest-api, scan-rest, soap-service, graphql-server,
+                                      concat-spa, concat-spa-two-stage, forms-target
                           Config:     grpc-server (included via TARGETS_SETUP when set up)
                           Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,
                                       generate-graphql, generate-graphql-imports,
@@ -146,8 +146,8 @@ Options:
                           Import:     import-burp, import-har, import-base64,
                                       import-mitmproxy, import-mitmproxy-native,
                                       import-unicode, import-duplicates,
-                                      import-malformed, import-empty
-                          Crawl:      crawl-depth, crawl-unreachable, no-download
+                                      import-malformed, import-empty, auth-capture
+                          Crawl:      crawl-depth, crawl-unreachable, ssrf-rejection, no-download
                           Edge cases: edge-cases, classifier-edge, spec-edge
   --verbose             Enable verbose vespasian output
   --no-build            Skip building vespasian and target binaries

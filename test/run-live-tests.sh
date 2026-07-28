@@ -182,7 +182,7 @@ preflight_test_host() {
     local targets=$1
     local failed=0
     case ",${targets}," in
-        *,rest-api,*|*,edge-cases,*|*,crawl-depth,*|*,no-download,*)
+        *,rest-api,*|*,scan-rest,*|*,edge-cases,*|*,crawl-depth,*|*,no-download,*)
             _probe_target_host "${REST_API_PORT:-}" "/api/health" "rest-api" || failed=1
             ;;
     esac
@@ -2511,16 +2511,12 @@ test_import_malformed() {
     log_header "Testing: import-malformed (graceful handling of bad input)"
 
     # check_panic fails the test if an import's combined output contains a Go
-    # panic / goroutine stack trace. A panic is a crash, NOT graceful handling,
-    # so it must never be accepted as a "graceful" non-zero exit (LAB-3890 T3,
-    # gap B3). Defined here so it shares this function's `failures` via bash
-    # dynamic scoping.
+    # panic / goroutine stack trace (LAB-3890 T3, gap B3). The detection itself
+    # lives in validate.sh:assert_no_panic so validate_test.sh can regression-test
+    # the regex; this thin wrapper keeps sharing this function's `failures` via
+    # bash dynamic scoping (PR #187 review finding TEST-002).
     check_panic() {
-        local label=$1 output=$2
-        if printf '%s' "$output" | grep -qiE 'panic:|goroutine [0-9]+ \[running\]'; then
-            log_fail "${label}: PANICKED (not graceful): $(printf '%s' "$output" | grep -iE 'panic:' | head -1)"
-            failures=$((failures + 1))
-        fi
+        assert_no_panic "$1" "$2" || failures=$((failures + 1))
     }
 
     # Test 1: Truncated/broken XML — should fail gracefully (non-zero exit, no crash)
@@ -3224,19 +3220,31 @@ test_crawl_depth() {
         # /deep/3 (depth 2) but MUST NOT reach /deep/4+ (depth 3+). The old check
         # flagged /deep/3 and only warned; it now hard-fails on any hop beyond
         # the requested depth (LAB-3890 T3, gap B2).
-        local beyond_depth
-        beyond_depth=$(python3 - "$shallow_capture" << 'PYEOF' 2>/dev/null || echo "?"
+        local depth_counts beyond_depth reached_depth
+        depth_counts=$(python3 - "$shallow_capture" << 'PYEOF' 2>/dev/null || echo "? ?"
 import json, sys
 data = json.load(open(sys.argv[1]))
 urls = [r['url'] for r in data]
 beyond = [u for u in urls if '/deep/4' in u or '/deep/5' in u or '/deep/6' in u]
-print(len(beyond))
+# Positive side of the boundary: --depth 2 from seed /deep/1 MUST actually reach
+# /deep/2 or /deep/3. Without this, an under-crawl that stops at the seed also
+# reports zero /deep/4+ and would pass green (PR #187 review finding TEST-003).
+reached = [u for u in urls if '/deep/2' in u or '/deep/3' in u]
+print(len(beyond), len(reached))
 PYEOF
         )
+        beyond_depth=${depth_counts%% *}
+        reached_depth=${depth_counts##* }
         if [ "$beyond_depth" = "0" ]; then
             log_ok "Depth limit: correctly stopped within depth 2 (no /deep/4+)"
         else
             log_fail "Depth limit: found ${beyond_depth} URL(s) beyond depth 2 (/deep/4+) — --depth not enforced"
+            failures=$((failures + 1))
+        fi
+        if [ "$reached_depth" != "0" ] && [ "$reached_depth" != "?" ]; then
+            log_ok "Depth reach: crawl followed links past the seed (${reached_depth} URL(s) at /deep/2+)"
+        else
+            log_fail "Depth reach: crawl never got past the seed (no /deep/2 or /deep/3) — under-crawl / premature stop"
             failures=$((failures + 1))
         fi
     else
@@ -3828,7 +3836,7 @@ usage() {
     echo "  --targets <list>      Comma-separated targets to test (overrides --group)"
     echo "                        Valid targets:"
     echo "                          Service:    rest-api, scan-rest, soap-service, graphql-server,"
-    echo "                                      concat-spa, concat-spa-two-stage"
+    echo "                                      concat-spa, concat-spa-two-stage, forms-target"
     echo "                          Config:     grpc-server (included via TARGETS_SETUP when set up)"
     echo "                          Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,"
     echo "                                      generate-graphql, generate-graphql-imports,"
