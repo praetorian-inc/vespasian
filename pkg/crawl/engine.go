@@ -370,7 +370,7 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 			// it in this run, but keep it out of the persisted seen-set so a resumed
 			// run can: seen is cumulative, so leaving it in would blacklist the page
 			// permanently after one bad response.
-			e.frontier.MarkFailed(entry.URL)
+			e.frontier.MarkFailed(entry)
 			e.frontier.MarkIdle()
 			continue
 		}

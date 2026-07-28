@@ -384,7 +384,7 @@ func TestSnapshot_ExcludesTransientlyFailedPages(t *testing.T) {
 		{URL: "https://ex.com/ok", Depth: 0},
 		{URL: "https://ex.com/broken", Depth: 0},
 	})
-	f.MarkFailed("https://ex.com/broken")
+	f.MarkFailed(urlEntry{URL: "https://ex.com/broken", Depth: 0})
 
 	_, seen := f.Snapshot()
 	if slices.Contains(seen, frontierKey("https://ex.com/broken")) {
@@ -397,5 +397,152 @@ func TestSnapshot_ExcludesTransientlyFailedPages(t *testing.T) {
 	// Still deduped WITHIN this run: a second referrer must not re-enqueue it.
 	if n := f.Push([]urlEntry{{URL: "https://ex.com/broken", Depth: 1}}); n != 0 {
 		t.Errorf("failed page was re-enqueued in the same run (%d added); it would spend the page budget on retries", n)
+	}
+}
+
+// TestSnapshot_FailedPageIsCarriedAsPending pins the other half of transient-
+// failure handling (Codex review, PR #189). Omitting a failed page from the
+// snapshot's seen-set is not enough on its own: the page was POPPED before it
+// failed, so it is in neither the queue nor the seen-set, and the checkpoint
+// carries it in neither half. It then survives only if some other pending page
+// happens to re-link it. It must come back as PENDING.
+func TestSnapshot_FailedPageIsCarriedAsPending(t *testing.T) {
+	f := newURLFrontier(3, nil)
+	f.Push([]urlEntry{{URL: "https://ex.com/broken", Depth: 2}})
+
+	// Pop it, exactly as a worker does before discovering the failure.
+	entry, ok := f.Pop()
+	if !ok {
+		t.Fatal("Pop returned nothing")
+	}
+	f.MarkFailed(entry)
+	f.MarkIdle()
+
+	pending, seen := f.Snapshot()
+
+	if slices.Contains(seen, frontierKey("https://ex.com/broken")) {
+		t.Errorf("failed page must not be in the snapshot seen-set: %v", seen)
+	}
+
+	var found *PendingURL
+	for i := range pending {
+		if pending[i].URL == "https://ex.com/broken" {
+			found = &pending[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("failed page is in neither Pending nor Seen, so resume drops it entirely: pending=%+v seen=%v", pending, seen)
+	}
+	if found.Depth != 2 {
+		t.Errorf("failed page requeued at Depth %d, want 2 (its original depth)", found.Depth)
+	}
+}
+
+// TestSnapshot_LastPageFailure_ResumeStillHasWork is the end-to-end shape of the
+// same bug: a crawl that covered everything except a final transiently-failed
+// page used to checkpoint an empty queue and a complete seen-set, so the resumed
+// run had nothing to crawl and the page was never retried.
+func TestSnapshot_LastPageFailure_ResumeStillHasWork(t *testing.T) {
+	f := newURLFrontier(3, nil)
+	f.Push([]urlEntry{{URL: "https://ex.com/only", Depth: 0}})
+	entry, _ := f.Pop()
+	f.MarkFailed(entry)
+	f.MarkIdle()
+
+	pending, seen := f.Snapshot()
+
+	resumed := newURLFrontier(3, nil)
+	resumed.Restore(pending, seen)
+	if resumed.Len() == 0 {
+		t.Fatal("resumed frontier is empty: the failed page was lost, so the resumed run reports nothing to crawl")
+	}
+}
+
+// TestSnapshot_FailedPendingOrderIsDeterministic pins that requeued failed pages
+// do not reintroduce ordering variance. f.failed is a map, so unsorted iteration
+// would make the pending order differ run to run for identical input.
+func TestSnapshot_FailedPendingOrderIsDeterministic(t *testing.T) {
+	build := func() []PendingURL {
+		f := newURLFrontier(3, nil)
+		urls := []string{"https://ex.com/c", "https://ex.com/a", "https://ex.com/b", "https://ex.com/d"}
+		for _, u := range urls {
+			f.Push([]urlEntry{{URL: u, Depth: 1}})
+		}
+		for range urls {
+			e, _ := f.Pop()
+			f.MarkFailed(e)
+			f.MarkIdle()
+		}
+		pending, _ := f.Snapshot()
+		return pending
+	}
+
+	want := build()
+	for i := range 20 {
+		got := build()
+		if len(got) != len(want) {
+			t.Fatalf("iteration %d: length %d, want %d", i, len(got), len(want))
+		}
+		for j := range got {
+			if got[j].URL != want[j].URL {
+				t.Fatalf("iteration %d: pending order differs at %d: %q vs %q", i, j, got[j].URL, want[j].URL)
+			}
+		}
+	}
+}
+
+// TestRestore_RevalidatesPendingAgainstScopeAndDepth pins the security fix from
+// the Codex review of PR #189. A checkpoint round-trips through host storage and
+// its fingerprint is derived from non-secret crawl config, so it cannot be
+// authenticated. Restore must therefore re-apply the scope and depth gates that
+// Push enforces on every other URL, or a crafted checkpoint seeds the frontier
+// with out-of-scope and private-network targets.
+func TestRestore_RevalidatesPendingAgainstScopeAndDepth(t *testing.T) {
+	inScope := func(u string) bool { return strings.HasPrefix(u, "https://target.test/") }
+
+	f := newURLFrontier(2, inScope)
+	f.Restore([]urlEntry{
+		{URL: "https://target.test/legit", Depth: 1},
+		{URL: "https://evil.test/exfil", Depth: 1},       // out of scope
+		{URL: "http://169.254.169.254/latest", Depth: 1}, // link-local, out of scope
+		{URL: "https://target.test/too-deep", Depth: 99}, // beyond maxDepth
+		{URL: "", Depth: 0},                              // unparseable
+	}, nil)
+
+	var got []string
+	for {
+		e, ok := f.Pop()
+		if !ok {
+			break
+		}
+		got = append(got, e.URL)
+		f.MarkIdle()
+	}
+
+	want := []string{"https://target.test/legit"}
+	if !slices.Equal(got, want) {
+		t.Errorf("Restore admitted entries it should have rejected.\n got: %v\nwant: %v", got, want)
+	}
+}
+
+// TestRestore_KeepsLegitimateResumeQueue guards the fix against over-correction:
+// re-validating must not reject the normal resumed queue. In particular the
+// seen-check Push applies must NOT be applied here, since restored pending
+// entries are legitimately already in the checkpoint's seen-set.
+func TestRestore_KeepsLegitimateResumeQueue(t *testing.T) {
+	inScope := func(u string) bool { return strings.HasPrefix(u, "https://target.test/") }
+
+	f := newURLFrontier(5, inScope)
+	pending := []urlEntry{
+		{URL: "https://target.test/a", Depth: 1},
+		{URL: "https://target.test/b", Depth: 2},
+	}
+	// The same URLs appear in seen, exactly as a real checkpoint records them.
+	seen := []string{frontierKey("https://target.test/a"), frontierKey("https://target.test/b")}
+
+	f.Restore(pending, seen)
+
+	if f.Len() != 2 {
+		t.Fatalf("resumed queue has %d entries, want 2; the seen-set must not reject the restored queue", f.Len())
 	}
 }

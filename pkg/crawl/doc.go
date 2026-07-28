@@ -152,11 +152,16 @@
 // pending queue ([]PendingURL) and seen-set, gated by [ComputeConfigFingerprint]
 // (target/scope/depth) and a staleness bound ([Checkpoint.Usable],
 // [DefaultCheckpointMaxAge]); a page whose visit failed transiently is omitted
-// from the persisted seen-set so a resumed run retries it;
+// from the persisted seen-set AND returned to the persisted pending queue so a
+// resumed run retries it (omitting it from seen alone loses the page: it was
+// popped before failing, so it is in neither half of the checkpoint);
 // resume is driven through [CrawlerOptions]: set ResumeFrom to continue a prior
 // crawl and OnCheckpoint to receive the state captured when this one stops
 // (including on budget truncation or cancellation, which is the case resume
-// exists for). A checkpoint whose fingerprint or age does not match is reported
+// exists for). Restored pending entries are re-validated against depth and scope
+// on load: a checkpoint round-trips through host storage and its fingerprint is
+// derived from non-secret config, so it is parsed input, not trusted in-process
+// state. A checkpoint whose fingerprint or age does not match is reported
 // on Stderr and ignored, so a config change costs a full re-crawl rather than a
 // failed run. Both backends honor it. Storing and passing the checkpoint between
 // runs is the host's (Guard's) concern and is not built here.

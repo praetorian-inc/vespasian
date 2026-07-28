@@ -328,7 +328,7 @@ func (c *HTTPCrawler) runWorker(
 		// there turned one bad fetch into a permanent drop. It is not requeued now,
 		// so this run does not retry it.
 		if observed == nil {
-			frontier.MarkFailed(entry.URL)
+			frontier.MarkFailed(entry)
 		}
 
 		if observed != nil {

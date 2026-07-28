@@ -264,9 +264,30 @@ func (f *urlFrontier) Snapshot() (pending []PendingURL, seen []string) {
 	defer f.mu.Unlock()
 	pending = make([]PendingURL, len(f.queue))
 	copy(pending, f.queue)
+
+	// Transiently-failed pages go back on the PENDING queue, not merely out of
+	// seen. They were popped before failing, so they are in neither the queue nor
+	// (once excluded below) the seen-set; carrying them in neither half would
+	// drop them from resume entirely, and they would be retried only if some
+	// other pending page happened to re-link them. A run whose only failure was
+	// the last page would resume with an empty queue and a complete seen-set,
+	// report "nothing to crawl", and never revisit it.
+	//
+	// Sorted before appending because f.failed is a map: unsorted iteration would
+	// make the checkpoint's pending order vary run to run for identical input,
+	// which is the determinism this ticket exists to remove.
+	failedKeys := make([]string, 0, len(f.failed))
+	for k := range f.failed {
+		failedKeys = append(failedKeys, k)
+	}
+	sort.Strings(failedKeys)
+	for _, k := range failedKeys {
+		pending = append(pending, f.failed[k])
+	}
+
 	seen = make([]string, 0, len(f.seen))
 	for k := range f.seen {
-		if f.failed[k] {
+		if _, isFailed := f.failed[k]; isFailed {
 			continue
 		}
 		seen = append(seen, k)
@@ -277,14 +298,42 @@ func (f *urlFrontier) Snapshot() (pending []PendingURL, seen []string) {
 
 // Restore pre-loads resume state into the frontier before the crawl starts: the
 // seen keys are marked so neither the restored queue nor newly-discovered links
-// re-enqueue a covered page, and the pending entries are placed directly on the
-// queue (they already passed scope/depth when first enqueued, and are already in
-// seen, so they bypass Push's checks). Call on a fresh frontier before seeding.
+// re-enqueue a covered page, and the pending entries are placed on the queue.
+// Call on a fresh frontier before seeding.
+//
+// Pending entries are re-validated against depth and scope even though they
+// passed those checks in the run that produced them. A checkpoint is not
+// in-process state: it round-trips through host storage, so it is parsed input,
+// and [ComputeConfigFingerprint] cannot authenticate it — the fingerprint is
+// derived from the crawl config, which is not secret, so anyone who can write to
+// checkpoint storage can produce one that verifies. Appending Pending unchecked
+// would let such an artifact seed the frontier with out-of-scope or private-network
+// URLs, bypassing the scope and SSRF gates that [urlFrontier.Push] applies to
+// every other URL. Re-checking here costs one predicate call per entry and makes
+// the frontier's invariants hold regardless of where the queue came from.
+//
+// The seen check that Push applies is deliberately NOT applied: restored pending
+// entries are legitimately in the checkpoint's seen-set already, and rejecting
+// them on that basis would discard the entire resumed queue. They are marked seen
+// here so a later rediscovery still dedups against them.
 func (f *urlFrontier) Restore(pending []urlEntry, seen []string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	for _, e := range pending {
+		key := frontierKey(e.URL)
+		if key == "" {
+			continue
+		}
+		if f.maxDepth >= 0 && e.Depth > f.maxDepth {
+			continue
+		}
+		if f.scopeFn != nil && !f.scopeFn(e.URL) {
+			continue
+		}
+		f.seen[key] = true
+		f.queue = append(f.queue, e)
+	}
 	for _, k := range seen {
 		f.seen[k] = true
 	}
-	f.queue = append(f.queue, pending...)
 }
