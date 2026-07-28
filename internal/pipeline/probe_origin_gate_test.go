@@ -1,0 +1,379 @@
+// Copyright 2026 Praetorian Security, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package pipeline_test
+
+import (
+	"bytes"
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/praetorian-inc/vespasian/internal/pipeline"
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
+)
+
+// countingAPIServer returns an httptest server that increments hits on every
+// request and answers a minimal JSON body, plus the counter itself.
+func countingAPIServer(t *testing.T) (*httptest.Server, *int32) {
+	t.Helper()
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &hits
+}
+
+// apiRequest builds a minimal REST-classifiable ObservedRequest for rawURL
+// (JSON content-type response on an /api/ path, matching classify Rule 2/3).
+func apiRequest(rawURL string) crawl.ObservedRequest {
+	return crawl.ObservedRequest{
+		Method:  "GET",
+		URL:     rawURL,
+		Headers: map[string]string{"Content-Type": "application/json"},
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "application/json",
+			Headers:     map[string]string{"Content-Type": "application/json"},
+			Body:        []byte(`{"id":1}`),
+		},
+	}
+}
+
+// TestClassifyProbeGenerate_SameOriginCandidateIsProbed pins the positive half
+// of the SEC-BE-001 origin gate: a candidate whose URL shares TargetURL's
+// origin must still be probed (the gate must not fail closed for legitimate
+// same-origin targets).
+func TestClassifyProbeGenerate_SameOriginCandidateIsProbed(t *testing.T) {
+	target, hits := countingAPIServer(t)
+
+	requests := []crawl.ObservedRequest{apiRequest(target.URL + "/api/v1/users")}
+
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Deduplicate:  true,
+		TargetURL:    target.URL,
+	})
+	require.NoError(t, err)
+
+	assert.Positive(t, atomic.LoadInt32(hits), "same-origin candidate must be probed")
+}
+
+// TestClassifyProbeGenerate_CrossOriginCandidateIsNotProbed pins the negative
+// half of the SEC-BE-001 origin gate AND doubles as the AllowPrivate-ordering
+// regression test: AllowPrivate=true is required here for the loopback
+// attacker server to even be dial-able, so if the origin gate were applied
+// BEFORE the opts.AllowPrivate branch in ClassifyProbeGenerate (which replaces
+// cfg.URLValidator with an origin-blind no-op), the attacker server would
+// receive the probe request and this test would fail. It must therefore fail
+// if the gate is moved before that branch.
+func TestClassifyProbeGenerate_CrossOriginCandidateIsNotProbed(t *testing.T) {
+	target, targetHits := countingAPIServer(t)
+	attacker, attackerHits := countingAPIServer(t)
+
+	requests := []crawl.ObservedRequest{
+		apiRequest(target.URL + "/api/v1/users"),
+		apiRequest(attacker.URL + "/api/v1/collect"),
+	}
+
+	// Status is deliberately left nil (verbose off): the cross-origin skip
+	// warning must NOT depend on --verbose (see TestClassifyProbeGenerate_
+	// CrossOriginWarningNotGatedByStatus for the dedicated regression test),
+	// so it is asserted here on Warnings instead, mirroring
+	// crawl.JSReplayConfig.Stderr / AugmentOptions.WarnError.
+	var warnings bytes.Buffer
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Deduplicate:  true,
+		TargetURL:    target.URL,
+		Warnings:     &warnings,
+	})
+	require.NoError(t, err)
+
+	assert.Positive(t, atomic.LoadInt32(targetHits), "same-origin candidate must still be probed")
+	assert.Zero(t, atomic.LoadInt32(attackerHits), "cross-origin candidate must NOT be probed")
+	assert.Contains(t, warnings.String(), "skipping cross-origin URL",
+		"a warning must be emitted when a cross-origin probe target is skipped")
+	assert.Contains(t, warnings.String(), "AllowCrossOriginProbe",
+		"the warning must name the opt-out field, mirroring jsreplay's AllowCrossOrigin wording style")
+}
+
+// TestClassifyProbeGenerate_CrossOriginWarningNotGatedByStatus is the direct
+// regression test for the review finding that cross-origin probe skips were
+// silent by default: Status (the --verbose sink) is left nil here, exactly
+// the default non-verbose CLI invocation, yet the skip warning must still
+// reach Warnings. Prior to the fix, this warning only ever reached Status
+// (nil in the default CLI invocation), so it was invisible without
+// --verbose; this test pins the fix, not the pre-fix behavior.
+func TestClassifyProbeGenerate_CrossOriginWarningNotGatedByStatus(t *testing.T) {
+	target, _ := countingAPIServer(t)
+	attacker, attackerHits := countingAPIServer(t)
+
+	requests := []crawl.ObservedRequest{
+		apiRequest(target.URL + "/api/v1/users"),
+		apiRequest(attacker.URL + "/api/v1/collect"),
+	}
+
+	var warnings bytes.Buffer
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Deduplicate:  true,
+		TargetURL:    target.URL,
+		Status:       nil, // verbose off
+		Warnings:     &warnings,
+	})
+	require.NoError(t, err)
+
+	assert.Zero(t, atomic.LoadInt32(attackerHits), "cross-origin candidate must NOT be probed")
+	assert.Contains(t, warnings.String(), "skipping cross-origin URL",
+		"the cross-origin skip warning must be emitted on Warnings even when Status (--verbose) is nil")
+}
+
+// TestClassifyProbeGenerate_CrossOriginWarningDedupedByOrigin proves that
+// many cross-origin candidates on the SAME rejected origin produce exactly
+// one skip-warning line, not one per URL — avoiding log spam from a bundle
+// with many candidates on one attacker host.
+func TestClassifyProbeGenerate_CrossOriginWarningDedupedByOrigin(t *testing.T) {
+	target, _ := countingAPIServer(t)
+	attacker, attackerHits := countingAPIServer(t)
+
+	requests := []crawl.ObservedRequest{
+		apiRequest(target.URL + "/api/v1/users"),
+		apiRequest(attacker.URL + "/api/v1/collect"),
+		apiRequest(attacker.URL + "/api/v1/exfiltrate"),
+		apiRequest(attacker.URL + "/api/v1/beacon"),
+	}
+
+	var warnings bytes.Buffer
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Deduplicate:  true,
+		TargetURL:    target.URL,
+		Warnings:     &warnings,
+	})
+	require.NoError(t, err)
+
+	assert.Zero(t, atomic.LoadInt32(attackerHits), "no cross-origin candidate must be probed")
+	assert.Equal(t, 1, strings.Count(warnings.String(), "skipping cross-origin URL"),
+		"three candidates on the same rejected origin must produce exactly one skip warning, not three")
+}
+
+// TestClassifyProbeGenerate_AllowCrossOriginProbeOptOut proves the internal
+// opt-out field permits cross-origin probing when explicitly set.
+func TestClassifyProbeGenerate_AllowCrossOriginProbeOptOut(t *testing.T) {
+	target, _ := countingAPIServer(t)
+	attacker, attackerHits := countingAPIServer(t)
+
+	requests := []crawl.ObservedRequest{
+		apiRequest(target.URL + "/api/v1/users"),
+		apiRequest(attacker.URL + "/api/v1/collect"),
+	}
+
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:               pipeline.APITypeREST,
+		Confidence:            0.5,
+		Probe:                 true,
+		AllowPrivate:          true,
+		Deduplicate:           true,
+		TargetURL:             target.URL,
+		AllowCrossOriginProbe: true,
+	})
+	require.NoError(t, err)
+
+	assert.Positive(t, atomic.LoadInt32(attackerHits),
+		"AllowCrossOriginProbe=true must permit probing the cross-origin candidate")
+}
+
+// TestClassifyProbeGenerate_UnresolvableOriginFailsClosed pins the gate's
+// fail-closed branch (`targetOrigin == ""`): when neither an explicit
+// TargetURL nor any request in the capture yields a usable origin,
+// crawl.ResolveTargetOrigin returns "" and EVERY probe candidate must be
+// rejected — not implicitly treated as same-origin.
+//
+// Constructing this at the ClassifyProbeGenerate level with a dialable
+// candidate is impossible by design: ResolveTargetOrigin's third fallback
+// scans every request for the first one with a resolvable origin, so any
+// request carrying an absolute http(s) URL (the only kind an httptest server
+// could ever receive a hit from) would itself make the resolved origin
+// non-empty. A relative-path candidate (no scheme, no host) is therefore the
+// only way to reach targetOrigin == "" while still having something
+// classified and handed to a probe strategy: crawl.ResolveTargetOrigin("",
+// requests) below is asserted "" as a precondition check, and RESTClassifier
+// still classifies the relative URL (Rule 2, JSON content-type) so it reaches
+// the gate. Because a relative URL can never be dialed by net/http regardless
+// of the gate's outcome (confirmed separately: url.Parse gives it no host, so
+// http.Client.Do fails before any TCP connection), a request-counter
+// assertion cannot distinguish fail-closed from fail-open here; the status
+// message the gate writes on its reject branch is the only observable signal
+// tied to the branch under test, so it is asserted as the value-level
+// evidence in its place (per SEC-BE-001 rejecting this exact candidate).
+func TestClassifyProbeGenerate_UnresolvableOriginFailsClosed(t *testing.T) {
+	requests := []crawl.ObservedRequest{apiRequest("/api/v1/users")}
+	require.Equal(t, "", crawl.ResolveTargetOrigin("", requests),
+		"precondition: this capture must resolve to an empty target origin")
+
+	var warnings bytes.Buffer
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Deduplicate:  true,
+		Warnings:     &warnings,
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, warnings.String(), "skipping cross-origin URL /api/v1/users",
+		"an unresolvable target origin must fail closed and reject every probe candidate")
+	assert.Contains(t, warnings.String(), "AllowCrossOriginProbe",
+		"the warning must name the opt-out field even when the origin could not be resolved at all")
+	assert.Contains(t, warnings.String(), "no usable origin could be derived",
+		"the one-time derived-origin warning must also fire and explain that no origin could be resolved at all")
+}
+
+// thirdPartyAssetServer returns an httptest server that answers a
+// non-HTML, non-API asset response (e.g. a CDN-hosted analytics script), so
+// its request never satisfies firstHTMLOrigin nor gets classified as an API
+// candidate — it exists purely to occupy the "first request" slot in a
+// mixed-origin capture.
+func thirdPartyAssetServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		_, _ = w.Write([]byte("// analytics beacon\n"))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestClassifyProbeGenerate_MixedOriginWithoutTargetURLSkipsRealAPI pins Gap
+// 2's hazard exactly as it currently behaves: in a mixed-origin capture (as a
+// HAR/Burp import might produce) with no HTML response anywhere and no
+// --target-url, crawl.ResolveTargetOrigin's third fallback binds to the
+// origin of the FIRST request in the capture — here a third-party CDN
+// asset — rather than the real API host that appears later. Every genuine
+// API endpoint on that different host is then, by the SEC-BE-001 gate's own
+// logic, indistinguishable from an attacker-controlled cross-origin
+// candidate, and is silently skipped. Before this PR's gate existed, that
+// endpoint would have been probed; this test documents the tradeoff the gate
+// introduces so a future change to ResolveTargetOrigin's fallback order is
+// caught here rather than discovered as a silent regression in the field.
+func TestClassifyProbeGenerate_MixedOriginWithoutTargetURLSkipsRealAPI(t *testing.T) {
+	cdn := thirdPartyAssetServer(t)
+	api, apiHits := countingAPIServer(t)
+
+	// CDN asset first (mimics import ordering, where the capture's first
+	// entry need not be the app's own page), the real API host after it.
+	requests := []crawl.ObservedRequest{
+		apiRequest(cdn.URL + "/analytics.js"),
+		apiRequest(api.URL + "/api/v1/accounts"),
+	}
+	require.Equal(t, cdn.URL, crawl.ResolveTargetOrigin("", requests),
+		"precondition: the resolved origin must be the CDN's, not the API host's")
+
+	var warnings bytes.Buffer
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Deduplicate:  true,
+		Warnings:     &warnings,
+	})
+	require.NoError(t, err)
+
+	assert.Zero(t, atomic.LoadInt32(apiHits),
+		"without --target-url, the real API host is misresolved as cross-origin relative to the CDN and must be skipped (documents the hazard)")
+	assert.Contains(t, warnings.String(), "skipping cross-origin URL "+api.URL+"/api/v1/accounts")
+	assert.Contains(t, warnings.String(), cdn.URL,
+		"the one-time derived-origin warning must name the (wrongly) derived CDN origin so the operator can see why")
+}
+
+// TestClassifyProbeGenerate_DerivedOriginWarningAbsentWhenTargetURLSet is the
+// companion negative case: when --target-url IS supplied, the origin was
+// chosen by the operator, not derived, so the one-time derived-origin
+// warning must not fire (only the ordinary per-URL skip warning, if any,
+// would appear).
+func TestClassifyProbeGenerate_DerivedOriginWarningAbsentWhenTargetURLSet(t *testing.T) {
+	target, hits := countingAPIServer(t)
+
+	requests := []crawl.ObservedRequest{apiRequest(target.URL + "/api/v1/users")}
+
+	var warnings bytes.Buffer
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Deduplicate:  true,
+		TargetURL:    target.URL,
+		Warnings:     &warnings,
+	})
+	require.NoError(t, err)
+
+	assert.Positive(t, atomic.LoadInt32(hits))
+	assert.NotContains(t, warnings.String(), "not set",
+		"the derived-origin warning must not fire when --target-url was explicitly supplied")
+}
+
+// TestClassifyProbeGenerate_MixedOriginWithTargetURLProbesRealAPI is the
+// companion to TestClassifyProbeGenerate_MixedOriginWithoutTargetURLSkipsRealAPI:
+// the same mixed-origin capture, but with --target-url pinned to the real API
+// host. crawl.ResolveTargetOrigin's explicit-targetURL branch now takes
+// precedence over the CDN-first fallback, so the genuine API endpoint is
+// recognized as same-origin and probed — the documented remedy for the
+// hazard the previous test pins.
+func TestClassifyProbeGenerate_MixedOriginWithTargetURLProbesRealAPI(t *testing.T) {
+	cdn := thirdPartyAssetServer(t)
+	api, apiHits := countingAPIServer(t)
+
+	requests := []crawl.ObservedRequest{
+		apiRequest(cdn.URL + "/analytics.js"),
+		apiRequest(api.URL + "/api/v1/accounts"),
+	}
+
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Deduplicate:  true,
+		TargetURL:    api.URL,
+	})
+	require.NoError(t, err)
+
+	assert.Positive(t, atomic.LoadInt32(apiHits),
+		"--target-url pinned to the real API host must make its endpoints same-origin and probed")
+}

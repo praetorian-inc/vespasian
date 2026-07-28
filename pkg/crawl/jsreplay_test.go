@@ -2265,6 +2265,71 @@ func TestOriginOf(t *testing.T) {
 	assert.Equal(t, "", originOf("/relative/path"))
 }
 
+// TestResolveTargetOrigin pins the priority order documented on
+// ResolveTargetOrigin: explicit targetURL wins outright; otherwise fall back
+// to the first HTML-response request's origin; otherwise the first
+// non-empty request URL's origin; otherwise "".
+func TestResolveTargetOrigin(t *testing.T) {
+	htmlReq := ObservedRequest{
+		URL:      "http://html.example.test/",
+		Response: ObservedResponse{ContentType: "text/html", Body: []byte("<!DOCTYPE html>")},
+	}
+	firstReq := ObservedRequest{
+		URL:      "http://first.example.test/app.js",
+		Response: ObservedResponse{ContentType: "application/javascript"},
+	}
+
+	tests := []struct {
+		name      string
+		targetURL string
+		requests  []ObservedRequest
+		want      string
+	}{
+		{
+			name:      "explicit targetURL wins over everything else",
+			targetURL: "https://explicit.example.test",
+			requests:  []ObservedRequest{firstReq, htmlReq},
+			want:      "https://explicit.example.test:443",
+		},
+		{
+			name:      "falls back to first-HTML origin when targetURL is empty",
+			targetURL: "",
+			requests:  []ObservedRequest{firstReq, htmlReq},
+			want:      "http://html.example.test:80",
+		},
+		{
+			name:      "falls back to first non-empty request URL when no HTML present",
+			targetURL: "",
+			requests:  []ObservedRequest{firstReq},
+			want:      "http://first.example.test:80",
+		},
+		{
+			name:      "unparseable targetURL is ignored, falls through",
+			targetURL: "not a url",
+			requests:  []ObservedRequest{firstReq},
+			want:      "http://first.example.test:80",
+		},
+		{
+			name:      "empty request set and empty targetURL yields empty origin",
+			targetURL: "",
+			requests:  nil,
+			want:      "",
+		},
+		{
+			name:      "requests with only empty URLs yield empty origin",
+			targetURL: "",
+			requests:  []ObservedRequest{{URL: ""}, {URL: ""}},
+			want:      "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, ResolveTargetOrigin(tt.targetURL, tt.requests))
+		})
+	}
+}
+
 func TestExtractAPIPaths_CleanPathPassesThrough(t *testing.T) {
 	// Sanity check that a clean quoted path is extracted and parses as a
 	// valid URL. Sanitization of attacker-controlled control characters is
@@ -3977,4 +4042,20 @@ func TestIsPrintableASCIIURL(t *testing.T) {
 	for _, in := range bad {
 		assert.False(t, IsPrintableASCIIURL(in), "must be rejected: %q", in)
 	}
+}
+
+// TestIsPrintableASCIIURL_SharedScanIndexAdvance pins scanEscapedBytes' shared
+// index-skip behavior (the `i += 2` after a decoded percent-escape) through
+// the IsPrintableASCIIURL caller specifically. TestPercentEscapeValidation
+// exercises the same shared loop only via cleanConcatPath/allowedConcatBytes;
+// mutating scanEscapedBytes' `i += 2` to `i += 3` (skipping one byte too many,
+// so the byte immediately after an escape is never validated) left
+// TestIsPrintableASCIIURL green, because none of its fixtures place a
+// rejectable byte directly after a valid escape.
+func TestIsPrintableASCIIURL_SharedScanIndexAdvance(t *testing.T) {
+	assert.True(t, IsPrintableASCIIURL("/api/x%20y"), "a lone valid escape must still be accepted")
+	assert.False(t, IsPrintableASCIIURL("/api/x%20\x01y"), "a control byte directly after a valid escape must be rejected")
+	assert.False(t, IsPrintableASCIIURL("/api/x%20\x7Fy"), "DEL directly after a valid escape must be rejected")
+	assert.False(t, IsPrintableASCIIURL("/api/x%20%00y"), "a bad escape immediately following a good one must be rejected")
+	assert.True(t, IsPrintableASCIIURL("/api/x%20%21y"), "two adjacent valid escapes must both be accepted")
 }

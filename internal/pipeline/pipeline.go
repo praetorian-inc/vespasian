@@ -49,6 +49,24 @@ type Options struct {
 	// SSRF protection is still enforced by the dialer regardless.
 	GRPCInsecureSkipVerify bool
 
+	// TargetURL is the scan's intended target, used together with requests to
+	// derive the origin for the probe-stage cross-origin gate (SEC-BE-001) via
+	// crawl.ResolveTargetOrigin. Should be the same value handed to the
+	// JS-replay stage's JSReplayConfig.TargetURL so both stages agree on what
+	// "the target origin" means for this scan. If empty, the origin is
+	// derived from requests the same way JS-replay does.
+	TargetURL string
+
+	// AllowCrossOriginProbe disables the probe-stage cross-origin gate,
+	// permitting probe requests to targets whose origin does not match the
+	// origin resolved from TargetURL/requests. Internal-only — mirrors
+	// crawl.JSReplayConfig.AllowCrossOrigin: defaults to false and has no CLI
+	// flag. Enabling this lets a classified candidate (including a hostile
+	// JS-static literal promoted by classify Rule 7) direct probe traffic at
+	// an attacker-chosen public host; appropriate only for trusted
+	// multi-host/tenant scans.
+	AllowCrossOriginProbe bool
+
 	// MergeSlugs enables observation-based slug merging in REST path
 	// normalization. Ignored by the wsdl/graphql generators.
 	MergeSlugs bool
@@ -61,6 +79,14 @@ type Options struct {
 	// Status is an optional io.Writer for verbose status messages.
 	// Pass nil or io.Discard to suppress.
 	Status io.Writer
+
+	// Warnings is an optional io.Writer for operator-facing warnings that
+	// must be visible regardless of --verbose: the SEC-BE-001 cross-origin
+	// probe-skip warning and the one-time "origin was derived, not chosen"
+	// warning. Mirrors crawl.JSReplayConfig.Stderr / AugmentOptions.WarnError
+	// — separate from Status so these are never accidentally silenced by a
+	// non-verbose CLI invocation. Pass nil to stay fully quiet (e.g. the SDK).
+	Warnings io.Writer
 }
 
 // ValidateSlugThreshold rejects a --slug-threshold < 2 when --merge-slugs is
@@ -129,6 +155,30 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 				return d.DialContext(ctx, network, addr)
 			}
 		}
+
+		// Cross-origin probe gate (SEC-BE-001). Applied AFTER the AllowPrivate
+		// branch above — and wrapping whatever validator is in place at this
+		// point, nil or the no-op set above — so --dangerous-allow-private
+		// disables SSRF checking only and never this gate. Without it, a
+		// hostile JS-static literal (e.g. fetch("https://attacker.example/api/x"))
+		// promoted by classify Rule 7's StaticJSConfidence floor reaches probe
+		// with no origin check at all; the same gap applies to any
+		// cross-origin candidate regardless of producer, since probe is the
+		// only unscoped egress path in the pipeline (crawl is scope-guarded,
+		// JS-replay is same-origin by default). See newCrossOriginValidator
+		// and warnDerivedProbeOrigin for the gate/warning construction.
+		if !opts.AllowCrossOriginProbe {
+			targetOrigin := crawl.ResolveTargetOrigin(opts.TargetURL, requests)
+			if opts.TargetURL == "" {
+				warnDerivedProbeOrigin(opts.Warnings, targetOrigin)
+			}
+			baseValidator := cfg.URLValidator
+			if baseValidator == nil {
+				baseValidator = probe.ValidateProbeURL
+			}
+			cfg.URLValidator = newCrossOriginValidator(baseValidator, targetOrigin, opts.Warnings)
+		}
+
 		// Pure grpc-gateway traffic is REST/JSON, so the gRPC classifier never
 		// marks it APIType=="grpc" and the gRPC/gateway probes (which only
 		// iterate grpc endpoints) get no targets. Seed one synthetic grpc

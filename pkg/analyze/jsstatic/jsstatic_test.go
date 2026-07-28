@@ -1169,3 +1169,68 @@ func TestAnalyze_EndpointsKeptReflectsSynthesisDrops(t *testing.T) {
 			res.Stats.EndpointsFound, res.Stats.EndpointsKept)
 	}
 }
+
+// TestAnalyze_EndpointsKeptReflectsSourcemapSynthesisDrops is the sourcemap-arm
+// counterpart to TestAnalyze_EndpointsKeptReflectsSynthesisDrops (TEST-002).
+// EndpointsKept is accumulated separately for the bundle body (analyzeOne,
+// after the first toRequests call) and for each recovered sourcemap source
+// (after the second toRequests call inside the sourcemap loop); the sourcemap
+// arm also feeds `remaining := MaxEndpointsPerBundle - EndpointsKept`, so an
+// inflated count there silently starves later sourcemap sources of budget.
+//
+// The bundle body here carries zero API endpoints (only the sourceMappingURL
+// comment), so the bundle-body accumulation contributes nothing and cannot
+// mask a miscount in the sourcemap arm — isolating this test to the second
+// accumulation site. Mutation-tested: changing `EndpointsKept += len(smSynth)`
+// to `+= len(smEps)` (counting pre-synthesis endpoints instead of post-drop
+// survivors) leaves every other test in the package green.
+func TestAnalyze_EndpointsKeptReflectsSourcemapSynthesisDrops(t *testing.T) {
+	// One clean endpoint the gate must keep, one carrying credentials the gate
+	// must drop — both live ONLY in the sourcemap source.
+	srcContent := `fetch("/api/sm/keep");` + `fetch("https://u:p@example.com/api/sm/drop");`
+	smDoc := fmt.Sprintf(`{"sources":["src/index.js"],"sourcesContent":[%s]}`,
+		func() string { b, _ := json.Marshal(srcContent); return string(b) }())
+	encoded := base64.StdEncoding.EncodeToString([]byte(smDoc))
+	// Bundle body deliberately has no fetch/axios calls at all, so the
+	// bundle-body arm's EndpointsFound/EndpointsKept contribution is zero.
+	bundleBody := "//# sourceMappingURL=data:application/json;base64," + encoded + "\n"
+
+	res, err := Analyze(context.Background(), []crawl.ObservedRequest{
+		makeJSCapture("https://example.com/app.js", bundleBody),
+	}, Options{})
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+
+	var kept int
+	var sawKeep bool
+	for _, r := range res.Requests {
+		if !crawl.IsJSStaticSource(r.Source) {
+			continue
+		}
+		kept++
+		if strings.Contains(r.URL, "@") {
+			t.Errorf("synthesized request carries embedded credentials: %q (source %q)", r.URL, r.Source)
+		}
+		if strings.HasSuffix(r.URL, "/api/sm/keep") {
+			sawKeep = true
+		}
+	}
+
+	if res.Stats.EndpointsKept != kept {
+		t.Errorf("Stats.EndpointsKept = %d, but %d JS-static requests were actually synthesized; "+
+			"the sourcemap arm must count post-synthesis survivors, not pre-synthesis extracted endpoints",
+			res.Stats.EndpointsKept, kept)
+	}
+	// Non-vacuous: the gate must actually have dropped the credentialed
+	// endpoint, and kept the clean one, otherwise a blanket accept OR a
+	// blanket reject would both leave EndpointsKept trivially consistent.
+	if !sawKeep {
+		t.Fatalf("positive control /api/sm/keep was dropped — the gate is over-blocking, got %v", res.Requests)
+	}
+	if res.Stats.EndpointsFound <= res.Stats.EndpointsKept {
+		t.Errorf("expected the sourcemap-arm gate to drop at least one endpoint (Found=%d Kept=%d); "+
+			"without a drop this test cannot detect the desync",
+			res.Stats.EndpointsFound, res.Stats.EndpointsKept)
+	}
+}

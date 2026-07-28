@@ -51,15 +51,33 @@
 //     companions appear for a path recovered both ways on the same origin.
 //
 //     An absolute reconstruction (a bundle literal that concatenates a full
-//     http(s) URL) is gated by crawl.ValidateFullURL — the same parse-time check
-//     the active path applies in addPath, rejecting embedded credentials,
-//     non-http(s) schemes and empty hosts — and then required to match the
-//     bundle's own host AND scheme (SEC-BE-001, LAB-4992). A cross-origin
-//     reconstruction, one that smuggles HTTP Basic credentials via userinfo
-//     (which net/url keeps in u.User, so a host-only comparison misses it), and
-//     one that downgrades https to http are all dropped, so a hostile bundle
-//     literal cannot steer the offline candidate set — or the probe stage that
-//     later consumes it — at an attacker-chosen host or credential.
+//     http(s) URL) must additionally share the bundle's own origin — scheme,
+//     host AND port, via crawl.SameOrigin — enforced by the concat producer
+//     itself (extractConcatEndpoints), since a speculative recombination that
+//     lands on a different host or downgrades https to http is far more
+//     likely an artifact or a plant than a real call site (SEC-BE-001,
+//     LAB-4992).
+//
+//     Credential rejection, the byte policy, and scheme validity are enforced
+//     once for EVERY producer (AST literal, sourcemap-recovered, and concat
+//     alike) at a single synthesis choke point, specSafeURL in toRequests,
+//     which runs on each endpoint's final RESOLVED URL rather than the
+//     pre-resolution literal. It is deliberately parse-based, with no
+//     string-prefix test: given the parsed form, (1) every byte must be
+//     printable ASCII, whether raw or reached via a percent-escape, so a
+//     hostile bundle cannot make a spec path key or servers entry render
+//     differently from its bytes (SEC-BE-002); (2) the URL may carry no
+//     userinfo, however spelled (u:p@host, the scheme-relative //u:p@host,
+//     or an explicit scheme://u:p@host) — this is the credential-injection
+//     sink, since ssrf.ValidateURL never inspects u.User and
+//     probe.Config.AuthHeaders is set by no non-test caller, so net/http
+//     would otherwise derive an `Authorization: Basic` header from an
+//     attacker-chosen credential on every probe (SEC-BE-001); and (3) any URL
+//     that carries a host must use the http or https scheme, which catches a
+//     scheme-relative literal that resolution left without one. A hostile
+//     bundle literal cannot steer the offline candidate set — or the probe
+//     stage that later consumes it — at an attacker-chosen host, credential,
+//     or byte-spoofed path.
 //
 //     Capture compatibility (QUAL-001, LAB-4992): this applies to captures whose
 //     JS bundles have not ALREADY been through an older jsstatic pass.

@@ -59,6 +59,12 @@ type ScanOptions struct {
 	// Pass nil to suppress.
 	Status io.Writer
 
+	// Warnings is an optional io.Writer for the SEC-BE-001 cross-origin
+	// probe-skip warning and the one-time derived-origin warning, forwarded
+	// to Options.Warnings. Not gated on verbosity; pass nil to stay quiet
+	// (e.g. the SDK).
+	Warnings io.Writer
+
 	// AfterWSDL, when non-nil, runs after WSDL resolution and before
 	// classification, receiving the (post-WSDL-resolve) request slice and
 	// returning the slice to classify. The CLI uses this to keep its JS-replay
@@ -100,6 +106,8 @@ func ResolveAndGenerate(ctx context.Context, requests []crawl.ObservedRequest, o
 		MergeSlugs:             opts.MergeSlugs,
 		SlugThreshold:          opts.SlugThreshold,
 		Status:                 opts.Status,
+		Warnings:               opts.Warnings,
+		TargetURL:              opts.TargetURL,
 	})
 	return spec, apiType, foundWSDL, requests, err
 }

@@ -699,6 +699,44 @@ func firstHTMLOrigin(requests []ObservedRequest) string {
 	return ""
 }
 
+// ResolveTargetOrigin derives "the target origin" for a scan from an explicit
+// target URL and an observed request set, in priority order:
+//  1. explicit targetURL, if it parses to a usable origin;
+//  2. the origin of the first request whose RESPONSE is HTML (the real app
+//     page) — see firstHTMLOrigin;
+//  3. the origin of the first request with a non-empty URL.
+//
+// Returns "" if none of the above yields a usable origin.
+//
+// Preferring the HTML page (step 2) over the plain first-request fallback
+// (step 3) matters for mixed-origin / imported captures (HAR/Burp) whose
+// first entry may be a third-party asset (CDN font, analytics beacon):
+// binding to that asset's origin would leave the app's same-origin bundles
+// looking cross-origin (LAB-3892 review). Single-origin crawl captures are
+// unaffected — their first entry is the HTML page anyway.
+//
+// Exported and shared (SEC-BE-001) so ReplayJSExtracted and the probe-stage
+// cross-origin gate in internal/pipeline agree on what "the target origin"
+// means for a given scan; two independent derivations would risk silently
+// diverging and reopening the cross-origin gap one of them is meant to close.
+func ResolveTargetOrigin(targetURL string, requests []ObservedRequest) string {
+	if origin := originOf(targetURL); origin != "" {
+		return origin
+	}
+	if origin := firstHTMLOrigin(requests); origin != "" {
+		return origin
+	}
+	for _, req := range requests {
+		if req.URL == "" {
+			continue
+		}
+		if origin := originOf(req.URL); origin != "" {
+			return origin
+		}
+	}
+	return ""
+}
+
 // isSameOrigin reports whether rawURL has the same origin as targetOrigin.
 // Both sides are normalized via originOf so default-port-vs-explicit-port
 // pairs (e.g., https://example.com and https://example.com:443) compare equal.
@@ -1799,9 +1837,26 @@ func cleanConcatPath(p string) string {
 // every non-ASCII escape and every encoded control byte (%00, %0A, %7F) while
 // still admitting the encodings real APIs use (%20, %2F, %3D, %5B).
 func allowedConcatBytes(s string, inSuffix bool) bool {
+	return scanEscapedBytes(s, func(c byte) bool {
+		return isAllowedConcatByte(c, inSuffix)
+	})
+}
+
+// scanEscapedBytes walks s and reports whether every byte is admissible: a
+// literal byte must satisfy isLiteralByte, and a `%` must start a
+// well-formed percent-escape that decodes to printable ASCII (see
+// decodePercentEscape) — the escape-handling half of the policy is identical
+// for every caller, so it lives here once rather than in each caller's own
+// loop (QUAL-002).
+//
+// isLiteralByte is where callers differ: allowedConcatBytes gates non-`%`
+// bytes through isAllowedConcatByte (parameterized on inSuffix via closure,
+// so that concat-specific concept never leaks into this shared loop), while
+// IsPrintableASCIIURL gates them with a direct 0x21-0x7E range check.
+func scanEscapedBytes(s string, isLiteralByte func(byte) bool) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] != '%' {
-			if !isAllowedConcatByte(s[i], inSuffix) {
+			if !isLiteralByte(s[i]) {
 				return false
 			}
 			continue
@@ -1872,19 +1927,9 @@ func decodePercentEscape(s string, i int) (byte, bool) {
 // non-ASCII APIs, which this extractor was never able to reconstruct reliably
 // anyway.
 func IsPrintableASCIIURL(raw string) bool {
-	for i := 0; i < len(raw); i++ {
-		if raw[i] == '%' {
-			if _, ok := decodePercentEscape(raw, i); !ok {
-				return false
-			}
-			i += 2
-			continue
-		}
-		if raw[i] < 0x21 || raw[i] > 0x7E {
-			return false
-		}
-	}
-	return true
+	return scanEscapedBytes(raw, func(c byte) bool {
+		return c >= 0x21 && c <= 0x7E
+	})
 }
 
 // isAllowedConcatByte reports whether c may appear literally in a reconstructed
@@ -2026,28 +2071,10 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		fmt.Fprintf(cfg.Stderr, format, args...) //nolint:errcheck // operator-facing warning
 	}
 
-	// Determine the target origin. Priority: explicit cfg.TargetURL, then the
-	// origin of the first request whose RESPONSE is HTML (the real app page),
-	// then the first non-empty request URL. Preferring the HTML page matters for
-	// mixed-origin / imported captures (HAR/Burp) whose first entry may be a
-	// third-party asset (CDN font, analytics beacon): binding replay to that
-	// asset's origin leaves the app's same-origin bundles cross-origin and skips
-	// them entirely (LAB-3892 review). Single-origin crawl captures are
-	// unaffected — their first entry is the HTML page anyway.
-	targetOrigin := originOf(cfg.TargetURL)
-	if targetOrigin == "" {
-		targetOrigin = firstHTMLOrigin(requests)
-	}
-	if targetOrigin == "" {
-		for _, req := range requests {
-			if req.URL != "" {
-				targetOrigin = originOf(req.URL)
-				if targetOrigin != "" {
-					break
-				}
-			}
-		}
-	}
+	// Determine the target origin. See ResolveTargetOrigin for the priority
+	// order and rationale (explicit cfg.TargetURL, then the HTML page's
+	// origin, then the first non-empty request URL).
+	targetOrigin := ResolveTargetOrigin(cfg.TargetURL, requests)
 	if targetOrigin == "" {
 		return requests
 	}

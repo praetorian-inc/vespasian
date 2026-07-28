@@ -954,7 +954,7 @@ func TestAnalyze_AbsoluteCredentialGate(t *testing.T) {
 }
 
 // TestExtractFromBundle_CrossOriginASTLiteralRetained pins the asymmetry
-// rejectUnsafeAbsolute documents: the credential/scheme/host-validity gate applies
+// specSafeURL documents: the credential/scheme/host-validity gate applies
 // to every producer, but the stricter SAME-ORIGIN requirement stays concat-only.
 //
 // An AST literal is a real call site the bundle invokes, and a SPA calling

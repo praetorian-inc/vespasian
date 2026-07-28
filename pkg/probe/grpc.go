@@ -204,9 +204,17 @@ func reflectionUnavailableReason(err error) (string, bool) {
 //     succeeded. Services may still be empty if the server only exposes the
 //     reflection service itself.
 func (p *GRPCProbe) probeTarget(ctx context.Context, t grpcTargetInfo) *classify.GRPCReflectionResult {
-	// SSRF preflight using a synthesized http URL so the existing validator's
-	// DNS lookup + private-IP blocklist applies to gRPC targets too.
-	if err := p.config.URLValidator("http://" + t.hostPort); err != nil {
+	// SSRF preflight using a synthesized URL so the existing validator's DNS
+	// lookup + private-IP blocklist applies to gRPC targets too. The scheme
+	// reflects t.useTLS (not hardcoded "http") so a validator that also
+	// enforces an origin/scheme check (SEC-BE-001, internal/pipeline's
+	// cross-origin probe gate) sees the same scheme this target actually
+	// dials with, rather than always comparing as "http" regardless of TLS.
+	scheme := "http"
+	if t.useTLS {
+		scheme = "https"
+	}
+	if err := p.config.URLValidator(scheme + "://" + t.hostPort); err != nil {
 		slog.DebugContext(ctx, "grpc probe: URL validation failed", "target", t.hostPort, "error", err)
 		return nil
 	}

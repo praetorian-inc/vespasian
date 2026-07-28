@@ -498,6 +498,14 @@ func (c *GenerateCmd) options() pipeline.Options {
 		MergeSlugs:             c.MergeSlugs,
 		SlugThreshold:          c.SlugThreshold,
 		Status:                 statusWriter(c.Verbose),
+		// Warnings is NOT gated on --verbose (unlike Status above): the
+		// SEC-BE-001 cross-origin skip warning must always be visible to the
+		// operator, mirroring buildJSReplayConfig's unconditional Stderr wire.
+		Warnings: os.Stderr,
+		// Reuses the same --target-url value already handed to the JS-replay
+		// stage (see resolveJSReplayConfig) so both stages agree on the scan's
+		// origin for their respective cross-origin gates (SEC-BE-001).
+		TargetURL: c.TargetURL,
 	}
 }
 
@@ -637,7 +645,9 @@ func (c *ScanCmd) scanOptions(apiType string, afterWSDL func(ctx context.Context
 		MergeSlugs:             c.MergeSlugs,
 		SlugThreshold:          c.SlugThreshold,
 		Status:                 statusWriter(c.Verbose),
-		AfterWSDL:              afterWSDL,
+		// Not gated on --verbose — see GenerateCmd.options's identical field.
+		Warnings:  os.Stderr,
+		AfterWSDL: afterWSDL,
 	}
 }
 

