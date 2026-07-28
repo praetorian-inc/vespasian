@@ -3730,3 +3730,141 @@ func TestCleanConcatPath(t *testing.T) {
 		})
 	}
 }
+
+// TestIsAbsoluteHTTPURL pins the case-insensitivity that motivated this helper
+// (TEST-001 / QUAL-003). Mutation-tested previously: a case-sensitive
+// implementation survived the entire suite, because every existing fixture
+// spelled the scheme in lower case.
+//
+// Case matters because url.Parse lower-cases the scheme, so "HTTPS://h/x" is
+// absolute to every downstream consumer. A case-sensitive check would classify it
+// as relative and route it into path resolution — prepending a slash (jsstatic) or
+// concatenating it onto the target origin (the probe loop) instead of gating it.
+func TestIsAbsoluteHTTPURL(t *testing.T) {
+	absolute := []string{
+		"http://example.com/api/x",
+		"https://example.com/api/x",
+		"HTTP://example.com/api/x",
+		"HTTPS://example.com/api/x",
+		"HtTpS://example.com/api/x",
+		"https://u:p@example.com/api/x", // absolute regardless of userinfo
+	}
+	for _, in := range absolute {
+		assert.True(t, IsAbsoluteHTTPURL(in), "expected %q to be absolute", in)
+	}
+
+	notAbsolute := []string{
+		"/api/x",
+		"api/x",
+		"//example.com/api/x", // scheme-relative: NOT absolute until resolved
+		"ftp://example.com/x",
+		"javascript:/api/x",
+		"httpsx://example.com/x",
+		"xhttps://example.com/x",
+		"",
+	}
+	for _, in := range notAbsolute {
+		assert.False(t, IsAbsoluteHTTPURL(in), "expected %q NOT to be absolute", in)
+	}
+}
+
+// TestSameOrigin gives the newly exported comparison direct coverage (TEST-005).
+// Mutation-tested previously: flipping its fail-closed arm to `return true`
+// survived the whole suite, because every caller happened to be exercised only
+// with parseable same-origin or clearly-different-origin inputs.
+func TestSameOrigin(t *testing.T) {
+	same := [][2]string{
+		{"https://example.com/a", "https://example.com/b"},
+		{"https://example.com/a", "https://example.com:443/b"}, // default port canonicalized
+		{"http://example.com/a", "http://example.com:80/b"},    // ditto for http
+		{"https://EXAMPLE.com/a", "https://example.com/b"},     // host case
+		{"https://example.com:8443/a", "https://example.com:8443/b"},
+	}
+	for _, tt := range same {
+		assert.True(t, SameOrigin(tt[0], tt[1]), "expected same origin: %q vs %q", tt[0], tt[1])
+	}
+
+	differ := [][2]string{
+		{"https://example.com/a", "http://example.com/a"},       // scheme
+		{"https://example.com/a", "https://other.com/a"},        // host
+		{"https://example.com/a", "https://example.com:8443/a"}, // explicit non-default port
+		{"https://example.com/a", "https://example.com./a"},     // trailing dot is a distinct host
+	}
+	for _, tt := range differ {
+		assert.False(t, SameOrigin(tt[0], tt[1]), "expected different origin: %q vs %q", tt[0], tt[1])
+	}
+
+	// Fail-closed arm: anything without a parseable origin is never "same",
+	// including two identically-unparseable inputs. This is the branch a
+	// `return true` mutation slipped past.
+	failClosed := [][2]string{
+		{"", ""},
+		{"", "https://example.com/a"},
+		{"https://example.com/a", ""},
+		{"/api/x", "/api/x"},               // relative: no host
+		{"not a url\x7f", "not a url\x7f"}, // unparseable both sides
+		{"https://example.com/a", "not a url\x7f"},
+	}
+	for _, tt := range failClosed {
+		assert.False(t, SameOrigin(tt[0], tt[1]),
+			"must fail closed for %q vs %q", tt[0], tt[1])
+	}
+}
+
+// TestCleanConcatPathAllowList pins the allow-list's ACCEPT set and its
+// path-vs-suffix asymmetry (TEST-006, TEST-007). Both were unpinned: narrowing the
+// permitted punctuation by 12 characters survived the suite, and so did allowing
+// the query delimiters inside the path portion.
+//
+// Without the accept half, a future tightening silently drops real endpoints —
+// which already happened once (QUAL-004: `?filter[status]=open` and `?q=a|b` were
+// rejected by the first allow-list).
+func TestCleanConcatPathAllowList(t *testing.T) {
+	// Accept: every permitted punctuation character, in a path and in a query.
+	accepted := []string{
+		"/api/a-b_c.d~e",
+		"/api/v1/items:action",
+		"/api/users/{userId}/orders",
+		"/api/a!b$c'd(e)f*g+h,i;j",
+		"/api/items@rev",
+		"/api/items[0]",
+		"/api/items|alt",
+		"/api/items?filter[status]=open", // QUAL-004 regression guard
+		"/api/items?q=a|b",               // QUAL-004 regression guard
+		"/api/v1/items?page=2&size=10",
+		"/api/items?name=a%20b", // legit percent-escape
+		"/api/x%2Fy",            // encoded slash
+		"/api/items#frag",
+	}
+	for _, in := range accepted {
+		assert.Equal(t, in, cleanConcatPath(in), "must be accepted unchanged: %q", in)
+	}
+
+	// TEST-007: `?`, `=`, `&` and `#` are suffix-only. IndexAny splits on the
+	// first `?`/`#`, so reaching the path arm with one requires `=` or `&`, which
+	// no split consumes.
+	suffixOnlyInPath := []string{
+		"/api/a=b/c",
+		"/api/a&b/c",
+	}
+	for _, in := range suffixOnlyInPath {
+		assert.Empty(t, cleanConcatPath(in),
+			"query delimiter must be rejected in the path portion: %q", in)
+	}
+
+	// Percent-escape validation (SEC-BE-002): non-ASCII and control decodes are
+	// rejected; malformed escapes are rejected rather than passed through.
+	rejectedEscapes := []string{
+		"/api/x%E2%80%AEy", // U+202E bidi override — decodes non-ASCII
+		"/api/x%C3%A9y",    // é — decodes non-ASCII
+		"/api/x%00y",       // NUL
+		"/api/x%0Ay",       // LF
+		"/api/x%7Fy",       // DEL
+		"/api/x%",          // truncated
+		"/api/x%E",         // truncated
+		"/api/x%ZZy",       // non-hex
+	}
+	for _, in := range rejectedEscapes {
+		assert.Empty(t, cleanConcatPath(in), "must be rejected: %q", in)
+	}
+}

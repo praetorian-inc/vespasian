@@ -958,7 +958,15 @@ func TestAPIIndicatorParityWithCrawlExtraction(t *testing.T) {
 // match — that would make /myapi/, /xapi/ and /notgraphql look like API paths
 // everywhere in the pipeline.
 func TestAPIIndicatorUnanchoredNotFloored(t *testing.T) {
-	// Exactly the strings crawl's extractor produces for these bundles.
+	// The paths these extractions normalize to once jsstatic prefixes an origin —
+	// NOT the extractor's raw output. Verified against ExtractStaticConcatPaths:
+	//   "xapi/".concat("users/1")        -> "xapi/users/1"    (no leading slash;
+	//                                       extractConcatEndpoints adds it)
+	//   "/myapi/".concat("users/2")      -> "/myapi/users/2"
+	//   "/notgraphql/".concat("query")   -> "/notgraphql/query"
+	// The earlier comment claimed these were "exactly the strings crawl's
+	// extractor produces", which overstated it for the first entry and cited no
+	// bundle for the third (TEST-004).
 	unanchored := []string{
 		"/xapi/users/1",
 		"/myapi/users/2",

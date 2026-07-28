@@ -702,10 +702,26 @@ func firstHTMLOrigin(requests []ObservedRequest) string {
 // Both sides are normalized via originOf so default-port-vs-explicit-port
 // pairs (e.g., https://example.com and https://example.com:443) compare equal.
 func isSameOrigin(rawURL, targetOrigin string) bool {
-	if targetOrigin == "" {
-		return false
-	}
-	return originOf(rawURL) == originOf(targetOrigin)
+	// Delegates to the exported SameOrigin so this package has exactly one
+	// origin-comparison implementation (QUAL-002). The guards are equivalent:
+	// a "" targetOrigin yields originOf("") == "", which SameOrigin never
+	// reports equal because it first requires a non-empty left origin.
+	return SameOrigin(rawURL, targetOrigin)
+}
+
+// IsAbsoluteHTTPURL reports whether raw carries an http or https scheme,
+// case-insensitively. url.Parse lower-cases the scheme, so a bundle literal
+// spelled "HTTPS://host/x" is absolute to every downstream consumer; a
+// case-sensitive strings.HasPrefix check would classify it as relative and send
+// it down a path-resolution branch instead (QUAL-003). Shared with
+// pkg/analyze/jsstatic so the offline and active paths classify identically.
+//
+// This answers only "does it have an http(s) scheme". It is NOT a validity
+// check — callers that act on the URL must still run ValidateFullURL (embedded
+// credentials, empty host) and, before any request, ssrf.ValidateURL.
+func IsAbsoluteHTTPURL(raw string) bool {
+	lower := strings.ToLower(raw)
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
 }
 
 // sanitizeForLog escapes terminal control characters and other non-printable
@@ -1076,7 +1092,7 @@ func reconstructTemplateLiteral(segment []byte) (string, bool) {
 	// Trim non-path noise from each end. Template literals embed paths in
 	// expressions like ` + path + `; we want only the path-like core.
 	candidate = strings.TrimSpace(candidate)
-	if !strings.HasPrefix(candidate, "/") && !strings.HasPrefix(candidate, "http://") && !strings.HasPrefix(candidate, "https://") {
+	if !strings.HasPrefix(candidate, "/") && !IsAbsoluteHTTPURL(candidate) {
 		// Look for the first slash and trim before it.
 		if idx := strings.Index(candidate, "/"); idx > 0 {
 			candidate = candidate[idx:]
@@ -1548,7 +1564,7 @@ func extractAPIPaths(jsBody []byte, requests []ObservedRequest) []string { //nol
 		// Full URLs are kept as-is (they include scheme+host) after a
 		// defense-in-depth validation pass that rejects credentials,
 		// non-http(s) schemes, and empty hosts.
-		if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+		if IsAbsoluteHTTPURL(raw) {
 			cleaned, ok := ValidateFullURL(raw)
 			if !ok {
 				return
@@ -1761,33 +1777,93 @@ func cleanConcatPath(p string) string {
 	// why the two portions are checked against different sets: a bare `?` inside
 	// what cleanConcatPath treats as the path would mean the split above did not
 	// happen, i.e. a malformed reconstruction.
-	for i := 0; i < len(path); i++ {
-		if !isAllowedConcatByte(path[i], false) {
-			return ""
-		}
-	}
-	for i := 0; i < len(suffix); i++ {
-		if !isAllowedConcatByte(suffix[i], true) {
-			return ""
-		}
+	if !allowedConcatBytes(path, false) || !allowedConcatBytes(suffix, true) {
+		return ""
 	}
 	return p
 }
 
-// isAllowedConcatByte reports whether c may appear in a reconstructed candidate
-// path. ASCII-only by construction: every byte >= 0x80 falls through to false, so
-// no non-ASCII rune can reach a generated spec path key (SEC-BE-002). inSuffix
-// admits the query/fragment delimiters, which are illegal in the path portion.
+// allowedConcatBytes reports whether every byte of s is admissible, treating a
+// `%` as the start of a percent-escape that must be well-formed AND must decode
+// to a printable ASCII byte.
+//
+// The decode check is what closes the percent-encoding route around the
+// allow-list (SEC-BE-002, third pass). Permitting a bare `%` was not enough:
+// `/api/x%E2%80%AEy` passes a byte-wise allow-list unchanged, and the sink
+// DECODES — url.Parse populates u.Path with the raw bytes E2 80 AE, groupEndpoints
+// keys the OpenAPI path on u.Path, and yaml.v3's is_printable admits a 0xE2 lead
+// byte — so a U+202E right-to-left override reached the generated spec path key
+// raw, which is the exact deliverable-spoofing the allow-list was written to
+// prevent. Requiring the decoded byte to be printable ASCII (0x20-0x7E) rejects
+// every non-ASCII escape and every encoded control byte (%00, %0A, %7F) while
+// still admitting the encodings real APIs use (%20, %2F, %3D, %5B).
+func allowedConcatBytes(s string, inSuffix bool) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '%' {
+			if !isAllowedConcatByte(s[i], inSuffix) {
+				return false
+			}
+			continue
+		}
+		// A `%` must be followed by exactly two hex digits decoding to printable
+		// ASCII. A truncated escape ("/api/x%" or "/api/x%E") is malformed and
+		// rejected rather than passed through.
+		if i+2 >= len(s) {
+			return false
+		}
+		hi, hiOK := unhex(s[i+1])
+		lo, loOK := unhex(s[i+2])
+		if !hiOK || !loOK {
+			return false
+		}
+		if decoded := hi<<4 | lo; decoded < 0x20 || decoded > 0x7E {
+			return false
+		}
+		i += 2
+	}
+	return true
+}
+
+// unhex decodes a single hex digit.
+func unhex(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
+}
+
+// isAllowedConcatByte reports whether c may appear literally in a reconstructed
+// candidate path. ASCII-only by construction: every byte >= 0x80 falls through to
+// false, so no raw non-ASCII rune can reach a generated spec path key
+// (SEC-BE-002). inSuffix admits the query/fragment delimiters, which would mean a
+// malformed reconstruction if they appeared in the path portion.
+//
+// `%` is deliberately NOT handled here — allowedConcatBytes intercepts it first so
+// the escape can be validated as a unit.
 func isAllowedConcatByte(c byte, inSuffix bool) bool {
 	switch {
 	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
 		return true
 	}
 	switch c {
-	// Structural and RFC 3986 sub-delims / unreserved punctuation that legitimately
-	// appear in API paths, plus `{}` for the {param} placeholders the REST
-	// normalizer emits and `%` for percent-encoding.
-	case '/', '_', '-', '.', ':', '{', '}', '%', '~', '@', '!', '$', '\'', '(', ')', '*', '+', ',', ';':
+	// Structural and RFC 3986 sub-delims / unreserved punctuation that
+	// legitimately appear in API paths, plus `{}` for the {param} placeholders the
+	// REST normalizer emits.
+	case '/', '_', '-', '.', ':', '{', '}', '~', '@', '!', '$', '\'', '(', ')', '*', '+', ',', ';':
+		return true
+	// QUAL-004: brackets and the pipe are gen-delims/unreserved-in-practice that
+	// real APIs use heavily in query syntax — `?filter[status]=open` (JSON:API and
+	// PHP-style array params) and `?q=a|b`. The first allow-list omitted them, so
+	// those endpoints were silently dropped, which is a recall regression rather
+	// than a security gain: both are plain ASCII and cannot spoof a rendered path.
+	// Admitted in the path portion too, since the pre-allow-list block-list
+	// accepted them there and nothing about a path makes them dangerous.
+	case '[', ']', '|':
 		return true
 	case '?', '=', '&', '#':
 		return inSuffix
@@ -2102,7 +2178,7 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		// Full URLs are probed as-is; relative paths are resolved against
 		// the target origin.
 		fullURL := path
-		if !strings.HasPrefix(path, "http://") && !strings.HasPrefix(path, "https://") {
+		if !IsAbsoluteHTTPURL(path) {
 			fullURL = targetOrigin + path
 		}
 
