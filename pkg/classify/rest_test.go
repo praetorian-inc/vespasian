@@ -699,7 +699,12 @@ func TestMatchAPIContentType_StructuredSuffix(t *testing.T) {
 		{"geo+json", "application/geo+json", SuffixFamilyJSON},
 		{"vendor github", "application/vnd.github+json", SuffixFamilyJSON},
 		{"vendor with params", "application/vnd.acme.v2+json; charset=utf-8", SuffixFamilyJSON},
-		{"atom+xml", "application/atom+xml", SuffixFamilyXML},
+		// Syndication feeds carry a structured suffix but are documents for
+		// feed readers, not endpoints. The classifier-edge live test asserts a
+		// feed stays out of the spec.
+		{"atom feed is not an API", "application/atom+xml", ""},
+		{"rss feed is not an API", "application/rss+xml", ""},
+		{"json feed is not an API", "application/feed+json", ""},
 		{"soap+xml belongs to WSDLClassifier", "application/soap+xml", ""},
 
 		// Excluded: navigation types, one of which carries a +xml suffix and
@@ -809,4 +814,29 @@ func TestRESTClassifier_FrameworkRuleDoesNotFireOnOtherSources(t *testing.T) {
 		_, _, reason := c.ClassifyDetail(req)
 		assert.NotContains(t, reason, "framework-route", "source %q must not trigger Rule 7", src)
 	}
+}
+
+// TestRESTClassifier_RSSFeedNotAnAPI pins the regression the classifier-edge
+// live test caught: adding RFC 6839 suffix matching made application/rss+xml an
+// API media type, so a plain blog feed at /feed.xml landed in the OpenAPI spec.
+// It must score below the threshold on both the response content-type (Rule 2)
+// and the Accept header (Rule 6).
+func TestRESTClassifier_RSSFeedNotAnAPI(t *testing.T) {
+	c := &RESTClassifier{}
+	req := crawl.ObservedRequest{
+		Method:  "GET",
+		URL:     "http://localhost:8080/feed.xml",
+		Headers: map[string]string{"Accept": "application/rss+xml"},
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "application/rss+xml",
+			Headers:     map[string]string{"Content-Type": "application/rss+xml"},
+			Body:        []byte(`<rss version="2.0"><channel><title>Test</title></channel></rss>`),
+		},
+	}
+
+	isAPI, confidence, _ := c.ClassifyDetail(req)
+	assert.Less(t, confidence, DefaultConfidenceThreshold,
+		"an RSS feed must not clear the API confidence threshold")
+	assert.False(t, isAPI, "an RSS feed is a syndication document, not an API endpoint")
 }

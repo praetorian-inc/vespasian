@@ -275,6 +275,16 @@ var soapContentTypes = []string{
 	"application/soap+xml",
 }
 
+// feedContentTypes are syndication formats. They carry a +json/+xml structured
+// suffix but are content documents for feed readers, not API endpoints, so the
+// suffix tier must not classify them. Vespasian maps APIs; an RSS or Atom feed
+// in an OpenAPI spec is noise, and the classifier-edge live test asserts a feed
+// stays out. Without this exclusion the suffix rule pulls in every blog feed on
+// the target.
+var feedContentTypes = []string{
+	"application/rss+xml", "application/atom+xml", "application/feed+json",
+}
+
 // matchAPIContentType canonicalizes ct (lowercase + charset/parameter strip via
 // mediatype.Base) and returns a stable token identifying the API media type, or
 // "" if it is not an API type. Shared by Rule 2 (response content-type) and
@@ -294,8 +304,10 @@ var soapContentTypes = []string{
 // is what removes the hardcoding.
 //
 // The suffix tier is narrow on purpose: it requires the application/ top-level
-// type, so text/* and image/* cannot match, and navigationContentTypes is
-// excluded first so application/xhtml+xml stays a navigation.
+// type, so text/* and image/* cannot match, and three exclusion sets run first —
+// navigationContentTypes (application/xhtml+xml is a page), soapContentTypes
+// (owned by WSDLClassifier), and feedContentTypes (syndication documents, not
+// endpoints).
 func matchAPIContentType(ct string) string {
 	base := mediatype.Base(ct)
 	if base == "" {
@@ -314,7 +326,7 @@ func matchAPIContentType(ct string) string {
 	if !strings.HasPrefix(base, "application/") {
 		return ""
 	}
-	if slices.Contains(soapContentTypes, base) {
+	if slices.Contains(soapContentTypes, base) || slices.Contains(feedContentTypes, base) {
 		return ""
 	}
 	switch {
