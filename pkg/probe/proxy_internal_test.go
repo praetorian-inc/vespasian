@@ -18,7 +18,9 @@
 package probe
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"testing"
@@ -90,4 +92,27 @@ func TestConfig_WithDefaults_NoProxyUnchanged(t *testing.T) {
 	tr, ok := cfg.Client.Transport.(*http.Transport)
 	require.True(t, ok, "Transport must be *http.Transport, got %T", cfg.Client.Transport)
 	assert.NotNil(t, tr.DialContext, "unproxied default client must keep the SSRF-safe dial guard")
+}
+
+// TestConfig_WithDefaults_WarnsWhenClientInjectedWithProxy is the SEC-BE-004
+// proof for the probe stage: when a caller injects Config.Client (which owns
+// its own transport) AND enables Config.Proxy, withDefaults must not silently
+// bypass the proxy — it emits a loud warning via the default slog logger
+// (probe/types.go's withDefaults has no per-Config Logger field, unlike the
+// crawl/jsstatic stages, so this captures the process-wide default logger).
+func TestConfig_WithDefaults_WarnsWhenClientInjectedWithProxy(t *testing.T) {
+	var buf bytes.Buffer
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(origLogger)
+
+	proxyURL, err := url.Parse("http://127.0.0.1:8080")
+	require.NoError(t, err)
+
+	injectedClient := &http.Client{}
+	cfg := Config{Client: injectedClient, Proxy: httpx.ProxyConfig{URL: proxyURL}}.withDefaults()
+
+	assert.Same(t, injectedClient, cfg.Client, "an injected Client must not be replaced when Proxy is enabled")
+	assert.Contains(t, buf.String(), "BYPASS the proxy",
+		"withDefaults must warn that probe traffic will bypass the proxy when a Client is injected alongside a configured Proxy")
 }

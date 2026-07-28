@@ -43,6 +43,12 @@ func writeStatus(w io.Writer, format string, args ...any) {
 // this cap — the only real difference is the dialer (SSRF-safe vs permissive).
 const wsdlStageTimeout = 10 * time.Second
 
+// wsdlClientTimeout is the overall per-request budget on the WSDL probe's
+// http.Client (covering the full exchange, including the response-body read),
+// shared by both the proxied and non-proxy client builds so the two stay in
+// lockstep.
+const wsdlClientTimeout = 15 * time.Second
+
 // buildWSDLProbeClient constructs the HTTP client used by ProbeWSDLDocument.
 // When proxy is enabled the transport routes through it (no dial-time SSRF pin —
 // we dial the proxy, not the target). Otherwise, when allowPrivate is false the
@@ -50,7 +56,7 @@ const wsdlStageTimeout = 10 * time.Second
 // AllowPrivate probes elsewhere.
 func buildWSDLProbeClient(allowPrivate bool, proxy httpx.ProxyConfig) *http.Client {
 	if proxy.Enabled() {
-		return httpx.BuildHTTPClient(proxy, 15*time.Second, httpx.NoFollowRedirects)
+		return httpx.BuildHTTPClient(proxy, wsdlClientTimeout, httpx.NoFollowRedirects)
 	}
 	transport := &http.Transport{
 		DialContext:           probe.SSRFSafeDialContext,
@@ -64,7 +70,7 @@ func buildWSDLProbeClient(allowPrivate bool, proxy httpx.ProxyConfig) *http.Clie
 		}
 	}
 	return &http.Client{
-		Timeout:       15 * time.Second,
+		Timeout:       wsdlClientTimeout,
 		Transport:     transport,
 		CheckRedirect: httpx.NoFollowRedirects,
 	}

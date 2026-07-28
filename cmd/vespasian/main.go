@@ -361,6 +361,21 @@ type CrawlCmd struct {
 	CrawlOptions
 }
 
+// augmentOptions builds the pipeline.AugmentOptions for this command's JS-static
+// stage from its flags plus the already-parsed proxy config threaded in by Run.
+// Extracted so a CLI-boundary test can assert the proxy (and each other flag)
+// reaches pipeline.AugmentOptions without executing Run().
+func (c *CrawlCmd) augmentOptions(proxy httpx.ProxyConfig) pipeline.AugmentOptions {
+	return pipeline.AugmentOptions{
+		AnalyzeJS:       c.AnalyzeJS,
+		FetchSourcemaps: c.FetchSourcemaps,
+		AllowPrivate:    c.DangerousAllowPrivate,
+		Status:          statusWriter(c.Verbose),
+		WarnError:       os.Stderr,
+		Proxy:           proxy,
+	}
+}
+
 // Run executes the crawl command.
 func (c *CrawlCmd) Run() error {
 	if err := validateURL(c.URL); err != nil {
@@ -411,14 +426,7 @@ func (c *CrawlCmd) Run() error {
 	// AnalyzeJS's idempotency guard (crawl.AnyStaticSource) detects the
 	// static:js entries this stage writes into the capture and short-circuits the
 	// second analysis, so `crawl | generate` is byte-identical to a single `scan`.
-	requests = pipeline.AnalyzeJS(bs.ctx, requests, pipeline.AugmentOptions{
-		AnalyzeJS:       c.AnalyzeJS,
-		FetchSourcemaps: c.FetchSourcemaps,
-		AllowPrivate:    c.DangerousAllowPrivate,
-		Status:          statusWriter(c.Verbose),
-		WarnError:       os.Stderr,
-		Proxy:           crawlProxy,
-	})
+	requests = pipeline.AnalyzeJS(bs.ctx, requests, c.augmentOptions(crawlProxy))
 
 	return writeOutput(c.Output, func(w io.Writer) error {
 		return crawl.WriteCapture(w, requests)
@@ -510,6 +518,21 @@ func (c *GenerateCmd) options(proxy httpx.ProxyConfig) pipeline.Options {
 	}
 }
 
+// augmentOptions builds the pipeline.AugmentOptions for this command's
+// static-HTML-forms + JS-static stage from its flags plus the already-parsed
+// proxy config threaded in by Run. Extracted so a CLI-boundary test can assert
+// the proxy (and each other flag) reaches pipeline.AugmentOptions without Run().
+func (c *GenerateCmd) augmentOptions(proxy httpx.ProxyConfig) pipeline.AugmentOptions {
+	return pipeline.AugmentOptions{
+		AnalyzeJS:       c.AnalyzeJS,
+		FetchSourcemaps: c.FetchSourcemaps,
+		AllowPrivate:    c.DangerousAllowPrivate,
+		Status:          statusWriter(c.Verbose),
+		WarnError:       os.Stderr,
+		Proxy:           proxy,
+	}
+}
+
 // resolveJSReplayConfig parses --header and validates --target-url, then
 // builds the JSReplayConfig for GenerateCmd.Run's JS-replay step. Extracted
 // from Run so the fail-fast validation (header parse + target-url
@@ -585,14 +608,7 @@ func (c *GenerateCmd) Run() (err error) {
 	// static analysis in the canonical forms-then-jsstatic order (see
 	// pipeline.Augment). Captures produced by crawl/import (which don't run form
 	// extraction inline) get the same treatment as captures produced by scan.
-	requests = pipeline.Augment(ctx, requests, pipeline.AugmentOptions{
-		AnalyzeJS:       c.AnalyzeJS,
-		FetchSourcemaps: c.FetchSourcemaps,
-		AllowPrivate:    c.DangerousAllowPrivate,
-		Status:          statusWriter(c.Verbose),
-		WarnError:       os.Stderr,
-		Proxy:           jsReplayCfg.Proxy,
-	})
+	requests = pipeline.Augment(ctx, requests, c.augmentOptions(jsReplayCfg.Proxy))
 
 	warnSSRFDisabled(c.DangerousAllowPrivate, c.Probe)
 
@@ -659,6 +675,21 @@ func (c *ScanCmd) scanOptions(apiType string, afterWSDL func(ctx context.Context
 	}
 }
 
+// augmentOptions builds the pipeline.AugmentOptions for this command's
+// static-HTML-forms + JS-static stage from its flags plus the already-parsed
+// proxy config threaded in by Run. Extracted so a CLI-boundary test can assert
+// the proxy (and each other flag) reaches pipeline.AugmentOptions without Run().
+func (c *ScanCmd) augmentOptions(proxy httpx.ProxyConfig) pipeline.AugmentOptions {
+	return pipeline.AugmentOptions{
+		AnalyzeJS:       c.AnalyzeJS,
+		FetchSourcemaps: c.FetchSourcemaps,
+		AllowPrivate:    c.DangerousAllowPrivate,
+		Status:          statusWriter(c.Verbose),
+		WarnError:       os.Stderr,
+		Proxy:           proxy,
+	}
+}
+
 // Run executes the scan command (crawl + generate pipeline).
 func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	if err := validateURL(c.URL); err != nil {
@@ -713,14 +744,7 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	// pipeline.Augment). Same helper used by GenerateCmd.Run — the order
 	// contract is centralized to prevent the two commands from silently
 	// diverging.
-	requests = pipeline.Augment(bs.ctx, requests, pipeline.AugmentOptions{
-		AnalyzeJS:       c.AnalyzeJS,
-		FetchSourcemaps: c.FetchSourcemaps,
-		AllowPrivate:    c.DangerousAllowPrivate,
-		Status:          statusWriter(c.Verbose),
-		WarnError:       os.Stderr,
-		Proxy:           scanProxy,
-	})
+	requests = pipeline.Augment(bs.ctx, requests, c.augmentOptions(scanProxy))
 
 	// Resolve the API type up front (when auto) so the verbose "detected API
 	// type" line reflects the traffic-derived type *before* any WSDL promotion,

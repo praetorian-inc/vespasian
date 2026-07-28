@@ -3162,6 +3162,31 @@ func TestJSReplayConfig_WithDefaults_ProxyClient(t *testing.T) {
 	})
 }
 
+// TestJSReplayConfig_WithDefaults_WarnsWhenClientInjectedWithProxy is the
+// SEC-BE-004 proof for the JS-replay stage: when a caller injects
+// JSReplayConfig.Client (which owns its own transport) AND enables Proxy,
+// withDefaults must not silently bypass the proxy — it writes a loud warning
+// to cfg.Stderr, mirroring the equivalent probe-stage guard
+// (pkg/probe/proxy_internal_test.go:TestConfig_WithDefaults_WarnsWhenClientInjectedWithProxy).
+func TestJSReplayConfig_WithDefaults_WarnsWhenClientInjectedWithProxy(t *testing.T) {
+	proxyURL, err := url.Parse("http://127.0.0.1:8080")
+	require.NoError(t, err)
+
+	var stderr bytes.Buffer
+	injectedClient := &http.Client{}
+	cfg := JSReplayConfig{
+		Client: injectedClient,
+		Proxy:  httpx.ProxyConfig{URL: proxyURL},
+		Stderr: &stderr,
+	}.withDefaults()
+
+	assert.NotNil(t, cfg.Client, "an injected Client must survive withDefaults even when Proxy is enabled")
+	assert.Contains(t, stderr.String(), "js-extract: warning",
+		"withDefaults must warn on Stderr when a Client is injected alongside a configured Proxy")
+	assert.Contains(t, stderr.String(), "BYPASS the proxy",
+		"the warning must explain that replay traffic will bypass the proxy")
+}
+
 // TestJSReplayConfig_WithDefaults_NoProxyUnchanged verifies that a zero-value
 // Proxy leaves the existing newSSRFSafeClient construction untouched (the
 // default client still installs the SSRF-safe dial guard when !AllowPrivate).

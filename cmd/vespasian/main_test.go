@@ -3481,6 +3481,86 @@ func TestGenerateCmd_ProxyFlagsParse(t *testing.T) {
 	require.True(t, cli.Generate.ProxyInsecure)
 }
 
+// TestCrawlCmd_AugmentOptions_CarriesProxy is the TEST-001 proof that
+// CrawlCmd's proxy (set via the embedded CrawlOptions.Proxy) reaches
+// pipeline.AugmentOptions via the new CrawlCmd.augmentOptions() helper. Before
+// this test, no test exercised augmentOptions at all — deleting its `Proxy:`
+// line left the whole suite green.
+func TestCrawlCmd_AugmentOptions_CarriesProxy(t *testing.T) {
+	cmd := &CrawlCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080"}}
+	proxy := parseProxyConfigOrEmpty(cmd.Proxy, cmd.ProxyInsecure)
+	opts := cmd.augmentOptions(proxy)
+	require.NotNil(t, opts.Proxy.URL, "CrawlCmd.Proxy must reach pipeline.AugmentOptions.Proxy")
+
+	// Two-sided check on Proxy.Insecure, mirroring the TEST-002 pattern used
+	// for options()/scanOptions() below.
+	t.Run("ProxyInsecure=true reaches opts.Proxy.Insecure", func(t *testing.T) {
+		insecureCmd := &CrawlCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080", ProxyInsecure: true}}
+		insecureProxy := parseProxyConfigOrEmpty(insecureCmd.Proxy, insecureCmd.ProxyInsecure)
+		insecureOpts := insecureCmd.augmentOptions(insecureProxy)
+		require.True(t, insecureOpts.Proxy.Insecure, "CrawlCmd.ProxyInsecure=true must reach pipeline.AugmentOptions.Proxy.Insecure")
+	})
+
+	t.Run("ProxyInsecure=false reaches opts.Proxy.Insecure", func(t *testing.T) {
+		secureCmd := &CrawlCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080", ProxyInsecure: false}}
+		secureProxy := parseProxyConfigOrEmpty(secureCmd.Proxy, secureCmd.ProxyInsecure)
+		secureOpts := secureCmd.augmentOptions(secureProxy)
+		require.False(t, secureOpts.Proxy.Insecure, "CrawlCmd.ProxyInsecure=false must reach pipeline.AugmentOptions.Proxy.Insecure")
+	})
+}
+
+// TestGenerateCmd_AugmentOptions_CarriesProxy is the TEST-001 proof that
+// GenerateCmd's proxy reaches pipeline.AugmentOptions via
+// GenerateCmd.augmentOptions() — the sibling helper to options() (already
+// covered by TestGenerateCmd_Options_CarriesProxy below), added for the
+// static-HTML-forms + JS-static augment stage.
+func TestGenerateCmd_AugmentOptions_CarriesProxy(t *testing.T) {
+	cmd := &GenerateCmd{Proxy: "http://127.0.0.1:8080"}
+	proxy := parseProxyConfigOrEmpty(cmd.Proxy, cmd.ProxyInsecure)
+	opts := cmd.augmentOptions(proxy)
+	require.NotNil(t, opts.Proxy.URL, "GenerateCmd.Proxy must reach pipeline.AugmentOptions.Proxy")
+
+	t.Run("ProxyInsecure=true reaches opts.Proxy.Insecure", func(t *testing.T) {
+		insecureCmd := &GenerateCmd{Proxy: "http://127.0.0.1:8080", ProxyInsecure: true}
+		insecureProxy := parseProxyConfigOrEmpty(insecureCmd.Proxy, insecureCmd.ProxyInsecure)
+		insecureOpts := insecureCmd.augmentOptions(insecureProxy)
+		require.True(t, insecureOpts.Proxy.Insecure, "GenerateCmd.ProxyInsecure=true must reach pipeline.AugmentOptions.Proxy.Insecure")
+	})
+
+	t.Run("ProxyInsecure=false reaches opts.Proxy.Insecure", func(t *testing.T) {
+		secureCmd := &GenerateCmd{Proxy: "http://127.0.0.1:8080", ProxyInsecure: false}
+		secureProxy := parseProxyConfigOrEmpty(secureCmd.Proxy, secureCmd.ProxyInsecure)
+		secureOpts := secureCmd.augmentOptions(secureProxy)
+		require.False(t, secureOpts.Proxy.Insecure, "GenerateCmd.ProxyInsecure=false must reach pipeline.AugmentOptions.Proxy.Insecure")
+	})
+}
+
+// TestScanCmd_AugmentOptions_CarriesProxy is the TEST-001 proof that ScanCmd's
+// proxy reaches pipeline.AugmentOptions via ScanCmd.augmentOptions() — the
+// sibling helper to scanOptions() (already covered by
+// TestScanCmd_ScanOptions_CarriesProxy below), added for the
+// static-HTML-forms + JS-static augment stage.
+func TestScanCmd_AugmentOptions_CarriesProxy(t *testing.T) {
+	cmd := &ScanCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080"}}
+	proxy := parseProxyConfigOrEmpty(cmd.Proxy, cmd.ProxyInsecure)
+	opts := cmd.augmentOptions(proxy)
+	require.NotNil(t, opts.Proxy.URL, "ScanCmd.Proxy must reach pipeline.AugmentOptions.Proxy")
+
+	t.Run("ProxyInsecure=true reaches opts.Proxy.Insecure", func(t *testing.T) {
+		insecureCmd := &ScanCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080", ProxyInsecure: true}}
+		insecureProxy := parseProxyConfigOrEmpty(insecureCmd.Proxy, insecureCmd.ProxyInsecure)
+		insecureOpts := insecureCmd.augmentOptions(insecureProxy)
+		require.True(t, insecureOpts.Proxy.Insecure, "ScanCmd.ProxyInsecure=true must reach pipeline.AugmentOptions.Proxy.Insecure")
+	})
+
+	t.Run("ProxyInsecure=false reaches opts.Proxy.Insecure", func(t *testing.T) {
+		secureCmd := &ScanCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080", ProxyInsecure: false}}
+		secureProxy := parseProxyConfigOrEmpty(secureCmd.Proxy, secureCmd.ProxyInsecure)
+		secureOpts := secureCmd.augmentOptions(secureProxy)
+		require.False(t, secureOpts.Proxy.Insecure, "ScanCmd.ProxyInsecure=false must reach pipeline.AugmentOptions.Proxy.Insecure")
+	})
+}
+
 // TestGenerateCmd_Options_CarriesProxy closes the CLI-boundary gap: it asserts
 // c.Proxy actually reaches pipeline.Options (via GenerateCmd.options()),
 // mirroring TestGRPCInsecureSkipVerify_ReachesOptions.

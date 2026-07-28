@@ -96,8 +96,10 @@ type JSReplayConfig struct {
 	// honored ONLY when Client is nil (the production path — buildJSReplayConfig
 	// never sets Client): an injected Client owns its transport, and
 	// wrapClientWithSSRF would clobber a proxied dialer (see architecture.md §1).
-	// The proxied client installs no dial-time SSRF pin (we dial the proxy, not
-	// the target); URL-level scope (ValidateProbeURL/canFetchURL) is unchanged.
+	// When a Client IS injected while Proxy is set, withDefaults emits a warning to
+	// Stderr that replay traffic will BYPASS the proxy. The proxied client installs
+	// no dial-time SSRF pin (we dial the proxy, not the target); URL-level scope
+	// (ValidateProbeURL/canFetchURL) is unchanged.
 	Proxy httpx.ProxyConfig
 
 	// Verbose enables debug logging to Stderr.
@@ -151,6 +153,12 @@ func (cfg JSReplayConfig) withDefaults() JSReplayConfig {
 			cfg.Client = newSSRFSafeClient(cfg.Timeout, cfg.AllowPrivate)
 		}
 	} else {
+		if cfg.Proxy.Enabled() {
+			// SEC-BE-004: an injected Client owns its transport, so a configured
+			// Proxy is silently ignored here. Warn loudly rather than bypass the
+			// proxy without a trace.
+			fmt.Fprintf(cfg.Stderr, "js-extract: warning: Proxy configured but ignored — an injected Client owns its transport; replay traffic will BYPASS the proxy\n") //nolint:errcheck // best-effort warning
+		}
 		// Caller supplied a client. SSRF-wrap when AllowPrivate is false,
 		// and always enforce our redirect policy: probeURL records the
 		// status we asked for (no auto-follow), and fetchJSBody follows

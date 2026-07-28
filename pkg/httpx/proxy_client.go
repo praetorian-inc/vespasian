@@ -153,10 +153,14 @@ func connectDialer(p ProxyConfig) func(ctx context.Context, addr string) (net.Co
 		if strings.ContainsAny(addr, "\r\n") {
 			return nil, fmt.Errorf("httpx: invalid proxy target address %q: contains CR or LF", addr)
 		}
-		// Positive check: require a bare host:port literal. This rejects anything
-		// that is not a clean target (schemes, paths, embedded spaces) before it
-		// reaches the CONNECT request line and Host header — CR/LF is caught above
-		// because net.SplitHostPort splits such payloads cleanly and would not.
+		// net.SplitHostPort requires a single top-level host:port split: it
+		// validates bracket syntax and colon count, so it rejects an absolute-form
+		// URI or a multi-colon payload (e.g. "http://x" or "a:b:c"). It does NOT
+		// validate host cleanliness or that the port is numeric — it accepts
+		// "foo bar:80" and "example.com:80/path" — so this is a shape check that
+		// addr is a lone host:port pair, NOT a "clean target" check. The CR/LF
+		// denylist immediately above is the injection guard that keeps extra header
+		// lines / request smuggling out of the CONNECT request line and Host header.
 		if _, _, err := net.SplitHostPort(addr); err != nil {
 			return nil, fmt.Errorf("httpx: invalid proxy target address %q: %w", addr, err)
 		}

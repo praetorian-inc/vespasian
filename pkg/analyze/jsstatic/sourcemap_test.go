@@ -15,11 +15,13 @@
 package jsstatic
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -796,15 +798,19 @@ func TestDefaultSourcemapClient_ProxyVsSSRF(t *testing.T) {
 	})
 }
 
-// TestDefaultSourcemapClient_ProxyRefusesRedirects is a regression test for
-// an SSRF-via-redirect gap (LAB-4993 review): the proxy branch of
-// defaultSourcemapClient passes `nil` as the checkRedirect func to
-// httpx.BuildHTTPClient, so the returned client falls back to net/http's
-// default CheckRedirect (follow up to 10 redirects) instead of refusing them
-// like the non-proxy branch does (CheckRedirect: noFollowRedirects). Mirrors
-// the non-proxy parity assertion pattern from F12a
-// (TestSourcemap_RedirectToDifferentHostBlocked): a proxied client must
-// refuse redirects exactly like the unproxied default client.
+// TestDefaultSourcemapClient_ProxyRefusesRedirects is a regression guard for
+// an SSRF-via-redirect gap (LAB-4993 review): an earlier version of the proxy
+// branch of defaultSourcemapClient passed `nil` as the checkRedirect func to
+// httpx.BuildHTTPClient, which would have made the returned client fall back
+// to net/http's default CheckRedirect (follow up to 10 redirects) instead of
+// refusing them like the non-proxy branch does. The shipped code passes
+// httpx.NoFollowRedirects (sourcemap.go's defaultSourcemapClient proxy
+// branch) instead, so the proxied client refuses redirects exactly like the
+// unproxied default client — this test fails if that ever regresses back to
+// nil. Mirrors the non-proxy parity assertion pattern from F12a
+// (TestSourcemap_RedirectToDifferentHostBlocked) and the corrected,
+// past-tense regression-guard style used at
+// pkg/httpx/proxy_client_test.go:TestProxyDialer_RejectsCRLFInAddr.
 func TestDefaultSourcemapClient_ProxyRefusesRedirects(t *testing.T) {
 	proxyURL, err := url.Parse("http://127.0.0.1:8080")
 	if err != nil {
@@ -883,4 +889,61 @@ func TestSourcemap_ProxiedFetch_AllowPrivateGate(t *testing.T) {
 			t.Error("AllowPrivate=true: expected the proxy to be contacted")
 		}
 	})
+}
+
+// TestRecoverSourcemap_HTTPClientInjectedWithProxyWarnsAndBypasses is the
+// SEC-BE-004 proof for jsstatic: when opts.HTTPClient is injected (owns its
+// own transport) AND opts.Proxy is enabled, recoverSourcemap must not
+// silently bypass the proxy — it logs a loud warning via opts.Logger.
+//
+// Deviation from the original test-lead spec: the spec asked for
+// opts.HTTPClient to be "a stub (a RoundTripper returning a minimal valid
+// sourcemap JSON)". That stub would never actually be invoked:
+// recoverSourcemap's caller-supplied-client branch unconditionally replaces
+// clientCopy.Transport with ssrfSafeTransport(opts.AllowPrivate)
+// (sourcemap.go, right after the SEC-BE-004 warning) — discarding whatever
+// RoundTripper the caller supplied — so a fake RoundTripper would silently
+// never run and the test would be asserting nothing about the fetch itself.
+// This test instead uses a real httptest.Server (the same pattern as
+// TestSourcemap_CallerClient_SSRFOverlayEnforced above) with
+// AllowPrivate=true so the real ssrfSafeTransport permits dialing it, proving
+// both that the warning fires AND that the fetch still succeeds (BYPASSING
+// the proxy, exactly as the warning says) rather than silently failing.
+func TestRecoverSourcemap_HTTPClientInjectedWithProxyWarnsAndBypasses(t *testing.T) {
+	content := []string{"var w = 1;"}
+	body := makeSourcemapJSON(content)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	mapURL := srv.URL + "/app.js.map"
+	bundleURL := srv.URL + "/app.js"
+	bundle := []byte(fmt.Sprintf("console.log(1);\n//# sourceMappingURL=%s\n", mapURL))
+
+	proxyURL, err := url.Parse("http://127.0.0.1:8080") // never actually dialed: an injected HTTPClient opts out of Proxy
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	opts := Options{
+		HTTPClient:      &http.Client{}, // any non-nil client triggers the caller-supplied-client branch
+		Proxy:           httpx.ProxyConfig{URL: proxyURL},
+		FetchSourcemaps: true,
+		AllowPrivate:    true, // test server is on 127.0.0.1; also skips ValidateProbeURL
+		Logger:          slog.New(slog.NewTextHandler(&logBuf, nil)),
+	}
+
+	sources, stats := recoverSourcemap(context.Background(), bundle, bundleURL, opts)
+	if len(sources) != 1 {
+		t.Fatalf("expected 1 source recovered despite the injected HTTPClient, got %d: %v", len(sources), sources)
+	}
+	if stats.SourcemapsRecovered != 1 {
+		t.Errorf("expected 1 recovered, got %d", stats.SourcemapsRecovered)
+	}
+	if !strings.Contains(logBuf.String(), "BYPASS the proxy") {
+		t.Errorf("expected the Proxy-ignored bypass warning in opts.Logger output, got: %q", logBuf.String())
+	}
 }

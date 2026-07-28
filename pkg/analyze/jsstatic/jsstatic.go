@@ -76,8 +76,9 @@ type Options struct {
 	// is honored ONLY when HTTPClient is nil (the production path — pipeline
 	// never sets HTTPClient): an injected HTTPClient has its Transport overwritten
 	// with ssrfSafeTransport (see recoverSourcemap), which would clobber a proxied
-	// dialer. The proxied client installs no dial-time SSRF pin (we dial the
-	// proxy, not the target); the same-host URL check is unchanged.
+	// dialer, so recoverSourcemap emits a warning that sourcemap fetches will BYPASS
+	// the proxy in that case. The proxied client installs no dial-time SSRF pin (we
+	// dial the proxy, not the target); the same-host URL check is unchanged.
 	Proxy httpx.ProxyConfig
 
 	// PerBundleTimeout caps jsluice parsing time per bundle. Default: 5s.

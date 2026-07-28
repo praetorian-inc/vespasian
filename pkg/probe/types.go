@@ -16,6 +16,7 @@ package probe
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"net/http"
 	"time"
@@ -32,10 +33,12 @@ type Config struct {
 
 	// Proxy routes probe traffic through an intercepting proxy when set. It is
 	// honored only when Client is nil (the production path); an injected Client
-	// owns its own transport. When enabled, withDefaults builds a proxied client
-	// (no dial-time SSRF pin — we dial the proxy, not the target) and dialGRPC
-	// tunnels the reflection dial through the proxy. URL-level scope validation
-	// (URLValidator) is unchanged, so a private target still needs allow-private.
+	// owns its own transport, and in that case withDefaults emits a warning that
+	// probe traffic will BYPASS the proxy. When enabled (Client nil), withDefaults
+	// builds a proxied client (no dial-time SSRF pin — we dial the proxy, not the
+	// target) and dialGRPC tunnels the reflection dial through the proxy. URL-level
+	// scope validation (URLValidator) is unchanged, so a private target still needs
+	// allow-private.
 	Proxy httpx.ProxyConfig
 
 	// Timeout is the per-request timeout for probe HTTP calls.
@@ -161,6 +164,11 @@ func (cfg Config) withDefaults() Config {
 				Transport:     DefaultTransport(),
 			}
 		}
+	} else if cfg.Proxy.Enabled() {
+		// SEC-BE-004: an injected Client owns its transport, so a configured Proxy
+		// is silently ignored here. Warn loudly rather than bypass the proxy
+		// without a trace.
+		slog.Warn("probe: Proxy configured but ignored — an injected Client owns its transport; probe traffic will BYPASS the proxy")
 	}
 	return cfg
 }

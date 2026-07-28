@@ -215,6 +215,14 @@ func (p *GRPCProbe) probeTarget(ctx context.Context, t grpcTargetInfo) *classify
 	reqCtx, cancel := context.WithTimeout(ctx, p.config.Timeout)
 	defer cancel()
 
+	// REQ-001: surface the --proxy-insecure / --grpc-insecure-skip-verify
+	// divergence instead of failing silently. --proxy-insecure does NOT relax the
+	// gRPC target-cert verification, so a TLS gRPC target behind a re-signing proxy
+	// fails verification unless the operator also passes --grpc-insecure-skip-verify.
+	if p.proxyTLSVerifyMismatch(t) {
+		slog.WarnContext(ctx, "grpc probe: --proxy-insecure does not relax gRPC target-cert verification; a TLS gRPC target behind an intercepting proxy will fail verification — pass --grpc-insecure-skip-verify to enumerate it", "target", t.hostPort)
+	}
+
 	conn, err := p.dialGRPC(t)
 	if err != nil {
 		slog.DebugContext(ctx, "grpc probe: dial setup failed", "target", t.hostPort, "error", err)
@@ -256,11 +264,38 @@ func (p *GRPCProbe) dialGRPC(t grpcTargetInfo) (*grpc.ClientConn, error) {
 		return nil, err
 	}
 
-	return grpc.NewClient(t.hostPort,
+	// QUAL-004: gRPC's default "dns" resolver resolves the target LOCALLY before
+	// the WithContextDialer runs. On the proxied path that means the proxy dialer
+	// would only ever see an IP literal — DNS for a proxy-only internal target
+	// would never traverse the proxy, and the proxy would see CONNECT <ip>:port
+	// instead of the hostname, breaking Burp/mitmproxy scope rules. So ONLY when
+	// proxied, use the "passthrough" resolver to hand the original host:port
+	// straight to the ProxyDialer and let the proxy resolve it. The non-proxy path
+	// keeps the bare host:port on purpose: the dns resolver's local pre-resolution
+	// is fine there because the configured SSRF-safe dialer (ssrfSafeDialContext)
+	// re-resolves and re-checks IPs at connect time, closing the TOCTOU window.
+	target := t.hostPort
+	if p.config.Proxy.Enabled() {
+		target = "passthrough:///" + t.hostPort
+	}
+
+	return grpc.NewClient(target,
 		grpc.WithTransportCredentials(creds),
 		grpc.WithContextDialer(dialer),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxReflectionRecvBytes)),
 	)
+}
+
+// proxyTLSVerifyMismatch reports whether the operator asked for a proxied scan
+// of a TLS gRPC target with --proxy-insecure but WITHOUT
+// --grpc-insecure-skip-verify. In that configuration the reflection dial tunnels
+// through the intercepting proxy but STILL verifies the gRPC target's own
+// certificate (--proxy-insecure deliberately does not relax it) — which a
+// re-signing proxy will fail — so the probe would otherwise return nothing with
+// only a debug log line. probeTarget uses this to emit a loud, actionable warning
+// instead.
+func (p *GRPCProbe) proxyTLSVerifyMismatch(t grpcTargetInfo) bool {
+	return t.useTLS && p.config.Proxy.Enabled() && p.config.Proxy.Insecure && !p.config.GRPCInsecureSkipVerify
 }
 
 // grpcDialer selects the context dialer for the reflection dial. When proxied it

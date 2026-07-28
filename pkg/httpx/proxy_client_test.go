@@ -417,24 +417,25 @@ func TestProxyDialer_UnsupportedScheme(t *testing.T) {
 	assert.Error(t, err, "an unsupported proxy scheme must be rejected")
 }
 
-// TestProxyDialer_RejectsCRLFInAddr is a regression guard for a
-// CRLF-injection gap (LAB-4993 review): connectDialer builds the CONNECT
-// request via fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", addr,
-// addr), so an addr containing "\r\n" could inject extra header lines (or a
-// second smuggled request) into the bytes written to the proxy connection.
-// The shipped guard (strings.ContainsAny(addr, "\r\n") in connectDialer,
-// proxy_client.go:153) rejects such an addr before it ever reaches the
-// CONNECT request line.
-//
-// The stub "proxy" below is deliberately naive: it replies "200 Connection
-// established" without inspecting the request at all. So a *successful*
-// ProxyDialer round-trip against it can only mean the client wrote the
-// CRLF-laden addr onto the wire unvalidated — if this guard is ever removed,
-// dialErr below would be nil and this test would fail.
-func TestProxyDialer_RejectsCRLFInAddr(t *testing.T) {
+// TestProxyDialer_NilURL is the TEST-004 proof that ProxyDialer guards against
+// a zero-value/nil ProxyConfig.URL (rather than panicking on p.URL.Scheme)
+// with an actionable error identifying the missing proxy URL.
+func TestProxyDialer_NilURL(t *testing.T) {
+	_, err := ProxyDialer(ProxyConfig{})
+	require.Error(t, err, "ProxyDialer must reject a nil proxy URL instead of panicking")
+	assert.Contains(t, err.Error(), "non-nil proxy URL")
+}
+
+// newNaiveCONNECTStub starts a "proxy" that blindly replies "200 Connection
+// established" to whatever it receives, without inspecting the request at
+// all. Used by TestProxyDialer_RejectsCRLFInAddr's subtests: a *successful*
+// ProxyDialer round-trip against it can only mean the client wrote the given
+// addr onto the wire unvalidated.
+func newNaiveCONNECTStub(t *testing.T) *url.URL {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	defer ln.Close() //nolint:errcheck // test cleanup
+	t.Cleanup(func() { ln.Close() }) //nolint:errcheck,gosec // test cleanup
 
 	go func() {
 		conn, err := ln.Accept()
@@ -447,17 +448,64 @@ func TestProxyDialer_RejectsCRLFInAddr(t *testing.T) {
 
 	proxyURL, err := url.Parse("http://" + ln.Addr().String())
 	require.NoError(t, err)
+	return proxyURL
+}
 
-	dial, err := ProxyDialer(ProxyConfig{URL: proxyURL})
-	require.NoError(t, err)
+// TestProxyDialer_RejectsCRLFInAddr is a regression guard for a
+// CRLF-injection gap (LAB-4993 review): connectDialer builds the CONNECT
+// request via fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", addr,
+// addr), so an addr containing "\r\n" could inject extra header lines (or a
+// second smuggled request) into the bytes written to the proxy connection.
+// The shipped guard (strings.ContainsAny(addr, "\r\n") in connectDialer,
+// proxy_client.go:153) rejects such an addr before it ever reaches the
+// CONNECT request line.
+//
+// SEC-BE-003 (PR #186 review): the crlf_guard subtest's payload
+// ("evil.com\r\nfoo:80") is deliberately chosen to contain exactly one colon,
+// so it PASSES net.SplitHostPort's host:port shape check on its own —
+// isolating the CRLF denylist as the guard actually under test. An earlier
+// version of this test used the payload "evil\r\nHost: injected:80", which
+// has two colons and is therefore ALSO rejected by the net.SplitHostPort
+// shape check (proxy_client.go:164) independent of the CRLF denylist —
+// deleting the CRLF guard alone would have left that payload, and the test,
+// still failing closed, silently losing coverage of the CRLF-specific guard.
+// The sibling shape_check subtest below exercises the SplitHostPort guard in
+// isolation with a payload that carries no CRLF at all, so each guard now has
+// an assertion that can only pass when THAT guard specifically is present.
+func TestProxyDialer_RejectsCRLFInAddr(t *testing.T) {
+	t.Run("crlf_guard", func(t *testing.T) {
+		proxyURL := newNaiveCONNECTStub(t)
+		dial, err := ProxyDialer(ProxyConfig{URL: proxyURL})
+		require.NoError(t, err)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
 
-	_, dialErr := dial(ctx, "evil\r\nHost: injected:80")
-	assert.Error(t, dialErr,
-		"ProxyDialer must reject a target address containing CRLF before writing it into the CONNECT request line "+
-			"(the naive stub proxy accepts anything, so a nil error here proves the CRLF payload went out unvalidated)")
+		_, dialErr := dial(ctx, "evil.com\r\nfoo:80")
+		require.Error(t, dialErr,
+			"ProxyDialer must reject a target address containing CRLF before writing it into the CONNECT request line "+
+				"(the naive stub proxy accepts anything, so a nil error here proves the CRLF payload went out unvalidated); "+
+				"this payload has a single colon so it passes the net.SplitHostPort shape check on its own, isolating the CRLF guard")
+		assert.Contains(t, dialErr.Error(), "contains CR or LF",
+			"error must come from the CRLF denylist specifically, not incidentally from the SplitHostPort shape check")
+	})
+
+	t.Run("shape_check", func(t *testing.T) {
+		proxyURL := newNaiveCONNECTStub(t)
+		dial, err := ProxyDialer(ProxyConfig{URL: proxyURL})
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		// No CRLF anywhere in this payload — it fails purely on shape (too many
+		// colons for an unbracketed host:port), isolating the net.SplitHostPort
+		// guard from the CRLF denylist above.
+		_, dialErr := dial(ctx, "evil:host:80")
+		require.Error(t, dialErr, "ProxyDialer must reject an addr that is not a valid single host:port pair")
+		assert.NotContains(t, dialErr.Error(), "contains CR or LF",
+			"a non-CRLF malformed address must be rejected by the SplitHostPort shape check, not the CRLF guard")
+	})
 }
 
 // TestProxyDialer_ConnectResponseRespectsContextDeadline is a regression
