@@ -333,6 +333,15 @@ func (f *urlFrontier) Restore(pending []urlEntry, seen []string) {
 		if key == "" {
 			continue
 		}
+		// Dedup WITHIN pending. Restore runs on a fresh frontier, so anything
+		// already in f.seen here was put there by an earlier entry of this same
+		// slice — a corrupted or hand-edited checkpoint listing one URL repeatedly
+		// would otherwise queue it once per occurrence and spend the page budget
+		// refetching it (CodeRabbit review, PR #189). The checkpoint's own seen-set
+		// is still applied after this loop, so it cannot reject the resumed queue.
+		if f.seen[key] {
+			continue
+		}
 		if f.maxDepth >= 0 && e.Depth > f.maxDepth {
 			continue
 		}

@@ -38,6 +38,10 @@ func TestComputeConfigFingerprint(t *testing.T) {
 		ComputeConfigFingerprint("https://ex.com", "same-domain", 3, true, false),
 		ComputeConfigFingerprint("https://ex.com", "same-origin", 5, true, false),
 		ComputeConfigFingerprint("https://ex.com", "same-origin", 3, false, false),
+		// allowPrivate: without this case a regression dropping it from the
+		// fingerprint would let a --dangerous-allow-private checkpoint be resumed
+		// by a run without the flag, and this test would stay green.
+		ComputeConfigFingerprint("https://ex.com", "same-origin", 3, true, true),
 	} {
 		if fp == base {
 			t.Error("fingerprint did not change when a defining field changed")
@@ -544,5 +548,23 @@ func TestRestore_KeepsLegitimateResumeQueue(t *testing.T) {
 
 	if f.Len() != 2 {
 		t.Fatalf("resumed queue has %d entries, want 2; the seen-set must not reject the restored queue", f.Len())
+	}
+}
+
+// TestRestore_DedupsRepeatedPendingEntries pins that a checkpoint listing the
+// same URL more than once queues it once. A corrupted or hand-edited Pending
+// list would otherwise spend one page-budget slot per duplicate refetching the
+// same page (CodeRabbit review, PR #189).
+func TestRestore_DedupsRepeatedPendingEntries(t *testing.T) {
+	f := newURLFrontier(5, nil)
+	f.Restore([]urlEntry{
+		{URL: "https://ex.com/a", Depth: 1},
+		{URL: "https://ex.com/a", Depth: 1},
+		{URL: "https://ex.com/a?x=1", Depth: 1}, // same frontier key (query stripped)
+		{URL: "https://ex.com/b", Depth: 1},
+	}, nil)
+
+	if f.Len() != 2 {
+		t.Errorf("restored queue has %d entries, want 2 (duplicates must collapse)", f.Len())
 	}
 }
