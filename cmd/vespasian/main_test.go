@@ -3325,6 +3325,58 @@ func TestGenerateCmdRun_TargetURLOverridesOrigin(t *testing.T) {
 	})
 }
 
+// TestGenerateCmdRun_FullyOfflineRecoversConcatEndpoint is LAB-4992 AC1 in its
+// literal shape (TEST-001): "fully-offline `generate rest` (no network access) on
+// a capture whose endpoints exist only as JS-bundle concatenations surfaces those
+// endpoints in the generated spec".
+//
+// Every other CLI test asserting the concat endpoint reaches the spec runs with
+// Probe: true and relies on the probe failing — either against a `.invalid`
+// hostname (so the guarantee rests on DNS behavior rather than on the offline
+// path) or against a live httptest server. This one starts no HTTP server at all
+// and disables probing outright, so nothing but the offline static path can
+// produce the endpoint.
+func TestGenerateCmdRun_FullyOfflineRecoversConcatEndpoint(t *testing.T) {
+	const appJS = `function loadOrders(uid) { return fetch("/api/users/".concat(uid, "/orders")); }`
+
+	// Source "burp" so pipeline.AnalyzeJS's AnyStaticSource guard does not
+	// short-circuit the offline analysis (see QUAL-001 in jsstatic/doc.go).
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://app.example.com/app.js",
+			Source: "burp",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/javascript",
+				Body:        []byte(appJS),
+			},
+		},
+	}
+
+	capturePath := filepath.Join(t.TempDir(), "capture.json")
+	f, err := os.Create(capturePath) //nolint:gosec // G304: test file
+	require.NoError(t, err)
+	require.NoError(t, crawl.WriteCapture(f, requests))
+	require.NoError(t, f.Close())
+
+	outputPath := filepath.Join(t.TempDir(), "spec.yaml")
+	cmd := &GenerateCmd{
+		APIType:    "rest",
+		Capture:    capturePath,
+		Output:     outputPath,
+		Confidence: classify.DefaultConfidenceThreshold,
+		Probe:      false, // no network at all
+		AnalyzeJS:  true,
+	}
+	require.NoError(t, cmd.Run())
+
+	specBytes, err := os.ReadFile(outputPath) //nolint:gosec // G304: test file
+	require.NoError(t, err)
+	require.Contains(t, string(specBytes), "/api/users/{userId}/orders",
+		"LAB-4992 AC1: a concat-only endpoint must reach the spec with --probe=false and no network access")
+}
+
 // TestGenerateCmdRun_ReachableTargetIsNeverWorseThanOffline is the end-to-end
 // guard for QUAL-004 (LAB-4992): supplying a REACHABLE --target-url must never
 // produce less output than running fully offline.

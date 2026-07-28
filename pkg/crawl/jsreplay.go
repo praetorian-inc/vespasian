@@ -43,8 +43,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 	"github.com/praetorian-inc/vespasian/pkg/ssrf"
@@ -612,6 +610,27 @@ func hasAPIIndicator(path string) bool {
 func hasInlinePrefix(trimmedPath string) bool {
 	loc := apiIndicatorPattern.FindStringIndex(trimmedPath)
 	return loc != nil && loc[0] > 0
+}
+
+// SameOrigin reports whether a and b share an origin (scheme + host + port),
+// canonicalizing default ports so `https://h/x` and `https://h:443/y` compare
+// equal. Returns false when either URL is unparseable or has no host, so a
+// malformed input fails closed.
+//
+// Exported for pkg/analyze/jsstatic (QUAL-001, LAB-4992): the offline concat
+// extractor previously compared host and scheme with its own ad hoc
+// hostOfURL/schemeOfURL pair, which — unlike originOf here — did NOT canonicalize
+// default ports. A reconstruction of `https://h:443/api/x` from a bundle served
+// at `https://h/` therefore failed the same-origin gate and the endpoint was
+// silently dropped, while this package's own probeMatchKey treated the two as
+// identical. Sharing one comparison keeps the offline and active paths from
+// disagreeing about what "the bundle's own origin" means.
+func SameOrigin(a, b string) bool {
+	oa := originOf(a)
+	if oa == "" {
+		return false
+	}
+	return oa == originOf(b)
 }
 
 // defaultPortForScheme returns the canonical default port for a URL scheme,
@@ -1708,59 +1727,72 @@ func cleanConcatPath(p string) string {
 	if p == "" || !hasAPIIndicator(p) {
 		return ""
 	}
-	// Reject any whitespace, control, format or line/paragraph-separator rune, or
-	// a raw byte that is not valid UTF-8. A crafted bundle literal can embed
-	// these: parseConcatArgs / readChainOperand -> stringLiteralValue copy
+	// Enforce a strict ASCII ALLOW-list over the reconstruction (SEC-BE-002,
+	// third pass). This is the only extractor in this file that admits arbitrary
+	// bytes: parseConcatArgs / readChainOperand -> stringLiteralValue copy
 	// string-literal operand bytes VERBATIM with no character class, so whatever
 	// a hostile bundle puts inside a `.concat()` argument or `+`-chain operand
-	// lands in the reconstruction, and the ASCII `api/` elsewhere in the path
-	// still satisfies hasAPIIndicator.
+	// lands here, and the ASCII `api/` elsewhere in the path still satisfies
+	// hasAPIIndicator. The sibling extractors (apiPathPattern,
+	// templateLiteralPattern, fullURLPattern, servicePrefixPattern) all already
+	// constrain their captures to an ASCII class, so an allow-list here brings
+	// this path in line with them rather than inventing a new policy.
 	//
-	// The predicate is deliberately broader than unicode.IsControl (SEC-BE-002,
-	// second pass). IsControl consults only the Latin-1 properties table and
-	// returns FALSE for every rune above U+00FF, so an earlier
-	// `r == ' ' || unicode.IsControl(r)` check — whose comment claimed to reject
-	// "any non-printable/control byte" — let the entire Cf, Zs, Zl and Zp
-	// categories through: U+202A-U+202E bidi embed/override, U+200B ZWSP,
-	// U+200E/U+200F LRM/RLM, U+2060 word joiner, U+FEFF BOM, U+00A0 NBSP and
-	// U+3000 ideographic space all survived into a candidate path. IsSpace now
-	// covers Zs (including NBSP and U+3000) plus ASCII whitespace, so the
-	// explicit ' ' test is subsumed; Cf covers the bidi controls, ZWSP, the
-	// directional marks, the word joiner and the BOM.
+	// An allow-list replaced an enumerate-the-bad-categories block-list, which
+	// kept losing this race. The block-list's first form (`r == ' ' ||
+	// unicode.IsControl(r)`) let every rune above U+00FF through, because
+	// unicode.IsControl consults only the Latin-1 table — U+202A-U+202E bidi
+	// override, U+200B ZWSP, U+FEFF BOM, U+00A0 NBSP, U+3000. Widening it to
+	// Zs/Cc/Cf/Zl/Zp closed those but still admitted homoglyphs (Cyrillic а),
+	// fullwidth slash lookalikes (U+FF0F), combining marks (U+0301) and variation
+	// selectors (U+FE0F, category Mn — not Cf). Inverting the predicate closes the
+	// entire non-ASCII class at once and needs no width-1 utf8.RuneError special
+	// case, since every byte >= 0x80 simply is not in the set.
 	//
 	// The HTTP request path was never the exposure — net/url percent-encodes
 	// non-ASCII in EscapedPath(), so there is no request-splitting or
-	// header-injection vector. The sink is the operator-facing artifact: U+202E
-	// (E2 80 AE) satisfies gopkg.in/yaml.v3's is_printable check and is emitted
-	// RAW into the generated OpenAPI path key, so a scanned site could make a
-	// spec path RENDER differently from the bytes it contains (RTL override) or
-	// hide segments behind zero-width runes — report/deliverable spoofing during
-	// an assessment.
+	// header-injection vector. The sink is the operator-facing artifact: yaml.v3
+	// emits these bytes RAW into the generated OpenAPI path key, so a scanned site
+	// could make a spec path RENDER differently from the bytes it contains (RTL
+	// override, homoglyph) or hide segments behind zero-width runes —
+	// report/deliverable spoofing during an assessment.
 	//
-	// A lone non-UTF-8 high byte (0x80-0x9F) decodes to utf8.RuneError, for which
-	// none of the category predicates are true — strings.IndexFunc alone (which
-	// decodes runes the same way) would let it through, so this scans bytes
-	// directly and additionally rejects any width-1 RuneError decode.
-	for i := 0; i < len(p); {
-		r, size := utf8.DecodeRuneInString(p[i:])
-		if isRejectedPathRune(r) || (r == utf8.RuneError && size == 1) {
+	// `?`, `=`, `&` and `#` are legal only in the query/fragment suffix, which is
+	// why the two portions are checked against different sets: a bare `?` inside
+	// what cleanConcatPath treats as the path would mean the split above did not
+	// happen, i.e. a malformed reconstruction.
+	for i := 0; i < len(path); i++ {
+		if !isAllowedConcatByte(path[i], false) {
 			return ""
 		}
-		i += size
+	}
+	for i := 0; i < len(suffix); i++ {
+		if !isAllowedConcatByte(suffix[i], true) {
+			return ""
+		}
 	}
 	return p
 }
 
-// isRejectedPathRune reports whether r must never appear in a reconstructed
-// candidate path: whitespace (Zs + ASCII), control (Cc), format (Cf), or
-// line/paragraph separator (Zl/Zp). See cleanConcatPath's byte scan for why
-// unicode.IsControl alone is insufficient (SEC-BE-002).
-func isRejectedPathRune(r rune) bool {
-	return unicode.IsSpace(r) ||
-		unicode.IsControl(r) ||
-		unicode.Is(unicode.Cf, r) ||
-		unicode.Is(unicode.Zl, r) ||
-		unicode.Is(unicode.Zp, r)
+// isAllowedConcatByte reports whether c may appear in a reconstructed candidate
+// path. ASCII-only by construction: every byte >= 0x80 falls through to false, so
+// no non-ASCII rune can reach a generated spec path key (SEC-BE-002). inSuffix
+// admits the query/fragment delimiters, which are illegal in the path portion.
+func isAllowedConcatByte(c byte, inSuffix bool) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	}
+	switch c {
+	// Structural and RFC 3986 sub-delims / unreserved punctuation that legitimately
+	// appear in API paths, plus `{}` for the {param} placeholders the REST
+	// normalizer emits and `%` for percent-encoding.
+	case '/', '_', '-', '.', ':', '{', '}', '%', '~', '@', '!', '$', '\'', '(', ')', '*', '+', ',', ';':
+		return true
+	case '?', '=', '&', '#':
+		return inSuffix
+	}
+	return false
 }
 
 // servicePrefixPlusHeadPattern matches the head of a `+`-concat chain whose

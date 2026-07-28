@@ -115,7 +115,12 @@
 //     (auth headers and probes are restricted to the scan target's origin
 //     by default) and uses [github.com/praetorian-inc/vespasian/pkg/ssrf]
 //     for SSRF protection unless the operator explicitly opts out via
-//     AllowPrivate.
+//     AllowPrivate. Relative to the fully-offline static path, replay is
+//     strictly ADDITIVE: it supersedes an offline static:js-concat mirror only
+//     for a path the probe answered 404 — the sole dispositive refutation — so
+//     a 200 text/html SPA catch-all, a 204, an HTML-bodied 401/403 or a
+//     302 to /login can never remove an endpoint the offline pass recovered
+//     (LAB-4992 QUAL-004).
 //   - [ExtractStaticConcatPaths] is the network-free subset of the concat /
 //     service-prefix reconstruction, shared with pkg/analyze/jsstatic (LAB-4992)
 //     so the fully-offline static analyzer reconstructs these forms identically
@@ -125,6 +130,17 @@
 //     identically; the active path additionally probes them and does a
 //     speculative service-prefix fan-out that the offline path omits (that
 //     fan-out is only safe when 404-filtered by probing).
+//   - [ValidateFullURL], [SameOrigin] and [APIIndicatorAlternation] are exported
+//     for the same reason as [ExtractStaticConcatPaths] — they are the shared
+//     definitions that keep the offline static path from drifting away from this
+//     one (LAB-4992). [ValidateFullURL] is the parse-time URL gate (rejects
+//     embedded credentials, non-http(s) schemes, empty hosts) that both paths
+//     apply before emitting or probing an absolute reconstruction; [SameOrigin]
+//     compares origins with default-port canonicalization, so the two paths agree
+//     on what counts as the bundle's own origin; [APIIndicatorAlternation] is the
+//     single source of truth for which path segments signal an API endpoint, and
+//     pkg/classify pins its Rule 3 gate against it so the classifier cannot
+//     silently stop recognizing an indicator this package still extracts.
 //
 // Session-cookie helpers (LAB-2222) let callers bootstrap Chrome's cookie
 // store from a user-supplied Cookie header so subsequent navigations are

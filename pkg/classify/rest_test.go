@@ -881,12 +881,25 @@ func TestStaticJSFloorClearsDefaultThreshold(t *testing.T) {
 // silently dropped at the default confidence.
 //
 // Two assertions, deliberately paired:
-//  1. every indicator crawl can extract yields a Rule 7 floor here, and
+//  1. every indicator crawl can extract, in SEGMENT-ANCHORED position, yields a
+//     Rule 7 floor here, and
 //  2. crawl's alternation is still exactly the set enumerated below.
 //
 // (2) is what makes this a guard rather than a snapshot: adding an indicator to
 // crawl (say `v0/` or `svc/`) fails this test until the classifier's gate and
 // this table are widened to match.
+//
+// SCOPE (TEST-004): "segment-anchored" is load-bearing and this test does NOT
+// claim parity over every string crawl can extract. crawl's apiIndicatorPattern
+// is unanchored, so it also matches an indicator embedded mid-token: verified
+// live, `ExtractStaticConcatPaths` emits `xapi/users/1` and `/myapi/users/2`,
+// which this classifier scores 0 and drops. That asymmetry is DELIBERATE, not a
+// gap to close by loosening Rule 3 — `/myapi/` is an accidental substring match,
+// not an API indicator, and admitting it would raise false positives for every
+// source, not just JS-static ones. crawl over-extracting costs only a discarded
+// candidate; the classifier over-matching would corrupt real output. The negative
+// cases in TestAPIIndicatorUnanchoredNotFloored pin that decision so it reads as
+// a choice rather than an oversight.
 func TestAPIIndicatorParityWithCrawlExtraction(t *testing.T) {
 	// Pinned so widening crawl's extraction set forces a matching widening of
 	// the classifier's Rule 3 gate. Update BOTH sides plus the table below.
@@ -924,6 +937,49 @@ func TestAPIIndicatorParityWithCrawlExtraction(t *testing.T) {
 			assert.Contains(t, reason, "static-js-candidate", "Rule 7 must fire for an extractable indicator")
 			assert.GreaterOrEqual(t, confidence, DefaultConfidenceThreshold,
 				"candidate must survive default-confidence generation, got %v", confidence)
+		})
+	}
+}
+
+// TestAPIIndicatorUnanchoredNotFloored pins the negative direction of the
+// extraction/classification asymmetry (TEST-004, LAB-4992).
+//
+// crawl.apiIndicatorPattern is unanchored, so crawl extracts paths whose "API
+// indicator" is only an accidental substring of a larger token — verified live,
+// ExtractStaticConcatPaths emits `xapi/users/1` for `"xapi/".concat("users/1")`
+// and `/myapi/users/2` for `"/myapi/".concat("users/2")`. This classifier
+// requires a segment-delimited indicator ("/api/", or a bare version segment), so
+// those score 0 and are dropped at the default confidence.
+//
+// This is the intended contract, and the asymmetry is safe in exactly one
+// direction: crawl over-extracting merely wastes a candidate, whereas the
+// classifier over-matching would promote genuinely non-API paths for EVERY
+// source. Do not "fix" a failure here by loosening apiPathSegments to a substring
+// match — that would make /myapi/, /xapi/ and /notgraphql look like API paths
+// everywhere in the pipeline.
+func TestAPIIndicatorUnanchoredNotFloored(t *testing.T) {
+	// Exactly the strings crawl's extractor produces for these bundles.
+	unanchored := []string{
+		"/xapi/users/1",
+		"/myapi/users/2",
+		"/notgraphql/query",
+	}
+
+	for _, path := range unanchored {
+		t.Run(path, func(t *testing.T) {
+			c := &RESTClassifier{}
+			isAPI, confidence, reason := c.ClassifyDetail(crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com" + path,
+				Source: crawl.SourceStaticJSConcat,
+			})
+
+			assert.NotContains(t, reason, "static-js-candidate",
+				"Rule 7 must NOT fire for a substring-embedded indicator: %s", path)
+			assert.Less(t, confidence, DefaultConfidenceThreshold,
+				"a substring-embedded indicator must stay below the default threshold, got %v", confidence)
+			assert.False(t, isAPI,
+				"a substring-embedded indicator must not classify as an API path")
 		})
 	}
 }

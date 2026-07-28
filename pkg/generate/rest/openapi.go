@@ -228,7 +228,6 @@ var jsStaticSourceRank = map[string]int{
 //     the SAME friendly tag) → the LEAST-CONFIDENT member present (confidence
 //     order, most → least: js-bundle > js-sourcemap > js-bundle-concat), e.g.
 //     js-bundle + js-bundle-concat → "js-bundle-concat"
-//   - any request with a genuinely non-JS-static source in the group          → "dynamic"
 //   - empty group (len(group) == 0)                  → "" (no extension emitted)
 //
 // For non-empty input the function always returns one of: "dynamic",

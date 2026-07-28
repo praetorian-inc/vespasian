@@ -719,31 +719,65 @@ func TestCapBundleEndpoints_ASTRetainedWhenConcatAbundant(t *testing.T) {
 // the concat reserve from exceeding the budget (QUAL-003). Without the budget/2
 // clamp, a budget below concatMinReserve would make astBudget negative and zero
 // out AST entirely.
+//
+// TEST-003: this asserts the EXACT split, not merely that AST is non-empty. The
+// earlier `astKept != 0` form was the loosest of the three budget tests while
+// guarding the tightest branch — loosening the clamp to `budget-1` (which leaves
+// AST just 1 slot of 20 at budget=10) kept the whole package green.
 func TestCapBundleEndpoints_SmallBudgetDoesNotStarveAST(t *testing.T) {
-	for _, budget := range []int{1, 2, 4, 10, concatMinReserve} {
-		t.Run(fmt.Sprintf("budget=%d", budget), func(t *testing.T) {
+	const nAST, nConcat = 20, 20
+
+	// Expected split per budget, derived from capBundleEndpoints' contract:
+	//   reserve = min(len(concat), concatMinReserve, budget/2)
+	//   astKept = min(len(ast), budget-reserve); concatKept = budget - astKept
+	// Written out literally rather than recomputed from the formula so the test
+	// would fail if the formula itself were changed (a test that recomputes the
+	// implementation's arithmetic cannot detect a change to it).
+	cases := []struct {
+		budget            int
+		wantAST, wantCcat int
+	}{
+		{budget: 0, wantAST: 0, wantCcat: 0},    // nothing kept
+		{budget: 1, wantAST: 1, wantCcat: 0},    // budget/2 == 0 -> no reserve
+		{budget: 2, wantAST: 1, wantCcat: 1},    // reserve 1
+		{budget: 4, wantAST: 2, wantCcat: 2},    // reserve 2
+		{budget: 10, wantAST: 5, wantCcat: 5},   // reserve 5 (budget/2 binds)
+		{budget: 16, wantAST: 8, wantCcat: 8},   // reserve 8 (budget/2 still binds)
+		{budget: 40, wantAST: 20, wantCcat: 20}, // both fit entirely
+	}
+
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("budget=%d", tc.budget), func(t *testing.T) {
 			var eps []ExtractedEndpoint
-			for i := 0; i < 20; i++ {
+			for i := 0; i < nAST; i++ {
 				eps = append(eps, ExtractedEndpoint{URL: fmt.Sprintf("/api/ast%d", i)})
 			}
-			for i := 0; i < 20; i++ {
+			for i := 0; i < nConcat; i++ {
 				eps = append(eps, ExtractedEndpoint{URL: fmt.Sprintf("/api/concat%d", i), SourceTag: SourceJSConcat})
 			}
 
-			got := capBundleEndpoints(eps, budget)
+			got := capBundleEndpoints(eps, tc.budget)
 
-			if len(got) != budget {
-				t.Fatalf("kept %d, want %d (budget must be fully utilized)", len(got), budget)
-			}
-			var astKept int
+			var astKept, concatKept int
 			for _, ep := range got {
-				if ep.SourceTag != SourceJSConcat {
+				if ep.SourceTag == SourceJSConcat {
+					concatKept++
+				} else {
 					astKept++
 				}
 			}
-			// AST is never zeroed out while AST endpoints exist and budget > 0.
-			if astKept == 0 {
-				t.Errorf("AST endpoints kept = 0 at budget=%d; the concat reserve must never starve AST", budget)
+
+			if astKept != tc.wantAST || concatKept != tc.wantCcat {
+				t.Errorf("budget=%d: kept ast=%d concat=%d, want ast=%d concat=%d",
+					tc.budget, astKept, concatKept, tc.wantAST, tc.wantCcat)
+			}
+			if want := tc.wantAST + tc.wantCcat; len(got) != want {
+				t.Errorf("budget=%d: kept %d total, want %d (budget must be fully utilized)", tc.budget, len(got), want)
+			}
+			// The clamp's purpose: AST is never zeroed out while AST endpoints
+			// exist and the budget is non-zero.
+			if tc.budget > 0 && astKept == 0 {
+				t.Errorf("AST endpoints kept = 0 at budget=%d; the concat reserve must never starve AST", tc.budget)
 			}
 		})
 	}

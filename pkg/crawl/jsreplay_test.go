@@ -1693,6 +1693,24 @@ func TestReachedPathKey(t *testing.T) {
 	assert.Equal(t, "http://example.com", reachedPathKey("http://example.com"))
 	// The empty string likewise round-trips verbatim.
 	assert.Equal(t, "", reachedPathKey(""))
+
+	// TEST-005: the root-path preservation guard (`path != "/"` around the
+	// trailing-slash trim) was never exercised. Without it, "/" would trim to ""
+	// and every root URL would collide with the empty-path fallback bucket.
+	assert.Equal(t, "/", reachedPathKey("http://example.com/"),
+		"a root path must be preserved as \"/\", not trimmed to \"\"")
+	// And the asymmetry that guard creates: a root path and a path-less origin
+	// are deliberately DIFFERENT keys ("/" vs the raw-string fallback), so a
+	// refuted root probe cannot supersede a mirror that carried no path at all.
+	assert.NotEqual(t, reachedPathKey("http://example.com/"), reachedPathKey("http://example.com"),
+		"root path and path-less origin must not share a key")
+
+	// Documented edge: an all-slashes path collapses to "" (the trim empties it
+	// and the `path == ""` fallback already ran on the pre-trim value). Pinned as
+	// observed rather than as intended — it is unreachable for real mirrors,
+	// because cleanConcatPath collapses "//" to "/", trims it to "", and then
+	// rejects it on hasAPIIndicator, so no such candidate is ever emitted.
+	assert.Equal(t, "", reachedPathKey("http://example.com//"))
 }
 
 // errRoundTripper always returns the configured error from RoundTrip.
@@ -3584,13 +3602,19 @@ func TestCleanConcatPath(t *testing.T) {
 			want: "",
 		},
 
-		// SEC-BE-002 (second pass): unicode.IsControl consults only the Latin-1
-		// table and returns false above U+00FF, so these all survived a
-		// `' ' || IsControl` predicate. They reach a candidate path because
-		// stringLiteralValue copies operand bytes verbatim, and the sink is the
-		// generated OpenAPI document — yaml.v3 emits them raw, so the rendered
-		// path can differ from the bytes it contains (bidi override) or hide
-		// segments (zero-width).
+		// SEC-BE-002: every non-ASCII rune is rejected, because cleanConcatPath
+		// now enforces an ASCII ALLOW-list rather than enumerating bad Unicode
+		// categories. They reach a candidate path because stringLiteralValue
+		// copies operand bytes verbatim, and the sink is the generated OpenAPI
+		// document — yaml.v3 emits them raw, so the rendered path can differ from
+		// the bytes it contains (bidi override, homoglyph) or hide segments
+		// (zero-width).
+		//
+		// The first six cases below are the ones the original
+		// `' ' || unicode.IsControl` predicate missed (IsControl is Latin-1-only,
+		// so it returns false above U+00FF). The four after them are the ones the
+		// widened Zs/Cc/Cf/Zl/Zp block-list STILL missed — which is why the
+		// predicate was inverted rather than widened a third time.
 		{
 			name: "rejects U+202E right-to-left override (Cf)",
 			in:   "/api/\u202Ex",
@@ -3619,6 +3643,39 @@ func TestCleanConcatPath(t *testing.T) {
 		{
 			name: "rejects U+2028 line separator (Zl)",
 			in:   "/api/\u2028x",
+			want: "",
+		},
+		{
+			// TEST-006: the Zp arm was never covered.
+			name: "rejects U+2029 paragraph separator (Zp)",
+			in:   "/api/\u2029x",
+			want: "",
+		},
+
+		// These four survived even the widened Zs/Cc/Cf/Zl/Zp block-list and are
+		// the direct reason for the allow-list inversion.
+		{
+			// The homoglyph sits AFTER a valid ASCII `api/` so hasAPIIndicator
+			// still matches and the charset check is what rejects it. Putting it
+			// inside the indicator itself ("/\u0430pi/users") would make this case
+			// vacuous \u2014 hasAPIIndicator would reject it whatever the charset does.
+			name: "rejects Cyrillic homoglyph (Ll, renders as Latin e)",
+			in:   "/api/us\u0435rs",
+			want: "",
+		},
+		{
+			name: "rejects U+FF0F fullwidth solidus (Po, renders as /)",
+			in:   "/api/x\uff0fy",
+			want: "",
+		},
+		{
+			name: "rejects U+0301 combining acute accent (Mn)",
+			in:   "/api/x\u0301y",
+			want: "",
+		},
+		{
+			name: "rejects U+FE0F variation selector-16 (Mn, not Cf)",
+			in:   "/api/x\ufe0fy",
 			want: "",
 		},
 
@@ -3651,6 +3708,20 @@ func TestCleanConcatPath(t *testing.T) {
 			name: "preserves trailing slash inside query value",
 			in:   "/api/proxy?url=https://a/",
 			want: "/api/proxy?url=https://a/",
+		},
+
+		// TEST-006: the `#` arm of the IndexAny(p, "?#") split was untested — only
+		// the `?` arm had coverage. A fragment must be split off like a query, so
+		// `//` inside it is preserved and the path portion is still trimmed.
+		{
+			name: "collapses path slashes but preserves them inside a fragment",
+			in:   "/api//x#a//b",
+			want: "/api/x#a//b",
+		},
+		{
+			name: "trims trailing path slash before a fragment",
+			in:   "/api/x/#frag",
+			want: "/api/x#frag",
 		},
 	}
 	for _, tt := range tests {
