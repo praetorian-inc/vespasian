@@ -95,7 +95,7 @@ type JSReplayConfig struct {
 	// Proxy routes replay traffic through an intercepting proxy when set. It is
 	// honored ONLY when Client is nil (the production path — buildJSReplayConfig
 	// never sets Client): an injected Client owns its transport, and
-	// wrapClientWithSSRF would clobber a proxied dialer (see architecture.md §1).
+	// wrapClientWithSSRF would clobber a proxied dialer.
 	// When a Client IS injected while Proxy is set, withDefaults emits a warning to
 	// Stderr that replay traffic will BYPASS the proxy. The proxied client installs
 	// no dial-time SSRF pin (we dial the proxy, not the target); URL-level scope
@@ -147,7 +147,7 @@ func (cfg JSReplayConfig) withDefaults() JSReplayConfig {
 			// Route through the proxy: no dial-time SSRF pin (we dial the proxy,
 			// not the target). This is the production path; an injected Client
 			// deliberately opts out of Proxy (wrapClientWithSSRF would clobber a
-			// proxied dialer — architecture.md §1).
+			// proxied dialer).
 			cfg.Client = httpx.BuildHTTPClient(cfg.Proxy, cfg.Timeout, httpx.NoFollowRedirects)
 		} else {
 			cfg.Client = newSSRFSafeClient(cfg.Timeout, cfg.AllowPrivate)

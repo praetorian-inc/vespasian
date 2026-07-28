@@ -39,8 +39,8 @@ func writeStatus(w io.Writer, format string, args ...any) {
 
 // wsdlStageTimeout caps each connection phase (TLS handshake, response header)
 // independently of the overall Client.Timeout, so a slow or malicious target
-// can't burn the whole budget on a single stage. Both transport branches share
-// this cap — the only real difference is the dialer (SSRF-safe vs permissive).
+// can't burn the whole budget on a single stage. All three transport branches
+// (proxied, SSRF-safe non-proxy, and permissive non-proxy) share this cap.
 const wsdlStageTimeout = 10 * time.Second
 
 // wsdlClientTimeout is the overall per-request budget on the WSDL probe's
@@ -56,7 +56,15 @@ const wsdlClientTimeout = 15 * time.Second
 // AllowPrivate probes elsewhere.
 func buildWSDLProbeClient(allowPrivate bool, proxy httpx.ProxyConfig) *http.Client {
 	if proxy.Enabled() {
-		return httpx.BuildHTTPClient(proxy, wsdlClientTimeout, httpx.NoFollowRedirects)
+		client := httpx.BuildHTTPClient(proxy, wsdlClientTimeout, httpx.NoFollowRedirects)
+		// Apply the same per-stage caps the non-proxy branches use so a slow/malicious
+		// target can't stall a single stage up to the full client budget. BuildHTTPClient
+		// always sets a *http.Transport. [QUAL-001]
+		if tr, ok := client.Transport.(*http.Transport); ok {
+			tr.TLSHandshakeTimeout = wsdlStageTimeout
+			tr.ResponseHeaderTimeout = wsdlStageTimeout
+		}
+		return client
 	}
 	transport := &http.Transport{
 		DialContext:           probe.SSRFSafeDialContext,

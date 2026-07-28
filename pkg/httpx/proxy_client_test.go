@@ -1072,3 +1072,109 @@ func TestResolveConnectResult(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// TEST-003 + TEST-004 + SEC-BE-002
+// ---------------------------------------------------------------------------
+
+// startCONNECTReplyStub starts a "proxy" that reads and drains a CONNECT
+// request (request line + headers to the blank line), then writes back the
+// given raw reply verbatim, letting callers craft an oversized or non-200
+// CONNECT response. Unlike startRecordingCONNECTProxy / newNaiveCONNECTStub,
+// this lets the caller control the exact reply bytes.
+func startCONNECTReplyStub(t *testing.T, reply string) *url.URL {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { ln.Close() }) //nolint:errcheck,gosec // test cleanup
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close() //nolint:errcheck // test cleanup
+		reader := bufio.NewReader(conn)
+		if _, err := reader.ReadString('\n'); err != nil { // CONNECT request line
+			return
+		}
+		for { // drain request headers to the blank line
+			line, err := reader.ReadString('\n')
+			if err != nil || line == "\r\n" || line == "\n" {
+				break
+			}
+		}
+		conn.Write([]byte(reply)) //nolint:errcheck,gosec // test best-effort; reply may exceed the client's header cap
+		<-stop
+	}()
+	proxyURL, err := url.Parse("http://" + ln.Addr().String())
+	require.NoError(t, err)
+	return proxyURL
+}
+
+func TestProxyDialer_BoundsConnectReplyHeaders(t *testing.T) {
+	t.Run("over cap fails the dial", func(t *testing.T) {
+		oversized := "HTTP/1.1 200 Connection established\r\n" +
+			strings.Repeat("X-Pad: "+strings.Repeat("a", 1024)+"\r\n", 128) // ~132KiB, no terminator
+		proxyURL := startCONNECTReplyStub(t, oversized)
+		dial, err := ProxyDialer(ProxyConfig{URL: proxyURL})
+		require.NoError(t, err)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, err := dial(ctx, "127.0.0.1:1")
+		require.Error(t, err, "an over-cap CONNECT header block must fail the dial")
+		assert.Contains(t, err.Error(), "reading CONNECT response")
+		assert.Nil(t, conn)
+	})
+	t.Run("under cap succeeds", func(t *testing.T) {
+		underCap := "HTTP/1.1 200 Connection established\r\n" +
+			strings.Repeat("X-Pad: "+strings.Repeat("a", 1024)+"\r\n", 31) + "\r\n" // ~32KiB, terminated
+		proxyURL := startCONNECTReplyStub(t, underCap)
+		dial, err := ProxyDialer(ProxyConfig{URL: proxyURL})
+		require.NoError(t, err)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, err := dial(ctx, "127.0.0.1:1")
+		require.NoError(t, err, "a large-but-under-cap CONNECT reply must still succeed")
+		require.NotNil(t, conn)
+		conn.Close() //nolint:errcheck,gosec // test cleanup
+	})
+}
+
+func TestProxyDialer_RejectsNonOKConnectReply(t *testing.T) {
+	t.Run("407 Proxy Authentication Required", func(t *testing.T) {
+		proxyURL := startCONNECTReplyStub(t, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\n\r\n")
+		dial, err := ProxyDialer(ProxyConfig{URL: proxyURL})
+		require.NoError(t, err)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, err := dial(ctx, "127.0.0.1:1")
+		assert.Nil(t, conn)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "proxy CONNECT to")
+		assert.Contains(t, err.Error(), "407")
+	})
+	t.Run("502 Bad Gateway", func(t *testing.T) {
+		proxyURL := startCONNECTReplyStub(t, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+		dial, err := ProxyDialer(ProxyConfig{URL: proxyURL})
+		require.NoError(t, err)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, err := dial(ctx, "127.0.0.1:1")
+		assert.Nil(t, conn)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "502", "the status-agnostic check must report a 502 too, not just 407")
+	})
+}
+
+// SEC-BE-002: a disabled proxy must fail SAFE — a non-proxied client
+// (Transport.Proxy == nil) that KEEPS a dialer (DialContext != nil).
+func TestBuildHTTPClient_DisabledProxyFailsSafe(t *testing.T) {
+	client := BuildHTTPClient(ProxyConfig{}, 10*time.Second, nil)
+	require.NotNil(t, client)
+	tr, ok := client.Transport.(*http.Transport)
+	require.True(t, ok, "Transport must be *http.Transport, got %T", client.Transport)
+	assert.Nil(t, tr.Proxy, "a disabled proxy must yield a non-proxied client (no Proxy func)")
+	assert.NotNil(t, tr.DialContext, "the fail-safe path must keep the cloned default dialer")
+}

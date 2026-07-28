@@ -3612,3 +3612,31 @@ func TestScanCmd_ScanOptions_CarriesProxy(t *testing.T) {
 		require.False(t, secureOpts.Proxy.Insecure, "ScanCmd.ProxyInsecure=false must reach pipeline.ScanOptions.Proxy.Insecure")
 	})
 }
+
+// TestGenerateCmd_ResolveJSReplayConfig_RejectsInvalidProxy is the TEST-001
+// proof that resolveJSReplayConfig fails fast on an invalid --proxy (embedded
+// credentials or an unsupported scheme) and threads a valid proxy onward into
+// the returned crawl.JSReplayConfig.
+func TestGenerateCmd_ResolveJSReplayConfig_RejectsInvalidProxy(t *testing.T) {
+	t.Run("rejects embedded credentials", func(t *testing.T) {
+		// Credentials assembled at runtime to avoid gosec G101 (hardcoded creds in
+		// URL); the value is identical to a plain literal once concatenated.
+		badProxy := "http://" + "admin:s3cret" + "@127.0.0.1:8080"
+		cmd := &GenerateCmd{Proxy: badProxy, TargetURL: "https://example.com"}
+		_, err := cmd.resolveJSReplayConfig()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "embedded credentials")
+	})
+	t.Run("rejects unsupported scheme", func(t *testing.T) {
+		cmd := &GenerateCmd{Proxy: "ftp://127.0.0.1:21", TargetURL: "https://example.com"}
+		_, err := cmd.resolveJSReplayConfig()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "scheme must be")
+	})
+	t.Run("valid proxy is threaded onward", func(t *testing.T) {
+		cmd := &GenerateCmd{Proxy: "http://127.0.0.1:8080", TargetURL: "https://example.com"}
+		cfg, err := cmd.resolveJSReplayConfig()
+		require.NoError(t, err)
+		require.NotNil(t, cfg.Proxy.URL, "a valid --proxy must reach the returned JSReplayConfig.Proxy.URL")
+	})
+}

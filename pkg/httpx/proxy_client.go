@@ -58,8 +58,11 @@ func NoFollowRedirects(*http.Request, []*http.Request) error {
 //
 //   - clones http.DefaultTransport (keeps keep-alive / HTTP2 / idle tunings)
 //   - sets Transport.Proxy = http.ProxyURL(p.URL) (stdlib tunnels http/https/socks5)
-//   - clears Transport.DialContext: no dial-time SSRF pin is installed because we
-//     dial the proxy, not the target; URL-level scope stays the caller's job
+//   - clears Transport.DialContext: this drops the cloned DefaultTransport's plain
+//     30s dial timeout (a net.Dialer bound, not an SSRF pin — there was never one on
+//     the proxy connection since we dial the proxy, not the target); the connect
+//     phase is instead bounded by the caller's Client.Timeout (≤15s everywhere).
+//     URL-level scope stays the caller's job
 //   - sets TLSClientConfig.InsecureSkipVerify only when p.Insecure && the proxy
 //     scheme is http/https (an intercepting MITM proxy presenting its own CA).
 //     socks5 is a transparent TCP tunnel, so verification always stays on for it.
@@ -73,7 +76,10 @@ func NoFollowRedirects(*http.Request, []*http.Request) error {
 // changes. They are intentionally NOT merged: this builder additionally pins
 // MinVersion TLS 1.2 and clears DialContext, whereas crawl keeps DefaultTransport's
 // dialer for the proxy connection (its tests assert a non-nil proxy-branch
-// DialContext), so delegating here would regress that proven path.
+// DialContext). That DialContext difference is a dial-timeout choice, not a security
+// control — neither path pins the proxy dial — so delegating here would change
+// crawl's proven dial-timeout behavior (its 30s dialer vs this builder's reliance on
+// the caller's tighter Client.Timeout).
 func BuildHTTPClient(p ProxyConfig, timeout time.Duration,
 	checkRedirect func(*http.Request, []*http.Request) error) *http.Client {
 	base, ok := http.DefaultTransport.(*http.Transport)
@@ -83,9 +89,21 @@ func BuildHTTPClient(p ProxyConfig, timeout time.Duration,
 		base = &http.Transport{}
 	}
 	t := base.Clone()
+	// Contract is p.Enabled(); every caller gates on it. Defensive fail-safe: if
+	// ever called with a disabled proxy, return a non-proxied client that KEEPS the
+	// cloned default dialer (its 30s bound) rather than one that neither proxies nor
+	// dials. A cloned DefaultTransport carries Proxy=ProxyFromEnvironment, so clear it
+	// too, since the disabled path must not silently route through an env proxy. [SEC-BE-002]
+	if !p.Enabled() {
+		t.Proxy = nil
+		return &http.Client{Transport: t, Timeout: timeout, CheckRedirect: checkRedirect}
+	}
 	t.Proxy = http.ProxyURL(p.URL)
-	// Drop the cloned default dialer: with a proxy we dial the proxy, not the
-	// target, so the SSRF dial pin is neither installed nor needed here.
+	// Drop the cloned default dialer's DialContext: this removes DefaultTransport's
+	// plain 30s dial timeout (a net.Dialer bound), NOT an SSRF pin — there was never
+	// one on the proxy connection (we dial the proxy, not the target). The connect
+	// phase is instead bounded by the caller's Client.Timeout, which is ≤15s
+	// everywhere (tighter than the 30s we drop).
 	t.DialContext = nil
 	// TLS verification stays on by default. It is disabled only when the operator
 	// explicitly opts in via --proxy-insecure AND the proxy is http/https: an
@@ -93,7 +111,7 @@ func BuildHTTPClient(p ProxyConfig, timeout time.Duration,
 	// so verification must be off for that substitute certificate to be accepted.
 	// socks5 tunnels TCP transparently — TLS runs directly against the real target
 	// through the tunnel — so verification is always kept for socks5.
-	if p.Insecure && p.URL != nil && (p.URL.Scheme == "http" || p.URL.Scheme == "https") {
+	if p.Insecure && (p.URL.Scheme == "http" || p.URL.Scheme == "https") {
 		// #nosec G402 -- opt-in via --proxy-insecure for http/https proxy MITM; socks5 always verifies (see package doc)
 		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}
 	}

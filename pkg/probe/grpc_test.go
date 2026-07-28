@@ -16,6 +16,7 @@ package probe
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -26,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/url"
@@ -1204,6 +1206,13 @@ func TestGRPCProbe_ProxyInsecureTLSGating(t *testing.T) {
 	defer stop()
 
 	t.Run("http_proxy_insecure_alone_does_not_skip_verify", func(t *testing.T) {
+		// TEST-005/TEST-006: capture the process-default slog logger to assert the
+		// REQ-001 warning fires. Mutates global slog state — must NOT be parallel.
+		var warnBuf bytes.Buffer
+		origLogger := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&warnBuf, nil)))
+		t.Cleanup(func() { slog.SetDefault(origLogger) })
+
 		proxyAddr, _, stopProxy := startRecordingCONNECTProxy(t, addr)
 		defer stopProxy()
 
@@ -1229,6 +1238,8 @@ func TestGRPCProbe_ProxyInsecureTLSGating(t *testing.T) {
 		require.Len(t, result, 1)
 		assert.Nil(t, result[0].GRPCSchema,
 			"http/https proxy Insecure=true must NOT skip target verification on its own (SEC-BE-004 decouple); the self-signed cert must fail verification")
+		assert.Contains(t, warnBuf.String(), "--grpc-insecure-skip-verify",
+			"probeTarget must emit the REQ-001 warning pointing at --grpc-insecure-skip-verify")
 	})
 
 	t.Run("grpc_insecure_skip_verify_skips_regardless_of_proxy", func(t *testing.T) {

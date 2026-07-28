@@ -343,8 +343,10 @@ vespasian scan <url> [flags]
                      intercepting proxy (Burp/mitmproxy MITM): the crawl stage (only with
                      --headless=false) plus — regardless of --headless — jsstatic sourcemap fetch,
                      probe, WSDL discovery, and JS-replay. Off by default. No effect on socks5, on the
-                     gRPC reflection dial (use --grpc-insecure-skip-verify), or on the headless backend
-                     (trust the proxy CA via the OS store).
+                     gRPC target's certificate verification (governed solely by
+                     --grpc-insecure-skip-verify) — though for an https-scheme proxy --proxy-insecure
+                     DOES disable verification of the proxy's own certificate on that dial's CONNECT
+                     leg — or on the headless backend (trust the proxy CA via the OS store).
   --confidence       Min classification confidence (default: 0.5)
   --probe            Enable active probing (default: true)
   --deduplicate      Deduplicate endpoints before probing (default: true)
@@ -421,9 +423,11 @@ vespasian generate <api-type> <capture-file> [flags]
                      TLS verification stays on by default (socks5 always verifies). Private targets still
                      require --dangerous-allow-private (proxy relaxes only the dial-time SSRF pin, not URL scope).
   --proxy-insecure   Disable TLS verification for the net/http stages routed through an http/https
-                     intercepting proxy (Burp/mitmproxy MITM): probe, WSDL discovery, JS-replay, and
-                     jsstatic sourcemap fetch. Off by default. No effect on socks5, or on the gRPC
-                     reflection dial (use --grpc-insecure-skip-verify).
+                     intercepting proxy (Burp/mitmproxy MITM): probe, JS-replay, and jsstatic sourcemap
+                     fetch. Off by default. No effect on socks5 or on the gRPC target's certificate
+                     verification (governed solely by --grpc-insecure-skip-verify) — though for an
+                     https-scheme proxy --proxy-insecure DOES disable verification of the proxy's own
+                     certificate on that dial's CONNECT leg.
   --dangerous-allow-private  Disable SSRF protection on the probe path
                      (OPTIONS/schema/WSDL-fetch/GraphQL introspection) for
                      private/localhost targets. WARNING: Do not use on

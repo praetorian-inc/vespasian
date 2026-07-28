@@ -104,7 +104,10 @@ func TestConfig_WithDefaults_WarnsWhenClientInjectedWithProxy(t *testing.T) {
 	var buf bytes.Buffer
 	origLogger := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
-	defer slog.SetDefault(origLogger)
+	// t.Cleanup (not defer) so the default logger is restored even if a helper
+	// goroutine calls t.Fatal. This test (and any sibling reading the process-
+	// default slog logger) must NOT be parallel — they mutate global slog state.
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
 
 	proxyURL, err := url.Parse("http://127.0.0.1:8080")
 	require.NoError(t, err)
@@ -115,4 +118,33 @@ func TestConfig_WithDefaults_WarnsWhenClientInjectedWithProxy(t *testing.T) {
 	assert.Same(t, injectedClient, cfg.Client, "an injected Client must not be replaced when Proxy is enabled")
 	assert.Contains(t, buf.String(), "BYPASS the proxy",
 		"withDefaults must warn that probe traffic will bypass the proxy when a Client is injected alongside a configured Proxy")
+}
+
+// TestGRPCProbe_ProxyTLSVerifyMismatch is the TEST-005(a) proof for
+// proxyTLSVerifyMismatch: it reports true only when ALL of (target is TLS,
+// proxy is configured, Proxy.Insecure is set, GRPCInsecureSkipVerify is unset)
+// hold at once.
+func TestGRPCProbe_ProxyTLSVerifyMismatch(t *testing.T) {
+	proxyURL, err := url.Parse("http://127.0.0.1:8080")
+	require.NoError(t, err)
+	enabledInsecure := httpx.ProxyConfig{URL: proxyURL, Insecure: true}
+	tests := []struct {
+		name  string
+		proxy httpx.ProxyConfig
+		skip  bool
+		tls   bool
+		want  bool
+	}{
+		{"all conditions met", enabledInsecure, false, true, true},
+		{"target not TLS", enabledInsecure, false, false, false},
+		{"no proxy configured", httpx.ProxyConfig{Insecure: true}, false, true, false},
+		{"proxy not insecure", httpx.ProxyConfig{URL: proxyURL, Insecure: false}, false, true, false},
+		{"grpc skip verify set", enabledInsecure, true, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &GRPCProbe{config: Config{Proxy: tt.proxy, GRPCInsecureSkipVerify: tt.skip}}
+			assert.Equal(t, tt.want, p.proxyTLSVerifyMismatch(grpcTargetInfo{useTLS: tt.tls}))
+		})
+	}
 }

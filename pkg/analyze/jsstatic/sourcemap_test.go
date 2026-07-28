@@ -946,4 +946,32 @@ func TestRecoverSourcemap_HTTPClientInjectedWithProxyWarnsAndBypasses(t *testing
 	if !strings.Contains(logBuf.String(), "BYPASS the proxy") {
 		t.Errorf("expected the Proxy-ignored bypass warning in opts.Logger output, got: %q", logBuf.String())
 	}
+
+	// TEST-002 + TEST-006: exercise the nil-opts.Logger fallback to slog.Default()
+	// which is otherwise never executed. Mutates global slog state, so this subtest
+	// (and any sibling reading the process-default logger) must NOT be parallel.
+	t.Run("nil Logger falls back to slog.Default", func(t *testing.T) {
+		var defBuf bytes.Buffer
+		orig := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&defBuf, nil)))
+		t.Cleanup(func() { slog.SetDefault(orig) })
+
+		opts := Options{
+			HTTPClient:      &http.Client{},
+			Proxy:           httpx.ProxyConfig{URL: proxyURL},
+			FetchSourcemaps: true,
+			AllowPrivate:    true,
+			// Logger deliberately nil: exercises the slog.Default() fallback.
+		}
+		sources, stats := recoverSourcemap(context.Background(), bundle, bundleURL, opts)
+		if len(sources) != 1 {
+			t.Fatalf("expected 1 source recovered with a nil Logger, got %d: %v", len(sources), sources)
+		}
+		if stats.SourcemapsRecovered != 1 {
+			t.Errorf("expected 1 recovered, got %d", stats.SourcemapsRecovered)
+		}
+		if !strings.Contains(defBuf.String(), "BYPASS the proxy") {
+			t.Errorf("expected the bypass warning routed to slog.Default(), got: %q", defBuf.String())
+		}
+	})
 }

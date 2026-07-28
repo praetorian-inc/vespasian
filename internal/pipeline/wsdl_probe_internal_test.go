@@ -74,4 +74,26 @@ func TestBuildWSDLProbeClient_ProxyInsecure(t *testing.T) {
 			t.Error("socks5 is a transparent tunnel; Insecure must never skip verification of the real target")
 		}
 	})
+
+	// QUAL-001: the proxied branch of buildWSDLProbeClient must set the same
+	// per-stage (TLS handshake / response header) timeouts as the non-proxy
+	// branch, rather than falling back to unbounded defaults.
+	t.Run("proxied client carries the per-stage caps", func(t *testing.T) {
+		proxyURL, err := url.Parse("http://127.0.0.1:8080")
+		if err != nil {
+			t.Fatalf("parse proxy URL: %v", err)
+		}
+
+		client := buildWSDLProbeClient(false, httpx.ProxyConfig{URL: proxyURL})
+		tr, ok := client.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("Transport = %T, want *http.Transport", client.Transport)
+		}
+		if tr.ResponseHeaderTimeout != wsdlStageTimeout {
+			t.Errorf("ResponseHeaderTimeout = %v, want %v (QUAL-001)", tr.ResponseHeaderTimeout, wsdlStageTimeout)
+		}
+		if tr.TLSHandshakeTimeout != wsdlStageTimeout {
+			t.Errorf("TLSHandshakeTimeout = %v, want %v", tr.TLSHandshakeTimeout, wsdlStageTimeout)
+		}
+	})
 }
