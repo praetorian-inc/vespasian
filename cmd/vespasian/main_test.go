@@ -1020,6 +1020,46 @@ func TestGRPCInsecureSkipVerify_ReachesOptions(t *testing.T) {
 	require.False(t, (&ScanCmd{GRPCInsecureSkipVerify: false}).scanOptions("rest", nil).GRPCInsecureSkipVerify)
 }
 
+// TestOptions_WarningsAlwaysWiredToStderr pins the CLI wiring of the
+// always-on warnings writer (TEST-001): pipeline.Options.Warnings/
+// ScanOptions.Warnings must be os.Stderr unconditionally, NOT
+// statusWriter(c.Verbose) — the latter would silently restore the exact
+// "cross-origin skips are invisible without --verbose" regression the
+// SEC-BE-001 warning field was introduced to fix (see options()'s and
+// scanOptions()'s doc comments). Verified by mutation: flipping `Warnings:
+// os.Stderr` to `Warnings: statusWriter(c.Verbose)` in main.go survived the
+// full suite before this test existed, because every other test either sets
+// Verbose:true or never inspects Warnings at all.
+func TestOptions_WarningsAlwaysWiredToStderr(t *testing.T) {
+	genOpts := (&GenerateCmd{Verbose: false}).options()
+	require.Equal(t, os.Stderr, genOpts.Warnings,
+		"GenerateCmd.options().Warnings must always be os.Stderr, not gated on --verbose")
+	require.NotEqual(t, statusWriter(false), genOpts.Warnings,
+		"Warnings must not collapse to statusWriter(false) (nil), which would silence the SEC-BE-001 warning")
+
+	scanOpts := (&ScanCmd{CrawlOptions: CrawlOptions{Verbose: false}}).scanOptions("rest", nil)
+	require.Equal(t, os.Stderr, scanOpts.Warnings,
+		"ScanCmd.scanOptions().Warnings must always be os.Stderr, not gated on --verbose")
+	require.NotEqual(t, statusWriter(false), scanOpts.Warnings,
+		"Warnings must not collapse to statusWriter(false) (nil), which would silence the SEC-BE-001 warning")
+}
+
+// TestOptions_TargetURLReachesPipeline pins TEST-002: c.TargetURL must reach
+// pipeline.Options.TargetURL (via GenerateCmd.options()) and
+// pipeline.ScanOptions.TargetURL (via ScanCmd.scanOptions(), sourced from
+// c.URL — see scanOptions's doc comment). Without this assignment,
+// `generate --target-url` silently stops being the documented remedy for
+// skipped cross-origin endpoints (SEC-BE-001).
+func TestOptions_TargetURLReachesPipeline(t *testing.T) {
+	require.Equal(t, "https://api.example.test",
+		(&GenerateCmd{TargetURL: "https://api.example.test"}).options().TargetURL,
+		"GenerateCmd.TargetURL must reach pipeline.Options.TargetURL")
+
+	require.Equal(t, "https://api.example.test",
+		(&ScanCmd{URL: "https://api.example.test"}).scanOptions("rest", nil).TargetURL,
+		"ScanCmd.URL must reach pipeline.ScanOptions.TargetURL")
+}
+
 // TestDangerousAllowPrivate_SameOutputForPublicURLs verifies that allowPrivate=true
 // and allowPrivate=false produce identical specs when all targets are public.
 func TestDangerousAllowPrivate_SameOutputForPublicURLs(t *testing.T) {

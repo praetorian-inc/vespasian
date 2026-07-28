@@ -4021,6 +4021,15 @@ func TestIsPrintableASCIIURL(t *testing.T) {
 		"/api/items?filter[status]=open&q=a|b",
 		"/api/x%20y",
 		"/api/x%2Fy",
+		// TEST-007: printable ASCII but OUTSIDE isAllowedConcatByte's
+		// allow-list (backslash isn't a structural/sub-delim byte that
+		// function admits). Documents the asymmetry this function's doc
+		// comment claims: IsPrintableASCIIURL gates literal bytes with a
+		// direct 0x21-0x7E range check, NOT isAllowedConcatByte, so a byte
+		// isAllowedConcatByte would reject must still be accepted here.
+		// Without this fixture, swapping the 0x21-0x7E predicate for
+		// isAllowedConcatByte survives every existing fixture undetected.
+		`/api/x\y`,
 	}
 	for _, in := range ok {
 		assert.True(t, IsPrintableASCIIURL(in), "must be accepted: %q", in)

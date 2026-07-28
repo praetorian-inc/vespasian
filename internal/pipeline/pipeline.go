@@ -172,11 +172,7 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 			if opts.TargetURL == "" {
 				warnDerivedProbeOrigin(opts.Warnings, targetOrigin)
 			}
-			baseValidator := cfg.URLValidator
-			if baseValidator == nil {
-				baseValidator = probe.ValidateProbeURL
-			}
-			cfg.URLValidator = newCrossOriginValidator(baseValidator, targetOrigin, opts.Warnings)
+			cfg.URLValidator = newCrossOriginValidator(cfg.URLValidator, targetOrigin, opts.Warnings)
 		}
 
 		// Pure grpc-gateway traffic is REST/JSON, so the gRPC classifier never

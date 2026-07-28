@@ -82,6 +82,77 @@ func TestClassifyProbeGenerate_SameOriginCandidateIsProbed(t *testing.T) {
 	assert.Positive(t, atomic.LoadInt32(hits), "same-origin candidate must be probed")
 }
 
+// TestClassifyProbeGenerate_SameOriginLoopbackRejectedWithoutAllowPrivate is
+// the TEST-003 regression test: it is the only test in this file that
+// exercises the gate in its default, shipped configuration (AllowPrivate:
+// false, so baseValidator falls back to probe.ValidateProbeURL at
+// pipeline.go rather than being replaced by the AllowPrivate no-op). Every
+// other test in this file sets AllowPrivate: true, which installs an
+// origin-blind no-op validator BEFORE the gate wraps it — so the gate's
+// same-origin arm (`return base(rawURL)`) and the production-default
+// baseValidator fallback are both completely unpinned by those tests: either
+// could be reduced to `return nil` and the suite would stay green, silently
+// deleting SSRF/private-IP enforcement for every same-origin probe target.
+//
+// The httptest server here is same-origin (TargetURL == its own URL) but
+// resolves to a loopback/private IP, so probe.ValidateProbeURL (ssrf.ValidateURL
+// under the hood) must reject it even though crawl.SameOrigin says yes —
+// proving the same-origin arm truly delegates to the SSRF validator rather
+// than short-circuiting to an unconditional allow. Pairs with
+// TestClassifyProbeGenerate_SameOriginCandidateIsProbed (AllowPrivate: true)
+// as the positive control.
+func TestClassifyProbeGenerate_SameOriginLoopbackRejectedWithoutAllowPrivate(t *testing.T) {
+	target, hits := countingAPIServer(t)
+
+	requests := []crawl.ObservedRequest{apiRequest(target.URL + "/api/v1/users")}
+
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: false,
+		Deduplicate:  true,
+		TargetURL:    target.URL,
+	})
+	require.NoError(t, err)
+
+	assert.Zero(t, atomic.LoadInt32(hits),
+		"a same-origin loopback candidate must still be rejected by the SSRF validator "+
+			"when AllowPrivate is false (the shipped default)")
+}
+
+// TestClassifyProbeGenerate_SameOriginUserinfoCredentialInjectionRejected is
+// the SEC-BE-001 regression test: crawl.SameOrigin compares via
+// u.Hostname(), which excludes userinfo entirely, so a same-origin candidate
+// spelled "http://user:pass@<targethost>/api/x" is judged same-origin by the
+// gate. AllowPrivate is true here specifically to isolate this assertion from
+// the SSRF layer (ssrf.ValidateURL also never inspects userinfo) — proving
+// crawl.ValidateFullURL is what rejects the embedded credentials, not
+// something incidental to SSRF screening. Without this gate, net/http would
+// derive an `Authorization: Basic <base64(user:pass)>` header from
+// req.URL.User and send it to the target on the operator's behalf.
+func TestClassifyProbeGenerate_SameOriginUserinfoCredentialInjectionRejected(t *testing.T) {
+	target, hits := countingAPIServer(t)
+
+	userinfoURL := strings.Replace(target.URL, "://", "://user:pass@", 1) + "/api/v1/x"
+
+	requests := []crawl.ObservedRequest{apiRequest(userinfoURL)}
+
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Deduplicate:  true,
+		TargetURL:    target.URL,
+	})
+	require.NoError(t, err)
+
+	assert.Zero(t, atomic.LoadInt32(hits),
+		"a same-origin candidate carrying userinfo credentials must be rejected by crawl.ValidateFullURL "+
+			"rather than probed with an attacker-derived Authorization: Basic header")
+}
+
 // TestClassifyProbeGenerate_CrossOriginCandidateIsNotProbed pins the negative
 // half of the SEC-BE-001 origin gate AND doubles as the AllowPrivate-ordering
 // regression test: AllowPrivate=true is required here for the loopback
@@ -122,6 +193,41 @@ func TestClassifyProbeGenerate_CrossOriginCandidateIsNotProbed(t *testing.T) {
 		"a warning must be emitted when a cross-origin probe target is skipped")
 	assert.Contains(t, warnings.String(), "AllowCrossOriginProbe",
 		"the warning must name the opt-out field, mirroring jsreplay's AllowCrossOrigin wording style")
+}
+
+// TestClassifyProbeGenerate_CrossOriginRejectWithNilWarnings is the TEST-004
+// regression test: Options.Warnings documents "Pass nil to stay fully quiet
+// (e.g. the SDK)", and pkg/sdk never sets it, yet no test exercised the
+// per-URL cross-origin skip warning's nil-writer path (writeStatus at
+// probe_origin_gate.go). This mirrors
+// TestClassifyProbeGenerate_CrossOriginCandidateIsNotProbed but leaves
+// Warnings nil — the SDK's exact configuration — and gives the cross-origin
+// candidate a non-asset path (not .js) so it actually reaches the validator
+// rather than being filtered out by classify's static-asset exclusion first.
+func TestClassifyProbeGenerate_CrossOriginRejectWithNilWarnings(t *testing.T) {
+	target, targetHits := countingAPIServer(t)
+	attacker, attackerHits := countingAPIServer(t)
+
+	requests := []crawl.ObservedRequest{
+		apiRequest(target.URL + "/api/v1/users"),
+		apiRequest(attacker.URL + "/api/v1/collect"),
+	}
+
+	assert.NotPanics(t, func() {
+		_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+			APIType:      pipeline.APITypeREST,
+			Confidence:   0.5,
+			Probe:        true,
+			AllowPrivate: true,
+			Deduplicate:  true,
+			TargetURL:    target.URL,
+			Warnings:     nil, // the SDK's exact configuration
+		})
+		require.NoError(t, err)
+	}, "the cross-origin reject path must not panic when Warnings is nil")
+
+	assert.Positive(t, atomic.LoadInt32(targetHits), "same-origin candidate must still be probed")
+	assert.Zero(t, atomic.LoadInt32(attackerHits), "cross-origin candidate must NOT be probed even with Warnings nil")
 }
 
 // TestClassifyProbeGenerate_CrossOriginWarningNotGatedByStatus is the direct
@@ -190,6 +296,48 @@ func TestClassifyProbeGenerate_CrossOriginWarningDedupedByOrigin(t *testing.T) {
 		"three candidates on the same rejected origin must produce exactly one skip warning, not three")
 }
 
+// TestClassifyProbeGenerate_CrossOriginWarningNotOverCollapsedAcrossHosts is
+// the TEST-005 regression test: it pins the dedupe map in the "do not
+// over-collapse" direction, which TestClassifyProbeGenerate_
+// CrossOriginWarningDedupedByOrigin (a single attacker host) cannot exercise.
+// Mutating bestEffortOrigin's body to `return ""` makes every rejected URL
+// key identically, collapsing an operator's real multi-host mixed capture
+// (see TestClassifyProbeGenerate_MixedOriginWithoutTargetURLSkipsRealAPI) into
+// a single warning line naming only the first rejected URL — silently hiding
+// every subsequent cross-origin host from the operator. Two DISTINCT
+// cross-origin hosts here must therefore produce two warning lines, each
+// naming its own host.
+func TestClassifyProbeGenerate_CrossOriginWarningNotOverCollapsedAcrossHosts(t *testing.T) {
+	target, _ := countingAPIServer(t)
+	attacker1, attacker1Hits := countingAPIServer(t)
+	attacker2, attacker2Hits := countingAPIServer(t)
+
+	requests := []crawl.ObservedRequest{
+		apiRequest(target.URL + "/api/v1/users"),
+		apiRequest(attacker1.URL + "/api/v1/collect"),
+		apiRequest(attacker2.URL + "/api/v1/exfiltrate"),
+	}
+
+	var warnings bytes.Buffer
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Deduplicate:  true,
+		TargetURL:    target.URL,
+		Warnings:     &warnings,
+	})
+	require.NoError(t, err)
+
+	assert.Zero(t, atomic.LoadInt32(attacker1Hits), "no cross-origin candidate must be probed")
+	assert.Zero(t, atomic.LoadInt32(attacker2Hits), "no cross-origin candidate must be probed")
+	assert.Equal(t, 2, strings.Count(warnings.String(), "skipping cross-origin URL"),
+		"two DISTINCT cross-origin hosts must each produce their own skip warning, not collapse to one")
+	assert.Contains(t, warnings.String(), attacker1.URL, "the first host must be named in a warning")
+	assert.Contains(t, warnings.String(), attacker2.URL, "the second host must be named in a warning")
+}
+
 // TestClassifyProbeGenerate_AllowCrossOriginProbeOptOut proves the internal
 // opt-out field permits cross-origin probing when explicitly set.
 func TestClassifyProbeGenerate_AllowCrossOriginProbeOptOut(t *testing.T) {
@@ -255,27 +403,43 @@ func TestClassifyProbeGenerate_UnresolvableOriginFailsClosed(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	assert.Contains(t, warnings.String(), "skipping cross-origin URL /api/v1/users",
-		"an unresolvable target origin must fail closed and reject every probe candidate")
+	assert.Contains(t, warnings.String(), `skipping cross-origin URL "/api/v1/users"`,
+		"an unresolvable target origin must fail closed and reject every probe candidate; "+
+			"the URL is quoted because SEC-BE-002 runs it through crawl.SanitizeForLog")
 	assert.Contains(t, warnings.String(), "AllowCrossOriginProbe",
 		"the warning must name the opt-out field even when the origin could not be resolved at all")
 	assert.Contains(t, warnings.String(), "no usable origin could be derived",
 		"the one-time derived-origin warning must also fire and explain that no origin could be resolved at all")
 }
 
-// thirdPartyAssetServer returns an httptest server that answers a
-// non-HTML, non-API asset response (e.g. a CDN-hosted analytics script), so
-// its request never satisfies firstHTMLOrigin nor gets classified as an API
-// candidate — it exists purely to occupy the "first request" slot in a
-// mixed-origin capture.
-func thirdPartyAssetServer(t *testing.T) *httptest.Server {
+// thirdPartyAssetServer returns an httptest server used only to mint a
+// second, distinct origin for mixed-origin capture tests (e.g. a CDN hosting
+// a third-party asset) — it exists purely to occupy the "first request" slot
+// in a mixed-origin capture (TEST-006).
+//
+// Its handler is never actually invoked by either call site: both wrap it
+// with apiRequest(cdn.URL + "/analytics.js"), which synthesizes an
+// ObservedRequest carrying its own application/json response record rather
+// than issuing a live HTTP request. The CDN entry is excluded from
+// firstHTMLOrigin/classification not because of anything this handler
+// returns, but because (a) apiRequest's response carries an
+// application/json Content-Type, so firstHTMLOrigin's HTML sniff never
+// matches it, and (b) the ".js" extension on its URL is on
+// pkg/classify/rest.go's static-asset exclusion list, so RESTClassifier
+// never promotes it to an API candidate. hits counts requests that actually
+// reach this handler — expected to stay zero in every caller — so a future
+// change to either exclusion mechanism that turned the CDN entry into a live
+// probe target would be caught here rather than passing silently.
+func thirdPartyAssetServer(t *testing.T) (*httptest.Server, *int32) {
 	t.Helper()
+	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
 		w.Header().Set("Content-Type", "application/javascript")
 		_, _ = w.Write([]byte("// analytics beacon\n"))
 	}))
 	t.Cleanup(srv.Close)
-	return srv
+	return srv, &hits
 }
 
 // TestClassifyProbeGenerate_MixedOriginWithoutTargetURLSkipsRealAPI pins Gap
@@ -291,7 +455,7 @@ func thirdPartyAssetServer(t *testing.T) *httptest.Server {
 // introduces so a future change to ResolveTargetOrigin's fallback order is
 // caught here rather than discovered as a silent regression in the field.
 func TestClassifyProbeGenerate_MixedOriginWithoutTargetURLSkipsRealAPI(t *testing.T) {
-	cdn := thirdPartyAssetServer(t)
+	cdn, cdnHits := thirdPartyAssetServer(t)
 	api, apiHits := countingAPIServer(t)
 
 	// CDN asset first (mimics import ordering, where the capture's first
@@ -316,9 +480,68 @@ func TestClassifyProbeGenerate_MixedOriginWithoutTargetURLSkipsRealAPI(t *testin
 
 	assert.Zero(t, atomic.LoadInt32(apiHits),
 		"without --target-url, the real API host is misresolved as cross-origin relative to the CDN and must be skipped (documents the hazard)")
-	assert.Contains(t, warnings.String(), "skipping cross-origin URL "+api.URL+"/api/v1/accounts")
+	assert.Contains(t, warnings.String(), `skipping cross-origin URL "`+api.URL+`/api/v1/accounts"`,
+		"the URL is quoted because SEC-BE-002 runs it through crawl.SanitizeForLog")
 	assert.Contains(t, warnings.String(), cdn.URL,
 		"the one-time derived-origin warning must name the (wrongly) derived CDN origin so the operator can see why")
+	assert.Zero(t, atomic.LoadInt32(cdnHits),
+		"the CDN server must never actually receive a request (TEST-006): exclusion happens at "+
+			"classification time via apiRequest's JSON content-type and the .js static-asset filter")
+}
+
+// TestClassifyProbeGenerate_DerivedOriginWarningEscapesBidiOverride pins the
+// second half of TEST-008/SEC-BE-002: warnDerivedProbeOrigin must run the
+// DERIVED origin through crawl.SanitizeForLog, not just the per-URL skip
+// warning's rawURL (already pinned by
+// TestClassifyProbeGenerate_MixedOriginWithoutTargetURLSkipsRealAPI's quoted
+// api.URL assertion). Removing that wrap survives every other test in this
+// file because none of them derive an origin containing an escape-worthy
+// byte.
+//
+// The derived origin CAN carry such a byte: crawl.ResolveTargetOrigin's
+// fallback loop feeds the first request's raw URL through originOf, which
+// calls url.Parse then u.Hostname() — net/url rejects literal ASCII control
+// bytes (0x00-0x1F, 0x7F) outright ("invalid control character in URL"), but
+// does NOT reject a bidi override rune (U+202E) in the host, and
+// u.Hostname()/strings.ToLower leave it untouched. So a mixed-origin capture
+// whose first entry's host contains U+202E produces exactly this targetOrigin
+// (verified empirically via net/url before writing this test), mirroring
+// pkg/crawl/jsreplay_test.go's "sanitizeForLog neutralizes control bytes in
+// the origin" subtest for warnDerivedOrigin's identical wrap.
+func TestClassifyProbeGenerate_DerivedOriginWarningEscapesBidiOverride(t *testing.T) {
+	api, apiHits := countingAPIServer(t)
+
+	// bidiHostURL is never dialed: it is excluded from classification by the
+	// same apiRequest(".js" + JSON content-type) mechanism
+	// thirdPartyAssetServer's doc comment explains, and it occupies only the
+	// "first request" slot so crawl.ResolveTargetOrigin's fallback derives its
+	// (unreachable, bidi-bearing) origin instead of api's.
+	const bidiHostURL = "http://evil\u202e.example.test"
+	requests := []crawl.ObservedRequest{
+		apiRequest(bidiHostURL + "/analytics.js"),
+		apiRequest(api.URL + "/api/v1/accounts"),
+	}
+	derivedOrigin := crawl.ResolveTargetOrigin("", requests)
+	require.Contains(t, derivedOrigin, "\u202e",
+		"precondition: the derived origin must carry the raw bidi override byte")
+
+	var warnings bytes.Buffer
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Deduplicate:  true,
+		Warnings:     &warnings,
+	})
+	require.NoError(t, err)
+
+	assert.Zero(t, atomic.LoadInt32(apiHits),
+		"precondition: api must be cross-origin relative to the derived bidi origin, so it's never dialed")
+	assert.NotContains(t, warnings.String(), "\u202e",
+		"the derived-origin warning must escape the bidi override byte, not emit it raw (SEC-BE-002)")
+	assert.Contains(t, warnings.String(), `evil\u202e.example.test`,
+		"the derived-origin warning must still name the (escaped) derived origin so the operator can see why")
 }
 
 // TestClassifyProbeGenerate_DerivedOriginWarningAbsentWhenTargetURLSet is the
@@ -356,7 +579,7 @@ func TestClassifyProbeGenerate_DerivedOriginWarningAbsentWhenTargetURLSet(t *tes
 // recognized as same-origin and probed — the documented remedy for the
 // hazard the previous test pins.
 func TestClassifyProbeGenerate_MixedOriginWithTargetURLProbesRealAPI(t *testing.T) {
-	cdn := thirdPartyAssetServer(t)
+	cdn, cdnHits := thirdPartyAssetServer(t)
 	api, apiHits := countingAPIServer(t)
 
 	requests := []crawl.ObservedRequest{
@@ -376,4 +599,6 @@ func TestClassifyProbeGenerate_MixedOriginWithTargetURLProbesRealAPI(t *testing.
 
 	assert.Positive(t, atomic.LoadInt32(apiHits),
 		"--target-url pinned to the real API host must make its endpoints same-origin and probed")
+	assert.Zero(t, atomic.LoadInt32(cdnHits),
+		"the CDN server must never actually receive a request (TEST-006)")
 }

@@ -775,6 +775,20 @@ func sanitizeForLog(s string) string {
 	return strconv.Quote(s)
 }
 
+// SanitizeForLog is the exported form of sanitizeForLog (SEC-BE-002,
+// LAB-4992): internal/pipeline's probe-stage cross-origin gate warnings
+// (probe_origin_gate.go) print attacker-influenced URLs/origins to the same
+// always-on operator-facing sink this package's own warnings use
+// (warnDerivedOrigin, the js-extract cross-origin skip warning), so they must
+// apply the identical sanitizer rather than growing a second, possibly
+// diverging implementation. The unexported sanitizeForLog remains the single
+// implementation; this is a thin exported entry point for cross-package
+// reuse, mirroring how SameOrigin/ResolveTargetOrigin/IsPrintableASCIIURL are
+// already exported from this file for the same reason.
+func SanitizeForLog(s string) string {
+	return sanitizeForLog(s)
+}
+
 // warnDerivedOrigin emits the interim origin-disclosure mitigation warning (see LAB-4998):
 // when --target-url is unset, the JS-replay origin is derived from the capture
 // rather than explicitly chosen, so this always (not gated on Verbose) surfaces
