@@ -84,12 +84,44 @@ func TestLogClassificationReasons_EmptyReason(t *testing.T) {
 	}
 }
 
+// TestLogClassificationReasons_SwitchArmsRenderExpectedValue pins each arm of
+// logClassificationReasons' path-rendering switch to the EXACT value it should
+// print. Both non-default arms were previously unpinned: replacing arm 1's
+// guard with `case false:` (so paths render as origins) and reducing arm 2 to
+// u.Hostname() (dropping the port) each survived the whole suite, because the
+// only coverage asserted a substring the leaky forms also satisfied.
+func TestLogClassificationReasons_SwitchArmsRenderExpectedValue(t *testing.T) {
+	for _, tc := range []struct {
+		name, rawURL, want string
+	}{
+		// Arm 1: a path is present, so print the path -- NOT the origin.
+		{"path arm prints the path", "https://api.example.com:8443/api/v1/users", "/api/v1/users"},
+		// Arm 2: pathless, so print scheme://host INCLUDING the port, which
+		// u.Hostname() would silently drop.
+		{"host arm keeps the port", "https://api.example.com:8443", "https://api.example.com:8443"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logClassificationReasons(&buf, []classify.ClassifiedRequest{
+				cr("GET", tc.rawURL, "rest", "path-heuristic", 0.6),
+			})
+			if !strings.Contains(buf.String(), tc.want) {
+				t.Errorf("expected rendered value %q, got: %q", tc.want, buf.String())
+			}
+			// Arm 1 must not fall through to the origin form, and arm 2 must
+			// not be reduced to a bare hostname; asserting the complement is
+			// what makes each arm's mutant die.
+			if tc.want == "/api/v1/users" && strings.Contains(buf.String(), "https://api.example.com:8443\t") {
+				t.Errorf("path arm rendered the origin instead of the path: %q", buf.String())
+			}
+		})
+	}
+}
+
 // TestLogClassificationReasons_UnparseablePathFallback verifies that a URL with
-// no parseable path falls back to printing the full URL instead of an empty
-// path field.
+// no parseable path falls back to the origin rather than an empty path field.
 func TestLogClassificationReasons_UnparseablePathFallback(t *testing.T) {
-	// A URL with no path component (Path == "") triggers the fallback to the
-	// full URL string.
+	// A URL with no path component (Path == "") triggers the origin fallback.
 	const rawURL = "https://api.example.com"
 	var buf bytes.Buffer
 	logClassificationReasons(&buf, []classify.ClassifiedRequest{
@@ -140,13 +172,35 @@ func TestLogClassificationReasons_SanitizesTerminalEscapes(t *testing.T) {
 // or "http://user:pass@host?x=1" (query only, still no path). user:pass is
 // synthetic test data, not a real secret.
 func TestLogClassificationReasons_PathlessUserinfoURLNoCredentialLeak(t *testing.T) {
-	var buf bytes.Buffer
-	logClassificationReasons(&buf, []classify.ClassifiedRequest{
-		cr("GET", "http://user:pass@example.com", "rest", "path-heuristic", 0.6),
-	})
-	out := buf.String()
-	if strings.Contains(out, "user:pass") {
-		t.Errorf("credential leaked into Status output: %q", out)
+	// Each URL shape below embeds a synthetic credential (user:pass, RFC 2606
+	// domain) and must NOT have it echoed to Status. They exercise three
+	// distinct arms of logClassificationReasons' switch, and each was verified
+	// to leak before the arm covering it existed:
+	//
+	//   pathless-with-host      -> u.Host arm      (u.Host excludes userinfo)
+	//   scheme-colon / opaque   -> default arm     (url.Parse fills u.Opaque and
+	//                                               leaves u.User NIL, so a
+	//                                               u.User check misses it)
+	//   authority-only userinfo -> default arm     (u.User set, Host+Path empty)
+	//
+	// The last two fell through to printing the raw URL until the default arm
+	// was added; a u.Path-bearing URL is covered by the sibling tests above.
+	for _, raw := range []string{
+		"http://user:pass@example.com",
+		"https:user:pass@example.com/api/x",
+		"http://user:pass@",
+	} {
+		var buf bytes.Buffer
+		logClassificationReasons(&buf, []classify.ClassifiedRequest{
+			cr("GET", raw, "rest", "path-heuristic", 0.6),
+		})
+		out := buf.String()
+		if strings.Contains(out, "user:pass") {
+			t.Errorf("credential leaked into Status output for %q: %q", raw, out)
+		}
+		if strings.Contains(out, "pass@") {
+			t.Errorf("partial credential leaked into Status output for %q: %q", raw, out)
+		}
 	}
 }
 

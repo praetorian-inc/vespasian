@@ -431,12 +431,26 @@ func TestClassifyProbeGenerate_CrossOriginWarningExcludesUserinfoCredentials(t *
 		"the cross-origin skip warning must never echo a percent-encoded re-encoding of the credential either")
 	assert.NotContains(t, warnings.String(), "user@",
 		"the cross-origin skip warning must never echo the username-only portion of the credential either")
-	// Pin the full line, not just a substring: any content appended or
-	// re-encoded onto this line (e.g. a debug "cand=<rawURL>" suffix) must
-	// fail this test, not just the credential-specific checks above.
-	assert.Equal(t, "probe: skipping cross-origin candidates for \""+attacker.URL+"\" (use AllowCrossOriginProbe to allow)\n",
-		warnings.String(),
-		"the warning must contain nothing but the credential-free, quoted origin")
+	// Pin the cross-origin warning LINE, not the whole buffer. Asserting on
+	// warnings.String() coupled this test to every other writer on that sink
+	// (warnDerivedProbeOrigin in particular), so an unrelated wording change
+	// there broke it while a real leak on a DIFFERENT line could still pass.
+	// Selecting our line first keeps the strictness where it belongs: any
+	// content appended or re-encoded onto THIS line (e.g. a debug
+	// "cand=<rawURL>" suffix) still fails, which the credential-specific
+	// NotContains assertions above cannot catch on their own -- they remain
+	// only because they name the exact leak shapes in the failure message.
+	var gotLine string
+	for _, line := range strings.Split(warnings.String(), "\n") {
+		if strings.Contains(line, "skipping cross-origin candidates") {
+			gotLine = line
+			break
+		}
+	}
+	require.NotEmpty(t, gotLine, "expected a cross-origin skip warning; got: %q", warnings.String())
+	assert.Equal(t, "probe: skipping cross-origin candidates for \""+attacker.URL+"\" (use AllowCrossOriginProbe to allow)",
+		gotLine,
+		"the warning line must contain nothing but the credential-free, quoted origin")
 }
 
 // TestClassifyProbeGenerate_AllowCrossOriginProbeOptOut proves the internal

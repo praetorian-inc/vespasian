@@ -71,11 +71,28 @@ func logClassificationReasons(w io.Writer, classified []classify.ClassifiedReque
 			case u.Path != "":
 				path = u.Path
 			case u.Host != "":
-				// Pathless (or query-only) URL: fall back to the origin, not
-				// the raw URL. u.Host excludes userinfo (u.User holds it
-				// separately), so this never echoes embedded HTTP Basic
+				// Pathless (or query-only) URL: fall back to the origin rather
+				// than the raw URL. u.Host excludes userinfo (u.User holds it
+				// separately), so this arm cannot echo embedded HTTP Basic
 				// credentials the way printing c.URL directly would.
 				path = u.Scheme + "://" + u.Host
+			default:
+				// Neither a path nor a host survived parsing, so `path` still
+				// holds the raw c.URL. Two shapes reach here WITH credentials
+				// embedded, so this arm is required, not defensive:
+				//   - scheme-colon form, e.g. "https:user:pass@h/api/x" --
+				//     url.Parse puts everything in u.Opaque and leaves u.User
+				//     nil, so a u.User check would not catch it;
+				//   - authority-only userinfo, e.g. "http://user:pass@" --
+				//     u.User is set but both Host and Path are empty.
+				// Strip at the LAST '@', mirroring the split Go's own
+				// parseAuthority performs, so no userinfo survives for any
+				// remaining shape. Confined to this arm deliberately: applying
+				// it to the u.Path arm would mangle a legitimate path that
+				// contains '@' (e.g. /api/users/a@b.com).
+				if i := strings.LastIndex(path, "@"); i >= 0 {
+					path = path[i+1:]
+				}
 			}
 		}
 		reason := c.Reason
