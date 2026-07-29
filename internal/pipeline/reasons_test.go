@@ -92,21 +92,37 @@ func TestLogClassificationReasons_EmptyReason(t *testing.T) {
 // only coverage asserted a substring the leaky forms also satisfied.
 func TestLogClassificationReasons_SwitchArmsRenderExpectedValue(t *testing.T) {
 	for _, tc := range []struct {
-		name, rawURL, want string
+		name, rawURL, want, mustNotContain string
 	}{
 		// Arm 1: a path is present, so print the path -- NOT the origin.
-		{"path arm prints the path", "https://api.example.com:8443/api/v1/users", "/api/v1/users"},
-		// Arm 2: pathless, so print scheme://host INCLUDING the port, which
-		// u.Hostname() would silently drop.
-		{"host arm keeps the port", "https://api.example.com:8443", "https://api.example.com:8443"},
+		// mustNotContain pins that it does NOT fall through to the origin form.
+		{
+			"path arm prints the path",
+			"https://api.example.com:8443/api/v1/users", "/api/v1/users",
+			"https://api.example.com:8443/api/v1/users",
+		},
+		// Arm 2: pathless, so print scheme://host INCLUDING the port (which
+		// u.Hostname() would silently drop) and WITHOUT the query. The
+		// query-drop is what makes deleting the arm visible: without it the
+		// value falls through to redactUserinfo, which returns the URL with
+		// its query intact, and a bare Contains(want) still passed (mutant M9).
+		{
+			"host arm keeps the port and drops the query",
+			"https://api.example.com:8443?x=1", "https://api.example.com:8443",
+			"?x=1",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var buf bytes.Buffer
 			logClassificationReasons(&buf, []classify.ClassifiedRequest{
 				cr("GET", tc.rawURL, "rest", "path-heuristic", 0.6),
 			})
-			if !strings.Contains(buf.String(), tc.want) {
-				t.Errorf("expected rendered value %q, got: %q", tc.want, buf.String())
+			out := buf.String()
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("expected rendered value %q, got: %q", tc.want, out)
+			}
+			if strings.Contains(out, tc.mustNotContain) {
+				t.Errorf("arm rendered %q, which it must not: %q", tc.mustNotContain, out)
 			}
 		})
 	}
@@ -158,13 +174,6 @@ func TestLogClassificationReasons_SanitizesTerminalEscapes(t *testing.T) {
 	}
 }
 
-// TestLogClassificationReasons_PathlessUserinfoURLNoCredentialLeak verifies
-// that a pathless (or query-only) URL carrying embedded HTTP Basic userinfo
-// never has that credential printed to the -v Status output. logPath's
-// fallback previously used the full raw URL whenever u.Path == "", which
-// echoes userinfo verbatim for a URL like "http://user:pass@host" (no path)
-// or "http://user:pass@host?x=1" (query only, still no path). user:pass is
-// synthetic test data, not a real secret.
 // TestLogClassificationReasons_StripsUserinfoExactly pins the LOGIC of the
 // last-'@' strip, not merely its presence. Three mutants survived when only
 // "does not contain user:pass" was asserted: LastIndex->Index (strips at the
@@ -192,12 +201,33 @@ func TestLogClassificationReasons_StripsUserinfoExactly(t *testing.T) {
 		},
 		{
 			// Invalid port -> url.Parse ERROR -> switch skipped entirely.
-			name: "parse-error branch strips at the last @",
+			// redactUserinfo is authority-scoped, so the ORIGIN survives; only
+			// the userinfo is removed.
+			name: "parse-error branch strips userinfo and keeps the origin",
 			// user:pass is synthetic; ":8o8" is an intentionally invalid port so
 			// url.Parse fails. The fixture asserts non-disclosure.
 			rawURL:         "http://user:pass@host:8o8/pkg.Svc/Method",
-			want:           "host:8o8/pkg.Svc/Method",
+			want:           "http://host:8o8/pkg.Svc/Method",
 			mustNotContain: "user:pass",
+		},
+		{
+			// REGRESSION GUARD: a '@' in the PATH must never be mistaken for a
+			// userinfo delimiter. A last-'@'-anywhere strip rendered this as
+			// "/api/v1/users", concealing the attacker-controlled origin so it
+			// read as a local path -- worse for an operator than the leak it was
+			// closing. The whole URL must survive untouched.
+			name:           "a @ in the path does not conceal the origin",
+			rawURL:         "http://evil.attacker.example:8o8/x@/api/v1/users",
+			want:           "http://evil.attacker.example:8o8/x@/api/v1/users",
+			mustNotContain: "zz-never-present-zz",
+		},
+		{
+			// Two '@' inside the authority: strip to the LAST, keep the origin.
+			// u:p is synthetic; example.test is reserved.
+			name:           "multiple @ within the authority",
+			rawURL:         "http://u:p@a@host.example.test:8o8/p",
+			want:           "http://host.example.test:8o8/p",
+			mustNotContain: "u:p@",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -214,8 +244,10 @@ func TestLogClassificationReasons_StripsUserinfoExactly(t *testing.T) {
 			if strings.Contains(out, tc.mustNotContain) {
 				t.Errorf("unexpected %q in output: %q", tc.mustNotContain, out)
 			}
-			// Kills path[i+1:]->path[i:] (a retained leading '@').
-			if strings.Contains(out, "@"+tc.want) {
+			// Kills path[i+1:]->path[i:] (a retained '@' before the remainder).
+			// Skipped where want legitimately contains its own '@' (the
+			// path-@ regression case above).
+			if !strings.Contains(tc.want, "@") && strings.Contains(out, "@"+tc.want) {
 				t.Errorf("strip kept the '@' separator: %q", out)
 			}
 			if strings.Contains(out, "user:pass") {
@@ -225,6 +257,13 @@ func TestLogClassificationReasons_StripsUserinfoExactly(t *testing.T) {
 	}
 }
 
+// TestLogClassificationReasons_PathlessUserinfoURLNoCredentialLeak verifies
+// that a pathless (or query-only) URL carrying embedded HTTP Basic userinfo
+// never has that credential printed to the -v Status output. logPath's
+// fallback previously used the full raw URL whenever u.Path == "", which
+// echoes userinfo verbatim for a URL like "http://user:pass@host" (no path)
+// or "http://user:pass@host?x=1" (query only, still no path). user:pass is
+// synthetic test data, not a real secret.
 func TestLogClassificationReasons_PathlessUserinfoURLNoCredentialLeak(t *testing.T) {
 	// Each URL shape below embeds a synthetic credential (user:pass, RFC 2606
 	// domain) and must NOT have it echoed to Status. They exercise three

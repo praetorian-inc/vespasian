@@ -71,28 +71,20 @@ func logClassificationReasons(w io.Writer, classified []classify.ClassifiedReque
 			case u.Path != "":
 				path = u.Path
 			case u.Host != "":
-				// Pathless (or query-only) URL: fall back to the origin rather
-				// than the raw URL. u.Host excludes userinfo (u.User holds it
-				// separately), so this arm cannot echo embedded HTTP Basic
-				// credentials the way printing c.URL directly would.
+				// Pathless (or query-only): print the origin, not the raw URL.
+				// u.Host excludes userinfo (u.User holds it separately).
 				path = u.Scheme + "://" + u.Host
 			default:
-				// Neither Path nor Host survived parsing, so `path` still holds
-				// the raw c.URL, which can embed credentials. Strip at the LAST
-				// '@' (the split Go's own parseAuthority performs). Confined to
-				// this arm so a legitimate path containing '@' is not mangled.
-				// Reachable shapes are enumerated in
-				// TestLogClassificationReasons_StripsUserinfoExactly.
-				if i := strings.LastIndex(path, "@"); i >= 0 {
-					path = path[i+1:]
-				}
+				// Parsed, but neither Path nor Host survived (opaque forms), so
+				// `path` still holds the raw c.URL.
+				path = redactUserinfo(path)
 			}
-		} else if i := strings.LastIndex(path, "@"); i >= 0 {
-			// url.Parse failed, so the switch never ran. Reachable with
-			// credentials: GRPCClassifier fails open on a malformed URL
-			// (pkg/classify/grpc.go) and still classifies on content-type
-			// alone. Same strip as the default arm.
-			path = path[i+1:]
+		} else {
+			// url.Parse failed, so the switch never ran and `path` still holds
+			// the raw c.URL. Reachable with credentials: GRPCClassifier fails
+			// open on a malformed URL (pkg/classify/grpc.go) and still
+			// classifies on content-type alone.
+			path = redactUserinfo(path)
 		}
 		reason := c.Reason
 		if reason == "" {
@@ -109,4 +101,43 @@ func logClassificationReasons(w io.Writer, classified []classify.ClassifiedReque
 	for _, ln := range lines {
 		writeStatus(w, "%s\n", ln)
 	}
+}
+
+// redactUserinfo removes an embedded userinfo component from raw while
+// preserving everything else, for the paths where url.Parse could not give us a
+// structured URL to work from (a parse error, or an opaque form that yields
+// neither Host nor Path).
+//
+// The search is confined to the AUTHORITY -- after "//" and before the next "/"
+// -- because that is the only place RFC 3986 allows userinfo. An earlier version
+// stripped at the last '@' anywhere in the string, which silently discarded the
+// origin whenever a '@' appeared in the path: "http://evil.example:8o8/x@/api/v1/users"
+// rendered as "/api/v1/users", concealing an attacker-controlled host and making
+// it read as a local path. Preserving the origin matters more to an operator
+// than trimming the path.
+//
+// With no "//" at all (opaque / scheme-colon form, e.g. "weird:u:p@h/api/x")
+// there is no authority to scope to, so the last-'@' strip applies to the whole
+// remainder -- that shape has no origin to conceal.
+func redactUserinfo(raw string) string {
+	start := strings.Index(raw, "//")
+	if start < 0 {
+		if i := strings.LastIndex(raw, "@"); i >= 0 {
+			return raw[i+1:]
+		}
+		return raw
+	}
+	start += 2
+	end := strings.IndexByte(raw[start:], '/')
+	if end < 0 {
+		end = len(raw)
+	} else {
+		end += start
+	}
+	authority := raw[start:end]
+	i := strings.LastIndex(authority, "@")
+	if i < 0 {
+		return raw
+	}
+	return raw[:start] + authority[i+1:] + raw[end:]
 }
