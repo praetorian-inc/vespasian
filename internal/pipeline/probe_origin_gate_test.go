@@ -121,16 +121,6 @@ func TestClassifyProbeGenerate_SameOriginLoopbackRejectedWithoutAllowPrivate(t *
 			"when AllowPrivate is false (the shipped default)")
 }
 
-// TestClassifyProbeGenerate_SameOriginUserinfoCredentialInjectionRejected is
-// the SEC-BE-001 regression test: crawl.SameOrigin compares via
-// u.Hostname(), which excludes userinfo entirely, so a same-origin candidate
-// spelled "http://user:pass@<targethost>/api/x" is judged same-origin by the
-// gate. AllowPrivate is true here specifically to isolate this assertion from
-// the SSRF layer (ssrf.ValidateURL also never inspects userinfo) — proving
-// crawl.ValidateFullURL is what rejects the embedded credentials, not
-// something incidental to SSRF screening. Without this gate, net/http would
-// derive an `Authorization: Basic <base64(user:pass)>` header from
-// req.URL.User and send it to the target on the operator's behalf.
 // TestClassifyProbeGenerate_UserinfoRejectedEvenWithCrossOriginProbeAllowed pins
 // the UNCONDITIONAL half of SEC-BE-001: crawl.ValidateFullURL's parse-time
 // userinfo/scheme gate must survive AllowCrossOriginProbe: true. The two gates are
@@ -168,6 +158,16 @@ func TestClassifyProbeGenerate_UserinfoRejectedEvenWithCrossOriginProbeAllowed(t
 			"gate (crawl.ValidateFullURL) must still reject this candidate")
 }
 
+// TestClassifyProbeGenerate_SameOriginUserinfoCredentialInjectionRejected is
+// the SEC-BE-001 regression test: crawl.SameOrigin compares via
+// u.Hostname(), which excludes userinfo entirely, so a same-origin candidate
+// spelled "http://user:pass@<targethost>/api/x" is judged same-origin by the
+// gate. AllowPrivate is true here specifically to isolate this assertion from
+// the SSRF layer (ssrf.ValidateURL also never inspects userinfo) — proving
+// crawl.ValidateFullURL is what rejects the embedded credentials, not
+// something incidental to SSRF screening. Without this gate, net/http would
+// derive an `Authorization: Basic <base64(user:pass)>` header from
+// req.URL.User and send it to the target on the operator's behalf.
 func TestClassifyProbeGenerate_SameOriginUserinfoCredentialInjectionRejected(t *testing.T) {
 	target, hits := countingAPIServer(t)
 
@@ -190,6 +190,38 @@ func TestClassifyProbeGenerate_SameOriginUserinfoCredentialInjectionRejected(t *
 	assert.Zero(t, atomic.LoadInt32(hits),
 		"a same-origin candidate carrying userinfo credentials must be rejected by crawl.ValidateFullURL "+
 			"rather than probed with an attacker-derived Authorization: Basic header")
+}
+
+// TestClassifyProbeGenerate_UserinfoRejectionWarnsAndSanitizesURL is the
+// SEC-BE-002 regression test: newFullURLValidator's parse-time rejection used
+// to produce no operator-visible output at all (every consumer of the
+// returned error discards it into slog.DebugContext, and no slog handler is
+// configured anywhere in this repo), so a blocked userinfo-smuggling
+// candidate left no trace. This pins the fix: the rejection must reach the
+// always-on Warnings sink, and the URL it names must be run through
+// crawl.SanitizeForLog (mandatory per an earlier finding on this PR about
+// unsanitized warning output) rather than interpolated raw.
+func TestClassifyProbeGenerate_UserinfoRejectionWarnsAndSanitizesURL(t *testing.T) {
+	target, hits := countingAPIServer(t)
+
+	userinfoURL := strings.Replace(target.URL, "://", "://user:pass@", 1) + "/api/v1/x"
+	requests := []crawl.ObservedRequest{apiRequest(userinfoURL)}
+
+	var warnings bytes.Buffer
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Deduplicate:  true,
+		TargetURL:    target.URL,
+		Warnings:     &warnings,
+	})
+	require.NoError(t, err)
+
+	assert.Zero(t, atomic.LoadInt32(hits), "credential-injection candidate must not be probed")
+	assert.Contains(t, warnings.String(), crawl.SanitizeForLog(userinfoURL),
+		"the parse-time rejection must warn on Warnings, naming the URL run through crawl.SanitizeForLog")
 }
 
 // TestClassifyProbeGenerate_CrossOriginCandidateIsNotProbed pins the negative
@@ -449,6 +481,49 @@ func TestClassifyProbeGenerate_UnresolvableOriginFailsClosed(t *testing.T) {
 		"the warning must name the opt-out field even when the origin could not be resolved at all")
 	assert.Contains(t, warnings.String(), "no usable origin could be derived",
 		"the one-time derived-origin warning must also fire and explain that no origin could be resolved at all")
+}
+
+// TestClassifyProbeGenerate_CrossOriginGateRunsBeforeParseTimeGate is the
+// TEST-003 regression test: it pins the newFullURLValidator /
+// newCrossOriginValidator composition order directly and on purpose, rather
+// than incidentally through TestClassifyProbeGenerate_UnresolvableOriginFailsClosed
+// (whose relative-URL fixture exercises the same ordering only as a side
+// effect of forcing crawl.ResolveTargetOrigin to return ""). The candidate
+// here is BOTH cross-origin (a different host than TargetURL) AND carries
+// userinfo (which newFullURLValidator's parse-time gate would ALSO reject),
+// so which warning appears proves which gate ran first. With the composition
+// pipeline.go documents (origin gate outermost), crawl.SameOrigin rejects it
+// before ValidateFullURL ever runs, so only the cross-origin warning fires.
+// If the two wraps were swapped, the parse-time gate would reject it first
+// and the cross-origin warning would never appear.
+func TestClassifyProbeGenerate_CrossOriginGateRunsBeforeParseTimeGate(t *testing.T) {
+	target, _ := countingAPIServer(t)
+	attacker, attackerHits := countingAPIServer(t)
+
+	attackerUserinfoURL := strings.Replace(attacker.URL, "://", "://user:pass@", 1) + "/api/v1/collect"
+	requests := []crawl.ObservedRequest{
+		apiRequest(target.URL + "/api/v1/users"),
+		apiRequest(attackerUserinfoURL),
+	}
+
+	var warnings bytes.Buffer
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Deduplicate:  true,
+		TargetURL:    target.URL,
+		Warnings:     &warnings,
+	})
+	require.NoError(t, err)
+
+	assert.Zero(t, atomic.LoadInt32(attackerHits), "cross-origin candidate must not be probed")
+	assert.Contains(t, warnings.String(), "skipping cross-origin URL",
+		"the origin gate must run first (outermost): a candidate that is both cross-origin and "+
+			"userinfo-bearing must be rejected there, proving the composition order pipeline.go documents")
+	assert.NotContains(t, warnings.String(), "failed parse-time validation",
+		"the parse-time gate must never run for this candidate — the origin gate rejects it first")
 }
 
 // thirdPartyAssetServer returns an httptest server used only to mint a

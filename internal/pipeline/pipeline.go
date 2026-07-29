@@ -177,17 +177,37 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 		// Applied BEFORE that branch, not after, so it ends up INSIDE the
 		// cross-origin wrapper rather than outside it. Ordering is
 		// operator-visible, not cosmetic: wrapped the other way round, a
-		// candidate ValidateFullURL rejects (e.g. a hostless/relative URL like
-		// "/api/v1/users") is refused before the origin gate ever runs, so the
-		// "skipping cross-origin URL" warning is silently never emitted. The
-		// origin gate must stay the outermost layer to keep that diagnostic.
+		// same-origin candidate carrying embedded userinfo credentials (e.g.
+		// "https://user:pass@<targethost>/api/x") would be rejected by
+		// ValidateFullURL before the cross-origin SameOrigin check ever ran
+		// for it, so the origin gate would never get a chance to evaluate a
+		// candidate that IS same-origin (SEC-BE-001 review finding). A
+		// hostless/relative candidate like "/api/v1/users" is NOT the case
+		// this ordering protects: it is cross-origin either way
+		// (crawl.SameOrigin never treats a hostless URL as matching), and
+		// bestEffortOrigin("") == "" for it regardless of wrap order, so it
+		// always shares one warnedOrigins[""] dedupe slot with every other
+		// unparseable candidate -- a warning-noise concern, not an ordering
+		// one. The origin gate must stay the outermost layer so it is never
+		// skipped for a same-origin userinfo candidate.
+		//
+		// Second, stronger reason the order is load-bearing: this wrap is what
+		// resolves a nil cfg.URLValidator (the default AllowPrivate=false
+		// path) to probe.ValidateProbeURL, and newCrossOriginValidator no
+		// longer carries its own nil check -- that branch was provably dead
+		// GIVEN this order and was removed (TEST-001 review finding, following
+		// 851a41f). So newCrossOriginValidator now relies on receiving an
+		// already-non-nil base. Reversing these two wraps therefore panics on
+		// the first probed candidate rather than degrading quietly, which is
+		// the failure mode we want: a future reordering cannot silently drop
+		// SSRF enforcement or the cross-origin warning.
 		//
 		// Placed at the pipeline level (not composed into
 		// probe.ValidateProbeURL) because that function is also the exported
 		// default for pkg/probe, which pkg/sdk consumes directly; changing its
 		// behavior would affect every caller of pkg/probe -- a low-severity
 		// finding does not warrant that blast radius.
-		cfg.URLValidator = newFullURLValidator(cfg.URLValidator)
+		cfg.URLValidator = newFullURLValidator(cfg.URLValidator, opts.Warnings)
 
 		if !opts.AllowCrossOriginProbe {
 			targetOrigin := crawl.ResolveTargetOrigin(opts.TargetURL, requests)

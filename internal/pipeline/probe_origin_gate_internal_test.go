@@ -64,21 +64,24 @@ func TestNewCrossOriginValidator_SameOriginAllowsWhenBaseAllows(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// TestNewCrossOriginValidator_NilCfgValidatorFallsBackToProbeValidateProbeURL
-// is the white-box regression test for the TEST-003 finding's second half:
-// pipeline.go's `baseValidator = probe.ValidateProbeURL` fallback (moved into
-// this function so it is directly testable — see newCrossOriginValidator's
-// doc comment for why a black-box network test cannot distinguish this
-// mutation from cfg.Dialer's own redundant SSRF check). A nil cfgValidator
-// (the default, AllowPrivate=false configuration) must fall back to the REAL
-// probe.ValidateProbeURL — not an unconditional allow — so a same-origin
-// candidate whose host is a private/loopback IP is still rejected. If that
-// fallback were replaced with a no-op (mutation (b)), this call would return
-// nil instead of an error.
-func TestNewCrossOriginValidator_NilCfgValidatorFallsBackToProbeValidateProbeURL(t *testing.T) {
-	validate := newCrossOriginValidator(nil, "http://127.0.0.1:9", nil)
+// TestNewFullURLValidator_NilBaseFallsBackToProbeValidateProbeURL is the
+// white-box regression test for the TEST-001 finding: newFullURLValidator is
+// now the FIRST wrapper applied at the pipeline.go call site, so in the
+// shipped default configuration (AllowPrivate=false, so probe.DefaultConfig()
+// leaves cfg.URLValidator nil) it is THIS function's nil-base fallback -- not
+// newCrossOriginValidator's, which no longer has one (see its doc comment) --
+// that installs the real SSRF check. A nil base must fall back to the REAL
+// probe.ValidateProbeURL -- not an unconditional allow -- so a candidate
+// whose host is a private/loopback IP is still rejected. If that fallback
+// were replaced with a no-op, this call would return nil instead of an
+// error. This test replaces
+// TestNewCrossOriginValidator_NilCfgValidatorFallsBackToProbeValidateProbeURL,
+// which pinned the identical fallback on newCrossOriginValidator after it had
+// become dead code from the production call site.
+func TestNewFullURLValidator_NilBaseFallsBackToProbeValidateProbeURL(t *testing.T) {
+	validate := newFullURLValidator(nil, nil)
 
 	err := validate("http://127.0.0.1:9/api/v1/x")
-	require.Error(t, err, "a nil cfgValidator must fall back to probe.ValidateProbeURL, "+
-		"which rejects a same-origin loopback candidate")
+	require.Error(t, err, "a nil base must fall back to probe.ValidateProbeURL, "+
+		"which rejects a loopback candidate")
 }

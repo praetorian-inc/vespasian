@@ -32,19 +32,16 @@ import (
 // complexity" finding) so the gate is a small, independently testable
 // function taking its inputs as plain parameters — no interface or struct.
 //
-// cfgValidator is cfg.URLValidator as it stands when this is called: nil in
-// the default (AllowPrivate=false) path, or the AllowPrivate no-op override.
-// A nil cfgValidator falls back to probe.ValidateProbeURL here (moved in from
-// ClassifyProbeGenerate, TEST-003 review finding) specifically so that
-// fallback selection is exercised by a direct unit test: a black-box test
-// driving this through a real network probe cannot distinguish "the fallback
-// was skipped" from "the fallback ran but was overridden" for a loopback
-// target, because probe.Config's Dialer independently re-checks the same
-// private-IP predicate at connect time (defense-in-depth) regardless of what
-// URLValidator decided — so a same-origin loopback candidate is rejected
-// either way and the two mutations are behaviorally invisible over the wire.
-// Keeping the fallback here, in the same function this package already unit
-// tests directly, closes that gap without adding an interface or DI seam.
+// base must be non-nil. At the pipeline.go call site it always is: base is
+// whatever newFullURLValidator returned from the prior wrap, and that
+// function's own nil-base fallback guarantees it never returns nil. This
+// function used to carry an identical nil-fallback of its own (added when it
+// was the innermost wrap and could receive a nil cfg.URLValidator directly);
+// the restructure that moved the parse-time gate (newFullURLValidator) to
+// wrap first made that fallback dead code from the production call site
+// (TEST-001 review finding: the fallback's test had drifted onto the dead
+// copy instead of the live one), so it was removed here rather than kept
+// unreachable.
 //
 // targetOrigin == "" is deliberately NOT special-cased: crawl.SameOrigin
 // already returns false whenever either side's origin can't be resolved
@@ -78,11 +75,7 @@ import (
 // NOT added now (KISS — guarding a race that cannot currently occur is
 // complexity for no present benefit), so this comment is the tripwire for
 // whoever parallelizes RunStrategies next (SEC-BE-003).
-func newCrossOriginValidator(cfgValidator func(string) error, targetOrigin string, warnings io.Writer) func(string) error {
-	base := cfgValidator
-	if base == nil {
-		base = probe.ValidateProbeURL
-	}
+func newCrossOriginValidator(base func(string) error, targetOrigin string, warnings io.Writer) func(string) error {
 	warnedOrigins := make(map[string]bool)
 	return func(rawURL string) error {
 		if crawl.SameOrigin(rawURL, targetOrigin) {
@@ -109,8 +102,8 @@ func newCrossOriginValidator(cfgValidator func(string) error, targetOrigin strin
 // to the caller that actually issues the request, so rawURL is what gets
 // probed either way.
 //
-// Called unconditionally at the pipeline.go call site -- after and outside the
-// `if !opts.AllowCrossOriginProbe` branch -- rather than composed into
+// Called unconditionally at the pipeline.go call site -- before and outside
+// the `if !opts.AllowCrossOriginProbe` branch -- rather than composed into
 // newCrossOriginValidator's same-origin arm (where it lived before), because
 // AllowCrossOriginProbe disabling the cross-origin gate must not also disable
 // this independent parse-time gate (SEC-BE-001 review finding: they were
@@ -120,17 +113,39 @@ func newCrossOriginValidator(cfgValidator func(string) error, targetOrigin strin
 // a low-severity finding that does not justify changing that shared default's
 // behavior for every caller.
 //
-// A nil base falls back to probe.ValidateProbeURL, mirroring
-// newCrossOriginValidator's identical nil-fallback: base is nil whenever
-// AllowCrossOriginProbe is true and AllowPrivate is false, since
-// probe.DefaultConfig() leaves Config.URLValidator nil in that combination
-// and no other branch in ClassifyProbeGenerate sets it.
-func newFullURLValidator(base func(string) error) func(string) error {
+// A nil base falls back to probe.ValidateProbeURL. At the pipeline.go call
+// site, base is cfg.URLValidator as it stands there: nil iff
+// !opts.AllowPrivate (probe.DefaultConfig() leaves Config.URLValidator nil in
+// that case; the AllowPrivate branch above installs a no-op override
+// otherwise) -- independent of AllowCrossOriginProbe, since this call happens
+// before that flag's branch is even evaluated (QUAL-001 review finding: the
+// prior version of this comment named AllowCrossOriginProbe as a factor here,
+// which it is not).
+//
+// warnings receives a deduped, always-on line (SEC-BE-002 review finding)
+// when the parse-time gate rejects a candidate, mirroring
+// newCrossOriginValidator's cross-origin skip warning: without it, the
+// highest-value rejection this gate performs -- stopping a same-origin
+// candidate smuggling attacker-chosen HTTP Basic credentials via embedded
+// userinfo -- produced no operator-visible signal, since every consumer of
+// the returned error discards it into slog.DebugContext and no slog handler
+// is configured anywhere in this repo. Deduped by bestEffortOrigin, same as
+// the cross-origin arm, so a bundle spelling many userinfo variants of one
+// host can't flood the warnings sink.
+func newFullURLValidator(base func(string) error, warnings io.Writer) func(string) error {
 	if base == nil {
 		base = probe.ValidateProbeURL
 	}
+	warnedOrigins := make(map[string]bool)
 	return func(rawURL string) error {
 		if _, ok := crawl.ValidateFullURL(rawURL); !ok {
+			origin := bestEffortOrigin(rawURL)
+			if !warnedOrigins[origin] {
+				warnedOrigins[origin] = true
+				writeStatus(warnings,
+					"probe: skipping URL %s (failed parse-time validation: embedded credentials or unsupported scheme)\n",
+					crawl.SanitizeForLog(rawURL))
+			}
 			return fmt.Errorf("probe: URL rejected by parse-time validation: %s", rawURL)
 		}
 		return base(rawURL)
