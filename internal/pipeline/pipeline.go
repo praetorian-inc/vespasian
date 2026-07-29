@@ -167,9 +167,41 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 		// only unscoped egress path in the pipeline (crawl is scope-guarded,
 		// JS-replay is same-origin by default). See newCrossOriginValidator
 		// and warnDerivedProbeOrigin for the gate/warning construction.
+		// Unconditional parse-time gate (SEC-BE-001): crawl.ValidateFullURL
+		// rejects userinfo/unsafe-scheme candidates. Applied OUTSIDE the
+		// AllowCrossOriginProbe branch below so this independent concern is
+		// never disabled together with the cross-origin gate -- previously it
+		// lived only inside newCrossOriginValidator's same-origin arm, so
+		// AllowCrossOriginProbe:true skipped it entirely.
+		//
+		// Applied BEFORE that branch, not after, so it ends up INSIDE the
+		// cross-origin wrapper rather than outside it. Ordering is
+		// operator-visible, not cosmetic: wrapped the other way round, a
+		// candidate ValidateFullURL rejects (e.g. a hostless/relative URL like
+		// "/api/v1/users") is refused before the origin gate ever runs, so the
+		// "skipping cross-origin URL" warning is silently never emitted. The
+		// origin gate must stay the outermost layer to keep that diagnostic.
+		//
+		// Placed at the pipeline level (not composed into
+		// probe.ValidateProbeURL) because that function is also the exported
+		// default for pkg/probe, which pkg/sdk consumes directly; changing its
+		// behavior would affect every caller of pkg/probe -- a low-severity
+		// finding does not warrant that blast radius.
+		cfg.URLValidator = newFullURLValidator(cfg.URLValidator)
+
 		if !opts.AllowCrossOriginProbe {
 			targetOrigin := crawl.ResolveTargetOrigin(opts.TargetURL, requests)
-			if opts.TargetURL == "" {
+			// Key the warning on whether opts.TargetURL actually pinned
+			// targetOrigin (SEC-BE-002), not merely on opts.TargetURL being
+			// non-empty: an unparseable or hostless TargetURL (e.g. "not a
+			// url", "://") is non-empty but unusable, so
+			// crawl.ResolveTargetOrigin silently falls through to deriving
+			// the origin from the capture -- the exact case this warning
+			// exists to surface. crawl.SameOrigin("", targetOrigin) is
+			// always false (it requires a non-empty left-hand origin), so
+			// an empty TargetURL still warns too; this one predicate covers
+			// both "not set" and "set but unusable".
+			if !crawl.SameOrigin(opts.TargetURL, targetOrigin) {
 				warnDerivedProbeOrigin(opts.Warnings, targetOrigin)
 			}
 			cfg.URLValidator = newCrossOriginValidator(cfg.URLValidator, targetOrigin, opts.Warnings)

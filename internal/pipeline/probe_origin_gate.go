@@ -55,24 +55,29 @@ import (
 // 851a41f resolved for the concat guard's dead terms; removed here for the
 // same reason (code-quality review, redundant-term finding).
 //
-// The same-origin arm additionally runs crawl.ValidateFullURL before
-// delegating to base (SEC-BE-001 review finding): crawl.SameOrigin compares
+// The parse-time userinfo/scheme gate (SEC-BE-001: crawl.SameOrigin compares
 // via u.Hostname(), which excludes userinfo entirely, so
 // "https://user:pass@<targethost>/api/x" is judged same-origin, and neither
 // base (SSRF: scheme + resolved IPs only) nor anything upstream of this point
-// inspects u.User — net/http would then derive an `Authorization: Basic`
-// header from the attacker-chosen userinfo on the outbound probe request.
-// ValidateFullURL is the same parse-time gate the jsstatic synthesis choke
-// point and JS-replay's addPath already apply to exactly this sink; chaining
-// it here closes it for the probe stage too, for every producer (not just
-// jsstatic). Only its boolean is used — its normalized/cleaned URL string is
-// discarded because probe.Config.URLValidator's signature (func(string)
-// error) has no channel to feed a rewritten URL back to the caller that
-// actually issues the request, so rawURL is what gets probed either way.
+// inspects u.User) is applied by newFullURLValidator, NOT here — it wraps
+// whatever this function returns from the pipeline.go call site, unconditional
+// on AllowCrossOriginProbe, so it is never skipped together with the
+// cross-origin check this function performs. See newFullURLValidator's doc
+// comment for why it lives at that call site instead of inside this
+// function's same-origin arm.
 //
 // Per-URL skip warnings are deduped by rawURL's origin (not path), so a
 // capture with many cross-origin candidates on one attacker host emits a
 // single warning line instead of one per URL.
+//
+// warnedOrigins is an unsynchronized plain map, safe only because
+// probe.RunStrategies (the sole caller of the validator this returns) invokes
+// probe strategies sequentially today. If that ever becomes concurrent, every
+// call into the closure returned here would need external synchronization
+// (e.g. a mutex around the map) to avoid a data race; a mutex is deliberately
+// NOT added now (KISS — guarding a race that cannot currently occur is
+// complexity for no present benefit), so this comment is the tripwire for
+// whoever parallelizes RunStrategies next (SEC-BE-003).
 func newCrossOriginValidator(cfgValidator func(string) error, targetOrigin string, warnings io.Writer) func(string) error {
 	base := cfgValidator
 	if base == nil {
@@ -81,9 +86,6 @@ func newCrossOriginValidator(cfgValidator func(string) error, targetOrigin strin
 	warnedOrigins := make(map[string]bool)
 	return func(rawURL string) error {
 		if crawl.SameOrigin(rawURL, targetOrigin) {
-			if _, ok := crawl.ValidateFullURL(rawURL); !ok {
-				return fmt.Errorf("probe: URL rejected by parse-time validation: %s", rawURL)
-			}
 			return base(rawURL)
 		}
 		origin := bestEffortOrigin(rawURL)
@@ -94,6 +96,44 @@ func newCrossOriginValidator(cfgValidator func(string) error, targetOrigin strin
 				crawl.SanitizeForLog(rawURL))
 		}
 		return fmt.Errorf("probe: cross-origin URL rejected: %s", rawURL)
+	}
+}
+
+// newFullURLValidator wraps base with crawl.ValidateFullURL (SEC-BE-001):
+// rawURL is rejected unless it passes that parse-time userinfo/scheme gate,
+// the same one JS-replay's addPath and jsstatic's synthesis choke point
+// (specSafeURL) already apply to this sink. Only ValidateFullURL's boolean is
+// used; see newCrossOriginValidator's (former) identical note -- its
+// normalized/cleaned URL string is discarded because probe.Config.URLValidator's
+// signature (func(string) error) has no channel to feed a rewritten URL back
+// to the caller that actually issues the request, so rawURL is what gets
+// probed either way.
+//
+// Called unconditionally at the pipeline.go call site -- after and outside the
+// `if !opts.AllowCrossOriginProbe` branch -- rather than composed into
+// newCrossOriginValidator's same-origin arm (where it lived before), because
+// AllowCrossOriginProbe disabling the cross-origin gate must not also disable
+// this independent parse-time gate (SEC-BE-001 review finding: they were
+// previously coupled, so AllowCrossOriginProbe:true silently dropped both).
+// Also not composed into probe.ValidateProbeURL itself: that function is the
+// exported default for pkg/probe, which pkg/sdk consumes directly, and this is
+// a low-severity finding that does not justify changing that shared default's
+// behavior for every caller.
+//
+// A nil base falls back to probe.ValidateProbeURL, mirroring
+// newCrossOriginValidator's identical nil-fallback: base is nil whenever
+// AllowCrossOriginProbe is true and AllowPrivate is false, since
+// probe.DefaultConfig() leaves Config.URLValidator nil in that combination
+// and no other branch in ClassifyProbeGenerate sets it.
+func newFullURLValidator(base func(string) error) func(string) error {
+	if base == nil {
+		base = probe.ValidateProbeURL
+	}
+	return func(rawURL string) error {
+		if _, ok := crawl.ValidateFullURL(rawURL); !ok {
+			return fmt.Errorf("probe: URL rejected by parse-time validation: %s", rawURL)
+		}
+		return base(rawURL)
 	}
 }
 

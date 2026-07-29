@@ -45,9 +45,16 @@ func TestNewCrossOriginValidator_SameOriginDelegatesToBase(t *testing.T) {
 	assert.Same(t, sentinel, err, "the same-origin arm must return exactly base's error, proving it delegates rather than short-circuiting")
 }
 
-// TestNewCrossOriginValidator_SameOriginAllowsWhenBaseAllows is the positive
-// companion: when base has no objection, the same-origin arm must not
-// introduce a rejection of its own.
+// TestNewCrossOriginValidator_SameOriginAllowsWhenBaseAllows is a cheap,
+// white-box positive control: when base has no objection, the same-origin arm
+// must not introduce a rejection of its own. It has NO independent kill of its
+// own beyond what TestClassifyProbeGenerate_SameOriginCandidateIsProbed
+// (probe_origin_gate_test.go) already covers black-box, end-to-end, through
+// the real ClassifyProbeGenerate call site (TEST-001 review finding) --
+// mutating the same-origin arm to always return an error would fail both.
+// Kept (rather than deleted) because it isolates the same-origin arm from
+// probe.RunStrategies/network entirely, making a future failure here cheaper
+// to diagnose than tracing back through the black-box test.
 func TestNewCrossOriginValidator_SameOriginAllowsWhenBaseAllows(t *testing.T) {
 	base := func(string) error { return nil }
 

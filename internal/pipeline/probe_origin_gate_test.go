@@ -131,6 +131,43 @@ func TestClassifyProbeGenerate_SameOriginLoopbackRejectedWithoutAllowPrivate(t *
 // something incidental to SSRF screening. Without this gate, net/http would
 // derive an `Authorization: Basic <base64(user:pass)>` header from
 // req.URL.User and send it to the target on the operator's behalf.
+// TestClassifyProbeGenerate_UserinfoRejectedEvenWithCrossOriginProbeAllowed pins
+// the UNCONDITIONAL half of SEC-BE-001: crawl.ValidateFullURL's parse-time
+// userinfo/scheme gate must survive AllowCrossOriginProbe: true. The two gates are
+// independent concerns — the origin gate decides WHERE a probe may go, the
+// parse-time gate decides whether the URL is safe to issue at all — and they were
+// previously coupled, with ValidateFullURL living inside newCrossOriginValidator's
+// same-origin arm so the opt-out silently disabled both.
+//
+// Verified by mutation: moving `cfg.URLValidator = newFullURLValidator(...)` back
+// inside the `if !opts.AllowCrossOriginProbe` branch in pipeline.go leaves every
+// other test in the repository green, so without this test the exact defect
+// SEC-BE-001 was raised about could be reintroduced undetected. The sibling test
+// below covers the same rejection in the default (opt-out off) configuration.
+//
+// user:pass is synthetic test data, not a real secret; the fixture asserts REJECTION.
+func TestClassifyProbeGenerate_UserinfoRejectedEvenWithCrossOriginProbeAllowed(t *testing.T) {
+	target, hits := countingAPIServer(t)
+
+	userinfoURL := strings.Replace(target.URL, "://", "://user:pass@", 1) + "/api/v1/x"
+	requests := []crawl.ObservedRequest{apiRequest(userinfoURL)}
+
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:               pipeline.APITypeREST,
+		Confidence:            0.5,
+		Probe:                 true,
+		AllowPrivate:          true,
+		Deduplicate:           true,
+		TargetURL:             target.URL,
+		AllowCrossOriginProbe: true, // origin gate OFF; parse-time gate must remain ON
+	})
+	require.NoError(t, err)
+
+	assert.Zero(t, atomic.LoadInt32(hits),
+		"AllowCrossOriginProbe disables only the cross-origin gate; the parse-time userinfo "+
+			"gate (crawl.ValidateFullURL) must still reject this candidate")
+}
+
 func TestClassifyProbeGenerate_SameOriginUserinfoCredentialInjectionRejected(t *testing.T) {
 	target, hits := countingAPIServer(t)
 
@@ -603,4 +640,56 @@ func TestClassifyProbeGenerate_MixedOriginWithTargetURLProbesRealAPI(t *testing.
 		"--target-url pinned to the real API host must make its endpoints same-origin and probed")
 	assert.Zero(t, atomic.LoadInt32(cdnHits),
 		"the CDN server must never actually receive a request (TEST-006)")
+}
+
+// TestClassifyProbeGenerate_UnusableTargetURLStillWarns is the SEC-BE-002
+// regression test. Before the fix, the derived-origin warning was keyed on
+// `opts.TargetURL == ""` alone, so a non-empty but UNUSABLE --target-url
+// (unparseable, or parseable with no host) silently fell through
+// crawl.ResolveTargetOrigin's fallback chain to an origin derived from the
+// capture -- exactly the case the warning exists to surface -- without ever
+// firing it: the operator would see endpoints skipped with no signal that
+// --target-url had not, in fact, taken effect.
+//
+// Reuses the CDN-first / real-API-second shape from
+// TestClassifyProbeGenerate_MixedOriginWithoutTargetURLSkipsRealAPI: an
+// unusable TargetURL ("not a url", no scheme, no host) makes
+// crawl.ResolveTargetOrigin fall back to the CDN's origin exactly as an EMPTY
+// TargetURL would, so the real API host is (wrongly) treated as
+// cross-origin and skipped -- and the fix must still emit the derived-origin
+// warning in this case, not just the opts.TargetURL == "" case.
+//
+// The companion "a usable TargetURL must not warn" case is already covered by
+// TestClassifyProbeGenerate_DerivedOriginWarningAbsentWhenTargetURLSet; not
+// duplicated here.
+func TestClassifyProbeGenerate_UnusableTargetURLStillWarns(t *testing.T) {
+	cdn, cdnHits := thirdPartyAssetServer(t)
+	api, apiHits := countingAPIServer(t)
+
+	requests := []crawl.ObservedRequest{
+		apiRequest(cdn.URL + "/analytics.js"),
+		apiRequest(api.URL + "/api/v1/accounts"),
+	}
+	require.Equal(t, "", crawl.ResolveTargetOrigin("not a url", nil),
+		"precondition: \"not a url\" must not itself resolve to a usable origin")
+
+	var warnings bytes.Buffer
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Deduplicate:  true,
+		TargetURL:    "not a url",
+		Warnings:     &warnings,
+	})
+	require.NoError(t, err)
+
+	assert.Zero(t, atomic.LoadInt32(apiHits),
+		"an unusable --target-url must not pin the real API host as same-origin; "+
+			"ResolveTargetOrigin falls back to the CDN's origin exactly as it would for an empty TargetURL")
+	assert.Zero(t, atomic.LoadInt32(cdnHits))
+	assert.Contains(t, warnings.String(), "probe-stage cross-origin gate (SEC-BE-001) derived origin",
+		"a non-empty but unusable --target-url must still trigger the derived-origin warning, "+
+			"not just an empty one")
 }
