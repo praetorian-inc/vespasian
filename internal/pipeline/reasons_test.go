@@ -183,14 +183,18 @@ func TestLogClassificationReasons_StripsUserinfoExactly(t *testing.T) {
 		{
 			// Opaque form: url.Parse fills u.Opaque, leaves Host/Path empty and
 			// u.User NIL -> default arm. Two '@' so first-vs-last differ.
-			name:           "default arm strips at the last @",
+			name: "default arm strips at the last @",
+			// user:pass is synthetic; final.example.com is an RFC 2606 reserved
+			// domain. The fixture asserts the credential is NOT printed.
 			rawURL:         "weird:user:pass@first@final.example.com/api/x",
 			want:           "final.example.com/api/x",
 			mustNotContain: "first@",
 		},
 		{
 			// Invalid port -> url.Parse ERROR -> switch skipped entirely.
-			name:           "parse-error branch strips at the last @",
+			name: "parse-error branch strips at the last @",
+			// user:pass is synthetic; ":8o8" is an intentionally invalid port so
+			// url.Parse fails. The fixture asserts non-disclosure.
 			rawURL:         "http://user:pass@host:8o8/pkg.Svc/Method",
 			want:           "host:8o8/pkg.Svc/Method",
 			mustNotContain: "user:pass",

@@ -3812,6 +3812,9 @@ func TestIsAbsoluteHTTPURL(t *testing.T) {
 		"HTTP://example.com/api/x",
 		"HTTPS://example.com/api/x",
 		"HtTpS://example.com/api/x",
+		// u:p is synthetic; example.com is an RFC 2606 reserved domain. Present
+		// only to prove IsAbsoluteHTTPURL ignores userinfo when deciding
+		// absoluteness; no credential is used or sent.
 		"https://u:p@example.com/api/x", // absolute regardless of userinfo
 	}
 	for _, in := range absolute {
