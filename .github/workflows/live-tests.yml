@@ -50,6 +50,13 @@ jobs:
       - name: Run install-chrome self-test
         run: bash test/install-chrome-selftest.sh
 
+      # Teardown / orphan-PID / port-exhaustion regressions (LAB-2893). Needs
+      # no Go, Node or Chrome — it spawns lightweight stand-ins — so it belongs
+      # in this un-gated job rather than the full live suite. Previously it ran
+      # in no job at all despite its header claiming otherwise.
+      - name: Run setup-live-targets self-test
+        run: bash test/setup-live-targets_test.sh
+
   # Gate: run by default; skip PR runs only when 'skip-live-tests' label is present.
   # Push-to-main and workflow_dispatch always run.
   check-label:

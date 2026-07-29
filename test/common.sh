@@ -47,6 +47,11 @@ CHROME_CANDIDATES=(
 )
 
 # Probe a candidate for actual runnability. --version is fast and needs no X/DBus.
+#
+# Note this EXECUTES whatever the ambient PATH resolves for the bare-name
+# candidates, and install-chrome.sh calls it while running under sudo. That is
+# accepted: anyone who can place a binary earlier on root's PATH already has
+# the privilege the probe would grant, so it crosses no trust boundary.
 chrome_runnable() {
     local t=""
     if command -v timeout >/dev/null 2>&1; then

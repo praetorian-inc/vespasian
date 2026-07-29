@@ -441,10 +441,10 @@ source <(sed -n '/^targets_need_config()/,/^}/p' "$RUNNER")
 
 # Fidelity sentinel, matching the one guarding the run_tests_guidance
 # extraction above. Without it a broken/empty sed range leaves
-# targets_need_config UNDEFINED, `if targets_need_config ...` returns 127, the
-# else-branch runs, and every assertion below reports PASS while testing
-# nothing. Verified: with the extraction sabotaged, the offline row passes
-# vacuously. Assert the function exists before asserting what it does.
+# targets_need_config UNDEFINED and every call returns 127 — which the
+# inverted-polarity offline row below reads as success, so it passes
+# VACUOUSLY while the remaining rows fail confusingly. Verified by sabotaging
+# the range. Assert the function exists before asserting what it does.
 if declare -F targets_need_config >/dev/null; then
     pass "targets_need_config sourced from run-live-tests.sh"
 else
@@ -478,6 +478,18 @@ else
     fail "targets_need_config: unknown target wrongly reported as config-free"
 fi
 
+# A comma-split that word-split an UNQUOTED expansion would also GLOB, so a
+# list containing * would expand against the cwd before comparison. Run from a
+# directory holding a file named after a real offline target: if the split
+# globs, "*" becomes "import-burp" and this wrongly reports config-free.
+globdir="$TMPDIR_T/globdir"
+mkdir -p "$globdir" && : > "$globdir/import-burp"
+if (cd "$globdir" && targets_need_config "*"); then
+    pass "targets_need_config: a glob is not expanded (stays unknown, fails closed)"
+else
+    fail "targets_need_config: '*' was glob-expanded against the cwd"
+fi
+
 # Behavioral: a real (non-dry-run) offline selection must get PAST config
 # loading. Asserted as the absence of the config error rather than a specific
 # exit code, because how far the run then gets legitimately differs by
@@ -496,6 +508,16 @@ if [[ "$real_offline" == *"Config file not found"* ]]; then
     fail "real offline run demanded a config: $(printf '%s' "$real_offline" | head -3)"
 else
     pass "real offline run (--targets import-empty) proceeds without a config file"
+fi
+
+# The check above is negative-only, so ANY unrelated early failure would satisfy
+# it. Pair it with a positive marker proving the run actually got as far as the
+# post-config stage: either the binary check (CI, where this job runs before
+# setup-go) or the target dispatch itself (locally, where bin/vespasian exists).
+if [[ "$real_offline" == *"vespasian binary not found"* || "$real_offline" == *"import-empty"* ]]; then
+    pass "real offline run reached the post-config stage (binary check or target dispatch)"
+else
+    fail "real offline run failed before reaching post-config: $(printf '%s' "$real_offline" | head -3)"
 fi
 
 echo ""
@@ -549,6 +571,11 @@ printf '%s\n' "REST_API_PORT=8990" "VESPASIAN=/tmp/evil" "TARGETS_SETUP=" > "$al
 allowlist_out=$(
     source "$SCRIPT_DIR/common.sh"
     source <(sed -n '/^load_config()/,/^}/p' "$RUNNER")
+    # Same fidelity sentinel as the two extractions above: a broken sed range
+    # would leave load_config undefined, and the assertions below — which look
+    # for a *warning* in the output — would then read an empty result as "no
+    # disallowed key applied" and pass without exercising the allowlist at all.
+    declare -F load_config >/dev/null || echo "SENTINEL_LOAD_CONFIG_MISSING"
     VESPASIAN="__sentinel__"
     REST_API_PORT="__unset__"
     CONFIG_FILE="$allowlist_cfg"
@@ -556,6 +583,12 @@ allowlist_out=$(
     echo "RESULT_VESPASIAN=$VESPASIAN"
     echo "RESULT_REST_API_PORT=$REST_API_PORT"
 ) || true
+
+if printf '%s\n' "$allowlist_out" | grep -q "SENTINEL_LOAD_CONFIG_MISSING"; then
+    fail "load_config was not sourced (extraction broken/empty) — assertions below are vacuous"
+else
+    pass "load_config sourced from run-live-tests.sh"
+fi
 
 if printf '%s\n' "$allowlist_out" | grep -q "Skipping unexpected config key: VESPASIAN"; then
     pass "load_config: disallowed key VESPASIAN skipped with warning"

@@ -95,10 +95,13 @@ resolve_arch() {
 }
 
 usage() {
-    # Slice the header comment block out of this file. The selftest pins a
-    # sentinel from the first AND last line of this range so an edit that
-    # shifts the header fails a test instead of silently truncating --help.
-    sed -n '3,46p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    # Print the leading comment block, delimiter-driven: skip the shebang, emit
+    # every consecutive `#` line, stop at the first line that is not a comment.
+    # A hardcoded line range would silently truncate --help the moment the
+    # header grew or shrank.
+    awk 'NR==1 && /^#!/ { next }
+         /^#/            { sub(/^# ?/, ""); print; next }
+                         { exit }' "${BASH_SOURCE[0]}"
 }
 
 parse_args() {
@@ -200,15 +203,24 @@ cleanup_apt_wiring() {
 # repo_add_once is already false. Pre-seeding is cleaner than adding-then-
 # deleting: the source is never created in the first place.
 suppress_permanent_repo() {
-    local f=/etc/default/google-chrome
+    # Overridable purely so install-chrome-selftest.sh can exercise the symlink
+    # guard and the rewrite branches against a fixture path. Production callers
+    # never set it.
+    local f="${CHROME_DEFAULTS_FILE:-/etc/default/google-chrome}"
     # An unexpected symlink here would redirect a root-privileged write to a
     # target of the planter's choosing; fail loudly rather than write through.
+    #
+    # Only this path is guarded: TMP_KEYRING and TMP_LIST live in
+    # /usr/share/keyrings and /etc/apt/sources.list.d, which are root-owned and
+    # root-writable only, so planting a symlink there already requires the
+    # privilege the write would grant. /etc/default is the same in a stock
+    # image — the guard is defence in depth for images that loosen it.
     if [ -L "$f" ]; then
         log_fail "${f} is a symlink — refusing to write through it."
         return 1
     fi
     # No -m on install -d: an existing /etc/default keeps whatever mode it has.
-    $SUDO install -d /etc/default
+    $SUDO install -d "$(dirname "$f")"
     if [ ! -f "$f" ]; then
         printf 'repo_add_once=false\n' | $SUDO tee "$f" >/dev/null
     elif ! grep -q '^repo_add_once=' "$f" 2>/dev/null; then
@@ -220,6 +232,14 @@ suppress_permanent_repo() {
 
 remove_phone_home() {
     $SUDO rm -f "${PHONE_HOME_PATHS[@]}"
+}
+
+# in_container reports whether this looks like a throwaway image, which is the
+# only place it is safe to wipe the apt cache — doing that on a developer's own
+# machine destroys whole-system apt index state they never consented to lose.
+# Both probes are overridable so the selftest can drive each arm.
+in_container() {
+    [ -f "${DOCKERENV_PATH:-/.dockerenv}" ] || [ -n "${REMOTE_CONTAINERS:-}" ]
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -255,8 +275,13 @@ main() {
     # shellcheck disable=SC2064  # tmpdir is expanded now on purpose
     trap "rm -rf '${tmpdir}'; cleanup_apt_wiring" EXIT
 
-    suppress_permanent_repo
+    # Trust check FIRST: install_pinned_key aborts on a fingerprint mismatch, so
+    # ordering it ahead of suppress_permanent_repo means a run that never earns
+    # trust also never mutates /etc/default. Suppression is only required before
+    # `apt-get install` (it is the package postinst that re-adds the repo), so
+    # nothing is lost by deferring it.
     install_pinned_key "$tmpdir"
+    suppress_permanent_repo
 
     log_info "Installing google-chrome-stable via apt (signature-verified)"
     export DEBIAN_FRONTEND=noninteractive
@@ -266,10 +291,7 @@ main() {
     cleanup_apt_wiring
     remove_phone_home
 
-    # Only wipe the apt cache in a throwaway image. Doing it unconditionally
-    # destroys whole-system apt index state on the developer machines this
-    # script's header invites people to run it on.
-    if [ -f /.dockerenv ] || [ -n "${REMOTE_CONTAINERS:-}" ]; then
+    if in_container; then
         $SUDO rm -rf /var/lib/apt/lists/*
     else
         log_info "Not in a container — leaving /var/lib/apt/lists intact."

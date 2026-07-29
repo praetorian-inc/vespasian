@@ -306,6 +306,46 @@ assert_gate "case i: the same target WITH --skip-start is non-fatal" \
 assert_gate "case j: no-arg check_prerequisites defaults to the strict gate" \
     FAIL "$(run_prereqs_with_stub_only)"
 
+# ── Case k: browser_required's mapping itself ──────────────────
+result=$(
+    (
+        # shellcheck source=setup-live-targets.sh
+        source "${SETUP_SCRIPT}"
+        set +e
+        browser_required "grpc-server"; echo "grpc=$?"
+        browser_required "rest-api"; echo "rest=$?"
+        browser_required "grpc-server,concat-spa"; echo "mixed=$?"
+        browser_required "totally-unknown-target"; echo "unknown=$?"
+    )
+)
+assert_eq "case k: grpc-server alone needs no browser" "grpc=1" "$(echo "${result}" | sed -n '1p')"
+assert_eq "case k: rest-api needs a browser" "rest=0" "$(echo "${result}" | sed -n '2p')"
+assert_eq "case k: a mixed list needs a browser" "mixed=0" "$(echo "${result}" | sed -n '3p')"
+# Deliberately fail-OPEN, unlike targets_need_config's fail-closed default: an
+# unknown name here only relaxes a warning, and main()'s build dispatch rejects
+# the typo with "Unknown target" + exit 1 before anything is provisioned. Pinned
+# so the asymmetry with its sibling is a recorded decision, not an accident.
+assert_eq "case k: an unknown target does not force the browser gate (fails open)" \
+    "unknown=1" "$(echo "${result}" | sed -n '4p')"
+
+# A comma-splitting bug that word-split an UNQUOTED expansion would also glob,
+# so a list containing * would expand against the cwd before being compared.
+# Run from a directory that contains a file literally named like a browser
+# target: if the split globs, "*" becomes "rest-api" and this returns 0.
+glob_rc=$(
+    (
+        # shellcheck source=setup-live-targets.sh
+        source "${SETUP_SCRIPT}"
+        mkdir -p "${FIXTURE_DIR}/globdir" && : > "${FIXTURE_DIR}/globdir/rest-api"
+        cd "${FIXTURE_DIR}/globdir" || exit 9
+        set +e
+        browser_required "*"
+        printf '%s\n' "$?"
+    )
+)
+assert_eq "case k: a glob in the target list is not expanded (stays unknown)" \
+    "1" "${glob_rc}"
+
 # ── Cases l-m: the rc==1 arm (NO browser at all) ───────────────
 # Cases g-j all pin CHROME_CANDIDATES to the snap stub, which only exercises
 # rc==2 ("present but not runnable"). A fresh devcontainer before
@@ -331,28 +371,6 @@ else
     echo "FAIL: case m: absent-browser hint is missing install-chrome.sh or still suggests chromium-browser"
     fail_count=$((fail_count + 1))
 fi
-
-# Case k: browser_required's mapping itself.
-result=$(
-    (
-        # shellcheck source=setup-live-targets.sh
-        source "${SETUP_SCRIPT}"
-        set +e
-        browser_required "grpc-server"; echo "grpc=$?"
-        browser_required "rest-api"; echo "rest=$?"
-        browser_required "grpc-server,concat-spa"; echo "mixed=$?"
-        browser_required "totally-unknown-target"; echo "unknown=$?"
-    )
-)
-assert_eq "case k: grpc-server alone needs no browser" "grpc=1" "$(echo "${result}" | sed -n '1p')"
-assert_eq "case k: rest-api needs a browser" "rest=0" "$(echo "${result}" | sed -n '2p')"
-assert_eq "case k: a mixed list needs a browser" "mixed=0" "$(echo "${result}" | sed -n '3p')"
-# Deliberately fail-OPEN, unlike targets_need_config's fail-closed default: an
-# unknown name here only relaxes a warning, and main()'s build dispatch rejects
-# the typo with "Unknown target" + exit 1 before anything is provisioned. Pinned
-# so the asymmetry with its sibling is a recorded decision, not an accident.
-assert_eq "case k: an unknown target does not force the browser gate (fails open)" \
-    "unknown=1" "$(echo "${result}" | sed -n '4p')"
 
 # ── Summary ─────────────────────────────────────────────────────
 echo ""
