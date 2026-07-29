@@ -339,7 +339,7 @@ Open a GitHub issue and include:
 
 Captures and generated specs routinely contain hostnames, tokens, cookies, and request bodies from real targets. Redact before attaching anything to a public issue.
 
-Use issues for questions too, until dedicated discussion channels exist.
+Questions belong in issues too — [`SUPPORT.md`](SUPPORT.md) covers where to ask what, what to include, and what response to expect.
 
 ## Security disclosures
 
