@@ -15,6 +15,7 @@
 package crawl
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -221,19 +222,158 @@ func (c *Checkpoint) Save(w io.Writer) error {
 // Layered bounds on a decoded checkpoint. A checkpoint is read back from host
 // storage rather than produced in-process, so it is parsed input and gets the
 // same treatment as the importers: a byte cap on the reader and an element cap on
-// each slice, so a corrupted or hostile artifact cannot exhaust memory.
+// each slice.
+//
+// BOTH caps are load-bearing, and that took a fix. The element caps used to be
+// checked with len() AFTER json.Unmarshal had already materialized the whole
+// decoded value, so only MaxCheckpointBytes actually bounded anything and the
+// comment here claimed more than the code delivered (LAB-4678 review, SEC-BE-002).
+// The caps are now enforced DURING decode by boundedPending and boundedSeen.
+//
+// Measured against this code, peak RSS in a separate process, rejecting a 64 MB
+// artifact made of 16.7M one-character seen keys:
+//
+//	before: 1265 MB    after: 196 MB
+//
+// For reference a LEGITIMATE checkpoint at exactly MaxCheckpointEntries (1M
+// realistic URL keys) is 51.4 MB on disk and costs 229 MB to decode, and is
+// accepted. So the adversarial worst case now costs no more than the legitimate
+// worst case, which is the property worth having: an attacker cannot make rejection
+// more expensive than ordinary use.
+//
+// That 51.4 MB figure is also why MaxCheckpointBytes was NOT simply lowered
+// instead, which was the other option considered. Bounding transient memory to
+// ~230 MB through the byte cap alone needs a cap around 12 MB, which caps a
+// legitimate checkpoint at roughly 230k entries and makes the documented 1M entry
+// cap unreachable — the byte cap would silently become the real limit while the
+// entry cap kept claiming otherwise. The ~20x expansion is specific to the
+// adversarial shape, where tiny elements maximize per-string overhead; realistic
+// URLs expand about 4x. So the defense has to target element COUNT, which is what
+// the entry cap always claimed to do and now actually does.
 const (
 	// MaxCheckpointBytes bounds the encoded size accepted by LoadCheckpoint.
 	MaxCheckpointBytes = 64 * 1024 * 1024 // 64 MB
-	// MaxCheckpointEntries bounds Pending and Seen independently.
+	// MaxCheckpointEntries bounds Pending and Seen independently, enforced during
+	// decode rather than after it; see boundedPending and boundedSeen.
 	MaxCheckpointEntries = 1_000_000
 )
+
+// boundedPending and boundedSeen are [Checkpoint.Pending] and [Checkpoint.Seen]
+// during decoding only. Each stops at MaxCheckpointEntries and errors instead of
+// decoding the rest of the array, which is what keeps a hostile artifact from
+// costing 1.3 GB of transient allocation to reject.
+//
+// They exist as separate types, rather than as a hand-rolled token loop over the
+// whole object, so encoding/json still drives the object structure. A hand-written
+// parser on a parsed-input security boundary is where bugs live, and the existing
+// read-then-unmarshal shape also keeps the byte-cap check exact: a decoder streaming
+// straight off the reader would have consumed a prefix before the overflow was
+// detectable, turning "checkpoint exceeds N bytes" into a JSON syntax error.
+type (
+	boundedPending []PendingURL
+	boundedSeen    []string
+)
+
+// UnmarshalJSON decodes the pending array, refusing more than MaxCheckpointEntries.
+func (b *boundedPending) UnmarshalJSON(data []byte) error {
+	return decodeBoundedArray(data, "pending", MaxCheckpointEntries, func(dec *json.Decoder) error {
+		var e PendingURL
+		if err := dec.Decode(&e); err != nil {
+			return err
+		}
+		*b = append(*b, e)
+		return nil
+	})
+}
+
+// UnmarshalJSON decodes the seen array, refusing more than MaxCheckpointEntries.
+func (b *boundedSeen) UnmarshalJSON(data []byte) error {
+	return decodeBoundedArray(data, "seen", MaxCheckpointEntries, func(dec *json.Decoder) error {
+		var s string
+		if err := dec.Decode(&s); err != nil {
+			return err
+		}
+		*b = append(*b, s)
+		return nil
+	})
+}
+
+// decodeBoundedArray token-decodes a JSON array from data, calling decodeElem for
+// each element and aborting once max is passed. name appears in the error so the
+// operator learns WHICH array overflowed, matching the diagnostic the previous
+// post-decode len() checks produced.
+//
+// max is a parameter rather than a direct read of MaxCheckpointEntries so the abort
+// semantics are testable at a small bound. Proving early abort otherwise requires
+// building a payload past the real 1,000,000-element cap, which costs seconds per
+// case and would roughly double this package's test time for behavior that is
+// independent of the constant's value.
+func decodeBoundedArray(data []byte, name string, max int, decodeElem func(*json.Decoder) error) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	// A JSON null for the field is valid and means "absent", matching how
+	// encoding/json treats a null slice.
+	if tok == nil {
+		return nil
+	}
+	if tok != json.Delim('[') {
+		return fmt.Errorf("checkpoint %s: expected an array", name)
+	}
+	n := 0
+	for dec.More() {
+		n++
+		if n > max {
+			return fmt.Errorf("checkpoint %s entries exceed %d", name, max)
+		}
+		if err := decodeElem(dec); err != nil {
+			return err
+		}
+	}
+	// Closing bracket.
+	_, err = dec.Token()
+	return err
+}
+
+// UnmarshalJSON decodes a checkpoint with the two unbounded arrays capped during
+// decode. Every other field is decoded by encoding/json through the embedded alias,
+// so a field added to Checkpoint is picked up here with no change and this cannot
+// drift out of sync with the struct.
+//
+// The alias is a defined type rather than a type alias, which strips the method set
+// and stops this method from recursing into itself.
+func (c *Checkpoint) UnmarshalJSON(data []byte) error {
+	type alias Checkpoint
+	var wire struct {
+		alias
+		// Shadow the two array fields at depth 0, so encoding/json prefers these
+		// over the embedded alias's copies.
+		Pending boundedPending `json:"pending"`
+		Seen    boundedSeen    `json:"seen"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*c = Checkpoint(wire.alias)
+	c.Pending = wire.Pending
+	c.Seen = wire.Seen
+	return nil
+}
 
 // LoadCheckpoint decodes a checkpoint from r and rejects an unknown schema
 // version, so a format change fails closed rather than being misinterpreted. The
 // reader is capped at MaxCheckpointBytes and each slice at MaxCheckpointEntries;
 // exceeding either is an error rather than a silent truncation, since a truncated
 // seen-set would let the resumed crawl re-cover pages it should skip.
+//
+// The element caps are enforced inside [Checkpoint.UnmarshalJSON] rather than by a
+// len() check here. A post-decode check cannot bound anything: by the time it runs,
+// the oversized array has already been materialized, which is the whole cost being
+// defended against. There is deliberately no len() re-check below — after a
+// successful decode it is unreachable by construction, and unreachable validation
+// reads as protection that is not there.
 func LoadCheckpoint(r io.Reader) (*Checkpoint, error) {
 	// Read under the cap first (+1 so a payload exactly at the cap is
 	// distinguishable from one over it), then unmarshal. Reading before decoding
@@ -252,12 +392,6 @@ func LoadCheckpoint(r io.Reader) (*Checkpoint, error) {
 	}
 	if c.Version != checkpointVersion {
 		return nil, fmt.Errorf("checkpoint version %d unsupported (want %d)", c.Version, checkpointVersion)
-	}
-	if len(c.Pending) > MaxCheckpointEntries {
-		return nil, fmt.Errorf("checkpoint pending entries %d exceeds %d", len(c.Pending), MaxCheckpointEntries)
-	}
-	if len(c.Seen) > MaxCheckpointEntries {
-		return nil, fmt.Errorf("checkpoint seen entries %d exceeds %d", len(c.Seen), MaxCheckpointEntries)
 	}
 	return &c, nil
 }

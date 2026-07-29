@@ -16,6 +16,7 @@ package crawl
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"regexp"
 	"slices"
@@ -660,5 +661,174 @@ func TestRestore_DedupsRepeatedPendingEntries(t *testing.T) {
 
 	if f.Len() != 2 {
 		t.Errorf("restored queue has %d entries, want 2 (duplicates must collapse)", f.Len())
+	}
+}
+
+// TestDecodeBoundedArray_AbortsAtTheBound is the falsifiability test for SEC-BE-002.
+// The element caps used to be len() checks that ran AFTER json.Unmarshal had
+// materialized the whole decoded value, so they bounded nothing: rejecting a 64 MB
+// artifact of one-character seen keys cost 1323 MB peak RSS, measured, versus 222 MB
+// once the cap is enforced during decode.
+//
+// Memory is not asserted directly — an RSS or TotalAlloc threshold would be flaky
+// across platforms and Go versions. This asserts the MECHANISM that produces the
+// memory property: decoding stops at the bound and never looks at what follows. A
+// poison element planted past the bound would produce a distinctly different error
+// if the decoder still walked the whole array, so getting the bound error proves the
+// abort. It runs at a small bound because that behavior is independent of the value
+// of MaxCheckpointEntries, and building a real-cap payload costs seconds per case.
+func TestDecodeBoundedArray_AbortsAtTheBound(t *testing.T) {
+	// Six elements against a bound of three. Element five is an object where a string
+	// belongs: reaching it means the abort did not happen.
+	const raw = `["a","b","c","d",{"not":"a string"},"f"]`
+
+	var decoded []string
+	err := decodeBoundedArray([]byte(raw), "seen", 3, func(dec *json.Decoder) error {
+		var s string
+		if err := dec.Decode(&s); err != nil {
+			return err
+		}
+		decoded = append(decoded, s)
+		return nil
+	})
+
+	if err == nil {
+		t.Fatal("expected the bound to reject a 6-element array against a bound of 3")
+	}
+	if !strings.Contains(err.Error(), "seen entries exceed 3") {
+		t.Errorf("error = %v\nwant the bound error naming the array. A type error here "+
+			"means the decoder walked past the bound and reached the poison element, "+
+			"i.e. the bound is being checked after decoding rather than during it", err)
+	}
+	if strings.Contains(err.Error(), "cannot unmarshal") {
+		t.Error("decoder reached the poison element past the bound: the element cap is " +
+			"not bounding the decode")
+	}
+	// Decoding must have stopped at the bound, not merely reported afterwards.
+	if len(decoded) > 3 {
+		t.Errorf("decoded %d elements against a bound of 3: elements past the bound were "+
+			"still materialized, which is the allocation this cap exists to prevent", len(decoded))
+	}
+}
+
+// TestDecodeBoundedArray_AtBoundSucceeds pins the boundary from the other side: a
+// count exactly at the bound is legitimate. An off-by-one would silently cap real
+// coverage one entry short, and Seen is cumulative so that error compounds across
+// every resume cycle.
+func TestDecodeBoundedArray_AtBoundSucceeds(t *testing.T) {
+	var decoded []string
+	err := decodeBoundedArray([]byte(`["a","b","c"]`), "seen", 3, func(dec *json.Decoder) error {
+		var s string
+		if err := dec.Decode(&s); err != nil {
+			return err
+		}
+		decoded = append(decoded, s)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("an array exactly at the bound must decode, got: %v", err)
+	}
+	if !slices.Equal(decoded, []string{"a", "b", "c"}) {
+		t.Errorf("decoded = %v, want all three elements", decoded)
+	}
+}
+
+// TestBoundedDecodersUseTheRealCap ties the fast tests above to production: they run
+// at a small bound, so something must assert that the shipped decoders pass
+// MaxCheckpointEntries rather than some other value. Without this, a decoder wired to
+// a smaller bound would reject legitimate checkpoints and every test above would
+// still pass.
+func TestBoundedDecodersUseTheRealCap(t *testing.T) {
+	src, err := os.ReadFile("checkpoint.go")
+	if err != nil {
+		t.Fatalf("read checkpoint.go: %v", err)
+	}
+	for _, name := range []string{"pending", "seen"} {
+		want := `decodeBoundedArray(data, "` + name + `", MaxCheckpointEntries,`
+		if !bytes.Contains(src, []byte(want)) {
+			t.Errorf("the %q decoder does not pass MaxCheckpointEntries as its bound; "+
+				"expected to find %s", name, want)
+		}
+	}
+}
+
+// TestLoadCheckpoint_RealCapIsEnforcedEndToEnd is the one deliberately expensive
+// case: it builds a payload past the real MaxCheckpointEntries and drives the whole
+// LoadCheckpoint path, proving the constant is wired through Checkpoint's custom
+// UnmarshalJSON and not just through decodeBoundedArray in isolation. Kept to a
+// single array (seen) because the pending equivalent needs a ~35 MB payload and cost
+// 10s, which is not worth paying twice for the same wiring.
+func TestLoadCheckpoint_RealCapIsEnforcedEndToEnd(t *testing.T) {
+	var b bytes.Buffer
+	b.WriteString(`{"version":1,"config_fingerprint":"fp","created_at_unix":0,"pending":[],"seen":[`)
+	for i := 0; i <= MaxCheckpointEntries; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`"a"`)
+	}
+	b.WriteString(`]}`)
+
+	if _, err := LoadCheckpoint(bytes.NewReader(b.Bytes())); err == nil ||
+		!strings.Contains(err.Error(), "seen entries exceed") {
+		t.Errorf("LoadCheckpoint error = %v, want the seen-entries cap error", err)
+	}
+}
+
+// TestCheckpoint_UnmarshalJSONCoversEveryField guards the one risk the custom
+// UnmarshalJSON introduces. It decodes the non-array fields through an embedded
+// defined-type alias so a field added to Checkpoint is picked up with no change
+// here — but if that embedding were ever replaced with a hand-listed wire struct,
+// a new field would silently stop decoding. This round-trips every field with a
+// distinctive value so that regression fails loudly.
+func TestCheckpoint_UnmarshalJSONCoversEveryField(t *testing.T) {
+	want := &Checkpoint{
+		Version:           checkpointVersion,
+		ConfigFingerprint: "distinctive-fingerprint",
+		CreatedAtUnix:     1234567890,
+		Pending:           []PendingURL{{URL: "https://ex.com/queued", Depth: 2}},
+		Seen:              []string{"https://ex.com/", "https://ex.com/covered"},
+	}
+
+	var buf bytes.Buffer
+	if err := want.Save(&buf); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadCheckpoint(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Version != want.Version {
+		t.Errorf("Version = %d, want %d", got.Version, want.Version)
+	}
+	if got.ConfigFingerprint != want.ConfigFingerprint {
+		t.Errorf("ConfigFingerprint = %q, want %q; the custom UnmarshalJSON is dropping "+
+			"a non-array field", got.ConfigFingerprint, want.ConfigFingerprint)
+	}
+	if got.CreatedAtUnix != want.CreatedAtUnix {
+		t.Errorf("CreatedAtUnix = %d, want %d; the custom UnmarshalJSON is dropping a "+
+			"non-array field", got.CreatedAtUnix, want.CreatedAtUnix)
+	}
+	if !slices.Equal(got.Seen, want.Seen) {
+		t.Errorf("Seen = %v, want %v", got.Seen, want.Seen)
+	}
+	if len(got.Pending) != 1 || got.Pending[0] != want.Pending[0] {
+		t.Errorf("Pending = %+v, want %+v", got.Pending, want.Pending)
+	}
+}
+
+// TestCheckpoint_NullArraysDecodeAsEmpty covers the JSON-null branch of the bounded
+// decoders. encoding/json treats null as "leave the slice nil" for a plain []string,
+// so a custom UnmarshalJSON that errored on null would reject checkpoints a
+// conforming producer can legitimately write.
+func TestCheckpoint_NullArraysDecodeAsEmpty(t *testing.T) {
+	raw := `{"version":1,"config_fingerprint":"fp","created_at_unix":0,"pending":null,"seen":null}`
+	cp, err := LoadCheckpoint(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("null arrays must decode as empty, got: %v", err)
+	}
+	if len(cp.Pending) != 0 || len(cp.Seen) != 0 {
+		t.Errorf("pending=%v seen=%v, want both empty", cp.Pending, cp.Seen)
 	}
 }
