@@ -219,18 +219,46 @@ func scopeCheckerWith(seedURL string, scope string, allowPrivate bool, hc *hostC
 //     pushed and honors the Depth the artifact claims, so a crafted checkpoint could
 //     put a non-seed URL at depth 0 ahead of the seed and pick which page learned
 //     the origin (LAB-4678 review, SEC-BE-004).
+//
 //  2. It is one-shot and adds exactly ONE origin: the scheme://host the seed
 //     resolved to. It is not a domain-level relaxation, and a second call (a
 //     resumed depth-0 entry, a retry) cannot add another origin.
-//  3. The learned origin must share the seed's REGISTRABLE DOMAIN. http→https and
-//     apex→www always do; an IdP hand-off, an open redirect on the seed, or any
-//     other foreign-domain target does not, and is refused. Without this the
-//     widening turned one redirect into crawl scope the operator never authorized,
-//     defeating --scope as a containment control (Codex review, PR #189).
+//
+//  3. The learned origin must be a HOST VARIANT of the seed: the same host, or the
+//     seed's host with a leading "www." added or removed. That is exactly the set of
+//     cases the widening exists for (http→https, apex→www) and nothing more. Scheme
+//     and port may change, because http→https is itself a port change and a
+//     different port on the same host crosses no host boundary.
+//
+//     This bound used to be the seed's REGISTRABLE DOMAIN, which is the
+//     "same-domain" policy applied regardless of what the operator configured. Under
+//     --scope same-origin the policy predicate is an exact scheme://host comparison,
+//     so that admitted one origin the operator had excluded: seed
+//     https://www.target.com redirecting to https://staging-abc.target.com put that
+//     host in scope, and operator --header values are applied per page with no origin
+//     check, so a static Authorization header went with it. It also contradicted the
+//     doc.go package comment, which names only http→https and apex→www, and
+//     scopeChecker, which documents same-domain as the mode that allows subdomains
+//     (LAB-4678 review, SEC-BE-009).
+//
+//     Narrowing this costs nothing under --scope same-domain, where the base
+//     predicate already accepts every host under the registrable domain and the
+//     learned origin was never load-bearing. TestSeedScope_NarrowingDoesNotAffectSameDomainScope
+//     pins that.
+//
+//     An IdP hand-off, an open redirect on the seed, or any other foreign-domain
+//     target is refused, and so is a sibling subdomain. Both refusals are reported
+//     with the remedy: re-seed at the resolved URL, which admits exactly the one
+//     origin the operator chose, rather than --scope same-domain, which would admit
+//     every subdomain. Without a bound here the widening turned one redirect into
+//     crawl scope the operator never authorized, defeating --scope as a containment
+//     control (Codex review, PR #189; narrowed by LAB-4678 review, SEC-BE-009).
+//
 //  4. The SSRF gate still applies. A seed that redirects to 127.0.0.1,
 //     169.254.169.254, or any RFC1918 address is refused unless the operator
 //     passed --dangerous-allow-private, exactly as for the seed itself. The
 //     verdict is taken once, at learn time, not per URL.
+//
 //  5. The widening is announced on stderr, so the operator sees the effective
 //     scope of the run instead of silently getting a wider crawl.
 //
@@ -331,17 +359,49 @@ func (s *seedScope) LearnEffectiveOrigin(effectiveURL string) {
 	if origin == s.seedOrigin {
 		return
 	}
-	// The widening exists for http→https and apex→www, which are always the SAME
-	// registrable domain. A redirect to a FOREIGN domain is a different thing: an
-	// IdP hand-off, an open redirect on the seed, or an attacker-controlled
-	// target. Admitting it would turn one redirect into crawl scope the operator
-	// never authorized, defeating --scope as a containment control. Constrain the
-	// learned origin to the seed's registrable domain before publishing it
-	// (Codex review, PR #189).
-	if !s.sameRegistrableDomain(u.Hostname()) {
+	// The widening exists for http→https and apex→www, and the learned origin must be
+	// one of those: the SAME HOST, or the seed's host with a leading "www." added or
+	// removed. Anything else is refused.
+	//
+	// This used to be bounded by the seed's REGISTRABLE DOMAIN instead, which is the
+	// "same-domain" policy applied regardless of what the operator configured. Under
+	// --scope same-origin the policy predicate is an exact scheme://host comparison, so
+	// that bound admitted one origin the operator had excluded: seed
+	// https://www.target.com redirecting to https://staging-abc.target.com — via an
+	// open redirect on the seed, a subdomain takeover, or a misconfigured vhost — put
+	// that origin in scope, and operator --header values are applied per page with no
+	// origin check, so a static Authorization header went with it. Scope is an
+	// engagement containment boundary, so admitting a host the operator excluded is
+	// the more expensive error (LAB-4678 review, SEC-BE-009).
+	//
+	// The narrow rule is also what this package already documented: the doc.go
+	// package comment names "http -> https, apex -> www" as the cases the widening
+	// exists for, and scopeChecker documents same-domain as the mode that allows
+	// subdomains. The registrable-domain bound was the outlier.
+	//
+	// Bounded on the HOST, so scheme and port may change: http→https IS a port change
+	// (80→443) as far as origins go, so the rule cannot key on port, and a different
+	// port on the same host crosses no host boundary — the operator's credentials go
+	// to the same machine either way, and engagements scope by host.
+	//
+	// Under --scope same-domain this narrowing changes nothing, verified by test: the
+	// base predicate already accepts every host under the registrable domain there, so
+	// the learned origin was never load-bearing in that mode.
+	if !s.sameHostVariant(u.Hostname()) {
 		if s.stderr != nil {
-			fmt.Fprintf(s.stderr, "scope: seed redirected to %s, a different domain than %s; not adding it to scope\n", //nolint:errcheck // best-effort status
-				origin, s.seedOrigin)
+			// Two messages, because they are different operator situations: a foreign
+			// domain is usually an IdP hand-off or an open redirect, while a sibling
+			// host under the same domain is usually the real app on another subdomain.
+			what := "a different domain than"
+			if s.sameRegistrableDomain(u.Hostname()) {
+				what = "a different host on the same domain as"
+			}
+			// Recommend RE-SEEDING rather than --scope same-domain. Re-seeding admits
+			// exactly the one origin the operator chose; widening the scope admits
+			// every subdomain, which is broader than what was just refused.
+			fmt.Fprintf(s.stderr, "scope: seed redirected to %s, %s %s; not adding it to scope. "+ //nolint:errcheck // best-effort status
+				"If that origin is the intended target, re-run with it as the seed URL\n",
+				origin, what, s.seedOrigin)
 		}
 		return
 	}
@@ -364,20 +424,56 @@ func (s *seedScope) LearnEffectiveOrigin(effectiveURL string) {
 	}
 }
 
-// sameRegistrableDomain reports whether host shares the seed's registrable
-// domain, which is the bound on how far the seed-redirect widening may reach.
+// seedHostname returns the seed's hostname, read from seedOrigin rather than stored
+// separately so there is one source of truth for what the seed was.
+func (s *seedScope) seedHostname() string {
+	if u := parseHTTPURL(s.seedOrigin); u != nil {
+		return u.Hostname()
+	}
+	return ""
+}
+
+// sameHostVariant reports whether host is the seed's own host, or the seed's host
+// with a leading "www." added or removed. That is the bound on how far the
+// seed-redirect widening may reach: exactly the two cases doc.go documents it for,
+// http→https (same host, scheme change) and apex→www.
+//
+// Both directions of the www swap are accepted. doc.go names "apex -> www", but the
+// reverse redirect is just as common a deployment and is the same one-label
+// relationship; refusing it would be an arbitrary asymmetry.
+//
+// An IP-literal or single-label seed (http://127.0.0.1:8080, http://localhost) is
+// handled by the exact-match arm, which permits the scheme-only case while refusing
+// to treat one bare host as equivalent to any other.
+func (s *seedScope) sameHostVariant(host string) bool {
+	seedHost := s.seedHostname()
+	if seedHost == "" || host == "" {
+		return false
+	}
+	if strings.EqualFold(seedHost, host) {
+		return true
+	}
+	const www = "www."
+	// Exactly one leading "www." apart, in either direction.
+	return strings.EqualFold(strings.TrimPrefix(strings.ToLower(seedHost), www), host) &&
+		strings.HasPrefix(strings.ToLower(seedHost), www) ||
+		strings.EqualFold(seedHost, strings.TrimPrefix(strings.ToLower(host), www)) &&
+			strings.HasPrefix(strings.ToLower(host), www)
+}
+
+// sameRegistrableDomain reports whether host shares the seed's registrable domain.
+//
+// It is no longer the widening GATE — sameHostVariant is, see LearnEffectiveOrigin
+// for why. It survives as a diagnostic classifier, to tell the operator whether a
+// refused redirect went to a foreign domain (usually an IdP hand-off or an open
+// redirect) or to a sibling host on their own domain (usually the real app on
+// another subdomain). Those are different situations and deserve different messages.
 //
 // It falls back to an exact hostname match when either side has no registrable
 // domain — an IP-literal or single-label seed such as http://127.0.0.1:8080 or
-// http://localhost. That still permits the scheme-only case the widening exists
-// for (http→https on the same host) while refusing to treat one bare host as
-// equivalent to any other. The seed hostname is read from seedOrigin rather than
-// stored separately so there is one source of truth for what the seed was.
+// http://localhost.
 func (s *seedScope) sameRegistrableDomain(host string) bool {
-	seedHost := ""
-	if u := parseHTTPURL(s.seedOrigin); u != nil {
-		seedHost = u.Hostname()
-	}
+	seedHost := s.seedHostname()
 	if seedHost == "" || host == "" {
 		return false
 	}

@@ -28,10 +28,14 @@
 // dynamic requests are captured. Passively captured requests are scope-filtered
 // like frontier links, and the frontier treats URLs differing only in query
 // parameters as one page. On the headless backend the scope predicate also learns
-// the seed's EFFECTIVE origin from the depth-0 navigation, so a seed that redirects
-// cross-origin (http -> https, apex -> www) does not discard every captured
-// request; the widening is one-shot, adds exactly the origin the seed resolved to,
-// still applies the SSRF gate, and is reported on Stderr.
+// the seed's EFFECTIVE origin from the seed's own navigation, so a seed that
+// redirects cross-origin (http -> https, apex -> www) does not discard every
+// captured request; the widening is one-shot, adds exactly the origin the seed
+// resolved to, still applies the SSRF gate, and is reported on Stderr. Those two
+// cases are the BOUND, not just examples: the learned origin must be the seed's own
+// host or a leading-"www." variant of it, so a redirect to a sibling subdomain or a
+// foreign domain is refused and reported. Admitting a subdomain is what --scope
+// same-domain is for.
 //
 // An opt-in interaction pass ([CrawlerOptions.Interact], headless only, off by
 // default; the net/http backend warns and ignores it) clicks a bounded set of
