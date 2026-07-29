@@ -17,9 +17,11 @@ package crawl
 import (
 	"bytes"
 	"context"
+	"io"
 	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestScopeChecker_SameOrigin(t *testing.T) {
@@ -472,24 +474,84 @@ func TestSeedScope_RefusesPrivateEffectiveOrigin(t *testing.T) {
 	}
 }
 
+// staticResolver returns a lookupHost function that answers from addrs and reports
+// NXDOMAIN-equivalent for anything else. It exists so tests that exercise the
+// private-host SSRF gate do not depend on the environment's DNS.
+//
+// Why this is required rather than convenient: the private-origin assertion below
+// used to be wrapped in t.Skipf, so any resolver returning a public A record for
+// the test hostname — a wildcard search domain, an ISP hijacking NXDOMAIN, a
+// corporate split-horizon resolver — made the security assertion silently vanish
+// with a green test. The premise was also wrong: localhost.example.com does not
+// resolve, so the test was passing through isPrivateHost's DNS-failure
+// fail-closed branch, not through a private resolution (LAB-4678 review, TEST-009).
+func staticResolver(addrs map[string][]string) func(string) ([]string, error) {
+	return func(host string) ([]string, error) {
+		if a, ok := addrs[host]; ok {
+			return a, nil
+		}
+		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+	}
+}
+
+// newSeedScopeWithResolver builds a seedScope whose private-host verdicts come from
+// a fixed table instead of the system resolver. The hostChecker is shared by the
+// base predicate and LearnEffectiveOrigin, so overriding it here covers both.
+func newSeedScopeWithResolver(t *testing.T, seedURL, scope string, allowPrivate bool,
+	stderr io.Writer, addrs map[string][]string,
+) *seedScope {
+	t.Helper()
+	s, err := newSeedScope(seedURL, scope, allowPrivate, stderr)
+	if err != nil {
+		t.Fatalf("newSeedScope: %v", err)
+	}
+	s.hosts.lookupHost = staticResolver(addrs)
+	return s
+}
+
 // TestSeedScope_RefusesPrivateSameDomainOrigin exercises the SSRF gate on the
 // path that now reaches it: the redirect target shares the seed's registrable
 // domain, so the domain constraint passes and the private-host check is what
 // refuses it. This is the case where the --dangerous-allow-private hint is the
 // useful diagnostic.
+//
+// The resolver is injected so the private resolution is a fact of the test rather
+// than of the environment, and the assertion always executes.
 func TestSeedScope_RefusesPrivateSameDomainOrigin(t *testing.T) {
 	var stderr bytes.Buffer
-	s, err := newSeedScope("https://intranet.example.com", "same-origin", false, &stderr)
-	if err != nil {
-		t.Fatalf("newSeedScope: %v", err)
-	}
-	// Same registrable domain (example.com), but the host resolves privately.
-	s.LearnEffectiveOrigin("https://localhost.example.com/")
+	s := newSeedScopeWithResolver(t, "https://intranet.example.com", "same-origin", false, &stderr,
+		map[string][]string{
+			"intranet.example.com": {"93.184.216.34"},
+			// Same registrable domain (example.com), resolving into RFC1918.
+			"internal.example.com": {"10.0.0.7"},
+		})
+
+	s.LearnEffectiveOrigin("https://internal.example.com/")
+
 	if !strings.Contains(stderr.String(), "private origin") {
-		t.Skipf("host does not resolve privately in this environment; stderr = %q", stderr.String())
+		t.Errorf("private-origin refusal not reported; stderr = %q", stderr.String())
 	}
-	if s.Check("https://localhost.example.com/admin") {
+	if s.Check("https://internal.example.com/admin") {
 		t.Error("private same-domain origin was admitted without --dangerous-allow-private")
+	}
+}
+
+// TestSeedScope_DNSFailureFailsClosed pins the branch the previous version of the
+// test was accidentally exercising. An unresolvable redirect target must be refused,
+// not admitted: isPrivateHost reports a DNS error as private on purpose.
+func TestSeedScope_DNSFailureFailsClosed(t *testing.T) {
+	var stderr bytes.Buffer
+	s := newSeedScopeWithResolver(t, "https://target.example.com", "same-origin", false, &stderr,
+		map[string][]string{"target.example.com": {"93.184.216.34"}})
+
+	// Not in the resolver table, so the lookup fails.
+	s.LearnEffectiveOrigin("https://ghost.example.com/")
+
+	if s.Check("https://ghost.example.com/admin") {
+		t.Error("an unresolvable same-domain origin was admitted; the SSRF gate must fail closed")
+	}
+	if !strings.Contains(stderr.String(), "private origin") {
+		t.Errorf("refusal not reported; stderr = %q", stderr.String())
 	}
 }
 
@@ -515,12 +577,20 @@ func TestSeedScope_RefusesForeignDomainRedirect(t *testing.T) {
 // TestSeedScope_AllowsIntendedWidenings pins that the constraint does not break
 // the two deployments the widening exists for: http -> https on the same host,
 // and apex -> www on the same registrable domain.
+//
+// These run with allowPrivate=false, so they reach the private-host check and
+// therefore resolve DNS. The resolver is injected to keep them hermetic: against
+// the system resolver a CI runner without DNS makes every lookup fail, isPrivateHost
+// fails closed, and both widenings would be refused for a reason unrelated to what
+// is under test.
 func TestSeedScope_AllowsIntendedWidenings(t *testing.T) {
+	public := map[string][]string{
+		"example.com":     {"93.184.216.34"},
+		"www.example.com": {"93.184.216.34"},
+	}
+
 	t.Run("http to https", func(t *testing.T) {
-		s, err := newSeedScope("http://example.com", "same-origin", false, nil)
-		if err != nil {
-			t.Fatalf("newSeedScope: %v", err)
-		}
+		s := newSeedScopeWithResolver(t, "http://example.com", "same-origin", false, nil, public)
 		s.LearnEffectiveOrigin("https://example.com/")
 		if !s.Check("https://example.com/dashboard") {
 			t.Error("http -> https seed redirect must stay crawlable")
@@ -528,13 +598,102 @@ func TestSeedScope_AllowsIntendedWidenings(t *testing.T) {
 	})
 
 	t.Run("apex to www", func(t *testing.T) {
-		s, err := newSeedScope("https://example.com", "same-origin", false, nil)
-		if err != nil {
-			t.Fatalf("newSeedScope: %v", err)
-		}
+		s := newSeedScopeWithResolver(t, "https://example.com", "same-origin", false, nil, public)
 		s.LearnEffectiveOrigin("https://www.example.com/")
 		if !s.Check("https://www.example.com/dashboard") {
 			t.Error("apex -> www seed redirect must stay crawlable")
 		}
 	})
+}
+
+// TestHostChecker_MemoizesPerHostname pins the property that makes resume startup
+// bounded: one resolution per distinct hostname, not one per call. urlFrontier.Restore
+// invokes the scope predicate once per pending entry and LoadCheckpoint admits up to
+// MaxCheckpointEntries of them, so an uncached verdict meant an unbounded,
+// uninterruptible stall before the crawl produced any output (LAB-4678 review,
+// SEC-BE-003).
+func TestHostChecker_MemoizesPerHostname(t *testing.T) {
+	var calls int
+	hc := newHostChecker()
+	hc.lookupHost = func(host string) ([]string, error) {
+		calls++
+		return []string{"93.184.216.34"}, nil
+	}
+
+	for range 100 {
+		if hc.isPrivate("example.com") {
+			t.Fatal("public address reported as private")
+		}
+	}
+	if calls != 1 {
+		t.Errorf("resolver called %d times for one hostname, want 1", calls)
+	}
+
+	// A second hostname is a separate verdict and costs exactly one more lookup.
+	hc.isPrivate("other.example.com")
+	if calls != 2 {
+		t.Errorf("resolver called %d times for two hostnames, want 2", calls)
+	}
+
+	// A raw IP needs no resolution at all.
+	before := calls
+	if !hc.isPrivate("10.0.0.1") {
+		t.Error("10.0.0.1 must be private")
+	}
+	if calls != before {
+		t.Errorf("raw IP triggered %d resolution(s), want 0", calls-before)
+	}
+}
+
+// TestHostChecker_CachesNegativeAndPositiveVerdicts pins that a private verdict is
+// cached too. Caching only the public answer would leave the pathological case (a
+// checkpoint full of private hosts) paying a lookup per entry.
+func TestHostChecker_CachesNegativeAndPositiveVerdicts(t *testing.T) {
+	var calls int
+	hc := newHostChecker()
+	hc.lookupHost = func(host string) ([]string, error) {
+		calls++
+		return []string{"10.1.2.3"}, nil
+	}
+
+	for range 50 {
+		if !hc.isPrivate("internal.example.com") {
+			t.Fatal("RFC1918 address reported as public")
+		}
+	}
+	if calls != 1 {
+		t.Errorf("resolver called %d times, want 1: private verdicts must cache too", calls)
+	}
+}
+
+// TestRestore_DoesNotHoldLockAcrossScopeCheck pins that the scope predicate, which
+// resolves DNS, runs outside the frontier lock. If it ran inside, this test deadlocks:
+// the predicate calls back into a frontier method that needs the same mutex
+// (LAB-4678 review, SEC-BE-003).
+func TestRestore_DoesNotHoldLockAcrossScopeCheck(t *testing.T) {
+	f := newURLFrontier(5, nil)
+	f.scopeFn = func(string) bool {
+		// A frontier operation from inside the predicate. Len takes f.mu.
+		_ = f.Len()
+		return true
+	}
+
+	done := make(chan struct{})
+	go func() {
+		f.Restore([]urlEntry{
+			{URL: "https://ex.com/a", Depth: 1},
+			{URL: "https://ex.com/b", Depth: 1},
+		}, nil)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Restore deadlocked: the scope predicate is being called with f.mu held")
+	}
+
+	if f.Len() != 2 {
+		t.Errorf("restored queue has %d entries, want 2", f.Len())
+	}
 }

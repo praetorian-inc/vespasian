@@ -39,14 +39,85 @@ func isPrivateIP(ip net.IP) bool {
 // resolved IPs are private/internal. Also returns true for raw IP addresses
 // in private ranges. This prevents the browser from navigating to internal
 // network endpoints (SSRF protection).
+//
+// Uncached. Prefer a [hostChecker] for anything on a per-URL path; this remains
+// for one-shot call sites and for tests that assert the raw resolution behavior.
 func isPrivateHost(hostname string) bool {
-	// Check if it's already a raw IP address.
+	return newHostChecker().isPrivate(hostname)
+}
+
+// maxHostVerdictCacheEntries bounds the memoization map. A crawl is scope-limited
+// to one origin or one registrable domain, so the distinct-host count is small in
+// practice; the cap exists so a wildcard-DNS target cannot grow the map without
+// bound. Past the cap the checker still answers correctly, it just stops caching.
+const maxHostVerdictCacheEntries = 4096
+
+// hostChecker answers "is this hostname private?" and MEMOIZES the verdict per
+// hostname for its own lifetime.
+//
+// Why memoization is load-bearing rather than an optimization: the verdict comes
+// from a blocking net.LookupHost that takes no context, and it sits on the
+// per-URL scope path. Every scope check of an out-of-origin URL paid a fresh
+// uncached resolution, and urlFrontier.Restore calls the scope predicate once PER
+// PENDING ENTRY, with LoadCheckpoint admitting up to MaxCheckpointEntries
+// (1,000,000). That made resume startup stall for an unbounded wall-clock period,
+// uninterruptible, on work that is one lookup per distinct host (LAB-4678 review,
+// SEC-BE-003). The prior fix removed the redundant lookup from seedScope.Check's
+// learned-origin comparison but left the class in place on s.base.
+//
+// lookupHost is a field so tests can supply a deterministic resolver instead of
+// depending on the environment's DNS. A crawl builds one checker, so a verdict is
+// cached for the run and not across runs, which keeps the staleness window to a
+// single crawl. The scope check is a coarse pre-filter regardless: pkg/ssrf's
+// SafeDialContext re-resolves at connect time, and that is what defeats DNS
+// rebinding.
+type hostChecker struct {
+	lookupHost func(string) ([]string, error)
+
+	mu      sync.Mutex
+	verdict map[string]bool
+}
+
+// newHostChecker returns a hostChecker backed by the system resolver.
+func newHostChecker() *hostChecker {
+	return &hostChecker{
+		lookupHost: net.LookupHost,
+		verdict:    make(map[string]bool),
+	}
+}
+
+// isPrivate reports whether hostname is a raw private IP or resolves to one.
+// A DNS failure is reported as private: rejecting on an unresolvable host fails
+// closed, which is the safe direction for an SSRF gate.
+func (h *hostChecker) isPrivate(hostname string) bool {
+	// A raw IP needs no resolution and no cache entry.
 	if ip := net.ParseIP(hostname); ip != nil {
 		return isPrivateIP(ip)
 	}
 
-	// Resolve and check all addresses.
-	addrs, err := net.LookupHost(hostname) //nolint:gosec // G704: intentional SSRF protection — taint flows to isPrivateHost check below
+	h.mu.Lock()
+	cached, ok := h.verdict[hostname]
+	h.mu.Unlock()
+	if ok {
+		return cached
+	}
+
+	private := h.resolveIsPrivate(hostname)
+
+	h.mu.Lock()
+	if len(h.verdict) < maxHostVerdictCacheEntries {
+		h.verdict[hostname] = private
+	}
+	h.mu.Unlock()
+	return private
+}
+
+// resolveIsPrivate performs the resolution itself. Split out so the lookup is
+// never held under h.mu: two goroutines racing on the same new hostname each pay
+// one lookup, which is strictly better than serializing every caller behind the
+// lock for the duration of a DNS round trip.
+func (h *hostChecker) resolveIsPrivate(hostname string) bool {
+	addrs, err := h.lookupHost(hostname) //nolint:gosec // G704: intentional SSRF protection — taint flows to isPrivateIP below
 	if err != nil {
 		// DNS failure — reject to be safe.
 		return true
@@ -67,7 +138,18 @@ func isPrivateHost(hostname string) bool {
 // Scope policies:
 //   - "same-origin": exact scheme + host + port match
 //   - "same-domain": registered domain match, allowing subdomains
+//
+// The returned predicate memoizes private-host verdicts for its own lifetime; see
+// [hostChecker].
 func scopeChecker(seedURL string, scope string, allowPrivate bool) (func(string) bool, error) {
+	return scopeCheckerWith(seedURL, scope, allowPrivate, newHostChecker())
+}
+
+// scopeCheckerWith is [scopeChecker] over a caller-supplied [hostChecker]. It
+// exists so a caller that ALSO resolves hosts itself shares one memoization map
+// with the predicate instead of keeping a second, divergent cache — seedScope is
+// the only such caller, since LearnEffectiveOrigin resolves the learned origin.
+func scopeCheckerWith(seedURL string, scope string, allowPrivate bool, hc *hostChecker) (func(string) bool, error) {
 	seed, err := url.Parse(seedURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse seed URL: %w", err)
@@ -81,7 +163,7 @@ func scopeChecker(seedURL string, scope string, allowPrivate bool) (func(string)
 		if allowPrivate {
 			return true
 		}
-		return !isPrivateHost(u.Hostname())
+		return !hc.isPrivate(u.Hostname())
 	}
 
 	switch scope {
@@ -158,6 +240,10 @@ type seedScope struct {
 	seedOrigin   string
 	stderr       io.Writer
 
+	// hosts is shared with the base predicate so a hostname resolved by either is
+	// resolved once for the whole crawl.
+	hosts *hostChecker
+
 	mu        sync.RWMutex
 	learned   bool   // LearnEffectiveOrigin already ran (one-shot)
 	effOrigin string // the seed's post-redirect origin, "" when it matched seedOrigin
@@ -167,7 +253,8 @@ type seedScope struct {
 // [scopeChecker] with the seed-effective-origin widening documented on
 // [seedScope]. stderr may be nil to suppress the widening notice.
 func newSeedScope(seedURL, scope string, allowPrivate bool, stderr io.Writer) (*seedScope, error) {
-	base, err := scopeChecker(seedURL, scope, allowPrivate)
+	hosts := newHostChecker()
+	base, err := scopeCheckerWith(seedURL, scope, allowPrivate, hosts)
 	if err != nil {
 		return nil, err
 	}
@@ -184,6 +271,7 @@ func newSeedScope(seedURL, scope string, allowPrivate bool, stderr io.Writer) (*
 		allowPrivate: allowPrivate,
 		seedOrigin:   seedOrigin,
 		stderr:       stderr,
+		hosts:        hosts,
 	}, nil
 }
 
@@ -254,7 +342,7 @@ func (s *seedScope) LearnEffectiveOrigin(effectiveURL string) {
 	}
 	// The SSRF decision is taken before publishing the origin so the operator is
 	// never told the scope widened to a host the crawl will then refuse.
-	if !s.allowPrivate && isPrivateHost(u.Hostname()) {
+	if !s.allowPrivate && s.hosts.isPrivate(u.Hostname()) {
 		if s.stderr != nil {
 			fmt.Fprintf(s.stderr, "scope: seed redirected to private origin %s; not adding it to scope (pass %s to allow)\n", //nolint:errcheck // best-effort status
 				origin, flagDangerousAllowPrivate)

@@ -325,14 +325,40 @@ func (f *urlFrontier) Snapshot() (pending []PendingURL, seen []string) {
 // entries are legitimately in the checkpoint's seen-set already, and rejecting
 // them on that basis would discard the entire resumed queue. They are marked seen
 // here so a later rediscovery still dedups against them.
+//
+// Validation runs in two passes, BEFORE the lock is taken and then under it. The
+// scope predicate performs a blocking DNS resolution (isPrivateHost) that takes no
+// context, and LoadCheckpoint admits up to MaxCheckpointEntries pending entries,
+// so calling it inside the critical section held f.mu across an unbounded amount
+// of network I/O and blocked every concurrent frontier operation for the duration
+// (LAB-4678 review, SEC-BE-003). The predicate is a pure function of the URL, so
+// hoisting it out changes no verdict. Duplicate collapse still happens under the
+// lock, because it is the frontier's own state that decides it.
 func (f *urlFrontier) Restore(pending []urlEntry, seen []string) {
+	// Pass 1, no lock held: the URL-only checks, including the one that resolves DNS.
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	maxDepth, scopeFn := f.maxDepth, f.scopeFn
+	f.mu.Unlock()
+
+	admitted := make([]urlEntry, 0, len(pending))
 	for _, e := range pending {
-		key := frontierKey(e.URL)
-		if key == "" {
+		if frontierKey(e.URL) == "" {
 			continue
 		}
+		if maxDepth >= 0 && e.Depth > maxDepth {
+			continue
+		}
+		if scopeFn != nil && !scopeFn(e.URL) {
+			continue
+		}
+		admitted = append(admitted, e)
+	}
+
+	// Pass 2, under the lock: frontier state only.
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, e := range admitted {
+		key := frontierKey(e.URL)
 		// Dedup WITHIN pending. Restore runs on a fresh frontier, so anything
 		// already in f.seen here was put there by an earlier entry of this same
 		// slice — a corrupted or hand-edited checkpoint listing one URL repeatedly
@@ -340,12 +366,6 @@ func (f *urlFrontier) Restore(pending []urlEntry, seen []string) {
 		// refetching it (CodeRabbit review, PR #189). The checkpoint's own seen-set
 		// is still applied after this loop, so it cannot reject the resumed queue.
 		if f.seen[key] {
-			continue
-		}
-		if f.maxDepth >= 0 && e.Depth > f.maxDepth {
-			continue
-		}
-		if f.scopeFn != nil && !f.scopeFn(e.URL) {
 			continue
 		}
 		f.seen[key] = true
