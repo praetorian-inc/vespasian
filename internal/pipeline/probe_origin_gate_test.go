@@ -233,7 +233,7 @@ func TestClassifyProbeGenerate_CrossOriginCandidateIsNotProbed(t *testing.T) {
 
 	assert.Positive(t, atomic.LoadInt32(targetHits), "same-origin candidate must still be probed")
 	assert.Zero(t, atomic.LoadInt32(attackerHits), "cross-origin candidate must NOT be probed")
-	assert.Contains(t, warnings.String(), "skipping cross-origin URL",
+	assert.Contains(t, warnings.String(), "skipping cross-origin candidates for",
 		"a warning must be emitted when a cross-origin probe target is skipped")
 	assert.Contains(t, warnings.String(), "AllowCrossOriginProbe",
 		"the warning must name the opt-out field, mirroring jsreplay's AllowCrossOrigin wording style")
@@ -304,7 +304,7 @@ func TestClassifyProbeGenerate_CrossOriginWarningNotGatedByStatus(t *testing.T) 
 	require.NoError(t, err)
 
 	assert.Zero(t, atomic.LoadInt32(attackerHits), "cross-origin candidate must NOT be probed")
-	assert.Contains(t, warnings.String(), "skipping cross-origin URL",
+	assert.Contains(t, warnings.String(), "skipping cross-origin candidates for",
 		"the cross-origin skip warning must be emitted on Warnings even when Status (--verbose) is nil")
 }
 
@@ -336,7 +336,7 @@ func TestClassifyProbeGenerate_CrossOriginWarningDedupedByOrigin(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Zero(t, atomic.LoadInt32(attackerHits), "no cross-origin candidate must be probed")
-	assert.Equal(t, 1, strings.Count(warnings.String(), "skipping cross-origin URL"),
+	assert.Equal(t, 1, strings.Count(warnings.String(), "skipping cross-origin candidates for"),
 		"three candidates on the same rejected origin must produce exactly one skip warning, not three")
 }
 
@@ -376,10 +376,59 @@ func TestClassifyProbeGenerate_CrossOriginWarningNotOverCollapsedAcrossHosts(t *
 
 	assert.Zero(t, atomic.LoadInt32(attacker1Hits), "no cross-origin candidate must be probed")
 	assert.Zero(t, atomic.LoadInt32(attacker2Hits), "no cross-origin candidate must be probed")
-	assert.Equal(t, 2, strings.Count(warnings.String(), "skipping cross-origin URL"),
+	assert.Equal(t, 2, strings.Count(warnings.String(), "skipping cross-origin candidates for"),
 		"two DISTINCT cross-origin hosts must each produce their own skip warning, not collapse to one")
 	assert.Contains(t, warnings.String(), attacker1.URL, "the first host must be named in a warning")
 	assert.Contains(t, warnings.String(), attacker2.URL, "the second host must be named in a warning")
+}
+
+// TestClassifyProbeGenerate_CrossOriginWarningExcludesUserinfoCredentials is
+// the direct regression test for the fix that prompted this warning's wording
+// change: a cross-origin candidate can carry embedded HTTP Basic userinfo
+// (e.g. a URL recovered from a Burp/HAR capture that still has the
+// operator's own credentials embedded), and this always-on
+// (non---verbose-gated) warning must never echo them in cleartext.
+// bestEffortOrigin is userinfo-free by construction -- url.URL.Host excludes
+// userinfo; u.User holds it separately (see newCrossOriginValidator's doc
+// comment) -- so only the origin is printed, never the credential-bearing
+// rawURL.
+//
+// user:pass is synthetic test data on a loopback httptest server (RFC 2606 /
+// loopback-equivalent fixture), not a real secret; this fixture asserts
+// NON-DISCLOSURE -- the credential must never appear in Warnings, in any
+// form.
+//
+// Mutation-verified: reverting the production line in probe_origin_gate.go
+// to print crawl.SanitizeForLog(rawURL) instead of crawl.SanitizeForLog(origin)
+// makes this test fail, since the quoted rawURL then contains "user:pass".
+func TestClassifyProbeGenerate_CrossOriginWarningExcludesUserinfoCredentials(t *testing.T) {
+	target, _ := countingAPIServer(t)
+	attacker, attackerHits := countingAPIServer(t)
+
+	// user:pass is synthetic test data, not a real secret; see doc comment.
+	attackerUserinfoURL := strings.Replace(attacker.URL, "://", "://user:pass@", 1) + "/api/v1/collect"
+	requests := []crawl.ObservedRequest{
+		apiRequest(target.URL + "/api/v1/users"),
+		apiRequest(attackerUserinfoURL),
+	}
+
+	var warnings bytes.Buffer
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Deduplicate:  true,
+		TargetURL:    target.URL,
+		Warnings:     &warnings,
+	})
+	require.NoError(t, err)
+
+	assert.Zero(t, atomic.LoadInt32(attackerHits), "cross-origin candidate must NOT be probed")
+	assert.NotContains(t, warnings.String(), "user:pass",
+		"the cross-origin skip warning must never echo embedded userinfo credentials in cleartext")
+	assert.Contains(t, warnings.String(), `skipping cross-origin candidates for "`+attacker.URL+`"`,
+		"the warning must still name the (credential-free) origin")
 }
 
 // TestClassifyProbeGenerate_AllowCrossOriginProbeOptOut proves the internal
@@ -431,6 +480,16 @@ func TestClassifyProbeGenerate_AllowCrossOriginProbeOptOut(t *testing.T) {
 // message the gate writes on its reject branch is the only observable signal
 // tied to the branch under test, so it is asserted as the value-level
 // evidence in its place (per SEC-BE-001 rejecting this exact candidate).
+//
+// The gate's warning now prints bestEffortOrigin(rawURL), not rawURL itself
+// (see newCrossOriginValidator's doc comment: printing rawURL could echo
+// embedded userinfo credentials to this always-on writer). Because the only
+// candidate reachable here is relative ("/api/v1/users", no host, forced by
+// the constraint above), its origin is "" -- and crawl.SanitizeForLog
+// special-cases "" to return it unquoted, so this specific fixture cannot
+// demonstrate the sanitizer's quoting behavior. That proof lives instead in
+// TestClassifyProbeGenerate_MixedOriginWithoutTargetURLSkipsRealAPI, where
+// the rejected candidate's origin is non-empty.
 func TestClassifyProbeGenerate_UnresolvableOriginFailsClosed(t *testing.T) {
 	requests := []crawl.ObservedRequest{apiRequest("/api/v1/users")}
 	require.Equal(t, "", crawl.ResolveTargetOrigin("", requests),
@@ -447,9 +506,8 @@ func TestClassifyProbeGenerate_UnresolvableOriginFailsClosed(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	assert.Contains(t, warnings.String(), `skipping cross-origin URL "/api/v1/users"`,
-		"an unresolvable target origin must fail closed and reject every probe candidate; "+
-			"the URL is quoted because SEC-BE-002 runs it through crawl.SanitizeForLog")
+	assert.Contains(t, warnings.String(), "skipping cross-origin candidates for",
+		"an unresolvable target origin must fail closed and reject every probe candidate")
 	assert.Contains(t, warnings.String(), "AllowCrossOriginProbe",
 		"the warning must name the opt-out field even when the origin could not be resolved at all")
 	assert.Contains(t, warnings.String(), "no usable origin could be derived",
@@ -493,7 +551,7 @@ func TestClassifyProbeGenerate_CrossOriginGateRunsBeforeParseTimeGate(t *testing
 	require.NoError(t, err)
 
 	assert.Zero(t, atomic.LoadInt32(attackerHits), "cross-origin candidate must not be probed")
-	assert.Contains(t, warnings.String(), "skipping cross-origin URL",
+	assert.Contains(t, warnings.String(), "skipping cross-origin candidates for",
 		"the origin gate must run first (outermost): a candidate that is both cross-origin and "+
 			"userinfo-bearing must be rejected there, proving the composition order pipeline.go documents")
 }
@@ -566,8 +624,14 @@ func TestClassifyProbeGenerate_MixedOriginWithoutTargetURLSkipsRealAPI(t *testin
 
 	assert.Zero(t, atomic.LoadInt32(apiHits),
 		"without --target-url, the real API host is misresolved as cross-origin relative to the CDN and must be skipped (documents the hazard)")
-	assert.Contains(t, warnings.String(), `skipping cross-origin URL "`+api.URL+`/api/v1/accounts"`,
-		"the URL is quoted because SEC-BE-002 runs it through crawl.SanitizeForLog")
+	// The gate prints the candidate's ORIGIN, not its full rawURL (see
+	// newCrossOriginValidator's doc comment), so api.URL -- which is itself
+	// exactly "scheme://host" with no path -- is what appears here, quoted.
+	// This is also the sanitization pin for the gate's per-URL skip warning:
+	// mutating crawl.SanitizeForLog to `return s` drops the surrounding quote
+	// characters and fails this assertion.
+	assert.Contains(t, warnings.String(), `skipping cross-origin candidates for "`+api.URL+`"`,
+		"the origin is quoted because SEC-BE-002 runs it through crawl.SanitizeForLog")
 	assert.Contains(t, warnings.String(), cdn.URL,
 		"the one-time derived-origin warning must name the (wrongly) derived CDN origin so the operator can see why")
 	assert.Zero(t, atomic.LoadInt32(cdnHits),

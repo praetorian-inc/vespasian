@@ -254,7 +254,7 @@ func TestResolveAndGenerate_ForwardsTargetURLAndWarningsToProbeGate(t *testing.T
 		"the non-pinned origin must be rejected by the cross-origin gate, not probed")
 
 	// Warnings forwarded: the skip warning reaches the caller's writer.
-	assert.Contains(t, warnings.String(), "skipping cross-origin URL",
+	assert.Contains(t, warnings.String(), "skipping cross-origin candidates for",
 		"ScanOptions.Warnings must reach Options.Warnings so the cross-origin skip warning is visible")
 	assert.NotContains(t, warnings.String(), "--target-url not set",
 		"TargetURL pinned the origin, so the derived-origin warning must NOT fire")

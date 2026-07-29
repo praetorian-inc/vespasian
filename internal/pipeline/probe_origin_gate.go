@@ -95,9 +95,21 @@ func newCrossOriginValidator(base func(string) error, targetOrigin string, warni
 		origin := bestEffortOrigin(rawURL)
 		if !warnedOrigins[origin] {
 			warnedOrigins[origin] = true
+			// Report the ORIGIN, never rawURL: a cross-origin candidate can
+			// also carry embedded userinfo, and crawl.SanitizeForLog is
+			// strconv.Quote -- it escapes control bytes but redacts nothing,
+			// so printing rawURL would echo the credential cleartext to this
+			// always-on (non---verbose-gated) writer. Since `import` preserves
+			// userinfo verbatim, that credential can be the customer's real
+			// one from a Burp/HAR capture. bestEffortOrigin is userinfo-free
+			// by construction (url.URL.Host excludes userinfo; u.User holds it
+			// separately), and the dedupe above is already per-origin, so only
+			// one URL per origin was ever shown -- the path carried no
+			// diagnostic value the origin does not. The sibling parse-time
+			// rejection is silent for the same reason (see newFullURLValidator).
 			writeStatus(warnings,
-				"probe: skipping cross-origin URL %s (use AllowCrossOriginProbe to allow)\n",
-				crawl.SanitizeForLog(rawURL))
+				"probe: skipping cross-origin candidates for %s (use AllowCrossOriginProbe to allow)\n",
+				crawl.SanitizeForLog(origin))
 		}
 		return fmt.Errorf("probe: cross-origin URL rejected: %s", rawURL)
 	}
