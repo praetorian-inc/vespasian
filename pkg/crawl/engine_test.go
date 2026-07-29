@@ -18,7 +18,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"go/types"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -865,16 +868,22 @@ var urlEchoIdentifiers = []string{
 }
 
 // TestOperatorFacingURLEchoesAreRedacted is the class-level guard for SEC-BE-005.
-// redactSeedURL was applied at nine echo sites and skipped at the one this PR
-// added; reviewing the diff found the new line but nothing compared it against the
+// redactSeedURL was applied at nine echo sites and skipped at the one this PR added;
+// reviewing the diff found the new line but nothing compared it against the
 // established pattern. This scans every non-test file in the package for an
-// operator-facing message that interpolates a raw-URL identifier and requires
-// redactSeedURL on the same line, so the eleventh site cannot regress the way the
-// tenth did.
+// operator-facing message that interpolates a raw-URL identifier and requires that
+// argument to go through redactSeedURL, so the eleventh site cannot regress the way
+// the tenth did.
 //
-// It reads source rather than behavior on purpose: the alternative is one
-// behavioral test per echo site, several of which need a live browser or a real
-// redirect to reach.
+// It parses with go/ast and inspects whole CALL EXPRESSIONS, not lines. A
+// line-oriented scan silently missed any call whose format string and arguments sit
+// on different lines, which is how several echoes in this package are already
+// written — so a new unredacted echo wrapped across lines passed the guard, and the
+// coverage floor below could not catch it either (CodeRabbit review of the
+// SEC-BE-005 fix). Verified by mutation: a multi-line unredacted Fprintf now fails.
+//
+// It reads source rather than behavior on purpose: the alternative is one behavioral
+// test per echo site, several of which need a live browser or a real redirect.
 func TestOperatorFacingURLEchoesAreRedacted(t *testing.T) {
 	files, err := filepath.Glob("*.go")
 	if err != nil {
@@ -886,36 +895,66 @@ func TestOperatorFacingURLEchoesAreRedacted(t *testing.T) {
 		if strings.HasSuffix(f, "_test.go") {
 			continue
 		}
-		src, err := os.ReadFile(f) //nolint:gosec // G304: f comes from a glob of this package's own directory
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, f, nil, 0)
 		if err != nil {
-			t.Fatalf("read %s: %v", f, err)
+			t.Fatalf("parse %s: %v", f, err)
 		}
-		for n, line := range strings.Split(string(src), "\n") {
-			// Only message-producing calls. A plain assignment or comparison that
-			// mentions a URL identifier is not an echo.
-			if !strings.Contains(line, "fmt.Fprint") && !strings.Contains(line, "fmt.Errorf") {
-				continue
+
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok || !isMessageCall(call.Fun) {
+				return true
 			}
-			for _, id := range urlEchoIdentifiers {
-				if !strings.Contains(line, id) {
+			for _, arg := range call.Args {
+				inner, redacted := redactedArg(arg)
+				name := types.ExprString(inner)
+				if !slices.Contains(urlEchoIdentifiers, name) {
 					continue
 				}
 				checked++
-				if !strings.Contains(line, "redactSeedURL(") {
-					t.Errorf("%s:%d echoes raw URL identifier %q without redactSeedURL; "+
-						"an operator-supplied URL can carry userinfo credentials and stderr "+
-						"lands in CI logs\n\t%s", f, n+1, id, strings.TrimSpace(line))
+				if !redacted {
+					pos := fset.Position(arg.Pos())
+					t.Errorf("%s:%d passes raw URL identifier %q to %s without "+
+						"redactSeedURL; an operator-supplied URL can carry userinfo "+
+						"credentials and stderr lands in CI logs",
+						f, pos.Line, name, types.ExprString(call.Fun))
 				}
 			}
-		}
+			return true
+		})
 	}
 
-	// If the identifier list ever stops matching the code, this guard silently
-	// passes over everything. Assert it still finds the known sites.
+	// If the identifier list ever stops matching the code, this guard silently passes
+	// over everything. Assert it still finds the known sites.
 	if checked < 5 {
-		t.Errorf("matched only %d URL echo sites; urlEchoIdentifiers has probably drifted "+
-			"from the code and this guard is no longer checking anything", checked)
+		t.Errorf("matched only %d URL echo arguments; urlEchoIdentifiers has probably "+
+			"drifted from the code and this guard is no longer checking anything", checked)
 	}
+}
+
+// isMessageCall reports whether fn is one of the fmt calls that produce an
+// operator-facing message. Restricted to these so an ordinary assignment or
+// comparison mentioning a URL identifier is not treated as an echo.
+func isMessageCall(fn ast.Expr) bool {
+	name := types.ExprString(fn)
+	return strings.HasPrefix(name, "fmt.Fprint") || name == "fmt.Errorf" || name == "fmt.Sprintf"
+}
+
+// redactedArg unwraps a redactSeedURL(x) argument, returning x and true. For any
+// other expression it returns the expression unchanged and false. Checking each
+// argument expression individually is what makes the guard insensitive to line
+// breaks: it never has to see the call and its arguments on one line.
+func redactedArg(arg ast.Expr) (inner ast.Expr, redacted bool) {
+	call, ok := arg.(*ast.CallExpr)
+	if !ok {
+		return arg, false
+	}
+	ident, ok := call.Fun.(*ast.Ident)
+	if !ok || ident.Name != "redactSeedURL" || len(call.Args) != 1 {
+		return arg, false
+	}
+	return call.Args[0], true
 }
 
 // TestLearnSeedOrigin_OnlyTheSeedWidensScope pins the containment invariant that
