@@ -16,40 +16,134 @@ package crawl
 
 import (
 	"bytes"
+	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 )
 
+// fingerprintInput mirrors ComputeConfigFingerprint's parameter list so the
+// sensitivity table below can vary exactly one field per case and name it. A
+// hand-written list of positional calls is what let allowPrivate go unvaried
+// through the whole original test, and what would let the NEXT added field go
+// unvaried too (LAB-4678 review, TEST-003/SEC-BE-001).
+type fingerprintInput struct {
+	targetURL    string
+	scope        string
+	depth        int
+	headless     bool
+	allowPrivate bool
+	interact     bool
+}
+
+func (i fingerprintInput) hash() string {
+	return ComputeConfigFingerprint(i.targetURL, i.scope, i.depth, i.headless, i.allowPrivate, i.interact)
+}
+
+// with returns a copy of i with mutate applied, so each table case below reads as
+// "the base config, except this one field".
+func (i fingerprintInput) with(mutate func(*fingerprintInput)) fingerprintInput {
+	mutate(&i)
+	return i
+}
+
 func TestComputeConfigFingerprint(t *testing.T) {
-	base := ComputeConfigFingerprint("https://ex.com", "same-origin", 3, true, false)
-	if base == "" {
+	base := fingerprintInput{
+		targetURL: "https://ex.com", scope: "same-origin", depth: 3,
+		headless: true, allowPrivate: false, interact: false,
+	}
+	baseFP := base.hash()
+	if baseFP == "" {
 		t.Fatal("empty fingerprint")
 	}
-	if base != ComputeConfigFingerprint("https://ex.com", "same-origin", 3, true, false) {
+	if baseFP != base.hash() {
 		t.Error("fingerprint not stable for identical inputs")
 	}
-	// Each defining field changes the fingerprint, including the backend: the
-	// two backends discover different link sets, so a headless checkpoint must
-	// not be reusable by the net/http backend.
-	for _, fp := range []string{
-		ComputeConfigFingerprint("https://other.com", "same-origin", 3, true, false),
-		ComputeConfigFingerprint("https://ex.com", "same-domain", 3, true, false),
-		ComputeConfigFingerprint("https://ex.com", "same-origin", 5, true, false),
-		ComputeConfigFingerprint("https://ex.com", "same-origin", 3, false, false),
-		// allowPrivate: without this case a regression dropping it from the
-		// fingerprint would let a --dangerous-allow-private checkpoint be resumed
-		// by a run without the flag, and this test would stay green.
-		ComputeConfigFingerprint("https://ex.com", "same-origin", 3, true, true),
-	} {
-		if fp == base {
-			t.Error("fingerprint did not change when a defining field changed")
+
+	// EVERY parameter, one mutation each. Each case states what breaks if the field
+	// is dropped from the hash, because that is the regression this guards.
+	cases := []struct {
+		field string
+		why   string
+		input fingerprintInput
+	}{
+		{"targetURL", "a checkpoint for one target would resume against another",
+			base.with(func(i *fingerprintInput) { i.targetURL = "https://other.com" })},
+		{"scope", "a same-domain checkpoint would resume a same-origin run and vice versa",
+			base.with(func(i *fingerprintInput) { i.scope = "same-domain" })},
+		{"depth", "coverage gathered at one depth limit would count as coverage at another",
+			base.with(func(i *fingerprintInput) { i.depth = 5 })},
+		{"headless", "the two backends discover different link sets, so a headless checkpoint would mark JS-discovered pages covered for a net/http run that never sees them",
+			base.with(func(i *fingerprintInput) { i.headless = false })},
+		{"allowPrivate", "a checkpoint whose queue was gathered with --dangerous-allow-private would be accepted by a run without it",
+			base.with(func(i *fingerprintInput) { i.allowPrivate = true })},
+		{"interact", "enabling --interact on resume would yield zero extra coverage, because every prior page is already marked seen",
+			base.with(func(i *fingerprintInput) { i.interact = true })},
+	}
+
+	seen := map[string]string{baseFP: "base"}
+	for _, c := range cases {
+		t.Run(c.field, func(t *testing.T) {
+			fp := c.input.hash()
+			if fp == baseFP {
+				t.Errorf("fingerprint unchanged when %s changed; without it, %s", c.field, c.why)
+			}
+			if other, dup := seen[fp]; dup {
+				t.Errorf("%s collides with %s", c.field, other)
+			}
+			seen[fp] = c.field
+		})
+	}
+
+	// Length-prefixing prevents field-boundary collisions.
+	a := fingerprintInput{targetURL: "ab", scope: "", headless: true}
+	b := fingerprintInput{targetURL: "a", scope: "b", headless: true}
+	if a.hash() == b.hash() {
+		t.Error("field-boundary collision")
+	}
+}
+
+// TestComputeConfigFingerprint_CoversEveryParameter is the drift guard the
+// hand-written sensitivity list could not be. It reads ComputeConfigFingerprint's
+// declared parameters straight from the source and fails when one has no case in
+// TestComputeConfigFingerprint's table, so adding a discovery-affecting option
+// without asserting it cannot ship silently — the exact way allowPrivate and then
+// interact were missed (LAB-4678 review, TEST-003/SEC-BE-001).
+func TestComputeConfigFingerprint_CoversEveryParameter(t *testing.T) {
+	src, err := os.ReadFile("checkpoint.go")
+	if err != nil {
+		t.Fatalf("read checkpoint.go: %v", err)
+	}
+	decl := regexp.MustCompile(`func ComputeConfigFingerprint\(([^)]*)\)`).FindSubmatch(src)
+	if decl == nil {
+		t.Fatal("could not locate the ComputeConfigFingerprint declaration; update this guard")
+	}
+
+	// "targetURL, scope string, depth int, headless, allowPrivate, interact bool"
+	// -> the identifier at the head of each comma-separated group.
+	var params []string
+	for _, group := range strings.Split(string(decl[1]), ",") {
+		if name := strings.Fields(strings.TrimSpace(group)); len(name) > 0 {
+			params = append(params, name[0])
 		}
 	}
-	// Length-prefixing prevents field-boundary collisions.
-	if ComputeConfigFingerprint("ab", "", 0, true, false) == ComputeConfigFingerprint("a", "b", 0, true, false) {
-		t.Error("field-boundary collision")
+	if len(params) == 0 {
+		t.Fatal("parsed zero parameters; update this guard")
+	}
+
+	tests, err := os.ReadFile("checkpoint_test.go")
+	if err != nil {
+		t.Fatalf("read checkpoint_test.go: %v", err)
+	}
+	for _, p := range params {
+		if !bytes.Contains(tests, []byte(`{"`+p+`", `)) {
+			t.Errorf("ComputeConfigFingerprint parameter %q has no case in "+
+				"TestComputeConfigFingerprint's sensitivity table. Add one asserting the "+
+				"fingerprint changes when it changes, or the field can be dropped from the "+
+				"hash without any test noticing.", p)
+		}
 	}
 }
 

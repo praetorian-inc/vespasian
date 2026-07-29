@@ -106,12 +106,40 @@ type PendingURL struct {
 // restored pending URL against the current scope predicate; this is the second
 // layer, so the two must both fail before a checkpoint can widen the crawl's
 // reach (Codex review, PR #189).
-func ComputeConfigFingerprint(targetURL, scope string, depth int, headless, allowPrivate bool) string {
+//
+// interact is included for the same reason as headless: it changes WHAT the crawl
+// discovers, not how much. --interact clicks controls to surface endpoints that a
+// passive visit never fires, so a page covered without it is not covered with it.
+// Omitting it meant enabling --interact on a resumed run produced ZERO extra
+// coverage — Restore marks every previously-visited page seen, and the interaction
+// pass only runs on pages the crawl visits. If the prior run drained the frontier
+// the follow-up did not merely under-cover, it failed outright with "nothing to
+// crawl" (LAB-4678 review, SEC-BE-001).
+//
+// MEMBERSHIP RULE, so the next option is not forgotten the same way: an input
+// belongs here when changing it changes the set of URLs or requests the crawl can
+// discover or is permitted to reach. It does NOT belong here when it only bounds
+// how much of that set one run gets through. Apply this test before adding a
+// CrawlerOptions field, and see TestComputeConfigFingerprint_CoversEveryParameter
+// for the guard that every parameter here actually affects the hash.
+//
+// Headers are deliberately EXCLUDED, which is the one case where the rule above
+// does not settle it. Credentials do change the reachable surface, so by the rule
+// they would belong. They are excluded anyway because the common operator action is
+// re-supplying a REFRESHED token for the same identity, and invalidating the
+// checkpoint on every token rotation would make resume unusable for exactly the
+// authenticated crawls it is most valuable for. The cost is real and is the
+// operator's to manage: a crawl first run unauthenticated, then resumed with
+// -H "Authorization: ...", permanently skips the authenticated surface behind
+// already-seen pages, because Seen accumulates and nothing prunes it. Start a fresh
+// checkpoint when the identity changes rather than the token.
+func ComputeConfigFingerprint(targetURL, scope string, depth int, headless, allowPrivate, interact bool) string {
 	// Length-prefix each field so ("a","b") and ("ab","") cannot collide, then
 	// hash the assembled input in one shot.
 	field := func(s string) string { return strconv.Itoa(len(s)) + ":" + s }
 	input := field(targetURL) + field(scope) + field(strconv.Itoa(depth)) +
-		field(strconv.FormatBool(headless)) + field(strconv.FormatBool(allowPrivate))
+		field(strconv.FormatBool(headless)) + field(strconv.FormatBool(allowPrivate)) +
+		field(strconv.FormatBool(interact))
 	sum := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(sum[:])
 }

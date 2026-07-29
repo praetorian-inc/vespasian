@@ -291,7 +291,7 @@ func TestCrawl_ResumeSkipsCoveredPages(t *testing.T) {
 	if len(cp.Pending) == 0 {
 		t.Fatal("checkpoint carried no pending pages, so resume cannot continue")
 	}
-	if cp.ConfigFingerprint != ComputeConfigFingerprint(srv.URL, base.Scope, base.Depth, false, base.AllowPrivate) {
+	if cp.ConfigFingerprint != ComputeConfigFingerprint(srv.URL, base.Scope, base.Depth, false, base.AllowPrivate, base.Interact) {
 		t.Error("checkpoint fingerprint does not match the crawl config")
 	}
 
@@ -349,7 +349,7 @@ func TestCrawl_ResumeRejectsForeignCheckpoint(t *testing.T) {
 	// this target's seed is already covered. Honoring it would crawl nothing.
 	foreign := &Checkpoint{
 		Version:           checkpointVersion,
-		ConfigFingerprint: ComputeConfigFingerprint("https://elsewhere.example", "", 5, false, false),
+		ConfigFingerprint: ComputeConfigFingerprint("https://elsewhere.example", "", 5, false, false, false),
 		CreatedAtUnix:     time.Now().Unix(),
 		Seen:              []string{frontierKey(srv.URL + "/")},
 	}
