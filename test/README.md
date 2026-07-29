@@ -18,9 +18,66 @@ End-to-end live tests that spin up intentionally simple target applications, run
 ## Prerequisites
 
 - **Go 1.25+** — [https://go.dev/dl/](https://go.dev/dl/)
-- **Chrome/Chromium** — Required for headless crawling
+- **Chrome/Chromium** — Required for headless crawling (see below)
 - **python3** — Required for test validation scripts
 - **Node.js** — Required for the graphql-server target
+
+### Chrome in containers
+
+A stock Ubuntu devcontainer ships `/usr/bin/chromium-browser` as a **snap
+launcher stub**, and snapd is unavailable inside the container. The stub
+satisfies `command -v` and `-x` but fails the moment it runs, so `setup-live-targets.sh`
+reports it as *"found … but it is not runnable"* rather than passing preflight
+and failing later mid-crawl.
+
+Install a real, non-snap Chrome (`.deb`, amd64 or arm64):
+
+```bash
+./test/install-chrome.sh          # idempotent; no-op if a runnable browser exists
+export VESPASIAN_NO_SANDBOX=true  # containers generally cannot use the Chrome sandbox
+```
+
+The script deliberately leaves **no background egress** behind: Google's apt
+source (`/etc/apt/sources.list.d/google-chrome.list`) is suppressed at install
+time via `repo_add_once=false`, and both it and the daily update pinger
+(`/etc/cron.daily/google-chrome`) are removed afterwards. Chrome's own telemetry
+is separately disabled on every browser vespasian launches (LAB-4999), and the
+live suite always launches through vespasian, so it inherits those flags.
+
+`apt install chromium` / `chromium-browser` are **not** alternatives on Ubuntu
+noble — both are transitional packages that pre-depend on snapd.
+
+### Running without a browser
+
+Browser-free work does not require a browser to be present:
+
+```bash
+./test/run-live-tests.sh --group offline   # importers, generators, fixtures — no setup run needed
+./test/setup-live-targets.sh --skip-start  # build binaries only
+```
+
+The offline group talks to no service, so it needs neither `.live-test-config`
+nor a browser and runs on a fresh checkout. Likewise, `setup-live-targets.sh`
+treats a missing browser as fatal only when the selected targets actually drive
+the headless backend — `--skip-start` and a `grpc-server`-only setup warn and
+continue. Selections that do need a browser still fail loudly at preflight.
+
+### Dynamic (integration) tests
+
+Separate from this live suite, `pkg/crawl` carries `//go:build integration`
+tests that launch a real browser to exercise `NewBrowserManager`'s launch / kill
+/ close lifecycle. They are excluded from `make test` by the build tag and need
+the same non-snap Chrome as above:
+
+```bash
+export VESPASIAN_NO_SANDBOX=true
+go test -tags integration ./pkg/crawl/...
+```
+
+`TestConfigureLauncher_PinsSystemBrowser` is the exception: it only needs a
+browser binary to exist on disk (it asserts go-rod's `.Bin` is pinned so no
+Chromium is auto-downloaded — LAB-4999), so it runs even where Chrome cannot
+launch, and skips cleanly when no browser is present at all.
 
 ## Targets
 

@@ -112,6 +112,27 @@ resolve_targets() {
     printf '%s\n' "$resolved"
 }
 
+# targets_need_config returns 0 when the resolved target list contains at least
+# one target that talks to a live service — i.e. one that needs the ports
+# setup-live-targets.sh writes into .live-test-config.
+#
+# Membership in OFFLINE_TARGETS is the test, rather than a second
+# hand-maintained list: an offline target is service-free by definition, and
+# test-runner-args.sh already guards that array against drift from the dispatch
+# block. A target absent from OFFLINE_TARGETS is assumed to need config, so the
+# unknown/typo case fails loudly on a missing config instead of running
+# half-configured against default ports.
+targets_need_config() {
+    local target
+    for target in ${1//,/ }; do
+        case " ${OFFLINE_TARGETS[*]} " in
+            *" ${target} "*) ;;   # service-free — needs nothing from the config
+            *) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 # Source shared colors, logging, and validation functions
 # shellcheck source=common.sh
 source "${SCRIPT_DIR}/common.sh"
@@ -3717,14 +3738,16 @@ main() {
 
     log_header "Vespasian Live Test Runner"
 
-    # Load config only when it is actually needed. A real run always needs it
-    # (TEST_HOST and service ports for preflight and the tests). A --dry-run
-    # needs it only to resolve the "all" group, whose config-driven
-    # TARGETS_SETUP folds in config-only targets like grpc-server. The offline
-    # and live groups — and an explicit --targets list — resolve purely from the
-    # in-script arrays, so requiring a config there would make --dry-run fail on
-    # a fresh checkout for no reason.
-    if [ "$dry_run" != true ] || { [ -z "$targets" ] && [ "${group:-all}" = all ]; }; then
+    # Load config only when it is actually needed.
+    #
+    # The "all" group must be resolved AFTER load_config, because its
+    # config-driven TARGETS_SETUP folds in config-only targets like grpc-server.
+    # Every other selection — the offline and live groups, and an explicit
+    # --targets list — resolves purely from the in-script arrays, so it can be
+    # resolved first and only then decide whether a config is needed at all.
+    local resolving_all=false
+    if [ -z "$targets" ] && [ "${group:-all}" = all ]; then
+        resolving_all=true
         load_config
     fi
 
@@ -3740,6 +3763,17 @@ main() {
     if [ "$dry_run" = true ]; then
         echo "targets=$targets"
         return 0
+    fi
+
+    # For every non-"all" selection, require a config only when a selected
+    # target actually talks to a live service (LAB-5064). Offline targets are
+    # service-free, so `--group offline` — and any importer/generator --targets
+    # list — now runs on a fresh checkout with no setup-live-targets.sh run at
+    # all. That is the whole point on a browserless host, where setup used to
+    # bail at the Chrome preflight before ever writing .live-test-config and
+    # took deterministic offline coverage down with it.
+    if [ "$resolving_all" != true ] && targets_need_config "$targets"; then
+        load_config
     fi
 
     preflight_test_host "$targets"

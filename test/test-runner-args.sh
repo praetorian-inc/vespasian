@@ -429,6 +429,58 @@ else
 fi
 
 echo ""
+echo "=== A REAL offline run needs no config (LAB-5064) ==="
+
+# The block above only covers --dry-run. LAB-5064 is about the REAL run: on a
+# browserless host setup-live-targets.sh used to exit at the Chrome preflight
+# before writing .live-test-config, which took the service-free offline group
+# down with it even though it needs no ports at all. Guard both halves of the
+# fix — the predicate, and the runner actually honouring it.
+
+source <(sed -n '/^targets_need_config()/,/^}/p' "$RUNNER")
+
+if targets_need_config "$(join_targets "${OFFLINE_TARGETS[@]}")"; then
+    fail "targets_need_config: offline group wrongly reported as needing config"
+else
+    pass "targets_need_config: offline group needs no config"
+fi
+
+if targets_need_config "import-burp,rest-api"; then
+    pass "targets_need_config: a mixed list needs config (live member present)"
+else
+    fail "targets_need_config: mixed list wrongly reported as config-free"
+fi
+
+if targets_need_config "$(join_targets "${LIVE_TARGETS[@]}")"; then
+    pass "targets_need_config: live group needs config"
+else
+    fail "targets_need_config: live group wrongly reported as config-free"
+fi
+
+# An unrecognised target must FAIL CLOSED — treated as needing config, so a typo
+# surfaces as a missing-config error instead of silently running against
+# hardcoded default ports.
+if targets_need_config "totally-unknown-target"; then
+    pass "targets_need_config: unknown target fails closed (needs config)"
+else
+    fail "targets_need_config: unknown target wrongly reported as config-free"
+fi
+
+# Behavioral: a real (non-dry-run) offline selection must get PAST config
+# loading. Asserted as the absence of the config error rather than a specific
+# exit code, because how far the run then gets legitimately differs by
+# environment — in CI this guard runs before setup-go, so it stops at the
+# missing vespasian binary; locally the binary exists and the importer test
+# actually runs. Either way, reaching that point proves no config was demanded.
+# One tiny importer target keeps it fast in both.
+real_offline=$(env CONFIG_FILE="$noconfig" bash -c "source '$RUNNER' --targets import-empty --no-build" 2>&1) || true
+if [[ "$real_offline" == *"Config file not found"* ]]; then
+    fail "real offline run demanded a config: $(printf '%s' "$real_offline" | head -3)"
+else
+    pass "real offline run (--targets import-empty) proceeds without a config file"
+fi
+
+echo ""
 echo "=== Setup-complete guidance (setup-live-targets.sh) ==="
 
 # Drive the REAL run_tests_guidance selector (sourced above, not a copy) for

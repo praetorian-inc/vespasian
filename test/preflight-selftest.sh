@@ -214,6 +214,91 @@ out_f=$(echo "${result}" | sed -n '2p')
 assert_eq "case f: no-timeout fallback still detects a working browser (rc 0)" "0" "${rc_f}"
 assert_eq "case f: no-timeout fallback returns the working browser path" "${WORKING_BROWSER}" "${out_f}"
 
+# ── Cases g-j: the browser gate is CONDITIONAL (LAB-5064) ───────
+#
+# A hard browser gate on every setup blocked work that provably needs no
+# browser and, because it exits before write_config, took the browserless
+# offline run down with it. check_prerequisites now takes <targets> <skip_start>
+# and only treats a missing browser as fatal when the selection actually
+# provisions a browser-backed target.
+#
+# These assert on the "Prerequisites check failed" line rather than on the exit
+# code, so they isolate the browser gate from the script's other prerequisites
+# (go / python3 / node), whose presence varies by host.
+
+# Runs check_prerequisites with only the snap stub available and echoes its
+# output. Args are forwarded verbatim, so the no-arg default is exercised too.
+run_prereqs_with_stub_only() {
+    (
+        # shellcheck source=setup-live-targets.sh
+        source "${SETUP_SCRIPT}"
+        # shellcheck disable=SC2034  # consumed by detect_chrome_binary from the sourced script
+        CHROME_CANDIDATES=("${SNAP_STUB}")
+        set +e
+        check_prerequisites "$@" 2>&1
+    ) || true
+}
+
+assert_gate() {
+    local desc=$1 expect_fatal=$2 output=$3
+    local blocked=false
+    printf '%s' "${output}" | grep -q "Prerequisites check failed" && blocked=true
+    if [ "${blocked}" = "${expect_fatal}" ]; then
+        echo "PASS: ${desc}"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: ${desc} (expected fatal=${expect_fatal}, got fatal=${blocked})"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+# Case g: a browser-backed target is selected → a broken browser is still fatal.
+# This is the LAB-3893 guarantee; the conditional gate must not weaken it.
+assert_gate "case g: browser-backed target keeps the browser gate fatal" \
+    true "$(run_prereqs_with_stub_only "rest-api" false)"
+
+# Case h: grpc-server only. Its live test speaks gRPC reflection and never
+# launches Chrome, so a browserless host must not block the setup.
+out_h="$(run_prereqs_with_stub_only "grpc-server" false)"
+assert_gate "case h: grpc-server-only setup does not require a browser" false "${out_h}"
+# Non-fatal must not mean silent: the stub is still diagnosed, just at WARN.
+# A developer who later switches to a browser-backed target needs to have seen
+# that their /usr/bin/chromium-browser is a stub.
+if printf '%s' "${out_h}" | grep -q "not runnable"; then
+    echo "PASS: case h: broken browser still diagnosed, just non-fatally"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case h: non-fatal gate silently swallowed the broken-browser diagnosis"
+    fail_count=$((fail_count + 1))
+fi
+
+# Case i: --skip-start builds binaries and starts nothing, so it needs no
+# browser regardless of how many browser-backed targets are selected.
+assert_gate "case i: --skip-start never requires a browser" \
+    true "$(run_prereqs_with_stub_only "rest-api" false)"
+assert_gate "case i: --skip-start with browser targets is non-fatal" \
+    false "$(run_prereqs_with_stub_only "rest-api" true)"
+
+# Case j: the no-argument call (used by nothing in-tree, but the safe default)
+# must keep the old strict behaviour — every target selected, gate fatal.
+assert_gate "case j: no-arg check_prerequisites defaults to the strict gate" \
+    true "$(run_prereqs_with_stub_only)"
+
+# Case k: browser_required's mapping itself.
+result=$(
+    (
+        # shellcheck source=setup-live-targets.sh
+        source "${SETUP_SCRIPT}"
+        set +e
+        browser_required "grpc-server"; echo "grpc=$?"
+        browser_required "rest-api"; echo "rest=$?"
+        browser_required "grpc-server,concat-spa"; echo "mixed=$?"
+    )
+)
+assert_eq "case k: grpc-server alone needs no browser" "grpc=1" "$(echo "${result}" | sed -n '1p')"
+assert_eq "case k: rest-api needs a browser" "rest=0" "$(echo "${result}" | sed -n '2p')"
+assert_eq "case k: a mixed list needs a browser" "mixed=0" "$(echo "${result}" | sed -n '3p')"
+
 # ── Summary ─────────────────────────────────────────────────────
 echo ""
 echo "preflight-selftest: ${pass_count} passed, ${fail_count} failed"

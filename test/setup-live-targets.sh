@@ -124,52 +124,51 @@ resolve_port_or_die() {
 # Prerequisites
 # ──────────────────────────────────────────────────────────────
 
-# Candidate browsers, in priority order. Overridable by tests.
-CHROME_CANDIDATES=(
-    google-chrome chromium-browser chromium chrome
-    /usr/bin/google-chrome /usr/bin/chromium-browser /usr/bin/chromium
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-    /snap/bin/chromium
-)
+# CHROME_CANDIDATES, chrome_runnable, and detect_chrome_binary now live in
+# common.sh (sourced above) so install-chrome.sh can reuse the same probe.
 
-# Probe a candidate for actual runnability. --version is fast and needs no X/DBus.
-chrome_runnable() {
-    local t=""
-    if command -v timeout >/dev/null 2>&1; then
-        t=timeout
-    elif command -v gtimeout >/dev/null 2>&1; then   # macOS + coreutils
-        t=gtimeout
-    fi
-    if [ -n "$t" ]; then
-        "$t" 2 "$1" --version >/dev/null 2>&1
-    else
-        # No timeout available (e.g. stock macOS): probe directly. A binary that
-        # hangs on --version would block here — known limitation, documented in
-        # test/README.md.
-        "$1" --version >/dev/null 2>&1
-    fi
-}
+# Setup targets whose live tests drive the rod (headless-browser) backend.
+# grpc-server is deliberately absent: its live test speaks gRPC reflection and
+# never launches Chrome, so setting it up on a browserless host is legitimate.
+# Consulted by browser_required to decide whether a missing browser is fatal.
+BROWSER_TARGETS="rest-api soap-service graphql-server concat-spa forms-target"
 
-# Resolve + probe candidates. On success: echo the runnable binary, return 0.
-# On "present but not runnable": echo the first broken binary, return 2.
-# On "nothing found": echo nothing, return 1.
-detect_chrome_binary() {
-    local browser bin stub=""
-    for browser in "${CHROME_CANDIDATES[@]}"; do
-        bin=$(command -v "$browser" 2>/dev/null) || continue
-        if chrome_runnable "$bin"; then
-            printf '%s\n' "$bin"
-            return 0
-        fi
-        [ -z "$stub" ] && stub="$bin"
+# browser_required returns 0 when the selected target list contains at least one
+# target whose live test needs a runnable browser.
+#
+# The point of the distinction (LAB-5064): a hard browser gate on EVERY setup
+# blocks work that provably needs no browser — `--skip-start` (build-only) and
+# grpc-server-only setups — and, because the gate exits before write_config,
+# it also blocked the browserless `--group offline` run downstream. When no
+# selected target needs a browser the check degrades to a warning, matching the
+# warn-and-skip contract run-live-tests.sh already applies per rod target.
+browser_required() {
+    local selected=$1 target
+    for target in ${selected//,/ }; do
+        case " ${BROWSER_TARGETS} " in
+            *" ${target} "*) return 0 ;;
+        esac
     done
-    [ -n "$stub" ] && { printf '%s\n' "$stub"; return 2; }
     return 1
 }
 
+# check_prerequisites <targets> <skip_start>
+#
+# Both arguments feed the browser gate only; every other prerequisite is
+# unconditional. skip_start is passed as "true"/"false" from main.
 check_prerequisites() {
+    local selected="${1:-$ALL_TARGETS}"
+    local skip_start="${2:-false}"
     log_header "Checking Prerequisites"
     local failed=0
+
+    # A browser is fatal only when this setup is actually provisioning targets
+    # whose live tests launch one. --skip-start builds binaries and starts
+    # nothing, so it never needs a browser regardless of target selection.
+    local browser_fatal=true
+    if [ "$skip_start" = true ] || ! browser_required "$selected"; then
+        browser_fatal=false
+    fi
 
     # Go
     if command -v go >/dev/null 2>&1; then
@@ -186,12 +185,23 @@ check_prerequisites() {
     # this script's `set -e`, a bare `chrome_bin=$(cmd); rc=$?` would abort the
     # script the instant detect_chrome_binary returns non-zero, before rc=$?
     # ever ran, and the elif/else branches below would never execute.
+    #
+    # When browser_fatal is false the same diagnosis is reported at WARN and
+    # does not set `failed`, so setup completes and writes .live-test-config.
+    # `browser_log` / the explicit `if` below rather than `[ … ] && failed=1`:
+    # under this script's `set -e` a trailing AND-list whose test is false
+    # returns 1 and would abort the script mid-preflight — the same class of
+    # bug the detect_chrome_binary note above guards against.
     local chrome_bin rc=0
     chrome_bin=$(detect_chrome_binary) || rc=$?
+    local browser_log=log_fail
+    if [ "$browser_fatal" != true ]; then
+        browser_log=log_warn
+    fi
     if [ $rc -eq 0 ]; then
         log_ok "Browser: $chrome_bin"
     elif [ $rc -eq 2 ]; then
-        log_fail "Found ${chrome_bin} but it is not runnable"
+        $browser_log "Found ${chrome_bin} but it is not runnable"
         case "$chrome_bin" in
             */snap/*|*/chromium-browser|*/chromium)
                 log_info "(looks like the Ubuntu snap stub — install the chromium snap: 'snap install chromium', or use google-chrome)."
@@ -200,11 +210,21 @@ check_prerequisites() {
                 log_info "(the binary exists but failed to run — check permissions, missing shared libraries, or reinstall the browser)."
                 ;;
         esac
-        failed=1
+        if [ "$browser_fatal" = true ]; then
+            failed=1
+        fi
     else
-        log_fail "Chrome/Chromium not found. Required for headless crawling."
-        log_info "Install: https://www.google.com/chrome/ or 'apt install chromium-browser'"
-        failed=1
+        $browser_log "Chrome/Chromium not found. Required for headless crawling."
+        # Deliberately NOT suggesting 'apt install chromium-browser': on Ubuntu
+        # noble that package is a transitional stub that pre-depends on snapd,
+        # i.e. the unrunnable binary this check exists to catch.
+        log_info "Install: './test/install-chrome.sh' (Debian/Ubuntu container) or https://www.google.com/chrome/"
+        if [ "$browser_fatal" = true ]; then
+            failed=1
+        fi
+    fi
+    if [ $rc -ne 0 ] && [ "$browser_fatal" != true ]; then
+        log_info "(no browser needed for this setup — browser-backed targets will skip when you run them)."
     fi
 
     # python3
@@ -819,7 +839,9 @@ main() {
 
     log_header "Vespasian Live Test Setup"
 
-    check_prerequisites
+    # Pass the selection through: the browser gate is fatal only for setups that
+    # actually provision browser-backed targets (LAB-5064).
+    check_prerequisites "$targets" "$skip_start"
 
     # ── Build phase ──
     log_header "Building Binaries"

@@ -121,7 +121,9 @@ The `test/` directory contains live test targets:
 - **test/concat-spa/**: Go HTTP server serving a single-page app whose API endpoints exist only as concatenated strings in an external JS bundle (discovered via post-crawl JS-replay)
 - **test/forms-target/**: Go HTTP server serving an HTML `<form>` page whose POST endpoints are recovered by static form extraction (`analyze.ExtractForms`); a co-located GET search form contributes query parameters to a crawl-linked endpoint
 
-See `test/README.md` for how to run the suite, including the `TEST_HOST` override for devcontainer setups.
+Supporting scripts: `test/install-chrome.sh` provisions a real non-snap Chrome for containers (Ubuntu's `chromium-browser` is a snap stub that cannot run in-container), and `test/preflight-selftest.sh` / `test/test-runner-args.sh` are the CI-run regression guards for the setup preflight and the target-group/dispatch wiring.
+
+See `test/README.md` for how to run the suite, including the `TEST_HOST` override for devcontainer setups, the browserless `--group offline` path, and the `//go:build integration` browser-lifecycle tests.
 
 ## Code Conventions
 
