@@ -155,7 +155,7 @@ func scopeCheckerWith(seedURL string, scope string, allowPrivate bool, hc *hostC
 		return nil, fmt.Errorf("parse seed URL: %w", err)
 	}
 	if seed.Host == "" {
-		return nil, fmt.Errorf("seed URL has no host: %q", seedURL)
+		return nil, fmt.Errorf("seed URL has no host: %q", redactSeedURL(seedURL))
 	}
 
 	// ssrfCheck returns false (reject) if the URL resolves to a private IP.
@@ -211,9 +211,14 @@ func scopeCheckerWith(seedURL string, scope string, allowPrivate bool, hc *hostC
 // deliberately narrow and auditable:
 //
 //  1. Only the SEED's own navigation can widen scope. LearnEffectiveOrigin is
-//     called from the depth-0 page visit and nowhere else, so a redirect issued
-//     by some arbitrary page deeper in the crawl — which an attacker-controlled
-//     page could trigger at will — never widens anything.
+//     called from the visit of the entry whose frontier key EQUALS the seed's, and
+//     nowhere else, so a redirect issued by some arbitrary page deeper in the crawl
+//     — which an attacker-controlled page could trigger at will — never widens
+//     anything. The gate is seed identity rather than depth 0 because resume broke
+//     depth as a proxy: resumeFrontier restores pending entries before the seed is
+//     pushed and honors the Depth the artifact claims, so a crafted checkpoint could
+//     put a non-seed URL at depth 0 ahead of the seed and pick which page learned
+//     the origin (LAB-4678 review, SEC-BE-004).
 //  2. It is one-shot and adds exactly ONE origin: the scheme://host the seed
 //     resolved to. It is not a domain-level relaxation, and a second call (a
 //     resumed depth-0 entry, a retry) cannot add another origin.

@@ -15,7 +15,10 @@
 package crawl
 
 import (
+	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -734,4 +737,162 @@ func TestBudgetReached_Reserve(t *testing.T) {
 			t.Errorf("reserve consumed a page slot when the request budget stopped the crawl: pageCount = %d, want 1", pages)
 		}
 	})
+}
+
+// TestEnrichTarget_RedactsCredentialsInNavigationNotice pins the redaction on the
+// interaction navigation notice. For the depth-0 visit pageURL is the seed exactly
+// as the operator typed it, so echoing it raw wrote cleartext credentials to
+// stderr, and stderr lands in CI job logs, shell scrollback, and any wrapper that
+// captures the capability's output (LAB-4678 review, SEC-BE-005).
+//
+// navigated=true is the only branch that writes, and it ignores the page argument,
+// so this needs no browser.
+func TestEnrichTarget_RedactsCredentialsInNavigationNotice(t *testing.T) {
+	var stderr bytes.Buffer
+	e := &rodEngine{opts: engineOptions{Stderr: &stderr}}
+
+	if got := e.enrichTarget(nil, true, "https://admin:s3cret@target.example.com/app"); got != nil {
+		t.Error("enrichTarget must return nil when a click navigated away unrecoverably")
+	}
+
+	out := stderr.String()
+	if out == "" {
+		t.Fatal("no notice written")
+	}
+	for _, secret := range []string{"s3cret", "admin:"} {
+		if strings.Contains(out, secret) {
+			t.Errorf("credential %q leaked to stderr: %q", secret, out)
+		}
+	}
+}
+
+// urlEchoIdentifiers are the identifiers in this package that hold a RAW,
+// operator-supplied URL, which may carry userinfo credentials. Identifiers holding
+// a derived origin (originOf output, which is scheme://host and so cannot contain
+// userinfo) are deliberately absent.
+var urlEchoIdentifiers = []string{
+	"pageURL", "targetURL", "seedURL", "rawURL", "effectiveURL",
+	"entry.URL", "target.URL", "req.URL.String()", "info.URL",
+}
+
+// TestOperatorFacingURLEchoesAreRedacted is the class-level guard for SEC-BE-005.
+// redactSeedURL was applied at nine echo sites and skipped at the one this PR
+// added; reviewing the diff found the new line but nothing compared it against the
+// established pattern. This scans every non-test file in the package for an
+// operator-facing message that interpolates a raw-URL identifier and requires
+// redactSeedURL on the same line, so the eleventh site cannot regress the way the
+// tenth did.
+//
+// It reads source rather than behavior on purpose: the alternative is one
+// behavioral test per echo site, several of which need a live browser or a real
+// redirect to reach.
+func TestOperatorFacingURLEchoesAreRedacted(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+
+	checked := 0
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		for n, line := range strings.Split(string(src), "\n") {
+			// Only message-producing calls. A plain assignment or comparison that
+			// mentions a URL identifier is not an echo.
+			if !strings.Contains(line, "fmt.Fprint") && !strings.Contains(line, "fmt.Errorf") {
+				continue
+			}
+			for _, id := range urlEchoIdentifiers {
+				if !strings.Contains(line, id) {
+					continue
+				}
+				checked++
+				if !strings.Contains(line, "redactSeedURL(") {
+					t.Errorf("%s:%d echoes raw URL identifier %q without redactSeedURL; "+
+						"an operator-supplied URL can carry userinfo credentials and stderr "+
+						"lands in CI logs\n\t%s", f, n+1, id, strings.TrimSpace(line))
+				}
+			}
+		}
+	}
+
+	// If the identifier list ever stops matching the code, this guard silently
+	// passes over everything. Assert it still finds the known sites.
+	if checked < 5 {
+		t.Errorf("matched only %d URL echo sites; urlEchoIdentifiers has probably drifted "+
+			"from the code and this guard is no longer checking anything", checked)
+	}
+}
+
+// TestLearnSeedOrigin_OnlyTheSeedWidensScope pins the containment invariant that
+// seedScope's whole argument rests on: only the seed's own navigation may widen
+// scope. The gate used to be Depth == 0, which was a valid proxy only while the
+// seed was the sole depth-0 entry.
+//
+// Resume broke that. resumeFrontier restores pending entries BEFORE the seed is
+// pushed, and urlFrontier.Restore honors whatever Depth the checkpoint claims, so a
+// restored entry carrying "Depth": 0 with a different URL is popped ahead of the
+// seed and became the page whose post-redirect origin was learned. A checkpoint is
+// unauthenticated by design, so anyone who could write to checkpoint storage chose
+// which page decided the widening (LAB-4678 review, SEC-BE-004).
+//
+// The gate is reached before any CDP call, so a nil page exercises it: a rejected
+// target returns before touching the page, and an accepted one would nil-panic —
+// which is what makes "accepted" observable here without a browser.
+func TestLearnSeedOrigin_OnlyTheSeedWidensScope(t *testing.T) {
+	const seed = "https://target.example.com/app"
+
+	cases := []struct {
+		name         string
+		target       urlEntry
+		wantConsider bool
+	}{
+		{"the seed itself is considered", urlEntry{URL: seed, Depth: 0}, true},
+		{"the seed at a non-zero depth is still the seed", urlEntry{URL: seed, Depth: 3}, true},
+		// The regression: a checkpoint-injected entry claiming depth 0.
+		{"a foreign URL claiming depth 0 is refused", urlEntry{URL: "https://attacker.example/x", Depth: 0}, false},
+		{"an ordinary deeper page is refused", urlEntry{URL: "https://target.example.com/deep", Depth: 2}, false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var learned []string
+			e := &rodEngine{
+				seedKey: frontierKey(seed),
+				opts: engineOptions{
+					LearnEffectiveOrigin: func(u string) { learned = append(learned, u) },
+				},
+			}
+
+			// A considered target proceeds to page.Info() on the nil page and panics;
+			// a refused one returns before touching it. Either way the callback must
+			// not have fired, since a nil page yields no URL.
+			considered := func() (reached bool) {
+				defer func() { reached = recover() != nil }()
+				e.learnSeedOrigin(nil, c.target)
+				return false
+			}()
+
+			if considered != c.wantConsider {
+				t.Errorf("target %+v: reached the page read = %v, want %v",
+					c.target, considered, c.wantConsider)
+			}
+			if len(learned) != 0 {
+				t.Errorf("LearnEffectiveOrigin called with %v from a nil page", learned)
+			}
+		})
+	}
+}
+
+// TestLearnSeedOrigin_NoCallbackIsInert covers the nil-callback guard so the
+// identity check cannot be reordered ahead of it into a nil dereference.
+func TestLearnSeedOrigin_NoCallbackIsInert(t *testing.T) {
+	e := &rodEngine{seedKey: frontierKey("https://ex.com/"), opts: engineOptions{}}
+	// Must return without touching the nil page even for the seed itself.
+	e.learnSeedOrigin(nil, urlEntry{URL: "https://ex.com/", Depth: 0})
 }

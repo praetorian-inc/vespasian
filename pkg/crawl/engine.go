@@ -152,6 +152,12 @@ type rodEngine struct {
 	browser  *rod.Browser
 	opts     engineOptions
 	frontier *urlFrontier
+
+	// seedKey is frontierKey(seedURL), set by Crawl before any worker starts and
+	// read-only afterwards. It identifies the SEED entry so learnSeedOrigin can gate
+	// on "is this the seed" rather than on "is this depth 0"; see learnSeedOrigin for
+	// why depth is not a valid proxy once resume exists.
+	seedKey string
 }
 
 // newRodEngine connects to the Chrome instance at wsURL and returns a crawl
@@ -197,6 +203,10 @@ func newRodEngine(wsURL string, opts engineOptions) (*rodEngine, error) {
 // completes (frontier exhausted, maxPages reached, or ctx canceled). Each
 // captured network request is passed to onResult as it is observed.
 func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(ObservedRequest)) error {
+	// Record which frontier entry IS the seed, before any worker starts. Written
+	// once here and only read afterwards, so no synchronization is needed.
+	e.seedKey = frontierKey(seedURL)
+
 	// Seed the frontier. If Push adds zero entries the seed was rejected
 	// (malformed URL, scope mismatch, or — the common case — the seed is a
 	// private host such as localhost / 127.0.0.1 / RFC1918 / 169.254.*, which
@@ -363,7 +373,7 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 				return
 			}
 			if e.opts.Stderr != nil {
-				fmt.Fprintf(e.opts.Stderr, "worker %d: error visiting %s: %v\n", id, entry.URL, err) //nolint:errcheck // best-effort
+				fmt.Fprintf(e.opts.Stderr, "worker %d: error visiting %s: %v\n", id, redactSeedURL(entry.URL), err) //nolint:errcheck // best-effort
 			}
 			// The visit failed for a plausibly transient reason (navigation error,
 			// DNS blip, connection reset) with the crawl still healthy. Do not retry
@@ -505,12 +515,24 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 // Redirects have been followed by the time the load event fires, so page.Info()
 // reports the document the seed actually resolved to.
 //
-// Only depth 0 — the seed itself — may widen scope, and the widening is one-shot
-// inside the predicate (see [seedScope]). It must run before the scope filter in
+// Only the SEED itself may widen scope, and the widening is one-shot inside the
+// predicate (see [seedScope]). It must run before the scope filter in
 // enrichFromPage, or a cross-origin seed redirect discards every captured request
 // and the crawl returns an empty capture with no diagnostic.
+//
+// The gate is IDENTITY with the seed, not Depth == 0. Depth was a valid proxy only
+// while the seed was the sole depth-0 entry, which stopped being true when resume
+// landed: resumeFrontier runs BEFORE the seed is pushed, and urlFrontier.Restore
+// honors whatever Depth the checkpoint claims, so a restored entry carrying
+// "Depth": 0 with a different URL is popped from the FIFO queue ahead of the seed
+// and would become the page whose post-redirect origin is learned. A checkpoint is
+// unauthenticated by design — its fingerprint is derived from non-secret crawl
+// config — so under the proxy gate anyone able to write to checkpoint storage chose
+// which page decided the scope widening. Comparing against the seed's frontier key
+// restores the invariant seedScope's containment argument depends on
+// (LAB-4678 review, SEC-BE-004).
 func (e *rodEngine) learnSeedOrigin(page *rod.Page, target urlEntry) {
-	if target.Depth != 0 || e.opts.LearnEffectiveOrigin == nil {
+	if e.opts.LearnEffectiveOrigin == nil || frontierKey(target.URL) != e.seedKey {
 		return
 	}
 	info, err := page.Info()
@@ -535,7 +557,13 @@ func (e *rodEngine) enrichTarget(page *rod.Page, navigated bool, pageURL string)
 		return page
 	}
 	if e.opts.Stderr != nil {
-		fmt.Fprintf(e.opts.Stderr, "interact: a click navigated away from %s and the page could not be restored; skipping DOM enrichment for it\n", pageURL) //nolint:errcheck // best-effort
+		// redactSeedURL, not the raw URL: for the depth-0 visit pageURL is the seed
+		// exactly as the operator typed it, so `vespasian crawl --interact
+		// https://admin:s3cret@target/` wrote cleartext credentials to stderr, which
+		// lands in CI job logs, shell scrollback, and any wrapper capturing the
+		// capability's stderr. Every other operator-facing URL echo in this package
+		// already redacts; this one was added without it (LAB-4678 review, SEC-BE-005).
+		fmt.Fprintf(e.opts.Stderr, "interact: a click navigated away from %s and the page could not be restored; skipping DOM enrichment for it\n", redactSeedURL(pageURL)) //nolint:errcheck // best-effort
 	}
 	return nil
 }
@@ -630,7 +658,7 @@ func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, 
 	domLinks, err := extractLinks(page, baseURL)
 	if err != nil {
 		if stderr != nil {
-			fmt.Fprintf(stderr, "link extraction failed for %s: %v\n", pageURL, err) //nolint:errcheck // best-effort
+			fmt.Fprintf(stderr, "link extraction failed for %s: %v\n", redactSeedURL(pageURL), err) //nolint:errcheck // best-effort
 		}
 		domLinks = nil
 	}
@@ -643,7 +671,7 @@ func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, 
 	// here is non-fatal — treat as "no forms discovered" and keep going.
 	forms, ferr := extractForms(page, resolvedPageURL, baseURL)
 	if ferr != nil && stderr != nil {
-		fmt.Fprintf(stderr, "form extraction failed for %s: %v\n", pageURL, ferr) //nolint:errcheck // best-effort
+		fmt.Fprintf(stderr, "form extraction failed for %s: %v\n", redactSeedURL(pageURL), ferr) //nolint:errcheck // best-effort
 	}
 
 	captured, links := mergeEnrichedLinksFn(captured, domLinks, jsFromResponses, jsFromInline, forms, resolvedPageURL, baseURL, scopeFn)
