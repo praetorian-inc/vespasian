@@ -17,6 +17,11 @@ package sdk
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"strconv"
+	"strings"
 	"testing"
 
 	"time"
@@ -738,17 +743,79 @@ func TestCrawlOptsFromCtx_MaxRequestsAndInteractDefaults(t *testing.T) {
 // Parameters(). A parameter honored by crawlOptsFromCtx but absent from the
 // declaration is unreachable through the Guard-facing surface, so the feature
 // ships dark and only a hand-built context can exercise it.
+// The read set is DERIVED FROM SOURCE, not hand-listed. A literal slice annotated
+// "keep in sync" only covers keys someone remembered to add, which is the very
+// failure mode this test exists to catch: the next parameter read by crawlOptsFromCtx
+// without a matching entry would ship dark and the test would stay green. Parsing the
+// function's own ctx.Parameters.Get*("...") calls removes the sync burden entirely
+// (LAB-4678 review, TEST-010).
 func TestCapability_DeclaredParametersAreReadable(t *testing.T) {
 	declared := make(map[string]bool)
 	for _, p := range (&Capability{}).Parameters() {
 		declared[p.Name] = true
 	}
 
-	// Every key crawlOptsFromCtx consults. Keep in sync with that function.
-	for _, name := range []string{
-		"timeout", "max_pages", "depth", "max_requests", "interact", "headers", "scope",
-	} {
+	read := parametersReadFromSource(t)
+	require.NotEmpty(t, read,
+		"parsed zero parameter reads out of crawlOptsFromCtx; the extraction below has "+
+			"drifted from the code and this guard is no longer checking anything")
+
+	for _, name := range read {
 		assert.True(t, declared[name],
 			"crawlOptsFromCtx reads %q but Parameters() does not declare it, so no host can set it", name)
 	}
+}
+
+// parametersReadFromSource returns every parameter name crawlOptsFromCtx pulls off
+// the ExecutionContext, by parsing capability.go with go/ast and collecting the string
+// literal argument of each ctx.Parameters.Get* call inside that function.
+//
+// go/ast rather than a regexp so a name mentioned in a comment or an unrelated string
+// cannot be picked up, and so the extraction is scoped to the one function.
+func parametersReadFromSource(t *testing.T) []string {
+	t.Helper()
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "capability.go", nil, 0)
+	require.NoError(t, err, "parse capability.go")
+
+	var fn *ast.FuncDecl
+	for _, decl := range file.Decls {
+		if f, ok := decl.(*ast.FuncDecl); ok && f.Name.Name == "crawlOptsFromCtx" {
+			fn = f
+			break
+		}
+	}
+	require.NotNil(t, fn, "crawlOptsFromCtx not found in capability.go; update this guard")
+
+	seen := make(map[string]bool)
+	var names []string
+	ast.Inspect(fn, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) == 0 {
+			return true
+		}
+		// Match ctx.Parameters.GetString / GetInt / GetBool / ... — a selector whose
+		// method name starts with "Get" and whose receiver is a "Parameters" selector.
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || !strings.HasPrefix(sel.Sel.Name, "Get") {
+			return true
+		}
+		recv, ok := sel.X.(*ast.SelectorExpr)
+		if !ok || recv.Sel.Name != "Parameters" {
+			return true
+		}
+		lit, ok := call.Args[0].(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return true
+		}
+		name, err := strconv.Unquote(lit.Value)
+		if err != nil || seen[name] {
+			return true
+		}
+		seen[name] = true
+		names = append(names, name)
+		return true
+	})
+	return names
 }

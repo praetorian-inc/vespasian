@@ -17,6 +17,7 @@ package crawl
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -25,6 +26,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // mergeEnrichedLinks is the pure, DOM-free portion of enrichFromPage. These
@@ -884,7 +886,7 @@ func TestOperatorFacingURLEchoesAreRedacted(t *testing.T) {
 		if strings.HasSuffix(f, "_test.go") {
 			continue
 		}
-		src, err := os.ReadFile(f)
+		src, err := os.ReadFile(f) //nolint:gosec // G304: f comes from a glob of this package's own directory
 		if err != nil {
 			t.Fatalf("read %s: %v", f, err)
 		}
@@ -982,4 +984,148 @@ func TestLearnSeedOrigin_NoCallbackIsInert(t *testing.T) {
 	e := &rodEngine{seedKey: frontierKey("https://ex.com/"), opts: engineOptions{}}
 	// Must return without touching the nil page even for the seed itself.
 	e.learnSeedOrigin(nil, urlEntry{URL: "https://ex.com/", Depth: 0})
+}
+
+// newTestEngine builds a rodEngine with no browser, for driving worker's budget and
+// requeue logic directly. visit is stubbed, so nothing touches Chrome.
+func newTestEngine(opts engineOptions, visit func(context.Context, urlEntry) ([]ObservedRequest, []string, error)) *rodEngine {
+	e := &rodEngine{
+		opts:     opts,
+		frontier: newURLFrontier(opts.MaxDepth, opts.ScopeCheck),
+		visit:    visit,
+	}
+	return e
+}
+
+// nRequests builds n distinct captured requests for one page, so a stubbed visit can
+// return a realistic multi-request page the way a real SPA visit does.
+func nRequests(pageURL string, n int) []ObservedRequest {
+	out := make([]ObservedRequest, 0, n)
+	for i := range n {
+		out = append(out, ObservedRequest{
+			Method: "GET",
+			URL:    fmt.Sprintf("%s/xhr/%d", pageURL, i),
+		})
+	}
+	return out
+}
+
+// TestWorker_MaxRequestsBudget_RodBackend covers --max-requests on the DEFAULT
+// (headless) backend, which is the one Guard runs and the one that had no coverage at
+// any level. The existing TestCrawl_MaxRequests_HTTPBackend sets Headless: false, so
+// it exercises the net/http path where one page is one request and the request budget
+// degenerates into a page cap; nothing verified that the rod worker consults the
+// request budget at all (LAB-4678 review, TEST-004).
+//
+// It asserts the three properties the PR claims:
+//   - the crawl stops taking new pages once reqCount >= MaxRequests,
+//   - the entry dequeued but not visited is REQUEUED, so it survives into resume
+//     state rather than being dropped,
+//   - the documented bound holds: the final count exceeds MaxRequests by at most one
+//     page's requests, and is not unbounded.
+func TestWorker_MaxRequestsBudget_RodBackend(t *testing.T) {
+	const (
+		maxRequests       = 10
+		requestsPerPage   = 4
+		pagesInFrontier   = 20
+		expectedOvershoot = requestsPerPage - 1 // the page that crosses the bound still finishes
+	)
+
+	var visited atomic.Int64
+	visit := func(_ context.Context, target urlEntry) ([]ObservedRequest, []string, error) {
+		visited.Add(1)
+		// No links: the frontier is pre-seeded, so the budget is the only thing that
+		// can stop the crawl and a failure shows up as a hang or an overshoot.
+		return nRequests(target.URL, requestsPerPage), nil, nil
+	}
+
+	e := newTestEngine(engineOptions{
+		MaxRequests: maxRequests,
+		MaxDepth:    -1,
+		Concurrency: 1,
+	}, visit)
+
+	entries := make([]urlEntry, 0, pagesInFrontier)
+	for i := range pagesInFrontier {
+		entries = append(entries, urlEntry{URL: fmt.Sprintf("https://ex.com/p%d", i), Depth: 1})
+	}
+	if got := e.frontier.Push(entries); got != pagesInFrontier {
+		t.Fatalf("seeded %d entries, want %d", got, pagesInFrontier)
+	}
+
+	var (
+		mu        sync.Mutex
+		pageCount int
+		reqCount  int
+		emitted   atomic.Int64
+	)
+
+	done := make(chan struct{})
+	go func() {
+		e.worker(context.Background(), 0, func(ObservedRequest) { emitted.Add(1) }, &mu, &pageCount, &reqCount)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("worker did not terminate: the request budget must stop the loop, not spin")
+	}
+
+	got := int(emitted.Load())
+	if got < maxRequests {
+		t.Errorf("emitted %d requests, want at least the budget of %d", got, maxRequests)
+	}
+	if got > maxRequests+expectedOvershoot {
+		t.Errorf("emitted %d requests, want at most %d (budget %d + one page's %d requests): "+
+			"the overshoot must be bounded by one page, not unbounded",
+			got, maxRequests+expectedOvershoot, maxRequests, requestsPerPage)
+	}
+
+	// The budget must stop the crawl well short of the frontier.
+	if v := int(visited.Load()); v >= pagesInFrontier {
+		t.Errorf("visited %d of %d pages: the request budget did not stop the crawl", v, pagesInFrontier)
+	}
+
+	// Unvisited pages must remain in resume state, including the entry that was
+	// dequeued and then returned when the budget check fired.
+	cp := e.frontier.Snapshot
+	pending, _ := cp()
+	if len(pending) == 0 {
+		t.Fatal("no pending entries survived: pages the budget prevented from being " +
+			"visited must be requeued for resume, not dropped")
+	}
+	if len(pending)+int(visited.Load()) < pagesInFrontier {
+		t.Errorf("pending(%d) + visited(%d) = %d, want at least %d: an entry was dropped "+
+			"rather than requeued", len(pending), visited.Load(), len(pending)+int(visited.Load()), pagesInFrontier)
+	}
+}
+
+// TestWorker_MaxRequestsZeroIsUnlimited pins that the budget is opt-in: with
+// MaxRequests unset the worker drains the frontier. A guard that treated 0 as "stop
+// immediately" would make the flag's default silently disable the crawl.
+func TestWorker_MaxRequestsZeroIsUnlimited(t *testing.T) {
+	const pages = 6
+	e := newTestEngine(engineOptions{MaxDepth: -1, Concurrency: 1},
+		func(_ context.Context, target urlEntry) ([]ObservedRequest, []string, error) {
+			return nRequests(target.URL, 3), nil, nil
+		})
+
+	entries := make([]urlEntry, 0, pages)
+	for i := range pages {
+		entries = append(entries, urlEntry{URL: fmt.Sprintf("https://ex.com/p%d", i), Depth: 1})
+	}
+	e.frontier.Push(entries)
+
+	var (
+		mu        sync.Mutex
+		pageCount int
+		reqCount  int
+		emitted   atomic.Int64
+	)
+	e.worker(context.Background(), 0, func(ObservedRequest) { emitted.Add(1) }, &mu, &pageCount, &reqCount)
+
+	if got := int(emitted.Load()); got != pages*3 {
+		t.Errorf("emitted %d requests, want %d: MaxRequests=0 must mean unlimited", got, pages*3)
+	}
 }

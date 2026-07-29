@@ -158,6 +158,19 @@ type rodEngine struct {
 	// on "is this the seed" rather than on "is this depth 0"; see learnSeedOrigin for
 	// why depth is not a valid proxy once resume exists.
 	seedKey string
+
+	// visit performs one page visit. It is a field, defaulting to visitPage, purely
+	// so worker's budget and requeue logic is reachable without a browser.
+	//
+	// Without this seam the entire worker loop — both budgetReached calls, the
+	// requeue-on-budget path, and MaxRequests enforcement on the DEFAULT backend —
+	// was testable only through the //go:build integration suite, which no CI job
+	// runs. The request budget's only non-tagged coverage exercised the net/http
+	// backend, where one page is one request so it degenerates to a page cap.
+	// Removing `maxRequests := e.opts.MaxRequests` would have left --max-requests
+	// silently inert on the backend Guard actually uses, with every test still green
+	// (LAB-4678 review, TEST-004).
+	visit func(ctx context.Context, target urlEntry) ([]ObservedRequest, []string, error)
 }
 
 // newRodEngine connects to the Chrome instance at wsURL and returns a crawl
@@ -192,11 +205,13 @@ func newRodEngine(wsURL string, opts engineOptions) (*rodEngine, error) {
 
 	frontier := newURLFrontier(opts.MaxDepth, opts.ScopeCheck)
 
-	return &rodEngine{
+	e := &rodEngine{
 		browser:  browser,
 		opts:     opts,
 		frontier: frontier,
-	}, nil
+	}
+	e.visit = e.visitPage
+	return e, nil
 }
 
 // Crawl starts the concurrent crawl from seedURL. It blocks until the crawl
@@ -364,7 +379,7 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 			return
 		}
 
-		requests, links, err := e.visitPage(ctx, entry)
+		requests, links, err := e.visit(ctx, entry)
 		if err != nil {
 			if ctx.Err() != nil {
 				// Canceled mid-visit: the page was not covered, so requeue it.

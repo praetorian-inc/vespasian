@@ -201,15 +201,23 @@ func TestRodEngine_Concurrency(t *testing.T) {
 		t.Errorf("peak concurrent page requests = %d, want >= 2 (workers did not run in parallel)", peak)
 	}
 
-	// Secondary, coarse ceiling: a fully serial crawl could not beat one
-	// per-page floor per page. perPageFloor is the unavoidable cost of a single
-	// visit under completion-driven capture, so serialFloor is a genuine lower
-	// bound on serial execution — finishing under it is only possible with
-	// overlap. Derived from the configured timings, not a fixed constant.
+	// Timing is DIAGNOSTIC ONLY, never a pass/fail signal.
+	//
+	// The peak-in-flight assertion above already excludes serial execution
+	// completely: a serial crawl cannot exceed 1. So a wall-clock bound adds no
+	// discriminating power, and it reintroduces the exact failure mode this test was
+	// rewritten to remove — the original hardcoded "under 8s" became a false failure
+	// at ~8.1s while parallelism was working fine. Deriving the floor from the
+	// configured timings makes the bound track the defaults, but it still ties the
+	// verdict to wall clock on a shared CI runner, and it still shrinks if
+	// DefaultNetworkIdleFloor or DefaultNetworkQuietPeriod are ever lowered
+	// (LAB-4678 review, TEST-006).
 	perPageFloor := serverDelay + stableWait + DefaultNetworkIdleFloor + DefaultNetworkQuietPeriod
 	serialFloor := time.Duration(totalPages) * perPageFloor
 	if elapsed >= serialFloor {
-		t.Errorf("Crawl took %v, want under the serial floor %v (concurrency not working?)", elapsed, serialFloor)
+		t.Logf("NOTE: crawl took %v, at or above the serial floor %v. Parallelism is "+
+			"already proven by peak=%d above, so this is a slow-runner signal, not a failure.",
+			elapsed, serialFloor, peak)
 	}
 
 	t.Logf("Crawl completed in %v with %d results; peak concurrent page requests = %d (serial floor %v)",
