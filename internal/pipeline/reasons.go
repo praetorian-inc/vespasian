@@ -23,6 +23,7 @@ import (
 	"unicode"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
 // sanitizeForTerminal replaces non-printable runes with an escaped \xNN form so
@@ -76,15 +77,20 @@ func logClassificationReasons(w io.Writer, classified []classify.ClassifiedReque
 				path = u.Scheme + "://" + u.Host
 			default:
 				// Parsed, but neither Path nor Host survived (opaque forms), so
-				// `path` still holds the raw c.URL.
-				path = redactUserinfo(path)
+				// `path` still holds the raw c.URL, which may embed userinfo.
+				// crawl.RedactURL fails CLOSED: it emits a placeholder whenever
+				// it cannot prove the result is credential-free, including the
+				// opaque case where url.Parse leaves credentials in u.Opaque and
+				// u.User is nil.
+				path = crawl.RedactURL(path)
 			}
 		} else {
 			// url.Parse failed, so the switch never ran and `path` still holds
 			// the raw c.URL. Reachable with credentials: GRPCClassifier fails
 			// open on a malformed URL (pkg/classify/grpc.go) and still
-			// classifies on content-type alone.
-			path = redactUserinfo(path)
+			// classifies on content-type alone. crawl.RedactURL fails closed on
+			// a parse error carrying "@".
+			path = crawl.RedactURL(path)
 		}
 		reason := c.Reason
 		if reason == "" {
@@ -101,43 +107,4 @@ func logClassificationReasons(w io.Writer, classified []classify.ClassifiedReque
 	for _, ln := range lines {
 		writeStatus(w, "%s\n", ln)
 	}
-}
-
-// redactUserinfo removes an embedded userinfo component from raw while
-// preserving everything else, for the paths where url.Parse could not give us a
-// structured URL to work from (a parse error, or an opaque form that yields
-// neither Host nor Path).
-//
-// The search is confined to the AUTHORITY -- after "//" and before the next "/"
-// -- because that is the only place RFC 3986 allows userinfo. An earlier version
-// stripped at the last '@' anywhere in the string, which silently discarded the
-// origin whenever a '@' appeared in the path: "http://evil.example:8o8/x@/api/v1/users"
-// rendered as "/api/v1/users", concealing an attacker-controlled host and making
-// it read as a local path. Preserving the origin matters more to an operator
-// than trimming the path.
-//
-// With no "//" at all (opaque / scheme-colon form, e.g. "weird:u:p@h/api/x")
-// there is no authority to scope to, so the last-'@' strip applies to the whole
-// remainder -- that shape has no origin to conceal.
-func redactUserinfo(raw string) string {
-	start := strings.Index(raw, "//")
-	if start < 0 {
-		if i := strings.LastIndex(raw, "@"); i >= 0 {
-			return raw[i+1:]
-		}
-		return raw
-	}
-	start += 2
-	end := strings.IndexByte(raw[start:], '/')
-	if end < 0 {
-		end = len(raw)
-	} else {
-		end += start
-	}
-	authority := raw[start:end]
-	i := strings.LastIndex(authority, "@")
-	if i < 0 {
-		return raw
-	}
-	return raw[:start] + authority[i+1:] + raw[end:]
 }

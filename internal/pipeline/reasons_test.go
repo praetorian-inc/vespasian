@@ -174,61 +174,48 @@ func TestLogClassificationReasons_SanitizesTerminalEscapes(t *testing.T) {
 	}
 }
 
-// TestLogClassificationReasons_StripsUserinfoExactly pins the LOGIC of the
-// last-'@' strip, not merely its presence. Three mutants survived when only
-// "does not contain user:pass" was asserted: LastIndex->Index (strips at the
-// FIRST '@'), path[i+1:]->path[i:] (keeps the '@'), and replacing the strip
-// with path="" (silently guts the whole -v diagnostic). Asserting the EXACT
-// rendered remainder kills all three.
+// TestLogClassificationReasons_RedactsUserinfo pins that no URL shape carrying
+// embedded userinfo reaches the -v Status output with its credential intact.
 //
-// Both credential-carrying branches are covered: the switch's default arm
-// (url.Parse succeeds but yields neither Path nor Host) and the url.Parse
-// ERROR branch (reachable because GRPCClassifier fails open on a malformed URL
-// and still classifies on content-type alone).
-func TestLogClassificationReasons_StripsUserinfoExactly(t *testing.T) {
-	for _, tc := range []struct {
-		name, rawURL, want, mustNotContain string
-	}{
-		{
-			// Opaque form: url.Parse fills u.Opaque, leaves Host/Path empty and
-			// u.User NIL -> default arm. Two '@' so first-vs-last differ.
-			name: "default arm strips at the last @",
-			// user:pass is synthetic; final.example.com is an RFC 2606 reserved
-			// domain. The fixture asserts the credential is NOT printed.
-			rawURL:         "weird:user:pass@first@final.example.com/api/x",
-			want:           "final.example.com/api/x",
-			mustNotContain: "first@",
-		},
-		{
-			// Invalid port -> url.Parse ERROR -> switch skipped entirely.
-			// redactUserinfo is authority-scoped, so the ORIGIN survives; only
-			// the userinfo is removed.
-			name: "parse-error branch strips userinfo and keeps the origin",
-			// user:pass is synthetic; ":8o8" is an intentionally invalid port so
-			// url.Parse fails. The fixture asserts non-disclosure.
-			rawURL:         "http://user:pass@host:8o8/pkg.Svc/Method",
-			want:           "http://host:8o8/pkg.Svc/Method",
-			mustNotContain: "user:pass",
-		},
-		{
-			// REGRESSION GUARD: a '@' in the PATH must never be mistaken for a
-			// userinfo delimiter. A last-'@'-anywhere strip rendered this as
-			// "/api/v1/users", concealing the attacker-controlled origin so it
-			// read as a local path -- worse for an operator than the leak it was
-			// closing. The whole URL must survive untouched.
-			name:           "a @ in the path does not conceal the origin",
-			rawURL:         "http://evil.attacker.example:8o8/x@/api/v1/users",
-			want:           "http://evil.attacker.example:8o8/x@/api/v1/users",
-			mustNotContain: "zz-never-present-zz",
-		},
-		{
-			// Two '@' inside the authority: strip to the LAST, keep the origin.
-			// u:p is synthetic; example.test is reserved.
-			name:           "multiple @ within the authority",
-			rawURL:         "http://u:p@a@host.example.test:8o8/p",
-			want:           "http://host.example.test:8o8/p",
-			mustNotContain: "u:p@",
-		},
+// The redaction is delegated to crawl.RedactURL (a pass-through to
+// redactSeedURL, already tested in pkg/crawl), which FAILS CLOSED: whenever it
+// cannot prove the result is credential-free it emits a placeholder rather than
+// attempting to strip. Three hand-rolled strip attempts in this PR each shipped
+// a new reachable defect -- concealing the origin, missing '?'/'#' as authority
+// terminators, and leaking the opaque form where url.Parse leaves credentials in
+// u.Opaque with u.User nil -- which is why the local helper was removed in
+// favor of the reviewed one.
+//
+// Consequence worth naming: for a URL whose '@' is in the path rather than the
+// userinfo, RedactURL cannot cheaply tell the two apart and emits the
+// placeholder. The operator loses host/path context in that case. That is a
+// deliberate, documented false positive (see redactSeedURL's doc comment) and a
+// strictly better failure mode than the alternative this PR shipped twice:
+// silently rendering a truncated path that READ as legitimate while the
+// attacker-controlled origin had been discarded.
+//
+// All credentials below are synthetic on reserved/loopback hosts.
+func TestLogClassificationReasons_RedactsUserinfo(t *testing.T) {
+	const placeholder = "<URL with userinfo redacted>"
+	for _, tc := range []struct{ name, rawURL, want string }{
+		// Parses cleanly with userinfo -> u.User = nil, origin preserved.
+		{"userinfo stripped, origin kept", "http://user:pass@example.com", "http://example.com"},
+		// Authority-only userinfo.
+		// Go's URL.String() omits the "//" once u.User is nil and Host is
+		// empty, so this renders as "http:" -- credential-free.
+		{"authority-only userinfo", "http://user:pass@", "http:"},
+		// Opaque: credentials live in u.Opaque, u.User is nil -> fail closed.
+		{"opaque form fails closed", "weird:user:pass@first@final.example.com/api/x", placeholder},
+		// Opaque with a "//" later in the PATH -- the shape my authority-scoped
+		// helper leaked verbatim.
+		{"opaque with // in path fails closed", "https:user:pass@example.com//api/x", placeholder},
+		// url.Parse error (invalid port) + "@" -> fail closed.
+		{"parse error with userinfo fails closed", "http://user:pass@host:8o8/pkg.Svc/Method", placeholder},
+		// A '@' in the PATH: indistinguishable from userinfo, so fail closed.
+		// Deliberate false positive -- but it never conceals an origin behind a
+		// plausible-looking path, which is the regression this replaces.
+		{"path @ fails closed rather than concealing the origin",
+			"http://evil.attacker.example:8o8/x@/api/v1/users", placeholder},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var buf bytes.Buffer
@@ -236,22 +223,13 @@ func TestLogClassificationReasons_StripsUserinfoExactly(t *testing.T) {
 				cr("POST", tc.rawURL, "grpc", "content-type", 0.95),
 			})
 			out := buf.String()
-			// Kills strip->path="" (nothing rendered) and Index (wrong remainder).
 			if !strings.Contains(out, tc.want) {
-				t.Errorf("expected rendered remainder %q, got: %q", tc.want, out)
+				t.Errorf("expected %q in output, got: %q", tc.want, out)
 			}
-			// Kills LastIndex->Index for the two-'@' case, and any credential leak.
-			if strings.Contains(out, tc.mustNotContain) {
-				t.Errorf("unexpected %q in output: %q", tc.mustNotContain, out)
-			}
-			// Kills path[i+1:]->path[i:] (a retained '@' before the remainder).
-			// Skipped where want legitimately contains its own '@' (the
-			// path-@ regression case above).
-			if !strings.Contains(tc.want, "@") && strings.Contains(out, "@"+tc.want) {
-				t.Errorf("strip kept the '@' separator: %q", out)
-			}
-			if strings.Contains(out, "user:pass") {
-				t.Errorf("credential leaked: %q", out)
+			for _, cred := range []string{"user:pass", "u:p@", "user%3Apass"} {
+				if strings.Contains(out, cred) {
+					t.Errorf("credential %q leaked: %q", cred, out)
+				}
 			}
 		})
 	}

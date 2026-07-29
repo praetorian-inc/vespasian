@@ -91,6 +91,20 @@ func redactSeedURL(raw string) string {
 	return out
 }
 
+// RedactURL redacts userinfo from raw. It is the exported form of
+// redactSeedURL, for callers outside this
+// package that echo a capture- or bundle-derived URL to an operator (currently
+// internal/pipeline's classification-reason output). It is a thin pass-through,
+// NOT a second implementation: redactSeedURL remains the single definition, so
+// the two cannot diverge. Mirrors how SanitizeForLog, SameOrigin,
+// ResolveTargetOrigin and IsPrintableASCIIURL are already exported from this
+// package for the same reason.
+//
+// The "Seed" in the underlying name predates this general use; the logic is not
+// seed-specific -- it redacts userinfo from any URL and fails closed to a
+// placeholder whenever it cannot prove the result is credential-free.
+func RedactURL(raw string) string { return redactSeedURL(raw) }
+
 // engineOptions configures the concurrent headless crawl engine.
 type engineOptions struct {
 	Concurrency   int               // concurrent tabs (0 → DefaultConcurrency)
