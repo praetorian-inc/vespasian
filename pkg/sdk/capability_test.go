@@ -15,8 +15,12 @@
 package sdk
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"time"
@@ -452,6 +456,73 @@ func TestInvoke_ScanMode_InvalidScopeReturnsError(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid scope")
+}
+
+// ---------------------------------------------------------------------------
+// 6b. SEC-BE-002: probe-coverage telemetry
+// ---------------------------------------------------------------------------
+
+// TestSlogWriter_ScanOptionsDrivenRunSurfacesSkipAsSlogRecord is the required
+// regression test for SEC-BE-002: before the fix, runScan's
+// pipeline.ScanOptions left Warnings unset entirely, so a probe-coverage
+// decision made by the SEC-BE-001 cross-origin gate (internal/pipeline) had
+// nowhere to go on the SDK path -- not the spec, not slog. This drives the
+// real pipeline.ResolveAndGenerate (not the stubbed generateFunc seam) with
+// the exact ScanOptions shape runScan builds -- TargetURL pinned to the app's
+// own origin, Warnings set to slogWriter -- against a two-origin capture, so
+// the cross-origin candidate is genuinely skipped by the gate and must
+// surface at least one slog record.
+func TestSlogWriter_ScanOptionsDrivenRunSurfacesSkipAsSlogRecord(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1}`))
+	}))
+	t.Cleanup(api.Close)
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1}`))
+	}))
+	t.Cleanup(attacker.Close)
+
+	jsonAPIRequest := func(rawURL string) crawl.ObservedRequest {
+		return crawl.ObservedRequest{
+			Method:  "GET",
+			URL:     rawURL,
+			Headers: map[string]string{"Content-Type": "application/json"},
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Headers:     map[string]string{"Content-Type": "application/json"},
+				Body:        []byte(`{"id":1}`),
+			},
+		}
+	}
+	requests := []crawl.ObservedRequest{
+		jsonAPIRequest(api.URL + "/api/v1/users"),
+		jsonAPIRequest(attacker.URL + "/api/v1/collect"),
+	}
+
+	var logBuf bytes.Buffer
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
+	// Mirrors runScan's ScanOptions literal in capability.go exactly, in
+	// particular Warnings: slogWriter{...} and AllowPrivate: false (the SDK
+	// never sets AllowPrivate true).
+	_, _, _, _, err := pipeline.ResolveAndGenerate(context.Background(), requests, pipeline.ScanOptions{
+		TargetURL:    api.URL,
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		Deduplicate:  true,
+		AllowPrivate: false,
+		Warnings:     slogWriter{target: api.URL},
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, logBuf.String(), "probe coverage warning",
+		"a candidate skipped by the SEC-BE-001 cross-origin gate must surface at least one slog record (SEC-BE-002)")
 }
 
 // ---------------------------------------------------------------------------

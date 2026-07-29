@@ -1327,7 +1327,10 @@ func TestReplayJSExtracted_MaxEndpointsCountsAllAttempts(t *testing.T) {
 	cfg := allowLocal(srv)
 	cfg.MaxEndpoints = 3
 	ReplayJSExtracted(context.Background(), requests, cfg)
-	assert.Equal(t, 3, hits, "MaxEndpoints must cap probe attempts even when all return 404")
+	// 3 real probe attempts (the MaxEndpoints cap) plus exactly 1 SEC-BE-004
+	// control probe: the server always 404s, so the first real 404 triggers a
+	// one-shot control probe against this origin, and it too hits this server.
+	assert.Equal(t, 4, hits, "MaxEndpoints must cap real probe attempts at 3 even when all return 404, plus the one-shot SEC-BE-004 control probe")
 }
 
 func TestReplayJSExtracted_DeterministicProbeOrder(t *testing.T) {
@@ -1418,12 +1421,19 @@ func TestReplayJSExtracted_Filters404(t *testing.T) {
 // decoy, inflating the live concat-spa spec from 2 paths to 3.
 func TestReplayJSExtracted_DropsOfflineConcatMirrorForReachedPaths(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/orders") {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/orders"):
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(`{"ok":true}`)) //nolint:errcheck,gosec // test handler
-			return
+		case r.URL.Path == "/api/missing/0/gone":
+			w.WriteHeader(http.StatusNotFound) // the decoy JS-replay refutes
+		default:
+			// Anything else — including the SEC-BE-004 control probe's random
+			// path — is NOT 404, so this origin discriminates and 404 stays
+			// dispositive for the decoy above.
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"ok":true}`)) //nolint:errcheck,gosec // test handler
 		}
-		w.WriteHeader(http.StatusNotFound) // /api/missing/0/gone decoy
 	}))
 	defer srv.Close()
 
@@ -1576,7 +1586,14 @@ func TestReplayJSExtracted_KeepsNonConcatMirrorsForRefutedPaths(t *testing.T) {
 			w.Write([]byte(`fetch("/api/gated/".concat(x,"/thing"));`)) //nolint:errcheck,gosec // test handler
 			return
 		}
-		w.WriteHeader(http.StatusNotFound) // refutes /api/gated/0/thing
+		if r.URL.Path == "/api/gated/0/thing" {
+			w.WriteHeader(http.StatusNotFound) // refutes /api/gated/0/thing
+			return
+		}
+		// Anything else — including the SEC-BE-004 control probe's random
+		// path — is NOT 404, so this origin discriminates and 404 stays
+		// dispositive for the path above.
+		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
 
@@ -1630,7 +1647,14 @@ func TestReplayJSExtracted_KeepsNonConcatMirrorsForRefutedPaths(t *testing.T) {
 // which only covers the same-origin case.
 func TestReplayJSExtracted_DropsOfflineConcatMirrorAcrossHosts(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound) // the target 404s the reconstructed path
+		if r.URL.Path == "/api/missing/0/gone" {
+			w.WriteHeader(http.StatusNotFound) // the target 404s the reconstructed path
+			return
+		}
+		// Anything else — including the SEC-BE-004 control probe's random
+		// path — is NOT 404, so this origin discriminates and 404 stays
+		// dispositive for the path above.
+		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
 
@@ -1654,6 +1678,108 @@ func TestReplayJSExtracted_DropsOfflineConcatMirrorAcrossHosts(t *testing.T) {
 			t.Fatalf("expected cross-host offline concat mirror %q to be dropped once the target 404s the reconstructed path, got it retained", r.URL)
 		}
 	}
+}
+
+// TestReplayJSExtracted_CatchAllOriginKeepsMirrors is the regression guard for
+// SEC-BE-004 (LAB-4992). Returning 404 rather than 401/403 for an
+// unauthorized-but-real resource is a widespread anti-enumeration convention,
+// and a hostile target can go further and fingerprint doRequest's fixed
+// User-Agent to 404 every unauthenticated probe outright, hiding its whole
+// API surface from an unauthenticated `generate --probe` run. Before this
+// fix, any such target had its 404 trusted exactly like a genuinely
+// discriminating one, silently deleting real, correctly-recovered endpoints
+// via supersedeConcatMirrors.
+//
+// Here the origin 404s EVERYTHING, including the random SEC-BE-004 control
+// path that is certainly not a real endpoint. That makes 404 non-dispositive
+// for this origin: no offline concat mirror may be dropped, and exactly one
+// warning naming the origin must be emitted so the operator knows 404-based
+// refutation was disabled there.
+func TestReplayJSExtracted_CatchAllOriginKeepsMirrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound) // 404s EVERYTHING, including the control probe
+	}))
+	defer srv.Close()
+
+	jsBody := []byte(`fetch("/api/missing/".concat(x,"/gone"));`)
+	requests := []ObservedRequest{
+		{
+			Method:   "GET",
+			URL:      srv.URL + "/app.js",
+			Source:   "katana",
+			Response: ObservedResponse{StatusCode: 200, ContentType: "application/javascript", Body: jsBody},
+		},
+		// Passive offline mirror for the same (404'd) reconstruction.
+		{Method: "GET", URL: srv.URL + "/api/missing/0/gone", Source: SourceStaticJSConcat},
+	}
+
+	var stderr bytes.Buffer
+	cfg := allowLocal(srv)
+	cfg.Stderr = &stderr
+
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	var sawMirror bool
+	for _, r := range result {
+		if r.Source == SourceStaticJSConcat && r.URL == srv.URL+"/api/missing/0/gone" {
+			sawMirror = true
+		}
+	}
+	assert.True(t, sawMirror,
+		"a catch-all origin must not have any offline concat mirror dropped: its 404 is not dispositive")
+
+	origin := originOf(srv.URL)
+	quotedOrigin := strconv.Quote(origin)
+	warnings := stderr.String()
+	assert.Equal(t, 1, strings.Count(warnings, quotedOrigin),
+		"exactly one warning naming the origin %s must be emitted, got: %s", quotedOrigin, warnings)
+}
+
+// TestReplayJSExtracted_DiscriminatingOriginDropsMirrorAndWarns is the
+// companion regression guard for SEC-BE-004 (LAB-4992). Here the origin
+// DISCRIMINATES: the random SEC-BE-004 control path comes back non-404
+// (200), so a 404 for the JS bundle's reconstructed decoy path is trusted as
+// before — the offline concat mirror for that specific path must still be
+// dropped, and a warning NAMING that path must be emitted so the loss is no
+// longer silent.
+func TestReplayJSExtracted_DiscriminatingOriginDropsMirrorAndWarns(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/missing/0/gone" {
+			w.WriteHeader(http.StatusNotFound) // the decoy JS-replay refutes
+			return
+		}
+		// Anything else — including the SEC-BE-004 control probe's random
+		// path — is NOT 404, so this origin discriminates.
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	jsBody := []byte(`fetch("/api/missing/".concat(x,"/gone"));`)
+	requests := []ObservedRequest{
+		{
+			Method:   "GET",
+			URL:      srv.URL + "/app.js",
+			Source:   "katana",
+			Response: ObservedResponse{StatusCode: 200, ContentType: "application/javascript", Body: jsBody},
+		},
+		{Method: "GET", URL: srv.URL + "/api/missing/0/gone", Source: SourceStaticJSConcat},
+	}
+
+	var stderr bytes.Buffer
+	cfg := allowLocal(srv)
+	cfg.Stderr = &stderr
+
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	for _, r := range result {
+		if r.Source == SourceStaticJSConcat {
+			t.Fatalf("expected the 404'd offline concat mirror %q to be dropped on a discriminating origin, got it retained", r.URL)
+		}
+	}
+
+	quotedPath := strconv.Quote(srv.URL + "/api/missing/0/gone")
+	assert.Contains(t, stderr.String(), quotedPath,
+		"a warning naming the dropped path must be emitted, got: %s", stderr.String())
 }
 
 // TestReachedPathKey pins the reached-set normalization that lets the offline
@@ -3980,9 +4106,10 @@ func TestIsAbsoluteHTTPURLCallSites(t *testing.T) {
 
 }
 
-// TestPercentEscapeValidation pins decodePercentEscape's contract directly
-// (TEST-005). Three mutants previously survived the whole suite because the
-// accepted-escape fixtures only ever used the hex digits {0, 2, F}:
+// TestPercentEscapeValidation pins validPercentEscape's contract, exercised
+// through cleanConcatPath (TEST-005). Three mutants previously survived the
+// whole suite because the accepted-escape fixtures only ever used the hex
+// digits {0, 2, F}:
 //   - `i += 2` -> `i += 3`, which skips validation of the byte AFTER an escape
 //   - deleting unhex's lowercase-hex arm, silently dropping %2f / %3d / %7e
 //   - narrowing the accepted decode range by one (> 0x7E -> > 0x7D)

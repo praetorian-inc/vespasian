@@ -457,6 +457,41 @@ func TestOpenAPIGenerator_MultipleServers(t *testing.T) {
 	}
 }
 
+// SEC-BE-003: a cross-origin static:js candidate is never probed (the probe
+// egress gate only prevents the REQUEST; extractServers must independently
+// exclude it from the DELIVERABLE). The attacker host is chosen to sort
+// FIRST alphabetically ("a.attacker.example" < "www.example.com") so this
+// test fails under the pre-fix behavior, which always used servers[0] for
+// both the servers list membership and the title — proving the exploit this
+// fix closes.
+func TestExtractServers_JSStaticCrossOriginExcluded(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://www.example.com/api/users", ""),
+		makeClassified("GET", "https://a.attacker.example/api/collect", "static:js"),
+	}
+
+	servers, titleHost := extractServers(endpoints)
+
+	require.Len(t, servers, 1, "unprobed JS-static host must not be added to servers")
+	assert.Equal(t, "https://www.example.com", servers[0].URL)
+	assert.Equal(t, "www.example.com API", titleHost, "info.title must not be captured by the unprobed JS-static host")
+}
+
+// Fallback: a fully-offline capture (every endpoint is JS-static) must still
+// produce a usable, populated servers list rather than an empty one.
+func TestExtractServers_AllJSStaticFallsBackToPopulated(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "static:js"),
+		makeClassified("GET", "https://h/api/y", "static:js-concat"),
+	}
+
+	servers, titleHost := extractServers(endpoints)
+
+	require.Len(t, servers, 1, "fully-offline capture must still populate servers")
+	assert.Equal(t, "https://h", servers[0].URL)
+	assert.Equal(t, "h API", titleHost)
+}
+
 func TestP0Fixes_ContextAwarePathParams(t *testing.T) {
 	gen := &OpenAPIGenerator{}
 

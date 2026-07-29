@@ -123,9 +123,16 @@ described in this section, additionally re-fetches and probes those same
 reconstructions over HTTP, drops 404 decoys, and performs a speculative
 service-prefix fan-out that the offline pass deliberately omits (fan-out
 combinations are only safe once probed and 404-filtered). Live replay is
-purely *additive*: only a 404 refutes an offline candidate, so pointing
-`generate` at a reachable target never yields fewer endpoints than running
-fully offline.
+additive, with one exception: a path the probe answers with a 404 is dropped
+as a decoy — other statuses (200, 204, 401/403, 302, ...) never refute an
+offline candidate — and even a 404 only drops the candidate when a random
+control path on the same origin does *not* also come back 404. If it does,
+the target is treated as a catch-all / anti-enumeration responder (a
+widespread convention that returns 404 rather than 401/403 for a real but
+unauthorized endpoint, which a hostile target can extend by fingerprinting
+the probe's User-Agent and 404ing everything) and no candidate on that origin
+is dropped, so pointing `generate` at such a target never yields fewer
+endpoints than running fully offline.
 
 > **Note:** a `capture.json` produced by a build predating this feature already
 > carries `static:js` entries, which makes `generate` skip the static pass

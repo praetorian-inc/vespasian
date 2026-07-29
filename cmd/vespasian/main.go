@@ -591,9 +591,11 @@ func (c *GenerateCmd) Run() (err error) {
 	// Replay JS-extracted URLs with raw HTTP so the two-stage crawl→generate
 	// workflow recovers SPA endpoints that exist only inside JS bundles (e.g.
 	// concat-style paths), matching what scan does (LAB-3892). Static JS
-	// analysis (pipeline.Augment above) surfaces literal paths, but concat /
-	// service-prefix forms need the active re-fetch to be reconstructed and
-	// confirmed. Gated on c.Probe && c.AnalyzeJS — the same gate scan uses — so
+	// analysis (pipeline.Augment above) already reconstructs literal, concat,
+	// and service-prefix forms fully offline as unprobed candidates; replay
+	// additionally re-fetches them, probes them, 404-filters them, and performs
+	// the speculative service-prefix fan-out the offline pass deliberately
+	// omits. Gated on c.Probe && c.AnalyzeJS — the same gate scan uses — so
 	// --probe=false or --analyze-js=false keeps generate passive (see
 	// maybeReplayJSExtracted). --header/-H supplies the auth headers the capture
 	// can't preserve (forwarded only to same-origin fetches/probes), and

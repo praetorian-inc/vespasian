@@ -34,6 +34,7 @@ package crawl
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -1859,7 +1860,7 @@ func allowedConcatBytes(s string, inSuffix bool) bool {
 // scanEscapedBytes walks s and reports whether every byte is admissible: a
 // literal byte must satisfy isLiteralByte, and a `%` must start a
 // well-formed percent-escape that decodes to printable ASCII (see
-// decodePercentEscape) — the escape-handling half of the policy is identical
+// validPercentEscape) — the escape-handling half of the policy is identical
 // for every caller, so it lives here once rather than in each caller's own
 // loop (QUAL-002).
 //
@@ -1875,7 +1876,7 @@ func scanEscapedBytes(s string, isLiteralByte func(byte) bool) bool {
 			}
 			continue
 		}
-		if _, ok := decodePercentEscape(s, i); !ok {
+		if !validPercentEscape(s, i) {
 			return false
 		}
 		// Skip the two hex digits; the loop's own i++ accounts for the '%'.
@@ -1884,10 +1885,11 @@ func scanEscapedBytes(s string, isLiteralByte func(byte) bool) bool {
 	return true
 }
 
-// decodePercentEscape decodes the escape starting at s[i] (which must be '%'),
-// returning the decoded byte. It reports ok=false when the escape is truncated
-// ("/api/x%", "/api/x%E"), contains a non-hex digit, or decodes to anything other
-// than printable ASCII (0x20-0x7E).
+// validPercentEscape reports whether the escape starting at s[i] (which must
+// be '%') is well-formed and decodes to printable ASCII (0x20-0x7E). It
+// reports false when the escape is truncated ("/api/x%", "/api/x%E"),
+// contains a non-hex digit, or decodes to anything other than printable
+// ASCII.
 //
 // The printable-ASCII requirement is the load-bearing part (SEC-BE-002): a
 // byte-wise allow-list that merely permits `%` is trivially routed around,
@@ -1900,18 +1902,18 @@ func scanEscapedBytes(s string, isLiteralByte func(byte) bool) bool {
 // Uses encoding/hex rather than a hand-rolled digit decoder so the accepted digit
 // set (both cases, exactly [0-9A-Fa-f]) is the standard library's rather than
 // something this file has to get right and keep right.
-func decodePercentEscape(s string, i int) (byte, bool) {
+func validPercentEscape(s string, i int) bool {
 	if i+2 >= len(s) {
-		return 0, false
+		return false
 	}
 	buf, err := hex.DecodeString(s[i+1 : i+3])
 	if err != nil {
-		return 0, false
+		return false
 	}
 	if buf[0] < 0x20 || buf[0] > 0x7E {
-		return 0, false
+		return false
 	}
-	return buf[0], true
+	return true
 }
 
 // IsPrintableASCIIURL reports whether raw is safe to place in an operator-facing
@@ -2219,10 +2221,12 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	copy(result, requests)
 
 	// refuted records the reachedPathKey of every full URL the target answered
-	// 404 for. Those paths — and ONLY those — have a dispositive negative
-	// verdict, so supersedeConcatMirrors drops their passive offline concat
-	// mirror after the loop; see its doc comment for what survives a non-404 and
-	// why, and reachedPathKey's for why the key is path-only, not origin+path.
+	// 404 for on an origin where 404 was found to be a meaningful (dispositive)
+	// verdict — see controlPathIsDispositive below. Those paths — and ONLY
+	// those — have a dispositive negative verdict, so supersedeConcatMirrors
+	// drops their passive offline concat mirror after the loop; see its doc
+	// comment for what survives a non-404 and why, and reachedPathKey's for why
+	// the key is path-only, not origin+path.
 	//
 	// QUAL-004: this set was previously populated for ANY answered status, which
 	// made live replay SUBTRACTIVE — supplying a reachable --target-url produced
@@ -2237,7 +2241,22 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	// and is dropped at the 0.5 default threshold. Measured end-to-end, the spec
 	// went from one path to zero. Restricting the set to 404 keeps the decoy
 	// filter this exists for while making replay purely additive.
+	//
+	// SEC-BE-004: restricting to 404 was still not enough. Returning 404 rather
+	// than 401/403 for an unauthorized-but-real resource is a widespread
+	// anti-enumeration convention, and doRequest's fixed User-Agent lets a
+	// hostile target fingerprint this scanner and 404 every request to hide its
+	// entire API surface. Either way, a bare 404 stopped being trustworthy on
+	// its own. nonDispositiveOrigins and controlProbed gate refuted per origin:
+	// the first 404 seen for an origin triggers a one-shot control probe of a
+	// random, certainly-nonexistent path on that same origin
+	// (controlPathIsDispositive); if the control ALSO comes back 404, the
+	// origin is treated as a catch-all responder and no 404 on it refutes
+	// anything (a warning names the origin once), otherwise 404 is trusted as
+	// before (and a warning names each dropped path).
 	refuted := make(map[string]bool)
+	nonDispositiveOrigins := make(map[string]bool)
+	controlProbed := make(map[string]bool)
 
 	probed := 0
 	for _, path := range sortedPaths {
@@ -2303,11 +2322,29 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		// prefix is /workshop/). Keeping them would pollute the spec with
 		// endpoints that don't actually exist on that service.
 		//
-		// A 404 is also the only DISPOSITIVE verdict, so it is the only status
-		// that refutes the offline concat mirror for this path (QUAL-004 — see
-		// refuted's doc comment above).
+		// A 404 is also the only potentially DISPOSITIVE verdict, so it is the
+		// only status that can refute the offline concat mirror for this path
+		// (QUAL-004 — see refuted's doc comment above). Whether it actually does
+		// depends on the SEC-BE-004 control probe below: an origin's first 404
+		// triggers a one-shot check of a random nonexistent control path on
+		// that origin, and only a non-404 (or failed) control leaves 404
+		// trusted as dispositive there.
 		if resp.StatusCode == http.StatusNotFound {
+			origin := originOf(fullURL)
+			if !controlProbed[origin] {
+				controlProbed[origin] = true
+				if !controlPathIsDispositive(loopCtx, cfg, origin, targetOrigin, randomControlPath()) {
+					nonDispositiveOrigins[origin] = true
+					warnf("js-extract: %s answered 404 for a random nonexistent control path; "+
+						"treating 404 as non-dispositive there and not dropping any offline mirror for it "+
+						"(possible anti-enumeration / catch-all responder)\n", sanitizeForLog(origin))
+				}
+			}
+			if nonDispositiveOrigins[origin] {
+				continue
+			}
 			refuted[reachedPathKey(fullURL)] = true
+			warnf("js-extract: %s answered 404; dropping its offline js-concat mirror\n", sanitizeForLog(fullURL))
 			continue
 		}
 
@@ -2628,4 +2665,51 @@ func flattenHeaders(h http.Header) map[string]string {
 		}
 	}
 	return result
+}
+
+// randomControlPath returns "/" followed by 32 random lowercase hex
+// characters — a decoy path that is, for all practical purposes, guaranteed
+// not to exist on any real target. ReplayJSExtracted probes it once per
+// origin (see controlPathIsDispositive) to test whether that origin's 404
+// responses are meaningful at all (SEC-BE-004).
+func randomControlPath() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand.Read does not fail in practice on any platform Go
+		// supports; this fallback exists only so a read error can't skip the
+		// control probe outright.
+		return "/00000000000000000000000000000000"
+	}
+	return "/" + hex.EncodeToString(b)
+}
+
+// controlPathIsDispositive probes origin+controlPath — a path known not to
+// exist — and reports whether a 404 response FROM origin can be trusted to
+// mean "this path does not exist" (SEC-BE-004).
+//
+// It returns false ("404 is non-dispositive here") only when the control
+// probe itself comes back 404: an origin that 404s a path guaranteed not to
+// exist tells us nothing by 404ing anything else either, since returning 404
+// (rather than 401/403) for a real-but-unauthorized resource is a widespread
+// anti-enumeration convention, and a hostile target can go further and
+// fingerprint doRequest's fixed User-Agent to 404 every request from this
+// scanner and hide its whole API surface. Callers must not treat 404 as
+// refuting anything on such an origin.
+//
+// It returns true ("404 is dispositive here") when the control probe answers
+// with anything other than 404, or when the control request fails outright
+// (network error, timeout, TLS failure): a failed request is not positive
+// evidence that the origin is a catch-all, so the historical (QUAL-004)
+// behavior of trusting a 404 verdict is kept as the safe default.
+//
+// controlPath is a caller-supplied parameter — not generated inside this
+// function — purely so tests can pin a fixed value instead of the random one
+// randomControlPath produces, without needing an interface or injected
+// dependency.
+func controlPathIsDispositive(ctx context.Context, cfg JSReplayConfig, origin, targetOrigin, controlPath string) bool {
+	resp := probeURL(ctx, cfg, origin+controlPath, targetOrigin)
+	if resp == nil {
+		return true
+	}
+	return resp.StatusCode != http.StatusNotFound
 }

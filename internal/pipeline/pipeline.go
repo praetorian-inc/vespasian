@@ -199,20 +199,24 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 
 		if !opts.AllowCrossOriginProbe {
 			targetOrigin := crawl.ResolveTargetOrigin(opts.TargetURL, requests)
-			// Key the warning on whether opts.TargetURL actually pinned
-			// targetOrigin (SEC-BE-002), not merely on opts.TargetURL being
-			// non-empty: an unparseable or hostless TargetURL (e.g. "not a
-			// url", "://") is non-empty but unusable, so
-			// crawl.ResolveTargetOrigin silently falls through to deriving
-			// the origin from the capture -- the exact case this warning
-			// exists to surface. crawl.SameOrigin("", targetOrigin) is
-			// always false (it requires a non-empty left-hand origin), so
-			// an empty TargetURL still warns too; this one predicate covers
-			// both "not set" and "set but unusable".
-			if !crawl.SameOrigin(opts.TargetURL, targetOrigin) {
-				warnDerivedProbeOrigin(opts.Warnings, targetOrigin)
-			}
-			cfg.URLValidator = newCrossOriginValidator(cfg.URLValidator, targetOrigin, opts.Warnings)
+			// originIsDerived keys the (lazy) derived-origin warning on
+			// whether opts.TargetURL actually pinned targetOrigin
+			// (SEC-BE-002), not merely on opts.TargetURL being non-empty: an
+			// unparseable or hostless TargetURL (e.g. "not a url", "://") is
+			// non-empty but unusable, so crawl.ResolveTargetOrigin silently
+			// falls through to deriving the origin from the capture -- the
+			// exact case this warning exists to surface. crawl.SameOrigin("",
+			// targetOrigin) is always false (it requires a non-empty
+			// left-hand origin), so an empty TargetURL counts as derived too;
+			// this one predicate covers both "not set" and "set but
+			// unusable". The warning itself is NOT emitted here -- it fires
+			// lazily, inside newCrossOriginValidator, only on the first
+			// candidate actually rejected as cross-origin (SEC-BE-001 nit
+			// review finding: emitting it here, unconditionally, printed
+			// "endpoints will be skipped" even on an all-same-origin capture
+			// where nothing ever was).
+			originIsDerived := !crawl.SameOrigin(opts.TargetURL, targetOrigin)
+			cfg.URLValidator = newCrossOriginValidator(cfg.URLValidator, targetOrigin, originIsDerived, opts.Warnings)
 		}
 
 		// Pure grpc-gateway traffic is REST/JSON, so the gRPC classifier never

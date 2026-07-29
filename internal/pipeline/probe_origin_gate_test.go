@@ -748,6 +748,49 @@ func TestClassifyProbeGenerate_DerivedOriginWarningAbsentWhenTargetURLSet(t *tes
 		"the derived-origin warning must not fire when --target-url was explicitly supplied")
 }
 
+// TestClassifyProbeGenerate_AllSameOriginNoTargetURLStaysQuiet is the direct
+// regression test for the SEC-BE-001 nit review finding's laziness fix: the
+// derived-origin warning used to fire unconditionally, once per
+// ClassifyProbeGenerate invocation, before any candidate was even evaluated
+// -- so the ordinary single-origin `generate` without --target-url (an
+// all-same-origin capture, the common case) printed "endpoints outside this
+// origin will be skipped" even though nothing ever was, eroding the signal
+// the warning exists to carry. --target-url is deliberately left unset here
+// so targetOrigin is DERIVED from the capture (the precondition for the
+// warning to even be eligible to fire), and every candidate is same-origin
+// relative to that derived origin, so nothing is ever rejected as
+// cross-origin -- the warning must therefore never fire at all.
+//
+// Mutation-verified against the pre-fix behavior: moving the
+// warnDerivedProbeOrigin call back to pipeline.go's eager call site (before
+// the `if !opts.AllowCrossOriginProbe` branch's validator is even
+// constructed) makes this test fail, since the warning would then print
+// unconditionally regardless of whether any candidate was actually skipped.
+func TestClassifyProbeGenerate_AllSameOriginNoTargetURLStaysQuiet(t *testing.T) {
+	target, hits := countingAPIServer(t)
+
+	requests := []crawl.ObservedRequest{apiRequest(target.URL + "/api/v1/users")}
+	require.Equal(t, target.URL, crawl.ResolveTargetOrigin("", requests),
+		"precondition: with no --target-url, the origin must be derived from the capture's only request")
+
+	var warnings bytes.Buffer
+	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Deduplicate:  true,
+		// TargetURL deliberately left unset: the origin is derived, not chosen.
+		Warnings: &warnings,
+	})
+	require.NoError(t, err)
+
+	assert.Positive(t, atomic.LoadInt32(hits), "the sole, same-origin candidate must still be probed")
+	assert.Empty(t, warnings.String(),
+		"an all-same-origin capture must stay completely quiet: nothing was skipped, "+
+			"so neither the derived-origin warning nor a per-origin skip warning may print")
+}
+
 // TestClassifyProbeGenerate_MixedOriginWithTargetURLProbesRealAPI is the
 // companion to TestClassifyProbeGenerate_MixedOriginWithoutTargetURLSkipsRealAPI:
 // the same mixed-origin capture, but with --target-url pinned to the real API
@@ -827,7 +870,12 @@ func TestClassifyProbeGenerate_UnusableTargetURLStillWarns(t *testing.T) {
 		"an unusable --target-url must not pin the real API host as same-origin; "+
 			"ResolveTargetOrigin falls back to the CDN's origin exactly as it would for an empty TargetURL")
 	assert.Zero(t, atomic.LoadInt32(cdnHits))
-	assert.Contains(t, warnings.String(), "probe-stage cross-origin gate (SEC-BE-001) derived origin",
+	// The exact wording changed (SEC-BE-001 nit review finding): the
+	// operator-facing string no longer names the internal finding ID
+	// "SEC-BE-001", which meant nothing outside this repo's review history.
+	// "derived origin" is what remains of the old assertion's substring and
+	// is still unique to this message.
+	assert.Contains(t, warnings.String(), "derived origin",
 		"a non-empty but unusable --target-url must still trigger the derived-origin warning, "+
 			"not just an empty one")
 }

@@ -78,19 +78,44 @@ import (
 // capture with many cross-origin candidates on one attacker host emits a
 // single warning line instead of one per URL.
 //
-// warnedOrigins is an unsynchronized plain map, safe only because
-// probe.RunStrategies (the sole caller of the validator this returns) invokes
-// probe strategies sequentially today. If that ever becomes concurrent, every
-// call into the closure returned here would need external synchronization
-// (e.g. a mutex around the map) to avoid a data race; a mutex is deliberately
-// NOT added now (KISS — guarding a race that cannot currently occur is
-// complexity for no present benefit), so this comment is the tripwire for
-// whoever parallelizes RunStrategies next (SEC-BE-003).
-func newCrossOriginValidator(base func(string) error, targetOrigin string, warnings io.Writer) func(string) error {
+// originIsDerived tells the closure whether targetOrigin came from
+// --target-url (false) or was derived from the capture (true) — mirroring
+// pipeline.go's `!crawl.SameOrigin(opts.TargetURL, targetOrigin)` check at the
+// call site. When true, warnDerivedProbeOrigin fires LAZILY: only on the
+// first candidate this closure actually rejects as cross-origin, never up
+// front (SEC-BE-001 nit review finding). An all-same-origin capture — the
+// common case for a plain `generate` without --target-url — therefore stays
+// completely quiet instead of printing a warning about a derivation that
+// never mattered. This applies uniformly to both of
+// warnDerivedProbeOrigin's message variants, including the
+// targetOrigin == "" ("no usable origin could be derived") case: once
+// targetOrigin is "", crawl.SameOrigin never returns true (a "" left-hand
+// origin never compares equal — see that function's doc comment), so every
+// candidate that reaches this closure is rejected anyway and the lazy trigger
+// fires on the very first one. Laziness only changes behavior when zero
+// candidates ever reach the validator, and in that case there is nothing to
+// explain, so silence is correct there too — no separate "warn eagerly for
+// this branch" carve-out is needed.
+//
+// warnedOrigins and warnedDerivedOrigin are unsynchronized plain state (a map
+// and a bool), safe only because probe.RunStrategies (the sole caller of the
+// validator this returns) invokes probe strategies sequentially today. If
+// that ever becomes concurrent, every call into the closure returned here
+// would need external synchronization (e.g. a mutex around both) to avoid a
+// data race; a mutex is deliberately NOT added now (KISS — guarding a race
+// that cannot currently occur is complexity for no present benefit), so this
+// comment is the tripwire for whoever parallelizes RunStrategies next
+// (SEC-BE-003).
+func newCrossOriginValidator(base func(string) error, targetOrigin string, originIsDerived bool, warnings io.Writer) func(string) error {
 	warnedOrigins := make(map[string]bool)
+	warnedDerivedOrigin := false
 	return func(rawURL string) error {
 		if crawl.SameOrigin(rawURL, targetOrigin) {
 			return base(rawURL)
+		}
+		if originIsDerived && !warnedDerivedOrigin {
+			warnedDerivedOrigin = true
+			warnDerivedProbeOrigin(warnings, targetOrigin)
 		}
 		origin := bestEffortOrigin(rawURL)
 		if !warnedOrigins[origin] {
@@ -185,22 +210,34 @@ func bestEffortOrigin(rawURL string) string {
 	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
 }
 
-// warnDerivedProbeOrigin emits a one-time, always-on warning — mirroring
-// crawl.warnDerivedOrigin (LAB-4998) — when --target-url was not supplied, so
-// the probe-stage cross-origin gate (SEC-BE-001) is comparing candidates
-// against an origin DERIVED from the capture rather than one the operator
-// chose. Without this, an operator whose real API endpoints are silently
-// skipped (e.g. a mixed-origin HAR/Burp import whose first entry is a
-// third-party CDN) has no signal explaining why, or that --target-url is the
-// fix. Called once per ClassifyProbeGenerate invocation, not per candidate.
+// warnDerivedProbeOrigin emits a one-time, operator-facing warning —
+// mirroring crawl.warnDerivedOrigin (LAB-4998) — when --target-url was not
+// supplied, so the probe-stage cross-origin gate (SEC-BE-001) is comparing
+// candidates against an origin DERIVED from the capture rather than one the
+// operator chose. Without this, an operator whose real API endpoints are
+// silently skipped (e.g. a mixed-origin HAR/Burp import whose first entry is
+// a third-party CDN) has no signal explaining why, or that --target-url is
+// the fix.
+//
+// The visible message strings below deliberately do NOT mention "SEC-BE-001"
+// — that identifier is this repo's internal code-review finding number, with
+// no meaning to an operator reading stderr, and cmd/vespasian wires
+// Options.Warnings/ScanOptions.Warnings to os.Stderr unconditionally (never
+// gated on --verbose), so every operator sees whatever this prints (SEC-BE-001
+// nit review finding). Only the operator-actionable fix (--target-url) is
+// named in the text; the finding ID stays in this doc comment for
+// maintainers.
+//
+// Callers invoke this lazily, not once per ClassifyProbeGenerate invocation:
+// see newCrossOriginValidator's doc comment for why and when it actually
+// fires.
 func warnDerivedProbeOrigin(w io.Writer, targetOrigin string) {
 	if targetOrigin == "" {
 		writeStatus(w, "WARNING: --target-url not set and no usable origin could be derived from the capture; "+
-			"the probe-stage cross-origin gate (SEC-BE-001) will reject every probe candidate. "+
-			"Pass --target-url to allow probing.\n")
+			"every probe candidate is being rejected. Pass --target-url to allow probing.\n")
 		return
 	}
-	writeStatus(w, "WARNING: --target-url not set; probe-stage cross-origin gate (SEC-BE-001) derived origin %s "+
-		"from the capture — endpoints outside this origin will be skipped. Pass --target-url to pin it.\n",
+	writeStatus(w, "WARNING: --target-url not set; derived origin %s from the capture — "+
+		"endpoints outside this origin are being skipped. Pass --target-url to pin it.\n",
 		crawl.SanitizeForLog(targetOrigin))
 }

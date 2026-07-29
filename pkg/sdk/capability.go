@@ -170,6 +170,31 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 	return scanErr
 }
 
+// slogWriter is a minimal io.Writer that funnels lines written to it into
+// slog.Warn, tagged with the scan target (SEC-BE-002). Its sole caller is
+// runScan's ScanOptions.Warnings below: without it, the probe-stage
+// cross-origin gate's warnings (internal/pipeline's writeStatus calls, via
+// pipeline.Options.Warnings) had nowhere to go on the SDK path -- Warnings
+// was left unset entirely, so a WebApplication whose app and API endpoints
+// live on different origins (e.g. www.example.com vs api.example.com)
+// silently stopped having its API probed, with no record of the decision
+// anywhere: not the spec, not slog. Constructed at the call site below, not
+// as a package-level var or via init(), per KISS -- a named type with one
+// method needs neither.
+type slogWriter struct {
+	target string
+}
+
+// Write logs p (trimmed of the trailing newline writeStatus always appends
+// in internal/pipeline) at Warn level, tagged with the scan target for
+// attribution, and reports the full input length so callers relying on
+// io.Writer's contract (n == len(p), err == nil for a "successful" write)
+// see no error -- this adapter cannot fail.
+func (w slogWriter) Write(p []byte) (int, error) {
+	slog.Warn("vespasian: probe coverage warning", "target", w.target, "detail", strings.TrimSuffix(string(p), "\n"))
+	return len(p), nil
+}
+
 // runScan runs the classify → probe → generate phase and emits a WebApplication
 // with the spec if one is produced. Returns (hasSpec, resolvedAPIType).
 func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.ObservedRequest, input capmodel.WebApplication, output capability.Emitter) (bool, string, error) {
@@ -200,7 +225,12 @@ func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.O
 		MergeSlugs:    mergeSlugs,
 		SlugThreshold: slugThreshold,
 		Status:        nil,
-		AfterWSDL:     nil,
+		// Warnings routes the probe-stage cross-origin gate's warnings into
+		// slog (SEC-BE-002) rather than leaving them unset (silently
+		// discarded by internal/pipeline's nil-safe writeStatus). See
+		// slogWriter's doc comment above.
+		Warnings:  slogWriter{target: input.PrimaryURL},
+		AfterWSDL: nil,
 	})
 	if err != nil {
 		slog.Warn("vespasian: classify/generate failed", "target", input.PrimaryURL, "error", err)

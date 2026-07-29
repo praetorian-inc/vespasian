@@ -813,6 +813,34 @@ func TestExtractFromBundle_ConcatFilteredAsAsset(t *testing.T) {
 	}
 }
 
+// TEST-001: pins extractConcatEndpoints' `seen` dedup guard, which previously
+// had zero coverage — deleting it left the entire 18-package suite green. The
+// astURLs guard above it does not cover this arm: it only compares against
+// AST-recovered URLs, and jsluice emits nothing for these bare `var` string
+// concatenations. Here two distinct raw reconstructions from
+// crawl.ExtractStaticConcatPaths — a root-relative "/api/x/" + "y" and a
+// document-relative "api/x/" + "y" — collapse onto the SAME path after the
+// leading-slash normalization performed just above the guard, so the `seen`
+// map must catch the second as a duplicate. Deliberately counts every match
+// (not findEndpoint, which returns only the first and would pass vacuously
+// even with the duplicate present).
+func TestExtractFromBundle_ConcatDuplicateAfterSlashNormalizationDeduped(t *testing.T) {
+	src := []byte(`var a = "/api/x/" + "y"; var b = "api/x/" + "y";`)
+	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var count int
+	for _, ep := range endpoints {
+		if ep.URL == "/api/x/y" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected exactly one /api/x/y endpoint (duplicate after slash normalization must be deduped), got %d: %v", count, endpoints)
+	}
+}
+
 // SEC-BE-001: the concat receiver form must not emit an absolute,
 // cross-origin reconstruction. A hostile bundle literal like
 // "https://attacker.example/api/x".concat(id) would otherwise reconstruct to
