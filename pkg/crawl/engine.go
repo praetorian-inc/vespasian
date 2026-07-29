@@ -102,8 +102,7 @@ func redactSeedURL(raw string) string {
 // exported-wrapper-over-private-twin in this package. SameOrigin,
 // ResolveTargetOrigin and IsPrintableASCIIURL are also exported for
 // cross-package use, but they are primary definitions with no private twin --
-// a different pattern, which an earlier draft of this comment wrongly cited
-// as the same precedent.
+// a different pattern.
 //
 // The "Seed" in the underlying name predates this general use; the logic is
 // not seed-specific -- it redacts userinfo from any URL and fails closed to a

@@ -188,13 +188,19 @@ func TestLogClassificationReasons_SanitizesTerminalEscapes(t *testing.T) {
 //
 // Consequence worth naming: for a URL whose '@' is in the path rather than the
 // userinfo, RedactURL cannot cheaply tell the two apart and emits the
-// placeholder. The operator loses host/path context in that case. That is a
+// placeholder, and the operator loses host/path context. Note this applies only
+// where RedactURL is reached at all: a '@' in the path of an otherwise VALID URL
+// takes the u.Path arm and is printed verbatim ("/x@/api/v1/users"), so the
+// context loss is confined to the opaque and parse-error shapes. That is a
 // deliberate, documented false positive (see redactSeedURL's doc comment) and a
 // strictly better failure mode than the alternative this PR shipped twice:
 // silently rendering a truncated path that READ as legitimate while the
 // attacker-controlled origin had been discarded.
 //
-// All credentials below are synthetic on reserved/loopback hosts.
+// All credentials below are synthetic. Hosts are RFC 2606 reserved
+// (example.com, .example/.test) or a bare unqualified name that resolves
+// nowhere; none is a real host and none is dialed -- these rows never leave
+// logClassificationReasons.
 func TestLogClassificationReasons_RedactsUserinfo(t *testing.T) {
 	const placeholder = "<URL with userinfo redacted>"
 	for _, tc := range []struct{ name, rawURL, want string }{
@@ -222,7 +228,9 @@ func TestLogClassificationReasons_RedactsUserinfo(t *testing.T) {
 		// Reaches RedactURL via the url.Parse-ERROR branch (the ":8o8" port is
 		// invalid), NOT the default arm -- both entry points are covered, this
 		// row being one of the two error-branch cases. Deliberate false
-		// positive: the operator loses host/path context, but the origin is
+		// positive -- reached here only because the invalid port forces a parse
+		// error; the same path-'@' in a valid URL prints verbatim via arm 1.
+		// The operator loses host/path context, but the origin is
 		// never CONCEALED behind a plausible-looking path, which is the
 		// regression this replaces.
 		{"path @ fails closed rather than concealing the origin",
@@ -255,9 +263,13 @@ func TestLogClassificationReasons_RedactsUserinfo(t *testing.T) {
 // synthetic test data, not a real secret.
 func TestLogClassificationReasons_PathlessUserinfoURLNoCredentialLeak(t *testing.T) {
 	// Each URL shape below embeds a synthetic credential (user:pass, RFC 2606
-	// domain) and must NOT have it echoed to Status. They exercise three
-	// distinct arms of logClassificationReasons' switch, and each was verified
-	// to leak before the arm covering it existed:
+	// domain) and must NOT have it echoed to Status. They exercise TWO of
+	// logClassificationReasons' switch arms -- u.Host and default -- and each
+	// was verified to leak before the arm covering it existed. This test is a
+	// strict subset of ..._RedactsUserinfo (which also covers the url.Parse
+	// error branch); it is kept because it documents the original defect, but
+	// it is not the primary pin: mutating `u.User = nil` out of redactSeedURL
+	// leaves this test passing and is caught there instead.
 	//
 	//   pathless-with-host      -> u.Host arm      (u.Host excludes userinfo)
 	//   scheme-colon / opaque   -> default arm     (url.Parse fills u.Opaque and

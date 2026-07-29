@@ -109,6 +109,12 @@
 //     configuration and graceful shutdown (headless path only).
 //   - [ValidateProxyAddr] validates a proxy address (http/https/socks5, host
 //     required, no embedded credentials) for both backends.
+//   - [RedactURL] removes userinfo from a URL before it is echoed to an
+//     operator, failing CLOSED to a placeholder whenever it cannot prove the
+//     result is credential-free (opaque forms keep credentials in
+//     url.URL.Opaque with User nil, and a parse error can carry them
+//     verbatim). Exported for internal/pipeline's classification-reason
+//     output.
 //   - [ObservedRequest] and [ObservedResponse] represent captured HTTP traffic.
 //   - [JSReplayConfig] and [ReplayJSExtracted] implement the post-crawl JS
 //     bundle scanning step. The replay step enforces a same-origin gate
@@ -130,12 +136,6 @@
 //     identically; the active path additionally probes them and does a
 //     speculative service-prefix fan-out that the offline path omits (that
 //     fan-out is only safe when 404-filtered by probing).
-//   - [RedactURL] removes userinfo from a URL before it is echoed to an
-//     operator, failing CLOSED to a placeholder whenever it cannot prove the
-//     result is credential-free (opaque forms keep credentials in
-//     url.URL.Opaque with User nil, and a parse error can carry them
-//     verbatim). Exported for internal/pipeline's classification-reason
-//     output.
 //   - [ValidateFullURL], [SameOrigin], [IsAbsoluteHTTPURL], [IsPrintableASCIIURL]
 //     and [APIIndicatorAlternation] are exported for the same reason as
 //     [ExtractStaticConcatPaths] — they are the shared definitions that keep the
