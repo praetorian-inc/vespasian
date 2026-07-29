@@ -197,10 +197,10 @@ func TestLogClassificationReasons_SanitizesTerminalEscapes(t *testing.T) {
 // silently rendering a truncated path that READ as legitimate while the
 // attacker-controlled origin had been discarded.
 //
-// All credentials below are synthetic. Hosts are RFC 2606 reserved
-// (example.com, .example/.test) or a bare unqualified name that resolves
-// nowhere; none is a real host and none is dialed -- these rows never leave
-// logClassificationReasons.
+// Every credential below is synthetic and no host is ever dialed -- these rows
+// never leave logClassificationReasons. (Deliberately not enumerating the host
+// forms: two prior attempts at that list were both wrong, once naming a
+// loopback row that does not exist and once a .test domain no fixture uses.)
 func TestLogClassificationReasons_RedactsUserinfo(t *testing.T) {
 	const placeholder = "<URL with userinfo redacted>"
 	for _, tc := range []struct{ name, rawURL, want string }{
@@ -251,50 +251,6 @@ func TestLogClassificationReasons_RedactsUserinfo(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// TestLogClassificationReasons_PathlessUserinfoURLNoCredentialLeak verifies
-// that a pathless (or query-only) URL carrying embedded HTTP Basic userinfo
-// never has that credential printed to the -v Status output. logPath's
-// fallback previously used the full raw URL whenever u.Path == "", which
-// echoes userinfo verbatim for a URL like "http://user:pass@host" (no path)
-// or "http://user:pass@host?x=1" (query only, still no path). user:pass is
-// synthetic test data, not a real secret.
-func TestLogClassificationReasons_PathlessUserinfoURLNoCredentialLeak(t *testing.T) {
-	// Each URL shape below embeds a synthetic credential (user:pass, RFC 2606
-	// domain) and must NOT have it echoed to Status. They exercise TWO of
-	// logClassificationReasons' switch arms -- u.Host and default -- and each
-	// was verified to leak before the arm covering it existed. This test is a
-	// strict subset of ..._RedactsUserinfo (which also covers the url.Parse
-	// error branch); it is kept because it documents the original defect, but
-	// it is not the primary pin: mutating `u.User = nil` out of redactSeedURL
-	// leaves this test passing and is caught there instead.
-	//
-	//   pathless-with-host      -> u.Host arm      (u.Host excludes userinfo)
-	//   scheme-colon / opaque   -> default arm     (url.Parse fills u.Opaque and
-	//                                               leaves u.User NIL, so a
-	//                                               u.User check misses it)
-	//   authority-only userinfo -> default arm     (u.User set, Host+Path empty)
-	//
-	// The last two fell through to printing the raw URL until the default arm
-	// was added; a u.Path-bearing URL is covered by the sibling tests above.
-	for _, raw := range []string{
-		"http://user:pass@example.com",
-		"https:user:pass@example.com/api/x",
-		"http://user:pass@",
-	} {
-		var buf bytes.Buffer
-		logClassificationReasons(&buf, []classify.ClassifiedRequest{
-			cr("GET", raw, "rest", "path-heuristic", 0.6),
-		})
-		out := buf.String()
-		if strings.Contains(out, "user:pass") {
-			t.Errorf("credential leaked into Status output for %q: %q", raw, out)
-		}
-		if strings.Contains(out, "pass@") {
-			t.Errorf("partial credential leaked into Status output for %q: %q", raw, out)
-		}
 	}
 }
 
