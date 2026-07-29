@@ -182,13 +182,27 @@ assert_contains "case f: non-PGP key body is diagnosed" \
 
 # f2: a well-formed key whose primary fingerprint is NOT the pinned one. This is
 # the substituted-key scenario the pin exists to stop.
+#
+# NOTE on the rc check: on its own it is NOT load-bearing. With the comparison
+# deleted, install_pinned_key still returns non-zero — but only because the
+# SUDO=/bin/false stub fails on the write that follows. The assertions that
+# actually pin the control are the two message checks below plus the negative
+# "did not accept" check: a mutated build emits the ACCEPTANCE message for a key
+# it should have refused, and that is what fails.
 # shellcheck disable=SC2031  # SCRIPT_DIR is read, not modified; false positive here
 res_f2=$(run_install_pinned_key "cat '${SCRIPT_DIR}/fixtures/not-google-signing-key.asc' > \"\$out\"")
-assert_eq "case f: a valid but unexpected key is rejected (rc 1)" "1" "$(echo "${res_f2}" | sed -n '1p')"
+assert_eq "case f: a valid but unexpected key does not succeed (rc 1)" "1" "$(echo "${res_f2}" | sed -n '1p')"
 assert_contains "case f: unexpected key is diagnosed as a fingerprint mismatch" \
     "fingerprint mismatch" "${res_f2}"
 assert_contains "case f: the rejection reports the fingerprint actually seen" \
     "790BC7277767219C42C86F933B4FE6ACC0B21F32" "${res_f2}"
+if printf '%s' "${res_f2}" | grep -q "matches pinned fingerprint"; then
+    echo "FAIL: case f: an unexpected key was ACCEPTED (pin is not gating)"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS: case f: an unexpected key is never reported as matching the pin"
+    pass_count=$((pass_count + 1))
+fi
 
 # ── Case g: the symlink guard on the defaults file ─────────────
 # CHROME_DEFAULTS_FILE redirects the one root-privileged write outside

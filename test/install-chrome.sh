@@ -41,6 +41,18 @@
 # already present. Safe to call from a Dockerfile RUN, a devcontainer
 # postCreateCommand, or by hand.
 #
+# Trust assumption for the test seams: CHROME_DEFAULTS_FILE and DOCKERENV_PATH
+# exist only so install-chrome-selftest.sh can reach the symlink guard and the
+# container gate unprivileged. They are read from the environment and feed
+# root-privileged operations, so they are inputs from an ALREADY-PRIVILEGED
+# caller — either the script runs as root (whoever set them was already root),
+# or it runs unprivileged and the caller must already hold the sudo rights it
+# uses. Default sudoers (`Defaults env_reset`) drops both. This script must
+# therefore never be exposed through a narrowly-scoped sudoers grant that also
+# permits environment passing (SETENV, `sudo -E`, or an env_keep entry): that
+# would be the one configuration in which these seams could steer a privileged
+# write. Nothing in this repo creates or recommends such a grant.
+#
 # Usage:
 #   ./test/install-chrome.sh            # install if needed
 

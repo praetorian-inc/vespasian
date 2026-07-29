@@ -57,6 +57,14 @@ jobs:
       - name: Run setup-live-targets self-test
         run: bash test/setup-live-targets_test.sh
 
+      # Target-group/dispatch drift guard plus the offline-run and load_config
+      # allowlist guards. Moved here from the label-gated `test` job: it needs
+      # no Go, Node or Chrome, and leaving it gated meant a PR carrying
+      # 'skip-live-tests' skipped the very guards that catch silent coverage
+      # drift — exactly what they exist to prevent.
+      - name: Drift guard (target groups vs dispatch)
+        run: ./test/test-runner-args.sh
+
   # Gate: run by default; skip PR runs only when 'skip-live-tests' label is present.
   # Push-to-main and workflow_dispatch always run.
   check-label:
@@ -102,9 +110,6 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           persist-credentials: false
-
-      - name: Drift guard (target groups vs dispatch)
-        run: ./test/test-runner-args.sh
 
       - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
         with:
