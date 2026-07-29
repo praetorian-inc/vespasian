@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -735,6 +736,92 @@ func TestBudgetReached_Reserve(t *testing.T) {
 		}
 		if pages != 1 {
 			t.Errorf("reserve consumed a page slot when the request budget stopped the crawl: pageCount = %d, want 1", pages)
+		}
+	})
+
+	// The property this function exists for is exactness UNDER CONCURRENCY, and every
+	// subtest above is single-goroutine. budgetReached takes a *sync.Mutex precisely
+	// because N workers call it, yet nothing in the default suite ever called it from
+	// more than one goroutine, and the only end-to-end assertion of the exact-page-cap
+	// criterion (TestRodEngine_MaxPages) is behind //go:build integration and does not
+	// run in CI. So nothing CI executed verified that concurrent reservation cannot
+	// overshoot (LAB-4678 review, TEST-007).
+	//
+	// budgetReached is a pure function over pointers, so the invariant is directly
+	// testable in microseconds under -race with no browser.
+	t.Run("concurrent reservation admits exactly maxPages", func(t *testing.T) {
+		const (
+			goroutines = 200
+			maxPages   = 37 // not a divisor of goroutines, so an off-by-one cannot hide
+		)
+		var (
+			mu       sync.Mutex
+			pages    int
+			reqs     int
+			admitted atomic.Int64
+			wg       sync.WaitGroup
+		)
+
+		start := make(chan struct{})
+		for range goroutines {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start // maximize contention on the compare-and-increment
+				if !budgetReached(&mu, &pages, maxPages, &reqs, 0, true) {
+					admitted.Add(1)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		if got := admitted.Load(); got != maxPages {
+			t.Errorf("admitted %d pages, want exactly %d: concurrent reservation "+
+				"overshot or undershot the page cap", got, maxPages)
+		}
+		if pages != maxPages {
+			t.Errorf("pageCount = %d, want exactly %d: reserved slots must equal admissions",
+				pages, maxPages)
+		}
+	})
+
+	// The mirror case for the request dimension: the request budget must also stop
+	// admissions exactly, and must never consume a page slot when it is what stopped
+	// the crawl.
+	t.Run("concurrent calls stop exactly at the request cap", func(t *testing.T) {
+		const (
+			goroutines  = 200
+			maxRequests = 25
+		)
+		var (
+			mu       sync.Mutex
+			pages    int
+			reqs     = maxRequests // already at the bound
+			admitted atomic.Int64
+			wg       sync.WaitGroup
+		)
+
+		start := make(chan struct{})
+		for range goroutines {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				if !budgetReached(&mu, &pages, 0, &reqs, maxRequests, true) {
+					admitted.Add(1)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		if got := admitted.Load(); got != 0 {
+			t.Errorf("admitted %d pages with the request budget already exhausted, want 0", got)
+		}
+		if pages != 0 {
+			t.Errorf("pageCount = %d, want 0: no page slot may be consumed when the "+
+				"request budget is what stopped the crawl", pages)
 		}
 	})
 }

@@ -492,7 +492,8 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 	// late and dynamic XHR/fetch calls (mutation/intersection observers, delayed
 	// data loads) are captured rather than dropped (LAB-4678 Phase 1). Bounded by
 	// a floor, a quiet period, a per-request timeout, and the page ceiling; see
-	// waitForNetworkIdle. Returns whatever was captured so far if ctx is canceled.
+	// waitForNetworkIdle. Returns early if ctx is canceled; the snapshot below is
+	// the single place this page's captured requests are read.
 	e.waitForNetworkIdle(ctx, capture, pageDeadline)
 
 	// Optionally exercise the page (clicks / client-side route changes) to
@@ -568,19 +569,27 @@ func (e *rodEngine) enrichTarget(page *rod.Page, navigated bool, pageURL string)
 	return nil
 }
 
-// waitForNetworkIdle blocks until the page's network goes quiet or a bound is
-// hit, then returns the captured requests (LAB-4678 Phase 1). It replaces the
-// previous fixed 200ms settle so late/dynamic requests are captured. It stops at
-// the page deadline; or, once past the floor, when no requests are in flight and
-// the network has been quiet for the quiet period; or when ctx is canceled
-// (returning whatever was captured so far).
+// waitForNetworkIdle blocks until the page's network goes quiet or a bound is hit
+// (LAB-4678 Phase 1). It replaces the previous fixed 200ms settle so late/dynamic
+// requests are captured. It stops at the page deadline; or, once past the floor,
+// when no requests are in flight and the network has been quiet for the quiet
+// period; or when ctx is canceled.
+//
+// It returns nothing. It used to return capture.Results(), which every one of its
+// three call sites discarded — visitPage takes its own snapshot afterwards. That
+// was not merely an unused value: Results() takes the capture mutex and rebuilds
+// every captured request, re-parsing each URL and re-deriving its query params, so
+// each return was O(total captured bytes) for the page. interactPage calls this once
+// per click plus once per returnToPage, so a page paid up to 16 full reconstructions
+// purely to throw them away, across Concurrency tabs, scaled by attacker-controlled
+// page content (LAB-4678 review, QUAL-005/SEC-BE-006).
 //
 // deadline is the WHOLE PAGE's ceiling, shared by the baseline wait and every
 // interaction wait, so a page cannot exceed its budget by calling this
 // repeatedly. The floor still applies per call, which is deliberate: each click
 // needs a minimum window for its requests to start, and the shared deadline caps
 // the total regardless.
-func (e *rodEngine) waitForNetworkIdle(ctx context.Context, capture *pageNetworkCapture, deadline time.Time) []ObservedRequest {
+func (e *rodEngine) waitForNetworkIdle(ctx context.Context, capture *pageNetworkCapture, deadline time.Time) {
 	start := time.Now()
 	ticker := time.NewTicker(networkIdlePollInterval)
 	defer ticker.Stop()
@@ -589,11 +598,11 @@ func (e *rodEngine) waitForNetworkIdle(ctx context.Context, capture *pageNetwork
 		inFlight, sinceActivity := capture.networkState(e.opts.PerRequestTimeout, now)
 		if networkIdleReached(inFlight, sinceActivity, now.Sub(start),
 			e.opts.NetworkIdleFloor, e.opts.NetworkQuietPeriod, !now.Before(deadline)) {
-			return capture.Results()
+			return
 		}
 		select {
 		case <-ctx.Done():
-			return capture.Results()
+			return
 		case <-ticker.C:
 		}
 	}

@@ -320,6 +320,12 @@ func TestPageNetworkCapture_ResultsOrderIsStable(t *testing.T) {
 // against double-counting: CDP reuses a request ID across a redirect chain and the
 // request handler overwrites the pending entry, so appending to the order index
 // unconditionally would emit that request more than once.
+//
+// It drives recordSent, the real production guard, rather than re-implementing it.
+// The previous version built c.order by hand and copied the guard into its own body,
+// so deleting the guard from network.go left this test green — it asserted against a
+// copy of the code (LAB-4678 review, TEST-008). Verified by mutation: removing the
+// `if _, seen := c.pending[id]; !seen` condition in recordSent fails this test.
 func TestPageNetworkCapture_RedirectReusedIDEmittedOnce(t *testing.T) {
 	c := &pageNetworkCapture{
 		pending:      make(map[proto.NetworkRequestID]*pendingRequest),
@@ -327,14 +333,10 @@ func TestPageNetworkCapture_RedirectReusedIDEmittedOnce(t *testing.T) {
 		lastActivity: time.Now(),
 	}
 	const id = proto.NetworkRequestID("shared")
-	// First send.
-	c.pending[id] = &pendingRequest{method: "GET", url: "https://ex.com/start", complete: true}
-	c.order = append(c.order, id)
-	// Redirect: same request ID, new target. Mirrors the handler's guard.
-	if _, seen := c.pending[id]; !seen {
-		c.order = append(c.order, id)
-	}
-	c.pending[id] = &pendingRequest{method: "GET", url: "https://ex.com/final", complete: true}
+	// First send, then the redirect hop reusing the same request ID. Both go through
+	// the same path the CDP handler uses.
+	c.recordSent(id, &pendingRequest{method: "GET", url: "https://ex.com/start", complete: true})
+	c.recordSent(id, &pendingRequest{method: "GET", url: "https://ex.com/final", complete: true})
 
 	got := c.Results()
 	if len(got) != 1 {

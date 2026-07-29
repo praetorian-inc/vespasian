@@ -88,26 +88,45 @@ func newPageNetworkCapture(page *rod.Page, pageURL string) (*pageNetworkCapture,
 	return c, wait
 }
 
+// recordSent registers a request that is about to be sent: it appends the ID to the
+// order index ONCE and stores (or replaces) the pending entry. It sets startedAt and
+// lastActivity itself, so callers pass only the request fields they read off the CDP
+// event.
+//
+// The append is guarded because CDP REUSES a request ID across a redirect chain: the
+// same ID fires RequestWillBeSent again for the new target, and the pending entry is
+// overwritten so only the final hop survives. Appending unconditionally would put the
+// ID in the order index once per hop and Results() would emit that request N times.
+//
+// This is a named method rather than an inline closure so a test can drive the real
+// guard. The regression test used to build c.pending and c.order by hand and then
+// re-implement the guard in its own body ("Mirrors the handler's guard"), which meant
+// deleting the production guard left it green — it asserted against a copy of the code
+// rather than the code (LAB-4678 review, TEST-008).
+func (c *pageNetworkCapture) recordSent(id proto.NetworkRequestID, req *pendingRequest) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	if _, seen := c.pending[id]; !seen {
+		c.order = append(c.order, id)
+	}
+	req.startedAt = now
+	c.pending[id] = req
+	c.lastActivity = now
+}
+
 // setupListeners registers CDP event handlers and returns a wait function.
 // The wait function blocks until all registered events resolve. Callers
 // should invoke it in a goroutine; it runs for the lifetime of the page.
 func (c *pageNetworkCapture) setupListeners(page *rod.Page) func() {
 	return page.EachEvent(
 		func(e *proto.NetworkRequestWillBeSent) {
-			c.mu.Lock()
-			defer c.mu.Unlock()
-			now := time.Now()
-			if _, seen := c.pending[e.RequestID]; !seen {
-				c.order = append(c.order, e.RequestID)
-			}
-			c.pending[e.RequestID] = &pendingRequest{
-				method:    e.Request.Method,
-				url:       e.Request.URL,
-				headers:   flattenNetworkHeaders(e.Request.Headers),
-				body:      string(truncateBody([]byte(e.Request.PostData))),
-				startedAt: now,
-			}
-			c.lastActivity = now
+			c.recordSent(e.RequestID, &pendingRequest{
+				method:  e.Request.Method,
+				url:     e.Request.URL,
+				headers: flattenNetworkHeaders(e.Request.Headers),
+				body:    string(truncateBody([]byte(e.Request.PostData))),
+			})
 		},
 		func(e *proto.NetworkResponseReceived) {
 			c.mu.Lock()
