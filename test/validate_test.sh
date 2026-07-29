@@ -423,6 +423,97 @@ assert_reject "unparsable page count ('?')" \
     "page count is not a number" \
     assert_max_pages "unparsable-count" "?" 10 5
 
+# assert_count <label> <expected> <function> <args...>
+#   -> runs <function> with <args...>, captures its stdout, and compares it
+#      (trimmed of a trailing newline) against <expected>. count_capture_pages
+#      communicates its result via printed stdout rather than a return code,
+#      so assert_ok/assert_reject (which only inspect rc / combined output)
+#      don't fit; this is the dedicated stdout-comparison counterpart.
+assert_count() {
+    local label=$1 expected=$2; shift 2
+    local actual
+    actual=$("$@" 2>/dev/null)
+
+    if [ "$actual" = "$expected" ]; then
+        log_ok "PASS (count matches): ${label}"
+        PASS=$((PASS + 1))
+    else
+        log_fail "FAIL (count mismatch): ${label}
+  expected: ${expected}
+  actual:   ${actual}"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+# ──────────────────────────────────────────────────────────────
+# count_capture_pages
+# ──────────────────────────────────────────────────────────────
+log_header "count_capture_pages"
+
+# rod-style capture: 10 distinct page_url values but 20 records (each page
+# contributes a navigation record plus a /favicon.ico sub-resource record
+# sharing the same page_url). This is the exact CI scenario from PR #187 —
+# the single most important case here.
+python3 - "${WORK_DIR}/rod-style-capture.json" << 'PYEOF'
+import json, sys
+
+records = []
+for i in range(10):
+    page_url = "http://example.test/page%d" % i
+    records.append({"url": page_url, "page_url": page_url, "source": "rod"})
+    records.append({"url": page_url + "/favicon.ico", "page_url": page_url, "source": "rod"})
+
+with open(sys.argv[1], "w") as f:
+    json.dump(records, f)
+PYEOF
+assert_count "rod-style capture: 10 pages, 20 records (navigation + favicon per page)" \
+    "10" \
+    count_capture_pages "${WORK_DIR}/rod-style-capture.json"
+
+# net/http-style capture: no page_url key at all, 10 distinct urls.
+python3 - "${WORK_DIR}/http-style-capture.json" << 'PYEOF'
+import json, sys
+
+records = [{"url": "http://example.test/page%d" % i, "source": "http"} for i in range(10)]
+
+with open(sys.argv[1], "w") as f:
+    json.dump(records, f)
+PYEOF
+assert_count "net/http-style capture: 10 records, no page_url key, 10 distinct urls" \
+    "10" \
+    count_capture_pages "${WORK_DIR}/http-style-capture.json"
+
+# Duplicate urls, no page_url: must count distinct urls, not records.
+python3 - "${WORK_DIR}/duplicate-urls-capture.json" << 'PYEOF'
+import json, sys
+
+records = [{"url": "http://example.test/same"} for _ in range(5)]
+
+with open(sys.argv[1], "w") as f:
+    json.dump(records, f)
+PYEOF
+assert_count "duplicate urls, no page_url: distinct count not record count" \
+    "1" \
+    count_capture_pages "${WORK_DIR}/duplicate-urls-capture.json"
+
+# Empty list.
+printf '[]' > "${WORK_DIR}/empty-capture.json"
+assert_count "empty list" \
+    "0" \
+    count_capture_pages "${WORK_DIR}/empty-capture.json"
+
+# Malformed JSON.
+printf '{not valid json' > "${WORK_DIR}/malformed-capture.json"
+assert_count "malformed JSON" \
+    "?" \
+    count_capture_pages "${WORK_DIR}/malformed-capture.json"
+
+# Not a list.
+printf '{}' > "${WORK_DIR}/not-a-list-capture.json"
+assert_count "not a list (object)" \
+    "0" \
+    count_capture_pages "${WORK_DIR}/not-a-list-capture.json"
+
 # ──────────────────────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────────────────────

@@ -684,6 +684,54 @@ print(count)
 PYEOF
 }
 
+# count_capture_pages counts the number of distinct PAGES visited in a
+# capture, not the number of raw captured request records (LAB-4678,
+# pkg/crawl/doc.go). MaxPages caps pages (distinct URLs visited) rather than
+# captured requests, because a single SPA page can fire dozens of XHR/fetch
+# calls that all count as one page. pkg/crawl/engine.go's visitPage opens a
+# fresh tab per page on the rod (headless browser) backend, so the browser
+# also emits that page's sub-resource requests (e.g. a 200 /favicon.ico) into
+# the capture — inflating a raw record count well past the page budget even
+# though the budget itself (pageBudgetReached, reserved under a mutex before
+# each visit) was enforced exactly. pkg/crawl's own
+# TestCrawlerContract_RespectsMaxPages test counts pages the same way for the
+# same reason, explicitly excluding sub-resources so the counter is
+# comparable across both the http and rod backends. This was the CI failure
+# in PR #187 ("Max-pages limit: captured 20 requests (limit=10, allowed
+# <=15)"): the test was counting raw capture records against a page budget.
+#
+# Discriminator: ObservedRequest carries a page_url field
+# (pkg/crawl/types.go:37) that the browser backend sets on every captured
+# exchange to the page it was observed on (pkg/crawl/network.go:154-161), so
+# distinct page_url values are exactly the visited-page set. The net/http
+# backend emits no page_url at all (one record per page, source=http), so
+# fall back to counting distinct url values there.
+# Usage: count_capture_pages <capture_file>
+count_capture_pages() {
+    local capture_file=$1
+    python3 - "$capture_file" << 'PYEOF'
+import json, sys
+
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+except Exception:
+    print("?")
+    sys.exit(0)
+
+if not isinstance(data, list):
+    print(0)
+    sys.exit(0)
+
+page_urls = {r.get("page_url") for r in data if isinstance(r, dict) and r.get("page_url")}
+if page_urls:
+    print(len(page_urls))
+else:
+    urls = {r.get("url") for r in data if isinstance(r, dict) and r.get("url")}
+    print(len(urls))
+PYEOF
+}
+
 # validate_paths_absent fails if any forbidden path appears as a top-level
 # key in the OpenAPI spec. Matching convention per forbidden value F:
 #   - F ending in "/"  → SUBTREE match: flags the root and any descendant
@@ -794,7 +842,7 @@ assert_max_pages() {
     fi
     local max_allowed=$((limit + margin))
     if [ "$page_count" -gt "$max_allowed" ]; then
-        log_fail "${label}: captured ${page_count} requests (limit=${limit}, allowed <=${max_allowed}) — --max-pages not enforced"
+        log_fail "${label}: visited ${page_count} page(s) (limit=${limit}, allowed <=${max_allowed}) — --max-pages not enforced"
         return 1
     fi
     return 0

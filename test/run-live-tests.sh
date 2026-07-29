@@ -3353,12 +3353,17 @@ PYEOF
         $verbose_flag 2>&1; then
 
         local page_count
-        page_count=$(json_len "$limited_capture")
-        # max-pages=10 must be enforced. A small margin tolerates in-flight
-        # concurrency, but a broken cap (the many-links page exposes 20 links) is
-        # now a hard failure, not a warning (LAB-3890 T3, gap B2).
+        page_count=$(count_capture_pages "$limited_capture")
+        # --max-pages caps pages visited, not captured requests. The rod
+        # (headless browser) backend visits each page in a fresh tab, so
+        # sub-resources (e.g. a 200 /favicon.ico) fired by that page land in
+        # the capture too. Counting raw records over-counted and produced a
+        # false "--max-pages not enforced" failure in CI at 20-vs-10 while the
+        # crawler was behaving correctly. pkg/crawl's own
+        # TestCrawlerContract_RespectsMaxPages counts pages the same way and
+        # passes on both backends (PR #187 / LAB-3890 T3, gap B2).
         if assert_max_pages "Max-pages limit" "$page_count" 10 5; then
-            log_ok "Max-pages limit: captured ${page_count} requests (limit=10)"
+            log_ok "Max-pages limit: visited ${page_count} page(s) (limit=10)"
         else
             failures=$((failures + 1))
         fi
