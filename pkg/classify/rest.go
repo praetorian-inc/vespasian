@@ -23,10 +23,14 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 )
 
-// staticExtensions lists file extensions that indicate static assets.
+// staticExtensions lists file extensions that indicate static assets. Rule 1 of
+// every classifier rejects on these, so an entry here excludes by URL regardless
+// of what content-type the server sent. .webmanifest is the belt to
+// documentContentTypes' braces: a manifest served with a wrong or missing
+// content-type is still not an endpoint.
 var staticExtensions = []string{
 	".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".ico",
-	".woff", ".woff2", ".ttf", ".eot", ".svg", ".map",
+	".woff", ".woff2", ".ttf", ".eot", ".svg", ".map", ".webmanifest",
 }
 
 // staticPathSegments lists path segments that indicate static asset directories.
@@ -107,16 +111,31 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 		}
 	}
 
+	respCT := req.Response.ContentType
+	if respCT == "" {
+		respCT = mediatype.Header(req.Response.Headers, "content-type")
+	}
+
+	// Rule 1b: Document media types DISQUALIFY, they are not merely a missing
+	// signal. Keeping them out of matchAPIContentType only silences Rule 2; Rule 5
+	// still scores any JSON-object body at JSONBodyConfidence (0.85), which clears
+	// the threshold on its own. A web app manifest and a JSON Feed both have JSON
+	// object bodies, so without this early return /manifest.json still landed in
+	// the spec after being excluded from the content-type tier — the exclusion set
+	// alone was not the fix (LAB-4678 review, QUAL-003).
+	//
+	// This mirrors Rule 1: an identified non-endpoint is rejected outright rather
+	// than left for a later rule to promote.
+	if isDocumentContentType(respCT) {
+		return false, 0, ""
+	}
+
 	var confidence float64
 	var reason string
 
 	// Rule 2: Content-type filter. rule2CT records the API media type matched
 	// on the response so Rule 6 can avoid re-reporting the same content type as
 	// a request-side signal (QUAL-005).
-	respCT := req.Response.ContentType
-	if respCT == "" {
-		respCT = mediatype.Header(req.Response.Headers, "content-type")
-	}
 	rule2CT := matchAPIContentType(respCT)
 	if rule2CT != "" {
 		confidence = ContentTypeConfidence
@@ -262,14 +281,42 @@ var soapContentTypes = []string{
 	"application/soap+xml",
 }
 
-// feedContentTypes are syndication formats. They carry a +json/+xml structured
-// suffix but are content documents for feed readers, not API endpoints, so the
-// suffix tier must not classify them. Vespasian maps APIs; an RSS or Atom feed
-// in an OpenAPI spec is noise, and the classifier-edge live test asserts a feed
-// stays out. Without this exclusion the suffix rule pulls in every blog feed on
-// the target.
-var feedContentTypes = []string{
+// documentContentTypes are media types that carry a +json/+xml structured suffix
+// but are DOCUMENTS rather than endpoint responses, so the suffix tier must not
+// classify them. Vespasian maps APIs; a document in an OpenAPI spec is noise.
+//
+// Membership rule, so this set stops growing one incident at a time: a type
+// belongs here when its payload is consumed as a standalone document by the
+// browser or a reader application, and fetching it tells you nothing about an
+// endpoint's request/response contract. That is the test to apply before adding
+// an entry, and the reason each entry below is present.
+//
+// Deliberately NOT here: application/ld+json, application/geo+json, and vendor
+// types like application/vnd.github+json. Those are endpoint response bodies —
+// JSON-LD served as a response IS the API's data (Hydra, ActivityPub) — and
+// matchAPIContentType's whole purpose is to stop hardcoding an allowlist that
+// excludes them. A <script type="application/ld+json"> block never reaches here,
+// because this matches response and request Content-Type headers, not markup.
+var documentContentTypes = []string{
+	// Syndication feeds: a feed is a document for feed readers. Without this the
+	// suffix rule pulls in every blog feed on the target. The classifier-edge
+	// live test asserts a feed stays out.
 	"application/rss+xml", "application/atom+xml", "application/feed+json",
+	// Web app manifest: browser install metadata, served at /manifest.json or
+	// /site.webmanifest by essentially every modern SPA, which is this tool's
+	// target class. Omitting it added a false operation to most REST specs and
+	// inflated the restCount DetectAPIType weighs (LAB-4678 review, QUAL-003).
+	"application/manifest+json",
+}
+
+// isDocumentContentType reports whether ct is one of the documentContentTypes,
+// canonicalized the same way matchAPIContentType canonicalizes. Callers treat a
+// true result as a disqualifier for the whole request, not just as the absence of
+// a content-type signal — see Rule 1b in ClassifyDetail for why the distinction
+// matters.
+func isDocumentContentType(ct string) bool {
+	base := mediatype.Base(ct)
+	return base != "" && slices.Contains(documentContentTypes, base)
 }
 
 // matchAPIContentType canonicalizes ct (lowercase + charset/parameter strip via
@@ -293,8 +340,9 @@ var feedContentTypes = []string{
 // The suffix tier is narrow on purpose: it requires the application/ top-level
 // type, so text/* and image/* cannot match, and three exclusion sets run first —
 // navigationContentTypes (application/xhtml+xml is a page), soapContentTypes
-// (owned by WSDLClassifier), and feedContentTypes (syndication documents, not
-// endpoints).
+// (owned by WSDLClassifier), and documentContentTypes (feeds and web app
+// manifests, which are documents rather than endpoint responses; see that set's
+// membership rule before adding to it).
 func matchAPIContentType(ct string) string {
 	base := mediatype.Base(ct)
 	if base == "" {
@@ -313,7 +361,7 @@ func matchAPIContentType(ct string) string {
 	if !strings.HasPrefix(base, "application/") {
 		return ""
 	}
-	if slices.Contains(soapContentTypes, base) || slices.Contains(feedContentTypes, base) {
+	if slices.Contains(soapContentTypes, base) || slices.Contains(documentContentTypes, base) {
 		return ""
 	}
 	switch {

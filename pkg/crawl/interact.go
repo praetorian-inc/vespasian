@@ -33,6 +33,19 @@ import (
 // by default (LAB-4678 Phase 2).
 const maxInteractionsPerPage = 8
 
+// maxInteractionCandidates bounds how many matched elements collectInteractionElements
+// will accumulate in one scan. maxInteractionsPerPage bounds the CLICKS; without this
+// the CANDIDATE LIST was unbounded and driven entirely by page content: a page
+// rendering 200,000 <button> nodes forced a CDP response carrying that many remote
+// object IDs plus an equally sized rod.Elements and []string, re-collected before
+// every click, across Concurrency tabs (LAB-4678 review, SEC-BE-007).
+//
+// The scan returns at the FIRST acceptable element, so truncating costs no realistic
+// coverage: reaching this cap means several hundred candidates were all rejected as
+// blank, destructive, or already clicked, and the pass has at most 8 clicks to spend
+// regardless. Set well above maxInteractionsPerPage so ordinary pages never truncate.
+const maxInteractionCandidates = 512
+
 // interactionSelectors are the DOM selectors for elements likely to trigger
 // client-side behavior (XHR/fetch or a client-side route change) when clicked,
 // without a full navigation. Anchors are excluded: their hrefs are already
@@ -212,14 +225,38 @@ func interactionCandidate(label string, used map[string]bool) bool {
 	return norm != "" && !isDestructiveLabel(label) && !used[norm]
 }
 
-// currentPageURL returns the page's current document URL, or "" when it cannot be
+// currentPageURL returns the page's current document URL and whether it could be
 // read. Used to detect that a click navigated.
-func currentPageURL(page *rod.Page) string {
+//
+// The ok return is not decoration: page.Info() errors precisely when a document is
+// mid-navigation, which is exactly the state the navigation check exists to catch.
+// This used to return a bare string with "" meaning unreadable, which made an
+// unreadable URL indistinguishable from a value and let the caller's comparison
+// silently fail OPEN — the pass kept clicking on a document the worker was never
+// assigned, and reported navigated=false so DOM enrichment ran against it. Every
+// caller must now decide what an unreadable URL means, and the compiler makes them
+// (LAB-4678 review, QUAL-007/SEC-BE-008).
+func currentPageURL(page *rod.Page) (string, bool) {
 	info, err := page.Info()
 	if err != nil || info == nil {
-		return ""
+		return "", false
 	}
-	return info.URL
+	return info.URL, info.URL != ""
+}
+
+// leftAssignedPage is the pure post-click decision for whether the worker may
+// still be off its assigned document, split out so the fail-closed rule is
+// unit-testable without a browser (the same reason networkIdleReached and
+// budgetReached are factored out).
+//
+// It reports true when recovery must be attempted: either the URL changed, or it
+// could not be read at all. The unreadable case is the load-bearing one —
+// page.Info() fails while a document is mid-navigation, so after a click "cannot
+// read" is evidence of navigation, not evidence of staying put. Reading it as
+// "unchanged" is what let the pass keep clicking a foreign document and then
+// report navigated=false so DOM enrichment ran against it.
+func leftAssignedPage(now string, readable bool, startURL string) bool {
+	return !readable || now != startURL
 }
 
 // collectInteractionElements queries the page for every interaction selector and
@@ -238,6 +275,10 @@ func currentPageURL(page *rod.Page) string {
 //
 // A label that cannot be read comes back blank, which interactionCandidate
 // rejects — the same fail-closed treatment clickAllowed applies.
+//
+// The retained match count is capped at maxInteractionCandidates so page content
+// cannot drive this function's allocation size; see that constant for why
+// truncating costs no coverage.
 func collectInteractionElements(page *rod.Page, used map[string]bool) (rod.Elements, []string, int) {
 	var elements rod.Elements
 	for _, sel := range interactionSelectors {
@@ -245,7 +286,16 @@ func collectInteractionElements(page *rod.Page, used map[string]bool) (rod.Eleme
 		if err != nil {
 			continue // non-fatal: selector may not match
 		}
+		// Retain at most maxInteractionCandidates across all selectors. A page
+		// controls how many elements match, so accumulating every match let page
+		// content dictate this function's allocation size (SEC-BE-007).
+		if room := maxInteractionCandidates - len(elements); len(els) > room {
+			els = els[:room]
+		}
 		elements = append(elements, els...)
+		if len(elements) >= maxInteractionCandidates {
+			break
+		}
 	}
 	labels := make([]string, len(elements))
 	for i, el := range elements {
@@ -305,7 +355,16 @@ func (e *rodEngine) interactPage(ctx context.Context, page *rod.Page, capture *p
 	if page == nil {
 		return false
 	}
-	startURL := currentPageURL(page)
+	// Without a readable start URL, navigation can never be detected for this page,
+	// so no click on it can be made safely. Skip the pass entirely rather than
+	// clicking blind. Returning false is correct and not a fail-open: nothing has
+	// been clicked yet, so the live document is still the assigned one and DOM
+	// enrichment is safe. The fail-closed decision here is "do not click", not
+	// "assume we navigated".
+	startURL, ok := currentPageURL(page)
+	if !ok {
+		return false
+	}
 	used := make(map[string]bool, maxInteractionsPerPage)
 
 	for range maxInteractionsPerPage {
@@ -348,7 +407,13 @@ func (e *rodEngine) interactPage(ctx context.Context, page *rod.Page, capture *p
 		// and keep going: the remaining controls still need exercising, and `used`
 		// keeps this one from being clicked again. If we cannot get back, report it
 		// so the caller does not enrich from the wrong document.
-		if now := currentPageURL(page); startURL != "" && now != "" && now != startURL {
+		//
+		// An UNREADABLE post-click URL counts as navigated. page.Info() fails while a
+		// document is mid-navigation, so "cannot read" after a click is evidence of
+		// the very thing being tested for, not evidence of staying put. Treating it
+		// as unchanged is what let the pass keep clicking a foreign document.
+		now, readable := currentPageURL(page)
+		if leftAssignedPage(now, readable, startURL) {
 			if !e.returnToPage(ctx, page, startURL, capture, deadline) {
 				return true
 			}
@@ -370,5 +435,8 @@ func (e *rodEngine) returnToPage(ctx context.Context, page *rod.Page, url string
 		return false
 	}
 	e.waitForNetworkIdle(ctx, capture, deadline)
-	return currentPageURL(page) == url
+	// An unreadable URL cannot confirm the assigned document is loaded, so it is a
+	// failure to restore, not a success.
+	now, ok := currentPageURL(page)
+	return ok && now == url
 }

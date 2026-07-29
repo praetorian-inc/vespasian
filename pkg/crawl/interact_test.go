@@ -118,3 +118,50 @@ func TestIsDestructiveLabel_IrreversibleCommits(t *testing.T) {
 		}
 	}
 }
+
+// TestLeftAssignedPage_FailsClosedOnUnreadableURL pins the fail-closed rule for the
+// post-click navigation check. The unreadable case is the whole point: page.Info()
+// errors while a document is mid-navigation, which is exactly the state a navigating
+// click produces, so "cannot read the URL" must count as "may have navigated".
+//
+// Before this, the guard read `startURL != "" && now != "" && now != startURL`, so an
+// unreadable URL skipped recovery entirely: the pass kept clicking a document the
+// worker was never assigned and reported navigated=false, which let visitPage run DOM
+// enrichment against a foreign page and push its links and forms into the frontier
+// off-budget (LAB-4678 review, QUAL-007/SEC-BE-008).
+func TestLeftAssignedPage_FailsClosedOnUnreadableURL(t *testing.T) {
+	const assigned = "https://ex.com/dashboard"
+	cases := []struct {
+		name     string
+		now      string
+		readable bool
+		want     bool
+	}{
+		{"same URL, readable: stayed put", assigned, true, false},
+		{"different URL, readable: navigated", "https://ex.com/other", true, true},
+		// The regression cases. Each of these returned false before the fix.
+		{"unreadable, empty: must assume navigated", "", false, true},
+		{"unreadable but same value: must still assume navigated", assigned, false, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := leftAssignedPage(c.now, c.readable, assigned); got != c.want {
+				t.Errorf("leftAssignedPage(%q, %v, %q) = %v, want %v",
+					c.now, c.readable, assigned, got, c.want)
+			}
+		})
+	}
+}
+
+// TestMaxInteractionCandidates_ExceedsClickBudget pins the relationship the candidate
+// cap depends on. The cap only costs no coverage while it stays well above the click
+// budget: reaching it means that many candidates were all rejected, and the pass can
+// spend at most maxInteractionsPerPage clicks regardless (SEC-BE-007). Lowering the
+// cap toward the click budget would silently start dropping clickable controls.
+func TestMaxInteractionCandidates_ExceedsClickBudget(t *testing.T) {
+	if maxInteractionCandidates <= maxInteractionsPerPage {
+		t.Fatalf("maxInteractionCandidates (%d) must exceed maxInteractionsPerPage (%d), "+
+			"or truncating the candidate list can drop clickable controls",
+			maxInteractionCandidates, maxInteractionsPerPage)
+	}
+}

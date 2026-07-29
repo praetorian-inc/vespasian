@@ -706,6 +706,11 @@ func TestMatchAPIContentType_StructuredSuffix(t *testing.T) {
 		{"rss feed is not an API", "application/rss+xml", ""},
 		{"json feed is not an API", "application/feed+json", ""},
 		{"soap+xml belongs to WSDLClassifier", "application/soap+xml", ""},
+		// A web app manifest is browser install metadata, served by essentially
+		// every modern SPA. It matched the +json arm and became a false operation
+		// in most REST specs (LAB-4678 review, QUAL-003).
+		{"web app manifest is not an API", "application/manifest+json", ""},
+		{"web app manifest with charset", "application/manifest+json; charset=utf-8", ""},
 
 		// Excluded: navigation types, one of which carries a +xml suffix and
 		// would otherwise match tier 2 on every HTML page load.
@@ -810,4 +815,68 @@ func TestRESTClassifier_RSSFeedNotAnAPI(t *testing.T) {
 	assert.Less(t, confidence, DefaultConfidenceThreshold,
 		"an RSS feed must not clear the API confidence threshold")
 	assert.False(t, isAPI, "an RSS feed is a syndication document, not an API endpoint")
+}
+
+// TestRESTClassifier_JSONFeedNotAnAPI covers the half of the feed exclusion that
+// TestRESTClassifier_RSSFeedNotAnAPI could not reach. That test uses an XML feed,
+// whose body never triggers Rule 5. application/feed+json is a JSON Feed: it was
+// already in the exclusion set, so Rule 2 stayed silent, but its JSON object body
+// scored JSONBodyConfidence (0.85) and cleared the threshold anyway. Excluding a
+// media type from the content-type tier was never sufficient on its own; Rule 1b
+// is what makes a document type disqualifying (LAB-4678 review, QUAL-003).
+func TestRESTClassifier_JSONFeedNotAnAPI(t *testing.T) {
+	c := &RESTClassifier{}
+	isAPI, confidence, _ := c.ClassifyDetail(crawl.ObservedRequest{
+		Method: "GET",
+		URL:    "https://ex.com/feed.json",
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "application/feed+json",
+			Headers:     map[string]string{"Content-Type": "application/feed+json"},
+			Body:        []byte(`{"version":"https://jsonfeed.org/version/1.1","items":[]}`),
+		},
+	})
+	assert.Less(t, confidence, DefaultConfidenceThreshold,
+		"a JSON Feed must not clear the API confidence threshold on its body structure")
+	assert.False(t, isAPI, "a JSON Feed is a syndication document, not an API endpoint")
+}
+
+// TestRESTClassifier_WebAppManifestNotAnAPI drives the full classifier over the
+// two shapes a web app manifest actually ships as, at their conventional
+// document-root locations. Both are served by essentially every modern SPA, so
+// before this exclusion the suffix tier added a false operation to most REST
+// specs and inflated the restCount DetectAPIType weighs (LAB-4678 review,
+// QUAL-003). /manifest.json is caught by the content-type exclusion and
+// /site.webmanifest by the static-extension rule, so this covers both halves of
+// the fix.
+func TestRESTClassifier_WebAppManifestNotAnAPI(t *testing.T) {
+	const body = `{"name":"App","short_name":"App","start_url":"/","display":"standalone"}`
+	for _, tc := range []struct {
+		name string
+		url  string
+		ct   string
+	}{
+		{"manifest.json served as manifest+json", "https://ex.com/manifest.json", "application/manifest+json"},
+		{"site.webmanifest served as manifest+json", "https://ex.com/site.webmanifest", "application/manifest+json"},
+		// A manifest served with a generic or wrong content-type must still be
+		// excluded by URL. This is the case documentContentTypes alone misses.
+		{"site.webmanifest served as plain json", "https://ex.com/site.webmanifest", "application/json"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &RESTClassifier{}
+			isAPI, confidence, _ := c.ClassifyDetail(crawl.ObservedRequest{
+				Method: "GET",
+				URL:    tc.url,
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: tc.ct,
+					Headers:     map[string]string{"Content-Type": tc.ct},
+					Body:        []byte(body),
+				},
+			})
+			assert.Less(t, confidence, DefaultConfidenceThreshold,
+				"a web app manifest must not clear the API confidence threshold")
+			assert.False(t, isAPI, "a web app manifest is browser install metadata, not an API endpoint")
+		})
+	}
 }
