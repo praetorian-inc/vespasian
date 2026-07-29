@@ -78,10 +78,18 @@ func TestNewCrossOriginValidator_SameOriginAllowsWhenBaseAllows(t *testing.T) {
 // TestNewCrossOriginValidator_NilCfgValidatorFallsBackToProbeValidateProbeURL,
 // which pinned the identical fallback on newCrossOriginValidator after it had
 // become dead code from the production call site.
+//
+// TEST-002: the URL is both loopback (rejected by the SSRF fallback) AND
+// well-formed with no userinfo (so the parse-time gate above it would NOT
+// reject it), so the assertion below can only be satisfied by the fallback
+// branch actually being consulted -- not incidentally by the parse-time gate
+// rejecting first, which the plain require.Error alone could not rule out.
 func TestNewFullURLValidator_NilBaseFallsBackToProbeValidateProbeURL(t *testing.T) {
-	validate := newFullURLValidator(nil, nil)
+	validate := newFullURLValidator(nil)
 
 	err := validate("http://127.0.0.1:9/api/v1/x")
 	require.Error(t, err, "a nil base must fall back to probe.ValidateProbeURL, "+
 		"which rejects a loopback candidate")
+	assert.NotContains(t, err.Error(), "parse-time validation",
+		"the error must come from the SSRF fallback branch, not the parse-time gate")
 }

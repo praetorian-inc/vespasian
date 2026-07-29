@@ -1189,6 +1189,8 @@ func TestAnalyze_EndpointsKeptReflectsSynthesisDrops(t *testing.T) {
 func TestAnalyze_EndpointsKeptReflectsSourcemapSynthesisDrops(t *testing.T) {
 	// One clean endpoint the gate must keep, one carrying credentials the gate
 	// must drop — both live ONLY in the sourcemap source.
+	// u:p is synthetic; example.com is an RFC 2606 reserved domain. This
+	// fixture asserts the credential gate REJECTS it.
 	srcContent := `fetch("/api/sm/keep");` + `fetch("https://u:p@example.com/api/sm/drop");`
 	smDoc := fmt.Sprintf(`{"sources":["src/index.js"],"sourcesContent":[%s]}`,
 		func() string { b, _ := json.Marshal(srcContent); return string(b) }())

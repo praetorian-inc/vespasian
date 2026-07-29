@@ -43,6 +43,17 @@ import (
 // copy instead of the live one), so it was removed here rather than kept
 // unreachable.
 //
+// This is not merely "removed dead code" -- there is no reachable path where
+// a nil base would even reach this function today: pipeline.go's only call
+// site passes the newFullURLValidator closure (never nil), and both direct
+// unit tests of this function pass a non-nil base explicitly. The function
+// is unexported to internal/pipeline and ScanOptions has no
+// AllowCrossOriginProbe field, so no external caller can vary that call
+// site's shape either. A panic here therefore trades nothing away: it cannot
+// fire on any path that exists today, and if a future refactor ever did
+// route a nil base here, crashing that scan run is preferable to silently
+// falling back to a validator no caller asked for.
+//
 // targetOrigin == "" is deliberately NOT special-cased: crawl.SameOrigin
 // already returns false whenever either side's origin can't be resolved
 // (its doc comment: a "" left-hand origin never compares equal), so an
@@ -122,30 +133,26 @@ func newCrossOriginValidator(base func(string) error, targetOrigin string, warni
 // prior version of this comment named AllowCrossOriginProbe as a factor here,
 // which it is not).
 //
-// warnings receives a deduped, always-on line (SEC-BE-002 review finding)
-// when the parse-time gate rejects a candidate, mirroring
-// newCrossOriginValidator's cross-origin skip warning: without it, the
-// highest-value rejection this gate performs -- stopping a same-origin
-// candidate smuggling attacker-chosen HTTP Basic credentials via embedded
-// userinfo -- produced no operator-visible signal, since every consumer of
-// the returned error discards it into slog.DebugContext and no slog handler
-// is configured anywhere in this repo. Deduped by bestEffortOrigin, same as
-// the cross-origin arm, so a bundle spelling many userinfo variants of one
-// host can't flood the warnings sink.
-func newFullURLValidator(base func(string) error, warnings io.Writer) func(string) error {
+// The rejection here is deliberately SILENT -- unlike newCrossOriginValidator,
+// this function never writes to Warnings (SEC-BE-001). crawl.SanitizeForLog
+// is strconv.Quote: it escapes control bytes but redacts nothing, and the
+// rejection this gate exists for is embedded HTTP Basic credentials
+// (u.User != nil). import preserves userinfo verbatim, so the rejected URL
+// can carry the operator's own real credentials recovered from a Burp/HAR
+// capture, not an attacker-chosen value -- printing it to Warnings (an
+// always-on sink, not gated on --verbose: cmd/vespasian/main.go) would echo
+// that secret in cleartext to a lower-trust destination (terminal scrollback,
+// redirected stderr, CI logs) than the capture file the operator already
+// controls. JS-replay's addPath applies this identical gate and rejects
+// silently with a bare `return` (pkg/crawl/jsreplay.go); this matches that
+// convention. Do not reintroduce a warning here without a redaction scheme
+// first.
+func newFullURLValidator(base func(string) error) func(string) error {
 	if base == nil {
 		base = probe.ValidateProbeURL
 	}
-	warnedOrigins := make(map[string]bool)
 	return func(rawURL string) error {
 		if _, ok := crawl.ValidateFullURL(rawURL); !ok {
-			origin := bestEffortOrigin(rawURL)
-			if !warnedOrigins[origin] {
-				warnedOrigins[origin] = true
-				writeStatus(warnings,
-					"probe: skipping URL %s (failed parse-time validation: embedded credentials or unsupported scheme)\n",
-					crawl.SanitizeForLog(rawURL))
-			}
 			return fmt.Errorf("probe: URL rejected by parse-time validation: %s", rawURL)
 		}
 		return base(rawURL)
