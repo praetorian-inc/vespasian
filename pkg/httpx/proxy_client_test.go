@@ -1178,3 +1178,69 @@ func TestBuildHTTPClient_DisabledProxyFailsSafe(t *testing.T) {
 	assert.Nil(t, tr.Proxy, "a disabled proxy must yield a non-proxied client (no Proxy func)")
 	assert.NotNil(t, tr.DialContext, "the fail-safe path must keep the cloned default dialer")
 }
+
+// ---------------------------------------------------------------------------
+// TEST-003 (PR #186 round-7 review, LAB-4993)
+// ---------------------------------------------------------------------------
+
+// TestConnectHandshake_ClearsDeadlineForTunneledTraffic is the TEST-003
+// regression guard: connectHandshake sets conn.SetDeadline(ctx.Deadline())
+// to bound only the CONNECT round trip, then documents (proxy_client.go:313)
+// that it clears the deadline with conn.SetDeadline(time.Time{}) before
+// returning, so the bound does not survive into the tunneled traffic. This
+// matters for the gRPC reflection dial specifically: when proxied, that ctx
+// is grpc-go's own internal connect-attempt context (bounded by
+// minConnectTimeout, 20s by default) — not p.config.Timeout, which only
+// bounds the reflection RPC via a separate reqCtx that never reaches the
+// conn — so if the deadline leaked past the handshake, every proxied
+// reflection stream would silently die the instant that connect deadline
+// elapsed, however long the stream needed to stay open.
+//
+// TestProxyDialer_HTTPConnectTunnel and
+// TestProxyDialer_HTTPSProxy_ConnectTunnel already dial through a CONNECT
+// tunnel and exercise tunnel I/O, but both use a 5s ctx and read/write
+// immediately after dialing — well before any deadline could matter — so
+// they pass identically whether or not the clear exists. This test differs
+// by waiting for the ORIGINAL ctx to actually expire (via <-ctx.Done(), not
+// a sleep, so the wait is exact rather than a timing guess) before doing any
+// tunnel I/O. If the clear were dropped (or moved earlier, e.g. before the
+// pipelined-bytes read on proxy_client.go:308-311), the conn would still
+// carry that now-elapsed deadline, and the Write/Read below would fail with
+// an i/o timeout instead of round-tripping through the echo server.
+func TestConnectHandshake_ClearsDeadlineForTunneledTraffic(t *testing.T) {
+	targetAddr, stopTarget := startTCPEchoServer(t)
+	defer stopTarget()
+
+	proxyAddr, _, stopProxy := startRecordingCONNECTProxy(t, targetAddr)
+	defer stopProxy()
+
+	proxyURL, err := url.Parse("http://" + proxyAddr)
+	require.NoError(t, err)
+
+	dial, err := ProxyDialer(ProxyConfig{URL: proxyURL})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	conn, err := dial(ctx, targetAddr)
+	require.NoError(t, err, "the CONNECT handshake must succeed before its own ctx deadline elapses")
+	defer conn.Close() //nolint:errcheck // test cleanup
+
+	// Wait for the ORIGINAL ctx deadline to actually pass — deterministically,
+	// via the context's own Done() channel rather than a wall-clock sleep —
+	// before touching the tunnel. If connectHandshake's clear didn't run (or
+	// ran too early), conn still carries this exact deadline and the I/O
+	// below fails with an i/o timeout.
+	<-ctx.Done()
+
+	_, err = conn.Write([]byte("hello"))
+	require.NoError(t, err, "tunnel write after the original CONNECT deadline elapsed must succeed: "+
+		"a non-nil error here means the handshake deadline leaked into tunneled traffic")
+	buf := make([]byte, 5)
+	_, err = io.ReadFull(conn, buf)
+	require.NoError(t, err, "tunnel read after the original CONNECT deadline elapsed must succeed: "+
+		"a non-nil error here (e.g. i/o timeout) means the handshake deadline leaked into tunneled traffic")
+	assert.Equal(t, "hello", string(buf),
+		"expected the echo server's reply through the tunnel after the original deadline elapsed")
+}
