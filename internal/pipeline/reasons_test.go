@@ -197,10 +197,22 @@ func TestLogClassificationReasons_SanitizesTerminalEscapes(t *testing.T) {
 // silently rendering a truncated path that READ as legitimate while the
 // attacker-controlled origin had been discarded.
 //
-// Every credential below is synthetic and no host is ever dialed -- these rows
-// never leave logClassificationReasons. (Deliberately not enumerating the host
-// forms: two prior attempts at that list were both wrong, once naming a
-// loopback row that does not exist and once a .test domain no fixture uses.)
+// NOTE for alert triage: titus/kingfisher reports "Credentials in a URL"
+// against the rawURL fixtures in the table below (e.g. code-scanning alert 112
+// against the `http://user:pass@example.com` row). Every one is a synthetic
+// `user:pass` against example.com or a syntactically invalid host, no host is
+// ever dialed -- these rows never leave logClassificationReasons, which writes
+// to an in-memory buffer here -- and the credential IS the input under test:
+// this table exists precisely to prove a userinfo-bearing URL never renders its
+// credential. Removing or masking the userinfo would delete the test's subject,
+// and building the string from concatenated parts to slip past the scanner
+// would hide the fixture from readers while defeating a control the repository
+// relies on. The values are therefore retained deliberately; the alerts are
+// expected and should be dismissed as used-in-tests.
+//
+// (Deliberately not enumerating the host forms: two prior attempts at that list
+// were both wrong, once naming a loopback row that does not exist and once a
+// .test domain no fixture uses.)
 func TestLogClassificationReasons_RedactsUserinfo(t *testing.T) {
 	const placeholder = "<URL with userinfo redacted>"
 	for _, tc := range []struct{ name, rawURL, want string }{
