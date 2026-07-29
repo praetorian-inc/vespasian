@@ -142,14 +142,76 @@ BROWSER_TARGETS="rest-api soap-service graphql-server concat-spa forms-target"
 # it also blocked the browserless `--group offline` run downstream. When no
 # selected target needs a browser the check degrades to a warning, matching the
 # warn-and-skip contract run-live-tests.sh already applies per rod target.
+#
+# Unrecognised names fail OPEN (no browser required) — deliberately, and unlike
+# run-live-tests.sh's targets_need_config, which fails closed. The asymmetry is
+# safe because the consequence differs: failing open here only relaxes a
+# warning, and main()'s build dispatch rejects an unknown target with
+# "Unknown target" + exit 1 before anything is provisioned. Pinned by
+# preflight-selftest.sh case k.
 browser_required() {
-    local selected=$1 target
-    for target in ${selected//,/ }; do
+    # read -ra from a QUOTED here-string rather than an unquoted
+    # ${selected//,/ }: an unquoted expansion both splits AND globs, so a list
+    # containing * would expand against the cwd before comparison.
+    local target parts
+    read -ra parts <<< "${1//,/ }"
+    for target in "${parts[@]}"; do
         case " ${BROWSER_TARGETS} " in
             *" ${target} "*) return 0 ;;
         esac
     done
     return 1
+}
+
+# report_browser_prerequisite prints the browser diagnosis at the right severity
+# and returns 0 when the browser requirement is SATISFIED, 1 when it is not and
+# the caller should count that as a failure. Split out of check_prerequisites so
+# the "is a browser required, and how loudly do we complain" policy lives apart
+# from the flat go/python3/node checklist.
+#
+# $1 = browser_fatal ("true"/"false")
+report_browser_prerequisite() {
+    local browser_fatal=$1
+    # `chrome_bin=$(detect_chrome_binary) || rc=$?` (not `; rc=$?`) — under this
+    # script's `set -e`, a bare `chrome_bin=$(cmd); rc=$?` would abort the script
+    # the instant detect_chrome_binary returned non-zero, before rc=$? ever ran.
+    local chrome_bin rc=0
+    chrome_bin=$(detect_chrome_binary) || rc=$?
+
+    if [ $rc -eq 0 ]; then
+        log_ok "Browser: $chrome_bin"
+        return 0
+    fi
+
+    # Same diagnosis either way; only the severity and the return differ.
+    local browser_log=log_fail
+    if [ "$browser_fatal" != true ]; then
+        browser_log=log_warn
+    fi
+
+    if [ $rc -eq 2 ]; then
+        $browser_log "Found ${chrome_bin} but it is not runnable"
+        case "$chrome_bin" in
+            */snap/*|*/chromium-browser|*/chromium)
+                log_info "(looks like the Ubuntu snap stub — install the chromium snap: 'snap install chromium', or use google-chrome)."
+                ;;
+            *)
+                log_info "(the binary exists but failed to run — check permissions, missing shared libraries, or reinstall the browser)."
+                ;;
+        esac
+    else
+        $browser_log "Chrome/Chromium not found. Required for headless crawling."
+        # Deliberately NOT suggesting 'apt install chromium-browser': on Ubuntu
+        # noble that package is a transitional stub that pre-depends on snapd,
+        # i.e. the unrunnable binary this check exists to catch.
+        log_info "Install: './test/install-chrome.sh' (Debian/Ubuntu container) or https://www.google.com/chrome/"
+    fi
+
+    if [ "$browser_fatal" = true ]; then
+        return 1
+    fi
+    log_info "(no browser needed for this setup — browser-backed targets will skip when you run them)."
+    return 0
 }
 
 # check_prerequisites <targets> <skip_start>
@@ -179,52 +241,15 @@ check_prerequisites() {
     fi
 
     # Chrome/Chromium — presence alone is not enough (snap stubs satisfy
-    # command -v / -x but fail at runtime). detect_chrome_binary probes
-    # runnability so preflight fails loudly here, not during `vespasian crawl`.
-    # Note: `chrome_bin=$(detect_chrome_binary) || rc=$?` (not `; rc=$?`) — under
-    # this script's `set -e`, a bare `chrome_bin=$(cmd); rc=$?` would abort the
-    # script the instant detect_chrome_binary returns non-zero, before rc=$?
-    # ever ran, and the elif/else branches below would never execute.
+    # command -v / -x but fail at runtime). report_browser_prerequisite probes
+    # runnability so preflight fails loudly here, not during `vespasian crawl`,
+    # and downgrades to a warning when this setup needs no browser.
     #
-    # When browser_fatal is false the same diagnosis is reported at WARN and
-    # does not set `failed`, so setup completes and writes .live-test-config.
-    # `browser_log` / the explicit `if` below rather than `[ … ] && failed=1`:
-    # under this script's `set -e` a trailing AND-list whose test is false
-    # returns 1 and would abort the script mid-preflight — the same class of
-    # bug the detect_chrome_binary note above guards against.
-    local chrome_bin rc=0
-    chrome_bin=$(detect_chrome_binary) || rc=$?
-    local browser_log=log_fail
-    if [ "$browser_fatal" != true ]; then
-        browser_log=log_warn
-    fi
-    if [ $rc -eq 0 ]; then
-        log_ok "Browser: $chrome_bin"
-    elif [ $rc -eq 2 ]; then
-        $browser_log "Found ${chrome_bin} but it is not runnable"
-        case "$chrome_bin" in
-            */snap/*|*/chromium-browser|*/chromium)
-                log_info "(looks like the Ubuntu snap stub — install the chromium snap: 'snap install chromium', or use google-chrome)."
-                ;;
-            *)
-                log_info "(the binary exists but failed to run — check permissions, missing shared libraries, or reinstall the browser)."
-                ;;
-        esac
-        if [ "$browser_fatal" = true ]; then
-            failed=1
-        fi
-    else
-        $browser_log "Chrome/Chromium not found. Required for headless crawling."
-        # Deliberately NOT suggesting 'apt install chromium-browser': on Ubuntu
-        # noble that package is a transitional stub that pre-depends on snapd,
-        # i.e. the unrunnable binary this check exists to catch.
-        log_info "Install: './test/install-chrome.sh' (Debian/Ubuntu container) or https://www.google.com/chrome/"
-        if [ "$browser_fatal" = true ]; then
-            failed=1
-        fi
-    fi
-    if [ $rc -ne 0 ] && [ "$browser_fatal" != true ]; then
-        log_info "(no browser needed for this setup — browser-backed targets will skip when you run them)."
+    # Explicit `if` rather than `report_browser_prerequisite ... || failed=1`:
+    # under this script's `set -e` a trailing AND/OR-list whose final status is
+    # non-zero would abort the script mid-preflight.
+    if ! report_browser_prerequisite "$browser_fatal"; then
+        failed=1
     fi
 
     # python3

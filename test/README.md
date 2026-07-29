@@ -37,15 +37,38 @@ Install a real, non-snap Chrome (`.deb`, amd64 or arm64):
 export VESPASIAN_NO_SANDBOX=true  # containers generally cannot use the Chrome sandbox
 ```
 
-The script deliberately leaves **no background egress** behind: Google's apt
-source (`/etc/apt/sources.list.d/google-chrome.list`) is suppressed at install
-time via `repo_add_once=false`, and both it and the daily update pinger
-(`/etc/cron.daily/google-chrome`) are removed afterwards. Chrome's own telemetry
-is separately disabled on every browser vespasian launches (LAB-4999), and the
-live suite always launches through vespasian, so it inherits those flags.
+**How the package is trusted.** Google's apt repository is added *temporarily*,
+with its signing key pinned by primary-key fingerprint. apt then verifies the
+chain — Release signature → `Packages` digest → `.deb` digest — before dpkg runs
+the package's maintainer scripts as root. Downloading the `.deb` directly would
+leave TLS as the only control: `apt-get install ./local.deb` does **not**
+authenticate a local file argument, and Google's `.deb` carries no embedded
+`debsigs` signature to check instead. The fingerprint pin is what makes the
+check meaningful — a key fetched over the same channel as the package, unpinned,
+buys nothing against an attacker who controls that channel. If Google rotates
+its primary key the script fails loudly and the constant must be updated
+deliberately.
+
+**No background egress.** The temporary repo and keyring are removed once the
+install completes (via an `EXIT` trap, so an aborted run cannot leave them
+behind). The `google-chrome-stable` package's own permanent apt source and daily
+update pinger (`/etc/cron.daily/google-chrome`) are suppressed via
+`repo_add_once=false` and then verified absent. Chrome's telemetry is separately
+disabled on every browser vespasian launches (LAB-4999), and the live suite
+always launches through vespasian, so it inherits those flags.
+
+**Version policy.** The script tracks Chrome *stable* rather than pinning a
+version — for a test-only layer that is the right trade, since a pinned version
+goes stale and eventually 404s. The installed version is logged on success so an
+image build record identifies exactly what landed.
 
 `apt install chromium` / `chromium-browser` are **not** alternatives on Ubuntu
 noble — both are transitional packages that pre-depend on snapd.
+
+The non-privileged surface (argument handling, architecture resolution, the
+pinned fingerprint) is covered by `test/install-chrome-selftest.sh`, which runs
+in CI. The download / apt / privileged-mutation paths are deliberately not
+tested: they need root, network, and destructive system changes.
 
 ### Running without a browser
 

@@ -23,7 +23,10 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # Path to the resolved-ports config written by setup-live-targets.sh. Overridable
 # via the CONFIG_FILE env var (used by test/test-runner-args.sh --dry-run runs).
 CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/.live-test-config}"
-RESULTS_DIR="${SCRIPT_DIR}/.results"
+# Where per-target results are written. Overridable via the RESULTS_DIR env var
+# (same pattern as CONFIG_FILE below) so test/test-runner-args.sh can point a
+# real run at a temp dir instead of writing into the repo checkout.
+RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/.results}"
 VESPASIAN="${PROJECT_ROOT}/bin/vespasian"
 
 # Hostname the test harness uses to reach the target services. Defaults to
@@ -123,8 +126,19 @@ resolve_targets() {
 # unknown/typo case fails loudly on a missing config instead of running
 # half-configured against default ports.
 targets_need_config() {
-    local target
-    for target in ${1//,/ }; do
+    # read -ra from a QUOTED here-string rather than an unquoted ${1//,/ }:
+    # word-splitting an unquoted expansion also GLOBS, so a target list
+    # containing * would expand against the cwd before it was ever compared.
+    # This predicate decides whether a gate applies, so it must not rely on
+    # downstream validation to catch that.
+    #
+    # Note the here-string, NOT `local IFS=,` + read: IFS also controls how
+    # "${OFFLINE_TARGETS[*]}" below joins, so setting it to a comma silently
+    # turns the haystack into a comma-joined string and breaks the
+    # space-delimited match.
+    local target parts
+    read -ra parts <<< "${1//,/ }"
+    for target in "${parts[@]}"; do
         case " ${OFFLINE_TARGETS[*]} " in
             *" ${target} "*) ;;   # service-free — needs nothing from the config
             *) return 0 ;;

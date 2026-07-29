@@ -38,10 +38,17 @@ jobs:
           persist-credentials: false
 
       - name: Syntax check
-        run: bash -n test/setup-live-targets.sh
+        run: bash -n test/setup-live-targets.sh && bash -n test/install-chrome.sh
 
       - name: Run preflight self-test
         run: bash test/preflight-selftest.sh
+
+      # install-chrome.sh's non-privileged surface: argument handling,
+      # architecture resolution, and the pinned signing-key fingerprint. The
+      # download / apt / privileged-mutation paths are deliberately not
+      # exercised — they need root, network, and destructive system changes.
+      - name: Run install-chrome self-test
+        run: bash test/install-chrome-selftest.sh
 
   # Gate: run by default; skip PR runs only when 'skip-live-tests' label is present.
   # Push-to-main and workflow_dispatch always run.

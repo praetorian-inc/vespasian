@@ -439,6 +439,18 @@ echo "=== A REAL offline run needs no config (LAB-5064) ==="
 
 source <(sed -n '/^targets_need_config()/,/^}/p' "$RUNNER")
 
+# Fidelity sentinel, matching the one guarding the run_tests_guidance
+# extraction above. Without it a broken/empty sed range leaves
+# targets_need_config UNDEFINED, `if targets_need_config ...` returns 127, the
+# else-branch runs, and every assertion below reports PASS while testing
+# nothing. Verified: with the extraction sabotaged, the offline row passes
+# vacuously. Assert the function exists before asserting what it does.
+if declare -F targets_need_config >/dev/null; then
+    pass "targets_need_config sourced from run-live-tests.sh"
+else
+    fail "targets_need_config was not sourced (extraction broken/empty)"
+fi
+
 if targets_need_config "$(join_targets "${OFFLINE_TARGETS[@]}")"; then
     fail "targets_need_config: offline group wrongly reported as needing config"
 else
@@ -473,7 +485,13 @@ fi
 # missing vespasian binary; locally the binary exists and the importer test
 # actually runs. Either way, reaching that point proves no config was demanded.
 # One tiny importer target keeps it fast in both.
-real_offline=$(env CONFIG_FILE="$noconfig" bash -c "source '$RUNNER' --targets import-empty --no-build" 2>&1) || true
+#
+# RESULTS_DIR is redirected into the throwaway temp dir: locally this really
+# does execute an importer, and without the override it would write into the
+# repo's test/.results/ — a side effect this file's header disclaims ("Does NOT
+# run actual live tests").
+real_offline=$(env CONFIG_FILE="$noconfig" RESULTS_DIR="$TMPDIR_T/results" \
+    bash -c "source '$RUNNER' --targets import-empty --no-build" 2>&1) || true
 if [[ "$real_offline" == *"Config file not found"* ]]; then
     fail "real offline run demanded a config: $(printf '%s' "$real_offline" | head -3)"
 else
