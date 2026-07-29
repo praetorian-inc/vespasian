@@ -150,6 +150,14 @@ func NearMisses(classifiers []APIClassifier, requests []crawl.ObservedRequest, f
 // 443 for https) stripped, so the dedup key treats example.com,
 // EXAMPLE.com:443, and example.com as the same host. Mirrors the host handling
 // in pkg/crawl's canonicalizeURL.
+//
+// An IPv6 literal is re-bracketed when a port is appended. u.Hostname() strips the
+// brackets, so joining host + ":" + port produced "::1:8080" — an authority that is
+// not merely ugly but ambiguous and unparseable. It is currently only concatenated
+// into an opaque dedup key and is internally consistent there, so no behavior is
+// wrong today; the reason to fix it is that this reads as a general-purpose
+// canonicalizer, and the next caller that logs or re-parses the result would get an
+// invalid host (LAB-4678 review, QUAL-002).
 func canonicalHost(u *url.URL) string {
 	host := strings.ToLower(u.Hostname())
 	if host == "" {
@@ -162,6 +170,11 @@ func canonicalHost(u *url.URL) string {
 	scheme := strings.ToLower(u.Scheme)
 	if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
 		return host
+	}
+	// A colon in the hostname means an IPv6 literal, which must be bracketed before
+	// a port is appended (RFC 3986 §3.2.2).
+	if strings.Contains(host, ":") {
+		return "[" + host + "]:" + port
 	}
 	return host + ":" + port
 }

@@ -134,8 +134,11 @@ func DetectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
 		}
 	}
 
-	// GraphQL is resolved first: it must dominate REST and also out-count WSDL,
-	// so a SOAP-heavy capture with a handful of GraphQL-ish requests stays WSDL.
+	// GraphQL is resolved first: it must dominate REST and be AT LEAST AS MANY as
+	// WSDL, so a SOAP-heavy capture with a handful of GraphQL-ish requests stays
+	// WSDL. A GraphQL/WSDL tie resolves to GraphQL, matching the tie-to-GraphQL
+	// ordering of the per-request argmax above; stating it as "out-count WSDL"
+	// described a stricter rule than the >= implements (LAB-4678 review, QUAL-001).
 	if challengerWins(graphqlCount, restCount) && graphqlCount >= wsdlCount {
 		return APITypeGraphQL
 	}

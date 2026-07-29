@@ -16,6 +16,7 @@ package classify
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -1418,4 +1419,61 @@ func TestNearMisses(t *testing.T) {
 	assert.Contains(t, nm[0].URL, "/api/thing")
 	assert.GreaterOrEqual(t, nm[0].Confidence, NearMissFloor)
 	assert.Less(t, nm[0].Confidence, DefaultConfidenceThreshold)
+}
+
+// TestCanonicalHost covers the host canonicalization the dedup key is built from,
+// including the IPv6 bracketing. u.Hostname() strips brackets from an IPv6 literal,
+// so appending a port without re-bracketing produced "::1:8080" — an authority no
+// caller could re-parse (LAB-4678 review, QUAL-002).
+func TestCanonicalHost(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"lowercases host", "https://EXAMPLE.com/a", "example.com"},
+		{"strips default https port", "https://example.com:443/a", "example.com"},
+		{"strips default http port", "http://example.com:80/a", "example.com"},
+		{"keeps non-default port", "https://example.com:8443/a", "example.com:8443"},
+		{"http on 443 is not a default pair", "http://example.com:443/a", "example.com:443"},
+		{"no host", "/relative/path", ""},
+
+		// IPv6. The bracketed forms are what a caller can hand back to url.Parse.
+		{"ipv6 loopback with port", "http://[::1]:8080/api", "[::1]:8080"},
+		{"ipv6 full with port", "https://[2001:db8::1]:8443/api", "[2001:db8::1]:8443"},
+		{"ipv6 without port", "http://[::1]/api", "::1"},
+		{"ipv6 on default port is stripped", "https://[::1]:443/api", "::1"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			u, err := url.Parse(c.raw)
+			if err != nil {
+				t.Fatalf("parse %q: %v", c.raw, err)
+			}
+			if got := canonicalHost(u); got != c.want {
+				t.Errorf("canonicalHost(%q) = %q, want %q", c.raw, got, c.want)
+			}
+		})
+	}
+}
+
+// TestCanonicalHost_IPv6WithPortIsReparseable is the property behind the bracketing:
+// the output must be usable as an authority, which is what a future caller that logs
+// or re-parses it would rely on.
+func TestCanonicalHost_IPv6WithPortIsReparseable(t *testing.T) {
+	u, err := url.Parse("http://[::1]:8080/api")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	got := canonicalHost(u)
+
+	round, err := url.Parse("http://" + got + "/")
+	if err != nil {
+		t.Fatalf("canonicalHost produced an unparseable authority %q: %v", got, err)
+	}
+	if round.Hostname() != "::1" || round.Port() != "8080" {
+		t.Errorf("round-trip of %q gave host=%q port=%q, want ::1 and 8080",
+			got, round.Hostname(), round.Port())
+	}
 }
