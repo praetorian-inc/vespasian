@@ -724,7 +724,8 @@ func extractConcatEndpoints(jsSource []byte, baseURL, baseHost string, seen map[
 		// crawl.SameOrigin compares scheme, host AND port with default-port
 		// canonicalization, so an https bundle cannot force a cleartext http probe of
 		// its own host and `https://h:443/x` counts as same-origin as `https://h/`
-		// (QUAL-001, matching pkg/crawl's own probeMatchKey).
+		// (QUAL-001 — SameOrigin delegates to pkg/crawl's own originOf, which
+		// substitutes the scheme's default port when the URL omits it).
 		//
 		// This is the ONLY check here. Credential/scheme validity and the byte policy
 		// are enforced once for every producer by specSafeURL in toRequests — the

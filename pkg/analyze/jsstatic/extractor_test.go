@@ -993,7 +993,7 @@ var cross = "https://api.example.com/api/".concat("reviews");
 // same-origin gate now uses crawl.SameOrigin, which canonicalizes default ports.
 // The previous ad hoc hostOfURL/schemeOfURL comparison dropped this
 // reconstruction because "example.com:443" != "example.com", even though
-// pkg/crawl's own probeMatchKey treats the two as one origin.
+// pkg/crawl's own originOf treats the two as one origin.
 func TestExtractFromBundle_ConcatDefaultPortSameOrigin(t *testing.T) {
 	src := []byte(`var u = "https://example.com:443/api/".concat("orders");`)
 	endpoints, err := ExtractFromBundle(src, "https://example.com/app.js")

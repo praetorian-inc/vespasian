@@ -623,9 +623,9 @@ func hasInlinePrefix(trimmedPath string) bool {
 // hostOfURL/schemeOfURL pair, which — unlike originOf here — did NOT canonicalize
 // default ports. A reconstruction of `https://h:443/api/x` from a bundle served
 // at `https://h/` therefore failed the same-origin gate and the endpoint was
-// silently dropped, while this package's own probeMatchKey treated the two as
-// identical. Sharing one comparison keeps the offline and active paths from
-// disagreeing about what "the bundle's own origin" means.
+// silently dropped, even though this package's own comparison (originOf) treats
+// the two as identical. Sharing one comparison keeps the offline and active
+// paths from disagreeing about what "the bundle's own origin" means.
 func SameOrigin(a, b string) bool {
 	oa := originOf(a)
 	if oa == "" {
@@ -2220,44 +2220,23 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 
 	// refuted records the reachedPathKey of every full URL the target answered
 	// 404 for. Those paths — and ONLY those — have a dispositive negative
-	// verdict, so the passive offline concat mirror (SourceStaticJSConcat,
-	// emitted by pkg/analyze/jsstatic) is dropped after the loop by
-	// supersedeConcatMirrors: a 404'd decoy must not survive via the mirror.
-	// Paths the target never answered (connection failures / fully offline) are
-	// absent here, so their offline candidates are preserved (LAB-4992 AC1).
+	// verdict, so supersedeConcatMirrors drops their passive offline concat
+	// mirror after the loop; see its doc comment for what survives a non-404 and
+	// why, and reachedPathKey's for why the key is path-only, not origin+path.
 	//
-	// QUAL-004: this set was previously populated for ANY answered status, on the
-	// theory that JS-replay is "authoritative" for every path the target
-	// answered. It is not, and the consequence was that supplying a reachable
-	// --target-url produced STRICTLY LESS output than running fully offline —
-	// inverting the feature on exactly the deployment shape JS-replay exists for.
-	// probeURL returns a non-nil *ObservedResponse for every completed exchange
-	// regardless of status or content type, so a 200 text/html SPA catch-all
-	// (nginx try_files), a 204, an HTML-bodied 401/403, or a 302 -> /login (the
-	// usual auth-gated-API reply) all deleted the mirror. The replacement
-	// appended below carries Source "js-extract", which crawl.IsJSStaticSource
-	// does NOT match, so classify Rule 7's StaticJSConfidence floor never applies
-	// to it: such a replacement scores only Rule 3's 0.15 and is dropped at the
-	// 0.5 default threshold. Net effect, measured end-to-end: the spec went from
-	// one path to zero.
-	//
-	// Restricting the set to 404 keeps the decoy filter this exists for while
-	// making live replay purely ADDITIVE, as pkg/crawl/doc.go and README claim.
-	// A non-404 answer now leaves the mirror in place AND appends the richer
-	// js-extract observation; both describe the same endpoint, and since
-	// groupEndpoints keys on normalized path + method (host-agnostic) they
-	// collapse into a single OpenAPI operation rather than a duplicate path. The
-	// probed observation supplies the real status/content-type, so the operation
-	// is no worse off than before — it merely can no longer fall below the
-	// offline floor.
-	//
-	// Keyed path-only (QUAL-001), not origin+path: jsstatic resolves the mirror
-	// URL against the bundle/capture origin (which may be a CDN hosting the JS,
-	// or differ from an operator-pinned --target-url), while this loop always
-	// probes against the target origin. An origin-qualified key would silently
-	// no-op the drop whenever the bundle host differs from the target host,
-	// re-opening the 404-decoy leak. Matching on path alone drops the mirror
-	// regardless of which host either side resolved the URL against.
+	// QUAL-004: this set was previously populated for ANY answered status, which
+	// made live replay SUBTRACTIVE — supplying a reachable --target-url produced
+	// STRICTLY LESS output than running fully offline, inverting the feature on
+	// exactly the deployment shape JS-replay exists for. probeURL returns a
+	// non-nil *ObservedResponse for every completed exchange regardless of status
+	// or content type, so a 200 text/html SPA catch-all (nginx try_files), a 204,
+	// an HTML-bodied 401/403, or a 302 -> /login all deleted the mirror; and the
+	// replacement appended below carries Source "js-extract", which
+	// crawl.IsJSStaticSource does NOT match, so classify Rule 7's
+	// StaticJSConfidence floor never applies to it — it scores only Rule 3's 0.15
+	// and is dropped at the 0.5 default threshold. Measured end-to-end, the spec
+	// went from one path to zero. Restricting the set to 404 keeps the decoy
+	// filter this exists for while making replay purely additive.
 	refuted := make(map[string]bool)
 
 	probed := 0
@@ -2326,10 +2305,7 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		//
 		// A 404 is also the only DISPOSITIVE verdict, so it is the only status
 		// that refutes the offline concat mirror for this path (QUAL-004 — see
-		// refuted's doc comment for why "any answered status" made live replay
-		// subtractive). Keyed path-only so the match survives host-case /
-		// trailing-slash / bundle-vs-target host differences between this probe
-		// URL and the mirror URL jsstatic resolved against the bundle origin.
+		// refuted's doc comment above).
 		if resp.StatusCode == http.StatusNotFound {
 			refuted[reachedPathKey(fullURL)] = true
 			continue
