@@ -66,8 +66,17 @@ func logClassificationReasons(w io.Writer, classified []classify.ClassifiedReque
 	lines := make([]string, 0, len(classified))
 	for _, c := range classified {
 		path := c.URL
-		if u, err := url.Parse(c.URL); err == nil && u.Path != "" {
-			path = u.Path
+		if u, err := url.Parse(c.URL); err == nil {
+			switch {
+			case u.Path != "":
+				path = u.Path
+			case u.Host != "":
+				// Pathless (or query-only) URL: fall back to the origin, not
+				// the raw URL. u.Host excludes userinfo (u.User holds it
+				// separately), so this never echoes embedded HTTP Basic
+				// credentials the way printing c.URL directly would.
+				path = u.Scheme + "://" + u.Host
+			}
 		}
 		reason := c.Reason
 		if reason == "" {

@@ -387,7 +387,7 @@ func TestClassifyProbeGenerate_CrossOriginWarningNotOverCollapsedAcrossHosts(t *
 // change: a cross-origin candidate can carry embedded HTTP Basic userinfo
 // (e.g. a URL recovered from a Burp/HAR capture that still has the
 // operator's own credentials embedded), and this always-on
-// (non---verbose-gated) warning must never echo them in cleartext.
+// (not gated on --verbose) warning must never echo them in cleartext.
 // bestEffortOrigin is userinfo-free by construction -- url.URL.Host excludes
 // userinfo; u.User holds it separately (see newCrossOriginValidator's doc
 // comment) -- so only the origin is printed, never the credential-bearing
@@ -427,8 +427,16 @@ func TestClassifyProbeGenerate_CrossOriginWarningExcludesUserinfoCredentials(t *
 	assert.Zero(t, atomic.LoadInt32(attackerHits), "cross-origin candidate must NOT be probed")
 	assert.NotContains(t, warnings.String(), "user:pass",
 		"the cross-origin skip warning must never echo embedded userinfo credentials in cleartext")
-	assert.Contains(t, warnings.String(), `skipping cross-origin candidates for "`+attacker.URL+`"`,
-		"the warning must still name the (credential-free) origin")
+	assert.NotContains(t, warnings.String(), "user%3Apass",
+		"the cross-origin skip warning must never echo a percent-encoded re-encoding of the credential either")
+	assert.NotContains(t, warnings.String(), "user@",
+		"the cross-origin skip warning must never echo the username-only portion of the credential either")
+	// Pin the full line, not just a substring: any content appended or
+	// re-encoded onto this line (e.g. a debug "cand=<rawURL>" suffix) must
+	// fail this test, not just the credential-specific checks above.
+	assert.Equal(t, "probe: skipping cross-origin candidates for \""+attacker.URL+"\" (use AllowCrossOriginProbe to allow)\n",
+		warnings.String(),
+		"the warning must contain nothing but the credential-free, quoted origin")
 }
 
 // TestClassifyProbeGenerate_AllowCrossOriginProbeOptOut proves the internal

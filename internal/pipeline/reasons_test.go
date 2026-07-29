@@ -132,6 +132,24 @@ func TestLogClassificationReasons_SanitizesTerminalEscapes(t *testing.T) {
 	}
 }
 
+// TestLogClassificationReasons_PathlessUserinfoURLNoCredentialLeak verifies
+// that a pathless (or query-only) URL carrying embedded HTTP Basic userinfo
+// never has that credential printed to the -v Status output. logPath's
+// fallback previously used the full raw URL whenever u.Path == "", which
+// echoes userinfo verbatim for a URL like "http://user:pass@host" (no path)
+// or "http://user:pass@host?x=1" (query only, still no path). user:pass is
+// synthetic test data, not a real secret.
+func TestLogClassificationReasons_PathlessUserinfoURLNoCredentialLeak(t *testing.T) {
+	var buf bytes.Buffer
+	logClassificationReasons(&buf, []classify.ClassifiedRequest{
+		cr("GET", "http://user:pass@example.com", "rest", "path-heuristic", 0.6),
+	})
+	out := buf.String()
+	if strings.Contains(out, "user:pass") {
+		t.Errorf("credential leaked into Status output: %q", out)
+	}
+}
+
 // TestLogClassificationReasons_NoOutput verifies the no-op guards: a nil writer
 // must not panic, and an empty slice produces no output.
 func TestLogClassificationReasons_NoOutput(t *testing.T) {
