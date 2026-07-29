@@ -483,7 +483,7 @@ make clean       # Remove build artifacts
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, project layout, how to add a classifier, generator, importer, or probe strategy, and the commit and pull request conventions.
 
-In short: fork the repository, create a feature branch, make sure `make check` passes, and open a Pull Request.
+In short: fork the repository, create a feature branch, make sure `make check` passes, and open a Pull Request. Note that `make check` reformats as well as validates — it runs `gofmt -s -w .` first, so it may modify your working tree.
 
 This project is governed by our [Code of Conduct](CODE_OF_CONDUCT.md). Security vulnerabilities should be reported per [SECURITY.md](SECURITY.md) rather than as public issues.
 

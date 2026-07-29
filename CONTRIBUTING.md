@@ -75,6 +75,8 @@ make coverage         # Coverage profile + per-function report (excludes test/)
 make live-test-clean  # Stop orphaned live-test services
 ```
 
+Note that `make check` runs `make fmt` first, which rewrites files in place via `gofmt -s -w .` — it validates *and* reformats. Expect it to modify your working tree, and check `git status` afterwards so any reformatting lands in your commit rather than surprising you later. Use `make vet lint test` if you want the checks without the rewrite.
+
 ### Devcontainers
 
 Unit tests run fine in a container. Two gotchas if you develop in one:
@@ -86,7 +88,7 @@ See [`test/README.md`](test/README.md) for details.
 
 ## Project layout
 
-```
+```text
 cmd/
   vespasian/            CLI entry point (Kong), commands, signal handling, browser lifecycle
 
@@ -292,7 +294,7 @@ This project uses **conventional commits**. Prefix each commit with its type:
 
 An optional scope narrows it: `fix(test):`, `feat(crawl):`. Use the imperative mood, and put the "why" in the body when the diff doesn't make it obvious. Reference the tracking issue where there is one.
 
-```
+```text
 feat(importer): support mitmproxy native tnetstring format
 
 fix(generate): stop collapsing distinct routes sharing a path prefix
