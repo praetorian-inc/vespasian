@@ -192,6 +192,11 @@ func TestClassifyProbeGenerate_SameOriginUserinfoCredentialInjectionRejected(t *
 	})
 	require.NoError(t, err)
 
+	// NOTE for alert triage: titus reports "HTTP Basic Authentication" against
+	// this assertion's MESSAGE, not against any credential. The finding is the
+	// phrase "Authorization: Basic" in the prose below -- there is no secret on
+	// this line. Left as-is: the message names the exact header the gate exists
+	// to prevent, which is the clearest way to state the failure.
 	assert.Zero(t, atomic.LoadInt32(hits),
 		"a same-origin candidate carrying userinfo credentials must be rejected by crawl.ValidateFullURL "+
 			"rather than probed with an attacker-derived Authorization: Basic header")
