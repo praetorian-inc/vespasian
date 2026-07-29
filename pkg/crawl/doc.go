@@ -150,7 +150,7 @@
 // Cross-run resume primitives (LAB-4678 Phase 4, vespasian side) let coverage
 // accumulate across separate crawls: [Checkpoint] serializes the frontier's
 // pending queue ([]PendingURL) and seen-set, gated by [ComputeConfigFingerprint]
-// (target/scope/depth) and a staleness bound ([Checkpoint.Usable],
+// (target/scope/depth/backend/allow-private/interact) and a staleness bound ([Checkpoint.Usable],
 // [DefaultCheckpointMaxAge]); a page whose visit failed transiently is omitted
 // from the persisted seen-set AND returned to the persisted pending queue so a
 // resumed run retries it (omitting it from seen alone loses the page: it was
