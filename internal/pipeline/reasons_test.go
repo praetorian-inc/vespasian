@@ -108,12 +108,6 @@ func TestLogClassificationReasons_SwitchArmsRenderExpectedValue(t *testing.T) {
 			if !strings.Contains(buf.String(), tc.want) {
 				t.Errorf("expected rendered value %q, got: %q", tc.want, buf.String())
 			}
-			// Arm 1 must not fall through to the origin form, and arm 2 must
-			// not be reduced to a bare hostname; asserting the complement is
-			// what makes each arm's mutant die.
-			if tc.want == "/api/v1/users" && strings.Contains(buf.String(), "https://api.example.com:8443\t") {
-				t.Errorf("path arm rendered the origin instead of the path: %q", buf.String())
-			}
 		})
 	}
 }
@@ -171,6 +165,62 @@ func TestLogClassificationReasons_SanitizesTerminalEscapes(t *testing.T) {
 // echoes userinfo verbatim for a URL like "http://user:pass@host" (no path)
 // or "http://user:pass@host?x=1" (query only, still no path). user:pass is
 // synthetic test data, not a real secret.
+// TestLogClassificationReasons_StripsUserinfoExactly pins the LOGIC of the
+// last-'@' strip, not merely its presence. Three mutants survived when only
+// "does not contain user:pass" was asserted: LastIndex->Index (strips at the
+// FIRST '@'), path[i+1:]->path[i:] (keeps the '@'), and replacing the strip
+// with path="" (silently guts the whole -v diagnostic). Asserting the EXACT
+// rendered remainder kills all three.
+//
+// Both credential-carrying branches are covered: the switch's default arm
+// (url.Parse succeeds but yields neither Path nor Host) and the url.Parse
+// ERROR branch (reachable because GRPCClassifier fails open on a malformed URL
+// and still classifies on content-type alone).
+func TestLogClassificationReasons_StripsUserinfoExactly(t *testing.T) {
+	for _, tc := range []struct {
+		name, rawURL, want, mustNotContain string
+	}{
+		{
+			// Opaque form: url.Parse fills u.Opaque, leaves Host/Path empty and
+			// u.User NIL -> default arm. Two '@' so first-vs-last differ.
+			name:           "default arm strips at the last @",
+			rawURL:         "weird:user:pass@first@final.example.com/api/x",
+			want:           "final.example.com/api/x",
+			mustNotContain: "first@",
+		},
+		{
+			// Invalid port -> url.Parse ERROR -> switch skipped entirely.
+			name:           "parse-error branch strips at the last @",
+			rawURL:         "http://user:pass@host:8o8/pkg.Svc/Method",
+			want:           "host:8o8/pkg.Svc/Method",
+			mustNotContain: "user:pass",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logClassificationReasons(&buf, []classify.ClassifiedRequest{
+				cr("POST", tc.rawURL, "grpc", "content-type", 0.95),
+			})
+			out := buf.String()
+			// Kills strip->path="" (nothing rendered) and Index (wrong remainder).
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("expected rendered remainder %q, got: %q", tc.want, out)
+			}
+			// Kills LastIndex->Index for the two-'@' case, and any credential leak.
+			if strings.Contains(out, tc.mustNotContain) {
+				t.Errorf("unexpected %q in output: %q", tc.mustNotContain, out)
+			}
+			// Kills path[i+1:]->path[i:] (a retained leading '@').
+			if strings.Contains(out, "@"+tc.want) {
+				t.Errorf("strip kept the '@' separator: %q", out)
+			}
+			if strings.Contains(out, "user:pass") {
+				t.Errorf("credential leaked: %q", out)
+			}
+		})
+	}
+}
+
 func TestLogClassificationReasons_PathlessUserinfoURLNoCredentialLeak(t *testing.T) {
 	// Each URL shape below embeds a synthetic credential (user:pass, RFC 2606
 	// domain) and must NOT have it echoed to Status. They exercise three

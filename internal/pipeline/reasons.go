@@ -77,23 +77,22 @@ func logClassificationReasons(w io.Writer, classified []classify.ClassifiedReque
 				// credentials the way printing c.URL directly would.
 				path = u.Scheme + "://" + u.Host
 			default:
-				// Neither a path nor a host survived parsing, so `path` still
-				// holds the raw c.URL. Two shapes reach here WITH credentials
-				// embedded, so this arm is required, not defensive:
-				//   - scheme-colon form, e.g. "https:user:pass@h/api/x" --
-				//     url.Parse puts everything in u.Opaque and leaves u.User
-				//     nil, so a u.User check would not catch it;
-				//   - authority-only userinfo, e.g. "http://user:pass@" --
-				//     u.User is set but both Host and Path are empty.
-				// Strip at the LAST '@', mirroring the split Go's own
-				// parseAuthority performs, so no userinfo survives for any
-				// remaining shape. Confined to this arm deliberately: applying
-				// it to the u.Path arm would mangle a legitimate path that
-				// contains '@' (e.g. /api/users/a@b.com).
+				// Neither Path nor Host survived parsing, so `path` still holds
+				// the raw c.URL, which can embed credentials. Strip at the LAST
+				// '@' (the split Go's own parseAuthority performs). Confined to
+				// this arm so a legitimate path containing '@' is not mangled.
+				// Reachable shapes are enumerated in
+				// TestLogClassificationReasons_StripsUserinfoExactly.
 				if i := strings.LastIndex(path, "@"); i >= 0 {
 					path = path[i+1:]
 				}
 			}
+		} else if i := strings.LastIndex(path, "@"); i >= 0 {
+			// url.Parse failed, so the switch never ran. Reachable with
+			// credentials: GRPCClassifier fails open on a malformed URL
+			// (pkg/classify/grpc.go) and still classifies on content-type
+			// alone. Same strip as the default arm.
+			path = path[i+1:]
 		}
 		reason := c.Reason
 		if reason == "" {
