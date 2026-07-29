@@ -1,0 +1,15 @@
+Introspection: ENABLED
+Server ready at http://localhost:8992/
+GraphQL endpoint: http://localhost:8992/graphql
+
+Pages:
+  http://localhost:8992/          (home + recent posts)
+  http://localhost:8992/users      (all users)
+  http://localhost:8992/users/1    (user detail)
+  http://localhost:8992/posts      (all posts)
+  http://localhost:8992/posts/10   (post detail + like)
+  http://localhost:8992/search     (search)
+  http://localhost:8992/create     (create post form)
+
+Vespasian:
+  ./vespasian-test scan http://localhost:8992/ --api-type graphql -v -o schema.graphql

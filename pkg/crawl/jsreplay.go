@@ -34,7 +34,6 @@ package crawl
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -2221,12 +2220,10 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	copy(result, requests)
 
 	// refuted records the reachedPathKey of every full URL the target answered
-	// 404 for on an origin where 404 was found to be a meaningful (dispositive)
-	// verdict — see controlPathIsDispositive below. Those paths — and ONLY
-	// those — have a dispositive negative verdict, so supersedeConcatMirrors
-	// drops their passive offline concat mirror after the loop; see its doc
-	// comment for what survives a non-404 and why, and reachedPathKey's for why
-	// the key is path-only, not origin+path.
+	// 404 for. Those paths — and ONLY those — have a dispositive negative
+	// verdict, so supersedeConcatMirrors drops their passive offline concat
+	// mirror after the loop; see its doc comment for what survives a non-404 and
+	// why, and reachedPathKey's for why the key is path-only, not origin+path.
 	//
 	// QUAL-004: this set was previously populated for ANY answered status, which
 	// made live replay SUBTRACTIVE — supplying a reachable --target-url produced
@@ -2242,21 +2239,28 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	// went from one path to zero. Restricting the set to 404 keeps the decoy
 	// filter this exists for while making replay purely additive.
 	//
-	// SEC-BE-004: restricting to 404 was still not enough. Returning 404 rather
-	// than 401/403 for an unauthorized-but-real resource is a widespread
-	// anti-enumeration convention, and doRequest's fixed User-Agent lets a
-	// hostile target fingerprint this scanner and 404 every request to hide its
-	// entire API surface. Either way, a bare 404 stopped being trustworthy on
-	// its own. nonDispositiveOrigins and controlProbed gate refuted per origin:
-	// the first 404 seen for an origin triggers a one-shot control probe of a
-	// random, certainly-nonexistent path on that same origin
-	// (controlPathIsDispositive); if the control ALSO comes back 404, the
-	// origin is treated as a catch-all responder and no 404 on it refutes
-	// anything (a warning names the origin once), otherwise 404 is trusted as
-	// before (and a warning names each dropped path).
+	// SEC-BE-004: a 404 is the best available signal, but it is NOT proof of
+	// absence. Returning 404 rather than 401/403 for an unauthorized-but-real
+	// resource is a widespread anti-enumeration convention, and doRequest's
+	// fixed User-Agent lets a hostile target fingerprint this scanner and 404
+	// everything to hide its API surface. So an unauthenticated run can drop a
+	// real endpoint here.
+	//
+	// That ambiguity is NOT resolvable by probing. A control probe of a random
+	// nonexistent path was implemented and reverted: a correctly-behaving
+	// server 404s such a path precisely BECAUSE it does not exist, so the
+	// control response is identical for an honest server and for an
+	// anti-enumeration one — it misclassified every normal target (caught by
+	// the concat-spa live test, whose mux 404s unknown paths) while giving no
+	// signal at all for the case it was written to detect. Distinguishing
+	// "absent" from "unauthorized" requires credentials, not another request.
+	//
+	// What is done instead: the drop is ANNOUNCED. Each dropped path is named
+	// on Warnings with the two remedies (--header, --probe=false), so the loss
+	// is visible and recoverable rather than silent. Do not reintroduce a
+	// probe-based gate here without a signal that actually separates the two
+	// cases.
 	refuted := make(map[string]bool)
-	nonDispositiveOrigins := make(map[string]bool)
-	controlProbed := make(map[string]bool)
 
 	probed := 0
 	for _, path := range sortedPaths {
@@ -2322,29 +2326,20 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		// prefix is /workshop/). Keeping them would pollute the spec with
 		// endpoints that don't actually exist on that service.
 		//
-		// A 404 is also the only potentially DISPOSITIVE verdict, so it is the
-		// only status that can refute the offline concat mirror for this path
-		// (QUAL-004 — see refuted's doc comment above). Whether it actually does
-		// depends on the SEC-BE-004 control probe below: an origin's first 404
-		// triggers a one-shot check of a random nonexistent control path on
-		// that origin, and only a non-404 (or failed) control leaves 404
-		// trusted as dispositive there.
+		// A 404 is also the only DISPOSITIVE verdict, so it is the only status
+		// that refutes the offline concat mirror for this path (QUAL-004 — see
+		// refuted's doc comment above).
+		//
+		// SEC-BE-004: the drop is announced on Warnings rather than performed
+		// silently, because a 404 cannot be trusted absolutely — see refuted's
+		// doc comment for why no probe can separate "absent" from
+		// "unauthorized". Naming each dropped path is what lets an operator
+		// notice the loss and re-run with --header or --probe=false.
 		if resp.StatusCode == http.StatusNotFound {
-			origin := originOf(fullURL)
-			if !controlProbed[origin] {
-				controlProbed[origin] = true
-				if !controlPathIsDispositive(loopCtx, cfg, origin, targetOrigin, randomControlPath()) {
-					nonDispositiveOrigins[origin] = true
-					warnf("js-extract: %s answered 404 for a random nonexistent control path; "+
-						"treating 404 as non-dispositive there and not dropping any offline mirror for it "+
-						"(possible anti-enumeration / catch-all responder)\n", sanitizeForLog(origin))
-				}
-			}
-			if nonDispositiveOrigins[origin] {
-				continue
-			}
 			refuted[reachedPathKey(fullURL)] = true
-			warnf("js-extract: %s answered 404; dropping its offline js-concat mirror\n", sanitizeForLog(fullURL))
+			warnf("js-extract: %s answered 404; dropping its offline js-concat mirror "+
+				"(re-run with --header if this endpoint is auth-gated, or --probe=false to keep every offline candidate)\n",
+				sanitizeForLog(fullURL))
 			continue
 		}
 
@@ -2665,51 +2660,4 @@ func flattenHeaders(h http.Header) map[string]string {
 		}
 	}
 	return result
-}
-
-// randomControlPath returns "/" followed by 32 random lowercase hex
-// characters — a decoy path that is, for all practical purposes, guaranteed
-// not to exist on any real target. ReplayJSExtracted probes it once per
-// origin (see controlPathIsDispositive) to test whether that origin's 404
-// responses are meaningful at all (SEC-BE-004).
-func randomControlPath() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		// crypto/rand.Read does not fail in practice on any platform Go
-		// supports; this fallback exists only so a read error can't skip the
-		// control probe outright.
-		return "/00000000000000000000000000000000"
-	}
-	return "/" + hex.EncodeToString(b)
-}
-
-// controlPathIsDispositive probes origin+controlPath — a path known not to
-// exist — and reports whether a 404 response FROM origin can be trusted to
-// mean "this path does not exist" (SEC-BE-004).
-//
-// It returns false ("404 is non-dispositive here") only when the control
-// probe itself comes back 404: an origin that 404s a path guaranteed not to
-// exist tells us nothing by 404ing anything else either, since returning 404
-// (rather than 401/403) for a real-but-unauthorized resource is a widespread
-// anti-enumeration convention, and a hostile target can go further and
-// fingerprint doRequest's fixed User-Agent to 404 every request from this
-// scanner and hide its whole API surface. Callers must not treat 404 as
-// refuting anything on such an origin.
-//
-// It returns true ("404 is dispositive here") when the control probe answers
-// with anything other than 404, or when the control request fails outright
-// (network error, timeout, TLS failure): a failed request is not positive
-// evidence that the origin is a catch-all, so the historical (QUAL-004)
-// behavior of trusting a 404 verdict is kept as the safe default.
-//
-// controlPath is a caller-supplied parameter — not generated inside this
-// function — purely so tests can pin a fixed value instead of the random one
-// randomControlPath produces, without needing an interface or injected
-// dependency.
-func controlPathIsDispositive(ctx context.Context, cfg JSReplayConfig, origin, targetOrigin, controlPath string) bool {
-	resp := probeURL(ctx, cfg, origin+controlPath, targetOrigin)
-	if resp == nil {
-		return true
-	}
-	return resp.StatusCode != http.StatusNotFound
 }
