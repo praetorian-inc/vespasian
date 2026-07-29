@@ -337,7 +337,12 @@ func TestAnalyzeJS_ErrorPath_WarnErrorContract(t *testing.T) {
 // sourcemap, fetched through a recording proxy, must show proxy traffic
 // (LAB-4993).
 func TestAnalyzeJS_ForwardsProxy(t *testing.T) {
-	mapBody := []byte(`{"version":3,"sources":["app.ts"],"sourcesContent":["export const x = 1;"]}`)
+	// sourcesContent carries a fetch() literal for a path (/api/from-sourcemap)
+	// that appears nowhere else in this test — in particular it differs from
+	// the bundle body's own /api/x literal below. That makes its presence in
+	// out unambiguous proof that it was recovered via the sourcemap fetch,
+	// not the bundle-body extraction pass.
+	mapBody := []byte(`{"version":3,"sources":["app.ts"],"sourcesContent":["fetch(\"/api/from-sourcemap\");"]}`)
 
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/app.js.map" {
@@ -349,7 +354,10 @@ func TestAnalyzeJS_ForwardsProxy(t *testing.T) {
 	}))
 	t.Cleanup(origin.Close)
 
-	proxy, hits := newRecordingProxy(t, false)
+	// forwardBody=true: the map body must actually reach jsstatic's fetch
+	// client through the proxy, or json.Unmarshal fails and sourcemap
+	// recovery never happens (see newRecordingProxy in pipeline_test.go).
+	proxy, hits := newRecordingProxy(t, true)
 
 	proxyURL, err := url.Parse(proxy.URL)
 	require.NoError(t, err)
@@ -375,6 +383,15 @@ func TestAnalyzeJS_ForwardsProxy(t *testing.T) {
 		AllowPrivate:    true,
 		Proxy:           httpx.ProxyConfig{URL: proxyURL},
 	})
-	require.Greater(t, len(out), len(captured), "expected enriched slice with sourcemap-recovered endpoints")
+	recoveredIdx := -1
+	for i, r := range out {
+		if r.Source == crawl.SourceStaticJSSourcemap {
+			recoveredIdx = i
+			break
+		}
+	}
+	require.NotEqual(t, -1, recoveredIdx, "expected a %s entry recovered from the sourcemap", crawl.SourceStaticJSSourcemap)
+	assert.Equal(t, origin.URL+"/api/from-sourcemap", out[recoveredIdx].URL,
+		"sourcemap-recovered endpoint must resolve to the path found in the map's sourcesContent")
 	assert.NotZero(t, hits.Load(), "sourcemap fetch must route through the configured proxy")
 }

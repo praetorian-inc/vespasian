@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,7 +38,12 @@ import (
 // the proxy, not the target), preserves the probe package's redirect policy
 // (ErrUseLastResponse), and (TEST-011) that Config.Proxy.Insecure survives the
 // withDefaults->BuildHTTPClient hop for an http/https proxy but never for
-// socks5 (a transparent TCP tunnel with no substitute CA to trust).
+// socks5 (a transparent TCP tunnel with no substitute CA to trust). Also
+// (TEST-004) that Client.Timeout — the ONLY bound on a proxied probe
+// request, since the proxied transport clones DefaultTransport but clears
+// DialContext and installs no TLSHandshakeTimeout/ResponseHeaderTimeout stage
+// caps — defaults to a non-zero value when Config.Timeout is unset, and
+// survives unchanged to the client when explicitly configured.
 func TestConfig_WithDefaults_ProxyClient(t *testing.T) {
 	proxyURL, err := url.Parse("http://127.0.0.1:8080")
 	require.NoError(t, err)
@@ -54,6 +60,21 @@ func TestConfig_WithDefaults_ProxyClient(t *testing.T) {
 	gotErr := cfg.Client.CheckRedirect(nil, nil)
 	assert.True(t, errors.Is(gotErr, http.ErrUseLastResponse),
 		"proxied client must keep the probe package's ErrUseLastResponse redirect policy")
+
+	// TEST-004: Client.Timeout is the ONLY thing bounding a proxied probe
+	// request (the proxied transport carries no stage caps). Assert it
+	// defaults to a non-zero value, and against the package's documented
+	// default (DefaultConfig) rather than a magic literal.
+	assert.NotZero(t, cfg.Client.Timeout, "proxied client must have a non-zero Timeout — it is the only bound on a proxied probe request")
+	assert.Equal(t, DefaultConfig().Timeout, cfg.Client.Timeout,
+		"proxied client's default Timeout must equal the package's documented default (DefaultConfig)")
+
+	t.Run("explicit Timeout survives to the proxied client", func(t *testing.T) {
+		explicitTimeout := 7 * time.Second
+		explicitCfg := Config{Proxy: httpx.ProxyConfig{URL: proxyURL}, Timeout: explicitTimeout}.withDefaults()
+		assert.Equal(t, explicitTimeout, explicitCfg.Client.Timeout,
+			"proxied client must carry the configured Timeout unchanged")
+	})
 
 	t.Run("http proxy Insecure=true", func(t *testing.T) {
 		insecureURL, err := url.Parse("http://127.0.0.1:8080")

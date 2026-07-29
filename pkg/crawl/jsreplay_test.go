@@ -3131,6 +3131,11 @@ func TestJSReplayConfig_WithDefaults_ProxyClient(t *testing.T) {
 	assert.True(t, errors.Is(gotErr, http.ErrUseLastResponse),
 		"proxied client must keep the replay step's httpx.NoFollowRedirects policy")
 
+	// TEST-004 parity (see pkg/probe/proxy_internal_test.go): Timeout is the
+	// only bound on a proxied replay request, so it must default to a
+	// non-zero value on the client.
+	assert.Equal(t, defaultTimeout, cfg.Client.Timeout, "proxied client must carry the default per-request Timeout")
+
 	// TEST-011: Config.Proxy.Insecure must survive the
 	// withDefaults->BuildHTTPClient hop for an http/https proxy, but never for
 	// socks5 (a transparent TCP tunnel with no substitute CA to trust).

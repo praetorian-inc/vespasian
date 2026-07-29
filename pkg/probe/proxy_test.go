@@ -62,6 +62,11 @@ func TestProbe_OptionsStrategy_RoutesThroughProxy(t *testing.T) {
 			return
 		}
 		defer resp.Body.Close() //nolint:errcheck // test cleanup
+		for k, vs := range resp.Header {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
 		w.WriteHeader(resp.StatusCode)
 	}))
 	defer proxy.Close()
@@ -80,8 +85,11 @@ func TestProbe_OptionsStrategy_RoutesThroughProxy(t *testing.T) {
 		{ObservedRequest: crawl.ObservedRequest{Method: "GET", URL: origin.URL + "/api/users"}, IsAPI: true},
 	}
 
-	_, err = p.Probe(context.Background(), endpoints)
+	enriched, err := p.Probe(context.Background(), endpoints)
 	require.NoError(t, err)
 
 	assert.NotZero(t, proxied.Load(), "OPTIONS strategy must route its request through the configured proxy")
+
+	require.Len(t, enriched, 1, "expected exactly one enriched endpoint")
+	assert.Equal(t, []string{"GET", "POST"}, enriched[0].AllowedMethods, "Allow header from the proxied origin response must survive the round trip")
 }
