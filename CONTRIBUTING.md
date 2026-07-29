@@ -311,7 +311,7 @@ test: add live coverage for HTML form extraction
 5. Keep diffs reviewable — no unrelated reformatting.
 6. Update `README.md` and the relevant `doc.go` if you change user-facing behavior or a package's public API.
 
-Review is driven by [`CODEOWNERS`](CODEOWNERS); a maintainer review is required before merge. [`GOVERNANCE.md`](GOVERNANCE.md) lists the current maintainers and describes how decisions get made — including what to do if a pull request stalls or a review is disputed.
+Review is driven by [`CODEOWNERS`](CODEOWNERS); a maintainer review is required before merge.
 
 Two CI workflows gate a PR:
 
@@ -339,7 +339,7 @@ Open a GitHub issue and include:
 
 Captures and generated specs routinely contain hostnames, tokens, cookies, and request bodies from real targets. Redact before attaching anything to a public issue.
 
-Questions belong in issues too — [`SUPPORT.md`](SUPPORT.md) covers where to ask what, what to include, and what response to expect.
+Questions belong in issues too.
 
 ## Security disclosures
 
