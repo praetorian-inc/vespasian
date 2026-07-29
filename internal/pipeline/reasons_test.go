@@ -104,7 +104,7 @@ func TestLogClassificationReasons_SwitchArmsRenderExpectedValue(t *testing.T) {
 		// Arm 2: pathless, so print scheme://host INCLUDING the port (which
 		// u.Hostname() would silently drop) and WITHOUT the query. The
 		// query-drop is what makes deleting the arm visible: without it the
-		// value falls through to redactUserinfo, which returns the URL with
+		// value falls through to crawl.RedactURL, which returns the URL with
 		// its query intact, and a bare Contains(want) still passed (mutant M9).
 		{
 			"host arm keeps the port and drops the query",
@@ -198,8 +198,15 @@ func TestLogClassificationReasons_SanitizesTerminalEscapes(t *testing.T) {
 func TestLogClassificationReasons_RedactsUserinfo(t *testing.T) {
 	const placeholder = "<URL with userinfo redacted>"
 	for _, tc := range []struct{ name, rawURL, want string }{
-		// Parses cleanly with userinfo -> u.User = nil, origin preserved.
-		{"userinfo stripped, origin kept", "http://user:pass@example.com", "http://example.com"},
+		// NOTE: this row does NOT reach crawl.RedactURL. It parses cleanly with
+		// a host and no path, so it takes the switch's u.Host arm, which builds
+		// scheme://u.Host directly (u.Host excludes userinfo). Kept here because
+		// it is the one userinfo-bearing shape that still renders a real value
+		// rather than the placeholder -- useful contrast -- but the arm itself is
+		// pinned by TestLogClassificationReasons_SwitchArmsRenderExpectedValue,
+		// not by this row. Verified: mutating `u.User = nil` out of redactSeedURL
+		// is caught by the authority-only row below, not by this one.
+		{"host arm renders the origin (not via RedactURL)", "http://user:pass@example.com", "http://example.com"},
 		// Authority-only userinfo.
 		// Go's URL.String() omits the "//" once u.User is nil and Host is
 		// empty, so this renders as "http:" -- credential-free.
@@ -211,9 +218,13 @@ func TestLogClassificationReasons_RedactsUserinfo(t *testing.T) {
 		{"opaque with // in path fails closed", "https:user:pass@example.com//api/x", placeholder},
 		// url.Parse error (invalid port) + "@" -> fail closed.
 		{"parse error with userinfo fails closed", "http://user:pass@host:8o8/pkg.Svc/Method", placeholder},
-		// A '@' in the PATH: indistinguishable from userinfo, so fail closed.
-		// Deliberate false positive -- but it never conceals an origin behind a
-		// plausible-looking path, which is the regression this replaces.
+		// A '@' in the PATH, indistinguishable from userinfo, so fail closed.
+		// Reaches RedactURL via the url.Parse-ERROR branch (the ":8o8" port is
+		// invalid), NOT the default arm -- both entry points are covered, this
+		// row being one of the two error-branch cases. Deliberate false
+		// positive: the operator loses host/path context, but the origin is
+		// never CONCEALED behind a plausible-looking path, which is the
+		// regression this replaces.
 		{"path @ fails closed rather than concealing the origin",
 			"http://evil.attacker.example:8o8/x@/api/v1/users", placeholder},
 	} {
