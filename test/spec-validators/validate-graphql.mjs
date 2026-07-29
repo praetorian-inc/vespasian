@@ -15,8 +15,17 @@
 // Usage:   node validate-graphql.mjs <sdl_file>
 // Exit 0 + "OK: ..." on a valid SDL; exit 1 + "INVALID: <reason>" otherwise.
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { buildSchema, validateSchema } from "graphql";
+
+// Cap the input before any parsing, so a pathological document cannot pin the
+// parser. The sibling OpenAPI validator needs this because js-yaml has no
+// maxAliasCount equivalent and YAML anchor/alias expansion is unbounded (a
+// ~400-byte alias bomb expands exponentially and still exits 0 reporting "OK");
+// the same bound is applied here so both validators refuse oversized input
+// rather than only one. A wall-clock timeout on the shell side covers the
+// expansion itself (PR #187 review finding SEC-FE-003).
+const MAX_SDL_BYTES = 5 * 1024 * 1024; // 5 MiB = 5242880
 
 const sdlFile = process.argv[2];
 
@@ -27,6 +36,14 @@ if (!sdlFile) {
 
 if (!existsSync(sdlFile)) {
   console.error(`INVALID: SDL file not found: ${sdlFile}`);
+  process.exit(1);
+}
+
+const sdlBytes = statSync(sdlFile).size;
+if (sdlBytes > MAX_SDL_BYTES) {
+  console.error(
+    `INVALID: SDL file too large: ${sdlBytes} bytes (limit ${MAX_SDL_BYTES})`,
+  );
   process.exit(1);
 }
 

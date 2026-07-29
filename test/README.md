@@ -287,11 +287,12 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 ## Expected Results
 
-All 28 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest). The sample below is a default `--group all` run (19 offline + 9 live targets); the config-only `grpc-server` target runs additionally only when `TARGETS_SETUP` is configured.
+All 31 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest). The sample below is a default `--group all` run (21 offline + 10 live targets); the config-only `grpc-server` target runs additionally only when `TARGETS_SETUP` is configured.
 
 ```text
   TARGET                      STATUS    ENDPOINTS   EXPECTED   DURATION
   --------------------------  --------  ----------  ---------  --------
+  auth-capture                PASS      1           1          0s
   classifier-edge             PASS      -           -          0s
   concat-spa                  PASS      2           2          90s
   concat-spa-two-stage        PASS      2           2          92s
@@ -303,7 +304,7 @@ All 28 tests should pass. Order is non-deterministic and durations vary by machi
   generate-graphql-imports    PASS      2           2          0s
   generate-js-static          PASS      3           3          1s
   generate-merge-slugs        PASS      3           3          0s
-  generate-rest               PASS      8           8          0s
+  generate-rest               PASS      10          10         0s
   generate-wsdl               PASS      3           3          1s
   generate-wsdl-matrix        PASS      3           3          1s
   graphql-server              PASS      8           8          1s
@@ -317,11 +318,13 @@ All 28 tests should pass. Order is non-deterministic and durations vary by machi
   import-mitmproxy-native     PASS      3           3          1s
   import-unicode              PASS      3           3          0s
   no-download                 PASS      -           -          80s
-  rest-api                    PASS      8           8          79s
+  rest-api                    PASS      11          11         79s
+  scan-rest                   PASS      11          11         84s
   soap-service                PASS      3           3          51s
   spec-edge                   PASS      -           -          0s
+  ssrf-rejection              PASS      -           -          0s
 
-  Total: 28 passed, 0 failed, 0 skipped
+  Total: 31 passed, 0 failed, 0 skipped
 ```
 
 Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are informational and do not cause failures.

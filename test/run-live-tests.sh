@@ -399,6 +399,20 @@ test_rest_api() {
         failures=$((failures + 1))
     fi
 
+    # Literal proof of the ExtractForms claim in expected-paths.json.
+    # validate_path_coverage's paths_match treats a braced segment as a wildcard
+    # on either side, so expected "/api/subscribe" is satisfied by any two-segment
+    # templated path such as "/api/{slug}" — which merge-slugs is designed to
+    # produce. scan-rest already has this literal check; without it here the
+    # fixture's capability claim rests on a wildcard-tolerant matcher
+    # (PR #187 review finding TEST-001).
+    if grep -q "/api/subscribe" "$spec_file"; then
+        log_ok "rest-api: /api/subscribe present (generate's ExtractForms augmentation ran)"
+    else
+        log_fail "rest-api: /api/subscribe absent — generate's ExtractForms augmentation did not run"
+        failures=$((failures + 1))
+    fi
+
     # NOTE: No exact spec comparison here — the live crawl is non-deterministic,
     # so the generated spec varies between runs. Exact spec comparison is done in
     # test_generate_rest which uses a fixed import as input.
@@ -420,10 +434,11 @@ test_rest_api() {
 
 # test_scan_rest drives the single-stage `scan` command (crawl + augment +
 # classify + generate in ONE invocation) against the rest-api target. It is the
-# only live target that exercises the scan command's full pipeline INCLUDING the
-# analyze.ExtractForms augmentation (LAB-3890 T2, gap A1). The rest-api index
-# serves a static HTML <form action="/api/subscribe"> that is never linked or
-# fetched, so /api/subscribe appearing in the generated spec proves ExtractForms
+# only live target that drives the single-stage scan command end to end; the
+# two-stage rest-api target covers the same ExtractForms augmentation via
+# generate (LAB-3890 T2, gap A1). The rest-api index serves a static HTML
+# <form action="/api/subscribe"> that is never linked or fetched, so
+# /api/subscribe appearing in the generated spec proves ExtractForms
 # synthesized it inside the scan pipeline. Uses the same rest-api server as
 # test_rest_api (which drives the two-stage crawl+generate flow), so the two
 # tests can be compared directly.
@@ -488,6 +503,15 @@ test_scan_rest() {
     endpoint_count=$(count_spec_endpoints "$spec_file")
     local expected_count
     expected_count=$(json_field "$expected" total_paths)
+
+    # Exact-count: validate_path_coverage only detects MISSING paths, so without
+    # this a scan regression that emitted the expected paths plus spurious ones
+    # would report PASS with a mismatched pair of numbers in the summary
+    # (PR #187 review finding TEST-002).
+    if [ "$endpoint_count" != "$expected_count" ]; then
+        log_fail "scan-rest: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
+        failures=$((failures + 1))
+    fi
 
     local duration=$((SECONDS - start))
     if [ $failures -eq 0 ]; then
@@ -2598,18 +2622,43 @@ test_ssrf_rejection() {
 
     # The SSRF frontier gate must REJECT a private/loopback seed when
     # --dangerous-allow-private is absent. Every other crawl/scan target passes
-    # that bypass flag, so this is the only place the gate is asserted to
-    # actually reject (LAB-3890 T4, gap A4). No server needed — rejection
-    # happens before any connection.
+    # that bypass flag, so this is the only place the crawl-frontier gate
+    # (CrawlCmd/ScanCmd, cmd/vespasian/main.go:361 and :615) is asserted to
+    # actually reject (LAB-3890 T4, gap A4). --headless=false selects the
+    # net/http backend so the frontier gate is reached without launching Chrome:
+    # CrawlCmd.Run calls setupBrowserAndSignals before doCrawl, so with the
+    # default --headless a host without usable Chrome would fail this target for
+    # a reason unrelated to what it asserts. No server and no browser needed —
+    # rejection happens before any connection.
+    #
+    # SCOPE (PR #187 review finding SEC-BE-002): vespasian gates private/loopback
+    # traffic on TWO independent surfaces, each with its own
+    # --dangerous-allow-private bypass — the crawl frontier asserted above, and
+    # the separate probe path (GenerateCmd, cmd/vespasian/main.go:472; enabled by
+    # default since Probe defaults to true), implemented via
+    # ssrf.SafeDialContext/ssrf.ValidateURL in pkg/probe/types.go:101-131. This
+    # target does not exercise `generate`, so the probe-path gate has NO
+    # rejection assertion anywhere in this suite. Investigated adding one:
+    # built the binary and ran `generate rest` against a loopback-origin capture
+    # with and without --dangerous-allow-private — the generated spec was
+    # byte-identical (md5-equal) either way, and the only differing output was
+    # the static "SSRF protection disabled" banner that's printed whenever the
+    # flag is parsed, regardless of whether the gate would have blocked
+    # anything. Per-URL validation failures inside the probe strategies
+    # (pkg/probe/options.go, schema.go, etc.) are swallowed as slog.Debug and
+    # never surface as a probe error or CLI diagnostic, so a regression
+    # neutering the probe-path dialer (e.g. hand-rolling an http.Transport
+    # instead of cloning DefaultTransport, per the pkg/probe/types.go:101-109
+    # warning) would fail nothing here. No fabricated assertion has been added;
+    # this second bypassable surface is tracked in the LAB-3890 backlog.
     local private_url="http://127.0.0.1:9"
     local out
-    if out=$("$VESPASIAN" crawl "$private_url" -o /dev/null 2>&1); then
+    if out=$("$VESPASIAN" crawl "$private_url" -o /dev/null --headless=false 2>&1); then
         log_fail "SSRF gate: crawl of ${private_url} succeeded WITHOUT --dangerous-allow-private (gate did not reject)"
         failures=$((failures + 1))
-    elif printf '%s' "$out" | grep -qiE 'ssrf|private|rejected by frontier|dangerous-allow-private'; then
+    elif assert_ssrf_rejected "SSRF gate" "$private_url" "$out"; then
         log_ok "SSRF gate: private target correctly rejected"
     else
-        log_fail "SSRF gate: crawl failed but not via the SSRF gate: $(printf '%s' "$out" | head -1)"
         failures=$((failures + 1))
     fi
 
@@ -2642,26 +2691,69 @@ test_auth_capture() {
     fi
 
     # The captured request must retain its Authorization header — auth must not
-    # be silently dropped by the pipeline (LAB-3890 T4, gap A5).
-    if grep -q '"Authorization"' "$imported_file" && grep -q 'Bearer test-token-abc123' "$imported_file"; then
-        log_ok "auth-capture: Authorization header preserved in capture"
-    else
-        log_fail "auth-capture: Authorization header missing from imported capture"
+    # be silently dropped by the pipeline (LAB-3890 T4, gap A5). A pair of
+    # whole-file greps is satisfied by a degenerate file containing "[]" plus the
+    # bare strings "Authorization" and "Bearer test-token-abc123" anywhere in the
+    # file, with no proof the header is attached to the right request. This
+    # requires exactly one imported entry whose method/url round-tripped from the
+    # fixture and whose Authorization header carries the fixture's token
+    # (PR #187 review finding TEST-003).
+    local result rc=0
+    result=$(python3 - "$imported_file" << 'PYEOF'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    imported = json.load(f)
+
+if not isinstance(imported, list) or len(imported) != 1:
+    got = len(imported) if isinstance(imported, list) else "non-list"
+    print("COUNT MISMATCH: got %s imported entr(y/ies), expected exactly 1" % got)
+    sys.exit(1)
+
+entry = imported[0]
+if entry.get("method") != "GET":
+    print("METHOD MISMATCH: got %r, expected GET" % entry.get("method"))
+    sys.exit(1)
+
+if entry.get("url") != "http://api.example.com/api/account":
+    print("URL MISMATCH: got %r, expected http://api.example.com/api/account" % entry.get("url"))
+    sys.exit(1)
+
+auth = entry.get("headers", {}).get("Authorization")
+if auth != "Bearer test-token-abc123":
+    print("AUTH HEADER MISMATCH: got %r, expected 'Bearer test-token-abc123'" % auth)
+    sys.exit(1)
+
+print("OK: 1 entry imported, GET http://api.example.com/api/account, Authorization preserved")
+PYEOF
+    ) || rc=$?
+    if [ $rc -ne 0 ]; then
+        log_fail "auth-capture: ${result}"
         failures=$((failures + 1))
+    else
+        log_ok "auth-capture: ${result}"
     fi
 
-    # KNOWN GAP (LAB-3890 T4 / A5): the generator does not yet emit OpenAPI
-    # securitySchemes from captured auth. Asserting captured-auth -> securitySchemes
-    # requires that generator feature (tracked separately); this target asserts
-    # only that auth is captured/preserved.
-    log_info "auth-capture: NOTE — securitySchemes generation from captured auth is not yet implemented (separate feature)."
+    # KNOWN GAP (LAB-3890 T4 / A5, rescoped to import-side auth preservation
+    # only): the generator does not yet emit OpenAPI securitySchemes from
+    # captured auth. Asserting captured-auth -> securitySchemes ships with
+    # LAB-5332 (PR #187 review finding REQ-001 — the prior claim that this was
+    # tracked elsewhere was unverifiable at review time, since no such ticket
+    # existed); this target asserts only that auth is captured/preserved.
+    log_info "auth-capture: NOTE — securitySchemes generation from captured auth is tracked in LAB-5332 (not yet implemented)."
+
+    # Measured, not hardcoded — the summary row must report what was actually
+    # imported, not a literal that would keep reading "1" even if the import
+    # stopped producing entries entirely (PR #187 review finding TEST-003).
+    local entry_count
+    entry_count=$(json_len "$imported_file")
 
     local duration=$((SECONDS - start))
     if [ $failures -eq 0 ]; then
-        set_test_result "auth-capture" "PASS" "1" "1" "$duration"
+        set_test_result "auth-capture" "PASS" "$entry_count" "1" "$duration"
         log_ok "auth-capture: PASSED (${duration}s)"
     else
-        set_test_result "auth-capture" "FAIL" "?" "1" "$duration"
+        set_test_result "auth-capture" "FAIL" "$entry_count" "1" "$duration"
         log_fail "auth-capture: FAILED (${duration}s)"
     fi
 }
@@ -3235,16 +3327,13 @@ PYEOF
         )
         beyond_depth=${depth_counts%% *}
         reached_depth=${depth_counts##* }
-        if [ "$beyond_depth" = "0" ]; then
-            log_ok "Depth limit: correctly stopped within depth 2 (no /deep/4+)"
+        # Both counts come from word-splitting one line of python stdout, so a
+        # change to that print format yields garbage rather than a number.
+        # assert_within_depth rejects a non-numeric value on EITHER side; the
+        # old inline check guarded only reached_depth (PR #187 finding TEST-004).
+        if assert_within_depth "Depth limit" "$beyond_depth" "$reached_depth"; then
+            log_ok "Depth limit: stayed within depth 2 and followed ${reached_depth} link(s) past the seed"
         else
-            log_fail "Depth limit: found ${beyond_depth} URL(s) beyond depth 2 (/deep/4+) — --depth not enforced"
-            failures=$((failures + 1))
-        fi
-        if [ "$reached_depth" != "0" ] && [ "$reached_depth" != "?" ]; then
-            log_ok "Depth reach: crawl followed links past the seed (${reached_depth} URL(s) at /deep/2+)"
-        else
-            log_fail "Depth reach: crawl never got past the seed (no /deep/2 or /deep/3) — under-crawl / premature stop"
             failures=$((failures + 1))
         fi
     else
@@ -3268,10 +3357,9 @@ PYEOF
         # max-pages=10 must be enforced. A small margin tolerates in-flight
         # concurrency, but a broken cap (the many-links page exposes 20 links) is
         # now a hard failure, not a warning (LAB-3890 T3, gap B2).
-        if [ "$page_count" != "?" ] && [ "$page_count" -le 15 ]; then
+        if assert_max_pages "Max-pages limit" "$page_count" 10 5; then
             log_ok "Max-pages limit: captured ${page_count} requests (limit=10)"
         else
-            log_fail "Max-pages limit: captured ${page_count} requests (expected <=15) — --max-pages not enforced"
             failures=$((failures + 1))
         fi
     else

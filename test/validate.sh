@@ -9,13 +9,57 @@
 VALIDATE_SH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPEC_VALIDATORS_DIR="${VALIDATE_SH_DIR}/spec-validators"
 
+# SPEC_VALIDATOR_TIMEOUT bounds each node validator run. js-yaml enforces no
+# alias-expansion cap, so a YAML anchor bomb parses unbounded AND exits 0
+# reporting a valid spec; without this the only backstop is the CI job's
+# timeout-minutes, which surfaces as an opaque job kill rather than a validator
+# failure (PR #187 review finding SEC-FE-003).
+SPEC_VALIDATOR_TIMEOUT="${SPEC_VALIDATOR_TIMEOUT:-30}"
+
+# _run_spec_validator runs a node validator under a wall-clock bound, echoing
+# its combined output and returning its exit status. Exit 124 (timeout) is
+# rewritten into an explicit message so a hang is diagnosable.
+# GNU `timeout` is absent on macOS by default, so fall back to `gtimeout` and
+# then to running unwrapped rather than failing the whole suite.
+# Usage: _run_spec_validator <script> <file>
+_run_spec_validator() {
+    local script=$1 file=$2
+    local runner=""
+    if command -v timeout >/dev/null 2>&1; then
+        runner="timeout"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        runner="gtimeout"
+    fi
+
+    local out rc=0
+    if [ -n "$runner" ]; then
+        out=$("$runner" "$SPEC_VALIDATOR_TIMEOUT" node "$script" "$file" 2>&1) || rc=$?
+        if [ $rc -eq 124 ]; then
+            printf '%s\n' "validator timed out after ${SPEC_VALIDATOR_TIMEOUT}s: $(basename "$script")"
+            return 1
+        fi
+    else
+        out=$(node "$script" "$file" 2>&1) || rc=$?
+    fi
+    printf '%s\n' "$out"
+    return $rc
+}
+
 # _ensure_spec_validators fails with an actionable message if the Node
 # validator dependencies have not been installed.
 _ensure_spec_validators() {
-    if [ ! -d "${SPEC_VALIDATORS_DIR}/node_modules" ]; then
-        log_fail "spec-validators deps missing — run: (cd ${SPEC_VALIDATORS_DIR} && npm ci)"
-        return 1
-    fi
+    # Check the actual entry points, not just the directory: an interrupted
+    # npm ci or a pruned cache leaves node_modules present but unusable, which
+    # would skip this actionable message and surface as a raw
+    # ERR_MODULE_NOT_FOUND stack trace instead (PR #187 review finding
+    # SEC-FE-004).
+    local pkg
+    for pkg in "@apidevtools/swagger-parser" "graphql"; do
+        if [ ! -f "${SPEC_VALIDATORS_DIR}/node_modules/${pkg}/package.json" ]; then
+            log_fail "spec-validators deps missing or incomplete (${pkg}) — run: (cd ${SPEC_VALIDATORS_DIR} && npm ci)"
+            return 1
+        fi
+    done
     return 0
 }
 
@@ -122,7 +166,7 @@ validate_openapi_structure() {
     _ensure_spec_validators || return 1
 
     local result rc=0
-    result=$(node "${SPEC_VALIDATORS_DIR}/validate-openapi.mjs" "$spec_file" 2>&1) || rc=$?
+    result=$(_run_spec_validator "${SPEC_VALIDATORS_DIR}/validate-openapi.mjs" "$spec_file") || rc=$?
 
     if [ $rc -ne 0 ]; then
         log_fail "OpenAPI structure: $result"
@@ -271,75 +315,88 @@ PYEOF
 # or unexpected operations in the WSDL are NOT flagged (PR #187 review finding
 # TEST-004).
 # LAB-3890 T1: replaces the old substring check (`GetUser` false-passed on
-# `GetUserList`, and names in comments false-passed). Uses xmllint for
-# well-formedness + exact operation-name extraction, jq to read expected ops.
+# `GetUserList`, and names in comments false-passed).
+#
+# Parses with python3 xml.etree rather than xmllint (PR #187 review finding
+# QUAL-002): xmllint ships in libxml2-utils, which is NOT installed on the
+# ubuntu-24.04 runner image and cannot be added from a later step because
+# harden-runner sets disable-sudo. python3 is already a hard dependency of every
+# other validator in this file, so the XML path is now provisioned identically
+# to the rest of the suite and the whole function is hermetic.
+#
+# ElementTree drops comments during parse, so an operation name that appears
+# only inside an XML comment is not in the extracted set.
 # Usage: validate_soap_operations <wsdl_file> <expected_json>
 validate_soap_operations() {
     local wsdl_file=$1
     local expected_json=$2
 
-    # LAB-3890 TEST-006: fail loud when a required parser is missing. A missing jq
-    # otherwise makes the expected-ops read below yield no input, so the
-    # missing-operations loop never runs and the check false-passes ("all
-    # operations found", return 0) regardless of the WSDL's contents.
-    if ! command -v xmllint >/dev/null 2>&1; then
-        log_fail "SOAP operations: xmllint not installed (install libxml2-utils)"
-        return 1
-    fi
-    if ! command -v jq >/dev/null 2>&1; then
-        log_fail "SOAP operations: jq not installed"
-        return 1
-    fi
-
     if [ ! -f "$wsdl_file" ]; then
-        log_fail "WSDL file not found: $wsdl_file"
+        log_fail "SOAP operations: WSDL file not found: $wsdl_file"
+        return 1
+    fi
+    if [ ! -f "$expected_json" ]; then
+        log_fail "SOAP operations: expected-operations file not found: $expected_json"
         return 1
     fi
 
-    # Real XML parse: reject WSDL that is not well-formed.
-    if ! xmllint --noout "$wsdl_file" 2>/dev/null; then
-        log_fail "SOAP operations: WSDL is not well-formed XML"
+    local result rc=0
+    result=$(python3 - "$wsdl_file" "$expected_json" << 'PYEOF'
+import json, sys
+import xml.etree.ElementTree as ET
+
+wsdl_file, expected_file = sys.argv[1], sys.argv[2]
+
+try:
+    root = ET.parse(wsdl_file).getroot()
+except ET.ParseError as e:
+    print("not well-formed XML: %s" % e)
+    sys.exit(1)
+
+try:
+    with open(expected_file) as f:
+        expected = json.load(f)
+except (OSError, ValueError) as e:
+    print("could not read expected operations from %s: %s" % (expected_file, e))
+    sys.exit(1)
+
+expected_ops = expected.get("operations") or []
+if not expected_ops:
+    print("no expected operations listed in %s" % expected_file)
+    sys.exit(1)
+
+
+def local_name(tag):
+    """Strip any {namespace} prefix — WSDLs vary in how they bind the wsdl ns."""
+    return tag.rsplit("}", 1)[-1]
+
+
+# Only direct operation children of a portType count, so an <operation> under
+# <binding> does not satisfy the check.
+actual_ops = set()
+for elem in root.iter():
+    if local_name(elem.tag) != "portType":
+        continue
+    for child in elem:
+        if local_name(child.tag) == "operation":
+            name = child.get("name")
+            if name:
+                actual_ops.add(name)
+
+missing = [op for op in expected_ops if op not in actual_ops]
+if missing:
+    print("MISSING operations: " + ", ".join(missing))
+    sys.exit(1)
+
+print("all %d expected operations present (exact name match)" % len(expected_ops))
+PYEOF
+    ) || rc=$?
+
+    if [ $rc -ne 0 ]; then
+        log_fail "SOAP operations: $result"
         return 1
     fi
-
-    # Exact set of portType operation names (namespace-agnostic via local-name).
-    local actual_ops
-    actual_ops=$(xmllint --xpath \
-        '//*[local-name()="portType"]/*[local-name()="operation"]/@name' \
-        "$wsdl_file" 2>/dev/null \
-        | grep -oE 'name="[^"]*"' | sed -E 's/name="([^"]*)"/\1/' | sort -u)
-
-    # Read the expected operation set explicitly so an empty or failed extraction
-    # (bad JSON, jq error) is a hard failure rather than a silent "nothing missing".
-    # A process substitution here would swallow jq's exit status.
-    local expected_ops
-    if ! expected_ops=$(jq -r '.operations[]' "$expected_json" 2>/dev/null); then
-        log_fail "SOAP operations: could not read expected operations from $expected_json"
-        return 1
-    fi
-    if [ -z "$expected_ops" ]; then
-        log_fail "SOAP operations: no expected operations listed in $expected_json"
-        return 1
-    fi
-
-    local missing=()
-    local op
-    while IFS= read -r op; do
-        [ -z "$op" ] && continue
-        if ! grep -qxF -- "$op" <<< "$actual_ops"; then
-            missing+=("$op")
-        fi
-    done <<< "$expected_ops"
-
-    if [ ${#missing[@]} -ne 0 ]; then
-        local IFS=", "
-        log_fail "SOAP operations: MISSING operations: ${missing[*]}"
-        return 1
-    fi
-
-    local total
-    total=$(jq -r '.operations | length' "$expected_json")
-    log_ok "SOAP operations: all ${total} expected operations present (exact name match)"
+    log_ok "SOAP operations: $result"
     return 0
 }
 
@@ -354,6 +411,46 @@ assert_no_panic() {
     local label=$1 output=$2
     if printf '%s' "$output" | grep -qiE 'panic:|goroutine [0-9]+ \[running\]'; then
         log_fail "${label}: PANICKED (not graceful): $(printf '%s' "$output" | grep -iE 'panic:' | head -1)"
+        return 1
+    fi
+    return 0
+}
+
+# assert_ssrf_rejected checks that captured crawl output proves the crawl
+# frontier's SSRF gate rejected a seed, rather than the command merely having
+# failed for some other reason (PR #187 review finding SEC-BE-003).
+#
+# The predicate lives here, not inline in run-live-tests.sh, so validate_test.sh
+# can regression-lock it the same way assert_no_panic is locked.
+#
+# The old inline check grepped case-insensitively for
+# 'ssrf|private|rejected by frontier|dangerous-allow-private'. kong is built
+# with kong.UsageOnError() (cmd/vespasian/main.go:771), so any parse error
+# prints the usage block — which lists --dangerous-allow-private and its
+# "Disable SSRF protection ... private/localhost targets" help text. Renaming
+# the crawl subcommand or the -o short flag would therefore have satisfied that
+# grep with the gate never having run.
+#
+# Note the underlying error is deliberately multi-cause ("scope, SSRF, or
+# parse", pkg/crawl/engine.go:162 and pkg/crawl/http_crawler.go:164), so this
+# asserts the FRONTIER rejected the seed, which is the strongest signal the
+# binary currently emits. Narrowing further needs a distinct SSRF-specific
+# message from pkg/crawl.
+# Returns 0 when the output proves a frontier rejection of <seed_url>.
+# Usage: assert_ssrf_rejected <label> <seed_url> <output>
+assert_ssrf_rejected() {
+    local label=$1 seed_url=$2 output=$3
+
+    if printf '%s' "$output" | grep -qF 'Usage: vespasian'; then
+        log_fail "${label}: kong printed its usage banner — the command failed to PARSE, so the SSRF gate never ran"
+        return 1
+    fi
+    if ! printf '%s' "$output" | grep -qF 'seed URL rejected by frontier'; then
+        log_fail "${label}: output has no frontier rejection: $(printf '%s' "$output" | tail -1)"
+        return 1
+    fi
+    if ! printf '%s' "$output" | grep -qF -- "$seed_url"; then
+        log_fail "${label}: frontier rejection did not name the seed ${seed_url}"
         return 1
     fi
     return 0
@@ -421,7 +518,7 @@ validate_graphql_structure() {
     _ensure_spec_validators || return 1
 
     local result rc=0
-    result=$(node "${SPEC_VALIDATORS_DIR}/validate-graphql.mjs" "$sdl_file" 2>&1) || rc=$?
+    result=$(_run_spec_validator "${SPEC_VALIDATORS_DIR}/validate-graphql.mjs" "$sdl_file") || rc=$?
 
     if [ $rc -ne 0 ]; then
         log_fail "GraphQL structure: $result"
@@ -649,5 +746,56 @@ PYEOF
         return 1
     fi
     log_ok "${result}"
+    return 0
+}
+
+# assert_within_depth checks a depth-limited crawl stayed inside its --depth
+# budget AND actually followed links past the seed (LAB-3890 T3, gap B2).
+# Extracted from test_crawl_depth so validate_test.sh can lock the boundary
+# logic (PR #187 review finding TEST-004).
+#
+# Both counts are recovered by string surgery on one line of python stdout in
+# the caller, so a change to that print format yields garbage rather than a
+# number. The inline version guarded only reached_depth against the "?"
+# sentinel; here BOTH sides must be numeric or the assertion hard-fails.
+# Usage: assert_within_depth <label> <beyond_count> <reached_count>
+assert_within_depth() {
+    local label=$1 beyond=$2 reached=$3
+
+    if ! [[ $beyond =~ ^[0-9]+$ ]]; then
+        log_fail "${label}: beyond-depth count is not a number: '${beyond}' (depth-count extraction failed)"
+        return 1
+    fi
+    if ! [[ $reached =~ ^[0-9]+$ ]]; then
+        log_fail "${label}: reached-depth count is not a number: '${reached}' (depth-count extraction failed)"
+        return 1
+    fi
+    if [ "$beyond" -ne 0 ]; then
+        log_fail "${label}: found ${beyond} URL(s) beyond the requested depth — --depth not enforced"
+        return 1
+    fi
+    if [ "$reached" -eq 0 ]; then
+        log_fail "${label}: crawl never got past the seed — under-crawl / premature stop"
+        return 1
+    fi
+    return 0
+}
+
+# assert_max_pages checks a crawl honoured its --max-pages cap, allowing a
+# margin for requests already in flight when the cap is hit (LAB-3890 T3, gap
+# B2). Extracted from test_crawl_depth (PR #187 review finding TEST-004).
+# Usage: assert_max_pages <label> <page_count> <limit> <margin>
+assert_max_pages() {
+    local label=$1 page_count=$2 limit=$3 margin=$4
+
+    if ! [[ $page_count =~ ^[0-9]+$ ]]; then
+        log_fail "${label}: page count is not a number: '${page_count}' (capture read failed)"
+        return 1
+    fi
+    local max_allowed=$((limit + margin))
+    if [ "$page_count" -gt "$max_allowed" ]; then
+        log_fail "${label}: captured ${page_count} requests (limit=${limit}, allowed <=${max_allowed}) — --max-pages not enforced"
+        return 1
+    fi
     return 0
 }
