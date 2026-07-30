@@ -72,12 +72,19 @@
 //     sink, since ssrf.ValidateURL never inspects u.User and
 //     probe.Config.AuthHeaders is set by no non-test caller, so net/http
 //     would otherwise derive an `Authorization: Basic` header from an
-//     attacker-chosen credential on every probe (SEC-BE-001); and (3) any URL
-//     that carries a host must use the http or https scheme, which catches a
-//     scheme-relative literal that resolution left without one. A hostile
-//     bundle literal cannot steer the offline candidate set — or the probe
-//     stage that later consumes it — at an attacker-chosen host, credential,
-//     or byte-spoofed path.
+//     attacker-chosen credential on every probe (SEC-BE-001); (3) the URL may
+//     carry no opaque part (scheme:opaque-data, e.g. "mailto:x@y.com" or
+//     "https:api/x" — no host, no resolvable path); and (4) any URL that
+//     carries a host must use the http or https scheme (catching a
+//     scheme-relative literal that resolution left without one), AND an
+//     http(s)-scheme URL must carry a host — "https:/api/x" parses to
+//     Scheme="https", Host="" (a single slash after the scheme is not an
+//     authority marker), and without this check it produced a degenerate
+//     "https://" spec server entry that sorted before every real host and
+//     blanked info.title (LAB-4992 review). A hostile bundle literal cannot
+//     steer the offline candidate set — or the probe stage that later
+//     consumes it — at an attacker-chosen host, credential, or byte-spoofed
+//     path.
 //
 //     Capture compatibility (QUAL-001, LAB-4992): this applies to captures whose
 //     JS bundles have not ALREADY been through an older jsstatic pass.

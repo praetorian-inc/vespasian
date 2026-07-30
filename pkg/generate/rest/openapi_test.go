@@ -457,39 +457,197 @@ func TestOpenAPIGenerator_MultipleServers(t *testing.T) {
 	}
 }
 
-// SEC-BE-003: a cross-origin static:js candidate is never probed (the probe
-// egress gate only prevents the REQUEST; extractServers must independently
-// exclude it from the DELIVERABLE). The attacker host is chosen to sort
-// FIRST alphabetically ("a.attacker.example" < "www.example.com") so this
-// test fails under the pre-fix behavior, which always used servers[0] for
-// both the servers list membership and the title — proving the exploit this
-// fix closes.
+// SEC-BE-003/SEC-BE-002: a cross-origin static:js candidate is never probed
+// (the probe egress gate only prevents the REQUEST; extractServers must
+// independently exclude it from the DELIVERABLE). The attacker host is chosen
+// to sort FIRST alphabetically ("a.attacker.example" < "www.example.com") so
+// this test fails under the pre-fix behavior, which always used servers[0]
+// for both the servers list membership and the title — proving the exploit
+// this fix closes. No TargetOrigin is supplied, so the primary origin falls
+// back to the lowest-sorted DYNAMICALLY OBSERVED endpoint (www.example.com).
 func TestExtractServers_JSStaticCrossOriginExcluded(t *testing.T) {
 	endpoints := []classify.ClassifiedRequest{
 		makeClassified("GET", "https://www.example.com/api/users", ""),
 		makeClassified("GET", "https://a.attacker.example/api/collect", "static:js"),
 	}
 
-	servers, titleHost := extractServers(endpoints)
+	servers, titleHost, excluded := extractServers(endpoints, "")
 
 	require.Len(t, servers, 1, "unprobed JS-static host must not be added to servers")
 	assert.Equal(t, "https://www.example.com", servers[0].URL)
 	assert.Equal(t, "www.example.com API", titleHost, "info.title must not be captured by the unprobed JS-static host")
+	assert.True(t, excluded["https://a.attacker.example"], "attacker origin must be reported as excluded from the global list")
 }
 
-// Fallback: a fully-offline capture (every endpoint is JS-static) must still
-// produce a usable, populated servers list rather than an empty one.
-func TestExtractServers_AllJSStaticFallsBackToPopulated(t *testing.T) {
+// TestExtractServers_FullyOfflineAllJSStatic_NoTargetOriginExcludesAttacker is
+// the SEC-BE-002 regression guard (LAB-4992 review): a FULLY-OFFLINE capture
+// (every endpoint is JS-static — no dynamically observed endpoint exists at
+// all) containing both a legitimate host and an attacker-planted host, with NO
+// TargetOrigin supplied. This is the flagship LAB-4992 scenario: the pre-fix
+// code's "observed == 0 -> fall back to the FULL unfiltered endpoint set"
+// branch trusted the entirely offline, attacker-controlled JS-static set, and
+// picked the alphabetically-first host for both servers[0] and info.title.
+// "a.attacker.example" sorts before "www.example.com", so this test fails
+// under the pre-fix behavior.
+//
+// Without a TargetOrigin the run cannot vouch for EITHER host from this
+// endpoint set alone (both are equally unprobed), so the assertion is
+// necessarily negative: the attacker host must never surface, in servers or
+// in the title.
+func TestExtractServers_FullyOfflineAllJSStatic_NoTargetOriginExcludesAttacker(t *testing.T) {
 	endpoints := []classify.ClassifiedRequest{
-		makeClassified("GET", "https://h/api/x", "static:js"),
-		makeClassified("GET", "https://h/api/y", "static:js-concat"),
+		makeClassified("GET", "https://www.example.com/api/x", "static:js"),
+		makeClassified("GET", "https://a.attacker.example/api/collect", "static:js"),
 	}
 
-	servers, titleHost := extractServers(endpoints)
+	servers, titleHost, _ := extractServers(endpoints, "")
 
-	require.Len(t, servers, 1, "fully-offline capture must still populate servers")
-	assert.Equal(t, "https://h", servers[0].URL)
-	assert.Equal(t, "h API", titleHost)
+	for _, s := range servers {
+		assert.NotEqual(t, "https://a.attacker.example", s.URL, "attacker origin must never appear in servers")
+	}
+	assert.NotContains(t, titleHost, "attacker", "attacker origin must never appear in info.title")
+}
+
+// TestExtractServers_FullyOfflineAllJSStatic_WithTargetOriginPinsLegit is the
+// companion to the test above: the SAME fully-offline, all-JS-static endpoint
+// set, but this time the caller supplies the trusted TargetOrigin (as the
+// pipeline does via crawl.ResolveTargetOrigin, derived from the capture's own
+// HTML page or --target-url — never from bundle content). With a vouched
+// origin available, the legitimate host must become both servers[0] and the
+// title host, and the attacker host must still never surface.
+func TestExtractServers_FullyOfflineAllJSStatic_WithTargetOriginPinsLegit(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://www.example.com/api/x", "static:js"),
+		makeClassified("GET", "https://a.attacker.example/api/collect", "static:js"),
+	}
+
+	servers, titleHost, excluded := extractServers(endpoints, "https://www.example.com")
+
+	require.NotEmpty(t, servers)
+	assert.Equal(t, "https://www.example.com", servers[0].URL, "the vouched TargetOrigin must be servers[0]")
+	assert.Equal(t, "www.example.com API", titleHost, "title must derive from the vouched TargetOrigin")
+	for _, s := range servers {
+		assert.NotEqual(t, "https://a.attacker.example", s.URL, "attacker origin must never appear in servers")
+	}
+	assert.True(t, excluded["https://a.attacker.example"], "attacker origin must be reported as excluded from the global list")
+}
+
+// TestExtractServers_HostlessSchemeLiteralRejected pins the LAB-4992 review
+// fix: a scheme-only literal like "https:/api/x" (single slash — not an
+// authority marker) parses via url.Parse to Scheme="https", Host="". The
+// pre-fix loop only checked the scheme, so this produced a degenerate
+// "https://" server entry — which sorts before every real hostname and, via
+// the title-from-servers[0] logic, blanked info.title (firstURL.Host == "").
+func TestExtractServers_HostlessSchemeLiteralRejected(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https:/api/x", ""),
+	}
+
+	servers, titleHost, _ := extractServers(endpoints, "")
+
+	for _, s := range servers {
+		assert.NotEqual(t, "https://", s.URL, "a scheme-only literal must not produce a degenerate \"https://\" server entry")
+	}
+	assert.Equal(t, "API", titleHost, "with no usable origin, title must fall back to the default rather than blank")
+}
+
+// TestExtractServers_HostlessTargetOriginRejected pins canonicalizeOrigin's
+// empty-host guard on the TARGET-ORIGIN path, which is a separate arm from the
+// endpoint path guarded by originFromURL (pinned by
+// TestExtractServers_HostlessSchemeLiteralRejected above). Without the
+// Hostname() == "" check, a degenerate targetOrigin such as "https:/api/x"
+// canonicalizes to the bare "https://" and becomes the PRIMARY server —
+// occupying servers[0] and displacing the real observed host, which is the
+// same degenerate-origin failure SEC-BE-002 closed for bundle literals, just
+// reached through --target-url instead. Verified non-vacuous by deleting the
+// Hostname() == "" term: this test then fails while the rest of the package
+// stays green.
+func TestExtractServers_HostlessTargetOriginRejected(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://legit.example/api/users", ""),
+	}
+
+	servers, titleHost, _ := extractServers(endpoints, "https:/api/x")
+
+	require.NotEmpty(t, servers, "the observed origin must still populate servers")
+	assert.Equal(t, "https://legit.example", servers[0].URL,
+		"an unusable targetOrigin must not become the primary server; the observed origin must")
+	for _, s := range servers {
+		assert.NotEqual(t, "https://", s.URL, "a host-less targetOrigin must not produce a degenerate \"https://\" entry")
+	}
+	assert.Equal(t, "legit.example API", titleHost,
+		"title must come from the real observed origin, not from the unusable targetOrigin")
+}
+
+// TestExtractServers_StaticHTMLCarveOut pins the doc-comment claim (computeSourceTag,
+// extractServers) that static:html is deliberately NOT filtered like a JS-static
+// source: the page carrying the <form> was fetched over the wire during the
+// crawl, unlike a JS-static candidate whose entire existence is reconstructed
+// offline. This asserts the concrete consequence: a dynamic endpoint and a
+// static:html endpoint on DIFFERENT hosts both reach the global servers list,
+// and (with no TargetOrigin) the primary/title is the lowest-sorted of the two
+// — exercising crawl.IsJSStaticSource's exclusion of "static:html" in both
+// directions (present in servers, eligible as primary).
+func TestExtractServers_StaticHTMLCarveOut(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://real.example.com/api/x", ""),
+		makeClassified("POST", "https://forms.example.com/api/submit", "static:html"),
+	}
+
+	servers, titleHost, excluded := extractServers(endpoints, "")
+
+	urls := make([]string, 0, len(servers))
+	for _, s := range servers {
+		urls = append(urls, s.URL)
+	}
+	assert.Contains(t, urls, "https://real.example.com", "the dynamic endpoint's origin must be in servers")
+	assert.Contains(t, urls, "https://forms.example.com", "the static:html endpoint's origin must be in servers (not treated as JS-static)")
+	assert.Equal(t, "forms.example.com API", titleHost, "\"forms.example.com\" sorts before \"real.example.com\" and static:html is eligible as the primary fallback")
+	assert.Empty(t, excluded, "static:html must never be reported as an excluded (cross-origin JS-static) origin")
+}
+
+// TestBuildOperation_CrossOriginJSStaticGetsPerOperationServersOverride is the
+// SEC-BE-001 regression guard: groupEndpoints groups purely by normalized path
+// and method, ignoring host, so a JS-static endpoint recovered on a different
+// host than the primary origin still produces a path entry in the spec even
+// though its origin is excluded from the global servers list. Without a
+// per-operation override, that path is silently attributed to the primary
+// host in every client that reads only the global servers list — sending
+// follow-up testing at the wrong target. This asserts the operation carries
+// its own servers override naming its actual origin, and that the global
+// servers list never contains that origin.
+func TestBuildOperation_CrossOriginJSStaticGetsPerOperationServersOverride(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://app.example.com/api/users", ""),
+		makeClassified("GET", "https://api.example.com/api/orders", "static:js"),
+	}
+
+	gen := &OpenAPIGenerator{Format: "yaml", TargetOrigin: "https://app.example.com"}
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err)
+
+	var parsed struct {
+		Servers []struct {
+			URL string `yaml:"url"`
+		} `yaml:"servers"`
+		Paths map[string]struct {
+			Get struct {
+				Servers []struct {
+					URL string `yaml:"url"`
+				} `yaml:"servers"`
+			} `yaml:"get"`
+		} `yaml:"paths"`
+	}
+	require.NoError(t, yaml.Unmarshal(spec, &parsed))
+
+	for _, s := range parsed.Servers {
+		assert.NotEqual(t, "https://api.example.com", s.URL, "cross-origin JS-static host must not appear in the global servers list")
+	}
+
+	ordersOp, ok := parsed.Paths["/api/orders"]
+	require.True(t, ok, "expected /api/orders path in the spec")
+	require.Len(t, ordersOp.Get.Servers, 1, "cross-origin operation must carry a per-operation servers override")
+	assert.Equal(t, "https://api.example.com", ordersOp.Get.Servers[0].URL)
 }
 
 func TestP0Fixes_ContextAwarePathParams(t *testing.T) {
@@ -2001,7 +2159,7 @@ func TestBuildOperation_EmptyValuesQueryParam(t *testing.T) {
 	key := endpointKey{path: "/items", method: "get"}
 
 	// Must not panic.
-	op := buildOperation(key, group, false)
+	op := buildOperation(key, group, false, nil)
 
 	// "foo" must be absent — no observed values means we cannot document it.
 	for _, paramRef := range op.Parameters {
@@ -2037,7 +2195,7 @@ func TestBuildOperation_ScalarQueryParam(t *testing.T) {
 		},
 	}
 	key := endpointKey{path: "/items", method: "get"}
-	op := buildOperation(key, group, false)
+	op := buildOperation(key, group, false, nil)
 
 	require.Len(t, op.Parameters, 1)
 	param := op.Parameters[0].Value
@@ -2067,7 +2225,7 @@ func TestBuildOperation_MultiValueQueryParam_AllInts(t *testing.T) {
 		},
 	}
 	key := endpointKey{path: "/items", method: "get"}
-	op := buildOperation(key, group, false)
+	op := buildOperation(key, group, false, nil)
 
 	require.Len(t, op.Parameters, 1)
 	param := op.Parameters[0].Value
@@ -2101,7 +2259,7 @@ func TestBuildOperation_MultiValueQueryParam_Mixed(t *testing.T) {
 		},
 	}
 	key := endpointKey{path: "/items", method: "get"}
-	op := buildOperation(key, group, false)
+	op := buildOperation(key, group, false, nil)
 
 	require.Len(t, op.Parameters, 1)
 	param := op.Parameters[0].Value
@@ -2123,7 +2281,7 @@ func TestBuildOperation_MultiValueQueryParam_AllBool(t *testing.T) {
 		},
 	}
 	key := endpointKey{path: "/flags", method: "get"}
-	op := buildOperation(key, group, false)
+	op := buildOperation(key, group, false, nil)
 
 	require.Len(t, op.Parameters, 1)
 	param := op.Parameters[0].Value
@@ -2176,7 +2334,7 @@ func TestBuildOperation_ScalarQueryParam_OrderIndependence(t *testing.T) {
 			QueryParams: map[string][]string{"limit": {"1.5"}},
 		}},
 	}
-	op := buildOperation(endpointKey{path: "/items", method: "get"}, group, false)
+	op := buildOperation(endpointKey{path: "/items", method: "get"}, group, false, nil)
 	require.NotNil(t, op)
 	require.Len(t, op.Parameters, 1)
 	p := op.Parameters[0].Value
@@ -2212,7 +2370,7 @@ func TestBuildOperation_PostDedupScalarNotOverWidened(t *testing.T) {
 			MultiValueQueryKeys: map[string]bool{}, // empty: page was scalar in both contributing obs
 		},
 	}
-	op := buildOperation(endpointKey{path: "/items", method: "get"}, group, false)
+	op := buildOperation(endpointKey{path: "/items", method: "get"}, group, false, nil)
 	require.NotNil(t, op)
 	require.Len(t, op.Parameters, 1)
 	p := op.Parameters[0].Value
@@ -2240,7 +2398,7 @@ func TestBuildOperation_PostDedupArrayStillDetected(t *testing.T) {
 			MultiValueQueryKeys: map[string]bool{"tag": true},
 		},
 	}
-	op := buildOperation(endpointKey{path: "/items", method: "get"}, group, false)
+	op := buildOperation(endpointKey{path: "/items", method: "get"}, group, false, nil)
 	require.NotNil(t, op)
 	require.Len(t, op.Parameters, 1)
 	p := op.Parameters[0].Value

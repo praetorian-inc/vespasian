@@ -125,6 +125,13 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 		classified = classify.Deduplicate(classified)
 	}
 
+	// Resolved once and shared by the probe-stage cross-origin gate below and
+	// the REST generator's servers/info.title derivation (SEC-BE-001/
+	// SEC-BE-002), so the two stages never independently derive "the target
+	// origin" and risk disagreeing. See crawl.ResolveTargetOrigin's doc
+	// comment.
+	targetOrigin := crawl.ResolveTargetOrigin(opts.TargetURL, requests)
+
 	writeStatus(opts.Status, "classified %d API requests (threshold=%.2f)\n", len(classified), opts.Confidence)
 	logClassificationReasons(opts.Status, classified)
 
@@ -198,7 +205,6 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 		cfg.URLValidator = newFullURLValidator(cfg.URLValidator)
 
 		if !opts.AllowCrossOriginProbe {
-			targetOrigin := crawl.ResolveTargetOrigin(opts.TargetURL, requests)
 			// originIsDerived keys the (lazy) derived-origin warning on
 			// whether opts.TargetURL actually pinned targetOrigin
 			// (SEC-BE-002), not merely on opts.TargetURL being non-empty: an
@@ -250,6 +256,7 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 	gen, err := generate.GetWithOptions(opts.APIType, generate.Options{
 		MergeSlugs:    opts.MergeSlugs,
 		SlugThreshold: opts.SlugThreshold,
+		TargetOrigin:  targetOrigin,
 	})
 	if err != nil {
 		return nil, err

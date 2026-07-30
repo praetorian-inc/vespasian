@@ -174,7 +174,7 @@ func synthBody(fields []string) []byte {
 // parsed form carries userinfo it is rejected, and if it carries a host it must be
 // http(s).
 //
-// Three rules:
+// Four rules:
 //  1. Byte policy (crawl.IsPrintableASCIIURL) — no raw non-ASCII or control bytes
 //     and no percent-escape decoding to them, so a hostile bundle cannot make a
 //     spec path key or servers entry render differently from its bytes
@@ -184,10 +184,18 @@ func synthBody(fields []string) []byte {
 //     ssrf.ValidateURL never inspects u.User and probe.Config.AuthHeaders is set
 //     by no non-test caller, so net/http would derive `Authorization: Basic` from
 //     req.URL.User on every probe (SEC-BE-001).
-//  3. A URL that carries a host must be http or https. This catches the
-//     scheme-relative form (host set, scheme empty) and any other scheme that
-//     reached this point. A purely relative path (no host, no scheme) is fine and
-//     is the common case.
+//  3. No opaque part (url.URL.Opaque != ""). An opaque URL ("scheme:opaque-data",
+//     e.g. "mailto:x@y.com" or "https:api/x") carries neither a host nor a
+//     resolvable path, so it can never be a real spec-safe endpoint.
+//  4. A URL that carries a host must be http or https (catches the
+//     scheme-relative form — host set, scheme empty — and any other scheme
+//     reaching this point); AND an http(s)-scheme URL must carry a host (LAB-4992
+//     review: "https:/api/x" parses to Scheme="https", Host="" — a single slash
+//     after the scheme is not an authority marker — and the pre-fix rule below
+//     only fired when Host != "", so this host-less "absolute" slipped through
+//     and, once passed to extractServers, produced the degenerate "https://"
+//     server entry that sorts before every real host and blanks info.title). A
+//     purely relative path (no host, no scheme) is fine and is the common case.
 func specSafeURL(raw string) bool {
 	if !crawl.IsPrintableASCIIURL(raw) {
 		return false
@@ -199,7 +207,14 @@ func specSafeURL(raw string) bool {
 	if u.User != nil {
 		return false
 	}
-	if u.Host != "" && u.Scheme != "http" && u.Scheme != "https" {
+	if u.Opaque != "" {
+		return false
+	}
+	isHTTPScheme := u.Scheme == "http" || u.Scheme == "https"
+	if u.Host != "" && !isHTTPScheme {
+		return false
+	}
+	if isHTTPScheme && u.Host == "" {
 		return false
 	}
 	return true

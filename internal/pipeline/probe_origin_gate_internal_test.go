@@ -15,7 +15,9 @@
 package pipeline
 
 import (
+	"bytes"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -92,4 +94,33 @@ func TestNewFullURLValidator_NilBaseFallsBackToProbeValidateProbeURL(t *testing.
 		"which rejects a loopback candidate")
 	assert.NotContains(t, err.Error(), "parse-time validation",
 		"the error must come from the SSRF fallback branch, not the parse-time gate")
+}
+
+// TestNewCrossOriginValidator_DerivedOriginWarningFiresOnlyOnce is the
+// white-box regression test for the ONCE-ONLY half of the derived-origin
+// warning (TEST-001 review finding): the LAZINESS half (nothing printed until
+// a candidate is actually rejected) is already covered black-box by
+// TestClassifyProbeGenerate_AllSameOriginNoTargetURLStaysQuiet
+// (probe_origin_gate_test.go), but no test previously drove the closure past
+// a SECOND cross-origin rejection with originIsDerived true, so the
+// `!warnedDerivedOrigin` term guarding repeat emission was unconstrained --
+// deleting it would let the warning print once per rejected origin instead of
+// once per validator lifetime (stderr spam). This calls newCrossOriginValidator
+// directly with originIsDerived=true and drives the returned closure through
+// TWO distinct cross-origin hosts, asserting the derived-origin warning line
+// appears exactly once despite two rejections.
+func TestNewCrossOriginValidator_DerivedOriginWarningFiresOnlyOnce(t *testing.T) {
+	base := func(string) error { return nil }
+	var warnings bytes.Buffer
+
+	validate := newCrossOriginValidator(base, "http://target.example:80", true, &warnings)
+
+	err1 := validate("http://attacker1.example/api/v1/collect")
+	require.Error(t, err1, "a cross-origin candidate must be rejected")
+	err2 := validate("http://attacker2.example/api/v1/exfiltrate")
+	require.Error(t, err2, "a second, distinct cross-origin candidate must also be rejected")
+
+	assert.Equal(t, 1, strings.Count(warnings.String(), "WARNING: --target-url not set"),
+		"the derived-origin warning must fire exactly once across the validator's lifetime, "+
+			"even though two distinct cross-origin hosts were rejected")
 }
