@@ -116,10 +116,26 @@ type OpenAPIGenerator struct {
 // schema model uses `*bool` for tri-state, requiring an addressable value.
 var explodeTrue = true
 
-// endpointKey groups endpoints by normalized path and HTTP method.
+// endpointKey groups endpoints by normalized path, HTTP method, AND origin
+// (scheme://host, via originFromURL).
+//
+// SEC-BE-001 (LAB-4992 review): classify.Deduplicate keys on method+path
+// (host-agnostic), NormalizePathsWithNames' numeric-ID detection runs
+// unconditionally, and (pre-fix) groupEndpoints itself keyed only on
+// {path, method} — so a group could silently mix endpoints observed on
+// different origins. buildOperation's per-operation servers override then
+// derived its answer from group[0].URL alone, which is attacker-steerable:
+// depending on which hostname happened to sort first, either an attacker
+// origin overrode a real endpoint's origin, or an attacker-planted path was
+// silently attributed to the trusted host. Folding origin into the key makes
+// a mixed-origin group impossible — every group now shares exactly one
+// origin, so the override (or lack of one) is always correct for its group.
+// Generate resolves the resulting (path, method) slot collisions
+// deterministically (see the keys sort in Generate).
 type endpointKey struct {
 	path   string
 	method string
+	origin string
 }
 
 // APIType returns the API type.
@@ -188,6 +204,15 @@ func canonicalizeOrigin(origin string) (string, bool) {
 // serve it (SEC-BE-001). buildOperation now closes that gap with a
 // per-operation servers override for any endpoint whose origin is in the
 // excluded set this function returns.
+//
+// SEC-BE-001 follow-up (LAB-4992 review): the override above was itself
+// exploitable, because classify.Deduplicate, NormalizePathsWithNames, and
+// (formerly) groupEndpoints all group host-agnostically — a single group
+// could silently mix endpoints from different origins, and the override
+// derived its answer from an arbitrary member of that mixed group. origin is
+// now part of endpointKey (see its doc comment) so a group can never mix
+// origins; Generate resolves the resulting (path, method) slot collisions by
+// letting the primary/trusted origin's group win deterministically.
 //
 // Derivation:
 //  1. primary origin = targetOrigin if it parses to a usable http(s) origin;
@@ -327,7 +352,10 @@ func groupEndpoints(endpoints []classify.ClassifiedRequest, opts NormalizeOption
 
 	endpointGroups := make(map[endpointKey][]classify.ClassifiedRequest)
 	for _, p := range parsed {
-		key := endpointKey{normalized[p.path], strings.ToLower(p.endpoint.Method)}
+		// origin ("" if unparseable/host-less) is part of the key (SEC-BE-001)
+		// so a group can never mix endpoints from different origins.
+		origin, _ := originFromURL(p.endpoint.URL)
+		key := endpointKey{path: normalized[p.path], method: strings.ToLower(p.endpoint.Method), origin: origin}
 		endpointGroups[key] = append(endpointGroups[key], p.endpoint)
 	}
 	return endpointGroups
@@ -468,11 +496,12 @@ func mergeJSONBodies(bodies [][]byte) *openapi3.SchemaRef {
 //
 // excludedOrigins is the set of origins extractServers excluded from the
 // global servers list (cross-origin JS-static candidates, SEC-BE-001). When
-// the group's own origin (taken from its first entry, deterministic after the
-// sort below) is in that set, the operation gets a per-operation `servers`
-// override naming its own origin — otherwise groupEndpoints would still emit
-// this path under the single global server, silently attributing a recovered
-// path to a host that does not serve it.
+// the group's own origin (key.origin — every entry in the group shares this
+// origin since origin is now part of endpointKey) is in that set, the
+// operation gets a per-operation `servers` override naming its own origin —
+// otherwise groupEndpoints would still emit this path under the single
+// global server, silently attributing a recovered path to a host that does
+// not serve it.
 func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSource bool, excludedOrigins map[string]bool) *openapi3.Operation { //nolint:gocyclo // OpenAPI operation builder
 	operation := &openapi3.Operation{
 		Summary:   capitalizeFirst(key.method) + " " + key.path,
@@ -511,12 +540,10 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 	// SEC-BE-001: a cross-origin JS-static endpoint's origin was excluded from
 	// the global servers list by extractServers; give the operation its own
 	// `servers` override so it is never silently attributed to the primary
-	// host. The group's origin is taken from its first (deterministically
-	// sorted, above) entry.
-	if len(excludedOrigins) > 0 {
-		if origin, ok := originFromURL(group[0].URL); ok && excludedOrigins[origin] {
-			operation.Servers = &openapi3.Servers{&openapi3.Server{URL: origin}}
-		}
+	// host. key.origin is authoritative for the whole group (origin is part
+	// of endpointKey), so no mixed-origin group can produce a wrong answer.
+	if key.origin != "" && excludedOrigins[key.origin] {
+		operation.Servers = &openapi3.Servers{&openapi3.Server{URL: key.origin}}
 	}
 
 	// --- Query parameters: collect union from all endpoints, track frequency, values, and multi-value ---
@@ -796,6 +823,32 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 	return operation
 }
 
+// recordCollisionOrigin records, on the winning operation of a (path,
+// method) slot collision (SEC-BE-001), the origin of a group that lost that
+// collision and so could not be emitted. There is exactly one Operation slot
+// per (path, method) in doc.Paths, so the losing group's endpoint cannot be
+// represented as its own operation — but its loss must never be silent.
+// x-vespasian-collision-origins lists every suppressed origin, deduplicated
+// and sorted for determinism, in the same extension style as
+// x-vespasian-source.
+func recordCollisionOrigin(winner *openapi3.Operation, origin string) {
+	if winner.Extensions == nil {
+		winner.Extensions = map[string]any{}
+	}
+	var existing []string
+	if v, ok := winner.Extensions["x-vespasian-collision-origins"].([]string); ok {
+		existing = v
+	}
+	for _, o := range existing {
+		if o == origin {
+			return
+		}
+	}
+	existing = append(existing, origin)
+	sort.Strings(existing)
+	winner.Extensions["x-vespasian-collision-origins"] = existing
+}
+
 // Generate produces an OpenAPI specification.
 func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]byte, error) { //nolint:gocyclo // top-level generation orchestration
 	if len(endpoints) == 0 {
@@ -824,7 +877,23 @@ func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]b
 	// output is byte-identical to pre-LAB-2108 when --analyze-js is not in use.
 	staticPresent := anyStaticSource(endpoints)
 
-	// Sort endpoint keys for deterministic output
+	// primaryOrigin is the origin extractServers placed at servers[0] (the
+	// vouched TargetOrigin if usable, else the lowest-sorted dynamically
+	// observed origin, else "" when the run cannot vouch for anything). Used
+	// below to make the (path, method) slot collision below resolve to the
+	// trusted origin, not to whichever origin's endpoint happened to sort
+	// first alphabetically.
+	primaryOrigin := ""
+	if len(servers) > 0 {
+		primaryOrigin = servers[0].URL
+	}
+
+	// Sort endpoint keys for deterministic output. SEC-BE-001: origin is now
+	// part of endpointKey, so two groups can share a (path, method) slot in
+	// doc.Paths (only one can occupy it — see the collision handling below).
+	// The primary origin sorts first for a shared (path, method) so it always
+	// wins that slot, independent of capture order (LAB-4678) and independent
+	// of which origin's hostname happens to sort first alphabetically.
 	keys := make([]endpointKey, 0, len(endpointGroups))
 	for k := range endpointGroups {
 		keys = append(keys, k)
@@ -833,20 +902,50 @@ func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]b
 		if keys[i].path != keys[j].path {
 			return keys[i].path < keys[j].path
 		}
-		return keys[i].method < keys[j].method
+		if keys[i].method != keys[j].method {
+			return keys[i].method < keys[j].method
+		}
+		iPrimary := keys[i].origin == primaryOrigin
+		jPrimary := keys[j].origin == primaryOrigin
+		if iPrimary != jPrimary {
+			return iPrimary
+		}
+		return keys[i].origin < keys[j].origin
 	})
+
+	// occupiedSlots tracks which (path, method) slot each already-built
+	// operation occupies, so a later colliding group (same path+method,
+	// different origin) is detected rather than silently overwriting the
+	// winner set by the sort above.
+	type slot struct{ path, method string }
+	occupiedSlots := make(map[slot]*openapi3.Operation)
 
 	// Build paths
 	for _, key := range keys {
 		group := endpointGroups[key]
+
+		// Build operation from group
+		operation := buildOperation(key, group, staticPresent, excludedOrigins)
+
+		s := slot{key.path, key.method}
+		if winner, collided := occupiedSlots[s]; collided {
+			// SEC-BE-001: two groups (distinct origins) normalized to the
+			// same (path, method) slot; only one Operation fits in
+			// doc.Paths. The sort above guarantees `winner` is the
+			// primary-origin (or otherwise deterministic) group — this
+			// later group must not clobber it. The loss is made visible on
+			// the winning operation (same style as x-vespasian-source)
+			// rather than silently discarded.
+			recordCollisionOrigin(winner, key.origin)
+			continue
+		}
+		occupiedSlots[s] = operation
+
 		pathItem := doc.Paths.Find(key.path)
 		if pathItem == nil {
 			pathItem = &openapi3.PathItem{}
 			doc.Paths.Set(key.path, pathItem)
 		}
-
-		// Build operation from group
-		operation := buildOperation(key, group, staticPresent, excludedOrigins)
 
 		// Set operation for the method
 		switch key.method {

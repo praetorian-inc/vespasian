@@ -32,8 +32,15 @@
 //     review). Such a host is not silently relabelled either: the endpoints on
 //     it keep their real origin via a per-operation `servers` override, so a
 //     recovered path is never attributed to a host that does not serve it
-//     (SEC-BE-001). static:html is deliberately NOT treated as JS-static here —
-//     the page carrying the form was fetched over the wire during the crawl.
+//     (SEC-BE-001). Grouping is origin-aware (origin is part of the internal
+//     endpointKey), so a group can never mix endpoints from different
+//     origins and the override is always correct for its group; when two
+//     groups' normalized path+method collide across origins, the
+//     primary/trusted origin's operation deterministically wins that slot,
+//     and the suppressed group is recorded (not silently dropped) via the
+//     `x-vespasian-collision-origins` extension on the winning operation.
+//     static:html is deliberately NOT treated as JS-static here — the page
+//     carrying the form was fetched over the wire during the crawl.
 //   - [NormalizePathsWithNames] is the primary normalization entry point. It
 //     accepts a population of observed paths and returns a map of input path
 //     to template path, performing both single-path regex detection (UUIDs,

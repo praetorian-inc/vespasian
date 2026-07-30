@@ -457,6 +457,28 @@ func TestOpenAPIGenerator_MultipleServers(t *testing.T) {
 	}
 }
 
+// TestExtractServers_ProductionOriginShapeStripsDefaultPort is TEST-001
+// (LAB-4992 review): crawl.ResolveTargetOrigin -> originOf ALWAYS makes the
+// port explicit, so in production TargetOrigin arrives as "https://host:443"
+// or "http://host:80", never a bare "https://host". Without
+// canonicalizeOrigin's default-port strip, that explicit-port TargetOrigin
+// would never string-equal the port-free origin originFromURL derives from
+// the SAME host's observed endpoint URL, producing two server entries for one
+// host and a titleHost with the port baked in (doc comment's exact claim).
+// This test uses that PRODUCTION shape directly, rather than a bare-host
+// TargetOrigin as most other tests do.
+func TestExtractServers_ProductionOriginShapeStripsDefaultPort(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://www.example.com/api/users", ""),
+	}
+
+	servers, titleHost, _ := extractServers(endpoints, "https://www.example.com:443")
+
+	require.Len(t, servers, 1, "the explicit-port TargetOrigin must dedupe against the same host's observed origin, not produce a second entry")
+	assert.Equal(t, "https://www.example.com", servers[0].URL, "the default port must be stripped from the server URL")
+	assert.Equal(t, "www.example.com API", titleHost, "the default port must be stripped from info.title's host")
+}
+
 // SEC-BE-003/SEC-BE-002: a cross-origin static:js candidate is never probed
 // (the probe egress gate only prevents the REQUEST; extractServers must
 // independently exclude it from the DELIVERABLE). The attacker host is chosen
@@ -490,22 +512,35 @@ func TestExtractServers_JSStaticCrossOriginExcluded(t *testing.T) {
 // "a.attacker.example" sorts before "www.example.com", so this test fails
 // under the pre-fix behavior.
 //
-// Without a TargetOrigin the run cannot vouch for EITHER host from this
-// endpoint set alone (both are equally unprobed), so the assertion is
-// necessarily negative: the attacker host must never surface, in servers or
-// in the title.
+// TEST-003 fix (LAB-4992 review): the original version of this test asserted
+// only `for _, s := range servers { assert.NotEqual(...) }` and
+// `assert.NotContains(titleHost, "attacker")`. In this exact branch — no
+// TargetOrigin, zero dynamically observed endpoints — servers is empty, so
+// the range loop body never executes and its assertion is vacuous (asserts
+// nothing). This version asserts the ACTUAL, POSITIVE contract instead: with
+// no vouched origin available at all, choosePrimaryOrigin returns "" and
+// BOTH JS-static origins are excluded (neither can be admitted as
+// same-origin with an empty primary) — servers is empty and titleHost falls
+// back to the bare default. This is a deliberately defensive branch: in the
+// real pipeline, crawl.ResolveTargetOrigin's third fallback means primary is
+// essentially always non-empty, so a fully-offline capture with a TRULY empty
+// primary is an edge case exercised directly by this unit test, not the
+// common path. Whether "no vouched origin -> empty servers" is the right
+// call is pinned here deliberately, positively, and explicitly — not left
+// implicit.
 func TestExtractServers_FullyOfflineAllJSStatic_NoTargetOriginExcludesAttacker(t *testing.T) {
 	endpoints := []classify.ClassifiedRequest{
 		makeClassified("GET", "https://www.example.com/api/x", "static:js"),
 		makeClassified("GET", "https://a.attacker.example/api/collect", "static:js"),
 	}
 
-	servers, titleHost, _ := extractServers(endpoints, "")
+	servers, titleHost, excluded := extractServers(endpoints, "")
 
-	for _, s := range servers {
-		assert.NotEqual(t, "https://a.attacker.example", s.URL, "attacker origin must never appear in servers")
-	}
-	assert.NotContains(t, titleHost, "attacker", "attacker origin must never appear in info.title")
+	assert.Empty(t, servers, "with no vouched origin at all, servers must be empty rather than trusting any unprobed JS-static host")
+	assert.True(t, excluded["https://www.example.com"], "the legitimate host must be reported as excluded (unprobed, no primary to be same-origin with)")
+	assert.True(t, excluded["https://a.attacker.example"], "the attacker host must be reported as excluded")
+	assert.Len(t, excluded, 2, "both origins, and only both, must be reported as excluded")
+	assert.Equal(t, "API", titleHost, "with no usable origin, title must fall back to the bare default")
 }
 
 // TestExtractServers_FullyOfflineAllJSStatic_WithTargetOriginPinsLegit is the
@@ -606,6 +641,29 @@ func TestExtractServers_StaticHTMLCarveOut(t *testing.T) {
 	assert.Empty(t, excluded, "static:html must never be reported as an excluded (cross-origin JS-static) origin")
 }
 
+// TestExtractServers_SameOriginJSStaticAdmitted is TEST-002 (LAB-4992 review):
+// the common offline-SPA case is a JS-static endpoint recovered on the SAME
+// origin as the trusted primary (e.g. a bundle literal for a same-host API
+// path never triggered during the crawl). extractServers's admission arm
+// (primary != "" && crawl.SameOrigin(origin, primary)) must add that origin
+// to servers via the ordinary addServer path (a no-op dedup here, since the
+// origin is identical to primary) and must NOT report it as excluded —
+// neutralizing this arm would flag the TRUSTED origin itself as excluded and
+// give every offline-recovered, same-origin operation a redundant
+// per-operation override.
+func TestExtractServers_SameOriginJSStaticAdmitted(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://www.example.com/api/users", ""),
+		makeClassified("GET", "https://www.example.com/api/offline-only", "static:js"),
+	}
+
+	servers, _, excluded := extractServers(endpoints, "https://www.example.com")
+
+	require.Len(t, servers, 1, "the same-origin JS-static endpoint must not produce a second server entry")
+	assert.Equal(t, "https://www.example.com", servers[0].URL)
+	assert.False(t, excluded["https://www.example.com"], "the trusted, same-origin host must never be reported as excluded")
+}
+
 // TestBuildOperation_CrossOriginJSStaticGetsPerOperationServersOverride is the
 // SEC-BE-001 regression guard: groupEndpoints groups purely by normalized path
 // and method, ignoring host, so a JS-static endpoint recovered on a different
@@ -616,6 +674,16 @@ func TestExtractServers_StaticHTMLCarveOut(t *testing.T) {
 // follow-up testing at the wrong target. This asserts the operation carries
 // its own servers override naming its actual origin, and that the global
 // servers list never contains that origin.
+//
+// TEST-004 (LAB-4992 review): the original version of this test asserted
+// only the POSITIVE half — the excluded operation gets an override. It used
+// disjoint paths (/api/users vs. /api/orders), so nothing here ever checked
+// that a NON-excluded operation (the /api/users one, on the primary origin)
+// carries NO override. Dropping the `&& excludedOrigins[origin]` half of
+// buildOperation's membership test would give every non-excluded operation a
+// spurious override too, undetected by the original assertions. This version
+// adds that missing negative assertion directly (KISS: reusing this test's
+// existing fixture rather than adding a near-duplicate sibling test).
 func TestBuildOperation_CrossOriginJSStaticGetsPerOperationServersOverride(t *testing.T) {
 	endpoints := []classify.ClassifiedRequest{
 		makeClassified("GET", "https://app.example.com/api/users", ""),
@@ -648,6 +716,77 @@ func TestBuildOperation_CrossOriginJSStaticGetsPerOperationServersOverride(t *te
 	require.True(t, ok, "expected /api/orders path in the spec")
 	require.Len(t, ordersOp.Get.Servers, 1, "cross-origin operation must carry a per-operation servers override")
 	assert.Equal(t, "https://api.example.com", ordersOp.Get.Servers[0].URL)
+
+	usersOp, ok := parsed.Paths["/api/users"]
+	require.True(t, ok, "expected /api/users path in the spec")
+	assert.Empty(t, usersOp.Get.Servers, "a non-excluded (primary-origin) operation must carry NO servers override")
+}
+
+// TestGenerate_CollisionTrustedOriginWinsSlot is the SEC-BE-001 fix
+// verification. classify.Deduplicate, NormalizePathsWithNames, and (pre-fix)
+// groupEndpoints all key host-agnostically, so a REAL endpoint observed on the
+// trusted origin and an attacker-planted JS-static literal on a different
+// origin can normalize to the exact same path+method. Pre-fix, both
+// observations landed in a single group and buildOperation derived the
+// per-operation override from group[0].URL alone — sort order decided
+// whether the attacker origin silently overrode the trusted one, or the
+// attacker path was silently attributed to the trusted host, depending only
+// on which hostname happened to sort first.
+//
+// With origin folded into endpointKey, these two observations can no longer
+// share a group — they now collide on the same (path, method) SLOT in
+// doc.Paths instead. This test asserts the deterministic resolution: the
+// trusted (primary) origin's operation always wins the slot regardless of
+// which hostname sorts first, and the attacker origin never appears in any
+// operation's servers override anywhere in the document.
+func TestGenerate_CollisionTrustedOriginWinsSlot(t *testing.T) {
+	// "a.evil.example" sorts BEFORE "app.example.com" alphabetically, so this
+	// case would have made the attacker origin win under the old
+	// group[0]-based logic.
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://app.example.com/api/users/42", ""),
+		makeClassified("GET", "https://a.evil.example/api/users/7", "static:js"),
+	}
+
+	gen := &OpenAPIGenerator{Format: "yaml", TargetOrigin: "https://app.example.com:443"}
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err)
+
+	var parsed struct {
+		Servers []struct {
+			URL string `yaml:"url"`
+		} `yaml:"servers"`
+		Paths map[string]struct {
+			Get struct {
+				Servers []struct {
+					URL string `yaml:"url"`
+				} `yaml:"servers"`
+			} `yaml:"get"`
+		} `yaml:"paths"`
+	}
+	require.NoError(t, yaml.Unmarshal(spec, &parsed))
+
+	for _, s := range parsed.Servers {
+		assert.NotEqual(t, "https://a.evil.example", s.URL, "attacker origin must never appear in the global servers list")
+	}
+	for path, pathItem := range parsed.Paths {
+		for _, s := range pathItem.Get.Servers {
+			assert.NotEqual(t, "https://a.evil.example", s.URL, "attacker origin must never appear in any operation's servers override (path %s)", path)
+		}
+	}
+
+	// Both endpoints normalize to the same path+method, so exactly one Get
+	// operation slot must exist for it, and it must belong to the trusted
+	// origin (no per-operation override needed since it IS the primary).
+	require.Len(t, parsed.Paths, 1, "both observations must collide onto a single path slot")
+	for _, pathItem := range parsed.Paths {
+		assert.Empty(t, pathItem.Get.Servers, "the trusted-origin operation that wins the slot must not carry a spurious servers override")
+	}
+
+	// The suppressed attacker-origin group must not be silently discarded —
+	// the collision loss must be recorded visibly on the winning operation.
+	assert.Contains(t, string(spec), "x-vespasian-collision-origins", "the suppressed cross-origin group's loss must be recorded visibly, not silently dropped")
+	assert.Contains(t, string(spec), "a.evil.example", "the recorded collision must name the suppressed origin")
 }
 
 func TestP0Fixes_ContextAwarePathParams(t *testing.T) {
