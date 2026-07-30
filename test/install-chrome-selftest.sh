@@ -63,11 +63,50 @@ assert_contains "case a: --help includes the first header line" \
     "Installs a real, non-snap Google Chrome" "${help_out}"
 assert_contains "case a: --help includes the last header line" \
     "install if needed" "${help_out}"
-if printf '%s' "${help_out}" | grep -q "set -euo pipefail"; then
-    echo "FAIL: case a: --help spilled past the header into script body"
+# Overrun check. An earlier version grepped for "set -euo pipefail" here, which
+# was VACUOUS: the awk walk only ever prints lines matching /^#/, so a
+# non-comment line can never appear no matter how far the walk runs. Dropping
+# the `{ exit }` grew --help from 56 to 101 lines with every assertion still
+# green. The real failure mode is column-0 comments from further down the file
+# leaking in, so the sentinel has to be one of those.
+#
+# OVERRUN_SENTINEL is asserted to still EXIST in the source first — otherwise a
+# reword would silently disarm this check rather than failing it.
+OVERRUN_SENTINEL="signature check ornamental"
+if grep -qF -- "${OVERRUN_SENTINEL}" "${INSTALL_SCRIPT}"; then
+    echo "PASS: case a: overrun sentinel still present in the source (check has teeth)"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case a: overrun sentinel '${OVERRUN_SENTINEL}' no longer in install-chrome.sh — pick a new one"
+    fail_count=$((fail_count + 1))
+fi
+if printf '%s' "${help_out}" | grep -qF -- "${OVERRUN_SENTINEL}"; then
+    echo "FAIL: case a: --help ran past the header into body comments"
     fail_count=$((fail_count + 1))
 else
     echo "PASS: case a: --help stops at the end of the header comment block"
+    pass_count=$((pass_count + 1))
+fi
+# Positive end-pin: the last non-blank line must still be the usage example.
+assert_contains "case a: --help ends on the usage line" \
+    "install if needed" "$(printf '%s' "${help_out}" | grep -v '^[[:space:]]*$' | tail -1)"
+
+# ── Case a2: the script is committed executable ────────────────
+# setup-live-targets.sh's browserless hint tells operators to run
+# `./test/install-chrome.sh` directly. A lost exec bit makes that rc=126 while
+# every other case here still passes, because they all invoke it via `bash`.
+#
+# Asserted against the GIT INDEX mode, not `[ -x ]`, for two reasons. First,
+# the committed mode is what actually reaches other clones and CI — a
+# working-tree chmod that was never staged helps nobody. Second, `[ -x ]` is
+# not trustworthy here: on the overlay filesystem this devcontainer uses it
+# returned true for this very file while it sat at mode 644 and `./` gave 126.
+# Skips cleanly outside a git checkout rather than failing spuriously.
+if git -C "${SCRIPT_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    mode=$(git -C "${SCRIPT_DIR}" ls-files -s -- install-chrome.sh | awk '{print $1}')
+    assert_eq "case a2: install-chrome.sh is committed executable (100755)" "100755" "${mode}"
+else
+    echo "PASS: case a2: skipped (not a git checkout)"
     pass_count=$((pass_count + 1))
 fi
 
