@@ -26,6 +26,15 @@ INSTALL_SCRIPT="${SCRIPT_DIR}/install-chrome.sh"
 
 pass_count=0
 fail_count=0
+skip_count=0
+
+# A check that could not run is NOT a pass. Tallied separately so the summary
+# distinguishes "verified" from "unverifiable here", following the
+# pass/fail/skip precedent in test/run-live-tests.sh's result table.
+skip() {
+    echo "SKIP: $1"
+    skip_count=$((skip_count + 1))
+}
 
 assert_eq() {
     local desc=$1 expected=$2 actual=$3
@@ -106,21 +115,18 @@ if git -C "${SCRIPT_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     mode=$(git -C "${SCRIPT_DIR}" ls-files -s -- install-chrome.sh | awk '{print $1}')
     assert_eq "case a2: install-chrome.sh is committed executable (100755)" "100755" "${mode}"
 else
-    echo "PASS: case a2: skipped (not a git checkout)"
-    pass_count=$((pass_count + 1))
+    # SKIP, not PASS: a git-less copy (tarball, `git archive`, docker COPY
+    # without .git) cannot answer this, and counting it as a pass made the
+    # summary indistinguishable from a real run.
+    skip "case a2: committed-mode check (not a git checkout)"
 fi
 
-# The index mode above is what SHIPS; this is what the operator in front of a
-# browserless container actually types. They are not the same check: with
-# core.fileMode=false a working-tree `chmod -x` leaves the index at 100755 and
-# `git status` empty, so the index assertion stays green while ./ returns 126.
-# Every other case here invokes the script through `bash`, which is precisely
-# how the original exec-bit regression stayed hidden — so invoke it the
-# operator's way, once.
-# Invoked as "${INSTALL_SCRIPT}" — an ABSOLUTE path, and deliberately NOT
-# `bash "${INSTALL_SCRIPT}"`: only a direct exec consults the mode bit. Absolute
-# rather than ./test/... so the suite behaves the same run from the repo root or
-# from inside test/.
+# Direct-exec companion to the index check above (see its rationale); this one
+# covers core.fileMode=false's blind spot, where a working-tree `chmod -x`
+# leaves the index at 100755 and `git status` empty while ./ returns 126.
+# Invoked via the ABSOLUTE "${INSTALL_SCRIPT}" and deliberately NOT through
+# `bash`: only a direct exec consults the mode bit, and an absolute path keeps
+# the result identical from the repo root or from inside test/.
 "${INSTALL_SCRIPT}" --help >/dev/null 2>&1 && direct_rc=0 || direct_rc=$?
 assert_eq "case a2: install-chrome.sh runs by direct exec, not 126" "0" "${direct_rc}"
 
@@ -324,5 +330,5 @@ assert_eq "case h: neither signal means NOT a container (cache is left alone)" \
 
 # ── Summary ─────────────────────────────────────────────────────
 echo ""
-echo "install-chrome-selftest: ${pass_count} passed, ${fail_count} failed"
+echo "install-chrome-selftest: ${pass_count} passed, ${fail_count} failed, ${skip_count} skipped"
 [ "${fail_count}" -eq 0 ]
