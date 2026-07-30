@@ -221,25 +221,31 @@ func extractServers(endpoints []classify.ClassifiedRequest, targetOrigin string)
 		addServer(origin)
 	}
 
-	// excluded means "this run cannot vouch for the origin", NOT "a bundle
-	// mentioned it" (SEC-BE-002, LAB-4992 review). collectEndpointOrigins
-	// buckets an origin into observedOrigins and jsStaticOrigins
-	// INDEPENDENTLY, so the same origin can be in both: genuinely observed on
-	// the wire AND also named by a bundle literal. serverSet already holds
-	// every origin vouched for above (the primary plus each observed origin),
-	// so consulting it here keeps a bundle from demoting a real observation.
-	// Without that check, a bundle served from app.example.com that merely
-	// references https://api.example.com/... — which any ordinary SPA does —
-	// marked api.example.com excluded, dropping it to trustRank 2 alongside
-	// genuinely untrusted origins and handing a colliding slot back to the
-	// attacker-steerable origin byte-compare that trustRank exists to remove.
+	// "excluded" means unvouched, not merely bundle-mentioned — see the
+	// package doc comment for the full semantic contract (SEC-BE-002). The
+	// mechanism: serverSet already holds every origin vouched for above (the
+	// primary plus each observed origin), so an origin collectEndpointOrigins
+	// also placed in jsStaticOrigins (i.e. named by a bundle literal) is only
+	// excluded when it is NOT already in serverSet.
+	//
+	// This is a two-arm switch, not three (round-23 review, finding A): a
+	// prior version had a third arm admitting a jsStaticOrigin that was
+	// merely crawl.SameOrigin with primary, even when not in serverSet. That
+	// arm was unreachable dead code — primary and every jsStaticOrigin are
+	// both crawl.CanonicalOrigin outputs (collectEndpointOrigins,
+	// choosePrimaryOrigin), CanonicalOrigin is idempotent, and
+	// crawl.SameOrigin over two CanonicalOrigin outputs can only agree with
+	// plain string equality (TestCanonicalOrigin_SameOriginImpliesEquality,
+	// pkg/crawl) — so `SameOrigin(origin, primary)` true implies
+	// `origin == primary`, and primary is unconditionally added to serverSet
+	// before this loop runs (addServer(primary) above), meaning the
+	// `serverSet[origin]` arm above always matches first. Do not restore a
+	// same-origin admission arm here without first breaking that invariant.
 	excluded := make(map[string]bool)
 	for _, origin := range sortedCopy(jsStaticOrigins) {
 		switch {
 		case serverSet[origin]:
 			// Already vouched for; a bundle naming it changes nothing.
-		case primary != "" && crawl.SameOrigin(origin, primary):
-			addServer(origin)
 		default:
 			excluded[origin] = true
 		}

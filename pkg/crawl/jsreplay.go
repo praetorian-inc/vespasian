@@ -672,22 +672,57 @@ func defaultPortForScheme(scheme string) string {
 // observation and an attacker-authored candidate on a different IPv6 literal
 // silently merge into one endpointKey.origin in pkg/generate/rest, and it
 // made the emitted `servers` URL and `info.title` syntactically invalid for
-// IPv6 (a bracket-less "https://2001:db8::1:8443" is not a valid URL). The
-// bracket check is keyed on ":" appearing in the hostname — an IPv4 or DNS
-// hostname never contains ":", so this is a no-op for every non-IPv6 host.
+// IPv6 (a bracket-less "https://2001:db8::1:8443" is not a valid URL).
+//
+// SEC-BE (round-23 review): the re-bracketing decision is keyed on whether
+// url.Parse itself bracketed u.Host (strings.HasPrefix(u.Host, "[")), NOT on
+// whether Hostname() merely contains a ":". The two differ for a host that is
+// not actually an IP literal:
+//   - "https://foo:bar:80/api/x" is a malformed authority, not an IPv6
+//     literal — url.Parse never bracketed it (u.Host == "foo:bar:80"), but
+//     Hostname() still returns "foo:bar" (containing ":") because Go's
+//     host/port split treats the LAST colon as the port delimiter. The old
+//     `strings.Contains(host, ":")` check re-bracketed this into
+//     "[foo:bar]:80" — a string that does not re-parse as the same origin
+//     (CanonicalOrigin loses idempotency) and was never a legitimate host.
+//   - "https://[fe80::1%25eth0]/x" IS bracketed by url.Parse, but carries an
+//     IPv6 zone ID (link-local scope). Hostname() returns "fe80::1%eth0"; a
+//     "%" is not valid outside percent-encoding in a URL, so re-bracketing it
+//     verbatim produces a string ("https://[fe80::1%eth0]") that is not a
+//     valid URL and does not re-parse either.
+//
+// Both shapes fail closed (return "") rather than emit a value that cannot
+// re-parse: originOf's documented contract is that "" means "no usable
+// origin", which every caller here and in pkg/generate/rest already treats
+// as "skip this candidate" — never as "treat it as same-origin" — so this is
+// the safe direction for a shape this run cannot make sense of. A link-local
+// zone-id address is not a legitimate scan-target origin either. For a
+// genuine bracketed IPv6 literal (no zone ID), the check is a no-op: an IPv4
+// or DNS hostname is never bracketed by url.Parse in the first place.
 func originOf(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Host == "" {
 		return ""
 	}
 	scheme := strings.ToLower(u.Scheme)
+	bracketed := strings.HasPrefix(u.Host, "[")
 	host := strings.ToLower(u.Hostname())
-	if strings.Contains(host, ":") {
-		// IPv6 literal: Hostname() stripped the brackets Host had; put them
-		// back so the origin stays a syntactically valid host and stays
-		// distinguishable from a differently-bracketed spelling of a
-		// similar-looking literal (see doc comment above).
+	switch {
+	case bracketed && strings.Contains(host, "%"):
+		// Bracketed IPv6 literal carrying a zone ID: re-bracketing verbatim
+		// would embed a raw "%", which is invalid in a URL. Fail closed.
+		return ""
+	case bracketed:
+		// Genuine bracketed IPv6 literal: put the brackets Hostname() stripped
+		// back on, so the origin stays syntactically valid and distinguishable
+		// from a differently-bracketed spelling of a similar-looking literal
+		// (see doc comment above).
 		host = "[" + host + "]"
+	case strings.Contains(host, ":"):
+		// Host contains ":" but url.Parse did NOT bracket it: not an IP
+		// literal at all, a malformed authority (see doc comment above). Fail
+		// closed rather than fabricate an invalid, non-reparseable origin.
+		return ""
 	}
 	port := u.Port()
 	if port == "" {
@@ -706,7 +741,10 @@ func originOf(rawURL string) string {
 // a usable http(s) origin with a host present (a host-less "absolute" URL
 // such as "https:/api/x" — a single slash after the scheme is not an
 // authority marker — is rejected here rather than producing a degenerate
-// "https://" origin).
+// "https://" origin). This also covers the two non-IP-literal host shapes
+// originOf fails closed on (SEC-BE, round-23 review): a malformed authority
+// like "foo:bar:80" and a bracketed IPv6 literal carrying a zone ID
+// ("[fe80::1%eth0]") — see originOf's doc comment for why.
 //
 // It shares originOf's lower-casing and default-port equivalence (so
 // "https://h" and "https://h:443" are the same origin), but — unlike

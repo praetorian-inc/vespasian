@@ -593,21 +593,36 @@ func TestExtractServers_HostlessSchemeLiteralRejected(t *testing.T) {
 // the single crawl.CanonicalOrigin (SEC-BE-001/QUAL-001) — there is no
 // longer a "separate arm" per input; both call sites share one guard.
 //
-// CanonicalOrigin itself carries a `u.Host == ""` check, but it is currently
-// redundant defense-in-depth: originOf (which CanonicalOrigin delegates to)
-// has its own independent `u.Host == ""` check, so either one alone already
-// makes CanonicalOrigin("https:/api/x") return "". Deleting only one of the
-// two guards is a SEMANTICALLY EQUIVALENT mutant — the other backstops it,
-// and this test (along with TestCanonicalOrigin and TestOriginOf) stays
-// green. Deleting BOTH guards is the mutation that actually kills this
-// test: CanonicalOrigin then returns the degenerate "https://" for
-// "https:/api/x", which becomes the PRIMARY server — occupying servers[0]
-// and displacing the real observed host — the same degenerate-origin
-// failure SEC-BE-002 closed for bundle literals, just reached through
-// --target-url instead. Verified: removing both guards makes this test fail
-// with servers[0] == "https://" and titleHost == "API" instead of the real
-// observed origin; restoring either guard alone is enough to make it pass
-// again.
+// CanonicalOrigin itself carries a `u.Host == ""` check, and originOf (which
+// CanonicalOrigin delegates to) has its own independent `u.Host == ""`
+// check. These are NOT a symmetric pair of equivalent mutants — verified by
+// deleting each in isolation and running TestOriginOf, TestCanonicalOrigin,
+// and this test:
+//   - Deleting CanonicalOrigin's own guard alone IS semantically equivalent
+//     for all three tests: CanonicalOrigin still calls originOf
+//     unconditionally, and originOf's guard alone already makes
+//     originOf("https:/api/x") — and so CanonicalOrigin("https:/api/x") —
+//     return "". All three tests stay green.
+//   - Deleting originOf's own guard alone is NOT equivalent: TestOriginOf
+//     fails directly, because it exercises originOf itself (same package),
+//     not only through CanonicalOrigin. `originOf("/relative/path")` then
+//     returns "://" instead of "" (confirmed: `expected: "" / actual:
+//     "://"`). TestCanonicalOrigin and this test still stay green, because
+//     CanonicalOrigin's OWN guard short-circuits before ever calling
+//     originOf for a host-less URL — originOf's guard is never reached from
+//     that path, so its deletion is invisible to any test that only goes
+//     through CanonicalOrigin.
+//
+// Deleting BOTH guards is the mutation that kills every one of the three:
+// CanonicalOrigin then returns the degenerate "https://" for "https:/api/x",
+// which becomes the PRIMARY server — occupying servers[0] and displacing the
+// real observed host — the same degenerate-origin failure SEC-BE-002 closed
+// for bundle literals, just reached through --target-url instead. Verified:
+// removing both guards makes this test fail with servers[0] == "https://"
+// and titleHost == "API" instead of the real observed origin; restoring
+// either guard alone is enough to make this test (and TestCanonicalOrigin)
+// pass again — though, per above, restoring originOf's guard alone is also
+// required for TestOriginOf specifically.
 func TestExtractServers_HostlessTargetOriginRejected(t *testing.T) {
 	endpoints := []classify.ClassifiedRequest{
 		makeClassified("GET", "https://legit.example/api/users", ""),
@@ -652,16 +667,21 @@ func TestExtractServers_StaticHTMLCarveOut(t *testing.T) {
 	assert.Empty(t, excluded, "static:html must never be reported as an excluded (cross-origin JS-static) origin")
 }
 
-// TestExtractServers_SameOriginJSStaticAdmitted is TEST-002 (LAB-4992 review):
-// the common offline-SPA case is a JS-static endpoint recovered on the SAME
-// origin as the trusted primary (e.g. a bundle literal for a same-host API
-// path never triggered during the crawl). extractServers's admission arm
-// (primary != "" && crawl.SameOrigin(origin, primary)) must add that origin
-// to servers via the ordinary addServer path (a no-op dedup here, since the
-// origin is identical to primary) and must NOT report it as excluded —
-// neutralizing this arm would flag the TRUSTED origin itself as excluded and
-// give every offline-recovered, same-origin operation a redundant
-// per-operation override.
+// TestExtractServers_SameOriginJSStaticAdmitted is TEST-002 (LAB-4992
+// review), retargeted (round-23 review, finding B): the common offline-SPA
+// case is a JS-static endpoint recovered on the SAME origin as the trusted
+// primary (e.g. a bundle literal for a same-host API path never triggered
+// during the crawl). Its fixture uses "https://www.example.com" for the
+// observed dynamic endpoint, the static:js endpoint, AND TargetOrigin, so
+// this origin is already in serverSet (added for primary, before the
+// exclusion loop runs) by the time the loop reaches it — execution stops at
+// the `serverSet[origin]` arm ("already vouched for; a bundle naming it
+// changes nothing"), NOT at a same-origin admission arm (that arm was
+// removed as unreachable dead code; see TestCanonicalOrigin_SameOriginImpliesEquality
+// in pkg/crawl for why it could never fire). What this test still correctly
+// pins is the observable BEHAVIOR: a JS-static endpoint on the same origin as
+// the trusted primary must not produce a second `servers` entry and must not
+// be reported as excluded — regardless of which arm of the switch admits it.
 func TestExtractServers_SameOriginJSStaticAdmitted(t *testing.T) {
 	endpoints := []classify.ClassifiedRequest{
 		makeClassified("GET", "https://www.example.com/api/users", ""),

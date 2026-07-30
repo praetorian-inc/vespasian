@@ -2339,6 +2339,37 @@ func TestOriginOf(t *testing.T) {
 	assert.Equal(t, "https://[2001:db8::1:8443]:443", originOf("https://[2001:db8::1:8443]/x"))
 	assert.NotEqual(t, originOf("https://[2001:db8::1]:8443/x"), originOf("https://[2001:db8::1:8443]/x"),
 		"these two distinct IPv6 literals must never canonicalize to the same origin")
+
+	// SEC-BE (LAB-4992 round-23 review): re-bracketing must be driven by
+	// whether url.Parse itself bracketed u.Host, not by whether Hostname()
+	// merely CONTAINS a colon. "foo:bar:80" is a malformed authority (not an
+	// IP literal) where url.Parse splits Hostname()="foo:bar" / Port()="80";
+	// the old `strings.Contains(host, ":")` heuristic re-bracketed it into
+	// "[foo:bar]:80", a string that does not re-parse as the same origin
+	// (loses idempotency) and was never a legitimate host to begin with.
+	// originOf now fails closed ("") for this shape.
+	assert.Equal(t, "", originOf("https://foo:bar:80/api/x"), "malformed non-bracketed authority containing ':' must fail closed, not be re-bracketed")
+
+	// A bracketed IPv6 literal carrying a zone ID (link-local scope, e.g.
+	// "fe80::1%eth0") re-brackets to a host containing a RAW '%', which is
+	// invalid in a URL and does not re-parse. A zone-id address is not a
+	// legitimate scan-target origin, so originOf fails closed for it too.
+	assert.Equal(t, "", originOf("https://[fe80::1%25eth0]/x"), "bracketed IPv6 host carrying a zone ID must fail closed, not emit a raw '%'")
+
+	// TEST (round-22 review, finding E): the early return for a scheme with
+	// no known default port sits BELOW the bracketing switch above, so an
+	// IPv6 host must stay bracketed on that branch too, not just on the
+	// http(s)-with-explicit-port branch. Every current pkg/generate/rest call
+	// site reaches originOf only through crawl.CanonicalOrigin, which rejects
+	// non-http(s) schemes before calling originOf and so never exercises this
+	// branch — but SameOrigin itself has no such scheme gate, and
+	// internal/pipeline calls crawl.SameOrigin(opts.TargetURL, targetOrigin)
+	// directly on the raw --target-url flag value (pipeline.go), which is
+	// unrestricted user input. This is directly observable on originOf too,
+	// since this test lives in the same package. Verified by mutation:
+	// reverting the early return to use the unbracketed u.Hostname() instead
+	// of the bracketed `host` variable breaks this exact assertion.
+	assert.Equal(t, "ws://[::1]", originOf("ws://[::1]/x"), "IPv6 host must stay bracketed on the unknown-scheme/no-default-port early-return branch too")
 }
 
 // TestCanonicalOrigin pins CanonicalOrigin's contract (SEC-BE-001/QUAL-001,
@@ -2372,6 +2403,80 @@ func TestCanonicalOrigin(t *testing.T) {
 	// bracket-less string must canonicalize DIFFERENTLY.
 	assert.NotEqual(t, CanonicalOrigin("https://[2001:db8::1]:8443/x"), CanonicalOrigin("https://[2001:db8::1:8443]/x"),
 		"these two distinct IPv6 literals must never canonicalize to the same origin")
+
+	// SEC-BE (LAB-4992 round-23 review): CanonicalOrigin must fail closed
+	// (not fabricate an unparseable origin) for the two non-IP-literal shapes
+	// that reach originOf's bracketing logic — see TestOriginOf for the
+	// underlying mechanism.
+	assert.Equal(t, "", CanonicalOrigin("https://foo:bar:80/api/x"), "malformed authority must fail closed, not become \"https://[foo:bar]:80\"")
+	assert.Equal(t, "", CanonicalOrigin("https://[fe80::1%25eth0]/x"), "zone-id IPv6 literal must fail closed, not become a raw '%' URL")
+
+	// Idempotency (SEC-BE-001/QUAL-001's own invariant): CanonicalOrigin's
+	// output must always re-parse to itself. The two fail-closed shapes above
+	// trivially satisfy this ("" -> ""), but pin it explicitly since it is the
+	// exact property the pre-fix bug violated for "foo:bar:80".
+	for _, raw := range []string{
+		"https://foo:bar:80/api/x",
+		"https://[fe80::1%25eth0]/x",
+		"https://[2001:db8::1]:8443/x",
+		"https://example.com/x",
+	} {
+		once := CanonicalOrigin(raw)
+		twice := CanonicalOrigin(once)
+		assert.Equal(t, once, twice, "CanonicalOrigin(%q) must be idempotent under re-parse", raw)
+	}
+}
+
+// TestCanonicalOrigin_SameOriginImpliesEquality pins the invariant
+// pkg/generate/rest's extractServers relies on to justify dropping its
+// former "SameOrigin but not string-equal" admission arm (SEC-BE-001, round-23
+// review): CanonicalOrigin is idempotent, and both operands SameOrigin
+// compares in extractServers (an endpoint's origin and the run's primary
+// origin) are always themselves CanonicalOrigin outputs. Once both sides of a
+// comparison have already been through the SAME canonicalization function,
+// SameOrigin (scheme+host+port equality after originOf's own, coarser
+// normalization) can only agree with CanonicalOrigin's string equality — it
+// can never report "same origin" for two CanonicalOrigin outputs that are
+// themselves different strings, because there is no further normalization
+// SameOrigin applies that CanonicalOrigin didn't already apply (lower-casing,
+// default-port equivalence, IPv6 bracketing all happen in the shared
+// originOf underneath both). This is why extractServers' admission arm
+// (`primary != "" && crawl.SameOrigin(origin, primary)`) was unreachable:
+// origin and primary are both crawl.CanonicalOrigin(...) results, so
+// SameOrigin(origin, primary) true implies origin == primary, which the
+// preceding `serverSet[origin]` check (primary is always added to serverSet
+// before this arm runs) already caught.
+//
+// The table below covers the shapes named in the round-23 review: bracketed
+// IPv6 (with and without an explicit port), mixed host case, an
+// explicit-vs-implicit default port pair, and a plain hostname — for each,
+// two independently-canonicalized spellings of the SAME origin must satisfy
+// SameOrigin(a, b) == (a == b), with both sides computed from CanonicalOrigin
+// (never from the raw literal), matching how extractServers/choosePrimaryOrigin
+// actually feed these two functions.
+func TestCanonicalOrigin_SameOriginImpliesEquality(t *testing.T) {
+	pairs := []struct {
+		name string
+		a, b string
+	}{
+		{"bracketed IPv6, no port vs explicit default port", "https://[::1]/x", "https://[::1]:443/y"},
+		{"bracketed IPv6, non-default port, identical spelling", "https://[2001:db8::1]:8443/x", "https://[2001:db8::1]:8443/y"},
+		{"mixed host case", "https://EXAMPLE.com/x", "https://example.com/y"},
+		{"explicit vs implicit default port", "https://example.com:443/x", "https://example.com/y"},
+		{"plain hostname, identical", "https://example.com/x", "https://example.com/y"},
+		{"distinct plain hostnames", "https://example.com/x", "https://other.example.com/y"},
+		{"distinct bracketed IPv6 literals (port-absorption ambiguity)", "https://[2001:db8::1]:8443/x", "https://[2001:db8::1:8443]/y"},
+	}
+	for _, tt := range pairs {
+		t.Run(tt.name, func(t *testing.T) {
+			a := CanonicalOrigin(tt.a)
+			b := CanonicalOrigin(tt.b)
+			require.NotEmpty(t, a, "fixture must canonicalize to a usable origin")
+			require.NotEmpty(t, b, "fixture must canonicalize to a usable origin")
+			assert.Equal(t, a == b, SameOrigin(a, b),
+				"SameOrigin(%q, %q) must agree with string equality once both sides are CanonicalOrigin outputs", a, b)
+		})
+	}
 }
 
 // TestResolveTargetOrigin pins the priority order documented on
@@ -3968,9 +4073,30 @@ func TestSameOrigin(t *testing.T) {
 		{"https://example.com/a", "https://other.com/a"},        // host
 		{"https://example.com/a", "https://example.com:8443/a"}, // explicit non-default port
 		{"https://example.com/a", "https://example.com./a"},     // trailing dot is a distinct host
-		// SEC-BE-001 (LAB-4992 review): two IPv6 literals that previously
-		// collapsed to the same bracket-less origin string.
+		// TEST (round-22 review, finding F): this http(s) pair does NOT
+		// actually require re-bracketing to differ under SameOrigin — verified
+		// by mutation, removing originOf's re-bracketing entirely still
+		// differs here, because https always appends a non-empty default port
+		// when none is given, and that extra ":443" suffix (present only on
+		// the second URL's unbracketed form) already breaks string equality
+		// on its own. The genuine collision this pair guards against — where
+		// BOTH strip to the identical bracket-less form — only manifests
+		// through CanonicalOrigin's *additional* default-port-suffix
+		// stripping, which is pinned directly by TestCanonicalOrigin's own
+		// assert.NotEqual for this exact pair, and by TestOriginOf's assert
+		// on the raw bracketed originOf output. Retained here only as a
+		// same-origin/host-equality sanity check for this pair, not as a
+		// bracket-pinning regression guard.
 		{"https://[2001:db8::1]:8443/a", "https://[2001:db8::1:8443]/b"},
+		// This pair, by contrast, DOES require re-bracketing to differ under
+		// SameOrigin directly (verified by mutation): an unknown scheme (no
+		// default port — see originOf's early-return branch, finding E) never
+		// appends a port suffix when none is given, so nothing masks a
+		// bracket-less collision the way https's always-present default port
+		// does above. Without re-bracketing, both origins fold to the
+		// identical unbracketed string "ws://2001:db8::1:8443" and SameOrigin
+		// would wrongly report them as the same origin.
+		{"ws://[2001:db8::1]:8443/a", "ws://[2001:db8::1:8443]/b"},
 	}
 	for _, tt := range differ {
 		assert.False(t, SameOrigin(tt[0], tt[1]), "expected different origin: %q vs %q", tt[0], tt[1])
