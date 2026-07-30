@@ -153,6 +153,17 @@ browser_required() {
     # read -ra from a QUOTED here-string rather than an unquoted
     # ${selected//,/ }: an unquoted expansion both splits AND globs, so a list
     # containing * would expand against the cwd before comparison.
+    #
+    # SIBLING: run-live-tests.sh's targets_need_config uses this same split for
+    # the same reason. The two are deliberately NOT factored into a shared
+    # helper: it is not that sharing is impossible — a split-only helper using
+    # this file's own RESOLVED_PORT-style global-output convention would work —
+    # but that it isn't worth it for ONE shared line. The classification around
+    # that line diverges on all three axes that matter: haystack type (string
+    # here, array there), quantifier (any-is-in here, any-is-NOT-in there), and
+    # unknown-target default (open here, closed there). If you "simplify" this
+    # split back to an unquoted expansion, fix the sibling too — and note both
+    # are pinned by glob assertions (preflight-selftest case k, test-runner-args).
     local target parts
     read -ra parts <<< "${1//,/ }"
     for target in "${parts[@]}"; do

@@ -136,6 +136,13 @@ targets_need_config() {
     # "${OFFLINE_TARGETS[*]}" below joins, so setting it to a comma silently
     # turns the haystack into a comma-joined string and breaks the
     # space-delimited match.
+    #
+    # SIBLING: setup-live-targets.sh's browser_required uses this same split for
+    # the same reason. The two are deliberately NOT factored into a shared
+    # helper — not because sharing is impossible, but because it isn't worth it
+    # for one shared line; see the note there for the divergence that makes a
+    # common predicate awkward. If you change this split, change that one too;
+    # both are pinned by glob assertions.
     local target parts
     read -ra parts <<< "${1//,/ }"
     for target in "${parts[@]}"; do
