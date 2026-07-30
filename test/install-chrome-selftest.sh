@@ -110,6 +110,20 @@ else
     pass_count=$((pass_count + 1))
 fi
 
+# The index mode above is what SHIPS; this is what the operator in front of a
+# browserless container actually types. They are not the same check: with
+# core.fileMode=false a working-tree `chmod -x` leaves the index at 100755 and
+# `git status` empty, so the index assertion stays green while ./ returns 126.
+# Every other case here invokes the script through `bash`, which is precisely
+# how the original exec-bit regression stayed hidden — so invoke it the
+# operator's way, once.
+# Invoked as "${INSTALL_SCRIPT}" — an ABSOLUTE path, and deliberately NOT
+# `bash "${INSTALL_SCRIPT}"`: only a direct exec consults the mode bit. Absolute
+# rather than ./test/... so the suite behaves the same run from the repo root or
+# from inside test/.
+"${INSTALL_SCRIPT}" --help >/dev/null 2>&1 && direct_rc=0 || direct_rc=$?
+assert_eq "case a2: install-chrome.sh runs by direct exec, not 126" "0" "${direct_rc}"
+
 # ── Case b: unknown flag is rejected ───────────────────────────
 bad_out=$(bash "${INSTALL_SCRIPT}" --not-a-real-flag 2>&1) && bad_rc=0 || bad_rc=$?
 assert_eq "case b: unknown flag exits 1" "1" "${bad_rc}"
