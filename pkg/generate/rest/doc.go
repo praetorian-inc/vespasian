@@ -43,7 +43,12 @@
 //     "https:/api/x", a single slash after the scheme, which is not an
 //     authority marker) last, so neither an excluded nor an unknown-
 //     provenance origin can ever win over a vouched one regardless of which
-//     hostname (or lack thereof) sorts first (SEC-BE-002/TEST-001) — and the
+//     hostname (or lack thereof) sorts first (SEC-BE-002/TEST-001). "Excluded"
+//     means the run cannot vouch for the origin, NOT merely that a bundle
+//     mentioned it: an origin both observed on the wire and named by a bundle
+//     literal stays vouched, since otherwise an ordinary SPA bundle
+//     referencing its own API host would demote that host and hand a colliding
+//     slot back to an attacker-chosen origin (SEC-BE-002). The
 //     suppressed group is recorded (not silently dropped) via the
 //     `x-vespasian-collision-origins` extension on the winning operation.
 //     static:html is deliberately NOT treated as JS-static here — the page

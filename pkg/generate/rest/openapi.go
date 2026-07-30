@@ -221,11 +221,26 @@ func extractServers(endpoints []classify.ClassifiedRequest, targetOrigin string)
 		addServer(origin)
 	}
 
+	// excluded means "this run cannot vouch for the origin", NOT "a bundle
+	// mentioned it" (SEC-BE-002, LAB-4992 review). collectEndpointOrigins
+	// buckets an origin into observedOrigins and jsStaticOrigins
+	// INDEPENDENTLY, so the same origin can be in both: genuinely observed on
+	// the wire AND also named by a bundle literal. serverSet already holds
+	// every origin vouched for above (the primary plus each observed origin),
+	// so consulting it here keeps a bundle from demoting a real observation.
+	// Without that check, a bundle served from app.example.com that merely
+	// references https://api.example.com/... — which any ordinary SPA does —
+	// marked api.example.com excluded, dropping it to trustRank 2 alongside
+	// genuinely untrusted origins and handing a colliding slot back to the
+	// attacker-steerable origin byte-compare that trustRank exists to remove.
 	excluded := make(map[string]bool)
 	for _, origin := range sortedCopy(jsStaticOrigins) {
-		if primary != "" && crawl.SameOrigin(origin, primary) {
+		switch {
+		case serverSet[origin]:
+			// Already vouched for; a bundle naming it changes nothing.
+		case primary != "" && crawl.SameOrigin(origin, primary):
 			addServer(origin)
-		} else {
+		default:
 			excluded[origin] = true
 		}
 	}

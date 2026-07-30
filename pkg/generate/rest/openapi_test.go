@@ -984,6 +984,73 @@ func TestGenerate_CollisionNeitherOriginPrimary_TrustRankPicksObservedOverExclud
 	}
 }
 
+// TestExtractServers_ObservedOriginNamedInBundleStaysVouched is SEC-BE-002
+// (LAB-4992 review). collectEndpointOrigins buckets an origin into `observed`
+// and `jsStatic` INDEPENDENTLY, so an origin can appear in both: dynamically
+// observed on the wire AND merely named by a bundle literal. The exclusion
+// loop used to mark every jsStatic origin that is not same-origin with primary
+// as excluded, without subtracting the origins it had just added to `servers`.
+// So `excludedOrigins` meant "appeared in a bundle", not "cannot be vouched
+// for", and a bundle that merely NAMES a real observed host demoted that host
+// to trustRank 2 — tying it with genuinely untrusted origins and dropping back
+// to the attacker-steerable byte compare the rank exists to eliminate.
+//
+// The attacker's cost is zero: a normal SPA bundle served from app.example.com
+// references https://api.example.com/... constantly, so in the ORDINARY case
+// every non-primary observed origin was already unprotected.
+func TestExtractServers_ObservedOriginNamedInBundleStaysVouched(t *testing.T) {
+	const observedAPI = "https://api.example.com"
+
+	servers, _, excluded := extractServers([]classify.ClassifiedRequest{
+		makeClassified("GET", "https://app.example.com/", ""),
+		makeClassified("GET", observedAPI+"/api/users/42", ""),
+		// The poison: the bundle names the very origin observed above.
+		makeClassified("GET", observedAPI+"/api/health", crawl.SourceStaticJS),
+	}, "https://app.example.com")
+
+	assert.False(t, excluded[observedAPI],
+		"an origin observed on the wire must stay vouched for even when a bundle also names it; otherwise trustRank demotes the real endpoint to untrusted")
+
+	var urls []string
+	for _, s := range servers {
+		urls = append(urls, s.URL)
+	}
+	assert.Contains(t, urls, observedAPI, "the observed origin must remain in the global servers list")
+}
+
+// TestGenerate_BundleNamingObservedHostCannotHandSlotToAttacker is the
+// end-to-end half of SEC-BE-002: with the poison line present, an attacker
+// origin that sorts first must still lose the (path, method) slot to the real
+// observed endpoint.
+func TestGenerate_BundleNamingObservedHostCannotHandSlotToAttacker(t *testing.T) {
+	const attacker = "https://0.evil.example"
+
+	g := &OpenAPIGenerator{Format: "yaml", TargetOrigin: "https://app.example.com"}
+	spec, err := g.Generate([]classify.ClassifiedRequest{
+		makeClassified("GET", "https://app.example.com/", ""),
+		makeClassified("GET", "https://api.example.com/api/users/42", ""),
+		makeClassified("GET", "https://api.example.com/api/health", crawl.SourceStaticJS),
+		makeClassified("GET", attacker+"/api/users/7", crawl.SourceStaticJS),
+	})
+	require.NoError(t, err)
+	specStr := string(spec)
+
+	assert.NotContains(t, specStr, "- url: "+attacker,
+		"an attacker origin must never define a server, globally or per-operation")
+	assert.Contains(t, specStr, attacker,
+		"the attacker group must still be RECORDED as suppressed rather than silently dropped")
+
+	parsed, err := openapi3.NewLoader().LoadFromData(spec)
+	require.NoError(t, err)
+	users := parsed.Paths.Find("/api/users/{userId}")
+	require.NotNil(t, users, "the real observed endpoint must own the collided slot")
+	require.NotNil(t, users.Get)
+	assert.Empty(t, users.Get.Servers,
+		"the winner is the real observed origin, which needs no per-operation override")
+	assert.Equal(t, "dynamic", users.Get.Extensions["x-vespasian-source"],
+		"the surviving operation must be the dynamically observed one, not the bundle-derived candidate")
+}
+
 // TestGenerate_ThreeOriginCollision_RecordsAllSuppressedOrigins is TEST-001
 // (LAB-4992 review): every prior collision test produced exactly ONE
 // suppressed origin, so recordCollisionOrigin's "existing" slice was always
