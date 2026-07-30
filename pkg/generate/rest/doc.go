@@ -38,11 +38,14 @@
 //     groups' normalized path+method collide across origins, the colliding
 //     group with the lowest trust rank deterministically wins that slot —
 //     the primary origin first, then any other non-excluded origin, then an
-//     excluded origin last, so an excluded (unprobed, attacker-influenceable)
-//     origin can never win over a non-excluded one regardless of which
-//     hostname sorts first (SEC-BE-002) — and the suppressed group is
-//     recorded (not silently dropped) via the `x-vespasian-collision-origins`
-//     extension on the winning operation.
+//     excluded origin OR an origin of unknown provenance (the empty string —
+//     crawl.CanonicalOrigin's result for a host-less literal such as
+//     "https:/api/x", a single slash after the scheme, which is not an
+//     authority marker) last, so neither an excluded nor an unknown-
+//     provenance origin can ever win over a vouched one regardless of which
+//     hostname (or lack thereof) sorts first (SEC-BE-002/TEST-001) — and the
+//     suppressed group is recorded (not silently dropped) via the
+//     `x-vespasian-collision-origins` extension on the winning operation.
 //     static:html is deliberately NOT treated as JS-static here — the page
 //     carrying the form was fetched over the wire during the crawl.
 //   - [NormalizePathsWithNames] is the primary normalization entry point. It

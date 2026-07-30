@@ -586,17 +586,28 @@ func TestExtractServers_HostlessSchemeLiteralRejected(t *testing.T) {
 	assert.Equal(t, "API", titleHost, "with no usable origin, title must fall back to the default rather than blank")
 }
 
-// TestExtractServers_HostlessTargetOriginRejected pins canonicalizeOrigin's
-// empty-host guard on the TARGET-ORIGIN path, which is a separate arm from the
-// endpoint path guarded by originFromURL (pinned by
-// TestExtractServers_HostlessSchemeLiteralRejected above). Without the
-// Hostname() == "" check, a degenerate targetOrigin such as "https:/api/x"
-// canonicalizes to the bare "https://" and becomes the PRIMARY server —
-// occupying servers[0] and displacing the real observed host, which is the
-// same degenerate-origin failure SEC-BE-002 closed for bundle literals, just
-// reached through --target-url instead. Verified non-vacuous by deleting the
-// Hostname() == "" term: this test then fails while the rest of the package
-// stays green.
+// TestExtractServers_HostlessTargetOriginRejected pins the TARGET-ORIGIN
+// path's host-less rejection. This function (choosePrimaryOrigin) and the
+// ENDPOINT path (collectEndpointOrigins, pinned by
+// TestExtractServers_HostlessSchemeLiteralRejected above) both go through
+// the single crawl.CanonicalOrigin (SEC-BE-001/QUAL-001) — there is no
+// longer a "separate arm" per input; both call sites share one guard.
+//
+// CanonicalOrigin itself carries a `u.Host == ""` check, but it is currently
+// redundant defense-in-depth: originOf (which CanonicalOrigin delegates to)
+// has its own independent `u.Host == ""` check, so either one alone already
+// makes CanonicalOrigin("https:/api/x") return "". Deleting only one of the
+// two guards is a SEMANTICALLY EQUIVALENT mutant — the other backstops it,
+// and this test (along with TestCanonicalOrigin and TestOriginOf) stays
+// green. Deleting BOTH guards is the mutation that actually kills this
+// test: CanonicalOrigin then returns the degenerate "https://" for
+// "https:/api/x", which becomes the PRIMARY server — occupying servers[0]
+// and displacing the real observed host — the same degenerate-origin
+// failure SEC-BE-002 closed for bundle literals, just reached through
+// --target-url instead. Verified: removing both guards makes this test fail
+// with servers[0] == "https://" and titleHost == "API" instead of the real
+// observed origin; restoring either guard alone is enough to make it pass
+// again.
 func TestExtractServers_HostlessTargetOriginRejected(t *testing.T) {
 	endpoints := []classify.ClassifiedRequest{
 		makeClassified("GET", "https://legit.example/api/users", ""),
@@ -662,6 +673,37 @@ func TestExtractServers_SameOriginJSStaticAdmitted(t *testing.T) {
 	require.Len(t, servers, 1, "the same-origin JS-static endpoint must not produce a second server entry")
 	assert.Equal(t, "https://www.example.com", servers[0].URL)
 	assert.False(t, excluded["https://www.example.com"], "the trusted, same-origin host must never be reported as excluded")
+}
+
+// TestGenerate_IPv6TargetEmitsBracketedServersURL is SEC-BE-001 (LAB-4992
+// review): a bracket-less "servers" URL for an IPv6 host
+// ("https://2001:db8::1:8443") is not a valid URL — RFC 3986 requires the
+// literal to be wrapped in "[...]" so ":" inside the address isn't parsed as
+// the port delimiter. crawl.CanonicalOrigin/originOf re-bracket the host when
+// rebuilding it from url.URL.Hostname() (which strips brackets), so the
+// generated spec's servers[0] and info.title must both keep the brackets.
+func TestGenerate_IPv6TargetEmitsBracketedServersURL(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://[2001:db8::1]:8443/api/users", ""),
+	}
+
+	gen := &OpenAPIGenerator{Format: "yaml", TargetOrigin: "https://[2001:db8::1]:8443"}
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err)
+
+	var parsed struct {
+		Info struct {
+			Title string `yaml:"title"`
+		} `yaml:"info"`
+		Servers []struct {
+			URL string `yaml:"url"`
+		} `yaml:"servers"`
+	}
+	require.NoError(t, yaml.Unmarshal(spec, &parsed))
+
+	require.Len(t, parsed.Servers, 1)
+	assert.Equal(t, "https://[2001:db8::1]:8443", parsed.Servers[0].URL, "the IPv6 host must stay bracketed in the servers URL")
+	assert.Equal(t, "[2001:db8::1]:8443 API", parsed.Info.Title, "the IPv6 host must stay bracketed in info.title")
 }
 
 // TestExtractServers_ExplicitPortDedupesWithBareHostTargetOrigin is
@@ -987,6 +1029,154 @@ func TestGenerate_ThreeOriginCollision_RecordsAllSuppressedOrigins(t *testing.T)
 	}
 	assert.Equal(t, []string{"https://evil.example", "https://other.example.com"}, origins,
 		"both suppressed origins must be recorded in full, not just the last one (TEST-001)")
+}
+
+// TestTrustRank_EmptyOriginIsUntrusted is TEST-001 (LAB-4992 review): an
+// empty origin (crawl.CanonicalOrigin's result for a host-less literal such
+// as "https:/api/x") is unknown provenance and must rank as the LEAST
+// trusted (2), never as trusted as the primary (0) or as an ordinary
+// non-excluded origin (1). collectEndpointOrigins skips empty origins, so ""
+// never enters excludedOrigins — the empty-origin case must be handled by
+// trustRank itself, not by excludedOrigins[""].
+//
+// The primaryOrigin == "" case is the "additional hole": choosePrimaryOrigin
+// returns "" when the run cannot vouch for any origin at all (no usable
+// TargetOrigin and no dynamically observed endpoint). Before the fix,
+// origin == primaryOrigin was checked FIRST, so "" == "" matched that arm
+// and ranked an unknown-provenance origin as rank 0 — the MOST trusted of
+// all, worse than the plain default-arm bug.
+func TestTrustRank_EmptyOriginIsUntrusted(t *testing.T) {
+	assert.Equal(t, 2, trustRank("", "https://app.example.com", map[string]bool{}),
+		"an empty origin must never rank as trusted as an ordinary non-excluded origin")
+	assert.Equal(t, 2, trustRank("", "", map[string]bool{}),
+		"an empty origin must rank untrusted even when primaryOrigin is itself empty (the run cannot vouch for any origin)")
+	assert.Equal(t, 0, trustRank("https://app.example.com", "https://app.example.com", map[string]bool{}),
+		"the primary origin itself must still rank 0")
+}
+
+// TestGenerate_HostlessOriginLiteralNeverWinsCollision is TEST-001 (LAB-4992
+// review), the end-to-end reproduction: a host-less literal such as
+// "https:/api/thing/7" (single slash — not an authority marker) canonicalizes
+// to "" via crawl.CanonicalOrigin. TargetOrigin is set to a THIRD origin
+// (app.example.com — the page the crawl actually ran against) so the real
+// observed endpoint (api.example.com) is non-primary, non-excluded, i.e.
+// rank 1 under the fixed code — exactly matching the empty origin's OLD
+// (buggy) default-arm rank of 1. At that tie, the buggy string tie-break
+// ("" sorts before every real origin string) let the attacker's host-less,
+// js-bundle-concat candidate win the (path, method) slot outright, silently
+// suppressing the real endpoint. The real endpoint must win regardless.
+func TestGenerate_HostlessOriginLiteralNeverWinsCollision(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://api.example.com/api/thing/42", ""),
+		makeClassified("GET", "https:/api/thing/7", "static:js-concat"),
+	}
+
+	gen := &OpenAPIGenerator{Format: "yaml", TargetOrigin: "https://app.example.com"}
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err)
+	specStr := string(spec)
+
+	var parsed map[string]any
+	require.NoError(t, yaml.Unmarshal(spec, &parsed))
+	paths, ok := parsed["paths"].(map[string]any)
+	require.True(t, ok, "expected a paths map")
+	require.Len(t, paths, 1, "both observations must collide onto a single path slot")
+
+	// The winning operation must be the real, observed endpoint — pinned via
+	// its x-vespasian-source: an operation built from the host-less
+	// js-bundle-concat candidate would carry x-vespasian-source:
+	// js-bundle-concat; the real endpoint (empty Source) carries no
+	// x-vespasian-source extension at all under a single-member group, but a
+	// COLLISION winner keeps its own group's tag, which for the real
+	// endpoint's group is "" (empty Source, non-JS-static) -> "dynamic" is
+	// only emitted when staticPresent is true (it is here, since the other
+	// group is JS-static), so assert the tag directly.
+	assert.NotContains(t, specStr, "js-bundle-concat",
+		"the host-less, never-probed candidate must not win the slot (its x-vespasian-source tag must not appear)")
+	assert.Contains(t, specStr, "x-vespasian-source: dynamic",
+		"the real, dynamically observed endpoint must win the slot")
+
+	// The suppressed candidate's loss must still be visible, not silently
+	// dropped, even though its own origin is "" (empty). This is the
+	// deliberate choice this code makes (recordCollisionOrigin's doc
+	// comment): the suppressed group's origin is recorded as-is, including
+	// when that origin is "" — the empty string itself communicates WHICH
+	// candidate lost (an unknown-provenance one), consistent with trustRank
+	// ranking "" as least trusted rather than a special "unknown" sentinel.
+	var getOp map[string]any
+	for _, pathItemAny := range paths {
+		pathItem, ok := pathItemAny.(map[string]any)
+		require.True(t, ok)
+		getOp, ok = pathItem["get"].(map[string]any)
+		require.True(t, ok)
+	}
+	require.NotNil(t, getOp)
+	rawOrigins, ok := getOp["x-vespasian-collision-origins"].([]any)
+	require.True(t, ok, "expected x-vespasian-collision-origins on the winning operation")
+	require.Len(t, rawOrigins, 1)
+	assert.Equal(t, "", rawOrigins[0], "the suppressed host-less candidate's loss must be recorded as the empty origin, not silently dropped")
+}
+
+// TestGenerate_PrimarySortsLaterStillWinsCollision is TEST-002 (LAB-4992
+// review): mutating trustRank's primary arm (`return 0` -> `return 1`)
+// survives the rest of the suite because every existing collision test gives
+// the primary a hostname that already sorts first alphabetically among the
+// non-excluded (rank-1) origins, so rank and string order agree and the
+// mutant is indistinguishable from correct code. Here the primary's hostname
+// ("zzz.example.com") sorts LATER than a competing non-excluded, dynamically
+// observed origin ("aaa.example.com"). Correct code (rank 0 for the primary)
+// must still make the primary win; the mutant (rank 1, tying with the
+// competitor's rank 1) would let the competitor win via the string
+// tie-break instead.
+func TestGenerate_PrimarySortsLaterStillWinsCollision(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://zzz.example.com/api/thing/42", ""),
+		makeClassified("GET", "https://aaa.example.com/api/thing/7", ""),
+	}
+
+	gen := &OpenAPIGenerator{Format: "yaml", TargetOrigin: "https://zzz.example.com"}
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err)
+
+	var parsed map[string]any
+	require.NoError(t, yaml.Unmarshal(spec, &parsed))
+
+	paths, ok := parsed["paths"].(map[string]any)
+	require.True(t, ok, "expected a paths map")
+	require.Len(t, paths, 1, "both observations must collide onto a single path slot")
+
+	var getOp map[string]any
+	for _, pathItemAny := range paths {
+		pathItem, ok := pathItemAny.(map[string]any)
+		require.True(t, ok)
+		getOp, ok = pathItem["get"].(map[string]any)
+		require.True(t, ok)
+	}
+	require.NotNil(t, getOp)
+
+	assert.Nil(t, getOp["servers"],
+		"the primary-origin operation that wins the slot must not carry a per-operation servers override")
+
+	// This is the assertion that actually discriminates the winner: the
+	// collision-origins extension is set only on the WINNING operation and
+	// names the LOSING origin. If the mutant (rank 1 for the primary) let
+	// the alphabetically-first "aaa.example.com" win instead, this
+	// operation's collision-origins would read "zzz.example.com" (the
+	// primary, having lost) rather than "aaa.example.com" — asserting
+	// global servers-list order or "no per-operation override" (checked
+	// above) cannot tell the two outcomes apart, since neither origin is
+	// excluded and extractServers always places the primary at servers[0]
+	// regardless of which one wins the (path, method) slot collision.
+	rawOrigins, ok := getOp["x-vespasian-collision-origins"].([]any)
+	require.True(t, ok, "expected x-vespasian-collision-origins on the winning operation")
+	origins := make([]string, 0, len(rawOrigins))
+	for _, o := range rawOrigins {
+		s, ok := o.(string)
+		require.True(t, ok)
+		origins = append(origins, s)
+	}
+	assert.Equal(t, []string{"https://aaa.example.com"}, origins,
+		"the primary (zzz.example.com) must win the slot despite sorting later alphabetically; the non-primary aaa.example.com must be the one recorded as suppressed")
 }
 
 func TestP0Fixes_ContextAwarePathParams(t *testing.T) {

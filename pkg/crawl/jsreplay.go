@@ -659,6 +659,22 @@ func defaultPortForScheme(scheme string) string {
 // all collapse to the same string. Without this normalization, isSameOrigin
 // would treat the implicit-port and explicit-port forms as different origins
 // and incorrectly skip valid same-origin probes.
+//
+// SEC-BE-001 (LAB-4992 review): u.Hostname() strips the enclosing brackets
+// from an IPv6 literal host (e.g. "[::1]" -> "::1"), so an IPv6 host is
+// re-bracketed here before being joined with ":" + port. Without this, two
+// distinct URLs — one with a real port outside the brackets
+// ("https://[2001:db8::1]:8443/x") and one where that same digit sequence is
+// actually part of the IPv6 literal itself, with no port at all
+// ("https://[2001:db8::1:8443]/x", which gets the https default port 443) —
+// rebuild to the IDENTICAL bracket-less string "https://2001:db8::1:8443",
+// making originOf non-injective for IPv6 targets. That collision let a real
+// observation and an attacker-authored candidate on a different IPv6 literal
+// silently merge into one endpointKey.origin in pkg/generate/rest, and it
+// made the emitted `servers` URL and `info.title` syntactically invalid for
+// IPv6 (a bracket-less "https://2001:db8::1:8443" is not a valid URL). The
+// bracket check is keyed on ":" appearing in the hostname — an IPv4 or DNS
+// hostname never contains ":", so this is a no-op for every non-IPv6 host.
 func originOf(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Host == "" {
@@ -666,6 +682,13 @@ func originOf(rawURL string) string {
 	}
 	scheme := strings.ToLower(u.Scheme)
 	host := strings.ToLower(u.Hostname())
+	if strings.Contains(host, ":") {
+		// IPv6 literal: Hostname() stripped the brackets Host had; put them
+		// back so the origin stays a syntactically valid host and stays
+		// distinguishable from a differently-bracketed spelling of a
+		// similar-looking literal (see doc comment above).
+		host = "[" + host + "]"
+	}
 	port := u.Port()
 	if port == "" {
 		port = defaultPortForScheme(scheme)

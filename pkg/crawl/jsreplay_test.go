@@ -2321,6 +2321,24 @@ func TestOriginOf(t *testing.T) {
 	assert.Equal(t, "https://example.com:443", originOf("HTTPS://Example.COM/api"))
 	assert.Equal(t, "", originOf("not a url"))
 	assert.Equal(t, "", originOf("/relative/path"))
+
+	// SEC-BE-001 (LAB-4992 review): u.Hostname() strips the brackets from an
+	// IPv6 literal host, so the un-bracketed host must be re-bracketed before
+	// being joined with ":" + port — otherwise "[::1]:8443" and a bracketless
+	// rebuild "::1:8443" become indistinguishable from an IPv6 literal that
+	// legitimately ends in ":8443" as part of its own address.
+	assert.Equal(t, "https://[::1]:443", originOf("https://[::1]/x"), "IPv6 host must stay bracketed with the implicit default port made explicit")
+	assert.Equal(t, "https://[::1]:8443", originOf("https://[::1]:8443/x"), "IPv6 host must stay bracketed with an explicit non-default port")
+	// The two spellings below only differ in where the brackets fall — one
+	// puts ":8443" outside the brackets (a real port), the other puts it
+	// inside (part of the IPv6 literal itself, with no port at all, so the
+	// https default of 443 applies). Rebuilding from Hostname() without
+	// re-bracketing collapses both to the bracketless string
+	// "https://2001:db8::1:8443", making them indistinguishable.
+	assert.Equal(t, "https://[2001:db8::1]:8443", originOf("https://[2001:db8::1]:8443/x"))
+	assert.Equal(t, "https://[2001:db8::1:8443]:443", originOf("https://[2001:db8::1:8443]/x"))
+	assert.NotEqual(t, originOf("https://[2001:db8::1]:8443/x"), originOf("https://[2001:db8::1:8443]/x"),
+		"these two distinct IPv6 literals must never canonicalize to the same origin")
 }
 
 // TestCanonicalOrigin pins CanonicalOrigin's contract (SEC-BE-001/QUAL-001,
@@ -2343,6 +2361,17 @@ func TestCanonicalOrigin(t *testing.T) {
 	assert.Equal(t, "", CanonicalOrigin("/relative/path"), "relative (host-less) URL rejected")
 	assert.Equal(t, "", CanonicalOrigin("ftp://example.com/x"), "non-http(s) scheme rejected")
 	assert.Equal(t, "", CanonicalOrigin("https:/api/x"), "single slash after scheme is not an authority marker; host-less")
+
+	// SEC-BE-001 (LAB-4992 review): IPv6 literals must keep their brackets
+	// (a bracket-less "servers" URL is syntactically invalid) and the
+	// default-port TrimSuffix must still fire with brackets present.
+	assert.Equal(t, "https://[::1]", CanonicalOrigin("https://[::1]/x"), "bracketed IPv6 host, default port implicit")
+	assert.Equal(t, "https://[::1]:8443", CanonicalOrigin("https://[::1]:8443/x"), "bracketed IPv6 host, non-default port preserved")
+	assert.Equal(t, "https://[::1]", CanonicalOrigin("https://[::1]:443/x"), "explicit default port must strip even with brackets present")
+	// Two distinct IPv6 spellings that previously collapsed to the same
+	// bracket-less string must canonicalize DIFFERENTLY.
+	assert.NotEqual(t, CanonicalOrigin("https://[2001:db8::1]:8443/x"), CanonicalOrigin("https://[2001:db8::1:8443]/x"),
+		"these two distinct IPv6 literals must never canonicalize to the same origin")
 }
 
 // TestResolveTargetOrigin pins the priority order documented on
@@ -3927,6 +3956,8 @@ func TestSameOrigin(t *testing.T) {
 		{"http://example.com/a", "http://example.com:80/b"},    // ditto for http
 		{"https://EXAMPLE.com/a", "https://example.com/b"},     // host case
 		{"https://example.com:8443/a", "https://example.com:8443/b"},
+		{"https://[::1]/a", "https://[::1]:443/b"},             // IPv6, default port canonicalized
+		{"https://[2001:DB8::1]/a", "https://[2001:db8::1]/b"}, // IPv6 host case
 	}
 	for _, tt := range same {
 		assert.True(t, SameOrigin(tt[0], tt[1]), "expected same origin: %q vs %q", tt[0], tt[1])
@@ -3937,6 +3968,9 @@ func TestSameOrigin(t *testing.T) {
 		{"https://example.com/a", "https://other.com/a"},        // host
 		{"https://example.com/a", "https://example.com:8443/a"}, // explicit non-default port
 		{"https://example.com/a", "https://example.com./a"},     // trailing dot is a distinct host
+		// SEC-BE-001 (LAB-4992 review): two IPv6 literals that previously
+		// collapsed to the same bracket-less origin string.
+		{"https://[2001:db8::1]:8443/a", "https://[2001:db8::1:8443]/b"},
 	}
 	for _, tt := range differ {
 		assert.False(t, SameOrigin(tt[0], tt[1]), "expected different origin: %q vs %q", tt[0], tt[1])

@@ -146,11 +146,20 @@
 //     default-port canonicalization, so the two paths agree on what counts as
 //     the bundle's own origin; [CanonicalOrigin] is the single "scheme://host"
 //     origin definition for both comparison AND display (lower-cased,
-//     default port stripped) — exported so pkg/generate/rest does not carry
-//     a second, subtly different origin normalization, which previously let
-//     a trusted host spelled with an explicit default port or mixed case
-//     lose its own tie-break to an attacker-controlled origin
-//     (SEC-BE-001/QUAL-001); [IsAbsoluteHTTPURL] answers "does this carry an
+//     default port stripped, IPv6 hosts kept bracketed) — exported so
+//     pkg/generate/rest does not carry a second, subtly different origin
+//     normalization, which previously let a trusted host spelled with an
+//     explicit default port or mixed case lose its own tie-break to an
+//     attacker-controlled origin (SEC-BE-001/QUAL-001). An IPv6 literal host
+//     is re-bracketed when rebuilt from url.URL.Hostname() (which strips the
+//     brackets Host had), both so the result stays a syntactically valid URL
+//     and so two differently-bracketed IPv6 spellings that would otherwise
+//     rebuild to the identical bracket-less string (one with a real port
+//     outside the brackets, one where that same digit sequence is part of
+//     the literal itself) canonicalize differently, as they must; the fix is
+//     in the shared originOf helper so CanonicalOrigin, SameOrigin, and
+//     ResolveTargetOrigin all agree (SEC-BE-001 follow-up);
+//     [IsAbsoluteHTTPURL] answers "does this carry an
 //     http(s) scheme" case-insensitively, because url.Parse lower-cases the
 //     scheme and a case-sensitive prefix test would classify "HTTPS://h/x" as
 //     relative; [IsPrintableASCIIURL] is the byte policy for anything bound

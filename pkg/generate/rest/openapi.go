@@ -794,6 +794,14 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 // x-vespasian-collision-origins lists every suppressed origin, deduplicated
 // and sorted for determinism, in the same extension style as
 // x-vespasian-source.
+//
+// origin can be "" (TEST-001, LAB-4992 review): a suppressed group's
+// endpointKey.origin is crawl.CanonicalOrigin's result for its member
+// endpoints' URL, which is "" for a host-less literal such as
+// "https:/api/x". This is deliberate, not a gap — the empty string is
+// itself informative here (it names WHICH unknown-provenance candidate
+// lost, consistent with trustRank ranking "" as least trusted), and every
+// caller of this function already has a non-empty winner to attach it to.
 func recordCollisionOrigin(winner *openapi3.Operation, origin string) {
 	if winner.Extensions == nil {
 		winner.Extensions = map[string]any{}
@@ -817,15 +825,23 @@ func recordCollisionOrigin(winner *openapi3.Operation, origin string) {
 // slot collision by this rank rather than by the origin string itself, so
 // that a colliding slot is always won by the most trusted origin present:
 //
-//	0 — the primary origin (the run's vouched origin; see choosePrimaryOrigin)
-//	1 — any other non-excluded origin: dynamically observed, or JS-static
-//	    same-origin with primary — both already passed extractServers'
-//	    admission and sit in the global servers list
-//	2 — an excluded origin: cross-origin JS-static, never probed, and
-//	    named only by content the run does not control (the bundle itself)
+//	0 — the primary origin (the run's vouched origin; see choosePrimaryOrigin).
+//	    A JS-static origin that is same-origin with primary (crawl.SameOrigin)
+//	    also lands here, NOT in rank 1 below: extractServers admits it via the
+//	    same crawl.CanonicalOrigin every origin in this function is compared
+//	    with, so its canonicalized string is identical to primaryOrigin's —
+//	    `origin == primaryOrigin` is true for it (QUAL-001: an earlier version
+//	    of this comment placed it in rank 1, which the code never does).
+//	1 — any other non-excluded, non-empty origin: a dynamically observed
+//	    origin distinct from primary. Already passed extractServers'
+//	    admission and sits in the global servers list.
+//	2 — an excluded origin (cross-origin JS-static, never probed, and named
+//	    only by content the run does not control) OR an origin of unknown
+//	    provenance ("" — see below)
 //
-// INVARIANT: an origin in excludedOrigins must NEVER win a (path, method)
-// slot that a non-excluded group also claims.
+// INVARIANT: an origin this run cannot vouch for — excluded OR of unknown
+// provenance — must NEVER win a (path, method) slot that a vouched
+// (non-excluded, non-empty) origin also claims.
 //
 // SEC-BE-002 (LAB-4992 review): the prior tie-break compared each colliding
 // origin to primaryOrigin as a single boolean (iPrimary/jPrimary). That
@@ -837,8 +853,22 @@ func recordCollisionOrigin(winner *openapi3.Operation, origin string) {
 // by choosing a hostname that sorts first. This 3-level rank makes that
 // case explicit and impossible: rank 2 (excluded) can never beat rank 0 or
 // 1 (not excluded), regardless of which hostname sorts first.
+//
+// TEST-001 (LAB-4992 review): an empty origin — crawl.CanonicalOrigin's
+// result for a host-less literal such as "https:/api/x" (single slash, not
+// an authority marker) — is skipped by collectEndpointOrigins, so "" never
+// enters excludedOrigins; it used to fall to the default case (rank 1),
+// defeating the invariant above for exactly the origin this run knows
+// LEAST about. Worse, `origin == primaryOrigin` was checked FIRST, and
+// primaryOrigin is itself "" whenever choosePrimaryOrigin cannot vouch for
+// any origin at all (no usable TargetOrigin and no dynamically observed
+// endpoint) — so an empty origin then matched THAT arm and ranked 0, the
+// MOST trusted of all. The empty-origin case is now checked first and
+// explicitly, so it can never be short-circuited by an empty primaryOrigin.
 func trustRank(origin, primaryOrigin string, excludedOrigins map[string]bool) int {
 	switch {
+	case origin == "":
+		return 2
 	case origin == primaryOrigin:
 		return 0
 	case excludedOrigins[origin]:
