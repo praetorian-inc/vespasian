@@ -66,6 +66,13 @@ const (
 	// response arrived too late to capture still classifies — the REST-vs-not
 	// verdict then depends on the request, not on response timing (LAB-4678, B2).
 	RequestSignalConfidence = 0.6
+	// NextRouteProvenanceConfidence is assigned by Rule 7 to a route recovered from a
+	// Next.js App Router chunk URL. It is a REPORTING level, not an API signal: it
+	// sits at NearMissFloor so the route is listed among the -v near-misses, and far
+	// below DefaultConfidenceThreshold so it can never become a spec operation with a
+	// guessed verb. TestNextRouteProvenanceConfidence_IsReportingOnly pins both
+	// bounds, so neither constant can drift into swallowing the other.
+	NextRouteProvenanceConfidence = NearMissFloor
 )
 
 // RESTClassifier classifies REST API requests using ordered heuristic rules.
@@ -84,13 +91,19 @@ func (c *RESTClassifier) Classify(req crawl.ObservedRequest) (bool, float64) {
 
 // ClassifyDetail returns classification result with a detailed reason string.
 //
-// Heuristic rules applied in order:
-//  1. Static asset exclusion → (false, 0, "")
-//  2. Content-type filter → confidence 0.8
-//  3. Path heuristics → boost +0.15 (cap 1.0)
-//  4. HTTP method signal → confidence max(current, 0.7)
-//  5. Response structure → confidence max(current, 0.85)
-//  6. Request-side API signal (Accept / request content-type) → max(current, 0.6)
+// Heuristic rules applied in order. Rules 1, 1a and 1b are DISQUALIFIERS: they
+// return outright, so no later rule can promote an identified non-endpoint.
+//
+//	Rule 1  static asset (extension, path segment)   -> (false, 0, "")
+//	Rule 1a well-known document path (documentPaths) -> (false, 0, "")
+//	Rule 1b document media type                     -> (false, 0, "")
+//	Rule 2  response content-type       -> confidence 0.8
+//	Rule 3  path heuristics             -> boost +0.15 (cap 1.0)
+//	Rule 4  non-GET method              -> max(current, 0.7)
+//	Rule 5  JSON response structure     -> max(current, 0.85)
+//	Rule 6  request-side API signal     -> max(current, 0.6)
+//	Rule 7  Next.js chunk provenance    -> max(current, NextRouteProvenanceConfidence),
+//	        a reporting-only floor, deliberately far below the API threshold
 func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float64, string) { //nolint:gocyclo // multi-signal heuristic classifier
 	parsedURL, err := url.Parse(req.URL)
 	if err != nil {
@@ -109,6 +122,12 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 		if strings.Contains(lowerPath, seg) {
 			return false, 0, ""
 		}
+	}
+	// Rule 1a: Well-known document PATHS, for documents whose served content-type
+	// cannot be relied on. See documentPaths for why the extension rule and the
+	// content-type rule both miss the common case.
+	if isDocumentPath(lowerPath) {
+		return false, 0, ""
 	}
 
 	respCT := req.Response.ContentType
@@ -226,17 +245,38 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 		reason = appendReason(reason, "request-signal:"+signal)
 	}
 
-	// There is deliberately no rule keyed on a Next.js route-handler Source.
-	// An App Router route-handler chunk URL proves the PATH is served but says
-	// nothing about which verbs the module exports. Classifying it as an API on
-	// provenance alone made the generator emit a `get` operation for a route that
-	// may export only POST, and nothing downstream corrects that: the OPTIONS
-	// probe records ClassifiedRequest.AllowedMethods, but pkg/generate/rest does
-	// not read it, so the invented verb survives into the spec (Codex review, PR
-	// #189). A recovered route is therefore surfaced as a sub-threshold near-miss
-	// under -v rather than documented as an operation that may not exist.
-	// Restoring it correctly means teaching the generator to emit operations from
-	// AllowedMethods, which is a separate change.
+	// Rule 7: Next.js App Router provenance — a REPORTING signal only, deliberately
+	// far below the threshold.
+	//
+	// An App Router chunk URL proves the PATH is served but says nothing about which
+	// verbs the module exports. Classifying it as an API on provenance alone made the
+	// generator emit a `get` operation for a route that may export only POST, and
+	// nothing downstream corrects that: the OPTIONS probe records
+	// ClassifiedRequest.AllowedMethods, but pkg/generate/rest does not read it, so the
+	// invented verb survives into the spec (Codex review, PR #189). So this must not
+	// reach DefaultConfidenceThreshold, and NextRouteProvenanceConfidence is asserted
+	// against that bound by test.
+	//
+	// It cannot be ZERO either, which is where this rule's absence left it. Keeping a
+	// recovered route out of the spec is correct; scoring it 0 ALSO put it below
+	// classify.NearMissFloor, so NearMisses dropped it and it appeared in no output at
+	// all. That hit the headline case squarely: /vaults/{vaultId} matches no
+	// apiPathSegments entry, so it had no path boost to fall back on either. The only
+	// recovered routes an operator could see were the ones that happened to sit under
+	// /api/, visible via the path heuristic rather than via anything this feature
+	// contributed. Meanwhile README.md, CLAUDE.md, pkg/analyze/jsstatic/doc.go and this
+	// rule's own predecessor comment all asserted that recovered routes surface as
+	// sub-threshold near-misses under -v. Pinning the score to the near-miss floor is
+	// what makes those four claims true.
+	//
+	// Restoring them as real operations means teaching the generator to emit from
+	// AllowedMethods, which is still a separate change.
+	if req.Source == crawl.SourceNextRouteHandler || req.Source == crawl.SourceNextPageRoute {
+		if confidence < NextRouteProvenanceConfidence {
+			confidence = NextRouteProvenanceConfidence
+		}
+		reason = appendReason(reason, "next-route-chunk")
+	}
 
 	return confidence > 0, confidence, reason
 }
@@ -309,6 +349,48 @@ var documentContentTypes = []string{
 	"application/manifest+json",
 }
 
+// documentPaths are exact request paths that are always a standalone document
+// rather than an endpoint, matched at the END of the path so a subdirectory
+// deployment still hits.
+//
+// This exists because the other two manifest defenses BOTH miss the common case.
+// documentContentTypes rejects application/manifest+json, and staticExtensions
+// rejects .webmanifest — so /site.webmanifest is covered either way. But the web
+// app manifest is conventionally named /manifest.json, and a .json file is very
+// commonly served as plain application/json (that is the default mapping in most
+// servers and CDNs; only some frameworks set application/manifest+json). In that
+// combination nothing fired: .json is not a static extension, application/json is
+// obviously not a document type, and Rule 2 scored it 0.8 while Rule 5's JSON
+// object body took it to 0.85. Measured before this rule: /manifest.json served as
+// application/json classified at 0.85 and became an operation in the spec.
+//
+// The rest.go comment on staticExtensions called .webmanifest "the belt to
+// documentContentTypes' braces: a manifest served with a wrong or missing
+// content-type is still not an endpoint" — true only for the filename almost
+// nobody uses. This is the belt for the one they do.
+//
+// Membership rule, same as documentContentTypes: the payload is consumed as a
+// standalone document, and fetching it says nothing about an endpoint's contract.
+// Add a path here only when the content-type cannot be trusted to identify it,
+// otherwise documentContentTypes is the right place. An app with a real API at
+// /manifest.json would be misclassified; that is the same accepted asymmetry as
+// skipping a read-only "Payment history" control in the --interact list.
+var documentPaths = []string{
+	"/manifest.json",
+}
+
+// isDocumentPath reports whether lowerPath ends in one of documentPaths. Every
+// entry begins with "/", so the suffix test also covers an exact match and matches
+// only on a whole final segment — "/app-manifest.json" does not hit "/manifest.json".
+func isDocumentPath(lowerPath string) bool {
+	for _, p := range documentPaths {
+		if strings.HasSuffix(lowerPath, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // isDocumentContentType reports whether ct is one of the documentContentTypes,
 // canonicalized the same way matchAPIContentType canonicalizes. Callers treat a
 // true result as a disqualifier for the whole request, not just as the absence of
@@ -375,8 +457,11 @@ func matchAPIContentType(ct string) string {
 
 // acceptSignalsAPI parses an Accept header and returns the API media type the
 // client is explicitly asking for, or "" if none. It splits into media ranges,
-// ignores q-parameters and the "*/*" wildcard, and exact-matches against
-// apiContentTypes. Crucially, a header that accepts text/html or
+// ignores q-parameters, and matches each range with [matchAPIContentType] — so it
+// accepts the exact apiContentTypes entries AND the RFC 6839 structured-suffix
+// tier, and inherits that function's navigation/SOAP/document exclusions. "*/*"
+// matches nothing there, so a non-committal fetch contributes no signal.
+// Crucially, a header that accepts text/html or
 // application/xhtml+xml is treated as a document navigation, NOT API intent —
 // browsers always send those on page loads, and the standard navigation Accept
 // header also contains application/xml (which would otherwise substring-match).

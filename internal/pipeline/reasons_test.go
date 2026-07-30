@@ -229,3 +229,36 @@ func TestLogClassificationReasons_NoOutput(t *testing.T) {
 		t.Errorf("empty input should produce no output, got: %q", buf.String())
 	}
 }
+
+// TestLogNearMisses_ReportsRecoveredNextRoutes is the end-to-end half of the
+// Next.js reporting fix. README.md, CLAUDE.md and pkg/analyze/jsstatic/doc.go all
+// state that routes recovered from App Router chunk URLs are surfaced under -v.
+// Asserting the classifier's confidence band is not enough — logNearMisses applies
+// its own floor, so the claim is only true if the route actually reaches this
+// output. It did not: a page route scored 0, below classify.NearMissFloor, so it
+// was filtered out here and the feature produced nothing an operator could see.
+//
+// /vaults/{vaultId} is the case the README leads with. The braces arrive
+// percent-encoded because jsstatic resolves the route through
+// url.ResolveReference, which is the form that actually reaches this code.
+func TestLogNearMisses_ReportsRecoveredNextRoutes(t *testing.T) {
+	var buf bytes.Buffer
+	classifiers := []classify.APIClassifier{&classify.RESTClassifier{}}
+	requests := []crawl.ObservedRequest{
+		{Method: "GET", URL: "https://app.test/vaults/%7BvaultId%7D", Source: crawl.SourceNextPageRoute},
+		{Method: "GET", URL: "https://app.test/api/files", Source: crawl.SourceNextRouteHandler},
+	}
+	logNearMisses(&buf, classifiers, requests, classify.DefaultConfidenceThreshold)
+
+	out := buf.String()
+	for _, want := range []string{"/vaults/{vaultId}", "/api/files"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("recovered route %q is not reported under -v, so the Next.js "+
+				"recovery feature has no observable output for it.\ngot:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, "next-route-chunk") {
+		t.Errorf("the -v line must name chunk-URL provenance as the reason, so an "+
+			"operator can tell a recovered route from a genuine weak-signal endpoint.\ngot:\n%s", out)
+	}
+}

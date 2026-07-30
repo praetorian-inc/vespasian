@@ -126,8 +126,12 @@ type engineOptions struct {
 	// SEED page actually resolved to after redirects. It lets the scope predicate
 	// treat the seed's effective origin as in scope, which is what makes an
 	// "http → https" or "apex → www" seed redirect crawlable instead of yielding
-	// an empty capture. Only the depth-0 visit calls it; see [seedScope] for the
-	// containment reasoning.
+	// an empty capture. Only the visit of the SEED ITSELF calls it, gated on
+	// frontier-key identity rather than on Depth == 0 — resume restores pending
+	// entries before the seed is pushed and honors the depth the checkpoint claims,
+	// so depth 0 stopped being a reliable proxy for "is the seed" (LAB-4678 review,
+	// SEC-BE-004). See [learnSeedOrigin] and [seedScope] for the containment
+	// reasoning.
 	LearnEffectiveOrigin func(effectiveURL string)
 
 	// Completion-driven capture bounds (0 → the Default* above).
@@ -265,10 +269,29 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 	//
 	// MaxRequests (LAB-4678 Phase 3) is a second, independent budget: a
 	// rate/politeness bound on the total number of captured requests, distinct
-	// from the crawl-breadth MaxPages. It stops enqueuing new pages once the
+	// from the crawl-breadth MaxPages. It stops taking new pages once the
 	// captured-request count reaches the bound; like MaxPages it is graceful —
-	// pages already in flight finish and emit their requests, so the final count
-	// can slightly exceed the bound rather than cutting a page mid-capture.
+	// pages already in flight finish and emit their requests rather than being
+	// cut mid-capture.
+	//
+	// OVERSHOOT, stated precisely because it is much larger than "one page" and an
+	// operator sets this against a target they are being careful with. reqCount is
+	// incremented only AFTER a visit returns, while the budget is consulted BEFORE
+	// one starts, so all Concurrency workers can clear the check in the window
+	// before any of them increments. The bound is therefore
+	//
+	//	MaxRequests + (Concurrency x requests-per-page)
+	//
+	// not MaxRequests + one page's requests. Measured: MaxRequests=10 at the
+	// default Concurrency=10 with 4 requests per page emits 44. It also cannot
+	// bound BELOW a single page's request count. Unlike MaxPages — where
+	// budgetReached's reserve makes the page cap exact — a request budget cannot be
+	// reserved, because a page's request count is unknown until the page has been
+	// visited. Tightening this means either capping in-flight pages as the budget
+	// nears or cutting a page mid-capture, both of which trade away the graceful
+	// drain; that is a design change, not a doc fix. The real bound is pinned by
+	// TestWorker_MaxRequestsOvershoot_ScalesWithConcurrency, so the number quoted
+	// here and in the README cannot drift from the behavior again.
 	var (
 		mu        sync.Mutex
 		pageCount int

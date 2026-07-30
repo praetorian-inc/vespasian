@@ -58,7 +58,11 @@
 // "static:js-nextpage" (an App Router page route). Neither Next.js tag carries an
 // API signal: the chunk URL proves the path is served but not which verbs the
 // route exports, so recovered routes surface as sub-threshold near-misses under
-// -v rather than as invented operations in the spec.
+// -v rather than as invented operations in the spec. pkg/classify scores them at
+// NextRouteProvenanceConfidence for exactly that: it sits at classify.NearMissFloor,
+// which is the level the -v near-miss report filters on. Scoring them at 0 instead
+// made this sentence false for every route off the /api/ path allowlist — including
+// the /vaults/{vaultId} example above, which then appeared nowhere at all.
 // The OpenAPI generator strips the "static:" prefix when emitting the
 // x-vespasian-source extension on each operation ("static:js" -> "js-bundle",
 // "static:js-sourcemap" -> "js-sourcemap"; any dynamic-source group resolves to

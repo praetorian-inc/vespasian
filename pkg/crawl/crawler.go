@@ -67,7 +67,8 @@ type CrawlerOptions struct {
 	// ResumeFrom carries cross-run resume state from a previous crawl so coverage
 	// accumulates instead of restarting (LAB-4678 Phase 4). The checkpoint is
 	// validated against the current config ([ComputeConfigFingerprint] over
-	// target, scope, depth, and backend) and CheckpointMaxAge before use; a
+	// target, scope, depth, backend, AllowPrivate and Interact — see that
+	// function for the membership rule) and CheckpointMaxAge before use; a
 	// mismatched or stale checkpoint is reported on Stderr and ignored, degrading
 	// to a full crawl rather than failing. Nil starts fresh. Honored by both
 	// backends.

@@ -234,7 +234,7 @@ type CrawlOptions struct {
 	Output          string        `short:"o" help:"Output file path"`
 	Depth           int           `default:"3" help:"Maximum crawl depth"`
 	MaxPages        int           `default:"100" help:"Maximum number of pages (URLs visited) to crawl; pages already in flight when the limit is reached still finish"`
-	MaxRequests     int           `name:"max-requests" default:"0" help:"Maximum captured requests before the crawl stops enqueuing new pages (0 = unlimited). A rate/politeness bound distinct from --max-pages; pages already in flight when the limit is reached still finish."`
+	MaxRequests     int           `name:"max-requests" default:"0" help:"Soft budget on captured requests (0 = unlimited). A rate/politeness bound distinct from --max-pages. Checked between pages and only updated once a page finishes, so the total can reach --max-requests + (--concurrency x requests-per-page) — at the default --concurrency 10 that is roughly 4x a small budget. Pass --concurrency 1 for a tight bound."`
 	Interact        bool          `name:"interact" help:"Click page controls (buttons, [role=button], [onclick]) to surface endpoints that only fire on interaction. Includes form submit buttons, so it submits forms and can mutate state. Headless backend only. Skips destructive, session-ending, and payment-commit labels on a best-effort match. Off by default."`
 	Timeout         time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
 	Scope           string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`

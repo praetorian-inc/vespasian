@@ -1168,3 +1168,92 @@ func TestWorker_MaxRequestsZeroIsUnlimited(t *testing.T) {
 		t.Errorf("emitted %d requests, want %d: MaxRequests=0 must mean unlimited", got, pages*3)
 	}
 }
+
+// TestWorker_MaxRequestsOvershoot_ScalesWithConcurrency pins the ACTUAL --max-requests
+// bound, which is not the one the docs used to state.
+//
+// TestWorker_MaxRequestsBudget_RodBackend runs at Concurrency=1, where the overshoot
+// really is one page's requests. That made the documented bound ("the final count can
+// exceed the bound by up to one page's worth of requests") look verified while the
+// default is Concurrency=10. reqCount is incremented only AFTER a visit returns and
+// the budget is consulted BEFORE one starts, so every worker can clear the check in
+// that window: the bound is MaxRequests + (Concurrency x requests-per-page). Measured
+// at the default concurrency, a budget of 10 emits 44 — over 3x the old claim, on a
+// control an operator sets precisely because they are being careful with the target.
+//
+// The assertion is two-sided on purpose. The upper bound stops the overshoot from
+// growing further; the lower bound is what fails if someone "fixes" the docs back to
+// one page without changing the code, because a Concurrency=1-shaped expectation
+// cannot hold here.
+func TestWorker_MaxRequestsOvershoot_ScalesWithConcurrency(t *testing.T) {
+	const (
+		maxRequests     = 10
+		requestsPerPage = 4
+		pages           = 200
+		concurrency     = DefaultConcurrency
+	)
+
+	// Every worker parks inside its visit long enough that all of them clear the
+	// pre-visit budget check before any increments reqCount. This is the real
+	// interleaving under a slow target, made deterministic.
+	release := make(chan struct{})
+	var arrived sync.WaitGroup
+	arrived.Add(concurrency)
+	var parked atomic.Bool
+	visit := func(_ context.Context, target urlEntry) ([]ObservedRequest, []string, error) {
+		if !parked.Load() {
+			arrived.Done()
+			<-release
+		}
+		return nRequests(target.URL, requestsPerPage), nil, nil
+	}
+
+	e := newTestEngine(engineOptions{
+		MaxRequests: maxRequests,
+		MaxDepth:    -1,
+		Concurrency: concurrency,
+	}, visit)
+
+	entries := make([]urlEntry, 0, pages)
+	for i := range pages {
+		entries = append(entries, urlEntry{URL: fmt.Sprintf("https://ex.com/p%d", i), Depth: 1})
+	}
+	e.frontier.Push(entries)
+
+	var (
+		mu        sync.Mutex
+		pageCount int
+		reqCount  int
+		emitted   atomic.Int64
+		wg        sync.WaitGroup
+	)
+	for i := range concurrency {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			e.worker(context.Background(), id, func(ObservedRequest) { emitted.Add(1) }, &mu, &pageCount, &reqCount)
+		}(i)
+	}
+
+	// Once all Concurrency workers are inside a visit, stop parking and let them run.
+	arrived.Wait()
+	parked.Store(true)
+	close(release)
+	wg.Wait()
+
+	got := int(emitted.Load())
+	onePageClaim := maxRequests + (requestsPerPage - 1)
+	realBound := maxRequests + concurrency*requestsPerPage
+
+	if got <= onePageClaim {
+		t.Errorf("emitted %d requests, which is within the old one-page claim of %d. "+
+			"At Concurrency=%d the overshoot MUST be larger; if the code now genuinely "+
+			"bounds it this tightly, update the README/CLAUDE.md/engine.go wording that "+
+			"this test exists to keep honest", got, onePageClaim, concurrency)
+	}
+	if got > realBound {
+		t.Errorf("emitted %d requests, above the documented bound MaxRequests + "+
+			"(Concurrency x requests-per-page) = %d + (%d x %d) = %d",
+			got, maxRequests, concurrency, requestsPerPage, realBound)
+	}
+}

@@ -45,7 +45,7 @@ Vespasian takes a different approach: it observes actual network traffic at the 
 | **API Type Auto-Detection** | Automatically determines API type (REST, GraphQL, WSDL) from captured traffic without manual selection. Each request votes for one type only, and a non-REST type must beat the REST surface by a margin to win, so the verdict does not flip on a single extra or missing captured request. gRPC is opt-in via `--api-type grpc` — its binary HTTP/2 framing is not auto-detected |
 | **Browser Crawling** | Two backends: headless mode drives Chrome via [go-rod](https://github.com/go-rod/rod) for full JavaScript/SPA support; non-headless mode uses a stdlib net/http engine (DFS, 150 rps, scope+SSRF redirect guard) for lightweight crawls. The headless backend uses a configured or **system Chrome** by default and does not download a browser from third-party mirrors unless explicitly opted in (supply-chain hardening); it also disables Chrome telemetry so crawl egress stays minimal |
 | **SPA Bundle Extraction** | Post-crawl pass that scans JavaScript bundles for API path strings and probes them with raw HTTP, recovering endpoints the headless browser could not exercise |
-| **Next.js Route Recovery** | Recovers App Router routes from chunk URLs (`/_next/static/chunks/app/vaults/[vaultId]/page-<hash>.js` → `/vaults/{vaultId}`), including dynamic and catch-all segments. Works on React Server Components bundles, where request paths are built at runtime and no path literal exists in the body to extract. Recovered routes are reported under `-v`; they are not emitted as spec operations, since the chunk URL does not reveal which HTTP verbs the route exports |
+| **Next.js Route Recovery** | Recovers App Router routes from chunk URLs (`/_next/static/chunks/app/vaults/[vaultId]/page-<hash>.js` → `/vaults/{vaultId}`), including dynamic and catch-all segments. Works on React Server Components bundles, where request paths are built at runtime and no path literal exists in the body to extract. Recovered routes are reported under `-v` as near-misses (reason `next-route-chunk`); they are not emitted as spec operations, since the chunk URL does not reveal which HTTP verbs the route exports |
 | **Static Form Extraction** | Statically parses `<form>` elements in captured HTML responses — including login, search, and admin forms — to surface submission endpoints and parameters that dynamic crawling may never trigger |
 | **Traffic Import** | Import existing captures from Burp Suite XML, HAR 1.2 files, and mitmproxy dumps |
 | **Active Probing** | OPTIONS discovery, JSON schema inference, WSDL document fetching, GraphQL introspection, and gRPC server reflection |
@@ -334,9 +334,14 @@ vespasian scan <url> [flags]
   --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100)
   --max-requests     Captured-request budget (0 = unlimited); a rate/politeness bound distinct
                      from --max-pages. Checked BETWEEN pages, not per request: the crawl stops
-                     taking new pages once the count is reached and lets in-flight pages finish,
-                     so the final count can exceed the bound by up to one page's worth of
-                     requests. It cannot bound below a single page's request count.
+                     taking new pages once the count is reached and lets in-flight pages finish.
+                     It is a SOFT bound and the overshoot is not small — the count is only
+                     updated after a page finishes, so every concurrent worker can start a page
+                     before any of them reports, and the total can reach
+                     --max-requests + (--concurrency x requests-per-page). With the default
+                     --concurrency 10, --max-requests 10 against pages firing 4 requests each
+                     emits about 44. It also cannot bound below a single page's request count.
+                     Use --concurrency 1 when the bound needs to be tight.
   --interact         Click buttons to surface interaction-only endpoints (headless only; off by
                      default). It matches every <button>, [role=button], and [onclick] control,
                      INCLUDING form submit buttons, so it submits forms and can mutate state.
@@ -379,9 +384,14 @@ vespasian crawl <url> [flags]
   --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100)
   --max-requests     Captured-request budget (0 = unlimited); a rate/politeness bound distinct
                      from --max-pages. Checked BETWEEN pages, not per request: the crawl stops
-                     taking new pages once the count is reached and lets in-flight pages finish,
-                     so the final count can exceed the bound by up to one page's worth of
-                     requests. It cannot bound below a single page's request count.
+                     taking new pages once the count is reached and lets in-flight pages finish.
+                     It is a SOFT bound and the overshoot is not small — the count is only
+                     updated after a page finishes, so every concurrent worker can start a page
+                     before any of them reports, and the total can reach
+                     --max-requests + (--concurrency x requests-per-page). With the default
+                     --concurrency 10, --max-requests 10 against pages firing 4 requests each
+                     emits about 44. It also cannot bound below a single page's request count.
+                     Use --concurrency 1 when the bound needs to be tight.
   --interact         Click buttons to surface interaction-only endpoints (headless only; off by
                      default). It matches every <button>, [role=button], and [onclick] control,
                      INCLUDING form submit buttons, so it submits forms and can mutate state.

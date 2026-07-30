@@ -155,10 +155,17 @@ func DetectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
 //
 // With restCount == 0 the margin term is 0 and the floor alone decides, so a
 // capture containing only challenger-typed requests takes that type. That is
-// correct: there is no dominant REST surface to discard. The failure the earlier
-// revert cited — one stray text/xml retyping a mostly-REST app — is prevented by
-// the margin, not the floor: at rest=20 a challenger needs 30 votes, so a single
-// stray cannot flip anything.
+// correct: there is no dominant REST surface to discard.
+//
+// Which mechanism stops the failure the earlier revert cited — one stray text/xml
+// retyping a mostly-REST app — depends on restCount, and it is worth being precise
+// because these constants get tuned. When REST has votes, the MARGIN stops it: at
+// rest=20 a challenger needs 30, so a single stray cannot flip anything. When
+// restCount is 0 the margin term is 0 and stops nothing; there, EXCLUSIVE ASSIGNMENT
+// in DetectAPIType is what does the work — a lone text/xml response scores higher on
+// REST (0.8, an exact apiContentTypes entry) than on WSDL, so it is a REST vote and
+// the capture is (rest=1, wsdl=0) rather than (rest=0, wsdl=1). Neither the floor nor
+// the margin is load-bearing for that case.
 func challengerWins(challengerCount, restCount int) bool {
 	if challengerCount < MinChallengerMatches {
 		return false

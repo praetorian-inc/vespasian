@@ -101,8 +101,8 @@ func TestClickAllowed(t *testing.T) {
 
 // TestIsDestructiveLabel_IrreversibleCommits covers the labels added because their
 // consequences cannot be undone by re-running the crawl. Generic mutating verbs
-// (submit, save, search) are deliberately NOT skipped — see the tradeoff note on
-// destructiveLabelSubstrings — so they are asserted safe here to pin that choice.
+// (submit, save, search) are deliberately NOT skipped — see the tradeoff note above
+// destructiveLabelWords — so they are asserted safe here to pin that choice.
 func TestIsDestructiveLabel_IrreversibleCommits(t *testing.T) {
 	for _, l := range []string{
 		"Pay now", "Submit payment", "Purchase", "Buy now",

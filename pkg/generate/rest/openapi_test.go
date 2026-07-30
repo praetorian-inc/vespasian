@@ -2561,3 +2561,51 @@ func TestBuildOperation_PreservesRequestResponsePairingByStatus(t *testing.T) {
 	assert.Contains(t, errProps, "error")
 	assert.NotContains(t, errProps, "id", "the 200 body must not leak into the 422 schema")
 }
+
+// TestComputeSourceTag_TotalOverEveryJSStaticSource pins the contract stated on
+// computeSourceTag: for non-empty input it returns exactly one of "dynamic",
+// "js-bundle", "js-sourcemap" — never "".
+//
+// It iterates every Source that crawl.IsJSStaticSource accepts, because that set is
+// what broke the contract: LAB-4678 added static:js-nextroute and static:js-nextpage
+// to IsJSStaticSource without adding them to computeSourceTag's switch, so those
+// groups fell through with friendly == "" and emitted no extension. Enumerating the
+// set here means the next Source added to IsJSStaticSource fails this test instead of
+// silently producing an empty tag.
+func TestComputeSourceTag_TotalOverEveryJSStaticSource(t *testing.T) {
+	jsStaticSources := []string{
+		crawl.SourceStaticJS,
+		crawl.SourceStaticJSSourcemap,
+		crawl.SourceNextRouteHandler,
+		crawl.SourceNextPageRoute,
+	}
+	for _, src := range jsStaticSources {
+		require.True(t, crawl.IsJSStaticSource(src),
+			"%q must be in the IsJSStaticSource set this test enumerates", src)
+	}
+
+	valid := []string{"dynamic", "js-bundle", "js-sourcemap"}
+	mk := func(src string) classify.ClassifiedRequest {
+		return classify.ClassifiedRequest{ObservedRequest: crawl.ObservedRequest{Source: src}}
+	}
+
+	for _, src := range jsStaticSources {
+		t.Run("uniform "+src, func(t *testing.T) {
+			got := computeSourceTag([]classify.ClassifiedRequest{mk(src), mk(src)})
+			assert.Contains(t, valid, got,
+				"a uniform %q group returned %q; non-empty input must always yield one of "+
+					"the three contract values, and %q means no extension is emitted at all", src, got, got)
+		})
+		t.Run("mixed with static:js "+src, func(t *testing.T) {
+			got := computeSourceTag([]classify.ClassifiedRequest{mk(crawl.SourceStaticJS), mk(src)})
+			assert.Contains(t, valid, got)
+		})
+	}
+
+	// The two contract-named sources must still map to their own values, so the
+	// totality fix did not flatten everything to "dynamic".
+	assert.Equal(t, "js-bundle", computeSourceTag([]classify.ClassifiedRequest{mk(crawl.SourceStaticJS)}))
+	assert.Equal(t, "js-sourcemap", computeSourceTag([]classify.ClassifiedRequest{mk(crawl.SourceStaticJSSourcemap)}))
+	assert.Equal(t, "dynamic", computeSourceTag([]classify.ClassifiedRequest{mk("")}))
+	assert.Equal(t, "", computeSourceTag(nil), "the empty-group contract is unchanged")
+}

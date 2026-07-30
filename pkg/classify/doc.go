@@ -28,7 +28,9 @@
 //     application/atom+xml, application/feed+json), which are documents for feed
 //     readers rather than endpoints. Routes recovered from Next.js App Router
 //     chunk URLs carry provenance only and no API signal, because the chunk URL
-//     does not reveal which verbs the route exports. Static assets are excluded. [DefaultConfidenceThreshold] is the default
+//     does not reveal which verbs the route exports; they score at
+//     [NextRouteProvenanceConfidence], which reports them via [NearMisses] without
+//     ever reaching the threshold. Static assets are excluded. [DefaultConfidenceThreshold] is the default
 //     minimum confidence.
 //   - GraphQL: detected via /graphql path, query syntax in POST body, and
 //     data/errors keys in response JSON.

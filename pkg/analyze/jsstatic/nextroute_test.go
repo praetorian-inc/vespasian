@@ -137,8 +137,11 @@ func TestNextRouteFromChunkURL(t *testing.T) {
 }
 
 // TestExtractNextRoute_SourceTags pins that the two chunk kinds carry different
-// provenance, which is what lets the classifier treat a route handler as an API
-// endpoint while leaving a page route as navigation.
+// provenance. NEITHER is an API signal — a chunk URL does not reveal which verbs the
+// module exports, so pkg/classify scores both at NextRouteProvenanceConfidence, which
+// is a reporting level that surfaces the route under -v and can never make it a spec
+// operation. The tags are distinct so the -v line and the capture record which kind
+// of chunk the route came from.
 func TestExtractNextRoute_SourceTags(t *testing.T) {
 	page := extractNextRoute("https://x.test/_next/static/chunks/app/dashboard/page-abc.js", "https://x.test/")
 	require.NotNil(t, page)

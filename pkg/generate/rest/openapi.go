@@ -225,23 +225,34 @@ func anyStaticSource(endpoints []classify.ClassifiedRequest) bool {
 // open list — a new "static:foo" source must NOT silently surface as
 // x-vespasian-source: foo because the extension consumer contract names only
 // the three non-empty values above.
+//
+// The membership test is LOCAL to this function (friendlySourceTag) rather than
+// delegated to crawl.IsJSStaticSource, and that separation is the fix for a real
+// break. IsJSStaticSource owns "is this a JS-bundle static source" for the
+// extension-emission gate (anyStaticSource); this function owns the narrower "does
+// this source have a friendly name in the consumer contract". LAB-4678 added
+// static:js-nextroute and static:js-nextpage to IsJSStaticSource but not to the
+// switch here, so the two questions silently diverged: an all-nextroute group
+// passed the IsJSStaticSource check, fell through the switch with friendly == "",
+// and returned "" — no extension emitted at all, violating the contract stated
+// above that non-empty input always yields one of the three values. A group mixing
+// static:js with static:js-nextroute returned "dynamic", falsely claiming the
+// endpoint was dynamically observed. Both were unreachable only because
+// Next.js-recovered routes score below the classification threshold and so never
+// arrive here — and rest.go names emitting them from AllowedMethods as the intended
+// follow-up, which is what would make it live.
 func computeSourceTag(group []classify.ClassifiedRequest) string {
 	if len(group) == 0 {
 		return ""
 	}
 	var tag string
 	for _, ep := range group {
-		if !crawl.IsJSStaticSource(ep.Source) {
-			// Any non-JS-static source (dynamic, empty, or static:html etc.)
-			// wins immediately.
+		friendly, ok := friendlySourceTag(ep.Source)
+		if !ok {
+			// Any source without a friendly name — dynamic, empty, static:html, or a
+			// JS-static source outside the two the contract names — is "dynamic",
+			// matching the documented catch-all above.
 			return "dynamic"
-		}
-		var friendly string
-		switch ep.Source {
-		case crawl.SourceStaticJS:
-			friendly = "js-bundle"
-		case crawl.SourceStaticJSSourcemap:
-			friendly = "js-sourcemap"
 		}
 		if tag == "" {
 			tag = friendly
@@ -252,6 +263,21 @@ func computeSourceTag(group []classify.ClassifiedRequest) string {
 		}
 	}
 	return tag
+}
+
+// friendlySourceTag maps a Source to its x-vespasian-source value, reporting false
+// for any source the consumer contract does not name. Keeping this total — every
+// input gets an answer — is what stops a newly added Source constant from producing
+// an empty tag by falling through a switch.
+func friendlySourceTag(source string) (string, bool) {
+	switch source {
+	case crawl.SourceStaticJS:
+		return "js-bundle", true
+	case crawl.SourceStaticJSSourcemap:
+		return "js-sourcemap", true
+	default:
+		return "", false
+	}
 }
 
 // mergeJSONBodies infers and merges JSON schemas from multiple body observations.
