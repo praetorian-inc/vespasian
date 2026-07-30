@@ -2323,6 +2323,28 @@ func TestOriginOf(t *testing.T) {
 	assert.Equal(t, "", originOf("/relative/path"))
 }
 
+// TestCanonicalOrigin pins CanonicalOrigin's contract (SEC-BE-001/QUAL-001,
+// LAB-4992 review): the single, shared "what is an origin" definition for
+// both pkg/crawl and pkg/generate/rest. It must agree with originOf on
+// lower-casing and default-port equivalence (so a bare-host and an
+// explicit-default-port spelling of the same origin compare equal), but
+// display the default-port-stripped form (unlike originOf, which always
+// makes the port explicit) so generated output shows "https://example.com"
+// rather than "https://example.com:443". Non-http(s) schemes and host-less
+// URLs are rejected, matching originFromURL/canonicalizeOrigin's prior
+// behavior in pkg/generate/rest.
+func TestCanonicalOrigin(t *testing.T) {
+	assert.Equal(t, "https://example.com", CanonicalOrigin("https://example.com/api"), "bare host, default port implicit")
+	assert.Equal(t, "https://example.com", CanonicalOrigin("https://example.com:443/api"), "explicit default port must strip to match the bare-host form")
+	assert.Equal(t, "http://example.com", CanonicalOrigin("http://example.com:80/api"), "explicit default http port must strip")
+	assert.Equal(t, "https://example.com:8443", CanonicalOrigin("https://example.com:8443/x"), "non-default port must be preserved")
+	assert.Equal(t, "https://example.com", CanonicalOrigin("HTTPS://Example.COM/api"), "scheme and host must lower-case")
+	assert.Equal(t, "", CanonicalOrigin("not a url"))
+	assert.Equal(t, "", CanonicalOrigin("/relative/path"), "relative (host-less) URL rejected")
+	assert.Equal(t, "", CanonicalOrigin("ftp://example.com/x"), "non-http(s) scheme rejected")
+	assert.Equal(t, "", CanonicalOrigin("https:/api/x"), "single slash after scheme is not an authority marker; host-less")
+}
+
 // TestResolveTargetOrigin pins the priority order documented on
 // ResolveTargetOrigin: explicit targetURL wins outright; otherwise fall back
 // to the first HTML-response request's origin; otherwise the first

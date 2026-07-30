@@ -678,6 +678,41 @@ func originOf(rawURL string) string {
 	return scheme + "://" + host + ":" + port
 }
 
+// CanonicalOrigin returns the canonical "scheme://host[:port]" origin of
+// rawURL for both comparison and display, or "" if rawURL does not parse to
+// a usable http(s) origin with a host present (a host-less "absolute" URL
+// such as "https:/api/x" — a single slash after the scheme is not an
+// authority marker — is rejected here rather than producing a degenerate
+// "https://" origin).
+//
+// It shares originOf's lower-casing and default-port equivalence (so
+// "https://h" and "https://h:443" are the same origin), but — unlike
+// originOf, which always makes the port explicit — strips a default port
+// from the result, so the canonical form matches the conventional display
+// shape ("https://example.com", not "https://example.com:443").
+//
+// Exported so pkg/generate/rest (and any other origin-comparing consumer)
+// shares exactly one definition of "origin" with this package, mirroring why
+// [SameOrigin], [ResolveTargetOrigin], and [IsPrintableASCIIURL] are each
+// exported (LAB-4992 review): pkg/generate/rest previously carried its own
+// origin normalization (originFromURL + canonicalizeOrigin) that disagreed
+// with this one on host case-folding and default-port handling — a trusted
+// host spelled with an explicit ":443" or mixed case never string-equalled
+// the same host derived from an endpoint URL, letting a colliding
+// attacker-controlled origin win a tie-break that the trusted host should
+// have won.
+func CanonicalOrigin(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return ""
+	}
+	origin := originOf(rawURL)
+	if dp := defaultPortForScheme(strings.ToLower(u.Scheme)); dp != "" {
+		origin = strings.TrimSuffix(origin, ":"+dp)
+	}
+	return origin
+}
+
 // firstHTMLOrigin returns the origin of the first request whose response is
 // HTML (by content type or sniffed body), or "" if none is found. It lets
 // ReplayJSExtracted bind to the real app page rather than an arbitrary first

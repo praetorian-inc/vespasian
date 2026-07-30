@@ -117,7 +117,7 @@ type OpenAPIGenerator struct {
 var explodeTrue = true
 
 // endpointKey groups endpoints by normalized path, HTTP method, AND origin
-// (scheme://host, via originFromURL).
+// (scheme://host, via crawl.CanonicalOrigin).
 //
 // SEC-BE-001 (LAB-4992 review): classify.Deduplicate keys on method+path
 // (host-agnostic), NormalizePathsWithNames' numeric-ID detection runs
@@ -141,45 +141,6 @@ type endpointKey struct {
 // APIType returns the API type.
 func (g *OpenAPIGenerator) APIType() string {
 	return "rest"
-}
-
-// originFromURL returns the "scheme://host" origin of rawURL (preserving any
-// explicit port exactly as written, unlike crawl's originOf which always
-// makes the port explicit), or "" if rawURL does not parse to a usable
-// http(s) origin. A host-less "absolute" URL (e.g. "https:/api/x", which
-// url.Parse reports as Scheme="https", Host="" — a single slash after the
-// scheme is not an authority marker) is rejected here: without this check it
-// produced a degenerate "https://" entry that sorted before every real
-// hostname and, via the title-from-primary logic, blanked info.title.
-func originFromURL(rawURL string) (string, bool) {
-	parsedURL, err := url.Parse(rawURL)
-	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
-		return "", false
-	}
-	return parsedURL.Scheme + "://" + parsedURL.Host, true
-}
-
-// canonicalizeOrigin normalizes an externally supplied origin string (e.g.
-// crawl.ResolveTargetOrigin's output, which always makes the port explicit —
-// "https://h" becomes "https://h:443") to the same "scheme://host" display
-// form originFromURL produces for endpoint URLs, stripping a redundant
-// default port. Without this, a TargetOrigin derived from a bare-host URL
-// would never string-equal (and so never dedupe against) the same origin
-// seen on an observed endpoint, producing two entries for one host.
-func canonicalizeOrigin(origin string) (string, bool) {
-	u, err := url.Parse(origin)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
-		return "", false
-	}
-	port := u.Port()
-	if (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
-		port = ""
-	}
-	host := u.Hostname()
-	if port != "" {
-		host += ":" + port
-	}
-	return u.Scheme + "://" + host, true
 }
 
 // extractServers derives the OpenAPI servers list, the info.title host, and
@@ -212,7 +173,9 @@ func canonicalizeOrigin(origin string) (string, bool) {
 // derived its answer from an arbitrary member of that mixed group. origin is
 // now part of endpointKey (see its doc comment) so a group can never mix
 // origins; Generate resolves the resulting (path, method) slot collisions by
-// letting the primary/trusted origin's group win deterministically.
+// trust rank (see trustRank), so the most-trusted colliding group always
+// wins deterministically — an excluded origin can never win over a
+// non-excluded one (SEC-BE-002), regardless of which hostname sorts first.
 //
 // Derivation:
 //  1. primary origin = targetOrigin if it parses to a usable http(s) origin;
@@ -278,15 +241,15 @@ func extractServers(endpoints []classify.ClassifiedRequest, targetOrigin string)
 }
 
 // collectEndpointOrigins partitions endpoints' origins (scheme://host, via
-// originFromURL) into dynamically observed and JS-static buckets, each
-// deduped and in first-seen order. Endpoints with an unparseable or
+// crawl.CanonicalOrigin) into dynamically observed and JS-static buckets,
+// each deduped and in first-seen order. Endpoints with an unparseable or
 // non-http(s)-with-host URL are silently skipped.
 func collectEndpointOrigins(endpoints []classify.ClassifiedRequest) (observed, jsStatic []string) {
 	seenObserved := make(map[string]bool)
 	seenJSStatic := make(map[string]bool)
 	for _, ep := range endpoints {
-		origin, ok := originFromURL(ep.URL)
-		if !ok {
+		origin := crawl.CanonicalOrigin(ep.URL)
+		if origin == "" {
 			continue
 		}
 		if crawl.IsJSStaticSource(ep.Source) {
@@ -305,10 +268,10 @@ func collectEndpointOrigins(endpoints []classify.ClassifiedRequest) (observed, j
 }
 
 // choosePrimaryOrigin picks the primary origin: targetOrigin if it
-// canonicalizes to a usable http(s) origin, else the lowest-sorted
-// dynamically observed origin, else "" (no vouched origin).
+// canonicalizes (crawl.CanonicalOrigin) to a usable http(s) origin, else the
+// lowest-sorted dynamically observed origin, else "" (no vouched origin).
 func choosePrimaryOrigin(targetOrigin string, observedOrigins []string) string {
-	if primary, ok := canonicalizeOrigin(targetOrigin); ok {
+	if primary := crawl.CanonicalOrigin(targetOrigin); primary != "" {
 		return primary
 	}
 	if len(observedOrigins) == 0 {
@@ -354,7 +317,7 @@ func groupEndpoints(endpoints []classify.ClassifiedRequest, opts NormalizeOption
 	for _, p := range parsed {
 		// origin ("" if unparseable/host-less) is part of the key (SEC-BE-001)
 		// so a group can never mix endpoints from different origins.
-		origin, _ := originFromURL(p.endpoint.URL)
+		origin := crawl.CanonicalOrigin(p.endpoint.URL)
 		key := endpointKey{path: normalized[p.path], method: strings.ToLower(p.endpoint.Method), origin: origin}
 		endpointGroups[key] = append(endpointGroups[key], p.endpoint)
 	}
@@ -849,78 +812,59 @@ func recordCollisionOrigin(winner *openapi3.Operation, origin string) {
 	winner.Extensions["x-vespasian-collision-origins"] = existing
 }
 
-// Generate produces an OpenAPI specification.
-func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]byte, error) { //nolint:gocyclo // top-level generation orchestration
-	if len(endpoints) == 0 {
-		return nil, nil
+// trustRank orders an origin by how much this run can vouch for it, lowest
+// = most trusted. Generate's keys sort (below) tie-breaks a (path, method)
+// slot collision by this rank rather than by the origin string itself, so
+// that a colliding slot is always won by the most trusted origin present:
+//
+//	0 — the primary origin (the run's vouched origin; see choosePrimaryOrigin)
+//	1 — any other non-excluded origin: dynamically observed, or JS-static
+//	    same-origin with primary — both already passed extractServers'
+//	    admission and sit in the global servers list
+//	2 — an excluded origin: cross-origin JS-static, never probed, and
+//	    named only by content the run does not control (the bundle itself)
+//
+// INVARIANT: an origin in excludedOrigins must NEVER win a (path, method)
+// slot that a non-excluded group also claims.
+//
+// SEC-BE-002 (LAB-4992 review): the prior tie-break compared each colliding
+// origin to primaryOrigin as a single boolean (iPrimary/jPrimary). That
+// abstains whenever NEITHER colliding origin IS the primary — a real,
+// dynamically-observed endpoint (e.g. captured on a different page than the
+// primary) colliding with an excluded, cross-origin JS-static literal falls
+// straight through to a plain byte-compare of the origin strings, so an
+// attacker who controls the JS-static literal's URL can win the slot simply
+// by choosing a hostname that sorts first. This 3-level rank makes that
+// case explicit and impossible: rank 2 (excluded) can never beat rank 0 or
+// 1 (not excluded), regardless of which hostname sorts first.
+func trustRank(origin, primaryOrigin string, excludedOrigins map[string]bool) int {
+	switch {
+	case origin == primaryOrigin:
+		return 0
+	case excludedOrigins[origin]:
+		return 2
+	default:
+		return 1
 	}
+}
 
-	// Extract servers and title
-	servers, titleHost, excludedOrigins := extractServers(endpoints, g.TargetOrigin)
-
-	// Create OpenAPI document
-	doc := &openapi3.T{
-		OpenAPI: "3.0.3",
-		Info: &openapi3.Info{
-			Title:   titleHost,
-			Version: "1.0.0",
-		},
-		Paths:   openapi3.NewPaths(),
-		Servers: servers,
-	}
-
-	// Group and sort endpoints
-	endpointGroups := groupEndpoints(endpoints, NormalizeOptions{MergeSlugs: g.MergeSlugs, SlugThreshold: g.SlugThreshold})
-
-	// Determine whether to emit x-vespasian-source extensions.
-	// Only emitted when at least one input request has a "static:" Source so that
-	// output is byte-identical to pre-LAB-2108 when --analyze-js is not in use.
-	staticPresent := anyStaticSource(endpoints)
-
-	// primaryOrigin is the origin extractServers placed at servers[0] (the
-	// vouched TargetOrigin if usable, else the lowest-sorted dynamically
-	// observed origin, else "" when the run cannot vouch for anything). Used
-	// below to make the (path, method) slot collision below resolve to the
-	// trusted origin, not to whichever origin's endpoint happened to sort
-	// first alphabetically.
-	primaryOrigin := ""
-	if len(servers) > 0 {
-		primaryOrigin = servers[0].URL
-	}
-
-	// Sort endpoint keys for deterministic output. SEC-BE-001: origin is now
-	// part of endpointKey, so two groups can share a (path, method) slot in
-	// doc.Paths (only one can occupy it — see the collision handling below).
-	// The primary origin sorts first for a shared (path, method) so it always
-	// wins that slot, independent of capture order (LAB-4678) and independent
-	// of which origin's hostname happens to sort first alphabetically.
-	keys := make([]endpointKey, 0, len(endpointGroups))
-	for k := range endpointGroups {
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].path != keys[j].path {
-			return keys[i].path < keys[j].path
-		}
-		if keys[i].method != keys[j].method {
-			return keys[i].method < keys[j].method
-		}
-		iPrimary := keys[i].origin == primaryOrigin
-		jPrimary := keys[j].origin == primaryOrigin
-		if iPrimary != jPrimary {
-			return iPrimary
-		}
-		return keys[i].origin < keys[j].origin
-	})
-
+// resolveCollisions builds each key's operation and places it into
+// doc.Paths, resolving (path, method) slot collisions between groups whose
+// paths and methods normalize identically but whose origins differ
+// (SEC-BE-001/SEC-BE-002). keys must already be sorted (see Generate) so
+// that, for any set of keys colliding on the same (path, method), the
+// lowest-trustRank (most trusted) key is the first one encountered for that
+// slot — every later key for the same slot is a loser whose origin is
+// recorded via recordCollisionOrigin instead of building a second,
+// unreachable Operation.
+func resolveCollisions(doc *openapi3.T, keys []endpointKey, endpointGroups map[endpointKey][]classify.ClassifiedRequest, staticPresent bool, excludedOrigins map[string]bool) {
 	// occupiedSlots tracks which (path, method) slot each already-built
 	// operation occupies, so a later colliding group (same path+method,
 	// different origin) is detected rather than silently overwriting the
-	// winner set by the sort above.
+	// winner set by the caller's sort.
 	type slot struct{ path, method string }
 	occupiedSlots := make(map[slot]*openapi3.Operation)
 
-	// Build paths
 	for _, key := range keys {
 		group := endpointGroups[key]
 
@@ -929,10 +873,10 @@ func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]b
 
 		s := slot{key.path, key.method}
 		if winner, collided := occupiedSlots[s]; collided {
-			// SEC-BE-001: two groups (distinct origins) normalized to the
-			// same (path, method) slot; only one Operation fits in
-			// doc.Paths. The sort above guarantees `winner` is the
-			// primary-origin (or otherwise deterministic) group — this
+			// SEC-BE-001/SEC-BE-002: two groups (distinct origins)
+			// normalized to the same (path, method) slot; only one
+			// Operation fits in doc.Paths. The caller's sort guarantees
+			// `winner` is the lowest-trustRank (most trusted) group — this
 			// later group must not clobber it. The loss is made visible on
 			// the winning operation (same style as x-vespasian-source)
 			// rather than silently discarded.
@@ -965,6 +909,75 @@ func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]b
 			pathItem.Options = operation
 		}
 	}
+}
+
+// Generate produces an OpenAPI specification.
+func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]byte, error) {
+	if len(endpoints) == 0 {
+		return nil, nil
+	}
+
+	// Extract servers and title
+	servers, titleHost, excludedOrigins := extractServers(endpoints, g.TargetOrigin)
+
+	// Create OpenAPI document
+	doc := &openapi3.T{
+		OpenAPI: "3.0.3",
+		Info: &openapi3.Info{
+			Title:   titleHost,
+			Version: "1.0.0",
+		},
+		Paths:   openapi3.NewPaths(),
+		Servers: servers,
+	}
+
+	// Group and sort endpoints
+	endpointGroups := groupEndpoints(endpoints, NormalizeOptions{MergeSlugs: g.MergeSlugs, SlugThreshold: g.SlugThreshold})
+
+	// Determine whether to emit x-vespasian-source extensions.
+	// Only emitted when at least one input request has a "static:" Source so that
+	// output is byte-identical to pre-LAB-2108 when --analyze-js is not in use.
+	staticPresent := anyStaticSource(endpoints)
+
+	// primaryOrigin is the origin extractServers placed at servers[0] (the
+	// vouched TargetOrigin if usable, else the lowest-sorted dynamically
+	// observed origin, else "" when the run cannot vouch for anything). Fed
+	// into trustRank below so the (path, method) slot collision resolves to
+	// the most trusted colliding origin, never to whichever origin's
+	// hostname happens to sort first alphabetically.
+	primaryOrigin := ""
+	if len(servers) > 0 {
+		primaryOrigin = servers[0].URL
+	}
+
+	// Sort endpoint keys for deterministic output. SEC-BE-001: origin is now
+	// part of endpointKey, so two groups can share a (path, method) slot in
+	// doc.Paths (only one can occupy it — see resolveCollisions). The
+	// lowest-trustRank origin sorts first for a shared (path, method) — see
+	// trustRank's doc comment for why rank, not a primary/non-primary
+	// boolean, is required — and the trailing origin-string compare exists
+	// only to keep the sort a strict total order (LAB-4678's determinism
+	// guarantee) among keys that share the same rank.
+	keys := make([]endpointKey, 0, len(endpointGroups))
+	for k := range endpointGroups {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].path != keys[j].path {
+			return keys[i].path < keys[j].path
+		}
+		if keys[i].method != keys[j].method {
+			return keys[i].method < keys[j].method
+		}
+		ri := trustRank(keys[i].origin, primaryOrigin, excludedOrigins)
+		rj := trustRank(keys[j].origin, primaryOrigin, excludedOrigins)
+		if ri != rj {
+			return ri < rj
+		}
+		return keys[i].origin < keys[j].origin
+	})
+
+	resolveCollisions(doc, keys, endpointGroups, staticPresent, excludedOrigins)
 
 	// Extract schemas to components/schemas with $ref references
 	extractComponents(doc)

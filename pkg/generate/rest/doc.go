@@ -35,10 +35,14 @@
 //     (SEC-BE-001). Grouping is origin-aware (origin is part of the internal
 //     endpointKey), so a group can never mix endpoints from different
 //     origins and the override is always correct for its group; when two
-//     groups' normalized path+method collide across origins, the
-//     primary/trusted origin's operation deterministically wins that slot,
-//     and the suppressed group is recorded (not silently dropped) via the
-//     `x-vespasian-collision-origins` extension on the winning operation.
+//     groups' normalized path+method collide across origins, the colliding
+//     group with the lowest trust rank deterministically wins that slot —
+//     the primary origin first, then any other non-excluded origin, then an
+//     excluded origin last, so an excluded (unprobed, attacker-influenceable)
+//     origin can never win over a non-excluded one regardless of which
+//     hostname sorts first (SEC-BE-002) — and the suppressed group is
+//     recorded (not silently dropped) via the `x-vespasian-collision-origins`
+//     extension on the winning operation.
 //     static:html is deliberately NOT treated as JS-static here — the page
 //     carrying the form was fetched over the wire during the crawl.
 //   - [NormalizePathsWithNames] is the primary normalization entry point. It

@@ -664,6 +664,42 @@ func TestExtractServers_SameOriginJSStaticAdmitted(t *testing.T) {
 	assert.False(t, excluded["https://www.example.com"], "the trusted, same-origin host must never be reported as excluded")
 }
 
+// TestExtractServers_ExplicitPortDedupesWithBareHostTargetOrigin is
+// SEC-BE-001/QUAL-001 (LAB-4992 review): originFromURL preserved an
+// endpoint's port EXACTLY as written while canonicalizeOrigin (applied only
+// to TargetOrigin) stripped a redundant default port — two different
+// normalizations of the same origin. An endpoint spelled with an explicit
+// ":443" therefore never string-equalled a bare-host TargetOrigin for the
+// SAME host, producing two server entries for one host. Both sides now go
+// through the single crawl.CanonicalOrigin, so they agree.
+func TestExtractServers_ExplicitPortDedupesWithBareHostTargetOrigin(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://www.example.com:443/api/users", ""),
+	}
+
+	servers, titleHost, _ := extractServers(endpoints, "https://www.example.com")
+
+	require.Len(t, servers, 1, "the explicit-port endpoint origin must dedupe against the bare-host TargetOrigin, not produce a second entry")
+	assert.Equal(t, "https://www.example.com", servers[0].URL)
+	assert.Equal(t, "www.example.com API", titleHost)
+}
+
+// TestExtractServers_MixedCaseHostDedupes is QUAL-001 (LAB-4992 review): a
+// mixed-case endpoint host (as commonly seen in captured traffic) must
+// canonicalize to the same lower-cased origin as the TargetOrigin, not
+// produce a second, case-distinct server entry.
+func TestExtractServers_MixedCaseHostDedupes(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://App.Example.com/api/users", ""),
+	}
+
+	servers, titleHost, _ := extractServers(endpoints, "https://app.example.com")
+
+	require.Len(t, servers, 1, "a mixed-case host must dedupe against the lower-cased TargetOrigin, not produce two entries")
+	assert.Equal(t, "https://app.example.com", servers[0].URL)
+	assert.Equal(t, "app.example.com API", titleHost)
+}
+
 // TestBuildOperation_CrossOriginJSStaticGetsPerOperationServersOverride is the
 // SEC-BE-001 regression guard: groupEndpoints groups purely by normalized path
 // and method, ignoring host, so a JS-static endpoint recovered on a different
@@ -787,6 +823,170 @@ func TestGenerate_CollisionTrustedOriginWinsSlot(t *testing.T) {
 	// the collision loss must be recorded visibly on the winning operation.
 	assert.Contains(t, string(spec), "x-vespasian-collision-origins", "the suppressed cross-origin group's loss must be recorded visibly, not silently dropped")
 	assert.Contains(t, string(spec), "a.evil.example", "the recorded collision must name the suppressed origin")
+}
+
+// TestGenerate_ExplicitPortTrustedOriginWinsSlotAndDedupes is SEC-BE-001
+// (LAB-4992 review): reproduces the exact scenario from the finding — the
+// trusted endpoint is captured with an explicit ":443" while TargetOrigin
+// arrives in the same production shape (crawl.ResolveTargetOrigin always
+// makes the port explicit). Before the fix, originFromURL preserved the
+// endpoint's port verbatim while canonicalizeOrigin stripped TargetOrigin's,
+// so the two never string-equalled: the trusted host lost its own
+// tie-break to the attacker origin, AND the spec listed both
+// "https://app.example.com" and "https://app.example.com:443" as separate
+// servers. With both sides canonicalized identically, the trusted host must
+// win its slot and appear exactly once in servers.
+func TestGenerate_ExplicitPortTrustedOriginWinsSlotAndDedupes(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://app.example.com:443/api/users/42", ""),
+		makeClassified("GET", "https://a.evil.example/api/users/7", "static:js"),
+	}
+
+	gen := &OpenAPIGenerator{Format: "yaml", TargetOrigin: "https://app.example.com:443"}
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err)
+
+	var parsed struct {
+		Servers []struct {
+			URL string `yaml:"url"`
+		} `yaml:"servers"`
+		Paths map[string]struct {
+			Get struct {
+				Servers []struct {
+					URL string `yaml:"url"`
+				} `yaml:"servers"`
+			} `yaml:"get"`
+		} `yaml:"paths"`
+	}
+	require.NoError(t, yaml.Unmarshal(spec, &parsed))
+
+	require.Len(t, parsed.Servers, 1, "the explicit-port trusted origin must dedupe to a single server entry, not two")
+	assert.Equal(t, "https://app.example.com", parsed.Servers[0].URL)
+	for _, s := range parsed.Servers {
+		assert.NotEqual(t, "https://a.evil.example", s.URL, "attacker origin must never appear in the global servers list")
+	}
+
+	require.Len(t, parsed.Paths, 1, "both observations must collide onto a single path slot")
+	for _, pathItem := range parsed.Paths {
+		assert.Empty(t, pathItem.Get.Servers, "the trusted-origin operation that wins the slot must not carry a spurious servers override")
+	}
+
+	assert.Contains(t, string(spec), "x-vespasian-collision-origins", "the suppressed attacker group's loss must be recorded, not silently dropped")
+	assert.Contains(t, string(spec), "a.evil.example", "the recorded collision must name the suppressed attacker origin")
+}
+
+// TestGenerate_CollisionNeitherOriginPrimary_TrustRankPicksObservedOverExcluded
+// is the SEC-BE-002 fix verification. The prior tie-break compared each
+// colliding origin to primaryOrigin as a single boolean — when NEITHER
+// colliding origin IS the primary, it abstained and fell through to a plain
+// byte-compare of the (attacker-controlled) origin string. Here the REAL
+// endpoint is observed on a non-primary, non-excluded origin
+// (api.example.com — a page other than the primary served this API, but it
+// WAS actually seen on the wire) and the attacker endpoint is an unprobed,
+// cross-origin JS-static literal. Neither equals the primary
+// (app.example.com). The real, non-excluded origin must win regardless of
+// which hostname sorts first alphabetically — that is the whole point of
+// ranking by trust rather than by origin string.
+func TestGenerate_CollisionNeitherOriginPrimary_TrustRankPicksObservedOverExcluded(t *testing.T) {
+	cases := []struct {
+		name         string
+		attackerHost string
+	}{
+		{name: "attacker hostname sorts before the real observed host", attackerHost: "a.evil.example"},
+		{name: "attacker hostname sorts after the real observed host", attackerHost: "zzz.evil.example"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			attackerOrigin := "https://" + tc.attackerHost
+			endpoints := []classify.ClassifiedRequest{
+				makeClassified("GET", "https://api.example.com/api/users/42", ""),
+				makeClassified("GET", attackerOrigin+"/api/users/7", "static:js"),
+			}
+
+			gen := &OpenAPIGenerator{Format: "yaml", TargetOrigin: "https://app.example.com:443"}
+			spec, err := gen.Generate(endpoints)
+			require.NoError(t, err)
+			specStr := string(spec)
+
+			var parsed struct {
+				Servers []struct {
+					URL string `yaml:"url"`
+				} `yaml:"servers"`
+				Paths map[string]struct {
+					Get struct {
+						Servers []struct {
+							URL string `yaml:"url"`
+						} `yaml:"servers"`
+					} `yaml:"get"`
+				} `yaml:"paths"`
+			}
+			require.NoError(t, yaml.Unmarshal(spec, &parsed))
+
+			serverURLs := make([]string, 0, len(parsed.Servers))
+			for _, s := range parsed.Servers {
+				serverURLs = append(serverURLs, s.URL)
+				assert.NotEqual(t, attackerOrigin, s.URL, "attacker origin must never appear in the global servers list")
+			}
+			assert.Contains(t, serverURLs, "https://api.example.com", "the real observed endpoint's origin must remain in the global servers list")
+
+			require.Len(t, parsed.Paths, 1, "both observations must collide onto a single path slot")
+			for path, item := range parsed.Paths {
+				assert.Empty(t, item.Get.Servers,
+					"the winning operation is the real observed (non-excluded) origin, which needs no per-operation override (path %s)", path)
+			}
+
+			assert.Contains(t, specStr, "x-vespasian-collision-origins", "the suppressed attacker group's loss must be recorded, not silently dropped")
+			assert.Contains(t, specStr, tc.attackerHost, "the recorded collision must name the suppressed attacker origin")
+		})
+	}
+}
+
+// TestGenerate_ThreeOriginCollision_RecordsAllSuppressedOrigins is TEST-001
+// (LAB-4992 review): every prior collision test produced exactly ONE
+// suppressed origin, so recordCollisionOrigin's "existing" slice was always
+// nil and the append-to-existing branch never ran. Here three origins
+// collide on one (path, method) slot, so the SECOND recordCollisionOrigin
+// call must append to (not replace) the first. Asserts the full recorded
+// value, not merely that it Contains one of the two losers.
+func TestGenerate_ThreeOriginCollision_RecordsAllSuppressedOrigins(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://app.example.com/api/thing", ""),
+		makeClassified("GET", "https://other.example.com/api/thing", ""),
+		makeClassified("GET", "https://evil.example/api/thing", "static:js"),
+	}
+
+	gen := &OpenAPIGenerator{Format: "yaml", TargetOrigin: "https://app.example.com"}
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err)
+
+	var parsed map[string]any
+	require.NoError(t, yaml.Unmarshal(spec, &parsed))
+
+	paths, ok := parsed["paths"].(map[string]any)
+	require.True(t, ok, "expected a paths map")
+	require.Len(t, paths, 1, "all three observations must collide onto a single path slot")
+
+	var getOp map[string]any
+	for _, pathItemAny := range paths {
+		pathItem, ok := pathItemAny.(map[string]any)
+		require.True(t, ok)
+		getOp, ok = pathItem["get"].(map[string]any)
+		require.True(t, ok)
+	}
+	require.NotNil(t, getOp)
+
+	rawOrigins, ok := getOp["x-vespasian-collision-origins"].([]any)
+	require.True(t, ok, "expected x-vespasian-collision-origins on the winning operation")
+
+	origins := make([]string, 0, len(rawOrigins))
+	for _, o := range rawOrigins {
+		s, ok := o.(string)
+		require.True(t, ok)
+		origins = append(origins, s)
+	}
+	assert.Equal(t, []string{"https://evil.example", "https://other.example.com"}, origins,
+		"both suppressed origins must be recorded in full, not just the last one (TEST-001)")
 }
 
 func TestP0Fixes_ContextAwarePathParams(t *testing.T) {
