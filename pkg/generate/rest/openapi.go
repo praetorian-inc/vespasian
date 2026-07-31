@@ -243,10 +243,10 @@ func extractServers(endpoints []classify.ClassifiedRequest, targetOrigin string)
 	// same-origin admission arm here without first breaking that invariant.
 	excluded := make(map[string]bool)
 	for _, origin := range sortedCopy(jsStaticOrigins) {
-		switch {
-		case serverSet[origin]:
-			// Already vouched for; a bundle naming it changes nothing.
-		default:
+		// serverSet already holds every vouched origin (primary plus each
+		// dynamically observed one), so a bundle merely naming one of them
+		// cannot demote it.
+		if !serverSet[origin] {
 			excluded[origin] = true
 		}
 	}

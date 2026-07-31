@@ -228,6 +228,53 @@ func TestValidateURL(t *testing.T) {
 	}
 }
 
+// TestValidateTargetURL_RejectsUnresolvableOrigin is SEC-BE-001 (LAB-4992
+// review). validateTargetURL delegated entirely to validateURL, which checks
+// only parse + scheme + non-empty Host. But the origin the run actually
+// enforces with is crawl.CanonicalOrigin, which fails closed on two shapes
+// validateURL accepts: a host with a duplicated port ("host:8443:8443" — a
+// realistic paste error, which url.Parse accepts because it validates only the
+// segment after the LAST colon) and a bracketed IPv6 literal carrying a zone
+// ID. For those, CanonicalOrigin returns "" and crawl.ResolveTargetOrigin
+// silently skips its explicit-target step, rebinding the probe origin to the
+// capture-derived one — exactly the wrong-origin footgun --target-url exists to
+// prevent. Because JS-replay forwards --header credentials to whatever it
+// considers same-origin, the operator's credentials would then be sent to the
+// capture-derived origin instead of the one they pinned, with no error.
+//
+// The rule: validate with the same predicate the run enforces with, so a
+// --target-url the CLI accepts can never fail to resolve later.
+func TestValidateTargetURL_RejectsUnresolvableOrigin(t *testing.T) {
+	tests := []struct {
+		name    string
+		url     string
+		wantErr bool
+	}{
+		{"empty is allowed (origin derived from capture)", "", false},
+		{"plain https", "https://example.com", false},
+		{"explicit port", "https://example.com:8443", false},
+		{"bracketed IPv6", "https://[2001:db8::1]:8443", false},
+		{"duplicated port", "https://host:8443:8443/", true},
+		{"IPv6 zone id", "https://[fe80::1%25eth0]/", true},
+		{"missing scheme", "example.com", true},
+		{"ftp scheme", "ftp://example.com", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateTargetURL(tt.url)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateTargetURL(%q) error = %v, wantErr %v", tt.url, err, tt.wantErr)
+			}
+			// The invariant: anything accepted must resolve to a usable origin.
+			if err == nil && tt.url != "" && crawl.CanonicalOrigin(tt.url) == "" {
+				t.Errorf("validateTargetURL(%q) accepted a value that canonicalizes to an empty origin; "+
+					"ResolveTargetOrigin will silently fall back to the capture-derived origin", tt.url)
+			}
+		})
+	}
+}
+
 func TestParseHeaders_Valid(t *testing.T) {
 	tests := []struct {
 		name    string

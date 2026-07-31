@@ -707,22 +707,19 @@ func originOf(rawURL string) string {
 	scheme := strings.ToLower(u.Scheme)
 	bracketed := strings.HasPrefix(u.Host, "[")
 	host := strings.ToLower(u.Hostname())
-	switch {
-	case bracketed && strings.Contains(host, "%"):
-		// Bracketed IPv6 literal carrying a zone ID: re-bracketing verbatim
-		// would embed a raw "%", which is invalid in a URL. Fail closed.
+	// Two shapes cannot yield a valid origin, so both fail closed rather than
+	// fabricate a string that will not re-parse (see doc comment above):
+	// a bracketed literal carrying a zone ID, whose "%" is invalid in a URL,
+	// and a host containing ":" that url.Parse did NOT bracket, which is a
+	// malformed authority rather than an IP literal.
+	if (bracketed && strings.Contains(host, "%")) || (!bracketed && strings.Contains(host, ":")) {
 		return ""
-	case bracketed:
-		// Genuine bracketed IPv6 literal: put the brackets Hostname() stripped
-		// back on, so the origin stays syntactically valid and distinguishable
-		// from a differently-bracketed spelling of a similar-looking literal
-		// (see doc comment above).
+	}
+	if bracketed {
+		// Genuine bracketed IPv6 literal: put back the brackets Hostname()
+		// stripped, so the origin stays syntactically valid and distinguishable
+		// from a differently-bracketed spelling of a similar-looking literal.
 		host = "[" + host + "]"
-	case strings.Contains(host, ":"):
-		// Host contains ":" but url.Parse did NOT bracket it: not an IP
-		// literal at all, a malformed authority (see doc comment above). Fail
-		// closed rather than fabricate an invalid, non-reparseable origin.
-		return ""
 	}
 	port := u.Port()
 	if port == "" {

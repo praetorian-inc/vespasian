@@ -795,12 +795,29 @@ func main() {
 // Delegates the parse/scheme/host check to validateURL so the two
 // validators can't drift; this also means --target-url now requires http/https
 // like the crawl/scan target URL does.
+//
+// It then re-checks the value through crawl.CanonicalOrigin — the SAME
+// predicate the run later enforces with — because validateURL's parse/scheme/
+// non-empty-Host test is strictly weaker (SEC-BE-001, LAB-4992 review). Two
+// shapes it accepts canonicalize to "": a duplicated port ("host:8443:8443",
+// which url.Parse tolerates because it validates only the segment after the
+// LAST colon) and a bracketed IPv6 literal carrying a zone ID. For those,
+// crawl.ResolveTargetOrigin silently skips its explicit-target step and rebinds
+// the probe origin to the capture-derived one; since JS-replay forwards
+// --header credentials to whatever it treats as same-origin, the operator's
+// credentials would go to that rebound origin rather than the pinned one, with
+// no error shown. Validating with the enforcing predicate means a --target-url
+// the CLI accepts can never fail to resolve later.
 func validateTargetURL(raw string) error {
 	if raw == "" {
 		return nil
 	}
 	if err := validateURL(raw); err != nil {
 		return fmt.Errorf("invalid --target-url %q: %w", raw, err)
+	}
+	if crawl.CanonicalOrigin(raw) == "" {
+		return fmt.Errorf("invalid --target-url %q: host is not a usable origin "+
+			"(check for a duplicated port such as \"host:8443:8443\", or an IPv6 zone id)", raw)
 	}
 	return nil
 }
