@@ -39,6 +39,25 @@ type ClassifiedRequest struct {
 	// should fall back to len-based detection in that case.
 	MultiValueQueryKeys map[string]bool `json:"multi_value_query_keys,omitempty"`
 
+	// MergedResponses holds responses from other observations of this same
+	// endpoint that Deduplicate collapsed into this entry, excluding the one
+	// retained in ObservedRequest.Response. Bounded by MaxMergedResponses.
+	//
+	// It exists because the dedup key hashes the REQUEST body, so two observations
+	// of a bodyless endpoint — every GET — collapse to one entry and
+	// preferredResponse keeps a single response. The OpenAPI generator's schema
+	// union then had nothing to union: GET /users returning [{"id":1,"name":"a"}]
+	// and later [{"id":2,"email":"b@x"}] emitted a schema without `email`, which is
+	// the exact case LAB-4678 Phase 3 set out to fix. The union code was correct
+	// and unreachable, because Deduplicate runs before the generator
+	// (internal/pipeline/pipeline.go) and --deduplicate defaults to true.
+	//
+	// Carrying the extra responses here rather than splitting them into separate
+	// dedup entries keeps the endpoint count, and therefore the probe workload,
+	// unchanged — probing iterates deduplicated endpoints, so a response-shaped
+	// dedup key would have re-probed one URL once per distinct response body.
+	MergedResponses []crawl.ObservedResponse `json:"merged_responses,omitempty"`
+
 	// Probe-enriched fields (populated by pkg/probe strategies)
 	AllowedMethods []string               `json:"allowed_methods,omitempty"`
 	ResponseSchema map[string]interface{} `json:"response_schema,omitempty"`

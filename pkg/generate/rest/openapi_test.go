@@ -2584,7 +2584,11 @@ func TestComputeSourceTag_TotalOverEveryJSStaticSource(t *testing.T) {
 			"%q must be in the IsJSStaticSource set this test enumerates", src)
 	}
 
-	valid := []string{"dynamic", "js-bundle", "js-sourcemap"}
+	// Every JS-static source now has its OWN name rather than collapsing to
+	// "dynamic". A recovered Next.js route that reaches the generator must not
+	// claim it was dynamically observed — it was read off a chunk URL and never
+	// requested.
+	valid := []string{"dynamic", "js-bundle", "js-sourcemap", "js-nextroute", "js-nextpage"}
 	mk := func(src string) classify.ClassifiedRequest {
 		return classify.ClassifiedRequest{ObservedRequest: crawl.ObservedRequest{Source: src}}
 	}
@@ -2594,7 +2598,10 @@ func TestComputeSourceTag_TotalOverEveryJSStaticSource(t *testing.T) {
 			got := computeSourceTag([]classify.ClassifiedRequest{mk(src), mk(src)})
 			assert.Contains(t, valid, got,
 				"a uniform %q group returned %q; non-empty input must always yield one of "+
-					"the three contract values, and %q means no extension is emitted at all", src, got, got)
+					"the contract values, and anything else means no extension is emitted at all", src, got)
+			assert.NotEqual(t, "dynamic", got,
+				"a uniform %q group must not report %q: the endpoint was recovered "+
+					"statically and never requested", src, "dynamic")
 		})
 		t.Run("mixed with static:js "+src, func(t *testing.T) {
 			got := computeSourceTag([]classify.ClassifiedRequest{mk(crawl.SourceStaticJS), mk(src)})

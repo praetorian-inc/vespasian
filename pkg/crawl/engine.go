@@ -26,6 +26,8 @@ import (
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
+
+	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 )
 
 // DefaultStableWait is the default DOM stability wait duration.
@@ -157,7 +159,7 @@ type rodEngine struct {
 	opts     engineOptions
 	frontier *urlFrontier
 
-	// seedKey is frontierKey(seedURL), set by Crawl before any worker starts and
+	// seedKey is canonicalizeURL(seedURL, false), set by Crawl before any worker starts and
 	// read-only afterwards. It identifies the SEED entry so learnSeedOrigin can gate
 	// on "is this the seed" rather than on "is this depth 0"; see learnSeedOrigin for
 	// why depth is not a valid proxy once resume exists.
@@ -224,7 +226,11 @@ func newRodEngine(wsURL string, opts engineOptions) (*rodEngine, error) {
 func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(ObservedRequest)) error {
 	// Record which frontier entry IS the seed, before any worker starts. Written
 	// once here and only read afterwards, so no synchronization is needed.
-	e.seedKey = frontierKey(seedURL)
+	// Full canonical URL, not the query-stripped frontier key: the frontier now
+	// admits several query variants of one path, so the stripped form no longer
+	// identifies a single entry and a variant of the seed's path would have been
+	// mistaken for the seed itself.
+	e.seedKey = canonicalizeURL(seedURL, false)
 
 	// Seed the frontier. If Push adds zero entries the seed was rejected
 	// (malformed URL, scope mismatch, or — the common case — the seed is a
@@ -269,34 +275,11 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 	//
 	// MaxRequests (LAB-4678 Phase 3) is a second, independent budget: a
 	// rate/politeness bound on the total number of captured requests, distinct
-	// from the crawl-breadth MaxPages. It stops taking new pages once the
-	// captured-request count reaches the bound; like MaxPages it is graceful —
-	// pages already in flight finish and emit their requests rather than being
-	// cut mid-capture.
-	//
-	// OVERSHOOT, stated precisely because it is much larger than "one page" and an
-	// operator sets this against a target they are being careful with. reqCount is
-	// incremented only AFTER a visit returns, while the budget is consulted BEFORE
-	// one starts, so all Concurrency workers can clear the check in the window
-	// before any of them increments. The bound is therefore
-	//
-	//	MaxRequests + (Concurrency x requests-per-page)
-	//
-	// not MaxRequests + one page's requests. Measured: MaxRequests=10 at the
-	// default Concurrency=10 with 4 requests per page emits 44. It also cannot
-	// bound BELOW a single page's request count. Unlike MaxPages — where
-	// budgetReached's reserve makes the page cap exact — a request budget cannot be
-	// reserved, because a page's request count is unknown until the page has been
-	// visited. Tightening this means either capping in-flight pages as the budget
-	// nears or cutting a page mid-capture, both of which trade away the graceful
-	// drain; that is a design change, not a doc fix. The real bound is pinned by
-	// TestWorker_MaxRequestsOvershoot_ScalesWithConcurrency, so the number quoted
-	// here and in the README cannot drift from the behavior again.
-	var (
-		mu        sync.Mutex
-		pageCount int
-		reqCount  int
-	)
+	// from the crawl-breadth MaxPages. Both are enforced by crawlBudget, which
+	// RESERVES an estimated request cost before a page starts rather than
+	// counting only after it finishes — see that type for why counting after was
+	// not a bound at all.
+	budget := newCrawlBudget(e.opts.MaxPages, e.opts.MaxRequests)
 
 	// Workers run under ctx directly. The page budget no longer cancels the
 	// crawl (it just stops workers from taking new pages under the mutex), so
@@ -307,7 +290,7 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			e.worker(ctx, id, onResult, &mu, &pageCount, &reqCount)
+			e.worker(ctx, id, onResult, budget)
 		}(i)
 	}
 
@@ -328,37 +311,171 @@ func (e *rodEngine) Close() error {
 	return e.browser.Close()
 }
 
-// budgetReached reports whether either crawl budget is exhausted: the page
-// budget (pages visited) or the request budget (captured requests). A budget of
-// 0 means unlimited for that dimension. It takes mu for the duration of the
-// check, so callers must NOT hold it. When reserve is true and neither budget is
-// reached, it consumes one page slot before returning false — the compare and
-// the increment happen in a single critical section so concurrent workers cannot
-// overshoot the page cap (a separate check-then-increment would race). Pass
-// reserve=false for the pre-Pop early-out that must not consume a slot. Both
-// budgets are graceful: this gates only the start of a new page; pages already
-// in flight finish and emit their requests.
-func budgetReached(mu *sync.Mutex, pageCount *int, maxPages int, reqCount *int, maxRequests int, reserve bool) bool {
-	mu.Lock()
-	defer mu.Unlock()
-	if maxPages > 0 && *pageCount >= maxPages {
+// initialRequestsPerPageEstimate is what crawlBudget assumes a page will cost
+// before it has measured one. It is deliberately pessimistic: over-estimating
+// costs a little parallelism at the start of a crawl and is corrected within one
+// page, while under-estimating spends budget that cannot be taken back, because
+// the requests have already been sent to the target.
+const initialRequestsPerPageEstimate = 8
+
+// crawlBudget enforces the page and request budgets together.
+//
+// The request budget RESERVES an estimated cost before a page starts, and
+// reconciles against the actual count when it finishes. That is the difference
+// between a bound and a running total. Counting only after a page returned meant
+// the budget was consulted before a visit and updated after it, so every worker
+// could clear the check inside the same window and the real bound was
+//
+//	MaxRequests + (Concurrency x requests-per-page)
+//
+// Measured on the old code: --max-requests 10 at the default --concurrency 10
+// against pages firing 4 requests each emitted 44. It also could not bound below
+// a single page's request count. Documenting that overshoot did not make it a
+// politeness control — an operator who needs one against a fragile target is not
+// served by a number four times what they asked for.
+//
+// The estimate is the running mean of requests per completed page, so it adapts
+// to the target rather than to a guess. As the budget fills, the reservation
+// naturally reduces concurrency: with 2 units left and an 8-unit estimate, no new
+// page starts. Serializing near the limit is the correct trade for a bound that
+// exists to protect the target.
+//
+// Residual overshoot is bounded by how far a page exceeds the current mean,
+// summed over in-flight pages, rather than by concurrency. It cannot be zero
+// without cutting a page mid-capture, which would re-introduce the partial-page
+// truncation MaxPages was changed to avoid.
+type crawlBudget struct {
+	mu          sync.Mutex
+	maxPages    int
+	maxRequests int
+
+	pageCount int // pages started (slots consumed)
+	reqCount  int // requests emitted by completed pages
+	reserved  int // estimated cost of pages currently in flight
+
+	pagesMeasured   int // completed pages contributing to the mean
+	requestsMeasure int // their total request count
+}
+
+func newCrawlBudget(maxPages, maxRequests int) *crawlBudget {
+	return &crawlBudget{maxPages: maxPages, maxRequests: maxRequests}
+}
+
+// estimate returns the expected request cost of one page. Caller holds mu.
+func (b *crawlBudget) estimate() int {
+	if b.pagesMeasured == 0 {
+		return initialRequestsPerPageEstimate
+	}
+	// Round up so the estimate never understates a fractional mean.
+	est := (b.requestsMeasure + b.pagesMeasured - 1) / b.pagesMeasured
+	if est < 1 {
+		return 1
+	}
+	return est
+}
+
+// exhausted reports whether no further page may START. Caller holds mu.
+func (b *crawlBudget) exhausted() bool {
+	if b.maxPages > 0 && b.pageCount >= b.maxPages {
 		return true
 	}
-	if maxRequests > 0 && *reqCount >= maxRequests {
-		return true
+	return b.maxRequests > 0 && b.reqCount+b.reserved >= b.maxRequests
+}
+
+// Reached is the check-only pre-Pop early-out. It consumes nothing, so a worker
+// that is about to block on Pop can bail without holding a slot.
+func (b *crawlBudget) Reached() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.exhausted()
+}
+
+// TryReserve consumes one page slot plus this page's estimated request cost, and
+// reports whether the page may proceed. Compare and consume happen in one
+// critical section, so concurrent workers cannot both pass a check that only one
+// of them fits through.
+//
+// The returned reservation must be passed to Release when the page finishes.
+func (b *crawlBudget) TryReserve() (reservation int, ok bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.exhausted() {
+		return 0, false
 	}
-	if reserve {
-		*pageCount++
+	est := b.estimate()
+	// Admit the page only if its ESTIMATED cost also fits. Without this the
+	// budget is only ever checked against already-spent requests, which is what
+	// let every worker start a page against a nearly-full budget.
+	if b.maxRequests > 0 && b.reqCount+b.reserved+est > b.maxRequests {
+		// One exception: if nothing is in flight and nothing has been spent, allow
+		// a single page through. Otherwise a budget smaller than one page's
+		// estimated cost would crawl nothing at all and report an empty capture,
+		// which reads as "the target has no API" rather than "the budget was too
+		// small". This is the one case where the bound can be exceeded, it is
+		// bounded by one page, and it only arises when the operator asked for less
+		// than one page's worth.
+		if b.reqCount > 0 || b.reserved > 0 {
+			return 0, false
+		}
 	}
-	return false
+	b.pageCount++
+	b.reserved += est
+	return est, true
+}
+
+// Release reconciles a COMPLETED page: it returns the reservation, records the
+// page's actual request count, and folds that count into the estimate for later
+// pages.
+func (b *crawlBudget) Release(reservation, actual int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.releaseLocked(reservation)
+	b.reqCount += actual
+	b.pagesMeasured++
+	b.requestsMeasure += actual
+}
+
+// Cancel returns the reservation for a page that did NOT complete — a failed
+// visit, or one abandoned on context cancellation.
+//
+// It is separate from Release rather than Release(reservation, 0) because a page
+// that never finished is not evidence that pages cost zero requests. Feeding it
+// to the mean would drag the estimate toward zero, and a too-low estimate is
+// exactly what lets too many pages start against a nearly-full budget — the
+// failure this type exists to prevent. The page slot itself is deliberately NOT
+// returned, matching the pre-existing treatment of pageCount on abandoned pages.
+func (b *crawlBudget) Cancel(reservation int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.releaseLocked(reservation)
+}
+
+// releaseLocked returns a reservation to the pool. Caller holds mu.
+func (b *crawlBudget) releaseLocked(reservation int) {
+	b.reserved -= reservation
+	if b.reserved < 0 {
+		b.reserved = 0
+	}
+}
+
+// Pages reports how many page slots have been consumed. Test-facing.
+func (b *crawlBudget) Pages() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.pageCount
+}
+
+// Requests reports how many requests completed pages have emitted. Test-facing.
+func (b *crawlBudget) Requests() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.reqCount
 }
 
 // worker is the per-tab goroutine. It takes URLs from the frontier, visits
 // each one in a fresh tab, captures network events, extracts links, and pushes
 // discovered URLs back to the frontier.
-func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRequest), mu *sync.Mutex, pageCount, reqCount *int) {
-	maxPages := e.opts.MaxPages
-	maxRequests := e.opts.MaxRequests
+func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRequest), budget *crawlBudget) {
 	for {
 		// Check context before blocking on Pop.
 		if ctx.Err() != nil {
@@ -368,7 +485,7 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		// Stop taking new pages once either budget is reached. Pages already
 		// being visited by other workers still finalize below. Check-only (no
 		// reservation): we have not popped an entry yet.
-		if budgetReached(mu, pageCount, maxPages, reqCount, maxRequests, false) {
+		if budget.Reached() {
 			return
 		}
 
@@ -394,7 +511,8 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		// never persisted into the checkpoint, and every path that requeues has ctx
 		// already canceled, so any worker that reads the inflated count exits on
 		// its own ctx check first.
-		if budgetReached(mu, pageCount, maxPages, reqCount, maxRequests, true) {
+		reservation, admitted := budget.TryReserve()
+		if !admitted {
 			// Return the entry to the queue: it was dequeued but never visited,
 			// so it must survive into resume state instead of being dropped.
 			e.frontier.Requeue(entry)
@@ -406,10 +524,12 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		if err != nil {
 			if ctx.Err() != nil {
 				// Canceled mid-visit: the page was not covered, so requeue it.
+				budget.Cancel(reservation)
 				e.frontier.Requeue(entry)
 				e.frontier.MarkIdle()
 				return
 			}
+			budget.Cancel(reservation)
 			if e.opts.Stderr != nil {
 				fmt.Fprintf(e.opts.Stderr, "worker %d: error visiting %s: %v\n", id, redactSeedURL(entry.URL), err) //nolint:errcheck // best-effort
 			}
@@ -423,22 +543,25 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 			continue
 		}
 
-		// Emit captured requests and count them toward the MaxRequests budget.
-		// Counting emitted requests (not just page loads) is what makes the
-		// budget a request-rate bound distinct from MaxPages.
+		// Emit captured requests and reconcile the reservation against what the
+		// page actually cost. Counting emitted requests (not just page loads) is
+		// what makes the budget a request-rate bound distinct from MaxPages.
+		emitted := 0
 		for _, req := range requests {
 			if ctx.Err() != nil {
 				// Canceled part-way through emitting this page's requests, so
-				// its surface is incomplete. Requeue it for the next run.
+				// its surface is incomplete. Requeue it for the next run. The
+				// requests already emitted still count against the budget: they
+				// were sent to the target, which is what the budget bounds.
+				budget.Release(reservation, emitted)
 				e.frontier.Requeue(entry)
 				e.frontier.MarkIdle()
 				return
 			}
 			onResult(req)
-			mu.Lock()
-			*reqCount++
-			mu.Unlock()
+			emitted++
 		}
+		budget.Release(reservation, emitted)
 
 		// Push discovered links at depth+1.
 		if len(links) > 0 {
@@ -571,7 +694,7 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 // restores the invariant seedScope's containment argument depends on
 // (LAB-4678 review, SEC-BE-004).
 func (e *rodEngine) learnSeedOrigin(page *rod.Page, target urlEntry) {
-	if e.opts.LearnEffectiveOrigin == nil || frontierKey(target.URL) != e.seedKey {
+	if e.opts.LearnEffectiveOrigin == nil || canonicalizeURL(target.URL, false) != e.seedKey {
 		return
 	}
 	info, err := page.Info()
@@ -659,6 +782,48 @@ func networkIdleReached(inFlight int, sinceActivity, elapsed, floor, quiet time.
 		return false
 	}
 	return inFlight == 0 && sinceActivity >= quiet
+}
+
+// isRetainedForStaticAnalysis reports whether an out-of-scope captured request
+// must survive the scope filter anyway because a later stage reads its BODY
+// rather than treating it as an endpoint.
+//
+// Today that is exactly one case: a JavaScript bundle. pkg/analyze/jsstatic runs
+// over the capture after the crawl, and it is the only input it has — so scope-
+// filtering the capture also decided what static analysis could see. A Next.js or
+// SPA bundle served from a separate asset host (assetPrefix, a CDN, a static.
+// subdomain) is out of scope under the default same-origin policy, so the filter
+// silently removed both SPA bundle extraction and App Router route recovery for
+// every target deployed that way. That is the normal Next.js deployment, not an
+// edge case, and it failed with no diagnostic: the operator saw a smaller spec,
+// not an error.
+//
+// Retaining the bundle is not a scope escape. The browser had already fetched it
+// as a subresource of an in-scope page, so no new request is issued, and nothing
+// downstream treats it as an endpoint: pkg/classify rejects ".js" as a static
+// asset in rule 1 of every classifier, so it cannot reach the spec or the
+// `servers` list. What it can do is contribute the paths inside it, which
+// jsstatic resolves against the PAGE url, keeping recovered endpoints on the
+// in-scope origin.
+//
+// Third-party XHR/fetch to analytics and external APIs — the traffic the filter
+// exists for — is unaffected: those are JSON, not JavaScript.
+// It shares isJavaScriptContentType with the jsluice extraction path rather than
+// applying its own test, so "what counts as a JS body" is decided in one place
+// for both the stage that reads bodies and the filter that decides which bodies
+// survive to be read.
+func isRetainedForStaticAnalysis(r ObservedRequest) bool {
+	if isJavaScriptContentType(strings.ToLower(mediatype.Base(r.Response.ContentType))) {
+		return true
+	}
+	// Fall back to the URL extension when the content-type is missing or wrong,
+	// which is common for CDN-served assets.
+	u, err := url.Parse(r.URL)
+	if err != nil {
+		return false
+	}
+	p := strings.ToLower(u.Path)
+	return strings.HasSuffix(p, ".js") || strings.HasSuffix(p, ".mjs")
 }
 
 // enrichFromPage extracts links from the DOM, runs jsluice on JS sources and
@@ -780,7 +945,7 @@ func mergeEnrichedLinks(
 	if scopeFn != nil {
 		inScope := make([]ObservedRequest, 0, len(captured))
 		for _, r := range captured {
-			if scopeFn(r.URL) {
+			if scopeFn(r.URL) || isRetainedForStaticAnalysis(r) {
 				inScope = append(inScope, r)
 			}
 		}

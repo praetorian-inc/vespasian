@@ -371,9 +371,11 @@ func (c *Checkpoint) UnmarshalJSON(data []byte) error {
 // The element caps are enforced inside [Checkpoint.UnmarshalJSON] rather than by a
 // len() check here. A post-decode check cannot bound anything: by the time it runs,
 // the oversized array has already been materialized, which is the whole cost being
-// defended against. There is deliberately no len() re-check below — after a
-// successful decode it is unreachable by construction, and unreachable validation
-// reads as protection that is not there.
+// defended against. There is deliberately no len() re-check below — a successful
+// decode has already rejected an over-cap array, so the re-check would never fire,
+// and validation that never fires reads as protection that is not there.
+// TestBoundedDecodersUseTheRealCap and TestLoadCheckpoint_RealCapIsEnforcedEndToEnd
+// pin that the decode path is what enforces it.
 func LoadCheckpoint(r io.Reader) (*Checkpoint, error) {
 	// Read under the cap first (+1 so a payload exactly at the cap is
 	// distinguishable from one over it), then unmarshal. Reading before decoding
@@ -504,7 +506,7 @@ func (f *urlFrontier) Restore(pending []urlEntry, seen []string) {
 
 	admitted := make([]urlEntry, 0, len(pending))
 	for _, e := range pending {
-		if frontierKey(e.URL) == "" {
+		if canonicalizeURL(e.URL, false) == "" {
 			continue
 		}
 		if maxDepth >= 0 && e.Depth > maxDepth {
@@ -520,7 +522,7 @@ func (f *urlFrontier) Restore(pending []urlEntry, seen []string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, e := range admitted {
-		key := frontierKey(e.URL)
+		key := canonicalizeURL(e.URL, false)
 		// Dedup WITHIN pending. Restore runs on a fresh frontier, so anything
 		// already in f.seen here was put there by an earlier entry of this same
 		// slice — a corrupted or hand-edited checkpoint listing one URL repeatedly
@@ -530,7 +532,17 @@ func (f *urlFrontier) Restore(pending []urlEntry, seen []string) {
 		if f.seen[key] {
 			continue
 		}
+		// Apply the same per-path query-variant cap Push applies. A checkpoint is
+		// parsed input from host storage, so without this an artifact listing
+		// MaxCheckpointEntries variants of one path would queue all of them and
+		// spend the whole page budget on one page — a bound Push enforces on
+		// discovered links but Restore would otherwise skip.
+		pathKey := frontierKey(e.URL)
+		if f.variants[pathKey] >= maxQueryVariantsPerPath {
+			continue
+		}
 		f.seen[key] = true
+		f.variants[pathKey]++
 		f.queue = append(f.queue, e)
 	}
 	for _, k := range seen {

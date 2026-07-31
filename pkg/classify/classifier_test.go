@@ -1477,3 +1477,80 @@ func TestCanonicalHost_IPv6WithPortIsReparseable(t *testing.T) {
 			got, round.Hostname(), round.Port())
 	}
 }
+
+func TestDeduplicate_RetainsDistinctResponsesForUnion(t *testing.T) {
+	mk := func(body string) ClassifiedRequest {
+		return ClassifiedRequest{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "GET", URL: "https://ex.com/users",
+				Response: crawl.ObservedResponse{
+					StatusCode: 200, ContentType: "application/json", Body: []byte(body),
+				},
+			},
+			IsAPI: true, Confidence: 0.9, APIType: "rest",
+		}
+	}
+	out := Deduplicate([]ClassifiedRequest{
+		mk(`[{"id":1,"name":"a"}]`),
+		mk(`[{"id":2,"email":"b@x"}]`),
+	})
+
+	if len(out) != 1 {
+		t.Fatalf("deduplicated to %d entries, want 1 (the endpoint count must not change)", len(out))
+	}
+	if len(out[0].MergedResponses) != 1 {
+		t.Fatalf("MergedResponses has %d entries, want 1: the response the dedup discarded "+
+			"must survive for the generator's schema union", len(out[0].MergedResponses))
+	}
+
+	// Both bodies must be present across Response + MergedResponses.
+	bodies := []string{string(out[0].Response.Body)}
+	for _, r := range out[0].MergedResponses {
+		bodies = append(bodies, string(r.Body))
+	}
+	for _, want := range []string{`[{"id":1,"name":"a"}]`, `[{"id":2,"email":"b@x"}]`} {
+		found := false
+		for _, b := range bodies {
+			if b == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("observation %s was dropped; carried bodies: %v", want, bodies)
+		}
+	}
+}
+
+func TestDeduplicate_MergedResponsesAreBoundedAndDeduped(t *testing.T) {
+	mk := func(body string) ClassifiedRequest {
+		return ClassifiedRequest{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "GET", URL: "https://ex.com/x",
+				Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(body)},
+			},
+			IsAPI: true, Confidence: 0.9,
+		}
+	}
+
+	t.Run("identical bodies collapse", func(t *testing.T) {
+		var in []ClassifiedRequest
+		for range 50 {
+			in = append(in, mk(`{"a":1}`))
+		}
+		out := Deduplicate(in)
+		if n := len(out[0].MergedResponses); n != 0 {
+			t.Errorf("MergedResponses = %d for 50 identical responses, want 0", n)
+		}
+	})
+
+	t.Run("distinct bodies are bounded", func(t *testing.T) {
+		var in []ClassifiedRequest
+		for i := range 100 {
+			in = append(in, mk(`{"n":`+string(rune('0'+i%10))+`,"i":`+string(rune('a'+i%26))+`}`))
+		}
+		out := Deduplicate(in)
+		if n := len(out[0].MergedResponses); n > MaxMergedResponses {
+			t.Errorf("MergedResponses = %d, above the bound of %d", n, MaxMergedResponses)
+		}
+	})
+}

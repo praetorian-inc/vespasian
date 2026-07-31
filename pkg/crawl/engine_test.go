@@ -669,10 +669,10 @@ func TestMergeEnrichedLinks_NilScopeKeepsCaptured(t *testing.T) {
 	}
 }
 
-// TestBudgetReached covers the two crawl budgets (LAB-4678 Phase 3): a 0 budget
-// is unlimited for that dimension, and either dimension hitting its bound stops
-// the crawl from starting a new page.
-func TestBudgetReached(t *testing.T) {
+// TestCrawlBudget_Reached covers the check-only pre-Pop early-out: a 0 budget is
+// unlimited for that dimension, and either dimension hitting its bound stops the
+// crawl from starting a new page. It must consume nothing.
+func TestCrawlBudget_Reached(t *testing.T) {
 	cases := []struct {
 		name                                   string
 		pageCount, maxPages, reqCount, maxReqs int
@@ -688,92 +688,101 @@ func TestBudgetReached(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var mu sync.Mutex
-			pages, reqs := tc.pageCount, tc.reqCount
-			if got := budgetReached(&mu, &pages, tc.maxPages, &reqs, tc.maxReqs, false); got != tc.want {
-				t.Errorf("budgetReached(pages=%d/%d, reqs=%d/%d) = %v, want %v",
+			b := newCrawlBudget(tc.maxPages, tc.maxReqs)
+			b.pageCount, b.reqCount = tc.pageCount, tc.reqCount
+			if got := b.Reached(); got != tc.want {
+				t.Errorf("Reached(pages=%d/%d, reqs=%d/%d) = %v, want %v",
 					tc.pageCount, tc.maxPages, tc.reqCount, tc.maxReqs, got, tc.want)
 			}
-			// The pre-Pop early-out must never consume a page slot.
-			if pages != tc.pageCount {
-				t.Errorf("check-only call changed pageCount: %d -> %d", tc.pageCount, pages)
-			}
-			if reqs != tc.reqCount {
-				t.Errorf("check-only call changed reqCount: %d -> %d", tc.reqCount, reqs)
+			if b.Pages() != tc.pageCount || b.Requests() != tc.reqCount {
+				t.Errorf("check-only call mutated state: pages %d->%d, reqs %d->%d",
+					tc.pageCount, b.Pages(), tc.reqCount, b.Requests())
 			}
 		})
 	}
 }
 
-// TestBudgetReached_Reserve pins the reserve semantics that keep the page cap
-// exact under concurrency: a reserving call consumes exactly one page slot when
-// it admits the page, and consumes none when it reports a budget reached — for
-// either dimension. Compare and increment share one critical section, so a
-// separate check-then-increment cannot race workers past MaxPages.
-func TestBudgetReached_Reserve(t *testing.T) {
+// TestCrawlBudget_TryReserve pins the reserve semantics that keep the page cap
+// exact under concurrency: a reserving call consumes exactly one page slot when it
+// admits the page, and consumes none when it refuses — for either dimension.
+func TestCrawlBudget_TryReserve(t *testing.T) {
 	t.Run("admits and consumes one slot", func(t *testing.T) {
-		var mu sync.Mutex
-		pages, reqs := 3, 0
-		if budgetReached(&mu, &pages, 5, &reqs, 0, true) {
-			t.Fatal("reported budget reached at 3/5 pages")
+		b := newCrawlBudget(5, 0)
+		b.pageCount = 3
+		if _, ok := b.TryReserve(); !ok {
+			t.Fatal("refused at 3/5 pages")
 		}
-		if pages != 4 {
-			t.Errorf("reserve did not consume a slot: pageCount = %d, want 4", pages)
+		if b.Pages() != 4 {
+			t.Errorf("reserve did not consume a slot: pages = %d, want 4", b.Pages())
 		}
 	})
 
 	t.Run("page cap reached consumes nothing", func(t *testing.T) {
-		var mu sync.Mutex
-		pages, reqs := 5, 0
-		if !budgetReached(&mu, &pages, 5, &reqs, 0, true) {
-			t.Fatal("did not report budget reached at 5/5 pages")
+		b := newCrawlBudget(5, 0)
+		b.pageCount = 5
+		if _, ok := b.TryReserve(); ok {
+			t.Fatal("admitted a page at 5/5")
 		}
-		if pages != 5 {
-			t.Errorf("reserve consumed a slot past the page cap: pageCount = %d, want 5", pages)
+		if b.Pages() != 5 {
+			t.Errorf("reserve consumed a slot past the page cap: pages = %d, want 5", b.Pages())
 		}
 	})
 
 	t.Run("request cap reached consumes no page slot", func(t *testing.T) {
-		var mu sync.Mutex
-		pages, reqs := 1, 50
-		if !budgetReached(&mu, &pages, 100, &reqs, 50, true) {
-			t.Fatal("did not report budget reached at 50/50 requests")
+		b := newCrawlBudget(100, 50)
+		b.pageCount, b.reqCount = 1, 50
+		if _, ok := b.TryReserve(); ok {
+			t.Fatal("admitted a page at 50/50 requests")
 		}
-		if pages != 1 {
-			t.Errorf("reserve consumed a page slot when the request budget stopped the crawl: pageCount = %d, want 1", pages)
+		if b.Pages() != 1 {
+			t.Errorf("reserve consumed a page slot when the request budget stopped the crawl: pages = %d, want 1", b.Pages())
 		}
 	})
 
-	// The property this function exists for is exactness UNDER CONCURRENCY, and every
-	// subtest above is single-goroutine. budgetReached takes a *sync.Mutex precisely
-	// because N workers call it, yet nothing in the default suite ever called it from
-	// more than one goroutine, and the only end-to-end assertion of the exact-page-cap
-	// criterion (TestRodEngine_MaxPages) is behind //go:build integration and does not
-	// run in CI. So nothing CI executed verified that concurrent reservation cannot
-	// overshoot (LAB-4678 review, TEST-007).
-	//
-	// budgetReached is a pure function over pointers, so the invariant is directly
-	// testable in microseconds under -race with no browser.
+	// The estimated cost of the page must be charged up front, not just the
+	// already-spent total. Without this the budget is only ever compared against
+	// requests that have already been sent, which is what let every worker start a
+	// page against a nearly-full budget.
+	t.Run("refuses when the estimate does not fit", func(t *testing.T) {
+		b := newCrawlBudget(0, 10)
+		b.reqCount = 5 // 5 spent, 5 left, estimate is initialRequestsPerPageEstimate (8)
+		b.pagesMeasured, b.requestsMeasure = 1, initialRequestsPerPageEstimate
+		if _, ok := b.TryReserve(); ok {
+			t.Errorf("admitted a page estimated at %d requests with only 5 of the budget left",
+				initialRequestsPerPageEstimate)
+		}
+	})
+
+	// A budget smaller than one page's estimated cost must still crawl one page,
+	// or an empty capture reads as "the target has no API" rather than "the budget
+	// was too small".
+	t.Run("admits the first page even when the budget is below one page", func(t *testing.T) {
+		b := newCrawlBudget(0, 1)
+		if _, ok := b.TryReserve(); !ok {
+			t.Error("refused the very first page, so a small budget would capture nothing at all")
+		}
+		if _, ok := b.TryReserve(); ok {
+			t.Error("admitted a second page: the below-one-page allowance is for the first page only")
+		}
+	})
+
 	t.Run("concurrent reservation admits exactly maxPages", func(t *testing.T) {
 		const (
 			goroutines = 200
 			maxPages   = 37 // not a divisor of goroutines, so an off-by-one cannot hide
 		)
+		b := newCrawlBudget(maxPages, 0)
 		var (
-			mu       sync.Mutex
-			pages    int
-			reqs     int
 			admitted atomic.Int64
 			wg       sync.WaitGroup
 		)
-
 		start := make(chan struct{})
 		for range goroutines {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				<-start // maximize contention on the compare-and-increment
-				if !budgetReached(&mu, &pages, maxPages, &reqs, 0, true) {
+				if _, ok := b.TryReserve(); ok {
 					admitted.Add(1)
 				}
 			}()
@@ -785,35 +794,30 @@ func TestBudgetReached_Reserve(t *testing.T) {
 			t.Errorf("admitted %d pages, want exactly %d: concurrent reservation "+
 				"overshot or undershot the page cap", got, maxPages)
 		}
-		if pages != maxPages {
-			t.Errorf("pageCount = %d, want exactly %d: reserved slots must equal admissions",
-				pages, maxPages)
+		if b.Pages() != maxPages {
+			t.Errorf("pages = %d, want exactly %d: reserved slots must equal admissions",
+				b.Pages(), maxPages)
 		}
 	})
 
-	// The mirror case for the request dimension: the request budget must also stop
-	// admissions exactly, and must never consume a page slot when it is what stopped
-	// the crawl.
 	t.Run("concurrent calls stop exactly at the request cap", func(t *testing.T) {
 		const (
 			goroutines  = 200
 			maxRequests = 25
 		)
+		b := newCrawlBudget(0, maxRequests)
+		b.reqCount = maxRequests // already at the bound
 		var (
-			mu       sync.Mutex
-			pages    int
-			reqs     = maxRequests // already at the bound
 			admitted atomic.Int64
 			wg       sync.WaitGroup
 		)
-
 		start := make(chan struct{})
 		for range goroutines {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				<-start
-				if !budgetReached(&mu, &pages, 0, &reqs, maxRequests, true) {
+				if _, ok := b.TryReserve(); ok {
 					admitted.Add(1)
 				}
 			}()
@@ -824,11 +828,38 @@ func TestBudgetReached_Reserve(t *testing.T) {
 		if got := admitted.Load(); got != 0 {
 			t.Errorf("admitted %d pages with the request budget already exhausted, want 0", got)
 		}
-		if pages != 0 {
-			t.Errorf("pageCount = %d, want 0: no page slot may be consumed when the "+
-				"request budget is what stopped the crawl", pages)
+		if b.Pages() != 0 {
+			t.Errorf("pages = %d, want 0: no page slot may be consumed when the "+
+				"request budget is what stopped the crawl", b.Pages())
 		}
 	})
+}
+
+// TestCrawlBudget_CancelDoesNotPoisonTheEstimate pins why Cancel exists separately
+// from Release. A page that failed or was abandoned is not evidence that pages cost
+// zero requests; folding it into the mean drags the estimate down, and a too-low
+// estimate is what lets too many pages start against a nearly-full budget.
+func TestCrawlBudget_CancelDoesNotPoisonTheEstimate(t *testing.T) {
+	b := newCrawlBudget(0, 1000)
+
+	r, _ := b.TryReserve()
+	b.Release(r, 12) // one real page costing 12
+
+	for range 20 {
+		r, _ := b.TryReserve()
+		b.Cancel(r) // twenty failures
+	}
+
+	b.mu.Lock()
+	est := b.estimate()
+	b.mu.Unlock()
+	if est != 12 {
+		t.Errorf("estimate = %d after 1 real page (12 requests) and 20 cancellations, want 12: "+
+			"canceled pages must not contribute a zero-cost sample", est)
+	}
+	if b.reserved != 0 {
+		t.Errorf("reserved = %d, want 0: every reservation was returned", b.reserved)
+	}
 }
 
 // TestEnrichTarget_RedactsCredentialsInNavigationNotice pins the redaction on the
@@ -1060,8 +1091,15 @@ func nRequests(pageURL string, n int) []ObservedRequest {
 //   - the crawl stops taking new pages once reqCount >= MaxRequests,
 //   - the entry dequeued but not visited is REQUEUED, so it survives into resume
 //     state rather than being dropped,
-//   - the documented bound holds: the final count exceeds MaxRequests by at most one
-//     page's requests, and is not unbounded.
+//   - the budget is a CEILING: the final count never exceeds MaxRequests by more
+//     than the page that crosses it.
+//
+// The lower bound is deliberately NOT "at least MaxRequests". crawlBudget reserves an
+// estimated cost before admitting a page, so it stops admitting once the next page
+// would not fit — which can leave part of the budget unspent. For a control whose
+// purpose is protecting the target, undershooting is the correct direction to err;
+// this test previously required the count to REACH the budget, which only held
+// because the old implementation overshot it.
 func TestWorker_MaxRequestsBudget_RodBackend(t *testing.T) {
 	const (
 		maxRequests       = 10
@@ -1092,16 +1130,12 @@ func TestWorker_MaxRequestsBudget_RodBackend(t *testing.T) {
 		t.Fatalf("seeded %d entries, want %d", got, pagesInFrontier)
 	}
 
-	var (
-		mu        sync.Mutex
-		pageCount int
-		reqCount  int
-		emitted   atomic.Int64
-	)
+	budget := newCrawlBudget(e.opts.MaxPages, e.opts.MaxRequests)
+	var emitted atomic.Int64
 
 	done := make(chan struct{})
 	go func() {
-		e.worker(context.Background(), 0, func(ObservedRequest) { emitted.Add(1) }, &mu, &pageCount, &reqCount)
+		e.worker(context.Background(), 0, func(ObservedRequest) { emitted.Add(1) }, budget)
 		close(done)
 	}()
 
@@ -1112,13 +1146,19 @@ func TestWorker_MaxRequestsBudget_RodBackend(t *testing.T) {
 	}
 
 	got := int(emitted.Load())
-	if got < maxRequests {
-		t.Errorf("emitted %d requests, want at least the budget of %d", got, maxRequests)
+	if got == 0 {
+		t.Error("emitted nothing: a budget of more than one page must still crawl")
 	}
 	if got > maxRequests+expectedOvershoot {
 		t.Errorf("emitted %d requests, want at most %d (budget %d + one page's %d requests): "+
 			"the overshoot must be bounded by one page, not unbounded",
 			got, maxRequests+expectedOvershoot, maxRequests, requestsPerPage)
+	}
+	// Undershoot is allowed but must stay proportionate: reserving is meant to stop
+	// the LAST page that would not fit, not to strand most of the budget.
+	if got < maxRequests-requestsPerPage {
+		t.Errorf("emitted %d requests against a budget of %d: the reservation is stranding "+
+			"more than one page's worth of budget", got, maxRequests)
 	}
 
 	// The budget must stop the crawl well short of the frontier.
@@ -1156,104 +1196,95 @@ func TestWorker_MaxRequestsZeroIsUnlimited(t *testing.T) {
 	}
 	e.frontier.Push(entries)
 
-	var (
-		mu        sync.Mutex
-		pageCount int
-		reqCount  int
-		emitted   atomic.Int64
-	)
-	e.worker(context.Background(), 0, func(ObservedRequest) { emitted.Add(1) }, &mu, &pageCount, &reqCount)
+	budget := newCrawlBudget(e.opts.MaxPages, e.opts.MaxRequests)
+	var emitted atomic.Int64
+	e.worker(context.Background(), 0, func(ObservedRequest) { emitted.Add(1) }, budget)
 
 	if got := int(emitted.Load()); got != pages*3 {
 		t.Errorf("emitted %d requests, want %d: MaxRequests=0 must mean unlimited", got, pages*3)
 	}
 }
 
-// TestWorker_MaxRequestsOvershoot_ScalesWithConcurrency pins the ACTUAL --max-requests
-// bound, which is not the one the docs used to state.
+// TestWorker_MaxRequestsBound_DoesNotScaleWithConcurrency pins the property that
+// makes --max-requests a usable politeness control: the total does NOT grow with
+// --concurrency.
 //
-// TestWorker_MaxRequestsBudget_RodBackend runs at Concurrency=1, where the overshoot
-// really is one page's requests. That made the documented bound ("the final count can
-// exceed the bound by up to one page's worth of requests") look verified while the
-// default is Concurrency=10. reqCount is incremented only AFTER a visit returns and
-// the budget is consulted BEFORE one starts, so every worker can clear the check in
-// that window: the bound is MaxRequests + (Concurrency x requests-per-page). Measured
-// at the default concurrency, a budget of 10 emits 44 — over 3x the old claim, on a
-// control an operator sets precisely because they are being careful with the target.
+// The predecessor of this test asserted the opposite, because that is what the code
+// did. reqCount was incremented only AFTER a visit returned while the budget was
+// consulted BEFORE one started, so every worker cleared the check inside the same
+// window and the real bound was MaxRequests + (Concurrency x requests-per-page):
+// a budget of 10 at the default --concurrency 10 against 4-request pages emitted 44.
+// The test parked all Concurrency workers inside a visit to force that interleaving
+// and then asserted the result was ABOVE a one-page overshoot, which locked the
+// defect in as the specification.
 //
-// The assertion is two-sided on purpose. The upper bound stops the overshoot from
-// growing further; the lower bound is what fails if someone "fixes" the docs back to
-// one page without changing the code, because a Concurrency=1-shaped expectation
-// cannot hold here.
-func TestWorker_MaxRequestsOvershoot_ScalesWithConcurrency(t *testing.T) {
+// crawlBudget now reserves an estimated cost before admitting a page, so the same
+// interleaving cannot occur: workers are refused at TryReserve rather than queuing
+// up inside visits. The assertion is therefore the inverse — the emitted total must
+// stay at or near the budget regardless of concurrency, and specifically must not
+// reach the old concurrency-scaled figure.
+func TestWorker_MaxRequestsBound_DoesNotScaleWithConcurrency(t *testing.T) {
 	const (
 		maxRequests     = 10
 		requestsPerPage = 4
 		pages           = 200
-		concurrency     = DefaultConcurrency
 	)
 
-	// Every worker parks inside its visit long enough that all of them clear the
-	// pre-visit budget check before any increments reqCount. This is the real
-	// interleaving under a slow target, made deterministic.
-	release := make(chan struct{})
-	var arrived sync.WaitGroup
-	arrived.Add(concurrency)
-	var parked atomic.Bool
-	visit := func(_ context.Context, target urlEntry) ([]ObservedRequest, []string, error) {
-		if !parked.Load() {
-			arrived.Done()
-			<-release
-		}
-		return nRequests(target.URL, requestsPerPage), nil, nil
-	}
+	for _, concurrency := range []int{1, 2, DefaultConcurrency} {
+		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
+			visit := func(_ context.Context, target urlEntry) ([]ObservedRequest, []string, error) {
+				return nRequests(target.URL, requestsPerPage), nil, nil
+			}
+			e := newTestEngine(engineOptions{
+				MaxRequests: maxRequests,
+				MaxDepth:    -1,
+				Concurrency: concurrency,
+			}, visit)
 
-	e := newTestEngine(engineOptions{
-		MaxRequests: maxRequests,
-		MaxDepth:    -1,
-		Concurrency: concurrency,
-	}, visit)
+			entries := make([]urlEntry, 0, pages)
+			for i := range pages {
+				entries = append(entries, urlEntry{URL: fmt.Sprintf("https://ex.com/p%d", i), Depth: 1})
+			}
+			e.frontier.Push(entries)
 
-	entries := make([]urlEntry, 0, pages)
-	for i := range pages {
-		entries = append(entries, urlEntry{URL: fmt.Sprintf("https://ex.com/p%d", i), Depth: 1})
-	}
-	e.frontier.Push(entries)
+			budget := newCrawlBudget(e.opts.MaxPages, e.opts.MaxRequests)
+			var (
+				emitted atomic.Int64
+				wg      sync.WaitGroup
+			)
+			for i := range concurrency {
+				wg.Add(1)
+				go func(id int) {
+					defer wg.Done()
+					e.worker(context.Background(), id, func(ObservedRequest) { emitted.Add(1) }, budget)
+				}(i)
+			}
 
-	var (
-		mu        sync.Mutex
-		pageCount int
-		reqCount  int
-		emitted   atomic.Int64
-		wg        sync.WaitGroup
-	)
-	for i := range concurrency {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			e.worker(context.Background(), id, func(ObservedRequest) { emitted.Add(1) }, &mu, &pageCount, &reqCount)
-		}(i)
-	}
+			done := make(chan struct{})
+			go func() { wg.Wait(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(30 * time.Second):
+				t.Fatal("workers did not terminate: the request budget must stop the loop, not spin")
+			}
 
-	// Once all Concurrency workers are inside a visit, stop parking and let them run.
-	arrived.Wait()
-	parked.Store(true)
-	close(release)
-	wg.Wait()
+			got := int(emitted.Load())
+			oldConcurrencyScaledBound := maxRequests + concurrency*requestsPerPage
 
-	got := int(emitted.Load())
-	onePageClaim := maxRequests + (requestsPerPage - 1)
-	realBound := maxRequests + concurrency*requestsPerPage
-
-	if got <= onePageClaim {
-		t.Errorf("emitted %d requests, which is within the old one-page claim of %d. "+
-			"At Concurrency=%d the overshoot MUST be larger; if the code now genuinely "+
-			"bounds it this tightly, update the README/CLAUDE.md/engine.go wording that "+
-			"this test exists to keep honest", got, onePageClaim, concurrency)
-	}
-	if got > realBound {
-		t.Errorf("emitted %d requests, above the documented bound MaxRequests + "+
-			"(Concurrency x requests-per-page) = %d + (%d x %d) = %d",
-			got, maxRequests, concurrency, requestsPerPage, realBound)
+			// The page that crosses the bound still finishes, so one page's worth of
+			// overshoot is inherent to the graceful drain and is accepted.
+			upper := maxRequests + requestsPerPage
+			if got > upper {
+				t.Errorf("emitted %d requests for --max-requests %d at concurrency %d, "+
+					"above the one-page allowance of %d", got, maxRequests, concurrency, upper)
+			}
+			if concurrency > 1 && got >= oldConcurrencyScaledBound {
+				t.Errorf("emitted %d requests, at or above the old concurrency-scaled bound of %d: "+
+					"the overshoot is scaling with --concurrency again", got, oldConcurrencyScaledBound)
+			}
+			if got == 0 {
+				t.Error("emitted nothing: a budget above one page must still crawl")
+			}
+		})
 	}
 }

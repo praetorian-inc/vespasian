@@ -54,7 +54,32 @@ type urlFrontier struct {
 	// nor seen, so it would be carried in neither half of the checkpoint and
 	// survive only if some other pending page happens to re-link it.
 	failed map[string]urlEntry
+
+	// variants counts how many distinct query variants of each path have been
+	// admitted, so a path may be visited more than once when its query string
+	// changes. See [maxQueryVariantsPerPath].
+	variants map[string]int
 }
+
+// maxQueryVariantsPerPath bounds how many distinct query strings one path may be
+// crawled with.
+//
+// Collapsing every query variant of a path to a single visit assumes the query
+// only selects WHICH row a page shows, not WHAT the page does — true for
+// /product?id=1 versus /product?id=2, and false for the two shapes that matter:
+// pagination (?page=2 commonly fires a different XHR than page 1) and
+// query-switched views (?tab=billing, ?view=admin), where one query value can be
+// the only route into a whole section of the app. Normalizing the PATH does not
+// normalize the RESULTS.
+//
+// A cap keeps most of what collapsing bought — a catalog with 5,000 ?id= values
+// still costs a handful of visits instead of 5,000 — while leaving room for the
+// handful of variants that carry distinct surface. It is not a measured
+// distribution over real targets; it is a deliberate ceiling chosen so the
+// pathological case stays bounded and the common case (a page reached with two or
+// three different query strings) is no longer silently dropped. Re-tune it
+// against real Guard runs rather than treating it as settled.
+const maxQueryVariantsPerPath = 4
 
 // newURLFrontier creates a frontier with the given max depth and scope filter.
 // The scopeFn is called for every URL before enqueuing; returning false rejects
@@ -64,6 +89,7 @@ func newURLFrontier(maxDepth int, scopeFn func(string) bool) *urlFrontier {
 		queue:    make([]urlEntry, 0, 64),
 		seen:     make(map[string]bool),
 		failed:   make(map[string]urlEntry),
+		variants: make(map[string]int),
 		maxDepth: maxDepth,
 		scopeFn:  scopeFn,
 	}
@@ -89,15 +115,30 @@ func (f *urlFrontier) Push(entries []urlEntry) int {
 			continue
 		}
 
-		// Dedup on the frontier key (query stripped) so URLs differing only in
-		// query parameters are treated as one page and visited once (LAB-4678
-		// Phase 1); the original e.URL is still what gets queued and fetched.
-		normalized := frontierKey(e.URL)
+		// Dedup on the FULL canonical URL, so two links differing only in query
+		// string are distinct entries, and bound how many variants of one path
+		// may be admitted (LAB-4678 Phase 1, revised).
+		//
+		// Deduping on the query-stripped key alone collapsed every variant to one
+		// visit. That saved budget on /product?id=N, and silently lost ?page=2 and
+		// ?tab=billing, which are separate pages wearing the same path.
+		normalized := canonicalizeURL(e.URL, false)
 		if normalized == "" {
+			continue
+		}
+		pathKey := frontierKey(e.URL)
+		if pathKey == "" {
 			continue
 		}
 
 		if f.seen[normalized] {
+			continue
+		}
+
+		// A path gets one free visit plus maxQueryVariantsPerPath-1 further query
+		// variants. The first visit of a path always passes, so a target with no
+		// query strings behaves exactly as before.
+		if f.variants[pathKey] >= maxQueryVariantsPerPath {
 			continue
 		}
 
@@ -106,6 +147,7 @@ func (f *urlFrontier) Push(entries []urlEntry) int {
 		}
 
 		f.seen[normalized] = true
+		f.variants[pathKey]++
 		f.queue = append(f.queue, e)
 		added++
 	}
@@ -159,7 +201,10 @@ func (f *urlFrontier) Requeue(e urlEntry) {
 //
 // Callers must still call MarkIdle afterwards, exactly as after any Pop.
 func (f *urlFrontier) MarkFailed(e urlEntry) {
-	key := frontierKey(e.URL)
+	// Keyed on the same identity as `seen` (the full canonical URL), so a failed
+	// ?page=2 is excluded from the persisted seen-set without also un-seeing
+	// ?page=1, which is now a separate entry.
+	key := canonicalizeURL(e.URL, false)
 	if key == "" {
 		return
 	}

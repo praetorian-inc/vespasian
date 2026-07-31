@@ -42,10 +42,10 @@ Vespasian takes a different approach: it observes actual network traffic at the 
 | **GraphQL API Discovery** | Detects GraphQL endpoints, runs tiered introspection queries, and generates GraphQL SDL schemas |
 | **WSDL/SOAP Discovery** | Identifies SOAP services via SOAPAction headers and envelope detection; fetches and parses WSDL documents |
 | **gRPC API Discovery** | Classifies gRPC and gRPC-Web traffic via content-type, trailer headers, and path shape; enumerates services and methods through the Server Reflection Protocol — with reflection-off fallbacks (grpc-gateway/Envoy OpenAPI scrape and gRPC-Web JS-binding recovery) — and generates `.proto` schemas |
-| **API Type Auto-Detection** | Automatically determines API type (REST, GraphQL, WSDL) from captured traffic without manual selection. Each request votes for one type only, and a non-REST type must beat the REST surface by a margin to win, so the verdict does not flip on a single extra or missing captured request. gRPC is opt-in via `--api-type grpc` — its binary HTTP/2 framing is not auto-detected |
+| **API Type Auto-Detection** | Automatically determines API type (REST, GraphQL, WSDL) from captured traffic without manual selection. Each request votes for one type only, and a non-REST type must beat the REST surface by a 1.5x margin to win. That keeps the verdict stable where mixed captures actually sit — near-equal counts, where the old rule flipped on a single request — but a threshold rule always has a boundary, so a capture sitting exactly at the margin can still change type on one observation. Generic `text/xml` is not treated as SOAP evidence on its own, so one XML document cannot type a whole capture as WSDL. gRPC is opt-in via `--api-type grpc` — its binary HTTP/2 framing is not auto-detected |
 | **Browser Crawling** | Two backends: headless mode drives Chrome via [go-rod](https://github.com/go-rod/rod) for full JavaScript/SPA support; non-headless mode uses a stdlib net/http engine (DFS, 150 rps, scope+SSRF redirect guard) for lightweight crawls. The headless backend uses a configured or **system Chrome** by default and does not download a browser from third-party mirrors unless explicitly opted in (supply-chain hardening); it also disables Chrome telemetry so crawl egress stays minimal |
-| **SPA Bundle Extraction** | Post-crawl pass that scans JavaScript bundles for API path strings and probes them with raw HTTP, recovering endpoints the headless browser could not exercise |
-| **Next.js Route Recovery** | Recovers App Router routes from chunk URLs (`/_next/static/chunks/app/vaults/[vaultId]/page-<hash>.js` → `/vaults/{vaultId}`), including dynamic and catch-all segments. Works on React Server Components bundles, where request paths are built at runtime and no path literal exists in the body to extract. Recovered routes are reported under `-v` as near-misses (reason `next-route-chunk`); they are not emitted as spec operations, since the chunk URL does not reveal which HTTP verbs the route exports |
+| **SPA Bundle Extraction** | Post-crawl pass that scans JavaScript bundles for API path strings and probes them with raw HTTP, recovering endpoints the headless browser could not exercise. JavaScript bodies are kept in the capture even when the bundle is served from an out-of-scope asset host (a CDN, `assetPrefix`, a `static.` subdomain), since static analysis reads the capture and would otherwise see nothing for those deployments; the bundles themselves are never classified as endpoints |
+| **Next.js Route Recovery** | Recovers App Router routes from chunk URLs (`/_next/static/chunks/app/vaults/[vaultId]/page-<hash>.js` → `/vaults/{vaultId}`), including dynamic and catch-all segments. Works on React Server Components bundles, where request paths are built at runtime and no path literal exists in the body to extract. Recovered routes are reported under `-v` as near-misses (reason `next-route-chunk`); they are never emitted as spec operations, since the chunk URL does not reveal which HTTP verbs the route exports. The exclusion is structural — the classifier reports them as not-an-API rather than merely scoring them low — so it holds at any `--confidence` value |
 | **Static Form Extraction** | Statically parses `<form>` elements in captured HTML responses — including login, search, and admin forms — to surface submission endpoints and parameters that dynamic crawling may never trigger |
 | **Traffic Import** | Import existing captures from Burp Suite XML, HAR 1.2 files, and mitmproxy dumps |
 | **Active Probing** | OPTIONS discovery, JSON schema inference, WSDL document fetching, GraphQL introspection, and gRPC server reflection |
@@ -331,17 +331,20 @@ vespasian scan <url> [flags]
   -H, --header       Auth headers to inject (repeatable)
   -o, --output       Output spec file (default: stdout)
   --depth            Max crawl depth (default: 3)
-  --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100)
+  --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100).
+                     URLs differing only in query string are separate pages, capped at 4 distinct
+                     query variants per path: ?page=2 and ?tab=billing routinely serve different
+                     content than the bare path, while a catalogue of ?id= values does not, so the
+                     cap admits the former without spending the budget on the latter.
   --max-requests     Captured-request budget (0 = unlimited); a rate/politeness bound distinct
-                     from --max-pages. Checked BETWEEN pages, not per request: the crawl stops
-                     taking new pages once the count is reached and lets in-flight pages finish.
-                     It is a SOFT bound and the overshoot is not small — the count is only
-                     updated after a page finishes, so every concurrent worker can start a page
-                     before any of them reports, and the total can reach
-                     --max-requests + (--concurrency x requests-per-page). With the default
-                     --concurrency 10, --max-requests 10 against pages firing 4 requests each
-                     emits about 44. It also cannot bound below a single page's request count.
-                     Use --concurrency 1 when the bound needs to be tight.
+                     from --max-pages. The crawl reserves a page's estimated request cost
+                     before starting it and reconciles against the actual count when it
+                     finishes, so the total does NOT scale with --concurrency. The estimate is
+                     the running mean of requests per page, so it adapts to the target; as the
+                     budget fills, fewer pages start concurrently. Overshoot is bounded by the
+                     page that crosses the limit, since in-flight pages are allowed to finish
+                     rather than being cut mid-capture. The budget may also be UNDER-spent: if
+                     the next page is not estimated to fit, it does not start.
   --interact         Click buttons to surface interaction-only endpoints (headless only; off by
                      default). It matches every <button>, [role=button], and [onclick] control,
                      INCLUDING form submit buttons, so it submits forms and can mutate state.
@@ -381,17 +384,20 @@ vespasian crawl <url> [flags]
   -H, --header       Auth headers to inject (repeatable)
   -o, --output       Capture output file (default: stdout)
   --depth            Max crawl depth (default: 3)
-  --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100)
+  --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100).
+                     URLs differing only in query string are separate pages, capped at 4 distinct
+                     query variants per path: ?page=2 and ?tab=billing routinely serve different
+                     content than the bare path, while a catalogue of ?id= values does not, so the
+                     cap admits the former without spending the budget on the latter.
   --max-requests     Captured-request budget (0 = unlimited); a rate/politeness bound distinct
-                     from --max-pages. Checked BETWEEN pages, not per request: the crawl stops
-                     taking new pages once the count is reached and lets in-flight pages finish.
-                     It is a SOFT bound and the overshoot is not small — the count is only
-                     updated after a page finishes, so every concurrent worker can start a page
-                     before any of them reports, and the total can reach
-                     --max-requests + (--concurrency x requests-per-page). With the default
-                     --concurrency 10, --max-requests 10 against pages firing 4 requests each
-                     emits about 44. It also cannot bound below a single page's request count.
-                     Use --concurrency 1 when the bound needs to be tight.
+                     from --max-pages. The crawl reserves a page's estimated request cost
+                     before starting it and reconciles against the actual count when it
+                     finishes, so the total does NOT scale with --concurrency. The estimate is
+                     the running mean of requests per page, so it adapts to the target; as the
+                     budget fills, fewer pages start concurrently. Overshoot is bounded by the
+                     page that crosses the limit, since in-flight pages are allowed to finish
+                     rather than being cut mid-capture. The budget may also be UNDER-spent: if
+                     the next page is not estimated to fit, it does not start.
   --interact         Click buttons to surface interaction-only endpoints (headless only; off by
                      default). It matches every <button>, [role=button], and [onclick] control,
                      INCLUDING form submit buttons, so it submits forms and can mutate state.

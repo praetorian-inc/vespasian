@@ -85,8 +85,11 @@ func (c *Capability) Parameters() []capability.Parameter {
 		capability.Int("slug_threshold", "Distinct values at a path position before merge_slugs collapses it (minimum 2)").WithDefault("2"),
 		// Declared, not just read in crawlOptsFromCtx: hosts discover configurable
 		// inputs from this list, so a parameter the reader honors but this list
-		// omits is unreachable through the Guard-facing surface and settable only
-		// by a hand-built ExecutionContext (Codex review, PR #189).
+		// omits is not reachable through the Guard-facing surface and is settable
+		// only by a hand-built ExecutionContext (Codex review, PR #189).
+		// TestCapability_DeclaredParametersAreReadable derives the read set from
+		// crawlOptsFromCtx's own source and fails on any parameter missing here, so
+		// the next one cannot ship dark.
 		capability.Int("max_requests", "Maximum captured requests before stopping (0 = unlimited); a rate bound distinct from max_pages").WithDefault("0"),
 		capability.Bool("interact", "Click a bounded set of page controls to surface interaction-only endpoints (headless only; mutates state)").WithDefault("false"),
 	}

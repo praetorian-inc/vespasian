@@ -271,11 +271,27 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	//
 	// Restoring them as real operations means teaching the generator to emit from
 	// AllowedMethods, which is still a separate change.
+	//
+	// The isAPI=false return is what makes "never an operation" true, and a
+	// confidence band alone did not. RunClassifiers gates on isAPI (requireAPI),
+	// NearMisses does not, so returning false keeps the route out of the spec at
+	// ANY threshold while still reporting it under -v. Scoring it at
+	// NearMissFloor and relying on DefaultConfidenceThreshold to exclude it made
+	// the exclusion depend on --confidence, which is an operator flag: at
+	// --confidence 0.1 the routes classified and the generator emitted
+	//
+	//	/vaults/{vaultId}:
+	//	    get:                              <- verb invented, route may be POST-only
+	//	        x-vespasian-source: dynamic   <- false, never requested
+	//
+	// which is both harms this rule exists to prevent, reachable by widening
+	// recall — the ordinary reason to touch --confidence.
+	// TestNextRoute_NeverAnOperationAtAnyThreshold pins it across the range.
 	if req.Source == crawl.SourceNextRouteHandler || req.Source == crawl.SourceNextPageRoute {
 		if confidence < NextRouteProvenanceConfidence {
 			confidence = NextRouteProvenanceConfidence
 		}
-		reason = appendReason(reason, "next-route-chunk")
+		return false, confidence, appendReason(reason, "next-route-chunk")
 	}
 
 	return confidence > 0, confidence, reason
@@ -335,8 +351,9 @@ var soapContentTypes = []string{
 // types like application/vnd.github+json. Those are endpoint response bodies —
 // JSON-LD served as a response IS the API's data (Hydra, ActivityPub) — and
 // matchAPIContentType's whole purpose is to stop hardcoding an allowlist that
-// excludes them. A <script type="application/ld+json"> block never reaches here,
-// because this matches response and request Content-Type headers, not markup.
+// excludes them. A <script type="application/ld+json"> block is not seen here: this
+// matches response and request Content-Type headers, not markup, so a JSON-LD block
+// embedded in an HTML page reaches the classifier as text/html.
 var documentContentTypes = []string{
 	// Syndication feeds: a feed is a document for feed readers. Without this the
 	// suffix rule pulls in every blog feed on the target. The classifier-edge

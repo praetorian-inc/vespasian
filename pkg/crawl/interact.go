@@ -355,9 +355,10 @@ func (e *rodEngine) interactPage(ctx context.Context, page *rod.Page, capture *p
 	if page == nil {
 		return false
 	}
-	// Without a readable start URL, navigation can never be detected for this page,
-	// so no click on it can be made safely. Skip the pass entirely rather than
-	// clicking blind. Returning false is correct and not a fail-open: nothing has
+	// Without a readable start URL there is no baseline to compare against after a
+	// click, so this page's navigation check would have nothing to detect and no
+	// click on it can be made safely. Skip the pass entirely rather than clicking
+	// blind. Returning false is correct and not a fail-open: nothing has
 	// been clicked yet, so the live document is still the assigned one and DOM
 	// enrichment is safe. The fail-closed decision here is "do not click", not
 	// "assume we navigated".
@@ -389,9 +390,11 @@ func (e *rodEngine) interactPage(ctx context.Context, page *rod.Page, capture *p
 		used[normalizeLabel(labels[idx])] = true
 
 		// Re-read the label immediately before clicking. The scan above is
-		// time-of-check-to-time-of-use: rendering between the scan and the click
-		// can leave a valid handle pointing at a destructive action the scan never
-		// saw. clickAllowed fails closed on an unreadable label.
+		// time-of-check-to-time-of-use: rendering between the scan and the click can
+		// leave a valid handle pointing at a destructive action that was not present
+		// when the scan read it. clickAllowed fails closed on an unreadable label;
+		// TestClickAllowed covers that gate and TestRodEngine_Interact_SkipsDestructive
+		// (build tag: integration) covers it end to end.
 		if label, ok := elementLabel(elements[idx]); !clickAllowed(label, ok) {
 			continue
 		}

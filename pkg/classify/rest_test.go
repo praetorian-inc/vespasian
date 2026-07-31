@@ -988,3 +988,27 @@ func TestIsDocumentPath_MatchesWholeSegmentOnly(t *testing.T) {
 		assert.False(t, isDocumentPath(miss), "%q must NOT be excluded as a document path", miss)
 	}
 }
+
+func TestNextRoute_NeverAnOperationAtAnyThreshold(t *testing.T) {
+	reqs := []crawl.ObservedRequest{
+		{Method: "GET", URL: "https://ex.com/vaults/{vaultId}", Source: crawl.SourceNextPageRoute},
+		{Method: "GET", URL: "https://ex.com/admin/reports", Source: crawl.SourceNextRouteHandler},
+	}
+	classifiers := []APIClassifier{&RESTClassifier{}}
+
+	for _, threshold := range []float64{0.5, 0.2, NearMissFloor, 0.05, 0.01} {
+		got := RunClassifiers(classifiers, reqs, threshold)
+		if len(got) != 0 {
+			t.Errorf("--confidence %.2f classified %d Next.js-recovered routes; they must never "+
+				"reach the generator, which would invent a verb the chunk URL never revealed",
+				threshold, len(got))
+		}
+	}
+
+	// ...and they are still visible to the operator under -v.
+	nm := NearMisses(classifiers, reqs, NearMissFloor, DefaultConfidenceThreshold)
+	if len(nm) != len(reqs) {
+		t.Errorf("NearMisses reported %d of %d recovered routes; excluding them from the spec "+
+			"must not also make them invisible", len(nm), len(reqs))
+	}
+}

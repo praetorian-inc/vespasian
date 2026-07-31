@@ -339,7 +339,21 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest { //nolint:
 			// was identical. preferredResponse is order-free: it prefers a
 			// populated response over an empty (half-captured) one and breaks
 			// ties on a stable content fingerprint.
-			existing.req.Response = preferredResponse(existing.req.Response, req.Response)
+			// Retain the response that is NOT selected, so the generator can union
+			// its schema. preferredResponse picks one and the other used to be
+			// discarded here, which made pkg/generate/rest's recursive schema union
+			// unreachable for every bodyless endpoint — see
+			// ClassifiedRequest.MergedResponses.
+			//
+			// Order-free like the selection above: whichever response loses is the
+			// one carried, so the retained pair does not depend on observation order.
+			winner := preferredResponse(existing.req.Response, req.Response)
+			loser := req.Response
+			if sameResponseContent(winner, req.Response) {
+				loser = existing.req.Response
+			}
+			existing.req.Response = winner
+			existing.req.MergedResponses = appendMergedResponse(existing.req.MergedResponses, winner, loser)
 		}
 	}
 
@@ -386,6 +400,47 @@ func CompareResponses(a, b crawl.ObservedResponse) int {
 		return 1
 	}
 	return bytes.Compare(a.Body, b.Body)
+}
+
+// MaxMergedResponses bounds ClassifiedRequest.MergedResponses per endpoint.
+//
+// The bound exists because a body that varies per observation — a timestamp, a
+// request id, a cache token — makes every observation of one endpoint distinct,
+// so an unbounded list would grow with capture size and be walked again for every
+// observation, giving quadratic work on the endpoint the crawl saw most.
+//
+// 8 is chosen against what the union can actually use: the union is additive and
+// only ever ADDS a property, so the Nth response contributes nothing unless it
+// carries a field absent from all N-1 before it. Field sets on one endpoint are
+// small and highly overlapping, so the marginal yield collapses within a handful
+// of observations. It is not a measured distribution over real captures, and it is
+// deliberately generous relative to the 2-3 variants (populated/empty, one status
+// per shape) that motivated this.
+const MaxMergedResponses = 8
+
+// sameResponseContent reports whether two responses carry the same status and the
+// same body bytes, which is the test for "this observation adds nothing to union".
+func sameResponseContent(a, b crawl.ObservedResponse) bool {
+	return a.StatusCode == b.StatusCode && bytes.Equal(a.Body, b.Body)
+}
+
+// appendMergedResponse adds loser to merged unless it duplicates winner or an
+// entry already held, and unless the list is full. Deduplicating here keeps a
+// page that fires the same XHR fifty times from filling the budget with one
+// repeated shape and crowding out a genuinely different observation.
+func appendMergedResponse(merged []crawl.ObservedResponse, winner, loser crawl.ObservedResponse) []crawl.ObservedResponse {
+	if len(loser.Body) == 0 || sameResponseContent(winner, loser) {
+		return merged
+	}
+	if len(merged) >= MaxMergedResponses {
+		return merged
+	}
+	for _, m := range merged {
+		if sameResponseContent(m, loser) {
+			return merged
+		}
+	}
+	return append(merged, loser)
 }
 
 // preferredResponse deterministically selects which of two responses observed

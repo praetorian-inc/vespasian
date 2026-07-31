@@ -15,6 +15,7 @@
 package crawl
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -452,31 +453,64 @@ func TestFrontier_RequeueAfterClose(t *testing.T) {
 	}
 }
 
-// TestFrontier_DedupQueryVariants verifies URLs differing only in query params
-// collapse to one frontier entry, so the crawler visits the page template once
-// rather than spending the page budget on near-duplicate variants (LAB-4678
-// Phase 1). Distinct paths remain distinct.
-func TestFrontier_DedupQueryVariants(t *testing.T) {
+// TestFrontier_BoundedQueryVariants verifies the per-path query-variant policy:
+// a path may be crawled with up to maxQueryVariantsPerPath distinct query strings,
+// after which further variants are dropped.
+//
+// The predecessor of this test asserted that ALL query variants collapse to one
+// entry. That is right for /product?id=1 vs ?id=2 and wrong for ?page=2 and
+// ?tab=billing, which are different pages sharing a path — normalizing the path
+// does not normalize the results. The cap keeps the budget protection against a
+// catalog of thousands of ?id= values while letting the handful of variants that
+// carry real surface through.
+func TestFrontier_BoundedQueryVariants(t *testing.T) {
 	f := newURLFrontier(10, nil)
 
-	f.Push([]urlEntry{{URL: "https://example.com/product?id=1", Depth: 0}})
-	added := f.Push([]urlEntry{{URL: "https://example.com/product?id=2&ref=x", Depth: 0}})
+	// Distinct query variants of one path are admitted, up to the cap.
+	for i := range maxQueryVariantsPerPath {
+		added := f.Push([]urlEntry{{URL: fmt.Sprintf("https://example.com/product?id=%d", i), Depth: 0}})
+		if added != 1 {
+			t.Errorf("variant %d: Push returned %d, want 1 (under the cap)", i, added)
+		}
+	}
+	if f.Len() != maxQueryVariantsPerPath {
+		t.Errorf("Len = %d, want %d", f.Len(), maxQueryVariantsPerPath)
+	}
+
+	// Past the cap, further variants of the SAME path are dropped, so a catalog
+	// cannot consume the page budget.
+	added := f.Push([]urlEntry{{URL: "https://example.com/product?id=9999", Depth: 0}})
 	if added != 0 {
-		t.Errorf("Push returned %d, want 0 (query-only difference must dedup)", added)
-	}
-	if f.Len() != 1 {
-		t.Errorf("Len = %d, want 1", f.Len())
+		t.Errorf("Push returned %d past the %d-variant cap, want 0", added, maxQueryVariantsPerPath)
 	}
 
-	// A genuinely different path is still enqueued.
-	added = f.Push([]urlEntry{{URL: "https://example.com/category?id=1", Depth: 0}})
-	if added != 1 {
-		t.Errorf("Push returned %d, want 1 (distinct path)", added)
+	// An exact repeat is still deduplicated regardless of the cap.
+	if got := f.Push([]urlEntry{{URL: "https://example.com/product?id=0", Depth: 0}}); got != 0 {
+		t.Errorf("Push returned %d for an exact repeat, want 0", got)
 	}
 
-	// The first-seen variant (with its query) is what gets queued/fetched.
+	// A genuinely different path has its own allowance.
+	if got := f.Push([]urlEntry{{URL: "https://example.com/category?id=1", Depth: 0}}); got != 1 {
+		t.Errorf("Push returned %d, want 1 (distinct path has its own variant budget)", got)
+	}
+
+	// The first-seen variant keeps its query when queued and fetched.
 	entry, ok := f.Pop()
-	if !ok || entry.URL != "https://example.com/product?id=1" {
+	if !ok || entry.URL != "https://example.com/product?id=0" {
 		t.Errorf("Pop = %q (ok=%v), want the first-seen variant with its query", entry.URL, ok)
+	}
+}
+
+// TestFrontier_QueryVariantCapIsPerPath pins that the cap does not leak across
+// paths: exhausting one path's allowance must not affect another's.
+func TestFrontier_QueryVariantCapIsPerPath(t *testing.T) {
+	f := newURLFrontier(10, nil)
+	for i := range maxQueryVariantsPerPath + 3 {
+		f.Push([]urlEntry{{URL: fmt.Sprintf("https://example.com/a?p=%d", i), Depth: 0}})
+	}
+	for i := range maxQueryVariantsPerPath {
+		if got := f.Push([]urlEntry{{URL: fmt.Sprintf("https://example.com/b?p=%d", i), Depth: 0}}); got != 1 {
+			t.Errorf("path /b variant %d rejected; the cap must be per path, not global", i)
+		}
 	}
 }

@@ -6,7 +6,7 @@ GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 LDFLAGS   := -s -w -X main.version=$(VERSION) -X main.gitCommit=$(GIT_COMMIT) -X main.buildDate=$(BUILD_DATE)
 
-.PHONY: build test test-integration lint fmt vet check coverage clean deps live-test-clean
+.PHONY: build test test-integration lint lint-comments lint-comments-all fmt vet check coverage clean deps live-test-clean
 
 build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/vespasian
@@ -30,13 +30,24 @@ test-integration:
 lint:
 	golangci-lint run
 
+# Fails when a comment guarantees a state cannot occur without naming the test that
+# pins it. Scoped to files changed against BASE_REF (default origin/main) so it
+# ratchets: new and modified code must comply, pre-existing claims do not block a
+# merge. See the script header for the three LAB-4678 defects that motivated it.
+lint-comments:
+	./scripts/check-unreachability-claims.sh --changed
+
+# Whole-tree sweep. Advisory: run it to see the remaining backlog, not as a gate.
+lint-comments-all:
+	./scripts/check-unreachability-claims.sh --all
+
 fmt:
 	gofmt -s -w .
 
 vet:
 	go vet ./...
 
-check: fmt vet lint test
+check: fmt vet lint lint-comments test
 
 coverage:
 	go test -race -coverprofile=coverage.out $$(go list ./... | grep -v '/test/')

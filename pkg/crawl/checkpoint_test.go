@@ -17,6 +17,7 @@ package crawl
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"regexp"
 	"slices"
@@ -654,13 +655,36 @@ func TestRestore_DedupsRepeatedPendingEntries(t *testing.T) {
 	f := newURLFrontier(5, nil)
 	f.Restore([]urlEntry{
 		{URL: "https://ex.com/a", Depth: 1},
-		{URL: "https://ex.com/a", Depth: 1},
-		{URL: "https://ex.com/a?x=1", Depth: 1}, // same frontier key (query stripped)
+		{URL: "https://ex.com/a", Depth: 1},     // exact repeat: collapses
+		{URL: "https://ex.com/a?x=1", Depth: 1}, // distinct query variant: admitted
 		{URL: "https://ex.com/b", Depth: 1},
 	}, nil)
 
-	if f.Len() != 2 {
-		t.Errorf("restored queue has %d entries, want 2 (duplicates must collapse)", f.Len())
+	// Three: /a, /a?x=1, /b. The query variant is its OWN entry now — the frontier
+	// admits up to maxQueryVariantsPerPath variants per path, because a query can
+	// select a different page rather than a different row of the same one.
+	if f.Len() != 3 {
+		t.Errorf("restored queue has %d entries, want 3 (exact repeats collapse, "+
+			"distinct query variants do not)", f.Len())
+	}
+}
+
+// TestRestore_AppliesQueryVariantCap pins that Restore enforces the same per-path
+// variant cap Push does. A checkpoint is parsed input from host storage, so without
+// this an artifact listing thousands of query variants of one path would queue all
+// of them and spend the entire page budget on a single page — a bound that applies
+// to discovered links must not be skippable by writing to checkpoint storage.
+func TestRestore_AppliesQueryVariantCap(t *testing.T) {
+	f := newURLFrontier(5, nil)
+	pending := make([]urlEntry, 0, 50)
+	for i := range 50 {
+		pending = append(pending, urlEntry{URL: fmt.Sprintf("https://ex.com/list?page=%d", i), Depth: 1})
+	}
+	f.Restore(pending, nil)
+
+	if f.Len() != maxQueryVariantsPerPath {
+		t.Errorf("restored %d entries from 50 query variants of one path, want %d: "+
+			"Restore must apply the same cap as Push", f.Len(), maxQueryVariantsPerPath)
 	}
 }
 

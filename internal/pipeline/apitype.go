@@ -33,12 +33,25 @@ const (
 
 // Dominance rule constants for DetectAPIType (LAB-4678).
 const (
-	// MinChallengerMatches is the absolute floor a non-REST type must clear
-	// before it can take the verdict. It is 1 because the weak-signal problem is
-	// already handled upstream by exclusive assignment (see DetectAPIType): a
-	// lone text/xml response scores higher on REST than on WSDL and is therefore
-	// never a WSDL vote in the first place. The floor remains as an explicit
-	// guard so a zero-vote type can never win.
+	// MinChallengerMatches is the absolute floor a non-REST type must clear before
+	// it can take the verdict. It is 1: the floor's job is only to stop a type with
+	// zero votes from winning, which matters when restCount is 0 and the margin term
+	// below is therefore also 0.
+	//
+	// It is deliberately NOT the defense against a weak minority signal, and the
+	// previous version of this comment claiming otherwise is what let a real defect
+	// ship. It argued the floor was safe at 1 because "a lone text/xml response
+	// scores higher on REST than on WSDL and is therefore never a WSDL vote".
+	// Measured, the opposite held: WSDL scored 0.85 against REST's 0.80, so the
+	// request WAS a WSDL vote, (rest=0, wsdl=1) cleared this floor, and a single XML
+	// response typed an entire capture as SOAP.
+	//
+	// The actual defense is that classifiers score honestly, which is enforced where
+	// the scores are produced rather than here: classify.GenericXMLConfidence puts
+	// bare text/xml below both the threshold and REST. TestWSDL_GenericXMLIsNotASoapVote
+	// pins the ordering and TestDetectAPIType_GenericXMLDoesNotTypeTheCapture pins the
+	// end-to-end verdict, so a future classifier change that re-inverts them fails a
+	// test rather than an argument in a comment.
 	MinChallengerMatches = 1
 
 	// DominanceMargin is how far a challenger must exceed the REST tally to win.
