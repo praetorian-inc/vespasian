@@ -706,6 +706,17 @@ PYEOF
 # distinct page_url values are exactly the visited-page set. The net/http
 # backend emits no page_url at all (one record per page, source=http), so
 # fall back to counting distinct url values there.
+#
+# Invariant (PR #187 review finding CodeRabbit r3676134141): any
+# structurally invalid capture yields "?", which assert_max_pages rejects
+# via its ^[0-9]+$ guard — so a broken capture can never satisfy the
+# max-pages assertion. This includes non-list top-level JSON (object,
+# string, number, null) and a non-empty list from which zero pages could be
+# derived (no element is a dict, or no element carries page_url or url —
+# url is a required ObservedRequest field per pkg/crawl/types.go, so a
+# non-empty capture always yields at least one). Only a genuinely empty
+# list ([]) yields "0", since that's a structurally valid capture meaning
+# "zero requests captured" and 0 pages does not exceed the cap.
 # Usage: count_capture_pages <capture_file>
 count_capture_pages() {
     local capture_file=$1
@@ -720,15 +731,23 @@ except Exception:
     sys.exit(0)
 
 if not isinstance(data, list):
-    print(0)
+    print("?")
     sys.exit(0)
 
 page_urls = {r.get("page_url") for r in data if isinstance(r, dict) and r.get("page_url")}
 if page_urls:
     print(len(page_urls))
-else:
-    urls = {r.get("url") for r in data if isinstance(r, dict) and r.get("url")}
+    sys.exit(0)
+
+urls = {r.get("url") for r in data if isinstance(r, dict) and r.get("url")}
+if urls:
     print(len(urls))
+    sys.exit(0)
+
+if len(data) == 0:
+    print(0)
+else:
+    print("?")
 PYEOF
 }
 
@@ -829,20 +848,29 @@ assert_within_depth() {
     return 0
 }
 
-# assert_max_pages checks a crawl honoured its --max-pages cap, allowing a
-# margin for requests already in flight when the cap is hit (LAB-3890 T3, gap
-# B2). Extracted from test_crawl_depth (PR #187 review finding TEST-004).
-# Usage: assert_max_pages <label> <page_count> <limit> <margin>
+# assert_max_pages checks a crawl honoured its --max-pages cap (LAB-3890 T3,
+# gap B2). Extracted from test_crawl_depth (PR #187 review finding TEST-004).
+#
+# This used to allow a margin (page_count <= limit + margin) on the theory
+# that in-flight requests could overshoot the cap. That tolerance is gone: it
+# no longer models anything real. count_capture_pages counts visited PAGES,
+# not raw requests, and pageBudgetReached (pkg/crawl/engine.go) compares and
+# increments the visited count inside a single mutex-guarded critical
+# section, so the number of visited pages can never exceed MaxPages. CI run
+# 30469344133 confirms this empirically: "[OK] Max-pages limit: visited 10
+# page(s) (limit=10)" — the crawler lands exactly on the cap, zero overshoot.
+# Keeping a vestigial margin only invites it being silently widened again
+# (PR #187 review finding, outside-diff L836-L845).
+# Usage: assert_max_pages <label> <page_count> <limit>
 assert_max_pages() {
-    local label=$1 page_count=$2 limit=$3 margin=$4
+    local label=$1 page_count=$2 limit=$3
 
     if ! [[ $page_count =~ ^[0-9]+$ ]]; then
         log_fail "${label}: page count is not a number: '${page_count}' (capture read failed)"
         return 1
     fi
-    local max_allowed=$((limit + margin))
-    if [ "$page_count" -gt "$max_allowed" ]; then
-        log_fail "${label}: visited ${page_count} page(s) (limit=${limit}, allowed <=${max_allowed}) — --max-pages not enforced"
+    if [ "$page_count" -gt "$limit" ]; then
+        log_fail "${label}: visited ${page_count} page(s) (limit=${limit}) — --max-pages not enforced"
         return 1
     fi
     return 0

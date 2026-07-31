@@ -3362,7 +3362,7 @@ PYEOF
         # crawler was behaving correctly. pkg/crawl's own
         # TestCrawlerContract_RespectsMaxPages counts pages the same way and
         # passes on both backends (PR #187 / LAB-3890 T3, gap B2).
-        if assert_max_pages "Max-pages limit" "$page_count" 10 5; then
+        if assert_max_pages "Max-pages limit" "$page_count" 10; then
             log_ok "Max-pages limit: visited ${page_count} page(s) (limit=10)"
         else
             failures=$((failures + 1))

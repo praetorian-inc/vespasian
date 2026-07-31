@@ -34,7 +34,32 @@ import SwaggerParser from "@apidevtools/swagger-parser";
 // 9 -> no return after 30s) and still exits 0 reporting "OK: valid spec". A
 // size cap bounds the parser's input; a wall-clock timeout on the shell side
 // bounds the expansion itself (PR #187 review finding SEC-FE-003).
-const MAX_SPEC_BYTES = 5 * 1024 * 1024; // 5 MiB = 5242880
+//
+// SPEC_VALIDATOR_MAX_BYTES overrides the default (mirroring
+// SPEC_VALIDATOR_TIMEOUT in test/validate.sh). It exists so validate_test.sh can
+// exercise the too-large rejection against a small fixture instead of having to
+// generate a >5 MiB file. A value that is present but not a positive integer is
+// a misconfiguration and is rejected outright rather than silently falling back
+// to the default — a silently ignored override would let a test believe it had
+// exercised the cap when it had not.
+const DEFAULT_MAX_SPEC_BYTES = 5 * 1024 * 1024; // 5 MiB = 5242880
+
+// Unset or empty -> the default. Anything else must be a positive base-10
+// integer; non-numeric, zero, negative and fractional values all fail fast.
+function resolveMaxBytes(raw) {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_MAX_SPEC_BYTES;
+  const value = raw.trim();
+  const parsed = Number.parseInt(value, 10);
+  if (!/^[0-9]+$/.test(value) || !Number.isSafeInteger(parsed) || parsed <= 0) {
+    console.error(
+      `INVALID: SPEC_VALIDATOR_MAX_BYTES must be a positive base-10 integer of bytes, got: "${raw}"`,
+    );
+    process.exit(2);
+  }
+  return parsed;
+}
+
+const MAX_SPEC_BYTES = resolveMaxBytes(process.env.SPEC_VALIDATOR_MAX_BYTES);
 
 // The only keys in a Path Item Object that denote an operation. Everything else
 // a path item may carry (parameters, summary, description, servers, $ref) is

@@ -308,6 +308,72 @@ assert_reject "missing spec-validator node_modules gives an actionable npm ci me
     _test_missing_spec_validator_deps "${EMPTY_DEPS_DIR}"
 
 # ──────────────────────────────────────────────────────────────
+# SPEC_VALIDATOR_MAX_BYTES (too-large rejection path)
+# ──────────────────────────────────────────────────────────────
+log_header "SPEC_VALIDATOR_MAX_BYTES"
+
+# CodeRabbit nitpick (PR #187): the too-large rejection branch in both
+# validate-openapi.mjs and validate-graphql.mjs was untestable without
+# generating a multi-megabyte fixture. SPEC_VALIDATOR_MAX_BYTES lets this
+# exercise that branch cheaply against the real (small) fixtures instead.
+#
+# Same subshell-wrapper pattern as _test_missing_spec_validator_deps above:
+# each wrapper runs in an explicit subshell so `export SPEC_VALIDATOR_MAX_BYTES`
+# CANNOT leak into the rest of this script's run.
+_test_tiny_max_bytes_openapi() {
+    local spec_file=$1
+    (
+        export SPEC_VALIDATOR_MAX_BYTES=10
+        validate_openapi_structure "$spec_file"
+    )
+}
+_test_tiny_max_bytes_graphql() {
+    local sdl_file=$1
+    (
+        export SPEC_VALIDATOR_MAX_BYTES=10
+        validate_graphql_structure "$sdl_file"
+    )
+}
+_test_generous_max_bytes_openapi() {
+    local spec_file=$1
+    (
+        export SPEC_VALIDATOR_MAX_BYTES=10485760
+        validate_openapi_structure "$spec_file"
+    )
+}
+_test_generous_max_bytes_graphql() {
+    local sdl_file=$1
+    (
+        export SPEC_VALIDATOR_MAX_BYTES=10485760
+        validate_graphql_structure "$sdl_file"
+    )
+}
+
+assert_reject "tiny SPEC_VALIDATOR_MAX_BYTES rejects the real OpenAPI fixture as too large" \
+    "too large" \
+    _test_tiny_max_bytes_openapi "${THIS_DIR}/rest-api/expected-spec.yaml"
+
+assert_reject "tiny SPEC_VALIDATOR_MAX_BYTES rejects the real GraphQL fixture as too large" \
+    "too large" \
+    _test_tiny_max_bytes_graphql "${THIS_DIR}/graphql-server/expected-spec.graphql"
+
+# A generous override must not trivially "pass" by rejecting everything —
+# both real fixtures must still be accepted under it.
+assert_ok "generous SPEC_VALIDATOR_MAX_BYTES still accepts the real OpenAPI fixture" \
+    _test_generous_max_bytes_openapi "${THIS_DIR}/rest-api/expected-spec.yaml"
+assert_ok "generous SPEC_VALIDATOR_MAX_BYTES still accepts the real GraphQL fixture" \
+    _test_generous_max_bytes_graphql "${THIS_DIR}/graphql-server/expected-spec.graphql"
+
+# The override must not leak into this script's own environment.
+if [ -n "${SPEC_VALIDATOR_MAX_BYTES+x}" ]; then
+    log_fail "FAIL (env leak): SPEC_VALIDATOR_MAX_BYTES leaked into the parent shell: '${SPEC_VALIDATOR_MAX_BYTES}'"
+    FAIL=$((FAIL + 1))
+else
+    log_ok "PASS (no env leak): SPEC_VALIDATOR_MAX_BYTES is unset in the parent shell"
+    PASS=$((PASS + 1))
+fi
+
+# ──────────────────────────────────────────────────────────────
 # assert_no_panic
 # ──────────────────────────────────────────────────────────────
 log_header "assert_no_panic"
@@ -411,17 +477,22 @@ assert_reject "unparsable reached-depth count ('?')" \
 # ──────────────────────────────────────────────────────────────
 log_header "assert_max_pages"
 
-# Production values: limit=10, margin=5.
-assert_ok "at the margin (15) is accepted" \
-    assert_max_pages "at-margin" 15 10 5
+# Production value: limit=10. No margin — the cap is enforced exactly
+# (PR #187 review finding, outside-diff L836-L845; see assert_max_pages
+# comment in validate.sh for why the margin was removed).
+assert_ok "at the limit (10) is accepted" \
+    assert_max_pages "at-limit" 10 10
 
-assert_reject "over the margin (16) is rejected" \
+assert_reject "one over the limit (11) is rejected" \
     "--max-pages not enforced" \
-    assert_max_pages "over-margin" 16 10 5
+    assert_max_pages "over-limit" 11 10
+
+assert_ok "comfortably under the limit (3) is accepted" \
+    assert_max_pages "under-limit" 3 10
 
 assert_reject "unparsable page count ('?')" \
     "page count is not a number" \
-    assert_max_pages "unparsable-count" "?" 10 5
+    assert_max_pages "unparsable-count" "?" 10
 
 # assert_count <label> <expected> <function> <args...>
 #   -> runs <function> with <args...>, captures its stdout, and compares it
@@ -508,11 +579,48 @@ assert_count "malformed JSON" \
     "?" \
     count_capture_pages "${WORK_DIR}/malformed-capture.json"
 
-# Not a list.
+# Not a list (object). A structurally invalid capture must never satisfy
+# assert_max_pages by masquerading as "0 pages" (PR #187 review finding
+# CodeRabbit r3676134141) — it must yield "?", which assert_max_pages
+# rejects via its ^[0-9]+$ guard.
 printf '{}' > "${WORK_DIR}/not-a-list-capture.json"
 assert_count "not a list (object)" \
-    "0" \
+    "?" \
     count_capture_pages "${WORK_DIR}/not-a-list-capture.json"
+
+# Not a list (array of scalars, non-empty). Same defect class: a non-empty
+# list with no dict elements yields zero derivable pages, so it must be
+# rejected as "?" rather than silently reported as "0".
+printf '["a", "b"]' > "${WORK_DIR}/not-a-list-of-dicts-capture.json"
+assert_count "not a list of dicts (array of scalars)" \
+    "?" \
+    count_capture_pages "${WORK_DIR}/not-a-list-of-dicts-capture.json"
+
+# Not a list (string).
+printf '"nope"' > "${WORK_DIR}/not-a-list-string-capture.json"
+assert_count "not a list (string)" \
+    "?" \
+    count_capture_pages "${WORK_DIR}/not-a-list-string-capture.json"
+
+# Not a list (number).
+printf '42' > "${WORK_DIR}/not-a-list-number-capture.json"
+assert_count "not a list (number)" \
+    "?" \
+    count_capture_pages "${WORK_DIR}/not-a-list-number-capture.json"
+
+# Not a list (null).
+printf 'null' > "${WORK_DIR}/not-a-list-null-capture.json"
+assert_count "not a list (null)" \
+    "?" \
+    count_capture_pages "${WORK_DIR}/not-a-list-null-capture.json"
+
+# Non-empty list of dicts, but no record carries url or page_url: not a
+# capture at all (url is a required ObservedRequest field), so zero
+# derivable pages must be reported as "?", not "0".
+printf '[{"method":"GET"},{"method":"POST"}]' > "${WORK_DIR}/no-url-field-capture.json"
+assert_count "non-empty list of dicts, no url/page_url field on any record" \
+    "?" \
+    count_capture_pages "${WORK_DIR}/no-url-field-capture.json"
 
 # ──────────────────────────────────────────────────────────────
 # Summary
