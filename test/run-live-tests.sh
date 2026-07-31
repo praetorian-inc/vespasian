@@ -27,7 +27,11 @@ CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/.live-test-config}"
 # (same pattern as CONFIG_FILE below) so test/test-runner-args.sh can point a
 # real run at a temp dir instead of writing into the repo checkout.
 RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/.results}"
-VESPASIAN="${PROJECT_ROOT}/bin/vespasian"
+# Overridable so test-runner-args.sh can pin the binary-absent arm and get the
+# same assertion in CI (where this runs before the build) as locally (where
+# bin/vespasian already exists). Also lets an operator point the suite at a
+# binary built elsewhere.
+VESPASIAN="${VESPASIAN:-${PROJECT_ROOT}/bin/vespasian}"
 
 # Hostname the test harness uses to reach the target services. Defaults to
 # "localhost" for host-only runs. Set TEST_HOST=host.docker.internal (or the
@@ -344,18 +348,22 @@ crawl_backend() {
 }
 
 # chrome_available returns 0 if Chrome is likely reachable, 1 otherwise.
-# This is a best-effort shell heuristic (binary presence or rod's cached
-# Chromium directory) and may diverge from the Go skipIfNoChrome probe, which
-# actually attempts to launch a headless browser via NewBrowserManager. A false
-# positive here (chrome_available returns 0 but Chrome fails to launch) degrades
-# to a log_warn + skip, never a hard failure. A false negative causes the rod
-# backend to be skipped even when Chrome is present; re-run with an explicit
-# Chrome binary on PATH if rod skips unexpectedly.
+#
+# Delegates to detect_chrome_binary (test/common.sh), which RUNS the candidate
+# rather than merely resolving it. That matters on a stock devcontainer, where
+# /usr/bin/chromium-browser is a snap launcher stub: the old presence-only probe
+# (command -v) returned 0 for it, so rod-backed targets were attempted and then
+# failed inside the crawl instead of skipping with a clear reason. Sharing the
+# probe also means the runner, setup-live-targets.sh's preflight, and
+# install-chrome.sh's idempotency check can no longer disagree about whether this
+# host has a usable browser.
+#
+# The rod cache remains a fallback: go-rod can drive a browser it downloaded
+# itself, which is not on PATH and so invisible to the candidate list.
+#
+# A false positive still degrades to a log_warn + skip, never a hard failure.
 chrome_available() {
-    command -v google-chrome >/dev/null 2>&1 || \
-    command -v chromium >/dev/null 2>&1 || \
-    command -v chromium-browser >/dev/null 2>&1 || \
-    [ -d "$HOME/.cache/rod/browser" ]
+    detect_chrome_binary >/dev/null 2>&1 || [ -d "$HOME/.cache/rod/browser" ]
 }
 
 # ──────────────────────────────────────────────────────────────

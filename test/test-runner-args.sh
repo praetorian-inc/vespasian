@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # Tests for run-live-tests.sh target group consistency and the --group flag,
-# plus the setup-live-targets.sh run-guidance selector. Does NOT run actual live
-# tests — only validates that the group arrays stay in sync with the case
-# dispatch block, that --group resolves the correct target set (via --dry-run,
-# no binary required), and that setup-complete guidance steers full vs partial
-# setups correctly.
+# plus the setup-live-targets.sh run-guidance selector. Validates that the group
+# arrays stay in sync with the case dispatch block, that --group resolves the
+# correct target set (via --dry-run, no binary required), and that
+# setup-complete guidance steers full vs partial setups correctly.
+#
+# Starts no live services and contacts no network. It is dry-run based with ONE
+# deliberate exception: the "real offline run" block below invokes the runner for
+# real to prove a browserless offline run needs no config file. That block pins
+# VESPASIAN to a nonexistent path so it always exercises the binary-absent arm —
+# otherwise the assertion would cover a different code path in CI (where this job
+# runs before the build) than locally (where bin/vespasian exists). RESULTS_DIR is
+# redirected into a temp dir so nothing is written into the repo.
 
 set -euo pipefail
 
@@ -502,7 +509,12 @@ fi
 # does execute an importer, and without the override it would write into the
 # repo's test/.results/ — a side effect this file's header disclaims ("Does NOT
 # run actual live tests").
+# VESPASIAN is pinned to a path that cannot exist so this always lands on the
+# binary-absent arm. Without the pin the assertion below covered the binary check
+# in CI and the target dispatch locally — two different code paths behind one
+# green result, and neither environment tested what the other did.
 real_offline=$(env CONFIG_FILE="$noconfig" RESULTS_DIR="$TMPDIR_T/results" \
+    VESPASIAN="$TMPDIR_T/no-such-vespasian-binary" \
     bash -c "source '$RUNNER' --targets import-empty --no-build" 2>&1) || true
 if [[ "$real_offline" == *"Config file not found"* ]]; then
     fail "real offline run demanded a config: $(printf '%s' "$real_offline" | head -3)"
@@ -512,12 +524,41 @@ fi
 
 # The check above is negative-only, so ANY unrelated early failure would satisfy
 # it. Pair it with a positive marker proving the run actually got as far as the
-# post-config stage: either the binary check (CI, where this job runs before
-# setup-go) or the target dispatch itself (locally, where bin/vespasian exists).
-if [[ "$real_offline" == *"vespasian binary not found"* || "$real_offline" == *"import-empty"* ]]; then
-    pass "real offline run reached the post-config stage (binary check or target dispatch)"
+# post-config stage. With VESPASIAN pinned absent, that marker is the binary
+# check — deterministically, in every environment.
+if [[ "$real_offline" == *"vespasian binary not found"* ]]; then
+    pass "real offline run reached the post-config stage (binary check)"
 else
     fail "real offline run failed before reaching post-config: $(printf '%s' "$real_offline" | head -3)"
+fi
+
+echo ""
+echo "=== Browser probe shared with common.sh ==="
+# chrome_available gates the rod-backed targets. It must use the SHARED
+# detect_chrome_binary probe from common.sh, which actually runs the candidate,
+# not a bare `command -v`: on a stock devcontainer /usr/bin/chromium-browser is a
+# snap launcher stub that resolves fine and then fails at launch, so a
+# presence-only probe attempted the crawl and failed inside it instead of
+# skipping with a reason. Sharing the probe is also what keeps the runner, the
+# setup preflight and install-chrome.sh from disagreeing about whether this host
+# has a usable browser.
+#
+# This is a DRIFT guard, in the same spirit as the target-group check above, and
+# it is deliberately structural. run-live-tests.sh calls `main "$@"` unguarded, so
+# chrome_available cannot be sourced and called in isolation without running the
+# whole runner. The probe's BEHAVIOUR is covered where it lives — preflight-selftest
+# drives detect_chrome_binary against working, snap-stub, and absent browsers —
+# so what is left to protect here is the delegation itself.
+chrome_avail_body=$(awk '/^chrome_available\(\) \{/,/^\}/' "$RUNNER")
+if printf '%s' "$chrome_avail_body" | grep -q 'detect_chrome_binary'; then
+    pass "chrome_available delegates to common.sh's detect_chrome_binary"
+else
+    fail "chrome_available no longer uses detect_chrome_binary — the runner's browser probe has drifted from the shared one"
+fi
+if printf '%s' "$chrome_avail_body" | grep -qE 'command -v (google-chrome|chromium|chromium-browser)'; then
+    fail "chrome_available reintroduced a presence-only 'command -v' probe (snap stubs pass it)"
+else
+    pass "chrome_available carries no presence-only browser check"
 fi
 
 echo ""

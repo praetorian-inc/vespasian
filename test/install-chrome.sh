@@ -41,17 +41,22 @@
 # already present. Safe to call from a Dockerfile RUN, a devcontainer
 # postCreateCommand, or by hand.
 #
-# Trust assumption for the test seams: CHROME_DEFAULTS_FILE and DOCKERENV_PATH
-# exist only so install-chrome-selftest.sh can reach the symlink guard and the
-# container gate unprivileged. They are read from the environment and feed
-# root-privileged operations, so they are inputs from an ALREADY-PRIVILEGED
-# caller — either the script runs as root (whoever set them was already root),
-# or it runs unprivileged and the caller must already hold the sudo rights it
-# uses. Default sudoers (`Defaults env_reset`) drops both. This script must
-# therefore never be exposed through a narrowly-scoped sudoers grant that also
-# permits environment passing (SETENV, `sudo -E`, or an env_keep entry): that
-# would be the one configuration in which these seams could steer a privileged
-# write. Nothing in this repo creates or recommends such a grant.
+# Trust assumption for the test seam: VESPASIAN_TEST_ROOT exists only so
+# install-chrome-selftest.sh can reach the symlink guard, the container gate, and
+# the phone-home removal/verification chain unprivileged. It is read from the
+# environment and feeds root-privileged operations, so it is an input from an
+# ALREADY-PRIVILEGED caller — either the script runs as root (whoever set it was
+# already root), or it runs unprivileged and the caller must already hold the
+# sudo rights it uses. Default sudoers (`Defaults env_reset`) drops it. This
+# script must therefore never be exposed through a narrowly-scoped sudoers grant
+# that also permits environment passing (SETENV, `sudo -E`, or an env_keep
+# entry): that would be the one configuration in which the seam could steer a
+# privileged write. Nothing in this repo creates or recommends such a grant.
+#
+# The name is deliberately namespaced. The earlier CHROME_DEFAULTS_FILE /
+# DOCKERENV_PATH pair was generic enough to be set by unrelated ambient tooling
+# in a devcontainer or image build, which would have pointed a privileged write
+# at an unintended path or run the apt-cache wipe on a non-container host.
 #
 # Usage:
 #   ./test/install-chrome.sh            # install if needed
@@ -76,14 +81,41 @@ GOOGLE_KEY_URL="https://dl.google.com/linux/linux_signing_key.pub"
 GOOGLE_KEY_FPR="EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796"
 GOOGLE_APT_URL="https://dl.google.com/linux/chrome/deb/"
 
+# VESPASIAN_TEST_ROOT reroots every absolute system path this script reads or
+# writes. It exists so install-chrome-selftest.sh can drive the privileged
+# branches — the defaults-file rewrite, the phone-home removal, and the
+# post-install verification — against fixtures, unprivileged. Production callers
+# never set it, and it replaces the earlier CHROME_DEFAULTS_FILE / DOCKERENV_PATH
+# pair: one namespaced seam instead of two un-namespaced ones that could collide
+# with ambient tooling in a devcontainer.
+#
+# It feeds root-privileged writes, so it is an input from an ALREADY-PRIVILEGED
+# caller — see the trust note in the header block.
+TEST_ROOT="${VESPASIAN_TEST_ROOT:-}"
+
 # Temporary apt wiring, removed by cleanup_apt_wiring on every exit path.
-TMP_LIST="/etc/apt/sources.list.d/google-chrome-vespasian-temp.list"
-TMP_KEYRING="/usr/share/keyrings/google-chrome-vespasian-temp.gpg"
+TMP_LIST="${TEST_ROOT}/etc/apt/sources.list.d/google-chrome-vespasian-temp.list"
+TMP_KEYRING="${TEST_ROOT}/usr/share/keyrings/google-chrome-vespasian-temp.gpg"
+
+# The package's own opt-out file, and a durable record of what version landed.
+CHROME_DEFAULTS_FILE="${TEST_ROOT}/etc/default/google-chrome"
+CHROME_VERSION_RECORD="${TEST_ROOT}/usr/share/vespasian/chrome-version"
 
 # Artifacts the google-chrome-stable package drops that phone home.
+#
+# Both apt source spellings are listed. The current package (150.x) writes the
+# deb822 `google-chrome.sources` — its postinst sets
+# SOURCES_FILE="$APT_SOURCESDIR/google-chrome.sources" and treats
+# `google-chrome.list` purely as a legacy path to migrate away from. Removing
+# only the legacy name meant verify_install could report "no Google apt source"
+# while the file the package actually writes sat untouched. The package's own
+# keyring is listed for the same reason: verify_install's message claims no
+# keyring is left behind, so it has to actually check for one.
 PHONE_HOME_PATHS=(
-    /etc/apt/sources.list.d/google-chrome.list
-    /etc/cron.daily/google-chrome
+    "${TEST_ROOT}/etc/apt/sources.list.d/google-chrome.list"
+    "${TEST_ROOT}/etc/apt/sources.list.d/google-chrome.sources"
+    "${TEST_ROOT}/etc/cron.daily/google-chrome"
+    "${TEST_ROOT}/usr/share/keyrings/google-chrome.gpg"
 )
 
 # ──────────────────────────────────────────────────────────────
@@ -102,7 +134,11 @@ resolve_arch() {
             return 0
             ;;
     esac
-    log_fail "No google-chrome-stable build for architecture '${arch}' (amd64 and arm64 only)."
+    # >&2 is load-bearing: the caller is `ARCH="$(resolve_arch)"`, so anything
+    # this writes to stdout is swallowed by the command substitution and the
+    # operator sees an empty terminal before set -e aborts. Diagnostics have to
+    # bypass the capture to be diagnostics at all.
+    log_fail "No google-chrome-stable build for architecture '${arch}' (amd64 and arm64 only)." >&2
     return 1
 }
 
@@ -162,6 +198,22 @@ require_apt() {
     fi
 }
 
+# Fail on a missing curl/gpg with a message that names the missing package.
+# Without this the absence of gnupg surfaced from `gpg --dearmor` as "Fetched
+# signing key is not a valid PGP key" — an accusation that Google's key is
+# forged, whose tempting remedy is to bypass the verification. Wrong diagnosis
+# in the most dangerous possible direction.
+require_tools() {
+    local missing=()
+    command -v curl >/dev/null 2>&1 || missing+=("curl")
+    command -v gpg  >/dev/null 2>&1 || missing+=("gnupg")
+    if [ ${#missing[@]} -gt 0 ]; then
+        log_fail "Missing required tool(s): ${missing[*]}"
+        log_info "Install them first: apt-get install -y ${missing[*]}"
+        return 1
+    fi
+}
+
 # ──────────────────────────────────────────────────────────────
 # Trusted apt wiring
 # ──────────────────────────────────────────────────────────────
@@ -170,7 +222,17 @@ require_apt() {
 # and install it as a dedicated keyring. Refuses to proceed on any mismatch —
 # an unpinned key would make the whole signature check ornamental.
 install_pinned_key() {
-    local tmp_key="$1/google.pub" tmp_gpg="$1/google.gpg" fprs
+    local tmp_key="$1/google.pub" tmp_gpg="$1/google.gpg" tmp_ring="$1/google.kbx"
+    local gpg_err="$1/gpg.err" gpg_home="$1/gnupg" fprs
+    # A private homedir for every gpg call below. Without it gpg falls back to
+    # the caller's ~/.gnupg — creating and locking a trustdb in root's home on
+    # first use, which both mutates state this script has no business touching
+    # and makes the outcome depend on whether that directory already existed.
+    # Separate chmod, not `mkdir -m`: with -p the mode applies only to the
+    # deepest directory created (SC2174), which would leave an intermediate at
+    # the default umask.
+    mkdir -p "$gpg_home"
+    chmod 700 "$gpg_home"
     # --proto/--proto-redir '=https': a downgrade redirect is a hard failure,
     # never a silent cleartext fetch. --max-time bounds the whole transfer so a
     # tarpitted mirror surfaces as an error instead of a wedged image build.
@@ -181,25 +243,52 @@ install_pinned_key() {
         return 1
     fi
 
-    if ! gpg --dearmor < "$tmp_key" > "$tmp_gpg" 2>/dev/null; then
+    # Import into a scratch keyring rather than dearmoring in place. gpg's own
+    # stderr is kept and echoed on failure: discarding it is what turned a
+    # missing gnupg into a bogus "the key is forged" report.
+    if ! gpg --homedir "$gpg_home" --no-default-keyring --keyring "$tmp_ring" \
+        --batch --quiet --import "$tmp_key" 2>"$gpg_err"; then
         log_fail "Fetched signing key is not a valid PGP key."
+        [ -s "$gpg_err" ] && log_info "  gpg: $(tr '\n' ' ' < "$gpg_err")"
         return 1
     fi
 
     # Compare against the primary key's fingerprint only (the `pub` record);
     # subkey fingerprints rotate and are not the trust anchor.
-    fprs=$(gpg --show-keys --with-colons --with-fingerprint "$tmp_key" 2>/dev/null \
+    #
+    # MEMBERSHIP, not equality: Google documents publishing its active and
+    # obsolete primary keys in one bundle, and a key transition would legitimately
+    # ship two `pub` records. Equality would refuse that outright. Membership is
+    # only safe because of the export below — we hand apt exactly the pinned key,
+    # so extra keys in the bundle are inspected and then discarded rather than
+    # trusted. Widening this check without keeping that export would silently
+    # extend apt's trust to whatever else the endpoint returned.
+    fprs=$(gpg --homedir "$gpg_home" --no-default-keyring --keyring "$tmp_ring" \
+        --with-colons --fingerprint 2>/dev/null \
         | awk -F: '$1=="pub"{want=1} $1=="fpr" && want{print $10; want=0}')
-    if [ "$fprs" != "$GOOGLE_KEY_FPR" ]; then
+    if ! printf '%s\n' "$fprs" | grep -qxF -- "$GOOGLE_KEY_FPR"; then
         log_fail "Google signing key fingerprint mismatch — refusing to install."
         log_info "  expected: ${GOOGLE_KEY_FPR}"
         log_info "  got:      ${fprs:-<none>}"
         log_info "If Google rotated their primary key, update GOOGLE_KEY_FPR deliberately."
         return 1
     fi
+
+    # Export ONLY the pinned fingerprint. Installing the whole fetched blob would
+    # tell apt to trust every key the endpoint chose to return.
+    if ! gpg --homedir "$gpg_home" --no-default-keyring --keyring "$tmp_ring" \
+        --batch --yes --export "$GOOGLE_KEY_FPR" > "$tmp_gpg" 2>"$gpg_err" || [ ! -s "$tmp_gpg" ]; then
+        log_fail "Could not export the pinned key ${GOOGLE_KEY_FPR} — refusing to install."
+        [ -s "$gpg_err" ] && log_info "  gpg: $(tr '\n' ' ' < "$gpg_err")"
+        return 1
+    fi
     log_ok "Signing key matches pinned fingerprint ${GOOGLE_KEY_FPR}"
 
-    $SUDO install -m 0644 "$tmp_gpg" "$TMP_KEYRING"
+    $SUDO install -d -- "$(dirname -- "$TMP_KEYRING")" "$(dirname -- "$TMP_LIST")"
+    $SUDO install -m 0644 -- "$tmp_gpg" "$TMP_KEYRING"
+    # signed-by= is the whole point: it scopes verification of this source to the
+    # fingerprint-pinned keyring. Without it apt would fall back to any key in
+    # the system-wide trusted set and the pin would be ornamental.
     printf 'deb [arch=%s signed-by=%s] %s stable main\n' "$ARCH" "$TMP_KEYRING" "$GOOGLE_APT_URL" \
         | $SUDO tee "$TMP_LIST" >/dev/null
 }
@@ -208,17 +297,14 @@ install_pinned_key() {
 # between adding and installing cannot leave the source behind — that source
 # persisting is exactly the phone-home the ticket is trying to prevent.
 cleanup_apt_wiring() {
-    $SUDO rm -f "$TMP_LIST" "$TMP_KEYRING"
+    $SUDO rm -f -- "$TMP_LIST" "$TMP_KEYRING"
 }
 
 # The package's postinst re-adds Google's permanent apt source unless
 # repo_add_once is already false. Pre-seeding is cleaner than adding-then-
 # deleting: the source is never created in the first place.
 suppress_permanent_repo() {
-    # Overridable purely so install-chrome-selftest.sh can exercise the symlink
-    # guard and the rewrite branches against a fixture path. Production callers
-    # never set it.
-    local f="${CHROME_DEFAULTS_FILE:-/etc/default/google-chrome}"
+    local f="$CHROME_DEFAULTS_FILE" staged
     # An unexpected symlink here would redirect a root-privileged write to a
     # target of the planter's choosing; fail loudly rather than write through.
     #
@@ -232,43 +318,121 @@ suppress_permanent_repo() {
         return 1
     fi
     # No -m on install -d: an existing /etc/default keeps whatever mode it has.
-    $SUDO install -d "$(dirname "$f")"
-    if [ ! -f "$f" ]; then
-        printf 'repo_add_once=false\n' | $SUDO tee "$f" >/dev/null
-    elif ! grep -q '^repo_add_once=' "$f" 2>/dev/null; then
-        printf 'repo_add_once=false\n' | $SUDO tee -a "$f" >/dev/null
-    else
-        $SUDO sed -i 's/^repo_add_once=.*/repo_add_once=false/' "$f"
+    $SUDO install -d -- "$(dirname -- "$f")"
+
+    # Render the whole desired file, then land it with a single atomic rename.
+    #
+    # This replaces a create/append/rewrite branch trio that had two problems.
+    # The branch predicates ran WITHOUT $SUDO while the writes ran WITH it, so an
+    # unreadable-but-existing file (root-owned 0600) sent an unprivileged caller
+    # down the append arm and duplicated the key instead of rewriting it. And
+    # `tee`/`sed -i` follow symlinks by name, leaving a check-then-write window
+    # after the [ -L ] guard. One rewrite fixes both: the read that decides the
+    # content runs at the same privilege as the write, and rename(2) replaces a
+    # symlink rather than writing through it.
+    staged="${SCRATCH_DIR}/google-chrome.defaults"
+    : > "$staged"
+    if $SUDO test -f "$f"; then
+        # Drop any existing setting, keep everything else, then re-add ours.
+        #
+        # grep's exit status is three-valued and the difference matters: 0 = lines
+        # kept, 1 = no lines matched (a file that held nothing but repo_add_once,
+        # which is normal), 2 = an actual error such as an unreadable file. A bare
+        # `|| true` would treat 2 exactly like 1 and silently write out a file
+        # containing only our opt-out, discarding whatever settings we could not
+        # read. Only 0 and 1 are acceptable here.
+        local grep_rc=0
+        $SUDO grep -v '^repo_add_once=' -- "$f" > "$staged" || grep_rc=$?
+        if [ "$grep_rc" -gt 1 ]; then
+            log_fail "Could not read ${f} (grep exit ${grep_rc}) — refusing to rewrite it."
+            return 1
+        fi
     fi
+    printf 'repo_add_once=false\n' >> "$staged"
+    $SUDO install -m 0644 -- "$staged" "${f}.vespasian-tmp"
+    $SUDO mv -f -- "${f}.vespasian-tmp" "$f"
 }
 
 remove_phone_home() {
-    $SUDO rm -f "${PHONE_HOME_PATHS[@]}"
+    $SUDO rm -f -- "${PHONE_HOME_PATHS[@]}"
 }
 
 # in_container reports whether this looks like a throwaway image, which is the
 # only place it is safe to wipe the apt cache — doing that on a developer's own
 # machine destroys whole-system apt index state they never consented to lose.
-# Both probes are overridable so the selftest can drive each arm.
+# Both probes are reachable from the selftest: the marker path is rerooted by
+# VESPASIAN_TEST_ROOT, and REMOTE_CONTAINERS is read from the environment.
 in_container() {
-    [ -f "${DOCKERENV_PATH:-/.dockerenv}" ] || [ -n "${REMOTE_CONTAINERS:-}" ]
+    [ -f "${TEST_ROOT}/.dockerenv" ] || [ -n "${REMOTE_CONTAINERS:-}" ]
 }
 
 # ──────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────
 
+# SCRATCH_DIR is a script-level global, not a local in main, for two reasons:
+# suppress_permanent_repo stages its rewrite there, and the EXIT trap needs the
+# path still in scope when it fires.
+SCRATCH_DIR=""
+
+cleanup_all() {
+    [ -n "$SCRATCH_DIR" ] && rm -rf -- "$SCRATCH_DIR"
+    cleanup_apt_wiring
+}
+
 main() {
     parse_args "$@"
 
     log_header "Installing Chrome for vespasian tests"
 
+    require_tools
+    resolve_sudo
+
+    # The scratch dir and its teardown are set up BEFORE the idempotency check,
+    # because that path now also removes phone-home artifacts and so needs both.
+    SCRATCH_DIR="$(mktemp -d)"
+    # Single-quoted trap bodies: they are re-parsed as commands when the trap
+    # fires, so interpolating the path here would let a quote in $TMPDIR (which
+    # mktemp honours) break out into the trap body. Expanding $SCRATCH_DIR at
+    # fire time instead removes that surface entirely.
+    #
+    # INT and TERM are handled as well as EXIT, because an interrupted run that
+    # had already written the temporary apt source would otherwise leave a live,
+    # trusted Google source on the host — exactly the persistent egress this
+    # script exists to avoid.
+    #
+    # They `exit` rather than calling cleanup_all directly, and that is the whole
+    # point: a bash signal handler RETURNS TO THE INTERRUPTED CODE when it
+    # finishes. `trap 'cleanup_all' EXIT INT TERM` therefore tore the apt wiring
+    # down and then carried straight on into `apt-get install` with its
+    # repository already deleted, finally exiting 0 as though nothing had
+    # happened. Exiting from the handler routes through the EXIT trap, so
+    # cleanup_all runs exactly once and the status reports the signal (130/143
+    # per the shell convention of 128+signo).
+    trap 'cleanup_all' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
     # Idempotency: a browser that actually RUNS (not merely a snap stub that
-    # resolves) means there is nothing to do.
+    # resolves) means there is no install to do.
     local existing rc=0
     existing=$(detect_chrome_binary) || rc=$?
     if [ $rc -eq 0 ]; then
         log_ok "Runnable browser already present: ${existing}"
+        # Still enforce AC4 before returning success. Chrome may have been
+        # installed by another layer or by hand, in which case the package's
+        # permanent apt source and its root-run daily pinger are present and this
+        # script is the only thing that removes them. Exiting early without this
+        # reported "all good" while a standing egress channel sat in the image.
+        #
+        # cleanup_apt_wiring too, which makes the script SELF-HEALING: a previous
+        # run killed between writing the temporary apt source and removing it
+        # (OOM, cancelled CI job, aborted docker build) leaves a live Google
+        # source behind, and this early exit is the path every later run takes.
+        # Without this, that leftover persisted forever.
+        remove_phone_home
+        cleanup_apt_wiring
+        verify_install
         exit 0
     fi
     if [ $rc -eq 2 ]; then
@@ -276,23 +440,21 @@ main() {
     fi
 
     require_apt
-    resolve_sudo
-    ARCH="$(resolve_arch)"
+    # Explicit status check rather than a bare `ARCH="$(resolve_arch)"`: the
+    # assignment form makes set -e abort with the reason still trapped inside the
+    # substitution. resolve_arch writes its diagnostic to stderr, which reaches
+    # the operator, and this makes the exit deliberate rather than incidental.
+    if ! ARCH="$(resolve_arch)"; then
+        exit 1
+    fi
     log_info "Architecture: ${ARCH}"
-
-    local tmpdir
-    tmpdir="$(mktemp -d)"
-    # Single trap covers both the scratch dir and the apt wiring, so an abort
-    # anywhere below still tears the temporary repo down.
-    # shellcheck disable=SC2064  # tmpdir is expanded now on purpose
-    trap "rm -rf '${tmpdir}'; cleanup_apt_wiring" EXIT
 
     # Trust check FIRST: install_pinned_key aborts on a fingerprint mismatch, so
     # ordering it ahead of suppress_permanent_repo means a run that never earns
     # trust also never mutates /etc/default. Suppression is only required before
     # `apt-get install` (it is the package postinst that re-adds the repo), so
     # nothing is lost by deferring it.
-    install_pinned_key "$tmpdir"
+    install_pinned_key "$SCRATCH_DIR"
     suppress_permanent_repo
 
     log_info "Installing google-chrome-stable via apt (signature-verified)"
@@ -304,7 +466,7 @@ main() {
     remove_phone_home
 
     if in_container; then
-        $SUDO rm -rf /var/lib/apt/lists/*
+        $SUDO rm -rf -- "${TEST_ROOT}/var/lib/apt/lists"/*
     else
         log_info "Not in a container — leaving /var/lib/apt/lists intact."
     fi
@@ -321,7 +483,22 @@ verify_install() {
     fi
     # Log the exact version: this script tracks stable rather than pinning, so
     # the version string is the only record of what actually landed.
-    log_ok "Browser: ${installed} ($("${installed}" --version 2>/dev/null || echo 'version unknown'))"
+    local version
+    version="$("${installed}" --version 2>/dev/null || echo 'version unknown')"
+    log_ok "Browser: ${installed} (${version})"
+
+    # ...and record it durably. Logging alone was not enough: a Dockerfile RUN or
+    # postCreateCommand that discards stdout left the image with no evidence of
+    # which Chrome build it shipped, so a bad stable release could not be
+    # correlated to an image or rolled back to a known-good one.
+    if $SUDO install -d -- "$(dirname -- "$CHROME_VERSION_RECORD")" 2>/dev/null &&
+       printf '%s\n' "$version" | $SUDO tee "$CHROME_VERSION_RECORD" >/dev/null; then
+        log_info "Recorded build in ${CHROME_VERSION_RECORD}"
+    else
+        # Non-fatal: the browser is installed and working, and the record is an
+        # audit convenience rather than a correctness requirement.
+        log_warn "Could not write the version record to ${CHROME_VERSION_RECORD}"
+    fi
 
     local leftover
     for leftover in "${PHONE_HOME_PATHS[@]}" "$TMP_LIST" "$TMP_KEYRING"; do

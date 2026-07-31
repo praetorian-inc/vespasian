@@ -37,6 +37,26 @@ Install a real, non-snap Chrome (`.deb`, amd64 or arm64):
 export VESPASIAN_NO_SANDBOX=true  # containers generally cannot use the Chrome sandbox
 ```
 
+> **This is a manual step today.** Nothing in this repo runs the installer
+> automatically — the devcontainer definition lives elsewhere, so a fresh
+> container comes up browserless and you must run the command above once. To
+> remove that step, the image that owns the devcontainer needs to call the
+> script at build or create time:
+>
+> ```dockerfile
+> # Dockerfile layer
+> COPY test/install-chrome.sh /tmp/install-chrome.sh
+> RUN /tmp/install-chrome.sh && rm /tmp/install-chrome.sh
+> ```
+>
+> ```jsonc
+> // .devcontainer/devcontainer.json — alternative, runs on container create
+> { "postCreateCommand": "./test/install-chrome.sh" }
+> ```
+>
+> The script is idempotent and exits 0 when a runnable browser is already
+> present, so either hook is safe to invoke on every build or rebuild.
+
 **How the package is trusted.** Google's apt repository is added *temporarily*,
 with its signing key pinned by primary-key fingerprint. apt then verifies the
 chain — Release signature → `Packages` digest → `.deb` digest — before dpkg runs

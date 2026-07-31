@@ -372,6 +372,89 @@ else
     fail_count=$((fail_count + 1))
 fi
 
+# ── Case n: main()'s CALL SITE, end to end ─────────────────────
+# Cases g-m all invoke check_prerequisites directly with explicit arguments, so
+# every one of them stayed green when main()'s call site was reverted to a bare
+# `check_prerequisites` — reintroducing the exact browserless hard-fail LAB-5064
+# exists to fix. Worse, case j asserts that the argument-less call MUST be fatal,
+# so the suite actively certified the broken call site as correct.
+#
+# This case closes that by running main() itself. The build helpers are stubbed
+# (no compilation, no network); everything up to and including the browser gate
+# is the real code path.
+#
+# It has teeth in both directions: strip the arguments from the call site and the
+# gate goes fatal, check_prerequisites exits 1, and BOTH the WARN assertion and
+# the past-prereqs marker below fail.
+PAST_PREREQS_MARKER="STUB-REACHED-BUILD-PHASE"
+
+run_setup_main() {
+    (
+        # shellcheck source=setup-live-targets.sh
+        source "${SETUP_SCRIPT}"
+        # shellcheck disable=SC2034  # consumed by detect_chrome_binary from the sourced script
+        CHROME_CANDIDATES=("${SNAP_STUB}")
+        # build_vespasian is the FIRST thing main() calls after the prerequisite
+        # gate, so stubbing it with an immediate exit does double duty: it stands
+        # in as the past-prereqs marker, and it makes this case incapable of
+        # reaching the real build or service-start phases.
+        #
+        # That second property is not a nicety. An earlier revision stubbed only
+        # build_vespasian and build_grpc_server without exiting, and when the
+        # "browser gate never fatal" mutation let a rest-api setup through, the
+        # test compiled Go and started live services from a scratch copy of the
+        # tree. A test must stay inert under mutation, not just under the
+        # behaviour it expects.
+        build_vespasian() { log_ok "${PAST_PREREQS_MARKER}"; exit 0; }
+        set +e
+        main "$@" 2>&1
+    ) || true
+}
+
+# grpc-server speaks gRPC reflection and never launches a browser; --skip-start
+# starts nothing at all. A browserless host must therefore get through setup.
+out_n="$(run_setup_main --targets grpc-server --skip-start)"
+assert_gate "case n: main() with a browserless grpc-server setup warns, not fails" \
+    WARN "${out_n}"
+# check_prerequisites exits 1 on a fatal gate, so the marker can only appear if
+# the gate stayed non-fatal AND the run continued past it.
+if printf '%s' "${out_n}" | grep -qF "${PAST_PREREQS_MARKER}"; then
+    echo "PASS: case n: the run proceeds past prerequisites into the build phase"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case n: the run did not get past prerequisites (browser gate still fatal?)"
+    fail_count=$((fail_count + 1))
+fi
+if printf '%s' "${out_n}" | grep -q "Prerequisites check failed"; then
+    echo "FAIL: case n: main() hard-failed prerequisites on a browserless grpc-server setup"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS: case n: main() did not hard-fail prerequisites"
+    pass_count=$((pass_count + 1))
+fi
+
+# And the LAB-3893 half of the contract at the same call site: a browser-backed
+# target through main() must STILL hard-fail. Without this, "make the gate
+# conditional" could regress into "never gate" and the rows above would happily
+# stay green. Asserting the marker is ABSENT is what catches that.
+out_n2="$(run_setup_main --targets rest-api)"
+assert_gate "case n: main() with a browser-backed target is still fatal" \
+    FAIL "${out_n2}"
+if printf '%s' "${out_n2}" | grep -q "Prerequisites check failed"; then
+    echo "PASS: case n: a browser-backed setup still aborts at prerequisites"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case n: a browser-backed setup no longer aborts (LAB-3893 regression)"
+    fail_count=$((fail_count + 1))
+fi
+if printf '%s' "${out_n2}" | grep -qF "${PAST_PREREQS_MARKER}"; then
+    echo "FAIL: case n: a browser-backed setup got past the gate it should have failed"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS: case n: a browser-backed setup never reaches the build phase"
+    pass_count=$((pass_count + 1))
+fi
+
 # ── Summary ─────────────────────────────────────────────────────
 echo ""
 echo "preflight-selftest: ${pass_count} passed, ${fail_count} failed"
