@@ -2,7 +2,7 @@
 
 Thanks for your interest in contributing. This doc covers the dev setup, project structure, and how to add a classifier, generator, importer, or probe strategy.
 
-For what Vespasian is and how the two-stage pipeline fits together, read the [Architecture](README.md#architecture) section of the README first — this guide assumes it.
+Read the [Architecture](README.md#architecture) section of the README first. It explains what Vespasian is and how the two-stage pipeline fits together, which this guide assumes you know.
 
 ## Table of contents
 
