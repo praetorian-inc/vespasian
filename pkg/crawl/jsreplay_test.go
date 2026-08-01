@@ -1271,6 +1271,59 @@ func TestReplayJSExtracted_EmptyInput(t *testing.T) {
 	})
 }
 
+// TestReplayJSExtracted_UncanonicalizableScanSeedNeverForwardsCredentials
+// pins the structural argument in validateTargetURL's doc comment
+// (cmd/vespasian/main.go, SEC-BE-001, LAB-4992 review) for why ScanCmd's
+// crawl-target seed (c.URL) does not need the crawl.CanonicalOrigin-enforcing
+// predicate that --target-url gets: the seed IS the crawl target, so every
+// observed request necessarily shares its origin. An un-canonicalizable seed
+// (here, a duplicated port -- the same shape validateTargetURL rejects for
+// --target-url, and which ScanCmd.Run's validateURL(c.URL) alone accepts)
+// makes crawl.ResolveTargetOrigin resolve to "" for both the seed itself and
+// every request derived from it, so ReplayJSExtracted's `targetOrigin == ""`
+// early return fires before any request -- including one carrying the
+// --header credential below -- is ever issued.
+//
+// The assertion mirrors TestReplayJSExtracted_EmptyInput's "requests with
+// empty URLs" case: an empty Stderr buffer proves execution never reached
+// the logging inside the script-discovery/probe loops past the early
+// return, and the returned requests are unmodified.
+func TestReplayJSExtracted_UncanonicalizableScanSeedNeverForwardsCredentials(t *testing.T) {
+	// Mirrors validateTargetURL's duplicated-port example: passes validateURL
+	// (scheme and host are both non-empty) but fails crawl.CanonicalOrigin.
+	seed := "https://host:8443:8443/"
+	require.Empty(t, CanonicalOrigin(seed),
+		"test seed must reproduce the un-canonicalizable shape ScanCmd.Run's validateURL(c.URL) alone accepts")
+
+	requests := []ObservedRequest{
+		{
+			Method: "GET",
+			URL:    seed,
+			Source: "katana",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<html><script src="/app.js"></script></html>`),
+			},
+		},
+	}
+
+	require.Empty(t, ResolveTargetOrigin(seed, requests),
+		"an un-canonicalizable ScanCmd-shaped seed must resolve to no usable target origin")
+
+	var stderr bytes.Buffer
+	result := ReplayJSExtracted(context.Background(), requests, JSReplayConfig{
+		TargetURL: seed,
+		Headers:   map[string]string{"Authorization": "Bearer super-secret-token"},
+		Verbose:   true,
+		Stderr:    &stderr,
+	})
+
+	assert.Equal(t, requests, result, "requests must be returned unmodified when targetOrigin cannot be resolved")
+	assert.Empty(t, stderr.Bytes(),
+		"early return must skip script-discovery and probe phases entirely, before any --header credential could be forwarded")
+}
+
 func TestReplayJSExtracted_MaxEndpoints(t *testing.T) {
 	callCount := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

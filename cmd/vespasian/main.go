@@ -655,6 +655,20 @@ func (c *ScanCmd) scanOptions(apiType string, afterWSDL func(ctx context.Context
 
 // Run executes the scan command (crawl + generate pipeline).
 func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
+	// Deliberately validated with validateURL alone, not the stricter
+	// crawl.CanonicalOrigin-enforcing predicate validateTargetURL applies to
+	// --target-url (SEC-BE-001, LAB-4992 review). c.URL is both the crawl
+	// target AND (via ScanOptions.TargetURL / buildJSReplayConfig) the
+	// JS-replay origin, so an un-canonicalizable-but-validateURL-passing seed
+	// (e.g. a duplicated port) cannot silently rebind credential forwarding to
+	// some OTHER origin the way a diverging --target-url could: the seed IS
+	// the crawl target, so crawl.ResolveTargetOrigin degrades to
+	// targetOrigin == "" for it, and crawl.ReplayJSExtracted returns the
+	// requests unmodified as soon as it sees that empty origin — before
+	// issuing any request, so no --header credential is ever forwarded
+	// anywhere. See pkg/crawl's
+	// TestReplayJSExtracted_UncanonicalizableScanSeedNeverForwardsCredentials
+	// for the pinned structural argument.
 	if err := validateURL(c.URL); err != nil {
 		return err
 	}
@@ -806,18 +820,30 @@ func main() {
 // the probe origin to the capture-derived one; since JS-replay forwards
 // --header credentials to whatever it treats as same-origin, the operator's
 // credentials would go to that rebound origin rather than the pinned one, with
-// no error shown. Validating with the enforcing predicate means a --target-url
-// the CLI accepts can never fail to resolve later.
+// no error shown. Validating with the enforcing predicate means the
+// --target-url value THIS FUNCTION PRODUCES can never fail to resolve later.
+//
+// This is a --target-url-specific guarantee, not a codebase-wide one: it says
+// nothing about ScanCmd's crawl-target seed (c.URL), which is validated only
+// by validateURL and never routed through this function — see ScanCmd.Run's
+// own validateURL(c.URL) call for why that seed does not need the same
+// enforcing predicate (SEC-BE-001, LAB-4992 review).
 func validateTargetURL(raw string) error {
 	if raw == "" {
 		return nil
 	}
 	if err := validateURL(raw); err != nil {
-		return fmt.Errorf("invalid --target-url %q: %w", raw, err)
+		// Re-derive the error against the redacted form rather than wrapping
+		// err directly: err's own message also embeds raw verbatim (SEC-BE-002),
+		// so wrapping it here would still leak userinfo credentials even with
+		// the %q above redacted. Stripping userinfo doesn't change the
+		// scheme/host validity validateURL checks, so this fails for the
+		// identical structural reason.
+		return fmt.Errorf("invalid --target-url %q: %w", crawl.RedactURL(raw), validateURL(crawl.RedactURL(raw)))
 	}
 	if crawl.CanonicalOrigin(raw) == "" {
 		return fmt.Errorf("invalid --target-url %q: host is not a usable origin "+
-			"(check for a duplicated port such as \"host:8443:8443\", or an IPv6 zone id)", raw)
+			"(check for a duplicated port such as \"host:8443:8443\", or an IPv6 zone id)", crawl.RedactURL(raw))
 	}
 	return nil
 }

@@ -228,10 +228,10 @@ func extractServers(endpoints []classify.ClassifiedRequest, targetOrigin string)
 	// also placed in jsStaticOrigins (i.e. named by a bundle literal) is only
 	// excluded when it is NOT already in serverSet.
 	//
-	// This is a two-arm switch, not three (round-23 review, finding A): a
-	// prior version had a third arm admitting a jsStaticOrigin that was
-	// merely crawl.SameOrigin with primary, even when not in serverSet. That
-	// arm was unreachable dead code — primary and every jsStaticOrigin are
+	// This is a single if-check inside the loop below, not a three-arm
+	// switch: a prior version had a third arm admitting a jsStaticOrigin that
+	// was merely crawl.SameOrigin with primary, even when not in serverSet.
+	// That arm was unreachable dead code — primary and every jsStaticOrigin are
 	// both crawl.CanonicalOrigin outputs (collectEndpointOrigins,
 	// choosePrimaryOrigin), CanonicalOrigin is idempotent, and
 	// crawl.SameOrigin over two CanonicalOrigin outputs can only agree with

@@ -275,6 +275,34 @@ func TestValidateTargetURL_RejectsUnresolvableOrigin(t *testing.T) {
 	}
 }
 
+// TestValidateTargetURL_RedactsUserinfoInErrors is SEC-BE-002 (LAB-4992
+// review). validateTargetURL echoes the raw --target-url with %q in both of
+// its error returns. A --target-url carrying userinfo (e.g.
+// https://user:secret@host/) would otherwise print the password verbatim to
+// stderr/CI logs. Both error branches are covered: one input that fails
+// validateURL outright (bad scheme), and one that passes validateURL but
+// fails the stricter crawl.CanonicalOrigin check (duplicated port).
+func TestValidateTargetURL_RedactsUserinfoInErrors(t *testing.T) {
+	const password = "secretpass"
+
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{"fails validateURL (bad scheme)", "ftp://user:" + password + "@host/"},
+		{"passes validateURL, fails CanonicalOrigin (duplicated port)", "https://user:" + password + "@host:8443:8443/"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateTargetURL(tt.url)
+			require.Error(t, err)
+			require.NotContains(t, err.Error(), password,
+				"validateTargetURL error must not echo the --target-url password verbatim")
+		})
+	}
+}
+
 func TestParseHeaders_Valid(t *testing.T) {
 	tests := []struct {
 		name    string
