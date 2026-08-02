@@ -226,7 +226,7 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 			// "endpoints will be skipped" even on an all-same-origin capture
 			// where nothing ever was).
 			originIsDerived := !crawl.SameOrigin(opts.TargetURL, targetOrigin)
-			cfg.URLValidator = newCrossOriginValidator(cfg.URLValidator, targetOrigin, originIsDerived, opts.TargetURL != "", opts.Warnings)
+			cfg.URLValidator = newCrossOriginValidator(cfg.URLValidator, targetOrigin, opts.TargetURL, originIsDerived, opts.Warnings)
 		}
 
 		// Pure grpc-gateway traffic is REST/JSON, so the gRPC classifier never

@@ -229,7 +229,18 @@ func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.O
 		// slog (SEC-BE-002) rather than leaving them unset (silently
 		// discarded by internal/pipeline's nil-safe writeStatus). See
 		// slogWriter's doc comment above.
-		Warnings:  slogWriter{target: input.PrimaryURL},
+		// Redacted once at construction rather than per Write: PrimaryURL is
+		// operator-supplied and nothing upstream strips userinfo, so a
+		// credentialed target would otherwise be tagged onto every warning
+		// this writer emits (SEC-BE-005 review finding).
+		//
+		// NOTE: two PRE-EXISTING sinks in this file still log PrimaryURL raw
+		// (the scan-completed Info and the classify/generate-failed Warn).
+		// They are unchanged by this PR and out of its diff scope, so they are
+		// deliberately not touched here; the right fix is to sanitize once in
+		// Match, which is the common chokepoint for all three. Tracked
+		// separately.
+		Warnings:  slogWriter{target: crawl.RedactURL(input.PrimaryURL)},
 		AfterWSDL: nil,
 	})
 	if err != nil {

@@ -40,7 +40,7 @@ func TestNewCrossOriginValidator_SameOriginDelegatesToBase(t *testing.T) {
 	sentinel := errors.New("sentinel: base was consulted")
 	base := func(string) error { return sentinel }
 
-	validate := newCrossOriginValidator(base, "http://target.example:80", false, false, nil)
+	validate := newCrossOriginValidator(base, "http://target.example:80", "", false, nil)
 
 	err := validate("http://target.example/api/v1/x")
 	require.Error(t, err)
@@ -60,7 +60,7 @@ func TestNewCrossOriginValidator_SameOriginDelegatesToBase(t *testing.T) {
 func TestNewCrossOriginValidator_SameOriginAllowsWhenBaseAllows(t *testing.T) {
 	base := func(string) error { return nil }
 
-	validate := newCrossOriginValidator(base, "http://target.example:80", false, false, nil)
+	validate := newCrossOriginValidator(base, "http://target.example:80", "", false, nil)
 
 	err := validate("http://target.example/api/v1/x")
 	assert.NoError(t, err)
@@ -113,7 +113,7 @@ func TestNewCrossOriginValidator_DerivedOriginWarningFiresOnlyOnce(t *testing.T)
 	base := func(string) error { return nil }
 	var warnings bytes.Buffer
 
-	validate := newCrossOriginValidator(base, "http://target.example:80", true, false, &warnings)
+	validate := newCrossOriginValidator(base, "http://target.example:80", "", true, &warnings)
 
 	err1 := validate("http://attacker1.example/api/v1/collect")
 	require.Error(t, err1, "a cross-origin candidate must be rejected")

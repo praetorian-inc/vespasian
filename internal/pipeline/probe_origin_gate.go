@@ -87,8 +87,11 @@ import (
 // common case for a plain `generate` without --target-url — therefore stays
 // completely quiet instead of printing a warning about a derivation that
 // never mattered. This applies uniformly to both of
-// warnDerivedProbeOrigin's message variants, including the
-// targetOrigin == "" ("no usable origin could be derived") case: once
+// warnDerivedProbeOrigin's message variants, including both of its
+// targetOrigin == "" cases (the pinned-but-unresolvable one and the
+// nothing-pinned one -- see that function's doc comment for the current
+// wording; it is not quoted here so the two cannot drift again, QUAL-001
+// review finding): once
 // targetOrigin is "", crawl.SameOrigin never returns true (a "" left-hand
 // origin never compares equal — see that function's doc comment), so every
 // candidate that reaches this closure is rejected anyway and the lazy trigger
@@ -106,7 +109,13 @@ import (
 // that cannot currently occur is complexity for no present benefit), so this
 // comment is the tripwire for whoever parallelizes RunStrategies next
 // (SEC-BE-003).
-func newCrossOriginValidator(base func(string) error, targetOrigin string, originIsDerived, targetPinned bool, warnings io.Writer) func(string) error {
+// targetURL is the raw value the caller pinned (empty when nothing was
+// pinned), not a second bool beside originIsDerived: two adjacent bools at a
+// call site are trivially transposable and neither reads as its meaning
+// (QUAL-002 review finding). The one fact needed downstream -- whether a
+// target was pinned at all -- is derived from it here, at the single point of
+// use, rather than computed at the call site and carried as an opaque flag.
+func newCrossOriginValidator(base func(string) error, targetOrigin, targetURL string, originIsDerived bool, warnings io.Writer) func(string) error {
 	warnedOrigins := make(map[string]bool)
 	warnedDerivedOrigin := false
 	return func(rawURL string) error {
@@ -115,7 +124,7 @@ func newCrossOriginValidator(base func(string) error, targetOrigin string, origi
 		}
 		if originIsDerived && !warnedDerivedOrigin {
 			warnedDerivedOrigin = true
-			warnDerivedProbeOrigin(warnings, targetOrigin, targetPinned)
+			warnDerivedProbeOrigin(warnings, targetOrigin, targetURL != "")
 		}
 		origin := bestEffortOrigin(rawURL)
 		if !warnedOrigins[origin] {
@@ -211,22 +220,34 @@ func bestEffortOrigin(rawURL string) string {
 }
 
 // warnDerivedProbeOrigin emits a one-time, operator-facing warning —
-// mirroring crawl.warnDerivedOrigin (LAB-4998) — when --target-url was not
-// supplied, so the probe-stage cross-origin gate (SEC-BE-001) is comparing
-// candidates against an origin DERIVED from the capture rather than one the
-// operator chose. Without this, an operator whose real API endpoints are
-// silently skipped (e.g. a mixed-origin HAR/Burp import whose first entry is
-// a third-party CDN) has no signal explaining why, or that --target-url is
-// the fix.
+// mirroring crawl.warnDerivedOrigin (LAB-4998) — whenever the probe-stage
+// cross-origin gate (SEC-BE-001) is comparing candidates against an origin the
+// operator did not effectively choose. That covers three cases, distinguished
+// by targetOrigin and targetPinned (QUAL-003 review finding: the earlier
+// wording described only the first):
+//
+//   - Nothing pinned, an origin derived from the capture. The common case, and
+//     the original reason this exists: an operator whose real API endpoints are
+//     silently skipped (e.g. a mixed-origin HAR/Burp import whose first entry
+//     is a third-party CDN) otherwise has no signal explaining why.
+//   - Nothing pinned and nothing derivable — targetOrigin == "", so every
+//     candidate is rejected.
+//   - A target WAS pinned but could not be resolved to a usable origin
+//     (duplicated port, IPv6 zone id), so crawl.ResolveTargetOrigin failed
+//     closed and targetOrigin == "" here too. Reporting this as "not set"
+//     would state the opposite of what happened, which is why targetPinned
+//     exists (SEC-BE-003 review finding).
 //
 // The visible message strings below deliberately do NOT mention "SEC-BE-001"
 // — that identifier is this repo's internal code-review finding number, with
 // no meaning to an operator reading stderr, and cmd/vespasian wires
 // Options.Warnings/ScanOptions.Warnings to os.Stderr unconditionally (never
 // gated on --verbose), so every operator sees whatever this prints (SEC-BE-001
-// nit review finding). Only the operator-actionable fix (--target-url) is
-// named in the text; the finding ID stays in this doc comment for
-// maintainers.
+// nit review finding). They also name no FLAG (SEC-BE-004 review finding):
+// this same code path serves `generate --target-url`, `scan` (whose target is
+// positional, with no --target-url flag at all), and pkg/sdk callers with no
+// command line, so the text states the outcome and the diagnosis and lets the
+// operator map it to whichever entry point they used.
 //
 // Callers invoke this lazily, not once per ClassifyProbeGenerate invocation:
 // see newCrossOriginValidator's doc comment for why and when it actually

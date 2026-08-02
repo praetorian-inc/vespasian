@@ -216,6 +216,14 @@ func TestValidateURL(t *testing.T) {
 		{"empty string", "", true},
 		{"ftp scheme", "ftp://example.com", true},
 		{"just path", "/api/v1", true},
+		// The CanonicalOrigin guard, pinned on validateURL itself rather than
+		// only through the validateTargetURL wrapper (SEC-BE-002 review
+		// finding). These are the seed paths' actual validator: CrawlCmd and
+		// ScanCmd call validateURL directly, so a regression here would let an
+		// un-canonicalizable crawl/scan target through even while the
+		// --target-url tests still passed.
+		{"duplicated port", "https://host:8443:8443/", true},
+		{"IPv6 zone id", "https://[fe80::1%25eth0]/", true},
 	}
 
 	for _, tt := range tests {
@@ -228,18 +236,6 @@ func TestValidateURL(t *testing.T) {
 	}
 }
 
-// TestValidateTargetURL_AcceptsButFailsClosedOnUnresolvableOrigin is
-// SEC-BE-001 (LAB-4992 review). validateTargetURL no longer re-checks
-// --target-url against crawl.CanonicalOrigin directly (that check, and its
-// CLI-level rejection, has been REMOVED from this function and its error
-// message) — the enforcement moved to crawl.ResolveTargetOrigin, which fails
-// closed for a non-empty targetURL that doesn't canonicalize instead of
-// falling through to a capture-derived origin (see ResolveTargetOrigin's doc
-// comment). So a duplicated-port or IPv6-zone-id --target-url, previously
-// rejected here, is now ACCEPTED by the CLI: the guarantee that no --header
-// credential is ever forwarded to the wrong origin is enforced later, at
-// resolution time, for every caller of ResolveTargetOrigin rather than only
-// for --target-url.
 // TestValidateTargetURL_RejectsUnresolvableOriginAndFailsClosed pins BOTH
 // layers of the SEC-BE-001 defense (LAB-4992 review).
 //
@@ -316,10 +312,30 @@ func TestValidateTargetURL_RejectsUnresolvableOriginAndFailsClosed(t *testing.T)
 // passed even when nothing was echoed. Asserting a hostname that appears
 // nowhere else in the message makes it fail if the redacted value stops
 // being printed (TEST-003 review finding).
+// NOTE for alert triage: titus reports "Generic Password" against the
+// `password` constant below (code-scanning alert 119), and "Credentials in a
+// URL" against the fixture rows built from it. Every value is synthetic
+// (`svc-account:secretpass` against api.internal.example, a reserved example
+// domain), no host is ever dialed -- validateTargetURL only parses -- and the
+// credential IS the subject under test: this table exists precisely to prove a
+// userinfo-bearing --target-url never renders its credential into an error.
+// Removing or masking the userinfo would delete the test's subject, and
+// assembling the string from concatenated parts to slip past the scanner would
+// hide the fixture from readers while defeating a control the repository
+// relies on. Retained deliberately; the alerts are false positives of the same
+// class as 97-115 and are dismissed on the same grounds.
 func TestValidateTargetURL_RedactsUserinfoInErrors(t *testing.T) {
 	const username = "svc-account"
 	const password = "secretpass"
 	const host = "api.internal.example"
+	// A percent-encoded credential: a raw '@' would terminate the userinfo
+	// early, so the reserved character itself is what gets encoded. Kept as a
+	// distinct row because redactSeedURL round-trips through url.Parse, which
+	// can decode escapes -- so the encoded and decoded spellings are two
+	// separate leak paths and both must be asserted absent (TEST-001 review
+	// finding: this coverage was dropped when the table was reworked).
+	const encodedPassword = "p%40ss"
+	const decodedPassword = "p@ss"
 
 	tests := []struct {
 		name string
@@ -330,12 +346,20 @@ func TestValidateTargetURL_RedactsUserinfoInErrors(t *testing.T) {
 		// can strip userinfo cleanly, its placeholder where it cannot prove
 		// the result credential-free, and a bare scheme where there was no
 		// host to keep. A shared "contains host OR placeholder" assertion was
-		// what let the previous version pass without any redaction at all.
+		// what let an earlier version pass without any redaction at all.
+		//
+		// The missing-host rows assert the QUOTED form `"https:"` including
+		// its surrounding double quotes, which only the %q verb can produce.
+		// Asserting bare `https:` would be satisfied by the unquoted
+		// `(e.g., https://example.com)` boilerplate in the same message, so
+		// the row would pass even if the %q operand stopped being printed
+		// (TEST-002 review finding).
 		wantEcho string
 	}{
 		{"fails url.Parse (invalid port) -- exercises the *url.Error unwrap", "https://" + username + ":" + password + "@" + host + ":notaport/", "URL with userinfo redacted"},
 		{"fails validateURL (bad scheme)", "ftp://" + username + ":" + password + "@" + host + "/", host},
-		{"fails validateURL (missing host)", "https://" + username + ":" + password + "@", "https:"},
+		{"fails validateURL (missing host)", "https://" + username + ":" + password + "@", `"https:"`},
+		{"percent-encoded credential (missing host)", "https://" + username + ":" + encodedPassword + "@", `"https:"`},
 		{"fails CanonicalOrigin (duplicated port)", "https://" + username + ":" + password + "@" + host + ":8443:8443/", host},
 	}
 
@@ -348,6 +372,11 @@ func TestValidateTargetURL_RedactsUserinfoInErrors(t *testing.T) {
 				"validateTargetURL error must not echo the --target-url password verbatim")
 			require.NotContains(t, msg, username,
 				"validateTargetURL error must not echo the --target-url username")
+			require.NotContains(t, msg, encodedPassword,
+				"validateTargetURL error must not echo a percent-encoded credential in its encoded form")
+			require.NotContains(t, msg, decodedPassword,
+				"validateTargetURL error must not echo a percent-encoded credential in its decoded form -- "+
+					"redactSeedURL round-trips through url.Parse, which can decode the escape")
 			// Positive assertions: the message must still usefully identify
 			// the problem even with credentials stripped.
 			require.Contains(t, msg, "--target-url",

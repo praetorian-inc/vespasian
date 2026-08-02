@@ -797,14 +797,24 @@ func main() {
 // validators can't drift; this also means --target-url now requires
 // http/https like the crawl/scan target URL does.
 //
-// This function does NOT re-check the value against crawl.CanonicalOrigin
-// (SEC-BE-001, LAB-4992 review): that enforcement now lives in
-// ResolveTargetOrigin, which every caller of a resolved target origin goes
-// through, rather than being duplicated here for --target-url alone. A
-// --target-url that passes this function but fails to canonicalize is
-// accepted by the CLI but fails closed later at origin resolution — see
-// ResolveTargetOrigin's doc comment — forwarding no --header credential
-// anywhere rather than silently rebinding to a capture-derived origin.
+// An un-canonicalizable value (duplicated port, IPv6 zone id) is rejected on
+// two independent layers (SEC-BE-001, LAB-4992 review), and this function
+// inherits the first of them rather than implementing either:
+//
+//   - Argv: validateURL itself applies the crawl.CanonicalOrigin check, so the
+//     operator gets an immediate error naming the offending value. That check
+//     is shared with the crawl/scan seed (CrawlCmd.Run, ScanCmd.Run call
+//     validateURL directly), not special-cased for --target-url.
+//   - Runtime: crawl.ResolveTargetOrigin independently fails closed for the
+//     same values, returning "" rather than falling through to a
+//     capture-derived origin. That layer is what protects pkg/sdk and library
+//     callers, which never reach these CLI validators, and it is what
+//     guarantees no --header credential is forwarded to an origin a bundle
+//     chose. See ResolveTargetOrigin's doc comment.
+//
+// Neither layer is redundant: removing the first costs the diagnostic and
+// lets a run crawl, probe nothing, and exit successfully; removing the second
+// reopens the credential-rebind path for every non-CLI caller.
 func validateTargetURL(raw string) error {
 	if raw == "" {
 		return nil
