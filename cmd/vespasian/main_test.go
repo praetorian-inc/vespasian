@@ -329,11 +329,16 @@ func TestValidateTargetURL_RedactsUserinfoInErrors(t *testing.T) {
 	const password = "secretpass"
 	const host = "api.internal.example"
 	// A percent-encoded credential: a raw '@' would terminate the userinfo
-	// early, so the reserved character itself is what gets encoded. Kept as a
-	// distinct row because redactSeedURL round-trips through url.Parse, which
-	// can decode escapes -- so the encoded and decoded spellings are two
-	// separate leak paths and both must be asserted absent (TEST-001 review
-	// finding: this coverage was dropped when the table was reworked).
+	// early, so the reserved character itself is what gets encoded.
+	//
+	// The ENCODED assertion is the live one: it fails if the escape ever
+	// reaches the message verbatim. The DECODED assertion cannot fail on any
+	// current path -- redactSeedURL renders via url.URL.String(), which
+	// re-escapes userinfo, so `p@ss` can never appear (TEST-001 review
+	// finding corrected an earlier comment here claiming these were two
+	// reachable leak paths). It is kept as forward-looking defense in depth
+	// against a future formatter that reads the decoded u.User.Password(),
+	// which would leak the plaintext -- not as coverage of a reachable bug.
 	const encodedPassword = "p%40ss"
 	const decodedPassword = "p@ss"
 

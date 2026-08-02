@@ -575,6 +575,70 @@ func TestRunScan_SetsScanOptionsWarningsToSlogWriter(t *testing.T) {
 	assert.Equal(t, "https://x.com", sw.target, "the slogWriter must target the input's PrimaryURL")
 }
 
+// TestRunScan_SlogWriterTargetRedactsUserinfo pins the SEC-BE-005 redaction
+// (LAB-4992 review). slogWriter tags every warning it emits with its target
+// via slog.Warn, and PrimaryURL is operator-supplied with nothing upstream
+// stripping userinfo -- Match only parses and checks the scheme -- so a
+// credentialed target would otherwise be written to the SDK host's log sink
+// on every probe-coverage warning.
+//
+// The sibling test above cannot catch a revert: its PrimaryURL carries no
+// credentials, so `sw.target` equals the raw input either way. This one uses a
+// credentialed URL and asserts the exact redacted form, so deleting the
+// crawl.RedactURL wrap in capability.go fails here rather than silently
+// shipping the credential (SEC-BE-004/TEST-002 review finding).
+func TestRunScan_SlogWriterTargetRedactsUserinfo(t *testing.T) {
+	// NOTE for alert triage: titus flags the synthetic `svc-account:secretpass`
+	// below. The credential IS the subject under test -- this test exists to
+	// prove it never reaches slogWriter.target -- and x.example is a reserved
+	// domain that is never dialed (crawl is stubbed). Same class as alerts
+	// 97-115 and 119; retained deliberately.
+	// Written as one literal rather than concatenated parts on purpose:
+	// splitting it to slip past the scanner would hide the fixture from
+	// readers while defeating a control the repository relies on, so the
+	// suppression is explicit and carries its reason instead.
+	const primary = "https://svc-account:secretpass@x.example/" //nolint:gosec // G101: synthetic fixture; the credential is the subject under test (see NOTE above)
+
+	var captured pipeline.ScanOptions
+	orig := generateFunc
+	generateFunc = func(_ context.Context, _ []crawl.ObservedRequest, opts pipeline.ScanOptions) ([]byte, string, bool, []crawl.ObservedRequest, error) {
+		captured = opts
+		return []byte(`openapi: "3.0"`), pipeline.APITypeREST, false, nil, nil
+	}
+	t.Cleanup(func() { generateFunc = orig })
+
+	stubCrawl(t, []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://x.example/api/v1/users",
+			Source: crawl.SourceStaticJS, // idempotency guard: skip jsstatic.Analyze
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Body:        []byte(`[{"id":1}]`),
+			},
+		},
+	}, nil)
+
+	c := &Capability{}
+	ctx := ctxWithParams("mode", "scan", "api_type", "rest", "probe", "false")
+	_, _, err := collect(t, c, ctx, seedApp(primary))
+	require.NoError(t, err)
+
+	sw, ok := captured.Warnings.(slogWriter)
+	require.True(t, ok, "runScan must set ScanOptions.Warnings to a slogWriter, got %T", captured.Warnings)
+	assert.NotContains(t, sw.target, "secretpass",
+		"the slogWriter target must not carry the PrimaryURL password into the host's log sink")
+	assert.NotContains(t, sw.target, "svc-account",
+		"the slogWriter target must not carry the PrimaryURL username either")
+	// Exact form, not just absence: this also pins that the host survives
+	// redaction, so a future change that replaced the value with a bare
+	// placeholder would be caught rather than silently passing the
+	// NotContains assertions above.
+	assert.Equal(t, "https://x.example/", sw.target,
+		"the slogWriter target must be the crawl.RedactURL form of PrimaryURL")
+}
+
 // ---------------------------------------------------------------------------
 // 7. Parameters declaration
 // ---------------------------------------------------------------------------

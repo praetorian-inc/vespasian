@@ -90,9 +90,9 @@ import (
 // warnDerivedProbeOrigin's message variants, including both of its
 // targetOrigin == "" cases (the pinned-but-unresolvable one and the
 // nothing-pinned one -- see that function's doc comment for the current
-// wording; it is not quoted here so the two cannot drift again, QUAL-001
-// review finding): once
-// targetOrigin is "", crawl.SameOrigin never returns true (a "" left-hand
+// wording, which is deliberately not quoted here so the two cannot drift
+// again, QUAL-001 review finding). Once targetOrigin is "",
+// crawl.SameOrigin never returns true (a "" left-hand
 // origin never compares equal — see that function's doc comment), so every
 // candidate that reaches this closure is rejected anyway and the lazy trigger
 // fires on the very first one. Laziness only changes behavior when zero
@@ -109,12 +109,18 @@ import (
 // that cannot currently occur is complexity for no present benefit), so this
 // comment is the tripwire for whoever parallelizes RunStrategies next
 // (SEC-BE-003).
+//
 // targetURL is the raw value the caller pinned (empty when nothing was
 // pinned), not a second bool beside originIsDerived: two adjacent bools at a
 // call site are trivially transposable and neither reads as its meaning
 // (QUAL-002 review finding). The one fact needed downstream -- whether a
 // target was pinned at all -- is derived from it here, at the single point of
 // use, rather than computed at the call site and carried as an opaque flag.
+//
+// targetURL is consumed ONLY as `targetURL != ""` and must never be written to
+// warnings: it is operator-supplied and may carry userinfo, while warnings is
+// an always-on sink (never gated on --verbose). If it ever needs to be shown,
+// route it through crawl.RedactURL first (SEC-BE-002 review finding).
 func newCrossOriginValidator(base func(string) error, targetOrigin, targetURL string, originIsDerived bool, warnings io.Writer) func(string) error {
 	warnedOrigins := make(map[string]bool)
 	warnedDerivedOrigin := false

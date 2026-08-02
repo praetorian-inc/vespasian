@@ -215,9 +215,11 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 			// still counts as "derived" here because crawl.SameOrigin("", "")
 			// is false -- SameOrigin requires a non-empty left-hand origin --
 			// so the operator still gets told why every candidate is being
-			// rejected. targetPinned distinguishes the two ""-origin cases for
-			// the message itself (SEC-BE-003): a pinned-but-unresolvable
-			// target must not be reported as "not set". This one predicate
+			// rejected. This call site forwards opts.TargetURL raw;
+			// newCrossOriginValidator derives "was a target pinned at all"
+			// from it at its single point of use, which is what distinguishes
+			// the two ""-origin messages (SEC-BE-003): a pinned-but-
+			// unresolvable target must not be reported as "not set". This one predicate
 			// covers "not set", "set but unusable", and the genuinely derived
 			// case. The warning itself is NOT emitted here -- it fires
 			// lazily, inside newCrossOriginValidator, only on the first

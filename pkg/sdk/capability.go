@@ -234,12 +234,19 @@ func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.O
 		// credentialed target would otherwise be tagged onto every warning
 		// this writer emits (SEC-BE-005 review finding).
 		//
-		// NOTE: two PRE-EXISTING sinks in this file still log PrimaryURL raw
-		// (the scan-completed Info and the classify/generate-failed Warn).
-		// They are unchanged by this PR and out of its diff scope, so they are
-		// deliberately not touched here; the right fix is to sanitize once in
-		// Match, which is the common chokepoint for all three. Tracked
-		// separately.
+		// NOTE: THREE pre-existing slog sinks in this file still log
+		// PrimaryURL raw -- the crawl-completed Info (:149), the
+		// scan-completed Info (:161), and the classify/generate-failed Warn
+		// (:247) -- plus Match's own %q echo at :96. All are unchanged by this
+		// PR and out of its diff scope, so they are deliberately not touched
+		// here.
+		//
+		// Match is NOT the chokepoint for fixing them: it takes input by value
+		// and returns only error, so it can REJECT a userinfo-bearing
+		// PrimaryURL but cannot sanitize the value Invoke later reads. The
+		// real options are to reject in Match (a validation, and a behavior
+		// change for callers that legitimately pass credentials) or to redact
+		// at each sink the way this line does. Tracked separately.
 		Warnings:  slogWriter{target: crawl.RedactURL(input.PrimaryURL)},
 		AfterWSDL: nil,
 	})
