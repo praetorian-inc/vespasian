@@ -242,9 +242,11 @@ func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.O
 		// touched here.
 		//
 		// They are named by message string rather than line number on
-		// purpose: earlier revisions of this NOTE cited :149/:161/:247, and
-		// every one drifted as the comment above them grew (the real lines
-		// are 148/160/254 today). Grep the strings instead.
+		// purpose: three earlier revisions of this NOTE cited line numbers,
+		// and every citation went stale as the comment above the sinks grew --
+		// including the sentence that first explained the problem, which
+		// listed the then-current lines and invalidated one of them by
+		// existing. Grep the strings instead.
 		//
 		// Match is NOT the chokepoint for fixing them: it takes input by value
 		// and returns only error, so it can REJECT a userinfo-bearing
