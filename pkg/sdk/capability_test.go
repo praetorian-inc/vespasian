@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -598,6 +599,20 @@ func TestRunScan_SlogWriterTargetRedactsUserinfo(t *testing.T) {
 	// readers while defeating a control the repository relies on, so the
 	// suppression is explicit and carries its reason instead.
 	const primary = "https://svc-account:secretpass@x.example/" //nolint:gosec // G101: synthetic fixture; the credential is the subject under test (see NOTE above)
+
+	// Capture slog rather than letting it reach stderr. Invoke passes through
+	// the PRE-EXISTING "vespasian scan completed" Info, which still logs
+	// PrimaryURL raw, so without this the run prints this test's own synthetic
+	// credential into the terminal and CI logs (SEC-BE-002 review finding).
+	//
+	// This silences the TEST only. It does NOT close the deferred production
+	// issue -- the three raw sinks enumerated in capability.go's NOTE are
+	// still there, and the assertion below deliberately proves the redaction
+	// on the one sink this PR does own. Do not read a quiet test as evidence
+	// that the deferred ticket is done.
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
 
 	var captured pipeline.ScanOptions
 	orig := generateFunc

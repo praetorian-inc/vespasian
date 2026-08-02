@@ -333,12 +333,19 @@ func TestValidateTargetURL_RedactsUserinfoInErrors(t *testing.T) {
 	//
 	// The ENCODED assertion is the live one: it fails if the escape ever
 	// reaches the message verbatim. The DECODED assertion cannot fail on any
-	// current path -- redactSeedURL renders via url.URL.String(), which
-	// re-escapes userinfo, so `p@ss` can never appear (TEST-001 review
-	// finding corrected an earlier comment here claiming these were two
-	// reachable leak paths). It is kept as forward-looking defense in depth
-	// against a future formatter that reads the decoded u.User.Password(),
-	// which would leak the plaintext -- not as coverage of a reachable bug.
+	// current path, but NOT for the reason an earlier revision of this comment
+	// gave (it claimed url.URL.String() re-escapes userinfo). The real
+	// mechanism is simpler: redactSeedURL sets `u.User = nil`, so the userinfo
+	// is dropped outright before String() is ever called -- and on the
+	// parse-failure row it returns the placeholder instead. Either way the
+	// credential is gone in any spelling, so `p@ss` can never appear.
+	//
+	// The distinction matters to whoever edits redactSeedURL next: the
+	// property depends on that nil assignment, not on escaping behavior, so
+	// removing the nil is what would break it (TEST-001 review finding). The
+	// assertion is kept as forward-looking defense in depth against a future
+	// formatter that reads the decoded u.User.Password() -- not as coverage of
+	// a reachable bug.
 	const encodedPassword = "p%40ss"
 	const decodedPassword = "p@ss"
 
