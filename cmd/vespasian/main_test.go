@@ -228,23 +228,19 @@ func TestValidateURL(t *testing.T) {
 	}
 }
 
-// TestValidateTargetURL_RejectsUnresolvableOrigin is SEC-BE-001 (LAB-4992
-// review). validateTargetURL delegated entirely to validateURL, which checks
-// only parse + scheme + non-empty Host. But the origin the run actually
-// enforces with is crawl.CanonicalOrigin, which fails closed on two shapes
-// validateURL accepts: a host with a duplicated port ("host:8443:8443" — a
-// realistic paste error, which url.Parse accepts because it validates only the
-// segment after the LAST colon) and a bracketed IPv6 literal carrying a zone
-// ID. For those, CanonicalOrigin returns "" and crawl.ResolveTargetOrigin
-// silently skips its explicit-target step, rebinding the probe origin to the
-// capture-derived one — exactly the wrong-origin footgun --target-url exists to
-// prevent. Because JS-replay forwards --header credentials to whatever it
-// considers same-origin, the operator's credentials would then be sent to the
-// capture-derived origin instead of the one they pinned, with no error.
-//
-// The rule: validate with the same predicate the run enforces with, so a
-// --target-url the CLI accepts can never fail to resolve later.
-func TestValidateTargetURL_RejectsUnresolvableOrigin(t *testing.T) {
+// TestValidateTargetURL_AcceptsButFailsClosedOnUnresolvableOrigin is
+// SEC-BE-001 (LAB-4992 review). validateTargetURL no longer re-checks
+// --target-url against crawl.CanonicalOrigin directly (that check, and its
+// CLI-level rejection, has been REMOVED from this function and its error
+// message) — the enforcement moved to crawl.ResolveTargetOrigin, which fails
+// closed for a non-empty targetURL that doesn't canonicalize instead of
+// falling through to a capture-derived origin (see ResolveTargetOrigin's doc
+// comment). So a duplicated-port or IPv6-zone-id --target-url, previously
+// rejected here, is now ACCEPTED by the CLI: the guarantee that no --header
+// credential is ever forwarded to the wrong origin is enforced later, at
+// resolution time, for every caller of ResolveTargetOrigin rather than only
+// for --target-url.
+func TestValidateTargetURL_AcceptsButFailsClosedOnUnresolvableOrigin(t *testing.T) {
 	tests := []struct {
 		name    string
 		url     string
@@ -254,8 +250,8 @@ func TestValidateTargetURL_RejectsUnresolvableOrigin(t *testing.T) {
 		{"plain https", "https://example.com", false},
 		{"explicit port", "https://example.com:8443", false},
 		{"bracketed IPv6", "https://[2001:db8::1]:8443", false},
-		{"duplicated port", "https://host:8443:8443/", true},
-		{"IPv6 zone id", "https://[fe80::1%25eth0]/", true},
+		{"duplicated port -- now accepted by the CLI, fails closed at resolution", "https://host:8443:8443/", false},
+		{"IPv6 zone id -- now accepted by the CLI, fails closed at resolution", "https://[fe80::1%25eth0]/", false},
 		{"missing scheme", "example.com", true},
 		{"ftp scheme", "ftp://example.com", true},
 	}
@@ -266,39 +262,62 @@ func TestValidateTargetURL_RejectsUnresolvableOrigin(t *testing.T) {
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("validateTargetURL(%q) error = %v, wantErr %v", tt.url, err, tt.wantErr)
 			}
-			// The invariant: anything accepted must resolve to a usable origin.
+			// Whether or not the CLI accepts it, an un-canonicalizable value
+			// must fail closed at origin resolution rather than silently
+			// fall back to a capture-derived origin (SEC-BE-001).
 			if err == nil && tt.url != "" && crawl.CanonicalOrigin(tt.url) == "" {
-				t.Errorf("validateTargetURL(%q) accepted a value that canonicalizes to an empty origin; "+
-					"ResolveTargetOrigin will silently fall back to the capture-derived origin", tt.url)
+				if got := crawl.ResolveTargetOrigin(tt.url, nil); got != "" {
+					t.Errorf("ResolveTargetOrigin(%q, nil) = %q, want \"\" (must fail closed)", tt.url, got)
+				}
 			}
 		})
 	}
 }
 
 // TestValidateTargetURL_RedactsUserinfoInErrors is SEC-BE-002 (LAB-4992
-// review). validateTargetURL echoes the raw --target-url with %q in both of
-// its error returns. A --target-url carrying userinfo (e.g.
-// https://user:secret@host/) would otherwise print the password verbatim to
-// stderr/CI logs. Both error branches are covered: one input that fails
-// validateURL outright (bad scheme), and one that passes validateURL but
-// fails the stricter crawl.CanonicalOrigin check (duplicated port).
+// review). validateTargetURL delegates to validateURL, which must never echo
+// raw --target-url userinfo (username, password, or a percent-encoded
+// credential in either its encoded or decoded form) to stderr/CI logs. Both
+// error branches validateURL can produce are covered: a bad scheme, and a
+// missing host -- the duplicated-port shape no longer errors here (see
+// TestValidateTargetURL_AcceptsButFailsClosedOnUnresolvableOrigin), so it is
+// no longer a usable erroring case for this test.
 func TestValidateTargetURL_RedactsUserinfoInErrors(t *testing.T) {
+	const username = "svc-account"
 	const password = "secretpass"
+	// A percent-encoded credential (raw '@' would end the userinfo early, so
+	// the reserved character itself is what gets percent-encoded).
+	const encodedPassword = "p%40ss"
+	const decodedPassword = "p@ss"
 
 	tests := []struct {
 		name string
 		url  string
 	}{
-		{"fails validateURL (bad scheme)", "ftp://user:" + password + "@host/"},
-		{"passes validateURL, fails CanonicalOrigin (duplicated port)", "https://user:" + password + "@host:8443:8443/"},
+		{"fails validateURL (bad scheme)", "ftp://" + username + ":" + password + "@host/"},
+		{"fails validateURL (missing host)", "https://" + username + ":" + password + "@"},
+		{"percent-encoded credential (missing host)", "https://" + username + ":" + encodedPassword + "@"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := validateTargetURL(tt.url)
 			require.Error(t, err)
-			require.NotContains(t, err.Error(), password,
+			msg := err.Error()
+			require.NotContains(t, msg, password,
 				"validateTargetURL error must not echo the --target-url password verbatim")
+			require.NotContains(t, msg, username,
+				"validateTargetURL error must not echo the --target-url username")
+			require.NotContains(t, msg, encodedPassword,
+				"validateTargetURL error must not echo a percent-encoded credential in encoded form")
+			require.NotContains(t, msg, decodedPassword,
+				"validateTargetURL error must not echo a percent-encoded credential in decoded form")
+			// Positive assertion: the message must still usefully identify
+			// the problem even with credentials stripped.
+			require.Contains(t, msg, "--target-url",
+				"validateTargetURL error must still identify --target-url as the source of the problem")
+			require.True(t, strings.Contains(msg, "host") || strings.Contains(msg, "URL with userinfo redacted"),
+				"validateTargetURL error must still surface the redacted host or the redaction placeholder")
 		})
 	}
 }

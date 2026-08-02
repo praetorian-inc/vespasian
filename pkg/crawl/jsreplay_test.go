@@ -1272,28 +1272,40 @@ func TestReplayJSExtracted_EmptyInput(t *testing.T) {
 }
 
 // TestReplayJSExtracted_UncanonicalizableScanSeedNeverForwardsCredentials
-// pins the structural argument in validateTargetURL's doc comment
-// (cmd/vespasian/main.go, SEC-BE-001, LAB-4992 review) for why ScanCmd's
-// crawl-target seed (c.URL) does not need the crawl.CanonicalOrigin-enforcing
-// predicate that --target-url gets: the seed IS the crawl target, so every
-// observed request necessarily shares its origin. An un-canonicalizable seed
-// (here, a duplicated port -- the same shape validateTargetURL rejects for
-// --target-url, and which ScanCmd.Run's validateURL(c.URL) alone accepts)
-// makes crawl.ResolveTargetOrigin resolve to "" for both the seed itself and
-// every request derived from it, so ReplayJSExtracted's `targetOrigin == ""`
-// early return fires before any request -- including one carrying the
-// --header credential below -- is ever issued.
+// pins the structural argument in ResolveTargetOrigin's doc comment
+// (pkg/crawl/jsreplay.go, SEC-BE-001, LAB-4992 review) for why an
+// un-canonicalizable target (here, a duplicated port -- the same shape a
+// ScanCmd crawl-target seed can carry) must never let ReplayJSExtracted fall
+// through to a capture-derived origin: ResolveTargetOrigin resolves to "" for
+// this seed, so the `targetOrigin == ""` early return must fire before any
+// request -- including one carrying the --header credential below -- is ever
+// issued.
 //
-// The assertion mirrors TestReplayJSExtracted_EmptyInput's "requests with
-// empty URLs" case: an empty Stderr buffer proves execution never reached
-// the logging inside the script-discovery/probe loops past the early
-// return, and the returned requests are unmodified.
+// TEST-002 (LAB-4992 review): the assertion is on EGRESS, not logging. A
+// genuinely reachable httptest.Server stands in for the script the capture
+// references; the request-count assertion proves the early return stopped
+// the fetch from ever reaching that reachable server. An empty Stderr buffer
+// (the prior assertion) only proves logging didn't run -- it would still
+// pass if the early return were deleted but the Verbose-gated logging
+// elsewhere were silenced, so it does not actually prove no request was
+// issued.
 func TestReplayJSExtracted_UncanonicalizableScanSeedNeverForwardsCredentials(t *testing.T) {
-	// Mirrors validateTargetURL's duplicated-port example: passes validateURL
-	// (scheme and host are both non-empty) but fails crawl.CanonicalOrigin.
+	// Mirrors the duplicated-port shape validateURL now rejects at the CLI
+	// boundary (cmd/vespasian/main.go): passes the parse/scheme/host check
+	// but fails crawl.CanonicalOrigin.
 	seed := "https://host:8443:8443/"
 	require.Empty(t, CanonicalOrigin(seed),
-		"test seed must reproduce the un-canonicalizable shape ScanCmd.Run's validateURL(c.URL) alone accepts")
+		"test seed must reproduce the un-canonicalizable shape a validateURL-passing target can still carry")
+
+	// Genuinely reachable server: if the targetOrigin=="" early return did
+	// not fire, script discovery would fetch this URL and hits would be > 0.
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Write([]byte(`"/api/v1/data"`)) //nolint:errcheck,gosec // test handler
+	}))
+	defer srv.Close()
 
 	requests := []ObservedRequest{
 		{
@@ -1303,13 +1315,13 @@ func TestReplayJSExtracted_UncanonicalizableScanSeedNeverForwardsCredentials(t *
 			Response: ObservedResponse{
 				StatusCode:  200,
 				ContentType: "text/html",
-				Body:        []byte(`<html><script src="/app.js"></script></html>`),
+				Body:        []byte(`<html><script src="` + srv.URL + `/app.js"></script></html>`),
 			},
 		},
 	}
 
 	require.Empty(t, ResolveTargetOrigin(seed, requests),
-		"an un-canonicalizable ScanCmd-shaped seed must resolve to no usable target origin")
+		"an un-canonicalizable seed must resolve to no usable target origin")
 
 	var stderr bytes.Buffer
 	result := ReplayJSExtracted(context.Background(), requests, JSReplayConfig{
@@ -1317,11 +1329,22 @@ func TestReplayJSExtracted_UncanonicalizableScanSeedNeverForwardsCredentials(t *
 		Headers:   map[string]string{"Authorization": "Bearer super-secret-token"},
 		Verbose:   true,
 		Stderr:    &stderr,
+		Client:    srv.Client(),
+		// AllowPrivate lets the client reach the httptest.Server's loopback
+		// listener. AllowCrossOrigin isolates the targetOrigin=="" early
+		// return under test from the independent same-origin gate every
+		// fetch call site also applies (SameOrigin(x, "") is unconditionally
+		// false -- see isSameOrigin's doc comment): without it, that gate
+		// alone would keep hits at 0 even if the early return were removed,
+		// masking a mutation to it. Never set true in production (ScanCmd
+		// exposes no such flag).
+		AllowPrivate:     true,
+		AllowCrossOrigin: true,
 	})
 
 	assert.Equal(t, requests, result, "requests must be returned unmodified when targetOrigin cannot be resolved")
-	assert.Empty(t, stderr.Bytes(),
-		"early return must skip script-discovery and probe phases entirely, before any --header credential could be forwarded")
+	assert.Equal(t, 0, hits,
+		"early return must fire before any HTTP request is issued -- including one that could carry the --header credential")
 }
 
 func TestReplayJSExtracted_MaxEndpoints(t *testing.T) {
@@ -2571,10 +2594,27 @@ func TestResolveTargetOrigin(t *testing.T) {
 			want:      "http://first.example.test:80",
 		},
 		{
-			name:      "unparseable targetURL is ignored, falls through",
+			// SEC-BE-001 (LAB-4992 review): a non-empty targetURL that fails
+			// to canonicalize must fail closed, NOT fall through to the
+			// capture-derived tiers. Falling through here let bundle-supplied
+			// content (synthetic static:js entries reconstructed from bundle
+			// text) choose the origin that receives --header credentials —
+			// this case used to expect "http://first.example.test:80".
+			name:      "unparseable targetURL fails closed, does not fall through",
 			targetURL: "not a url",
 			requests:  []ObservedRequest{firstReq},
-			want:      "http://first.example.test:80",
+			want:      "",
+		},
+		{
+			// SEC-BE-001 (LAB-4992 review): a bracketed IPv6 zone-id target
+			// (fails closed in originOf via the zone-id arm) must also fail
+			// closed here rather than rebind to a capture-derived origin,
+			// even when the capture has multiple candidate origins to choose
+			// from.
+			name:      "zone-id targetURL fails closed even with a multi-origin capture",
+			targetURL: "https://[fe80::1%25eth0]/",
+			requests:  []ObservedRequest{firstReq, htmlReq},
+			want:      "",
 		},
 		{
 			name:      "empty request set and empty targetURL yields empty origin",

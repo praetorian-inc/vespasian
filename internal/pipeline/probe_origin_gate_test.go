@@ -824,21 +824,22 @@ func TestClassifyProbeGenerate_MixedOriginWithTargetURLProbesRealAPI(t *testing.
 }
 
 // TestClassifyProbeGenerate_UnusableTargetURLStillWarns is the SEC-BE-002
-// regression test. Before the fix, the derived-origin warning was keyed on
-// `opts.TargetURL == ""` alone, so a non-empty but UNUSABLE --target-url
-// (unparseable, or parseable with no host) silently fell through
-// crawl.ResolveTargetOrigin's fallback chain to an origin derived from the
-// capture -- exactly the case the warning exists to surface -- without ever
-// firing it: the operator would see endpoints skipped with no signal that
-// --target-url had not, in fact, taken effect.
+// regression test, UPDATED for SEC-BE-001's fail-closed ResolveTargetOrigin
+// (LAB-4992 review). Before SEC-BE-001, a non-empty but UNUSABLE --target-url
+// (unparseable, or parseable with no host) made crawl.ResolveTargetOrigin
+// silently fall through its fallback chain to an origin derived from the
+// capture (here, the CDN's), so this test originally asserted the
+// "derived origin %s from the capture" warning variant and that only the real
+// API host (cross-origin relative to that derived CDN origin) was skipped.
 //
-// Reuses the CDN-first / real-API-second shape from
-// TestClassifyProbeGenerate_MixedOriginWithoutTargetURLSkipsRealAPI: an
-// unusable TargetURL ("not a url", no scheme, no host) makes
-// crawl.ResolveTargetOrigin fall back to the CDN's origin exactly as an EMPTY
-// TargetURL would, so the real API host is (wrongly) treated as
-// cross-origin and skipped -- and the fix must still emit the derived-origin
-// warning in this case, not just the opts.TargetURL == "" case.
+// ResolveTargetOrigin now fails closed for this exact input instead of
+// falling through (an un-canonicalizable EXPLICIT target must never let
+// bundle-supplied capture content pick the origin — see its doc comment), so
+// targetOrigin is now "" here too, same as the opts.TargetURL == "" case: the
+// warning fires the OTHER variant ("no usable origin could be derived from
+// the capture; every probe candidate is being rejected"), and EVERY
+// candidate — not just the real API host — is rejected as a result. This is
+// a stricter (more secure), not weaker, outcome.
 //
 // The companion "a usable TargetURL must not warn" case is already covered by
 // TestClassifyProbeGenerate_DerivedOriginWarningAbsentWhenTargetURLSet; not
@@ -853,6 +854,9 @@ func TestClassifyProbeGenerate_UnusableTargetURLStillWarns(t *testing.T) {
 	}
 	require.Equal(t, "", crawl.ResolveTargetOrigin("not a url", nil),
 		"precondition: \"not a url\" must not itself resolve to a usable origin")
+	require.Equal(t, "", crawl.ResolveTargetOrigin("not a url", requests),
+		"precondition (SEC-BE-001): a non-empty but un-canonicalizable TargetURL must fail closed "+
+			"rather than fall through to the capture-derived CDN origin")
 
 	var warnings bytes.Buffer
 	_, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
@@ -867,15 +871,12 @@ func TestClassifyProbeGenerate_UnusableTargetURLStillWarns(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Zero(t, atomic.LoadInt32(apiHits),
-		"an unusable --target-url must not pin the real API host as same-origin; "+
-			"ResolveTargetOrigin falls back to the CDN's origin exactly as it would for an empty TargetURL")
+		"an unusable --target-url must not pin the real API host as same-origin")
 	assert.Zero(t, atomic.LoadInt32(cdnHits))
 	// The exact wording changed (SEC-BE-001 nit review finding): the
 	// operator-facing string no longer names the internal finding ID
 	// "SEC-BE-001", which meant nothing outside this repo's review history.
-	// "derived origin" is what remains of the old assertion's substring and
-	// is still unique to this message.
-	assert.Contains(t, warnings.String(), "derived origin",
-		"a non-empty but unusable --target-url must still trigger the derived-origin warning, "+
-			"not just an empty one")
+	assert.Contains(t, warnings.String(), "no usable origin could be derived",
+		"a non-empty but unusable --target-url must still trigger the derived-origin warning -- now the "+
+			"'no usable origin' variant, since ResolveTargetOrigin fails closed instead of deriving one")
 }

@@ -655,20 +655,6 @@ func (c *ScanCmd) scanOptions(apiType string, afterWSDL func(ctx context.Context
 
 // Run executes the scan command (crawl + generate pipeline).
 func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
-	// Deliberately validated with validateURL alone, not the stricter
-	// crawl.CanonicalOrigin-enforcing predicate validateTargetURL applies to
-	// --target-url (SEC-BE-001, LAB-4992 review). c.URL is both the crawl
-	// target AND (via ScanOptions.TargetURL / buildJSReplayConfig) the
-	// JS-replay origin, so an un-canonicalizable-but-validateURL-passing seed
-	// (e.g. a duplicated port) cannot silently rebind credential forwarding to
-	// some OTHER origin the way a diverging --target-url could: the seed IS
-	// the crawl target, so crawl.ResolveTargetOrigin degrades to
-	// targetOrigin == "" for it, and crawl.ReplayJSExtracted returns the
-	// requests unmodified as soon as it sees that empty origin — before
-	// issuing any request, so no --header credential is ever forwarded
-	// anywhere. See pkg/crawl's
-	// TestReplayJSExtracted_UncanonicalizableScanSeedNeverForwardsCredentials
-	// for the pinned structural argument.
 	if err := validateURL(c.URL); err != nil {
 		return err
 	}
@@ -806,44 +792,25 @@ func main() {
 // validateTargetURL rejects a non-empty --target-url that is not an absolute
 // URL. A typo would otherwise silently fall back to the capture-derived origin
 // heuristic, reintroducing the wrong-origin footgun --target-url prevents.
-// Delegates the parse/scheme/host check to validateURL so the two
-// validators can't drift; this also means --target-url now requires http/https
-// like the crawl/scan target URL does.
+// Delegates entirely to validateURL — which already redacts userinfo from
+// every message it returns (SEC-BE-002, LAB-4992 review) — so the two
+// validators can't drift; this also means --target-url now requires
+// http/https like the crawl/scan target URL does.
 //
-// It then re-checks the value through crawl.CanonicalOrigin — the SAME
-// predicate the run later enforces with — because validateURL's parse/scheme/
-// non-empty-Host test is strictly weaker (SEC-BE-001, LAB-4992 review). Two
-// shapes it accepts canonicalize to "": a duplicated port ("host:8443:8443",
-// which url.Parse tolerates because it validates only the segment after the
-// LAST colon) and a bracketed IPv6 literal carrying a zone ID. For those,
-// crawl.ResolveTargetOrigin silently skips its explicit-target step and rebinds
-// the probe origin to the capture-derived one; since JS-replay forwards
-// --header credentials to whatever it treats as same-origin, the operator's
-// credentials would go to that rebound origin rather than the pinned one, with
-// no error shown. Validating with the enforcing predicate means the
-// --target-url value THIS FUNCTION PRODUCES can never fail to resolve later.
-//
-// This is a --target-url-specific guarantee, not a codebase-wide one: it says
-// nothing about ScanCmd's crawl-target seed (c.URL), which is validated only
-// by validateURL and never routed through this function — see ScanCmd.Run's
-// own validateURL(c.URL) call for why that seed does not need the same
-// enforcing predicate (SEC-BE-001, LAB-4992 review).
+// This function does NOT re-check the value against crawl.CanonicalOrigin
+// (SEC-BE-001, LAB-4992 review): that enforcement now lives in
+// ResolveTargetOrigin, which every caller of a resolved target origin goes
+// through, rather than being duplicated here for --target-url alone. A
+// --target-url that passes this function but fails to canonicalize is
+// accepted by the CLI but fails closed later at origin resolution — see
+// ResolveTargetOrigin's doc comment — forwarding no --header credential
+// anywhere rather than silently rebinding to a capture-derived origin.
 func validateTargetURL(raw string) error {
 	if raw == "" {
 		return nil
 	}
 	if err := validateURL(raw); err != nil {
-		// Re-derive the error against the redacted form rather than wrapping
-		// err directly: err's own message also embeds raw verbatim (SEC-BE-002),
-		// so wrapping it here would still leak userinfo credentials even with
-		// the %q above redacted. Stripping userinfo doesn't change the
-		// scheme/host validity validateURL checks, so this fails for the
-		// identical structural reason.
-		return fmt.Errorf("invalid --target-url %q: %w", crawl.RedactURL(raw), validateURL(crawl.RedactURL(raw)))
-	}
-	if crawl.CanonicalOrigin(raw) == "" {
-		return fmt.Errorf("invalid --target-url %q: host is not a usable origin "+
-			"(check for a duplicated port such as \"host:8443:8443\", or an IPv6 zone id)", crawl.RedactURL(raw))
+		return fmt.Errorf("invalid --target-url: %w", err)
 	}
 	return nil
 }
@@ -916,17 +883,32 @@ func statusWriter(verbose bool) io.Writer {
 	return nil
 }
 
-// validateURL checks that the given string is a valid URL with scheme and host.
+// validateURL checks that the given string is a valid URL with scheme and
+// host. Every error message echoes crawl.RedactURL(rawURL), never rawURL
+// itself (SEC-BE-002, QUAL-001, LAB-4992 review): this function is reached
+// directly by the crawl/scan URL argument and (via validateTargetURL)
+// --target-url, both of which may carry userinfo credentials that must not be
+// echoed to stderr/CI logs.
+//
+// url.Parse's own returned *url.Error also embeds the raw URL in its message
+// (e.g. `parse "https://user:pass@host": net/url: invalid ...`), so wrapping
+// it directly would re-leak the credential even with %q above redacted;
+// unwrapping to its inner .Err (the cause, without the URL) avoids that while
+// keeping the message useful.
 func validateURL(rawURL string) error {
+	redacted := crawl.RedactURL(rawURL)
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return fmt.Errorf("invalid URL %q: %w", rawURL, err)
+		if uerr, ok := err.(*url.Error); ok { //nolint:errorlint // extracting the embedded cause, not testing err's identity
+			err = uerr.Err
+		}
+		return fmt.Errorf("invalid URL %q: %w", redacted, err)
 	}
 	if u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("invalid URL %q: must include scheme and host (e.g., https://example.com)", rawURL)
+		return fmt.Errorf("invalid URL %q: must include scheme and host (e.g., https://example.com)", redacted)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("invalid URL %q: scheme must be http or https", rawURL)
+		return fmt.Errorf("invalid URL %q: scheme must be http or https", redacted)
 	}
 	return nil
 }

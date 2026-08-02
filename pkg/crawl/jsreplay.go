@@ -801,6 +801,17 @@ func firstHTMLOrigin(requests []ObservedRequest) string {
 //
 // Returns "" if none of the above yields a usable origin.
 //
+// A non-empty targetURL that fails to canonicalize (step 1) does NOT fall
+// through to steps 2-3 (SEC-BE-001, LAB-4992 review): the request set may
+// contain synthetic static:js entries whose URLs are reconstructed from
+// bundle text (pipeline.Augment runs before the JS-replay hook), so falling
+// through would let a hostile bundle supply the origin that receives
+// --header credentials — silently rebinding a pinned target to one the
+// capture's own content chose. An explicitly pinned target that cannot be
+// honored must fail closed instead. The capture-derived fallback (steps 2-3)
+// remains correct and intended for the targetURL == "" case (e.g. `generate`
+// with no --target-url), where there is no pinned target to betray.
+//
 // Preferring the HTML page (step 2) over the plain first-request fallback
 // (step 3) matters for mixed-origin / imported captures (HAR/Burp) whose
 // first entry may be a third-party asset (CDN font, analytics beacon):
@@ -813,8 +824,9 @@ func firstHTMLOrigin(requests []ObservedRequest) string {
 // means for a given scan; two independent derivations would risk silently
 // diverging and reopening the cross-origin gap one of them is meant to close.
 func ResolveTargetOrigin(targetURL string, requests []ObservedRequest) string {
-	if origin := originOf(targetURL); origin != "" {
-		return origin
+	if targetURL != "" {
+		// Fail closed here rather than falling through — see doc comment.
+		return originOf(targetURL)
 	}
 	if origin := firstHTMLOrigin(requests); origin != "" {
 		return origin
