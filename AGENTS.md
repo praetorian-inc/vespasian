@@ -135,7 +135,7 @@ See `test/README.md` for how to run the suite, including the `TEST_HOST` overrid
 
 - After implementing a feature or fix, run `make check` to ensure all tests and the linter pass.
 - After modifying a Go source file, update its package's `doc.go` if the change affects the package's public API or purpose.
-- After adding or changing features, review `README.md` and `CLAUDE.md` for accuracy and update them if needed.
+- After adding or changing features, review `README.md` and `AGENTS.md` (this file — `CLAUDE.md` is only a one-line pointer to it) for accuracy and update them if needed.
 
 ## CI
 
