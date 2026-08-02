@@ -40,7 +40,7 @@ func TestNewCrossOriginValidator_SameOriginDelegatesToBase(t *testing.T) {
 	sentinel := errors.New("sentinel: base was consulted")
 	base := func(string) error { return sentinel }
 
-	validate := newCrossOriginValidator(base, "http://target.example:80", false, nil)
+	validate := newCrossOriginValidator(base, "http://target.example:80", false, false, nil)
 
 	err := validate("http://target.example/api/v1/x")
 	require.Error(t, err)
@@ -60,7 +60,7 @@ func TestNewCrossOriginValidator_SameOriginDelegatesToBase(t *testing.T) {
 func TestNewCrossOriginValidator_SameOriginAllowsWhenBaseAllows(t *testing.T) {
 	base := func(string) error { return nil }
 
-	validate := newCrossOriginValidator(base, "http://target.example:80", false, nil)
+	validate := newCrossOriginValidator(base, "http://target.example:80", false, false, nil)
 
 	err := validate("http://target.example/api/v1/x")
 	assert.NoError(t, err)
@@ -113,14 +113,14 @@ func TestNewCrossOriginValidator_DerivedOriginWarningFiresOnlyOnce(t *testing.T)
 	base := func(string) error { return nil }
 	var warnings bytes.Buffer
 
-	validate := newCrossOriginValidator(base, "http://target.example:80", true, &warnings)
+	validate := newCrossOriginValidator(base, "http://target.example:80", true, false, &warnings)
 
 	err1 := validate("http://attacker1.example/api/v1/collect")
 	require.Error(t, err1, "a cross-origin candidate must be rejected")
 	err2 := validate("http://attacker2.example/api/v1/exfiltrate")
 	require.Error(t, err2, "a second, distinct cross-origin candidate must also be rejected")
 
-	assert.Equal(t, 1, strings.Count(warnings.String(), "WARNING: --target-url not set"),
+	assert.Equal(t, 1, strings.Count(warnings.String(), "WARNING: no target origin was pinned"),
 		"the derived-origin warning must fire exactly once across the validator's lifetime, "+
 			"even though two distinct cross-origin hosts were rejected")
 }

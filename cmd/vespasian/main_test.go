@@ -240,7 +240,22 @@ func TestValidateURL(t *testing.T) {
 // credential is ever forwarded to the wrong origin is enforced later, at
 // resolution time, for every caller of ResolveTargetOrigin rather than only
 // for --target-url.
-func TestValidateTargetURL_AcceptsButFailsClosedOnUnresolvableOrigin(t *testing.T) {
+// TestValidateTargetURL_RejectsUnresolvableOriginAndFailsClosed pins BOTH
+// layers of the SEC-BE-001 defense (LAB-4992 review).
+//
+// Layer 1 (argv): validateURL now rejects an un-canonicalizable value up
+// front, so the operator gets an immediate, actionable error instead of a run
+// that crawls, probes nothing, and exits successfully having silently done
+// no work. This check was briefly delegated entirely to ResolveTargetOrigin;
+// that closed the security hole but lost the diagnostic, so it is back here
+// as well.
+//
+// Layer 2 (runtime): crawl.ResolveTargetOrigin independently fails closed for
+// the same values, which is what actually protects pkg/sdk and library
+// callers that never touch these CLI validators. The subtest below asserts
+// layer 2 directly rather than trusting layer 1 to be the only gate, so
+// removing either one fails this test.
+func TestValidateTargetURL_RejectsUnresolvableOriginAndFailsClosed(t *testing.T) {
 	tests := []struct {
 		name    string
 		url     string
@@ -250,8 +265,8 @@ func TestValidateTargetURL_AcceptsButFailsClosedOnUnresolvableOrigin(t *testing.
 		{"plain https", "https://example.com", false},
 		{"explicit port", "https://example.com:8443", false},
 		{"bracketed IPv6", "https://[2001:db8::1]:8443", false},
-		{"duplicated port -- now accepted by the CLI, fails closed at resolution", "https://host:8443:8443/", false},
-		{"IPv6 zone id -- now accepted by the CLI, fails closed at resolution", "https://[fe80::1%25eth0]/", false},
+		{"duplicated port -- rejected at argv", "https://host:8443:8443/", true},
+		{"IPv6 zone id -- rejected at argv", "https://[fe80::1%25eth0]/", true},
 		{"missing scheme", "example.com", true},
 		{"ftp scheme", "ftp://example.com", true},
 	}
@@ -262,10 +277,18 @@ func TestValidateTargetURL_AcceptsButFailsClosedOnUnresolvableOrigin(t *testing.
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("validateTargetURL(%q) error = %v, wantErr %v", tt.url, err, tt.wantErr)
 			}
-			// Whether or not the CLI accepts it, an un-canonicalizable value
-			// must fail closed at origin resolution rather than silently
-			// fall back to a capture-derived origin (SEC-BE-001).
-			if err == nil && tt.url != "" && crawl.CanonicalOrigin(tt.url) == "" {
+			// Layer 2, asserted independently of layer 1: an
+			// un-canonicalizable value must resolve to no origin at all,
+			// never to a capture-derived one a hostile bundle could supply.
+			//
+			// Scoped to http(s) because CanonicalOrigin and originOf
+			// deliberately disagree for other schemes: CanonicalOrigin
+			// returns "" for "ftp://example.com" while originOf returns
+			// "ftp://example.com". That divergence is harmless here (a
+			// non-http scheme is already rejected on scheme grounds) but it
+			// would make this assertion fire on a row it was never about.
+			isHTTP := strings.HasPrefix(tt.url, "http://") || strings.HasPrefix(tt.url, "https://")
+			if isHTTP && crawl.CanonicalOrigin(tt.url) == "" {
 				if got := crawl.ResolveTargetOrigin(tt.url, nil); got != "" {
 					t.Errorf("ResolveTargetOrigin(%q, nil) = %q, want \"\" (must fail closed)", tt.url, got)
 				}
@@ -276,27 +299,44 @@ func TestValidateTargetURL_AcceptsButFailsClosedOnUnresolvableOrigin(t *testing.
 
 // TestValidateTargetURL_RedactsUserinfoInErrors is SEC-BE-002 (LAB-4992
 // review). validateTargetURL delegates to validateURL, which must never echo
-// raw --target-url userinfo (username, password, or a percent-encoded
-// credential in either its encoded or decoded form) to stderr/CI logs. Both
-// error branches validateURL can produce are covered: a bad scheme, and a
-// missing host -- the duplicated-port shape no longer errors here (see
-// TestValidateTargetURL_AcceptsButFailsClosedOnUnresolvableOrigin), so it is
-// no longer a usable erroring case for this test.
+// raw --target-url userinfo to stderr/CI logs.
+//
+// Every error branch validateURL can produce is covered, each by an input
+// that reaches it and carries credentials: url.Parse failure, bad scheme,
+// missing host, and the un-canonicalizable-origin check. The parse-failure
+// row is the one that matters most: it is the only input reaching the
+// *url.Error unwrap, whose whole purpose is that url.Parse's own message
+// embeds the raw URL, so wrapping it directly would re-leak the credential
+// the %q operand just redacted (TEST-001/QUAL-001 review finding — that
+// branch previously had zero coverage).
+//
+// The fixture hostname is deliberately distinctive rather than "host": the
+// previous positive assertion looked for the substring "host", which the
+// boilerplate "must include scheme and host" satisfies on its own, so it
+// passed even when nothing was echoed. Asserting a hostname that appears
+// nowhere else in the message makes it fail if the redacted value stops
+// being printed (TEST-003 review finding).
 func TestValidateTargetURL_RedactsUserinfoInErrors(t *testing.T) {
 	const username = "svc-account"
 	const password = "secretpass"
-	// A percent-encoded credential (raw '@' would end the userinfo early, so
-	// the reserved character itself is what gets percent-encoded).
-	const encodedPassword = "p%40ss"
-	const decodedPassword = "p@ss"
+	const host = "api.internal.example"
 
 	tests := []struct {
 		name string
 		url  string
+		// wantEcho is the exact substring the redacted value must contribute
+		// to the message. Stated per-row rather than as a shared disjunction
+		// because RedactURL's output differs by branch: a hostname where it
+		// can strip userinfo cleanly, its placeholder where it cannot prove
+		// the result credential-free, and a bare scheme where there was no
+		// host to keep. A shared "contains host OR placeholder" assertion was
+		// what let the previous version pass without any redaction at all.
+		wantEcho string
 	}{
-		{"fails validateURL (bad scheme)", "ftp://" + username + ":" + password + "@host/"},
-		{"fails validateURL (missing host)", "https://" + username + ":" + password + "@"},
-		{"percent-encoded credential (missing host)", "https://" + username + ":" + encodedPassword + "@"},
+		{"fails url.Parse (invalid port) -- exercises the *url.Error unwrap", "https://" + username + ":" + password + "@" + host + ":notaport/", "URL with userinfo redacted"},
+		{"fails validateURL (bad scheme)", "ftp://" + username + ":" + password + "@" + host + "/", host},
+		{"fails validateURL (missing host)", "https://" + username + ":" + password + "@", "https:"},
+		{"fails CanonicalOrigin (duplicated port)", "https://" + username + ":" + password + "@" + host + ":8443:8443/", host},
 	}
 
 	for _, tt := range tests {
@@ -308,16 +348,13 @@ func TestValidateTargetURL_RedactsUserinfoInErrors(t *testing.T) {
 				"validateTargetURL error must not echo the --target-url password verbatim")
 			require.NotContains(t, msg, username,
 				"validateTargetURL error must not echo the --target-url username")
-			require.NotContains(t, msg, encodedPassword,
-				"validateTargetURL error must not echo a percent-encoded credential in encoded form")
-			require.NotContains(t, msg, decodedPassword,
-				"validateTargetURL error must not echo a percent-encoded credential in decoded form")
-			// Positive assertion: the message must still usefully identify
+			// Positive assertions: the message must still usefully identify
 			// the problem even with credentials stripped.
 			require.Contains(t, msg, "--target-url",
 				"validateTargetURL error must still identify --target-url as the source of the problem")
-			require.True(t, strings.Contains(msg, "host") || strings.Contains(msg, "URL with userinfo redacted"),
-				"validateTargetURL error must still surface the redacted host or the redaction placeholder")
+			require.Contains(t, msg, tt.wantEcho,
+				"the redacted value must still be echoed so the operator can see WHICH input was rejected; "+
+					"this fails if the %q operand stops being printed")
 		})
 	}
 }

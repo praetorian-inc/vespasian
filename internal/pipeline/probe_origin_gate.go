@@ -106,7 +106,7 @@ import (
 // that cannot currently occur is complexity for no present benefit), so this
 // comment is the tripwire for whoever parallelizes RunStrategies next
 // (SEC-BE-003).
-func newCrossOriginValidator(base func(string) error, targetOrigin string, originIsDerived bool, warnings io.Writer) func(string) error {
+func newCrossOriginValidator(base func(string) error, targetOrigin string, originIsDerived, targetPinned bool, warnings io.Writer) func(string) error {
 	warnedOrigins := make(map[string]bool)
 	warnedDerivedOrigin := false
 	return func(rawURL string) error {
@@ -115,7 +115,7 @@ func newCrossOriginValidator(base func(string) error, targetOrigin string, origi
 		}
 		if originIsDerived && !warnedDerivedOrigin {
 			warnedDerivedOrigin = true
-			warnDerivedProbeOrigin(warnings, targetOrigin)
+			warnDerivedProbeOrigin(warnings, targetOrigin, targetPinned)
 		}
 		origin := bestEffortOrigin(rawURL)
 		if !warnedOrigins[origin] {
@@ -231,13 +231,27 @@ func bestEffortOrigin(rawURL string) string {
 // Callers invoke this lazily, not once per ClassifyProbeGenerate invocation:
 // see newCrossOriginValidator's doc comment for why and when it actually
 // fires.
-func warnDerivedProbeOrigin(w io.Writer, targetOrigin string) {
+func warnDerivedProbeOrigin(w io.Writer, targetOrigin string, targetPinned bool) {
 	if targetOrigin == "" {
-		writeStatus(w, "WARNING: --target-url not set and no usable origin could be derived from the capture; "+
-			"every probe candidate is being rejected. Pass --target-url to allow probing.\n")
+		if targetPinned {
+			// A target WAS supplied but could not be resolved to an origin
+			// (duplicated port, IPv6 zone id). Saying "not set" here would
+			// state the opposite of what happened and send the operator to
+			// re-pass a value that is already the problem (SEC-BE-003).
+			writeStatus(w, "WARNING: the pinned target URL could not be resolved to a usable origin "+
+				"(check for a duplicated port such as \"host:8443:8443\", or an IPv6 zone id); "+
+				"every probe candidate is being rejected.\n")
+			return
+		}
+		writeStatus(w, "WARNING: no target origin was pinned and none could be derived from the capture; "+
+			"every probe candidate is being rejected.\n")
 		return
 	}
-	writeStatus(w, "WARNING: --target-url not set; derived origin %s from the capture — "+
-		"endpoints outside this origin are being skipped. Pass --target-url to pin it.\n",
+	// Reached only when nothing was pinned, so the origin was derived. The
+	// remedy is deliberately phrased without naming a flag: ScanCmd has no
+	// --target-url (it pins via its positional URL), so naming that flag here
+	// would prescribe something `scan` operators cannot do (SEC-BE-003).
+	writeStatus(w, "WARNING: no target origin was pinned; derived origin %s from the capture — "+
+		"endpoints outside this origin are being skipped. Pin the target origin to control this.\n",
 		crawl.SanitizeForLog(targetOrigin))
 }

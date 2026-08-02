@@ -537,7 +537,7 @@ func TestClassifyProbeGenerate_UnresolvableOriginFailsClosed(t *testing.T) {
 		"an unresolvable target origin must fail closed and reject every probe candidate")
 	assert.Contains(t, warnings.String(), "AllowCrossOriginProbe",
 		"the warning must name the opt-out field even when the origin could not be resolved at all")
-	assert.Contains(t, warnings.String(), "no usable origin could be derived",
+	assert.Contains(t, warnings.String(), "none could be derived from the capture",
 		"the one-time derived-origin warning must also fire and explain that no origin could be resolved at all")
 }
 
@@ -876,7 +876,8 @@ func TestClassifyProbeGenerate_UnusableTargetURLStillWarns(t *testing.T) {
 	// The exact wording changed (SEC-BE-001 nit review finding): the
 	// operator-facing string no longer names the internal finding ID
 	// "SEC-BE-001", which meant nothing outside this repo's review history.
-	assert.Contains(t, warnings.String(), "no usable origin could be derived",
-		"a non-empty but unusable --target-url must still trigger the derived-origin warning -- now the "+
-			"'no usable origin' variant, since ResolveTargetOrigin fails closed instead of deriving one")
+	assert.Contains(t, warnings.String(), "the pinned target URL could not be resolved to a usable origin",
+		"a non-empty but unusable --target-url must trigger the PINNED variant of the warning: saying "+
+			"\"not set\" or \"none could be derived\" here would tell the operator the opposite of what "+
+			"happened and send them to re-pass the value that is already the problem (SEC-BE-003)")
 }

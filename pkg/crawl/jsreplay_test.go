@@ -1299,9 +1299,13 @@ func TestReplayJSExtracted_UncanonicalizableScanSeedNeverForwardsCredentials(t *
 
 	// Genuinely reachable server: if the targetOrigin=="" early return did
 	// not fire, script discovery would fetch this URL and hits would be > 0.
-	hits := 0
+	// Counted atomically because the handler runs on the server's goroutine
+	// (TEST-004 review finding); today the count stays 0 so the race is
+	// latent, but a regression is exactly the case that would trip it, and a
+	// race report is a worse failure signal than a clean assertion.
+	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits++
+		atomic.AddInt32(&hits, 1)
 		w.Header().Set("Content-Type", "application/javascript")
 		w.Write([]byte(`"/api/v1/data"`)) //nolint:errcheck,gosec // test handler
 	}))
@@ -1311,6 +1315,24 @@ func TestReplayJSExtracted_UncanonicalizableScanSeedNeverForwardsCredentials(t *
 		{
 			Method: "GET",
 			URL:    seed,
+			Source: "katana",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<html><script src="` + srv.URL + `/app.js"></script></html>`),
+			},
+		},
+		// A SECOND entry on a canonicalizable origin (TEST-005 review
+		// finding). Without it this fixture could not detect a revert of
+		// ResolveTargetOrigin's fail-closed guard: with only the seed
+		// present, falling back through the capture-derived tiers still
+		// yields no usable origin, so hits would stay 0 either way and the
+		// test would pass against the very regression it exists to catch.
+		// With it, a revert resolves targetOrigin to this origin, the fetch
+		// proceeds, and hits goes above zero.
+		{
+			Method: "GET",
+			URL:    "https://capture.example.test/",
 			Source: "katana",
 			Response: ObservedResponse{
 				StatusCode:  200,
@@ -1343,7 +1365,7 @@ func TestReplayJSExtracted_UncanonicalizableScanSeedNeverForwardsCredentials(t *
 	})
 
 	assert.Equal(t, requests, result, "requests must be returned unmodified when targetOrigin cannot be resolved")
-	assert.Equal(t, 0, hits,
+	assert.Equal(t, int32(0), atomic.LoadInt32(&hits),
 		"early return must fire before any HTTP request is issued -- including one that could carry the --header credential")
 }
 

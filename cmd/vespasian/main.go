@@ -899,7 +899,8 @@ func validateURL(rawURL string) error {
 	redacted := crawl.RedactURL(rawURL)
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		if uerr, ok := err.(*url.Error); ok { //nolint:errorlint // extracting the embedded cause, not testing err's identity
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
 			err = uerr.Err
 		}
 		return fmt.Errorf("invalid URL %q: %w", redacted, err)
@@ -909,6 +910,10 @@ func validateURL(rawURL string) error {
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return fmt.Errorf("invalid URL %q: scheme must be http or https", redacted)
+	}
+	if crawl.CanonicalOrigin(rawURL) == "" {
+		return fmt.Errorf("invalid URL %q: host is not a usable origin "+
+			"(check for a duplicated port such as \"host:8443:8443\", or an IPv6 zone id)", redacted)
 	}
 	return nil
 }
