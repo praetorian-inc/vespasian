@@ -4,18 +4,18 @@ Thanks for using Vespasian. This page explains where to ask, what to include, an
 
 ## Where to ask
 
-Everything goes through [GitHub Issues](https://github.com/praetorian-inc/vespasian/issues) — pick the template that fits:
+Everything goes through [GitHub Issues](https://github.com/praetorian-inc/vespasian/issues):
 
-| You want to | Use |
+| You want to | Open an issue and |
 |---|---|
-| Ask how to do something, or check whether behavior is expected | **Question** template |
-| Report something that doesn't work | **Bug report** template |
-| Suggest a capability or improvement | **Feature request** template |
-| Report a security vulnerability | **Not an issue** — see [SECURITY.md](SECURITY.md) |
+| Ask how to do something, or check whether behavior is expected | say it's a question, and include the context below |
+| Report something that doesn't work | describe expected versus actual, with the context below |
+| Suggest a capability or improvement | describe the use case it unblocks |
+| Report a security vulnerability | **don't** — see [SECURITY.md](SECURITY.md) |
 
-Start at [new issue](https://github.com/praetorian-inc/vespasian/issues/new/choose). Before filing, the [README](README.md) covers installation, the CLI reference, and which API types are supported — a fair number of questions are answered there.
+Start at [new issue](https://github.com/praetorian-inc/vespasian/issues/new). Before filing, the [README](README.md) covers installation, the CLI reference, which API types are supported, and an [FAQ](README.md#frequently-asked-questions) — a fair number of questions are answered there.
 
-If you're unsure whether something is a bug or a misunderstanding, file it as a **question**. Working that out is our job, not yours.
+If you're unsure whether something is a bug or a misunderstanding, say so and file it as a question. Working that out is our job, not yours.
 
 ## What to include
 
@@ -23,13 +23,13 @@ Vespasian's behavior depends heavily on what it was pointed at and how the traff
 
 - **Version** — output of `vespasian version`
 - **OS and architecture**, and whether you're running in a container or devcontainer
+- **Go version** (`go version`) if you built from source
 - **The command you ran**, with flags
 - **Where the traffic came from** — headless crawl, Burp Suite XML, HAR, or mitmproxy import
 - **What you expected** versus what happened
 - **A relevant excerpt** of `capture.json` or the generated spec
 
-> [!WARNING]
-> **Redact before posting.** Captures and generated specs routinely contain hostnames, tokens, cookies, and request bodies from real targets. Issues are public and are not the place for any of that. Strip it, or replace it with representative dummy values.
+**Redact before posting.** Captures and generated specs routinely contain hostnames, tokens, cookies, and request bodies from real targets. Issues are public and are not the place for any of that. Strip it, or replace it with representative dummy values.
 
 ## What to expect
 
@@ -39,7 +39,7 @@ In practice:
 
 - Questions and bug reports with the context above get answered fastest, because there's nothing to ask for first.
 - Reproducible bugs are prioritized over ones we can't reproduce.
-- A quiet issue hasn't been rejected. If a week passes with no reply, comment on the thread — [GOVERNANCE.md](GOVERNANCE.md) describes how to escalate.
+- A quiet issue hasn't been rejected. Comment on the thread — maintainers may simply have missed it — and if it's still quiet after roughly a week, escalate per [GOVERNANCE.md](GOVERNANCE.md).
 
 ## Security
 
