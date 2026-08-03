@@ -329,17 +329,9 @@ Two CI workflows gate a PR:
 
 ## Reporting issues
 
-Open a GitHub issue and include:
+Bug reports, feature requests, and questions all go through GitHub Issues. [`SUPPORT.md`](SUPPORT.md) is the single source for where to ask what, the context to include, and what response to expect — it is kept there rather than duplicated here so the two cannot drift.
 
-- What you expected versus what happened
-- Steps to reproduce — the CLI command and flags, and the capture source (crawl, Burp XML, HAR, mitmproxy)
-- Vespasian version (`vespasian version`)
-- Go version (`go version`), OS, and architecture
-- A **redacted** `capture.json` excerpt where relevant
-
-Captures and generated specs routinely contain hostnames, tokens, cookies, and request bodies from real targets. Redact before attaching anything to a public issue.
-
-Questions belong in issues too.
+One thing worth repeating: captures and generated specs routinely contain hostnames, tokens, cookies, and request bodies from real targets. Redact before attaching anything to a public issue.
 
 ## Security disclosures
 
