@@ -1267,8 +1267,9 @@ func extractAPIPaths(jsBody []byte, requests []ObservedRequest) []string { //nol
 // raw HTTP, and appends what answers to the returned slice.
 //
 // It exists because a headless crawl cannot exercise paths that need user
-// interaction or auth state, or that jsluice cannot resolve; raw HTTP also
-// bypasses SPA catch-all routing. Defenses are in the file header.
+// interaction or auth state, or that jsluice cannot resolve. Raw HTTP does not
+// escape a server-side catch-all: a wrong path still returns the SPA shell, which
+// is why fetchJSBodyHop filters HTML. Defenses are in the file header.
 func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSReplayConfig) []ObservedRequest { //nolint:gocyclo // top-level JS extraction orchestration
 	cfg = cfg.withDefaults()
 

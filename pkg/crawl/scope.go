@@ -32,8 +32,9 @@ func isPrivateIP(ip net.IP) bool {
 	return ssrf.IsPrivateIP(ip)
 }
 
-// isPrivateHost resolves the host and reports true if any address is private,
-// keeping the browser off internal endpoints.
+// isPrivateHost resolves the host and reports true if any address is private.
+// This is the upfront check only — it cannot bind what Chrome later resolves, and
+// the headless path has no dial-time revalidation (see crawlHeadless).
 func isPrivateHost(hostname string) bool {
 	if ip := net.ParseIP(hostname); ip != nil {
 		return isPrivateIP(ip)

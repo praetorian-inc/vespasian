@@ -16,8 +16,9 @@
 // endpoints and parameters the capture itself never exercised. It runs between
 // capture and classification.
 //
-// ExtractForms tokenizes HTML bodies and emits one synthetic ObservedRequest per
-// <form>, tagged Source="static:html". It complements pkg/crawl's DOM extractor
+// ExtractForms tokenizes HTML bodies and emits at most one synthetic
+// ObservedRequest per <form>, tagged Source="static:html", dropping forms whose
+// action is unparseable, non-http(s) or off-host. It complements pkg/crawl's DOM extractor
 // (Source="form"), which only runs during a live headless crawl — so imported
 // Burp, HAR and mitmproxy traffic gets form coverage too.
 //

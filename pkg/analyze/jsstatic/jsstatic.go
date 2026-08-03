@@ -31,7 +31,7 @@ const (
 	SourceSourcemap = crawl.SourceStaticJSSourcemap
 )
 
-// Applied by withDefaults when the Options field is zero.
+// Applied by withDefaults when the Options field is non-positive.
 const (
 	DefaultPerBundleTimeout      = 5 * time.Second
 	DefaultMaxBundleSize         = 5 * 1024 * 1024 // 5 MB
@@ -96,7 +96,7 @@ type Result struct {
 // Stats counts what the analyser saw and emitted, for verbose output and tests.
 type Stats struct {
 	BundlesAnalyzed     int // handed to jsluice, post-filter and size-cap
-	BundlesSkipped      int // oversized, empty, or parse timeout
+	BundlesSkipped      int // oversized, or a parse timeout; NOT empty bodies
 	SourcemapsRecovered int // decoded via sourcesContent
 	SourcemapFetchFails int // sourceMappingURL seen, fetch failed
 	EndpointsFound      int // before the cap and toRequests synthesis
@@ -106,8 +106,8 @@ type Stats struct {
 	SourcemapSourcesOversized int // over MaxBundleSize, never reach jsluice
 	SourcemapSourcePanics     int // one per "jsluice panic" error
 
-	// Still in workCh at cancellation: neither analyzed nor skipped. 0 on a clean
-	// run.
+	// Bundles that produced no result before cancellation — still queued, or
+	// dequeued by a worker that then saw ctx.Done(). 0 on a clean run.
 	BundlesAbandonedOnCancel int
 
 	// Panic inside analyzeOne but OUTSIDE the extraction goroutine. 0 on a clean
@@ -155,9 +155,12 @@ const (
 //
 // On timeout the orchestrator returns but the goroutine runs until jsluice
 // finishes, since jsluice is not context-aware. The channel is buffered to
-// capacity 1 so that late send cannot block. Worst case per Analyze call is
-// Concurrency x (1+N) in-flight goroutines, N being the sourcesContent entries in
-// a recovered sourcemap, each dispatched separately.
+// capacity 1 so that late send cannot block.
+//
+// Concurrency does NOT bound the leak. It bounds how many extractions are awaited
+// at once; a worker that times out moves on to the next bundle, so leaked
+// goroutines accumulate one per timed-out extraction over the whole run — worst
+// case one for every bundle plus every sourcemap source in the input.
 //
 // If tree-sitter ever genuinely deadlocks, the goroutine blocks for the lifetime
 // of the call. Only pkg/probe-style process isolation fixes that.
@@ -305,12 +308,13 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	return result
 }
 
-// Analyze runs static analysis over every JS body in captured, returning a new
-// slice with synthesized entries APPENDED — the order matters, because
-// classify.Deduplicate keeps dynamic entries on ties. The input is never mutated.
+// Analyze runs static analysis over every JS body in captured. On the normal path
+// it returns a new slice with synthesized entries APPENDED — the order matters,
+// because classify.Deduplicate keeps dynamic entries on ties. The input is never
+// mutated; when there is nothing to analyze it returns captured itself.
 //
-// The error is for catastrophic failures only; per-bundle parse failures are
-// logged and counted.
+// The error is ctx.Err() on cancellation, with the partial result alongside it.
+// Per-bundle parse failures are logged and counted, not returned.
 func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options) (Result, error) {
 	if ctx.Err() != nil {
 		return Result{Requests: captured}, ctx.Err()
@@ -366,8 +370,9 @@ func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options
 		close(resultCh)
 	}()
 
-	// workerProcessed counts bundles a worker actually picked up; the shortfall
-	// against len(bundles) is BundlesAbandonedOnCancel.
+	// workerProcessed counts bundles that produced a result; the shortfall against
+	// len(bundles) is BundlesAbandonedOnCancel, which therefore also covers a
+	// bundle a worker dequeued and abandoned on ctx.Done().
 	var synthesized []crawl.ObservedRequest
 	workerProcessed := 0
 	for r := range resultCh {

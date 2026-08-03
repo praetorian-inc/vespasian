@@ -22,7 +22,7 @@ type ObservedRequest struct {
 	QueryParams map[string][]string `json:"query_params,omitempty"`
 	Body        []byte              `json:"body,omitempty"`
 	Response    ObservedResponse    `json:"response"`
-	// Known values: "katana", "browser", "form" (live crawl); "import:burp",
+	// Known values: "katana", "browser", "http", "form" (live crawl); "import:burp",
 	// "import:har", "import:mitmproxy"; "static:html" (pkg/analyze); "static:js",
 	// "static:js-sourcemap" (pkg/analyze/jsstatic).
 	Source    string `json:"source"`

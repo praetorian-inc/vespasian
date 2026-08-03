@@ -123,7 +123,8 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 	// MaxPages counts pages, not requests — one SPA page fires dozens of XHR calls
 	// (LAB-4678). Slots are reserved under this mutex before visiting, which makes
 	// the cap exact, and hitting it does NOT cancel ctx: in-flight pages finalize
-	// and emit everything they captured, so the emitted set is stable run-to-run.
+	// and emit everything they captured rather than being cut off mid-page. Which
+	// pages land inside the budget still varies run to run.
 	var (
 		mu        sync.Mutex
 		pageCount int

@@ -57,8 +57,9 @@ type staticFormField struct {
 // resolved. The NUL prefix cannot collide with a real parsed value.
 const sentinelSelectedOption = "\x00selected"
 
-// ExtractForms returns one synthetic ObservedRequest per <form>, ready to append
-// to the captured slice. Bodies over maxBodyBytes are truncated first.
+// ExtractForms returns at most one synthetic ObservedRequest per <form>, ready to
+// append to the captured slice: forms whose action is unparseable, non-http(s) or
+// off-host are dropped. Bodies over maxBodyBytes are truncated first.
 func ExtractForms(requests []crawl.ObservedRequest) []crawl.ObservedRequest {
 	var out []crawl.ObservedRequest
 	for _, req := range requests {

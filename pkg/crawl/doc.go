@@ -68,13 +68,17 @@
 //
 // After a headless crawl, [ReplayJSExtracted] scans captured JS bundles for API
 // path strings and probes them over raw HTTP, recovering endpoints the browser
-// cannot exercise (gated behind interaction, or built by runtime concatenation)
-// and bypassing SPA catch-all routing. It recognizes quoted paths, template
-// literals, full URLs, literal+literal `+` prefixes, and identifier-bearing
-// concatenation via String.prototype.concat or `+` (LAB-1368) — the last
-// substitutes a numeric sentinel for non-literal operands so the path stays
-// probeable and parameterizable. Runs under a same-origin gate and pkg/ssrf unless
-// AllowPrivate.
+// cannot exercise: paths gated behind interaction, paths built by runtime
+// concatenation, and paths a browser can only reach by navigating, where an SPA
+// serves its shell instead. Raw HTTP does not escape a server-side catch-all,
+// though: a wrong path still returns that shell, which is why fetchJSBodyHop
+// filters HTML.
+//
+// Recognized forms are quoted paths, template literals, full URLs,
+// literal+literal `+` prefixes, and identifier-bearing concatenation via
+// String.prototype.concat or `+` (LAB-1368) — the last substitutes a numeric
+// sentinel for non-literal operands so the path stays probeable and
+// parameterizable. Runs under a same-origin gate and pkg/ssrf unless AllowPrivate.
 //
 // # Session cookies (LAB-2222)
 //

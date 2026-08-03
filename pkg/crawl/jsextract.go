@@ -116,8 +116,9 @@ func isJavaScriptContentType(ct string) bool {
 }
 
 // jsExtractedToLinks resolves against base for the frontier, dropping static
-// assets and streaming transports: interception already captured them, and
-// navigating wastes the page budget and nests paths on SPA catch-all servers.
+// assets and streaming transports: they are not useful frontier targets, and
+// navigating wastes the page budget and nests paths on SPA catch-all servers. On
+// the headless path CDP interception has already captured their content.
 func jsExtractedToLinks(extracted []jsExtractedURL, baseURL string) []string {
 	seen := make(map[string]bool)
 	var links []string

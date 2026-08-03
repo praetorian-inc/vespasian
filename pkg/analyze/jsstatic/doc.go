@@ -38,8 +38,9 @@
 // can hold a worker for (1+N) x PerBundleTimeout, and a bundle that deadlocks the
 // parser leaks its goroutine for the life of the process.
 //
-// Worst case is Concurrency x (1+N) leaked goroutines, N being the sourcesContent
-// entries in a recovered sourcemap. For long-running processes over untrusted
-// input, process isolation — vespasian per target under a wall-clock timeout — is
-// the mitigation.
+// Concurrency does not bound the leak: it caps how many extractions run at once,
+// while a worker that times out moves on, so leaks accumulate one per timed-out
+// extraction across the run — worst case one for every bundle plus every
+// sourcemap source. For long-running processes over untrusted input, process
+// isolation, vespasian per target under a wall-clock timeout, is the mitigation.
 package jsstatic
