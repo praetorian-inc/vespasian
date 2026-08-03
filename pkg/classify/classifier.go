@@ -35,6 +35,13 @@ import (
 // each entry point (LAB-4678, QUAL-001).
 const DefaultConfidenceThreshold = 0.5
 
+// NearMissFloor is the minimum confidence a dropped request must reach to be
+// reported as a below-threshold near-miss under -v (LAB-4678 Phase 1). It is
+// above zero so static assets and zero-signal requests (which score 0) are not
+// logged as noise, but low enough to surface an endpoint that showed real signal
+// (e.g. the path heuristic alone, 0.15) yet fell under the API threshold.
+const NearMissFloor = 0.1
+
 // APIClassifier determines if a request is an API call.
 type APIClassifier interface {
 	// Name returns the classifier name (e.g., "rest", "graphql").
@@ -56,42 +63,20 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 	var results []ClassifiedRequest
 
 	for _, req := range requests {
-		var bestMatch ClassifiedRequest
-		bestMatch.ObservedRequest = req
-		bestMatch.IsAPI = false
-		bestMatch.Confidence = 0
-
 		// Capture per-observation multi-value-ness BEFORE Deduplicate can
 		// merge values across observations and obscure which keys were
 		// truly multi-value in any single request. Always non-nil so
 		// downstream consumers can distinguish "RunClassifiers ran, no
 		// multi-value keys" from "ClassifiedRequest built directly".
-		bestMatch.MultiValueQueryKeys = make(map[string]bool)
+		multiValue := make(map[string]bool)
 		for k, vs := range req.QueryParams {
 			if len(vs) > 1 {
-				bestMatch.MultiValueQueryKeys[k] = true
+				multiValue[k] = true
 			}
 		}
 
-		for _, classifier := range classifiers {
-			var isAPI bool
-			var confidence float64
-			var reason string
-
-			if dc, ok := classifier.(DetailedClassifier); ok {
-				isAPI, confidence, reason = dc.ClassifyDetail(req)
-			} else {
-				isAPI, confidence = classifier.Classify(req)
-				reason = "classified by " + classifier.Name()
-			}
-
-			if isAPI && confidence > bestMatch.Confidence {
-				bestMatch.IsAPI = true
-				bestMatch.Confidence = confidence
-				bestMatch.APIType = classifier.Name()
-				bestMatch.Reason = reason
-			}
-		}
+		bestMatch := bestClassification(classifiers, req, true)
+		bestMatch.MultiValueQueryKeys = multiValue
 
 		if bestMatch.Confidence >= threshold {
 			results = append(results, bestMatch)
@@ -101,8 +86,103 @@ func RunClassifiers(classifiers []APIClassifier, requests []crawl.ObservedReques
 	return results
 }
 
+// bestClassification runs every classifier over req and returns the
+// highest-confidence verdict, shared by [RunClassifiers] and [NearMisses] so the
+// two cannot drift apart in how they pick a winner.
+//
+// requireAPI is RunClassifiers' gate: when true, only a verdict the classifier
+// itself marked as an API can win, so a classifier reporting "not my type" with
+// residual confidence cannot claim the request and mislabel its APIType. Every
+// classifier today couples isAPI to confidence>0, so both modes agree — the flag
+// is explicit so a future classifier returning (false, >0) cannot silently change
+// which verdict wins.
+func bestClassification(classifiers []APIClassifier, req crawl.ObservedRequest, requireAPI bool) ClassifiedRequest {
+	var best ClassifiedRequest
+	best.ObservedRequest = req
+
+	for _, classifier := range classifiers {
+		var isAPI bool
+		var confidence float64
+		var reason string
+
+		if dc, ok := classifier.(DetailedClassifier); ok {
+			isAPI, confidence, reason = dc.ClassifyDetail(req)
+		} else {
+			isAPI, confidence = classifier.Classify(req)
+			reason = "classified by " + classifier.Name()
+		}
+
+		if requireAPI && !isAPI {
+			continue
+		}
+		if confidence > best.Confidence {
+			best.IsAPI = isAPI
+			best.Confidence = confidence
+			best.APIType = classifier.Name()
+			best.Reason = reason
+		}
+	}
+	return best
+}
+
+// NearMisses returns requests that classified with floor <= confidence <
+// threshold: endpoints dropped for being below the API threshold but that still
+// showed some signal. It is used only for -v near-miss logging so an operator
+// can see why an expected endpoint is MISSING from the spec (LAB-4678 Phase 1).
+// Selection mirrors RunClassifiers (highest-confidence classifier wins) but keeps
+// the sub-threshold band instead of discarding it; requests scoring below floor
+// (static assets, zero-signal) are excluded.
+func NearMisses(classifiers []APIClassifier, requests []crawl.ObservedRequest, floor, threshold float64) []ClassifiedRequest {
+	var results []ClassifiedRequest
+	for _, req := range requests {
+		// requireAPI=false: a near-miss is by definition a request no classifier
+		// claimed, so the strongest signal wins regardless of the isAPI verdict.
+		best := bestClassification(classifiers, req, false)
+
+		if best.Confidence >= floor && best.Confidence < threshold {
+			results = append(results, best)
+		}
+	}
+	return results
+}
+
+// canonicalHost returns u's host lowercased with a default port (80 for http,
+// 443 for https) stripped, so the dedup key treats example.com,
+// EXAMPLE.com:443, and example.com as the same host. Mirrors the host handling
+// in pkg/crawl's canonicalizeURL.
+//
+// An IPv6 literal is re-bracketed when a port is appended. u.Hostname() strips the
+// brackets, so joining host + ":" + port produced "::1:8080" — an authority that is
+// not merely ugly but ambiguous and unparseable. It is currently only concatenated
+// into an opaque dedup key and is internally consistent there, so no behavior is
+// wrong today; the reason to fix it is that this reads as a general-purpose
+// canonicalizer, and the next caller that logs or re-parses the result would get an
+// invalid host (LAB-4678 review, QUAL-002).
+func canonicalHost(u *url.URL) string {
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return ""
+	}
+	port := u.Port()
+	if port == "" {
+		return host
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		return host
+	}
+	// A colon in the hostname means an IPv6 literal, which must be bracketed before
+	// a port is appended (RFC 3986 §3.2.2).
+	if strings.Contains(host, ":") {
+		return "[" + host + "]:" + port
+	}
+	return host + ":" + port
+}
+
 // Deduplicate removes duplicate classified requests, keeping the highest confidence.
-// The deduplication key is METHOD:path (query params and fragments stripped).
+// The deduplication key is METHOD:canonicalHost:path (query params and fragments
+// stripped), extended with SOAPAction and a content-type + body hash where those
+// are present — see the key construction below for why each part is there.
 // Multi-value QueryParams from duplicate observations are merged with union-of-values,
 // preserving first-seen order.
 //
@@ -129,11 +209,16 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest { //nolint:
 			continue
 		}
 
-		// Dedup key intentionally omits host: the crawl layer's scope
-		// restrictions (same-origin / same-domain) make cross-host
-		// duplicates unlikely, and consolidating by path is the desired
-		// behavior for single-target scans.
-		key := req.Method + ":" + parsedURL.Path
+		// Dedup key includes a canonical host (LAB-4678 Phase 1). Omitting it
+		// (the prior behavior) rested on a now-false "cross-host duplicates are
+		// unlikely" assumption: a same-domain scan legitimately observes several
+		// in-scope hosts (e.g. api.example.com and www.example.com), and merging
+		// their identical paths dropped one host's response and query params.
+		// Same-origin scans have a single host, so the key is unchanged for them.
+		// The OpenAPI generator groups by path (host-blind) and lists hosts as
+		// servers, so keeping per-host observations distinct here only makes the
+		// downstream union more complete.
+		key := req.Method + ":" + canonicalHost(parsedURL) + ":" + parsedURL.Path
 
 		// For SOAP endpoints, include SOAPAction in the dedup key so distinct
 		// operations on the same URL path are preserved.
@@ -254,7 +339,21 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest { //nolint:
 			// was identical. preferredResponse is order-free: it prefers a
 			// populated response over an empty (half-captured) one and breaks
 			// ties on a stable content fingerprint.
-			existing.req.Response = preferredResponse(existing.req.Response, req.Response)
+			// Retain the response that is NOT selected, so the generator can union
+			// its schema. preferredResponse picks one and the other used to be
+			// discarded here, which made pkg/generate/rest's recursive schema union
+			// unreachable for every bodyless endpoint — see
+			// ClassifiedRequest.MergedResponses.
+			//
+			// Order-free like the selection above: whichever response loses is the
+			// one carried, so the retained pair does not depend on observation order.
+			winner := preferredResponse(existing.req.Response, req.Response)
+			loser := req.Response
+			if sameResponseContent(winner, req.Response) {
+				loser = existing.req.Response
+			}
+			existing.req.Response = winner
+			existing.req.MergedResponses = appendMergedResponse(existing.req.MergedResponses, winner, loser)
 		}
 	}
 
@@ -301,6 +400,47 @@ func CompareResponses(a, b crawl.ObservedResponse) int {
 		return 1
 	}
 	return bytes.Compare(a.Body, b.Body)
+}
+
+// MaxMergedResponses bounds ClassifiedRequest.MergedResponses per endpoint.
+//
+// The bound exists because a body that varies per observation — a timestamp, a
+// request id, a cache token — makes every observation of one endpoint distinct,
+// so an unbounded list would grow with capture size and be walked again for every
+// observation, giving quadratic work on the endpoint the crawl saw most.
+//
+// 8 is chosen against what the union can actually use: the union is additive and
+// only ever ADDS a property, so the Nth response contributes nothing unless it
+// carries a field absent from all N-1 before it. Field sets on one endpoint are
+// small and highly overlapping, so the marginal yield collapses within a handful
+// of observations. It is not a measured distribution over real captures, and it is
+// deliberately generous relative to the 2-3 variants (populated/empty, one status
+// per shape) that motivated this.
+const MaxMergedResponses = 8
+
+// sameResponseContent reports whether two responses carry the same status and the
+// same body bytes, which is the test for "this observation adds nothing to union".
+func sameResponseContent(a, b crawl.ObservedResponse) bool {
+	return a.StatusCode == b.StatusCode && bytes.Equal(a.Body, b.Body)
+}
+
+// appendMergedResponse adds loser to merged unless it duplicates winner or an
+// entry already held, and unless the list is full. Deduplicating here keeps a
+// page that fires the same XHR fifty times from filling the budget with one
+// repeated shape and crowding out a genuinely different observation.
+func appendMergedResponse(merged []crawl.ObservedResponse, winner, loser crawl.ObservedResponse) []crawl.ObservedResponse {
+	if len(loser.Body) == 0 || sameResponseContent(winner, loser) {
+		return merged
+	}
+	if len(merged) >= MaxMergedResponses {
+		return merged
+	}
+	for _, m := range merged {
+		if sameResponseContent(m, loser) {
+			return merged
+		}
+	}
+	return append(merged, loser)
 }
 
 // preferredResponse deterministically selects which of two responses observed

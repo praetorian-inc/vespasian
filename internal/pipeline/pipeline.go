@@ -101,6 +101,7 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 
 	writeStatus(opts.Status, "classified %d API requests (threshold=%.2f)\n", len(classified), opts.Confidence)
 	logClassificationReasons(opts.Status, classified)
+	logNearMisses(opts.Status, classifiers, requests, opts.Confidence)
 
 	if opts.Probe {
 		cfg := probe.DefaultConfig()

@@ -18,11 +18,20 @@
 //
 // Supported API types:
 //   - REST: detected via content-type, path patterns (/api/, /v1/), HTTP
-//     methods, and response structure. A request-side signal (an API path plus
-//     a JSON/XML Accept or request content-type) also classifies an endpoint
-//     whose response was not captured, so the verdict does not depend on
-//     response timing. Static assets are excluded. [DefaultConfidenceThreshold]
-//     is the default minimum confidence.
+//     methods, and response structure. A request-side signal (a JSON/XML Accept
+//     or request content-type, on any path) also classifies an endpoint whose
+//     response was not captured, so the verdict does not depend on response
+//     timing. API media types are not limited to a hardcoded list: any RFC 6839
+//     application/*+json or application/*+xml structured syntax suffix counts,
+//     excluding application/xhtml+xml (a navigation) and application/soap+xml
+//     (owned by the WSDL classifier), and syndication feeds (application/rss+xml,
+//     application/atom+xml, application/feed+json), which are documents for feed
+//     readers rather than endpoints. Routes recovered from Next.js App Router
+//     chunk URLs carry provenance only and no API signal, because the chunk URL
+//     does not reveal which verbs the route exports; they score at
+//     [NextRouteProvenanceConfidence], which reports them via [NearMisses] without
+//     ever reaching the threshold. Static assets are excluded. [DefaultConfidenceThreshold] is the default
+//     minimum confidence.
 //   - GraphQL: detected via /graphql path, query syntax in POST body, and
 //     data/errors keys in response JSON.
 //   - WSDL/SOAP: detected via SOAPAction header, SOAP envelope in body, and
@@ -32,6 +41,9 @@
 //
 // [RunClassifiers] applies one or more classifiers to a slice of observed
 // requests, returning only those that exceed the confidence threshold.
+// [NearMisses] returns the complementary band — requests scoring at or above
+// [NearMissFloor] but below the threshold — so verbose callers can explain why
+// an expected endpoint was dropped rather than emitted.
 // [Deduplicate] removes duplicate endpoints based on method, normalized URL,
 // and (for non-empty bodies) Content-Type plus an 8-byte body fingerprint.
 // Bodyless requests still collapse by method and path. Distinct request body

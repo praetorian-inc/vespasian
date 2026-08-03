@@ -83,6 +83,15 @@ func (c *Capability) Parameters() []capability.Parameter {
 		capability.Bool("probe", "Enable endpoint probing").WithDefault("true"),
 		capability.Bool("merge_slugs", "Merge sibling slug paths into one templated REST path (off by default; REST only)").WithDefault("false"),
 		capability.Int("slug_threshold", "Distinct values at a path position before merge_slugs collapses it (minimum 2)").WithDefault("2"),
+		// Declared, not just read in crawlOptsFromCtx: hosts discover configurable
+		// inputs from this list, so a parameter the reader honors but this list
+		// omits is not reachable through the Guard-facing surface and is settable
+		// only by a hand-built ExecutionContext (Codex review, PR #189).
+		// TestCapability_DeclaredParametersAreReadable derives the read set from
+		// crawlOptsFromCtx's own source and fails on any parameter missing here, so
+		// the next one cannot ship dark.
+		capability.Int("max_requests", "Maximum captured requests before stopping (0 = unlimited); a rate bound distinct from max_pages").WithDefault("0"),
+		capability.Bool("interact", "Click a bounded set of page controls to surface interaction-only endpoints (headless only; mutates state)").WithDefault("false"),
 	}
 }
 
@@ -254,6 +263,16 @@ func crawlOptsFromCtx(ctx capability.ExecutionContext) (crawl.CrawlerOptions, er
 	}
 	if d, ok := ctx.Parameters.GetInt("depth"); ok {
 		opts.Depth = d
+	}
+	// max_requests and interact are user-facing CLI flags, so they must also be
+	// reachable from the Guard-facing surface; without these two reads neither was.
+	// (ResumeFrom/OnCheckpoint stay unwired here on purpose — checkpoint storage and
+	// hand-back are the host's, see doc.go.)
+	if m, ok := ctx.Parameters.GetInt("max_requests"); ok {
+		opts.MaxRequests = m
+	}
+	if i, ok := ctx.Parameters.GetBool("interact"); ok {
+		opts.Interact = i
 	}
 	if h, ok := ctx.Parameters.GetString("headers"); ok && h != "" {
 		parsed, err := parseHeaders(h)

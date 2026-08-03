@@ -15,8 +15,11 @@
 package crawl
 
 import (
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/ysmood/gson"
@@ -218,5 +221,128 @@ func TestMapNetworkToObservedRequest_MultiValueQueryParam(t *testing.T) {
 	}
 	if obs.QueryParams["tag"][0] != "a" || obs.QueryParams["tag"][1] != "b" {
 		t.Errorf("QueryParams[tag] = %v, want [a b]", obs.QueryParams["tag"])
+	}
+}
+
+// --- LAB-4678 Phase 1: completion-driven capture ---
+
+func TestNetworkIdleReached(t *testing.T) {
+	const floor = 500 * time.Millisecond
+	const quiet = 500 * time.Millisecond
+
+	cases := []struct {
+		name            string
+		inFlight        int
+		sinceActivity   time.Duration
+		elapsed         time.Duration
+		deadlineReached bool
+		want            bool
+	}{
+		// The page deadline outranks everything, including in-flight requests and
+		// the floor: it is the whole page's budget, shared across the baseline
+		// wait and every interaction wait, so it must be able to cut a wait short.
+		{"deadline wins even with requests in flight", 3, 0, time.Second, true, true},
+		{"deadline wins before the floor", 3, 0, 0, true, true},
+		{"before floor never idle even if quiet", 0, time.Second, floor - time.Millisecond, false, false},
+		{"past floor, idle and quiet -> stop", 0, quiet, floor, false, true},
+		{"past floor but requests in flight -> wait", 2, quiet, floor + time.Second, false, false},
+		{"past floor, idle but not quiet yet -> wait", 0, quiet - time.Millisecond, floor + time.Second, false, false},
+		// A long-running page that has not hit its deadline keeps waiting, so the
+		// stop decision never depends on elapsed time alone.
+		{"no deadline, long elapsed, still busy -> wait", 1, 0, time.Hour, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := networkIdleReached(tc.inFlight, tc.sinceActivity, tc.elapsed, floor, quiet, tc.deadlineReached)
+			if got != tc.want {
+				t.Errorf("networkIdleReached(inFlight=%d, since=%v, elapsed=%v, deadlineReached=%v) = %v, want %v",
+					tc.inFlight, tc.sinceActivity, tc.elapsed, tc.deadlineReached, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNetworkState_InFlightCounting(t *testing.T) {
+	now := time.Now()
+	const perReq = 10 * time.Second
+	c := &pageNetworkCapture{
+		pending:      make(map[proto.NetworkRequestID]*pendingRequest),
+		lastActivity: now.Add(-2 * time.Second),
+	}
+	// Completed request: never in flight.
+	c.pending["done"] = &pendingRequest{startedAt: now.Add(-time.Second), complete: true}
+	// Recent, incomplete: in flight.
+	c.pending["live"] = &pendingRequest{startedAt: now.Add(-time.Second)}
+	// Incomplete but older than perReq: aged out, not in flight.
+	c.pending["hung"] = &pendingRequest{startedAt: now.Add(-perReq - time.Second)}
+
+	inFlight, since := c.networkState(perReq, now)
+	if inFlight != 1 {
+		t.Errorf("inFlight = %d, want 1 (only the recent incomplete request counts)", inFlight)
+	}
+	if since != 2*time.Second {
+		t.Errorf("sinceLastActivity = %v, want 2s", since)
+	}
+}
+
+// TestPageNetworkCapture_ResultsOrderIsStable pins per-page capture order to the
+// order requests were sent. Results used to range the pending map, so Go's
+// randomized map iteration reordered every page's requests run-to-run and
+// capture.json was not byte-stable for identical input.
+func TestPageNetworkCapture_ResultsOrderIsStable(t *testing.T) {
+	const n = 12 // enough that hitting the sent order by chance is not a concern
+	c := &pageNetworkCapture{
+		pending:      make(map[proto.NetworkRequestID]*pendingRequest),
+		pageURL:      "https://ex.com/",
+		lastActivity: time.Now(),
+	}
+	want := make([]string, 0, n)
+	for i := range n {
+		id := proto.NetworkRequestID(fmt.Sprintf("req-%02d", i))
+		u := fmt.Sprintf("https://ex.com/api/%02d", i)
+		c.pending[id] = &pendingRequest{method: "GET", url: u, complete: true}
+		c.order = append(c.order, id)
+		want = append(want, u)
+	}
+
+	for range 5 {
+		got := make([]string, 0, n)
+		for _, r := range c.Results() {
+			got = append(got, r.URL)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("Results order = %v, want send order %v", got, want)
+		}
+	}
+}
+
+// TestPageNetworkCapture_RedirectReusedIDEmittedOnce guards the ordering index
+// against double-counting: CDP reuses a request ID across a redirect chain and the
+// request handler overwrites the pending entry, so appending to the order index
+// unconditionally would emit that request more than once.
+//
+// It drives recordSent, the real production guard, rather than re-implementing it.
+// The previous version built c.order by hand and copied the guard into its own body,
+// so deleting the guard from network.go left this test green — it asserted against a
+// copy of the code (LAB-4678 review, TEST-008). Verified by mutation: removing the
+// `if _, seen := c.pending[id]; !seen` condition in recordSent fails this test.
+func TestPageNetworkCapture_RedirectReusedIDEmittedOnce(t *testing.T) {
+	c := &pageNetworkCapture{
+		pending:      make(map[proto.NetworkRequestID]*pendingRequest),
+		pageURL:      "https://ex.com/",
+		lastActivity: time.Now(),
+	}
+	const id = proto.NetworkRequestID("shared")
+	// First send, then the redirect hop reusing the same request ID. Both go through
+	// the same path the CDP handler uses.
+	c.recordSent(id, &pendingRequest{method: "GET", url: "https://ex.com/start", complete: true})
+	c.recordSent(id, &pendingRequest{method: "GET", url: "https://ex.com/final", complete: true})
+
+	got := c.Results()
+	if len(got) != 1 {
+		t.Fatalf("got %d results for one reused request ID, want 1: %+v", len(got), got)
+	}
+	if got[0].URL != "https://ex.com/final" {
+		t.Errorf("URL = %q, want the post-redirect target", got[0].URL)
 	}
 }

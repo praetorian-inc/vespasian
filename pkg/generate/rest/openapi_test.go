@@ -2346,3 +2346,273 @@ func TestGenerate_ResponseSchema_ArraySurvivesEmptyBaseObservation(t *testing.T)
 			"populated array response schema must survive regardless of observation order")
 	}
 }
+
+// TestUnionSchemaProperties_RecursiveAdditive verifies the Phase 3 response
+// schema union (LAB-4678): fields present in only one observation are preserved
+// both at the top level and nested under a shared object, and existing fields
+// are never removed or retyped.
+func TestUnionSchemaProperties_RecursiveAdditive(t *testing.T) {
+	strSchema := func() *openapi3.SchemaRef {
+		return &openapi3.SchemaRef{Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}}
+	}
+	objSchema := func(props map[string]*openapi3.SchemaRef) *openapi3.Schema {
+		return &openapi3.Schema{Type: &openapi3.Types{"object"}, Properties: props}
+	}
+
+	// dst: {id, user:{name}}   src: {email, user:{age}}
+	dst := objSchema(map[string]*openapi3.SchemaRef{
+		"id":   strSchema(),
+		"user": {Value: objSchema(map[string]*openapi3.SchemaRef{"name": strSchema()})},
+	})
+	src := objSchema(map[string]*openapi3.SchemaRef{
+		"email": strSchema(),
+		"user":  {Value: objSchema(map[string]*openapi3.SchemaRef{"age": strSchema()})},
+	})
+
+	unionSchemaProperties(dst, src, maxSchemaUnionDepth)
+
+	// Top-level union: id (dst-only) and email (src-only) both present.
+	assert.Contains(t, dst.Properties, "id")
+	assert.Contains(t, dst.Properties, "email")
+	// Nested union under the shared "user": both name and age present.
+	user := dst.Properties["user"].Value
+	require.NotNil(t, user)
+	assert.Contains(t, user.Properties, "name", "existing nested field retained")
+	assert.Contains(t, user.Properties, "age", "src-only nested field added")
+}
+
+// TestUnionSchemaProperties_DepthGuard verifies recursion stops at depth 0
+// without panicking (guards against pathological/cyclic inferred schemas).
+func TestUnionSchemaProperties_DepthGuard(t *testing.T) {
+	obj := &openapi3.Schema{Type: &openapi3.Types{"object"}, Properties: map[string]*openapi3.SchemaRef{
+		"a": {Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}},
+	}}
+	src := &openapi3.Schema{Type: &openapi3.Types{"object"}, Properties: map[string]*openapi3.SchemaRef{
+		"b": {Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}},
+	}}
+	unionSchemaProperties(obj, src, 0) // depth 0 -> no-op
+	assert.NotContains(t, obj.Properties, "b", "depth 0 must not merge")
+}
+
+// TestUnionSchemaProperties_ArrayItems covers the collection case, which is where
+// partial observations are most common. GET /users returning [{"id":1,"name":"a"}]
+// and later [{"id":2,"email":"b@x"}] must document all three item fields. The union
+// previously recursed only through Properties, and an array schema has none of its
+// own, so the item schema was never entered and every field after the first
+// observation was dropped.
+func TestUnionSchemaProperties_ArrayItems(t *testing.T) {
+	strSchema := func() *openapi3.SchemaRef {
+		return &openapi3.SchemaRef{Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}}
+	}
+	arrayOfObject := func(props map[string]*openapi3.SchemaRef) *openapi3.Schema {
+		return &openapi3.Schema{
+			Type: &openapi3.Types{"array"},
+			Items: &openapi3.SchemaRef{Value: &openapi3.Schema{
+				Type: &openapi3.Types{"object"}, Properties: props,
+			}},
+		}
+	}
+
+	dst := arrayOfObject(map[string]*openapi3.SchemaRef{"id": strSchema(), "name": strSchema()})
+	src := arrayOfObject(map[string]*openapi3.SchemaRef{"id": strSchema(), "email": strSchema()})
+
+	unionSchemaProperties(dst, src, maxSchemaUnionDepth)
+
+	items := dst.Items.Value
+	require.NotNil(t, items)
+	assert.Contains(t, items.Properties, "id")
+	assert.Contains(t, items.Properties, "name", "first observation's item field retained")
+	assert.Contains(t, items.Properties, "email", "second observation's item-only field must be unioned in")
+}
+
+// TestUnionSchemaProperties_NestedArrayOfObjects verifies the array recursion is
+// reachable through an object property too, and that Items consumes a depth level
+// like any other nesting step (so the existing bound still applies).
+func TestUnionSchemaProperties_NestedArrayOfObjects(t *testing.T) {
+	str := func() *openapi3.SchemaRef {
+		return &openapi3.SchemaRef{Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}}
+	}
+	withItems := func(props map[string]*openapi3.SchemaRef) *openapi3.Schema {
+		return &openapi3.Schema{Type: &openapi3.Types{"object"}, Properties: map[string]*openapi3.SchemaRef{
+			"rows": {Value: &openapi3.Schema{
+				Type:  &openapi3.Types{"array"},
+				Items: &openapi3.SchemaRef{Value: &openapi3.Schema{Type: &openapi3.Types{"object"}, Properties: props}},
+			}},
+		}}
+	}
+
+	dst := withItems(map[string]*openapi3.SchemaRef{"a": str()})
+	src := withItems(map[string]*openapi3.SchemaRef{"b": str()})
+	unionSchemaProperties(dst, src, maxSchemaUnionDepth)
+	rows := dst.Properties["rows"].Value.Items.Value
+	assert.Contains(t, rows.Properties, "a")
+	assert.Contains(t, rows.Properties, "b")
+
+	// depth 2 reaches the "rows" property (1) and its items (2), so the merge lands;
+	// depth 1 stops before the items and must not.
+	shallowDst := withItems(map[string]*openapi3.SchemaRef{"a": str()})
+	unionSchemaProperties(shallowDst, src, 1)
+	assert.NotContains(t, shallowDst.Properties["rows"].Value.Items.Value.Properties, "b",
+		"array items must consume a depth level")
+}
+
+// jsonObservation builds one classified observation of the same endpoint with
+// the given status and JSON response body. Shared by the buildOperation-level
+// response-merge tests below.
+func jsonObservation(status int, body string) classify.ClassifiedRequest {
+	return classify.ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: "GET",
+			URL:    "https://api.test/users",
+			Response: crawl.ObservedResponse{
+				StatusCode:  status,
+				ContentType: "application/json",
+				Body:        []byte(body),
+			},
+		},
+		IsAPI:      true,
+		APIType:    "rest",
+		Confidence: 0.9,
+	}
+}
+
+// TestBuildOperation_TopLevelArrayResponseUnion pins the LAB-4678 audit item-10
+// fix END TO END through buildOperation, not by calling unionSchemaProperties
+// directly. The direct-call tests above all bypassed the caller guard in
+// buildOperation, which gated the union on Properties != nil — nil for a
+// top-level array — making the array recursion unreachable for exactly the
+// collection-endpoint case it was written for. Later observations' item fields
+// were silently dropped from the spec.
+func TestBuildOperation_TopLevelArrayResponseUnion(t *testing.T) {
+	group := []classify.ClassifiedRequest{
+		jsonObservation(200, `[{"id":1,"name":"a"}]`),
+		jsonObservation(200, `[{"id":2,"email":"b@x"}]`),
+	}
+
+	op := buildOperation(endpointKey{method: "GET", path: "/users"}, group, false)
+
+	resp := op.Responses.Value("200")
+	require.NotNil(t, resp)
+	require.NotNil(t, resp.Value)
+	mt := resp.Value.Content["application/json"]
+	require.NotNil(t, mt)
+	require.NotNil(t, mt.Schema)
+	require.NotNil(t, mt.Schema.Value)
+
+	schema := mt.Schema.Value
+	require.Nil(t, schema.Properties, "a top-level array schema must have nil Properties (the condition that broke the guard)")
+	require.NotNil(t, schema.Items, "top-level array response must expose Items")
+	require.NotNil(t, schema.Items.Value)
+
+	props := schema.Items.Value.Properties
+	assert.Contains(t, props, "id", "field common to both observations must survive")
+	assert.Contains(t, props, "name", "field from the first observation must survive")
+	assert.Contains(t, props, "email", "field from the SECOND observation must survive the union")
+}
+
+// TestBuildOperation_ArrayResponseUnionIsOrderIndependent pins that the array
+// union does not depend on which observation buildOperation sees first, so the
+// emitted spec stays a deterministic function of the observation set.
+func TestBuildOperation_ArrayResponseUnionIsOrderIndependent(t *testing.T) {
+	forward := []classify.ClassifiedRequest{
+		jsonObservation(200, `[{"id":1,"name":"a"}]`),
+		jsonObservation(200, `[{"id":2,"email":"b@x"}]`),
+	}
+	reversed := []classify.ClassifiedRequest{
+		jsonObservation(200, `[{"id":2,"email":"b@x"}]`),
+		jsonObservation(200, `[{"id":1,"name":"a"}]`),
+	}
+
+	itemProps := func(group []classify.ClassifiedRequest) map[string]*openapi3.SchemaRef {
+		op := buildOperation(endpointKey{method: "GET", path: "/users"}, group, false)
+		return op.Responses.Value("200").Value.Content["application/json"].Schema.Value.Items.Value.Properties
+	}
+
+	for _, name := range []string{"id", "name", "email"} {
+		assert.Contains(t, itemProps(forward), name, "forward order must union %q", name)
+		assert.Contains(t, itemProps(reversed), name, "reversed order must union %q", name)
+	}
+}
+
+// TestBuildOperation_PreservesRequestResponsePairingByStatus pins the pairing
+// half of LAB-4678's "spec preserves response fields and request/response
+// pairing across observations". OpenAPI expresses that correspondence only
+// through per-status response entries, so preserving it means two observations
+// of the same endpoint with different statuses keep two distinct response
+// schemas rather than collapsing into one merged shape.
+func TestBuildOperation_PreservesRequestResponsePairingByStatus(t *testing.T) {
+	group := []classify.ClassifiedRequest{
+		jsonObservation(200, `{"id":1,"name":"ok"}`),
+		jsonObservation(422, `{"error":"bad","field":"name"}`),
+	}
+
+	op := buildOperation(endpointKey{method: "GET", path: "/users"}, group, false)
+
+	okResp := op.Responses.Value("200")
+	errResp := op.Responses.Value("422")
+	require.NotNil(t, okResp, "200 observation must keep its own response entry")
+	require.NotNil(t, errResp, "422 observation must keep its own response entry")
+
+	okProps := okResp.Value.Content["application/json"].Schema.Value.Properties
+	errProps := errResp.Value.Content["application/json"].Schema.Value.Properties
+
+	assert.Contains(t, okProps, "name")
+	assert.NotContains(t, okProps, "error", "the 422 body must not leak into the 200 schema")
+	assert.Contains(t, errProps, "error")
+	assert.NotContains(t, errProps, "id", "the 200 body must not leak into the 422 schema")
+}
+
+// TestComputeSourceTag_TotalOverEveryJSStaticSource pins the contract stated on
+// computeSourceTag: for non-empty input it returns exactly one of "dynamic",
+// "js-bundle", "js-sourcemap" — never "".
+//
+// It iterates every Source that crawl.IsJSStaticSource accepts, because that set is
+// what broke the contract: LAB-4678 added static:js-nextroute and static:js-nextpage
+// to IsJSStaticSource without adding them to computeSourceTag's switch, so those
+// groups fell through with friendly == "" and emitted no extension. Enumerating the
+// set here means the next Source added to IsJSStaticSource fails this test instead of
+// silently producing an empty tag.
+func TestComputeSourceTag_TotalOverEveryJSStaticSource(t *testing.T) {
+	jsStaticSources := []string{
+		crawl.SourceStaticJS,
+		crawl.SourceStaticJSSourcemap,
+		crawl.SourceNextRouteHandler,
+		crawl.SourceNextPageRoute,
+	}
+	for _, src := range jsStaticSources {
+		require.True(t, crawl.IsJSStaticSource(src),
+			"%q must be in the IsJSStaticSource set this test enumerates", src)
+	}
+
+	// Every JS-static source now has its OWN name rather than collapsing to
+	// "dynamic". A recovered Next.js route that reaches the generator must not
+	// claim it was dynamically observed — it was read off a chunk URL and never
+	// requested.
+	valid := []string{"dynamic", "js-bundle", "js-sourcemap", "js-nextroute", "js-nextpage"}
+	mk := func(src string) classify.ClassifiedRequest {
+		return classify.ClassifiedRequest{ObservedRequest: crawl.ObservedRequest{Source: src}}
+	}
+
+	for _, src := range jsStaticSources {
+		t.Run("uniform "+src, func(t *testing.T) {
+			got := computeSourceTag([]classify.ClassifiedRequest{mk(src), mk(src)})
+			assert.Contains(t, valid, got,
+				"a uniform %q group returned %q; non-empty input must always yield one of "+
+					"the contract values, and anything else means no extension is emitted at all", src, got)
+			assert.NotEqual(t, "dynamic", got,
+				"a uniform %q group must not report %q: the endpoint was recovered "+
+					"statically and never requested", src, "dynamic")
+		})
+		t.Run("mixed with static:js "+src, func(t *testing.T) {
+			got := computeSourceTag([]classify.ClassifiedRequest{mk(crawl.SourceStaticJS), mk(src)})
+			assert.Contains(t, valid, got)
+		})
+	}
+
+	// The two contract-named sources must still map to their own values, so the
+	// totality fix did not flatten everything to "dynamic".
+	assert.Equal(t, "js-bundle", computeSourceTag([]classify.ClassifiedRequest{mk(crawl.SourceStaticJS)}))
+	assert.Equal(t, "js-sourcemap", computeSourceTag([]classify.ClassifiedRequest{mk(crawl.SourceStaticJSSourcemap)}))
+	assert.Equal(t, "dynamic", computeSourceTag([]classify.ClassifiedRequest{mk("")}))
+	assert.Equal(t, "", computeSourceTag(nil), "the empty-group contract is unchanged")
+}

@@ -234,6 +234,8 @@ type CrawlOptions struct {
 	Output          string        `short:"o" help:"Output file path"`
 	Depth           int           `default:"3" help:"Maximum crawl depth"`
 	MaxPages        int           `default:"100" help:"Maximum number of pages (URLs visited) to crawl; pages already in flight when the limit is reached still finish"`
+	MaxRequests     int           `name:"max-requests" default:"0" help:"Soft budget on captured requests (0 = unlimited). A rate/politeness bound distinct from --max-pages. Checked between pages and only updated once a page finishes, so the total can reach --max-requests + (--concurrency x requests-per-page) — at the default --concurrency 10 that is roughly 4x a small budget. Pass --concurrency 1 for a tight bound."`
+	Interact        bool          `name:"interact" help:"Click page controls (buttons, [role=button], [onclick]) to surface endpoints that only fire on interaction. Includes form submit buttons, so it submits forms and can mutate state. Headless backend only. Skips destructive, session-ending, and payment-commit labels on a best-effort match. Off by default."`
 	Timeout         time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
 	Scope           string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
 	Headless        bool          `default:"true" help:"Use headless browser"`
@@ -244,6 +246,36 @@ type CrawlOptions struct {
 	Verbose         bool          `short:"v" help:"Enable verbose logging"`
 	AnalyzeJS       bool          `name:"analyze-js"      default:"true"  help:"Statically analyze captured JS bundles to discover API endpoints, parameters, and request bodies."`
 	FetchSourcemaps bool          `name:"fetch-sourcemaps" default:"true"  help:"When --analyze-js is set, fetch .js.map sourcemaps referenced via //# sourceMappingURL= comments to recover original sources."`
+}
+
+// crawlerOptions maps the shared CLI crawl flags onto crawl.CrawlerOptions.
+//
+// It exists so there is exactly ONE mapping, called by both CrawlCmd.Run and
+// ScanCmd.Run. The two commands previously each built this literal inline, which
+// made "wire the flag into one command and forget the other" a live failure mode:
+// a new flag could work under `vespasian crawl` and silently do nothing under
+// `vespasian scan`, and no test compared the two blocks. That is exactly how
+// --max-requests and --interact shipped with neither wiring asserted (LAB-4678
+// review, TEST-001). With one constructor the divergence is not merely untested,
+// it is unrepresentable.
+//
+// allowPrivate is a parameter rather than a CrawlOptions field because each command
+// declares its own --dangerous-allow-private with command-specific help text: on
+// CrawlCmd it covers the crawl only, on ScanCmd the crawl and the probe path.
+func (o CrawlOptions) crawlerOptions(allowPrivate bool) crawl.CrawlerOptions {
+	return crawl.CrawlerOptions{
+		Depth:         o.Depth,
+		MaxPages:      o.MaxPages,
+		MaxRequests:   o.MaxRequests,
+		Interact:      o.Interact,
+		Timeout:       o.Timeout,
+		Scope:         o.Scope,
+		Headless:      o.Headless,
+		Proxy:         o.Proxy,
+		ProxyInsecure: o.ProxyInsecure,
+		Concurrency:   o.Concurrency,
+		AllowPrivate:  allowPrivate,
+	}
 }
 
 // SlugOptions holds the path-normalization flags shared by GenerateCmd and ScanCmd.
@@ -368,17 +400,8 @@ func (c *CrawlCmd) Run() error {
 		return err
 	}
 
-	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions, crawl.CrawlerOptions{
-		Depth:         c.Depth,
-		MaxPages:      c.MaxPages,
-		Timeout:       c.Timeout,
-		Scope:         c.Scope,
-		Headless:      c.Headless,
-		Proxy:         c.Proxy,
-		ProxyInsecure: c.ProxyInsecure,
-		Concurrency:   c.Concurrency,
-		AllowPrivate:  c.DangerousAllowPrivate,
-	})
+	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions,
+		c.crawlerOptions(c.DangerousAllowPrivate))
 	if err != nil {
 		return err
 	}
@@ -651,17 +674,8 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		return err
 	}
 
-	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions, crawl.CrawlerOptions{
-		Depth:         c.Depth,
-		MaxPages:      c.MaxPages,
-		Timeout:       c.Timeout,
-		Scope:         c.Scope,
-		Headless:      c.Headless,
-		Proxy:         c.Proxy,
-		ProxyInsecure: c.ProxyInsecure,
-		Concurrency:   c.Concurrency,
-		AllowPrivate:  c.DangerousAllowPrivate,
-	})
+	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions,
+		c.crawlerOptions(c.DangerousAllowPrivate))
 	if err != nil {
 		return err
 	}

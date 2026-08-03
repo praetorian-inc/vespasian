@@ -23,6 +23,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -103,15 +104,55 @@ func TestRodEngine_BasicCrawl(t *testing.T) {
 	mu.Unlock()
 }
 
+// TestRodEngine_Concurrency verifies that workers visit pages in parallel.
+//
+// It asserts overlap DIRECTLY, by recording the peak number of page requests the
+// test server handles simultaneously, rather than inferring concurrency from
+// elapsed time. Wall clock alone stopped being a usable signal once
+// completion-driven capture landed (LAB-4678 Phase 1): each visit now costs the
+// server delay plus the DOM-stability wait plus the network-idle floor and quiet
+// period, so fixed per-page overhead dominates the server's 500ms delay and a
+// concurrent crawl no longer finishes under the old serial-by-server-delay
+// estimate. The previous hardcoded "under 8s" bound was calibrated against the
+// pre-Phase-1 fixed-settle model and became a false failure at ~8.1s while
+// parallelism was in fact working.
+//
+// The elapsed-time check is retained as a coarse ceiling, but derived from the
+// configured timings instead of a magic constant, so it tracks the engine's
+// defaults rather than drifting out of calibration again.
 func TestRodEngine_Concurrency(t *testing.T) {
-	// Each page has a 500ms delay. With 5 concurrent workers, 10 pages should
-	// take ~1-2 seconds. Serial would take ~5+ seconds.
+	const (
+		concurrency = 5
+		leafPages   = 10
+		totalPages  = leafPages + 1 // root + leaves
+		serverDelay = 500 * time.Millisecond
+		stableWait  = 500 * time.Millisecond
+	)
+
+	// pageInFlight counts in-progress requests for CRAWL TARGETS only (the root
+	// and /pageN). Incidental browser fetches such as /favicon.ico are excluded:
+	// those can overlap a page load from the SAME worker, which would register as
+	// concurrency without proving that two workers ran at once.
+	var pageInFlight, maxPageInFlight int64
+	isCrawlTarget := func(p string) bool { return p == "/" || strings.HasPrefix(p, "/page") }
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(500 * time.Millisecond)
+		if isCrawlTarget(r.URL.Path) {
+			cur := atomic.AddInt64(&pageInFlight, 1)
+			// Raise the recorded peak to cur if cur is greater.
+			for {
+				peak := atomic.LoadInt64(&maxPageInFlight)
+				if cur <= peak || atomic.CompareAndSwapInt64(&maxPageInFlight, peak, cur) {
+					break
+				}
+			}
+			defer atomic.AddInt64(&pageInFlight, -1)
+		}
+		time.Sleep(serverDelay)
 		w.Header().Set("Content-Type", "text/html")
 		if r.URL.Path == "/" {
 			body := `<html><body>`
-			for i := range 10 {
+			for i := range leafPages {
 				body += fmt.Sprintf(`<a href="/page%d">Page %d</a>`, i, i)
 			}
 			body += `</body></html>`
@@ -124,11 +165,11 @@ func TestRodEngine_Concurrency(t *testing.T) {
 
 	bm := launchTestBrowser(t)
 	engine, err := newRodEngine(bm.wsURL(), engineOptions{
-		Concurrency:   5,
+		Concurrency:   concurrency,
 		MaxPages:      100,
 		MaxDepth:      2,
 		PageTimeout:   10 * time.Second,
-		StableTimeout: 500 * time.Millisecond,
+		StableTimeout: stableWait,
 	})
 	if err != nil {
 		t.Fatalf("newRodEngine: %v", err)
@@ -150,12 +191,37 @@ func TestRodEngine_Concurrency(t *testing.T) {
 		t.Fatalf("Crawl error: %v", err)
 	}
 
-	// Concurrent crawl should be significantly faster than serial.
-	// 11 pages * 500ms serial = 5.5s. With 5 workers ≈ 2-3s.
-	if elapsed > 8*time.Second {
-		t.Errorf("Crawl took %v, expected less than 8s (concurrency not working?)", elapsed)
+	// Primary assertion: two or more page requests were in flight at once, so
+	// workers demonstrably ran in parallel. The bound is 2 rather than
+	// Concurrency because which workers overlap is up to the scheduler and the
+	// link-discovery order; requiring the full 5 would be flaky while proving
+	// nothing extra. A serial crawl can never exceed 1.
+	peak := atomic.LoadInt64(&maxPageInFlight)
+	if peak < 2 {
+		t.Errorf("peak concurrent page requests = %d, want >= 2 (workers did not run in parallel)", peak)
 	}
-	t.Logf("Crawl completed in %v with %d results", elapsed, len(results))
+
+	// Timing is DIAGNOSTIC ONLY, never a pass/fail signal.
+	//
+	// The peak-in-flight assertion above already excludes serial execution
+	// completely: a serial crawl cannot exceed 1. So a wall-clock bound adds no
+	// discriminating power, and it reintroduces the exact failure mode this test was
+	// rewritten to remove — the original hardcoded "under 8s" became a false failure
+	// at ~8.1s while parallelism was working fine. Deriving the floor from the
+	// configured timings makes the bound track the defaults, but it still ties the
+	// verdict to wall clock on a shared CI runner, and it still shrinks if
+	// DefaultNetworkIdleFloor or DefaultNetworkQuietPeriod are ever lowered
+	// (LAB-4678 review, TEST-006).
+	perPageFloor := serverDelay + stableWait + DefaultNetworkIdleFloor + DefaultNetworkQuietPeriod
+	serialFloor := time.Duration(totalPages) * perPageFloor
+	if elapsed >= serialFloor {
+		t.Logf("NOTE: crawl took %v, at or above the serial floor %v. Parallelism is "+
+			"already proven by peak=%d above, so this is a slow-runner signal, not a failure.",
+			elapsed, serialFloor, peak)
+	}
+
+	t.Logf("Crawl completed in %v with %d results; peak concurrent page requests = %d (serial floor %v)",
+		elapsed, len(results), peak, serialFloor)
 }
 
 // TestRodEngine_MaxPages pins AC12 (LAB-4678): a saturated concurrent crawl
@@ -574,5 +640,250 @@ func TestRodEngine_DepthLimit(t *testing.T) {
 	t.Logf("Got %d results with MaxDepth=1", count)
 	if count == 0 {
 		t.Error("Got 0 results, expected at least 1")
+	}
+}
+
+// interactFixture serves a page whose only API calls fire on click, plus a
+// destructive control that must never be clicked. Returns the server and a
+// per-path hit recorder.
+//
+// The FIRST control is a plain <button> inside a <form>, i.e. an HTML-default
+// type=submit that performs a full navigation when clicked. That placement is the
+// point: with the interaction pass holding handles from a single pre-click scan,
+// this click invalidated every remaining handle, so the useful control behind it
+// was never exercised and the interaction-only endpoint was missed — coverage
+// depended on sibling order. The fixture previously served only bare
+// <button onclick="fetch(...)"> elements, the one shape in which that bug cannot
+// appear, which is why the test passed while the bug was live.
+func interactFixture(t *testing.T) (*httptest.Server, func(string) int) {
+	t.Helper()
+	var mu sync.Mutex
+	hits := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits[r.URL.Path]++
+		mu.Unlock()
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"ok":true}`)
+			return
+		}
+		if r.URL.Path == "/submitted" {
+			// The form's landing page. Its own form action is unique to it, and
+			// extractForms turns a discovered action into a synthetic
+			// ObservedRequest unconditionally (no frontier or depth involved), so
+			// its presence in the capture is direct proof that enrichment read a
+			// document this worker was never assigned.
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, `<html><body><form action="/wrong-attribution" method="post"><input name="q"></form></body></html>`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		// The /api endpoints below appear nowhere as a link or a literal fetch on
+		// load, so passive crawling and static JS analysis cannot reach them — only
+		// a real click can. The destructive controls carry their verb in different
+		// places (text, aria-label, title) to exercise every label source.
+		fmt.Fprint(w, `<html><body>
+<form action="/submitted" method="get"><button id="form-submit">Search</button></form>
+<button id="safe" onclick="fetch('/api/interaction-only')">Load more</button>
+<button id="danger-text" onclick="fetch('/api/destructive-text')">Delete account</button>
+<button id="danger-aria" aria-label="Delete item" onclick="fetch('/api/destructive-aria')">&times;</button>
+<button id="danger-title" title="Erase everything" onclick="fetch('/api/destructive-title')">!</button>
+</body></html>`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func(p string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return hits[p]
+	}
+}
+
+// runInteractCrawl crawls the fixture once with interaction on or off and
+// returns the captured request URLs.
+func runInteractCrawl(t *testing.T, srv *httptest.Server, interact bool) []string {
+	t.Helper()
+	bm := launchTestBrowser(t)
+	engine, err := newRodEngine(bm.wsURL(), engineOptions{
+		Concurrency:   1,
+		MaxPages:      2,
+		MaxDepth:      0,
+		PageTimeout:   20 * time.Second,
+		StableTimeout: 500 * time.Millisecond,
+		Interact:      interact,
+	})
+	if err != nil {
+		t.Fatalf("newRodEngine: %v", err)
+	}
+	defer engine.Close() //nolint:errcheck // test cleanup
+
+	var mu sync.Mutex
+	var urls []string
+	if err := engine.Crawl(context.Background(), srv.URL+"/", func(req ObservedRequest) {
+		mu.Lock()
+		urls = append(urls, req.URL)
+		mu.Unlock()
+	}); err != nil {
+		t.Fatalf("Crawl(interact=%v): %v", interact, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	return append([]string(nil), urls...)
+}
+
+// TestRodEngine_Interact_CapturesInteractionOnlyEndpoint is the end-to-end proof
+// that the opt-in interaction pass does what it claims (LAB-4678 Phase 2). The
+// fixture's endpoint fires only from a click handler, so it is unreachable by
+// passive capture — with --interact off it must be absent, and with it on it must
+// be captured. Without this the feature had no coverage at all beyond its two
+// pure helpers.
+func TestRodEngine_Interact_CapturesInteractionOnlyEndpoint(t *testing.T) {
+	srv, _ := interactFixture(t)
+
+	off := runInteractCrawl(t, srv, false)
+	for _, u := range off {
+		if strings.Contains(u, "/api/interaction-only") {
+			t.Fatalf("interaction-only endpoint captured with Interact=false: %v", off)
+		}
+	}
+
+	on := runInteractCrawl(t, srv, true)
+	var found bool
+	for _, u := range on {
+		if strings.Contains(u, "/api/interaction-only") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("Interact=true did not capture the interaction-only endpoint; captured: %v", on)
+	}
+}
+
+// TestRodEngine_Interact_SkipsDestructiveControls verifies the interaction pass
+// never fires a destructive control, whichever label source carries the verb:
+// visible text, aria-label, or title. A click here would delete data on a real
+// engagement target, so this is the safety property that makes the feature
+// usable at all.
+func TestRodEngine_Interact_SkipsDestructiveControls(t *testing.T) {
+	srv, hits := interactFixture(t)
+
+	captured := runInteractCrawl(t, srv, true)
+
+	// The safe control must have fired, otherwise this test would pass simply
+	// because no clicking happened at all.
+	if hits("/api/interaction-only") == 0 {
+		t.Fatalf("no interaction occurred, so the destructive assertions prove nothing; captured: %v", captured)
+	}
+
+	for _, p := range []string{"/api/destructive-text", "/api/destructive-aria", "/api/destructive-title"} {
+		if n := hits(p); n != 0 {
+			t.Errorf("destructive control was clicked: %s hit %d times", p, n)
+		}
+		for _, u := range captured {
+			if strings.Contains(u, p) {
+				t.Errorf("destructive endpoint appears in capture: %s", u)
+			}
+		}
+	}
+}
+
+// TestRodEngine_Interact_SubmitButtonDoesNotCostCoverage regresses the
+// interaction pass's handling of a click that NAVIGATES. The fixture's first
+// control is a form submit button, positioned ahead of the useful one; clicking it
+// performs a full navigation, which invalidated every element handle the pass had
+// scanned up front, so the interaction-only endpoint behind it was never reached.
+// Coverage must not depend on sibling order.
+//
+// It also pins the attribution rule: after the navigating click the crawler must
+// not extract from the navigated-to document. /submitted carries a form whose
+// action is unique to it, and form actions become synthetic ObservedRequests
+// unconditionally, so that action appearing in the capture means enrichment read a
+// page this worker was never assigned (and pushed its surface into the frontier
+// without the page counting against --max-pages).
+func TestRodEngine_Interact_SubmitButtonDoesNotCostCoverage(t *testing.T) {
+	srv, hits := interactFixture(t)
+
+	captured := runInteractCrawl(t, srv, true)
+
+	// The navigating control was in fact clicked — otherwise this test would pass
+	// simply because the submit button was skipped, proving nothing.
+	if hits("/submitted") == 0 {
+		t.Fatalf("the form submit button was never clicked, so this test proves nothing; captured: %v", captured)
+	}
+	// And the useful control behind it still fired.
+	if hits("/api/interaction-only") == 0 {
+		t.Errorf("interaction-only endpoint missed: a navigating control ahead of it cost the page's coverage; captured: %v", captured)
+	}
+	for _, u := range captured {
+		if strings.Contains(u, "/wrong-attribution") {
+			t.Errorf("capture contains a form action from the navigated-to document (%s): enrichment read a page this worker was not assigned", u)
+		}
+	}
+}
+
+// TestRodCrawler_CrossOriginSeedRedirect regresses the empty-capture bug: when the
+// seed URL redirects to a DIFFERENT origin (the shape of every http→https and
+// apex→www deployment), Chrome follows the redirect and every captured request
+// carries the post-redirect origin, which the exact same-origin predicate rejected
+// wholesale. The crawl returned zero requests with a zero exit status and no
+// diagnostic.
+//
+// The two httptest servers listen on different ports, so they are different
+// origins under the same-origin policy — the same condition as apex→www.
+func TestRodCrawler_CrossOriginSeedRedirect(t *testing.T) {
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/data" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"ok":true}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<html><body><h1>App</h1>
+<script>fetch('/api/data')</script>
+</body></html>`)
+	}))
+	defer app.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, app.URL+"/", http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	var stderr strings.Builder
+	bm := launchTestBrowser(t)
+	c := NewCrawler(CrawlerOptions{
+		Depth:        1,
+		MaxPages:     5,
+		Timeout:      60 * time.Second,
+		Scope:        "same-origin",
+		Headless:     true,
+		AllowPrivate: true,
+		BrowserMgr:   bm,
+		Stderr:       &stderr,
+	})
+
+	results, err := c.Crawl(context.Background(), redirector.URL+"/")
+	if err != nil {
+		t.Fatalf("Crawl error: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatalf("cross-origin seed redirect produced an empty capture; stderr:\n%s", stderr.String())
+	}
+
+	var sawAPI bool
+	seen := make([]string, 0, len(results))
+	for _, r := range results {
+		seen = append(seen, r.URL)
+		if r.URL == app.URL+"/api/data" {
+			sawAPI = true
+		}
+	}
+	if !sawAPI {
+		t.Errorf("did not capture %s after the seed redirect; captured: %v", app.URL+"/api/data", seen)
+	}
+	// The widened scope must be visible to the operator, not silent.
+	if !strings.Contains(stderr.String(), "redirected to") {
+		t.Errorf("scope widening was not reported on stderr; stderr:\n%s", stderr.String())
 	}
 }

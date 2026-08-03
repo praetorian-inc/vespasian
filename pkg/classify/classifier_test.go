@@ -16,6 +16,7 @@ package classify
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -1345,4 +1346,211 @@ func BenchmarkDeduplicate(b *testing.B) {
 			}
 		})
 	}
+}
+
+// --- LAB-4678 Phase 1 ---
+
+// TestDeduplicate_KeepsDistinctHosts verifies that the same METHOD:path on two
+// different in-scope hosts (a same-domain scan can observe several) survives
+// deduplication instead of collapsing and losing one host's observation.
+func TestDeduplicate_KeepsDistinctHosts(t *testing.T) {
+	classified := []ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:   "GET",
+				URL:      "https://api.example.com/v1/users",
+				Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`{"a":1}`)},
+			},
+			IsAPI: true, Confidence: 0.9, APIType: "rest",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{
+				Method:   "GET",
+				URL:      "https://www.example.com/v1/users",
+				Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`{"b":2}`)},
+			},
+			IsAPI: true, Confidence: 0.9, APIType: "rest",
+		},
+	}
+
+	result := Deduplicate(classified)
+	assert.Len(t, result, 2, "same path on distinct hosts must not merge")
+}
+
+// TestDeduplicate_SameHostDefaultPortCollapses verifies the host in the dedup
+// key is canonicalized: an explicit :443 on https collapses with the bare host,
+// so a default-port variation does not create a spurious duplicate endpoint.
+func TestDeduplicate_SameHostDefaultPortCollapses(t *testing.T) {
+	classified := []ClassifiedRequest{
+		{
+			ObservedRequest: crawl.ObservedRequest{Method: "GET", URL: "https://example.com/v1/users"},
+			IsAPI:           true, Confidence: 0.9, APIType: "rest",
+		},
+		{
+			ObservedRequest: crawl.ObservedRequest{Method: "GET", URL: "https://example.com:443/v1/users"},
+			IsAPI:           true, Confidence: 0.9, APIType: "rest",
+		},
+	}
+
+	result := Deduplicate(classified)
+	assert.Len(t, result, 1, "https default port :443 must canonicalize to the bare host")
+}
+
+// TestNearMisses returns only endpoints in the [floor, threshold) band: an
+// endpoint with real-but-weak signal (path heuristic alone) is a near-miss,
+// a static asset (0 confidence) is excluded, and a strong API (>= threshold)
+// is excluded because it is emitted, not a miss.
+func TestNearMisses(t *testing.T) {
+	classifiers := []APIClassifier{&RESTClassifier{}}
+	requests := []crawl.ObservedRequest{
+		// Path heuristic only (0.15): below threshold but a real near-miss.
+		{Method: "GET", URL: "https://ex.com/api/thing"},
+		// Static asset: Rule 1 excludes -> confidence 0, below floor.
+		{Method: "GET", URL: "https://ex.com/static/app.css"},
+		// Strong API (JSON response, 0.85): at/above threshold, emitted not missed.
+		{
+			Method: "GET", URL: "https://ex.com/api/data",
+			Response: crawl.ObservedResponse{ContentType: "application/json", Body: []byte(`{"x":1}`)},
+		},
+	}
+
+	nm := NearMisses(classifiers, requests, NearMissFloor, DefaultConfidenceThreshold)
+	require.Len(t, nm, 1, "only the weak-signal endpoint is a near-miss")
+	assert.Contains(t, nm[0].URL, "/api/thing")
+	assert.GreaterOrEqual(t, nm[0].Confidence, NearMissFloor)
+	assert.Less(t, nm[0].Confidence, DefaultConfidenceThreshold)
+}
+
+// TestCanonicalHost covers the host canonicalization the dedup key is built from,
+// including the IPv6 bracketing. u.Hostname() strips brackets from an IPv6 literal,
+// so appending a port without re-bracketing produced "::1:8080" — an authority no
+// caller could re-parse (LAB-4678 review, QUAL-002).
+func TestCanonicalHost(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"lowercases host", "https://EXAMPLE.com/a", "example.com"},
+		{"strips default https port", "https://example.com:443/a", "example.com"},
+		{"strips default http port", "http://example.com:80/a", "example.com"},
+		{"keeps non-default port", "https://example.com:8443/a", "example.com:8443"},
+		{"http on 443 is not a default pair", "http://example.com:443/a", "example.com:443"},
+		{"no host", "/relative/path", ""},
+
+		// IPv6. The bracketed forms are what a caller can hand back to url.Parse.
+		{"ipv6 loopback with port", "http://[::1]:8080/api", "[::1]:8080"},
+		{"ipv6 full with port", "https://[2001:db8::1]:8443/api", "[2001:db8::1]:8443"},
+		{"ipv6 without port", "http://[::1]/api", "::1"},
+		{"ipv6 on default port is stripped", "https://[::1]:443/api", "::1"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			u, err := url.Parse(c.raw)
+			if err != nil {
+				t.Fatalf("parse %q: %v", c.raw, err)
+			}
+			if got := canonicalHost(u); got != c.want {
+				t.Errorf("canonicalHost(%q) = %q, want %q", c.raw, got, c.want)
+			}
+		})
+	}
+}
+
+// TestCanonicalHost_IPv6WithPortIsReparseable is the property behind the bracketing:
+// the output must be usable as an authority, which is what a future caller that logs
+// or re-parses it would rely on.
+func TestCanonicalHost_IPv6WithPortIsReparseable(t *testing.T) {
+	u, err := url.Parse("http://[::1]:8080/api")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	got := canonicalHost(u)
+
+	round, err := url.Parse("http://" + got + "/")
+	if err != nil {
+		t.Fatalf("canonicalHost produced an unparseable authority %q: %v", got, err)
+	}
+	if round.Hostname() != "::1" || round.Port() != "8080" {
+		t.Errorf("round-trip of %q gave host=%q port=%q, want ::1 and 8080",
+			got, round.Hostname(), round.Port())
+	}
+}
+
+func TestDeduplicate_RetainsDistinctResponsesForUnion(t *testing.T) {
+	mk := func(body string) ClassifiedRequest {
+		return ClassifiedRequest{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "GET", URL: "https://ex.com/users",
+				Response: crawl.ObservedResponse{
+					StatusCode: 200, ContentType: "application/json", Body: []byte(body),
+				},
+			},
+			IsAPI: true, Confidence: 0.9, APIType: "rest",
+		}
+	}
+	out := Deduplicate([]ClassifiedRequest{
+		mk(`[{"id":1,"name":"a"}]`),
+		mk(`[{"id":2,"email":"b@x"}]`),
+	})
+
+	if len(out) != 1 {
+		t.Fatalf("deduplicated to %d entries, want 1 (the endpoint count must not change)", len(out))
+	}
+	if len(out[0].MergedResponses) != 1 {
+		t.Fatalf("MergedResponses has %d entries, want 1: the response the dedup discarded "+
+			"must survive for the generator's schema union", len(out[0].MergedResponses))
+	}
+
+	// Both bodies must be present across Response + MergedResponses.
+	bodies := []string{string(out[0].Response.Body)}
+	for _, r := range out[0].MergedResponses {
+		bodies = append(bodies, string(r.Body))
+	}
+	for _, want := range []string{`[{"id":1,"name":"a"}]`, `[{"id":2,"email":"b@x"}]`} {
+		found := false
+		for _, b := range bodies {
+			if b == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("observation %s was dropped; carried bodies: %v", want, bodies)
+		}
+	}
+}
+
+func TestDeduplicate_MergedResponsesAreBoundedAndDeduped(t *testing.T) {
+	mk := func(body string) ClassifiedRequest {
+		return ClassifiedRequest{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "GET", URL: "https://ex.com/x",
+				Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(body)},
+			},
+			IsAPI: true, Confidence: 0.9,
+		}
+	}
+
+	t.Run("identical bodies collapse", func(t *testing.T) {
+		var in []ClassifiedRequest
+		for range 50 {
+			in = append(in, mk(`{"a":1}`))
+		}
+		out := Deduplicate(in)
+		if n := len(out[0].MergedResponses); n != 0 {
+			t.Errorf("MergedResponses = %d for 50 identical responses, want 0", n)
+		}
+	})
+
+	t.Run("distinct bodies are bounded", func(t *testing.T) {
+		var in []ClassifiedRequest
+		for i := range 100 {
+			in = append(in, mk(`{"n":`+string(rune('0'+i%10))+`,"i":`+string(rune('a'+i%26))+`}`))
+		}
+		out := Deduplicate(in)
+		if n := len(out[0].MergedResponses); n > MaxMergedResponses {
+			t.Errorf("MergedResponses = %d, above the bound of %d", n, MaxMergedResponses)
+		}
+	})
 }

@@ -15,10 +15,13 @@
 package crawl
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestScopeChecker_SameOrigin(t *testing.T) {
@@ -141,7 +144,10 @@ func TestScopeChecker_UnknownScopeDefaultsToSameOrigin(t *testing.T) {
 	}
 }
 
-func TestNormalizeURL(t *testing.T) {
+// TestCanonicalizeURL_KeepQuery covers canonicalizeURL in its query-preserving
+// mode. It used to test the normalizeURL wrapper, which was removed once
+// urlFrontier.Push switched to frontierKey and left it with no production caller.
+func TestCanonicalizeURL_KeepQuery(t *testing.T) {
 	tests := []struct {
 		name  string
 		input string
@@ -161,9 +167,9 @@ func TestNormalizeURL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := normalizeURL(tt.input)
+			got := canonicalizeURL(tt.input, false)
 			if got != tt.want {
-				t.Errorf("normalizeURL(%q) = %q, want %q", tt.input, got, tt.want)
+				t.Errorf("canonicalizeURL(%q, false) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
 	}
@@ -337,3 +343,545 @@ func TestSSRFSafeDialContext_DNSFailure(t *testing.T) {
 // multi-IP fallback path require a reachable public endpoint and are therefore
 // not unit-testable here — loopback is blocked by the SSRF guard itself.
 // Those paths are covered by live/integration tests.
+
+// TestFrontierKey verifies the frontier dedup key strips the query (and
+// fragment) while keeping scheme/host/path canonicalization, so query-only
+// variants share a key but distinct paths do not (LAB-4678 Phase 1).
+func TestFrontierKey(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"https://example.com/p?id=1", "https://example.com/p"},
+		{"https://example.com/p?id=2&ref=x", "https://example.com/p"},
+		{"https://EXAMPLE.com:443/p?id=1#frag", "https://example.com/p"},
+		{"https://example.com/other?id=1", "https://example.com/other"},
+	}
+	got := map[string]string{}
+	for _, tc := range cases {
+		k := frontierKey(tc.in)
+		if k != tc.want {
+			t.Errorf("frontierKey(%q) = %q, want %q", tc.in, k, tc.want)
+		}
+		got[tc.in] = k
+	}
+	// The two /p query variants must share a key; /other must differ.
+	if got["https://example.com/p?id=1"] != got["https://example.com/p?id=2&ref=x"] {
+		t.Errorf("query variants of /p produced different keys")
+	}
+	if got["https://example.com/p?id=1"] == got["https://example.com/other?id=1"] {
+		t.Errorf("distinct paths collapsed to the same key")
+	}
+}
+
+// TestSeedScope_LearnsEffectiveOrigin is the unit-level pin for the
+// cross-origin-seed-redirect fix. With a same-origin policy, a URL on the origin
+// the seed actually resolved to must be in scope once that origin is learned, and
+// out of scope before — otherwise every request Chrome captures after following
+// the seed's redirect is discarded and the crawl yields an empty capture.
+func TestSeedScope_LearnsEffectiveOrigin(t *testing.T) {
+	var stderr bytes.Buffer
+	s, err := newSeedScope("http://example.com", "same-origin", true, &stderr)
+	if err != nil {
+		t.Fatalf("newSeedScope: %v", err)
+	}
+
+	const post = "https://www.example.com/api/users"
+	if s.Check(post) {
+		t.Fatal("post-redirect origin in scope before the redirect was observed")
+	}
+	if !s.Check("http://example.com/api/users") {
+		t.Fatal("seed origin not in scope")
+	}
+
+	s.LearnEffectiveOrigin("https://www.example.com/")
+
+	if !s.Check(post) {
+		t.Error("post-redirect origin still out of scope after LearnEffectiveOrigin")
+	}
+	// Widening is bounded to that one origin: nothing else is admitted.
+	for _, u := range []string{
+		"https://attacker.test/x",
+		"https://other.example.com/x", // a sibling host is NOT implied
+		"https://www.example.com:8443/x",
+	} {
+		if s.Check(u) {
+			t.Errorf("Check(%q) = true, want false (widening must add exactly one origin)", u)
+		}
+	}
+	// And it is announced, not silent.
+	if !strings.Contains(stderr.String(), "https://www.example.com") {
+		t.Errorf("scope widening not reported on stderr; got %q", stderr.String())
+	}
+}
+
+// TestSeedScope_LearnIsOneShot pins the containment bound: only the seed's FIRST
+// navigation may widen scope. A later call — a resumed depth-0 entry, a retry, or
+// any future caller — must not be able to add a second origin.
+func TestSeedScope_LearnIsOneShot(t *testing.T) {
+	s, err := newSeedScope("http://example.com", "same-origin", true, nil)
+	if err != nil {
+		t.Fatalf("newSeedScope: %v", err)
+	}
+	s.LearnEffectiveOrigin("https://www.example.com/")
+	s.LearnEffectiveOrigin("https://attacker.test/")
+	if s.Check("https://attacker.test/x") {
+		t.Error("a second LearnEffectiveOrigin call widened scope again")
+	}
+	if !s.Check("https://www.example.com/x") {
+		t.Error("the first learned origin was lost")
+	}
+}
+
+// TestSeedScope_LearnNoopOnSameOrigin verifies the common case adds nothing: a
+// seed that redirects within its own origin (or not at all) leaves the accepted
+// set exactly as configured, and says nothing on stderr.
+func TestSeedScope_LearnNoopOnSameOrigin(t *testing.T) {
+	var stderr bytes.Buffer
+	s, err := newSeedScope("https://example.com/start", "same-origin", true, &stderr)
+	if err != nil {
+		t.Fatalf("newSeedScope: %v", err)
+	}
+	// Same origin in explicit-port form: must be recognized as unchanged.
+	s.LearnEffectiveOrigin("https://example.com:443/app/")
+	if s.effOrigin != "" {
+		t.Errorf("effOrigin = %q, want empty (no widening for a same-origin redirect)", s.effOrigin)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+// TestSeedScope_RefusesPrivateEffectiveOrigin verifies the gates still hold over
+// the widened origin: a seed that redirects to a private host on a DIFFERENT
+// domain must not pull that host into scope. Since the Codex review of PR #189
+// the domain constraint is checked first, so this is refused as a foreign domain
+// rather than as a private origin — either way it stays out of scope, and it is
+// now refused even with --dangerous-allow-private, because a cross-domain
+// redirect is not what the seed widening exists for.
+func TestSeedScope_RefusesPrivateEffectiveOrigin(t *testing.T) {
+	var stderr bytes.Buffer
+	s, err := newSeedScope("https://example.com", "same-origin", false, &stderr)
+	if err != nil {
+		t.Fatalf("newSeedScope: %v", err)
+	}
+	s.LearnEffectiveOrigin("http://127.0.0.1:8080/")
+	if s.Check("http://127.0.0.1:8080/admin") {
+		t.Error("private effective origin was admitted without --dangerous-allow-private")
+	}
+	if !strings.Contains(stderr.String(), "different domain") {
+		t.Errorf("cross-domain refusal not reported; stderr = %q", stderr.String())
+	}
+}
+
+// staticResolver returns a lookupHost function that answers from addrs and reports
+// NXDOMAIN-equivalent for anything else. It exists so tests that exercise the
+// private-host SSRF gate do not depend on the environment's DNS.
+//
+// Why this is required rather than convenient: the private-origin assertion below
+// used to be wrapped in t.Skipf, so any resolver returning a public A record for
+// the test hostname — a wildcard search domain, an ISP hijacking NXDOMAIN, a
+// corporate split-horizon resolver — made the security assertion silently vanish
+// with a green test. The premise was also wrong: localhost.example.com does not
+// resolve, so the test was passing through isPrivateHost's DNS-failure
+// fail-closed branch, not through a private resolution (LAB-4678 review, TEST-009).
+func staticResolver(addrs map[string][]string) func(string) ([]string, error) {
+	return func(host string) ([]string, error) {
+		if a, ok := addrs[host]; ok {
+			return a, nil
+		}
+		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+	}
+}
+
+// newSeedScopeWithResolver builds a seedScope whose private-host verdicts come from
+// a fixed table instead of the system resolver. The hostChecker is shared by the
+// base predicate and LearnEffectiveOrigin, so overriding it here covers both.
+func newSeedScopeWithResolver(t *testing.T, seedURL, scope string, allowPrivate bool,
+	stderr io.Writer, addrs map[string][]string,
+) *seedScope {
+	t.Helper()
+	s, err := newSeedScope(seedURL, scope, allowPrivate, stderr)
+	if err != nil {
+		t.Fatalf("newSeedScope: %v", err)
+	}
+	s.hosts.lookupHost = staticResolver(addrs)
+	return s
+}
+
+// TestSeedScope_RefusesPrivateVariantOrigin exercises the SSRF gate on the path
+// that reaches it. Since SEC-BE-009 the host-variant check runs first, so the target
+// must be an apex/www variant of the seed to get as far as the private-host check —
+// a sibling subdomain is now refused before it, by the variant gate. The scenario is
+// a split-horizon resolver where www resolves internally.
+//
+// The resolver is injected so the private resolution is a fact of the test rather
+// than of the environment, and the assertion always executes.
+func TestSeedScope_RefusesPrivateVariantOrigin(t *testing.T) {
+	var stderr bytes.Buffer
+	s := newSeedScopeWithResolver(t, "https://example.com", "same-origin", false, &stderr,
+		map[string][]string{
+			"example.com": {"93.184.216.34"},
+			// An apex->www variant, so it clears the variant gate, but it resolves
+			// into RFC1918 so the SSRF gate must refuse it.
+			"www.example.com": {"10.0.0.7"},
+		})
+
+	s.LearnEffectiveOrigin("https://www.example.com/")
+
+	if !strings.Contains(stderr.String(), "private origin") {
+		t.Errorf("private-origin refusal not reported; stderr = %q", stderr.String())
+	}
+	if s.Check("https://www.example.com/admin") {
+		t.Error("private variant origin was admitted without --dangerous-allow-private")
+	}
+}
+
+// TestSeedScope_DNSFailureFailsClosed pins the branch the previous version of the
+// test was accidentally exercising. An unresolvable redirect target must be refused,
+// not admitted: isPrivateHost reports a DNS error as private on purpose. The target
+// is an apex->www variant so it reaches the DNS check rather than being refused by
+// the variant gate first.
+func TestSeedScope_DNSFailureFailsClosed(t *testing.T) {
+	var stderr bytes.Buffer
+	s := newSeedScopeWithResolver(t, "https://example.com", "same-origin", false, &stderr,
+		map[string][]string{"example.com": {"93.184.216.34"}})
+
+	// Not in the resolver table, so the lookup fails.
+	s.LearnEffectiveOrigin("https://www.example.com/")
+
+	if s.Check("https://www.example.com/admin") {
+		t.Error("an unresolvable variant origin was admitted; the SSRF gate must fail closed")
+	}
+	if !strings.Contains(stderr.String(), "private origin") {
+		t.Errorf("refusal not reported; stderr = %q", stderr.String())
+	}
+}
+
+// TestSeedScope_RefusesForeignDomainRedirect is the containment case from the
+// Codex review: an IdP hand-off or an open redirect on the seed must not become
+// crawl scope. Before the fix the foreign origin was admitted after only the
+// private-host check, so any external redirect target joined the crawl.
+func TestSeedScope_RefusesForeignDomainRedirect(t *testing.T) {
+	var stderr bytes.Buffer
+	s, err := newSeedScope("https://target.example.com", "same-origin", false, &stderr)
+	if err != nil {
+		t.Fatalf("newSeedScope: %v", err)
+	}
+	s.LearnEffectiveOrigin("https://idp.attacker.test/authorize")
+	if s.Check("https://idp.attacker.test/anything") {
+		t.Error("a seed redirect to a foreign registrable domain widened the crawl scope")
+	}
+	if !strings.Contains(stderr.String(), "different domain") {
+		t.Errorf("cross-domain refusal not reported; stderr = %q", stderr.String())
+	}
+}
+
+// TestSeedScope_AllowsIntendedWidenings pins that the constraint does not break
+// the two deployments the widening exists for: http -> https on the same host,
+// and apex -> www on the same registrable domain.
+//
+// These run with allowPrivate=false, so they reach the private-host check and
+// therefore resolve DNS. The resolver is injected to keep them hermetic: against
+// the system resolver a CI runner without DNS makes every lookup fail, isPrivateHost
+// fails closed, and both widenings would be refused for a reason unrelated to what
+// is under test.
+func TestSeedScope_AllowsIntendedWidenings(t *testing.T) {
+	public := map[string][]string{
+		"example.com":     {"93.184.216.34"},
+		"www.example.com": {"93.184.216.34"},
+	}
+
+	t.Run("http to https", func(t *testing.T) {
+		s := newSeedScopeWithResolver(t, "http://example.com", "same-origin", false, nil, public)
+		s.LearnEffectiveOrigin("https://example.com/")
+		if !s.Check("https://example.com/dashboard") {
+			t.Error("http -> https seed redirect must stay crawlable")
+		}
+	})
+
+	t.Run("apex to www", func(t *testing.T) {
+		s := newSeedScopeWithResolver(t, "https://example.com", "same-origin", false, nil, public)
+		s.LearnEffectiveOrigin("https://www.example.com/")
+		if !s.Check("https://www.example.com/dashboard") {
+			t.Error("apex -> www seed redirect must stay crawlable")
+		}
+	})
+}
+
+// TestHostChecker_MemoizesPerHostname pins the property that makes resume startup
+// bounded: one resolution per distinct hostname, not one per call. urlFrontier.Restore
+// invokes the scope predicate once per pending entry and LoadCheckpoint admits up to
+// MaxCheckpointEntries of them, so an uncached verdict meant an unbounded,
+// uninterruptible stall before the crawl produced any output (LAB-4678 review,
+// SEC-BE-003).
+func TestHostChecker_MemoizesPerHostname(t *testing.T) {
+	var calls int
+	hc := newHostChecker()
+	hc.lookupHost = func(host string) ([]string, error) {
+		calls++
+		return []string{"93.184.216.34"}, nil
+	}
+
+	for range 100 {
+		if hc.isPrivate("example.com") {
+			t.Fatal("public address reported as private")
+		}
+	}
+	if calls != 1 {
+		t.Errorf("resolver called %d times for one hostname, want 1", calls)
+	}
+
+	// A second hostname is a separate verdict and costs exactly one more lookup.
+	hc.isPrivate("other.example.com")
+	if calls != 2 {
+		t.Errorf("resolver called %d times for two hostnames, want 2", calls)
+	}
+
+	// A raw IP needs no resolution at all.
+	before := calls
+	if !hc.isPrivate("10.0.0.1") {
+		t.Error("10.0.0.1 must be private")
+	}
+	if calls != before {
+		t.Errorf("raw IP triggered %d resolution(s), want 0", calls-before)
+	}
+}
+
+// TestHostChecker_CachesNegativeAndPositiveVerdicts pins that a private verdict is
+// cached too. Caching only the public answer would leave the pathological case (a
+// checkpoint full of private hosts) paying a lookup per entry.
+func TestHostChecker_CachesNegativeAndPositiveVerdicts(t *testing.T) {
+	var calls int
+	hc := newHostChecker()
+	hc.lookupHost = func(host string) ([]string, error) {
+		calls++
+		return []string{"10.1.2.3"}, nil
+	}
+
+	for range 50 {
+		if !hc.isPrivate("internal.example.com") {
+			t.Fatal("RFC1918 address reported as public")
+		}
+	}
+	if calls != 1 {
+		t.Errorf("resolver called %d times, want 1: private verdicts must cache too", calls)
+	}
+}
+
+// TestRestore_DoesNotHoldLockAcrossScopeCheck pins that the scope predicate, which
+// resolves DNS, runs outside the frontier lock. If it ran inside, this test deadlocks:
+// the predicate calls back into a frontier method that needs the same mutex
+// (LAB-4678 review, SEC-BE-003).
+func TestRestore_DoesNotHoldLockAcrossScopeCheck(t *testing.T) {
+	f := newURLFrontier(5, nil)
+	f.scopeFn = func(string) bool {
+		// A frontier operation from inside the predicate. Len takes f.mu.
+		_ = f.Len()
+		return true
+	}
+
+	done := make(chan struct{})
+	go func() {
+		f.Restore([]urlEntry{
+			{URL: "https://ex.com/a", Depth: 1},
+			{URL: "https://ex.com/b", Depth: 1},
+		}, nil)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Restore deadlocked: the scope predicate is being called with f.mu held")
+	}
+
+	if f.Len() != 2 {
+		t.Errorf("restored queue has %d entries, want 2", f.Len())
+	}
+}
+
+// TestSeedScope_WideningIsBoundedToHostVariants is the SEC-BE-009 regression test.
+//
+// The widening used to be bounded by the seed's REGISTRABLE DOMAIN, which is the
+// "same-domain" policy applied no matter what the operator configured. Under
+// --scope same-origin the policy is an exact scheme://host comparison, so that bound
+// admitted an origin the operator had excluded: a seed redirect to a sibling
+// subdomain — open redirect, subdomain takeover, misconfigured vhost — put that host
+// in scope, and operator --header values are applied per page with no origin check,
+// so a static Authorization header went with it.
+//
+// The accepted set is now exactly what doc.go documents the widening as existing
+// for: the same host with a scheme change, or an apex/www swap.
+func TestSeedScope_WideningIsBoundedToHostVariants(t *testing.T) {
+	resolver := map[string][]string{
+		"target.com":             {"93.184.216.34"},
+		"www.target.com":         {"93.184.216.34"},
+		"staging-abc.target.com": {"93.184.216.34"},
+		"app.target.com":         {"93.184.216.34"},
+		"idp.attacker.test":      {"93.184.216.34"},
+	}
+
+	cases := []struct {
+		name    string
+		seed    string
+		learned string
+		probe   string
+		want    bool
+	}{
+		// The two cases the widening is documented to exist for.
+		{"http to https on the same host", "http://www.target.com", "https://www.target.com/", "https://www.target.com/x", true},
+		{"apex to www", "https://target.com", "https://www.target.com/", "https://www.target.com/x", true},
+		{"www to apex", "https://www.target.com", "https://target.com/", "https://target.com/x", true},
+
+		// The regression. Both are under the seed's registrable domain, so the old
+		// eTLD+1 bound admitted them.
+		{"sibling subdomain refused", "https://www.target.com", "https://staging-abc.target.com/", "https://staging-abc.target.com/admin", false},
+		{"apex to unrelated subdomain refused", "https://target.com", "https://app.target.com/", "https://app.target.com/x", false},
+
+		// Already refused before this change; must stay refused.
+		{"foreign domain refused", "https://www.target.com", "https://idp.attacker.test/authorize", "https://idp.attacker.test/x", false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			s := newSeedScopeWithResolver(t, c.seed, "same-origin", false, &stderr, resolver)
+			s.LearnEffectiveOrigin(c.learned)
+
+			if got := s.Check(c.probe); got != c.want {
+				t.Errorf("Check(%q) = %v, want %v after a seed redirect to %q\nstderr: %s",
+					c.probe, got, c.want, c.learned, stderr.String())
+			}
+
+			// A refusal must be reported, and must point at re-seeding rather than
+			// at --scope same-domain, which would admit every subdomain.
+			if !c.want {
+				out := stderr.String()
+				if !strings.Contains(out, "not adding it to scope") {
+					t.Errorf("refusal not reported on stderr: %q", out)
+				}
+				if !strings.Contains(out, "re-run with it as the seed URL") {
+					t.Errorf("refusal does not name the remedy: %q", out)
+				}
+				if strings.Contains(out, "same-domain") {
+					t.Errorf("refusal recommends widening the scope, which admits every "+
+						"subdomain and is broader than what was just refused: %q", out)
+				}
+			}
+		})
+	}
+}
+
+// TestSeedScope_RefusalDistinguishesForeignDomainFromSiblingHost pins the two
+// diagnostics. A foreign domain is usually an IdP hand-off or an open redirect; a
+// sibling host on the operator's own domain is usually the real app on another
+// subdomain. Both are refused, but an operator needs to tell them apart.
+func TestSeedScope_RefusalDistinguishesForeignDomainFromSiblingHost(t *testing.T) {
+	resolver := map[string][]string{
+		"www.target.com":         {"93.184.216.34"},
+		"staging-abc.target.com": {"93.184.216.34"},
+		"idp.attacker.test":      {"93.184.216.34"},
+	}
+
+	t.Run("sibling host on the same domain", func(t *testing.T) {
+		var stderr bytes.Buffer
+		s := newSeedScopeWithResolver(t, "https://www.target.com", "same-origin", false, &stderr, resolver)
+		s.LearnEffectiveOrigin("https://staging-abc.target.com/")
+		if !strings.Contains(stderr.String(), "a different host on the same domain as") {
+			t.Errorf("stderr = %q, want the same-domain sibling wording", stderr.String())
+		}
+	})
+
+	t.Run("foreign domain", func(t *testing.T) {
+		var stderr bytes.Buffer
+		s := newSeedScopeWithResolver(t, "https://www.target.com", "same-origin", false, &stderr, resolver)
+		s.LearnEffectiveOrigin("https://idp.attacker.test/authorize")
+		if !strings.Contains(stderr.String(), "a different domain than") {
+			t.Errorf("stderr = %q, want the foreign-domain wording", stderr.String())
+		}
+	})
+}
+
+// TestSeedScope_NarrowingDoesNotAffectSameDomainScope pins the claim that made this
+// change cheap: under --scope same-domain the widening was never load-bearing,
+// because the base predicate already accepts every host under the registrable
+// domain. So narrowing the widening costs no coverage in that mode.
+//
+// This is the measurement the decision rested on, kept as a test so it cannot
+// silently stop being true.
+func TestSeedScope_NarrowingDoesNotAffectSameDomainScope(t *testing.T) {
+	resolver := map[string][]string{
+		"www.target.com":         {"93.184.216.34"},
+		"staging-abc.target.com": {"93.184.216.34"},
+	}
+
+	// The base predicate alone, with no learned origin at all.
+	hc := newHostChecker()
+	hc.lookupHost = staticResolver(resolver)
+	base, err := scopeCheckerWith("https://www.target.com", "same-domain", false, hc)
+	if err != nil {
+		t.Fatalf("scopeCheckerWith: %v", err)
+	}
+	if !base("https://staging-abc.target.com/admin") {
+		t.Fatal("same-domain base predicate rejected a sibling subdomain; if this is ever " +
+			"true, narrowing the seed widening DOES cost coverage in same-domain mode and " +
+			"the SEC-BE-009 decision needs revisiting")
+	}
+
+	// And with the narrowed widening in place, same-domain still reaches it.
+	var stderr bytes.Buffer
+	s := newSeedScopeWithResolver(t, "https://www.target.com", "same-domain", false, &stderr, resolver)
+	s.LearnEffectiveOrigin("https://staging-abc.target.com/")
+	if !s.Check("https://staging-abc.target.com/admin") {
+		t.Error("same-domain scope lost a sibling subdomain after the widening was narrowed")
+	}
+
+	// Contrast: the same seed and redirect under same-origin is refused.
+	var stderr2 bytes.Buffer
+	s2 := newSeedScopeWithResolver(t, "https://www.target.com", "same-origin", false, &stderr2, resolver)
+	s2.LearnEffectiveOrigin("https://staging-abc.target.com/")
+	if s2.Check("https://staging-abc.target.com/admin") {
+		t.Error("same-origin admitted a sibling subdomain via the seed widening")
+	}
+}
+
+// TestSameHostVariant covers the predicate directly, including the shapes a
+// substring-based implementation would get wrong.
+func TestSameHostVariant(t *testing.T) {
+	cases := []struct {
+		seed string
+		host string
+		want bool
+	}{
+		{"www.target.com", "www.target.com", true},
+		{"WWW.Target.com", "www.target.com", true}, // case-insensitive
+		{"target.com", "www.target.com", true},     // apex -> www
+		{"www.target.com", "target.com", true},     // www -> apex
+		{"127.0.0.1", "127.0.0.1", true},           // IP literal, scheme-only change
+		{"localhost", "localhost", true},           // single-label seed
+
+		{"www.target.com", "staging.target.com", false},
+		{"target.com", "app.target.com", false},
+		{"target.com", "other.com", false},
+		{"127.0.0.1", "127.0.0.2", false},
+		// "www." must be a LEADING label, not a substring anywhere.
+		{"target.com", "wwwtarget.com", false},
+		{"target.com", "evil-www.target.com", false},
+		{"target.com", "www.target.com.evil.test", false},
+		// Two labels deep is not a variant.
+		{"target.com", "www.www.target.com", false},
+		{"", "target.com", false},
+		{"target.com", "", false},
+	}
+
+	for _, c := range cases {
+		s := &seedScope{seedOrigin: "https://" + c.seed}
+		if c.seed == "" {
+			s.seedOrigin = ""
+		}
+		if got := s.sameHostVariant(c.host); got != c.want {
+			t.Errorf("seed %q, host %q: sameHostVariant = %v, want %v", c.seed, c.host, got, c.want)
+		}
+	}
+}

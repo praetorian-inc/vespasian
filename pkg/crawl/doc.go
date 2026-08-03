@@ -22,6 +22,28 @@
 // listeners. This is the correct choice for single-page applications and any
 // site that requires JavaScript execution. External .js bundles are fetched by
 // the browser itself; this path does not perform separate JS file retrieval.
+// After DOM stability the crawl waits for the network to go quiet (bounded by
+// [DefaultNetworkIdleFloor], [DefaultNetworkQuietPeriod], [DefaultPerRequestTimeout],
+// and the per-page timeout) rather than a fixed settle window, so late and
+// dynamic requests are captured. Passively captured requests are scope-filtered
+// like frontier links, and the frontier treats URLs differing only in query
+// parameters as one page. On the headless backend the scope predicate also learns
+// the seed's EFFECTIVE origin from the seed's own navigation, so a seed that
+// redirects cross-origin (http -> https, apex -> www) does not discard every
+// captured request; the widening is one-shot, adds exactly the origin the seed
+// resolved to, still applies the SSRF gate, and is reported on Stderr. Those two
+// cases are the BOUND, not just examples: the learned origin must be the seed's own
+// host or a leading-"www." variant of it, so a redirect to a sibling subdomain or a
+// foreign domain is refused and reported. Admitting a subdomain is what --scope
+// same-domain is for.
+//
+// An opt-in interaction pass ([CrawlerOptions.Interact], headless only, off by
+// default; the net/http backend warns and ignores it) clicks a bounded set of
+// controls per page to surface endpoints that only fire on interaction. It matches
+// form submit buttons too, so it submits forms and can mutate state; destructive,
+// session-ending, and irreversible-commit labels are skipped on a best-effort
+// match, and a click that navigates returns the tab to the assigned page so no
+// surface is attributed to a document the worker was not assigned.
 //
 // Browser binary (LAB-4999): the headless path pins a local Chrome via
 // [BrowserOptions.ChromePath] when set, otherwise the system browser resolved
@@ -128,6 +150,25 @@
 //   - [ParseCookiesToParams] converts a Cookie header value into CDP
 //     [proto.NetworkCookieParam] entries scoped to the target URL's host
 //     and scheme. Rejects non-http(s) or hostless target URLs.
+//
+// Cross-run resume primitives (LAB-4678 Phase 4, vespasian side) let coverage
+// accumulate across separate crawls: [Checkpoint] serializes the frontier's
+// pending queue ([]PendingURL) and seen-set, gated by [ComputeConfigFingerprint]
+// (target/scope/depth/backend/allow-private/interact) and a staleness bound ([Checkpoint.Usable],
+// [DefaultCheckpointMaxAge]); a page whose visit failed transiently is omitted
+// from the persisted seen-set AND returned to the persisted pending queue so a
+// resumed run retries it (omitting it from seen alone loses the page: it was
+// popped before failing, so it is in neither half of the checkpoint);
+// resume is driven through [CrawlerOptions]: set ResumeFrom to continue a prior
+// crawl and OnCheckpoint to receive the state captured when this one stops
+// (including on budget truncation or cancellation, which is the case resume
+// exists for). Restored pending entries are re-validated against depth and scope
+// on load: a checkpoint round-trips through host storage and its fingerprint is
+// derived from non-secret config, so it is parsed input, not trusted in-process
+// state. A checkpoint whose fingerprint or age does not match is reported
+// on Stderr and ignored, so a config change costs a full re-crawl rather than a
+// failed run. Both backends honor it. Storing and passing the checkpoint between
+// runs is the host's (Guard's) concern and is not built here.
 //
 // [go-rod]: https://github.com/go-rod/rod
 package crawl

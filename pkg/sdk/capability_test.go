@@ -17,6 +17,11 @@ package sdk
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"strconv"
+	"strings"
 	"testing"
 
 	"time"
@@ -466,8 +471,8 @@ func TestCapability_Parameters(t *testing.T) {
 	c := &Capability{}
 	params := c.Parameters()
 
-	// Exactly 11 declared parameters.
-	require.Len(t, params, 11)
+	// Exactly 13 declared parameters.
+	require.Len(t, params, 13)
 
 	// Build a name -> Parameter map for convenient field assertions.
 	byName := make(map[string]capability.Parameter, len(params))
@@ -479,7 +484,7 @@ func TestCapability_Parameters(t *testing.T) {
 	for _, name := range []string{
 		"mode", "api_type", "timeout", "max_pages", "depth",
 		"scope", "headers", "confidence", "probe",
-		"merge_slugs", "slug_threshold",
+		"merge_slugs", "slug_threshold", "max_requests", "interact",
 	} {
 		assert.Contains(t, byName, name, "missing parameter %q", name)
 	}
@@ -492,6 +497,8 @@ func TestCapability_Parameters(t *testing.T) {
 	assert.Equal(t, "true", byName["probe"].Default)
 	assert.Equal(t, "false", byName["merge_slugs"].Default)
 	assert.Equal(t, "2", byName["slug_threshold"].Default)
+	assert.Equal(t, "0", byName["max_requests"].Default)
+	assert.Equal(t, "false", byName["interact"].Default)
 
 	// WithOptions enum sets for the parameters that have them.
 	assert.ElementsMatch(t, []string{"scan", "crawl"}, byName["mode"].Options)
@@ -702,4 +709,113 @@ func TestCrawlOptsFromCtx_InvalidHeaderReturnsError(t *testing.T) {
 	_, err := crawlOptsFromCtx(ctxWithParams("headers", "no-colon-here"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "vespasian:")
+}
+
+// TestCrawlOptsFromCtx_MaxRequestsAndInteract covers the two crawl options that
+// were unreachable from the Guard-facing surface: --max-requests and --interact are
+// both user-facing CLI flags, but crawlOptsFromCtx never read them, so a host had no
+// way to set either. (ResumeFrom/OnCheckpoint stay unwired on purpose — the host
+// owns checkpoint storage.)
+func TestCrawlOptsFromCtx_MaxRequestsAndInteract(t *testing.T) {
+	ctx := capability.ExecutionContext{Parameters: capability.Parameters{
+		capability.String("max_requests", "").WithDefault("25"),
+		capability.Bool("interact", "").WithDefault("true"),
+	}}
+	opts, err := crawlOptsFromCtx(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 25, opts.MaxRequests)
+	assert.True(t, opts.Interact)
+}
+
+// TestCrawlOptsFromCtx_MaxRequestsAndInteractDefaults pins the unset case: absent
+// parameters must leave both at their zero values (unlimited requests, no clicking),
+// so a host that does not opt in never gets interaction side effects.
+func TestCrawlOptsFromCtx_MaxRequestsAndInteractDefaults(t *testing.T) {
+	opts, err := crawlOptsFromCtx(ctxWithParams())
+	require.NoError(t, err)
+	assert.Equal(t, 0, opts.MaxRequests)
+	assert.False(t, opts.Interact)
+}
+
+// TestCapability_DeclaredParametersAreReadable pins the invariant the Codex
+// review of PR #189 caught a violation of: every crawl-shaping parameter this
+// capability READS from the ExecutionContext must also be DECLARED in
+// Parameters(). A parameter honored by crawlOptsFromCtx but absent from the
+// declaration is unreachable through the Guard-facing surface, so the feature
+// ships dark and only a hand-built context can exercise it.
+// The read set is DERIVED FROM SOURCE, not hand-listed. A literal slice annotated
+// "keep in sync" only covers keys someone remembered to add, which is the very
+// failure mode this test exists to catch: the next parameter read by crawlOptsFromCtx
+// without a matching entry would ship dark and the test would stay green. Parsing the
+// function's own ctx.Parameters.Get*("...") calls removes the sync burden entirely
+// (LAB-4678 review, TEST-010).
+func TestCapability_DeclaredParametersAreReadable(t *testing.T) {
+	declared := make(map[string]bool)
+	for _, p := range (&Capability{}).Parameters() {
+		declared[p.Name] = true
+	}
+
+	read := parametersReadFromSource(t)
+	require.NotEmpty(t, read,
+		"parsed zero parameter reads out of crawlOptsFromCtx; the extraction below has "+
+			"drifted from the code and this guard is no longer checking anything")
+
+	for _, name := range read {
+		assert.True(t, declared[name],
+			"crawlOptsFromCtx reads %q but Parameters() does not declare it, so no host can set it", name)
+	}
+}
+
+// parametersReadFromSource returns every parameter name crawlOptsFromCtx pulls off
+// the ExecutionContext, by parsing capability.go with go/ast and collecting the string
+// literal argument of each ctx.Parameters.Get* call inside that function.
+//
+// go/ast rather than a regexp so a name mentioned in a comment or an unrelated string
+// cannot be picked up, and so the extraction is scoped to the one function.
+func parametersReadFromSource(t *testing.T) []string {
+	t.Helper()
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "capability.go", nil, 0)
+	require.NoError(t, err, "parse capability.go")
+
+	var fn *ast.FuncDecl
+	for _, decl := range file.Decls {
+		if f, ok := decl.(*ast.FuncDecl); ok && f.Name.Name == "crawlOptsFromCtx" {
+			fn = f
+			break
+		}
+	}
+	require.NotNil(t, fn, "crawlOptsFromCtx not found in capability.go; update this guard")
+
+	seen := make(map[string]bool)
+	var names []string
+	ast.Inspect(fn, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) == 0 {
+			return true
+		}
+		// Match ctx.Parameters.GetString / GetInt / GetBool / ... — a selector whose
+		// method name starts with "Get" and whose receiver is a "Parameters" selector.
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || !strings.HasPrefix(sel.Sel.Name, "Get") {
+			return true
+		}
+		recv, ok := sel.X.(*ast.SelectorExpr)
+		if !ok || recv.Sel.Name != "Parameters" {
+			return true
+		}
+		lit, ok := call.Args[0].(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return true
+		}
+		name, err := strconv.Unquote(lit.Value)
+		if err != nil || seen[name] {
+			return true
+		}
+		seen[name] = true
+		names = append(names, name)
+		return true
+	})
+	return names
 }

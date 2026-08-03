@@ -132,6 +132,88 @@ func TestLogClassificationReasons_SanitizesTerminalEscapes(t *testing.T) {
 	}
 }
 
+// TestLogNearMisses_DedupsByEndpoint verifies near-miss output collapses to one
+// line per endpoint (method+path), matching how the classified half is
+// deduplicated, so repeated below-threshold traffic cannot bury the signal.
+//
+// Scope of what this pins: query-only variants of one endpoint collapse. It does
+// NOT distinguish endpoint-level from line-level dedup, because it cannot today —
+// the near-miss band is [NearMissFloor, threshold) and the only REST confidence
+// in that band is PathHeuristicBoost (0.15; the others are 0.6/0.7/0.8/0.85), so
+// every near-miss for a given method+path renders an identical line either way.
+// The key is endpoint identity so it stays correct if a future signal lands in
+// the band with a different score.
+func TestLogNearMisses_DedupsByEndpoint(t *testing.T) {
+	var buf bytes.Buffer
+	classifiers := []classify.APIClassifier{&classify.RESTClassifier{}}
+	// Three query-only variants of one endpoint, plus a second distinct endpoint.
+	requests := []crawl.ObservedRequest{
+		{Method: "GET", URL: "https://example.com/api/thing"},
+		{Method: "GET", URL: "https://example.com/api/thing?page=1"},
+		{Method: "GET", URL: "https://example.com/api/thing?page=2"},
+		{Method: "GET", URL: "https://example.com/api/other"},
+	}
+	logNearMisses(&buf, classifiers, requests, classify.DefaultConfidenceThreshold)
+
+	out := buf.String()
+	if out == "" {
+		t.Fatal("expected near-miss output")
+	}
+	// One header line plus one line per distinct endpoint (/api/thing, /api/other).
+	body := strings.Split(strings.TrimRight(out, "\n"), "\n")[1:]
+	if len(body) != 2 {
+		t.Errorf("got %d near-miss lines, want 2 (one per endpoint):\n%s", len(body), out)
+	}
+	var thing int
+	for _, ln := range body {
+		if strings.Contains(ln, "/api/thing") {
+			thing++
+		}
+	}
+	if thing != 1 {
+		t.Errorf("endpoint /api/thing produced %d lines, want 1:\n%s", thing, out)
+	}
+}
+
+// TestLogNearMisses_SanitizesTerminalEscapes verifies the near-miss -v output
+// neutralizes control bytes too. Near-miss lines render the same untrusted
+// crawled path as the classified lines, so both share classificationLine and
+// the near-miss path must not become a second, unsanitized route to the
+// operator's terminal (SEC-BE-001, extended to the Phase 1 near-miss output).
+func TestLogNearMisses_SanitizesTerminalEscapes(t *testing.T) {
+	var buf bytes.Buffer
+	classifiers := []classify.APIClassifier{&classify.RESTClassifier{}}
+	// A GET on an api-like path with no captured response and no API Accept
+	// header scores the path boost alone (0.15) — inside the near-miss band
+	// [NearMissFloor, threshold), so it is dropped from the spec but logged.
+	//
+	// The control bytes are percent-encoded, which is how they actually reach
+	// this code: url.Parse REJECTS raw ASCII control characters outright (so a
+	// raw-byte URL would never classify at all), but percent-DECODES %1b/%0a
+	// into raw ESC and newline in u.Path — the decoded form classificationLine
+	// must neutralize.
+	requests := []crawl.ObservedRequest{
+		{Method: "GET", URL: "https://example.com/api/%1b[2J%0aitems"},
+	}
+	logNearMisses(&buf, classifiers, requests, classify.DefaultConfidenceThreshold)
+
+	out := buf.String()
+	if out == "" {
+		t.Fatal("expected a near-miss line for a path-boost-only api-path GET")
+	}
+	if strings.ContainsRune(out, '\x1b') {
+		t.Errorf("raw ESC byte reached terminal output: %q", out)
+	}
+	if !strings.Contains(out, `\x1b`) {
+		t.Errorf("control byte should be escaped as \\x1b: %q", out)
+	}
+	// One header line plus one endpoint line; the path's embedded newline must
+	// not split the record into a third.
+	if got := strings.Count(strings.TrimRight(out, "\n"), "\n"); got != 1 {
+		t.Errorf("path newline was not neutralized (log-splitting), %d line breaks: %q", got, out)
+	}
+}
+
 // TestLogClassificationReasons_NoOutput verifies the no-op guards: a nil writer
 // must not panic, and an empty slice produces no output.
 func TestLogClassificationReasons_NoOutput(t *testing.T) {
@@ -145,5 +227,38 @@ func TestLogClassificationReasons_NoOutput(t *testing.T) {
 	logClassificationReasons(&buf, nil)
 	if buf.Len() != 0 {
 		t.Errorf("empty input should produce no output, got: %q", buf.String())
+	}
+}
+
+// TestLogNearMisses_ReportsRecoveredNextRoutes is the end-to-end half of the
+// Next.js reporting fix. README.md, CLAUDE.md and pkg/analyze/jsstatic/doc.go all
+// state that routes recovered from App Router chunk URLs are surfaced under -v.
+// Asserting the classifier's confidence band is not enough — logNearMisses applies
+// its own floor, so the claim is only true if the route actually reaches this
+// output. It did not: a page route scored 0, below classify.NearMissFloor, so it
+// was filtered out here and the feature produced nothing an operator could see.
+//
+// /vaults/{vaultId} is the case the README leads with. The braces arrive
+// percent-encoded because jsstatic resolves the route through
+// url.ResolveReference, which is the form that actually reaches this code.
+func TestLogNearMisses_ReportsRecoveredNextRoutes(t *testing.T) {
+	var buf bytes.Buffer
+	classifiers := []classify.APIClassifier{&classify.RESTClassifier{}}
+	requests := []crawl.ObservedRequest{
+		{Method: "GET", URL: "https://app.test/vaults/%7BvaultId%7D", Source: crawl.SourceNextPageRoute},
+		{Method: "GET", URL: "https://app.test/api/files", Source: crawl.SourceNextRouteHandler},
+	}
+	logNearMisses(&buf, classifiers, requests, classify.DefaultConfidenceThreshold)
+
+	out := buf.String()
+	for _, want := range []string{"/vaults/{vaultId}", "/api/files"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("recovered route %q is not reported under -v, so the Next.js "+
+				"recovery feature has no observable output for it.\ngot:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, "next-route-chunk") {
+		t.Errorf("the -v line must name chunk-URL provenance as the reason, so an "+
+			"operator can tell a recovered route from a genuine weak-signal endpoint.\ngot:\n%s", out)
 	}
 }

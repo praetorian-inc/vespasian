@@ -15,6 +15,8 @@
 package pipeline
 
 import (
+	"math"
+
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/probe"
@@ -29,10 +31,78 @@ const (
 	APITypeGRPC    = "grpc"
 )
 
+// Dominance rule constants for DetectAPIType (LAB-4678).
+const (
+	// MinChallengerMatches is the absolute floor a non-REST type must clear before
+	// it can take the verdict. It is 1: the floor's job is only to stop a type with
+	// zero votes from winning, which matters when restCount is 0 and the margin term
+	// below is therefore also 0.
+	//
+	// It is deliberately NOT the defense against a weak minority signal, and the
+	// previous version of this comment claiming otherwise is what let a real defect
+	// ship. It argued the floor was safe at 1 because "a lone text/xml response
+	// scores higher on REST than on WSDL and is therefore never a WSDL vote".
+	// Measured, the opposite held: WSDL scored 0.85 against REST's 0.80, so the
+	// request WAS a WSDL vote, (rest=0, wsdl=1) cleared this floor, and a single XML
+	// response typed an entire capture as SOAP.
+	//
+	// The actual defense is that classifiers score honestly, which is enforced where
+	// the scores are produced rather than here: classify.GenericXMLConfidence puts
+	// bare text/xml below both the threshold and REST. TestWSDL_GenericXMLIsNotASoapVote
+	// pins the ordering and TestDetectAPIType_GenericXMLDoesNotTypeTheCapture pins the
+	// end-to-end verdict, so a future classifier change that re-inverts them fails a
+	// test rather than an argument in a comment.
+	MinChallengerMatches = 1
+
+	// DominanceMargin is how far a challenger must exceed the REST tally to win.
+	// A challenger needs count >= ceil(restCount * DominanceMargin), so the
+	// verdict does not sit on a knife edge where one more or one fewer captured
+	// request flips the whole generator.
+	DominanceMargin = 1.5
+
+	// scoreEpsilon absorbs floating-point accumulation error when comparing two
+	// classifier confidences for the tie-break below. Confidences are built by
+	// addition — RESTClassifier reaches 0.95 as 0.8 + 0.15, which evaluates to
+	// 0.9500000000000001 — so a specialist scoring a literal 0.95 would lose an
+	// intended tie by 1e-16. Comparing within this tolerance makes the tie-break
+	// depend on the intended score, not on the order the score was summed in.
+	scoreEpsilon = 1e-9
+)
+
+// atLeast reports whether a is greater than or equal to b within scoreEpsilon.
+func atLeast(a, b float64) bool { return a >= b-scoreEpsilon }
+
 // DetectAPIType runs lightweight classification against all three API types and
-// picks the winner. GraphQL wins when it has matches and at least as many as
-// both others. WSDL wins when it has matches and at least as many as REST.
-// Otherwise REST is returned.
+// picks the dominant surface. GraphQL is resolved first, then WSDL; REST is the
+// default and the fallback.
+//
+// Each request votes for at most ONE type: the classifier that scores it highest
+// at or above threshold, with REST winning ties. Previously every classifier that
+// matched a request counted it, so a single SOAP envelope incremented both the
+// WSDL tally (0.90) and the REST tally (0.80). That double-counting is what made
+// the tallies incomparable — a challenger could never out-count a REST surface
+// that included all of the challenger's own requests — and it is why the old rule
+// had to fall back to >= ties, which is what put the verdict on a knife edge.
+//
+// A challenger type (GraphQL, WSDL) then takes the verdict only when it clears
+// BOTH MinChallengerMatches and the DominanceMargin over REST — see challengerWins.
+//
+// Why not a plain count comparison (the pre-LAB-4678 rule): comparing raw counts
+// with >= ties put the verdict on a knife edge. (rest=10, gql=10) typed the app
+// GraphQL while (rest=11, gql=10) typed it REST, so a single extra or missing
+// observation switched the generator and the whole emitted spec. Truncated and
+// timing-variant captures move counts by exactly that much, which is the
+// run-to-run verdict instability this ticket targets. That rule also let
+// (rest=0, wsdl=1) emit a WSDL spec off one stray text/xml.
+//
+// Why not presence-wins: an earlier LAB-4678 Phase 3 attempt made GraphQL/WSDL
+// win on having any match at all. It was reverted because it flipped the type on
+// weak minority signals and discarded the dominant REST surface of mixed apps.
+//
+// The floor-plus-margin rule keeps dominant-surface selection — a genuinely
+// GraphQL-dominant capture still wins — while being robust to the ±1 observation
+// variance that made the old rule unstable, and it fixes the lone-signal case
+// that caused the revert.
 //
 // Note: this performs a lightweight classification pass separate from the full
 // RunClassifiers call inside ClassifyProbeGenerate. The duplication is
@@ -44,29 +114,77 @@ func DetectAPIType(requests []crawl.ObservedRequest, threshold float64) string {
 	restClassifier := &classify.RESTClassifier{}
 	graphqlClassifier := &classify.GraphQLClassifier{}
 
+	// score returns the classifier's confidence when it both matches and clears
+	// the threshold, else 0 — so a sub-threshold match cannot win the argmax.
+	score := func(c classify.APIClassifier, req crawl.ObservedRequest) float64 {
+		if isAPI, confidence := c.Classify(req); isAPI && confidence >= threshold {
+			return confidence
+		}
+		return 0
+	}
+
 	var wsdlCount, restCount, graphqlCount int
 	for _, req := range requests {
-		if isAPI, confidence := wsdlClassifier.Classify(req); isAPI && confidence >= threshold {
-			wsdlCount++
-		}
-		if isAPI, confidence := restClassifier.Classify(req); isAPI && confidence >= threshold {
-			restCount++
-		}
-		if isAPI, confidence := graphqlClassifier.Classify(req); isAPI && confidence >= threshold {
+		restScore := score(restClassifier, req)
+		wsdlScore := score(wsdlClassifier, req)
+		graphqlScore := score(graphqlClassifier, req)
+
+		// Exclusive assignment: the request votes once, for its strongest type.
+		// Ties go to the SPECIALIST (GraphQL, then WSDL) rather than to REST,
+		// because REST is the generic shape every specialized request also has.
+		// A GraphQL call is always additionally "a JSON POST", and /graphql is
+		// itself in the REST path allowlist, so REST ties GraphQL at 0.95 on a
+		// textbook GraphQL request; giving that tie to REST would make GraphQL
+		// undetectable. REST still takes every request no specialist scores at
+		// least as highly, and remains the fallback when nothing matches.
+		switch {
+		case graphqlScore > 0 && atLeast(graphqlScore, restScore) && atLeast(graphqlScore, wsdlScore):
 			graphqlCount++
+		case wsdlScore > 0 && atLeast(wsdlScore, restScore):
+			wsdlCount++
+		case restScore > 0:
+			restCount++
 		}
 	}
 
-	// GraphQL wins when it has matches and at least as many as both others.
-	if graphqlCount > 0 && graphqlCount >= wsdlCount && graphqlCount >= restCount {
+	// GraphQL is resolved first: it must dominate REST and be AT LEAST AS MANY as
+	// WSDL, so a SOAP-heavy capture with a handful of GraphQL-ish requests stays
+	// WSDL. A GraphQL/WSDL tie resolves to GraphQL, matching the tie-to-GraphQL
+	// ordering of the per-request argmax above; stating it as "out-count WSDL"
+	// described a stricter rule than the >= implements (LAB-4678 review, QUAL-001).
+	if challengerWins(graphqlCount, restCount) && graphqlCount >= wsdlCount {
 		return APITypeGraphQL
 	}
-	// WSDL wins when it has at least one match and at least as many as REST
-	// (ties favor WSDL). GraphQL is already resolved above.
-	if wsdlCount > 0 && wsdlCount >= restCount {
+	// WSDL next. GraphQL is already resolved above.
+	if challengerWins(wsdlCount, restCount) {
 		return APITypeWSDL
 	}
 	return APITypeREST
+}
+
+// challengerWins reports whether a non-REST type with challengerCount matches
+// beats a REST surface of restCount matches. It requires an absolute floor and a
+// relative margin; see the DetectAPIType doc comment for why both are needed.
+//
+// With restCount == 0 the margin term is 0 and the floor alone decides, so a
+// capture containing only challenger-typed requests takes that type. That is
+// correct: there is no dominant REST surface to discard.
+//
+// Which mechanism stops the failure the earlier revert cited — one stray text/xml
+// retyping a mostly-REST app — depends on restCount, and it is worth being precise
+// because these constants get tuned. When REST has votes, the MARGIN stops it: at
+// rest=20 a challenger needs 30, so a single stray cannot flip anything. When
+// restCount is 0 the margin term is 0 and stops nothing; there, EXCLUSIVE ASSIGNMENT
+// in DetectAPIType is what does the work — a lone text/xml response scores higher on
+// REST (0.8, an exact apiContentTypes entry) than on WSDL, so it is a REST vote and
+// the capture is (rest=1, wsdl=0) rather than (rest=0, wsdl=1). Neither the floor nor
+// the margin is load-bearing for that case.
+func challengerWins(challengerCount, restCount int) bool {
+	if challengerCount < MinChallengerMatches {
+		return false
+	}
+	required := int(math.Ceil(float64(restCount) * DominanceMargin))
+	return challengerCount >= required
 }
 
 // ClassifiersForType returns the appropriate classifiers for the given API type.

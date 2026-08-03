@@ -32,13 +32,48 @@
 //     JSON body ({"a": null, "b": null}) so the existing
 //     pkg/generate/rest.InferSchema produces an object schema downstream.
 //
+// # Next.js App Router routes
+//
+// Body extraction only finds paths that exist as literals. React Server
+// Components and Server Actions build their request paths at runtime, so an RSC
+// bundle can contain no API path at all — a marker scan of one real 44-bundle
+// capture found zero.
+//
+// The route is still recoverable, because the App Router names each page and
+// route-handler chunk after the route's own directory:
+//
+//	/_next/static/chunks/app/vaults/%5BvaultId%5D/page-8ca1aac6111f15fc.js
+//	  -> /vaults/{vaultId}
+//
+// nextroute.go derives routes from those URLs independently of the body, so it
+// works on bundles that yield nothing to jsluice and on bundles whose parse
+// fails outright. Route groups, parallel-route slots, private folders and
+// intercepting prefixes are dropped; dynamic and catch-all segments become
+// OpenAPI {param} form. Server-action endpoints remain unrecoverable statically.
+//
 // # Source tagging
 //
-// Each synthesized [crawl.ObservedRequest] carries Source = "static:js" or
-// "static:js-sourcemap". The OpenAPI generator strips the "static:" prefix
-// when emitting the x-vespasian-source extension on each operation
-// ("static:js" -> "js-bundle", "static:js-sourcemap" -> "js-sourcemap";
-// any dynamic-source group resolves to "dynamic", which wins on mixed groups).
+// Each synthesized [crawl.ObservedRequest] carries one of Source = "static:js",
+// "static:js-sourcemap", "static:js-nextroute" (an App Router route handler) or
+// "static:js-nextpage" (an App Router page route). Neither Next.js tag carries an
+// API signal: the chunk URL proves the path is served but not which verbs the
+// route exports, so recovered routes surface as sub-threshold near-misses under
+// -v rather than as invented operations in the spec.
+//
+// pkg/classify enforces that with two independent things, and both are needed.
+// Rule 7 reports isAPI=false, which is what keeps the route out of the spec: it is
+// the gate RunClassifiers applies and NearMisses ignores, so it holds at every
+// --confidence value. Rule 7 also scores the route at NextRouteProvenanceConfidence,
+// pinned to classify.NearMissFloor, which is what keeps it VISIBLE under -v.
+// Scoring alone was not enough — --confidence is an operator flag, and at 0.1 the
+// routes classified and the generator emitted a guessed `get`. Scoring 0 is equally
+// wrong: it drops the route below the near-miss floor and it appears nowhere at
+// all, which is what happened to every route off the /api/ path allowlist,
+// /vaults/{vaultId} included.
+// The OpenAPI generator strips the "static:" prefix when emitting the
+// x-vespasian-source extension on each operation ("static:js" -> "js-bundle",
+// "static:js-sourcemap" -> "js-sourcemap"; any dynamic-source group resolves to
+// "dynamic", which wins on mixed groups).
 //
 // # Security and Operator Considerations
 //

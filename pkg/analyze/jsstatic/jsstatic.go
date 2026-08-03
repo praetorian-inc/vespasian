@@ -15,9 +15,11 @@
 package jsstatic
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -324,6 +326,17 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	var result perBundleResult
 	body := req.Response.Body
 
+	// Next.js App Router route recovery (LAB-4678 audit item 7). Derived from the
+	// bundle URL, not its body, so it runs before body extraction and still
+	// applies to bundles whose parse times out or panics below. See nextroute.go
+	// for why the URL carries the route.
+	if ep := extractNextRoute(req.URL, req.PageURL); ep != nil {
+		result.stats.EndpointsFound++
+		synth := toRequests([]ExtractedEndpoint{*ep}, req.URL)
+		result.requests = append(result.requests, synth...)
+		result.stats.EndpointsKept += len(synth)
+	}
+
 	// Sourcemap recovery (ctx propagated for remote fetch cancellation).
 	smSources, smStats := recoverSourcemap(ctx, body, req.URL, opts)
 	result.stats.SourcemapFetchFails += smStats.SourcemapFetchFails
@@ -393,6 +406,60 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	}
 
 	return result
+}
+
+// synthesizedLess is the deterministic ordering for synthesized static:js
+// entries (LAB-4678 Phase 2): URL, then method, then source tag, then request
+// body, then page URL, then headers. Kept as a named helper so Analyze stays
+// under the cyclomatic gate.
+//
+// The keys are exactly the fields [toRequests] populates, which is what makes this
+// a total order over synthesized entries: any two distinct entries differ in at
+// least one of them. The final tiebreakers matter — without them, entries equal on
+// the earlier keys compare equal and sort.SliceStable preserves their
+// worker-completion order, which is nondeterministic, leaving exactly the ordering
+// variance this sort exists to remove. The previous final key was QueryParams,
+// which toRequests never sets, so PageURL- and Headers-only differences fell
+// through to worker order.
+func synthesizedLess(a, b crawl.ObservedRequest) bool {
+	if a.URL != b.URL {
+		return a.URL < b.URL
+	}
+	if a.Method != b.Method {
+		return a.Method < b.Method
+	}
+	if a.Source != b.Source {
+		return a.Source < b.Source
+	}
+	if c := bytes.Compare(a.Body, b.Body); c != 0 {
+		return c < 0
+	}
+	if a.PageURL != b.PageURL {
+		return a.PageURL < b.PageURL
+	}
+	return headerKey(a.Headers) < headerKey(b.Headers)
+}
+
+// headerKey renders a header map as a canonical, comparable string: entries sorted
+// by name, joined as "name:value". Used only as a sort tiebreaker, so it needs to
+// be stable and total, not parseable.
+func headerKey(h map[string]string) string {
+	if len(h) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(h))
+	for k := range h {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, k := range names {
+		b.WriteString(k)
+		b.WriteByte(':')
+		b.WriteString(h[k])
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 // Analyze runs static analysis on every JS body in captured. It returns a
@@ -509,6 +576,18 @@ func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options
 	if abandoned := len(bundles) - workerProcessed; abandoned > 0 {
 		stats.BundlesAbandonedOnCancel = abandoned
 	}
+
+	// Sort the synthesized entries into a deterministic order (LAB-4678 Phase 2).
+	// The worker pool fans results into resultCh in completion order, which is
+	// non-deterministic across runs, so without this the appended static:js
+	// entries would be ordered by worker scheduling. Downstream dedup/generate
+	// are order-independent for the retained data, but ordering the synthesized
+	// block here makes jsstatic's own output a deterministic function of the
+	// capture rather than relying on those downstream sorts. Key: URL, method,
+	// source tag, then request body.
+	sort.SliceStable(synthesized, func(i, j int) bool {
+		return synthesizedLess(synthesized[i], synthesized[j])
+	})
 
 	// Build result: original captured first, synthesized appended after.
 	out := make([]crawl.ObservedRequest, len(captured), len(captured)+len(synthesized))
