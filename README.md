@@ -508,13 +508,11 @@ make clean       # Remove build artifacts
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/my-feature`)
-3. Commit your changes (`git commit -am 'Add my feature'`)
-4. Push to the branch (`git push origin feature/my-feature`)
-5. Open a Pull Request
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, project layout, how to add a classifier, generator, importer, or probe strategy, and the commit and pull request conventions.
 
-Please ensure all CI checks pass before requesting review.
+In short: fork the repository, create a feature branch, make sure `make check` passes, and open a Pull Request. Note that `make check` reformats as well as validates — it runs `gofmt -s -w .` first, so it may modify your working tree.
+
+This project is governed by our [Code of Conduct](CODE_OF_CONDUCT.md). Security vulnerabilities should be reported per [SECURITY.md](SECURITY.md) rather than as public issues.
 
 ## License
 
