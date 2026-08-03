@@ -21,18 +21,9 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
-// toRequests converts a slice of ExtractedEndpoint into crawl.ObservedRequest
-// values. captureURL is the URL of the JS bundle that was analyzed; it is used
-// to resolve relative endpoint URLs to absolute form.
-//
-// Rules:
-//   - Source is taken directly from ExtractedEndpoint.SourceTag.
-//   - If BodyFields is non-empty, a synthetic JSON body is constructed as
-//     {"field": null, ...} with keys sorted lexicographically. This lets
-//     pkg/generate/rest.InferSchema produce a real object schema.
-//   - GET requests (and any method with zero BodyFields) receive a nil Body.
-//   - Content-Type header is added when ExtractedEndpoint.ContentType is set.
-//   - PageURL is propagated from ExtractedEndpoint.PageURL.
+// toRequests converts endpoints to requests, resolving relative URLs against
+// captureURL. BodyFields become a synthetic {"field": null} body so
+// rest.InferSchema produces a real object schema; no fields means a nil body.
 func toRequests(endpoints []ExtractedEndpoint, captureURL string) []crawl.ObservedRequest {
 	if len(endpoints) == 0 {
 		return nil
@@ -53,9 +44,7 @@ func toRequests(endpoints []ExtractedEndpoint, captureURL string) []crawl.Observ
 			PageURL: ep.PageURL,
 		}
 
-		// Resolve URL: absolute URLs are preserved; relative URLs are resolved
-		// against PageURL first (document-relative paths), falling back to the
-		// bundle URL when PageURL is empty or unparseable.
+		// PageURL first for document-relative paths, then the bundle URL.
 		base := bundleBase
 		if ep.PageURL != "" {
 			if pageBase, err := url.Parse(ep.PageURL); err == nil && pageBase.Host != "" {
@@ -64,12 +53,10 @@ func toRequests(endpoints []ExtractedEndpoint, captureURL string) []crawl.Observ
 		}
 		req.URL = resolveURL(ep.URL, base)
 
-		// Synthesize JSON body when BodyFields are present.
 		if len(ep.BodyFields) > 0 {
 			req.Body = synthBody(ep.BodyFields)
 		}
 
-		// Add Content-Type header when set.
 		if ep.ContentType != "" {
 			req.Headers = map[string]string{"Content-Type": ep.ContentType}
 		}
@@ -79,8 +66,7 @@ func toRequests(endpoints []ExtractedEndpoint, captureURL string) []crawl.Observ
 	return reqs
 }
 
-// resolveURL resolves rawURL relative to base. If rawURL is already absolute
-// or base is nil, rawURL is returned unchanged.
+// resolveURL returns rawURL unchanged when it is absolute or base is nil.
 func resolveURL(rawURL string, base *url.URL) string {
 	if base == nil {
 		return rawURL
@@ -95,16 +81,11 @@ func resolveURL(rawURL string, base *url.URL) string {
 	return base.ResolveReference(ref).String()
 }
 
-// synthBody marshals a map of field-name → nil into a JSON object byte slice.
-// Returns nil when fields is empty.
+// synthBody marshals field->nil into a JSON object; nil when fields is empty.
 //
-// Output is deterministic: encoding/json marshals map[string]interface{} with
-// keys in sorted order, which is guaranteed by the Go specification ("The map
-// keys are sorted and used as JSON object keys" —
-// https://pkg.go.dev/encoding/json#Marshal). This guarantee holds regardless
-// of the order of the input fields slice. In practice the current callers
-// (collectObjectKeys) already return fields in sorted order, but that is a
-// caller-side convention, not a correctness requirement here.
+// Deterministic whatever order fields arrives in: encoding/json sorts map keys
+// ("The map keys are sorted and used as JSON object keys" —
+// https://pkg.go.dev/encoding/json#Marshal), so callers need not pre-sort.
 func synthBody(fields []string) []byte {
 	if len(fields) == 0 {
 		return nil

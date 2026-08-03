@@ -13,45 +13,34 @@
 // limitations under the License.
 
 // Package jsstatic statically analyses JavaScript bundles to recover API
-// endpoints, methods, path parameters, and request-body field names.
+// endpoints, methods, path parameters and request-body field names. It runs
+// between capture and classify/generate, returning the input captures with
+// synthesized [crawl.ObservedRequest] entries appended.
 //
-// It is invoked between the capture stage (pkg/crawl, pkg/importer) and the
-// classify/generate stages (pkg/classify, pkg/generate). It returns the input
-// captures unchanged, with newly synthesized [crawl.ObservedRequest] entries
-// appended (Source = "static:js" or "static:js-sourcemap").
-//
-// The analyser is a thin wrapper over BishopFox/jsluice's tree-sitter URL
-// matchers, with two extensions over the upstream library:
-//
-//   - "EXPR" placeholders in URL paths are normalised to OpenAPI {param}
-//     form using the names of the original template-literal identifiers when
-//     they can be recovered.
-//   - For fetch(url, {body: JSON.stringify({a, b})}) and axios.<m>(url, {a, b})
-//     calls, the names of the top-level keys of the object literal are
-//     captured as body parameter names. They are emitted as a synthesized
-//     JSON body ({"a": null, "b": null}) so the existing
-//     pkg/generate/rest.InferSchema produces an object schema downstream.
+// It wraps BishopFox/jsluice's tree-sitter URL matchers with two extensions:
+// "EXPR" placeholders become OpenAPI {param} using the original template-literal
+// identifiers where recoverable, and the top-level keys of a fetch/axios body
+// object are emitted as a synthetic JSON body ({"a": null}) so
+// rest.InferSchema produces a real object schema.
 //
 // # Source tagging
 //
-// Each synthesized [crawl.ObservedRequest] carries Source = "static:js" or
-// "static:js-sourcemap". The OpenAPI generator strips the "static:" prefix
-// when emitting the x-vespasian-source extension on each operation
-// ("static:js" -> "js-bundle", "static:js-sourcemap" -> "js-sourcemap";
-// any dynamic-source group resolves to "dynamic", which wins on mixed groups).
+// Entries carry Source="static:js" or "static:js-sourcemap". The OpenAPI
+// generator strips the prefix for x-vespasian-source ("js-bundle",
+// "js-sourcemap"); any dynamic source in a group wins over both.
 //
-// # Security and Operator Considerations
+// # Security
 //
-// When analyzing attacker-controlled JavaScript bundles (i.e., when the crawled
-// application serves malicious content), enabling --analyze-js carries a bounded
-// resource-exhaustion risk. The underlying jsluice/tree-sitter parser is not
-// context-aware: if it hangs on adversarial input, the per-bundle goroutine will
-// remain in-flight until jsluice returns (it cannot be canceled). Per-bundle and
-// per-source timeouts (PerBundleTimeout, default 5s) bound wait time per input,
-// but a bundle that causes the parser to deadlock will leak that goroutine for
-// the duration of the process. The worst-case number of leaked goroutines is
-// Concurrency × (1 + N) where N is the number of sourcesContent entries in
-// a recovered sourcemap. Operators analyzing untrusted bundles in long-running
-// processes should be aware of this residual risk; process isolation (running
-// vespasian per-target with a wall-clock timeout) is the recommended mitigation.
+// Against attacker-controlled bundles, --analyze-js carries a bounded
+// resource-exhaustion risk. jsluice/tree-sitter is not context-aware, so a
+// goroutine inside it cannot be canceled. PerBundleTimeout (default 5s) bounds
+// each input separately — the bundle and every sourcemap source — so one bundle
+// can hold a worker for (1+N) x PerBundleTimeout, and a bundle that deadlocks the
+// parser leaks its goroutine for the life of the process.
+//
+// Concurrency does not bound the leak: it caps how many extractions run at once,
+// while a worker that times out moves on, so leaks accumulate one per timed-out
+// extraction across the run — worst case one for every bundle plus every
+// sourcemap source. For long-running processes over untrusted input, process
+// isolation, vespasian per target under a wall-clock timeout, is the mitigation.
 package jsstatic

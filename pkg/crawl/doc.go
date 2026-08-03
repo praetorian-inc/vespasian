@@ -12,122 +12,83 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package crawl captures HTTP traffic from web applications and exposes it as
-// [ObservedRequest] values. Two crawler backends are available, selected via
-// [CrawlerOptions.Headless]:
+// Package crawl captures HTTP traffic and exposes it as [ObservedRequest] values.
+// Two backends, selected by [CrawlerOptions.Headless]:
 //
-// Headless mode ([RodCrawler], default): uses [go-rod] to drive concurrent
-// Chrome tabs. All outbound requests—XHR, fetch, dynamically constructed
-// JavaScript calls—are intercepted via Chrome DevTools Protocol network
-// listeners. This is the correct choice for single-page applications and any
-// site that requires JavaScript execution. External .js bundles are fetched by
-// the browser itself; this path does not perform separate JS file retrieval.
+// Headless ([RodCrawler], default) drives concurrent Chrome tabs via [go-rod] and
+// intercepts every outbound request through CDP network listeners. Required for
+// SPAs. The browser fetches .js bundles itself.
 //
-// Browser binary (LAB-4999): the headless path pins a local Chrome via
-// [BrowserOptions.ChromePath] when set, otherwise the system browser resolved
-// by go-rod's launcher.LookPath. It does not, by default, let go-rod
-// auto-download a Chromium from third-party mirrors (a supply-chain risk and a
-// source of nondeterministic egress). When no system browser is found it
-// errors, unless downloads are explicitly opted in via
-// [BrowserOptions.AllowBrowserDownload]
-// or the VESPASIAN_ALLOW_BROWSER_DOWNLOAD=true environment variable (intended
-// for local dev on platforms without a system Chrome). The launcher also sets
-// Chrome telemetry/phone-home-disabling flags so crawl egress stays minimal.
+// Non-headless ([HTTPCrawler]) uses net/http with a DFS frontier, a 150 req/s
+// limiter and a 10 MB per-page read cap. goquery parses each page once with the
+// same link selectors as the headless path; jsluice reads inline <script> blocks.
 //
-// Non-headless mode ([HTTPCrawler]): uses the Go stdlib net/http client with a
-// depth-first search frontier, 150 req/s rate limiter, and a 10 MB per-page
-// read cap. HTML pages are parsed with goquery (single parse per page) using
-// the same link selectors as the headless path; inline <script> blocks are
-// analyzed with jsluice to surface additional endpoints. Redirect chains are
-// validated by a scope+SSRF guard (redirectScopeGuard, defense-in-depth) and
-// the authoritative DNS-rebinding control is ssrfSafeDialContext, which
-// re-resolves the host at connect time: redirects and connections that target
-// private/link-local addresses (e.g. 169.254.169.254) are blocked.
+// # Browser binary (LAB-4999)
 //
-// Proxy support (LAB-4011): both backends honor [CrawlerOptions.Proxy]
-// (http/https/socks5), validated by [ValidateProxyAddr]. On the HTTP path the
-// proxy is wired into the transport via http.ProxyURL. Two consequences follow
-// from routing through an intercepting proxy (Burp, mitmproxy):
-//   - TLS certificate verification stays ON by default. For an http/https
-//     intercepting proxy it can be disabled (InsecureSkipVerify) only by the
-//     explicit opt-in [CrawlerOptions.ProxyInsecure] (--proxy-insecure), so the
-//     proxy's own MITM certificate is accepted. This opt-in applies to the HTTP
-//     backend only; on the headless path Chrome validates against the OS trust
-//     store, so the operator must trust the proxy CA out-of-band and
-//     --proxy-insecure has no effect there. For socks5 proxies the Go client
-//     does TLS directly with the target through the tunnel, so verification is
-//     always kept regardless of ProxyInsecure.
-//   - The dial-time SSRF pin (ssrfSafeDialContext) is NOT installed for proxy
-//     connections: the client dials the proxy (commonly loopback), not the
-//     target, so pinning the dialed IP would block the proxy and gives no
-//     target protection. The upfront scopeChecker SSRF check and
-//     redirectScopeGuard still confine targets at the URL level, so crawling a
-//     private target through a proxy still requires AllowPrivate. DNS-rebinding
-//     protection at the target is delegated to the trusted proxy.
+// The headless path pins [BrowserOptions.ChromePath] or the system browser from
+// launcher.LookPath, and will NOT let go-rod auto-download a Chromium from
+// third-party mirrors — a supply-chain risk and nondeterministic egress. With no
+// system browser it errors unless [BrowserOptions.AllowBrowserDownload] or
+// VESPASIAN_ALLOW_BROWSER_DOWNLOAD=true opts in, for dev platforms with no Chrome
+// build. It also sets telemetry-disabling launch flags.
 //
-// The headless ([RodCrawler]) path relies on Chrome's own networking stack for
-// DNS resolution and does NOT have a Go dial-time IP pin. The upfront
-// scopeChecker SSRF check applies, but Chrome-resolved addresses are not
-// re-validated at dial time (known limitation; see crawlHeadless).
+// # SSRF
 //
-// Page budget (LAB-4678): [CrawlerOptions.MaxPages] limits the number of pages
-// (distinct URLs visited), not captured requests — a single SPA page can fire
-// dozens of XHR/fetch calls, so counting requests truncated the crawl far
-// earlier than "max pages" implies. Each worker reserves a page slot under a
-// mutex before navigating, so the cap is exact and the crawl never overshoots
-// MaxPages. Reaching the budget does NOT cancel the shared browser context:
-// workers stop taking new pages, while pages already in flight complete their
-// normal bounded visit and emit all of their captured requests, rather than
-// being killed mid-capture.
+// On the HTTP path ssrfSafeDialContext is authoritative: it re-resolves at connect
+// time, so redirects and connections to private or link-local addresses
+// (169.254.169.254) are blocked. redirectScopeGuard is defense in depth.
 //
-// The package also defines the capture file format: a JSON array of
-// ObservedRequest structs that serves as the interchange format between the
-// capture stage (crawl or import) and the generation stage.
+// The headless path has NO Go dial-time pin — Chrome resolves DNS itself, so only
+// the upfront scopeChecker check applies and Chrome-resolved addresses are never
+// re-validated. Known limitation; see crawlHeadless.
 //
-// After the headless crawl, the package runs a post-crawl JS extraction
-// step that scans response bodies of JavaScript bundles for API path
-// strings and probes them with raw HTTP requests. This recovers endpoints
-// that the headless browser cannot exercise (paths gated behind user
-// interactions or built from runtime string concatenations) and bypasses
-// SPA catch-all routing that would otherwise return index.html instead of
-// API responses. The extractor recognizes quoted-string paths, template
-// literals, full URLs, literal+literal `+` service-prefix concatenations,
-// and identifier-bearing concatenations using either String.prototype.concat
-// or the `+` operator (LAB-1368) — the last form reconstructs a path by
-// substituting a numeric sentinel for non-literal operands so the result is
-// probeable and the REST normalizer can parameterize it.
+// # Proxy support (LAB-4011)
 //
-// Key types:
-//   - [Crawler] is the common interface satisfied by [RodCrawler], [HTTPCrawler],
-//     and [FakeCrawler]. Use [NewCrawler] to obtain the right implementation.
-//   - [RodCrawler] is the headless go-rod backend (Chrome required).
-//   - [HTTPCrawler] is the non-headless stdlib net/http backend (DFS, 150 rps,
-//     10 MB read cap, scope+SSRF redirect guard).
-//   - [FakeCrawler] is a test double that returns a pre-configured slice of
-//     [ObservedRequest] values with no network activity.
-//   - [BrowserManager] manages Chrome process lifecycle, including proxy
-//     configuration and graceful shutdown (headless path only).
-//   - [ValidateProxyAddr] validates a proxy address (http/https/socks5, host
-//     required, no embedded credentials) for both backends.
-//   - [ObservedRequest] and [ObservedResponse] represent captured HTTP traffic.
-//   - [JSReplayConfig] and [ReplayJSExtracted] implement the post-crawl JS
-//     bundle scanning step. The replay step enforces a same-origin gate
-//     (auth headers and probes are restricted to the scan target's origin
-//     by default) and uses [github.com/praetorian-inc/vespasian/pkg/ssrf]
-//     for SSRF protection unless the operator explicitly opts out via
-//     AllowPrivate.
+// Both backends honor [CrawlerOptions.Proxy] (http/https/socks5, validated by
+// [ValidateProxyAddr]). Two consequences of routing through an intercepting proxy:
 //
-// Session-cookie helpers (LAB-2222) let callers bootstrap Chrome's cookie
-// store from a user-supplied Cookie header so subsequent navigations are
-// authenticated. Callers typically extract a Cookie header from their input
-// headers, convert it to CDP cookie parameters for the target origin, and
-// set those on the browser before navigation:
-//   - [ExtractCookieHeader] separates Cookie values (case-insensitively)
-//     from the remaining headers, returning a concatenated cookie string
-//     and a map of the non-cookie headers.
-//   - [ParseCookiesToParams] converts a Cookie header value into CDP
-//     [proto.NetworkCookieParam] entries scoped to the target URL's host
-//     and scheme. Rejects non-http(s) or hostless target URLs.
+//   - TLS verification stays ON. [CrawlerOptions.ProxyInsecure]
+//     (--proxy-insecure) disables it for an http/https MITM proxy, HTTP backend
+//     only: the headless path validates against the OS trust store, so trust the
+//     proxy CA out of band there. socks5 always verifies, since the Go client does
+//     TLS to the target through the tunnel.
+//   - No dial-time SSRF pin is installed for proxy connections: the client dials
+//     the proxy, usually loopback, so pinning would block the proxy and protect
+//     nothing. URL-level scope still applies, so a private target still needs
+//     AllowPrivate, and rebinding protection is delegated to the proxy.
+//
+// # Page budget (LAB-4678)
+//
+// [CrawlerOptions.MaxPages] counts pages, not captured requests — one SPA page
+// fires dozens of XHR calls. Workers reserve a slot before navigating, so the cap
+// is exact, and reaching it does NOT cancel the browser context: in-flight pages
+// finish their bounded visit and emit everything they captured.
+//
+// # JS replay
+//
+// After a headless crawl, [ReplayJSExtracted] scans captured JS bundles for API
+// path strings and probes them over raw HTTP, recovering endpoints the browser
+// cannot exercise: paths gated behind interaction, paths built by runtime
+// concatenation, and paths a browser can only reach by navigating, where an SPA
+// serves its shell instead. Raw HTTP does not escape a server-side catch-all,
+// though: a wrong path still returns that shell, which is why fetchJSBodyHop
+// filters HTML.
+//
+// Recognized forms are quoted paths, template literals, full URLs,
+// literal+literal `+` prefixes, and identifier-bearing concatenation via
+// String.prototype.concat or `+` (LAB-1368) — the last substitutes a numeric
+// sentinel for non-literal operands so the path stays probeable and
+// parameterizable. Runs under a same-origin gate and pkg/ssrf unless AllowPrivate.
+//
+// # Session cookies (LAB-2222)
+//
+// [ExtractCookieHeader] pulls the Cookie header out, [ParseCookiesToParams]
+// converts it, and the result is set on the browser before navigating. Cookies
+// must go through the CDP Storage domain rather than Network.setExtraHTTPHeaders:
+// only those survive redirects, new tabs and page-initiated fetch().
+//
+// The package also defines the capture format: a JSON array of ObservedRequest,
+// the interchange between the capture and generation stages.
 //
 // [go-rod]: https://github.com/go-rod/rod
 package crawl

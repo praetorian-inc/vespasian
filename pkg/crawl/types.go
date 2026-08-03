@@ -22,45 +22,31 @@ type ObservedRequest struct {
 	QueryParams map[string][]string `json:"query_params,omitempty"`
 	Body        []byte              `json:"body,omitempty"`
 	Response    ObservedResponse    `json:"response"`
-	// Source identifies the channel the request was observed on. Known values:
-	//
-	//   - "katana", "browser"            (live crawl, see pkg/crawl)
-	//   - "form"                         (form submission, see pkg/crawl)
-	//   - "import:burp", "import:har",
-	//     "import:mitmproxy"             (offline imports, see pkg/importer)
-	//   - "static:html"                  (static analysis of HTML <form> elements, pkg/analyze)
-	//   - "static:js"                    (static analysis of JS bundles, pkg/analyze/jsstatic)
-	//   - "static:js-sourcemap"          (recovered via .js.map sourcesContent)
+	// Known values: "katana", "browser", "http", "form" (live crawl); "import:burp",
+	// "import:har", "import:mitmproxy"; "static:html" (pkg/analyze); "static:js",
+	// "static:js-sourcemap" (pkg/analyze/jsstatic).
 	Source    string `json:"source"`
 	Tag       string `json:"tag,omitempty"`
 	Attribute string `json:"attribute,omitempty"`
 	PageURL   string `json:"page_url,omitempty"`
 }
 
-// Canonical Source values for static-analysis-derived requests. These live in
-// pkg/crawl because Source is a field of ObservedRequest (defined here) and the
-// values form a shared vocabulary across packages: pkg/analyze/jsstatic writes
-// them and pkg/generate/rest reads them to derive the x-vespasian-source
-// OpenAPI extension. Defining them here keeps the producer and consumer in
-// sync without either package having to import the other.
+// Here rather than in a producer package: jsstatic writes these and
+// pkg/generate/rest reads them for the x-vespasian-source extension, so this keeps
+// them in sync without either importing the other.
 const (
-	// SourceStaticJS marks a request synthesized from static analysis of a JS bundle.
-	SourceStaticJS = "static:js"
-	// SourceStaticJSSourcemap marks a request synthesized from a recovered .js.map source.
+	SourceStaticJS          = "static:js"
 	SourceStaticJSSourcemap = "static:js-sourcemap"
 )
 
-// IsJSStaticSource returns true iff source is one of the JS-bundle
-// static-analysis Source values (SourceStaticJS or SourceStaticJSSourcemap).
-// Other "static:*" sources (e.g. "static:html" from HTML form analysis) are
-// intentionally excluded — they have separate provenance.
+// IsJSStaticSource covers the two JS-bundle values only. "static:html" is excluded
+// deliberately: different provenance.
 func IsJSStaticSource(source string) bool {
 	return source == SourceStaticJS || source == SourceStaticJSSourcemap
 }
 
-// AnyStaticSource reports whether any ObservedRequest in reqs carries a
-// JS-bundle static-analysis Source value. Useful as a gate to avoid emitting
-// JS-specific metadata (e.g. x-vespasian-source) when no JS analysis ran.
+// AnyStaticSource gates JS-specific metadata so none is emitted when no JS
+// analysis ran.
 func AnyStaticSource(reqs []ObservedRequest) bool {
 	for _, r := range reqs {
 		if IsJSStaticSource(r.Source) {
