@@ -25,47 +25,40 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
-// SourceStaticHTML is the Source value assigned to ObservedRequests
-// synthesized from static HTML form analysis.
+// SourceStaticHTML tags requests synthesized from static HTML form analysis.
 const SourceStaticHTML = "static:html"
 
 const (
 	maxFormsPerBody    = 1000
 	maxFieldsPerForm   = 500
 	maxAttrValueBytes  = 4096
-	maxFieldValueBytes = 4096    // cap textarea text content and <option> text
-	maxBodyBytes       = 8 << 20 // 8 MiB cap on HTML response bodies passed to parseForms
+	maxFieldValueBytes = 4096    // textarea and <option> text
+	maxBodyBytes       = 8 << 20 // HTML bodies handed to parseForms
 )
 
-// staticForm is the intermediate representation of a parsed <form>.
 type staticForm struct {
-	Action  string            // raw action attribute (unresolved)
-	Method  string            // raw method attribute (unresolved)
-	Enctype string            // raw enctype (possibly empty)
-	Fields  []staticFormField // preserves discovery order; duplicates allowed
+	Action  string            // raw, unresolved
+	Method  string            // raw, unresolved
+	Enctype string            // may be empty
+	Fields  []staticFormField // discovery order; duplicates allowed
 }
 
 type staticFormField struct {
 	Name        string
-	Type        string // lowercased; empty if absent ("" treated as "text")
+	Type        string // lowercased; "" means "text"
 	Value       string
 	Placeholder string
 	Required    bool
-	Hidden      bool // type=="hidden"
-	Sensitive   bool // heuristic match on Name (CSRF, session, token, API key, etc.)
+	Hidden      bool
+	Sensitive   bool // isSensitiveName matched
 }
 
-// sentinelSelectedOption marks a select field whose <option selected> was
-// observed before its value was resolved. The NUL prefix ensures the marker
-// cannot collide with any real form value parsed from HTML.
+// sentinelSelectedOption marks a <option selected> seen before its value
+// resolved. The NUL prefix cannot collide with a real parsed value.
 const sentinelSelectedOption = "\x00selected"
 
-// ExtractForms scans each request's HTML response body for <form> elements
-// and returns one synthetic ObservedRequest per form. Non-HTML responses and
-// responses with empty bodies are skipped. Response bodies larger than
-// maxBodyBytes (8 MiB) are truncated before parsing to bound memory usage.
-// The returned slice can be appended directly to the captured requests slice
-// before classification.
+// ExtractForms returns one synthetic ObservedRequest per <form>, ready to append
+// to the captured slice. Bodies over maxBodyBytes are truncated first.
 func ExtractForms(requests []crawl.ObservedRequest) []crawl.ObservedRequest {
 	var out []crawl.ObservedRequest
 	for _, req := range requests {
@@ -91,14 +84,11 @@ func ExtractForms(requests []crawl.ObservedRequest) []crawl.ObservedRequest {
 	return out
 }
 
-// isHTMLResponse returns true if the response is likely HTML. It checks the
-// Content-Type (case-insensitive, tolerant of "; charset=..." suffix) and,
-// if that's empty/ambiguous, falls back to sniffing for a DOCTYPE or <html>
-// within the first 512 bytes.
+// isHTMLResponse checks Content-Type, then sniffs the first 512 bytes for a
+// doctype or <html> when it is absent.
 func isHTMLResponse(resp crawl.ObservedResponse) bool {
 	ct := strings.ToLower(strings.TrimSpace(resp.ContentType))
 	if ct == "" {
-		// Also check the Headers map — Content-Type may live there instead.
 		for k, v := range resp.Headers {
 			if strings.EqualFold(k, "content-type") {
 				ct = strings.ToLower(strings.TrimSpace(v))
@@ -110,11 +100,10 @@ func isHTMLResponse(resp crawl.ObservedResponse) bool {
 		strings.HasPrefix(ct, "application/xhtml+xml") {
 		return true
 	}
+	// A known non-HTML type is authoritative; only sniff when there is none.
 	if ct != "" {
-		// Known non-HTML content type — skip, don't sniff.
 		return false
 	}
-	// No content-type at all: sniff the first 512 bytes.
 	n := len(resp.Body)
 	if n > 512 {
 		n = 512
@@ -124,20 +113,19 @@ func isHTMLResponse(resp crawl.ObservedResponse) bool {
 		strings.Contains(head, "<html")
 }
 
-// pendingFieldState tracks state for elements whose value spans multiple tokens
-// (textarea text content and select option values).
+// pendingFieldState covers elements whose value spans several tokens.
 type pendingFieldState struct {
-	field       *staticFormField // pointer into the parent form's Fields slice
+	field       *staticFormField // into the parent form's Fields
 	inTextarea  bool
 	inSelect    bool
 	inOption    bool
-	optionValue string  // value attr of current <option> (may be empty → use text)
-	optionText  string  // accumulated text content of current <option>
-	firstOption *string // non-nil once the first option's value is determined
+	optionValue string // empty means fall back to optionText
+	optionText  string
+	firstOption *string // non-nil once the first option resolved
 }
 
-// parseForms tokenizes body and returns every <form> element found, including
-// leftovers left open at EOF and recoverable nested forms.
+// parseForms returns every <form>, including ones left open at EOF and
+// recoverable nested ones.
 func parseForms(body []byte) []staticForm {
 	z := html.NewTokenizer(bytes.NewReader(body))
 	var stack []*staticForm
@@ -156,9 +144,8 @@ func parseForms(body []byte) []staticForm {
 				handlePendingStartTag(tok, pending)
 				continue
 			}
-			// Cap: once we have reached the maximum number of forms, skip new
-			// <form> start tags but continue tokenizing so unclosed forms on the
-			// stack are still flushed at EOF.
+			// Keep tokenizing past the cap so forms already on the stack still
+			// flush at EOF.
 			if tok.DataAtom == atom.Form && len(results)+len(stack) >= maxFormsPerBody {
 				continue
 			}
@@ -184,8 +171,8 @@ func parseForms(body []byte) []staticForm {
 	}
 }
 
-// flushUnclosedForms appends all forms remaining on the stack (innermost-first)
-// to results and returns the final slice. Any in-flight select is resolved first.
+// flushUnclosedForms drains the stack innermost-first, resolving any in-flight
+// select.
 func flushUnclosedForms(stack []*staticForm, results []staticForm, pending *pendingFieldState) []staticForm {
 	if pending != nil && pending.inSelect {
 		resolveSelectValue(pending)
@@ -196,8 +183,7 @@ func flushUnclosedForms(stack []*staticForm, results []staticForm, pending *pend
 	return results
 }
 
-// handlePendingStartTag handles a start tag token while inside a textarea or
-// select element. Only <option> tags inside a select are relevant.
+// handlePendingStartTag only cares about <option> inside a select.
 func handlePendingStartTag(tok html.Token, pending *pendingFieldState) {
 	if !pending.inSelect || tok.DataAtom != atom.Option {
 		return
@@ -206,15 +192,12 @@ func handlePendingStartTag(tok html.Token, pending *pendingFieldState) {
 	pending.optionValue = getAttr(tok, "value")
 	pending.optionText = ""
 	if hasAttr(tok, "selected") && pending.field.Value == "" {
-		// Sentinel marks that a selected option was found; resolved at </option>.
 		pending.field.Value = sentinelSelectedOption
 	}
 }
 
-// handlePendingText accumulates text tokens while inside a textarea or select.
-// Accumulation is capped at maxFieldValueBytes to prevent attacker-controlled
-// HTML (imported captures, stored content on target) from growing synthesized
-// request bodies without bound.
+// handlePendingText accumulates up to maxFieldValueBytes, so attacker-controlled
+// HTML cannot grow a synthesized body without bound.
 func handlePendingText(text string, pending *pendingFieldState) {
 	switch {
 	case pending.inTextarea:
@@ -224,8 +207,8 @@ func handlePendingText(text string, pending *pendingFieldState) {
 	}
 }
 
-// appendCapped returns prefix+suffix truncated to limit bytes. It avoids
-// materializing the combined string when the prefix is already at or above limit.
+// appendCapped truncates to limit without materializing the join when prefix is
+// already there.
 func appendCapped(prefix, suffix string, limit int) string {
 	if len(prefix) >= limit {
 		return prefix
@@ -237,8 +220,7 @@ func appendCapped(prefix, suffix string, limit int) string {
 	return prefix + suffix
 }
 
-// handlePendingEndTag processes an end tag while pending is active. It updates
-// or clears the pending pointer via the pointer-to-pointer parameter.
+// handlePendingEndTag updates or clears pending through the double pointer.
 func handlePendingEndTag(tok html.Token, pending **pendingFieldState) {
 	p := *pending
 	switch tok.DataAtom {
@@ -255,8 +237,7 @@ func handlePendingEndTag(tok html.Token, pending **pendingFieldState) {
 	}
 }
 
-// commitOption finalizes the current <option> inside a select: resolves the
-// selected-sentinel if present and tracks the first-option fallback.
+// commitOption resolves the sentinel and records the first-option fallback.
 func commitOption(p *pendingFieldState) {
 	optVal := p.optionValue
 	if optVal == "" {
@@ -274,9 +255,7 @@ func commitOption(p *pendingFieldState) {
 	p.optionText = ""
 }
 
-// resolveSelectValue finalizes the Value on a pending select field. It uses the
-// selected option's value if one was found, otherwise falls back to the first
-// option's value.
+// resolveSelectValue prefers the selected option, else the first.
 func resolveSelectValue(p *pendingFieldState) {
 	if p.field.Value == sentinelSelectedOption {
 		p.field.Value = ""
@@ -286,10 +265,8 @@ func resolveSelectValue(p *pendingFieldState) {
 	}
 }
 
-// handleStartTag processes a start/self-closing tag token and updates the
-// form stack. pending is set when a textarea or select element is opened so
-// that subsequent text tokens and option tags can be routed to the right field.
-// Returns the updated stack.
+// handleStartTag updates the form stack, setting pending on textarea or select so
+// later tokens route to the right field.
 func handleStartTag(tok html.Token, stack []*staticForm, pending **pendingFieldState) []*staticForm {
 	switch tok.DataAtom {
 	case atom.Form:
@@ -312,11 +289,9 @@ func handleStartTag(tok html.Token, stack []*staticForm, pending **pendingFieldS
 	return stack
 }
 
-// currentFormForField runs the common entry guards every handle*Tag function
-// needs: returns the current (innermost) form pointer along with the field
-// name if the field should be appended. Returns ok=false when the tag should
-// be ignored (no current form, cross-form association via form-attr, missing
-// name, control bytes in name, or per-form field cap reached).
+// currentFormForField is the shared guard: ok=false for no current form, a
+// cross-form form= attribute, a missing or control-byte-bearing name, or the
+// per-form field cap.
 func currentFormForField(tok html.Token, stack []*staticForm) (*staticForm, string, bool) {
 	if len(stack) == 0 {
 		return nil, "", false
@@ -335,10 +310,8 @@ func currentFormForField(tok html.Token, stack []*staticForm) (*staticForm, stri
 	return f, name, true
 }
 
-// handleInputTag appends a field to the current form when the <input> is valid
-// (has a name, is within a form, is not cross-associated, is not a
-// skippable type such as submit/button/image/file/reset, and the name contains
-// no control bytes).
+// handleInputTag appends when the <input> passes currentFormForField and is not a
+// skippable type.
 func handleInputTag(tok html.Token, stack []*staticForm) {
 	f, name, ok := currentFormForField(tok, stack)
 	if !ok {
@@ -363,9 +336,7 @@ func handleInputTag(tok html.Token, stack []*staticForm) {
 	})
 }
 
-// handleTextareaTag appends a textarea field to the current form and sets
-// pending so that subsequent text tokens accumulate into its Value until
-// the matching </textarea>.
+// handleTextareaTag sets pending so text accumulates until </textarea>.
 func handleTextareaTag(tok html.Token, stack []*staticForm, pending **pendingFieldState) {
 	f, name, ok := currentFormForField(tok, stack)
 	if !ok {
@@ -378,8 +349,9 @@ func handleTextareaTag(tok html.Token, stack []*staticForm, pending **pendingFie
 		Required:    hasAttr(tok, "required"),
 		Sensitive:   isSensitiveName(name),
 	})
-	// Record a pointer to the newly appended field so text tokens can
-	// accumulate into its Value until </textarea>.
+	// Points INTO f.Fields, so it survives only while nothing appends to that
+	// slice. Safe because parseForms routes every tag through
+	// handlePendingStartTag while pending is set, and that never adds a field.
 	fieldPtr := &f.Fields[len(f.Fields)-1]
 	*pending = &pendingFieldState{
 		field:      fieldPtr,
@@ -387,8 +359,7 @@ func handleTextareaTag(tok html.Token, stack []*staticForm, pending **pendingFie
 	}
 }
 
-// handleSelectTag appends a select field to the current form and sets pending
-// so that <option> tokens can be examined until the matching </select>.
+// handleSelectTag sets pending so <option> tokens are read until </select>.
 func handleSelectTag(tok html.Token, stack []*staticForm, pending **pendingFieldState) {
 	f, name, ok := currentFormForField(tok, stack)
 	if !ok {
@@ -401,8 +372,7 @@ func handleSelectTag(tok html.Token, stack []*staticForm, pending **pendingField
 		Required:    hasAttr(tok, "required"),
 		Sensitive:   isSensitiveName(name),
 	})
-	// Record a pointer to the newly appended field so option tokens can
-	// be examined until </select>.
+	// See handleTextareaTag on why no append can invalidate this.
 	fieldPtr := &f.Fields[len(f.Fields)-1]
 	*pending = &pendingFieldState{
 		field:    fieldPtr,
@@ -410,10 +380,8 @@ func handleSelectTag(tok html.Token, stack []*staticForm, pending **pendingField
 	}
 }
 
-// synthesizeRequest converts a parsed form into an ObservedRequest. It
-// resolves the action against baseURL and populates Method/URL/Headers/Body/
-// QueryParams/Source/PageURL. Returns (_, false) if the action cannot be
-// resolved to an http(s) URL.
+// synthesizeRequest resolves the action against baseURL and fills the request.
+// (_, false) when the action is not an http(s) URL.
 func synthesizeRequest(f staticForm, baseURL string) (crawl.ObservedRequest, bool) {
 	resolved, sanitizedBase, ok := resolveAction(baseURL, f.Action)
 	if !ok {
@@ -451,29 +419,27 @@ func synthesizeRequest(f staticForm, baseURL string) (crawl.ObservedRequest, boo
 			return crawl.ObservedRequest{}, false
 		}
 		q := u.Query()
-		// Form fields take precedence over pre-existing action-URL query values
-		// on key conflict; all duplicate form-field values are preserved.
+		// Fields win over the action URL's own query on key conflict; duplicates
+		// are preserved.
 		for k, vs := range values {
 			q.Del(k)
 			for _, v := range vs {
 				q.Add(k, v)
 			}
 		}
-		// SEC-BE-001: cap values before encode so URL string matches QueryParams.
+		// SEC-BE-001: cap before encoding or the URL and QueryParams disagree.
 		crawl.CapQueryValues(q)
 		u.RawQuery = q.Encode()
 		obs.URL = u.String()
 		obs.QueryParams = q
 	} else {
-		// NOTE: Even when the form declares multipart/form-data, we URL-encode
-		// the body. The goal of ExtractForms is parameter discovery for spec
-		// generation, not faithful request replay. Mirrors crawl.formsToObservedRequests
-		// for consistency.
+		// multipart/form-data is URL-encoded anyway: this is parameter discovery
+		// for spec generation, not faithful replay. Matches
+		// crawl.formsToObservedRequests.
 		obs.Headers = map[string]string{"content-type": enctype}
 		obs.Body = []byte(values.Encode())
-		// Preserve any pre-existing query in the action URL.
 		if u, err := url.Parse(resolved); err == nil {
-			// SEC-BE-001: cap values to bound per-key memory from untrusted action URLs.
+			// SEC-BE-001: bound per-key memory from an untrusted action URL.
 			obs.QueryParams = crawl.CapQueryValues(u.Query())
 		}
 	}
@@ -481,22 +447,17 @@ func synthesizeRequest(f staticForm, baseURL string) (crawl.ObservedRequest, boo
 	return obs, true
 }
 
-// resolveAction resolves a form action against baseURL. Empty/missing action
-// ("") returns baseURL unchanged (self-submit). Non-http(s) schemes and
-// unparseable URLs return ("", "", false). Off-host actions (different hostname
-// or port from base) are rejected to keep synthesized requests within the
-// parent request's scope.
-//
-// Returns the resolved action URL and a sanitized copy of the base URL (userinfo
-// stripped, fragment stripped). Both are safe to persist into capture.json.
+// resolveAction returns the resolved action and a sanitized base (userinfo and
+// fragment stripped), both safe for capture.json. Empty action self-submits;
+// non-http(s), unparseable and off-host actions return ok=false so synthesized
+// requests stay in the parent's scope.
 func resolveAction(base, ref string) (string, string, bool) {
 	ref = strings.TrimSpace(ref)
 	baseU, err := url.Parse(base)
 	if err != nil || (baseU.Scheme != "http" && baseU.Scheme != "https") {
 		return "", "", false
 	}
-	// Strip userinfo and fragment from base URL to prevent credentials from being
-	// persisted into capture.json.
+	// Or credentials land in capture.json.
 	baseU.User = nil
 	baseU.Fragment = ""
 	sanitizedBase := baseU.String()
@@ -514,15 +475,13 @@ func resolveAction(base, ref string) (string, string, bool) {
 	if !validateResolvedURL(baseU, resolved) {
 		return "", "", false
 	}
-	// Strip userinfo from the resolved URL to prevent credentials from being
-	// persisted into capture.json or sent in synthetic requests.
+	// Same, plus they would be sent in the synthetic request.
 	resolved.User = nil
 	resolved.Fragment = ""
 	return resolved.String(), sanitizedBase, true
 }
 
-// isUnsupportedSchemeRef reports whether ref begins with a scheme that cannot
-// produce a valid HTTP(S) action URL (javascript:, mailto:, data:, tel:, blob:).
+// isUnsupportedSchemeRef covers javascript:, mailto:, data:, tel: and blob:.
 func isUnsupportedSchemeRef(ref string) bool {
 	lower := strings.ToLower(ref)
 	return strings.HasPrefix(lower, "javascript:") ||
@@ -532,12 +491,9 @@ func isUnsupportedSchemeRef(ref string) bool {
 		strings.HasPrefix(lower, "blob:")
 }
 
-// effectivePort returns the URL's port, expanding empty values to the scheme's
-// default (80 for http, 443 for https). Required so that "https://host/" and
-// "https://host:443/x" compare as the same origin in validateResolvedURL —
-// url.URL.Port() returns "" when the default port is omitted, which would
-// otherwise cause same-origin form actions that include the explicit default
-// port to be incorrectly rejected as off-host.
+// effectivePort expands an omitted port to the scheme default. url.URL.Port()
+// returns "" in that case, so without this validateResolvedURL rejects
+// "https://host:443/x" against base "https://host/" as off-host (RFC 3986).
 func effectivePort(u *url.URL) string {
 	if p := u.Port(); p != "" {
 		return p
@@ -551,20 +507,14 @@ func effectivePort(u *url.URL) string {
 	return ""
 }
 
-// validateResolvedURL checks that the resolved URL is an HTTP(S) URL on the
-// same scheme, hostname, and port as the base URL. Returns false if any
-// constraint is violated.
+// validateResolvedURL requires the same scheme, hostname and effective port.
 func validateResolvedURL(baseU, resolved *url.URL) bool {
 	if resolved.Scheme != "http" && resolved.Scheme != "https" {
 		return false
 	}
-	// Reject scheme changes: different scheme = different origin.
 	if resolved.Scheme != baseU.Scheme {
 		return false
 	}
-	// Reject off-host actions: hostname and port must both match the base URL.
-	// effectivePort normalises omitted default ports so that "https://host/" and
-	// "https://host:443/x" are treated as the same origin (RFC 3986 §3.2.3).
 	if !strings.EqualFold(resolved.Hostname(), baseU.Hostname()) ||
 		effectivePort(resolved) != effectivePort(baseU) {
 		return false
@@ -572,8 +522,7 @@ func validateResolvedURL(baseU, resolved *url.URL) bool {
 	return true
 }
 
-// allowedFormMethods is the set of HTTP method strings accepted by synthesizeRequest.
-// Any form method not in this set is normalised to "GET".
+// Anything outside allowedFormMethods becomes "GET".
 var allowedFormMethods = map[string]struct{}{
 	"GET":     {},
 	"POST":    {},
@@ -584,17 +533,15 @@ var allowedFormMethods = map[string]struct{}{
 	"OPTIONS": {},
 }
 
-// allowedFormEnctypes is the set of MIME types accepted as form enctype values.
-// Any enctype not in this set is normalised to "application/x-www-form-urlencoded".
+// Anything outside allowedFormEnctypes becomes application/x-www-form-urlencoded.
 var allowedFormEnctypes = map[string]struct{}{
 	"application/x-www-form-urlencoded": {},
 	"multipart/form-data":               {},
 	"text/plain":                        {},
 }
 
-// containsControlByte returns true if s contains any byte below 0x20 (space)
-// or equal to 0x7f (DEL). Used to reject field names that contain CR, LF, NUL,
-// or other control characters that could enable header injection or log forging.
+// containsControlByte rejects field names carrying CR, LF, NUL or other control
+// bytes, which enable header injection and log forging.
 func containsControlByte(s string) bool {
 	for i := 0; i < len(s); i++ {
 		b := s[i]
@@ -613,20 +560,11 @@ var sensitiveSubstrings = []string{
 	"samlrequest", "samlresponse", "relaystate",
 }
 
-// isSensitiveName matches form-field names that commonly carry secrets or
-// anti-CSRF tokens. Matched names have their values blanked by fieldValue so
-// they are never persisted into capture.json or replayed during probing.
-// Matching is a case-insensitive substring check against a known list:
+// isSensitiveName substring-matches sensitiveSubstrings, plus an exact "_token".
+// fieldValue blanks whatever matches, so it never reaches capture.json or a probe.
 //
-//   - CSRF / XSRF tokens: "csrf", "xsrf", "_token", "authenticity_token"
-//   - Session and auth tokens: "session" (matches "sessionid" by substring),
-//     "access_token", "refresh_token", "bearer", "jwt", "oauth"
-//   - API keys: "apikey", "api_key", "api-key"
-//   - SAML markers: "samlrequest", "samlresponse", "relaystate"
-//
-// "nonce" and "state" are intentionally excluded from the substring list
-// because they collide with common non-sensitive parameter names (e.g.,
-// `state=California` in address forms).
+// "nonce" and "state" are deliberately absent: they collide with ordinary
+// parameters, e.g. state=California in an address form.
 func isSensitiveName(name string) bool {
 	n := strings.ToLower(name)
 	if n == "_token" {
@@ -640,9 +578,7 @@ func isSensitiveName(name string) bool {
 	return false
 }
 
-// isSkippableType reports whether an <input type="..."> carries no
-// parameter-discovery data. Matches crawl.isSkippableInputType exactly:
-// submit, button, image, reset, file (all lowercased).
+// isSkippableType matches crawl.isSkippableInputType exactly.
 func isSkippableType(inputType string) bool {
 	switch inputType {
 	case "submit", "button", "image", "file", "reset":
@@ -651,14 +587,9 @@ func isSkippableType(inputType string) bool {
 	return false
 }
 
-// fieldValue returns value, or placeholder if value is empty, or "".
-// Sensitive fields (CSRF tokens, session IDs, API keys, JWTs, OAuth tokens,
-// SAML state — see isSensitiveName) always return "" regardless of
-// Value/Placeholder to prevent secrets from being persisted into capture.json
-// or replayed during probing.
-// Hidden fields also always return "" because hidden inputs commonly bear
-// secrets that must not be persisted or replayed; the field NAME alone is what
-// spec generation needs.
+// fieldValue falls back to placeholder. Sensitive (see isSensitiveName) and
+// hidden fields always return "": both routinely carry secrets, and spec
+// generation needs only the NAME.
 func fieldValue(f staticFormField) string {
 	if f.Sensitive || f.Hidden {
 		return ""
@@ -669,10 +600,8 @@ func fieldValue(f staticFormField) string {
 	return f.Placeholder
 }
 
-// fieldsToValues converts staticFormField slice into url.Values, preserving
-// insertion order and all duplicates. url.Values.Add is used (not Set) because
-// staticForm.Fields explicitly allows duplicate names (e.g. multi-select
-// checkboxes, array-style names like tags[], repeated hidden fields).
+// fieldsToValues uses Add, not Set: duplicate names are legitimate — multi-select
+// checkboxes, tags[]-style arrays, repeated hidden fields.
 func fieldsToValues(fields []staticFormField) url.Values {
 	values := url.Values{}
 	for _, fld := range fields {

@@ -12,23 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package analyze runs after traffic capture and before classification. It
-// performs static analysis of captured response bodies to surface additional
-// API endpoints and parameters that were not exercised by the capture itself.
+// Package analyze statically analyses captured response bodies to surface
+// endpoints and parameters the capture itself never exercised. It runs between
+// capture and classification.
 //
-// The current analyzer, ExtractForms, parses HTML response bodies with the
-// golang.org/x/net/html tokenizer and emits one synthetic ObservedRequest per
-// <form> element found. This complements pkg/crawl's DOM-based extractor
-// (Source="form") which runs only during live headless crawling: static
-// analysis also benefits traffic imported from Burp, HAR, or mitmproxy.
+// ExtractForms tokenizes HTML bodies and emits one synthetic ObservedRequest per
+// <form>, tagged Source="static:html". It complements pkg/crawl's DOM extractor
+// (Source="form"), which only runs during a live headless crawl — so imported
+// Burp, HAR and mitmproxy traffic gets form coverage too.
 //
-// Synthetic requests are tagged with Source="static:html" so downstream
-// consumers can distinguish them from live captures.
-//
-// ExtractGRPCWebBindings runs jsluice over captured JavaScript bodies to
-// recover gRPC service/method/type names and streaming flags from generated
-// gRPC-Web and Connect-ES client artifacts (connect-es service objects,
-// *_pb_service.js stubs, *_grpc_web_pb.js MethodDescriptors). It returns
-// []classify.GRPCService for the reflection-off gRPC discovery path; message
-// fields are not recovered (names only).
+// ExtractGRPCWebBindings runs jsluice over captured JS to recover gRPC
+// service/method/type names and streaming flags from generated gRPC-Web and
+// Connect-ES clients, for the reflection-off discovery path. Names only, no
+// message fields.
 package analyze

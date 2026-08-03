@@ -21,15 +21,13 @@ import (
 	"time"
 )
 
-// Crawl runs a concurrent headless crawl using go-rod directly.
-// This is a verbatim wrapper of the original crawlHeadless logic.
+// Crawl runs a concurrent headless crawl.
 func (c *RodCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRequest, error) {
 	maxPages, err := validateCrawlInputs(c.opts, targetURL)
 	if err != nil {
 		return nil, err
 	}
 
-	// Early return if the parent context is already canceled.
 	if ctx.Err() != nil {
 		if c.opts.Stderr != nil {
 			fmt.Fprint(c.opts.Stderr, interruptMessage) //nolint:errcheck // best-effort status message
@@ -37,7 +35,6 @@ func (c *RodCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReq
 		return nil, ctx.Err()
 	}
 
-	// Use caller-provided browser or launch Chrome under vespasian's control.
 	var browserMgr *BrowserManager
 	if c.opts.BrowserMgr != nil {
 		browserMgr = c.opts.BrowserMgr
@@ -52,18 +49,12 @@ func (c *RodCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedReq
 	return c.crawlHeadless(ctx, targetURL, maxPages, browserMgr)
 }
 
-// crawlHeadless runs a concurrent headless crawl using go-rod directly. It
-// drives multiple browser tabs in parallel so DOM-stability waits overlap
-// across pages, making crawls significantly faster than a serial page-by-page
-// visit.
+// crawlHeadless drives tabs in parallel so DOM-stability waits overlap.
 //
-// SSRF note: the headless backend relies on Chrome's own networking stack and
-// the upfront scopeChecker SSRF check. It does NOT have a Go dial-time IP pin
-// (ssrfSafeDialContext) equivalent — Chrome's DNS resolution is outside Go's
-// net.Dialer. This is a known limitation; the HTTPCrawler path uses
-// ssrfSafeDialContext as the authoritative DNS-rebinding control.
+// SSRF: no Go dial-time IP pin here — Chrome resolves DNS outside net.Dialer, so
+// only the upfront scopeChecker check applies. Known limitation; HTTPCrawler uses
+// ssrfSafeDialContext as the authoritative rebinding control.
 func (c *RodCrawler) crawlHeadless(ctx context.Context, targetURL string, maxPages int, browserMgr *BrowserManager) ([]ObservedRequest, error) {
-	// Apply the overall crawl timeout if configured.
 	if c.opts.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.opts.Timeout)
@@ -75,14 +66,10 @@ func (c *RodCrawler) crawlHeadless(ctx context.Context, targetURL string, maxPag
 		return nil, fmt.Errorf("scope setup: %w", err)
 	}
 
-	// LAB-2222: a Cookie value passed via --header must be injected into
-	// Chrome's cookie store (Storage.setCookies), not attached as an extra
-	// HTTP header. Extra headers set via Network.setExtraHTTPHeaders don't
-	// survive server-side redirects (e.g., Spring Security's 302→/login on
-	// WebGoat strips the JSESSIONID, breaking session auth). Cookies in
-	// Chrome's own store persist across redirects, new tabs, and fetches.
-	// See ApplyCookieHeader for the extract/parse/inject pipeline and
-	// cookies_test.go for the wiring coverage.
+	// A --header Cookie goes into Chrome's store via Storage.setCookies, not
+	// Network.setExtraHTTPHeaders: extra headers do not survive server-side
+	// redirects — Spring Security's 302 to /login on WebGoat strips the JSESSIONID
+	// and breaks session auth (LAB-2222).
 	extraHeaders, err := ApplyCookieHeader(c.opts.Headers, targetURL, browserMgr.SetCookies)
 	if err != nil {
 		return nil, err
@@ -112,7 +99,7 @@ func (c *RodCrawler) crawlHeadless(ctx context.Context, targetURL string, maxPag
 		mu.Unlock()
 	})
 
-	// On signal, kill Chrome immediately to stop all outbound requests.
+	// Killing Chrome is what actually stops outbound requests.
 	if ctx.Err() != nil {
 		if c.opts.Stderr != nil {
 			fmt.Fprint(c.opts.Stderr, interruptMessage) //nolint:errcheck // best-effort status message

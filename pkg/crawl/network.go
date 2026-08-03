@@ -24,8 +24,7 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 )
 
-// pendingRequest tracks a network request that has been sent but whose
-// response has not yet been fully received.
+// pendingRequest is a sent request whose response is still arriving.
 type pendingRequest struct {
 	method  string
 	url     string
@@ -42,9 +41,8 @@ type pendingRequest struct {
 	complete bool
 }
 
-// pageNetworkCapture passively captures all network requests and responses on
-// a single page via CDP Network domain events. It correlates request/response
-// pairs by request ID and produces ObservedRequest values.
+// pageNetworkCapture correlates CDP Network events by request ID into
+// ObservedRequest values.
 type pageNetworkCapture struct {
 	mu      sync.Mutex
 	pending map[proto.NetworkRequestID]*pendingRequest
@@ -52,10 +50,8 @@ type pageNetworkCapture struct {
 	page    *rod.Page
 }
 
-// newPageNetworkCapture creates a capture session and wires up CDP event
-// listeners on the given page. The caller must call wait() (returned by
-// setupListeners) after page navigation completes to ensure all events are
-// processed.
+// newPageNetworkCapture wires up the CDP listeners. The caller must run the
+// returned wait function so events are processed.
 func newPageNetworkCapture(page *rod.Page, pageURL string) (*pageNetworkCapture, func()) {
 	c := &pageNetworkCapture{
 		pending: make(map[proto.NetworkRequestID]*pendingRequest),
@@ -66,9 +62,8 @@ func newPageNetworkCapture(page *rod.Page, pageURL string) (*pageNetworkCapture,
 	return c, wait
 }
 
-// setupListeners registers CDP event handlers and returns a wait function.
-// The wait function blocks until all registered events resolve. Callers
-// should invoke it in a goroutine; it runs for the lifetime of the page.
+// setupListeners returns a function that blocks for the lifetime of the page; run
+// it in a goroutine.
 func (c *pageNetworkCapture) setupListeners(page *rod.Page) func() {
 	return page.EachEvent(
 		func(e *proto.NetworkRequestWillBeSent) {
@@ -95,21 +90,19 @@ func (c *pageNetworkCapture) setupListeners(page *rod.Page) func() {
 		func(e *proto.NetworkLoadingFinished) {
 			c.mu.Lock()
 			req, ok := c.pending[e.RequestID]
+			// CDP replays events, so an already-finalized request must be skipped or
+			// it is written twice.
 			if !ok || req.complete {
-				// Not found or already finalized — skip to prevent
-				// duplicate writes from replayed CDP events (H-1 fix).
 				c.mu.Unlock()
 				return
 			}
-			// Mark complete under lock before releasing for the blocking
-			// CDP call. This ensures no other handler can finalize this
-			// request concurrently (H-1 fix).
+			// Set while still holding the lock, before releasing it for the blocking
+			// CDP call below, so no other handler can finalize this concurrently.
 			req.complete = true
 			c.mu.Unlock()
 
-			// Fetch response body outside the lock — this is a CDP call
-			// that can block. The body may be unavailable (e.g., for
-			// redirects or cached responses); that's fine.
+			// Outside the lock: this CDP call blocks. An unavailable body (redirect,
+			// cached response) is fine.
 			body, err := proto.NetworkGetResponseBody{RequestID: e.RequestID}.Call(page)
 			if err == nil && body != nil {
 				var bodyBytes []byte
@@ -121,9 +114,9 @@ func (c *pageNetworkCapture) setupListeners(page *rod.Page) func() {
 				} else {
 					bodyBytes = []byte(body.Body)
 				}
-				// Truncate at collection time to bound memory usage.
-				// Without this, a hostile page generating many large XHR
-				// responses could exhaust memory (H-3 fix).
+				// At collection time, not at use: a hostile page generating many large
+				// XHR responses would exhaust memory before anything downstream
+				// could cap it.
 				bodyBytes = truncateBody(bodyBytes)
 
 				c.mu.Lock()
@@ -134,8 +127,7 @@ func (c *pageNetworkCapture) setupListeners(page *rod.Page) func() {
 	)
 }
 
-// Results returns all captured network exchanges as ObservedRequest values.
-// Call this after navigation and DOM stability wait are complete.
+// Results is valid once navigation and the stability wait are complete.
 func (c *pageNetworkCapture) Results() []ObservedRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -147,10 +139,8 @@ func (c *pageNetworkCapture) Results() []ObservedRequest {
 	return results
 }
 
-// mapNetworkToObservedRequest converts a captured network exchange to an
-// ObservedRequest and extracts query parameters. Body truncation is applied
-// at collection time (NetworkRequestWillBeSent for request bodies,
-// NetworkLoadingFinished for response bodies), not here.
+// mapNetworkToObservedRequest converts one exchange. Bodies were already
+// truncated at collection time, not here.
 func mapNetworkToObservedRequest(req *pendingRequest, pageURL string) ObservedRequest {
 	obs := ObservedRequest{
 		Method:  req.method,
@@ -171,7 +161,6 @@ func mapNetworkToObservedRequest(req *pendingRequest, pageURL string) ObservedRe
 		obs.Method = "GET"
 	}
 
-	// Parse query parameters from URL.
 	if obs.URL != "" {
 		if u, err := url.Parse(obs.URL); err == nil {
 			obs.QueryParams = CapQueryValues(u.Query())
@@ -181,7 +170,6 @@ func mapNetworkToObservedRequest(req *pendingRequest, pageURL string) ObservedRe
 	return obs
 }
 
-// truncateBody returns body truncated to MaxResponseBodySize.
 func truncateBody(body []byte) []byte {
 	if len(body) > MaxResponseBodySize {
 		return body[:MaxResponseBodySize]
@@ -189,8 +177,7 @@ func truncateBody(body []byte) []byte {
 	return body
 }
 
-// flattenNetworkHeaders converts CDP NetworkHeaders (map[string]gson.JSON) to
-// a simple map[string]string, lowercasing header names for consistency.
+// flattenNetworkHeaders lowercases header names.
 func flattenNetworkHeaders(headers proto.NetworkHeaders) map[string]string {
 	if len(headers) == 0 {
 		return nil

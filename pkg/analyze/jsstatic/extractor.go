@@ -21,19 +21,16 @@ import (
 	"github.com/BishopFox/jsluice"
 )
 
-// assetExtensions are file-like URL suffixes that indicate non-API resources.
 var assetExtensions = []string{
 	".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff",
 	".css", ".svg", ".woff", ".woff2", ".ttf", ".eot",
 	".map", ".js", ".ico", ".pdf", ".zip",
 }
 
-// filteredSchemes are URL schemes that are never API calls.
 var filteredSchemes = []string{
 	"javascript:", "data:", "blob:", "mailto:", "tel:", "chrome-extension:",
 }
 
-// filterURL returns true if the URL should be dropped.
 func filterURL(rawURL string) bool {
 	if rawURL == "" {
 		return true
@@ -41,15 +38,13 @@ func filterURL(rawURL string) bool {
 
 	lower := strings.ToLower(rawURL)
 
-	// Drop non-API schemes.
 	for _, scheme := range filteredSchemes {
 		if strings.HasPrefix(lower, scheme) {
 			return true
 		}
 	}
 
-	// Drop asset file extensions by checking path portion.
-	// Strip query/fragment for extension check.
+	// Extension check runs on the path, so strip query and fragment.
 	pathPart := rawURL
 	if idx := strings.IndexAny(pathPart, "?#"); idx != -1 {
 		pathPart = pathPart[:idx]
@@ -64,15 +59,13 @@ func filterURL(rawURL string) bool {
 	return false
 }
 
-// isExprOnly returns true if the URL consists only of EXPR placeholders and
-// path separators — these are fully dynamic and carry no structural info.
+// isExprOnly drops fully-dynamic URLs: only placeholders and separators, so no
+// structure to recover.
 func isExprOnly(rawURL string) bool {
-	// Strip query/fragment.
 	u := rawURL
 	if idx := strings.IndexAny(u, "?#"); idx != -1 {
 		u = u[:idx]
 	}
-	// Strip scheme+authority for absolute URLs.
 	if i := strings.Index(u, "://"); i != -1 {
 		rest := u[i+3:]
 		if slash := strings.Index(rest, "/"); slash != -1 {
@@ -81,15 +74,13 @@ func isExprOnly(rawURL string) bool {
 			return false
 		}
 	}
-	// Remove path separators and EXPR — if nothing remains, it's EXPR-only.
 	cleaned := strings.ReplaceAll(u, "/", "")
 	cleaned = strings.ReplaceAll(cleaned, jsluice.ExpressionPlaceholder, "")
 	return cleaned == ""
 }
 
-// collapseTemplateLiteral parses a tree-sitter template_string node and
-// returns the collapsed URL string with EXPR placeholders and the list of
-// identifier tokens collected from the substitutions.
+// collapseTemplateLiteral returns the URL with EXPR placeholders plus the
+// identifier tokens recovered from the substitutions.
 func collapseTemplateLiteral(n *jsluice.Node) (string, []string) {
 	raw := n.Content()
 	if len(raw) < 2 || raw[0] != '`' {
@@ -102,9 +93,8 @@ func collapseTemplateLiteral(n *jsluice.Node) (string, []string) {
 	return collapsed, tokens
 }
 
-// collectTemplateTokens walks template_substitution children and returns
-// recovered identifier names (including the .property of member_expression
-// substitutions).
+// collectTemplateTokens recovers identifier names, including the .property of a
+// member expression.
 func collectTemplateTokens(n *jsluice.Node) []string {
 	var tokens []string
 	for i := 0; i < n.ChildCount(); i++ {
@@ -127,9 +117,8 @@ func collectTemplateTokens(n *jsluice.Node) []string {
 	return tokens
 }
 
-// replaceTemplateSubs replaces every ${...} substitution in inner with the
-// jsluice EXPR placeholder. Brace-depth counting handles nested braces like
-// ${fn({a:1})} — a naive first-`}` scan would corrupt the URL.
+// replaceTemplateSubs counts brace depth, so ${fn({a:1})} survives — a naive
+// first-`}` scan corrupts the URL.
 func replaceTemplateSubs(inner string) string {
 	var result strings.Builder
 	for i := 0; i < len(inner); {
@@ -145,8 +134,7 @@ func replaceTemplateSubs(inner string) string {
 	return result.String()
 }
 
-// skipBalancedBraces returns the index just past the matching '}' starting
-// from start (which points at the byte AFTER the opening '${').
+// skipBalancedBraces takes start just past the opening '${'.
 func skipBalancedBraces(s string, start int) int {
 	depth := 1
 	for j := start; j < len(s); j++ {
@@ -163,8 +151,7 @@ func skipBalancedBraces(s string, start int) int {
 	return len(s)
 }
 
-// extractMethodFromOptions extracts the HTTP method string from an options
-// object argument like {method: "POST"}.
+// extractMethodFromOptions reads {method: "POST"}.
 func extractMethodFromOptions(optNode *jsluice.Node) string {
 	if optNode == nil || optNode.Type() != "object" {
 		return ""
@@ -174,25 +161,20 @@ func extractMethodFromOptions(optNode *jsluice.Node) string {
 	if methodNode == nil || !methodNode.IsValid() {
 		return ""
 	}
-	// Strip surrounding quotes.
 	val := strings.Trim(methodNode.Content(), "\"'`")
 	return strings.ToUpper(strings.TrimSpace(val))
 }
 
-// fetchHTTPMethods is the set of valid HTTP methods we recognize.
 var fetchHTTPMethods = map[string]bool{
 	"GET": true, "POST": true, "PUT": true, "PATCH": true,
 	"DELETE": true, "HEAD": true, "OPTIONS": true,
 }
 
-// extractTemplateLiteralFetches walks the AST for fetch(...) calls whose
-// first argument is a template_string and returns extracted endpoints with
-// identifier tokens recovered from template substitutions (e.g., ${userId}
-// → token "userId" used to name the path parameter).
+// extractTemplateLiteralFetches handles fetch(`...`), recovering ${userId} as the
+// token that names the path parameter.
 func extractTemplateLiteralFetches(analyzer *jsluice.Analyzer, baseURL string) []ExtractedEndpoint {
 	var endpoints []ExtractedEndpoint
 
-	// Walk call_expressions directly.
 	analyzer.Query("(call_expression) @call", func(n *jsluice.Node) {
 		fn := n.ChildByFieldName("function")
 		if fn == nil || fn.Content() != "fetch" {
@@ -215,7 +197,6 @@ func extractTemplateLiteralFetches(analyzer *jsluice.Analyzer, baseURL string) [
 
 		normalized := NormalizeEXPRPath(rawURL, tokens)
 
-		// Extract method from second argument options object.
 		method := "GET"
 		optArg := args.NamedChild(1)
 		if optArg != nil {
@@ -235,16 +216,9 @@ func extractTemplateLiteralFetches(analyzer *jsluice.Analyzer, baseURL string) [
 	return endpoints
 }
 
-// axiosMethods maps axios.<method> names to HTTP methods.
-//
-// Special cases handled outside the axiosMethodHasBody data-arg path:
-//   - "request": httpMethod=="", so extractAxiosMemberCall delegates to
-//     endpointFromAxiosConfigObject — URL, method, and body all come from
-//     the first positional config object.
-//   - "delete": in axios v1.x, axios.delete(url, config) — the second
-//     positional arg is a CONFIG object (keys like headers/params/data), NOT
-//     a body. Body lives in config.data. Handled by a dedicated branch in
-//     extractAxiosMemberCall so config keys are never misreported as body fields.
+// axiosMethods maps axios.<method> to an HTTP method. "request" and "delete" take
+// no positional body and have dedicated branches in extractAxiosMemberCall; see the
+// body-field collection there.
 var axiosMethods = map[string]string{
 	"get":     "GET",
 	"post":    "POST",
@@ -255,8 +229,8 @@ var axiosMethods = map[string]string{
 	"head":    "HEAD",
 }
 
-// collectObjectKeys returns the top-level keys of a tree-sitter object node,
-// sorted lexicographically. Handles both pair nodes and shorthand_property_identifier.
+// collectObjectKeys returns sorted top-level keys, handling pairs and shorthand
+// property identifiers.
 func collectObjectKeys(objNode *jsluice.Node) []string {
 	if objNode == nil || !objNode.IsValid() || objNode.Type() != "object" {
 		return nil
@@ -269,8 +243,7 @@ func collectObjectKeys(objNode *jsluice.Node) []string {
 			keyNode := child.ChildByFieldName("key")
 			if keyNode != nil && keyNode.IsValid() {
 				k := keyNode.Content()
-				// String-literal keys (type "string") have surrounding quotes;
-				// strip leading/trailing " ' ` so the body field names are bare.
+				// String-literal keys are quoted; field names must be bare.
 				if keyNode.Type() == "string" {
 					k = strings.Trim(k, "\"'`")
 				}
@@ -284,8 +257,8 @@ func collectObjectKeys(objNode *jsluice.Node) []string {
 	return keys
 }
 
-// extractJSONStringifyKeys returns the top-level keys from a JSON.stringify(obj) call.
-// Returns nil if the node isn't JSON.stringify or the argument isn't an object literal.
+// extractJSONStringifyKeys returns nil unless the node is JSON.stringify over an
+// object literal.
 func extractJSONStringifyKeys(n *jsluice.Node) []string {
 	if n == nil || !n.IsValid() || n.Type() != "call_expression" {
 		return nil
@@ -305,7 +278,6 @@ func extractJSONStringifyKeys(n *jsluice.Node) []string {
 	return collectObjectKeys(obj)
 }
 
-// extractStringLiteral returns the unquoted content of a string node.
 func extractStringLiteral(n *jsluice.Node) string {
 	if n == nil || !n.IsValid() {
 		return ""
@@ -316,8 +288,7 @@ func extractStringLiteral(n *jsluice.Node) string {
 	return strings.Trim(n.Content(), "\"'`")
 }
 
-// extractAxiosCalls walks the AST and extracts endpoints from axios.method() and
-// axios({config}) call forms.
+// extractAxiosCalls handles the axios.method() and axios({config}) forms.
 func extractAxiosCalls(analyzer *jsluice.Analyzer, baseURL string) []ExtractedEndpoint {
 	var endpoints []ExtractedEndpoint
 
@@ -346,7 +317,6 @@ func extractAxiosCalls(analyzer *jsluice.Analyzer, baseURL string) []ExtractedEn
 	return endpoints
 }
 
-// extractAxiosMemberCall handles `axios.<method>(url, [data], [config])` form.
 func extractAxiosMemberCall(fn, args *jsluice.Node, baseURL string) (ExtractedEndpoint, bool) {
 	obj := fn.ChildByFieldName("object")
 	prop := fn.ChildByFieldName("property")
@@ -359,9 +329,8 @@ func extractAxiosMemberCall(fn, args *jsluice.Node, baseURL string) (ExtractedEn
 		return ExtractedEndpoint{}, false
 	}
 	if httpMethod == "" {
-		// axios.request(config) — URL, method, and body all come from the
-		// config object (the first positional arg), not from positional URL
-		// args. Delegate to the shared config-object parser.
+		// axios.request(config): URL, method and body all come from the config
+		// object, not positional args.
 		return endpointFromAxiosConfigObject(args.NamedChild(0), baseURL)
 	}
 
@@ -374,11 +343,9 @@ func extractAxiosMemberCall(fn, args *jsluice.Node, baseURL string) (ExtractedEn
 		return ExtractedEndpoint{}, false
 	}
 
-	// Collect body fields.
-	//   - post/put/patch: second arg IS the body object; collect its keys directly.
-	//   - delete: second arg is a CONFIG object (headers/params/data/…); body lives
-	//     in config.data only. Collecting the config object's own keys would
-	//     misreport "headers", "params", etc. as body field names.
+	// post/put/patch take the body as the second arg. delete takes a CONFIG object
+	// there, with the body under config.data — collecting its own keys would
+	// misreport "headers" and "params" as body fields (axios v1.x).
 	var bodyFields []string
 	if axiosMethodHasBody(methodName) {
 		if dataArg := args.NamedChild(1); dataArg != nil && dataArg.Type() == "object" {
@@ -397,7 +364,6 @@ func extractAxiosMemberCall(fn, args *jsluice.Node, baseURL string) (ExtractedEn
 	}, true
 }
 
-// extractAxiosConfigCall handles `axios({url, method, data, ...})` form.
 func extractAxiosConfigCall(fn, args *jsluice.Node, baseURL string) (ExtractedEndpoint, bool) {
 	if fn.Content() != "axios" {
 		return ExtractedEndpoint{}, false
@@ -612,14 +578,10 @@ func ExtractFromBundle(jsSource []byte, baseURL string) ([]ExtractedEndpoint, er
 		endpoints = append(endpoints, ep)
 	}
 
-	// 4. Collect endpoints from jsluice's built-in URL matchers.
-	//
-	// jsluice emits a redundant method-less "fetch" match alongside every
-	// method-bearing "fetch" match for the same URL. Keeping the method-less
-	// duplicate defaults it to GET and synthesizes a phantom GET endpoint for
-	// any non-GET fetch (e.g. fetch(u,{method:"POST"}) would yield BOTH POST
-	// and a GET that never occurs). Pre-scan the method-bearing fetch URLs so
-	// jsluiceURLToEndpoint can drop the redundant companion.
+	// jsluice emits a redundant method-less "fetch" match beside every
+	// method-bearing one for the same URL. Kept, it defaults to GET and
+	// synthesizes a phantom endpoint — fetch(u,{method:"POST"}) yields both POST
+	// and a GET. Pre-scan so jsluiceURLToEndpoint can drop the companion.
 	jsluiceURLs := analyzer.GetURLs()
 	fetchURLsWithMethod := make(map[string]bool)
 	for _, u := range jsluiceURLs {

@@ -20,13 +20,10 @@ import (
 	"github.com/PuerkitoBio/goquery"
 )
 
-// extractFromHTMLDoc extracts navigable links and the effective base URL from
-// an already-parsed *goquery.Document. Callers that need both links and
-// inline-script results should use extractHTMLAndInlineScripts to avoid
-// parsing the document twice.
+// extractFromHTMLDoc works on an already-parsed document. For links AND
+// inline-script results use extractHTMLAndInlineScripts, which parses once.
 func extractFromHTMLDoc(doc *goquery.Document, pageURL string) ([]string, string) {
-	// Resolve the effective base URL: honor <base href> when present, applying
-	// the same scheme-downgrade and cross-host guards as effectiveBaseURLFrom.
+	// Same scheme-downgrade and cross-host guards as the rod path.
 	base := pageURL
 	if href, exists := doc.Find("base[href]").First().Attr("href"); exists {
 		base = effectiveBaseURLFrom(href, pageURL)
@@ -62,9 +59,8 @@ func extractFromHTMLDoc(doc *goquery.Document, pageURL string) ([]string, string
 	return links, base
 }
 
-// extractHTMLAndInlineScripts parses the HTML body exactly once and returns
-// both the navigable links (with the effective base URL) and any jsluice
-// results from inline <script> tags.
+// extractHTMLAndInlineScripts parses once, returning links, base and
+// inline-script results.
 func extractHTMLAndInlineScripts(body []byte, pageURL string) (links []string, base string, inlineScripts []jsExtractedURL) {
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
 	if err != nil {
@@ -75,10 +71,8 @@ func extractHTMLAndInlineScripts(body []byte, pageURL string) (links []string, b
 	return links, base, inlineScripts
 }
 
-// extractInlineScriptsFromDoc runs jsluice on all inline <script> tags (those
-// without a src attribute) in an already-parsed *goquery.Document. Callers
-// that hold a doc from a prior parse should call this directly to avoid
-// re-parsing the body.
+// extractInlineScriptsFromDoc runs jsluice on src-less <script> tags. Call it
+// directly when a parsed doc is already in hand.
 func extractInlineScriptsFromDoc(doc *goquery.Document) []jsExtractedURL {
 	var results []jsExtractedURL
 	doc.Find("script:not([src])").Each(func(_ int, s *goquery.Selection) {

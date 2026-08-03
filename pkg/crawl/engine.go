@@ -28,45 +28,22 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 )
 
-// DefaultStableWait is the default DOM stability wait duration.
+// DefaultStableWait is the default DOM-stability wait.
 const DefaultStableWait = 3 * time.Second
 
-// ---- operator-message helpers ----
-
-// flagDangerousAllowPrivate is the CLI flag name that disables SSRF protection
-// for private/localhost targets. It is referenced in operator-facing error
-// messages so operators can copy-paste it verbatim; keep this in sync with the
-// `name:"..."` tag on CrawlCmd.DangerousAllowPrivate / ScanCmd.DangerousAllowPrivate
-// in cmd/vespasian/main.go.
+// Kept in sync with the `name:"..."` tag on CrawlCmd.DangerousAllowPrivate and
+// ScanCmd.DangerousAllowPrivate; operators copy-paste it from error messages.
 const flagDangerousAllowPrivate = "--dangerous-allow-private"
 
-// redactedURLPlaceholder is substituted for a URL that cannot be safely
-// stripped of userinfo (either url.Parse failed and "@" is present, or
-// url.Parse succeeded into an opaque form where u.User is not populated).
-// Emitting the raw string in either case would leak credentials — the whole
-// point of redactSeedURL is to hide them.
 const redactedURLPlaceholder = "<URL with userinfo redacted>"
 
-// redactSeedURL returns raw with any userinfo (user[:password]) removed so the
-// URL can be echoed to stderr / logs without leaking credentials. Behavior:
-//   - url.Parse succeeds AND the re-serialized URL has no "@": userinfo is
-//     stripped via u.User = nil and the URL is re-serialized.
-//   - url.Parse succeeds AND the re-serialized URL still contains "@":
-//     either the URL is in opaque form (e.g. "http:user:pass@host/path" parses
-//     into u.Opaque rather than u.User, so u.User = nil is a no-op), or "@"
-//     appears unencoded in the path/query (Go preserves it there — e.g.
-//     "http://example.com/@user" or "http://example.com/?q=a@b"). Fail closed
-//     in both cases: emit the placeholder rather than round-trip credentials
-//     through u.String(). For the path/query case this is a deliberate false
-//     positive — operators lose host/path context, but we accept that to avoid
-//     any risk of echoing credentials. Keep the check in place.
-//   - url.Parse fails AND raw contains "@": fail closed — emit the placeholder,
-//     since a parse failure on a URL with "@" (e.g. "http://admin:se%zz@host/path"
-//     — invalid percent escape in userinfo) would otherwise echo the credentials
-//     verbatim. Note: "@" may also appear in the path or query of a malformed
-//     URL (with no real userinfo); same deliberate false positive as above.
-//   - url.Parse fails AND raw contains no "@": return raw unchanged; nothing
-//     to redact and the operator still gets an actionable error.
+// redactSeedURL strips userinfo so the seed URL can be echoed to stderr.
+//
+// Fails closed on any residual "@": an opaque URL ("http:user:pass@host/path")
+// parses into u.Opaque, so u.User = nil is a no-op and credentials would survive
+// u.String(). A parse failure with "@" would echo them verbatim. "@" also appears
+// unencoded in paths and queries, which cannot cheaply be told apart from the
+// credential case, so those lose host context — a deliberate false positive.
 func redactSeedURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -76,14 +53,6 @@ func redactSeedURL(raw string) string {
 		return raw
 	}
 	u.User = nil
-	// Defensive: the residual-"@" check catches two distinct cases:
-	//   1. Opaque URLs (e.g. "http:user:pass@host/path") parse with userinfo
-	//      in u.Opaque, so u.User = nil above is a no-op and credentials
-	//      would survive u.String() verbatim.
-	//   2. "@" unencoded in the path or query (e.g. "http://example.com/@user")
-	//      — no credentials, but we cannot cheaply distinguish this case from
-	//      (1), so we fall back to the placeholder. Deliberate false positive;
-	//      see the function-level doc comment.
 	out := u.String()
 	if strings.Contains(out, "@") {
 		return redactedURLPlaceholder
@@ -103,23 +72,19 @@ type engineOptions struct {
 	Stderr        io.Writer         // user-facing status messages
 }
 
-// rodEngine implements a concurrent headless crawl using go-rod. It connects
-// to an existing Chrome instance (managed by BrowserManager) and runs N worker
-// goroutines, each operating its own browser tab.
+// rodEngine connects to a BrowserManager-owned Chrome and runs one worker
+// goroutine per tab.
 type rodEngine struct {
 	browser  *rod.Browser
 	opts     engineOptions
 	frontier *urlFrontier
 }
 
-// newRodEngine connects to the Chrome instance at wsURL and returns a crawl
-// engine ready to start. The caller must call Close() when done.
+// newRodEngine connects to wsURL. The caller must Close().
 func newRodEngine(wsURL string, opts engineOptions) (*rodEngine, error) {
 	if opts.Concurrency > MaxConcurrency && opts.Stderr != nil {
 		fmt.Fprintf(opts.Stderr, "warning: --concurrency %d exceeds maximum (%d), capping\n", opts.Concurrency, MaxConcurrency) //nolint:errcheck // best-effort
 	}
-	// clampConcurrency (crawler.go) is the shared clamp: 0 → DefaultConcurrency,
-	// > MaxConcurrency → MaxConcurrency. The warning above is rod-specific.
 	opts.Concurrency = clampConcurrency(opts.Concurrency)
 	if opts.PageTimeout <= 0 {
 		opts.PageTimeout = time.Duration(PageTimeout) * time.Second
@@ -142,47 +107,28 @@ func newRodEngine(wsURL string, opts engineOptions) (*rodEngine, error) {
 	}, nil
 }
 
-// Crawl starts the concurrent crawl from seedURL. It blocks until the crawl
-// completes (frontier exhausted, maxPages reached, or ctx canceled). Each
-// captured network request is passed to onResult as it is observed.
+// Crawl blocks until the frontier is exhausted, maxPages is hit, or ctx is
+// canceled, passing each captured request to onResult.
 func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(ObservedRequest)) error {
-	// Seed the frontier. If Push adds zero entries the seed was rejected
-	// (malformed URL, scope mismatch, or — the common case — the seed is a
-	// private host such as localhost / 127.0.0.1 / RFC1918 / 169.254.*, which
-	// the scope predicate's SSRF check rejects unless flagDangerousAllowPrivate
-	// is set). Without this guard the crawl silently returned zero captures
-	// with no error to help the operator diagnose (LAB-2438).
+	// Push returns 0 when the seed is rejected: malformed, out of scope, or —
+	// usually — a private host the SSRF check refuses without
+	// flagDangerousAllowPrivate. Erroring is what stops that looking like a
+	// successful crawl of nothing (LAB-2438).
 	if e.frontier.Push([]urlEntry{{URL: seedURL, Depth: 0}}) == 0 {
-		// redactSeedURL strips userinfo (user[:password]) before echoing the
-		// seed URL to stderr. If an operator pastes a credentialed URL and
-		// forgets flagDangerousAllowPrivate, the error message still lands in
-		// shell history / CI logs / scrollback — without this we would emit
-		// the cleartext credentials. url.Parse errors return the raw string
-		// unchanged so the operator still sees an actionable message.
 		return fmt.Errorf("seed URL rejected by frontier (scope, SSRF, or parse): %s; "+
 			"if crawling a private host (localhost, 127.0.0.1, RFC1918, link-local), "+
 			"pass %s", redactSeedURL(seedURL), flagDangerousAllowPrivate)
 	}
 
-	// Track pages VISITED for MaxPages enforcement (LAB-4678, A1). The budget
-	// counts pages (URLs visited), not captured requests: a single SPA page can
-	// fire dozens of XHR/fetch calls, so counting requests truncated the crawl
-	// far earlier than "max pages" implies, and hard-canceling the shared
-	// context when the count was hit abandoned in-flight tabs mid-capture —
-	// dropping part of a page's surface and varying the emitted set run-to-run.
-	// Workers now reserve a page slot under this mutex before visiting and stop
-	// taking new pages once the budget is reached, so pages already in flight
-	// finalize and emit all of their captured requests, and the crawl is no
-	// longer canceled mid-page.
+	// MaxPages counts pages, not requests — one SPA page fires dozens of XHR calls
+	// (LAB-4678). Slots are reserved under this mutex before visiting, which makes
+	// the cap exact, and hitting it does NOT cancel ctx: in-flight pages finalize
+	// and emit everything they captured, so the emitted set is stable run-to-run.
 	var (
 		mu        sync.Mutex
 		pageCount int
 	)
 
-	// Workers run under ctx directly. The page budget no longer cancels the
-	// crawl (it just stops workers from taking new pages under the mutex), so
-	// the former context.WithCancel wrapper served no purpose beyond ctx's own
-	// parent cancellation and was removed (QUAL-006).
 	var wg sync.WaitGroup
 	for i := range e.opts.Concurrency {
 		wg.Add(1)
@@ -197,19 +143,15 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 	return ctx.Err()
 }
 
-// Close disconnects from the browser. It does NOT kill Chrome — BrowserManager
-// owns that lifecycle.
+// Close disconnects only. BrowserManager owns the Chrome lifecycle.
 func (e *rodEngine) Close() error {
 	return e.browser.Close()
 }
 
-// pageBudgetReached reports whether the visited-page budget is exhausted,
-// taking mu for the duration of the check. maxPages <= 0 means unlimited. When
-// reserve is true and the budget is not yet reached, it consumes one page slot
-// before returning false — the compare and the increment happen in a single
-// critical section so concurrent workers cannot overshoot the cap (a separate
-// check-then-increment would race). Pass reserve=false for the pre-Pop
-// early-out that must not consume a slot.
+// pageBudgetReached checks under mu; maxPages <= 0 is unlimited. With reserve, the
+// compare and the increment share one critical section, so workers cannot
+// overshoot — a separate check-then-increment would race. reserve=false is for the
+// pre-Pop early-out, which must not consume a slot.
 func pageBudgetReached(mu *sync.Mutex, pageCount *int, maxPages int, reserve bool) bool {
 	mu.Lock()
 	defer mu.Unlock()
@@ -222,19 +164,14 @@ func pageBudgetReached(mu *sync.Mutex, pageCount *int, maxPages int, reserve boo
 	return false
 }
 
-// worker is the per-tab goroutine. It takes URLs from the frontier, visits
-// each one in a fresh tab, captures network events, extracts links, and pushes
-// discovered URLs back to the frontier.
+// worker is the per-tab goroutine: pop, visit, capture, push discovered links.
 func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRequest), mu *sync.Mutex, pageCount *int, maxPages int) {
 	for {
-		// Check context before blocking on Pop.
 		if ctx.Err() != nil {
 			return
 		}
 
-		// Stop taking new pages once the page budget is reached. Pages already
-		// being visited by other workers still finalize below. Check-only (no
-		// reservation): we have not popped an entry yet.
+		// Check-only: nothing popped yet, so no slot to reserve.
 		if pageBudgetReached(mu, pageCount, maxPages, false) {
 			return
 		}
@@ -243,16 +180,13 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		if !ok {
 			return // frontier exhausted
 		}
-		// MarkActive is NOT called here: Pop atomically increments the active
-		// counter before returning, making dequeue+activate a single critical
-		// section. Callers only need MarkIdle() after processing completes.
+		// MarkActive is NOT called: Pop already incremented the active counter
+		// inside its own critical section, making dequeue+activate atomic. Only
+		// MarkIdle() is needed after processing.
 
-		// Reserve this page's budget slot before visiting. Another worker may
-		// have reached the budget while we were blocked in Pop waiting for a
-		// link; if so, release the entry without visiting so the crawl never
-		// exceeds MaxPages. Reserving before the visit (rather than counting
-		// after) keeps the cap exact instead of overshooting by up to
-		// Concurrency pages.
+		// Another worker may have filled the budget while this one blocked in Pop,
+		// so release without visiting. Reserving before the visit rather than
+		// counting after is what avoids overshooting by up to Concurrency pages.
 		if pageBudgetReached(mu, pageCount, maxPages, true) {
 			e.frontier.MarkIdle()
 			return
@@ -271,7 +205,6 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 			continue
 		}
 
-		// Emit captured requests.
 		for _, req := range requests {
 			if ctx.Err() != nil {
 				e.frontier.MarkIdle()
@@ -280,7 +213,6 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 			onResult(req)
 		}
 
-		// Push discovered links at depth+1.
 		if len(links) > 0 {
 			entries := make([]urlEntry, len(links))
 			for i, link := range links {
@@ -293,10 +225,10 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 	}
 }
 
-// visitPage navigates a fresh tab to the given URL, captures network events,
-// waits for DOM stability, and extracts links.
+// visitPage navigates a fresh tab, captures network events, waits for DOM
+// stability, and extracts links.
 func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedRequest, []string, error) {
-	// Create a new tab for each visit to avoid stale state.
+	// Fresh tab per visit: no stale state carried between pages.
 	page, err := e.browser.Page(proto.TargetCreateTarget{URL: "about:blank"})
 	if err != nil {
 		return nil, nil, fmt.Errorf("create tab: %w", err)
@@ -305,16 +237,13 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 		page.Close() //nolint:errcheck,gosec // best-effort close; page may already be closed
 	}()
 
-	// Apply context and per-page timeout.
 	page = page.Context(ctx).Timeout(e.opts.PageTimeout)
 
-	// Enable the Network domain for capturing requests.
 	enableNetwork := proto.NetworkEnable{}
 	if err := enableNetwork.Call(page); err != nil {
 		return nil, nil, fmt.Errorf("enable network: %w", err)
 	}
 
-	// Set custom headers if configured.
 	if len(e.opts.Headers) > 0 {
 		headerPairs := make([]string, 0, len(e.opts.Headers)*2)
 		for k, v := range e.opts.Headers {
@@ -327,41 +256,33 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 		defer cleanup()
 	}
 
-	// Wire up network capture before navigation.
+	// Before navigation, or the first requests are missed.
 	capture, waitEvents := newPageNetworkCapture(page, target.URL)
 
-	// Start the event listener in a goroutine. The goroutine exits when
-	// the page is closed (deferred above) or the page context expires.
-	// go-rod's EachEvent internally listens on the page's CDP session,
-	// which is torn down by page.Close().
+	// Exits when page.Close() tears down the CDP session EachEvent listens on, or
+	// when the page context expires.
 	go waitEvents()
 
-	// Navigate to the target URL.
 	if err := page.Navigate(target.URL); err != nil {
 		return nil, nil, fmt.Errorf("navigate: %w", err)
 	}
 
-	// Wait for page load event.
 	if err := page.WaitLoad(); err != nil {
-		// Non-fatal: some pages may not fire load event before timeout.
-		// Continue to collect whatever network events were captured.
+		// Non-fatal: not every page fires load before the timeout.
 		if ctx.Err() != nil {
 			return capture.Results(), nil, nil
 		}
 	}
 
-	// Wait for DOM stability — the key optimization: these waits overlap
-	// across concurrent workers instead of serializing.
+	// These waits overlap across workers rather than serializing.
 	if err := page.WaitStable(e.opts.StableTimeout); err != nil {
-		// Non-fatal: collect partial results.
 		if ctx.Err() != nil {
 			return capture.Results(), nil, nil
 		}
 	}
 
-	// Give network events a brief moment to settle after DOM stability.
-	// This catches late XHR/fetch calls triggered by mutation observers
-	// or intersection observers that fire during DOM stabilization.
+	// Catches late XHR/fetch from mutation and intersection observers that fire
+	// during stabilization.
 	settle := time.NewTimer(200 * time.Millisecond)
 	select {
 	case <-settle.C:
@@ -370,51 +291,34 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 		return capture.Results(), nil, nil
 	}
 
-	// Extract links, run jsluice, and discover forms from the stabilized page.
 	capturedResults := capture.Results()
 	results, links := enrichFromPage(page, capturedResults, target.URL, e.opts.Stderr, e.opts.ScopeCheck)
 	return results, links, nil
 }
 
-// enrichFromPage extracts links from the DOM, runs jsluice on JS sources and
-// inline scripts, and discovers forms. It returns the enriched results and all
-// discovered links for the frontier. Errors are logged to stderr (if non-nil)
-// but are non-fatal — captured network results are always returned.
+// enrichFromPage does the DOM-reading half — links, jsluice, forms — then hands
+// the pure combining logic to [mergeEnrichedLinks], which is unit tested. Errors
+// are non-fatal; captured network results are always returned.
 //
-// pageURL is the URL the worker navigated to (used for form PageURL tagging
-// and as a fallback for URL resolution when the DOM provides no <base href>
-// and page.Info() returns an error).
-//
-// scopeFn is forwarded to mergeEnrichedLinks so form actions whose host
-// is out of scope are not appended as synthetic ObservedRequests.
-//
-// This function handles the DOM-reading side (page.Info, extractLinks,
-// extractForms, extractURLsFromInlineScripts) and then delegates the pure
-// link-combining logic to [mergeEnrichedLinks], which is directly unit
-// tested.
+// pageURL is where the worker navigated, used for form PageURL tagging and as the
+// resolution fallback when there is no <base href> and page.Info() errors.
 func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, stderr io.Writer, scopeFn func(string) bool) ([]ObservedRequest, []string) {
-	// Defensive: a nil page means there's nothing to read from the DOM.
-	// Route straight to the merger so any already-captured network requests
-	// are still returned. No production caller passes nil today — this
-	// guard exists so the merger-threading contract can be tested without
-	// standing up a real rod.Page (round-11 TEST-001).
+	// No production caller passes nil today; the guard exists so the
+	// merger-threading contract is testable without a real rod.Page.
 	if page == nil {
 		captured, links := mergeEnrichedLinksFn(captured, nil, nil, nil, nil, pageURL, pageURL, scopeFn)
 		return captured, links
 	}
 
-	// Resolve the effective base URL for any relative references on this page.
-	// jsluice-extracted URLs and form actions must honor <base href> the same
-	// way the browser would, or we end up queuing mangled/nested paths.
+	// jsluice URLs and form actions must honor <base href> like the browser, or
+	// the frontier queues mangled nested paths.
 	resolvedPageURL := pageURL
 	if info, err := page.Info(); err == nil && info.URL != "" {
 		resolvedPageURL = info.URL
 	}
 	baseURL := effectiveBaseURL(page, resolvedPageURL)
 
-	// Extract links from the DOM. A failure here is non-fatal — it only
-	// affects DOM-sourced href discovery. Continue with domLinks=nil so the
-	// JS-from-responses, inline-script, and form paths still enrich captured.
+	// Non-fatal: domLinks=nil still leaves the JS, inline-script and form paths.
 	domLinks, err := extractLinks(page, baseURL)
 	if err != nil {
 		if stderr != nil {
@@ -426,9 +330,8 @@ func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, 
 	jsFromResponses := extractURLsFromResponses(captured)
 	jsFromInline := extractURLsFromInlineScripts(page)
 
-	// extractForms uses resolvedPageURL for no-action forms (HTML spec) and
-	// baseURL for explicit action refs (browser behavior). A DOM query error
-	// here is non-fatal — treat as "no forms discovered" and keep going.
+	// resolvedPageURL for no-action forms per the HTML spec, baseURL for explicit
+	// action refs per browser behavior. A DOM error means no forms.
 	forms, ferr := extractForms(page, resolvedPageURL, baseURL)
 	if ferr != nil && stderr != nil {
 		fmt.Fprintf(stderr, "form extraction failed for %s: %v\n", pageURL, ferr) //nolint:errcheck // best-effort
@@ -438,43 +341,23 @@ func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, 
 	return captured, links
 }
 
-// mergeEnrichedLinksFn is the function enrichFromPage calls to combine
-// page-extracted inputs with scope enforcement. Package-level var so tests
-// can verify the scopeFn argument is threaded correctly from e.opts.ScopeCheck
-// through enrichFromPage to mergeEnrichedLinks (the one-line call was
-// previously integration-only coverage — see LAB-2221 round-11 TEST-001).
-// Production callers always see the real mergeEnrichedLinks.
+// mergeEnrichedLinksFn is a var so tests can check scopeFn is threaded from
+// e.opts.ScopeCheck through to mergeEnrichedLinks without a browser (LAB-2221).
 //
-// NOT PARALLEL-SAFE: tests swap this via a t.Cleanup-restored pattern and
-// MUST NOT call t.Parallel() — concurrent swaps would race on the global.
-// No sync is used here because the production read path is single-threaded
-// per page and the test swap happens before the call under test.
+// NOT PARALLEL-SAFE: tests swap it and MUST NOT call t.Parallel().
+// Unsynchronized because production reads it single-threaded per page.
 var mergeEnrichedLinksFn = mergeEnrichedLinks
 
-// mergeEnrichedLinks combines every link source discovered on a page into a
-// single link list for the frontier, appends synthetic form ObservedRequests
-// to captured, and returns the combined (captured, links) pair. This is the
-// pure, DOM-free portion of enrichFromPage and is directly unit tested.
+// mergeEnrichedLinks is the pure, DOM-free half of enrichFromPage: it merges every
+// link source and appends synthetic form ObservedRequests to captured.
 //
-//   - jsFromResponses/jsFromInline come from jsluice and are routed through
-//     jsExtractedToLinks so asset-only hits (main.js, styles.css) are
-//     dropped before entering the frontier.
-//   - form actions arrive pre-resolved from extractForms (explicit
-//     action= values resolved against baseURL; no-action forms set to
-//     pageURL). Only the asset/streaming filter applies here.
-//   - pageURL is the resolved navigation URL; baseURL is the <base href>-
-//     aware base. Both are passed because forms need page-URL semantics
-//     for PageURL tagging but base-URL semantics for explicit action refs.
-//   - scopeFn filters form actions before they become synthetic
-//     ObservedRequests. Frontier-side links already go through scope
-//     at Push; this protects the captured-append path from
-//     attacker-host form actions on an in-scope page. When scopeFn is
-//     nil, no filtering is applied.
+// Both pageURL and baseURL are needed: forms tag PageURL from the former and
+// resolve explicit action refs against the latter. scopeFn filters form actions,
+// which the frontier's Push-time scope check cannot do because these go straight
+// into captured. Nil scopeFn means no filtering.
 //
-// The returned links slice may contain cross-source duplicates (a URL
-// reached from both a DOM href and a jsluice hit will appear twice).
-// The frontier deduplicates on Push, so callers should not add another
-// dedup layer here.
+// Returned links may hold cross-source duplicates; the frontier dedupes on Push,
+// so do not add another layer.
 func mergeEnrichedLinks(
 	captured []ObservedRequest,
 	domLinks []string,
@@ -493,19 +376,13 @@ func mergeEnrichedLinks(
 	}
 
 	if len(forms) > 0 {
-		// Scope-enforce form actions before they become synthetic
-		// ObservedRequests. Without this, a <form action="https://attacker/x">
-		// on an in-scope page would flow into captured -> capture.json ->
-		// probes, which would re-request the attacker URL with any
-		// operator-supplied headers attached. (Frontier-side links are
-		// scope-checked at Push; this closes the corresponding gap on the
-		// captured-append side.) f.Action is always absolute per
-		// resolveFormAction; empty Action means the form spec-defaults to
-		// pageURL, which is same-origin by definition — keep those.
+		// Without this, <form action="https://attacker/x"> on an in-scope page
+		// reaches capture.json and then the probe stage, which re-requests it with
+		// the operator's headers attached. Empty Action spec-defaults to pageURL and
+		// is same-origin, so keep those.
 		//
-		// Fast path: nil scopeFn means no filtering; alias `forms` directly
-		// to avoid allocation. Do not mutate scopedForms when scopeFn is nil
-		// — the alias would leak back to the caller's slice.
+		// Nil scopeFn aliases `forms` to avoid an allocation — do NOT mutate
+		// scopedForms in that case, the alias reaches the caller's slice.
 		scopedForms := forms
 		if scopeFn != nil {
 			scopedForms = make([]discoveredForm, 0, len(forms))

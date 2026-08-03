@@ -26,52 +26,38 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 )
 
-// browserLookPath resolves the system browser binary. It is a package var so
-// tests can exercise the no-browser-found path deterministically regardless of
-// what is installed on the host (go-rod uses the same "interface for testing"
-// idiom for its own exec calls). Production code always uses launcher.LookPath.
+// browserLookPath is a var so tests can hit the no-browser-found path whatever
+// the host has installed.
 //
-// NOT PARALLEL-SAFE: tests swap this via a t.Cleanup-restored pattern (see
-// stubLookPath in browser_test.go) and MUST NOT call t.Parallel() — concurrent
-// swaps would race on the global. No sync is used here because the production
-// read path runs once per launcher configuration and the test swap happens
-// before the call under test.
+// NOT PARALLEL-SAFE: tests swap it (stubLookPath) and MUST NOT call t.Parallel().
+// Unsynchronized because production reads it once per launcher config and the swap
+// precedes the call under test.
 var browserLookPath = launcher.LookPath
 
 // BrowserOptions configures Chrome launch parameters.
 type BrowserOptions struct {
 	Headless bool
 
-	// NoSandbox disables Chrome's OS-level sandbox. This removes a primary
-	// exploit mitigation barrier and should only be set in containerized or
-	// CI environments where the sandbox cannot be enabled (e.g., Docker
-	// without --cap-add SYS_ADMIN). The sandbox is also disabled when the
-	// VESPASIAN_NO_SANDBOX environment variable is set to "true".
+	// Removes a primary exploit mitigation. Only for containers that cannot
+	// enable it (Docker without --cap-add SYS_ADMIN). VESPASIAN_NO_SANDBOX=true
+	// does the same.
 	NoSandbox bool
 
-	// ChromePath overrides the Chrome binary used by the launcher. This value
-	// is passed directly to exec.Command — it must be a trusted, hardcoded
-	// path. Never populate from user-controlled input.
+	// Passed straight to exec.Command: must be trusted and hardcoded, never
+	// user-controlled.
 	ChromePath string
 
-	// AllowBrowserDownload permits go-rod to download a managed Chromium from
-	// its third-party mirror hosts (Google Storage, npmmirror, Playwright CDN)
-	// when no system browser is found and ChromePath is unset. It is OFF by
-	// default: configureLauncher pins the system browser via launcher.LookPath()
-	// and errors when none is found, so a security crawl never pulls a browser
-	// binary over the network (supply-chain hardening, LAB-4999). Enable it — or
-	// set VESPASIAN_ALLOW_BROWSER_DOWNLOAD=true — only for local dev on platforms
-	// without a system Chrome (e.g. arm64 Linux, where Google Chrome has no build).
+	// Lets go-rod pull a Chromium from third-party mirrors (Google Storage,
+	// npmmirror, Playwright CDN). OFF by default so a security crawl never fetches
+	// a browser binary over the network (LAB-4999). For local dev on platforms with
+	// no system Chrome, e.g. arm64 Linux.
 	AllowBrowserDownload bool
 
-	// Proxy sets the Chrome --proxy-server flag, routing all browser traffic
-	// through the given address (e.g., "http://127.0.0.1:8080" for Burp Suite).
-	Proxy string
+	Proxy string // Chrome --proxy-server, e.g. "http://127.0.0.1:8080"
 }
 
-// BrowserManager owns the Chrome process lifecycle. It launches Chrome via
-// go-rod's launcher and retains the handle so vespasian can kill the browser
-// immediately on signal, stopping all outbound requests.
+// BrowserManager owns the Chrome process lifecycle, retaining the launcher handle
+// so a signal can kill the browser and stop all outbound requests at once.
 type BrowserManager struct {
 	launcher    *launcher.Launcher
 	browser     *rod.Browser
@@ -80,36 +66,15 @@ type BrowserManager struct {
 	cleanupOnce sync.Once
 }
 
-// vespasianEnablesNoSandbox reports whether Vespasian's own configuration opts
-// into disabling Chrome's OS-level sandbox — either explicitly via
-// BrowserOptions.NoSandbox or via the VESPASIAN_NO_SANDBOX env var (set by CI
-// workflows). It is the single source of truth for that decision; both
-// configureLauncher and browser_test.go consult it. Keeping the decision in a
-// self-contained helper lets the test assert Vespasian's contribution
-// directly, which stays deterministic even where go-rod's launcher.New() adds
-// --no-sandbox by default in containers and masks the launcher-observed flag
-// (LAB-4994).
+// vespasianEnablesNoSandbox is the single source of truth for the sandbox
+// decision. Separate from the launcher's own state because go-rod's
+// launcher.New() adds --no-sandbox by default in containers, which masks the flag
+// as observed on the launcher (LAB-4994).
 func vespasianEnablesNoSandbox(opts BrowserOptions) bool {
 	return opts.NoSandbox || os.Getenv("VESPASIAN_NO_SANDBOX") == "true"
 }
 
-// configureLauncher applies BrowserOptions to a new launcher without
-// launching Chrome. In order, it:
-//
-//  1. Disables the sandbox when vespasianEnablesNoSandbox opts in — i.e.
-//     opts.NoSandbox is set or VESPASIAN_NO_SANDBOX is "true" (see that
-//     helper's doc for the exact condition, incl. go-rod's container default;
-//     LAB-4994).
-//  2. Validates opts.Proxy (when set) via ValidateProxyAddr before touching
-//     the browser binary, so a bad proxy is always reported as a proxy error
-//     independent of what Chrome is installed on the host.
-//  3. Pins the browser binary via pinBrowserBinary, which returns a "no system
-//     Chrome/Chromium found" error when no browser is resolvable — unless
-//     downloads are opted in via opts.AllowBrowserDownload or
-//     VESPASIAN_ALLOW_BROWSER_DOWNLOAD=true (Finding 1, LAB-4999). This is a
-//     new failure mode unrelated to the sandbox.
-//  4. Applies telemetry/phone-home-disabling launch flags via
-//     disableChromeTelemetry (Finding 2, LAB-4999).
+// configureLauncher applies BrowserOptions without launching Chrome.
 func configureLauncher(opts BrowserOptions) (*launcher.Launcher, error) {
 	l := launcher.New().
 		Headless(opts.Headless)
@@ -117,12 +82,8 @@ func configureLauncher(opts BrowserOptions) (*launcher.Launcher, error) {
 	if vespasianEnablesNoSandbox(opts) {
 		l = l.NoSandbox(true)
 	}
-	// Validate the proxy before resolving the browser binary. Proxy validation
-	// is a deterministic check on caller input; pinning depends on what is
-	// installed on the host. Ordering validation first keeps error behavior
-	// host-independent — a bad proxy is always reported as a proxy error, even
-	// on a machine without a system Chrome — instead of masking it behind a
-	// "no system browser" error (LAB-4999 review feedback).
+	// Before pinning, so a bad proxy reports as a proxy error even on a host with
+	// no Chrome, rather than being masked by "no system browser".
 	if opts.Proxy != "" {
 		if err := ValidateProxyAddr(opts.Proxy); err != nil {
 			return nil, err
@@ -137,24 +98,13 @@ func configureLauncher(opts BrowserOptions) (*launcher.Launcher, error) {
 	return l, nil
 }
 
-// pinBrowserBinary sets the launcher's browser binary so go-rod uses a local
-// Chrome and never auto-downloads one (Finding 1, LAB-4999). By default go-rod
-// leaves the binary unset and, at launch, downloads a managed Chromium from
-// third-party mirror hosts (storage.googleapis.com, registry.npmmirror.com,
-// playwright.*) — a supply-chain risk and a source of nondeterministic CI
-// egress. go-rod does NOT auto-discover a system Chrome; LookPath() is a
-// separate helper the launcher never calls on its own.
+// pinBrowserBinary stops go-rod auto-downloading a browser (LAB-4999). Left
+// unset it fetches a managed Chromium from third-party mirrors
+// (storage.googleapis.com, registry.npmmirror.com, playwright.*), a supply-chain
+// risk and nondeterministic CI egress. go-rod does NOT auto-discover a system
+// Chrome — LookPath() is a helper the launcher never calls itself.
 //
-// Resolution order:
-//  1. opts.ChromePath, if set, is used verbatim.
-//  2. otherwise the system browser is resolved via launcher.LookPath() (whose
-//     Linux candidates include /usr/bin/google-chrome-stable, the CI runner's
-//     Chrome).
-//  3. if none is found, return an error rather than let go-rod download —
-//     UNLESS downloads are explicitly opted in via opts.AllowBrowserDownload or
-//     VESPASIAN_ALLOW_BROWSER_DOWNLOAD=true, in which case the binary is left
-//     unset so go-rod falls back to its managed download (keeps local dev
-//     working on platforms with no system Chrome, e.g. arm64 Linux).
+// ChromePath, else LookPath(), else error unless downloads are opted in.
 func pinBrowserBinary(l *launcher.Launcher, opts BrowserOptions) error {
 	if opts.ChromePath != "" {
 		l.Bin(opts.ChromePath)
@@ -165,51 +115,36 @@ func pinBrowserBinary(l *launcher.Launcher, opts BrowserOptions) error {
 		return nil
 	}
 	if opts.AllowBrowserDownload || os.Getenv("VESPASIAN_ALLOW_BROWSER_DOWNLOAD") == "true" {
-		// Leave the binary unset so go-rod downloads a managed browser.
-		return nil
+		return nil // unset: go-rod downloads a managed browser
 	}
 	return fmt.Errorf("no system Chrome/Chromium found in standard paths: set BrowserOptions.ChromePath, install a browser, or set VESPASIAN_ALLOW_BROWSER_DOWNLOAD=true to allow go-rod to download one")
 }
 
-// chromeEgressSink is a destination for launch flags that redirect a Chrome
-// subsystem's endpoint rather than toggle a boolean switch. It resolves to
-// nothing: ".invalid" is reserved by RFC 2606 and is guaranteed to never
-// resolve on the public Internet, so pointing a Google-service URL override
-// here fails fast (NXDOMAIN, no TCP/TLS handshake) instead of reaching any
-// real host. Distinct path/port suffixes below are cosmetic (readability of
-// any dropped-connection diagnostics), not functionally required.
+// chromeEgressSink is where URL-override flags point. ".invalid" is RFC 2606
+// reserved and never resolves, so an override fails at NXDOMAIN with no handshake.
+// The distinct path/port suffixes below are cosmetic.
 const chromeEgressSink = "https://vespasian-blocked.invalid"
 
-// disableChromeTelemetry adds launch flags that stop Chrome from phoning home
-// to Google during a crawl (Finding 2, LAB-4999). go-rod's defaults already
-// set --disable-background-networking and --disable-sync, but Chrome still
-// reaches component-update, domain-reliability, optimization-hints and autofill
-// endpoints — including dynamically-sharded *.gvt1.com hosts that make a CI
-// egress allowlist brittle. These flags suppress that chatter without affecting
-// the crawl.
+// disableChromeTelemetry stops Chrome phoning home during a crawl (LAB-4999).
+// go-rod already sets --disable-background-networking and --disable-sync, but
+// Chrome still reaches component-update, domain-reliability, optimization-hints
+// and autofill, including sharded *.gvt1.com hosts that make a CI egress
+// allowlist brittle.
 //
 // Tradeoff: --disable-component-update also stops in-crawl CRLSet and
-// Safe-Browsing list refreshes, so Chrome relies on the build-time CRLSet for
-// the crawl's duration. Accepted for short-lived, operator-initiated crawls —
-// full TLS chain verification against the OS trust store and the SSRF/scope
-// guards remain in force (LAB-4999).
+// Safe-Browsing list refreshes, so the build-time CRLSet stands for the crawl.
+// Accepted: OS-trust-store TLS verification and the SSRF/scope guards remain.
 //
-// A live step-security/harden-runner egress audit of branded google-chrome-stable
-// (LAB-4999 review) found the flags above insufficient: even with them set,
-// branded Chrome still phoned home to accounts.google.com (13x — the primary
-// target below), www.google.com, clients2.google.com,
-// android.clients.google.com, mtalk.google.com:5228, and
-// safebrowsingohttpgateway.googleapis.com. The flags below target each of
-// those hosts individually. Unlike the boolean switches above, most of these
-// are URL-override switches: Chrome's C++ browser-process code builds a
-// request against a compiled-in default host, and reading a command-line
-// switch to override that default is the only verified lever for that
-// subsystem. Redirecting to chromeEgressSink (see above) suppresses the
-// egress without a boolean "disable" existing for that host. These only
-// affect Chrome's own browser-process requests — not renderer-initiated
-// requests a crawled page's own JavaScript makes to accounts.google.com
-// (e.g. a real "Sign in with Google" button), which the crawler must still
-// observe.
+// A live harden-runner audit of branded google-chrome-stable showed the above
+// insufficient — it still reached accounts.google.com (13x), www.google.com,
+// clients2.google.com, android.clients.google.com, mtalk.google.com:5228 and
+// safebrowsingohttpgateway.googleapis.com. The flags below target each.
+//
+// Most are URL overrides, not booleans: Chrome builds the request against a
+// compiled-in host and the switch is the only verified lever, so redirecting to
+// chromeEgressSink is how egress stops where no "disable" exists. This covers
+// only Chrome's own browser-process requests, never a page's own JavaScript
+// hitting accounts.google.com, which the crawl must still observe.
 //
 //   - --gaia-url redirects accounts.google.com, Chrome's own GAIA/account-
 //     consistency origin (google_apis/gaia/gaia_urls.cc: kDefaultGaiaUrl is
@@ -279,8 +214,7 @@ func disableChromeTelemetry(l *launcher.Launcher) {
 	l.Set("disable-component-update")
 	l.Set("disable-domain-reliability")
 	l.Set("no-pings")
-	// Append, not Set: go-rod seeds disable-features with site-per-process and
-	// TranslateUI (see launcher.New), which must be preserved.
+	// Append, not Set: go-rod seeds this with site-per-process and TranslateUI.
 	l.Append("disable-features", "OptimizationHints", "AutofillServerCommunication", "SafeBrowsingHashPrefixRealTimeLookups")
 
 	l.Set("gaia-url", chromeEgressSink)
@@ -290,8 +224,7 @@ func disableChromeTelemetry(l *launcher.Launcher) {
 	l.Set("apps-gallery-update-url", chromeEgressSink+"/no-extension-updates")
 }
 
-// NewBrowserManager launches a Chrome instance with the given options and
-// returns a manager that owns its lifecycle.
+// NewBrowserManager launches Chrome and owns its lifecycle.
 func NewBrowserManager(opts BrowserOptions) (*BrowserManager, error) {
 	l, err := configureLauncher(opts)
 	if err != nil {
@@ -317,47 +250,39 @@ func NewBrowserManager(opts BrowserOptions) (*BrowserManager, error) {
 	}, nil
 }
 
-// wsURL returns the Chrome DevTools Protocol WebSocket URL. The headless crawl
-// engine (go-rod) connects to this URL instead of launching its own browser,
-// so vespasian owns the Chrome process lifecycle.
-//
-// Security: this URL grants full control of the browser session. Do not
-// log it or expose it to untrusted callers.
+// wsURL is the CDP endpoint the engine connects to instead of launching its own
+// browser. It grants full control of the session: never log or expose it.
 func (b *BrowserManager) wsURL() string {
 	return b.wsEndpoint
 }
 
-// Kill immediately terminates the Chrome process. This stops all outbound
-// network requests. Safe to call multiple times.
+// Kill terminates Chrome, stopping all outbound requests. Idempotent.
 func (b *BrowserManager) Kill() {
 	b.killOnce.Do(func() {
 		b.launcher.Kill()
 	})
 }
 
-// cleanup waits for Chrome to exit and removes the temporary user data
-// directory. Safe to call multiple times.
+// cleanup waits for exit and removes the temp user-data dir. Idempotent.
 func (b *BrowserManager) cleanup() {
 	b.cleanupOnce.Do(func() {
 		b.launcher.Cleanup()
 	})
 }
 
-// Close kills Chrome (if still running) and cleans up resources. Intended
-// for use with defer in the normal (non-signal) path.
+// Close kills Chrome and cleans up. For defer on the non-signal path.
 func (b *BrowserManager) Close() {
 	if b.browser != nil {
-		// #nosec G104 -- best-effort close on a process that may already be dead; any error is unactionable and the subsequent Kill() + cleanup() still execute.
+		// #nosec G104 -- may already be dead; Kill() and cleanup() still run.
 		b.browser.Close() //nolint:errcheck,gosec // best-effort; process may already be dead
 	}
 	b.Kill()
 	b.cleanup()
 }
 
-// SetCookies injects cookies into Chrome's cookie store via the Storage.setCookies
-// CDP protocol. This is the reliable way to propagate session cookies across all
-// browser requests — unlike Network.setExtraHTTPHeaders, cookies set via the
-// Storage domain survive redirects, new tabs, and Fetch API interception.
+// SetCookies goes through CDP Storage.setCookies, not
+// Network.setExtraHTTPHeaders: only those survive redirects, new tabs and
+// page-initiated fetch().
 func (b *BrowserManager) SetCookies(cookies []*proto.NetworkCookieParam) error {
 	if b == nil || b.browser == nil {
 		return fmt.Errorf("browser not connected")
@@ -365,27 +290,19 @@ func (b *BrowserManager) SetCookies(cookies []*proto.NetworkCookieParam) error {
 	return b.browser.SetCookies(cookies)
 }
 
-// PID returns the Chrome process ID, useful for testing.
+// PID returns the Chrome process ID.
 func (b *BrowserManager) PID() int {
 	return b.launcher.PID()
 }
 
-// ValidateProxyAddr checks that the proxy address is a valid http/https/socks5
-// URL with a host and no embedded credentials. It is used by both crawler
-// backends: the headless path (NewBrowserManager, for the Chrome
-// --proxy-server flag) and the HTTP path (HTTPCrawler.Crawl and the CLI's
-// doCrawl, before opts.Proxy is printed) so a bad or credential-bearing proxy
-// is rejected before any network activity or logging.
+// ValidateProxyAddr requires http/https/socks5, a host, and no credentials. Both
+// backends call it before any network activity or logging of opts.Proxy.
 func ValidateProxyAddr(addr string) error {
-	// A proxy address is scheme://host[:port] and legitimately carries no
-	// userinfo, so treat any '@' as embedded credentials and reject it before
-	// anything echoes addr. Mask everything up to and including the last '@':
-	// userinfo always precedes the '@', so replacing that whole span with a
-	// fixed placeholder makes it impossible for a password to reach logs, CI
-	// output, or terminal scrollback — regardless of characters in the
-	// credential ('/', '?', '#', '%', a literal '://', or extra '@'s) that a
-	// structure-aware scan could misjudge. With no '@' the address cannot carry
-	// credentials, so the errors below may safely echo it.
+	// A proxy address carries no userinfo, so any '@' means credentials. Mask
+	// through the LAST '@' rather than parsing: userinfo always precedes it, so no
+	// password reaches logs whatever it contains ('/', '?', '#', '%', '://', more
+	// '@'s) that a structure-aware scan could misread. With no '@' the errors below
+	// may echo addr safely.
 	if at := strings.LastIndexByte(addr, '@'); at >= 0 {
 		masked := "xxxxx@" + addr[at+1:]
 		return fmt.Errorf("invalid proxy address %q: embedded credentials are not supported (they would be visible in process listing); configure authentication in your proxy instead", masked)

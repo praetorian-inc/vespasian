@@ -22,11 +22,9 @@ type urlEntry struct {
 	Depth int
 }
 
-// urlFrontier is a thread-safe queue of URLs to visit, with deduplication,
-// scope filtering, and depth tracking. Workers call Pop to get the next URL and
-// Push to enqueue discovered links. The frontier detects completion when the
-// queue is empty and no workers are actively processing a page.
-// By default the queue is FIFO (BFS). Call SetDFS(true) to switch to LIFO (DFS).
+// urlFrontier is a thread-safe queue with dedup, scope filtering and depth
+// tracking. Complete when the queue is empty and no worker is active. FIFO (BFS)
+// unless SetDFS(true).
 type urlFrontier struct {
 	mu       sync.Mutex
 	cond     *sync.Cond
@@ -39,9 +37,7 @@ type urlFrontier struct {
 	dfs      bool // when true, Pop uses LIFO order (depth-first)
 }
 
-// newURLFrontier creates a frontier with the given max depth and scope filter.
-// The scopeFn is called for every URL before enqueuing; returning false rejects
-// the URL. A nil scopeFn accepts all URLs.
+// newURLFrontier calls scopeFn before enqueuing each URL; nil accepts everything.
 func newURLFrontier(maxDepth int, scopeFn func(string) bool) *urlFrontier {
 	f := &urlFrontier{
 		queue:    make([]urlEntry, 0, 64),
@@ -53,8 +49,7 @@ func newURLFrontier(maxDepth int, scopeFn func(string) bool) *urlFrontier {
 	return f
 }
 
-// Push adds URLs to the frontier if they pass scope, depth, and dedup checks.
-// Returns the number of URLs actually enqueued.
+// Push returns the number enqueued after scope, depth and dedup checks.
 func (f *urlFrontier) Push(entries []urlEntry) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -65,8 +60,7 @@ func (f *urlFrontier) Push(entries []urlEntry) int {
 
 	added := 0
 	for _, e := range entries {
-		// Depth check: entries at depth > maxDepth are links we would visit
-		// at maxDepth+1, which exceeds the configured limit.
+
 		if f.maxDepth >= 0 && e.Depth > f.maxDepth {
 			continue
 		}
@@ -95,29 +89,20 @@ func (f *urlFrontier) Push(entries []urlEntry) int {
 	return added
 }
 
-// SetDFS switches the frontier to depth-first (LIFO) pop order when v is true,
-// or back to breadth-first (FIFO) when v is false. The mutation is
-// mutex-protected and is therefore safe from data races. However, SetDFS is
-// intended to be called before the first Push: calling it after workers have
-// started produces a non-deterministic mid-crawl traversal-order change (a
-// logical race), not a data race.
+// SetDFS switches pop order. Mutex-protected, so no data race, but call it before
+// the first Push: mid-crawl it changes traversal order non-deterministically.
 func (f *urlFrontier) SetDFS(v bool) {
 	f.mu.Lock()
 	f.dfs = v
 	f.mu.Unlock()
 }
 
-// Pop returns the next URL to visit, atomically marking the entry as active.
-// It blocks until a URL is available or the frontier is done (empty queue, no
-// active workers, or closed). Returns (entry, true) on success or
-// (urlEntry{}, false) when the frontier is exhausted.
-// When SetDFS(true) has been called, Pop returns the last-pushed entry (LIFO).
+// Pop blocks until an entry is available or the frontier is exhausted.
 //
-// Active tracking is incremented inside Pop's critical section before the
-// mutex is released, making dequeue+activate atomic. This closes the TOCTOU
-// window where a concurrent Pop could observe an empty queue with active==0
-// while another worker holds an entry but has not yet called MarkActive.
-// Callers MUST call MarkIdle() exactly once when done processing the entry.
+// The active counter is incremented inside Pop's critical section, making
+// dequeue+activate atomic. That closes the TOCTOU window where a concurrent Pop
+// sees an empty queue with active==0 while another worker holds an entry but has
+// not yet marked itself active. Callers MUST call MarkIdle() exactly once.
 func (f *urlFrontier) Pop() (urlEntry, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -126,49 +111,39 @@ func (f *urlFrontier) Pop() (urlEntry, bool) {
 		if len(f.queue) > 0 {
 			var entry urlEntry
 			if f.dfs {
-				// LIFO: take the last element. Clear the popped slot before
-				// reslicing so the backing array does not retain the entry
-				// (GC concern on large DFS crawls — mirrors the FIFO path).
+				// Clear the slot before reslicing or the backing array retains it.
 				last := len(f.queue) - 1
 				entry = f.queue[last]
 				f.queue[last] = urlEntry{}
 				f.queue = f.queue[:last]
 			} else {
-				// FIFO: take the first element. Zero the dequeued slot before
-				// advancing so the backing array does not retain it between
-				// compactions (same GC concern handled in the DFS branch).
+				// Zero before advancing, same reason.
 				entry = f.queue[0]
 				f.queue[0] = urlEntry{}
 				f.queue = f.queue[1:]
-				// Compact the backing array when it's 4x larger than needed.
-				// Without this, consumed slots hold stale entries that can't
-				// be GC'd — a memory concern on large crawls.
+				// Compact at 4x: consumed slots otherwise pin stale entries.
 				if cap(f.queue) > 4*len(f.queue) && len(f.queue) > 0 {
 					compact := make([]urlEntry, len(f.queue))
 					copy(compact, f.queue)
 					f.queue = compact
 				}
 			}
-			// Atomically mark this worker as active so concurrent Pop calls
-			// block instead of returning false when the queue drains.
+			// Marked active here so a concurrent Pop blocks rather than returning
+			// false as the queue drains.
 			f.active++
 			return entry, true
 		}
 
-		// Queue is empty. If no workers are active (and thus no new URLs can
-		// arrive), or the frontier is closed, we're done.
+		// Empty and nobody active means no new URLs can arrive.
 		if f.active == 0 || f.closed {
 			return urlEntry{}, false
 		}
 
-		// Wait for Push or MarkIdle to signal.
 		f.cond.Wait()
 	}
 }
 
-// MarkIdle decrements the active-worker counter. Call this when a worker
-// finishes processing a URL (after pushing discovered links). If the queue
-// is empty and no workers are active, waiting Pop calls are unblocked.
+// MarkIdle decrements the active counter, after pushing discovered links.
 func (f *urlFrontier) MarkIdle() {
 	f.mu.Lock()
 	f.active--
@@ -178,8 +153,7 @@ func (f *urlFrontier) MarkIdle() {
 	f.mu.Unlock()
 }
 
-// Close signals that no more URLs will be added externally. Any blocked Pop
-// calls will return false once the queue drains.
+// Close makes blocked Pop calls return false once the queue drains.
 func (f *urlFrontier) Close() {
 	f.mu.Lock()
 	f.closed = true
@@ -187,16 +161,14 @@ func (f *urlFrontier) Close() {
 	f.mu.Unlock()
 }
 
-// Len returns the number of URLs currently in the queue (not including
-// URLs being actively processed by workers).
+// Len excludes URLs being actively processed.
 func (f *urlFrontier) Len() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.queue)
 }
 
-// Seen returns the total number of unique URLs that have been enqueued
-// (including those already processed).
+// Seen counts every unique URL ever enqueued.
 func (f *urlFrontier) Seen() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
