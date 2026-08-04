@@ -362,7 +362,7 @@ type CrawlCmd struct {
 }
 
 // buildAugmentOptions assembles the pipeline.AugmentOptions shared by the crawl,
-// generate, and scan commands' JS-static stage. Centralised (QUAL-001) so a new
+// generate, and scan commands' JS-static stage. Centralized (QUAL-001) so a new
 // AugmentOptions field is wired in one place instead of being triplicated across
 // the three per-command augmentOptions builders — a miss there would silently drop
 // the field for one subcommand. Each command's augmentOptions delegates here.
