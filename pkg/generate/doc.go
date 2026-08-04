@@ -25,4 +25,10 @@
 //
 // Use [Get] to retrieve a generator by API type name, or [GetWithOptions] to
 // pass [Options] (e.g. REST slug-merging configuration) to the generator.
+//
+// [Options.TargetOrigin] carries the origin the scan can actually vouch for —
+// the resolved target origin (crawl.ResolveTargetOrigin, derived from
+// --target-url or the capture's own HTML page, never from bundle content).
+// The REST generator uses it to decide which hosts may define the emitted
+// spec's identity; see the servers/info.title notes in the rest sub-package.
 package generate

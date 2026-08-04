@@ -267,6 +267,81 @@ func TestAnalyzeJS_AlreadyAnalyzed_SkipsReanalysis(t *testing.T) {
 	assert.Equal(t, 1, staticCount, "expected exactly the pre-seeded static entry; guard failed to skip re-analysis")
 }
 
+// TestAnalyzeJS_PreLAB4992Capture_SkipsConcatRecovery pins the capture-compatibility
+// boundary QUAL-001 identified (LAB-4992) so the documented behavior is verified
+// rather than merely asserted in prose.
+//
+// The AnyStaticSource guard is PRESENCE-aware, not capability-aware: its premise
+// is "this capture already ran jsstatic, so it has all jsstatic output". That was
+// version-independent before LAB-4992 and no longer is. A capture written by a
+// pre-LAB-4992 crawl/scan carries static:js entries but NO static:js-concat
+// entries, so the concat reconstruction never runs on a later generate — the
+// endpoint is not recovered, silently.
+//
+// Re-capturing is the accepted answer (documented in CLAUDE.md's Capture Format
+// section beside the LAB-2110 precedent, in README, and in
+// pkg/analyze/jsstatic/doc.go), NOT re-running the analysis: the guard is what
+// keeps `crawl | generate` byte-identical to `scan`, and re-running jsstatic over
+// a capture that already holds its own output would duplicate entries. This test
+// exists so the tradeoff cannot be reversed by accident — if someone makes the
+// guard capability-aware, this test fails and forces the idempotency question to
+// be answered deliberately.
+func TestAnalyzeJS_PreLAB4992Capture_SkipsConcatRecovery(t *testing.T) {
+	const appJS = `function loadOrders(uid) { return fetch("/api/users/".concat(uid, "/orders")); }`
+
+	bundle := crawl.ObservedRequest{
+		Method: "GET",
+		URL:    "https://example.com/app.js",
+		Source: "katana",
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "application/javascript",
+			Body:        []byte(appJS),
+		},
+	}
+
+	concatURLs := func(reqs []crawl.ObservedRequest) []string {
+		var out []string
+		for _, r := range reqs {
+			if r.Source == crawl.SourceStaticJSConcat {
+				out = append(out, r.URL)
+			}
+		}
+		return out
+	}
+
+	// Baseline: a capture with NO pre-existing JS-static source (as `import`
+	// produces) does recover the concat endpoint. This makes the negative case
+	// below meaningful rather than vacuous.
+	t.Run("import_style_capture_recovers_concat", func(t *testing.T) {
+		out := pipeline.AnalyzeJS(context.Background(), []crawl.ObservedRequest{bundle}, pipeline.AugmentOptions{
+			AnalyzeJS:    true,
+			AllowPrivate: true,
+		})
+		assert.Contains(t, concatURLs(out), "https://example.com/api/users/0/orders",
+			"a capture carrying no static:js source must exercise the offline concat reconstruction")
+	})
+
+	// A pre-LAB-4992 crawl/scan capture: static:js present, static:js-concat
+	// absent. The guard short-circuits, so no concat endpoint is recovered.
+	t.Run("pre_lab4992_crawl_capture_skips_concat", func(t *testing.T) {
+		captured := []crawl.ObservedRequest{
+			bundle,
+			// What the crawl-time jsstatic pass of an older build wrote: an
+			// AST-recovered literal, and nothing for the concat form.
+			{Method: "GET", URL: "https://example.com/api/v1/users", Source: crawl.SourceStaticJS},
+		}
+		out := pipeline.AnalyzeJS(context.Background(), captured, pipeline.AugmentOptions{
+			AnalyzeJS:    true,
+			AllowPrivate: true,
+		})
+
+		require.Len(t, out, len(captured), "the idempotency guard must return the capture unchanged")
+		assert.Empty(t, concatURLs(out),
+			"a pre-LAB-4992 crawl capture yields no static:js-concat entry — re-capture is required (QUAL-001); if this now fails, the guard was made capability-aware and the crawl|generate == scan idempotency contract must be re-verified")
+	})
+}
+
 // TestAnalyzeJS_ErrorPath_WarnErrorContract pins the exact warn-sink contract
 // this change builds. On JS-analysis error (pre-canceled ctx) AnalyzeJS returns
 // the ORIGINAL slice; the failure warning goes to WarnError (not Status) so the

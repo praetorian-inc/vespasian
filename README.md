@@ -47,10 +47,10 @@ Vespasian takes a different approach: it observes actual network traffic at the 
 | **SPA Bundle Extraction** | Post-crawl pass that scans JavaScript bundles for API path strings and probes them with raw HTTP, recovering endpoints the headless browser could not exercise |
 | **Static Form Extraction** | Statically parses `<form>` elements in captured HTML responses — including login, search, and admin forms — to surface submission endpoints and parameters that dynamic crawling may never trigger |
 | **Traffic Import** | Import existing captures from Burp Suite XML, HAR 1.2 files, and mitmproxy dumps |
-| **Active Probing** | OPTIONS discovery, JSON schema inference, WSDL document fetching, GraphQL introspection, and gRPC server reflection |
+| **Active Probing** | OPTIONS discovery, JSON schema inference, WSDL document fetching, GraphQL introspection, and gRPC server reflection. Every probe target is gated to the scan's own origin by default — a classified candidate whose URL doesn't share the scan target's scheme/host/port (e.g. an attacker-controlled absolute URL recovered from a JS bundle) is skipped rather than probed; internal-only, no CLI flag, same policy as SPA Bundle Extraction's cross-origin gate below |
 | **Path Normalization** | `/users/42` and `/users/87` become `/users/{id}` with known literal preservation (`/me`, `/self`) |
 | **SSRF Protection** | Blocks crawling and probing of private and loopback addresses by default. Pass `--dangerous-allow-private` to test internal targets (localhost, 127.0.0.1, RFC1918, link-local); the flag is required when the seed URL is itself a private host. |
-| **JS Bundle Static Analysis** | Statically analyses captured JavaScript bundles to recover API endpoints, path parameters, and request-body fields missed by dynamic crawling. Enabled by default via `--analyze-js`; sourcemap recovery is controlled by `--fetch-sourcemaps` (default: `true` for `scan`/`crawl`, `false` for `generate`). |
+| **JS Bundle Static Analysis** | Statically analyses captured JavaScript bundles to recover API endpoints, path parameters, and request-body fields missed by dynamic crawling. Also reconstructs concat / `+`-chain / literal service-prefix forms (e.g. `"/api/posts/".concat(id, "/comment")`, `"identity/" + "api/auth/login"`) fully offline as unprobed candidates, with no network access required — non-literal operands become a numeric sentinel, parameterized downstream. Enabled by default via `--analyze-js`; sourcemap recovery is controlled by `--fetch-sourcemaps` (default: `true` for `scan`/`crawl`, `false` for `generate`). |
 | **Proxy Support** | Route traffic through Burp Suite or other intercepting proxies; http/https/socks5. Covers the crawl stage on both backends (headless Chrome and `--headless=false` net/http) plus the post-crawl active stages — probe (OPTIONS/schema/WSDL-fetch/GraphQL introspection/gRPC reflection), JS-replay, and jsstatic sourcemap fetches. socks5 always verifies TLS; `--proxy-insecure` (http/https only) accepts a MITM proxy's certificate. |
 | **Two-Stage Pipeline** | Capture once, generate many: separate capture and generation steps for maximum flexibility |
 
@@ -114,6 +114,35 @@ literals (identifiers, function calls, expressions) are replaced with a numeric
 placeholder, so `"/api/posts/".concat(id, "/comment")` becomes the probeable
 path `/api/posts/0/comment`, which the OpenAPI generator then parameterizes to
 `/api/posts/{postId}/comment`.
+
+These concat / `+`-chain / service-prefix paths are also recovered by a
+second, fully-offline static analysis pass (see "JS Bundle Static Analysis"
+above) that needs no reachable target at all — it emits them as unprobed
+candidates directly from the captured bundle bytes. Live JS-replay,
+described in this section, additionally re-fetches and probes those same
+reconstructions over HTTP, drops 404 decoys, and performs a speculative
+service-prefix fan-out that the offline pass deliberately omits (fan-out
+combinations are only safe once probed and 404-filtered). Live replay is
+additive, with one exception: a path the probe answers with a 404 is dropped
+as a decoy — other statuses (200, 204, 401/403, 302, ...) never refute an
+offline candidate. So pointing `generate` at a reachable target *can* yield
+slightly fewer endpoints than running fully offline.
+
+A 404 is the best signal available here, but it is not proof of absence.
+Returning 404 rather than 401/403 for a real-but-unauthorized resource is a
+widespread anti-enumeration convention, and a hostile target can fingerprint
+the probe's `User-Agent` and 404 everything to hide its API surface. Because
+an honest server also 404s a path that is genuinely absent, no additional
+probe can separate the two cases — telling them apart needs credentials, not
+another request. Every dropped path is therefore **named on stderr** along
+with both remedies: re-run with `--header` if the endpoint is auth-gated, or
+`--probe=false` to keep every offline candidate.
+
+> **Note:** a `capture.json` produced by a build predating this feature already
+> carries `static:js` entries, which makes `generate` skip the static pass
+> (the idempotency guard that keeps `crawl` → `generate` identical to `scan`).
+> Re-run the capture to recover concat/service-prefix endpoints from it.
+> Captures from `import` (Burp/HAR/mitmproxy) are unaffected.
 
 By default this step:
 
@@ -528,13 +557,11 @@ make clean       # Remove build artifacts
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/my-feature`)
-3. Commit your changes (`git commit -am 'Add my feature'`)
-4. Push to the branch (`git push origin feature/my-feature`)
-5. Open a Pull Request
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, project layout, how to add a classifier, generator, importer, or probe strategy, and the commit and pull request conventions.
 
-Please ensure all CI checks pass before requesting review.
+In short: fork the repository, create a feature branch, make sure `make check` passes, and open a Pull Request. Note that `make check` reformats as well as validates — it runs `gofmt -s -w .` first, so it may modify your working tree.
+
+This project is governed by our [Code of Conduct](CODE_OF_CONDUCT.md). Security vulnerabilities should be reported per [SECURITY.md](SECURITY.md) rather than as public issues.
 
 ## License
 

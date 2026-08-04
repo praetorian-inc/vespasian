@@ -32,6 +32,7 @@ import (
 const (
 	SourceJS        = crawl.SourceStaticJS
 	SourceSourcemap = crawl.SourceStaticJSSourcemap
+	SourceJSConcat  = crawl.SourceStaticJSConcat
 )
 
 // Default tuning bounds. Mirrored on Options when zero.
@@ -41,6 +42,18 @@ const (
 	DefaultMaxEndpointsPerBundle = 500
 	DefaultConcurrency           = 4
 )
+
+// concatMinReserve is the number of MaxEndpointsPerBundle slots capBundleEndpoints
+// guarantees to concat/service-prefix reconstructions when the cap binds, so
+// AST-recovered endpoints cannot starve them entirely (QUAL-001, LAB-4992).
+//
+// It is deliberately a small fixed reserve rather than a proportional share
+// (QUAL-003): concat candidates are speculative and never probed, so they must
+// not displace directly AST-recovered literals one-for-one. capBundleEndpoints
+// additionally clamps the reserve to budget/2 so it cannot invert and starve AST
+// on small budgets, and concat still reclaims any budget AST leaves unused — the
+// reserve is a floor, not a quota.
+const concatMinReserve = 16
 
 // Options configures Analyze. Zero values resolve to the Default* constants.
 //
@@ -327,6 +340,73 @@ func safeAnalyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options
 	return analyzeOne(ctx, req, opts)
 }
 
+// capBundleEndpoints truncates eps to budget entries WITHOUT letting
+// AST-recovered endpoints starve concat/service-prefix candidates (QUAL-001,
+// LAB-4992). ExtractFromBundle appends concat reconstructions (SourceJSConcat)
+// after all AST-recovered endpoints, so a naive `eps[:budget]` prefix
+// truncation drops every concat candidate whenever the AST portion alone
+// reaches budget.
+//
+// Instead, concat is guaranteed a SMALL floor so AST endpoints cannot starve it
+// entirely, AST is then given whatever budget remains after that floor, and
+// concat finally reclaims any budget AST did not actually use — so the total
+// kept is always min(len(ast)+len(concat), budget) and the cap is never
+// under-filled the way a hard max/2 split on concat alone would leave it when
+// AST is small (QUAL-002).
+//
+// QUAL-003: the floor is deliberately small (concatMinReserve, additionally
+// capped at budget/2 so it can never invert and starve AST) rather than the
+// budget/2 reservation it replaced. That earlier reservation was UNCONDITIONAL,
+// so it taxed AST even when concat was abundant and low-value: with the default
+// budget of 500, a bundle yielding 600 AST endpoints and 300 concat
+// reconstructions kept only 250 AST, where a pre-LAB-4992 `eps[:budget]` kept
+// 500. That eviction was not an edge case — concat reconstructions exist in
+// essentially every SPA bundle, ExtractStaticConcatPaths composes two
+// independently capped producers (up to 512 candidates from one bundle), and
+// servicePrefixPlusHeadPattern matches any short quoted slash-terminated
+// literal followed by `+`, which is dense in minified output. Trading a
+// directly AST-recovered literal for an unprobed sentinel-substituted guess 1:1
+// is the wrong direction: concat candidates are speculative, so they get a
+// guaranteed toehold, not parity.
+func capBundleEndpoints(eps []ExtractedEndpoint, budget int) []ExtractedEndpoint {
+	var ast, concat []ExtractedEndpoint
+	for _, ep := range eps {
+		if ep.SourceTag == SourceJSConcat {
+			concat = append(concat, ep)
+		} else {
+			ast = append(ast, ep)
+		}
+	}
+
+	// Reserve a small floor for concat so AST endpoints cannot starve concat
+	// reconstructions completely (QUAL-001), but keep it well below budget so
+	// abundant concat cannot displace high-fidelity AST literals (QUAL-003).
+	// The budget/2 clamp keeps the floor from exceeding the budget on small
+	// budgets, which would otherwise zero out AST.
+	concatFloor := len(concat)
+	if concatFloor > concatMinReserve {
+		concatFloor = concatMinReserve
+	}
+	if concatFloor > budget/2 {
+		concatFloor = budget / 2
+	}
+
+	// AST gets everything but the floor...
+	astBudget := budget - concatFloor
+	if len(ast) > astBudget {
+		ast = ast[:astBudget]
+	}
+
+	// ...and concat reclaims whatever AST did not use, so the cap stays fully
+	// utilized when AST is scarce.
+	concatBudget := budget - len(ast)
+	if len(concat) > concatBudget {
+		concat = concat[:concatBudget]
+	}
+
+	return append(ast, concat...)
+}
+
 // analyzeOne analyzes a single captured JS bundle. It runs sourcemap recovery
 // and extractor extraction, then synthesizes requests. The function is safe to
 // call from goroutines; it has no shared mutable state.
@@ -355,11 +435,24 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	// bundle, counting both the bundle body and any recovered sourcemap
 	// sources. The cap is applied first to the bundle body and then
 	// re-evaluated as remaining-budget on each sourcemap source below.
+	//
+	// QUAL-001 (LAB-4992): a plain prefix truncation here would keep only the
+	// first MaxEndpointsPerBundle entries of bundleEps. Because
+	// ExtractFromBundle appends concat/service-prefix reconstructions AFTER
+	// all AST-recovered endpoints, any bundle whose AST endpoint count alone
+	// reaches the cap would silently drop every concat candidate — undermining
+	// the acceptance criterion that offline generate must surface concat
+	// endpoints. capBundleEndpoints reserves a fair share of the budget for
+	// concat candidates instead of truncating the combined slice blindly.
 	if len(bundleEps) > opts.MaxEndpointsPerBundle {
-		bundleEps = bundleEps[:opts.MaxEndpointsPerBundle]
+		bundleEps = capBundleEndpoints(bundleEps, opts.MaxEndpointsPerBundle)
 	}
 	for i := range bundleEps {
-		bundleEps[i].SourceTag = SourceJS
+		// Preserve the distinct concat reconstruction tag; force everything else
+		// from the bundle body to the plain JS-bundle source.
+		if bundleEps[i].SourceTag != SourceJSConcat {
+			bundleEps[i].SourceTag = SourceJS
+		}
 	}
 	synth := toRequests(bundleEps, req.URL)
 	result.requests = append(result.requests, synth...)
@@ -391,11 +484,23 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 			continue
 		}
 		result.stats.EndpointsFound += len(smEps)
+		// QUAL-011 (LAB-4992): route this through capBundleEndpoints, exactly
+		// like the bundle-body truncation above, rather than taking a bare
+		// prefix slice. ExtractFromBundle runs the same step-5 concat
+		// extraction on each sourcemap source and appends those
+		// reconstructions AFTER all AST-recovered endpoints, so a prefix slice
+		// silently drops every concat candidate from any sourcemap source
+		// whose AST endpoints alone consume the remaining budget — the precise
+		// failure mode capBundleEndpoints exists to prevent.
 		if len(smEps) > remaining {
-			smEps = smEps[:remaining]
+			smEps = capBundleEndpoints(smEps, remaining)
 		}
 		for i := range smEps {
-			smEps[i].SourceTag = SourceSourcemap
+			// Preserve the distinct concat reconstruction tag; force everything
+			// else recovered from the sourcemap to the sourcemap source.
+			if smEps[i].SourceTag != SourceJSConcat {
+				smEps[i].SourceTag = SourceSourcemap
+			}
 		}
 		smSynth := toRequests(smEps, req.URL)
 		result.requests = append(result.requests, smSynth...)

@@ -24,13 +24,19 @@ import (
 )
 
 func TestGetWithOptions_PropagatesToREST(t *testing.T) {
-	gen, err := GetWithOptions("rest", Options{MergeSlugs: true, SlugThreshold: 5})
+	gen, err := GetWithOptions("rest", Options{
+		MergeSlugs:    true,
+		SlugThreshold: 5,
+		TargetOrigin:  "https://vouched.example.com",
+	})
 	require.NoError(t, err)
 
 	rg, ok := gen.(*rest.OpenAPIGenerator)
 	require.True(t, ok)
 	require.True(t, rg.MergeSlugs)
 	require.Equal(t, 5, rg.SlugThreshold)
+	require.Equal(t, "https://vouched.example.com", rg.TargetOrigin,
+		"GetWithOptions must forward Options.TargetOrigin to rest.OpenAPIGenerator (TEST-001, LAB-4992 review)")
 }
 
 func TestGet(t *testing.T) {

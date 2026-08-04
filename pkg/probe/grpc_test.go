@@ -241,6 +241,49 @@ func TestGRPCProbe_Probe_SelfSignedTLS(t *testing.T) {
 	assert.True(t, schema.ReflectionEnabled, "self-signed cert must not block enumeration")
 }
 
+// TestGRPCProbe_ProbeTarget_URLValidatorSchemeMatchesTLS pins probeTarget's
+// scheme selection (SEC-BE-001): the synthesized URL handed to
+// Config.URLValidator must reflect t.useTLS rather than being hardcoded to
+// "http". internal/pipeline's cross-origin probe gate compares this scheme
+// against the scan's resolved target origin, so a probe against an https
+// target that is always reported to the validator as "http" would silently
+// pass the cross-origin gate for the wrong scheme (or fail a same-origin
+// comparison against a genuinely https target).
+//
+// The validator itself rejects every call, so probeTarget never dials —
+// this isolates the assertion to the URL string constructed before the dial,
+// with no dependency on a running gRPC server.
+func TestGRPCProbe_ProbeTarget_URLValidatorSchemeMatchesTLS(t *testing.T) {
+	var gotURLs []string
+	cfg := Config{
+		Timeout: 5 * time.Second,
+		URLValidator: func(rawURL string) error {
+			gotURLs = append(gotURLs, rawURL)
+			return errors.New("reject before dialing")
+		},
+	}
+	p := NewGRPCProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{APIType: "grpc"},
+		{APIType: "grpc"},
+	}
+	endpoints[0].URL = "http://cleartext.example.test:80/lab.v1.UserService/GetUser"
+	endpoints[1].URL = "https://tls.example.test:443/lab.v1.UserService/GetUser"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	result, err := p.Probe(ctx, endpoints)
+	require.NoError(t, err)
+	require.Len(t, result, 2)
+
+	assert.Equal(t, []string{
+		"http://cleartext.example.test:80",
+		"https://tls.example.test:443",
+	}, gotURLs, "the URLValidator must see a scheme matching each target's own useTLS, not a hardcoded http")
+}
+
 func TestGRPCProbe_Probe_FiltersReflectionServiceItself(t *testing.T) {
 	addr, stop := startTestGRPCServer(t)
 	defer stop()

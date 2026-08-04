@@ -40,6 +40,7 @@ import (
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
+	"gopkg.in/yaml.v3"
 
 	"github.com/praetorian-inc/vespasian/internal/pipeline"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
@@ -106,6 +107,82 @@ func TestClassifyProbeGenerate_RESTHappyPath(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.NotEmpty(t, spec, "expected non-empty OpenAPI spec for REST requests")
+}
+
+// TestClassifyProbeGenerate_TargetOriginReachesGeneratedSpec is TEST-001 (LAB-4992
+// review, hop B): pins that opts.TargetURL, forwarded through
+// ClassifyProbeGenerate to generate.Options.TargetOrigin
+// (`TargetOrigin: targetOrigin,` in pipeline.go), actually reaches the
+// generated spec's servers[0].URL and info.title — not merely a struct
+// field somewhere in between.
+//
+// Two origins are used, and the pinned one ("zzz.example.com") is chosen so
+// it does NOT sort first alphabetically among the origins — mirroring the
+// discrimination technique in
+// TestGenerate_PrimarySortsLaterStillWinsCollision
+// (pkg/generate/rest/openapi_test.go). If the TargetOrigin forward were
+// deleted, generate.Options.TargetOrigin would be "" and
+// choosePrimaryOrigin would fall back to the lowest-sorted dynamically
+// observed origin ("aaa.example.com" as a bare origin string), which is a
+// DIFFERENT server than the deliberately-later-sorting pinned host,
+// discriminating the deletion. Had the pinned origin sorted first, this
+// test would pass identically whether or not the forward exists, making it
+// vacuous.
+//
+// Probe is disabled and no live server is used, so this test is fully
+// offline and hermetic.
+func TestClassifyProbeGenerate_TargetOriginReachesGeneratedSpec(t *testing.T) {
+	requests := []crawl.ObservedRequest{
+		{
+			Method:  "GET",
+			URL:     "https://zzz.example.com/api/v1/things",
+			Headers: map[string]string{"Content-Type": "application/json"},
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Headers:     map[string]string{"Content-Type": "application/json"},
+				Body:        []byte(`[{"id":1}]`),
+			},
+		},
+		{
+			Method:  "GET",
+			URL:     "https://aaa.example.com/api/v1/others",
+			Headers: map[string]string{"Content-Type": "application/json"},
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Headers:     map[string]string{"Content-Type": "application/json"},
+				Body:        []byte(`[{"id":2}]`),
+			},
+		},
+	}
+
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:     pipeline.APITypeREST,
+		Confidence:  0.5,
+		Probe:       false,
+		Deduplicate: true,
+		TargetURL:   "https://zzz.example.com",
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, spec)
+
+	var parsed map[string]any
+	require.NoError(t, yaml.Unmarshal(spec, &parsed))
+
+	servers, ok := parsed["servers"].([]any)
+	require.True(t, ok, "expected a servers list in the generated spec")
+	require.NotEmpty(t, servers)
+	firstServer, ok := servers[0].(map[string]any)
+	require.True(t, ok, "expected servers[0] to be a map")
+	assert.Equal(t, "https://zzz.example.com", firstServer["url"],
+		"servers[0].url must derive from the pinned --target-url origin (TargetURL), "+
+			"not the alphabetically-first observed origin")
+
+	info, ok := parsed["info"].(map[string]any)
+	require.True(t, ok, "expected an info block in the generated spec")
+	assert.Equal(t, "zzz.example.com API", info["title"],
+		"info.title must derive from the pinned --target-url origin")
 }
 
 func TestClassifyProbeGenerate_EmptyRequestsReturnsSpec(t *testing.T) {
