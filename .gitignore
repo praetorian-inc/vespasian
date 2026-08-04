@@ -46,6 +46,8 @@ Thumbs.db
 test/.live-test-config
 test/.results/
 test/.*.pid
+test/.*.pids
+test/.*.log
 test/rest-api/rest-api
 test/soap-service/soap-service
 test/grpc-server/grpc-server

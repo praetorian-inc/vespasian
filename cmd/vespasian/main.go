@@ -498,6 +498,14 @@ func (c *GenerateCmd) options() pipeline.Options {
 		MergeSlugs:             c.MergeSlugs,
 		SlugThreshold:          c.SlugThreshold,
 		Status:                 statusWriter(c.Verbose),
+		// Warnings is NOT gated on --verbose (unlike Status above): the
+		// SEC-BE-001 cross-origin skip warning must always be visible to the
+		// operator, mirroring buildJSReplayConfig's unconditional Stderr wire.
+		Warnings: os.Stderr,
+		// Reuses the same --target-url value already handed to the JS-replay
+		// stage (see resolveJSReplayConfig) so both stages agree on the scan's
+		// origin for their respective cross-origin gates (SEC-BE-001).
+		TargetURL: c.TargetURL,
 	}
 }
 
@@ -583,9 +591,11 @@ func (c *GenerateCmd) Run() (err error) {
 	// Replay JS-extracted URLs with raw HTTP so the two-stage crawl→generate
 	// workflow recovers SPA endpoints that exist only inside JS bundles (e.g.
 	// concat-style paths), matching what scan does (LAB-3892). Static JS
-	// analysis (pipeline.Augment above) surfaces literal paths, but concat /
-	// service-prefix forms need the active re-fetch to be reconstructed and
-	// confirmed. Gated on c.Probe && c.AnalyzeJS — the same gate scan uses — so
+	// analysis (pipeline.Augment above) already reconstructs literal, concat,
+	// and service-prefix forms fully offline as unprobed candidates; replay
+	// additionally re-fetches them, probes them, 404-filters them, and performs
+	// the speculative service-prefix fan-out the offline pass deliberately
+	// omits. Gated on c.Probe && c.AnalyzeJS — the same gate scan uses — so
 	// --probe=false or --analyze-js=false keeps generate passive (see
 	// maybeReplayJSExtracted). --header/-H supplies the auth headers the capture
 	// can't preserve (forwarded only to same-origin fetches/probes), and
@@ -637,7 +647,9 @@ func (c *ScanCmd) scanOptions(apiType string, afterWSDL func(ctx context.Context
 		MergeSlugs:             c.MergeSlugs,
 		SlugThreshold:          c.SlugThreshold,
 		Status:                 statusWriter(c.Verbose),
-		AfterWSDL:              afterWSDL,
+		// Not gated on --verbose — see GenerateCmd.options's identical field.
+		Warnings:  os.Stderr,
+		AfterWSDL: afterWSDL,
 	}
 }
 
@@ -780,15 +792,35 @@ func main() {
 // validateTargetURL rejects a non-empty --target-url that is not an absolute
 // URL. A typo would otherwise silently fall back to the capture-derived origin
 // heuristic, reintroducing the wrong-origin footgun --target-url prevents.
-// Delegates the parse/scheme/host check to validateURL so the two
-// validators can't drift; this also means --target-url now requires http/https
-// like the crawl/scan target URL does.
+// Delegates entirely to validateURL — which already redacts userinfo from
+// every message it returns (SEC-BE-002, LAB-4992 review) — so the two
+// validators can't drift; this also means --target-url now requires
+// http/https like the crawl/scan target URL does.
+//
+// An un-canonicalizable value (duplicated port, IPv6 zone id) is rejected on
+// two independent layers (SEC-BE-001, LAB-4992 review), and this function
+// inherits the first of them rather than implementing either:
+//
+//   - Argv: validateURL itself applies the crawl.CanonicalOrigin check, so the
+//     operator gets an immediate error naming the offending value. That check
+//     is shared with the crawl/scan seed (CrawlCmd.Run, ScanCmd.Run call
+//     validateURL directly), not special-cased for --target-url.
+//   - Runtime: crawl.ResolveTargetOrigin independently fails closed for the
+//     same values, returning "" rather than falling through to a
+//     capture-derived origin. That layer is what protects pkg/sdk and library
+//     callers, which never reach these CLI validators, and it is what
+//     guarantees no --header credential is forwarded to an origin a bundle
+//     chose. See ResolveTargetOrigin's doc comment.
+//
+// Neither layer is redundant: removing the first costs the diagnostic and
+// lets a run crawl, probe nothing, and exit successfully; removing the second
+// reopens the credential-rebind path for every non-CLI caller.
 func validateTargetURL(raw string) error {
 	if raw == "" {
 		return nil
 	}
 	if err := validateURL(raw); err != nil {
-		return fmt.Errorf("invalid --target-url %q: %w", raw, err)
+		return fmt.Errorf("invalid --target-url: %w", err)
 	}
 	return nil
 }
@@ -861,17 +893,37 @@ func statusWriter(verbose bool) io.Writer {
 	return nil
 }
 
-// validateURL checks that the given string is a valid URL with scheme and host.
+// validateURL checks that the given string is a valid URL with scheme and
+// host. Every error message echoes crawl.RedactURL(rawURL), never rawURL
+// itself (SEC-BE-002, QUAL-001, LAB-4992 review): this function is reached
+// directly by the crawl/scan URL argument and (via validateTargetURL)
+// --target-url, both of which may carry userinfo credentials that must not be
+// echoed to stderr/CI logs.
+//
+// url.Parse's own returned *url.Error also embeds the raw URL in its message
+// (e.g. `parse "https://user:pass@host": net/url: invalid ...`), so wrapping
+// it directly would re-leak the credential even with %q above redacted;
+// unwrapping to its inner .Err (the cause, without the URL) avoids that while
+// keeping the message useful.
 func validateURL(rawURL string) error {
+	redacted := crawl.RedactURL(rawURL)
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return fmt.Errorf("invalid URL %q: %w", rawURL, err)
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			err = uerr.Err
+		}
+		return fmt.Errorf("invalid URL %q: %w", redacted, err)
 	}
 	if u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("invalid URL %q: must include scheme and host (e.g., https://example.com)", rawURL)
+		return fmt.Errorf("invalid URL %q: must include scheme and host (e.g., https://example.com)", redacted)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("invalid URL %q: scheme must be http or https", rawURL)
+		return fmt.Errorf("invalid URL %q: scheme must be http or https", redacted)
+	}
+	if crawl.CanonicalOrigin(rawURL) == "" {
+		return fmt.Errorf("invalid URL %q: host is not a usable origin "+
+			"(check for a duplicated port such as \"host:8443:8443\", or an IPv6 zone id)", redacted)
 	}
 	return nil
 }
