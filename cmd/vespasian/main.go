@@ -361,19 +361,29 @@ type CrawlCmd struct {
 	CrawlOptions
 }
 
-// augmentOptions builds the pipeline.AugmentOptions for this command's JS-static
-// stage from its flags plus the already-parsed proxy config threaded in by Run.
-// Extracted so a CLI-boundary test can assert the proxy (and each other flag)
-// reaches pipeline.AugmentOptions without executing Run().
-func (c *CrawlCmd) augmentOptions(proxy httpx.ProxyConfig) pipeline.AugmentOptions {
+// buildAugmentOptions assembles the pipeline.AugmentOptions shared by the crawl,
+// generate, and scan commands' JS-static stage. Centralised (QUAL-001) so a new
+// AugmentOptions field is wired in one place instead of being triplicated across
+// the three per-command augmentOptions builders — a miss there would silently drop
+// the field for one subcommand. Each command's augmentOptions delegates here.
+func buildAugmentOptions(analyzeJS, fetchSourcemaps, allowPrivate, verbose bool, proxy httpx.ProxyConfig) pipeline.AugmentOptions {
 	return pipeline.AugmentOptions{
-		AnalyzeJS:       c.AnalyzeJS,
-		FetchSourcemaps: c.FetchSourcemaps,
-		AllowPrivate:    c.DangerousAllowPrivate,
-		Status:          statusWriter(c.Verbose),
+		AnalyzeJS:       analyzeJS,
+		FetchSourcemaps: fetchSourcemaps,
+		AllowPrivate:    allowPrivate,
+		Status:          statusWriter(verbose),
 		WarnError:       os.Stderr,
 		Proxy:           proxy,
 	}
+}
+
+// augmentOptions builds the pipeline.AugmentOptions for this command's JS-static
+// stage from its flags plus the already-parsed proxy config threaded in by Run.
+// Delegates to buildAugmentOptions (QUAL-001). Extracted so a CLI-boundary test
+// can assert the proxy (and each other flag) reaches pipeline.AugmentOptions
+// without executing Run().
+func (c *CrawlCmd) augmentOptions(proxy httpx.ProxyConfig) pipeline.AugmentOptions {
+	return buildAugmentOptions(c.AnalyzeJS, c.FetchSourcemaps, c.DangerousAllowPrivate, c.Verbose, proxy)
 }
 
 // Run executes the crawl command.
@@ -528,17 +538,11 @@ func (c *GenerateCmd) options(proxy httpx.ProxyConfig) pipeline.Options {
 
 // augmentOptions builds the pipeline.AugmentOptions for this command's
 // static-HTML-forms + JS-static stage from its flags plus the already-parsed
-// proxy config threaded in by Run. Extracted so a CLI-boundary test can assert
-// the proxy (and each other flag) reaches pipeline.AugmentOptions without Run().
+// proxy config threaded in by Run. Delegates to buildAugmentOptions (QUAL-001).
+// Extracted so a CLI-boundary test can assert the proxy (and each other flag)
+// reaches pipeline.AugmentOptions without Run().
 func (c *GenerateCmd) augmentOptions(proxy httpx.ProxyConfig) pipeline.AugmentOptions {
-	return pipeline.AugmentOptions{
-		AnalyzeJS:       c.AnalyzeJS,
-		FetchSourcemaps: c.FetchSourcemaps,
-		AllowPrivate:    c.DangerousAllowPrivate,
-		Status:          statusWriter(c.Verbose),
-		WarnError:       os.Stderr,
-		Proxy:           proxy,
-	}
+	return buildAugmentOptions(c.AnalyzeJS, c.FetchSourcemaps, c.DangerousAllowPrivate, c.Verbose, proxy)
 }
 
 // resolveJSReplayConfig parses --header and validates --target-url, then
@@ -689,17 +693,11 @@ func (c *ScanCmd) scanOptions(apiType string, afterWSDL func(ctx context.Context
 
 // augmentOptions builds the pipeline.AugmentOptions for this command's
 // static-HTML-forms + JS-static stage from its flags plus the already-parsed
-// proxy config threaded in by Run. Extracted so a CLI-boundary test can assert
-// the proxy (and each other flag) reaches pipeline.AugmentOptions without Run().
+// proxy config threaded in by Run. Delegates to buildAugmentOptions (QUAL-001).
+// Extracted so a CLI-boundary test can assert the proxy (and each other flag)
+// reaches pipeline.AugmentOptions without Run().
 func (c *ScanCmd) augmentOptions(proxy httpx.ProxyConfig) pipeline.AugmentOptions {
-	return pipeline.AugmentOptions{
-		AnalyzeJS:       c.AnalyzeJS,
-		FetchSourcemaps: c.FetchSourcemaps,
-		AllowPrivate:    c.DangerousAllowPrivate,
-		Status:          statusWriter(c.Verbose),
-		WarnError:       os.Stderr,
-		Proxy:           proxy,
-	}
+	return buildAugmentOptions(c.AnalyzeJS, c.FetchSourcemaps, c.DangerousAllowPrivate, c.Verbose, proxy)
 }
 
 // Run executes the scan command (crawl + generate pipeline).
