@@ -13,3 +13,35 @@ updates:
       interval: weekly
     commit-message:
       prefix: "ci"
+    ignore:
+      # The leaderboard reusables are SHA-pinned, and the pinned SHA is
+      # allow-listed by `job_workflow_ref` in the LeaderboardMetricsRole IAM
+      # trust policy in guard. Bumping the pin therefore does not just change a
+      # version — it presents a `job_workflow_ref` that is NOT on the trust
+      # list, so OIDC AssumeRole is denied and the run fails.
+      #
+      # That failure is SILENT in the only way that matters: nothing alerts on
+      # it, so contribution metrics simply stop being delivered and the loss is
+      # only discoverable by auditing run conclusions after the fact. brutus#229
+      # and augustus#241 were both merged as routine dependabot bumps and each
+      # took its repo's metrics dark until someone went looking (ENG-5687).
+      #
+      # Rolling this pin is a COORDINATED operation, not a dependency update:
+      # add the new SHA to the IAM trust policy and deploy it to prod BEFORE
+      # the pin moves (the ENG-4164 runbook). Dependabot cannot do that half,
+      # so it must not do this half either. Roll it by hand as part of that
+      # runbook.
+      #
+      # The wildcard comes first so a leaderboard reusable added later is
+      # covered without a follow-up edit here — an ignore rule whose absence is
+      # invisible is exactly the failure mode above. The two exact names are
+      # then listed as well, and they are NOT redundancy for its own sake: the
+      # wildcard's match semantics against a reusable-workflow dependency name
+      # are unverified in this org, whereas the exact form is empirically proven
+      # (augustus and brutus have had zero leaderboard bumps since adopting it).
+      # If the wildcard silently fails to match, the exact entries still hold —
+      # and a control that cannot be tested before it is needed should not be
+      # the only control.
+      - dependency-name: "praetorian-inc/public-workflows/.github/workflows/leaderboard-*"
+      - dependency-name: "praetorian-inc/public-workflows/.github/workflows/leaderboard-metrics.yml"
+      - dependency-name: "praetorian-inc/public-workflows/.github/workflows/leaderboard-backfill.yml"
