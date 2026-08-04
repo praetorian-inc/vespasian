@@ -32,16 +32,24 @@ updates:
       # so it must not do this half either. Roll it by hand as part of that
       # runbook.
       #
-      # The wildcard comes first so a leaderboard reusable added later is
-      # covered without a follow-up edit here — an ignore rule whose absence is
-      # invisible is exactly the failure mode above. The two exact names are
-      # then listed as well, and they are NOT redundancy for its own sake: the
-      # wildcard's match semantics against a reusable-workflow dependency name
-      # are unverified in this org, whereas the exact form is empirically proven
-      # (augustus and brutus have had zero leaderboard bumps since adopting it).
-      # If the wildcard silently fails to match, the exact entries still hold —
-      # and a control that cannot be tested before it is needed should not be
-      # the only control.
-      - dependency-name: "praetorian-inc/public-workflows/.github/workflows/leaderboard-*"
+      # The EXACT NAMES are what do the work here, so ADDING A NEW LEADERBOARD
+      # REUSABLE MEANS ADDING ITS EXACT NAME to this list. Only the exact form
+      # has evidence behind it: augustus and brutus both still pin v2.16.3 with
+      # v2.16.13 available, and both took a github-actions bump for
+      # claude-md-drift.yml on 2026-08-02 while the leaderboard pin was
+      # skipped — same pin, same available upgrade, same ecosystem run,
+      # differing only in the ignore rule.
+      #
+      # The `leaderboard-*` wildcard is OPPORTUNISTIC FORWARD COVERAGE and is
+      # NOT load-bearing. Its match semantics against a reusable-workflow
+      # dependency name are unverified in this org, and — the part that
+      # matters — they CANNOT be verified by watching this rule work:
+      # suppression happens if EITHER the wildcard or an exact name matches, so
+      # a quiet dependabot run only proves the exact names held and says
+      # nothing about the wildcard. Reading it as "a reusable added later needs
+      # no edit here" would rebuild the very failure mode this rule exists to
+      # stop — a control that looks present, does nothing, and tells no one.
       - dependency-name: "praetorian-inc/public-workflows/.github/workflows/leaderboard-metrics.yml"
       - dependency-name: "praetorian-inc/public-workflows/.github/workflows/leaderboard-backfill.yml"
+      # Non-load-bearing; see above. Never a substitute for an exact entry.
+      - dependency-name: "praetorian-inc/public-workflows/.github/workflows/leaderboard-*"
