@@ -734,17 +734,23 @@ if not isinstance(data, list):
     print("?")
     sys.exit(0)
 
-page_urls = {r.get("page_url") for r in data if isinstance(r, dict) and r.get("page_url")}
-if page_urls:
-    print(len(page_urls))
-    sys.exit(0)
+# Count distinct page identity across BOTH keys in a single pass, preferring
+# page_url per record and falling back to url when a record has no page_url.
+# A capture that MIXES rod-style records (have page_url) with url-only records
+# must not drop the url-only pages: taking distinct page_url values only when
+# any existed undercounted such a capture, the false-PASS direction for
+# assert_max_pages (LAB-3890 TEST-001). Behaviour is unchanged for a
+# single-backend capture (all page_url, or all url).
+pages = set()
+for r in data:
+    if isinstance(r, dict):
+        key = r.get("page_url") or r.get("url")
+        if key:
+            pages.add(key)
 
-urls = {r.get("url") for r in data if isinstance(r, dict) and r.get("url")}
-if urls:
-    print(len(urls))
-    sys.exit(0)
-
-if len(data) == 0:
+if pages:
+    print(len(pages))
+elif len(data) == 0:
     print(0)
 else:
     print("?")

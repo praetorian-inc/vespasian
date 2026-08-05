@@ -312,6 +312,21 @@ assert_reject "missing spec-validator node_modules gives an actionable npm ci me
 # ──────────────────────────────────────────────────────────────
 log_header "SPEC_VALIDATOR_MAX_BYTES"
 
+# Baseline SPEC_VALIDATOR_MAX_BYTES BEFORE any wrapper runs. It is a supported
+# override both validators read, so a CI job or developer may legitimately have
+# it exported in the parent shell. The leak check at the end of this section
+# compares against this baseline (set/unset status + value) so that "a wrapper's
+# `export` escaped its subshell" (a real leak) is told apart from "the caller
+# already had it set" (fine) — the ${VAR+x} form alone flagged the latter as a
+# spurious leak (LAB-3890 TEST-002).
+if [ -n "${SPEC_VALIDATOR_MAX_BYTES+x}" ]; then
+    BASELINE_MAX_BYTES_SET=1
+    BASELINE_MAX_BYTES_VAL="$SPEC_VALIDATOR_MAX_BYTES"
+else
+    BASELINE_MAX_BYTES_SET=0
+    BASELINE_MAX_BYTES_VAL=
+fi
+
 # CodeRabbit nitpick (PR #187): the too-large rejection branch in both
 # validate-openapi.mjs and validate-graphql.mjs was untestable without
 # generating a multi-megabyte fixture. SPEC_VALIDATOR_MAX_BYTES lets this
@@ -364,13 +379,24 @@ assert_ok "generous SPEC_VALIDATOR_MAX_BYTES still accepts the real OpenAPI fixt
 assert_ok "generous SPEC_VALIDATOR_MAX_BYTES still accepts the real GraphQL fixture" \
     _test_generous_max_bytes_graphql "${THIS_DIR}/graphql-server/expected-spec.graphql"
 
-# The override must not leak into this script's own environment.
+# The wrappers must leave SPEC_VALIDATOR_MAX_BYTES exactly as the caller had it
+# — same set/unset status, and if set the same value. Comparing against the
+# baseline captured above (not merely "is it set now?") means a caller that
+# legitimately exported the override is not misreported as a leak; only a value
+# the wrappers themselves changed counts as one (LAB-3890 TEST-002).
 if [ -n "${SPEC_VALIDATOR_MAX_BYTES+x}" ]; then
-    log_fail "FAIL (env leak): SPEC_VALIDATOR_MAX_BYTES leaked into the parent shell: '${SPEC_VALIDATOR_MAX_BYTES}'"
-    FAIL=$((FAIL + 1))
+    NOW_MAX_BYTES_SET=1
+    NOW_MAX_BYTES_VAL="$SPEC_VALIDATOR_MAX_BYTES"
 else
-    log_ok "PASS (no env leak): SPEC_VALIDATOR_MAX_BYTES is unset in the parent shell"
+    NOW_MAX_BYTES_SET=0
+    NOW_MAX_BYTES_VAL=
+fi
+if [ "$NOW_MAX_BYTES_SET" = "$BASELINE_MAX_BYTES_SET" ] && [ "$NOW_MAX_BYTES_VAL" = "$BASELINE_MAX_BYTES_VAL" ]; then
+    log_ok "PASS (no env leak): SPEC_VALIDATOR_MAX_BYTES matches its pre-test baseline (set=${BASELINE_MAX_BYTES_SET})"
     PASS=$((PASS + 1))
+else
+    log_fail "FAIL (env leak): SPEC_VALIDATOR_MAX_BYTES changed across the wrappers — baseline set=${BASELINE_MAX_BYTES_SET} val='${BASELINE_MAX_BYTES_VAL}', now set=${NOW_MAX_BYTES_SET} val='${NOW_MAX_BYTES_VAL}'"
+    FAIL=$((FAIL + 1))
 fi
 
 # ──────────────────────────────────────────────────────────────
@@ -566,6 +592,37 @@ PYEOF
 assert_count "duplicate urls, no page_url: distinct count not record count" \
     "1" \
     count_capture_pages "${WORK_DIR}/duplicate-urls-capture.json"
+
+# Mixed-backend capture (PR #187 LAB-3890 TEST-001): a single capture that
+# mixes rod-style records (carry page_url) with net/http-style records (carry
+# only url). The page count is the union of distinct page identities across
+# BOTH keys — page_url preferred per record, url the fallback when a record has
+# no page_url. The pre-fix logic returned the distinct page_url count whenever
+# ANY page_url existed, silently dropping every url-only page (an undercount —
+# the false-PASS direction for assert_max_pages). A page named by a page_url in
+# one record and by a url in another must de-dup to a single page.
+#   p1, p2   -> page_url only                     (2 pages)
+#   p3, p4   -> url only                          (2 pages)
+#   shared   -> once via page_url, once via url   (coincide -> 1 page)
+# => 5 distinct pages across 6 records.
+python3 - "${WORK_DIR}/mixed-backend-capture.json" << 'PYEOF'
+import json, sys
+
+records = [
+    {"page_url": "http://example.test/p1"},
+    {"page_url": "http://example.test/p2"},
+    {"url": "http://example.test/p3"},
+    {"url": "http://example.test/p4"},
+    {"page_url": "http://example.test/shared"},
+    {"url": "http://example.test/shared"},
+]
+
+with open(sys.argv[1], "w") as f:
+    json.dump(records, f)
+PYEOF
+assert_count "mixed backend: page_url-only + url-only records, union de-duped across both keys" \
+    "5" \
+    count_capture_pages "${WORK_DIR}/mixed-backend-capture.json"
 
 # Empty list.
 printf '[]' > "${WORK_DIR}/empty-capture.json"

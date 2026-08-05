@@ -27,6 +27,9 @@ jobs:
       # outbound network traffic. Audit mode is non-blocking — it logs egress
       # to the StepSecurity dashboard without enforcing an allowlist. Flip to
       # 'block' with an allowed-endpoints list once telemetry confirms the set.
+      # DUPLICATED across preflight-selftest / validator-regression / test.
+      # harden-runner is a SHA-pinned security control: bump ALL THREE copies
+      # in lockstep — a missed copy silently leaves a job on a stale pin.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -57,6 +60,9 @@ jobs:
       # outbound network traffic. Audit mode is non-blocking — it logs egress
       # to the StepSecurity dashboard without enforcing an allowlist. Flip to
       # 'block' with an allowed-endpoints list once telemetry confirms the set.
+      # DUPLICATED across preflight-selftest / validator-regression / test.
+      # harden-runner is a SHA-pinned security control: bump ALL THREE copies
+      # in lockstep — a missed copy silently leaves a job on a stale pin.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -67,6 +73,10 @@ jobs:
         with:
           persist-credentials: false
 
+      # DUPLICATED across validator-regression / test: this setup-node (npm
+      # cache) plus the `npm ci --ignore-scripts` "Install spec validators" step
+      # below are kept byte-identical in both jobs — update BOTH copies in
+      # lockstep.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: 20
@@ -121,6 +131,9 @@ jobs:
       # 'block' with an allowed-endpoints list once telemetry confirms the set
       # (expected: github.com, proxy.golang.org, sum.golang.org,
       # storage.googleapis.com, objects.githubusercontent.com, registry.npmjs.org).
+      # DUPLICATED across preflight-selftest / validator-regression / test.
+      # harden-runner is a SHA-pinned security control: bump ALL THREE copies
+      # in lockstep — a missed copy silently leaves a job on a stale pin.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -138,6 +151,10 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # DUPLICATED across validator-regression / test: this setup-node (npm
+      # cache) plus the `npm ci --ignore-scripts` "Install spec validators" step
+      # below are kept byte-identical in both jobs — update BOTH copies in
+      # lockstep.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: 20
