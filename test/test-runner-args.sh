@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # Tests for run-live-tests.sh target group consistency and the --group flag,
-# plus the setup-live-targets.sh run-guidance selector. Does NOT run actual live
-# tests — only validates that the group arrays stay in sync with the case
-# dispatch block, that --group resolves the correct target set (via --dry-run,
-# no binary required), and that setup-complete guidance steers full vs partial
-# setups correctly.
+# plus the setup-live-targets.sh run-guidance selector. Validates that the group
+# arrays stay in sync with the case dispatch block, that --group resolves the
+# correct target set (via --dry-run, no binary required), and that
+# setup-complete guidance steers full vs partial setups correctly.
+#
+# Starts no live services and contacts no network. It is dry-run based with ONE
+# deliberate exception: the "real offline run" block below invokes the runner for
+# real to prove a browserless offline run needs no config file. That block pins
+# VESPASIAN to a nonexistent path so it always exercises the binary-absent arm —
+# otherwise the assertion would cover a different code path in CI (where this job
+# runs before the build) than locally (where bin/vespasian exists). RESULTS_DIR is
+# redirected into a temp dir so nothing is written into the repo.
 
 set -euo pipefail
 
@@ -429,6 +436,132 @@ else
 fi
 
 echo ""
+echo "=== A REAL offline run needs no config (LAB-5064) ==="
+
+# The block above only covers --dry-run. LAB-5064 is about the REAL run: on a
+# browserless host setup-live-targets.sh used to exit at the Chrome preflight
+# before writing .live-test-config, which took the service-free offline group
+# down with it even though it needs no ports at all. Guard both halves of the
+# fix — the predicate, and the runner actually honouring it.
+
+source <(sed -n '/^targets_need_config()/,/^}/p' "$RUNNER")
+
+# Fidelity sentinel, matching the one guarding the run_tests_guidance
+# extraction above. Without it a broken/empty sed range leaves
+# targets_need_config UNDEFINED and every call returns 127 — which the
+# inverted-polarity offline row below reads as success, so it passes
+# VACUOUSLY while the remaining rows fail confusingly. Verified by sabotaging
+# the range. Assert the function exists before asserting what it does.
+if declare -F targets_need_config >/dev/null; then
+    pass "targets_need_config sourced from run-live-tests.sh"
+else
+    fail "targets_need_config was not sourced (extraction broken/empty)"
+fi
+
+if targets_need_config "$(join_targets "${OFFLINE_TARGETS[@]}")"; then
+    fail "targets_need_config: offline group wrongly reported as needing config"
+else
+    pass "targets_need_config: offline group needs no config"
+fi
+
+if targets_need_config "import-burp,rest-api"; then
+    pass "targets_need_config: a mixed list needs config (live member present)"
+else
+    fail "targets_need_config: mixed list wrongly reported as config-free"
+fi
+
+if targets_need_config "$(join_targets "${LIVE_TARGETS[@]}")"; then
+    pass "targets_need_config: live group needs config"
+else
+    fail "targets_need_config: live group wrongly reported as config-free"
+fi
+
+# An unrecognised target must FAIL CLOSED — treated as needing config, so a typo
+# surfaces as a missing-config error instead of silently running against
+# hardcoded default ports.
+if targets_need_config "totally-unknown-target"; then
+    pass "targets_need_config: unknown target fails closed (needs config)"
+else
+    fail "targets_need_config: unknown target wrongly reported as config-free"
+fi
+
+# A comma-split that word-split an UNQUOTED expansion would also GLOB, so a
+# list containing * would expand against the cwd before comparison. Run from a
+# directory holding a file named after a real offline target: if the split
+# globs, "*" becomes "import-burp" and this wrongly reports config-free.
+globdir="$TMPDIR_T/globdir"
+mkdir -p "$globdir" && : > "$globdir/import-burp"
+if (cd "$globdir" && targets_need_config "*"); then
+    pass "targets_need_config: a glob is not expanded (stays unknown, fails closed)"
+else
+    fail "targets_need_config: '*' was glob-expanded against the cwd"
+fi
+
+# Behavioral: a real (non-dry-run) offline selection must get PAST config
+# loading. Asserted as the absence of the config error rather than a specific
+# exit code, because how far the run then gets legitimately differs by
+# environment — in CI this guard runs before setup-go, so it stops at the
+# missing vespasian binary; locally the binary exists and the importer test
+# actually runs. Either way, reaching that point proves no config was demanded.
+# One tiny importer target keeps it fast in both.
+#
+# RESULTS_DIR is redirected into the throwaway temp dir: locally this really
+# does execute an importer, and without the override it would write into the
+# repo's test/.results/ — a side effect this file's header disclaims ("Does NOT
+# run actual live tests").
+# VESPASIAN is pinned to a path that cannot exist so this always lands on the
+# binary-absent arm. Without the pin the assertion below covered the binary check
+# in CI and the target dispatch locally — two different code paths behind one
+# green result, and neither environment tested what the other did.
+real_offline=$(env CONFIG_FILE="$noconfig" RESULTS_DIR="$TMPDIR_T/results" \
+    VESPASIAN="$TMPDIR_T/no-such-vespasian-binary" \
+    bash -c "source '$RUNNER' --targets import-empty --no-build" 2>&1) || true
+if [[ "$real_offline" == *"Config file not found"* ]]; then
+    fail "real offline run demanded a config: $(printf '%s' "$real_offline" | head -3)"
+else
+    pass "real offline run (--targets import-empty) proceeds without a config file"
+fi
+
+# The check above is negative-only, so ANY unrelated early failure would satisfy
+# it. Pair it with a positive marker proving the run actually got as far as the
+# post-config stage. With VESPASIAN pinned absent, that marker is the binary
+# check — deterministically, in every environment.
+if [[ "$real_offline" == *"vespasian binary not found"* ]]; then
+    pass "real offline run reached the post-config stage (binary check)"
+else
+    fail "real offline run failed before reaching post-config: $(printf '%s' "$real_offline" | head -3)"
+fi
+
+echo ""
+echo "=== Browser probe shared with common.sh ==="
+# chrome_available gates the rod-backed targets. It must use the SHARED
+# detect_chrome_binary probe from common.sh, which actually runs the candidate,
+# not a bare `command -v`: on a stock devcontainer /usr/bin/chromium-browser is a
+# snap launcher stub that resolves fine and then fails at launch, so a
+# presence-only probe attempted the crawl and failed inside it instead of
+# skipping with a reason. Sharing the probe is also what keeps the runner, the
+# setup preflight and install-chrome.sh from disagreeing about whether this host
+# has a usable browser.
+#
+# This is a DRIFT guard, in the same spirit as the target-group check above, and
+# it is deliberately structural. run-live-tests.sh calls `main "$@"` unguarded, so
+# chrome_available cannot be sourced and called in isolation without running the
+# whole runner. The probe's BEHAVIOUR is covered where it lives — preflight-selftest
+# drives detect_chrome_binary against working, snap-stub, and absent browsers —
+# so what is left to protect here is the delegation itself.
+chrome_avail_body=$(awk '/^chrome_available\(\) \{/,/^\}/' "$RUNNER")
+if printf '%s' "$chrome_avail_body" | grep -q 'detect_chrome_binary'; then
+    pass "chrome_available delegates to common.sh's detect_chrome_binary"
+else
+    fail "chrome_available no longer uses detect_chrome_binary — the runner's browser probe has drifted from the shared one"
+fi
+if printf '%s' "$chrome_avail_body" | grep -qE 'command -v (google-chrome|chromium|chromium-browser)'; then
+    fail "chrome_available reintroduced a presence-only 'command -v' probe (snap stubs pass it)"
+else
+    pass "chrome_available carries no presence-only browser check"
+fi
+
+echo ""
 echo "=== Setup-complete guidance (setup-live-targets.sh) ==="
 
 # Drive the REAL run_tests_guidance selector (sourced above, not a copy) for
@@ -479,6 +612,11 @@ printf '%s\n' "REST_API_PORT=8990" "VESPASIAN=/tmp/evil" "TARGETS_SETUP=" > "$al
 allowlist_out=$(
     source "$SCRIPT_DIR/common.sh"
     source <(sed -n '/^load_config()/,/^}/p' "$RUNNER")
+    # Same fidelity sentinel as the two extractions above: a broken sed range
+    # would leave load_config undefined, and the assertions below — which look
+    # for a *warning* in the output — would then read an empty result as "no
+    # disallowed key applied" and pass without exercising the allowlist at all.
+    declare -F load_config >/dev/null || echo "SENTINEL_LOAD_CONFIG_MISSING"
     VESPASIAN="__sentinel__"
     REST_API_PORT="__unset__"
     CONFIG_FILE="$allowlist_cfg"
@@ -486,6 +624,12 @@ allowlist_out=$(
     echo "RESULT_VESPASIAN=$VESPASIAN"
     echo "RESULT_REST_API_PORT=$REST_API_PORT"
 ) || true
+
+if printf '%s\n' "$allowlist_out" | grep -q "SENTINEL_LOAD_CONFIG_MISSING"; then
+    fail "load_config was not sourced (extraction broken/empty) — assertions below are vacuous"
+else
+    pass "load_config sourced from run-live-tests.sh"
+fi
 
 if printf '%s\n' "$allowlist_out" | grep -q "Skipping unexpected config key: VESPASIAN"; then
     pass "load_config: disallowed key VESPASIAN skipped with warning"

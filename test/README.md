@@ -18,9 +18,109 @@ End-to-end live tests that spin up intentionally simple target applications, run
 ## Prerequisites
 
 - **Go 1.25+** — [https://go.dev/dl/](https://go.dev/dl/)
-- **Chrome/Chromium** — Required for headless crawling
+- **Chrome/Chromium** — Required for headless crawling (see below)
 - **python3** — Required for test validation scripts
 - **Node.js** — Required for the graphql-server target
+
+### Chrome in containers
+
+A stock Ubuntu devcontainer ships `/usr/bin/chromium-browser` as a **snap
+launcher stub**, and snapd is unavailable inside the container. The stub
+satisfies `command -v` and `-x` but fails the moment it runs, so `setup-live-targets.sh`
+reports it as *"found … but it is not runnable"* rather than passing preflight
+and failing later mid-crawl.
+
+Install a real, non-snap Chrome (`.deb`, amd64 or arm64):
+
+```bash
+./test/install-chrome.sh          # idempotent; no-op if a runnable browser exists
+export VESPASIAN_NO_SANDBOX=true  # containers generally cannot use the Chrome sandbox
+```
+
+> **This is a manual step today.** Nothing in this repo runs the installer
+> automatically — the devcontainer definition lives elsewhere, so a fresh
+> container comes up browserless and you must run the command above once. To
+> remove that step, the image that owns the devcontainer needs to call the
+> script at build or create time:
+>
+> ```dockerfile
+> # Dockerfile layer
+> COPY test/install-chrome.sh /tmp/install-chrome.sh
+> RUN /tmp/install-chrome.sh && rm /tmp/install-chrome.sh
+> ```
+>
+> ```jsonc
+> // .devcontainer/devcontainer.json — alternative, runs on container create
+> { "postCreateCommand": "./test/install-chrome.sh" }
+> ```
+>
+> The script is idempotent and exits 0 when a runnable browser is already
+> present, so either hook is safe to invoke on every build or rebuild.
+
+**How the package is trusted.** Google's apt repository is added *temporarily*,
+with its signing key pinned by primary-key fingerprint. apt then verifies the
+chain — Release signature → `Packages` digest → `.deb` digest — before dpkg runs
+the package's maintainer scripts as root. Downloading the `.deb` directly would
+leave TLS as the only control: `apt-get install ./local.deb` does **not**
+authenticate a local file argument, and Google's `.deb` carries no embedded
+`debsigs` signature to check instead. The fingerprint pin is what makes the
+check meaningful — a key fetched over the same channel as the package, unpinned,
+buys nothing against an attacker who controls that channel. If Google rotates
+its primary key the script fails loudly and the constant must be updated
+deliberately.
+
+**No background egress.** The temporary repo and keyring are removed once the
+install completes (via an `EXIT` trap, so an aborted run cannot leave them
+behind). The `google-chrome-stable` package's own permanent apt source and daily
+update pinger (`/etc/cron.daily/google-chrome`) are suppressed via
+`repo_add_once=false` and then verified absent. Chrome's telemetry is separately
+disabled on every browser vespasian launches (LAB-4999), and the live suite
+always launches through vespasian, so it inherits those flags.
+
+**Version policy.** The script tracks Chrome *stable* rather than pinning a
+version — for a test-only layer that is the right trade, since a pinned version
+goes stale and eventually 404s. The installed version is logged on success so an
+image build record identifies exactly what landed.
+
+`apt install chromium` / `chromium-browser` are **not** alternatives on Ubuntu
+noble — both are transitional packages that pre-depend on snapd.
+
+The non-privileged surface (argument handling, architecture resolution, the
+pinned fingerprint) is covered by `test/install-chrome-selftest.sh`, which runs
+in CI. The download / apt / privileged-mutation paths are deliberately not
+tested: they need root, network, and destructive system changes.
+
+### Running without a browser
+
+Browser-free work does not require a browser to be present:
+
+```bash
+./test/run-live-tests.sh --group offline   # importers, generators, fixtures — no setup run needed
+./test/setup-live-targets.sh --skip-start  # build binaries only
+```
+
+The offline group talks to no service, so it needs neither `.live-test-config`
+nor a browser and runs on a fresh checkout. Likewise, `setup-live-targets.sh`
+treats a missing browser as fatal only when the selected targets actually drive
+the headless backend — `--skip-start` and a `grpc-server`-only setup warn and
+continue. Selections that do need a browser still fail loudly at preflight.
+
+### Dynamic (integration) tests
+
+Separate from this live suite, `pkg/crawl` carries `//go:build integration`
+tests that launch a real browser to exercise `NewBrowserManager`'s launch / kill
+/ close lifecycle. They are excluded from `make test` by the build tag and need
+the same non-snap Chrome as above:
+
+```bash
+export VESPASIAN_NO_SANDBOX=true
+go test -tags integration ./pkg/crawl/...
+```
+
+`TestConfigureLauncher_PinsSystemBrowser` is the exception: it only needs a
+browser binary to exist on disk (it asserts go-rod's `.Bin` is pinned so no
+Chromium is auto-downloaded — LAB-4999), so it runs even where Chrome cannot
+launch, and skips cleanly when no browser is present at all.
 
 ## Targets
 

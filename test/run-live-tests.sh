@@ -23,8 +23,15 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # Path to the resolved-ports config written by setup-live-targets.sh. Overridable
 # via the CONFIG_FILE env var (used by test/test-runner-args.sh --dry-run runs).
 CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/.live-test-config}"
-RESULTS_DIR="${SCRIPT_DIR}/.results"
-VESPASIAN="${PROJECT_ROOT}/bin/vespasian"
+# Where per-target results are written. Overridable via the RESULTS_DIR env var
+# (same pattern as CONFIG_FILE below) so test/test-runner-args.sh can point a
+# real run at a temp dir instead of writing into the repo checkout.
+RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/.results}"
+# Overridable so test-runner-args.sh can pin the binary-absent arm and get the
+# same assertion in CI (where this runs before the build) as locally (where
+# bin/vespasian already exists). Also lets an operator point the suite at a
+# binary built elsewhere.
+VESPASIAN="${VESPASIAN:-${PROJECT_ROOT}/bin/vespasian}"
 
 # Hostname the test harness uses to reach the target services. Defaults to
 # "localhost" for host-only runs. Set TEST_HOST=host.docker.internal (or the
@@ -110,6 +117,45 @@ resolve_targets() {
             ;;
     esac
     printf '%s\n' "$resolved"
+}
+
+# targets_need_config returns 0 when the resolved target list contains at least
+# one target that talks to a live service — i.e. one that needs the ports
+# setup-live-targets.sh writes into .live-test-config.
+#
+# Membership in OFFLINE_TARGETS is the test, rather than a second
+# hand-maintained list: an offline target is service-free by definition, and
+# test-runner-args.sh already guards that array against drift from the dispatch
+# block. A target absent from OFFLINE_TARGETS is assumed to need config, so the
+# unknown/typo case fails loudly on a missing config instead of running
+# half-configured against default ports.
+targets_need_config() {
+    # read -ra from a QUOTED here-string rather than an unquoted ${1//,/ }:
+    # word-splitting an unquoted expansion also GLOBS, so a target list
+    # containing * would expand against the cwd before it was ever compared.
+    # This predicate decides whether a gate applies, so it must not rely on
+    # downstream validation to catch that.
+    #
+    # Note the here-string, NOT `local IFS=,` + read: IFS also controls how
+    # "${OFFLINE_TARGETS[*]}" below joins, so setting it to a comma silently
+    # turns the haystack into a comma-joined string and breaks the
+    # space-delimited match.
+    #
+    # SIBLING: setup-live-targets.sh's browser_required uses this same split for
+    # the same reason. The two are deliberately NOT factored into a shared
+    # helper — not because sharing is impossible, but because it isn't worth it
+    # for one shared line; see the note there for the divergence that makes a
+    # common predicate awkward. If you change this split, change that one too;
+    # both are pinned by glob assertions.
+    local target parts
+    read -ra parts <<< "${1//,/ }"
+    for target in "${parts[@]}"; do
+        case " ${OFFLINE_TARGETS[*]} " in
+            *" ${target} "*) ;;   # service-free — needs nothing from the config
+            *) return 0 ;;
+        esac
+    done
+    return 1
 }
 
 # Source shared colors, logging, and validation functions
@@ -302,18 +348,22 @@ crawl_backend() {
 }
 
 # chrome_available returns 0 if Chrome is likely reachable, 1 otherwise.
-# This is a best-effort shell heuristic (binary presence or rod's cached
-# Chromium directory) and may diverge from the Go skipIfNoChrome probe, which
-# actually attempts to launch a headless browser via NewBrowserManager. A false
-# positive here (chrome_available returns 0 but Chrome fails to launch) degrades
-# to a log_warn + skip, never a hard failure. A false negative causes the rod
-# backend to be skipped even when Chrome is present; re-run with an explicit
-# Chrome binary on PATH if rod skips unexpectedly.
+#
+# Delegates to detect_chrome_binary (test/common.sh), which RUNS the candidate
+# rather than merely resolving it. That matters on a stock devcontainer, where
+# /usr/bin/chromium-browser is a snap launcher stub: the old presence-only probe
+# (command -v) returned 0 for it, so rod-backed targets were attempted and then
+# failed inside the crawl instead of skipping with a clear reason. Sharing the
+# probe also means the runner, setup-live-targets.sh's preflight, and
+# install-chrome.sh's idempotency check can no longer disagree about whether this
+# host has a usable browser.
+#
+# The rod cache remains a fallback: go-rod can drive a browser it downloaded
+# itself, which is not on PATH and so invisible to the candidate list.
+#
+# A false positive still degrades to a log_warn + skip, never a hard failure.
 chrome_available() {
-    command -v google-chrome >/dev/null 2>&1 || \
-    command -v chromium >/dev/null 2>&1 || \
-    command -v chromium-browser >/dev/null 2>&1 || \
-    [ -d "$HOME/.cache/rod/browser" ]
+    detect_chrome_binary >/dev/null 2>&1 || [ -d "$HOME/.cache/rod/browser" ]
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -3717,14 +3767,16 @@ main() {
 
     log_header "Vespasian Live Test Runner"
 
-    # Load config only when it is actually needed. A real run always needs it
-    # (TEST_HOST and service ports for preflight and the tests). A --dry-run
-    # needs it only to resolve the "all" group, whose config-driven
-    # TARGETS_SETUP folds in config-only targets like grpc-server. The offline
-    # and live groups — and an explicit --targets list — resolve purely from the
-    # in-script arrays, so requiring a config there would make --dry-run fail on
-    # a fresh checkout for no reason.
-    if [ "$dry_run" != true ] || { [ -z "$targets" ] && [ "${group:-all}" = all ]; }; then
+    # Load config only when it is actually needed.
+    #
+    # The "all" group must be resolved AFTER load_config, because its
+    # config-driven TARGETS_SETUP folds in config-only targets like grpc-server.
+    # Every other selection — the offline and live groups, and an explicit
+    # --targets list — resolves purely from the in-script arrays, so it can be
+    # resolved first and only then decide whether a config is needed at all.
+    local resolving_all=false
+    if [ -z "$targets" ] && [ "${group:-all}" = all ]; then
+        resolving_all=true
         load_config
     fi
 
@@ -3740,6 +3792,17 @@ main() {
     if [ "$dry_run" = true ]; then
         echo "targets=$targets"
         return 0
+    fi
+
+    # For every non-"all" selection, require a config only when a selected
+    # target actually talks to a live service (LAB-5064). Offline targets are
+    # service-free, so `--group offline` — and any importer/generator --targets
+    # list — now runs on a fresh checkout with no setup-live-targets.sh run at
+    # all. That is the whole point on a browserless host, where setup used to
+    # bail at the Chrome preflight before ever writing .live-test-config and
+    # took deterministic offline coverage down with it.
+    if [ "$resolving_all" != true ] && targets_need_config "$targets"; then
+        load_config
     fi
 
     preflight_test_host "$targets"

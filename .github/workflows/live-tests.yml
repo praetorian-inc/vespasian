@@ -38,10 +38,32 @@ jobs:
           persist-credentials: false
 
       - name: Syntax check
-        run: bash -n test/setup-live-targets.sh
+        run: bash -n test/setup-live-targets.sh && bash -n test/install-chrome.sh
 
       - name: Run preflight self-test
         run: bash test/preflight-selftest.sh
+
+      # install-chrome.sh's non-privileged surface: argument handling,
+      # architecture resolution, and the pinned signing-key fingerprint. The
+      # download / apt / privileged-mutation paths are deliberately not
+      # exercised — they need root, network, and destructive system changes.
+      - name: Run install-chrome self-test
+        run: bash test/install-chrome-selftest.sh
+
+      # Teardown / orphan-PID / port-exhaustion regressions (LAB-2893). Needs
+      # no Go, Node or Chrome — it spawns lightweight stand-ins — so it belongs
+      # in this un-gated job rather than the full live suite. Previously it ran
+      # in no job at all despite its header claiming otherwise.
+      - name: Run setup-live-targets self-test
+        run: bash test/setup-live-targets_test.sh
+
+      # Target-group/dispatch drift guard plus the offline-run and load_config
+      # allowlist guards. Moved here from the label-gated `test` job: it needs
+      # no Go, Node or Chrome, and leaving it gated meant a PR carrying
+      # 'skip-live-tests' skipped the very guards that catch silent coverage
+      # drift — exactly what they exist to prevent.
+      - name: Drift guard (target groups vs dispatch)
+        run: ./test/test-runner-args.sh
 
   # Gate: run by default; skip PR runs only when 'skip-live-tests' label is present.
   # Push-to-main and workflow_dispatch always run.
@@ -66,7 +88,16 @@ jobs:
   # test/run-live-tests.sh (OFFLINE_TARGETS / LIVE_TARGETS); offline targets
   # run first so a live-setup failure cannot mask deterministic coverage.
   test:
-    needs: check-label
+    # preflight-selftest as well as check-label: the drift guard and the shell
+    # self-tests moved into that job, and they used to be the FIRST step of this
+    # one, where a failure stopped the 30-minute suite immediately. Depending on
+    # the job restores that fail-fast: there is no value in building Go, starting
+    # six services and crawling with a browser when the guards have already shown
+    # the target groups have drifted out of sync with the dispatch block.
+    #
+    # preflight-selftest needs no Go, Node or Chrome and finishes in well under a
+    # minute, so serializing on it costs far less than a wasted full run.
+    needs: [check-label, preflight-selftest]
     if: needs.check-label.outputs.should-run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -88,9 +119,6 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           persist-credentials: false
-
-      - name: Drift guard (target groups vs dispatch)
-        run: ./test/test-runner-args.sh
 
       - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
         with:

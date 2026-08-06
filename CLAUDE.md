@@ -124,7 +124,9 @@ The `test/` directory contains live test targets:
 - **test/concat-spa/**: Go HTTP server serving a single-page app whose API endpoints exist only as concatenated strings in an external JS bundle (discovered via post-crawl JS-replay)
 - **test/forms-target/**: Go HTTP server serving an HTML `<form>` page whose POST endpoints are recovered by static form extraction (`analyze.ExtractForms`); a co-located GET search form contributes query parameters to a crawl-linked endpoint
 
-See `test/README.md` for how to run the suite, including the `TEST_HOST` override for devcontainer setups.
+Supporting scripts: `test/install-chrome.sh` provisions a real non-snap Chrome for containers (Ubuntu's `chromium-browser` is a snap stub that cannot run in-container), installing it from Google's apt repo with the signing key pinned by fingerprint and the repo removed again afterwards. It is **not wired into any image build** — nothing calls it automatically, because the devcontainer definition lives outside this repo; a fresh container is browserless until an image layer or `postCreateCommand` invokes it. `test/preflight-selftest.sh`, `test/test-runner-args.sh`, `test/install-chrome-selftest.sh`, and `test/setup-live-targets_test.sh` are the CI-run regression guards for the setup preflight, the target-group/dispatch wiring, the installer's non-privileged surface, and the setup script's argument handling. All four run in the un-gated `preflight-selftest` job, which the `test` job depends on so a guard failure stops the full suite before it builds anything.
+
+See `test/README.md` for how to run the suite, including the `TEST_HOST` override for devcontainer setups, the browserless `--group offline` path, and the `//go:build integration` browser-lifecycle tests.
 
 ## Code Conventions
 
