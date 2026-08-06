@@ -1,0 +1,171 @@
+// Copyright 2026 Praetorian Security, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package probe — internal tests for the unexported withDefaults proxy
+// wiring. Uses `package probe` (not probe_test) because withDefaults is
+// unexported (LAB-4993).
+package probe
+
+import (
+	"bytes"
+	"errors"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
+)
+
+// TestConfig_WithDefaults_ProxyClient verifies that when Config.Proxy is
+// enabled and Client is nil, withDefaults builds a proxied client: the
+// transport routes through the proxy, has no SSRF dial pin installed (we dial
+// the proxy, not the target), preserves the probe package's redirect policy
+// (ErrUseLastResponse), and (TEST-011) that Config.Proxy.Insecure survives the
+// withDefaults->BuildHTTPClient hop for an http/https proxy but never for
+// socks5 (a transparent TCP tunnel with no substitute CA to trust). Also
+// (TEST-004) that Client.Timeout — the ONLY bound on a proxied probe
+// request, since the proxied transport clones DefaultTransport but clears
+// DialContext and installs no TLSHandshakeTimeout/ResponseHeaderTimeout stage
+// caps — defaults to a non-zero value when Config.Timeout is unset, and
+// survives unchanged to the client when explicitly configured.
+func TestConfig_WithDefaults_ProxyClient(t *testing.T) {
+	proxyURL, err := url.Parse("http://127.0.0.1:8080")
+	require.NoError(t, err)
+
+	cfg := Config{Proxy: httpx.ProxyConfig{URL: proxyURL}}.withDefaults()
+
+	require.NotNil(t, cfg.Client)
+	tr, ok := cfg.Client.Transport.(*http.Transport)
+	require.True(t, ok, "Transport must be *http.Transport, got %T", cfg.Client.Transport)
+	assert.NotNil(t, tr.Proxy, "proxied client must set Transport.Proxy")
+	assert.Nil(t, tr.DialContext, "proxied client must NOT install the SSRF dial pin (no target pin when proxied)")
+
+	require.NotNil(t, cfg.Client.CheckRedirect)
+	gotErr := cfg.Client.CheckRedirect(nil, nil)
+	assert.True(t, errors.Is(gotErr, http.ErrUseLastResponse),
+		"proxied client must keep the probe package's ErrUseLastResponse redirect policy")
+
+	// TEST-004: Client.Timeout is the ONLY thing bounding a proxied probe
+	// request (the proxied transport carries no stage caps). Assert it
+	// defaults to a non-zero value, and against the package's documented
+	// default (DefaultConfig) rather than a magic literal.
+	assert.NotZero(t, cfg.Client.Timeout, "proxied client must have a non-zero Timeout — it is the only bound on a proxied probe request")
+	assert.Equal(t, DefaultConfig().Timeout, cfg.Client.Timeout,
+		"proxied client's default Timeout must equal the package's documented default (DefaultConfig)")
+
+	t.Run("explicit Timeout survives to the proxied client", func(t *testing.T) {
+		explicitTimeout := 7 * time.Second
+		explicitCfg := Config{Proxy: httpx.ProxyConfig{URL: proxyURL}, Timeout: explicitTimeout}.withDefaults()
+		assert.Equal(t, explicitTimeout, explicitCfg.Client.Timeout,
+			"proxied client must carry the configured Timeout unchanged")
+	})
+
+	t.Run("http proxy Insecure=true", func(t *testing.T) {
+		insecureURL, err := url.Parse("http://127.0.0.1:8080")
+		require.NoError(t, err)
+
+		insecureCfg := Config{Proxy: httpx.ProxyConfig{URL: insecureURL, Insecure: true}}.withDefaults()
+
+		insecureTr, ok := insecureCfg.Client.Transport.(*http.Transport)
+		require.True(t, ok, "Transport must be *http.Transport, got %T", insecureCfg.Client.Transport)
+		require.NotNil(t, insecureTr.TLSClientConfig, "Insecure=true must install a TLSClientConfig")
+		assert.True(t, insecureTr.TLSClientConfig.InsecureSkipVerify,
+			"Config.Proxy.Insecure must survive the withDefaults->BuildHTTPClient hop for an http/https proxy")
+	})
+
+	t.Run("socks5 proxy Insecure=true stays verified", func(t *testing.T) {
+		socksURL, err := url.Parse("socks5://127.0.0.1:1080")
+		require.NoError(t, err)
+
+		socksCfg := Config{Proxy: httpx.ProxyConfig{URL: socksURL, Insecure: true}}.withDefaults()
+
+		socksTr, ok := socksCfg.Client.Transport.(*http.Transport)
+		require.True(t, ok, "Transport must be *http.Transport, got %T", socksCfg.Client.Transport)
+		if socksTr.TLSClientConfig != nil {
+			assert.False(t, socksTr.TLSClientConfig.InsecureSkipVerify,
+				"socks5 is a transparent tunnel; Insecure must never skip verification of the real target")
+		}
+	})
+}
+
+// TestConfig_WithDefaults_NoProxyUnchanged verifies that a zero-value Proxy
+// leaves the existing SSRF-safe default client construction untouched.
+func TestConfig_WithDefaults_NoProxyUnchanged(t *testing.T) {
+	cfg := Config{}.withDefaults()
+
+	require.NotNil(t, cfg.Client)
+	tr, ok := cfg.Client.Transport.(*http.Transport)
+	require.True(t, ok, "Transport must be *http.Transport, got %T", cfg.Client.Transport)
+	assert.NotNil(t, tr.DialContext, "unproxied default client must keep the SSRF-safe dial guard")
+}
+
+// TestConfig_WithDefaults_WarnsWhenClientInjectedWithProxy is the SEC-BE-004
+// proof for the probe stage: when a caller injects Config.Client (which owns
+// its own transport) AND enables Config.Proxy, withDefaults must not silently
+// bypass the proxy — it emits a loud warning via the default slog logger
+// (probe/types.go's withDefaults has no per-Config Logger field, unlike the
+// crawl/jsstatic stages, so this captures the process-wide default logger).
+func TestConfig_WithDefaults_WarnsWhenClientInjectedWithProxy(t *testing.T) {
+	var buf bytes.Buffer
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	// t.Cleanup (not defer) so the default logger is restored even if a helper
+	// goroutine calls t.Fatal. This test (and any sibling reading the process-
+	// default slog logger) must NOT be parallel — they mutate global slog state.
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
+	proxyURL, err := url.Parse("http://127.0.0.1:8080")
+	require.NoError(t, err)
+
+	injectedClient := &http.Client{}
+	cfg := Config{Client: injectedClient, Proxy: httpx.ProxyConfig{URL: proxyURL}}.withDefaults()
+
+	assert.Same(t, injectedClient, cfg.Client, "an injected Client must not be replaced when Proxy is enabled")
+	assert.Contains(t, buf.String(), "BYPASS the proxy",
+		"withDefaults must warn that probe traffic will bypass the proxy when a Client is injected alongside a configured Proxy")
+}
+
+// TestGRPCProbe_ProxyTLSVerifyMismatch is the TEST-005(a) proof for
+// proxyTLSVerifyMismatch: it reports true only when ALL of (target is TLS,
+// proxy is configured, Proxy.Insecure is set, GRPCInsecureSkipVerify is unset)
+// hold at once.
+func TestGRPCProbe_ProxyTLSVerifyMismatch(t *testing.T) {
+	proxyURL, err := url.Parse("http://127.0.0.1:8080")
+	require.NoError(t, err)
+	enabledInsecure := httpx.ProxyConfig{URL: proxyURL, Insecure: true}
+	tests := []struct {
+		name  string
+		proxy httpx.ProxyConfig
+		skip  bool
+		tls   bool
+		want  bool
+	}{
+		{"all conditions met", enabledInsecure, false, true, true},
+		{"target not TLS", enabledInsecure, false, false, false},
+		{"no proxy configured", httpx.ProxyConfig{Insecure: true}, false, true, false},
+		{"proxy not insecure", httpx.ProxyConfig{URL: proxyURL, Insecure: false}, false, true, false},
+		{"grpc skip verify set", enabledInsecure, true, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &GRPCProbe{config: Config{Proxy: tt.proxy, GRPCInsecureSkipVerify: tt.skip}}
+			assert.Equal(t, tt.want, p.proxyTLSVerifyMismatch(grpcTargetInfo{useTLS: tt.tls}))
+		})
+	}
+}

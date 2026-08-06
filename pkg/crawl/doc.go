@@ -121,7 +121,11 @@
 //     (auth headers and probes are restricted to the scan target's origin
 //     by default) and uses [github.com/praetorian-inc/vespasian/pkg/ssrf]
 //     for SSRF protection unless the operator explicitly opts out via
-//     AllowPrivate. Relative to the fully-offline static path, replay is
+//     AllowPrivate. When [JSReplayConfig.Proxy] is set (and no Client is
+//     injected) the replay client routes through the intercepting proxy —
+//     LAB-4993 made probe and JS-replay proxy-aware, so --proxy is no longer
+//     crawl-only. socks5 always verifies TLS; --proxy-insecure is http/https only.
+//     Relative to the fully-offline static path, replay is
 //     strictly ADDITIVE: it supersedes an offline static:js-concat mirror only
 //     for a path the probe answered 404 — the sole dispositive refutation — so
 //     a 200 text/html SPA catch-all, a 204, an HTML-bodied 401/403 or a

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 )
 
 // Source values that this package writes to crawl.ObservedRequest.Source.
@@ -65,7 +66,7 @@ type Options struct {
 	// HTTPClient is the client used for sourcemap fetches.
 	//
 	// When set, Analyze wraps the caller's client in a shallow copy that overlays
-	// both noFollowRedirects (so a .js.map URL cannot 302 to an attacker host and
+	// both httpx.NoFollowRedirects (so a .js.map URL cannot 302 to an attacker host and
 	// bypass the sameHost pre-flight check) and an SSRF-safe DialContext matching
 	// the posture of the default client (probe.SSRFSafeDialContext, or a
 	// permissive dialer when AllowPrivate is true). The caller's original client
@@ -83,6 +84,15 @@ type Options struct {
 	// AllowPrivate disables SSRF protection on sourcemap fetches. Mirrors the
 	// --dangerous-allow-private flag on the parent command.
 	AllowPrivate bool
+
+	// Proxy routes sourcemap fetches through an intercepting proxy when set. It
+	// is honored ONLY when HTTPClient is nil (the production path — pipeline
+	// never sets HTTPClient): an injected HTTPClient has its Transport overwritten
+	// with ssrfSafeTransport (see recoverSourcemap), which would clobber a proxied
+	// dialer, so recoverSourcemap emits a warning that sourcemap fetches will BYPASS
+	// the proxy in that case. The proxied client installs no dial-time SSRF pin (we
+	// dial the proxy, not the target); the same-host URL check is unchanged.
+	Proxy httpx.ProxyConfig
 
 	// PerBundleTimeout caps jsluice parsing time per bundle. Default: 5s.
 	PerBundleTimeout time.Duration

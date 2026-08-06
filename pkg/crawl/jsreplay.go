@@ -45,6 +45,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 	"github.com/praetorian-inc/vespasian/pkg/ssrf"
 )
@@ -92,6 +93,16 @@ type JSReplayConfig struct {
 	// SSRF-safe transport when !AllowPrivate.
 	Client *http.Client
 
+	// Proxy routes replay traffic through an intercepting proxy when set. It is
+	// honored ONLY when Client is nil (the production path — buildJSReplayConfig
+	// never sets Client): an injected Client owns its transport, and
+	// wrapClientWithSSRF would clobber a proxied dialer.
+	// When a Client IS injected while Proxy is set, withDefaults emits a warning to
+	// Stderr that replay traffic will BYPASS the proxy. The proxied client installs
+	// no dial-time SSRF pin (we dial the proxy, not the target); URL-level scope
+	// (ValidateProbeURL/canFetchURL) is unchanged.
+	Proxy httpx.ProxyConfig
+
 	// Verbose enables debug logging to Stderr.
 	Verbose bool
 
@@ -133,8 +144,22 @@ func (cfg JSReplayConfig) withDefaults() JSReplayConfig {
 		cfg.Stderr = io.Discard
 	}
 	if cfg.Client == nil {
-		cfg.Client = newSSRFSafeClient(cfg.Timeout, cfg.AllowPrivate)
+		if cfg.Proxy.Enabled() {
+			// Route through the proxy: no dial-time SSRF pin (we dial the proxy,
+			// not the target). This is the production path; an injected Client
+			// deliberately opts out of Proxy (wrapClientWithSSRF would clobber a
+			// proxied dialer).
+			cfg.Client = httpx.BuildHTTPClient(cfg.Proxy, cfg.Timeout, httpx.NoFollowRedirects)
+		} else {
+			cfg.Client = newSSRFSafeClient(cfg.Timeout, cfg.AllowPrivate)
+		}
 	} else {
+		if cfg.Proxy.Enabled() {
+			// SEC-BE-004: an injected Client owns its transport, so a configured
+			// Proxy is silently ignored here. Warn loudly rather than bypass the
+			// proxy without a trace.
+			fmt.Fprintf(cfg.Stderr, "js-extract: warning: Proxy configured but ignored — an injected Client owns its transport; replay traffic will BYPASS the proxy\n") //nolint:errcheck // best-effort warning
+		}
 		// Caller supplied a client. SSRF-wrap when AllowPrivate is false,
 		// and always enforce our redirect policy: probeURL records the
 		// status we asked for (no auto-follow), and fetchJSBody follows
@@ -151,17 +176,9 @@ func (cfg JSReplayConfig) withDefaults() JSReplayConfig {
 				cfg.Client.Timeout = cfg.Timeout
 			}
 		}
-		cfg.Client.CheckRedirect = noRedirect
+		cfg.Client.CheckRedirect = httpx.NoFollowRedirects
 	}
 	return cfg
-}
-
-// noRedirect is the redirect policy used by ReplayJSExtracted's HTTP client.
-// It causes Go's http.Client to return 3xx responses verbatim instead of
-// auto-following them; probeURL needs the actual response from the URL we
-// asked for, and fetchJSBody manages its own bounded redirect-follow loop.
-func noRedirect(*http.Request, []*http.Request) error {
-	return http.ErrUseLastResponse
 }
 
 // wrapClientWithSSRF returns a copy of caller with its transport replaced by
@@ -252,7 +269,7 @@ func newSSRFSafeClient(timeout time.Duration, allowPrivate bool) *http.Client {
 	return &http.Client{
 		Timeout:       timeout,
 		Transport:     transport,
-		CheckRedirect: noRedirect,
+		CheckRedirect: httpx.NoFollowRedirects,
 	}
 }
 

@@ -34,6 +34,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 	"github.com/praetorian-inc/vespasian/pkg/ssrf"
 )
 
@@ -3850,6 +3851,305 @@ func TestReplayJSExtracted_NoHTMLFallsBackToFirstURL(t *testing.T) {
 	}
 	assert.Contains(t, apiURLs, app.URL+"/api/users/0/orders",
 		"with no HTML response and no TargetURL, replay must bind to the first non-empty request's origin (the JS bundle's)")
+}
+
+// ---------------------------------------------------------------------------
+// Task 5: JSReplayConfig.Proxy field + proxied client in withDefaults (LAB-4993)
+// ---------------------------------------------------------------------------
+
+// TestJSReplayConfig_WithDefaults_ProxyClient verifies that when Proxy is
+// enabled and Client is nil, withDefaults builds a proxied client: transport
+// routes through the proxy, has no SSRF dial pin (we dial the proxy, not the
+// target), and keeps the replay step's noRedirect policy.
+func TestJSReplayConfig_WithDefaults_ProxyClient(t *testing.T) {
+	proxyURL, err := url.Parse("http://127.0.0.1:8080")
+	require.NoError(t, err)
+
+	cfg := JSReplayConfig{Proxy: httpx.ProxyConfig{URL: proxyURL}}.withDefaults()
+
+	require.NotNil(t, cfg.Client)
+	tr, ok := cfg.Client.Transport.(*http.Transport)
+	require.True(t, ok, "Transport must be *http.Transport, got %T", cfg.Client.Transport)
+	assert.NotNil(t, tr.Proxy, "proxied client must set Transport.Proxy")
+	assert.Nil(t, tr.DialContext, "proxied client must NOT install the SSRF dial pin")
+
+	require.NotNil(t, cfg.Client.CheckRedirect)
+	gotErr := cfg.Client.CheckRedirect(nil, nil)
+	assert.True(t, errors.Is(gotErr, http.ErrUseLastResponse),
+		"proxied client must keep the replay step's httpx.NoFollowRedirects policy")
+
+	// TEST-004 parity (see pkg/probe/proxy_internal_test.go): Timeout is the
+	// only bound on a proxied replay request, so it must default to a
+	// non-zero value on the client.
+	assert.Equal(t, defaultTimeout, cfg.Client.Timeout, "proxied client must carry the default per-request Timeout")
+
+	// TEST-011: Config.Proxy.Insecure must survive the
+	// withDefaults->BuildHTTPClient hop for an http/https proxy, but never for
+	// socks5 (a transparent TCP tunnel with no substitute CA to trust).
+	t.Run("http proxy Insecure=true", func(t *testing.T) {
+		insecureURL, err := url.Parse("http://127.0.0.1:8080")
+		require.NoError(t, err)
+
+		insecureCfg := JSReplayConfig{Proxy: httpx.ProxyConfig{URL: insecureURL, Insecure: true}}.withDefaults()
+
+		insecureTr, ok := insecureCfg.Client.Transport.(*http.Transport)
+		require.True(t, ok, "Transport must be *http.Transport, got %T", insecureCfg.Client.Transport)
+		require.NotNil(t, insecureTr.TLSClientConfig, "Insecure=true must install a TLSClientConfig")
+		assert.True(t, insecureTr.TLSClientConfig.InsecureSkipVerify,
+			"Config.Proxy.Insecure must survive the withDefaults->BuildHTTPClient hop for an http/https proxy")
+	})
+
+	t.Run("socks5 proxy Insecure=true stays verified", func(t *testing.T) {
+		socksURL, err := url.Parse("socks5://127.0.0.1:1080")
+		require.NoError(t, err)
+
+		socksCfg := JSReplayConfig{Proxy: httpx.ProxyConfig{URL: socksURL, Insecure: true}}.withDefaults()
+
+		socksTr, ok := socksCfg.Client.Transport.(*http.Transport)
+		require.True(t, ok, "Transport must be *http.Transport, got %T", socksCfg.Client.Transport)
+		if socksTr.TLSClientConfig != nil {
+			assert.False(t, socksTr.TLSClientConfig.InsecureSkipVerify,
+				"socks5 is a transparent tunnel; Insecure must never skip verification of the real target")
+		}
+	})
+}
+
+// TestJSReplayConfig_WithDefaults_WarnsWhenClientInjectedWithProxy is the
+// SEC-BE-004 proof for the JS-replay stage: when a caller injects
+// JSReplayConfig.Client (which owns its own transport) AND enables Proxy,
+// withDefaults must not silently bypass the proxy — it writes a loud warning
+// to cfg.Stderr, mirroring the equivalent probe-stage guard
+// (pkg/probe/proxy_internal_test.go:TestConfig_WithDefaults_WarnsWhenClientInjectedWithProxy).
+func TestJSReplayConfig_WithDefaults_WarnsWhenClientInjectedWithProxy(t *testing.T) {
+	proxyURL, err := url.Parse("http://127.0.0.1:8080")
+	require.NoError(t, err)
+
+	var stderr bytes.Buffer
+	injectedClient := &http.Client{}
+	cfg := JSReplayConfig{
+		Client: injectedClient,
+		Proxy:  httpx.ProxyConfig{URL: proxyURL},
+		Stderr: &stderr,
+	}.withDefaults()
+
+	assert.NotNil(t, cfg.Client, "an injected Client must survive withDefaults even when Proxy is enabled")
+	assert.Contains(t, stderr.String(), "js-extract: warning",
+		"withDefaults must warn on Stderr when a Client is injected alongside a configured Proxy")
+	assert.Contains(t, stderr.String(), "BYPASS the proxy",
+		"the warning must explain that replay traffic will bypass the proxy")
+}
+
+// TestJSReplayConfig_WithDefaults_NoProxyUnchanged verifies that a zero-value
+// Proxy leaves the existing newSSRFSafeClient construction untouched (the
+// default client still installs the SSRF-safe dial guard when !AllowPrivate).
+func TestJSReplayConfig_WithDefaults_NoProxyUnchanged(t *testing.T) {
+	cfg := JSReplayConfig{}.withDefaults()
+
+	require.NotNil(t, cfg.Client)
+	tr, ok := cfg.Client.Transport.(*http.Transport)
+	require.True(t, ok, "Transport must be *http.Transport, got %T", cfg.Client.Transport)
+	require.NotNil(t, tr.DialContext, "unproxied default client must keep the SSRF-safe dial guard")
+	_, dialErr := tr.DialContext(context.Background(), "tcp", "127.0.0.1:1")
+	require.Error(t, dialErr, "DialContext must reject loopback under SSRF protection")
+	assert.Contains(t, dialErr.Error(), "private")
+}
+
+// TestReplayJSExtracted_RoutesThroughProxy is the AC-1 proof for JS-replay:
+// end-to-end, modeled on pkg/crawl/http_crawler_test.go:195 (recording
+// forwarding proxy) and TestReplayJSExtracted_HTMLScriptDiscovery (HTML page
+// referencing an external JS bundle that must be fetched over the network).
+// The config deliberately leaves Client nil so withDefaults' proxied branch is
+// exercised — an injected Client would opt out of Proxy (see architecture.md
+// §1 hazard).
+func TestReplayJSExtracted_RoutesThroughProxy(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/main.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			w.Write([]byte(`var api = "/api/v1/products";`)) //nolint:errcheck,gosec // test handler
+		case "/api/v1/products":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"data":[]}`)) //nolint:errcheck,gosec // test handler
+		default:
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte(`<!DOCTYPE html><html><head><script src="main.js"></script></head></html>`)) //nolint:errcheck,gosec // test handler
+		}
+	}))
+	defer origin.Close()
+
+	proxyURL, hits := newRecordingProxy(t)
+
+	requests := []ObservedRequest{
+		{
+			Method: "GET",
+			URL:    origin.URL + "/",
+			Source: "katana",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<!DOCTYPE html><html><head><script src="main.js"></script></head></html>`),
+			},
+		},
+	}
+
+	cfg := JSReplayConfig{
+		Proxy:        httpx.ProxyConfig{URL: proxyURL},
+		AllowPrivate: true,
+		TargetURL:    origin.URL,
+	}
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	var apiURLs []string
+	for _, r := range result {
+		if r.Source == "js-extract" {
+			apiURLs = append(apiURLs, r.URL)
+		}
+	}
+	assert.Contains(t, apiURLs, origin.URL+"/api/v1/products")
+	assert.NotZero(t, hits.Load(), "JS-replay must route its fetches through the configured proxy")
+}
+
+// TestReplayJSExtracted_ProxiedFetch_AllowPrivateGate is the TEST-002 proof
+// for the URL-level SSRF gate on the proxied JS-replay path (PR #186 round-7
+// review). withDefaults' proxied branch (jsreplay.go ~146-155) deliberately
+// installs no dial-time SSRF pin when a Proxy is configured — we dial the
+// proxy, not the target — so canFetchURL's ssrf.ValidateURLContext call
+// (jsreplay.go ~2018-2021, guarded by !cfg.AllowPrivate) is the only
+// remaining scope guard on that path. It must reject the loopback target
+// BEFORE any HTTP request reaches the proxy — the recording proxy seeing
+// zero hits is the strongest available proof the validator runs before any
+// network I/O. Mirrors TestSourcemap_ProxiedFetch_AllowPrivateGate
+// (jsstatic package) and
+// TestClassifyProbeGenerate_ProxiedLoopback_RequiresAllowPrivate (pipeline
+// package). The AllowPrivate=true side of this gate is already covered by
+// TestReplayJSExtracted_RoutesThroughProxy above, so this test deliberately
+// does NOT add a redundant AllowPrivate=true subtest. Guards against a
+// regression that skips URL validation when a proxy is configured — the
+// exact "the proxy relaxes SSRF" mistake the proxied branch invites — which
+// would otherwise leave this suite green.
+func TestReplayJSExtracted_ProxiedFetch_AllowPrivateGate(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/main.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			w.Write([]byte(`var api = "/api/v1/products";`)) //nolint:errcheck,gosec // test handler
+		case "/api/v1/products":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"data":[]}`)) //nolint:errcheck,gosec // test handler
+		default:
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte(`<!DOCTYPE html><html><head><script src="main.js"></script></head></html>`)) //nolint:errcheck,gosec // test handler
+		}
+	}))
+	defer origin.Close()
+
+	proxyURL, hits := newRecordingProxy(t)
+
+	requests := []ObservedRequest{
+		{
+			Method: "GET",
+			URL:    origin.URL + "/",
+			Source: "katana",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<!DOCTYPE html><html><head><script src="main.js"></script></head></html>`),
+			},
+		},
+	}
+
+	// Client is deliberately left nil: this forces withDefaults down the
+	// httpx.BuildHTTPClient proxied branch (the branch with no dial-time
+	// SSRF pin) rather than the injected-Client branch.
+	cfg := JSReplayConfig{
+		Proxy:        httpx.ProxyConfig{URL: proxyURL},
+		AllowPrivate: false, // loopback origin — the SSRF validator must reject it
+		TargetURL:    origin.URL,
+	}
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	var jsExtracted []string
+	for _, r := range result {
+		if r.Source == "js-extract" {
+			jsExtracted = append(jsExtracted, r.URL)
+		}
+	}
+	assert.Empty(t, jsExtracted, "no js-extract entries must be appended when the SSRF gate rejects the loopback target before any fetch")
+	assert.Zero(t, hits.Load(), "the SSRF validator must reject the loopback target before the proxy is ever contacted")
+}
+
+// TestReplayJSExtracted_ProxiedProbe_AllowPrivateGate is the TEST-002 proof
+// for the URL-level SSRF gate on the *probe-loop* half of the proxied
+// JS-replay path (PR #186 independent review). It is the sibling of
+// TestReplayJSExtracted_ProxiedFetch_AllowPrivateGate above, which covers
+// the canFetchURL guard (jsreplay.go ~2019) that gates the JS *fetch*
+// (fetchJSBody, called at ~1994). That sibling test cannot reach the
+// probe-loop guard (jsreplay.go ~1866, immediately before probeURL at
+// ~1874): it supplies an HTML body with a <script src="main.js">, so the JS
+// bundle must be fetched before any endpoint can be extracted — the fetch
+// gate rejects it first, no endpoints are ever discovered, and the probe
+// loop never runs.
+//
+// This test instead supplies the captured request's Response.Body as the
+// JS source itself. jsreplay.go:1761 sets jsBody := req.Response.Body and
+// only re-fetches when that body is empty or truncated at
+// MaxResponseBodySize (~1767); a non-empty, non-truncated inline body
+// therefore skips canFetchURL/fetchJSBody entirely. extractAPIPaths runs
+// directly against the inline body, the discovered "/api/v1/products" path
+// enters the probe loop, and the AllowPrivate gate at jsreplay.go:1865
+// becomes the sole guard standing between the loopback-resolving URL and
+// probeURL. As with its fetch-side sibling, withDefaults' proxied branch
+// installs no dial-time SSRF pin (we dial the proxy, not the target), so
+// the recording proxy seeing zero hits is the strongest available proof
+// the validator runs before any network I/O. Guards against the same
+// regression class as its sibling: relaxing line 1865 to also require
+// "!cfg.Proxy.Enabled()" would leave the entire pkg/crawl suite green —
+// this test is what makes that regression visible for the probe half of
+// the gate.
+func TestReplayJSExtracted_ProxiedProbe_AllowPrivateGate(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/products" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"data":[]}`)) //nolint:errcheck,gosec // test handler
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer origin.Close()
+
+	proxyURL, hits := newRecordingProxy(t)
+
+	requests := []ObservedRequest{
+		{
+			Method: "GET",
+			URL:    origin.URL + "/main.js",
+			Source: "katana",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/javascript",
+				Body:        []byte(`var api = "/api/v1/products";`),
+			},
+		},
+	}
+
+	// Client is deliberately left nil: this forces withDefaults down the
+	// httpx.BuildHTTPClient proxied branch (the branch with no dial-time
+	// SSRF pin) rather than the injected-Client branch.
+	cfg := JSReplayConfig{
+		Proxy:        httpx.ProxyConfig{URL: proxyURL},
+		AllowPrivate: false, // loopback origin — the probe-loop SSRF gate must reject it
+		TargetURL:    origin.URL,
+	}
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	var jsExtracted []string
+	for _, r := range result {
+		if r.Source == "js-extract" {
+			jsExtracted = append(jsExtracted, r.URL)
+		}
+	}
+	assert.Empty(t, jsExtracted, "no js-extract entries must be appended when the probe-loop SSRF gate rejects the loopback target before any probe")
+	assert.Zero(t, hits.Load(), "the SSRF validator must reject the loopback target before the proxy is ever contacted")
 }
 
 // TestExtractStaticConcatPaths pins the network-free concat / +-chain /

@@ -17,6 +17,10 @@ package pipeline_test
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -24,6 +28,7 @@ import (
 
 	"github.com/praetorian-inc/vespasian/internal/pipeline"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 )
 
 // formsAndJSCapture returns one HTML page carrying a <form> and one JS bundle
@@ -400,4 +405,68 @@ func TestAnalyzeJS_ErrorPath_WarnErrorContract(t *testing.T) {
 		})
 		require.Len(t, out, len(captured), "expected original slice on error (SDK quiet config)")
 	})
+}
+
+// TestAnalyzeJS_ForwardsProxy is the AC-1 proof that AugmentOptions.Proxy
+// reaches jsstatic.Options.Proxy: a JS bundle referencing a same-host .js.map
+// sourcemap, fetched through a recording proxy, must show proxy traffic
+// (LAB-4993).
+func TestAnalyzeJS_ForwardsProxy(t *testing.T) {
+	// sourcesContent carries a fetch() literal for a path (/api/from-sourcemap)
+	// that appears nowhere else in this test — in particular it differs from
+	// the bundle body's own /api/x literal below. That makes its presence in
+	// out unambiguous proof that it was recovered via the sourcemap fetch,
+	// not the bundle-body extraction pass.
+	mapBody := []byte(`{"version":3,"sources":["app.ts"],"sourcesContent":["fetch(\"/api/from-sourcemap\");"]}`)
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/app.js.map" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(mapBody) //nolint:errcheck,gosec // test handler
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(origin.Close)
+
+	// forwardBody=true: the map body must actually reach jsstatic's fetch
+	// client through the proxy, or json.Unmarshal fails and sourcemap
+	// recovery never happens (see newRecordingProxy in pipeline_test.go).
+	proxy, hits := newRecordingProxy(t, true)
+
+	proxyURL, err := url.Parse(proxy.URL)
+	require.NoError(t, err)
+
+	bundleURL := origin.URL + "/app.js"
+	mapURL := origin.URL + "/app.js.map"
+	captured := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    bundleURL,
+			Source: "katana",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/javascript",
+				Body:        []byte(fmt.Sprintf("fetch(\"/api/x\");\n//# sourceMappingURL=%s\n", mapURL)),
+			},
+		},
+	}
+
+	out := pipeline.AnalyzeJS(context.Background(), captured, pipeline.AugmentOptions{
+		AnalyzeJS:       true,
+		FetchSourcemaps: true,
+		AllowPrivate:    true,
+		Proxy:           httpx.ProxyConfig{URL: proxyURL},
+	})
+	recoveredIdx := -1
+	for i, r := range out {
+		if r.Source == crawl.SourceStaticJSSourcemap {
+			recoveredIdx = i
+			break
+		}
+	}
+	require.NotEqual(t, -1, recoveredIdx, "expected a %s entry recovered from the sourcemap", crawl.SourceStaticJSSourcemap)
+	assert.Equal(t, origin.URL+"/api/from-sourcemap", out[recoveredIdx].URL,
+		"sourcemap-recovered endpoint must resolve to the path found in the map's sourcesContent")
+	assert.NotZero(t, hits.Load(), "sourcemap fetch must route through the configured proxy")
 }
