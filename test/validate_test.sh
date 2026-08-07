@@ -287,6 +287,17 @@ assert_reject "junk text containing 'type Query {' and '}'" "INVALID:" \
 assert_reject "nonexistent GraphQL SDL file" "SDL file not found" \
     validate_graphql_structure "${WORK_DIR}/does-not-exist.graphql"
 
+# A syntactically valid SDL with no Query root type must be rejected — the
+# no-Query-root branch of validateSchema() (validate-graphql.mjs) previously
+# had no regression case (PR #187 review finding TEST-013).
+cat > "${WORK_DIR}/no-query-root.graphql" <<'EOF'
+type Foo {
+  a: String
+}
+EOF
+assert_reject "valid SDL with no Query root type" "Query root type must be provided" \
+    validate_graphql_structure "${WORK_DIR}/no-query-root.graphql"
+
 # ──────────────────────────────────────────────────────────────
 # _ensure_spec_validators
 # ──────────────────────────────────────────────────────────────
@@ -397,6 +408,63 @@ if [ "$NOW_MAX_BYTES_SET" = "$BASELINE_MAX_BYTES_SET" ] && [ "$NOW_MAX_BYTES_VAL
 else
     log_fail "FAIL (env leak): SPEC_VALIDATOR_MAX_BYTES changed across the wrappers — baseline set=${BASELINE_MAX_BYTES_SET} val='${BASELINE_MAX_BYTES_VAL}', now set=${NOW_MAX_BYTES_SET} val='${NOW_MAX_BYTES_VAL}'"
     FAIL=$((FAIL + 1))
+fi
+
+# ──────────────────────────────────────────────────────────────
+# SPEC_VALIDATOR_TIMEOUT (validator wall-clock bound / YAML alias bomb)
+# ──────────────────────────────────────────────────────────────
+log_header "SPEC_VALIDATOR_TIMEOUT"
+
+# SEC-FE-003 (PR #187 review): js-yaml applies no alias-expansion cap, so a
+# YAML anchor bomb makes swagger-parser expand unbounded and — without a
+# wall-clock bound — eventually return 0 for a "valid" spec after burning the
+# CI job's whole timeout as an opaque kill. _run_spec_validator now runs each
+# validator under `timeout`/`gtimeout` and rewrites exit 124 into an explicit
+# "validator timed out after Ns" failure. Same explicit-subshell wrapper as the
+# SPEC_VALIDATOR_MAX_BYTES cases above, so `export SPEC_VALIDATOR_TIMEOUT`
+# cannot leak into the rest of this run.
+_test_validator_timeout_openapi() {
+    local spec_file=$1
+    (
+        export SPEC_VALIDATOR_TIMEOUT=3
+        validate_openapi_structure "$spec_file"
+    )
+}
+
+# A sub-1 KiB billion-laughs / alias bomb: 9 anchors a–i, each a 9-element list
+# of references to the level below, so a naive walk expands to 9^8 nodes while
+# the file itself stays tiny. Inline in WORK_DIR like every other fixture here.
+cat > "${WORK_DIR}/alias-bomb.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: alias bomb
+  version: "1.0.0"
+paths: {}
+components:
+  schemas:
+    a: &a ["lol","lol","lol","lol","lol","lol","lol","lol","lol"]
+    b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a]
+    c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b]
+    d: &d [*c, *c, *c, *c, *c, *c, *c, *c, *c]
+    e: &e [*d, *d, *d, *d, *d, *d, *d, *d, *d]
+    f: &f [*e, *e, *e, *e, *e, *e, *e, *e, *e]
+    g: &g [*f, *f, *f, *f, *f, *f, *f, *f, *f]
+    h: &h [*g, *g, *g, *g, *g, *g, *g, *g, *g]
+    i: &i [*h, *h, *h, *h, *h, *h, *h, *h, *h]
+EOF
+
+# The bomb can only be bounded where a timeout binary exists.
+# _run_spec_validator falls back to running the validator UNWRAPPED when neither
+# timeout nor gtimeout is present (validate.sh), so on such a host this case
+# would hang the whole suite — guard it and skip loudly instead. A stock macOS
+# dev box has neither; the CI validator-regression job runs on ubuntu, where
+# `timeout` is present.
+if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+    assert_reject "YAML alias bomb trips the validator wall-clock bound" \
+        "validator timed out after" \
+        _test_validator_timeout_openapi "${WORK_DIR}/alias-bomb.yaml"
+else
+    log_warn "no timeout/gtimeout binary — skipping SPEC_VALIDATOR_TIMEOUT alias-bomb case (cannot bound the validator on this host)"
 fi
 
 # ──────────────────────────────────────────────────────────────
@@ -519,6 +587,20 @@ assert_ok "comfortably under the limit (3) is accepted" \
 assert_reject "unparsable page count ('?')" \
     "page count is not a number" \
     assert_max_pages "unparsable-count" "?" 10
+
+# Lower bound (TEST-020): the upper bound alone greened on an empty/1-page
+# crawl. Default floor (min_pages=1) rejects a 0-page capture; an explicit
+# floor rejects a crawl that stopped at the seed.
+assert_reject "empty crawl (0 pages) is rejected by the default floor" \
+    "under-crawl" \
+    assert_max_pages "under-crawl-default" 0 10
+
+assert_reject "one page under an explicit floor of 2 is rejected" \
+    "under-crawl" \
+    assert_max_pages "under-crawl-floor" 1 10 2
+
+assert_ok "at an explicit floor of 2 is accepted" \
+    assert_max_pages "at-floor" 2 10 2
 
 # assert_count <label> <expected> <function> <args...>
 #   -> runs <function> with <args...>, captures its stdout, and compares it
@@ -678,6 +760,46 @@ printf '[{"method":"GET"},{"method":"POST"}]' > "${WORK_DIR}/no-url-field-captur
 assert_count "non-empty list of dicts, no url/page_url field on any record" \
     "?" \
     count_capture_pages "${WORK_DIR}/no-url-field-capture.json"
+
+# ──────────────────────────────────────────────────────────────
+# validate_path_coverage — total_paths parity guard (TEST-005)
+# ──────────────────────────────────────────────────────────────
+log_header "validate_path_coverage total_paths parity"
+
+# validate_path_coverage now self-checks that a fixture's total_paths equals
+# len(paths) (PR #187 review finding TEST-005). Prove all three branches
+# offline: matching key passes, mismatched key is rejected, absent key is
+# accepted (the guard is opt-in per fixture).
+cat > "${WORK_DIR}/cov-spec.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: t
+  version: "1.0.0"
+paths:
+  /a:
+    get:
+      responses:
+        '200':
+          description: ok
+EOF
+cat > "${WORK_DIR}/cov-ok.json" <<'EOF'
+{"paths": {"/a": ["GET"]}, "total_paths": 1}
+EOF
+cat > "${WORK_DIR}/cov-mismatch.json" <<'EOF'
+{"paths": {"/a": ["GET"]}, "total_paths": 5}
+EOF
+cat > "${WORK_DIR}/cov-nokey.json" <<'EOF'
+{"paths": {"/a": ["GET"]}}
+EOF
+
+assert_ok "total_paths matches len(paths)" \
+    validate_path_coverage "${WORK_DIR}/cov-spec.yaml" "${WORK_DIR}/cov-ok.json"
+
+assert_reject "total_paths disagrees with len(paths)" "PARITY MISMATCH" \
+    validate_path_coverage "${WORK_DIR}/cov-spec.yaml" "${WORK_DIR}/cov-mismatch.json"
+
+assert_ok "absent total_paths key is accepted (opt-in guard)" \
+    validate_path_coverage "${WORK_DIR}/cov-spec.yaml" "${WORK_DIR}/cov-nokey.json"
 
 # ──────────────────────────────────────────────────────────────
 # Summary

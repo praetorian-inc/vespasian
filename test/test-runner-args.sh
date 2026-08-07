@@ -504,6 +504,33 @@ else
 fi
 
 echo ""
+echo "=== Fixture total_paths parity (offline) ==="
+
+# total_paths is a hand-maintained duplicate of len(paths) in the rest-api
+# expected-path fixtures (PR #187 review finding TEST-005). validate.sh now
+# self-checks it at every live consumption, but this offline drift-guard fails
+# fast — with no node, no live services, no Go build — the moment the two
+# rest-api fixtures fall out of lockstep. Both fixtures are checked.
+for fixture in "$SCRIPT_DIR/rest-api/expected-paths.json" "$SCRIPT_DIR/rest-api/scan-expected-paths.json"; do
+    parity_out=$(python3 - "$fixture" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+t = d.get("total_paths")
+n = len(d["paths"])
+if t != n:
+    print("PARITY MISMATCH in %s: total_paths=%s len(paths)=%d" % (sys.argv[1], t, n))
+    sys.exit(1)
+print("OK %s: total_paths=%d == len(paths)" % (sys.argv[1], t))
+PY
+    ) && parity_rc=0 || parity_rc=$?
+    if [[ "$parity_rc" -eq 0 ]]; then
+        pass "$parity_out"
+    else
+        fail "$parity_out"
+    fi
+done
+
+echo ""
 echo "=== Summary ==="
 echo "  $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]] && exit 0 || exit 1
