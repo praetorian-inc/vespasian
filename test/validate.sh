@@ -4,6 +4,65 @@
 # Shared validation functions for vespasian live tests.
 # Source this file from run-live-tests.sh.
 
+# Directory containing this script, used to locate the Node spec-validators
+# package (LAB-3890 T1). validate.sh is sourced, so resolve from BASH_SOURCE.
+VALIDATE_SH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SPEC_VALIDATORS_DIR="${VALIDATE_SH_DIR}/spec-validators"
+
+# SPEC_VALIDATOR_TIMEOUT bounds each node validator run. js-yaml enforces no
+# alias-expansion cap, so a YAML anchor bomb parses unbounded AND exits 0
+# reporting a valid spec; without this the only backstop is the CI job's
+# timeout-minutes, which surfaces as an opaque job kill rather than a validator
+# failure (PR #187 review finding SEC-FE-003).
+SPEC_VALIDATOR_TIMEOUT="${SPEC_VALIDATOR_TIMEOUT:-30}"
+
+# _run_spec_validator runs a node validator under a wall-clock bound, echoing
+# its combined output and returning its exit status. Exit 124 (timeout) is
+# rewritten into an explicit message so a hang is diagnosable.
+# GNU `timeout` is absent on macOS by default, so fall back to `gtimeout` and
+# then to running unwrapped rather than failing the whole suite.
+# Usage: _run_spec_validator <script> <file>
+_run_spec_validator() {
+    local script=$1 file=$2
+    local runner=""
+    if command -v timeout >/dev/null 2>&1; then
+        runner="timeout"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        runner="gtimeout"
+    fi
+
+    local out rc=0
+    if [ -n "$runner" ]; then
+        out=$("$runner" "$SPEC_VALIDATOR_TIMEOUT" node "$script" "$file" 2>&1) || rc=$?
+        if [ $rc -eq 124 ]; then
+            printf '%s\n' "validator timed out after ${SPEC_VALIDATOR_TIMEOUT}s: $(basename "$script")"
+            return 1
+        fi
+    else
+        out=$(node "$script" "$file" 2>&1) || rc=$?
+    fi
+    printf '%s\n' "$out"
+    return $rc
+}
+
+# _ensure_spec_validators fails with an actionable message if the Node
+# validator dependencies have not been installed.
+_ensure_spec_validators() {
+    # Check the actual entry points, not just the directory: an interrupted
+    # npm ci or a pruned cache leaves node_modules present but unusable, which
+    # would skip this actionable message and surface as a raw
+    # ERR_MODULE_NOT_FOUND stack trace instead (PR #187 review finding
+    # SEC-FE-004).
+    local pkg
+    for pkg in "@apidevtools/swagger-parser" "graphql"; do
+        if [ ! -f "${SPEC_VALIDATORS_DIR}/node_modules/${pkg}/package.json" ]; then
+            log_fail "spec-validators deps missing or incomplete (${pkg}) — run: (cd ${SPEC_VALIDATORS_DIR} && npm ci)"
+            return 1
+        fi
+    done
+    return 0
+}
+
 # validate_path_coverage checks that all expected paths exist in a generated OpenAPI spec.
 # Usage: validate_path_coverage <spec_file> <expected_paths_json>
 # Returns 0 if all paths found, 1 otherwise.
@@ -92,7 +151,10 @@ PYEOF
     return 0
 }
 
-# validate_openapi_structure checks that the spec file has required OpenAPI fields.
+# validate_openapi_structure validates an OpenAPI document with a real parser.
+# LAB-3890 T1: replaces the old grep-for-top-level-keys check (which passed any
+# file merely containing "openapi:"/"info:"/"paths:"). Uses swagger-parser,
+# which validates against the OpenAPI 3.0 schema and resolves $refs.
 # Usage: validate_openapi_structure <spec_file>
 validate_openapi_structure() {
     local spec_file=$1
@@ -101,28 +163,10 @@ validate_openapi_structure() {
         log_fail "Spec file not found: $spec_file"
         return 1
     fi
+    _ensure_spec_validators || return 1
 
     local result rc=0
-    result=$(python3 - "$spec_file" << 'PYEOF'
-import sys, re
-
-with open(sys.argv[1]) as f:
-    content = f.read()
-
-# Check for required top-level YAML keys (not indented, not in comments)
-required = ["openapi", "info", "paths"]
-missing = []
-for key in required:
-    # Match key at start of line (no leading whitespace), not in a comment
-    if not re.search(r'^' + re.escape(key) + r'\s*:', content, re.MULTILINE):
-        missing.append(key + ":")
-
-if missing:
-    print("MISSING fields: " + ", ".join(missing))
-    sys.exit(1)
-print("OK: valid OpenAPI structure")
-PYEOF
-    ) || rc=$?
+    result=$(_run_spec_validator "${SPEC_VALIDATORS_DIR}/validate-openapi.mjs" "$spec_file") || rc=$?
 
     if [ $rc -ne 0 ]; then
         log_fail "OpenAPI structure: $result"
@@ -265,37 +309,86 @@ PYEOF
     return 0
 }
 
-# validate_soap_operations checks that WSDL output contains expected operations.
+# validate_soap_operations validates a WSDL with a real XML parser and checks
+# that every expected operation is present, using exact per-name matching
+# against portType operation names. This is an expected-subset check: extra
+# or unexpected operations in the WSDL are NOT flagged (PR #187 review finding
+# TEST-004).
+# LAB-3890 T1: replaces the old substring check (`GetUser` false-passed on
+# `GetUserList`, and names in comments false-passed).
+#
+# Parses with python3 xml.etree rather than xmllint (PR #187 review finding
+# QUAL-002): xmllint ships in libxml2-utils, which is NOT installed on the
+# ubuntu-24.04 runner image and cannot be added from a later step because
+# harden-runner sets disable-sudo. python3 is already a hard dependency of every
+# other validator in this file, so the XML path is now provisioned identically
+# to the rest of the suite and the whole function is hermetic.
+#
+# ElementTree drops comments during parse, so an operation name that appears
+# only inside an XML comment is not in the extracted set.
 # Usage: validate_soap_operations <wsdl_file> <expected_json>
 validate_soap_operations() {
     local wsdl_file=$1
     local expected_json=$2
 
     if [ ! -f "$wsdl_file" ]; then
-        log_fail "WSDL file not found: $wsdl_file"
+        log_fail "SOAP operations: WSDL file not found: $wsdl_file"
+        return 1
+    fi
+    if [ ! -f "$expected_json" ]; then
+        log_fail "SOAP operations: expected-operations file not found: $expected_json"
         return 1
     fi
 
     local result rc=0
     result=$(python3 - "$wsdl_file" "$expected_json" << 'PYEOF'
 import json, sys
+import xml.etree.ElementTree as ET
 
-with open(sys.argv[1]) as f:
-    content = f.read()
+wsdl_file, expected_file = sys.argv[1], sys.argv[2]
 
-with open(sys.argv[2]) as f:
-    expected = json.load(f)
+try:
+    root = ET.parse(wsdl_file).getroot()
+except ET.ParseError as e:
+    print("not well-formed XML: %s" % e)
+    sys.exit(1)
 
-missing = []
-for op in expected["operations"]:
-    if op not in content:
-        missing.append(op)
+try:
+    with open(expected_file) as f:
+        expected = json.load(f)
+except (OSError, ValueError) as e:
+    print("could not read expected operations from %s: %s" % (expected_file, e))
+    sys.exit(1)
 
+expected_ops = expected.get("operations") or []
+if not expected_ops:
+    print("no expected operations listed in %s" % expected_file)
+    sys.exit(1)
+
+
+def local_name(tag):
+    """Strip any {namespace} prefix — WSDLs vary in how they bind the wsdl ns."""
+    return tag.rsplit("}", 1)[-1]
+
+
+# Only direct operation children of a portType count, so an <operation> under
+# <binding> does not satisfy the check.
+actual_ops = set()
+for elem in root.iter():
+    if local_name(elem.tag) != "portType":
+        continue
+    for child in elem:
+        if local_name(child.tag) == "operation":
+            name = child.get("name")
+            if name:
+                actual_ops.add(name)
+
+missing = [op for op in expected_ops if op not in actual_ops]
 if missing:
     print("MISSING operations: " + ", ".join(missing))
     sys.exit(1)
 
-print("OK: all %d operations found" % len(expected["operations"]))
+print("all %d expected operations present (exact name match)" % len(expected_ops))
 PYEOF
     ) || rc=$?
 
@@ -304,6 +397,62 @@ PYEOF
         return 1
     fi
     log_ok "SOAP operations: $result"
+    return 0
+}
+
+# assert_no_panic checks that captured tool output contains no Go panic or
+# goroutine stack trace. A panic is a crash, NOT graceful handling, so it must
+# never be accepted as a "graceful" non-zero exit (LAB-3890 T3, gap B3).
+# Extracted from test_import_malformed's nested check_panic so the regex itself
+# is regression-tested by validate_test.sh (PR #187 review finding TEST-002).
+# Returns 0 when the output is panic-free, 1 when a panic/stack trace is found.
+# Usage: assert_no_panic <label> <output>
+assert_no_panic() {
+    local label=$1 output=$2
+    if printf '%s' "$output" | grep -qiE 'panic:|goroutine [0-9]+ \[running\]'; then
+        log_fail "${label}: PANICKED (not graceful): $(printf '%s' "$output" | grep -iE 'panic:' | head -1)"
+        return 1
+    fi
+    return 0
+}
+
+# assert_ssrf_rejected checks that captured crawl output proves the crawl
+# frontier's SSRF gate rejected a seed, rather than the command merely having
+# failed for some other reason (PR #187 review finding SEC-BE-003).
+#
+# The predicate lives here, not inline in run-live-tests.sh, so validate_test.sh
+# can regression-lock it the same way assert_no_panic is locked.
+#
+# The old inline check grepped case-insensitively for
+# 'ssrf|private|rejected by frontier|dangerous-allow-private'. kong is built
+# with kong.UsageOnError() (cmd/vespasian/main.go:771), so any parse error
+# prints the usage block — which lists --dangerous-allow-private and its
+# "Disable SSRF protection ... private/localhost targets" help text. Renaming
+# the crawl subcommand or the -o short flag would therefore have satisfied that
+# grep with the gate never having run.
+#
+# Note the underlying error is deliberately multi-cause ("scope, SSRF, or
+# parse", pkg/crawl/engine.go:162 and pkg/crawl/http_crawler.go:164), so this
+# asserts the FRONTIER rejected the seed, which is the strongest signal the
+# binary currently emits. Narrowing further needs a distinct SSRF-specific
+# message from pkg/crawl.
+# Returns 0 when the output proves a frontier rejection of <seed_url>.
+# Usage: assert_ssrf_rejected <label> <seed_url> <output>
+assert_ssrf_rejected() {
+    local label=$1 seed_url=$2 output=$3
+
+    if printf '%s' "$output" | grep -qF 'Usage: vespasian'; then
+        log_fail "${label}: kong printed its usage banner — the command failed to PARSE, so the SSRF gate never ran"
+        return 1
+    fi
+    if ! printf '%s' "$output" | grep -qF 'seed URL rejected by frontier'; then
+        log_fail "${label}: output has no frontier rejection: $(printf '%s' "$output" | tail -1)"
+        return 1
+    fi
+    if ! printf '%s' "$output" | grep -qF -- "$seed_url"; then
+        log_fail "${label}: frontier rejection did not name the seed ${seed_url}"
+        return 1
+    fi
     return 0
 }
 
@@ -355,7 +504,9 @@ PYEOF
     return 0
 }
 
-# validate_graphql_structure checks that a GraphQL SDL file has basic structural validity.
+# validate_graphql_structure validates a GraphQL SDL file with a real parser.
+# LAB-3890 T1: replaces the old check for the literals "type Query {" + "}".
+# Uses graphql-js buildSchema + validateSchema.
 # Usage: validate_graphql_structure <sdl_file>
 validate_graphql_structure() {
     local sdl_file=$1
@@ -364,28 +515,10 @@ validate_graphql_structure() {
         log_fail "SDL file not found: $sdl_file"
         return 1
     fi
+    _ensure_spec_validators || return 1
 
     local result rc=0
-    result=$(python3 - "$sdl_file" << 'PYEOF'
-import sys
-
-with open(sys.argv[1]) as f:
-    content = f.read()
-
-checks = []
-if "type Query {" not in content:
-    checks.append("missing 'type Query'")
-if "}" not in content:
-    checks.append("missing closing braces")
-if len(content.strip()) < 50:
-    checks.append("suspiciously short (%d chars)" % len(content.strip()))
-
-if checks:
-    print("INVALID: " + ", ".join(checks))
-    sys.exit(1)
-print("OK: valid GraphQL SDL structure")
-PYEOF
-    ) || rc=$?
+    result=$(_run_spec_validator "${SPEC_VALIDATORS_DIR}/validate-graphql.mjs" "$sdl_file") || rc=$?
 
     if [ $rc -ne 0 ]; then
         log_fail "GraphQL structure: $result"
@@ -551,6 +684,79 @@ print(count)
 PYEOF
 }
 
+# count_capture_pages counts the number of distinct PAGES visited in a
+# capture, not the number of raw captured request records (LAB-4678,
+# pkg/crawl/doc.go). MaxPages caps pages (distinct URLs visited) rather than
+# captured requests, because a single SPA page can fire dozens of XHR/fetch
+# calls that all count as one page. pkg/crawl/engine.go's visitPage opens a
+# fresh tab per page on the rod (headless browser) backend, so the browser
+# also emits that page's sub-resource requests (e.g. a 200 /favicon.ico) into
+# the capture — inflating a raw record count well past the page budget even
+# though the budget itself (pageBudgetReached, reserved under a mutex before
+# each visit) was enforced exactly. pkg/crawl's own
+# TestCrawlerContract_RespectsMaxPages test counts pages the same way for the
+# same reason, explicitly excluding sub-resources so the counter is
+# comparable across both the http and rod backends. This was the CI failure
+# in PR #187 ("Max-pages limit: captured 20 requests (limit=10, allowed
+# <=15)"): the test was counting raw capture records against a page budget.
+#
+# Discriminator: ObservedRequest carries a page_url field
+# (pkg/crawl/types.go:37) that the browser backend sets on every captured
+# exchange to the page it was observed on (pkg/crawl/network.go:154-161), so
+# distinct page_url values are exactly the visited-page set. The net/http
+# backend emits no page_url at all (one record per page, source=http), so
+# fall back to counting distinct url values there.
+#
+# Invariant (PR #187 review finding CodeRabbit r3676134141): any
+# structurally invalid capture yields "?", which assert_max_pages rejects
+# via its ^[0-9]+$ guard — so a broken capture can never satisfy the
+# max-pages assertion. This includes non-list top-level JSON (object,
+# string, number, null) and a non-empty list from which zero pages could be
+# derived (no element is a dict, or no element carries page_url or url —
+# url is a required ObservedRequest field per pkg/crawl/types.go, so a
+# non-empty capture always yields at least one). Only a genuinely empty
+# list ([]) yields "0", since that's a structurally valid capture meaning
+# "zero requests captured" and 0 pages does not exceed the cap.
+# Usage: count_capture_pages <capture_file>
+count_capture_pages() {
+    local capture_file=$1
+    python3 - "$capture_file" << 'PYEOF'
+import json, sys
+
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+except Exception:
+    print("?")
+    sys.exit(0)
+
+if not isinstance(data, list):
+    print("?")
+    sys.exit(0)
+
+# Count distinct page identity across BOTH keys in a single pass, preferring
+# page_url per record and falling back to url when a record has no page_url.
+# A capture that MIXES rod-style records (have page_url) with url-only records
+# must not drop the url-only pages: taking distinct page_url values only when
+# any existed undercounted such a capture, the false-PASS direction for
+# assert_max_pages (LAB-3890 TEST-001). Behaviour is unchanged for a
+# single-backend capture (all page_url, or all url).
+pages = set()
+for r in data:
+    if isinstance(r, dict):
+        key = r.get("page_url") or r.get("url")
+        if key:
+            pages.add(key)
+
+if pages:
+    print(len(pages))
+elif len(data) == 0:
+    print(0)
+else:
+    print("?")
+PYEOF
+}
+
 # validate_paths_absent fails if any forbidden path appears as a top-level
 # key in the OpenAPI spec. Matching convention per forbidden value F:
 #   - F ending in "/"  → SUBTREE match: flags the root and any descendant
@@ -613,5 +819,65 @@ PYEOF
         return 1
     fi
     log_ok "${result}"
+    return 0
+}
+
+# assert_within_depth checks a depth-limited crawl stayed inside its --depth
+# budget AND actually followed links past the seed (LAB-3890 T3, gap B2).
+# Extracted from test_crawl_depth so validate_test.sh can lock the boundary
+# logic (PR #187 review finding TEST-004).
+#
+# Both counts are recovered by string surgery on one line of python stdout in
+# the caller, so a change to that print format yields garbage rather than a
+# number. The inline version guarded only reached_depth against the "?"
+# sentinel; here BOTH sides must be numeric or the assertion hard-fails.
+# Usage: assert_within_depth <label> <beyond_count> <reached_count>
+assert_within_depth() {
+    local label=$1 beyond=$2 reached=$3
+
+    if ! [[ $beyond =~ ^[0-9]+$ ]]; then
+        log_fail "${label}: beyond-depth count is not a number: '${beyond}' (depth-count extraction failed)"
+        return 1
+    fi
+    if ! [[ $reached =~ ^[0-9]+$ ]]; then
+        log_fail "${label}: reached-depth count is not a number: '${reached}' (depth-count extraction failed)"
+        return 1
+    fi
+    if [ "$beyond" -ne 0 ]; then
+        log_fail "${label}: found ${beyond} URL(s) beyond the requested depth — --depth not enforced"
+        return 1
+    fi
+    if [ "$reached" -eq 0 ]; then
+        log_fail "${label}: crawl never got past the seed — under-crawl / premature stop"
+        return 1
+    fi
+    return 0
+}
+
+# assert_max_pages checks a crawl honoured its --max-pages cap (LAB-3890 T3,
+# gap B2). Extracted from test_crawl_depth (PR #187 review finding TEST-004).
+#
+# This used to allow a margin (page_count <= limit + margin) on the theory
+# that in-flight requests could overshoot the cap. That tolerance is gone: it
+# no longer models anything real. count_capture_pages counts visited PAGES,
+# not raw requests, and pageBudgetReached (pkg/crawl/engine.go) compares and
+# increments the visited count inside a single mutex-guarded critical
+# section, so the number of visited pages can never exceed MaxPages. CI run
+# 30469344133 confirms this empirically: "[OK] Max-pages limit: visited 10
+# page(s) (limit=10)" — the crawler lands exactly on the cap, zero overshoot.
+# Keeping a vestigial margin only invites it being silently widened again
+# (PR #187 review finding, outside-diff L836-L845).
+# Usage: assert_max_pages <label> <page_count> <limit>
+assert_max_pages() {
+    local label=$1 page_count=$2 limit=$3
+
+    if ! [[ $page_count =~ ^[0-9]+$ ]]; then
+        log_fail "${label}: page count is not a number: '${page_count}' (capture read failed)"
+        return 1
+    fi
+    if [ "$page_count" -gt "$limit" ]; then
+        log_fail "${label}: visited ${page_count} page(s) (limit=${limit}) — --max-pages not enforced"
+        return 1
+    fi
     return 0
 }
