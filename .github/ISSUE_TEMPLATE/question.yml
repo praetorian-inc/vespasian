@@ -1,0 +1,36 @@
+name: Question
+description: Ask how to do something with Vespasian
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Questions are welcome here. Before filing, the [README](https://github.com/praetorian-inc/vespasian#readme)
+        covers installation, the CLI reference, and supported API types.
+
+        > [!WARNING]
+        > Redact hostnames, tokens, and request bodies from anything you paste — issues are public.
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+      description: Describe the outcome you're after, not just the command that isn't working.
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried?
+      description: Commands you've run and what happened. This is usually the difference between a fast answer and a long back-and-forth.
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Vespasian version
+      description: Output of `vespasian version`, if relevant.
+      placeholder: v1.0.0

@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/praetorian-inc/vespasian/security/policy
+    about: Do not open a public issue for security vulnerabilities. Report them privately per our security policy.
