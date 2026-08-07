@@ -413,14 +413,44 @@ test_rest_api() {
         failures=$((failures + 1))
     fi
 
-    # NOTE: No exact spec comparison here — the live crawl is non-deterministic,
-    # so the generated spec varies between runs. Exact spec comparison is done in
-    # test_generate_rest which uses a fixed import as input.
+    # ExtractForms did more than surface the path: assert /api/subscribe carries
+    # a POST operation and NO GET (assert_post_get_operations walks the spec per
+    # exact path key), and that the form's urlencoded body fields (email, name)
+    # surface as request-body schema properties UNDER THAT ENDPOINT
+    # (assert_form_body_fields). Without these, the fixture's POST-method + body
+    # -field expectations for /api/subscribe were inert (PR #187 review finding
+    # TEST-006). These are the same helpers forms-target uses; $expected already
+    # points at rest-api/expected-paths.json, which now carries post_form_paths
+    # and post_form_body_fields_by_path for /api/subscribe.
+    if ! assert_post_get_operations "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+    if ! assert_form_body_fields "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+
+    # NOTE: No exact spec *text* comparison here — the live crawl is
+    # non-deterministic, so the generated spec's serialization (parameter
+    # naming, ordering) varies between runs. Exact spec-text comparison is done
+    # in test_generate_rest, which uses a fixed import as input. The path COUNT
+    # is deterministic (same recovered set as scan-rest) and IS asserted below
+    # (TEST-004).
 
     local endpoint_count
     endpoint_count=$(count_spec_endpoints "$spec_file")
     local expected_count
     expected_count=$(json_field "$expected" total_paths)
+
+    # Exact-count: validate_path_coverage only detects MISSING paths, and the
+    # two-stage crawl+generate path recovers the same set as the single-stage
+    # scan (see the fixtures' lockstep note), so — exactly as test_scan_rest
+    # already does against the same server — a regression that emitted the
+    # expected paths plus spurious ones must not report PASS with a mismatched
+    # pair of numbers in the summary (PR #187 review finding TEST-004).
+    if [ "$endpoint_count" != "$expected_count" ]; then
+        log_fail "rest-api: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
+        failures=$((failures + 1))
+    fi
 
     local duration=$((SECONDS - start))
     if [ $failures -eq 0 ]; then
@@ -496,6 +526,18 @@ test_scan_rest() {
         log_ok "scan-rest: /api/subscribe present (ExtractForms augmentation ran)"
     else
         log_fail "scan-rest: /api/subscribe absent — scan's ExtractForms augmentation did not run"
+        failures=$((failures + 1))
+    fi
+
+    # As with test_rest_api (TEST-006): prove ExtractForms produced a POST-only
+    # /api/subscribe operation with its urlencoded body fields (email, name)
+    # attached to that endpoint, not merely that the path string appears.
+    # $expected here points at rest-api/scan-expected-paths.json (kept in
+    # lockstep with expected-paths.json).
+    if ! assert_post_get_operations "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+    if ! assert_form_body_fields "$spec_file" "$expected"; then
         failures=$((failures + 1))
     fi
 
@@ -3362,7 +3404,11 @@ PYEOF
         # crawler was behaving correctly. pkg/crawl's own
         # TestCrawlerContract_RespectsMaxPages counts pages the same way and
         # passes on both backends (PR #187 / LAB-3890 T3, gap B2).
-        if assert_max_pages "Max-pages limit" "$page_count" 10; then
+        # Floor of 2: the seed /api/many-links plus at least one of its 20
+        # links must be visited, so a crawler that stops at the seed (or
+        # captures nothing) fails instead of silently passing limit=10
+        # (PR #187 review finding TEST-020).
+        if assert_max_pages "Max-pages limit" "$page_count" 10 2; then
             log_ok "Max-pages limit: visited ${page_count} page(s) (limit=10)"
         else
             failures=$((failures + 1))
