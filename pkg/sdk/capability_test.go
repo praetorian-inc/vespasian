@@ -15,8 +15,13 @@
 package sdk
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"time"
@@ -452,6 +457,201 @@ func TestInvoke_ScanMode_InvalidScopeReturnsError(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid scope")
+}
+
+// ---------------------------------------------------------------------------
+// 6b. SEC-BE-002: probe-coverage telemetry
+// ---------------------------------------------------------------------------
+
+// TestSlogWriter_PipelineResolveAndGenerateSurfacesSkipAsSlogRecord tests
+// internal/pipeline's Warnings plumbing: given a pipeline.ScanOptions whose
+// Warnings field is a slogWriter, a probe-coverage decision made by the
+// SEC-BE-001 cross-origin gate must surface as a slog record. This drives the
+// real pipeline.ResolveAndGenerate (not the stubbed generateFunc seam) with a
+// hand-built ScanOptions literal shaped like runScan's -- TargetURL pinned to
+// the app's own origin, Warnings set to slogWriter -- against a two-origin
+// capture, so the cross-origin candidate is genuinely skipped by the gate.
+//
+// NOTE: this test builds its OWN pipeline.ScanOptions literal rather than
+// driving runScan/Invoke, so it proves internal/pipeline writes to whatever
+// Warnings the caller passes -- never in doubt -- but says nothing about
+// whether capability.go's runScan actually constructs its ScanOptions with
+// Warnings set to a slogWriter. TestRunScan_SetsScanOptionsWarningsToSlogWriter
+// below is the regression guard for that wiring.
+func TestSlogWriter_PipelineResolveAndGenerateSurfacesSkipAsSlogRecord(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1}`))
+	}))
+	t.Cleanup(api.Close)
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1}`))
+	}))
+	t.Cleanup(attacker.Close)
+
+	jsonAPIRequest := func(rawURL string) crawl.ObservedRequest {
+		return crawl.ObservedRequest{
+			Method:  "GET",
+			URL:     rawURL,
+			Headers: map[string]string{"Content-Type": "application/json"},
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Headers:     map[string]string{"Content-Type": "application/json"},
+				Body:        []byte(`{"id":1}`),
+			},
+		}
+	}
+	requests := []crawl.ObservedRequest{
+		jsonAPIRequest(api.URL + "/api/v1/users"),
+		jsonAPIRequest(attacker.URL + "/api/v1/collect"),
+	}
+
+	var logBuf bytes.Buffer
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
+	// Mirrors runScan's ScanOptions literal in capability.go exactly, in
+	// particular Warnings: slogWriter{...} and AllowPrivate: false (the SDK
+	// never sets AllowPrivate true).
+	_, _, _, _, err := pipeline.ResolveAndGenerate(context.Background(), requests, pipeline.ScanOptions{
+		TargetURL:    api.URL,
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		Deduplicate:  true,
+		AllowPrivate: false,
+		Warnings:     slogWriter{target: api.URL},
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, logBuf.String(), "probe coverage warning",
+		"a candidate skipped by the SEC-BE-001 cross-origin gate must surface at least one slog record (SEC-BE-002)")
+}
+
+// TestRunScan_SetsScanOptionsWarningsToSlogWriter is the regression guard for
+// capability.go's runScan wiring (TEST-002 review finding):
+// TestSlogWriter_PipelineResolveAndGenerateSurfacesSkipAsSlogRecord above
+// proves internal/pipeline honors whatever Warnings a caller passes, but
+// never drives runScan/Invoke itself, so it cannot catch runScan failing to
+// set Warnings at all -- reverting capability.go's
+// `Warnings: slogWriter{...}` to `Warnings: nil` left that test (and the
+// entire suite) green. This test swaps generateFunc (the package-level seam
+// already used by stubGenerate above) for a recorder that captures the
+// pipeline.ScanOptions runScan actually builds, drives Invoke in scan mode,
+// and asserts the captured Warnings is a slogWriter targeting the input's
+// PrimaryURL.
+func TestRunScan_SetsScanOptionsWarningsToSlogWriter(t *testing.T) {
+	var captured pipeline.ScanOptions
+	orig := generateFunc
+	generateFunc = func(_ context.Context, _ []crawl.ObservedRequest, opts pipeline.ScanOptions) ([]byte, string, bool, []crawl.ObservedRequest, error) {
+		captured = opts
+		return []byte(`openapi: "3.0"`), pipeline.APITypeREST, false, nil, nil
+	}
+	t.Cleanup(func() { generateFunc = orig })
+
+	stubCrawl(t, []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://x.com/api/v1/users",
+			Source: crawl.SourceStaticJS, // idempotency guard: skip jsstatic.Analyze
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Body:        []byte(`[{"id":1}]`),
+			},
+		},
+	}, nil)
+
+	c := &Capability{}
+	ctx := ctxWithParams("mode", "scan", "api_type", "rest", "probe", "false")
+	_, _, err := collect(t, c, ctx, seedApp("https://x.com"))
+	require.NoError(t, err)
+
+	require.NotNil(t, captured.Warnings, "runScan must set ScanOptions.Warnings, not leave it nil")
+	sw, ok := captured.Warnings.(slogWriter)
+	require.True(t, ok, "runScan must set ScanOptions.Warnings to a slogWriter, got %T", captured.Warnings)
+	assert.Equal(t, "https://x.com", sw.target, "the slogWriter must target the input's PrimaryURL")
+}
+
+// TestRunScan_SlogWriterTargetRedactsUserinfo pins the SEC-BE-005 redaction
+// (LAB-4992 review). slogWriter tags every warning it emits with its target
+// via slog.Warn, and PrimaryURL is operator-supplied with nothing upstream
+// stripping userinfo -- Match only parses and checks the scheme -- so a
+// credentialed target would otherwise be written to the SDK host's log sink
+// on every probe-coverage warning.
+//
+// The sibling test above cannot catch a revert: its PrimaryURL carries no
+// credentials, so `sw.target` equals the raw input either way. This one uses a
+// credentialed URL and asserts the exact redacted form, so deleting the
+// crawl.RedactURL wrap in capability.go fails here rather than silently
+// shipping the credential (SEC-BE-004/TEST-002 review finding).
+func TestRunScan_SlogWriterTargetRedactsUserinfo(t *testing.T) {
+	// NOTE for alert triage: titus flags the synthetic `svc-account:secretpass`
+	// below. The credential IS the subject under test -- this test exists to
+	// prove it never reaches slogWriter.target -- and x.example is a reserved
+	// domain that is never dialed (crawl is stubbed). Same class as alerts
+	// 97-115 and 119; retained deliberately.
+	// Written as one literal rather than concatenated parts on purpose:
+	// splitting it to slip past the scanner would hide the fixture from
+	// readers while defeating a control the repository relies on, so the
+	// suppression is explicit and carries its reason instead.
+	const primary = "https://svc-account:secretpass@x.example/" //nolint:gosec // G101: synthetic fixture; the credential is the subject under test (see NOTE above)
+
+	// Capture slog rather than letting it reach stderr. Invoke passes through
+	// the PRE-EXISTING "vespasian scan completed" Info, which still logs
+	// PrimaryURL raw, so without this the run prints this test's own synthetic
+	// credential into the terminal and CI logs (SEC-BE-002 review finding).
+	//
+	// This silences the TEST only. It does NOT close the deferred production
+	// issue -- the three raw sinks enumerated in capability.go's NOTE are
+	// still there, and the assertion below deliberately proves the redaction
+	// on the one sink this PR does own. Do not read a quiet test as evidence
+	// that the deferred ticket is done.
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
+	var captured pipeline.ScanOptions
+	orig := generateFunc
+	generateFunc = func(_ context.Context, _ []crawl.ObservedRequest, opts pipeline.ScanOptions) ([]byte, string, bool, []crawl.ObservedRequest, error) {
+		captured = opts
+		return []byte(`openapi: "3.0"`), pipeline.APITypeREST, false, nil, nil
+	}
+	t.Cleanup(func() { generateFunc = orig })
+
+	stubCrawl(t, []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://x.example/api/v1/users",
+			Source: crawl.SourceStaticJS, // idempotency guard: skip jsstatic.Analyze
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Body:        []byte(`[{"id":1}]`),
+			},
+		},
+	}, nil)
+
+	c := &Capability{}
+	ctx := ctxWithParams("mode", "scan", "api_type", "rest", "probe", "false")
+	_, _, err := collect(t, c, ctx, seedApp(primary))
+	require.NoError(t, err)
+
+	sw, ok := captured.Warnings.(slogWriter)
+	require.True(t, ok, "runScan must set ScanOptions.Warnings to a slogWriter, got %T", captured.Warnings)
+	assert.NotContains(t, sw.target, "secretpass",
+		"the slogWriter target must not carry the PrimaryURL password into the host's log sink")
+	assert.NotContains(t, sw.target, "svc-account",
+		"the slogWriter target must not carry the PrimaryURL username either")
+	// Exact form, not just absence: this also pins that the host survives
+	// redaction, so a future change that replaced the value with a bare
+	// placeholder would be caught rather than silently passing the
+	// NotContains assertions above.
+	assert.Equal(t, "https://x.example/", sw.target,
+		"the slogWriter target must be the crawl.RedactURL form of PrimaryURL")
 }
 
 // ---------------------------------------------------------------------------

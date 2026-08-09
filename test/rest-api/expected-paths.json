@@ -1,5 +1,5 @@
 {
-  "description": "Expected API paths from a live crawl of the REST API target. The crawler discovers GET endpoints via links on the index page and POST endpoints via JS fetch calls. Parameter names may vary (e.g., {userId} vs {id}).",
+  "description": "Expected API paths from a live crawl of the REST API target, two-stage: `vespasian crawl` then `vespasian generate`. Consumed by test_rest_api in test/run-live-tests.sh. The crawler discovers GET endpoints via links on the index page and POST endpoints via JS fetch calls. /api/subscribe is discovered via generate's analyze.ExtractForms augmentation from the static HTML <form> on the index page (LAB-3890 T2). Parameter names may vary (e.g., {userId} vs {id}). INTENTIONAL DUPLICATE — EDIT BOTH FILES: this file and its sibling test/rest-api/scan-expected-paths.json are deliberately kept in lockstep. They exist as two files only because two different tests read them (test_rest_api reads this one, test_scan_rest reads scan-expected-paths.json) and JSON has no comment syntax; the paths and total_paths are identical on purpose. Any endpoint added to or removed from the test/rest-api server must be applied to BOTH files — updating only one silently diverges the rest-api and scan-rest expectations instead of failing loudly. They match today because pipeline.Augment (and its ExtractForms step) runs in both GenerateCmd.Run and ScanCmd.Run, so the two-stage crawl+generate path and the single-stage scan path recover the same set. Divergence is only justified once that stops being true — e.g. a discovery or probe stage is added to one command and not the other, or scan starts seeing endpoints the crawl capture cannot carry — and whoever makes them differ should replace this note in both files with the reason.",
   "paths": {
     "/api/health": ["GET"],
     "/api/users": ["GET"],
@@ -10,8 +10,9 @@
     "/api/orders": ["GET"],
     "/api/orders/{id}": ["GET"],
     "/api/login": ["POST"],
-    "/api/upload": ["POST"]
+    "/api/upload": ["POST"],
+    "/api/subscribe": ["POST"]
   },
-  "total_paths": 10,
+  "total_paths": 11,
   "excluded_patterns": [".js", ".css", ".png", ".ico", ".svg", ".woff"]
 }

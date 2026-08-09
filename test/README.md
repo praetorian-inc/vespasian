@@ -237,8 +237,8 @@ Options:
   --group <name>        Run a predefined target group: offline, live, or all (default: all)
   --targets <list>      Comma-separated targets to test (overrides --group)
                         Valid targets:
-                          Service:    rest-api, soap-service, graphql-server, concat-spa,
-                                      concat-spa-two-stage
+                          Service:    rest-api, scan-rest, soap-service, graphql-server,
+                                      concat-spa, concat-spa-two-stage, forms-target
                           Config:     grpc-server (included via TARGETS_SETUP when set up)
                           Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,
                                       generate-graphql, generate-graphql-imports,
@@ -246,8 +246,8 @@ Options:
                           Import:     import-burp, import-har, import-base64,
                                       import-mitmproxy, import-mitmproxy-native,
                                       import-unicode, import-duplicates,
-                                      import-malformed, import-empty
-                          Crawl:      crawl-depth, crawl-unreachable, no-download
+                                      import-malformed, import-empty, auth-capture
+                          Crawl:      crawl-depth, crawl-unreachable, ssrf-rejection, no-download
                           Edge cases: edge-cases, classifier-edge, spec-edge
   --verbose             Enable verbose vespasian output
   --no-build            Skip building vespasian and target binaries
@@ -365,14 +365,18 @@ Results are saved to `test/.results/` with one subdirectory per test:
 │   └── (empty on success)  # Validates graceful failure on bad input
 ├── import-empty/
 │   └── imported.json       # Imported from empty Burp/HAR
+├── auth-capture/
+│   └── imported.json       # Authorization header preserved through import (LAB-3890 A5)
 ├── edge-cases/
-│   └── (crawl artifacts)   # Timeout, error handling, auth header tests
+│   └── (crawl artifacts)   # Timeout, redirects, HTTP errors, encoding
 ├── crawl-depth/
 │   ├── shallow.json        # Depth-limited crawl
 │   ├── limited.json        # Max-pages-limited crawl
 │   └── loop.json           # Infinite loop detection
 ├── crawl-unreachable/
 │   └── capture.json        # Crawl of unreachable host
+├── ssrf-rejection/
+│   └── (no artifact)       # Asserts SSRF gate rejects a private target (LAB-3890 A4)
 ├── classifier-edge/
 │   ├── capture.json        # Synthetic edge case requests
 │   └── spec.yaml           # Spec from classifier edge cases
@@ -383,11 +387,12 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 ## Expected Results
 
-All 28 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest). The sample below is a default `--group all` run (19 offline + 9 live targets); the config-only `grpc-server` target runs additionally only when `TARGETS_SETUP` is configured.
+All 31 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest). The sample below is a default `--group all` run (21 offline + 10 live targets); the config-only `grpc-server` target runs additionally only when `TARGETS_SETUP` is configured.
 
 ```text
   TARGET                      STATUS    ENDPOINTS   EXPECTED   DURATION
   --------------------------  --------  ----------  ---------  --------
+  auth-capture                PASS      1           1          0s
   classifier-edge             PASS      -           -          0s
   concat-spa                  PASS      2           2          90s
   concat-spa-two-stage        PASS      2           2          92s
@@ -399,7 +404,7 @@ All 28 tests should pass. Order is non-deterministic and durations vary by machi
   generate-graphql-imports    PASS      2           2          0s
   generate-js-static          PASS      3           3          1s
   generate-merge-slugs        PASS      3           3          0s
-  generate-rest               PASS      8           8          0s
+  generate-rest               PASS      10          10         0s
   generate-wsdl               PASS      3           3          1s
   generate-wsdl-matrix        PASS      3           3          1s
   graphql-server              PASS      8           8          1s
@@ -413,11 +418,13 @@ All 28 tests should pass. Order is non-deterministic and durations vary by machi
   import-mitmproxy-native     PASS      3           3          1s
   import-unicode              PASS      3           3          0s
   no-download                 PASS      -           -          80s
-  rest-api                    PASS      8           8          79s
+  rest-api                    PASS      11          11         79s
+  scan-rest                   PASS      11          11         84s
   soap-service                PASS      3           3          51s
   spec-edge                   PASS      -           -          0s
+  ssrf-rejection              PASS      -           -          0s
 
-  Total: 28 passed, 0 failed, 0 skipped
+  Total: 31 passed, 0 failed, 0 skipped
 ```
 
 Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are informational and do not cause failures.

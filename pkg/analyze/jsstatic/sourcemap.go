@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
 
@@ -91,15 +92,43 @@ func recoverSourcemap(ctx context.Context, bundle []byte, bundleURL string, opts
 		return nil, stats
 	}
 
+	// URL-level SSRF validation (SEC-BE-001): reject a private/internal mapURL
+	// unless the operator opted in via --dangerous-allow-private. This is the
+	// only SSRF gate on the proxied path — defaultSourcemapClient's proxy branch
+	// clears the dial-time pin (it dials the proxy, not the target) — so without
+	// this a proxied fetch could reach an internal host. Runs before any client
+	// construction/network I/O so it covers BOTH the nil-HTTPClient (default/
+	// proxied) and caller-supplied paths, mirroring the probe/WSDL/JS-replay
+	// stages (see internal/pipeline/wsdl_probe.go).
+	if !opts.AllowPrivate {
+		if err := probe.ValidateProbeURL(mappingURL); err != nil {
+			stats.SourcemapFetchFails++
+			return nil, stats
+		}
+	}
+
 	client := opts.HTTPClient
 	if client == nil {
-		client = defaultSourcemapClient(opts.AllowPrivate)
+		client = defaultSourcemapClient(opts.AllowPrivate, opts.Proxy)
 	} else {
-		// Caller-supplied client: enforce both noFollowRedirects and an SSRF-safe
-		// DialContext on a shallow-copy so neither mutation touches the caller's
-		// original client.
+		// SEC-BE-004: an injected HTTPClient owns its transport, so a configured
+		// Proxy is silently ignored here — recoverSourcemap overwrites the client's
+		// Transport with ssrfSafeTransport, which would clobber a proxied dialer.
+		// Warn loudly rather than bypass the proxy without a trace. opts.Logger is
+		// nil when recoverSourcemap is called directly (tests) without Analyze's
+		// withDefaults defaulting, so fall back to slog.Default().
+		if opts.Proxy.Enabled() {
+			logger := opts.Logger
+			if logger == nil {
+				logger = slog.Default()
+			}
+			logger.Warn("jsstatic: Proxy configured but ignored — an injected HTTPClient owns its transport; sourcemap fetches will BYPASS the proxy")
+		}
+		// Caller-supplied client: enforce both httpx.NoFollowRedirects and an
+		// SSRF-safe DialContext on a shallow-copy so neither mutation touches the
+		// caller's original client.
 		//
-		// noFollowRedirects: a same-host .js.map URL that 302s to an attacker
+		// httpx.NoFollowRedirects: a same-host .js.map URL that 302s to an attacker
 		// host would bypass the sameHost pre-flight check above.
 		//
 		// SSRFSafeDialContext (or permissive dialer when AllowPrivate is true):
@@ -109,7 +138,7 @@ func recoverSourcemap(ctx context.Context, bundle []byte, bundleURL string, opts
 		// Transport. We do NOT mutate the caller's Transport — a new *http.Transport
 		// is constructed so that AllowPrivate semantics are respected.
 		clientCopy := *client
-		clientCopy.CheckRedirect = noFollowRedirects
+		clientCopy.CheckRedirect = httpx.NoFollowRedirects
 		clientCopy.Transport = ssrfSafeTransport(opts.AllowPrivate)
 		// Enforce the same overall deadline as the default client so a slow-drip
 		// body read is bounded even when the caller's client left Timeout unset
@@ -232,14 +261,6 @@ func effectivePort(u *url.URL) string {
 	return ""
 }
 
-// noFollowRedirects is a CheckRedirect function that prevents the HTTP client
-// from following 3xx responses. A same-host .js.map URL that redirects to a
-// different host would bypass the sameHost pre-flight check; blocking all
-// redirects closes this gap.
-func noFollowRedirects(_ *http.Request, _ []*http.Request) error {
-	return http.ErrUseLastResponse
-}
-
 // ssrfSafeTransport returns a new *http.Transport with the appropriate
 // DialContext for sourcemap fetches. When allowPrivate is false, the SSRF-safe
 // dial context from pkg/probe is used. When allowPrivate is true, a permissive
@@ -267,30 +288,51 @@ func ssrfSafeTransport(allowPrivate bool) *http.Transport {
 // When allowPrivate is false, the SSRF-safe dial context from pkg/probe is
 // used. When allowPrivate is true, a permissive dialer is used instead.
 // Redirects are disabled unconditionally to prevent host-redirect bypass.
-func defaultSourcemapClient(allowPrivate bool) *http.Client {
+func defaultSourcemapClient(allowPrivate bool, proxy httpx.ProxyConfig) *http.Client {
+	if proxy.Enabled() {
+		// Route through the proxy: no dial-time SSRF pin (we dial the proxy, not
+		// the target). This is the production path (pipeline leaves HTTPClient
+		// nil); an injected HTTPClient opts out of Proxy — recoverSourcemap
+		// overwrites its Transport with ssrfSafeTransport, which would clobber a
+		// proxied dialer. Redirects are refused (httpx.NoFollowRedirects, same as
+		// the non-proxy branch): the sameHost check only vets the initial URL and
+		// the dial-pin is dropped when proxied, so following a cross-host 302 would
+		// be an SSRF backstop gap.
+		return httpx.BuildHTTPClient(proxy, 10*time.Second, httpx.NoFollowRedirects)
+	}
 	return &http.Client{
 		Timeout:       10 * time.Second,
-		CheckRedirect: noFollowRedirects,
+		CheckRedirect: httpx.NoFollowRedirects,
 		Transport:     ssrfSafeTransport(allowPrivate),
 	}
 }
 
 // fetchRemoteSourcemap GETs the sourcemap URL, reads up to maxSourcemapResponseSize
 // bytes, and returns sourcesContent strings. ctx is propagated into the HTTP
-// request so that cancellation from the caller is honored. The SSRF posture
-// is established on the client argument by the caller (recoverSourcemap picks
-// either defaultSourcemapClient(allowPrivate) or the user-supplied client
-// wrapped with noFollowRedirects), so this function does not need to know
-// about it.
+// request so that cancellation from the caller is honored.
+//
+// The SSRF posture is established by recoverSourcemap before this function runs:
+// the sameHost pre-flight vets the initial URL, and probe.ValidateProbeURL(mappingURL)
+// is the URL-level SSRF gate that runs before ANY client construction or network
+// I/O, covering BOTH the proxied and the unproxied/caller-supplied paths — it is
+// the actual (and only) SSRF gate on the proxied path. The dial-time pin
+// (probe.SSRFSafeDialContext) applies ONLY on the unproxied/default branches; it
+// is intentionally absent when proxied (we dial the proxy, not the target).
+// Redirects are blocked on ALL branches via httpx.NoFollowRedirects. This function
+// therefore does not need to know how the client's SSRF posture was configured.
 func fetchRemoteSourcemap(ctx context.Context, client *http.Client, mapURL string) ([]string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, mapURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	// gosec G107/G704: mapURL is host-validated (sameHost) and dial-validated
-	// (probe.SSRFSafeDialContext or, when AllowPrivate is true, an explicit
-	// opt-in). Redirects are blocked via CheckRedirect=noFollowRedirects on
-	// the default client. The taint warning here is a known false positive.
+	// gosec G107/G704: mapURL is host-validated (sameHost) and URL-level SSRF-gated
+	// by probe.ValidateProbeURL before any client construction — the gate that
+	// covers the proxied path, where the dial-time pin is intentionally absent (we
+	// dial the proxy, not the target). On the unproxied/default branches the dial is
+	// additionally pinned by probe.SSRFSafeDialContext (or, when AllowPrivate is
+	// true, an explicit opt-in). Redirects are blocked via
+	// CheckRedirect=httpx.NoFollowRedirects on all branches. The taint warning here
+	// is a known false positive.
 	resp, err := client.Do(req) //nolint:gosec // mapURL pre-validated; see comment above
 	if err != nil {
 		return nil, err

@@ -18,27 +18,112 @@
 // It is invoked between the capture stage (pkg/crawl, pkg/importer) and the
 // classify/generate stages (pkg/classify, pkg/generate). It returns the input
 // captures unchanged, with newly synthesized [crawl.ObservedRequest] entries
-// appended (Source = "static:js" or "static:js-sourcemap").
+// appended (Source = "static:js", "static:js-sourcemap", or
+// "static:js-concat").
 //
 // The analyser is a thin wrapper over BishopFox/jsluice's tree-sitter URL
-// matchers, with two extensions over the upstream library:
+// matchers, with three extensions over the upstream library:
 //
 //   - "EXPR" placeholders in URL paths are normalised to OpenAPI {param}
 //     form using the names of the original template-literal identifiers when
 //     they can be recovered.
+//
 //   - For fetch(url, {body: JSON.stringify({a, b})}) and axios.<m>(url, {a, b})
 //     calls, the names of the top-level keys of the object literal are
 //     captured as body parameter names. They are emitted as a synthesized
 //     JSON body ({"a": null, "b": null}) so the existing
 //     pkg/generate/rest.InferSchema produces an object schema downstream.
 //
+//   - Paths built by JS string concatenation that jsluice's AST analysis
+//     cannot resolve — String.prototype.concat, "+"-operator chains, and
+//     literal service-prefix "+"-concatenation — are reconstructed via the
+//     shared crawl.ExtractStaticConcatPaths extractor (LAB-4992), with a numeric
+//     sentinel ("0") substituted for non-literal operands so the REST normalizer
+//     can parameterize them (e.g. /api/users/0/orders -> /api/users/{userId}/orders).
+//     This makes fully-offline `generate` recover concat/service-prefix SPA
+//     endpoints without a reachable target — the same forms the active,
+//     network-bound crawl.ReplayJSExtracted path probes. Emitted as GET
+//     candidates (a bare path carries no method) and deduped, via a
+//     representation-agnostic AND origin-scoped key (numeric sentinel "0" and
+//     {param} placeholders both normalized; key prefixed with the endpoint's
+//     host so a same-path endpoint on a DIFFERENT host is never suppressed),
+//     against the URLs the AST walkers already recovered so no phantom-GET
+//     companions appear for a path recovered both ways on the same origin.
+//
+//     An absolute reconstruction (a bundle literal that concatenates a full
+//     http(s) URL) must additionally share the bundle's own origin — scheme,
+//     host AND port, via crawl.SameOrigin — enforced by the concat producer
+//     itself (extractConcatEndpoints), since a speculative recombination that
+//     lands on a different host or downgrades https to http is far more
+//     likely an artifact or a plant than a real call site (SEC-BE-001,
+//     LAB-4992).
+//
+//     Credential rejection, the byte policy, and scheme validity are enforced
+//     once for EVERY producer (AST literal, sourcemap-recovered, and concat
+//     alike) at a single synthesis choke point, specSafeURL in toRequests,
+//     which runs on each endpoint's final RESOLVED URL rather than the
+//     pre-resolution literal. It is deliberately parse-based, with no
+//     string-prefix test: given the parsed form, (1) every byte must be
+//     printable ASCII, whether raw or reached via a percent-escape, so a
+//     hostile bundle cannot make a spec path key or servers entry render
+//     differently from its bytes (SEC-BE-002); (2) the URL may carry no
+//     userinfo, however spelled (u:p@host, the scheme-relative //u:p@host,
+//     or an explicit scheme://u:p@host) — this is the credential-injection
+//     sink, since ssrf.ValidateURL never inspects u.User and
+//     probe.Config.AuthHeaders is set by no non-test caller, so net/http
+//     would otherwise derive an `Authorization: Basic` header from an
+//     attacker-chosen credential on every probe (SEC-BE-001); (3) the URL may
+//     carry no opaque part (scheme:opaque-data, e.g. "mailto:x@y.com" or
+//     "https:api/x" — no host, no resolvable path); and (4) any URL that
+//     carries a host must use the http or https scheme (catching a
+//     scheme-relative literal that resolution left without one), AND an
+//     http(s)-scheme URL must carry a host — "https:/api/x" parses to
+//     Scheme="https", Host="" (a single slash after the scheme is not an
+//     authority marker), and without this check it produced a degenerate
+//     "https://" spec server entry that sorted before every real host and
+//     blanked info.title (LAB-4992 review). A hostile bundle literal cannot
+//     steer the offline candidate set — or the probe stage that later
+//     consumes it — at an attacker-chosen host, credential, or byte-spoofed
+//     path.
+//
+//     Capture compatibility (QUAL-001, LAB-4992): this applies to captures whose
+//     JS bundles have not ALREADY been through an older jsstatic pass.
+//     pipeline.AnalyzeJS short-circuits on crawl.AnyStaticSource — "this capture
+//     was produced by a stage that already ran jsstatic.Analyze" — and CrawlCmd
+//     runs jsstatic at crawl time, writing static:js entries into the capture.
+//     That guard's premise ("already ran jsstatic" implies "has all jsstatic
+//     output") was version-independent before this change and no longer is: a
+//     capture written by any pre-LAB-4992 `crawl`/`scan` build carries static:js
+//     entries but NO static:js-concat entries, so `generate` skips the analysis
+//     entirely and recovers no concat endpoint. Re-run the capture to pick these
+//     up (documented in CLAUDE.md's Capture Format section alongside the
+//     LAB-2110 precedent). Re-running the analysis instead of re-capturing is not
+//     an option here: the guard is what makes `crawl | generate` byte-identical
+//     to `scan`, and re-running jsstatic over a capture that already contains its
+//     own output would duplicate entries. Captures from `import` (Burp/HAR/
+//     mitmproxy) carry no static:js source at all, so they always exercise this
+//     path regardless of the build that produced them.
+//
 // # Source tagging
 //
-// Each synthesized [crawl.ObservedRequest] carries Source = "static:js" or
-// "static:js-sourcemap". The OpenAPI generator strips the "static:" prefix
-// when emitting the x-vespasian-source extension on each operation
-// ("static:js" -> "js-bundle", "static:js-sourcemap" -> "js-sourcemap";
-// any dynamic-source group resolves to "dynamic", which wins on mixed groups).
+// Each synthesized [crawl.ObservedRequest] carries Source = "static:js"
+// (AST-recovered literal), "static:js-sourcemap" (recovered from a .js.map
+// source), or "static:js-concat" (a never-probed concat/+-chain/service-prefix
+// reconstruction — LAB-4992). The OpenAPI generator maps these to the
+// x-vespasian-source extension on each operation ("static:js" -> "js-bundle",
+// "static:js-sourcemap" -> "js-sourcemap", "static:js-concat" ->
+// "js-bundle-concat"; any dynamic-source group resolves to "dynamic", which
+// wins on mixed groups). The distinct "static:js-concat" tag lets consumers
+// weight speculative reconstructions below directly-observed literals.
+//
+// # Confidence at generation
+//
+// A concat/literal candidate reaches the generated spec only after
+// classification. Fully offline it has no probed response, so it scores only the
+// REST classifier's path heuristic; RESTClassifier Rule 7 floors any JS-static
+// candidate whose path carries an API indicator to the default --confidence
+// threshold (0.5) so these offline candidates survive default-confidence
+// generation instead of being silently dropped.
 //
 // # Security and Operator Considerations
 //

@@ -109,13 +109,72 @@
 //     configuration and graceful shutdown (headless path only).
 //   - [ValidateProxyAddr] validates a proxy address (http/https/socks5, host
 //     required, no embedded credentials) for both backends.
+//   - [RedactURL] removes userinfo from a URL before it is echoed to an
+//     operator, failing CLOSED to a placeholder whenever it cannot prove the
+//     result is credential-free (opaque forms keep credentials in
+//     url.URL.Opaque with User nil, and a parse error can carry them
+//     verbatim). Exported for internal/pipeline's classification-reason
+//     output.
 //   - [ObservedRequest] and [ObservedResponse] represent captured HTTP traffic.
 //   - [JSReplayConfig] and [ReplayJSExtracted] implement the post-crawl JS
 //     bundle scanning step. The replay step enforces a same-origin gate
 //     (auth headers and probes are restricted to the scan target's origin
 //     by default) and uses [github.com/praetorian-inc/vespasian/pkg/ssrf]
 //     for SSRF protection unless the operator explicitly opts out via
-//     AllowPrivate.
+//     AllowPrivate. When [JSReplayConfig.Proxy] is set (and no Client is
+//     injected) the replay client routes through the intercepting proxy —
+//     LAB-4993 made probe and JS-replay proxy-aware, so --proxy is no longer
+//     crawl-only. socks5 always verifies TLS; --proxy-insecure is http/https only.
+//     Relative to the fully-offline static path, replay is
+//     strictly ADDITIVE: it supersedes an offline static:js-concat mirror only
+//     for a path the probe answered 404 — the sole dispositive refutation — so
+//     a 200 text/html SPA catch-all, a 204, an HTML-bodied 401/403 or a
+//     302 to /login can never remove an endpoint the offline pass recovered
+//     (LAB-4992 QUAL-004).
+//   - [ExtractStaticConcatPaths] is the network-free subset of the concat /
+//     service-prefix reconstruction, shared with pkg/analyze/jsstatic (LAB-4992)
+//     so the fully-offline static analyzer reconstructs these forms identically
+//     to the active replay path. The active path (extractAPIPaths) runs the same
+//     underlying extractors — extractConcatPaths AND servicePrefixPlusPaths — so
+//     both paths recover the concat/+-chain and literal service-prefix forms
+//     identically; the active path additionally probes them and does a
+//     speculative service-prefix fan-out that the offline path omits (that
+//     fan-out is only safe when 404-filtered by probing).
+//   - [ValidateFullURL], [SameOrigin], [CanonicalOrigin], [IsAbsoluteHTTPURL],
+//     [IsPrintableASCIIURL] and [APIIndicatorAlternation] are exported for the
+//     same reason as [ExtractStaticConcatPaths] — they are the shared
+//     definitions that keep other packages from drifting away from this one
+//     (LAB-4992). [ValidateFullURL] is the parse-time URL gate (rejects
+//     embedded credentials, non-http(s) schemes, empty hosts) applied before
+//     probing an absolute reconstruction; [SameOrigin] compares origins with
+//     default-port canonicalization, so the two paths agree on what counts as
+//     the bundle's own origin; [CanonicalOrigin] is the single "scheme://host"
+//     origin definition for both comparison AND display (lower-cased,
+//     default port stripped, IPv6 hosts kept bracketed) — exported so
+//     pkg/generate/rest does not carry a second, subtly different origin
+//     normalization, which previously let a trusted host spelled with an
+//     explicit default port or mixed case lose its own tie-break to an
+//     attacker-controlled origin (SEC-BE-001/QUAL-001). An IPv6 literal host
+//     is re-bracketed when rebuilt from url.URL.Hostname() (which strips the
+//     brackets Host had), both so the result stays a syntactically valid URL
+//     and so two differently-bracketed IPv6 spellings that would otherwise
+//     rebuild to the identical bracket-less string (one with a real port
+//     outside the brackets, one where that same digit sequence is part of
+//     the literal itself) canonicalize differently, as they must; the fix is
+//     in the shared originOf helper so CanonicalOrigin, SameOrigin, and
+//     ResolveTargetOrigin all agree (SEC-BE-001 follow-up);
+//     [IsAbsoluteHTTPURL] answers "does this carry an
+//     http(s) scheme" case-insensitively, because url.Parse lower-cases the
+//     scheme and a case-sensitive prefix test would classify "HTTPS://h/x" as
+//     relative; [IsPrintableASCIIURL] is the byte policy for anything bound
+//     for an operator-facing artifact (no raw non-ASCII or control bytes, and
+//     no percent-escape decoding to them), which pkg/analyze/jsstatic applies
+//     at its synthesis choke point so every producer shares one rule rather
+//     than only the concat reconstruction being filtered; [APIIndicatorAlternation]
+//     is the single source of truth for which path segments signal an API
+//     endpoint, and pkg/classify pins its Rule 3 gate against it so the
+//     classifier cannot silently stop recognizing an indicator this package
+//     still extracts.
 //
 // Session-cookie helpers (LAB-2222) let callers bootstrap Chrome's cookie
 // store from a user-supplied Cookie header so subsequent navigations are

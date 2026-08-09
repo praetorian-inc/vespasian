@@ -24,6 +24,7 @@ import (
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	wsdlgen "github.com/praetorian-inc/vespasian/pkg/generate/wsdl"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
 
@@ -38,14 +39,33 @@ func writeStatus(w io.Writer, format string, args ...any) {
 
 // wsdlStageTimeout caps each connection phase (TLS handshake, response header)
 // independently of the overall Client.Timeout, so a slow or malicious target
-// can't burn the whole budget on a single stage. Both transport branches share
-// this cap — the only real difference is the dialer (SSRF-safe vs permissive).
+// can't burn the whole budget on a single stage. All three transport branches
+// (proxied, SSRF-safe non-proxy, and permissive non-proxy) share this cap.
 const wsdlStageTimeout = 10 * time.Second
 
+// wsdlClientTimeout is the overall per-request budget on the WSDL probe's
+// http.Client (covering the full exchange, including the response-body read),
+// shared by both the proxied and non-proxy client builds so the two stay in
+// lockstep.
+const wsdlClientTimeout = 15 * time.Second
+
 // buildWSDLProbeClient constructs the HTTP client used by ProbeWSDLDocument.
-// When allowPrivate is false the transport uses SSRF-safe dialing; when true
-// it mirrors the timeouts applied to AllowPrivate probes elsewhere.
-func buildWSDLProbeClient(allowPrivate bool) *http.Client {
+// When proxy is enabled the transport routes through it (no dial-time SSRF pin —
+// we dial the proxy, not the target). Otherwise, when allowPrivate is false the
+// transport uses SSRF-safe dialing; when true it mirrors the timeouts applied to
+// AllowPrivate probes elsewhere.
+func buildWSDLProbeClient(allowPrivate bool, proxy httpx.ProxyConfig) *http.Client {
+	if proxy.Enabled() {
+		client := httpx.BuildHTTPClient(proxy, wsdlClientTimeout, httpx.NoFollowRedirects)
+		// Apply the same per-stage caps the non-proxy branches use so a slow/malicious
+		// target can't stall a single stage up to the full client budget. BuildHTTPClient
+		// always sets a *http.Transport. [QUAL-001]
+		if tr, ok := client.Transport.(*http.Transport); ok {
+			tr.TLSHandshakeTimeout = wsdlStageTimeout
+			tr.ResponseHeaderTimeout = wsdlStageTimeout
+		}
+		return client
+	}
 	transport := &http.Transport{
 		DialContext:           probe.SSRFSafeDialContext,
 		TLSHandshakeTimeout:   wsdlStageTimeout,
@@ -58,11 +78,9 @@ func buildWSDLProbeClient(allowPrivate bool) *http.Client {
 		}
 	}
 	return &http.Client{
-		Timeout:   15 * time.Second,
-		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+		Timeout:       wsdlClientTimeout,
+		Transport:     transport,
+		CheckRedirect: httpx.NoFollowRedirects,
 	}
 }
 
@@ -70,7 +88,12 @@ func buildWSDLProbeClient(allowPrivate bool) *http.Client {
 // Returns the raw WSDL bytes on success, or nil if the probe fails or the
 // response is not a valid WSDL document. status is an optional io.Writer
 // for progress messages; pass nil or io.Discard to suppress them.
-func ProbeWSDLDocument(ctx context.Context, targetURL string, allowPrivate bool, status io.Writer) []byte {
+//
+// proxy routes the WSDL fetch through an intercepting proxy when set (the zero
+// value means unproxied); the proxied client carries no dial-time SSRF pin (we
+// dial the proxy, not the target), so the URL-level ValidateProbeURL check above
+// remains the scope guard — mirroring probe.Config.Proxy.
+func ProbeWSDLDocument(ctx context.Context, targetURL string, allowPrivate bool, proxy httpx.ProxyConfig, status io.Writer) []byte {
 	parsedURL, err := url.Parse(targetURL)
 	if err != nil {
 		writeStatus(status, "wsdl discovery: invalid URL %q: %v\n", targetURL, err)
@@ -88,7 +111,7 @@ func ProbeWSDLDocument(ctx context.Context, targetURL string, allowPrivate bool,
 		}
 	}
 
-	client := buildWSDLProbeClient(allowPrivate)
+	client := buildWSDLProbeClient(allowPrivate, proxy)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wsdlURL, nil)
 	if err != nil {
@@ -138,8 +161,12 @@ func ProbeWSDLDocument(ctx context.Context, targetURL string, allowPrivate bool,
 //
 // This helper is the single source of truth for WSDL discovery shared by
 // ScanCmd.Run (cmd/vespasian/main.go) and Capability.runScan (pkg/sdk).
-func ProbeAndAppendWSDLRequest(ctx context.Context, targetURL string, requests []crawl.ObservedRequest, allowPrivate bool, status io.Writer) ([]crawl.ObservedRequest, bool, string) {
-	wsdlDoc := ProbeWSDLDocument(ctx, targetURL, allowPrivate, status)
+//
+// proxy routes the WSDL fetch through an intercepting proxy when set (the zero
+// value means unproxied); the proxied client carries no dial-time SSRF pin, so
+// URL-level validation remains the scope guard — mirroring probe.Config.Proxy.
+func ProbeAndAppendWSDLRequest(ctx context.Context, targetURL string, requests []crawl.ObservedRequest, allowPrivate bool, proxy httpx.ProxyConfig, status io.Writer) ([]crawl.ObservedRequest, bool, string) {
+	wsdlDoc := ProbeWSDLDocument(ctx, targetURL, allowPrivate, proxy, status)
 	if wsdlDoc == nil {
 		return requests, false, ""
 	}
@@ -174,11 +201,15 @@ func ProbeAndAppendWSDLRequest(ctx context.Context, targetURL string, requests [
 // original requests slice and apiType are returned unchanged. It returns the
 // (possibly augmented) requests, the resolved API type, and whether a WSDL
 // document was found.
-func ResolveWSDLType(ctx context.Context, targetURL, apiType string, requests []crawl.ObservedRequest, probe, allowPrivate bool, status io.Writer) ([]crawl.ObservedRequest, string, bool) {
+//
+// proxy routes the WSDL fetch through an intercepting proxy when set (the zero
+// value means unproxied); the proxied client carries no dial-time SSRF pin, so
+// URL-level validation remains the scope guard — mirroring probe.Config.Proxy.
+func ResolveWSDLType(ctx context.Context, targetURL, apiType string, requests []crawl.ObservedRequest, probe, allowPrivate bool, proxy httpx.ProxyConfig, status io.Writer) ([]crawl.ObservedRequest, string, bool) {
 	if !probe || (apiType != APITypeWSDL && apiType != APITypeREST) {
 		return requests, apiType, false
 	}
-	augmented, foundWSDL, _ := ProbeAndAppendWSDLRequest(ctx, targetURL, requests, allowPrivate, status)
+	augmented, foundWSDL, _ := ProbeAndAppendWSDLRequest(ctx, targetURL, requests, allowPrivate, proxy, status)
 	if foundWSDL {
 		return augmented, APITypeWSDL, true
 	}
