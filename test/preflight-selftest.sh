@@ -247,13 +247,17 @@ EOF
     # users to export CHROME_PROBE_TIMEOUT, and an ambient value below ~1s
     # would fail this assertion spuriously. (Empty means "unset" to :-.)
     assert_eq "case f2: slow browser passes under the default 2s budget" \
-        "0" "$(CHROME_PROBE_TIMEOUT= probe_slow_browser)"
+        "0" "$(CHROME_PROBE_TIMEOUT='' probe_slow_browser)"
+    # Assert rc 124 exactly — timeout/gtimeout's "I killed it" status. Any
+    # other nonzero rc (125 invalid duration, the probe's own failure code)
+    # would mean the probe failed for the wrong reason, not that the budget
+    # was enforced.
     rc_f2=$(CHROME_PROBE_TIMEOUT=0.2 probe_slow_browser)
-    if [ "${rc_f2}" != "0" ]; then
-        echo "PASS: case f2: CHROME_PROBE_TIMEOUT=0.2 kills the slow probe (rc ${rc_f2})"
+    if [ "${rc_f2}" = "124" ]; then
+        echo "PASS: case f2: CHROME_PROBE_TIMEOUT=0.2 kills the slow probe (rc 124)"
         pass_count=$((pass_count + 1))
     else
-        echo "FAIL: case f2: CHROME_PROBE_TIMEOUT=0.2 was ignored — slow probe still passed"
+        echo "FAIL: case f2: expected timeout kill (rc 124), got rc ${rc_f2}"
         fail_count=$((fail_count + 1))
     fi
 else
