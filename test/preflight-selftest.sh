@@ -243,8 +243,11 @@ EOF
         )
     }
 
+    # Pin the budget to its default for the first probe: the README tells
+    # users to export CHROME_PROBE_TIMEOUT, and an ambient value below ~1s
+    # would fail this assertion spuriously. (Empty means "unset" to :-.)
     assert_eq "case f2: slow browser passes under the default 2s budget" \
-        "0" "$(probe_slow_browser)"
+        "0" "$(CHROME_PROBE_TIMEOUT= probe_slow_browser)"
     rc_f2=$(CHROME_PROBE_TIMEOUT=0.2 probe_slow_browser)
     if [ "${rc_f2}" != "0" ]; then
         echo "PASS: case f2: CHROME_PROBE_TIMEOUT=0.2 kills the slow probe (rc ${rc_f2})"
