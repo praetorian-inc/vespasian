@@ -520,6 +520,12 @@ macOS ships neither, so on an unpatched macOS install the probe runs without a
 timeout — a binary that hangs on `--version` would block preflight rather
 than failing fast.
 
+**Slow hosts:** the probe gives each candidate 2 seconds to answer
+`--version`. On a cold or throttled container mount a healthy browser's first
+exec can take longer, which surfaces as a spurious `Found <path> but it is not
+runnable`. Set `CHROME_PROBE_TIMEOUT` (seconds, fractions allowed) to widen
+the budget: `CHROME_PROBE_TIMEOUT=10 ./test/setup-live-targets.sh`.
+
 ### Crawl produces empty capture
 
 Ensure the target service is running and healthy. Run the check from the host that started the services (`setup-live-targets.sh` binds to localhost there):

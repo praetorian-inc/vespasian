@@ -52,6 +52,11 @@ CHROME_CANDIDATES=(
 # candidates, and install-chrome.sh calls it while running under sudo. That is
 # accepted: anyone who can place a binary earlier on root's PATH already has
 # the privilege the probe would grant, so it crosses no trust boundary.
+#
+# The probe budget defaults to 2s but honours CHROME_PROBE_TIMEOUT: on a
+# cold or throttled container mount a slow first exec can outlive a fixed
+# budget, and the miss surfaces as a fatal "not runnable" — the same
+# false-positive class LAB-3893 exists to prevent.
 chrome_runnable() {
     local t=""
     if command -v timeout >/dev/null 2>&1; then
@@ -60,7 +65,7 @@ chrome_runnable() {
         t=gtimeout
     fi
     if [ -n "$t" ]; then
-        "$t" 2 "$1" --version >/dev/null 2>&1
+        "$t" "${CHROME_PROBE_TIMEOUT:-2}" "$1" --version >/dev/null 2>&1
     else
         # No timeout available (e.g. stock macOS): probe directly. A binary that
         # hangs on --version would block here — known limitation, documented in

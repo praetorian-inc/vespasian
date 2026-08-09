@@ -215,6 +215,48 @@ out_f=$(echo "${result}" | sed -n '2p')
 assert_eq "case f: no-timeout fallback still detects a working browser (rc 0)" "0" "${rc_f}"
 assert_eq "case f: no-timeout fallback returns the working browser path" "${WORKING_BROWSER}" "${out_f}"
 
+# ── Case f2: CHROME_PROBE_TIMEOUT reaches the probe budget ─────
+# The probe budget defaults to 2s but must honour CHROME_PROBE_TIMEOUT (a
+# cold container mount can make a healthy browser's first exec slow). A
+# "browser" that answers --version after ~1s passes under the default budget
+# but must be killed under CHROME_PROBE_TIMEOUT=0.2 — if the override never
+# reaches the timeout invocation, the slow probe still succeeds and the
+# second assertion fails. Skipped when no timeout/gtimeout is on PATH (the
+# bare-probe fallback has no budget to override; case f covers that path).
+if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+    SLOW_BROWSER="${FIXTURE_DIR}/bin/slow-chrome"
+    cat > "${SLOW_BROWSER}" <<'EOF'
+#!/bin/bash
+sleep 1
+echo "Fake Slow Chrome 999.0.0.0"
+exit 0
+EOF
+    chmod +x "${SLOW_BROWSER}"
+
+    probe_slow_browser() {
+        (
+            # shellcheck source=setup-live-targets.sh disable=SC1091
+            source "${SETUP_SCRIPT}"
+            set +e
+            chrome_runnable "${SLOW_BROWSER}"
+            printf '%s\n' "$?"
+        )
+    }
+
+    assert_eq "case f2: slow browser passes under the default 2s budget" \
+        "0" "$(probe_slow_browser)"
+    rc_f2=$(CHROME_PROBE_TIMEOUT=0.2 probe_slow_browser)
+    if [ "${rc_f2}" != "0" ]; then
+        echo "PASS: case f2: CHROME_PROBE_TIMEOUT=0.2 kills the slow probe (rc ${rc_f2})"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: case f2: CHROME_PROBE_TIMEOUT=0.2 was ignored — slow probe still passed"
+        fail_count=$((fail_count + 1))
+    fi
+else
+    echo "SKIP: case f2: no timeout/gtimeout on PATH — no probe budget to override"
+fi
+
 # ── Cases g-j: the browser gate is CONDITIONAL (LAB-5064) ───────
 #
 # A hard browser gate on every setup blocked work that provably needs no
