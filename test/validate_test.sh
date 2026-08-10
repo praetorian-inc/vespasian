@@ -38,6 +38,8 @@ THIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${THIS_DIR}/common.sh"
 # shellcheck source=/dev/null
 source "${THIS_DIR}/validate.sh"
+# shellcheck source=/dev/null
+source "${THIS_DIR}/form-spec-asserts.sh"
 
 WORK_DIR="$(mktemp -d)"
 cleanup() { rm -rf "${WORK_DIR}"; }
@@ -800,6 +802,203 @@ assert_reject "total_paths disagrees with len(paths)" "PARITY MISMATCH" \
 
 assert_ok "absent total_paths key is accepted (opt-in guard)" \
     validate_path_coverage "${WORK_DIR}/cov-spec.yaml" "${WORK_DIR}/cov-nokey.json"
+
+# ──────────────────────────────────────────────────────────────
+# POST-form spec asserts — offline regression net (LAB-5611 / TEST-006)
+# ──────────────────────────────────────────────────────────────
+log_header "POST-form spec asserts (assert_post_get_operations / assert_form_body_fields)"
+
+# TEST-006 wired assert_post_get_operations and assert_form_body_fields into the
+# live 'test' job only, which the skip-live-tests label can bypass. Both helpers
+# are ~90 lines of hand-rolled YAML-parsing python; a parser regression that made
+# either silently always-succeed would slip past the ungated net. These offline
+# cases exercise the REAL helpers (sourced from form-spec-asserts.sh, the same
+# code the live runner calls) against hand-crafted spec + expected-paths
+# fixtures, locking their parsing logic outside the label gate.
+
+# --- assert_post_get_operations --------------------------------------------
+# Positive control: a POST-only action (post op present, no get op) passes.
+cat > "${WORK_DIR}/pgo-ok-spec.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: t
+  version: "1.0.0"
+paths:
+  /api/login:
+    post:
+      responses:
+        '200':
+          description: ok
+EOF
+cat > "${WORK_DIR}/pgo-expected.json" <<'EOF'
+{"post_form_paths": ["/api/login"]}
+EOF
+assert_ok "assert_post_get_operations accepts a POST-only action" \
+    assert_post_get_operations "${WORK_DIR}/pgo-ok-spec.yaml" "${WORK_DIR}/pgo-expected.json"
+
+# Reject: a GET operation on a POST-only action (404/confidence-filter regressed).
+cat > "${WORK_DIR}/pgo-get-spec.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: t
+  version: "1.0.0"
+paths:
+  /api/login:
+    get:
+      responses:
+        '200':
+          description: ok
+    post:
+      responses:
+        '200':
+          description: ok
+EOF
+assert_reject "assert_post_get_operations rejects a GET on a POST-only action" \
+    "unexpected GET operation on POST-only action" \
+    assert_post_get_operations "${WORK_DIR}/pgo-get-spec.yaml" "${WORK_DIR}/pgo-expected.json"
+
+# Reject: the POST operation is missing entirely.
+cat > "${WORK_DIR}/pgo-nopost-spec.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: t
+  version: "1.0.0"
+paths:
+  /api/login:
+    put:
+      responses:
+        '200':
+          description: ok
+EOF
+assert_reject "assert_post_get_operations rejects a spec missing the POST operation" \
+    "expected POST operation" \
+    assert_post_get_operations "${WORK_DIR}/pgo-nopost-spec.yaml" "${WORK_DIR}/pgo-expected.json"
+
+# --- assert_form_body_fields -----------------------------------------------
+# Positive control: each form's fields resolve under its OWN distinct schema.
+cat > "${WORK_DIR}/fbf-ok-spec.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: t
+  version: "1.0.0"
+paths:
+  /api/login:
+    post:
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/LoginBody'
+      responses:
+        '200':
+          description: ok
+  /api/register:
+    post:
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/RegisterBody'
+      responses:
+        '200':
+          description: ok
+components:
+  schemas:
+    LoginBody:
+      type: object
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+    RegisterBody:
+      type: object
+      properties:
+        username:
+          type: string
+        email:
+          type: string
+EOF
+cat > "${WORK_DIR}/fbf-ok.json" <<'EOF'
+{"post_form_body_fields_by_path": {"/api/login": ["username", "password"], "/api/register": ["username", "email"]}}
+EOF
+assert_ok "assert_form_body_fields accepts fields under each form's own distinct schema" \
+    assert_form_body_fields "${WORK_DIR}/fbf-ok-spec.yaml" "${WORK_DIR}/fbf-ok.json"
+
+# Reject: a POST body missing an expected field.
+cat > "${WORK_DIR}/fbf-missing-spec.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: t
+  version: "1.0.0"
+paths:
+  /api/login:
+    post:
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/LoginBody'
+      responses:
+        '200':
+          description: ok
+components:
+  schemas:
+    LoginBody:
+      type: object
+      properties:
+        username:
+          type: string
+EOF
+cat > "${WORK_DIR}/fbf-login-only.json" <<'EOF'
+{"post_form_body_fields_by_path": {"/api/login": ["username", "password"]}}
+EOF
+assert_reject "assert_form_body_fields rejects a POST body missing an expected field" \
+    "request-body missing field(s)" \
+    assert_form_body_fields "${WORK_DIR}/fbf-missing-spec.yaml" "${WORK_DIR}/fbf-login-only.json"
+
+# Reject: two forms collapsed onto one shared request-body schema (distinctness guard).
+cat > "${WORK_DIR}/fbf-shared-spec.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: t
+  version: "1.0.0"
+paths:
+  /api/login:
+    post:
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/SharedBody'
+      responses:
+        '200':
+          description: ok
+  /api/register:
+    post:
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/SharedBody'
+      responses:
+        '200':
+          description: ok
+components:
+  schemas:
+    SharedBody:
+      type: object
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+        email:
+          type: string
+EOF
+assert_reject "assert_form_body_fields rejects two forms sharing one request-body schema" \
+    "share request-body schema" \
+    assert_form_body_fields "${WORK_DIR}/fbf-shared-spec.yaml" "${WORK_DIR}/fbf-ok.json"
 
 # ──────────────────────────────────────────────────────────────
 # Summary
