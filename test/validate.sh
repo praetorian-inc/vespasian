@@ -890,12 +890,42 @@ assert_max_pages() {
         log_fail "${label}: page count is not a number: '${page_count}' (capture read failed)"
         return 1
     fi
+    if ! [[ $min_pages =~ ^[0-9]+$ ]]; then
+        log_fail "${label}: floor (min_pages) is not a number: '${min_pages}'"
+        return 1
+    fi
     if [ "$page_count" -gt "$limit" ]; then
         log_fail "${label}: visited ${page_count} page(s) (limit=${limit}) — --max-pages not enforced"
         return 1
     fi
     if [ "$page_count" -lt "$min_pages" ]; then
         log_fail "${label}: visited ${page_count} page(s), expected at least ${min_pages} — under-crawl / crawler not crawling"
+        return 1
+    fi
+    return 0
+}
+
+# assert_exact_path_count checks a generated spec has EXACTLY the expected number
+# of paths — no missing paths (validate_path_coverage's job) and no spurious
+# extras. Extracted from the inline rest-api / scan-rest count checks in
+# run-live-tests.sh (PR #208 review finding TEST-003) so the comparison — and its
+# numeric guards — get offline regression cases under the un-gated
+# validator-regression job, the same way assert_max_pages / assert_within_depth
+# were extracted for PR #187. BOTH counts must be numeric or the assertion
+# hard-fails rather than silently string-comparing a "?" capture-read sentinel.
+# Usage: assert_exact_path_count <label> <actual> <expected>
+assert_exact_path_count() {
+    local label=$1 actual=$2 expected=$3
+    if ! [[ $actual =~ ^[0-9]+$ ]]; then
+        log_fail "${label}: path count is not a number: '${actual}' (capture read failed)"
+        return 1
+    fi
+    if ! [[ $expected =~ ^[0-9]+$ ]]; then
+        log_fail "${label}: expected path count is not a number: '${expected}'"
+        return 1
+    fi
+    if [ "$actual" != "$expected" ]; then
+        log_fail "${label}: spec has ${actual} path(s), expected exactly ${expected}"
         return 1
     fi
     return 0

@@ -417,6 +417,20 @@ fi
 # ──────────────────────────────────────────────────────────────
 log_header "SPEC_VALIDATOR_TIMEOUT"
 
+# Baseline SPEC_VALIDATOR_TIMEOUT BEFORE any wrapper runs, mirroring the
+# SPEC_VALIDATOR_MAX_BYTES baseline above: it is a supported override a CI job or
+# developer may legitimately have exported, so the leak check at the end of this
+# section compares set/unset status + value against THIS baseline (not merely "is
+# it set now?"), telling a real escaped `export` apart from a pre-set caller env
+# (mirrors LAB-3890 TEST-002 for MAX_BYTES).
+if [ -n "${SPEC_VALIDATOR_TIMEOUT+x}" ]; then
+    BASELINE_TIMEOUT_SET=1
+    BASELINE_TIMEOUT_VAL="$SPEC_VALIDATOR_TIMEOUT"
+else
+    BASELINE_TIMEOUT_SET=0
+    BASELINE_TIMEOUT_VAL=
+fi
+
 # SEC-FE-003 (PR #187 review): js-yaml applies no alias-expansion cap, so a
 # YAML anchor bomb makes swagger-parser expand unbounded and — without a
 # wall-clock bound — eventually return 0 for a "valid" spec after burning the
@@ -433,9 +447,18 @@ _test_validator_timeout_openapi() {
     )
 }
 
-# A sub-1 KiB billion-laughs / alias bomb: 9 anchors a–i, each a 9-element list
-# of references to the level below, so a naive walk expands to 9^8 nodes while
-# the file itself stays tiny. Inline in WORK_DIR like every other fixture here.
+# Accept side (TEST-010): a real spec must still validate under an explicit
+# SPEC_VALIDATOR_TIMEOUT override — the bomb reject below only proves the
+# wall-clock bound fires, not that normal specs survive it. Unconditional (not
+# inside the timeout-binary guard): a valid spec validates whether or not a
+# timeout binary is present, exercising _run_spec_validator's non-124 path.
+assert_ok "a real OpenAPI spec still validates under an explicit SPEC_VALIDATOR_TIMEOUT" \
+    _test_validator_timeout_openapi "${THIS_DIR}/rest-api/expected-spec.yaml"
+
+# A sub-1 KiB billion-laughs / alias bomb: 9 anchors a–i — a is a 9-element list
+# of scalars and b–i are each 9-element lists of references to the level below,
+# so the deepest anchor expands to 9^9 nodes while the file itself stays tiny.
+# Inline in WORK_DIR like every other fixture here.
 cat > "${WORK_DIR}/alias-bomb.yaml" <<'EOF'
 openapi: 3.0.3
 info:
@@ -466,7 +489,36 @@ if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; th
         "validator timed out after" \
         _test_validator_timeout_openapi "${WORK_DIR}/alias-bomb.yaml"
 else
-    log_warn "no timeout/gtimeout binary — skipping SPEC_VALIDATOR_TIMEOUT alias-bomb case (cannot bound the validator on this host)"
+    # TEST-012: do not let the skip silently reduce the pass count in CI. The
+    # un-gated validator-regression job runs on ubuntu where /usr/bin/timeout
+    # exists, so CI stays green; a future runner that drops coreutils goes red
+    # instead of quietly dropping this regression case.
+    if [ "${CI:-}" = "true" ]; then
+        log_fail "FAIL (no timeout/gtimeout binary in CI): cannot bound the validator, so the SPEC_VALIDATOR_TIMEOUT alias-bomb regression case did not run"
+        FAIL=$((FAIL + 1))
+    else
+        log_warn "no timeout/gtimeout binary — skipping SPEC_VALIDATOR_TIMEOUT alias-bomb case (cannot bound the validator on this host)"
+    fi
+fi
+
+# The wrappers must leave SPEC_VALIDATOR_TIMEOUT exactly as the caller had it —
+# same set/unset status, and if set the same value. Compare against the baseline
+# captured at the top of this section (not merely "is it set now?"), so a caller
+# that legitimately exported the override is not misreported as a leak; only a
+# value the wrappers themselves changed counts (mirrors the MAX_BYTES leak check).
+if [ -n "${SPEC_VALIDATOR_TIMEOUT+x}" ]; then
+    NOW_TIMEOUT_SET=1
+    NOW_TIMEOUT_VAL="$SPEC_VALIDATOR_TIMEOUT"
+else
+    NOW_TIMEOUT_SET=0
+    NOW_TIMEOUT_VAL=
+fi
+if [ "$NOW_TIMEOUT_SET" = "$BASELINE_TIMEOUT_SET" ] && [ "$NOW_TIMEOUT_VAL" = "$BASELINE_TIMEOUT_VAL" ]; then
+    log_ok "PASS (no env leak): SPEC_VALIDATOR_TIMEOUT matches its pre-test baseline (set=${BASELINE_TIMEOUT_SET})"
+    PASS=$((PASS + 1))
+else
+    log_fail "FAIL (env leak): SPEC_VALIDATOR_TIMEOUT changed across the wrappers — baseline set=${BASELINE_TIMEOUT_SET} val='${BASELINE_TIMEOUT_VAL}', now set=${NOW_TIMEOUT_SET} val='${NOW_TIMEOUT_VAL}'"
+    FAIL=$((FAIL + 1))
 fi
 
 # ──────────────────────────────────────────────────────────────
@@ -594,15 +646,43 @@ assert_reject "unparsable page count ('?')" \
 # crawl. Default floor (min_pages=1) rejects a 0-page capture; an explicit
 # floor rejects a crawl that stopped at the seed.
 assert_reject "empty crawl (0 pages) is rejected by the default floor" \
-    "under-crawl" \
+    "expected at least" \
     assert_max_pages "under-crawl-default" 0 10
 
 assert_reject "one page under an explicit floor of 2 is rejected" \
-    "under-crawl" \
+    "expected at least" \
     assert_max_pages "under-crawl-floor" 1 10 2
 
 assert_ok "at an explicit floor of 2 is accepted" \
     assert_max_pages "at-floor" 2 10 2
+
+# TEST-009: a non-numeric floor must be rejected. Input 5/10/abc: page_count=5
+# passes its own numeric guard, so only the min_pages guard can fire here — "not
+# a number" unambiguously identifies that arm for this input.
+assert_reject "non-numeric floor is rejected" \
+    "not a number" \
+    assert_max_pages "bad-floor" 5 10 abc
+
+# ──────────────────────────────────────────────────────────────
+# assert_exact_path_count
+# ──────────────────────────────────────────────────────────────
+log_header "assert_exact_path_count"
+
+# Locks the exact-count guard extracted from the inline rest-api / scan-rest
+# checks in run-live-tests.sh (TEST-003): equal counts accepted, any mismatch
+# rejected with "expected exactly", and a non-numeric count hard-failed instead
+# of silently string-compared.
+assert_ok "exact path count: equal counts accepted" \
+    assert_exact_path_count "count-equal" 5 5
+assert_reject "exact path count: actual over expected is rejected" \
+    "expected exactly" \
+    assert_exact_path_count "count-over" 6 5
+assert_reject "exact path count: actual under expected is rejected" \
+    "expected exactly" \
+    assert_exact_path_count "count-under" 4 5
+assert_reject "exact path count: non-numeric actual is rejected" \
+    "not a number" \
+    assert_exact_path_count "count-nan" "?" 5
 
 # assert_count <label> <expected> <function> <args...>
 #   -> runs <function> with <args...>, captures its stdout, and compares it
@@ -1051,6 +1131,121 @@ EOF
 assert_reject "assert_form_body_fields rejects a POST operation with no requestBody" \
     "no requestBody" \
     assert_form_body_fields "${WORK_DIR}/fbf-norb-spec.yaml" "${WORK_DIR}/fbf-norb.json"
+
+# ──────────────────────────────────────────────────────────────
+# rest-api fixture parity (cross-file lockstep + per-fixture invariants)
+# ──────────────────────────────────────────────────────────────
+log_header "rest-api fixture parity (cross-file lockstep + per-fixture invariants)"
+
+# Offline enforcement of the rest-api fixtures' lockstep + internal invariants,
+# python3-only (no node, no live services, no Go build). Moved here from
+# test-runner-args.sh, which runs only in the label-gated `test` job, so
+# `skip-live-tests` disabled the old parity check; validate_test.sh runs in the
+# un-gated validator-regression job. TEST-006: the two fixtures declare
+# paths/total_paths/post_form_paths/post_form_body_fields_by_path identical on
+# purpose ("EDIT BOTH FILES") — assert cross-file equality, order-insensitive.
+# TEST-005: per fixture, total_paths == len(paths); post_form_paths non-empty;
+# every post_form_paths entry is a key of paths; every
+# post_form_body_fields_by_path key is in post_form_paths with a non-empty field
+# list. TEST-007: capture stderr too and print a self-describing, fixture-named
+# message. TEST-008: label by os.path.basename, never the absolute argv path.
+#
+# _assert_fixture_parity prints its verdict to stdout and returns 0/1 with NO
+# internal log_ok/log_fail, so the real pair drives assert_ok and the synthetic
+# negative controls drive assert_reject — each increments the counter once.
+_assert_fixture_parity() {
+    # $1 = fixture A path, $2 = fixture B path
+    local out rc=0
+    out=$(python3 - "$1" "$2" 2>&1 <<'PY'
+import sys, json, os
+
+def load(p):
+    with open(p) as f:
+        return json.load(f)
+
+a_path, b_path = sys.argv[1], sys.argv[2]
+a_name, b_name = os.path.basename(a_path), os.path.basename(b_path)
+problems = []
+
+def check_one(name, d):
+    paths = d.get("paths", {})
+    tp = d.get("total_paths")
+    if tp != len(paths):
+        problems.append("%s: total_paths=%r != len(paths)=%d" % (name, tp, len(paths)))
+    pfp = d.get("post_form_paths", [])
+    if not pfp:
+        problems.append("%s: post_form_paths is empty or missing" % name)
+    for p in pfp:
+        if p not in paths:
+            problems.append("%s: post_form_paths entry %r is not a key of paths" % (name, p))
+    bf = d.get("post_form_body_fields_by_path", {})
+    for k, fields in bf.items():
+        if k not in pfp:
+            problems.append("%s: post_form_body_fields_by_path key %r not in post_form_paths" % (name, k))
+        if not fields:
+            problems.append("%s: post_form_body_fields_by_path[%r] field list is empty" % (name, k))
+
+try:
+    a = load(a_path); b = load(b_path)
+except Exception as e:
+    print("fixture parity: could not load fixtures (%s / %s): %s" % (a_name, b_name, e))
+    sys.exit(1)
+
+check_one(a_name, a)
+check_one(b_name, b)
+
+# Cross-file lockstep (order-insensitive on lists).
+def norm(d):
+    return {
+        "paths": sorted((d.get("paths") or {}).keys()),
+        "total_paths": d.get("total_paths"),
+        "post_form_paths": sorted(d.get("post_form_paths") or []),
+        "post_form_body_fields_by_path": {k: sorted(v) for k, v in (d.get("post_form_body_fields_by_path") or {}).items()},
+    }
+if norm(a) != norm(b):
+    problems.append("cross-file lockstep broken between %s and %s (paths/total_paths/post_form_paths/post_form_body_fields_by_path must be identical)" % (a_name, b_name))
+
+if problems:
+    print("fixture parity FAILED: " + "; ".join(problems))
+    sys.exit(1)
+print("fixture parity OK: %s and %s are in lockstep and internally consistent" % (a_name, b_name))
+sys.exit(0)
+PY
+    ) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "fixture parity: ${out:-python3 failed with no output}"
+        return 1
+    fi
+    echo "${out}"
+    return 0
+}
+
+assert_ok "rest-api fixtures are in lockstep and internally consistent" \
+    _assert_fixture_parity "${THIS_DIR}/rest-api/expected-paths.json" "${THIS_DIR}/rest-api/scan-expected-paths.json"
+
+# Negative control 1: cross-file divergence (an extra path in A) is rejected.
+cat > "${WORK_DIR}/parity-a.json" <<'EOF'
+{"paths": {"/api/x": ["GET"], "/api/extra": ["GET"]}, "total_paths": 2,
+ "post_form_paths": ["/api/x"], "post_form_body_fields_by_path": {"/api/x": ["f"]}}
+EOF
+cat > "${WORK_DIR}/parity-b.json" <<'EOF'
+{"paths": {"/api/x": ["GET"]}, "total_paths": 1,
+ "post_form_paths": ["/api/x"], "post_form_body_fields_by_path": {"/api/x": ["f"]}}
+EOF
+assert_reject "fixture parity rejects cross-file path divergence" \
+    "lockstep broken" \
+    _assert_fixture_parity "${WORK_DIR}/parity-a.json" "${WORK_DIR}/parity-b.json"
+
+# Negative control 2: an intra-file invariant violation (a post_form_paths entry
+# that is not a key of paths) is rejected. Same file for both args so the
+# cross-file check passes and the intra-file check is what fires.
+cat > "${WORK_DIR}/parity-bad-a.json" <<'EOF'
+{"paths": {"/api/x": ["GET"]}, "total_paths": 1,
+ "post_form_paths": ["/api/ghost"], "post_form_body_fields_by_path": {"/api/ghost": ["f"]}}
+EOF
+assert_reject "fixture parity rejects a post_form_paths entry absent from paths" \
+    "not a key of paths" \
+    _assert_fixture_parity "${WORK_DIR}/parity-bad-a.json" "${WORK_DIR}/parity-bad-a.json"
 
 # ──────────────────────────────────────────────────────────────
 # Summary

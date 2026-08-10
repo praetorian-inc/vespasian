@@ -503,32 +503,12 @@ else
     fail "load_config: allowed key REST_API_PORT not applied (expected 8990): $allowlist_out"
 fi
 
-echo ""
-echo "=== Fixture total_paths parity (offline) ==="
-
-# total_paths is a hand-maintained duplicate of len(paths) in the rest-api
-# expected-path fixtures (PR #187 review finding TEST-005). validate.sh now
-# self-checks it at every live consumption, but this offline drift-guard fails
-# fast — with no node, no live services, no Go build — the moment the two
-# rest-api fixtures fall out of lockstep. Both fixtures are checked.
-for fixture in "$SCRIPT_DIR/rest-api/expected-paths.json" "$SCRIPT_DIR/rest-api/scan-expected-paths.json"; do
-    parity_out=$(python3 - "$fixture" <<'PY'
-import json, sys
-d = json.load(open(sys.argv[1]))
-t = d.get("total_paths")
-n = len(d["paths"])
-if t != n:
-    print("PARITY MISMATCH in %s: total_paths=%s len(paths)=%d" % (sys.argv[1], t, n))
-    sys.exit(1)
-print("OK %s: total_paths=%d == len(paths)" % (sys.argv[1], t))
-PY
-    ) && parity_rc=0 || parity_rc=$?
-    if [[ "$parity_rc" -eq 0 ]]; then
-        pass "$parity_out"
-    else
-        fail "$parity_out"
-    fi
-done
+# Fixture parity (cross-file lockstep + per-fixture invariants for the rest-api
+# fixtures) moved to test/validate_test.sh so the un-gated validator-regression
+# job enforces it — `skip-live-tests` no longer disables it. This drift guard
+# runs only in the label-gated `test` job, so the parity check lived behind a
+# gate; the richer checks now live in the "rest-api fixture parity" section of
+# validate_test.sh (LAB-5611 / PR #208 review TEST-005/006/007/008).
 
 echo ""
 echo "=== Summary ==="

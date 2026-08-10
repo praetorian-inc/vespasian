@@ -41,7 +41,7 @@ For each target:
 3. **Crawl** — `vespasian crawl <url> --dangerous-allow-private -o capture.json`
 4. **Validate capture** — Check request count and expected URLs
 5. **Generate** — `vespasian generate <type> capture.json -o spec.<ext>`
-6. **Validate spec** — Path/operation coverage, schema structure, no static assets
+6. **Validate spec** — Path/operation coverage, schema structure, no static assets. For `rest-api` and `scan-rest`, this additionally asserts an exact path count (the generated spec has exactly the number of paths the fixture declares — not merely "at least"), that each POST-only form action (`/api/subscribe`) carries a `post` operation and no `get` (`assert_post_get_operations`), and that each urlencoded POST form's input names (`email`, `name`) surface as request-body schema properties under that action's own endpoint (`assert_form_body_fields`) — the same operation- and body-field-level checks documented for `forms-target` below
 7. **Print summary** — Pass/fail status with endpoint counts and durations
 
 > **Why `--dangerous-allow-private`?** All live targets run on `localhost`, which the crawler's SSRF gate treats as a private host. The flag is required on every `vespasian crawl` invocation in this suite; running without it will exit non-zero with `seed URL rejected by frontier ...`. The flag name reflects production-risk semantics — pass it only when you intend to crawl a known-private host (e.g., this suite, or an internal-network assessment).

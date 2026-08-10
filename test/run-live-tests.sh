@@ -424,6 +424,12 @@ test_rest_api() {
     # TEST-006). These are the same helpers forms-target uses; $expected already
     # points at rest-api/expected-paths.json, which now carries post_form_paths
     # and post_form_body_fields_by_path for /api/subscribe.
+    #
+    # GET-absence rationale here differs from forms-target: rest-api/main.go
+    # registers no /api/subscribe handler, so the catch-all mux serves the
+    # crawler's GET probe as 200 text/html (the index page), NOT a 404. The GET
+    # stays out of the spec via non-API/HTML content-type classification, not via
+    # a 404/confidence filter (PR #208 review finding TEST-002).
     if ! assert_post_get_operations "$spec_file" "$expected"; then
         failures=$((failures + 1))
     fi
@@ -449,8 +455,7 @@ test_rest_api() {
     # already does against the same server — a regression that emitted the
     # expected paths plus spurious ones must not report PASS with a mismatched
     # pair of numbers in the summary (PR #187 review finding TEST-004).
-    if [ "$endpoint_count" != "$expected_count" ]; then
-        log_fail "rest-api: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
+    if ! assert_exact_path_count "rest-api" "$endpoint_count" "$expected_count"; then
         failures=$((failures + 1))
     fi
 
@@ -536,6 +541,10 @@ test_scan_rest() {
     # attached to that endpoint, not merely that the path string appears.
     # $expected here points at rest-api/scan-expected-paths.json (kept in
     # lockstep with expected-paths.json).
+    #
+    # As in test_rest_api, GET-absence here is enforced by non-API/HTML
+    # classification — the unrouted /api/subscribe is served 200 text/html by the
+    # catch-all mux, NOT a 404 (PR #208 review finding TEST-002).
     if ! assert_post_get_operations "$spec_file" "$expected"; then
         failures=$((failures + 1))
     fi
@@ -552,8 +561,7 @@ test_scan_rest() {
     # this a scan regression that emitted the expected paths plus spurious ones
     # would report PASS with a mismatched pair of numbers in the summary
     # (PR #187 review finding TEST-002).
-    if [ "$endpoint_count" != "$expected_count" ]; then
-        log_fail "scan-rest: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
+    if ! assert_exact_path_count "scan-rest" "$endpoint_count" "$expected_count"; then
         failures=$((failures + 1))
     fi
 
@@ -3089,11 +3097,17 @@ PYEOF
         # crawler was behaving correctly. pkg/crawl's own
         # TestCrawlerContract_RespectsMaxPages counts pages the same way and
         # passes on both backends (PR #187 / LAB-3890 T3, gap B2).
-        # Floor of 2: the seed /api/many-links plus at least one of its 20
-        # links must be visited, so a crawler that stops at the seed (or
-        # captures nothing) fails instead of silently passing limit=10
-        # (PR #187 review finding TEST-020).
-        if assert_max_pages "Max-pages limit" "$page_count" 10 2; then
+        # Floor == limit (10): --max-pages is exact in BOTH directions here.
+        # pageBudgetReached (pkg/crawl/engine.go) reserves each page slot inside a
+        # single mutex-guarded critical section, so the visited count can never
+        # exceed MaxPages; and the seed /api/many-links carries 20 links (21
+        # reachable pages), so a correct crawler under limit=10 visits exactly 10
+        # — CI has shown "visited 10 page(s) (limit=10)" across runs. A floor
+        # below 10 would let a regression that crawled only a few of the 20 links
+        # still pass; matching the exact upper bound the function already asserts
+        # closes that slack (PR #187 review finding TEST-020, tightened per PR
+        # #208 review finding TEST-004).
+        if assert_max_pages "Max-pages limit" "$page_count" 10 10; then
             log_ok "Max-pages limit: visited ${page_count} page(s) (limit=10)"
         else
             failures=$((failures + 1))

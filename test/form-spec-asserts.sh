@@ -236,10 +236,13 @@ PYEOF
 # assert_post_get_operations verifies, for each POST-only form action, that the
 # generated spec has a POST operation AND no GET operation UNDER THAT EXACT PATH
 # (scoped to the path block, not a whole-file summary grep). The GET-absence half
-# is load-bearing for the "must NOT appear" contract: the crawler's GET probes of
-# the POST form actions 404 and are filtered at the default 0.5 confidence, so a
-# 404/confidence-filter regression would surface as a GET operation on a POST-only
-# action. Reads post_form_paths from expected-paths.json.
+# is load-bearing for the "must NOT appear" contract, but the mechanism that
+# keeps a GET off a POST-only action is target-dependent: on forms-target the
+# crawler's GET probe of the form action 404s and is filtered at the default 0.5
+# confidence; on rest-api/scan-rest the unrouted action is served by the catch-all
+# as 200 text/html and is dropped by non-API/HTML classification instead. Either
+# way a GET operation appearing on a POST-only action is a regression in that
+# filtering path. Reads post_form_paths from expected-paths.json.
 # Usage: assert_post_get_operations <spec.yaml> <expected-paths.json>
 assert_post_get_operations() {
     local spec=$1 expected=$2
@@ -311,7 +314,7 @@ for p in paths:
                          % (p, ", ".join(sorted(ops)) or "none"))
         failures += 1
     if "get" in ops:
-        sys.stderr.write("  detail: %s: unexpected GET operation on POST-only action (404/confidence filter regressed?)\n" % p)
+        sys.stderr.write("  detail: %s: unexpected GET operation on POST-only action (404/confidence or non-API/HTML filter regressed?)\n" % p)
         failures += 1
 
 if failures:
