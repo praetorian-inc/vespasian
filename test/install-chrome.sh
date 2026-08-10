@@ -104,49 +104,65 @@ TEST_ROOT="${VESPASIAN_TEST_ROOT:-}"
 # it looks closed: `.` and `/` are both legal characters, so `/tmp/x/../..`
 # passed every test above and then resolved to `/` — which would prefix nothing
 # at all and point TMP_LIST, the defaults file, and the phone-home removal at
-# the REAL system paths. A symlinked test root reaches the same place. So the
-# value is canonicalized and a resolved `/` is refused outright.
+# the REAL system paths. A symlinked test root reaches the same place.
+#
+# Two later holes of the same shape are closed here too, because "resolves to
+# the real root" has more than one spelling and more than one route:
+#   * `//` is NOT `/`. POSIX leaves a leading double slash implementation-
+#     defined and bash's `pwd -P` preserves it, so a `= "/"` comparison let
+#     `//` through and every derived path became `//etc/...` — the real system.
+#     Both spellings are refused.
+#   * A root that does not EXIST skipped canonicalization entirely, so
+#     `<symlink-to-/>/nope` was never resolved and the guard never ran. The
+#     root must therefore exist; requiring that removes the branch rather than
+#     trying to resolve a path that is not there.
 case "$TEST_ROOT" in
     "") ;;                                  # unset — the production case
     /*) case "$TEST_ROOT" in
             *[!A-Za-z0-9._/-]*)
-                printf '[FAIL] VESPASIAN_TEST_ROOT contains characters outside [A-Za-z0-9._/-]: %s\n' \
-                    "$TEST_ROOT" >&2
+                log_fail "VESPASIAN_TEST_ROOT contains characters outside [A-Za-z0-9._/-]: ${TEST_ROOT}" >&2
                 exit 1
                 ;;
         esac
-        # No `..` component: it is the cheap, string-level half of the check and
-        # it rejects the traversal even when the path does not exist yet, which
-        # the canonicalization below cannot do.
+        # No `..` component: the cheap string-level half, and the only half that
+        # can speak about a path before it is resolved.
         case "/${TEST_ROOT}/" in
             */../*)
-                printf '[FAIL] VESPASIAN_TEST_ROOT must not contain a ".." component: %s\n' \
-                    "$TEST_ROOT" >&2
+                log_fail "VESPASIAN_TEST_ROOT must not contain a \"..\" component: ${TEST_ROOT}" >&2
                 exit 1
                 ;;
         esac
-        # Then resolve symlinks for a root that exists, and refuse "/" however
-        # it was spelled. A test root of / is never legitimate: the seam exists
-        # to confine privileged writes to a fixture tree, and / is the absence
-        # of confinement.
-        if [ -d "$TEST_ROOT" ]; then
-            _resolved=$(cd -P -- "$TEST_ROOT" 2>/dev/null && pwd -P) || _resolved=""
-            if [ -z "$_resolved" ]; then
-                printf '[FAIL] VESPASIAN_TEST_ROOT could not be resolved: %s\n' "$TEST_ROOT" >&2
-                exit 1
-            fi
-            if [ "$_resolved" = "/" ]; then
-                printf '[FAIL] VESPASIAN_TEST_ROOT resolves to / (no confinement): %s\n' "$TEST_ROOT" >&2
-                exit 1
-            fi
-            TEST_ROOT="$_resolved"
-            unset _resolved
+        # Must exist, so canonicalization always runs. A fixture root is created
+        # by the caller before use, so this costs a real caller nothing.
+        if [ ! -d "$TEST_ROOT" ]; then
+            log_fail "VESPASIAN_TEST_ROOT must be an existing directory: ${TEST_ROOT}" >&2
+            exit 1
         fi
+        _resolved=$(cd -P -- "$TEST_ROOT" 2>/dev/null && pwd -P) || _resolved=""
+        if [ -z "$_resolved" ]; then
+            log_fail "VESPASIAN_TEST_ROOT could not be resolved: ${TEST_ROOT}" >&2
+            exit 1
+        fi
+        case "$_resolved" in
+            /|//)
+                log_fail "VESPASIAN_TEST_ROOT resolves to the filesystem root (no confinement): ${TEST_ROOT}" >&2
+                exit 1
+                ;;
+        esac
+        TEST_ROOT="$_resolved"
+        unset _resolved
         ;;
-    *)  printf '[FAIL] VESPASIAN_TEST_ROOT must be an absolute path: %s\n' "$TEST_ROOT" >&2
+    *)  log_fail "VESPASIAN_TEST_ROOT must be an absolute path: ${TEST_ROOT}" >&2
         exit 1
         ;;
 esac
+
+# ARCH is set by main() from resolve_arch and read by install_pinned_key when it
+# writes the apt source line. It is a cross-function global rather than a
+# parameter because it is derived once per run and never varies after; declared
+# here so the coupling is visible at the top of the file instead of only at the
+# two sites that use it.
+ARCH=""
 
 # Temporary apt wiring, removed by cleanup_apt_wiring on every exit path.
 TMP_LIST="${TEST_ROOT}/etc/apt/sources.list.d/google-chrome-vespasian-temp.list"

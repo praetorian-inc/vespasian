@@ -6,16 +6,24 @@
 # means main() does not run), then exercise the pure helpers.
 #
 # Covered: argument handling (a-c), architecture resolution (d), the pinned
-# signing-key trust anchor (e-f), the defaults-file symlink guard and its
-# rewrite branches (g), and container detection for the apt-cache wipe (h).
-# Cases f and g are the behavioural tests for the two security controls: both
-# fail if their check is removed, which case e alone does not.
+# signing-key trust anchor including its success path from a committed fixture
+# (e-f, j-j2), the defaults-file symlink guard and its rewrite branches (g, q),
+# container detection for the apt-cache wipe (h), the phone-home removal and
+# verification chain on both the container and non-container arms (n, o, o2),
+# cleanup_all's failed-install arm (u), VESPASIAN_TEST_ROOT containment (t),
+# the log helpers' escape hardening (s), and the browser-present-without-
+# curl/gpg path (r). Each of those is behavioural: it fails if its check is
+# removed, which an assertion on the message alone does not.
 #
-# DELIBERATELY UNTESTED: the actual download, `apt-get install`, and the
-# system-wide mutations that follow a successful key verification. Those need
-# root, network, and destructive changes to system state, so exercising them in
-# CI would cost more than it proves. Every rejection path IS reachable
-# unprivileged, because each one returns before the first $SUDO.
+# NOT COVERED HERE: the actual download, `apt-get install`, and the system-wide
+# mutations that follow a successful key verification. Those need root, network,
+# and destructive changes to system state, so this suite stops before the first
+# $SUDO — every rejection path returns before it. That region is covered instead
+# by the `install-chrome-e2e` CI job, which runs the installer end-to-end as
+# root in a disposable container.
+#
+# This suite needs NO network: the Google key it verifies against is the
+# committed fixture test/fixtures/google-linux-signing-key.asc.
 #
 # Usage: bash test/install-chrome-selftest.sh
 
@@ -950,6 +958,11 @@ set +e
 out_r=$(
     PATH="${root_r}/bin"
     export PATH
+    # REMOTE_CONTAINERS is pinned empty: without it this case exercises the
+    # container arm on a devcontainer and the non-container arm on CI, so the
+    # two environments silently test different code — exactly the dependence
+    # that made case o fail on a GitHub runner.
+    unset REMOTE_CONTAINERS
     VESPASIAN_TEST_ROOT="${root_r}" \
     bash "${SCRIPT_DIR}/install-chrome.sh" 2>&1
 )
@@ -1012,34 +1025,39 @@ fi
 
 # ── Case t: VESPASIAN_TEST_ROOT containment ────────────────────
 # The seam prefixes every system path this script writes, so a value that
-# RESOLVES to / removes the confinement it exists to provide. The charset check
-# does not catch that: `.` and `/` are both legal, so `/tmp/x/../..` passed it
-# and then resolved to /, pointing the defaults-file rewrite and the phone-home
-# removal at the real system. A symlinked root reaches the same place.
+# RESOLVES to the real root removes the confinement it exists to provide.
+# Each row pins WHICH guard fired, not merely that something did: asserting the
+# shared token "VESPASIAN_TEST_ROOT" would let the charset guard take credit for
+# rejecting a traversal, leaving the traversal guard itself unproven.
 t_root="${FIXTURE_DIR}/root-t"
 mkdir -p "${t_root}"
 ln -sfn / "${FIXTURE_DIR}/root-symlink-to-slash"
 
-# Each of these must be REFUSED before the script does anything else.
-for bad_root in \
-    "${t_root}/../.." \
-    "/tmp/../.." \
-    "${FIXTURE_DIR}/root-symlink-to-slash" \
-    "/" \
-    "relative/path" \
-    "/tmp/has space" ; do
+# bad_root <TAB> expected-substring of the refusal
+while IFS=$'\t' read -r bad_root want; do
+    [ -n "${bad_root}" ] || continue
     set +e
     out_t=$(VESPASIAN_TEST_ROOT="${bad_root}" bash "${INSTALL_SCRIPT}" --help 2>&1)
     rc_t=$?
     set -e
-    if [ "${rc_t}" -ne 0 ] && printf '%s' "${out_t}" | grep -qF "VESPASIAN_TEST_ROOT"; then
-        echo "PASS: case t: refuses VESPASIAN_TEST_ROOT='${bad_root}'"
+    if [ "${rc_t}" -ne 0 ] && printf '%s' "${out_t}" | grep -qF -- "${want}"; then
+        echo "PASS: case t: refuses '${bad_root}' via the expected guard (${want})"
         pass_count=$((pass_count + 1))
     else
-        echo "FAIL: case t: accepted VESPASIAN_TEST_ROOT='${bad_root}' (rc ${rc_t})"
+        echo "FAIL: case t: '${bad_root}' rc=${rc_t}, expected refusal containing [${want}], got: $(printf '%s' "${out_t}" | tail -1)"
         fail_count=$((fail_count + 1))
     fi
-done
+done <<EOF
+${t_root}/../..	must not contain a ".." component
+/tmp/../..	must not contain a ".." component
+${FIXTURE_DIR}/root-symlink-to-slash	resolves to the filesystem root
+/	resolves to the filesystem root
+//	resolves to the filesystem root
+${FIXTURE_DIR}/root-symlink-to-slash/nonexistent	must be an existing directory
+${FIXTURE_DIR}/definitely-not-created	must be an existing directory
+relative/path	must be an absolute path
+/tmp/has space	characters outside
+EOF
 
 # ...and a legitimate fixture root must still be accepted, or the guard has
 # simply broken the seam every other case depends on.
@@ -1048,6 +1066,66 @@ out_t_ok=$(VESPASIAN_TEST_ROOT="${t_root}" bash "${INSTALL_SCRIPT}" --help 2>&1)
 rc_t_ok=$?
 set -e
 assert_eq "case t: a normal fixture root is still accepted" "0" "${rc_t_ok}"
+# A trailing slash is a normal spelling and must not be refused.
+set +e
+out_t_sl=$(VESPASIAN_TEST_ROOT="${t_root}/" bash "${INSTALL_SCRIPT}" --help 2>&1)
+rc_t_sl=$?
+set -e
+assert_eq "case t: a fixture root with a trailing slash is accepted" "0" "${rc_t_sl}"
+
+# ── Case u: cleanup_all removes phone-home after a FAILED install ─
+# The EXIT trap is the only thing that clears the package's artifacts when an
+# install dies after dpkg ran the postinst — the one window in which a failed
+# run ADDS standing egress. It is gated on INSTALL_ATTEMPTED, so both arms need
+# pinning: set, it must clean; unset, it must not touch a thing.
+root_u="${FIXTURE_DIR}/root-u"
+mkdir -p "${root_u}/etc/apt/sources.list.d" "${root_u}/etc/cron.daily" "${root_u}/usr/share/keyrings"
+plant_u() {
+    printf 'deb x\n' > "${root_u}/etc/apt/sources.list.d/google-chrome.list"
+    printf 'deb x\n' > "${root_u}/etc/apt/sources.list.d/google-chrome.sources"
+    : > "${root_u}/etc/cron.daily/google-chrome"
+    : > "${root_u}/usr/share/keyrings/google-chrome.gpg"
+}
+
+plant_u
+(
+    VESPASIAN_TEST_ROOT="${root_u}"
+    export VESPASIAN_TEST_ROOT
+    # shellcheck source=install-chrome.sh disable=SC1091
+    source "${INSTALL_SCRIPT}"
+    SUDO=""
+    SCRATCH_DIR="${FIXTURE_DIR}/scratch-u"; mkdir -p "$SCRATCH_DIR"
+    INSTALL_ATTEMPTED=1
+    cleanup_all
+) >/dev/null 2>&1
+left_u=0
+for f in "${root_u}/etc/apt/sources.list.d/google-chrome.list" \
+         "${root_u}/etc/apt/sources.list.d/google-chrome.sources" \
+         "${root_u}/etc/cron.daily/google-chrome" \
+         "${root_u}/usr/share/keyrings/google-chrome.gpg"; do
+    [ -e "$f" ] && left_u=1
+done
+assert_eq "case u: a failed install (INSTALL_ATTEMPTED=1) has its phone-home artifacts cleaned" \
+    "0" "${left_u}"
+
+plant_u
+(
+    VESPASIAN_TEST_ROOT="${root_u}"
+    export VESPASIAN_TEST_ROOT
+    # shellcheck source=install-chrome.sh disable=SC1091
+    source "${INSTALL_SCRIPT}"
+    SUDO=""
+    SCRATCH_DIR="${FIXTURE_DIR}/scratch-u2"; mkdir -p "$SCRATCH_DIR"
+    INSTALL_ATTEMPTED=0
+    cleanup_all
+) >/dev/null 2>&1
+kept_u=1
+for f in "${root_u}/etc/apt/sources.list.d/google-chrome.list" \
+         "${root_u}/etc/cron.daily/google-chrome"; do
+    [ -e "$f" ] || kept_u=0
+done
+assert_eq "case u: a run that never installed (INSTALL_ATTEMPTED=0) touches nothing" \
+    "1" "${kept_u}"
 
 # ── Case s: log helpers must not interpret escapes in DATA ─────
 # log_* render externally-derived strings (gpg stderr, browser paths, apt
@@ -1094,8 +1172,8 @@ echo "install-chrome-selftest: ${pass_count} passed, ${fail_count} failed, ${ski
 # Failing on any skip converts that into a visible CI failure.
 if [ "${skip_count}" -ne 0 ]; then
     echo "install-chrome-selftest: FAIL — ${skip_count} case(s) skipped; skips are coverage holes here."
-    echo "  (cases j/j2 need dl.google.com; if this runner has no egress, that must be fixed"
-    echo "   or the key committed as a fixture — not silently skipped.)"
+    echo "  (cases j/j2 read test/fixtures/google-linux-signing-key.asc; if that fixture is"
+    echo "   missing or empty the trust anchor's success path is untested — fix it, do not skip.)"
     exit 1
 fi
 [ "${fail_count}" -eq 0 ]

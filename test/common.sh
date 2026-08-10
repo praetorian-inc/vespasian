@@ -73,17 +73,33 @@ CHROME_CANDIDATES=(
 # decimal falls back to the default with a warning.
 chrome_runnable() {
     local t="" budget="${CHROME_PROBE_TIMEOUT:-2}"
-    # 0 is rejected along with the malformed values: GNU timeout treats a
-    # duration of 0 as "no timeout at all", so a zero budget silently disables
-    # the very guard this function exists to provide — a hanging browser would
-    # then block preflight forever instead of being reported as not runnable.
+    # Two rejections, and they are separate questions:
+    #   * not a plain decimal  -> timeout(1) would exit 125 without running the
+    #     browser, which the caller reads as "not runnable" — the LAB-3893
+    #     false positive this override exists to cure.
+    #   * numerically zero     -> GNU timeout reads 0 as "no timeout at all",
+    #     silently disabling the guard; a hanging browser would then block
+    #     preflight forever.
+    # Zero is tested by stripping the zeros and dots and asking whether anything
+    # is left, rather than by globbing. A glob for zero over-rejected every
+    # leading-zero duration that is NOT zero — `007`, `00.1`, `0.05` are all
+    # perfectly good budgets and were being thrown away.
+    _stripped=${budget//[0.]/}
     case "$budget" in
-        ''|*[!0-9.]*|*.*.*|.|0|0.|0.0*|.0*|00*)
+        ''|*[!0-9.]*|*.*.*|.)
             printf 'CHROME_PROBE_TIMEOUT=%s is not a usable timeout (positive seconds); using 2s.\n' \
                 "$budget" >&2
             budget=2
             ;;
+        *)  if [ -z "${_stripped}" ]; then
+                # Nothing but zeros and dots remain -> numerically zero.
+                printf 'CHROME_PROBE_TIMEOUT=%s is zero, which disables the timeout; using 2s.\n' \
+                    "$budget" >&2
+                budget=2
+            fi
+            ;;
     esac
+    unset _stripped
     if command -v timeout >/dev/null 2>&1; then
         t=timeout
     elif command -v gtimeout >/dev/null 2>&1; then   # macOS + coreutils

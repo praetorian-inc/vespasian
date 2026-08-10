@@ -47,9 +47,11 @@ export VESPASIAN_NO_SANDBOX=true  # containers generally cannot use the Chrome s
 > devcontainer needs to call the script at build or create time:
 >
 > ```dockerfile
-> # Dockerfile layer
-> COPY test/install-chrome.sh /tmp/install-chrome.sh
-> RUN /tmp/install-chrome.sh && rm /tmp/install-chrome.sh
+> # Dockerfile layer. Both files are copied into the SAME directory: the
+> # installer sources common.sh from its own dirname, so copying it alone
+> # fails at `source` with "No such file or directory".
+> COPY test/install-chrome.sh test/common.sh /tmp/vespasian-chrome/
+> RUN /tmp/vespasian-chrome/install-chrome.sh && rm -rf /tmp/vespasian-chrome
 > ```
 >
 > ```jsonc
