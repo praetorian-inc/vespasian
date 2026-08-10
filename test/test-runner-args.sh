@@ -722,14 +722,49 @@ else
         else
             pass "un-gated job has no continue-on-error: true"
         fi
-        # The job's own `if:` is not in scope here (the job is deliberately
-        # un-gated and has none); this looks for a STEP-level `if:`, which is
-        # indented deeper than the `- name:` it belongs to.
-        if printf '%s\n' "$runlines" | grep -qE '^[[:space:]]{8,}if:'; then
-            fail "un-gated job has a step-level if: — a guard step can be silently skipped"
+        # ANY `if:` inside this job block is a finding, at any indentation.
+        #
+        # The first version anchored on `^[[:space:]]{8,}if:` to distinguish a
+        # step-level `if:` from a job-level one. That encoded the file's CURRENT
+        # indentation (steps items at 6, keys at 8) into a security guard, and
+        # YAML permits the sequence at the parent key's indent instead (items at
+        # 4, keys at 6) — a reformat nobody would think twice about silently
+        # disarmed it. Mutation-proven.
+        #
+        # Dropping the depth distinction is safe BECAUSE of what this block is:
+        # extraction starts after the `preflight-selftest:` line, so the job's
+        # own key/value lines are inside it, and this job is deliberately
+        # un-gated. It has no `if:` of any kind today, and if someone adds one —
+        # at either level — that is exactly the change this guard should refuse
+        # to let through unnoticed.
+        if printf '%s\n' "$runlines" | grep -qE '^[[:space:]]*if:'; then
+            fail "un-gated job contains an if: condition — a guard can be silently skipped"
         else
-            pass "un-gated job has no step-level if: conditions"
+            pass "un-gated job has no if: conditions at any level"
         fi
+    fi
+fi
+
+# install-chrome-e2e is the sole automated coverage of the installer's
+# privileged region (download, signature-verified apt install, trap teardown,
+# AC4 cleanup). Deleting the job would remove that coverage with every other
+# check in the repo still green — the same silent-loss shape this file exists
+# to prevent, one level up.
+if [[ -f "$WORKFLOW" ]]; then
+    if grep -qE '^  install-chrome-e2e:' "$WORKFLOW"; then
+        pass "install-chrome-e2e job still defined (privileged-path coverage present)"
+        e2e_block=$(awk '
+            /^  install-chrome-e2e:/ { inblock=1; next }
+            inblock && /^  [a-zA-Z_-]+:/ { inblock=0 }
+            inblock { print }
+        ' "$WORKFLOW")
+        if printf '%s\n' "$e2e_block" | grep -qE 'run:[[:space:]]*(\./|bash )?test/install-chrome\.sh'; then
+            pass "install-chrome-e2e still invokes test/install-chrome.sh end-to-end"
+        else
+            fail "install-chrome-e2e no longer runs test/install-chrome.sh — the privileged path is uncovered"
+        fi
+    else
+        fail "install-chrome-e2e job is gone — the installer's privileged path has no coverage at all"
     fi
 fi
 

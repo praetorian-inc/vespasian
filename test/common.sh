@@ -16,11 +16,17 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+# %b for the colour constants, %s for the caller's text — same split as the
+# log_* helpers below, and for the same reason: `echo -e` interpreted escapes
+# in the MESSAGE, so any interpolated value could forge output or drive the
+# terminal. Hardening four of five helpers and leaving this one is the kind of
+# gap that reads as covered.
 log_header() {
-    echo ""
-    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${BLUE}  $1${NC}"
-    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════${NC}"
+    local bar="════════════════════════════════════════════════════════════════"
+    printf '\n'
+    printf '%b%b%s%b\n' "$BOLD" "$BLUE" "$bar" "$NC"
+    printf '%b%b  %s%b\n' "$BOLD" "$BLUE" "$1" "$NC"
+    printf '%b%b%s%b\n' "$BOLD" "$BLUE" "$bar" "$NC"
 }
 
 # %b for the colour constants (they carry real escapes), %s for the MESSAGE.
@@ -72,7 +78,7 @@ CHROME_CANDIDATES=(
 # be parsed as a flag rather than a duration. Anything that is not a bare
 # decimal falls back to the default with a warning.
 chrome_runnable() {
-    local t="" budget="${CHROME_PROBE_TIMEOUT:-2}"
+    local t="" budget="${CHROME_PROBE_TIMEOUT:-2}" stripped
     # Two rejections, and they are separate questions:
     #   * not a plain decimal  -> timeout(1) would exit 125 without running the
     #     browser, which the caller reads as "not runnable" — the LAB-3893
@@ -84,14 +90,14 @@ chrome_runnable() {
     # is left, rather than by globbing. A glob for zero over-rejected every
     # leading-zero duration that is NOT zero — `007`, `00.1`, `0.05` are all
     # perfectly good budgets and were being thrown away.
-    _stripped=${budget//[0.]/}
+    stripped=${budget//[0.]/}
     case "$budget" in
         ''|*[!0-9.]*|*.*.*|.)
             printf 'CHROME_PROBE_TIMEOUT=%s is not a usable timeout (positive seconds); using 2s.\n' \
                 "$budget" >&2
             budget=2
             ;;
-        *)  if [ -z "${_stripped}" ]; then
+        *)  if [ -z "${stripped}" ]; then
                 # Nothing but zeros and dots remain -> numerically zero.
                 printf 'CHROME_PROBE_TIMEOUT=%s is zero, which disables the timeout; using 2s.\n' \
                     "$budget" >&2
@@ -99,7 +105,6 @@ chrome_runnable() {
             fi
             ;;
     esac
-    unset _stripped
     if command -v timeout >/dev/null 2>&1; then
         t=timeout
     elif command -v gtimeout >/dev/null 2>&1; then   # macOS + coreutils

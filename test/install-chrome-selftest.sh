@@ -35,6 +35,10 @@ INSTALL_SCRIPT="${SCRIPT_DIR}/install-chrome.sh"
 pass_count=0
 fail_count=0
 skip_count=0
+# Skips that represent a real coverage hole rather than an unsuitable
+# environment. Only the trust-anchor success path qualifies; see the policy at
+# the end of this file.
+trust_anchor_skips=0
 
 # A check that could not run is NOT a pass. Tallied separately so the summary
 # distinguishes "verified" from "unverifiable here", following the
@@ -523,7 +527,10 @@ EOF
         pass_count=$((pass_count + 1))
     fi
 else
-    skip "case j: apt-wiring assertions (could not fetch Google's key — no network)"
+    # Counted separately: this is the trust anchor's ONLY success-path coverage,
+    # so skipping it is a coverage hole rather than an unsuitable environment.
+    skip "case j/j2: trust-anchor success path (fixture test/fixtures/google-linux-signing-key.asc missing or empty)"
+    trust_anchor_skips=$((trust_anchor_skips + 1))
 fi
 
 # ── Case k: suppress_permanent_repo's append branch ─────────────
@@ -1036,6 +1043,15 @@ ln -sfn / "${FIXTURE_DIR}/root-symlink-to-slash"
 # bad_root <TAB> expected-substring of the refusal
 while IFS=$'\t' read -r bad_root want; do
     [ -n "${bad_root}" ] || continue
+    # An empty `want` means the row lost its tab (an editor converting tabs to
+    # spaces is the realistic way), and `grep -qF -- ""` matches ANY output — so
+    # the row would silently degrade from "the right guard fired" to "something
+    # fired". Refuse the row instead of letting it pass vacuously.
+    if [ -z "${want}" ]; then
+        echo "FAIL: case t: table row for '${bad_root}' has no expected-message column (tab lost?)"
+        fail_count=$((fail_count + 1))
+        continue
+    fi
     set +e
     out_t=$(VESPASIAN_TEST_ROOT="${bad_root}" bash "${INSTALL_SCRIPT}" --help 2>&1)
     rc_t=$?
@@ -1170,10 +1186,20 @@ echo "install-chrome-selftest: ${pass_count} passed, ${fail_count} failed, ${ski
 # cannot be fetched — so an egress change (or a proxy, or an offline runner)
 # could silently disarm the pin's positive coverage while the suite stayed green.
 # Failing on any skip converts that into a visible CI failure.
-if [ "${skip_count}" -ne 0 ]; then
-    echo "install-chrome-selftest: FAIL — ${skip_count} case(s) skipped; skips are coverage holes here."
+# Only j/j2 skipping is a coverage hole worth failing on: they are the sole
+# assertions covering the trust anchor's SUCCESS path. Cases a2 (needs a git
+# checkout) and l (cannot run as root) skip for environmental reasons that are
+# legitimate — a tarball export, or CI running as root — and failing the whole
+# suite for those turns a valid environment into a red build. The counter is
+# scoped so the policy means what it says.
+if [ "${trust_anchor_skips}" -ne 0 ]; then
+    echo "install-chrome-selftest: FAIL — the trust-anchor success path (j/j2) was skipped; that is a coverage hole."
     echo "  (cases j/j2 read test/fixtures/google-linux-signing-key.asc; if that fixture is"
     echo "   missing or empty the trust anchor's success path is untested — fix it, do not skip.)"
     exit 1
+fi
+if [ "${skip_count}" -ne 0 ]; then
+    echo "install-chrome-selftest: NOTE — ${skip_count} case(s) skipped for environmental reasons"
+    echo "  (a2 needs a git checkout; l cannot run as root). Not a failure, but not coverage either."
 fi
 [ "${fail_count}" -eq 0 ]

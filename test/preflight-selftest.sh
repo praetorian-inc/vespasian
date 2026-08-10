@@ -300,7 +300,7 @@ EOF
     # Boundary spellings matter here: an earlier zero-glob rejected 007, 00.1 and
 # 0.05 — all perfectly good budgets — while a plain `0` slipped through some
 # variants. Both directions are pinned: these must all still DETECT the browser.
-for bad in "abc" "-1" "2s" "1.2.3" "0" "00" "0.0" "0." ""; do
+for bad in "abc" "-1" "2s" "1.2.3" "0" "00" "0.0" "0." "000.000" ".0" ""; do
         rc_f3=$(CHROME_PROBE_TIMEOUT="${bad}" probe_working_browser)
         assert_eq "case f3: CHROME_PROBE_TIMEOUT='${bad}' still detects a working browser" \
             "0" "${rc_f3}"
@@ -323,10 +323,16 @@ for bad in "abc" "-1" "2s" "1.2.3" "0" "00" "0.0" "0." ""; do
     # rejected them or not. Asserting the warning proves they were rejected HERE.
     assert_contains_f3 "case f3: a suffixed budget ('2s') is rejected by validation, not passed through" \
         "CHROME_PROBE_TIMEOUT=2s" "$(CHROME_PROBE_TIMEOUT=2s warn_of)"
-    assert_contains_f3 "case f3: a zero budget is rejected (0 would disable the timeout)" \
-        "is zero" "$(CHROME_PROBE_TIMEOUT=0 warn_of)"
-    assert_contains_f3 "case f3: '0.0' is recognised as zero too" \
-        "is zero" "$(CHROME_PROBE_TIMEOUT=0.0 warn_of)"
+    # Every zero spelling gets its own WARNING assertion, not just an rc check.
+    # The rc-based loop above is vacuous for these: rc 0 holds whether the value
+    # was rejected (budget falls back to 2) or passed straight through (GNU
+    # timeout reads `00` as 0 = no timeout, and the fake browser answers
+    # instantly either way). Mutation-proven — narrowing the validation to a
+    # literal `0` left the `00` and `0.` rows green.
+    for zero in "0" "00" "0." "0.0" "000.000" ".0"; do
+        assert_contains_f3 "case f3: '${zero}' is recognised as a zero budget and refused" \
+            "is zero" "$(CHROME_PROBE_TIMEOUT="${zero}" warn_of)"
+    done
     # ...and the converse: leading-zero durations that are NOT zero must be
     # accepted silently. Rejecting them was a real over-reach in an earlier glob.
     for good in "007" "00.1" "0.05" ".5" "2.50"; do
