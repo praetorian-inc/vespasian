@@ -150,13 +150,15 @@ See `test/README.md` for how to run the suite, including the `TEST_HOST` overrid
 GitHub Actions runs on push to main and PRs:
 
 - **ci.yml**: Build, test (`go test -race`, 80% coverage threshold), lint (golangci-lint v2), and format check. Runs on all pushes and PRs.
-- **live-tests.yml**: four jobs — two un-gated guard jobs, a label gate, and the full suite.
+- **live-tests.yml**: five jobs — two un-gated guard jobs, an opt-in end-to-end installer job, a label gate, and the full suite.
 
   **`preflight-selftest`** (un-gated) is the shell regression net. It runs a `bash -n` syntax check and then all four guard suites: `test/preflight-selftest.sh` (Chrome/Chromium detection, LAB-3893), `test/install-chrome-selftest.sh` (the installer's non-privileged surface), `test/setup-live-targets_test.sh` (teardown / orphan-PID hardening, LAB-2893), and `test/test-runner-args.sh` (target-group vs dispatch drift, the un-gated job's own step list, and browser-target classification). None need Go, Node, or Chrome. `test-runner-args.sh` fails CI if a dispatch target is not covered by `OFFLINE_TARGETS`, `LIVE_TARGETS`, or the config-only set (e.g. `grpc-server`), if this job stops invoking one of the four suites, or if a target in `ALL_TARGETS` is classified neither browser nor non-browser.
 
   **`validator-regression`** (un-gated) does its own `npm ci --ignore-scripts` in `test/spec-validators` and runs `./test/validate_test.sh` to prove the spec validators still reject malformed specs.
 
   Both guard jobs sit deliberately **outside** the label gate, so `skip-live-tests` cannot switch off the regression net. Both have ~5-minute timeouts.
+
+  **`install-chrome-e2e`** exercises the installer's PRIVILEGED path — the download, the signature-verified apt install, the trap teardown, and the AC4 cleanup that runs after the package's postinst. It is opt-in (`workflow_dispatch`, plus every push to `main`) rather than per-PR, because it needs root, real egress to Google, and it mutates system state; it runs as root in a disposable digest-pinned `ubuntu:24.04` container, so those mutations are thrown away. It asserts a runnable browser, absent phone-home artifacts, a version record, and an idempotent second run. `install-chrome-selftest.sh` covers every rejection arm unprivileged but stops before the first `$SUDO`, so without this job that region had no automated coverage at all.
 
   **`check-label`** decides whether the full suite runs: every PR by default, skipped when the `skip-live-tests` label is present; push to `main` and `workflow_dispatch` always run.
 

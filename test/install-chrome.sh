@@ -182,9 +182,11 @@ parse_args() {
                 exit 0
                 ;;
             *)
-                # printf, not log_fail: $arg is caller-supplied and log_fail
-                # runs `echo -e`, which would interpret \e sequences the caller
-                # embedded and hand them control of the terminal.
+                # printf, not log_fail, keeps this usage error independent of the
+                # log helpers entirely. (log_fail is printf-based now and would
+                # also be safe; it was `echo -e` when this branch was written,
+                # which would have interpreted \e sequences in caller-supplied
+                # $arg and handed them control of the terminal.)
                 printf 'Unknown option: %s (try --help)\n' "$arg" >&2
                 exit 1
                 ;;
@@ -563,9 +565,17 @@ verify_install() {
     # Staged then `install -m 0644`, matching how the keyring is written: the mode
     # is stated at the call site instead of being left to the caller's umask, and
     # the file lands atomically. `tee` did neither.
+    #
+    # Only when this run actually installed something. On the browser-already-
+    # present early exit the script promises to touch nothing it does not own,
+    # and a root-owned write into /usr/share is exactly such a touch — it also
+    # overwrote the record of the build a PREVIOUS run installed with whatever
+    # the ambient browser happens to report.
     local staged_version="${SCRATCH_DIR}/chrome-version"
-    printf '%s\n' "$version" > "$staged_version"
-    if $SUDO install -d -- "$(dirname -- "$CHROME_VERSION_RECORD")" 2>/dev/null &&
+    if [ "$INSTALL_ATTEMPTED" -ne 1 ]; then
+        log_info "Not recording a version (no install performed this run)."
+    elif printf '%s\n' "$version" > "$staged_version" &&
+       $SUDO install -d -- "$(dirname -- "$CHROME_VERSION_RECORD")" 2>/dev/null &&
        $SUDO install -m 0644 -- "$staged_version" "$CHROME_VERSION_RECORD"; then
         log_info "Recorded build in ${CHROME_VERSION_RECORD}"
     else
@@ -574,14 +584,36 @@ verify_install() {
         log_warn "Could not write the version record to ${CHROME_VERSION_RECORD}"
     fi
 
+    # This script's OWN temporary artifacts are always fatal if they survive:
+    # they exist only because this run created them, so one left behind is a
+    # teardown bug and a standing trusted apt source.
     local leftover
-    for leftover in "${PHONE_HOME_PATHS[@]}" "$TMP_LIST" "$TMP_KEYRING"; do
+    for leftover in "$TMP_LIST" "$TMP_KEYRING"; do
         if [ -e "$leftover" ]; then
-            log_fail "Phone-home / temporary artifact still present: ${leftover}"
+            log_fail "Temporary apt artifact still present: ${leftover}"
             exit 1
         fi
     done
-    log_ok "No Google apt source, keyring, or update pinger left behind"
+
+    # The PACKAGE's phone-home artifacts are only fatal where we undertook to
+    # remove them, which is the same condition that governs the removal itself.
+    # Checking them unconditionally contradicted the in_container() gate: on a
+    # developer's machine the script would announce "leaving the google-chrome
+    # apt source and updater alone" and then exit 1 for finding exactly the
+    # thing it had just said it would leave — turning a normal Chrome install
+    # into a hard failure. The check and the removal have to share one predicate.
+    if in_container; then
+        for leftover in "${PHONE_HOME_PATHS[@]}"; do
+            if [ -e "$leftover" ]; then
+                log_fail "Phone-home artifact still present: ${leftover}"
+                exit 1
+            fi
+        done
+        log_ok "No Google apt source, keyring, or update pinger left behind"
+    else
+        log_ok "No temporary apt artifacts left behind"
+        log_info "Package-owned apt source / updater not audited (not a container)."
+    fi
 
     log_info "Containers usually need a sandbox opt-out: export VESPASIAN_NO_SANDBOX=true"
 }

@@ -73,9 +73,13 @@ CHROME_CANDIDATES=(
 # decimal falls back to the default with a warning.
 chrome_runnable() {
     local t="" budget="${CHROME_PROBE_TIMEOUT:-2}"
+    # 0 is rejected along with the malformed values: GNU timeout treats a
+    # duration of 0 as "no timeout at all", so a zero budget silently disables
+    # the very guard this function exists to provide — a hanging browser would
+    # then block preflight forever instead of being reported as not runnable.
     case "$budget" in
-        ''|*[!0-9.]*|*.*.*|.)
-            printf 'CHROME_PROBE_TIMEOUT=%s is not a number (seconds); using 2s.\n' \
+        ''|*[!0-9.]*|*.*.*|.|0|0.|0.0*|.0*|00*)
+            printf 'CHROME_PROBE_TIMEOUT=%s is not a usable timeout (positive seconds); using 2s.\n' \
                 "$budget" >&2
             budget=2
             ;;

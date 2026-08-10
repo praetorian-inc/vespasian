@@ -3958,8 +3958,10 @@ print_summary() {
     done
 
     echo ""
-    echo -e "  Total: ${GREEN}${total_pass} passed${NC}, ${RED}${total_fail} failed${NC}, ${YELLOW}${total_skip} skipped${NC}"
-    echo -e "  Results saved to: ${RESULTS_DIR}/"
+    printf '  Total: %b%s passed%b, %b%s failed%b, %b%s skipped%b\n' \
+        "$GREEN" "$total_pass" "$NC" "$RED" "$total_fail" "$NC" "$YELLOW" "$total_skip" "$NC"
+    # %s for RESULTS_DIR: it is env-overridable, so it is data, not format.
+    printf '  Results saved to: %s/\n' "$RESULTS_DIR"
 
     if [ $total_fail -gt 0 ]; then
         return 1

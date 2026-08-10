@@ -297,7 +297,7 @@ EOF
         )
         cat "${errf}"
     }
-    for bad in "abc" "-1" "2s" "1.2.3" ""; do
+    for bad in "abc" "-1" "2s" "1.2.3" "0" ""; do
         rc_f3=$(CHROME_PROBE_TIMEOUT="${bad}" probe_working_browser)
         assert_eq "case f3: CHROME_PROBE_TIMEOUT='${bad}' still detects a working browser" \
             "0" "${rc_f3}"
@@ -314,6 +314,14 @@ EOF
     }
     assert_contains_f3 "case f3: a malformed budget warns and names the value" \
         "CHROME_PROBE_TIMEOUT=abc" "$(CHROME_PROBE_TIMEOUT=abc warn_of)"
+    # '2s' and '0' deserve their own warning assertions. Without them their loop
+    # iterations above could not fail: GNU timeout accepts a "2s" suffix and
+    # treats 0 as "no timeout", so both would yield rc 0 whether validation
+    # rejected them or not. Asserting the warning proves they were rejected HERE.
+    assert_contains_f3 "case f3: a suffixed budget ('2s') is rejected by validation, not passed through" \
+        "CHROME_PROBE_TIMEOUT=2s" "$(CHROME_PROBE_TIMEOUT=2s warn_of)"
+    assert_contains_f3 "case f3: a zero budget is rejected (0 would disable the timeout)" \
+        "CHROME_PROBE_TIMEOUT=0" "$(CHROME_PROBE_TIMEOUT=0 warn_of)"
     assert_eq "case f3: an empty budget is treated as unset, no warning" \
         "" "$(CHROME_PROBE_TIMEOUT='' warn_of)"
 else

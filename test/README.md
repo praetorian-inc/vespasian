@@ -90,8 +90,13 @@ noble — both are transitional packages that pre-depend on snapd.
 
 The non-privileged surface (argument handling, architecture resolution, the
 pinned fingerprint) is covered by `test/install-chrome-selftest.sh`, which runs
-in CI. The download / apt / privileged-mutation paths are deliberately not
-tested: they need root, network, and destructive system changes.
+in CI on every push. The download / apt / privileged-mutation paths are not
+reachable from that suite — they need root, network, and destructive system
+changes — so they are covered separately by the `install-chrome-e2e` CI job,
+which runs the installer end-to-end as root inside a disposable `ubuntu:24.04`
+container. That job is opt-in (`workflow_dispatch`) and also runs on every push
+to `main`, rather than on every PR, because it is slow and depends on Google's
+apt repo being reachable.
 
 ### Running without a browser
 

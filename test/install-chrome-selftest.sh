@@ -391,15 +391,33 @@ assert_contains "case i: the reason is explained, not just a bare exit" \
 # Runs with SUDO="" and VESPASIAN_TEST_ROOT so the two privileged writes land in
 # fixtures. The curl stub serves the REAL Google key, so the fingerprint pin is
 # genuinely satisfied rather than bypassed.
-GOOGLE_KEY_CACHE="${FIXTURE_DIR}/google-real.pub"
-# --proto-redir mirrors the production fetch in install_pinned_key: without it
-# a redirect could downgrade to plain HTTP, so the two fetches would not be
-# comparable and this case would validate a weaker path than the one shipped.
-if curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 \
-    -o "${GOOGLE_KEY_CACHE}" https://dl.google.com/linux/linux_signing_key.pub 2>/dev/null; then
+# The key comes from a COMMITTED FIXTURE, not the network. It is public data
+# (no secret material — same class as not-google-signing-key.asc next to it),
+# and it only goes stale when GOOGLE_KEY_FPR has to be updated deliberately,
+# which is the same event. Fetching it live made these — the ONLY assertions
+# covering the trust anchor's success path — silently skip on any runner without
+# egress to dl.google.com, so an egress change could disarm them while the suite
+# stayed green.
+GOOGLE_KEY_CACHE="${SCRIPT_DIR}/fixtures/google-linux-signing-key.asc"
+if [ -s "${GOOGLE_KEY_CACHE}" ]; then
     have_real_key=1
 else
     have_real_key=0
+fi
+
+# Guard the fixture itself: if it ever stops containing the pinned primary key,
+# cases j/j2 would be testing nothing. Assert that before relying on it.
+if [ "${have_real_key}" -eq 1 ]; then
+    fixture_fprs=$(gpg --homedir "${GNUPG_ASSERT_HOME}" --show-keys --with-colons \
+        --with-fingerprint "${GOOGLE_KEY_CACHE}" 2>/dev/null \
+        | awk -F: '$1=="pub"{w=1} $1=="fpr"&&w{print $10; w=0}')
+    if printf '%s\n' "${fixture_fprs}" | grep -qxF -- "EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796"; then
+        echo "PASS: fixture google-linux-signing-key.asc carries the pinned primary key"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: fixture google-linux-signing-key.asc no longer carries the pinned key — j/j2 would be vacuous"
+        fail_count=$((fail_count + 1))
+    fi
 fi
 
 if [ "${have_real_key}" -eq 1 ]; then
@@ -741,9 +759,19 @@ EOF
 chmod +x "${FIXTURE_DIR}/bin/sudo"
 
 plant_phone_home
+# The container marker is planted EXPLICITLY. Phone-home removal on the early
+# exit is gated on in_container(), which reads "${TEST_ROOT}/.dockerenv" or an
+# ambient REMOTE_CONTAINERS. Relying on the ambient variable made this case pass
+# in a devcontainer (which exports it) and FAIL on a GitHub-hosted runner, where
+# it is unset — a test whose result depended on who ran it. Planting the marker
+# under the fixture root pins the container arm on every host.
+: > "${root_n}/.dockerenv"
 res_o=$(
     VESPASIAN_TEST_ROOT="${root_n}"
     export VESPASIAN_TEST_ROOT
+    # Unset so the fixture's own marker is the only thing in_container() can be
+    # answering; otherwise an ambient value would mask a broken marker.
+    unset REMOTE_CONTAINERS
     PATH="${FIXTURE_DIR}/bin:${PATH}"
     # shellcheck source=install-chrome.sh
     source "${INSTALL_SCRIPT}"
@@ -930,6 +958,92 @@ set -e
 assert_eq "case r: browser present + no gpg/curl on PATH still exits 0" "0" "${rc_r}"
 assert_contains "case r: it reports the existing browser rather than a missing tool" \
     "already present" "${out_r}"
+
+# ── Case o2: the NON-container early exit leaves the host alone ─
+# The mirror of case o, and the arm that regressed. On a machine that is not a
+# throwaway image the early exit must NOT delete the package's apt source or
+# updater (they are not ours), must NOT exit 1 for finding them, and must say so.
+# An earlier version of this fix gated the removal on in_container() but left
+# verify_install checking those same paths unconditionally, so a developer's
+# machine with a normally-installed Chrome got a hard failure. Only the pair of
+# cases o + o2 pins both arms.
+plant_phone_home
+rm -f "${root_n}/.dockerenv"
+res_o2=$(
+    VESPASIAN_TEST_ROOT="${root_n}"
+    export VESPASIAN_TEST_ROOT
+    unset REMOTE_CONTAINERS
+    PATH="${FIXTURE_DIR}/bin:${PATH}"
+    # shellcheck source=install-chrome.sh
+    source "${INSTALL_SCRIPT}"
+    CHROME_CANDIDATES=("${FIXTURE_DIR}/fakebin/google-chrome")
+    set +e
+    out=$(main 2>&1)
+    printf '%s\n%s\n' "$?" "${out}"
+)
+assert_eq "case o2: non-container early exit still succeeds (rc 0)" \
+    "0" "$(echo "${res_o2}" | sed -n '1p')"
+assert_contains "case o2: it says it is leaving the package's artifacts alone" \
+    "Not a container" "${res_o2}"
+if [ -f "${root_n}/etc/cron.daily/google-chrome" ] && \
+   [ -f "${root_n}/etc/apt/sources.list.d/google-chrome.list" ]; then
+    echo "PASS: case o2: the package's apt source and updater SURVIVE outside a container"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case o2: the early exit deleted package-owned artifacts on a non-container host"
+    fail_count=$((fail_count + 1))
+fi
+# And the script's OWN temp artifacts are still torn down on this path.
+if [ ! -e "${root_n}/etc/apt/sources.list.d/google-chrome-vespasian-temp.list" ]; then
+    echo "PASS: case o2: this script's own temporary apt source is still removed"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case o2: a temporary apt source survived the non-container early exit"
+    fail_count=$((fail_count + 1))
+fi
+# No version record on a run that installed nothing.
+if [ ! -e "${root_n}/usr/share/vespasian/chrome-version" ]; then
+    echo "PASS: case o2: no version record written on a no-install run"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case o2: the no-touch early exit wrote a version record"
+    fail_count=$((fail_count + 1))
+fi
+
+# ── Case s: log helpers must not interpret escapes in DATA ─────
+# log_* render externally-derived strings (gpg stderr, browser paths, apt
+# errors). They were `echo -e`, which interprets \e/\n INSIDE the message, so a
+# hostile or merely odd string could forge log lines or drive the terminal.
+# They are printf '%b[TAG]%b %s' now — colour via %b, message via %s. Without
+# this case, reverting to `echo -e` leaves every other assertion green.
+log_probe=$(
+    # shellcheck source=common.sh
+    source "${SCRIPT_DIR}/common.sh"
+    log_info 'literal\e[31m and \n stay literal'
+    log_fail 'second\tline'
+)
+if printf '%s' "${log_probe}" | grep -qF 'literal\e[31m and \n stay literal'; then
+    echo "PASS: case s: log_info prints backslash escapes in the message literally"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case s: log_info interpreted escapes in the message (echo -e regression?)"
+    fail_count=$((fail_count + 1))
+fi
+if printf '%s' "${log_probe}" | grep -qF 'second\tline'; then
+    echo "PASS: case s: log_fail prints backslash escapes in the message literally"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case s: log_fail interpreted escapes in the message (echo -e regression?)"
+    fail_count=$((fail_count + 1))
+fi
+# The colour codes must STILL render, or the fix broke the logs to pass the test.
+if printf '%s' "${log_probe}" | grep -q "$(printf '\033')"; then
+    echo "PASS: case s: colour escapes still render (fix did not strip formatting)"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case s: colour escapes no longer render"
+    fail_count=$((fail_count + 1))
+fi
 
 # ── Summary ─────────────────────────────────────────────────────
 echo ""

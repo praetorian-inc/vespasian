@@ -31,6 +31,10 @@ fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1" >&2; }
 # parent and torn down by the trap has no such scoping problem.
 TMPDIR_T="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR_T"' EXIT
+# INT/TERM too, matching the other selftests: a bash signal handler returns to
+# the interrupted code, so without an explicit exit a Ctrl-C leaks the temp tree.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 new_tmp() { mktemp "$TMPDIR_T/cfg.XXXXXX"; }
 
 # ── Source the target arrays and helper from the runner ──────────
@@ -689,8 +693,14 @@ else
         fail "could not extract the preflight-selftest job block (extraction broken — assertions below are vacuous)"
     else
         pass "preflight-selftest job block extracted from live-tests.yml"
+        # Comments are stripped and the match is anchored on the `run:` line.
+        # Matching the bare filename anywhere in the block was a FALSE NEGATIVE:
+        # the surrounding comments name every suite, so deleting a step left the
+        # guard green. Verified by mutation — with the plain -qF match, removing
+        # the install-chrome self-test step still passed.
+        runlines=$(printf '%s\n' "$preflight_block" | grep -vE '^[[:space:]]*#')
         for suite in preflight-selftest.sh install-chrome-selftest.sh setup-live-targets_test.sh test-runner-args.sh; do
-            if printf '%s\n' "$preflight_block" | grep -qF -- "$suite"; then
+            if printf '%s\n' "$runlines" | grep -qE "run:[[:space:]]*(\./|bash )?test/${suite}([[:space:]]|$)"; then
                 pass "un-gated job invokes $suite"
             else
                 fail "un-gated preflight-selftest job no longer invokes $suite — coverage dropped silently"

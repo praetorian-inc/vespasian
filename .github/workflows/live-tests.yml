@@ -142,7 +142,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     container:
-      image: ubuntu:24.04
+      # Digest-pinned like the SHA-pinned actions above: a mutable tag means the
+      # thing this job installs into can change under us between runs. Refresh
+      # deliberately.
+      image: ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea
     steps:
       # No harden-runner here: it does not support running inside a container
       # job. The egress this job makes (Google's apt repo) is the thing under
@@ -177,8 +180,16 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
+          # KEEP IN LOCKSTEP with PHONE_HOME_PATHS + TMP_LIST/TMP_KEYRING in
+          # test/install-chrome.sh. The list is duplicated deliberately — an
+          # assertion that sourced the script under test would inherit the same
+          # blind spot as the script — but a duplicate drifts, and this one had
+          # already lost the deb822 source and the package's own keyring, the two
+          # paths the CURRENT package actually writes.
           for p in /etc/apt/sources.list.d/google-chrome.list \
+                   /etc/apt/sources.list.d/google-chrome.sources \
                    /etc/cron.daily/google-chrome \
+                   /usr/share/keyrings/google-chrome.gpg \
                    /etc/apt/sources.list.d/google-chrome-vespasian-temp.list \
                    /usr/share/keyrings/google-chrome-vespasian-temp.gpg; do
             if [ -e "$p" ]; then echo "LEFTOVER: $p"; fail=1; fi
