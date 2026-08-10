@@ -700,12 +700,36 @@ else
         # the install-chrome self-test step still passed.
         runlines=$(printf '%s\n' "$preflight_block" | grep -vE '^[[:space:]]*#')
         for suite in preflight-selftest.sh install-chrome-selftest.sh setup-live-targets_test.sh test-runner-args.sh; do
-            if printf '%s\n' "$runlines" | grep -qE "run:[[:space:]]*(\./|bash )?test/${suite}([[:space:]]|$)"; then
+            # Dots are escaped: unescaped, `.` matches any character, so the
+            # pattern for install-chrome-selftest.sh would also accept
+            # `install-chrome-selftestXsh`. Harmless today, but this guard exists
+            # precisely to notice small edits nobody meant to make.
+            suite_re=${suite//./\\.}
+            if printf '%s\n' "$runlines" | grep -qE "run:[[:space:]]*(\./|bash )?test/${suite_re}([[:space:]]|$)"; then
                 pass "un-gated job invokes $suite"
             else
                 fail "un-gated preflight-selftest job no longer invokes $suite — coverage dropped silently"
             fi
         done
+
+        # A step that is PRESENT but neutered is the same coverage loss as a
+        # deleted one, and it is harder to spot in review: `continue-on-error`
+        # turns a red suite green, and a step-level `if:` can switch it off for
+        # exactly the events that matter. Checking only that the invocation
+        # exists would call both of those wired.
+        if printf '%s\n' "$runlines" | grep -qE '^[[:space:]]*continue-on-error:[[:space:]]*true'; then
+            fail "un-gated job sets continue-on-error: true — a failing guard would not fail CI"
+        else
+            pass "un-gated job has no continue-on-error: true"
+        fi
+        # The job's own `if:` is not in scope here (the job is deliberately
+        # un-gated and has none); this looks for a STEP-level `if:`, which is
+        # indented deeper than the `- name:` it belongs to.
+        if printf '%s\n' "$runlines" | grep -qE '^[[:space:]]{8,}if:'; then
+            fail "un-gated job has a step-level if: — a guard step can be silently skipped"
+        else
+            pass "un-gated job has no step-level if: conditions"
+        fi
     fi
 fi
 
