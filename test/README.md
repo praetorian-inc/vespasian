@@ -33,15 +33,18 @@ and failing later mid-crawl.
 Install a real, non-snap Chrome (`.deb`, amd64 or arm64):
 
 ```bash
-./test/install-chrome.sh          # idempotent; no-op if a runnable browser exists
+./test/install-chrome.sh          # idempotent; if a runnable browser exists it skips the
+                                  # install but still clears this script's own apt
+                                  # leftovers (and, in a container, the package's
+                                  # phone-home artifacts). Uses sudo.
 export VESPASIAN_NO_SANDBOX=true  # containers generally cannot use the Chrome sandbox
 ```
 
-> **This is a manual step today.** Nothing in this repo runs the installer
-> automatically — the devcontainer definition lives elsewhere, so a fresh
-> container comes up browserless and you must run the command above once. To
-> remove that step, the image that owns the devcontainer needs to call the
-> script at build or create time:
+> **This is a manual step today** — tracked in [LAB-5766](https://linear.app/praetorianlabs/issue/LAB-5766).
+> Nothing in this repo runs the installer automatically, because the devcontainer
+> definition lives elsewhere, so a fresh container comes up browserless and you
+> must run the command above once. To remove that step, the image that owns the
+> devcontainer needs to call the script at build or create time:
 >
 > ```dockerfile
 > # Dockerfile layer
@@ -284,6 +287,16 @@ FORMS_TARGET_BIND_HOST=127.0.0.1 ./test/setup-live-targets.sh --targets forms-ta
 
 `run-live-tests.sh` reads resolved ports and `TARGETS_SETUP` from `CONFIG_FILE`, which defaults to `test/.live-test-config` (written by `setup-live-targets.sh`). Override it with the `CONFIG_FILE` environment variable — an internal test-harness knob that `test/test-runner-args.sh` uses to point `--dry-run` invocations at a throwaway stub config, so the group-resolution tests need no real setup. Only an allowlisted set of keys (the `*_PORT` values and `TARGETS_SETUP`) is honored from the file.
 
+The config file is loaded only when a selected target actually talks to a live service, so `--group offline` runs on a fresh checkout with no config and no prior setup.
+
+### `RESULTS_DIR` (optional)
+
+Where per-target result files are written; defaults to `test/.results/`. Override it to keep a run's output out of the repo — `test/test-runner-args.sh` sets it to a temp dir for the one block that really executes the runner, so the guard suite leaves nothing behind.
+
+### `VESPASIAN` (optional)
+
+Path to the `vespasian` binary under test; defaults to `bin/vespasian`. Override it to test a binary built elsewhere. Note this is **not** settable from `CONFIG_FILE`: `VESPASIAN` is deliberately absent from `load_config`'s allowlist, so a config file cannot redirect which binary the suite executes.
+
 ### `.live-test-config`
 
 The setup script writes `.live-test-config` with resolved ports:
@@ -506,8 +519,10 @@ processes holding the port window so you can see what to stop. Use `--teardown`
 Install Chrome or Chromium:
 
 ```bash
-# Ubuntu/Debian
-sudo apt install chromium-browser
+# Ubuntu/Debian — installs a real, non-snap Chrome (see "Chrome in containers" above).
+# Do NOT use `apt install chromium-browser`: on recent Ubuntu that package is the
+# snap stub described below, which installs cleanly and then fails at runtime.
+./test/install-chrome.sh
 
 # macOS
 brew install --cask google-chrome

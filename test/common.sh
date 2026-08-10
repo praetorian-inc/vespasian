@@ -23,10 +23,15 @@ log_header() {
     echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════${NC}"
 }
 
-log_info()   { echo -e "${CYAN}[INFO]${NC} $1"; }
-log_ok()     { echo -e "${GREEN}[OK]${NC} $1"; }
-log_warn()   { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_fail()   { echo -e "${RED}[FAIL]${NC} $1"; }
+# %b for the colour constants (they carry real escapes), %s for the MESSAGE.
+# `echo -e` interpreted escapes in the message too, so any externally-derived
+# string — gpg's stderr, a browser path, an apt error — could smuggle \n, \r or
+# \e through the log and forge output lines or rewrite the terminal. printf with
+# %s makes the data inert without losing the colour.
+log_info()   { printf '%b[INFO]%b %s\n' "$CYAN" "$NC" "$1"; }
+log_ok()     { printf '%b[OK]%b %s\n' "$GREEN" "$NC" "$1"; }
+log_warn()   { printf '%b[WARN]%b %s\n' "$YELLOW" "$NC" "$1"; }
+log_fail()   { printf '%b[FAIL]%b %s\n' "$RED" "$NC" "$1"; }
 
 # ──────────────────────────────────────────────────────────────
 # Browser detection (LAB-3893)
@@ -57,15 +62,31 @@ CHROME_CANDIDATES=(
 # cold or throttled container mount a slow first exec can outlive a fixed
 # budget, and the miss surfaces as a fatal "not runnable" — the same
 # false-positive class LAB-3893 exists to prevent.
+#
+# The override is validated rather than passed through. Two reasons, and the
+# first is the one that bites: an unparseable value makes timeout(1) exit 125
+# without ever running the browser, which chrome_runnable reports as "not
+# runnable" — reintroducing exactly the false positive the override exists to
+# cure, and pointing the blame at the browser instead of the typo. Second, an
+# unvalidated value reaches timeout's OPTION position, so a leading dash would
+# be parsed as a flag rather than a duration. Anything that is not a bare
+# decimal falls back to the default with a warning.
 chrome_runnable() {
-    local t=""
+    local t="" budget="${CHROME_PROBE_TIMEOUT:-2}"
+    case "$budget" in
+        ''|*[!0-9.]*|*.*.*|.)
+            printf 'CHROME_PROBE_TIMEOUT=%s is not a number (seconds); using 2s.\n' \
+                "$budget" >&2
+            budget=2
+            ;;
+    esac
     if command -v timeout >/dev/null 2>&1; then
         t=timeout
     elif command -v gtimeout >/dev/null 2>&1; then   # macOS + coreutils
         t=gtimeout
     fi
     if [ -n "$t" ]; then
-        "$t" "${CHROME_PROBE_TIMEOUT:-2}" "$1" --version >/dev/null 2>&1
+        "$t" "$budget" "$1" --version >/dev/null 2>&1
     else
         # No timeout available (e.g. stock macOS): probe directly. A binary that
         # hangs on --version would block here — known limitation, documented in

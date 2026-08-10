@@ -40,31 +40,40 @@ jobs:
         with:
           persist-credentials: false
 
+      # All four guard suites below are invoked by DIRECT EXEC, not via `bash`.
+      # They are committed 100755 and the repo tells operators to run them that
+      # way, so exec-ing them also verifies the mode bit survived the round trip;
+      # `bash <script>` silently works on a file that lost +x. One style for all
+      # four, so there is nothing to keep in sync.
       - name: Syntax check
         run: bash -n test/setup-live-targets.sh && bash -n test/install-chrome.sh
 
       - name: Run preflight self-test
-        run: bash test/preflight-selftest.sh
+        run: ./test/preflight-selftest.sh
 
       # install-chrome.sh's non-privileged surface: argument handling,
       # architecture resolution, and the pinned signing-key fingerprint. The
       # download / apt / privileged-mutation paths are deliberately not
       # exercised — they need root, network, and destructive system changes.
       - name: Run install-chrome self-test
-        run: bash test/install-chrome-selftest.sh
+        run: ./test/install-chrome-selftest.sh
 
       # Teardown / orphan-PID / port-exhaustion regressions (LAB-2893). Needs
       # no Go, Node or Chrome — it spawns lightweight stand-ins — so it belongs
       # in this un-gated job rather than the full live suite. Previously it ran
       # in no job at all despite its header claiming otherwise.
       - name: Run setup-live-targets self-test
-        run: bash test/setup-live-targets_test.sh
+        run: ./test/setup-live-targets_test.sh
 
       # Target-group/dispatch drift guard plus the offline-run and load_config
       # allowlist guards. Moved here from the label-gated `test` job: it needs
       # no Go, Node or Chrome, and leaving it gated meant a PR carrying
       # 'skip-live-tests' skipped the very guards that catch silent coverage
       # drift — exactly what they exist to prevent.
+      #
+      # This step also guards THIS job's own wiring: test-runner-args.sh asserts
+      # that each of the four suites above is still invoked here, so silently
+      # dropping one fails CI instead of quietly reducing coverage.
       - name: Drift guard (target groups vs dispatch)
         run: ./test/test-runner-args.sh
 
@@ -116,6 +125,76 @@ jobs:
 
       - name: Validator regression test
         run: ./test/validate_test.sh
+
+  # End-to-end exercise of install-chrome.sh's PRIVILEGED path — the download,
+  # the signature-verified apt install, the trap teardown, and the AC4 cleanup
+  # that runs after the package's postinst. install-chrome-selftest.sh covers
+  # every rejection arm unprivileged but deliberately stops before the first
+  # $SUDO, so this region shipped with no automated coverage at all: a change
+  # that broke the actual install would pass every existing suite.
+  #
+  # Not run on every PR. It needs root, network egress to Google, and it mutates
+  # system state — all of which are fine here because the container is thrown
+  # away, but it is slow and externally-dependent, so it is opt-in via
+  # workflow_dispatch (and on push to main, where a break should not stay hidden).
+  install-chrome-e2e:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container:
+      image: ubuntu:24.04
+    steps:
+      # No harden-runner here: it does not support running inside a container
+      # job. The egress this job makes (Google's apt repo) is the thing under
+      # test, and the container is disposable.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      # The image is bare: the installer needs apt metadata plus curl/gpg, and
+      # asserting their absence first is not the point of this job.
+      - name: Bootstrap the bare image
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends ca-certificates curl gnupg
+
+      # Runs as root, so SUDO resolves empty and every privileged branch is
+      # exercised directly.
+      - name: Install Chrome end-to-end
+        run: ./test/install-chrome.sh
+
+      - name: Assert the install actually produced a runnable browser
+        run: |
+          set -euo pipefail
+          # shellcheck source=test/common.sh
+          . ./test/common.sh
+          bin=$(detect_chrome_binary)
+          echo "detected: ${bin}"
+          "${bin}" --headless --no-sandbox --dump-dom about:blank >/dev/null
+
+      # AC4, asserted against a real install rather than a fixture.
+      - name: Assert no phone-home artifacts survive
+        run: |
+          set -euo pipefail
+          fail=0
+          for p in /etc/apt/sources.list.d/google-chrome.list \
+                   /etc/cron.daily/google-chrome \
+                   /etc/apt/sources.list.d/google-chrome-vespasian-temp.list \
+                   /usr/share/keyrings/google-chrome-vespasian-temp.gpg; do
+            if [ -e "$p" ]; then echo "LEFTOVER: $p"; fail=1; fi
+          done
+          [ -s /usr/share/vespasian/chrome-version ] || { echo "missing version record"; fail=1; }
+          echo "recorded build: $(cat /usr/share/vespasian/chrome-version)"
+          exit "$fail"
+
+      # Second run must take the idempotent early-exit path and stay clean.
+      - name: Re-run is idempotent
+        run: |
+          set -euo pipefail
+          out=$(./test/install-chrome.sh 2>&1)
+          printf '%s\n' "$out"
+          printf '%s' "$out" | grep -q "already present" \
+            || { echo "second run did not take the idempotent path"; exit 1; }
 
   # Gate: run by default; skip PR runs only when 'skip-live-tests' label is present.
   # Push-to-main and workflow_dispatch always run.
@@ -203,16 +282,13 @@ jobs:
       - name: Build vespasian
         run: go build -o bin/vespasian ./cmd/vespasian
 
-      - name: Write stub config for offline tests
-        run: |
-          printf '%s\n' \
-            "REST_API_PORT=8990" \
-            "SOAP_SERVICE_PORT=8991" \
-            "GRAPHQL_SERVER_PORT=8992" \
-            "CONCAT_SPA_PORT=8993" \
-            "TARGETS_SETUP=" \
-            > test/.live-test-config
-
+      # No stub config is written before the offline run any more. LAB-5064 made
+      # run-live-tests.sh load .live-test-config only when a selected target
+      # actually talks to a live service, so the offline group needs none — and
+      # writing one here meant CI exercised the config-present path while the
+      # promise made to developers ("--group offline works on a fresh checkout")
+      # went untested on every run. The live group still gets a real config from
+      # the "Setup live targets" step below.
       - name: Run offline tests
         run: ./test/run-live-tests.sh --no-start --no-build --group offline
 

@@ -532,6 +532,28 @@ else
     fail "real offline run failed before reaching post-config: $(printf '%s' "$real_offline" | head -3)"
 fi
 
+# The mirror image of the two assertions above, and the one that gives them
+# teeth. Everything so far proves an OFFLINE target does not demand a config;
+# nothing proved a LIVE target still does. Deleting the conditional load_config
+# call site entirely therefore left all of these green — the guard was
+# unpinned in the one direction that matters, because a runner that never loads
+# config passes every "no config demanded" assertion by construction.
+live_needs_config=$(env CONFIG_FILE="$noconfig" RESULTS_DIR="$TMPDIR_T/results" \
+    VESPASIAN="$TMPDIR_T/no-such-vespasian-binary" \
+    bash -c "source '$RUNNER' --targets rest-api --no-build" 2>&1) || true
+if [[ "$live_needs_config" == *"Config file not found"* ]]; then
+    pass "live target still demands a config file (load_config call site is wired)"
+else
+    fail "live target did NOT demand a config — the conditional load_config call site is gone: $(printf '%s' "$live_needs_config" | head -3)"
+fi
+# Negative companion: it must fail AT the config check, not sail past it to the
+# binary check. Otherwise a runner that loads config too late would still pass.
+if [[ "$live_needs_config" == *"vespasian binary not found"* ]]; then
+    fail "live target reached the binary check despite a missing config — config is loaded too late"
+else
+    pass "live target stops at the config check, before the binary check"
+fi
+
 echo ""
 echo "=== Browser probe shared with common.sh ==="
 # chrome_available gates the rod-backed targets. It must use the SHARED
@@ -645,6 +667,76 @@ if printf '%s\n' "$allowlist_out" | grep -qx "RESULT_REST_API_PORT=8990"; then
     pass "load_config: allowed key REST_API_PORT applied"
 else
     fail "load_config: allowed key REST_API_PORT not applied (expected 8990): $allowlist_out"
+fi
+
+echo ""
+echo "=== Un-gated CI job wiring (the guards must actually be invoked) ==="
+# Every suite in this repo is only as good as the CI step that runs it, and
+# those steps are hand-maintained in a YAML block that nothing checks. Dropping
+# one is invisible: the suite still passes locally, CI still goes green, and
+# coverage silently falls. The job block is extracted by name so an unrelated
+# `test` job invoking the same script cannot satisfy this.
+WORKFLOW="$SCRIPT_DIR/../.github/workflows/live-tests.yml"
+if [[ ! -f "$WORKFLOW" ]]; then
+    fail "live-tests.yml not found at $WORKFLOW"
+else
+    preflight_block=$(awk '
+        /^  preflight-selftest:/ { inblock=1; next }
+        inblock && /^  [a-zA-Z_-]+:/ { inblock=0 }
+        inblock { print }
+    ' "$WORKFLOW")
+    if [[ -z "$preflight_block" ]]; then
+        fail "could not extract the preflight-selftest job block (extraction broken — assertions below are vacuous)"
+    else
+        pass "preflight-selftest job block extracted from live-tests.yml"
+        for suite in preflight-selftest.sh install-chrome-selftest.sh setup-live-targets_test.sh test-runner-args.sh; do
+            if printf '%s\n' "$preflight_block" | grep -qF -- "$suite"; then
+                pass "un-gated job invokes $suite"
+            else
+                fail "un-gated preflight-selftest job no longer invokes $suite — coverage dropped silently"
+            fi
+        done
+    fi
+fi
+
+echo ""
+echo "=== Browser-target classification is exhaustive (no fail-open) ==="
+# BROWSER_TARGETS is hand-maintained and decides whether the Chrome preflight is
+# fatal. A target missing from it fails OPEN: setup proceeds browserless and the
+# target fails later with a confusing error instead of a clear prerequisite one.
+# Requiring every ALL_TARGETS member to be classified one way or the other turns
+# that into a loud CI failure at the moment a target is added.
+NON_BROWSER_TARGETS="grpc-server"
+setup_all=$(grep -E '^ALL_TARGETS=' "$SETUP" | sed 's/^ALL_TARGETS=//; s/"//g' | tr ',' ' ')
+setup_browser=$(grep -E '^BROWSER_TARGETS=' "$SETUP" | sed 's/^BROWSER_TARGETS=//; s/"//g')
+if [[ -z "$setup_all" || -z "$setup_browser" ]]; then
+    fail "could not extract ALL_TARGETS/BROWSER_TARGETS from setup-live-targets.sh (assertions vacuous)"
+else
+    pass "ALL_TARGETS and BROWSER_TARGETS extracted from setup-live-targets.sh"
+    unclassified=""
+    for t in $setup_all; do
+        case " $setup_browser $NON_BROWSER_TARGETS " in
+            *" $t "*) ;;
+            *) unclassified="$unclassified $t" ;;
+        esac
+    done
+    if [[ -n "$unclassified" ]]; then
+        fail "target(s) in ALL_TARGETS classified neither browser nor non-browser:$unclassified"
+        fail "  add to BROWSER_TARGETS in setup-live-targets.sh, or to NON_BROWSER_TARGETS in this guard"
+    else
+        pass "every ALL_TARGETS member is classified browser or non-browser"
+    fi
+    # And the converse: a BROWSER_TARGETS entry that is not a real target is a
+    # typo that silently classifies nothing.
+    stale=""
+    for t in $setup_browser; do
+        case " $setup_all " in *" $t "*) ;; *) stale="$stale $t" ;; esac
+    done
+    if [[ -n "$stale" ]]; then
+        fail "BROWSER_TARGETS names target(s) absent from ALL_TARGETS (typo?):$stale"
+    else
+        pass "every BROWSER_TARGETS entry is a real target"
+    fi
 fi
 
 echo ""

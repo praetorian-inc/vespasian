@@ -59,7 +59,21 @@ assert_contains() {
 }
 
 FIXTURE_DIR=$(mktemp -d)
+# INT/TERM as well as EXIT, mirroring install-chrome.sh: a bash signal handler
+# returns to the interrupted code, so without an explicit exit a Ctrl-C left the
+# fixture tree behind in $TMPDIR. Exiting from the handler routes through EXIT so
+# cleanup runs exactly once.
 trap 'rm -rf "${FIXTURE_DIR}"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# A throwaway GNUPGHOME for the assertion helpers below. `gpg --show-keys` on a
+# keyring still initialises the caller's ~/.gnupg (creating it, and taking its
+# lock) — install_pinned_key is careful to pass --homedir for exactly that
+# reason, and the assertions that check its work should be no less careful.
+GNUPG_ASSERT_HOME="${FIXTURE_DIR}/gnupg-assert"
+mkdir -p "${GNUPG_ASSERT_HOME}"
+chmod 700 "${GNUPG_ASSERT_HOME}"
 
 # ── Case a: --help prints exactly the header comment block ─────
 # usage() walks the leading `#` lines and stops at the first non-comment, so
@@ -378,7 +392,10 @@ assert_contains "case i: the reason is explained, not just a bare exit" \
 # fixtures. The curl stub serves the REAL Google key, so the fingerprint pin is
 # genuinely satisfied rather than bypassed.
 GOOGLE_KEY_CACHE="${FIXTURE_DIR}/google-real.pub"
-if curl -fsSL --proto '=https' --connect-timeout 10 --max-time 60 \
+# --proto-redir mirrors the production fetch in install_pinned_key: without it
+# a redirect could downgrade to plain HTTP, so the two fetches would not be
+# comparable and this case would validate a weaker path than the one shipped.
+if curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 \
     -o "${GOOGLE_KEY_CACHE}" https://dl.google.com/linux/linux_signing_key.pub 2>/dev/null; then
     have_real_key=1
 else
@@ -423,7 +440,7 @@ EOF
         "644" "$(stat -c '%a' "${root_j}/usr/share/keyrings/google-chrome-vespasian-temp.gpg" 2>/dev/null)"
     # Only the pinned key may end up in the keyring: exporting the whole fetched
     # bundle would hand apt every key the endpoint chose to return.
-    exported_fprs=$(gpg --show-keys --with-colons --with-fingerprint \
+    exported_fprs=$(gpg --homedir "${GNUPG_ASSERT_HOME}" --show-keys --with-colons --with-fingerprint \
         "${root_j}/usr/share/keyrings/google-chrome-vespasian-temp.gpg" 2>/dev/null \
         | awk -F: '$1=="pub"{want=1} $1=="fpr" && want{print $10; want=0}')
     assert_eq "case j: the keyring holds exactly the pinned key, nothing else" \
@@ -467,7 +484,7 @@ EOF
     )
     assert_eq "case j2: a bundle CONTAINING the pinned key is accepted (rc 0)" \
         "0" "$(echo "${res_j2}" | sed -n '1p')"
-    j2_fprs=$(gpg --show-keys --with-colons --with-fingerprint \
+    j2_fprs=$(gpg --homedir "${GNUPG_ASSERT_HOME}" --show-keys --with-colons --with-fingerprint \
         "${root_j2}/usr/share/keyrings/google-chrome-vespasian-temp.gpg" 2>/dev/null \
         | awk -F: '$1=="pub"{want=1} $1=="fpr" && want{print $10; want=0}')
     assert_eq "case j2: only the pinned key is exported, the co-bundled key is dropped" \
@@ -686,6 +703,27 @@ assert_eq "case n: verify_install passes on a clean tree (rc 0)" \
 assert_contains "case n: the clean tree is reported as such" \
     "left behind" "${res_n4}"
 
+# n5: verify_install's OTHER failure arm — no runnable browser after an install
+# that reported success. Cases n3/n4 only pin the surviving-artifact arm, so
+# deleting this one left the suite fully green while the script would happily
+# report a successful install of a browser that is not there.
+res_n5=$(
+    VESPASIAN_TEST_ROOT="${root_n}"
+    export VESPASIAN_TEST_ROOT
+    # shellcheck source=install-chrome.sh
+    source "${INSTALL_SCRIPT}"
+    SUDO=""
+    # No candidate resolves, so detect_chrome_binary returns 1.
+    CHROME_CANDIDATES=("${FIXTURE_DIR}/definitely-not-a-browser")
+    set +e
+    out=$(verify_install 2>&1)
+    printf '%s\n%s\n' "$?" "${out}"
+)
+assert_eq "case n5: verify_install fails when no browser is detectable (rc 1)" \
+    "1" "$(echo "${res_n5}" | sed -n '1p')"
+assert_contains "case n5: it says the install produced no runnable browser" \
+    "no runnable browser was detected" "${res_n5}"
+
 # ── Case o: the idempotent early exit still enforces AC4 ────────
 # main() returns 0 the moment any runnable browser is found. That short-circuit
 # used to skip remove_phone_home and verify_install entirely, so on a host where
@@ -823,7 +861,88 @@ assert_contains "case q: the refusal explains it could not read the file" \
 assert_eq "case q: the unreadable file is left untouched, not clobbered" \
     "KEEP_ME=1" "$(cat "${FIXTURE_DIR}/defaults-unreadable")"
 
+# ── Case r: browser present + gpg absent still exits 0 ─────────
+# require_tools moved off the top of main() onto the install path, because
+# curl/gpg are only needed there. This pins that: a host that already HAS a
+# runnable browser must succeed even with no gpg on PATH. Before the move it
+# exited 1 for want of a tool it was never going to use.
+root_r="${FIXTURE_DIR}/root-r"
+mkdir -p "${root_r}/etc/apt/sources.list.d" "${root_r}/usr/share/keyrings" "${root_r}/bin"
+# Mirror the real PATH into a fixture bin, MINUS exactly curl and gpg. Mirroring
+# and subtracting (rather than allow-listing the handful of tools the script is
+# thought to need) is what keeps this case honest: an allow-list turns any tool
+# the script legitimately gains into a spurious failure that looks like the
+# regression this case exists to catch. It has to be absence of curl/gpg that
+# fails it, and nothing else.
+while IFS= read -r d; do
+    [ -d "$d" ] || continue
+    for p in "$d"/*; do
+        if [ ! -x "$p" ] || [ -d "$p" ]; then continue; fi
+        b=$(basename -- "$p")
+        # curl/gpg: the absence under test. Browser names: this case supplies its
+        # OWN fake browser below, and mirroring a real one from the host would
+        # both defeat that and (being a root-owned symlink target) silently
+        # swallow the fake — the fixture would then exercise the host's actual
+        # Chrome and pass for entirely the wrong reason.
+        case "$b" in
+            curl|gpg|gpg2|gpgv) continue ;;
+            google-chrome|google-chrome-stable|chromium|chromium-browser|chrome) continue ;;
+            sudo) continue ;;   # replaced by an unprivileged shim below
+        esac
+        [ -e "${root_r}/bin/${b}" ] || ln -sf "$p" "${root_r}/bin/${b}"
+    done
+done <<< "$(printf '%s\n' "$PATH" | tr ':' '\n')"
+rm -f "${root_r}/bin/google-chrome"
+cat > "${root_r}/bin/google-chrome" <<'EOF'
+#!/bin/bash
+echo "Fake Chrome 999.0.0.0"
+EOF
+chmod +x "${root_r}/bin/google-chrome"
+
+# An unprivileged `sudo` shim. Passing SUDO="" is NOT enough here: this case
+# executes the script rather than sourcing it, so resolve_sudo runs and
+# overwrites SUDO with the real sudo — which made an earlier draft of this case
+# perform genuine root-owned writes into the fixture (and leave them behind for
+# the cleanup trap to choke on). The shim keeps resolve_sudo's logic exercised
+# while confining every "privileged" write to files this user owns.
+cat > "${root_r}/bin/sudo" <<'EOF'
+#!/bin/bash
+while [ "$#" -gt 0 ]; do
+    case "$1" in -n|-E|-H) shift ;; --) shift; break ;; *) break ;; esac
+done
+exec "$@"
+EOF
+chmod +x "${root_r}/bin/sudo"
+# Guard the guard: if curl/gpg leaked into the mirror the case proves nothing.
+if PATH="${root_r}/bin" command -v gpg >/dev/null 2>&1 || PATH="${root_r}/bin" command -v curl >/dev/null 2>&1; then
+    echo "FAIL: case r: fixture PATH still exposes curl/gpg — the case would pass vacuously"
+    fail_count=$((fail_count + 1))
+fi
+set +e
+out_r=$(
+    PATH="${root_r}/bin"
+    export PATH
+    VESPASIAN_TEST_ROOT="${root_r}" \
+    bash "${SCRIPT_DIR}/install-chrome.sh" 2>&1
+)
+rc_r=$?
+set -e
+assert_eq "case r: browser present + no gpg/curl on PATH still exits 0" "0" "${rc_r}"
+assert_contains "case r: it reports the existing browser rather than a missing tool" \
+    "already present" "${out_r}"
+
 # ── Summary ─────────────────────────────────────────────────────
 echo ""
 echo "install-chrome-selftest: ${pass_count} passed, ${fail_count} failed, ${skip_count} skipped"
+# A SKIP is a coverage hole, not a pass. Cases j/j2 are the only assertions that
+# cover the trust anchor's SUCCESS path, and they self-skip when the Google key
+# cannot be fetched — so an egress change (or a proxy, or an offline runner)
+# could silently disarm the pin's positive coverage while the suite stayed green.
+# Failing on any skip converts that into a visible CI failure.
+if [ "${skip_count}" -ne 0 ]; then
+    echo "install-chrome-selftest: FAIL — ${skip_count} case(s) skipped; skips are coverage holes here."
+    echo "  (cases j/j2 need dl.google.com; if this runner has no egress, that must be fixed"
+    echo "   or the key committed as a fixture — not silently skipped.)"
+    exit 1
+fi
 [ "${fail_count}" -eq 0 ]

@@ -93,6 +93,27 @@ GOOGLE_APT_URL="https://dl.google.com/linux/chrome/deb/"
 # caller — see the trust note in the header block.
 TEST_ROOT="${VESPASIAN_TEST_ROOT:-}"
 
+# Enforce the documented assumption instead of only stating it. TEST_ROOT is
+# prefixed onto paths that are later written with sudo, so a value containing
+# whitespace, a quote, or a glob character would reshape those paths. Production
+# callers leave it empty; a test caller passes a mktemp -d path, which always
+# satisfies this. Fail closed rather than sanitize: silently rewriting a path
+# that feeds a privileged write is worse than refusing it.
+case "$TEST_ROOT" in
+    "") ;;                                  # unset — the production case
+    /*) case "$TEST_ROOT" in
+            *[!A-Za-z0-9._/-]*)
+                printf '[FAIL] VESPASIAN_TEST_ROOT contains characters outside [A-Za-z0-9._/-]: %s\n' \
+                    "$TEST_ROOT" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    *)  printf '[FAIL] VESPASIAN_TEST_ROOT must be an absolute path: %s\n' "$TEST_ROOT" >&2
+        exit 1
+        ;;
+esac
+
 # Temporary apt wiring, removed by cleanup_apt_wiring on every exit path.
 TMP_LIST="${TEST_ROOT}/etc/apt/sources.list.d/google-chrome-vespasian-temp.list"
 TMP_KEYRING="${TEST_ROOT}/usr/share/keyrings/google-chrome-vespasian-temp.gpg"
@@ -263,13 +284,23 @@ install_pinned_key() {
     # so extra keys in the bundle are inspected and then discarded rather than
     # trusted. Widening this check without keeping that export would silently
     # extend apt's trust to whatever else the endpoint returned.
+    # stderr is captured, not discarded, for the same reason the import above
+    # keeps it: a gpg that fails to RUN produces no fingerprints, which is
+    # indistinguishable from a key whose fingerprints do not match unless the
+    # tool's own complaint survives. Reporting a broken toolchain as "the key is
+    # substituted" sends the reader hunting a supply-chain attack that is not there.
     fprs=$(gpg --homedir "$gpg_home" --no-default-keyring --keyring "$tmp_ring" \
-        --with-colons --fingerprint 2>/dev/null \
+        --with-colons --fingerprint 2>"$gpg_err" \
         | awk -F: '$1=="pub"{want=1} $1=="fpr" && want{print $10; want=0}')
+    if [ -z "$fprs" ]; then
+        log_fail "Could not read any key fingerprint from the fetched key — refusing to install."
+        [ -s "$gpg_err" ] && log_info "  gpg: $(tr '\n' ' ' < "$gpg_err")"
+        return 1
+    fi
     if ! printf '%s\n' "$fprs" | grep -qxF -- "$GOOGLE_KEY_FPR"; then
         log_fail "Google signing key fingerprint mismatch — refusing to install."
         log_info "  expected: ${GOOGLE_KEY_FPR}"
-        log_info "  got:      ${fprs:-<none>}"
+        log_info "  got:      ${fprs}"
         log_info "If Google rotated their primary key, update GOOGLE_KEY_FPR deliberately."
         return 1
     fi
@@ -375,9 +406,26 @@ in_container() {
 # path still in scope when it fires.
 SCRATCH_DIR=""
 
+# Set to 1 immediately before the apt install runs. It is what lets cleanup_all
+# distinguish "this run created the package's phone-home artifacts" from "they
+# were already on the machine", so the trap removes only what this run caused.
+INSTALL_ATTEMPTED=0
+
 cleanup_all() {
     [ -n "$SCRATCH_DIR" ] && rm -rf -- "$SCRATCH_DIR"
     cleanup_apt_wiring
+    # AC4 on the FAILURE paths too. Every success path already calls this, but an
+    # install that died after dpkg ran the package's postinst — the exact moment
+    # the permanent Google source and the daily pinger appear — left both behind,
+    # so a failed run was the one case that ADDED standing egress. It is an rm -f
+    # of fixed paths, so it is idempotent and safe to reach twice.
+    #
+    # Guarded on INSTALL_ATTEMPTED rather than run unconditionally: without that,
+    # this trap would fire on the browser-already-present early exit and delete a
+    # pre-existing Chrome's update channel on a developer's machine — undoing the
+    # in_container check on that path by the back door.
+    [ "$INSTALL_ATTEMPTED" -eq 1 ] && remove_phone_home
+    return 0
 }
 
 main() {
@@ -385,7 +433,10 @@ main() {
 
     log_header "Installing Chrome for vespasian tests"
 
-    require_tools
+    # NOTE: require_tools is deliberately NOT called here. curl and gpg are
+    # needed only by the install path, and gating the idempotency check on them
+    # made a host that already HAS a runnable browser fail for want of a tool it
+    # was never going to use. It is called on the install path instead, below.
     resolve_sudo
 
     # The scratch dir and its teardown are set up BEFORE the idempotency check,
@@ -419,19 +470,30 @@ main() {
     existing=$(detect_chrome_binary) || rc=$?
     if [ $rc -eq 0 ]; then
         log_ok "Runnable browser already present: ${existing}"
-        # Still enforce AC4 before returning success. Chrome may have been
-        # installed by another layer or by hand, in which case the package's
-        # permanent apt source and its root-run daily pinger are present and this
-        # script is the only thing that removes them. Exiting early without this
-        # reported "all good" while a standing egress channel sat in the image.
-        #
-        # cleanup_apt_wiring too, which makes the script SELF-HEALING: a previous
-        # run killed between writing the temporary apt source and removing it
-        # (OOM, cancelled CI job, aborted docker build) leaves a live Google
-        # source behind, and this early exit is the path every later run takes.
-        # Without this, that leftover persisted forever.
-        remove_phone_home
+        # cleanup_apt_wiring is unconditional, and only ever removes artifacts
+        # THIS script created. That makes the script self-healing: a previous run
+        # killed between writing the temporary apt source and removing it (OOM,
+        # cancelled CI job, aborted docker build) leaves a live Google source
+        # behind, and this early exit is the path every later run takes.
         cleanup_apt_wiring
+
+        # AC4 enforcement, but only where this script owns the machine.
+        #
+        # remove_phone_home deletes artifacts the google-chrome PACKAGE owns —
+        # /etc/apt/sources.list.d/google-chrome.list and the daily updater — which
+        # this script did not necessarily create. In a throwaway image that is the
+        # point: the image must add no standing egress. On a developer's own
+        # machine it is not ours to do. Someone who installed Chrome by hand and
+        # then ran this script to check for a browser would have silently had
+        # Chrome's update channel removed, a system-wide change they never asked
+        # for and would not think to look for. Same reasoning as the apt-cache
+        # wipe that in_container already guards.
+        if in_container; then
+            remove_phone_home
+        else
+            log_info "Not a container — leaving the google-chrome apt source and updater alone."
+            log_info "  (run inside the devcontainer image, or remove them by hand, to enforce AC4)"
+        fi
         verify_install
         exit 0
     fi
@@ -440,6 +502,9 @@ main() {
     fi
 
     require_apt
+    # curl and gpg are needed from here down and nowhere above, which is why the
+    # check lives on the install path rather than at the top of main().
+    require_tools
     # Explicit status check rather than a bare `ARCH="$(resolve_arch)"`: the
     # assignment form makes set -e abort with the reason still trapped inside the
     # substitution. resolve_arch writes its diagnostic to stderr, which reaches
@@ -459,6 +524,10 @@ main() {
 
     log_info "Installing google-chrome-stable via apt (signature-verified)"
     export DEBIAN_FRONTEND=noninteractive
+    # Set BEFORE apt runs, not after: the postinst that plants the phone-home
+    # artifacts runs inside this command, so a failure part-way through must
+    # still count as "this run caused them" for cleanup_all.
+    INSTALL_ATTEMPTED=1
     $SUDO apt-get update -qq
     $SUDO apt-get install -y --no-install-recommends google-chrome-stable
 
@@ -491,8 +560,13 @@ verify_install() {
     # postCreateCommand that discards stdout left the image with no evidence of
     # which Chrome build it shipped, so a bad stable release could not be
     # correlated to an image or rolled back to a known-good one.
+    # Staged then `install -m 0644`, matching how the keyring is written: the mode
+    # is stated at the call site instead of being left to the caller's umask, and
+    # the file lands atomically. `tee` did neither.
+    local staged_version="${SCRATCH_DIR}/chrome-version"
+    printf '%s\n' "$version" > "$staged_version"
     if $SUDO install -d -- "$(dirname -- "$CHROME_VERSION_RECORD")" 2>/dev/null &&
-       printf '%s\n' "$version" | $SUDO tee "$CHROME_VERSION_RECORD" >/dev/null; then
+       $SUDO install -m 0644 -- "$staged_version" "$CHROME_VERSION_RECORD"; then
         log_info "Recorded build in ${CHROME_VERSION_RECORD}"
     else
         # Non-fatal: the browser is installed and working, and the record is an

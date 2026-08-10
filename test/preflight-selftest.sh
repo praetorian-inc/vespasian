@@ -30,7 +30,11 @@ assert_eq() {
 
 # ── Fixture setup ──────────────────────────────────────────────
 FIXTURE_DIR=$(mktemp -d)
+# INT/TERM as well as EXIT: a bash signal handler returns to the interrupted
+# code, so without an explicit exit a Ctrl-C left the fixture tree in $TMPDIR.
 trap 'rm -rf "${FIXTURE_DIR}"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # A working "browser": prints a version string and exits 0.
 mkdir -p "${FIXTURE_DIR}/bin"
@@ -224,10 +228,15 @@ assert_eq "case f: no-timeout fallback returns the working browser path" "${WORK
 # second assertion fails. Skipped when no timeout/gtimeout is on PATH (the
 # bare-probe fallback has no budget to override; case f covers that path).
 if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+    # 0.5s, not 1s. The fixture has to outlive the 0.2s override (so the kill
+    # assertion is real) and comfortably fit inside the 2s default (so the
+    # pass-side assertion is not a coin flip on a loaded CI box). At 1s the
+    # pass side had only ~1s of headroom; at 0.5s it has ~1.5s while the kill
+    # side keeps a 2.5x margin.
     SLOW_BROWSER="${FIXTURE_DIR}/bin/slow-chrome"
     cat > "${SLOW_BROWSER}" <<'EOF'
 #!/bin/bash
-sleep 1
+sleep 0.5
 echo "Fake Slow Chrome 999.0.0.0"
 exit 0
 EOF
@@ -260,6 +269,53 @@ EOF
         echo "FAIL: case f2: expected timeout kill (rc 124), got rc ${rc_f2}"
         fail_count=$((fail_count + 1))
     fi
+    # ── Case f3: a malformed budget must not condemn the browser ──
+    # An unparseable CHROME_PROBE_TIMEOUT makes timeout(1) exit 125 WITHOUT
+    # running the browser, which chrome_runnable would otherwise report as
+    # "not runnable" — reintroducing the LAB-3893 false positive the override
+    # exists to cure, and blaming the browser for a typo in an env var. The
+    # value is validated and falls back to the 2s default with a warning.
+    probe_working_browser() {
+        (
+            # shellcheck source=setup-live-targets.sh disable=SC1091
+            source "${SETUP_SCRIPT}"
+            set +e
+            chrome_runnable "${WORKING_BROWSER}" 2>/dev/null
+            printf '%s\n' "$?"
+        )
+    }
+    # stderr is captured via a file rather than `2>&1 >/dev/null`: that ordering
+    # reads backwards (it duplicates stdout's CURRENT target before /dev/null is
+    # applied) and shellcheck flags it as SC2069. A file keeps the intent obvious.
+    warn_of() {
+        local errf="${FIXTURE_DIR}/f3.err"
+        (
+            # shellcheck source=setup-live-targets.sh disable=SC1091
+            source "${SETUP_SCRIPT}"
+            set +e
+            chrome_runnable "${WORKING_BROWSER}" >/dev/null 2>"${errf}"
+        )
+        cat "${errf}"
+    }
+    for bad in "abc" "-1" "2s" "1.2.3" ""; do
+        rc_f3=$(CHROME_PROBE_TIMEOUT="${bad}" probe_working_browser)
+        assert_eq "case f3: CHROME_PROBE_TIMEOUT='${bad}' still detects a working browser" \
+            "0" "${rc_f3}"
+    done
+    # An empty value means "unset" to :- and must stay silent; a malformed one
+    # must say so, otherwise the fallback is invisible and the typo persists.
+    assert_contains_f3() {
+        local desc=$1 needle=$2 hay=$3
+        if printf '%s' "${hay}" | grep -qF -- "${needle}"; then
+            echo "PASS: ${desc}"; pass_count=$((pass_count + 1))
+        else
+            echo "FAIL: ${desc} (output did not contain [${needle}])"; fail_count=$((fail_count + 1))
+        fi
+    }
+    assert_contains_f3 "case f3: a malformed budget warns and names the value" \
+        "CHROME_PROBE_TIMEOUT=abc" "$(CHROME_PROBE_TIMEOUT=abc warn_of)"
+    assert_eq "case f3: an empty budget is treated as unset, no warning" \
+        "" "$(CHROME_PROBE_TIMEOUT='' warn_of)"
 else
     echo "SKIP: case f2: no timeout/gtimeout on PATH — no probe budget to override"
 fi
