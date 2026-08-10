@@ -1000,6 +1000,58 @@ assert_reject "assert_form_body_fields rejects two forms sharing one request-bod
     "share request-body schema" \
     assert_form_body_fields "${WORK_DIR}/fbf-shared-spec.yaml" "${WORK_DIR}/fbf-ok.json"
 
+# Reject: the expected path is absent from the spec entirely ("path not found").
+cat > "${WORK_DIR}/fbf-nopath-spec.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: t
+  version: "1.0.0"
+paths:
+  /api/login:
+    post:
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/LoginBody'
+      responses:
+        '200':
+          description: ok
+components:
+  schemas:
+    LoginBody:
+      type: object
+      properties:
+        username:
+          type: string
+EOF
+cat > "${WORK_DIR}/fbf-absent-path.json" <<'EOF'
+{"post_form_body_fields_by_path": {"/api/absent": ["username"]}}
+EOF
+assert_reject "assert_form_body_fields rejects an expected path absent from the spec" \
+    "path not found" \
+    assert_form_body_fields "${WORK_DIR}/fbf-nopath-spec.yaml" "${WORK_DIR}/fbf-absent-path.json"
+
+# Reject: the POST operation exists but carries no requestBody ("no requestBody").
+cat > "${WORK_DIR}/fbf-norb-spec.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: t
+  version: "1.0.0"
+paths:
+  /api/login:
+    post:
+      responses:
+        '200':
+          description: ok
+EOF
+cat > "${WORK_DIR}/fbf-norb.json" <<'EOF'
+{"post_form_body_fields_by_path": {"/api/login": ["username"]}}
+EOF
+assert_reject "assert_form_body_fields rejects a POST operation with no requestBody" \
+    "no requestBody" \
+    assert_form_body_fields "${WORK_DIR}/fbf-norb-spec.yaml" "${WORK_DIR}/fbf-norb.json"
+
 # ──────────────────────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────────────────────
