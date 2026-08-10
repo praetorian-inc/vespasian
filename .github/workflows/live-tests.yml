@@ -141,6 +141,12 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # Restated at job level even though the workflow default already grants only
+    # `contents: read`. This job runs as root with live egress, so it is the one
+    # place a future widening of the workflow-level default should NOT silently
+    # apply — an explicit block here is the tripwire for that.
+    permissions:
+      contents: read
     container:
       # Digest-pinned like the SHA-pinned actions above: a mutable tag means the
       # thing this job installs into can change under us between runs. Refresh

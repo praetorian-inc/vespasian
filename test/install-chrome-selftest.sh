@@ -375,10 +375,39 @@ make_dpkg_stub riscv64
 # exit and never reach resolve_arch. Overriding the array is what makes this case
 # give the same answer on a browserless CI runner and on a dev box with Chrome.
 mkdir -p "${FIXTURE_DIR}/root-arch"
+# main() reaches resolve_arch only after resolve_sudo, require_apt and
+# require_tools. Those are stubbed here for FIDELITY, not for portability.
+#
+# Measured, because the obvious story is wrong: without these stubs the case
+# still passes on a PATH with no apt-get at all. It passes because the harness
+# runs `set +e` before calling main(), which disables errexit, so require_apt's
+# `return 1` is DISCARDED and execution walks on to resolve_arch anyway. That
+# makes the case green by way of a control flow production can never take —
+# under the script's own `set -euo pipefail`, that same failure aborts.
+# Satisfying the prerequisites for real means the case reaches resolve_arch the
+# way a real run would.
+# The stubs go in a directory of their OWN, not the shared FIXTURE_DIR/bin.
+# Writing them into the shared bin poisoned every LATER case: case j needs the
+# REAL gpg to verify the pinned key, and a `gpg` that exits 0 made its four
+# trust-anchor assertions fail. Scoping them to this case is the difference
+# between fixing an isolation problem and moving it downstream.
+ARCH_STUBS="${FIXTURE_DIR}/bin-arch"
+mkdir -p "${ARCH_STUBS}"
+# sudo must actually chain through to its argument; the rest need only exist
+# and succeed, because this case is about what happens AFTER them.
+printf '#!/bin/bash\nexec "$@"\n' > "${ARCH_STUBS}/sudo"
+for _t in apt-get curl gpg; do
+    printf '#!/bin/bash\nexit 0\n' > "${ARCH_STUBS}/${_t}"
+done
+chmod +x "${ARCH_STUBS}"/*
+unset _t
 arch_result=$(
     VESPASIAN_TEST_ROOT="${FIXTURE_DIR}/root-arch"
     export VESPASIAN_TEST_ROOT
-    PATH="${FIXTURE_DIR}/bin:${PATH}"
+    # bin-arch first (this case's stubs), then the shared fixture bin (for the
+    # dpkg stub), then the host (for coreutils). Prefixed rather than replaced:
+    # replacing PATH outright broke the script at `dirname` before main() ran.
+    PATH="${ARCH_STUBS}:${FIXTURE_DIR}/bin:${PATH}"
     # shellcheck source=install-chrome.sh
     source "${INSTALL_SCRIPT}"
     CHROME_CANDIDATES=()

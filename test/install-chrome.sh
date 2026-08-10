@@ -58,6 +58,17 @@
 # in a devcontainer or image build, which would have pointed a privileged write
 # at an unintended path or run the apt-cache wipe on a non-container host.
 #
+# What the validation below does and does NOT close, stated so future readers
+# stop re-deriving it. CLOSED: a relative path, characters outside
+# [A-Za-z0-9._/-], any ".." component, a root that does not exist, and any
+# spelling that RESOLVES to the filesystem root ("/", "//", "/.", a root that is
+# itself a symlink to /). ACCEPTED RESIDUALS, all of which require the caller to
+# already hold the privilege the write would grant: a symlink planted INSIDE the
+# root after validation, a bind mount at the root, and a directory swapped
+# between canonicalization and the privileged write (TOCTOU). Those are not
+# defended against, because the seam's whole trust model is that its caller is
+# already privileged — see the paragraph above.
+#
 # Usage:
 #   ./test/install-chrome.sh            # install if needed
 
@@ -104,7 +115,9 @@ TEST_ROOT="${VESPASIAN_TEST_ROOT:-}"
 # it looks closed: `.` and `/` are both legal characters, so `/tmp/x/../..`
 # passed every test above and then resolved to `/` — which would prefix nothing
 # at all and point TMP_LIST, the defaults file, and the phone-home removal at
-# the REAL system paths. A symlinked test root reaches the same place.
+# the REAL system paths. A test root that IS a symlink reaches the same place
+# (canonicalization resolves it); a symlink planted inside the root afterwards
+# is an accepted residual — see the trust note above.
 #
 # Two later holes of the same shape are closed here too, because "resolves to
 # the real root" has more than one spelling and more than one route:
