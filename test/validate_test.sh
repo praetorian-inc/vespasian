@@ -657,10 +657,12 @@ assert_ok "at an explicit floor of 2 is accepted" \
     assert_max_pages "at-floor" 2 10 2
 
 # TEST-009: a non-numeric floor must be rejected. Input 5/10/abc: page_count=5
-# passes its own numeric guard, so only the min_pages guard can fire here — "not
-# a number" unambiguously identifies that arm for this input.
+# passes its own numeric guard, so only the min_pages guard can fire here. Anchor
+# on the arm-specific "floor (min_pages) is not a number" rather than the bare
+# "not a number" the page-count arm also emits, so a regression that fired the
+# wrong numeric guard would be caught instead of passing on the shared substring.
 assert_reject "non-numeric floor is rejected" \
-    "not a number" \
+    "floor (min_pages) is not a number" \
     assert_max_pages "bad-floor" 5 10 abc
 
 # ──────────────────────────────────────────────────────────────
@@ -681,7 +683,7 @@ assert_reject "exact path count: actual under expected is rejected" \
     "expected exactly" \
     assert_exact_path_count "count-under" 4 5
 assert_reject "exact path count: non-numeric actual is rejected" \
-    "not a number" \
+    "path count is not a number: '?' (capture read failed)" \
     assert_exact_path_count "count-nan" "?" 5
 assert_reject "exact path count: non-numeric expected is rejected" \
     "expected path count is not a number" \
@@ -957,6 +959,26 @@ assert_reject "assert_post_get_operations rejects a spec missing the POST operat
     "expected POST operation" \
     assert_post_get_operations "${WORK_DIR}/pgo-nopost-spec.yaml" "${WORK_DIR}/pgo-expected.json"
 
+# Reject: an expected form-action path is absent from the spec entirely.
+cat > "${WORK_DIR}/pgo-absent-spec.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: t
+  version: "1.0.0"
+paths:
+  /api/login:
+    post:
+      responses:
+        '200':
+          description: ok
+EOF
+cat > "${WORK_DIR}/pgo-absent.json" <<'EOF'
+{"post_form_paths": ["/api/absent"]}
+EOF
+assert_reject "assert_post_get_operations rejects an expected path absent from the spec" \
+    "path not present in spec" \
+    assert_post_get_operations "${WORK_DIR}/pgo-absent-spec.yaml" "${WORK_DIR}/pgo-absent.json"
+
 # --- assert_form_body_fields -----------------------------------------------
 # Positive control: each form's fields resolve under its OWN distinct schema.
 cat > "${WORK_DIR}/fbf-ok-spec.yaml" <<'EOF'
@@ -1134,6 +1156,120 @@ EOF
 assert_reject "assert_form_body_fields rejects a POST operation with no requestBody" \
     "no requestBody" \
     assert_form_body_fields "${WORK_DIR}/fbf-norb-spec.yaml" "${WORK_DIR}/fbf-norb.json"
+
+# --- body_fields_for_path parser-arm coverage (LAB-5611 review follow-up) ------
+# The fbf-* cases above lock the $ref-resolved happy path plus path-not-found and
+# no-requestBody. These lock the remaining body_fields_for_path arms so a parser
+# regression in any of them is caught by the ungated validator-regression job,
+# not only the label-gated live 'test' run.
+
+# Reject: the path exists but carries no POST operation (only a GET).
+cat > "${WORK_DIR}/fbf-nopost-spec.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: t
+  version: "1.0.0"
+paths:
+  /api/login:
+    get:
+      responses:
+        '200':
+          description: ok
+EOF
+cat > "${WORK_DIR}/fbf-nopost.json" <<'EOF'
+{"post_form_body_fields_by_path": {"/api/login": ["username"]}}
+EOF
+assert_reject "assert_form_body_fields rejects a path with no POST operation" \
+    "no POST operation" \
+    assert_form_body_fields "${WORK_DIR}/fbf-nopost-spec.yaml" "${WORK_DIR}/fbf-nopost.json"
+
+# Positive control: an INLINE request-body schema (properties block, no $ref).
+# Every other fbf fixture uses a $ref, so this is the only case locking the
+# inline parse path; the real rest-api spec may express a urlencoded body inline.
+cat > "${WORK_DIR}/fbf-inline-spec.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: t
+  version: "1.0.0"
+paths:
+  /api/subscribe:
+    post:
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                email:
+                  type: string
+                name:
+                  type: string
+      responses:
+        '200':
+          description: ok
+EOF
+cat > "${WORK_DIR}/fbf-inline.json" <<'EOF'
+{"post_form_body_fields_by_path": {"/api/subscribe": ["email", "name"]}}
+EOF
+assert_ok "assert_form_body_fields accepts fields under an inline request-body schema" \
+    assert_form_body_fields "${WORK_DIR}/fbf-inline-spec.yaml" "${WORK_DIR}/fbf-inline.json"
+
+# Reject: the request-body ref points at a components schema that does not exist.
+cat > "${WORK_DIR}/fbf-refmissing-spec.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: t
+  version: "1.0.0"
+paths:
+  /api/login:
+    post:
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/MissingBody'
+      responses:
+        '200':
+          description: ok
+components:
+  schemas:
+    LoginBody:
+      type: object
+      properties:
+        username:
+          type: string
+EOF
+cat > "${WORK_DIR}/fbf-refmissing.json" <<'EOF'
+{"post_form_body_fields_by_path": {"/api/login": ["username"]}}
+EOF
+assert_reject "assert_form_body_fields rejects a request-body ref to an absent schema" \
+    "schema MissingBody not found" \
+    assert_form_body_fields "${WORK_DIR}/fbf-refmissing-spec.yaml" "${WORK_DIR}/fbf-refmissing.json"
+
+# Reject: a POST requestBody whose schema resolves to no properties at all.
+cat > "${WORK_DIR}/fbf-noprops-spec.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: t
+  version: "1.0.0"
+paths:
+  /api/login:
+    post:
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: ok
+EOF
+cat > "${WORK_DIR}/fbf-noprops.json" <<'EOF'
+{"post_form_body_fields_by_path": {"/api/login": ["username"]}}
+EOF
+assert_reject "assert_form_body_fields rejects a request-body schema with no properties" \
+    "no request-body schema properties" \
+    assert_form_body_fields "${WORK_DIR}/fbf-noprops-spec.yaml" "${WORK_DIR}/fbf-noprops.json"
 
 # ──────────────────────────────────────────────────────────────
 # rest-api fixture parity (cross-file lockstep + per-fixture invariants)
