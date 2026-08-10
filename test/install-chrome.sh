@@ -99,6 +99,13 @@ TEST_ROOT="${VESPASIAN_TEST_ROOT:-}"
 # callers leave it empty; a test caller passes a mktemp -d path, which always
 # satisfies this. Fail closed rather than sanitize: silently rewriting a path
 # that feeds a privileged write is worse than refusing it.
+#
+# The charset check alone was NOT enough, and the gap is worth stating because
+# it looks closed: `.` and `/` are both legal characters, so `/tmp/x/../..`
+# passed every test above and then resolved to `/` — which would prefix nothing
+# at all and point TMP_LIST, the defaults file, and the phone-home removal at
+# the REAL system paths. A symlinked test root reaches the same place. So the
+# value is canonicalized and a resolved `/` is refused outright.
 case "$TEST_ROOT" in
     "") ;;                                  # unset — the production case
     /*) case "$TEST_ROOT" in
@@ -108,6 +115,33 @@ case "$TEST_ROOT" in
                 exit 1
                 ;;
         esac
+        # No `..` component: it is the cheap, string-level half of the check and
+        # it rejects the traversal even when the path does not exist yet, which
+        # the canonicalization below cannot do.
+        case "/${TEST_ROOT}/" in
+            */../*)
+                printf '[FAIL] VESPASIAN_TEST_ROOT must not contain a ".." component: %s\n' \
+                    "$TEST_ROOT" >&2
+                exit 1
+                ;;
+        esac
+        # Then resolve symlinks for a root that exists, and refuse "/" however
+        # it was spelled. A test root of / is never legitimate: the seam exists
+        # to confine privileged writes to a fixture tree, and / is the absence
+        # of confinement.
+        if [ -d "$TEST_ROOT" ]; then
+            _resolved=$(cd -P -- "$TEST_ROOT" 2>/dev/null && pwd -P) || _resolved=""
+            if [ -z "$_resolved" ]; then
+                printf '[FAIL] VESPASIAN_TEST_ROOT could not be resolved: %s\n' "$TEST_ROOT" >&2
+                exit 1
+            fi
+            if [ "$_resolved" = "/" ]; then
+                printf '[FAIL] VESPASIAN_TEST_ROOT resolves to / (no confinement): %s\n' "$TEST_ROOT" >&2
+                exit 1
+            fi
+            TEST_ROOT="$_resolved"
+            unset _resolved
+        fi
         ;;
     *)  printf '[FAIL] VESPASIAN_TEST_ROOT must be an absolute path: %s\n' "$TEST_ROOT" >&2
         exit 1

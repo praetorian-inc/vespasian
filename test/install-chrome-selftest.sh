@@ -1010,6 +1010,45 @@ else
     fail_count=$((fail_count + 1))
 fi
 
+# ── Case t: VESPASIAN_TEST_ROOT containment ────────────────────
+# The seam prefixes every system path this script writes, so a value that
+# RESOLVES to / removes the confinement it exists to provide. The charset check
+# does not catch that: `.` and `/` are both legal, so `/tmp/x/../..` passed it
+# and then resolved to /, pointing the defaults-file rewrite and the phone-home
+# removal at the real system. A symlinked root reaches the same place.
+t_root="${FIXTURE_DIR}/root-t"
+mkdir -p "${t_root}"
+ln -sfn / "${FIXTURE_DIR}/root-symlink-to-slash"
+
+# Each of these must be REFUSED before the script does anything else.
+for bad_root in \
+    "${t_root}/../.." \
+    "/tmp/../.." \
+    "${FIXTURE_DIR}/root-symlink-to-slash" \
+    "/" \
+    "relative/path" \
+    "/tmp/has space" ; do
+    set +e
+    out_t=$(VESPASIAN_TEST_ROOT="${bad_root}" bash "${INSTALL_SCRIPT}" --help 2>&1)
+    rc_t=$?
+    set -e
+    if [ "${rc_t}" -ne 0 ] && printf '%s' "${out_t}" | grep -qF "VESPASIAN_TEST_ROOT"; then
+        echo "PASS: case t: refuses VESPASIAN_TEST_ROOT='${bad_root}'"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: case t: accepted VESPASIAN_TEST_ROOT='${bad_root}' (rc ${rc_t})"
+        fail_count=$((fail_count + 1))
+    fi
+done
+
+# ...and a legitimate fixture root must still be accepted, or the guard has
+# simply broken the seam every other case depends on.
+set +e
+out_t_ok=$(VESPASIAN_TEST_ROOT="${t_root}" bash "${INSTALL_SCRIPT}" --help 2>&1)
+rc_t_ok=$?
+set -e
+assert_eq "case t: a normal fixture root is still accepted" "0" "${rc_t_ok}"
+
 # ── Case s: log helpers must not interpret escapes in DATA ─────
 # log_* render externally-derived strings (gpg stderr, browser paths, apt
 # errors). They were `echo -e`, which interprets \e/\n INSIDE the message, so a
