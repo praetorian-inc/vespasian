@@ -617,8 +617,7 @@ validate_concat_spec() {
 
     # Exact-count: any path beyond the two concat endpoints means a receiver
     # literal or the control leaked through the 404 filter.
-    if [ "$endpoint_count" != "$expected_count" ]; then
-        log_fail "${test_name}: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
+    if ! assert_exact_path_count "${test_name}" "$endpoint_count" "$expected_count"; then
         failures=$((failures + 1))
     fi
 
@@ -1043,8 +1042,7 @@ test_forms_target() {
     # expected form-derived paths. A spurious extra path (a receiver literal or a
     # crawl artifact that slipped the classifier) trips this. Mirrors the sibling
     # test_concat_spa exact-count check.
-    if [ "$endpoint_count" != "$expected_count" ]; then
-        log_fail "forms-target: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
+    if ! assert_exact_path_count "forms-target" "$endpoint_count" "$expected_count"; then
         failures=$((failures + 1))
     fi
 
@@ -2076,8 +2074,7 @@ test_generate_js_static() {
 
     local endpoint_count
     endpoint_count=$(count_spec_endpoints "$spec_on")
-    if [ "$endpoint_count" != "$expected_count" ]; then
-        log_fail "Expected ${expected_count} statically-discovered paths, got ${endpoint_count}"
+    if ! assert_exact_path_count "generate-js-static" "$endpoint_count" "$expected_count"; then
         failures=$((failures + 1))
     else
         log_ok "Recovered ${endpoint_count} paths from the JS bundle"

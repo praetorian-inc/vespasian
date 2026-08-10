@@ -683,6 +683,9 @@ assert_reject "exact path count: actual under expected is rejected" \
 assert_reject "exact path count: non-numeric actual is rejected" \
     "not a number" \
     assert_exact_path_count "count-nan" "?" 5
+assert_reject "exact path count: non-numeric expected is rejected" \
+    "expected path count is not a number" \
+    assert_exact_path_count "count-expected-nan" 5 ""
 
 # assert_count <label> <expected> <function> <args...>
 #   -> runs <function> with <args...>, captures its stdout, and compares it
