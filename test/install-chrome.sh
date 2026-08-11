@@ -493,9 +493,30 @@ verify_apt_origin() {
     # only when it is also the installed version; matching $1 either with or
     # without that prefix is what makes this work whether or not the package
     # is installed yet.
+    #
+    # SEC-BE-001: `$1 == ver` alone cannot tell a VERSION row from a SOURCE
+    # row. `apt-cache policy`'s version table alternates
+    # `<version> <priority>` lines with `   <priority> <scheme>://...` lines
+    # beneath them, and a bare-integer Debian version ("500", "1001" are both
+    # syntactically valid) has the exact same shape as a priority column — so
+    # `$1 == ver` could match a source line whose priority happens to equal
+    # the candidate string, set `want` there, and read $2 of whatever line
+    # follows (an unrelated block) as the "origin". `$NF ~ /^[0-9]+$/`
+    # disambiguates structurally rather than by value: a version row's last
+    # field is always its priority (digits); a source row's last field is
+    # always "Packages" or a local path (e.g. /var/lib/dpkg/status) — never a
+    # bare number — so this excludes every source row regardless of what its
+    # priority column contains. The origin row itself is now validated the
+    # same way before being trusted: `$1` must be the priority (digits) and
+    # `$2` must look like `scheme://...`, so a following line of unexpected
+    # shape yields an empty origin (fail-closed via the host check below)
+    # rather than a garbage host taken on faith.
     origin=$(printf '%s\n' "$policy" | awk -v ver="$candidate" '
-        want { print $2; exit }
-        ($1 == "***" && $2 == ver) || $1 == ver { want = 1 }
+        want {
+            if ($1 ~ /^[0-9]+$/ && $2 ~ /^[a-z][a-z0-9+.-]*:\/\//) { print $2 }
+            exit
+        }
+        (($1 == "***" && $2 == ver) || $1 == ver) && $NF ~ /^[0-9]+$/ { want = 1 }
     ')
     # Anchor on the URL's host component, not a substring of the whole URL.
     # `grep -qF 'dl.google.com'` also matched a lookalike host such as
@@ -566,12 +587,38 @@ suppress_permanent_repo() {
         # `|| true` would treat 2 exactly like 1 and silently write out a file
         # containing only our opt-out, discarding whatever settings we could not
         # read. Only 0 and 1 are acceptable here.
+        # SEC-BE-002: re-verify the link guards INSIDE the privileged read.
+        #
+        # The [ -L ] and nlink checks above run in the caller's shell, minutes of
+        # wall-clock and several privileged commands before this read. That is a
+        # classic check-then-use gap: a planter who wins the race between the
+        # guard and this line turns a root-privileged read of $f into an
+        # arbitrary root-readable-file read, landing in $staged, which the
+        # unprivileged caller owns. Re-checking here does not make the window
+        # zero — nothing in shell can — but it collapses it from "the whole
+        # guard-to-read span" to "inside one `sh -c`", and it means BOTH ends of
+        # the window are guarded rather than just the entry.
+        #
+        # Exit codes are passed through deliberately: grep's 0/1/2 distinction is
+        # load-bearing below (0 = lines kept, 1 = nothing matched, which is
+        # normal, 2 = a real read error), so the guard uses 3 and 4 to stay out
+        # of grep's range.
         local grep_rc=0
-        $SUDO grep -v '^repo_add_once=' -- "$f" > "$staged" || grep_rc=$?
-        if [ "$grep_rc" -gt 1 ]; then
-            log_fail "Could not read ${f} (grep exit ${grep_rc}) — refusing to rewrite it." >&2
-            return 1
-        fi
+        $SUDO sh -c '
+            f="$1"
+            [ -L "$f" ] && exit 3
+            [ "$(stat -c "%h" -- "$f" 2>/dev/null || echo 1)" -ne 1 ] && exit 4
+            exec grep -v "^repo_add_once=" -- "$f"
+        ' _ "$f" > "$staged" || grep_rc=$?
+        case "$grep_rc" in
+            0|1) ;;
+            3)  log_fail "${f} became a symlink between the guard and the read — refusing to rewrite it." >&2
+                return 1 ;;
+            4)  log_fail "${f} gained a hard link between the guard and the read — refusing to rewrite it." >&2
+                return 1 ;;
+            *)  log_fail "Could not read ${f} (grep exit ${grep_rc}) — refusing to rewrite it." >&2
+                return 1 ;;
+        esac
     fi
     printf 'repo_add_once=false\n' >> "$staged"
     # A single `install`, not a stage-then-`mv`: install already unlinks the
@@ -699,11 +746,15 @@ cleanup_all() {
     # concurrent run's. Tearing either down unconditionally there strips the
     # OTHER run's live apt source, pinned keyring and origin pin between its
     # `apt-get update` and `apt-get install`, which is the exact race the lock
-    # exists to prevent, reopened on the lock's own failure path. Without
-    # flock at all (LOCK_HELD stays 0 for the whole run), there is no way to
-    # tell either, so this trap conservatively does nothing there rather than
-    # risk deleting a peer's wiring — the missing-lock exposure itself is
-    # tracked separately (SEC-BE-007).
+    # exists to prevent, reopened on the lock's own failure path.
+    #
+    # This gate is sound only because flock is now REQUIRED (SEC-BE-003): with
+    # the old degrade path, LOCK_HELD also stayed 0 on a host without flock —
+    # while that run still wrote the wiring and still ran apt-get install — so
+    # the gate silently disabled the AC4 teardown on exactly the hosts that
+    # needed it. main() now refuses to run without flock, and the lock is taken
+    # above every write site, so LOCK_HELD=0 means precisely "never acquired,
+    # therefore never wrote anything to clean up".
     if [ "$LOCK_HELD" -eq 1 ]; then
         if [ "$INSTALL_ATTEMPTED" -eq 1 ] && [ "$INSTALL_SUCCEEDED" -ne 1 ]; then
             if in_container; then
@@ -774,11 +825,24 @@ main() {
     trap 'exit 143' TERM
 
     # Acquire the install lock before the idempotency check's own cleanup call
-    # below — see LOCK_FILE's declaration for why. flock is the idiomatic tool
-    # for this; where it is unavailable this degrades to the previous
-    # (undefended) behaviour rather than failing the whole script over a
-    # missing coreutils-adjacent tool.
-    if command -v flock >/dev/null 2>&1; then
+    # below — see LOCK_FILE's declaration for why.
+    #
+    # flock is REQUIRED, not optional (SEC-BE-003). This used to degrade with a
+    # warning when flock was absent, and that degrade path was the bug: LOCK_HELD
+    # stayed 0 for the whole run while the run still wrote TMP_LIST/TMP_KEYRING/
+    # TMP_PREF and still ran `apt-get install`, so cleanup_all — gated on
+    # LOCK_HELD — did nothing, and any later failure stranded a permanently
+    # trusted Google apt source and the package's root-run daily cron pinger.
+    # A degrade that silently disables the AC4 teardown is worse than a refusal,
+    # and no test covered it. flock ships in util-linux, which is Priority:
+    # required on every Debian/Ubuntu base this script targets, so refusing
+    # costs nothing real. Checked here rather than in require_tools because
+    # require_tools runs on the install path, below the lock.
+    if ! command -v flock >/dev/null 2>&1; then
+        log_fail "flock not found — refusing to run without mutual exclusion (util-linux provides it)." >&2
+        exit 1
+    fi
+    {
         mkdir -p -- "$(dirname -- "$LOCK_FILE")"
         # LOCK_FILE is a FIXED, world-guessable path under /tmp in production,
         # and this whole block runs as root whenever the script itself does (a
@@ -804,33 +868,44 @@ main() {
                 exit 1
             fi
         fi
-        # `install`, not a bare redirection: it unlinks the destination before
-        # creating the new file (the same pattern suppress_permanent_repo's
-        # rewrite relies on), and it states the mode explicitly rather than
-        # leaving it to the caller's umask. That second part also fixes a
-        # standalone bug: under the caller's umask a root run could leave the
-        # lock at 0666 (world-writable, under `umask 0`) or otherwise
-        # unpredictable, and a LATER non-root run's bare `exec {LOCK_FD}>`
-        # (opened for WRITE) then failed EACCES on a root-owned file with no
-        # diagnostic — a redirection failure on `exec` terminates a
-        # non-interactive shell outright, before any log_fail runs. Opening
-        # read-only below sidesteps that entirely: flock needs no write access
-        # to the fd it locks, so a root-owned 0644 file is always still
-        # lockable by anyone.
-        $SUDO install -m 0644 -- /dev/null "$LOCK_FILE"
+        # Create ONLY when absent (SEC-BE-004). The previous line here was an
+        # unconditional `install -m 0644 -- /dev/null "$LOCK_FILE"`, and
+        # `install(1)` unlinks the destination before creating it — so every run
+        # got a FRESH INODE and `flock` serialised nothing. Reproduced directly:
+        # two concurrent runs of that sequence both acquired the lock, on
+        # different inodes. A lock is the one file that must NOT be replaced.
+        #
+        # Mode is still stated explicitly on the create so the caller's umask
+        # cannot leave it world-writable under `umask 0`, and the open below is
+        # read-only: flock needs no write access to the fd it locks, so a
+        # root-created 0644 lock stays lockable by a later non-root run. (A
+        # write-mode open would fail EACCES there, and a failed redirection on
+        # `exec` kills a non-interactive shell before any diagnostic runs.)
+        #
+        # Residual, stated rather than hidden: two runs racing the very FIRST
+        # creation can still each create-and-open before the other's flock, so
+        # the very first run on a fresh host is not serialised. Every run after
+        # it is, because the inode then persists. Closing that last gap needs an
+        # atomic create-or-open primitive shell does not offer without either a
+        # world-writable mode or a spin loop on mkdir, neither of which is worth
+        # it here.
+        if [ ! -e "$LOCK_FILE" ]; then
+            $SUDO install -m 0644 -- /dev/null "$LOCK_FILE"
+        fi
         exec {LOCK_FD}<"$LOCK_FILE"
         if ! flock -w 300 "$LOCK_FD"; then
             log_fail "Could not acquire the install lock (${LOCK_FILE}) within 300s — another run appears stuck." >&2
             exit 1
         fi
-        # Only now does this run actually own the shared apt-wiring lifecycle
+        # Only now does this run own the shared apt-wiring lifecycle
         # (SEC-BE-008) — see LOCK_HELD's declaration for why cleanup_all reads
         # this before touching TMP_LIST/TMP_KEYRING/TMP_PREF or the phone-home
-        # paths.
+        # paths. With the degrade path gone, LOCK_HELD=0 now means exactly one
+        # thing: this run never acquired the lock, and therefore never wrote any
+        # wiring (the lock is taken above every write site in main()). That is
+        # what makes the gate in cleanup_all sound rather than over-broad.
         LOCK_HELD=1
-    else
-        log_warn "flock not found — concurrent installs are not mutually exclusive (see SEC-BE-007)."
-    fi
+    }
 
     # Idempotency: a browser that actually RUNS (not merely a snap stub that
     # resolves) means there is no install to do.
@@ -913,7 +988,19 @@ main() {
     # can actually signal the process it bounds. This also puts $SUDO back in
     # the position every other call site in this file already unquotes
     # without a shellcheck exemption, so none is needed here either.
-    if ! $SUDO timeout 300 apt-get update -qq -o DPkg::Lock::Timeout=120; then
+    #
+    # `-k 30` (SEC-BE-006): apt defers SIGTERM while a dpkg transaction is in
+    # flight, so the plain TERM on expiry can leave the process still running
+    # at the 300s/900s mark. `-k 30` has timeout follow up with SIGKILL 30s
+    # later if apt-get is still alive, so a wedged run is bounded even when it
+    # ignores the first signal. Residual, stated rather than hidden: timeout
+    # signals only its direct child (apt-get), not the dpkg subprocess apt-get
+    # forks — a dpkg maintainer script already running when either signal
+    # lands can still outlive this bound. Reaching dpkg's own descendants
+    # would need `setsid`/`--foreground` process-group signalling, which is a
+    # larger behavioural change than this fix; the kill-after backstop at
+    # least guarantees apt-get itself does not wait forever.
+    if ! $SUDO timeout -k 30 300 apt-get update -qq -o DPkg::Lock::Timeout=120; then
         log_fail "apt-get update failed or timed out (held dpkg lock, or an unreachable mirror)." >&2
         exit 1
     fi
@@ -928,7 +1015,7 @@ main() {
     if ! verify_apt_origin; then
         exit 1
     fi
-    if ! $SUDO timeout 900 apt-get install -y --no-install-recommends \
+    if ! $SUDO timeout -k 30 900 apt-get install -y --no-install-recommends \
         -o DPkg::Lock::Timeout=120 google-chrome-stable; then
         log_fail "apt-get install failed or timed out." >&2
         exit 1

@@ -63,7 +63,7 @@ export CHROME_PROBE_TIMEOUT=2
 # pin is not meant to turn a valid environment into a red build); the trust
 # anchor's own skip is already a hard failure via trust_anchor_skips,
 # independently of this pin.
-EXPECTED_ASSERTIONS=183
+EXPECTED_ASSERTIONS=192
 
 pass_count=0
 fail_count=0
@@ -352,13 +352,21 @@ fi
 # is ever actually wrapped in `timeout`/`DPkg::Lock::Timeout`. Grepping the
 # source is the same idiom as f0-f4 above, for the same reason: the flag's
 # absence is silent.
-if grep -qE '\$SUDO timeout 300 apt-get update -qq -o DPkg::Lock::Timeout=120' "${INSTALL_SCRIPT}" \
-    && grep -qE '\$SUDO timeout 900 apt-get install ' "${INSTALL_SCRIPT}" \
-    && grep -qF -- '-o DPkg::Lock::Timeout=120 google-chrome-stable' "${INSTALL_SCRIPT}"; then
-    echo "PASS: case f: both apt-get calls are bounded by timeout and DPkg::Lock::Timeout, with \$SUDO privileging the timeout itself (SEC-BE-010)"
+#
+# Scoped to main()'s own body (TEST-001), the same way case p scopes its trap
+# greps: grepping the whole file let a commented-out or documentation
+# occurrence of the same text satisfy the check without the call itself ever
+# running inside main(). `|| true` guards the assignment for the same reason
+# case p's does -- an empty match must FAIL the assertions below, not abort
+# the suite under this file's own `set -euo pipefail`.
+main_body_f5=$(awk '/^main\(\) \{/,/^\}/' "${INSTALL_SCRIPT}" || true)
+if printf '%s' "${main_body_f5}" | grep -qE '\$SUDO timeout -k 30 300 apt-get update -qq -o DPkg::Lock::Timeout=120' \
+    && printf '%s' "${main_body_f5}" | grep -qE '\$SUDO timeout -k 30 900 apt-get install ' \
+    && printf '%s' "${main_body_f5}" | grep -qF -- '-o DPkg::Lock::Timeout=120 google-chrome-stable'; then
+    echo "PASS: case f: both apt-get calls are bounded by timeout -k 30 and DPkg::Lock::Timeout, with \$SUDO privileging the timeout itself (SEC-BE-010)"
     pass_count=$((pass_count + 1))
 else
-    echo "FAIL: case f: an apt-get call lost its timeout/DPkg::Lock::Timeout bound, or \$SUDO no longer wraps timeout"
+    echo "FAIL: case f: an apt-get call in main() lost its timeout/-k/DPkg::Lock::Timeout bound, or \$SUDO no longer wraps timeout"
     fail_count=$((fail_count + 1))
 fi
 
@@ -1874,7 +1882,11 @@ main_body_u=$(awk '/^main\(\) \{/,/^\}/' "${INSTALL_SCRIPT}")
 # install" substring, which the log_fail message a few lines below it
 # ("apt-get install failed or timed out.") does not carry -- so the anchor
 # still lands on the real call, not that diagnostic.
-apt_at=$(printf '%s\n' "${main_body_u}" | grep -n '\$SUDO timeout [0-9]* apt-get install ' | head -1 | cut -d: -f1 || true)
+# The `-k <n>` slot is optional in this anchor because SEC-BE-006 added it
+# (`timeout -k 30 900 …`, so a process ignoring the first signal still dies).
+# Without the optional group this sentinel fired — correctly and loudly, which
+# is the point of having it — the moment that flag landed.
+apt_at=$(printf '%s\n' "${main_body_u}" | grep -nE '\$SUDO timeout (-k [0-9]+ )?[0-9]+ apt-get install ' | head -1 | cut -d: -f1 || true)
 succ_at=$(printf '%s\n' "${main_body_u}" | grep -n '^[[:space:]]*INSTALL_SUCCEEDED=1[[:space:]]*$' | head -1 | cut -d: -f1 || true)
 rm_at=""
 if [ -n "${apt_at}" ]; then
@@ -2058,6 +2070,18 @@ if [ "${have_real_key}" -eq 1 ]; then
         "644" "$(stat -c '%a' "${root_v1}/usr/share/vespasian/chrome-version" 2>/dev/null)"
     assert_eq "case v: the chrome-version record's parent directory is 0755" \
         "755" "$(stat -c '%a' "${root_v1}/usr/share/vespasian" 2>/dev/null)"
+    # SEC-BE-005/TEST-005: the lock file is the only privileged write in the
+    # whole script with no stat -c %a assertion anywhere in this suite before
+    # this line. run_main_install_path runs main() under `umask 0` (see the
+    # comment on that `umask 0` line above), which is exactly the adverse case
+    # `install -m 0644` exists to defend against -- a bare `> "$LOCK_FILE"` or
+    # `touch` would land the lock at 0666 under this umask instead. Measured:
+    # swapping `$SUDO install -m 0644 -- /dev/null "$LOCK_FILE"` for
+    # `$SUDO rm -f -- "$LOCK_FILE"; $SUDO touch "$LOCK_FILE"; $SUDO chmod 0666
+    # "$LOCK_FILE"` on a scratch copy left the whole suite green before this
+    # assertion existed.
+    assert_eq "case v: the install lock is created 0644 even under umask 0" \
+        "644" "$(stat -c '%a' "${root_v1}/tmp/vespasian-install-chrome.lock" 2>/dev/null)"
 
     root_v2="${FIXTURE_DIR}/root-v2"
     res_v2=$(run_main_install_path "${root_v2}" "host")
@@ -2209,6 +2233,32 @@ res_w4=$(run_verify_apt_origin '(none)' '1.0.0-1' \
     pathmatch)
 assert_eq "case w: dl.google.com appearing in the PATH is refused" \
     "1" "$(echo "${res_w4}" | sed -n '1p')"
+
+# w4b (SEC-BE-001): a bare-integer version collides with a PRIORITY column,
+# not just a URL lookalike. `500` is a syntactically valid Debian version, and
+# a naive `$1 == ver` row selector cannot tell that version row apart from a
+# SOURCE row whose priority happens to equal it. This fixture's first source
+# line ("500 https://.../dl.google.com/...") sits at the SAME priority as an
+# unrelated earlier version row, purely to give the buggy selector a
+# priority-column match to latch onto before it ever reaches the real
+# candidate row below. The REAL match for candidate "500" is the LAST version
+# row ("500 100"), whose source is evil.example. Before SEC-BE-001's fix this
+# fixture made verify_apt_origin match the source row's priority column,
+# print the FOLLOWING line's dl.google.com URL, and ACCEPT — while the
+# version apt actually resolves comes from evil.example. Confirmed by
+# reverting the `$NF ~ /^[0-9]+$/` guard on a scratch copy: this exact
+# fixture then returns rc 0 instead of rc 1.
+res_w4b=$(run_verify_apt_origin '(none)' '500' \
+    '     999.0.0-1 500
+        500 https://mirror.example/linux/chrome/deb stable/main amd64 Packages
+        500 https://dl.google.com/linux/chrome/deb stable/main amd64 Packages
+     500 100
+        100 https://evil.example/linux/chrome/deb stable/main amd64 Packages' \
+    priority_collision)
+assert_eq "case w: a bare-integer version cannot be satisfied by a priority-column collision (rc 1)" \
+    "1" "$(echo "${res_w4b}" | sed -n '1p')"
+assert_contains "case w: the priority-collision fixture is refused as evil.example, not accepted as dl.google.com" \
+    "evil.example" "${res_w4b}"
 
 # An apt-cache that produces nothing (held dpkg lock, corrupted cache) must be
 # refused with a diagnostic rather than aborting the script under errexit — the
@@ -2534,6 +2584,109 @@ if [ -e "${root_z3}/etc/apt/sources.list.d/google-chrome-vespasian-temp.list" ] 
 else
     echo "FAIL: case z: a run that never held the lock removed apt wiring it does not own — the exact race the lock exists to prevent"
     fail_count=$((fail_count + 1))
+fi
+
+# z4: the lock ACTUALLY EXCLUDES two concurrent runs (TEST-002).
+#
+# Every flock assertion above this point drives a STUBBED flock that always
+# exits 1, which proves what happens when acquisition fails but says nothing
+# about whether acquisition succeeding means anything. It did not: the previous
+# implementation ran `install -m 0644 -- /dev/null "$LOCK_FILE"` unconditionally,
+# and install(1) unlinks its destination before creating it, so each run locked
+# a FRESH INODE and two runs proceeded in parallel. The whole suite stayed green
+# through that, because no case ever held the lock in one process and tried to
+# take it in another.
+#
+# This drives the real flock against the script's real acquisition sequence,
+# extracted from the source so it cannot drift from what main() does. Holder
+# takes the lock and sleeps; contender uses a 1s timeout and must FAIL.
+lock_seq_ok=1
+grep -q 'if \[ ! -e "\$LOCK_FILE" \]; then' "${INSTALL_SCRIPT}" || lock_seq_ok=0
+grep -q 'exec {LOCK_FD}<"\$LOCK_FILE"' "${INSTALL_SCRIPT}" || lock_seq_ok=0
+if [ "${lock_seq_ok}" -ne 1 ]; then
+    echo "FAIL: case z4: the lock acquisition sequence changed shape — this case no longer mirrors main(), fix it rather than deleting it"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS: case z4: the acquisition sequence still matches the one exercised below"
+    pass_count=$((pass_count + 1))
+fi
+
+z4_dir="${FIXTURE_DIR}/lock-z4"; mkdir -p "${z4_dir}"
+z4_lock="${z4_dir}/vespasian-install-chrome.lock"
+cat > "${z4_dir}/acquire.sh" <<'Z4EOF'
+#!/usr/bin/env bash
+# Mirrors main()'s acquisition: create ONLY when absent, open read-only, flock.
+LOCK_FILE="$1"; hold="$2"; wait_s="$3"
+if [ ! -e "$LOCK_FILE" ]; then install -m 0644 -- /dev/null "$LOCK_FILE"; fi
+exec {LOCK_FD}<"$LOCK_FILE"
+if flock -w "$wait_s" "$LOCK_FD"; then echo "ACQUIRED"; sleep "$hold"; else echo "BLOCKED"; fi
+Z4EOF
+chmod +x "${z4_dir}/acquire.sh"
+"${z4_dir}/acquire.sh" "${z4_lock}" 3 1 > "${z4_dir}/holder.out" 2>&1 &
+z4_holder=$!
+sleep 0.5
+z4_contender=$("${z4_dir}/acquire.sh" "${z4_lock}" 0 1 2>&1)
+wait "${z4_holder}" 2>/dev/null || true
+assert_eq "case z4: the first run acquires the install lock" \
+    "ACQUIRED" "$(cat "${z4_dir}/holder.out")"
+assert_eq "case z4: a CONCURRENT second run is blocked by it (mutual exclusion is real)" \
+    "BLOCKED" "${z4_contender}"
+
+# z5: flock is required, not optional (SEC-BE-003).
+#
+# main() used to warn and continue when flock was missing. On that path
+# LOCK_HELD stayed 0 while the run still wrote the apt wiring and still ran
+# apt-get install, so cleanup_all — gated on LOCK_HELD — did nothing, and a
+# failed install stranded a permanently trusted Google apt source plus the
+# package's root cron pinger. The degrade is gone; this pins that it stays gone.
+run_no_flock() {
+    local root="$1" bin="${FIXTURE_DIR}/bin-noflock"
+    rm -rf "${root}" "${bin}"; mkdir -p "${root}" "${bin}"
+    printf '#!/bin/bash\nexec "$@"\n' > "${bin}/sudo"; chmod +x "${bin}/sudo"
+    # Build the tool farm BEFORE narrowing PATH — populating it from inside a
+    # shell that has already lost `mkdir` does not work, which is how the first
+    # version of this case failed.
+    local core="${FIXTURE_DIR}/bin-noflock-core"
+    rm -rf "${core}"; mkdir -p "${core}"
+    local t p
+    for t in bash sh env cat rm mkdir rmdir stat install grep sed awk id dirname basename ln chmod date sleep tr sort head tail wc mktemp; do
+        p="$(command -v "$t" 2>/dev/null)" && ln -sf "$p" "${core}/$t"
+    done
+    # Sanity: the farm must NOT contain flock, or this case proves nothing.
+    if [ -e "${core}/flock" ]; then
+        echo "FAIL: case z5: the no-flock tool farm contains flock — the case would be vacuous"
+        return 99
+    fi
+    (
+        VESPASIAN_TEST_ROOT="${root}"; export VESPASIAN_TEST_ROOT
+        unset REMOTE_CONTAINERS; unset container
+        PATH="${bin}:${core}"; export PATH
+        # shellcheck source=install-chrome.sh
+        source "${INSTALL_SCRIPT}"
+        set +e
+        out=$(main 2>&1)
+        printf '%s\n%s\n' "$?" "${out}"
+    )
+}
+res_z5=$(run_no_flock "${FIXTURE_DIR}/root-z5")
+assert_eq "case z5: main() refuses to run when flock is absent (rc 1)" \
+    "1" "$(echo "${res_z5}" | sed -n '1p')"
+# Match the REFUSAL's distinctive wording, not the bare token "flock not found".
+# Measured: the old degrade logged "flock not found — concurrent installs are
+# not mutually exclusive", so an assertion on that token passed identically
+# whether the script refused or warned-and-continued, and a mutation restoring
+# the degrade left this case green. "refusing to run" appears only on the
+# refusal path.
+assert_contains "case z5: the refusal names flock rather than degrading silently" \
+    "refusing to run without mutual exclusion" "${res_z5}"
+# And prove it aborted BEFORE doing any work: a degrade would fall through to
+# the idempotency check and the install path, both of which announce themselves.
+if printf '%s' "${res_z5}" | grep -q 'Runnable browser already present\|Installing google-chrome-stable'; then
+    echo "FAIL: case z5: the run continued past the missing-flock check — the degrade path is back"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS: case z5: the run stopped at the flock check rather than continuing into the install path"
+    pass_count=$((pass_count + 1))
 fi
 
 # ── Summary ─────────────────────────────────────────────────────

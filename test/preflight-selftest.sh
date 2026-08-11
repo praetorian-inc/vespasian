@@ -22,6 +22,15 @@ skip_count=0
 # stay enforced even when a block legitimately skips, instead of going dark
 # the moment skip_count is nonzero.
 skip_credit=0
+# TEST-006: flips to 1 immediately before the Summary section runs, matching
+# install-chrome-selftest.sh and test-runner-args.sh. Every case here is a flat
+# sequence under this script's own `set -euo pipefail`; a stray `exit 0` (or an
+# errexit abort) anywhere above the summary would otherwise print PASS lines,
+# no summary, and a green CI check for however many cases never ran. MEASURED
+# on a scratch copy: injecting `exit 0` right after this block gave a bare
+# `rm -rf` on the fixture dir and exit 0 — no FAIL, no summary — before this
+# sentinel existed.
+SUITE_COMPLETED=0
 
 # Environment-dependent blocks call this instead of a bare `echo SKIP`.
 #
@@ -69,7 +78,12 @@ assert_eq() {
 FIXTURE_DIR=$(mktemp -d)
 # INT/TERM as well as EXIT: a bash signal handler returns to the interrupted
 # code, so without an explicit exit a Ctrl-C left the fixture tree in $TMPDIR.
-trap 'rm -rf "${FIXTURE_DIR}"' EXIT
+#
+# The completion sentinel is folded into THIS trap rather than registered as a
+# second one (TEST-006): bash keeps a single EXIT trap, so a separate
+# `trap ... EXIT` declared here would silently REPLACE this one and never
+# fire — exactly the inert-assertion failure mode this suite exists to catch.
+trap 'rm -rf "${FIXTURE_DIR}"; if [ "${SUITE_COMPLETED}" != 1 ]; then echo "preflight-selftest: FAIL — suite terminated before reaching the summary; results are incomplete" >&2; exit 1; fi' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -808,6 +822,7 @@ else
 fi
 
 # ── Summary ─────────────────────────────────────────────────────
+SUITE_COMPLETED=1
 echo ""
 echo "preflight-selftest: ${pass_count} passed, ${fail_count} failed, ${skip_count} skipped"
 

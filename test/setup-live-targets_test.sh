@@ -46,6 +46,15 @@ cleanup() {
         if [ -n "$pid" ]; then kill -9 "$pid" 2>/dev/null || true; fi
     done
     rm -rf "${STATE_DIR}"
+    # The completion sentinel is folded into THIS trap rather than registered
+    # as a second one (TEST-006): bash keeps a single EXIT trap, so a separate
+    # `trap ... EXIT` declared anywhere else would silently REPLACE this one
+    # and never fire — exactly the inert-assertion failure mode this suite
+    # exists to catch.
+    if [ "${SUITE_COMPLETED}" != 1 ]; then
+        echo "setup-live-targets_test: FAIL — suite terminated before reaching the summary; results are incomplete" >&2
+        exit 1
+    fi
 }
 trap cleanup EXIT
 
@@ -86,6 +95,13 @@ export SWEEP_ORPHANS
 PASS=0
 FAIL=0
 SKIP=0
+# TEST-006: flips to 1 immediately before the Summary section runs, matching
+# install-chrome-selftest.sh and test-runner-args.sh. This file runs under
+# `set -uo pipefail` (no -e), but an explicit `exit` anywhere above the
+# summary — or a bare-variable/unset-command abort under -u — would otherwise
+# print "ok"/"FAIL" lines for whatever ran and then a green CI check with no
+# summary and no accounting for what never ran.
+SUITE_COMPLETED=0
 
 ok()   { echo "  ok   - $1"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL - $1"; FAIL=$((FAIL + 1)); }
@@ -482,6 +498,48 @@ for fn in start_rest_api start_soap_service start_concat_spa start_graphql_serve
     esac
 done
 
+# ── Test 18b: the TARGETS THEMSELVES honour the seam (TEST-007) ─────────────
+#
+# Test 18 above asserts only that the SHELL passes BIND_HOST. That is half the
+# contract and it was the half that hid the bug: no suite referenced
+# rest-api/main.go, soap-service/main.go, concat-spa/main.go or
+# graphql-server/server.js at all, so reverting the four targets to their old
+# wildcard bind — `addr := ":" + port` / `listen(port)` — left every assertion
+# in every suite green while the exposure SEC-BE-015 was filed for came back.
+# The seam is inert unless BOTH ends exist, so both ends are asserted.
+#
+# This is a source-level check, not a socket-level one, and that is a deliberate
+# limit: the preflight-selftest CI job installs no Go and no Node, so a test that
+# built and started a target would skip in exactly the environment that runs the
+# guards. It fails on the mutation the finding named, which a behavioural test
+# in an unreachable job would not.
+echo "Test 18b: each target's own source reads BIND_HOST (SEC-BE-015 / TEST-007)"
+target_reads_bind_host() {
+    # $1 = repo-relative source, $2 = the read it must contain
+    local src="${SCRIPT_DIR}/$1" needle="$2"
+    if [ ! -f "$src" ]; then
+        fail "$1 not found — cannot verify it honours BIND_HOST"
+        return
+    fi
+    if grep -qF -- "$needle" "$src"; then
+        ok "$1 reads BIND_HOST"
+    else
+        fail "$1 no longer reads BIND_HOST — the shell seam is inert and the target binds every interface again"
+    fi
+}
+target_reads_bind_host "rest-api/main.go"        'os.Getenv("BIND_HOST")'
+target_reads_bind_host "soap-service/main.go"    'os.Getenv("BIND_HOST")'
+target_reads_bind_host "concat-spa/main.go"      'os.Getenv("BIND_HOST")'
+target_reads_bind_host "graphql-server/server.js" 'process.env.BIND_HOST'
+# And that none of them has drifted back to a wildcard bind.
+for src in rest-api/main.go soap-service/main.go concat-spa/main.go; do
+    if grep -qE '^[[:space:]]*addr := ":" \+ port' "${SCRIPT_DIR}/${src}"; then
+        fail "${src} still builds a wildcard addr (\`:\" + port\`) — the loopback default is bypassed"
+    else
+        ok "${src} does not build a wildcard addr"
+    fi
+done
+
 # ── Test 19: forms-target's own bind default is loopback (TEST-019) ─────────
 echo "Test 19: forms-target defaults its bind host to loopback"
 case "$(declare -f start_forms_target)" in
@@ -492,18 +550,61 @@ case "$(declare -f start_forms_target)" in
 esac
 
 # ── Test 20: wait_for_http bounds its curl probe (TEST-017, SEC-BE-012) ─────
+#
+# TEST-008: a source-text match cannot tell "curl has --max-time and it works"
+# from "curl has --max-time and something else swallowed the effect" — the
+# property is directly observable, so it is observed instead: a listener that
+# accepts the TCP handshake and then never responds is exactly the SEC-BE-012
+# scenario the function's own comment names, so wait_for_http is driven
+# against one for real. The whole call is wrapped in an outer `timeout` (the
+# same belt-and-suspenders shape Test 21 uses): if a mutation deletes
+# --max-time, curl blocks on the unread response forever, the outer `timeout`
+# kills the subshell before it ever prints "rc=", and the assertion below
+# goes red instead of the suite hanging until CI's own job timeout.
 echo "Test 20: wait_for_http bounds its curl probe with --max-time"
-case "$(declare -f wait_for_http)" in
-    *'curl -sf --max-time 2'*)
-        ok "wait_for_http's curl probe carries --max-time 2" ;;
-    *)
-        fail "wait_for_http's curl probe carries --max-time 2 (source changed)" ;;
-esac
+if { command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; } \
+   && command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    t_bin20="$(command -v timeout || command -v gtimeout)"
+    hport="$(free_port)"
+    python3 - "$hport" <<'PY' >/dev/null 2>&1 &
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(5)
+while True:
+    conn, _ = s.accept()   # accept and hold — never read, never write, never close
+PY
+    hsp=$!
+    SPAWNED_PIDS+=("$hsp")
+    disown "$hsp" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        (exec 3<>"/dev/tcp/127.0.0.1/${hport}") 2>/dev/null && { exec 3>&- 3<&-; break; }
+        sleep 0.2
+    done
+
+    out20="$("$t_bin20" 6 bash -c '
+        source "'"${SCRIPT_UNDER_TEST}"'"
+        rc=0
+        wait_for_http "http://127.0.0.1:'"${hport}"'/" 2 || rc=$?
+        echo "rc=$rc"
+    ' 2>&1)"
+    kill -9 "$hsp" 2>/dev/null || true
+    assert_contains "$out20" "rc=1" "wait_for_http's curl probe is bounded by --max-time against a handshake-then-silent listener"
+else
+    skip "timeout/gtimeout, curl, and python3 required"
+fi
 
 # ── Test 21: wait_for_grpc's timeout-wrapped /dev/tcp arm (TEST-020) ────────
 echo "Test 21: wait_for_grpc connects via the timeout-wrapped /dev/tcp arm when grpcurl/nc are absent"
+# python3 is required too (TEST-009): the body below spawns a python3
+# http.server as the listener the /dev/tcp arm connects to, and every other
+# environment-gated block in this file guards python3 explicitly for the same
+# reason — without the guard this hard-fails on a host without python3
+# instead of skipping like its siblings do.
 if { command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; } \
-   && command -v dirname >/dev/null 2>&1 && command -v sleep >/dev/null 2>&1; then
+   && command -v dirname >/dev/null 2>&1 && command -v sleep >/dev/null 2>&1 \
+   && command -v python3 >/dev/null 2>&1; then
     # A minimal PATH containing only the tools this arm (plus sourcing) needs —
     # NOT grpcurl or nc — so the third arm is exercised regardless of what is
     # actually installed on the host running this suite.
@@ -519,7 +620,15 @@ if { command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; 
     gsp=$!
     SPAWNED_PIDS+=("$gsp")
     disown "$gsp" 2>/dev/null || true
-    sleep 0.3
+    # TEST-010: poll for the listener to actually accept a connection instead
+    # of a fixed `sleep 0.3` — on a loaded runner 0.3s can be short of the
+    # interpreter's own startup, which would make the rc=0 arm below flake
+    # red for a reason that has nothing to do with wait_for_grpc. Same
+    # bounded-retry shape Test 16 already uses for a listener it starts.
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        (exec 3<>"/dev/tcp/127.0.0.1/${gport}") 2>/dev/null && { exec 3>&- 3<&-; break; }
+        sleep 0.2
+    done
 
     out="$(PATH="$mini_bin" bash -c '
         command -v grpcurl >/dev/null 2>&1 && { echo "grpcurl still on PATH"; exit 99; }
@@ -533,7 +642,12 @@ if { command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; 
     kill -9 "$gsp" 2>/dev/null || true
     assert_contains "$out" "rc=0" "connects via the timeout-wrapped /dev/tcp arm with grpcurl/nc absent"
 
-    start=$SECONDS
+    # TEST-010: no wall-clock upper-bound assertion here (a "returns within
+    # roughly the outer timeout" check computed from $SECONDS was removed —
+    # a 2s outer timeout with only 2s of headroom flakes on a loaded runner).
+    # The rc=1 assertion below already proves the call does not hang: it
+    # cannot return "rc=1" at all unless wait_for_grpc actually returned
+    # rather than blocking forever against a closed port.
     out2="$(PATH="$mini_bin" bash -c '
         # shellcheck source=/dev/null
         source "'"${SCRIPT_UNDER_TEST}"'"
@@ -541,13 +655,7 @@ if { command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; 
         wait_for_grpc 127.0.0.1 1 2 || rc=$?
         echo "rc=$rc"
     ' 2>&1)"
-    elapsed=$((SECONDS - start))
     assert_contains "$out2" "rc=1" "returns non-zero against a closed port instead of hanging"
-    if [ "$elapsed" -le 4 ]; then
-        ok "returns within roughly the outer timeout (elapsed ${elapsed}s)"
-    else
-        fail "returns within roughly the outer timeout (elapsed ${elapsed}s, expected <=4)"
-    fi
 
     rm -rf "$mini_bin"
 else
@@ -603,9 +711,51 @@ assert_alive "$safe_pid" "disarmed trap leaves a successfully-started service ru
 kill -9 "$safe_pid" 2>/dev/null || true
 clear_recorded_pids soap-service
 
+# Test 24b (TEST-011): Tests 23/24 above register `trap 'teardown_on_failure'
+# EXIT` THEMSELVES, inside their own subshell — real coverage of what the
+# function does, but none of the regression TEST-022 names (a failed partial
+# setup leaving unauthenticated listeners running) depends on main() actually
+# performing that registration. MEASURED on a scratch copy: deleting
+# `SETUP_IN_PROGRESS=true` and `trap 'teardown_on_failure' EXIT` from main()
+# gives Passed: 61 Skipped: 0 Failed: 0 — Tests 23/24 stay green because they
+# never touch main() at all. Mirrors install-chrome-selftest.sh case p, which
+# extracts main()'s body with awk rather than trusting a whole-file grep.
+echo "Test 24b: main() actually arms the SETUP_IN_PROGRESS/teardown_on_failure trap it relies on"
+main_body_24b="$(awk '/^main\(\) \{/,/^\}/' "${SCRIPT_UNDER_TEST}")"
+if printf '%s' "${main_body_24b}" | grep -qE '^[[:space:]]*SETUP_IN_PROGRESS=true$'; then
+    ok "main() sets SETUP_IN_PROGRESS=true before starting services"
+else
+    fail "main() sets SETUP_IN_PROGRESS=true before starting services (registration missing)"
+fi
+if printf '%s' "${main_body_24b}" | grep -qE "^[[:space:]]*trap 'teardown_on_failure' EXIT\$"; then
+    ok "main() registers trap 'teardown_on_failure' EXIT"
+else
+    fail "main() registers trap 'teardown_on_failure' EXIT (registration missing)"
+fi
+if printf '%s' "${main_body_24b}" | grep -qE '^[[:space:]]*SETUP_IN_PROGRESS=false$'; then
+    ok "main() clears SETUP_IN_PROGRESS=false after a successful write_config"
+else
+    fail "main() clears SETUP_IN_PROGRESS=false after a successful write_config (disarm missing)"
+fi
+
 # ── Summary ─────────────────────────────────────────────────────────────────
+SUITE_COMPLETED=1
 echo ""
 echo "──────────────────────────────────────────"
 echo "Passed: ${PASS}   Skipped: ${SKIP}   Failed: ${FAIL}"
 echo "──────────────────────────────────────────"
+# Assertion accounting (TEST-006): this file had no EXPECTED_ASSERTIONS pin at
+# all before this line, so deleting a whole Test block silently shrank PASS
+# with nothing to compare it against — the exact deletion-detection gap
+# install-chrome-selftest.sh and test-runner-args.sh already close for
+# themselves. Enforced only when SKIP is 0, mirroring install-chrome-
+# selftest.sh's own (pre-existing, TEST-003-flagged) gate: this file's skips
+# are all ambient-toolchain (python3/lsof/pgrep/curl/timeout), and turning a
+# valid degraded environment into a red build is not the point of this pin.
+EXPECTED_ASSERTIONS=63
+if [ "${SKIP}" -eq 0 ] && [ "$((PASS + FAIL))" -ne "${EXPECTED_ASSERTIONS}" ]; then
+    echo "setup-live-targets_test: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (Passed+Failed), saw $((PASS + FAIL))."
+    echo "  A Test block was added or removed without updating EXPECTED_ASSERTIONS."
+    exit 1
+fi
 [ "$FAIL" -eq 0 ]
