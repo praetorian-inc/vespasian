@@ -377,3 +377,147 @@ PYEOF
     log_ok "${result}"
     return 0
 }
+
+# assert_path_methods locks the per-path HTTP method sets the rest-api fixtures
+# declare. TEST-001 (PR #208): this PR made expected-paths.json and
+# scan-expected-paths.json deliberately diverge on /api/login and /api/upload
+# (two-stage GET-only vs scan GET+POST) to encode real generator behavior, but no
+# assertion read the method VALUES — validate_path_coverage keys on path names,
+# _assert_fixture_parity's norm() omits methods, and assert_post_get_operations
+# reads only post_form_paths (/api/subscribe). So the divergence was inert: a
+# regression that flipped either path's classification would not fail a test.
+#
+# This reads each declared path's method list and asserts its {get,post} membership
+# against the generated spec's operation set for that path. The comparison universe
+# is deliberately {get,post} — the only verbs these fixtures track — so it is
+# immune to any put/patch/delete/options a pipeline legitimately emits, yet still
+# catches two-stage-emits-POST and scan-drops-POST in both directions (and, as a
+# bonus, locks every resource path GET-only and /api/subscribe POST-only). A
+# fixture verb outside {get,post} fails loudly rather than being silently dropped.
+# Paths are matched POSITIONALLY (params vs params), because the spec normalizes
+# param names ({userId}) while the fixtures use {id}.
+# Usage: assert_path_methods <spec.yaml> <expected-paths.json>
+assert_path_methods() {
+    local spec=$1 expected=$2
+    local result rc=0
+    result=$(python3 - "$spec" "$expected" << 'PYEOF'
+import sys, json, re
+
+spec_file = sys.argv[1]
+expected_json = sys.argv[2]
+TRACKED = ("get", "post")
+
+with open(expected_json) as f:
+    exp = json.load(f)
+declared = exp["paths"]
+
+with open(spec_file) as f:
+    lines = f.read().split("\n")
+
+
+def ind(s):
+    return len(s) - len(s.lstrip(" "))
+
+
+def paths_match(expected_path, found_path):
+    e_parts = expected_path.strip("/").split("/")
+    f_parts = found_path.strip("/").split("/")
+    if len(e_parts) != len(f_parts):
+        return False
+    for e, f in zip(e_parts, f_parts):
+        e_is_param = e.startswith("{") and e.endswith("}")
+        f_is_param = f.startswith("{") and f.endswith("}")
+        if e_is_param or f_is_param:
+            continue
+        if e != f:
+            return False
+    return True
+
+
+# Map every top-level spec path key to its first-level operation set.
+def collect_spec_paths():
+    result = {}
+    in_paths = False
+    paths_indent = None
+    i = 0
+    while i < len(lines):
+        st = lines[i].rstrip()
+        if re.match(r"^paths:\s*(|\{\})\s*$", st):
+            in_paths = True
+            if "{}" in st:
+                break
+            i += 1
+            continue
+        if in_paths:
+            if st and not st[0].isspace():
+                break
+            m = re.match(r'^(\s+)(?:"(/[^"]*)"|\'(/[^\']*)\'|(/[^:"\']*)):\s*$', st)
+            if m:
+                k_indent = len(m.group(1))
+                if paths_indent is None:
+                    paths_indent = k_indent
+                if k_indent == paths_indent:
+                    key = m.group(2) or m.group(3) or m.group(4)
+                    ops = set()
+                    child_indent = None
+                    j = i + 1
+                    while j < len(lines):
+                        if lines[j].strip() and ind(lines[j]) <= k_indent:
+                            break
+                        mo = re.match(r"^(\s+)([a-z]+):\s*$", lines[j])
+                        if mo:
+                            lvl = len(mo.group(1))
+                            if child_indent is None:
+                                child_indent = lvl
+                            if lvl == child_indent and mo.group(2) in (
+                                "get", "post", "put", "patch", "delete", "head", "options"
+                            ):
+                                ops.add(mo.group(2))
+                        j += 1
+                    result[key] = ops
+        i += 1
+    return result
+
+
+spec_paths = collect_spec_paths()
+
+failures = 0
+for path, methods in declared.items():
+    lowered = [m.lower() for m in methods]
+    untracked = sorted(set(m for m in lowered if m not in TRACKED))
+    if untracked:
+        sys.stderr.write(
+            "  detail: %s: fixture declares verb(s) %s outside the asserted {get,post} universe -- widen assert_path_methods\n"
+            % (path, ", ".join(untracked)))
+        failures += 1
+        continue
+    expected_tracked = set(m for m in lowered if m in TRACKED)
+    matches = [sp for sp in spec_paths if paths_match(path, sp)]
+    if not matches:
+        sys.stderr.write("  detail: %s: path not present in spec\n" % path)
+        failures += 1
+        continue
+    actual_tracked = set()
+    for sp in matches:
+        actual_tracked |= (spec_paths[sp] & set(TRACKED))
+    if actual_tracked != expected_tracked:
+        sys.stderr.write(
+            "  detail: %s: method mismatch: expected get/post set %s, spec has %s\n"
+            % (path, ", ".join(sorted(expected_tracked)) or "none",
+               ", ".join(sorted(actual_tracked)) or "none"))
+        failures += 1
+
+if failures:
+    print("path methods: %d path(s) disagree with declared {get,post} method sets" % failures)
+    sys.exit(1)
+print("path methods: every declared path's {get,post} operations match the fixture")
+sys.exit(0)
+PYEOF
+    ) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log_fail "${result:-path methods: check failed}"
+        return 1
+    fi
+    log_ok "${result}"
+    return 0
+}

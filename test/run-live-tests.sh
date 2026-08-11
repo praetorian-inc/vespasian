@@ -437,6 +437,17 @@ test_rest_api() {
         failures=$((failures + 1))
     fi
 
+    # TEST-001 (PR #208): lock the per-path method sets this fixture declares.
+    # expected-paths.json intentionally lists /api/login and /api/upload as
+    # GET-only here (two-stage crawl + generate --probe=false: no JS runs, the
+    # inline fetch POST literals are recovered statically as GET candidates); a
+    # regression that emitted POST for either would silently diverge the fixture
+    # from reality. Also locks every resource path GET-only and /api/subscribe
+    # POST-only. Compared over the {get,post} universe the fixtures track.
+    if ! assert_path_methods "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+
     # NOTE: No exact spec *text* comparison here — the live crawl is
     # non-deterministic, so the generated spec's serialization (parameter
     # naming, ordering) varies between runs. Exact spec-text comparison is done
@@ -549,6 +560,15 @@ test_scan_rest() {
         failures=$((failures + 1))
     fi
     if ! assert_form_body_fields "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+
+    # TEST-001 (PR #208): the scan counterpart. scan-expected-paths.json lists
+    # /api/login and /api/upload as GET+POST here (single-stage headless scan: JS
+    # fires the POSTs and probing observes them), diverging from the two-stage
+    # fixture on exactly those two paths. Locking both sides makes the
+    # two-stage-vs-scan classification a tested invariant, not a silent claim.
+    if ! assert_path_methods "$spec_file" "$expected"; then
         failures=$((failures + 1))
     fi
 

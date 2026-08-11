@@ -513,6 +513,34 @@ components:
     i: &i [*h, *h, *h, *h, *h, *h, *h, *h, *h]
 EOF
 
+# TEST-002 (PR #208): the alias-bomb case above anchors only on the CONFIGURED
+# value being interpolated into the MESSAGE. It cannot distinguish a build whose
+# enforced `timeout` bound tracks SPEC_VALIDATOR_TIMEOUT from a mutant that
+# hardcodes the bound argument (e.g. `timeout 30`) while leaving ${...}
+# interpolation intact — the bomb never terminates, so both time out and both
+# print the configured value. Bind the ENFORCED bound directly: a fixed 3s sleeper
+# validator, driven once with a 1s override (must trip, and name "1s") and once
+# with a 10s override (must finish). Any constant-bound mutant fails one of the
+# pair. Ignores its input arg like a real validator would where the timeout fires
+# before parsing. No top-level await, so it runs on any node.
+cat > "${WORK_DIR}/sleeper-validator.mjs" <<'EOF'
+// Keeps the event loop alive ~3s, then exits 0. See validate_test.sh TEST-002.
+setTimeout(() => process.exit(0), 3000);
+EOF
+printf 'openapi: 3.0.3\n' > "${WORK_DIR}/sleeper-input.yaml"
+
+# Same explicit-subshell wrapper as _test_validator_timeout_openapi, so the
+# `export SPEC_VALIDATOR_TIMEOUT` cannot leak into the rest of this run (the
+# end-of-section leak check still brackets these). Calls _run_spec_validator
+# directly with the sleeper script rather than a real validator.
+_run_sleeper_under_timeout() {
+    local bound=$1
+    (
+        export SPEC_VALIDATOR_TIMEOUT="$bound"
+        _run_spec_validator "${WORK_DIR}/sleeper-validator.mjs" "${WORK_DIR}/sleeper-input.yaml"
+    )
+}
+
 # The bomb can only be bounded where a timeout binary exists.
 # _run_spec_validator falls back to running the validator UNWRAPPED when neither
 # timeout nor gtimeout is present (validate.sh), so on such a host this case
@@ -528,6 +556,20 @@ if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; th
     assert_reject "YAML alias bomb trips the validator wall-clock bound at the configured 3s" \
         "validator timed out after 3s" \
         _test_validator_timeout_openapi "${WORK_DIR}/alias-bomb.yaml"
+
+    # TEST-002 (PR #208): bind the ENFORCED wall-clock bound to the env var, not
+    # merely its interpolation into the message. A 1s override MUST trip the 3s
+    # sleeper — and the message must name "1s", killing a message-only mutant that
+    # echoed a hardcoded "3s" — while a 10s override MUST let the same sleeper
+    # finish (rc 0), proving the bound tracks the value rather than always-tripping.
+    # A constant-bound mutant fails one side: `timeout 30` finishes under the 1s
+    # case (reject sees rc 0), `timeout 1` trips under the 10s case (ok sees a
+    # timeout).
+    assert_reject "a 1s SPEC_VALIDATOR_TIMEOUT trips the enforced bound on a 3s validator (names the configured 1s)" \
+        "validator timed out after 1s" \
+        _run_sleeper_under_timeout 1
+    assert_ok "a 10s SPEC_VALIDATOR_TIMEOUT lets the same 3s validator finish (bound tracks the value, not always-trip)" \
+        _run_sleeper_under_timeout 10
 else
     # TEST-012: do not let the skip silently reduce the pass count in CI. The
     # un-gated validator-regression job runs on ubuntu where /usr/bin/timeout
@@ -1392,6 +1434,95 @@ EOF
 assert_reject "assert_form_body_fields rejects a urlencoded schema carrying a foreign field beyond the expected set" \
     "request-body has unexpected field(s)" \
     assert_form_body_fields "${WORK_DIR}/fbf-extra-spec.yaml" "${WORK_DIR}/fbf-extra.json"
+
+# ──────────────────────────────────────────────────────────────
+# assert_path_methods — offline regression net (LAB-5611 / TEST-001, PR #208)
+# ──────────────────────────────────────────────────────────────
+log_header "assert_path_methods (per-path {get,post} method-set lock)"
+
+# assert_path_methods is wired into the live test_rest_api/test_scan_rest only,
+# which skip-live-tests can bypass. Exercise the REAL helper offline against
+# hand-crafted spec + expected fixtures so its parsing/comparison can't silently
+# regress outside the label gate.
+
+# Positive: GET-only declaration matches a GET-only spec, AND a {id}-vs-{userId}
+# parameterized path matches positionally (proves param-tolerant matching).
+cat > "${WORK_DIR}/apm-ok-spec.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: t
+  version: "1.0.0"
+paths:
+  /api/login:
+    get:
+      responses:
+        '200':
+          description: ok
+  /api/users/{userId}:
+    get:
+      responses:
+        '200':
+          description: ok
+EOF
+cat > "${WORK_DIR}/apm-ok.json" <<'EOF'
+{"paths": {"/api/login": ["GET"], "/api/users/{id}": ["GET"]}}
+EOF
+assert_ok "assert_path_methods accepts GET-only decls (and matches {id} vs {userId} positionally)" \
+    assert_path_methods "${WORK_DIR}/apm-ok-spec.yaml" "${WORK_DIR}/apm-ok.json"
+
+# Positive: a GET+POST declaration (scan-style) matches a GET+POST spec.
+cat > "${WORK_DIR}/apm-getpost-spec.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: t
+  version: "1.0.0"
+paths:
+  /api/login:
+    get:
+      responses:
+        '200':
+          description: ok
+    post:
+      responses:
+        '200':
+          description: ok
+EOF
+cat > "${WORK_DIR}/apm-getpost.json" <<'EOF'
+{"paths": {"/api/login": ["GET", "POST"]}}
+EOF
+assert_ok "assert_path_methods accepts a GET+POST declaration matching the spec" \
+    assert_path_methods "${WORK_DIR}/apm-getpost-spec.yaml" "${WORK_DIR}/apm-getpost.json"
+
+# Reject: fixture declares GET+POST but the spec dropped POST (scan-drops-POST regression).
+assert_reject "assert_path_methods rejects a spec missing a declared POST" \
+    "method mismatch" \
+    assert_path_methods "${WORK_DIR}/apm-ok-spec.yaml" "${WORK_DIR}/apm-getpost.json"
+
+# Reject: fixture declares GET-only but the spec emitted POST too
+# (two-stage-emits-POST regression — the exact case TEST-001 names).
+cat > "${WORK_DIR}/apm-getonly.json" <<'EOF'
+{"paths": {"/api/login": ["GET"]}}
+EOF
+assert_reject "assert_path_methods rejects an unexpected POST on a GET-only decl" \
+    "method mismatch" \
+    assert_path_methods "${WORK_DIR}/apm-getpost-spec.yaml" "${WORK_DIR}/apm-getonly.json"
+
+# Reject: a declared path is absent from the spec entirely.
+cat > "${WORK_DIR}/apm-absent.json" <<'EOF'
+{"paths": {"/api/absent": ["GET"]}}
+EOF
+assert_reject "assert_path_methods rejects a declared path absent from the spec" \
+    "path not present in spec" \
+    assert_path_methods "${WORK_DIR}/apm-ok-spec.yaml" "${WORK_DIR}/apm-absent.json"
+
+# Reject (loud guard): a fixture verb outside the tracked {get,post} universe must
+# fail with a widen-the-helper message, never be silently ignored.
+cat > "${WORK_DIR}/apm-untracked.json" <<'EOF'
+{"paths": {"/api/login": ["PUT"]}}
+EOF
+assert_reject "assert_path_methods rejects a fixture verb outside {get,post} (loud guard)" \
+    "outside the asserted {get,post} universe" \
+    assert_path_methods "${WORK_DIR}/apm-ok-spec.yaml" "${WORK_DIR}/apm-untracked.json"
 
 # ──────────────────────────────────────────────────────────────
 # rest-api fixture parity (cross-file lockstep + per-fixture invariants)
