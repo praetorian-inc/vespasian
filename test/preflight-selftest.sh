@@ -220,19 +220,30 @@ assert_eq "case f: no-timeout fallback still detects a working browser (rc 0)" "
 assert_eq "case f: no-timeout fallback returns the working browser path" "${WORKING_BROWSER}" "${out_f}"
 
 # ── Case f2: CHROME_PROBE_TIMEOUT reaches the probe budget ─────
-# The probe budget defaults to 2s but must honour CHROME_PROBE_TIMEOUT (a
-# cold container mount can make a healthy browser's first exec slow). A
-# "browser" that answers --version after ~1s passes under the default budget
-# but must be killed under CHROME_PROBE_TIMEOUT=0.2 — if the override never
-# reaches the timeout invocation, the slow probe still succeeds and the
-# second assertion fails. Skipped when no timeout/gtimeout is on PATH (the
-# bare-probe fallback has no budget to override; case f covers that path).
+# chrome_runnable must honour CHROME_PROBE_TIMEOUT (a cold container mount can
+# make a healthy browser's first exec slow). A "browser" that takes real
+# wall-clock time to answer --version must (a) survive a comfortably large
+# override and (b) be killed by a tiny one — proving the override actually
+# reaches the timeout invocation, in both directions.
+#
+# The pass side is pinned to an EXPLICIT override (CHROME_PROBE_TIMEOUT=10),
+# NOT the production default (hardcoded "2" in chrome_runnable, common.sh).
+# An earlier version pinned the pass side to that literal default, which made
+# the assertion load-sensitive: the fixture's sleep had to outlive bash/
+# timeout process-startup jitter on a throttled CI runner while still fitting
+# inside a fixed 2s ceiling it does not control (TEST-013). An explicit,
+# generous override turns this into a RATIO assertion — budget far exceeds
+# sleep — rather than an absolute-wall-clock one, so ordinary CI jitter cannot
+# flip it. This does mean case f2 no longer pins the literal "2" default
+# value itself; nothing else in this suite does either, and that value is a
+# tuning constant, not part of the LAB-5064/LAB-3893 contract this file
+# guards. Skipped when no timeout/gtimeout is on PATH (the bare-probe
+# fallback has no budget to override; case f covers that path).
 if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
-    # 0.5s, not 1s. The fixture has to outlive the 0.2s override (so the kill
-    # assertion is real) and comfortably fit inside the 2s default (so the
-    # pass-side assertion is not a coin flip on a loaded CI box). At 1s the
-    # pass side had only ~1s of headroom; at 0.5s it has ~1.5s while the kill
-    # side keeps a 2.5x margin.
+    # 0.5s sleep against a 10s override below is a 20x margin, and against
+    # the 0.2s kill override is a fixed 2.5x margin in the other direction
+    # (sleep always takes >= 0.5s of real time regardless of CPU load, so
+    # that side was never load-sensitive to begin with).
     SLOW_BROWSER="${FIXTURE_DIR}/bin/slow-chrome"
     cat > "${SLOW_BROWSER}" <<'EOF'
 #!/bin/bash
@@ -252,11 +263,8 @@ EOF
         )
     }
 
-    # Pin the budget to its default for the first probe: the README tells
-    # users to export CHROME_PROBE_TIMEOUT, and an ambient value below ~1s
-    # would fail this assertion spuriously. (Empty means "unset" to :-.)
-    assert_eq "case f2: slow browser passes under the default 2s budget" \
-        "0" "$(CHROME_PROBE_TIMEOUT='' probe_slow_browser)"
+    assert_eq "case f2: slow browser passes when the override budget comfortably exceeds it" \
+        "0" "$(CHROME_PROBE_TIMEOUT=10 probe_slow_browser)"
     # Assert rc 124 exactly — timeout/gtimeout's "I killed it" status. Any
     # other nonzero rc (125 invalid duration, the probe's own failure code)
     # would mean the probe failed for the wrong reason, not that the budget
@@ -518,6 +526,25 @@ fi
 # the past-prereqs marker below fail.
 PAST_PREREQS_MARKER="STUB-REACHED-BUILD-PHASE"
 
+# check_prerequisites exits 1 on ANY failed prerequisite, not just the browser
+# gate — go, python3 too. The marker and the "Prerequisites check failed"
+# epilogue are therefore only readable as browser-gate signals on a host that
+# has go and python3 (this suite's own README/CLAUDE.md claim that guard
+# scripts "need no Go, Node, or Chrome" is about running the SUITE, not about
+# what a non-fatal gate needs downstream of it in main()). Without this guard
+# a python3-less host would see the browser gate behave correctly yet still
+# fail these two assertions on an unrelated missing prerequisite (TEST-016) —
+# a false RED, not a false green, but one that couples this un-gated
+# preflight-selftest job to the runner image's toolchain. Gate the
+# marker/epilogue checks on it and SKIP with a clear reason otherwise; the
+# browser-severity assertions (assert_gate, above and below) are NOT gated
+# because browser_gate_level reads only the browser diagnosis line and never
+# depends on go/python3 being present.
+HAS_NONBROWSER_PREREQS=true
+if ! command -v go >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+    HAS_NONBROWSER_PREREQS=false
+fi
+
 run_setup_main() {
     (
         # shellcheck source=setup-live-targets.sh
@@ -547,20 +574,51 @@ out_n="$(run_setup_main --targets grpc-server --skip-start)"
 assert_gate "case n: main() with a browserless grpc-server setup warns, not fails" \
     WARN "${out_n}"
 # check_prerequisites exits 1 on a fatal gate, so the marker can only appear if
-# the gate stayed non-fatal AND the run continued past it.
-if printf '%s' "${out_n}" | grep -qF "${PAST_PREREQS_MARKER}"; then
-    echo "PASS: case n: the run proceeds past prerequisites into the build phase"
-    pass_count=$((pass_count + 1))
+# the gate stayed non-fatal AND the run continued past it. Guarded on
+# HAS_NONBROWSER_PREREQS — see the comment above PAST_PREREQS_MARKER.
+if [ "${HAS_NONBROWSER_PREREQS}" = true ]; then
+    if printf '%s' "${out_n}" | grep -qF "${PAST_PREREQS_MARKER}"; then
+        echo "PASS: case n: the run proceeds past prerequisites into the build phase"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: case n: the run did not get past prerequisites (browser gate still fatal?)"
+        fail_count=$((fail_count + 1))
+    fi
+    if printf '%s' "${out_n}" | grep -q "Prerequisites check failed"; then
+        echo "FAIL: case n: main() hard-failed prerequisites on a browserless grpc-server setup"
+        fail_count=$((fail_count + 1))
+    else
+        echo "PASS: case n: main() did not hard-fail prerequisites"
+        pass_count=$((pass_count + 1))
+    fi
 else
-    echo "FAIL: case n: the run did not get past prerequisites (browser gate still fatal?)"
-    fail_count=$((fail_count + 1))
+    echo "SKIP: case n: marker/epilogue assertions need go and python3 on PATH"
 fi
-if printf '%s' "${out_n}" | grep -q "Prerequisites check failed"; then
-    echo "FAIL: case n: main() hard-failed prerequisites on a browserless grpc-server setup"
-    fail_count=$((fail_count + 1))
+
+# Case n (continued): isolate --skip-start AT THE CALL SITE against a
+# browser-backed target (TEST-017). out_n above isolates the TARGETS argument
+# (grpc-server has no browser target at all) but not skip_start: grpc-server
+# is already outside BROWSER_TARGETS, so browser_required returns 1 and the
+# gate degrades to WARN whether or not --skip-start is even passed — a
+# mutation at setup-live-targets.sh's call site (main() forwarding
+# `check_prerequisites "$targets" false` instead of "$skip_start") would leave
+# out_n, out_n2 below, and every case g-m green. This row and out_n2 differ in
+# EXACTLY ONE way — the presence of --skip-start against the same
+# browser-backed rest-api target — mirroring case i's isolation of skip_start
+# one level down, but through main() itself.
+out_n3="$(run_setup_main --targets rest-api --skip-start)"
+assert_gate "case n: main() forwards --skip-start for a browser-backed target (non-fatal)" \
+    WARN "${out_n3}"
+if [ "${HAS_NONBROWSER_PREREQS}" = true ]; then
+    if printf '%s' "${out_n3}" | grep -qF "${PAST_PREREQS_MARKER}"; then
+        echo "PASS: case n: --skip-start at the call site reaches the build phase"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: case n: --skip-start at the call site did not reach the build phase"
+        fail_count=$((fail_count + 1))
+    fi
 else
-    echo "PASS: case n: main() did not hard-fail prerequisites"
-    pass_count=$((pass_count + 1))
+    echo "SKIP: case n: --skip-start marker assertion needs go and python3 on PATH"
 fi
 
 # And the LAB-3893 half of the contract at the same call site: a browser-backed
@@ -583,6 +641,51 @@ if printf '%s' "${out_n2}" | grep -qF "${PAST_PREREQS_MARKER}"; then
 else
     echo "PASS: case n: a browser-backed setup never reaches the build phase"
     pass_count=$((pass_count + 1))
+fi
+
+# ── Case o: the rc==0 arm — a runnable browser is actually present ────
+# report_browser_prerequisite has three arms: rc==0 (browser found -> log_ok,
+# return 0), rc==2 (present but not runnable) and rc==1 (nothing found).
+# Cases g-n all pin CHROME_CANDIDATES to either the snap stub (rc==2, via
+# run_prereqs_with_stub_only) or a missing path (rc==1, via
+# run_prereqs_with_no_browser) — every one of them exercises a FAILURE arm of
+# the browser probe. The rc==0 "browser found" arm — the one that runs on
+# every correctly provisioned machine — was never fed to check_prerequisites
+# anywhere in this suite (TEST-015). A mutation that condemns a healthy
+# browser (e.g. replacing the rc==0 branch's `return 0` with a failure) would
+# therefore leave every case in this file green.
+#
+# Reuses run_prereqs_with directly (not the stub/no-browser wrappers) with
+# WORKING_BROWSER, against a browser-backed target with skip_start=false —
+# the case most like a real developer's first run on a freshly provisioned
+# host.
+out_o="$(run_prereqs_with "${WORKING_BROWSER}" "rest-api" false)"
+assert_gate "case o: a working browser leaves no [FAIL]/[WARN] browser diagnosis" \
+    NONE "${out_o}"
+if printf '%s' "${out_o}" | grep -q '\[OK\]' && \
+   printf '%s' "${out_o}" | grep -qF "Browser: ${WORKING_BROWSER}"; then
+    echo "PASS: case o: check_prerequisites logs the detected browser at [OK]"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case o: check_prerequisites did not log the detected browser at [OK]"
+    fail_count=$((fail_count + 1))
+fi
+# A working browser must not, by itself, cause the run to hard-fail. Guarded
+# on HAS_NONBROWSER_PREREQS for the same reason as case n's epilogue check
+# (see the comment above PAST_PREREQS_MARKER): check_prerequisites exits 1 on
+# ANY failed prerequisite, so on a go/python3-less host this line would print
+# regardless of the browser arm's own (correct) behaviour, coupling this
+# assertion to the runner image's toolchain the same way TEST-016 flagged.
+if [ "${HAS_NONBROWSER_PREREQS}" = true ]; then
+    if printf '%s' "${out_o}" | grep -q "Prerequisites check failed"; then
+        echo "FAIL: case o: a working browser still hard-failed prerequisites"
+        fail_count=$((fail_count + 1))
+    else
+        echo "PASS: case o: a working browser does not hard-fail prerequisites"
+        pass_count=$((pass_count + 1))
+    fi
+else
+    echo "SKIP: case o: epilogue-absence assertion needs go and python3 on PATH"
 fi
 
 # ── Summary ─────────────────────────────────────────────────────

@@ -23,11 +23,18 @@
 # fetched over the same channel as the package, unpinned, would buy nothing
 # against an attacker who controls that channel.
 #
-# Egress note: the repo and key are removed again once the install finishes, so
-# nothing persists to phone home. The google-chrome-stable package also tries
-# to install its own permanent apt source (/etc/apt/sources.list.d/google-chrome.list)
-# and a daily update pinger (/etc/cron.daily/google-chrome); both are suppressed
-# and then verified absent. Telemetry of the browser vespasian LAUNCHES is a
+# Egress note: the repo and key THIS SCRIPT adds are removed again once the
+# install finishes, so nothing this script itself wired up persists to phone
+# home. The google-chrome-stable package also tries to install its own
+# permanent apt source (/etc/apt/sources.list.d/google-chrome.list) and a daily
+# update pinger (/etc/cron.daily/google-chrome); this script always pre-seeds
+# the package's own opt-out so neither is ever created. Inside a throwaway
+# image (in_container()) it goes further and also removes + verifies absent
+# whatever the package planted anyway — that is AC4. Outside a container,
+# removing artifacts the package owns is not this script's call: they are the
+# normal update channel for a browser the operator is going to keep using, so
+# this script leaves them alone there once suppression has already stopped
+# them being created. Telemetry of the browser vespasian LAUNCHES is a
 # separate, already-solved concern: crawls go through NewBrowserManager, which
 # applies disableChromeTelemetry's flags (LAB-4999).
 #
@@ -180,6 +187,14 @@ ARCH=""
 # Temporary apt wiring, removed by cleanup_apt_wiring on every exit path.
 TMP_LIST="${TEST_ROOT}/etc/apt/sources.list.d/google-chrome-vespasian-temp.list"
 TMP_KEYRING="${TEST_ROOT}/usr/share/keyrings/google-chrome-vespasian-temp.gpg"
+# Pins the package NAME to the origin this script vouched for. Without this,
+# `apt-get install google-chrome-stable` resolves the name across every
+# configured source — a leftover permanent google-chrome.sources from an
+# earlier install, or any other third-party repo offering the same name —
+# and the fingerprint pin above never gates the artifact dpkg actually
+# unpacks. Pin-Priority 1001 outranks even an already-installed version, so
+# a stale local package cannot win over the origin this run trusts either.
+TMP_PREF="${TEST_ROOT}/etc/apt/preferences.d/google-chrome-vespasian-temp.pref"
 
 # The package's own opt-out file, and a durable record of what version landed.
 CHROME_DEFAULTS_FILE="${TEST_ROOT}/etc/default/google-chrome"
@@ -308,7 +323,7 @@ require_tools() {
 # and install it as a dedicated keyring. Refuses to proceed on any mismatch —
 # an unpinned key would make the whole signature check ornamental.
 install_pinned_key() {
-    local tmp_key="$1/google.pub" tmp_gpg="$1/google.gpg" tmp_ring="$1/google.kbx"
+    local tmp_key="$1/google.pub" tmp_gpg="$1/google.gpg" tmp_ring="$1/google.kbx" tmp_list="$1/google-chrome.list"
     local gpg_err="$1/gpg.err" gpg_home="$1/gnupg" fprs
     # A private homedir for every gpg call below. Without it gpg falls back to
     # the caller's ~/.gnupg — creating and locking a trustdb in root's home on
@@ -385,15 +400,52 @@ install_pinned_key() {
     # signed-by= is the whole point: it scopes verification of this source to the
     # fingerprint-pinned keyring. Without it apt would fall back to any key in
     # the system-wide trusted set and the pin would be ornamental.
+    #
+    # Staged then `install -m 0644`, matching the keyring write immediately
+    # above: the mode is stated at the call site instead of being left to the
+    # caller's umask, and the file lands atomically. `| $SUDO tee` did neither
+    # — under `umask 0` (a Dockerfile RUN commonly runs with one) it would have
+    # landed this apt source world-writable in /etc/apt/sources.list.d/,
+    # letting any local user repoint it — swap the URL, or `signed-by=` for
+    # `[trusted=yes]` — before the apt-get install a few lines down runs it as
+    # root. The fingerprint pin does not help there: the attacker rewrites the
+    # very line that names the pinned keyring.
     printf 'deb [arch=%s signed-by=%s] %s stable main\n' "$ARCH" "$TMP_KEYRING" "$GOOGLE_APT_URL" \
-        | $SUDO tee "$TMP_LIST" >/dev/null
+        > "$tmp_list"
+    $SUDO install -m 0644 -- "$tmp_list" "$TMP_LIST"
+
+    # Constrain resolution of the package NAME to the origin just pinned above
+    # (see TMP_PREF's declaration) — same staged-then-install pattern as the
+    # keyring and the source line.
+    local tmp_pref="$1/google-chrome.pref"
+    printf 'Package: google-chrome-stable\nPin: origin dl.google.com\nPin-Priority: 1001\n' \
+        > "$tmp_pref"
+    $SUDO install -d -- "$(dirname -- "$TMP_PREF")"
+    $SUDO install -m 0644 -- "$tmp_pref" "$TMP_PREF"
 }
 
-# Remove the temporary repo + keyring. Registered as a trap so a failure
+# Remove the temporary repo + keyring + pin. Registered as a trap so a failure
 # between adding and installing cannot leave the source behind — that source
 # persisting is exactly the phone-home the ticket is trying to prevent.
 cleanup_apt_wiring() {
-    $SUDO rm -f -- "$TMP_LIST" "$TMP_KEYRING"
+    $SUDO rm -f -- "$TMP_LIST" "$TMP_KEYRING" "$TMP_PREF"
+}
+
+# Confirms apt actually satisfied google-chrome-stable from dl.google.com —
+# the origin TMP_PREF pins — rather than from a stale permanent source left by
+# an earlier install, or any other third-party repo already offering a
+# package by this name. The fingerprint pin only gates a SOURCE's signature;
+# it never gated which source apt picked for the package NAME, and the pin
+# file alone raises that source's priority but does not prove apt actually
+# used it. `apt-cache policy` is read-only, so this needs no $SUDO.
+verify_apt_origin() {
+    local origin
+    origin=$(apt-cache policy google-chrome-stable 2>/dev/null \
+        | awk '/^ \*\*\*/{getline; print $2; exit}')
+    if ! printf '%s' "$origin" | grep -qF 'dl.google.com'; then
+        log_fail "google-chrome-stable was satisfied from an unexpected origin: ${origin:-unknown} (expected dl.google.com)"
+        return 1
+    fi
 }
 
 # The package's postinst re-adds Google's permanent apt source unless
@@ -476,23 +528,67 @@ SCRATCH_DIR=""
 # were already on the machine", so the trap removes only what this run caused.
 INSTALL_ATTEMPTED=0
 
+# Set to 1 once apt-get install has actually returned success (i.e. main() is
+# past the point set -e would have aborted it). This is what lets cleanup_all
+# tell apart "the install finished and main() itself already made the
+# container-aware call on whether to remove the phone-home artifacts" from
+# "the install died before main() ever reached that call". The trap must
+# handle only the second case: re-deciding on the first would run on every
+# successful exit and silently undo main()'s choice to leave a developer's
+# machine alone.
+INSTALL_SUCCEEDED=0
+
 cleanup_all() {
-    [ -n "$SCRATCH_DIR" ] && rm -rf -- "$SCRATCH_DIR"
-    cleanup_apt_wiring
-    # AC4 on the FAILURE paths too. Every success path already calls this, but an
-    # install that died after dpkg ran the package's postinst — the exact moment
-    # the permanent Google source and the daily pinger appear — left both behind,
-    # so a failed run was the one case that ADDED standing egress. It is an rm -f
-    # of fixed paths, so it is idempotent and safe to reach twice.
+    # Failure-tolerant end to end, via `|| true` on every step, and ordered so
+    # the security-relevant removal runs FIRST. This handler executes under
+    # the script's own `set -euo pipefail` — errexit is NOT suspended inside a
+    # trap — so an earlier step failing (an expired sudo credential cache
+    # between the last privileged command and the trap firing; `rm -rf` on a
+    # read-only /tmp mount or an immutable file) used to abort the whole
+    # handler before it ever reached remove_phone_home below, leaving a
+    # permanently trusted Google apt source and a root-run daily cron pinger
+    # on the host — exactly the standing egress this script exists to remove
+    # on its failure paths. `|| true` is what stops one step's failure from
+    # skipping the rest; the reorder is what stops it from skipping the most
+    # security-relevant one specifically.
     #
-    # Guarded on INSTALL_ATTEMPTED rather than run unconditionally: without that,
-    # this trap would fire on the browser-already-present early exit and delete a
-    # pre-existing Chrome's update channel on a developer's machine — undoing the
-    # in_container check on that path by the back door.
-    [ "$INSTALL_ATTEMPTED" -eq 1 ] && remove_phone_home
+    # AC4 on the FAILURE path too: an install that died after dpkg ran the
+    # package's postinst — the exact moment the permanent Google source and the
+    # daily pinger appear — left both behind, so a failed run was the one case
+    # that ADDED standing egress. remove_phone_home is an rm -f of fixed paths,
+    # so it is idempotent and safe to reach twice.
+    #
+    # Run unconditionally here, NOT gated on in_container: a run that died
+    # mid-install never reached main()'s own container-aware removal below, so
+    # this is the only place that decision gets made for a failed run — and a
+    # failed run leaves no working Chrome whose update channel is worth
+    # preserving either way. INSTALL_SUCCEEDED is what keeps this from also
+    # firing on every SUCCESSFUL exit: main() already made the real,
+    # container-aware decision there, and re-deciding here would silently
+    # remove the artifacts main() had just chosen to leave alone outside a
+    # container.
+    #
+    # Guarded on INSTALL_ATTEMPTED too, rather than run unconditionally: without
+    # that, this trap would fire on the browser-already-present early exit and
+    # delete a pre-existing Chrome's update channel on a developer's machine —
+    # undoing the in_container check on that path by the back door.
+    if [ "$INSTALL_ATTEMPTED" -eq 1 ] && [ "$INSTALL_SUCCEEDED" -ne 1 ]; then
+        remove_phone_home || true
+    fi
+    cleanup_apt_wiring || true
+    if [ -n "$SCRATCH_DIR" ]; then
+        rm -rf -- "$SCRATCH_DIR" || true
+    fi
     return 0
 }
 
+# Pipeline orchestrator: parse args → idempotency check (+ its own AC4 cleanup)
+# → prereqs → trust setup → install → verify. Intentionally longer than the
+# ~60-line guideline: each stage is a distinct sequential step that delegates
+# to a helper, and the two script-level state flags (INSTALL_ATTEMPTED,
+# INSTALL_SUCCEEDED) that the EXIT trap reads have to be set at exact points in
+# this one sequence — splitting it would scatter that ordering across
+# functions rather than removing it.
 main() {
     parse_args "$@"
 
@@ -595,9 +691,38 @@ main() {
     INSTALL_ATTEMPTED=1
     $SUDO apt-get update -qq
     $SUDO apt-get install -y --no-install-recommends google-chrome-stable
+    if ! verify_apt_origin; then
+        exit 1
+    fi
 
     cleanup_apt_wiring
-    remove_phone_home
+
+    # AC4 (no phone-home from the devcontainer image) only obligates removing
+    # the PACKAGE's own artifacts inside a throwaway image — same policy as the
+    # idempotent early exit above and the audit in verify_install below.
+    # Ungated, this was the one place a developer's own machine had the update
+    # channel for the Chrome it JUST installed removed, silently and
+    # unconditionally — the same mistake the early-exit branch above already
+    # guards against, just reached from the other side of the install.
+    if in_container; then
+        remove_phone_home
+    else
+        log_info "Not a container — leaving the google-chrome apt source and updater alone."
+        log_info "  (run inside the devcontainer image, or remove them by hand, to enforce AC4)"
+    fi
+
+    # Set HERE, immediately after the container-aware removal above, and NOT
+    # earlier next to apt-get: this flag means "main() has already made the
+    # container-aware AC4 decision", which is only true once that branch has
+    # actually run. Setting it right after `apt-get install` succeeded opened a
+    # hole on the failure path — dpkg's postinst plants the phone-home artifacts
+    # DURING apt-get, so an `exit 1` from verify_apt_origin between the two
+    # points left the trap looking at INSTALL_SUCCEEDED=1, skipping its own
+    # removal, and stranding a permanently trusted Google apt source plus the
+    # root-run daily pinger on the host. Any new early-exit added between
+    # apt-get and this line is covered by the trap precisely because the flag is
+    # still 0 there.
+    INSTALL_SUCCEEDED=1
 
     if in_container; then
         $SUDO rm -rf -- "${TEST_ROOT}/var/lib/apt/lists"/*
@@ -606,6 +731,27 @@ main() {
     fi
 
     verify_install
+}
+
+# Persists the installed version durably (called only from verify_install, for
+# a run that actually installed something). Logging alone was not enough: a
+# Dockerfile RUN or postCreateCommand that discards stdout left the image with
+# no evidence of which Chrome build it shipped, so a bad stable release could
+# not be correlated to an image or rolled back to a known-good one. Staged
+# then `install -m 0644`, matching how the keyring is written: the mode is
+# stated at the call site instead of being left to the caller's umask, and the
+# file lands atomically. `tee` did neither.
+record_chrome_version() {
+    local version="$1" staged_version="${SCRATCH_DIR}/chrome-version"
+    if printf '%s\n' "$version" > "$staged_version" &&
+       $SUDO install -d -- "$(dirname -- "$CHROME_VERSION_RECORD")" 2>/dev/null &&
+       $SUDO install -m 0644 -- "$staged_version" "$CHROME_VERSION_RECORD"; then
+        log_info "Recorded build in ${CHROME_VERSION_RECORD}"
+    else
+        # Non-fatal: the browser is installed and working, and the record is an
+        # audit convenience rather than a correctness requirement.
+        log_warn "Could not write the version record to ${CHROME_VERSION_RECORD}"
+    fi
 }
 
 verify_install() {
@@ -621,37 +767,22 @@ verify_install() {
     version="$("${installed}" --version 2>/dev/null || echo 'version unknown')"
     log_ok "Browser: ${installed} (${version})"
 
-    # ...and record it durably. Logging alone was not enough: a Dockerfile RUN or
-    # postCreateCommand that discards stdout left the image with no evidence of
-    # which Chrome build it shipped, so a bad stable release could not be
-    # correlated to an image or rolled back to a known-good one.
-    # Staged then `install -m 0644`, matching how the keyring is written: the mode
-    # is stated at the call site instead of being left to the caller's umask, and
-    # the file lands atomically. `tee` did neither.
-    #
     # Only when this run actually installed something. On the browser-already-
     # present early exit the script promises to touch nothing it does not own,
     # and a root-owned write into /usr/share is exactly such a touch — it also
-    # overwrote the record of the build a PREVIOUS run installed with whatever
-    # the ambient browser happens to report.
-    local staged_version="${SCRATCH_DIR}/chrome-version"
+    # would overwrite the record of the build a PREVIOUS run installed with
+    # whatever the ambient browser happens to report.
     if [ "$INSTALL_ATTEMPTED" -ne 1 ]; then
         log_info "Not recording a version (no install performed this run)."
-    elif printf '%s\n' "$version" > "$staged_version" &&
-       $SUDO install -d -- "$(dirname -- "$CHROME_VERSION_RECORD")" 2>/dev/null &&
-       $SUDO install -m 0644 -- "$staged_version" "$CHROME_VERSION_RECORD"; then
-        log_info "Recorded build in ${CHROME_VERSION_RECORD}"
     else
-        # Non-fatal: the browser is installed and working, and the record is an
-        # audit convenience rather than a correctness requirement.
-        log_warn "Could not write the version record to ${CHROME_VERSION_RECORD}"
+        record_chrome_version "$version"
     fi
 
     # This script's OWN temporary artifacts are always fatal if they survive:
     # they exist only because this run created them, so one left behind is a
     # teardown bug and a standing trusted apt source.
     local leftover
-    for leftover in "$TMP_LIST" "$TMP_KEYRING"; do
+    for leftover in "$TMP_LIST" "$TMP_KEYRING" "$TMP_PREF"; do
         if [ -e "$leftover" ]; then
             log_fail "Temporary apt artifact still present: ${leftover}"
             exit 1

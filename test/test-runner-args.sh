@@ -517,6 +517,13 @@ fi
 # binary-absent arm. Without the pin the assertion below covered the binary check
 # in CI and the target dispatch locally — two different code paths behind one
 # green result, and neither environment tested what the other did.
+#
+# Record whether the repo's own test/.results pre-exists BEFORE either real-run
+# block below, so the isolation assertion after them cannot be confused by a
+# leftover from an unrelated prior run (e.g. a developer's `make test`).
+results_dir_pre_existing=false
+[[ -e "$SCRIPT_DIR/.results" ]] && results_dir_pre_existing=true
+
 real_offline=$(env CONFIG_FILE="$noconfig" RESULTS_DIR="$TMPDIR_T/results" \
     VESPASIAN="$TMPDIR_T/no-such-vespasian-binary" \
     bash -c "source '$RUNNER' --targets import-empty --no-build" 2>&1) || true
@@ -530,10 +537,18 @@ fi
 # it. Pair it with a positive marker proving the run actually got as far as the
 # post-config stage. With VESPASIAN pinned absent, that marker is the binary
 # check — deterministically, in every environment.
-if [[ "$real_offline" == *"vespasian binary not found"* ]]; then
-    pass "real offline run reached the post-config stage (binary check)"
+#
+# The message must name the EXACT overridden path, not merely contain "vespasian
+# binary not found" (TEST-018). A substring-only match is satisfied just as well
+# by the default ${PROJECT_ROOT}/bin/vespasian path, which is what a broken
+# VESPASIAN="${VESPASIAN:-...}" indirection (dropped back to a plain assignment
+# that ignores the env override) would report instead — in CI (no build) that
+# message differs only in the path, so only pinning the exact path proves the
+# override, rather than ambient binary absence, is what produced this failure.
+if [[ "$real_offline" == *"vespasian binary not found at $TMPDIR_T/no-such-vespasian-binary"* ]]; then
+    pass "real offline run reached the post-config stage; VESPASIAN override honoured (exact overridden path in failure message)"
 else
-    fail "real offline run failed before reaching post-config: $(printf '%s' "$real_offline" | head -3)"
+    fail "real offline run failed before reaching post-config, or the VESPASIAN override was not honoured: $(printf '%s' "$real_offline" | head -3)"
 fi
 
 # The mirror image of the two assertions above, and the one that gives them
@@ -558,6 +573,22 @@ else
     pass "live target stops at the config check, before the binary check"
 fi
 
+# The header claims RESULTS_DIR "is redirected into a temp dir so nothing is
+# written into the repo." Nothing above pins that: both real-run blocks pass
+# RESULTS_DIR="$TMPDIR_T/results" as an env override, but if run-live-tests.sh
+# ever reverted its RESULTS_DIR="${RESULTS_DIR:-...}" indirection back to a
+# plain assignment, the override would be silently discarded and the
+# real_offline block (which reaches `mkdir -p "$RESULTS_DIR"` before the
+# binary-absent exit) would create test/.results inside this repo checkout —
+# invisible to `git status` because test/.results is gitignored (TEST-020).
+if $results_dir_pre_existing; then
+    echo "  (skipping RESULTS_DIR isolation check: $SCRIPT_DIR/.results pre-existed before this run)"
+elif [[ -e "$SCRIPT_DIR/.results" ]]; then
+    fail "RESULTS_DIR override was not honoured — test/.results was created in the repo checkout by the real-run block"
+else
+    pass "RESULTS_DIR override honoured — no test/.results written into the repo checkout by the real-run block"
+fi
+
 echo ""
 echo "=== Browser probe shared with common.sh ==="
 # chrome_available gates the rod-backed targets. It must use the SHARED
@@ -569,12 +600,13 @@ echo "=== Browser probe shared with common.sh ==="
 # setup preflight and install-chrome.sh from disagreeing about whether this host
 # has a usable browser.
 #
-# This is a DRIFT guard, in the same spirit as the target-group check above, and
-# it is deliberately structural. run-live-tests.sh calls `main "$@"` unguarded, so
-# chrome_available cannot be sourced and called in isolation without running the
-# whole runner. The probe's BEHAVIOUR is covered where it lives — preflight-selftest
-# drives detect_chrome_binary against working, snap-stub, and absent browsers —
-# so what is left to protect here is the delegation itself.
+# This is a DRIFT guard, in the same spirit as the target-group check above.
+# Both greps below are structural: they are satisfied by a body that calls
+# detect_chrome_binary and throws the answer away (TEST-021), e.g.
+# `detect_chrome_binary >/dev/null 2>&1; return 0`. Make the RESULT
+# load-bearing by extracting chrome_available the same way targets_need_config
+# is above — a sed range over the source, not the whole runner (which calls
+# `main "$@"` unguarded) — and driving it against a fixture CHROME_CANDIDATES.
 chrome_avail_body=$(awk '/^chrome_available\(\) \{/,/^\}/' "$RUNNER")
 if printf '%s' "$chrome_avail_body" | grep -q 'detect_chrome_binary'; then
     pass "chrome_available delegates to common.sh's detect_chrome_binary"
@@ -585,6 +617,98 @@ if printf '%s' "$chrome_avail_body" | grep -qE 'command -v (google-chrome|chromi
     fail "chrome_available reintroduced a presence-only 'command -v' probe (snap stubs pass it)"
 else
     pass "chrome_available carries no presence-only browser check"
+fi
+
+# shellcheck source=common.sh
+source "$SCRIPT_DIR/common.sh"
+source <(sed -n '/^chrome_available() {/,/^}/p' "$RUNNER")
+
+# Fidelity sentinel, matching the ones guarding the other function extractions
+# in this file: a broken/empty sed range would leave chrome_available
+# UNDEFINED, and calling it would then error under `set -e` rather than
+# silently misreport — but assert presence explicitly so that failure mode is
+# named instead of a confusing abort deeper in the behavioral checks below.
+if declare -F chrome_available >/dev/null; then
+    pass "chrome_available sourced from run-live-tests.sh"
+else
+    fail "chrome_available was not sourced (extraction broken/empty)"
+fi
+
+chrome_fixture_dir="$TMPDIR_T/chrome-fixture"
+mkdir -p "$chrome_fixture_dir/bin" "$chrome_fixture_dir/home"
+
+# A working "browser": prints a version string and exits 0 (mirrors
+# preflight-selftest.sh's fixture).
+chrome_working_browser="$chrome_fixture_dir/bin/google-chrome"
+cat > "$chrome_working_browser" <<'EOF'
+#!/bin/bash
+echo "Fake Chrome 999.0.0.0"
+exit 0
+EOF
+chmod +x "$chrome_working_browser"
+
+# A present-but-not-runnable "browser": the LAB-3893 snap-stub failure mode.
+chrome_broken_browser="$chrome_fixture_dir/bin/broken-chrome"
+cat > "$chrome_broken_browser" <<'EOF'
+#!/bin/bash
+echo "broken-chrome: not runnable" >&2
+exit 127
+EOF
+chmod +x "$chrome_broken_browser"
+
+# Positive polarity: a working candidate reports available.
+if (
+    CHROME_CANDIDATES=("$chrome_working_browser")
+    HOME="$chrome_fixture_dir/home"
+    chrome_available
+); then
+    pass "chrome_available: reports available with a runnable candidate"
+else
+    fail "chrome_available: expected available (rc 0) with a runnable candidate"
+fi
+
+# Negative polarity — the one a `detect_chrome_binary >/dev/null 2>&1; return 0`
+# mutation defeats: only a non-runnable candidate, and HOME pointed at a
+# directory with no .cache/rod/browser fallback.
+if (
+    CHROME_CANDIDATES=("$chrome_broken_browser")
+    HOME="$chrome_fixture_dir/home"
+    chrome_available
+); then
+    fail "chrome_available: expected unavailable (rc 1) with only a non-runnable candidate and no rod cache"
+else
+    pass "chrome_available: reports unavailable with only a non-runnable candidate and no rod cache"
+fi
+
+echo ""
+echo "=== print_summary: RESULTS_DIR is data, not format (TEST-019) ==="
+# This PR converts print_summary's RESULTS_DIR line from `echo -e` to
+# `printf '%s'`, with an explicit rationale: RESULTS_DIR is env-overridable, so
+# it is data, not format, and must not have backslash escapes interpreted.
+# Nothing exercised print_summary at all before this. common.sh is already
+# sourced above (chrome_available block); extract print_summary the same way
+# targets_need_config/load_config are extracted.
+source <(sed -n '/^print_summary() {/,/^}/p' "$RUNNER")
+
+if declare -F print_summary >/dev/null; then
+    pass "print_summary sourced from run-live-tests.sh"
+else
+    fail "print_summary was not sourced (extraction broken/empty)"
+fi
+
+# Empty TEST_STATUS (and friends) so the per-target loop body never runs —
+# only the Total/Results lines under test are exercised. These associative
+# arrays are declared globally in run-live-tests.sh; declare fresh ones here
+# since only print_summary's body, not the whole file, was sourced.
+summary_out=$(
+    declare -A TEST_STATUS=() TEST_ENDPOINTS=() TEST_EXPECTED=() TEST_DURATION=()
+    RESULTS_DIR='/tmp/x\e[31m'
+    print_summary
+) || true
+if printf '%s' "$summary_out" | grep -qF '\e[31m'; then
+    pass "print_summary: RESULTS_DIR backslash escape stays literal (printf %s, not echo -e)"
+else
+    fail "print_summary: RESULTS_DIR backslash escape was interpreted — expected literal '\\e[31m' in: $summary_out"
 fi
 
 echo ""
@@ -745,6 +869,42 @@ else
     fi
 fi
 
+echo ""
+echo "=== Suite coverage: every suite in test/ is wired into some CI job (TEST-022) ==="
+# The hardcoded loop above only proves the DELETE direction for four names
+# inside ONE job. It misses (1) a suite wired into a DIFFERENT job — e.g.
+# test/validate_test.sh runs under validator-regression, not
+# preflight-selftest, and a grep for validate_test anywhere above this point
+# in this file returns nothing — and (2) a suite added to test/ and never
+# wired into ANY job, since a hand-maintained loop can only check names
+# someone remembered to add to it — the same failure mode as remembering to
+# add the CI step in the first place. Mirrors the ALL_TARGETS/BROWSER_TARGETS
+# exhaustiveness pattern below: derive the candidate set from the tree instead
+# of trusting a hardcoded list to stay current.
+mapfile -t candidate_suites < <(
+    (cd "$SCRIPT_DIR" && ls -1 -- *selftest.sh *_test.sh 2>/dev/null; printf '%s\n' test-runner-args.sh) | sort -u
+)
+if printf '%s\n' "${candidate_suites[@]}" | grep -qx 'install-chrome-selftest.sh' \
+   && printf '%s\n' "${candidate_suites[@]}" | grep -qx 'test-runner-args.sh'; then
+    pass "candidate suite list derived from test/*selftest.sh + test/*_test.sh (sentinels present)"
+else
+    fail "candidate suite list derivation is broken/empty (expected sentinels missing)"
+fi
+
+if [[ -f "$WORKFLOW" ]]; then
+    workflow_runlines_all=$(grep -vE '^[[:space:]]*#' "$WORKFLOW")
+    for suite in "${candidate_suites[@]}"; do
+        suite_re=${suite//./\\.}
+        if printf '%s\n' "$workflow_runlines_all" | grep -qE "run:[[:space:]]*(\./|bash )?test/${suite_re}([[:space:]]|$)"; then
+            pass "suite '$suite' is invoked by some CI job in live-tests.yml"
+        else
+            fail "suite '$suite' exists in test/ but is not invoked by any CI job — add it to a job, or to the exemption list here"
+        fi
+    done
+else
+    fail "live-tests.yml not found at $WORKFLOW (suite-coverage assertions vacuous)"
+fi
+
 # install-chrome-e2e is the sole automated coverage of the installer's
 # privileged region (download, signature-verified apt install, trap teardown,
 # AC4 cleanup). Deleting the job would remove that coverage with every other
@@ -762,6 +922,88 @@ if [[ -f "$WORKFLOW" ]]; then
             pass "install-chrome-e2e still invokes test/install-chrome.sh end-to-end"
         else
             fail "install-chrome-e2e no longer runs test/install-chrome.sh — the privileged path is uncovered"
+        fi
+
+        # The job-exists / script-runs checks above say nothing about the
+        # STEPS that turn that run into a test (TEST-023): deleting the "Assert
+        # no phone-home artifacts survive" step — the only place AC4 and the
+        # version record are verified against a real install — left the two
+        # checks above green with no other signal. Require the verification
+        # steps explicitly, and reject the same continue-on-error escape hatch
+        # the preflight-selftest block above rejects.
+        e2e_runlines=$(printf '%s\n' "$e2e_block" | grep -vE '^[[:space:]]*#')
+        if printf '%s\n' "$e2e_runlines" | grep -q 'chrome-version'; then
+            pass "install-chrome-e2e still asserts the chrome-version record (AC4)"
+        else
+            fail "install-chrome-e2e no longer asserts the chrome-version record — AC4 version-record coverage dropped silently"
+        fi
+        if printf '%s\n' "$e2e_runlines" | grep -qE '/etc/cron\.daily/google-chrome'; then
+            pass "install-chrome-e2e still asserts /etc/cron.daily/google-chrome is absent (AC4)"
+        else
+            fail "install-chrome-e2e no longer asserts /etc/cron.daily/google-chrome is absent — AC4 phone-home coverage dropped silently"
+        fi
+        if printf '%s\n' "$e2e_runlines" | grep -q 'already present'; then
+            pass "install-chrome-e2e still asserts the idempotent re-run marker"
+        else
+            fail "install-chrome-e2e no longer asserts the 'already present' idempotent re-run marker"
+        fi
+        if printf '%s\n' "$e2e_runlines" | grep -qE '^[[:space:]]*continue-on-error:[[:space:]]*true'; then
+            fail "install-chrome-e2e sets continue-on-error: true — a failing verification step would not fail CI"
+        else
+            pass "install-chrome-e2e has no continue-on-error: true"
+        fi
+
+        echo ""
+        echo "=== Phone-home path list: workflow vs install-chrome.sh (TEST-001) ==="
+        # AC4's control surface is hand-copied under a "KEEP IN LOCKSTEP" comment
+        # with no guard: PHONE_HOME_PATHS + TMP_LIST/TMP_KEYRING/TMP_PREF in
+        # install-chrome.sh, and the `for p in ...` list in this job's own
+        # "Assert no phone-home artifacts survive" step (already extracted above
+        # as e2e_block). Nothing detected the drift the comment itself admits
+        # already happened once. Parse PHONE_HOME_PATHS structurally (sed range
+        # + array source, like OFFLINE_TARGETS/LIVE_TARGETS above) rather than
+        # grepping for literal paths, so this guard is robust to unrelated edits
+        # to install-chrome.sh's surrounding code.
+        INSTALL_CHROME="$SCRIPT_DIR/install-chrome.sh"
+        if [[ ! -f "$INSTALL_CHROME" ]]; then
+            fail "install-chrome.sh not found at $INSTALL_CHROME (phone-home drift guard vacuous)"
+        else
+            # TEST_ROOT must be set (empty) before sourcing: PHONE_HOME_PATHS,
+            # TMP_LIST, TMP_KEYRING and TMP_PREF all reference "${TEST_ROOT}/...",
+            # and this file runs under `set -u`. Empty TEST_ROOT resolves to the
+            # bare system paths the workflow's e2e job — which runs unrooted, as
+            # root — actually asserts against.
+            TEST_ROOT=""
+            source <(sed -n '/^PHONE_HOME_PATHS=(/,/^)/p' "$INSTALL_CHROME")
+            source <(grep '^TMP_LIST=' "$INSTALL_CHROME")
+            source <(grep '^TMP_KEYRING=' "$INSTALL_CHROME")
+            source <(grep '^TMP_PREF=' "$INSTALL_CHROME")
+
+            # Fidelity sentinel: an empty/broken extraction would make the
+            # comparison below vacuously agree with whatever (nothing) it found.
+            if [[ "${#PHONE_HOME_PATHS[@]}" -gt 0 && -n "${TMP_LIST:-}" && -n "${TMP_KEYRING:-}" && -n "${TMP_PREF:-}" ]] \
+               && printf '%s\n' "${PHONE_HOME_PATHS[@]}" | grep -qx '/etc/cron.daily/google-chrome'; then
+                pass "PHONE_HOME_PATHS/TMP_LIST/TMP_KEYRING/TMP_PREF extracted from install-chrome.sh"
+            else
+                fail "PHONE_HOME_PATHS/TMP_LIST/TMP_KEYRING/TMP_PREF extraction from install-chrome.sh is broken/empty"
+            fi
+
+            install_chrome_paths=$(printf '%s\n' "${PHONE_HOME_PATHS[@]}" "$TMP_LIST" "$TMP_KEYRING" "$TMP_PREF" | sort -u)
+
+            # The workflow's `for p in ...; do` list, from e2e_block above.
+            # Backslash line-continuations are stripped before word-splitting.
+            workflow_phone_home_paths=$(printf '%s\n' "$e2e_block" \
+                | sed -n '/for p in /,/; do/p' \
+                | sed -e 's/^[[:space:]]*for p in //' -e 's/\\$//' -e 's/;[[:space:]]*do$//' \
+                | tr -s '[:space:]' '\n' | grep -v '^$' | sort -u)
+
+            if [[ -z "$workflow_phone_home_paths" ]]; then
+                fail "could not extract the workflow's 'for p in ...' phone-home path list (extraction broken)"
+            elif [[ "$install_chrome_paths" == "$workflow_phone_home_paths" ]]; then
+                pass "workflow phone-home path list matches install-chrome.sh's PHONE_HOME_PATHS + TMP_LIST/TMP_KEYRING/TMP_PREF"
+            else
+                fail "workflow phone-home path list has drifted from install-chrome.sh: $(diff <(printf '%s\n' "$install_chrome_paths") <(printf '%s\n' "$workflow_phone_home_paths") | tr '\n' ' ')"
+            fi
         fi
     else
         fail "install-chrome-e2e job is gone — the installer's privileged path has no coverage at all"

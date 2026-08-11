@@ -23,7 +23,10 @@
 # root in a disposable container.
 #
 # This suite needs NO network: the Google key it verifies against is the
-# committed fixture test/fixtures/google-linux-signing-key.asc.
+# committed fixture test/fixtures/google-linux-signing-key.asc. It DOES need an
+# ambient gpg (to verify that fixture the same way install_pinned_key would);
+# an absent gpg is treated as a coverage-hole skip of the trust anchor's
+# success path (cases j/j2), not a silent abort (TEST-005).
 #
 # Usage: bash test/install-chrome-selftest.sh
 
@@ -179,21 +182,27 @@ fi
 # Stub `dpkg` on PATH so the mapping is exercised without caring what the host
 # actually is. resolve_arch echoes the arch on success and returns non-zero on
 # an unsupported one.
-mkdir -p "${FIXTURE_DIR}/bin"
+#
+# The stub goes in a dir of its OWN (bin-d), not a shared FIXTURE_DIR/bin --
+# see case i's comment on why a shared bin poisons later cases (TEST-002). A
+# dpkg last written here for "riscv64" must never leak into any later case.
+mkdir -p "${FIXTURE_DIR}/bin-d"
 make_dpkg_stub() {
-    cat > "${FIXTURE_DIR}/bin/dpkg" <<EOF
+    local dir="${2:-${FIXTURE_DIR}/bin-d}"
+    mkdir -p "${dir}"
+    cat > "${dir}/dpkg" <<EOF
 #!/bin/bash
 [ "\$1" = "--print-architecture" ] && { echo "$1"; exit 0; }
 exit 1
 EOF
-    chmod +x "${FIXTURE_DIR}/bin/dpkg"
+    chmod +x "${dir}/dpkg"
 }
 
 run_resolve_arch() {
     make_dpkg_stub "$1"
     # shellcheck disable=SC2030,SC2031  # subshell-local PATH is the isolation mechanism, not a bug
     (
-        PATH="${FIXTURE_DIR}/bin:${PATH}"
+        PATH="${FIXTURE_DIR}/bin-d:${PATH}"
         # shellcheck source=install-chrome.sh
         source "${INSTALL_SCRIPT}"
         set +e
@@ -233,7 +242,11 @@ assert_eq "case e: pinned signing-key fingerprint constant is unchanged" \
 # This is the case that fails if the fingerprint comparison is removed.
 run_install_pinned_key() {
     local stub_body=$1
-    cat > "${FIXTURE_DIR}/bin/curl" <<EOF
+    # Own bin (bin-f), not the shared FIXTURE_DIR/bin -- TEST-002. This curl
+    # stub is rewritten on every f0/f1/f2 call, so a shared dir would make each
+    # call's curl silently depend on whatever the PREVIOUS f-case last wrote.
+    mkdir -p "${FIXTURE_DIR}/bin-f"
+    cat > "${FIXTURE_DIR}/bin-f/curl" <<EOF
 #!/bin/bash
 # Ignore curl's flags; the last argument is the URL, the -o target is what
 # install_pinned_key reads back.
@@ -244,10 +257,10 @@ while [ \$# -gt 0 ]; do
 done
 ${stub_body}
 EOF
-    chmod +x "${FIXTURE_DIR}/bin/curl"
+    chmod +x "${FIXTURE_DIR}/bin-f/curl"
     # shellcheck disable=SC2030,SC2031  # subshell-local PATH/SUDO overrides are deliberate
     (
-        PATH="${FIXTURE_DIR}/bin:${PATH}"
+        PATH="${FIXTURE_DIR}/bin-f:${PATH}"
         # shellcheck source=install-chrome.sh
         source "${INSTALL_SCRIPT}"
         SUDO="/bin/false"   # any privileged call would fail loudly, proving we never reach one
@@ -257,6 +270,36 @@ EOF
         printf '%s\n%s\n' "$?" "${out}"
     )
 }
+
+# f0: curl itself fails to fetch the key (network error, DNS failure, a
+# downgrade redirect refused by --proto/--proto-redir). This is the FIRST and
+# EARLIEST branch of install_pinned_key, and it was untested: f1/f2's stub
+# below always exits 0, so a fetch failure never happened in this suite.
+res_f0=$(run_install_pinned_key 'exit 22')
+assert_eq "case f: a curl fetch failure is refused (rc 1)" "1" "$(echo "${res_f0}" | sed -n '1p')"
+assert_contains "case f: the fetch failure is diagnosed, not blamed on the key" \
+    "Could not fetch Google's signing key" "${res_f0}"
+if printf '%s' "${res_f0}" | grep -q "matches pinned fingerprint"; then
+    echo "FAIL: case f: a fetch failure did not stop before ever verifying a key"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS: case f: a fetch failure stops before any verification or \$SUDO call"
+    pass_count=$((pass_count + 1))
+fi
+
+# Structural companion to f0: --proto/--proto-redir are what turn a downgrade
+# REDIRECT into a hard failure rather than a silent cleartext fetch, and no
+# behavioural test can see them -- a working curl fetches the key with or
+# without them, so f0's stub (which ignores every flag but -o) cannot tell the
+# difference either. Grepping the source is the only practical guard for a
+# flag whose absence is silent, same spirit as case p's trap-line check below.
+if grep -qF -- "--proto '=https' --proto-redir '=https'" "${INSTALL_SCRIPT}"; then
+    echo "PASS: case f: the key fetch pins --proto and --proto-redir to https (downgrade redirects refused)"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case f: the key fetch no longer pins --proto/--proto-redir to https"
+    fail_count=$((fail_count + 1))
+fi
 
 # f1: the endpoint returns something that is not a PGP key at all.
 # shellcheck disable=SC2016  # $out is expanded inside the stub at run time, not here
@@ -286,6 +329,69 @@ if printf '%s' "${res_f2}" | grep -q "matches pinned fingerprint"; then
     fail_count=$((fail_count + 1))
 else
     echo "PASS: case f: an unexpected key is never reported as matching the pin"
+    pass_count=$((pass_count + 1))
+fi
+
+# f4: main() calls install_pinned_key BEFORE suppress_permanent_repo, so a run
+# that never earns trust also never mutates /etc/default (install-chrome.sh's
+# own stated ordering rationale). Drives this through main() itself, since that
+# is the only call site where the ordering exists at all -- f0-f2 call
+# install_pinned_key in isolation and say nothing about it. CHROME_CANDIDATES
+# is emptied and a passthrough sudo is supplied so main() reaches the ordered
+# pair unprivileged; the curl stub serves the wrong key so install_pinned_key
+# fails and the run must stop there.
+root_f4="${FIXTURE_DIR}/root-f4"
+bin_f4="${FIXTURE_DIR}/bin-f4"
+mkdir -p "${root_f4}" "${bin_f4}"
+printf '#!/bin/bash\nexec "$@"\n' > "${bin_f4}/sudo"
+cat > "${bin_f4}/dpkg" <<'EOF'
+#!/bin/bash
+[ "$1" = "--print-architecture" ] && { echo amd64; exit 0; }
+exit 1
+EOF
+cat > "${bin_f4}/curl" <<EOF
+#!/bin/bash
+out=""
+while [ \$# -gt 0 ]; do
+    [ "\$1" = "-o" ] && { out="\$2"; shift 2; continue; }
+    shift
+done
+cat '${SCRIPT_DIR}/fixtures/not-google-signing-key.asc' > "\$out"
+EOF
+chmod +x "${bin_f4}/sudo" "${bin_f4}/dpkg" "${bin_f4}/curl"
+# NOT the usual `set +e` INSIDE the subshell before calling main(): the ordering
+# property being tested is main()'s reliance on `set -e` ITSELF to abort before
+# suppress_permanent_repo runs (install_pinned_key's failure is a bare
+# statement, not an explicit `if ! ...; then exit 1; fi` check). Disabling
+# errexit before the call -- the pattern every other main()-driving case in
+# this file uses -- would disable it for main()'s own internals too, and
+# install_pinned_key's failure would silently stop aborting the run, which is
+# exactly the ordering swap this case exists to catch. So `set +e` is applied
+# OUTSIDE, around the whole command substitution, the same way case r and case
+# t already do it for a script invocation.
+set +e
+res_f4=$(
+    (
+        VESPASIAN_TEST_ROOT="${root_f4}"
+        export VESPASIAN_TEST_ROOT
+        PATH="${bin_f4}:${PATH}"
+        # shellcheck source=install-chrome.sh
+        source "${INSTALL_SCRIPT}"
+        CHROME_CANDIDATES=()
+        main
+    ) 2>&1
+)
+rc_f4=$?
+set -e
+assert_eq "case f: main() aborts on a fingerprint mismatch before any further mutation (rc 1)" \
+    "1" "${rc_f4}"
+assert_contains "case f: the abort is the fingerprint mismatch, not something else" \
+    "fingerprint mismatch" "${res_f4}"
+if [ -e "${root_f4}/etc/default/google-chrome" ]; then
+    echo "FAIL: case f: /etc/default/google-chrome was written despite never earning trust (ordering swapped?)"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS: case f: a run that never earns trust never mutates /etc/default (install before suppress)"
     pass_count=$((pass_count + 1))
 fi
 
@@ -368,7 +474,7 @@ assert_eq "case h: neither signal means NOT a container (cache is left alone)" \
 # stdout and main()'s `ARCH="$(resolve_arch)"` captured it, so the script died
 # with an empty terminal. Run the SCRIPT (not the function) so the call site is
 # in scope, and assert the reason appears in the combined output.
-make_dpkg_stub riscv64
+#
 # CHROME_CANDIDATES is emptied rather than relying on PATH isolation: the array
 # holds ABSOLUTE paths (/usr/bin/google-chrome …), which `command -v` resolves
 # regardless of PATH, so a host with a real Chrome would take the idempotency
@@ -391,8 +497,15 @@ mkdir -p "${FIXTURE_DIR}/root-arch"
 # REAL gpg to verify the pinned key, and a `gpg` that exits 0 made its four
 # trust-anchor assertions fail. Scoping them to this case is the difference
 # between fixing an isolation problem and moving it downstream.
+#
+# dpkg's stub lives in THIS SAME directory now too (TEST-002), rather than in
+# the shared FIXTURE_DIR/bin used by case d's run_resolve_arch: a `dpkg` last
+# written by case d for a DIFFERENT arch, resolved here only because it
+# happened to still be on PATH, is exactly the undeclared cross-case ordering
+# dependency this suite already fixed once for apt-get/curl/gpg/sudo above.
 ARCH_STUBS="${FIXTURE_DIR}/bin-arch"
 mkdir -p "${ARCH_STUBS}"
+make_dpkg_stub riscv64 "${ARCH_STUBS}"
 # sudo must actually chain through to its argument; the rest need only exist
 # and succeed, because this case is about what happens AFTER them.
 printf '#!/bin/bash\nexec "$@"\n' > "${ARCH_STUBS}/sudo"
@@ -404,10 +517,10 @@ unset _t
 arch_result=$(
     VESPASIAN_TEST_ROOT="${FIXTURE_DIR}/root-arch"
     export VESPASIAN_TEST_ROOT
-    # bin-arch first (this case's stubs), then the shared fixture bin (for the
-    # dpkg stub), then the host (for coreutils). Prefixed rather than replaced:
-    # replacing PATH outright broke the script at `dirname` before main() ran.
-    PATH="${ARCH_STUBS}:${FIXTURE_DIR}/bin:${PATH}"
+    # bin-arch first (this case's own stubs, dpkg included), then the host (for
+    # coreutils). Prefixed rather than replaced: replacing PATH outright broke
+    # the script at `dirname` before main() ran.
+    PATH="${ARCH_STUBS}:${PATH}"
     # shellcheck source=install-chrome.sh
     source "${INSTALL_SCRIPT}"
     CHROME_CANDIDATES=()
@@ -440,7 +553,20 @@ assert_contains "case i: the reason is explained, not just a bare exit" \
 # egress to dl.google.com, so an egress change could disarm them while the suite
 # stayed green.
 GOOGLE_KEY_CACHE="${SCRIPT_DIR}/fixtures/google-linux-signing-key.asc"
-if [ -s "${GOOGLE_KEY_CACHE}" ]; then
+# TEST-005: this suite's header claims it needs no network, but says nothing
+# about gpg -- and the very next line calls it unconditionally. An absent gpg
+# used to abort the whole script here under `set -euo pipefail` (a bare
+# command-not-found inside a pipeline feeding a command substitution), killing
+# the run mid-suite with no summary and no indication that everything from
+# here on -- the trust anchor, the phone-home chain, containment, cleanup_all
+# -- never executed. Checked explicitly so the gap becomes a diagnosable skip
+# (and, per the policy below, a hard FAIL) instead of a silent abort.
+if command -v gpg >/dev/null 2>&1; then
+    have_gpg=1
+else
+    have_gpg=0
+fi
+if [ "${have_gpg}" -eq 1 ] && [ -s "${GOOGLE_KEY_CACHE}" ]; then
     have_real_key=1
 else
     have_real_key=0
@@ -463,12 +589,17 @@ fi
 
 if [ "${have_real_key}" -eq 1 ]; then
     root_j="${FIXTURE_DIR}/root-j"
-    mkdir -p "${root_j}/etc/apt/sources.list.d" "${root_j}/usr/share/keyrings"
+    mkdir -p "${root_j}/etc/apt/sources.list.d" "${root_j}/usr/share/keyrings" \
+             "${root_j}/etc/apt/preferences.d"
+    # bin-j, not the shared FIXTURE_DIR/bin (TEST-002): j2's curl below serves a
+    # DIFFERENT bundle, and a shared dir would make whichever ran last leak into
+    # any case added after them.
     res_j=$(
         VESPASIAN_TEST_ROOT="${root_j}"
         export VESPASIAN_TEST_ROOT
-        PATH="${FIXTURE_DIR}/bin:${PATH}"
-        cat > "${FIXTURE_DIR}/bin/curl" <<EOF
+        mkdir -p "${FIXTURE_DIR}/bin-j"
+        PATH="${FIXTURE_DIR}/bin-j:${PATH}"
+        cat > "${FIXTURE_DIR}/bin-j/curl" <<EOF
 #!/bin/bash
 out=""
 while [ \$# -gt 0 ]; do
@@ -477,7 +608,7 @@ while [ \$# -gt 0 ]; do
 done
 cat '${GOOGLE_KEY_CACHE}' > "\$out"
 EOF
-        chmod +x "${FIXTURE_DIR}/bin/curl"
+        chmod +x "${FIXTURE_DIR}/bin-j/curl"
         # shellcheck source=install-chrome.sh
         source "${INSTALL_SCRIPT}"
         SUDO=""
@@ -495,8 +626,16 @@ EOF
     assert_contains "case j: the emitted apt source pins the architecture" \
         "arch=amd64" \
         "$(cat "${root_j}/etc/apt/sources.list.d/google-chrome-vespasian-temp.list" 2>/dev/null)"
+    # Modes actually achieved on disk -- a literal `install -m 0644` in the
+    # source is not evidence of what lands; only stat proves it. All three of
+    # install_pinned_key's `install -m 0644` writes are checked, not just the
+    # keyring: TMP_LIST and TMP_PREF get the same treatment and had no assertion.
     assert_eq "case j: the installed keyring is world-readable but not writable (0644)" \
         "644" "$(stat -c '%a' "${root_j}/usr/share/keyrings/google-chrome-vespasian-temp.gpg" 2>/dev/null)"
+    assert_eq "case j: the installed apt source list is world-readable but not writable (0644)" \
+        "644" "$(stat -c '%a' "${root_j}/etc/apt/sources.list.d/google-chrome-vespasian-temp.list" 2>/dev/null)"
+    assert_eq "case j: the installed origin pin is world-readable but not writable (0644)" \
+        "644" "$(stat -c '%a' "${root_j}/etc/apt/preferences.d/google-chrome-vespasian-temp.pref" 2>/dev/null)"
     # Only the pinned key may end up in the keyring: exporting the whole fetched
     # bundle would hand apt every key the endpoint chose to return.
     exported_fprs=$(gpg --homedir "${GNUPG_ASSERT_HOME}" --show-keys --with-colons --with-fingerprint \
@@ -522,8 +661,9 @@ EOF
     res_j2=$(
         VESPASIAN_TEST_ROOT="${root_j2}"
         export VESPASIAN_TEST_ROOT
-        PATH="${FIXTURE_DIR}/bin:${PATH}"
-        cat > "${FIXTURE_DIR}/bin/curl" <<EOF
+        mkdir -p "${FIXTURE_DIR}/bin-j2"
+        PATH="${FIXTURE_DIR}/bin-j2:${PATH}"
+        cat > "${FIXTURE_DIR}/bin-j2/curl" <<EOF
 #!/bin/bash
 out=""
 while [ \$# -gt 0 ]; do
@@ -532,7 +672,7 @@ while [ \$# -gt 0 ]; do
 done
 cat '${FIXTURE_DIR}/two-key-bundle.asc' > "\$out"
 EOF
-        chmod +x "${FIXTURE_DIR}/bin/curl"
+        chmod +x "${FIXTURE_DIR}/bin-j2/curl"
         # shellcheck source=install-chrome.sh
         source "${INSTALL_SCRIPT}"
         SUDO=""
@@ -558,7 +698,11 @@ EOF
 else
     # Counted separately: this is the trust anchor's ONLY success-path coverage,
     # so skipping it is a coverage hole rather than an unsuitable environment.
-    skip "case j/j2: trust-anchor success path (fixture test/fixtures/google-linux-signing-key.asc missing or empty)"
+    if [ "${have_gpg}" -eq 1 ]; then
+        skip "case j/j2: trust-anchor success path (fixture test/fixtures/google-linux-signing-key.asc missing or empty)"
+    else
+        skip "case j/j2: trust-anchor success path (gpg not found on PATH)"
+    fi
     trust_anchor_skips=$((trust_anchor_skips + 1))
 fi
 
@@ -583,23 +727,86 @@ assert_contains "case k: the opt-out is appended" \
 # had a test. The selftest header claims every rejection path is reachable
 # unprivileged — these make that true rather than aspirational.
 run_resolve_sudo() {
+    # $2 (optional): a file to capture resolve_sudo's own diagnostic in. It is
+    # NOT captured via `out=$(resolve_sudo ...)` -- a command substitution
+    # always forks ITS OWN subshell, so any SUDO=... assignment resolve_sudo
+    # makes would be lost the instant that substitution returns, and every
+    # caller downstream would see "unset" regardless of which branch actually
+    # ran. Redirecting straight to a file keeps resolve_sudo in THIS subshell,
+    # so its SUDO assignment survives to the printf below.
+    local msgfile="${2:-/dev/null}"
     (
         # shellcheck source=install-chrome.sh
         source "${INSTALL_SCRIPT}"
         PATH="$1"
         set +e
-        resolve_sudo >/dev/null 2>&1
+        resolve_sudo >"${msgfile}" 2>&1
         printf '%s\n%s\n' "$?" "${SUDO-unset}"
     )
 }
+mkdir -p "${FIXTURE_DIR}/empty-bin"
+# The refusal path needs `id -u` to resolve to the REAL uid so the root check
+# inside resolve_sudo evaluates as DESIGNED. With a bare empty PATH, `id` is
+# unresolvable: `$(id -u)` returns empty, `[ "" -eq 0 ]` errors "integer
+# expression expected" and returns non-zero -- which happens to still take the
+# "not root" branch, so the case passed, but by a degenerate route that never
+# actually asked whether we are root. Stubbing `id` (not adding real coreutils
+# to PATH, which would risk making a real `sudo` resolvable too) fixes that
+# while keeping sudo itself genuinely absent.
+real_uid=$(id -u)
+cat > "${FIXTURE_DIR}/empty-bin/id" <<EOF
+#!/bin/bash
+[ "\$1" = "-u" ] && { echo "${real_uid}"; exit 0; }
+exit 1
+EOF
+chmod +x "${FIXTURE_DIR}/empty-bin/id"
+
 # A PATH with neither sudo nor anything else: non-root + no sudo must refuse.
+# Both output lines are asserted, not just rc: the previous version discarded
+# resolve_sudo's own diagnostic entirely (`>/dev/null 2>&1`), so the message
+# was unverified, and nothing ever read the SUDO line the harness captured.
 if [ "$(id -u)" -ne 0 ]; then
-    res_l=$(run_resolve_sudo "${FIXTURE_DIR}/empty-bin")
+    msgfile_l="${FIXTURE_DIR}/resolve_sudo_l.msg"
+    res_l=$(run_resolve_sudo "${FIXTURE_DIR}/empty-bin" "${msgfile_l}")
     assert_eq "case l: non-root without sudo refuses (rc 1)" \
         "1" "$(echo "${res_l}" | sed -n '1p')"
+    assert_eq "case l: SUDO is left unset on the refusal path" \
+        "unset" "$(echo "${res_l}" | sed -n '2p')"
+    assert_contains "case l: the refusal names the reason" \
+        "Not running as root and sudo is unavailable" "$(cat "${msgfile_l}" 2>/dev/null)"
 else
     skip "case l: non-root sudo refusal (running as root)"
 fi
+
+# The two SUCCESS paths had no coverage at all -- neither is hypothetical, both
+# feed every privileged command in the script. sudo-present: SUDO must become
+# exactly the string "sudo", not merely rc 0 (rc 0 alone is also what a broken
+# resolve_sudo that always "succeeds" would produce).
+mkdir -p "${FIXTURE_DIR}/sudo-bin"
+cp "${FIXTURE_DIR}/empty-bin/id" "${FIXTURE_DIR}/sudo-bin/id"
+printf '#!/bin/bash\nexec "$@"\n' > "${FIXTURE_DIR}/sudo-bin/sudo"
+chmod +x "${FIXTURE_DIR}/sudo-bin/sudo"
+res_l3=$(run_resolve_sudo "${FIXTURE_DIR}/sudo-bin")
+assert_eq "case l: non-root with sudo available succeeds (rc 0)" \
+    "0" "$(echo "${res_l3}" | sed -n '1p')"
+assert_eq "case l: SUDO is set to the sudo prefix" \
+    "sudo" "$(echo "${res_l3}" | sed -n '2p')"
+
+# Root branch: `id -u` stubbed to report 0 (fakeroot-style), which resolve_sudo
+# must accept WITHOUT ever calling sudo -- no sudo binary is on this PATH at
+# all, so a resolve_sudo that skipped the root check would fail here instead.
+mkdir -p "${FIXTURE_DIR}/root-bin"
+cat > "${FIXTURE_DIR}/root-bin/id" <<'EOF'
+#!/bin/bash
+[ "$1" = "-u" ] && { echo 0; exit 0; }
+exit 1
+EOF
+chmod +x "${FIXTURE_DIR}/root-bin/id"
+res_l4=$(run_resolve_sudo "${FIXTURE_DIR}/root-bin")
+assert_eq "case l: a root uid short-circuits before sudo is even checked (rc 0)" \
+    "0" "$(echo "${res_l4}" | sed -n '1p')"
+assert_eq "case l: SUDO is the empty prefix when already root" \
+    "" "$(echo "${res_l4}" | sed -n '2p')"
 
 run_require_apt() {
     (
@@ -654,14 +861,18 @@ root_n="${FIXTURE_DIR}/root-n"
 plant_phone_home() {
     rm -rf "${root_n}"
     mkdir -p "${root_n}/etc/apt/sources.list.d" "${root_n}/etc/cron.daily" \
-             "${root_n}/usr/share/keyrings"
+             "${root_n}/usr/share/keyrings" "${root_n}/etc/apt/preferences.d"
     # Both the legacy .list and the deb822 .sources the current package writes.
+    # TMP_PREF (the origin pin) is planted alongside TMP_LIST/TMP_KEYRING since
+    # cleanup_apt_wiring and verify_install's temp-artifact loop now cover all
+    # three.
     touch "${root_n}/etc/apt/sources.list.d/google-chrome.list" \
           "${root_n}/etc/apt/sources.list.d/google-chrome.sources" \
           "${root_n}/etc/cron.daily/google-chrome" \
           "${root_n}/usr/share/keyrings/google-chrome.gpg" \
           "${root_n}/etc/apt/sources.list.d/google-chrome-vespasian-temp.list" \
-          "${root_n}/usr/share/keyrings/google-chrome-vespasian-temp.gpg"
+          "${root_n}/usr/share/keyrings/google-chrome-vespasian-temp.gpg" \
+          "${root_n}/etc/apt/preferences.d/google-chrome-vespasian-temp.pref"
 }
 
 # A fake browser so verify_install gets past detect_chrome_binary.
@@ -715,7 +926,8 @@ res_n2=$(
 )
 assert_eq "case n: cleanup_apt_wiring succeeds (rc 0)" "0" "${res_n2}"
 for tmpart in etc/apt/sources.list.d/google-chrome-vespasian-temp.list \
-              usr/share/keyrings/google-chrome-vespasian-temp.gpg; do
+              usr/share/keyrings/google-chrome-vespasian-temp.gpg \
+              etc/apt/preferences.d/google-chrome-vespasian-temp.pref; do
     if [ -e "${root_n}/${tmpart}" ]; then
         echo "FAIL: case n: cleanup_apt_wiring left ${tmpart} behind"
         fail_count=$((fail_count + 1))
@@ -725,11 +937,52 @@ for tmpart in etc/apt/sources.list.d/google-chrome-vespasian-temp.list \
     fi
 done
 
-# n3: verify_install must FAIL when a phone-home artifact survives. This is the
-# assertion that makes the "No Google apt source ... left behind" message mean
-# something instead of merely being printed.
-plant_phone_home
-res_n3=$(
+# n3a: verify_install must FAIL when a PHONE-HOME artifact survives, and that
+# failure must be DISTINCT from the temporary-artifact failure below (TEST-007).
+# The old case n3 planted BOTH sets of files via plant_phone_home, so
+# verify_install always exited at the EARLIER temporary-artifact loop and the
+# PHONE_HOME_PATHS loop this case exists to cover was never reached; the
+# needle "still present" matched the earlier message too, so the case passed
+# either way. This fixture plants ONLY the PHONE_HOME_PATHS entries -- no
+# vespasian-temp files -- so the earlier loop passes clean and execution
+# actually reaches the phone-home loop. in_container()'s audit is gated on
+# in_container(), so the container arm is pinned explicitly, same as case o.
+rm -rf "${root_n}"
+mkdir -p "${root_n}/etc/apt/sources.list.d" "${root_n}/etc/cron.daily" \
+         "${root_n}/usr/share/keyrings"
+touch "${root_n}/etc/apt/sources.list.d/google-chrome.list" \
+      "${root_n}/etc/apt/sources.list.d/google-chrome.sources" \
+      "${root_n}/etc/cron.daily/google-chrome" \
+      "${root_n}/usr/share/keyrings/google-chrome.gpg"
+: > "${root_n}/.dockerenv"
+res_n3a=$(
+    VESPASIAN_TEST_ROOT="${root_n}"
+    export VESPASIAN_TEST_ROOT
+    unset REMOTE_CONTAINERS
+    PATH="${FIXTURE_DIR}/fakebin:${PATH}"
+    # shellcheck source=install-chrome.sh
+    source "${INSTALL_SCRIPT}"
+    SUDO=""
+    set +e
+    out=$(verify_install 2>&1)
+    printf '%s\n%s\n' "$?" "${out}"
+)
+assert_eq "case n3a: verify_install fails when a phone-home artifact survives (rc 1)" \
+    "1" "$(echo "${res_n3a}" | sed -n '1p')"
+assert_contains "case n3a: verify_install names the phone-home artifact distinctly" \
+    "Phone-home artifact still present" "${res_n3a}"
+
+# n3b: verify_install must FAIL when its OWN temporary apt artifact survives --
+# the OTHER half of the split, and the arm the old n3 was accidentally testing
+# every time. Fixture plants ONLY TMP_LIST/TMP_KEYRING/TMP_PREF, no
+# PHONE_HOME_PATHS, so this is reached regardless of in_container().
+rm -rf "${root_n}"
+mkdir -p "${root_n}/etc/apt/sources.list.d" "${root_n}/usr/share/keyrings" \
+         "${root_n}/etc/apt/preferences.d"
+touch "${root_n}/etc/apt/sources.list.d/google-chrome-vespasian-temp.list" \
+      "${root_n}/usr/share/keyrings/google-chrome-vespasian-temp.gpg" \
+      "${root_n}/etc/apt/preferences.d/google-chrome-vespasian-temp.pref"
+res_n3b=$(
     VESPASIAN_TEST_ROOT="${root_n}"
     export VESPASIAN_TEST_ROOT
     PATH="${FIXTURE_DIR}/fakebin:${PATH}"
@@ -740,16 +993,25 @@ res_n3=$(
     out=$(verify_install 2>&1)
     printf '%s\n%s\n' "$?" "${out}"
 )
-assert_eq "case n: verify_install fails when an artifact survives (rc 1)" \
-    "1" "$(echo "${res_n3}" | sed -n '1p')"
-assert_contains "case n: verify_install names the surviving artifact" \
-    "still present" "${res_n3}"
+assert_eq "case n3b: verify_install fails when a temporary apt artifact survives (rc 1)" \
+    "1" "$(echo "${res_n3b}" | sed -n '1p')"
+assert_contains "case n3b: verify_install names the temporary artifact distinctly" \
+    "Temporary apt artifact still present" "${res_n3b}"
 
-# n4: and it must PASS once the chain has actually cleaned up — otherwise n3
-# could be satisfied by a verify_install that always fails.
-res_n4=$(
+# n4a/n4b: verify_install must PASS once the chain has actually cleaned up, on
+# BOTH arms -- and each arm's success message must be asserted EXACTLY, not
+# via the ambiguous needle "left behind" that matches both of verify_install's
+# success messages (TEST-008). The old case n4 asserted only "left behind"
+# without pinning which arm ran, so its result silently depended on whether
+# the runner happened to export REMOTE_CONTAINERS (true in this devcontainer,
+# unset on a bare GitHub runner) -- exercising different production code
+# depending on who ran it, same divergence case o already had to fix.
+plant_phone_home
+: > "${root_n}/.dockerenv"
+res_n4a=$(
     VESPASIAN_TEST_ROOT="${root_n}"
     export VESPASIAN_TEST_ROOT
+    unset REMOTE_CONTAINERS
     PATH="${FIXTURE_DIR}/fakebin:${PATH}"
     # shellcheck source=install-chrome.sh
     source "${INSTALL_SCRIPT}"
@@ -760,10 +1022,33 @@ res_n4=$(
     out=$(verify_install 2>&1)
     printf '%s\n%s\n' "$?" "${out}"
 )
-assert_eq "case n: verify_install passes on a clean tree (rc 0)" \
-    "0" "$(echo "${res_n4}" | sed -n '1p')"
-assert_contains "case n: the clean tree is reported as such" \
-    "left behind" "${res_n4}"
+assert_eq "case n4a: verify_install passes on a clean tree, container arm (rc 0)" \
+    "0" "$(echo "${res_n4a}" | sed -n '1p')"
+assert_contains "case n4a: the container arm reports its exact success message" \
+    "No Google apt source, keyring, or update pinger left behind" "${res_n4a}"
+
+plant_phone_home
+rm -f "${root_n}/.dockerenv"
+res_n4b=$(
+    VESPASIAN_TEST_ROOT="${root_n}"
+    export VESPASIAN_TEST_ROOT
+    unset REMOTE_CONTAINERS
+    PATH="${FIXTURE_DIR}/fakebin:${PATH}"
+    # shellcheck source=install-chrome.sh
+    source "${INSTALL_SCRIPT}"
+    SUDO=""
+    set +e
+    remove_phone_home
+    cleanup_apt_wiring
+    out=$(verify_install 2>&1)
+    printf '%s\n%s\n' "$?" "${out}"
+)
+assert_eq "case n4b: verify_install passes on a clean tree, non-container arm (rc 0)" \
+    "0" "$(echo "${res_n4b}" | sed -n '1p')"
+assert_contains "case n4b: the non-container arm reports its exact (different) success message" \
+    "No temporary apt artifacts left behind" "${res_n4b}"
+assert_contains "case n4b: the non-container arm explains why package artifacts are unaudited" \
+    "not audited (not a container)" "${res_n4b}"
 
 # n5: verify_install's OTHER failure arm — no runnable browser after an install
 # that reported success. Cases n3/n4 only pin the surviving-artifact arm, so
@@ -796,11 +1081,16 @@ assert_contains "case n5: it says the install produced no runnable browser" \
 # override cannot keep these writes unprivileged. A passthrough `sudo` stub on
 # PATH is what does: resolve_sudo finds it and every $SUDO call runs as the test
 # user, leaving no root-owned files in the fixture tree.
-cat > "${FIXTURE_DIR}/bin/sudo" <<'EOF'
+#
+# Own dir (bin-o), not the shared FIXTURE_DIR/bin (TEST-002): case o2 below
+# installs its OWN sudo shim rather than inheriting this one, so the two cases
+# do not silently depend on which order they run in.
+mkdir -p "${FIXTURE_DIR}/bin-o"
+cat > "${FIXTURE_DIR}/bin-o/sudo" <<'EOF'
 #!/bin/bash
 exec "$@"
 EOF
-chmod +x "${FIXTURE_DIR}/bin/sudo"
+chmod +x "${FIXTURE_DIR}/bin-o/sudo"
 
 plant_phone_home
 # The container marker is planted EXPLICITLY. Phone-home removal on the early
@@ -816,7 +1106,7 @@ res_o=$(
     # Unset so the fixture's own marker is the only thing in_container() can be
     # answering; otherwise an ambient value would mask a broken marker.
     unset REMOTE_CONTAINERS
-    PATH="${FIXTURE_DIR}/bin:${PATH}"
+    PATH="${FIXTURE_DIR}/bin-o:${PATH}"
     # shellcheck source=install-chrome.sh
     source "${INSTALL_SCRIPT}"
     # Pin the candidate to the fake so the early exit is taken deterministically
@@ -866,7 +1156,22 @@ done
 # written, hung the suite twice on exactly that, and would have been a flaky test
 # in CI. A flaky assertion is worth less than a deterministic one plus the
 # recorded reasoning above.
-trap_setup=$(grep -E "^ *trap " "${INSTALL_SCRIPT}")
+#
+# TEST-009: the extraction used to grep the WHOLE FILE, so a trap statement
+# sitting in a function main() never calls (e.g. a helper the traps were moved
+# into but never wired up) satisfied every assertion below just as well as the
+# real ones inside main(). Anchoring the extraction to main()'s own body closes
+# that: a trap outside the range main() actually executes can no longer count.
+#
+# `|| true` is load-bearing, not decoration: if a mutation removes every trap
+# from main()'s body, grep finds zero matches and exits 1, and under this
+# file's own `set -euo pipefail` that pipeline failure would silently ABORT
+# THE WHOLE SUITE right here -- no summary, no FAIL line, the exact anti-
+# pattern TEST-005 exists to prevent, just relocated to this assignment.
+# Falling back to an empty trap_setup instead lets every assertion below
+# evaluate against "no traps found" and FAIL individually, which is what
+# should happen when main() no longer installs its signal handlers.
+trap_setup=$(awk '/^main\(\) \{/,/^\}/' "${INSTALL_SCRIPT}" | grep -E "^ *trap " || true)
 if printf '%s' "${trap_setup}" | grep -qE "trap 'exit 130' INT"; then
     echo "PASS: case p: SIGINT exits (130) rather than resuming the interrupted run"
     pass_count=$((pass_count + 1))
@@ -897,6 +1202,60 @@ else
     echo "FAIL: case p: nothing cleans up on EXIT"
     fail_count=$((fail_count + 1))
 fi
+
+# p2: a RUNTIME complement to the structural check above, closing the one gap
+# that text-matching main()'s body cannot: a trap statement can sit textually
+# inside main() (so it satisfies the awk-scoped grep above) and still never
+# execute, e.g. wrapped in a branch main() never takes. Driving a real SIGINT/
+# SIGTERM is out (see the note above -- it hung the suite twice); this
+# doesn't drive a signal at all. It overrides detect_chrome_binary AFTER
+# sourcing the script -- bash resolves function calls by name at call time, so
+# main() invokes THIS version -- to snapshot the shell's ACTUAL trap table
+# (`trap -p`) the instant main() reaches its first call to it, which is
+# immediately after main()'s own `trap ... EXIT/INT/TERM` statements and
+# before anything needing curl/gpg/apt-get. The override also reports a
+# browser present, so main() takes the harmless early exit right after.
+# VERIFIED to catch what the structural check above cannot: wrapping the three
+# `trap` statements in `if false; then ... fi` (still textually inside
+# main()) leaves the grep-based check green but this probe's output empty.
+run_trap_probe() {
+    (
+        # This SELFTEST script sets its own EXIT/INT/TERM traps at file scope
+        # (near the top, for its own FIXTURE_DIR cleanup), and subshells
+        # INHERIT signal traps from their parent unless cleared. install-
+        # chrome.sh's INT/TERM bodies (`exit 130` / `exit 143`) are byte-
+        # identical to this harness's own, so without this reset the probe
+        # below would "see" the HARNESS's ambient traps and pass even when
+        # main() never installs its own -- measured: it did, on first draft,
+        # for exactly the INT/TERM assertions (the EXIT trap bodies differ
+        # between the two scripts, so that one was never masked). Clearing
+        # first makes every trap this probe reports attributable to main().
+        trap - EXIT INT TERM
+        VESPASIAN_TEST_ROOT="$1"
+        export VESPASIAN_TEST_ROOT
+        PATH="${FIXTURE_DIR}/bin-p:${PATH}"
+        # shellcheck source=install-chrome.sh
+        source "${INSTALL_SCRIPT}"
+        # shellcheck disable=SC2317  # invoked indirectly, by main() calling this name dynamically
+        detect_chrome_binary() {
+            trap -p
+            printf '/bin/true\n'
+            return 0
+        }
+        set +e
+        main 2>&1
+    )
+}
+mkdir -p "${FIXTURE_DIR}/root-p-trap" "${FIXTURE_DIR}/bin-p"
+printf '#!/bin/bash\nexec "$@"\n' > "${FIXTURE_DIR}/bin-p/sudo"
+chmod +x "${FIXTURE_DIR}/bin-p/sudo"
+trap_probe=$(run_trap_probe "${FIXTURE_DIR}/root-p-trap")
+assert_contains "case p2 (runtime): cleanup_all is actually installed on EXIT" \
+    "trap -- 'cleanup_all' EXIT" "${trap_probe}"
+assert_contains "case p2 (runtime): SIGINT is actually wired to exit 130" \
+    "trap -- 'exit 130' SIGINT" "${trap_probe}"
+assert_contains "case p2 (runtime): SIGTERM is actually wired to exit 143" \
+    "trap -- 'exit 143' SIGTERM" "${trap_probe}"
 
 # ── Case q: an unreadable defaults file is refused, not silently clobbered ─
 # suppress_permanent_repo reads the current file to decide what to write back.
@@ -1016,13 +1375,25 @@ assert_contains "case r: it reports the existing browser rather than a missing t
 # verify_install checking those same paths unconditionally, so a developer's
 # machine with a normally-installed Chrome got a hard failure. Only the pair of
 # cases o + o2 pins both arms.
+#
+# TEST-002: this installs its OWN sudo shim (bin-o2) rather than inheriting
+# case o's (bin-o). The two cases sharing one bin was an undeclared ordering
+# dependency -- reordering or deleting case o would have silently changed what
+# case o2 executes as, without any assertion here noticing.
+mkdir -p "${FIXTURE_DIR}/bin-o2"
+cat > "${FIXTURE_DIR}/bin-o2/sudo" <<'EOF'
+#!/bin/bash
+exec "$@"
+EOF
+chmod +x "${FIXTURE_DIR}/bin-o2/sudo"
+
 plant_phone_home
 rm -f "${root_n}/.dockerenv"
 res_o2=$(
     VESPASIAN_TEST_ROOT="${root_n}"
     export VESPASIAN_TEST_ROOT
     unset REMOTE_CONTAINERS
-    PATH="${FIXTURE_DIR}/bin:${PATH}"
+    PATH="${FIXTURE_DIR}/bin-o2:${PATH}"
     # shellcheck source=install-chrome.sh
     source "${INSTALL_SCRIPT}"
     CHROME_CANDIDATES=("${FIXTURE_DIR}/fakebin/google-chrome")
@@ -1057,6 +1428,131 @@ if [ ! -e "${root_n}/usr/share/vespasian/chrome-version" ]; then
 else
     echo "FAIL: case o2: the no-touch early exit wrote a version record"
     fail_count=$((fail_count + 1))
+fi
+
+# ── Case v: in_container() gates removal on the MAIN install path too ───
+# Cases o/o2 pin the in_container() gate on the IDEMPOTENT early exit only.
+# main() has a SECOND, independent in_container() call further down -- reached
+# only after `apt-get install` has actually "succeeded" -- and nothing
+# exercised it: every other case in this suite stops before the first $SUDO.
+# This is the security-relevant behaviour change of the whole wave (remove_
+# phone_home on the main path used to run unconditionally; it is now gated the
+# same way the early exit already was) and it had zero coverage.
+#
+# Reaching it unprivileged needs every step of the install path stubbed
+# through, INCLUDING the postinst side effect the whole audit exists to catch:
+# a real `apt-get install` is what actually plants the phone-home artifacts, so
+# the apt-get stub plants them itself (and drops a runnable fake browser)
+# exactly when it is invoked with "install", mirroring what dpkg's postinst
+# really does. Depends on the same committed key fixture as cases j/j2 (install_
+# pinned_key has to genuinely succeed to reach this code); skips distinctly
+# from trust_anchor_skips if that fixture or gpg is unavailable, since this
+# case is not testing the trust anchor itself, only relying on it.
+run_main_install_path() {
+    local root="$1" container="$2" bin_v
+    bin_v="${FIXTURE_DIR}/bin-v-${container}"
+    rm -rf "${root}" "${bin_v}"
+    mkdir -p "${root}" "${bin_v}"
+
+    printf '#!/bin/bash\nexec "$@"\n' > "${bin_v}/sudo"
+    cat > "${bin_v}/dpkg" <<'EOF'
+#!/bin/bash
+[ "$1" = "--print-architecture" ] && { echo amd64; exit 0; }
+exit 1
+EOF
+    cat > "${bin_v}/curl" <<EOF
+#!/bin/bash
+out=""
+while [ \$# -gt 0 ]; do
+    [ "\$1" = "-o" ] && { out="\$2"; shift 2; continue; }
+    shift
+done
+cat '${GOOGLE_KEY_CACHE}' > "\$out"
+EOF
+    cat > "${bin_v}/apt-cache" <<'POLICY_STUB'
+#!/bin/bash
+cat <<'POLICY'
+google-chrome-stable:
+  Installed: (none)
+  Candidate: 999.0.0.0-1
+  Version table:
+ *** 999.0.0.0-1 500
+        500 http://dl.google.com/linux/chrome/deb stable/main amd64 Packages
+POLICY
+POLICY_STUB
+    # Simulates dpkg's postinst: the actual moment the phone-home artifacts and
+    # a runnable browser binary appear on a real host. Only "install" plants
+    # them, so `apt-get update` (and anything else) stays a no-op.
+    cat > "${bin_v}/apt-get" <<EOF
+#!/bin/bash
+case "\$*" in
+    *install*google-chrome-stable*)
+        mkdir -p '${root}/etc/apt/sources.list.d' '${root}/etc/cron.daily' '${root}/usr/share/keyrings'
+        touch '${root}/etc/apt/sources.list.d/google-chrome.list' \\
+              '${root}/etc/apt/sources.list.d/google-chrome.sources' \\
+              '${root}/etc/cron.daily/google-chrome' \\
+              '${root}/usr/share/keyrings/google-chrome.gpg'
+        printf '#!/bin/bash\necho "Google Chrome 999.0.0.0"\n' > '${bin_v}/google-chrome'
+        chmod +x '${bin_v}/google-chrome'
+        ;;
+esac
+exit 0
+EOF
+    chmod +x "${bin_v}/sudo" "${bin_v}/dpkg" "${bin_v}/curl" "${bin_v}/apt-cache" "${bin_v}/apt-get"
+
+    (
+        VESPASIAN_TEST_ROOT="${root}"
+        export VESPASIAN_TEST_ROOT
+        if [ "${container}" = "container" ]; then
+            : > "${root}/.dockerenv"
+        fi
+        unset REMOTE_CONTAINERS
+        PATH="${bin_v}:${PATH}"
+        # shellcheck source=install-chrome.sh
+        source "${INSTALL_SCRIPT}"
+        # An ABSOLUTE path, not the bare name "google-chrome": command -v on a
+        # bare name resolves it anywhere on PATH, including a REAL Chrome the
+        # host already has (this devcontainer does). That silently took the
+        # idempotent EARLY exit instead of the main install path this case
+        # exists to drive through -- same trap case i's comment documents --
+        # and made both assertions below pass for the wrong reason (nothing
+        # was ever planted, so nothing needed to be removed). Pinning to the
+        # exact path the apt-get stub will create is what forces the real path.
+        CHROME_CANDIDATES=("${bin_v}/google-chrome")
+        set +e
+        out=$(main 2>&1)
+        printf '%s\n%s\n' "$?" "${out}"
+    )
+}
+
+if [ "${have_real_key}" -eq 1 ]; then
+    root_v1="${FIXTURE_DIR}/root-v1"
+    res_v1=$(run_main_install_path "${root_v1}" "container")
+    assert_eq "case v: in_container()=true main-install-path run succeeds end to end (rc 0)" \
+        "0" "$(echo "${res_v1}" | sed -n '1p')"
+    if [ -e "${root_v1}/etc/apt/sources.list.d/google-chrome.list" ] || \
+       [ -e "${root_v1}/etc/cron.daily/google-chrome" ]; then
+        echo "FAIL: case v: in_container()=true still left the package's phone-home artifacts on the main install path"
+        fail_count=$((fail_count + 1))
+    else
+        echo "PASS: case v: in_container()=true removes the package's phone-home artifacts on the main install path"
+        pass_count=$((pass_count + 1))
+    fi
+
+    root_v2="${FIXTURE_DIR}/root-v2"
+    res_v2=$(run_main_install_path "${root_v2}" "host")
+    assert_eq "case v: in_container()=false main-install-path run succeeds end to end (rc 0)" \
+        "0" "$(echo "${res_v2}" | sed -n '1p')"
+    if [ -e "${root_v2}/etc/apt/sources.list.d/google-chrome.list" ] && \
+       [ -e "${root_v2}/etc/cron.daily/google-chrome" ]; then
+        echo "PASS: case v: in_container()=false leaves the package's phone-home artifacts alone on the main install path"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: case v: in_container()=false removed artifacts it does not own on the main install path"
+        fail_count=$((fail_count + 1))
+    fi
+else
+    skip "case v: main-install-path in_container() gating (needs the same key fixture/gpg as j/j2)"
 fi
 
 # ── Case t: VESPASIAN_TEST_ROOT containment ────────────────────
@@ -1172,17 +1668,105 @@ done
 assert_eq "case u: a run that never installed (INSTALL_ATTEMPTED=0) touches nothing" \
     "1" "${kept_u}"
 
+# The trap's OTHER guard. INSTALL_SUCCEEDED=1 means "main() already made the
+# container-aware AC4 decision", so the trap must defer to it and leave the
+# package's artifacts exactly as main() chose to. Without this arm, a trap that
+# ignored the flag would silently delete the update channel of the Chrome it had
+# just successfully installed on a developer's machine — undoing case v's gate
+# from the failure side.
+plant_u
+(
+    VESPASIAN_TEST_ROOT="${root_u}"
+    export VESPASIAN_TEST_ROOT
+    # shellcheck source=install-chrome.sh disable=SC1091
+    source "${INSTALL_SCRIPT}"
+    SUDO=""
+    SCRATCH_DIR="${FIXTURE_DIR}/scratch-u3"; mkdir -p "$SCRATCH_DIR"
+    INSTALL_ATTEMPTED=1
+    INSTALL_SUCCEEDED=1
+    cleanup_all
+) >/dev/null 2>&1
+kept_u3=1
+for f in "${root_u}/etc/apt/sources.list.d/google-chrome.list" \
+         "${root_u}/etc/cron.daily/google-chrome"; do
+    [ -e "$f" ] || kept_u3=0
+done
+assert_eq "case u: a SUCCESSFUL install (INSTALL_SUCCEEDED=1) leaves main()'s decision alone" \
+    "1" "${kept_u3}"
+
+# Ordering guard, and the reason this case exists at all. INSTALL_SUCCEEDED must
+# be set AFTER main()'s container-aware removal, not next to `apt-get install`.
+# dpkg's postinst plants the phone-home artifacts DURING apt-get, so an early
+# exit between the two points (verify_apt_origin's `exit 1` is one today, and
+# any future check added there is another) fires the trap with the flag already
+# set — the trap then defers to a decision main() never reached, and a
+# permanently trusted Google apt source plus the root-run daily pinger survive a
+# FAILED run. That regression shipped once and is invisible behaviourally: every
+# other assertion in this file stays green with the assignment in the wrong
+# place, because no case drives that exact window. Hence a structural check.
+#
+# The anchor has to be the INSTALL-PATH removal specifically. main() contains a
+# SECOND bare `remove_phone_home` earlier, on the idempotent early-exit branch,
+# and anchoring on the first match silently compares against that one instead:
+# the buggy position (right after `apt-get install`) still sorts after the
+# early-exit removal, so the guard passed while reproducing the exact regression
+# it exists to catch. Verified by mutation — this comment is the record of that.
+# Anchoring on `apt-get install` first, then the NEXT removal after it, pins the
+# window that actually matters: apt-get < install-path removal < flag.
+# `|| true` on every extraction below is load-bearing, exactly as in case p: a
+# mutation that removes one of these statements makes its grep match nothing and
+# exit 1, and under this file's `set -euo pipefail` that pipeline failure aborts
+# THE WHOLE SUITE at this assignment — no summary, no FAIL line. Falling back to
+# an empty string instead lets the sentinel below report the breakage as a
+# failure, which is the entire point of having a sentinel.
+main_body_u=$(awk '/^main\(\) \{/,/^\}/' "${INSTALL_SCRIPT}")
+apt_at=$(printf '%s\n' "${main_body_u}" | grep -n '^[[:space:]]*\$SUDO apt-get install ' | head -1 | cut -d: -f1 || true)
+succ_at=$(printf '%s\n' "${main_body_u}" | grep -n '^[[:space:]]*INSTALL_SUCCEEDED=1[[:space:]]*$' | head -1 | cut -d: -f1 || true)
+rm_at=""
+if [ -n "${apt_at}" ]; then
+    rm_at=$(printf '%s\n' "${main_body_u}" | awk -v start="${apt_at}" \
+        'NR > start && /^[[:space:]]*remove_phone_home[[:space:]]*$/ { print NR; exit }')
+fi
+# Fidelity sentinel first: a broken extraction (main() renamed, any of the three
+# statements reworded) must FAIL loudly rather than let the comparison below pass
+# vacuously on empty strings.
+if [ -n "${succ_at}" ] && [ -n "${rm_at}" ] && [ -n "${apt_at}" ]; then
+    echo "PASS: case u: apt-get install, the install-path removal, and INSTALL_SUCCEEDED=1 all located in main()"
+    pass_count=$((pass_count + 1))
+    if [ "${succ_at}" -gt "${rm_at}" ]; then
+        echo "PASS: case u: INSTALL_SUCCEEDED is set after main()'s container-aware removal"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: case u: INSTALL_SUCCEEDED=1 precedes remove_phone_home — a failed run between apt-get and the removal would strand the Google apt source and pinger"
+        fail_count=$((fail_count + 1))
+    fi
+else
+    echo "FAIL: case u: could not locate apt-get install, the install-path remove_phone_home, and/or INSTALL_SUCCEEDED=1 in main() — ordering guard is vacuous"
+    fail_count=$((fail_count + 1))
+fi
+
 # ── Case s: log helpers must not interpret escapes in DATA ─────
 # log_* render externally-derived strings (gpg stderr, browser paths, apt
 # errors). They were `echo -e`, which interprets \e/\n INSIDE the message, so a
 # hostile or merely odd string could forge log lines or drive the terminal.
 # They are printf '%b[TAG]%b %s' now — colour via %b, message via %s. Without
 # this case, reverting to `echo -e` leaves every other assertion green.
+# TEST-011: round 4 hardened log_header too ("was still `echo -e`-ing its
+# argument while its four siblings were hardened to printf %s"), but no
+# assertion was added for it, and this probe only ever drove log_info/log_fail
+# -- log_header, log_ok and log_warn stayed unproven. log_ok and log_warn are
+# not cosmetic gaps either: report_browser_prerequisite renders a filesystem
+# path through exactly one of them (`log_ok "Browser: $chrome_bin"` or the
+# not-runnable branch), so those are the two that render externally-derived
+# data most often in this script.
 log_probe=$(
     # shellcheck source=common.sh
     source "${SCRIPT_DIR}/common.sh"
     log_info 'literal\e[31m and \n stay literal'
     log_fail 'second\tline'
+    log_header 'header\e[31m stays literal'
+    log_ok 'ok\e[31m stays literal'
+    log_warn 'warn\e[31m stays literal'
 )
 if printf '%s' "${log_probe}" | grep -qF 'literal\e[31m and \n stay literal'; then
     echo "PASS: case s: log_info prints backslash escapes in the message literally"
@@ -1196,6 +1780,27 @@ if printf '%s' "${log_probe}" | grep -qF 'second\tline'; then
     pass_count=$((pass_count + 1))
 else
     echo "FAIL: case s: log_fail interpreted escapes in the message (echo -e regression?)"
+    fail_count=$((fail_count + 1))
+fi
+if printf '%s' "${log_probe}" | grep -qF 'header\e[31m stays literal'; then
+    echo "PASS: case s: log_header prints backslash escapes in the message literally"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case s: log_header interpreted escapes in the message (echo -e regression?)"
+    fail_count=$((fail_count + 1))
+fi
+if printf '%s' "${log_probe}" | grep -qF 'ok\e[31m stays literal'; then
+    echo "PASS: case s: log_ok prints backslash escapes in the message literally"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case s: log_ok interpreted escapes in the message (echo -e regression?)"
+    fail_count=$((fail_count + 1))
+fi
+if printf '%s' "${log_probe}" | grep -qF 'warn\e[31m stays literal'; then
+    echo "PASS: case s: log_warn prints backslash escapes in the message literally"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case s: log_warn interpreted escapes in the message (echo -e regression?)"
     fail_count=$((fail_count + 1))
 fi
 # The colour codes must STILL render, or the fix broke the logs to pass the test.

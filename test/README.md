@@ -74,13 +74,19 @@ buys nothing against an attacker who controls that channel. If Google rotates
 its primary key the script fails loudly and the constant must be updated
 deliberately.
 
-**No background egress.** The temporary repo and keyring are removed once the
-install completes (via an `EXIT` trap, so an aborted run cannot leave them
-behind). The `google-chrome-stable` package's own permanent apt source and daily
-update pinger (`/etc/cron.daily/google-chrome`) are suppressed via
-`repo_add_once=false` and then verified absent. Chrome's telemetry is separately
-disabled on every browser vespasian launches (LAB-4999), and the live suite
-always launches through vespasian, so it inherits those flags.
+**No background egress.** The temporary repo and keyring this script itself
+adds are removed once the install completes (via an `EXIT` trap, so an aborted
+run cannot leave them behind). The `google-chrome-stable` package's own
+permanent apt source and daily update pinger (`/etc/cron.daily/google-chrome`)
+are always suppressed via `repo_add_once=false`, so the package never creates
+them in the first place. Inside a throwaway image the script goes further and
+also removes and verifies absent whatever the package planted anyway — that
+pair is the "no phone-home from the devcontainer image" acceptance criterion.
+Outside a container (a developer's own machine), removing artifacts the
+package owns is not this script's call, so they are left alone as Chrome's
+normal update channel. Chrome's telemetry is separately disabled on every
+browser vespasian launches (LAB-4999), and the live suite always launches
+through vespasian, so it inherits those flags.
 
 **Version policy.** The script tracks Chrome *stable* rather than pinning a
 version — for a test-only layer that is the right trade, since a pinned version
@@ -303,6 +309,36 @@ Where per-target result files are written; defaults to `test/.results/`. Overrid
 ### `VESPASIAN` (optional)
 
 Path to the `vespasian` binary under test; defaults to `bin/vespasian`. Override it to test a binary built elsewhere. Note this is **not** settable from `CONFIG_FILE`: `VESPASIAN` is deliberately absent from `load_config`'s allowlist, so a config file cannot redirect which binary the suite executes.
+
+### `VESPASIAN_TEST_ROOT` (internal, test-only)
+
+Read by `install-chrome.sh` to reroot every absolute system path it reads or
+writes — the pinned keyring, the temporary apt source, `/etc/default/google-chrome`,
+the phone-home artifacts it may remove, and the version record — under a
+caller-supplied directory instead of the real filesystem. It exists solely so
+`test/install-chrome-selftest.sh` can drive the installer's privileged branches
+(the defaults-file rewrite, the container gate, phone-home removal and
+verification) against fixtures, unprivileged. **No production caller sets
+it** — `install-chrome.sh` itself, `setup-live-targets.sh`, the
+Dockerfile/`postCreateCommand` snippets above, and the CI jobs all leave it
+unset.
+
+The script validates the value before using it — it must be an absolute,
+existing directory containing only `[A-Za-z0-9._/-]`, with no `..` component,
+and must not resolve to `/` or `//` — which closes the obvious ways a
+caller-controlled value could redirect a root-privileged write onto the real
+system. It does **not** defend against a symlink planted inside the root
+*after* validation, a bind mount at the root, or the root being swapped out
+from under it between validation and the write (TOCTOU): those are accepted
+residuals, because the variable's whole trust model assumes its caller is
+*already* privileged — either the process runs as root, or it runs
+unprivileged and already holds the `sudo` rights the script would use anyway.
+
+Because it feeds root-privileged writes, it must never be exposed through a
+narrowly-scoped `sudoers` grant that also permits environment passing
+(`SETENV`, `sudo -E`, or an `env_keep` entry) — default `sudoers`
+(`Defaults env_reset`) already drops it, and that default must not be loosened
+for this script.
 
 ### `.live-test-config`
 

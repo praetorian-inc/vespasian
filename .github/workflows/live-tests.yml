@@ -16,9 +16,13 @@ permissions:
   contents: read
 
 jobs:
-  # Fast, un-gated regression self-test for the preflight Chrome/Chromium
-  # detection logic (LAB-3893). Independent of the check-label gate, so it runs
-  # on every push/PR even when the full suite is skipped via 'skip-live-tests'.
+  # Fast, un-gated regression net: a syntax check plus all four guard suites —
+  # preflight Chrome/Chromium detection (LAB-3893), install-chrome.sh's
+  # non-privileged surface, setup-live-targets.sh's teardown/orphan-PID
+  # hardening (LAB-2893), and the target-group/dispatch drift guard (which also
+  # guards this job's own step list and the browser-target classification).
+  # Independent of the check-label gate, so it runs on every push/PR even when
+  # the full suite is skipped via 'skip-live-tests'.
   preflight-selftest:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -186,8 +190,8 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
-          # KEEP IN LOCKSTEP with PHONE_HOME_PATHS + TMP_LIST/TMP_KEYRING in
-          # test/install-chrome.sh. The list is duplicated deliberately — an
+          # KEEP IN LOCKSTEP with PHONE_HOME_PATHS + TMP_LIST/TMP_KEYRING/TMP_PREF
+          # in test/install-chrome.sh. The list is duplicated deliberately — an
           # assertion that sourced the script under test would inherit the same
           # blind spot as the script — but a duplicate drifts, and this one had
           # already lost the deb822 source and the package's own keyring, the two
@@ -197,7 +201,8 @@ jobs:
                    /etc/cron.daily/google-chrome \
                    /usr/share/keyrings/google-chrome.gpg \
                    /etc/apt/sources.list.d/google-chrome-vespasian-temp.list \
-                   /usr/share/keyrings/google-chrome-vespasian-temp.gpg; do
+                   /usr/share/keyrings/google-chrome-vespasian-temp.gpg \
+                   /etc/apt/preferences.d/google-chrome-vespasian-temp.pref; do
             if [ -e "$p" ]; then echo "LEFTOVER: $p"; fail=1; fi
           done
           [ -s /usr/share/vespasian/chrome-version ] || { echo "missing version record"; fail=1; }
