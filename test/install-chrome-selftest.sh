@@ -63,7 +63,7 @@ export CHROME_PROBE_TIMEOUT=2
 # pin is not meant to turn a valid environment into a red build); the trust
 # anchor's own skip is already a hard failure via trust_anchor_skips,
 # independently of this pin.
-EXPECTED_ASSERTIONS=182
+EXPECTED_ASSERTIONS=183
 
 pass_count=0
 fail_count=0

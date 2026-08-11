@@ -19,6 +19,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNNER="$SCRIPT_DIR/run-live-tests.sh"
 PASS=0
 FAIL=0
+# TEST-025: a completion sentinel, matching install-chrome-selftest.sh. Without
+# it an `exit 0` or an errexit abort part-way through this file printed a run of
+# PASS lines, no summary, and a green CI check — the suite reporting success for
+# the assertions it happened to reach before dying.
+SUITE_COMPLETED=0
 
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1" >&2; }
@@ -30,7 +35,12 @@ fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1" >&2; }
 # subshell would discard any array registration; a filesystem dir created in the
 # parent and torn down by the trap has no such scoping problem.
 TMPDIR_T="$(mktemp -d)"
-trap 'rm -rf "$TMPDIR_T"' EXIT
+# The completion sentinel is folded into THIS trap rather than registered as a
+# second one: bash keeps a single EXIT trap, so a separate `trap ... EXIT`
+# declared earlier is silently REPLACED by this one and never fires. That is
+# exactly the inert-assertion failure mode this suite exists to catch, so it is
+# worth stating rather than leaving to be rediscovered.
+trap 'rm -rf "$TMPDIR_T"; if [ "${SUITE_COMPLETED}" != 1 ]; then echo "test-runner-args: FAIL — suite terminated before reaching the summary; results are incomplete" >&2; exit 1; fi' EXIT
 # INT/TERM too, matching the other selftests: a bash signal handler returns to
 # the interrupted code, so without an explicit exit a Ctrl-C leaks the temp tree.
 trap 'exit 130' INT
@@ -1506,7 +1516,21 @@ else
     fi
 fi
 
+SUITE_COMPLETED=1
+
 echo ""
 echo "=== Summary ==="
 echo "  $PASS passed, $FAIL failed"
+# TEST-025: both sibling suites pin their assertion total; this one did not, so
+# deleting a case reduced coverage in silence — every remaining assertion still
+# passed and the suite still exited 0. Every assertion here iterates a fixed
+# literal list and nothing skips, so the total is host-independent and a plain
+# equality pin is safe (unlike preflight-selftest, whose environmental skips
+# need skip-credit accounting).
+EXPECTED_ASSERTIONS=110
+if [[ $((PASS + FAIL)) -ne "$EXPECTED_ASSERTIONS" ]]; then
+    echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail), saw $((PASS + FAIL))."
+    echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
+    exit 1
+fi
 [[ "$FAIL" -eq 0 ]] && exit 0 || exit 1
