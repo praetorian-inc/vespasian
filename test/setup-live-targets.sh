@@ -351,7 +351,13 @@ wait_for_http() {
     local start=$SECONDS
 
     while true; do
-        if curl -sf -o /dev/null "$url" 2>/dev/null; then
+        # --max-time bounds the PROBE itself, not just the interval between
+        # probes: without it curl has no default overall timeout, so a
+        # service that accepts the TCP handshake and then never responds
+        # wedges here forever and the outer $timeout deadline below is never
+        # even reached (SEC-BE-012). run-live-tests.sh:214's sibling probe
+        # already does this; this matches it.
+        if curl -sf --max-time 2 -o /dev/null "$url" 2>/dev/null; then
             return 0
         fi
         if [ $((SECONDS - start)) -ge "$timeout" ]; then
@@ -432,10 +438,21 @@ pid_matches_service() {
     comm="$(basename "$comm" 2>/dev/null)"
     [ -n "$comm" ] || return 1
 
+    # Explicit return codes, not a bare `return` picking up the `[ ]`
+    # test's status: this function is now reachable from the EXIT trap
+    # (SEC-BE-015) below, and a bare `return` inside a function invoked
+    # from an EXIT trap under `set -e` does not reliably propagate the
+    # last command's own status — it can echo back the ORIGINAL exit
+    # code that fired the trap instead, silently turning a real match
+    # into a false "no match". Verified: a bare `return` reintroduces
+    # this exact failure when this function runs inside the trap.
     binary="$(service_binary "$name")"
     if [ -n "$binary" ]; then
-        [ "$comm" = "$binary" ]
-        return
+        if [ "$comm" = "$binary" ]; then
+            return 0
+        else
+            return 1
+        fi
     fi
 
     # No unique binary → node-based graphql-server: require node AND a listening
@@ -461,7 +478,7 @@ start_rest_api() {
         log_ok "rest-api started (PID: ${pid}, port: ${port})"
     else
         log_fail "rest-api failed to start within 15s"
-        kill "$pid" 2>/dev/null || true
+        kill_pid "$pid" || true
         return 1
     fi
 }
@@ -478,7 +495,7 @@ start_concat_spa() {
         log_ok "concat-spa started (PID: ${pid}, port: ${port})"
     else
         log_fail "concat-spa failed to start within 15s"
-        kill "$pid" 2>/dev/null || true
+        kill_pid "$pid" || true
         return 1
     fi
 }
@@ -487,10 +504,13 @@ start_forms_target() {
     local port=$1
     log_info "Starting forms-target on port ${port}..."
     cd "${SCRIPT_DIR}/forms-target"
-    # forms-target binds loopback by default; bind all interfaces so a
-    # devcontainer crawler (TEST_HOST=host.docker.internal) can reach the host.
-    # Override with FORMS_TARGET_BIND_HOST=127.0.0.1 for host-only local runs.
-    PORT="$port" BIND_HOST="${FORMS_TARGET_BIND_HOST:-0.0.0.0}" ./forms-target &
+    # forms-target binds loopback by default (matching its own Go default,
+    # main.go:95) — an unauthenticated HTTP app with login/register/feedback
+    # forms has no business listening on every interface of the operator's
+    # machine unless asked (SEC-BE-013). Widen explicitly for the devcontainer
+    # case (TEST_HOST=host.docker.internal) with:
+    #   FORMS_TARGET_BIND_HOST=0.0.0.0 ./test/setup-live-targets.sh
+    PORT="$port" BIND_HOST="${FORMS_TARGET_BIND_HOST:-127.0.0.1}" ./forms-target &
     local pid=$!
     record_pid forms-target "$pid"
 
@@ -498,7 +518,7 @@ start_forms_target() {
         log_ok "forms-target started (PID: ${pid}, port: ${port})"
     else
         log_fail "forms-target failed to start within 15s"
-        kill "$pid" 2>/dev/null || true
+        kill_pid "$pid" || true
         return 1
     fi
 }
@@ -515,7 +535,7 @@ start_soap_service() {
         log_ok "soap-service started (PID: ${pid}, port: ${port})"
     else
         log_fail "soap-service failed to start within 15s"
-        kill "$pid" 2>/dev/null || true
+        kill_pid "$pid" || true
         return 1
     fi
 }
@@ -532,7 +552,7 @@ start_graphql_server() {
         log_ok "graphql-server started (PID: ${pid}, port: ${port})"
     else
         log_fail "graphql-server failed to start within 15s"
-        kill "$pid" 2>/dev/null || true
+        kill_pid "$pid" || true
         return 1
     fi
 }
@@ -542,17 +562,33 @@ wait_for_grpc() {
     local port=$2
     local timeout=${3:-30}
     local start=$SECONDS
+    # Resolves the same timeout/gtimeout seam common.sh's chrome_runnable
+    # already establishes, reused here to bound the bare /dev/tcp arm below.
+    local t=""
+    if command -v timeout >/dev/null 2>&1; then
+        t=timeout
+    elif command -v gtimeout >/dev/null 2>&1; then   # macOS + coreutils
+        t=gtimeout
+    fi
 
     while true; do
+        # Each arm is bounded to 2s so the probe itself cannot outlive the
+        # outer $timeout deadline (SEC-BE-012, same shape as wait_for_http).
         if command -v grpcurl >/dev/null 2>&1; then
-            if grpcurl -plaintext "${host}:${port}" list >/dev/null 2>&1; then
+            if grpcurl -max-time 2 -plaintext "${host}:${port}" list >/dev/null 2>&1; then
                 return 0
             fi
         elif command -v nc >/dev/null 2>&1; then
-            if nc -z "${host}" "${port}" 2>/dev/null; then
+            if nc -z -w 2 "${host}" "${port}" 2>/dev/null; then
+                return 0
+            fi
+        elif [ -n "$t" ]; then
+            if "$t" 2 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
                 return 0
             fi
         else
+            # No timeout/gtimeout available: falls back to the unbounded
+            # probe (same documented limitation as chrome_runnable).
             if (echo >/dev/tcp/"${host}"/"${port}") 2>/dev/null; then
                 return 0
             fi
@@ -576,7 +612,7 @@ start_grpc_server() {
         log_ok "grpc-server started (PID: ${pid}, port: ${port})"
     else
         log_fail "grpc-server failed to start within 15s"
-        kill "$pid" 2>/dev/null || true
+        kill_pid "$pid" || true
         return 1
     fi
 }
@@ -759,7 +795,15 @@ write_config() {
     local forms_port=$6
     local targets=$7
 
-    cat > "$CONFIG_FILE" <<EOF
+    # Rendered to a staged file, then installed with an explicit mode
+    # (SEC-BE-014): a bare `cat >` lands at the caller's umask, so under
+    # umask 0 (a Dockerfile RUN commonly runs with one) this config —
+    # load_config declare -g's it straight into run-live-tests.sh — would
+    # land world-writable. Mirrors install-chrome.sh:404-412's reasoning for
+    # its own writes.
+    local staged
+    staged="$(mktemp "${STATE_DIR}/.live-test-config.XXXXXX")"
+    cat > "$staged" <<EOF
 # Auto-generated by setup-live-targets.sh on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 # Source this or let run-live-tests.sh read it automatically.
 REST_API_PORT=${rest_port}
@@ -770,6 +814,8 @@ CONCAT_SPA_PORT=${concat_port}
 FORMS_TARGET_PORT=${forms_port}
 TARGETS_SETUP=${targets}
 EOF
+    install -m 0644 -- "$staged" "$CONFIG_FILE"
+    rm -f -- "$staged"
     log_ok "Wrote config to ${CONFIG_FILE}"
 }
 
@@ -858,6 +904,25 @@ run_tests_guidance() {
     fi
 }
 
+# Set true for the duration of the start-services window and read by the
+# EXIT trap below (SEC-BE-015). Left false the rest of the run so --teardown,
+# --skip-start, --help, and a normal successful exit never trigger it.
+SETUP_IN_PROGRESS=false
+
+# EXIT handler for the start-services window: a failed start used to leave
+# every already-started service running and .live-test-config unwritten.
+# Reuses do_teardown — the same stop_service/kill_pid/pid_matches_service
+# machinery --teardown already uses — rather than a parallel kill path.
+# cleanup_stale_state (called right before this window opens) already
+# cleared any leftover PIDs from a PRIOR run, so every pid log entry present
+# when this fires belongs to the CURRENT invocation.
+teardown_on_failure() {
+    if [ "$SETUP_IN_PROGRESS" = true ]; then
+        log_warn "Setup interrupted or failed — tearing down what this run started."
+        do_teardown
+    fi
+}
+
 # Pipeline orchestrator: parse args → teardown? → prereqs → build → stale
 # cleanup → resolve ports + start → write config. Intentionally longer than the
 # ~60-line guideline: each stage is a distinct sequential step that delegates to
@@ -913,6 +978,16 @@ main() {
     # next service's port check sees the previous one as occupied.
     log_header "Starting Services"
 
+    # Arm the teardown trap for this window only (SEC-BE-015). INT/TERM exit
+    # THROUGH the EXIT trap (128+signo) rather than calling teardown_on_failure
+    # directly: a signal handler that doesn't exit RETURNS to the interrupted
+    # code afterward and the script would carry on starting more services with
+    # its state already torn down (mirrors install-chrome.sh's trap wiring).
+    SETUP_IN_PROGRESS=true
+    trap 'teardown_on_failure' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
     local start_failed=0
     REST_API_PORT="" SOAP_SERVICE_PORT="" GRAPHQL_SERVER_PORT="" GRPC_SERVER_PORT="" CONCAT_SPA_PORT="" FORMS_TARGET_PORT=""
     for target in "${TARGET_ARRAY[@]}"; do
@@ -957,7 +1032,7 @@ main() {
     done
 
     if [ $start_failed -ne 0 ]; then
-        log_fail "One or more services failed to start. Run --teardown and retry."
+        log_fail "One or more services failed to start. Tearing down and exiting."
         exit 1
     fi
 
@@ -969,6 +1044,10 @@ main() {
     # so a no-arg run-live-tests.sh exercises the two-stage flow too (LAB-3892).
     local run_targets="${targets/concat-spa/concat-spa,concat-spa-two-stage}"
     write_config "${REST_API_PORT:-}" "${SOAP_SERVICE_PORT:-}" "${GRAPHQL_SERVER_PORT:-}" "${GRPC_SERVER_PORT:-}" "${CONCAT_SPA_PORT:-}" "${FORMS_TARGET_PORT:-}" "$run_targets"
+
+    # Disarm: setup succeeded and the config is written, so a later signal or
+    # exit must leave the just-started services (and this config) alone.
+    SETUP_IN_PROGRESS=false
 
     log_header "Setup Complete"
     # Emit the run guidance (full vs partial setup) via the shared, testable

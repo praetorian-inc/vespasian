@@ -10,10 +10,10 @@
 # (e-f, j-j2), the defaults-file symlink guard and its rewrite branches (g, q),
 # container detection for the apt-cache wipe (h), the phone-home removal and
 # verification chain on both the container and non-container arms (n, o, o2),
-# cleanup_all's failed-install arm (u), VESPASIAN_TEST_ROOT containment (t),
-# the log helpers' escape hardening (s), and the browser-present-without-
-# curl/gpg path (r). Each of those is behavioural: it fails if its check is
-# removed, which an assertion on the message alone does not.
+# the browser-present-without-curl/gpg path (r), the log helpers' escape
+# hardening (s), VESPASIAN_TEST_ROOT containment (t), and cleanup_all's
+# failed-install arm (u). Each of those is behavioural: it fails if its check
+# is removed, which an assertion on the message alone does not.
 #
 # NOT COVERED HERE: the actual download, `apt-get install`, and the system-wide
 # mutations that follow a successful key verification. Those need root, network,
@@ -42,6 +42,17 @@ skip_count=0
 # environment. Only the trust-anchor success path qualifies; see the policy at
 # the end of this file.
 trust_anchor_skips=0
+
+# Completion sentinel (TEST-009): flips to 1 immediately before the Summary
+# section runs. Every case in this file is a flat sequence under this script's
+# own `set -euo pipefail`, and several source a production script that calls
+# `exit` (install-chrome.sh's parse_args on --help; today every such source
+# sits inside a `( ... )` subshell, but nothing enforces that staying true) --
+# so a stray `exit 0` anywhere before the summary yields PASS lines, no
+# summary, and a green CI check with however many cases never ran. The EXIT
+# trap below turns that into a red build by checking the flag was actually
+# set before the fixture cleanup it already does.
+SUITE_COMPLETED=0
 
 # A check that could not run is NOT a pass. Tallied separately so the summary
 # distinguishes "verified" from "unverifiable here", following the
@@ -78,7 +89,7 @@ FIXTURE_DIR=$(mktemp -d)
 # returns to the interrupted code, so without an explicit exit a Ctrl-C left the
 # fixture tree behind in $TMPDIR. Exiting from the handler routes through EXIT so
 # cleanup runs exactly once.
-trap 'rm -rf "${FIXTURE_DIR}"' EXIT
+trap 'rm -rf "${FIXTURE_DIR}"; if [ "${SUITE_COMPLETED}" != 1 ]; then echo "install-chrome-selftest: FAIL — suite terminated before reaching the summary; results are incomplete" >&2; exit 1; fi' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -266,7 +277,12 @@ EOF
         SUDO="/bin/false"   # any privileged call would fail loudly, proving we never reach one
         ARCH="amd64"
         set +e
-        out=$(install_pinned_key "${FIXTURE_DIR}" 2>&1)
+        # Own scratch dir (f-scratch), not the shared FIXTURE_DIR (TEST-006):
+        # install_pinned_key derives its gpg homedir/keyring from "$1", and
+        # case j below needs its OWN gpg keyring, untainted by whatever key
+        # f0/f1/f2 last imported into one shared here.
+        mkdir -p "${FIXTURE_DIR}/f-scratch"
+        out=$(install_pinned_key "${FIXTURE_DIR}/f-scratch" 2>&1)
         printf '%s\n%s\n' "$?" "${out}"
     )
 }
@@ -435,12 +451,19 @@ res_g2=$(run_suppress "${FIXTURE_DIR}/defaults-existing")
 assert_eq "case g: an existing defaults file is accepted (rc 0)" "0" "$(echo "${res_g2}" | sed -n '1p')"
 assert_eq "case g: repo_add_once=true is rewritten to false" \
     "repo_add_once=false" "$(cat "${FIXTURE_DIR}/defaults-existing")"
+# Mode actually achieved on disk (SEC-BE-003) -- a literal `install -m 0644`
+# in the source is not evidence of what lands; only stat proves it, same
+# reasoning as case j's three keyring/list/pref mode assertions below.
+assert_eq "case g: the rewritten defaults file is world-readable but not writable (0644)" \
+    "644" "$(stat -c '%a' "${FIXTURE_DIR}/defaults-existing" 2>/dev/null)"
 
 # g3: absent file is created opted-out.
 res_g3=$(run_suppress "${FIXTURE_DIR}/defaults-new")
 assert_eq "case g: an absent defaults file is created (rc 0)" "0" "$(echo "${res_g3}" | sed -n '1p')"
 assert_eq "case g: the created file opts out of the repo" \
     "repo_add_once=false" "$(cat "${FIXTURE_DIR}/defaults-new")"
+assert_eq "case g: the newly-created defaults file is world-readable but not writable (0644)" \
+    "644" "$(stat -c '%a' "${FIXTURE_DIR}/defaults-new" 2>/dev/null)"
 
 # ── Case h: container detection gates the apt-cache wipe ───────
 # Wiping /var/lib/apt/lists is safe in a throwaway image and destructive on a
@@ -614,7 +637,17 @@ EOF
         SUDO=""
         ARCH="amd64"
         set +e
-        out=$(install_pinned_key "${FIXTURE_DIR}" 2>&1)
+        # Own scratch dir (j-scratch), not the shared FIXTURE_DIR (TEST-006):
+        # cases f0/f1/f2 above pass install_pinned_key that same shared dir,
+        # and it accumulates a gpg keyring across calls (gpg --import is
+        # additive, nothing here deletes between cases). f2 imports a valid
+        # but NON-Google key there, so case j — unscoped — was silently
+        # verifying its fingerprint check against a keyring that already held
+        # a second, unrelated key, not the single-key input its own comments
+        # assume. Scoped, this case's gpg homedir starts empty every run,
+        # mirroring round 5's fix for the same hazard in the PATH stub bins.
+        mkdir -p "${FIXTURE_DIR}/j-scratch"
+        out=$(install_pinned_key "${FIXTURE_DIR}/j-scratch" 2>&1)
         printf '%s\n%s\n' "$?" "${out}"
     )
     assert_eq "case j: the real Google key satisfies the pin (rc 0)" \
@@ -735,6 +768,8 @@ assert_contains "case k: the pre-existing unrelated setting is preserved" \
     "SOMETHING_ELSE=1" "$(cat "${FIXTURE_DIR}/defaults-no-key")"
 assert_contains "case k: the opt-out is appended" \
     "repo_add_once=false" "$(cat "${FIXTURE_DIR}/defaults-no-key")"
+assert_eq "case k: the appended-to defaults file is world-readable but not writable (0644)" \
+    "644" "$(stat -c '%a' "${FIXTURE_DIR}/defaults-no-key" 2>/dev/null)"
 
 # ── Case l: resolve_sudo and require_apt refusals ───────────────
 # Both are pure precondition paths that return before any mutation, and neither
@@ -1145,6 +1180,69 @@ for leftover in etc/apt/sources.list.d/google-chrome.list \
     fi
 done
 
+# ── Case o2: the NON-container early exit leaves the host alone ─
+# The mirror of case o, and the arm that regressed. On a machine that is not a
+# throwaway image the early exit must NOT delete the package's apt source or
+# updater (they are not ours), must NOT exit 1 for finding them, and must say so.
+# An earlier version of this fix gated the removal on in_container() but left
+# verify_install checking those same paths unconditionally, so a developer's
+# machine with a normally-installed Chrome got a hard failure. Only the pair of
+# cases o + o2 pins both arms.
+#
+# TEST-002: this installs its OWN sudo shim (bin-o2) rather than inheriting
+# case o's (bin-o). The two cases sharing one bin was an undeclared ordering
+# dependency -- reordering or deleting case o would have silently changed what
+# case o2 executes as, without any assertion here noticing.
+mkdir -p "${FIXTURE_DIR}/bin-o2"
+cat > "${FIXTURE_DIR}/bin-o2/sudo" <<'EOF'
+#!/bin/bash
+exec "$@"
+EOF
+chmod +x "${FIXTURE_DIR}/bin-o2/sudo"
+
+plant_phone_home
+rm -f "${root_n}/.dockerenv"
+res_o2=$(
+    VESPASIAN_TEST_ROOT="${root_n}"
+    export VESPASIAN_TEST_ROOT
+    unset REMOTE_CONTAINERS
+    PATH="${FIXTURE_DIR}/bin-o2:${PATH}"
+    # shellcheck source=install-chrome.sh
+    source "${INSTALL_SCRIPT}"
+    CHROME_CANDIDATES=("${FIXTURE_DIR}/fakebin/google-chrome")
+    set +e
+    out=$(main 2>&1)
+    printf '%s\n%s\n' "$?" "${out}"
+)
+assert_eq "case o2: non-container early exit still succeeds (rc 0)" \
+    "0" "$(echo "${res_o2}" | sed -n '1p')"
+assert_contains "case o2: it says it is leaving the package's artifacts alone" \
+    "Not a container" "${res_o2}"
+if [ -f "${root_n}/etc/cron.daily/google-chrome" ] && \
+   [ -f "${root_n}/etc/apt/sources.list.d/google-chrome.list" ]; then
+    echo "PASS: case o2: the package's apt source and updater SURVIVE outside a container"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case o2: the early exit deleted package-owned artifacts on a non-container host"
+    fail_count=$((fail_count + 1))
+fi
+# And the script's OWN temp artifacts are still torn down on this path.
+if [ ! -e "${root_n}/etc/apt/sources.list.d/google-chrome-vespasian-temp.list" ]; then
+    echo "PASS: case o2: this script's own temporary apt source is still removed"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case o2: a temporary apt source survived the non-container early exit"
+    fail_count=$((fail_count + 1))
+fi
+# No version record on a run that installed nothing.
+if [ ! -e "${root_n}/usr/share/vespasian/chrome-version" ]; then
+    echo "PASS: case o2: no version record written on a no-install run"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case o2: the no-touch early exit wrote a version record"
+    fail_count=$((fail_count + 1))
+fi
+
 # ── Case p: INT/TERM handlers must EXIT, not just clean up ──────
 # The temporary Google apt source is live between install_pinned_key and
 # cleanup_apt_wiring, and a source left behind there is exactly the standing
@@ -1381,202 +1479,71 @@ assert_eq "case r: browser present + no gpg/curl on PATH still exits 0" "0" "${r
 assert_contains "case r: it reports the existing browser rather than a missing tool" \
     "already present" "${out_r}"
 
-# ── Case o2: the NON-container early exit leaves the host alone ─
-# The mirror of case o, and the arm that regressed. On a machine that is not a
-# throwaway image the early exit must NOT delete the package's apt source or
-# updater (they are not ours), must NOT exit 1 for finding them, and must say so.
-# An earlier version of this fix gated the removal on in_container() but left
-# verify_install checking those same paths unconditionally, so a developer's
-# machine with a normally-installed Chrome got a hard failure. Only the pair of
-# cases o + o2 pins both arms.
-#
-# TEST-002: this installs its OWN sudo shim (bin-o2) rather than inheriting
-# case o's (bin-o). The two cases sharing one bin was an undeclared ordering
-# dependency -- reordering or deleting case o would have silently changed what
-# case o2 executes as, without any assertion here noticing.
-mkdir -p "${FIXTURE_DIR}/bin-o2"
-cat > "${FIXTURE_DIR}/bin-o2/sudo" <<'EOF'
-#!/bin/bash
-exec "$@"
-EOF
-chmod +x "${FIXTURE_DIR}/bin-o2/sudo"
-
-plant_phone_home
-rm -f "${root_n}/.dockerenv"
-res_o2=$(
-    VESPASIAN_TEST_ROOT="${root_n}"
-    export VESPASIAN_TEST_ROOT
-    unset REMOTE_CONTAINERS
-    PATH="${FIXTURE_DIR}/bin-o2:${PATH}"
-    # shellcheck source=install-chrome.sh
-    source "${INSTALL_SCRIPT}"
-    CHROME_CANDIDATES=("${FIXTURE_DIR}/fakebin/google-chrome")
-    set +e
-    out=$(main 2>&1)
-    printf '%s\n%s\n' "$?" "${out}"
+# ── Case s: log helpers must not interpret escapes in DATA ─────
+# log_* render externally-derived strings (gpg stderr, browser paths, apt
+# errors). They were `echo -e`, which interprets \e/\n INSIDE the message, so a
+# hostile or merely odd string could forge log lines or drive the terminal.
+# They are printf '%b[TAG]%b %s' now — colour via %b, message via %s. Without
+# this case, reverting to `echo -e` leaves every other assertion green.
+# TEST-011: round 4 hardened log_header too ("was still `echo -e`-ing its
+# argument while its four siblings were hardened to printf %s"), but no
+# assertion was added for it, and this probe only ever drove log_info/log_fail
+# -- log_header, log_ok and log_warn stayed unproven. log_ok and log_warn are
+# not cosmetic gaps either: report_browser_prerequisite renders a filesystem
+# path through exactly one of them (`log_ok "Browser: $chrome_bin"` or the
+# not-runnable branch), so those are the two that render externally-derived
+# data most often in this script.
+log_probe=$(
+    # shellcheck source=common.sh
+    source "${SCRIPT_DIR}/common.sh"
+    log_info 'literal\e[31m and \n stay literal'
+    log_fail 'second\tline'
+    log_header 'header\e[31m stays literal'
+    log_ok 'ok\e[31m stays literal'
+    log_warn 'warn\e[31m stays literal'
 )
-assert_eq "case o2: non-container early exit still succeeds (rc 0)" \
-    "0" "$(echo "${res_o2}" | sed -n '1p')"
-assert_contains "case o2: it says it is leaving the package's artifacts alone" \
-    "Not a container" "${res_o2}"
-if [ -f "${root_n}/etc/cron.daily/google-chrome" ] && \
-   [ -f "${root_n}/etc/apt/sources.list.d/google-chrome.list" ]; then
-    echo "PASS: case o2: the package's apt source and updater SURVIVE outside a container"
+if printf '%s' "${log_probe}" | grep -qF 'literal\e[31m and \n stay literal'; then
+    echo "PASS: case s: log_info prints backslash escapes in the message literally"
     pass_count=$((pass_count + 1))
 else
-    echo "FAIL: case o2: the early exit deleted package-owned artifacts on a non-container host"
+    echo "FAIL: case s: log_info interpreted escapes in the message (echo -e regression?)"
     fail_count=$((fail_count + 1))
 fi
-# And the script's OWN temp artifacts are still torn down on this path.
-if [ ! -e "${root_n}/etc/apt/sources.list.d/google-chrome-vespasian-temp.list" ]; then
-    echo "PASS: case o2: this script's own temporary apt source is still removed"
+if printf '%s' "${log_probe}" | grep -qF 'second\tline'; then
+    echo "PASS: case s: log_fail prints backslash escapes in the message literally"
     pass_count=$((pass_count + 1))
 else
-    echo "FAIL: case o2: a temporary apt source survived the non-container early exit"
+    echo "FAIL: case s: log_fail interpreted escapes in the message (echo -e regression?)"
     fail_count=$((fail_count + 1))
 fi
-# No version record on a run that installed nothing.
-if [ ! -e "${root_n}/usr/share/vespasian/chrome-version" ]; then
-    echo "PASS: case o2: no version record written on a no-install run"
+if printf '%s' "${log_probe}" | grep -qF 'header\e[31m stays literal'; then
+    echo "PASS: case s: log_header prints backslash escapes in the message literally"
     pass_count=$((pass_count + 1))
 else
-    echo "FAIL: case o2: the no-touch early exit wrote a version record"
+    echo "FAIL: case s: log_header interpreted escapes in the message (echo -e regression?)"
     fail_count=$((fail_count + 1))
 fi
-
-# ── Case v: in_container() gates removal on the MAIN install path too ───
-# Cases o/o2 pin the in_container() gate on the IDEMPOTENT early exit only.
-# main() has a SECOND, independent in_container() call further down -- reached
-# only after `apt-get install` has actually "succeeded" -- and nothing
-# exercised it: every other case in this suite stops before the first $SUDO.
-# This is the security-relevant behaviour change of the whole wave (remove_
-# phone_home on the main path used to run unconditionally; it is now gated the
-# same way the early exit already was) and it had zero coverage.
-#
-# Reaching it unprivileged needs every step of the install path stubbed
-# through, INCLUDING the postinst side effect the whole audit exists to catch:
-# a real `apt-get install` is what actually plants the phone-home artifacts, so
-# the apt-get stub plants them itself (and drops a runnable fake browser)
-# exactly when it is invoked with "install", mirroring what dpkg's postinst
-# really does. Depends on the same committed key fixture as cases j/j2 (install_
-# pinned_key has to genuinely succeed to reach this code); skips distinctly
-# from trust_anchor_skips if that fixture or gpg is unavailable, since this
-# case is not testing the trust anchor itself, only relying on it.
-run_main_install_path() {
-    # $2 is named "mode", not "container": install-chrome.sh's in_container()
-    # now also checks the ambient `container` env var (SEC-BE-005), and a local
-    # variable of that exact name here would shadow it for every function this
-    # subshell sources and calls -- silently making in_container() see "host"/
-    # "container" as a non-empty value and answer true unconditionally. Verified
-    # by the collision itself: this is what happened before this var was renamed.
-    local root="$1" mode="$2" bin_v
-    bin_v="${FIXTURE_DIR}/bin-v-${mode}"
-    rm -rf "${root}" "${bin_v}"
-    mkdir -p "${root}" "${bin_v}"
-
-    printf '#!/bin/bash\nexec "$@"\n' > "${bin_v}/sudo"
-    cat > "${bin_v}/dpkg" <<'EOF'
-#!/bin/bash
-[ "$1" = "--print-architecture" ] && { echo amd64; exit 0; }
-exit 1
-EOF
-    cat > "${bin_v}/curl" <<EOF
-#!/bin/bash
-out=""
-while [ \$# -gt 0 ]; do
-    [ "\$1" = "-o" ] && { out="\$2"; shift 2; continue; }
-    shift
-done
-cat '${GOOGLE_KEY_CACHE}' > "\$out"
-EOF
-    cat > "${bin_v}/apt-cache" <<'POLICY_STUB'
-#!/bin/bash
-cat <<'POLICY'
-google-chrome-stable:
-  Installed: (none)
-  Candidate: 999.0.0.0-1
-  Version table:
- *** 999.0.0.0-1 500
-        500 http://dl.google.com/linux/chrome/deb stable/main amd64 Packages
-POLICY
-POLICY_STUB
-    # Simulates dpkg's postinst: the actual moment the phone-home artifacts and
-    # a runnable browser binary appear on a real host. Only "install" plants
-    # them, so `apt-get update` (and anything else) stays a no-op.
-    cat > "${bin_v}/apt-get" <<EOF
-#!/bin/bash
-case "\$*" in
-    *install*google-chrome-stable*)
-        mkdir -p '${root}/etc/apt/sources.list.d' '${root}/etc/cron.daily' '${root}/usr/share/keyrings'
-        touch '${root}/etc/apt/sources.list.d/google-chrome.list' \\
-              '${root}/etc/apt/sources.list.d/google-chrome.sources' \\
-              '${root}/etc/cron.daily/google-chrome' \\
-              '${root}/usr/share/keyrings/google-chrome.gpg'
-        printf '#!/bin/bash\necho "Google Chrome 999.0.0.0"\n' > '${bin_v}/google-chrome'
-        chmod +x '${bin_v}/google-chrome'
-        ;;
-esac
-exit 0
-EOF
-    chmod +x "${bin_v}/sudo" "${bin_v}/dpkg" "${bin_v}/curl" "${bin_v}/apt-cache" "${bin_v}/apt-get"
-
-    (
-        VESPASIAN_TEST_ROOT="${root}"
-        export VESPASIAN_TEST_ROOT
-        if [ "${mode}" = "container" ]; then
-            : > "${root}/.dockerenv"
-        fi
-        unset REMOTE_CONTAINERS
-        # Unset too, not just avoided by renaming the local above: an ambient
-        # `container` (set by some CI runners' own containerized job) must not
-        # silently flip this run onto the container arm regardless of $mode.
-        unset container
-        PATH="${bin_v}:${PATH}"
-        # shellcheck source=install-chrome.sh
-        source "${INSTALL_SCRIPT}"
-        # An ABSOLUTE path, not the bare name "google-chrome": command -v on a
-        # bare name resolves it anywhere on PATH, including a REAL Chrome the
-        # host already has (this devcontainer does). That silently took the
-        # idempotent EARLY exit instead of the main install path this case
-        # exists to drive through -- same trap case i's comment documents --
-        # and made both assertions below pass for the wrong reason (nothing
-        # was ever planted, so nothing needed to be removed). Pinning to the
-        # exact path the apt-get stub will create is what forces the real path.
-        CHROME_CANDIDATES=("${bin_v}/google-chrome")
-        set +e
-        out=$(main 2>&1)
-        printf '%s\n%s\n' "$?" "${out}"
-    )
-}
-
-if [ "${have_real_key}" -eq 1 ]; then
-    root_v1="${FIXTURE_DIR}/root-v1"
-    res_v1=$(run_main_install_path "${root_v1}" "container")
-    assert_eq "case v: in_container()=true main-install-path run succeeds end to end (rc 0)" \
-        "0" "$(echo "${res_v1}" | sed -n '1p')"
-    if [ -e "${root_v1}/etc/apt/sources.list.d/google-chrome.list" ] || \
-       [ -e "${root_v1}/etc/cron.daily/google-chrome" ]; then
-        echo "FAIL: case v: in_container()=true still left the package's phone-home artifacts on the main install path"
-        fail_count=$((fail_count + 1))
-    else
-        echo "PASS: case v: in_container()=true removes the package's phone-home artifacts on the main install path"
-        pass_count=$((pass_count + 1))
-    fi
-
-    root_v2="${FIXTURE_DIR}/root-v2"
-    res_v2=$(run_main_install_path "${root_v2}" "host")
-    assert_eq "case v: in_container()=false main-install-path run succeeds end to end (rc 0)" \
-        "0" "$(echo "${res_v2}" | sed -n '1p')"
-    if [ -e "${root_v2}/etc/apt/sources.list.d/google-chrome.list" ] && \
-       [ -e "${root_v2}/etc/cron.daily/google-chrome" ]; then
-        echo "PASS: case v: in_container()=false leaves the package's phone-home artifacts alone on the main install path"
-        pass_count=$((pass_count + 1))
-    else
-        echo "FAIL: case v: in_container()=false removed artifacts it does not own on the main install path"
-        fail_count=$((fail_count + 1))
-    fi
+if printf '%s' "${log_probe}" | grep -qF 'ok\e[31m stays literal'; then
+    echo "PASS: case s: log_ok prints backslash escapes in the message literally"
+    pass_count=$((pass_count + 1))
 else
-    skip "case v: main-install-path in_container() gating (needs the same key fixture/gpg as j/j2)"
+    echo "FAIL: case s: log_ok interpreted escapes in the message (echo -e regression?)"
+    fail_count=$((fail_count + 1))
+fi
+if printf '%s' "${log_probe}" | grep -qF 'warn\e[31m stays literal'; then
+    echo "PASS: case s: log_warn prints backslash escapes in the message literally"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case s: log_warn interpreted escapes in the message (echo -e regression?)"
+    fail_count=$((fail_count + 1))
+fi
+# The colour codes must STILL render, or the fix broke the logs to pass the test.
+if printf '%s' "${log_probe}" | grep -q "$(printf '\033')"; then
+    echo "PASS: case s: colour escapes still render (fix did not strip formatting)"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case s: colour escapes no longer render"
+    fail_count=$((fail_count + 1))
 fi
 
 # ── Case t: VESPASIAN_TEST_ROOT containment ────────────────────
@@ -1652,10 +1619,18 @@ plant_u() {
     : > "${root_u}/usr/share/keyrings/google-chrome.gpg"
 }
 
+# SEC-BE-006: this trap-fired removal is now ALSO gated on in_container(), so
+# the container arm has to be pinned deterministically rather than relying on
+# whatever REMOTE_CONTAINERS happens to be exported as on the machine running
+# this suite (set in this devcontainer, unset on a bare GitHub runner).
+: > "${root_u}/.dockerenv"
+
 plant_u
 (
     VESPASIAN_TEST_ROOT="${root_u}"
     export VESPASIAN_TEST_ROOT
+    unset REMOTE_CONTAINERS
+    unset container
     # shellcheck source=install-chrome.sh disable=SC1091
     source "${INSTALL_SCRIPT}"
     SUDO=""
@@ -1670,8 +1645,39 @@ for f in "${root_u}/etc/apt/sources.list.d/google-chrome.list" \
          "${root_u}/usr/share/keyrings/google-chrome.gpg"; do
     [ -e "$f" ] && left_u=1
 done
-assert_eq "case u: a failed install (INSTALL_ATTEMPTED=1) has its phone-home artifacts cleaned" \
+assert_eq "case u: a failed install (INSTALL_ATTEMPTED=1) in a container has its phone-home artifacts cleaned" \
     "0" "${left_u}"
+
+# The NON-container arm of the same guard (SEC-BE-006): a failed install must
+# NOT strip a working Chrome's update channel outside a container — dpkg's
+# postinst plants these artifacts DURING apt-get, so `apt-get install`
+# succeeding followed by an abort (verify_apt_origin returning non-zero is one
+# such abort, and it is exactly this reachable) must leave them in place on a
+# developer's own machine. No case in this suite (root_u has no .dockerenv
+# from here on, and the two ambient signals are unset) covered this before.
+rm -f "${root_u}/.dockerenv"
+plant_u
+(
+    VESPASIAN_TEST_ROOT="${root_u}"
+    export VESPASIAN_TEST_ROOT
+    unset REMOTE_CONTAINERS
+    unset container
+    # shellcheck source=install-chrome.sh disable=SC1091
+    source "${INSTALL_SCRIPT}"
+    SUDO=""
+    SCRATCH_DIR="${FIXTURE_DIR}/scratch-u4"; mkdir -p "$SCRATCH_DIR"
+    INSTALL_ATTEMPTED=1
+    cleanup_all
+) >/dev/null 2>&1
+kept_u4=1
+for f in "${root_u}/etc/apt/sources.list.d/google-chrome.list" \
+         "${root_u}/etc/apt/sources.list.d/google-chrome.sources" \
+         "${root_u}/etc/cron.daily/google-chrome" \
+         "${root_u}/usr/share/keyrings/google-chrome.gpg"; do
+    [ -e "$f" ] || kept_u4=0
+done
+assert_eq "case u: a failed install (INSTALL_ATTEMPTED=1) outside a container leaves phone-home artifacts alone" \
+    "1" "${kept_u4}"
 
 plant_u
 (
@@ -1744,7 +1750,12 @@ assert_eq "case u: a SUCCESSFUL install (INSTALL_SUCCEEDED=1) leaves main()'s de
 # an empty string instead lets the sentinel below report the breakage as a
 # failure, which is the entire point of having a sentinel.
 main_body_u=$(awk '/^main\(\) \{/,/^\}/' "${INSTALL_SCRIPT}")
-apt_at=$(printf '%s\n' "${main_body_u}" | grep -n '^[[:space:]]*\$SUDO apt-get install ' | head -1 | cut -d: -f1 || true)
+# Not anchored to line-start any more (SEC-BE-008 wrapped the call in
+# `if ! timeout N $SUDO apt-get install ...; then`), but still requires the
+# literal "$SUDO apt-get install " substring, which the log_fail message a
+# few lines below it ("apt-get install failed or timed out.") does not carry
+# -- so the anchor still lands on the real call, not that diagnostic.
+apt_at=$(printf '%s\n' "${main_body_u}" | grep -n '\$SUDO apt-get install ' | head -1 | cut -d: -f1 || true)
 succ_at=$(printf '%s\n' "${main_body_u}" | grep -n '^[[:space:]]*INSTALL_SUCCEEDED=1[[:space:]]*$' | head -1 | cut -d: -f1 || true)
 rm_at=""
 if [ -n "${apt_at}" ]; then
@@ -1769,71 +1780,188 @@ else
     fail_count=$((fail_count + 1))
 fi
 
-# ── Case s: log helpers must not interpret escapes in DATA ─────
-# log_* render externally-derived strings (gpg stderr, browser paths, apt
-# errors). They were `echo -e`, which interprets \e/\n INSIDE the message, so a
-# hostile or merely odd string could forge log lines or drive the terminal.
-# They are printf '%b[TAG]%b %s' now — colour via %b, message via %s. Without
-# this case, reverting to `echo -e` leaves every other assertion green.
-# TEST-011: round 4 hardened log_header too ("was still `echo -e`-ing its
-# argument while its four siblings were hardened to printf %s"), but no
-# assertion was added for it, and this probe only ever drove log_info/log_fail
-# -- log_header, log_ok and log_warn stayed unproven. log_ok and log_warn are
-# not cosmetic gaps either: report_browser_prerequisite renders a filesystem
-# path through exactly one of them (`log_ok "Browser: $chrome_bin"` or the
-# not-runnable branch), so those are the two that render externally-derived
-# data most often in this script.
-log_probe=$(
-    # shellcheck source=common.sh
-    source "${SCRIPT_DIR}/common.sh"
-    log_info 'literal\e[31m and \n stay literal'
-    log_fail 'second\tline'
-    log_header 'header\e[31m stays literal'
-    log_ok 'ok\e[31m stays literal'
-    log_warn 'warn\e[31m stays literal'
-)
-if printf '%s' "${log_probe}" | grep -qF 'literal\e[31m and \n stay literal'; then
-    echo "PASS: case s: log_info prints backslash escapes in the message literally"
-    pass_count=$((pass_count + 1))
+# ── Case v: in_container() gates removal on the MAIN install path too ───
+# Cases o/o2 pin the in_container() gate on the IDEMPOTENT early exit only.
+# main() has a SECOND, independent in_container() call further down -- reached
+# only after `apt-get install` has actually "succeeded" -- and nothing
+# exercised it: every other case in this suite stops before the first $SUDO.
+# This is the security-relevant behaviour change of the whole wave (remove_
+# phone_home on the main path used to run unconditionally; it is now gated the
+# same way the early exit already was) and it had zero coverage.
+#
+# Reaching it unprivileged needs every step of the install path stubbed
+# through, INCLUDING the postinst side effect the whole audit exists to catch:
+# a real `apt-get install` is what actually plants the phone-home artifacts, so
+# the apt-get stub plants them itself (and drops a runnable fake browser)
+# exactly when it is invoked with "install", mirroring what dpkg's postinst
+# really does. Depends on the same committed key fixture as cases j/j2 (install_
+# pinned_key has to genuinely succeed to reach this code); skips distinctly
+# from trust_anchor_skips if that fixture or gpg is unavailable, since this
+# case is not testing the trust anchor itself, only relying on it.
+run_main_install_path() {
+    # $2 is named "mode", not "container": install-chrome.sh's in_container()
+    # now also checks the ambient `container` env var (SEC-BE-005), and a local
+    # variable of that exact name here would shadow it for every function this
+    # subshell sources and calls -- silently making in_container() see "host"/
+    # "container" as a non-empty value and answer true unconditionally. Verified
+    # by the collision itself: this is what happened before this var was renamed.
+    local root="$1" mode="$2" bin_v
+    bin_v="${FIXTURE_DIR}/bin-v-${mode}"
+    rm -rf "${root}" "${bin_v}"
+    mkdir -p "${root}" "${bin_v}"
+
+    # A marker under /var/lib/apt/lists (TEST-012): the in_container() gate on
+    # main()'s cache wipe had no fixture tree to actually wipe, so a mutation
+    # that deleted the gate entirely was invisible to this suite. Planted here
+    # so both the container and host runs below can pin their own arm of it.
+    mkdir -p "${root}/var/lib/apt/lists"
+    : > "${root}/var/lib/apt/lists/marker"
+
+    printf '#!/bin/bash\nexec "$@"\n' > "${bin_v}/sudo"
+    cat > "${bin_v}/dpkg" <<'EOF'
+#!/bin/bash
+[ "$1" = "--print-architecture" ] && { echo amd64; exit 0; }
+exit 1
+EOF
+    cat > "${bin_v}/curl" <<EOF
+#!/bin/bash
+out=""
+while [ \$# -gt 0 ]; do
+    [ "\$1" = "-o" ] && { out="\$2"; shift 2; continue; }
+    shift
+done
+cat '${GOOGLE_KEY_CACHE}' > "\$out"
+EOF
+    cat > "${bin_v}/apt-cache" <<'POLICY_STUB'
+#!/bin/bash
+cat <<'POLICY'
+google-chrome-stable:
+  Installed: (none)
+  Candidate: 999.0.0.0-1
+  Version table:
+ *** 999.0.0.0-1 500
+        500 http://dl.google.com/linux/chrome/deb stable/main amd64 Packages
+POLICY
+POLICY_STUB
+    # Simulates dpkg's postinst: the actual moment the phone-home artifacts and
+    # a runnable browser binary appear on a real host. Only "install" plants
+    # them, so `apt-get update` (and anything else) stays a no-op.
+    cat > "${bin_v}/apt-get" <<EOF
+#!/bin/bash
+case "\$*" in
+    *install*google-chrome-stable*)
+        mkdir -p '${root}/etc/apt/sources.list.d' '${root}/etc/cron.daily' '${root}/usr/share/keyrings'
+        touch '${root}/etc/apt/sources.list.d/google-chrome.list' \\
+              '${root}/etc/apt/sources.list.d/google-chrome.sources' \\
+              '${root}/etc/cron.daily/google-chrome' \\
+              '${root}/usr/share/keyrings/google-chrome.gpg'
+        printf '#!/bin/bash\necho "Google Chrome 999.0.0.0"\n' > '${bin_v}/google-chrome'
+        chmod +x '${bin_v}/google-chrome'
+        ;;
+esac
+exit 0
+EOF
+    chmod +x "${bin_v}/sudo" "${bin_v}/dpkg" "${bin_v}/curl" "${bin_v}/apt-cache" "${bin_v}/apt-get"
+
+    (
+        # umask 0 (SEC-BE-003): a Dockerfile RUN commonly runs with one, and
+        # it is the adverse case that actually distinguishes `install -d`
+        # (fixed 0755 regardless of umask) from a `mkdir -p` regression
+        # (0777 under this umask) -- under the suite's own ambient umask
+        # (022 in this devcontainer and on GitHub-hosted runners) the two
+        # produce the SAME mode, so the parent-directory assertion below
+        # would not bite without this. Forcing it here is what gives that
+        # assertion teeth on every host this suite runs on.
+        umask 0
+        VESPASIAN_TEST_ROOT="${root}"
+        export VESPASIAN_TEST_ROOT
+        if [ "${mode}" = "container" ]; then
+            : > "${root}/.dockerenv"
+        fi
+        unset REMOTE_CONTAINERS
+        # Unset too, not just avoided by renaming the local above: an ambient
+        # `container` (set by some CI runners' own containerized job) must not
+        # silently flip this run onto the container arm regardless of $mode.
+        unset container
+        PATH="${bin_v}:${PATH}"
+        # shellcheck source=install-chrome.sh
+        source "${INSTALL_SCRIPT}"
+        # An ABSOLUTE path, not the bare name "google-chrome": command -v on a
+        # bare name resolves it anywhere on PATH, including a REAL Chrome the
+        # host already has (this devcontainer does). That silently took the
+        # idempotent EARLY exit instead of the main install path this case
+        # exists to drive through -- same trap case i's comment documents --
+        # and made both assertions below pass for the wrong reason (nothing
+        # was ever planted, so nothing needed to be removed). Pinning to the
+        # exact path the apt-get stub will create is what forces the real path.
+        CHROME_CANDIDATES=("${bin_v}/google-chrome")
+        set +e
+        out=$(main 2>&1)
+        printf '%s\n%s\n' "$?" "${out}"
+    )
+}
+
+if [ "${have_real_key}" -eq 1 ]; then
+    root_v1="${FIXTURE_DIR}/root-v1"
+    res_v1=$(run_main_install_path "${root_v1}" "container")
+    assert_eq "case v: in_container()=true main-install-path run succeeds end to end (rc 0)" \
+        "0" "$(echo "${res_v1}" | sed -n '1p')"
+    if [ -e "${root_v1}/etc/apt/sources.list.d/google-chrome.list" ] || \
+       [ -e "${root_v1}/etc/cron.daily/google-chrome" ]; then
+        echo "FAIL: case v: in_container()=true still left the package's phone-home artifacts on the main install path"
+        fail_count=$((fail_count + 1))
+    else
+        echo "PASS: case v: in_container()=true removes the package's phone-home artifacts on the main install path"
+        pass_count=$((pass_count + 1))
+    fi
+    # TEST-012: the in_container() gate on the /var/lib/apt/lists wipe had no
+    # fixture to actually destroy, so this arm is what proves it still fires.
+    if [ -e "${root_v1}/var/lib/apt/lists/marker" ]; then
+        echo "FAIL: case v: in_container()=true left /var/lib/apt/lists intact (the cache wipe did not run)"
+        fail_count=$((fail_count + 1))
+    else
+        echo "PASS: case v: in_container()=true wipes /var/lib/apt/lists"
+        pass_count=$((pass_count + 1))
+    fi
+    # TEST-013 / SEC-BE-003: the version record's success path had no positive
+    # assertion anywhere in this per-PR suite (only its ABSENCE on a no-install
+    # run, in case o2) -- only the mode was previously stat-checked for the
+    # keyring/list/pref trio, not for this write or its parent directory.
+    assert_contains "case v: an install writes the chrome-version record" \
+        "999.0.0.0" "$(cat "${root_v1}/usr/share/vespasian/chrome-version" 2>/dev/null)"
+    assert_eq "case v: the chrome-version record is world-readable but not writable (0644)" \
+        "644" "$(stat -c '%a' "${root_v1}/usr/share/vespasian/chrome-version" 2>/dev/null)"
+    assert_eq "case v: the chrome-version record's parent directory is 0755" \
+        "755" "$(stat -c '%a' "${root_v1}/usr/share/vespasian" 2>/dev/null)"
+
+    root_v2="${FIXTURE_DIR}/root-v2"
+    res_v2=$(run_main_install_path "${root_v2}" "host")
+    assert_eq "case v: in_container()=false main-install-path run succeeds end to end (rc 0)" \
+        "0" "$(echo "${res_v2}" | sed -n '1p')"
+    if [ -e "${root_v2}/etc/apt/sources.list.d/google-chrome.list" ] && \
+       [ -e "${root_v2}/etc/cron.daily/google-chrome" ]; then
+        echo "PASS: case v: in_container()=false leaves the package's phone-home artifacts alone on the main install path"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: case v: in_container()=false removed artifacts it does not own on the main install path"
+        fail_count=$((fail_count + 1))
+    fi
+    # TEST-012, the host arm: /var/lib/apt/lists is not this script's to wipe
+    # outside a container.
+    if [ -e "${root_v2}/var/lib/apt/lists/marker" ]; then
+        echo "PASS: case v: in_container()=false leaves /var/lib/apt/lists intact"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: case v: in_container()=false wiped /var/lib/apt/lists, which it does not own"
+        fail_count=$((fail_count + 1))
+    fi
+    # TEST-013: the record is written on the install path regardless of
+    # in_container() -- that predicate governs the PACKAGE's own artifacts,
+    # not this script's own audit record.
+    assert_contains "case v: an install writes the chrome-version record outside a container too" \
+        "999.0.0.0" "$(cat "${root_v2}/usr/share/vespasian/chrome-version" 2>/dev/null)"
 else
-    echo "FAIL: case s: log_info interpreted escapes in the message (echo -e regression?)"
-    fail_count=$((fail_count + 1))
-fi
-if printf '%s' "${log_probe}" | grep -qF 'second\tline'; then
-    echo "PASS: case s: log_fail prints backslash escapes in the message literally"
-    pass_count=$((pass_count + 1))
-else
-    echo "FAIL: case s: log_fail interpreted escapes in the message (echo -e regression?)"
-    fail_count=$((fail_count + 1))
-fi
-if printf '%s' "${log_probe}" | grep -qF 'header\e[31m stays literal'; then
-    echo "PASS: case s: log_header prints backslash escapes in the message literally"
-    pass_count=$((pass_count + 1))
-else
-    echo "FAIL: case s: log_header interpreted escapes in the message (echo -e regression?)"
-    fail_count=$((fail_count + 1))
-fi
-if printf '%s' "${log_probe}" | grep -qF 'ok\e[31m stays literal'; then
-    echo "PASS: case s: log_ok prints backslash escapes in the message literally"
-    pass_count=$((pass_count + 1))
-else
-    echo "FAIL: case s: log_ok interpreted escapes in the message (echo -e regression?)"
-    fail_count=$((fail_count + 1))
-fi
-if printf '%s' "${log_probe}" | grep -qF 'warn\e[31m stays literal'; then
-    echo "PASS: case s: log_warn prints backslash escapes in the message literally"
-    pass_count=$((pass_count + 1))
-else
-    echo "FAIL: case s: log_warn interpreted escapes in the message (echo -e regression?)"
-    fail_count=$((fail_count + 1))
-fi
-# The colour codes must STILL render, or the fix broke the logs to pass the test.
-if printf '%s' "${log_probe}" | grep -q "$(printf '\033')"; then
-    echo "PASS: case s: colour escapes still render (fix did not strip formatting)"
-    pass_count=$((pass_count + 1))
-else
-    echo "FAIL: case s: colour escapes no longer render"
-    fail_count=$((fail_count + 1))
+    skip "case v: main-install-path in_container() gating (needs the same key fixture/gpg as j/j2)"
 fi
 
 # ── Case w: verify_apt_origin, both arms (TEST-010) ─────────────
@@ -1914,6 +2042,9 @@ assert_contains "case w: the empty-policy refusal is diagnosed as unknown" \
 # cleanup_all's own control flow rather than about what the steps do. That is
 # the property under test: ORDER (security-relevant removal first) and
 # TOLERANCE (an earlier failure must not skip a later step).
+mkdir -p "${FIXTURE_DIR}/root-x"
+: > "${FIXTURE_DIR}/root-x/.dockerenv"
+
 run_cleanup_all() {
     local order_log="$1" fail_step="$2" rc=0
     # The subshell is the errexit boundary. `cleanup_all` is invoked as a PLAIN
@@ -1926,6 +2057,17 @@ run_cleanup_all() {
     # `||` on cleanup_all, deleting every `|| true` from the handler kept the
     # suite green.
     (
+        # cleanup_all now calls in_container() before its first step
+        # (SEC-BE-006), so this case's own subject — ORDER and TOLERANCE of
+        # cleanup_all's steps — needs a deterministic container answer,
+        # independent of whether the host running this suite happens to
+        # export REMOTE_CONTAINERS. root-x/.dockerenv pins it to "container",
+        # which is the arm that actually calls remove_phone_home; case u
+        # covers the non-container arm.
+        VESPASIAN_TEST_ROOT="${FIXTURE_DIR}/root-x"
+        export VESPASIAN_TEST_ROOT
+        unset REMOTE_CONTAINERS
+        unset container
         # shellcheck source=install-chrome.sh
         source "${INSTALL_SCRIPT}"
         # A failed install: this is the arm that must remove the phone-home
@@ -1988,7 +2130,93 @@ for guarded_step in remove_phone_home cleanup_apt_wiring; do
     fi
 done
 
+# ── Case y: the pre-install origin gate refuses BEFORE apt-get install runs ──
+# (SEC-BE-009). verify_apt_origin now runs twice: once right after `apt-get
+# update`, before `apt-get install` ever executes, and again afterward as a
+# second check. This pins the FIRST call specifically -- apt-cache policy
+# reports a non-Google origin for the candidate, so the install must never
+# run at all, and no maintainer script from the wrong origin ever executes as
+# root. Depends on the same committed key fixture as cases j/j2/v (install_
+# pinned_key has to genuinely succeed to reach the gate), so it skips the
+# same way those do when that fixture or gpg is unavailable.
+if [ "${have_real_key}" -eq 1 ]; then
+    root_y="${FIXTURE_DIR}/root-y"
+    bin_y="${FIXTURE_DIR}/bin-y"
+    rm -rf "${root_y}" "${bin_y}"
+    mkdir -p "${root_y}" "${bin_y}"
+    printf '#!/bin/bash\nexec "$@"\n' > "${bin_y}/sudo"
+    cat > "${bin_y}/dpkg" <<'EOF'
+#!/bin/bash
+[ "$1" = "--print-architecture" ] && { echo amd64; exit 0; }
+exit 1
+EOF
+    cat > "${bin_y}/curl" <<EOF
+#!/bin/bash
+out=""
+while [ \$# -gt 0 ]; do
+    [ "\$1" = "-o" ] && { out="\$2"; shift 2; continue; }
+    shift
+done
+cat '${GOOGLE_KEY_CACHE}' > "\$out"
+EOF
+    # A HOSTILE apt-cache policy: the candidate resolves from a third-party
+    # mirror, not dl.google.com -- exactly the scenario TMP_PREF exists to
+    # prevent, reached here via a stale/unrelated source rather than a failed
+    # fetch of the pinned one (apt-get update itself still reports success).
+    cat > "${bin_y}/apt-cache" <<'POLICY_STUB'
+#!/bin/bash
+cat <<'POLICY'
+google-chrome-stable:
+  Installed: (none)
+  Candidate: 1.0.0-1
+  Version table:
+ *** 1.0.0-1 500
+        500 https://mirror.evil.example/linux/chrome/deb stable/main amd64 Packages
+POLICY
+POLICY_STUB
+    # apt-get install must NEVER be invoked; a marker file proves it, since a
+    # gated run and a run that reached install-and-failed would both exit
+    # non-zero and look identical from rc alone.
+    cat > "${bin_y}/apt-get" <<EOF
+#!/bin/bash
+case "\$*" in
+    *install*google-chrome-stable*)
+        touch '${bin_y}/apt-get-install-ran'
+        ;;
+esac
+exit 0
+EOF
+    chmod +x "${bin_y}"/sudo "${bin_y}"/dpkg "${bin_y}"/curl "${bin_y}"/apt-cache "${bin_y}"/apt-get
+    res_y=$(
+        VESPASIAN_TEST_ROOT="${root_y}"
+        export VESPASIAN_TEST_ROOT
+        unset REMOTE_CONTAINERS
+        unset container
+        PATH="${bin_y}:${PATH}"
+        # shellcheck source=install-chrome.sh
+        source "${INSTALL_SCRIPT}"
+        CHROME_CANDIDATES=()
+        set +e
+        out=$(main 2>&1)
+        printf '%s\n%s\n' "$?" "${out}"
+    )
+    assert_eq "case y: main() aborts before apt-get install when the candidate's origin is wrong (rc 1)" \
+        "1" "$(echo "${res_y}" | sed -n '1p')"
+    assert_contains "case y: the abort names the unexpected origin" \
+        "unexpected origin" "${res_y}"
+    if [ -e "${bin_y}/apt-get-install-ran" ]; then
+        echo "FAIL: case y: apt-get install ran despite the pre-install origin gate"
+        fail_count=$((fail_count + 1))
+    else
+        echo "PASS: case y: apt-get install never ran — the origin gate fired before it"
+        pass_count=$((pass_count + 1))
+    fi
+else
+    skip "case y: pre-install origin gate (needs the same key fixture/gpg as j/j2)"
+fi
+
 # ── Summary ─────────────────────────────────────────────────────
+SUITE_COMPLETED=1
 echo ""
 echo "install-chrome-selftest: ${pass_count} passed, ${fail_count} failed, ${skip_count} skipped"
 # A SKIP is a coverage hole, not a pass. Cases j/j2 are the only assertions that

@@ -680,6 +680,24 @@ else
     pass "chrome_available: reports unavailable with only a non-runnable candidate and no rod cache"
 fi
 
+# The rod-cache FALLBACK arm (TEST-016). The two polarities above both leave
+# $HOME without a rod cache, so the `|| [ -d "$HOME/.cache/rod/browser" ]` half
+# of chrome_available was never the deciding term: deleting it entirely kept
+# this suite green. That arm is what lets a host whose only browser is one
+# go-rod downloaded itself — not on PATH, so invisible to CHROME_CANDIDATES —
+# still run the rod-backed targets instead of skipping them, which is the
+# difference between AC3 executing and AC3 quietly SKIPping.
+mkdir -p "$chrome_fixture_dir/home-rod/.cache/rod/browser"
+if (
+    CHROME_CANDIDATES=("$chrome_broken_browser")
+    HOME="$chrome_fixture_dir/home-rod"
+    chrome_available
+); then
+    pass "chrome_available: a rod-downloaded browser counts as available even with no runnable candidate"
+else
+    fail "chrome_available: expected available (rc 0) via the rod-cache fallback with a rod cache present"
+fi
+
 echo ""
 echo "=== print_summary: RESULTS_DIR is data, not format (TEST-019) ==="
 # This PR converts print_summary's RESULTS_DIR line from `echo -e` to
@@ -907,13 +925,100 @@ else
 fi
 
 if [[ -f "$WORKFLOW" ]]; then
-    workflow_runlines_all=$(grep -vE '^[[:space:]]*#' "$WORKFLOW")
+    # TEST-018: presence of a matching `run:` line anywhere in the file proves
+    # only that the text exists, not that anything can execute it — a job
+    # gated off with `if: false` (or any other neutering) still contains the
+    # line. Resolve which job actually HOSTS the match, the same way
+    # preflight_block/e2e_block/test_block above pin a single named job, but
+    # parameterized: the hosting job for a given suite isn't known ahead of
+    # time, so the extraction idiom is wrapped in a function and driven by the
+    # job-name list derived from the workflow itself.
+    #
+    # extract_job_block's end-of-block regex adds 0-9 to the character class
+    # the sibling blocks above use ([a-zA-Z_-]+): that class alone stops
+    # mid-name on install-chrome-e2e (the digit in "e2e" breaks the match),
+    # which would silently swallow the next job's content whenever the search
+    # starts at the job immediately before it.
+    extract_job_block() {
+        awk -v job_line="  $1:" '
+            $0 == job_line { inblock=1; next }
+            inblock && /^  [A-Za-z0-9_-]+:/ { inblock=0 }
+            inblock { print }
+        ' "$WORKFLOW"
+    }
+
+    mapfile -t all_job_names < <(
+        awk '
+            /^jobs:/ { in_jobs=1; next }
+            in_jobs && /^[A-Za-z]/ { in_jobs=0 }
+            in_jobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+                line=$0
+                sub(/^  /, "", line)
+                sub(/:[[:space:]]*$/, "", line)
+                print line
+            }
+        ' "$WORKFLOW"
+    )
+    if printf '%s\n' "${all_job_names[@]}" | grep -qx 'preflight-selftest' \
+       && printf '%s\n' "${all_job_names[@]}" | grep -qx 'validator-regression'; then
+        pass "job name list derived from live-tests.yml (sentinels present)"
+    else
+        fail "job name list derivation from live-tests.yml is broken/empty (expected sentinels missing)"
+    fi
+
+    # Jobs whose if: gate is deliberate and already pinned elsewhere in this
+    # file: install-chrome-e2e's exact trigger arms (TEST-001, above), and
+    # test's dependency on check-label's skip-live-tests gate. A job reaching
+    # this allowlist is not itself a finding — only an if: on a job NOT on it.
+    ALLOWED_GATED_JOBS=(install-chrome-e2e test)
+
+    declare -a hosting_jobs=()
     for suite in "${candidate_suites[@]}"; do
         suite_re=${suite//./\\.}
-        if printf '%s\n' "$workflow_runlines_all" | grep -qE "run:[[:space:]]*(\./|bash )?test/${suite_re}([[:space:]]|$)"; then
-            pass "suite '$suite' is invoked by some CI job in live-tests.yml"
+        hosting_job=""
+        for job_name in "${all_job_names[@]}"; do
+            job_runlines=$(extract_job_block "$job_name" | grep -vE '^[[:space:]]*#')
+            if printf '%s\n' "$job_runlines" | grep -qE "run:[[:space:]]*(\./|bash )?test/${suite_re}([[:space:]]|\$)"; then
+                hosting_job="$job_name"
+                break
+            fi
+        done
+        if [[ -n "$hosting_job" ]]; then
+            pass "suite '$suite' is invoked by job '$hosting_job' in live-tests.yml"
+            hosting_jobs+=("$hosting_job")
         else
             fail "suite '$suite' exists in test/ but is not invoked by any CI job — add it to a job, or to the exemption list here"
+        fi
+    done
+
+    # A suite's coverage is only as real as the job hosting it being able to
+    # run at all. Apply the same two neutering checks the preflight-selftest
+    # and install-chrome-e2e blocks above already apply to themselves — but to
+    # whichever job the loop above actually found — once per distinct hosting
+    # job rather than once per suite, since several suites share a host.
+    mapfile -t unique_hosting_jobs < <(printf '%s\n' "${hosting_jobs[@]}" | sort -u)
+    for job_name in "${unique_hosting_jobs[@]}"; do
+        [[ -z "$job_name" ]] && continue
+        job_runlines=$(extract_job_block "$job_name" | grep -vE '^[[:space:]]*#')
+
+        if printf '%s\n' "$job_runlines" | grep -qE '^[[:space:]]*continue-on-error:[[:space:]]*true'; then
+            fail "job '$job_name' (hosts suite coverage asserted above) sets continue-on-error: true — a failing suite would not fail CI"
+        else
+            pass "job '$job_name' (hosts suite coverage asserted above) has no continue-on-error: true"
+        fi
+
+        if printf '%s\n' "$job_runlines" | grep -qE '^[[:space:]]*if:'; then
+            allowed=0
+            for allowed_job in "${ALLOWED_GATED_JOBS[@]}"; do
+                [[ "$job_name" == "$allowed_job" ]] && allowed=1
+            done
+            if [[ "$allowed" -eq 1 ]]; then
+                pass "job '$job_name' carries an if: gate, but is on the allowlist of legitimately-gated jobs"
+            else
+                fail "job '$job_name' (hosts suite coverage asserted above) carries an if: gate not on the allowlist — the job, and every suite it hosts, may never run"
+            fi
+        else
+            pass "job '$job_name' (hosts suite coverage asserted above) has no if: gate"
         fi
     done
 else

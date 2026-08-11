@@ -290,11 +290,15 @@ For Linux devcontainers without Docker Desktop, use the detected host gateway (e
 
 ### `FORMS_TARGET_BIND_HOST` (optional)
 
-The `forms-target` server binds `127.0.0.1` by default (via its `BIND_HOST` env var). `setup-live-targets.sh` starts it with `BIND_HOST=${FORMS_TARGET_BIND_HOST:-0.0.0.0}` so a crawler running inside a devcontainer (reaching the host via `TEST_HOST=host.docker.internal`) can connect. For host-only local runs, pin it back to loopback:
+The `forms-target` server binds `127.0.0.1` by default (via its `BIND_HOST` env var), and `setup-live-targets.sh` now honours that default rather than overriding it. It is an unauthenticated HTTP app serving login / register / feedback forms, so it has no business listening on every interface of the operator's machine unless asked.
+
+Widen it explicitly when the crawler runs inside a devcontainer and reaches the host via `TEST_HOST=host.docker.internal`:
 
 ```bash
-FORMS_TARGET_BIND_HOST=127.0.0.1 ./test/setup-live-targets.sh --targets forms-target
+FORMS_TARGET_BIND_HOST=0.0.0.0 ./test/setup-live-targets.sh --targets forms-target
 ```
+
+Nothing else needs this: every other target either binds all interfaces already or, like `grpc-server`, hard-pins loopback in its own Go source.
 
 ### `CONFIG_FILE` (optional)
 

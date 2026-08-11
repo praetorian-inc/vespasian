@@ -203,6 +203,17 @@ TMP_KEYRING="${TEST_ROOT}/usr/share/keyrings/google-chrome-vespasian-temp.gpg"
 # a stale local package cannot win over the origin this run trusts either.
 TMP_PREF="${TEST_ROOT}/etc/apt/preferences.d/google-chrome-vespasian-temp.pref"
 
+# Mutual exclusion for the whole apt-wiring lifecycle (SEC-BE-007). TMP_LIST,
+# TMP_KEYRING and TMP_PREF above are FIXED filenames, not per-run, so two
+# concurrent invocations of this script — a postCreateCommand racing a
+# developer's manual run, or two parallel provisioning steps, both patterns
+# this script's header advertises as safe — would otherwise let one run's
+# "self-healing" cleanup (see cleanup_apt_wiring's call sites in main()) strip
+# the OTHER run's live apt wiring out from under it, including the origin pin
+# between its `apt-get update` and `apt-get install`. Acquired in main(),
+# before the idempotency check's own cleanup call.
+LOCK_FILE="${TEST_ROOT}/tmp/vespasian-install-chrome.lock"
+
 # The package's own opt-out file, and a durable record of what version landed.
 CHROME_DEFAULTS_FILE="${TEST_ROOT}/etc/default/google-chrome"
 CHROME_VERSION_RECORD="${TEST_ROOT}/usr/share/vespasian/chrome-version"
@@ -613,22 +624,31 @@ cleanup_all() {
     # that ADDED standing egress. remove_phone_home is an rm -f of fixed paths,
     # so it is idempotent and safe to reach twice.
     #
-    # Run unconditionally here, NOT gated on in_container: a run that died
-    # mid-install never reached main()'s own container-aware removal below, so
-    # this is the only place that decision gets made for a failed run — and a
-    # failed run leaves no working Chrome whose update channel is worth
-    # preserving either way. INSTALL_SUCCEEDED is what keeps this from also
-    # firing on every SUCCESSFUL exit: main() already made the real,
-    # container-aware decision there, and re-deciding here would silently
-    # remove the artifacts main() had just chosen to leave alone outside a
-    # container.
+    # Gated on in_container() too (SEC-BE-006): a run that died mid-install
+    # never reached main()'s own container-aware removal below, so this is the
+    # only place that decision gets made for a failed run — but "a failed run
+    # leaves no working Chrome whose update channel is worth preserving" is
+    # only true INSIDE a container. Outside one, `apt-get install` can already
+    # have succeeded (dpkg's postinst plants the phone-home artifacts during
+    # apt-get, before verify_apt_origin or anything after it ever runs), so an
+    # abort between those two points would otherwise strip a WORKING, just-
+    # installed Chrome's update channel on a developer's own machine — the
+    # same thing the in_container() gate already prevents on every other call
+    # site in this file. INSTALL_SUCCEEDED is what keeps this from also firing
+    # on every SUCCESSFUL exit: main() already made the real, container-aware
+    # decision there, and re-deciding here would silently remove the
+    # artifacts main() had just chosen to leave alone outside a container.
     #
     # Guarded on INSTALL_ATTEMPTED too, rather than run unconditionally: without
     # that, this trap would fire on the browser-already-present early exit and
     # delete a pre-existing Chrome's update channel on a developer's machine —
     # undoing the in_container check on that path by the back door.
     if [ "$INSTALL_ATTEMPTED" -eq 1 ] && [ "$INSTALL_SUCCEEDED" -ne 1 ]; then
-        remove_phone_home || true
+        if in_container; then
+            remove_phone_home || true
+        else
+            log_warn "Failed install left the google-chrome apt source and updater in place (not a container — see SEC-BE-006)."
+        fi
     fi
     cleanup_apt_wiring || true
     if [ -n "$SCRATCH_DIR" ]; then
@@ -679,6 +699,22 @@ main() {
     trap 'cleanup_all' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
+
+    # Acquire the install lock before the idempotency check's own cleanup call
+    # below — see LOCK_FILE's declaration for why. flock is the idiomatic tool
+    # for this; where it is unavailable this degrades to the previous
+    # (undefended) behaviour rather than failing the whole script over a
+    # missing coreutils-adjacent tool.
+    if command -v flock >/dev/null 2>&1; then
+        mkdir -p -- "$(dirname -- "$LOCK_FILE")"
+        exec {LOCK_FD}>"$LOCK_FILE"
+        if ! flock -w 300 "$LOCK_FD"; then
+            log_fail "Could not acquire the install lock (${LOCK_FILE}) within 300s — another run appears stuck." >&2
+            exit 1
+        fi
+    else
+        log_warn "flock not found — concurrent installs are not mutually exclusive (see SEC-BE-007)."
+    fi
 
     # Idempotency: a browser that actually RUNS (not merely a snap stub that
     # resolves) means there is no install to do.
@@ -744,8 +780,40 @@ main() {
     # artifacts runs inside this command, so a failure part-way through must
     # still count as "this run caused them" for cleanup_all.
     INSTALL_ATTEMPTED=1
-    $SUDO apt-get update -qq
-    $SUDO apt-get install -y --no-install-recommends google-chrome-stable
+    # Both apt invocations are bounded, the same reasoning as the key fetch
+    # above: a held dpkg/apt lock or a tarpitted mirror would otherwise wedge
+    # this run indefinitely with the temporary Google source still live in
+    # /etc (SEC-BE-008). DPkg::Lock::Timeout turns a held lock into a
+    # diagnosable apt error instead of a silent hang; `timeout` is the outer
+    # backstop for every other way an apt run can wedge.
+    # shellcheck disable=SC2086  # $SUDO is deliberately unquoted: it is either
+    # "sudo" or the empty string, and quoting it would pass an empty argument.
+    # Every other $SUDO call site in this file relies on the same property;
+    # only these two are flagged because `timeout` moves $SUDO out of the
+    # command-name position shellcheck exempts.
+    if ! timeout 300 $SUDO apt-get update -qq -o DPkg::Lock::Timeout=120; then
+        log_fail "apt-get update failed or timed out (held dpkg lock, or an unreachable mirror)." >&2
+        exit 1
+    fi
+    # Gate BEFORE dpkg ever runs a maintainer script, not only after (SEC-
+    # BE-009). `apt-get update -qq` exits 0 even when the just-pinned source
+    # failed to fetch — apt only warns — so without this, `apt-get install`
+    # below could still resolve the package NAME from whatever OTHER source
+    # already offers it, and dpkg would run that package's postinst as root
+    # before the post-install check further down ever gets a say.
+    # `apt-cache policy` is read-only and reports the CANDIDATE's origin, so
+    # this needs no install to answer.
+    if ! verify_apt_origin; then
+        exit 1
+    fi
+    # shellcheck disable=SC2086  # $SUDO unquoted, as above.
+    if ! timeout 900 $SUDO apt-get install -y --no-install-recommends \
+        -o DPkg::Lock::Timeout=120 google-chrome-stable; then
+        log_fail "apt-get install failed or timed out." >&2
+        exit 1
+    fi
+    # Re-check after install too: confirms dpkg actually unpacked what the
+    # gate above approved, rather than trusting the gate alone.
     if ! verify_apt_origin; then
         exit 1
     fi
@@ -798,8 +866,12 @@ main() {
 # file lands atomically. `tee` did neither.
 record_chrome_version() {
     local version="$1" staged_version="${SCRATCH_DIR}/chrome-version"
+    # -m 0755 on the parent: unlike suppress_permanent_repo's /etc/default
+    # (which usually already exists and so keeps whatever mode it has),
+    # /usr/share/vespasian is a directory THIS script creates, so its mode is
+    # ours to state rather than leave to the caller's umask (SEC-BE-003).
     if printf '%s\n' "$version" > "$staged_version" &&
-       $SUDO install -d -- "$(dirname -- "$CHROME_VERSION_RECORD")" &&
+       $SUDO install -d -m 0755 -- "$(dirname -- "$CHROME_VERSION_RECORD")" &&
        $SUDO install -m 0644 -- "$staged_version" "$CHROME_VERSION_RECORD"; then
         log_info "Recorded build in ${CHROME_VERSION_RECORD}"
     else

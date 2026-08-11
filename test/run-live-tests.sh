@@ -178,10 +178,14 @@ load_config() {
         exit 1
     fi
 
-    # Only these keys may be set from the config file. An explicit allowlist
+    # Only these keys may be set from the CONFIG FILE. An explicit allowlist
     # (rather than any KEY=VALUE) ensures a crafted or hand-edited config can
-    # never rebind security-relevant globals such as VESPASIAN, PATH,
-    # RESULTS_DIR, or TEST_HOST.
+    # never rebind PATH or TEST_HOST, or a global this file itself only ever
+    # sets from the environment (VESPASIAN, RESULTS_DIR — see their
+    # env-override assignments above; a config-file value can never reach
+    # them). It does NOT constrain those two globals' own environment
+    # overrides, which are deliberately settable by the same user who runs
+    # this script (see test/README.md's TEST_HOST/RESULTS_DIR docs).
     local allowed_keys=" REST_API_PORT SOAP_SERVICE_PORT GRAPHQL_SERVER_PORT GRPC_SERVER_PORT CONCAT_SPA_PORT FORMS_TARGET_PORT TARGETS_SETUP "
 
     # Safety: only allow safe KEY=VALUE lines
@@ -190,11 +194,33 @@ load_config() {
         [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
         # Validate format
         if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@,+\"\ -]*$ ]]; then
-            local key="${line%%=*}"
+            local key="${line%%=*}" value="${line#*=}"
             if [[ "$allowed_keys" != *" ${key} "* ]]; then
                 log_warn "Skipping unexpected config key: ${key}"
                 continue
             fi
+            # The allowlist above only protects the KEY half — the format
+            # regex still admits '@'/':' in the VALUE, so
+            # REST_API_PORT=@evil.com would pass both checks and, unvalidated,
+            # make _probe_target_host build a URL curl parses as userinfo +
+            # an attacker-chosen host (SEC-BE-011). Every allowlisted key
+            # except TARGETS_SETUP is a TCP port, so require a numeric
+            # 1-65535 value for those, and a plain target-list charset for
+            # TARGETS_SETUP.
+            case "$key" in
+                TARGETS_SETUP)
+                    if [[ ! "$value" =~ ^[A-Za-z0-9,-]*$ ]]; then
+                        log_warn "Skipping ${key}: unexpected characters in value: ${value}"
+                        continue
+                    fi
+                    ;;
+                *)
+                    if [[ ! "$value" =~ ^[0-9]{1,5}$ ]] || [ "$value" -lt 1 ] || [ "$value" -gt 65535 ]; then
+                        log_warn "Skipping ${key}: not a valid port (1-65535): ${value}"
+                        continue
+                    fi
+                    ;;
+            esac
             declare -g "$line"
         else
             log_warn "Skipping invalid config line: $line"
