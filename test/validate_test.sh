@@ -455,6 +455,41 @@ _test_validator_timeout_openapi() {
 assert_ok "a real OpenAPI spec still validates under an explicit SPEC_VALIDATOR_TIMEOUT" \
     _test_validator_timeout_openapi "${THIS_DIR}/rest-api/expected-spec.yaml"
 
+# TEST-014: every case in this section pins an explicit SPEC_VALIDATOR_TIMEOUT=3,
+# so validate.sh's SHIPPED DEFAULT (`${SPEC_VALIDATOR_TIMEOUT:-30}`) is never
+# exercised — rewriting the default to `:-0` (GNU `timeout 0` disables the bound
+# entirely, so the alias bomb would hang unbounded) or to an absurd `:-99999` (far
+# past the CI job's ~5-min kill, so the bound never fires as a diagnosable failure)
+# leaves this whole suite green. Re-source validate.sh with SPEC_VALIDATOR_TIMEOUT
+# UNSET in a subshell to observe the default it ships, and assert it is a positive,
+# sub-CI-budget integer: >0 so `timeout N` actually bounds the run, and <300 so the
+# bound trips before the ~5-min job kill turns it into an opaque hang (SEC-FE-003).
+_default_spec_validator_timeout() {
+    (
+        unset SPEC_VALIDATOR_TIMEOUT
+        # shellcheck source=/dev/null
+        source "${THIS_DIR}/validate.sh"
+        printf '%s' "${SPEC_VALIDATOR_TIMEOUT}"
+    )
+}
+_assert_default_timeout_sane() {
+    local def
+    def="$(_default_spec_validator_timeout)"
+    case "$def" in
+        ''|*[!0-9]*)
+            printf 'default SPEC_VALIDATOR_TIMEOUT is not a positive integer: %s\n' "$def" >&2
+            return 1
+            ;;
+    esac
+    if [ "$def" -gt 0 ] && [ "$def" -lt 300 ]; then
+        return 0
+    fi
+    printf 'default SPEC_VALIDATOR_TIMEOUT out of bounds (0 < n < 300): %s\n' "$def" >&2
+    return 1
+}
+assert_ok "validate.sh ships a positive, sub-CI-budget default SPEC_VALIDATOR_TIMEOUT" \
+    _assert_default_timeout_sane
+
 # A sub-1 KiB billion-laughs / alias bomb: 9 anchors a–i — a is a 9-element list
 # of scalars and b–i are each 9-element lists of references to the level below,
 # so the deepest anchor expands to 9^9 nodes while the file itself stays tiny.
@@ -485,8 +520,13 @@ EOF
 # dev box has neither; the CI validator-regression job runs on ubuntu, where
 # `timeout` is present.
 if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
-    assert_reject "YAML alias bomb trips the validator wall-clock bound" \
-        "validator timed out after" \
+    # Anchor on the CONFIGURED value (3s), not just "timed out": _run_spec_validator
+    # interpolates ${SPEC_VALIDATOR_TIMEOUT} into this message (validate.sh), so a
+    # mutation that makes it ignore the env var (hardcode a different bound) no
+    # longer prints "3s" and this reject flips red — killing the surviving mutant
+    # that the loose "validator timed out after" anchor left green (TEST-016).
+    assert_reject "YAML alias bomb trips the validator wall-clock bound at the configured 3s" \
+        "validator timed out after 3s" \
         _test_validator_timeout_openapi "${WORK_DIR}/alias-bomb.yaml"
 else
     # TEST-012: do not let the skip silently reduce the pass count in CI. The
@@ -1270,6 +1310,88 @@ EOF
 assert_reject "assert_form_body_fields rejects a request-body schema with no properties" \
     "no request-body schema properties" \
     assert_form_body_fields "${WORK_DIR}/fbf-noprops-spec.yaml" "${WORK_DIR}/fbf-noprops.json"
+
+# Reject (TEST-001, mutation-testing follow-up on the PR #208 re-review): the
+# expected fields live under a SIBLING media type (application/json), while the
+# application/x-www-form-urlencoded body carries no matching schema. A urlencoded
+# form contract must NOT be satisfied by a JSON sibling's fields — before the
+# media-type scoping fix, body_fields_for_path scanned the whole requestBody block
+# and false-passed here. Scoped to urlencoded, the empty urlencoded schema reaches
+# "no request-body schema properties".
+cat > "${WORK_DIR}/fbf-json-sibling-spec.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: t
+  version: "1.0.0"
+paths:
+  /api/login:
+    post:
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginBody'
+      responses:
+        '200':
+          description: ok
+components:
+  schemas:
+    LoginBody:
+      type: object
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+EOF
+cat > "${WORK_DIR}/fbf-json-sibling.json" <<'EOF'
+{"post_form_body_fields_by_path": {"/api/login": ["username", "password"]}}
+EOF
+assert_reject "assert_form_body_fields rejects fields carried only by a non-urlencoded (application/json) sibling body" \
+    "no request-body schema properties" \
+    assert_form_body_fields "${WORK_DIR}/fbf-json-sibling-spec.yaml" "${WORK_DIR}/fbf-json-sibling.json"
+
+# Reject (TEST-003, mutation-testing follow-up on the PR #208 re-review): the
+# resolved urlencoded schema carries a FOREIGN field (email) beyond the expected
+# set {username, password}. The old subset-only check (`missing = expected - got`)
+# false-passed any superset; the exact-set check rejects the unexpected field.
+cat > "${WORK_DIR}/fbf-extra-spec.yaml" <<'EOF'
+openapi: 3.0.3
+info:
+  title: t
+  version: "1.0.0"
+paths:
+  /api/login:
+    post:
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/LoginBody'
+      responses:
+        '200':
+          description: ok
+components:
+  schemas:
+    LoginBody:
+      type: object
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+        email:
+          type: string
+EOF
+cat > "${WORK_DIR}/fbf-extra.json" <<'EOF'
+{"post_form_body_fields_by_path": {"/api/login": ["username", "password"]}}
+EOF
+assert_reject "assert_form_body_fields rejects a urlencoded schema carrying a foreign field beyond the expected set" \
+    "request-body has unexpected field(s)" \
+    assert_form_body_fields "${WORK_DIR}/fbf-extra-spec.yaml" "${WORK_DIR}/fbf-extra.json"
 
 # ──────────────────────────────────────────────────────────────
 # rest-api fixture parity (cross-file lockstep + per-fixture invariants)

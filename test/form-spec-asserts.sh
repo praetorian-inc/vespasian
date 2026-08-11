@@ -15,9 +15,12 @@
 # assert_form_body_fields verifies each urlencoded POST <form>'s input names
 # surface as request-body schema properties UNDER THAT FORM'S OWN ENDPOINT. It
 # reads post_form_body_fields_by_path {path: [fields...]} from
-# expected-paths.json, resolves each path's POST requestBody schema (a $ref into
-# components/schemas, or an inline properties block) and asserts every expected
-# field is a property of THAT schema. This closes the false-pass gap of the
+# expected-paths.json, resolves each path's POST requestBody schema UNDER THE
+# application/x-www-form-urlencoded media type (a $ref into components/schemas, or
+# an inline properties block) and asserts that schema's properties are EXACTLY the
+# expected fields — every expected field present AND no unexpected/foreign field
+# beyond them, and a sibling media type such as application/json cannot satisfy the
+# urlencoded form contract. This closes the false-pass gap of the
 # previous whole-file `grep "^<indent><field>:"`: a field attributed to the
 # wrong operation (e.g. all names collapsing onto one path), or masked by a
 # same-named property shared across forms (username/password in both login and
@@ -157,7 +160,44 @@ def body_fields_for_path(path):
             r_end = j
             break
     rbblock = postblock[rb_start + 1:r_end]
-    for line in rbblock:
+
+    # Scope the schema search to the application/x-www-form-urlencoded media type
+    # (TEST-001): a sibling media type such as application/json must NOT satisfy a
+    # urlencoded form contract. Locate content:, then the urlencoded sub-block
+    # within it, and restrict BOTH the $ref scan and the inline-properties scan to
+    # it. An absent or empty urlencoded body reaches "no request-body schema
+    # properties" below (the JSON sibling's fields are never scanned).
+    content_start = None
+    content_indent = None
+    for k, line in enumerate(rbblock):
+        if re.match(r"^\s+content:\s*$", line):
+            content_start = k
+            content_indent = ind(line)
+            break
+    urlenc = []
+    if content_start is not None:
+        c_end = len(rbblock)
+        for j in range(content_start + 1, len(rbblock)):
+            if rbblock[j].strip() and ind(rbblock[j]) <= content_indent:
+                c_end = j
+                break
+        cblock = rbblock[content_start + 1:c_end]
+        mt_start = None
+        mt_indent = None
+        for k, line in enumerate(cblock):
+            if re.match(r"^\s+application/x-www-form-urlencoded:\s*$", line):
+                mt_start = k
+                mt_indent = ind(line)
+                break
+        if mt_start is not None:
+            m_end = len(cblock)
+            for j in range(mt_start + 1, len(cblock)):
+                if cblock[j].strip() and ind(cblock[j]) <= mt_indent:
+                    m_end = j
+                    break
+            urlenc = cblock[mt_start + 1:m_end]
+
+    for line in urlenc:
         m = re.search(r"\$ref:\s*'?#/components/schemas/([A-Za-z0-9_.-]+)'?", line)
         if m:
             props = schema_properties(m.group(1))
@@ -168,7 +208,7 @@ def body_fields_for_path(path):
     props_indent = None
     child_indent = None
     props = []
-    for line in rbblock:
+    for line in urlenc:
         if re.match(r"^\s+properties:\s*$", line):
             in_props = True
             props_indent = ind(line)
@@ -198,10 +238,16 @@ for path in sorted(by_path):
         failures += 1
         continue
     schema_by_path[path] = schema_id
-    missing = [f for f in fields if f not in got]
+    expected_set = set(fields)
+    missing = sorted(expected_set - got)
+    unexpected = sorted(got - expected_set)
     if missing:
         sys.stderr.write("  detail: %s request-body missing field(s): %s (found: %s)\n"
                          % (path, ", ".join(missing), ", ".join(sorted(got))))
+        failures += 1
+    if unexpected:
+        sys.stderr.write("  detail: %s request-body has unexpected field(s): %s (expected exactly: %s)\n"
+                         % (path, ", ".join(unexpected), ", ".join(sorted(expected_set))))
         failures += 1
 
 # Distinctness guard (TEST-002a): each POST form must resolve to its OWN
