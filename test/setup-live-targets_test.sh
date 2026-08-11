@@ -471,6 +471,138 @@ else
     skip "pgrep required"
 fi
 
+# ── Test 18: LIVE_TARGET_BIND_HOST seam reaches every non-hardened target ────
+echo "Test 18: rest-api/soap-service/concat-spa/graphql-server pass an explicit bind host (SEC-BE-015)"
+for fn in start_rest_api start_soap_service start_concat_spa start_graphql_server; do
+    case "$(declare -f "$fn")" in
+        *'BIND_HOST="${LIVE_TARGET_BIND_HOST:-127.0.0.1}"'*)
+            ok "${fn} passes an explicit BIND_HOST seam" ;;
+        *)
+            fail "${fn} passes an explicit BIND_HOST seam (source changed)" ;;
+    esac
+done
+
+# ── Test 19: forms-target's own bind default is loopback (TEST-019) ─────────
+echo "Test 19: forms-target defaults its bind host to loopback"
+case "$(declare -f start_forms_target)" in
+    *'BIND_HOST="${FORMS_TARGET_BIND_HOST:-127.0.0.1}"'*)
+        ok "start_forms_target defaults BIND_HOST to 127.0.0.1" ;;
+    *)
+        fail "start_forms_target defaults BIND_HOST to 127.0.0.1 (source changed)" ;;
+esac
+
+# ── Test 20: wait_for_http bounds its curl probe (TEST-017, SEC-BE-012) ─────
+echo "Test 20: wait_for_http bounds its curl probe with --max-time"
+case "$(declare -f wait_for_http)" in
+    *'curl -sf --max-time 2'*)
+        ok "wait_for_http's curl probe carries --max-time 2" ;;
+    *)
+        fail "wait_for_http's curl probe carries --max-time 2 (source changed)" ;;
+esac
+
+# ── Test 21: wait_for_grpc's timeout-wrapped /dev/tcp arm (TEST-020) ────────
+echo "Test 21: wait_for_grpc connects via the timeout-wrapped /dev/tcp arm when grpcurl/nc are absent"
+if { command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; } \
+   && command -v dirname >/dev/null 2>&1 && command -v sleep >/dev/null 2>&1; then
+    # A minimal PATH containing only the tools this arm (plus sourcing) needs —
+    # NOT grpcurl or nc — so the third arm is exercised regardless of what is
+    # actually installed on the host running this suite.
+    mini_bin="$(mktemp -d)"
+    t_bin="$(command -v timeout || command -v gtimeout)"
+    ln -s "$t_bin" "${mini_bin}/$(basename "$t_bin")"
+    ln -s "$(command -v dirname)" "${mini_bin}/dirname"
+    ln -s "$(command -v sleep)" "${mini_bin}/sleep"
+    ln -s "$(command -v bash)" "${mini_bin}/bash"
+
+    gport="$(free_port)"
+    python3 -m http.server "$gport" --bind 127.0.0.1 >/dev/null 2>&1 &
+    gsp=$!
+    SPAWNED_PIDS+=("$gsp")
+    disown "$gsp" 2>/dev/null || true
+    sleep 0.3
+
+    out="$(PATH="$mini_bin" bash -c '
+        command -v grpcurl >/dev/null 2>&1 && { echo "grpcurl still on PATH"; exit 99; }
+        command -v nc >/dev/null 2>&1 && { echo "nc still on PATH"; exit 98; }
+        # shellcheck source=/dev/null
+        source "'"${SCRIPT_UNDER_TEST}"'"
+        rc=0
+        wait_for_grpc 127.0.0.1 "'"$gport"'" 3 || rc=$?
+        echo "rc=$rc"
+    ' 2>&1)"
+    kill -9 "$gsp" 2>/dev/null || true
+    assert_contains "$out" "rc=0" "connects via the timeout-wrapped /dev/tcp arm with grpcurl/nc absent"
+
+    start=$SECONDS
+    out2="$(PATH="$mini_bin" bash -c '
+        # shellcheck source=/dev/null
+        source "'"${SCRIPT_UNDER_TEST}"'"
+        rc=0
+        wait_for_grpc 127.0.0.1 1 2 || rc=$?
+        echo "rc=$rc"
+    ' 2>&1)"
+    elapsed=$((SECONDS - start))
+    assert_contains "$out2" "rc=1" "returns non-zero against a closed port instead of hanging"
+    if [ "$elapsed" -le 4 ]; then
+        ok "returns within roughly the outer timeout (elapsed ${elapsed}s)"
+    else
+        fail "returns within roughly the outer timeout (elapsed ${elapsed}s, expected <=4)"
+    fi
+
+    rm -rf "$mini_bin"
+else
+    skip "timeout/gtimeout, dirname, and sleep required"
+fi
+
+# ── Test 22: write_config lands the config at 0644 regardless of umask ──────
+echo "Test 22: write_config lands .live-test-config at mode 644 under umask 0 (SEC-BE-017, TEST-021)"
+if command -v stat >/dev/null 2>&1; then
+    (
+        umask 0
+        write_config 1111 2222 3333 4444 5555 6666 "rest-api,soap-service" >/dev/null 2>&1
+    )
+    mode="$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null)"
+    assert_eq "$mode" "644" "config file lands at mode 644 even under umask 0"
+    contents="$(cat "$CONFIG_FILE" 2>/dev/null)"
+    assert_contains "$contents" "REST_API_PORT=1111" "config carries the written port value"
+    rm -f "$CONFIG_FILE"
+else
+    skip "stat required"
+fi
+
+# ── Test 23: teardown_on_failure EXIT trap tears down a failed partial setup ─
+# Exercises the exact call chain SEC-BE-015 added: EXIT trap -> teardown_on_
+# failure -> do_teardown -> stop_service -> pid_matches_service, with the trap
+# firing from a genuinely non-zero exit (so $? at trap-entry is 1, the specific
+# condition TEST-018 says pid_matches_service's bare-return bug depended on).
+echo "Test 23: teardown_on_failure tears down services started before a failed setup exits (TEST-022, TEST-018)"
+spawn_named rest-api; trap_pid=$REPLY
+record_pid rest-api "$trap_pid"
+(
+    SETUP_IN_PROGRESS=true
+    trap 'teardown_on_failure' EXIT
+    exit 1
+) >/dev/null 2>&1
+assert_dead "$trap_pid" "EXIT trap's do_teardown kills the service this run started"
+assert_no_file "${STATE_DIR}/.rest-api.pids" "EXIT trap's do_teardown clears the pid log"
+
+# ── Test 24: the same trap is a no-op once SETUP_IN_PROGRESS is cleared ─────
+# Covers the OTHER arm TEST-022 calls out: a successful setup clears
+# SETUP_IN_PROGRESS after write_config, so the trap must not tear down the
+# services it just started on a normal, successful exit.
+echo "Test 24: the teardown_on_failure trap is a no-op once SETUP_IN_PROGRESS is cleared"
+spawn_named soap-service; safe_pid=$REPLY
+record_pid soap-service "$safe_pid"
+(
+    SETUP_IN_PROGRESS=true
+    trap 'teardown_on_failure' EXIT
+    SETUP_IN_PROGRESS=false   # mirrors main() clearing it right after write_config
+    exit 0
+) >/dev/null 2>&1
+assert_alive "$safe_pid" "disarmed trap leaves a successfully-started service running"
+kill -9 "$safe_pid" 2>/dev/null || true
+clear_recorded_pids soap-service
+
 # ── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "──────────────────────────────────────────"

@@ -17,28 +17,42 @@ SETUP_SCRIPT="${SCRIPT_DIR}/setup-live-targets.sh"
 pass_count=0
 fail_count=0
 skip_count=0
+# Sum of the assertion counts each fired skip() call would otherwise have
+# contributed (see the credit argument below). Lets the completion sentinel
+# stay enforced even when a block legitimately skips, instead of going dark
+# the moment skip_count is nonzero.
+skip_credit=0
 
 # Environment-dependent blocks call this instead of a bare `echo SKIP`.
 #
-# Without a counter the suite could lose assertions silently: forcing
-# HAS_NONBROWSER_PREREQS false drops the run from EXPECTED_ASSERTIONS to four
-# fewer and still prints "N passed, 0 failed" and exits 0 — and the CI job that
-# runs this deliberately installs neither Go nor Node, so that is the arm CI
-# actually takes. A skip is a legitimate outcome; an INVISIBLE skip is not.
+# Takes a CREDIT: the number of assertions the skipped block would have made
+# on a fully-equipped host. Without it the completion sentinel below had to
+# disable itself whenever anything skipped, and every skip trigger in this
+# file is ambient toolchain availability (Go, Python3, timeout/gtimeout) — on
+# a host missing any of those, EXPECTED_ASSERTIONS stopped being checked at
+# all, silently, on the exact kind of host most likely to differ from the
+# author's. The credit lets the sentinel keep pass+fail+skip_credit pinned to
+# EXPECTED_ASSERTIONS regardless of which arm ran, so deleting a case still
+# fails the suite even on a degraded host. Credits were derived empirically —
+# forcing each skip arm on a fully-equipped host and reading off exactly how
+# many assertions vanished — not estimated from reading the block.
 skip() {
+    local credit=${2:-0}
     echo "SKIP: $1"
     skip_count=$((skip_count + 1))
+    skip_credit=$((skip_credit + credit))
 }
 
 # Completion sentinel. Pinned to the assertion count of a fully-equipped run
-# (nothing skipped). It is only enforced when skip_count is 0, because a
-# degraded environment legitimately runs fewer assertions — but in that case
-# the skips are counted and printed above, so the shortfall is attributable
-# rather than silent. Deleting a case on a full host changes this total and
+# (nothing skipped). Enforced unconditionally: pass_count + fail_count +
+# skip_credit must equal this total on EVERY host, degraded or not, because
+# skip_credit already accounts for whatever a skipped block would have added.
+# Deleting a case — on a full host OR a degraded one — changes this total and
 # fails the suite, which is the regression this guards.
 #
-# Update deliberately when adding or removing an assertion.
-EXPECTED_ASSERTIONS=71
+# Update deliberately when adding or removing an assertion, and update the
+# matching skip() credit if the change touches an environment-gated block.
+EXPECTED_ASSERTIONS=73
 
 assert_eq() {
     local desc=$1 expected=$2 actual=$3
@@ -417,8 +431,43 @@ for bad in "abc" "-1" "2s" "1.2.3" "0" "00" "0.0" "0." "000.000" ".0" ""; do
     assert_eq "case f3: an empty budget is treated as unset, no warning" \
         "" "$(CHROME_PROBE_TIMEOUT='' warn_of)"
 else
-    skip "case f2: no timeout/gtimeout on PATH — no probe budget to override"
+    # Credit 27: measured by forcing this arm false on a fully-equipped host
+    # and reading pass_count's drop (71 -> 44). Covers the f2 pass/kill pair,
+    # the 11-value f3 detects-anyway loop, the 2 named-warning assertions, the
+    # 6-value zero-spelling loop, the 5-value valid-budget loop, and the
+    # empty-budget assertion.
+    skip "case f2: no timeout/gtimeout on PATH — no probe budget to override" 27
 fi
+
+# ── Case p: _CHROME_BUDGET_WARNED dedups within ONE shell (TEST-002) ──
+# The warn-once guard added alongside _CHROME_BUDGET_WARNED has no coverage
+# anywhere: every existing budget-warning case above (f3's warn_of /
+# probe_working_browser) sources the script in a FRESH subshell per
+# invocation, so _CHROME_BUDGET_WARNED starts empty every time and the
+# dedup path — printing the warning once per RUN rather than once per
+# candidate probed — never executes. detect_chrome_binary's loop over
+# CHROME_CANDIDATES is the only production call site that invokes
+# chrome_runnable more than once in the SAME shell, so drive that loop
+# directly, in one `source`, with three present-but-broken candidates and a
+# single bad CHROME_PROBE_TIMEOUT for the whole loop. This case needs no
+# timeout/gtimeout gate: chrome_runnable validates the budget before it
+# checks for either, so the dedup path runs on every host.
+warn_count_over_candidates() {
+    local budget=$1 pattern=$2 errf="${FIXTURE_DIR}/p.err"
+    (
+        # shellcheck source=setup-live-targets.sh disable=SC1091
+        source "${SETUP_SCRIPT}"
+        # shellcheck disable=SC2034  # consumed by detect_chrome_binary from the sourced script
+        CHROME_CANDIDATES=("${SNAP_STUB}" "${GENERIC_BROKEN}" "${SNAP_STUB}")
+        set +e
+        CHROME_PROBE_TIMEOUT="${budget}" detect_chrome_binary >/dev/null 2>"${errf}"
+    )
+    grep -c "${pattern}" "${errf}"
+}
+assert_eq "case p: a malformed CHROME_PROBE_TIMEOUT warns exactly once across 3 probes in one shell" \
+    "1" "$(warn_count_over_candidates "abc" "is not a usable timeout")"
+assert_eq "case p: a zero CHROME_PROBE_TIMEOUT warns exactly once across 3 probes in one shell" \
+    "1" "$(warn_count_over_candidates "0" "is zero, which disables the timeout")"
 
 # ── Cases g-j: the browser gate is CONDITIONAL (LAB-5064) ───────
 #
@@ -659,7 +708,8 @@ if [ "${HAS_NONBROWSER_PREREQS}" = true ]; then
         pass_count=$((pass_count + 1))
     fi
 else
-    skip "case n: marker/epilogue assertions need go and python3 on PATH"
+    # Credit 2: the marker-present and epilogue-absent assertions below.
+    skip "case n: marker/epilogue assertions need go and python3 on PATH" 2
 fi
 
 # Case n (continued): isolate --skip-start AT THE CALL SITE against a
@@ -685,7 +735,8 @@ if [ "${HAS_NONBROWSER_PREREQS}" = true ]; then
         fail_count=$((fail_count + 1))
     fi
 else
-    skip "case n: --skip-start marker assertion needs go and python3 on PATH"
+    # Credit 1: the single marker-reached-build-phase assertion below.
+    skip "case n: --skip-start marker assertion needs go and python3 on PATH" 1
 fi
 
 # And the LAB-3893 half of the contract at the same call site: a browser-backed
@@ -752,21 +803,29 @@ if [ "${HAS_NONBROWSER_PREREQS}" = true ]; then
         pass_count=$((pass_count + 1))
     fi
 else
-    skip "case o: epilogue-absence assertion needs go and python3 on PATH"
+    # Credit 1: the single epilogue-absence assertion below.
+    skip "case o: epilogue-absence assertion needs go and python3 on PATH" 1
 fi
 
 # ── Summary ─────────────────────────────────────────────────────
 echo ""
 echo "preflight-selftest: ${pass_count} passed, ${fail_count} failed, ${skip_count} skipped"
 
-# Assertion accounting (TEST-015). On a fully-equipped host nothing may vanish:
-# the total is pinned, so deleting a case fails here even though every surviving
-# case still passes. When blocks were skipped the total legitimately differs,
-# and the skip lines above say which blocks and why.
+# Assertion accounting (TEST-015 / TEST-013). Nothing may vanish on ANY host,
+# degraded or not: pass + fail + skip_credit is pinned to EXPECTED_ASSERTIONS
+# unconditionally, so deleting a case fails here even on a host where some
+# blocks legitimately skip for want of Go, Python3, or timeout/gtimeout — the
+# exact ambient-toolchain gap this suite's own skip triggers depend on, and
+# which this repo's un-gated preflight-selftest CI job cannot be assumed to
+# lack (GitHub's ubuntu-24.04 runner image ships Go and Python3 preinstalled
+# regardless of whether a setup-go/setup-node step ran, so this job most
+# likely takes the zero-skip arm in practice — but the pin no longer depends
+# on that guess either way). When blocks were skipped the skip lines above say
+# which and why; the NOTE below is informational, not a gate.
 total=$((pass_count + fail_count))
-if [ "${skip_count}" -eq 0 ] && [ "${total}" -ne "${EXPECTED_ASSERTIONS}" ]; then
-    echo "FAIL: assertion accounting drift — expected ${EXPECTED_ASSERTIONS} assertions with nothing skipped, saw ${total}."
-    echo "      A case was added or removed without updating EXPECTED_ASSERTIONS."
+if [ "$((total + skip_credit))" -ne "${EXPECTED_ASSERTIONS}" ]; then
+    echo "FAIL: assertion accounting drift — expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip_credit), saw $((total + skip_credit))."
+    echo "      A case was added or removed without updating EXPECTED_ASSERTIONS, or a skip() credit is stale."
     exit 1
 fi
 if [ "${skip_count}" -gt 0 ]; then

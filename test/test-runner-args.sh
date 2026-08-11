@@ -730,6 +730,59 @@ else
 fi
 
 echo ""
+echo "=== print_summary: all-skipped-is-not-a-pass gate (TEST-016 / AC3) ==="
+# The block above declares EMPTY TEST_STATUS/TEST_ENDPOINTS/TEST_EXPECTED/
+# TEST_DURATION arrays precisely so the per-target loop never runs — which
+# also makes total_pass=0 AND total_skip=0, so the AC3 gate's own
+# `total_skip -gt 0` condition is false and it is never entered. Drive
+# print_summary with a POPULATED array so all three arms of the gate are
+# actually exercised: an all-skipped run must fail, the documented escape
+# hatch must turn that into a pass, and a legitimate partial skip (something
+# else in the run actually passed) must not be caught by the gate at all.
+
+# Arm 1: every selected target skipped, nothing else ran — must fail.
+all_skip_rc=0
+all_skip_out=$(
+    declare -A TEST_STATUS=([rest-api]=SKIP) TEST_ENDPOINTS=([rest-api]=-) TEST_EXPECTED=([rest-api]=-) TEST_DURATION=([rest-api]=0)
+    RESULTS_DIR="$TMPDIR_T/results"
+    print_summary
+) || all_skip_rc=$?
+if [[ "$all_skip_rc" -ne 0 ]] && printf '%s' "$all_skip_out" | grep -q "nothing executed"; then
+    pass "print_summary: an all-skipped run fails ('nothing executed') — AC3 gate fires"
+else
+    fail "print_summary: an all-skipped run did not fail as expected (rc=$all_skip_rc): $all_skip_out"
+fi
+
+# Arm 2: the documented escape hatch converts the same all-skipped input to a
+# pass, and is exercised at all (it has no test anywhere else in this repo).
+allow_no_exec_rc=0
+allow_no_exec_out=$(
+    declare -A TEST_STATUS=([rest-api]=SKIP) TEST_ENDPOINTS=([rest-api]=-) TEST_EXPECTED=([rest-api]=-) TEST_DURATION=([rest-api]=0)
+    RESULTS_DIR="$TMPDIR_T/results"
+    LIVE_TESTS_ALLOW_NO_EXECUTION=1
+    print_summary
+) || allow_no_exec_rc=$?
+if [[ "$allow_no_exec_rc" -eq 0 ]]; then
+    pass "print_summary: LIVE_TESTS_ALLOW_NO_EXECUTION=1 turns an all-skipped run into success"
+else
+    fail "print_summary: LIVE_TESTS_ALLOW_NO_EXECUTION=1 did not accept an all-skipped run (rc=$allow_no_exec_rc): $allow_no_exec_out"
+fi
+
+# Arm 3: a legitimate PARTIAL skip — something else in the same run actually
+# passed — must NOT be caught by the all-skipped gate.
+partial_skip_rc=0
+partial_skip_out=$(
+    declare -A TEST_STATUS=([a]=PASS [b]=SKIP) TEST_ENDPOINTS=([a]=1 [b]=-) TEST_EXPECTED=([a]=1 [b]=-) TEST_DURATION=([a]=0 [b]=0)
+    RESULTS_DIR="$TMPDIR_T/results"
+    print_summary
+) || partial_skip_rc=$?
+if [[ "$partial_skip_rc" -eq 0 ]]; then
+    pass "print_summary: a partial skip (one PASS, one SKIP) still succeeds"
+else
+    fail "print_summary: a legitimate partial skip was wrongly failed by the all-skipped gate (rc=$partial_skip_rc): $partial_skip_out"
+fi
+
+echo ""
 echo "=== Setup-complete guidance (setup-live-targets.sh) ==="
 
 # Drive the REAL run_tests_guidance selector (sourced above, not a copy) for
@@ -813,6 +866,126 @@ if printf '%s\n' "$allowlist_out" | grep -qx "RESULT_REST_API_PORT=8990"; then
     pass "load_config: allowed key REST_API_PORT applied"
 else
     fail "load_config: allowed key REST_API_PORT not applied (expected 8990): $allowlist_out"
+fi
+
+echo ""
+echo "=== load_config value validation (TEST-015 / SEC-BE-011 / SEC-BE-013) ==="
+# The block above only exercises the KEY half of load_config's allowlist. The
+# format regex still admits '@'/':' in the VALUE, so REST_API_PORT=@evil.com
+# passes both the format check and the key allowlist and, unvalidated, would
+# make _probe_target_host build a URL curl parses as userinfo + an
+# attacker-chosen host. Drive the real load_config against a config that
+# exercises every value-validation arm: an out-of-charset port, an
+# out-of-range port on both ends, an empty port (must be skipped SILENTLY —
+# SEC-BE-014 — since setup-live-targets.sh's write_config always emits every
+# allowlisted key, so a partial setup writes empty values for targets it
+# never configured), and a TARGETS_SETUP value outside its own charset.
+invalid_values_cfg=$(new_tmp)
+printf '%s\n' \
+    "REST_API_PORT=@evil.com" \
+    "SOAP_SERVICE_PORT=99999" \
+    "GRAPHQL_SERVER_PORT=0" \
+    "GRPC_SERVER_PORT=" \
+    "TARGETS_SETUP=rest-api:evil" \
+    > "$invalid_values_cfg"
+invalid_values_out=$(
+    source "$SCRIPT_DIR/common.sh"
+    source <(sed -n '/^load_config()/,/^}/p' "$RUNNER")
+    declare -F load_config >/dev/null || echo "SENTINEL_LOAD_CONFIG_MISSING"
+    REST_API_PORT="__sentinel_rest__"
+    SOAP_SERVICE_PORT="__sentinel_soap__"
+    GRAPHQL_SERVER_PORT="__sentinel_graphql__"
+    GRPC_SERVER_PORT="__sentinel_grpc__"
+    TARGETS_SETUP="__sentinel_targets__"
+    CONFIG_FILE="$invalid_values_cfg"
+    load_config 2>&1 || true
+    echo "RESULT_REST_API_PORT=$REST_API_PORT"
+    echo "RESULT_SOAP_SERVICE_PORT=$SOAP_SERVICE_PORT"
+    echo "RESULT_GRAPHQL_SERVER_PORT=$GRAPHQL_SERVER_PORT"
+    echo "RESULT_GRPC_SERVER_PORT=$GRPC_SERVER_PORT"
+    echo "RESULT_TARGETS_SETUP=$TARGETS_SETUP"
+) || true
+
+if printf '%s\n' "$invalid_values_out" | grep -q "SENTINEL_LOAD_CONFIG_MISSING"; then
+    fail "load_config was not sourced (extraction broken/empty) — value-validation assertions below are vacuous"
+else
+    pass "load_config sourced from run-live-tests.sh (value-validation block)"
+fi
+
+if printf '%s\n' "$invalid_values_out" | grep -qF "Skipping REST_API_PORT: not a valid port (1-65535): @evil.com"; then
+    pass "load_config: REST_API_PORT=@evil.com (userinfo-style value) rejected with warning"
+else
+    fail "load_config: expected REST_API_PORT=@evil.com to be rejected, got: $invalid_values_out"
+fi
+if printf '%s\n' "$invalid_values_out" | grep -qx "RESULT_REST_API_PORT=__sentinel_rest__"; then
+    pass "load_config: rejected REST_API_PORT value not applied (sentinel preserved)"
+else
+    fail "load_config: REST_API_PORT was rebound despite an invalid value: $invalid_values_out"
+fi
+
+if printf '%s\n' "$invalid_values_out" | grep -qF "Skipping SOAP_SERVICE_PORT: not a valid port (1-65535): 99999"; then
+    pass "load_config: SOAP_SERVICE_PORT=99999 (out of range, high) rejected with warning"
+else
+    fail "load_config: expected SOAP_SERVICE_PORT=99999 to be rejected, got: $invalid_values_out"
+fi
+if printf '%s\n' "$invalid_values_out" | grep -qx "RESULT_SOAP_SERVICE_PORT=__sentinel_soap__"; then
+    pass "load_config: rejected SOAP_SERVICE_PORT value not applied (sentinel preserved)"
+else
+    fail "load_config: SOAP_SERVICE_PORT was rebound despite an out-of-range value: $invalid_values_out"
+fi
+
+if printf '%s\n' "$invalid_values_out" | grep -qF "Skipping GRAPHQL_SERVER_PORT: not a valid port (1-65535): 0"; then
+    pass "load_config: GRAPHQL_SERVER_PORT=0 (out of range, low) rejected with warning"
+else
+    fail "load_config: expected GRAPHQL_SERVER_PORT=0 to be rejected, got: $invalid_values_out"
+fi
+if printf '%s\n' "$invalid_values_out" | grep -qx "RESULT_GRAPHQL_SERVER_PORT=__sentinel_graphql__"; then
+    pass "load_config: rejected GRAPHQL_SERVER_PORT value not applied (sentinel preserved)"
+else
+    fail "load_config: GRAPHQL_SERVER_PORT was rebound despite an out-of-range value: $invalid_values_out"
+fi
+
+# SEC-BE-014: an EMPTY port value is "target not set up", not tampering, so it
+# must be skipped WITHOUT a warning — unlike every other reject case above.
+if printf '%s\n' "$invalid_values_out" | grep -q "GRPC_SERVER_PORT"'.*not a valid port'; then
+    fail "load_config: empty GRPC_SERVER_PORT logged a 'not a valid port' warning — SEC-BE-014 desensitization regressed"
+else
+    pass "load_config: empty GRPC_SERVER_PORT is skipped without a warning (SEC-BE-014)"
+fi
+if printf '%s\n' "$invalid_values_out" | grep -qx "RESULT_GRPC_SERVER_PORT=__sentinel_grpc__"; then
+    pass "load_config: empty GRPC_SERVER_PORT value not applied (sentinel preserved)"
+else
+    fail "load_config: GRPC_SERVER_PORT was rebound by an empty value: $invalid_values_out"
+fi
+
+if printf '%s\n' "$invalid_values_out" | grep -qF "Skipping TARGETS_SETUP: unexpected characters in value: rest-api:evil"; then
+    pass "load_config: TARGETS_SETUP=rest-api:evil (outside its charset) rejected with warning"
+else
+    fail "load_config: expected TARGETS_SETUP=rest-api:evil to be rejected, got: $invalid_values_out"
+fi
+if printf '%s\n' "$invalid_values_out" | grep -qx "RESULT_TARGETS_SETUP=__sentinel_targets__"; then
+    pass "load_config: rejected TARGETS_SETUP value not applied (sentinel preserved)"
+else
+    fail "load_config: TARGETS_SETUP was rebound despite an invalid value: $invalid_values_out"
+fi
+
+# The accept direction for TARGETS_SETUP: a value inside its charset (letters,
+# digits, comma, hyphen) must still be applied — the reject-only block above
+# would also pass if the case arm rejected every value unconditionally.
+valid_targets_cfg=$(new_tmp)
+printf '%s\n' "TARGETS_SETUP=rest-api,soap-service" > "$valid_targets_cfg"
+valid_targets_out=$(
+    source "$SCRIPT_DIR/common.sh"
+    source <(sed -n '/^load_config()/,/^}/p' "$RUNNER")
+    TARGETS_SETUP="__sentinel_targets__"
+    CONFIG_FILE="$valid_targets_cfg"
+    load_config 2>&1 || true
+    echo "RESULT_TARGETS_SETUP=$TARGETS_SETUP"
+) || true
+if printf '%s\n' "$valid_targets_out" | grep -qx "RESULT_TARGETS_SETUP=rest-api,soap-service"; then
+    pass "load_config: TARGETS_SETUP=rest-api,soap-service (valid charset) applied"
+else
+    fail "load_config: valid TARGETS_SETUP value not applied (expected rest-api,soap-service): $valid_targets_out"
 fi
 
 echo ""
@@ -967,10 +1140,15 @@ if [[ -f "$WORKFLOW" ]]; then
     fi
 
     # Jobs whose if: gate is deliberate and already pinned elsewhere in this
-    # file: install-chrome-e2e's exact trigger arms (TEST-001, above), and
-    # test's dependency on check-label's skip-live-tests gate. A job reaching
-    # this allowlist is not itself a finding — only an if: on a job NOT on it.
-    ALLOWED_GATED_JOBS=(install-chrome-e2e test)
+    # file: install-chrome-e2e's exact trigger arms (TEST-001, above). `test`
+    # is deliberately NOT on this list (TEST-023): it is the label-gated job
+    # (`skip-live-tests` switches it off via check-label), so a guard suite
+    # hosted ONLY by `test` would satisfy "wired into some CI job" while
+    # staying silently skippable on any PR carrying that label — precisely
+    # the defect this PR fixes by moving test-runner-args.sh out of `test`
+    # and into the un-gated preflight-selftest job. A job reaching this
+    # allowlist is not itself a finding — only an if: on a job NOT on it.
+    ALLOWED_GATED_JOBS=(install-chrome-e2e)
 
     declare -a hosting_jobs=()
     for suite in "${candidate_suites[@]}"; do
@@ -978,7 +1156,13 @@ if [[ -f "$WORKFLOW" ]]; then
         hosting_job=""
         for job_name in "${all_job_names[@]}"; do
             job_runlines=$(extract_job_block "$job_name" | grep -vE '^[[:space:]]*#')
-            if printf '%s\n' "$job_runlines" | grep -qE "run:[[:space:]]*(\./|bash )?test/${suite_re}([[:space:]]|\$)"; then
+            # TEST-024: end-anchored, matching the TEST-017 tightening applied
+            # to the preflight-selftest block's own per-suite regex (below,
+            # and at the hardcoded block above) — the loose `([[:space:]]|$)`
+            # alternation also matches the space before a trailing
+            # '|| true'/'|| exit 0'/'|| :', so a neutered invocation would
+            # still count as "hosted" here.
+            if printf '%s\n' "$job_runlines" | grep -qE "run:[[:space:]]*(\./|bash )?test/${suite_re}[[:space:]]*\$"; then
                 hosting_job="$job_name"
                 break
             fi
@@ -992,7 +1176,7 @@ if [[ -f "$WORKFLOW" ]]; then
     done
 
     # A suite's coverage is only as real as the job hosting it being able to
-    # run at all. Apply the same two neutering checks the preflight-selftest
+    # run at all. Apply the same THREE neutering checks the preflight-selftest
     # and install-chrome-e2e blocks above already apply to themselves — but to
     # whichever job the loop above actually found — once per distinct hosting
     # job rather than once per suite, since several suites share a host.
@@ -1005,6 +1189,17 @@ if [[ -f "$WORKFLOW" ]]; then
             fail "job '$job_name' (hosts suite coverage asserted above) sets continue-on-error: true — a failing suite would not fail CI"
         else
             pass "job '$job_name' (hosts suite coverage asserted above) has no continue-on-error: true"
+        fi
+
+        # TEST-024: the two checks above only re-implemented two of the three
+        # neutering shapes the hardcoded preflight-selftest/install-chrome-e2e
+        # blocks apply to themselves — this generic loop was missing the
+        # cheapest one of all, a trailing '|| true'/'|| exit 0'/'|| :' on a
+        # run line, which trips neither continue-on-error nor an if: gate.
+        if printf '%s\n' "$job_runlines" | grep -qE '\|\|[[:space:]]*(true|exit 0|:)([[:space:]]|$)'; then
+            fail "job '$job_name' (hosts suite coverage asserted above) neuters a step with a trailing '|| true'/'|| exit 0'/'|| :' — a failing suite would not fail CI"
+        else
+            pass "job '$job_name' (hosts suite coverage asserted above) has no trailing '|| true'/'|| exit 0'/'|| :' step neutering"
         fi
 
         if printf '%s\n' "$job_runlines" | grep -qE '^[[:space:]]*if:'; then
@@ -1086,6 +1281,22 @@ if [[ -f "$WORKFLOW" ]]; then
         else
             fail "install-chrome-e2e no longer asserts the chrome-version record — AC4 version-record coverage dropped silently"
         fi
+        # TEST-001: `[ -s ]` alone passes on a bare newline or a record left by
+        # an earlier image layer, so the real install was verified LESS
+        # specifically than the fixture-level case v, which already asserts both
+        # the version string and 0644. Require the two content checks that close
+        # that gap, so deleting either one fails here rather than silently
+        # reverting the e2e assertion to a non-emptiness test.
+        if printf '%s\n' "$e2e_runlines" | grep -qE 'grep -qF "\$major" "\$record"'; then
+            pass "install-chrome-e2e asserts the record names the installed major version"
+        else
+            fail "install-chrome-e2e no longer asserts the record CONTENT — a bare newline would satisfy the -s test alone (TEST-001)"
+        fi
+        if printf '%s\n' "$e2e_runlines" | grep -qE 'stat -c .%a. "\$record"'; then
+            pass "install-chrome-e2e asserts the record's achieved mode"
+        else
+            fail "install-chrome-e2e no longer asserts the version record's mode — a literal 0644 in the installer is not evidence of the mode on disk (SEC-BE-003/TEST-001)"
+        fi
         # TEST-019: same tightening for the cron.daily check — the bare path
         # also matches the `for p in ...` list on its own, without proving the
         # loop body that actually inspects each $p and sets fail=1 is intact.
@@ -1099,6 +1310,37 @@ if [[ -f "$WORKFLOW" ]]; then
             pass "install-chrome-e2e still asserts the idempotent re-run marker"
         else
             fail "install-chrome-e2e no longer asserts the 'already present' idempotent re-run marker"
+        fi
+        # QUAL-001: the workflow hardcodes the phone-home path list that
+        # install-chrome.sh already defines once (PHONE_HOME_PATHS, plus
+        # TMP_LIST/TMP_KEYRING/TMP_PREF). The duplication is deliberate — an
+        # assertion that sourced the script under test would inherit the
+        # script's own blind spot — but a deliberate duplicate still drifts, and
+        # this one HAS already drifted once in this branch's history (it lost the
+        # deb822 source and the package's own keyring). Nothing enforced that
+        # they stay in step, so a future rename in the installer would leave the
+        # AC4 assertion quietly checking a path the installer no longer writes.
+        # Compare the two sets here: keep the duplication, remove the silence.
+        installer_paths=$(
+            sed -n 's/^[[:space:]]*"\${TEST_ROOT}\(\/[^"]*\)".*/\1/p' "$SCRIPT_DIR/install-chrome.sh" \
+            | sort -u
+        )
+        # The installer also defines the three temp artifacts as scalars.
+        installer_paths=$(
+            printf '%s\n' "$installer_paths"
+            sed -n 's/^TMP_\(LIST\|KEYRING\|PREF\)="\${TEST_ROOT}\(\/[^"]*\)".*/\2/p' "$SCRIPT_DIR/install-chrome.sh"
+        )
+        installer_paths=$(printf '%s\n' "$installer_paths" | grep -E '^/(etc|usr)/' | sort -u)
+        workflow_paths=$(
+            printf '%s\n' "$e2e_runlines" \
+            | grep -oE '/(etc/apt/[a-z0-9./-]+|etc/cron\.daily/[a-z0-9.-]+|usr/share/keyrings/[a-z0-9.-]+)' \
+            | sort -u
+        )
+        missing_from_workflow=$(comm -23 <(printf '%s\n' "$installer_paths") <(printf '%s\n' "$workflow_paths"))
+        if [[ -z "$missing_from_workflow" ]]; then
+            pass "install-chrome-e2e's phone-home list covers every path install-chrome.sh writes ($(printf '%s\n' "$installer_paths" | grep -c .) paths)"
+        else
+            fail "install-chrome-e2e's phone-home list has DRIFTED from install-chrome.sh — the installer writes paths the AC4 assertion never checks: $(printf '%s' "$missing_from_workflow" | tr '\n' ' ')"
         fi
         if printf '%s\n' "$e2e_runlines" | grep -qE '^[[:space:]]*continue-on-error:[[:space:]]*true'; then
             fail "install-chrome-e2e sets continue-on-error: true — a failing verification step would not fail CI"

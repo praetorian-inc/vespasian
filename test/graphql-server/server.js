@@ -493,7 +493,14 @@ async function start() {
 
   const httpServer = http.createServer(app);
   const port = parseInt(process.env.PORT, 10) || 4000;
-  httpServer.listen(port, () => {
+  // SEC-BE-015: bind loopback by default. This target is unauthenticated by
+  // design, and listen(port) with no host binds every interface, exposing it to
+  // the whole local network for the lifetime of a test run.
+  // setup-live-targets.sh passes BIND_HOST explicitly and opts into a wider
+  // bind only when the devcontainer flow needs it (a crawler in a container
+  // reaching the host via TEST_HOST). Mirrors test/forms-target/main.go.
+  const host = process.env.BIND_HOST || "127.0.0.1";
+  httpServer.listen(port, host, () => {
     console.log("Server ready at http://localhost:" + port + "/");
     console.log("GraphQL endpoint: http://localhost:" + port + "/graphql");
     console.log("\nPages:");

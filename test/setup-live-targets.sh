@@ -466,11 +466,22 @@ pid_matches_service() {
     return 1
 }
 
+# LIVE_TARGET_BIND_HOST is the same seam FORMS_TARGET_BIND_HOST already gives
+# forms-target, extended to the other targets whose own source has no bind
+# control (SEC-BE-015): rest-api, soap-service, concat-spa, and graphql-server
+# default to the wildcard address in their own main.go/server.js (unlike
+# forms-target and grpc-server, which already default to loopback). Passing
+# it here is a NO-OP for those four until each target's own source is changed
+# to read it — this script cannot make a target bind loopback that never reads
+# a host env var. It is set now so the shell side no longer needs a second
+# change once each target's one-line fix (mirroring forms-target/main.go, see
+# `host := os.Getenv("BIND_HOST")`) lands. Widen explicitly with:
+#   LIVE_TARGET_BIND_HOST=0.0.0.0 ./test/setup-live-targets.sh
 start_rest_api() {
     local port=$1
     log_info "Starting rest-api on port ${port}..."
     cd "${SCRIPT_DIR}/rest-api"
-    PORT="$port" ./rest-api &
+    PORT="$port" BIND_HOST="${LIVE_TARGET_BIND_HOST:-127.0.0.1}" ./rest-api &
     local pid=$!
     record_pid rest-api "$pid"
 
@@ -487,7 +498,9 @@ start_concat_spa() {
     local port=$1
     log_info "Starting concat-spa on port ${port}..."
     cd "${SCRIPT_DIR}/concat-spa"
-    PORT="$port" ./concat-spa &
+    # See LIVE_TARGET_BIND_HOST comment above start_rest_api (SEC-BE-015):
+    # currently a no-op until concat-spa/main.go reads BIND_HOST.
+    PORT="$port" BIND_HOST="${LIVE_TARGET_BIND_HOST:-127.0.0.1}" ./concat-spa &
     local pid=$!
     record_pid concat-spa "$pid"
 
@@ -527,7 +540,9 @@ start_soap_service() {
     local port=$1
     log_info "Starting soap-service on port ${port}..."
     cd "${SCRIPT_DIR}/soap-service"
-    PORT="$port" WSDL_PATH="${SCRIPT_DIR}/soap-service/service.wsdl" ./soap-service &
+    # See LIVE_TARGET_BIND_HOST comment above start_rest_api (SEC-BE-015):
+    # currently a no-op until soap-service/main.go reads BIND_HOST.
+    PORT="$port" WSDL_PATH="${SCRIPT_DIR}/soap-service/service.wsdl" BIND_HOST="${LIVE_TARGET_BIND_HOST:-127.0.0.1}" ./soap-service &
     local pid=$!
     record_pid soap-service "$pid"
 
@@ -544,7 +559,10 @@ start_graphql_server() {
     local port=$1
     log_info "Starting graphql-server on port ${port}..."
     cd "${SCRIPT_DIR}/graphql-server"
-    PORT="$port" node server.js > "${STATE_DIR}/.graphql-server.log" 2>&1 &
+    # See LIVE_TARGET_BIND_HOST comment above start_rest_api (SEC-BE-015):
+    # currently a no-op until graphql-server/server.js passes a host to
+    # httpServer.listen(port, host, ...).
+    PORT="$port" BIND_HOST="${LIVE_TARGET_BIND_HOST:-127.0.0.1}" node server.js > "${STATE_DIR}/.graphql-server.log" 2>&1 &
     local pid=$!
     record_pid graphql-server "$pid"
 
@@ -583,7 +601,13 @@ wait_for_grpc() {
                 return 0
             fi
         elif [ -n "$t" ]; then
-            if "$t" 2 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
+            # host/port are passed as argv ($1/$2 inside the -c script), not
+            # spliced into the program text: this is the one listener-spawning
+            # script in the repo, and interpolating them into the string would
+            # make the two values the only thing separating this from arbitrary
+            # command execution (SEC-BE-016). `_` fills $0 so $1/$2 land where
+            # expected.
+            if "$t" 2 bash -c 'echo >/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null; then
                 return 0
             fi
         else

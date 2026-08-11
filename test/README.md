@@ -310,6 +310,21 @@ The config file is loaded only when a selected target actually talks to a live s
 
 Where per-target result files are written; defaults to `test/.results/`. Override it to keep a run's output out of the repo — `test/test-runner-args.sh` sets it to a temp dir for the one block that really executes the runner, so the guard suite leaves nothing behind.
 
+### `LIVE_TESTS_ALLOW_NO_EXECUTION` (optional — disables a merge gate)
+
+Set to any non-empty value to make `run-live-tests.sh` treat a run in which **every** selected target
+skipped as a success instead of a failure.
+
+Leave it unset. The check it disables is what makes this ticket's AC3 — "rod-backed targets, including
+`no-download`, execute rather than SKIP" — enforceable at all: without it a `--group live` run of three
+SKIPs and zero passes exits 0, and CI stays green while proving nothing. Setting this variable in CI
+therefore retires AC3's enforcement silently, which is the opposite of what a green build would imply.
+
+The legitimate use is interactive and local: a developer deliberately running the live group on a
+browserless box who wants the skips reported without a non-zero exit. Prefer running
+`./test/install-chrome.sh` instead, so the targets actually execute. `--group offline` needs no browser
+and is unaffected by this variable either way.
+
 ### `VESPASIAN` (optional)
 
 Path to the `vespasian` binary under test; defaults to `bin/vespasian`. Override it to test a binary built elsewhere. Note this is **not** settable from `CONFIG_FILE`: `VESPASIAN` is deliberately absent from `load_config`'s allowlist, so a config file cannot redirect which binary the suite executes.

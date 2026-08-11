@@ -465,13 +465,38 @@ cleanup_apt_wiring() {
 # file alone raises that source's priority but does not prove apt actually
 # used it. `apt-cache policy` is read-only, so this needs no $SUDO.
 verify_apt_origin() {
-    local origin host
-    # `|| origin=""` guards the assignment itself: under `set -euo pipefail`, a
-    # failing apt-cache (a held dpkg lock, a corrupted cache) propagates through
-    # the pipe even though awk itself exits 0, which would otherwise abort the
-    # script here with no diagnostic instead of reaching the log_fail below.
-    origin=$(apt-cache policy google-chrome-stable 2>/dev/null \
-        | awk '/^ \*\*\*/{getline; print $2; exit}') || origin=""
+    local policy candidate origin host
+    # `|| policy=""` guards the assignment itself: under `set -euo pipefail`, a
+    # failing apt-cache (a held dpkg lock, a corrupted cache) would otherwise
+    # abort the script here with no diagnostic instead of reaching the
+    # log_fail below.
+    policy=$(apt-cache policy google-chrome-stable 2>/dev/null) || policy=""
+
+    # Read the CANDIDATE's version, not the `***` marker (SEC-BE-002). `***`
+    # flags ONLY the installed version, and a package that is not yet
+    # installed has no `***` line in its version table at all — anchoring
+    # there made this check refuse on every host BEFORE the package was
+    # installed, which is exactly when the pre-install call site (main(),
+    # before `apt-get install`) needs an answer. `Candidate:` is populated
+    # whenever apt can resolve the package at all, installed or not, and
+    # names the version dpkg is about to unpack (or already has).
+    candidate=$(printf '%s\n' "$policy" | awk -F': ' '/^  Candidate:/ { print $2; exit }')
+    if [ -z "$candidate" ] || [ "$candidate" = "(none)" ]; then
+        log_fail "google-chrome-stable was satisfied from an unexpected origin: unknown (expected dl.google.com)" >&2
+        return 1
+    fi
+
+    # Find the version-table entry for exactly that candidate version —
+    # matched as a whole field, not a substring, so "1.0" cannot match
+    # "1.0.1" — and read the first (highest-priority) source line beneath it,
+    # which is the one apt actually uses. The entry is prefixed with `***`
+    # only when it is also the installed version; matching $1 either with or
+    # without that prefix is what makes this work whether or not the package
+    # is installed yet.
+    origin=$(printf '%s\n' "$policy" | awk -v ver="$candidate" '
+        want { print $2; exit }
+        ($1 == "***" && $2 == ver) || $1 == ver { want = 1 }
+    ')
     # Anchor on the URL's host component, not a substring of the whole URL.
     # `grep -qF 'dl.google.com'` also matched a lookalike host such as
     # "dl.google.com.attacker.example" or "mirror.example/dl.google.com/...",
@@ -574,10 +599,24 @@ remove_phone_home() {
 # rerooted by VESPASIAN_TEST_ROOT, and REMOTE_CONTAINERS / container are read
 # from the environment.
 in_container() {
-    [ -f "${TEST_ROOT}/.dockerenv" ] ||
-    [ -f "${TEST_ROOT}/run/.containerenv" ] ||
-    [ -n "${REMOTE_CONTAINERS:-}" ] ||
-    [ -n "${container:-}" ]
+    [ -f "${TEST_ROOT}/.dockerenv" ] && return 0
+    [ -f "${TEST_ROOT}/run/.containerenv" ] && return 0
+    [ -n "${REMOTE_CONTAINERS:-}" ] && return 0
+    # $container is validated against known runtime names (SEC-BE-004), not
+    # accepted as any non-empty value: it is a bare, lowercase,
+    # un-namespaced systemd convention -- far more collidable than the two
+    # marker paths above, and unlike VESPASIAN_TEST_ROOT it is read straight
+    # from the ambient environment with no validation at all. An unrelated
+    # tool exporting a same-named variable (a Makefile, a CI shim) would
+    # otherwise win the destructive branch (remove_phone_home, the apt-cache
+    # wipe) on a developer's own machine.
+    case "${container:-}" in
+        docker | podman | lxc | lxc-libvirt | systemd-nspawn | rkt | oci | \
+        buildah | kaniko | containerd | crio | pouch | proot)
+            return 0
+            ;;
+    esac
+    return 1
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -603,6 +642,15 @@ INSTALL_ATTEMPTED=0
 # successful exit and silently undo main()'s choice to leave a developer's
 # machine alone.
 INSTALL_SUCCEEDED=0
+
+# Set to 1 only once flock has actually granted THIS run exclusive ownership
+# of the shared apt-wiring lifecycle (SEC-BE-008) — see the lock acquisition
+# in main() for where. A run that never held the lock (the 300s timeout
+# branch, or the flock-absent degrade) cannot tell its OWN temporary wiring
+# apart from a CONCURRENT run's, so cleanup_all must not blindly tear either
+# down in that case: doing so on the timeout path was the exact race the lock
+# exists to prevent, reopened on the lock's own failure path.
+LOCK_HELD=0
 
 cleanup_all() {
     # Failure-tolerant end to end, via `|| true` on every step, and ordered so
@@ -643,14 +691,39 @@ cleanup_all() {
     # that, this trap would fire on the browser-already-present early exit and
     # delete a pre-existing Chrome's update channel on a developer's machine —
     # undoing the in_container check on that path by the back door.
-    if [ "$INSTALL_ATTEMPTED" -eq 1 ] && [ "$INSTALL_SUCCEEDED" -ne 1 ]; then
-        if in_container; then
-            remove_phone_home || true
-        else
-            log_warn "Failed install left the google-chrome apt source and updater in place (not a container — see SEC-BE-006)."
+    #
+    # Guarded on LOCK_HELD too (SEC-BE-008): TMP_LIST/TMP_KEYRING/TMP_PREF and
+    # the phone-home paths are FIXED filenames shared by every run, and this
+    # trap fires on the lock-timeout `exit 1` too — at which point THIS run
+    # never held the lock and cannot tell its own wiring apart from a
+    # concurrent run's. Tearing either down unconditionally there strips the
+    # OTHER run's live apt source, pinned keyring and origin pin between its
+    # `apt-get update` and `apt-get install`, which is the exact race the lock
+    # exists to prevent, reopened on the lock's own failure path. Without
+    # flock at all (LOCK_HELD stays 0 for the whole run), there is no way to
+    # tell either, so this trap conservatively does nothing there rather than
+    # risk deleting a peer's wiring — the missing-lock exposure itself is
+    # tracked separately (SEC-BE-007).
+    if [ "$LOCK_HELD" -eq 1 ]; then
+        if [ "$INSTALL_ATTEMPTED" -eq 1 ] && [ "$INSTALL_SUCCEEDED" -ne 1 ]; then
+            if in_container; then
+                # log_warn, not a bare `|| true` (SEC-BE-005): the tolerance
+                # itself must stay (an expired sudo credential cache, a
+                # read-only mount, or an immutable attribute must not abort
+                # the rest of this handler under errexit), but a removal that
+                # fails here leaves a permanently trusted Google apt source
+                # and a root-run daily cron pinger on the host with nothing
+                # said about it — the same state verify_install treats as
+                # fatal on the success path. log_warn always itself succeeds
+                # (a printf), so the tolerance is unchanged; only the silence
+                # is fixed.
+                remove_phone_home || log_warn "Could not remove all google-chrome phone-home artifacts — a Google apt source, keyring, or update pinger may remain. Remove ${PHONE_HOME_PATHS[*]} by hand."
+            else
+                log_warn "Failed install left the google-chrome apt source and updater in place (not a container — see SEC-BE-006)."
+            fi
         fi
+        cleanup_apt_wiring || log_warn "Could not remove this run's temporary apt wiring — ${TMP_LIST}, ${TMP_KEYRING}, and/or ${TMP_PREF} may remain. Remove them by hand."
     fi
-    cleanup_apt_wiring || true
     if [ -n "$SCRATCH_DIR" ]; then
         rm -rf -- "$SCRATCH_DIR" || true
     fi
@@ -707,11 +780,54 @@ main() {
     # missing coreutils-adjacent tool.
     if command -v flock >/dev/null 2>&1; then
         mkdir -p -- "$(dirname -- "$LOCK_FILE")"
-        exec {LOCK_FD}>"$LOCK_FILE"
+        # LOCK_FILE is a FIXED, world-guessable path under /tmp in production,
+        # and this whole block runs as root whenever the script itself does (a
+        # Dockerfile RUN, a devcontainer postCreateCommand, or install-chrome-e2e)
+        # — the same guard suppress_permanent_repo applies to the defaults file,
+        # for the same two reasons (SEC-BE-006). A symlink here would redirect
+        # a root-owned open at a target of the planter's choosing; a hardlink
+        # defeats the symlink guard from the read side the same way it does for
+        # the defaults file. Checked AND recreated: the check gives a named,
+        # fail-closed diagnostic instead of silently overwriting evidence of
+        # the attempt, and `install` below unlinks-then-creates regardless, so
+        # a plant that lands in the gap between the check and the install still
+        # cannot be opened through.
+        if [ -L "$LOCK_FILE" ]; then
+            log_fail "${LOCK_FILE} is a symlink — refusing to lock through it." >&2
+            exit 1
+        fi
+        if [ -e "$LOCK_FILE" ]; then
+            local lock_nlink
+            lock_nlink=$(stat -c '%h' -- "$LOCK_FILE" 2>/dev/null) || lock_nlink=""
+            if [ -n "$lock_nlink" ] && [ "$lock_nlink" -ne 1 ]; then
+                log_fail "${LOCK_FILE} has multiple hard links (${lock_nlink}) — refusing to lock through it." >&2
+                exit 1
+            fi
+        fi
+        # `install`, not a bare redirection: it unlinks the destination before
+        # creating the new file (the same pattern suppress_permanent_repo's
+        # rewrite relies on), and it states the mode explicitly rather than
+        # leaving it to the caller's umask. That second part also fixes a
+        # standalone bug: under the caller's umask a root run could leave the
+        # lock at 0666 (world-writable, under `umask 0`) or otherwise
+        # unpredictable, and a LATER non-root run's bare `exec {LOCK_FD}>`
+        # (opened for WRITE) then failed EACCES on a root-owned file with no
+        # diagnostic — a redirection failure on `exec` terminates a
+        # non-interactive shell outright, before any log_fail runs. Opening
+        # read-only below sidesteps that entirely: flock needs no write access
+        # to the fd it locks, so a root-owned 0644 file is always still
+        # lockable by anyone.
+        $SUDO install -m 0644 -- /dev/null "$LOCK_FILE"
+        exec {LOCK_FD}<"$LOCK_FILE"
         if ! flock -w 300 "$LOCK_FD"; then
             log_fail "Could not acquire the install lock (${LOCK_FILE}) within 300s — another run appears stuck." >&2
             exit 1
         fi
+        # Only now does this run actually own the shared apt-wiring lifecycle
+        # (SEC-BE-008) — see LOCK_HELD's declaration for why cleanup_all reads
+        # this before touching TMP_LIST/TMP_KEYRING/TMP_PREF or the phone-home
+        # paths.
+        LOCK_HELD=1
     else
         log_warn "flock not found — concurrent installs are not mutually exclusive (see SEC-BE-007)."
     fi
@@ -786,12 +902,18 @@ main() {
     # /etc (SEC-BE-008). DPkg::Lock::Timeout turns a held lock into a
     # diagnosable apt error instead of a silent hang; `timeout` is the outer
     # backstop for every other way an apt run can wedge.
-    # shellcheck disable=SC2086  # $SUDO is deliberately unquoted: it is either
-    # "sudo" or the empty string, and quoting it would pass an empty argument.
-    # Every other $SUDO call site in this file relies on the same property;
-    # only these two are flagged because `timeout` moves $SUDO out of the
-    # command-name position shellcheck exempts.
-    if ! timeout 300 $SUDO apt-get update -qq -o DPkg::Lock::Timeout=120; then
+    #
+    # $SUDO in the COMMAND-NAME position, not `timeout $SUDO apt-get` (SEC-BE-010):
+    # on the unprivileged path $SUDO is "sudo", and `timeout N $SUDO apt-get`
+    # ran `timeout` itself as the invoking user while `sudo`/`apt-get` ran as
+    # root — signal permission requires the sender's UID to match the
+    # receiver's, so `timeout`'s SIGTERM on expiry was silently refused by the
+    # kernel and it just kept waiting for a child it could never kill. `$SUDO
+    # timeout N apt-get` makes the timeout process itself privileged, so it
+    # can actually signal the process it bounds. This also puts $SUDO back in
+    # the position every other call site in this file already unquotes
+    # without a shellcheck exemption, so none is needed here either.
+    if ! $SUDO timeout 300 apt-get update -qq -o DPkg::Lock::Timeout=120; then
         log_fail "apt-get update failed or timed out (held dpkg lock, or an unreachable mirror)." >&2
         exit 1
     fi
@@ -806,8 +928,7 @@ main() {
     if ! verify_apt_origin; then
         exit 1
     fi
-    # shellcheck disable=SC2086  # $SUDO unquoted, as above.
-    if ! timeout 900 $SUDO apt-get install -y --no-install-recommends \
+    if ! $SUDO timeout 900 apt-get install -y --no-install-recommends \
         -o DPkg::Lock::Timeout=120 google-chrome-stable; then
         log_fail "apt-get install failed or timed out." >&2
         exit 1
@@ -830,8 +951,15 @@ main() {
     if in_container; then
         remove_phone_home
     else
-        log_info "Not a container — leaving the google-chrome apt source and updater alone."
-        log_info "  (run inside the devcontainer image, or remove them by hand, to enforce AC4)"
+        # NOT "leaving the apt source and updater alone" (SEC-BE-009): unlike
+        # the idempotent early-exit branch above, suppress_permanent_repo
+        # already ran on THIS path (unconditionally, before apt-get install),
+        # so the package's postinst never created its own apt source or daily
+        # pinger in the first place — there is nothing left to leave alone.
+        # The message says what actually happened instead: this install has
+        # no update channel, on purpose, until the operator restores one.
+        log_info "Not a container — google-chrome-stable was installed with no apt update channel (repo_add_once=false in ${CHROME_DEFAULTS_FILE})."
+        log_info "  To restore Chrome's normal update channel: remove that setting (or the whole file) and re-add Google's source."
     fi
 
     # Set HERE, immediately after the container-aware removal above, and NOT

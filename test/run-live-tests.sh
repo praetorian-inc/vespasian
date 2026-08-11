@@ -215,6 +215,19 @@ load_config() {
                     fi
                     ;;
                 *)
+                    # An EMPTY port value means "this target was never set up"
+                    # (setup-live-targets.sh's write_config emits every
+                    # allowlisted key unconditionally, so a partial setup —
+                    # e.g. `--targets rest-api` — writes SOAP_SERVICE_PORT=
+                    # with no value), not a tampered one. Warning on that
+                    # trains readers to scroll past the one alarm that
+                    # matters when a value is genuinely malformed
+                    # (SEC-BE-014). Every other consumer already reads
+                    # ${VAR:-default}, so skipping silently changes nothing
+                    # about the resolved port.
+                    if [ -z "$value" ]; then
+                        continue
+                    fi
                     if [[ ! "$value" =~ ^[0-9]{1,5}$ ]] || [ "$value" -lt 1 ] || [ "$value" -gt 65535 ]; then
                         log_warn "Skipping ${key}: not a valid port (1-65535): ${value}"
                         continue
@@ -4105,6 +4118,14 @@ main() {
     done
 
     log_header "Vespasian Live Test Runner"
+
+    # VESPASIAN and RESULTS_DIR are ambient env-override seams (SEC-BE-012):
+    # generic names that unrelated tooling in a devcontainer or image build
+    # could set, silently redirecting which binary is under test or where
+    # results land. Logging the effective values makes an ambient override
+    # visible in the run output instead of only in the results path.
+    log_info "VESPASIAN=${VESPASIAN}"
+    log_info "RESULTS_DIR=${RESULTS_DIR}"
 
     # Load config only when it is actually needed.
     #

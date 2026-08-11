@@ -205,7 +205,26 @@ jobs:
                    /etc/apt/preferences.d/google-chrome-vespasian-temp.pref; do
             if [ -e "$p" ]; then echo "LEFTOVER: $p"; fail=1; fi
           done
+          # TEST-001: `[ -s ]` passed on any non-empty byte, so a bare newline or
+          # a stale record from an earlier image layer satisfied it. Assert the
+          # record actually names the browser that was just installed, and that
+          # it landed at the mode SEC-BE-003 requires — the fixture-level case v
+          # in install-chrome-selftest.sh already checks both, so the real
+          # install was being verified less specifically than the mock.
           [ -s /usr/share/vespasian/chrome-version ] || { echo "missing version record"; fail=1; }
+          if [ -s /usr/share/vespasian/chrome-version ]; then
+            record=/usr/share/vespasian/chrome-version
+            . ./test/common.sh
+            bin=$(detect_chrome_binary)
+            # Major version only: the record is written once at install time and
+            # the binary could legitimately be a later build by the time a
+            # re-run reads it, but the major cannot drift within one job.
+            major=$("${bin}" --version | grep -oE '[0-9]+' | head -1)
+            grep -qF "$major" "$record" \
+              || { echo "version record does not name the installed major ($major): $(cat "$record")"; fail=1; }
+            mode=$(stat -c '%a' "$record")
+            [ "$mode" = "644" ] || { echo "version record mode is $mode, expected 644"; fail=1; }
+          fi
           echo "recorded build: $(cat /usr/share/vespasian/chrome-version)"
           exit "$fail"
 
