@@ -636,6 +636,20 @@ EOF
         "644" "$(stat -c '%a' "${root_j}/etc/apt/sources.list.d/google-chrome-vespasian-temp.list" 2>/dev/null)"
     assert_eq "case j: the installed origin pin is world-readable but not writable (0644)" \
         "644" "$(stat -c '%a' "${root_j}/etc/apt/preferences.d/google-chrome-vespasian-temp.pref" 2>/dev/null)"
+    # The pin's CONTENT, not just its mode (TEST-007). Asserting 0644 alone left
+    # the file's actual policy untested: rewriting it to `Pin: origin
+    # evil.example.com` / `Pin-Priority: 1` keeps the mode at 0644 and stays
+    # green, while the constraint that makes `apt-get install` resolve the
+    # package NAME from the origin this script vouched for is gone. That pin is
+    # one of the two layers of the "the package came from where we verified"
+    # guarantee, so it needs its own assertion rather than a mode proxy.
+    pref_j=$(cat "${root_j}/etc/apt/preferences.d/google-chrome-vespasian-temp.pref" 2>/dev/null)
+    assert_contains "case j: the origin pin names the package it constrains" \
+        "Package: google-chrome-stable" "${pref_j}"
+    assert_contains "case j: the origin pin constrains the package to dl.google.com" \
+        "Pin: origin dl.google.com" "${pref_j}"
+    assert_contains "case j: the origin pin outranks an already-installed version (1001)" \
+        "Pin-Priority: 1001" "${pref_j}"
     # Only the pinned key may end up in the keyring: exporting the whole fetched
     # bundle would hand apt every key the endpoint chose to return.
     exported_fprs=$(gpg --homedir "${GNUPG_ASSERT_HOME}" --show-keys --with-colons --with-fingerprint \
@@ -1449,8 +1463,14 @@ fi
 # from trust_anchor_skips if that fixture or gpg is unavailable, since this
 # case is not testing the trust anchor itself, only relying on it.
 run_main_install_path() {
-    local root="$1" container="$2" bin_v
-    bin_v="${FIXTURE_DIR}/bin-v-${container}"
+    # $2 is named "mode", not "container": install-chrome.sh's in_container()
+    # now also checks the ambient `container` env var (SEC-BE-005), and a local
+    # variable of that exact name here would shadow it for every function this
+    # subshell sources and calls -- silently making in_container() see "host"/
+    # "container" as a non-empty value and answer true unconditionally. Verified
+    # by the collision itself: this is what happened before this var was renamed.
+    local root="$1" mode="$2" bin_v
+    bin_v="${FIXTURE_DIR}/bin-v-${mode}"
     rm -rf "${root}" "${bin_v}"
     mkdir -p "${root}" "${bin_v}"
 
@@ -1503,10 +1523,14 @@ EOF
     (
         VESPASIAN_TEST_ROOT="${root}"
         export VESPASIAN_TEST_ROOT
-        if [ "${container}" = "container" ]; then
+        if [ "${mode}" = "container" ]; then
             : > "${root}/.dockerenv"
         fi
         unset REMOTE_CONTAINERS
+        # Unset too, not just avoided by renaming the local above: an ambient
+        # `container` (set by some CI runners' own containerized job) must not
+        # silently flip this run onto the container arm regardless of $mode.
+        unset container
         PATH="${bin_v}:${PATH}"
         # shellcheck source=install-chrome.sh
         source "${INSTALL_SCRIPT}"
@@ -1811,6 +1835,158 @@ else
     echo "FAIL: case s: colour escapes no longer render"
     fail_count=$((fail_count + 1))
 fi
+
+# ── Case w: verify_apt_origin, both arms (TEST-010) ─────────────
+#
+# This function was reachable from no case at all — it appeared in the suite
+# only inside a comment — so BOTH arms were untested and replacing its whole
+# body with `return 0` left the suite green. It is one of the two layers of the
+# "the package came from the origin we vouched for" guarantee (the apt
+# preference pin is the other), so an unexercised accept-anything arm is a
+# silent loss of that guarantee.
+#
+# Driven with a stubbed apt-cache so no real apt state is needed: the function
+# only parses `apt-cache policy` output, which makes it cheap to pin exactly.
+run_verify_apt_origin() {
+    local policy_out="$1" stub_bin="${FIXTURE_DIR}/bin-w-$2"
+    rm -rf "${stub_bin}"; mkdir -p "${stub_bin}"
+    {
+        printf '#!/bin/bash\n'
+        printf 'cat <<'"'"'POLICY'"'"'\n%s\nPOLICY\n' "${policy_out}"
+    } > "${stub_bin}/apt-cache"
+    chmod +x "${stub_bin}/apt-cache"
+    (
+        # shellcheck source=install-chrome.sh
+        source "${INSTALL_SCRIPT}"
+        PATH="${stub_bin}:${PATH}"
+        set +e
+        out=$(verify_apt_origin 2>&1)
+        printf '%s\n%s\n' "$?" "${out}"
+    )
+}
+
+# The accepting arm: the installed candidate came from Google's own host.
+res_w1=$(run_verify_apt_origin ' *** 150.0.7871.186 1001
+        1001 https://dl.google.com/linux/chrome/deb stable/main amd64 Packages' accept)
+assert_eq "case w: an origin of dl.google.com is accepted (rc 0)" \
+    "0" "$(echo "${res_w1}" | sed -n '1p')"
+
+# The rejecting arm: a completely different host.
+res_w2=$(run_verify_apt_origin ' *** 150.0.7871.186 1001
+        1001 https://mirror.evil.example/linux/chrome/deb stable/main amd64 Packages' reject)
+assert_eq "case w: a foreign origin is refused (rc 1)" \
+    "1" "$(echo "${res_w2}" | sed -n '1p')"
+assert_contains "case w: the refusal names the origin it saw" \
+    "mirror.evil.example" "${res_w2}"
+
+# The substring trap this check used to fall into: `grep -qF 'dl.google.com'`
+# matched any URL merely CONTAINING that text, so a lookalike host satisfied it.
+# Both of these are rejected only because the check now anchors on the URL's
+# host component (SEC-BE-001).
+res_w3=$(run_verify_apt_origin ' *** 150.0.7871.186 1001
+        1001 https://dl.google.com.attacker.example/linux/chrome/deb stable/main amd64 Packages' lookalike)
+assert_eq "case w: a lookalike host (dl.google.com.attacker.example) is refused" \
+    "1" "$(echo "${res_w3}" | sed -n '1p')"
+res_w4=$(run_verify_apt_origin ' *** 150.0.7871.186 1001
+        1001 https://mirror.example/dl.google.com/deb stable/main amd64 Packages' pathmatch)
+assert_eq "case w: dl.google.com appearing in the PATH is refused" \
+    "1" "$(echo "${res_w4}" | sed -n '1p')"
+
+# An apt-cache that produces nothing (held dpkg lock, corrupted cache) must be
+# refused with a diagnostic rather than aborting the script under errexit — the
+# `|| origin=""` guard exists for exactly this, and without a case the guard's
+# absence would surface as a silent abort rather than a failure (QUAL-006).
+res_w5=$(run_verify_apt_origin '' emptypolicy)
+assert_eq "case w: an unreadable apt policy is refused, not silently accepted" \
+    "1" "$(echo "${res_w5}" | sed -n '1p')"
+assert_contains "case w: the empty-policy refusal is diagnosed as unknown" \
+    "unknown" "${res_w5}"
+
+# ── Case x: cleanup_all's step ORDER and errexit tolerance (TEST-011) ──
+#
+# Cases p/p2 assert the trap is REGISTERED (`trap 'cleanup_all' EXIT`); nothing
+# asserted what the handler does once it fires. Reverting it to its pre-round-5
+# shape — cleanup_apt_wiring first, no `|| true` — left the suite green, so the
+# fix for "one failing step aborts the handler under errexit and strands a
+# permanently trusted Google apt source plus a root cron pinger" was unprotected.
+#
+# Driven by replacing the two steps with recorders, so the assertions are about
+# cleanup_all's own control flow rather than about what the steps do. That is
+# the property under test: ORDER (security-relevant removal first) and
+# TOLERANCE (an earlier failure must not skip a later step).
+run_cleanup_all() {
+    local order_log="$1" fail_step="$2" rc=0
+    # The subshell is the errexit boundary. `cleanup_all` is invoked as a PLAIN
+    # command inside it, so the script's own `set -euo pipefail` applies to the
+    # handler's steps: without `|| true`, a failing step aborts the subshell and
+    # the order log is left short. Capturing rc with `|| rc=$?` on the SUBSHELL
+    # (not on cleanup_all) is what keeps errexit live where it matters — putting
+    # `||` directly on cleanup_all suspends errexit for the whole handler and
+    # makes this case pass whether or not the tolerance is there. Verified: with
+    # `||` on cleanup_all, deleting every `|| true` from the handler kept the
+    # suite green.
+    (
+        # shellcheck source=install-chrome.sh
+        source "${INSTALL_SCRIPT}"
+        # A failed install: this is the arm that must remove the phone-home
+        # artifacts, and the arm a mid-install abort actually takes.
+        INSTALL_ATTEMPTED=1
+        INSTALL_SUCCEEDED=0
+        SCRATCH_DIR=""
+        remove_phone_home() {
+            echo "remove_phone_home" >> "${order_log}"
+            [ "${fail_step}" = "remove_phone_home" ] && return 1
+            return 0
+        }
+        cleanup_apt_wiring() {
+            echo "cleanup_apt_wiring" >> "${order_log}"
+            [ "${fail_step}" = "cleanup_apt_wiring" ] && return 1
+            return 0
+        }
+        # Re-arm errexit EXPLICITLY inside the subshell. Bash disables `set -e`
+        # for a compound command that is an operand of `||`, and that disabling
+        # reaches inside the subshell too — so without this line the handler runs
+        # errexit-off and the tolerance assertions below pass whether or not
+        # `|| true` is present. Measured: deleting every `|| true` from
+        # cleanup_all kept the suite green until this `set -e` was added.
+        set -e
+        cleanup_all >/dev/null 2>&1
+    ) || rc=$?
+    printf '%s\n' "${rc}"
+}
+
+# Order: the security-relevant removal must run BEFORE the wiring cleanup.
+log_x1="${FIXTURE_DIR}/cleanup-order-1"; : > "${log_x1}"
+rc_x1=$(run_cleanup_all "${log_x1}" none)
+assert_eq "case x: cleanup_all succeeds when both steps succeed (rc 0)" "0" "${rc_x1}"
+assert_eq "case x: remove_phone_home runs BEFORE cleanup_apt_wiring" \
+    "remove_phone_home cleanup_apt_wiring" "$(tr '\n' ' ' < "${log_x1}" | sed 's/ $//')"
+
+# Tolerance, asserted from the SOURCE rather than at runtime.
+#
+# A runtime attempt was written first and deliberately discarded: bash disables
+# `set -e` for a compound command that is an operand of `||`, and that reaches
+# inside the subshell, so every arrangement of `( ... ) || rc=$?` ran the handler
+# errexit-OFF. Measured against a copy with every `|| true` deleted from
+# cleanup_all: the suite stayed green (151/0). An assertion that cannot fail is
+# not coverage, so the runtime rc checks were removed rather than left in place
+# looking like protection.
+#
+# What DOES bite is asserting the tolerance is present in the handler's text.
+# The property is a syntactic one — each step is `|| true`-guarded — so a
+# source-level check is the honest form, and it is the same derive-from-source
+# idiom the CI-wiring guards in test-runner-args.sh already use.
+cleanup_all_src=$(sed -n '/^cleanup_all() {/,/^}/p' "${INSTALL_SCRIPT}")
+for guarded_step in remove_phone_home cleanup_apt_wiring; do
+    if printf '%s' "${cleanup_all_src}" \
+        | grep -qE "^[[:space:]]*${guarded_step}[[:space:]]*\|\|[[:space:]]*true[[:space:]]*$"; then
+        echo "PASS: case x: cleanup_all still tolerates a failing ${guarded_step} (|| true)"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: case x: cleanup_all no longer guards ${guarded_step} with '|| true' — one failing step will abort the handler under errexit and strand the phone-home artifacts"
+        fail_count=$((fail_count + 1))
+    fi
+done
 
 # ── Summary ─────────────────────────────────────────────────────
 echo ""

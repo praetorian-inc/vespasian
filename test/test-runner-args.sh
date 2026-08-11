@@ -829,7 +829,13 @@ else
             # `install-chrome-selftestXsh`. Harmless today, but this guard exists
             # precisely to notice small edits nobody meant to make.
             suite_re=${suite//./\\.}
-            if printf '%s\n' "$runlines" | grep -qE "run:[[:space:]]*(\./|bash )?test/${suite_re}([[:space:]]|$)"; then
+            # TEST-017: anchored strictly to end-of-line (only trailing
+            # whitespace allowed after the script name) — previously the
+            # `([[:space:]]|$)` alternation matched the space before a
+            # trailing '|| true' too, so appending that to a run line still
+            # satisfied "invokes $suite" even though the failure it produces
+            # would be swallowed.
+            if printf '%s\n' "$runlines" | grep -qE "run:[[:space:]]*(\./|bash )?test/${suite_re}[[:space:]]*\$"; then
                 pass "un-gated job invokes $suite"
             else
                 fail "un-gated preflight-selftest job no longer invokes $suite — coverage dropped silently"
@@ -845,6 +851,15 @@ else
             fail "un-gated job sets continue-on-error: true — a failing guard would not fail CI"
         else
             pass "un-gated job has no continue-on-error: true"
+        fi
+        # TEST-017: the cheapest neutering shape of all — a trailing
+        # '|| true' / '|| exit 0' / '|| :' on a run line — trips neither the
+        # continue-on-error check above nor the per-suite invocation regexes,
+        # which only assert the invocation is PRESENT, not un-neutered.
+        if printf '%s\n' "$runlines" | grep -qE '\|\|[[:space:]]*(true|exit 0|:)([[:space:]]|$)'; then
+            fail "un-gated job neuters a step with a trailing '|| true'/'|| exit 0'/'|| :' — a failing guard would not fail CI"
+        else
+            pass "un-gated job has no trailing '|| true'/'|| exit 0'/'|| :' step neutering"
         fi
         # ANY `if:` inside this job block is a finding, at any indentation.
         #
@@ -924,6 +939,21 @@ if [[ -f "$WORKFLOW" ]]; then
             fail "install-chrome-e2e no longer runs test/install-chrome.sh — the privileged path is uncovered"
         fi
 
+        # TEST-001: the checks above prove the job exists and still runs the
+        # script, but say nothing about the one thing that decides whether it
+        # ever runs at all — its `if:`. This job is deliberately opt-in
+        # (workflow_dispatch, plus push to main so a break there cannot stay
+        # hidden); narrowing that gate to one arm, or to `if: false`, leaves
+        # every other check in this file green while the installer's
+        # privileged path silently loses all coverage. Pin the gate's
+        # content, not just its absence — require both trigger arms by name.
+        if printf '%s\n' "$e2e_block" | grep -qE '^[[:space:]]*if:.*workflow_dispatch' \
+           && printf '%s\n' "$e2e_block" | grep -qE '^[[:space:]]*if:.*refs/heads/main'; then
+            pass "install-chrome-e2e's if: gate still names both the workflow_dispatch and push-to-main arms"
+        else
+            fail "install-chrome-e2e's if: gate no longer names both trigger arms — the opt-in gate may have been narrowed or disabled, silently dropping the installer's only privileged-path coverage"
+        fi
+
         # The job-exists / script-runs checks above say nothing about the
         # STEPS that turn that run into a test (TEST-023): deleting the "Assert
         # no phone-home artifacts survive" step — the only place AC4 and the
@@ -932,12 +962,30 @@ if [[ -f "$WORKFLOW" ]]; then
         # steps explicitly, and reject the same continue-on-error escape hatch
         # the preflight-selftest block above rejects.
         e2e_runlines=$(printf '%s\n' "$e2e_block" | grep -vE '^[[:space:]]*#')
-        if printf '%s\n' "$e2e_runlines" | grep -q 'chrome-version'; then
+        # TEST-002: also require the headless-render assertion — the only
+        # place anything actually drives the installed binary — not just the
+        # three needles below (chrome-version, cron.daily absence, idempotent
+        # re-run). --dump-dom is the most specific token: it appears nowhere
+        # else in the step.
+        if printf '%s\n' "$e2e_runlines" | grep -q -- '--dump-dom'; then
+            pass "install-chrome-e2e still asserts a runnable headless render (--dump-dom)"
+        else
+            fail "install-chrome-e2e no longer asserts a runnable headless render — the --dump-dom check was removed"
+        fi
+        # TEST-019: match the assertion's own shape, not the bare path — the
+        # bare 'chrome-version' token also matches the purely informational
+        # `echo "recorded build: ..."` line beneath it, so deleting the real
+        # assertion while keeping the echo left this guard green.
+        if printf '%s\n' "$e2e_runlines" | grep -qE '\[ -s /usr/share/vespasian/chrome-version \]'; then
             pass "install-chrome-e2e still asserts the chrome-version record (AC4)"
         else
             fail "install-chrome-e2e no longer asserts the chrome-version record — AC4 version-record coverage dropped silently"
         fi
-        if printf '%s\n' "$e2e_runlines" | grep -qE '/etc/cron\.daily/google-chrome'; then
+        # TEST-019: same tightening for the cron.daily check — the bare path
+        # also matches the `for p in ...` list on its own, without proving the
+        # loop body that actually inspects each $p and sets fail=1 is intact.
+        if printf '%s\n' "$e2e_runlines" | grep -qE '/etc/cron\.daily/google-chrome' \
+           && printf '%s\n' "$e2e_runlines" | grep -qE 'if \[ -e "[$]p" \]; then echo "LEFTOVER: [$]p"; fail=1; fi'; then
             pass "install-chrome-e2e still asserts /etc/cron.daily/google-chrome is absent (AC4)"
         else
             fail "install-chrome-e2e no longer asserts /etc/cron.daily/google-chrome is absent — AC4 phone-home coverage dropped silently"
@@ -951,6 +999,15 @@ if [[ -f "$WORKFLOW" ]]; then
             fail "install-chrome-e2e sets continue-on-error: true — a failing verification step would not fail CI"
         else
             pass "install-chrome-e2e has no continue-on-error: true"
+        fi
+        # TEST-017: continue-on-error isn't the only neutering shape — a
+        # trailing '|| true' / '|| exit 0' / '|| :' on a run line swallows the
+        # failure just as effectively and trips neither the check above nor
+        # the invocation regexes elsewhere in this file.
+        if printf '%s\n' "$e2e_runlines" | grep -qE '\|\|[[:space:]]*(true|exit 0|:)([[:space:]]|$)'; then
+            fail "install-chrome-e2e neuters a step with a trailing '|| true'/'|| exit 0'/'|| :' — a failing verification step would not fail CI"
+        else
+            pass "install-chrome-e2e has no trailing '|| true'/'|| exit 0'/'|| :' step neutering"
         fi
 
         echo ""
@@ -1008,6 +1065,58 @@ if [[ -f "$WORKFLOW" ]]; then
     else
         fail "install-chrome-e2e job is gone — the installer's privileged path has no coverage at all"
     fi
+fi
+
+echo ""
+echo "=== test job wiring (TEST-003) ==="
+# preflight-selftest and install-chrome-e2e got step-list wiring guards above
+# because a hand-maintained YAML block can silently lose a step with every
+# other check in the repo still green. The `test` job — where the entire
+# offline/live suite actually executes — had no equivalent.
+if [[ -f "$WORKFLOW" ]]; then
+    test_block=$(awk '
+        /^  test:/ { inblock=1; next }
+        inblock && /^  [a-zA-Z_-]+:/ { inblock=0 }
+        inblock { print }
+    ' "$WORKFLOW")
+    if [[ -z "$test_block" ]]; then
+        fail "could not extract the test job block (extraction broken — assertions below are vacuous)"
+    else
+        pass "test job block extracted from live-tests.yml"
+        test_runlines=$(printf '%s\n' "$test_block" | grep -vE '^[[:space:]]*#')
+
+        if printf '%s\n' "$test_runlines" | grep -qE 'run:[[:space:]]*(\./|bash )?test/run-live-tests\.sh.*--group[[:space:]]+offline([[:space:]]|$)'; then
+            pass "test job still runs the offline group via run-live-tests.sh --group offline"
+        else
+            fail "test job no longer runs run-live-tests.sh --group offline — offline coverage dropped silently"
+        fi
+
+        if printf '%s\n' "$test_runlines" | grep -qE 'run:[[:space:]]*(\./|bash )?test/run-live-tests\.sh.*--group[[:space:]]+live([[:space:]]|$)'; then
+            pass "test job still runs the live group via run-live-tests.sh --group live"
+        else
+            fail "test job no longer runs run-live-tests.sh --group live — live coverage dropped silently"
+        fi
+
+        if printf '%s\n' "$test_block" | grep -qE '^[[:space:]]*needs:.*preflight-selftest'; then
+            pass "test job still depends on preflight-selftest (fail-fast preserved)"
+        else
+            fail "test job no longer depends on preflight-selftest — the fail-fast dependency was dropped"
+        fi
+
+        # LAB-5064's AC3 promise: the offline group exercises the same
+        # no-config path a developer gets on a fresh checkout. Re-adding a
+        # stub-config step ahead of "Run offline tests" would silently revert
+        # that without tripping either check above, since the offline run
+        # step itself is untouched.
+        before_offline=$(printf '%s\n' "$test_runlines" | sed -n '1,/Run offline tests/p' | sed '$d')
+        if printf '%s\n' "$before_offline" | grep -q '\.live-test-config'; then
+            fail "test job writes a config file before the offline run — the no-config offline path (AC3) is no longer exercised"
+        else
+            pass "test job writes no config before the offline run (AC3 no-config path preserved)"
+        fi
+    fi
+else
+    fail "live-tests.yml not found at $WORKFLOW (test-job wiring assertions vacuous)"
 fi
 
 echo ""

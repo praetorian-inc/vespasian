@@ -44,9 +44,10 @@
 # from this script alone. The installed version is therefore logged on success
 # so an image build record identifies exactly what landed.
 #
-# Idempotent: exits 0 without touching the system when a runnable browser is
-# already present. Safe to call from a Dockerfile RUN, a devcontainer
-# postCreateCommand, or by hand.
+# Idempotent: exits 0 when a runnable browser is already present, after
+# clearing this script's own leftover apt wiring (and, in a container, the
+# package's phone-home artifacts) — no new installation is attempted. Safe to
+# call from a Dockerfile RUN, a devcontainer postCreateCommand, or by hand.
 #
 # Trust assumption for the test seam: VESPASIAN_TEST_ROOT exists only so
 # install-chrome-selftest.sh can reach the symlink guard, the container gate, and
@@ -87,6 +88,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # chrome_runnable, detect_chrome_binary) that setup-live-targets.sh's preflight
 # uses, so "already installed" here means exactly what "prerequisite satisfied"
 # means there.
+#
+# Convention: log_fail() writes to stdout by default (see common.sh), so every
+# call site in this file redirects it to stderr with `>&2` — diagnostics belong
+# on stderr regardless of whether the caller happens to be a command
+# substitution that would otherwise swallow them (resolve_arch's is the one
+# case where that is load-bearing rather than merely stylistic).
 # shellcheck source=common.sh
 source "${SCRIPT_DIR}/common.sh"
 
@@ -287,13 +294,13 @@ resolve_sudo() {
         SUDO="sudo"
         return 0
     fi
-    log_fail "Not running as root and sudo is unavailable — cannot install packages."
+    log_fail "Not running as root and sudo is unavailable — cannot install packages." >&2
     return 1
 }
 
 require_apt() {
     if ! command -v apt-get >/dev/null 2>&1; then
-        log_fail "install-chrome.sh supports Debian/Ubuntu (apt-get) only."
+        log_fail "install-chrome.sh supports Debian/Ubuntu (apt-get) only." >&2
         log_info "On macOS install Google Chrome normally; on other distros use your package manager."
         return 1
     fi
@@ -309,7 +316,7 @@ require_tools() {
     command -v curl >/dev/null 2>&1 || missing+=("curl")
     command -v gpg  >/dev/null 2>&1 || missing+=("gnupg")
     if [ ${#missing[@]} -gt 0 ]; then
-        log_fail "Missing required tool(s): ${missing[*]}"
+        log_fail "Missing required tool(s): ${missing[*]}" >&2
         log_info "Install them first: apt-get install -y ${missing[*]}"
         return 1
     fi
@@ -322,6 +329,14 @@ require_tools() {
 # Fetch Google's signing key, verify it against the pinned PRIMARY fingerprint,
 # and install it as a dedicated keyring. Refuses to proceed on any mismatch —
 # an unpinned key would make the whole signature check ornamental.
+#
+# Intentionally longer than the ~60-line guideline, like main(): fetch, import,
+# fingerprint-check, export, and the three privileged writes (keyring, source
+# list, origin pin) are one linear trust chain where each step's failure must
+# abort before the next runs. Splitting fetch+verify from the writes would
+# still leave a >60-line write half (three staged-then-install calls, each with
+# its own rationale comment) and would scatter that ordering across two
+# functions instead of removing it from either.
 install_pinned_key() {
     local tmp_key="$1/google.pub" tmp_gpg="$1/google.gpg" tmp_ring="$1/google.kbx" tmp_list="$1/google-chrome.list"
     local gpg_err="$1/gpg.err" gpg_home="$1/gnupg" fprs
@@ -340,7 +355,7 @@ install_pinned_key() {
     if ! curl -fsSL --proto '=https' --proto-redir '=https' \
         --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 \
         -o "$tmp_key" "$GOOGLE_KEY_URL"; then
-        log_fail "Could not fetch Google's signing key: ${GOOGLE_KEY_URL}"
+        log_fail "Could not fetch Google's signing key: ${GOOGLE_KEY_URL}" >&2
         return 1
     fi
 
@@ -349,7 +364,7 @@ install_pinned_key() {
     # missing gnupg into a bogus "the key is forged" report.
     if ! gpg --homedir "$gpg_home" --no-default-keyring --keyring "$tmp_ring" \
         --batch --quiet --import "$tmp_key" 2>"$gpg_err"; then
-        log_fail "Fetched signing key is not a valid PGP key."
+        log_fail "Fetched signing key is not a valid PGP key." >&2
         [ -s "$gpg_err" ] && log_info "  gpg: $(tr '\n' ' ' < "$gpg_err")"
         return 1
     fi
@@ -373,12 +388,12 @@ install_pinned_key() {
         --with-colons --fingerprint 2>"$gpg_err" \
         | awk -F: '$1=="pub"{want=1} $1=="fpr" && want{print $10; want=0}')
     if [ -z "$fprs" ]; then
-        log_fail "Could not read any key fingerprint from the fetched key — refusing to install."
+        log_fail "Could not read any key fingerprint from the fetched key — refusing to install." >&2
         [ -s "$gpg_err" ] && log_info "  gpg: $(tr '\n' ' ' < "$gpg_err")"
         return 1
     fi
     if ! printf '%s\n' "$fprs" | grep -qxF -- "$GOOGLE_KEY_FPR"; then
-        log_fail "Google signing key fingerprint mismatch — refusing to install."
+        log_fail "Google signing key fingerprint mismatch — refusing to install." >&2
         log_info "  expected: ${GOOGLE_KEY_FPR}"
         log_info "  got:      ${fprs}"
         log_info "If Google rotated their primary key, update GOOGLE_KEY_FPR deliberately."
@@ -389,7 +404,7 @@ install_pinned_key() {
     # tell apt to trust every key the endpoint chose to return.
     if ! gpg --homedir "$gpg_home" --no-default-keyring --keyring "$tmp_ring" \
         --batch --yes --export "$GOOGLE_KEY_FPR" > "$tmp_gpg" 2>"$gpg_err" || [ ! -s "$tmp_gpg" ]; then
-        log_fail "Could not export the pinned key ${GOOGLE_KEY_FPR} — refusing to install."
+        log_fail "Could not export the pinned key ${GOOGLE_KEY_FPR} — refusing to install." >&2
         [ -s "$gpg_err" ] && log_info "  gpg: $(tr '\n' ' ' < "$gpg_err")"
         return 1
     fi
@@ -439,11 +454,21 @@ cleanup_apt_wiring() {
 # file alone raises that source's priority but does not prove apt actually
 # used it. `apt-cache policy` is read-only, so this needs no $SUDO.
 verify_apt_origin() {
-    local origin
+    local origin host
+    # `|| origin=""` guards the assignment itself: under `set -euo pipefail`, a
+    # failing apt-cache (a held dpkg lock, a corrupted cache) propagates through
+    # the pipe even though awk itself exits 0, which would otherwise abort the
+    # script here with no diagnostic instead of reaching the log_fail below.
     origin=$(apt-cache policy google-chrome-stable 2>/dev/null \
-        | awk '/^ \*\*\*/{getline; print $2; exit}')
-    if ! printf '%s' "$origin" | grep -qF 'dl.google.com'; then
-        log_fail "google-chrome-stable was satisfied from an unexpected origin: ${origin:-unknown} (expected dl.google.com)"
+        | awk '/^ \*\*\*/{getline; print $2; exit}') || origin=""
+    # Anchor on the URL's host component, not a substring of the whole URL.
+    # `grep -qF 'dl.google.com'` also matched a lookalike host such as
+    # "dl.google.com.attacker.example" or "mirror.example/dl.google.com/...",
+    # which defeats the whole point of this check.
+    host="${origin#*://}"
+    host="${host%%/*}"
+    if [ "$host" != "dl.google.com" ]; then
+        log_fail "google-chrome-stable was satisfied from an unexpected origin: ${origin:-unknown} (expected dl.google.com)" >&2
         return 1
     fi
 }
@@ -462,13 +487,28 @@ suppress_permanent_repo() {
     # privilege the write would grant. /etc/default is the same in a stock
     # image — the guard is defence in depth for images that loosen it.
     if [ -L "$f" ]; then
-        log_fail "${f} is a symlink — refusing to write through it."
+        log_fail "${f} is a symlink — refusing to write through it." >&2
         return 1
+    fi
+    # A hardlink is neither a symlink nor caught by [ -L ], and it defeats the
+    # guard above from the READ side rather than the write side: the $SUDO
+    # grep below reads "$f" as root and the unprivileged caller's own shell
+    # redirects that output into $staged, so a hardlink planted at "$f" turns
+    # this into an arbitrary root-readable-file read into a caller-owned file.
+    # stat needs no $SUDO — nlink is available without read permission on the
+    # file itself, same as the [ -L ] test above.
+    if [ -e "$f" ]; then
+        local nlink
+        nlink=$(stat -c '%h' -- "$f" 2>/dev/null) || nlink=""
+        if [ -n "$nlink" ] && [ "$nlink" -ne 1 ]; then
+            log_fail "${f} has multiple hard links (${nlink}) — refusing to write through it." >&2
+            return 1
+        fi
     fi
     # No -m on install -d: an existing /etc/default keeps whatever mode it has.
     $SUDO install -d -- "$(dirname -- "$f")"
 
-    # Render the whole desired file, then land it with a single atomic rename.
+    # Render the whole desired file, then land it with a single `install`.
     #
     # This replaces a create/append/rewrite branch trio that had two problems.
     # The branch predicates ran WITHOUT $SUDO while the writes ran WITH it, so an
@@ -476,8 +516,9 @@ suppress_permanent_repo() {
     # down the append arm and duplicated the key instead of rewriting it. And
     # `tee`/`sed -i` follow symlinks by name, leaving a check-then-write window
     # after the [ -L ] guard. One rewrite fixes both: the read that decides the
-    # content runs at the same privilege as the write, and rename(2) replaces a
-    # symlink rather than writing through it.
+    # content runs at the same privilege as the write, and `install` unlinks the
+    # destination before creating the new file rather than writing through a
+    # symlink.
     staged="${SCRATCH_DIR}/google-chrome.defaults"
     : > "$staged"
     if $SUDO test -f "$f"; then
@@ -492,13 +533,17 @@ suppress_permanent_repo() {
         local grep_rc=0
         $SUDO grep -v '^repo_add_once=' -- "$f" > "$staged" || grep_rc=$?
         if [ "$grep_rc" -gt 1 ]; then
-            log_fail "Could not read ${f} (grep exit ${grep_rc}) — refusing to rewrite it."
+            log_fail "Could not read ${f} (grep exit ${grep_rc}) — refusing to rewrite it." >&2
             return 1
         fi
     fi
     printf 'repo_add_once=false\n' >> "$staged"
-    $SUDO install -m 0644 -- "$staged" "${f}.vespasian-tmp"
-    $SUDO mv -f -- "${f}.vespasian-tmp" "$f"
+    # A single `install`, not a stage-then-`mv`: install already unlinks the
+    # destination before opening (verified above the symlink guard does not
+    # get bypassed), so the two-step's atomicity is preserved without a second
+    # privileged path — the earlier two-step left a root-owned
+    # "${f}.vespasian-tmp" with no release if the `mv` step failed.
+    $SUDO install -m 0644 -- "$staged" "$f"
 }
 
 remove_phone_home() {
@@ -506,12 +551,22 @@ remove_phone_home() {
 }
 
 # in_container reports whether this looks like a throwaway image, which is the
-# only place it is safe to wipe the apt cache — doing that on a developer's own
-# machine destroys whole-system apt index state they never consented to lose.
-# Both probes are reachable from the selftest: the marker path is rerooted by
-# VESPASIAN_TEST_ROOT, and REMOTE_CONTAINERS is read from the environment.
+# only place it is safe to wipe the apt cache, remove the package's phone-home
+# artifacts (AC4), and skip auditing them — doing any of that on a developer's
+# own machine destroys state they never consented to lose. Docker and VS Code
+# Dev Containers were the only two runtimes probed; every other build path
+# (Podman/Buildah, rootless `podman build`, kaniko/img, plain containerd/CRI-O/
+# Kubernetes) answered false here, so an image built by any of THOSE shipped
+# the exact standing egress AC4 exists to eliminate — silently, since
+# verify_install shares this same predicate for its audit (see its call site).
+# All four probes are reachable from the selftest: the two marker paths are
+# rerooted by VESPASIAN_TEST_ROOT, and REMOTE_CONTAINERS / container are read
+# from the environment.
 in_container() {
-    [ -f "${TEST_ROOT}/.dockerenv" ] || [ -n "${REMOTE_CONTAINERS:-}" ]
+    [ -f "${TEST_ROOT}/.dockerenv" ] ||
+    [ -f "${TEST_ROOT}/run/.containerenv" ] ||
+    [ -n "${REMOTE_CONTAINERS:-}" ] ||
+    [ -n "${container:-}" ]
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -744,7 +799,7 @@ main() {
 record_chrome_version() {
     local version="$1" staged_version="${SCRATCH_DIR}/chrome-version"
     if printf '%s\n' "$version" > "$staged_version" &&
-       $SUDO install -d -- "$(dirname -- "$CHROME_VERSION_RECORD")" 2>/dev/null &&
+       $SUDO install -d -- "$(dirname -- "$CHROME_VERSION_RECORD")" &&
        $SUDO install -m 0644 -- "$staged_version" "$CHROME_VERSION_RECORD"; then
         log_info "Recorded build in ${CHROME_VERSION_RECORD}"
     else
@@ -758,7 +813,7 @@ verify_install() {
     local installed rc=0
     installed=$(detect_chrome_binary) || rc=$?
     if [ $rc -ne 0 ]; then
-        log_fail "Install completed but no runnable browser was detected."
+        log_fail "Install completed but no runnable browser was detected." >&2
         exit 1
     fi
     # Log the exact version: this script tracks stable rather than pinning, so
@@ -784,7 +839,7 @@ verify_install() {
     local leftover
     for leftover in "$TMP_LIST" "$TMP_KEYRING" "$TMP_PREF"; do
         if [ -e "$leftover" ]; then
-            log_fail "Temporary apt artifact still present: ${leftover}"
+            log_fail "Temporary apt artifact still present: ${leftover}" >&2
             exit 1
         fi
     done
@@ -799,7 +854,7 @@ verify_install() {
     if in_container; then
         for leftover in "${PHONE_HOME_PATHS[@]}"; do
             if [ -e "$leftover" ]; then
-                log_fail "Phone-home artifact still present: ${leftover}"
+                log_fail "Phone-home artifact still present: ${leftover}" >&2
                 exit 1
             fi
         done

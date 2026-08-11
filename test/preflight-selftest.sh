@@ -16,6 +16,29 @@ SETUP_SCRIPT="${SCRIPT_DIR}/setup-live-targets.sh"
 
 pass_count=0
 fail_count=0
+skip_count=0
+
+# Environment-dependent blocks call this instead of a bare `echo SKIP`.
+#
+# Without a counter the suite could lose assertions silently: forcing
+# HAS_NONBROWSER_PREREQS false drops the run from EXPECTED_ASSERTIONS to four
+# fewer and still prints "N passed, 0 failed" and exits 0 — and the CI job that
+# runs this deliberately installs neither Go nor Node, so that is the arm CI
+# actually takes. A skip is a legitimate outcome; an INVISIBLE skip is not.
+skip() {
+    echo "SKIP: $1"
+    skip_count=$((skip_count + 1))
+}
+
+# Completion sentinel. Pinned to the assertion count of a fully-equipped run
+# (nothing skipped). It is only enforced when skip_count is 0, because a
+# degraded environment legitimately runs fewer assertions — but in that case
+# the skips are counted and printed above, so the shortfall is attributable
+# rather than silent. Deleting a case on a full host changes this total and
+# fails the suite, which is the regression this guards.
+#
+# Update deliberately when adding or removing an assertion.
+EXPECTED_ASSERTIONS=71
 
 assert_eq() {
     local desc=$1 expected=$2 actual=$3
@@ -72,6 +95,50 @@ chmod +x "${GENERIC_BROKEN}"
 # sources unconditionally at top level (not inside main()), so any override must
 # happen AFTER sourcing — source first, then override, then call
 # detect_chrome_binary.
+
+# Pin the probe budget for the whole suite (TEST-014).
+#
+# Only cases f2/f3 used to pin it, so every OTHER case inherited whatever the
+# ambient environment had. That is not hypothetical: `CHROME_PROBE_TIMEOUT=0.0001
+# bash test/preflight-selftest.sh` drops this suite to 59/6 and install-chrome
+# to 121/16, because a budget that small makes every real probe time out and
+# report a healthy browser as "not runnable" — the exact LAB-3893 false positive
+# the override exists to cure. The cases that deliberately vary the budget set
+# it per-invocation, which still overrides this default.
+export CHROME_PROBE_TIMEOUT=2
+
+# ── Case a0: the PRODUCTION candidate list (TEST-005) ──────────
+# Every other case in every suite OVERRIDES CHROME_CANDIDATES with fixtures, so
+# the shipped list in common.sh was asserted nowhere: trimming it to a single
+# `google-chrome` entry — deleting `chromium-browser`, the very snap-stub name
+# LAB-3893 exists to diagnose — left all four suites green. This is the one case
+# that reads the real array, so it must NOT override it.
+prod_candidates=$(
+    (
+        # shellcheck source=common.sh
+        source "${SCRIPT_DIR}/common.sh"
+        printf '%s\n' "${CHROME_CANDIDATES[@]}"
+    )
+)
+for required in google-chrome chromium-browser chromium /usr/bin/google-chrome /snap/bin/chromium; do
+    if printf '%s\n' "${prod_candidates}" | grep -qxF -- "${required}"; then
+        echo "PASS: case a0: production CHROME_CANDIDATES still contains '${required}'"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: case a0: production CHROME_CANDIDATES lost '${required}' — detection coverage silently narrowed"
+        fail_count=$((fail_count + 1))
+    fi
+done
+# Order is load-bearing: google-chrome must be probed before chromium-browser,
+# so a host with both prefers the real Chrome over Ubuntu's snap launcher stub.
+if [ "$(printf '%s\n' "${prod_candidates}" | grep -nxF -- google-chrome | cut -d: -f1)" \
+     -lt "$(printf '%s\n' "${prod_candidates}" | grep -nxF -- chromium-browser | cut -d: -f1)" ]; then
+    echo "PASS: case a0: google-chrome is probed before chromium-browser"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case a0: candidate priority inverted — the snap stub would be preferred over real Chrome"
+    fail_count=$((fail_count + 1))
+fi
 
 # ── Case a: working browser present ────────────────────────────
 result=$(
@@ -350,7 +417,7 @@ for bad in "abc" "-1" "2s" "1.2.3" "0" "00" "0.0" "0." "000.000" ".0" ""; do
     assert_eq "case f3: an empty budget is treated as unset, no warning" \
         "" "$(CHROME_PROBE_TIMEOUT='' warn_of)"
 else
-    echo "SKIP: case f2: no timeout/gtimeout on PATH — no probe budget to override"
+    skip "case f2: no timeout/gtimeout on PATH — no probe budget to override"
 fi
 
 # ── Cases g-j: the browser gate is CONDITIONAL (LAB-5064) ───────
@@ -592,7 +659,7 @@ if [ "${HAS_NONBROWSER_PREREQS}" = true ]; then
         pass_count=$((pass_count + 1))
     fi
 else
-    echo "SKIP: case n: marker/epilogue assertions need go and python3 on PATH"
+    skip "case n: marker/epilogue assertions need go and python3 on PATH"
 fi
 
 # Case n (continued): isolate --skip-start AT THE CALL SITE against a
@@ -618,7 +685,7 @@ if [ "${HAS_NONBROWSER_PREREQS}" = true ]; then
         fail_count=$((fail_count + 1))
     fi
 else
-    echo "SKIP: case n: --skip-start marker assertion needs go and python3 on PATH"
+    skip "case n: --skip-start marker assertion needs go and python3 on PATH"
 fi
 
 # And the LAB-3893 half of the contract at the same call site: a browser-backed
@@ -685,10 +752,24 @@ if [ "${HAS_NONBROWSER_PREREQS}" = true ]; then
         pass_count=$((pass_count + 1))
     fi
 else
-    echo "SKIP: case o: epilogue-absence assertion needs go and python3 on PATH"
+    skip "case o: epilogue-absence assertion needs go and python3 on PATH"
 fi
 
 # ── Summary ─────────────────────────────────────────────────────
 echo ""
-echo "preflight-selftest: ${pass_count} passed, ${fail_count} failed"
+echo "preflight-selftest: ${pass_count} passed, ${fail_count} failed, ${skip_count} skipped"
+
+# Assertion accounting (TEST-015). On a fully-equipped host nothing may vanish:
+# the total is pinned, so deleting a case fails here even though every surviving
+# case still passes. When blocks were skipped the total legitimately differs,
+# and the skip lines above say which blocks and why.
+total=$((pass_count + fail_count))
+if [ "${skip_count}" -eq 0 ] && [ "${total}" -ne "${EXPECTED_ASSERTIONS}" ]; then
+    echo "FAIL: assertion accounting drift — expected ${EXPECTED_ASSERTIONS} assertions with nothing skipped, saw ${total}."
+    echo "      A case was added or removed without updating EXPECTED_ASSERTIONS."
+    exit 1
+fi
+if [ "${skip_count}" -gt 0 ]; then
+    echo "NOTE: ${skip_count} block(s) skipped — this run did not exercise the full suite."
+fi
 [ "${fail_count}" -eq 0 ]

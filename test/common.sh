@@ -42,11 +42,13 @@ log_fail()   { printf '%b[FAIL]%b %s\n' "$RED" "$NC" "$1"; }
 # ──────────────────────────────────────────────────────────────
 # Browser detection (LAB-3893)
 #
-# Lives here, not in setup-live-targets.sh, because three callers need the same
+# Lives here, not in setup-live-targets.sh, because four callers need the same
 # answer to "is there a REAL browser on this host": setup-live-targets.sh
 # (preflight gate), install-chrome.sh (idempotency — skip the install when a
-# runnable browser already exists), and preflight-selftest.sh (regression
-# coverage). A second copy of the probe would drift from the first.
+# runnable browser already exists), run-live-tests.sh (chrome_available, which
+# decides whether the rod-backed targets execute or SKIP), and
+# preflight-selftest.sh (regression coverage). A second copy of the probe would
+# drift from the first.
 # ──────────────────────────────────────────────────────────────
 
 # Candidate browsers, in priority order. Overridable by tests.
@@ -77,6 +79,13 @@ CHROME_CANDIDATES=(
 # unvalidated value reaches timeout's OPTION position, so a leading dash would
 # be parsed as a flag rather than a duration. Anything that is not a bare
 # decimal falls back to the default with a warning.
+# Set once the budget has been validated and any warning emitted, so the
+# diagnostic is printed once per run rather than once per candidate probed.
+# detect_chrome_binary calls chrome_runnable in a loop over CHROME_CANDIDATES,
+# so a single bad CHROME_PROBE_TIMEOUT used to print the same warning up to
+# nine times for one misconfiguration.
+_CHROME_BUDGET_WARNED=""
+
 chrome_runnable() {
     local t="" budget="${CHROME_PROBE_TIMEOUT:-2}" stripped
     # Two rejections, and they are separate questions:
@@ -93,14 +102,20 @@ chrome_runnable() {
     stripped=${budget//[0.]/}
     case "$budget" in
         ''|*[!0-9.]*|*.*.*|.)
-            printf 'CHROME_PROBE_TIMEOUT=%s is not a usable timeout (positive seconds); using 2s.\n' \
-                "$budget" >&2
+            if [ -z "${_CHROME_BUDGET_WARNED}" ]; then
+                printf 'CHROME_PROBE_TIMEOUT=%s is not a usable timeout (positive seconds); using 2s.\n' \
+                    "$budget" >&2
+                _CHROME_BUDGET_WARNED=1
+            fi
             budget=2
             ;;
         *)  if [ -z "${stripped}" ]; then
                 # Nothing but zeros and dots remain -> numerically zero.
-                printf 'CHROME_PROBE_TIMEOUT=%s is zero, which disables the timeout; using 2s.\n' \
-                    "$budget" >&2
+                if [ -z "${_CHROME_BUDGET_WARNED}" ]; then
+                    printf 'CHROME_PROBE_TIMEOUT=%s is zero, which disables the timeout; using 2s.\n' \
+                        "$budget" >&2
+                    _CHROME_BUDGET_WARNED=1
+                fi
                 budget=2
             fi
             ;;

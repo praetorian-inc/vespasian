@@ -3966,6 +3966,30 @@ print_summary() {
     if [ $total_fail -gt 0 ]; then
         return 1
     fi
+
+    # A run that EXECUTED NOTHING is not a pass (AC3).
+    #
+    # The only failure condition used to be `total_fail -gt 0`, so a live group
+    # whose rod-backed targets all SKIPped — three SKIPs, zero passes — returned
+    # 0 and CI went green. That is precisely the state AC3 forbids: "rod-backed
+    # targets, including no-download, execute rather than SKIP". Losing Chrome on
+    # the runner, or regressing chrome_available, would therefore make the
+    # headline criterion silently untrue with nothing red to show for it, and it
+    # swallows the no-download half of AC4 along with it.
+    #
+    # Skips remain legitimate when something else in the same run actually ran;
+    # this only fires when the whole selection was skipped. A developer
+    # deliberately running the live group on a browserless box can opt out.
+    if [ $total_pass -eq 0 ] && [ $total_skip -gt 0 ]; then
+        if [ -n "${LIVE_TESTS_ALLOW_NO_EXECUTION:-}" ]; then
+            log_warn "Every selected target was skipped; LIVE_TESTS_ALLOW_NO_EXECUTION is set, treating as success."
+            return 0
+        fi
+        log_fail "Every selected target was skipped — nothing executed, so this run proves nothing."
+        log_info "  A rod-backed target SKIPs when no runnable browser is found: run test/install-chrome.sh,"
+        log_info "  or set LIVE_TESTS_ALLOW_NO_EXECUTION=1 to accept an all-skipped run."
+        return 1
+    fi
     return 0
 }
 
