@@ -35,7 +35,12 @@ SCRIPT_UNDER_TEST="${THIS_DIR}/setup-live-targets.sh"
 # Isolate all PID/state files in a temp dir so we never touch the real test/
 # tree. This uses the dedicated state-dir override, NOT SCRIPT_DIR — the script
 # always resolves SCRIPT_DIR from its own location and sources common.sh there.
-STATE_DIR="$(mktemp -d)"
+# SEC-BE-006: pin the parent instead of inheriting $TMPDIR. This tree holds
+# executable fixtures that get PATH-prepended and RUN, so an inherited TMPDIR
+# pointing at a non-sticky directory a second local user can write to would let
+# them rename it away between creation and use and choose the binaries this suite
+# executes. /tmp's sticky bit is the property being relied on.
+STATE_DIR="$(TMPDIR=/tmp mktemp -d)"
 
 # Track every PID we spawn so cleanup is guaranteed even if an assertion fails.
 SPAWNED_PIDS=()
@@ -525,8 +530,8 @@ echo "Test 18b: each target's own source reads BIND_HOST (SEC-BE-015 / TEST-007)
 # PR actually changed were held to a weaker one than the target it did not.
 target_reads_bind_host() {
     # $1 = repo-relative source, $2 = the read it must contain,
-    # $3 = the loopback default it must fall back to
-    local src="${SCRIPT_DIR}/$1" needle="$2" default_needle="$3"
+    # $3 = the collapsed resolution STRUCTURE it must have (see TEST-014 below)
+    local src="${SCRIPT_DIR}/$1" needle="$2" struct_needle="$3"
     if [ ! -f "$src" ]; then
         fail "$1 not found — cannot verify it honours BIND_HOST"
         fail "$1 not found — cannot verify its loopback default"
@@ -537,16 +542,41 @@ target_reads_bind_host() {
     else
         fail "$1 no longer reads BIND_HOST — the shell seam is inert and the target binds every interface again"
     fi
-    if grep -qF -- "$default_needle" "$src"; then
+    # TEST-014: match the whole resolution STRUCTURE, comment-stripped and
+    # whitespace-collapsed, not just the loopback literal.
+    #
+    # A literal grep for `host = "127.0.0.1"` catches the obvious regression
+    # (rewriting the literal to "0.0.0.0" — measured: 72 passed / 4 FAILED, exit 1)
+    # but not a LOGIC INVERSION, because the inversion leaves the literal exactly
+    # where it was. Measured: flipping `if host == ""` to `if host != ""` in all
+    # three Go targets and dropping the `host` argument from server.js's
+    # `listen(port, host, …)` left this suite at 76 passed / 0 failed, exit 0 while
+    # printing "defaults to loopback" for every target — and the mutated rest-api
+    # genuinely logged `listening on :18777`, i.e. every interface, which is the
+    # precise SEC-BE-015 exposure these assertions exist to prevent.
+    #
+    # Source-level rather than socket-level for the reason given above: the
+    # preflight-selftest job that runs this suite installs no Go and no Node, so a
+    # test that built and started a target would skip in exactly the environment
+    # the guard is for. Pinning the structure is what a source check can honestly
+    # do; it fails on both the literal swap and the inversion.
+    local collapsed
+    collapsed=$(grep -vE '^[[:space:]]*(//|#)' "$src" | tr '\n' ' ' | tr -s '[:space:]' ' ')
+    if printf '%s' "$collapsed" | grep -qF -- "$struct_needle"; then
         ok "$1 defaults to loopback when BIND_HOST is unset"
     else
-        fail "$1 no longer defaults to loopback when BIND_HOST is unset — the unset path, which is the default, exposes it on every interface"
+        fail "$1 no longer defaults to loopback when BIND_HOST is unset — the unset path, which is the default, exposes it on every interface (structure expected: ${struct_needle})"
     fi
 }
-target_reads_bind_host "rest-api/main.go"        'os.Getenv("BIND_HOST")'  'host = "127.0.0.1"'
-target_reads_bind_host "soap-service/main.go"    'os.Getenv("BIND_HOST")'  'host = "127.0.0.1"'
-target_reads_bind_host "concat-spa/main.go"      'os.Getenv("BIND_HOST")'  'host = "127.0.0.1"'
-target_reads_bind_host "graphql-server/server.js" 'process.env.BIND_HOST'  'process.env.BIND_HOST || "127.0.0.1"'
+# $3 is the collapsed STRUCTURE the resolution must have, not a bare literal: the
+# guard, its body, and (for Go) the JoinHostPort that consumes the result.
+target_reads_bind_host "rest-api/main.go"        'os.Getenv("BIND_HOST")'  'if host == "" { host = "127.0.0.1" } addr := net.JoinHostPort(host, port)'
+target_reads_bind_host "soap-service/main.go"    'os.Getenv("BIND_HOST")'  'if host == "" { host = "127.0.0.1" } addr := net.JoinHostPort(host, port)'
+target_reads_bind_host "concat-spa/main.go"      'os.Getenv("BIND_HOST")'  'if host == "" { host = "127.0.0.1" } addr := net.JoinHostPort(host, port)'
+# For the Node target the equivalent structure is the defaulting expression AND the
+# listen() call that actually PASSES host — dropping that argument is the pre-PR
+# shape and binds every interface while the defaulting line sits there untouched.
+target_reads_bind_host "graphql-server/server.js" 'process.env.BIND_HOST'  'const host = process.env.BIND_HOST || "127.0.0.1"; httpServer.listen(port, host,'
 # And that none of them has drifted back to a wildcard bind.
 for src in rest-api/main.go soap-service/main.go concat-spa/main.go; do
     if grep -qE '^[[:space:]]*addr := ":" \+ port' "${SCRIPT_DIR}/${src}"; then
@@ -673,7 +703,7 @@ if { command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; 
     # A minimal PATH containing only the tools this arm (plus sourcing) needs —
     # NOT grpcurl or nc — so the third arm is exercised regardless of what is
     # actually installed on the host running this suite.
-    mini_bin="$(mktemp -d)"
+    mini_bin="$(TMPDIR=/tmp mktemp -d)"
     t_bin="$(command -v timeout || command -v gtimeout)"
     ln -s "$t_bin" "${mini_bin}/$(basename "$t_bin")"
     ln -s "$(command -v dirname)" "${mini_bin}/dirname"
@@ -839,10 +869,28 @@ if [ -n "${trap_at}" ] && [ -n "${firststart_at}" ] && [ "${trap_at}" -lt "${fir
 else
     fail "the teardown_on_failure trap is armed after the first service start — an early failure leaks listeners"
 fi
+# TEST-015: reworded, because the old text ("AFTER write_config succeeds") claimed
+# more than a line-number comparison can know. This assertion compares POSITIONS
+# inside main()'s body; it says nothing about execution or exit status. Measured:
+# wrapping main()'s write_config call in a never-true conditional left the suite at
+# 76/0, exit 0 while still printing "cleared only AFTER write_config succeeds" —
+# with write_config unreachable and never running at all.
 if [ -n "${disarm_at}" ] && [ -n "${writecfg_at}" ] && [ "${disarm_at}" -gt "${writecfg_at}" ]; then
-    ok "SETUP_IN_PROGRESS=false is cleared only AFTER write_config succeeds"
+    ok "SETUP_IN_PROGRESS=false is positioned AFTER main()'s write_config call"
 else
     fail "SETUP_IN_PROGRESS=false is cleared before write_config completes — the trap is a no-op for the whole start span, restoring the TEST-022 regression"
+fi
+# And the claim the position comparison cannot make: that the call is REACHED.
+# main()'s statements sit at one level of indentation; a call nested deeper is
+# inside a conditional or loop and may never run, which is exactly the mutation
+# above. Pinning the indentation is the cheapest honest check available to a
+# source-level test, and it is the shape the sibling assertions already rely on.
+writecfg_indent=$(printf '%s\n' "${main_body_24b}" | grep -E '^[[:space:]]*write_config ' | head -1 | sed -E 's/[^[:space:]].*//' | awk '{ print length }')
+start_indent=$(printf '%s\n' "${main_body_24b}" | grep -E '^[[:space:]]*SETUP_IN_PROGRESS=true$' | head -1 | sed -E 's/[^[:space:]].*//' | awk '{ print length }')
+if [ -n "${writecfg_indent}" ] && [ -n "${start_indent}" ] && [ "${writecfg_indent}" -eq "${start_indent}" ]; then
+    ok "main()'s write_config call is unconditional (same nesting depth as the trap arm)"
+else
+    fail "main()'s write_config call is nested deeper than main()'s own statements (indent ${writecfg_indent} vs ${start_indent}) — it sits inside a conditional and may never run, so the ordering claim above is about a call that does not happen"
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────
@@ -870,7 +918,7 @@ echo "────────────────────────�
 # timeout+dirname+sleep 2, stat 2. A degraded host still totals
 # EXPECTED_ASSERTIONS and stays green, while a DELETED assertion is now caught on
 # every host rather than only on a fully-equipped one.
-EXPECTED_ASSERTIONS=76
+EXPECTED_ASSERTIONS=77
 if [ "$((PASS + FAIL + SKIP_CREDIT))" -ne "${EXPECTED_ASSERTIONS}" ]; then
     echo "setup-live-targets_test: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (Passed+Failed+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A Test block was added or removed without updating EXPECTED_ASSERTIONS."

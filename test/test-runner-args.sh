@@ -41,7 +41,12 @@ skip() { SKIP=$((SKIP + 1)); SKIP_CREDIT=$((SKIP_CREDIT + ${2:-0})); echo "  SKI
 # because new_tmp is called via command substitution ($(new_tmp)), whose
 # subshell would discard any array registration; a filesystem dir created in the
 # parent and torn down by the trap has no such scoping problem.
-TMPDIR_T="$(mktemp -d)"
+# SEC-BE-006: pin the parent instead of inheriting $TMPDIR. This tree holds
+# executable fixtures that get PATH-prepended and RUN, so an inherited TMPDIR
+# pointing at a non-sticky directory a second local user can write to would let
+# them rename it away between creation and use and choose the binaries this suite
+# executes. /tmp's sticky bit is the property being relied on.
+TMPDIR_T="$(TMPDIR=/tmp mktemp -d)"
 # The completion sentinel is folded into THIS trap rather than registered as a
 # second one: bash keeps a single EXIT trap, so a separate `trap ... EXIT`
 # declared earlier is silently REPLACED by this one and never fires. That is
@@ -686,15 +691,38 @@ echo "=== Browser probe shared with common.sh ==="
 # is above — a sed range over the source, not the whole runner (which calls
 # `main "$@"` unguarded) — and driving it against a fixture CHROME_CANDIDATES.
 chrome_avail_body=$(awk '/^chrome_available\(\) \{/,/^\}/' "$RUNNER")
-if printf '%s' "$chrome_avail_body" | grep -q 'detect_chrome_binary'; then
+# TEST-016: strip comment lines before grepping, the same way the workflow
+# step-list guards below strip them. Grepping the raw body was a false
+# certification: re-implementing the probe inline and leaving
+# "previously delegated to detect_chrome_binary" in a comment kept this printing
+# "chrome_available delegates to …" while the delegation was gone. Mutation-proven
+# — the inline re-implementation left the suite at 112/0, exit 0, and the three
+# BEHAVIOURAL polarity checks below passed too, because an inline copy reproduces
+# the shared probe's behaviour on these fixtures while no longer BEING it. That is
+# what makes the comment strip load-bearing rather than cosmetic: behaviour alone
+# cannot distinguish delegation from duplication.
+chrome_avail_code=$(printf '%s\n' "$chrome_avail_body" | grep -vE '^[[:space:]]*#')
+if printf '%s' "$chrome_avail_code" | grep -q 'detect_chrome_binary'; then
     pass "chrome_available delegates to common.sh's detect_chrome_binary"
 else
     fail "chrome_available no longer uses detect_chrome_binary — the runner's browser probe has drifted from the shared one"
 fi
-if printf '%s' "$chrome_avail_body" | grep -qE 'command -v (google-chrome|chromium|chromium-browser)'; then
-    fail "chrome_available reintroduced a presence-only 'command -v' probe (snap stubs pass it)"
+# Broadened past `command -v`: `type -P` and `which` resolve a name exactly the
+# same way, so pinning one spelling let the other reintroduce the presence-only
+# probe this check exists to refuse.
+if printf '%s' "$chrome_avail_code" | grep -qE '(command -v|type -P|which)[[:space:]]+.*(google-chrome|chromium|chromium-browser)'; then
+    fail "chrome_available reintroduced a presence-only probe (command -v/type -P/which — snap stubs pass it)"
 else
     pass "chrome_available carries no presence-only browser check"
+fi
+# And that it still resolves candidates from the SHARED list rather than a local
+# one. An inline loop over its own hardcoded names is drift even when it delegates
+# the runnability probe, because the two scripts then disagree about WHICH
+# browsers to consider.
+if printf '%s' "$chrome_avail_code" | grep -qE 'CHROME_CANDIDATES'; then
+    fail "chrome_available iterates CHROME_CANDIDATES itself — resolution belongs to detect_chrome_binary, not the runner"
+else
+    pass "chrome_available does not re-implement candidate resolution"
 fi
 
 # shellcheck source=common.sh
@@ -1538,12 +1566,54 @@ if [[ -f "$WORKFLOW" ]]; then
         # stub-config step ahead of "Run offline tests" would silently revert
         # that without tripping either check above, since the offline run
         # step itself is untouched.
+        # TEST-018: match the SCRIPT that writes the config, not just the config
+        # FILENAME. Grepping only for `.live-test-config` was a false negative:
+        # `setup-live-targets.sh` is what writes that file, and a `run:
+        # ./test/setup-live-targets.sh` step contains the filename nowhere, so
+        # inserting one ahead of the offline run reverted AC3 while this
+        # assertion still printed "no-config path preserved". Mutation-proven —
+        # with the filename-only grep, adding a setup step before the offline run
+        # left the suite at 112/0, exit 0.
         before_offline=$(printf '%s\n' "$test_runlines" | sed -n '1,/Run offline tests/p' | sed '$d')
-        if printf '%s\n' "$before_offline" | grep -q '\.live-test-config'; then
-            fail "test job writes a config file before the offline run — the no-config offline path (AC3) is no longer exercised"
+        if printf '%s\n' "$before_offline" | grep -qE '\.live-test-config|run:[[:space:]]*(\./|bash )?test/setup-live-targets\.sh'; then
+            fail "test job writes a config file (or runs setup-live-targets.sh) before the offline run — the no-config offline path (AC3) is no longer exercised"
         else
             pass "test job writes no config before the offline run (AC3 no-config path preserved)"
         fi
+
+        # TEST-017: the same three neutering shapes the un-gated job is held to.
+        # This job is where the entire offline+live suite actually executes, and
+        # it had NONE of these checks: the four assertions above prove the run
+        # steps are PRESENT, not that a failure from them can still fail CI.
+        # Mutation-proven — `continue-on-error: true` on the offline run step, and
+        # separately a trailing `|| true` on its command, each left this suite at
+        # 112/0, exit 0.
+        if printf '%s\n' "$test_runlines" | grep -qE '^[[:space:]]*continue-on-error:[[:space:]]*true'; then
+            fail "test job sets continue-on-error: true — a failing suite would not fail CI"
+        else
+            pass "test job has no continue-on-error: true"
+        fi
+        if printf '%s\n' "$test_runlines" | grep -qE '\|\|[[:space:]]*(true|exit 0|:)([[:space:]]|$)'; then
+            fail "test job neuters a step with a trailing '|| true'/'|| exit 0'/'|| :' — a failing suite would not fail CI"
+        else
+            pass "test job has no trailing '|| true'/'|| exit 0'/'|| :' step neutering"
+        fi
+        # Unlike the un-gated job, this one legitimately carries `if:` — a
+        # job-level label gate and `if: always()` on the upload/teardown steps —
+        # so a blanket ban would be wrong. Pin the property that actually
+        # matters instead: the two steps that RUN the suites are unconditional.
+        # An `if: false` (or any condition) on either is the neutering this
+        # catches, and it is invisible to the three checks above.
+        for step in 'Run offline tests' 'Run live tests'; do
+            step_if=$(printf '%s\n' "$test_runlines" \
+                | sed -n "/- name: ${step}\$/,/- name: /p" \
+                | grep -cE '^[[:space:]]*if:' || true)
+            if [[ "$step_if" -eq 0 ]]; then
+                pass "test job's '${step}' step is unconditional (no if:)"
+            else
+                fail "test job's '${step}' step carries an if: — the suite can be silently skipped while CI stays green"
+            fi
+        done
     fi
 else
     fail "live-tests.yml not found at $WORKFLOW (test-job wiring assertions vacuous)"
@@ -1605,7 +1675,7 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # arm fires. The pin itself stays UNCONDITIONAL — gating it on "no skips", the
 # way the sibling suite used to, is what let a deletion hide behind an unrelated
 # ambient condition.
-EXPECTED_ASSERTIONS=112
+EXPECTED_ASSERTIONS=117
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."

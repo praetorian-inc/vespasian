@@ -528,6 +528,32 @@ verify_apt_origin() {
         log_fail "google-chrome-stable was satisfied from an unexpected origin: ${origin:-unknown} (expected dl.google.com)" >&2
         return 1
     fi
+    # SEC-BE-002: the host alone is not the whole property. Two gaps it left:
+    #
+    #   * SCHEME. `http://dl.google.com/...` passed, because only the text after
+    #     `://` was compared. A plaintext apt transport for the right host is still
+    #     a downgrade — the package signature is checked either way, but the
+    #     metadata, and therefore the version apt selects, become
+    #     attacker-influenceable in transit.
+    #
+    #   * WHICH SOURCE. A pre-existing `google-chrome.sources` on the host, verified
+    #     by a DIFFERENT keyring, satisfies both the host and the scheme — so the
+    #     fingerprint pin this script goes to some trouble to establish became
+    #     ornamental on that path. Requiring the origin to be the URL this run
+    #     pinned ties the two together.
+    case "$origin" in
+        https://*) ;;
+        *)
+            log_fail "google-chrome-stable was satisfied over a non-https transport: ${origin} (expected an https:// source)" >&2
+            return 1
+            ;;
+    esac
+    # GOOGLE_APT_URL is the source this run wired up; apt reports the origin with the
+    # repo path appended, so compare by prefix rather than for equality.
+    if [ "${origin#"${GOOGLE_APT_URL%/}"}" = "$origin" ]; then
+        log_fail "google-chrome-stable was satisfied from ${origin}, which is not the source this run pinned (${GOOGLE_APT_URL}) — a pre-existing Google apt source verified by another keyring would make the fingerprint pin ornamental" >&2
+        return 1
+    fi
 }
 
 # The package's postinst re-adds Google's permanent apt source unless
@@ -648,7 +674,14 @@ remove_phone_home() {
 in_container() {
     [ -f "${TEST_ROOT}/.dockerenv" ] && return 0
     [ -f "${TEST_ROOT}/run/.containerenv" ] && return 0
-    [ -n "${REMOTE_CONTAINERS:-}" ] && return 0
+    # SEC-BE-003: validate this the way $container is validated below rather than
+    # accepting any non-empty value. VS Code Dev Containers sets it to "true"; a
+    # value of "false" (or an unrelated tool's same-named variable) previously won
+    # the destructive branch — remove_phone_home plus the apt-lists wipe — on a
+    # machine that is not a container at all, because only emptiness was tested.
+    case "${REMOTE_CONTAINERS:-}" in
+        true | True | TRUE | 1) return 0 ;;
+    esac
     # $container is validated against known runtime names (SEC-BE-004), not
     # accepted as any non-empty value: it is a bare, lowercase,
     # un-namespaced systemd convention -- far more collidable than the two
@@ -801,7 +834,13 @@ main() {
 
     # The scratch dir and its teardown are set up BEFORE the idempotency check,
     # because that path now also removes phone-home artifacts and so needs both.
-    SCRATCH_DIR="$(mktemp -d)"
+    # SEC-BE-004: pin the parent instead of inheriting $TMPDIR. Every file staged
+    # here is subsequently `install`-ed into a root-owned location, so a TMPDIR
+    # pointing at a non-sticky directory another local user can write to would let
+    # them swap the staged apt source or keyring between staging and install. /tmp's
+    # sticky bit is the property being relied on, and this script already assumes it
+    # for LOCK_FILE.
+    SCRATCH_DIR="$(TMPDIR=/tmp mktemp -d)"
     # Single-quoted trap bodies: they are re-parsed as commands when the trap
     # fires, so interpolating the path here would let a quote in $TMPDIR (which
     # mktemp honours) break out into the trap body. Expanding $SCRATCH_DIR at
@@ -1112,6 +1151,25 @@ main() {
 # then `install -m 0644`, matching how the keyring is written: the mode is
 # stated at the call site instead of being left to the caller's umask, and the
 # file lands atomically. `tee` did neither.
+# SEC-BE-005: run `<browser> --version` under the same bound chrome_runnable uses,
+# so a binary that hangs on --version cannot wedge the tail of a provisioning run.
+# Reuses CHROME_PROBE_TIMEOUT (common.sh) rather than introducing a second knob, and
+# degrades to an unbounded call only where neither timeout nor gtimeout exists — the
+# same documented degrade path chrome_runnable takes on stock macOS.
+_bounded_probe() {
+    local bin="$1" t="" budget="${CHROME_PROBE_TIMEOUT:-2}"
+    if command -v timeout >/dev/null 2>&1; then
+        t=timeout
+    elif command -v gtimeout >/dev/null 2>&1; then
+        t=gtimeout
+    fi
+    if [ -n "$t" ]; then
+        "$t" "$budget" "$bin" --version 2>/dev/null
+    else
+        "$bin" --version 2>/dev/null
+    fi
+}
+
 record_chrome_version() {
     local version="$1" staged_version="${SCRATCH_DIR}/chrome-version"
     # -m 0755 on the parent: unlike suppress_permanent_repo's /etc/default
@@ -1139,7 +1197,11 @@ verify_install() {
     # Log the exact version: this script tracks stable rather than pinning, so
     # the version string is the only record of what actually landed.
     local version
-    version="$("${installed}" --version 2>/dev/null || echo 'version unknown')"
+    # SEC-BE-005: bound this exec the way chrome_runnable bounds its own probe.
+    # detect_chrome_binary only reached this point by running the binary under a
+    # timeout; re-running it unbounded here reintroduces the hang that bound guards
+    # against, at the very end of a root provisioning run and with no diagnostic.
+    version="$(_bounded_probe "${installed}" || echo 'version unknown')"
     log_ok "Browser: ${installed} (${version})"
 
     # Only when this run actually installed something. On the browser-already-

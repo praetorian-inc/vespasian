@@ -181,12 +181,15 @@ jobs:
           set -euo pipefail
           # shellcheck source=test/common.sh
           . ./test/common.sh
-          # QUAL-001: check the exit status, don't just take stdout. On failure
-          # detect_chrome_binary returns non-zero with an EMPTY stdout, and
-          # `bin=$(...)` swallows that under `set -e` because a failing command
-          # substitution in an assignment does not trip errexit. The next line
-          # then ran `"" --headless …`, whose "command not found" is a far worse
-          # diagnostic than the real one.
+          # QUAL-001: check the exit status explicitly, don't just take stdout.
+          # On failure detect_chrome_binary returns non-zero with an EMPTY stdout.
+          # The `|| { … }` is what makes that failure actionable: without it the
+          # next line ran `"" --headless …`, whose "command not found" is a far
+          # worse diagnostic than the real one. (A bare `bin=$(...)` would in fact
+          # trip errexit here — a plain assignment takes the substitution's exit
+          # status; it is a `local`/`declare`/`export` DECLARATION that swallows
+          # it — but aborting with no message is still the wrong outcome, which is
+          # why the explicit handler stays.)
           bin=$(detect_chrome_binary) || {
             echo "detect_chrome_binary found no runnable browser after install" >&2
             exit 1

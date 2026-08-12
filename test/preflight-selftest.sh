@@ -61,7 +61,7 @@ skip() {
 #
 # Update deliberately when adding or removing an assertion, and update the
 # matching skip() credit if the change touches an environment-gated block.
-EXPECTED_ASSERTIONS=73
+EXPECTED_ASSERTIONS=78
 
 assert_eq() {
     local desc=$1 expected=$2 actual=$3
@@ -75,7 +75,12 @@ assert_eq() {
 }
 
 # ── Fixture setup ──────────────────────────────────────────────
-FIXTURE_DIR=$(mktemp -d)
+# SEC-BE-006: pin the parent instead of inheriting $TMPDIR. This tree holds
+# executable fixtures that get PATH-prepended and RUN, so an inherited TMPDIR
+# pointing at a non-sticky directory a second local user can write to would let
+# them rename it away between creation and use and choose the binaries this suite
+# executes. /tmp's sticky bit is the property being relied on.
+FIXTURE_DIR=$(TMPDIR=/tmp mktemp -d)
 # INT/TERM as well as EXIT: a bash signal handler returns to the interrupted
 # code, so without an explicit exit a Ctrl-C left the fixture tree in $TMPDIR.
 #
@@ -291,6 +296,77 @@ else
     fail_count=$((fail_count + 1))
 fi
 
+# ── Case e2: EVERY member of the snap-hint glob set (TEST-009) ──
+#
+# Cases b and e between them cover one glob member (*/snap/*) and the `*)` arm.
+# The set is `*/snap/*|*/chromium-browser|*/chromium`, so the other two members
+# were unasserted — mutation-proven: reducing the arm to `*/snap/*)` alone left
+# this suite at 73/0/0, exit 0 with both case b and case e still green.
+#
+# That is not a cosmetic gap. `/usr/bin/chromium-browser` IS the Ubuntu snap
+# launcher stub named in LAB-5064's own Evidence block and in its parent
+# LAB-3893, and it does NOT live under /snap/. Losing that member sends a
+# developer hitting the exact originating symptom to the generic "check
+# permissions, missing shared libraries" hint instead of the actionable snap
+# diagnosis — reintroducing the confusion LAB-3893 was filed to remove.
+#
+# Derived from the source, not hardcoded, so the test cannot drift from the arm
+# it guards.
+snap_glob=$(grep -oE '^\s+\*/snap/\*[^)]*\)' "${SETUP_SCRIPT}" | head -1 | tr -d ' )')
+if [ -z "${snap_glob}" ]; then
+    echo "FAIL: case e2: could not extract the snap-hint glob set from ${SETUP_SCRIPT} — the per-member assertions below are vacuous"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS: case e2: snap-hint glob set extracted from the source"
+    pass_count=$((pass_count + 1))
+    # Build a broken fixture whose PATH matches each glob member in turn, and
+    # require the snap hint for every one of them.
+    e2_missing=""
+    IFS='|' read -r -a e2_globs <<<"${snap_glob}"
+    for e2_glob in "${e2_globs[@]}"; do
+        # Turn the glob into a concrete path: */snap/* -> <fix>/snap/x,
+        # */chromium-browser -> <fix>/e2/chromium-browser, etc.
+        case "${e2_glob}" in
+            '*/snap/*') e2_dir="${FIXTURE_DIR}/e2-snap/snap"; e2_name="anything" ;;
+            '*/'*)      e2_dir="${FIXTURE_DIR}/e2-${e2_glob##*/}"; e2_name="${e2_glob##*/}" ;;
+            *)          continue ;;
+        esac
+        mkdir -p "${e2_dir}"
+        e2_bin="${e2_dir}/${e2_name}"
+        printf '#!/bin/bash\necho "stub" >&2\nexit 1\n' > "${e2_bin}"
+        chmod +x "${e2_bin}"
+        e2_out=$(
+            (
+                # shellcheck source=setup-live-targets.sh
+                source "${SETUP_SCRIPT}"
+                # shellcheck disable=SC2034  # consumed by detect_chrome_binary
+                CHROME_CANDIDATES=("${e2_bin}")
+                set +e
+                check_prerequisites 2>&1
+            )
+        ) || true
+        printf '%s' "${e2_out}" | grep -q "snap stub" || e2_missing="${e2_missing} ${e2_glob}"
+    done
+    if [ -n "${e2_missing}" ]; then
+        echo "FAIL: case e2: glob member(s) no longer produce the snap-stub hint:${e2_missing}"
+        fail_count=$((fail_count + 1))
+    else
+        echo "PASS: case e2: every snap-hint glob member (${snap_glob}) produces the snap-stub hint"
+        pass_count=$((pass_count + 1))
+    fi
+    # Pin the member count too: deriving the set from the source means a deletion
+    # shrinks the expectation and the evidence together, so the loop above would
+    # pass vacuously on whatever survived.
+    e2_count=${#e2_globs[@]}
+    if [ "${e2_count}" -ge 3 ]; then
+        echo "PASS: case e2: the snap-hint glob set still carries at least 3 members"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: case e2: the snap-hint glob set shrank to ${e2_count} member(s) (expected >= 3) — /usr/bin/chromium-browser, the LAB-3893 snap stub, may no longer be diagnosed"
+        fail_count=$((fail_count + 1))
+    fi
+fi
+
 # ── Case f: no timeout/gtimeout on PATH → bare-probe fallback ──
 # Exercises chrome_runnable's degrade path (stock macOS ships neither
 # timeout nor gtimeout). Restrict PATH to the fixture bin dir — which holds
@@ -313,6 +389,39 @@ rc_f=$(echo "${result}" | sed -n '1p')
 out_f=$(echo "${result}" | sed -n '2p')
 assert_eq "case f: no-timeout fallback still detects a working browser (rc 0)" "0" "${rc_f}"
 assert_eq "case f: no-timeout fallback returns the working browser path" "${WORKING_BROWSER}" "${out_f}"
+
+# ── Case f0: the fallback REJECTS a broken browser (TEST-010) ───
+#
+# Case f above pins the fallback only in the direction where the browser works,
+# so an accept-all fallback was indistinguishable from a correct one.
+# Mutation-proven: replacing chrome_runnable's `"$1" --version >/dev/null 2>&1`
+# with `return 0` left this suite at 73/0/0, exit 0. On a host with neither
+# timeout nor gtimeout — stock macOS, the very platform the fallback exists for —
+# that means a snap stub or an otherwise broken browser is reported RUNNABLE,
+# which is precisely the LAB-3893 false positive this probe exists to prevent.
+#
+# Both polarities are now pinned, so the fallback has to discriminate rather than
+# merely answer.
+result=$(
+    (
+        # shellcheck source=setup-live-targets.sh
+        source "${SETUP_SCRIPT}"
+        # shellcheck disable=SC2034  # consumed by detect_chrome_binary from the sourced script
+        CHROME_CANDIDATES=("${GENERIC_BROKEN}")
+        PATH="${FIXTURE_DIR}/bin"   # no timeout/gtimeout here → force the fallback
+        set +e
+        out=$(detect_chrome_binary)
+        rc=$?
+        printf '%s\n%s\n' "${rc}" "${out}"
+    )
+)
+rc_f0=$(echo "${result}" | sed -n '1p')
+out_f0=$(echo "${result}" | sed -n '2p')
+# rc 2 is detect_chrome_binary's "found a stub, nothing runnable" answer; the
+# broken fixture is the only candidate, so it must be reported as the stub rather
+# than as a working browser.
+assert_eq "case f0: no-timeout fallback REJECTS a broken browser (rc 2, not 0)" "2" "${rc_f0}"
+assert_eq "case f0: no-timeout fallback still echoes the stub path it rejected" "${GENERIC_BROKEN}" "${out_f0}"
 
 # ── Case f2: CHROME_PROBE_TIMEOUT reaches the probe budget ─────
 # chrome_runnable must honour CHROME_PROBE_TIMEOUT (a cold container mount can

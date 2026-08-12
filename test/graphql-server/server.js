@@ -85,8 +85,6 @@ const typeDefs = `#graphql
     USER
     POST
   }
-
-  union SearchItem = User | Post
 `;
 
 // Seed data (frozen) — working copies are reset on each server start

@@ -63,7 +63,7 @@ export CHROME_PROBE_TIMEOUT=2
 # pin is not meant to turn a valid environment into a red build); the trust
 # anchor's own skip is already a hard failure via trust_anchor_skips,
 # independently of this pin.
-EXPECTED_ASSERTIONS=201
+EXPECTED_ASSERTIONS=213
 
 pass_count=0
 fail_count=0
@@ -127,7 +127,34 @@ assert_contains() {
     fi
 }
 
-FIXTURE_DIR=$(mktemp -d)
+# Extract a function's body from the installer with COMMENT LINES REMOVED.
+#
+# TEST-003 / TEST-005: every source-grep assertion in this file previously ran
+# against the raw body, and a comment satisfies a grep exactly as well as the call
+# it names. Mutation-proven, twice: stripping `timeout -k 30 300` from the real
+# `apt-get update` and leaving the literal on a comment line inside main() kept the
+# suite at 201/0, exit 0 while printing "both apt-get calls are bounded"; the same
+# trick on `apt-get install` additionally made six of case u's and case v3's
+# position anchors resolve to the comment. An assertion that affirms an absent
+# control is worse than no assertion, because it is read as proof.
+#
+# One helper rather than the same two-line pipeline at five call sites: getting the
+# strip wrong at any single site silently reintroduces the whole defect class, which
+# is the failure mode this file has now hit in three consecutive review rounds.
+fn_code() {
+    awk "/^$1\\(\\) \\{/,/^\\}/" "${INSTALL_SCRIPT}" | grep -vE '^[[:space:]]*#' || true
+}
+
+# SEC-BE-001: pin the fixture tree's parent instead of inheriting $TMPDIR. This
+# directory holds ~20 stub EXECUTABLES (curl, sudo, dpkg, gpg, apt-get, browser
+# stand-ins) and every case prepends it to PATH before invoking the script under
+# test, so whatever lives at those paths runs. Under the default sticky /tmp the
+# 0700 directory mktemp creates is safe; the residual was an inherited TMPDIR
+# pointing at a non-sticky directory a second local user can write to, who could
+# then rename the tree away between creation and use and choose the binaries the
+# suite executes. Pinning /tmp closes that without validating anything, and /tmp's
+# sticky bit is the property being relied on.
+FIXTURE_DIR=$(TMPDIR=/tmp mktemp -d)
 # INT/TERM as well as EXIT, mirroring install-chrome.sh: a bash signal handler
 # returns to the interrupted code, so without an explicit exit a Ctrl-C left the
 # fixture tree behind in $TMPDIR. Exiting from the handler routes through EXIT so
@@ -362,7 +389,7 @@ fi
 # security control is worse than no assertion, because it is read as proof.
 # `|| true` guards the extraction so an empty match FAILS the check below rather
 # than aborting the suite under its own `set -euo pipefail`.
-key_fn_body_f=$(awk '/^install_pinned_key\(\) \{/,/^\}/' "${INSTALL_SCRIPT}" || true)
+key_fn_body_f=$(fn_code install_pinned_key)
 if printf '%s' "${key_fn_body_f}" \
     | grep -E '^[[:space:]]*(if ! )?curl ' \
     | grep -qF -- "--proto '=https' --proto-redir '=https'"; then
@@ -398,7 +425,7 @@ fi
 # running inside main(). `|| true` guards the assignment for the same reason
 # case p's does -- an empty match must FAIL the assertions below, not abort
 # the suite under this file's own `set -euo pipefail`.
-main_body_f5=$(awk '/^main\(\) \{/,/^\}/' "${INSTALL_SCRIPT}" || true)
+main_body_f5=$(fn_code main)
 if printf '%s' "${main_body_f5}" | grep -qE '\$SUDO timeout -k 30 300 apt-get update -qq -o DPkg::Lock::Timeout=120' \
     && printf '%s' "${main_body_f5}" | grep -qE '\$SUDO timeout -k 30 900 apt-get install ' \
     && printf '%s' "${main_body_f5}" | grep -qF -- '-o DPkg::Lock::Timeout=120 google-chrome-stable'; then
@@ -619,6 +646,61 @@ assert_eq "case h: REMOTE_CONTAINERS set means container" \
     "0" "$(run_in_container "${FIXTURE_DIR}/root-host" "true" "")"
 assert_eq "case h: \$container set means container (TEST-010)" \
     "0" "$(run_in_container "${FIXTURE_DIR}/root-host" "" "podman")"
+# TEST-004: every name in the allowlist, not just one. Pinning `podman` alone left
+# the other twelve untested — mutation-proven: reducing the case arm to
+# `docker | podman)` deleted eleven runtime names and the suite stayed at 201/0,
+# exit 0. That matters because SEC-BE-004's own rationale names buildah, kaniko,
+# containerd and crio as the reason the allowlist exists, so losing them silently
+# is losing the fix. Derived from the source rather than hardcoded here: a
+# hand-copied list in the test drifts from the one in the script, which is the
+# failure mode this assertion is meant to prevent.
+h_names=$(fn_code in_container \
+    | sed -n '/case "\${container:-}" in/,/esac/p' \
+    | grep -oE '[a-z][a-z0-9-]+' \
+    | grep -vE '^(case|container|esac|return|in)$' | sort -u)
+if [ -z "${h_names}" ]; then
+    echo "FAIL: case h: could not extract in_container's runtime-name allowlist — the per-name assertions below are vacuous"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS: case h: in_container's runtime-name allowlist extracted from the source"
+    pass_count=$((pass_count + 1))
+    h_unmatched=""
+    for h_name in ${h_names}; do
+        [ "$(run_in_container "${FIXTURE_DIR}/root-host" "" "${h_name}")" = "0" ] \
+            || h_unmatched="${h_unmatched} ${h_name}"
+    done
+    if [ -n "${h_unmatched}" ]; then
+        echo "FAIL: case h: \$container value(s) in the allowlist NOT treated as a container:${h_unmatched}"
+        fail_count=$((fail_count + 1))
+    else
+        h_count=$(printf '%s\n' ${h_names} | grep -c .)
+        echo "PASS: case h: all ${h_count} allowlisted \$container runtime names are treated as a container"
+        pass_count=$((pass_count + 1))
+    fi
+    # And the converse: the allowlist must not have shrunk. Pinned by count so a
+    # deletion is caught even though the names themselves are source-derived —
+    # without this, dropping eleven names shrinks BOTH the expectation and the
+    # evidence, and the loop above passes vacuously on the survivors.
+    if [ "$(printf '%s\n' ${h_names} | grep -c .)" -ge 13 ]; then
+        echo "PASS: case h: the runtime-name allowlist still carries at least 13 names"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: case h: in_container's runtime-name allowlist shrank to $(printf '%s\n' ${h_names} | grep -c .) names (expected >= 13) — SEC-BE-004's buildah/kaniko/containerd/crio coverage may be gone"
+        fail_count=$((fail_count + 1))
+    fi
+fi
+# SEC-BE-003: REMOTE_CONTAINERS is now validated the same way $container is,
+# instead of accepting any non-empty value. "false" is the case that mattered: a
+# tool (or a developer) setting it explicitly to false previously WON the
+# destructive branch — remove_phone_home plus the apt-lists wipe — on a machine
+# that is not a container at all, because only emptiness was tested.
+assert_eq "case h: REMOTE_CONTAINERS=false is NOT treated as a container (SEC-BE-003)" \
+    "1" "$(run_in_container "${FIXTURE_DIR}/root-host" "false" "")"
+assert_eq "case h: an unrecognized REMOTE_CONTAINERS value is NOT treated as a container" \
+    "1" "$(run_in_container "${FIXTURE_DIR}/root-host" "some-unrelated-value" "")"
+assert_eq "case h: REMOTE_CONTAINERS=1 IS treated as a container (truthy spelling)" \
+    "0" "$(run_in_container "${FIXTURE_DIR}/root-host" "1" "")"
+
 # SEC-BE-004: an unrelated tool exporting a same-named, non-empty $container
 # (a Makefile variable, a CI shim) must NOT win the destructive branch on a
 # developer's own machine -- only a recognized runtime name may.
@@ -1913,7 +1995,7 @@ assert_eq "case u: a SUCCESSFUL install (INSTALL_SUCCEEDED=1) leaves main()'s de
 # THE WHOLE SUITE at this assignment — no summary, no FAIL line. Falling back to
 # an empty string instead lets the sentinel below report the breakage as a
 # failure, which is the entire point of having a sentinel.
-main_body_u=$(awk '/^main\(\) \{/,/^\}/' "${INSTALL_SCRIPT}")
+main_body_u=$(fn_code main)
 # Not anchored to line-start any more (the apt bound wraps the call in
 # `if ! $SUDO timeout N apt-get install ...; then`, ordered $SUDO-first per
 # SEC-BE-010 so `timeout` itself runs privileged and can actually signal what
@@ -1925,7 +2007,7 @@ main_body_u=$(awk '/^main\(\) \{/,/^\}/' "${INSTALL_SCRIPT}")
 # (`timeout -k 30 900 …`, so a process ignoring the first signal still dies).
 # Without the optional group this sentinel fired — correctly and loudly, which
 # is the point of having it — the moment that flag landed.
-apt_at=$(printf '%s\n' "${main_body_u}" | grep -nE '\$SUDO timeout (-k [0-9]+ )?[0-9]+ apt-get install ' | head -1 | cut -d: -f1 || true)
+apt_at=$(printf '%s\n' "${main_body_u}" | grep -nE '^[[:space:]]*(if ! )?\$SUDO timeout (-k [0-9]+ )?[0-9]+ apt-get install ' | head -1 | cut -d: -f1 || true)
 succ_at=$(printf '%s\n' "${main_body_u}" | grep -n '^[[:space:]]*INSTALL_SUCCEEDED=1[[:space:]]*$' | head -1 | cut -d: -f1 || true)
 rm_at=""
 if [ -n "${apt_at}" ]; then
@@ -2016,7 +2098,7 @@ google-chrome-stable:
   Candidate: 999.0.0.0-1
   Version table:
      999.0.0.0-1 500
-        500 http://dl.google.com/linux/chrome/deb stable/main amd64 Packages
+        500 https://dl.google.com/linux/chrome/deb stable/main amd64 Packages
 POLICY
 POLICY_STUB
     # Simulates dpkg's postinst: the actual moment the phone-home artifacts and
@@ -2180,9 +2262,9 @@ fi
 # case u already uses for INSTALL_SUCCEEDED. A bare presence grep would pass with
 # the statements in the wrong order, which for suppression-before-install is the
 # whole property that matters.
-main_body_v3=$(awk '/^main\(\) \{/,/^\}/' "${INSTALL_SCRIPT}" || true)
+main_body_v3=$(fn_code main)
 sup_at=$(printf '%s\n' "${main_body_v3}" | grep -nE '^[[:space:]]*suppress_permanent_repo[[:space:]]*$' | head -1 | cut -d: -f1 || true)
-aptinst_at=$(printf '%s\n' "${main_body_v3}" | grep -nE '\$SUDO timeout (-k [0-9]+ )?[0-9]+ apt-get install ' | head -1 | cut -d: -f1 || true)
+aptinst_at=$(printf '%s\n' "${main_body_v3}" | grep -nE '^[[:space:]]*(if ! )?\$SUDO timeout (-k [0-9]+ )?[0-9]+ apt-get install ' | head -1 | cut -d: -f1 || true)
 origin_lines=$(printf '%s\n' "${main_body_v3}" | grep -nE '^[[:space:]]*if ! verify_apt_origin; then$' | cut -d: -f1 || true)
 origin_count=$(printf '%s' "${origin_lines}" | grep -c . || true)
 origin_post_at=""
@@ -2362,6 +2444,47 @@ assert_eq "case w: an unreadable apt policy is refused, not silently accepted" \
     "1" "$(echo "${res_w5}" | sed -n '1p')"
 assert_contains "case w: the empty-policy refusal is diagnosed as unknown" \
     "unknown" "${res_w5}"
+
+# w6 (SEC-BE-002): the RIGHT HOST over the WRONG TRANSPORT. The host comparison
+# alone accepted `http://dl.google.com/...` — a plaintext apt transport for the
+# correct host. The package signature is verified either way, but the metadata and
+# therefore the version apt selects become attacker-influenceable in transit, and
+# this script pins an https source precisely so that cannot happen. The case v
+# fixture used to encode the permissive behaviour (its stub emitted http://), which
+# is how this went unnoticed.
+res_w6=$(run_verify_apt_origin '(none)' '999.0.0.0-1' \
+    '     999.0.0.0-1 500
+        500 http://dl.google.com/linux/chrome/deb stable/main amd64 Packages' \
+    http_downgrade)
+assert_eq "case w: the right host over http:// is refused (rc 1)" \
+    "1" "$(echo "${res_w6}" | sed -n '1p')"
+assert_contains "case w: the http refusal names the transport, not just the host" \
+    "non-https transport" "${res_w6}"
+
+# w7 (SEC-BE-002): the right host AND https, but a DIFFERENT Google apt source than
+# the one this run pinned. A pre-existing `google-chrome.sources` verified by another
+# keyring satisfies both the host and the scheme, which made the fingerprint pin this
+# script establishes ornamental on that path. Tying the origin to GOOGLE_APT_URL is
+# what connects the two.
+res_w7=$(run_verify_apt_origin '(none)' '999.0.0.0-1' \
+    '     999.0.0.0-1 500
+        500 https://dl.google.com/linux/OTHER/deb stable/main amd64 Packages' \
+    foreign_google_source)
+assert_eq "case w: an https dl.google.com source that is NOT the pinned one is refused (rc 1)" \
+    "1" "$(echo "${res_w7}" | sed -n '1p')"
+assert_contains "case w: the wrong-source refusal names the source this run pinned" \
+    "not the source this run pinned" "${res_w7}"
+
+# w8 (TEST-006): a MALFORMED origin row — the shape guard's fail-closed arm. Case
+# w4b covers a priority-column collision, but nothing fed the parser a row whose
+# `$2` is not a `scheme://...` URL at all, so the guard that requires that shape was
+# never exercised in the direction where it must refuse.
+res_w8=$(run_verify_apt_origin '(none)' '999.0.0.0-1' \
+    '     999.0.0.0-1 500
+        500 not-a-url-at-all stable/main amd64 Packages' \
+    malformed_origin_row)
+assert_eq "case w: a malformed (non-URL) origin row is refused, not parsed as an origin (rc 1)" \
+    "1" "$(echo "${res_w8}" | sed -n '1p')"
 
 # ── Case x: cleanup_all's step ORDER and errexit tolerance (TEST-011) ──
 #
@@ -2732,14 +2855,53 @@ fi
 # This drives the real flock against the script's real acquisition sequence,
 # extracted from the source so it cannot drift from what main() does. Holder
 # takes the lock and sleeps; contender uses a 1s timeout and must FAIL.
+# TEST-007: scoped to main()'s COMMENT-STRIPPED body, not the whole installer.
+# Two defects, both mutation-proven:
+#
+#   1. The greps ran over the raw file, so a comment satisfied them. Rewriting the
+#      real acquisition to `[ ! -f ]` + an `<>` read-write open and leaving the old
+#      literals on one added comment line kept this printing "the acquisition
+#      sequence still matches the one exercised below" at 201/0, exit 0 — while the
+#      fixture below was mirroring a sequence main() no longer used. Detecting drift
+#      is this sentinel's ONLY job, so a comment-satisfiable sentinel is inert.
+#
+#   2. It pinned two lines of an acquisition that now carries five guards ahead of
+#      them (symlink, regular-file, hard-link count, owner, and the [ -e ] branch),
+#      all added by SEC-BE-004, and then claimed the sequences "match". Deleting any
+#      guard left the claim standing. The mirrored fixture deliberately does NOT
+#      reproduce the guards — it exercises mutual exclusion, and the guards have
+#      their own cases (z, z3) — so the honest contract is: pin the three lines the
+#      fixture DOES mirror, pin that the guards still exist, and say which is which.
+lock_main_code=$(fn_code main)
 lock_seq_ok=1
-grep -q 'if \[ ! -e "\$LOCK_FILE" \]; then' "${INSTALL_SCRIPT}" || lock_seq_ok=0
-grep -q 'exec {LOCK_FD}<"\$LOCK_FILE"' "${INSTALL_SCRIPT}" || lock_seq_ok=0
+grep -q 'if \[ ! -e "\$LOCK_FILE" \]; then' <<<"${lock_main_code}" || lock_seq_ok=0
+grep -q 'exec {LOCK_FD}<"\$LOCK_FILE"' <<<"${lock_main_code}" || lock_seq_ok=0
+grep -qE 'flock -w [0-9]+ "\$LOCK_FD"' <<<"${lock_main_code}" || lock_seq_ok=0
 if [ "${lock_seq_ok}" -ne 1 ]; then
-    echo "FAIL: case z4: the lock acquisition sequence changed shape — this case no longer mirrors main(), fix it rather than deleting it"
+    echo "FAIL: case z4: the three lines the fixture below mirrors (create-when-absent, read-only open, bounded flock) are no longer main()'s — fix the fixture rather than deleting this case"
     fail_count=$((fail_count + 1))
 else
-    echo "PASS: case z4: the acquisition sequence still matches the one exercised below"
+    echo "PASS: case z4: the create/open/flock lines the fixture mirrors are still main()'s"
+    pass_count=$((pass_count + 1))
+fi
+# The five SEC-BE-004 guards the fixture does not mirror. Pinned here because
+# nothing else notices their removal: cases z and z3 drive them behaviourally
+# through stubs, so deleting a guard from main() itself leaves those green.
+lock_guards_missing=""
+while IFS='|' read -r needle label; do
+    [ -n "$needle" ] || continue
+    grep -qE -- "$needle" <<<"${lock_main_code}" || lock_guards_missing="${lock_guards_missing} ${label}"
+done <<'GUARDS'
+if \[ -L "\$LOCK_FILE" \]; then|symlink-refusal
+if \[ ! -f "\$LOCK_FILE" \]; then|regular-file-refusal
+lock_nlink=\$\(stat -c '%h'|hardlink-count
+lock_owner=\$\(stat -c '%u'|owner-check
+GUARDS
+if [ -n "${lock_guards_missing}" ]; then
+    echo "FAIL: case z4: main()'s lock guards are gone:${lock_guards_missing} — a hostile plant at the fixed /tmp path is admitted again (SEC-BE-004)"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS: case z4: main() still carries all four SEC-BE-004 lock guards ahead of the open"
     pass_count=$((pass_count + 1))
 fi
 

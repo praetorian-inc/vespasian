@@ -298,7 +298,7 @@ Widen it explicitly when the crawler runs inside a devcontainer and reaches the 
 FORMS_TARGET_BIND_HOST=0.0.0.0 ./test/setup-live-targets.sh --targets forms-target
 ```
 
-Nothing else needs this: every other target either binds all interfaces already or, like `grpc-server`, hard-pins loopback in its own Go source.
+Nothing else needs this variable: the other four rod-backed targets share `LIVE_TARGET_BIND_HOST` (below), and `grpc-server` hard-pins loopback in its own Go source. Every target defaults to loopback — this variable exists because `forms-target` reads its own `BIND_HOST` rather than the shared one.
 
 ### `CONFIG_FILE` (optional)
 
@@ -530,10 +530,19 @@ Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are inform
 test/
 ├── setup-live-targets.sh    # Setup script
 ├── run-live-tests.sh        # Test runner
+├── install-chrome.sh        # Provisions a real non-snap Chrome (see "Chrome in containers")
+├── common.sh                # Shared logging + Chrome detection (detect_chrome_binary)
 ├── validate.sh              # Shared validation functions
 ├── README.md                # This file
 ├── .live-test-config        # Auto-generated (gitignored)
 ├── .results/                # Test output (gitignored)
+│
+│   # Guard suites — CI-run regression nets, no Go/Node/Chrome needed
+├── preflight-selftest.sh        # Chrome/Chromium detection (LAB-3893)
+├── install-chrome-selftest.sh   # install-chrome.sh's non-privileged surface
+├── setup-live-targets_test.sh   # Teardown / orphan-PID hardening (LAB-2893)
+├── test-runner-args.sh          # Target-group vs dispatch drift, CI step lists
+├── validate_test.sh             # Spec validators still reject malformed specs
 │
 ├── rest-api/
 │   ├── main.go              # REST API server
@@ -610,13 +619,13 @@ Install Chrome or Chromium:
 brew install --cask google-chrome
 ```
 
-**Found but not runnable:** on recent Ubuntu / WSL2 (and many CI base images),
-`/usr/bin/chromium-browser` is a snap *stub* — a launcher that satisfies
-`command -v` / `-x` but fails at runtime with "requires the chromium snap to
-be installed". `setup-live-targets.sh` probes each candidate binary with
-`--version` before accepting it, so this now fails preflight with `Found
-<path> but it is not runnable` instead of failing later during `vespasian
-crawl`. Fix with `snap install chromium`, or install `google-chrome` instead.
+**Found but not runnable:** this is the snap-stub case described under
+[Chrome in containers](#chrome-in-containers) above — the same cause, seen from the
+troubleshooting side. `setup-live-targets.sh` probes each candidate binary with
+`--version` before accepting it, so it fails preflight with `Found <path> but it is
+not runnable` instead of failing later during `vespasian crawl`. Fix with
+`./test/install-chrome.sh`, `snap install chromium`, or install `google-chrome`
+directly.
 
 **macOS note:** the runnability probe uses `timeout` (falling back to
 `gtimeout` from Homebrew coreutils) to guard against a hanging binary. Stock
