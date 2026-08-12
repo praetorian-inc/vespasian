@@ -19,6 +19,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNNER="$SCRIPT_DIR/run-live-tests.sh"
 PASS=0
 FAIL=0
+SKIP=0
+SKIP_CREDIT=0
 # TEST-025: a completion sentinel, matching install-chrome-selftest.sh. Without
 # it an `exit 0` or an errexit abort part-way through this file printed a run of
 # PASS lines, no summary, and a green CI check — the suite reporting success for
@@ -27,6 +29,11 @@ SUITE_COMPLETED=0
 
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1" >&2; }
+# TEST-017: this suite gained one environmental arm (test/.results may already
+# exist from a developer's own run-live-tests.sh run, since that is its default
+# RESULTS_DIR). It takes a credit so the pin below stays exact instead of being
+# switched off, which is the defect TEST-015 records against the sibling suite.
+skip() { SKIP=$((SKIP + 1)); SKIP_CREDIT=$((SKIP_CREDIT + ${2:-0})); echo "  SKIP: $1"; }
 
 # All temp configs live under one directory removed by a single EXIT trap, so
 # they are cleaned up no matter where the script exits (including a `set -e`
@@ -591,13 +598,74 @@ fi
 # real_offline block (which reaches `mkdir -p "$RESULTS_DIR"` before the
 # binary-absent exit) would create test/.results inside this repo checkout —
 # invisible to `git status` because test/.results is gitignored (TEST-020).
+# TEST-017: this check used to be one-shot, and it disabled itself in exactly
+# the state where the regression is present. The first arm emitted a bare `echo`
+# — neither pass nor fail — so it silently REMOVED itself from the count instead
+# of reporting anything. Measured sequence: on a clean tree the check passes
+# (110/0); applying the exact regression it guards correctly fails (109 passed,
+# 1 failed); but that failing run CREATES test/.results, nothing removes it (the
+# EXIT trap clears only $TMPDIR_T), so every later run takes the silent arm and
+# reports "109 passed, 0 failed" with the regression still in place. The only
+# surviving signal was the accounting sentinel's "A case was added or removed
+# without updating EXPECTED_ASSERTIONS", which blames test maintenance for a
+# live production regression and whose obvious remedy — bumping the pin to 109 —
+# deletes the coverage permanently. test/.results is gitignored, so nothing cues
+# a developer to remove it.
+#
+# Two changes make it repeatable: every arm now emits a COUNTED outcome, and the
+# failing arm removes the directory the real-run block just created so the next
+# run measures the code rather than the debris. The pre-existing arm is a
+# credited skip, not a silent echo, so the accounting stays exact either way.
 if $results_dir_pre_existing; then
-    echo "  (skipping RESULTS_DIR isolation check: $SCRIPT_DIR/.results pre-existed before this run)"
+    skip "RESULTS_DIR isolation check: $SCRIPT_DIR/.results pre-existed before this run (not created by it)" 1
 elif [[ -e "$SCRIPT_DIR/.results" ]]; then
     fail "RESULTS_DIR override was not honoured — test/.results was created in the repo checkout by the real-run block"
+    # Created by THIS suite's real-run block, so removing it is safe and is what
+    # keeps the check from being permanently disabled on this checkout.
+    rm -rf "$SCRIPT_DIR/.results"
 else
     pass "RESULTS_DIR override honoured — no test/.results written into the repo checkout by the real-run block"
 fi
+
+# ── Unknown-flag rejection (TEST-020) ──────────────────────────────────────
+#
+# run-live-tests.sh's parse loop has a catch-all that names the offending option,
+# prints usage and exits 1 — and NO suite asserted it. Replacing the catch-all
+# with `*) shift ;;` left this suite at 110/0, rc 0: a typo'd flag would then be
+# silently ignored and the run would proceed with the WRONG target selection
+# while reporting success, which for `--group offline` vs `--group live` is the
+# difference between running the browser tests and not.
+#
+# Both sibling suites already pin this for their own script
+# (install-chrome-selftest case b, setup-live-targets_test Test 22), so this was
+# the one un-pinned parser of the three. Driven behaviourally against the real
+# script rather than by grepping its source: the flag reaches a real parse loop
+# and the process really exits, so there is no source-vs-behaviour gap to hide in.
+# The exit code is asserted TOGETHER with the diagnostic, not separately. Measured
+# while building this check: replacing the catch-all with `*) shift ;;` still gave
+# rc 1, because the run then proceeded and died later for an unrelated reason (no
+# vespasian binary). A standalone `rc == 1` assertion therefore passes for the
+# wrong reason under the very mutation it exists to catch. The conjunction cannot:
+# only the real catch-all produces rc 1 AND names the flag.
+unknown_out=$(bash "$RUNNER" --not-a-real-flag 2>&1) && unknown_rc=0 || unknown_rc=$?
+unknown_named=false
+case "$unknown_out" in
+    *"Unknown option: --not-a-real-flag"*) unknown_named=true ;;
+esac
+if [[ "$unknown_rc" -eq 1 ]] && $unknown_named; then
+    pass "run-live-tests.sh rejects an unknown flag: exit 1 AND names the offending option"
+else
+    fail "run-live-tests.sh did not reject an unknown flag (rc $unknown_rc, named=$unknown_named) — a typo'd flag is silently ignored and the run proceeds with the wrong target selection"
+fi
+# Matched without a leading path: usage() prints "Usage: $0", so the text varies
+# with how the script was invoked (relative here, absolute via $RUNNER). Anchoring
+# on the basename plus "[options]" is invocation-independent.
+case "$unknown_out" in
+    *"run-live-tests.sh [options]"*)
+        pass "run-live-tests.sh prints usage when rejecting an unknown flag" ;;
+    *)
+        fail "run-live-tests.sh no longer prints usage when rejecting an unknown flag" ;;
+esac
 
 echo ""
 echo "=== Browser probe shared with common.sh ==="
@@ -1525,16 +1593,21 @@ SUITE_COMPLETED=1
 
 echo ""
 echo "=== Summary ==="
-echo "  $PASS passed, $FAIL failed"
+echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # TEST-025: both sibling suites pin their assertion total; this one did not, so
 # deleting a case reduced coverage in silence — every remaining assertion still
-# passed and the suite still exited 0. Every assertion here iterates a fixed
-# literal list and nothing skips, so the total is host-independent and a plain
-# equality pin is safe (unlike preflight-selftest, whose environmental skips
-# need skip-credit accounting).
-EXPECTED_ASSERTIONS=110
-if [[ $((PASS + FAIL)) -ne "$EXPECTED_ASSERTIONS" ]]; then
-    echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail), saw $((PASS + FAIL))."
+# passed and the suite still exited 0.
+#
+# TEST-017: the pin now counts skip credit. One arm here is environmental (the
+# RESULTS_DIR isolation check cannot measure anything when test/.results already
+# existed before the run), and it takes a credit of 1 rather than emitting
+# nothing, so a genuinely deleted assertion is still caught on a host where that
+# arm fires. The pin itself stays UNCONDITIONAL — gating it on "no skips", the
+# way the sibling suite used to, is what let a deletion hide behind an unrelated
+# ambient condition.
+EXPECTED_ASSERTIONS=112
+if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
+    echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
     exit 1
 fi

@@ -95,6 +95,7 @@ export SWEEP_ORPHANS
 PASS=0
 FAIL=0
 SKIP=0
+SKIP_CREDIT=0
 # TEST-006: flips to 1 immediately before the Summary section runs, matching
 # install-chrome-selftest.sh and test-runner-args.sh. This file runs under
 # `set -uo pipefail` (no -e), but an explicit `exit` anywhere above the
@@ -107,7 +108,7 @@ ok()   { echo "  ok   - $1"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL - $1"; FAIL=$((FAIL + 1)); }
 # Tool-prerequisite skips are counted so the summary can surface dropped coverage
 # (a bare "Passed: N Failed: 0" would otherwise hide silently skipped tests).
-skip() { echo "  skip - $1"; SKIP=$((SKIP + 1)); }
+skip() { echo "  skip - $1"; SKIP=$((SKIP + 1)); SKIP_CREDIT=$((SKIP_CREDIT + ${2:-0})); }
 
 is_alive() { kill -0 "$1" 2>/dev/null; }
 
@@ -223,7 +224,7 @@ if command -v python3 >/dev/null 2>&1; then
     SWEEP_ORPHANS=false
     _port_sweep_pid=""
 else
-    skip "python3 unavailable"
+    skip "python3 unavailable" 2
 fi
 
 # ── Test 6: setup → setup → teardown leaves zero processes (acceptance) ──────
@@ -275,7 +276,7 @@ if command -v python3 >/dev/null 2>&1 \
     assert_contains "$out" ":${hp}" "lists the listener holding the base port"
     kill -9 "$lp" 2>/dev/null || true
 else
-    skip "python3 and (lsof or ss) required"
+    skip "python3 and (lsof or ss) required" 2
 fi
 
 # ── Test 9: find_available_port increments past busy ports to the next free ──
@@ -463,7 +464,7 @@ if command -v lsof >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
         kill -9 "$op" 2>/dev/null || true
     fi
 else
-    skip "lsof and python3 required"
+    skip "lsof and python3 required" 3
 fi
 
 # ── Test 17: real orphan_pids_by_name matches by exact basename, current user ─
@@ -484,7 +485,7 @@ if command -v pgrep >/dev/null 2>&1; then
     assert_eq "$got" "" "a non-matching name returns nothing"
     kill -9 "$up" 2>/dev/null || true
 else
-    skip "pgrep required"
+    skip "pgrep required" 2
 fi
 
 # ── Test 18: LIVE_TARGET_BIND_HOST seam reaches every non-hardened target ────
@@ -514,11 +515,21 @@ done
 # guards. It fails on the mutation the finding named, which a behavioural test
 # in an unreachable job would not.
 echo "Test 18b: each target's own source reads BIND_HOST (SEC-BE-015 / TEST-007)"
+# TEST-013: reading BIND_HOST is necessary but NOT sufficient. A target that
+# reads the variable and then falls back to "0.0.0.0" honours the seam and is
+# still exposed on every interface when the variable is unset -- which is the
+# default path, and the one SEC-BE-015 exists to close. MEASURED: flipping all
+# four defaults from 127.0.0.1 to 0.0.0.0 left this suite at 65/0/0, because
+# every assertion here checked the READ and none checked the DEFAULT. Test 19
+# already holds forms-target to the stronger standard, so the four targets this
+# PR actually changed were held to a weaker one than the target it did not.
 target_reads_bind_host() {
-    # $1 = repo-relative source, $2 = the read it must contain
-    local src="${SCRIPT_DIR}/$1" needle="$2"
+    # $1 = repo-relative source, $2 = the read it must contain,
+    # $3 = the loopback default it must fall back to
+    local src="${SCRIPT_DIR}/$1" needle="$2" default_needle="$3"
     if [ ! -f "$src" ]; then
         fail "$1 not found — cannot verify it honours BIND_HOST"
+        fail "$1 not found — cannot verify its loopback default"
         return
     fi
     if grep -qF -- "$needle" "$src"; then
@@ -526,11 +537,16 @@ target_reads_bind_host() {
     else
         fail "$1 no longer reads BIND_HOST — the shell seam is inert and the target binds every interface again"
     fi
+    if grep -qF -- "$default_needle" "$src"; then
+        ok "$1 defaults to loopback when BIND_HOST is unset"
+    else
+        fail "$1 no longer defaults to loopback when BIND_HOST is unset — the unset path, which is the default, exposes it on every interface"
+    fi
 }
-target_reads_bind_host "rest-api/main.go"        'os.Getenv("BIND_HOST")'
-target_reads_bind_host "soap-service/main.go"    'os.Getenv("BIND_HOST")'
-target_reads_bind_host "concat-spa/main.go"      'os.Getenv("BIND_HOST")'
-target_reads_bind_host "graphql-server/server.js" 'process.env.BIND_HOST'
+target_reads_bind_host "rest-api/main.go"        'os.Getenv("BIND_HOST")'  'host = "127.0.0.1"'
+target_reads_bind_host "soap-service/main.go"    'os.Getenv("BIND_HOST")'  'host = "127.0.0.1"'
+target_reads_bind_host "concat-spa/main.go"      'os.Getenv("BIND_HOST")'  'host = "127.0.0.1"'
+target_reads_bind_host "graphql-server/server.js" 'process.env.BIND_HOST'  'process.env.BIND_HOST || "127.0.0.1"'
 # And that none of them has drifted back to a wildcard bind.
 for src in rest-api/main.go soap-service/main.go concat-spa/main.go; do
     if grep -qE '^[[:space:]]*addr := ":" \+ port' "${SCRIPT_DIR}/${src}"; then
@@ -539,6 +555,38 @@ for src in rest-api/main.go soap-service/main.go concat-spa/main.go; do
         ok "${src} does not build a wildcard addr"
     fi
 done
+
+# ── Test 18c: the graphql dep install stays script-free (TEST-011) ──────────
+#
+# SEC-BE-007 changed `npm install --silent` to `npm ci --ignore-scripts --silent`
+# in build_graphql_server, and nothing guarded it. `npm install` runs package
+# lifecycle scripts — arbitrary registry code on a developer's machine and on the
+# CI runner — and resolves loosely instead of honouring the committed lockfile,
+# so a silent revert reintroduces both. The sibling BIND_HOST seam got a guard in
+# the same PR; this call site did not.
+#
+# Scoped to build_graphql_server()'s own body, not the whole file: the flag name
+# appears in this script's comments and in the workflow, and a whole-file grep
+# would be satisfied by prose while the call itself regressed — the exact defect
+# TEST-003 records against install-chrome-selftest case f.
+echo "Test 18c: build_graphql_server installs deps with npm ci --ignore-scripts"
+gql_fn_body="$(awk '/^build_graphql_server\(\) \{/,/^\}/' "${SCRIPT_UNDER_TEST}")"
+gql_npm_lines="$(printf '%s\n' "${gql_fn_body}" | grep -E '^[[:space:]]*npm ' || true)"
+if [ -n "${gql_npm_lines}" ]; then
+    ok "build_graphql_server still contains an npm invocation (the checks below are not vacuous)"
+else
+    fail "build_graphql_server contains no npm invocation — the --ignore-scripts checks below are vacuous, fix the extraction rather than deleting it"
+fi
+if printf '%s\n' "${gql_npm_lines}" | grep -qF -- 'npm ci --ignore-scripts'; then
+    ok "the dep install uses npm ci --ignore-scripts (lockfile honoured, lifecycle scripts blocked)"
+else
+    fail "the dep install no longer uses npm ci --ignore-scripts — registry lifecycle scripts execute and the committed lockfile is bypassed (SEC-BE-007)"
+fi
+if printf '%s\n' "${gql_npm_lines}" | grep -qE '^[[:space:]]*npm install\b'; then
+    fail "build_graphql_server has reverted to npm install — lifecycle scripts run again (SEC-BE-007)"
+else
+    ok "build_graphql_server does not use npm install"
+fi
 
 # ── Test 19: forms-target's own bind default is loopback (TEST-019) ─────────
 echo "Test 19: forms-target defaults its bind host to loopback"
@@ -609,7 +657,7 @@ PY
     kill -9 "$hsp" 2>/dev/null || true
     assert_contains "$out20" "rc=1" "wait_for_http's curl probe is bounded by --max-time against a handshake-then-silent listener"
 else
-    skip "timeout/gtimeout, curl, and python3 required"
+    skip "timeout/gtimeout, curl, and python3 required" 1
 fi
 
 # ── Test 21: wait_for_grpc's timeout-wrapped /dev/tcp arm (TEST-020) ────────
@@ -676,7 +724,7 @@ if { command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; 
 
     rm -rf "$mini_bin"
 else
-    skip "timeout/gtimeout, dirname, and sleep required"
+    skip "timeout/gtimeout, dirname, and sleep required" 2
 fi
 
 # ── Test 22: write_config lands the config at 0644 regardless of umask ──────
@@ -692,7 +740,7 @@ if command -v stat >/dev/null 2>&1; then
     assert_contains "$contents" "REST_API_PORT=1111" "config carries the written port value"
     rm -f "$CONFIG_FILE"
 else
-    skip "stat required"
+    skip "stat required" 2
 fi
 
 # ── Test 23: teardown_on_failure EXIT trap tears down a failed partial setup ─
@@ -737,22 +785,64 @@ clear_recorded_pids soap-service
 # gives Passed: 61 Skipped: 0 Failed: 0 — Tests 23/24 stay green because they
 # never touch main() at all. Mirrors install-chrome-selftest.sh case p, which
 # extracts main()'s body with awk rather than trusting a whole-file grep.
+#
+# TEST-014: the three checks below were unordered PRESENCE greps, and the
+# property that matters is POSITION. MEASURED: hoisting `SETUP_IN_PROGRESS=false`
+# from after write_config up to just after the trap arm makes the failure
+# teardown a no-op across the entire service-start span -- fully restoring the
+# TEST-022 regression -- and all three greps still matched, so the suite stayed
+# at 65/0/0 and exited 0 while the third assertion's own message ("clears ...
+# AFTER a successful write_config") had become false. Line numbers inside the
+# same awk-extracted body settle it, the way install-chrome-selftest case u does
+# for INSTALL_SUCCEEDED.
 echo "Test 24b: main() actually arms the SETUP_IN_PROGRESS/teardown_on_failure trap it relies on"
 main_body_24b="$(awk '/^main\(\) \{/,/^\}/' "${SCRIPT_UNDER_TEST}")"
-if printf '%s' "${main_body_24b}" | grep -qE '^[[:space:]]*SETUP_IN_PROGRESS=true$'; then
-    ok "main() sets SETUP_IN_PROGRESS=true before starting services"
+arm_at=$(printf '%s\n' "${main_body_24b}" | grep -nE '^[[:space:]]*SETUP_IN_PROGRESS=true$' | head -1 | cut -d: -f1 || true)
+trap_at=$(printf '%s\n' "${main_body_24b}" | grep -nE "^[[:space:]]*trap 'teardown_on_failure' EXIT\$" | head -1 | cut -d: -f1 || true)
+disarm_at=$(printf '%s\n' "${main_body_24b}" | grep -nE '^[[:space:]]*SETUP_IN_PROGRESS=false$' | head -1 | cut -d: -f1 || true)
+firststart_at=$(printf '%s\n' "${main_body_24b}" | grep -nE '^[[:space:]]*start_[a-z_]+ "\$' | head -1 | cut -d: -f1 || true)
+writecfg_at=$(printf '%s\n' "${main_body_24b}" | grep -nE '^[[:space:]]*write_config ' | head -1 | cut -d: -f1 || true)
+
+# Fidelity sentinel: an extraction that finds nothing must FAIL loudly rather
+# than let every ordering comparison below pass vacuously on empty strings.
+if [ -n "${arm_at}" ] && [ -n "${trap_at}" ] && [ -n "${disarm_at}" ] \
+   && [ -n "${firststart_at}" ] && [ -n "${writecfg_at}" ]; then
+    ok "Test 24b located main()'s arm, trap, disarm, first service start and write_config"
 else
-    fail "main() sets SETUP_IN_PROGRESS=true before starting services (registration missing)"
+    fail "Test 24b could not locate one of main()'s arm/trap/disarm/start/write_config statements — the ordering assertions below are vacuous, fix the extraction rather than deleting it"
 fi
-if printf '%s' "${main_body_24b}" | grep -qE "^[[:space:]]*trap 'teardown_on_failure' EXIT\$"; then
+
+if [ -n "${arm_at}" ]; then
+    ok "main() sets SETUP_IN_PROGRESS=true"
+else
+    fail "main() sets SETUP_IN_PROGRESS=true (registration missing)"
+fi
+if [ -n "${trap_at}" ]; then
     ok "main() registers trap 'teardown_on_failure' EXIT"
 else
     fail "main() registers trap 'teardown_on_failure' EXIT (registration missing)"
 fi
-if printf '%s' "${main_body_24b}" | grep -qE '^[[:space:]]*SETUP_IN_PROGRESS=false$'; then
-    ok "main() clears SETUP_IN_PROGRESS=false after a successful write_config"
+if [ -n "${disarm_at}" ]; then
+    ok "main() clears SETUP_IN_PROGRESS=false"
 else
-    fail "main() clears SETUP_IN_PROGRESS=false after a successful write_config (disarm missing)"
+    fail "main() clears SETUP_IN_PROGRESS=false (disarm missing)"
+fi
+
+# The three ordering claims the presence greps left unchecked.
+if [ -n "${arm_at}" ] && [ -n "${firststart_at}" ] && [ "${arm_at}" -lt "${firststart_at}" ]; then
+    ok "SETUP_IN_PROGRESS=true precedes the first service start"
+else
+    fail "SETUP_IN_PROGRESS=true does not precede the first service start — a service that fails before the arm is never torn down"
+fi
+if [ -n "${trap_at}" ] && [ -n "${firststart_at}" ] && [ "${trap_at}" -lt "${firststart_at}" ]; then
+    ok "the teardown_on_failure trap is armed before the first service start"
+else
+    fail "the teardown_on_failure trap is armed after the first service start — an early failure leaks listeners"
+fi
+if [ -n "${disarm_at}" ] && [ -n "${writecfg_at}" ] && [ "${disarm_at}" -gt "${writecfg_at}" ]; then
+    ok "SETUP_IN_PROGRESS=false is cleared only AFTER write_config succeeds"
+else
+    fail "SETUP_IN_PROGRESS=false is cleared before write_config completes — the trap is a no-op for the whole start span, restoring the TEST-022 regression"
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────
@@ -765,13 +855,24 @@ echo "────────────────────────�
 # all before this line, so deleting a whole Test block silently shrank PASS
 # with nothing to compare it against — the exact deletion-detection gap
 # install-chrome-selftest.sh and test-runner-args.sh already close for
-# themselves. Enforced only when SKIP is 0, mirroring install-chrome-
-# selftest.sh's own (pre-existing, TEST-003-flagged) gate: this file's skips
-# are all ambient-toolchain (python3/lsof/pgrep/curl/timeout), and turning a
-# valid degraded environment into a red build is not the point of this pin.
-EXPECTED_ASSERTIONS=65
-if [ "${SKIP}" -eq 0 ] && [ "$((PASS + FAIL))" -ne "${EXPECTED_ASSERTIONS}" ]; then
-    echo "setup-live-targets_test: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (Passed+Failed), saw $((PASS + FAIL))."
+# themselves.
+#
+# TEST-015: the pin used to be gated on `SKIP -eq 0`, which switched it OFF in
+# precisely the environments most likely to differ from the author's. Every
+# trigger here is ambient (python3/lsof/ss/pgrep/curl/timeout/stat), so on a host
+# missing any one of them the pin stopped being checked at all: deleting a whole
+# Test block AND running without pgrep reported "Passed: 60 Failed: 0" and
+# exited 0. It is now enforced UNCONDITIONALLY against pass+fail+credit.
+#
+# The credits are MEASURED, not estimated: each guard was forced false in turn on
+# a scratch copy and the assertion delta read off — python3 2, python3+lsof/ss 2,
+# Test 16 lsof+python3 3, pgrep 2, Test 20 timeout+curl+python3 1, Test 21
+# timeout+dirname+sleep 2, stat 2. A degraded host still totals
+# EXPECTED_ASSERTIONS and stays green, while a DELETED assertion is now caught on
+# every host rather than only on a fully-equipped one.
+EXPECTED_ASSERTIONS=76
+if [ "$((PASS + FAIL + SKIP_CREDIT))" -ne "${EXPECTED_ASSERTIONS}" ]; then
+    echo "setup-live-targets_test: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (Passed+Failed+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A Test block was added or removed without updating EXPECTED_ASSERTIONS."
     exit 1
 fi

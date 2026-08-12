@@ -861,10 +861,43 @@ main() {
             exit 1
         fi
         if [ -e "$LOCK_FILE" ]; then
+            # SEC-BE-004: refuse anything that is not a plain file BEFORE the
+            # open below. The symlink and hardlink checks are type checks for
+            # exactly two types; every other type slipped through, and a FIFO is
+            # the dangerous one: `[ ! -e ]` declines to replace it, and
+            # `exec {LOCK_FD}<` then blocks in open(2) forever waiting for a
+            # writer. The `flock -w 300` bound never applies because the hang is
+            # in the OPEN, not in the lock, so a root provisioning run wedges
+            # with no diagnostic at all. `[ -f ]` admits regular files only, so
+            # this one test covers FIFOs, directories, devices and sockets.
+            if [ ! -f "$LOCK_FILE" ]; then
+                log_fail "${LOCK_FILE} exists but is not a regular file — refusing to lock through it." >&2
+                exit 1
+            fi
             local lock_nlink
             lock_nlink=$(stat -c '%h' -- "$LOCK_FILE" 2>/dev/null) || lock_nlink=""
             if [ -n "$lock_nlink" ] && [ "$lock_nlink" -ne 1 ]; then
                 log_fail "${LOCK_FILE} has multiple hard links (${lock_nlink}) — refusing to lock through it." >&2
+                exit 1
+            fi
+            # A plain file planted by ANOTHER unprivileged user is still hostile:
+            # they can hold flock and stall every run for the full 300s window.
+            # root (0) and the invoking user are the only legitimate owners --
+            # root because $SUDO created it, the invoking user because a non-root
+            # run creates it itself with no $SUDO.
+            #
+            # This fails CLOSED when stat yields nothing, unlike the nlink check
+            # above: substituting a safe-looking default is what made that check
+            # disarmable, and repeating the pattern in a guard added to fix a
+            # guard would be its own defect.
+            local lock_owner
+            lock_owner=$(stat -c '%u' -- "$LOCK_FILE" 2>/dev/null) || lock_owner=""
+            if [ -z "$lock_owner" ]; then
+                log_fail "Could not determine the owner of ${LOCK_FILE} — refusing to lock through it." >&2
+                exit 1
+            fi
+            if [ "$lock_owner" -ne 0 ] && [ "$lock_owner" -ne "$(id -u)" ]; then
+                log_fail "${LOCK_FILE} is owned by uid ${lock_owner}, neither root nor $(id -u) — refusing to lock through it." >&2
                 exit 1
             fi
         fi

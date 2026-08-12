@@ -63,7 +63,7 @@ export CHROME_PROBE_TIMEOUT=2
 # pin is not meant to turn a valid environment into a red build); the trust
 # anchor's own skip is already a hard failure via trust_anchor_skips,
 # independently of this pin.
-EXPECTED_ASSERTIONS=192
+EXPECTED_ASSERTIONS=201
 
 pass_count=0
 fail_count=0
@@ -352,11 +352,37 @@ fi
 # without them, so f0's stub (which ignores every flag but -o) cannot tell the
 # difference either. Grepping the source is the only practical guard for a
 # flag whose absence is silent, same spirit as case p's trap-line check below.
-if grep -qF -- "--proto '=https' --proto-redir '=https'" "${INSTALL_SCRIPT}"; then
+#
+# TEST-003: scoped to install_pinned_key()'s body, and to the curl line within
+# it, the same way f5 below scopes to main(). The previous version grepped the
+# WHOLE file, which a comment mentioning the flags satisfies just as well as the
+# call itself -- so deleting the flags from the fetch and leaving any prose
+# behind kept this assertion GREEN while affirmatively reporting that a
+# TLS-downgrade control was in place. An assertion that certifies an absent
+# security control is worse than no assertion, because it is read as proof.
+# `|| true` guards the extraction so an empty match FAILS the check below rather
+# than aborting the suite under its own `set -euo pipefail`.
+key_fn_body_f=$(awk '/^install_pinned_key\(\) \{/,/^\}/' "${INSTALL_SCRIPT}" || true)
+if printf '%s' "${key_fn_body_f}" \
+    | grep -E '^[[:space:]]*(if ! )?curl ' \
+    | grep -qF -- "--proto '=https' --proto-redir '=https'"; then
     echo "PASS: case f: the key fetch pins --proto and --proto-redir to https (downgrade redirects refused)"
     pass_count=$((pass_count + 1))
 else
     echo "FAIL: case f: the key fetch no longer pins --proto/--proto-redir to https"
+    fail_count=$((fail_count + 1))
+fi
+
+# Fidelity sentinel for the scoping above: if install_pinned_key() is renamed or
+# the fetch stops being a `curl` line, the awk/grep pair silently matches nothing
+# and the assertion fails for the wrong reason. Pin that the extraction actually
+# found the fetch, so a structural drift is reported as drift rather than as a
+# missing flag.
+if printf '%s' "${key_fn_body_f}" | grep -qE '^[[:space:]]*(if ! )?curl '; then
+    echo "PASS: case f: the scoped extraction still finds the key-fetch curl in install_pinned_key()"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case f: install_pinned_key() no longer contains a curl line — the --proto check above is now vacuous, fix the extraction rather than deleting it"
     fail_count=$((fail_count + 1))
 fi
 
@@ -2133,6 +2159,60 @@ else
     skip "case v: main-install-path in_container() gating (needs the same key fixture/gpg as j/j2)" 12
 fi
 
+# ── Case v3: main()'s AC4 and origin-recheck call sites, by POSITION ────────
+#
+# TEST-005 / TEST-007. Case v above drives the real install path, but its only
+# assertion for the non-container arm is `assert_contains ... "no apt update
+# channel"` -- the LOG LINE that claims suppression happened, not the call that
+# makes it true. Deleting `suppress_permanent_repo` from main() left the entire
+# suite green at 191/0: main() deliberately skips remove_phone_home on that path
+# and verify_install deliberately skips the artifact audit, both justified by
+# "suppression already ran", so with the call gone nothing removes the Google
+# apt source and root cron pinger on a developer's machine and nothing notices.
+# That call is the ONLY AC4 control on the non-container path.
+#
+# TEST-007 is the same shape one function over: verify_apt_origin is called
+# twice, before AND after `apt-get install` (the postinst runs DURING apt-get,
+# which is exactly when the origin can change), and case y pins only the first.
+#
+# Both are position claims, not presence claims, so both are checked by
+# comparing line numbers inside main()'s own awk-extracted body -- the technique
+# case u already uses for INSTALL_SUCCEEDED. A bare presence grep would pass with
+# the statements in the wrong order, which for suppression-before-install is the
+# whole property that matters.
+main_body_v3=$(awk '/^main\(\) \{/,/^\}/' "${INSTALL_SCRIPT}" || true)
+sup_at=$(printf '%s\n' "${main_body_v3}" | grep -nE '^[[:space:]]*suppress_permanent_repo[[:space:]]*$' | head -1 | cut -d: -f1 || true)
+aptinst_at=$(printf '%s\n' "${main_body_v3}" | grep -nE '\$SUDO timeout (-k [0-9]+ )?[0-9]+ apt-get install ' | head -1 | cut -d: -f1 || true)
+origin_lines=$(printf '%s\n' "${main_body_v3}" | grep -nE '^[[:space:]]*if ! verify_apt_origin; then$' | cut -d: -f1 || true)
+origin_count=$(printf '%s' "${origin_lines}" | grep -c . || true)
+origin_post_at=""
+if [ -n "${aptinst_at}" ]; then
+    origin_post_at=$(printf '%s\n' "${origin_lines}" | awk -v start="${aptinst_at}" '$1 > start { print $1; exit }')
+fi
+
+# Fidelity sentinel first, for the same reason case u has one: a renamed main()
+# or a reworded statement makes every comparison below compare empty strings,
+# which would pass vacuously. Drift must be reported as drift.
+if [ -n "${sup_at}" ] && [ -n "${aptinst_at}" ] && [ "${origin_count}" -ge 1 ]; then
+    echo "PASS: case v3: main()'s suppression call, apt-get install, and origin check all located"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case v3: could not locate main()'s suppression call, apt-get install, or origin check — the ordering assertions below are vacuous, fix the extraction rather than deleting it"
+    fail_count=$((fail_count + 1))
+fi
+
+assert_eq "case v3: main() actually CALLS suppress_permanent_repo (AC4's only control on the non-container path)" \
+    "called" "$([ -n "${sup_at}" ] && echo "called" || echo "MISSING — the 'no apt update channel' log line is now a false claim")"
+
+assert_eq "case v3: suppression runs BEFORE apt-get install, so the postinst never creates the repo or pinger" \
+    "before" "$( { [ -n "${sup_at}" ] && [ -n "${aptinst_at}" ] && [ "${sup_at}" -lt "${aptinst_at}" ]; } && echo "before" || echo "NOT before apt-get install — the postinst plants the phone-home artifacts first")"
+
+assert_eq "case v3: verify_apt_origin is called twice, not once" \
+    "2" "${origin_count}"
+
+assert_eq "case v3: one verify_apt_origin call sits AFTER apt-get install (the postinst can change the origin mid-install)" \
+    "after" "$([ -n "${origin_post_at}" ] && echo "after" || echo "MISSING — only the pre-install gate is present")"
+
 # ── Case w: verify_apt_origin, both arms (TEST-010 / SEC-BE-002) ─
 #
 # This function was reachable from no case at all — it appeared in the suite
@@ -2521,18 +2601,42 @@ run_lock_plant() {
     case "${attack}" in
         symlink)  ln -s "${root}/victim" "${root}/tmp/vespasian-install-chrome.lock" ;;
         hardlink) ln "${root}/victim" "${root}/tmp/vespasian-install-chrome.lock" ;;
+        # SEC-BE-004: a FIFO passes both guards above -- it is not a symlink and
+        # has one hard link -- and `[ ! -e ]` then declines to replace it, so
+        # `exec {LOCK_FD}<` blocks in open(2) forever waiting for a writer. The
+        # deliberate `flock -w 300` bound is never reached because the hang is
+        # in the OPEN, not the lock. That is why this helper is timeout-bounded:
+        # without the bound this case wedges the whole suite instead of failing.
+        fifo)     mkfifo "${root}/tmp/vespasian-install-chrome.lock" ;;
     esac
+    # A run that hangs must FAIL LOUDLY, not hang the suite. rc 124 from
+    # timeout(1) is the signal, and the assertions below treat it as a failure
+    # distinct from a clean refusal.
+    local tmo=""
+    for c in timeout gtimeout; do
+        command -v "$c" >/dev/null 2>&1 && { tmo="$c"; break; }
+    done
     (
         VESPASIAN_TEST_ROOT="${root}"
         export VESPASIAN_TEST_ROOT
         unset REMOTE_CONTAINERS
         unset container
         PATH="${bin}:${PATH}"
-        # shellcheck source=install-chrome.sh
-        source "${INSTALL_SCRIPT}"
         set +e
-        out=$(main 2>&1)
-        printf '%s\n%s\n' "$?" "${out}"
+        local out rc
+        if [ -n "${tmo}" ]; then
+            # `main` is not auto-invoked when sourced (BASH_SOURCE guard), so the
+            # inner shell sources then calls it explicitly, exactly as the
+            # unbounded arm below does.
+            out=$("${tmo}" 15 bash -c 'source "$1"; main' _ "${INSTALL_SCRIPT}" 2>&1)
+            rc=$?
+        else
+            # shellcheck source=install-chrome.sh
+            source "${INSTALL_SCRIPT}"
+            out=$(main 2>&1)
+            rc=$?
+        fi
+        printf '%s\n%s\n' "${rc}" "${out}"
     )
 }
 
@@ -2551,6 +2655,21 @@ assert_contains "case z: the hardlink refusal names the multiple hard links" \
     "multiple hard links" "${res_z2}"
 assert_eq "case z: the hardlink attack's target is untouched" \
     "do not touch me" "$(cat "${FIXTURE_DIR}/root-z2/victim" 2>/dev/null)"
+
+# case z3 (SEC-BE-004): the lock path is a fixed name in a sticky world-writable
+# directory, so an unprivileged local user can plant ANY file type there before a
+# root run. The symlink and hardlink guards above are the only two type checks,
+# and a FIFO defeats both. Asserting rc 1 alone is not enough here: rc 124 means
+# the run HUNG, which is the actual defect and a strictly worse outcome than a
+# refusal, so it gets its own assertion rather than being folded into "not 1".
+res_z3=$(run_lock_plant "${FIXTURE_DIR}/root-z3" fifo)
+rc_z3=$(echo "${res_z3}" | sed -n '1p')
+assert_eq "case z3: a FIFO at the lock path does not hang the run (rc is not 124)" \
+    "no-timeout" "$([ "${rc_z3}" = "124" ] && echo "HUNG in open(2) — flock -w never applies" || echo "no-timeout")"
+assert_eq "case z3: a FIFO at the lock path is refused (rc 1)" \
+    "1" "${rc_z3}"
+assert_contains "case z3: the refusal names the file type rather than a lock timeout" \
+    "not a regular file" "${res_z3}"
 
 # The acquisition itself, and what happens when it fails (TEST-011/TEST-012).
 # A stubbed `flock` that always times out stands in for a genuinely contended
