@@ -20,11 +20,12 @@ import (
 	"encoding/xml"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/praetorian-inc/vespasian/test/internal/target"
 )
 
 // SOAPEnvelope wraps a SOAP request or response body.
@@ -202,19 +203,13 @@ func main() {
 	mux.HandleFunc("/service.wsdl", handleWSDL)
 	mux.HandleFunc("/soap", handleSOAP)
 
-	// SEC-BE-015: bind loopback by default. These targets are unauthenticated
-	// by design, so listening on every interface exposed them to the whole
-	// local network for the lifetime of a test run. setup-live-targets.sh
-	// passes BIND_HOST explicitly and opts into a wider bind only when the
-	// devcontainer flow needs it (a crawler in a container reaching the host
-	// via TEST_HOST). Mirrors test/forms-target/main.go.
-	host := os.Getenv("BIND_HOST")
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	addr := net.JoinHostPort(host, port)
-	log.Printf("soap-service listening on %s", addr)       //nolint:gosec // test server, log injection N/A
-	if err := http.ListenAndServe(addr, mux); err != nil { //nolint:gosec // test server, timeouts not needed
+	// SEC-BE-015 / QUAL-007: loopback default and the shared server timeout both
+	// live in test/internal/target, so there is one copy to reason about and one
+	// place for Test 18b to assert.
+	addr := target.Addr(port)
+	log.Printf("soap-service listening on http://%s/", addr) //nolint:gosec // test server, log injection N/A
+	srv := target.Server(addr, mux)
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }

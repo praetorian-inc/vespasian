@@ -17,10 +17,11 @@ package main
 import (
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"strings"
+
+	"github.com/praetorian-inc/vespasian/test/internal/target"
 )
 
 func main() {
@@ -75,19 +76,12 @@ func main() {
 		http.NotFound(w, r)
 	})
 
-	// SEC-BE-015: bind loopback by default. These targets are unauthenticated
-	// by design, so listening on every interface exposed them to the whole
-	// local network for the lifetime of a test run. setup-live-targets.sh
-	// passes BIND_HOST explicitly and opts into a wider bind only when the
-	// devcontainer flow needs it (a crawler in a container reaching the host
-	// via TEST_HOST). Mirrors test/forms-target/main.go.
-	host := os.Getenv("BIND_HOST")
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	addr := net.JoinHostPort(host, port)
-	log.Printf("concat-spa listening on http://%s/", addr)     //nolint:gosec // G706: local test target; port is a controlled PORT env/default, not attacker input
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 0} //nolint:gosec // local test target, no timeout needed
+	// SEC-BE-015 / QUAL-007: loopback default and the shared server timeout both
+	// live in test/internal/target, so there is one copy to reason about and one
+	// place for Test 18b to assert.
+	addr := target.Addr(port)
+	log.Printf("concat-spa listening on http://%s/", addr) //nolint:gosec // G706: local test target; port is a controlled PORT env/default, not attacker input
+	srv := target.Server(addr, mux)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}

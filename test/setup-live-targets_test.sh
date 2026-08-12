@@ -519,72 +519,94 @@ done
 # built and started a target would skip in exactly the environment that runs the
 # guards. It fails on the mutation the finding named, which a behavioural test
 # in an unreachable job would not.
-echo "Test 18b: each target's own source reads BIND_HOST (SEC-BE-015 / TEST-007)"
-# TEST-013: reading BIND_HOST is necessary but NOT sufficient. A target that
-# reads the variable and then falls back to "0.0.0.0" honours the seam and is
-# still exposed on every interface when the variable is unset -- which is the
-# default path, and the one SEC-BE-015 exists to close. MEASURED: flipping all
-# four defaults from 127.0.0.1 to 0.0.0.0 left this suite at 65/0/0, because
-# every assertion here checked the READ and none checked the DEFAULT. Test 19
-# already holds forms-target to the stronger standard, so the four targets this
-# PR actually changed were held to a weaker one than the target it did not.
-target_reads_bind_host() {
-    # $1 = repo-relative source, $2 = the read it must contain,
-    # $3 = the collapsed resolution STRUCTURE it must have (see TEST-014 below)
-    local src="${SCRIPT_DIR}/$1" needle="$2" struct_needle="$3"
-    if [ ! -f "$src" ]; then
-        fail "$1 not found — cannot verify it honours BIND_HOST"
-        fail "$1 not found — cannot verify its loopback default"
-        return
-    fi
-    if grep -qF -- "$needle" "$src"; then
-        ok "$1 reads BIND_HOST"
-    else
-        fail "$1 no longer reads BIND_HOST — the shell seam is inert and the target binds every interface again"
-    fi
-    # TEST-014: match the whole resolution STRUCTURE, comment-stripped and
-    # whitespace-collapsed, not just the loopback literal.
-    #
-    # A literal grep for `host = "127.0.0.1"` catches the obvious regression
-    # (rewriting the literal to "0.0.0.0" — measured: 72 passed / 4 FAILED, exit 1)
-    # but not a LOGIC INVERSION, because the inversion leaves the literal exactly
-    # where it was. Measured: flipping `if host == ""` to `if host != ""` in all
-    # three Go targets and dropping the `host` argument from server.js's
-    # `listen(port, host, …)` left this suite at 76 passed / 0 failed, exit 0 while
-    # printing "defaults to loopback" for every target — and the mutated rest-api
-    # genuinely logged `listening on :18777`, i.e. every interface, which is the
-    # precise SEC-BE-015 exposure these assertions exist to prevent.
-    #
-    # Source-level rather than socket-level for the reason given above: the
-    # preflight-selftest job that runs this suite installs no Go and no Node, so a
-    # test that built and started a target would skip in exactly the environment
-    # the guard is for. Pinning the structure is what a source check can honestly
-    # do; it fails on both the literal swap and the inversion.
-    local collapsed
-    collapsed=$(grep -vE '^[[:space:]]*(//|#)' "$src" | tr '\n' ' ' | tr -s '[:space:]' ' ')
-    if printf '%s' "$collapsed" | grep -qF -- "$struct_needle"; then
-        ok "$1 defaults to loopback when BIND_HOST is unset"
-    else
-        fail "$1 no longer defaults to loopback when BIND_HOST is unset — the unset path, which is the default, exposes it on every interface (structure expected: ${struct_needle})"
-    fi
+echo "Test 18b: the loopback default lives in one asserted place and every target uses it (SEC-BE-015 / TEST-014 / QUAL-007)"
+# QUAL-007 moved the BIND_HOST resolution out of four byte-identical copies into
+# test/internal/target. That changes what this test must pin, and makes the pin
+# stronger: the security-relevant default is asserted ONCE, and each target is
+# asserted to DELEGATE rather than to re-derive it.
+#
+# TEST-014, why a literal grep is not enough. The previous version grepped each
+# target for `host = "127.0.0.1"`. That caught rewriting the literal to "0.0.0.0"
+# (measured: 72 passed / 4 FAILED, exit 1) but NOT a logic inversion, because the
+# inversion leaves the literal exactly where it was: flipping `if host == ""` to
+# `if host != ""` in all three Go targets and dropping the `host` argument from
+# server.js's `listen(port, host, …)` left the suite at 76/0, exit 0 while printing
+# "defaults to loopback" for every target — and the mutated rest-api genuinely
+# logged `listening on :18777`, i.e. every interface. So the shared default is
+# matched as a whole STRUCTURE, comment-stripped and whitespace-collapsed.
+#
+# Source-level rather than socket-level, deliberately: the preflight-selftest job
+# that runs this suite installs no Go and no Node, so a test that built and started
+# a target would skip in exactly the environment the guard is for.
+collapse_code() {
+    grep -vE '^[[:space:]]*(//|#)' "$1" | tr '\n' ' ' | tr -s '[:space:]' ' '
 }
-# $3 is the collapsed STRUCTURE the resolution must have, not a bare literal: the
-# guard, its body, and (for Go) the JoinHostPort that consumes the result.
-target_reads_bind_host "rest-api/main.go"        'os.Getenv("BIND_HOST")'  'if host == "" { host = "127.0.0.1" } addr := net.JoinHostPort(host, port)'
-target_reads_bind_host "soap-service/main.go"    'os.Getenv("BIND_HOST")'  'if host == "" { host = "127.0.0.1" } addr := net.JoinHostPort(host, port)'
-target_reads_bind_host "concat-spa/main.go"      'os.Getenv("BIND_HOST")'  'if host == "" { host = "127.0.0.1" } addr := net.JoinHostPort(host, port)'
-# For the Node target the equivalent structure is the defaulting expression AND the
-# listen() call that actually PASSES host — dropping that argument is the pre-PR
-# shape and binds every interface while the defaulting line sits there untouched.
-target_reads_bind_host "graphql-server/server.js" 'process.env.BIND_HOST'  'const host = process.env.BIND_HOST || "127.0.0.1"; httpServer.listen(port, host,'
-# And that none of them has drifted back to a wildcard bind.
-for src in rest-api/main.go soap-service/main.go concat-spa/main.go; do
-    if grep -qE '^[[:space:]]*addr := ":" \+ port' "${SCRIPT_DIR}/${src}"; then
-        fail "${src} still builds a wildcard addr (\`:\" + port\`) — the loopback default is bypassed"
+
+SHARED_TARGET="${SCRIPT_DIR}/internal/target/target.go"
+if [ ! -f "${SHARED_TARGET}" ]; then
+    fail "test/internal/target/target.go not found — the shared loopback default is gone and every target below resolves its own bind"
+    fail "test/internal/target/target.go not found — cannot verify the shared server timeout"
+else
+    shared_code=$(collapse_code "${SHARED_TARGET}")
+    # The default, as a structure: the guard, its body, and the JoinHostPort that
+    # consumes the result. Any of the three missing means the default is not what
+    # it claims.
+    if printf '%s' "${shared_code}" | grep -qF 'host := os.Getenv("BIND_HOST") if host == "" { host = "127.0.0.1" } return net.JoinHostPort(host, port)'; then
+        ok "shared target.Addr defaults to loopback when BIND_HOST is unset"
     else
-        ok "${src} does not build a wildcard addr"
+        fail "shared target.Addr no longer defaults to loopback when BIND_HOST is unset — the unset path, which is the default, exposes every Go target on every interface (SEC-BE-015)"
+    fi
+    # SEC-BE-007: the shared server timeout. rest-api and soap-service previously
+    # called http.ListenAndServe with no server struct, and concat-spa set
+    # ReadHeaderTimeout: 0 explicitly, each on a "timeouts not needed" rationale
+    # that held only while these targets were loopback-only. This PR ships the
+    # LIVE_TARGET_BIND_HOST=0.0.0.0 opt-in, so an unbounded header read became a
+    # slow-loris against a developer machine or CI runner.
+    if printf '%s' "${shared_code}" | grep -qE 'ReadHeaderTimeout = [0-9]+ \* time\.Second' \
+       && printf '%s' "${shared_code}" | grep -qF 'ReadHeaderTimeout: ReadHeaderTimeout'; then
+        ok "shared target.Server applies a non-zero ReadHeaderTimeout (SEC-BE-007)"
+    else
+        fail "shared target.Server no longer applies a non-zero ReadHeaderTimeout — the 0.0.0.0 opt-in this PR documents leaves an unbounded header read (SEC-BE-007)"
+    fi
+fi
+
+# Each Go target must DELEGATE, not re-derive. A target that grows its own
+# os.Getenv("BIND_HOST") block again is drift even if that block happens to be
+# correct today, because the assertion above would then be pinning a default the
+# target no longer uses.
+for src in rest-api/main.go soap-service/main.go concat-spa/main.go forms-target/main.go; do
+    f="${SCRIPT_DIR}/${src}"
+    if [ ! -f "$f" ]; then
+        fail "${src} not found — cannot verify it delegates its bind to test/internal/target"
+        continue
+    fi
+    code=$(collapse_code "$f")
+    if printf '%s' "${code}" | grep -qF 'addr := target.Addr(port)' \
+       && printf '%s' "${code}" | grep -qF 'srv := target.Server(addr, mux)'; then
+        if printf '%s' "${code}" | grep -qF 'os.Getenv("BIND_HOST")'; then
+            fail "${src} calls target.Addr but ALSO resolves BIND_HOST itself — two sources of truth for the loopback default"
+        else
+            ok "${src} delegates both its bind address and its server timeout to test/internal/target"
+        fi
+    else
+        fail "${src} no longer delegates to test/internal/target — it resolves its own bind and/or builds its own server, so the shared loopback default and timeout do not apply to it"
     fi
 done
+
+# graphql-server is Node and cannot share the Go helper, so it keeps a structural
+# check of its own: the defaulting expression AND the listen() call that actually
+# PASSES host. Dropping that argument is the pre-PR shape and binds every interface
+# while the defaulting line sits there untouched.
+gql="${SCRIPT_DIR}/graphql-server/server.js"
+if [ ! -f "$gql" ]; then
+    fail "graphql-server/server.js not found — cannot verify its loopback default"
+else
+    if printf '%s' "$(collapse_code "$gql")" | grep -qF 'const host = process.env.BIND_HOST || "127.0.0.1"; httpServer.listen(port, host,'; then
+        ok "graphql-server/server.js defaults to loopback AND passes host to listen()"
+    else
+        fail "graphql-server/server.js no longer defaults to loopback or no longer passes host to listen() — the unset path exposes it on every interface"
+    fi
+fi
 
 # ── Test 18c: the graphql dep install stays script-free (TEST-011) ──────────
 #
@@ -633,15 +655,24 @@ esac
 # unnoticed for a whole review round. Source-level for the same reason 18b is —
 # the preflight-selftest CI job installs no Go, so a build-and-start assertion
 # would skip in exactly the job that runs the guards.
-if grep -qF 'os.Getenv("BIND_HOST")' "${THIS_DIR}/forms-target/main.go"; then
-    ok "forms-target/main.go reads BIND_HOST"
+# QUAL-007: forms-target no longer reads BIND_HOST itself — the resolution moved to
+# test/internal/target, which Test 18b above asserts once (the loopback default AND
+# that every target including this one delegates to it). Re-grepping this file for
+# `os.Getenv("BIND_HOST")` here would now FAIL on correct code, and re-asserting the
+# default would duplicate 18b. What is still specific to forms-target, and still
+# worth pinning, is that BOTH halves of ITS seam exist: the shell passes
+# FORMS_TARGET_BIND_HOST (asserted above) and the target consumes a bind address at
+# all rather than hardcoding one.
+if grep -qF 'target.Addr(port)' "${THIS_DIR}/forms-target/main.go"; then
+    ok "forms-target/main.go resolves its bind through the shared, asserted helper"
 else
-    fail "forms-target/main.go no longer reads BIND_HOST — the shell seam is inert and the target binds every interface"
+    fail "forms-target/main.go no longer resolves its bind through test/internal/target — the FORMS_TARGET_BIND_HOST seam the shell half passes may be inert"
 fi
-if grep -qE 'host = "127\.0\.0\.1"' "${THIS_DIR}/forms-target/main.go"; then
-    ok "forms-target/main.go defaults to loopback when BIND_HOST is unset"
+if grep -qE '^[[:space:]]*(port|addr)' "${THIS_DIR}/forms-target/main.go" \
+   && ! grep -qE 'net\.Listen(AndServe)?\("tcp", *"127\.0\.0\.1' "${THIS_DIR}/forms-target/main.go"; then
+    ok "forms-target/main.go does not hardcode a bind address (the seam is live)"
 else
-    fail "forms-target/main.go no longer defaults to loopback — an unset BIND_HOST would bind every interface"
+    fail "forms-target/main.go hardcodes its bind address — FORMS_TARGET_BIND_HOST cannot widen it and the shell half above is inert"
 fi
 
 # ── Test 20: wait_for_http bounds its curl probe (TEST-017, SEC-BE-012) ─────
@@ -918,7 +949,7 @@ echo "────────────────────────�
 # timeout+dirname+sleep 2, stat 2. A degraded host still totals
 # EXPECTED_ASSERTIONS and stays green, while a DELETED assertion is now caught on
 # every host rather than only on a fully-equipped one.
-EXPECTED_ASSERTIONS=77
+EXPECTED_ASSERTIONS=73
 if [ "$((PASS + FAIL + SKIP_CREDIT))" -ne "${EXPECTED_ASSERTIONS}" ]; then
     echo "setup-live-targets_test: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (Passed+Failed+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A Test block was added or removed without updating EXPECTED_ASSERTIONS."
