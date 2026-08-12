@@ -1193,8 +1193,20 @@ echo "=== Suite coverage: every suite in test/ is wired into some CI job (TEST-0
 # add the CI step in the first place. Mirrors the ALL_TARGETS/BROWSER_TARGETS
 # exhaustiveness pattern below: derive the candidate set from the tree instead
 # of trusting a hardcoded list to stay current.
+# TEST-019: derive from TRACKED files, not a working-tree listing. An `ls` picks up
+# untracked scratch copies — a `test/foo_test.sh` left over from debugging — and then
+# demands CI wiring for a file that is not in the repo, failing the suite on the
+# developer's machine and nowhere else. Falls back to `ls` only outside a git
+# checkout (a release tarball), where the two are equivalent anyway.
 mapfile -t candidate_suites < <(
-    (cd "$SCRIPT_DIR" && ls -1 -- *selftest.sh *_test.sh 2>/dev/null; printf '%s\n' test-runner-args.sh) | sort -u
+    {
+        if git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            git -C "$SCRIPT_DIR" ls-files -- '*selftest.sh' '*_test.sh' | xargs -r -n1 basename
+        else
+            (cd "$SCRIPT_DIR" && ls -1 -- *selftest.sh *_test.sh 2>/dev/null)
+        fi
+        printf '%s\n' test-runner-args.sh
+    } | sort -u
 )
 if printf '%s\n' "${candidate_suites[@]}" | grep -qx 'install-chrome-selftest.sh' \
    && printf '%s\n' "${candidate_suites[@]}" | grep -qx 'test-runner-args.sh'; then

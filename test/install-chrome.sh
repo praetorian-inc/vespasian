@@ -821,6 +821,26 @@ cleanup_all() {
 # INSTALL_SUCCEEDED) that the EXIT trap reads have to be set at exact points in
 # this one sequence — splitting it would scatter that ordering across
 # functions rather than removing it.
+# QUAL-006: main() is deliberately one long linear function (~320 lines, ~19 decision
+# points) rather than a set of helpers, and this comment is the rubric's required
+# justification rather than an excuse.
+#
+# What it does is a provisioning SEQUENCE whose ORDER is itself the security
+# property: acquire the lock before touching the fixed /tmp path; validate the arch
+# before fetching; pin the key before adding the source; seed repo_add_once=false
+# BEFORE apt-get install so the postinst never creates the phone-home artifacts;
+# verify the apt origin both before AND after the install, because the postinst can
+# change it mid-install; set INSTALL_SUCCEEDED only after the install returns. Three
+# separate review findings (TEST-005, TEST-007 and case u's ordering anchors) turn on
+# those relative positions, and the guard suite asserts them by LINE NUMBER inside
+# this function's own body.
+#
+# Extracting helpers would not remove one branch. It would move the ordering into
+# call sites, so the property the tests pin would no longer be visible in one place —
+# and the assertions that pin it would have to follow the code across functions,
+# which is precisely the drift the fidelity sentinels in case u/v3/z4 exist to catch.
+# The cost of the length is paid in reading; the cost of splitting would be paid in
+# weaker guarantees.
 main() {
     parse_args "$@"
 

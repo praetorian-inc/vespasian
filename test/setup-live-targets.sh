@@ -469,7 +469,26 @@ pid_matches_service() {
     [ "$comm" = "node" ] || return 1
     base="$(service_default_port "$name")"
     [ -n "$base" ] || return 1
-    for wpid in $(orphan_pids_by_port "$base"); do
+    # SEC-BE-008: honour "cannot determine" separately from "does not match".
+    # orphan_pids_by_port returns 2 when lsof is absent; treating that as
+    # not-a-match (which a bare `for` over its output does, since the loop ignores
+    # the exit status) meant teardown declined to kill graphql-server on every host
+    # without lsof, cleared its pid record anyway, and reported success.
+    #
+    # The port check exists to avoid killing an UNRELATED node process during a
+    # --sweep, where the candidate PID was discovered rather than recorded. When
+    # the PID came from our own pid log the provenance is already established, so
+    # the port check is corroboration, not the basis — and falling back to
+    # "node with the right name in our log" is correct rather than lax. A sweep
+    # cannot reach here with an unverifiable PID: sweep_orphans obtains its
+    # candidates FROM orphan_pids_by_port, which returns nothing when it cannot look.
+    local port_pids port_rc
+    port_pids="$(orphan_pids_by_port "$base")"
+    port_rc=$?
+    if [ "$port_rc" -eq 2 ]; then
+        return 0
+    fi
+    for wpid in $port_pids; do
         [ "$wpid" = "$pid" ] && return 0
     done
     return 1
@@ -693,7 +712,21 @@ orphan_pids_by_name() {
 orphan_pids_by_port() {
     local base=$1
     local end=$((base + 20)) pid comm
-    command -v lsof >/dev/null 2>&1 || return 0
+    # SEC-BE-008: distinguish "no listeners found" from "cannot look". Returning 0
+    # with no output for BOTH made the two indistinguishable to callers, and the
+    # consequence was silent: pid_matches_service's graphql-server arm requires a
+    # listening socket in the port window, so on a host without lsof it always
+    # answered "not a match" — stop_service then skipped the kill, cleared the pid
+    # record anyway, and reported "no running processes found" while an
+    # unauthenticated Apollo server kept listening with its only record erased.
+    # Return 2 for "cannot determine" so a caller can tell, and warn once.
+    if ! command -v lsof >/dev/null 2>&1; then
+        if [ -z "${_LSOF_MISSING_WARNED:-}" ]; then
+            log_warn "lsof not found — cannot identify node listeners by port; graphql-server may be left running by teardown. Install lsof for reliable teardown." >&2
+            _LSOF_MISSING_WARNED=1
+        fi
+        return 2
+    fi
     # One ranged lsof call (mirrors show_port_holders) instead of 21 per-port
     # invocations; -t yields de-duplicated PIDs, which we then filter to node.
     for pid in $(lsof -nP -tiTCP:"${base}-${end}" -sTCP:LISTEN 2>/dev/null || true); do

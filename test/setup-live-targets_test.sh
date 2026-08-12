@@ -493,6 +493,49 @@ else
     skip "pgrep required" 2
 fi
 
+# ── Test 17b: no lsof means "cannot determine", not "no match" (SEC-BE-008) ──
+#
+# orphan_pids_by_port used to `return 0` with no output when lsof was absent, which
+# is indistinguishable from "looked, found nothing". pid_matches_service's
+# graphql-server arm requires a listening socket in the port window, so on any host
+# without lsof it always answered "not a match": stop_service skipped the kill,
+# cleared the pid record anyway, and reported "no running processes found" while an
+# unauthenticated Apollo server kept listening with its only record erased.
+#
+# Driven with a PATH that deliberately lacks lsof, built by symlinking just the
+# tools the seam itself needs, so `command -v lsof` genuinely misses.
+echo "Test 17b: teardown can still identify graphql-server on a host without lsof (SEC-BE-008)"
+nolsof_bin="${STATE_DIR}/nolsof-bin"
+mkdir -p "${nolsof_bin}"
+for t in ps basename sleep grep sed awk cat head cut tr sort; do
+    src="$(command -v "$t" 2>/dev/null)" || continue
+    ln -sf "$src" "${nolsof_bin}/${t}" 2>/dev/null || true
+done
+if [ -x "${nolsof_bin}/ps" ] && ! PATH="${nolsof_bin}" command -v lsof >/dev/null 2>&1; then
+    cp "$(command -v sleep)" "${STATE_DIR}/node"
+    "${STATE_DIR}/node" 60 &
+    nl_pid=$!; SPAWNED_PIDS+=("$nl_pid"); disown "$nl_pid" 2>/dev/null || true
+    # The seam must report "cannot determine" (rc 2), not success-with-no-output.
+    ( PATH="${nolsof_bin}"; real_orphan_pids_by_port 8992 >/dev/null 2>&1 )
+    assert_eq "$?" "2" "real orphan_pids_by_port returns 2 (cannot determine) when lsof is absent"
+    # And pid_matches_service must therefore ACCEPT a node process recorded in our
+    # own pid log, so teardown proceeds to kill it instead of silently declining.
+    #
+    # The harness sandboxes orphan_pids_by_port for the whole run (see the top of
+    # this file) so a stray sweep can never reach a developer's real process table.
+    # That stub always returns 0, which is exactly the value under test here, so this
+    # one subshell points the seam back at the real implementation.
+    (
+        PATH="${nolsof_bin}"
+        orphan_pids_by_port() { real_orphan_pids_by_port "$@"; }
+        pid_matches_service "$nl_pid" graphql-server >/dev/null 2>&1
+    )
+    assert_eq "$?" "0" "pid_matches_service accepts a recorded node PID when the port check cannot look"
+    kill -9 "$nl_pid" 2>/dev/null || true
+else
+    skip "could not build an lsof-free PATH for the SEC-BE-008 check" 2
+fi
+
 # ── Test 18: LIVE_TARGET_BIND_HOST seam reaches every non-hardened target ────
 echo "Test 18: rest-api/soap-service/concat-spa/graphql-server pass an explicit bind host (SEC-BE-015)"
 for fn in start_rest_api start_soap_service start_concat_spa start_graphql_server; do
@@ -949,7 +992,7 @@ echo "────────────────────────�
 # timeout+dirname+sleep 2, stat 2. A degraded host still totals
 # EXPECTED_ASSERTIONS and stays green, while a DELETED assertion is now caught on
 # every host rather than only on a fully-equipped one.
-EXPECTED_ASSERTIONS=73
+EXPECTED_ASSERTIONS=75
 if [ "$((PASS + FAIL + SKIP_CREDIT))" -ne "${EXPECTED_ASSERTIONS}" ]; then
     echo "setup-live-targets_test: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (Passed+Failed+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A Test block was added or removed without updating EXPECTED_ASSERTIONS."

@@ -57,13 +57,17 @@ export CHROME_PROBE_TIMEOUT=2
 # Assertion accounting (TEST-008), same idiom as preflight-selftest.sh's
 # EXPECTED_ASSERTIONS: deleting a whole case (security-relevant or otherwise)
 # left this suite green as long as every SURVIVING case still passed, because
-# nothing compared the total against any expectation. Enforced only when
-# skip_count is 0 (this suite's two environmental skips — a2 needs a git
-# checkout, l cannot run as root — legitimately change the total, and this
-# pin is not meant to turn a valid environment into a red build); the trust
-# anchor's own skip is already a hard failure via trust_anchor_skips,
-# independently of this pin.
-EXPECTED_ASSERTIONS=213
+# nothing compared the total against any expectation.
+#
+# TEST-001: enforced UNCONDITIONALLY, against pass+fail+skip_credit. An earlier
+# version gated the pin on `skip_count -eq 0`, which switched the whole check off on
+# any host missing one of the tools a skip arm depends on — precisely the hosts most
+# likely to differ from the author's. Each skip() call instead carries a CREDIT equal
+# to the number of assertions its block would have made, so the total is invariant
+# across degraded hosts and a deleted case still fails the suite. The trust anchor's
+# own skip is additionally a hard failure via trust_anchor_skips, independently of
+# this pin.
+EXPECTED_ASSERTIONS=214
 
 pass_count=0
 fail_count=0
@@ -390,13 +394,20 @@ fi
 # `|| true` guards the extraction so an empty match FAILS the check below rather
 # than aborting the suite under its own `set -euo pipefail`.
 key_fn_body_f=$(fn_code install_pinned_key)
-if printf '%s' "${key_fn_body_f}" \
-    | grep -E '^[[:space:]]*(if ! )?curl ' \
-    | grep -qF -- "--proto '=https' --proto-redir '=https'"; then
-    echo "PASS: case f: the key fetch pins --proto and --proto-redir to https (downgrade redirects refused)"
+# TEST-002: EVERY curl in the function must be pinned, not merely one of them. The
+# previous form piped all curl lines into a single `grep -qF`, which answers "does
+# any line carry the flags" — so adding a second, unpinned fetch (a mirror fallback,
+# a retry with different options) would have been accepted silently. Only one curl
+# exists today, so nothing was mis-certified; this closes the semantics rather than
+# a present-day hole. Counted rather than any-matched so the two numbers must agree.
+f_curl_lines=$(printf '%s\n' "${key_fn_body_f}" | grep -cE '^[[:space:]]*(if ! )?curl ' || true)
+f_curl_pinned=$(printf '%s\n' "${key_fn_body_f}" | grep -E '^[[:space:]]*(if ! )?curl ' \
+    | grep -cF -- "--proto '=https' --proto-redir '=https'" || true)
+if [ "${f_curl_lines}" -ge 1 ] && [ "${f_curl_lines}" -eq "${f_curl_pinned}" ]; then
+    echo "PASS: case f: all ${f_curl_lines} curl fetch(es) in install_pinned_key pin --proto/--proto-redir to https (downgrade redirects refused)"
     pass_count=$((pass_count + 1))
 else
-    echo "FAIL: case f: the key fetch no longer pins --proto/--proto-redir to https"
+    echo "FAIL: case f: ${f_curl_pinned} of ${f_curl_lines} curl fetch(es) in install_pinned_key pin --proto/--proto-redir to https — an unpinned fetch accepts a downgrade redirect"
     fail_count=$((fail_count + 1))
 fi
 
@@ -2910,15 +2921,42 @@ z4_lock="${z4_dir}/vespasian-install-chrome.lock"
 cat > "${z4_dir}/acquire.sh" <<'Z4EOF'
 #!/usr/bin/env bash
 # Mirrors main()'s acquisition: create ONLY when absent, open read-only, flock.
-LOCK_FILE="$1"; hold="$2"; wait_s="$3"
+# TEST-008: $4, when given, is a readiness file this script touches AFTER the lock is
+# held, so the contender can wait for the real event instead of guessing at a delay.
+LOCK_FILE="$1"; hold="$2"; wait_s="$3"; ready_file="${4:-}"
 if [ ! -e "$LOCK_FILE" ]; then install -m 0644 -- /dev/null "$LOCK_FILE"; fi
 exec {LOCK_FD}<"$LOCK_FILE"
-if flock -w "$wait_s" "$LOCK_FD"; then echo "ACQUIRED"; sleep "$hold"; else echo "BLOCKED"; fi
+if flock -w "$wait_s" "$LOCK_FD"; then
+    echo "ACQUIRED"
+    [ -n "$ready_file" ] && : > "$ready_file"
+    sleep "$hold"
+else
+    echo "BLOCKED"
+fi
 Z4EOF
 chmod +x "${z4_dir}/acquire.sh"
-"${z4_dir}/acquire.sh" "${z4_lock}" 3 1 > "${z4_dir}/holder.out" 2>&1 &
+# TEST-008: readiness signal, not a fixed sleep. `sleep 0.5` was the only
+# wall-clock-timed assertion in the four suites, and it was timed in the fragile
+# direction: if a throttled runner had not let the holder take the lock within 0.5s,
+# the contender ACQUIRED and this case failed on correct code. Waiting for the
+# holder's own signal removes the race; the bounded loop means a genuine failure to
+# acquire still fails (with a named diagnostic) rather than hanging the suite.
+z4_ready="${z4_dir}/holder.ready"
+rm -f "${z4_ready}"
+"${z4_dir}/acquire.sh" "${z4_lock}" 3 1 "${z4_ready}" > "${z4_dir}/holder.out" 2>&1 &
 z4_holder=$!
-sleep 0.5
+z4_waited=0
+while [ ! -e "${z4_ready}" ] && [ "${z4_waited}" -lt 100 ]; do
+    sleep 0.05
+    z4_waited=$((z4_waited + 1))
+done
+if [ -e "${z4_ready}" ]; then
+    echo "PASS: case z4: the holder signalled it holds the lock (readiness, not a fixed delay)"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case z4: the holder never signalled it acquired the lock within 5s — the mutual-exclusion assertions below cannot be trusted"
+    fail_count=$((fail_count + 1))
+fi
 z4_contender=$("${z4_dir}/acquire.sh" "${z4_lock}" 0 1 2>&1)
 wait "${z4_holder}" 2>/dev/null || true
 assert_eq "case z4: the first run acquires the install lock" \

@@ -61,7 +61,7 @@ skip() {
 #
 # Update deliberately when adding or removing an assertion, and update the
 # matching skip() credit if the change touches an environment-gated block.
-EXPECTED_ASSERTIONS=78
+EXPECTED_ASSERTIONS=84
 
 assert_eq() {
     local desc=$1 expected=$2 actual=$3
@@ -367,6 +367,53 @@ else
     fi
 fi
 
+# ── Case e3: the FIRST broken stub is the one reported (TEST-012) ──
+#
+# detect_chrome_binary keeps `stub` set to the FIRST non-runnable candidate it saw
+# and echoes that one on rc 2, so the diagnostic names the browser the operator most
+# likely meant. Nothing asserted it: every existing case that lands on rc 2 supplies a
+# single broken candidate, and case p discards stdout entirely, so the contract held
+# only by construction. With two broken candidates, echoing the LAST one — a one-line
+# change (`stub="$bin"` unconditionally) — was previously invisible.
+result=$(
+    (
+        # shellcheck source=setup-live-targets.sh
+        source "${SETUP_SCRIPT}"
+        # shellcheck disable=SC2034  # consumed by detect_chrome_binary from the sourced script
+        CHROME_CANDIDATES=("${SNAP_STUB}" "${GENERIC_BROKEN}")
+        set +e
+        out=$(detect_chrome_binary)
+        rc=$?
+        printf '%s\n%s\n' "${rc}" "${out}"
+    )
+)
+assert_eq "case e3: two broken candidates still report 'stub found, none runnable' (rc 2)" \
+    "2" "$(echo "${result}" | sed -n '1p')"
+assert_eq "case e3: the FIRST broken candidate is the one echoed, not the last" \
+    "${SNAP_STUB}" "$(echo "${result}" | sed -n '2p')"
+
+# ── Case e4: a runnable candidate wins even when listed after a stub (TEST-012) ──
+# The other half of the same contract: the loop must keep looking past a stub rather
+# than reporting the first thing it finds. Case a0 pins the production candidate
+# ORDER (real Chrome ahead of the snap stub); this pins that the order is honoured
+# even when a stub comes first.
+result=$(
+    (
+        # shellcheck source=setup-live-targets.sh
+        source "${SETUP_SCRIPT}"
+        # shellcheck disable=SC2034  # consumed by detect_chrome_binary from the sourced script
+        CHROME_CANDIDATES=("${SNAP_STUB}" "${WORKING_BROWSER}")
+        set +e
+        out=$(detect_chrome_binary)
+        rc=$?
+        printf '%s\n%s\n' "${rc}" "${out}"
+    )
+)
+assert_eq "case e4: a runnable candidate after a stub is still found (rc 0)" \
+    "0" "$(echo "${result}" | sed -n '1p')"
+assert_eq "case e4: the runnable candidate is echoed, not the earlier stub" \
+    "${WORKING_BROWSER}" "$(echo "${result}" | sed -n '2p')"
+
 # ── Case f: no timeout/gtimeout on PATH → bare-probe fallback ──
 # Exercises chrome_runnable's degrade path (stock macOS ships neither
 # timeout nor gtimeout). Restrict PATH to the fixture bin dir — which holds
@@ -509,10 +556,15 @@ EOF
         )
         cat "${errf}"
     }
+    # TEST-011: continuation lines and the loop keyword now sit at this block's own
+    # indentation. The comment's 2nd and 3rd lines were at column 0 and the `for` was
+    # too, while the loop BODY was indented 8 — which reads as though the loop is
+    # outside the enclosing block when it is inside it.
+    #
     # Boundary spellings matter here: an earlier zero-glob rejected 007, 00.1 and
-# 0.05 — all perfectly good budgets — while a plain `0` slipped through some
-# variants. Both directions are pinned: these must all still DETECT the browser.
-for bad in "abc" "-1" "2s" "1.2.3" "0" "00" "0.0" "0." "000.000" ".0" ""; do
+    # 0.05 — all perfectly good budgets — while a plain `0` slipped through some
+    # variants. Both directions are pinned: these must all still DETECT the browser.
+    for bad in "abc" "-1" "2s" "1.2.3" "0" "00" "0.0" "0." "000.000" ".0" ""; do
         rc_f3=$(CHROME_PROBE_TIMEOUT="${bad}" probe_working_browser)
         assert_eq "case f3: CHROME_PROBE_TIMEOUT='${bad}' still detects a working browser" \
             "0" "${rc_f3}"
@@ -806,6 +858,65 @@ run_setup_main() {
         main "$@" 2>&1
     ) || true
 }
+
+# ── Case n2: a browserless run REACHES write_config (TEST-013) ──
+#
+# Case n proves a browserless setup gets past the prerequisite gate, and that is where
+# its stub exits. Nothing proved the run goes on to WRITE the config, which is the
+# outcome AC2 actually promises: `run-live-tests.sh --group offline` must work on a
+# fresh browserless checkout, and it loads ports and TARGETS_SETUP from
+# .live-test-config. A browser gate that turned fatal LATER — past the gate but before
+# write_config — would satisfy every other assertion in this file while leaving the
+# offline group with nothing to load.
+#
+# NOT driven with --skip-start: that flag deliberately `exit 0`s after the build with
+# "services not started", so a skip-start run legitimately never reaches write_config
+# and asserting otherwise would be asserting a false contract. Instead the build and
+# the service start are stubbed and main() is allowed to run through to the end.
+# STATE_DIR is resolved at SOURCE time from SETUP_LIVE_TARGETS_STATE_DIR, so the
+# override is exported before sourcing rather than set afterwards.
+n2_state="${FIXTURE_DIR}/n2-state"
+mkdir -p "${n2_state}"
+# stdout is not the outcome under test — the config FILE is — so it is kept on disk
+# for inspection rather than captured into an unused variable (SC2034).
+{
+    (
+        export SETUP_LIVE_TARGETS_STATE_DIR="${n2_state}"
+        # shellcheck source=setup-live-targets.sh
+        source "${SETUP_SCRIPT}"
+        # shellcheck disable=SC2034  # consumed by detect_chrome_binary from the sourced script
+        CHROME_CANDIDATES=("${SNAP_STUB}")
+        build_vespasian()     { :; }
+        build_grpc_server()   { :; }
+        build_graphql_server() { :; }
+        # Nothing is actually started: the port resolver reports a fixed port and the
+        # starter is a no-op, so this case cannot leave a listener or a PID behind.
+        # shellcheck disable=SC2034  # both are consumed by the sourced main(), not here
+        resolve_port_or_die() { RESOLVED_PORT=19999; GRPC_SERVER_PORT=19999; }
+        start_grpc_server()   { :; }
+        cleanup_stale_state() { :; }
+        # teardown_on_failure is armed by main() via an EXIT trap; with the starts
+        # stubbed it has nothing to tear down, but disarm it so a stray failure in
+        # this subshell cannot reach into the fixture tree.
+        teardown_on_failure() { :; }
+        set +e
+        main --targets grpc-server 2>&1
+    )
+} > "${n2_state}/main.out" 2>&1 || true
+if [ -f "${n2_state}/.live-test-config" ]; then
+    echo "PASS: case n2: a browserless setup reaches write_config and leaves a config behind (AC2)"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case n2: a browserless setup did NOT reach write_config — no .live-test-config was written, so 'run-live-tests.sh --group offline' has nothing to load on a browserless checkout (AC2)"
+    fail_count=$((fail_count + 1))
+fi
+if grep -qE '^TARGETS_SETUP=' "${n2_state}/.live-test-config" 2>/dev/null; then
+    echo "PASS: case n2: the config the browserless run wrote carries TARGETS_SETUP"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case n2: the browserless run's config has no TARGETS_SETUP line — run-live-tests.sh cannot tell which targets were provisioned"
+    fail_count=$((fail_count + 1))
+fi
 
 # grpc-server speaks gRPC reflection and never launches a browser; --skip-start
 # starts nothing at all. A browserless host must therefore get through setup.
