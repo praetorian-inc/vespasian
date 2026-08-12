@@ -310,6 +310,26 @@ The config file is loaded only when a selected target actually talks to a live s
 
 Where per-target result files are written; defaults to `test/.results/`. Override it to keep a run's output out of the repo — `test/test-runner-args.sh` sets it to a temp dir for the one block that really executes the runner, so the guard suite leaves nothing behind.
 
+### `LIVE_TARGET_BIND_HOST` (optional — widens an exposure)
+
+Bind address for `rest-api`, `soap-service`, `concat-spa` and `graphql-server`. Defaults to
+`127.0.0.1`.
+
+These four targets are unauthenticated by design — they exist to give the scanner something to
+discover — so they bind loopback and stay unreachable from the network. Setting this to `0.0.0.0`
+exposes all four on every interface for as long as the run lasts.
+
+The one legitimate reason to set it is the devcontainer flow, where the crawler runs inside a
+container and reaches the host through `TEST_HOST` rather than loopback:
+
+```bash
+LIVE_TARGET_BIND_HOST=0.0.0.0 ./test/setup-live-targets.sh
+```
+
+`forms-target` has its own equivalent (`FORMS_TARGET_BIND_HOST`, below) and `grpc-server` hardcodes
+loopback. Both halves of this seam are asserted — that `setup-live-targets.sh` passes the value, and
+that each target's own source reads it — because either half alone is inert.
+
 ### `LIVE_TESTS_ALLOW_NO_EXECUTION` (optional — disables a merge gate)
 
 Set to any non-empty value to make `run-live-tests.sh` treat a run in which **every** selected target

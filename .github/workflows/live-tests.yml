@@ -181,7 +181,17 @@ jobs:
           set -euo pipefail
           # shellcheck source=test/common.sh
           . ./test/common.sh
-          bin=$(detect_chrome_binary)
+          # QUAL-001: check the exit status, don't just take stdout. On failure
+          # detect_chrome_binary returns non-zero with an EMPTY stdout, and
+          # `bin=$(...)` swallows that under `set -e` because a failing command
+          # substitution in an assignment does not trip errexit. The next line
+          # then ran `"" --headless …`, whose "command not found" is a far worse
+          # diagnostic than the real one.
+          bin=$(detect_chrome_binary) || {
+            echo "detect_chrome_binary found no runnable browser after install" >&2
+            exit 1
+          }
+          [ -n "${bin}" ] || { echo "detect_chrome_binary returned an empty path" >&2; exit 1; }
           echo "detected: ${bin}"
           "${bin}" --headless --no-sandbox --dump-dom about:blank >/dev/null
 
@@ -215,13 +225,24 @@ jobs:
           if [ -s /usr/share/vespasian/chrome-version ]; then
             record=/usr/share/vespasian/chrome-version
             . ./test/common.sh
-            bin=$(detect_chrome_binary)
+            bin=$(detect_chrome_binary) || { echo "detect_chrome_binary failed"; fail=1; bin=""; }
             # Major version only: the record is written once at install time and
             # the binary could legitimately be a later build by the time a
             # re-run reads it, but the major cannot drift within one job.
-            major=$("${bin}" --version | grep -oE '[0-9]+' | head -1)
-            grep -qF "$major" "$record" \
-              || { echo "version record does not name the installed major ($major): $(cat "$record")"; fail=1; }
+            #
+            # Compare the record's OWN first version number to the installed
+            # major, rather than substring-searching for it. `grep -qF 150`
+            # also matched "1150", "3150" and a date like "2026-08-11 150", so
+            # it passed on records that never named this build. An equality test
+            # on the extracted number has no anchoring subtlety at all — and
+            # `^` inside an ERE alternation group is not an anchor in GNU grep,
+            # so the obvious regex fix silently matched nothing.
+            if [ -n "${bin}" ]; then
+              major=$("${bin}" --version | grep -oE '[0-9]+' | head -1)
+              rec_major=$(grep -oE '[0-9]+' "$record" | head -1)
+              [ "$rec_major" = "$major" ] \
+                || { echo "version record names major '$rec_major', installed is '$major': $(cat "$record")"; fail=1; }
+            fi
             mode=$(stat -c '%a' "$record")
             [ "$mode" = "644" ] || { echo "version record mode is $mode, expected 644"; fail=1; }
           fi

@@ -322,7 +322,16 @@ build_graphql_server() {
     log_info "Installing graphql-server dependencies..."
     cd "${SCRIPT_DIR}/graphql-server"
     if [ ! -d "node_modules" ]; then
-        npm install --silent
+        # SEC-BE-007: `npm ci --ignore-scripts`, matching every other npm call
+        # site in this repo (both `npm ci --ignore-scripts` invocations in
+        # .github/workflows/live-tests.yml). `npm install` runs package lifecycle
+        # scripts from the dependency tree, which is arbitrary code execution
+        # from the registry on a developer's machine and on the CI runner, and it
+        # resolves loosely instead of honouring the committed lockfile.
+        # package-lock.json is committed here, so `ci` is a drop-in. It only ever
+        # runs when node_modules is absent, so `ci`'s clean-slate install costs
+        # nothing extra.
+        npm ci --ignore-scripts --silent
     fi
     log_ok "graphql-server dependencies installed"
 }
@@ -467,15 +476,18 @@ pid_matches_service() {
 }
 
 # LIVE_TARGET_BIND_HOST is the same seam FORMS_TARGET_BIND_HOST already gives
-# forms-target, extended to the other targets whose own source has no bind
-# control (SEC-BE-015): rest-api, soap-service, concat-spa, and graphql-server
-# default to the wildcard address in their own main.go/server.js (unlike
-# forms-target and grpc-server, which already default to loopback). Passing
-# it here is a NO-OP for those four until each target's own source is changed
-# to read it — this script cannot make a target bind loopback that never reads
-# a host env var. It is set now so the shell side no longer needs a second
-# change once each target's one-line fix (mirroring forms-target/main.go, see
-# `host := os.Getenv("BIND_HOST")`) lands. Widen explicitly with:
+# forms-target, extended to rest-api, soap-service, concat-spa and
+# graphql-server (SEC-BE-015). All four used to bind the wildcard address in
+# their own main.go/server.js; each now reads BIND_HOST and defaults to
+# 127.0.0.1, mirroring forms-target/main.go (`host := os.Getenv("BIND_HOST")`)
+# and grpc-server, which hardcodes loopback. So the seam is LIVE end to end:
+# both halves — the value this script passes and the read in each target — are
+# asserted, by setup-live-targets_test.sh Tests 18 and 18b respectively, because
+# either half alone is inert.
+#
+# These are unauthenticated services, so loopback is the default and widening is
+# explicit and opt-in — needed only for the devcontainer flow where a crawler in
+# a container reaches the host by TEST_HOST:
 #   LIVE_TARGET_BIND_HOST=0.0.0.0 ./test/setup-live-targets.sh
 start_rest_api() {
     local port=$1
@@ -498,8 +510,7 @@ start_concat_spa() {
     local port=$1
     log_info "Starting concat-spa on port ${port}..."
     cd "${SCRIPT_DIR}/concat-spa"
-    # See LIVE_TARGET_BIND_HOST comment above start_rest_api (SEC-BE-015):
-    # currently a no-op until concat-spa/main.go reads BIND_HOST.
+    # See LIVE_TARGET_BIND_HOST comment above start_rest_api (SEC-BE-015).
     PORT="$port" BIND_HOST="${LIVE_TARGET_BIND_HOST:-127.0.0.1}" ./concat-spa &
     local pid=$!
     record_pid concat-spa "$pid"
@@ -540,8 +551,7 @@ start_soap_service() {
     local port=$1
     log_info "Starting soap-service on port ${port}..."
     cd "${SCRIPT_DIR}/soap-service"
-    # See LIVE_TARGET_BIND_HOST comment above start_rest_api (SEC-BE-015):
-    # currently a no-op until soap-service/main.go reads BIND_HOST.
+    # See LIVE_TARGET_BIND_HOST comment above start_rest_api (SEC-BE-015).
     PORT="$port" WSDL_PATH="${SCRIPT_DIR}/soap-service/service.wsdl" BIND_HOST="${LIVE_TARGET_BIND_HOST:-127.0.0.1}" ./soap-service &
     local pid=$!
     record_pid soap-service "$pid"
@@ -559,9 +569,7 @@ start_graphql_server() {
     local port=$1
     log_info "Starting graphql-server on port ${port}..."
     cd "${SCRIPT_DIR}/graphql-server"
-    # See LIVE_TARGET_BIND_HOST comment above start_rest_api (SEC-BE-015):
-    # currently a no-op until graphql-server/server.js passes a host to
-    # httpServer.listen(port, host, ...).
+    # See LIVE_TARGET_BIND_HOST comment above start_rest_api (SEC-BE-015).
     PORT="$port" BIND_HOST="${LIVE_TARGET_BIND_HOST:-127.0.0.1}" node server.js > "${STATE_DIR}/.graphql-server.log" 2>&1 &
     local pid=$!
     record_pid graphql-server "$pid"

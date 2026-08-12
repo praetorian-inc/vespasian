@@ -1297,10 +1297,15 @@ if [[ -f "$WORKFLOW" ]]; then
         # the version string and 0644. Require the two content checks that close
         # that gap, so deleting either one fails here rather than silently
         # reverting the e2e assertion to a non-emptiness test.
-        if printf '%s\n' "$e2e_runlines" | grep -qE 'grep -qF "\$major" "\$record"'; then
-            pass "install-chrome-e2e asserts the record names the installed major version"
+        # Needle tracks the CURRENT shape: an equality test between the record's
+        # own first version number and the installed major. The previous needle
+        # matched the literal `grep -qF "$major" "$record"`, which was itself the
+        # defect — an unanchored substring search that "150" satisfied inside
+        # "1150" or a date. Assert the comparison exists, not the old spelling.
+        if printf '%s\n' "$e2e_runlines" | grep -qE '\[ "\$rec_major" = "\$major" \]'; then
+            pass "install-chrome-e2e asserts the record's version number EQUALS the installed major"
         else
-            fail "install-chrome-e2e no longer asserts the record CONTENT — a bare newline would satisfy the -s test alone (TEST-001)"
+            fail "install-chrome-e2e no longer compares the record's version to the installed major — a bare newline, or a record naming another build, would satisfy the -s test alone (TEST-001)"
         fi
         if printf '%s\n' "$e2e_runlines" | grep -qE 'stat -c .%a. "\$record"'; then
             pass "install-chrome-e2e asserts the record's achieved mode"

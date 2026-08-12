@@ -68,6 +68,7 @@ EXPECTED_ASSERTIONS=192
 pass_count=0
 fail_count=0
 skip_count=0
+skip_credit=0
 # Skips that represent a real coverage hole rather than an unsuitable
 # environment. Only the trust-anchor success path qualifies; see the policy at
 # the end of this file.
@@ -87,9 +88,21 @@ SUITE_COMPLETED=0
 # A check that could not run is NOT a pass. Tallied separately so the summary
 # distinguishes "verified" from "unverifiable here", following the
 # pass/fail/skip precedent in test/run-live-tests.sh's result table.
+# TEST-003: every skip carries a CREDIT — the number of assertions that block
+# would have added on a fully-equipped host — so the accounting sentinel below
+# can be enforced unconditionally instead of switching itself off the moment
+# anything skips. Every skip trigger in this file is ambient (a git checkout, the
+# key fixture, gpg, running as root), so the old `skip_count -eq 0` guard meant
+# the pin stopped being checked precisely on the hosts most likely to differ from
+# the author's, silently. Credits were MEASURED, not estimated: each skip arm was
+# forced on a fully-equipped host and the assertion delta read off. a2=1, j/j2=14,
+# l=3, v=12, y=3; 192 on a full run. Cross-checked: an empty key fixture forces
+# a2+j/j2+v+y and yields 162 passed, and 162+1+14+12+3 = 192.
 skip() {
+    local credit=${2:-0}
     echo "SKIP: $1"
     skip_count=$((skip_count + 1))
+    skip_credit=$((skip_credit + credit))
 }
 
 assert_eq() {
@@ -188,7 +201,7 @@ else
     # SKIP, not PASS: a git-less copy (tarball, `git archive`, docker COPY
     # without .git) cannot answer this, and counting it as a pass made the
     # summary indistinguishable from a real run.
-    skip "case a2: committed-mode check (not a git checkout)"
+    skip "case a2: committed-mode check (not a git checkout)" 1
 fi
 
 # Direct-exec companion to the index check above (see its rationale); this one
@@ -857,9 +870,9 @@ else
     # Counted separately: this is the trust anchor's ONLY success-path coverage,
     # so skipping it is a coverage hole rather than an unsuitable environment.
     if [ "${have_gpg}" -eq 1 ]; then
-        skip "case j/j2: trust-anchor success path (fixture test/fixtures/google-linux-signing-key.asc missing or empty)"
+        skip "case j/j2: trust-anchor success path (fixture test/fixtures/google-linux-signing-key.asc missing or empty)" 14
     else
-        skip "case j/j2: trust-anchor success path (gpg not found on PATH)"
+        skip "case j/j2: trust-anchor success path (gpg not found on PATH)" 14
     fi
     trust_anchor_skips=$((trust_anchor_skips + 1))
 fi
@@ -935,7 +948,7 @@ if [ "$(id -u)" -ne 0 ]; then
     assert_contains "case l: the refusal names the reason" \
         "Not running as root and sudo is unavailable" "$(cat "${msgfile_l}" 2>/dev/null)"
 else
-    skip "case l: non-root sudo refusal (running as root)"
+    skip "case l: non-root sudo refusal (running as root)" 3
 fi
 
 # The two SUCCESS paths had no coverage at all -- neither is hypothetical, both
@@ -2117,7 +2130,7 @@ if [ "${have_real_key}" -eq 1 ]; then
     assert_contains "case v: the non-container message names the actual state (no update channel), not a false 'left alone'" \
         "no apt update channel" "${res_v2}"
 else
-    skip "case v: main-install-path in_container() gating (needs the same key fixture/gpg as j/j2)"
+    skip "case v: main-install-path in_container() gating (needs the same key fixture/gpg as j/j2)" 12
 fi
 
 # ── Case w: verify_apt_origin, both arms (TEST-010 / SEC-BE-002) ─
@@ -2489,7 +2502,7 @@ EOF
         pass_count=$((pass_count + 1))
     fi
 else
-    skip "case y: pre-install origin gate (needs the same key fixture/gpg as j/j2)"
+    skip "case y: pre-install origin gate (needs the same key fixture/gpg as j/j2)" 3
 fi
 
 # ── Case z: the install lock (SEC-BE-006 / SEC-BE-008 / TEST-011 / TEST-012) ──
@@ -2714,8 +2727,8 @@ if [ "${skip_count}" -ne 0 ]; then
     echo "install-chrome-selftest: NOTE — ${skip_count} case(s) skipped for environmental reasons"
     echo "  (a2 needs a git checkout; l cannot run as root). Not a failure, but not coverage either."
 fi
-if [ "${skip_count}" -eq 0 ] && [ "$((pass_count + fail_count))" -ne "${EXPECTED_ASSERTIONS}" ]; then
-    echo "install-chrome-selftest: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail), saw $((pass_count + fail_count))."
+if [ "$((pass_count + fail_count + skip_credit))" -ne "${EXPECTED_ASSERTIONS}" ]; then
+    echo "install-chrome-selftest: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip_credit), saw $((pass_count + fail_count + skip_credit))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
     exit 1
 fi

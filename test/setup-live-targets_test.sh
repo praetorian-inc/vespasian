@@ -548,6 +548,23 @@ case "$(declare -f start_forms_target)" in
     *)
         fail "start_forms_target defaults BIND_HOST to 127.0.0.1 (source changed)" ;;
 esac
+# TEST-008: the check above covers only the SHELL half. forms-target is the
+# target this seam was modelled on, so it gets the same both-halves treatment as
+# Test 18b: the value the shell passes is inert unless the target reads it, and
+# asserting one without the other is how the four siblings' inert seam went
+# unnoticed for a whole review round. Source-level for the same reason 18b is —
+# the preflight-selftest CI job installs no Go, so a build-and-start assertion
+# would skip in exactly the job that runs the guards.
+if grep -qF 'os.Getenv("BIND_HOST")' "${THIS_DIR}/forms-target/main.go"; then
+    ok "forms-target/main.go reads BIND_HOST"
+else
+    fail "forms-target/main.go no longer reads BIND_HOST — the shell seam is inert and the target binds every interface"
+fi
+if grep -qE 'host = "127\.0\.0\.1"' "${THIS_DIR}/forms-target/main.go"; then
+    ok "forms-target/main.go defaults to loopback when BIND_HOST is unset"
+else
+    fail "forms-target/main.go no longer defaults to loopback — an unset BIND_HOST would bind every interface"
+fi
 
 # ── Test 20: wait_for_http bounds its curl probe (TEST-017, SEC-BE-012) ─────
 #
@@ -752,7 +769,7 @@ echo "────────────────────────�
 # selftest.sh's own (pre-existing, TEST-003-flagged) gate: this file's skips
 # are all ambient-toolchain (python3/lsof/pgrep/curl/timeout), and turning a
 # valid degraded environment into a red build is not the point of this pin.
-EXPECTED_ASSERTIONS=63
+EXPECTED_ASSERTIONS=65
 if [ "${SKIP}" -eq 0 ] && [ "$((PASS + FAIL))" -ne "${EXPECTED_ASSERTIONS}" ]; then
     echo "setup-live-targets_test: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (Passed+Failed), saw $((PASS + FAIL))."
     echo "  A Test block was added or removed without updating EXPECTED_ASSERTIONS."
