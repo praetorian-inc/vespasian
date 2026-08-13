@@ -36,9 +36,13 @@
 # ("gating on Properties alone MADE the recursion unreachable") is excluded too: that
 # describes something that already happened rather than promising anything about now.
 #
-# By default it checks only files changed against a base ref, so it ratchets — new and
-# modified code must comply, and pre-existing claims are not a merge blocker. Pass
-# --all to sweep the whole tree.
+# By default it checks only comment BLOCKS whose lines changed against a base ref, so
+# it ratchets — new and modified code must comply, and pre-existing claims are not a
+# merge blocker. Editing a claim brings it into scope, since that is asserting it
+# afresh; editing an unrelated function in the same file does not. Selecting whole
+# changed FILES was the first attempt and did not deliver that: merging main into a
+# branch pulled seven untouched claims by other authors into scope and failed the
+# build. Pass --all to sweep the whole tree (advisory).
 
 set -uo pipefail
 
@@ -101,18 +105,52 @@ fi
 
 status=0
 
-list_files() {
-  if [ "$MODE" = all ]; then
-    git ls-files '*.go'
-  elif git rev-parse --verify --quiet "$BASE" >/dev/null; then
-    git diff --name-only --diff-filter=d "$BASE"...HEAD -- '*.go'
+# SCOPE_BY_LINE is 1 only when a real base ref gives us a diff to read; otherwise
+# (--all, or a missing base) every comment block in the listed files is in scope.
+#
+# Decided HERE, in the parent shell, and deliberately not inside list_files: that
+# function is consumed as `done < <(list_files)`, and process substitution runs in a
+# subshell, so an assignment made there is discarded. Setting it inside silently left
+# this at 0 and disabled the whole line-scoping pass while every file still got
+# listed — the check kept working and just stopped ratcheting.
+SCOPE_BY_LINE=0
+if [ "$MODE" = changed ]; then
+  if git rev-parse --verify --quiet "$BASE" >/dev/null; then
+    SCOPE_BY_LINE=1
   else
     # A missing base ref (shallow clone, detached CI checkout) degrades to the full
     # sweep rather than silently checking nothing. A check that quietly passes is
     # worse than one that is noisy.
     echo "warning: base ref $BASE not found; sweeping all files" >&2
+  fi
+fi
+
+list_files() {
+  if [ "$SCOPE_BY_LINE" -eq 1 ]; then
+    git diff --name-only --diff-filter=d "$BASE"...HEAD -- '*.go'
+  else
     git ls-files '*.go'
   fi
+}
+
+# changed_lines echoes the post-image line numbers this file gained or altered
+# against BASE, one "start,count" range per line, parsed from -U0 hunk headers.
+#
+# This is what makes the check a RATCHET rather than a blanket gate, and the
+# difference is not cosmetic. Selecting whole changed FILES means any pre-existing
+# uncited claim anywhere in a file blocks the merge the moment someone edits an
+# unrelated function in it — which contradicts this script's own header ("pre-existing
+# claims are not a merge blocker") and the Makefile's. It fired for real: merging main
+# into a branch pulled seven claims written by other authors into scope and failed the
+# build, none of them touched by that branch.
+#
+# Block-level, not line-level, granularity is deliberate: a citation may sit anywhere
+# in a comment block, so the unit of judgement is the whole block. A block counts as
+# in scope when ANY of its lines changed. Editing a claim therefore brings it into
+# scope (you are asserting it afresh), while leaving it alone does not.
+changed_lines() {
+  git diff -U0 "$BASE"...HEAD -- "$1" |
+    sed -n 's/^@@ -[0-9,]* +\([0-9]*\),\{0,1\}\([0-9]*\) @@.*/\1,\2/p'
 }
 
 while IFS= read -r file; do
@@ -122,13 +160,46 @@ while IFS= read -r file; do
   esac
   [ -f "$file" ] || continue
 
+  ranges=""
+  if [ "$SCOPE_BY_LINE" -eq 1 ]; then
+    ranges="$(changed_lines "$file")"
+    # No changed lines in a file the diff named means the change was a pure
+    # rename or mode change: nothing to judge.
+    [ -n "$ranges" ] || continue
+  fi
+
   # Walk each file's comment BLOCKS (runs of consecutive // lines), so a citation
   # anywhere in a block covers a claim anywhere in it.
-  VESPASIAN_TEST_NAMES="$existing_tests" \
-    awk -v file="$file" -v claim="$CLAIM" -v exclude="$EXCLUDE" -v cite="$CITATION" '
+  VESPASIAN_TEST_NAMES="$existing_tests" VESPASIAN_CHANGED_RANGES="$ranges" \
+    awk -v file="$file" -v claim="$CLAIM" -v exclude="$EXCLUDE" -v cite="$CITATION" \
+    -v scope_by_line="$SCOPE_BY_LINE" '
     BEGIN {
       n = split(ENVIRON["VESPASIAN_TEST_NAMES"], names, "\n")
       for (i = 1; i <= n; i++) if (names[i] != "") test_names[names[i]] = 1
+      nr_ranges = 0
+      if (scope_by_line) {
+        n = split(ENVIRON["VESPASIAN_CHANGED_RANGES"], rs, "\n")
+        for (i = 1; i <= n; i++) {
+          if (rs[i] == "") continue
+          split(rs[i], se, ",")
+          # A -U0 header of "+N" with no count means one line; "+N,0" is a pure
+          # deletion, which adds no post-image line and so is skipped.
+          cnt = (se[2] == "" ? 1 : se[2] + 0)
+          if (cnt <= 0) continue
+          nr_ranges++
+          lo[nr_ranges] = se[1] + 0
+          hi[nr_ranges] = se[1] + cnt - 1
+        }
+      }
+    }
+    # A block is in scope when any of its lines was added or altered. Whole-block
+    # granularity because a citation may sit anywhere in the block.
+    function block_in_scope(first, last,   i) {
+      if (!scope_by_line) return 1
+      for (i = 1; i <= nr_ranges; i++) {
+        if (first <= hi[i] && last >= lo[i]) return 1
+      }
+      return 0
     }
     function claim_line(b,   n, lines, i) {
       n = split(b, lines, "\n")
@@ -163,7 +234,9 @@ while IFS= read -r file; do
     function flush(   idx, lines) {
       if (block != "") {
         idx = claim_line(block)
-        if (idx) {
+        # `last` is the final line of the block: start plus its line count, less
+        # the leading empty field split() yields from the leading newline.
+        if (idx && block_in_scope(start, start + split(block, lines, "\n") - 2)) {
           first_bad = ""
           if (resolved_citation(block) == "") {
             split(block, lines, "\n")

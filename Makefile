@@ -31,9 +31,12 @@ lint:
 	golangci-lint run
 
 # Fails when a comment guarantees a state cannot occur without naming the test that
-# pins it. Scoped to files changed against BASE_REF (default origin/main) so it
-# ratchets: new and modified code must comply, pre-existing claims do not block a
-# merge. See the script header for the three LAB-4678 defects that motivated it.
+# pins it. Scoped to comment BLOCKS whose lines changed against BASE_REF (default
+# origin/main), so it genuinely ratchets: new and modified code must comply, and a
+# pre-existing claim in a file you edited elsewhere does not block the merge. It was
+# file-scoped first, which broke that promise the moment a branch merged main — seven
+# other authors' claims came into scope and failed the build. See the script header
+# for the three LAB-4678 defects that motivated the check itself.
 lint-comments: lint-comments-selftest
 	./scripts/check-unreachability-claims.sh --changed
 

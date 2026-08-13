@@ -18,12 +18,12 @@
 #
 #    Every case below asserts an EXACT exit code, so a checker that cannot start
 #    (returning 2 where 0 or 1 was expected) fails all of them. Verified by
-#    injecting an early `exit 2`: 9 of 9 cases failed.
+#    injecting an early `exit 2`: every case failed.
 #
 #    Read the limit precisely: this catches a portability fault only on the
 #    platform where that fault is fatal. Re-adding `mktemp -t NAME` and running
-#    this test on macOS still passes 9 of 9, because BSD mktemp accepts it — the
-#    very asymmetry that hid the bug. What closes the gap is the CI job running
+#    this test on macOS still passes everything, because BSD mktemp accepts it —
+#    the very asymmetry that hid the bug. What closes the gap is the CI job running
 #    this on ubuntu, not the test's existence. A green run here is evidence about
 #    this machine only.
 #
@@ -33,9 +33,13 @@
 # HOW IT WORKS
 #
 # Each case builds a throwaway git repo, drops the checker into scripts/, writes
-# fixture .go files, `git add`s them (the checker reads `git ls-files`, which lists
-# the index, so no commit is needed) and runs the checker in --all mode. A fresh
-# repo per case keeps one case's exit code from masking another's.
+# fixture .go files, and `git add`s them (the checker reads `git ls-files`, which
+# lists the index). A fresh repo per case keeps one case's exit code from masking
+# another's.
+#
+# Cases 1-9 run --all, where every comment block is in scope, and need no commit.
+# Cases 10-12 run --changed against a base ref and therefore do commit, because
+# that mode's whole point is which lines moved.
 #
 # mktemp is called as a bare `mktemp -d` with no template, which is the one form
 # both BSD and GNU accept — the bug above is not repeated here.
@@ -232,6 +236,103 @@ real_tests "$repo"
 claim_file "$repo" '// Thing does a thing. A second call can never happen.
 // TestNoSuchTestAnywhere and TestRealThing pin it.'
 assert_case "one resolving citation is enough alongside a phantom" 0 "!does not exist" "$repo"
+
+
+# ---------------------------------------------------------------------------
+# --changed mode: the RATCHET. Needs commits and a base ref, unlike the cases
+# above, so it gets its own fixture builder.
+#
+# Whole-file selection would flag a pre-existing claim the moment anyone edits an
+# unrelated function in the same file, which contradicts this checker's own header
+# and the Makefile's ("pre-existing claims are not a merge blocker"). It happened
+# for real: merging main into a branch pulled seven other authors' claims into
+# scope and failed the build.
+# ---------------------------------------------------------------------------
+
+# assert_changed NAME EXPECTED_EXIT EXPECTED_SUBSTRING REPO
+# Same contract as assert_case but runs --changed against the fixture's base-ref.
+assert_changed() {
+  local name="$1" want_exit="$2" want_sub="$3" repo="$4"
+  cases=$((cases + 1))
+
+  local out rc
+  out="$(cd "$repo" && BASE_REF=base-ref ./scripts/check-unreachability-claims.sh --changed 2>&1)"
+  rc=$?
+
+  local ok=1
+  if [ "$rc" -ne "$want_exit" ]; then
+    ok=0
+    printf 'FAIL %s\n  exit = %d, want %d\n' "$name" "$rc" "$want_exit"
+  fi
+  if [ -n "$want_sub" ]; then
+    case "$want_sub" in
+    '!'*)
+      if printf '%s' "$out" | grep -qF -- "${want_sub#!}"; then
+        ok=0
+        printf 'FAIL %s\n  output contains %q and must not\n' "$name" "${want_sub#!}"
+      fi
+      ;;
+    *)
+      if ! printf '%s' "$out" | grep -qF -- "$want_sub"; then
+        ok=0
+        printf 'FAIL %s\n  output lacks %q\n' "$name" "$want_sub"
+      fi
+      ;;
+    esac
+  fi
+
+  if [ "$ok" -eq 1 ]; then
+    printf 'ok   %s\n' "$name"
+  else
+    failures=$((failures + 1))
+    printf '  --- checker output ---\n%s\n  ----------------------\n' "$out"
+  fi
+  rm -rf "$repo"
+}
+
+# new_ratchet_repo builds a repo whose base-ref commit already contains an UNCITED
+# claim, so anything the caller does next is an edit on top of a pre-existing one.
+# Commits use the ambient git identity deliberately: overriding it is what the
+# no-override rule exists to prevent, and a throwaway repo needs no special author.
+new_ratchet_repo() {
+  local dir
+  dir="$(new_fixture_repo)" || return 1
+  mkdir -p "$dir/pkg"
+  cat >"$dir/pkg/a.go" <<'GOEOF'
+package a
+
+// Old is old. A second call can never happen.
+func Old() {}
+
+// Untouched is untouched.
+func Untouched() {}
+GOEOF
+  printf 'package a\n\nimport "testing"\n\nfunc TestRealThing(t *testing.T) {}\n' >"$dir/pkg/a_test.go"
+  git -C "$dir" add -A
+  git -C "$dir" commit -qm base
+  git -C "$dir" branch -q base-ref
+  echo "$dir"
+}
+
+# 10. An unrelated edit in a file holding a pre-existing uncited claim must NOT
+#     flag it. This is the ratchet.
+repo="$(new_ratchet_repo)" || exit 2
+perl -pi -e 's{// Untouched is untouched\.}{// Untouched now does more.}' "$repo/pkg/a.go"
+git -C "$repo" add -A && git -C "$repo" commit -qm edit-elsewhere
+assert_changed "unrelated edit does not pull in a pre-existing claim" 0 "!can never happen" "$repo"
+
+# 11. Editing the claim itself DOES bring it into scope — you are asserting it
+#     afresh, so it must carry a citation.
+repo="$(new_ratchet_repo)" || exit 2
+perl -pi -e 's{A second call can never happen\.}{A second call can never happen, truly.}' "$repo/pkg/a.go"
+git -C "$repo" add -A && git -C "$repo" commit -qm touch-the-claim
+assert_changed "editing a claim brings it into scope" 1 "unreachability claim with no test cited" "$repo"
+
+# 12. Every claim in a NEW file is in scope, since every line is added.
+repo="$(new_ratchet_repo)" || exit 2
+printf 'package a\n\n// New is new. This can never happen.\nfunc New() {}\n' >"$repo/pkg/b.go"
+git -C "$repo" add -A && git -C "$repo" commit -qm new-file
+assert_changed "a new file's claims are all in scope" 1 "pkg/b.go" "$repo"
 
 # ---------------------------------------------------------------------------
 echo
