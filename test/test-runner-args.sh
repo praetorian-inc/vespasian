@@ -1128,6 +1128,8 @@ fi
 
 echo ""
 echo "=== Un-gated CI job wiring (the guards must actually be invoked) ==="
+
+
 # Every suite in this repo is only as good as the CI step that runs it, and
 # those steps are hand-maintained in a YAML block that nothing checks. Dropping
 # one is invisible: the suite still passes locally, CI still goes green, and
@@ -1137,6 +1139,43 @@ WORKFLOW="$SCRIPT_DIR/../.github/workflows/live-tests.yml"
 if [[ ! -f "$WORKFLOW" ]]; then
     fail "live-tests.yml not found at $WORKFLOW"
 else
+    # TEST-020: every script the workflow DIRECT-EXECS must be committed executable.
+    #
+    # install-chrome-selftest.sh was 100755 for twenty-one commits and silently
+    # became 100644 at 5f45b53 ("assertions now prove, not grep"). live-tests.yml
+    # runs it as `./test/install-chrome-selftest.sh`, so from that commit on every
+    # CI run died with `Permission denied`, exit 126, BEFORE the suite executed a
+    # single assertion — measured in run 31619662298 on head 328d21f. The `test`
+    # job declares `needs: preflight-selftest`, so the live suite was skipped too.
+    # The guard suite was dead in CI for three review rounds while assertions were
+    # being ADDED to it, and nothing noticed: the job failed, but for a reason no
+    # assertion was watching. 4a2f939 had to restore the same bit on
+    # install-chrome.sh, so this has happened twice.
+    #
+    # The list is derived from the workflow, not hardcoded, so a newly
+    # direct-exec'd script is covered the day it is added. And the derivation is
+    # itself asserted non-empty: the first version of this check sat ABOVE the
+    # `WORKFLOW=` assignment, so its grep read an empty path, its loop never
+    # iterated, and it printed PASS with the exec bit reverted. A guard that
+    # cannot fail is the exact defect this suite exists to catch.
+    direct_exec_scripts=$(grep -oE 'run: \./(test/[a-zA-Z0-9_.-]+\.sh)' "$WORKFLOW" | sed 's|run: \./||' | sort -u)
+    if [[ -z "$direct_exec_scripts" ]]; then
+        fail "could not derive the direct-exec script list from live-tests.yml — the exec-bit assertion below would be vacuous"
+    else
+        exec_missing=""
+        while IFS= read -r rel; do
+            [[ -n "$rel" ]] || continue
+            mode=$(git -C "$SCRIPT_DIR/.." ls-files -s -- "$rel" 2>/dev/null | awk '{print $1}')
+            [[ -n "$mode" ]] || continue
+            [[ "$mode" == "100755" ]] || exec_missing="${exec_missing} ${rel}(${mode})"
+        done <<< "$direct_exec_scripts"
+        if [[ -n "$exec_missing" ]]; then
+            fail "live-tests.yml direct-execs script(s) NOT committed executable:${exec_missing} — CI dies with exit 126 before the suite runs one assertion"
+        else
+            pass "every script live-tests.yml direct-execs is committed 100755 ($(wc -l <<< "$direct_exec_scripts") scripts checked)"
+        fi
+    fi
+
     # TEST-018: the per-suite/continue-on-error/if: checks below all operate on
     # the preflight-selftest JOB BLOCK, which by construction starts after the
     # `preflight-selftest:` line — so none of them can see the top-level `on:`
@@ -1772,7 +1811,11 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # checks (TEST-018), +2 for targets_need_config's substring/glob-anchoring
 # checks (TEST-017 in the LAB-5064 review-round sense, not the TEST-017
 # skip-credit note above).
-EXPECTED_ASSERTIONS=121
+# TEST-020: 121 -> 122. One assertion added, checking that every script
+# live-tests.yml direct-execs is committed 100755 — the gap that let
+# install-chrome-selftest.sh run as 100644 and kill CI with exit 126 for three
+# review rounds without any assertion noticing.
+EXPECTED_ASSERTIONS=122
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
