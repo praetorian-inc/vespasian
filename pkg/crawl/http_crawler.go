@@ -51,6 +51,14 @@ func newHTTPClient(scopeFn func(string) bool, allowPrivate bool, timeout time.Du
 	transport := http.RoundTripper(http.DefaultTransport)
 	switch {
 	case proxyURL != nil:
+		// Cross-reference: pkg/httpx.BuildHTTPClient encodes the SAME
+		// security-sensitive TLS-verify gate below (InsecureSkipVerify only for
+		// --proxy-insecure && scheme http/https); keep the two in lockstep if that
+		// gate ever changes. They are intentionally NOT merged: this branch keeps
+		// DefaultTransport's dialer for the proxy connection (asserted by
+		// TestNewHTTPClient_Proxy), while httpx clears DialContext and pins MinVersion
+		// TLS 1.2, so delegating here would regress this proven path.
+		//
 		// Clone DefaultTransport and route through the proxy, keeping its
 		// keep-alive, HTTP/2, and idle-connection tunings.
 		base, ok := http.DefaultTransport.(*http.Transport)

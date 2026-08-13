@@ -195,6 +195,69 @@ func TestToRequests_RelativeEndpoint_FallsBackToCaptureURL(t *testing.T) {
 	}
 }
 
+// TestSpecSafeURL_NonHTTPSchemeWithHostRejected pins specSafeURL's third
+// rejection rule (TEST-003): a URL that carries a host must use the http or
+// https scheme. This rule is not exercised by TestAnalyze_BytePolicyGate
+// (which pins the byte-policy rule) or TestAnalyze_AbsoluteCredentialGate
+// (which pins the u.User != nil rule) — deleting it leaves the rest of the
+// suite green, even though commit e99dca9 credits it with closing the
+// SEC-BE-001 residual left by a scheme-relative literal whose bundle URL is
+// empty (resolveURL then returns the literal unresolved, so it keeps a host
+// but no scheme).
+//
+// "ftp://example.com/api/file" is chosen to reach this rule ALONE: it has a
+// host (Host != ""), it is not http/https, it carries no userinfo (rule 2
+// does not apply), and every byte is printable ASCII (rule 1 does not apply).
+func TestSpecSafeURL_NonHTTPSchemeWithHostRejected(t *testing.T) {
+	if specSafeURL("ftp://example.com/api/file") {
+		t.Error("specSafeURL(\"ftp://example.com/api/file\") = true, want false (host present with a non-http(s) scheme must be rejected)")
+	}
+	// Positive control: a clean https URL with the same host must still be
+	// accepted, so the assertion above cannot pass merely because specSafeURL
+	// rejects everything.
+	if !specSafeURL("https://example.com/api/file") {
+		t.Error("specSafeURL(\"https://example.com/api/file\") = false, want true (clean absolute URL must be accepted)")
+	}
+}
+
+// TestSpecSafeURL_HostlessAbsoluteRejected pins the LAB-4992 review fix
+// (SEC-BE-002 companion): a scheme-only literal like "https:/api/x" parses via
+// url.Parse to Scheme="https", Host="" (a single slash after the scheme is not
+// an authority marker). The pre-fix specSafeURL only checked Host!="" before
+// requiring an http(s) scheme, so a host-less "absolute" URL fell straight
+// through and was accepted — and, once it reached extractServers, produced the
+// degenerate "https://" server entry that sorts before every real host and
+// blanks info.title (this is exercised end-to-end by
+// TestExtractServers_HostlessSchemeLiteralRejected in pkg/generate/rest).
+func TestSpecSafeURL_HostlessAbsoluteRejected(t *testing.T) {
+	for _, raw := range []string{"https:/api/x", "https:///api/x", "http:/api/x"} {
+		if specSafeURL(raw) {
+			t.Errorf("specSafeURL(%q) = true, want false (http(s) scheme with no host must be rejected)", raw)
+		}
+	}
+	// Positive control: a normal absolute URL with a real host must still be
+	// accepted, so the loop above cannot pass merely because everything is
+	// rejected.
+	if !specSafeURL("https://example.com/api/x") {
+		t.Error("specSafeURL(\"https://example.com/api/x\") = false, want true (clean absolute URL must be accepted)")
+	}
+}
+
+// TestSpecSafeURL_OpaqueURLRejected pins the explicit u.Opaque != "" rejection
+// added alongside the host-less-absolute fix. "https:api/x" (single colon, no
+// slashes) parses to Scheme="https", Host="", Opaque="api/x" — the
+// host-less-absolute check above independently rejects this case too (Host==""
+// with an http(s) scheme), so this test targets the Opaque field directly with
+// a non-http(s) opaque scheme ("mailto:") that would otherwise need its own
+// reasoning to reject.
+func TestSpecSafeURL_OpaqueURLRejected(t *testing.T) {
+	for _, raw := range []string{"https:api/x", "mailto:test@example.com"} {
+		if specSafeURL(raw) {
+			t.Errorf("specSafeURL(%q) = true, want false (opaque URL must be rejected)", raw)
+		}
+	}
+}
+
 func TestToRequests_InferSchemaCompatible(t *testing.T) {
 	endpoints := []ExtractedEndpoint{
 		{Method: "POST", URL: "/api/x", BodyFields: []string{"name", "email"}, SourceTag: SourceJS, OriginBundle: "https://h/app.js"},

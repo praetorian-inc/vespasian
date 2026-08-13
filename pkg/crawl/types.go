@@ -31,6 +31,7 @@ type ObservedRequest struct {
 	//   - "static:html"                  (static analysis of HTML <form> elements, pkg/analyze)
 	//   - "static:js"                    (static analysis of JS bundles, pkg/analyze/jsstatic)
 	//   - "static:js-sourcemap"          (recovered via .js.map sourcesContent)
+	//   - "static:js-concat"             (concat / +-chain / service-prefix reconstruction, LAB-4992)
 	Source    string `json:"source"`
 	Tag       string `json:"tag,omitempty"`
 	Attribute string `json:"attribute,omitempty"`
@@ -48,6 +49,12 @@ const (
 	SourceStaticJS = "static:js"
 	// SourceStaticJSSourcemap marks a request synthesized from a recovered .js.map source.
 	SourceStaticJSSourcemap = "static:js-sourcemap"
+	// SourceStaticJSConcat marks a request reconstructed from JS string
+	// concatenation (concat / +-chain / service-prefix, LAB-4992). These are
+	// never probed on the offline path and involve speculative sentinel
+	// substitution, so they are tagged distinctly from AST-recovered literals
+	// (SourceStaticJS) to let downstream consumers weight them accordingly.
+	SourceStaticJSConcat = "static:js-concat"
 	// SourceNextRouteHandler marks a request recovered from a Next.js App Router
 	// ROUTE HANDLER chunk URL (app/<route>/route-<hash>.js). The chunk proves the
 	// framework serves that path, but not which verbs the module exports, so the
@@ -62,12 +69,14 @@ const (
 )
 
 // IsJSStaticSource returns true iff source is one of the JS-bundle
-// static-analysis Source values. Other "static:*" sources (e.g. "static:html"
-// from HTML form analysis) are intentionally excluded — they have separate
-// provenance.
+// static-analysis Source values (SourceStaticJS, SourceStaticJSSourcemap,
+// SourceStaticJSConcat, SourceNextRouteHandler, or SourceNextPageRoute). Other
+// "static:*" sources (e.g. "static:html" from HTML form analysis) are
+// intentionally excluded — they have separate provenance.
 func IsJSStaticSource(source string) bool {
 	return source == SourceStaticJS ||
 		source == SourceStaticJSSourcemap ||
+		source == SourceStaticJSConcat ||
 		source == SourceNextRouteHandler ||
 		source == SourceNextPageRoute
 }

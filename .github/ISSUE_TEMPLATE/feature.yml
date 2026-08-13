@@ -1,0 +1,44 @@
+name: Feature request
+description: Suggest a capability or improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. The most useful requests start from a
+        concrete problem rather than a proposed implementation.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: What are you doing today, and where does Vespasian fall short? Concrete examples help more than general statements.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What would you like Vespasian to do? A sketch of the CLI flags, output, or behavior is ideal.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+      description: Other tools, workarounds, or approaches you've tried, and why they weren't enough.
+
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Would you be willing to contribute this?
+      description: No obligation either way — it helps us decide where to spend review time.
+      options:
+        - "Yes, I'd like to implement it"
+        - "Yes, with guidance on where to start"
+        - "No, but I'm happy to test it"
+        - "No"
+    validations:
+      required: true

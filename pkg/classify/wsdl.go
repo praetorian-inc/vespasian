@@ -41,7 +41,7 @@ type WSDLClassifier struct{}
 //	DetectAPIType([one text/xml response], 0.5) = "wsdl"
 //	3 REST responses + 5 text/xml responses    = "wsdl"
 //
-// TestWSDL_GenericXMLIsNotASoapVote and TestDetectAPIType_LoneGenericXMLStaysREST
+// TestWSDL_GenericXMLIsNotASoapVote and TestDetectAPIType_GenericXMLDoesNotTypeTheCapture
 // pin both halves.
 const GenericXMLConfidence = 0.4
 

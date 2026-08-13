@@ -63,8 +63,33 @@ CLAIM='cannot happen|can never|can not happen|never happens|never reaches|never 
 # a fix. Same for "unreachable" in its network sense.
 EXCLUDE='was unreachable|were unreachable|made .* unreachable|making .* unreachable|left .* unreachable|became unreachable|unreachable target|unreachable host|unreachable network|would have been unreachable|had been unreachable'
 
-# Any Go test identifier satisfies the citation requirement.
+# A Go test identifier satisfies the citation requirement only if it RESOLVES to a
+# test that exists (see existing_tests below). Matching the identifier shape alone
+# turned "name the test" into "type a plausible test name": the PR that added this
+# script shipped three claims citing TestFriendlySourceTag_TotalOverJSStaticSources,
+# TestDetectAPIType_LoneGenericXMLStaysREST and TestRodEngine_Interact_SkipsDestructive,
+# none of which existed. A citation nobody can run is worse than none, because it
+# reads as evidence that someone already checked.
 CITATION='Test[A-Z][A-Za-z0-9_]*'
+
+# Every test function name in the module, one per line. Module-wide on purpose, and
+# independent of --changed/--all: a claim in pkg/classify legitimately cites a test in
+# internal/pipeline, so per-package scoping would reject valid citations.
+#
+# Passed to awk as a FILE rather than with -v. BSD awk (macOS) rejects a newline
+# inside a -v value ("awk: newline in string"), so -v would make this check
+# Linux-only while still exiting non-zero locally for the wrong reason.
+TESTS_FILE="$(mktemp -t vespasian-testnames)" || exit 2
+trap 'rm -f "$TESTS_FILE"' EXIT
+
+git ls-files '*_test.go' | tr '\n' '\0' |
+  xargs -0 grep -ho '^func Test[A-Za-z0-9_]*' 2>/dev/null |
+  sed 's/^func //' | sort -u >"$TESTS_FILE"
+
+if [ ! -s "$TESTS_FILE" ]; then
+  echo "error: found no test functions to resolve citations against; refusing to pass vacuously" >&2
+  exit 2
+fi
 
 status=0
 
@@ -91,7 +116,10 @@ while IFS= read -r file; do
 
   # Walk each file's comment BLOCKS (runs of consecutive // lines), so a citation
   # anywhere in a block covers a claim anywhere in it.
+  #
+  # TESTS_FILE is read first (NR == FNR), so the main body uses FNR for line numbers.
   awk -v file="$file" -v claim="$CLAIM" -v exclude="$EXCLUDE" -v cite="$CITATION" '
+    NR == FNR { if ($0 != "") test_names[$0] = 1; next }
     function claim_line(b,   n, lines, i) {
       n = split(b, lines, "\n")
       for (i = 1; i <= n; i++) {
@@ -99,29 +127,59 @@ while IFS= read -r file; do
       }
       return 0
     }
+    # A citation counts only when it names a test that exists. A trailing-underscore
+    # or otherwise partial identifier (e.g. "TestRodEngine_Interact_*" citing a
+    # family) resolves against any test it PREFIXES, so pointing at a group of tests
+    # stays valid while a typo or a renamed test does not.
+    function resolves(id,   t) {
+      if (id in test_names) return 1
+      for (t in test_names) if (index(t, id) == 1) return 1
+      return 0
+    }
+    # Returns the first cited identifier that resolves, or "" when none do. Sets
+    # cited_any so the caller can tell "no citation" from "citation that is a phantom".
+    function resolved_citation(b,   rest, id, m) {
+      cited_any = 0
+      rest = b
+      while (match(rest, cite)) {
+        id = substr(rest, RSTART, RLENGTH)
+        cited_any = 1
+        if (resolves(id)) return id
+        first_bad = (first_bad == "" ? id : first_bad)
+        rest = substr(rest, RSTART + RLENGTH)
+      }
+      return ""
+    }
     function flush(   idx, lines) {
       if (block != "") {
         idx = claim_line(block)
-        if (idx && block !~ cite) {
-          printf "%s:%d: unreachability claim with no test cited\n", file, start
-          split(block, lines, "\n")
-          gsub(/^[ \t]*\/\/[ \t]?/, "", lines[idx])
-          printf "        %s\n", lines[idx]
-          found++
+        if (idx) {
+          first_bad = ""
+          if (resolved_citation(block) == "") {
+            split(block, lines, "\n")
+            gsub(/^[ \t]*\/\/[ \t]?/, "", lines[idx])
+            if (cited_any) {
+              printf "%s:%d: unreachability claim cites a test that does not exist: %s\n", file, start, first_bad
+            } else {
+              printf "%s:%d: unreachability claim with no test cited\n", file, start
+            }
+            printf "        %s\n", lines[idx]
+            found++
+          }
         }
       }
       block = ""
     }
     {
       if ($0 ~ /^[ \t]*\/\//) {
-        if (block == "") start = NR
+        if (block == "") start = FNR
         block = block "\n" $0
       } else {
         flush()
       }
     }
     END { flush(); exit (found > 0 ? 1 : 0) }
-  ' "$file" || status=1
+  ' "$TESTS_FILE" "$file" || status=1
 done < <(list_files)
 
 if [ "$status" -ne 0 ]; then
@@ -131,7 +189,8 @@ Each comment above guarantees a state cannot occur, without naming a test that
 would fail if it did.
 
 Fix by one of:
-  1. Name the test in the comment (any Test<Name> identifier satisfies this).
+  1. Name a test that EXISTS (the name must resolve to a real Test func, or be a
+     prefix of one — a citation nobody can run is worse than none).
   2. Write that test, then name it. Preferred when the claim is load-bearing.
   3. Soften the claim to what is actually known ("today no caller does X"),
      if the guarantee is not one the code enforces.

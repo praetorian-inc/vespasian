@@ -351,7 +351,7 @@ func TestCrawl_ResumeRejectsForeignCheckpoint(t *testing.T) {
 		Version:           checkpointVersion,
 		ConfigFingerprint: ComputeConfigFingerprint("https://elsewhere.example", "", 5, false, false, false),
 		CreatedAtUnix:     time.Now().Unix(),
-		Seen:              []string{frontierKey(srv.URL + "/")},
+		Seen:              []string{seenKey(srv.URL + "/")},
 	}
 
 	var stderr bytes.Buffer

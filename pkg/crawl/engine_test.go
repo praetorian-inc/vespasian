@@ -1022,7 +1022,7 @@ func TestLearnSeedOrigin_OnlyTheSeedWidensScope(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			var learned []string
 			e := &rodEngine{
-				seedKey: frontierKey(seed),
+				seedKey: seenKey(seed),
 				opts: engineOptions{
 					LearnEffectiveOrigin: func(u string) { learned = append(learned, u) },
 				},
@@ -1051,7 +1051,7 @@ func TestLearnSeedOrigin_OnlyTheSeedWidensScope(t *testing.T) {
 // TestLearnSeedOrigin_NoCallbackIsInert covers the nil-callback guard so the
 // identity check cannot be reordered ahead of it into a nil dereference.
 func TestLearnSeedOrigin_NoCallbackIsInert(t *testing.T) {
-	e := &rodEngine{seedKey: frontierKey("https://ex.com/"), opts: engineOptions{}}
+	e := &rodEngine{seedKey: seenKey("https://ex.com/"), opts: engineOptions{}}
 	// Must return without touching the nil page even for the seed itself.
 	e.learnSeedOrigin(nil, urlEntry{URL: "https://ex.com/", Depth: 0})
 }

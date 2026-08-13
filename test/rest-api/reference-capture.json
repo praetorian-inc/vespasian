@@ -164,5 +164,58 @@
       "body": "eyJzdGF0dXMiOiJ1cGxvYWRlZCJ9"
     },
     "source": "test-crawl"
+  },
+  {
+    "_comment": "LAB-3890 T2: PUT on /api/users/{id} — pins update-method coverage in golden spec",
+    "method": "PUT",
+    "url": "http://localhost:8990/api/users/1",
+    "headers": {
+      "Content-Type": "application/json",
+      "Accept": "application/json"
+    },
+    "body": "eyJpZCI6MSwibmFtZSI6IkFsaWNlIFVwZGF0ZWQiLCJlbWFpbCI6ImFsaWNlLnVwZGF0ZWRAZXhhbXBsZS5jb20ifQ==",
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "eyJpZCI6MSwibmFtZSI6IkFsaWNlIFVwZGF0ZWQiLCJlbWFpbCI6ImFsaWNlLnVwZGF0ZWRAZXhhbXBsZS5jb20ifQ=="
+    },
+    "source": "test-crawl"
+  },
+  {
+    "_comment": "LAB-3890 T2: PATCH on /api/users/{id} — partial-update method coverage",
+    "method": "PATCH",
+    "url": "http://localhost:8990/api/users/1",
+    "headers": {
+      "Content-Type": "application/json",
+      "Accept": "application/json"
+    },
+    "body": "eyJlbWFpbCI6ImFsaWNlLnBhdGNoZWRAZXhhbXBsZS5jb20ifQ==",
+    "response": {
+      "status_code": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "content_type": "application/json",
+      "body": "eyJpZCI6MSwibmFtZSI6IkFsaWNlIiwiZW1haWwiOiJhbGljZUBleGFtcGxlLmNvbSJ9"
+    },
+    "source": "test-crawl"
+  },
+  {
+    "_comment": "LAB-3890 T2: DELETE on /api/users/{id} — delete method coverage (204, no body)",
+    "method": "DELETE",
+    "url": "http://localhost:8990/api/users/1",
+    "headers": {
+      "Accept": "application/json"
+    },
+    "response": {
+      "status_code": 204,
+      "headers": {},
+      "content_type": "",
+      "body": ""
+    },
+    "source": "test-crawl"
   }
 ]

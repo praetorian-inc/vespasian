@@ -31,6 +31,13 @@ type Options struct {
 	// SlugThreshold is the minimum distinct values at a path position before
 	// merging; clamped to >=2 downstream. Ignored unless MergeSlugs is set.
 	SlugThreshold int
+	// TargetOrigin is the trusted origin the scan can vouch for (the resolved
+	// target origin via crawl.ResolveTargetOrigin — derived from
+	// --target-url or the capture's own HTML page, never from bundle
+	// content). Forwarded to rest.OpenAPIGenerator, which uses it to derive
+	// OpenAPI servers/info.title from an origin a JS bundle cannot spoof
+	// (SEC-BE-001/SEC-BE-002). Ignored by wsdl/graphql/grpc.
+	TargetOrigin string
 }
 
 // Get returns a SpecGenerator for the given API type using default options.
@@ -43,7 +50,7 @@ func Get(apiType string) (SpecGenerator, error) {
 func GetWithOptions(apiType string, opts Options) (SpecGenerator, error) {
 	switch apiType {
 	case "rest":
-		return &rest.OpenAPIGenerator{MergeSlugs: opts.MergeSlugs, SlugThreshold: opts.SlugThreshold}, nil
+		return &rest.OpenAPIGenerator{MergeSlugs: opts.MergeSlugs, SlugThreshold: opts.SlugThreshold, TargetOrigin: opts.TargetOrigin}, nil
 	case "wsdl":
 		return &wsdl.Generator{}, nil
 	case "graphql":

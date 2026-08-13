@@ -344,9 +344,10 @@ func TestSSRFSafeDialContext_DNSFailure(t *testing.T) {
 // not unit-testable here — loopback is blocked by the SSRF guard itself.
 // Those paths are covered by live/integration tests.
 
-// TestFrontierKey verifies the frontier dedup key strips the query (and
+// TestFrontierKey verifies the PER-PATH variant-cap key strips the query (and
 // fragment) while keeping scheme/host/path canonicalization, so query-only
-// variants share a key but distinct paths do not (LAB-4678 Phase 1).
+// variants share a bucket but distinct paths do not. frontierKey stopped being the
+// frontier's dedup key when the query-collapse was reverted; see TestSeenKey.
 func TestFrontierKey(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -883,5 +884,55 @@ func TestSameHostVariant(t *testing.T) {
 		if got := s.sameHostVariant(c.host); got != c.want {
 			t.Errorf("seed %q, host %q: sameHostVariant = %v, want %v", c.seed, c.host, got, c.want)
 		}
+	}
+}
+
+// TestSeenKey_DistinctFromFrontierKey pins the split the LAB-4678 query-variant
+// revision created: seenKey (the frontier's dedup identity) KEEPS the query, while
+// frontierKey (the per-path variant-cap bucket) strips it.
+//
+// Both are one bool argument apart, and while the dedup key was inlined and
+// unnamed, three test fixtures for Checkpoint.Seen and rodEngine.seedKey built it
+// with frontierKey instead. They passed because every URL they used was
+// query-less — precisely the input on which the two functions agree, so the fixture
+// bug was invisible. This asserts they disagree wherever a query is present, so
+// picking the wrong one shows up as a failure rather than as a silent no-op.
+func TestSeenKey_DistinctFromFrontierKey(t *testing.T) {
+	// Query present: the two keys MUST differ, and seenKey must retain the query.
+	for _, in := range []string{
+		"https://example.com/p?page=2",
+		"https://example.com/p?tab=billing",
+		"https://EXAMPLE.com:443/p?id=1#frag",
+	} {
+		t.Run("query/"+in, func(t *testing.T) {
+			sk, fk := seenKey(in), frontierKey(in)
+			if sk == fk {
+				t.Errorf("seenKey(%q) == frontierKey(%q) == %q; a query-bearing URL must key "+
+					"differently for dedup than for the per-path cap", in, in, sk)
+			}
+			if !strings.Contains(sk, "?") {
+				t.Errorf("seenKey(%q) = %q dropped the query; two query variants would then "+
+					"collapse to one visit, which is the behavior this ticket reverted", in, sk)
+			}
+			if strings.Contains(fk, "?") {
+				t.Errorf("frontierKey(%q) = %q kept the query; the variant cap would then "+
+					"bucket per-URL and never bound anything", in, fk)
+			}
+		})
+	}
+
+	// No query: the two agree. This is the case that hid the fixture bug, asserted
+	// so the agreement is a documented property rather than an accident nobody
+	// checked — and so a reader of the failure above knows why it went unnoticed.
+	for _, in := range []string{
+		"https://example.com/p",
+		"https://EXAMPLE.com:443/p#frag",
+	} {
+		t.Run("no-query/"+in, func(t *testing.T) {
+			if sk, fk := seenKey(in), frontierKey(in); sk != fk {
+				t.Errorf("seenKey(%q) = %q, frontierKey(%q) = %q; with no query the two must "+
+					"agree, or query-less checkpoints stop resuming", in, sk, in, fk)
+			}
+		})
 	}
 }

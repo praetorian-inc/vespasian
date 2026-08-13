@@ -50,6 +50,16 @@
 // TOCTOU window between DNS validation and connection. This can be bypassed
 // with --dangerous-allow-private for testing internal targets.
 //
+// Probing is also gated to the scan's own origin (SEC-BE-001): the single
+// probe.Config construction site in internal/pipeline wraps [Config.URLValidator]
+// (composed with, not replacing, the SSRF check above) so that any classified
+// candidate whose URL does not share the scan target's scheme+host+port —
+// including a candidate promoted purely by classify's offline JS-static
+// confidence floor, which carries no probed response of its own — is skipped
+// rather than probed. This mirrors pkg/crawl's JSReplayConfig.AllowCrossOrigin:
+// internal-only, default false, no CLI flag; --dangerous-allow-private
+// disables only the SSRF check above, never this origin gate.
+//
 // [RunStrategies] applies a set of strategies to classified requests and
 // returns the enriched results along with any non-fatal probe errors.
 package probe

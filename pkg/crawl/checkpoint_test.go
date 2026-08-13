@@ -487,10 +487,10 @@ func TestSnapshot_ExcludesTransientlyFailedPages(t *testing.T) {
 	f.MarkFailed(urlEntry{URL: "https://ex.com/broken", Depth: 0})
 
 	_, seen := f.Snapshot()
-	if slices.Contains(seen, frontierKey("https://ex.com/broken")) {
+	if slices.Contains(seen, seenKey("https://ex.com/broken")) {
 		t.Errorf("snapshot seen-set contains the failed page, making the drop permanent: %v", seen)
 	}
-	if !slices.Contains(seen, frontierKey("https://ex.com/ok")) {
+	if !slices.Contains(seen, seenKey("https://ex.com/ok")) {
 		t.Errorf("snapshot seen-set lost a successful page: %v", seen)
 	}
 
@@ -520,7 +520,7 @@ func TestSnapshot_FailedPageIsCarriedAsPending(t *testing.T) {
 
 	pending, seen := f.Snapshot()
 
-	if slices.Contains(seen, frontierKey("https://ex.com/broken")) {
+	if slices.Contains(seen, seenKey("https://ex.com/broken")) {
 		t.Errorf("failed page must not be in the snapshot seen-set: %v", seen)
 	}
 
@@ -638,7 +638,7 @@ func TestRestore_KeepsLegitimateResumeQueue(t *testing.T) {
 		{URL: "https://target.test/b", Depth: 2},
 	}
 	// The same URLs appear in seen, exactly as a real checkpoint records them.
-	seen := []string{frontierKey("https://target.test/a"), frontierKey("https://target.test/b")}
+	seen := []string{seenKey("https://target.test/a"), seenKey("https://target.test/b")}
 
 	f.Restore(pending, seen)
 

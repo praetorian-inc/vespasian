@@ -521,16 +521,33 @@ func ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, e
 	return ssrf.SafeDialContext(ctx, network, addr)
 }
 
-// frontierKey returns the crawl-frontier dedup key for rawURL: the canonicalized
-// URL with its query string removed (LAB-4678 Phase 1). Two links differing only
-// in query parameters (e.g. /product?id=1 and /product?id=2) collapse to one
-// key, so the crawler visits the page template once instead of spending the page
-// budget on near-duplicate variants — a driver of run-to-run truncation
-// variance. The queued entry keeps the original URL, so the first variant is
-// still fetched with its parameters, and passive capture still records every
-// distinct-parameter request for classification; only re-crawling of the same
-// template is suppressed. Tradeoff: paginated query templates (?page=N) are
-// visited once.
+// seenKey returns the frontier's DEDUP key for rawURL: the canonicalized URL
+// with its query string intact. Two links differing only in query string get
+// different keys and are therefore separate pages
+// ([urlFrontier.Push], [urlFrontier.Restore], [urlFrontier.Snapshot]). It is also
+// the seed's identity for effective-origin learning (rodEngine.seedKey).
+//
+// Paired with [frontierKey] rather than inlined: the two keys differ only in a
+// bool argument to canonicalizeURL, and while this one had no name every caller
+// that wanted it reached for frontierKey instead. Test fixtures for
+// Checkpoint.Seen and rodEngine.seedKey did exactly that, and passed only because
+// the URLs they used carried no query — the case in which the two agree.
+func seenKey(rawURL string) string {
+	return canonicalizeURL(rawURL, false)
+}
+
+// frontierKey returns the PER-PATH key for rawURL: the canonicalized URL with its
+// query string removed. It is not the dedup key — see [seenKey] — and is used for
+// exactly one thing: counting how many query variants of a single path the
+// frontier has admitted, bounded by [maxQueryVariantsPerPath].
+//
+// It was the dedup key in LAB-4678 Phase 1, which collapsed every query variant of
+// a path to one visit. That was reverted later in the same ticket: collapsing
+// assumed the query selects which ROW a page shows, true for /product?id=N and
+// false for ?page=2 and ?tab=billing, where the query selects a different page and
+// normalizing the path does not normalize the results. The cap replaced the
+// collapse, so a path is visited up to maxQueryVariantsPerPath times rather than
+// once, and this function survives only as that cap's bucket key.
 func frontierKey(rawURL string) string {
 	return canonicalizeURL(rawURL, true)
 }

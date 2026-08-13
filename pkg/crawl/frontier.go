@@ -122,7 +122,7 @@ func (f *urlFrontier) Push(entries []urlEntry) int {
 		// Deduping on the query-stripped key alone collapsed every variant to one
 		// visit. That saved budget on /product?id=N, and silently lost ?page=2 and
 		// ?tab=billing, which are separate pages wearing the same path.
-		normalized := canonicalizeURL(e.URL, false)
+		normalized := seenKey(e.URL)
 		if normalized == "" {
 			continue
 		}
@@ -201,10 +201,10 @@ func (f *urlFrontier) Requeue(e urlEntry) {
 //
 // Callers must still call MarkIdle afterwards, exactly as after any Pop.
 func (f *urlFrontier) MarkFailed(e urlEntry) {
-	// Keyed on the same identity as `seen` (the full canonical URL), so a failed
-	// ?page=2 is excluded from the persisted seen-set without also un-seeing
+	// Keyed on the same identity as `seen` (seenKey, the full canonical URL), so a
+	// failed ?page=2 is excluded from the persisted seen-set without also un-seeing
 	// ?page=1, which is now a separate entry.
-	key := canonicalizeURL(e.URL, false)
+	key := seenKey(e.URL)
 	if key == "" {
 		return
 	}

@@ -24,6 +24,7 @@ func TestIsJSStaticSource(t *testing.T) {
 	}{
 		{SourceStaticJS, true},
 		{SourceStaticJSSourcemap, true},
+		{SourceStaticJSConcat, true},
 		{"static:html", false},
 		{"katana", false},
 		{"", false},
@@ -65,5 +66,12 @@ func TestAnyStaticSource(t *testing.T) {
 	}
 	if !AnyStaticSource(withSourcemap) {
 		t.Error("AnyStaticSource(withSourcemap) = false; want true")
+	}
+
+	withConcat := []ObservedRequest{
+		{Source: SourceStaticJSConcat},
+	}
+	if !AnyStaticSource(withConcat) {
+		t.Error("AnyStaticSource(withConcat) = false; want true")
 	}
 }

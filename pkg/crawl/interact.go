@@ -273,8 +273,13 @@ func leftAssignedPage(now string, readable bool, startURL string) bool {
 // (CodeRabbit review, PR #189). The caller only ever uses labels[idx], so the
 // rest was work spent to be discarded.
 //
-// A label that cannot be read comes back blank, which interactionCandidate
-// rejects — the same fail-closed treatment clickAllowed applies.
+// An unreadable label is failed closed on elementLabel's ok, not on the blank
+// label it also returns today. The two are equivalent right now, but only because
+// elementLabel discards the partial text it may already have read — a version that
+// returned that text alongside ok=false would leave the blank check protecting
+// nothing. clickAllowed takes ok for the same reason; nextInteractionTarget cannot,
+// since it receives already-read labels with no per-label signal, which is why the
+// check sits here rather than inside interactionCandidate.
 //
 // The retained match count is capped at maxInteractionCandidates so page content
 // cannot drive this function's allocation size; see that constant for why
@@ -299,8 +304,9 @@ func collectInteractionElements(page *rod.Page, used map[string]bool) (rod.Eleme
 	}
 	labels := make([]string, len(elements))
 	for i, el := range elements {
-		labels[i], _ = elementLabel(el)
-		if interactionCandidate(labels[i], used) {
+		label, ok := elementLabel(el)
+		labels[i] = label
+		if ok && interactionCandidate(label, used) {
 			return elements, labels, i
 		}
 	}
@@ -393,8 +399,9 @@ func (e *rodEngine) interactPage(ctx context.Context, page *rod.Page, capture *p
 		// time-of-check-to-time-of-use: rendering between the scan and the click can
 		// leave a valid handle pointing at a destructive action that was not present
 		// when the scan read it. clickAllowed fails closed on an unreadable label;
-		// TestClickAllowed covers that gate and TestRodEngine_Interact_SkipsDestructive
-		// (build tag: integration) covers it end to end.
+		// TestClickAllowed covers that gate and
+		// TestRodEngine_Interact_SkipsDestructiveControls (build tag: integration)
+		// covers it end to end.
 		if label, ok := elementLabel(elements[idx]); !clickAllowed(label, ok) {
 			continue
 		}

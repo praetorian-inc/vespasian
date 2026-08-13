@@ -506,7 +506,7 @@ func (f *urlFrontier) Restore(pending []urlEntry, seen []string) {
 
 	admitted := make([]urlEntry, 0, len(pending))
 	for _, e := range pending {
-		if canonicalizeURL(e.URL, false) == "" {
+		if seenKey(e.URL) == "" {
 			continue
 		}
 		if maxDepth >= 0 && e.Depth > maxDepth {
@@ -522,7 +522,7 @@ func (f *urlFrontier) Restore(pending []urlEntry, seen []string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, e := range admitted {
-		key := canonicalizeURL(e.URL, false)
+		key := seenKey(e.URL)
 		// Dedup WITHIN pending. Restore runs on a fresh frontier, so anything
 		// already in f.seen here was put there by an earlier entry of this same
 		// slice — a corrupted or hand-edited checkpoint listing one URL repeatedly

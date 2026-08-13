@@ -407,6 +407,164 @@ func TestRESTClassifier_ImplementsDetailedClassifier(t *testing.T) {
 	assert.Implements(t, (*DetailedClassifier)(nil), c)
 }
 
+// TestClassifyDetail_StaticJSCandidateFloor pins Rule 7 (LAB-4992): an unprobed
+// JS-static candidate whose path carries an API indicator is floored to
+// StaticJSConfidence (0.5) so it survives default-confidence generation instead
+// of being dropped at Rule 3's 0.15. Only fires for JS-static sources with a
+// matching path heuristic — plain dynamic GETs and non-API static:js entries
+// are unaffected.
+func TestClassifyDetail_StaticJSCandidateFloor(t *testing.T) {
+	c := &RESTClassifier{}
+
+	tests := []struct {
+		name      string
+		req       crawl.ObservedRequest
+		wantIsAPI bool
+		wantConf  float64
+	}{
+		{
+			name: "static:js concat GET with API path floored to 0.5",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/api/users/0/orders",
+				Source: crawl.SourceStaticJSConcat,
+			},
+			wantIsAPI: true,
+			wantConf:  StaticJSConfidence,
+		},
+		{
+			name: "static:js literal GET with API path floored to 0.5",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/api/items",
+				Source: crawl.SourceStaticJS,
+			},
+			wantIsAPI: true,
+			wantConf:  StaticJSConfidence,
+		},
+		{
+			// HIGH fix: version segments beyond the old literal list (v1-v3)
+			// must still satisfy apiVersionPathPattern so Rule 7 fires —
+			// otherwise crawl-extracted /v4+/ concat candidates are dropped.
+			// apiVersionPathPattern feeds the shared pathIsAPI computed BEFORE
+			// Rule 3 (not a Rule-3-local variable), so it now gates Rule 6 too
+			// — see TEST-010 in TestRESTClassifier_RequestSideSignal.
+			name: "static:js GET on /v4/ path floored to 0.5 (version beyond literal list)",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/v4/users/0",
+				Source: crawl.SourceStaticJSConcat,
+			},
+			wantIsAPI: true,
+			wantConf:  StaticJSConfidence,
+		},
+		{
+			name: "static:js GET WITHOUT API indicator is not floored",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/dashboard/home",
+				Source: crawl.SourceStaticJS,
+			},
+			wantIsAPI: false,
+			wantConf:  0,
+		},
+		{
+			name: "dynamic (non-static-js) GET with API path keeps 0.15",
+			req: crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com/api/users",
+				Source: "katana",
+			},
+			wantIsAPI: true,
+			wantConf:  PathHeuristicBoost,
+		},
+		{
+			name: "static:js POST with API path keeps its stronger method score",
+			req: crawl.ObservedRequest{
+				Method: "POST",
+				URL:    "https://example.com/api/users",
+				Source: crawl.SourceStaticJS,
+			},
+			wantIsAPI: true,
+			wantConf:  HTTPMethodConfidence,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isAPI, conf, _ := c.ClassifyDetail(tt.req)
+			assert.Equal(t, tt.wantIsAPI, isAPI)
+			assert.InDelta(t, tt.wantConf, conf, 1e-9)
+		})
+	}
+}
+
+// TestStaticJSFloor pins the extracted Rule 7 helper (QUAL-003) directly,
+// independent of ClassifyDetail's other rules.
+func TestStaticJSFloor(t *testing.T) {
+	tests := []struct {
+		name           string
+		req            crawl.ObservedRequest
+		pathIsAPI      bool
+		inConfidence   float64
+		inReason       string
+		wantConfidence float64
+		wantReason     string
+	}{
+		{
+			name:           "floors a low-confidence static:js candidate with matched path",
+			req:            crawl.ObservedRequest{Source: crawl.SourceStaticJSConcat},
+			pathIsAPI:      true,
+			inConfidence:   PathHeuristicBoost,
+			inReason:       "path-heuristic",
+			wantConfidence: StaticJSConfidence,
+			wantReason:     "path-heuristic+static-js-candidate",
+		},
+		{
+			name:           "sets reason from scratch when no prior reason",
+			req:            crawl.ObservedRequest{Source: crawl.SourceStaticJS},
+			pathIsAPI:      true,
+			inConfidence:   0,
+			inReason:       "",
+			wantConfidence: StaticJSConfidence,
+			wantReason:     "static-js-candidate",
+		},
+		{
+			name:           "does not floor when path did not match",
+			req:            crawl.ObservedRequest{Source: crawl.SourceStaticJS},
+			pathIsAPI:      false,
+			inConfidence:   0,
+			inReason:       "",
+			wantConfidence: 0,
+			wantReason:     "",
+		},
+		{
+			name:           "does not floor a non-JS-static source",
+			req:            crawl.ObservedRequest{Source: "katana"},
+			pathIsAPI:      true,
+			inConfidence:   PathHeuristicBoost,
+			inReason:       "path-heuristic",
+			wantConfidence: PathHeuristicBoost,
+			wantReason:     "path-heuristic",
+		},
+		{
+			name:           "leaves an already-higher confidence untouched",
+			req:            crawl.ObservedRequest{Source: crawl.SourceStaticJS},
+			pathIsAPI:      true,
+			inConfidence:   HTTPMethodConfidence,
+			inReason:       "method:POST",
+			wantConfidence: HTTPMethodConfidence,
+			wantReason:     "method:POST",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotConf, gotReason := staticJSFloor(tt.req, tt.pathIsAPI, tt.inConfidence, tt.inReason)
+			assert.InDelta(t, tt.wantConfidence, gotConf, 1e-9)
+			assert.Equal(t, tt.wantReason, gotReason)
+		})
+	}
+}
+
 // TestClassifyDetail_FallbackToHeaders verifies the classifier falls back to
 // Response.Headers when ContentType is empty, as happens when headers have
 // non-standard casing and ContentType wasn't populated by the crawler.
@@ -571,6 +729,27 @@ func TestRESTClassifier_RequestSideSignal(t *testing.T) {
 			wantMinConf:   RequestSignalConfidence,
 			wantReasonSub: "request-signal:accept",
 		},
+		{
+			// TEST-010: pins the version-segment arm of the shared pathIsAPI gate
+			// for Rule 6. Before the LAB-4678 x LAB-4992 merge, apiPathSegments
+			// held the literals "/v1/", "/v2/", "/v3/", so a /v4+/ path was not
+			// a gate member at all and this request classified (false, 0, "").
+			// The merge replaced those literals with apiVersionPathPattern
+			// (/v[1-9][0-9]*/) and hoisted the result into the single pathIsAPI
+			// that Rule 6 also consumes, which widened Rule 6's admission set to
+			// EVERY version segment. That widening was previously unpinned in
+			// both directions — see the /v4/docs entry in the browser-navigation
+			// guard below for the negative arm.
+			name: "json GET on /v4 version-segment path, no response",
+			req: crawl.ObservedRequest{
+				Method:  "GET",
+				URL:     "https://example.com/v4/users",
+				Headers: map[string]string{"Accept": "application/json"},
+			},
+			wantIsAPI:     true,
+			wantMinConf:   RequestSignalConfidence,
+			wantReasonSub: "request-signal:accept",
+		},
 	}
 
 	for _, tt := range tests {
@@ -598,11 +777,17 @@ func TestRESTClassifier_RequestSideSignal(t *testing.T) {
 	// application/xml (with a q-value) AND text/html. A crawled HTML page under
 	// an api-like path (e.g. a Swagger UI at /api/docs) must NOT be classified
 	// as a REST API by the request-side signal (review finding 001).
+	//
+	// TEST-010: "/v4/docs" covers the apiVersionPathPattern arm of pathIsAPI.
+	// The other entries were already literal apiPathSegments members before the
+	// LAB-4678 x LAB-4992 merge; /v4+/ became a gate member only as a result of
+	// it, so without this entry an over-classification regression on a document
+	// navigation under a high version segment would ship silently.
 	const navAccept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
 	// Includes non-allowlist paths (/dashboard, /profile): now that the request
 	// signal is path-independent (Phase 3), the navigation guard must hold there
 	// too — a browser page load must not classify regardless of path.
-	for _, p := range []string{"/api/docs", "/graphql", "/v2/dashboard", "/dashboard", "/profile"} {
+	for _, p := range []string{"/api/docs", "/graphql", "/v2/dashboard", "/v4/docs", "/dashboard", "/profile"} {
 		_, navConf, navReason := c.ClassifyDetail(crawl.ObservedRequest{
 			Method:  "GET",
 			URL:     "https://example.com" + p,
@@ -941,6 +1126,92 @@ func TestRESTClassifier_NextRouteIsReportedAsNearMiss(t *testing.T) {
 	}
 }
 
+// TestStaticJSFloorClearsDefaultThreshold pins the invariant Rule 7 depends on
+// (TEST-003, LAB-4992): the static-JS floor must be at least the default
+// confidence threshold, or every fully-offline concat/service-prefix candidate
+// is dropped by RunClassifiers.
+//
+// StaticJSConfidence is defined as DefaultConfidenceThreshold, so this holds by
+// construction today. The test exists because that binding is easy to undo:
+// re-inlining a 0.5 literal here (its previous form) restores a silent-drift
+// hazard where lowering the floor to 0.4 leaves every other Rule 7 test green
+// (they all assert against the StaticJSConfidence symbol, so they track the
+// constant whatever its value). RunClassifiers compares `>=`, so equality is
+// sufficient and the floor need not exceed the threshold.
+func TestStaticJSFloorClearsDefaultThreshold(t *testing.T) {
+	assert.GreaterOrEqual(t, StaticJSConfidence, DefaultConfidenceThreshold,
+		"Rule 7's static-JS floor must clear the default --confidence threshold or fully-offline concat candidates are dropped (LAB-4992 AC1)")
+}
+
+// TestAPIIndicatorParityWithCrawlExtraction closes the drift gap TEST-002
+// identified (LAB-4992): apiVersionPathPattern and apiPathSegments together
+// mirror crawl.APIIndicatorAlternation, and non-drift is the stated design
+// rationale for apiVersionPathPattern — but nothing enforced it, so widening
+// crawl's extraction set would produce candidates whose paths fail Rule 3.
+// Rule 7's floor is gated on pathIsAPI, so such a candidate scores 0 and is
+// silently dropped at the default confidence.
+//
+// Two assertions, deliberately paired:
+//  1. every indicator crawl can extract, in SEGMENT-ANCHORED position, yields a
+//     Rule 7 floor here, and
+//  2. crawl's alternation is still exactly the set enumerated below.
+//
+// (2) is what makes this a guard rather than a snapshot: adding an indicator to
+// crawl (say `v0/` or `svc/`) fails this test until the classifier's gate and
+// this table are widened to match.
+//
+// SCOPE (TEST-004): "segment-anchored" is load-bearing and this test does NOT
+// claim parity over every string crawl can extract. crawl's apiIndicatorPattern
+// is unanchored, so it also matches an indicator embedded mid-token: verified
+// live, `ExtractStaticConcatPaths` emits `xapi/users/1` and `/myapi/users/2`,
+// which this classifier scores 0 and drops. That asymmetry is DELIBERATE, not a
+// gap to close by loosening Rule 3 — `/myapi/` is an accidental substring match,
+// not an API indicator, and admitting it would raise false positives for every
+// source, not just JS-static ones. crawl over-extracting costs only a discarded
+// candidate; the classifier over-matching would corrupt real output. The negative
+// cases in TestAPIIndicatorUnanchoredNotFloored pin that decision so it reads as
+// a choice rather than an oversight.
+func TestAPIIndicatorParityWithCrawlExtraction(t *testing.T) {
+	// Pinned so widening crawl's extraction set forces a matching widening of
+	// the classifier's Rule 3 gate. Update BOTH sides plus the table below.
+	assert.Equal(t, `(?:api/|v[1-9][0-9]*/|rest/|rpc/|graphql)`, crawl.APIIndicatorAlternation,
+		"crawl's API-indicator set changed: widen apiPathSegments/apiVersionPathPattern and this test's table so extracted candidates still satisfy Rule 3 (LAB-4992 TEST-002)")
+
+	// One path per arm of the alternation, in the slash-delimited form the
+	// concat extractor emits after cleanConcatPath (leading slash added by
+	// jsstatic's extractConcatEndpoints). The version arm is sampled across the
+	// single- and multi-digit boundary that motivated apiVersionPathPattern.
+	paths := []string{
+		"/api/users",      // api/
+		"/v1/users",       // v[1-9][0-9]*/  (single digit)
+		"/v4/users",       // v[1-9][0-9]*/  (beyond the old fixed v1-v3 set)
+		"/v12/users",      // v[1-9][0-9]*/  (multi digit)
+		"/rest/users",     // rest/
+		"/rpc/getUser",    // rpc/
+		"/graphql",        // graphql
+		"/identity/api/x", // service-prefix reconstruction
+		"/api/users/0",    // non-literal operand sentinel
+	}
+
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			c := &RESTClassifier{}
+			// An unprobed offline concat candidate: bare GET, no response, so
+			// only Rule 3 (+0.15) and Rule 7 can fire.
+			isAPI, confidence, reason := c.ClassifyDetail(crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com" + path,
+				Source: crawl.SourceStaticJSConcat,
+			})
+
+			assert.True(t, isAPI, "extracted indicator must classify as an API path")
+			assert.Contains(t, reason, "static-js-candidate", "Rule 7 must fire for an extractable indicator")
+			assert.GreaterOrEqual(t, confidence, DefaultConfidenceThreshold,
+				"candidate must survive default-confidence generation, got %v", confidence)
+		})
+	}
+}
+
 // TestRESTClassifier_NextRouteProvenanceDoesNotPromote guards the other direction:
 // Rule 7 raises a floor, it must never lower or override a stronger signal, and it
 // must not push a route that ALSO has real signal over the threshold on its own.
@@ -1010,5 +1281,100 @@ func TestNextRoute_NeverAnOperationAtAnyThreshold(t *testing.T) {
 	if len(nm) != len(reqs) {
 		t.Errorf("NearMisses reported %d of %d recovered routes; excluding them from the spec "+
 			"must not also make them invisible", len(nm), len(reqs))
+	}
+}
+
+// TestAPIIndicatorUnanchoredNotFloored pins the negative direction of the
+// extraction/classification asymmetry (TEST-004, LAB-4992).
+//
+// crawl.apiIndicatorPattern is unanchored, so crawl extracts paths whose "API
+// indicator" is only an accidental substring of a larger token — verified live,
+// ExtractStaticConcatPaths emits `xapi/users/1` for `"xapi/".concat("users/1")`
+// and `/myapi/users/2` for `"/myapi/".concat("users/2")`. This classifier
+// requires a segment-delimited indicator ("/api/", or a bare version segment), so
+// those score 0 and are dropped at the default confidence.
+//
+// This is the intended contract, and the asymmetry is safe in exactly one
+// direction: crawl over-extracting merely wastes a candidate, whereas the
+// classifier over-matching would promote genuinely non-API paths for EVERY
+// source. Do not "fix" a failure here by loosening apiPathSegments to a substring
+// match — that would make /myapi/, /xapi/ and /notgraphql look like API paths
+// everywhere in the pipeline.
+func TestAPIIndicatorUnanchoredNotFloored(t *testing.T) {
+	// The paths these extractions normalize to once jsstatic prefixes an origin —
+	// NOT the extractor's raw output. Verified against ExtractStaticConcatPaths:
+	//   "xapi/".concat("users/1")        -> "xapi/users/1"    (no leading slash;
+	//                                       extractConcatEndpoints adds it)
+	//   "/myapi/".concat("users/2")      -> "/myapi/users/2"
+	//   "/notgraphql/".concat("query")   -> "/notgraphql/query"
+	// The earlier comment claimed these were "exactly the strings crawl's
+	// extractor produces", which overstated it for the first entry and cited no
+	// bundle for the third (TEST-004).
+	unanchored := []string{
+		"/xapi/users/1",
+		"/myapi/users/2",
+		"/notgraphql/query",
+	}
+
+	for _, path := range unanchored {
+		t.Run(path, func(t *testing.T) {
+			c := &RESTClassifier{}
+			isAPI, confidence, reason := c.ClassifyDetail(crawl.ObservedRequest{
+				Method: "GET",
+				URL:    "https://example.com" + path,
+				Source: crawl.SourceStaticJSConcat,
+			})
+
+			assert.NotContains(t, reason, "static-js-candidate",
+				"Rule 7 must NOT fire for a substring-embedded indicator: %s", path)
+			assert.Less(t, confidence, DefaultConfidenceThreshold,
+				"a substring-embedded indicator must stay below the default threshold, got %v", confidence)
+			assert.False(t, isAPI,
+				"a substring-embedded indicator must not classify as an API path")
+		})
+	}
+}
+
+// TestNextRoute_NotPromotedByStaticJSFloor pins the rule ordering the LAB-4678 x
+// LAB-4992 merge created. Both branches added a rule numbered 7: the Next.js
+// chunk-provenance disqualifier (now Rule 6a) and the offline JS-static floor
+// (Rule 7). They interact, because crawl.IsJSStaticSource — the gate on Rule 7's
+// floor — accepts both Next.js chunk sources.
+//
+// A recovered route on an /api/-style path therefore satisfies Rule 7's gate.
+// Reaching it would floor the route to StaticJSConfidence, which IS the default
+// --confidence, and return isAPI=true from `confidence > 0` — putting a guessed
+// verb in the spec for a route whose chunk URL never revealed one. That is the
+// exact defect Rule 6a exists to prevent, reintroduced by rule order alone.
+//
+// Rule 6a's early return is what prevents it. The paths below all carry an API
+// indicator, so each one fails this test if Rule 6a is moved after Rule 7 or its
+// `return` is softened to a fallthrough.
+func TestNextRoute_NotPromotedByStaticJSFloor(t *testing.T) {
+	c := &RESTClassifier{}
+	for _, tc := range []struct {
+		name, url, src string
+	}{
+		{"route handler under /api/", "https://app.test/api/vaults/%7BvaultId%7D", crawl.SourceNextRouteHandler},
+		{"page route under /api/", "https://app.test/api/dashboard", crawl.SourceNextPageRoute},
+		{"route handler under a version segment", "https://app.test/v2/vaults", crawl.SourceNextRouteHandler},
+		{"page route under /rest/", "https://app.test/rest/reports", crawl.SourceNextPageRoute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isAPI, confidence, reason := c.ClassifyDetail(crawl.ObservedRequest{
+				Method: "GET", URL: tc.url, Source: tc.src,
+			})
+
+			assert.False(t, isAPI,
+				"an API-looking path must not turn a chunk-URL route into an API: Rule 6a has to "+
+					"return before Rule 7's static-JS floor")
+			assert.Less(t, confidence, DefaultConfidenceThreshold,
+				"Rule 7's floor is StaticJSConfidence (== the default threshold), so reaching it "+
+					"puts the route in the spec at default --confidence")
+			assert.NotContains(t, reason, "static-js-candidate",
+				"the static-JS floor must not fire for a Next.js chunk source")
+			assert.Contains(t, reason, "next-route-chunk",
+				"the -v line must name provenance as the reason the route is listed")
+		})
 	}
 }

@@ -77,14 +77,34 @@ func logClassificationReasons(w io.Writer, classified []classify.ClassifiedReque
 }
 
 // endpointPath reduces a request URL to its path component for display and for
-// near-miss endpoint identity, falling back to the full URL when it does not
-// parse or carries no path. Shared so the rendered line and the dedup key agree
-// on what "the same endpoint" means.
+// near-miss endpoint identity. Shared so the rendered line and the dedup key
+// agree on what "the same endpoint" means. A pathless URL degrades to its
+// origin; anything that survives neither reduction is redacted rather than
+// echoed raw, because the fallback would otherwise carry userinfo.
 func endpointPath(rawURL string) string {
-	if u, err := url.Parse(rawURL); err == nil && u.Path != "" {
-		return u.Path
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		// url.Parse failed, so no component is trustworthy. Reachable with
+		// credentials: GRPCClassifier fails open on a malformed URL
+		// (pkg/classify/grpc.go) and still classifies on content-type alone.
+		// crawl.RedactURL fails closed on a parse error carrying "@".
+		return crawl.RedactURL(rawURL)
 	}
-	return rawURL
+	switch {
+	case u.Path != "":
+		return u.Path
+	case u.Host != "":
+		// Pathless (or query-only): print the origin, not the raw URL.
+		// u.Host excludes userinfo (u.User holds it separately).
+		return u.Scheme + "://" + u.Host
+	default:
+		// Parsed, but neither Path nor Host survived (opaque forms), so the raw
+		// URL is all that is left and it may embed userinfo. crawl.RedactURL
+		// fails CLOSED: it emits a placeholder whenever it cannot prove the
+		// result is credential-free, including the opaque case where url.Parse
+		// leaves credentials in u.Opaque and u.User is nil.
+		return crawl.RedactURL(rawURL)
+	}
 }
 
 // classificationLine formats one endpoint's verdict line for verbose output.

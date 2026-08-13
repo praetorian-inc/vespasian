@@ -24,7 +24,12 @@
 //     routing helpers keyed by API type.
 //   - ClassifyProbeGenerate — the classify → probe → generate step. Honors the
 //     REST slug-merging options (MergeSlugs/SlugThreshold) via
-//     generate.GetWithOptions.
+//     generate.GetWithOptions. It resolves the scan's trusted origin once
+//     (crawl.ResolveTargetOrigin) and hands that one value to BOTH the
+//     probe-stage cross-origin gate and the generator (generate.Options
+//     .TargetOrigin), so the stage that decides what may be requested and the
+//     stage that decides what may define the spec's identity cannot disagree
+//     about "the target origin".
 //   - ValidateSlugThreshold — shared source of truth rejecting --slug-threshold
 //     < 2 when --merge-slugs is on (REST only). Enforced by both the CLI (early,
 //     before crawl) and the SDK, and re-checked inside ClassifyProbeGenerate.
