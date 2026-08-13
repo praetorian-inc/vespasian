@@ -426,12 +426,29 @@ if command -v lsof >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     nnport="$(free_port)"
     python3 -m http.server "$nnport" --bind 127.0.0.1 >/dev/null 2>&1 &
     nn=$!; SPAWNED_PIDS+=("$nn"); disown "$nn" 2>/dev/null || true
-    for _ in 1 2 3 4 5 6 7 8 9 10; do lsof -nP -iTCP:"$nnport" -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 0.2; done
-    got="$(real_orphan_pids_by_port "$nnport")"
-    case " $got " in
-        *" $nn "*) fail "non-node listener excluded by node filter (got '$got')" ;;
-        *)         ok "non-node listener excluded by node filter" ;;
-    esac
+    nn_listening=false
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        lsof -nP -iTCP:"$nnport" -sTCP:LISTEN >/dev/null 2>&1 && { nn_listening=true; break; }
+        sleep 0.2
+    done
+    # TEST-014: the readiness loop above is best-effort — if the fixture never
+    # actually binds (e.g. free_port's TOCTOU window let something else grab
+    # the port first, or the process failed to start), the loop just falls
+    # through and the exclusion check below would trivially pass for the WRONG
+    # reason ("nothing is listening" looks identical to "the filter excluded
+    # it"). Measured: swapping the listener for `python3 -c pass` (exits
+    # immediately, never binds) still printed `ok` here before this guard was
+    # added. Prove the premise — the fixture is actually listening — before
+    # trusting the exclusion result.
+    if [ "$nn_listening" != true ]; then
+        fail "non-node listener excluded by node filter (fixture never became LISTEN on port $nnport; cannot prove exclusion)"
+    else
+        got="$(real_orphan_pids_by_port "$nnport")"
+        case " $got " in
+            *" $nn "*) fail "non-node listener excluded by node filter (got '$got')" ;;
+            *)         ok "non-node listener excluded by node filter" ;;
+        esac
+    fi
     kill -9 "$nn" 2>/dev/null || true
 
     # A node-named listener in the window must be RETURNED. Copy the python

@@ -61,7 +61,10 @@ skip() {
 #
 # Update deliberately when adding or removing an assertion, and update the
 # matching skip() credit if the change touches an environment-gated block.
-EXPECTED_ASSERTIONS=84
+# 88 = 84 + case f1's 4 assertions (TEST-011: gtimeout arm coverage). Case f1
+# synthesises its own fixture gtimeout rather than depending on ambient PATH,
+# so it runs unconditionally on every host and needs no skip() credit.
+EXPECTED_ASSERTIONS=88
 
 assert_eq() {
     local desc=$1 expected=$2 actual=$3
@@ -469,6 +472,95 @@ out_f0=$(echo "${result}" | sed -n '2p')
 # than as a working browser.
 assert_eq "case f0: no-timeout fallback REJECTS a broken browser (rc 2, not 0)" "2" "${rc_f0}"
 assert_eq "case f0: no-timeout fallback still echoes the stub path it rejected" "${GENERIC_BROKEN}" "${out_f0}"
+
+# ── Case f1: the gtimeout arm (macOS + coreutils) actually runs ─
+# TEST-011: chrome_runnable's `elif command -v gtimeout` was dead coverage —
+# no case anywhere selects it. Measured: deleting both gtimeout lines from
+# common.sh (the elif condition and `t=gtimeout`) left this suite green with
+# no case failing. Cases f/f0 above force the BARE-probe fallback by emptying
+# PATH of every timeout binary; every other case runs on this container,
+# which has no gtimeout at all (`command -v gtimeout` -> empty), so ambient
+# PATH can never reach the branch either. This case SYNTHESISES it instead of
+# depending on the host: a subshell-scoped PATH pointing at a directory that
+# holds ONLY a fixture `gtimeout` (plus a symlinked real `sleep`, needed by the
+# fixture's watchdog and by the slow-browser fixture below — no real `timeout`
+# anywhere on that PATH), so `command -v timeout` misses and chrome_runnable's
+# `elif command -v gtimeout` hits.
+#
+# A fixture that is merely resolvable on PATH would pass even if
+# chrome_runnable never executed it — the grep-shaped assertion this branch's
+# review has rejected for eleven rounds. Two behavioural properties instead,
+# mirroring what case f2 below pins for the `timeout` arm: (1) the fixture
+# records every invocation to a marker file, so passing proves gtimeout was
+# actually EXECUTED, not just present; (2) a slow browser under a tiny
+# override must be killed with rc 124 — the exact status GNU timeout/gtimeout
+# reserve for "I killed it".
+GTIMEOUT_BIN_DIR="${FIXTURE_DIR}/gtimeout-only-bin"
+mkdir -p "${GTIMEOUT_BIN_DIR}"
+ln -s "$(command -v sleep)" "${GTIMEOUT_BIN_DIR}/sleep"
+GTIMEOUT_MARKER="${FIXTURE_DIR}/gtimeout.invocations"
+
+# Minimal `timeout`-alike: runs its argv in the background, races a watchdog
+# `sleep` against it, and reports rc 124 if the watchdog wins — the same
+# externally-observable contract as GNU timeout/gtimeout, just implemented in
+# a few lines of bash instead of C.
+cat > "${GTIMEOUT_BIN_DIR}/gtimeout" <<'EOF'
+#!/bin/bash
+[ -n "${GTIMEOUT_MARKER:-}" ] && printf 'invoked\n' >> "${GTIMEOUT_MARKER}"
+duration="$1"
+shift
+"$@" &
+cmdpid=$!
+( sleep "${duration}"; kill -TERM "${cmdpid}" 2>/dev/null ) &
+watchdog=$!
+wait "${cmdpid}" 2>/dev/null
+rc=$?
+kill "${watchdog}" 2>/dev/null
+wait "${watchdog}" 2>/dev/null
+if [ "${rc}" -ge 128 ]; then
+    exit 124
+fi
+exit "${rc}"
+EOF
+chmod +x "${GTIMEOUT_BIN_DIR}/gtimeout"
+
+# Own slow-browser fixture rather than reusing f2's SLOW_BROWSER: f2's is only
+# created inside its own `command -v timeout/gtimeout` guard below, so on a
+# host that takes that guard's other arm it would not exist yet.
+GTIMEOUT_SLOW_BROWSER="${FIXTURE_DIR}/bin/slow-chrome-f1"
+cat > "${GTIMEOUT_SLOW_BROWSER}" <<'EOF'
+#!/bin/bash
+sleep 0.5
+echo "Fake Slow Chrome (f1) 999.0.0.0"
+exit 0
+EOF
+chmod +x "${GTIMEOUT_SLOW_BROWSER}"
+
+probe_via_gtimeout() {
+    local browser=$1 budget=$2
+    (
+        # shellcheck source=setup-live-targets.sh disable=SC1091
+        source "${SETUP_SCRIPT}"
+        PATH="${GTIMEOUT_BIN_DIR}"   # only the fixture gtimeout (+ sleep) — no timeout, no real gtimeout
+        export GTIMEOUT_MARKER
+        set +e
+        CHROME_PROBE_TIMEOUT="${budget}" chrome_runnable "${browser}"
+        printf '%s\n' "$?"
+    )
+}
+
+: > "${GTIMEOUT_MARKER}"
+rc_f1_pass=$(probe_via_gtimeout "${WORKING_BROWSER}" 10)
+assert_eq "case f1: gtimeout arm detects a working browser (rc 0)" "0" "${rc_f1_pass}"
+assert_eq "case f1: the fixture gtimeout was invoked to detect the working browser" \
+    "invoked" "$(cat "${GTIMEOUT_MARKER}")"
+
+: > "${GTIMEOUT_MARKER}"
+rc_f1_kill=$(probe_via_gtimeout "${GTIMEOUT_SLOW_BROWSER}" 0.2)
+assert_eq "case f1: CHROME_PROBE_TIMEOUT=0.2 kills the slow probe via gtimeout (rc 124)" \
+    "124" "${rc_f1_kill}"
+assert_eq "case f1: the fixture gtimeout was invoked to kill the slow probe" \
+    "invoked" "$(cat "${GTIMEOUT_MARKER}")"
 
 # ── Case f2: CHROME_PROBE_TIMEOUT reaches the probe budget ─────
 # chrome_runnable must honour CHROME_PROBE_TIMEOUT (a cold container mount can

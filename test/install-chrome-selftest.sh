@@ -67,7 +67,7 @@ export CHROME_PROBE_TIMEOUT=2
 # across degraded hosts and a deleted case still fails the suite. The trust anchor's
 # own skip is additionally a hard failure via trust_anchor_skips, independently of
 # this pin.
-EXPECTED_ASSERTIONS=214
+EXPECTED_ASSERTIONS=234
 
 pass_count=0
 fail_count=0
@@ -447,6 +447,46 @@ else
     fail_count=$((fail_count + 1))
 fi
 
+# f5b (TEST-002): the three checks above are EXISTENCE-based -- they prove the
+# two apt-get calls that exist today are bounded, but say nothing about a
+# THIRD, unbounded one added alongside them. MUTATION-PROVEN: adding a third
+# `$SUDO apt-get install -y --no-install-recommends some-extra-package` inside
+# main() left this suite at 214 passed / 0 failed, exit 0 while f5 kept printing
+# "both apt-get calls are bounded" — true of the two calls it already knew
+# about, silent on the one it didn't. Counted the same way case f's curl-fetch
+# check above counts curl lines against pinned-curl lines, so any THIRD (or
+# further) apt-get call has to carry the bound too, not just the first two.
+#
+# Line continuations are joined first: apt-get install's DPkg::Lock::Timeout
+# bound sits on the CONTINUATION line, not the invocation line, so each call
+# has to become exactly one logical line before it can be counted.
+main_body_f5_joined=$(printf '%s\n' "${main_body_f5}" | awk '{ if (sub(/\\$/, "")) { printf "%s ", $0; next } else { print } }')
+f5_aptget_lines=$(printf '%s\n' "${main_body_f5_joined}" \
+    | grep -cE '^[[:space:]]*(if ! )?\$SUDO .*apt-get (update|install) ' || true)
+f5_aptget_bounded=$(printf '%s\n' "${main_body_f5_joined}" \
+    | grep -E '^[[:space:]]*(if ! )?\$SUDO .*apt-get (update|install) ' \
+    | grep -F -- 'timeout -k' \
+    | grep -cF -- 'DPkg::Lock::Timeout=120' || true)
+if [ "${f5_aptget_lines}" -ge 2 ] && [ "${f5_aptget_lines}" -eq "${f5_aptget_bounded}" ]; then
+    echo "PASS: case f: all ${f5_aptget_lines} apt-get call(s) in main() carry the DPkg::Lock::Timeout=120 bound (no unbounded call slipped in alongside the two known ones)"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case f: only ${f5_aptget_bounded} of ${f5_aptget_lines} apt-get call(s) in main() carry the DPkg::Lock::Timeout=120 bound — an unbounded apt-get call is reachable"
+    fail_count=$((fail_count + 1))
+fi
+
+# Fidelity sentinel for the join+count above, the same idea as case f's curl
+# extraction sentinel: if main()'s apt-get calls are ever restructured (renamed,
+# no longer $SUDO-timeout-prefixed) the extraction would silently match nothing
+# and the count-match check above would pass vacuously at 0-of-0.
+if [ "${f5_aptget_lines}" -ge 1 ]; then
+    echo "PASS: case f: the apt-get call extraction still finds at least one call in main()"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case f: main() no longer contains a \$SUDO timeout ... apt-get call — the bound-count check above is now vacuous, fix the extraction rather than deleting it"
+    fail_count=$((fail_count + 1))
+fi
+
 # f1: the endpoint returns something that is not a PGP key at all.
 # shellcheck disable=SC2016  # $out is expanded inside the stub at run time, not here
 res_f1=$(run_install_pinned_key 'printf "definitely not a pgp key\n" > "$out"')
@@ -475,6 +515,75 @@ if printf '%s' "${res_f2}" | grep -q "matches pinned fingerprint"; then
     fail_count=$((fail_count + 1))
 else
     echo "PASS: case f: an unexpected key is never reported as matching the pin"
+    pass_count=$((pass_count + 1))
+fi
+
+# f2b (TEST-001): a near-miss primary key -- one whose fingerprint shares
+# GOOGLE_KEY_FPR's TRAILING 16 HEX CHARS (a 64-bit short key ID) with a
+# completely different key otherwise. No two real GPG keys are known to
+# collide on a 16-hex-char suffix -- finding one would need on the order of
+# 2^64 key generations -- so this drives install_pinned_key's fingerprint
+# comparison with a STUBBED gpg (the same idiom case w uses for a stubbed
+# apt-cache) instead of a committed fixture key, isolating the comparison
+# LOGIC from real cryptography.
+#
+# Nothing in any of the four suites previously distinguished a full
+# 40-hex-char fingerprint pin from a short-key-id (last-16-hex) pin: a
+# regression that shortened GOOGLE_KEY_FPR to its last 16 chars, or loosened
+# the `grep -qxF` membership check on line 406 to a suffix match, would
+# silently accept this key -- and every other 40-char suffix collision along
+# with it -- while f2 above (an UNRELATED foreign key with no suffix overlap)
+# would still be correctly refused either way, so f2 alone cannot catch this.
+near_miss_fpr="DEADBEEFCAFEBABE012345677721F63BD38B4796"  # ends in GOOGLE_KEY_FPR's trailing 16 hex chars
+mkdir -p "${FIXTURE_DIR}/bin-f2b"
+cat > "${FIXTURE_DIR}/bin-f2b/curl" <<'EOF'
+#!/bin/bash
+out=""
+while [ $# -gt 0 ]; do
+    [ "$1" = "-o" ] && { out="$2"; shift 2; continue; }
+    shift
+done
+printf 'dummy key bytes\n' > "$out"
+EOF
+cat > "${FIXTURE_DIR}/bin-f2b/gpg" <<EOF
+#!/bin/bash
+case "\$*" in
+    *--import*)
+        exit 0
+        ;;
+    *--fingerprint*)
+        printf 'pub:-:2048:1:AAAAAAAAAAAAAAAA:::-:::scESC:\n'
+        printf 'fpr:::::::::%s:\n' "${near_miss_fpr}"
+        exit 0
+        ;;
+    *--export*)
+        printf 'dummy exported key bytes\n'
+        exit 0
+        ;;
+esac
+exit 0
+EOF
+chmod +x "${FIXTURE_DIR}/bin-f2b/curl" "${FIXTURE_DIR}/bin-f2b/gpg"
+res_f2b=$(
+    # shellcheck source=install-chrome.sh
+    source "${INSTALL_SCRIPT}"
+    PATH="${FIXTURE_DIR}/bin-f2b:${PATH}"
+    SUDO="/bin/false"   # any privileged call would fail loudly, proving we never reach one
+    ARCH="amd64"
+    set +e
+    mkdir -p "${FIXTURE_DIR}/f2b-scratch"
+    out=$(install_pinned_key "${FIXTURE_DIR}/f2b-scratch" 2>&1)
+    printf '%s\n%s\n' "$?" "${out}"
+)
+assert_eq "case f: a near-miss key (shares only GOOGLE_KEY_FPR's trailing 16 hex chars) does not succeed (rc 1)" \
+    "1" "$(echo "${res_f2b}" | sed -n '1p')"
+assert_contains "case f: the near-miss key is diagnosed as a fingerprint mismatch" \
+    "fingerprint mismatch" "${res_f2b}"
+if printf '%s' "${res_f2b}" | grep -q "matches pinned fingerprint"; then
+    echo "FAIL: case f: a near-miss (short-key-id-colliding) key was ACCEPTED -- a truncated pin would be silently exploitable"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS: case f: a fingerprint that only shares the trailing 16 hex chars is never accepted as matching the pin"
     pass_count=$((pass_count + 1))
 fi
 
@@ -615,6 +724,71 @@ assert_contains "case g: the hardlink refusal names the reason" \
     "has multiple hard links" "${res_g4}"
 assert_eq "case g: the hardlink victim's content is untouched" \
     "KEEP_ME=1" "$(cat "${FIXTURE_DIR}/defaults-hardlink-victim")"
+
+# g5/g6 (TEST-007): the in-`sh` TOCTOU re-check. g/g4 above drive the OUTER
+# [ -L ]/nlink guards, which run once, well before the privileged read. The
+# `$SUDO sh -c '...'` block inside suppress_permanent_repo re-checks BOTH
+# conditions again, immediately before the read, specifically to close the
+# window between those two points — and nothing in any of the four suites ever
+# made that window matter: `[ -L "$f" ] && exit 3` and the hard-link re-check
+# `&& exit 4` are reachable only if "$f" changes shape AFTER the outer guard
+# passes, and no case swapped it there.
+#
+# This can't use real concurrency without flakiness, so it plants the swap
+# deterministically at the one place a swap CAN happen without a race: the
+# `$SUDO install -d -- "$(dirname -- "$f")"` call that runs between the outer
+# guard and the privileged read. A stubbed `install` performs the swap first,
+# then execs the real `install` so the directory step still succeeds — this is
+# exactly the race SEC-BE-002 defends against, sequenced rather than timed.
+run_suppress_toctou() {
+    local f="$1" victim="$2" attack="$3"
+    local bin="${FIXTURE_DIR}/bin-toctou-${attack}"
+    rm -rf "${bin}"; mkdir -p "${bin}"
+    local real_install
+    real_install="$(command -v install)"
+    case "${attack}" in
+        symlink)  printf '#!/bin/bash\nln -sf "%s" "%s"\nexec "%s" "$@"\n' \
+                       "${victim}" "${f}" "${real_install}" > "${bin}/install" ;;
+        hardlink) printf '#!/bin/bash\nln -f "%s" "%s"\nexec "%s" "$@"\n' \
+                       "${victim}" "${f}" "${real_install}" > "${bin}/install" ;;
+    esac
+    chmod +x "${bin}/install"
+    # shellcheck disable=SC2030,SC2031  # subshell-local overrides are deliberate
+    (
+        # shellcheck source=install-chrome.sh
+        source "${INSTALL_SCRIPT}"
+        SUDO=""
+        CHROME_DEFAULTS_FILE="${f}"
+        SCRATCH_DIR="${FIXTURE_DIR}/scratch"
+        mkdir -p "${SCRATCH_DIR}"
+        PATH="${bin}:${PATH}"
+        set +e
+        out=$(suppress_permanent_repo 2>&1)
+        printf '%s\n%s\n' "$?" "${out}"
+    )
+}
+
+printf 'repo_add_once=true\n' > "${FIXTURE_DIR}/defaults-toctou-symlink"
+printf 'root secret content\n' > "${FIXTURE_DIR}/toctou-symlink-victim"
+res_g5=$(run_suppress_toctou "${FIXTURE_DIR}/defaults-toctou-symlink" \
+    "${FIXTURE_DIR}/toctou-symlink-victim" symlink)
+assert_eq "case g: a defaults file swapped to a symlink between the outer guard and the privileged read is refused (rc 1)" \
+    "1" "$(echo "${res_g5}" | sed -n '1p')"
+assert_contains "case g: the in-sh re-check names the symlink race, not a generic read failure" \
+    "became a symlink between the guard and the read" "${res_g5}"
+assert_eq "case g: the symlink race's victim content is untouched" \
+    "root secret content" "$(cat "${FIXTURE_DIR}/toctou-symlink-victim")"
+
+printf 'repo_add_once=true\n' > "${FIXTURE_DIR}/defaults-toctou-hardlink"
+printf 'root secret hardlink content\n' > "${FIXTURE_DIR}/toctou-hardlink-victim"
+res_g6=$(run_suppress_toctou "${FIXTURE_DIR}/defaults-toctou-hardlink" \
+    "${FIXTURE_DIR}/toctou-hardlink-victim" hardlink)
+assert_eq "case g: a defaults file swapped to a hardlink between the outer guard and the privileged read is refused (rc 1)" \
+    "1" "$(echo "${res_g6}" | sed -n '1p')"
+assert_contains "case g: the in-sh re-check names the hardlink race, not a generic read failure" \
+    "gained a hard link between the guard and the read" "${res_g6}"
+assert_eq "case g: the hardlink race's victim content is untouched" \
+    "root secret hardlink content" "$(cat "${FIXTURE_DIR}/toctou-hardlink-victim")"
 
 # ── Case h: container detection gates the apt-cache wipe ───────
 # Wiping /var/lib/apt/lists is safe in a throwaway image and destructive on a
@@ -2407,18 +2581,39 @@ assert_contains "case w: the refusal names the origin it saw" \
 # matched any URL merely CONTAINING that text, so a lookalike host satisfied it.
 # Both of these are rejected only because the check now anchors on the URL's
 # host component (SEC-BE-001).
+#
+# TEST-003: `rc == 1` alone does not prove the HOST-anchoring gate is what
+# refused either fixture — a LATER gate (the GOOGLE_APT_URL prefix check) also
+# refuses both, since neither origin starts with GOOGLE_APT_URL, so a broken
+# host gate that let either origin through would still land on rc 1 via that
+# later gate. MUTATION-PROVEN: reverting the host-anchoring block (the two
+# extraction lines plus the exact-match `[ "$host" != "dl.google.com" ]`) to the
+# OLD substring form the comment above describes — `grep -qF 'dl.google.com'`
+# against the WHOLE origin, not the extracted host — left this suite at
+# 214 passed / 0 failed, exit 0: both origins still contain "dl.google.com" as a
+# substring (the lookalike as a host PREFIX, the pathmatch inside the path), so
+# the broken gate let both through, and both were then caught instead by the
+# GOOGLE_APT_URL prefix gate ("not the source this run pinned"), preserving
+# rc 1 for both while the check the case NAMES was silently defeated. Asserting
+# on the host gate's OWN distinctive message — which embeds the exact origin it
+# saw — closes that: a mutation that routes the refusal through a different
+# gate now shows up as a message mismatch instead of a matching rc.
 res_w3=$(run_verify_apt_origin '(none)' '1.0.0-1' \
     '     1.0.0-1 500
         500 https://dl.google.com.attacker.example/linux/chrome/deb stable/main amd64 Packages' \
     lookalike)
 assert_eq "case w: a lookalike host (dl.google.com.attacker.example) is refused" \
     "1" "$(echo "${res_w3}" | sed -n '1p')"
+assert_contains "case w: the lookalike is refused by the HOST-anchoring gate specifically" \
+    "unexpected origin: https://dl.google.com.attacker.example/linux/chrome/deb (expected dl.google.com)" "${res_w3}"
 res_w4=$(run_verify_apt_origin '(none)' '1.0.0-1' \
     '     1.0.0-1 500
         500 https://mirror.example/dl.google.com/deb stable/main amd64 Packages' \
     pathmatch)
 assert_eq "case w: dl.google.com appearing in the PATH is refused" \
     "1" "$(echo "${res_w4}" | sed -n '1p')"
+assert_contains "case w: the path-only match is refused by the HOST-anchoring gate specifically" \
+    "unexpected origin: https://mirror.example/dl.google.com/deb (expected dl.google.com)" "${res_w4}"
 
 # w4b (SEC-BE-001): a bare-integer version collides with a PRIORITY column,
 # not just a URL lookalike. `500` is a syntactically valid Debian version, and
@@ -2719,6 +2914,87 @@ else
     skip "case y: pre-install origin gate (needs the same key fixture/gpg as j/j2)" 3
 fi
 
+# ── Case bp: _bounded_probe (TEST-008 / SEC-BE-005) ─────────────
+# `grep -c _bounded_probe` returns 0 in all four suites: verify_install's
+# `--version` probe (SEC-BE-005 — a browser that hangs on `--version` must not
+# wedge the tail of a provisioning run) had no case anywhere. Driven directly,
+# the same way case n/o drive other small helpers in isolation, rather than
+# through the full install path this suite deliberately does not cover.
+bp_dir="${FIXTURE_DIR}/bounded-probe"; mkdir -p "${bp_dir}"
+
+# bp1: a normal, fast binary's --version output is returned unchanged, proving
+# the timeout wrapper does not itself swallow or mangle a well-behaved probe.
+cat > "${bp_dir}/chrome-fast" <<'EOF'
+#!/bin/bash
+[ "$1" = "--version" ] && { printf 'Google Chrome 999.0.0.0\n'; exit 0; }
+exit 1
+EOF
+chmod +x "${bp_dir}/chrome-fast"
+res_bp1=$(
+    # shellcheck source=install-chrome.sh
+    source "${INSTALL_SCRIPT}"
+    CHROME_PROBE_TIMEOUT=2
+    _bounded_probe "${bp_dir}/chrome-fast"
+)
+assert_eq "case bp: _bounded_probe returns a runnable binary's --version output" \
+    "Google Chrome 999.0.0.0" "${res_bp1}"
+
+# bp2 (SEC-BE-005): a binary that hangs on --version must not hang
+# _bounded_probe itself -- that is the entire point of wrapping the call in
+# timeout/gtimeout. `_bounded_probe`'s own bound is set very short
+# (CHROME_PROBE_TIMEOUT=1) and the whole thing is wrapped in a much longer
+# OUTER `timeout`, the same safety-net pattern case z3 uses for its FIFO: if
+# the inner bound is ever removed, the hanging binary's 30s sleep is instead
+# caught by the outer bound, so the suite fails loudly on a slow assertion
+# rather than wedging forever.
+#
+# rc alone cannot distinguish "bounded correctly" from "bounded only by the
+# outer safety net": both `timeout`s report 124 when they kill their child,
+# so a correct 1s inner bound and a broken 15s outer bound are the SAME exit
+# code. ELAPSED TIME is the only signal that actually separates them -- pass
+# means this returns in low single-digit seconds; drop means it takes ~15s
+# (the outer safety net's own bound) instead.
+cat > "${bp_dir}/chrome-hang" <<'EOF'
+#!/bin/bash
+[ "$1" = "--version" ] && { sleep 30; printf 'should never print\n'; exit 0; }
+exit 1
+EOF
+chmod +x "${bp_dir}/chrome-hang"
+bp_tmo=""
+for c in timeout gtimeout; do
+    command -v "$c" >/dev/null 2>&1 && { bp_tmo="$c"; break; }
+done
+if [ -n "${bp_tmo}" ]; then
+    bp_start=$(date +%s)
+    # `|| true` (same load-bearing reason as case j's fixture-fpr assignment):
+    # a bare `var=$(pipeline)` assignment takes the pipeline's own exit status
+    # under this file's `set -euo pipefail`, and BOTH the pass and fail paths
+    # here exit non-zero (the probe legitimately returns non-zero on a binary
+    # it never got a version out of), so without this the PASSING case would
+    # abort the whole suite before the assertions below ever run.
+    out_bp2=$("${bp_tmo}" 15 bash -c '
+        # shellcheck source=install-chrome.sh
+        source "$1"
+        CHROME_PROBE_TIMEOUT=1
+        _bounded_probe "$2"
+    ' _ "${INSTALL_SCRIPT}" "${bp_dir}/chrome-hang" 2>/dev/null) || true
+    bp_elapsed=$(( $(date +%s) - bp_start ))
+else
+    # No timeout(1)/gtimeout(1) on this host at all: same degrade path
+    # chrome_runnable documents for stock macOS. Nothing to bound the outer
+    # call with either, so this arm cannot be driven here without risking a
+    # genuinely wedged suite.
+    skip "case bp: _bounded_probe timeout enforcement (no timeout/gtimeout on PATH)" 2
+    out_bp2=""
+    bp_elapsed=""
+fi
+if [ -n "${bp_tmo}" ]; then
+    assert_eq "case bp: _bounded_probe cuts off a hanging --version near its own 1s bound, not the outer 15s safety net" \
+        "under-outer-bound" "$([ "${bp_elapsed}" -lt 10 ] && echo "under-outer-bound" || echo "HUNG ${bp_elapsed}s — SEC-BE-005 bound is gone")"
+    assert_eq "case bp: _bounded_probe on a hanging binary produces no output (the hang was cut off, not raced)" \
+        "" "${out_bp2}"
+fi
+
 # ── Case z: the install lock (SEC-BE-006 / SEC-BE-008 / TEST-011 / TEST-012) ──
 #
 # The flock block in main() had no assertion of any kind anywhere in this
@@ -2789,6 +3065,82 @@ assert_contains "case z: the hardlink refusal names the multiple hard links" \
     "multiple hard links" "${res_z2}"
 assert_eq "case z: the hardlink attack's target is untouched" \
     "do not touch me" "$(cat "${FIXTURE_DIR}/root-z2/victim" 2>/dev/null)"
+
+# case z2b (TEST-004 / TEST-005): a lock file owned by a THIRD uid — neither
+# root nor the invoking user — is the fourth SEC-BE-004 guard, and it had no
+# case anywhere in this suite: `grep -c 'owned by uid'` returns 1 in
+# install-chrome.sh and 0 across all four suites, for both the reject arm and
+# the `stat` failure arm ahead of it.
+#
+# It cannot be driven with a real chown: this suite runs unprivileged, and
+# chowning a file to a uid this process does not own is exactly the privilege
+# the guard exists to distrust. Instead a STUBBED `stat` — the same idiom case
+# w uses for `apt-cache` — reports a fabricated owner for ONLY the planted lock
+# file's `-c '%u'` query and defers to the REAL `stat` for every other query
+# (including this same file's `-c '%h'` query), so the hard-link guard ahead of
+# the owner check still sees a real, single-link file and does not itself
+# refuse first.
+#
+# TEST-005: case z4's guard-PRESENCE check further below can only see that the
+# `lock_owner=$(stat -c '%u' ...)` ASSIGNMENT still exists in main() — it says
+# nothing about what the code DOES with the value, so turning the comparison
+# unsatisfiable (`[ "$lock_owner" -eq -999 ]`, round 11's mutation) left that
+# check green with the needle untouched. A stubbed `flock` that always fails
+# stands in here for "whatever happens after the guards": if the owner guard
+# does NOT refuse a hostile owner, execution falls through to the real
+# acquisition and fails there instead, with a DIFFERENT, distinguishable
+# message ("Could not acquire the install lock") — so this case's message
+# assertion, not just its rc, is what a broken owner comparison actually trips.
+run_lock_owner() {
+    local root="$1" attack="$2" bin="${FIXTURE_DIR}/bin-lockowner-$2"
+    rm -rf "${root}" "${bin}"; mkdir -p "${root}/tmp" "${bin}"
+    printf '#!/bin/bash\nexec "$@"\n' > "${bin}/sudo"; chmod +x "${bin}/sudo"
+    printf '#!/bin/bash\nexit 1\n' > "${bin}/flock"
+    chmod +x "${bin}/sudo" "${bin}/flock"
+    local lock_path="${root}/tmp/vespasian-install-chrome.lock"
+    printf 'planted lock\n' > "${lock_path}"
+    # A uid guaranteed to differ from both root (0) and this test's own uid,
+    # without needing an actual "nobody"-class account to exist on the host.
+    local fake_uid=$(($(id -u) + 1))
+    local real_stat
+    real_stat="$(command -v stat)"
+    {
+        printf '#!/bin/bash\n'
+        printf 'if [ "$1" = "-c" ] && [ "$2" = "%%u" ] && [ "$4" = "%s" ]; then\n' "${lock_path}"
+        case "${attack}" in
+            reject)   printf '    echo %s\n' "${fake_uid}" ;;
+            statfail) printf '    exit 1\n' ;;
+        esac
+        printf 'else\n'
+        printf '    exec "%s" "$@"\n' "${real_stat}"
+        printf 'fi\n'
+    } > "${bin}/stat"
+    chmod +x "${bin}/stat"
+    (
+        VESPASIAN_TEST_ROOT="${root}"
+        export VESPASIAN_TEST_ROOT
+        unset REMOTE_CONTAINERS
+        unset container
+        PATH="${bin}:${PATH}"
+        # shellcheck source=install-chrome.sh
+        source "${INSTALL_SCRIPT}"
+        set +e
+        out=$(main 2>&1)
+        printf '%s\n%s\n' "$?" "${out}"
+    )
+}
+
+res_zown1=$(run_lock_owner "${FIXTURE_DIR}/root-zown1" reject)
+assert_eq "case z: a lock file owned by a third uid is refused (rc 1)" \
+    "1" "$(echo "${res_zown1}" | sed -n '1p')"
+assert_contains "case z: the third-uid refusal names the owner check, not a flock timeout" \
+    "neither root nor" "${res_zown1}"
+
+res_zown2=$(run_lock_owner "${FIXTURE_DIR}/root-zown2" statfail)
+assert_eq "case z: a lock file whose owner cannot be determined fails closed (rc 1)" \
+    "1" "$(echo "${res_zown2}" | sed -n '1p')"
+assert_contains "case z: the stat-failure refusal names the owner check, not a flock timeout" \
+    "Could not determine the owner" "${res_zown2}"
 
 # case z3 (SEC-BE-004): the lock path is a fixed name in a sticky world-writable
 # directory, so an unprivileged local user can plant ANY file type there before a

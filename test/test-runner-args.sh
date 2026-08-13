@@ -523,6 +523,38 @@ else
     fail "targets_need_config: '*' was glob-expanded against the cwd"
 fi
 
+# TEST-017: every case above drives the predicate with a WHOLE group list
+# (join_targets of a real array) or a target that shares no characters with any
+# real one ("totally-unknown-target"). None feeds a bare SUBSTRING of a real
+# offline target name, so replacing the whole-word match
+# (`case " ${OFFLINE_TARGETS[*]} " in *" ${target} "*)`) with an unbounded
+# substring match (dropping the space delimiters) would still classify every
+# case above identically — and "import" IS a literal substring of
+# "import-burp" et al., so a substring match would wrongly call it offline.
+# Verified by mutation: dropping the bounding spaces on both sides of the case
+# pattern left this suite at 117/0, exit 0.
+if targets_need_config "import"; then
+    pass "targets_need_config: 'import' (substring of import-burp/-har/...) is NOT treated as a match — fails closed"
+else
+    fail "targets_need_config: 'import' was matched as if it were a real target — whole-word anchoring lost (substring match regressed)"
+fi
+
+# TEST-017: the case pattern's `" ${target} "` is deliberately quoted so a
+# glob-metacharacter-bearing target value is matched LITERALLY rather than as
+# a wildcard (see the function's own comment on the here-string vs IFS split).
+# That quoting is untested: a target that is a real offline target name with a
+# trailing '*' appended is not itself a member of OFFLINE_TARGETS, so it must
+# still fail closed — UNLESS the quoting around ${target} in the case pattern
+# is dropped, in which case the '*' becomes an active wildcard and the pattern
+# matches "generate-rest" (a real member) through it. Verified by mutation:
+# removing the quotes around ${target} in the case pattern left this suite at
+# 117/0, exit 0 (this specific assertion flipped from PASS to FAIL).
+if targets_need_config "generate-rest*"; then
+    pass "targets_need_config: 'generate-rest*' (glob-bearing, not a real target) fails closed — target is matched literally, not as a wildcard"
+else
+    fail "targets_need_config: 'generate-rest*' was wrongly treated as config-free — a glob character in the target value acted as a wildcard"
+fi
+
 # Behavioral: a real (non-dry-run) offline selection must get PAST config
 # loading. Asserted as the absence of the config error rather than a specific
 # exit code, because how far the run then gets legitimately differs by
@@ -1105,6 +1137,27 @@ WORKFLOW="$SCRIPT_DIR/../.github/workflows/live-tests.yml"
 if [[ ! -f "$WORKFLOW" ]]; then
     fail "live-tests.yml not found at $WORKFLOW"
 else
+    # TEST-018: the per-suite/continue-on-error/if: checks below all operate on
+    # the preflight-selftest JOB BLOCK, which by construction starts after the
+    # `preflight-selftest:` line — so none of them can see the top-level `on:`
+    # triggers (line 3 of this file, structurally outside every job block).
+    # Deleting `pull_request:` there switches the un-gated guards off for every
+    # PR while every check below stays green, since the job itself, and every
+    # step inside it, is untouched. Verified by mutation: removing the
+    # `pull_request:` trigger left this suite at 117/0, exit 0.
+    on_block=$(awk '
+        /^on:/ { inblock=1; next }
+        inblock && /^[A-Za-z]/ { inblock=0 }
+        inblock { print }
+    ' "$WORKFLOW")
+    if [[ -z "$on_block" ]]; then
+        fail "could not extract the on: trigger block from live-tests.yml (extraction broken — assertion below is vacuous)"
+    elif printf '%s\n' "$on_block" | grep -qE '^  pull_request:'; then
+        pass "live-tests.yml still triggers on pull_request (the un-gated guard suites only run on PRs because of this)"
+    else
+        fail "live-tests.yml no longer triggers on pull_request — the un-gated guard suites (preflight-selftest, validator-regression) would never run on a PR"
+    fi
+
     preflight_block=$(awk '
         /^  preflight-selftest:/ { inblock=1; next }
         inblock && /^  [a-zA-Z_-]+:/ { inblock=0 }
@@ -1177,6 +1230,20 @@ else
             fail "un-gated job contains an if: condition — a guard can be silently skipped"
         else
             pass "un-gated job has no if: conditions at any level"
+        fi
+
+        # TEST-018: an `if:` isn't the only way to gate this job — a `needs:`
+        # on a job the check-label gate blocks (or that never runs on a plain
+        # PR push) has the same effect, and this job's own header comment says
+        # it is deliberately un-gated so that 'skip-live-tests' cannot switch
+        # off the regression net. None of the checks above would notice
+        # `needs:` being added: they only look at run lines and continue-on-
+        # error/if:. Verified by mutation: adding `needs: check-label` here
+        # left this suite at 117/0, exit 0.
+        if printf '%s\n' "$runlines" | grep -qE '^[[:space:]]*needs:'; then
+            fail "un-gated job now has a needs: dependency — this job is deliberately un-gated (see its header comment); a needs: on check-label (or anything check-label gates) would put every un-gated guard suite behind the skip-live-tests label"
+        else
+            pass "un-gated job has no needs: dependency (stays un-gated)"
         fi
     fi
 fi
@@ -1586,8 +1653,21 @@ if [[ -f "$WORKFLOW" ]]; then
         # assertion still printed "no-config path preserved". Mutation-proven —
         # with the filename-only grep, adding a setup step before the offline run
         # left the suite at 112/0, exit 0.
+        #
+        # TEST-019: do not anchor on `run:` being on the SAME line as the script
+        # path. A YAML block scalar step —
+        #   run: |
+        #     ./test/setup-live-targets.sh
+        # — puts the invocation on the line AFTER `run:`, so requiring
+        # `run:[[:space:]]*(\./|bash )?test/setup-live-targets\.sh` on one line
+        # never matches it: the second alternative only ever fired for the
+        # single-line `run: ./test/setup-live-targets.sh` form. Matching the
+        # invocation itself, independent of what precedes it on the same line,
+        # catches both forms. Mutation-proven — with the `run:`-anchored regex,
+        # inserting a `run: |` step ahead of the offline run left the suite at
+        # 117/0, exit 0.
         before_offline=$(printf '%s\n' "$test_runlines" | sed -n '1,/Run offline tests/p' | sed '$d')
-        if printf '%s\n' "$before_offline" | grep -qE '\.live-test-config|run:[[:space:]]*(\./|bash )?test/setup-live-targets\.sh'; then
+        if printf '%s\n' "$before_offline" | grep -qE '\.live-test-config|(\./|bash )?test/setup-live-targets\.sh'; then
             fail "test job writes a config file (or runs setup-live-targets.sh) before the offline run — the no-config offline path (AC3) is no longer exercised"
         else
             pass "test job writes no config before the offline run (AC3 no-config path preserved)"
@@ -1687,7 +1767,12 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # arm fires. The pin itself stays UNCONDITIONAL — gating it on "no skips", the
 # way the sibling suite used to, is what let a deletion hide behind an unrelated
 # ambient condition.
-EXPECTED_ASSERTIONS=117
+#
+# Bumped 117 -> 121: +2 for the un-gated job's on:/pull_request and needs:
+# checks (TEST-018), +2 for targets_need_config's substring/glob-anchoring
+# checks (TEST-017 in the LAB-5064 review-round sense, not the TEST-017
+# skip-credit note above).
+EXPECTED_ASSERTIONS=121
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
