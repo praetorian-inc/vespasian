@@ -72,21 +72,29 @@ EXCLUDE='was unreachable|were unreachable|made .* unreachable|making .* unreacha
 # reads as evidence that someone already checked.
 CITATION='Test[A-Z][A-Za-z0-9_]*'
 
-# Every test function name in the module, one per line. Module-wide on purpose, and
-# independent of --changed/--all: a claim in pkg/classify legitimately cites a test in
-# internal/pipeline, so per-package scoping would reject valid citations.
+# Every test function name in the module, one newline-separated list. Module-wide on
+# purpose, and independent of --changed/--all: a claim in pkg/classify legitimately
+# cites a test in internal/pipeline, so per-package scoping would reject valid
+# citations.
 #
-# Passed to awk as a FILE rather than with -v. BSD awk (macOS) rejects a newline
-# inside a -v value ("awk: newline in string"), so -v would make this check
-# Linux-only while still exiting non-zero locally for the wrong reason.
-TESTS_FILE="$(mktemp -t vespasian-testnames)" || exit 2
-trap 'rm -f "$TESTS_FILE"' EXIT
-
-git ls-files '*_test.go' | tr '\n' '\0' |
+# Handed to awk through the ENVIRONMENT (ENVIRON[...] below), which is the only one
+# of the three obvious channels that is portable both ways:
+#
+#   - -v VAR=value: BSD awk (macOS) rejects a newline inside a -v value
+#     ("awk: newline in string"), so the whole check aborts locally.
+#   - a temp file read as awk's first argument: needs mktemp, and `mktemp -t NAME`
+#     is a BSD prefix but a GNU template, so GNU rejects it with "too few X's in
+#     template". This script shipped that bug and it failed in CI while passing on
+#     macOS — the exact mirror of the -v problem.
+#   - ENVIRON: POSIX, and neither awk parses escapes in it.
+#
+# Size is bounded by the module's test count (~1700 names, ~70 KB), far inside
+# ARG_MAX on both platforms.
+existing_tests="$(git ls-files '*_test.go' | tr '\n' '\0' |
   xargs -0 grep -ho '^func Test[A-Za-z0-9_]*' 2>/dev/null |
-  sed 's/^func //' | sort -u >"$TESTS_FILE"
+  sed 's/^func //' | sort -u)"
 
-if [ ! -s "$TESTS_FILE" ]; then
+if [ -z "$existing_tests" ]; then
   echo "error: found no test functions to resolve citations against; refusing to pass vacuously" >&2
   exit 2
 fi
@@ -116,10 +124,12 @@ while IFS= read -r file; do
 
   # Walk each file's comment BLOCKS (runs of consecutive // lines), so a citation
   # anywhere in a block covers a claim anywhere in it.
-  #
-  # TESTS_FILE is read first (NR == FNR), so the main body uses FNR for line numbers.
-  awk -v file="$file" -v claim="$CLAIM" -v exclude="$EXCLUDE" -v cite="$CITATION" '
-    NR == FNR { if ($0 != "") test_names[$0] = 1; next }
+  VESPASIAN_TEST_NAMES="$existing_tests" \
+    awk -v file="$file" -v claim="$CLAIM" -v exclude="$EXCLUDE" -v cite="$CITATION" '
+    BEGIN {
+      n = split(ENVIRON["VESPASIAN_TEST_NAMES"], names, "\n")
+      for (i = 1; i <= n; i++) if (names[i] != "") test_names[names[i]] = 1
+    }
     function claim_line(b,   n, lines, i) {
       n = split(b, lines, "\n")
       for (i = 1; i <= n; i++) {
@@ -172,14 +182,14 @@ while IFS= read -r file; do
     }
     {
       if ($0 ~ /^[ \t]*\/\//) {
-        if (block == "") start = FNR
+        if (block == "") start = NR
         block = block "\n" $0
       } else {
         flush()
       }
     }
     END { flush(); exit (found > 0 ? 1 : 0) }
-  ' "$TESTS_FILE" "$file" || status=1
+    ' "$file" || status=1
 done < <(list_files)
 
 if [ "$status" -ne 0 ]; then
