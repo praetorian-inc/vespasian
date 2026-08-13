@@ -82,6 +82,54 @@ type crawlerContractCase struct {
 	headless bool
 }
 
+// contractCrawlTimeout is the whole-crawl budget shared by every contract test.
+//
+// It must clear the slowest crawl here by a wide margin, because exhausting it does
+// not reliably surface AS a timeout. Cancelling the crawl context makes
+// rodEngine.visit return nil links and the worker skip frontier.Push (both guarded
+// on ctx.Err()), so the crawl can end early and return partial results with a nil
+// error. Both outcomes were reproduced by sweeping this value:
+//
+//   - silent: RelativeLinks at a 4-7s budget captured /app/ but not /app/next and
+//     failed as "expected /app/next to be crawled", which reads as a
+//     link-resolution bug rather than a budget one.
+//   - loud: DepthLimit at an 11s budget failed as "Crawl error: context deadline
+//     exceeded".
+//
+// Measured cost, unloaded, rod backend (the http backend is single-digit
+// milliseconds and never binds). What truncation DOES depends on the assertion's
+// direction, so the two classes are listed apart:
+//
+// Tests that FAIL when truncated, because they assert a page WAS crawled:
+//
+//	DepthLimit         12.8s   ("/d2 at limit was not crawled")
+//	SendsCustomHeaders  9.0s
+//	FollowsLinks        8.9s   ("/p2 was not crawled")
+//	RelativeLinks…      8.9s   ("expected /app/next")
+//
+// Tests that PASS VACUOUSLY when truncated, because they assert a bound or an
+// absence — fewer requests satisfies them while testing nothing:
+//
+//	RespectsMaxPages   20.3s   (fetches <= maxPages+margin)
+//	ScopeConfinement    8.9s   (no cross-origin URL present)
+//
+// That second class is the reason to size this generously rather than to the
+// fail-on-truncation cost alone: ScopeConfinement and DepthLimit are the only
+// end-to-end assertions of two crawl containment controls (see CLAUDE.md), and a
+// budget-truncated ScopeConfinement reports success having exercised nothing.
+//
+// The floor is DefaultStableWait (3s of page.WaitStable) plus roughly 1s of
+// network-idle wait per page, so cost tracks crawl DEPTH more than page count;
+// RespectsMaxPages is slowest because it runs Depth 5 at Concurrency 1.
+//
+// 90s leaves 4.4x on the slowest crawl and 7x on the slowest fail-on-truncation
+// one. The previous shared value of 30s left DepthLimit 2.3x and RespectsMaxPages
+// 1.48x, and RelativeLinks (3.4x) was observed failing under full-suite load once
+// the integration tag began running in CI. Raising it is free on the passing path:
+// a crawl exits when the frontier drains, not when the budget expires, so every
+// cost above is unchanged at 30s, 90s and 300s (measured at all three).
+const contractCrawlTimeout = 90 * time.Second
+
 // crawlerBackends returns the two backends to exercise. This whole file is
 // behind `//go:build integration` (matching the repo's Chrome-test convention),
 // so default `make test` never runs it; the rod row additionally self-skips via
@@ -133,7 +181,7 @@ func TestCrawlerContract_FollowsLinks(t *testing.T) {
 	runCrawlerContract(t, srv,
 		func(headless bool) CrawlerOptions {
 			return CrawlerOptions{
-				Depth: 2, MaxPages: 10, Timeout: 30 * time.Second,
+				Depth: 2, MaxPages: 10, Timeout: contractCrawlTimeout,
 				AllowPrivate: true, Headless: headless,
 			}
 		},
@@ -217,7 +265,7 @@ func TestCrawlerContract_RespectsMaxPages(t *testing.T) {
 			// Concurrency:1 bounds in-flight overshoot to at most 1 extra
 			// page request beyond the cap trigger, making the margin tight.
 			c := NewCrawler(CrawlerOptions{
-				Depth: 5, MaxPages: maxPages, Timeout: 30 * time.Second,
+				Depth: 5, MaxPages: maxPages, Timeout: contractCrawlTimeout,
 				AllowPrivate: true, Headless: bc.headless, Concurrency: 1,
 			})
 			got, err := c.Crawl(context.Background(), srv.URL)
@@ -301,7 +349,7 @@ func TestCrawlerContract_SendsCustomHeaders(t *testing.T) {
 	runCrawlerContract(t, srv,
 		func(headless bool) CrawlerOptions {
 			return CrawlerOptions{
-				Depth: 2, MaxPages: 5, Timeout: 30 * time.Second,
+				Depth: 2, MaxPages: 5, Timeout: contractCrawlTimeout,
 				AllowPrivate: true, Headless: headless,
 				Headers: map[string]string{headerName: headerVal},
 			}
@@ -357,7 +405,7 @@ func TestCrawlerContract_ScopeConfinement(t *testing.T) {
 	runCrawlerContract(t, srv,
 		func(headless bool) CrawlerOptions {
 			return CrawlerOptions{
-				Depth: 2, MaxPages: 20, Timeout: 30 * time.Second,
+				Depth: 2, MaxPages: 20, Timeout: contractCrawlTimeout,
 				Scope: "same-origin", AllowPrivate: true, Headless: headless,
 			}
 		},
@@ -409,7 +457,7 @@ func TestCrawlerContract_RelativeLinksResolvedAgainstFinalURL(t *testing.T) {
 				skipIfNoChrome(t)
 			}
 			c := NewCrawler(CrawlerOptions{
-				Depth: 3, MaxPages: 20, Timeout: 30 * time.Second,
+				Depth: 3, MaxPages: 20, Timeout: contractCrawlTimeout,
 				AllowPrivate: true, Headless: bc.headless,
 			})
 			got, err := c.Crawl(context.Background(), startURL)
@@ -463,7 +511,7 @@ func TestCrawlerContract_DepthLimit(t *testing.T) {
 	runCrawlerContract(t, srv,
 		func(headless bool) CrawlerOptions {
 			return CrawlerOptions{
-				Depth: 2, MaxPages: 100, Timeout: 30 * time.Second,
+				Depth: 2, MaxPages: 100, Timeout: contractCrawlTimeout,
 				AllowPrivate: true, Headless: headless,
 			}
 		},
