@@ -62,6 +62,28 @@ new_fixture_repo() {
   local dir
   dir="$(mktemp -d)" || return 1
   git -C "$dir" init -q .
+  # Identity set ON THE FIXTURE REPO, because the --changed cases commit and a CI
+  # runner has none: this test failed there with "fatal: empty ident name" while
+  # passing locally off the author's global config. It is not overriding a resolved
+  # value — nothing resolves inside a throwaway repo — and it touches neither the real
+  # repo nor global config.
+  #
+  # The runner's condition cannot be faithfully reproduced on macOS, and the two
+  # obvious attempts both mislead:
+  #
+  #   - Clearing global/system config is not enough. macOS git then derives an
+  #     identity from the OS (verified: commits land as the login user at the
+  #     hostname), so they succeed and the gap stays invisible. The runner had a
+  #     derivable email but an EMPTY name, which is the case that errors.
+  #   - GIT_AUTHOR_NAME=/GIT_COMMITTER_NAME= does force the error, but env beats
+  #     repo config in git's precedence, so it also defeats the two lines above and
+  #     "fails" no matter how correct the fix is. It tests nothing.
+  #
+  # What was verified instead: with no global or system config, a repo carrying these
+  # two settings commits as `fixture <fixture@invalid>`, so repo-local config is what
+  # git uses and CI's missing global identity is covered.
+  git -C "$dir" config user.email fixture@invalid
+  git -C "$dir" config user.name fixture
   mkdir -p "$dir/scripts"
   cp "$CHECKER" "$dir/scripts/"
   echo "$dir"
