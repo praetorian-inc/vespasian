@@ -6,7 +6,7 @@ GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 LDFLAGS   := -s -w -X main.version=$(VERSION) -X main.gitCommit=$(GIT_COMMIT) -X main.buildDate=$(BUILD_DATE)
 
-.PHONY: build test test-integration lint lint-comments lint-comments-all fmt vet check coverage clean deps live-test-clean
+.PHONY: build test test-integration lint lint-comments lint-comments-selftest lint-comments-all fmt vet check coverage clean deps live-test-clean
 
 build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/vespasian
@@ -34,8 +34,16 @@ lint:
 # pins it. Scoped to files changed against BASE_REF (default origin/main) so it
 # ratchets: new and modified code must comply, pre-existing claims do not block a
 # merge. See the script header for the three LAB-4678 defects that motivated it.
-lint-comments:
+lint-comments: lint-comments-selftest
 	./scripts/check-unreachability-claims.sh --changed
+
+# Regression test for the checker itself, run before it so a broken checker is
+# reported as such rather than as claim violations. Cheap (about a second, no Go
+# build). NOTE: a green run here bounds this platform only — the checker is written
+# on macOS and the BSD/GNU userlands diverge in both directions, so CI running this
+# on ubuntu is what actually covers it.
+lint-comments-selftest:
+	./scripts/check-unreachability-claims_test.sh
 
 # Whole-tree sweep. Advisory: run it to see the remaining backlog, not as a gate.
 lint-comments-all:

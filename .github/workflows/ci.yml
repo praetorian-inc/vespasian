@@ -62,6 +62,16 @@ jobs:
           # turning a ratchet into a blanket gate.
           fetch-depth: 0
 
+      # Runs BEFORE the checker itself, deliberately. It is the only thing that
+      # exercises the checker on Linux: the script is authored on macOS, and the
+      # two userlands disagree in both directions (`mktemp -t NAME` is a BSD
+      # prefix but a GNU template; `awk -v` tolerates newlines on GNU and not on
+      # BSD), so a local green says nothing about this runner. A broken checker
+      # then reports as a checker bug here rather than as claim violations below,
+      # or as the silent pass that a shape-only citation match used to give.
+      - name: Self-test the claims checker
+        run: ./scripts/check-unreachability-claims_test.sh
+
       - name: Check unreachability claims cite a test
         env:
           BASE_REF: origin/${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}
