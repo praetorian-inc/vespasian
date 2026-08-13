@@ -581,8 +581,30 @@ echo "Test 18b: the loopback default lives in one asserted place and every targe
 # Source-level rather than socket-level, deliberately: the preflight-selftest job
 # that runs this suite installs no Go and no Node, so a test that built and started
 # a target would skip in exactly the environment the guard is for.
+# TEST-015: strip `/* */` BLOCK comments as well as `//` and `#` line comments.
+#
+# Stripping only line comments was the same defect this file was hardened against
+# one round earlier, regenerated one level down. The earlier fix taught the
+# chrome_available guard in test-runner-args.sh to drop `#` lines, because leaving
+# "previously delegated to detect_chrome_binary" in a comment kept that assertion
+# green while the delegation was gone. The identical trick worked here through a
+# block comment: parking `addr := target.Addr(port)` inside `/* ... */` and
+# re-implementing the bind inline left every assertion below green.
+#
+# A tighter grep is still a grep. What makes the checks below sound is that the
+# question they ask — "does this file CALL the shared helper" — is genuinely a
+# source-text question that behaviour cannot answer, since an inline copy behaves
+# identically. So the text has to be comment-free before it is matched.
 collapse_code() {
-    grep -vE '^[[:space:]]*(//|#)' "$1" | tr '\n' ' ' | tr -s '[:space:]' ' '
+    awk '
+        {
+            if (inblk) { if (sub(/^.*\*\//, "")) inblk = 0; else next }
+            while (sub(/\/\*[^*]*\*+([^\/*][^*]*\*+)*\//, " ")) { }
+            if (sub(/\/\*.*$/, " ")) inblk = 1
+        }
+        /^[[:space:]]*(\/\/|#)/ { next }
+        { print }
+    ' "$1" | tr '\n' ' ' | tr -s '[:space:]' ' '
 }
 
 SHARED_TARGET="${SCRIPT_DIR}/internal/target/target.go"
@@ -590,26 +612,42 @@ if [ ! -f "${SHARED_TARGET}" ]; then
     fail "test/internal/target/target.go not found — the shared loopback default is gone and every target below resolves its own bind"
     fail "test/internal/target/target.go not found — cannot verify the shared server timeout"
 else
-    shared_code=$(collapse_code "${SHARED_TARGET}")
-    # The default, as a structure: the guard, its body, and the JoinHostPort that
-    # consumes the result. Any of the three missing means the default is not what
-    # it claims.
-    if printf '%s' "${shared_code}" | grep -qF 'host := os.Getenv("BIND_HOST") if host == "" { host = "127.0.0.1" } return net.JoinHostPort(host, port)'; then
-        ok "shared target.Addr defaults to loopback when BIND_HOST is unset"
+    # TEST-016. The VALUES this file used to pin here — the loopback default
+    # (SEC-BE-015) and the non-zero header-read bound (SEC-BE-007) — are now
+    # asserted behaviourally in test/internal/target/target_test.go, which calls
+    # the real functions and checks what they return.
+    #
+    # That move was forced. The regex here read `ReadHeaderTimeout = [0-9]+ \*
+    # time\.Second`, which MATCHES `0 * time.Second` — it accepted the exact
+    # value it claimed to forbid. The structural grep for the Addr body was
+    # likewise satisfied by text sitting in a comment. Both holes are closed by
+    # asking the code rather than reading it: target_test.go fails on
+    # `ReadHeaderTimeout = 0`, on a `0.0.0.0` default, on inverting `host == ""`,
+    # and on replacing net.JoinHostPort with string concatenation — each
+    # mutation-verified.
+    #
+    # What stays here is the one question a Go test cannot answer: whether the
+    # four targets still DELEGATE to the shared helper. An inline copy behaves
+    # identically, so only the source text distinguishes it. That check is below.
+    #
+    # This job installs no Go, so it cannot run target_test.go itself. It asserts
+    # the file EXISTS and carries those behavioural assertions, so deleting the
+    # Go test to dodge it fails here instead of silently removing the coverage.
+    shared_test="${SCRIPT_DIR}/internal/target/target_test.go"
+    if [ ! -f "${shared_test}" ]; then
+        fail "test/internal/target/target_test.go is gone — the loopback default and the header-read bound have no behavioural assertion left, and the source greps that used to stand in for one were mutation-proven defeatable"
     else
-        fail "shared target.Addr no longer defaults to loopback when BIND_HOST is unset — the unset path, which is the default, exposes every Go target on every interface (SEC-BE-015)"
-    fi
-    # SEC-BE-007: the shared server timeout. rest-api and soap-service previously
-    # called http.ListenAndServe with no server struct, and concat-spa set
-    # ReadHeaderTimeout: 0 explicitly, each on a "timeouts not needed" rationale
-    # that held only while these targets were loopback-only. This PR ships the
-    # LIVE_TARGET_BIND_HOST=0.0.0.0 opt-in, so an unbounded header read became a
-    # slow-loris against a developer machine or CI runner.
-    if printf '%s' "${shared_code}" | grep -qE 'ReadHeaderTimeout = [0-9]+ \* time\.Second' \
-       && printf '%s' "${shared_code}" | grep -qF 'ReadHeaderTimeout: ReadHeaderTimeout'; then
-        ok "shared target.Server applies a non-zero ReadHeaderTimeout (SEC-BE-007)"
-    else
-        fail "shared target.Server no longer applies a non-zero ReadHeaderTimeout — the 0.0.0.0 opt-in this PR documents leaves an unbounded header read (SEC-BE-007)"
+        missing=""
+        for needle in 'func TestAddrDefaultsToLoopback' \
+                      'func TestAddrEmptyAndSetAreDistinct' \
+                      'func TestServerAppliesNonZeroReadHeaderTimeout'; do
+            grep -qF -- "$needle" "${shared_test}" || missing="${missing} ${needle#func }"
+        done
+        if [ -n "$missing" ]; then
+            fail "target_test.go no longer asserts:${missing} — these are the behavioural pins for SEC-BE-015 and SEC-BE-007"
+        else
+            ok "target_test.go carries the behavioural pins for the loopback default and the header-read bound (run by 'make test', not by this job)"
+        fi
     fi
 fi
 
@@ -992,7 +1030,14 @@ echo "────────────────────────�
 # timeout+dirname+sleep 2, stat 2. A degraded host still totals
 # EXPECTED_ASSERTIONS and stays green, while a DELETED assertion is now caught on
 # every host rather than only on a fully-equipped one.
-EXPECTED_ASSERTIONS=75
+# TEST-016: 75 -> 74. Test 18b's two structural pins (the loopback default and
+# the non-zero header-read bound) were replaced by ONE assertion that
+# test/internal/target/target_test.go exists and carries the behavioural checks.
+# Net -1 here, and a net GAIN in coverage: the Go test fails on `ReadHeaderTimeout
+# = 0`, on a 0.0.0.0 default, on inverting `host == ""`, and on dropping
+# net.JoinHostPort — none of which the greps caught, since the regex they used
+# matched `0 * time.Second` and their input was defeatable by a block comment.
+EXPECTED_ASSERTIONS=74
 if [ "$((PASS + FAIL + SKIP_CREDIT))" -ne "${EXPECTED_ASSERTIONS}" ]; then
     echo "setup-live-targets_test: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (Passed+Failed+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A Test block was added or removed without updating EXPECTED_ASSERTIONS."
