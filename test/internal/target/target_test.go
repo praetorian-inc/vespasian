@@ -14,7 +14,7 @@ import (
 // claims to forbid, and its comment-stripper removes only `//` lines, so the
 // matched structure can sit inside a `/* */` block while the real code differs.
 //
-// These are behavioural checks against the real functions. They cannot be
+// These are behavioral checks against the real functions. They cannot be
 // satisfied by moving text into a comment, by re-implementing the logic
 // inline, or by inverting a comparison, because they call the code and assert
 // on what it returns. They need no build tag, no fixture and no network, so
@@ -30,7 +30,7 @@ func TestAddrDefaultsToLoopback(t *testing.T) {
 	}
 }
 
-func TestAddrHonoursBindHostOverride(t *testing.T) {
+func TestAddrHonorsBindHostOverride(t *testing.T) {
 	t.Setenv("BIND_HOST", "0.0.0.0")
 
 	got := Addr("8080")
@@ -39,7 +39,7 @@ func TestAddrHonoursBindHostOverride(t *testing.T) {
 	}
 }
 
-// The override must be honoured only when it is actually set. An implementation
+// The override must be honored only when it is actually set. An implementation
 // that reads the variable but ignores it, or one that inverts the emptiness
 // test, passes TestAddrDefaultsToLoopback or the override test but not both.
 func TestAddrEmptyAndSetAreDistinct(t *testing.T) {
