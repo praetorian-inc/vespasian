@@ -29,7 +29,7 @@ This roster and [`CODEOWNERS`](CODEOWNERS) are kept in sync — `CODEOWNERS` is 
 
 Most changes are routine and need no ceremony:
 
-- **Pull requests** require at least one approving review from a maintainer other than the author before merge. `CODEOWNERS` requests that review automatically.
+- **Pull requests** require at least one approving review before merge; a branch ruleset enforces that. The approval is expected to come from a maintainer other than the author, and `CODEOWNERS` requests that review automatically, but code-owner approval is convention here rather than an enforced gate.
 - **Maintainers do not self-merge** without another maintainer's approval, including for their own changes.
 - **Routine changes** — bug fixes, tests, documentation, dependency bumps — proceed on a single approval.
 - **Substantial changes** — a new API type, a breaking change to the `capture.json` format, a new runtime dependency, or anything that changes CLI behavior users rely on — should start as an issue so the discussion happens before the implementation. This is about saving contributors wasted work, not about gatekeeping.
@@ -46,7 +46,9 @@ Any change to the team updates both this file and [`CODEOWNERS`](CODEOWNERS) in 
 
 ## Releases
 
-Any maintainer may cut a release. Releases are triggered by pushing a `v*` tag; [`.github/workflows/release.yml`](.github/workflows/release.yml) then runs GoReleaser, which builds the binaries and publishes the GitHub release. There is no manual publishing step.
+Releases are triggered by pushing a `v*` tag; [`.github/workflows/release.yml`](.github/workflows/release.yml) then runs GoReleaser, which builds the binaries and publishes the GitHub release. There is no manual publishing step.
+
+Creating the tag is the gated part. An organization-level ruleset restricts creation of `refs/tags/v*`, so being on the roster above does not by itself let you cut a release. A maintainer without that permission asks a Praetorian organization administrator to create the tag.
 
 ## Escalation
 

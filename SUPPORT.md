@@ -4,16 +4,16 @@ Thanks for using Vespasian. This page explains where to ask, what to include, an
 
 ## Where to ask
 
-Everything goes through [GitHub Issues](https://github.com/praetorian-inc/vespasian/issues):
+Questions, bug reports, and feature requests go through [GitHub Issues](https://github.com/praetorian-inc/vespasian/issues):
 
-| You want to | Open an issue and |
-|---|---|
-| Ask how to do something, or check whether behavior is expected | say it's a question, and include the context below |
-| Report something that doesn't work | describe expected versus actual, with the context below |
-| Suggest a capability or improvement | describe the use case it unblocks |
-| Report a security vulnerability | **don't** — see [SECURITY.md](SECURITY.md) |
+| You want to | Template | And |
+|---|---|---|
+| Ask how to do something, or check whether behavior is expected | **Question** | include the context below |
+| Report something that doesn't work | **Bug report** | describe expected versus actual, with the context below |
+| Suggest a capability or improvement | **Feature request** | describe the use case it unblocks |
+| Report a security vulnerability | none — **don't** | see [`SECURITY.md`](SECURITY.md) |
 
-Start at [new issue](https://github.com/praetorian-inc/vespasian/issues/new). Before filing, the [README](README.md) covers installation, the CLI reference, which API types are supported, and an [FAQ](README.md#frequently-asked-questions) — a fair number of questions are answered there.
+Start at [new issue](https://github.com/praetorian-inc/vespasian/issues/new/choose) and pick the matching template; each one asks for the context below as form fields. Before filing, the [README](README.md) covers installation, the CLI reference, which API types are supported, and an [FAQ](README.md#frequently-asked-questions) — a fair number of questions are answered there.
 
 If you're unsure whether something is a bug or a misunderstanding, say so and file it as a question. Working that out is our job, not yours.
 
@@ -39,8 +39,8 @@ In practice:
 
 - Questions and bug reports with the context above get answered fastest, because there's nothing to ask for first.
 - Reproducible bugs are prioritized over ones we can't reproduce.
-- A quiet issue hasn't been rejected. Comment on the thread — maintainers may simply have missed it — and if it's still quiet after roughly a week, escalate per [GOVERNANCE.md](GOVERNANCE.md).
+- A quiet issue hasn't been rejected. If a thread stays quiet, follow the escalation steps in [`GOVERNANCE.md`](GOVERNANCE.md).
 
 ## Security
 
-**Never report a security vulnerability in a public issue.** Follow [SECURITY.md](SECURITY.md) — email security@praetorian.com. The same applies to anything sensitive you find in a capture of a third party's system.
+**Never report a security vulnerability in a public issue.** Follow [`SECURITY.md`](SECURITY.md) — email security@praetorian.com. The same applies to anything sensitive you find in a capture of a third party's system.

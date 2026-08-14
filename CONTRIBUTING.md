@@ -329,9 +329,9 @@ Two CI workflows gate a PR:
 
 ## Reporting issues
 
-Bug reports, feature requests, and questions all go through GitHub Issues. [`SUPPORT.md`](SUPPORT.md) is the single source for where to ask what, the context to include, and what response to expect — it is kept there rather than duplicated here so the two cannot drift.
+Bug reports, feature requests, and questions all go through GitHub Issues. The forms in [`.github/ISSUE_TEMPLATE`](.github/ISSUE_TEMPLATE) are what a filed issue is actually held to — they collect the required context as form fields. [`SUPPORT.md`](SUPPORT.md) explains which template to pick and what response to expect; that guidance is kept there rather than restated here.
 
-One thing worth repeating: captures and generated specs routinely contain hostnames, tokens, cookies, and request bodies from real targets. Redact before attaching anything to a public issue.
+One thing worth repeating: captures and generated specs carry real hostnames, tokens, cookies, and request bodies. Redact before attaching anything to a public issue.
 
 ## Security disclosures
 
