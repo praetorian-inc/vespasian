@@ -311,16 +311,16 @@ test: add live coverage for HTML form extraction
 5. Keep diffs reviewable — no unrelated reformatting.
 6. Update `README.md` and the relevant `doc.go` if you change user-facing behavior or a package's public API.
 
-Review is driven by [`CODEOWNERS`](CODEOWNERS); a maintainer review is required before merge.
+Review is driven by [`CODEOWNERS`](CODEOWNERS); a maintainer review is required before merge. [`GOVERNANCE.md`](GOVERNANCE.md) lists the current maintainers and describes how decisions get made — including what to do if a pull request stalls or a review is disputed.
 
 Two CI workflows gate a PR:
 
 - **CI** — build, test, lint, and format check. Runs only when a PR touches Go sources, `go.mod`, `go.sum`, `.golangci*`, or the `Makefile`, so docs-only PRs intentionally show no CI run.
-- **Live Tests** — the end-to-end suite, on every PR.
+- **Live Tests** — the end-to-end suite, on every PR. It also carries the checks that must run regardless of what a PR touches, including **docs-check** (`test/check-docs.py`): required docs present, every relative link and heading anchor resolving, and the `CODEOWNERS` roster matching `GOVERNANCE.md`. Run it locally with `make check-docs`; `make check` includes it.
 
 ### PR checklist
 
-- [ ] `make check` passes (fmt, vet, lint, test)
+- [ ] `make check` passes (fmt, vet, lint, test, check-docs)
 - [ ] Tests added or updated for the change
 - [ ] New classifier / generator / importer / probe registered where the pipeline expects it
 - [ ] Commit messages follow conventional commit format
@@ -329,17 +329,9 @@ Two CI workflows gate a PR:
 
 ## Reporting issues
 
-Open a GitHub issue and include:
+Bug reports, feature requests, and questions all go through GitHub Issues. The forms in [`.github/ISSUE_TEMPLATE`](.github/ISSUE_TEMPLATE) are what a filed issue is actually held to — they collect the required context as form fields. [`SUPPORT.md`](SUPPORT.md) explains which template to pick and what response to expect; that guidance is kept there rather than restated here.
 
-- What you expected versus what happened
-- Steps to reproduce — the CLI command and flags, and the capture source (crawl, Burp XML, HAR, mitmproxy)
-- Vespasian version (`vespasian version`)
-- Go version (`go version`), OS, and architecture
-- A **redacted** `capture.json` excerpt where relevant
-
-Captures and generated specs routinely contain hostnames, tokens, cookies, and request bodies from real targets. Redact before attaching anything to a public issue.
-
-Questions belong in issues too.
+One thing worth repeating: captures and generated specs carry real hostnames, tokens, cookies, and request bodies. Redact before attaching anything to a public issue.
 
 ## Security disclosures
 
