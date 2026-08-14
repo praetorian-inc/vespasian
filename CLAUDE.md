@@ -27,8 +27,11 @@ make lint                     # Runs golangci-lint (gocritic, misspell, revive)
 # Format
 make fmt                      # Runs gofmt -s -w .
 
-# All checks (format, vet, lint, test)
+# All checks (format, vet, lint, test, docs)
 make check
+
+# Community-health docs only (presence, link/anchor resolution, CODEOWNERS roster)
+make check-docs
 
 # Coverage
 make coverage                 # Generates coverage.out and prints per-function coverage
@@ -127,6 +130,8 @@ The `test/` directory contains live test targets:
 
 `test/validate_test.sh` is the regression test that locks in those validators' reject behaviour: it asserts valid specs still pass and that every malformed / substring-trap fixture is rejected (e.g. an expected `GetUser` SOAP operation must no longer be satisfied by `GetUserList`). It needs only node plus the installed `test/spec-validators` deps — no Go build and no live services — and runs in about a second.
 
+`test/check-docs.py` guards the community-health docs (LAB-5870): the required root set exists, every relative markdown link and heading anchor resolves, and the `*` owner line in `CODEOWNERS` matches the maintainer table in `GOVERNANCE.md`. It exists because `GOVERNANCE.md` and `SUPPORT.md` were absent from `main` for a week — two stacked PRs merged into feature branches that nothing merges from again — and no check noticed; run against that commit it fails on both files. Python rather than shell because the link and anchor logic needs real parsing and these scripts are authored on macOS to run on Linux, where the `sed`/`grep`/`stat` flag sets diverge in both directions. Wired into `make check` and run in CI as the ungated `docs-check` job.
+
 See `test/README.md` for how to run the suite, including the `TEST_HOST` override for devcontainer setups.
 
 ## Code Conventions
@@ -150,4 +155,4 @@ GitHub Actions runs on push to main and PRs:
 - **ci.yml**: Build, test (`go test -race`, 80% coverage threshold), lint (golangci-lint v2), and format check. Runs on all pushes and PRs.
 - **live-tests.yml**: A single **test** job runs all targets via `test/run-live-tests.sh --group offline` then `--group live`. Before the offline run it does `npm ci --ignore-scripts` in `test/spec-validators` (via `actions/setup-node` with `cache: npm` keyed on `test/spec-validators/package-lock.json`), because the offline `generate-{rest,graphql,wsdl}` targets validate their output with the real parsers rather than grep. Target groups (`OFFLINE_TARGETS` / `LIVE_TARGETS`) are defined in `test/run-live-tests.sh` — the workflow references groups, not individual targets, so adding a target means editing one array in the runner. A drift-guard step (`test/test-runner-args.sh`) fails CI if a dispatch target is not covered by `OFFLINE_TARGETS`, `LIVE_TARGETS`, or the config-only set (e.g. `grpc-server`). Uses the stable Chrome shipped with the ubuntu-24.04 runner. The **test** job is gated: it `needs` a `check-label` job and runs on every PR by default; add the `skip-live-tests` label to bypass. Always runs on push to `main` and `workflow_dispatch`.
 
-  Two fast jobs sit deliberately **outside** that label gate, so `skip-live-tests` cannot switch off the regression net: **preflight-selftest** (`test/preflight-selftest.sh`, Chrome/Chromium detection logic, LAB-3893) and **validator-regression**, which does its own `npm ci --ignore-scripts` in `test/spec-validators` and then runs `./test/validate_test.sh` to prove the spec validators still reject malformed specs. Both are ~5-minute-timeout jobs needing no Go build and no live services. All three jobs (`preflight-selftest`, `validator-regression`, `test`) open with a `step-security/harden-runner` step in `egress-policy: audit` mode (LAB-4732 / SEC-BE-002) — defense-in-depth network monitoring that logs (does not block) outbound traffic; `registry.npmjs.org` is part of the anticipated allowlist. The `--ignore-scripts` flag on both installs is SEC-BE-001: it blocks npm lifecycle scripts from executing under the non-blocking audit-only egress policy.
+  Three fast jobs sit deliberately **outside** that label gate, so `skip-live-tests` cannot switch off the regression net: **preflight-selftest** (`test/preflight-selftest.sh`, Chrome/Chromium detection logic, LAB-3893); **validator-regression**, which does its own `npm ci --ignore-scripts` in `test/spec-validators` and then runs `./test/validate_test.sh` to prove the spec validators still reject malformed specs; and **docs-check** (`test/check-docs.py`, LAB-5870). All three need no Go build and no live services and carry a ~5-minute timeout. `docs-check` lives in this workflow rather than `ci.yml` because `ci.yml`'s `paths` filter is Go-only — a docs-only PR never triggers it, so the job guarding docs cannot be gated on Go files changing. All four jobs (`preflight-selftest`, `validator-regression`, `docs-check`, `test`) open with a `step-security/harden-runner` step in `egress-policy: audit` mode (LAB-4732 / SEC-BE-002) — defense-in-depth network monitoring that logs (does not block) outbound traffic; `registry.npmjs.org` is part of the anticipated allowlist. The `--ignore-scripts` flag on both installs is SEC-BE-001: it blocks npm lifecycle scripts from executing under the non-blocking audit-only egress policy.
