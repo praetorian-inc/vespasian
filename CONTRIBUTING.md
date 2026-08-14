@@ -311,7 +311,7 @@ test: add live coverage for HTML form extraction
 5. Keep diffs reviewable — no unrelated reformatting.
 6. Update `README.md` and the relevant `doc.go` if you change user-facing behavior or a package's public API.
 
-Review is driven by [`CODEOWNERS`](CODEOWNERS); a maintainer review is required before merge.
+Review is driven by [`CODEOWNERS`](CODEOWNERS); a maintainer review is required before merge. [`GOVERNANCE.md`](GOVERNANCE.md) lists the current maintainers and describes how decisions get made — including what to do if a pull request stalls or a review is disputed.
 
 Two CI workflows gate a PR:
 
@@ -329,17 +329,9 @@ Two CI workflows gate a PR:
 
 ## Reporting issues
 
-Open a GitHub issue and include:
+Bug reports, feature requests, and questions all go through GitHub Issues. [`SUPPORT.md`](SUPPORT.md) is the single source for where to ask what, the context to include, and what response to expect — it is kept there rather than duplicated here so the two cannot drift.
 
-- What you expected versus what happened
-- Steps to reproduce — the CLI command and flags, and the capture source (crawl, Burp XML, HAR, mitmproxy)
-- Vespasian version (`vespasian version`)
-- Go version (`go version`), OS, and architecture
-- A **redacted** `capture.json` excerpt where relevant
-
-Captures and generated specs routinely contain hostnames, tokens, cookies, and request bodies from real targets. Redact before attaching anything to a public issue.
-
-Questions belong in issues too.
+One thing worth repeating: captures and generated specs routinely contain hostnames, tokens, cookies, and request bodies from real targets. Redact before attaching anything to a public issue.
 
 ## Security disclosures
 

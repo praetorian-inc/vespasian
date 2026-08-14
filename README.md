@@ -561,7 +561,7 @@ Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the develo
 
 In short: fork the repository, create a feature branch, make sure `make check` passes, and open a Pull Request. Note that `make check` reformats as well as validates — it runs `gofmt -s -w .` first, so it may modify your working tree.
 
-This project is governed by our [Code of Conduct](CODE_OF_CONDUCT.md). Security vulnerabilities should be reported per [SECURITY.md](SECURITY.md) rather than as public issues.
+This project is governed by our [Code of Conduct](CODE_OF_CONDUCT.md), and [GOVERNANCE.md](GOVERNANCE.md) lists the maintainers and how decisions are made. For questions and support, see [SUPPORT.md](SUPPORT.md). Security vulnerabilities should be reported per [SECURITY.md](SECURITY.md) rather than as public issues.
 
 ## License
 
