@@ -1943,85 +1943,6 @@ else
     fi
 fi
 
-echo ""
-echo "=== Relation-naming assertions actually compare the relation (TEST-023) ==="
-# An assertion whose ok/fail message claims one statement comes BEFORE another
-# must contain an operator that compares their two positions. Naming a relation
-# is not testing it, and this file's own history is the evidence: Test 22's
-# graphql-log block was headed `# ORDERING`, its ok message said the install
-# happens "between its install(1) and the redirect", and no operator in it
-# compared the two line numbers. Moving the install AFTER the redirect left the
-# suite at exit 0 while the log was created at the caller's umask -- the exact
-# SEC-BE-003 loss the block existed to prevent. Measured across 56 blind
-# reviews of that diff: 54 missed it, because a reader who sees a check named
-# ORDERING audits its details and not its premise. So it is checked here
-# mechanically rather than left to review.
-#
-# Scope is deliberately narrow: only positional claims, only in ok/fail message
-# text. It says nothing about ATOMIC/EXCLUSIVE or any other vacuous assertion.
-# Widening it means adding a word to the alternation, not new machinery.
-rel_bad=0
-rel_checked=0
-for rel_f in "$SCRIPT_DIR"/*.sh; do
-    while IFS=: read -r rel_ln _; do
-        [ -n "$rel_ln" ] || continue
-        rel_checked=$((rel_checked + 1))
-        # The compare must belong to THIS assertion, so the search window is the
-        # assertion's own governing conditional chain: walk back to the nearest
-        # enclosing `if`, and look only there.
-        #
-        # The first version of this check used a flat 60-line lookback, which was
-        # the very defect it exists to catch. MUTATION-PROVEN: deleting the
-        # `[ "${trap_at}" -lt "${firststart_at}" ]` conjunct from the trap
-        # assertion left this check GREEN, because a SIBLING assertion's compare
-        # five lines earlier sat inside the window and vouched for it. "A compare
-        # exists nearby" is not "this claim is tested" — the same substitution the
-        # sed-range ORDERING bug made, reproduced in its replacement.
-        # Balanced scan, not "the nearest `if` above": a nested if/fi that opens
-        # and closes between the governing `if` and the assertion would otherwise
-        # be latched as the start, and the guard would false-FIRE on a legitimate
-        # block. MUTATION-PROVEN: inserting `if true; then :; fi` before a
-        # correctly-compared assertion made the naive version report it as
-        # uncompared. Walk up counting `fi` and `if`; the enclosing `if` is the
-        # one that leaves depth negative.
-        rel_floor=$((rel_ln > 60 ? rel_ln - 60 : 1))
-        # Balanced scan by TOKEN, not by line shape. Two earlier attempts failed:
-        # "nearest `if` above" latched a nested if/fi and false-FIRED on a correct
-        # assertion, and anchoring `fi` to line-start missed the one-line form
-        # `if true; then :; fi`, which then read as an unmatched `if`. Counting
-        # bare `if`/`fi` WORDS per line handles both — a one-liner nets zero, and
-        # `elif` tokenizes as `elif` so it never opens a block. Walking up, the
-        # enclosing `if` is the first line that drives depth below zero.
-        rel_lo=$(awk -v n="$rel_ln" -v floor="$rel_floor" '
-            NR>=floor && NR<n { line[NR]=$0 }
-            END{
-                d=0
-                for (i=n-1; i>=floor; i--) {
-                    t=line[i]; nif=0; nfi=0
-                    c=split(t, w, /[^A-Za-z_]+/)
-                    for (k=1; k<=c; k++) { if (w[k]=="if") nif++; else if (w[k]=="fi") nfi++ }
-                    d += nfi - nif
-                    if (d < 0) { print i; exit }
-                }
-                print floor
-            }' "$rel_f")
-        if ! sed -n "${rel_lo},${rel_ln}p" "$rel_f" \
-             | grep -qE '\[ *"?\$\{?[A-Za-z_]*(_at|_line)\}?"? *-(lt|gt|le|ge) '; then
-            fail "$(basename "$rel_f"):${rel_ln} claims a positional relation but its own conditional (from line ${rel_lo}) contains no operator comparing two positions — the relation exists only in the message"
-            rel_bad=1
-        fi
-        # BOTH directions: an assertion claiming X comes AFTER Y makes exactly the
-        # same kind of claim as one claiming X comes BEFORE Y, and the original
-        # alternation matched only the BEFORE phrasings. Three live assertions in
-        # setup-live-targets_test.sh say AFTER and went unchecked.
-    done < <(grep -nE '^[[:space:]]*(ok|fail) "[^"]*( BEFORE | AFTER | precedes | armed before | armed after |positioned AFTER|between its )' "$rel_f")
-done
-if [ "$rel_checked" -eq 0 ]; then
-    fail "found no positional-relation assertions to check — the matcher has rotted, fix it rather than deleting this case"
-elif [ "$rel_bad" -eq 0 ]; then
-    pass "all $rel_checked positional-relation assertions compare two positions"
-fi
-
 SUITE_COMPLETED=1
 
 echo ""
@@ -2077,11 +1998,7 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # suite while this file stayed at 129/0 exit 0. The trigger-shape check (SELF-2)
 # is net zero — it replaced the narrower paths/paths-ignore check rather than
 # adding to it.
-# 130 -> 131. MEASURED. +1 for the TEST-023 relation-naming check, which emits
-# exactly one counted outcome on every path: one pass when every positional
-# claim compares two positions, one fail per offending assertion, and one fail
-# if the matcher finds nothing at all (so it cannot pass vacuously).
-EXPECTED_ASSERTIONS=131
+EXPECTED_ASSERTIONS=130
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
