@@ -322,12 +322,45 @@ require_apt() {
 # signing key is not a valid PGP key" — an accusation that Google's key is
 # forged, whose tempting remedy is to bypass the verification. Wrong diagnosis
 # in the most dangerous possible direction.
+#
+# `timeout` is listed for the same reason flock is refused rather than degraded
+# around (see main()): it is REQUIRED here, not optional. Both privileged apt
+# invocations below hard-code `$SUDO timeout -k 30 N apt-get ...` (SEC-BE-006/
+# SEC-BE-008), so on a host without it the run died at `apt-get update` with
+# "apt-get update failed or timed out (held dpkg lock, or an unreachable
+# mirror)" — three wrong diagnoses, none of them the missing binary.
+#
+# NOT the graceful `timeout_cmd` degrade that _bounded_probe/chrome_runnable
+# use, and the difference is deliberate on two counts. What that idiom bounds
+# is an unprivileged, read-only `<browser> --version`; its degrade exists for
+# stock macOS, which the install path cannot even reach because require_apt
+# refuses a non-apt host one line above this call. What the bound here protects
+# is a privileged apt transaction that runs with a TEMPORARY, fully trusted
+# Google apt source live in /etc — dropping it would leave a wedged root
+# apt-get, and that standing egress, with no time limit at all, in exactly the
+# unattended contexts this script targets (Dockerfile RUN, postCreateCommand,
+# CI). Refusing costs nothing real: coreutils is Priority: required on every
+# Debian/Ubuntu base this script supports, the same argument the flock check
+# already makes for util-linux.
+#
+# Tested for by its literal name rather than through timeout_cmd(): the apt
+# calls invoke `timeout`, so a macOS-style host carrying only `gtimeout` would
+# pass a timeout_cmd-based gate and still fail at the call site.
 require_tools() {
-    local missing=()
+    local missing=() note=""
     command -v curl >/dev/null 2>&1 || missing+=("curl")
     command -v gpg  >/dev/null 2>&1 || missing+=("gnupg")
+    if ! command -v timeout >/dev/null 2>&1; then
+        missing+=("coreutils")
+        # The entries above are PACKAGE names (so the apt-get hint below is
+        # copy-pasteable), and "coreutils" — unlike "gnupg" for gpg — names
+        # roughly a hundred programs, so on its own it does not tell the
+        # operator which one is actually absent. Say it outright.
+        note="coreutils provides timeout(1), which bounds both privileged apt calls below."
+    fi
     if [ ${#missing[@]} -gt 0 ]; then
         log_fail "Missing required tool(s): ${missing[*]}" >&2
+        if [ -n "$note" ]; then log_info "  ${note}"; fi
         log_info "Install them first: apt-get install -y ${missing[*]}"
         return 1
     fi

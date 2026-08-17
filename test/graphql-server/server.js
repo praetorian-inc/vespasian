@@ -498,19 +498,25 @@ async function start() {
   // bind only when the devcontainer flow needs it (a crawler in a container
   // reaching the host via TEST_HOST). Mirrors test/forms-target/main.go.
   const host = process.env.BIND_HOST || "127.0.0.1";
+  // Announce the address actually bound, not a hardcoded "localhost": under
+  // LIVE_TARGET_BIND_HOST=0.0.0.0 this fixture listens on every interface, and
+  // a log line still saying "localhost" hid that widening from whoever read
+  // the startup output. Matches the four Go fixtures, which all print their
+  // resolved addr. Bracketing mirrors net.JoinHostPort for an IPv6 BIND_HOST.
+  const addr = host.includes(":") ? "[" + host + "]:" + port : host + ":" + port;
   httpServer.listen(port, host, () => {
-    console.log("Server ready at http://localhost:" + port + "/");
-    console.log("GraphQL endpoint: http://localhost:" + port + "/graphql");
+    console.log("Server ready at http://" + addr + "/");
+    console.log("GraphQL endpoint: http://" + addr + "/graphql");
     console.log("\nPages:");
-    console.log("  http://localhost:" + port + "/          (home + recent posts)");
-    console.log("  http://localhost:" + port + "/users      (all users)");
-    console.log("  http://localhost:" + port + "/users/1    (user detail)");
-    console.log("  http://localhost:" + port + "/posts      (all posts)");
-    console.log("  http://localhost:" + port + "/posts/10   (post detail + like)");
-    console.log("  http://localhost:" + port + "/search     (search)");
-    console.log("  http://localhost:" + port + "/create     (create post form)");
+    console.log("  http://" + addr + "/          (home + recent posts)");
+    console.log("  http://" + addr + "/users      (all users)");
+    console.log("  http://" + addr + "/users/1    (user detail)");
+    console.log("  http://" + addr + "/posts      (all posts)");
+    console.log("  http://" + addr + "/posts/10   (post detail + like)");
+    console.log("  http://" + addr + "/search     (search)");
+    console.log("  http://" + addr + "/create     (create post form)");
     console.log("\nVespasian:");
-    console.log("  ./vespasian-test scan http://localhost:" + port + "/ --api-type graphql -v -o schema.graphql");
+    console.log("  ./vespasian-test scan http://" + addr + "/ --api-type graphql -v -o schema.graphql");
   });
 }
 
