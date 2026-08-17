@@ -862,6 +862,40 @@ func TestCrawlBudget_CancelDoesNotPoisonTheEstimate(t *testing.T) {
 	}
 }
 
+// TestCrawlBudget_AbandonChargesRequestsWithoutSkewingEstimate pins the two halves
+// of the part-way-canceled reconciliation, which pull in opposite directions.
+//
+// The worker's mid-emit cancellation path used Release, which is correct about the
+// budget (the emitted requests really were sent to the target) and wrong about the
+// mean (a partial count is not a sample of what a page costs). Release drags the
+// estimate down, which is the exact failure Cancel's doc comment exists to prevent:
+// a too-low estimate is what lets too many pages start against a nearly-full budget.
+func TestCrawlBudget_AbandonChargesRequestsWithoutSkewingEstimate(t *testing.T) {
+	b := newCrawlBudget(0, 1000)
+
+	r, _ := b.TryReserve()
+	b.Release(r, 12) // one complete page costing 12
+
+	r, _ = b.TryReserve()
+	b.Abandon(r, 2) // cut off after emitting 2 of its requests
+
+	b.mu.Lock()
+	est := b.estimate()
+	b.mu.Unlock()
+
+	if est != 12 {
+		t.Errorf("estimate = %d after one 12-request page and one page abandoned at 2, want 12: "+
+			"a partial count is not a sample of what a page costs", est)
+	}
+	if got := b.Requests(); got != 14 {
+		t.Errorf("Requests() = %d, want 14: the 2 emitted requests reached the target, so they "+
+			"must still count against a budget that exists to protect it", got)
+	}
+	if b.reserved != 0 {
+		t.Errorf("reserved = %d, want 0: every reservation was returned", b.reserved)
+	}
+}
+
 // TestEnrichTarget_RedactsCredentialsInNavigationNotice pins the redaction on the
 // interaction navigation notice. For the depth-0 visit pageURL is the seed exactly
 // as the operator typed it, so echoing it raw wrote cleartext credentials to

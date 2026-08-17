@@ -68,9 +68,17 @@ const maxHostVerdictCacheEntries = 4096
 // lookupHost is a field so tests can supply a deterministic resolver instead of
 // depending on the environment's DNS. A crawl builds one checker, so a verdict is
 // cached for the run and not across runs, which keeps the staleness window to a
-// single crawl. The scope check is a coarse pre-filter regardless: pkg/ssrf's
-// SafeDialContext re-resolves at connect time, and that is what defeats DNS
-// rebinding.
+// single crawl.
+//
+// What backs that window differs by backend, and the difference is the reason to
+// state it rather than call the scope check a pre-filter and stop. On the net/http
+// backend pkg/ssrf's SafeDialContext re-resolves at connect time and is what
+// actually defeats DNS rebinding. On the HEADLESS backend Chrome does its own
+// dialing, so SafeDialContext never runs and this verdict is the only DNS-derived
+// gate; memoizing widens its staleness window from per-check to per-run. The TOCTOU
+// is not introduced by memoization — Chrome re-resolves independently of any check
+// Go made — but the run-length window is what this trades for bounding Restore's
+// per-entry resolution cost.
 type hostChecker struct {
 	lookupHost func(string) ([]string, error)
 

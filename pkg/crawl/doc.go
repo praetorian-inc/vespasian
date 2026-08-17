@@ -26,8 +26,12 @@
 // [DefaultNetworkIdleFloor], [DefaultNetworkQuietPeriod], [DefaultPerRequestTimeout],
 // and the per-page timeout) rather than a fixed settle window, so late and
 // dynamic requests are captured. Passively captured requests are scope-filtered
-// like frontier links, and the frontier treats URLs differing only in query
-// parameters as one page. On the headless backend the scope predicate also learns
+// like frontier links, with one exemption: a JavaScript body is retained even when
+// its URL is out of scope, because pkg/analyze/jsstatic reads the capture and has
+// no other input. The frontier treats URLs differing only in query parameters as
+// DISTINCT pages, capped at [maxQueryVariantsPerPath] variants per path — ?page=2
+// and ?tab=billing select a different page, not a different row of the same one.
+// On the headless backend the scope predicate also learns
 // the seed's EFFECTIVE origin from the seed's own navigation, so a seed that
 // redirects cross-origin (http -> https, apex -> www) does not discard every
 // captured request; the widening is one-shot, adds exactly the origin the seed

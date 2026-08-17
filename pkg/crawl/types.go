@@ -32,6 +32,8 @@ type ObservedRequest struct {
 	//   - "static:js"                    (static analysis of JS bundles, pkg/analyze/jsstatic)
 	//   - "static:js-sourcemap"          (recovered via .js.map sourcesContent)
 	//   - "static:js-concat"             (concat / +-chain / service-prefix reconstruction, LAB-4992)
+	//   - "static:js-nextroute"          (Next.js App Router route-handler chunk URL)
+	//   - "static:js-nextpage"           (Next.js App Router page chunk URL)
 	Source    string `json:"source"`
 	Tag       string `json:"tag,omitempty"`
 	Attribute string `json:"attribute,omitempty"`

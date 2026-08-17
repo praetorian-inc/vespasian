@@ -773,15 +773,12 @@ func TestExtractServers_MixedCaseHostDedupes(t *testing.T) {
 // its own servers override naming its actual origin, and that the global
 // servers list never contains that origin.
 //
-// TEST-004 (LAB-4992 review): the original version of this test asserted
-// only the POSITIVE half — the excluded operation gets an override. It used
-// disjoint paths (/api/users vs. /api/orders), so nothing here ever checked
-// that a NON-excluded operation (the /api/users one, on the primary origin)
-// carries NO override. Dropping the `&& excludedOrigins[origin]` half of
-// buildOperation's membership test would give every non-excluded operation a
-// spurious override too, undetected by the original assertions. This version
-// adds that missing negative assertion directly (KISS: reusing this test's
-// existing fixture rather than adding a near-duplicate sibling test).
+// Both halves of buildOperation's membership test are asserted here. The
+// positive half is that the excluded operation gets a per-operation servers
+// override; the negative half is that the non-excluded operation on the primary
+// origin gets none. Without the negative assertion, dropping the
+// `&& excludedOrigins[origin]` conjunct would give every operation a spurious
+// override and nothing here would fail.
 func TestBuildOperation_CrossOriginJSStaticGetsPerOperationServersOverride(t *testing.T) {
 	endpoints := []classify.ClassifiedRequest{
 		makeClassified("GET", "https://app.example.com/api/users", ""),

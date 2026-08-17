@@ -493,6 +493,54 @@ func TestAnalyze_StatsEndpointsFound(t *testing.T) {
 	}
 }
 
+// TestAnalyze_MaxEndpointsPerBundle_CountsNextRouteRecovery pins the Next.js
+// chunk-URL recovery against the SAME per-bundle cap as everything else.
+//
+// The route is synthesized from the bundle URL before body extraction runs, so
+// budgeting the body against the full MaxEndpointsPerBundle let such a bundle keep
+// cap+1. The sourcemap loop already subtracts what has been kept; the body path
+// must too, or the cap means one thing for ordinary bundles and another for the
+// exact bundles this feature targets.
+func TestAnalyze_MaxEndpointsPerBundle_CountsNextRouteRecovery(t *testing.T) {
+	var sb strings.Builder
+	for i := 0; i < 10; i++ {
+		fmt.Fprintf(&sb, "fetch(\"/api/r%d\");\n", i)
+	}
+	// A real App Router chunk URL: nextroute.go recovers /vaults/{vaultId} from
+	// the path alone, independently of the body above.
+	const chunk = "https://example.com/_next/static/chunks/app/vaults/%5BvaultId%5D/page-8ca1aac6111f15fc.js"
+
+	res, err := Analyze(context.Background(), []crawl.ObservedRequest{
+		makeJSCapture(chunk, sb.String()),
+	}, Options{MaxEndpointsPerBundle: 4})
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+
+	var static, nextRoute int
+	for _, r := range res.Requests {
+		if crawl.IsJSStaticSource(r.Source) {
+			static++
+		}
+		if r.Source == crawl.SourceNextPageRoute {
+			nextRoute++
+		}
+	}
+	if static != 4 {
+		t.Errorf("kept %d JS-static endpoints with MaxEndpointsPerBundle=4; the chunk-URL "+
+			"recovery must be charged against the cap, not added on top of it", static)
+	}
+	if res.Stats.EndpointsKept != 4 {
+		t.Errorf("Stats.EndpointsKept = %d, want 4", res.Stats.EndpointsKept)
+	}
+	// Non-vacuous: the recovery has to have actually fired, or this asserts nothing
+	// about the interaction between the two producers.
+	if nextRoute != 1 {
+		t.Fatalf("recovered %d Next.js routes from %q, want 1; without the recovery this "+
+			"test cannot detect the off-by-one", nextRoute, chunk)
+	}
+}
+
 // TestExtractFromBundle_HonorsMaxEndpoints verifies that the analyzer respects
 // Options.MaxEndpointsPerBundle by truncating the per-bundle endpoint slice.
 func TestExtractFromBundle_HonorsMaxEndpoints(t *testing.T) {

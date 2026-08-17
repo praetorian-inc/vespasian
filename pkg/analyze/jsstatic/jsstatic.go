@@ -299,10 +299,9 @@ func extractWithTimeout(ctx context.Context, source []byte, sourceURL, kind stri
 // call site is a single nil-check with no allocation and no side effects in
 // production builds.
 //
-// Dependency-injecting these hooks through Options would expose test seams as
-// part of the public API surface, which violates KISS for what amounts to two
-// conditional nil-checks. The package-level variable pattern is the accepted
-// Go idiom for this pattern and predates this PR.
+// They are package-level variables rather than Options fields so the test seam
+// stays out of the public API surface: Options is what callers configure, and two
+// fault-injection points do not belong in a caller's configuration.
 
 // testInjectPanic is a panic-fault-injection point used by jsstatic's
 // panic-recovery regression tests. The hook is consulted at exactly two
@@ -450,16 +449,24 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	// sources. The cap is applied first to the bundle body and then
 	// re-evaluated as remaining-budget on each sourcemap source below.
 	//
-	// QUAL-001 (LAB-4992): a plain prefix truncation here would keep only the
-	// first MaxEndpointsPerBundle entries of bundleEps. Because
-	// ExtractFromBundle appends concat/service-prefix reconstructions AFTER
-	// all AST-recovered endpoints, any bundle whose AST endpoint count alone
-	// reaches the cap would silently drop every concat candidate — undermining
-	// the acceptance criterion that offline generate must surface concat
-	// endpoints. capBundleEndpoints reserves a fair share of the budget for
-	// concat candidates instead of truncating the combined slice blindly.
-	if len(bundleEps) > opts.MaxEndpointsPerBundle {
-		bundleEps = capBundleEndpoints(bundleEps, opts.MaxEndpointsPerBundle)
+	// A plain prefix truncation here would keep only the first
+	// MaxEndpointsPerBundle entries of bundleEps. Because ExtractFromBundle
+	// appends concat/service-prefix reconstructions AFTER all AST-recovered
+	// endpoints, any bundle whose AST endpoint count alone reaches the cap would
+	// silently drop every concat candidate — undermining the acceptance criterion
+	// that offline generate must surface concat endpoints (LAB-4992).
+	// capBundleEndpoints reserves a fair share of the budget for concat
+	// candidates instead of truncating the combined slice blindly.
+	//
+	// The budget is the cap MINUS what the Next.js chunk-URL recovery above
+	// already kept, matching how the sourcemap loop below computes `remaining`.
+	// Using the full cap here let a Next.js chunk bundle keep cap+1.
+	bodyBudget := opts.MaxEndpointsPerBundle - result.stats.EndpointsKept
+	if bodyBudget < 0 {
+		bodyBudget = 0
+	}
+	if len(bundleEps) > bodyBudget {
+		bundleEps = capBundleEndpoints(bundleEps, bodyBudget)
 	}
 	for i := range bundleEps {
 		// Preserve the distinct concat reconstruction tag; force everything else
@@ -589,14 +596,11 @@ func headerKey(h map[string]string) string {
 // canceled). Per-bundle parse failures are logged and counted in Stats but
 // do not abort the analysis.
 //
-// Length rationale: this function's body is the orchestration shape of the
-// package — pre-loop classification, worker-pool fan-out, fan-in with Stats
-// merge, output slice build, and post-run cancellation check. These phases
-// are cohesive: each step reads the output of the previous one and the
-// control flow is sequential. Splitting the merge or fan-out into helpers
-// would force them to expose Stats, work channels, and the
-// abandoned-on-cancel accounting as parameters, which would obscure rather
-// than clarify the orchestration.
+// The phases below — pre-loop classification, worker-pool fan-out, fan-in with
+// Stats merge, output slice build, post-run cancellation check — are sequential
+// and each reads the previous one's output. Splitting the merge or the fan-out
+// into helpers would force them to take Stats, the work channels, and the
+// abandoned-on-cancel accounting as parameters.
 func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options) (Result, error) {
 	// Check context before any work.
 	if ctx.Err() != nil {

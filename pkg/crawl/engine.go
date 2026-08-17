@@ -468,6 +468,25 @@ func (b *crawlBudget) Cancel(reservation int) {
 	b.releaseLocked(reservation)
 }
 
+// Abandon reconciles a page that was cut off PART-WAY through emitting: it
+// returns the reservation and charges the requests already emitted against the
+// budget, but does NOT fold them into the mean.
+//
+// Both halves matter and they pull in opposite directions. The emitted requests
+// were really sent to the target, so they must count against a budget that exists
+// to protect it — Cancel alone would forget them. But a partial count is not a
+// sample of what a page costs, and feeding it to the mean is the exact drag
+// Cancel's doc warns about; the worker's cancellation path used Release, so it
+// did both correctly and incorrectly at once.
+//
+// TestCrawlBudget_AbandonChargesRequestsWithoutSkewingEstimate pins the pair.
+func (b *crawlBudget) Abandon(reservation, emitted int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.releaseLocked(reservation)
+	b.reqCount += emitted
+}
+
 // releaseLocked returns a reservation to the pool. Caller holds mu.
 func (b *crawlBudget) releaseLocked(reservation int) {
 	b.reserved -= reservation
@@ -571,7 +590,10 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 				// its surface is incomplete. Requeue it for the next run. The
 				// requests already emitted still count against the budget: they
 				// were sent to the target, which is what the budget bounds.
-				budget.Release(reservation, emitted)
+				// Abandon, not Release: a partial count is not a sample of what a
+				// page costs, and feeding it to the running mean is the drag
+				// Cancel's doc comment warns about.
+				budget.Abandon(reservation, emitted)
 				e.frontier.Requeue(entry)
 				e.frontier.MarkIdle()
 				return

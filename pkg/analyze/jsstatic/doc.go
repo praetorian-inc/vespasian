@@ -135,7 +135,10 @@
 // operation ("static:js" -> "js-bundle", "static:js-sourcemap" ->
 // "js-sourcemap", "static:js-concat" -> "js-bundle-concat",
 // "static:js-nextroute" -> "js-nextroute", "static:js-nextpage" ->
-// "js-nextpage"). A group mixing distinct JS-static tags resolves to the
+// "js-nextpage"). The last two do not occur in emitted output: pkg/classify
+// Rule 6a reports both chunk sources as not-an-API, so they never reach the
+// generator (see "Next.js App Router routes" above). They exist so the tag
+// vocabulary stays total. A group mixing distinct JS-static tags resolves to the
 // least-confident member present rather than to "dynamic", which is reserved for
 // a group holding a genuinely non-JS-static source. The distinct tags let
 // consumers weight speculative reconstructions and chunk-URL recoveries below

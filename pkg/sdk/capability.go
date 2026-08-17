@@ -102,7 +102,9 @@ func (c *Capability) Match(_ capability.ExecutionContext, input capmodel.WebAppl
 	}
 	u, err := url.Parse(input.PrimaryURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return fmt.Errorf("vespasian requires HTTP/HTTPS URL, got %q", input.PrimaryURL)
+		// Redacted: the rejected value is echoed into the host's error surface, and
+		// a userinfo-bearing URL is exactly the kind that fails this check.
+		return fmt.Errorf("vespasian requires HTTP/HTTPS URL, got %q", crawl.RedactURL(input.PrimaryURL))
 	}
 	if !input.Seed {
 		return fmt.Errorf("vespasian only runs on web application seeds")
@@ -128,6 +130,12 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 	}
 
 	start := time.Now()
+
+	// PrimaryURL is host-supplied and nothing upstream strips userinfo, so every
+	// sink below logs the redacted form. Computed once: crawl.RedactURL fails
+	// closed to a placeholder whenever it cannot prove the result is
+	// credential-free.
+	logTarget := crawl.RedactURL(input.PrimaryURL)
 
 	// TODO: propagate ctx from ExecutionContext once capability-sdk exposes a
 	// context.Context (see doc.go). Until then the crawl and JS-analysis phases
@@ -155,7 +163,7 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 
 	if mode == "crawl" {
 		slog.Info("vespasian crawl completed",
-			"target", input.PrimaryURL,
+			"target", logTarget,
 			"mode", "crawl",
 			"duration_ms", time.Since(start).Milliseconds(),
 			"crawled_pages", len(requests),
@@ -167,7 +175,7 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 	hasSpec, apiType, scanErr := c.runScan(ctx, requests, input, output)
 
 	slog.Info("vespasian scan completed",
-		"target", input.PrimaryURL,
+		"target", logTarget,
 		"mode", "scan",
 		"duration_ms", time.Since(start).Milliseconds(),
 		"crawled_pages", len(requests),
@@ -180,16 +188,18 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 }
 
 // slogWriter is a minimal io.Writer that funnels lines written to it into
-// slog.Warn, tagged with the scan target (SEC-BE-002). Its sole caller is
-// runScan's ScanOptions.Warnings below: without it, the probe-stage
-// cross-origin gate's warnings (internal/pipeline's writeStatus calls, via
-// pipeline.Options.Warnings) had nowhere to go on the SDK path -- Warnings
-// was left unset entirely, so a WebApplication whose app and API endpoints
-// live on different origins (e.g. www.example.com vs api.example.com)
-// silently stopped having its API probed, with no record of the decision
-// anywhere: not the spec, not slog. Constructed at the call site below, not
-// as a package-level var or via init(), per KISS -- a named type with one
-// method needs neither.
+// slog.Warn, tagged with the scan target. Its sole caller is runScan's
+// ScanOptions.Warnings below: without it, the probe-stage cross-origin gate's
+// warnings (internal/pipeline's writeStatus calls, via
+// pipeline.Options.Warnings) had nowhere to go on the SDK path -- Warnings was
+// left unset entirely, so a WebApplication whose app and API endpoints live on
+// different origins (e.g. www.example.com vs api.example.com) silently stopped
+// having its API probed, with no record of the decision anywhere: not the spec,
+// not slog.
+//
+// target must already be redacted; this type does not redact. Callers pass
+// crawl.RedactURL's output so a credentialed PrimaryURL is not tagged onto
+// every warning the writer emits.
 type slogWriter struct {
 	target string
 }
@@ -214,6 +224,12 @@ func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.O
 
 	apiType, _ := ctx.Parameters.GetString("api_type")
 
+	// Every sink in this function that names the target logs this, not
+	// input.PrimaryURL: the value is host-supplied, nothing upstream strips
+	// userinfo, and crawl.RedactURL fails closed to a placeholder whenever it
+	// cannot prove the result is credential-free.
+	redactedTarget := crawl.RedactURL(input.PrimaryURL)
+
 	// ResolveAndGenerate detects the API type (when apiType is "" or "auto"),
 	// conditionally probes <primaryURL>?wsdl and promotes to WSDL on success,
 	// then classifies, probes, and generates the spec. WSDL discovery is gated
@@ -235,39 +251,15 @@ func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.O
 		SlugThreshold: slugThreshold,
 		Status:        nil,
 		// Warnings routes the probe-stage cross-origin gate's warnings into
-		// slog (SEC-BE-002) rather than leaving them unset (silently
-		// discarded by internal/pipeline's nil-safe writeStatus). See
-		// slogWriter's doc comment above.
-		// Redacted once at construction rather than per Write: PrimaryURL is
-		// operator-supplied and nothing upstream strips userinfo, so a
-		// credentialed target would otherwise be tagged onto every warning
-		// this writer emits (SEC-BE-005 review finding).
-		//
-		// NOTE: THREE pre-existing slog sinks in this file still log
-		// PrimaryURL raw -- "vespasian crawl completed", "vespasian scan
-		// completed", and "vespasian: classify/generate failed" -- plus
-		// Match's own %q echo in its HTTP/HTTPS rejection. All are unchanged
-		// by this PR and out of its diff scope, so they are deliberately not
-		// touched here.
-		//
-		// They are named by message string rather than line number on
-		// purpose: three earlier revisions of this NOTE cited line numbers,
-		// and every citation went stale as the comment above the sinks grew --
-		// including the sentence that first explained the problem, which
-		// listed the then-current lines and invalidated one of them by
-		// existing. Grep the strings instead.
-		//
-		// Match is NOT the chokepoint for fixing them: it takes input by value
-		// and returns only error, so it can REJECT a userinfo-bearing
-		// PrimaryURL but cannot sanitize the value Invoke later reads. The
-		// real options are to reject in Match (a validation, and a behavior
-		// change for callers that legitimately pass credentials) or to redact
-		// at each sink the way this line does. Tracked separately.
-		Warnings:  slogWriter{target: crawl.RedactURL(input.PrimaryURL)},
+		// slog rather than leaving them unset (silently discarded by
+		// internal/pipeline's nil-safe writeStatus), so a WebApplication whose
+		// app and API live on different origins does not stop having its API
+		// probed with no record of the decision anywhere. See slogWriter above.
+		Warnings:  slogWriter{target: redactedTarget},
 		AfterWSDL: nil,
 	})
 	if err != nil {
-		slog.Warn("vespasian: classify/generate failed", "target", input.PrimaryURL, "error", err)
+		slog.Warn("vespasian: classify/generate failed", "target", redactedTarget, "error", err)
 		return false, apiType, nil
 	}
 

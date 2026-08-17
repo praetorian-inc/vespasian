@@ -92,13 +92,13 @@ func (c *WSDLClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	var confidence float64
 	var reason string
 
-	// Signal 1: SOAPAction header present (case-insensitive).
+	// Signal 2: SOAPAction header present (case-insensitive).
 	if _, ok := getHeaderCaseInsensitive(req.Headers, "SOAPAction"); ok {
 		confidence = 0.95
 		reason = "soapaction-header"
 	}
 
-	// Signal 2: SOAP envelope in the request OR the response body.
+	// Signal 3: SOAP envelope in the request OR the response body.
 	//
 	// The response side was added with the signal-6 split below. Lowering bare
 	// text/xml means a genuine SOAP exchange can no longer coast on its
@@ -118,7 +118,7 @@ func (c *WSDLClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 		}
 	}
 
-	// Signal 3: ?wsdl query param or URL path ends with /wsdl (case-insensitive).
+	// Signal 4: ?wsdl query param or URL path ends with /wsdl (case-insensitive).
 	lowerQuery := strings.ToLower(parsedURL.RawQuery)
 	if strings.Contains(lowerQuery, "wsdl") || strings.HasSuffix(lowerPath, "/wsdl") {
 		if confidence < 0.90 {

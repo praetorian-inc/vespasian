@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	"mime"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
@@ -272,8 +273,15 @@ func Deduplicate(classified []ClassifiedRequest) []ClassifiedRequest { //nolint:
 		if !found {
 			order = append(order, key)
 			// Deep-copy QueryParams so that merging into the entry does not mutate
-			// the caller's original ClassifiedRequest slices.
+			// the caller's original ClassifiedRequest slices. MergedResponses is
+			// cloned for the same reason: appendMergedResponse appends to it below,
+			// which would write into the caller's backing array when it has spare
+			// capacity. RunClassifiers always produces a nil MergedResponses, so
+			// this only bites a direct caller of this exported function.
 			entryCopy := req
+			if req.MergedResponses != nil {
+				entryCopy.MergedResponses = slices.Clone(req.MergedResponses)
+			}
 			if req.QueryParams != nil {
 				entryCopy.QueryParams = make(map[string][]string, len(req.QueryParams))
 				for k, vs := range req.QueryParams {

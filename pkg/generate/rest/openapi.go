@@ -420,6 +420,15 @@ var leastConfidentJSStaticTag = func() string {
 // named values. TestFriendlySourceTag_TotalOverJSStaticSources asserts that every
 // source crawl.IsJSStaticSource accepts has a name here, so the two cannot drift.
 //
+// The two Next.js values are NOT emitted today, and the mapping above describes
+// this function rather than the spec. RESTClassifier Rule 6a returns isAPI=false
+// for both chunk sources and RunClassifiers gates on isAPI, so a Next.js-recovered
+// route never reaches Generate at any --confidence — TestNextRoute_NeverAnOperationAtAnyThreshold
+// pins that. They are named here so the vocabulary stays total (a missing name
+// would make an all-nextroute group emit no extension rather than a wrong one),
+// and they become reachable if the generator is ever taught to emit routes from
+// ClassifiedRequest.AllowedMethods, which is what would give the route a verb.
+//
 // "dynamic" is reserved strictly for a group containing a real non-JS-static
 // source (dynamic / static:html / empty). An all-JS-static group, even when it
 // mixes distinct JS-static tags, must never resolve to "dynamic", since that is
