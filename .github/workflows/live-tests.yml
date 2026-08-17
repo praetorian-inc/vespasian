@@ -286,7 +286,15 @@ jobs:
             mode=$(stat -c '%a' "$record")
             [ "$mode" = "644" ] || { echo "version record mode is $mode, expected 644"; fail=1; }
           fi
-          echo "recorded build: $(cat /usr/share/vespasian/chrome-version)"
+          # Guarded: the `[ -s ]` check above already reports a missing record
+          # with a clear message and sets fail=1. An unguarded `cat` here then
+          # appended a raw "No such file or directory" to stderr, burying that
+          # diagnosis under a second, less informative error.
+          if [ -s /usr/share/vespasian/chrome-version ]; then
+            echo "recorded build: $(cat /usr/share/vespasian/chrome-version)"
+          else
+            echo "recorded build: (no version record written)"
+          fi
           exit "$fail"
 
       # Second run must take the idempotent early-exit path and stay clean.

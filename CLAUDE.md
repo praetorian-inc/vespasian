@@ -155,7 +155,7 @@ See `test/README.md` for how to run the suite, including the `TEST_HOST` overrid
 GitHub Actions runs on push to main and PRs:
 
 - **ci.yml**: Build, test (`go test -race`, 80% coverage threshold), lint (golangci-lint v2), and format check. Runs on all pushes and PRs.
-- **live-tests.yml**: five jobs — two un-gated guard jobs, an opt-in end-to-end installer job, a label gate, and the full suite.
+- **live-tests.yml**: six jobs — three un-gated guard jobs, an opt-in end-to-end installer job, a label gate, and the full suite.
 
   **`preflight-selftest`** (un-gated) is the shell regression net. It runs a `bash -n` syntax check and then all four guard suites: `test/preflight-selftest.sh` (Chrome/Chromium detection, LAB-3893), `test/install-chrome-selftest.sh` (the installer's non-privileged surface), `test/setup-live-targets_test.sh` (teardown / orphan-PID hardening, LAB-2893), and `test/test-runner-args.sh` (target-group vs dispatch drift, the un-gated job's own step list, browser-target classification, and TEST-023: every assertion whose message claims one statement comes BEFORE another must contain an operator comparing their two positions). None need Go, Node, or Chrome. `test-runner-args.sh` fails CI if a dispatch target is not covered by `OFFLINE_TARGETS`, `LIVE_TARGETS`, or the config-only set (e.g. `grpc-server`), if this job stops invoking one of the four suites, or if a target in `ALL_TARGETS` is classified neither browser nor non-browser.
 
