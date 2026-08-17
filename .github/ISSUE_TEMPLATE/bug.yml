@@ -1,0 +1,100 @@
+name: Bug report
+description: Something in Vespasian doesn't work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug.
+
+        > [!CAUTION]
+        > **Do not report security vulnerabilities here.** Public issues are visible to everyone.
+        > Follow our [security policy](https://github.com/praetorian-inc/vespasian/security/policy) instead.
+
+        > [!WARNING]
+        > **Redact before posting.** Captures and generated specs routinely contain hostnames,
+        > tokens, cookies, and request bodies from real targets. Strip anything sensitive from
+        > commands, logs, and capture excerpts below.
+
+  - type: input
+    id: version
+    attributes:
+      label: Vespasian version
+      description: Output of `vespasian version`.
+      placeholder: v1.0.0
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: OS and architecture
+      description: Include whether you're in a container or devcontainer, which often matters for browser-driven runs.
+      placeholder: Ubuntu 24.04, linux/amd64, devcontainer
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command you ran
+      description: The full command line, including flags. Redact target hostnames if they're sensitive.
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: api-type
+    attributes:
+      label: Target API type
+      options:
+        - REST
+        - GraphQL
+        - SOAP / WSDL
+        - gRPC
+        - SPA / JS-heavy app
+        - Other or not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: capture-source
+    attributes:
+      label: Where did the traffic come from?
+      options:
+        - Headless crawl
+        - Burp Suite XML import
+        - HAR import
+        - mitmproxy import
+        - Not applicable
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected to happen
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happened
+      description: Include how it differed — missing endpoints, wrong spec output, a crash, an empty capture.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output
+      description: Relevant stdout/stderr. Paste the full error rather than a summary where you can.
+      render: shell
+
+  - type: textarea
+    id: capture
+    attributes:
+      label: Capture excerpt (redacted)
+      description: A few relevant entries from `capture.json`, or the relevant part of the generated spec.
+      render: json

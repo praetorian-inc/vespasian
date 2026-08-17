@@ -1,4 +1,6 @@
 # Specify code owners for this repository.
 # See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# This list must match the maintainer roster in GOVERNANCE.md. Change both together.
 
-* @santiago-praetorian @praetorian-peter-mueller
+* @santiago-praetorian @eli-wald @logan-bayless

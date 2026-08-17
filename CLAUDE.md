@@ -27,8 +27,11 @@ make lint                     # Runs golangci-lint (gocritic, misspell, revive)
 # Format
 make fmt                      # Runs gofmt -s -w .
 
-# All checks (format, vet, lint, test)
+# All checks (format, vet, lint, test, docs)
 make check
+
+# Community-health docs only (presence, link/anchor resolution, CODEOWNERS roster)
+make check-docs
 
 # Coverage
 make coverage                 # Generates coverage.out and prints per-function coverage
@@ -129,6 +132,8 @@ The `test/` directory contains live test targets:
 
 Supporting scripts: `test/install-chrome.sh` provisions a real non-snap Chrome for containers (Ubuntu's `chromium-browser` is a snap stub that cannot run in-container), installing it from Google's apt repo with the signing key pinned by fingerprint and the repo removed again afterwards. It is **not wired into any image build** — nothing calls it automatically, because the devcontainer definition lives outside this repo; a fresh container is browserless until an image layer or `postCreateCommand` invokes it. That wiring is tracked in LAB-5766. `test/preflight-selftest.sh`, `test/test-runner-args.sh`, `test/install-chrome-selftest.sh`, and `test/setup-live-targets_test.sh` are the CI-run regression guards for the setup preflight, the target-group/dispatch wiring (plus the un-gated job's own step list and the browser-target classification), the installer's non-privileged surface, and the setup script's teardown / orphan-process hardening (LAB-2893). All four run in the un-gated `preflight-selftest` job, which the `test` job depends on so a guard failure stops the full suite before it builds anything.
 
+`test/check-docs.py` guards the community-health docs (LAB-5870): the required root set exists, every relative markdown link and heading anchor resolves, and the `*` owner line in `CODEOWNERS` matches the maintainer table in `GOVERNANCE.md`. It exists because `GOVERNANCE.md` and `SUPPORT.md` were absent from `main` for a week — two stacked PRs merged into feature branches that nothing merges from again — and no check noticed; run against that commit it fails on both files. Python rather than shell because the link and anchor logic needs real parsing and these scripts are authored on macOS to run on Linux, where the `sed`/`grep`/`stat` flag sets diverge in both directions. Wired into `make check` and run in CI as the ungated `docs-check` job.
+
 See `test/README.md` for how to run the suite, including the `TEST_HOST` override for devcontainer setups, the browserless `--group offline` path, and the `//go:build integration` browser-lifecycle tests.
 
 ## Code Conventions
@@ -156,7 +161,9 @@ GitHub Actions runs on push to main and PRs:
 
   **`validator-regression`** (un-gated) does its own `npm ci --ignore-scripts` in `test/spec-validators` and runs `./test/validate_test.sh` to prove the spec validators still reject malformed specs.
 
-  Both guard jobs sit deliberately **outside** the label gate, so `skip-live-tests` cannot switch off the regression net. Both have ~5-minute timeouts.
+  **`docs-check`** (un-gated) runs `python3 test/check-docs.py --verbose` (LAB-5870): the required community-health docs exist, every relative markdown link and heading anchor resolves, and the `*` owner line in `CODEOWNERS` matches the maintainer table in `GOVERNANCE.md`. It lives in this workflow rather than `ci.yml` because `ci.yml`'s `paths` filter is Go-only — a docs-only PR never triggers it, so the job guarding docs must not be gated on Go files changing.
+
+  All three guard jobs (`preflight-selftest`, `validator-regression`, `docs-check`) sit deliberately **outside** the label gate, so `skip-live-tests` cannot switch off the regression net. All three have ~5-minute timeouts.
 
   **`install-chrome-e2e`** exercises the installer's PRIVILEGED path — the download, the signature-verified apt install, the trap teardown, and the AC4 cleanup that runs after the package's postinst. It is opt-in (`workflow_dispatch`, plus every push to `main`) rather than per-PR, because it needs root, real egress to Google, and it mutates system state; it runs as root in a disposable digest-pinned `ubuntu:24.04` container, so those mutations are thrown away. It asserts a runnable browser, absent phone-home artifacts, a version record, and an idempotent second run. `install-chrome-selftest.sh` covers every rejection arm unprivileged but stops before the first `$SUDO`, so without this job that region had no automated coverage at all.
 
@@ -164,4 +171,4 @@ GitHub Actions runs on push to main and PRs:
 
   **`test`** runs all targets via `test/run-live-tests.sh --group offline` then `--group live`, using the stable Chrome shipped with the ubuntu-24.04 runner. It declares `needs: [check-label, preflight-selftest]` — the second dependency is fail-fast, not decoration: the shell guards used to be this job's first step, and depending on the job restores that behaviour, so a drift failure stops the run before it builds Go, starts six services, and crawls with a browser. It does `npm ci --ignore-scripts` in `test/spec-validators` (via `actions/setup-node` with `cache: npm` keyed on `test/spec-validators/package-lock.json`) because the offline `generate-{rest,graphql,wsdl}` targets validate output with real parsers rather than grep. No stub config is written before the offline run: `run-live-tests.sh` loads `.live-test-config` only for targets that talk to a live service, so the offline group exercises the same no-config path a developer gets on a fresh checkout. Target groups are defined in `test/run-live-tests.sh` — the workflow references groups, not individual targets, so adding a target means editing one array in the runner.
 
-  All three real jobs (`preflight-selftest`, `validator-regression`, `test`) open with a `step-security/harden-runner` step in `egress-policy: audit` mode (LAB-4732 / SEC-BE-002) — defense-in-depth network monitoring that logs (does not block) outbound traffic; `registry.npmjs.org` is part of the anticipated allowlist. The `--ignore-scripts` flag on both npm installs is SEC-BE-001: it blocks npm lifecycle scripts from executing under the non-blocking audit-only egress policy.
+  All four real jobs (`preflight-selftest`, `validator-regression`, `docs-check`, `test`) open with a `step-security/harden-runner` step in `egress-policy: audit` mode (LAB-4732 / SEC-BE-002) — defense-in-depth network monitoring that logs (does not block) outbound traffic; `registry.npmjs.org` is part of the anticipated allowlist. The `--ignore-scripts` flag on both npm installs is SEC-BE-001: it blocks npm lifecycle scripts from executing under the non-blocking audit-only egress policy.

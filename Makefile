@@ -6,7 +6,7 @@ GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 LDFLAGS   := -s -w -X main.version=$(VERSION) -X main.gitCommit=$(GIT_COMMIT) -X main.buildDate=$(BUILD_DATE)
 
-.PHONY: build test lint fmt vet check coverage clean deps live-test-clean
+.PHONY: build test lint fmt vet check check-docs coverage clean deps live-test-clean
 
 build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/vespasian
@@ -23,7 +23,13 @@ fmt:
 vet:
 	go vet ./...
 
-check: fmt vet lint test
+check: fmt vet lint test check-docs
+
+# Community-health docs: presence, link/anchor resolution, CODEOWNERS-vs-GOVERNANCE
+# roster equality. Also runs as its own CI job, because ci.yml's paths filter means a
+# docs-only PR never reaches this Makefile.
+check-docs:
+	python3 test/check-docs.py
 
 coverage:
 	go test -race -coverprofile=coverage.out $$(go list ./... | grep -v '/test/')
