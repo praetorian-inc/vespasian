@@ -455,8 +455,23 @@ key_fn_body_f=$(fn_code install_pinned_key)
 # pinned-count, AND the fidelity sentinel below, so widening the match can never
 # leave the sentinel behind pattern-coupled to the old, narrower regex.
 curl_word_re='(^|[[:space:]]|\$\(|\(|\||&&|;)curl[[:space:]]'
-f_curl_lines=$(printf '%s\n' "${key_fn_body_f}" | grep -cE "$curl_word_re" || true)
-f_curl_pinned=$(printf '%s\n' "${key_fn_body_f}" | grep -E "$curl_word_re" \
+# ROUND-16: join line continuations FIRST, exactly as the f5b apt-get counter
+# does (see script_body_f5_joined below). Without it the two counters disagree on
+# what a "call" is: install_pinned_key's curl spans continuation lines and its
+# --proto/--proto-redir pins sit on a LATER line than the `curl` word, so the
+# pinned-count grep could only ever see them by accident of line splitting. The
+# asymmetry was the defect -- one sibling counting logical lines and the other
+# physical ones.
+#
+# KNOWN LIMITATION, stated rather than papered over: this counts `curl` in
+# command position by prefix, so a prose mention inside a same-line string (e.g.
+# log_info "... please curl the key ...") would also count. fn_code strips only
+# whole-line comments. No such string exists in install_pinned_key today, and the
+# fix -- parsing shell quoting -- is far more machinery than the risk warrants.
+key_fn_body_f_joined=$(printf '%s\n' "${key_fn_body_f}" \
+    | awk '{ if (sub(/\\$/, "")) { printf "%s ", $0; next } else { print } }')
+f_curl_lines=$(printf '%s\n' "${key_fn_body_f_joined}" | grep -cE "$curl_word_re" || true)
+f_curl_pinned=$(printf '%s\n' "${key_fn_body_f_joined}" | grep -E "$curl_word_re" \
     | grep -cF -- "--proto '=https' --proto-redir '=https'" || true)
 if [ "${f_curl_lines}" -ge 1 ] && [ "${f_curl_lines}" -eq "${f_curl_pinned}" ]; then
     echo "PASS: case f: all ${f_curl_lines} curl fetch(es) in install_pinned_key pin --proto/--proto-redir to https (downgrade redirects refused)"
@@ -475,7 +490,7 @@ fi
 # and the assertion fails for the wrong reason. Pin that the extraction actually
 # found the fetch, so a structural drift is reported as drift rather than as a
 # missing flag.
-if printf '%s' "${key_fn_body_f}" | grep -qE "$curl_word_re"; then
+if printf '%s' "${key_fn_body_f_joined}" | grep -qE "$curl_word_re"; then
     echo "PASS: case f: the scoped extraction still finds the key-fetch curl in install_pinned_key()"
     pass_count=$((pass_count + 1))
 else

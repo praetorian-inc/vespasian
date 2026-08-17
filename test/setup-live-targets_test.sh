@@ -574,6 +574,16 @@ done
 #   grpc-server   — passes no bind host at all; its literal bind is pinned in
 #                   Test 18b below.
 BIND_SEAM_EXEMPT="forms-target grpc-server"
+# ROUND-16 fidelity sentinel. ALL_TARGETS arrives by SOURCING the script under
+# test, so if it is ever renamed, moved below the main() guard, or emptied, the
+# loop below iterates zero times, `unchecked` stays empty, and the exhaustiveness
+# check PASSES having verified nothing. Same shape as the sentinels the sibling
+# suites carry on every extraction (test-runner-args.sh:1763 is the model).
+if [ -z "${ALL_TARGETS:-}" ]; then
+    fail "ALL_TARGETS is empty or unset after sourcing setup-live-targets.sh — the exhaustiveness check below would pass having iterated nothing; fix the extraction rather than deleting the check"
+else
+    ok "ALL_TARGETS extracted from setup-live-targets.sh (${ALL_TARGETS})"
+fi
 unchecked=""
 for t in ${ALL_TARGETS//,/ }; do
     case " rest-api soap-service concat-spa graphql-server $BIND_SEAM_EXEMPT " in
@@ -990,8 +1000,31 @@ if command -v stat >/dev/null 2>&1; then
     pidmode="$(stat -c '%a' "${STATE_DIR}/.modetest.pids" 2>/dev/null)"
     assert_eq "$pidmode" "600" "pid log lands at mode 600 even under umask 0 (SEC-BE-003)"
     rm -f "${STATE_DIR}/.modetest.pids"
+
+    # ROUND-16: the graphql log's mode had NO assertion at all. Its sibling
+    # write (record_pid, above) was hardened AND pinned in the same round; this
+    # one was hardened and left unguarded, which is this suite's own defect class
+    # -- a control shipped with nothing exercising it. Asserted the same way and
+    # in the same block, so the two cannot drift apart again.
+    #
+    # start_graphql_server is not called here (it would launch node); the
+    # `install -m 0600 /dev/null` line it runs is driven directly, which is the
+    # whole of the mode behaviour being pinned.
+    rm -f "${STATE_DIR}/.graphql-server.log"
+    ( umask 0; install -m 0600 /dev/null "${STATE_DIR}/.graphql-server.log" )
+    logmode="$(stat -c '%a' "${STATE_DIR}/.graphql-server.log" 2>/dev/null)"
+    assert_eq "$logmode" "600" "graphql server log lands at mode 600 even under umask 0 (SEC-BE-003)"
+    # And pin that start_graphql_server still CREATES it that way, so replacing
+    # the install(1) with a bare redirection -- which lands at the caller's umask
+    # -- is a failure here rather than a silent widening.
+    if printf '%s' "$(declare -f start_graphql_server)" | grep -qF 'install -m 0600 /dev/null'; then
+        ok "start_graphql_server pre-creates its log with an explicit 0600 mode (not a bare redirection at the caller's umask)"
+    else
+        fail "start_graphql_server no longer pre-creates .graphql-server.log with 'install -m 0600' — a bare redirection lands at the caller's umask, so under umask 0 the log holding service output would be world-writable (SEC-BE-003)"
+    fi
+    rm -f "${STATE_DIR}/.graphql-server.log"
 else
-    skip "stat required" 3
+    skip "stat required" 5
 fi
 
 # ── Test 23: teardown_on_failure EXIT trap tears down a failed partial setup ─
@@ -1151,7 +1184,14 @@ echo "────────────────────────�
 # assertion in Test 22). C2 and C5 are net zero: C2 rebalances Test 16's
 # cp-failure arm with a credited skip instead of adding a real assertion; C5
 # trades one Go test for another with no shell-side pin at all.
-EXPECTED_ASSERTIONS=80
+# ROUND-16: 80 -> 83. MEASURED. +2 in the Test 22 mode block (the graphql log's
+# 0600 mode, and that start_graphql_server still creates it with install(1)
+# rather than a bare redirection) -- that write was hardened last round with NO
+# assertion at all, unlike its record_pid sibling which was hardened AND pinned
+# in the same change. +1 for the ALL_TARGETS non-empty fidelity sentinel, without
+# which the exhaustiveness loop below it passes having iterated nothing.
+# The Test 22 skip credit moves 3 -> 5 to match.
+EXPECTED_ASSERTIONS=83
 if [ "$((PASS + FAIL + SKIP_CREDIT))" -ne "${EXPECTED_ASSERTIONS}" ]; then
     echo "setup-live-targets_test: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (Passed+Failed+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A Test block was added or removed without updating EXPECTED_ASSERTIONS."
