@@ -589,8 +589,8 @@ BIND_SEAM_EXEMPT="forms-target grpc-server"
 ALL_TARGETS_EXPECTED="rest-api soap-service graphql-server grpc-server concat-spa forms-target"
 missing_from_all=""
 for t in $ALL_TARGETS_EXPECTED; do
-    case ",${ALL_TARGETS}," in
-        *",$t,"*) ;;
+    case " ${ALL_TARGETS//,/ } " in
+        *" $t "*) ;;
         *) missing_from_all="$missing_from_all $t" ;;
     esac
 done
@@ -1046,7 +1046,13 @@ if command -v stat >/dev/null 2>&1; then
     if [ -z "$gql_install_line" ]; then
         fail "start_graphql_server no longer pre-creates its log with install(1) — a bare redirection lands at the caller's umask, so under umask 0 the log holding service output would be world-writable (SEC-BE-003)"
     else
-        ( umask 0; eval "$gql_install_line" ) >/dev/null 2>&1
+        # Status captured, not discarded: a second install line, a compound
+        # statement, or an unset var under `set +u` otherwise surfaced only as
+        # "expected '600', got ''", which reads as a mode defect rather than an
+        # extraction defect and sends the next reader to the wrong place.
+        if ! ( umask 0; eval "$gql_install_line" ) >/dev/null 2>&1; then
+            fail "could not execute start_graphql_server's install line in isolation (extracted: ${gql_install_line}) — the mode assertion below would report an empty mode as a 0600 violation; fix the extraction rather than deleting the check (SEC-BE-003)"
+        fi
         logmode="$(stat -c '%a' "${STATE_DIR}/.graphql-server.log" 2>/dev/null)"
         assert_eq "$logmode" "600" "start_graphql_server's own install line creates .graphql-server.log at mode 600 under umask 0 — pinning the path too, so an install pointed at another file cannot satisfy this (SEC-BE-003)"
 
@@ -1087,25 +1093,27 @@ $(declare -f "$w")"
         # than the span needs and is correct regardless — the function has no
         # legitimate reason to delete the file it just created with an explicit
         # mode. Together they cover inline, nested-helper, and top-level-helper.
-        # The verb list covers REMOVAL and MODE-WIDENING both. Enumerating only
-        # removal was defeated: `chmod 666 "$log"` after the install widens the
-        # mode without removing anything, and the stat above still reads 0600
-        # because it runs the install line in isolation. The property is "the
-        # 0600 mode survives to the write", and mode can be lost by being changed
-        # as easily as by the file being re-created.
+        # POSITION-COMPARED, not verb-enumerated. The predecessor scanned a span
+        # for a blacklist of removal/mode verbs and never compared ORDER, so the
+        # one thing it was named for went unchecked. MUTATION-PROVEN: moving the
+        # install line to AFTER the redirect left the suite at exit 0 while the
+        # log was created at the caller's umask — the exact loss the check exists
+        # to prevent. An enumeration also over-matched (`platform `, `perform `)
+        # and under-matched (`: > "$log"`, `cp /dev/null`).
         #
-        # This is an enumeration, which this file has learned to distrust — a verb
-        # not on the list slips through. It is kept because the alternative
-        # (executing the whole function) would launch node. The mitigation is that
-        # the list is paired with the executed-install check above and the span
-        # check below, so a single evasion must beat all three.
-        if printf '%s\n' "$gql_body" | grep -qE '(rm|unlink|mv|truncate|chmod|setfacl|chown|install)[[:space:]][^;]*graphql-server\.log' \
-           && [ "$(printf '%s\n' "$gql_body" | grep -cE '(rm|unlink|mv|truncate|chmod|setfacl|chown|install)[[:space:]][^;]*graphql-server\.log')" -gt 1 ]; then
-            fail "start_graphql_server removes or renames .graphql-server.log somewhere in its body (possibly via a helper defined inside it) — the redirect then RE-CREATES the file at the caller's umask and the explicit 0600 mode is lost (SEC-BE-003)"
-        elif printf '%s\n' "$gql_between" | grep -qE '(rm|unlink|mv|truncate|:>)[[:space:]]'; then
-            fail "start_graphql_server removes or replaces .graphql-server.log between the install(1) that sets its 0600 mode and the redirect that writes it — the redirect then RE-CREATES the file at the caller's umask, so the mode is lost (SEC-BE-003)"
+        # Same idiom as Test 24b below: locate each statement's line, assert the
+        # ordering, and refuse to compare on an extraction that found nothing.
+        gql_install_at=$(printf '%s\n' "$gql_body" | grep -nE '^[[:space:]]*install -m [0-7]+ /dev/null .*graphql-server\.log' | head -1 | cut -d: -f1 || true)
+        gql_redirect_at=$(printf '%s\n' "$gql_body" | grep -nE '^[[:space:]]*.*node server\.js >' | head -1 | cut -d: -f1 || true)
+        gql_clobber_at=$(printf '%s\n' "$gql_body" | grep -nE '^[[:space:]]*(rm|unlink|mv|truncate|chmod|setfacl|chown)[[:space:]][^;]*graphql-server\.log' | head -1 | cut -d: -f1 || true)
+        if [ -z "$gql_install_at" ] || [ -z "$gql_redirect_at" ]; then
+            fail "could not locate start_graphql_server's install line and/or its node redirect — the ordering assertion below would compare empty strings and pass vacuously; fix the extraction rather than deleting the check (SEC-BE-003)"
+        elif [ "$gql_install_at" -ge "$gql_redirect_at" ]; then
+            fail "start_graphql_server's install(1) runs at or AFTER the redirect (install line ${gql_install_at}, redirect line ${gql_redirect_at}) — the redirect creates .graphql-server.log at the caller's umask first, so the explicit 0600 mode never applies to the file the service writes (SEC-BE-003)"
+        elif [ -n "$gql_clobber_at" ] && [ "$gql_clobber_at" -gt "$gql_install_at" ] && [ "$gql_clobber_at" -lt "$gql_redirect_at" ]; then
+            fail "start_graphql_server removes, renames or re-modes .graphql-server.log at line ${gql_clobber_at}, between its install(1) (line ${gql_install_at}) and the redirect (line ${gql_redirect_at}) — the redirect then re-creates it at the caller's umask (SEC-BE-003)"
         else
-            ok "nothing removes or replaces .graphql-server.log between its install(1) and the redirect, so the 0600 mode survives to the write (SEC-BE-003)"
+            ok "start_graphql_server installs .graphql-server.log at 0600 BEFORE the redirect (lines ${gql_install_at} < ${gql_redirect_at}) and nothing clobbers it in between (SEC-BE-003)"
         fi
     fi
     rm -f "${STATE_DIR}/.graphql-server.log"
