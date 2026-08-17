@@ -536,11 +536,17 @@ verify_apt_origin() {
     #     metadata, and therefore the version apt selects, become
     #     attacker-influenceable in transit.
     #
-    #   * WHICH SOURCE. A pre-existing `google-chrome.sources` on the host, verified
-    #     by a DIFFERENT keyring, satisfies both the host and the scheme — so the
-    #     fingerprint pin this script goes to some trouble to establish became
-    #     ornamental on that path. Requiring the origin to be the URL this run
-    #     pinned ties the two together.
+    #   * WHICH SOURCE. Requiring the origin to be the exact URL this run pinned
+    #     (GOOGLE_APT_URL, by prefix) rejects a lookalike host, a downgraded
+    #     transport, and an unrelated third-party repo offering the same package
+    #     name under a different path. Accepted residual: Google's own package
+    #     postinst writes `URIs: https://dl.google.com/linux/chrome/deb`, which is
+    #     exactly GOOGLE_APT_URL, so a pre-existing `google-chrome.sources` at the
+    #     IDENTICAL URI but verified by a DIFFERENT keyring is indistinguishable
+    #     here — `apt-cache policy` never reports which keyring verified a source.
+    #     That scenario requires root to plant in the first place, so this is a
+    #     defence-in-depth claim that does not extend that far, not a reachable
+    #     escalation from this script's own unprivileged callers.
     case "$origin" in
         https://*) ;;
         *)
@@ -551,7 +557,7 @@ verify_apt_origin() {
     # GOOGLE_APT_URL is the source this run wired up; apt reports the origin with the
     # repo path appended, so compare by prefix rather than for equality.
     if [ "${origin#"${GOOGLE_APT_URL%/}"}" = "$origin" ]; then
-        log_fail "google-chrome-stable was satisfied from ${origin}, which is not the source this run pinned (${GOOGLE_APT_URL}) — a pre-existing Google apt source verified by another keyring would make the fingerprint pin ornamental" >&2
+        log_fail "google-chrome-stable was satisfied from ${origin}, which is not the source this run pinned (${GOOGLE_APT_URL}) — refusing rather than installing from an unpinned repo" >&2
         return 1
     fi
 }
@@ -1173,18 +1179,19 @@ main() {
 # file lands atomically. `tee` did neither.
 # SEC-BE-005: run `<browser> --version` under the same bound chrome_runnable uses,
 # so a binary that hangs on --version cannot wedge the tail of a provisioning run.
-# Reuses CHROME_PROBE_TIMEOUT (common.sh) rather than introducing a second knob, and
-# degrades to an unbounded call only where neither timeout nor gtimeout exists — the
-# same documented degrade path chrome_runnable takes on stock macOS.
+# SEC-BE-002: reuses common.sh's chrome_probe_budget() for the validated read of
+# CHROME_PROBE_TIMEOUT (this used to read the raw env var straight into timeout(1)'s
+# duration/option position — an unvalidated zero disabled the bound entirely, and a
+# leading-dash value reached timeout's OPTION position) and timeout_cmd() for the
+# timeout/gtimeout selection, rather than each keeping its own copy of either. Degrades
+# to an unbounded call only where neither timeout nor gtimeout exists — the same
+# documented degrade path chrome_runnable takes on stock macOS.
 _bounded_probe() {
-    local bin="$1" t="" budget="${CHROME_PROBE_TIMEOUT:-2}"
-    if command -v timeout >/dev/null 2>&1; then
-        t=timeout
-    elif command -v gtimeout >/dev/null 2>&1; then
-        t=gtimeout
-    fi
+    local bin="$1" t
+    chrome_probe_budget
+    t=$(timeout_cmd)
     if [ -n "$t" ]; then
-        "$t" "$budget" "$bin" --version 2>/dev/null
+        "$t" "$CHROME_PROBE_BUDGET" "$bin" --version 2>/dev/null
     else
         "$bin" --version 2>/dev/null
     fi

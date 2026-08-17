@@ -86,8 +86,22 @@ CHROME_CANDIDATES=(
 # nine times for one misconfiguration.
 _CHROME_BUDGET_WARNED=""
 
-chrome_runnable() {
-    local t="" budget="${CHROME_PROBE_TIMEOUT:-2}" stripped
+# The single validated reader of CHROME_PROBE_TIMEOUT (SEC-BE-002). Two callers
+# today — chrome_runnable below and _bounded_probe in install-chrome.sh, which
+# used to read the raw value straight into timeout(1)'s duration/option
+# position with no validation of its own.
+#
+# Returns via CHROME_PROBE_BUDGET, NOT stdout: `budget=$(chrome_probe_budget)`
+# would run this in a command-substitution SUBSHELL, where the
+# _CHROME_BUDGET_WARNED latch below is a copy that is discarded when the
+# subshell exits — so the warning would print once per candidate probed
+# instead of once per run. MEASURED: a subshell-returning form invoked three
+# times in one shell (as detect_chrome_binary's candidate loop does) printed
+# the warning three times with the latch never taking effect; the global form
+# printed it once, latch=1 — exactly what preflight-selftest.sh case p
+# (warn_count_over_candidates) asserts must hold.
+chrome_probe_budget() {
+    local budget="${CHROME_PROBE_TIMEOUT:-2}" stripped
     # Two rejections, and they are separate questions:
     #   * not a plain decimal  -> timeout(1) would exit 125 without running the
     #     browser, which the caller reads as "not runnable" — the LAB-3893
@@ -120,13 +134,29 @@ chrome_runnable() {
             fi
             ;;
     esac
-    if command -v timeout >/dev/null 2>&1; then
-        t=timeout
-    elif command -v gtimeout >/dev/null 2>&1; then   # macOS + coreutils
-        t=gtimeout
+    CHROME_PROBE_BUDGET=$budget
+}
+
+# Echoes `timeout`, `gtimeout` (macOS + coreutils), or nothing. Three callers:
+# chrome_runnable and _bounded_probe (install-chrome.sh, SEC-BE-002) share the
+# CHROME_PROBE_TIMEOUT-bounded browser probe; wait_for_grpc (setup-live-
+# targets.sh) reuses only this selection, not the budget validation above — its
+# hardcoded 2s bounds a gRPC connect probe, not a browser probe, and must not
+# start reading CHROME_PROBE_TIMEOUT. `t=$(timeout_cmd)` is a safe command
+# substitution here: this function sets no latch/state, unlike
+# chrome_probe_budget above.
+timeout_cmd() {
+    if command -v timeout >/dev/null 2>&1; then printf 'timeout\n'
+    elif command -v gtimeout >/dev/null 2>&1; then printf 'gtimeout\n'
     fi
+}
+
+chrome_runnable() {
+    local t
+    chrome_probe_budget
+    t=$(timeout_cmd)
     if [ -n "$t" ]; then
-        "$t" "$budget" "$1" --version >/dev/null 2>&1
+        "$t" "$CHROME_PROBE_BUDGET" "$1" --version >/dev/null 2>&1
     else
         # No timeout available (e.g. stock macOS): probe directly. A binary that
         # hangs on --version would block here — known limitation, documented in

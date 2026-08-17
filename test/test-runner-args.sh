@@ -1115,11 +1115,22 @@ printf '%s\n' "TARGETS_SETUP=rest-api,soap-service" > "$valid_targets_cfg"
 valid_targets_out=$(
     source "$SCRIPT_DIR/common.sh"
     source <(sed -n '/^load_config()/,/^}/p' "$RUNNER")
+    # N-2: this extraction's two siblings (969-991, 1029-1051) both echo
+    # SENTINEL_LOAD_CONFIG_MISSING out of their subshell and grep for it, so a
+    # broken sed range is caught. This copy had neither, so a broken range
+    # here would leave the accept-direction assertion below reading an empty
+    # result and silently agreeing that nothing was applied.
+    declare -F load_config >/dev/null || echo "SENTINEL_LOAD_CONFIG_MISSING"
     TARGETS_SETUP="__sentinel_targets__"
     CONFIG_FILE="$valid_targets_cfg"
     load_config 2>&1 || true
     echo "RESULT_TARGETS_SETUP=$TARGETS_SETUP"
 ) || true
+if printf '%s\n' "$valid_targets_out" | grep -q "SENTINEL_LOAD_CONFIG_MISSING"; then
+    fail "load_config was not sourced (extraction broken/empty) — the accept-direction assertion below is vacuous"
+else
+    pass "load_config sourced from run-live-tests.sh (accept-direction block)"
+fi
 if printf '%s\n' "$valid_targets_out" | grep -qx "RESULT_TARGETS_SETUP=rest-api,soap-service"; then
     pass "load_config: TARGETS_SETUP=rest-api,soap-service (valid charset) applied"
 else
@@ -1136,6 +1147,65 @@ echo "=== Un-gated CI job wiring (the guards must actually be invoked) ==="
 # coverage silently falls. The job block is extracted by name so an unrelated
 # `test` job invoking the same script cannot satisfy this.
 WORKFLOW="$SCRIPT_DIR/../.github/workflows/live-tests.yml"
+
+# extract_job_block(name) prints the body of a top-level job block — the
+# lines strictly between "  <name>:" and the next top-level job key. Defined
+# once, here, so every job-block extraction in this file (preflight_block,
+# e2e_block, test_block, and the hosting-job loop below) shares one
+# implementation instead of four hand-copied ones (TEST-013).
+#
+# The end-of-block regex adds 0-9 to the character class a narrower copy
+# would use ([a-zA-Z_-]+): that narrower class alone stops mid-name on
+# install-chrome-e2e (the digit in "e2e" breaks the match), which would
+# silently swallow the next job's content whenever the search starts at the
+# job immediately before it (N-3). It also compares $0 to the job line
+# EXACTLY, unlike an unanchored `/^  test:/`-style regex, which would also
+# match a future two-space-indented `  test:` key that is not the job (N-5).
+extract_job_block() {
+    awk -v job_line="  $1:" '
+        $0 == job_line { inblock=1; next }
+        inblock && /^  [A-Za-z0-9_-]+:/ { inblock=0 }
+        inblock { print }
+    ' "$WORKFLOW"
+}
+
+# yq_query "$expr": answers a SEMANTIC question about live-tests.yml with a
+# real YAML parse. A regex over source text cannot: every mutation this
+# closes preserves the text while changing the meaning, or the reverse (a
+# reordered step key, a paths: filter, a needs: on a sibling job).
+#
+# yq, not python3+PyYAML (binding decision D1-REVISED): PyYAML is NOT on the
+# ubuntu-24.04 runner image, whereas yq 4.53.3 is — a single static Go
+# binary, no interpreter or site-packages provenance problem. yq is also
+# YAML 1.2, where `on` is a plain string key; PyYAML is YAML 1.1, where a
+# bare `on:` parses as the BOOLEAN True, a live footgun for the next
+# maintainer.
+#
+# Absence is a FAIL, never a skip (D1): a guard that cannot run is the exact
+# defect this suite exists to catch. The presence check is memoised once,
+# and on absence this prints the sentinel __NO_YQ__ on stdout rather than
+# calling fail() itself: every call site below reads this via command
+# substitution ($(yq_query ...)), which runs in a SUBSHELL — a fail() call
+# from inside it would increment a subshell-local copy of $FAIL, discarded
+# when the subshell exits, silently UNDER-counting the very hard failure D1
+# requires to be counted (the identical trap AD-3 records for
+# chrome_probe_budget in the sibling suite). So each call site's own `case`
+# calls fail_no_yq in the parent shell instead, keeping the counted-outcome
+# total identical whether yq is present or absent.
+_YQ_OK=""   # "" = not probed, 1 = usable, 0 = absent
+yq_query() {
+    if [[ -z "$_YQ_OK" ]]; then
+        if command -v yq >/dev/null 2>&1; then _YQ_OK=1; else _YQ_OK=0; fi
+    fi
+    if [[ "$_YQ_OK" != 1 ]]; then printf '%s\n' '__NO_YQ__'; return 0; fi
+    yq "$1" "$WORKFLOW"
+}
+
+# One wording, one place, so it cannot drift across call sites.
+fail_no_yq() {
+    fail "$1 could not be verified: yq is required to answer this question about live-tests.yml, and a guard that cannot run is the exact defect this suite exists to catch — install it (https://github.com/mikefarah/yq). CI's ubuntu-24.04 runner already ships yq 4.53.3, so this cannot fail in CI."
+}
+
 if [[ ! -f "$WORKFLOW" ]]; then
     fail "live-tests.yml not found at $WORKFLOW"
 else
@@ -1184,107 +1254,135 @@ else
     # PR while every check below stays green, since the job itself, and every
     # step inside it, is untouched. Verified by mutation: removing the
     # `pull_request:` trigger left this suite at 117/0, exit 0.
-    on_block=$(awk '
-        /^on:/ { inblock=1; next }
-        inblock && /^[A-Za-z]/ { inblock=0 }
-        inblock { print }
-    ' "$WORKFLOW")
-    if [[ -z "$on_block" ]]; then
-        fail "could not extract the on: trigger block from live-tests.yml (extraction broken — assertion below is vacuous)"
-    elif printf '%s\n' "$on_block" | grep -qE '^  pull_request:'; then
-        pass "live-tests.yml still triggers on pull_request (the un-gated guard suites only run on PRs because of this)"
-    else
-        fail "live-tests.yml no longer triggers on pull_request — the un-gated guard suites (preflight-selftest, validator-regression) would never run on a PR"
-    fi
+    case "$(yq_query '.on | has("pull_request")')" in
+        __NO_YQ__) fail_no_yq "live-tests.yml's pull_request trigger" ;;
+        true)      pass "live-tests.yml still triggers on pull_request (the un-gated guard suites only run on PRs because of this)" ;;
+        *)         fail "live-tests.yml no longer triggers on pull_request — the un-gated guard suites (preflight-selftest, validator-regression) would never run on a PR" ;;
+    esac
+    # TEST-011: the vacuity check above only proves pull_request: exists — not
+    # that it still fires on every PR. A paths/paths-ignore filter under it
+    # silently switches every un-gated guard suite off for a PR that touches
+    # only test/*.sh or the workflow itself, which is every PR they exist to
+    # police (ci.yml already carries exactly such a filter, so this is not
+    # hypothetical). Two properties with different remedies get two messages.
+    case "$(yq_query '(.on.pull_request // {}) | has("paths") or has("paths-ignore")')" in
+        __NO_YQ__) fail_no_yq "live-tests.yml's pull_request path filter" ;;
+        false)     pass "live-tests.yml's pull_request trigger carries no paths/paths-ignore filter (a shell-only PR still runs the guard suites)" ;;
+        *)         fail "live-tests.yml's pull_request trigger now carries a paths/paths-ignore filter — a PR touching only test/*.sh or the workflow itself would run none of the four guard suites, which is every PR they exist to police" ;;
+    esac
 
-    preflight_block=$(awk '
-        /^  preflight-selftest:/ { inblock=1; next }
-        inblock && /^  [a-zA-Z_-]+:/ { inblock=0 }
-        inblock { print }
-    ' "$WORKFLOW")
-    if [[ -z "$preflight_block" ]]; then
-        fail "could not extract the preflight-selftest job block (extraction broken — assertions below are vacuous)"
-    else
-        pass "preflight-selftest job block extracted from live-tests.yml"
-        # Comments are stripped and the match is anchored on the `run:` line.
-        # Matching the bare filename anywhere in the block was a FALSE NEGATIVE:
-        # the surrounding comments name every suite, so deleting a step left the
-        # guard green. Verified by mutation — with the plain -qF match, removing
-        # the install-chrome self-test step still passed.
-        runlines=$(printf '%s\n' "$preflight_block" | grep -vE '^[[:space:]]*#')
-        for suite in preflight-selftest.sh install-chrome-selftest.sh setup-live-targets_test.sh test-runner-args.sh; do
-            # Dots are escaped: unescaped, `.` matches any character, so the
-            # pattern for install-chrome-selftest.sh would also accept
-            # `install-chrome-selftestXsh`. Harmless today, but this guard exists
-            # precisely to notice small edits nobody meant to make.
-            suite_re=${suite//./\\.}
-            # TEST-017: anchored strictly to end-of-line (only trailing
-            # whitespace allowed after the script name) — previously the
-            # `([[:space:]]|$)` alternation matched the space before a
-            # trailing '|| true' too, so appending that to a run line still
-            # satisfied "invokes $suite" even though the failure it produces
-            # would be swallowed.
-            if printf '%s\n' "$runlines" | grep -qE "run:[[:space:]]*(\./|bash )?test/${suite_re}[[:space:]]*\$"; then
-                pass "un-gated job invokes $suite"
+    # TEST-014: the checks in the loop below apply to preflight-selftest AND
+    # validator-regression — live-tests.yml's SECOND un-gated guard job (its
+    # own header comment says "Deliberately outside the check-label gate —
+    # same rationale as preflight-selftest above"), which this suite's own
+    # failure messages already name. Applying the neutering checks to only
+    # the first of the two left validator-regression's continue-on-error,
+    # if:, and needs: unguarded — verified by mutation: `needs: check-label`
+    # and `needs: test` on validator-regression both left this suite at
+    # 122/0, exit 0 (the latter is the worse case: `test` carries
+    # `if: needs.check-label.outputs.should-run == 'true'`, so that needs:
+    # would genuinely skip validator-regression whenever skip-live-tests is
+    # applied — exactly the outcome being un-gated is supposed to prevent).
+    #
+    # Both jobs are deliberately outside the check-label gate (see each job's
+    # header comment in live-tests.yml).
+    UNGATED_GUARD_JOBS=(preflight-selftest validator-regression)
+    for job in "${UNGATED_GUARD_JOBS[@]}"; do
+        job_block=$(extract_job_block "$job")
+        if [[ -z "$job_block" ]]; then
+            fail "could not extract the ${job} job block (extraction broken — assertions below are vacuous)"
+        else
+            pass "${job} job block extracted from live-tests.yml"
+            ungated_runlines=$(printf '%s\n' "$job_block" | grep -vE '^[[:space:]]*#')
+
+            # A step that is PRESENT but neutered is the same coverage loss as a
+            # deleted one, and it is harder to spot in review: `continue-on-error`
+            # turns a red suite green, and a step-level `if:` can switch it off for
+            # exactly the events that matter. Checking only that the invocation
+            # exists would call both of those wired.
+            if printf '%s\n' "$ungated_runlines" | grep -qE '^[[:space:]]*continue-on-error:[[:space:]]*true'; then
+                fail "${job} sets continue-on-error: true — a failing guard would not fail CI"
             else
-                fail "un-gated preflight-selftest job no longer invokes $suite — coverage dropped silently"
+                pass "${job} has no continue-on-error: true"
             fi
-        done
+            # TEST-017: the cheapest neutering shape of all — a trailing
+            # '|| true' / '|| exit 0' / '|| :' on a run line — trips neither the
+            # continue-on-error check above nor the per-suite invocation regexes,
+            # which only assert the invocation is PRESENT, not un-neutered.
+            if printf '%s\n' "$ungated_runlines" | grep -qE '\|\|[[:space:]]*(true|exit 0|:)([[:space:]]|$)'; then
+                fail "${job} neuters a step with a trailing '|| true'/'|| exit 0'/'|| :' — a failing guard would not fail CI"
+            else
+                pass "${job} has no trailing '|| true'/'|| exit 0'/'|| :' step neutering"
+            fi
+            # ANY `if:` inside this job block is a finding, at any indentation.
+            #
+            # The first version anchored on `^[[:space:]]{8,}if:` to distinguish a
+            # step-level `if:` from a job-level one. That encoded the file's CURRENT
+            # indentation (steps items at 6, keys at 8) into a security guard, and
+            # YAML permits the sequence at the parent key's indent instead (items at
+            # 4, keys at 6) — a reformat nobody would think twice about silently
+            # disarmed it. Mutation-proven.
+            #
+            # Dropping the depth distinction is safe BECAUSE of what this block is:
+            # extraction starts after the job's own name line, so the job's own
+            # key/value lines are inside it, and this job is deliberately un-gated.
+            # It has no `if:` of any kind today, and if someone adds one — at
+            # either level — that is exactly the change this guard should refuse
+            # to let through unnoticed.
+            if printf '%s\n' "$ungated_runlines" | grep -qE '^[[:space:]]*if:'; then
+                fail "${job} contains an if: condition — a guard can be silently skipped"
+            else
+                pass "${job} has no if: conditions at any level"
+            fi
 
-        # A step that is PRESENT but neutered is the same coverage loss as a
-        # deleted one, and it is harder to spot in review: `continue-on-error`
-        # turns a red suite green, and a step-level `if:` can switch it off for
-        # exactly the events that matter. Checking only that the invocation
-        # exists would call both of those wired.
-        if printf '%s\n' "$runlines" | grep -qE '^[[:space:]]*continue-on-error:[[:space:]]*true'; then
-            fail "un-gated job sets continue-on-error: true — a failing guard would not fail CI"
-        else
-            pass "un-gated job has no continue-on-error: true"
+            # TEST-018: an `if:` isn't the only way to gate this job — a `needs:`
+            # on a job the check-label gate blocks (or that never runs on a plain
+            # PR push) has the same effect, and this job's own header comment says
+            # it is deliberately un-gated so that 'skip-live-tests' cannot switch
+            # off the regression net. A `needs:` value may be a string or a list,
+            # which a text grep over the extracted block cannot see reliably —
+            # ask the parser instead (D1's second bound assertion).
+            case "$(yq_query ".jobs[\"${job}\"] | has(\"needs\")")" in
+                __NO_YQ__) fail_no_yq "${job}'s needs: dependencies" ;;
+                false)     pass "${job} has no needs: dependency (stays un-gated)" ;;
+                *)         fail "${job} now has a needs: dependency — this job is deliberately un-gated (see its header comment); a needs: on check-label, or on anything check-label gates, would put every un-gated guard suite behind the skip-live-tests label" ;;
+            esac
         fi
-        # TEST-017: the cheapest neutering shape of all — a trailing
-        # '|| true' / '|| exit 0' / '|| :' on a run line — trips neither the
-        # continue-on-error check above nor the per-suite invocation regexes,
-        # which only assert the invocation is PRESENT, not un-neutered.
-        if printf '%s\n' "$runlines" | grep -qE '\|\|[[:space:]]*(true|exit 0|:)([[:space:]]|$)'; then
-            fail "un-gated job neuters a step with a trailing '|| true'/'|| exit 0'/'|| :' — a failing guard would not fail CI"
-        else
-            pass "un-gated job has no trailing '|| true'/'|| exit 0'/'|| :' step neutering"
-        fi
-        # ANY `if:` inside this job block is a finding, at any indentation.
-        #
-        # The first version anchored on `^[[:space:]]{8,}if:` to distinguish a
-        # step-level `if:` from a job-level one. That encoded the file's CURRENT
-        # indentation (steps items at 6, keys at 8) into a security guard, and
-        # YAML permits the sequence at the parent key's indent instead (items at
-        # 4, keys at 6) — a reformat nobody would think twice about silently
-        # disarmed it. Mutation-proven.
-        #
-        # Dropping the depth distinction is safe BECAUSE of what this block is:
-        # extraction starts after the `preflight-selftest:` line, so the job's
-        # own key/value lines are inside it, and this job is deliberately
-        # un-gated. It has no `if:` of any kind today, and if someone adds one —
-        # at either level — that is exactly the change this guard should refuse
-        # to let through unnoticed.
-        if printf '%s\n' "$runlines" | grep -qE '^[[:space:]]*if:'; then
-            fail "un-gated job contains an if: condition — a guard can be silently skipped"
-        else
-            pass "un-gated job has no if: conditions at any level"
-        fi
+    done
 
-        # TEST-018: an `if:` isn't the only way to gate this job — a `needs:`
-        # on a job the check-label gate blocks (or that never runs on a plain
-        # PR push) has the same effect, and this job's own header comment says
-        # it is deliberately un-gated so that 'skip-live-tests' cannot switch
-        # off the regression net. None of the checks above would notice
-        # `needs:` being added: they only look at run lines and continue-on-
-        # error/if:. Verified by mutation: adding `needs: check-label` here
-        # left this suite at 117/0, exit 0.
-        if printf '%s\n' "$runlines" | grep -qE '^[[:space:]]*needs:'; then
-            fail "un-gated job now has a needs: dependency — this job is deliberately un-gated (see its header comment); a needs: on check-label (or anything check-label gates) would put every un-gated guard suite behind the skip-live-tests label"
+    # Which suites does preflight-selftest actually invoke. Scoped to
+    # preflight-selftest only: validator-regression hosts validate_test.sh,
+    # which is already covered by the generic suite-coverage loop below.
+    # Driven by a fresh extraction (not the loop's job_block above) — the
+    # loop already asserts preflight-selftest's block extracted successfully,
+    # so re-asserting it here would double-count; if extraction were ever
+    # broken, every check below would legitimately FAIL (an empty $runlines
+    # matches no run: line), not pass vacuously.
+    preflight_block=$(extract_job_block preflight-selftest)
+    # Comments are stripped and the match is anchored on the `run:` line.
+    # Matching the bare filename anywhere in the block was a FALSE NEGATIVE:
+    # the surrounding comments name every suite, so deleting a step left the
+    # guard green. Verified by mutation — with the plain -qF match, removing
+    # the install-chrome self-test step still passed.
+    runlines=$(printf '%s\n' "$preflight_block" | grep -vE '^[[:space:]]*#')
+    for suite in preflight-selftest.sh install-chrome-selftest.sh setup-live-targets_test.sh test-runner-args.sh; do
+        # Dots are escaped: unescaped, `.` matches any character, so the
+        # pattern for install-chrome-selftest.sh would also accept
+        # `install-chrome-selftestXsh`. Harmless today, but this guard exists
+        # precisely to notice small edits nobody meant to make.
+        suite_re=${suite//./\\.}
+        # TEST-017: anchored strictly to end-of-line (only trailing
+        # whitespace allowed after the script name) — previously the
+        # `([[:space:]]|$)` alternation matched the space before a
+        # trailing '|| true' too, so appending that to a run line still
+        # satisfied "invokes $suite" even though the failure it produces
+        # would be swallowed.
+        if printf '%s\n' "$runlines" | grep -qE "run:[[:space:]]*(\./|bash )?test/${suite_re}[[:space:]]*\$"; then
+            pass "un-gated job invokes $suite"
         else
-            pass "un-gated job has no needs: dependency (stays un-gated)"
+            fail "un-gated preflight-selftest job no longer invokes $suite — coverage dropped silently"
         fi
-    fi
+    done
 fi
 
 echo ""
@@ -1328,21 +1426,9 @@ if [[ -f "$WORKFLOW" ]]; then
     # line. Resolve which job actually HOSTS the match, the same way
     # preflight_block/e2e_block/test_block above pin a single named job, but
     # parameterized: the hosting job for a given suite isn't known ahead of
-    # time, so the extraction idiom is wrapped in a function and driven by the
-    # job-name list derived from the workflow itself.
-    #
-    # extract_job_block's end-of-block regex adds 0-9 to the character class
-    # the sibling blocks above use ([a-zA-Z_-]+): that class alone stops
-    # mid-name on install-chrome-e2e (the digit in "e2e" breaks the match),
-    # which would silently swallow the next job's content whenever the search
-    # starts at the job immediately before it.
-    extract_job_block() {
-        awk -v job_line="  $1:" '
-            $0 == job_line { inblock=1; next }
-            inblock && /^  [A-Za-z0-9_-]+:/ { inblock=0 }
-            inblock { print }
-        ' "$WORKFLOW"
-    }
+    # time, so the extraction idiom (extract_job_block, defined once above
+    # near WORKFLOW=) is driven by the job-name list derived from the
+    # workflow itself.
 
     mapfile -t all_job_names < <(
         awk '
@@ -1452,11 +1538,14 @@ fi
 if [[ -f "$WORKFLOW" ]]; then
     if grep -qE '^  install-chrome-e2e:' "$WORKFLOW"; then
         pass "install-chrome-e2e job still defined (privileged-path coverage present)"
-        e2e_block=$(awk '
-            /^  install-chrome-e2e:/ { inblock=1; next }
-            inblock && /^  [a-zA-Z_-]+:/ { inblock=0 }
-            inblock { print }
-        ' "$WORKFLOW")
+        e2e_block=$(extract_job_block install-chrome-e2e)
+        # N-1: e2e_block's two siblings (preflight_block, test_block) each
+        # guard their extraction with a fidelity sentinel; this one had
+        # neither, so every assertion below would pass vacuously if the
+        # extraction ever returned empty — the same shape as TEST-016.
+        if [[ -z "$e2e_block" ]]; then
+        fail "could not extract the install-chrome-e2e job block (extraction broken — the assertions below would be vacuous)"
+        else
         if printf '%s\n' "$e2e_block" | grep -qE 'run:[[:space:]]*(\./|bash )?test/install-chrome\.sh'; then
             pass "install-chrome-e2e still invokes test/install-chrome.sh end-to-end"
         else
@@ -1638,6 +1727,7 @@ if [[ -f "$WORKFLOW" ]]; then
                 fail "workflow phone-home path list has drifted from install-chrome.sh: $(diff <(printf '%s\n' "$install_chrome_paths") <(printf '%s\n' "$workflow_phone_home_paths") | tr '\n' ' ')"
             fi
         fi
+        fi
     else
         fail "install-chrome-e2e job is gone — the installer's privileged path has no coverage at all"
     fi
@@ -1650,11 +1740,7 @@ echo "=== test job wiring (TEST-003) ==="
 # other check in the repo still green. The `test` job — where the entire
 # offline/live suite actually executes — had no equivalent.
 if [[ -f "$WORKFLOW" ]]; then
-    test_block=$(awk '
-        /^  test:/ { inblock=1; next }
-        inblock && /^  [a-zA-Z_-]+:/ { inblock=0 }
-        inblock { print }
-    ' "$WORKFLOW")
+    test_block=$(extract_job_block test)
     if [[ -z "$test_block" ]]; then
         fail "could not extract the test job block (extraction broken — assertions below are vacuous)"
     else
@@ -1735,15 +1821,24 @@ if [[ -f "$WORKFLOW" ]]; then
         # matters instead: the two steps that RUN the suites are unconditional.
         # An `if: false` (or any condition) on either is the neutering this
         # catches, and it is invisible to the three checks above.
-        for step in 'Run offline tests' 'Run live tests'; do
-            step_if=$(printf '%s\n' "$test_runlines" \
-                | sed -n "/- name: ${step}\$/,/- name: /p" \
-                | grep -cE '^[[:space:]]*if:' || true)
-            if [[ "$step_if" -eq 0 ]]; then
-                pass "test job's '${step}' step is unconditional (no if:)"
-            else
-                fail "test job's '${step}' step carries an if: — the suite can be silently skipped while CI stays green"
-            fi
+        #
+        # TEST-016: locate each step by the invocation it CONTAINS, not by its
+        # human-readable name. A name-anchored sed range fails OPEN: reorder the
+        # step's keys so `if:` leads the mapping (YAML mappings are unordered,
+        # so this is valid) and the `- name: ...` line loses its `- ` prefix —
+        # the anchor never matches, sed emits nothing, and the guard reports
+        # "unconditional" for a step that is disabled. A rename reaches the same
+        # place permanently. Asking the parser for the step whose `run:` contains
+        # the invocation makes both mutations impossible at once, and a
+        # not-found result is a distinct FAIL value rather than a silent pass —
+        # the missing fidelity sentinel becomes free.
+        for group in offline live; do
+            case "$(yq_query "[.jobs.test.steps[] | select((.run // \"\") | test(\"--group ${group}\")) | has(\"if\")] | .[0]")" in
+                __NO_YQ__)      fail_no_yq "the test job's '--group ${group}' step gate" ;;
+                false)          pass "test job's '--group ${group}' step is unconditional (no if:, at any key position)" ;;
+                null)           fail "no step in the test job runs 'run-live-tests.sh --group ${group}' — the ${group} suite is not executed at all, or the step was renamed/restructured out of range" ;;
+                *)              fail "test job's '--group ${group}' step carries an if: — the suite can be silently skipped while CI stays green" ;;
+            esac
         done
     fi
 else
@@ -1815,7 +1910,31 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # live-tests.yml direct-execs is committed 100755 — the gap that let
 # install-chrome-selftest.sh run as 100644 and kill CI with exit 126 for three
 # review rounds without any assertion noticing.
-EXPECTED_ASSERTIONS=122
+#
+# Round-15 review: 122 -> 129. MEASURED by running the suite, not derived — the
+# per-task deltas in the round-15 plan were written without shell access and are
+# explicitly untrusted. Breakdown of the +7:
+#   +1  on: trigger vacuity guard (pull_request must EXIST before asking whether
+#       it is filtered, so a `false` from the filter query can never be vacuous)
+#   +1  on:/pull_request must carry no paths:/paths-ignore: filter — the old
+#       check asserted the trigger EXISTED, which a paths: filter satisfies
+#       while switching every guard suite off for shell-only PRs
+#   +3  the un-gated job checks (continue-on-error / trailing || true / needs:)
+#       now iterate BOTH un-gated guard jobs instead of preflight-selftest
+#       alone; validator-regression was unprotected, and `needs: test` on it
+#       genuinely skips it whenever skip-live-tests is applied
+#   +1  fidelity sentinel for e2e_block, whose five consumers could all pass
+#       vacuously on an empty extraction (its two sibling blocks already had one)
+#   +1  third load_config extraction's SENTINEL_LOAD_CONFIG_MISSING guard, which
+#       its two siblings already carried
+# Net zero, so not in the +7: routing the three inline awk job-block extractors
+# through the existing extract_job_block helper (their terminator class
+# [a-zA-Z_-]+ could not stop at a digit-bearing job name such as
+# install-chrome-e2e), locating the two suite-running steps by what they RUN
+# rather than by their name, widening the exec-bit derivation, matching suites
+# by repo-relative path, and collapsing the double-fail at the browser-target
+# classification arm to one counted outcome.
+EXPECTED_ASSERTIONS=129
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."

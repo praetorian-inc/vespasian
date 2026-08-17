@@ -67,7 +67,21 @@ export CHROME_PROBE_TIMEOUT=2
 # across degraded hosts and a deleted case still fails the suite. The trust anchor's
 # own skip is additionally a hard failure via trust_anchor_skips, independently of
 # this pin.
-EXPECTED_ASSERTIONS=234
+#
+# Round-15 review: 234 -> 238. MEASURED by running the suite, not derived — the
+# per-task deltas in that round's plan were written without shell access and were
+# explicitly flagged untrusted. The +4:
+#   +1  case f's curl-pin count now matches EVERY syntactic form of curl in
+#       install_pinned_key (assignment-form `k=$(curl …)` and `$SUDO curl`, not
+#       just a line-leading `curl`), and its fidelity sentinel was widened in the
+#       same edit — the sentinel reuses the count's own regex, so widening one
+#       without the other would have left it silently not covering
+#   +1  case f5b's apt-get count now scans the WHOLE script rather than main()'s
+#       body, closing the bare-`apt-get` and helper-nested evasions
+#   +2  case bp3, pinning that the consolidated chrome_probe_budget still
+#       validates the budget for _bounded_probe as chrome_runnable does
+# See the credit register above for the matching skip_credit accounting.
+EXPECTED_ASSERTIONS=238
 
 pass_count=0
 fail_count=0
@@ -98,10 +112,42 @@ SUITE_COMPLETED=0
 # anything skips. Every skip trigger in this file is ambient (a git checkout, the
 # key fixture, gpg, running as root), so the old `skip_count -eq 0` guard meant
 # the pin stopped being checked precisely on the hosts most likely to differ from
-# the author's, silently. Credits were MEASURED, not estimated: each skip arm was
-# forced on a fully-equipped host and the assertion delta read off. a2=1, j/j2=14,
-# l=3, v=12, y=3; 192 on a full run. Cross-checked: an empty key fixture forces
-# a2+j/j2+v+y and yields 162 passed, and 162+1+14+12+3 = 192.
+# the author's, silently.
+#
+# CREDIT REGISTER — round-15 review, TEST-002. The previous version of this note
+# had drifted into being wrong in three ways at once, which is the defect that
+# review round recorded: it listed five credits totalling 33 when seven call
+# sites declared 35; it omitted case bp entirely (bp landed in d38a81b, the same
+# commit that moved the pin to 234, while this note was last touched in eee71b1);
+# and it cited "192 on a full run" against a pin that was by then 234. A stale
+# provenance record is worse than none — it reads as evidence.
+#
+# The register is now derived from the call sites themselves, so it can be
+# checked against the source rather than believed:
+#
+#   line 235   a2    = 1    not inside a git work tree
+#   line 1198  j/j2  = 14   key fixture missing or empty
+#   line 1200  j/j2  = 14   gpg absent  (mutually exclusive with the above,
+#                                        so j/j2 contributes 14, never 28)
+#   line 1276  l     = 3    running as root
+#   line 2458  v     = 12   needs the same key fixture / gpg as j/j2
+#   line 2981  y     = 3    needs the same key fixture / gpg as j/j2
+#   line 3057  bp    = 4    no timeout/gtimeout on PATH
+#
+# Maximum skip_credit on a maximally-degraded host: 1+14+3+12+3+4 = 37.
+# EXPECTED_ASSERTIONS below is 238, MEASURED on a fully-equipped host in this
+# round (pass+fail+skip_credit with every arm live).
+#
+# PROVENANCE, stated precisely rather than blanket-claimed as "MEASURED":
+#   * a2, j/j2, l, v, y are INHERITED from the round-8 measurement and were not
+#     re-forced this round. They are unchanged since, and the arithmetic above
+#     reconciles with the declared values at each call site.
+#   * bp = 4 is NEW this round: it was 2 (covering case bp2's two assertions) and
+#     case bp3 added two more when the probe budget was consolidated into
+#     common.sh's chrome_probe_budget. It has NOT been forced on a
+#     timeout-less host.
+# When you next touch a skip arm, force it and read the delta rather than
+# extending this list by inference — that inference is exactly what decayed here.
 skip() {
     local credit=${2:-0}
     echo "SKIP: $1"
@@ -400,8 +446,17 @@ key_fn_body_f=$(fn_code install_pinned_key)
 # a retry with different options) would have been accepted silently. Only one curl
 # exists today, so nothing was mis-certified; this closes the semantics rather than
 # a present-day hole. Counted rather than any-matched so the two numbers must agree.
-f_curl_lines=$(printf '%s\n' "${key_fn_body_f}" | grep -cE '^[[:space:]]*(if ! )?curl ' || true)
-f_curl_pinned=$(printf '%s\n' "${key_fn_body_f}" | grep -E '^[[:space:]]*(if ! )?curl ' \
+#
+# TEST-003: `curl` is matched as a command word ANYWHERE on the line, not only as
+# the line's first word — the previous regex left an assignment-form fetch
+# (`key_alt=$(curl ...)`) uncounted, so a second, unpinned fetch added that way
+# left both the count and the pinned-count at 1 and this assertion still printed
+# "all 1 curl fetch(es) ... pinned". One shared variable feeds the count, the
+# pinned-count, AND the fidelity sentinel below, so widening the match can never
+# leave the sentinel behind pattern-coupled to the old, narrower regex.
+curl_word_re='(^|[[:space:]]|\$\(|\(|\||&&|;)curl[[:space:]]'
+f_curl_lines=$(printf '%s\n' "${key_fn_body_f}" | grep -cE "$curl_word_re" || true)
+f_curl_pinned=$(printf '%s\n' "${key_fn_body_f}" | grep -E "$curl_word_re" \
     | grep -cF -- "--proto '=https' --proto-redir '=https'" || true)
 if [ "${f_curl_lines}" -ge 1 ] && [ "${f_curl_lines}" -eq "${f_curl_pinned}" ]; then
     echo "PASS: case f: all ${f_curl_lines} curl fetch(es) in install_pinned_key pin --proto/--proto-redir to https (downgrade redirects refused)"
@@ -410,13 +465,17 @@ else
     echo "FAIL: case f: ${f_curl_pinned} of ${f_curl_lines} curl fetch(es) in install_pinned_key pin --proto/--proto-redir to https — an unpinned fetch accepts a downgrade redirect"
     fail_count=$((fail_count + 1))
 fi
+# Residual, stated honestly rather than implied fixed: a fetch smuggled into a
+# helper install_pinned_key() CALLS (rather than performed inline) is still
+# invisible here — fn_code is strictly single-function and non-recursive, and
+# no extractor in this repo follows transitive callees.
 
 # Fidelity sentinel for the scoping above: if install_pinned_key() is renamed or
 # the fetch stops being a `curl` line, the awk/grep pair silently matches nothing
 # and the assertion fails for the wrong reason. Pin that the extraction actually
 # found the fetch, so a structural drift is reported as drift rather than as a
 # missing flag.
-if printf '%s' "${key_fn_body_f}" | grep -qE '^[[:space:]]*(if ! )?curl '; then
+if printf '%s' "${key_fn_body_f}" | grep -qE "$curl_word_re"; then
     echo "PASS: case f: the scoped extraction still finds the key-fetch curl in install_pinned_key()"
     pass_count=$((pass_count + 1))
 else
@@ -447,43 +506,62 @@ else
     fail_count=$((fail_count + 1))
 fi
 
-# f5b (TEST-002): the three checks above are EXISTENCE-based -- they prove the
-# two apt-get calls that exist today are bounded, but say nothing about a
-# THIRD, unbounded one added alongside them. MUTATION-PROVEN: adding a third
-# `$SUDO apt-get install -y --no-install-recommends some-extra-package` inside
-# main() left this suite at 214 passed / 0 failed, exit 0 while f5 kept printing
-# "both apt-get calls are bounded" — true of the two calls it already knew
-# about, silent on the one it didn't. Counted the same way case f's curl-fetch
-# check above counts curl lines against pinned-curl lines, so any THIRD (or
-# further) apt-get call has to carry the bound too, not just the first two.
+# f5b (TEST-002 / TEST-004): the three checks above are EXISTENCE-based -- they
+# prove the two apt-get calls that exist today are bounded, but say nothing
+# about a THIRD, unbounded one added alongside them. MUTATION-PROVEN: adding a
+# third `$SUDO apt-get install -y --no-install-recommends some-extra-package`
+# inside main() left this suite at 214 passed / 0 failed, exit 0 while f5 kept
+# printing "both apt-get calls are bounded" — true of the two calls it already
+# knew about, silent on the one it didn't. Counted the same way case f's
+# curl-fetch check above counts curl lines against pinned-curl lines, so any
+# THIRD (or further) apt-get call has to carry the bound too, not just the
+# first two.
+#
+# TEST-004: scanned over the WHOLE SCRIPT, not fn_code main. Two further
+# mutations were verified to defeat a main()-scoped version while the suite
+# stayed green: a bare `apt-get install ...` with no `$SUDO` inside main()
+# (on the root path $SUDO expands to empty, so it is behaviourally identical
+# to the caught form at run time), and a `$SUDO apt-get install ...` as the
+# first line of a helper main() calls (suppress_permanent_repo). fn_code is
+# strictly single-function and non-recursive, and no extractor in this repo
+# follows transitive callees, so this could not be fixed by improving the
+# scoped extraction. Comments are stripped exactly as fn_code does (a comment
+# satisfies a grep, which is what this suite exists to avoid), and `$SUDO` is
+# de-anchored -- but `apt-get` must still be in COMMAND position: a free `.*`
+# before it would also match require_tools()'s help string above ("Install
+# them first: apt-get install -y ...") and turn this red on correct code.
 #
 # Line continuations are joined first: apt-get install's DPkg::Lock::Timeout
 # bound sits on the CONTINUATION line, not the invocation line, so each call
 # has to become exactly one logical line before it can be counted.
-main_body_f5_joined=$(printf '%s\n' "${main_body_f5}" | awk '{ if (sub(/\\$/, "")) { printf "%s ", $0; next } else { print } }')
-f5_aptget_lines=$(printf '%s\n' "${main_body_f5_joined}" \
-    | grep -cE '^[[:space:]]*(if ! )?\$SUDO .*apt-get (update|install) ' || true)
-f5_aptget_bounded=$(printf '%s\n' "${main_body_f5_joined}" \
-    | grep -E '^[[:space:]]*(if ! )?\$SUDO .*apt-get (update|install) ' \
+script_body_f5_joined=$(grep -vE '^[[:space:]]*#' "${INSTALL_SCRIPT}" \
+    | awk '{ if (sub(/\\$/, "")) { printf "%s ", $0; next } else { print } }')
+aptget_call_re='^[[:space:]]*(if ! )?(\$SUDO[[:space:]]+)?(timeout[[:space:]][^"]*)?apt-get[[:space:]]+(update|install)[[:space:]]'
+f5_aptget_lines=$(printf '%s\n' "${script_body_f5_joined}" \
+    | grep -cE "$aptget_call_re" || true)
+f5_aptget_bounded=$(printf '%s\n' "${script_body_f5_joined}" \
+    | grep -E "$aptget_call_re" \
     | grep -F -- 'timeout -k' \
     | grep -cF -- 'DPkg::Lock::Timeout=120' || true)
 if [ "${f5_aptget_lines}" -ge 2 ] && [ "${f5_aptget_lines}" -eq "${f5_aptget_bounded}" ]; then
-    echo "PASS: case f: all ${f5_aptget_lines} apt-get call(s) in main() carry the DPkg::Lock::Timeout=120 bound (no unbounded call slipped in alongside the two known ones)"
+    echo "PASS: case f: all ${f5_aptget_lines} apt-get call(s) in the script carry the DPkg::Lock::Timeout=120 bound (no unbounded call slipped in alongside the two known ones, whether inside main() or a helper it calls)"
     pass_count=$((pass_count + 1))
 else
-    echo "FAIL: case f: only ${f5_aptget_bounded} of ${f5_aptget_lines} apt-get call(s) in main() carry the DPkg::Lock::Timeout=120 bound — an unbounded apt-get call is reachable"
+    echo "FAIL: case f: only ${f5_aptget_bounded} of ${f5_aptget_lines} apt-get call(s) in the script carry the DPkg::Lock::Timeout=120 bound — an unbounded apt-get call is reachable"
     fail_count=$((fail_count + 1))
 fi
+# Residual, stated honestly: a call smuggled through `eval` or `bash -c` is
+# still not counted by a source-text scan.
 
 # Fidelity sentinel for the join+count above, the same idea as case f's curl
-# extraction sentinel: if main()'s apt-get calls are ever restructured (renamed,
-# no longer $SUDO-timeout-prefixed) the extraction would silently match nothing
-# and the count-match check above would pass vacuously at 0-of-0.
+# extraction sentinel: if the script's apt-get calls are ever restructured
+# (renamed, no longer $SUDO-timeout-prefixed) the extraction would silently
+# match nothing and the count-match check above would pass vacuously at 0-of-0.
 if [ "${f5_aptget_lines}" -ge 1 ]; then
-    echo "PASS: case f: the apt-get call extraction still finds at least one call in main()"
+    echo "PASS: case f: the apt-get call extraction still finds at least one call in the script"
     pass_count=$((pass_count + 1))
 else
-    echo "FAIL: case f: main() no longer contains a \$SUDO timeout ... apt-get call — the bound-count check above is now vacuous, fix the extraction rather than deleting it"
+    echo "FAIL: case f: the script no longer contains a \$SUDO timeout ... apt-get call — the bound-count check above is now vacuous, fix the extraction rather than deleting it"
     fail_count=$((fail_count + 1))
 fi
 
@@ -2426,6 +2504,40 @@ else
     skip "case v: main-install-path in_container() gating (needs the same key fixture/gpg as j/j2)" 12
 fi
 
+# ── Case v4: record_chrome_version's write-failure arm is non-fatal, not
+# silent (TEST-005) ──────────────────────────────────────────────────────────
+# record_chrome_version has two branches: the staged-write chain succeeds and
+# it logs "Recorded build in ...", or any step fails and it logs "Could not
+# write the version record to ..." and returns success anyway (deliberately
+# non-fatal -- the browser install already succeeded, and the record is an
+# audit convenience, not a correctness requirement). Only the success arm was
+# exercised anywhere (case v above, via the full install path); `grep -rn
+# 'Could not write the version record' test/` returns only install-chrome.sh
+# itself. Replacing the else body with `exit 1`, or with a silent `:`, left
+# all four suites green — and each changes real behaviour.
+#
+# rc alone is explicitly insufficient — install-chrome-selftest.sh's own case q
+# region records that being mutation-defeated once, because a later gate
+# produced the same rc — so both the rc AND the arm's distinctive message are
+# asserted. SCRATCH_DIR="" breaks the first `&&` clause at
+# install-chrome.sh:1199 (the same lever already used for cleanup_all's
+# failure arms above), with SUDO="" so nothing privileged is attempted.
+res_v4=$(
+    (
+        # shellcheck source=install-chrome.sh
+        source "${INSTALL_SCRIPT}"
+        SUDO=""
+        SCRATCH_DIR=""
+        set +e
+        out=$(record_chrome_version "999.0.0.0" 2>&1)
+        printf '%s\n%s\n' "$?" "${out}"
+    )
+)
+assert_eq "case v4: record_chrome_version's write-failure arm still returns 0 (the documented non-fatal contract)" \
+    "0" "$(echo "${res_v4}" | sed -n '1p')"
+assert_contains "case v4: record_chrome_version's write-failure arm logs that it could not write the record" \
+    "Could not write the version record" "${res_v4}"
+
 # ── Case v3: main()'s AC4 and origin-recheck call sites, by POSITION ────────
 #
 # TEST-005 / TEST-007. Case v above drives the real install path, but its only
@@ -2667,11 +2779,12 @@ assert_eq "case w: the right host over http:// is refused (rc 1)" \
 assert_contains "case w: the http refusal names the transport, not just the host" \
     "non-https transport" "${res_w6}"
 
-# w7 (SEC-BE-002): the right host AND https, but a DIFFERENT Google apt source than
-# the one this run pinned. A pre-existing `google-chrome.sources` verified by another
-# keyring satisfies both the host and the scheme, which made the fingerprint pin this
-# script establishes ornamental on that path. Tying the origin to GOOGLE_APT_URL is
-# what connects the two.
+# w7 (SEC-BE-002): the right host AND https, but a DIFFERENT repo PATH than the one
+# this run pinned (`/linux/OTHER/deb` rather than `/linux/chrome/deb`) — an unrelated
+# third-party repo offering the same package name under the right host and scheme.
+# The prefix comparison against GOOGLE_APT_URL rejects it because the PATH differs;
+# it does not (and cannot) distinguish an IDENTICAL URI verified by a different
+# keyring, which `apt-cache policy` never reports and which requires root to plant.
 res_w7=$(run_verify_apt_origin '(none)' '999.0.0.0-1' \
     '     999.0.0.0-1 500
         500 https://dl.google.com/linux/OTHER/deb stable/main amd64 Packages' \
@@ -2984,7 +3097,10 @@ else
     # chrome_runnable documents for stock macOS. Nothing to bound the outer
     # call with either, so this arm cannot be driven here without risking a
     # genuinely wedged suite.
-    skip "case bp: _bounded_probe timeout enforcement (no timeout/gtimeout on PATH)" 2
+    # Credit 4: bp2's own pair (elapsed-under-bound, no-output) plus bp3's pair
+    # below (CHROME_PROBE_TIMEOUT=0 rejected, CHROME_PROBE_TIMEOUT=--help
+    # rejected) — bp3 is driven inside this same guard, so it skips too.
+    skip "case bp: _bounded_probe timeout enforcement (no timeout/gtimeout on PATH)" 4
     out_bp2=""
     bp_elapsed=""
 fi
@@ -2993,6 +3109,37 @@ if [ -n "${bp_tmo}" ]; then
         "under-outer-bound" "$([ "${bp_elapsed}" -lt 10 ] && echo "under-outer-bound" || echo "HUNG ${bp_elapsed}s — SEC-BE-005 bound is gone")"
     assert_eq "case bp: _bounded_probe on a hanging binary produces no output (the hang was cut off, not raced)" \
         "" "${out_bp2}"
+
+    # bp3 (SEC-BE-002): _bounded_probe used to read CHROME_PROBE_TIMEOUT straight
+    # into timeout(1)'s duration/option position with no validation, unlike
+    # chrome_runnable, the sibling probe it says it reuses. Two values named by
+    # the finding: CHROME_PROBE_TIMEOUT=0 (GNU timeout reads 0 as "no timeout",
+    # which would let a hanging browser wedge the tail of a root provisioning
+    # run forever) and CHROME_PROBE_TIMEOUT=--help (an unvalidated value would
+    # reach timeout's OPTION position, landing usage text in the version
+    # record instead of failing loudly). Both are driven inside this same
+    # outer-safety-net guard as bp2 — same rationale: rc alone cannot
+    # distinguish a correctly-rejected value from the 15s outer net, so elapsed
+    # time is the assertion for the hang case.
+    bp3_start=$(date +%s)
+    out_bp3_zero=$("${bp_tmo}" 15 bash -c '
+        # shellcheck source=install-chrome.sh
+        source "$1"
+        CHROME_PROBE_TIMEOUT=0
+        _bounded_probe "$2"
+    ' _ "${INSTALL_SCRIPT}" "${bp_dir}/chrome-hang" 2>/dev/null) || true
+    bp3_elapsed=$(( $(date +%s) - bp3_start ))
+    assert_eq "case bp: CHROME_PROBE_TIMEOUT=0 is rejected — a hanging --version is still cut off near the validated 2s default rather than left unbounded (SEC-BE-002)" \
+        "under-outer-bound" "$([ "${bp3_elapsed}" -lt 10 ] && echo "under-outer-bound" || echo "HUNG ${bp3_elapsed}s — SEC-BE-002 validation is gone")"
+
+    out_bp3_help=$(
+        # shellcheck source=install-chrome.sh
+        source "${INSTALL_SCRIPT}"
+        CHROME_PROBE_TIMEOUT=--help
+        _bounded_probe "${bp_dir}/chrome-fast"
+    )
+    assert_eq "case bp: CHROME_PROBE_TIMEOUT=--help is rejected — _bounded_probe returns the browser's version string, not timeout(1)'s usage text (SEC-BE-002)" \
+        "Google Chrome 999.0.0.0" "${out_bp3_help}"
 fi
 
 # ── Case z: the install lock (SEC-BE-006 / SEC-BE-008 / TEST-011 / TEST-012) ──

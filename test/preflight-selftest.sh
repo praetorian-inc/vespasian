@@ -64,7 +64,13 @@ skip() {
 # 88 = 84 + case f1's 4 assertions (TEST-011: gtimeout arm coverage). Case f1
 # synthesises its own fixture gtimeout rather than depending on ambient PATH,
 # so it runs unconditionally on every host and needs no skip() credit.
-EXPECTED_ASSERTIONS=88
+#
+# Round-15 review, TEST-001: 88 -> 90. MEASURED by running the suite, not
+# derived. +2 for case f1b, which pins the PRODUCTION `${CHROME_PROBE_TIMEOUT:-2}`
+# default — the value every real run uses and which nothing asserted, because
+# both suites that could exercise the `:-` arm export the variable first. It
+# reuses case f1's fixture gtimeout and so likewise needs no skip() credit.
+EXPECTED_ASSERTIONS=90
 
 assert_eq() {
     local desc=$1 expected=$2 actual=$3
@@ -499,6 +505,10 @@ GTIMEOUT_BIN_DIR="${FIXTURE_DIR}/gtimeout-only-bin"
 mkdir -p "${GTIMEOUT_BIN_DIR}"
 ln -s "$(command -v sleep)" "${GTIMEOUT_BIN_DIR}/sleep"
 GTIMEOUT_MARKER="${FIXTURE_DIR}/gtimeout.invocations"
+# TEST-001: a SECOND, independent marker recording the duration gtimeout was
+# handed. Separate from GTIMEOUT_MARKER on purpose — case f1's four existing
+# assertions read that one and must keep reading exactly what they did before.
+GTIMEOUT_BUDGET_MARKER="${FIXTURE_DIR}/gtimeout.budget"
 
 # Minimal `timeout`-alike: runs its argv in the background, races a watchdog
 # `sleep` against it, and reports rc 124 if the watchdog wins — the same
@@ -507,6 +517,7 @@ GTIMEOUT_MARKER="${FIXTURE_DIR}/gtimeout.invocations"
 cat > "${GTIMEOUT_BIN_DIR}/gtimeout" <<'EOF'
 #!/bin/bash
 [ -n "${GTIMEOUT_MARKER:-}" ] && printf 'invoked\n' >> "${GTIMEOUT_MARKER}"
+[ -n "${GTIMEOUT_BUDGET_MARKER:-}" ] && printf '%s\n' "$1" >> "${GTIMEOUT_BUDGET_MARKER}"
 duration="$1"
 shift
 "$@" &
@@ -561,6 +572,44 @@ assert_eq "case f1: CHROME_PROBE_TIMEOUT=0.2 kills the slow probe via gtimeout (
     "124" "${rc_f1_kill}"
 assert_eq "case f1: the fixture gtimeout was invoked to kill the slow probe" \
     "invoked" "$(cat "${GTIMEOUT_MARKER}")"
+
+# ── Case f1b: the PRODUCTION default budget (TEST-001) ──────────────────────
+#
+# `chrome_probe_budget` reads `${CHROME_PROBE_TIMEOUT:-2}` (test/common.sh:104).
+# That literal 2 is what every real developer run and every CI run uses, and
+# until now NOTHING asserted it. Both suites that could exercise the `:-` arm
+# export the variable suite-wide first (here at :144, install-chrome-selftest.sh
+# at :55), and case f2 was deliberately moved onto an explicit override
+# (rationale at 571-584 below). MUTATION-PROVEN: `:-2` -> `:-0.001` left all
+# FOUR suites green while every real probe times out and a healthy browser is
+# reported "not runnable" — the exact LAB-3893 false positive this code cures,
+# on a path only the label-gated `test` job would ever notice.
+#
+# Asserts the budget VALUE handed to gtimeout, NOT elapsed wall-clock. Pinning
+# the pass side to the 2s default by timing was already tried and removed for
+# being load-sensitive on a throttled runner (see 571-584); reading the value
+# out of the fixture is deterministic, cannot flake, and catches ANY change to
+# the literal rather than only a large one.
+probe_via_gtimeout_default_budget() {
+    (
+        # shellcheck source=setup-live-targets.sh disable=SC1091
+        source "${SETUP_SCRIPT}"
+        PATH="${GTIMEOUT_BIN_DIR}"   # only the fixture gtimeout (+ sleep)
+        export GTIMEOUT_MARKER GTIMEOUT_BUDGET_MARKER
+        unset CHROME_PROBE_TIMEOUT   # the production path: no override at all
+        set +e
+        chrome_runnable "$1"
+        printf '%s\n' "$?"
+    )
+}
+
+: > "${GTIMEOUT_MARKER}"
+: > "${GTIMEOUT_BUDGET_MARKER}"
+rc_f1b=$(probe_via_gtimeout_default_budget "${WORKING_BROWSER}")
+assert_eq "case f1b: with CHROME_PROBE_TIMEOUT unset, the production default still detects a working browser (rc 0)" \
+    "0" "${rc_f1b}"
+assert_eq "case f1b: the un-overridden production budget reaches timeout as 2s — shrinking it makes every real probe time out and report a healthy browser as 'not runnable' (the LAB-3893 false positive)" \
+    "2" "$(head -1 "${GTIMEOUT_BUDGET_MARKER}")"
 
 # ── Case f2: CHROME_PROBE_TIMEOUT reaches the probe budget ─────
 # chrome_runnable must honour CHROME_PROBE_TIMEOUT (a cold container mount can

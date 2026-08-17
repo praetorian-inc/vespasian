@@ -459,6 +459,10 @@ if command -v lsof >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     rm -f "${STATE_DIR}/node"
     if ! cp "$(command -v python3)" "${STATE_DIR}/node"; then
         fail "could not stage node stand-in (cp failed)"
+        # Both arms of this block must emit 3 counted outcomes or the accounting
+        # sentinel fires a second, misleading failure (TEST-008). The two node-listener
+        # sub-cases below cannot run without the stand-in, so they are credited here.
+        skip "node-listener sub-cases need the staged stand-in" 1
     else
         nport="$(free_port)"
         "${STATE_DIR}/node" -m http.server "$nport" --bind 127.0.0.1 >/dev/null 2>&1 &
@@ -563,6 +567,25 @@ for fn in start_rest_api start_soap_service start_concat_spa start_graphql_serve
             fail "${fn} passes an explicit BIND_HOST seam (source changed)" ;;
     esac
 done
+# TEST-009: the four names above are hand-picked and never include grpc-server,
+# which IS a first-class ALL_TARGETS member. Being on the exemption list below
+# is not itself a finding — an UNLISTED, UNCHECKED target is.
+#   forms-target  — uses its own FORMS_TARGET_BIND_HOST seam; pinned by Test 19.
+#   grpc-server   — passes no bind host at all; its literal bind is pinned in
+#                   Test 18b below.
+BIND_SEAM_EXEMPT="forms-target grpc-server"
+unchecked=""
+for t in ${ALL_TARGETS//,/ }; do
+    case " rest-api soap-service concat-spa graphql-server $BIND_SEAM_EXEMPT " in
+        *" $t "*) ;;
+        *) unchecked="$unchecked $t" ;;
+    esac
+done
+if [ -n "$unchecked" ]; then
+    fail "target(s) in ALL_TARGETS have no bind-host assertion and are not on the exemption list:$unchecked — add a check here or an exemption with the reason"
+else
+    ok "every ALL_TARGETS member is either bind-host-asserted or on the documented exemption list"
+fi
 
 # ── Test 18b: the TARGETS THEMSELVES honour the seam (TEST-007) ─────────────
 #
@@ -624,47 +647,62 @@ collapse_code() {
     ' "$1" | tr '\n' ' ' | tr -s '[:space:]' ' '
 }
 
-SHARED_TARGET="${SCRIPT_DIR}/internal/target/target.go"
+SHARED_TARGET="${THIS_DIR}/internal/target/target.go"
 if [ ! -f "${SHARED_TARGET}" ]; then
     fail "test/internal/target/target.go not found — the shared loopback default is gone and every target below resolves its own bind"
     fail "test/internal/target/target.go not found — cannot verify the shared server timeout"
 else
-    # TEST-016. The VALUES this file used to pin here — the loopback default
-    # (SEC-BE-015) and the non-zero header-read bound (SEC-BE-007) — are now
-    # asserted behaviourally in test/internal/target/target_test.go, which calls
-    # the real functions and checks what they return.
-    #
-    # That move was forced. The regex here read `ReadHeaderTimeout = [0-9]+ \*
-    # time\.Second`, which MATCHES `0 * time.Second` — it accepted the exact
-    # value it claimed to forbid. The structural grep for the Addr body was
-    # likewise satisfied by text sitting in a comment. Both holes are closed by
-    # asking the code rather than reading it: target_test.go fails on
-    # `ReadHeaderTimeout = 0`, on a `0.0.0.0` default, on inverting `host == ""`,
-    # and on replacing net.JoinHostPort with string concatenation — each
-    # mutation-verified.
-    #
-    # What stays here is the one question a Go test cannot answer: whether the
-    # four targets still DELEGATE to the shared helper. An inline copy behaves
-    # identically, so only the source text distinguishes it. That check is below.
-    #
-    # This job installs no Go, so it cannot run target_test.go itself. It asserts
-    # the file EXISTS and carries those behavioural assertions, so deleting the
-    # Go test to dodge it fails here instead of silently removing the coverage.
-    shared_test="${SCRIPT_DIR}/internal/target/target_test.go"
-    if [ ! -f "${shared_test}" ]; then
-        fail "test/internal/target/target_test.go is gone — the loopback default and the header-read bound have no behavioural assertion left, and the source greps that used to stand in for one were mutation-proven defeatable"
+    shared_code=$(collapse_code "${SHARED_TARGET}")
+
+    # TEST-010 / D2. Both a structural pin over the collapsed source AND the Go
+    # behavioural tests in target_test.go are kept deliberately — this is the
+    # defence-in-depth the review found was lost, not a choice between the two:
+    # the shell pin below runs in the Go-less preflight-selftest job, the Go
+    # tests run under `make test`. This pin was deleted once on the theory that
+    # a /* */ block comment could satisfy it undetected, but collapse_code
+    # strips block comments in the very commit that theory rested on, so the
+    # pin is sound again as a fixed-string whole-structure match.
+    if printf '%s' "${shared_code}" | grep -qF 'host := os.Getenv("BIND_HOST") if host == "" { host = "127.0.0.1" } return net.JoinHostPort(host, port)'; then
+        ok "shared target.Addr still defaults to loopback when BIND_HOST is unset (SEC-BE-015)"
     else
-        missing=""
-        for needle in 'func TestAddrDefaultsToLoopback' \
-                      'func TestAddrEmptyAndSetAreDistinct' \
-                      'func TestServerAppliesNonZeroReadHeaderTimeout'; do
-            grep -qF -- "$needle" "${shared_test}" || missing="${missing} ${needle#func }"
-        done
-        if [ -n "$missing" ]; then
-            fail "target_test.go no longer asserts:${missing} — these are the behavioural pins for SEC-BE-015 and SEC-BE-007"
-        else
-            ok "target_test.go carries the behavioural pins for the loopback default and the header-read bound (run by 'make test', not by this job)"
-        fi
+        fail "shared target.Addr no longer defaults to loopback when BIND_HOST is unset — these targets are unauthenticated, so a wildcard default exposes them to the local network for the lifetime of a test run (SEC-BE-015)"
+    fi
+
+    # The quantifier is [1-9][0-9]*, not [0-9]+: the predecessor of this pin
+    # used [0-9]+, which matches the literal `0` it claimed to forbid.
+    if printf '%s' "${shared_code}" | grep -qE 'ReadHeaderTimeout = [1-9][0-9]* \* time\.Second'; then
+        ok "shared target server still applies a non-zero ReadHeaderTimeout (SEC-BE-007)"
+    else
+        fail "shared target server's ReadHeaderTimeout is zero or gone — an unbounded header read is a slow-loris against a developer machine or CI runner once LIVE_TARGET_BIND_HOST widens the bind (SEC-BE-007)"
+    fi
+fi
+
+# The Go behavioural layer. target_test.go carries the same two properties as
+# real tests against the real functions, closing what the source-text pins
+# above cannot: a comparison inversion, and (for the timeout) the exact-zero
+# value the old, looser regex used to accept. This check does not depend on
+# target.go existing, so it is its own top-level check rather than nested
+# inside the block above (TEST-008): target.go being absent does not prevent
+# checking whether target_test.go still asserts these things, and folding it
+# into the "target.go missing" arm would falsely claim that it does.
+#
+# This job installs no Go, so it cannot run target_test.go itself. It asserts
+# the file EXISTS and carries those behavioural assertions, so deleting the Go
+# test to dodge it fails here instead of silently removing the coverage.
+shared_test="${THIS_DIR}/internal/target/target_test.go"
+if [ ! -f "${shared_test}" ]; then
+    fail "test/internal/target/target_test.go is gone — the loopback default and the header-read bound have no behavioural assertion left, and the source greps that used to stand in for one were mutation-proven defeatable"
+else
+    missing=""
+    for needle in 'func TestAddrDefaultsToLoopbackWhenEmpty' \
+                  'func TestAddrDefaultsToLoopbackWhenUnset' \
+                  'func TestServerAppliesNonZeroReadHeaderTimeout'; do
+        grep -qF -- "$needle" "${shared_test}" || missing="${missing} ${needle#func }"
+    done
+    if [ -n "$missing" ]; then
+        fail "target_test.go no longer asserts:${missing} — these are the behavioural pins for SEC-BE-015 and SEC-BE-007"
+    else
+        ok "target_test.go carries the behavioural pins for the loopback default and the header-read bound (run by 'make test', not by this job)"
     fi
 fi
 
@@ -673,7 +711,7 @@ fi
 # correct today, because the assertion above would then be pinning a default the
 # target no longer uses.
 for src in rest-api/main.go soap-service/main.go concat-spa/main.go forms-target/main.go; do
-    f="${SCRIPT_DIR}/${src}"
+    f="${THIS_DIR}/${src}"
     if [ ! -f "$f" ]; then
         fail "${src} not found — cannot verify it delegates its bind to test/internal/target"
         continue
@@ -690,12 +728,30 @@ for src in rest-api/main.go soap-service/main.go concat-spa/main.go forms-target
         fail "${src} no longer delegates to test/internal/target — it resolves its own bind and/or builds its own server, so the shared loopback default and timeout do not apply to it"
     fi
 done
+# TEST-009: the four `src` entries above are hand-picked; grpc-server and any
+# future ALL_TARGETS member are invisible to this loop unless named here.
+#   graphql-server — Node, cannot share the Go helper; pinned by its own arm below.
+#   grpc-server    — builds no http.Server, so target.Server is inapplicable;
+#                    its literal bind is pinned by its own arm below.
+DELEGATION_EXEMPT="graphql-server grpc-server"
+unchecked_delegation=""
+for t in ${ALL_TARGETS//,/ }; do
+    case " rest-api soap-service concat-spa forms-target $DELEGATION_EXEMPT " in
+        *" $t "*) ;;
+        *) unchecked_delegation="$unchecked_delegation $t" ;;
+    esac
+done
+if [ -n "$unchecked_delegation" ]; then
+    fail "target(s) in ALL_TARGETS have no delegation assertion and are not on the exemption list:$unchecked_delegation — add a check here or an exemption with the reason"
+else
+    ok "every ALL_TARGETS member is either delegation-asserted or on the documented exemption list"
+fi
 
 # graphql-server is Node and cannot share the Go helper, so it keeps a structural
 # check of its own: the defaulting expression AND the listen() call that actually
 # PASSES host. Dropping that argument is the pre-PR shape and binds every interface
 # while the defaulting line sits there untouched.
-gql="${SCRIPT_DIR}/graphql-server/server.js"
+gql="${THIS_DIR}/graphql-server/server.js"
 if [ ! -f "$gql" ]; then
     fail "graphql-server/server.js not found — cannot verify its loopback default"
 else
@@ -703,6 +759,21 @@ else
         ok "graphql-server/server.js defaults to loopback AND passes host to listen()"
     else
         fail "graphql-server/server.js no longer defaults to loopback or no longer passes host to listen() — the unset path exposes it on every interface"
+    fi
+fi
+
+# grpc-server builds no http.Server, so it cannot use target.Server, and it
+# takes no BIND_HOST — its bind is a branch-free literal. A fixed-string
+# structural match is therefore complete for it: there is no logic to invert
+# (TEST-009).
+grpcsrc="${THIS_DIR}/grpc-server/main.go"
+if [ ! -f "$grpcsrc" ]; then
+    fail "grpc-server/main.go not found — cannot verify its loopback bind"
+else
+    if printf '%s' "$(collapse_code "$grpcsrc")" | grep -qF 'net.Listen("tcp", "127.0.0.1:"+resolved)'; then
+        ok "grpc-server/main.go binds loopback explicitly (SEC-BE-015)"
+    else
+        fail "grpc-server/main.go no longer binds 127.0.0.1 — the gRPC live target is unauthenticated, so a wildcard bind exposes it to the local network for the lifetime of a test run (SEC-BE-015)"
     fi
 fi
 
@@ -892,14 +963,18 @@ if command -v stat >/dev/null 2>&1; then
     (
         umask 0
         write_config 1111 2222 3333 4444 5555 6666 "rest-api,soap-service" >/dev/null 2>&1
+        record_pid modetest 4242
     )
     mode="$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null)"
     assert_eq "$mode" "644" "config file lands at mode 644 even under umask 0"
     contents="$(cat "$CONFIG_FILE" 2>/dev/null)"
     assert_contains "$contents" "REST_API_PORT=1111" "config carries the written port value"
     rm -f "$CONFIG_FILE"
+    pidmode="$(stat -c '%a' "${STATE_DIR}/.modetest.pids" 2>/dev/null)"
+    assert_eq "$pidmode" "600" "pid log lands at mode 600 even under umask 0 (SEC-BE-003)"
+    rm -f "${STATE_DIR}/.modetest.pids"
 else
-    skip "stat required" 2
+    skip "stat required" 3
 fi
 
 # ── Test 23: teardown_on_failure EXIT trap tears down a failed partial setup ─
@@ -1041,20 +1116,25 @@ echo "────────────────────────�
 # Test block AND running without pgrep reported "Passed: 60 Failed: 0" and
 # exited 0. It is now enforced UNCONDITIONALLY against pass+fail+credit.
 #
-# The credits are MEASURED, not estimated: each guard was forced false in turn on
-# a scratch copy and the assertion delta read off — python3 2, python3+lsof/ss 2,
-# Test 16 lsof+python3 3, pgrep 2, Test 20 timeout+curl+python3 1, Test 21
-# timeout+dirname+sleep 2, stat 2. A degraded host still totals
-# EXPECTED_ASSERTIONS and stays green, while a DELETED assertion is now caught on
-# every host rather than only on a fully-equipped one.
-# TEST-016: 75 -> 74. Test 18b's two structural pins (the loopback default and
-# the non-zero header-read bound) were replaced by ONE assertion that
-# test/internal/target/target_test.go exists and carries the behavioural checks.
-# Net -1 here, and a net GAIN in coverage: the Go test fails on `ReadHeaderTimeout
-# = 0`, on a 0.0.0.0 default, on inverting `host == ""`, and on dropping
-# net.JoinHostPort — none of which the greps caught, since the regex they used
-# matched `0 * time.Second` and their input was defeatable by a block comment.
-EXPECTED_ASSERTIONS=74
+# The credits are a DERIVED INVARIANT, not a frozen literal list (this record
+# went stale once already — see TEST-002's twin in install-chrome-selftest.sh):
+# the credits of the skip arms that actually fired, plus the observed
+# pass+fail, always total EXPECTED_ASSERTIONS. Each credit equals the number of
+# counted outcomes its guarded block would have emitted on a fully-equipped
+# host. All nine `skip "` sites in this file and their credits: 232 (python3,
+# 2), 284 (python3+lsof/ss, 2), 465 (cp-stage failure inside Test 16, 1), 493
+# (lsof+python3, 3), 514 (pgrep, 2), 557 (lsof-free PATH construction, 2), 890
+# (timeout/gtimeout+curl+python3, 1), 957 (timeout/gtimeout+dirname+sleep, 2),
+# 977 (stat, 3).
+#
+# 80 = 74 (round-15 baseline) + 2 (C1: the two Test 18b structural pins
+# restored, D2 — both layers, source pin and Go behavioural test, are kept
+# deliberately) + 3 (C3: TEST-009's two ALL_TARGETS-exhaustiveness assertions
+# plus the grpc-server loopback-bind pin) + 1 (C4: the SEC-BE-003 pid-log mode
+# assertion in Test 22). C2 and C5 are net zero: C2 rebalances Test 16's
+# cp-failure arm with a credited skip instead of adding a real assertion; C5
+# trades one Go test for another with no shell-side pin at all.
+EXPECTED_ASSERTIONS=80
 if [ "$((PASS + FAIL + SKIP_CREDIT))" -ne "${EXPECTED_ASSERTIONS}" ]; then
     echo "setup-live-targets_test: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (Passed+Failed+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A Test block was added or removed without updating EXPECTED_ASSERTIONS."

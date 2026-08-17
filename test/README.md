@@ -544,6 +544,9 @@ test/
 ├── test-runner-args.sh          # Target-group vs dispatch drift, CI step lists
 ├── validate_test.sh             # Spec validators still reject malformed specs
 │
+├── internal/
+│   └── target/              # Shared bind-host + server-timeout helper for the Go targets
+│
 ├── rest-api/
 │   ├── main.go              # REST API server
 │   └── expected-paths.json  # Expected paths for validation

@@ -380,7 +380,12 @@ wait_for_http() {
 # (append, not overwrite) so teardown can kill them all, not just the latest.
 record_pid() {
     local name=$1 pid=$2
-    echo "$pid" >> "${STATE_DIR}/.${name}.pids"
+    # SEC-BE-003: this log is the sole input to the teardown kill loop, so its
+    # mode is stated here rather than left to the caller's umask — same
+    # reasoning write_config applies to the config file. A subshell umask (not
+    # install -m) because this is an APPEND: install would truncate the earlier
+    # generations teardown still needs.
+    ( umask 077; echo "$pid" >> "${STATE_DIR}/.${name}.pids" )
 }
 
 # Kill a PID if it is alive: TERM, brief grace period, then KILL. Works for
@@ -589,6 +594,10 @@ start_graphql_server() {
     log_info "Starting graphql-server on port ${port}..."
     cd "${SCRIPT_DIR}/graphql-server"
     # See LIVE_TARGET_BIND_HOST comment above start_rest_api (SEC-BE-015).
+    # SEC-BE-003: pre-create the log with an explicit mode — a `>` redirect onto
+    # an existing file truncates without changing its mode, so the mode has to
+    # be set before the truncating redirect below, not after.
+    install -m 0600 /dev/null "${STATE_DIR}/.graphql-server.log"
     PORT="$port" BIND_HOST="${LIVE_TARGET_BIND_HOST:-127.0.0.1}" node server.js > "${STATE_DIR}/.graphql-server.log" 2>&1 &
     local pid=$!
     record_pid graphql-server "$pid"
@@ -609,12 +618,11 @@ wait_for_grpc() {
     local start=$SECONDS
     # Resolves the same timeout/gtimeout seam common.sh's chrome_runnable
     # already establishes, reused here to bound the bare /dev/tcp arm below.
-    local t=""
-    if command -v timeout >/dev/null 2>&1; then
-        t=timeout
-    elif command -v gtimeout >/dev/null 2>&1; then   # macOS + coreutils
-        t=gtimeout
-    fi
+    # timeout_cmd only — NOT chrome_probe_budget: the hardcoded 2s below bounds
+    # a gRPC connect probe, not a browser probe, and must not start reading
+    # CHROME_PROBE_TIMEOUT.
+    local t
+    t=$(timeout_cmd)
 
     while true; do
         # Each arm is bounded to 2s so the probe itself cannot outlive the
@@ -864,7 +872,7 @@ write_config() {
     # (SEC-BE-014): a bare `cat >` lands at the caller's umask, so under
     # umask 0 (a Dockerfile RUN commonly runs with one) this config —
     # load_config declare -g's it straight into run-live-tests.sh — would
-    # land world-writable. Mirrors install-chrome.sh:404-412's reasoning for
+    # land world-writable. Mirrors install-chrome.sh:424-441's reasoning for
     # its own writes.
     local staged
     staged="$(mktemp "${STATE_DIR}/.live-test-config.XXXXXX")"

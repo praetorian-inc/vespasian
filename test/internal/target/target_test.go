@@ -2,6 +2,7 @@ package target
 
 import (
 	"net/http"
+	"os"
 	"testing"
 	"time"
 )
@@ -21,12 +22,25 @@ import (
 // they run in the ordinary `make test` on every PR — unlike the shell guard,
 // which lives in a CI job that installs no Go.
 
-func TestAddrDefaultsToLoopback(t *testing.T) {
+func TestAddrDefaultsToLoopbackWhenEmpty(t *testing.T) {
 	t.Setenv("BIND_HOST", "")
 
 	got := Addr("8080")
 	if want := "127.0.0.1:8080"; got != want {
-		t.Fatalf("Addr with BIND_HOST unset = %q, want %q — the default bind is a security control: these targets are unauthenticated, so a wildcard default exposes them to the local network for the lifetime of a test run", got, want)
+		t.Fatalf("Addr with BIND_HOST empty = %q, want %q — the default bind is a security control: these targets are unauthenticated, so a wildcard default exposes them to the local network for the lifetime of a test run", got, want)
+	}
+}
+
+// The path target.go's own comment calls the common one: no BIND_HOST in the
+// environment at all, e.g. `go run ./test/rest-api` from a developer shell.
+// t.Setenv cannot express absence, so it is used only to register the restore.
+func TestAddrDefaultsToLoopbackWhenUnset(t *testing.T) {
+	t.Setenv("BIND_HOST", "placeholder")
+	os.Unsetenv("BIND_HOST")
+
+	got := Addr("8080")
+	if want := "127.0.0.1:8080"; got != want {
+		t.Fatalf("Addr with BIND_HOST absent from the environment = %q, want %q — the default bind is a security control: these targets are unauthenticated, so a wildcard default exposes them to the local network for the lifetime of a test run", got, want)
 	}
 }
 
@@ -36,21 +50,6 @@ func TestAddrHonorsBindHostOverride(t *testing.T) {
 	got := Addr("8080")
 	if want := "0.0.0.0:8080"; got != want {
 		t.Fatalf("Addr with BIND_HOST=0.0.0.0 = %q, want %q — the documented LIVE_TARGET_BIND_HOST opt-in must still work", got, want)
-	}
-}
-
-// The override must be honored only when it is actually set. An implementation
-// that reads the variable but ignores it, or one that inverts the emptiness
-// test, passes TestAddrDefaultsToLoopback or the override test but not both.
-func TestAddrEmptyAndSetAreDistinct(t *testing.T) {
-	t.Setenv("BIND_HOST", "")
-	unset := Addr("9999")
-
-	t.Setenv("BIND_HOST", "192.0.2.1")
-	set := Addr("9999")
-
-	if unset == set {
-		t.Fatalf("Addr returned %q both with BIND_HOST unset and with BIND_HOST=192.0.2.1 — the override is being ignored, or the emptiness test is inverted", unset)
 	}
 }
 
