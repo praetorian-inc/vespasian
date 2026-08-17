@@ -1056,6 +1056,41 @@ if command -v stat >/dev/null 2>&1; then
         logmode="$(stat -c '%a' "${STATE_DIR}/.graphql-server.log" 2>/dev/null)"
         assert_eq "$logmode" "600" "start_graphql_server's own install line creates .graphql-server.log at mode 600 under umask 0 — pinning the path too, so an install pointed at another file cannot satisfy this (SEC-BE-003)"
 
+        # BEHAVIOURAL. Everything else in this block reads the function's TEXT;
+        # this RUNS it. A textual scan can only recognise a clobber that spells
+        # the log path literally, so the SAME statement written through the
+        # function's own variable walks past all of them. MUTATION-PROVEN:
+        # `gqllog="${STATE_DIR}/.graphql-server.log"; chmod 666 "$gqllog"`
+        # inserted after the install left the suite at exit 0 while the log
+        # holding service output went world-writable.
+        #
+        # Driving the real function under umask 0 — Tests 20/21's own idiom, a
+        # stubbed PATH plus a sourced SUT — pins the mode of the file the
+        # service actually writes, whatever spelling a future clobber uses.
+        # That is what ends the enumeration arms race the comments below record:
+        # each of those fixes widened a pattern, and the next mutation simply
+        # spelled itself differently. `node` is stubbed to exit immediately, so
+        # nothing is launched and the redirect still truncates as in production.
+        gql_stub_bin="$(TMPDIR=/tmp mktemp -d)"
+        gql_beh_state="$(TMPDIR=/tmp mktemp -d)"
+        printf '#!/bin/sh\nexit 0\n' > "${gql_stub_bin}/node"
+        chmod 0755 "${gql_stub_bin}/node"
+        gql_beh_mode="$(
+            SETUP_LIVE_TARGETS_STATE_DIR="$gql_beh_state" \
+            PATH="${gql_stub_bin}:$PATH" bash -c '
+                # shellcheck source=/dev/null
+                source "'"${SCRIPT_UNDER_TEST}"'"
+                wait_for_http() { return 0; }
+                record_pid() { :; }
+                log_info() { :; }; log_ok() { :; }; log_fail() { :; }
+                umask 0
+                start_graphql_server 1 >/dev/null 2>&1
+                stat -c "%a" "${STATE_DIR}/.graphql-server.log" 2>/dev/null
+            ' 2>/dev/null | tail -1
+        )"
+        rm -rf "$gql_stub_bin" "$gql_beh_state"
+        assert_eq "$gql_beh_mode" "600" "RUNNING start_graphql_server under umask 0 leaves .graphql-server.log at mode 600 — pins the mode of the file the service actually writes, so a clobber spelled through a variable or a helper cannot evade it the way it evades the textual scans below (SEC-BE-003)"
+
         # ORDERING. The mode only holds if nothing between the install and the
         # truncating redirect removes the file: `>` on an EXISTING file truncates
         # and keeps its mode, but on a missing one it creates at the caller's
@@ -1118,7 +1153,7 @@ $(declare -f "$w")"
     fi
     rm -f "${STATE_DIR}/.graphql-server.log"
 else
-    skip "stat required" 5
+    skip "stat required" 6
 fi
 
 # ── Test 23: teardown_on_failure EXIT trap tears down a failed partial setup ─
@@ -1257,7 +1292,7 @@ pgrep required=2
 could not build an lsof-free PATH for the SEC-BE-008 check=2
 timeout/gtimeout, curl, and python3 required=1
 timeout/gtimeout, dirname, and sleep required=2
-stat required=5'
+stat required=6'
 actual_skip_register=$(grep -oE '^[[:space:]]*skip "[^"]*" [0-9]+' "$THIS_DIR/setup-live-targets_test.sh" \
     | sed -E 's/^[[:space:]]*skip "([^"]*)" ([0-9]+)$/\1=\2/')
 # Sites WITHOUT an explicit credit default to 0 and would silently not appear
@@ -1339,7 +1374,7 @@ echo "────────────────────────�
 # skip-credit register, which replaced a prose list of line numbers that had
 # already gone stale twice. The ALL_TARGETS bidirectional check is net zero — it
 # replaced the liveness-only sentinel rather than adding to it.
-EXPECTED_ASSERTIONS=84
+EXPECTED_ASSERTIONS=85
 if [ "$((PASS + FAIL + SKIP_CREDIT))" -ne "${EXPECTED_ASSERTIONS}" ]; then
     echo "setup-live-targets_test: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (Passed+Failed+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A Test block was added or removed without updating EXPECTED_ASSERTIONS."
