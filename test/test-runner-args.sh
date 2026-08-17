@@ -1977,9 +1977,34 @@ for rel_f in "$SCRIPT_DIR"/*.sh; do
         # five lines earlier sat inside the window and vouched for it. "A compare
         # exists nearby" is not "this claim is tested" — the same substitution the
         # sed-range ORDERING bug made, reproduced in its replacement.
+        # Balanced scan, not "the nearest `if` above": a nested if/fi that opens
+        # and closes between the governing `if` and the assertion would otherwise
+        # be latched as the start, and the guard would false-FIRE on a legitimate
+        # block. MUTATION-PROVEN: inserting `if true; then :; fi` before a
+        # correctly-compared assertion made the naive version report it as
+        # uncompared. Walk up counting `fi` and `if`; the enclosing `if` is the
+        # one that leaves depth negative.
         rel_floor=$((rel_ln > 60 ? rel_ln - 60 : 1))
-        rel_lo=$(awk -v n="$rel_ln" -v floor="$rel_floor" \
-                     'NR>=floor && NR<n && /^[[:space:]]*if[[:space:]]/ {l=NR} END{print (l?l:floor)}' "$rel_f")
+        # Balanced scan by TOKEN, not by line shape. Two earlier attempts failed:
+        # "nearest `if` above" latched a nested if/fi and false-FIRED on a correct
+        # assertion, and anchoring `fi` to line-start missed the one-line form
+        # `if true; then :; fi`, which then read as an unmatched `if`. Counting
+        # bare `if`/`fi` WORDS per line handles both — a one-liner nets zero, and
+        # `elif` tokenizes as `elif` so it never opens a block. Walking up, the
+        # enclosing `if` is the first line that drives depth below zero.
+        rel_lo=$(awk -v n="$rel_ln" -v floor="$rel_floor" '
+            NR>=floor && NR<n { line[NR]=$0 }
+            END{
+                d=0
+                for (i=n-1; i>=floor; i--) {
+                    t=line[i]; nif=0; nfi=0
+                    c=split(t, w, /[^A-Za-z_]+/)
+                    for (k=1; k<=c; k++) { if (w[k]=="if") nif++; else if (w[k]=="fi") nfi++ }
+                    d += nfi - nif
+                    if (d < 0) { print i; exit }
+                }
+                print floor
+            }' "$rel_f")
         if ! sed -n "${rel_lo},${rel_ln}p" "$rel_f" \
              | grep -qE '\[ *"?\$\{?[A-Za-z_]*(_at|_line)\}?"? *-(lt|gt|le|ge) '; then
             fail "$(basename "$rel_f"):${rel_ln} claims a positional relation but its own conditional (from line ${rel_lo}) contains no operator comparing two positions — the relation exists only in the message"
