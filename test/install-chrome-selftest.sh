@@ -468,8 +468,25 @@ curl_word_re='(^|[[:space:]]|\$\(|\(|\||&&|;)curl[[:space:]]'
 # log_info "... please curl the key ...") would also count. fn_code strips only
 # whole-line comments. No such string exists in install_pinned_key today, and the
 # fix -- parsing shell quoting -- is far more machinery than the risk warrants.
-key_fn_body_f_joined=$(printf '%s\n' "${key_fn_body_f}" \
-    | awk '{ if (sub(/\\$/, "")) { printf "%s ", $0; next } else { print } }')
+#
+# ROUND-16 CORRECTION: joining alone was a COVERAGE REGRESSION, caught by
+# mutation. `grep -c` counts LINES, so once continuations are joined a single
+# line can hold BOTH an unpinned and a pinned curl and be counted once:
+#
+#   curl http://mirror/key.pub || \        unjoined: lines=2 pinned=1 -> FAIL (right)
+#   curl --proto '=https' ... https://...    joined: lines=1 pinned=1 -> PASS (wrong)
+#
+# That reverts the guarantee TEST-002 established and neutralizes TEST-003's
+# widening, since ||, && and ; are exactly the operators that precede a `\`.
+# So: join continuations (flags stay with their command), THEN split on command
+# separators (each command is counted on its own). Both properties hold at once.
+# The same normalisation is applied to the f5b apt-get counter below, which had
+# the identical latent bug.
+normalize_commands() {
+    awk '{ if (sub(/\\$/, "")) { printf "%s ", $0; next } else { print } }' \
+        | sed 's/||/\n/g; s/&&/\n/g; s/;/\n/g; s/|/\n/g'
+}
+key_fn_body_f_joined=$(printf '%s\n' "${key_fn_body_f}" | normalize_commands)
 f_curl_lines=$(printf '%s\n' "${key_fn_body_f_joined}" | grep -cE "$curl_word_re" || true)
 f_curl_pinned=$(printf '%s\n' "${key_fn_body_f_joined}" | grep -E "$curl_word_re" \
     | grep -cF -- "--proto '=https' --proto-redir '=https'" || true)
@@ -549,8 +566,11 @@ fi
 # Line continuations are joined first: apt-get install's DPkg::Lock::Timeout
 # bound sits on the CONTINUATION line, not the invocation line, so each call
 # has to become exactly one logical line before it can be counted.
-script_body_f5_joined=$(grep -vE '^[[:space:]]*#' "${INSTALL_SCRIPT}" \
-    | awk '{ if (sub(/\\$/, "")) { printf "%s ", $0; next } else { print } }')
+# Same join-then-split normalisation as case f above, and for the same reason:
+# joining alone let two apt-get calls chained by `&&` across a continuation count
+# as one line, so an unbounded call rode along with a bounded one. Verified: a
+# two-call continuation counted 1 before this change and 2 after.
+script_body_f5_joined=$(grep -vE '^[[:space:]]*#' "${INSTALL_SCRIPT}" | normalize_commands)
 # SELF-4: the prefix set is a CHAIN of command words, not a fixed `$SUDO?timeout?`.
 # The predecessor required the literal `$SUDO`, so three behaviourally identical
 # forms evaded it and measured GREEN with an unbounded call present:
