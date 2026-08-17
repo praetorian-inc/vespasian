@@ -1044,19 +1044,32 @@ mkdir -p "${n2_state}"
         main --targets grpc-server 2>&1
     )
 } > "${n2_state}/main.out" 2>&1 || true
-if [ -f "${n2_state}/.live-test-config" ]; then
-    echo "PASS: case n2: a browserless setup reaches write_config and leaves a config behind (AC2)"
-    pass_count=$((pass_count + 1))
+# Gated on HAS_NONBROWSER_PREREQS for exactly the reason case n's marker/epilogue
+# checks are (TEST-016): both assertions below require the run to reach
+# write_config, and check_prerequisites fails first on a host missing go or
+# python3 — an unrelated missing prerequisite, not the browser gate under test.
+# Ungated, this suite went RED on any such host for an environmental reason,
+# which is precisely the coupling the gate above exists to break. The
+# browser-severity assertions stay ungated because they read only the browser
+# diagnosis line.
+if [ "${HAS_NONBROWSER_PREREQS}" = true ]; then
+    if [ -f "${n2_state}/.live-test-config" ]; then
+        echo "PASS: case n2: a browserless setup reaches write_config and leaves a config behind (AC2)"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: case n2: a browserless setup did NOT reach write_config — no .live-test-config was written, so 'run-live-tests.sh --group offline' has nothing to load on a browserless checkout (AC2)"
+        fail_count=$((fail_count + 1))
+    fi
+    if grep -qE '^TARGETS_SETUP=' "${n2_state}/.live-test-config" 2>/dev/null; then
+        echo "PASS: case n2: the config the browserless run wrote carries TARGETS_SETUP"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: case n2: the browserless run's config has no TARGETS_SETUP line — run-live-tests.sh cannot tell which targets were provisioned"
+        fail_count=$((fail_count + 1))
+    fi
 else
-    echo "FAIL: case n2: a browserless setup did NOT reach write_config — no .live-test-config was written, so 'run-live-tests.sh --group offline' has nothing to load on a browserless checkout (AC2)"
-    fail_count=$((fail_count + 1))
-fi
-if grep -qE '^TARGETS_SETUP=' "${n2_state}/.live-test-config" 2>/dev/null; then
-    echo "PASS: case n2: the config the browserless run wrote carries TARGETS_SETUP"
-    pass_count=$((pass_count + 1))
-else
-    echo "FAIL: case n2: the browserless run's config has no TARGETS_SETUP line — run-live-tests.sh cannot tell which targets were provisioned"
-    fail_count=$((fail_count + 1))
+    # Credit 2: the write_config-reached and TARGETS_SETUP assertions above.
+    skip "case n2: reaching write_config needs go and python3 on PATH" 2
 fi
 
 # grpc-server speaks gRPC reflection and never launches a browser; --skip-start

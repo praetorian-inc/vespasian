@@ -31,6 +31,14 @@ RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/.results}"
 # same assertion in CI (where this runs before the build) as locally (where
 # bin/vespasian already exists). Also lets an operator point the suite at a
 # binary built elsewhere.
+# ANNOUNCED when it comes from the environment. The name is generic enough for
+# an unrelated ambient value to select the binary every crawl/generate in this
+# suite executes, and a silent redirect means the run reports on a binary the
+# operator did not mean to test. Not renamed to a namespaced form: this is a
+# read-only selector with no privilege boundary (unlike install-chrome.sh's
+# VESPASIAN_TEST_ROOT, which gates privileged writes and IS namespaced), and
+# test-runner-args.sh pins this name to exercise the binary-absent arm.
+if [ -n "${VESPASIAN:-}" ]; then VESPASIAN_FROM_ENV=1; fi
 VESPASIAN="${VESPASIAN:-${PROJECT_ROOT}/bin/vespasian}"
 
 # Hostname the test harness uses to reach the target services. Defaults to
@@ -164,6 +172,13 @@ targets_need_config() {
 # Source shared colors, logging, and validation functions
 # shellcheck source=common.sh
 source "${SCRIPT_DIR}/common.sh"
+
+# Announced HERE, not at the VESPASIAN default above: common.sh (which defines
+# log_warn) is not sourced until this line, so the notice cannot be emitted
+# earlier without calling an undefined function.
+if [ -n "${VESPASIAN_FROM_ENV:-}" ]; then
+    log_warn "VESPASIAN was set in the environment (${VESPASIAN}) — every crawl/generate in this run uses THAT binary, not ${PROJECT_ROOT}/bin/vespasian."
+fi
 # shellcheck source=validate.sh
 source "${SCRIPT_DIR}/validate.sh"
 

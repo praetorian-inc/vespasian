@@ -37,6 +37,14 @@ import (
 // value; the other three now share it rather than each deciding again.
 const ReadHeaderTimeout = 5 * time.Second
 
+// Companion bounds to ReadHeaderTimeout, covering the whole-request and
+// idle-connection cases it does not reach. See the note in Server().
+const (
+	ReadTimeout  = 30 * time.Second
+	WriteTimeout = 30 * time.Second
+	IdleTimeout  = 60 * time.Second
+)
+
 // Addr returns the address a live-test target should listen on.
 //
 // Binds loopback by DEFAULT. setup-live-targets.sh passes BIND_HOST explicitly and
@@ -62,5 +70,15 @@ func Server(addr string, h http.Handler) *http.Server {
 		Addr:              addr,
 		Handler:           h,
 		ReadHeaderTimeout: ReadHeaderTimeout,
+		// ReadHeaderTimeout alone bounds only the header read. With
+		// LIVE_TARGET_BIND_HOST able to widen these unauthenticated fixtures off
+		// loopback, a client that sends a complete header and then dribbles a body,
+		// or that completes a request and holds the connection idle, was still
+		// unbounded. Same threat, same fix, one line each. Generous relative to
+		// what these fixtures serve (small local payloads), so they bound abuse
+		// without capping any legitimate test.
+		ReadTimeout:  ReadTimeout,
+		WriteTimeout: WriteTimeout,
+		IdleTimeout:  IdleTimeout,
 	}
 }

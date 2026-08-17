@@ -1143,8 +1143,15 @@ main() {
         # pinger in the first place — there is nothing left to leave alone.
         # The message says what actually happened instead: this install has
         # no update channel, on purpose, until the operator restores one.
-        log_info "Not a container — google-chrome-stable was installed with no apt update channel (repo_add_once=false in ${CHROME_DEFAULTS_FILE})."
-        log_info "  To restore Chrome's normal update channel: remove that setting (or the whole file) and re-add Google's source."
+        # log_warn, not log_info: on a durable host this is a security-relevant
+        # trade, not an FYI. The browser these tests drive renders arbitrary web
+        # content, and it will now receive no security updates until an operator
+        # acts. The suppression itself is deliberate and required by AC4 (the
+        # package postinst re-adds Google's apt source and daily pinger, which is
+        # exactly the phone-home this script exists to remove), so the fix is to
+        # raise the volume of the notice, not to skip the suppression.
+        log_warn "Not a container — google-chrome-stable was installed with no apt update channel (repo_add_once=false in ${CHROME_DEFAULTS_FILE}); it will NOT receive security updates."
+        log_warn "  To restore Chrome's normal update channel: remove that setting (or the whole file) and re-add Google's source."
     fi
 
     # Set HERE, immediately after the container-aware removal above, and NOT

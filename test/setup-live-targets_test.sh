@@ -1042,7 +1042,19 @@ if command -v stat >/dev/null 2>&1; then
     # stat the real filename. Mode AND target path are then both pinned, because
     # a line pointing elsewhere leaves .graphql-server.log absent.
     rm -f "${STATE_DIR}/.graphql-server.log"
-    gql_install_line="$(declare -f start_graphql_server | grep -F 'install -m' | head -1)"
+    # Anchored to the log this block is about, not to any `install -m`. The
+    # extraction defines what gets eval'd two lines down, so selecting it by a
+    # bare verb substring meant a SECOND install statement added to this function
+    # would silently hand `head -1` the wrong line, and the mode assertion would
+    # then report a confusing failure about a file it never meant to check.
+    # (Comments cannot collide here: bash strips them at parse time, so
+    # `declare -f` prints from the parse tree.) The count check makes an
+    # ambiguous extraction loud instead of arbitrary.
+    gql_install_line="$(declare -f start_graphql_server | grep -E 'install -m [0-7]+ .*graphql-server\.log' | head -1)"
+    gql_install_n="$(declare -f start_graphql_server | grep -cE 'install -m [0-7]+ .*graphql-server\.log')"
+    if [ "$gql_install_n" -gt 1 ]; then
+        fail "start_graphql_server has ${gql_install_n} install(1) lines targeting .graphql-server.log — the extraction below would pick one arbitrarily; disambiguate rather than trusting head -1 (SEC-BE-003)"
+    fi
     if [ -z "$gql_install_line" ]; then
         fail "start_graphql_server no longer pre-creates its log with install(1) — a bare redirection lands at the caller's umask, so under umask 0 the log holding service output would be world-writable (SEC-BE-003)"
     else
