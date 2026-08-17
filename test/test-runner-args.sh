@@ -1943,6 +1943,46 @@ else
     fi
 fi
 
+echo ""
+echo "=== Relation-naming assertions actually compare the relation (TEST-023) ==="
+# An assertion whose ok/fail message claims one statement comes BEFORE another
+# must contain an operator that compares their two positions. Naming a relation
+# is not testing it, and this file's own history is the evidence: Test 22's
+# graphql-log block was headed `# ORDERING`, its ok message said the install
+# happens "between its install(1) and the redirect", and no operator in it
+# compared the two line numbers. Moving the install AFTER the redirect left the
+# suite at exit 0 while the log was created at the caller's umask -- the exact
+# SEC-BE-003 loss the block existed to prevent. Measured across 56 blind
+# reviews of that diff: 54 missed it, because a reader who sees a check named
+# ORDERING audits its details and not its premise. So it is checked here
+# mechanically rather than left to review.
+#
+# Scope is deliberately narrow: only positional claims, only in ok/fail message
+# text. It says nothing about ATOMIC/EXCLUSIVE or any other vacuous assertion.
+# Widening it means adding a word to the alternation, not new machinery.
+rel_bad=0
+rel_checked=0
+for rel_f in "$SCRIPT_DIR"/*.sh; do
+    while IFS=: read -r rel_ln _; do
+        [ -n "$rel_ln" ] || continue
+        rel_checked=$((rel_checked + 1))
+        # The compare must be within the enclosing block, not anywhere in the
+        # file: a 60-line lookback covers every such block in this tree and
+        # stops a distant unrelated compare from vouching for this assertion.
+        rel_lo=$((rel_ln > 60 ? rel_ln - 60 : 1))
+        if ! sed -n "${rel_lo},${rel_ln}p" "$rel_f" \
+             | grep -qE '\[ *"?\$\{?[A-Za-z_]*(_at|_line)\}?"? *-(lt|gt|le|ge) '; then
+            fail "$(basename "$rel_f"):${rel_ln} claims a positional relation but no operator compares two positions — the relation exists only in the message"
+            rel_bad=1
+        fi
+    done < <(grep -nE '^[[:space:]]*(ok|fail) "[^"]*( BEFORE | precedes | armed before |between its )' "$rel_f")
+done
+if [ "$rel_checked" -eq 0 ]; then
+    fail "found no positional-relation assertions to check — the matcher has rotted, fix it rather than deleting this case"
+elif [ "$rel_bad" -eq 0 ]; then
+    pass "all $rel_checked positional-relation assertions compare two positions"
+fi
+
 SUITE_COMPLETED=1
 
 echo ""
@@ -1998,7 +2038,11 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # suite while this file stayed at 129/0 exit 0. The trigger-shape check (SELF-2)
 # is net zero — it replaced the narrower paths/paths-ignore check rather than
 # adding to it.
-EXPECTED_ASSERTIONS=130
+# 130 -> 131. MEASURED. +1 for the TEST-023 relation-naming check, which emits
+# exactly one counted outcome on every path: one pass when every positional
+# claim compares two positions, one fail per offending assertion, and one fail
+# if the matcher finds nothing at all (so it cannot pass vacuously).
+EXPECTED_ASSERTIONS=131
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
