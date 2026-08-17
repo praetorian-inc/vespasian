@@ -579,10 +579,27 @@ BIND_SEAM_EXEMPT="forms-target grpc-server"
 # loop below iterates zero times, `unchecked` stays empty, and the exhaustiveness
 # check PASSES having verified nothing. Same shape as the sentinels the sibling
 # suites carry on every extraction (test-runner-args.sh:1763 is the model).
+# BIDIRECTIONAL, not just live. Checking `-z` alone catches an emptied or renamed
+# ALL_TARGETS but NOT a SHRUNK one: MUTATION-PROVEN, ALL_TARGETS="rest-api" printed
+# ok, iterated once, found it classified, and passed vacuously — the exhaustiveness
+# claim held over a list that had lost five of six targets. The loop below asks
+# "is every ALL_TARGETS member covered"; this asks the converse, "is every name we
+# rely on still IN ALL_TARGETS", which is the direction a shrink breaks. Same
+# two-directional shape as test-runner-args.sh's browser-classification check.
+ALL_TARGETS_EXPECTED="rest-api soap-service graphql-server grpc-server concat-spa forms-target"
+missing_from_all=""
+for t in $ALL_TARGETS_EXPECTED; do
+    case ",${ALL_TARGETS}," in
+        *",$t,"*) ;;
+        *) missing_from_all="$missing_from_all $t" ;;
+    esac
+done
 if [ -z "${ALL_TARGETS:-}" ]; then
     fail "ALL_TARGETS is empty or unset after sourcing setup-live-targets.sh — the exhaustiveness check below would pass having iterated nothing; fix the extraction rather than deleting the check"
+elif [ -n "$missing_from_all" ]; then
+    fail "target(s) dropped out of ALL_TARGETS:${missing_from_all} — the exhaustiveness loop below only checks that members ARE classified, so a shrunk list passes while the dropped targets lose every assertion that iterates it. If a target was deliberately retired, remove it from ALL_TARGETS_EXPECTED here and say why"
 else
-    ok "ALL_TARGETS extracted from setup-live-targets.sh (${ALL_TARGETS})"
+    ok "ALL_TARGETS still carries all $(set -- $ALL_TARGETS_EXPECTED; echo $#) expected targets (a shrunk list cannot pass the loop below vacuously)"
 fi
 unchecked=""
 for t in ${ALL_TARGETS//,/ }; do
@@ -1032,6 +1049,21 @@ if command -v stat >/dev/null 2>&1; then
         ( umask 0; eval "$gql_install_line" ) >/dev/null 2>&1
         logmode="$(stat -c '%a' "${STATE_DIR}/.graphql-server.log" 2>/dev/null)"
         assert_eq "$logmode" "600" "start_graphql_server's own install line creates .graphql-server.log at mode 600 under umask 0 — pinning the path too, so an install pointed at another file cannot satisfy this (SEC-BE-003)"
+
+        # ORDERING. The mode only holds if nothing between the install and the
+        # truncating redirect removes the file: `>` on an EXISTING file truncates
+        # and keeps its mode, but on a missing one it creates at the caller's
+        # umask. MUTATION-PROVEN: inserting `rm -f "$log"  # rotate` after the
+        # install left the assertion above green while the log went back to the
+        # ambient umask. Executing the install line proves mode and path; only
+        # inspecting the function body can prove nothing UNDOES it in between.
+        gql_body="$(declare -f start_graphql_server)"
+        gql_between="$(printf '%s\n' "$gql_body" | sed -n '/install -m/,/graphql-server\.log/p')"
+        if printf '%s\n' "$gql_between" | grep -qE '(rm|unlink|mv|truncate|:>)[[:space:]]'; then
+            fail "start_graphql_server removes or replaces .graphql-server.log between the install(1) that sets its 0600 mode and the redirect that writes it — the redirect then RE-CREATES the file at the caller's umask, so the mode is lost (SEC-BE-003)"
+        else
+            ok "nothing removes or replaces .graphql-server.log between its install(1) and the redirect, so the 0600 mode survives to the write (SEC-BE-003)"
+        fi
     fi
     rm -f "${STATE_DIR}/.graphql-server.log"
 else
@@ -1158,6 +1190,18 @@ else
     fail "main()'s write_config call is nested deeper than main()'s own statements (indent ${writecfg_indent} vs ${start_indent}) — it sits inside a conditional and may never run, so the ordering claim above is about a call that does not happen"
 fi
 
+# ── Skip-credit register (self-verifying; see the rationale below the pin) ──
+EXPECTED_SKIP_SITES=9
+EXPECTED_SKIP_CREDIT_TOTAL=19
+actual_skip_sites=$(grep -cE '^[[:space:]]*skip "' "$THIS_DIR/setup-live-targets_test.sh")
+actual_skip_total=$(grep -oE '^[[:space:]]*skip "[^"]*" [0-9]+' "$THIS_DIR/setup-live-targets_test.sh" \
+    | grep -oE '[0-9]+$' | awk '{s+=$1} END {print s+0}')
+if [ "$actual_skip_sites" -eq "$EXPECTED_SKIP_SITES" ] && [ "$actual_skip_total" -eq "$EXPECTED_SKIP_CREDIT_TOTAL" ]; then
+    ok "skip-credit register is current: ${actual_skip_sites} sites totalling ${actual_skip_total} credit"
+else
+    fail "skip-credit register drifted: found ${actual_skip_sites} skip sites totalling ${actual_skip_total} credit, expected ${EXPECTED_SKIP_SITES}/${EXPECTED_SKIP_CREDIT_TOTAL} — a skip was added, removed, or re-credited without updating this register (which is what makes the unconditional pin below trustworthy on a degraded host)"
+fi
+
 # ── Summary ─────────────────────────────────────────────────────────────────
 SUITE_COMPLETED=1
 echo ""
@@ -1182,11 +1226,20 @@ echo "────────────────────────�
 # the credits of the skip arms that actually fired, plus the observed
 # pass+fail, always total EXPECTED_ASSERTIONS. Each credit equals the number of
 # counted outcomes its guarded block would have emitted on a fully-equipped
-# host. All nine `skip "` sites in this file and their credits: 232 (python3,
-# 2), 284 (python3+lsof/ss, 2), 465 (cp-stage failure inside Test 16, 1), 493
-# (lsof+python3, 3), 514 (pgrep, 2), 557 (lsof-free PATH construction, 2), 890
-# (timeout/gtimeout+curl+python3, 1), 957 (timeout/gtimeout+dirname+sleep, 2),
-# 977 (stat, 3).
+# host.
+#
+# The register below USED to be a prose list of `skip "` sites with their line
+# numbers. It went stale in the same commit whose own comment warned that it had
+# gone stale once already — three of its nine line numbers were off by 27 after
+# an insertion above them, and one credit no longer matched its site. A record of
+# where the code is, written next to the code, is the same defect this suite
+# exists to catch: it DESCRIBES rather than EXERCISES, so nothing fails when it
+# drifts.
+#
+# So it is derived and asserted instead. The counts below are read out of this
+# file at runtime; if a skip site is added, removed, or has its credit changed
+# without updating these two numbers, the assertion fails and names the delta.
+# Line numbers are deliberately absent — they are what rots.
 #
 # 80 = 74 (round-15 baseline) + 2 (C1: the two Test 18b structural pins
 # restored, D2 — both layers, source pin and Go behavioural test, are kept
@@ -1208,7 +1261,13 @@ echo "────────────────────────�
 # defeated the pair by keeping the literal and retargeting the path. The
 # replacement is ONE assertion that executes the production install line and
 # stats the real filename, pinning mode and path together.
-EXPECTED_ASSERTIONS=82
+# ROUND-16 final: 82 -> 84. MEASURED. +1 for the ordering check (nothing may
+# remove .graphql-server.log between its install(1) and the redirect, which a
+# `rm -f  # rotate` mutation proved was unguarded). +1 for the self-verifying
+# skip-credit register, which replaced a prose list of line numbers that had
+# already gone stale twice. The ALL_TARGETS bidirectional check is net zero — it
+# replaced the liveness-only sentinel rather than adding to it.
+EXPECTED_ASSERTIONS=84
 if [ "$((PASS + FAIL + SKIP_CREDIT))" -ne "${EXPECTED_ASSERTIONS}" ]; then
     echo "setup-live-targets_test: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (Passed+Failed+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A Test block was added or removed without updating EXPECTED_ASSERTIONS."
