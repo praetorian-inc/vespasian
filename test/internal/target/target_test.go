@@ -85,6 +85,46 @@ func TestReadHeaderTimeoutConstantIsSane(t *testing.T) {
 	}
 }
 
+// The three companion bounds get the same treatment ReadHeaderTimeout already
+// had, and for the reason this suite exists: a control nothing exercises is a
+// control that can be deleted silently. MUTATION-PROVEN: before this test,
+// removing `ReadTimeout: ReadTimeout` from Server() left `go test` fully green.
+func TestServerAppliesCompanionTimeouts(t *testing.T) {
+	srv := Server("127.0.0.1:0", http.NewServeMux())
+	for _, c := range []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{"ReadTimeout", srv.ReadTimeout, ReadTimeout},
+		{"WriteTimeout", srv.WriteTimeout, WriteTimeout},
+		{"IdleTimeout", srv.IdleTimeout, IdleTimeout},
+	} {
+		if c.got <= 0 {
+			t.Fatalf("Server().%s = %v, want a positive duration — an unbounded body read, response write or idle hold is reachable once LIVE_TARGET_BIND_HOST widens the bind off loopback", c.name, c.got)
+		}
+		if c.got != c.want {
+			t.Fatalf("Server().%s = %v, want the shared constant %v — a target that hardcodes its own value has drifted from the one the other three share", c.name, c.got, c.want)
+		}
+	}
+}
+
+// Sanity-bound the constants themselves, mirroring TestReadHeaderTimeoutConstantIsSane:
+// a "timeout" of an hour bounds nothing an attacker cares about.
+func TestCompanionTimeoutConstantsAreSane(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		d    time.Duration
+	}{{"ReadTimeout", ReadTimeout}, {"WriteTimeout", WriteTimeout}, {"IdleTimeout", IdleTimeout}} {
+		if c.d <= 0 {
+			t.Fatalf("%s = %v, want a positive duration", c.name, c.d)
+		}
+		if c.d > 5*time.Minute {
+			t.Fatalf("%s = %v, want at most five minutes — a bound this long does not meaningfully cap a slow client", c.name, c.d)
+		}
+	}
+}
+
 func TestServerCarriesAddrAndHandler(t *testing.T) {
 	mux := http.NewServeMux()
 	srv := Server("127.0.0.1:8081", mux)
