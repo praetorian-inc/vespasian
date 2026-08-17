@@ -1049,11 +1049,17 @@ if command -v stat >/dev/null 2>&1; then
     # then report a confusing failure about a file it never meant to check.
     # (Comments cannot collide here: bash strips them at parse time, so
     # `declare -f` prints from the parse tree.) The count check makes an
-    # ambiguous extraction loud instead of arbitrary.
+    # ambiguous extraction loud AND inert, rather than arbitrary.
     gql_install_line="$(declare -f start_graphql_server | grep -E 'install -m [0-7]+ .*graphql-server\.log' | head -1)"
     gql_install_n="$(declare -f start_graphql_server | grep -cE 'install -m [0-7]+ .*graphql-server\.log')"
     if [ "$gql_install_n" -gt 1 ]; then
+        # Blank the extraction too. fail() only increments a counter and returns,
+        # so without this the block fell through and eval'd head -1's arbitrary
+        # pick anyway — loud AND arbitrary, while the comment claimed otherwise.
+        # Empty routes control to the [ -z ] arm below, which reports the
+        # extraction failure instead of acting on a coin-flip.
         fail "start_graphql_server has ${gql_install_n} install(1) lines targeting .graphql-server.log — the extraction below would pick one arbitrarily; disambiguate rather than trusting head -1 (SEC-BE-003)"
+        gql_install_line=""
     fi
     if [ -z "$gql_install_line" ]; then
         fail "start_graphql_server no longer pre-creates its log with install(1) — a bare redirection lands at the caller's umask, so under umask 0 the log holding service output would be world-writable (SEC-BE-003)"

@@ -38,7 +38,12 @@ RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/.results}"
 # read-only selector with no privilege boundary (unlike install-chrome.sh's
 # VESPASIAN_TEST_ROOT, which gates privileged writes and IS namespaced), and
 # test-runner-args.sh pins this name to exercise the binary-absent arm.
-if [ -n "${VESPASIAN:-}" ]; then VESPASIAN_FROM_ENV=1; fi
+# Derived into a name the environment cannot pre-set: an inherited
+# VESPASIAN_FROM_ENV fired the notice below with VESPASIAN UNSET, printing the
+# default path on both sides of "not". `local` is unavailable at file scope, so
+# the flag is cleared first and only then set — an inherited value cannot survive.
+_vespasian_from_env=""
+if [ -n "${VESPASIAN:-}" ]; then _vespasian_from_env="${VESPASIAN}"; fi
 VESPASIAN="${VESPASIAN:-${PROJECT_ROOT}/bin/vespasian}"
 
 # Hostname the test harness uses to reach the target services. Defaults to
@@ -176,8 +181,8 @@ source "${SCRIPT_DIR}/common.sh"
 # Announced HERE, not at the VESPASIAN default above: common.sh (which defines
 # log_warn) is not sourced until this line, so the notice cannot be emitted
 # earlier without calling an undefined function.
-if [ -n "${VESPASIAN_FROM_ENV:-}" ]; then
-    log_warn "VESPASIAN was set in the environment (${VESPASIAN}) — every crawl/generate in this run uses THAT binary, not ${PROJECT_ROOT}/bin/vespasian."
+if [ -n "$_vespasian_from_env" ]; then
+    log_warn "VESPASIAN was set in the environment (${_vespasian_from_env}) — every crawl/generate in this run uses THAT binary, not ${PROJECT_ROOT}/bin/vespasian."
 fi
 # shellcheck source=validate.sh
 source "${SCRIPT_DIR}/validate.sh"
