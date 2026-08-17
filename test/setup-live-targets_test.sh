@@ -1010,21 +1010,32 @@ if command -v stat >/dev/null 2>&1; then
     # start_graphql_server is not called here (it would launch node); the
     # `install -m 0600 /dev/null` line it runs is driven directly, which is the
     # whole of the mode behaviour being pinned.
+    # ROUND-16, corrected after a mutation defeated the first attempt. The first
+    # version ran `install -m 0600` ITSELF and asserted the result -- a tautology
+    # testing install(1), not the production code -- and separately grepped
+    # start_graphql_server for the literal `install -m 0600 /dev/null`.
+    # MUTATION-PROVEN defeat: keeping that exact literal but pointing it at a
+    # DIFFERENT file (`.decoy.log`) satisfied the grep while the real log went
+    # back to being created by the bare redirection at the caller's umask. Both
+    # halves passed. That is the "assertion names the control" shape this suite
+    # exists to catch, reproduced in the assertion meant to close it.
+    #
+    # The fix executes the PRODUCTION line rather than imitating it: extract the
+    # install command from the live function body and run it under umask 0, then
+    # stat the real filename. Mode AND target path are then both pinned, because
+    # a line pointing elsewhere leaves .graphql-server.log absent.
     rm -f "${STATE_DIR}/.graphql-server.log"
-    ( umask 0; install -m 0600 /dev/null "${STATE_DIR}/.graphql-server.log" )
-    logmode="$(stat -c '%a' "${STATE_DIR}/.graphql-server.log" 2>/dev/null)"
-    assert_eq "$logmode" "600" "graphql server log lands at mode 600 even under umask 0 (SEC-BE-003)"
-    # And pin that start_graphql_server still CREATES it that way, so replacing
-    # the install(1) with a bare redirection -- which lands at the caller's umask
-    # -- is a failure here rather than a silent widening.
-    if printf '%s' "$(declare -f start_graphql_server)" | grep -qF 'install -m 0600 /dev/null'; then
-        ok "start_graphql_server pre-creates its log with an explicit 0600 mode (not a bare redirection at the caller's umask)"
+    gql_install_line="$(declare -f start_graphql_server | grep -F 'install -m' | head -1)"
+    if [ -z "$gql_install_line" ]; then
+        fail "start_graphql_server no longer pre-creates its log with install(1) — a bare redirection lands at the caller's umask, so under umask 0 the log holding service output would be world-writable (SEC-BE-003)"
     else
-        fail "start_graphql_server no longer pre-creates .graphql-server.log with 'install -m 0600' — a bare redirection lands at the caller's umask, so under umask 0 the log holding service output would be world-writable (SEC-BE-003)"
+        ( umask 0; eval "$gql_install_line" ) >/dev/null 2>&1
+        logmode="$(stat -c '%a' "${STATE_DIR}/.graphql-server.log" 2>/dev/null)"
+        assert_eq "$logmode" "600" "start_graphql_server's own install line creates .graphql-server.log at mode 600 under umask 0 — pinning the path too, so an install pointed at another file cannot satisfy this (SEC-BE-003)"
     fi
     rm -f "${STATE_DIR}/.graphql-server.log"
 else
-    skip "stat required" 5
+    skip "stat required" 4
 fi
 
 # ── Test 23: teardown_on_failure EXIT trap tears down a failed partial setup ─
@@ -1190,8 +1201,14 @@ echo "────────────────────────�
 # assertion at all, unlike its record_pid sibling which was hardened AND pinned
 # in the same change. +1 for the ALL_TARGETS non-empty fidelity sentinel, without
 # which the exhaustiveness loop below it passes having iterated nothing.
-# The Test 22 skip credit moves 3 -> 5 to match.
-EXPECTED_ASSERTIONS=83
+# The Test 22 skip credit moves 3 -> 4 to match.
+#
+# 83 -> 82 after the graphql assertion was CORRECTED: the first version used two
+# assertions (a tautological install(1) run, plus a literal grep) and a mutation
+# defeated the pair by keeping the literal and retargeting the path. The
+# replacement is ONE assertion that executes the production install line and
+# stats the real filename, pinning mode and path together.
+EXPECTED_ASSERTIONS=82
 if [ "$((PASS + FAIL + SKIP_CREDIT))" -ne "${EXPECTED_ASSERTIONS}" ]; then
     echo "setup-live-targets_test: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (Passed+Failed+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A Test block was added or removed without updating EXPECTED_ASSERTIONS."
