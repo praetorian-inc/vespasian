@@ -536,7 +536,21 @@ fi
 # has to become exactly one logical line before it can be counted.
 script_body_f5_joined=$(grep -vE '^[[:space:]]*#' "${INSTALL_SCRIPT}" \
     | awk '{ if (sub(/\\$/, "")) { printf "%s ", $0; next } else { print } }')
-aptget_call_re='^[[:space:]]*(if ! )?(\$SUDO[[:space:]]+)?(timeout[[:space:]][^"]*)?apt-get[[:space:]]+(update|install)[[:space:]]'
+# SELF-4: the prefix set is a CHAIN of command words, not a fixed `$SUDO?timeout?`.
+# The predecessor required the literal `$SUDO`, so three behaviourally identical
+# forms evaded it and measured GREEN with an unbounded call present:
+#   sudo apt-get install …          (literal sudo; identical on the unprivileged path)
+#   cd /tmp && apt-get install …    (after a && separator)
+#   env FOO=1 apt-get install …     (env-prefixed)
+# Anchoring on "line start OR a command separator, then any chain of prefix words"
+# is complete for command position in a way an enumeration of two prefixes is not.
+#
+# It must still refuse a match INSIDE a string: require_tools()'s help text
+# (`log_info "Install them first: apt-get install -y …"`) contains the words but
+# not in command position, and a free `.*` before apt-get would turn this red on
+# correct code. Verified against the real script: exactly 2 matches, 0 of them the
+# help string; and each of the three evasions above raises the count to 3.
+aptget_call_re='(^|[;&|][[:space:]]*)[[:space:]]*(if[[:space:]]+!:?[[:space:]]+)?([[:space:]]*(\$SUDO|sudo|env|timeout|nice|ionice)[[:space:]]+([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+|-[^[:space:]]+[[:space:]]+|[0-9]+[[:space:]]+)*)*apt-get[[:space:]]+(update|install)[[:space:]]'
 f5_aptget_lines=$(printf '%s\n' "${script_body_f5_joined}" \
     | grep -cE "$aptget_call_re" || true)
 f5_aptget_bounded=$(printf '%s\n' "${script_body_f5_joined}" \
@@ -3122,12 +3136,15 @@ if [ -n "${bp_tmo}" ]; then
     # distinguish a correctly-rejected value from the 15s outer net, so elapsed
     # time is the assertion for the hang case.
     bp3_start=$(date +%s)
-    out_bp3_zero=$("${bp_tmo}" 15 bash -c '
+    # stdout is discarded rather than captured: the assertion for the hang case is
+    # ELAPSED TIME (see above), so binding the output to a variable only produced an
+    # unused one. rc is likewise not the assertion here.
+    "${bp_tmo}" 15 bash -c '
         # shellcheck source=install-chrome.sh
         source "$1"
         CHROME_PROBE_TIMEOUT=0
         _bounded_probe "$2"
-    ' _ "${INSTALL_SCRIPT}" "${bp_dir}/chrome-hang" 2>/dev/null) || true
+    ' _ "${INSTALL_SCRIPT}" "${bp_dir}/chrome-hang" >/dev/null 2>&1 || true
     bp3_elapsed=$(( $(date +%s) - bp3_start ))
     assert_eq "case bp: CHROME_PROBE_TIMEOUT=0 is rejected — a hanging --version is still cut off near the validated 2s default rather than left unbounded (SEC-BE-002)" \
         "under-outer-bound" "$([ "${bp3_elapsed}" -lt 10 ] && echo "under-outer-bound" || echo "HUNG ${bp3_elapsed}s — SEC-BE-002 validation is gone")"

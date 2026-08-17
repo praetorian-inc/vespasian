@@ -662,18 +662,35 @@ else
     # a /* */ block comment could satisfy it undetected, but collapse_code
     # strips block comments in the very commit that theory rested on, so the
     # pin is sound again as a fixed-string whole-structure match.
-    if printf '%s' "${shared_code}" | grep -qF 'host := os.Getenv("BIND_HOST") if host == "" { host = "127.0.0.1" } return net.JoinHostPort(host, port)'; then
-        ok "shared target.Addr still defaults to loopback when BIND_HOST is unset (SEC-BE-015)"
+    # SELF-5: ANCHORED, not containment. `grep -qF` asks only whether the text
+    # appears SOMEWHERE — so a new code path prepended AHEAD of the pinned block
+    # leaves it matching. MUTATION-PROVEN: adding
+    #   if os.Getenv("BIND_ALL") != "" { return net.JoinHostPort("0.0.0.0", port) }
+    # at the top of Addr left BOTH this suite AND `go test` green, because the
+    # pinned text is still present and no Go test sets BIND_ALL. Matching the
+    # whole function body — from `func Addr` to its closing return — is what makes
+    # the comment's "whole-structure match" claim actually true.
+    if printf '%s' "${shared_code}" | grep -qF 'func Addr(port string) string { host := os.Getenv("BIND_HOST") if host == "" { host = "127.0.0.1" } return net.JoinHostPort(host, port) }'; then
+        ok "shared target.Addr's whole body is the loopback default (no other code path can reach the bind) (SEC-BE-015)"
     else
-        fail "shared target.Addr no longer defaults to loopback when BIND_HOST is unset — these targets are unauthenticated, so a wildcard default exposes them to the local network for the lifetime of a test run (SEC-BE-015)"
+        fail "shared target.Addr's body is no longer exactly the loopback-default structure — either the default changed, or another code path was added that can return a different host before it. These targets are unauthenticated, so a wildcard bind exposes them to the local network for the lifetime of a test run (SEC-BE-015)"
     fi
 
-    # The quantifier is [1-9][0-9]*, not [0-9]+: the predecessor of this pin
-    # used [0-9]+, which matches the literal `0` it claimed to forbid.
-    if printf '%s' "${shared_code}" | grep -qE 'ReadHeaderTimeout = [1-9][0-9]* \* time\.Second'; then
-        ok "shared target server still applies a non-zero ReadHeaderTimeout (SEC-BE-007)"
+    # TWO conditions, deliberately. The quantifier is [1-9][0-9]*, not [0-9]+:
+    # the round-13 predecessor used [0-9]+, which matches the literal `0` it
+    # claimed to forbid.
+    #
+    # SELF-3: the second condition is NOT optional and was wrongly dropped when
+    # this pin was restored. The first proves the CONSTANT is declared non-zero;
+    # only the second proves Server() still APPLIES it. MUTATION-PROVEN: deleting
+    # `ReadHeaderTimeout: ReadHeaderTimeout,` from the Server struct left this
+    # suite green with the constant check alone. The round-13 pin had both; the
+    # restoration kept one. Do not drop it again.
+    if printf '%s' "${shared_code}" | grep -qE 'ReadHeaderTimeout = [1-9][0-9]* \* time\.Second' \
+       && printf '%s' "${shared_code}" | grep -qF 'ReadHeaderTimeout: ReadHeaderTimeout'; then
+        ok "shared target server declares a non-zero ReadHeaderTimeout AND applies it in Server() (SEC-BE-007)"
     else
-        fail "shared target server's ReadHeaderTimeout is zero or gone — an unbounded header read is a slow-loris against a developer machine or CI runner once LIVE_TARGET_BIND_HOST widens the bind (SEC-BE-007)"
+        fail "shared target server's ReadHeaderTimeout is zero, gone, or no longer applied by Server() — an unbounded header read is a slow-loris against a developer machine or CI runner once LIVE_TARGET_BIND_HOST widens the bind (SEC-BE-007)"
     fi
 fi
 

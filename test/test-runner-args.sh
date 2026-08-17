@@ -1198,7 +1198,25 @@ yq_query() {
         if command -v yq >/dev/null 2>&1; then _YQ_OK=1; else _YQ_OK=0; fi
     fi
     if [[ "$_YQ_OK" != 1 ]]; then printf '%s\n' '__NO_YQ__'; return 0; fi
-    yq "$1" "$WORKFLOW"
+    local expr=$1; shift
+    # SELF-3: distinguish a yq FAILURE from a legitimate empty/false answer. yq
+    # exits non-zero with empty stdout on unparseable YAML; without this, a
+    # corrupted live-tests.yml aborted the suite mid-run under `set -e` and was
+    # caught only by the whole-suite completion sentinel — fail-closed, but the
+    # diagnostic named the wrong defect and the run never reached its assertion
+    # count, so the accounting pin could not tell a broken workflow from deleted
+    # assertions. A third sentinel makes it a counted, correctly-named failure.
+    local out
+    if ! out=$(yq "$@" "$expr" "$WORKFLOW" 2>/dev/null); then
+        printf '%s\n' '__YQ_ERROR__'
+        return 0
+    fi
+    printf '%s\n' "$out"
+}
+
+# One wording, one place, for the parse-error arm — same reasoning as fail_no_yq.
+fail_yq_error() {
+    fail "$1 could not be verified: yq could not parse ${WORKFLOW} (it exits non-zero with empty output on malformed YAML). The workflow is broken, or the query no longer matches its structure — fix the workflow rather than deleting this assertion."
 }
 
 # One wording, one place, so it cannot drift across call sites.
@@ -1256,6 +1274,7 @@ else
     # `pull_request:` trigger left this suite at 117/0, exit 0.
     case "$(yq_query '.on | has("pull_request")')" in
         __NO_YQ__) fail_no_yq "live-tests.yml's pull_request trigger" ;;
+        __YQ_ERROR__) fail_yq_error "live-tests.yml's pull_request trigger" ;;
         true)      pass "live-tests.yml still triggers on pull_request (the un-gated guard suites only run on PRs because of this)" ;;
         *)         fail "live-tests.yml no longer triggers on pull_request — the un-gated guard suites (preflight-selftest, validator-regression) would never run on a PR" ;;
     esac
@@ -1265,10 +1284,48 @@ else
     # only test/*.sh or the workflow itself, which is every PR they exist to
     # police (ci.yml already carries exactly such a filter, so this is not
     # hypothetical). Two properties with different remedies get two messages.
-    case "$(yq_query '(.on.pull_request // {}) | has("paths") or has("paths-ignore")')" in
-        __NO_YQ__) fail_no_yq "live-tests.yml's pull_request path filter" ;;
-        false)     pass "live-tests.yml's pull_request trigger carries no paths/paths-ignore filter (a shell-only PR still runs the guard suites)" ;;
-        *)         fail "live-tests.yml's pull_request trigger now carries a paths/paths-ignore filter — a PR touching only test/*.sh or the workflow itself would run none of the four guard suites, which is every PR they exist to police" ;;
+    # SELF-2: pin the trigger's WHOLE SHAPE, not an enumeration of known-bad keys.
+    #
+    # The predecessor of this check asked `has("paths") or has("paths-ignore")`.
+    # That was the same mistake one level down: `types:` and `branches:` narrow a
+    # trigger just as completely, and neither was enumerated. MUTATION-PROVEN:
+    # `types: [opened, synchronize, ...]` -> `types: [labeled]` left this suite at
+    # 129/0 exit 0 while no ordinary PR push would run a single guard suite.
+    #
+    # Enumerating keys can only ever be as complete as the enumeration. Comparing
+    # the whole block to an expected value is complete by construction: any added,
+    # removed or altered key is a mismatch. sort_keys makes it order-independent so
+    # a benign reformat cannot trip it.
+    #
+    # If you INTENTIONALLY change the trigger, update EXPECTED_PR_TRIGGER below and
+    # say why in the commit — that edit is exactly the review moment this pin exists
+    # to force.
+    EXPECTED_PR_TRIGGER='{"branches":["main"],"types":["opened","synchronize","reopened","labeled","unlabeled"]}'
+    actual_pr_trigger="$(yq_query '.on.pull_request | sort_keys(..)' -o=json -I=0)"
+    case "$actual_pr_trigger" in
+        __NO_YQ__) fail_no_yq "live-tests.yml's pull_request trigger shape" ;;
+        __YQ_ERROR__) fail_yq_error "live-tests.yml's pull_request trigger shape" ;;
+        "$EXPECTED_PR_TRIGGER")
+            pass "live-tests.yml's pull_request trigger is unnarrowed (no paths/paths-ignore/types/branches filter that would stop a shell-only PR running the guard suites)" ;;
+        *)  fail "live-tests.yml's pull_request trigger shape changed: expected ${EXPECTED_PR_TRIGGER}, got ${actual_pr_trigger} — a paths/paths-ignore/types/branches narrowing switches off every un-gated guard suite for the PRs they exist to police; if the change is deliberate, update EXPECTED_PR_TRIGGER" ;;
+    esac
+
+    # SELF-1: the test job's OWN gate. The per-step if: check further below asks
+    # whether the two suite-running STEPS are gated; it cannot see a gate on the
+    # JOB that contains them, which is strictly more powerful. MUTATION-PROVEN:
+    # replacing this job's condition with `if: false` left this suite at 129/0
+    # exit 0 while the entire live suite — offline group, live group, every
+    # rod-backed target — stopped running.
+    #
+    # Asserting the VALUE, not absence: this job legitimately HAS an if:, so
+    # `has("if")` would fail immediately and is the wrong question.
+    EXPECTED_TEST_JOB_IF="needs.check-label.outputs.should-run == 'true'"
+    case "$(yq_query '.jobs.test.if // "__ABSENT__"')" in
+        __NO_YQ__) fail_no_yq "the test job's gate condition" ;;
+        __YQ_ERROR__) fail_yq_error "the test job's gate condition" ;;
+        "$EXPECTED_TEST_JOB_IF")
+            pass "the test job's gate is still the check-label condition (the whole live suite cannot be switched off by retargeting it)" ;;
+        *)  fail "the test job's gate condition is no longer ${EXPECTED_TEST_JOB_IF} — retargeting or falsifying it stops the ENTIRE live suite while CI stays green; if the change is deliberate, update EXPECTED_TEST_JOB_IF" ;;
     esac
 
     # TEST-014: the checks in the loop below apply to preflight-selftest AND
@@ -1344,6 +1401,7 @@ else
             # ask the parser instead (D1's second bound assertion).
             case "$(yq_query ".jobs[\"${job}\"] | has(\"needs\")")" in
                 __NO_YQ__) fail_no_yq "${job}'s needs: dependencies" ;;
+                __YQ_ERROR__) fail_yq_error "${job}'s needs: dependencies" ;;
                 false)     pass "${job} has no needs: dependency (stays un-gated)" ;;
                 *)         fail "${job} now has a needs: dependency — this job is deliberately un-gated (see its header comment); a needs: on check-label, or on anything check-label gates, would put every un-gated guard suite behind the skip-live-tests label" ;;
             esac
@@ -1934,7 +1992,13 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # rather than by their name, widening the exec-bit derivation, matching suites
 # by repo-relative path, and collapsing the double-fail at the browser-target
 # classification arm to one counted outcome.
-EXPECTED_ASSERTIONS=129
+# Adversarial self-review: 129 -> 130. MEASURED. +1 for the test job's own gate
+# check (SELF-1): the per-step if: check could not see a JOB-level gate, and
+# replacing the test job's condition with `if: false` stopped the entire live
+# suite while this file stayed at 129/0 exit 0. The trigger-shape check (SELF-2)
+# is net zero — it replaced the narrower paths/paths-ignore check rather than
+# adding to it.
+EXPECTED_ASSERTIONS=130
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
