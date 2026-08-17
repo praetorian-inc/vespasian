@@ -1966,16 +1966,30 @@ for rel_f in "$SCRIPT_DIR"/*.sh; do
     while IFS=: read -r rel_ln _; do
         [ -n "$rel_ln" ] || continue
         rel_checked=$((rel_checked + 1))
-        # The compare must be within the enclosing block, not anywhere in the
-        # file: a 60-line lookback covers every such block in this tree and
-        # stops a distant unrelated compare from vouching for this assertion.
-        rel_lo=$((rel_ln > 60 ? rel_ln - 60 : 1))
+        # The compare must belong to THIS assertion, so the search window is the
+        # assertion's own governing conditional chain: walk back to the nearest
+        # enclosing `if`, and look only there.
+        #
+        # The first version of this check used a flat 60-line lookback, which was
+        # the very defect it exists to catch. MUTATION-PROVEN: deleting the
+        # `[ "${trap_at}" -lt "${firststart_at}" ]` conjunct from the trap
+        # assertion left this check GREEN, because a SIBLING assertion's compare
+        # five lines earlier sat inside the window and vouched for it. "A compare
+        # exists nearby" is not "this claim is tested" — the same substitution the
+        # sed-range ORDERING bug made, reproduced in its replacement.
+        rel_floor=$((rel_ln > 60 ? rel_ln - 60 : 1))
+        rel_lo=$(awk -v n="$rel_ln" -v floor="$rel_floor" \
+                     'NR>=floor && NR<n && /^[[:space:]]*if[[:space:]]/ {l=NR} END{print (l?l:floor)}' "$rel_f")
         if ! sed -n "${rel_lo},${rel_ln}p" "$rel_f" \
              | grep -qE '\[ *"?\$\{?[A-Za-z_]*(_at|_line)\}?"? *-(lt|gt|le|ge) '; then
-            fail "$(basename "$rel_f"):${rel_ln} claims a positional relation but no operator compares two positions — the relation exists only in the message"
+            fail "$(basename "$rel_f"):${rel_ln} claims a positional relation but its own conditional (from line ${rel_lo}) contains no operator comparing two positions — the relation exists only in the message"
             rel_bad=1
         fi
-    done < <(grep -nE '^[[:space:]]*(ok|fail) "[^"]*( BEFORE | precedes | armed before |between its )' "$rel_f")
+        # BOTH directions: an assertion claiming X comes AFTER Y makes exactly the
+        # same kind of claim as one claiming X comes BEFORE Y, and the original
+        # alternation matched only the BEFORE phrasings. Three live assertions in
+        # setup-live-targets_test.sh say AFTER and went unchecked.
+    done < <(grep -nE '^[[:space:]]*(ok|fail) "[^"]*( BEFORE | AFTER | precedes | armed before | armed after |positioned AFTER|between its )' "$rel_f")
 done
 if [ "$rel_checked" -eq 0 ]; then
     fail "found no positional-relation assertions to check — the matcher has rotted, fix it rather than deleting this case"
