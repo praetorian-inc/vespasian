@@ -444,8 +444,11 @@ service_default_port() {
 # of the user's node processes onto which the recorded PID may have been recycled.
 # For it we additionally require the PID to be listening in the service's port
 # window, reusing the same node-in-window identity filter as the orphan sweep
-# (orphan_pids_by_port). If that check cannot run (e.g. lsof unavailable) we
-# decline the match rather than kill an unverified node process.
+# (orphan_pids_by_port). If that check CANNOT RUN (lsof unavailable) we accept the
+# match on provenance instead — see the SEC-BE-008 note at the port check below.
+# This comment previously said the opposite ("we decline the match"), describing
+# the behaviour from before SEC-BE-008 and telling the next auditor the guard was
+# closed when the code had deliberately opened it.
 pid_matches_service() {
     local pid=$1 name=$2 comm binary base wpid
     comm="$(ps -p "$pid" -o comm= 2>/dev/null)"
@@ -484,9 +487,22 @@ pid_matches_service() {
     # --sweep, where the candidate PID was discovered rather than recorded. When
     # the PID came from our own pid log the provenance is already established, so
     # the port check is corroboration, not the basis — and falling back to
-    # "node with the right name in our log" is correct rather than lax. A sweep
-    # cannot reach here with an unverifiable PID: sweep_orphans obtains its
-    # candidates FROM orphan_pids_by_port, which returns nothing when it cannot look.
+    # "node with the right name in our log" is correct rather than lax.
+    #
+    # Provenance is guaranteed by the call sites, not by sweep_orphans: BOTH
+    # callers (stop_service, cleanup_stale_state) read their PIDs from
+    # `recorded_pids`, i.e. our own pid log. sweep_orphans never calls this
+    # function at all — it filters candidates through orphan_pids_by_name /
+    # orphan_pids_by_port directly — so a discovered PID cannot reach here.
+    # (An earlier version of this comment justified the fallback by claiming
+    # sweep_orphans routed through here; it does not, and the real guarantee
+    # is the stronger one above.)
+    #
+    # Residual, accepted: on an lsof-less host a recorded PID recycled onto an
+    # unrelated `node` process would be signalled. That is strictly better than
+    # the alternative it replaced, which left a live graphql-server holding its
+    # port on EVERY lsof-less host while clearing the pid record and reporting
+    # success.
     local port_pids port_rc
     port_pids="$(orphan_pids_by_port "$base")"
     port_rc=$?
