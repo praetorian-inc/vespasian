@@ -126,6 +126,9 @@ SUITE_COMPLETED=0
 # checked against the source rather than believed:
 #
 #   line 235   a2    = 1    not inside a git work tree
+#   line 665   f2    = 4    gpg absent (real, unstubbed gpg -- unlike f2b's
+#                                        own stubbed gpg, which needs no gate)
+#   line 804   f4    = 3    gpg absent, same reason as f2
 #   line 1198  j/j2  = 14   key fixture missing or empty
 #   line 1200  j/j2  = 14   gpg absent  (mutually exclusive with the above,
 #                                        so j/j2 contributes 14, never 28)
@@ -134,7 +137,7 @@ SUITE_COMPLETED=0
 #   line 2981  y     = 3    needs the same key fixture / gpg as j/j2
 #   line 3057  bp    = 4    no timeout/gtimeout on PATH
 #
-# Maximum skip_credit on a maximally-degraded host: 1+14+3+12+3+4 = 37.
+# Maximum skip_credit on a maximally-degraded host: 1+4+3+14+3+12+3+4 = 44.
 # EXPECTED_ASSERTIONS below is 238, MEASURED on a fully-equipped host in this
 # round (pass+fail+skip_credit with every arm live).
 #
@@ -364,6 +367,22 @@ fpr=$(
 )
 assert_eq "case e: pinned signing-key fingerprint constant is unchanged" \
     "EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796" "${fpr}"
+
+# f2 and f4 below drive install_pinned_key's REAL gpg --import/--fingerprint
+# calls against a real (committed, but non-Google) fixture key -- unlike f2b,
+# which stubs its own gpg on PATH and so needs no real binary at all. Without
+# this gate, an absent gpg makes --import fail as "command not found" before
+# ever reaching the fingerprint comparison, and the assertions that check for
+# "fingerprint mismatch" text fail while blaming the pin for what is actually
+# a missing tool (f0/f1/f2b are unaffected: f0 never calls gpg at all, f1's
+# "not a valid PGP key" message happens to match either failure reason, and
+# f2b's gpg is its own stub). Local to this section rather than reusing case
+# j/j2's `have_gpg` below (line ~1117): that variable is not computed until
+# AFTER this section runs.
+HAS_GPG=true
+if ! command -v gpg >/dev/null 2>&1; then
+    HAS_GPG=false
+fi
 
 # ── Case f: install_pinned_key REFUSES an unexpected key ───────
 # The behavioural test for the trust anchor. install_pinned_key fetches the key
@@ -630,19 +649,23 @@ assert_contains "case f: non-PGP key body is diagnosed" \
 # actually pin the control are the two message checks below plus the negative
 # "did not accept" check: a mutated build emits the ACCEPTANCE message for a key
 # it should have refused, and that is what fails.
-# shellcheck disable=SC2031  # SCRIPT_DIR is read, not modified; false positive here
-res_f2=$(run_install_pinned_key "cat '${SCRIPT_DIR}/fixtures/not-google-signing-key.asc' > \"\$out\"")
-assert_eq "case f: a valid but unexpected key does not succeed (rc 1)" "1" "$(echo "${res_f2}" | sed -n '1p')"
-assert_contains "case f: unexpected key is diagnosed as a fingerprint mismatch" \
-    "fingerprint mismatch" "${res_f2}"
-assert_contains "case f: the rejection reports the fingerprint actually seen" \
-    "790BC7277767219C42C86F933B4FE6ACC0B21F32" "${res_f2}"
-if printf '%s' "${res_f2}" | grep -q "matches pinned fingerprint"; then
-    echo "FAIL: case f: an unexpected key was ACCEPTED (pin is not gating)"
-    fail_count=$((fail_count + 1))
+if [ "${HAS_GPG}" = true ]; then
+    # shellcheck disable=SC2031  # SCRIPT_DIR is read, not modified; false positive here
+    res_f2=$(run_install_pinned_key "cat '${SCRIPT_DIR}/fixtures/not-google-signing-key.asc' > \"\$out\"")
+    assert_eq "case f: a valid but unexpected key does not succeed (rc 1)" "1" "$(echo "${res_f2}" | sed -n '1p')"
+    assert_contains "case f: unexpected key is diagnosed as a fingerprint mismatch" \
+        "fingerprint mismatch" "${res_f2}"
+    assert_contains "case f: the rejection reports the fingerprint actually seen" \
+        "790BC7277767219C42C86F933B4FE6ACC0B21F32" "${res_f2}"
+    if printf '%s' "${res_f2}" | grep -q "matches pinned fingerprint"; then
+        echo "FAIL: case f: an unexpected key was ACCEPTED (pin is not gating)"
+        fail_count=$((fail_count + 1))
+    else
+        echo "PASS: case f: an unexpected key is never reported as matching the pin"
+        pass_count=$((pass_count + 1))
+    fi
 else
-    echo "PASS: case f: an unexpected key is never reported as matching the pin"
-    pass_count=$((pass_count + 1))
+    skip "case f2: fingerprint-mismatch diagnosis for an unexpected real key (gpg not found on PATH)" 4
 fi
 
 # f2b (TEST-001): a near-miss primary key -- one whose fingerprint shares
@@ -725,16 +748,17 @@ fi
 # is emptied and a passthrough sudo is supplied so main() reaches the ordered
 # pair unprivileged; the curl stub serves the wrong key so install_pinned_key
 # fails and the run must stop there.
-root_f4="${FIXTURE_DIR}/root-f4"
-bin_f4="${FIXTURE_DIR}/bin-f4"
-mkdir -p "${root_f4}" "${bin_f4}"
-printf '#!/bin/bash\nexec "$@"\n' > "${bin_f4}/sudo"
-cat > "${bin_f4}/dpkg" <<'EOF'
+if [ "${HAS_GPG}" = true ]; then
+    root_f4="${FIXTURE_DIR}/root-f4"
+    bin_f4="${FIXTURE_DIR}/bin-f4"
+    mkdir -p "${root_f4}" "${bin_f4}"
+    printf '#!/bin/bash\nexec "$@"\n' > "${bin_f4}/sudo"
+    cat > "${bin_f4}/dpkg" <<'EOF'
 #!/bin/bash
 [ "$1" = "--print-architecture" ] && { echo amd64; exit 0; }
 exit 1
 EOF
-cat > "${bin_f4}/curl" <<EOF
+    cat > "${bin_f4}/curl" <<EOF
 #!/bin/bash
 out=""
 while [ \$# -gt 0 ]; do
@@ -743,41 +767,44 @@ while [ \$# -gt 0 ]; do
 done
 cat '${SCRIPT_DIR}/fixtures/not-google-signing-key.asc' > "\$out"
 EOF
-chmod +x "${bin_f4}/sudo" "${bin_f4}/dpkg" "${bin_f4}/curl"
-# NOT the usual `set +e` INSIDE the subshell before calling main(): the ordering
-# property being tested is main()'s reliance on `set -e` ITSELF to abort before
-# suppress_permanent_repo runs (install_pinned_key's failure is a bare
-# statement, not an explicit `if ! ...; then exit 1; fi` check). Disabling
-# errexit before the call -- the pattern every other main()-driving case in
-# this file uses -- would disable it for main()'s own internals too, and
-# install_pinned_key's failure would silently stop aborting the run, which is
-# exactly the ordering swap this case exists to catch. So `set +e` is applied
-# OUTSIDE, around the whole command substitution, the same way case r and case
-# t already do it for a script invocation.
-set +e
-res_f4=$(
-    (
-        VESPASIAN_TEST_ROOT="${root_f4}"
-        export VESPASIAN_TEST_ROOT
-        PATH="${bin_f4}:${PATH}"
-        # shellcheck source=install-chrome.sh
-        source "${INSTALL_SCRIPT}"
-        CHROME_CANDIDATES=()
-        main
-    ) 2>&1
-)
-rc_f4=$?
-set -e
-assert_eq "case f: main() aborts on a fingerprint mismatch before any further mutation (rc 1)" \
-    "1" "${rc_f4}"
-assert_contains "case f: the abort is the fingerprint mismatch, not something else" \
-    "fingerprint mismatch" "${res_f4}"
-if [ -e "${root_f4}/etc/default/google-chrome" ]; then
-    echo "FAIL: case f: /etc/default/google-chrome was written despite never earning trust (ordering swapped?)"
-    fail_count=$((fail_count + 1))
+    chmod +x "${bin_f4}/sudo" "${bin_f4}/dpkg" "${bin_f4}/curl"
+    # NOT the usual `set +e` INSIDE the subshell before calling main(): the ordering
+    # property being tested is main()'s reliance on `set -e` ITSELF to abort before
+    # suppress_permanent_repo runs (install_pinned_key's failure is a bare
+    # statement, not an explicit `if ! ...; then exit 1; fi` check). Disabling
+    # errexit before the call -- the pattern every other main()-driving case in
+    # this file uses -- would disable it for main()'s own internals too, and
+    # install_pinned_key's failure would silently stop aborting the run, which is
+    # exactly the ordering swap this case exists to catch. So `set +e` is applied
+    # OUTSIDE, around the whole command substitution, the same way case r and case
+    # t already do it for a script invocation.
+    set +e
+    res_f4=$(
+        (
+            VESPASIAN_TEST_ROOT="${root_f4}"
+            export VESPASIAN_TEST_ROOT
+            PATH="${bin_f4}:${PATH}"
+            # shellcheck source=install-chrome.sh
+            source "${INSTALL_SCRIPT}"
+            CHROME_CANDIDATES=()
+            main
+        ) 2>&1
+    )
+    rc_f4=$?
+    set -e
+    assert_eq "case f: main() aborts on a fingerprint mismatch before any further mutation (rc 1)" \
+        "1" "${rc_f4}"
+    assert_contains "case f: the abort is the fingerprint mismatch, not something else" \
+        "fingerprint mismatch" "${res_f4}"
+    if [ -e "${root_f4}/etc/default/google-chrome" ]; then
+        echo "FAIL: case f: /etc/default/google-chrome was written despite never earning trust (ordering swapped?)"
+        fail_count=$((fail_count + 1))
+    else
+        echo "PASS: case f: a run that never earns trust never mutates /etc/default (install before suppress)"
+        pass_count=$((pass_count + 1))
+    fi
 else
-    echo "PASS: case f: a run that never earns trust never mutates /etc/default (install before suppress)"
-    pass_count=$((pass_count + 1))
+    skip "case f4: main() ordering guarantee on a fingerprint mismatch (gpg not found on PATH)" 3
 fi
 
 # ── Case g: the symlink guard on the defaults file ─────────────
@@ -3240,9 +3267,20 @@ run_lock_plant() {
             out=$("${tmo}" 15 bash -c 'source "$1"; main' _ "${INSTALL_SCRIPT}" 2>&1)
             rc=$?
         else
-            # shellcheck source=install-chrome.sh
-            source "${INSTALL_SCRIPT}"
-            out=$(main 2>&1)
+            # A bare `bash -c` (not `source` directly into THIS subshell) is
+            # deliberate, not an unbounded-vs-bounded stylistic mismatch: a
+            # direct `source` here would pull install-chrome.sh's own
+            # `set -euo pipefail` into this subshell, and the next line would
+            # then be `out=$(main 2>&1)` -- a bare assignment. Under errexit, a
+            # failing `main` (every lock-planted case in this function
+            # deliberately makes it fail) aborts this whole `(` block before
+            # `rc=$?`/`printf` ever run, losing every case from z onward AND
+            # the assertion-accounting pin at the end of the file, with no
+            # FAIL printed for any of it -- a silent abort dressed as a clean
+            # run. A fresh bash process contains that errexit to itself; only
+            # its exit code escapes, exactly as the timeout arm above already
+            # relies on.
+            out=$(bash -c 'source "$1"; main' _ "${INSTALL_SCRIPT}" 2>&1)
             rc=$?
         fi
         printf '%s\n%s\n' "${rc}" "${out}"

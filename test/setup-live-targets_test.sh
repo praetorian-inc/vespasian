@@ -1156,7 +1156,23 @@ $(declare -f "$w")"
         #
         # Same idiom as Test 24b below: locate each statement's line, assert the
         # ordering, and refuse to compare on an extraction that found nothing.
-        gql_install_at=$(printf '%s\n' "$gql_body" | grep -nE '^[[:space:]]*install -m [0-7]+ /dev/null .*graphql-server\.log' | head -1 | cut -d: -f1 || true)
+        #
+        # NOT anchored to line-start (unlike Test 24b's greps). `declare -f`
+        # renders a backgrounded command (`cmd &`) joined onto the SAME physical
+        # line as the statement that follows it — confirmed by printing
+        # `declare -f` for a toy function ending in `&`. Moving the install line
+        # to AFTER the redirect (the exact mutation this block exists to catch)
+        # makes it the statement that follows `node server.js ... &`, so it no
+        # longer starts its own line; a `^[[:space:]]*install` anchor then fails
+        # to match it at all. MUTATION-PROVEN: with the anchor, that mutation
+        # left gql_install_at empty and fired the "could not locate" arm above
+        # instead of the ordering arm below — the wrong diagnosis, sending a
+        # reader to fix a working extraction. Unanchored (matching the same
+        # `install -m [0-7]+ .*graphql-server\.log` shape already used
+        # unanchored for the extraction/duplicate-count check above) finds the
+        # install text wherever it sits on the joined line, so the ordering
+        # compare below runs and reports the real defect.
+        gql_install_at=$(printf '%s\n' "$gql_body" | grep -nE 'install -m [0-7]+ /dev/null .*graphql-server\.log' | head -1 | cut -d: -f1 || true)
         gql_redirect_at=$(printf '%s\n' "$gql_body" | grep -nE '^[[:space:]]*.*node server\.js >' | head -1 | cut -d: -f1 || true)
         gql_clobber_at=$(printf '%s\n' "$gql_body" | grep -nE '^[[:space:]]*(rm|unlink|mv|truncate|chmod|setfacl|chown)[[:space:]][^;]*graphql-server\.log' | head -1 | cut -d: -f1 || true)
         if [ -z "$gql_install_at" ] || [ -z "$gql_redirect_at" ]; then

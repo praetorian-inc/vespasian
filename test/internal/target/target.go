@@ -18,7 +18,6 @@
 package target
 
 import (
-	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -56,15 +55,6 @@ func Addr(port string) string {
 	host := os.Getenv("BIND_HOST")
 	if host == "" {
 		host = "127.0.0.1"
-	} else {
-		// ANNOUNCED, for the same reason run-live-tests.sh announces an
-		// environment-supplied VESPASIAN: BIND_HOST is a generic name that
-		// unrelated ambient tooling can set, and this package's doc calls the
-		// loopback default a security control. setup-live-targets.sh always
-		// passes it explicitly (LIVE_TARGET_BIND_HOST, defaulting to loopback),
-		// so this can only bite the run-a-fixture-directly path — where a
-		// silently widened bind is exactly what nobody would look for.
-		fmt.Fprintf(os.Stderr, "[WARN] BIND_HOST=%s from the environment — this fixture binds there, not the 127.0.0.1 default\n", host)
 	}
 	return net.JoinHostPort(host, port)
 }
