@@ -1057,9 +1057,39 @@ if command -v stat >/dev/null 2>&1; then
         # install left the assertion above green while the log went back to the
         # ambient umask. Executing the install line proves mode and path; only
         # inspecting the function body can prove nothing UNDOES it in between.
+        # The span is install-line -> redirect-line: sed searches the END pattern
+        # from the line AFTER the start, so the install line (which also contains
+        # graphql-server.log) does not terminate its own range. Verified.
+        #
+        # Function calls in that span are RESOLVED, not just scanned: a rotation
+        # moved into a helper defeated the text-only version. MUTATION-PROVEN,
+        # `rotate_gql_log() { rm -f "$log"; }` plus a call to it between the
+        # install and the redirect passed, because the body only contained the
+        # CALL. Every word in the span that names a defined shell function has
+        # that function's own body appended before the scan.
         gql_body="$(declare -f start_graphql_server)"
         gql_between="$(printf '%s\n' "$gql_body" | sed -n '/install -m/,/graphql-server\.log/p')"
-        if printf '%s\n' "$gql_between" | grep -qE '(rm|unlink|mv|truncate|:>)[[:space:]]'; then
+        for w in $(printf '%s\n' "$gql_between" | tr -cs 'A-Za-z0-9_-' '\n'); do
+            if declare -F "$w" >/dev/null 2>&1; then
+                gql_between="${gql_between}
+$(declare -f "$w")"
+            fi
+        done
+        # declare -F only resolves TOP-LEVEL helpers. A helper defined INSIDE
+        # start_graphql_server does not exist until that function runs, so the
+        # resolution above cannot see it and the first version of this guard was
+        # defeated by exactly that: `rotate_gql_log() { rm -f "$log"; }` declared
+        # in the body, called between the install and the redirect. The nested
+        # definition also sits BEFORE the install line, so the span misses it too.
+        #
+        # So the span check is paired with a whole-body one: no statement anywhere
+        # in this function may remove or rename the log. That is a stronger claim
+        # than the span needs and is correct regardless — the function has no
+        # legitimate reason to delete the file it just created with an explicit
+        # mode. Together they cover inline, nested-helper, and top-level-helper.
+        if printf '%s\n' "$gql_body" | grep -qE '(rm|unlink|mv|truncate)[[:space:]][^;]*graphql-server\.log'; then
+            fail "start_graphql_server removes or renames .graphql-server.log somewhere in its body (possibly via a helper defined inside it) — the redirect then RE-CREATES the file at the caller's umask and the explicit 0600 mode is lost (SEC-BE-003)"
+        elif printf '%s\n' "$gql_between" | grep -qE '(rm|unlink|mv|truncate|:>)[[:space:]]'; then
             fail "start_graphql_server removes or replaces .graphql-server.log between the install(1) that sets its 0600 mode and the redirect that writes it — the redirect then RE-CREATES the file at the caller's umask, so the mode is lost (SEC-BE-003)"
         else
             ok "nothing removes or replaces .graphql-server.log between its install(1) and the redirect, so the 0600 mode survives to the write (SEC-BE-003)"
@@ -1191,15 +1221,36 @@ else
 fi
 
 # ── Skip-credit register (self-verifying; see the rationale below the pin) ──
-EXPECTED_SKIP_SITES=9
-EXPECTED_SKIP_CREDIT_TOTAL=19
+# PER-SITE, not just a total. Pinning only the sum was defeated by a zero-sum
+# swap: MUTATION-PROVEN, moving 1 credit from "lsof and python3 required" (3->2)
+# onto "python3 unavailable" (2->3) kept the total at 19 and passed, while both
+# arms now mis-credit their blocks — which is exactly the drift this register
+# exists to catch, since a wrong per-site credit breaks the pin on precisely the
+# degraded host that fires that arm. The register is each site's own credit,
+# keyed by its message, derived from the file at runtime.
+EXPECTED_SKIP_REGISTER='python3 unavailable=2
+python3 and (lsof or ss) required=2
+node-listener sub-cases need the staged stand-in=1
+lsof and python3 required=3
+pgrep required=2
+could not build an lsof-free PATH for the SEC-BE-008 check=2
+timeout/gtimeout, curl, and python3 required=1
+timeout/gtimeout, dirname, and sleep required=2
+stat required=4'
+actual_skip_register=$(grep -oE '^[[:space:]]*skip "[^"]*" [0-9]+' "$THIS_DIR/setup-live-targets_test.sh" \
+    | sed -E 's/^[[:space:]]*skip "([^"]*)" ([0-9]+)$/\1=\2/')
+# Sites WITHOUT an explicit credit default to 0 and would silently not appear
+# above, so they are counted separately rather than being invisible.
 actual_skip_sites=$(grep -cE '^[[:space:]]*skip "' "$THIS_DIR/setup-live-targets_test.sh")
-actual_skip_total=$(grep -oE '^[[:space:]]*skip "[^"]*" [0-9]+' "$THIS_DIR/setup-live-targets_test.sh" \
-    | grep -oE '[0-9]+$' | awk '{s+=$1} END {print s+0}')
-if [ "$actual_skip_sites" -eq "$EXPECTED_SKIP_SITES" ] && [ "$actual_skip_total" -eq "$EXPECTED_SKIP_CREDIT_TOTAL" ]; then
-    ok "skip-credit register is current: ${actual_skip_sites} sites totalling ${actual_skip_total} credit"
+expected_sites=$(printf '%s\n' "$EXPECTED_SKIP_REGISTER" | wc -l)
+if [ "$actual_skip_register" = "$EXPECTED_SKIP_REGISTER" ] && [ "$actual_skip_sites" -eq "$expected_sites" ]; then
+    ok "skip-credit register is current: ${actual_skip_sites} sites, each credit matching its recorded value"
 else
-    fail "skip-credit register drifted: found ${actual_skip_sites} skip sites totalling ${actual_skip_total} credit, expected ${EXPECTED_SKIP_SITES}/${EXPECTED_SKIP_CREDIT_TOTAL} — a skip was added, removed, or re-credited without updating this register (which is what makes the unconditional pin below trustworthy on a degraded host)"
+    fail "skip-credit register drifted — a skip was added, removed, re-credited, re-worded, or written without an explicit credit. Expected:
+${EXPECTED_SKIP_REGISTER}
+Found (${actual_skip_sites} total sites, credited ones listed):
+${actual_skip_register}
+Per-site credits are pinned, not just their sum: a zero-sum swap between two arms leaves the total correct while both mis-credit their blocks, breaking the unconditional pin below on exactly the degraded host that fires them."
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────
