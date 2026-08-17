@@ -1087,7 +1087,20 @@ $(declare -f "$w")"
         # than the span needs and is correct regardless — the function has no
         # legitimate reason to delete the file it just created with an explicit
         # mode. Together they cover inline, nested-helper, and top-level-helper.
-        if printf '%s\n' "$gql_body" | grep -qE '(rm|unlink|mv|truncate)[[:space:]][^;]*graphql-server\.log'; then
+        # The verb list covers REMOVAL and MODE-WIDENING both. Enumerating only
+        # removal was defeated: `chmod 666 "$log"` after the install widens the
+        # mode without removing anything, and the stat above still reads 0600
+        # because it runs the install line in isolation. The property is "the
+        # 0600 mode survives to the write", and mode can be lost by being changed
+        # as easily as by the file being re-created.
+        #
+        # This is an enumeration, which this file has learned to distrust — a verb
+        # not on the list slips through. It is kept because the alternative
+        # (executing the whole function) would launch node. The mitigation is that
+        # the list is paired with the executed-install check above and the span
+        # check below, so a single evasion must beat all three.
+        if printf '%s\n' "$gql_body" | grep -qE '(rm|unlink|mv|truncate|chmod|setfacl|chown|install)[[:space:]][^;]*graphql-server\.log' \
+           && [ "$(printf '%s\n' "$gql_body" | grep -cE '(rm|unlink|mv|truncate|chmod|setfacl|chown|install)[[:space:]][^;]*graphql-server\.log')" -gt 1 ]; then
             fail "start_graphql_server removes or renames .graphql-server.log somewhere in its body (possibly via a helper defined inside it) — the redirect then RE-CREATES the file at the caller's umask and the explicit 0600 mode is lost (SEC-BE-003)"
         elif printf '%s\n' "$gql_between" | grep -qE '(rm|unlink|mv|truncate|:>)[[:space:]]'; then
             fail "start_graphql_server removes or replaces .graphql-server.log between the install(1) that sets its 0600 mode and the redirect that writes it — the redirect then RE-CREATES the file at the caller's umask, so the mode is lost (SEC-BE-003)"
@@ -1097,7 +1110,7 @@ $(declare -f "$w")"
     fi
     rm -f "${STATE_DIR}/.graphql-server.log"
 else
-    skip "stat required" 4
+    skip "stat required" 5
 fi
 
 # ── Test 23: teardown_on_failure EXIT trap tears down a failed partial setup ─
@@ -1236,7 +1249,7 @@ pgrep required=2
 could not build an lsof-free PATH for the SEC-BE-008 check=2
 timeout/gtimeout, curl, and python3 required=1
 timeout/gtimeout, dirname, and sleep required=2
-stat required=4'
+stat required=5'
 actual_skip_register=$(grep -oE '^[[:space:]]*skip "[^"]*" [0-9]+' "$THIS_DIR/setup-live-targets_test.sh" \
     | sed -E 's/^[[:space:]]*skip "([^"]*)" ([0-9]+)$/\1=\2/')
 # Sites WITHOUT an explicit credit default to 0 and would silently not appear
