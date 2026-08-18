@@ -17,6 +17,7 @@ Read the [Architecture](README.md#architecture) section of the README first. It 
 - [Testing](#testing)
 - [Code style](#code-style)
 - [Commit messages](#commit-messages)
+- [Changelog](#changelog)
 - [Pull requests](#pull-requests)
 - [Reporting issues](#reporting-issues)
 - [Security disclosures](#security-disclosures)
@@ -319,6 +320,33 @@ fix(generate): stop collapsing distinct routes sharing a path prefix
 test: add live coverage for HTML form extraction
 ```
 
+## Changelog
+
+Vespasian keeps a hand-maintained [`CHANGELOG.md`](CHANGELOG.md) at the repository
+root, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
+following [Semantic Versioning](https://semver.org/spec/v2.0.0.html). It is the
+curated, human-readable history, and the canonical record of breaking changes.
+
+- **Update it in the same PR.** If your change affects user-facing behavior — a
+  new flag, a new API type, a changed default, or a bug fix a user would notice —
+  add a bullet under the `## [Unreleased]` heading, in the matching
+  `Added` / `Changed` / `Deprecated` / `Removed` / `Fixed` / `Security` group.
+  Purely internal changes (tests, CI, refactors, dependency bumps with no
+  behavior change) don't need an entry.
+- **Breaking changes are mandatory and go first.** Anything that invalidates an
+  existing `capture.json`, changes a persisted format, removes a flag, or changes
+  a default in a way that alters output goes under the `Breaking changes`
+  subsection of `[Unreleased]`, with a one-line migration note. A breaking change
+  requires a major-version bump at release time.
+- **Releases are cut by a maintainer.** At release time the maintainer renames
+  `[Unreleased]` to the new version with a date and opens a fresh `[Unreleased]`.
+  Contributors do not assign version numbers.
+- **`CHANGELOG.md` and the GitHub Release notes are complementary.** goreleaser
+  generates per-release notes from conventional commits (see
+  [`.goreleaser.yml`](.goreleaser.yml)) — the complete, raw commit log.
+  `CHANGELOG.md` is the curated summary. Writing good conventional-commit messages
+  (see [Commit messages](#commit-messages)) keeps both useful.
+
 ## Pull requests
 
 1. **One logical change per PR.** If you're fixing a bug and adding a feature, split them.
@@ -343,6 +371,7 @@ Two CI workflows gate a PR:
 - [ ] Commit messages follow conventional commit format
 - [ ] Apache 2.0 license header on any new source file
 - [ ] `README.md` / `doc.go` updated if user-facing behavior or a public API changed
+- [ ] `CHANGELOG.md` updated under `[Unreleased]` if the change is user-facing
 
 ## Reporting issues
 
