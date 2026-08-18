@@ -379,8 +379,12 @@ vespasian scan <url> [flags]
                      INCLUDING form submit buttons, so it submits forms and can mutate state.
                      Controls whose label looks destructive, session-ending, or an irreversible
                      commit (delete/logout/reset/pay/place order/...) are skipped, matched on
-                     visible text plus aria-label/title/value. That is a best-effort label match,
-                     not a guarantee — treat --interact as an active, state-changing option.
+                     visible text plus aria-label/title/value on the control and
+                     aria-label/title/alt on its descendants, so a labeled icon inside a button
+                     is not missed. A control whose label carries no word at all (an icon-only
+                     glyph) is treated as unreadable and skipped rather than clicked. That is a
+                     best-effort label match, not a guarantee — treat --interact as an active,
+                     state-changing option.
   --timeout          Maximum duration for the entire scan (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine
@@ -438,8 +442,12 @@ vespasian crawl <url> [flags]
                      INCLUDING form submit buttons, so it submits forms and can mutate state.
                      Controls whose label looks destructive, session-ending, or an irreversible
                      commit (delete/logout/reset/pay/place order/...) are skipped, matched on
-                     visible text plus aria-label/title/value. That is a best-effort label match,
-                     not a guarantee — treat --interact as an active, state-changing option.
+                     visible text plus aria-label/title/value on the control and
+                     aria-label/title/alt on its descendants, so a labeled icon inside a button
+                     is not missed. A control whose label carries no word at all (an icon-only
+                     glyph) is treated as unreadable and skipped rather than clicked. That is a
+                     best-effort label match, not a guarantee — treat --interact as an active,
+                     state-changing option.
   --timeout          Maximum duration for the entire crawl (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine
