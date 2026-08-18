@@ -97,6 +97,16 @@ def paths_match(expected_path, found_path):
 with open(sys.argv[1]) as f:
     expected = json.load(f)
 
+# TEST-005 (PR #187 review): total_paths is a hand-maintained duplicate of
+# len(paths) in the fixtures. Self-check it at every live consumption so the
+# two cannot drift silently. An absent key is allowed (older fixtures without
+# it stay valid) — this makes the guard opt-in per fixture.
+_total = expected.get("total_paths")
+if _total is not None and _total != len(expected["paths"]):
+    print("PARITY MISMATCH: total_paths=%s but paths has %d entries"
+          % (_total, len(expected["paths"])))
+    sys.exit(1)
+
 with open(sys.argv[2]) as f:
     content = f.read()
 
@@ -867,16 +877,55 @@ assert_within_depth() {
 # page(s) (limit=10)" — the crawler lands exactly on the cap, zero overshoot.
 # Keeping a vestigial margin only invites it being silently widened again
 # (PR #187 review finding, outside-diff L836-L845).
-# Usage: assert_max_pages <label> <page_count> <limit>
+# TEST-020 (PR #187 review): the upper bound alone greened on an empty/1-page
+# crawl that never followed a link — a crawler that isn't crawling passed
+# limit=10 silently. min_pages (default 1; a 0/empty capture is always a
+# failure) adds the lower bound, modeled on assert_within_depth's under-crawl
+# arm. The many-links caller passes an explicit floor above the default.
+# Usage: assert_max_pages <label> <page_count> <limit> [min_pages]
 assert_max_pages() {
-    local label=$1 page_count=$2 limit=$3
+    local label=$1 page_count=$2 limit=$3 min_pages=${4:-1}
 
     if ! [[ $page_count =~ ^[0-9]+$ ]]; then
         log_fail "${label}: page count is not a number: '${page_count}' (capture read failed)"
         return 1
     fi
+    if ! [[ $min_pages =~ ^[0-9]+$ ]]; then
+        log_fail "${label}: floor (min_pages) is not a number: '${min_pages}'"
+        return 1
+    fi
     if [ "$page_count" -gt "$limit" ]; then
         log_fail "${label}: visited ${page_count} page(s) (limit=${limit}) — --max-pages not enforced"
+        return 1
+    fi
+    if [ "$page_count" -lt "$min_pages" ]; then
+        log_fail "${label}: visited ${page_count} page(s), expected at least ${min_pages} — under-crawl / crawler not crawling"
+        return 1
+    fi
+    return 0
+}
+
+# assert_exact_path_count checks a generated spec has EXACTLY the expected number
+# of paths — no missing paths (validate_path_coverage's job) and no spurious
+# extras. Extracted from the inline rest-api / scan-rest count checks in
+# run-live-tests.sh (PR #208 review finding TEST-003) so the comparison — and its
+# numeric guards — get offline regression cases under the un-gated
+# validator-regression job, the same way assert_max_pages / assert_within_depth
+# were extracted for PR #187. BOTH counts must be numeric or the assertion
+# hard-fails rather than silently string-comparing a "?" capture-read sentinel.
+# Usage: assert_exact_path_count <label> <actual> <expected>
+assert_exact_path_count() {
+    local label=$1 actual=$2 expected=$3
+    if ! [[ $actual =~ ^[0-9]+$ ]]; then
+        log_fail "${label}: path count is not a number: '${actual}' (capture read failed)"
+        return 1
+    fi
+    if ! [[ $expected =~ ^[0-9]+$ ]]; then
+        log_fail "${label}: expected path count is not a number: '${expected}'"
+        return 1
+    fi
+    if [ "$actual" != "$expected" ]; then
+        log_fail "${label}: spec has ${actual} path(s), expected exactly ${expected}"
         return 1
     fi
     return 0
