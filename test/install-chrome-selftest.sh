@@ -68,7 +68,8 @@ export CHROME_PROBE_TIMEOUT=2
 # own skip is additionally a hard failure via trust_anchor_skips, independently of
 # this pin.
 #
-# Round-15 review: 234 -> 238. MEASURED by running the suite, not derived — the
+# Round-15 review: 234 -> 238 (later 239, then 244; see the register below).
+# MEASURED by running the suite, not derived — the
 # per-task deltas in that round's plan were written without shell access and were
 # explicitly flagged untrusted. The +4:
 #   +1  case f's curl-pin count now matches EVERY syntactic form of curl in
@@ -81,7 +82,7 @@ export CHROME_PROBE_TIMEOUT=2
 #   +2  case bp3, pinning that the consolidated chrome_probe_budget still
 #       validates the budget for _bounded_probe as chrome_runnable does
 # See the credit register below for the matching skip_credit accounting.
-EXPECTED_ASSERTIONS=239
+EXPECTED_ASSERTIONS=244
 
 pass_count=0
 fail_count=0
@@ -140,19 +141,24 @@ SUITE_COMPLETED=0
 #   y     = 3    needs the same key fixture / gpg as j/j2, OR timeout(1): y
 #                drives main(), same require_tools() refusal as f4
 #   bp    = 4    no timeout/gtimeout on PATH
+#   z4    = 3    no flock on PATH (the concurrency half only; z4's source-level
+#                ordering assertions need nothing ambient and always run)
 #
-# Maximum skip_credit on a maximally-degraded host: 1+4+3+14+3+12+3+4 = 44.
+# Maximum skip_credit on a maximally-degraded host: 1+4+3+14+3+12+3+4+3 = 47.
 # f4, v and y each have TWO independent triggers (gpg/fixture, or timeout) but
 # one skip() call apiece, so a host missing both tools still credits 3/12/3 --
 # never double.
-# EXPECTED_ASSERTIONS above is 238, MEASURED on a fully-equipped host in this
-# round (pass+fail+skip_credit with every arm live).
+# EXPECTED_ASSERTIONS above is 244, MEASURED on a fully-equipped host (pass+fail+
+# skip_credit with every arm live). It moved 238 -> 239 when case cr landed, and
+# 239 -> 244 when case z4 gained the four ordering assertions plus the per-site
+# register check. Every figure quoted below was re-measured at 244, not carried
+# forward: this note has already gone stale twice by being carried forward.
 #
 # PROVENANCE, stated precisely rather than blanket-claimed as "MEASURED":
 #   * f2 = 4, f4 = 3, j/j2 = 14, v = 12 and y = 3 were FORCED this round on a
 #     host with no gpg on PATH (every PATH entry containing a gpg binary was
 #     replaced by a symlink farm omitting it). That run reported 202 passed,
-#     0 failed, 5 skipped; 202 + 0 + 36 = 238, so the accounting pin held and
+#     0 failed, 5 skipped; 208 + 0 + 36 = 244, so the accounting pin held and
 #     these five credits are measured rather than declared. f2 and f4 are the
 #     two this list previously omitted altogether -- they were added in abc36ed,
 #     after the round-8 measurement that the rest of the register inherits.
@@ -161,7 +167,7 @@ SUITE_COMPLETED=0
 #     respectively, neither of which the equipped-host run can produce.
 #   * f4 = 3, v = 12 and y = 3 were ALSO forced this round on a host with no
 #     timeout and no gtimeout on PATH: 216 passed, 0 failed, 4 skipped, and
-#     216 + 0 + (3+12+3+4) = 238. Before those three gained the timeout gate the
+#     222 + 0 + (3+12+3+4) = 244. Before those three gained the timeout gate the
 #     same host reported 223/11/1 -- 11 hard failures naming the fingerprint
 #     check, the cache wipe and the version record, plus 3 vacuous passes.
 #   * bp = 4 is NEW this round: it was 2 (covering case bp2's two assertions) and
@@ -3537,9 +3543,13 @@ else
     echo "PASS: case z4: the create/open/flock lines the fixture mirrors are still main()'s"
     pass_count=$((pass_count + 1))
 fi
-# The five SEC-BE-004 guards the fixture does not mirror. Pinned here because
-# nothing else notices their removal: cases z and z3 drive them behaviourally
-# through stubs, so deleting a guard from main() itself leaves those green.
+# The four SEC-BE-004 guards the fixture does not mirror. Cases z and z3 DO drive
+# them behaviourally -- they source install-chrome.sh and run the real main() with
+# only $SUDO stubbed, so deleting `[ -L ]` really does fail case z. What those
+# cases cannot see is POSITION: run_lock_plant pre-plants the hostile file before
+# invoking main(), so the path always exists when the guards run, and the guards
+# fire identically whether they sit before or after the create. That is what the
+# ordering assertions below cover, and it is not hypothetical -- see their comment.
 lock_guards_missing=""
 while IFS='|' read -r needle label; do
     [ -n "$needle" ] || continue
@@ -3554,10 +3564,76 @@ if [ -n "${lock_guards_missing}" ]; then
     echo "FAIL: case z4: main()'s lock guards are gone:${lock_guards_missing} — a hostile plant at the fixed /tmp path is admitted again (SEC-BE-004)"
     fail_count=$((fail_count + 1))
 else
-    echo "PASS: case z4: main() still carries all four SEC-BE-004 lock guards ahead of the open"
+    echo "PASS: case z4: main() still carries all four SEC-BE-004 lock guards"
     pass_count=$((pass_count + 1))
 fi
 
+# TEST-001: the guards' POSITION, not merely their presence. The four needles above
+# match wherever the guards sit, and the old PASS text claimed "ahead of the open" --
+# a position it never measured. That mattered: SEC-BE-001's whole fix was positional.
+# The guards used to sit ABOVE the create with three of them inside `if [ -e ]`, so
+# on a host where the lock path was absent every guard was skipped and a plant
+# arriving before the conditional create was opened unchecked. MEASURED: restoring
+# that layout left this suite at 239 passed, 0 failed -- the security fix could be
+# reverted in full and nothing noticed.
+#
+# Same idiom as cases u and v3: locate each statement inside main()'s extracted body
+# and compare offsets, with a fidelity sentinel FIRST so a rename or a reword is
+# reported as drift instead of silently making every comparison compare empty
+# strings. `-e` deliberately has its own needle: its return is what re-admits the
+# skip-every-guard shape, so it is pinned absent rather than merely ordered.
+lk_create_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ ! -e "\$LOCK_FILE" \]; then$' | head -1 | cut -d: -f1 || true)
+lk_symlink_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ -L "\$LOCK_FILE" \]; then$' | head -1 | cut -d: -f1 || true)
+lk_regular_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ ! -f "\$LOCK_FILE" \]; then$' | head -1 | cut -d: -f1 || true)
+lk_owner_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*lock_owner=\$\(stat -c' | head -1 | cut -d: -f1 || true)
+lk_open_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*exec \{LOCK_FD\}<"\$LOCK_FILE"$' | head -1 | cut -d: -f1 || true)
+lk_ewrap_n=$(printf '%s\n' "${lock_main_code}" | grep -cE '^[[:space:]]*if \[ -e "\$LOCK_FILE" \]; then$' || true)
+
+if [ -n "${lk_create_at}" ] && [ -n "${lk_symlink_at}" ] && [ -n "${lk_regular_at}" ] \
+   && [ -n "${lk_owner_at}" ] && [ -n "${lk_open_at}" ]; then
+    echo "PASS: case z4: main()'s create, all four lock guards and the open were all located"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case z4: could not locate main()'s create, a lock guard, or the open — the ordering assertions below would be vacuous; fix the extraction rather than deleting it"
+    fail_count=$((fail_count + 1))
+fi
+
+assert_eq "case z4: every lock guard runs AFTER the create, so it inspects the inode exec will open" \
+    "after" "$( { [ -n "${lk_create_at}" ] && [ -n "${lk_symlink_at}" ] && [ -n "${lk_regular_at}" ] \
+                  && [ -n "${lk_owner_at}" ] \
+                  && [ "${lk_symlink_at}" -gt "${lk_create_at}" ] \
+                  && [ "${lk_regular_at}" -gt "${lk_create_at}" ] \
+                  && [ "${lk_owner_at}" -gt "${lk_create_at}" ]; } && echo "after" \
+                || echo "NOT after the create — on a host where the lock path is absent the guards are skipped and a plant before the conditional create is opened unchecked (SEC-BE-001)")"
+
+assert_eq "case z4: every lock guard runs BEFORE the open" \
+    "before" "$( { [ -n "${lk_open_at}" ] && [ -n "${lk_symlink_at}" ] && [ -n "${lk_regular_at}" ] \
+                   && [ -n "${lk_owner_at}" ] \
+                   && [ "${lk_symlink_at}" -lt "${lk_open_at}" ] \
+                   && [ "${lk_regular_at}" -lt "${lk_open_at}" ] \
+                   && [ "${lk_owner_at}" -lt "${lk_open_at}" ]; } && echo "before" \
+                || echo "NOT before exec {LOCK_FD}< — a guard after the open cannot stop the open it exists to gate")"
+
+assert_eq "case z4: no \`if [ -e ]\` wrapper around the guards (that shape skips them all when the path is absent)" \
+    "0" "${lk_ewrap_n}"
+
+# TEST-004: the SOURCE-level assertions above need nothing ambient -- they read
+# install-chrome.sh's text. The three below run two real processes contending for
+# a real lock, so they need flock(1), the one ambient dependency in this case that
+# had no credited skip while every other in this file does. This arm makes z4
+# report the missing tool instead of three failures blaming mutual exclusion.
+#
+# Scope, stated rather than implied: this does NOT make a flock-less host green,
+# and no claim here should be read that way. MEASURED at HEAD before this arm
+# existed, a PATH with no flock produced 11 failures across cases f, i, j and
+# others and terminated before the summary -- install-chrome.sh's require_tools
+# refuses such a host outright (case z5 pins that refusal), so every case that
+# drives main() fails for the same upstream reason. That shape is pre-existing,
+# unrelated to z4, and out of this round's scope. The credit keeps z4's own
+# accounting honest on it; it does not repair the shape.
+if ! command -v flock >/dev/null 2>&1; then
+    skip "case z4: concurrent lock acquisition (flock not found on PATH)" 3
+else
 z4_dir="${FIXTURE_DIR}/lock-z4"; mkdir -p "${z4_dir}"
 z4_lock="${z4_dir}/vespasian-install-chrome.lock"
 cat > "${z4_dir}/acquire.sh" <<'Z4EOF'
@@ -3605,6 +3681,7 @@ assert_eq "case z4: the first run acquires the install lock" \
     "ACQUIRED" "$(cat "${z4_dir}/holder.out")"
 assert_eq "case z4: a CONCURRENT second run is blocked by it (mutual exclusion is real)" \
     "BLOCKED" "${z4_contender}"
+fi
 
 # z5: flock is required, not optional (SEC-BE-003).
 #
@@ -3668,18 +3745,50 @@ fi
 # than believed" -- but nothing checked it, which is the same shape of unbacked
 # claim this suite exists to catch. This case makes the sentence true.
 #
-# It compares two independently-derived numbers:
-#   * DERIVED  -- parsed out of this file's own skip() call sites: the maximum
-#                 credit each case label can contribute, summed. j/j2 declares
-#                 the SAME credit on two mutually-exclusive arms (missing fixture
-#                 / absent gpg), so taking the max per label -- not the sum --
-#                 is what "maximally-degraded host" actually means, and is why
-#                 the total is 44 rather than the 58 the nine literals add to.
-#   * DECLARED -- the arithmetic expression written in the register comment,
-#                 evaluated. Not the "= 44" on its right-hand side: evaluating
-#                 the left side catches a register whose own sum has gone stale.
-# A call-site credit edited without updating the register now fails here instead
-# of silently invalidating every count in the file.
+# PER-SITE, not just a total (TEST-002). The first version of this case compared
+# only the scalar maximum, and that is defeatable by an offsetting pair: cases v
+# and y carry byte-identical gate conditions, so re-crediting v 12->13 and y 3->2
+# leaves the maximum at 44, leaves pass+fail+skip_credit at its pin on the equipped
+# host, and leaves it correct on all three degraded shapes too, because v and y
+# always co-fire. Both arms would then mis-credit their blocks. The sibling suite
+# recorded exactly this defeat as MUTATION-PROVEN and moved to a per-site register;
+# this is the same idiom, keyed by each site's own message.
+#
+# Sites are compared verbatim, credits included, so a re-credit, a re-wording, an
+# added arm, a removed arm, or a credit dropped entirely all show up as drift.
+EXPECTED_SKIP_REGISTER='case a2: committed-mode check (not a git checkout)=1
+case f2: fingerprint-mismatch diagnosis for an unexpected real key (gpg not found on PATH)=4
+case f4: main() ordering guarantee on a fingerprint mismatch ($(main_deps_missing) not found on PATH)=3
+case j/j2: trust-anchor success path (fixture test/fixtures/google-linux-signing-key.asc missing or empty)=14
+case j/j2: trust-anchor success path (gpg not found on PATH)=14
+case l: non-root sudo refusal (running as root)=3
+case v: main-install-path in_container() gating (needs the same key fixture/gpg as j/j2, plus timeout(1) for require_tools; missing: $(main_deps_missing))=12
+case y: pre-install origin gate (needs the same key fixture/gpg as j/j2, plus timeout(1) for require_tools; missing: $(main_deps_missing))=3
+case bp: _bounded_probe timeout enforcement (no timeout/gtimeout on PATH)=4
+case z4: concurrent lock acquisition (flock not found on PATH)=3'
+cr_actual=$(grep -oE '^[[:space:]]*skip "[^"]*" [0-9]+' "${BASH_SOURCE[0]}" \
+    | sed -E 's/^[[:space:]]*skip "([^"]*)" ([0-9]+)$/\1=\2/')
+# Sites WITHOUT an explicit credit default to 0 and would silently not appear
+# above, so they are counted separately rather than being invisible.
+cr_sites=$(grep -cE '^[[:space:]]*skip "' "${BASH_SOURCE[0]}")
+cr_expected_sites=$(printf '%s\n' "${EXPECTED_SKIP_REGISTER}" | wc -l)
+if [ "${cr_actual}" = "${EXPECTED_SKIP_REGISTER}" ] && [ "${cr_sites}" -eq "${cr_expected_sites}" ]; then
+    echo "PASS: case cr: skip-credit register is current — ${cr_sites} sites, each credit matching its recorded value"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case cr: skip-credit register drifted — a skip was added, removed, re-credited, re-worded, or written with no explicit credit. Expected:
+${EXPECTED_SKIP_REGISTER}
+Found (${cr_sites} total sites, credited ones listed):
+${cr_actual}
+Per-site credits are pinned, not just their sum: an offsetting swap between two arms that always co-fire (v and y) leaves the total right while both mis-credit their blocks."
+    fail_count=$((fail_count + 1))
+fi
+
+# And the DECLARED maximum in the register comment, evaluated -- the left-hand side
+# of the arithmetic, not the "= 44" written after it, so a register whose own sum
+# has gone stale is caught. Max per label, not sum: j/j2 declares the same credit
+# on two mutually-exclusive arms, which is why the maximum is 44 and not the 58 the
+# nine literals add to.
 cr_derived=$(
     awk '
         match($0, /skip "case [a-z0-9\/]+:/) {
@@ -3693,9 +3802,8 @@ cr_derived=$(
     ' "${BASH_SOURCE[0]}"
 )
 cr_declared=$(
-    # The register line: "# Maximum skip_credit ...: 1+4+3+14+3+12+3+4 = 44."
     expr_str=$(grep -oE '^# Maximum skip_credit on a maximally-degraded host: [0-9+]+' "${BASH_SOURCE[0]}" \
-               | grep -oE '[0-9+]+$')
+               | grep -oE '[0-9+]+$' || true)
     if [ -n "${expr_str}" ]; then echo $((expr_str)); else echo "UNPARSED"; fi
 )
 assert_eq "case cr: the credit register's declared maximum matches the skip() call sites" \

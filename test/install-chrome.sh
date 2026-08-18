@@ -992,11 +992,20 @@ main() {
         # directories, devices and sockets -- every type the symlink and hardlink
         # checks do not.
         #
-        # Residual, stated rather than hidden: a plant landing between the last
-        # guard and the `exec` one line later is still not excluded. Shell offers no
-        # atomic check-and-open, so that window cannot be closed here — only
-        # narrowed from the previous span (a create plus four guards) to a single
-        # statement boundary.
+        # Residual, stated precisely rather than flattered. Shell offers no atomic
+        # check-and-open, so a plant arriving after a guard is not excluded by that
+        # guard. "One statement boundary" would only be true of the LAST guard: the
+        # symlink test is three statements and two forks from the `exec`, and a
+        # symlink swapped in after it is not re-tested by what follows -- `[ -f ]`
+        # DEREFERENCES and would pass, and `stat` does NOT dereference, so `%h`
+        # reports the symlink's own link count of 1.
+        #
+        # What actually covers that span is the OWNER guard: `stat -c '%u'` is
+        # un-dereferenced, so it reports the planter's uid and refuses. The
+        # genuinely unexcluded set is therefore "a plant by root or by the invoking
+        # user" -- both of which can already do anything this script does. Do not
+        # delete the owner check on the assumption the ordering alone is sufficient;
+        # it is the guard carrying this span, not a redundant extra.
         if [ -L "$LOCK_FILE" ]; then
             log_fail "${LOCK_FILE} is a symlink — refusing to lock through it." >&2
             exit 1
