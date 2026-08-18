@@ -157,8 +157,8 @@ SUITE_COMPLETED=0
 # PROVENANCE, stated precisely rather than blanket-claimed as "MEASURED":
 #   * f2 = 4, f4 = 3, j/j2 = 14, v = 12 and y = 3 were FORCED this round on a
 #     host with no gpg on PATH (every PATH entry containing a gpg binary was
-#     replaced by a symlink farm omitting it). That run reported 202 passed,
-#     0 failed, 5 skipped; 208 + 0 + 36 = 244, so the accounting pin held and
+#     replaced by a symlink farm omitting it). RE-MEASURED at the current pin:
+#     208 passed, 0 failed, 5 skipped; 208 + 0 + 36 = 244, so the pin held and
 #     these five credits are measured rather than declared. f2 and f4 are the
 #     two this list previously omitted altogether -- they were added in abc36ed,
 #     after the round-8 measurement that the rest of the register inherits.
@@ -166,9 +166,11 @@ SUITE_COMPLETED=0
 #     not re-forced. Forcing them needs a non-git checkout and a root shell
 #     respectively, neither of which the equipped-host run can produce.
 #   * f4 = 3, v = 12 and y = 3 were ALSO forced this round on a host with no
-#     timeout and no gtimeout on PATH: 216 passed, 0 failed, 4 skipped, and
-#     222 + 0 + (3+12+3+4) = 244. Before those three gained the timeout gate the
-#     same host reported 223/11/1 -- 11 hard failures naming the fingerprint
+#     timeout and no gtimeout on PATH. RE-MEASURED at the current pin: 222
+#     passed, 0 failed, 4 skipped, and 222 + 0 + (3+12+3+4) = 244. Before those
+#     three gained the timeout gate the
+#     same host reported 223/11/1 (at the then-current pin of 238) -- 11 hard
+#     failures naming the fingerprint
 #     check, the cache wipe and the version record, plus 3 vacuous passes.
 #   * bp = 4 is NEW this round: it was 2 (covering case bp2's two assertions) and
 #     case bp3 added two more when the probe budget was consolidated into
@@ -3582,15 +3584,31 @@ fi
 # reported as drift instead of silently making every comparison compare empty
 # strings. `-e` deliberately has its own needle: its return is what re-admits the
 # skip-every-guard shape, so it is pinned absent rather than merely ordered.
+#
+# ALL FOUR guards are compared, not three. The first version of this block omitted
+# the hard-link guard while its sentinel still said "all four" and both assertions
+# were titled "every lock guard". MEASURED both directions: relocating ONLY that
+# guard above the create left the suite at 244 passed, 0 failed, and moving it
+# below the open did too -- every assertion here satisfied while that guard sat
+# exactly where the failure text says a guard must never sit. Above the create it
+# also goes vacuous: `stat` fails on an absent path, lock_nlink becomes empty, and
+# `[ -n "$lock_nlink" ]` skips the comparison.
+#
+# nlink is the guard least substitutable by its neighbours, so omitting it was the
+# worst of the four to omit: a hard link SHARES its target's inode, so `[ -L ]`
+# does not see it, `[ -f ]` passes it, and `stat -c '%u'` reports the TARGET's
+# owner -- a hard link to any root-owned file reads back uid 0 and clears the
+# owner check as well.
 lk_create_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ ! -e "\$LOCK_FILE" \]; then$' | head -1 | cut -d: -f1 || true)
 lk_symlink_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ -L "\$LOCK_FILE" \]; then$' | head -1 | cut -d: -f1 || true)
 lk_regular_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ ! -f "\$LOCK_FILE" \]; then$' | head -1 | cut -d: -f1 || true)
+lk_nlink_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*lock_nlink=\$\(stat -c' | head -1 | cut -d: -f1 || true)
 lk_owner_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*lock_owner=\$\(stat -c' | head -1 | cut -d: -f1 || true)
 lk_open_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*exec \{LOCK_FD\}<"\$LOCK_FILE"$' | head -1 | cut -d: -f1 || true)
 lk_ewrap_n=$(printf '%s\n' "${lock_main_code}" | grep -cE '^[[:space:]]*if \[ -e "\$LOCK_FILE" \]; then$' || true)
 
 if [ -n "${lk_create_at}" ] && [ -n "${lk_symlink_at}" ] && [ -n "${lk_regular_at}" ] \
-   && [ -n "${lk_owner_at}" ] && [ -n "${lk_open_at}" ]; then
+   && [ -n "${lk_nlink_at}" ] && [ -n "${lk_owner_at}" ] && [ -n "${lk_open_at}" ]; then
     echo "PASS: case z4: main()'s create, all four lock guards and the open were all located"
     pass_count=$((pass_count + 1))
 else
@@ -3600,17 +3618,19 @@ fi
 
 assert_eq "case z4: every lock guard runs AFTER the create, so it inspects the inode exec will open" \
     "after" "$( { [ -n "${lk_create_at}" ] && [ -n "${lk_symlink_at}" ] && [ -n "${lk_regular_at}" ] \
-                  && [ -n "${lk_owner_at}" ] \
+                  && [ -n "${lk_nlink_at}" ] && [ -n "${lk_owner_at}" ] \
                   && [ "${lk_symlink_at}" -gt "${lk_create_at}" ] \
                   && [ "${lk_regular_at}" -gt "${lk_create_at}" ] \
+                  && [ "${lk_nlink_at}" -gt "${lk_create_at}" ] \
                   && [ "${lk_owner_at}" -gt "${lk_create_at}" ]; } && echo "after" \
                 || echo "NOT after the create — on a host where the lock path is absent the guards are skipped and a plant before the conditional create is opened unchecked (SEC-BE-001)")"
 
 assert_eq "case z4: every lock guard runs BEFORE the open" \
     "before" "$( { [ -n "${lk_open_at}" ] && [ -n "${lk_symlink_at}" ] && [ -n "${lk_regular_at}" ] \
-                   && [ -n "${lk_owner_at}" ] \
+                   && [ -n "${lk_nlink_at}" ] && [ -n "${lk_owner_at}" ] \
                    && [ "${lk_symlink_at}" -lt "${lk_open_at}" ] \
                    && [ "${lk_regular_at}" -lt "${lk_open_at}" ] \
+                   && [ "${lk_nlink_at}" -lt "${lk_open_at}" ] \
                    && [ "${lk_owner_at}" -lt "${lk_open_at}" ]; } && echo "before" \
                 || echo "NOT before exec {LOCK_FD}< — a guard after the open cannot stop the open it exists to gate")"
 
@@ -3634,6 +3654,12 @@ assert_eq "case z4: no \`if [ -e ]\` wrapper around the guards (that shape skips
 if ! command -v flock >/dev/null 2>&1; then
     skip "case z4: concurrent lock acquisition (flock not found on PATH)" 3
 else
+# This branch's body is deliberately NOT indented. It contains a `<<'Z4EOF'`
+# here-doc, and `<<` (not `<<-`) requires its terminator at column 0; indenting
+# the body indents the delimiter and the here-doc swallows the rest of the file.
+# MEASURED: indenting the 47 lines below produced "here-document delimited by
+# end-of-file" and a syntax error. `<<-` is not an alternative either, since it
+# strips only TABS and this file is space-indented throughout.
 z4_dir="${FIXTURE_DIR}/lock-z4"; mkdir -p "${z4_dir}"
 z4_lock="${z4_dir}/vespasian-install-chrome.lock"
 cat > "${z4_dir}/acquire.sh" <<'Z4EOF'
@@ -3787,8 +3813,8 @@ fi
 # And the DECLARED maximum in the register comment, evaluated -- the left-hand side
 # of the arithmetic, not the "= 44" written after it, so a register whose own sum
 # has gone stale is caught. Max per label, not sum: j/j2 declares the same credit
-# on two mutually-exclusive arms, which is why the maximum is 44 and not the 58 the
-# nine literals add to.
+# on two mutually-exclusive arms, which is why the maximum is 47 and not the 61 the
+# ten literals add to.
 cr_derived=$(
     awk '
         match($0, /skip "case [a-z0-9\/]+:/) {
