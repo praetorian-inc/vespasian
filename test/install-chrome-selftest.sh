@@ -82,7 +82,7 @@ export CHROME_PROBE_TIMEOUT=2
 #   +2  case bp3, pinning that the consolidated chrome_probe_budget still
 #       validates the budget for _bounded_probe as chrome_runnable does
 # See the credit register below for the matching skip_credit accounting.
-EXPECTED_ASSERTIONS=244
+EXPECTED_ASSERTIONS=245
 
 pass_count=0
 fail_count=0
@@ -148,17 +148,17 @@ SUITE_COMPLETED=0
 # f4, v and y each have TWO independent triggers (gpg/fixture, or timeout) but
 # one skip() call apiece, so a host missing both tools still credits 3/12/3 --
 # never double.
-# EXPECTED_ASSERTIONS above is 244, MEASURED on a fully-equipped host (pass+fail+
+# EXPECTED_ASSERTIONS above is 245, MEASURED on a fully-equipped host (pass+fail+
 # skip_credit with every arm live). It moved 238 -> 239 when case cr landed, and
 # 239 -> 244 when case z4 gained the four ordering assertions plus the per-site
-# register check. Every figure quoted below was re-measured at 244, not carried
+# register check, and 244 -> 245 when the anchor-completeness check landed. Every figure quoted below was re-measured at 244, not carried
 # forward: this note has already gone stale twice by being carried forward.
 #
 # PROVENANCE, stated precisely rather than blanket-claimed as "MEASURED":
 #   * f2 = 4, f4 = 3, j/j2 = 14, v = 12 and y = 3 were FORCED this round on a
 #     host with no gpg on PATH (every PATH entry containing a gpg binary was
 #     replaced by a symlink farm omitting it). RE-MEASURED at the current pin:
-#     208 passed, 0 failed, 5 skipped; 208 + 0 + 36 = 244, so the pin held and
+#     209 passed, 0 failed, 5 skipped; 209 + 0 + 36 = 245, so the pin held and
 #     these five credits are measured rather than declared. f2 and f4 are the
 #     two this list previously omitted altogether -- they were added in abc36ed,
 #     after the round-8 measurement that the rest of the register inherits.
@@ -166,8 +166,8 @@ SUITE_COMPLETED=0
 #     not re-forced. Forcing them needs a non-git checkout and a root shell
 #     respectively, neither of which the equipped-host run can produce.
 #   * f4 = 3, v = 12 and y = 3 were ALSO forced this round on a host with no
-#     timeout and no gtimeout on PATH. RE-MEASURED at the current pin: 222
-#     passed, 0 failed, 4 skipped, and 222 + 0 + (3+12+3+4) = 244. Before those
+#     timeout and no gtimeout on PATH. RE-MEASURED at the current pin: 223
+#     passed, 0 failed, 4 skipped, and 223 + 0 + (3+12+3+4) = 245. Before those
 #     three gained the timeout gate the
 #     same host reported 223/11/1 (at the then-current pin of 238) -- 11 hard
 #     failures naming the fingerprint
@@ -3610,17 +3610,59 @@ fi
 # still runs and still prints "multiple hard links". Pinning the input while
 # claiming to pin the control is the same proxy defect this suite exists to
 # remove, reproduced inside the assertion written to remove it.
+#
+# The OWNER guard is TWO decisions and both are pinned. The first anchor caught
+# only `if [ -z "$lock_owner" ]` -- the fail-closed arm for an unreadable stat --
+# and left `if [ "$lock_owner" -ne 0 ] && [ "$lock_owner" -ne "$(id -u)" ]`, the
+# actual refusal, anchored nowhere. MEASURED: relocating ONLY that comparison
+# below the open kept both ordering assertions green at 244 passed, 0 failed,
+# with the refusal executing after the file was already opened. Case z2b stays
+# green through it too, because the refusal still runs and still prints
+# "neither root nor". By this file's own account (see the residual note in
+# install-chrome.sh) the uid comparison is the LOAD-BEARING half: a symlink
+# swapped in after `[ -L ]` is caught by nothing else, because `stat -c '%u'`
+# is the only un-dereferenced check left. Anchoring the wrong arm of a two-arm
+# guard is the same proxy defect one level down.
+#
+# TERMINATING RULE, so this stops being re-derived every round. This pin has been
+# found incomplete three rounds running, each time one level deeper: first a guard
+# omitted entirely, then two guards anchored on the `stat` assignment that feeds
+# them, then the wrong arm of the one guard that has two. The rule that ends it:
+#
+#   Anchor EVERY decision between the create and the open whose refusal a
+#   behavioural case asserts by message. One anchor per such decision -- not per
+#   guard, not per variable.
+#
+# Applying it mechanically yields exactly the five anchors below: symlink
+# ([ -L ], case z), regular-file ([ ! -f ], case z3), hard-link ([ -n ] && [ -ne 1 ],
+# case z2), owner-unreadable ([ -z ], case z2b), owner-uid ([ -ne 0 ] && [ -ne
+# $(id -u) ], case zown1). If a future edit adds a refusal with its own log_fail
+# and its own case, it needs its own anchor here; if this list and the set of
+# message-asserting cases ever disagree, the list is the one that is wrong.
 lk_create_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ ! -e "\$LOCK_FILE" \]; then$' | head -1 | cut -d: -f1 || true)
 lk_symlink_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ -L "\$LOCK_FILE" \]; then$' | head -1 | cut -d: -f1 || true)
 lk_regular_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ ! -f "\$LOCK_FILE" \]; then$' | head -1 | cut -d: -f1 || true)
 lk_nlink_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ -n "\$lock_nlink" \] && \[ "\$lock_nlink" -ne 1 \]; then$' | head -1 | cut -d: -f1 || true)
 lk_owner_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ -z "\$lock_owner" \]; then$' | head -1 | cut -d: -f1 || true)
+lk_owneruid_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ "\$lock_owner" -ne 0 \] && \[ "\$lock_owner" -ne "\$\(id -u\)" \]; then$' | head -1 | cut -d: -f1 || true)
 lk_open_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*exec \{LOCK_FD\}<"\$LOCK_FILE"$' | head -1 | cut -d: -f1 || true)
 lk_ewrap_n=$(printf '%s\n' "${lock_main_code}" | grep -cE '^[[:space:]]*if \[ -e "\$LOCK_FILE" \]; then$' || true)
 
+# The TERMINATING RULE above, enforced rather than asserted: count the refusal
+# decisions between the create and the open in main() itself, and require one
+# anchor apiece. A guard added later without an anchor here fails THIS check
+# instead of silently going unpinned, which is how the last three rounds each
+# discovered a missing anchor one at a time.
+lk_decisions=$(printf '%s\n' "${lock_main_code}" \
+    | awk -v a="${lk_create_at}" -v b="${lk_open_at}" \
+          'a != "" && b != "" && NR > a && NR < b && /^[[:space:]]*if \[/ { n++ } END { print n+0 }')
+assert_eq "case z4: every refusal decision between the create and the open has an ordering anchor" \
+    "5" "${lk_decisions}"
+
 if [ -n "${lk_create_at}" ] && [ -n "${lk_symlink_at}" ] && [ -n "${lk_regular_at}" ] \
-   && [ -n "${lk_nlink_at}" ] && [ -n "${lk_owner_at}" ] && [ -n "${lk_open_at}" ]; then
-    echo "PASS: case z4: main()'s create, all four lock guards and the open were all located"
+   && [ -n "${lk_nlink_at}" ] && [ -n "${lk_owner_at}" ] && [ -n "${lk_owneruid_at}" ] \
+   && [ -n "${lk_open_at}" ]; then
+    echo "PASS: case z4: main()'s create, all five lock decisions and the open were all located"
     pass_count=$((pass_count + 1))
 else
     echo "FAIL: case z4: could not locate main()'s create, a lock guard, or the open — the ordering assertions below would be vacuous; fix the extraction rather than deleting it"
@@ -3630,19 +3672,23 @@ fi
 assert_eq "case z4: every lock guard runs AFTER the create, so it inspects the inode exec will open" \
     "after" "$( { [ -n "${lk_create_at}" ] && [ -n "${lk_symlink_at}" ] && [ -n "${lk_regular_at}" ] \
                   && [ -n "${lk_nlink_at}" ] && [ -n "${lk_owner_at}" ] \
+                  && [ -n "${lk_owneruid_at}" ] \
                   && [ "${lk_symlink_at}" -gt "${lk_create_at}" ] \
                   && [ "${lk_regular_at}" -gt "${lk_create_at}" ] \
                   && [ "${lk_nlink_at}" -gt "${lk_create_at}" ] \
-                  && [ "${lk_owner_at}" -gt "${lk_create_at}" ]; } && echo "after" \
+                  && [ "${lk_owner_at}" -gt "${lk_create_at}" ] \
+                  && [ "${lk_owneruid_at}" -gt "${lk_create_at}" ]; } && echo "after" \
                 || echo "NOT after the create — on a host where the lock path is absent the guards are skipped and a plant before the conditional create is opened unchecked (SEC-BE-001)")"
 
 assert_eq "case z4: every lock guard runs BEFORE the open" \
     "before" "$( { [ -n "${lk_open_at}" ] && [ -n "${lk_symlink_at}" ] && [ -n "${lk_regular_at}" ] \
                    && [ -n "${lk_nlink_at}" ] && [ -n "${lk_owner_at}" ] \
+                   && [ -n "${lk_owneruid_at}" ] \
                    && [ "${lk_symlink_at}" -lt "${lk_open_at}" ] \
                    && [ "${lk_regular_at}" -lt "${lk_open_at}" ] \
                    && [ "${lk_nlink_at}" -lt "${lk_open_at}" ] \
-                   && [ "${lk_owner_at}" -lt "${lk_open_at}" ]; } && echo "before" \
+                   && [ "${lk_owner_at}" -lt "${lk_open_at}" ] \
+                   && [ "${lk_owneruid_at}" -lt "${lk_open_at}" ]; } && echo "before" \
                 || echo "NOT before exec {LOCK_FD}< — a guard after the open cannot stop the open it exists to gate")"
 
 assert_eq "case z4: no \`if [ -e ]\` wrapper around the guards (that shape skips them all when the path is absent)" \
@@ -3826,9 +3872,10 @@ fi
 # sum has gone stale is caught. Phrased without quoting the number: the previous
 # wording said `the "= 44" written after it` and was left behind when the maximum
 # became 47, in the very hunk that corrected the sentence two lines below. A
-# comment that names a figure it does not need is a comment that will go stale. Max per label, not sum: j/j2 declares the same credit
-# on two mutually-exclusive arms, which is why the maximum is 47 and not the 61 the
-# ten literals add to.
+# comment that names a figure it does not need is a comment that will go stale.
+#
+# Max per label, not sum: j/j2 declares the same credit on two mutually-exclusive
+# arms, which is why the maximum is 47 and not the 61 the ten literals add to.
 cr_derived=$(
     awk '
         match($0, /skip "case [a-z0-9\/]+:/) {
