@@ -3576,8 +3576,8 @@ fi
 # The guards used to sit ABOVE the create with three of them inside `if [ -e ]`, so
 # on a host where the lock path was absent every guard was skipped and a plant
 # arriving before the conditional create was opened unchecked. MEASURED: restoring
-# that layout left this suite at 239 passed, 0 failed -- the security fix could be
-# reverted in full and nothing noticed.
+# that layout left this suite at 239 passed, 0 failed (the pin was 239 then; it is
+# 244 now) -- the security fix could be reverted in full and nothing noticed.
 #
 # Same idiom as cases u and v3: locate each statement inside main()'s extracted body
 # and compare offsets, with a fidelity sentinel FIRST so a rename or a reword is
@@ -3599,11 +3599,22 @@ fi
 # does not see it, `[ -f ]` passes it, and `stat -c '%u'` reports the TARGET's
 # owner -- a hard link to any root-owned file reads back uid 0 and clears the
 # owner check as well.
+#
+# Anchored on each guard's DECISION, never on the `stat` assignment that feeds it.
+# The first version anchored nlink and owner on `lock_nlink=$(stat -c` and
+# `lock_owner=$(stat -c`, which are not controls -- they are inputs to controls.
+# MEASURED: moving ONLY the `if [ -n "$lock_nlink" ] ...` block below the open,
+# leaving its assignment in place, kept lk_nlink_at < lk_open_at and left the
+# suite at 244 passed, 0 failed, with the decision executing AFTER the file was
+# already opened. Case z2 stays green through that too, because the comparison
+# still runs and still prints "multiple hard links". Pinning the input while
+# claiming to pin the control is the same proxy defect this suite exists to
+# remove, reproduced inside the assertion written to remove it.
 lk_create_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ ! -e "\$LOCK_FILE" \]; then$' | head -1 | cut -d: -f1 || true)
 lk_symlink_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ -L "\$LOCK_FILE" \]; then$' | head -1 | cut -d: -f1 || true)
 lk_regular_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ ! -f "\$LOCK_FILE" \]; then$' | head -1 | cut -d: -f1 || true)
-lk_nlink_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*lock_nlink=\$\(stat -c' | head -1 | cut -d: -f1 || true)
-lk_owner_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*lock_owner=\$\(stat -c' | head -1 | cut -d: -f1 || true)
+lk_nlink_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ -n "\$lock_nlink" \] && \[ "\$lock_nlink" -ne 1 \]; then$' | head -1 | cut -d: -f1 || true)
+lk_owner_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ -z "\$lock_owner" \]; then$' | head -1 | cut -d: -f1 || true)
 lk_open_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*exec \{LOCK_FD\}<"\$LOCK_FILE"$' | head -1 | cut -d: -f1 || true)
 lk_ewrap_n=$(printf '%s\n' "${lock_main_code}" | grep -cE '^[[:space:]]*if \[ -e "\$LOCK_FILE" \]; then$' || true)
 
@@ -3811,8 +3822,11 @@ Per-site credits are pinned, not just their sum: an offsetting swap between two 
 fi
 
 # And the DECLARED maximum in the register comment, evaluated -- the left-hand side
-# of the arithmetic, not the "= 44" written after it, so a register whose own sum
-# has gone stale is caught. Max per label, not sum: j/j2 declares the same credit
+# of the arithmetic, not the total written after the "=", so a register whose own
+# sum has gone stale is caught. Phrased without quoting the number: the previous
+# wording said `the "= 44" written after it` and was left behind when the maximum
+# became 47, in the very hunk that corrected the sentence two lines below. A
+# comment that names a figure it does not need is a comment that will go stale. Max per label, not sum: j/j2 declares the same credit
 # on two mutually-exclusive arms, which is why the maximum is 47 and not the 61 the
 # ten literals add to.
 cr_derived=$(
