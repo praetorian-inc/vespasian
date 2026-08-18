@@ -151,8 +151,11 @@ SUITE_COMPLETED=0
 # EXPECTED_ASSERTIONS above is 245, MEASURED on a fully-equipped host (pass+fail+
 # skip_credit with every arm live). It moved 238 -> 239 when case cr landed, and
 # 239 -> 244 when case z4 gained the four ordering assertions plus the per-site
-# register check, and 244 -> 245 when the anchor-completeness check landed. Every figure quoted below was re-measured at 244, not carried
-# forward: this note has already gone stale twice by being carried forward.
+# register check, and 244 -> 245 when the anchor-completeness check landed.
+#
+# Every figure quoted below was re-measured at 245, not carried forward. This note
+# had gone stale by carry-forward in four consecutive review rounds before that
+# discipline was adopted.
 #
 # PROVENANCE, stated precisely rather than blanket-claimed as "MEASURED":
 #   * f2 = 4, f4 = 3, j/j2 = 14, v = 12 and y = 3 were FORCED this round on a
@@ -3576,8 +3579,9 @@ fi
 # The guards used to sit ABOVE the create with three of them inside `if [ -e ]`, so
 # on a host where the lock path was absent every guard was skipped and a plant
 # arriving before the conditional create was opened unchecked. MEASURED: restoring
-# that layout left this suite at 239 passed, 0 failed (the pin was 239 then; it is
-# 244 now) -- the security fix could be reverted in full and nothing noticed.
+# that layout left this suite at 239 passed, 0 failed (measured at the pin of the
+# day, 239; the pin is 245 now) -- the security fix could be reverted in full and
+# nothing noticed.
 #
 # Same idiom as cases u and v3: locate each statement inside main()'s extracted body
 # and compare offsets, with a fidelity sentinel FIRST so a rename or a reword is
@@ -3588,7 +3592,8 @@ fi
 # ALL FOUR guards are compared, not three. The first version of this block omitted
 # the hard-link guard while its sentinel still said "all four" and both assertions
 # were titled "every lock guard". MEASURED both directions: relocating ONLY that
-# guard above the create left the suite at 244 passed, 0 failed, and moving it
+# guard above the create left the suite at 244 passed, 0 failed (the pin then),
+# and moving it
 # below the open did too -- every assertion here satisfied while that guard sat
 # exactly where the failure text says a guard must never sit. Above the create it
 # also goes vacuous: `stat` fails on an absent path, lock_nlink becomes empty, and
@@ -3605,7 +3610,7 @@ fi
 # `lock_owner=$(stat -c`, which are not controls -- they are inputs to controls.
 # MEASURED: moving ONLY the `if [ -n "$lock_nlink" ] ...` block below the open,
 # leaving its assignment in place, kept lk_nlink_at < lk_open_at and left the
-# suite at 244 passed, 0 failed, with the decision executing AFTER the file was
+# suite at 244 passed, 0 failed (the pin then), with the decision executing AFTER the file was
 # already opened. Case z2 stays green through that too, because the comparison
 # still runs and still prints "multiple hard links". Pinning the input while
 # claiming to pin the control is the same proxy defect this suite exists to
@@ -3615,7 +3620,7 @@ fi
 # only `if [ -z "$lock_owner" ]` -- the fail-closed arm for an unreadable stat --
 # and left `if [ "$lock_owner" -ne 0 ] && [ "$lock_owner" -ne "$(id -u)" ]`, the
 # actual refusal, anchored nowhere. MEASURED: relocating ONLY that comparison
-# below the open kept both ordering assertions green at 244 passed, 0 failed,
+# below the open kept both ordering assertions green at 244 passed, 0 failed (the pin then),
 # with the refusal executing after the file was already opened. Case z2b stays
 # green through it too, because the refusal still runs and still prints
 # "neither root nor". By this file's own account (see the residual note in
@@ -3633,12 +3638,18 @@ fi
 #   behavioural case asserts by message. One anchor per such decision -- not per
 #   guard, not per variable.
 #
-# Applying it mechanically yields exactly the five anchors below: symlink
-# ([ -L ], case z), regular-file ([ ! -f ], case z3), hard-link ([ -n ] && [ -ne 1 ],
-# case z2), owner-unreadable ([ -z ], case z2b), owner-uid ([ -ne 0 ] && [ -ne
-# $(id -u) ], case zown1). If a future edit adds a refusal with its own log_fail
-# and its own case, it needs its own anchor here; if this list and the set of
-# message-asserting cases ever disagree, the list is the one that is wrong.
+# Applying it mechanically yields exactly the five anchors below: symlink ([ -L ]),
+# regular-file ([ ! -f ]), hard-link ([ -n ] && [ -ne 1 ]), owner-unreadable
+# ([ -z ]), and owner-uid ([ -ne 0 ] && [ -ne $(id -u) ]). Each is also refused
+# behaviourally -- four under case z, the file-type one under case z3 -- but the
+# case LABELS are deliberately NOT enumerated per anchor. An earlier version did
+# and got three of five wrong: `case z2` and `case zown1` appear nowhere, and
+# `case z2b` exists only as a heading comment above -- its own assertions are
+# labelled `case z`, a pre-existing heading/label mismatch this note is not the
+# place to fix. Naming five labels is five chances to be wrong, and the labels
+# are not what makes this list correct: the assertion below is, because it counts
+# the refusals in the source and demands one anchor each. A refusal added later
+# cannot go unanchored whatever its case is called.
 lk_create_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ ! -e "\$LOCK_FILE" \]; then$' | head -1 | cut -d: -f1 || true)
 lk_symlink_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ -L "\$LOCK_FILE" \]; then$' | head -1 | cut -d: -f1 || true)
 lk_regular_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \[ ! -f "\$LOCK_FILE" \]; then$' | head -1 | cut -d: -f1 || true)
@@ -3648,16 +3659,34 @@ lk_owneruid_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*if \
 lk_open_at=$(printf '%s\n' "${lock_main_code}" | grep -nE '^[[:space:]]*exec \{LOCK_FD\}<"\$LOCK_FILE"$' | head -1 | cut -d: -f1 || true)
 lk_ewrap_n=$(printf '%s\n' "${lock_main_code}" | grep -cE '^[[:space:]]*if \[ -e "\$LOCK_FILE" \]; then$' || true)
 
-# The TERMINATING RULE above, enforced rather than asserted: count the refusal
-# decisions between the create and the open in main() itself, and require one
-# anchor apiece. A guard added later without an anchor here fails THIS check
-# instead of silently going unpinned, which is how the last three rounds each
-# discovered a missing anchor one at a time.
-lk_decisions=$(printf '%s\n' "${lock_main_code}" \
+# The TERMINATING RULE above, enforced rather than asserted: count the refusals
+# between the create and the open in main() itself, and require one anchor apiece.
+# A guard added later without an anchor fails THIS check instead of silently going
+# unpinned, which is how the last three rounds each found a missing anchor, one at
+# a time, by review.
+#
+# Counted by `log_fail`, NOT by `if [`. Two reasons, both measured:
+#   * FORM-INDEPENDENT. An `if [` counter sees only one spelling of a refusal.
+#     MEASURED: adding `[ ! -S "$LOCK_FILE" ] || { log_fail ...; exit 1; }` to the
+#     span left the suite GREEN -- unanchored, uncounted, and inert. Every refusal
+#     in this span calls log_fail exactly once whatever its syntax, so counting
+#     that catches `if !`, `[ ] || { }`, `case`, and forms nobody has written yet.
+#   * NO LITERAL TO BUMP. The expected side is DERIVED from the anchors above, so
+#     there is no hardcoded number a future author can make green by editing one
+#     character -- the failure says 5 anchors vs 6 refusals, and the only way to
+#     square it is to add the anchor. A hardcoded expectation would have been the
+#     same carry-forward defect that decayed the credit register four rounds
+#     running, rebuilt one line below the note warning about it.
+lk_anchors_set=0
+for _lk_a in "${lk_symlink_at}" "${lk_regular_at}" "${lk_nlink_at}" \
+             "${lk_owner_at}" "${lk_owneruid_at}"; do
+    if [ -n "${_lk_a}" ]; then lk_anchors_set=$((lk_anchors_set + 1)); fi
+done
+lk_refusals=$(printf '%s\n' "${lock_main_code}" \
     | awk -v a="${lk_create_at}" -v b="${lk_open_at}" \
-          'a != "" && b != "" && NR > a && NR < b && /^[[:space:]]*if \[/ { n++ } END { print n+0 }')
-assert_eq "case z4: every refusal decision between the create and the open has an ordering anchor" \
-    "5" "${lk_decisions}"
+          'a != "" && b != "" && NR > a && NR < b && /log_fail/ { n++ } END { print n+0 }')
+assert_eq "case z4: every refusal between the create and the open has an ordering anchor (add the anchor, do not adjust this count)" \
+    "${lk_anchors_set}" "${lk_refusals}"
 
 if [ -n "${lk_create_at}" ] && [ -n "${lk_symlink_at}" ] && [ -n "${lk_regular_at}" ] \
    && [ -n "${lk_nlink_at}" ] && [ -n "${lk_owner_at}" ] && [ -n "${lk_owneruid_at}" ] \
