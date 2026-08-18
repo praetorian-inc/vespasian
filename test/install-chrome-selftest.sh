@@ -125,17 +125,17 @@ SUITE_COMPLETED=0
 # The register is now derived from the call sites themselves, so it can be
 # checked against the source rather than believed:
 #
-#   line 235   a2    = 1    not inside a git work tree
-#   line 665   f2    = 4    gpg absent (real, unstubbed gpg -- unlike f2b's
+#   a2    = 1    not inside a git work tree
+#   f2    = 4    gpg absent (real, unstubbed gpg -- unlike f2b's
 #                                        own stubbed gpg, which needs no gate)
-#   line 804   f4    = 3    gpg absent, same reason as f2
-#   line 1198  j/j2  = 14   key fixture missing or empty
-#   line 1200  j/j2  = 14   gpg absent  (mutually exclusive with the above,
+#   f4    = 3    gpg absent, same reason as f2
+#   j/j2  = 14   key fixture missing or empty
+#   j/j2  = 14   gpg absent  (mutually exclusive with the above,
 #                                        so j/j2 contributes 14, never 28)
-#   line 1276  l     = 3    running as root
-#   line 2458  v     = 12   needs the same key fixture / gpg as j/j2
-#   line 2981  y     = 3    needs the same key fixture / gpg as j/j2
-#   line 3057  bp    = 4    no timeout/gtimeout on PATH
+#   l     = 3    running as root
+#   v     = 12   needs the same key fixture / gpg as j/j2
+#   y     = 3    needs the same key fixture / gpg as j/j2
+#   bp    = 4    no timeout/gtimeout on PATH
 #
 # Maximum skip_credit on a maximally-degraded host: 1+4+3+14+3+12+3+4 = 44.
 # EXPECTED_ASSERTIONS below is 238, MEASURED on a fully-equipped host in this
@@ -3260,29 +3260,23 @@ run_lock_plant() {
         PATH="${bin}:${PATH}"
         set +e
         local out rc
-        if [ -n "${tmo}" ]; then
-            # `main` is not auto-invoked when sourced (BASH_SOURCE guard), so the
-            # inner shell sources then calls it explicitly, exactly as the
-            # unbounded arm below does.
-            out=$("${tmo}" 15 bash -c 'source "$1"; main' _ "${INSTALL_SCRIPT}" 2>&1)
-            rc=$?
-        else
-            # A bare `bash -c` (not `source` directly into THIS subshell) is
-            # deliberate, not an unbounded-vs-bounded stylistic mismatch: a
-            # direct `source` here would pull install-chrome.sh's own
-            # `set -euo pipefail` into this subshell, and the next line would
-            # then be `out=$(main 2>&1)` -- a bare assignment. Under errexit, a
-            # failing `main` (every lock-planted case in this function
-            # deliberately makes it fail) aborts this whole `(` block before
-            # `rc=$?`/`printf` ever run, losing every case from z onward AND
-            # the assertion-accounting pin at the end of the file, with no
-            # FAIL printed for any of it -- a silent abort dressed as a clean
-            # run. A fresh bash process contains that errexit to itself; only
-            # its exit code escapes, exactly as the timeout arm above already
-            # relies on.
-            out=$(bash -c 'source "$1"; main' _ "${INSTALL_SCRIPT}" 2>&1)
-            rc=$?
-        fi
+        # ONE arm, not two. The `bash -c` is load-bearing: sourcing
+        # install-chrome.sh directly here would pull its own `set -euo pipefail`
+        # into this subshell, and the following bare assignment would then abort
+        # the whole `(` block when main fails -- which every lock-planted case
+        # here deliberately makes it do -- losing every case from z onward AND
+        # the accounting pin, with no FAIL printed. A fresh bash process contains
+        # that errexit; only its exit code escapes.
+        #
+        # Kept as a single arm because the else branch ran ONLY on a host with
+        # neither timeout nor gtimeout -- no CI job -- so a revert to a direct
+        # `source` stayed fully green everywhere and was measured to lose 24
+        # assertions on a timeout-less host. One arm makes the form execute, and
+        # therefore be exercised, on every host.
+        local -a invoke=(bash -c 'source "$1"; main' _ "${INSTALL_SCRIPT}")
+        [ -n "${tmo}" ] && invoke=("${tmo}" 15 "${invoke[@]}")
+        out=$("${invoke[@]}" 2>&1)
+        rc=$?
         printf '%s\n%s\n' "${rc}" "${out}"
     )
 }
