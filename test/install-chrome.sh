@@ -898,7 +898,8 @@ main() {
     # pointing at a non-sticky directory another local user can write to would let
     # them swap the staged apt source or keyring between staging and install. /tmp's
     # sticky bit is the property being relied on, and this script already assumes it
-    # for LOCK_FILE.
+    # for LOCK_FILE -- see the residual note on the lock guards, which depends on
+    # this same property to bound the window between its last guard and the open.
     SCRATCH_DIR="$(TMPDIR=/tmp mktemp -d)"
     # Single-quoted trap bodies: they are re-parsed as commands when the trap
     # fires, so interpolating the path here would let a quote in $TMPDIR (which
@@ -994,18 +995,40 @@ main() {
         #
         # Residual, stated precisely rather than flattered. Shell offers no atomic
         # check-and-open, so a plant arriving after a guard is not excluded by that
-        # guard. "One statement boundary" would only be true of the LAST guard: the
-        # symlink test is three statements and two forks from the `exec`, and a
-        # symlink swapped in after it is not re-tested by what follows -- `[ -f ]`
-        # DEREFERENCES and would pass, and `stat` does NOT dereference, so `%h`
-        # reports the symlink's own link count of 1.
+        # guard, and "one statement boundary" would only ever be true of the LAST
+        # guard. COUNTED from the source below, on the path where no guard fires:
+        # the symlink test is EIGHT statements from the `exec`, and three forks on
+        # a non-root-owned lock (`stat -c '%h'`, `stat -c '%u'`, and the `$(id -u)`
+        # inside the owner comparison) or two on a root-owned one, where
+        # `[ "$lock_owner" -ne 0 ]` short-circuits before `$(id -u)` runs.
+        #
+        # An earlier version of this note said "three statements and two forks".
+        # Both figures were wrong in the direction that makes the window sound
+        # narrower than it is, which is the wrong direction for a note whose whole
+        # job is to stop someone deleting the owner guard as redundant. Recount
+        # from the source if you edit this block; do not carry these numbers
+        # forward.
+        #
+        # A symlink swapped in after the `[ -L ]` test is not re-tested by anything
+        # that follows: `[ -f ]` DEREFERENCES and would pass it, and `stat` does
+        # NOT dereference, so `%h` reports the symlink's own link count of 1.
         #
         # What actually covers that span is the OWNER guard: `stat -c '%u'` is
-        # un-dereferenced, so it reports the planter's uid and refuses. The
+        # un-dereferenced, so it reports the planter's uid and refuses. Deleting it
+        # on the assumption that the ordering alone is sufficient re-opens the whole
+        # eight-statement span -- it is the guard carrying this window, not a
+        # redundant extra.
+        #
+        # The remaining window, between the owner guard and the `exec`, is closed by
+        # a premise this block relies on and used to state 100 lines away instead of
+        # here: /tmp's STICKY BIT. It means only a file's owner (or root) may unlink
+        # or rename it, so a third local user cannot remove the checked lock and
+        # substitute their own -- see the matching note on SCRATCH_DIR/TMPDIR, which
+        # relies on the same property and already cites LOCK_FILE for it. The
         # genuinely unexcluded set is therefore "a plant by root or by the invoking
-        # user" -- both of which can already do anything this script does. Do not
-        # delete the owner check on the assumption the ordering alone is sufficient;
-        # it is the guard carrying this span, not a redundant extra.
+        # user", both of which can already do anything this script does. If
+        # LOCK_FILE is ever moved off a sticky directory, that sentence stops being
+        # true and this block needs an atomic primitive rather than a guard chain.
         if [ -L "$LOCK_FILE" ]; then
             log_fail "${LOCK_FILE} is a symlink — refusing to lock through it." >&2
             exit 1
