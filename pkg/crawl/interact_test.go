@@ -165,3 +165,68 @@ func TestMaxInteractionCandidates_ExceedsClickBudget(t *testing.T) {
 			maxInteractionCandidates, maxInteractionsPerPage)
 	}
 }
+
+// TestClickAllowed_GlyphOnlyLabelFailsClosed pins the fail-closed layer for the exact
+// control shape labelAttributes' comment says it covers: an icon-only control whose
+// icon is a TEXT CHARACTER rather than markup.
+//
+// el.Text() returns descendant text, so each of these read back non-blank. The old
+// gate tested strings.TrimSpace(label) != "", which such a label passes, and
+// isDestructiveLabel matched nothing because it splits on letters and digits and a
+// glyph is neither — so the pass clicked a control it had no evidence about. The
+// literal "x" close/delete button is the comment's own example (LAB-4678 review,
+// SEC-BE-006).
+func TestClickAllowed_GlyphOnlyLabelFailsClosed(t *testing.T) {
+	// Every label here is non-blank and yields zero letter-or-digit words.
+	for _, label := range []string{
+		"✕",          // ✕ MULTIPLICATION X, the common close/delete glyph
+		"\U0001F5D1", // 🗑 wastebasket
+		"",          // private-use-area icon-font codepoint
+		"×",          // × multiplication sign
+		"• •",        // bullets with whitespace
+		"—",          // em dash
+	} {
+		if clickAllowed(label, true) {
+			t.Errorf("clickAllowed(%q, true) = true; a label with no letter or digit carries no "+
+				"evidence a destructive-word list could act on, so the gate must fail closed", label)
+		}
+		if interactionCandidate(label, map[string]bool{}) {
+			t.Errorf("interactionCandidate(%q) = true; the up-front scan and the pre-click gate "+
+				"must agree in the restrictive direction", label)
+		}
+	}
+
+	// A glyph ALONGSIDE a real word is readable — the word is what the list matches on,
+	// and skipping these would cost most of the interaction coverage.
+	for _, label := range []string{"✕ Close", "Load more →", "Next ›"} {
+		if !clickAllowed(label, true) {
+			t.Errorf("clickAllowed(%q, true) = false; a glyph next to a real word is still readable", label)
+		}
+	}
+}
+
+// TestLabelIsReadable covers the predicate directly, including that it agrees with the
+// split isDestructiveLabel uses. A label the word list cannot see must not be treated
+// as read.
+func TestLabelIsReadable(t *testing.T) {
+	cases := []struct {
+		label string
+		want  bool
+	}{
+		{"Delete", true},
+		{"Delete?", true},
+		{"2FA", true},
+		{"x", true}, // a LETTER x is readable, unlike the ✕ glyph
+		{"", false},
+		{"   ", false},
+		{"✕", false},
+		{"!!!", false},
+		{"...", false},
+		{"\U0001F5D1️", false}, // wastebasket plus variation selector
+	}
+	for _, c := range cases {
+		if got := labelIsReadable(c.label); got != c.want {
+			t.Errorf("labelIsReadable(%q) = %v, want %v", c.label, got, c.want)
+		}
+	}
+}

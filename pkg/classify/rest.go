@@ -29,9 +29,59 @@ import (
 // of what content-type the server sent. .webmanifest is the belt to
 // documentContentTypes' braces: a manifest served with a wrong or missing
 // content-type is still not an endpoint.
+//
+// .mjs and .cjs are here because crawl.isRetainedForStaticAnalysis admits both into
+// the capture past the passive-capture scope filter, and only .js was excluded. An
+// out-of-scope GET https://cdn.example/api/data.mjs served as application/json with a
+// JSON body therefore cleared every rule and became an operation on an out-of-scope
+// host. crawl.nonPageExtensions already listed all three (LAB-4678 review, REQ-005).
 var staticExtensions = []string{
-	".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".ico",
+	".js", ".mjs", ".cjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".ico",
 	".woff", ".woff2", ".ttf", ".eot", ".svg", ".map", ".webmanifest",
+}
+
+// responseContentType resolves a response's media type, preferring the parsed
+// ContentType field and falling back to the raw header. Importers populate one or the
+// other depending on source, so both classifiers and Rule 1 need the same fallback.
+func responseContentType(req crawl.ObservedRequest) string {
+	if ct := req.Response.ContentType; ct != "" {
+		return ct
+	}
+	return mediatype.Header(req.Response.Headers, "content-type")
+}
+
+// isStaticAssetRequest is Rule 1's static-asset test, shared by every classifier so
+// the exclusion cannot be widened in one and left narrow in the others.
+//
+// It tests the URL extension AND the response media type. The media-type half exists
+// because the extension half does not cover what actually reaches the classifier:
+// crawl.isRetainedForStaticAnalysis keeps an out-of-scope response in the capture when
+// it looks like JavaScript, and it decides that from the CONTENT-TYPE first, falling
+// back to the path suffix only when the content-type is missing. So a bundle served
+// from an extensionless URL as application/javascript was retained by the filter with
+// no path suffix for Rule 1 to match, and a bundler output whose first non-space byte
+// is '{' or '[' then scored JSONBodyConfidence on the JSON-body rule — above the
+// default threshold — putting an out-of-scope host into the emitted spec and its
+// servers list. Both sides now call mediatype.IsJavaScript, so the scope exemption
+// cannot admit a media type this exclusion misses (LAB-4678 review, REQ-005).
+//
+// The cost is JSONP: an endpoint that answers with application/javascript is now
+// excluded on media type where it previously could classify on its path. That is the
+// stance Rule 1 already took — a JSONP endpoint served at /api/data.js was excluded by
+// the extension list before this — so extending it to the media type is consistent
+// rather than new, and it is the direction that keeps the scope exemption honest. A
+// JSONP-only API is not discoverable by this classifier; that is a known limitation,
+// not an oversight.
+//
+// respCT is passed in rather than re-derived because each caller already resolves the
+// content-type from Response.ContentType with a Headers fallback.
+func isStaticAssetRequest(lowerPath, respCT string) bool {
+	for _, ext := range staticExtensions {
+		if strings.HasSuffix(lowerPath, ext) {
+			return true
+		}
+	}
+	return mediatype.IsJavaScript(respCT)
 }
 
 // staticPathSegments lists path segments that indicate static asset directories.
@@ -148,11 +198,11 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 
 	lowerPath := strings.ToLower(parsedURL.Path)
 
-	// Rule 1: Static asset exclusion.
-	for _, ext := range staticExtensions {
-		if strings.HasSuffix(lowerPath, ext) {
-			return false, 0, ""
-		}
+	respCT := responseContentType(req)
+
+	// Rule 1: Static asset exclusion, by URL extension or JavaScript media type.
+	if isStaticAssetRequest(lowerPath, respCT) {
+		return false, 0, ""
 	}
 	for _, seg := range staticPathSegments {
 		if strings.Contains(lowerPath, seg) {
@@ -164,11 +214,6 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	// content-type rule both miss the common case.
 	if isDocumentPath(lowerPath) {
 		return false, 0, ""
-	}
-
-	respCT := req.Response.ContentType
-	if respCT == "" {
-		respCT = mediatype.Header(req.Response.Headers, "content-type")
 	}
 
 	// Rule 1b: Document media types DISQUALIFY, they are not merely a missing

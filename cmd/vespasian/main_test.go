@@ -4128,3 +4128,55 @@ func TestGenerateCmd_ResolveJSReplayConfig_RejectsInvalidProxy(t *testing.T) {
 		require.NotNil(t, cfg.Proxy.URL, "a valid --proxy must reach the returned JSReplayConfig.Proxy.URL")
 	})
 }
+
+// TestWriteOutput_FileModeIs0600 asserts the mode capture.json actually lands at.
+//
+// writeOutput is the only non-test file-write site in the repo and it is the one that
+// matters: capture.json carries request and response Headers verbatim, so an
+// authenticated crawl writes operator and target credentials through it. Before this
+// test the 0600 literal in the source was the only evidence, and a future edit to 0644
+// (or dropping the perm argument) would have failed nothing.
+//
+// The pre-existing case is the defect: O_CREATE's perm applies only when the call
+// creates the file, so a re-run over a capture.json left at 0644 by an older build, a
+// shell redirect, or a looser umask kept 0644 (LAB-4678 review, SEC-BE-001).
+func TestWriteOutput_FileModeIs0600(t *testing.T) {
+	write := func(w io.Writer) error {
+		_, err := w.Write([]byte(`[{"method":"GET"}]`))
+		return err
+	}
+
+	t.Run("fresh file", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "capture.json")
+		if err := writeOutput(p, write); err != nil {
+			t.Fatalf("writeOutput: %v", err)
+		}
+		assertMode0600(t, p)
+	})
+
+	t.Run("pre-existing loose file is tightened", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "capture.json")
+		// Pre-create world-readable, as a shell redirect or an older build would.
+		// The loose mode IS the fixture: writeOutput has to tighten it.
+		if err := os.WriteFile(p, []byte("stale"), 0o644); err != nil { //nolint:gosec // G306: a deliberately loose pre-existing file is the condition under test
+			t.Fatal(err)
+		}
+		if err := writeOutput(p, write); err != nil {
+			t.Fatalf("writeOutput: %v", err)
+		}
+		assertMode0600(t, p)
+	})
+}
+
+// assertMode0600 fails t unless path's permission bits are exactly 0600.
+func assertMode0600(t *testing.T, path string) {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if got := st.Mode().Perm(); got != 0o600 {
+		t.Errorf("mode = %04o, want 0600; capture.json carries captured Authorization "+
+			"headers and session cookies, so a looser mode exposes them to every local user", got)
+	}
+}

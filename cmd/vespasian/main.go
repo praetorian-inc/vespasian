@@ -206,15 +206,37 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl
 	return requests, nil
 }
 
+// captureFileMode is the mode every file writeOutput produces must end up with.
+//
+// 0600 because capture.json carries per-request Headers and Response.Headers verbatim
+// from the browser and the HTTP backend, so an authenticated crawl (-H "Authorization:
+// ...", session cookies) lands operator and target credentials on disk through this one
+// function. TestWriteOutput_FileModeIs0600 asserts the mode the file actually lands at,
+// on both the fresh and the pre-existing path; before that nothing did, and grep for
+// Mode().Perm() across the module returned nothing (LAB-4678 review, SEC-BE-001).
+const captureFileMode = 0o600
+
 // writeOutput opens the output file (or stdout if path is empty), calls fn to
 // write content, and ensures the file is closed properly.
+//
+// The mode is applied with Chmod after the open, not left to O_CREATE. O_CREATE's perm
+// argument takes effect only when the call actually CREATES the file, so with O_TRUNC
+// and no O_EXCL, re-running a scan over an existing capture.json — one from an older
+// build, a shell redirect, or a copy made under a looser umask — truncated and rewrote
+// it while KEEPING its original mode. The source said 0600 and the credentials landed
+// in a world-readable file. Chmod on the descriptor rather than the path so the mode is
+// set on the file just opened and not on whatever the path resolves to next.
 func writeOutput(path string, fn func(io.Writer) error) error {
 	if path == "" {
 		return fn(os.Stdout)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600) //nolint:gosec // G304: CLI tool, user controls output path
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, captureFileMode) //nolint:gosec // G304: CLI tool, user controls output path
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	if err := f.Chmod(captureFileMode); err != nil {
+		f.Close() //nolint:errcheck,gosec // already failing; the Chmod error is what the caller needs
+		return fmt.Errorf("failed to set output file permissions: %w", err)
 	}
 	writeErr := fn(f)
 	closeErr := f.Close()

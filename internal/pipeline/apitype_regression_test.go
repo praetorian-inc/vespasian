@@ -150,3 +150,48 @@ func TestSchemaUnion_SurvivesTheDefaultPipeline(t *testing.T) {
 		})
 	}
 }
+
+// TestBothBodylessStatusesSurviveTheDefaultPipeline drives the real default pipeline —
+// classify, then Deduplicate, then generate — over two observations of one bodyless-request
+// endpoint that answered with different status codes, and asserts the spec documents both.
+//
+// This is the shape appendMergedResponse's body-length gate discarded. Deduplicate's key
+// hashes the REQUEST body, so two GETs of /users collapse into one entry; preferredResponse
+// keeps one status as the retained Response and the other reaches the generator only through
+// MergedResponses. A 204 has no body, so the gate dropped it and the emitted document
+// documented 200 alone (LAB-4678 review, QUAL-002).
+//
+// End-to-end rather than a direct appendMergedResponse call because the defect was
+// specifically that the production path never carried the value: a unit test on the
+// generator would pass while the pipeline dropped the response before reaching it.
+func TestBothBodylessStatusesSurviveTheDefaultPipeline(t *testing.T) {
+	mkStatus := func(code int) crawl.ObservedRequest {
+		return crawl.ObservedRequest{
+			Method: "GET", URL: "https://ex.com/api/users",
+			Response: crawl.ObservedResponse{StatusCode: code, ContentType: "application/json"},
+		}
+	}
+
+	reqs := []crawl.ObservedRequest{mkStatus(200), mkStatus(204)}
+	classified := classify.RunClassifiers(
+		[]classify.APIClassifier{&classify.RESTClassifier{}}, reqs, 0.5)
+	deduped := classify.Deduplicate(classified)
+	if len(deduped) != 1 {
+		t.Fatalf("Deduplicate produced %d entries, want 1; this test's premise is that the two "+
+			"observations collapse, so the second status can only survive via MergedResponses", len(deduped))
+	}
+
+	g := &restgen.OpenAPIGenerator{}
+	raw, err := g.Generate(deduped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := string(raw)
+
+	for _, status := range []string{"\"200\"", "\"204\""} {
+		if !strings.Contains(spec, status) {
+			t.Errorf("status %s missing from the generated document; both observed statuses of a "+
+				"bodyless endpoint must be documented:\n%s", status, spec)
+		}
+	}
+}

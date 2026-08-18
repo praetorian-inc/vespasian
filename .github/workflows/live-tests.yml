@@ -182,6 +182,12 @@ jobs:
       # The runner's Chrome cannot use its sandbox in this container; browser.go
       # honors this env var (see shouldDisableSandbox), matching the `test` job.
       VESPASIAN_NO_SANDBOX: "true"
+      # This runner is SUPPOSED to have a browser, so an unavailable Chrome is a
+      # failure here rather than a skip. Without it every rod row skips and this job
+      # reports green having executed none of the browser-only assertions it exists
+      # for — the diagnostic step below deliberately decides nothing, so nothing else
+      # would catch that (LAB-4678 review, TEST-014).
+      VESPASIAN_REQUIRE_CHROME: "1"
     steps:
       # Defense-in-depth (LAB-4732 / SEC-BE-002): monitor and record all
       # outbound network traffic. Audit mode is non-blocking.

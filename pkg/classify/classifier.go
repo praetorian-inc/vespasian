@@ -436,8 +436,22 @@ func sameResponseContent(a, b crawl.ObservedResponse) bool {
 // entry already held, and unless the list is full. Deduplicating here keeps a
 // page that fires the same XHR fifty times from filling the budget with one
 // repeated shape and crowding out a genuinely different observation.
+//
+// The skip test is responsePopulated, NOT a body-length check. It was `len(loser.Body)
+// == 0`, which dropped exactly the case MergedResponses exists to carry: the dedup key
+// hashes the REQUEST body, so two bodyless-request observations of one endpoint that
+// answered with different STATUS codes (a 200 and a 204) collapse to one entry,
+// preferredResponse keeps one status, and this is the only path by which the other
+// reaches pkg/generate/rest's per-status loop. A 204 has no body, so the length gate
+// discarded it and the spec documented one of the two observed statuses. That also
+// contradicted responsePopulated above, which documents a positive StatusCode with no
+// body as a real response that documents the endpoint. responsePopulated still keeps
+// out the case the length gate was reaching for — a half-captured placeholder with a
+// zero status and no content — so a bogus status cannot enter the spec
+// (LAB-4678 review, QUAL-002). TestMergedResponses_RetainsDistinctBodylessStatus and
+// TestBuildOperation_DocumentsBothBodylessStatuses pin both halves.
 func appendMergedResponse(merged []crawl.ObservedResponse, winner, loser crawl.ObservedResponse) []crawl.ObservedResponse {
-	if len(loser.Body) == 0 || sameResponseContent(winner, loser) {
+	if !responsePopulated(loser) || sameResponseContent(winner, loser) {
 		return merged
 	}
 	if len(merged) >= MaxMergedResponses {

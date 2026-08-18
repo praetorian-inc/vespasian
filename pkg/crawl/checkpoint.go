@@ -269,6 +269,18 @@ const (
 // read-then-unmarshal shape also keeps the byte-cap check exact: a decoder streaming
 // straight off the reader would have consumed a prefix before the overflow was
 // detectable, turning "checkpoint exceeds N bytes" into a JSON syntax error.
+//
+// Each UnmarshalJSON RESETS its receiver first. encoding/json calls a field's
+// UnmarshalJSON once per occurrence of that key in the object, so a checkpoint
+// repeating "pending" or "seen" re-enters here with the accumulated slice intact
+// while decodeBoundedArray's counter restarts at zero. Appending across those calls
+// made the cap per-key-occurrence instead of per-checkpoint, leaving
+// MaxCheckpointBytes as the only real bound: ~16 repeated one-character-key arrays
+// fit under 64 MB and decode to ~16M entries, which is the transient-allocation cost
+// the cap exists to remove. Resetting makes a repeated key OVERWRITE, which is also
+// exactly what encoding/json does for a plain []string field.
+// TestBoundedDecoders_RepeatedKeyOverwrites and
+// TestLoadCheckpoint_RepeatedKeyDoesNotMultiplyTheCap pin both halves.
 type (
 	boundedPending []PendingURL
 	boundedSeen    []string
@@ -276,6 +288,7 @@ type (
 
 // UnmarshalJSON decodes the pending array, refusing more than MaxCheckpointEntries.
 func (b *boundedPending) UnmarshalJSON(data []byte) error {
+	*b = nil
 	return decodeBoundedArray(data, "pending", MaxCheckpointEntries, func(dec *json.Decoder) error {
 		var e PendingURL
 		if err := dec.Decode(&e); err != nil {
@@ -288,6 +301,7 @@ func (b *boundedPending) UnmarshalJSON(data []byte) error {
 
 // UnmarshalJSON decodes the seen array, refusing more than MaxCheckpointEntries.
 func (b *boundedSeen) UnmarshalJSON(data []byte) error {
+	*b = nil
 	return decodeBoundedArray(data, "seen", MaxCheckpointEntries, func(dec *json.Decoder) error {
 		var s string
 		if err := dec.Decode(&s); err != nil {

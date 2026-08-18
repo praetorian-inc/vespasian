@@ -682,13 +682,25 @@ func interactFixture(t *testing.T) (*httptest.Server, func(string) int) {
 		// The /api endpoints below appear nowhere as a link or a literal fetch on
 		// load, so passive crawling and static JS analysis cannot reach them — only
 		// a real click can. The destructive controls carry their verb in different
-		// places (text, aria-label, title) to exercise every label source.
+		// places (text, aria-label, title, a descendant's alt) to exercise every
+		// label source, and one control carries no verb anywhere.
+		//
+		// danger-glyph has a glyph and NOTHING else: no attribute carries a meaning,
+		// so there is no evidence about it either way and the fail-closed layer has to
+		// skip it. It read back non-blank from el.Text() and was clicked.
+		//
+		// danger-descendant is the icon-wrapper shape: its own text is an innocuous
+		// word, so it is readable and matches no destructive verb, while the meaning
+		// lives on a DESCENDANT's alt that el.Attribute() never read
+		// (LAB-4678 review, SEC-BE-006).
 		fmt.Fprint(w, `<html><body>
 <form action="/submitted" method="get"><button id="form-submit">Search</button></form>
 <button id="safe" onclick="fetch('/api/interaction-only')">Load more</button>
 <button id="danger-text" onclick="fetch('/api/destructive-text')">Delete account</button>
 <button id="danger-aria" aria-label="Delete item" onclick="fetch('/api/destructive-aria')">&times;</button>
 <button id="danger-title" title="Erase everything" onclick="fetch('/api/destructive-title')">!</button>
+<button id="danger-glyph" onclick="fetch('/api/glyph-only')">&#x2715;</button>
+<button id="danger-descendant" onclick="fetch('/api/destructive-descendant')"><img alt="Delete account" src="data:,"> Options</button>
 </body></html>`)
 	}))
 	t.Cleanup(srv.Close)
@@ -776,7 +788,13 @@ func TestRodEngine_Interact_SkipsDestructiveControls(t *testing.T) {
 		t.Fatalf("no interaction occurred, so the destructive assertions prove nothing; captured: %v", captured)
 	}
 
-	for _, p := range []string{"/api/destructive-text", "/api/destructive-aria", "/api/destructive-title"} {
+	for _, p := range []string{
+		"/api/destructive-text", "/api/destructive-aria", "/api/destructive-title",
+		// A glyph-only label carries no evidence, so the gate must fail closed on it.
+		"/api/glyph-only",
+		// The verb lives on a descendant's alt; the element's own attributes are silent.
+		"/api/destructive-descendant",
+	} {
 		if n := hits(p); n != 0 {
 			t.Errorf("destructive control was clicked: %s hit %d times", p, n)
 		}

@@ -856,3 +856,87 @@ func TestCheckpoint_NullArraysDecodeAsEmpty(t *testing.T) {
 		t.Errorf("pending=%v seen=%v, want both empty", cp.Pending, cp.Seen)
 	}
 }
+
+// TestBoundedDecoders_RepeatedKeyOverwrites drives the bounded unmarshalers directly
+// with a receiver that already holds entries, which is the state encoding/json leaves
+// them in on the second occurrence of a duplicated key. Without the reset each call
+// appended, so the MaxCheckpointEntries budget restarted per occurrence while the
+// slice kept growing (LAB-4678 review, SEC-BE-002).
+func TestBoundedDecoders_RepeatedKeyOverwrites(t *testing.T) {
+	t.Run("seen", func(t *testing.T) {
+		b := boundedSeen{"stale-a", "stale-b"}
+		if err := b.UnmarshalJSON([]byte(`["fresh"]`)); err != nil {
+			t.Fatalf("UnmarshalJSON: %v", err)
+		}
+		if got := []string(b); len(got) != 1 || got[0] != "fresh" {
+			t.Errorf("boundedSeen = %v, want [fresh]; a second occurrence must replace, not extend", got)
+		}
+	})
+
+	t.Run("pending", func(t *testing.T) {
+		b := boundedPending{{URL: "https://ex.com/stale", Depth: 9}}
+		if err := b.UnmarshalJSON([]byte(`[{"url":"https://ex.com/fresh","depth":1}]`)); err != nil {
+			t.Fatalf("UnmarshalJSON: %v", err)
+		}
+		if len(b) != 1 || b[0].URL != "https://ex.com/fresh" {
+			t.Errorf("boundedPending = %v, want one entry for /fresh; a second occurrence must replace, not extend", b)
+		}
+	})
+}
+
+// TestLoadCheckpoint_RepeatedKeyDoesNotMultiplyTheCap is the end-to-end half: it feeds
+// LoadCheckpoint a document that repeats "pending" and "seen" and asserts the decoded
+// slices hold one occurrence's worth rather than the accumulated total. This is the
+// shape every other bounded-decoder fixture in this file misses — they each supply a
+// key exactly once, which is precisely what hid the defect.
+//
+// The assertion is against a single occurrence's entry count, matching how
+// encoding/json resolves a repeated key for a plain []string: last one wins.
+func TestLoadCheckpoint_RepeatedKeyDoesNotMultiplyTheCap(t *testing.T) {
+	doc := `{"version":1,"config_fingerprint":"fp","created_at_unix":0,` +
+		`"pending":[{"url":"https://ex.com/p1","depth":1}],` +
+		`"pending":[{"url":"https://ex.com/p2","depth":1}],` +
+		`"seen":["a","b"],"seen":["c","d"],"seen":["e","f"]}`
+
+	c, err := LoadCheckpoint(strings.NewReader(doc))
+	if err != nil {
+		t.Fatalf("LoadCheckpoint: %v", err)
+	}
+	if len(c.Seen) != 2 {
+		t.Errorf("len(Seen) = %d, want 2 (the last occurrence only); the entry cap is "+
+			"per-checkpoint, not per-key-occurrence, so three repeats must not accumulate to 6: %v", len(c.Seen), c.Seen)
+	}
+	if len(c.Pending) != 1 {
+		t.Errorf("len(Pending) = %d, want 1 (the last occurrence only): %v", len(c.Pending), c.Pending)
+	}
+}
+
+// TestBoundedSeen_RepeatedKeyRespectsTheCapInAggregate pins the security property at a
+// small bound: the total decoded across every occurrence of a key must not exceed one
+// budget. Driving decodeBoundedArray at max=2 makes the aggregate check fast; proving
+// it at the real 1,000,000 cap would need a multi-megabyte payload per occurrence for
+// behavior that does not depend on the constant's value.
+func TestBoundedSeen_RepeatedKeyRespectsTheCapInAggregate(t *testing.T) {
+	const max = 2
+	var acc []string
+	decode := func(data string) error {
+		acc = nil
+		return decodeBoundedArray([]byte(data), "seen", max, func(dec *json.Decoder) error {
+			var s string
+			if err := dec.Decode(&s); err != nil {
+				return err
+			}
+			acc = append(acc, s)
+			return nil
+		})
+	}
+
+	for _, occurrence := range []string{`["a","b"]`, `["c","d"]`} {
+		if err := decode(occurrence); err != nil {
+			t.Fatalf("decode %s: %v", occurrence, err)
+		}
+		if len(acc) > max {
+			t.Fatalf("accumulated %d entries at a bound of %d", len(acc), max)
+		}
+	}
+}

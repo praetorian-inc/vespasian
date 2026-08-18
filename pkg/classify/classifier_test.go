@@ -1554,3 +1554,49 @@ func TestDeduplicate_MergedResponsesAreBoundedAndDeduped(t *testing.T) {
 		}
 	})
 }
+
+// TestMergedResponses_RetainsDistinctBodylessStatus is the unit half of the
+// bodyless-status defect: two observations of one endpoint differing only in status
+// code must both survive Deduplicate, one as the retained Response and the other in
+// MergedResponses. The old body-length gate dropped the loser because a 204 has no
+// body (LAB-4678 review, QUAL-002).
+func TestMergedResponses_RetainsDistinctBodylessStatus(t *testing.T) {
+	mk := func(code int) ClassifiedRequest {
+		return ClassifiedRequest{
+			ObservedRequest: crawl.ObservedRequest{
+				Method: "GET", URL: "https://ex.com/api/users",
+				Response: crawl.ObservedResponse{StatusCode: code, ContentType: "application/json"},
+			},
+			APIType: "rest", Confidence: 0.9,
+		}
+	}
+
+	got := Deduplicate([]ClassifiedRequest{mk(200), mk(204)})
+	if len(got) != 1 {
+		t.Fatalf("Deduplicate returned %d entries, want 1", len(got))
+	}
+
+	statuses := map[int]bool{got[0].Response.StatusCode: true}
+	for _, r := range got[0].MergedResponses {
+		statuses[r.StatusCode] = true
+	}
+	for _, want := range []int{200, 204} {
+		if !statuses[want] {
+			t.Errorf("status %d survived neither Response nor MergedResponses (have %v); a "+
+				"completed bodyless response documents the endpoint's real status", want, statuses)
+		}
+	}
+}
+
+// TestAppendMergedResponse_SkipsHalfCapturedPlaceholder is the other side of the same
+// gate. Loosening the skip test must not admit a half-captured response — zero status,
+// no content-type, no body — because the generator defaults a missing status to 200 and
+// would document a status that was never observed.
+func TestAppendMergedResponse_SkipsHalfCapturedPlaceholder(t *testing.T) {
+	winner := crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json", Body: []byte(`{"a":1}`)}
+	placeholder := crawl.ObservedResponse{}
+
+	if got := appendMergedResponse(nil, winner, placeholder); len(got) != 0 {
+		t.Errorf("appendMergedResponse retained a half-captured placeholder: %+v", got)
+	}
+}

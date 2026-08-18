@@ -82,11 +82,11 @@ func (c *WSDLClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 
 	lowerPath := strings.ToLower(parsedURL.Path)
 
-	// Static asset exclusion.
-	for _, ext := range staticExtensions {
-		if strings.HasSuffix(lowerPath, ext) {
-			return false, 0, ""
-		}
+	// Static asset exclusion, by URL extension or JavaScript media type. Shared with
+	// the REST and GraphQL classifiers so the exclusion cannot be widened in one and
+	// left narrow here (LAB-4678 review, REQ-005).
+	if isStaticAssetRequest(lowerPath, responseContentType(req)) {
+		return false, 0, ""
 	}
 
 	var confidence float64

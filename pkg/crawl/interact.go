@@ -112,17 +112,33 @@ var destructiveLabelPhrases = []string{
 // label. An icon-only or symbol control ("x", an SVG glyph) has no meaningful
 // text node, so its actual meaning lives here — and a destructive action has to
 // be recognizable from any of them, not from visible text alone.
+//
+// That assumption used to be unenforced in the one case it names. el.Text() returns
+// DESCENDANT text, so <button>✕</button> or a private-use-area icon-font codepoint
+// read back NON-BLANK, elementLabel reported ok=true, and isDestructiveLabel found
+// nothing because it splits on letters and digits and a glyph is neither. The
+// fail-closed layer was therefore unreachable for exactly the control shape this
+// comment describes. labelIsReadable now decides readability on words rather than on
+// non-emptiness, so a glyph-only label routes into the skip path
+// (LAB-4678 review, SEC-BE-006).
 var labelAttributes = []string{"aria-label", "title", "value"}
+
+// descendantLabelAttributes are read from a control's DESCENDANTS, not the element
+// itself. el.Attribute() does not descend, so <button><span title="Delete account">🗑
+// </span></button> presented a glyph as its whole label and hid the meaning from both
+// gates. alt is included for the <img> form of the same pattern.
+var descendantLabelAttributes = []string{"aria-label", "title", "alt"}
 
 // elementLabel returns everything that describes a control: its visible text
 // plus every label-bearing attribute, joined so isDestructiveLabel matches a
 // destructive verb wherever it appears.
 //
 // ok reports whether the label was fully READ, and is false when any read failed
-// (a stale handle, a detached node, an eval error) or when the assembled label is
-// blank. A caller must not treat a label it could not read as safe: the whole
-// point of reading the label is to recognize a destructive control, so an
-// unreadable one carries no evidence either way. See [clickAllowed].
+// (a stale handle, a detached node, an eval error) or when the assembled label is not
+// readable in the labelIsReadable sense — blank, or glyphs with no word in them. A
+// caller must not treat a label it could not read as safe: the whole point of reading
+// the label is to recognize a destructive control, so an unreadable one carries no
+// evidence either way. See [clickAllowed].
 func elementLabel(el *rod.Element) (label string, ok bool) {
 	var parts []string
 	txt, err := el.Text()
@@ -141,8 +157,60 @@ func elementLabel(el *rod.Element) (label string, ok bool) {
 			parts = append(parts, *v)
 		}
 	}
+	desc, err := descendantLabelText(el)
+	if err != nil {
+		return "", false
+	}
+	if desc != "" {
+		parts = append(parts, desc)
+	}
 	label = strings.Join(parts, " ")
-	return label, strings.TrimSpace(label) != ""
+	return label, labelIsReadable(label)
+}
+
+// descendantLabelText returns the descendantLabelAttributes found anywhere beneath el,
+// space-joined. It exists because el.Attribute() reads only the matched element, so an
+// icon wrapped in a labeled span or img kept its meaning out of both gates.
+//
+// One Eval for the whole subtree, matching the cost of the three Attribute round trips
+// above. An Eval error is returned rather than swallowed so elementLabel fails closed:
+// a label that could not be fully read is not evidence a control is safe.
+func descendantLabelText(el *rod.Element) (string, error) {
+	obj, err := el.Eval(`(attrs) => {
+		const out = [];
+		for (const node of this.querySelectorAll('*')) {
+			for (const a of attrs) {
+				const v = node.getAttribute(a);
+				if (v && v.trim()) out.push(v.trim());
+			}
+		}
+		return out.join(' ');
+	}`, descendantLabelAttributes)
+	if err != nil {
+		return "", err
+	}
+	if obj == nil {
+		return "", nil
+	}
+	return strings.TrimSpace(obj.Value.String()), nil
+}
+
+// labelWords splits a label into the words isDestructiveLabel matches against:
+// every run of letters and digits, so punctuation and separators delimit a word and
+// "Delete?" and "delete/remove" both yield "delete".
+func labelWords(label string) []string {
+	return strings.FieldsFunc(strings.ToLower(strings.TrimSpace(label)), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+}
+
+// labelIsReadable reports whether a label carries anything the destructive-label match
+// can act on. A label of glyphs alone ("✕", 🗑, an icon-font codepoint) is NOT readable:
+// it is non-empty, so a blank test passes it, but it yields zero words, so no word list
+// can ever reject it. Treating it as read is what let the fail-closed gate permit a
+// control it had no evidence about (LAB-4678 review, SEC-BE-006).
+func labelIsReadable(label string) bool {
+	return len(labelWords(label)) > 0
 }
 
 // clickAllowed is the pre-click decision: may the interaction pass click a control
@@ -153,14 +221,16 @@ func elementLabel(el *rod.Element) (label string, ok bool) {
 // elementLabel returned "" on a read failure, so isDestructiveLabel("") == false
 // let the click proceed — precisely in the mid-re-render case the pre-click
 // re-check exists to catch, and in disagreement with nextInteractionTarget,
-// which skips blank labels up front. The two gates now agree in the restrictive
-// direction.
+// which skips unreadable labels up front. The two gates now agree in the
+// restrictive direction.
 func clickAllowed(label string, ok bool) bool {
-	// The blank check is redundant with elementLabel's own ok (it reports false for
-	// a blank label) and is kept anyway: it states the rule at the decision point
-	// rather than relying on a caller's invariant, and it keeps the gate aligned
-	// with nextInteractionTarget, which skips blanks up front.
-	return ok && strings.TrimSpace(label) != "" && !isDestructiveLabel(label)
+	// The readability check is redundant with elementLabel's own ok (it reports false
+	// for an unreadable label) and is kept anyway: it states the rule at the decision
+	// point rather than relying on a caller's invariant, and it keeps the gate aligned
+	// with nextInteractionTarget, which skips unreadable labels up front. It tests
+	// labelIsReadable rather than non-emptiness so a glyph-only label is skipped here
+	// too, even if a caller ever passes ok=true for one.
+	return ok && labelIsReadable(label) && !isDestructiveLabel(label)
 }
 
 // isDestructiveLabel reports whether a control's label looks destructive or
@@ -175,12 +245,10 @@ func isDestructiveLabel(label string) bool {
 			return true
 		}
 	}
-	// Whole-word match for the single-word verbs. Splitting on every
-	// non-alphanumeric rune means punctuation and separators still delimit a word,
-	// so "Delete?" and "delete/remove" match while "Dropdown" and "Payment" do not.
-	for _, word := range strings.FieldsFunc(l, func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
-	}) {
+	// Whole-word match for the single-word verbs, over the same split labelIsReadable
+	// uses, so "a label with no words" and "a label with no destructive word" cannot
+	// diverge: "Delete?" and "delete/remove" match while "Dropdown" and "Payment" do not.
+	for _, word := range labelWords(l) {
 		if slices.Contains(destructiveLabelWords, word) {
 			return true
 		}
@@ -222,7 +290,9 @@ func nextInteractionTarget(labels []string, used map[string]bool) int {
 // eager and lazy paths disagree about what is clickable.
 func interactionCandidate(label string, used map[string]bool) bool {
 	norm := normalizeLabel(label)
-	return norm != "" && !isDestructiveLabel(label) && !used[norm]
+	// labelIsReadable rather than norm != "": a glyph-only label is non-empty and
+	// matches no destructive word, so a non-emptiness test admitted it here as well.
+	return labelIsReadable(label) && !isDestructiveLabel(label) && !used[norm]
 }
 
 // currentPageURL returns the page's current document URL and whether it could be

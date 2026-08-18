@@ -201,10 +201,20 @@ while IFS= read -r file; do
       }
       return 0
     }
-    function claim_line(b,   n, lines, i) {
+    # CLAIM and EXCLUDE are written lowercase, and the awk ~ operator is case-sensitive,
+    # so the line is lowercased before matching. Without it a claim opening a NEW SENTENCE --
+    # "Never reaches this branch except through the fallback below." -- has a capital
+    # leading word, matches nothing, and the whole block is treated as carrying no
+    # impossibility claim. That is the most natural way to write the claim and it was
+    # the one shape the gate could not see (LAB-4678 review, QUAL-003).
+    #
+    # Only this test is case-folded. CITATION is Test[A-Z][A-Za-z0-9_]*, whose whole
+    # discriminating power is its case, and resolved_citation reads the raw block.
+    function claim_line(b,   n, lines, i, l) {
       n = split(b, lines, "\n")
       for (i = 1; i <= n; i++) {
-        if (lines[i] ~ claim && lines[i] !~ exclude) return i
+        l = tolower(lines[i])
+        if (l ~ claim && l !~ exclude) return i
       }
       return 0
     }

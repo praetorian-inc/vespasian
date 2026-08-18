@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,6 +62,22 @@ var (
 // path RodCrawler.Crawl uses — so the skip reason matches real runtime
 // behavior. The result is cached in a sync.Once to avoid launching Chrome for
 // every subtest row.
+//
+// The skip is OPT-OUT on a runner that is supposed to have a browser. Set
+// VESPASIAN_REQUIRE_CHROME and an unavailable Chrome is fatal instead of skipped.
+//
+// Without that, every rod row of every contract test skips on a browserless runner
+// and `make test-integration` exits 0, which is indistinguishable in the build output
+// from a real pass. The only CI consumer of the integration tag deliberately refuses
+// to gate on browser availability — its browser-report step is continue-on-error and
+// documents itself as deciding nothing — so nothing else catches it. In that state the
+// suite silently returns to the pre-LAB-4678 position: TestRodEngine_Interact_SkipsDestructiveControls
+// and the rod halves of TestCrawlerContract_ScopeConfinement and _DepthLimit stop
+// executing, and those browser-only assertions are the reason the job exists. The http
+// rows keep running either way, so a green run proves less than it appears to
+// (LAB-4678 review, TEST-014).
+//
+// Developers without a browser keep the skip by simply not setting the variable.
 func skipIfNoChrome(t *testing.T) {
 	t.Helper()
 	chromeOnce.Do(func() {
@@ -72,6 +89,10 @@ func skipIfNoChrome(t *testing.T) {
 		bm.Close()
 	})
 	if chromeErr != nil {
+		if os.Getenv("VESPASIAN_REQUIRE_CHROME") != "" {
+			t.Fatalf("VESPASIAN_REQUIRE_CHROME is set but Chrome is unavailable, so the "+
+				"browser-only assertions would silently not run: %v", chromeErr)
+		}
 		t.Skipf("skipping headless backend: Chrome unavailable: %v", chromeErr)
 	}
 }

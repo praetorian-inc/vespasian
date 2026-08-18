@@ -37,8 +37,8 @@
 # lists the index). A fresh repo per case keeps one case's exit code from masking
 # another's.
 #
-# Cases 1-9 run --all, where every comment block is in scope, and need no commit.
-# Cases 10-12 run --changed against a base ref and therefore do commit, because
+# Cases 1-12 run --all, where every comment block is in scope, and need no commit.
+# Cases 13-15 run --changed against a base ref and therefore do commit, because
 # that mode's whole point is which lines moved.
 #
 # mktemp is called as a bare `mktemp -d` with no template, which is the one form
@@ -259,6 +259,49 @@ claim_file "$repo" '// Thing does a thing. A second call can never happen.
 // TestNoSuchTestAnywhere and TestRealThing pin it.'
 assert_case "one resolving citation is enough alongside a phantom" 0 "!does not exist" "$repo"
 
+# ---------------------------------------------------------------------------
+# 10. A claim is matched case-INSENSITIVELY, so one opening a sentence is caught.
+#
+#     CLAIM and EXCLUDE are lowercase alternations and awk's ~ is case-sensitive, so
+#     a claim written as its own sentence ("Never reaches this branch...") had a
+#     capital leading word, matched nothing, and the block was silently treated as
+#     carrying no claim at all. That is the most natural phrasing for the assertion
+#     this gate exists to catch (LAB-4678 review, QUAL-003).
+#
+#     Both rows are the SAME sentence differing only in the leading capital, so a
+#     failure here can only be about case.
+# ---------------------------------------------------------------------------
+repo="$(new_fixture_repo)" || exit 2
+real_tests "$repo"
+claim_file "$repo" '// Thing does a thing. Never reaches the fallback below.'
+assert_case "sentence-initial capitalized claim is flagged" 1 "unreachability claim with no test cited" "$repo"
+
+repo="$(new_fixture_repo)" || exit 2
+real_tests "$repo"
+claim_file "$repo" '// Thing does a thing. never reaches the fallback below.'
+assert_case "lowercase mid-sentence claim is still flagged" 1 "unreachability claim with no test cited" "$repo"
+
+# ---------------------------------------------------------------------------
+# 11. Case-folding must apply to EXCLUDE too, or lowercasing the input would start
+#     flagging capitalized past-tense narrative that the lowercase exclusions used
+#     to miss for the same reason.
+# ---------------------------------------------------------------------------
+repo="$(new_fixture_repo)" || exit 2
+real_tests "$repo"
+claim_file "$repo" '// Thing does a thing. Was unreachable until the guard below was added.'
+assert_case "capitalized past-tense narrative stays excluded" 0 "!unreachability claim" "$repo"
+
+# ---------------------------------------------------------------------------
+# 12. A capitalized claim WITH a resolving citation still passes: case-folding the
+#     claim test must not have folded the citation test, whose entire
+#     discriminating power is the capital T in Test[A-Z].
+# ---------------------------------------------------------------------------
+repo="$(new_fixture_repo)" || exit 2
+real_tests "$repo"
+claim_file "$repo" '// Thing does a thing. Never reaches the fallback below.
+// TestRealThing pins it.'
+assert_case "capitalized claim with a real citation passes" 0 "!unreachability claim" "$repo"
+
 
 # ---------------------------------------------------------------------------
 # --changed mode: the RATCHET. Needs commits and a base ref, unlike the cases
@@ -336,21 +379,21 @@ GOEOF
   echo "$dir"
 }
 
-# 10. An unrelated edit in a file holding a pre-existing uncited claim must NOT
+# 13. An unrelated edit in a file holding a pre-existing uncited claim must NOT
 #     flag it. This is the ratchet.
 repo="$(new_ratchet_repo)" || exit 2
 perl -pi -e 's{// Untouched is untouched\.}{// Untouched now does more.}' "$repo/pkg/a.go"
 git -C "$repo" add -A && git -C "$repo" commit -qm edit-elsewhere
 assert_changed "unrelated edit does not pull in a pre-existing claim" 0 "!can never happen" "$repo"
 
-# 11. Editing the claim itself DOES bring it into scope — you are asserting it
+# 14. Editing the claim itself DOES bring it into scope — you are asserting it
 #     afresh, so it must carry a citation.
 repo="$(new_ratchet_repo)" || exit 2
 perl -pi -e 's{A second call can never happen\.}{A second call can never happen, truly.}' "$repo/pkg/a.go"
 git -C "$repo" add -A && git -C "$repo" commit -qm touch-the-claim
 assert_changed "editing a claim brings it into scope" 1 "unreachability claim with no test cited" "$repo"
 
-# 12. Every claim in a NEW file is in scope, since every line is added.
+# 15. Every claim in a NEW file is in scope, since every line is added.
 repo="$(new_ratchet_repo)" || exit 2
 printf 'package a\n\n// New is new. This can never happen.\nfunc New() {}\n' >"$repo/pkg/b.go"
 git -C "$repo" add -A && git -C "$repo" commit -qm new-file
