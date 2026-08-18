@@ -949,56 +949,8 @@ main() {
         # for the same two reasons (SEC-BE-006). A symlink here would redirect
         # a root-owned open at a target of the planter's choosing; a hardlink
         # defeats the symlink guard from the read side the same way it does for
-        # the defaults file. Checked AND recreated: the check gives a named,
-        # fail-closed diagnostic instead of silently overwriting evidence of
-        # the attempt, and `install` below unlinks-then-creates regardless, so
-        # a plant that lands in the gap between the check and the install still
-        # cannot be opened through.
-        if [ -L "$LOCK_FILE" ]; then
-            log_fail "${LOCK_FILE} is a symlink — refusing to lock through it." >&2
-            exit 1
-        fi
-        if [ -e "$LOCK_FILE" ]; then
-            # SEC-BE-004: refuse anything that is not a plain file BEFORE the
-            # open below. The symlink and hardlink checks are type checks for
-            # exactly two types; every other type slipped through, and a FIFO is
-            # the dangerous one: `[ ! -e ]` declines to replace it, and
-            # `exec {LOCK_FD}<` then blocks in open(2) forever waiting for a
-            # writer. The `flock -w 300` bound never applies because the hang is
-            # in the OPEN, not in the lock, so a root provisioning run wedges
-            # with no diagnostic at all. `[ -f ]` admits regular files only, so
-            # this one test covers FIFOs, directories, devices and sockets.
-            if [ ! -f "$LOCK_FILE" ]; then
-                log_fail "${LOCK_FILE} exists but is not a regular file — refusing to lock through it." >&2
-                exit 1
-            fi
-            local lock_nlink
-            lock_nlink=$(stat -c '%h' -- "$LOCK_FILE" 2>/dev/null) || lock_nlink=""
-            if [ -n "$lock_nlink" ] && [ "$lock_nlink" -ne 1 ]; then
-                log_fail "${LOCK_FILE} has multiple hard links (${lock_nlink}) — refusing to lock through it." >&2
-                exit 1
-            fi
-            # A plain file planted by ANOTHER unprivileged user is still hostile:
-            # they can hold flock and stall every run for the full 300s window.
-            # root (0) and the invoking user are the only legitimate owners --
-            # root because $SUDO created it, the invoking user because a non-root
-            # run creates it itself with no $SUDO.
-            #
-            # This fails CLOSED when stat yields nothing, unlike the nlink check
-            # above: substituting a safe-looking default is what made that check
-            # disarmable, and repeating the pattern in a guard added to fix a
-            # guard would be its own defect.
-            local lock_owner
-            lock_owner=$(stat -c '%u' -- "$LOCK_FILE" 2>/dev/null) || lock_owner=""
-            if [ -z "$lock_owner" ]; then
-                log_fail "Could not determine the owner of ${LOCK_FILE} — refusing to lock through it." >&2
-                exit 1
-            fi
-            if [ "$lock_owner" -ne 0 ] && [ "$lock_owner" -ne "$(id -u)" ]; then
-                log_fail "${LOCK_FILE} is owned by uid ${lock_owner}, neither root nor $(id -u) — refusing to lock through it." >&2
-                exit 1
-            fi
-        fi
+        # the defaults file.
+        #
         # Create ONLY when absent (SEC-BE-004). The previous line here was an
         # unconditional `install -m 0644 -- /dev/null "$LOCK_FILE"`, and
         # `install(1)` unlinks the destination before creating it — so every run
@@ -1006,23 +958,86 @@ main() {
         # two concurrent runs of that sequence both acquired the lock, on
         # different inodes. A lock is the one file that must NOT be replaced.
         #
-        # Mode is still stated explicitly on the create so the caller's umask
-        # cannot leave it world-writable under `umask 0`, and the open below is
+        # Mode is stated explicitly on the create so the caller's umask cannot
+        # leave it world-writable under `umask 0`, and the open below is
         # read-only: flock needs no write access to the fd it locks, so a
         # root-created 0644 lock stays lockable by a later non-root run. (A
         # write-mode open would fail EACCES there, and a failed redirection on
         # `exec` kills a non-interactive shell before any diagnostic runs.)
-        #
-        # Residual, stated rather than hidden: two runs racing the very FIRST
-        # creation can still each create-and-open before the other's flock, so
-        # the very first run on a fresh host is not serialised. Every run after
-        # it is, because the inode then persists. Closing that last gap needs an
-        # atomic create-or-open primitive shell does not offer without either a
-        # world-writable mode or a spin loop on mkdir, neither of which is worth
-        # it here.
         if [ ! -e "$LOCK_FILE" ]; then
             $SUDO install -m 0644 -- /dev/null "$LOCK_FILE"
         fi
+
+        # SEC-BE-001: the guards run AFTER the create and immediately before the
+        # open, so they inspect the very inode `exec` is about to attach to.
+        #
+        # They used to sit ABOVE the create, wrapped in `if [ -e "$LOCK_FILE" ]`,
+        # justified by a comment reading "`install` below unlinks-then-creates
+        # regardless, so a plant that lands in the gap between the check and the
+        # install still cannot be opened through". That held while the create was
+        # UNCONDITIONAL. Making it conditional -- which the fix directly above had
+        # to do, because an unconditional create is what broke serialisation --
+        # silently invalidated it: on a host where the path was still absent every
+        # guard was skipped by the `-e` test, and a plant arriving before the
+        # `[ ! -e ]` turned the create into a no-op, so the open got the planted
+        # inode unchecked. A FIFO there blocks the root `exec` in open(2)
+        # indefinitely, and `flock -w 300` never applies because the hang is in the
+        # OPEN, not in the lock.
+        #
+        # No `-e` wrapper now: the create above guarantees the path exists, so a
+        # guard finding it gone means it vanished between two adjacent statements,
+        # and refusing is the right answer to that too.
+        #
+        # `[ -f ]` admits regular files only, so that single test covers FIFOs,
+        # directories, devices and sockets -- every type the symlink and hardlink
+        # checks do not.
+        #
+        # Residual, stated rather than hidden: a plant landing between the last
+        # guard and the `exec` one line later is still not excluded. Shell offers no
+        # atomic check-and-open, so that window cannot be closed here — only
+        # narrowed from the previous span (a create plus four guards) to a single
+        # statement boundary.
+        if [ -L "$LOCK_FILE" ]; then
+            log_fail "${LOCK_FILE} is a symlink — refusing to lock through it." >&2
+            exit 1
+        fi
+        if [ ! -f "$LOCK_FILE" ]; then
+            log_fail "${LOCK_FILE} exists but is not a regular file — refusing to lock through it." >&2
+            exit 1
+        fi
+        local lock_nlink
+        lock_nlink=$(stat -c '%h' -- "$LOCK_FILE" 2>/dev/null) || lock_nlink=""
+        if [ -n "$lock_nlink" ] && [ "$lock_nlink" -ne 1 ]; then
+            log_fail "${LOCK_FILE} has multiple hard links (${lock_nlink}) — refusing to lock through it." >&2
+            exit 1
+        fi
+        # A plain file planted by ANOTHER unprivileged user is still hostile:
+        # they can hold flock and stall every run for the full 300s window.
+        # root (0) and the invoking user are the only legitimate owners --
+        # root because $SUDO created it, the invoking user because a non-root
+        # run creates it itself with no $SUDO.
+        #
+        # This fails CLOSED when stat yields nothing, unlike the nlink check
+        # above: substituting a safe-looking default is what made that check
+        # disarmable, and repeating the pattern in a guard added to fix a
+        # guard would be its own defect.
+        local lock_owner
+        lock_owner=$(stat -c '%u' -- "$LOCK_FILE" 2>/dev/null) || lock_owner=""
+        if [ -z "$lock_owner" ]; then
+            log_fail "Could not determine the owner of ${LOCK_FILE} — refusing to lock through it." >&2
+            exit 1
+        fi
+        if [ "$lock_owner" -ne 0 ] && [ "$lock_owner" -ne "$(id -u)" ]; then
+            log_fail "${LOCK_FILE} is owned by uid ${lock_owner}, neither root nor $(id -u) — refusing to lock through it." >&2
+            exit 1
+        fi
+
+        # Residual on FIRST creation, stated rather than hidden: two runs racing the
+        # very first create can each create-and-open before the other's flock, so the
+        # first run on a fresh host is not serialised. Every run after it is, because
+        # the inode then persists. Closing that needs an atomic create-or-open
+        # primitive shell does not offer without either a world-writable mode or a
+        # spin loop on mkdir, neither worth it here.
         exec {LOCK_FD}<"$LOCK_FILE"
         if ! flock -w 300 "$LOCK_FD"; then
             log_fail "Could not acquire the install lock (${LOCK_FILE}) within 300s — another run appears stuck." >&2

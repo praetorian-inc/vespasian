@@ -876,7 +876,23 @@ esac
 # worth pinning, is that BOTH halves of ITS seam exist: the shell passes
 # FORMS_TARGET_BIND_HOST (asserted above) and the target consumes a bind address at
 # all rather than hardcoding one.
-if grep -qF 'target.Addr(port)' "${THIS_DIR}/forms-target/main.go"; then
+# Over collapse_code output, not the raw file: a raw `grep -qF` is satisfied by the
+# needle appearing in a COMMENT, which is exactly the name-it-instead-of-exercise-it
+# defect this suite exists to remove -- and Test 18b already runs its sibling needle
+# through collapse_code for that reason.
+#
+# What this does and does NOT close, measured rather than assumed. collapse_code
+# drops whole-line `//` and `#` comments and `/* */` blocks, so those forms can no
+# longer satisfy the needle. A TRAILING comment still can:
+#     addr := net.JoinHostPort(h, port) // was target.Addr(port)
+# passes this check. Closing that needs stripping `//` to end-of-line, which would
+# also cut the `http://` inside string literals that other pins in this file match
+# on -- a worse defect than the one it fixes. So this grep is a diagnostic, not the
+# carrier: what actually holds the property is Test 18b's delegation loop, which
+# asserts every ALL_TARGETS member resolves through the shared helper and fails on
+# a gutted body. Verified: the trailing-comment mutation above leaves THIS check
+# green and the suite still exits non-zero.
+if printf '%s' "$(collapse_code "${THIS_DIR}/forms-target/main.go")" | grep -qF 'target.Addr(port)'; then
     ok "forms-target/main.go resolves its bind through the shared, asserted helper"
 else
     fail "forms-target/main.go no longer resolves its bind through test/internal/target — the FORMS_TARGET_BIND_HOST seam the shell half passes may be inert"
@@ -1060,8 +1076,8 @@ if command -v stat >/dev/null 2>&1; then
     # The excluded class is every metacharacter that can chain or capture, not
     # just `;` and `&`. Measured against real `declare -f` output: bounding on
     # `[^;&]` alone still captured a trailing `> /tmp/f`, `| tee /tmp/f` and
-    # `$(id > /tmp/f)` whole, so the eval ran them. Redirect, pipe, backtick and
-    # backtick are excluded for the same reason `&` was. Bare `$` is NOT
+    # `$(id > /tmp/f)` whole, so the eval ran them. Redirects (`<` and `>`), pipe
+    # (`|`) and backtick are excluded for the same reason `&` was. Bare `$` is NOT
     # excluded: the production line is `"${STATE_DIR}/.graphql-server.log"`,
     # so excluding it stops the match inside the legitimate path — measured,
     # the suite went red. A `$(...)` payload still loses its own metachars to
@@ -1425,6 +1441,17 @@ echo "────────────────────────�
 # skip-credit register, which replaced a prose list of line numbers that had
 # already gone stale twice. The ALL_TARGETS bidirectional check is net zero — it
 # replaced the liveness-only sentinel rather than adding to it.
+#
+# 84 -> 85. MEASURED. +1 in 1ea83e0, which replaced the SEC-BE-003 log-mode
+# TEXTUAL scan with a run of the real start_graphql_server under umask 0 against a
+# stubbed node, then stat'd the file the service actually writes. A clobber spelled
+# through the function's own variable --
+#     gqllog="${STATE_DIR}/.graphql-server.log"; chmod 666 "$gqllog"
+# -- had defeated every textual form of the check (whole-body scan, resolved-helper
+# span, install-vs-redirect position compare), because each needs the literal path
+# on the offending line; the suite exited 0 with the log world-writable. The
+# executed stat carries the property now, and the textual checks were KEPT for
+# their diagnostics, which is why this is +1 rather than a replacement.
 EXPECTED_ASSERTIONS=85
 if [ "$((PASS + FAIL + SKIP_CREDIT))" -ne "${EXPECTED_ASSERTIONS}" ]; then
     echo "setup-live-targets_test: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (Passed+Failed+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."

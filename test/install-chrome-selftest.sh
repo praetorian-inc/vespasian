@@ -81,12 +81,13 @@ export CHROME_PROBE_TIMEOUT=2
 #   +2  case bp3, pinning that the consolidated chrome_probe_budget still
 #       validates the budget for _bounded_probe as chrome_runnable does
 # See the credit register below for the matching skip_credit accounting.
-EXPECTED_ASSERTIONS=238
+EXPECTED_ASSERTIONS=239
 
 pass_count=0
 fail_count=0
 skip_count=0
 skip_credit=0
+skipped_labels=""
 # Skips that represent a real coverage hole rather than an unsuitable
 # environment. Only the trust-anchor success path qualifies; see the policy at
 # the end of this file.
@@ -174,6 +175,12 @@ skip() {
     echo "SKIP: $1"
     skip_count=$((skip_count + 1))
     skip_credit=$((skip_credit + credit))
+    # Record WHICH case skipped. The summary NOTE used to name a hardcoded pair
+    # (a2 and l) whatever the real cause was, so every skip arm added since --
+    # f2, f4, j/j2, v, y, bp -- was misattributed by it. `${1%%:*}` takes the
+    # "case X" prefix each message already starts with; the full cause stays on
+    # the SKIP line itself.
+    skipped_labels="${skipped_labels}${skipped_labels:+, }${1%%:*}"
 }
 
 assert_eq() {
@@ -424,6 +431,15 @@ main_deps_missing() {
     local m=""
     [ "${HAS_GPG}" = true ]     || m="gpg"
     [ "${HAS_TIMEOUT}" = true ] || m="${m:+${m} and }timeout"
+    # Cases v and y gate on have_real_key, which is gpg AND a non-empty key
+    # fixture -- so the fixture is a third possible cause and reporting only the
+    # two TOOLS printed "missing: none" on the one host shape where the message
+    # mattered most. GOOGLE_KEY_CACHE is not assigned until later in this file,
+    # so a caller that runs BEFORE that point (case f4) has no fixture clause to
+    # report and correctly omits it; the :- keeps that from tripping `set -u`.
+    if [ -n "${GOOGLE_KEY_CACHE:-}" ] && [ ! -s "${GOOGLE_KEY_CACHE:-}" ]; then
+        m="${m:+${m} and }the key fixture"
+    fi
     printf '%s' "${m:-none}"
 }
 
@@ -3647,6 +3663,44 @@ else
     pass_count=$((pass_count + 1))
 fi
 
+# ── Case cr: the CREDIT REGISTER is derived from the call sites, not believed ──
+# TEST-001. The register above says it "can be checked against the source rather
+# than believed" -- but nothing checked it, which is the same shape of unbacked
+# claim this suite exists to catch. This case makes the sentence true.
+#
+# It compares two independently-derived numbers:
+#   * DERIVED  -- parsed out of this file's own skip() call sites: the maximum
+#                 credit each case label can contribute, summed. j/j2 declares
+#                 the SAME credit on two mutually-exclusive arms (missing fixture
+#                 / absent gpg), so taking the max per label -- not the sum --
+#                 is what "maximally-degraded host" actually means, and is why
+#                 the total is 44 rather than the 58 the nine literals add to.
+#   * DECLARED -- the arithmetic expression written in the register comment,
+#                 evaluated. Not the "= 44" on its right-hand side: evaluating
+#                 the left side catches a register whose own sum has gone stale.
+# A call-site credit edited without updating the register now fails here instead
+# of silently invalidating every count in the file.
+cr_derived=$(
+    awk '
+        match($0, /skip "case [a-z0-9\/]+:/) {
+            label = substr($0, RSTART + 11, RLENGTH - 12)
+            if (match($0, /" [0-9]+$/)) {
+                credit = substr($0, RSTART + 2, RLENGTH - 2) + 0
+                if (credit > max[label]) max[label] = credit
+            }
+        }
+        END { t = 0; for (l in max) t += max[l]; print t }
+    ' "${BASH_SOURCE[0]}"
+)
+cr_declared=$(
+    # The register line: "# Maximum skip_credit ...: 1+4+3+14+3+12+3+4 = 44."
+    expr_str=$(grep -oE '^# Maximum skip_credit on a maximally-degraded host: [0-9+]+' "${BASH_SOURCE[0]}" \
+               | grep -oE '[0-9+]+$')
+    if [ -n "${expr_str}" ]; then echo $((expr_str)); else echo "UNPARSED"; fi
+)
+assert_eq "case cr: the credit register's declared maximum matches the skip() call sites" \
+    "${cr_derived}" "${cr_declared}"
+
 # ── Summary ─────────────────────────────────────────────────────
 SUITE_COMPLETED=1
 echo ""
@@ -3663,8 +3717,9 @@ echo "install-chrome-selftest: ${pass_count} passed, ${fail_count} failed, ${ski
 # suite for those turns a valid environment into a red build. The counter is
 # scoped so the policy means what it says.
 if [ "${skip_count}" -ne 0 ]; then
-    echo "install-chrome-selftest: NOTE — ${skip_count} case(s) skipped for environmental reasons"
-    echo "  (a2 needs a git checkout; l cannot run as root). Not a failure, but not coverage either."
+    echo "install-chrome-selftest: NOTE — ${skip_count} case(s) skipped: ${skipped_labels}"
+    echo "  Each SKIP line above states its own cause; the credit register near the top"
+    echo "  of this file lists what each contributes. Skipped is not covered."
 fi
 # The accounting pin runs FIRST, before the trust-anchor guard's exit. Ordered
 # the other way, a gpg-less host exited at the trust-anchor check and the pin
