@@ -1092,7 +1092,7 @@ func TestNextRouteProvenanceConfidence_IsReportingOnly(t *testing.T) {
 }
 
 // TestRESTClassifier_NextRouteIsReportedAsNearMiss is the regression test for the
-// gap between the code and three documents. README.md, CLAUDE.md and
+// gap between the code and three documents. README.md, AGENTS.md and
 // pkg/analyze/jsstatic/doc.go all state that recovered Next.js routes surface as
 // sub-threshold near-misses under -v. They did not: a page route carries no
 // apiPathSegments match, no response and no headers, so it scored 0 — below

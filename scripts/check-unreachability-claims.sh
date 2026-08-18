@@ -11,7 +11,7 @@
 #   - apitype.go argued that exclusive assignment made a lone text/xml response
 #     impossible as a WSDL vote. It scored WSDL 0.85 against REST 0.80, so it was a
 #     WSDL vote, and one XML response typed a whole capture as SOAP.
-#   - rest.go, nextroute.go, jsstatic/doc.go, README.md and CLAUDE.md all asserted a
+#   - rest.go, nextroute.go, jsstatic/doc.go, README.md and AGENTS.md all asserted a
 #     recovered Next.js route "can never become a spec operation". --confidence is an
 #     operator flag; at 0.1 it did, with an invented verb.
 #   - openapi.go stated two source-tag bugs were unreachable "only because Next.js

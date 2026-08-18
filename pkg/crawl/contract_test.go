@@ -136,7 +136,7 @@ type crawlerContractCase struct {
 //
 // That second class is the reason to size this generously rather than to the
 // fail-on-truncation cost alone: ScopeConfinement and DepthLimit are the only
-// end-to-end assertions of two crawl containment controls (see CLAUDE.md), and a
+// end-to-end assertions of two crawl containment controls (see AGENTS.md), and a
 // budget-truncated ScopeConfinement reports success having exercised nothing.
 //
 // The floor is DefaultStableWait (3s of page.WaitStable) plus roughly 1s of

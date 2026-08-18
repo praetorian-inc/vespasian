@@ -359,7 +359,7 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	// apiPathSegments entry, so it had no path boost to fall back on either. The only
 	// recovered routes an operator could see were the ones that happened to sit under
 	// /api/, visible via the path heuristic rather than via anything this feature
-	// contributed. Meanwhile README.md, CLAUDE.md, pkg/analyze/jsstatic/doc.go and this
+	// contributed. Meanwhile README.md, AGENTS.md, pkg/analyze/jsstatic/doc.go and this
 	// rule's own predecessor comment all asserted that recovered routes surface as
 	// sub-threshold near-misses under -v. Pinning the score to the near-miss floor is
 	// what makes those four claims true.

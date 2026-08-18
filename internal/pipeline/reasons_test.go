@@ -365,7 +365,7 @@ func TestLogClassificationReasons_NoOutput(t *testing.T) {
 }
 
 // TestLogNearMisses_ReportsRecoveredNextRoutes is the end-to-end half of the
-// Next.js reporting fix. README.md, CLAUDE.md and pkg/analyze/jsstatic/doc.go all
+// Next.js reporting fix. README.md, AGENTS.md and pkg/analyze/jsstatic/doc.go all
 // state that routes recovered from App Router chunk URLs are surfaced under -v.
 // Asserting the classifier's confidence band is not enough — logNearMisses applies
 // its own floor, so the claim is only true if the route actually reaches this
