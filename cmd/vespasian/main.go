@@ -230,13 +230,14 @@ func writeOutput(path string, fn func(io.Writer) error) error {
 	if path == "" {
 		return fn(os.Stdout)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, captureFileMode) //nolint:gosec // G304: CLI tool, user controls output path
+	// #nosec G304 -- the path IS the operator's -o flag; gosec's os.Root autofix would scope away the feature.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, captureFileMode)
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %w", err)
 	}
 	if err := f.Chmod(captureFileMode); err != nil {
-		f.Close() //nolint:errcheck,gosec // already failing; the Chmod error is what the caller needs
-		return fmt.Errorf("failed to set output file permissions: %w", err)
+		closeErr := f.Close()
+		return errors.Join(fmt.Errorf("failed to set output file permissions: %w", err), closeErr)
 	}
 	writeErr := fn(f)
 	closeErr := f.Close()
