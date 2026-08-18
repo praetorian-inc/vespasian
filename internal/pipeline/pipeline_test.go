@@ -23,10 +23,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,9 +40,11 @@ import (
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
+	"gopkg.in/yaml.v3"
 
 	"github.com/praetorian-inc/vespasian/internal/pipeline"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 )
 
 // ---------------------------------------------------------------------------
@@ -102,6 +107,82 @@ func TestClassifyProbeGenerate_RESTHappyPath(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.NotEmpty(t, spec, "expected non-empty OpenAPI spec for REST requests")
+}
+
+// TestClassifyProbeGenerate_TargetOriginReachesGeneratedSpec is TEST-001 (LAB-4992
+// review, hop B): pins that opts.TargetURL, forwarded through
+// ClassifyProbeGenerate to generate.Options.TargetOrigin
+// (`TargetOrigin: targetOrigin,` in pipeline.go), actually reaches the
+// generated spec's servers[0].URL and info.title — not merely a struct
+// field somewhere in between.
+//
+// Two origins are used, and the pinned one ("zzz.example.com") is chosen so
+// it does NOT sort first alphabetically among the origins — mirroring the
+// discrimination technique in
+// TestGenerate_PrimarySortsLaterStillWinsCollision
+// (pkg/generate/rest/openapi_test.go). If the TargetOrigin forward were
+// deleted, generate.Options.TargetOrigin would be "" and
+// choosePrimaryOrigin would fall back to the lowest-sorted dynamically
+// observed origin ("aaa.example.com" as a bare origin string), which is a
+// DIFFERENT server than the deliberately-later-sorting pinned host,
+// discriminating the deletion. Had the pinned origin sorted first, this
+// test would pass identically whether or not the forward exists, making it
+// vacuous.
+//
+// Probe is disabled and no live server is used, so this test is fully
+// offline and hermetic.
+func TestClassifyProbeGenerate_TargetOriginReachesGeneratedSpec(t *testing.T) {
+	requests := []crawl.ObservedRequest{
+		{
+			Method:  "GET",
+			URL:     "https://zzz.example.com/api/v1/things",
+			Headers: map[string]string{"Content-Type": "application/json"},
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Headers:     map[string]string{"Content-Type": "application/json"},
+				Body:        []byte(`[{"id":1}]`),
+			},
+		},
+		{
+			Method:  "GET",
+			URL:     "https://aaa.example.com/api/v1/others",
+			Headers: map[string]string{"Content-Type": "application/json"},
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Headers:     map[string]string{"Content-Type": "application/json"},
+				Body:        []byte(`[{"id":2}]`),
+			},
+		},
+	}
+
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), requests, pipeline.Options{
+		APIType:     pipeline.APITypeREST,
+		Confidence:  0.5,
+		Probe:       false,
+		Deduplicate: true,
+		TargetURL:   "https://zzz.example.com",
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, spec)
+
+	var parsed map[string]any
+	require.NoError(t, yaml.Unmarshal(spec, &parsed))
+
+	servers, ok := parsed["servers"].([]any)
+	require.True(t, ok, "expected a servers list in the generated spec")
+	require.NotEmpty(t, servers)
+	firstServer, ok := servers[0].(map[string]any)
+	require.True(t, ok, "expected servers[0] to be a map")
+	assert.Equal(t, "https://zzz.example.com", firstServer["url"],
+		"servers[0].url must derive from the pinned --target-url origin (TargetURL), "+
+			"not the alphabetically-first observed origin")
+
+	info, ok := parsed["info"].(map[string]any)
+	require.True(t, ok, "expected an info block in the generated spec")
+	assert.Equal(t, "zzz.example.com API", info["title"],
+		"info.title must derive from the pinned --target-url origin")
 }
 
 func TestClassifyProbeGenerate_EmptyRequestsReturnsSpec(t *testing.T) {
@@ -339,4 +420,144 @@ func TestClassifyProbeGenerate_GRPCInsecureSkipVerify(t *testing.T) {
 			"verify-by-default must fail because reflection never ran (no descriptors), not some unrelated error")
 		assert.Empty(t, spec)
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Task 7: Options.Proxy threading (LAB-4993)
+// ---------------------------------------------------------------------------
+
+// restRequestsForOrigin returns a minimal REST-like request slice targeting a
+// caller-supplied origin, structured like restRequests() but pointed at a
+// loopback httptest server so the proxy tests below can exercise real network
+// probing rather than the fixed x.com host restRequests() uses.
+func restRequestsForOrigin(origin string) []crawl.ObservedRequest {
+	return []crawl.ObservedRequest{
+		{
+			Method:  "GET",
+			URL:     origin + "/api/v1/users",
+			Headers: map[string]string{"Content-Type": "application/json"},
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Headers:     map[string]string{"Content-Type": "application/json"},
+				Body:        []byte(`[{"id":1}]`),
+			},
+		},
+	}
+}
+
+// newRecordingProxy starts a forwarding httptest proxy that increments a
+// counter for every request it forwards. Modeled on
+// pkg/crawl/http_crawler_test.go:195.
+//
+// When forwardBody is false, only the upstream status code is relayed (the
+// original behavior: sufficient for callers that just assert hits > 0 or
+// need a valid status/spec from the probe stage). When forwardBody is true,
+// response headers and the response body are also copied through — required
+// by callers (e.g. WSDL discovery) that must actually read proxied content.
+func newRecordingProxy(t *testing.T, forwardBody bool) (proxy *httptest.Server, hits *atomic.Int64) {
+	t.Helper()
+	hits = &atomic.Int64{}
+	proxy = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		outReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.RequestURI, nil) //nolint:gosec // test proxy forwards the received request URI
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		resp, err := http.DefaultTransport.RoundTrip(outReq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close() //nolint:errcheck // test cleanup
+		if forwardBody {
+			for k, vs := range resp.Header {
+				for _, v := range vs {
+					w.Header().Add(k, v)
+				}
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		if forwardBody {
+			_, _ = io.Copy(w, resp.Body) //nolint:errcheck,gosec // test proxy
+		}
+	}))
+	t.Cleanup(proxy.Close)
+	return proxy, hits
+}
+
+// optionsOrigin starts an httptest server answering OPTIONS with an Allow
+// header (and a plain JSON body otherwise), suitable for the OPTIONS probe
+// strategy that ClassifyProbeGenerate runs for REST.
+func optionsOrigin(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Allow", "GET, POST")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestClassifyProbeGenerate_ProxyReachesProbe is the AC-1 + threading proof
+// for pipeline.Options.Proxy: with Probe enabled and a configured proxy, the
+// probe stage's HTTP client must route through it (the loopback proxy would
+// be rejected by the SSRF dial guard unless the proxy path correctly skips
+// it). Modeled on the recording-proxy pattern from
+// pkg/crawl/http_crawler_test.go:195 and TestClassifyProbeGenerate_GRPCInsecureSkipVerify.
+func TestClassifyProbeGenerate_ProxyReachesProbe(t *testing.T) {
+	origin := optionsOrigin(t)
+	proxy, hits := newRecordingProxy(t, false)
+
+	proxyURL, err := url.Parse(proxy.URL)
+	require.NoError(t, err)
+
+	spec, err := pipeline.ClassifyProbeGenerate(context.Background(), restRequestsForOrigin(origin.URL), pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: true,
+		Proxy:        httpx.ProxyConfig{URL: proxyURL},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, spec)
+
+	assert.NotZero(t, hits.Load(), "probe stage must route through the configured proxy")
+}
+
+// TestClassifyProbeGenerate_ProxiedLoopback_RequiresAllowPrivate is the
+// TEST-003 proof for the URL-level SSRF gate on the proxied probe path (the
+// AllowPrivate=true + Proxy combination is already covered by
+// TestClassifyProbeGenerate_ProxyReachesProbe above, so this covers the
+// previously-untested AllowPrivate=false side): buildProbeConfig leaves the
+// default URLValidator installed whenever AllowPrivate is false, proxied or
+// not — the proxied client itself carries no dial-time SSRF pin (we dial the
+// proxy, not the target), so that URL-level validator is the only remaining
+// scope guard for a private/loopback target. It must reject the target BEFORE
+// any request reaches the proxy — the recording proxy seeing zero hits is the
+// strongest proof the validator runs before any network I/O. Mirrors
+// TestSourcemap_ProxiedFetch_AllowPrivateGate (jsstatic package).
+func TestClassifyProbeGenerate_ProxiedLoopback_RequiresAllowPrivate(t *testing.T) {
+	origin := optionsOrigin(t)
+	proxy, hits := newRecordingProxy(t, false)
+
+	proxyURL, err := url.Parse(proxy.URL)
+	require.NoError(t, err)
+
+	_, err = pipeline.ClassifyProbeGenerate(context.Background(), restRequestsForOrigin(origin.URL), pipeline.Options{
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		AllowPrivate: false, // private/loopback target — the URL validator must reject it
+		Proxy:        httpx.ProxyConfig{URL: proxyURL},
+	})
+	require.NoError(t, err, "a rejected probe target is a warning, not a whole-pipeline error")
+
+	assert.Zero(t, hits.Load(), "the URL validator must reject the private-host target before the proxy is ever contacted")
 }

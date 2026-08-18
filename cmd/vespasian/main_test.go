@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,6 +38,7 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/analyze"
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 )
 
 // jsonGetRequest builds a minimal GET ObservedRequest for the given URL with a
@@ -216,6 +218,14 @@ func TestValidateURL(t *testing.T) {
 		{"empty string", "", true},
 		{"ftp scheme", "ftp://example.com", true},
 		{"just path", "/api/v1", true},
+		// The CanonicalOrigin guard, pinned on validateURL itself rather than
+		// only through the validateTargetURL wrapper (SEC-BE-002 review
+		// finding). These are the seed paths' actual validator: CrawlCmd and
+		// ScanCmd call validateURL directly, so a regression here would let an
+		// un-canonicalizable crawl/scan target through even while the
+		// --target-url tests still passed.
+		{"duplicated port", "https://host:8443:8443/", true},
+		{"IPv6 zone id", "https://[fe80::1%25eth0]/", true},
 	}
 
 	for _, tt := range tests {
@@ -224,6 +234,170 @@ func TestValidateURL(t *testing.T) {
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateURL(%q) error = %v, wantErr %v", tt.url, err, tt.wantErr)
 			}
+		})
+	}
+}
+
+// TestValidateTargetURL_RejectsUnresolvableOriginAndFailsClosed pins BOTH
+// layers of the SEC-BE-001 defense (LAB-4992 review).
+//
+// Layer 1 (argv): validateURL now rejects an un-canonicalizable value up
+// front, so the operator gets an immediate, actionable error instead of a run
+// that crawls, probes nothing, and exits successfully having silently done
+// no work. This check was briefly delegated entirely to ResolveTargetOrigin;
+// that closed the security hole but lost the diagnostic, so it is back here
+// as well.
+//
+// Layer 2 (runtime): crawl.ResolveTargetOrigin independently fails closed for
+// the same values, which is what actually protects pkg/sdk and library
+// callers that never touch these CLI validators. The subtest below asserts
+// layer 2 directly rather than trusting layer 1 to be the only gate, so
+// removing either one fails this test.
+func TestValidateTargetURL_RejectsUnresolvableOriginAndFailsClosed(t *testing.T) {
+	tests := []struct {
+		name    string
+		url     string
+		wantErr bool
+	}{
+		{"empty is allowed (origin derived from capture)", "", false},
+		{"plain https", "https://example.com", false},
+		{"explicit port", "https://example.com:8443", false},
+		{"bracketed IPv6", "https://[2001:db8::1]:8443", false},
+		{"duplicated port -- rejected at argv", "https://host:8443:8443/", true},
+		{"IPv6 zone id -- rejected at argv", "https://[fe80::1%25eth0]/", true},
+		{"missing scheme", "example.com", true},
+		{"ftp scheme", "ftp://example.com", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateTargetURL(tt.url)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateTargetURL(%q) error = %v, wantErr %v", tt.url, err, tt.wantErr)
+			}
+			// Layer 2, asserted independently of layer 1: an
+			// un-canonicalizable value must resolve to no origin at all,
+			// never to a capture-derived one a hostile bundle could supply.
+			//
+			// Scoped to http(s) because CanonicalOrigin and originOf
+			// deliberately disagree for other schemes: CanonicalOrigin
+			// returns "" for "ftp://example.com" while originOf returns
+			// "ftp://example.com". That divergence is harmless here (a
+			// non-http scheme is already rejected on scheme grounds) but it
+			// would make this assertion fire on a row it was never about.
+			isHTTP := strings.HasPrefix(tt.url, "http://") || strings.HasPrefix(tt.url, "https://")
+			if isHTTP && crawl.CanonicalOrigin(tt.url) == "" {
+				if got := crawl.ResolveTargetOrigin(tt.url, nil); got != "" {
+					t.Errorf("ResolveTargetOrigin(%q, nil) = %q, want \"\" (must fail closed)", tt.url, got)
+				}
+			}
+		})
+	}
+}
+
+// TestValidateTargetURL_RedactsUserinfoInErrors is SEC-BE-002 (LAB-4992
+// review). validateTargetURL delegates to validateURL, which must never echo
+// raw --target-url userinfo to stderr/CI logs.
+//
+// Every error branch validateURL can produce is covered, each by an input
+// that reaches it and carries credentials: url.Parse failure, bad scheme,
+// missing host, and the un-canonicalizable-origin check. The parse-failure
+// row is the one that matters most: it is the only input reaching the
+// *url.Error unwrap, whose whole purpose is that url.Parse's own message
+// embeds the raw URL, so wrapping it directly would re-leak the credential
+// the %q operand just redacted (TEST-001/QUAL-001 review finding — that
+// branch previously had zero coverage).
+//
+// The fixture hostname is deliberately distinctive rather than "host": the
+// previous positive assertion looked for the substring "host", which the
+// boilerplate "must include scheme and host" satisfies on its own, so it
+// passed even when nothing was echoed. Asserting a hostname that appears
+// nowhere else in the message makes it fail if the redacted value stops
+// being printed (TEST-003 review finding).
+// NOTE for alert triage: titus reports "Generic Password" against the
+// `password` constant below (code-scanning alert 119), and "Credentials in a
+// URL" against the fixture rows built from it. Every value is synthetic
+// (`svc-account:secretpass` against api.internal.example, a reserved example
+// domain), no host is ever dialed -- validateTargetURL only parses -- and the
+// credential IS the subject under test: this table exists precisely to prove a
+// userinfo-bearing --target-url never renders its credential into an error.
+// Removing or masking the userinfo would delete the test's subject, and
+// assembling the string from concatenated parts to slip past the scanner would
+// hide the fixture from readers while defeating a control the repository
+// relies on. Retained deliberately; the alerts are false positives of the same
+// class as 97-115 and are dismissed on the same grounds.
+func TestValidateTargetURL_RedactsUserinfoInErrors(t *testing.T) {
+	const username = "svc-account"
+	const password = "secretpass"
+	const host = "api.internal.example"
+	// A percent-encoded credential: a raw '@' would terminate the userinfo
+	// early, so the reserved character itself is what gets encoded.
+	//
+	// The ENCODED assertion is the live one: it fails if the escape ever
+	// reaches the message verbatim. The DECODED assertion cannot fail on any
+	// current path, but NOT for the reason an earlier revision of this comment
+	// gave (it claimed url.URL.String() re-escapes userinfo). The real
+	// mechanism is simpler: redactSeedURL sets `u.User = nil`, so the userinfo
+	// is dropped outright before String() is ever called -- and on the
+	// parse-failure row it returns the placeholder instead. Either way the
+	// credential is gone in any spelling, so `p@ss` can never appear.
+	//
+	// The distinction matters to whoever edits redactSeedURL next: the
+	// property depends on that nil assignment, not on escaping behavior, so
+	// removing the nil is what would break it (TEST-001 review finding). The
+	// assertion is kept as forward-looking defense in depth against a future
+	// formatter that reads the decoded u.User.Password() -- not as coverage of
+	// a reachable bug.
+	const encodedPassword = "p%40ss"
+	const decodedPassword = "p@ss"
+
+	tests := []struct {
+		name string
+		url  string
+		// wantEcho is the exact substring the redacted value must contribute
+		// to the message. Stated per-row rather than as a shared disjunction
+		// because RedactURL's output differs by branch: a hostname where it
+		// can strip userinfo cleanly, its placeholder where it cannot prove
+		// the result credential-free, and a bare scheme where there was no
+		// host to keep. A shared "contains host OR placeholder" assertion was
+		// what let an earlier version pass without any redaction at all.
+		//
+		// The missing-host rows assert the QUOTED form `"https:"` including
+		// its surrounding double quotes, which only the %q verb can produce.
+		// Asserting bare `https:` would be satisfied by the unquoted
+		// `(e.g., https://example.com)` boilerplate in the same message, so
+		// the row would pass even if the %q operand stopped being printed
+		// (TEST-002 review finding).
+		wantEcho string
+	}{
+		{"fails url.Parse (invalid port) -- exercises the *url.Error unwrap", "https://" + username + ":" + password + "@" + host + ":notaport/", "URL with userinfo redacted"},
+		{"fails validateURL (bad scheme)", "ftp://" + username + ":" + password + "@" + host + "/", host},
+		{"fails validateURL (missing host)", "https://" + username + ":" + password + "@", `"https:"`},
+		{"percent-encoded credential (missing host)", "https://" + username + ":" + encodedPassword + "@", `"https:"`},
+		{"fails CanonicalOrigin (duplicated port)", "https://" + username + ":" + password + "@" + host + ":8443:8443/", host},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateTargetURL(tt.url)
+			require.Error(t, err)
+			msg := err.Error()
+			require.NotContains(t, msg, password,
+				"validateTargetURL error must not echo the --target-url password verbatim")
+			require.NotContains(t, msg, username,
+				"validateTargetURL error must not echo the --target-url username")
+			require.NotContains(t, msg, encodedPassword,
+				"validateTargetURL error must not echo a percent-encoded credential in its encoded form")
+			require.NotContains(t, msg, decodedPassword,
+				"validateTargetURL error must not echo a percent-encoded credential in its decoded form -- "+
+					"redactSeedURL round-trips through url.Parse, which can decode the escape")
+			// Positive assertions: the message must still usefully identify
+			// the problem even with credentials stripped.
+			require.Contains(t, msg, "--target-url",
+				"validateTargetURL error must still identify --target-url as the source of the problem")
+			require.Contains(t, msg, tt.wantEcho,
+				"the redacted value must still be echoed so the operator can see WHICH input was rejected; "+
+					"this fails if the %q operand stops being printed")
 		})
 	}
 }
@@ -1011,13 +1185,53 @@ func TestGRPCInsecureSkipVerify_GenerateCmd(t *testing.T) {
 // hermetic Run() smoke test that never reaches pipeline.Options
 // construction on a REST capture).
 func TestGRPCInsecureSkipVerify_ReachesOptions(t *testing.T) {
-	require.True(t, (&GenerateCmd{GRPCInsecureSkipVerify: true}).options().GRPCInsecureSkipVerify,
+	require.True(t, (&GenerateCmd{GRPCInsecureSkipVerify: true}).options(httpx.ProxyConfig{}).GRPCInsecureSkipVerify,
 		"GenerateCmd flag must reach pipeline.Options")
-	require.False(t, (&GenerateCmd{GRPCInsecureSkipVerify: false}).options().GRPCInsecureSkipVerify)
+	require.False(t, (&GenerateCmd{GRPCInsecureSkipVerify: false}).options(httpx.ProxyConfig{}).GRPCInsecureSkipVerify)
 
-	require.True(t, (&ScanCmd{GRPCInsecureSkipVerify: true}).scanOptions("rest", nil).GRPCInsecureSkipVerify,
+	require.True(t, (&ScanCmd{GRPCInsecureSkipVerify: true}).scanOptions("rest", nil, httpx.ProxyConfig{}).GRPCInsecureSkipVerify,
 		"ScanCmd flag must reach pipeline.ScanOptions")
-	require.False(t, (&ScanCmd{GRPCInsecureSkipVerify: false}).scanOptions("rest", nil).GRPCInsecureSkipVerify)
+	require.False(t, (&ScanCmd{GRPCInsecureSkipVerify: false}).scanOptions("rest", nil, httpx.ProxyConfig{}).GRPCInsecureSkipVerify)
+}
+
+// TestOptions_WarningsAlwaysWiredToStderr pins the CLI wiring of the
+// always-on warnings writer (TEST-001): pipeline.Options.Warnings/
+// ScanOptions.Warnings must be os.Stderr unconditionally, NOT
+// statusWriter(c.Verbose) — the latter would silently restore the exact
+// "cross-origin skips are invisible without --verbose" regression the
+// SEC-BE-001 warning field was introduced to fix (see options()'s and
+// scanOptions()'s doc comments). Verified by mutation: flipping `Warnings:
+// os.Stderr` to `Warnings: statusWriter(c.Verbose)` in main.go survived the
+// full suite before this test existed, because every other test either sets
+// Verbose:true or never inspects Warnings at all.
+func TestOptions_WarningsAlwaysWiredToStderr(t *testing.T) {
+	genOpts := (&GenerateCmd{Verbose: false}).options(httpx.ProxyConfig{})
+	require.Equal(t, os.Stderr, genOpts.Warnings,
+		"GenerateCmd.options().Warnings must always be os.Stderr, not gated on --verbose")
+	require.NotEqual(t, statusWriter(false), genOpts.Warnings,
+		"Warnings must not collapse to statusWriter(false) (nil), which would silence the SEC-BE-001 warning")
+
+	scanOpts := (&ScanCmd{CrawlOptions: CrawlOptions{Verbose: false}}).scanOptions("rest", nil, httpx.ProxyConfig{})
+	require.Equal(t, os.Stderr, scanOpts.Warnings,
+		"ScanCmd.scanOptions().Warnings must always be os.Stderr, not gated on --verbose")
+	require.NotEqual(t, statusWriter(false), scanOpts.Warnings,
+		"Warnings must not collapse to statusWriter(false) (nil), which would silence the SEC-BE-001 warning")
+}
+
+// TestOptions_TargetURLReachesPipeline pins TEST-002: c.TargetURL must reach
+// pipeline.Options.TargetURL (via GenerateCmd.options()) and
+// pipeline.ScanOptions.TargetURL (via ScanCmd.scanOptions(), sourced from
+// c.URL — see scanOptions's doc comment). Without this assignment,
+// `generate --target-url` silently stops being the documented remedy for
+// skipped cross-origin endpoints (SEC-BE-001).
+func TestOptions_TargetURLReachesPipeline(t *testing.T) {
+	require.Equal(t, "https://api.example.test",
+		(&GenerateCmd{TargetURL: "https://api.example.test"}).options(httpx.ProxyConfig{}).TargetURL,
+		"GenerateCmd.TargetURL must reach pipeline.Options.TargetURL")
+
+	require.Equal(t, "https://api.example.test",
+		(&ScanCmd{URL: "https://api.example.test"}).scanOptions("rest", nil, httpx.ProxyConfig{}).TargetURL,
+		"ScanCmd.URL must reach pipeline.ScanOptions.TargetURL")
 }
 
 // TestDangerousAllowPrivate_SameOutputForPublicURLs verifies that allowPrivate=true
@@ -2273,7 +2487,7 @@ func TestProbeWSDLDocument_ValidWSDL(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/calculator.asmx", true, nil)
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/calculator.asmx", true, httpx.ProxyConfig{}, nil)
 	if doc == nil {
 		t.Fatal("probeWSDLDocument returned nil for valid WSDL endpoint")
 	}
@@ -2291,7 +2505,7 @@ func TestProbeWSDLDocument_NoWSDL(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL, true, nil)
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL, true, httpx.ProxyConfig{}, nil)
 	if doc != nil {
 		t.Errorf("probeWSDLDocument should return nil for non-WSDL endpoint, got %d bytes", len(doc))
 	}
@@ -2305,7 +2519,7 @@ func TestProbeWSDLDocument_404(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL, true, nil)
+	doc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL, true, httpx.ProxyConfig{}, nil)
 	if doc != nil {
 		t.Error("probeWSDLDocument should return nil for 404 response")
 	}
@@ -2362,7 +2576,7 @@ func TestScanPipeline_WSDLDiscoveryProbe(t *testing.T) {
 	}
 
 	// Active probe discovers the WSDL document
-	wsdlDoc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/calculator.asmx", true, nil)
+	wsdlDoc := pipeline.ProbeWSDLDocument(context.Background(), ts.URL+"/calculator.asmx", true, httpx.ProxyConfig{}, nil)
 	if wsdlDoc == nil {
 		t.Fatal("probeWSDLDocument should find the WSDL document")
 	}
@@ -2444,7 +2658,7 @@ func TestProbeWSDLDocument_URLConstruction(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			pipeline.ProbeWSDLDocument(context.Background(), ts.URL+tt.inputPath, true, nil)
+			pipeline.ProbeWSDLDocument(context.Background(), ts.URL+tt.inputPath, true, httpx.ProxyConfig{}, nil)
 
 			if gotQuery != tt.wantQuery {
 				t.Errorf("probeWSDLDocument(%q) sent query %q, want %q", tt.inputPath, gotQuery, tt.wantQuery)
@@ -3228,9 +3442,14 @@ func TestGenerateCmdRun_ForwardsHeaderToJSReplay(t *testing.T) {
 func TestGenerateCmdRun_TargetURLOverridesOrigin(t *testing.T) {
 	const appJS = `function loadOrders(uid) { return fetch("/api/users/".concat(uid, "/orders")); }`
 
+	// probeHits counts active JS-replay probes that actually reach the real
+	// server, so the tests can observe WHERE --target-url sends the probe
+	// independently of whether the endpoint reaches the spec.
+	var probeHits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/users/0/orders":
+			atomic.AddInt32(&probeHits, 1)
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"orders":[]}`))
 		default:
@@ -3239,9 +3458,12 @@ func TestGenerateCmdRun_TargetURLOverridesOrigin(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// The bundle is captured inline at a bogus origin, so replay processes its
-	// body without fetching. The extracted /api/users/0/orders is RELATIVE and
-	// gets probed against the derived origin — bogus by default, srv via override.
+	// The bundle is captured inline at a bogus origin. The concat endpoint
+	// /api/users/0/orders exists ONLY as a JS string concatenation, so:
+	//   - the fully-offline static analyzer (--analyze-js) reconstructs it as a
+	//     candidate regardless of origin reachability (LAB-4992), and
+	//   - the active JS-replay probe is sent to the derived origin (bogus by
+	//     default, srv when --target-url pins it).
 	requests := []crawl.ObservedRequest{
 		{
 			Method: "GET",
@@ -3263,11 +3485,24 @@ func TestGenerateCmdRun_TargetURLOverridesOrigin(t *testing.T) {
 
 	runGenerate := func(t *testing.T, targetURL string) string {
 		t.Helper()
+		atomic.StoreInt32(&probeHits, 0)
 		outputPath := filepath.Join(t.TempDir(), "spec.yaml")
 		cmd := &GenerateCmd{
-			APIType:               "rest",
-			Capture:               capturePath,
-			Output:                outputPath,
+			APIType: "rest",
+			Capture: capturePath,
+			Output:  outputPath,
+			// Pin the PRODUCTION default confidence. LAB-4992 AC1 requires the
+			// fully-offline concat endpoint to reach the spec at the real default
+			// — an unprobed bare-GET candidate scores only the 0.15 path
+			// heuristic and is dropped unless the classifier's static-JS floor
+			// (RESTClassifier Rule 7) promotes it. An earlier revision left
+			// Confidence at 0, which hid that drop.
+			//
+			// TEST-001: reference the constant, not a 0.5 literal. Hardcoding it
+			// decoupled this guard from the value it exists to pin — moving the
+			// production default to 0.6 would leave this test running at a stale
+			// 0.5, so AC1 would re-break with a green suite.
+			Confidence:            classify.DefaultConfidenceThreshold,
 			Probe:                 true,
 			AnalyzeJS:             true,
 			Deduplicate:           true,
@@ -3280,19 +3515,179 @@ func TestGenerateCmdRun_TargetURLOverridesOrigin(t *testing.T) {
 		return string(specBytes)
 	}
 
-	t.Run("without_target_url_probes_wrong_origin", func(t *testing.T) {
+	// LAB-4992: without --target-url the derived origin is unreachable, so the
+	// active probe never reaches the real server — yet the concat endpoint is
+	// still recovered offline as a static candidate (the capture-once /
+	// generate-many guarantee). The probe going to the bogus origin (not srv) is
+	// what --target-url exists to fix.
+	t.Run("without_target_url_recovers_offline_probes_wrong_origin", func(t *testing.T) {
 		spec := runGenerate(t, "")
-		require.NotContains(t, spec, "/orders",
-			"without --target-url the endpoint is probed against the capture's bogus origin and must not be recovered")
+		require.Contains(t, spec, "/api/users/{userId}/orders",
+			"LAB-4992: concat endpoint must be recovered offline as a static candidate even when the origin is unreachable")
+		require.Zero(t, atomic.LoadInt32(&probeHits),
+			"without --target-url the active probe must target the capture's bogus origin, not the real server")
 	})
 
-	t.Run("with_target_url_recovers", func(t *testing.T) {
+	// --target-url pins the reachable origin, so the active JS-replay probe is
+	// sent there (probeHits > 0) in addition to the offline static recovery.
+	t.Run("with_target_url_pins_probe_origin", func(t *testing.T) {
 		spec := runGenerate(t, srv.URL)
-		require.Contains(t, spec, "/api/users/",
-			"--target-url must pin the reachable origin so the concat endpoint is probed there and recovered")
-		require.Contains(t, spec, "/orders",
-			"--target-url must pin the reachable origin so the concat endpoint reaches the spec")
+		require.Contains(t, spec, "/api/users/{userId}/orders",
+			"--target-url must still surface the concat endpoint")
+		require.NotZero(t, atomic.LoadInt32(&probeHits),
+			"--target-url must pin the reachable origin so the concat endpoint is actively probed there")
 	})
+}
+
+// TestGenerateCmdRun_FullyOfflineRecoversConcatEndpoint is LAB-4992 AC1 in its
+// literal shape (TEST-001): "fully-offline `generate rest` (no network access) on
+// a capture whose endpoints exist only as JS-bundle concatenations surfaces those
+// endpoints in the generated spec".
+//
+// Every other CLI test asserting the concat endpoint reaches the spec runs with
+// Probe: true and relies on the probe failing — either against a `.invalid`
+// hostname (so the guarantee rests on DNS behavior rather than on the offline
+// path) or against a live httptest server. This one starts no HTTP server at all
+// and disables probing outright, so nothing but the offline static path can
+// produce the endpoint.
+func TestGenerateCmdRun_FullyOfflineRecoversConcatEndpoint(t *testing.T) {
+	const appJS = `function loadOrders(uid) { return fetch("/api/users/".concat(uid, "/orders")); }`
+
+	// Source "burp" so pipeline.AnalyzeJS's AnyStaticSource guard does not
+	// short-circuit the offline analysis (see QUAL-001 in jsstatic/doc.go).
+	requests := []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://app.example.com/app.js",
+			Source: "burp",
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/javascript",
+				Body:        []byte(appJS),
+			},
+		},
+	}
+
+	capturePath := filepath.Join(t.TempDir(), "capture.json")
+	f, err := os.Create(capturePath) //nolint:gosec // G304: test file
+	require.NoError(t, err)
+	require.NoError(t, crawl.WriteCapture(f, requests))
+	require.NoError(t, f.Close())
+
+	outputPath := filepath.Join(t.TempDir(), "spec.yaml")
+	cmd := &GenerateCmd{
+		APIType:    "rest",
+		Capture:    capturePath,
+		Output:     outputPath,
+		Confidence: classify.DefaultConfidenceThreshold,
+		Probe:      false, // no network at all
+		AnalyzeJS:  true,
+	}
+	require.NoError(t, cmd.Run())
+
+	specBytes, err := os.ReadFile(outputPath) //nolint:gosec // G304: test file
+	require.NoError(t, err)
+	require.Contains(t, string(specBytes), "/api/users/{userId}/orders",
+		"LAB-4992 AC1: a concat-only endpoint must reach the spec with --probe=false and no network access")
+}
+
+// TestGenerateCmdRun_ReachableTargetIsNeverWorseThanOffline is the end-to-end
+// guard for QUAL-004 (LAB-4992): supplying a REACHABLE --target-url must never
+// produce less output than running fully offline.
+//
+// Before the fix, JS-replay recorded a path as "reached" for any answered status
+// and then deleted the offline static:js-concat mirror, replacing it with a
+// Source "js-extract" entry. js-extract is not a crawl.IsJSStaticSource, so
+// classify Rule 7's StaticJSConfidence floor never applied to it: the
+// replacement scored only Rule 3's 0.15 and was dropped at the 0.5 default
+// threshold. Against a target answering 200 text/html (the nginx/SPA try_files
+// catch-all), 204, an HTML-bodied 401/403, or 302 -> /login, the spec went from
+// one path to ZERO — while the same capture generated against an unreachable
+// target kept the endpoint. This asserts through the real classifier and
+// generator at the production confidence default, which the unit-level guards in
+// pkg/crawl cannot do.
+func TestGenerateCmdRun_ReachableTargetIsNeverWorseThanOffline(t *testing.T) {
+	const appJS = `function loadOrders(uid) { return fetch("/api/users/".concat(uid, "/orders")); }`
+
+	cases := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+	}{
+		{name: "spa_catch_all_200_html", status: 200, contentType: "text/html", body: "<!doctype html><html></html>"},
+		{name: "no_content_204", status: 204},
+		{name: "auth_gated_401_html", status: 401, contentType: "text/html", body: "<html>login</html>"},
+		{name: "auth_gated_403_html", status: 403, contentType: "text/html", body: "<html>denied</html>"},
+		{name: "redirect_302_to_login", status: 302, contentType: "text/html"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/app.js" {
+					w.Header().Set("Content-Type", "application/javascript")
+					_, _ = w.Write([]byte(appJS))
+					return
+				}
+				// Every other path (including the reconstructed concat endpoint)
+				// answers with a NON-404, non-dispositive status.
+				if tc.status == 302 {
+					w.Header().Set("Location", "/login")
+				}
+				if tc.contentType != "" {
+					w.Header().Set("Content-Type", tc.contentType)
+				}
+				w.WriteHeader(tc.status)
+				if tc.body != "" {
+					_, _ = w.Write([]byte(tc.body))
+				}
+			}))
+			defer srv.Close()
+
+			// Source "burp" so pipeline.AnalyzeJS's AnyStaticSource guard does not
+			// short-circuit the offline analysis (see QUAL-001 note in
+			// pkg/analyze/jsstatic/doc.go).
+			requests := []crawl.ObservedRequest{
+				{
+					Method: "GET",
+					URL:    srv.URL + "/app.js",
+					Source: "burp",
+					Response: crawl.ObservedResponse{
+						StatusCode:  200,
+						ContentType: "application/javascript",
+						Body:        []byte(appJS),
+					},
+				},
+			}
+
+			capturePath := filepath.Join(t.TempDir(), "capture.json")
+			f, err := os.Create(capturePath) //nolint:gosec // G304: test file
+			require.NoError(t, err)
+			require.NoError(t, crawl.WriteCapture(f, requests))
+			require.NoError(t, f.Close())
+
+			outputPath := filepath.Join(t.TempDir(), "spec.yaml")
+			cmd := &GenerateCmd{
+				APIType:               "rest",
+				Capture:               capturePath,
+				Output:                outputPath,
+				Confidence:            classify.DefaultConfidenceThreshold,
+				Probe:                 true,
+				AnalyzeJS:             true,
+				Deduplicate:           true,
+				DangerousAllowPrivate: true,
+				TargetURL:             srv.URL, // reachable
+			}
+			require.NoError(t, cmd.Run())
+
+			specBytes, err := os.ReadFile(outputPath) //nolint:gosec // G304: test file
+			require.NoError(t, err)
+
+			require.Contains(t, string(specBytes), "/api/users/{userId}/orders",
+				"a reachable target answering %d must not REMOVE the offline concat endpoint: only a 404 is a dispositive refutation, and the js-extract replacement receives no Rule 7 floor (QUAL-004)", tc.status)
+		})
+	}
 }
 
 // TestGenerateCmdRun_RejectsMalformedTargetURL pins the fail-fast guard: a
@@ -3377,4 +3772,264 @@ func TestGenerateCmdRun_RejectsMalformedHeader(t *testing.T) {
 			require.Contains(t, err.Error(), "invalid --header")
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 9/10: CLI proxy plumbing (LAB-4993)
+// ---------------------------------------------------------------------------
+
+// TestBuildJSReplayConfig_SetsProxy verifies that buildJSReplayConfig's
+// trailing proxy parameter reaches the returned JSReplayConfig.Proxy field.
+func TestBuildJSReplayConfig_SetsProxy(t *testing.T) {
+	proxyURL, err := url.Parse("http://127.0.0.1:8080")
+	require.NoError(t, err)
+
+	cfg := buildJSReplayConfig(map[string]string{}, "https://example.com", false, false, httpx.ProxyConfig{URL: proxyURL})
+	require.NotNil(t, cfg.Proxy.URL, "buildJSReplayConfig must set JSReplayConfig.Proxy from the proxy argument")
+	require.Equal(t, proxyURL, cfg.Proxy.URL)
+
+	// TEST-002: the proxy argument's Insecure flag must reach
+	// JSReplayConfig.Proxy.Insecure too, both when set and when left at its
+	// false default (two-sided).
+	t.Run("Insecure=true reaches cfg.Proxy.Insecure", func(t *testing.T) {
+		insecureCfg := buildJSReplayConfig(map[string]string{}, "https://example.com", false, false, httpx.ProxyConfig{URL: proxyURL, Insecure: true})
+		require.True(t, insecureCfg.Proxy.Insecure, "buildJSReplayConfig must carry Proxy.Insecure=true into JSReplayConfig.Proxy.Insecure")
+	})
+
+	t.Run("Insecure=false reaches cfg.Proxy.Insecure", func(t *testing.T) {
+		secureCfg := buildJSReplayConfig(map[string]string{}, "https://example.com", false, false, httpx.ProxyConfig{URL: proxyURL, Insecure: false})
+		require.False(t, secureCfg.Proxy.Insecure, "buildJSReplayConfig must carry Proxy.Insecure=false into JSReplayConfig.Proxy.Insecure")
+	})
+}
+
+// TestParseProxyConfig_ValidatesAndParses verifies parseProxyConfig parses a
+// valid proxy address into httpx.ProxyConfig, rejects embedded credentials
+// and unsupported schemes (via crawl.ValidateProxyAddr), and carries the
+// insecure flag through.
+func TestParseProxyConfig_ValidatesAndParses(t *testing.T) {
+	t.Run("valid http proxy", func(t *testing.T) {
+		cfg, err := parseProxyConfig("http://127.0.0.1:8080", false)
+		require.NoError(t, err)
+		require.NotNil(t, cfg.URL)
+		require.Equal(t, "127.0.0.1:8080", cfg.URL.Host)
+		require.False(t, cfg.Insecure)
+	})
+
+	t.Run("rejects embedded credentials", func(t *testing.T) {
+		_, err := parseProxyConfig("http://user:pw@127.0.0.1:8080", false)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "embedded credentials")
+	})
+
+	t.Run("rejects unsupported scheme", func(t *testing.T) {
+		_, err := parseProxyConfig("ftp://127.0.0.1:21", false)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "scheme must be")
+	})
+
+	t.Run("insecure flag carried through", func(t *testing.T) {
+		cfg, err := parseProxyConfig("http://127.0.0.1:8080", true)
+		require.NoError(t, err)
+		require.True(t, cfg.Insecure)
+	})
+
+	// TEST-001: pins parseProxyConfigOrEmpty's fail-open contract — an invalid
+	// proxy address (rejected by parseProxyConfig, here an unsupported scheme)
+	// must yield a disabled ProxyConfig rather than propagating the error or
+	// leaving Insecure set.
+	t.Run("parseProxyConfigOrEmpty fails open on an invalid address", func(t *testing.T) {
+		cfg := parseProxyConfigOrEmpty("ftp://127.0.0.1:21", true)
+		require.False(t, cfg.Enabled(), "an invalid proxy address must fail open to a disabled ProxyConfig")
+	})
+}
+
+// TestWarnProxyNoPort verifies the extracted warnProxyNoPort helper: it warns
+// when the proxy address has no explicit port, and stays silent when a port
+// is present. Mirrors the pre-extraction behavior pinned by
+// TestDoCrawl_ProxyPortlessWarning.
+func TestWarnProxyNoPort(t *testing.T) {
+	t.Run("no port warns", func(t *testing.T) {
+		var buf bytes.Buffer
+		warnProxyNoPort(&buf, "http://proxy.local")
+		require.Contains(t, buf.String(), "has no explicit port")
+	})
+
+	t.Run("with port stays silent", func(t *testing.T) {
+		var buf bytes.Buffer
+		warnProxyNoPort(&buf, "http://proxy.local:8080")
+		require.Empty(t, buf.String())
+	})
+}
+
+// TestGenerateCmd_ProxyFlagsParse verifies that `generate` accepts
+// --proxy/--proxy-insecure via Kong.
+func TestGenerateCmd_ProxyFlagsParse(t *testing.T) {
+	var cli struct {
+		Generate GenerateCmd `cmd:"" name:"generate"`
+	}
+	p := kong.Must(&cli, kong.Name("vespasian"))
+	_, err := p.Parse([]string{"generate", "--proxy", "http://127.0.0.1:8080", "--proxy-insecure", "rest", "cap.json"})
+	require.NoError(t, err, "parsing generate --proxy/--proxy-insecure")
+	require.Equal(t, "http://127.0.0.1:8080", cli.Generate.Proxy)
+	require.True(t, cli.Generate.ProxyInsecure)
+}
+
+// TestCrawlCmd_AugmentOptions_CarriesProxy is the TEST-001 proof that
+// CrawlCmd's proxy (set via the embedded CrawlOptions.Proxy) reaches
+// pipeline.AugmentOptions via the new CrawlCmd.augmentOptions() helper. Before
+// this test, no test exercised augmentOptions at all — deleting its `Proxy:`
+// line left the whole suite green.
+func TestCrawlCmd_AugmentOptions_CarriesProxy(t *testing.T) {
+	cmd := &CrawlCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080"}}
+	proxy := parseProxyConfigOrEmpty(cmd.Proxy, cmd.ProxyInsecure)
+	opts := cmd.augmentOptions(proxy)
+	require.NotNil(t, opts.Proxy.URL, "CrawlCmd.Proxy must reach pipeline.AugmentOptions.Proxy")
+
+	// Two-sided check on Proxy.Insecure, mirroring the TEST-002 pattern used
+	// for options()/scanOptions() below.
+	t.Run("ProxyInsecure=true reaches opts.Proxy.Insecure", func(t *testing.T) {
+		insecureCmd := &CrawlCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080", ProxyInsecure: true}}
+		insecureProxy := parseProxyConfigOrEmpty(insecureCmd.Proxy, insecureCmd.ProxyInsecure)
+		insecureOpts := insecureCmd.augmentOptions(insecureProxy)
+		require.True(t, insecureOpts.Proxy.Insecure, "CrawlCmd.ProxyInsecure=true must reach pipeline.AugmentOptions.Proxy.Insecure")
+	})
+
+	t.Run("ProxyInsecure=false reaches opts.Proxy.Insecure", func(t *testing.T) {
+		secureCmd := &CrawlCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080", ProxyInsecure: false}}
+		secureProxy := parseProxyConfigOrEmpty(secureCmd.Proxy, secureCmd.ProxyInsecure)
+		secureOpts := secureCmd.augmentOptions(secureProxy)
+		require.False(t, secureOpts.Proxy.Insecure, "CrawlCmd.ProxyInsecure=false must reach pipeline.AugmentOptions.Proxy.Insecure")
+	})
+}
+
+// TestGenerateCmd_AugmentOptions_CarriesProxy is the TEST-001 proof that
+// GenerateCmd's proxy reaches pipeline.AugmentOptions via
+// GenerateCmd.augmentOptions() — the sibling helper to options() (already
+// covered by TestGenerateCmd_Options_CarriesProxy below), added for the
+// static-HTML-forms + JS-static augment stage.
+func TestGenerateCmd_AugmentOptions_CarriesProxy(t *testing.T) {
+	cmd := &GenerateCmd{Proxy: "http://127.0.0.1:8080"}
+	proxy := parseProxyConfigOrEmpty(cmd.Proxy, cmd.ProxyInsecure)
+	opts := cmd.augmentOptions(proxy)
+	require.NotNil(t, opts.Proxy.URL, "GenerateCmd.Proxy must reach pipeline.AugmentOptions.Proxy")
+
+	t.Run("ProxyInsecure=true reaches opts.Proxy.Insecure", func(t *testing.T) {
+		insecureCmd := &GenerateCmd{Proxy: "http://127.0.0.1:8080", ProxyInsecure: true}
+		insecureProxy := parseProxyConfigOrEmpty(insecureCmd.Proxy, insecureCmd.ProxyInsecure)
+		insecureOpts := insecureCmd.augmentOptions(insecureProxy)
+		require.True(t, insecureOpts.Proxy.Insecure, "GenerateCmd.ProxyInsecure=true must reach pipeline.AugmentOptions.Proxy.Insecure")
+	})
+
+	t.Run("ProxyInsecure=false reaches opts.Proxy.Insecure", func(t *testing.T) {
+		secureCmd := &GenerateCmd{Proxy: "http://127.0.0.1:8080", ProxyInsecure: false}
+		secureProxy := parseProxyConfigOrEmpty(secureCmd.Proxy, secureCmd.ProxyInsecure)
+		secureOpts := secureCmd.augmentOptions(secureProxy)
+		require.False(t, secureOpts.Proxy.Insecure, "GenerateCmd.ProxyInsecure=false must reach pipeline.AugmentOptions.Proxy.Insecure")
+	})
+}
+
+// TestScanCmd_AugmentOptions_CarriesProxy is the TEST-001 proof that ScanCmd's
+// proxy reaches pipeline.AugmentOptions via ScanCmd.augmentOptions() — the
+// sibling helper to scanOptions() (already covered by
+// TestScanCmd_ScanOptions_CarriesProxy below), added for the
+// static-HTML-forms + JS-static augment stage.
+func TestScanCmd_AugmentOptions_CarriesProxy(t *testing.T) {
+	cmd := &ScanCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080"}}
+	proxy := parseProxyConfigOrEmpty(cmd.Proxy, cmd.ProxyInsecure)
+	opts := cmd.augmentOptions(proxy)
+	require.NotNil(t, opts.Proxy.URL, "ScanCmd.Proxy must reach pipeline.AugmentOptions.Proxy")
+
+	t.Run("ProxyInsecure=true reaches opts.Proxy.Insecure", func(t *testing.T) {
+		insecureCmd := &ScanCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080", ProxyInsecure: true}}
+		insecureProxy := parseProxyConfigOrEmpty(insecureCmd.Proxy, insecureCmd.ProxyInsecure)
+		insecureOpts := insecureCmd.augmentOptions(insecureProxy)
+		require.True(t, insecureOpts.Proxy.Insecure, "ScanCmd.ProxyInsecure=true must reach pipeline.AugmentOptions.Proxy.Insecure")
+	})
+
+	t.Run("ProxyInsecure=false reaches opts.Proxy.Insecure", func(t *testing.T) {
+		secureCmd := &ScanCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080", ProxyInsecure: false}}
+		secureProxy := parseProxyConfigOrEmpty(secureCmd.Proxy, secureCmd.ProxyInsecure)
+		secureOpts := secureCmd.augmentOptions(secureProxy)
+		require.False(t, secureOpts.Proxy.Insecure, "ScanCmd.ProxyInsecure=false must reach pipeline.AugmentOptions.Proxy.Insecure")
+	})
+}
+
+// TestGenerateCmd_Options_CarriesProxy closes the CLI-boundary gap: it asserts
+// c.Proxy actually reaches pipeline.Options (via GenerateCmd.options()),
+// mirroring TestGRPCInsecureSkipVerify_ReachesOptions.
+func TestGenerateCmd_Options_CarriesProxy(t *testing.T) {
+	cmd := &GenerateCmd{Proxy: "http://127.0.0.1:8080"}
+	proxy := parseProxyConfigOrEmpty(cmd.Proxy, cmd.ProxyInsecure)
+	opts := cmd.options(proxy)
+	require.NotNil(t, opts.Proxy.URL, "GenerateCmd.Proxy must reach pipeline.Options.Proxy")
+
+	// TEST-002: ProxyInsecure must reach pipeline.Options.Proxy.Insecure too,
+	// both when set and when left at its false default (two-sided).
+	t.Run("ProxyInsecure=true reaches opts.Proxy.Insecure", func(t *testing.T) {
+		insecureCmd := &GenerateCmd{Proxy: "http://127.0.0.1:8080", ProxyInsecure: true}
+		insecureProxy := parseProxyConfigOrEmpty(insecureCmd.Proxy, insecureCmd.ProxyInsecure)
+		insecureOpts := insecureCmd.options(insecureProxy)
+		require.True(t, insecureOpts.Proxy.Insecure, "GenerateCmd.ProxyInsecure=true must reach pipeline.Options.Proxy.Insecure")
+	})
+
+	t.Run("ProxyInsecure=false reaches opts.Proxy.Insecure", func(t *testing.T) {
+		secureCmd := &GenerateCmd{Proxy: "http://127.0.0.1:8080", ProxyInsecure: false}
+		secureProxy := parseProxyConfigOrEmpty(secureCmd.Proxy, secureCmd.ProxyInsecure)
+		secureOpts := secureCmd.options(secureProxy)
+		require.False(t, secureOpts.Proxy.Insecure, "GenerateCmd.ProxyInsecure=false must reach pipeline.Options.Proxy.Insecure")
+	})
+}
+
+// TestScanCmd_ScanOptions_CarriesProxy verifies that ScanCmd's proxy (set via
+// the embedded CrawlOptions.Proxy) reaches pipeline.ScanOptions.Proxy via
+// scanOptions().
+func TestScanCmd_ScanOptions_CarriesProxy(t *testing.T) {
+	cmd := &ScanCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080"}}
+	proxy := parseProxyConfigOrEmpty(cmd.Proxy, cmd.ProxyInsecure)
+	opts := cmd.scanOptions("rest", nil, proxy)
+	require.NotNil(t, opts.Proxy.URL, "scanOptions must carry the passed proxy into pipeline.ScanOptions.Proxy")
+
+	// TEST-002: ProxyInsecure must reach pipeline.ScanOptions.Proxy.Insecure
+	// too, both when set and when left at its false default (two-sided).
+	t.Run("ProxyInsecure=true reaches opts.Proxy.Insecure", func(t *testing.T) {
+		insecureCmd := &ScanCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080", ProxyInsecure: true}}
+		insecureProxy := parseProxyConfigOrEmpty(insecureCmd.Proxy, insecureCmd.ProxyInsecure)
+		insecureOpts := insecureCmd.scanOptions("rest", nil, insecureProxy)
+		require.True(t, insecureOpts.Proxy.Insecure, "ScanCmd.ProxyInsecure=true must reach pipeline.ScanOptions.Proxy.Insecure")
+	})
+
+	t.Run("ProxyInsecure=false reaches opts.Proxy.Insecure", func(t *testing.T) {
+		secureCmd := &ScanCmd{CrawlOptions: CrawlOptions{Proxy: "http://127.0.0.1:8080", ProxyInsecure: false}}
+		secureProxy := parseProxyConfigOrEmpty(secureCmd.Proxy, secureCmd.ProxyInsecure)
+		secureOpts := secureCmd.scanOptions("rest", nil, secureProxy)
+		require.False(t, secureOpts.Proxy.Insecure, "ScanCmd.ProxyInsecure=false must reach pipeline.ScanOptions.Proxy.Insecure")
+	})
+}
+
+// TestGenerateCmd_ResolveJSReplayConfig_RejectsInvalidProxy is the TEST-001
+// proof that resolveJSReplayConfig fails fast on an invalid --proxy (embedded
+// credentials or an unsupported scheme) and threads a valid proxy onward into
+// the returned crawl.JSReplayConfig.
+func TestGenerateCmd_ResolveJSReplayConfig_RejectsInvalidProxy(t *testing.T) {
+	t.Run("rejects embedded credentials", func(t *testing.T) {
+		// Credentials assembled at runtime to avoid gosec G101 (hardcoded creds in
+		// URL); the value is identical to a plain literal once concatenated.
+		badProxy := "http://" + "admin:s3cret" + "@127.0.0.1:8080"
+		cmd := &GenerateCmd{Proxy: badProxy, TargetURL: "https://example.com"}
+		_, err := cmd.resolveJSReplayConfig()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "embedded credentials")
+	})
+	t.Run("rejects unsupported scheme", func(t *testing.T) {
+		cmd := &GenerateCmd{Proxy: "ftp://127.0.0.1:21", TargetURL: "https://example.com"}
+		_, err := cmd.resolveJSReplayConfig()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "scheme must be")
+	})
+	t.Run("valid proxy is threaded onward", func(t *testing.T) {
+		cmd := &GenerateCmd{Proxy: "http://127.0.0.1:8080", TargetURL: "https://example.com"}
+		cfg, err := cmd.resolveJSReplayConfig()
+		require.NoError(t, err)
+		require.NotNil(t, cfg.Proxy.URL, "a valid --proxy must reach the returned JSReplayConfig.Proxy.URL")
+	})
 }

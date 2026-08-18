@@ -15,6 +15,8 @@
 package probe
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -24,8 +26,13 @@ import (
 	"crypto/x509/pkix"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"math/big"
 	"net"
+	"net/url"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -44,6 +51,7 @@ import (
 	"google.golang.org/protobuf/types/descriptorpb"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 	"github.com/praetorian-inc/vespasian/test/grpc-server/labpb"
 )
 
@@ -231,6 +239,49 @@ func TestGRPCProbe_Probe_SelfSignedTLS(t *testing.T) {
 	schema := result[0].GRPCSchema
 	require.NotNil(t, schema, "GRPCSchema should be populated despite the self-signed certificate")
 	assert.True(t, schema.ReflectionEnabled, "self-signed cert must not block enumeration")
+}
+
+// TestGRPCProbe_ProbeTarget_URLValidatorSchemeMatchesTLS pins probeTarget's
+// scheme selection (SEC-BE-001): the synthesized URL handed to
+// Config.URLValidator must reflect t.useTLS rather than being hardcoded to
+// "http". internal/pipeline's cross-origin probe gate compares this scheme
+// against the scan's resolved target origin, so a probe against an https
+// target that is always reported to the validator as "http" would silently
+// pass the cross-origin gate for the wrong scheme (or fail a same-origin
+// comparison against a genuinely https target).
+//
+// The validator itself rejects every call, so probeTarget never dials —
+// this isolates the assertion to the URL string constructed before the dial,
+// with no dependency on a running gRPC server.
+func TestGRPCProbe_ProbeTarget_URLValidatorSchemeMatchesTLS(t *testing.T) {
+	var gotURLs []string
+	cfg := Config{
+		Timeout: 5 * time.Second,
+		URLValidator: func(rawURL string) error {
+			gotURLs = append(gotURLs, rawURL)
+			return errors.New("reject before dialing")
+		},
+	}
+	p := NewGRPCProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{
+		{APIType: "grpc"},
+		{APIType: "grpc"},
+	}
+	endpoints[0].URL = "http://cleartext.example.test:80/lab.v1.UserService/GetUser"
+	endpoints[1].URL = "https://tls.example.test:443/lab.v1.UserService/GetUser"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	result, err := p.Probe(ctx, endpoints)
+	require.NoError(t, err)
+	require.Len(t, result, 2)
+
+	assert.Equal(t, []string{
+		"http://cleartext.example.test:80",
+		"https://tls.example.test:443",
+	}, gotURLs, "the URLValidator must see a scheme matching each target's own useTLS, not a hardcoded http")
 }
 
 func TestGRPCProbe_Probe_FiltersReflectionServiceItself(t *testing.T) {
@@ -931,4 +982,395 @@ func TestWalkFileDescriptors_DedupSkipsSeen(t *testing.T) {
 
 	assert.Empty(t, out, "dedup guard should prevent re-fetching an already-seen descriptor")
 	assert.Zero(t, totalBytes, "totalBytes should be unchanged")
+}
+
+// ---------------------------------------------------------------------------
+// Task 8: gRPC reflection dial through proxy (LAB-4993)
+// ---------------------------------------------------------------------------
+
+// startRecordingCONNECTProxy starts a minimal HTTP CONNECT proxy on loopback
+// that records the requested target, replies "200 Connection established",
+// and pipes bytes bidirectionally between the client and targetAddr. Modeled
+// on architecture.md §5 / plan.md Task 2 (mirrors pkg/httpx's test helper of
+// the same shape, duplicated here since it is unexported in that package).
+func startRecordingCONNECTProxy(t *testing.T, targetAddr string) (addr string, recordedTarget func() string, stop func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	var recorded atomic.Value // string
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close() //nolint:errcheck // test cleanup
+
+		reader := bufio.NewReader(conn)
+		reqLine, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		fields := strings.Fields(reqLine)
+		if len(fields) >= 2 && fields[0] == "CONNECT" {
+			recorded.Store(fields[1])
+		}
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil || line == "\r\n" || line == "\n" {
+				break
+			}
+		}
+
+		if _, err := conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n")); err != nil {
+			return
+		}
+
+		targetConn, err := net.Dial("tcp", targetAddr)
+		if err != nil {
+			return
+		}
+		defer targetConn.Close() //nolint:errcheck // test cleanup
+
+		done := make(chan struct{})
+		go func() {
+			io.Copy(targetConn, reader) //nolint:errcheck,gosec // test tunnel copy
+			close(done)
+		}()
+		io.Copy(conn, targetConn) //nolint:errcheck,gosec // test tunnel copy
+		<-done
+	}()
+
+	return ln.Addr().String(),
+		func() string {
+			v, _ := recorded.Load().(string)
+			return v
+		},
+		func() { ln.Close() } //nolint:errcheck,gosec // test cleanup
+}
+
+// startRecordingSOCKS5Proxy is a minimal SOCKS5 server (CONNECT command, no
+// authentication) that dials the requested target and pipes bytes
+// bidirectionally, used to prove socks5 keeps TLS verification for the gRPC
+// dial regardless of GRPCInsecureSkipVerify/Proxy.Insecure. hits (TEST-005) is
+// incremented once per accepted connection, so callers can assert the tunnel
+// was actually traversed rather than relying solely on a nil-schema assertion
+// (which would also pass if the tunnel never connected at all) — matching the
+// hit-counter pattern every other stage's proxy test asserts on.
+func startRecordingSOCKS5Proxy(t *testing.T) (addr string, hits *atomic.Int64, stop func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	hits = &atomic.Int64{}
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		hits.Add(1)
+		defer conn.Close() //nolint:errcheck // test cleanup
+
+		head := make([]byte, 2)
+		if _, err := io.ReadFull(conn, head); err != nil {
+			return
+		}
+		methods := make([]byte, head[1])
+		if _, err := io.ReadFull(conn, methods); err != nil {
+			return
+		}
+		if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
+			return
+		}
+
+		reqHead := make([]byte, 4)
+		if _, err := io.ReadFull(conn, reqHead); err != nil {
+			return
+		}
+		var host string
+		switch reqHead[3] {
+		case 0x01: // IPv4
+			ipBuf := make([]byte, net.IPv4len)
+			if _, err := io.ReadFull(conn, ipBuf); err != nil {
+				return
+			}
+			host = net.IP(ipBuf).String()
+		case 0x03: // domain name
+			lenBuf := make([]byte, 1)
+			if _, err := io.ReadFull(conn, lenBuf); err != nil {
+				return
+			}
+			domainBuf := make([]byte, lenBuf[0])
+			if _, err := io.ReadFull(conn, domainBuf); err != nil {
+				return
+			}
+			host = string(domainBuf)
+		case 0x04: // IPv6
+			ipBuf := make([]byte, net.IPv6len)
+			if _, err := io.ReadFull(conn, ipBuf); err != nil {
+				return
+			}
+			host = net.IP(ipBuf).String()
+		default:
+			return
+		}
+		portBuf := make([]byte, 2)
+		if _, err := io.ReadFull(conn, portBuf); err != nil {
+			return
+		}
+		port := int(portBuf[0])<<8 | int(portBuf[1])
+
+		targetConn, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+		if err != nil {
+			conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) //nolint:errcheck,gosec // test best-effort failure reply
+			return
+		}
+		defer targetConn.Close() //nolint:errcheck // test cleanup
+
+		if _, err := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+			return
+		}
+
+		done := make(chan struct{})
+		go func() {
+			io.Copy(targetConn, conn) //nolint:errcheck,gosec // test tunnel copy
+			close(done)
+		}()
+		io.Copy(conn, targetConn) //nolint:errcheck,gosec // test tunnel copy
+		<-done
+	}()
+
+	return ln.Addr().String(), hits, func() { ln.Close() } //nolint:errcheck,gosec // test cleanup
+}
+
+// TestGRPCProbe_RoutesThroughHTTPConnectProxy is the AC-1 proof for gRPC: with
+// Config.Proxy enabled, dialGRPC must tunnel its connection through an HTTP
+// CONNECT proxy rather than dialing the target directly.
+func TestGRPCProbe_RoutesThroughHTTPConnectProxy(t *testing.T) {
+	addr, stop := startTestGRPCServer(t)
+	defer stop()
+
+	proxyAddr, recordedTarget, stopProxy := startRecordingCONNECTProxy(t, addr)
+	defer stopProxy()
+
+	proxyURL, err := url.Parse("http://" + proxyAddr)
+	require.NoError(t, err)
+
+	cfg := Config{
+		Timeout:      5 * time.Second,
+		URLValidator: func(string) error { return nil },
+		Proxy:        httpx.ProxyConfig{URL: proxyURL},
+	}
+	p := NewGRPCProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{{APIType: "grpc"}}
+	endpoints[0].URL = "http://" + addr + "/grpc.health.v1.Health/Check"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := p.Probe(ctx, endpoints)
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+
+	schema := result[0].GRPCSchema
+	require.NotNil(t, schema, "reflection must succeed when dialed through the proxy")
+	assert.True(t, schema.ReflectionEnabled)
+
+	assert.Equal(t, addr, recordedTarget(), "proxy must have recorded a CONNECT to the gRPC target")
+}
+
+// TestGRPCProbe_ProxyPassesHostnameNotIP is the QUAL-004 proof for gRPC: the
+// existing TestGRPCProbe_RoutesThroughHTTPConnectProxy above targets
+// 127.0.0.1:<port>, an IP literal that gRPC's built-in "dns" resolver would
+// pass through unchanged even without the passthrough-resolver fix — so it
+// cannot detect a regression back to pre-resolving the target. This test
+// drives the probe against a HOSTNAME target ("localhost:<port>") instead: if
+// dialGRPC ever reverted to handing gRPC's default "dns" resolver the bare
+// host:port (rather than "passthrough:///"+host:port), the dns resolver would
+// resolve "localhost" locally before WithContextDialer ever runs, and the
+// proxy would see a CONNECT to an IP literal instead of the hostname. The
+// recording proxy below dials the real test server directly (ignoring
+// whatever target string it received), so the tunnel still succeeds either
+// way — only the recorded CONNECT target string proves which resolver ran.
+func TestGRPCProbe_ProxyPassesHostnameNotIP(t *testing.T) {
+	addr, stop := startTestGRPCServer(t)
+	defer stop()
+
+	_, port, err := net.SplitHostPort(addr)
+	require.NoError(t, err)
+	hostname := "localhost:" + port
+
+	proxyAddr, recordedTarget, stopProxy := startRecordingCONNECTProxy(t, addr)
+	defer stopProxy()
+
+	proxyURL, err := url.Parse("http://" + proxyAddr)
+	require.NoError(t, err)
+
+	cfg := Config{
+		Timeout:      5 * time.Second,
+		URLValidator: func(string) error { return nil },
+		Proxy:        httpx.ProxyConfig{URL: proxyURL},
+	}
+	p := NewGRPCProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{{APIType: "grpc"}}
+	endpoints[0].URL = "http://" + hostname + "/grpc.health.v1.Health/Check"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := p.Probe(ctx, endpoints)
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+
+	schema := result[0].GRPCSchema
+	require.NotNil(t, schema, "reflection must succeed when dialed through the proxy for a hostname target")
+	assert.True(t, schema.ReflectionEnabled)
+
+	got := recordedTarget()
+	assert.Equal(t, hostname, got, "proxy must receive the ORIGINAL HOSTNAME in the CONNECT target, not a pre-resolved IP")
+	assert.NotContains(t, got, "127.0.0.1", "CONNECT target must not have been pre-resolved to an IPv4 literal by gRPC's dns resolver")
+	assert.NotContains(t, got, "::1", "CONNECT target must not have been pre-resolved to an IPv6 literal by gRPC's dns resolver")
+}
+
+// TestGRPCProbe_ProxyInsecureTLSGating is the AC-2/SEC-BE-004 proof for gRPC:
+// target-certificate verification is governed SOLELY by
+// GRPCInsecureSkipVerify. Proxy.Insecure no longer relaxes it — even through
+// an http/https (MITM) proxy — because Proxy.Insecure's job is limited to the
+// intercepting proxy's OWN substituted CA (BuildHTTPClient's TLS posture
+// toward the proxy), not the gRPC target's certificate. socks5 is unaffected
+// either way: it is a transparent tunnel, so verification of the target was
+// never influenced by Proxy.Insecure for it.
+func TestGRPCProbe_ProxyInsecureTLSGating(t *testing.T) {
+	addr, stop := startTestGRPCServerTLS(t)
+	defer stop()
+
+	t.Run("http_proxy_insecure_alone_does_not_skip_verify", func(t *testing.T) {
+		// TEST-005/TEST-006: capture the process-default slog logger to assert the
+		// REQ-001 warning fires. Mutates global slog state — must NOT be parallel.
+		var warnBuf bytes.Buffer
+		origLogger := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&warnBuf, nil)))
+		t.Cleanup(func() { slog.SetDefault(origLogger) })
+
+		proxyAddr, _, stopProxy := startRecordingCONNECTProxy(t, addr)
+		defer stopProxy()
+
+		proxyURL, err := url.Parse("http://" + proxyAddr)
+		require.NoError(t, err)
+
+		cfg := Config{
+			Timeout:                5 * time.Second,
+			URLValidator:           func(string) error { return nil },
+			Proxy:                  httpx.ProxyConfig{URL: proxyURL, Insecure: true},
+			GRPCInsecureSkipVerify: false,
+		}
+		p := NewGRPCProbe(cfg)
+
+		endpoints := []classify.ClassifiedRequest{{APIType: "grpc"}}
+		endpoints[0].URL = "https://" + addr + "/grpc.health.v1.Health/Check"
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		result, err := p.Probe(ctx, endpoints)
+		require.NoError(t, err)
+		require.Len(t, result, 1)
+		assert.Nil(t, result[0].GRPCSchema,
+			"http/https proxy Insecure=true must NOT skip target verification on its own (SEC-BE-004 decouple); the self-signed cert must fail verification")
+		assert.Contains(t, warnBuf.String(), "--grpc-insecure-skip-verify",
+			"probeTarget must emit the REQ-001 warning pointing at --grpc-insecure-skip-verify")
+	})
+
+	t.Run("grpc_insecure_skip_verify_skips_regardless_of_proxy", func(t *testing.T) {
+		proxyAddr, _, stopProxy := startRecordingCONNECTProxy(t, addr)
+		defer stopProxy()
+
+		proxyURL, err := url.Parse("http://" + proxyAddr)
+		require.NoError(t, err)
+
+		cfg := Config{
+			Timeout:                5 * time.Second,
+			URLValidator:           func(string) error { return nil },
+			Proxy:                  httpx.ProxyConfig{URL: proxyURL, Insecure: false},
+			GRPCInsecureSkipVerify: true,
+		}
+		p := NewGRPCProbe(cfg)
+
+		endpoints := []classify.ClassifiedRequest{{APIType: "grpc"}}
+		endpoints[0].URL = "https://" + addr + "/grpc.health.v1.Health/Check"
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		result, err := p.Probe(ctx, endpoints)
+		require.NoError(t, err)
+		require.Len(t, result, 1)
+		require.NotNil(t, result[0].GRPCSchema, "GRPCInsecureSkipVerify=true must skip verification of the self-signed cert regardless of Proxy.Insecure")
+		assert.True(t, result[0].GRPCSchema.ReflectionEnabled)
+	})
+
+	t.Run("socks5_proxy_insecure_does_not_skip_verify", func(t *testing.T) {
+		socksAddr, hits, stopProxy := startRecordingSOCKS5Proxy(t)
+		defer stopProxy()
+
+		proxyURL, err := url.Parse("socks5://" + socksAddr)
+		require.NoError(t, err)
+
+		cfg := Config{
+			Timeout:      5 * time.Second,
+			URLValidator: func(string) error { return nil },
+			Proxy:        httpx.ProxyConfig{URL: proxyURL, Insecure: true},
+		}
+		p := NewGRPCProbe(cfg)
+
+		endpoints := []classify.ClassifiedRequest{{APIType: "grpc"}}
+		endpoints[0].URL = "https://" + addr + "/grpc.health.v1.Health/Check"
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		result, err := p.Probe(ctx, endpoints)
+		require.NoError(t, err)
+		require.Len(t, result, 1)
+		assert.Nil(t, result[0].GRPCSchema,
+			"socks5 must keep TLS verification even with Proxy.Insecure=true; the self-signed cert must fail verification")
+		// TEST-005: without this, the nil-schema assertion above would also pass
+		// if the socks5 tunnel were never traversed at all (e.g. dialing the
+		// target directly and failing for an unrelated reason). Asserting the
+		// proxy actually accepted a connection proves the nil result comes from
+		// TLS verification correctly rejecting the self-signed cert THROUGH the
+		// tunnel, not from bypassing the proxy entirely.
+		assert.NotZero(t, hits.Load(), "socks5 proxy must have been traversed (connection accepted) for this assertion to be meaningful")
+	})
+}
+
+// TestGRPCProbe_NoProxyUnchanged is a regression guard: with a zero-value
+// Proxy, the existing cfg.Dialer path (used by tests targeting loopback) must
+// continue to work exactly as before the LAB-4993 proxy field was added.
+func TestGRPCProbe_NoProxyUnchanged(t *testing.T) {
+	addr, stop := startTestGRPCServer(t)
+	defer stop()
+
+	cfg := Config{
+		Timeout:      5 * time.Second,
+		URLValidator: func(string) error { return nil },
+		Dialer:       loopbackDialer,
+	}
+	p := NewGRPCProbe(cfg)
+
+	endpoints := []classify.ClassifiedRequest{{APIType: "grpc"}}
+	endpoints[0].URL = "http://" + addr + "/grpc.health.v1.Health/Check"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := p.Probe(ctx, endpoints)
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	require.NotNil(t, result[0].GRPCSchema, "no-proxy path must be unaffected by the Proxy field's addition")
+	assert.True(t, result[0].GRPCSchema.ReflectionEnabled)
 }

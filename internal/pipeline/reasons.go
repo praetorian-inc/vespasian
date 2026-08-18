@@ -23,6 +23,7 @@ import (
 	"unicode"
 
 	"github.com/praetorian-inc/vespasian/pkg/classify"
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
 // sanitizeForTerminal replaces non-printable runes with an escaped \xNN form so
@@ -66,8 +67,30 @@ func logClassificationReasons(w io.Writer, classified []classify.ClassifiedReque
 	lines := make([]string, 0, len(classified))
 	for _, c := range classified {
 		path := c.URL
-		if u, err := url.Parse(c.URL); err == nil && u.Path != "" {
-			path = u.Path
+		if u, err := url.Parse(c.URL); err == nil {
+			switch {
+			case u.Path != "":
+				path = u.Path
+			case u.Host != "":
+				// Pathless (or query-only): print the origin, not the raw URL.
+				// u.Host excludes userinfo (u.User holds it separately).
+				path = u.Scheme + "://" + u.Host
+			default:
+				// Parsed, but neither Path nor Host survived (opaque forms), so
+				// `path` still holds the raw c.URL, which may embed userinfo.
+				// crawl.RedactURL fails CLOSED: it emits a placeholder whenever
+				// it cannot prove the result is credential-free, including the
+				// opaque case where url.Parse leaves credentials in u.Opaque and
+				// u.User is nil.
+				path = crawl.RedactURL(path)
+			}
+		} else {
+			// url.Parse failed, so the switch never ran and `path` still holds
+			// the raw c.URL. Reachable with credentials: GRPCClassifier fails
+			// open on a malformed URL (pkg/classify/grpc.go) and still
+			// classifies on content-type alone. crawl.RedactURL fails closed on
+			// a parse error carrying "@".
+			path = crawl.RedactURL(path)
 		}
 		reason := c.Reason
 		if reason == "" {

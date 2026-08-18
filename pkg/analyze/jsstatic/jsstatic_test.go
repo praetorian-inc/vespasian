@@ -524,6 +524,265 @@ func TestExtractFromBundle_HonorsMaxEndpoints(t *testing.T) {
 	}
 }
 
+// TestAnalyze_MaxEndpointsPerBundle_PreservesConcatEndpoint is a regression for
+// QUAL-001 (LAB-4992): ExtractFromBundle appends concat/service-prefix
+// reconstructions AFTER all AST-recovered endpoints, and the truncation in
+// analyzeOne kept only the slice PREFIX (`bundleEps[:opts.MaxEndpointsPerBundle]`).
+// A bundle whose AST-recovered endpoint count alone reaches the cap therefore
+// silently dropped every concat candidate — directly undermining LAB-4992's
+// acceptance criterion that offline generate must surface concat endpoints.
+// Here 10 AST-literal fetch() calls exceed a cap of 5, plus one genuine
+// service-prefix concat reconstruction; the concat endpoint must still survive.
+func TestAnalyze_MaxEndpointsPerBundle_PreservesConcatEndpoint(t *testing.T) {
+	var sb strings.Builder
+	for i := 0; i < 10; i++ {
+		fmt.Fprintf(&sb, "fetch(\"/api/r%d\");\n", i)
+	}
+	// Literal+literal service-prefix form, recovered only by extractConcatEndpoints
+	// (crawl.ExtractStaticConcatPaths), never by jsluice's AST walkers.
+	sb.WriteString(`var svc = "identity/" + "api/auth/login";` + "\n")
+	cap := makeJSCapture("https://example.com/app.js", sb.String())
+
+	res, err := Analyze(context.Background(), []crawl.ObservedRequest{cap}, Options{
+		MaxEndpointsPerBundle: 5,
+	})
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	var sawConcat bool
+	for _, r := range res.Requests {
+		if r.Source == SourceJSConcat {
+			sawConcat = true
+			break
+		}
+	}
+	if !sawConcat {
+		t.Errorf("expected a %s endpoint to survive truncation when AST endpoints alone exceed MaxEndpointsPerBundle (5); got requests: %v", SourceJSConcat, res.Requests)
+	}
+}
+
+// TestAnalyze_MaxEndpointsPerBundle_PreservesConcatEndpointFromSourcemap is a
+// regression for QUAL-011 (LAB-4992). The bundle-body truncation was routed
+// through capBundleEndpoints so AST endpoints could not starve concat
+// candidates, but the sourcemap-source path in the same function still took a
+// bare prefix slice (`smEps = smEps[:remaining]`). ExtractFromBundle runs the
+// identical step-5 concat extraction on every sourcemap source and appends
+// those reconstructions AFTER all AST-recovered endpoints, so any sourcemap
+// source whose AST endpoints alone consume the remaining budget silently
+// dropped every concat candidate it contained.
+//
+// Here the bundle body carries no API endpoints of its own (only the
+// sourceMappingURL comment), so the full budget of 5 is available to the
+// sourcemap source. That source supplies 10 AST-literal fetch() calls — twice
+// the budget — plus one literal service-prefix concat form recoverable only by
+// crawl.ExtractStaticConcatPaths. Pre-fix the prefix slice kept the first 5 AST
+// endpoints and the concat candidate was lost; capBundleEndpoints reserves a
+// floor for it instead.
+func TestAnalyze_MaxEndpointsPerBundle_PreservesConcatEndpointFromSourcemap(t *testing.T) {
+	var smContent strings.Builder
+	for i := 0; i < 10; i++ {
+		fmt.Fprintf(&smContent, "fetch(\"/api/sm%d\");\n", i)
+	}
+	// Literal+literal service-prefix form: recovered only by
+	// extractConcatEndpoints, never by jsluice's AST walkers.
+	smContent.WriteString(`var svc = "identity/" + "api/auth/login";` + "\n")
+
+	smDoc := fmt.Sprintf(`{"sources":["src/x.js"],"sourcesContent":[%s]}`,
+		func() string { b, _ := json.Marshal(smContent.String()); return string(b) }())
+	encoded := base64.StdEncoding.EncodeToString([]byte(smDoc))
+	// Bundle body deliberately contains no API endpoints, so the whole
+	// per-bundle budget is left to the sourcemap source.
+	bundleBody := "//# sourceMappingURL=data:application/json;base64," + encoded + "\n"
+
+	bundle := makeJSCapture("https://h/app.js", bundleBody)
+	res, err := Analyze(context.Background(), []crawl.ObservedRequest{bundle}, Options{
+		MaxEndpointsPerBundle: 5,
+	})
+	if err != nil {
+		t.Fatalf("Analyze error: %v", err)
+	}
+
+	// TEST-002: assert the concrete reconstructed URL, not just the presence of
+	// the tag — a regression that corrupted the path while keeping the tag would
+	// otherwise pass.
+	var concatURLs []string
+	for _, r := range res.Requests {
+		if r.Source == SourceJSConcat {
+			concatURLs = append(concatURLs, r.URL)
+		}
+	}
+	if len(concatURLs) != 1 || concatURLs[0] != "https://h/identity/api/auth/login" {
+		t.Errorf("want exactly one %s request at https://h/identity/api/auth/login (the sourcemap-derived reconstruction surviving truncation when its AST endpoints alone exceed the remaining budget of 5); got %v (all requests: %v)",
+			SourceJSConcat, concatURLs, res.Requests)
+	}
+	// TEST-002: pin the budget exactly rather than one-sidedly. The concat floor
+	// reserves budget without expanding it, so the cap must be fully utilized —
+	// under-filling this same budget was the historical bug capBundleEndpoints
+	// was introduced to fix, and this test is the only coverage of the sourcemap
+	// arm of that accounting.
+	if res.Stats.EndpointsKept != 5 {
+		t.Errorf("EndpointsKept = %d, want exactly 5 (MaxEndpointsPerBundle must be fully utilized, not exceeded and not under-filled)", res.Stats.EndpointsKept)
+	}
+}
+
+// TestCapBundleEndpoints_ConcatAbundantFullyUtilizesBudget is a regression for
+// QUAL-002 (LAB-4992): capBundleEndpoints previously reserved a hard `max/2`
+// slice for concat candidates and gave AST the remainder, so whenever AST did
+// not need its entire share the leftover budget went unused instead of being
+// reclaimed by concat — under-filling the total cap below min(len(ast)+
+// len(concat), budget). This is the concat-ABUNDANT counterpart to
+// TestAnalyze_MaxEndpointsPerBundle_PreservesConcatEndpoint above, which only
+// covers the concat-scarce direction. Here AST supplies a few endpoints (but
+// fewer than half the budget) while concat reconstructions are abundant
+// (well over half the budget), so the old hard split under-fills while the
+// new floor-then-reclaim split does not.
+func TestCapBundleEndpoints_ConcatAbundantFullyUtilizesBudget(t *testing.T) {
+	const budget = 10
+
+	var eps []ExtractedEndpoint
+	for i := 0; i < 4; i++ {
+		eps = append(eps, ExtractedEndpoint{URL: fmt.Sprintf("/api/ast%d", i)})
+	}
+	for i := 0; i < 15; i++ {
+		eps = append(eps, ExtractedEndpoint{URL: fmt.Sprintf("/api/concat%d", i), SourceTag: SourceJSConcat})
+	}
+
+	got := capBundleEndpoints(eps, budget)
+
+	if len(got) != budget {
+		t.Fatalf("capBundleEndpoints kept %d endpoints, want %d (budget must be fully utilized, not under-filled)", len(got), budget)
+	}
+
+	var concatKept int
+	for _, ep := range got {
+		if ep.SourceTag == SourceJSConcat {
+			concatKept++
+		}
+	}
+	if want := budget / 2; concatKept < want {
+		t.Errorf("concat endpoints kept = %d, want >= %d (concat floor must be honored)", concatKept, want)
+	}
+}
+
+// TestCapBundleEndpoints_ASTRetainedWhenConcatAbundant pins the direction the
+// other capBundleEndpoints tests never covered (QUAL-003, LAB-4992): they both
+// reason about AST starving concat, never about concat taxing AST.
+//
+// The previous implementation reserved min(len(concat), budget/2)
+// UNCONDITIONALLY, so whenever MaxEndpointsPerBundle actually bound, abundant
+// concat evicted high-fidelity AST literals in favor of unprobed
+// sentinel-substituted guesses 1:1 — at the production budget this case kept
+// only 250 of 600 AST endpoints, where a plain prefix truncation kept 500.
+// Reaching enough concat candidates to trigger it is easy: ExtractStaticConcatPaths
+// composes two producers each capped at maxConcatPathsPerBundle (256).
+//
+// The contract asserted here: AST keeps everything except the small concat
+// reserve, concat still gets its guaranteed toehold, and the budget stays fully
+// utilized.
+func TestCapBundleEndpoints_ASTRetainedWhenConcatAbundant(t *testing.T) {
+	const budget = 500
+
+	var eps []ExtractedEndpoint
+	for i := 0; i < 600; i++ {
+		eps = append(eps, ExtractedEndpoint{URL: fmt.Sprintf("/api/ast%d", i)})
+	}
+	for i := 0; i < 300; i++ {
+		eps = append(eps, ExtractedEndpoint{URL: fmt.Sprintf("/api/concat%d", i), SourceTag: SourceJSConcat})
+	}
+
+	got := capBundleEndpoints(eps, budget)
+
+	if len(got) != budget {
+		t.Fatalf("capBundleEndpoints kept %d endpoints, want %d (budget must be fully utilized)", len(got), budget)
+	}
+
+	var astKept, concatKept int
+	for _, ep := range got {
+		if ep.SourceTag == SourceJSConcat {
+			concatKept++
+		} else {
+			astKept++
+		}
+	}
+
+	// AST surrenders only the small reserve, not half the budget.
+	if want := budget - concatMinReserve; astKept != want {
+		t.Errorf("AST endpoints kept = %d, want %d (concat must not displace AST beyond its small reserve; the old budget/2 reservation kept only %d)",
+			astKept, want, budget/2)
+	}
+	if concatKept != concatMinReserve {
+		t.Errorf("concat endpoints kept = %d, want %d (concat keeps its guaranteed reserve)", concatKept, concatMinReserve)
+	}
+}
+
+// TestCapBundleEndpoints_SmallBudgetDoesNotStarveAST guards the clamp that keeps
+// the concat reserve from exceeding the budget (QUAL-003). Without the budget/2
+// clamp, a budget below concatMinReserve would make astBudget negative and zero
+// out AST entirely.
+//
+// TEST-003: this asserts the EXACT split, not merely that AST is non-empty. The
+// earlier `astKept != 0` form was the loosest of the three budget tests while
+// guarding the tightest branch — loosening the clamp to `budget-1` (which leaves
+// AST just 1 slot of 20 at budget=10) kept the whole package green.
+func TestCapBundleEndpoints_SmallBudgetDoesNotStarveAST(t *testing.T) {
+	const nAST, nConcat = 20, 20
+
+	// Expected split per budget, derived from capBundleEndpoints' contract:
+	//   reserve = min(len(concat), concatMinReserve, budget/2)
+	//   astKept = min(len(ast), budget-reserve); concatKept = budget - astKept
+	// Written out literally rather than recomputed from the formula so the test
+	// would fail if the formula itself were changed (a test that recomputes the
+	// implementation's arithmetic cannot detect a change to it).
+	cases := []struct {
+		budget            int
+		wantAST, wantCcat int
+	}{
+		{budget: 0, wantAST: 0, wantCcat: 0},    // nothing kept
+		{budget: 1, wantAST: 1, wantCcat: 0},    // budget/2 == 0 -> no reserve
+		{budget: 2, wantAST: 1, wantCcat: 1},    // reserve 1
+		{budget: 4, wantAST: 2, wantCcat: 2},    // reserve 2
+		{budget: 10, wantAST: 5, wantCcat: 5},   // reserve 5 (budget/2 binds)
+		{budget: 16, wantAST: 8, wantCcat: 8},   // reserve 8 (budget/2 still binds)
+		{budget: 40, wantAST: 20, wantCcat: 20}, // both fit entirely
+	}
+
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("budget=%d", tc.budget), func(t *testing.T) {
+			var eps []ExtractedEndpoint
+			for i := 0; i < nAST; i++ {
+				eps = append(eps, ExtractedEndpoint{URL: fmt.Sprintf("/api/ast%d", i)})
+			}
+			for i := 0; i < nConcat; i++ {
+				eps = append(eps, ExtractedEndpoint{URL: fmt.Sprintf("/api/concat%d", i), SourceTag: SourceJSConcat})
+			}
+
+			got := capBundleEndpoints(eps, tc.budget)
+
+			var astKept, concatKept int
+			for _, ep := range got {
+				if ep.SourceTag == SourceJSConcat {
+					concatKept++
+				} else {
+					astKept++
+				}
+			}
+
+			if astKept != tc.wantAST || concatKept != tc.wantCcat {
+				t.Errorf("budget=%d: kept ast=%d concat=%d, want ast=%d concat=%d",
+					tc.budget, astKept, concatKept, tc.wantAST, tc.wantCcat)
+			}
+			if want := tc.wantAST + tc.wantCcat; len(got) != want {
+				t.Errorf("budget=%d: kept %d total, want %d (budget must be fully utilized)", tc.budget, len(got), want)
+			}
+			// The clamp's purpose: AST is never zeroed out while AST endpoints
+			// exist and the budget is non-zero.
+			if tc.budget > 0 && astKept == 0 {
+				t.Errorf("AST endpoints kept = 0 at budget=%d; the concat reserve must never starve AST", tc.budget)
+			}
+		})
+	}
+}
+
 // TestExtractFromBundle_MinifiedBundleSmoke confirms that extraction works on a
 // single-line minified-style bundle with multiple fetches concatenated together.
 func TestExtractFromBundle_MinifiedBundleSmoke(t *testing.T) {
@@ -793,5 +1052,189 @@ func TestAnalyze_SinglePassOversizedCount(t *testing.T) {
 	// All 3 original entries must be present in output.
 	if len(res.Requests) < 3 {
 		t.Errorf("expected at least 3 requests, got %d", len(res.Requests))
+	}
+}
+
+// LAB-4992 end-to-end: a fully-offline capture whose API endpoints exist ONLY
+// as JS-bundle concatenations must surface those endpoints as synthesized
+// candidate requests. Analyze performs no network I/O for concat reconstruction
+// (it operates on the captured bundle body), so this proves the offline
+// "capture once, generate many" path recovers concat SPA endpoints.
+func TestAnalyze_OfflineConcatReconstruction(t *testing.T) {
+	appJS := `
+function loadOrders(uid)  { return fetch("/api/users/".concat(uid, "/orders")); }
+function loadReviews(pid) { var u = "/api/products/" + pid + "/reviews"; return fetch(u); }
+`
+	captured := []crawl.ObservedRequest{makeJSCapture("https://shop.example.com/app.js", appJS)}
+
+	res, err := Analyze(context.Background(), captured, Options{})
+	if err != nil {
+		t.Fatalf("Analyze error: %v", err)
+	}
+
+	// Collect synthesized concat-reconstruction request URLs. Concat
+	// reconstructions carry the distinct SourceJSConcat tag (LAB-4992 /
+	// SEC-BE-001), not the plain SourceJS used for AST-recovered literals.
+	got := map[string]bool{}
+	for _, req := range res.Requests {
+		if req.Source == SourceJSConcat {
+			got[req.URL] = true
+		}
+	}
+	for _, want := range []string{
+		"https://shop.example.com/api/users/0/orders",
+		"https://shop.example.com/api/products/0/reviews",
+	} {
+		if !got[want] {
+			t.Errorf("expected offline-reconstructed candidate %q; got %v", want, got)
+		}
+	}
+}
+
+// LAB-4992 / SEC-BE-001: a concat reconstruction recovered from a SOURCEMAP
+// source must keep the distinct SourceJSConcat tag — the sourcemap override loop
+// (analyzeOne) must preserve it rather than force SourceSourcemap. Pins the
+// sourcemap branch of the tag-preservation guard (the bundle-body branch is
+// pinned by TestAnalyze_OfflineConcatReconstruction).
+func TestAnalyze_SourcemapConcatKeepsConcatSource(t *testing.T) {
+	srcContent := `var u = "/api/sm-users/" + id + "/orders"; fetch(u);`
+	smDoc := fmt.Sprintf(`{"sources":["src/index.js"],"sourcesContent":[%s]}`,
+		func() string { b, _ := json.Marshal(srcContent); return string(b) }())
+	encoded := base64.StdEncoding.EncodeToString([]byte(smDoc))
+	dataURI := "data:application/json;base64," + encoded
+	// Bundle body itself has no concat — the concat lives only in the sourcemap
+	// source, so a hit proves the sourcemap path produced it.
+	bundleBody := `fetch("/api/from-bundle")` + "\n//# sourceMappingURL=" + dataURI + "\n"
+
+	captured := []crawl.ObservedRequest{makeJSCapture("https://h/app.js", bundleBody)}
+	res, err := Analyze(context.Background(), captured, Options{})
+	if err != nil {
+		t.Fatalf("Analyze error: %v", err)
+	}
+	var src string
+	for _, req := range res.Requests {
+		if req.URL == "https://h/api/sm-users/0/orders" {
+			src = req.Source
+		}
+	}
+	if src == "" {
+		t.Fatalf("sourcemap concat candidate https://h/api/sm-users/0/orders not recovered; got %v", res.Requests)
+	}
+	if src != SourceJSConcat {
+		t.Errorf("sourcemap concat candidate Source = %q, want %q (must not be forced to SourceSourcemap)", src, SourceJSConcat)
+	}
+}
+
+// TestAnalyze_EndpointsKeptReflectsSynthesisDrops pins Stats.EndpointsKept against
+// the POST-synthesis request count (TEST-003).
+//
+// toRequests now drops endpoints whose resolved URL fails specSafeURL, so the
+// synthesized slice can be shorter than the extracted one. EndpointsKept is
+// documented as "endpoints that survived the cap and synthesis and made it into
+// Requests" and is also used as the sourcemap budget
+// (remaining := MaxEndpointsPerBundle - EndpointsKept), so inflating it would
+// silently starve sourcemap extraction. Mutation-tested: changing the accumulator
+// to `+= len(bundleEps)` previously survived the entire suite.
+func TestAnalyze_EndpointsKeptReflectsSynthesisDrops(t *testing.T) {
+	// Three API endpoints, two of which the gate must reject: one carrying
+	// credentials, one carrying a raw bidi override.
+	js := `fetch("/api/keep/one");` +
+		// u:p is synthetic; example.com is an RFC 2606 reserved domain. This
+		// fixture asserts the credential gate REJECTS it.
+		`fetch("https://u:p@example.com/api/drop/credential");` +
+		"fetch(\"/api/drop/\u202ebidi\");"
+
+	res, err := Analyze(context.Background(), []crawl.ObservedRequest{
+		makeJSCapture("https://example.com/app.js", js),
+	}, Options{})
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+
+	var kept int
+	for _, r := range res.Requests {
+		if crawl.IsJSStaticSource(r.Source) {
+			kept++
+		}
+	}
+
+	if res.Stats.EndpointsKept != kept {
+		t.Errorf("Stats.EndpointsKept = %d, but %d JS-static requests were actually synthesized; "+
+			"EndpointsKept must count post-synthesis survivors, not extracted endpoints",
+			res.Stats.EndpointsKept, kept)
+	}
+	// Non-vacuous: the gate must actually have dropped something, otherwise this
+	// test would pass trivially even with the inflated accumulator.
+	if res.Stats.EndpointsFound <= res.Stats.EndpointsKept {
+		t.Errorf("expected the gate to drop at least one endpoint (Found=%d Kept=%d); "+
+			"without a drop this test cannot detect the desync",
+			res.Stats.EndpointsFound, res.Stats.EndpointsKept)
+	}
+}
+
+// TestAnalyze_EndpointsKeptReflectsSourcemapSynthesisDrops is the sourcemap-arm
+// counterpart to TestAnalyze_EndpointsKeptReflectsSynthesisDrops (TEST-002).
+// EndpointsKept is accumulated separately for the bundle body (analyzeOne,
+// after the first toRequests call) and for each recovered sourcemap source
+// (after the second toRequests call inside the sourcemap loop); the sourcemap
+// arm also feeds `remaining := MaxEndpointsPerBundle - EndpointsKept`, so an
+// inflated count there silently starves later sourcemap sources of budget.
+//
+// The bundle body here carries zero API endpoints (only the sourceMappingURL
+// comment), so the bundle-body accumulation contributes nothing and cannot
+// mask a miscount in the sourcemap arm — isolating this test to the second
+// accumulation site. Mutation-tested: changing `EndpointsKept += len(smSynth)`
+// to `+= len(smEps)` (counting pre-synthesis endpoints instead of post-drop
+// survivors) leaves every other test in the package green.
+func TestAnalyze_EndpointsKeptReflectsSourcemapSynthesisDrops(t *testing.T) {
+	// One clean endpoint the gate must keep, one carrying credentials the gate
+	// must drop — both live ONLY in the sourcemap source.
+	// u:p is synthetic; example.com is an RFC 2606 reserved domain. This
+	// fixture asserts the credential gate REJECTS it.
+	srcContent := `fetch("/api/sm/keep");` + `fetch("https://u:p@example.com/api/sm/drop");`
+	smDoc := fmt.Sprintf(`{"sources":["src/index.js"],"sourcesContent":[%s]}`,
+		func() string { b, _ := json.Marshal(srcContent); return string(b) }())
+	encoded := base64.StdEncoding.EncodeToString([]byte(smDoc))
+	// Bundle body deliberately has no fetch/axios calls at all, so the
+	// bundle-body arm's EndpointsFound/EndpointsKept contribution is zero.
+	bundleBody := "//# sourceMappingURL=data:application/json;base64," + encoded + "\n"
+
+	res, err := Analyze(context.Background(), []crawl.ObservedRequest{
+		makeJSCapture("https://example.com/app.js", bundleBody),
+	}, Options{})
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+
+	var kept int
+	var sawKeep bool
+	for _, r := range res.Requests {
+		if !crawl.IsJSStaticSource(r.Source) {
+			continue
+		}
+		kept++
+		if strings.Contains(r.URL, "@") {
+			t.Errorf("synthesized request carries embedded credentials: %q (source %q)", r.URL, r.Source)
+		}
+		if strings.HasSuffix(r.URL, "/api/sm/keep") {
+			sawKeep = true
+		}
+	}
+
+	if res.Stats.EndpointsKept != kept {
+		t.Errorf("Stats.EndpointsKept = %d, but %d JS-static requests were actually synthesized; "+
+			"the sourcemap arm must count post-synthesis survivors, not pre-synthesis extracted endpoints",
+			res.Stats.EndpointsKept, kept)
+	}
+	// Non-vacuous: the gate must actually have dropped the credentialed
+	// endpoint, and kept the clean one, otherwise a blanket accept OR a
+	// blanket reject would both leave EndpointsKept trivially consistent.
+	if !sawKeep {
+		t.Fatalf("positive control /api/sm/keep was dropped — the gate is over-blocking, got %v", res.Requests)
+	}
+	if res.Stats.EndpointsFound <= res.Stats.EndpointsKept {
+		t.Errorf("expected the sourcemap-arm gate to drop at least one endpoint (Found=%d Kept=%d); "+
+			"without a drop this test cannot detect the desync",
+			res.Stats.EndpointsFound, res.Stats.EndpointsKept)
 	}
 }

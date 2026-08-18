@@ -694,6 +694,16 @@ func handleIndex(w http.ResponseWriter, _ *http.Request) {
   <li>POST /api/login - URL-encoded form login</li>
   <li>POST /api/upload - Multipart file upload</li>
 </ul>
+<!-- LAB-3890 T2: a real static HTML <form> whose action (/api/subscribe) is
+     NOT linked or fetched anywhere else. The scan command's analyze.ExtractForms
+     augmentation synthesizes a POST request from this markup, so /api/subscribe
+     appearing in the generated spec proves ExtractForms ran in the full pipeline. -->
+<h2>Subscribe (static HTML form — exercises scan's ExtractForms augmentation)</h2>
+<form method="post" action="/api/subscribe">
+  <input type="email" name="email" placeholder="you@example.com" required>
+  <input type="text" name="name" placeholder="Your name">
+  <button type="submit">Subscribe</button>
+</form>
 <!-- TEST-ONLY: inline script intentionally fires fetch() to exercise vespasian's form-body parser during E2E crawls. Acceptable here because this server is a local test fixture only — never deployed and not subject to CSP. Do NOT copy this pattern to production. -->
 <script>
   // Fire urlencoded POST to /api/login on page load (for form data E2E testing)

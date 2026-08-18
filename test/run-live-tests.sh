@@ -62,10 +62,13 @@ OFFLINE_TARGETS=(
     crawl-unreachable
     classifier-edge
     spec-edge
+    ssrf-rejection
+    auth-capture
 )
 
 LIVE_TARGETS=(
     rest-api
+    scan-rest
     soap-service
     graphql-server
     concat-spa
@@ -117,6 +120,8 @@ resolve_targets() {
 source "${SCRIPT_DIR}/common.sh"
 # shellcheck source=validate.sh
 source "${SCRIPT_DIR}/validate.sh"
+# shellcheck source=form-spec-asserts.sh
+source "${SCRIPT_DIR}/form-spec-asserts.sh"
 
 # ──────────────────────────────────────────────────────────────
 # Config loading
@@ -179,7 +184,7 @@ preflight_test_host() {
     local targets=$1
     local failed=0
     case ",${targets}," in
-        *,rest-api,*|*,edge-cases,*|*,crawl-depth,*|*,no-download,*)
+        *,rest-api,*|*,scan-rest,*|*,edge-cases,*|*,crawl-depth,*|*,no-download,*)
             _probe_target_host "${REST_API_PORT:-}" "/api/health" "rest-api" || failed=1
             ;;
     esac
@@ -396,14 +401,74 @@ test_rest_api() {
         failures=$((failures + 1))
     fi
 
-    # NOTE: No exact spec comparison here — the live crawl is non-deterministic,
-    # so the generated spec varies between runs. Exact spec comparison is done in
-    # test_generate_rest which uses a fixed import as input.
+    # Literal proof of the ExtractForms claim in expected-paths.json.
+    # validate_path_coverage's paths_match treats a braced segment as a wildcard
+    # on either side, so expected "/api/subscribe" is satisfied by any two-segment
+    # templated path such as "/api/{slug}" — which merge-slugs is designed to
+    # produce. scan-rest already has this literal check; without it here the
+    # fixture's capability claim rests on a wildcard-tolerant matcher
+    # (PR #187 review finding TEST-001).
+    if grep -q "/api/subscribe" "$spec_file"; then
+        log_ok "rest-api: /api/subscribe present (generate's ExtractForms augmentation ran)"
+    else
+        log_fail "rest-api: /api/subscribe absent — generate's ExtractForms augmentation did not run"
+        failures=$((failures + 1))
+    fi
+
+    # ExtractForms did more than surface the path: assert /api/subscribe carries
+    # a POST operation and NO GET (assert_post_get_operations walks the spec per
+    # exact path key), and that the form's urlencoded body fields (email, name)
+    # surface as request-body schema properties UNDER THAT ENDPOINT
+    # (assert_form_body_fields). Without these, the fixture's POST-method + body
+    # -field expectations for /api/subscribe were inert (PR #187 review finding
+    # TEST-006). These are the same helpers forms-target uses; $expected already
+    # points at rest-api/expected-paths.json, which now carries post_form_paths
+    # and post_form_body_fields_by_path for /api/subscribe.
+    #
+    # GET-absence rationale here differs from forms-target: rest-api/main.go
+    # registers no /api/subscribe handler, so the catch-all mux serves the
+    # crawler's GET probe as 200 text/html (the index page), NOT a 404. The GET
+    # stays out of the spec via non-API/HTML content-type classification, not via
+    # a 404/confidence filter (PR #208 review finding TEST-002).
+    if ! assert_post_get_operations "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+    if ! assert_form_body_fields "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+
+    # TEST-001 (PR #208): lock the per-path method sets this fixture declares.
+    # expected-paths.json intentionally lists /api/login and /api/upload as
+    # GET-only here (two-stage crawl + generate --probe=false: no JS runs, the
+    # inline fetch POST literals are recovered statically as GET candidates); a
+    # regression that emitted POST for either would silently diverge the fixture
+    # from reality. Also locks every resource path GET-only and /api/subscribe
+    # POST-only. Compared over the {get,post} universe the fixtures track.
+    if ! assert_path_methods "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+
+    # NOTE: No exact spec *text* comparison here — the live crawl is
+    # non-deterministic, so the generated spec's serialization (parameter
+    # naming, ordering) varies between runs. Exact spec-text comparison is done
+    # in test_generate_rest, which uses a fixed import as input. The path COUNT
+    # is deterministic (same recovered set as scan-rest) and IS asserted below
+    # (TEST-004).
 
     local endpoint_count
     endpoint_count=$(count_spec_endpoints "$spec_file")
     local expected_count
     expected_count=$(json_field "$expected" total_paths)
+
+    # Exact-count: validate_path_coverage only detects MISSING paths, and the
+    # two-stage crawl+generate path recovers the same set as the single-stage
+    # scan (see the fixtures' lockstep note), so — exactly as test_scan_rest
+    # already does against the same server — a regression that emitted the
+    # expected paths plus spurious ones must not report PASS with a mismatched
+    # pair of numbers in the summary (PR #187 review finding TEST-004).
+    if ! assert_exact_path_count "rest-api" "$endpoint_count" "$expected_count"; then
+        failures=$((failures + 1))
+    fi
 
     local duration=$((SECONDS - start))
     if [ $failures -eq 0 ]; then
@@ -412,6 +477,121 @@ test_rest_api() {
     else
         set_test_result "rest-api" "FAIL" "$endpoint_count" "$expected_count" "$duration"
         log_fail "rest-api: ${failures} check(s) failed (${duration}s)"
+    fi
+}
+
+# test_scan_rest drives the single-stage `scan` command (crawl + augment +
+# classify + generate in ONE invocation) against the rest-api target. It is the
+# only live target that drives the single-stage scan command end to end; the
+# two-stage rest-api target covers the same ExtractForms augmentation via
+# generate (LAB-3890 T2, gap A1). The rest-api index serves a static HTML
+# <form action="/api/subscribe"> that is never linked or fetched, so
+# /api/subscribe appearing in the generated spec proves ExtractForms
+# synthesized it inside the scan pipeline. Uses the same rest-api server as
+# test_rest_api (which drives the two-stage crawl+generate flow), so the two
+# tests can be compared directly.
+test_scan_rest() {
+    local port="${REST_API_PORT:-8990}"
+    local base_url="http://${TEST_HOST}:${port}"
+    local target_dir="${RESULTS_DIR}/scan-rest"
+    local spec_file="${target_dir}/spec.yaml"
+    local expected="${SCRIPT_DIR}/rest-api/scan-expected-paths.json"
+    local verbose_flag=""
+
+    [ "${VERBOSE:-false}" = true ] && verbose_flag="-v"
+
+    mkdir -p "$target_dir"
+    init_test_status "scan-rest"
+
+    local start=$SECONDS
+    local failures=0
+
+    log_header "Testing: scan-rest (${base_url})"
+
+    log_info "Scanning ${base_url} (single-stage: crawl + augment + generate)..."
+    if ! "$VESPASIAN" scan "$base_url" \
+        -o "$spec_file" \
+        --api-type rest \
+        --depth 2 \
+        --max-pages 50 \
+        --timeout 2m \
+        --dangerous-allow-private \
+        $verbose_flag 2>&1; then
+        log_fail "Scan failed"
+        set_test_result "scan-rest" "FAIL" "?" "?" "$((SECONDS - start))"
+        return 1
+    fi
+
+    # Layer 1: real OpenAPI validation (LAB-3890 T1 parser-backed validator).
+    if ! validate_openapi_structure "$spec_file"; then
+        failures=$((failures + 1))
+    fi
+
+    # Layer 2: full path coverage (incl. /api/subscribe) — param-tolerant.
+    if ! validate_path_coverage "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+
+    # Layer 3: no static assets leaked into the spec.
+    if ! validate_no_static_assets "$spec_file"; then
+        failures=$((failures + 1))
+    fi
+
+    # Layer 4: explicit ExtractForms proof with an actionable message. The only
+    # source of /api/subscribe is the static HTML form (not linked/fetched), so
+    # its absence means scan's ExtractForms augmentation did not run.
+    if grep -q "/api/subscribe" "$spec_file"; then
+        log_ok "scan-rest: /api/subscribe present (ExtractForms augmentation ran)"
+    else
+        log_fail "scan-rest: /api/subscribe absent — scan's ExtractForms augmentation did not run"
+        failures=$((failures + 1))
+    fi
+
+    # As with test_rest_api (TEST-006): prove ExtractForms produced a POST-only
+    # /api/subscribe operation with its urlencoded body fields (email, name)
+    # attached to that endpoint, not merely that the path string appears.
+    # $expected here points at rest-api/scan-expected-paths.json (kept in
+    # lockstep with expected-paths.json).
+    #
+    # As in test_rest_api, GET-absence here is enforced by non-API/HTML
+    # classification — the unrouted /api/subscribe is served 200 text/html by the
+    # catch-all mux, NOT a 404 (PR #208 review finding TEST-002).
+    if ! assert_post_get_operations "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+    if ! assert_form_body_fields "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+
+    # TEST-001 (PR #208): the scan counterpart. scan-expected-paths.json lists
+    # /api/login and /api/upload as GET+POST here (single-stage headless scan: JS
+    # fires the POSTs and probing observes them), diverging from the two-stage
+    # fixture on exactly those two paths. Locking both sides makes the
+    # two-stage-vs-scan classification a tested invariant, not a silent claim.
+    if ! assert_path_methods "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+
+    local endpoint_count
+    endpoint_count=$(count_spec_endpoints "$spec_file")
+    local expected_count
+    expected_count=$(json_field "$expected" total_paths)
+
+    # Exact-count: validate_path_coverage only detects MISSING paths, so without
+    # this a scan regression that emitted the expected paths plus spurious ones
+    # would report PASS with a mismatched pair of numbers in the summary
+    # (PR #187 review finding TEST-002).
+    if ! assert_exact_path_count "scan-rest" "$endpoint_count" "$expected_count"; then
+        failures=$((failures + 1))
+    fi
+
+    local duration=$((SECONDS - start))
+    if [ $failures -eq 0 ]; then
+        set_test_result "scan-rest" "PASS" "$endpoint_count" "$expected_count" "$duration"
+        log_ok "scan-rest: ALL CHECKS PASSED (${duration}s)"
+    else
+        set_test_result "scan-rest" "FAIL" "$endpoint_count" "$expected_count" "$duration"
+        log_fail "scan-rest: ${failures} check(s) failed (${duration}s)"
     fi
 }
 
@@ -457,8 +637,7 @@ validate_concat_spec() {
 
     # Exact-count: any path beyond the two concat endpoints means a receiver
     # literal or the control leaked through the 404 filter.
-    if [ "$endpoint_count" != "$expected_count" ]; then
-        log_fail "${test_name}: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
+    if ! assert_exact_path_count "${test_name}" "$endpoint_count" "$expected_count"; then
         failures=$((failures + 1))
     fi
 
@@ -743,323 +922,6 @@ PYEOF
     return 0
 }
 
-# assert_form_body_fields verifies each urlencoded POST <form>'s input names
-# surface as request-body schema properties UNDER THAT FORM'S OWN ENDPOINT. It
-# reads post_form_body_fields_by_path {path: [fields...]} from
-# expected-paths.json, resolves each path's POST requestBody schema (a $ref into
-# components/schemas, or an inline properties block) and asserts every expected
-# field is a property of THAT schema. This closes the false-pass gap of the
-# previous whole-file `grep "^<indent><field>:"`: a field attributed to the
-# wrong operation (e.g. all names collapsing onto one path), or masked by a
-# same-named property shared across forms (username/password in both login and
-# register), or matched from an unrelated schema property, no longer satisfies
-# the check. multipart (/api/feedback) has no inferred body schema and is
-# intentionally absent from the map.
-# Usage: assert_form_body_fields <spec.yaml> <expected-paths.json>
-assert_form_body_fields() {
-    local spec=$1 expected=$2
-    local result rc=0
-    result=$(python3 - "$spec" "$expected" << 'PYEOF'
-import sys, json, re
-
-# Scoped POST-form body-field check. argv[1]=spec.yaml argv[2]=expected-paths.json.
-spec_file = sys.argv[1]
-expected_json = sys.argv[2]
-
-with open(expected_json) as f:
-    exp = json.load(f)
-by_path = exp["post_form_body_fields_by_path"]
-
-with open(spec_file) as f:
-    lines = f.read().split("\n")
-
-
-def ind(s):
-    return len(s) - len(s.lstrip(" "))
-
-
-def section_block(name_regex, start=0, end=None):
-    if end is None:
-        end = len(lines)
-    for i in range(start, end):
-        if re.match(name_regex, lines[i]):
-            base = ind(lines[i])
-            b_end = end
-            for j in range(i + 1, end):
-                if lines[j].strip() and ind(lines[j]) <= base:
-                    b_end = j
-                    break
-            return i, base, lines[i + 1:b_end]
-    return None, None, None
-
-
-def find_path_block(path):
-    in_paths = False
-    paths_indent = None
-    for i, line in enumerate(lines):
-        st = line.rstrip()
-        if re.match(r"^paths:\s*$", st):
-            in_paths = True
-            continue
-        if in_paths:
-            if st and not st[0].isspace():
-                break
-            m = re.match(r'^(\s+)(?:"(/[^"]*)"|\'(/[^\']*)\'|(/[^:"\']*)):\s*$', st)
-            if m:
-                k_indent = len(m.group(1))
-                if paths_indent is None:
-                    paths_indent = k_indent
-                if k_indent == paths_indent:
-                    key = m.group(2) or m.group(3) or m.group(4)
-                    if key == path:
-                        p_end = len(lines)
-                        for j in range(i + 1, len(lines)):
-                            if lines[j].strip() and ind(lines[j]) <= k_indent:
-                                p_end = j
-                                break
-                        return lines[i + 1:p_end]
-    return None
-
-
-def schema_properties(schema_name):
-    ci = None
-    for i, line in enumerate(lines):
-        if re.match(r"^components:\s*$", line):
-            ci = i
-            break
-    if ci is None:
-        return None
-    _, _, sblock = section_block(r'^\s+%s:\s*$' % re.escape(schema_name), start=ci)
-    if sblock is None:
-        return None
-    props = []
-    in_props = False
-    props_indent = None
-    child_indent = None
-    for line in sblock:
-        if re.match(r"^\s+properties:\s*$", line):
-            in_props = True
-            props_indent = ind(line)
-            continue
-        if in_props:
-            if line.strip() and ind(line) <= props_indent:
-                break
-            m = re.match(r"^(\s+)([A-Za-z0-9_.$-]+):\s*$", line)
-            if m:
-                lvl = len(m.group(1))
-                if child_indent is None:
-                    child_indent = lvl
-                if lvl == child_indent:
-                    props.append(m.group(2))
-    return props
-
-
-def body_fields_for_path(path):
-    pblock = find_path_block(path)
-    if pblock is None:
-        return None, None, "path not found"
-    post_start = None
-    post_indent = None
-    for k, line in enumerate(pblock):
-        if re.match(r"^\s+post:\s*$", line):
-            post_start = k
-            post_indent = ind(line)
-            break
-    if post_start is None:
-        return None, None, "no POST operation"
-    p_end = len(pblock)
-    for j in range(post_start + 1, len(pblock)):
-        if pblock[j].strip() and ind(pblock[j]) <= post_indent:
-            p_end = j
-            break
-    postblock = pblock[post_start + 1:p_end]
-    rb_start = None
-    rb_indent = None
-    for k, line in enumerate(postblock):
-        if re.match(r"^\s+requestBody:\s*$", line):
-            rb_start = k
-            rb_indent = ind(line)
-            break
-    if rb_start is None:
-        return None, None, "no requestBody"
-    r_end = len(postblock)
-    for j in range(rb_start + 1, len(postblock)):
-        if postblock[j].strip() and ind(postblock[j]) <= rb_indent:
-            r_end = j
-            break
-    rbblock = postblock[rb_start + 1:r_end]
-    for line in rbblock:
-        m = re.search(r"\$ref:\s*'?#/components/schemas/([A-Za-z0-9_.-]+)'?", line)
-        if m:
-            props = schema_properties(m.group(1))
-            if props is None:
-                return None, None, "schema %s not found" % m.group(1)
-            return set(props), "ref:" + m.group(1), None
-    in_props = False
-    props_indent = None
-    child_indent = None
-    props = []
-    for line in rbblock:
-        if re.match(r"^\s+properties:\s*$", line):
-            in_props = True
-            props_indent = ind(line)
-            continue
-        if in_props:
-            if line.strip() and ind(line) <= props_indent:
-                break
-            m = re.match(r"^(\s+)([A-Za-z0-9_.$-]+):\s*$", line)
-            if m:
-                lvl = len(m.group(1))
-                if child_indent is None:
-                    child_indent = lvl
-                if lvl == child_indent:
-                    props.append(m.group(2))
-    if props:
-        return set(props), "inline:" + path, None
-    return None, None, "no request-body schema properties"
-
-
-failures = 0
-schema_by_path = {}
-for path in sorted(by_path):
-    fields = by_path[path]
-    got, schema_id, err = body_fields_for_path(path)
-    if got is None:
-        sys.stderr.write("  detail: %s: %s\n" % (path, err))
-        failures += 1
-        continue
-    schema_by_path[path] = schema_id
-    missing = [f for f in fields if f not in got]
-    if missing:
-        sys.stderr.write("  detail: %s request-body missing field(s): %s (found: %s)\n"
-                         % (path, ", ".join(missing), ", ".join(sorted(got))))
-        failures += 1
-
-# Distinctness guard (TEST-002a): each POST form must resolve to its OWN
-# request-body schema. A shared/union $ref referenced by more than one path could
-# mask per-endpoint field loss for names common to both forms (username/password),
-# so two paths resolving to the same schema identity is a failure.
-seen = {}
-for path in sorted(schema_by_path):
-    sid = schema_by_path[path]
-    if sid in seen:
-        sys.stderr.write("  detail: %s and %s share request-body schema '%s' (schemas must be distinct per endpoint)\n"
-                         % (seen[sid], path, sid))
-        failures += 1
-    else:
-        seen[sid] = path
-
-if failures:
-    print("POST-form body fields: %d issue(s) - missing field(s) or a request-body schema shared across endpoints" % failures)
-    sys.exit(1)
-print("POST-form body fields: every form's input names present under its own distinct request-body schema")
-sys.exit(0)
-PYEOF
-    ) || rc=$?
-    if [ "$rc" -ne 0 ]; then
-        log_fail "${result:-POST-form body fields: check failed}"
-        return 1
-    fi
-    log_ok "${result}"
-    return 0
-}
-
-# assert_post_get_operations verifies, for each POST-only form action, that the
-# generated spec has a POST operation AND no GET operation UNDER THAT EXACT PATH
-# (scoped to the path block, not a whole-file summary grep). The GET-absence half
-# is load-bearing for the "must NOT appear" contract: the crawler's GET probes of
-# the POST form actions 404 and are filtered at the default 0.5 confidence, so a
-# 404/confidence-filter regression would surface as a GET operation on a POST-only
-# action. Reads post_form_paths from expected-paths.json.
-# Usage: assert_post_get_operations <spec.yaml> <expected-paths.json>
-assert_post_get_operations() {
-    local spec=$1 expected=$2
-    local result rc=0
-    result=$(python3 - "$spec" "$expected" << 'PYEOF'
-import sys, json, re
-
-spec_file = sys.argv[1]
-expected_json = sys.argv[2]
-
-with open(expected_json) as f:
-    exp = json.load(f)
-paths = exp["post_form_paths"]
-
-with open(spec_file) as f:
-    lines = f.read().split("\n")
-
-
-def ind(s):
-    return len(s) - len(s.lstrip(" "))
-
-
-def path_operations(target):
-    in_paths = False
-    paths_indent = None
-    for i, line in enumerate(lines):
-        st = line.rstrip()
-        if re.match(r"^paths:\s*$", st):
-            in_paths = True
-            continue
-        if in_paths:
-            if st and not st[0].isspace():
-                break
-            m = re.match(r'^(\s+)(?:"(/[^"]*)"|\'(/[^\']*)\'|(/[^:"\']*)):\s*$', st)
-            if m:
-                k_indent = len(m.group(1))
-                if paths_indent is None:
-                    paths_indent = k_indent
-                if k_indent == paths_indent:
-                    key = m.group(2) or m.group(3) or m.group(4)
-                    if key == target:
-                        ops = set()
-                        child_indent = None
-                        for j in range(i + 1, len(lines)):
-                            if lines[j].strip() and ind(lines[j]) <= k_indent:
-                                break
-                            mo = re.match(r"^(\s+)([a-z]+):\s*$", lines[j])
-                            if mo:
-                                lvl = len(mo.group(1))
-                                if child_indent is None:
-                                    child_indent = lvl
-                                if lvl == child_indent and mo.group(2) in (
-                                    "get", "post", "put", "patch", "delete", "head", "options"
-                                ):
-                                    ops.add(mo.group(2))
-                        return ops
-    return None
-
-
-failures = 0
-for p in paths:
-    ops = path_operations(p)
-    if ops is None:
-        sys.stderr.write("  detail: %s: path not present in spec\n" % p)
-        failures += 1
-        continue
-    if "post" not in ops:
-        sys.stderr.write("  detail: %s: expected POST operation, found: %s\n"
-                         % (p, ", ".join(sorted(ops)) or "none"))
-        failures += 1
-    if "get" in ops:
-        sys.stderr.write("  detail: %s: unexpected GET operation on POST-only action (404/confidence filter regressed?)\n" % p)
-        failures += 1
-
-if failures:
-    print("POST/GET operations: %d issue(s) on form action paths" % failures)
-    sys.exit(1)
-print("POST/GET operations: every POST action has a post op and no get op, scoped to its path")
-sys.exit(0)
-PYEOF
-    ) || rc=$?
-    if [ "$rc" -ne 0 ]; then
-        log_fail "${result:-POST/GET operations: check failed}"
-        return 1
-    fi
-    log_ok "${result}"
-    return 0
-}
-
 test_forms_target() {
     local port="${FORMS_TARGET_PORT:-8994}"
     local base_url="http://${TEST_HOST}:${port}"
@@ -1200,8 +1062,7 @@ test_forms_target() {
     # expected form-derived paths. A spurious extra path (a receiver literal or a
     # crawl artifact that slipped the classifier) trips this. Mirrors the sibling
     # test_concat_spa exact-count check.
-    if [ "$endpoint_count" != "$expected_count" ]; then
-        log_fail "forms-target: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
+    if ! assert_exact_path_count "forms-target" "$endpoint_count" "$expected_count"; then
         failures=$((failures + 1))
     fi
 
@@ -2233,8 +2094,7 @@ test_generate_js_static() {
 
     local endpoint_count
     endpoint_count=$(count_spec_endpoints "$spec_on")
-    if [ "$endpoint_count" != "$expected_count" ]; then
-        log_fail "Expected ${expected_count} statically-discovered paths, got ${endpoint_count}"
+    if ! assert_exact_path_count "generate-js-static" "$endpoint_count" "$expected_count"; then
         failures=$((failures + 1))
     else
         log_ok "Recovered ${endpoint_count} paths from the JS bundle"
@@ -2426,6 +2286,15 @@ test_import_malformed() {
 
     log_header "Testing: import-malformed (graceful handling of bad input)"
 
+    # check_panic fails the test if an import's combined output contains a Go
+    # panic / goroutine stack trace (LAB-3890 T3, gap B3). The detection itself
+    # lives in validate.sh:assert_no_panic so validate_test.sh can regression-test
+    # the regex; this thin wrapper keeps sharing this function's `failures` via
+    # bash dynamic scoping (PR #187 review finding TEST-002).
+    check_panic() {
+        assert_no_panic "$1" "$2" || failures=$((failures + 1))
+    }
+
     # Test 1: Truncated/broken XML — should fail gracefully (non-zero exit, no crash)
     log_info "Importing truncated Burp XML..."
     local truncated_burp="${RESULTS_DIR}/import-malformed/truncated-burp.xml"
@@ -2438,6 +2307,7 @@ test_import_malformed() {
     } || {
         log_ok "Truncated Burp XML: rejected gracefully (exit non-zero)"
     }
+    check_panic "Truncated Burp XML" "$burp_err"
 
     # Test 2: Completely invalid XML — should fail gracefully
     log_info "Importing invalid Burp XML..."
@@ -2450,6 +2320,7 @@ test_import_malformed() {
     } || {
         log_ok "Invalid Burp XML: rejected gracefully"
     }
+    check_panic "Invalid Burp XML" "$burp_err2"
 
     # Test 3: Sparse Burp data (valid XML, empty/missing fields)
     log_info "Importing sparse Burp XML..."
@@ -2459,6 +2330,7 @@ test_import_malformed() {
     } || {
         log_ok "Sparse Burp XML: rejected gracefully"
     }
+    check_panic "Sparse Burp XML" "$sparse_burp_err"
 
     # Test 4: Completely invalid JSON — should fail gracefully
     log_info "Importing invalid HAR JSON..."
@@ -2471,6 +2343,7 @@ test_import_malformed() {
     } || {
         log_ok "Invalid HAR JSON: rejected gracefully"
     }
+    check_panic "Invalid HAR JSON" "$har_err"
 
     # Test 5: Sparse HAR data (valid JSON, empty/invalid fields)
     log_info "Importing sparse HAR JSON..."
@@ -2480,6 +2353,7 @@ test_import_malformed() {
     } || {
         log_ok "Sparse HAR JSON: rejected gracefully"
     }
+    check_panic "Sparse HAR JSON" "$sparse_har_err"
 
     local duration=$((SECONDS - start))
     if [ $failures -eq 0 ]; then
@@ -2488,6 +2362,151 @@ test_import_malformed() {
     else
         set_test_result "import-malformed" "FAIL" "?" "0" "$duration"
         log_fail "import-malformed: FAILED (${duration}s)"
+    fi
+}
+
+test_ssrf_rejection() {
+    init_test_status "ssrf-rejection"
+    local start=$SECONDS
+    local failures=0
+
+    log_header "Testing: ssrf-rejection (private target rejected without --dangerous-allow-private)"
+
+    # The SSRF frontier gate must REJECT a private/loopback seed when
+    # --dangerous-allow-private is absent. Every other crawl/scan target passes
+    # that bypass flag, so this is the only place the crawl-frontier gate
+    # (CrawlCmd/ScanCmd, cmd/vespasian/main.go:361 and :615) is asserted to
+    # actually reject (LAB-3890 T4, gap A4). --headless=false selects the
+    # net/http backend so the frontier gate is reached without launching Chrome:
+    # CrawlCmd.Run calls setupBrowserAndSignals before doCrawl, so with the
+    # default --headless a host without usable Chrome would fail this target for
+    # a reason unrelated to what it asserts. No server and no browser needed —
+    # rejection happens before any connection.
+    #
+    # SCOPE (PR #187 review finding SEC-BE-002): vespasian gates private/loopback
+    # traffic on TWO independent surfaces, each with its own
+    # --dangerous-allow-private bypass — the crawl frontier asserted above, and
+    # the separate probe path (GenerateCmd, cmd/vespasian/main.go:472; enabled by
+    # default since Probe defaults to true), implemented via
+    # ssrf.SafeDialContext/ssrf.ValidateURL in pkg/probe/types.go:101-131. This
+    # target does not exercise `generate`, so the probe-path gate has NO
+    # rejection assertion anywhere in this suite. Investigated adding one:
+    # built the binary and ran `generate rest` against a loopback-origin capture
+    # with and without --dangerous-allow-private — the generated spec was
+    # byte-identical (md5-equal) either way, and the only differing output was
+    # the static "SSRF protection disabled" banner that's printed whenever the
+    # flag is parsed, regardless of whether the gate would have blocked
+    # anything. Per-URL validation failures inside the probe strategies
+    # (pkg/probe/options.go, schema.go, etc.) are swallowed as slog.Debug and
+    # never surface as a probe error or CLI diagnostic, so a regression
+    # neutering the probe-path dialer (e.g. hand-rolling an http.Transport
+    # instead of cloning DefaultTransport, per the pkg/probe/types.go:101-109
+    # warning) would fail nothing here. No fabricated assertion has been added;
+    # this second bypassable surface is tracked in the LAB-3890 backlog.
+    local private_url="http://127.0.0.1:9"
+    local out
+    if out=$("$VESPASIAN" crawl "$private_url" -o /dev/null --headless=false 2>&1); then
+        log_fail "SSRF gate: crawl of ${private_url} succeeded WITHOUT --dangerous-allow-private (gate did not reject)"
+        failures=$((failures + 1))
+    elif assert_ssrf_rejected "SSRF gate" "$private_url" "$out"; then
+        log_ok "SSRF gate: private target correctly rejected"
+    else
+        failures=$((failures + 1))
+    fi
+
+    local duration=$((SECONDS - start))
+    if [ $failures -eq 0 ]; then
+        set_test_result "ssrf-rejection" "PASS" "-" "-" "$duration"
+        log_ok "ssrf-rejection: PASSED (${duration}s)"
+    else
+        set_test_result "ssrf-rejection" "FAIL" "-" "-" "$duration"
+        log_fail "ssrf-rejection: FAILED (${duration}s)"
+    fi
+}
+
+test_auth_capture() {
+    local target_dir="${RESULTS_DIR}/auth-capture"
+    local imported_file="${target_dir}/imported.json"
+    local fixture="${SCRIPT_DIR}/fixtures/sample-auth.har"
+
+    mkdir -p "$target_dir"
+    init_test_status "auth-capture"
+    local start=$SECONDS
+    local failures=0
+
+    log_header "Testing: auth-capture (Authorization header captured & preserved through import)"
+
+    if ! "$VESPASIAN" import har "$fixture" -o "$imported_file" 2>&1; then
+        log_fail "auth-capture: import of ${fixture} failed"
+        set_test_result "auth-capture" "FAIL" "?" "1" "$((SECONDS - start))"
+        return 1
+    fi
+
+    # The captured request must retain its Authorization header — auth must not
+    # be silently dropped by the pipeline (LAB-3890 T4, gap A5). A pair of
+    # whole-file greps is satisfied by a degenerate file containing "[]" plus the
+    # bare strings "Authorization" and "Bearer test-token-abc123" anywhere in the
+    # file, with no proof the header is attached to the right request. This
+    # requires exactly one imported entry whose method/url round-tripped from the
+    # fixture and whose Authorization header carries the fixture's token
+    # (PR #187 review finding TEST-003).
+    local result rc=0
+    result=$(python3 - "$imported_file" << 'PYEOF'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    imported = json.load(f)
+
+if not isinstance(imported, list) or len(imported) != 1:
+    got = len(imported) if isinstance(imported, list) else "non-list"
+    print("COUNT MISMATCH: got %s imported entr(y/ies), expected exactly 1" % got)
+    sys.exit(1)
+
+entry = imported[0]
+if entry.get("method") != "GET":
+    print("METHOD MISMATCH: got %r, expected GET" % entry.get("method"))
+    sys.exit(1)
+
+if entry.get("url") != "http://api.example.com/api/account":
+    print("URL MISMATCH: got %r, expected http://api.example.com/api/account" % entry.get("url"))
+    sys.exit(1)
+
+auth = entry.get("headers", {}).get("Authorization")
+if auth != "Bearer test-token-abc123":
+    print("AUTH HEADER MISMATCH: got %r, expected 'Bearer test-token-abc123'" % auth)
+    sys.exit(1)
+
+print("OK: 1 entry imported, GET http://api.example.com/api/account, Authorization preserved")
+PYEOF
+    ) || rc=$?
+    if [ $rc -ne 0 ]; then
+        log_fail "auth-capture: ${result}"
+        failures=$((failures + 1))
+    else
+        log_ok "auth-capture: ${result}"
+    fi
+
+    # KNOWN GAP (LAB-3890 T4 / A5, rescoped to import-side auth preservation
+    # only): the generator does not yet emit OpenAPI securitySchemes from
+    # captured auth. Asserting captured-auth -> securitySchemes ships with
+    # LAB-5332 (PR #187 review finding REQ-001 — the prior claim that this was
+    # tracked elsewhere was unverifiable at review time, since no such ticket
+    # existed); this target asserts only that auth is captured/preserved.
+    log_info "auth-capture: NOTE — securitySchemes generation from captured auth is tracked in LAB-5332 (not yet implemented)."
+
+    # Measured, not hardcoded — the summary row must report what was actually
+    # imported, not a literal that would keep reading "1" even if the import
+    # stopped producing entries entirely (PR #187 review finding TEST-003).
+    local entry_count
+    entry_count=$(json_len "$imported_file")
+
+    local duration=$((SECONDS - start))
+    if [ $failures -eq 0 ]; then
+        set_test_result "auth-capture" "PASS" "$entry_count" "1" "$duration"
+        log_ok "auth-capture: PASSED (${duration}s)"
+    else
+        set_test_result "auth-capture" "FAIL" "$entry_count" "1" "$duration"
+        log_fail "auth-capture: FAILED (${duration}s)"
     fi
 }
 
@@ -3030,7 +3049,7 @@ test_crawl_depth() {
 
     log_header "Testing: crawl-depth (deep links and max-pages limit)"
 
-    # Test 1: Crawl with depth=2 should NOT reach level 3+
+    # Test 1: Crawl with depth=2 should NOT reach beyond depth 2
     log_info "Crawling deep links with depth=2..."
     local shallow_capture="${target_dir}/shallow.json"
     if "$VESPASIAN" crawl "${base_url}/api/deep/1" \
@@ -3041,20 +3060,33 @@ test_crawl_depth() {
         --dangerous-allow-private \
         $verbose_flag 2>&1; then
 
-        # Should have levels 1-2, but not 3+
-        local has_deep
-        has_deep=$(python3 - "$shallow_capture" << 'PYEOF' 2>/dev/null || echo "?"
+        # The seed /api/deep/1 is depth 0, so --depth 2 may legitimately reach
+        # /deep/3 (depth 2) but MUST NOT reach /deep/4+ (depth 3+). The old check
+        # flagged /deep/3 and only warned; it now hard-fails on any hop beyond
+        # the requested depth (LAB-3890 T3, gap B2).
+        local depth_counts beyond_depth reached_depth
+        depth_counts=$(python3 - "$shallow_capture" << 'PYEOF' 2>/dev/null || echo "? ?"
 import json, sys
 data = json.load(open(sys.argv[1]))
 urls = [r['url'] for r in data]
-deep = [u for u in urls if '/deep/3' in u or '/deep/4' in u or '/deep/5' in u]
-print(len(deep))
+beyond = [u for u in urls if '/deep/4' in u or '/deep/5' in u or '/deep/6' in u]
+# Positive side of the boundary: --depth 2 from seed /deep/1 MUST actually reach
+# /deep/2 or /deep/3. Without this, an under-crawl that stops at the seed also
+# reports zero /deep/4+ and would pass green (PR #187 review finding TEST-003).
+reached = [u for u in urls if '/deep/2' in u or '/deep/3' in u]
+print(len(beyond), len(reached))
 PYEOF
         )
-        if [ "$has_deep" = "0" ]; then
-            log_ok "Depth limit: correctly stopped at depth 2"
+        beyond_depth=${depth_counts%% *}
+        reached_depth=${depth_counts##* }
+        # Both counts come from word-splitting one line of python stdout, so a
+        # change to that print format yields garbage rather than a number.
+        # assert_within_depth rejects a non-numeric value on EITHER side; the
+        # old inline check guarded only reached_depth (PR #187 finding TEST-004).
+        if assert_within_depth "Depth limit" "$beyond_depth" "$reached_depth"; then
+            log_ok "Depth limit: stayed within depth 2 and followed ${reached_depth} link(s) past the seed"
         else
-            log_warn "Depth limit: found ${has_deep} URLs beyond depth 2 (may vary by crawler)"
+            failures=$((failures + 1))
         fi
     else
         log_fail "Shallow crawl failed"
@@ -3073,12 +3105,29 @@ PYEOF
         $verbose_flag 2>&1; then
 
         local page_count
-        page_count=$(json_len "$limited_capture")
-        # Should be capped around max-pages
-        if [ "$page_count" != "?" ] && [ "$page_count" -le 15 ]; then
-            log_ok "Max-pages limit: captured ${page_count} requests (limit=10)"
+        page_count=$(count_capture_pages "$limited_capture")
+        # --max-pages caps pages visited, not captured requests. The rod
+        # (headless browser) backend visits each page in a fresh tab, so
+        # sub-resources (e.g. a 200 /favicon.ico) fired by that page land in
+        # the capture too. Counting raw records over-counted and produced a
+        # false "--max-pages not enforced" failure in CI at 20-vs-10 while the
+        # crawler was behaving correctly. pkg/crawl's own
+        # TestCrawlerContract_RespectsMaxPages counts pages the same way and
+        # passes on both backends (PR #187 / LAB-3890 T3, gap B2).
+        # Floor == limit (10): --max-pages is exact in BOTH directions here.
+        # pageBudgetReached (pkg/crawl/engine.go) reserves each page slot inside a
+        # single mutex-guarded critical section, so the visited count can never
+        # exceed MaxPages; and the seed /api/many-links carries 20 links (21
+        # reachable pages), so a correct crawler under limit=10 visits exactly 10
+        # — CI has shown "visited 10 page(s) (limit=10)" across runs. A floor
+        # below 10 would let a regression that crawled only a few of the 20 links
+        # still pass; matching the exact upper bound the function already asserts
+        # closes that slack (PR #187 review finding TEST-020, tightened per PR
+        # #208 review finding TEST-004).
+        if assert_max_pages "Max-pages limit" "$page_count" 10 10; then
+            log_ok "Max-pages limit: visited ${page_count} page(s) (limit=10)"
         else
-            log_warn "Max-pages limit: captured ${page_count} requests (expected <=15)"
+            failures=$((failures + 1))
         fi
     else
         log_fail "Limited crawl failed"
@@ -3641,8 +3690,8 @@ usage() {
     echo "  --group <name>        Run a predefined target group: offline, live, or all (default: all)"
     echo "  --targets <list>      Comma-separated targets to test (overrides --group)"
     echo "                        Valid targets:"
-    echo "                          Service:    rest-api, soap-service, graphql-server, concat-spa,"
-    echo "                                      concat-spa-two-stage"
+    echo "                          Service:    rest-api, scan-rest, soap-service, graphql-server,"
+    echo "                                      concat-spa, concat-spa-two-stage, forms-target"
     echo "                          Config:     grpc-server (included via TARGETS_SETUP when set up)"
     echo "                          Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,"
     echo "                                      generate-graphql, generate-graphql-imports,"
@@ -3650,8 +3699,8 @@ usage() {
     echo "                          Import:     import-burp, import-har, import-base64,"
     echo "                                      import-mitmproxy, import-mitmproxy-native,"
     echo "                                      import-unicode, import-duplicates,"
-    echo "                                      import-malformed, import-empty"
-    echo "                          Crawl:      crawl-depth, crawl-unreachable, no-download"
+    echo "                                      import-malformed, import-empty, auth-capture"
+    echo "                          Crawl:      crawl-depth, crawl-unreachable, ssrf-rejection, no-download"
     echo "                          Edge cases: edge-cases, classifier-edge, spec-edge"
     echo "  --verbose             Enable verbose vespasian output"
     echo "  --no-build            Skip building vespasian and target binaries"
@@ -3768,6 +3817,7 @@ main() {
     for target in "${TARGET_ARRAY[@]}"; do
         case "$target" in
             rest-api)      test_rest_api ;;
+            scan-rest)     test_scan_rest ;;
             soap-service)    test_soap_service ;;
             graphql-server)  test_graphql_server ;;
             grpc-server)     test_grpc_server ;;
@@ -3796,6 +3846,8 @@ main() {
             no-download)        test_no_download ;;
             classifier-edge)    test_classifier_edge_cases ;;
             spec-edge)          test_spec_edge_cases ;;
+            ssrf-rejection)     test_ssrf_rejection ;;
+            auth-capture)       test_auth_capture ;;
             *)
                 log_fail "Unknown target: $target"
                 init_test_status "$target"

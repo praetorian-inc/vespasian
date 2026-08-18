@@ -34,6 +34,7 @@ package crawl
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -44,6 +45,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 	"github.com/praetorian-inc/vespasian/pkg/ssrf"
 )
@@ -91,6 +93,16 @@ type JSReplayConfig struct {
 	// SSRF-safe transport when !AllowPrivate.
 	Client *http.Client
 
+	// Proxy routes replay traffic through an intercepting proxy when set. It is
+	// honored ONLY when Client is nil (the production path — buildJSReplayConfig
+	// never sets Client): an injected Client owns its transport, and
+	// wrapClientWithSSRF would clobber a proxied dialer.
+	// When a Client IS injected while Proxy is set, withDefaults emits a warning to
+	// Stderr that replay traffic will BYPASS the proxy. The proxied client installs
+	// no dial-time SSRF pin (we dial the proxy, not the target); URL-level scope
+	// (ValidateProbeURL/canFetchURL) is unchanged.
+	Proxy httpx.ProxyConfig
+
 	// Verbose enables debug logging to Stderr.
 	Verbose bool
 
@@ -132,8 +144,22 @@ func (cfg JSReplayConfig) withDefaults() JSReplayConfig {
 		cfg.Stderr = io.Discard
 	}
 	if cfg.Client == nil {
-		cfg.Client = newSSRFSafeClient(cfg.Timeout, cfg.AllowPrivate)
+		if cfg.Proxy.Enabled() {
+			// Route through the proxy: no dial-time SSRF pin (we dial the proxy,
+			// not the target). This is the production path; an injected Client
+			// deliberately opts out of Proxy (wrapClientWithSSRF would clobber a
+			// proxied dialer).
+			cfg.Client = httpx.BuildHTTPClient(cfg.Proxy, cfg.Timeout, httpx.NoFollowRedirects)
+		} else {
+			cfg.Client = newSSRFSafeClient(cfg.Timeout, cfg.AllowPrivate)
+		}
 	} else {
+		if cfg.Proxy.Enabled() {
+			// SEC-BE-004: an injected Client owns its transport, so a configured
+			// Proxy is silently ignored here. Warn loudly rather than bypass the
+			// proxy without a trace.
+			fmt.Fprintf(cfg.Stderr, "js-extract: warning: Proxy configured but ignored — an injected Client owns its transport; replay traffic will BYPASS the proxy\n") //nolint:errcheck // best-effort warning
+		}
 		// Caller supplied a client. SSRF-wrap when AllowPrivate is false,
 		// and always enforce our redirect policy: probeURL records the
 		// status we asked for (no auto-follow), and fetchJSBody follows
@@ -150,17 +176,9 @@ func (cfg JSReplayConfig) withDefaults() JSReplayConfig {
 				cfg.Client.Timeout = cfg.Timeout
 			}
 		}
-		cfg.Client.CheckRedirect = noRedirect
+		cfg.Client.CheckRedirect = httpx.NoFollowRedirects
 	}
 	return cfg
-}
-
-// noRedirect is the redirect policy used by ReplayJSExtracted's HTTP client.
-// It causes Go's http.Client to return 3xx responses verbatim instead of
-// auto-following them; probeURL needs the actual response from the URL we
-// asked for, and fetchJSBody manages its own bounded redirect-follow loop.
-func noRedirect(*http.Request, []*http.Request) error {
-	return http.ErrUseLastResponse
 }
 
 // wrapClientWithSSRF returns a copy of caller with its transport replaced by
@@ -251,7 +269,7 @@ func newSSRFSafeClient(timeout time.Duration, allowPrivate bool) *http.Client {
 	return &http.Client{
 		Timeout:       timeout,
 		Transport:     transport,
-		CheckRedirect: noRedirect,
+		CheckRedirect: httpx.NoFollowRedirects,
 	}
 }
 
@@ -355,7 +373,7 @@ var apiPathPattern = regexp.MustCompile(
 	`["']` +
 		`(/?` +
 		`(?:[a-zA-Z0-9_-]+/)*` +
-		apiIndicatorAlternation +
+		APIIndicatorAlternation +
 		`[a-zA-Z0-9/_\{}.:-]*)` +
 		`["']`,
 )
@@ -368,7 +386,7 @@ var templateLiteralPattern = regexp.MustCompile(
 	"`" +
 		`(/?` +
 		`(?:[a-zA-Z0-9_-]+/)*` +
-		apiIndicatorAlternation +
+		APIIndicatorAlternation +
 		`[a-zA-Z0-9/_\{}.:-]*)` +
 		"`",
 )
@@ -379,17 +397,27 @@ var fullURLPattern = regexp.MustCompile(
 	`["'` + "`]" +
 		`(https?://[a-zA-Z0-9._-]+(?::[0-9]+)?` +
 		`/(?:[a-zA-Z0-9_-]+/)*` +
-		apiIndicatorAlternation +
+		APIIndicatorAlternation +
 		`[a-zA-Z0-9/_\{}.:-]*)` +
 		`["'` + "`]",
 )
 
-// apiIndicatorAlternation is the single source of truth for which path
+// APIIndicatorAlternation is the single source of truth for which path
 // segments signal an API endpoint. It is concatenated into every extraction
 // regex (apiPathPattern, templateLiteralPattern, fullURLPattern,
 // servicePrefixPattern) and into apiIndicatorPattern, so the set cannot
 // drift between extraction and classification.
-const apiIndicatorAlternation = `(?:api/|v[1-9][0-9]*/|rest/|rpc/|graphql)`
+//
+// Exported for pkg/classify (TEST-002, LAB-4992): the classifier's Rule 3
+// gate (apiPathSegments + apiVersionPathPattern) must recognize every
+// indicator this extractor can produce, or offline concat/service-prefix
+// candidates on an unrecognized indicator fail Rule 3, Rule 7's static-JS
+// floor never fires, and they are silently dropped at the default
+// confidence. That mirroring was previously asserted only in prose;
+// classify's TestAPIIndicatorParityWithCrawlExtraction now pins this exact
+// string, so widening the set here fails that test until the classifier's
+// gate is widened to match.
+const APIIndicatorAlternation = `(?:api/|v[1-9][0-9]*/|rest/|rpc/|graphql)`
 
 // servicePrefixPattern matches service prefix strings concatenated with API paths
 // using the `+` operator between two QUOTED string literals.
@@ -400,7 +428,7 @@ const apiIndicatorAlternation = `(?:api/|v[1-9][0-9]*/|rest/|rpc/|graphql)`
 // operands — e.g. "/api/posts/".concat(id, "/comment") or "/api/users/" + id
 // + "/posts" — is handled separately by extractConcatPaths (see LAB-1368).
 var servicePrefixPattern = regexp.MustCompile(
-	`["']([a-zA-Z][a-zA-Z0-9_-]{1,30}/)["']\s*\+\s*["']` + apiIndicatorAlternation,
+	`["']([a-zA-Z][a-zA-Z0-9_-]{1,30}/)["']\s*\+\s*["']` + APIIndicatorAlternation,
 )
 
 // concatMethodPattern matches a quoted string literal receiver followed by
@@ -448,10 +476,16 @@ var concatPlusHeadPattern = regexp.MustCompile(
 	`["']` +
 		`(/?` +
 		`(?:[a-zA-Z0-9_-]+/)*` +
-		apiIndicatorAlternation +
+		APIIndicatorAlternation +
 		`[a-zA-Z0-9/_{}.:-]*)` +
 		`["']\s*\+`,
 )
+
+// ConcatPathSentinel is the exported form of concatPathSentinel. It is the
+// single source of truth for the sentinel value across packages —
+// pkg/analyze/jsstatic references it from concatDedupKey so its dedup
+// canonicalization cannot drift from the value this package substitutes.
+const ConcatPathSentinel = "0"
 
 // concatPathSentinel is what we substitute for any non-literal concat
 // argument or +-chain operand. A pure numeric segment so the REST
@@ -459,7 +493,7 @@ var concatPlusHeadPattern = regexp.MustCompile(
 // pkg/generate/rest/normalize.go). Using "0" rather than "{}" keeps the
 // reconstructed path a syntactically valid HTTP path that the prober can
 // actually issue a request against.
-const concatPathSentinel = "0"
+const concatPathSentinel = ConcatPathSentinel
 
 // maxConcatChainOperands bounds the length of a `+`-concat chain
 // parsePlusChain will walk before bailing out. Real URL chains rarely
@@ -503,9 +537,9 @@ const maxConcatArgList = 500
 const maxConcatPathsPerBundle = 256
 
 // apiIndicatorPattern matches the path segments that signal an API endpoint.
-// Sourced from apiIndicatorAlternation so it is impossible for it to drift
+// Sourced from APIIndicatorAlternation so it is impossible for it to drift
 // from the extraction regexes.
-var apiIndicatorPattern = regexp.MustCompile(`(?i)` + apiIndicatorAlternation)
+var apiIndicatorPattern = regexp.MustCompile(`(?i)` + APIIndicatorAlternation)
 
 // standalonePrefixPattern matches bare service-prefix string literals like
 // "identity/", "workshop/", "community/" — short lowercase-alpha-with-dashes
@@ -596,6 +630,27 @@ func hasInlinePrefix(trimmedPath string) bool {
 	return loc != nil && loc[0] > 0
 }
 
+// SameOrigin reports whether a and b share an origin (scheme + host + port),
+// canonicalizing default ports so `https://h/x` and `https://h:443/y` compare
+// equal. Returns false when either URL is unparseable or has no host, so a
+// malformed input fails closed.
+//
+// Exported for pkg/analyze/jsstatic (QUAL-001, LAB-4992): the offline concat
+// extractor previously compared host and scheme with its own ad hoc
+// hostOfURL/schemeOfURL pair, which — unlike originOf here — did NOT canonicalize
+// default ports. A reconstruction of `https://h:443/api/x` from a bundle served
+// at `https://h/` therefore failed the same-origin gate and the endpoint was
+// silently dropped, even though this package's own comparison (originOf) treats
+// the two as identical. Sharing one comparison keeps the offline and active
+// paths from disagreeing about what "the bundle's own origin" means.
+func SameOrigin(a, b string) bool {
+	oa := originOf(a)
+	if oa == "" {
+		return false
+	}
+	return oa == originOf(b)
+}
+
 // defaultPortForScheme returns the canonical default port for a URL scheme,
 // or "" if the scheme has no default we recognize. Used by originOf to
 // canonicalize implicit-vs-explicit-port forms (https://example.com and
@@ -621,13 +676,68 @@ func defaultPortForScheme(scheme string) string {
 // all collapse to the same string. Without this normalization, isSameOrigin
 // would treat the implicit-port and explicit-port forms as different origins
 // and incorrectly skip valid same-origin probes.
+//
+// SEC-BE-001 (LAB-4992 review): u.Hostname() strips the enclosing brackets
+// from an IPv6 literal host (e.g. "[::1]" -> "::1"), so an IPv6 host is
+// re-bracketed here before being joined with ":" + port. Without this, two
+// distinct URLs — one with a real port outside the brackets
+// ("https://[2001:db8::1]:8443/x") and one where that same digit sequence is
+// actually part of the IPv6 literal itself, with no port at all
+// ("https://[2001:db8::1:8443]/x", which gets the https default port 443) —
+// rebuild to the IDENTICAL bracket-less string "https://2001:db8::1:8443",
+// making originOf non-injective for IPv6 targets. That collision let a real
+// observation and an attacker-authored candidate on a different IPv6 literal
+// silently merge into one endpointKey.origin in pkg/generate/rest, and it
+// made the emitted `servers` URL and `info.title` syntactically invalid for
+// IPv6 (a bracket-less "https://2001:db8::1:8443" is not a valid URL).
+//
+// SEC-BE (round-23 review): the re-bracketing decision is keyed on whether
+// url.Parse itself bracketed u.Host (strings.HasPrefix(u.Host, "[")), NOT on
+// whether Hostname() merely contains a ":". The two differ for a host that is
+// not actually an IP literal:
+//   - "https://foo:bar:80/api/x" is a malformed authority, not an IPv6
+//     literal — url.Parse never bracketed it (u.Host == "foo:bar:80"), but
+//     Hostname() still returns "foo:bar" (containing ":") because Go's
+//     host/port split treats the LAST colon as the port delimiter. The old
+//     `strings.Contains(host, ":")` check re-bracketed this into
+//     "[foo:bar]:80" — a string that does not re-parse as the same origin
+//     (CanonicalOrigin loses idempotency) and was never a legitimate host.
+//   - "https://[fe80::1%25eth0]/x" IS bracketed by url.Parse, but carries an
+//     IPv6 zone ID (link-local scope). Hostname() returns "fe80::1%eth0"; a
+//     "%" is not valid outside percent-encoding in a URL, so re-bracketing it
+//     verbatim produces a string ("https://[fe80::1%eth0]") that is not a
+//     valid URL and does not re-parse either.
+//
+// Both shapes fail closed (return "") rather than emit a value that cannot
+// re-parse: originOf's documented contract is that "" means "no usable
+// origin", which every caller here and in pkg/generate/rest already treats
+// as "skip this candidate" — never as "treat it as same-origin" — so this is
+// the safe direction for a shape this run cannot make sense of. A link-local
+// zone-id address is not a legitimate scan-target origin either. For a
+// genuine bracketed IPv6 literal (no zone ID), the check is a no-op: an IPv4
+// or DNS hostname is never bracketed by url.Parse in the first place.
 func originOf(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Host == "" {
 		return ""
 	}
 	scheme := strings.ToLower(u.Scheme)
+	bracketed := strings.HasPrefix(u.Host, "[")
 	host := strings.ToLower(u.Hostname())
+	// Two shapes cannot yield a valid origin, so both fail closed rather than
+	// fabricate a string that will not re-parse (see doc comment above):
+	// a bracketed literal carrying a zone ID, whose "%" is invalid in a URL,
+	// and a host containing ":" that url.Parse did NOT bracket, which is a
+	// malformed authority rather than an IP literal.
+	if (bracketed && strings.Contains(host, "%")) || (!bracketed && strings.Contains(host, ":")) {
+		return ""
+	}
+	if bracketed {
+		// Genuine bracketed IPv6 literal: put back the brackets Hostname()
+		// stripped, so the origin stays syntactically valid and distinguishable
+		// from a differently-bracketed spelling of a similar-looking literal.
+		host = "[" + host + "]"
+	}
 	port := u.Port()
 	if port == "" {
 		port = defaultPortForScheme(scheme)
@@ -638,6 +748,44 @@ func originOf(rawURL string) string {
 		return scheme + "://" + host
 	}
 	return scheme + "://" + host + ":" + port
+}
+
+// CanonicalOrigin returns the canonical "scheme://host[:port]" origin of
+// rawURL for both comparison and display, or "" if rawURL does not parse to
+// a usable http(s) origin with a host present (a host-less "absolute" URL
+// such as "https:/api/x" — a single slash after the scheme is not an
+// authority marker — is rejected here rather than producing a degenerate
+// "https://" origin). This also covers the two non-IP-literal host shapes
+// originOf fails closed on (SEC-BE, round-23 review): a malformed authority
+// like "foo:bar:80" and a bracketed IPv6 literal carrying a zone ID
+// ("[fe80::1%eth0]") — see originOf's doc comment for why.
+//
+// It shares originOf's lower-casing and default-port equivalence (so
+// "https://h" and "https://h:443" are the same origin), but — unlike
+// originOf, which always makes the port explicit — strips a default port
+// from the result, so the canonical form matches the conventional display
+// shape ("https://example.com", not "https://example.com:443").
+//
+// Exported so pkg/generate/rest (and any other origin-comparing consumer)
+// shares exactly one definition of "origin" with this package, mirroring why
+// [SameOrigin], [ResolveTargetOrigin], and [IsPrintableASCIIURL] are each
+// exported (LAB-4992 review): pkg/generate/rest previously carried its own
+// origin normalization (originFromURL + canonicalizeOrigin) that disagreed
+// with this one on host case-folding and default-port handling — a trusted
+// host spelled with an explicit ":443" or mixed case never string-equalled
+// the same host derived from an endpoint URL, letting a colliding
+// attacker-controlled origin win a tie-break that the trusted host should
+// have won.
+func CanonicalOrigin(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return ""
+	}
+	origin := originOf(rawURL)
+	if dp := defaultPortForScheme(strings.ToLower(u.Scheme)); dp != "" {
+		origin = strings.TrimSuffix(origin, ":"+dp)
+	}
+	return origin
 }
 
 // firstHTMLOrigin returns the origin of the first request whose response is
@@ -661,14 +809,80 @@ func firstHTMLOrigin(requests []ObservedRequest) string {
 	return ""
 }
 
+// ResolveTargetOrigin derives "the target origin" for a scan from an explicit
+// target URL and an observed request set, in priority order:
+//  1. explicit targetURL, if it parses to a usable origin;
+//  2. the origin of the first request whose RESPONSE is HTML (the real app
+//     page) — see firstHTMLOrigin;
+//  3. the origin of the first request with a non-empty URL.
+//
+// Returns "" if none of the above yields a usable origin.
+//
+// A non-empty targetURL that fails to canonicalize (step 1) does NOT fall
+// through to steps 2-3 (SEC-BE-001, LAB-4992 review): the request set may
+// contain synthetic static:js entries whose URLs are reconstructed from
+// bundle text (pipeline.Augment runs before the JS-replay hook), so falling
+// through would let a hostile bundle supply the origin that receives
+// --header credentials — silently rebinding a pinned target to one the
+// capture's own content chose. An explicitly pinned target that cannot be
+// honored must fail closed instead. The capture-derived fallback (steps 2-3)
+// remains correct and intended for the targetURL == "" case (e.g. `generate`
+// with no --target-url), where there is no pinned target to betray.
+//
+// Preferring the HTML page (step 2) over the plain first-request fallback
+// (step 3) matters for mixed-origin / imported captures (HAR/Burp) whose
+// first entry may be a third-party asset (CDN font, analytics beacon):
+// binding to that asset's origin would leave the app's same-origin bundles
+// looking cross-origin (LAB-3892 review). Single-origin crawl captures are
+// unaffected — their first entry is the HTML page anyway.
+//
+// Exported and shared (SEC-BE-001) so ReplayJSExtracted and the probe-stage
+// cross-origin gate in internal/pipeline agree on what "the target origin"
+// means for a given scan; two independent derivations would risk silently
+// diverging and reopening the cross-origin gap one of them is meant to close.
+func ResolveTargetOrigin(targetURL string, requests []ObservedRequest) string {
+	if targetURL != "" {
+		// Fail closed here rather than falling through — see doc comment.
+		return originOf(targetURL)
+	}
+	if origin := firstHTMLOrigin(requests); origin != "" {
+		return origin
+	}
+	for _, req := range requests {
+		if req.URL == "" {
+			continue
+		}
+		if origin := originOf(req.URL); origin != "" {
+			return origin
+		}
+	}
+	return ""
+}
+
 // isSameOrigin reports whether rawURL has the same origin as targetOrigin.
 // Both sides are normalized via originOf so default-port-vs-explicit-port
 // pairs (e.g., https://example.com and https://example.com:443) compare equal.
 func isSameOrigin(rawURL, targetOrigin string) bool {
-	if targetOrigin == "" {
-		return false
-	}
-	return originOf(rawURL) == originOf(targetOrigin)
+	// Delegates to the exported SameOrigin so this package has exactly one
+	// origin-comparison implementation (QUAL-002). The guards are equivalent:
+	// a "" targetOrigin yields originOf("") == "", which SameOrigin never
+	// reports equal because it first requires a non-empty left origin.
+	return SameOrigin(rawURL, targetOrigin)
+}
+
+// IsAbsoluteHTTPURL reports whether raw carries an http or https scheme,
+// case-insensitively. url.Parse lower-cases the scheme, so a bundle literal
+// spelled "HTTPS://host/x" is absolute to every downstream consumer; a
+// case-sensitive strings.HasPrefix check would classify it as relative and send
+// it down a path-resolution branch instead (QUAL-003). Shared with
+// pkg/analyze/jsstatic so the offline and active paths classify identically.
+//
+// This answers only "does it have an http(s) scheme". It is NOT a validity
+// check — callers that act on the URL must still run ValidateFullURL (embedded
+// credentials, empty host) and, before any request, ssrf.ValidateURL.
+func IsAbsoluteHTTPURL(raw string) bool {
+	lower := strings.ToLower(raw)
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
 }
 
 // sanitizeForLog escapes terminal control characters and other non-printable
@@ -681,6 +895,20 @@ func sanitizeForLog(s string) string {
 	// strconv.Quote escapes control chars, non-printable bytes, and quotes;
 	// it returns a Go-quoted string, which is safe to render verbatim.
 	return strconv.Quote(s)
+}
+
+// SanitizeForLog is the exported form of sanitizeForLog (SEC-BE-002,
+// LAB-4992): internal/pipeline's probe-stage cross-origin gate warnings
+// (probe_origin_gate.go) print attacker-influenced URLs/origins to the same
+// always-on operator-facing sink this package's own warnings use
+// (warnDerivedOrigin, the js-extract cross-origin skip warning), so they must
+// apply the identical sanitizer rather than growing a second, possibly
+// diverging implementation. The unexported sanitizeForLog remains the single
+// implementation; this is a thin exported entry point for cross-package
+// reuse, mirroring how SameOrigin/ResolveTargetOrigin/IsPrintableASCIIURL are
+// already exported from this file for the same reason.
+func SanitizeForLog(s string) string {
+	return sanitizeForLog(s)
 }
 
 // warnDerivedOrigin emits the interim origin-disclosure mitigation warning (see LAB-4998):
@@ -712,13 +940,24 @@ func copyHeaders(h map[string]string) map[string]string {
 	return out
 }
 
-// validateFullURL is a parse-time canonicalization that rejects URLs with
+// ValidateFullURL is a parse-time canonicalization that rejects URLs with
 // embedded credentials, non-http(s) schemes, or empty hosts. It returns the
 // canonicalized URL on success. SSRF screening (blocklist + DNS) is layered
 // separately at probe time via ssrf.ValidateURL — callers MUST run that
-// before issuing any request, since validateFullURL alone does not reject
+// before issuing any request, since ValidateFullURL alone does not reject
 // URLs whose Host is a private IP literal.
-func validateFullURL(raw string) (string, bool) {
+//
+// Exported for pkg/analyze/jsstatic (SEC-BE-001, LAB-4992): the fully-offline
+// concat extractor emits absolute reconstructions too, and it MUST apply the
+// same parse-time gate as this file's addPath. A host-only comparison is not
+// sufficient — net/url puts userinfo in u.User, not u.Host, so
+// `"https://".concat("u:p@<bundlehost>/api/x")` has a host that equals the
+// bundle's own and would otherwise pass. Because probe.Config.AuthHeaders is
+// never populated by any non-test caller, net/http would then always derive
+// `Authorization: Basic <base64(userinfo)>` from req.URL.User and send
+// attacker-chosen credentials to the target on the operator's behalf. Sharing
+// this function keeps the offline and active paths from drifting apart again.
+func ValidateFullURL(raw string) (string, bool) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "", false
@@ -1028,7 +1267,7 @@ func reconstructTemplateLiteral(segment []byte) (string, bool) {
 	// Trim non-path noise from each end. Template literals embed paths in
 	// expressions like ` + path + `; we want only the path-like core.
 	candidate = strings.TrimSpace(candidate)
-	if !strings.HasPrefix(candidate, "/") && !strings.HasPrefix(candidate, "http://") && !strings.HasPrefix(candidate, "https://") {
+	if !strings.HasPrefix(candidate, "/") && !IsAbsoluteHTTPURL(candidate) {
 		// Look for the first slash and trim before it.
 		if idx := strings.Index(candidate, "/"); idx > 0 {
 			candidate = candidate[idx:]
@@ -1071,33 +1310,8 @@ func extractConcatPaths(jsBody []byte) []string { //nolint:gocyclo // emit() sta
 		if len(paths) >= maxConcatPathsPerBundle {
 			return
 		}
-		// Collapse `//` runs introduced by literal+literal concatenations
-		// where the head literal ends in `/` and the next literal begins
-		// with `/` (e.g. `"/api/posts/" + "/comment"` → `"/api/posts//comment"`).
-		// addPath downstream only trims leading/trailing slashes, not
-		// internal runs, and the REST normalizer treats `//{id}` as a
-		// distinct (malformed) path segment.
-		//
-		// Preserve the `://` scheme separator in full URLs: collapse only
-		// the path-side of the URL (or the whole string if no scheme is
-		// present). Looping until stable handles rare ≥3-slash runs.
-		if scheme, rest, hasScheme := strings.Cut(p, "://"); hasScheme {
-			for strings.Contains(rest, "//") {
-				rest = strings.ReplaceAll(rest, "//", "/")
-			}
-			p = scheme + "://" + rest
-		} else {
-			for strings.Contains(p, "//") {
-				p = strings.ReplaceAll(p, "//", "/")
-			}
-		}
-		if p == "" || !hasAPIIndicator(p) {
-			return
-		}
-		if strings.ContainsAny(p, " \t\r\n") {
-			return
-		}
-		if seen[p] {
+		p = cleanConcatPath(p)
+		if p == "" || seen[p] {
 			return
 		}
 		seen[p] = true
@@ -1525,8 +1739,8 @@ func extractAPIPaths(jsBody []byte, requests []ObservedRequest) []string { //nol
 		// Full URLs are kept as-is (they include scheme+host) after a
 		// defense-in-depth validation pass that rejects credentials,
 		// non-http(s) schemes, and empty hosts.
-		if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
-			cleaned, ok := validateFullURL(raw)
+		if IsAbsoluteHTTPURL(raw) {
+			cleaned, ok := ValidateFullURL(raw)
 			if !ok {
 				return
 			}
@@ -1618,13 +1832,353 @@ func extractAPIPaths(jsBody []byte, requests []ObservedRequest) []string { //nol
 	// (LAB-1368). Reconstructed paths use a numeric sentinel for non-literal
 	// operands so the REST normalizer can parameterize them. Run last so the
 	// more-precise strategies above win the dedup race when both match.
-	// (Strategy 4 — literal+literal service-prefix concatenation — runs
+	// (Strategy 4 — literal+literal service-prefix concatenation — also runs
 	// implicitly above via extractServicePrefixes + addPath fan-out.)
 	for _, p := range extractConcatPaths(jsBody) {
 		addPath(p)
 	}
 
+	// Strategy 5b: literal service-prefix +-concat (LAB-4992). Shares
+	// servicePrefixPlusPaths with the fully-offline static path (via
+	// ExtractStaticConcatPaths) so both reconstruct the
+	// `"identity/" + "api/auth/login"` form identically; replay additionally
+	// probes and 404-filters the reconstructions. Without this the "share one
+	// extractor / reconstruct identically" contract held only for the offline
+	// path — extractConcatPaths above misses the literal+literal service-prefix
+	// head that servicePrefixPlusPaths recovers.
+	for _, p := range servicePrefixPlusPaths(jsBody) {
+		addPath(p)
+	}
+
 	return paths
+}
+
+// cleanConcatPath collapses `//` runs in a reconstructed concat path (preserving
+// a `://` scheme separator) and rejects the path — returning "" — when it is
+// empty, carries no API indicator, or contains whitespace. Shared by
+// extractConcatPaths' emit() and servicePrefixPlusPaths so both concat
+// reconstruction forms filter and canonicalize identically.
+//
+// `//` runs arise from literal+literal concatenations where the head literal
+// ends in `/` and the next literal begins with `/` (e.g. `"/api/posts/" +
+// "/comment"`). The REST normalizer treats `//{id}` as a distinct (malformed)
+// segment, so collapsing here keeps reconstructed paths well-formed. Looping
+// until stable handles rare >=3-slash runs.
+//
+// The `//`-collapse and `://` scheme detection operate only on the path portion:
+// a query string / fragment is split off first so a relative path whose query
+// carries an absolute URL (e.g. `"/api//proxy?url=https://x"`) is not mistaken
+// for a scheme-bearing URL, and `//` inside a query value is preserved.
+func cleanConcatPath(p string) string {
+	path, suffix := p, ""
+	if i := strings.IndexAny(p, "?#"); i >= 0 {
+		path, suffix = p[:i], p[i:]
+	}
+
+	if scheme, rest, hasScheme := strings.Cut(path, "://"); hasScheme {
+		for strings.Contains(rest, "//") {
+			rest = strings.ReplaceAll(rest, "//", "/")
+		}
+		path = scheme + "://" + rest
+	} else {
+		for strings.Contains(path, "//") {
+			path = strings.ReplaceAll(path, "//", "/")
+		}
+	}
+
+	// Trim trailing slashes so this extractor canonicalizes paths IDENTICALLY to
+	// addPath ("ensure leading slash, trim trailing slash"), which is the shared
+	// contract for every other extractor in this file (QUAL-002, LAB-4992).
+	// Previously only the leading slash was normalized downstream and no side
+	// trimmed here, so a reconstruction like `"/api/orders/" + id + "/"` emitted
+	// /api/orders/0/ while the active path's equivalent emitted /api/orders/0.
+	// Two consequences, both spec-visible:
+	//
+	//  1. NormalizePathWithNames splits and rejoins on '/', so the trailing empty
+	//     segment survives: the offline mirror produced the OpenAPI path
+	//     `/api/orders/{orderId}/` while the live js-extract entry for the same
+	//     reconstruction produced `/api/orders/{orderId}` — two distinct
+	//     groupEndpoints keys for one endpoint, and neither merged with a real
+	//     dynamic observation of GET /api/orders/5 (which normalizes unslashed).
+	//  2. reachedPathKey trims the trailing slash on BOTH sides, so a live probe
+	//     of the unslashed form superseded the correctly-slashed mirror. On a
+	//     trailing-slash-required API (Django/DRF, Flask strict_slashes) that
+	//     probe 404s, so the mirror was dropped and the endpoint lost outright.
+	//
+	// Canonicalizing here rather than at each emitter keeps the active and
+	// offline paths from drifting again, which is this change's design goal. The
+	// trim applies to the path portion only, so a trailing slash inside a query
+	// value is preserved (addPath trims the whole string; the difference only
+	// matters for query-bearing reconstructions, where trimming the path is the
+	// correct reading). A path that trims away entirely (e.g. "/") fails the
+	// hasAPIIndicator check below, as it did before.
+	path = strings.TrimRight(path, "/")
+	p = path + suffix
+
+	if p == "" || !hasAPIIndicator(p) {
+		return ""
+	}
+	// Enforce a strict ASCII ALLOW-list over the reconstruction (SEC-BE-002,
+	// third pass). This is the only extractor in this file that admits arbitrary
+	// bytes: parseConcatArgs / readChainOperand -> stringLiteralValue copy
+	// string-literal operand bytes VERBATIM with no character class, so whatever
+	// a hostile bundle puts inside a `.concat()` argument or `+`-chain operand
+	// lands here, and the ASCII `api/` elsewhere in the path still satisfies
+	// hasAPIIndicator. The sibling extractors (apiPathPattern,
+	// templateLiteralPattern, fullURLPattern, servicePrefixPattern) all already
+	// constrain their captures to an ASCII class, so an allow-list here brings
+	// this path in line with them rather than inventing a new policy.
+	//
+	// An allow-list replaced an enumerate-the-bad-categories block-list, which
+	// kept losing this race. The block-list's first form (`r == ' ' ||
+	// unicode.IsControl(r)`) let every rune above U+00FF through, because
+	// unicode.IsControl consults only the Latin-1 table — U+202A-U+202E bidi
+	// override, U+200B ZWSP, U+FEFF BOM, U+00A0 NBSP, U+3000. Widening it to
+	// Zs/Cc/Cf/Zl/Zp closed those but still admitted homoglyphs (Cyrillic а),
+	// fullwidth slash lookalikes (U+FF0F), combining marks (U+0301) and variation
+	// selectors (U+FE0F, category Mn — not Cf). Inverting the predicate closes the
+	// entire non-ASCII class at once and needs no width-1 utf8.RuneError special
+	// case, since every byte >= 0x80 simply is not in the set.
+	//
+	// The HTTP request path was never the exposure — net/url percent-encodes
+	// non-ASCII in EscapedPath(), so there is no request-splitting or
+	// header-injection vector. The sink is the operator-facing artifact: yaml.v3
+	// emits these bytes RAW into the generated OpenAPI path key, so a scanned site
+	// could make a spec path RENDER differently from the bytes it contains (RTL
+	// override, homoglyph) or hide segments behind zero-width runes —
+	// report/deliverable spoofing during an assessment.
+	//
+	// `?`, `=`, `&` and `#` are legal only in the query/fragment suffix, which is
+	// why the two portions are checked against different sets: a bare `?` inside
+	// what cleanConcatPath treats as the path would mean the split above did not
+	// happen, i.e. a malformed reconstruction.
+	if !allowedConcatBytes(path, false) || !allowedConcatBytes(suffix, true) {
+		return ""
+	}
+	return p
+}
+
+// allowedConcatBytes reports whether every byte of s is admissible, treating a
+// `%` as the start of a percent-escape that must be well-formed AND must decode
+// to a printable ASCII byte.
+//
+// The decode check is what closes the percent-encoding route around the
+// allow-list (SEC-BE-002, third pass). Permitting a bare `%` was not enough:
+// `/api/x%E2%80%AEy` passes a byte-wise allow-list unchanged, and the sink
+// DECODES — url.Parse populates u.Path with the raw bytes E2 80 AE, groupEndpoints
+// keys the OpenAPI path on u.Path, and yaml.v3's is_printable admits a 0xE2 lead
+// byte — so a U+202E right-to-left override reached the generated spec path key
+// raw, which is the exact deliverable-spoofing the allow-list was written to
+// prevent. Requiring the decoded byte to be printable ASCII (0x20-0x7E) rejects
+// every non-ASCII escape and every encoded control byte (%00, %0A, %7F) while
+// still admitting the encodings real APIs use (%20, %2F, %3D, %5B).
+func allowedConcatBytes(s string, inSuffix bool) bool {
+	return scanEscapedBytes(s, func(c byte) bool {
+		return isAllowedConcatByte(c, inSuffix)
+	})
+}
+
+// scanEscapedBytes walks s and reports whether every byte is admissible: a
+// literal byte must satisfy isLiteralByte, and a `%` must start a
+// well-formed percent-escape that decodes to printable ASCII (see
+// validPercentEscape) — the escape-handling half of the policy is identical
+// for every caller, so it lives here once rather than in each caller's own
+// loop (QUAL-002).
+//
+// isLiteralByte is where callers differ: allowedConcatBytes gates non-`%`
+// bytes through isAllowedConcatByte (parameterized on inSuffix via closure,
+// so that concat-specific concept never leaks into this shared loop), while
+// IsPrintableASCIIURL gates them with a direct 0x21-0x7E range check.
+func scanEscapedBytes(s string, isLiteralByte func(byte) bool) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '%' {
+			if !isLiteralByte(s[i]) {
+				return false
+			}
+			continue
+		}
+		if !validPercentEscape(s, i) {
+			return false
+		}
+		// Skip the two hex digits; the loop's own i++ accounts for the '%'.
+		i += 2
+	}
+	return true
+}
+
+// validPercentEscape reports whether the escape starting at s[i] (which must
+// be '%') is well-formed and decodes to printable ASCII (0x20-0x7E). It
+// reports false when the escape is truncated ("/api/x%", "/api/x%E"),
+// contains a non-hex digit, or decodes to anything other than printable
+// ASCII.
+//
+// The printable-ASCII requirement is the load-bearing part (SEC-BE-002): a
+// byte-wise allow-list that merely permits `%` is trivially routed around,
+// because the sink DECODES. url.Parse populates u.Path with the decoded bytes,
+// groupEndpoints keys the OpenAPI path on u.Path, and yaml.v3 emits a 0xE2 lead
+// byte raw — so `/api/x%E2%80%AEy` delivered a U+202E right-to-left override into
+// the generated spec path key. Rejecting non-printable decodes also covers
+// encoded controls (%00, %0A, %7F) in one predicate.
+//
+// Uses encoding/hex rather than a hand-rolled digit decoder so the accepted digit
+// set (both cases, exactly [0-9A-Fa-f]) is the standard library's rather than
+// something this file has to get right and keep right.
+func validPercentEscape(s string, i int) bool {
+	if i+2 >= len(s) {
+		return false
+	}
+	buf, err := hex.DecodeString(s[i+1 : i+3])
+	if err != nil {
+		return false
+	}
+	if buf[0] < 0x20 || buf[0] > 0x7E {
+		return false
+	}
+	return true
+}
+
+// IsPrintableASCIIURL reports whether raw is safe to place in an operator-facing
+// artifact: every literal byte is printable, non-space ASCII, and every
+// percent-escape decodes to printable ASCII.
+//
+// Exported so pkg/analyze/jsstatic can apply ONE byte policy to every producer at
+// its synthesis choke point (SEC-BE-002). Previously the policy lived only in
+// cleanConcatPath, which guards the concat/service-prefix reconstruction — so the
+// jsluice AST-literal producer, whose only filter (filterURL) checks schemes and
+// asset extensions, had no charset check at all. That mattered because classify
+// Rule 7 floors EVERY IsJSStaticSource candidate to the default --confidence, so
+// AST literals that previously died at 0.15 now survive: `fetch("/api/v1/<U+202E>nimda")`
+// reached the generated OpenAPI path key with the override intact, and the
+// absolute variant put a raw-bidi host in the spec's servers list and info.title.
+// pkg/generate/rest applies no printable-ASCII filter of its own.
+//
+// Space is excluded deliberately (0x21 lower bound): a literal space cannot occur
+// in a URL that survived extraction, so admitting one would only widen the set
+// for no gain. A percent-ENCODED space (%20) is still accepted, since that is how
+// real APIs spell it.
+//
+// Tradeoff, accepted and documented: a genuinely internationalized host or path
+// spelled in raw UTF-8 (an IDN like https://münchen.example/api) is rejected
+// rather than percent-encoded. That matches what cleanConcatPath has always done
+// to the concat path, keeps one policy across producers, and costs recall only for
+// non-ASCII APIs, which this extractor was never able to reconstruct reliably
+// anyway.
+func IsPrintableASCIIURL(raw string) bool {
+	return scanEscapedBytes(raw, func(c byte) bool {
+		return c >= 0x21 && c <= 0x7E
+	})
+}
+
+// isAllowedConcatByte reports whether c may appear literally in a reconstructed
+// candidate path. ASCII-only by construction: every byte >= 0x80 falls through to
+// false, so no raw non-ASCII rune can reach a generated spec path key
+// (SEC-BE-002). inSuffix admits the query/fragment delimiters, which would mean a
+// malformed reconstruction if they appeared in the path portion.
+//
+// `%` is deliberately NOT handled here — allowedConcatBytes intercepts it first so
+// the escape can be validated as a unit.
+func isAllowedConcatByte(c byte, inSuffix bool) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	}
+	switch c {
+	// Structural and RFC 3986 sub-delims / unreserved punctuation that
+	// legitimately appear in API paths, plus `{}` for the {param} placeholders the
+	// REST normalizer emits.
+	case '/', '_', '-', '.', ':', '{', '}', '~', '@', '!', '$', '\'', '(', ')', '*', '+', ',', ';':
+		return true
+	// QUAL-004: brackets and the pipe are gen-delims/unreserved-in-practice that
+	// real APIs use heavily in query syntax — `?filter[status]=open` (JSON:API and
+	// PHP-style array params) and `?q=a|b`. The first allow-list omitted them, so
+	// those endpoints were silently dropped, which is a recall regression rather
+	// than a security gain: both are plain ASCII and cannot spoof a rendered path.
+	// Admitted in the path portion too, since the pre-allow-list block-list
+	// accepted them there and nothing about a path makes them dangerous.
+	case '[', ']', '|':
+		return true
+	case '?', '=', '&', '#':
+		return inSuffix
+	}
+	return false
+}
+
+// servicePrefixPlusHeadPattern matches the head of a `+`-concat chain whose
+// first operand is a quoted service-prefix literal — a short slash-terminated
+// segment that does NOT itself have to contain an API indicator (e.g.
+// "identity/", "svc/"). It is the service-prefix analog of
+// concatPlusHeadPattern, which requires the head to contain an API indicator
+// and therefore misses the literal+literal service-prefix form
+// `"identity/" + "api/auth/login"`.
+//
+// The head must start with a letter (no leading slash) so this pattern does not
+// re-match the leading-slash heads already handled by concatPlusHeadPattern.
+// cleanConcatPath's hasAPIIndicator post-filter drops any assembled chain that
+// never reaches an API path, so a bare `"assets/" + x` produces nothing.
+var servicePrefixPlusHeadPattern = regexp.MustCompile(
+	`["']([a-zA-Z][a-zA-Z0-9_-]{0,30}/)["']\s*\+`,
+)
+
+// servicePrefixPlusPaths reconstructs concrete `+`-concat chains whose head is a
+// service-prefix literal (`"identity/" + "api/auth/login"` -> identity/api/auth/login,
+// `"identity/" + id + "/api/x"` -> identity/0/api/x). It reuses parsePlusChain
+// for the tail walk (same numeric sentinel for non-literal operands) and
+// cleanConcatPath for the API-indicator filter, so it reconstructs identically
+// to the other concat forms. Bounded by maxConcatPathsPerBundle.
+func servicePrefixPlusPaths(jsBody []byte) []string {
+	var paths []string
+	seen := make(map[string]bool)
+	for _, match := range servicePrefixPlusHeadPattern.FindAllSubmatchIndex(jsBody, -1) {
+		if len(paths) >= maxConcatPathsPerBundle {
+			break
+		}
+		if len(match) < 4 || match[2] < 0 {
+			continue
+		}
+		head := string(jsBody[match[2]:match[3]])
+		suffix := parsePlusChain(jsBody, match[1])
+		p := cleanConcatPath(head + suffix)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		paths = append(paths, p)
+	}
+	return paths
+}
+
+// ExtractStaticConcatPaths reconstructs API paths built by JS string
+// concatenation from a single JS bundle body, using only network-free logic:
+// String.prototype.concat, `+`-operator chains, and literal service-prefix
+// `+`-concatenation. Non-literal operands are replaced with the numeric sentinel
+// ("0") so the reconstructed path stays parameterizable by the REST normalizer.
+//
+// It is the offline-safe entry point shared with pkg/analyze/jsstatic (LAB-4992)
+// so the fully-offline static analyzer reconstructs concat / service-prefix SPA
+// endpoints identically to the active ReplayJSExtracted path — which additionally
+// re-fetches the bundles and probes the reconstructed paths. Unlike the active
+// extractAPIPaths, it deliberately does NOT perform speculative service-prefix
+// fan-out (combining a discovered prefix with every bare path): those
+// combinations are only safe when probed and 404-filtered, which the offline
+// path cannot do. Returns raw reconstructions (deduped); the caller adds the
+// leading slash and resolves relative paths.
+func ExtractStaticConcatPaths(jsBody []byte) []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(p string) {
+		if p == "" || seen[p] {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	for _, p := range extractConcatPaths(jsBody) {
+		add(p)
+	}
+	for _, p := range servicePrefixPlusPaths(jsBody) {
+		add(p)
+	}
+	return out
 }
 
 // --- Main pipeline ---
@@ -1654,28 +2208,10 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		fmt.Fprintf(cfg.Stderr, format, args...) //nolint:errcheck // operator-facing warning
 	}
 
-	// Determine the target origin. Priority: explicit cfg.TargetURL, then the
-	// origin of the first request whose RESPONSE is HTML (the real app page),
-	// then the first non-empty request URL. Preferring the HTML page matters for
-	// mixed-origin / imported captures (HAR/Burp) whose first entry may be a
-	// third-party asset (CDN font, analytics beacon): binding replay to that
-	// asset's origin leaves the app's same-origin bundles cross-origin and skips
-	// them entirely (LAB-3892 review). Single-origin crawl captures are
-	// unaffected — their first entry is the HTML page anyway.
-	targetOrigin := originOf(cfg.TargetURL)
-	if targetOrigin == "" {
-		targetOrigin = firstHTMLOrigin(requests)
-	}
-	if targetOrigin == "" {
-		for _, req := range requests {
-			if req.URL != "" {
-				targetOrigin = originOf(req.URL)
-				if targetOrigin != "" {
-					break
-				}
-			}
-		}
-	}
+	// Determine the target origin. See ResolveTargetOrigin for the priority
+	// order and rationale (explicit cfg.TargetURL, then the HTML page's
+	// origin, then the first non-empty request URL).
+	targetOrigin := ResolveTargetOrigin(cfg.TargetURL, requests)
 	if targetOrigin == "" {
 		return requests
 	}
@@ -1805,6 +2341,49 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 	result := make([]ObservedRequest, len(requests))
 	copy(result, requests)
 
+	// refuted records the reachedPathKey of every full URL the target answered
+	// 404 for. Those paths — and ONLY those — have a dispositive negative
+	// verdict, so supersedeConcatMirrors drops their passive offline concat
+	// mirror after the loop; see its doc comment for what survives a non-404 and
+	// why, and reachedPathKey's for why the key is path-only, not origin+path.
+	//
+	// QUAL-004: this set was previously populated for ANY answered status, which
+	// made live replay SUBTRACTIVE — supplying a reachable --target-url produced
+	// STRICTLY LESS output than running fully offline, inverting the feature on
+	// exactly the deployment shape JS-replay exists for. probeURL returns a
+	// non-nil *ObservedResponse for every completed exchange regardless of status
+	// or content type, so a 200 text/html SPA catch-all (nginx try_files), a 204,
+	// an HTML-bodied 401/403, or a 302 -> /login all deleted the mirror; and the
+	// replacement appended below carries Source "js-extract", which
+	// crawl.IsJSStaticSource does NOT match, so classify Rule 7's
+	// StaticJSConfidence floor never applies to it — it scores only Rule 3's 0.15
+	// and is dropped at the 0.5 default threshold. Measured end-to-end, the spec
+	// went from one path to zero. Restricting the set to 404 keeps the decoy
+	// filter this exists for while making replay purely additive.
+	//
+	// SEC-BE-004: a 404 is the best available signal, but it is NOT proof of
+	// absence. Returning 404 rather than 401/403 for an unauthorized-but-real
+	// resource is a widespread anti-enumeration convention, and doRequest's
+	// fixed User-Agent lets a hostile target fingerprint this scanner and 404
+	// everything to hide its API surface. So an unauthenticated run can drop a
+	// real endpoint here.
+	//
+	// That ambiguity is NOT resolvable by probing. A control probe of a random
+	// nonexistent path was implemented and reverted: a correctly-behaving
+	// server 404s such a path precisely BECAUSE it does not exist, so the
+	// control response is identical for an honest server and for an
+	// anti-enumeration one — it misclassified every normal target (caught by
+	// the concat-spa live test, whose mux 404s unknown paths) while giving no
+	// signal at all for the case it was written to detect. Distinguishing
+	// "absent" from "unauthorized" requires credentials, not another request.
+	//
+	// What is done instead: the drop is ANNOUNCED. Each dropped path is named
+	// on Warnings with the two remedies (--header, --probe=false), so the loss
+	// is visible and recoverable rather than silent. Do not reintroduce a
+	// probe-based gate here without a signal that actually separates the two
+	// cases.
+	refuted := make(map[string]bool)
+
 	probed := 0
 	for _, path := range sortedPaths {
 		if probed >= cfg.MaxEndpoints {
@@ -1814,7 +2393,13 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		// Full URLs are probed as-is; relative paths are resolved against
 		// the target origin.
 		fullURL := path
-		if !strings.HasPrefix(path, "http://") && !strings.HasPrefix(path, "https://") {
+		// Defense-in-depth only: IsAbsoluteHTTPURL is case-insensitive, but nothing
+		// reaches here with a mixed-case scheme today because fullURLPattern (and the
+		// other extraction regexes) require a lowercase `https?://`, so such a literal
+		// is never extracted. Kept case-insensitive anyway so this branch stays correct
+		// if extraction is ever widened — but it is NOT unit-tested for that input,
+		// because a test would be vacuous (see TestIsAbsoluteHTTPURLCallSites).
+		if !IsAbsoluteHTTPURL(path) {
 			fullURL = targetOrigin + path
 		}
 
@@ -1858,12 +2443,25 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		if resp == nil {
 			continue
 		}
-
 		// Skip 404 responses — these are typically wrong service prefix
 		// combinations (e.g., /identity/api/shop/products when the correct
 		// prefix is /workshop/). Keeping them would pollute the spec with
 		// endpoints that don't actually exist on that service.
+		//
+		// A 404 is also the only DISPOSITIVE verdict, so it is the only status
+		// that refutes the offline concat mirror for this path (QUAL-004 — see
+		// refuted's doc comment above).
+		//
+		// SEC-BE-004: the drop is announced on Warnings rather than performed
+		// silently, because a 404 cannot be trusted absolutely — see refuted's
+		// doc comment for why no probe can separate "absent" from
+		// "unauthorized". Naming each dropped path is what lets an operator
+		// notice the loss and re-run with --header or --probe=false.
 		if resp.StatusCode == http.StatusNotFound {
+			refuted[reachedPathKey(fullURL)] = true
+			warnf("js-extract: %s answered 404; dropping its offline js-concat mirror "+
+				"(re-run with --header if this endpoint is auth-gated, or --probe=false to keep every offline candidate)\n",
+				sanitizeForLog(fullURL))
 			continue
 		}
 
@@ -1891,7 +2489,76 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 			probed, len(sortedPaths))
 	}
 
-	return result
+	return supersedeConcatMirrors(result, refuted)
+}
+
+// supersedeConcatMirrors drops the passive offline concat mirror
+// (SourceStaticJSConcat, emitted by pkg/analyze/jsstatic) for every path the
+// live probe REFUTED with a 404, so a decoy the target 404s does not leak back
+// into the spec via the mirror. Candidates for paths that were never probed, or
+// that answered with any non-404 status, are left untouched — the offline
+// fallback (LAB-4992 AC1) and the additive-replay guarantee (QUAL-004)
+// respectively. Matching is host-agnostic (path-only, QUAL-001): the mirror is
+// dropped whether or not the bundle it was reconstructed against shares a host
+// with the probe target.
+//
+// Only SourceStaticJSConcat is superseded. Plain SourceStaticJS and
+// SourceStaticJSSourcemap mirrors survive a 404 deliberately: an AST literal is
+// recovered from a real call site in the bundle, so a 404 there is more likely
+// auth/param-gated than a wrong-guess decoy, unlike an unvalidated combinatorial
+// reconstruction. pkg/classify/rest.go's staticJSFloor documents the same
+// asymmetry from the classifier side; TestReplayJSExtracted_KeepsNonConcatMirrorsForRefutedPaths
+// pins it. Do not widen this predicate to crawl.IsJSStaticSource without
+// revisiting that reasoning.
+//
+// Residual limitation: paths beyond cfg.MaxEndpoints are never probed, so they
+// never enter refuted and their offline mirror is retained — a decoy past the cap
+// can still surface. This matches the pre-existing MaxEndpoints truncation
+// semantics and is bounded by that cap.
+//
+// Extracted from ReplayJSExtracted (QUAL-004) so probe I/O and result filtering
+// are separable and independently testable.
+func supersedeConcatMirrors(result []ObservedRequest, refuted map[string]bool) []ObservedRequest {
+	if len(refuted) == 0 {
+		return result
+	}
+	filtered := result[:0]
+	for _, r := range result {
+		if r.Source == SourceStaticJSConcat && refuted[reachedPathKey(r.URL)] {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	return filtered
+}
+
+// reachedPathKey normalizes rawURL to a path-only key so the live-probe
+// reached-set matches the offline concat mirror regardless of which origin
+// each side resolved the URL against (LAB-4992 QUAL-001). jsstatic resolves
+// the mirror URL against the bundle/capture origin — which may be a CDN
+// hosting the JS, or differ from an operator-pinned --target-url — while
+// JS-replay always builds its probe URL from the target origin. Keying on
+// origin+path (the previous approach) silently no-ops the mirror-drop
+// whenever those origins differ, re-opening the 404-decoy leak; matching on
+// path alone (trailing slash trimmed, consistent with the rest of this
+// file's normalization) drops the mirror host-agnostically.
+//
+// Unparseable URLs and URLs with no path component fall back to the raw
+// string so a malformed input degrades to an exact (narrower, still safe)
+// match rather than silently colliding with every other empty-path URL.
+func reachedPathKey(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	path := u.EscapedPath()
+	if path == "" {
+		return rawURL
+	}
+	if path != "/" {
+		path = strings.TrimRight(path, "/")
+	}
+	return path
 }
 
 // --- HTTP helpers ---

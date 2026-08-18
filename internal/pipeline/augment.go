@@ -21,6 +21,7 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/analyze"
 	"github.com/praetorian-inc/vespasian/pkg/analyze/jsstatic"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 )
 
 // AugmentOptions configures Augment.
@@ -36,6 +37,11 @@ type AugmentOptions struct {
 	// AllowPrivate disables SSRF protection during JS-static sourcemap fetching
 	// (allow private/internal IPs).
 	AllowPrivate bool
+
+	// Proxy routes JS-static sourcemap fetches through an intercepting proxy when
+	// set. Forwarded to jsstatic.Options.Proxy, which honors it only on the
+	// default (nil-HTTPClient) path — the production path.
+	Proxy httpx.ProxyConfig
 
 	// Status is an optional io.Writer for the verbose js-static stats line.
 	// Pass nil to suppress.
@@ -94,6 +100,7 @@ func AnalyzeJS(ctx context.Context, requests []crawl.ObservedRequest, opts Augme
 	res, err := jsstatic.Analyze(ctx, requests, jsstatic.Options{
 		FetchSourcemaps: opts.FetchSourcemaps,
 		AllowPrivate:    opts.AllowPrivate,
+		Proxy:           opts.Proxy,
 	})
 	if err != nil {
 		writeStatus(opts.WarnError, "warning: js-static analysis failed: %v\n", err)
