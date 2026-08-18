@@ -961,7 +961,7 @@ PAST_PREREQS_MARKER="STUB-REACHED-BUILD-PHASE"
 # check_prerequisites exits 1 on ANY failed prerequisite, not just the browser
 # gate — go, python3 too. The marker and the "Prerequisites check failed"
 # epilogue are therefore only readable as browser-gate signals on a host that
-# has go and python3 (this suite's own README/CLAUDE.md claim that guard
+# has go and python3 (this suite's own README/AGENTS.md claim that guard
 # scripts "need no Go, Node, or Chrome" is about running the SUITE, not about
 # what a non-fatal gate needs downstream of it in main()). Without this guard
 # a python3-less host would see the browser gate behave correctly yet still

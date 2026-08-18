@@ -186,6 +186,8 @@ if [ -n "$_vespasian_from_env" ]; then
 fi
 # shellcheck source=validate.sh
 source "${SCRIPT_DIR}/validate.sh"
+# shellcheck source=form-spec-asserts.sh
+source "${SCRIPT_DIR}/form-spec-asserts.sh"
 
 # ──────────────────────────────────────────────────────────────
 # Config loading
@@ -522,14 +524,60 @@ test_rest_api() {
         failures=$((failures + 1))
     fi
 
-    # NOTE: No exact spec comparison here — the live crawl is non-deterministic,
-    # so the generated spec varies between runs. Exact spec comparison is done in
-    # test_generate_rest which uses a fixed import as input.
+    # ExtractForms did more than surface the path: assert /api/subscribe carries
+    # a POST operation and NO GET (assert_post_get_operations walks the spec per
+    # exact path key), and that the form's urlencoded body fields (email, name)
+    # surface as request-body schema properties UNDER THAT ENDPOINT
+    # (assert_form_body_fields). Without these, the fixture's POST-method + body
+    # -field expectations for /api/subscribe were inert (PR #187 review finding
+    # TEST-006). These are the same helpers forms-target uses; $expected already
+    # points at rest-api/expected-paths.json, which now carries post_form_paths
+    # and post_form_body_fields_by_path for /api/subscribe.
+    #
+    # GET-absence rationale here differs from forms-target: rest-api/main.go
+    # registers no /api/subscribe handler, so the catch-all mux serves the
+    # crawler's GET probe as 200 text/html (the index page), NOT a 404. The GET
+    # stays out of the spec via non-API/HTML content-type classification, not via
+    # a 404/confidence filter (PR #208 review finding TEST-002).
+    if ! assert_post_get_operations "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+    if ! assert_form_body_fields "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+
+    # TEST-001 (PR #208): lock the per-path method sets this fixture declares.
+    # expected-paths.json intentionally lists /api/login and /api/upload as
+    # GET-only here (two-stage crawl + generate --probe=false: no JS runs, the
+    # inline fetch POST literals are recovered statically as GET candidates); a
+    # regression that emitted POST for either would silently diverge the fixture
+    # from reality. Also locks every resource path GET-only and /api/subscribe
+    # POST-only. Compared over the {get,post} universe the fixtures track.
+    if ! assert_path_methods "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+
+    # NOTE: No exact spec *text* comparison here — the live crawl is
+    # non-deterministic, so the generated spec's serialization (parameter
+    # naming, ordering) varies between runs. Exact spec-text comparison is done
+    # in test_generate_rest, which uses a fixed import as input. The path COUNT
+    # is deterministic (same recovered set as scan-rest) and IS asserted below
+    # (TEST-004).
 
     local endpoint_count
     endpoint_count=$(count_spec_endpoints "$spec_file")
     local expected_count
     expected_count=$(json_field "$expected" total_paths)
+
+    # Exact-count: validate_path_coverage only detects MISSING paths, and the
+    # two-stage crawl+generate path recovers the same set as the single-stage
+    # scan (see the fixtures' lockstep note), so — exactly as test_scan_rest
+    # already does against the same server — a regression that emitted the
+    # expected paths plus spurious ones must not report PASS with a mismatched
+    # pair of numbers in the summary (PR #187 review finding TEST-004).
+    if ! assert_exact_path_count "rest-api" "$endpoint_count" "$expected_count"; then
+        failures=$((failures + 1))
+    fi
 
     local duration=$((SECONDS - start))
     if [ $failures -eq 0 ]; then
@@ -608,6 +656,31 @@ test_scan_rest() {
         failures=$((failures + 1))
     fi
 
+    # As with test_rest_api (TEST-006): prove ExtractForms produced a POST-only
+    # /api/subscribe operation with its urlencoded body fields (email, name)
+    # attached to that endpoint, not merely that the path string appears.
+    # $expected here points at rest-api/scan-expected-paths.json (kept in
+    # lockstep with expected-paths.json).
+    #
+    # As in test_rest_api, GET-absence here is enforced by non-API/HTML
+    # classification — the unrouted /api/subscribe is served 200 text/html by the
+    # catch-all mux, NOT a 404 (PR #208 review finding TEST-002).
+    if ! assert_post_get_operations "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+    if ! assert_form_body_fields "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+
+    # TEST-001 (PR #208): the scan counterpart. scan-expected-paths.json lists
+    # /api/login and /api/upload as GET+POST here (single-stage headless scan: JS
+    # fires the POSTs and probing observes them), diverging from the two-stage
+    # fixture on exactly those two paths. Locking both sides makes the
+    # two-stage-vs-scan classification a tested invariant, not a silent claim.
+    if ! assert_path_methods "$spec_file" "$expected"; then
+        failures=$((failures + 1))
+    fi
+
     local endpoint_count
     endpoint_count=$(count_spec_endpoints "$spec_file")
     local expected_count
@@ -617,8 +690,7 @@ test_scan_rest() {
     # this a scan regression that emitted the expected paths plus spurious ones
     # would report PASS with a mismatched pair of numbers in the summary
     # (PR #187 review finding TEST-002).
-    if [ "$endpoint_count" != "$expected_count" ]; then
-        log_fail "scan-rest: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
+    if ! assert_exact_path_count "scan-rest" "$endpoint_count" "$expected_count"; then
         failures=$((failures + 1))
     fi
 
@@ -674,8 +746,7 @@ validate_concat_spec() {
 
     # Exact-count: any path beyond the two concat endpoints means a receiver
     # literal or the control leaked through the 404 filter.
-    if [ "$endpoint_count" != "$expected_count" ]; then
-        log_fail "${test_name}: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
+    if ! assert_exact_path_count "${test_name}" "$endpoint_count" "$expected_count"; then
         failures=$((failures + 1))
     fi
 
@@ -960,323 +1031,6 @@ PYEOF
     return 0
 }
 
-# assert_form_body_fields verifies each urlencoded POST <form>'s input names
-# surface as request-body schema properties UNDER THAT FORM'S OWN ENDPOINT. It
-# reads post_form_body_fields_by_path {path: [fields...]} from
-# expected-paths.json, resolves each path's POST requestBody schema (a $ref into
-# components/schemas, or an inline properties block) and asserts every expected
-# field is a property of THAT schema. This closes the false-pass gap of the
-# previous whole-file `grep "^<indent><field>:"`: a field attributed to the
-# wrong operation (e.g. all names collapsing onto one path), or masked by a
-# same-named property shared across forms (username/password in both login and
-# register), or matched from an unrelated schema property, no longer satisfies
-# the check. multipart (/api/feedback) has no inferred body schema and is
-# intentionally absent from the map.
-# Usage: assert_form_body_fields <spec.yaml> <expected-paths.json>
-assert_form_body_fields() {
-    local spec=$1 expected=$2
-    local result rc=0
-    result=$(python3 - "$spec" "$expected" << 'PYEOF'
-import sys, json, re
-
-# Scoped POST-form body-field check. argv[1]=spec.yaml argv[2]=expected-paths.json.
-spec_file = sys.argv[1]
-expected_json = sys.argv[2]
-
-with open(expected_json) as f:
-    exp = json.load(f)
-by_path = exp["post_form_body_fields_by_path"]
-
-with open(spec_file) as f:
-    lines = f.read().split("\n")
-
-
-def ind(s):
-    return len(s) - len(s.lstrip(" "))
-
-
-def section_block(name_regex, start=0, end=None):
-    if end is None:
-        end = len(lines)
-    for i in range(start, end):
-        if re.match(name_regex, lines[i]):
-            base = ind(lines[i])
-            b_end = end
-            for j in range(i + 1, end):
-                if lines[j].strip() and ind(lines[j]) <= base:
-                    b_end = j
-                    break
-            return i, base, lines[i + 1:b_end]
-    return None, None, None
-
-
-def find_path_block(path):
-    in_paths = False
-    paths_indent = None
-    for i, line in enumerate(lines):
-        st = line.rstrip()
-        if re.match(r"^paths:\s*$", st):
-            in_paths = True
-            continue
-        if in_paths:
-            if st and not st[0].isspace():
-                break
-            m = re.match(r'^(\s+)(?:"(/[^"]*)"|\'(/[^\']*)\'|(/[^:"\']*)):\s*$', st)
-            if m:
-                k_indent = len(m.group(1))
-                if paths_indent is None:
-                    paths_indent = k_indent
-                if k_indent == paths_indent:
-                    key = m.group(2) or m.group(3) or m.group(4)
-                    if key == path:
-                        p_end = len(lines)
-                        for j in range(i + 1, len(lines)):
-                            if lines[j].strip() and ind(lines[j]) <= k_indent:
-                                p_end = j
-                                break
-                        return lines[i + 1:p_end]
-    return None
-
-
-def schema_properties(schema_name):
-    ci = None
-    for i, line in enumerate(lines):
-        if re.match(r"^components:\s*$", line):
-            ci = i
-            break
-    if ci is None:
-        return None
-    _, _, sblock = section_block(r'^\s+%s:\s*$' % re.escape(schema_name), start=ci)
-    if sblock is None:
-        return None
-    props = []
-    in_props = False
-    props_indent = None
-    child_indent = None
-    for line in sblock:
-        if re.match(r"^\s+properties:\s*$", line):
-            in_props = True
-            props_indent = ind(line)
-            continue
-        if in_props:
-            if line.strip() and ind(line) <= props_indent:
-                break
-            m = re.match(r"^(\s+)([A-Za-z0-9_.$-]+):\s*$", line)
-            if m:
-                lvl = len(m.group(1))
-                if child_indent is None:
-                    child_indent = lvl
-                if lvl == child_indent:
-                    props.append(m.group(2))
-    return props
-
-
-def body_fields_for_path(path):
-    pblock = find_path_block(path)
-    if pblock is None:
-        return None, None, "path not found"
-    post_start = None
-    post_indent = None
-    for k, line in enumerate(pblock):
-        if re.match(r"^\s+post:\s*$", line):
-            post_start = k
-            post_indent = ind(line)
-            break
-    if post_start is None:
-        return None, None, "no POST operation"
-    p_end = len(pblock)
-    for j in range(post_start + 1, len(pblock)):
-        if pblock[j].strip() and ind(pblock[j]) <= post_indent:
-            p_end = j
-            break
-    postblock = pblock[post_start + 1:p_end]
-    rb_start = None
-    rb_indent = None
-    for k, line in enumerate(postblock):
-        if re.match(r"^\s+requestBody:\s*$", line):
-            rb_start = k
-            rb_indent = ind(line)
-            break
-    if rb_start is None:
-        return None, None, "no requestBody"
-    r_end = len(postblock)
-    for j in range(rb_start + 1, len(postblock)):
-        if postblock[j].strip() and ind(postblock[j]) <= rb_indent:
-            r_end = j
-            break
-    rbblock = postblock[rb_start + 1:r_end]
-    for line in rbblock:
-        m = re.search(r"\$ref:\s*'?#/components/schemas/([A-Za-z0-9_.-]+)'?", line)
-        if m:
-            props = schema_properties(m.group(1))
-            if props is None:
-                return None, None, "schema %s not found" % m.group(1)
-            return set(props), "ref:" + m.group(1), None
-    in_props = False
-    props_indent = None
-    child_indent = None
-    props = []
-    for line in rbblock:
-        if re.match(r"^\s+properties:\s*$", line):
-            in_props = True
-            props_indent = ind(line)
-            continue
-        if in_props:
-            if line.strip() and ind(line) <= props_indent:
-                break
-            m = re.match(r"^(\s+)([A-Za-z0-9_.$-]+):\s*$", line)
-            if m:
-                lvl = len(m.group(1))
-                if child_indent is None:
-                    child_indent = lvl
-                if lvl == child_indent:
-                    props.append(m.group(2))
-    if props:
-        return set(props), "inline:" + path, None
-    return None, None, "no request-body schema properties"
-
-
-failures = 0
-schema_by_path = {}
-for path in sorted(by_path):
-    fields = by_path[path]
-    got, schema_id, err = body_fields_for_path(path)
-    if got is None:
-        sys.stderr.write("  detail: %s: %s\n" % (path, err))
-        failures += 1
-        continue
-    schema_by_path[path] = schema_id
-    missing = [f for f in fields if f not in got]
-    if missing:
-        sys.stderr.write("  detail: %s request-body missing field(s): %s (found: %s)\n"
-                         % (path, ", ".join(missing), ", ".join(sorted(got))))
-        failures += 1
-
-# Distinctness guard (TEST-002a): each POST form must resolve to its OWN
-# request-body schema. A shared/union $ref referenced by more than one path could
-# mask per-endpoint field loss for names common to both forms (username/password),
-# so two paths resolving to the same schema identity is a failure.
-seen = {}
-for path in sorted(schema_by_path):
-    sid = schema_by_path[path]
-    if sid in seen:
-        sys.stderr.write("  detail: %s and %s share request-body schema '%s' (schemas must be distinct per endpoint)\n"
-                         % (seen[sid], path, sid))
-        failures += 1
-    else:
-        seen[sid] = path
-
-if failures:
-    print("POST-form body fields: %d issue(s) - missing field(s) or a request-body schema shared across endpoints" % failures)
-    sys.exit(1)
-print("POST-form body fields: every form's input names present under its own distinct request-body schema")
-sys.exit(0)
-PYEOF
-    ) || rc=$?
-    if [ "$rc" -ne 0 ]; then
-        log_fail "${result:-POST-form body fields: check failed}"
-        return 1
-    fi
-    log_ok "${result}"
-    return 0
-}
-
-# assert_post_get_operations verifies, for each POST-only form action, that the
-# generated spec has a POST operation AND no GET operation UNDER THAT EXACT PATH
-# (scoped to the path block, not a whole-file summary grep). The GET-absence half
-# is load-bearing for the "must NOT appear" contract: the crawler's GET probes of
-# the POST form actions 404 and are filtered at the default 0.5 confidence, so a
-# 404/confidence-filter regression would surface as a GET operation on a POST-only
-# action. Reads post_form_paths from expected-paths.json.
-# Usage: assert_post_get_operations <spec.yaml> <expected-paths.json>
-assert_post_get_operations() {
-    local spec=$1 expected=$2
-    local result rc=0
-    result=$(python3 - "$spec" "$expected" << 'PYEOF'
-import sys, json, re
-
-spec_file = sys.argv[1]
-expected_json = sys.argv[2]
-
-with open(expected_json) as f:
-    exp = json.load(f)
-paths = exp["post_form_paths"]
-
-with open(spec_file) as f:
-    lines = f.read().split("\n")
-
-
-def ind(s):
-    return len(s) - len(s.lstrip(" "))
-
-
-def path_operations(target):
-    in_paths = False
-    paths_indent = None
-    for i, line in enumerate(lines):
-        st = line.rstrip()
-        if re.match(r"^paths:\s*$", st):
-            in_paths = True
-            continue
-        if in_paths:
-            if st and not st[0].isspace():
-                break
-            m = re.match(r'^(\s+)(?:"(/[^"]*)"|\'(/[^\']*)\'|(/[^:"\']*)):\s*$', st)
-            if m:
-                k_indent = len(m.group(1))
-                if paths_indent is None:
-                    paths_indent = k_indent
-                if k_indent == paths_indent:
-                    key = m.group(2) or m.group(3) or m.group(4)
-                    if key == target:
-                        ops = set()
-                        child_indent = None
-                        for j in range(i + 1, len(lines)):
-                            if lines[j].strip() and ind(lines[j]) <= k_indent:
-                                break
-                            mo = re.match(r"^(\s+)([a-z]+):\s*$", lines[j])
-                            if mo:
-                                lvl = len(mo.group(1))
-                                if child_indent is None:
-                                    child_indent = lvl
-                                if lvl == child_indent and mo.group(2) in (
-                                    "get", "post", "put", "patch", "delete", "head", "options"
-                                ):
-                                    ops.add(mo.group(2))
-                        return ops
-    return None
-
-
-failures = 0
-for p in paths:
-    ops = path_operations(p)
-    if ops is None:
-        sys.stderr.write("  detail: %s: path not present in spec\n" % p)
-        failures += 1
-        continue
-    if "post" not in ops:
-        sys.stderr.write("  detail: %s: expected POST operation, found: %s\n"
-                         % (p, ", ".join(sorted(ops)) or "none"))
-        failures += 1
-    if "get" in ops:
-        sys.stderr.write("  detail: %s: unexpected GET operation on POST-only action (404/confidence filter regressed?)\n" % p)
-        failures += 1
-
-if failures:
-    print("POST/GET operations: %d issue(s) on form action paths" % failures)
-    sys.exit(1)
-print("POST/GET operations: every POST action has a post op and no get op, scoped to its path")
-sys.exit(0)
-PYEOF
-    ) || rc=$?
-    if [ "$rc" -ne 0 ]; then
-        log_fail "${result:-POST/GET operations: check failed}"
-        return 1
-    fi
-    log_ok "${result}"
-    return 0
-}
-
 test_forms_target() {
     local port="${FORMS_TARGET_PORT:-8994}"
     local base_url="http://${TEST_HOST}:${port}"
@@ -1417,8 +1171,7 @@ test_forms_target() {
     # expected form-derived paths. A spurious extra path (a receiver literal or a
     # crawl artifact that slipped the classifier) trips this. Mirrors the sibling
     # test_concat_spa exact-count check.
-    if [ "$endpoint_count" != "$expected_count" ]; then
-        log_fail "forms-target: spec has ${endpoint_count} path(s), expected exactly ${expected_count}"
+    if ! assert_exact_path_count "forms-target" "$endpoint_count" "$expected_count"; then
         failures=$((failures + 1))
     fi
 
@@ -2450,8 +2203,7 @@ test_generate_js_static() {
 
     local endpoint_count
     endpoint_count=$(count_spec_endpoints "$spec_on")
-    if [ "$endpoint_count" != "$expected_count" ]; then
-        log_fail "Expected ${expected_count} statically-discovered paths, got ${endpoint_count}"
+    if ! assert_exact_path_count "generate-js-static" "$endpoint_count" "$expected_count"; then
         failures=$((failures + 1))
     else
         log_ok "Recovered ${endpoint_count} paths from the JS bundle"
@@ -3471,7 +3223,17 @@ PYEOF
         # crawler was behaving correctly. pkg/crawl's own
         # TestCrawlerContract_RespectsMaxPages counts pages the same way and
         # passes on both backends (PR #187 / LAB-3890 T3, gap B2).
-        if assert_max_pages "Max-pages limit" "$page_count" 10; then
+        # Floor == limit (10): --max-pages is exact in BOTH directions here.
+        # pageBudgetReached (pkg/crawl/engine.go) reserves each page slot inside a
+        # single mutex-guarded critical section, so the visited count can never
+        # exceed MaxPages; and the seed /api/many-links carries 20 links (21
+        # reachable pages), so a correct crawler under limit=10 visits exactly 10
+        # — CI has shown "visited 10 page(s) (limit=10)" across runs. A floor
+        # below 10 would let a regression that crawled only a few of the 20 links
+        # still pass; matching the exact upper bound the function already asserts
+        # closes that slack (PR #187 review finding TEST-020, tightened per PR
+        # #208 review finding TEST-004).
+        if assert_max_pages "Max-pages limit" "$page_count" 10 10; then
             log_ok "Max-pages limit: visited ${page_count} page(s) (limit=10)"
         else
             failures=$((failures + 1))
