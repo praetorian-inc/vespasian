@@ -3592,9 +3592,8 @@ fi
 # ALL FOUR guards are compared, not three. The first version of this block omitted
 # the hard-link guard while its sentinel still said "all four" and both assertions
 # were titled "every lock guard". MEASURED both directions: relocating ONLY that
-# guard above the create left the suite at 244 passed, 0 failed (the pin then),
-# and moving it
-# below the open did too -- every assertion here satisfied while that guard sat
+# guard above the create left the suite at 244 passed, 0 failed (the pin then), and
+# moving it below the open did too -- every assertion here satisfied while it sat
 # exactly where the failure text says a guard must never sit. Above the create it
 # also goes vacuous: `stat` fails on an absent path, lock_nlink becomes empty, and
 # `[ -n "$lock_nlink" ]` skips the comparison.
@@ -3665,12 +3664,23 @@ lk_ewrap_n=$(printf '%s\n' "${lock_main_code}" | grep -cE '^[[:space:]]*if \[ -e
 # unpinned, which is how the last three rounds each found a missing anchor, one at
 # a time, by review.
 #
-# Counted by `log_fail`, NOT by `if [`. Two reasons, both measured:
+# Counted by `exit [0-9]` -- the TERMINAL ACT -- not by `if [` and not by the
+# diagnostic. Three reasons, all measured:
 #   * FORM-INDEPENDENT. An `if [` counter sees only one spelling of a refusal.
 #     MEASURED: adding `[ ! -S "$LOCK_FILE" ] || { log_fail ...; exit 1; }` to the
-#     span left the suite GREEN -- unanchored, uncounted, and inert. Every refusal
-#     in this span calls log_fail exactly once whatever its syntax, so counting
-#     that catches `if !`, `[ ] || { }`, `case`, and forms nobody has written yet.
+#     span left the suite GREEN -- unanchored, uncounted, inert.
+#   * DIAGNOSTIC-INDEPENDENT. Counting `log_fail` was the first fix and it still
+#     missed a refusal that DELEGATES its diagnostic. MEASURED:
+#     `if ! is_safe_lock "$LOCK_FILE"; then exit 1; fi`, with the log_fail inside
+#     the helper, was GREEN -- `fn_code main` never sees the helper's body. That
+#     is not hypothetical: main() already refuses this way three times
+#     (`if ! ARCH="$(resolve_arch)"`, and twice `if ! verify_apt_origin`), and
+#     parse_args uses a bare `printf >&2; exit 1`. A refusal can omit log_fail;
+#     it cannot omit the exit, which is the thing that makes it a refusal.
+#   * NOT THE ALTERNATION. `log_fail|exit [0-9]` reads 10 here, not 5, because
+#     every refusal in this span has BOTH -- adopting it would have broken the
+#     check. Verified before changing: `exit [0-9]` alone reads exactly 5, one
+#     per refusal, and the span contains no non-refusal exit.
 #   * NO LITERAL TO BUMP. The expected side is DERIVED from the anchors above, so
 #     there is no hardcoded number a future author can make green by editing one
 #     character -- the failure says 5 anchors vs 6 refusals, and the only way to
@@ -3678,47 +3688,44 @@ lk_ewrap_n=$(printf '%s\n' "${lock_main_code}" | grep -cE '^[[:space:]]*if \[ -e
 #     same carry-forward defect that decayed the credit register four rounds
 #     running, rebuilt one line below the note warning about it.
 lk_anchors_set=0
+lk_after_ok=1
+lk_before_ok=1
+# ONE list, four uses. The five anchor positions were previously written out by
+# hand in four places -- the count loop, the located sentinel, and both ordering
+# comparisons -- so an author who added a sixth guard, hit the count failure, wrote
+# the anchor and added it to the count loop went green everywhere while the new
+# guard's POSITION stayed pinned by nothing. Driving all four from this array makes
+# a counted anchor necessarily a compared anchor; there is no list to fall out of.
 for _lk_a in "${lk_symlink_at}" "${lk_regular_at}" "${lk_nlink_at}" \
              "${lk_owner_at}" "${lk_owneruid_at}"; do
-    if [ -n "${_lk_a}" ]; then lk_anchors_set=$((lk_anchors_set + 1)); fi
+    if [ -z "${_lk_a}" ]; then continue; fi
+    lk_anchors_set=$((lk_anchors_set + 1))
+    if [ -z "${lk_create_at}" ] || [ "${_lk_a}" -le "${lk_create_at}" ]; then lk_after_ok=0; fi
+    if [ -z "${lk_open_at}" ]   || [ "${_lk_a}" -ge "${lk_open_at}" ];   then lk_before_ok=0; fi
 done
 lk_refusals=$(printf '%s\n' "${lock_main_code}" \
     | awk -v a="${lk_create_at}" -v b="${lk_open_at}" \
-          'a != "" && b != "" && NR > a && NR < b && /log_fail/ { n++ } END { print n+0 }')
+          'a != "" && b != "" && NR > a && NR < b && /exit [0-9]/ { n++ } END { print n+0 }')
 assert_eq "case z4: every refusal between the create and the open has an ordering anchor (add the anchor, do not adjust this count)" \
     "${lk_anchors_set}" "${lk_refusals}"
 
-if [ -n "${lk_create_at}" ] && [ -n "${lk_symlink_at}" ] && [ -n "${lk_regular_at}" ] \
-   && [ -n "${lk_nlink_at}" ] && [ -n "${lk_owner_at}" ] && [ -n "${lk_owneruid_at}" ] \
-   && [ -n "${lk_open_at}" ]; then
+# Fidelity sentinel: every anchor located, so the comparisons below are not
+# comparing empty strings. Counted from the same array rather than re-listed.
+if [ -n "${lk_create_at}" ] && [ -n "${lk_open_at}" ] && [ "${lk_anchors_set}" -eq 5 ]; then
     echo "PASS: case z4: main()'s create, all five lock decisions and the open were all located"
     pass_count=$((pass_count + 1))
 else
-    echo "FAIL: case z4: could not locate main()'s create, a lock guard, or the open — the ordering assertions below would be vacuous; fix the extraction rather than deleting it"
+    echo "FAIL: case z4: could not locate main()'s create, a lock decision, or the open — the ordering assertions below would be vacuous; fix the extraction rather than deleting it"
     fail_count=$((fail_count + 1))
 fi
 
 assert_eq "case z4: every lock guard runs AFTER the create, so it inspects the inode exec will open" \
-    "after" "$( { [ -n "${lk_create_at}" ] && [ -n "${lk_symlink_at}" ] && [ -n "${lk_regular_at}" ] \
-                  && [ -n "${lk_nlink_at}" ] && [ -n "${lk_owner_at}" ] \
-                  && [ -n "${lk_owneruid_at}" ] \
-                  && [ "${lk_symlink_at}" -gt "${lk_create_at}" ] \
-                  && [ "${lk_regular_at}" -gt "${lk_create_at}" ] \
-                  && [ "${lk_nlink_at}" -gt "${lk_create_at}" ] \
-                  && [ "${lk_owner_at}" -gt "${lk_create_at}" ] \
-                  && [ "${lk_owneruid_at}" -gt "${lk_create_at}" ]; } && echo "after" \
+    "after" "$( { [ "${lk_anchors_set}" -eq 5 ] && [ "${lk_after_ok}" -eq 1 ]; } && echo "after" \
                 || echo "NOT after the create — on a host where the lock path is absent the guards are skipped and a plant before the conditional create is opened unchecked (SEC-BE-001)")"
 
 assert_eq "case z4: every lock guard runs BEFORE the open" \
-    "before" "$( { [ -n "${lk_open_at}" ] && [ -n "${lk_symlink_at}" ] && [ -n "${lk_regular_at}" ] \
-                   && [ -n "${lk_nlink_at}" ] && [ -n "${lk_owner_at}" ] \
-                   && [ -n "${lk_owneruid_at}" ] \
-                   && [ "${lk_symlink_at}" -lt "${lk_open_at}" ] \
-                   && [ "${lk_regular_at}" -lt "${lk_open_at}" ] \
-                   && [ "${lk_nlink_at}" -lt "${lk_open_at}" ] \
-                   && [ "${lk_owner_at}" -lt "${lk_open_at}" ] \
-                   && [ "${lk_owneruid_at}" -lt "${lk_open_at}" ]; } && echo "before" \
-                || echo "NOT before exec {LOCK_FD}< — a guard after the open cannot stop the open it exists to gate")"
+    "before" "$( { [ "${lk_anchors_set}" -eq 5 ] && [ "${lk_before_ok}" -eq 1 ]; } && echo "before" \
+                 || echo "NOT before exec {LOCK_FD}< — a guard after the open cannot stop the open it exists to gate")"
 
 assert_eq "case z4: no \`if [ -e ]\` wrapper around the guards (that shape skips them all when the path is absent)" \
     "0" "${lk_ewrap_n}"
