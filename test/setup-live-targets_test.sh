@@ -802,7 +802,7 @@ else
     if printf '%s' "$(collapse_code "$gql")" | grep -qF 'const host = process.env.BIND_HOST || "127.0.0.1"; httpServer.listen(port, host,'; then
         ok "graphql-server/server.js defaults to loopback AND passes host to listen()"
     else
-        fail "graphql-server/server.js no longer defaults to loopback or no longer passes host to listen() — the unset path exposes it on every interface"
+        fail "graphql-server/server.js no longer defaults to loopback, no longer passes host to listen(), or no longer keeps the two ADJACENT — the unset path exposes it on every interface. This is a byte-exact adjacency pin over collapse_code output, so a behaviour-NEUTRAL edit trips it too: renaming \`host\`, switching quote style, or inserting any statement between the default and the listen() call. If that is what you did, re-read the pin string here and update it deliberately — do not widen it into two independent greps, which is the shape that let a decoy bind something other than the defaulted value"
     fi
 fi
 
@@ -1075,7 +1075,7 @@ if command -v stat >/dev/null 2>&1; then
         # pick anyway — loud AND arbitrary, while the comment claimed otherwise.
         # Empty routes control to the [ -z ] arm below, which reports the
         # extraction failure instead of acting on a coin-flip.
-        fail "start_graphql_server has ${gql_install_n} install(1) lines targeting .graphql-server.log — the extraction below would pick one arbitrarily; disambiguate rather than trusting head -1 (SEC-BE-003)"
+        fail "start_graphql_server has ${gql_install_n} install(1) statements targeting .graphql-server.log — the extraction above would pick one arbitrarily; disambiguate rather than trusting head -1 (SEC-BE-003)"
         gql_install_line=""
     fi
     if [ -z "$gql_install_line" ]; then

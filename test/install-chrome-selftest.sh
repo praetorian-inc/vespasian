@@ -80,7 +80,7 @@ export CHROME_PROBE_TIMEOUT=2
 #       body, closing the bare-`apt-get` and helper-nested evasions
 #   +2  case bp3, pinning that the consolidated chrome_probe_budget still
 #       validates the budget for _bounded_probe as chrome_runnable does
-# See the credit register above for the matching skip_credit accounting.
+# See the credit register below for the matching skip_credit accounting.
 EXPECTED_ASSERTIONS=238
 
 pass_count=0
@@ -128,27 +128,45 @@ SUITE_COMPLETED=0
 #   a2    = 1    not inside a git work tree
 #   f2    = 4    gpg absent (real, unstubbed gpg -- unlike f2b's
 #                                        own stubbed gpg, which needs no gate)
-#   f4    = 3    gpg absent, same reason as f2
+#   f4    = 3    gpg absent (same reason as f2) OR timeout(1) absent: f4 drives
+#                main(), whose require_tools() refuses a timeout-less host
 #   j/j2  = 14   key fixture missing or empty
 #   j/j2  = 14   gpg absent  (mutually exclusive with the above,
 #                                        so j/j2 contributes 14, never 28)
 #   l     = 3    running as root
-#   v     = 12   needs the same key fixture / gpg as j/j2
-#   y     = 3    needs the same key fixture / gpg as j/j2
+#   v     = 12   needs the same key fixture / gpg as j/j2, OR timeout(1): v
+#                drives main(), same require_tools() refusal as f4
+#   y     = 3    needs the same key fixture / gpg as j/j2, OR timeout(1): y
+#                drives main(), same require_tools() refusal as f4
 #   bp    = 4    no timeout/gtimeout on PATH
 #
 # Maximum skip_credit on a maximally-degraded host: 1+4+3+14+3+12+3+4 = 44.
-# EXPECTED_ASSERTIONS below is 238, MEASURED on a fully-equipped host in this
+# f4, v and y each have TWO independent triggers (gpg/fixture, or timeout) but
+# one skip() call apiece, so a host missing both tools still credits 3/12/3 --
+# never double.
+# EXPECTED_ASSERTIONS above is 238, MEASURED on a fully-equipped host in this
 # round (pass+fail+skip_credit with every arm live).
 #
 # PROVENANCE, stated precisely rather than blanket-claimed as "MEASURED":
-#   * a2, j/j2, l, v, y are INHERITED from the round-8 measurement and were not
-#     re-forced this round. They are unchanged since, and the arithmetic above
-#     reconciles with the declared values at each call site.
+#   * f2 = 4, f4 = 3, j/j2 = 14, v = 12 and y = 3 were FORCED this round on a
+#     host with no gpg on PATH (every PATH entry containing a gpg binary was
+#     replaced by a symlink farm omitting it). That run reported 202 passed,
+#     0 failed, 5 skipped; 202 + 0 + 36 = 238, so the accounting pin held and
+#     these five credits are measured rather than declared. f2 and f4 are the
+#     two this list previously omitted altogether -- they were added in abc36ed,
+#     after the round-8 measurement that the rest of the register inherits.
+#   * a2 = 1 and l = 3 remain INHERITED from the round-8 measurement and were
+#     not re-forced. Forcing them needs a non-git checkout and a root shell
+#     respectively, neither of which the equipped-host run can produce.
+#   * f4 = 3, v = 12 and y = 3 were ALSO forced this round on a host with no
+#     timeout and no gtimeout on PATH: 216 passed, 0 failed, 4 skipped, and
+#     216 + 0 + (3+12+3+4) = 238. Before those three gained the timeout gate the
+#     same host reported 223/11/1 -- 11 hard failures naming the fingerprint
+#     check, the cache wipe and the version record, plus 3 vacuous passes.
 #   * bp = 4 is NEW this round: it was 2 (covering case bp2's two assertions) and
 #     case bp3 added two more when the probe budget was consolidated into
-#     common.sh's chrome_probe_budget. It has NOT been forced on a
-#     timeout-less host.
+#     common.sh's chrome_probe_budget. It WAS forced on the timeout-less host
+#     described above, where it skipped and credited 4.
 # When you next touch a skip arm, force it and read the delta rather than
 # extending this list by inference — that inference is exactly what decayed here.
 skip() {
@@ -377,12 +395,37 @@ assert_eq "case e: pinned signing-key fingerprint constant is unchanged" \
 # a missing tool (f0/f1/f2b are unaffected: f0 never calls gpg at all, f1's
 # "not a valid PGP key" message happens to match either failure reason, and
 # f2b's gpg is its own stub). Local to this section rather than reusing case
-# j/j2's `have_gpg` below (line ~1117): that variable is not computed until
+# j/j2's `have_gpg` below: that variable is not computed until
 # AFTER this section runs.
 HAS_GPG=true
 if ! command -v gpg >/dev/null 2>&1; then
     HAS_GPG=false
 fi
+
+# Cases below that drive main() (f4, v, y) need timeout(1) as well as gpg.
+# require_tools() REFUSES a host without timeout -- deliberately, because it
+# bounds the privileged apt calls that run while a temporary trusted Google
+# source is live in /etc -- so main() exits at that check before reaching the
+# behaviour those cases assert. MEASURED on a PATH with neither timeout nor
+# gtimeout: 11 assertions failed naming the fingerprint check, the cache wipe
+# and the version record, and 3 more PASSED VACUOUSLY (main() never ran, so
+# "removed artifacts it does not own" held trivially) -- the exact defect class
+# this suite exists to catch, reproduced by the suite itself.
+# j/j2 is deliberately NOT gated on this: it exercises install_pinned_key
+# directly rather than through main(), and it passes on a timeout-less host.
+HAS_TIMEOUT=true
+if ! command -v timeout >/dev/null 2>&1; then
+    HAS_TIMEOUT=false
+fi
+
+# Names whichever precondition is actually absent, so a skip on a degraded host
+# reports its own cause instead of being re-diagnosed by hand.
+main_deps_missing() {
+    local m=""
+    [ "${HAS_GPG}" = true ]     || m="gpg"
+    [ "${HAS_TIMEOUT}" = true ] || m="${m:+${m} and }timeout"
+    printf '%s' "${m:-none}"
+}
 
 # ── Case f: install_pinned_key REFUSES an unexpected key ───────
 # The behavioural test for the trust anchor. install_pinned_key fetches the key
@@ -748,7 +791,7 @@ fi
 # is emptied and a passthrough sudo is supplied so main() reaches the ordered
 # pair unprivileged; the curl stub serves the wrong key so install_pinned_key
 # fails and the run must stop there.
-if [ "${HAS_GPG}" = true ]; then
+if [ "${HAS_GPG}" = true ] && [ "${HAS_TIMEOUT}" = true ]; then
     root_f4="${FIXTURE_DIR}/root-f4"
     bin_f4="${FIXTURE_DIR}/bin-f4"
     mkdir -p "${root_f4}" "${bin_f4}"
@@ -804,7 +847,7 @@ EOF
         pass_count=$((pass_count + 1))
     fi
 else
-    skip "case f4: main() ordering guarantee on a fingerprint mismatch (gpg not found on PATH)" 3
+    skip "case f4: main() ordering guarantee on a fingerprint mismatch ($(main_deps_missing) not found on PATH)" 3
 fi
 
 # ── Case g: the symlink guard on the defaults file ─────────────
@@ -2498,7 +2541,7 @@ EOF
     )
 }
 
-if [ "${have_real_key}" -eq 1 ]; then
+if [ "${have_real_key}" -eq 1 ] && [ "${HAS_TIMEOUT}" = true ]; then
     root_v1="${FIXTURE_DIR}/root-v1"
     res_v1=$(run_main_install_path "${root_v1}" "container")
     assert_eq "case v: in_container()=true main-install-path run succeeds end to end (rc 0)" \
@@ -2577,7 +2620,7 @@ if [ "${have_real_key}" -eq 1 ]; then
     assert_contains "case v: the non-container message names the actual state (no update channel), not a false 'left alone'" \
         "no apt update channel" "${res_v2}"
 else
-    skip "case v: main-install-path in_container() gating (needs the same key fixture/gpg as j/j2)" 12
+    skip "case v: main-install-path in_container() gating (needs the same key fixture/gpg as j/j2, plus timeout(1) for require_tools; missing: $(main_deps_missing))" 12
 fi
 
 # ── Case v4: record_chrome_version's write-failure arm is non-fatal, not
@@ -3022,7 +3065,7 @@ assert_contains "case x: a failing remove_phone_home is reported, not silently s
 # root. Depends on the same committed key fixture as cases j/j2/v (install_
 # pinned_key has to genuinely succeed to reach the gate), so it skips the
 # same way those do when that fixture or gpg is unavailable.
-if [ "${have_real_key}" -eq 1 ]; then
+if [ "${have_real_key}" -eq 1 ] && [ "${HAS_TIMEOUT}" = true ]; then
     root_y="${FIXTURE_DIR}/root-y"
     bin_y="${FIXTURE_DIR}/bin-y"
     rm -rf "${root_y}" "${bin_y}"
@@ -3100,7 +3143,7 @@ EOF
         pass_count=$((pass_count + 1))
     fi
 else
-    skip "case y: pre-install origin gate (needs the same key fixture/gpg as j/j2)" 3
+    skip "case y: pre-install origin gate (needs the same key fixture/gpg as j/j2, plus timeout(1) for require_tools; missing: $(main_deps_missing))" 3
 fi
 
 # ── Case bp: _bounded_probe (TEST-008 / SEC-BE-005) ─────────────
