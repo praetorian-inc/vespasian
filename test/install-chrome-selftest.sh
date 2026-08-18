@@ -3634,7 +3634,10 @@ fi
 # never evaluated — so on exactly the degraded configuration the skip credits
 # exist for, a wrong credit was invisible. Measured: with EXPECTED_ASSERTIONS
 # deliberately falsified on such a host, the old order printed no drift line at
-# all. Both guards now report.
+# all. The pin now reports it. (The two guards still exit independently: a
+# drift exits here, so the trust-anchor message below is not also printed --
+# both are CI failures either way, and reporting the accounting error first is
+# the point, since a wrong credit is what makes every other count untrustworthy.)
 if [ "$((pass_count + fail_count + skip_credit))" -ne "${EXPECTED_ASSERTIONS}" ]; then
     echo "install-chrome-selftest: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip_credit), saw $((pass_count + fail_count + skip_credit))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."

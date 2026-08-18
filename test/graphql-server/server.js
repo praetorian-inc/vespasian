@@ -499,7 +499,7 @@ async function start() {
   // reaching the host via TEST_HOST). Mirrors test/forms-target/main.go.
   const host = process.env.BIND_HOST || "127.0.0.1";
   httpServer.listen(port, host, () => {
-      // Computed INSIDE the callback: Test 19 in setup-live-targets_test.sh pins
+      // Computed INSIDE the callback: Test 18b in setup-live-targets_test.sh pins
       // `const host = ...` and `httpServer.listen(port, host,` as ADJACENT, so no
       // statement may sit between reading BIND_HOST and binding it. That pin is
       // stricter than two independent greps -- it rejects a decoy that keeps the

@@ -1056,7 +1056,17 @@ if command -v stat >/dev/null 2>&1; then
     # launch too — spawning an unrecorded, unreaped server from a check meant to
     # be inert, in the suite whose subject is orphan processes. Measured with a
     # marker-writing node stub: 1 background launch before this change, 0 after.
-    gql_install_matches="$(declare -f start_graphql_server | grep -oE 'install -m [0-7]+ [^;&]*graphql-server\.log[^;&]*')"
+    #
+    # The excluded class is every metacharacter that can chain or capture, not
+    # just `;` and `&`. Measured against real `declare -f` output: bounding on
+    # `[^;&]` alone still captured a trailing `> /tmp/f`, `| tee /tmp/f` and
+    # `$(id > /tmp/f)` whole, so the eval ran them. Redirect, pipe, backtick and
+    # backtick are excluded for the same reason `&` was. Bare `$` is NOT
+    # excluded: the production line is `"${STATE_DIR}/.graphql-server.log"`,
+    # so excluding it stops the match inside the legitimate path — measured,
+    # the suite went red. A `$(...)` payload still loses its own metachars to
+    # this class, and the content here is repo-controlled, not attacker-supplied.
+    gql_install_matches="$(declare -f start_graphql_server | grep -oE 'install -m [0-7]+ [^;&|<>`]*graphql-server\.log[^;&|<>`]*')"
     gql_install_line="$(printf '%s\n' "${gql_install_matches}" | head -1)"
     gql_install_n="$(printf '%s' "${gql_install_matches}" | grep -c '.')"
     if [ "$gql_install_n" -gt 1 ]; then
