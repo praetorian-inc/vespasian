@@ -1,5 +1,5 @@
 {
-  "description": "Expected API paths from a single-stage `vespasian scan` of the REST API target (LAB-3890 T2, gap A1). Consumed by test_scan_rest in test/run-live-tests.sh. Unlike rest-api (two-stage crawl+generate), this exercises the scan command's full pipeline end-to-end. /api/subscribe is served ONLY as a static HTML <form> action (never linked or fetched), so its presence proves the analyze.ExtractForms augmentation ran inside scan. Parameter names may vary ({userId} vs {id}); validate_path_coverage matches params positionally. INTENTIONAL DUPLICATE — EDIT BOTH FILES: this file and its sibling test/rest-api/expected-paths.json are deliberately kept in lockstep. They exist as two files only because two different tests read them (test_scan_rest reads this one, test_rest_api reads expected-paths.json) and JSON has no comment syntax; the paths and total_paths are identical on purpose. Any endpoint added to or removed from the test/rest-api server must be applied to BOTH files — updating only one silently diverges the scan-rest and rest-api expectations instead of failing loudly. They match today because pipeline.Augment (and its ExtractForms step) runs in both ScanCmd.Run and GenerateCmd.Run, so the single-stage scan path and the two-stage crawl+generate path recover the same set. Divergence is only justified once that stops being true — e.g. a discovery or probe stage is added to one command and not the other, or scan starts seeing endpoints the crawl capture cannot carry — and whoever makes them differ should replace this note in both files with the reason.",
+  "description": "Expected API paths from a single-stage `vespasian scan` of the REST API target (LAB-3890 T2, gap A1). Consumed by test_scan_rest in test/run-live-tests.sh. Unlike rest-api (two-stage crawl + `generate rest --probe=false`), this exercises the scan command's full pipeline end-to-end with the HEADLESS browser and active probing on. /api/subscribe is served ONLY as a static HTML <form> action (never linked or fetched), so its presence proves the analyze.ExtractForms augmentation ran inside scan. Parameter names may vary ({userId} vs {id}); validate_path_coverage matches params positionally. PARTIAL LOCKSTEP WITH expected-paths.json — the two fixtures are kept identical on the path SET, total_paths, post_form_paths, and post_form_body_fields_by_path (exactly the fields _assert_fixture_parity in test/validate_test.sh compares), so any endpoint added to or removed from the test/rest-api server MUST be applied to BOTH files or that assertion fails loudly. They DELIBERATELY DIVERGE on the per-path method lists for /api/login and /api/upload: here both are GET+POST, in expected-paths.json both are GET-only. This is real generator behavior, not drift — test_scan_rest runs the headless `scan` (JavaScript executes, firing the inline `fetch('/api/login',{method:'POST'})` / `fetch('/api/upload',{method:'POST'})` calls) with active probing on, so both paths are observed as GET+POST. test_rest_api generates from the non-headless http capture with `--probe=false`: no JS runs and no probe fires, so the same POST literals are recovered statically as GET-only candidates (Source=static:js, floored to default confidence by RESTClassifier Rule 7) and surface GET-only there. /api/subscribe is POST in both files because it originates from the static <form> via ExtractForms, independent of JS execution. The method lists are intentionally NOT compared by _assert_fixture_parity, and validate_path_coverage reads path keys only, so this divergence is expected and asserted-around rather than enforced. Whoever changes the two-stage vs scan discovery behavior (e.g. adds a probe/discovery stage to one command, or removes it) should update these method lists and this note in both files to match.",
   "paths": {
     "/api/subscribe": ["POST"],
     "/api/health": ["GET"],
@@ -10,9 +10,13 @@
     "/api/products/{id}": ["GET"],
     "/api/orders": ["GET"],
     "/api/orders/{id}": ["GET"],
-    "/api/login": ["POST"],
-    "/api/upload": ["POST"]
+    "/api/login": ["GET", "POST"],
+    "/api/upload": ["GET", "POST"]
   },
   "total_paths": 11,
+  "post_form_paths": ["/api/subscribe"],
+  "post_form_body_fields_by_path": {
+    "/api/subscribe": ["email", "name"]
+  },
   "excluded_patterns": [".js", ".css", ".png", ".ico", ".svg", ".woff"]
 }

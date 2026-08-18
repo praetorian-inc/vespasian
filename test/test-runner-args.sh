@@ -503,6 +503,13 @@ else
     fail "load_config: allowed key REST_API_PORT not applied (expected 8990): $allowlist_out"
 fi
 
+# Fixture parity (cross-file lockstep + per-fixture invariants for the rest-api
+# fixtures) moved to test/validate_test.sh so the un-gated validator-regression
+# job enforces it — `skip-live-tests` no longer disables it. This drift guard
+# runs only in the label-gated `test` job, so the parity check lived behind a
+# gate; the richer checks now live in the "rest-api fixture parity" section of
+# validate_test.sh (LAB-5611 / PR #208 review TEST-005/006/007/008).
+
 echo ""
 echo "=== Summary ==="
 echo "  $PASS passed, $FAIL failed"

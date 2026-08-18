@@ -1,0 +1,158 @@
+# AGENTS.md
+
+This is the canonical agent instruction file for this repository. It provides guidance to any coding agent working with this code — Claude Code, Codex, and Gemini all load it. `CLAUDE.md` is a one-line pointer to this file, and `.gemini/settings.json` names it for Gemini.
+
+## Overview
+
+Vespasian is an API discovery and specification generation tool for security assessments. It captures HTTP traffic through headless browser crawling or imports it from existing sources (Burp Suite XML, HAR, mitmproxy), classifies requests by API type (REST, GraphQL, SOAP/WSDL, gRPC), probes discovered endpoints, and generates specifications in the native format for each type: OpenAPI 3.0, GraphQL SDL, WSDL, or `.proto`. gRPC is opt-in (`--api-type grpc`) since its binary HTTP/2 framing is not auto-detected.
+
+## Build and Test Commands
+
+```bash
+# Build
+make build                    # Build binary to bin/vespasian
+
+# Run all tests with race detection
+make test                     # Equivalent to: go test -race ./...
+
+# Run tests for a specific package
+go test ./pkg/classify/...
+
+# Run a single test
+go test -run TestFunctionName ./pkg/package/...
+
+# Lint
+make lint                     # Runs golangci-lint (gocritic, misspell, revive)
+
+# Format
+make fmt                      # Runs gofmt -s -w .
+
+# All checks (format, vet, lint, test, docs)
+make check
+
+# Community-health docs only (presence, link/anchor resolution, CODEOWNERS roster)
+make check-docs
+
+# Coverage
+make coverage                 # Generates coverage.out and prints per-function coverage
+
+# Dependencies
+make deps                     # go mod download && go mod tidy
+
+# Clean
+make clean                    # Remove bin/, dist/, coverage.out
+
+# Live test services
+make live-test-clean          # Stop live test services (escape hatch for orphaned processes)
+```
+
+## Architecture
+
+### Two-Stage Pipeline
+
+Vespasian separates traffic capture from specification generation:
+
+1. **Capture**: Crawl a target with a headless browser or import traffic from Burp/HAR/mitmproxy → produces `capture.json` (array of `ObservedRequest`)
+2. **Generate**: Classify requests → probe endpoints → generate specification (OpenAPI 3.0, GraphQL SDL, WSDL, or `.proto`)
+
+The `scan` command combines both stages. The `crawl`/`import` and `generate` commands run them independently.
+
+### Core Flow
+
+The CLI (`cmd/vespasian`) uses Kong for argument parsing. Each command (crawl, import, generate, scan) has a `Run()` method. The scan pipeline:
+
+1. Crawl target URL → `[]crawl.ObservedRequest`
+2. Augment requests with static HTML form analysis via `analyze.ExtractForms()` (emits synthetic `ObservedRequest` entries with `Source="static:html"` for every `<form>` in HTML response bodies) — done **before** auto-detection so form-derived REST signals feed the heuristic
+3. Auto-detect API type (or use explicit `--api-type`)
+4. Classify requests via `classify.RunClassifiers()` with confidence threshold
+5. Deduplicate classified endpoints
+6. Probe endpoints via `probe.RunStrategies()` (OPTIONS, schema, WSDL fetch, GraphQL introspection, gRPC reflection, gRPC-gateway OpenAPI)
+7. Generate spec via `generate.Get(apiType).Generate()`
+
+Note: `detectAPIType` (auto mode) runs only the REST/WSDL/GraphQL classifiers — gRPC is never auto-selected and requires explicit `--api-type grpc`. Under `--api-type grpc`, three reflection-off-capable techniques are chained in priority order: server reflection (richest — real message fields) → grpc-gateway OpenAPI scrape → gRPC-Web JS-binding recovery from the capture. The first two are `ProbeStrategy` implementations run by `RunStrategies`; the binding recovery is applied afterward (`enrichGRPCFromBindings`) because it reads JS bodies from the full capture rather than the network. Reflection results are never overwritten by the name-only techniques. All three run only inside the `scan`/`generate` pipeline — there is no standalone `probe` CLI command.
+
+### Key Packages
+
+- **cmd/vespasian**: CLI entry point, command definitions, signal handling, browser lifecycle management
+- **internal/pipeline**: Shared crawl/classify/probe/generate orchestration consumed by both the CLI (`cmd/vespasian`) and the SDK (`pkg/sdk`). Exports `DetectAPIType`, `ClassifiersForType`, `StrategiesForType`, `ClassifyProbeGenerate`, `ResolveWSDLType`, `ProbeAndAppendWSDLRequest`, `ProbeWSDLDocument`, `IsStaticAssetURL`, `Augment`/`AnalyzeJS` (forms-then-jsstatic augmentation; `AnalyzeJS` is the JS-only stage CrawlCmd runs at crawl time), and `ResolveAndGenerate` (the bundled detect → wsdl-resolve → optional `AfterWSDL` hook → classify/probe/generate sequence; the CLI passes its JS-replay step as the `AfterWSDL` hook, the SDK passes nil). The gRPC path also chains grpc-gateway OpenAPI probing and gRPC-Web JS-binding enrichment (reflection > gateway > bindings) within the classify/probe/generate sequence.
+- **pkg/crawl**: Two crawler backends — headless mode uses go-rod to drive Chrome tabs (full JS/SPA support); non-headless mode uses a stdlib net/http engine with DFS frontier, 150 rps rate limiter, and scope+SSRF redirect guard. Both produce `ObservedRequest` values. The headless backend pins a local Chrome — `BrowserOptions.ChromePath` if set, otherwise the system browser resolved by `launcher.LookPath()` — and does not, by default, let go-rod auto-download a browser from third-party mirrors (supply-chain hardening, LAB-4999); when no system browser is found it errors unless `VESPASIAN_ALLOW_BROWSER_DOWNLOAD=true` (or `BrowserOptions.AllowBrowserDownload`) opts in, and it applies Chrome telemetry/phone-home-disabling launch flags so crawl egress stays minimal. The `no-download` live-test target guards this against regression. `--max-pages` counts distinct pages (URLs) visited, not captured requests; workers reserve a page slot before visiting so the cap is exact (no overshoot), and pages already in flight when the budget is reached finalize and emit their captured requests rather than being canceled mid-page. Both honor `--proxy` (http/https/socks5, validated by `ValidateProxyAddr`): the headless path routes Chrome via `--proxy-server`, the HTTP path wires `http.ProxyURL` into the transport. With `--proxy`, TLS verification stays on by default; `--proxy-insecure` disables it for http/https intercepting proxies (Burp/mitmproxy MITM) on the HTTP path only (socks5 always keeps verification, since the Go client does TLS directly to the target through the tunnel; the headless backend validates against the OS trust store, so trust the proxy CA out-of-band there; the gRPC reflection dial is unaffected — its target-cert verification is governed only by `--grpc-insecure-skip-verify`, not `--proxy-insecure`, even though the gRPC dial still tunnels through the proxy). The HTTP path also skips its dial-time SSRF pin for the proxy connection (URL-level scope still applies, so private targets still need `--dangerous-allow-private`). As of LAB-4993 `--proxy` covers every stage, not just crawl: the active probe (OPTIONS/schema/WSDL-fetch/GraphQL introspection/gRPC reflection), WSDL discovery, JS-replay, and `pkg/analyze/jsstatic` sourcemap fetches all route through the proxy too (built by `pkg/httpx.BuildHTTPClient`/`ProxyDialer`; socks5 always verifies TLS, `--proxy-insecure` applies to http/https only). Also owns capture file I/O and browser manager lifecycle, and the post-crawl JS-replay step (`ReplayJSExtracted`) that rescans captured JS bundles for API paths and probes them with raw HTTP under same-origin and SSRF protections. JS-replay runs in both `scan` and the two-stage `generate` command (LAB-3892), gated on `--probe && --analyze-js`. It re-fetches bundles and probes over HTTP using the origin recorded in the capture; when no explicit `--target-url` is given the origin is derived from the capture's first HTML-response page, falling back to the first request's origin only if the capture has no HTML response. The target must still be reachable at generate time. Static, fully-offline JS analysis is handled separately by `pkg/analyze/jsstatic` via `--analyze-js`; it recovers literal paths (jsluice AST) AND — since LAB-4992 — the concat / `+`-chain / service-prefix reconstructions, which it obtains from the shared `crawl.ExtractStaticConcatPaths` extractor. The active `extractAPIPaths` runs the same underlying extractors (`extractConcatPaths` **and** `servicePrefixPlusPaths`), so both paths reconstruct these forms identically; JS-replay additionally re-fetches and probes them and does a speculative service-prefix fan-out that the offline path deliberately omits, since it is only safe when 404-filtered by probing. Live replay is additive relative to the offline path, with one exception: `supersedeConcatMirrors` drops an offline `static:js-concat` mirror when the probe answers a path with **404** — a 200 `text/html` SPA catch-all, 204, HTML-bodied 401/403 or 302 → `/login` can never remove an endpoint the offline pass recovered (a live-only signal must never override an offline finding) — so a reachable target can yield slightly fewer endpoints than a fully-offline run. A 404 is the best available signal but is not proof of absence (returning 404 rather than 401/403 for a real-but-unauthorized resource is a widespread anti-enumeration convention, and a hostile target can fingerprint `doRequest`'s fixed User-Agent and 404 everything to hide its API surface), and no further probe can resolve that ambiguity — an honest server 404s an absent path for the same reason, so distinguishing the two needs credentials, not another request (a random-control-path gate was implemented during this PR's review and reverted for exactly this reason: it misclassified every well-behaved target). Instead the drop is ANNOUNCED: each dropped path is named on the warnings writer with both remedies (`--header` for an auth-gated endpoint, `--probe=false` to keep every offline candidate), so the loss is visible rather than silent. `crawl`/`import` alone stay passive and never run JS-replay. The extractor reconstructs paths from quoted strings, template literals, full URLs, service-prefix concatenation, and `String.prototype.concat`/`+`-string concatenation (substituting a numeric sentinel for non-literal operands so the path stays probeable and parameterizable)
+- **pkg/ssrf**: Leaf package providing `ValidateURL` and `SafeDialContext` for SSRF protection (rejects private/loopback/link-local destinations and re-resolves at connect time to defeat DNS rebinding); imported by both `pkg/probe` and `pkg/crawl`
+- **pkg/httpx**: Leaf package owning the proxy-client contract for every post-crawl stage (LAB-4993). Exports `ProxyConfig`, `BuildHTTPClient` (proxy-aware `*http.Client`; `http.ProxyURL` for http/https, `golang.org/x/net/proxy` for socks5), `ProxyDialer` (HTTP `CONNECT` tunnel + SOCKS5 dialer, for the gRPC reflection path which has no `http.ProxyURL` equivalent), and `NoFollowRedirects`. Imports only `golang.org/x/net/proxy` beyond stdlib and deliberately depends on none of crawl/probe/pipeline/ssrf, so it stays cycle-free. Note the proxied clients carry no dial-time SSRF pin (`DialContext` is cleared — we dial the proxy, not the target), which makes the URL-level validators in the calling stages the only remaining scope guard; socks5 always verifies TLS, `--proxy-insecure` applies to http/https proxies only.
+- **pkg/analyze**: Static analysis of captured HTML response bodies; extracts `<form>` endpoints and parameter names as synthetic `ObservedRequest` entries (`Source="static:html"`) to surface form-based APIs not triggered during crawl. Also hosts `ExtractGRPCWebBindings`, which runs jsluice over captured JS bodies to recover gRPC service/method/type names and streaming flags from generated gRPC-Web/Connect-ES client artifacts (names only; no message fields).
+- **pkg/classify**: Request classification engine with confidence-based heuristics; classifiers for REST, GraphQL, WSDL, and gRPC; deduplication
+- **pkg/probe**: Active endpoint probing strategies (OPTIONS discovery, JSON schema inference, WSDL document fetching, GraphQL introspection with 3-tier WAF bypass, gRPC server reflection, grpc-gateway OpenAPI scrape); SSRF protection with DNS rebinding mitigation (also applied to gRPC dial via a configurable `Config.Dialer`). The `GRPCGatewayProbe` fetches a bounded set of well-known swagger/OpenAPI paths over HTTP, recognizes grpc-gateway documents by their `operationId`/`tags` shape, and records the recovered service names on the endpoint's `GRPCSchema`; descriptor synthesis is deferred to `pkg/generate/grpc` (`FileDescriptorsFromServices`). Probing is also gated to the scan's own origin by default (LAB-4992), applying to ALL probe targets/API types, not just JS-static candidates: the single `probe.Config` construction site in `internal/pipeline` wraps `Config.URLValidator` so any candidate whose URL doesn't share the scan target's scheme/host/port is skipped rather than probed — mirroring `JSReplayConfig.AllowCrossOrigin` (the opt-out field is internal-only and defaults to false — so the gate itself is on by default; no CLI flag). The origin is taken from `--target-url` when set, otherwise derived from the capture the same way JS-replay derives it (`crawl.ResolveTargetOrigin`); when derived, a one-time warning names it so an operator seeing endpoints skipped knows `--target-url` is the fix.
+- **pkg/generate**: Spec generation interface and registry; delegates to sub-packages by API type
+- **pkg/generate/rest**: OpenAPI 3.0 generation, path normalization (UUID detection, context-aware parameter naming), JSON schema inference, form-encoded and multipart request-body inference. The emitted `servers` list and `info.title` derive from the origin the scan can vouch for — `Options.TargetOrigin`, i.e. `crawl.ResolveTargetOrigin` from `--target-url` or the capture's own HTML page — plus dynamically observed hosts; an unprobed JS-static candidate joins `servers` only when same-origin with it, so a hostile bundle literal cannot occupy `servers[0]` or capture `info.title` by sorting first (LAB-4992). Cross-origin JS-static endpoints are not relabelled onto the trusted host either: they keep their real origin through a per-operation `servers` override (LAB-4992) — origin is part of the internal grouping key so a group can never mix endpoints from different origins, and when two origins' groups collide on the same normalized path+method, the colliding group with the lowest trust rank (primary origin, then any other non-excluded origin, then an excluded origin OR an origin of unknown provenance — the empty string `crawl.CanonicalOrigin` returns for a host-less literal such as `https:/api/x`) deterministically wins that slot — neither an excluded nor an unknown-provenance origin can ever win over a vouched one, regardless of which hostname (or lack thereof) sorts first alphabetically (LAB-4992) — while the suppressed group is recorded (not silently dropped) via an `x-vespasian-collision-origins` extension. Origin comparison for all of the above (endpoint URLs AND `TargetOrigin`) goes through the single `crawl.CanonicalOrigin` (LAB-4992), so a trusted host spelled with an explicit default port, mixed case, or a bracketed IPv6 literal cannot lose its own tie-break or produce a duplicate `servers` entry. `static:html` is deliberately exempt from that filter — the page carrying the form was fetched over the wire during the crawl.
+- **pkg/generate/graphql**: GraphQL SDL generation from introspection results or traffic-based inference
+- **pkg/generate/wsdl**: WSDL generation from SOAP traffic, WSDL document parsing, type inference from SOAP envelopes
+- **pkg/generate/grpc**: `.proto` (proto3) generation from gRPC reflection descriptors via `jhump/protoreflect`'s `protoprint`. Reconstructs the `FileDescriptorProto` graph captured by the probe and renders deterministic source (sorted files/elements, `google/protobuf/*` well-known files omitted). Requires reflection `FileDescriptors`; traffic-only inference is not yet implemented and returns an error. `FileDescriptorsFromServices` is the name-only entry point: it synthesizes `FileDescriptorProto` wire bytes (empty message stubs, streaming flags preserved) from `[]classify.GRPCService` recovered by the reflection-off techniques (grpc-gateway OpenAPI, gRPC-Web bindings) and feeds them through the same `Generate`/`renderProto` path so all techniques emit byte-identical formatting. Synthetic filenames are namespaced (`<pkg>/synthetic.proto`) so they never collide with reflection's real descriptor filenames.
+- **pkg/analyze/jsstatic**: Static analysis of captured JavaScript bundles using BishopFox/jsluice. Sits between the capture stage and classify/generate stages. Recovers API endpoints, HTTP methods, path parameters (via EXPR→{param} normalization), and request-body field names (from `fetch`/`axios` object literals). Also reconstructs concat / `+`-chain / literal service-prefix paths that jsluice's AST cannot resolve via the shared `crawl.ExtractStaticConcatPaths` extractor (LAB-4992) — emitted as GET candidates with a numeric sentinel for non-literal operands (`/api/users/0/orders`, parameterized downstream by the REST normalizer), deduped against AST-recovered URLs on a representation-agnostic key (the sentinel `0` and `{param}` placeholders both normalize to a common token, and leading slashes are normalized) so no phantom GET companions appear for a path recovered both ways. This makes fully-offline `generate` recover concat/service-prefix SPA endpoints without a reachable target — provided the capture has not already been through an older jsstatic pass (see Capture Format below; pre-LAB-4992 `crawl`/`scan` captures need re-capturing, `import` captures are unaffected). Synthesises `crawl.ObservedRequest` entries with `Source="static:js"` (AST literal), `"static:js-sourcemap"`, or `"static:js-concat"` (concat reconstruction) and appends them after dynamic entries so `classify.Deduplicate` keeps dynamic observations on ties. Because a fully-offline candidate has no probed response, `RESTClassifier` Rule 7 floors any JS-static candidate whose path carries an API indicator to the default `--confidence` (0.5) so these candidates survive default-confidence generation. Enabled by default; opt out with `--analyze-js=false`.
+- **pkg/importer**: Traffic importers for Burp Suite XML, HAR 1.2, and mitmproxy dumps (including mitmproxy's native tnetstring `.mitm` format); format registry with layered safety caps — 500 MB per file, 64 MB per tnetstring element, 1 M entries per list/dict, 500 K flows per native stream
+- **pkg/mediatype**: Shared media-type canonicalization (lowercase + parameter strip). Used by classify and generate/rest where an import cycle prevents direct sharing.
+- **pkg/sdk**: Implements the capability-sdk `Capability[capmodel.WebApplication]` interface, exposing the vespasian pipeline to chariot/Guard hosts. The standalone CLI does not import this package.
+- **internal/grpcwire**: gRPC length-prefixed framing + protobuf wire-format parser (ParseFrame, ParseVarint, ParseTag, WalkFields). Not yet wired into the classifier, probe, or generator — it is foundation reserved for the future traffic-inference path that `pkg/generate/grpc` does not yet implement (the generator currently relies on reflection descriptors).
+
+### Key Patterns
+
+- **Registry pattern**: Both `pkg/importer` and `pkg/generate` use a registry map to look up implementations by name (`Get()` function)
+- **Strategy pattern**: `pkg/probe` defines `ProbeStrategy` interface; each probe type (Options, Schema, WSDL, GraphQL, gRPC reflection, grpc-gateway) is a separate implementation
+- **Classifier interface**: `pkg/classify` defines `APIClassifier` interface; each API type has its own classifier with heuristic rules and confidence scores
+
+### Capture Format
+
+The intermediate `capture.json` file is a JSON array of `crawl.ObservedRequest` structs. Each entry contains method, URL, headers, body, and response data. This format is shared between crawl output, importer output, and generator input.
+
+The `query_params` field is `map[string][]string` (multi-value). Capture files generated by versions ≤ LAB-2110 use the older `map[string]string` shape and are NOT compatible — re-run capture against the target.
+
+Capture files generated by versions ≤ LAB-4992 by `crawl`/`scan` remain readable, but do not yield concat/service-prefix SPA endpoints on a later `generate`. They carry `static:js` entries (written by the crawl-time jsstatic pass) but no `static:js-concat` entries, and `pipeline.AnalyzeJS` short-circuits on `crawl.AnyStaticSource` — the idempotency guard that makes `crawl` → `generate` byte-identical to `scan` — so the static pass never re-runs and the concat reconstruction never happens. Re-run capture to pick these endpoints up. `import`-produced captures carry no `static:js` source and are unaffected.
+
+## CLI Commands
+
+| Command   | Purpose |
+|-----------|---------|
+| `scan`    | Full pipeline: crawl + classify + probe + generate. Flags: `--analyze-js` (default true), `--fetch-sourcemaps` (default true), `--merge-slugs` (default false), `--slug-threshold` (default 2), `--grpc-insecure-skip-verify` (default false; opt-in TLS trust-chain skip for gRPC reflection) |
+| `crawl`   | Capture traffic via headless browser → capture.json. Flags: `--analyze-js` (default true), `--fetch-sourcemaps` (default true) |
+| `import`  | Convert Burp XML / HAR / mitmproxy → capture.json |
+| `generate` | Produce spec from capture.json (REST→OpenAPI, GraphQL→SDL, WSDL→WSDL, gRPC→`.proto`). Flags: `--analyze-js` (default true), `--fetch-sourcemaps` (default false), `--merge-slugs` (default false), `--slug-threshold` (default 2), `--grpc-insecure-skip-verify` (default false), `--header`/`-H` (repeatable auth headers forwarded to same-origin JS-replay fetches/probes), `--target-url` (override the capture-derived JS-replay origin). `grpc` must be passed explicitly; unlike the other types it is **not** fully offline — descriptors are not stored in the capture (`FileDescriptors` is `json:"-"`), so `generate grpc` re-runs the reflection probe live against the gRPC targets in the capture (needs `--probe`, on by default, and target reachability). |
+| `version` | Show version information |
+
+## Test Infrastructure
+
+The `test/` directory contains live test targets:
+
+- **test/rest-api/**: Go HTTP server exposing REST endpoints for end-to-end testing
+- **test/soap-service/**: Go HTTP server exposing SOAP/WSDL endpoints
+- **test/graphql-server/**: Node.js GraphQL server with Apollo
+- **test/grpc-server/**: Go gRPC server with Server Reflection enabled (sample User/Order/Account services, including a streaming method) for reflection-probe testing
+- **test/concat-spa/**: Go HTTP server serving a single-page app whose API endpoints exist only as concatenated strings in an external JS bundle (discovered via post-crawl JS-replay)
+- **test/forms-target/**: Go HTTP server serving an HTML `<form>` page whose POST endpoints are recovered by static form extraction (`analyze.ExtractForms`); a co-located GET search form contributes query parameters to a crawl-linked endpoint
+- **test/spec-validators/**: private, pinned npm package (`package.json` + committed `package-lock.json`) holding the real-parser spec validators that `test/validate.sh` shells out to — `validate-openapi.mjs` (`@apidevtools/swagger-parser`) and `validate-graphql.mjs` (`graphql-js`). Install once with `(cd test/spec-validators && npm ci --ignore-scripts)`; after that it is fully offline, so the only egress is the `npm ci` fetch from `registry.npmjs.org`. It replaced the previous grep/substring-based spec validation (LAB-3890 T1), which false-passed malformed specs that merely *contained* the right strings. `test/validate.sh` fails the run with a clear "run: npm ci" message if the deps are missing.
+
+`test/validate_test.sh` is the regression test that locks in those validators' reject behaviour: it asserts valid specs still pass and that every malformed / substring-trap fixture is rejected (e.g. an expected `GetUser` SOAP operation must no longer be satisfied by `GetUserList`). It needs only node plus the installed `test/spec-validators` deps — no Go build and no live services — and runs in about a second.
+
+`test/check-docs.py` guards the community-health docs (LAB-5870): the required root set exists, every relative markdown link and heading anchor resolves, and the `*` owner line in `CODEOWNERS` matches the maintainer table in `GOVERNANCE.md`. It exists because `GOVERNANCE.md` and `SUPPORT.md` were absent from `main` for a week — two stacked PRs merged into feature branches that nothing merges from again — and no check noticed; run against that commit it fails on both files. Python rather than shell because the link and anchor logic needs real parsing and these scripts are authored on macOS to run on Linux, where the `sed`/`grep`/`stat` flag sets diverge in both directions. Wired into `make check` and run in CI as the ungated `docs-check` job.
+
+See `test/README.md` for how to run the suite, including the `TEST_HOST` override for devcontainer setups.
+
+## Code Conventions
+
+- Go file naming: lowercase with underscores (e.g., `rest_classifier.go`, not `restClassifier.go`)
+- Test files match source files (`foo.go` → `foo_test.go`)
+- Formatting enforced by `gofmt -s` (run `make fmt`)
+- Linting via `golangci-lint` with gocritic, misspell, revive (run `make lint`)
+- Package-level documentation lives in `doc.go` files
+
+## Development Workflow
+
+- After implementing a feature or fix, run `make check` to ensure all tests and the linter pass.
+- After modifying a Go source file, update its package's `doc.go` if the change affects the package's public API or purpose.
+- After adding or changing features, review `README.md` and `AGENTS.md` (this file — `CLAUDE.md` is only a one-line pointer to it) for accuracy and update them if needed.
+
+## CI
+
+GitHub Actions runs on push to main and PRs:
+
+- **ci.yml**: Build, test (`go test -race`, 80% coverage threshold), lint (golangci-lint v2), and format check. Runs on all pushes and PRs.
+- **live-tests.yml**: A single **test** job runs all targets via `test/run-live-tests.sh --group offline` then `--group live`. Before the offline run it does `npm ci --ignore-scripts` in `test/spec-validators` (via `actions/setup-node` with `cache: npm` keyed on `test/spec-validators/package-lock.json`), because the offline `generate-{rest,graphql,wsdl}` targets validate their output with the real parsers rather than grep. Target groups (`OFFLINE_TARGETS` / `LIVE_TARGETS`) are defined in `test/run-live-tests.sh` — the workflow references groups, not individual targets, so adding a target means editing one array in the runner. A drift-guard step (`test/test-runner-args.sh`) fails CI if a dispatch target is not covered by `OFFLINE_TARGETS`, `LIVE_TARGETS`, or the config-only set (e.g. `grpc-server`). Uses the stable Chrome shipped with the ubuntu-24.04 runner. The **test** job is gated: it `needs` a `check-label` job and runs on every PR by default; add the `skip-live-tests` label to bypass. Always runs on push to `main` and `workflow_dispatch`.
+
+  Three fast jobs sit deliberately **outside** that label gate, so `skip-live-tests` cannot switch off the regression net: **preflight-selftest** (`test/preflight-selftest.sh`, Chrome/Chromium detection logic, LAB-3893); **validator-regression**, which does its own `npm ci --ignore-scripts` in `test/spec-validators` and then runs `./test/validate_test.sh` to prove the spec validators still reject malformed specs; and **docs-check** (`test/check-docs.py`, LAB-5870). All three need no Go build and no live services and carry a ~5-minute timeout. `docs-check` lives in this workflow rather than `ci.yml` because `ci.yml`'s `paths` filter is Go-only — a docs-only PR never triggers it, so the job guarding docs cannot be gated on Go files changing. All four jobs (`preflight-selftest`, `validator-regression`, `docs-check`, `test`) open with a `step-security/harden-runner` step in `egress-policy: audit` mode (LAB-4732 / SEC-BE-002) — defense-in-depth network monitoring that logs (does not block) outbound traffic; `registry.npmjs.org` is part of the anticipated allowlist. The `--ignore-scripts` flag on both installs is SEC-BE-001: it blocks npm lifecycle scripts from executing under the non-blocking audit-only egress policy.
