@@ -688,67 +688,19 @@ else
     # tests run under `make test`. This pin was deleted once on the theory that
     # a /* */ block comment could satisfy it undetected, but collapse_code
     # strips block comments in the very commit that theory rested on, so the
-    # pin is sound again as a structural check over the comment-free source.
-    # SELF-5: ANCHORED, not containment. `grep -qF` over the WHOLE file asks only
-    # whether the text appears SOMEWHERE — so a new code path prepended AHEAD of
-    # the pinned block leaves it matching. MUTATION-PROVEN: adding
+    # pin is sound again as a fixed-string whole-structure match.
+    # SELF-5: ANCHORED, not containment. `grep -qF` asks only whether the text
+    # appears SOMEWHERE — so a new code path prepended AHEAD of the pinned block
+    # leaves it matching. MUTATION-PROVEN: adding
     #   if os.Getenv("BIND_ALL") != "" { return net.JoinHostPort("0.0.0.0", port) }
     # at the top of Addr left BOTH this suite AND `go test` green, because the
-    # pinned text is still present and no Go test sets BIND_ALL. So the checks
-    # below are scoped to Addr's OWN body, extracted here.
-    #
-    # SELF-7: they are PROPERTIES of that body, not a byte-pin OF that body.
-    # The predecessor grep -qF'd Addr's entire collapsed body as one fixed string.
-    # It caught the mutations above, but it also failed on any edit that cannot
-    # change what Addr returns — and it duly false-positived on an operator
-    # WARNING (`fmt.Fprintf(os.Stderr, ...)` in the else arm, announcing that an
-    # ambient BIND_HOST had widened the bind off loopback). The cheapest way to go
-    # green was to DELETE the warning, so an over-strict test cost a production
-    # hardening. That trade is backwards, and it is the pin's fault: its stated
-    # purpose is "no other code path can return a different host", not "this
-    # function's text never changes".
-    #
-    # The four conditions below are that purpose, spelled out. Together they say:
-    # Addr has exactly ONE exit, that exit returns `host`, and `host` is written
-    # exactly twice — once from BIND_HOST and once with the loopback default under
-    # `== ""`. Any third writer, any second return, a changed default, a changed
-    # env var, or an inverted comparison breaks one of them; a logging statement
-    # (or any other non-returning, non-assigning line) breaks none.
-    #
-    # Extraction is `func Addr(` up to the next top-level `func ` in the
-    # comment-stripped, whitespace-collapsed source. A closure smuggled into Addr
-    # truncates the slice early, which the exactly-one-`return` condition then
-    # reports rather than silently accepting.
-    addr_body="$(printf '%s' "${shared_code}" | awk '
-        {
-            i = index($0, "func Addr(port string) string {")
-            if (i == 0) exit 0
-            s = substr($0, i)
-            j = index(substr(s, 2), "func ")
-            if (j > 0) s = substr(s, 1, j)
-            print s
-        }')"
-    addr_returns="$(printf '%s' "${addr_body}" | awk '{ print gsub(/return /, "") }')"
-    addr_writes="$(printf '%s' "${addr_body}" | awk '{ print gsub(/host :?= /, "") }')"
-    addr_why=""
-    if [ -z "${addr_body}" ]; then
-        addr_why=" func Addr(port string) string is gone or its signature changed, so none of the conditions below could even be evaluated"
+    # pinned text is still present and no Go test sets BIND_ALL. Matching the
+    # whole function body — from `func Addr` to its closing return — is what makes
+    # the comment's "whole-structure match" claim actually true.
+    if printf '%s' "${shared_code}" | grep -qF 'func Addr(port string) string { host := os.Getenv("BIND_HOST") if host == "" { host = "127.0.0.1" } return net.JoinHostPort(host, port) }'; then
+        ok "shared target.Addr's whole body is the loopback default (no other code path can reach the bind) (SEC-BE-015)"
     else
-        printf '%s' "${addr_body}" | grep -qF 'host := os.Getenv("BIND_HOST")' \
-            || addr_why="${addr_why} the bind host no longer comes from os.Getenv(\"BIND_HOST\");"
-        printf '%s' "${addr_body}" | grep -qF 'if host == "" { host = "127.0.0.1" }' \
-            || addr_why="${addr_why} the loopback default is gone, changed, or its \`== \"\"\` guard was inverted;"
-        printf '%s' "${addr_body}" | grep -qF 'return net.JoinHostPort(host, port)' \
-            || addr_why="${addr_why} the single return no longer returns net.JoinHostPort(host, port);"
-        [ "${addr_returns:-0}" = 1 ] \
-            || addr_why="${addr_why} Addr has ${addr_returns} return statements, not 1 — a second exit can hand back a host the checks above never see;"
-        [ "${addr_writes:-0}" = 2 ] \
-            || addr_why="${addr_why} \`host\` is written ${addr_writes} times, not 2 — a third writer can overwrite the BIND_HOST value or the loopback default;"
-    fi
-    if [ -z "${addr_why}" ]; then
-        ok "shared target.Addr has one exit returning \`host\`, and \`host\` is only ever the BIND_HOST value or the 127.0.0.1 default (no code path can return another host) (SEC-BE-015)"
-    else
-        fail "shared target.Addr can no longer be shown to return only a BIND_HOST-derived host:${addr_why} These targets are unauthenticated, so a wildcard bind exposes them to the local network for the lifetime of a test run (SEC-BE-015)"
+        fail "shared target.Addr's body is no longer exactly the loopback-default structure — either the default changed, or another code path was added that can return a different host before it. These targets are unauthenticated, so a wildcard bind exposes them to the local network for the lifetime of a test run (SEC-BE-015)"
     fi
 
     # TWO conditions, deliberately. The quantifier is [1-9][0-9]*, not [0-9]+:
@@ -847,24 +799,10 @@ gql="${THIS_DIR}/graphql-server/server.js"
 if [ ! -f "$gql" ]; then
     fail "graphql-server/server.js not found — cannot verify its loopback default"
 else
-    # Two INDEPENDENT properties, not one adjacency. The previous form pinned
-    # `const host = ...; httpServer.listen(port, host,` as a single contiguous
-    # string, so inserting any statement between them failed the assertion even
-    # though both properties still held — which is what happened when the fixture
-    # gained a line computing its announced address. An over-strict pin whose
-    # failure does not correspond to a real exposure trains the next reader to
-    # weaken it; same lesson as Test 18b above.
-    gql_code="$(collapse_code "$gql")"
-    gql_default_ok=0; gql_listen_ok=0
-    printf '%s' "$gql_code" | grep -qF 'process.env.BIND_HOST || "127.0.0.1"' && gql_default_ok=1
-    printf '%s' "$gql_code" | grep -qE 'httpServer\.listen\(port, *host,' && gql_listen_ok=1
-    if [ "$gql_default_ok" -eq 1 ] && [ "$gql_listen_ok" -eq 1 ]; then
+    if printf '%s' "$(collapse_code "$gql")" | grep -qF 'const host = process.env.BIND_HOST || "127.0.0.1"; httpServer.listen(port, host,'; then
         ok "graphql-server/server.js defaults to loopback AND passes host to listen()"
     else
-        gql_why=""
-        [ "$gql_default_ok" -eq 0 ] && gql_why="${gql_why} the BIND_HOST default is no longer \"127.0.0.1\";"
-        [ "$gql_listen_ok" -eq 0 ] && gql_why="${gql_why} listen() is no longer passed \$host;"
-        fail "graphql-server/server.js no longer binds loopback by default —${gql_why} the unset path exposes it on every interface"
+        fail "graphql-server/server.js no longer defaults to loopback or no longer passes host to listen() — the unset path exposes it on every interface"
     fi
 fi
 
@@ -1112,26 +1050,12 @@ if command -v stat >/dev/null 2>&1; then
     # (Comments cannot collide here: bash strips them at parse time, so
     # `declare -f` prints from the parse tree.) The count check makes an
     # ambiguous extraction loud AND inert, rather than arbitrary.
-    #
-    # SELF-6: extract the STATEMENT, not the physical line. `declare -f` prints
-    # from the parse tree, and it joins the statement FOLLOWING a backgrounded
-    # command onto the same physical line — reproduce it with
-    #   bash -c 'f() { sleep 0 & install -m 0600 /dev/null /tmp/z.log; }; declare -f f'
-    # Today the install precedes `node server.js … &`, so a whole-line grab
-    # happened to yield only the install. Reorder them — the exact mutation this
-    # block exists to catch — and `declare -f` emits
-    #   … node server.js > "…" 2>&1 & install -m 0600 /dev/null "…"
-    # on ONE line, and the eval below would LAUNCH an unrecorded, unreaped
-    # background server from a check meant to be inert, in the suite whose whole
-    # subject is orphan-process hardening. The sanity arm could not notice: `a & b`
-    # reports b's status, so the eval still "succeeds". `grep -oE` bounded by
-    # `[^;&]` returns just the install statement, so a joined line cannot smuggle
-    # its neighbour into the eval. MUTATION-PROVEN with a stubbed `node`: the old
-    # whole-line extraction left a live background process behind; this one does not.
-    #
-    # Counting MATCHES rather than matching LINES for the same reason — two
-    # install statements joined onto one physical line are two statements, and
-    # `grep -c` would have called that one.
+    # Extract the STATEMENT, not the physical line. `declare -f` joins the
+    # statement after a backgrounded command onto one line, so with the install
+    # and the `node ... &` reordered a whole-line grab would hand `eval` the node
+    # launch too — spawning an unrecorded, unreaped server from a check meant to
+    # be inert, in the suite whose subject is orphan processes. Measured with a
+    # marker-writing node stub: 1 background launch before this change, 0 after.
     gql_install_matches="$(declare -f start_graphql_server | grep -oE 'install -m [0-7]+ [^;&]*graphql-server\.log[^;&]*')"
     gql_install_line="$(printf '%s\n' "${gql_install_matches}" | head -1)"
     gql_install_n="$(printf '%s' "${gql_install_matches}" | grep -c '.')"
@@ -1141,7 +1065,7 @@ if command -v stat >/dev/null 2>&1; then
         # pick anyway — loud AND arbitrary, while the comment claimed otherwise.
         # Empty routes control to the [ -z ] arm below, which reports the
         # extraction failure instead of acting on a coin-flip.
-        fail "start_graphql_server has ${gql_install_n} install(1) statements targeting .graphql-server.log — the extraction below would pick one arbitrarily; disambiguate rather than trusting head -1 (SEC-BE-003)"
+        fail "start_graphql_server has ${gql_install_n} install(1) lines targeting .graphql-server.log — the extraction below would pick one arbitrarily; disambiguate rather than trusting head -1 (SEC-BE-003)"
         gql_install_line=""
     fi
     if [ -z "$gql_install_line" ]; then

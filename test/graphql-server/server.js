@@ -498,13 +498,19 @@ async function start() {
   // bind only when the devcontainer flow needs it (a crawler in a container
   // reaching the host via TEST_HOST). Mirrors test/forms-target/main.go.
   const host = process.env.BIND_HOST || "127.0.0.1";
-  // Announce the address actually bound, not a hardcoded "localhost": under
-  // LIVE_TARGET_BIND_HOST=0.0.0.0 this fixture listens on every interface, and
-  // a log line still saying "localhost" hid that widening from whoever read
-  // the startup output. Matches the four Go fixtures, which all print their
-  // resolved addr. Bracketing mirrors net.JoinHostPort for an IPv6 BIND_HOST.
-  const addr = host.includes(":") ? "[" + host + "]:" + port : host + ":" + port;
   httpServer.listen(port, host, () => {
+      // Computed INSIDE the callback: Test 19 in setup-live-targets_test.sh pins
+      // `const host = ...` and `httpServer.listen(port, host,` as ADJACENT, so no
+      // statement may sit between reading BIND_HOST and binding it. That pin is
+      // stricter than two independent greps -- it rejects a decoy that keeps the
+      // default in a dead variable while binding something else -- and it is worth
+      // more than the convenience of hoisting this line.
+    // Announce the address actually bound, not a hardcoded "localhost": under
+    // LIVE_TARGET_BIND_HOST=0.0.0.0 this fixture listens on every interface, and
+    // a log line still saying "localhost" hid that widening from whoever read
+    // the startup output. Matches the four Go fixtures, which all print their
+    // resolved addr. Bracketing mirrors net.JoinHostPort for an IPv6 BIND_HOST.
+    const addr = host.includes(":") ? "[" + host + "]:" + port : host + ":" + port;
     console.log("Server ready at http://" + addr + "/");
     console.log("GraphQL endpoint: http://" + addr + "/graphql");
     console.log("\nPages:");

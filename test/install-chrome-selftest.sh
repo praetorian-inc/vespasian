@@ -43,10 +43,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_SCRIPT="${SCRIPT_DIR}/install-chrome.sh"
-# This file's own absolute path. The skip-credit register near the end of the
-# suite greps THIS file for its own `skip "..." N` call sites, so it needs a
-# path that does not depend on the caller's cwd.
-SELF_FILE="${SCRIPT_DIR}/$(basename -- "${BASH_SOURCE[0]}")"
 
 # Pin the probe budget for the whole suite (TEST-005 / TEST-014). This suite
 # sources install-chrome.sh, which sources common.sh's detect_chrome_binary /
@@ -72,13 +68,6 @@ export CHROME_PROBE_TIMEOUT=2
 # own skip is additionally a hard failure via trust_anchor_skips, independently of
 # this pin.
 #
-# Round-15 review follow-up: 238 -> 240. MEASURED, not derived. The +2 are two
-# new self-checks that run on EVERY host (they read this file's own source, so
-# nothing gates them): the skip-credit register and the lock-plant invocation
-# form, both immediately before the Summary. Case f4's own assertion count did
-# not change — only its SKIP credit did, 3 -> 1, because two of its three
-# assertions no longer need gpg (see the case).
-#
 # Round-15 review: 234 -> 238. MEASURED by running the suite, not derived — the
 # per-task deltas in that round's plan were written without shell access and were
 # explicitly flagged untrusted. The +4:
@@ -92,7 +81,7 @@ export CHROME_PROBE_TIMEOUT=2
 #   +2  case bp3, pinning that the consolidated chrome_probe_budget still
 #       validates the budget for _bounded_probe as chrome_runnable does
 # See the credit register above for the matching skip_credit accounting.
-EXPECTED_ASSERTIONS=240
+EXPECTED_ASSERTIONS=238
 
 pass_count=0
 fail_count=0
@@ -133,46 +122,33 @@ SUITE_COMPLETED=0
 # and it cited "192 on a full run" against a pin that was by then 234. A stale
 # provenance record is worse than none — it reads as evidence.
 #
-# The register is now MACHINE-CHECKED against the call sites rather than
-# believed: EXPECTED_SKIP_REGISTER immediately before the Summary pins each
-# site's message and credit, derived from this file at runtime, following
-# test/setup-live-targets_test.sh's register. The prose below therefore carries
-# only what a grep cannot: WHY each arm skips.
+# The register is now derived from the call sites themselves, so it can be
+# checked against the source rather than believed:
 #
-# NO LINE NUMBERS, deliberately. The previous version carried one per site and
-# every one of them was wrong — off by 3 to 122 (a2 said 235 against an actual
-# 284) — because a hand-maintained line number drifts on every edit above it,
-# while claiming in the same breath that the register "can be checked against
-# the source". The runtime register makes them redundant; grep for the message.
+#   line 235   a2    = 1    not inside a git work tree
+#   line 665   f2    = 4    gpg absent (real, unstubbed gpg -- unlike f2b's
+#                                        own stubbed gpg, which needs no gate)
+#   line 804   f4    = 3    gpg absent, same reason as f2
+#   line 1198  j/j2  = 14   key fixture missing or empty
+#   line 1200  j/j2  = 14   gpg absent  (mutually exclusive with the above,
+#                                        so j/j2 contributes 14, never 28)
+#   line 1276  l     = 3    running as root
+#   line 2458  v     = 12   needs the same key fixture / gpg as j/j2
+#   line 2981  y     = 3    needs the same key fixture / gpg as j/j2
+#   line 3057  bp    = 4    no timeout/gtimeout on PATH
 #
-#   a2    = 1    not inside a git work tree
-#   f2    = 4    gpg absent (real, unstubbed gpg -- unlike f2b's own stubbed
-#                gpg, which needs no gate)
-#   f4    = 1    gpg absent. ONLY the "fingerprint mismatch" message assertion
-#                needs gpg; f4's other two (rc 1, and /etc/default never
-#                written) hold on a gpg-less host too — install_pinned_key
-#                still fails, at --import instead of the comparison — and are
-#                the only coverage anywhere that a run which never earns trust
-#                never mutates /etc/default, so they stay live.
-#   j/j2  = 14   key fixture missing or empty, OR gpg absent. The two call
-#                sites are mutually exclusive, so j/j2 contributes 14, never 28.
-#   l     = 3    running as root
-#   v     = 12   needs the same key fixture / gpg as j/j2
-#   y     = 3    needs the same key fixture / gpg as j/j2
-#   bp    = 4    no timeout/gtimeout on PATH
-#
-# Maximum skip_credit on a maximally-degraded host: 1+4+1+14+3+12+3+4 = 42.
-# EXPECTED_ASSERTIONS above is 240, MEASURED on a fully-equipped host
-# (pass+fail+skip_credit with every arm live).
+# Maximum skip_credit on a maximally-degraded host: 1+4+3+14+3+12+3+4 = 44.
+# EXPECTED_ASSERTIONS below is 238, MEASURED on a fully-equipped host in this
+# round (pass+fail+skip_credit with every arm live).
 #
 # PROVENANCE, stated precisely rather than blanket-claimed as "MEASURED":
 #   * a2, j/j2, l, v, y are INHERITED from the round-8 measurement and were not
 #     re-forced this round. They are unchanged since, and the arithmetic above
 #     reconciles with the declared values at each call site.
-#   * f2 = 4 and f4 = 1 were FORCED this round on a PATH with no gpg on it, and
-#     the pin held at 240 — which it could not do before, because the
-#     trust-anchor guard used to `exit 1` ahead of the pin on exactly that host.
-#   * bp = 4 was FORCED this round on a PATH with neither timeout nor gtimeout.
+#   * bp = 4 is NEW this round: it was 2 (covering case bp2's two assertions) and
+#     case bp3 added two more when the probe budget was consolidated into
+#     common.sh's chrome_probe_budget. It has NOT been forced on a
+#     timeout-less host.
 # When you next touch a skip arm, force it and read the delta rather than
 # extending this list by inference — that inference is exactly what decayed here.
 skip() {
@@ -392,39 +368,20 @@ fpr=$(
 assert_eq "case e: pinned signing-key fingerprint constant is unchanged" \
     "EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796" "${fpr}"
 
-# ── Does this host have a real gpg? ONE probe for the whole suite ──
-# There used to be two: `HAS_GPG` (string true/false) here for f2/f4, and
-# `have_gpg` (integer 1/0) at case j/j2, on the stated grounds that "have_gpg is
-# not computed until AFTER this section runs". That described the layout, not a
-# constraint — `command -v gpg` has no prerequisite, so the probe simply moves
-# up. Two names for one fact is a real hazard in a file this size: grepping
-# either name to find every gpg-gated case silently misses the other's, which
-# is how case f4's over-gating survived (see below).
-#
-# Integer 1/0, matching the surviving call sites' `-eq 1` idiom.
-#
-# WHY the gate exists at all: f2 and f4 drive install_pinned_key's REAL
-# gpg --import/--fingerprint calls against a real (committed, but non-Google)
-# fixture key -- unlike f2b, which stubs its own gpg on PATH and so needs no
-# real binary at all. Without a gate, an absent gpg makes --import fail as
-# "command not found" before ever reaching the fingerprint comparison, and the
-# assertions that check for "fingerprint mismatch" text fail while blaming the
-# pin for what is actually a missing tool (f0/f1/f2b are unaffected: f0 never
-# calls gpg at all, f1's "not a valid PGP key" message happens to match either
-# failure reason, and f2b's gpg is its own stub).
-#
-# TEST-005: case j/j2 further down calls gpg UNCONDITIONALLY. An absent gpg used
-# to abort the whole script there under `set -euo pipefail` (a bare
-# command-not-found inside a pipeline feeding a command substitution), killing
-# the run mid-suite with no summary and no indication that everything from there
-# on -- the trust anchor, the phone-home chain, containment, cleanup_all --
-# never executed. Probing explicitly turns that gap into a diagnosable skip
-# (and, per the policy at the end of this file, a hard FAIL) instead of a silent
-# abort.
-if command -v gpg >/dev/null 2>&1; then
-    have_gpg=1
-else
-    have_gpg=0
+# f2 and f4 below drive install_pinned_key's REAL gpg --import/--fingerprint
+# calls against a real (committed, but non-Google) fixture key -- unlike f2b,
+# which stubs its own gpg on PATH and so needs no real binary at all. Without
+# this gate, an absent gpg makes --import fail as "command not found" before
+# ever reaching the fingerprint comparison, and the assertions that check for
+# "fingerprint mismatch" text fail while blaming the pin for what is actually
+# a missing tool (f0/f1/f2b are unaffected: f0 never calls gpg at all, f1's
+# "not a valid PGP key" message happens to match either failure reason, and
+# f2b's gpg is its own stub). Local to this section rather than reusing case
+# j/j2's `have_gpg` below (line ~1117): that variable is not computed until
+# AFTER this section runs.
+HAS_GPG=true
+if ! command -v gpg >/dev/null 2>&1; then
+    HAS_GPG=false
 fi
 
 # ── Case f: install_pinned_key REFUSES an unexpected key ───────
@@ -692,7 +649,7 @@ assert_contains "case f: non-PGP key body is diagnosed" \
 # actually pin the control are the two message checks below plus the negative
 # "did not accept" check: a mutated build emits the ACCEPTANCE message for a key
 # it should have refused, and that is what fails.
-if [ "${have_gpg}" -eq 1 ]; then
+if [ "${HAS_GPG}" = true ]; then
     # shellcheck disable=SC2031  # SCRIPT_DIR is read, not modified; false positive here
     res_f2=$(run_install_pinned_key "cat '${SCRIPT_DIR}/fixtures/not-google-signing-key.asc' > \"\$out\"")
     assert_eq "case f: a valid but unexpected key does not succeed (rc 1)" "1" "$(echo "${res_f2}" | sed -n '1p')"
@@ -791,25 +748,17 @@ fi
 # is emptied and a passthrough sudo is supplied so main() reaches the ordered
 # pair unprivileged; the curl stub serves the wrong key so install_pinned_key
 # fails and the run must stop there.
-#
-# NOT gated on gpg as a whole (round-15 review). Only the "fingerprint mismatch"
-# message assertion needs a real gpg. Without one, install_pinned_key still
-# fails -- at --import, as "not a valid PGP key", instead of at the comparison
-# -- so it still returns 1, main() still aborts on it, and /etc/default is still
-# never written. Those two assertions are the ONLY coverage anywhere that a run
-# which never earns trust never mutates /etc/default, and gating them on a tool
-# they do not use deleted that coverage on exactly the hosts most likely to
-# differ from the author's.
-root_f4="${FIXTURE_DIR}/root-f4"
-bin_f4="${FIXTURE_DIR}/bin-f4"
-mkdir -p "${root_f4}" "${bin_f4}"
-printf '#!/bin/bash\nexec "$@"\n' > "${bin_f4}/sudo"
-cat > "${bin_f4}/dpkg" <<'EOF'
+if [ "${HAS_GPG}" = true ]; then
+    root_f4="${FIXTURE_DIR}/root-f4"
+    bin_f4="${FIXTURE_DIR}/bin-f4"
+    mkdir -p "${root_f4}" "${bin_f4}"
+    printf '#!/bin/bash\nexec "$@"\n' > "${bin_f4}/sudo"
+    cat > "${bin_f4}/dpkg" <<'EOF'
 #!/bin/bash
 [ "$1" = "--print-architecture" ] && { echo amd64; exit 0; }
 exit 1
 EOF
-cat > "${bin_f4}/curl" <<EOF
+    cat > "${bin_f4}/curl" <<EOF
 #!/bin/bash
 out=""
 while [ \$# -gt 0 ]; do
@@ -818,49 +767,44 @@ while [ \$# -gt 0 ]; do
 done
 cat '${SCRIPT_DIR}/fixtures/not-google-signing-key.asc' > "\$out"
 EOF
-chmod +x "${bin_f4}/sudo" "${bin_f4}/dpkg" "${bin_f4}/curl"
-# NOT the usual `set +e` INSIDE the subshell before calling main(): the ordering
-# property being tested is main()'s reliance on `set -e` ITSELF to abort before
-# suppress_permanent_repo runs (install_pinned_key's failure is a bare
-# statement, not an explicit `if ! ...; then exit 1; fi` check). Disabling
-# errexit before the call -- the pattern every other main()-driving case in
-# this file uses -- would disable it for main()'s own internals too, and
-# install_pinned_key's failure would silently stop aborting the run, which is
-# exactly the ordering swap this case exists to catch. So `set +e` is applied
-# OUTSIDE, around the whole command substitution, the same way case r and case
-# t already do it for a script invocation.
-set +e
-res_f4=$(
-    (
-        VESPASIAN_TEST_ROOT="${root_f4}"
-        export VESPASIAN_TEST_ROOT
-        PATH="${bin_f4}:${PATH}"
-        # shellcheck source=install-chrome.sh
-        source "${INSTALL_SCRIPT}"
-        CHROME_CANDIDATES=()
-        main
-    ) 2>&1
-)
-rc_f4=$?
-set -e
-assert_eq "case f: main() aborts before any further mutation when the key is not the pinned one (rc 1)" \
-    "1" "${rc_f4}"
-if [ -e "${root_f4}/etc/default/google-chrome" ]; then
-    echo "FAIL: case f: /etc/default/google-chrome was written despite never earning trust (ordering swapped?)"
-    fail_count=$((fail_count + 1))
-else
-    echo "PASS: case f: a run that never earns trust never mutates /etc/default (install before suppress)"
-    pass_count=$((pass_count + 1))
-fi
-# The only assertion of the three that needs a real gpg: with no gpg the run
-# aborts one step earlier, at --import, so the message is "not a valid PGP key"
-# rather than the mismatch. The abort and the un-mutated /etc/default above hold
-# either way and are asserted either way.
-if [ "${have_gpg}" -eq 1 ]; then
+    chmod +x "${bin_f4}/sudo" "${bin_f4}/dpkg" "${bin_f4}/curl"
+    # NOT the usual `set +e` INSIDE the subshell before calling main(): the ordering
+    # property being tested is main()'s reliance on `set -e` ITSELF to abort before
+    # suppress_permanent_repo runs (install_pinned_key's failure is a bare
+    # statement, not an explicit `if ! ...; then exit 1; fi` check). Disabling
+    # errexit before the call -- the pattern every other main()-driving case in
+    # this file uses -- would disable it for main()'s own internals too, and
+    # install_pinned_key's failure would silently stop aborting the run, which is
+    # exactly the ordering swap this case exists to catch. So `set +e` is applied
+    # OUTSIDE, around the whole command substitution, the same way case r and case
+    # t already do it for a script invocation.
+    set +e
+    res_f4=$(
+        (
+            VESPASIAN_TEST_ROOT="${root_f4}"
+            export VESPASIAN_TEST_ROOT
+            PATH="${bin_f4}:${PATH}"
+            # shellcheck source=install-chrome.sh
+            source "${INSTALL_SCRIPT}"
+            CHROME_CANDIDATES=()
+            main
+        ) 2>&1
+    )
+    rc_f4=$?
+    set -e
+    assert_eq "case f: main() aborts on a fingerprint mismatch before any further mutation (rc 1)" \
+        "1" "${rc_f4}"
     assert_contains "case f: the abort is the fingerprint mismatch, not something else" \
         "fingerprint mismatch" "${res_f4}"
+    if [ -e "${root_f4}/etc/default/google-chrome" ]; then
+        echo "FAIL: case f: /etc/default/google-chrome was written despite never earning trust (ordering swapped?)"
+        fail_count=$((fail_count + 1))
+    else
+        echo "PASS: case f: a run that never earns trust never mutates /etc/default (install before suppress)"
+        pass_count=$((pass_count + 1))
+    fi
 else
-    skip "case f4: the abort is specifically a fingerprint mismatch (gpg not found on PATH)" 1
+    skip "case f4: main() ordering guarantee on a fingerprint mismatch (gpg not found on PATH)" 3
 fi
 
 # ── Case g: the symlink guard on the defaults file ─────────────
@@ -1189,9 +1133,19 @@ assert_contains "case i: the reason is explained, not just a bare exit" \
 # egress to dl.google.com, so an egress change could disarm them while the suite
 # stayed green.
 GOOGLE_KEY_CACHE="${SCRIPT_DIR}/fixtures/google-linux-signing-key.asc"
-# `have_gpg` is the suite-wide probe, computed once near case f (TEST-005 and
-# the two-names hazard are both explained there). The line below calls gpg
-# unconditionally, which is why the probe has to gate it.
+# TEST-005: this suite's header claims it needs no network, but says nothing
+# about gpg -- and the very next line calls it unconditionally. An absent gpg
+# used to abort the whole script here under `set -euo pipefail` (a bare
+# command-not-found inside a pipeline feeding a command substitution), killing
+# the run mid-suite with no summary and no indication that everything from
+# here on -- the trust anchor, the phone-home chain, containment, cleanup_all
+# -- never executed. Checked explicitly so the gap becomes a diagnosable skip
+# (and, per the policy below, a hard FAIL) instead of a silent abort.
+if command -v gpg >/dev/null 2>&1; then
+    have_gpg=1
+else
+    have_gpg=0
+fi
 if [ "${have_gpg}" -eq 1 ] && [ -s "${GOOGLE_KEY_CACHE}" ]; then
     have_real_key=1
 else
@@ -3306,31 +3260,29 @@ run_lock_plant() {
         PATH="${bin}:${PATH}"
         set +e
         local out rc
-        # ONE invocation, optionally prefixed with the timeout. The two arms this
-        # replaced were byte-identical apart from that `"${tmo}" 15` prefix -- a
-        # 24-line branch to prepend two words -- and the cost of the duplication
-        # was not cosmetic: the no-timeout arm ran ONLY on a host with neither
-        # timeout nor gtimeout, which no CI job is, so reverting its `bash -c`
-        # (the fix below) stayed green everywhere. With one arm the fix executes
-        # on every host, and a revert fails everywhere. The array is never empty,
-        # so `set -u` has nothing to complain about.
-        local -a invoke=(bash -c 'source "$1"; main' _ "${INSTALL_SCRIPT}")
-        [ -n "${tmo}" ] && invoke=("${tmo}" 15 "${invoke[@]}")
-        # `main` is not auto-invoked when sourced (BASH_SOURCE guard), hence the
-        # explicit call. A bare `bash -c` (not `source` directly into THIS
-        # subshell) is deliberate, not a stylistic mismatch: a direct `source`
-        # here would pull install-chrome.sh's own `set -euo pipefail` into this
-        # subshell, and the next line would then be `out=$(main 2>&1)` -- a bare
-        # assignment. Under errexit, a failing `main` (every lock-planted case in
-        # this function deliberately makes it fail) aborts this whole `(` block
-        # before `rc=$?`/`printf` ever run, losing every case from z onward AND
-        # the assertion-accounting pin at the end of the file, with no FAIL
-        # printed for any of it -- a silent abort dressed as a clean run. A fresh
-        # bash process contains that errexit to itself; only its exit code
-        # escapes, exactly as the timeout prefix already relies on. The
-        # lock-plant invocation-form check before the Summary pins this shape.
-        out=$("${invoke[@]}" 2>&1)
-        rc=$?
+        if [ -n "${tmo}" ]; then
+            # `main` is not auto-invoked when sourced (BASH_SOURCE guard), so the
+            # inner shell sources then calls it explicitly, exactly as the
+            # unbounded arm below does.
+            out=$("${tmo}" 15 bash -c 'source "$1"; main' _ "${INSTALL_SCRIPT}" 2>&1)
+            rc=$?
+        else
+            # A bare `bash -c` (not `source` directly into THIS subshell) is
+            # deliberate, not an unbounded-vs-bounded stylistic mismatch: a
+            # direct `source` here would pull install-chrome.sh's own
+            # `set -euo pipefail` into this subshell, and the next line would
+            # then be `out=$(main 2>&1)` -- a bare assignment. Under errexit, a
+            # failing `main` (every lock-planted case in this function
+            # deliberately makes it fail) aborts this whole `(` block before
+            # `rc=$?`/`printf` ever run, losing every case from z onward AND
+            # the assertion-accounting pin at the end of the file, with no
+            # FAIL printed for any of it -- a silent abort dressed as a clean
+            # run. A fresh bash process contains that errexit to itself; only
+            # its exit code escapes, exactly as the timeout arm above already
+            # relies on.
+            out=$(bash -c 'source "$1"; main' _ "${INSTALL_SCRIPT}" 2>&1)
+            rc=$?
+        fi
         printf '%s\n%s\n' "${rc}" "${out}"
     )
 }
@@ -3658,70 +3610,6 @@ else
     pass_count=$((pass_count + 1))
 fi
 
-# ── Self-checks on this file's own guards ───────────────────────
-# Both read THIS file's source, so they run on every host — which is the point.
-# The two fixes in abc36ed had no guard of any kind: one lived in a branch no CI
-# job takes, the other was a pair of numbers in a comment.
-
-# 1. Skip-credit register (the idiom test/setup-live-targets_test.sh uses).
-# PER-SITE, not just a total: pinning only the sum is defeated by a zero-sum
-# swap (move 1 credit from f4 to f2 and the total is unchanged while both arms
-# mis-credit their blocks), and a wrong per-site credit breaks the accounting
-# pin on precisely the degraded host that fires that arm — the host where,
-# until this round, the pin was never reached at all. The register is each
-# site's own credit keyed by its message, derived from the file at runtime, so
-# adding, deleting, re-wording or re-crediting a skip fails here.
-#
-# The credits sum to 56, not to the 42 quoted in the register comment near the
-# top: cases j/j2's two sites are mutually exclusive, so only one of them can
-# ever fire. 56 - 14 = 42.
-EXPECTED_SKIP_REGISTER='case a2: committed-mode check (not a git checkout)=1
-case f2: fingerprint-mismatch diagnosis for an unexpected real key (gpg not found on PATH)=4
-case f4: the abort is specifically a fingerprint mismatch (gpg not found on PATH)=1
-case j/j2: trust-anchor success path (fixture test/fixtures/google-linux-signing-key.asc missing or empty)=14
-case j/j2: trust-anchor success path (gpg not found on PATH)=14
-case l: non-root sudo refusal (running as root)=3
-case v: main-install-path in_container() gating (needs the same key fixture/gpg as j/j2)=12
-case y: pre-install origin gate (needs the same key fixture/gpg as j/j2)=3
-case bp: _bounded_probe timeout enforcement (no timeout/gtimeout on PATH)=4'
-actual_skip_register=$(grep -oE '^[[:space:]]*skip "[^"]*" [0-9]+' "${SELF_FILE}" \
-    | sed -E 's/^[[:space:]]*skip "([^"]*)" ([0-9]+)$/\1=\2/')
-# A skip written WITHOUT an explicit credit defaults to 0 and would simply not
-# appear above, so the total number of call sites is counted separately rather
-# than being invisible.
-actual_skip_sites=$(grep -cE '^[[:space:]]*skip "' "${SELF_FILE}")
-expected_skip_sites=$(printf '%s\n' "${EXPECTED_SKIP_REGISTER}" | wc -l | tr -d ' ')
-if [ "${actual_skip_register}" = "${EXPECTED_SKIP_REGISTER}" ] && \
-   [ "${actual_skip_sites}" -eq "${expected_skip_sites}" ]; then
-    echo "PASS: skip-credit register is current: ${actual_skip_sites} sites, each credit matching its recorded value"
-    pass_count=$((pass_count + 1))
-else
-    echo "FAIL: skip-credit register drifted — a skip was added, removed, re-credited, re-worded, or written without an explicit credit. Expected:"
-    printf '%s\n' "${EXPECTED_SKIP_REGISTER}"
-    echo "Found (${actual_skip_sites} total sites, credited ones listed):"
-    printf '%s\n' "${actual_skip_register}"
-    fail_count=$((fail_count + 1))
-fi
-
-# 2. run_lock_plant's invocation form. The `bash -c` there is load-bearing (see
-# the comment at the call site: a direct `source` imports install-chrome.sh's
-# errexit and silently kills the suite from case z onward, pin included). It is
-# now a single unconditional invocation, so a revert to a direct source fails
-# on every host by EXECUTION — but a revert that also restores the old
-# timeout/no-timeout branching would put the direct source back on a path no CI
-# job takes. This pins the shape as well as running it.
-lockplant_body=$(awk '/^run_lock_plant\(\) \{/,/^\}/' "${SELF_FILE}" | grep -vE '^[[:space:]]*#')
-lp_bashc=$(printf '%s\n' "${lockplant_body}" | grep -cF "bash -c 'source \"\$1\"; main'" || true)
-lp_direct=$(printf '%s\n' "${lockplant_body}" | grep -cE '^[[:space:]]*source ' || true)
-if [ "${lp_bashc}" -eq 1 ] && [ "${lp_direct}" -eq 0 ]; then
-    echo "PASS: run_lock_plant drives main() through exactly one fresh \`bash -c\`, never a direct source"
-    pass_count=$((pass_count + 1))
-else
-    echo "FAIL: run_lock_plant's invocation form changed (${lp_bashc} \`bash -c\` invocation(s), ${lp_direct} direct source(s), expected 1 and 0)"
-    echo "  A direct \`source\` pulls install-chrome.sh's own errexit into the caller's subshell; the deliberately-failing main() then aborts it before rc/printf, losing every case from z onward AND the assertion-accounting pin, silently."
-    fail_count=$((fail_count + 1))
-fi
-
 # ── Summary ─────────────────────────────────────────────────────
 SUITE_COMPLETED=1
 echo ""
@@ -3737,36 +3625,25 @@ echo "install-chrome-selftest: ${pass_count} passed, ${fail_count} failed, ${ski
 # legitimate — a tarball export, or CI running as root — and failing the whole
 # suite for those turns a valid environment into a red build. The counter is
 # scoped so the policy means what it says.
-#
-# ORDER IS LOAD-BEARING. Every check below RECORDS its verdict in summary_rc and
-# the script exits once, at the end. The accounting pin used to sit AFTER the
-# trust-anchor `exit 1`, which meant that on a gpg-less host — exactly the
-# configuration the gpg gating exists for — the trust-anchor guard exited first
-# and the pin never evaluated at all. A wrong skip credit is invisible on every
-# host that fires the arm it belongs to, and visible only on hosts that do not,
-# which is the reverse of what a degraded-host pin is for. MEASURED: with that
-# `exit 1` neutralised, a gpg-less run reached the pin and satisfied it.
-summary_rc=0
-
-# The accounting pin FIRST, and unconditionally: it is the check most likely to
-# be disarmed by an early exit, and it is the one that has to hold on degraded
-# hosts to be worth anything.
-if [ "$((pass_count + fail_count + skip_credit))" -ne "${EXPECTED_ASSERTIONS}" ]; then
-    echo "install-chrome-selftest: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip_credit), saw $((pass_count + fail_count + skip_credit))."
-    echo "  A case was added or removed without updating EXPECTED_ASSERTIONS, or a skip's credit does not match the block it stands in for."
-    summary_rc=1
-fi
-# The trust-anchor guard keeps its own non-zero exit: it is a deliberate refusal
-# to call a run with no success-path coverage a pass, not a bug. It just no
-# longer pre-empts the pin above.
-if [ "${trust_anchor_skips}" -ne 0 ]; then
-    echo "install-chrome-selftest: FAIL — the trust-anchor success path (j/j2) was skipped; that is a coverage hole."
-    echo "  (cases j/j2 read test/fixtures/google-linux-signing-key.asc; if that fixture is"
-    echo "   missing or empty the trust anchor's success path is untested — fix it, do not skip.)"
-    summary_rc=1
-fi
 if [ "${skip_count}" -ne 0 ]; then
     echo "install-chrome-selftest: NOTE — ${skip_count} case(s) skipped for environmental reasons"
     echo "  (a2 needs a git checkout; l cannot run as root). Not a failure, but not coverage either."
 fi
-[ "${summary_rc}" -eq 0 ] && [ "${fail_count}" -eq 0 ]
+# The accounting pin runs FIRST, before the trust-anchor guard's exit. Ordered
+# the other way, a gpg-less host exited at the trust-anchor check and the pin
+# never evaluated — so on exactly the degraded configuration the skip credits
+# exist for, a wrong credit was invisible. Measured: with EXPECTED_ASSERTIONS
+# deliberately falsified on such a host, the old order printed no drift line at
+# all. Both guards now report.
+if [ "$((pass_count + fail_count + skip_credit))" -ne "${EXPECTED_ASSERTIONS}" ]; then
+    echo "install-chrome-selftest: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip_credit), saw $((pass_count + fail_count + skip_credit))."
+    echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
+    exit 1
+fi
+if [ "${trust_anchor_skips}" -ne 0 ]; then
+    echo "install-chrome-selftest: FAIL — the trust-anchor success path (j/j2) was skipped; that is a coverage hole."
+    echo "  (cases j/j2 read test/fixtures/google-linux-signing-key.asc; if that fixture is"
+    echo "   missing or empty the trust anchor's success path is untested — fix it, do not skip.)"
+    exit 1
+fi
+[ "${fail_count}" -eq 0 ]

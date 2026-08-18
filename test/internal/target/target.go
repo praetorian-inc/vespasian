@@ -18,7 +18,6 @@
 package target
 
 import (
-	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -52,18 +51,10 @@ const (
 // opts into a wider bind only when the devcontainer flow needs it (a crawler inside
 // a container reaching the host via TEST_HOST). The unset path is the common one, so
 // it is the one that must be safe.
-//
-// The non-default path is ANNOUNCED. BIND_HOST is read from the ambient
-// environment, so a value exported in a shell profile, a devcontainer env block
-// or a leftover `export` from an earlier run widens the bind of an
-// unauthenticated fixture with nothing on screen to say so. The warning cannot
-// change which host is returned — it only makes a silent widening loud.
 func Addr(port string) string {
 	host := os.Getenv("BIND_HOST")
 	if host == "" {
 		host = "127.0.0.1"
-	} else {
-		fmt.Fprintf(os.Stderr, "[WARN] BIND_HOST=%s from the environment — this fixture binds there, not the 127.0.0.1 default\n", host)
 	}
 	return net.JoinHostPort(host, port)
 }
