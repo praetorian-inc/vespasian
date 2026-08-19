@@ -78,3 +78,35 @@ jobs:
         run: |
           git fetch --no-tags origin "${BASE_REF#origin/}"
           make lint-comments
+
+  # LAB-5331: local coverage gate. The reusable go-ci.yml (the `ci` job) produces a
+  # coverage profile but never enforces a threshold, so this sibling job runs
+  # `make coverage-gate`, which fails the build when total statement coverage drops
+  # below COVERAGE_THRESHOLD (Makefile). No third-party service, token, or new egress.
+  coverage:
+    name: coverage-gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Defense-in-depth (LAB-4732 / SEC-BE-002): monitor/record outbound
+      # traffic. Audit mode is non-blocking. Expected egress: github.com,
+      # proxy.golang.org, sum.golang.org, storage.googleapis.com,
+      # objects.githubusercontent.com (Go toolchain + module download).
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
+        with:
+          go-version-file: go.mod
+      # `make coverage` runs the suite under -race, which requires CGO + a C
+      # compiler; ubuntu-latest ships gcc. The profile excludes test/.
+      - name: Enforce coverage threshold
+        env:
+          CGO_ENABLED: "1"
+        run: make coverage-gate

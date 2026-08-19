@@ -708,7 +708,7 @@ func TestCapability_Parameters(t *testing.T) {
 
 // TestCapability_Metadata pins the trivial getter surface (Name, Description,
 // Input, Full, Timeout) that were at 0.0% coverage. Each is a single-statement
-// function; covering them here contributes to the 80% threshold.
+// function; covering them here contributes to the coverage threshold.
 func TestCapability_Metadata(t *testing.T) {
 	c := &Capability{}
 

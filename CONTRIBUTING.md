@@ -72,6 +72,7 @@ make vet              # go vet ./...
 make lint             # golangci-lint run
 make check            # fmt + vet + lint + test — run this before opening a PR
 make coverage         # Coverage profile + per-function report (excludes test/)
+make coverage-gate    # Fail if total coverage is below the CI threshold (85%)
 make live-test-clean  # Stop orphaned live-test services
 ```
 
@@ -228,10 +229,11 @@ Conventions:
 ### Coverage
 
 ```bash
-make coverage    # Writes coverage.out, prints per-function coverage
+make coverage         # Writes coverage.out, prints per-function coverage
+make coverage-gate    # Fails if total statement coverage is below the threshold
 ```
 
-Aim to keep coverage at or above **80%** for the packages you touch. CI measures coverage on every Go PR but does not currently fail a build below a threshold, so this is enforced at review time — a PR that materially drops coverage will be asked for tests.
+CI enforces a minimum of **85%** total statement coverage on every Go PR: the `coverage-gate` job in `ci.yml` runs `make coverage-gate`, which fails the build when total coverage falls below 85%. Run `make coverage-gate` locally before pushing. The threshold lives in one place — `COVERAGE_THRESHOLD` in the `Makefile` — and sits just under the 86.4% baseline measured when the gate was introduced (LAB-5331), so keep coverage at or above 85% for the packages you touch rather than spending that headroom.
 
 ### Live tests
 
