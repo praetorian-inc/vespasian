@@ -20,6 +20,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -489,6 +490,54 @@ func TestAnalyze_StatsEndpointsFound(t *testing.T) {
 	}
 	if res.Stats.BundlesAnalyzed != 1 {
 		t.Errorf("expected BundlesAnalyzed=1, got %d", res.Stats.BundlesAnalyzed)
+	}
+}
+
+// TestAnalyze_MaxEndpointsPerBundle_CountsNextRouteRecovery pins the Next.js
+// chunk-URL recovery against the SAME per-bundle cap as everything else.
+//
+// The route is synthesized from the bundle URL before body extraction runs, so
+// budgeting the body against the full MaxEndpointsPerBundle let such a bundle keep
+// cap+1. The sourcemap loop already subtracts what has been kept; the body path
+// must too, or the cap means one thing for ordinary bundles and another for the
+// exact bundles this feature targets.
+func TestAnalyze_MaxEndpointsPerBundle_CountsNextRouteRecovery(t *testing.T) {
+	var sb strings.Builder
+	for i := 0; i < 10; i++ {
+		fmt.Fprintf(&sb, "fetch(\"/api/r%d\");\n", i)
+	}
+	// A real App Router chunk URL: nextroute.go recovers /vaults/{vaultId} from
+	// the path alone, independently of the body above.
+	const chunk = "https://example.com/_next/static/chunks/app/vaults/%5BvaultId%5D/page-8ca1aac6111f15fc.js"
+
+	res, err := Analyze(context.Background(), []crawl.ObservedRequest{
+		makeJSCapture(chunk, sb.String()),
+	}, Options{MaxEndpointsPerBundle: 4})
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+
+	var static, nextRoute int
+	for _, r := range res.Requests {
+		if crawl.IsJSStaticSource(r.Source) {
+			static++
+		}
+		if r.Source == crawl.SourceNextPageRoute {
+			nextRoute++
+		}
+	}
+	if static != 4 {
+		t.Errorf("kept %d JS-static endpoints with MaxEndpointsPerBundle=4; the chunk-URL "+
+			"recovery must be charged against the cap, not added on top of it", static)
+	}
+	if res.Stats.EndpointsKept != 4 {
+		t.Errorf("Stats.EndpointsKept = %d, want 4", res.Stats.EndpointsKept)
+	}
+	// Non-vacuous: the recovery has to have actually fired, or this asserts nothing
+	// about the interaction between the two producers.
+	if nextRoute != 1 {
+		t.Fatalf("recovered %d Next.js routes from %q, want 1; without the recovery this "+
+			"test cannot detect the off-by-one", nextRoute, chunk)
 	}
 }
 
@@ -1053,6 +1102,68 @@ func TestAnalyze_SinglePassOversizedCount(t *testing.T) {
 	if len(res.Requests) < 3 {
 		t.Errorf("expected at least 3 requests, got %d", len(res.Requests))
 	}
+}
+
+// TestAnalyze_DeterministicSynthesizedOrder verifies that Analyze emits the
+// synthesized static:js entries in a stable, capture-determined order across
+// runs (LAB-4678 Phase 2), despite the worker pool returning results in a
+// non-deterministic completion order. Multiple bundles with literal fetch
+// paths give the pool real work to reorder.
+func TestAnalyze_DeterministicSynthesizedOrder(t *testing.T) {
+	mkBundle := func(url, body string) crawl.ObservedRequest {
+		return crawl.ObservedRequest{
+			Method: "GET", URL: url,
+			Response: crawl.ObservedResponse{
+				StatusCode: 200, ContentType: "application/javascript", Body: []byte(body),
+			},
+		}
+	}
+	captured := []crawl.ObservedRequest{
+		mkBundle("https://ex.com/a.js", `fetch("/api/alpha");fetch("/api/bravo")`),
+		mkBundle("https://ex.com/b.js", `fetch("/api/charlie");fetch("/api/delta")`),
+		mkBundle("https://ex.com/c.js", `fetch("/api/echo");fetch("/api/foxtrot")`),
+		mkBundle("https://ex.com/d.js", `fetch("/api/golf");fetch("/api/hotel")`),
+	}
+
+	extractOrder := func() []string {
+		res, err := Analyze(context.Background(), captured, Options{Concurrency: 4})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var urls []string
+		for _, r := range res.Requests[len(captured):] { // synthesized tail only
+			// URL first, then method: matches synthesizedLess's key order so a
+			// lexicographic check below is a valid test of the production order.
+			urls = append(urls, r.URL+" "+r.Method)
+		}
+		return urls
+	}
+
+	first := extractOrder()
+	if len(first) == 0 {
+		t.Fatal("expected synthesized endpoints, got none")
+	}
+	// Repeated runs must produce byte-identical ordering.
+	for i := 0; i < 8; i++ {
+		got := extractOrder()
+		if !slices.Equal(first, got) {
+			t.Fatalf("synthesized order not deterministic across runs:\n first=%v\n run%d=%v", first, i, got)
+		}
+	}
+	// And that order must be ascending by (URL, method) — a necessary condition
+	// of synthesizedLess's ordering, checkable without reimplementing it.
+	if !sortedByURLMethod(first) {
+		t.Errorf("synthesized entries not in sorted order: %v", first)
+	}
+}
+
+func sortedByURLMethod(xs []string) bool {
+	for i := 1; i < len(xs); i++ {
+		if xs[i-1] > xs[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // LAB-4992 end-to-end: a fully-offline capture whose API endpoints exist ONLY

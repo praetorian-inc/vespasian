@@ -811,3 +811,68 @@ func TestHTTPCrawler_SendsCustomHeaders(t *testing.T) {
 		t.Errorf("X-Test-Header = %q, want sentinel", got)
 	}
 }
+
+// TestHTTPCrawler_InteractWarns covers --interact on the net/http backend. That
+// backend has no DOM to click, so it ignores the option; saying nothing left an
+// operator who ran "--interact --headless=false" to conclude the target had no
+// interaction-only surface. Mirrors the concurrency-cap warning in newRodEngine.
+func TestHTTPCrawler_InteractWarns(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<html><body>ok</body></html>`)
+	}))
+	defer srv.Close()
+
+	run := func(interact bool) string {
+		var stderr bytes.Buffer
+		c := &HTTPCrawler{opts: CrawlerOptions{
+			Depth: 0, MaxPages: 1, Scope: "same-origin",
+			AllowPrivate: true, Interact: interact, Stderr: &stderr,
+		}}
+		if _, err := c.Crawl(context.Background(), srv.URL+"/"); err != nil {
+			t.Fatalf("Crawl(interact=%v): %v", interact, err)
+		}
+		return stderr.String()
+	}
+
+	if got := run(true); !strings.Contains(got, "--interact") || !strings.Contains(got, "headless") {
+		t.Errorf("--interact on the net/http backend produced no warning; stderr = %q", got)
+	}
+	if got := run(false); strings.Contains(got, "--interact") {
+		t.Errorf("warned about --interact when it was not requested; stderr = %q", got)
+	}
+}
+
+// TestHTTPCrawler_TransientFailureNotPersistedAsSeen is the end-to-end half of the
+// retry-on-resume fix. Checkpoint.Seen accumulates across resume cycles, so a page
+// that failed once (here: nothing listening, i.e. a connection refused standing in
+// for a DNS blip or a 503-shaped transport failure) would be treated as covered by
+// every future resumed run and never retried.
+func TestHTTPCrawler_TransientFailureNotPersistedAsSeen(t *testing.T) {
+	// A server that is up long enough to hand out a reachable URL, then closed —
+	// so the crawl's fetch fails at the transport level.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	target := srv.URL + "/"
+	srv.Close()
+
+	var got *Checkpoint
+	var stderr bytes.Buffer
+	c := &HTTPCrawler{opts: CrawlerOptions{
+		Depth: 1, MaxPages: 5, Scope: "same-origin", AllowPrivate: true,
+		Stderr:       &stderr,
+		OnCheckpoint: func(cp *Checkpoint) { got = cp },
+	}}
+	results, err := c.Crawl(context.Background(), target)
+	if err != nil {
+		t.Fatalf("Crawl: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected no captured requests against a closed server, got %d", len(results))
+	}
+	if got == nil {
+		t.Fatal("no checkpoint captured")
+	}
+	if len(got.Seen) != 0 {
+		t.Errorf("checkpoint seen-set = %v, want empty: a transient fetch failure must stay retryable on resume", got.Seen)
+	}
+}

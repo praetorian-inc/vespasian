@@ -63,7 +63,12 @@ func TestWSDLClassifier_Classify(t *testing.T) {
 			wantReasonSub: "soap-content-type",
 		},
 		{
-			name: "text/xml content-type",
+			// text/xml is generic XML, not SOAP-specific, so on its own it scores
+			// GenericXMLConfidence — below DefaultConfidenceThreshold and below
+			// RESTClassifier's ContentTypeConfidence, so it is neither a WSDL match
+			// nor a WSDL vote. It used to score 0.85, which outranked REST's 0.8 and
+			// let one XML response type an entire capture as SOAP.
+			name: "text/xml content-type alone is generic XML, not a SOAP signal",
 			req: crawl.ObservedRequest{
 				Method: "POST",
 				URL:    "https://example.com/service",
@@ -73,9 +78,45 @@ func TestWSDLClassifier_Classify(t *testing.T) {
 				},
 			},
 			wantIsAPI:     true,
+			wantMinConf:   GenericXMLConfidence,
+			wantMaxConf:   GenericXMLConfidence,
+			wantReasonSub: "generic-xml-content-type",
+		},
+		{
+			// application/soap+xml IS SOAP-specific, so it keeps the full signal.
+			name: "application/soap+xml content-type",
+			req: crawl.ObservedRequest{
+				Method: "POST",
+				URL:    "https://example.com/service",
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: "application/soap+xml",
+				},
+			},
+			wantIsAPI:     true,
 			wantMinConf:   0.85,
 			wantMaxConf:   1.0,
 			wantReasonSub: "soap-content-type",
+		},
+		{
+			// A SOAP response with no SOAPAction and no request body still
+			// identifies as SOAP, via the envelope in the RESPONSE. This is what
+			// makes lowering bare text/xml safe.
+			name: "soap envelope in response body, no SOAPAction",
+			req: crawl.ObservedRequest{
+				Method: "POST",
+				URL:    "https://example.com/service",
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: "text/xml",
+					Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+						`<soap:Body><GetUserResponse/></soap:Body></soap:Envelope>`),
+				},
+			},
+			wantIsAPI:     true,
+			wantMinConf:   0.90,
+			wantMaxConf:   1.0,
+			wantReasonSub: "soap-envelope",
 		},
 		{
 			name: "SOAP envelope in body",
@@ -137,7 +178,7 @@ func TestWSDLClassifier_Classify(t *testing.T) {
 			wantIsAPI:     true,
 			wantMinConf:   0.3,
 			wantMaxConf:   0.3,
-			wantReasonSub: "soap-content-type",
+			wantReasonSub: "generic-xml-content-type",
 		},
 		{
 			name: "Atom feed exclusion",
@@ -270,4 +311,75 @@ func TestWSDLClassifier_ClassifyWrapper(t *testing.T) {
 func TestWSDLClassifier_ImplementsDetailedClassifier(t *testing.T) {
 	var c APIClassifier = &WSDLClassifier{}
 	assert.Implements(t, (*DetailedClassifier)(nil), c)
+}
+
+func TestWSDL_GenericXMLIsNotASoapVote(t *testing.T) {
+	req := crawl.ObservedRequest{
+		Method: "GET",
+		URL:    "https://example.com/sitemap",
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "text/xml",
+			Body:        []byte("<urlset><url><loc>https://example.com/</loc></url></urlset>"),
+		},
+	}
+
+	_, wsdlConf := (&WSDLClassifier{}).Classify(req)
+	_, restConf := (&RESTClassifier{}).Classify(req)
+
+	if wsdlConf >= restConf {
+		t.Errorf("bare text/xml scores WSDL %.2f >= REST %.2f: it becomes a WSDL vote in "+
+			"DetectAPIType, so one XML response can type an entire capture as SOAP",
+			wsdlConf, restConf)
+	}
+	if wsdlConf >= DefaultConfidenceThreshold {
+		t.Errorf("bare text/xml scores WSDL %.2f, at or above the %.2f threshold: generic XML "+
+			"is not SOAP evidence and must not be a WSDL match at all",
+			wsdlConf, DefaultConfidenceThreshold)
+	}
+}
+
+func TestWSDL_RealSoapStillClassifies(t *testing.T) {
+	cases := []struct {
+		name string
+		req  crawl.ObservedRequest
+	}{
+		{"SOAPAction header", crawl.ObservedRequest{
+			Method: "POST", URL: "https://ex.com/svc",
+			Headers:  map[string]string{"SOAPAction": `"urn:GetUser"`},
+			Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "text/xml"},
+		}},
+		{"envelope in request body", crawl.ObservedRequest{
+			Method: "POST", URL: "https://ex.com/svc",
+			Body:     []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"/>`),
+			Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "text/xml"},
+		}},
+		{"envelope in response body only", crawl.ObservedRequest{
+			Method: "POST", URL: "https://ex.com/svc",
+			Response: crawl.ObservedResponse{
+				StatusCode: 200, ContentType: "text/xml",
+				Body: []byte(`<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"/>`),
+			},
+		}},
+		{"application/soap+xml", crawl.ObservedRequest{
+			Method: "POST", URL: "https://ex.com/svc",
+			Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/soap+xml"},
+		}},
+		{"?wsdl URL", crawl.ObservedRequest{
+			Method: "GET", URL: "https://ex.com/svc?wsdl",
+			Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "text/xml"},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			isAPI, conf := (&WSDLClassifier{}).Classify(tc.req)
+			if !isAPI || conf < DefaultConfidenceThreshold {
+				t.Errorf("genuine SOAP no longer classifies: isAPI=%v conf=%.2f", isAPI, conf)
+			}
+			_, restConf := (&RESTClassifier{}).Classify(tc.req)
+			if conf < restConf {
+				t.Errorf("SOAP scores %.2f below REST's %.2f, so it would lose the vote", conf, restConf)
+			}
+		})
+	}
 }

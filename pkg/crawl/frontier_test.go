@@ -15,6 +15,7 @@
 package crawl
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -399,4 +400,117 @@ func TestFrontier_ActiveWorkerPreventsEarlyDone(t *testing.T) {
 	}
 	// Worker 2 consumed the discovered URL (active incremented by its Pop).
 	f.MarkIdle()
+}
+
+// TestFrontier_Requeue verifies an abandoned entry returns to the queue while
+// its key stays in seen. This is what keeps a budget-truncated crawl's pending
+// pages alive for cross-run resume: dropping them instead lost the entire
+// pending queue at default concurrency (LAB-4678 Phase 4).
+func TestFrontier_Requeue(t *testing.T) {
+	f := newURLFrontier(10, nil)
+	f.Push([]urlEntry{{URL: "https://ex.com/a", Depth: 1}})
+
+	entry, ok := f.Pop()
+	if !ok {
+		t.Fatal("Pop returned no entry")
+	}
+	if f.Len() != 0 {
+		t.Fatalf("queue len after Pop = %d, want 0", f.Len())
+	}
+
+	f.Requeue(entry)
+	f.MarkIdle()
+
+	if f.Len() != 1 {
+		t.Errorf("queue len after Requeue = %d, want 1", f.Len())
+	}
+	// The key must stay in seen so a rediscovered link still dedups.
+	if added := f.Push([]urlEntry{{URL: "https://ex.com/a", Depth: 1}}); added != 0 {
+		t.Errorf("Requeue cleared the seen key (Push added %d, want 0)", added)
+	}
+	// And the requeued entry is the one that comes back out.
+	got, ok := f.Pop()
+	if !ok || got.URL != "https://ex.com/a" || got.Depth != 1 {
+		t.Errorf("Pop after Requeue = %+v (ok=%v), want the requeued entry", got, ok)
+	}
+	// Snapshot must see a requeued entry as pending.
+	f.Requeue(got)
+	if pending, _ := f.Snapshot(); len(pending) != 1 {
+		t.Errorf("Snapshot pending = %d, want 1 (requeued entry must be resumable)", len(pending))
+	}
+}
+
+// TestFrontier_RequeueAfterClose verifies Requeue is a no-op once the frontier
+// is closed, so a late worker cannot resurrect the queue during shutdown.
+func TestFrontier_RequeueAfterClose(t *testing.T) {
+	f := newURLFrontier(10, nil)
+	f.Push([]urlEntry{{URL: "https://ex.com/a", Depth: 1}})
+	entry, _ := f.Pop()
+	f.Close()
+	f.Requeue(entry)
+	if f.Len() != 0 {
+		t.Errorf("Requeue after Close enqueued %d entries, want 0", f.Len())
+	}
+}
+
+// TestFrontier_BoundedQueryVariants verifies the per-path query-variant policy:
+// a path may be crawled with up to maxQueryVariantsPerPath distinct query strings,
+// after which further variants are dropped.
+//
+// The predecessor of this test asserted that ALL query variants collapse to one
+// entry. That is right for /product?id=1 vs ?id=2 and wrong for ?page=2 and
+// ?tab=billing, which are different pages sharing a path — normalizing the path
+// does not normalize the results. The cap keeps the budget protection against a
+// catalog of thousands of ?id= values while letting the handful of variants that
+// carry real surface through.
+func TestFrontier_BoundedQueryVariants(t *testing.T) {
+	f := newURLFrontier(10, nil)
+
+	// Distinct query variants of one path are admitted, up to the cap.
+	for i := range maxQueryVariantsPerPath {
+		added := f.Push([]urlEntry{{URL: fmt.Sprintf("https://example.com/product?id=%d", i), Depth: 0}})
+		if added != 1 {
+			t.Errorf("variant %d: Push returned %d, want 1 (under the cap)", i, added)
+		}
+	}
+	if f.Len() != maxQueryVariantsPerPath {
+		t.Errorf("Len = %d, want %d", f.Len(), maxQueryVariantsPerPath)
+	}
+
+	// Past the cap, further variants of the SAME path are dropped, so a catalog
+	// cannot consume the page budget.
+	added := f.Push([]urlEntry{{URL: "https://example.com/product?id=9999", Depth: 0}})
+	if added != 0 {
+		t.Errorf("Push returned %d past the %d-variant cap, want 0", added, maxQueryVariantsPerPath)
+	}
+
+	// An exact repeat is still deduplicated regardless of the cap.
+	if got := f.Push([]urlEntry{{URL: "https://example.com/product?id=0", Depth: 0}}); got != 0 {
+		t.Errorf("Push returned %d for an exact repeat, want 0", got)
+	}
+
+	// A genuinely different path has its own allowance.
+	if got := f.Push([]urlEntry{{URL: "https://example.com/category?id=1", Depth: 0}}); got != 1 {
+		t.Errorf("Push returned %d, want 1 (distinct path has its own variant budget)", got)
+	}
+
+	// The first-seen variant keeps its query when queued and fetched.
+	entry, ok := f.Pop()
+	if !ok || entry.URL != "https://example.com/product?id=0" {
+		t.Errorf("Pop = %q (ok=%v), want the first-seen variant with its query", entry.URL, ok)
+	}
+}
+
+// TestFrontier_QueryVariantCapIsPerPath pins that the cap does not leak across
+// paths: exhausting one path's allowance must not affect another's.
+func TestFrontier_QueryVariantCapIsPerPath(t *testing.T) {
+	f := newURLFrontier(10, nil)
+	for i := range maxQueryVariantsPerPath + 3 {
+		f.Push([]urlEntry{{URL: fmt.Sprintf("https://example.com/a?p=%d", i), Depth: 0}})
+	}
+	for i := range maxQueryVariantsPerPath {
+		if got := f.Push([]urlEntry{{URL: fmt.Sprintf("https://example.com/b?p=%d", i), Depth: 0}}); got != 1 {
+			t.Errorf("path /b variant %d rejected; the cap must be per path, not global", i)
+		}
+	}
 }

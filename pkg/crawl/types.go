@@ -32,6 +32,8 @@ type ObservedRequest struct {
 	//   - "static:js"                    (static analysis of JS bundles, pkg/analyze/jsstatic)
 	//   - "static:js-sourcemap"          (recovered via .js.map sourcesContent)
 	//   - "static:js-concat"             (concat / +-chain / service-prefix reconstruction, LAB-4992)
+	//   - "static:js-nextroute"          (Next.js App Router route-handler chunk URL)
+	//   - "static:js-nextpage"           (Next.js App Router page chunk URL)
 	Source    string `json:"source"`
 	Tag       string `json:"tag,omitempty"`
 	Attribute string `json:"attribute,omitempty"`
@@ -55,16 +57,30 @@ const (
 	// substitution, so they are tagged distinctly from AST-recovered literals
 	// (SourceStaticJS) to let downstream consumers weight them accordingly.
 	SourceStaticJSConcat = "static:js-concat"
+	// SourceNextRouteHandler marks a request recovered from a Next.js App Router
+	// ROUTE HANDLER chunk URL (app/<route>/route-<hash>.js). The chunk proves the
+	// framework serves that path, but not which verbs the module exports, so the
+	// tag records provenance only and carries no API signal — see the note in
+	// RESTClassifier.ClassifyDetail.
+	SourceNextRouteHandler = "static:js-nextroute"
+	// SourceNextPageRoute marks a request recovered from a Next.js App Router
+	// PAGE chunk URL (app/<route>/page-<hash>.js). A page route is navigational,
+	// not a REST endpoint, so it likewise carries no API signal and is surfaced
+	// only as a near-miss under -v, matching crawled HTML page routes.
+	SourceNextPageRoute = "static:js-nextpage"
 )
 
 // IsJSStaticSource returns true iff source is one of the JS-bundle
-// static-analysis Source values (SourceStaticJS, SourceStaticJSSourcemap, or
-// SourceStaticJSConcat). Other "static:*" sources (e.g. "static:html" from HTML
-// form analysis) are intentionally excluded — they have separate provenance.
+// static-analysis Source values (SourceStaticJS, SourceStaticJSSourcemap,
+// SourceStaticJSConcat, SourceNextRouteHandler, or SourceNextPageRoute). Other
+// "static:*" sources (e.g. "static:html" from HTML form analysis) are
+// intentionally excluded — they have separate provenance.
 func IsJSStaticSource(source string) bool {
 	return source == SourceStaticJS ||
 		source == SourceStaticJSSourcemap ||
-		source == SourceStaticJSConcat
+		source == SourceStaticJSConcat ||
+		source == SourceNextRouteHandler ||
+		source == SourceNextPageRoute
 }
 
 // AnyStaticSource reports whether any ObservedRequest in reqs carries a

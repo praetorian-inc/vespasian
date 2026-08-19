@@ -104,17 +104,45 @@
 //     mitmproxy) carry no static:js source at all, so they always exercise this
 //     path regardless of the build that produced them.
 //
+// # Next.js App Router routes
+//
+// Body extraction only finds paths that exist as literals. React Server
+// Components and Server Actions build their request paths at runtime, so an RSC
+// bundle can contain no API path at all — a marker scan of one real 44-bundle
+// capture found zero.
+//
+// The route is still recoverable, because the App Router names each page and
+// route-handler chunk after the route's own directory:
+//
+//	/_next/static/chunks/app/vaults/%5BvaultId%5D/page-8ca1aac6111f15fc.js
+//	  -> /vaults/{vaultId}
+//
+// nextroute.go derives routes from those URLs independently of the body, so it
+// works on bundles that yield nothing to jsluice and on bundles whose parse
+// fails outright. Route groups, parallel-route slots, private folders and
+// intercepting prefixes are dropped; dynamic and catch-all segments become
+// OpenAPI {param} form. Server-action endpoints remain unrecoverable statically.
+//
 // # Source tagging
 //
-// Each synthesized [crawl.ObservedRequest] carries Source = "static:js"
+// Each synthesized [crawl.ObservedRequest] carries one of Source = "static:js"
 // (AST-recovered literal), "static:js-sourcemap" (recovered from a .js.map
-// source), or "static:js-concat" (a never-probed concat/+-chain/service-prefix
-// reconstruction — LAB-4992). The OpenAPI generator maps these to the
-// x-vespasian-source extension on each operation ("static:js" -> "js-bundle",
-// "static:js-sourcemap" -> "js-sourcemap", "static:js-concat" ->
-// "js-bundle-concat"; any dynamic-source group resolves to "dynamic", which
-// wins on mixed groups). The distinct "static:js-concat" tag lets consumers
-// weight speculative reconstructions below directly-observed literals.
+// source), "static:js-concat" (a never-probed concat/+-chain/service-prefix
+// reconstruction — LAB-4992), "static:js-nextroute" (an App Router route
+// handler) or "static:js-nextpage" (an App Router page route).
+//
+// The OpenAPI generator maps these to the x-vespasian-source extension on each
+// operation ("static:js" -> "js-bundle", "static:js-sourcemap" ->
+// "js-sourcemap", "static:js-concat" -> "js-bundle-concat",
+// "static:js-nextroute" -> "js-nextroute", "static:js-nextpage" ->
+// "js-nextpage"). The last two do not occur in emitted output: pkg/classify
+// Rule 6a reports both chunk sources as not-an-API, so they never reach the
+// generator (see "Next.js App Router routes" above). They exist so the tag
+// vocabulary stays total. A group mixing distinct JS-static tags resolves to the
+// least-confident member present rather than to "dynamic", which is reserved for
+// a group holding a genuinely non-JS-static source. The distinct tags let
+// consumers weight speculative reconstructions and chunk-URL recoveries below
+// directly-observed literals.
 //
 // # Confidence at generation
 //
@@ -124,6 +152,21 @@
 // candidate whose path carries an API indicator to the default --confidence
 // threshold (0.5) so these offline candidates survive default-confidence
 // generation instead of being silently dropped.
+//
+// A recovered Next.js route is deliberately exempt from that floor. Rule 6a runs
+// first and returns outright, because the chunk URL proves the path is served but
+// says nothing about which verbs the route exports, so a floored route would
+// enter the spec under a guessed verb. pkg/classify enforces the exemption with
+// two independent things and both are needed. Rule 6a reports isAPI=false, which
+// is what keeps the route out of the spec: it is the gate RunClassifiers applies
+// and NearMisses ignores, so it holds at every --confidence value. Rule 6a also
+// scores the route at NextRouteProvenanceConfidence, pinned to
+// classify.NearMissFloor, which is what keeps it VISIBLE under -v. Scoring alone
+// was not enough — --confidence is an operator flag, and at 0.1 the routes
+// classified and the generator emitted a guessed `get`. Scoring 0 is equally
+// wrong: it drops the route below the near-miss floor and it appears nowhere at
+// all, which is what happened to every route off the /api/ path allowlist,
+// /vaults/{vaultId} included.
 //
 // # Security and Operator Considerations
 //

@@ -19,6 +19,8 @@ import (
 
 	"github.com/BishopFox/jsluice"
 	"github.com/go-rod/rod"
+
+	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 )
 
 // jsExtractedURL represents an endpoint discovered by jsluice from JavaScript
@@ -116,11 +118,13 @@ func extractURLsFromResponses(captured []ObservedRequest) []jsExtractedURL {
 }
 
 // isJavaScriptContentType returns true if the content type indicates JavaScript.
+//
+// It delegates to mediatype.IsJavaScript so pkg/classify's static-asset exclusion tests
+// the same bytes this package's retention exemption tests. Keeping a second copy here
+// is what let the scope filter admit a media type the classifier did not reject
+// (LAB-4678 review, REQ-005).
 func isJavaScriptContentType(ct string) bool {
-	return strings.Contains(ct, "javascript") ||
-		strings.Contains(ct, "ecmascript") ||
-		ct == "text/js" ||
-		ct == "application/x-js"
+	return mediatype.IsJavaScript(ct)
 }
 
 // jsExtractedToLinks resolves jsluice-discovered URLs against a base URL and

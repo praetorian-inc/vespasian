@@ -3774,6 +3774,101 @@ func TestGenerateCmdRun_RejectsMalformedHeader(t *testing.T) {
 	}
 }
 
+// TestCrawlOptions_CrawlerOptionsMapsEveryFlag asserts the single CLI-to-library
+// mapping carries every flag through with a distinctive non-zero value, so a field
+// dropped from crawlerOptions fails here.
+//
+// This replaces what would otherwise be a per-flag test duplicated across CrawlCmd
+// and ScanCmd. Both commands now call this one constructor (asserted separately
+// below), so one mapping test covers both — which is the point of collapsing the
+// duplicated literals rather than testing each copy (LAB-4678 review, TEST-001).
+func TestCrawlOptions_CrawlerOptionsMapsEveryFlag(t *testing.T) {
+	opts := CrawlOptions{
+		Depth:         7,
+		MaxPages:      42,
+		MaxRequests:   137,
+		Interact:      true,
+		Timeout:       3 * time.Minute,
+		Scope:         "same-domain",
+		Headless:      true,
+		Proxy:         "http://127.0.0.1:8080",
+		ProxyInsecure: true,
+		Concurrency:   5,
+	}
+
+	got := opts.crawlerOptions(true)
+
+	checks := []struct {
+		flag string
+		got  any
+		want any
+	}{
+		{"--depth", got.Depth, 7},
+		{"--max-pages", got.MaxPages, 42},
+		{"--max-requests", got.MaxRequests, 137},
+		{"--interact", got.Interact, true},
+		{"--timeout", got.Timeout, 3 * time.Minute},
+		{"--scope", got.Scope, "same-domain"},
+		{"--headless", got.Headless, true},
+		{"--proxy", got.Proxy, "http://127.0.0.1:8080"},
+		{"--proxy-insecure", got.ProxyInsecure, true},
+		{"--concurrency", got.Concurrency, 5},
+		{"--dangerous-allow-private", got.AllowPrivate, true},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s did not reach crawl.CrawlerOptions: got %v, want %v", c.flag, c.got, c.want)
+		}
+	}
+
+	// The zero case matters for the two flags whose default is off: a constructor
+	// that hardcoded `true` would pass every check above.
+	off := CrawlOptions{}.crawlerOptions(false)
+	if off.Interact {
+		t.Error("--interact defaulted to true in the mapping")
+	}
+	if off.MaxRequests != 0 {
+		t.Errorf("--max-requests default = %d, want 0 (unlimited)", off.MaxRequests)
+	}
+	if off.AllowPrivate {
+		t.Error("--dangerous-allow-private defaulted to true in the mapping")
+	}
+}
+
+// TestBothCommandsUseTheSharedCrawlerOptionsMapping is the guard that keeps the
+// mapping test above meaningful. It is only sufficient while BOTH commands actually
+// route through crawlerOptions; if either reverts to building a
+// crawl.CrawlerOptions literal inline, the two can diverge again and
+// TestCrawlOptions_CrawlerOptionsMapsEveryFlag would not notice.
+//
+// Reading the source is deliberate: the alternative is executing CrawlCmd.Run and
+// ScanCmd.Run, which launch a browser and perform a live crawl.
+func TestBothCommandsUseTheSharedCrawlerOptionsMapping(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	text := string(src)
+
+	if n := strings.Count(text, "crawlerOptions(c.DangerousAllowPrivate)"); n != 2 {
+		t.Errorf("found %d calls to the shared crawlerOptions mapping, want exactly 2 "+
+			"(CrawlCmd.Run and ScanCmd.Run)", n)
+	}
+
+	// No command may hand-roll the literal again. crawlerOptions itself is the one
+	// legitimate construction site.
+	body := text
+	if i := strings.Index(body, "func (o CrawlOptions) crawlerOptions("); i >= 0 {
+		if j := strings.Index(body[i:], "\n}\n"); j >= 0 {
+			body = body[:i] + body[i+j:] // excise the constructor before counting
+		}
+	}
+	if n := strings.Count(body, "crawl.CrawlerOptions{"); n != 0 {
+		t.Errorf("found %d inline crawl.CrawlerOptions literals outside crawlerOptions; "+
+			"a second construction site reintroduces the wire-one-forget-the-other bug", n)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Task 9/10: CLI proxy plumbing (LAB-4993)
 // ---------------------------------------------------------------------------
@@ -4032,4 +4127,56 @@ func TestGenerateCmd_ResolveJSReplayConfig_RejectsInvalidProxy(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, cfg.Proxy.URL, "a valid --proxy must reach the returned JSReplayConfig.Proxy.URL")
 	})
+}
+
+// TestWriteOutput_FileModeIs0600 asserts the mode capture.json actually lands at.
+//
+// writeOutput is the only non-test file-write site in the repo and it is the one that
+// matters: capture.json carries request and response Headers verbatim, so an
+// authenticated crawl writes operator and target credentials through it. Before this
+// test the 0600 literal in the source was the only evidence, and a future edit to 0644
+// (or dropping the perm argument) would have failed nothing.
+//
+// The pre-existing case is the defect: O_CREATE's perm applies only when the call
+// creates the file, so a re-run over a capture.json left at 0644 by an older build, a
+// shell redirect, or a looser umask kept 0644 (LAB-4678 review, SEC-BE-001).
+func TestWriteOutput_FileModeIs0600(t *testing.T) {
+	write := func(w io.Writer) error {
+		_, err := w.Write([]byte(`[{"method":"GET"}]`))
+		return err
+	}
+
+	t.Run("fresh file", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "capture.json")
+		if err := writeOutput(p, write); err != nil {
+			t.Fatalf("writeOutput: %v", err)
+		}
+		assertMode0600(t, p)
+	})
+
+	t.Run("pre-existing loose file is tightened", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "capture.json")
+		// Pre-create world-readable, as a shell redirect or an older build would.
+		// The loose mode IS the fixture: writeOutput has to tighten it.
+		if err := os.WriteFile(p, []byte("stale"), 0o644); err != nil { //nolint:gosec // G306: a deliberately loose pre-existing file is the condition under test
+			t.Fatal(err)
+		}
+		if err := writeOutput(p, write); err != nil {
+			t.Fatalf("writeOutput: %v", err)
+		}
+		assertMode0600(t, p)
+	})
+}
+
+// assertMode0600 fails t unless path's permission bits are exactly 0600.
+func assertMode0600(t *testing.T, path string) {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if got := st.Mode().Perm(); got != 0o600 {
+		t.Errorf("mode = %04o, want 0600; capture.json carries captured Authorization "+
+			"headers and session cookies, so a looser mode exposes them to every local user", got)
+	}
 }

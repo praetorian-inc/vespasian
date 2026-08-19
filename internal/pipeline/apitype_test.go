@@ -233,3 +233,190 @@ func TestDetectAPIType_PrefersWSDL(t *testing.T) {
 	got := pipeline.DetectAPIType(requests, 0.5)
 	assert.Equal(t, pipeline.APITypeWSDL, got)
 }
+
+// ---------------------------------------------------------------------------
+// LAB-4678 audit item 3: the API-type verdict must not turn on how many
+// endpoints happened to be emitted that run.
+// ---------------------------------------------------------------------------
+
+// restReq is a plain REST JSON request: REST-only signal.
+func restReq(n int) crawl.ObservedRequest {
+	return crawl.ObservedRequest{
+		Method:  "POST",
+		URL:     "https://x.com/api/users",
+		Headers: map[string]string{"Content-Type": "application/json"},
+		Body:    []byte(`{"name":"a"}`),
+		Response: crawl.ObservedResponse{
+			StatusCode: 200, ContentType: "application/json",
+			Body: []byte(`{"id":` + string(rune('0'+n%10)) + `}`),
+		},
+	}
+}
+
+// graphqlReq is a textbook GraphQL call. It also scores 0.95 on the REST
+// classifier, which is exactly why exclusive assignment is needed.
+func graphqlReq() crawl.ObservedRequest {
+	return crawl.ObservedRequest{
+		Method:  "POST",
+		URL:     "https://x.com/graphql",
+		Headers: map[string]string{"Content-Type": "application/json"},
+		Body:    []byte(`{"query":"{ user { id } }"}`),
+		Response: crawl.ObservedResponse{
+			StatusCode: 200, ContentType: "application/json",
+			Body: []byte(`{"data":{"user":{"id":"1"}}}`),
+		},
+	}
+}
+
+// wsdlReq is a SOAP envelope: a strong WSDL signal that the specialist wins
+// outright over REST in the per-request argmax.
+func wsdlReq() crawl.ObservedRequest {
+	const envelope = `<?xml version="1.0"?><soap:Envelope ` +
+		`xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+		`<soap:Body><GetUser><Id>1</Id></GetUser></soap:Body></soap:Envelope>`
+	return crawl.ObservedRequest{
+		Method:  "POST",
+		URL:     "https://x.com/services/UserService",
+		Headers: map[string]string{"Content-Type": "application/soap+xml", "SOAPAction": "GetUser"},
+		Body:    []byte(envelope),
+		Response: crawl.ObservedResponse{
+			StatusCode: 200, ContentType: "application/soap+xml",
+			Body: []byte(envelope),
+		},
+	}
+}
+
+// strayXMLReq is the weak minority signal whose ability to retype a whole
+// capture caused the earlier presence-wins attempt to be reverted.
+func strayXMLReq() crawl.ObservedRequest {
+	return crawl.ObservedRequest{
+		Method:   "GET",
+		URL:      "https://x.com/feed",
+		Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "text/xml"},
+	}
+}
+
+func repeat(req func(int) crawl.ObservedRequest, n int) []crawl.ObservedRequest {
+	out := make([]crawl.ObservedRequest, 0, n)
+	for i := range n {
+		out = append(out, req(i))
+	}
+	return out
+}
+
+// TestDetectAPIType_StableAcrossNearTieCounts is the core item-3 assertion. The
+// old raw-count rule flipped the verdict between REST and GraphQL on a single
+// observation around the tie point. Sweeping the REST count across that region
+// must now produce one stable answer.
+//
+// It asserts the EXPECTED verdict, not just self-agreement. Comparing every element
+// of the output against verdicts[0] is satisfied by any constant function, including
+// a DetectAPIType stubbed to return APITypeREST unconditionally, so the version that
+// only checked stability carried the criterion in its name without pinning anything
+// (LAB-4678 review, TEST-002).
+//
+// REST is the correct answer across this whole band, and stating why is the point:
+// challengerWins requires the challenger to clear MinChallengerMatches AND beat REST
+// by DominanceMargin (1.5x). At graphqlN=10 that needs restCount*1.5 <= 10, i.e.
+// restCount <= 6, so at restN=8..12 GraphQL never dominates and the verdict is REST
+// at every point in the sweep.
+func TestDetectAPIType_StableAcrossNearTieCounts(t *testing.T) {
+	const graphqlN = 10
+
+	for restN := 8; restN <= 12; restN++ {
+		reqs := repeat(restReq, restN)
+		for range graphqlN {
+			reqs = append(reqs, graphqlReq())
+		}
+		got := pipeline.DetectAPIType(reqs, 0.5)
+
+		assert.Equal(t, pipeline.APITypeREST, got,
+			"at restN=%d with graphqlN=%d, GraphQL does not clear the 1.5x dominance "+
+				"margin, so the verdict must be REST", restN, graphqlN)
+	}
+}
+
+// TestDetectAPIType_StrayXMLCannotRetypeRESTApp pins the failure that caused the
+// earlier revert: one incidental text/xml response in a REST-dominant capture
+// must not produce a WSDL spec and discard the REST surface.
+func TestDetectAPIType_StrayXMLCannotRetypeRESTApp(t *testing.T) {
+	reqs := append(repeat(restReq, 20), strayXMLReq())
+	assert.Equal(t, pipeline.APITypeREST, pipeline.DetectAPIType(reqs, 0.5),
+		"a single stray text/xml must not retype a 20-request REST surface")
+}
+
+// TestDetectAPIType_DominantSurfaceStillWins pins that the stability rules did
+// not cost dominant-surface selection: a genuinely GraphQL-dominant capture is
+// still typed GraphQL.
+func TestDetectAPIType_DominantSurfaceStillWins(t *testing.T) {
+	reqs := repeat(restReq, 2)
+	for range 20 {
+		reqs = append(reqs, graphqlReq())
+	}
+	assert.Equal(t, pipeline.APITypeGraphQL, pipeline.DetectAPIType(reqs, 0.5),
+		"a 20-vs-2 GraphQL majority must still win the verdict")
+}
+
+// TestDetectAPIType_ExclusiveAssignment pins that a request votes once. A
+// GraphQL call scores 0.95 on BOTH the GraphQL and REST classifiers; under the
+// old double-counting model those 5 calls also produced restCount=5, so GraphQL
+// could never out-count a REST tally that already contained it.
+func TestDetectAPIType_ExclusiveAssignment(t *testing.T) {
+	var reqs []crawl.ObservedRequest
+	for range 5 {
+		reqs = append(reqs, graphqlReq())
+	}
+	assert.Equal(t, pipeline.APITypeGraphQL, pipeline.DetectAPIType(reqs, 0.5),
+		"GraphQL requests must not also count toward the REST tally")
+}
+
+// TestDetectAPIType_VerdictIndependentOfEmittedCount pins the criterion as
+// literally worded: scaling the capture up and down, holding the mix fixed,
+// must not change the verdict. This is the truncation case — a shorter run
+// emits fewer endpoints in the same proportions.
+//
+// want is the LITERAL expected verdict. It used to be computed by calling
+// DetectAPIType on the scale-1 capture, which made the assertion "the function
+// agrees with itself" — satisfied by any constant implementation, and so no
+// independent check of the criterion the test is named for (LAB-4678 review,
+// TEST-002).
+//
+// GraphQL is correct at every scale: the mix is 1 REST to 4 GraphQL, so GraphQL
+// clears both the MinChallengerMatches floor (from scale 1, where it has 4) and the
+// 1.5x margin over REST at every scale.
+func TestDetectAPIType_VerdictIndependentOfEmittedCount(t *testing.T) {
+	build := func(scale int) []crawl.ObservedRequest {
+		reqs := repeat(restReq, 1*scale)
+		for range 4 * scale {
+			reqs = append(reqs, graphqlReq())
+		}
+		return reqs
+	}
+
+	for _, scale := range []int{1, 2, 3, 5, 10} {
+		assert.Equal(t, pipeline.APITypeGraphQL, pipeline.DetectAPIType(build(scale), 0.5),
+			"a fixed 1:4 REST:GraphQL mix must type GraphQL at every scale (scale=%d)", scale)
+	}
+}
+
+// TestDetectAPIType_GraphQLWSDLTieResolvesToGraphQL pins the tie the
+// graphqlCount >= wsdlCount comparison actually implements. The comment above it
+// used to say "out-count WSDL", which describes >, so a reader reasoning about tie
+// behavior would get the wrong answer. Pinning it means the operator cannot be
+// changed without a test failing to force the comment along with it (LAB-4678
+// review, QUAL-001).
+func TestDetectAPIType_GraphQLWSDLTieResolvesToGraphQL(t *testing.T) {
+	// Equal GraphQL and WSDL votes, with REST low enough that GraphQL clears the
+	// dominance margin and reaches the tie comparison at all.
+	var reqs []crawl.ObservedRequest
+	for range 8 {
+		reqs = append(reqs, graphqlReq())
+	}
+	for range 8 {
+		reqs = append(reqs, wsdlReq())
+	}
+
+	assert.Equal(t, pipeline.APITypeGraphQL, pipeline.DetectAPIType(reqs, 0.5),
+		"an equal GraphQL/WSDL vote count resolves to GraphQL, matching the "+
+			"tie-to-GraphQL ordering of the per-request argmax")
+}
