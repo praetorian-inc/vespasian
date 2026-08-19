@@ -9,7 +9,7 @@ LDFLAGS   := -s -w -X main.version=$(VERSION) -X main.gitCommit=$(GIT_COMMIT) -X
 # Minimum total statement coverage (%) enforced by `make coverage-gate` (see ci.yml).
 # The gate was introduced against an 86.4% baseline (LAB-5331); 85 leaves headroom for
 # minor run-to-run/refactor noise while still failing a build on a real regression.
-COVERAGE_THRESHOLD ?= 85
+COVERAGE_THRESHOLD ?= 99
 
 .PHONY: build test lint fmt vet check check-docs coverage coverage-gate clean deps live-test-clean
 
