@@ -503,7 +503,18 @@ verify_apt_origin() {
     # failing apt-cache (a held dpkg lock, a corrupted cache) would otherwise
     # abort the script here with no diagnostic instead of reaching the
     # log_fail below.
-    policy=$(apt-cache policy google-chrome-stable 2>/dev/null) || policy=""
+    #
+    # Bounded for the same reason both apt-get invocations are: the pre-install
+    # call site runs with the TEMPORARY, fully trusted Google apt source live in
+    # /etc, and a blocking apt-cache (a held dpkg lock, an NFS-stalled
+    # /var/lib/apt) hangs here with cleanup_all unreached — leaving that source
+    # standing for as long as the process does. `|| policy=""` already turns a
+    # non-zero exit into a clean log_fail, so a timeout kill lands on the
+    # existing diagnostic path rather than a new one. Shorter bound than the
+    # apt-get calls (30s, not 300/900): this reads an on-disk cache and does no
+    # network I/O, so any wait at all is a wedge rather than slow progress. No
+    # $SUDO for the same reason as above — the call is read-only.
+    policy=$(timeout -k 5 30 apt-cache policy google-chrome-stable 2>/dev/null) || policy=""
 
     # Read the CANDIDATE's version, not the `***` marker (SEC-BE-002). `***`
     # flags ONLY the installed version, and a package that is not yet
@@ -713,8 +724,8 @@ remove_phone_home() {
 in_container() {
     [ -f "${TEST_ROOT}/.dockerenv" ] && return 0
     [ -f "${TEST_ROOT}/run/.containerenv" ] && return 0
-    # SEC-BE-003: validate this the way $container is validated below rather than
-    # accepting any non-empty value. VS Code Dev Containers sets it to "true"; a
+    # Validate this the way $container is validated below rather than accepting
+    # any non-empty value. VS Code Dev Containers sets it to "true"; a
     # value of "false" (or an unrelated tool's same-named variable) previously won
     # the destructive branch — remove_phone_home plus the apt-lists wipe — on a
     # machine that is not a container at all, because only emptiness was tested.
@@ -820,7 +831,7 @@ cleanup_all() {
     # `apt-get update` and `apt-get install`, which is the exact race the lock
     # exists to prevent, reopened on the lock's own failure path.
     #
-    # This gate is sound only because flock is now REQUIRED (SEC-BE-003): with
+    # This gate is sound only because flock is now REQUIRED: with
     # the old degrade path, LOCK_HELD also stayed 0 on a host without flock —
     # while that run still wrote the wiring and still ran apt-get install — so
     # the gate silently disabled the AC4 teardown on exactly the hosts that
@@ -926,7 +937,7 @@ main() {
     # Acquire the install lock before the idempotency check's own cleanup call
     # below — see LOCK_FILE's declaration for why.
     #
-    # flock is REQUIRED, not optional (SEC-BE-003). This used to degrade with a
+    # flock is REQUIRED, not optional. This used to degrade with a
     # warning when flock was absent, and that degrade path was the bug: LOCK_HELD
     # stayed 0 for the whole run while the run still wrote TMP_LIST/TMP_KEYRING/
     # TMP_PREF and still ran `apt-get install`, so cleanup_all — gated on
@@ -1289,7 +1300,7 @@ record_chrome_version() {
     # -m 0755 on the parent: unlike suppress_permanent_repo's /etc/default
     # (which usually already exists and so keeps whatever mode it has),
     # /usr/share/vespasian is a directory THIS script creates, so its mode is
-    # ours to state rather than leave to the caller's umask (SEC-BE-003).
+    # ours to state rather than leave to the caller's umask.
     if printf '%s\n' "$version" > "$staged_version" &&
        $SUDO install -d -m 0755 -- "$(dirname -- "$CHROME_VERSION_RECORD")" &&
        $SUDO install -m 0644 -- "$staged_version" "$CHROME_VERSION_RECORD"; then

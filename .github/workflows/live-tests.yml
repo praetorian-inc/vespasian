@@ -51,7 +51,7 @@ jobs:
       # `bash <script>` silently works on a file that lost +x. One style for all
       # four, so there is nothing to keep in sync.
       - name: Syntax check
-        run: bash -n test/setup-live-targets.sh && bash -n test/install-chrome.sh
+        run: bash -n test/setup-live-targets.sh && bash -n test/install-chrome.sh && bash -n test/assert-chrome-install.sh
 
       - name: Run preflight self-test
         run: ./test/preflight-selftest.sh
@@ -187,8 +187,11 @@ jobs:
     timeout-minutes: 15
     # Restated at job level even though the workflow default already grants only
     # `contents: read`. This job runs as root with live egress, so it is the one
-    # place a future widening of the workflow-level default should NOT silently
-    # apply — an explicit block here is the tripwire for that.
+    # place a future widening of the workflow-level default must NOT reach. The
+    # block CONTAINS that widening; it does not report it. A job-level
+    # `permissions:` emits no signal when the default above it changes — the
+    # scope here simply stays narrow. Detecting the widening is a separate job
+    # for a workflow-shape guard, not something this block can do.
     permissions:
       contents: read
     container:
@@ -216,27 +219,12 @@ jobs:
       - name: Install Chrome end-to-end
         run: ./test/install-chrome.sh
 
+      # The assertions live in a committed script, not inline here: this job is
+      # opt-in, so a syntax error in an inline block would first surface on a
+      # push to main. As a file it is covered by the un-gated preflight-selftest
+      # job's `bash -n` list, which runs on every PR.
       - name: Assert the install actually produced a runnable browser
-        run: |
-          set -euo pipefail
-          # shellcheck source=test/common.sh
-          . ./test/common.sh
-          # QUAL-001: check the exit status explicitly, don't just take stdout.
-          # On failure detect_chrome_binary returns non-zero with an EMPTY stdout.
-          # The `|| { … }` is what makes that failure actionable: without it the
-          # next line ran `"" --headless …`, whose "command not found" is a far
-          # worse diagnostic than the real one. (A bare `bin=$(...)` would in fact
-          # trip errexit here — a plain assignment takes the substitution's exit
-          # status; it is a `local`/`declare`/`export` DECLARATION that swallows
-          # it — but aborting with no message is still the wrong outcome, which is
-          # why the explicit handler stays.)
-          bin=$(detect_chrome_binary) || {
-            echo "detect_chrome_binary found no runnable browser after install" >&2
-            exit 1
-          }
-          [ -n "${bin}" ] || { echo "detect_chrome_binary returned an empty path" >&2; exit 1; }
-          echo "detected: ${bin}"
-          "${bin}" --headless --no-sandbox --dump-dom about:blank >/dev/null
+        run: ./test/assert-chrome-install.sh
 
       # AC4, asserted against a real install rather than a fixture.
       - name: Assert no phone-home artifacts survive
@@ -304,7 +292,15 @@ jobs:
       - name: Re-run is idempotent
         run: |
           set -euo pipefail
-          out=$(./test/install-chrome.sh 2>&1)
+          # The explicit handler is what preserves $out on the failure path:
+          # under errexit a failing run aborts the step at the assignment, so
+          # the printf below never ran and the installer's own diagnostics —
+          # the only record of WHY the second run failed — were discarded.
+          out=$(./test/install-chrome.sh 2>&1) || {
+            printf '%s\n' "$out"
+            echo "second install-chrome.sh run failed" >&2
+            exit 1
+          }
           printf '%s\n' "$out"
           printf '%s' "$out" | grep -q "already present" \
             || { echo "second run did not take the idempotent path"; exit 1; }

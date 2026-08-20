@@ -1644,11 +1644,24 @@ if [[ -f "$WORKFLOW" ]]; then
         # place anything actually drives the installed binary — not just the
         # three needles below (chrome-version, cron.daily absence, idempotent
         # re-run). --dump-dom is the most specific token: it appears nowhere
-        # else in the step.
-        if printf '%s\n' "$e2e_runlines" | grep -q -- '--dump-dom'; then
-            pass "install-chrome-e2e still asserts a runnable headless render (--dump-dom)"
+        # else in the assertion.
+        #
+        # That assertion moved out of an inline `run:` block into
+        # test/assert-chrome-install.sh so the un-gated `bash -n` step covers
+        # it, which splits the property across two files. Both links are
+        # required: the job must still invoke the script, AND the script must
+        # still drive the binary. Checking only one leaves the other free to
+        # be deleted with this guard green — a job that runs a script whose
+        # render check was removed, or a script nothing runs.
+        RENDER_ASSERT="$SCRIPT_DIR/assert-chrome-install.sh"
+        if ! printf '%s\n' "$e2e_runlines" | grep -qE 'run:[[:space:]]*(\./|bash )?test/assert-chrome-install\.sh'; then
+            fail "install-chrome-e2e no longer invokes test/assert-chrome-install.sh — the headless-render assertion is not run"
+        elif [[ ! -f "$RENDER_ASSERT" ]]; then
+            fail "test/assert-chrome-install.sh is missing, but install-chrome-e2e still invokes it — the job dies before asserting anything"
+        elif grep -q -- '--dump-dom' "$RENDER_ASSERT"; then
+            pass "install-chrome-e2e invokes test/assert-chrome-install.sh, which still asserts a runnable headless render (--dump-dom)"
         else
-            fail "install-chrome-e2e no longer asserts a runnable headless render — the --dump-dom check was removed"
+            fail "test/assert-chrome-install.sh no longer asserts a runnable headless render — the --dump-dom check was removed"
         fi
         # TEST-019: match the assertion's own shape, not the bare path — the
         # bare 'chrome-version' token also matches the purely informational
