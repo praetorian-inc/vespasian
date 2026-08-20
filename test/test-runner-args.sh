@@ -1797,12 +1797,19 @@ if [[ -f "$WORKFLOW" ]]; then
             # exec'd "$@" verbatim would try to run the duration as a command,
             # which is how the first draft of this check reported the script
             # broken when the script was fine.
-            # QUOTED delimiter, with the log path passed as $1 by a tiny wrapper
-            # rather than interpolated. An unquoted here-doc was needed only to
-            # splice $rdir in, and that let a quote character in the path break
-            # out into the generated script — which is then EXECUTED.
-            # install-chrome-selftest.sh's copy of this stub takes the dir as an
-            # argument for the same reason.
+            # QUOTED delimiter, so the stub BODY is literal: an unquoted here-doc
+            # was needed only to splice $rdir into the logging line, and that let
+            # a quote in the path break out of the stub itself.
+            #
+            # Stated precisely, because a previous version of this comment
+            # overclaimed: $rdir is STILL interpolated, into the one-line wrapper
+            # written just below. That is a smaller surface than the whole stub,
+            # not zero — a quote in $rdir would break the wrapper too. It is
+            # unexploitable here (mktemp under the pinned sticky /tmp root cannot
+            # produce one) and is left rather than validated, because validating a
+            # path this suite generates itself would be theatre. install-chrome-
+            # selftest.sh's plant_timeout_stub needs no interpolation at all,
+            # since its stub does not log; it is not the same situation.
             cat > "$rdir/timeout-impl" <<'TIMEOUT_STUB'
 #!/bin/bash
 log=$1; shift
@@ -1838,7 +1845,22 @@ TIMEOUT_STUB
             # duration and is the only other timeout in the log; but adding `-k`
             # to that probe would activate it, and the comment this commit adds
             # to assert-chrome-install.sh discusses exactly that choice.
-            elif printf '%s\n' "$render_log" | grep -- '--dump-dom' | grep -qE -- '-k[[:space:]]+[1-9][0-9]*[[:space:]]+[1-9][0-9]*'; then
+            # Every spelling timeout(1) accepts for the kill-after, not just the
+            # one this script happens to use: `-k 5`, `-k5`, `--kill-after=5`,
+            # and a unit suffix (`5s`). The stub's own option loop handles all of
+            # them, so a render bounded any of those ways is correctly bounded —
+            # and a regex pinning one spelling would fail it with text naming a
+            # regression that had not happened. A false alarm here is as much a
+            # defect as a false pass: it trains a reader to edit the guard.
+            # POSITION too: the bound must precede the binary, which for the
+            # logged argv means the line STARTS with timeout's own options. Pinning
+            # only that both tokens appear on one line let the bound be moved PAST
+            # the binary — `"${render_timeout}" 30 "${bin}" ... about:blank -k 5 30`
+            # logs `30 <bin> ... --dump-dom about:blank -k 5 30`, which satisfies
+            # both predicates while timeout parses `-k 5 30` as arguments to the
+            # BROWSER and applies no kill-after at all. MUTATION-PROVEN.
+            elif printf '%s\n' "$render_log" | grep -- '--dump-dom' \
+                 | grep -qE -- '^[[:space:]]*(-k[[:space:]]*|--kill-after=)[1-9][0-9]*[a-z]?([[:space:]]|$)'; then
                 pass "executing test/assert-chrome-install.sh drives the browser with --dump-dom under a timeout carrying a positive -k bound (observed, not grepped)"
             else
                 fail "executing test/assert-chrome-install.sh did not invoke timeout with a positive -k bound around a --dump-dom render (observed argv: ${render_log:-<none>}) — the render either does not run or runs unbounded"

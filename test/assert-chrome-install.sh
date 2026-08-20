@@ -45,14 +45,24 @@ echo "detected: ${bin}"
 #
 # `-k 5` for the reason install-chrome.sh gives for its own apt bounds: a
 # process can defer the first SIGTERM, so without a kill-after a wedged browser
-# outlives the bound. That matches the three PRIVILEGED apt invocations, which
-# all carry one (`-k 5 30`, `-k 30 300`, `-k 30 900`). It deliberately does NOT
-# match the tree's three unprivileged probes — common.sh's chrome_runnable,
-# install-chrome.sh's _bounded_probe, and setup-live-targets.sh's wait_for_grpc
-# — which pass a bare duration. Those bound a `--version` call or a TCP connect
-# that either answers at once or is already wedged, so a kill-after buys nothing;
-# this one renders a document inside a root provisioning run, which is the shape
-# the apt bounds are written for.
+# outlives the bound.
+#
+# Which calls in the tree carry one, counted rather than asserted: three do —
+# install-chrome.sh's two PRIVILEGED apt-get invocations (`-k 30 300` on update,
+# `-k 30 900` on install) and its UNPRIVILEGED `apt-cache policy` origin check
+# (`-k 5 30`, read-only, and its own comment says so). Three do not:
+# common.sh's chrome_runnable, install-chrome.sh's _bounded_probe, and
+# setup-live-targets.sh's wait_for_grpc, which pass a bare duration. Those
+# predate this change; whether they SHOULD carry one is not settled here and no
+# comment in the tree argues it either way.
+#
+# So privilege is NOT the dividing line — an earlier version of this paragraph
+# said it was, and miscounted the apt-cache call as privileged to make that
+# split work. What actually separates the two groups is how long the bounded
+# command can legitimately run: an apt transaction or a network-backed policy
+# lookup can sit for tens of seconds, where a `--version` call or a TCP connect
+# resolves in milliseconds or not at all. This render paints a document, so it
+# belongs with the first group.
 #
 # --no-sandbox is unconditional: this script's only caller is the
 # install-chrome-e2e job, which runs as root in a container where Chrome's

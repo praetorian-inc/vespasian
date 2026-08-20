@@ -202,8 +202,8 @@ SUITE_COMPLETED=0
 # PROVENANCE, stated precisely rather than blanket-claimed as "MEASURED":
 #   * f2 = 4, f4 = 3, j/j2 = 13, v = 19 and y = 3 were FORCED on a host with no
 #     gpg on PATH (a symlink farm mirroring PATH but omitting every gpg binary).
-#     RE-MEASURED at the current pin: 224 passed, 0 failed, 5 skipped;
-#     224 + 0 + (4+3+13+19+3) = 266, so the pin held and these five credits are
+#     RE-MEASURED at the current pin: 230 passed, 0 failed, 5 skipped;
+#     230 + 0 + (4+3+13+19+3) = 272, so the pin held and these five credits are
 #     measured rather than declared. f2 and f4 are the two this list previously
 #     omitted altogether -- they were added in abc36ed, after the round-8
 #     measurement that the rest of the register inherits.
@@ -211,19 +211,19 @@ SUITE_COMPLETED=0
 #     not re-forced. Forcing them needs a non-git checkout and a root shell
 #     respectively, neither of which the equipped-host run can produce.
 #   * f4 = 3, v = 19 and y = 3 were ALSO forced on a host with no timeout and no
-#     gtimeout on PATH. RE-MEASURED at the current pin: 237 passed, 0 failed,
-#     4 skipped, and 237 + 0 + (3+19+3+4) = 266. Before those three gained the
+#     gtimeout on PATH. RE-MEASURED at the current pin: 243 passed, 0 failed,
+#     4 skipped, and 243 + 0 + (3+19+3+4) = 272. Before those three gained the
 #     timeout gate the same host reported 223/11/1 (at the then-current pin of
 #     238) -- 11 hard failures naming the fingerprint check, the cache wipe and
 #     the version record, plus 3 vacuous passes.
-#   * z4 = 3 was forced on a host with no flock on PATH: 263 passed, 0 failed,
-#     1 skipped, and 263 + 0 + 3 = 266. Before the plant_flock_stub arms landed
+#   * z4 = 3 was forced on a host with no flock on PATH: 269 passed, 0 failed,
+#     1 skipped, and 269 + 0 + 3 = 272. Before the plant_flock_stub arms landed
 #     that same host did not produce a number at all -- 11 hard failures across
 #     cases f, i, o and o2, then the suite TERMINATED at case p2 (whose
 #     `trap_probe=$(...)` assignment takes main()'s non-zero status under this
 #     file's errexit), printing no summary and crediting nothing after it.
-#   * ALL FOUR AT ONCE (no gpg, no timeout, no gtimeout, no flock): 217 passed,
-#     0 failed, 7 skipped, and 217 + 0 + (4+3+13+19+3+4+3) = 266. The register
+#   * ALL FOUR AT ONCE (no gpg, no timeout, no gtimeout, no flock): 223 passed,
+#     0 failed, 7 skipped, and 223 + 0 + (4+3+13+19+3+4+3) = 272. The register
 #     is per-site, so this is the arithmetic that would expose an offsetting
 #     re-credit between two arms that always co-fire.
 #   * bp = 4 is NEW this round: it was 2 (covering case bp2's two assertions) and
@@ -366,7 +366,7 @@ TIMEOUT_STUB
 # is the failure mode this file has now hit in three consecutive review rounds.
 # Whole-line AND trailing comments, in one place. THREE call sites now need
 # identical stripping — fn_code below, f5b's whole-script apt-get scan, and case
-# z4's anchor scan — and they had drifted: the trailing-comment half was added to
+# x's cleanup_all step-list scan — and they had drifted: the trailing-comment half was added to
 # fn_code only, leaving f5b scanning with the old line-anchored filter while its
 # own comment claimed it stripped "exactly as fn_code does". MUTATION-PROVEN: an
 # unbounded `$SUDO apt-get install ...   # bound: timeout -k 30 900 -o
@@ -388,21 +388,11 @@ strip_comments() {
 }
 
 fn_code() {
-    # Whole-line comments AND trailing comments. The filter was line-anchored
-    # (`grep -vE '^[[:space:]]*#'`), which strips a comment occupying its own
-    # line but leaves one appended to a CODE line — so
-    #     policy=$(apt-cache policy ...)   # was: timeout -k 5 30 apt-cache policy
-    # kept every literal this helper's callers pin while the real bound was gone.
-    # MUTATION-PROVEN defeated against the apt-cache pin below, which is exactly
-    # the defeat this helper exists to prevent and which the comment at its call
-    # site claimed was impossible.
-    #
-    # `sed 's/[[:space:]]#.*$//'` needs a preceding space so a `#` inside a
-    # word — `${VAR#prefix}`, `$#`, a URL fragment — is not treated as a comment
-    # opener. That is not a general shell-comment parser (a `#` inside a quoted
-    # string preceded by a space is still stripped), and it does not need to be:
-    # over-stripping can only make a pin FAIL, never falsely pass, so the error
-    # direction is fail-closed.
+    # Extraction only. The comment-stripping rules, and the one direction in
+    # which they are NOT fail-closed, live above strip_comments — this used to
+    # restate them, and the restatement kept the pre-correction wording
+    # ("over-stripping can only make a pin FAIL, never falsely pass") after the
+    # copy above it had been corrected. One explanation, one place.
     awk "/^$1\\(\\) \\{/,/^\\}/" "${INSTALL_SCRIPT}" | strip_comments
 }
 
@@ -887,6 +877,28 @@ fi
 # joining alone let two apt-get calls chained by `&&` across a continuation count
 # as one line, so an unbounded call rode along with a bounded one. Verified: a
 # two-call continuation counted 1 before this change and 2 after.
+# TWO bodies, filtered DIFFERENTLY, on purpose — this is the fix for a regression
+# the shared strip_comments introduced here.
+#
+# The TOTAL is counted over text with only WHOLE-LINE comments removed, so no
+# mid-line `#` can hide a call from it. MUTATION-PROVEN why that matters: with
+# both counts taken from the trailing-stripped text,
+#     : "step #1" ; $SUDO apt-get install -y --no-install-recommends nothing
+# as the first line of remove_phone_home measured 272 passed, exit 0 — the sed
+# deletes from the `#` inside the quoted string to end of line, taking the real
+# call with it, so it vanished from total AND bounded and their equality held.
+# An exact expected total does not fix that either: a hidden call leaves the
+# total looking correct. Only a filter that cannot lose the line does.
+#
+# The BOUNDED count is taken over text with trailing comments ALSO removed, so a
+# comment parking the bound literals beside an unbounded call cannot satisfy it —
+# the defect that fix was made for in the first place.
+#
+# Each filter is chosen for the direction it must not fail in: the total must
+# never undercount, the bounded must never overcount. One shared filter cannot
+# satisfy both, which is why strip_comments is deliberately NOT used for the
+# total here despite being used for the bounded count two lines down.
+script_body_f5_total=$(grep -vE '^[[:space:]]*#' "${INSTALL_SCRIPT}" | normalize_commands)
 script_body_f5_joined=$(strip_comments < "${INSTALL_SCRIPT}" | normalize_commands)
 # The prefix set is a CHAIN of command words, not a fixed `$SUDO?timeout?`.
 # The predecessor required the literal `$SUDO`, so three behaviourally identical
@@ -903,7 +915,7 @@ script_body_f5_joined=$(strip_comments < "${INSTALL_SCRIPT}" | normalize_command
 # correct code. Verified against the real script: exactly 2 matches, 0 of them the
 # help string; and each of the three evasions above raises the count to 3.
 aptget_call_re='(^|[;&|][[:space:]]*)[[:space:]]*(if[[:space:]]+!:?[[:space:]]+)?([[:space:]]*(\$SUDO|sudo|env|timeout|nice|ionice)[[:space:]]+([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+|-[^[:space:]]+[[:space:]]+|[0-9]+[[:space:]]+)*)*apt-get[[:space:]]+(update|install)[[:space:]]'
-f5_aptget_lines=$(printf '%s\n' "${script_body_f5_joined}" \
+f5_aptget_lines=$(printf '%s\n' "${script_body_f5_total}" \
     | grep -cE "$aptget_call_re" || true)
 f5_aptget_bounded=$(printf '%s\n' "${script_body_f5_joined}" \
     | grep -E "$aptget_call_re" \
@@ -919,15 +931,34 @@ fi
 # Residual, stated honestly: a call smuggled through `eval` or `bash -c` is
 # still not counted by a source-text scan.
 
-# Fidelity sentinel for the join+count above, the same idea as case f's curl
-# extraction sentinel: if the script's apt-get calls are ever restructured
-# (renamed, no longer $SUDO-timeout-prefixed) the extraction would silently
-# match nothing and the count-match check above would pass vacuously at 0-of-0.
-if [ "${f5_aptget_lines}" -ge 1 ]; then
-    echo "PASS: case f: the apt-get call extraction still finds at least one call in the script"
+# An EXACT expected total, not a `>= 1` floor. The equality check above compares
+# two counts derived from the SAME stripped text, so anything that hides a call
+# from the text drops it from both and leaves the equality intact — and a floor of
+# one cannot tell 2-of-2 from a hidden-third 2-of-2.
+#
+# MUTATION-PROVEN, and this is a regression the trailing-comment fix INTRODUCED
+# rather than a pre-existing gap: inserting
+#     : "step #1" ; $SUDO apt-get install -y --no-install-recommends nothing
+# as the first line of remove_phone_home measured 272 passed, exit 0, with f5b
+# printing "all 2 apt-get call(s) ... carry the bound". `sed 's/[[:space:]]#.*$//'`
+# deletes from the `#` inside the quoted string to end of line, taking the real
+# apt-get call with it. The filter this replaced stripped only whole-line
+# comments and counted 3 — so for a mid-line carrier the new filter is strictly
+# weaker than the one it replaced. Closing the trailing-comment carrier opened a
+# mid-line one.
+#
+# An exact count closes both directions without needing the text to be
+# trustworthy: hide a call and the total falls short, add an unbounded one and it
+# overshoots. The apt-cache pin next door already survives the same mutation
+# because its sentinel names a SPECIFIC call rather than counting; this is the
+# counting equivalent. Bump it deliberately when a legitimate apt-get call is
+# added — that friction is the point.
+F5_EXPECTED_APTGET=2
+if [ "${f5_aptget_lines}" -eq "${F5_EXPECTED_APTGET}" ]; then
+    echo "PASS: case f: the script contains exactly ${F5_EXPECTED_APTGET} apt-get call(s), so the bound count above compared a complete set"
     pass_count=$((pass_count + 1))
 else
-    echo "FAIL: case f: the script no longer contains a \$SUDO timeout ... apt-get call — the bound-count check above is now vacuous, fix the extraction rather than deleting it"
+    echo "FAIL: case f: the script contains ${f5_aptget_lines} apt-get call(s), expected ${F5_EXPECTED_APTGET} — either a call was ADDED (and the bound check above may have compared a partial set) or one is HIDDEN from the scan, e.g. behind a mid-line '#' that the comment strip eats to end of line. If the change is deliberate, update F5_EXPECTED_APTGET"
     fail_count=$((fail_count + 1))
 fi
 
@@ -4404,9 +4435,12 @@ else
 fi
 
 # ── Case pn: the provenance note's own pin figure matches the constant ──────
-# This note has now gone stale THREE times in three rounds — 238, 266 and 271 —
-# each time because a pin bump updated the constant and left the prose behind,
-# and each time it was caught by a reviewer rather than by the suite. Case cr
+# This note has gone stale three times, each time because a pin bump updated the
+# constant and left the prose behind, and each time it was a reviewer who noticed
+# rather than the suite. Verified from git rather than recalled: at 36ce5e2 the
+# note read 238 against a constant of 239; from c7113ca through 5a3ed4d it read
+# 266 against 267; at b1d626a and 449103b it still read 266, by then against 271.
+# The note never displayed 271 — that was only ever the constant's value. Case cr
 # already derives the skip-credit register from the call sites for exactly this
 # reason; this is the same idea one figure over.
 #
