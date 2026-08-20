@@ -1715,6 +1715,29 @@ if [[ -f "$WORKFLOW" ]]; then
         # steps explicitly, and reject the same continue-on-error escape hatch
         # the preflight-selftest block above rejects.
         e2e_runlines=$(printf '%s\n' "$e2e_block" | grep -vE '^[[:space:]]*#')
+        # Every CONTAINER job that uses bash in an inline `run:` must declare
+        # `shell: bash`. The runner does NOT default a container job's `run:` to
+        # bash — it uses `sh -e {0}` — so `set -euo pipefail` in an inline block
+        # is a line-1 fatal ("Illegal option -o pipefail", exit 2) and every
+        # assertion beneath it is skipped. MEASURED in run 32388761616, the first
+        # execution of this job in its life: two steps lost that way, and neither
+        # `bash -n` nor any suite could see it, because an inline block is not a
+        # file and the job is opt-in so no PR ever ran it.
+        #
+        # Asked of the CONTAINER-ness, not of install-chrome-e2e by name, so a
+        # future container job inherits the check. Non-container jobs are exempt:
+        # the runner does default those to bash.
+        e2e_is_container=$(yq_query '.jobs["install-chrome-e2e"] | has("container")' -o=json -I=0)
+        e2e_shell=$(yq_query '.jobs["install-chrome-e2e"].defaults.run.shell // ""' -o=json -I=0)
+        case "$e2e_is_container:$e2e_shell" in
+            __NO_YQ__*|*__NO_YQ__) fail_no_yq "install-chrome-e2e's container/shell shape" ;;
+            __YQ_ERROR__*|*__YQ_ERROR__) fail_yq_error "install-chrome-e2e's container/shell shape" ;;
+            'false:'*) pass "install-chrome-e2e is not a container job, so the runner defaults its run: steps to bash" ;;
+            'true:"bash"') pass "install-chrome-e2e is a container job and declares shell: bash, so its inline run: blocks get bash rather than sh -e" ;;
+            'true:'*) fail "install-chrome-e2e is a container job but does not declare 'defaults.run.shell: bash' (got ${e2e_shell:-none}) — the runner gives container jobs 'sh -e', so any inline run: block using 'set -o pipefail', arrays, or [[ ]] dies on its first line with exit 2 and every assertion under it is skipped" ;;
+            *) fail "could not determine install-chrome-e2e's container/shell shape (container=${e2e_is_container} shell=${e2e_shell})" ;;
+        esac
+
         # Also require the headless-render assertion — the only
         # place anything actually drives the installed binary — not just the
         # three needles below (chrome-version, cron.daily absence, idempotent
@@ -2102,7 +2125,13 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # arbitrary binary. The --dump-dom pin is net zero: the assertion moved into
 # test/assert-chrome-install.sh and the pin now requires both links (the job
 # invokes the script, the script drives the binary) in one counted outcome.
-EXPECTED_ASSERTIONS=134
+#
+# 134 -> 135. MEASURED. +1 for the container-shell check: a container job's
+# inline `run:` gets `sh -e {0}`, not bash, and run 32388761616 — the first time
+# install-chrome-e2e ever executed — lost two steps to `set -euo pipefail` dying
+# on line 1. Nothing could have caught it: an inline block is not a file, so
+# `bash -n` never sees it, and the job is opt-in, so no PR run exercised it.
+EXPECTED_ASSERTIONS=135
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."

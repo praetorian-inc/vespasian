@@ -199,6 +199,18 @@ jobs:
       # thing this job installs into can change under us between runs. Refresh
       # deliberately.
       image: ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea
+    # REQUIRED, not stylistic. For a CONTAINER job the runner does not default
+    # `run:` to bash — it uses `sh -e {0}` — so `set -euo pipefail` in an inline
+    # block dies on line 1 with "Illegal option -o pipefail" and exit 2, before
+    # a single assertion runs. MEASURED in run 32388761616, the first time this
+    # job ever executed: `Assert no phone-home artifacts survive` failed exactly
+    # there and `Re-run is idempotent` was skipped behind it. The two steps that
+    # invoke committed scripts were unaffected, because a `#!/usr/bin/env bash`
+    # shebang decides the interpreter regardless of the step shell — which is a
+    # second reason to keep assertions in scripts rather than inline here.
+    defaults:
+      run:
+        shell: bash
     steps:
       # No harden-runner here: it does not support running inside a container
       # job. The egress this job makes (Google's apt repo) is the thing under
