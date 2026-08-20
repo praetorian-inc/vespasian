@@ -50,9 +50,12 @@ echo "detected: ${bin}"
 # What the rest of the tree does, as fact rather than theory. Three calls carry a
 # kill-after: `timeout -k 30 300 apt-get update`, `timeout -k 30 900 apt-get
 # install`, and `timeout -k 5 30 apt-cache policy` (the last unprivileged — its
-# own comment says the call is read-only and needs no $SUDO). Three do not, all
+# own comment says the call is read-only and needs no $SUDO). FOUR do not, all
 # passing a bare duration: common.sh's chrome_runnable, install-chrome.sh's
-# _bounded_probe, setup-live-targets.sh's wait_for_grpc.
+# _bounded_probe, setup-live-targets.sh's wait_for_grpc, and validate.sh's
+# `"$runner" "$SPEC_VALIDATOR_TIMEOUT" node ...`. The fourth was missing from the
+# first count of this list — a reviewer found it — which is the third arithmetic
+# error this one paragraph has produced and the reason the next sentence exists.
 #
 # No rule is offered for which group a new call belongs to, deliberately. Three
 # earlier versions of this paragraph each proposed one — that all bounded calls
