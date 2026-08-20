@@ -97,7 +97,7 @@ export CHROME_PROBE_TIMEOUT=2
 #   +2  case bp3, pinning that the consolidated chrome_probe_budget still
 #       validates the budget for _bounded_probe as chrome_runnable does
 # See the credit register below for the matching skip_credit accounting.
-EXPECTED_ASSERTIONS=272
+EXPECTED_ASSERTIONS=273
 
 pass_count=0
 fail_count=0
@@ -163,7 +163,7 @@ SUITE_COMPLETED=0
 # f4, v and y each have TWO independent triggers (gpg/fixture, or timeout) but
 # one skip() call apiece, so a host missing both tools still credits 3/19/3 --
 # never double.
-# EXPECTED_ASSERTIONS above is 272, MEASURED on a fully-equipped host (pass+fail+
+# EXPECTED_ASSERTIONS above is 273, MEASURED on a fully-equipped host (pass+fail+
 # skip_credit with every arm live). It moved 238 -> 239 when case cr landed,
 # 239 -> 244 when case z4 gained the four ordering assertions plus the per-site
 # register check, 244 -> 245 when the anchor-completeness check landed, and
@@ -195,15 +195,15 @@ SUITE_COMPLETED=0
 # list, +2 case cl, -1 case j's two source-line fragments becoming one equality
 # on the whole line).
 #
-# Every figure quoted below was re-measured at the CURRENT pin, not carried forward. This note
+# Every figure quoted below was re-measured at the pin of 273, not carried forward. This note
 # had gone stale by carry-forward in four consecutive review rounds before that
 # discipline was adopted.
 #
 # PROVENANCE, stated precisely rather than blanket-claimed as "MEASURED":
 #   * f2 = 4, f4 = 3, j/j2 = 13, v = 19 and y = 3 were FORCED on a host with no
 #     gpg on PATH (a symlink farm mirroring PATH but omitting every gpg binary).
-#     RE-MEASURED at the current pin: 230 passed, 0 failed, 5 skipped;
-#     230 + 0 + (4+3+13+19+3) = 272, so the pin held and these five credits are
+#     RE-MEASURED at the current pin: 231 passed, 0 failed, 5 skipped;
+#     231 + 0 + (4+3+13+19+3) = 273, so the pin held and these five credits are
 #     measured rather than declared. f2 and f4 are the two this list previously
 #     omitted altogether -- they were added in abc36ed, after the round-8
 #     measurement that the rest of the register inherits.
@@ -211,19 +211,19 @@ SUITE_COMPLETED=0
 #     not re-forced. Forcing them needs a non-git checkout and a root shell
 #     respectively, neither of which the equipped-host run can produce.
 #   * f4 = 3, v = 19 and y = 3 were ALSO forced on a host with no timeout and no
-#     gtimeout on PATH. RE-MEASURED at the current pin: 243 passed, 0 failed,
-#     4 skipped, and 243 + 0 + (3+19+3+4) = 272. Before those three gained the
+#     gtimeout on PATH. RE-MEASURED at the current pin: 244 passed, 0 failed,
+#     4 skipped, and 244 + 0 + (3+19+3+4) = 273. Before those three gained the
 #     timeout gate the same host reported 223/11/1 (at the then-current pin of
 #     238) -- 11 hard failures naming the fingerprint check, the cache wipe and
 #     the version record, plus 3 vacuous passes.
-#   * z4 = 3 was forced on a host with no flock on PATH: 269 passed, 0 failed,
-#     1 skipped, and 269 + 0 + 3 = 272. Before the plant_flock_stub arms landed
+#   * z4 = 3 was forced on a host with no flock on PATH: 270 passed, 0 failed,
+#     1 skipped, and 270 + 0 + 3 = 273. Before the plant_flock_stub arms landed
 #     that same host did not produce a number at all -- 11 hard failures across
 #     cases f, i, o and o2, then the suite TERMINATED at case p2 (whose
 #     `trap_probe=$(...)` assignment takes main()'s non-zero status under this
 #     file's errexit), printing no summary and crediting nothing after it.
-#   * ALL FOUR AT ONCE (no gpg, no timeout, no gtimeout, no flock): 223 passed,
-#     0 failed, 7 skipped, and 223 + 0 + (4+3+13+19+3+4+3) = 272. The register
+#   * ALL FOUR AT ONCE (no gpg, no timeout, no gtimeout, no flock): 224 passed,
+#     0 failed, 7 skipped, and 224 + 0 + (4+3+13+19+3+4+3) = 273. The register
 #     is per-site, so this is the arithmetic that would expose an offsetting
 #     re-credit between two arms that always co-fire.
 #   * bp = 4 is NEW this round: it was 2 (covering case bp2's two assertions) and
@@ -4448,6 +4448,45 @@ fi
 # below it ("238 -> 239", "266 -> 267") is a record of past measurements and is
 # correct as written; pinning those would freeze the history.
 pn_declared=$(grep -oE '^# EXPECTED_ASSERTIONS above is [0-9]+' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+$' || true)
+# EVERY total in the provenance block, not just the headline sentence. Scoping to
+# one sentence is what let the block's arithmetic sit at 266 while that sentence
+# read 272 — the reviewer who found it noted the suite still could not catch it.
+# Two shapes carry a total: the reconciliation sums ("N + 0 + (...) = PIN") and
+# the "re-measured at the pin of N" line, which was briefly reworded to "the
+# CURRENT pin" to end the staleness and instead made it unfalsifiable. Naming the
+# figure and pinning it is the version a reader can check in one glance.
+# NOT anchored to end-of-line. The first version was (`= (2[0-9][0-9])$`), and
+# every reconciliation line continues with prose after its total —
+# "... = PIN, so the pin held and these five credits are" — so it matched only
+# the totals that happened to end their line and reported success while an
+# arithmetic total sat at 266. MUTATION-PROVEN against this very check.
+# Scoped to the PROVENANCE BLOCK, not the whole file: this case's own comment
+# quotes example totals ("= 272", "= 273") to explain what it checks, and a
+# file-wide scan flagged those as stale live figures. The block runs from the
+# credit register's header to the EXPECTED_ASSERTIONS assignment, which is the
+# span whose figures are claims about the current pin.
+# Terminator is `skip() {`, NOT the EXPECTED_ASSERTIONS assignment: that
+# assignment sits ABOVE the register header, so a range ending on it never closes
+# and swallows the rest of the file — which is how this check first reported an
+# example total from its own comment, 4200 lines away, as a stale live figure.
+pn_block=$(sed -n '/^# CREDIT REGISTER/,/^skip() {/p' "${BASH_SOURCE[0]}")
+pn_totals=$(printf '%s\n' "${pn_block}" \
+    | grep -oE '(= |at the pin of )(2[0-9][0-9])([^0-9]|$)' \
+    | grep -oE '2[0-9][0-9]' | sort -u || true)
+pn_wrong=""
+for t in ${pn_totals}; do
+    [ "$t" = "${EXPECTED_ASSERTIONS}" ] || pn_wrong="${pn_wrong} ${t}"
+done
+if [ -n "${pn_wrong}" ]; then
+    echo "FAIL: case pn: the provenance block quotes total(s):${pn_wrong} against a pin of ${EXPECTED_ASSERTIONS} — a figure went stale when the pin moved. Re-measure on the forced hosts rather than editing the arithmetic to match"
+    fail_count=$((fail_count + 1))
+elif [ -z "${pn_totals}" ]; then
+    echo "FAIL: case pn: found no reconciliation totals in the provenance block — the extraction broke; fix it rather than deleting this check"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS: case pn: every total quoted in the provenance block ($(printf '%s' "${pn_totals}" | tr '\n' ' ' | sed 's/ $//')) matches EXPECTED_ASSERTIONS"
+    pass_count=$((pass_count + 1))
+fi
 if [ -z "${pn_declared}" ]; then
     echo "FAIL: case pn: could not find the 'EXPECTED_ASSERTIONS above is N' sentence in the provenance note — the check below is vacuous; fix the extraction rather than deleting it"
     fail_count=$((fail_count + 1))
