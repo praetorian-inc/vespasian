@@ -884,8 +884,8 @@ write_config() {
     local forms_port=$6
     local targets=$7
 
-    # Rendered to a staged file, then installed with an explicit mode
-    #: a bare `cat >` lands at the caller's umask, so under
+    # Rendered to a staged file, then installed with an explicit mode:
+    # a bare `cat >` lands at the caller's umask, so under
     # umask 0 (a Dockerfile RUN commonly runs with one) this config —
     # load_config declare -g's it straight into run-live-tests.sh — would
     # land world-writable. Mirrors install-chrome.sh:424-441's reasoning for

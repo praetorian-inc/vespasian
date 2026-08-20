@@ -808,8 +808,7 @@ fi
 
 # grpc-server builds no http.Server, so it cannot use target.Server, and it
 # takes no BIND_HOST — its bind is a branch-free literal. A fixed-string
-# structural match is therefore complete for it: there is no logic to invert
-#.
+# structural match is therefore complete for it: there is no logic to invert.
 grpcsrc="${THIS_DIR}/grpc-server/main.go"
 if [ ! -f "$grpcsrc" ]; then
     fail "grpc-server/main.go not found — cannot verify its loopback bind"

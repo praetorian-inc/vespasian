@@ -243,8 +243,8 @@ load_config() {
                     # e.g. `--targets rest-api` — writes SOAP_SERVICE_PORT=
                     # with no value), not a tampered one. Warning on that
                     # trains readers to scroll past the one alarm that
-                    # matters when a value is genuinely malformed
-                    #. Every other consumer already reads
+                    # matters when a value is genuinely malformed.
+                    # Every other consumer already reads
                     # ${VAR:-default}, so skipping silently changes nothing
                     # about the resolved port.
                     if [ -z "$value" ]; then
@@ -529,8 +529,8 @@ test_rest_api() {
     # exact path key), and that the form's urlencoded body fields (email, name)
     # surface as request-body schema properties UNDER THAT ENDPOINT
     # (assert_form_body_fields). Without these, the fixture's POST-method + body
-    # -field expectations for /api/subscribe were inert (PR #187 review)
-    # . These are the same helpers forms-target uses; $expected already
+    # -field expectations for /api/subscribe were inert (PR #187 review).
+    # These are the same helpers forms-target uses; $expected already
     # points at rest-api/expected-paths.json, which now carries post_form_paths
     # and post_form_body_fields_by_path for /api/subscribe.
     #
@@ -561,8 +561,7 @@ test_rest_api() {
     # non-deterministic, so the generated spec's serialization (parameter
     # naming, ordering) varies between runs. Exact spec-text comparison is done
     # in test_generate_rest, which uses a fixed import as input. The path COUNT
-    # is deterministic (same recovered set as scan-rest) and IS asserted below
-    #.
+    # is deterministic (same recovered set as scan-rest) and IS asserted below.
 
     local endpoint_count
     endpoint_count=$(count_spec_endpoints "$spec_file")

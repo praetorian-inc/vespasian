@@ -33,4 +33,25 @@ bin=$(detect_chrome_binary) || {
 }
 [ -n "${bin}" ] || { echo "detect_chrome_binary returned an empty path" >&2; exit 1; }
 echo "detected: ${bin}"
-"${bin}" --headless --no-sandbox --dump-dom about:blank >/dev/null
+# Bounded, for the reason install-chrome.sh:1335 gives for the same operation:
+# "detect_chrome_binary only reached this point by running the binary under a
+# timeout; re-running it unbounded here reintroduces the hang that bound guards
+# against, at the very end of a root provisioning run and with no diagnostic."
+# --dump-dom renders a page, so it is materially more hang-prone than the
+# --version that comment was written about. Same idiom as common.sh's
+# chrome_runnable: use timeout(1) when it exists, probe directly when it does
+# not, rather than refusing to run. 30s, not CHROME_PROBE_BUDGET's 2s default,
+# because that budget bounds a --version call and this one paints a document.
+#
+# --no-sandbox is unconditional: this script's only caller is the
+# install-chrome-e2e job, which runs as root in a container where Chrome's
+# sandbox cannot initialise. The Go path makes the same choice behind
+# VESPASIAN_NO_SANDBOX (browser.go's shouldDisableSandbox); it is spelled out
+# here rather than gated because there is exactly one caller and it always
+# needs it.
+render_timeout=$(timeout_cmd)
+if [ -n "${render_timeout}" ]; then
+    "${render_timeout}" 30 "${bin}" --headless --no-sandbox --dump-dom about:blank >/dev/null
+else
+    "${bin}" --headless --no-sandbox --dump-dom about:blank >/dev/null
+fi

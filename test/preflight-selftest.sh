@@ -70,7 +70,12 @@ skip() {
 # default — the value every real run uses and which nothing asserted, because
 # both suites that could exercise the `:-` arm export the variable first. It
 # reuses case f1's fixture gtimeout and so likewise needs no skip() credit.
-EXPECTED_ASSERTIONS=90
+# 90 -> 91 in the round-17 self-review pass: +1 for case e2's MEMBERSHIP check on
+# */snap/*. The union derivation asserted the set was non-empty, that every member
+# produced the hint, and that there were at least three — never WHICH members, so
+# swapping the arm to `*/chromium-browser|*/chromium|*/chrome-sandbox)` passed at
+# 90/0/0. MUTATION-PROVEN both before and after the fix.
+EXPECTED_ASSERTIONS=91
 
 assert_eq() {
     local desc=$1 expected=$2 actual=$3
@@ -390,6 +395,23 @@ else
     # Pin the member count too: deriving the set from the source means a deletion
     # shrinks the expectation and the evidence together, so the loop above would
     # pass vacuously on whatever survived.
+    # MEMBERSHIP, not just the count. The union above asserts the set is
+    # non-empty, that every member produces the hint, and (below) that there are
+    # at least three. None of that pins WHICH members, so replacing the arm with
+    # `*/chromium-browser|*/chromium|*/chrome-sandbox)` — dropping the one member
+    # this case is named for and which carries LAB-3893's originating symptom —
+    # left the suite at 90/0/0, exit 0, with all three e2 assertions green.
+    # MUTATION-PROVEN. The `head -1` extraction this replaced could not miss it,
+    # because it was anchored on `^\s+\*/snap/\*`; the union traded that
+    # specific pin for a general one. This restores it without giving up the
+    # union's resistance to arm-splits and reordering.
+    if printf '%s\n' "${e2_globs[@]}" | grep -qxF -- '*/snap/*'; then
+        echo "PASS: case e2: */snap/* is still a member of the snap-hint set"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: case e2: */snap/* is NO LONGER a member of the snap-hint glob set (got ${snap_glob}) — every path under /snap/ now falls through to the generic 'check permissions' hint, which is the exact misdiagnosis LAB-3893 was filed to remove"
+        fail_count=$((fail_count + 1))
+    fi
     e2_count=${#e2_globs[@]}
     if [ "${e2_count}" -ge 3 ]; then
         echo "PASS: case e2: the snap-hint glob set still carries at least 3 members"

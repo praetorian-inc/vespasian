@@ -1756,7 +1756,16 @@ if [[ -f "$WORKFLOW" ]]; then
             fail "install-chrome-e2e no longer invokes test/assert-chrome-install.sh — the headless-render assertion is not run"
         elif [[ ! -f "$RENDER_ASSERT" ]]; then
             fail "test/assert-chrome-install.sh is missing, but install-chrome-e2e still invokes it — the job dies before asserting anything"
-        elif grep -q -- '--dump-dom' "$RENDER_ASSERT"; then
+        # Comments stripped, and the token required on a line that actually
+        # INVOKES the binary. Grepping the raw file was satisfiable from a
+        # comment: MUTATION-PROVEN — commenting out the exec while leaving
+        # `# was: "${bin}" --headless --no-sandbox --dump-dom about:blank` in
+        # place kept this printing "still asserts a runnable headless render"
+        # at exit 0 with nothing driving the browser. install-chrome-selftest.sh
+        # built fn_code() for exactly this class and records it as hit in three
+        # consecutive review rounds; this check is the same idea, inline.
+        elif grep -vE '^[[:space:]]*#' "$RENDER_ASSERT" | grep -q -e '--dump-dom' && \
+             grep -vE '^[[:space:]]*#' "$RENDER_ASSERT" | grep -e '--dump-dom' | grep -q '\${bin}'; then
             pass "install-chrome-e2e invokes test/assert-chrome-install.sh, which still asserts a runnable headless render (--dump-dom)"
         else
             fail "test/assert-chrome-install.sh no longer asserts a runnable headless render — the --dump-dom check was removed"

@@ -97,7 +97,7 @@ export CHROME_PROBE_TIMEOUT=2
 #   +2  case bp3, pinning that the consolidated chrome_probe_budget still
 #       validates the budget for _bounded_probe as chrome_runnable does
 # See the credit register below for the matching skip_credit accounting.
-EXPECTED_ASSERTIONS=266
+EXPECTED_ASSERTIONS=267
 
 pass_count=0
 fail_count=0
@@ -161,12 +161,18 @@ SUITE_COMPLETED=0
 #
 # Maximum skip_credit on a maximally-degraded host: 1+4+3+13+3+19+3+4+3 = 53.
 # f4, v and y each have TWO independent triggers (gpg/fixture, or timeout) but
-# one skip() call apiece, so a host missing both tools still credits 3/12/3 --
+# one skip() call apiece, so a host missing both tools still credits 3/19/3 --
 # never double.
 # EXPECTED_ASSERTIONS above is 266, MEASURED on a fully-equipped host (pass+fail+
 # skip_credit with every arm live). It moved 238 -> 239 when case cr landed,
 # 239 -> 244 when case z4 gained the four ordering assertions plus the per-site
 # register check, 244 -> 245 when the anchor-completeness check landed, and
+# 266 -> 267 in the round-17 self-review pass: +1 for the apt-cache bound pin.
+# The bound was added in round 16 and asserted by NOTHING — the two existing
+# bound checks are scoped to `apt-get ...`, so `apt-cache policy` matched
+# neither and deleting `timeout -k 5 30` left all four suites green at exit 0.
+# MUTATION-PROVEN before and after.
+#
 # 245 -> 266 in the round-16 review pass (+3 case m2, +7 cases f6/f7/f7b, +1
 # case u's INSTALL_ATTEMPTED ordering, +1 case v's rerooted defaults content,
 # +6 cases v5/v6, +1 case w5's candidate-gate arm, +1 case x's derived step
@@ -252,17 +258,19 @@ assert_contains() {
 # names. One helper, probed once, asks the same question everywhere; a host with
 # neither form gets the literal "no-stat", which fails the comparison with a
 # value that says why instead of an empty string that does not.
-_STAT_STYLE=""
+# Probed ONCE, here at file scope, not lazily inside the function. Every call
+# site is a `$(file_mode ...)` command substitution, so a lazy probe would run in
+# a subshell and its assignment would never reach the parent -- the memoisation
+# would be inert and re-probe on all nine calls, which is what an earlier version
+# did while its comment claimed otherwise.
+if stat -c '%a' . >/dev/null 2>&1; then
+    _STAT_STYLE=gnu
+elif stat -f '%Lp' . >/dev/null 2>&1; then
+    _STAT_STYLE=bsd
+else
+    _STAT_STYLE=none
+fi
 file_mode() {
-    if [ -z "${_STAT_STYLE}" ]; then
-        if stat -c '%a' . >/dev/null 2>&1; then
-            _STAT_STYLE=gnu
-        elif stat -f '%Lp' . >/dev/null 2>&1; then
-            _STAT_STYLE=bsd
-        else
-            _STAT_STYLE=none
-        fi
-    fi
     case "${_STAT_STYLE}" in
         gnu) stat -c '%a' "$1" 2>/dev/null ;;
         bsd) stat -f '%Lp' "$1" 2>/dev/null ;;
@@ -753,6 +761,27 @@ if printf '%s' "${main_body_f5}" | grep -qE '\$SUDO timeout -k 30 300 apt-get up
     pass_count=$((pass_count + 1))
 else
     echo "FAIL: case f: an apt-get call in main() lost its timeout/-k/DPkg::Lock::Timeout bound, or \$SUDO no longer wraps timeout"
+    fail_count=$((fail_count + 1))
+fi
+
+# The apt-cache call is bounded too, and NOTHING pinned it. The checks above are
+# scoped to a command NAME -- they end in `apt-get ...`, so `apt-cache policy`
+# matches neither arm, and the PASS text "both apt-get calls are bounded" is
+# telling the truth about a set that excludes it. MUTATION-PROVEN: deleting
+# `timeout -k 5 30` from verify_apt_origin's policy assignment left all four
+# suites green at exit 0.
+#
+# It matters for the same reason the apt-get bounds do: the pre-install call site
+# runs with the TEMPORARY, fully trusted Google apt source live in /etc, so a
+# blocking apt-cache (held dpkg lock, NFS-stalled /var/lib/apt) hangs there with
+# cleanup_all unreached and that source standing for the life of the process.
+# fn_code strips comments, so a literal on a comment line cannot satisfy this.
+vao_body=$(fn_code verify_apt_origin)
+if printf '%s' "${vao_body}" | grep -qE 'policy=\$\(timeout -k [0-9]+ [0-9]+ apt-cache policy '; then
+    echo "PASS: case f: verify_apt_origin's apt-cache call is bounded by timeout -k"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case f: verify_apt_origin's apt-cache policy call lost its timeout bound — a blocking apt-cache hangs the run with the temporary trusted Google apt source still live in /etc and cleanup_all unreached"
     fail_count=$((fail_count + 1))
 fi
 
@@ -2543,8 +2572,8 @@ plant_u
     SUDO=""
     # This case drives cleanup_all() directly, bypassing main()'s own lock
     # acquisition, so LOCK_HELD has to be pinned by hand to simulate the
-    # normal case under test here: a run that legitimately held the lock
-    #. The lock-not-held arms are covered separately.
+    # normal case under test here: a run that legitimately held the lock.
+    # The lock-not-held arms are covered separately.
     LOCK_HELD=1
     SCRATCH_DIR="${FIXTURE_DIR}/scratch-u"; mkdir -p "$SCRATCH_DIR"
     INSTALL_ATTEMPTED=1
@@ -3329,8 +3358,8 @@ run_cleanup_all() {
     # `||` on cleanup_all, deleting every `|| true` from the handler kept the
     # suite green.
     (
-        # cleanup_all now calls in_container() before its first step
-        #, so this case's own subject — ORDER and TOLERANCE of
+        # cleanup_all now calls in_container() before its first step,
+        # so this case's own subject — ORDER and TOLERANCE of
         # cleanup_all's steps — needs a deterministic container answer,
         # independent of whether the host running this suite happens to
         # export REMOTE_CONTAINERS. root-x/.dockerenv pins it to "container",
@@ -3467,8 +3496,8 @@ res_x2=$(
 assert_contains "case x: a failing remove_phone_home is reported, not silently swallowed" \
     "Could not remove" "${res_x2}"
 
-# ── Case y: the pre-install origin gate refuses BEFORE apt-get install runs ──
-#. verify_apt_origin now runs twice: once right after `apt-get
+# ── Case y: the pre-install origin gate refuses BEFORE apt-get install runs ──.
+# verify_apt_origin now runs twice: once right after `apt-get
 # update`, before `apt-get install` ever executes, and again afterward as a
 # second check. This pins the FIRST call specifically -- apt-cache policy
 # reports a non-Google origin for the candidate, so the install must never
@@ -3847,8 +3876,8 @@ assert_contains "case z3: the refusal names the file type rather than a lock tim
 # The acquisition itself, and what happens when it fails.
 # A stubbed `flock` that always times out stands in for a genuinely contended
 # lock without this case actually waiting out the real 300s bound. Fixed-path
-# apt wiring is pre-planted to stand in for a CONCURRENT run's live state
-#: this run must never hold the lock, so its own EXIT trap must
+# apt wiring is pre-planted to stand in for a CONCURRENT run's live state:
+# this run must never hold the lock, so its own EXIT trap must
 # not touch it.
 run_lock_contention() {
     local root="$1" bin="${FIXTURE_DIR}/bin-lockcontend"
@@ -4130,7 +4159,9 @@ assert_eq "case z4: no \`if [ -e ]\` wrapper around the guards (that shape skips
 # drives main() fails for the same upstream reason. That shape is pre-existing,
 # unrelated to z4, and out of this round's scope. The credit keeps z4's own
 # accounting honest on it; it does not repair the shape.
-if ! command -v flock >/dev/null 2>&1; then
+# HAS_FLOCK, not a second `command -v flock`: plant_flock_stub is keyed on that
+# variable, so two predicates one edit apart could diverge.
+if [ "${HAS_FLOCK}" = false ]; then
     skip "case z4: concurrent lock acquisition (flock not found on PATH)" 3
 else
 # This branch's body is deliberately NOT indented. It contains a `<<'Z4EOF'`

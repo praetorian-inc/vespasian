@@ -535,7 +535,7 @@ verify_apt_origin() {
         # different faults with different remedies: no resolvable candidate means
         # apt cannot see the package (a held lock, a corrupted cache, a source
         # that failed to fetch), not that the package came from the wrong place.
-        log_fail "google-chrome-stable has no resolvable apt candidate — cannot verify its origin (a held dpkg lock, a corrupted cache, or a source that failed to fetch)." >&2
+        log_fail "google-chrome-stable has no resolvable apt candidate — cannot verify its origin (a held dpkg lock, a corrupted cache, a source that failed to fetch, or the 30s bound above expiring; apt-cache stderr is suppressed, so re-run it by hand to see which)." >&2
         return 1
     fi
 
