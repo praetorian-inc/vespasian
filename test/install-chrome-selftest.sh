@@ -97,7 +97,7 @@ export CHROME_PROBE_TIMEOUT=2
 #   +2  case bp3, pinning that the consolidated chrome_probe_budget still
 #       validates the budget for _bounded_probe as chrome_runnable does
 # See the credit register below for the matching skip_credit accounting.
-EXPECTED_ASSERTIONS=274
+EXPECTED_ASSERTIONS=275
 
 pass_count=0
 fail_count=0
@@ -163,7 +163,7 @@ SUITE_COMPLETED=0
 # f4, v and y each have TWO independent triggers (gpg/fixture, or timeout) but
 # one skip() call apiece, so a host missing both tools still credits 3/19/3 --
 # never double.
-# EXPECTED_ASSERTIONS above is 274, MEASURED on a fully-equipped host (pass+fail+
+# EXPECTED_ASSERTIONS above is 275, MEASURED on a fully-equipped host (pass+fail+
 # skip_credit with every arm live). It moved 238 -> 239 when case cr landed,
 # 239 -> 244 when case z4 gained the four ordering assertions plus the per-site
 # register check, 244 -> 245 when the anchor-completeness check landed, and
@@ -197,15 +197,15 @@ SUITE_COMPLETED=0
 # list, +2 case cl, -1 case j's two source-line fragments becoming one equality
 # on the whole line).
 #
-# Every figure quoted below was re-measured at the pin of 274, not carried forward. This note
+# Every figure quoted below was re-measured at the pin of 275, not carried forward. This note
 # had gone stale by carry-forward in four consecutive review rounds before that
 # discipline was adopted.
 #
 # PROVENANCE, stated precisely rather than blanket-claimed as "MEASURED":
 #   * f2 = 4, f4 = 3, j/j2 = 13, v = 19 and y = 3 were FORCED on a host with no
 #     gpg on PATH (a symlink farm mirroring PATH but omitting every gpg binary).
-#     RE-MEASURED at the current pin: 232 passed, 0 failed, 5 skipped;
-#     232 + 0 + (4+3+13+19+3) = 274, so the pin held and these five credits are
+#     RE-MEASURED at the current pin: 233 passed, 0 failed, 5 skipped;
+#     233 + 0 + (4+3+13+19+3) = 275, so the pin held and these five credits are
 #     measured rather than declared. f2 and f4 are the two this list previously
 #     omitted altogether -- they were added in abc36ed, after the round-8
 #     measurement that the rest of the register inherits.
@@ -213,19 +213,19 @@ SUITE_COMPLETED=0
 #     not re-forced. Forcing them needs a non-git checkout and a root shell
 #     respectively, neither of which the equipped-host run can produce.
 #   * f4 = 3, v = 19 and y = 3 were ALSO forced on a host with no timeout and no
-#     gtimeout on PATH. RE-MEASURED at the current pin: 245 passed, 0 failed,
-#     4 skipped, and 245 + 0 + (3+19+3+4) = 274. Before those three gained the
+#     gtimeout on PATH. RE-MEASURED at the current pin: 246 passed, 0 failed,
+#     4 skipped, and 246 + 0 + (3+19+3+4) = 275. Before those three gained the
 #     timeout gate the same host reported 223/11/1 (at the then-current pin of
 #     238) -- 11 hard failures naming the fingerprint check, the cache wipe and
 #     the version record, plus 3 vacuous passes.
-#   * z4 = 3 was forced on a host with no flock on PATH: 271 passed, 0 failed,
-#     1 skipped, and 271 + 0 + 3 = 274. Before the plant_flock_stub arms landed
+#   * z4 = 3 was forced on a host with no flock on PATH: 272 passed, 0 failed,
+#     1 skipped, and 272 + 0 + 3 = 275. Before the plant_flock_stub arms landed
 #     that same host did not produce a number at all -- 11 hard failures across
 #     cases f, i, o and o2, then the suite TERMINATED at case p2 (whose
 #     `trap_probe=$(...)` assignment takes main()'s non-zero status under this
 #     file's errexit), printing no summary and crediting nothing after it.
-#   * ALL FOUR AT ONCE (no gpg, no timeout, no gtimeout, no flock): 225 passed,
-#     0 failed, 7 skipped, and 225 + 0 + (4+3+13+19+3+4+3) = 274. The register
+#   * ALL FOUR AT ONCE (no gpg, no timeout, no gtimeout, no flock): 226 passed,
+#     0 failed, 7 skipped, and 226 + 0 + (4+3+13+19+3+4+3) = 275. The register
 #     is per-site, so this is the arithmetic that would expose an offsetting
 #     re-credit between two arms that always co-fire.
 #   * bp = 4 is NEW this round: it was 2 (covering case bp2's two assertions) and
@@ -4530,7 +4530,35 @@ fi
 # not sum — MUTATION-PROVEN. Each line has the shape
 #     <passed> + <failed> + (<credits>) = <pin>
 # so the left side is evaluated and compared to the right.
-pn_sums=$(printf '%s\n' "${pn_block}" | grep -oE '[0-9]+ \+ [0-9]+ \+ \(?[0-9+]+\)? = [0-9]+' || true)
+# Addends are matched STRICTLY — `0` or a leading-nonzero decimal, nothing else —
+# and the number of reconciliations found is pinned. Both halves are needed, and
+# each closes a defect this check had when it was first written:
+#   * a leading zero (`08`) made `$(( ))` abort with "value too great for base",
+#     which emitted NO outcome, so the only signal was the assertion-count pin
+#     reporting "accounting drift" — the misattributing diagnosis this suite
+#     polices elsewhere.
+#   * a stray letter made the line fail the extraction and vanish silently: the
+#     other three still balanced, so the check reported success having examined
+#     three of four. MEASURED: 274 passed, exit 0, with one reconciliation
+#     unexamined.
+# A strict pattern keeps `$(( ))` from ever seeing a non-decimal, and the count
+# pin turns a line that drops out of the extraction into a named failure.
+PN_EXPECTED_SUMS=4
+pn_sums=$(printf '%s\n' "${pn_block}" \
+    | grep -oE '(0|[1-9][0-9]*) \+ (0|[1-9][0-9]*) \+ \(?(0|[1-9][0-9]*)(\+(0|[1-9][0-9]*))*\)? = (0|[1-9][0-9]*)' || true)
+pn_sum_count=$(printf '%s\n' "${pn_sums}" | grep -c . || true)
+# TWO-ARMED, so this block emits the same number of counted outcomes whichever
+# way it goes. A bare conditional FAIL would add an outcome only when failing,
+# which trips the assertion-count pin and reports "accounting drift" alongside the
+# real cause — the same misattribution this suite fixed in setup-live-targets_test
+# Test 22.
+if [ "${pn_sum_count}" -eq "${PN_EXPECTED_SUMS}" ]; then
+    echo "PASS: case pn: all ${PN_EXPECTED_SUMS} reconciliations in the provenance block are well-formed enough to evaluate"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case pn: found ${pn_sum_count} well-formed reconciliation(s) in the provenance block, expected ${PN_EXPECTED_SUMS} — a line was added, removed, or written with a malformed addend (a leading zero or a non-digit), and a line that fails this extraction is one the arithmetic check below never examines"
+    fail_count=$((fail_count + 1))
+fi
 pn_bad=""
 if [ -z "${pn_sums}" ]; then
     echo "FAIL: case pn: found no reconciliation sums in the provenance block — the arithmetic check is vacuous; fix the extraction rather than deleting it"
