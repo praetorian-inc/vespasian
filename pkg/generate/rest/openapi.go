@@ -172,8 +172,10 @@ func (g *OpenAPIGenerator) APIType() string {
 // could silently mix endpoints from different origins, and the override
 // derived its answer from an arbitrary member of that mixed group. origin is
 // now part of endpointKey (see its doc comment) so a group can never mix
-// origins; Generate resolves the resulting (path, method) slot collisions by
-// trust rank (see trustRank), so the most-trusted colliding group always
+// origins — TestGenerate_ThreeOriginCollision_RecordsAllSuppressedOrigins keeps
+// three origins on one path+method in three separate groups, which a mixed group
+// would collapse. Generate resolves the resulting (path, method) slot collisions
+// by trust rank (see trustRank), so the most-trusted colliding group always
 // wins deterministically — an excluded origin can never win over a
 // non-excluded one (SEC-BE-002), regardless of which hostname sorts first.
 //
@@ -337,7 +339,8 @@ func groupEndpoints(endpoints []classify.ClassifiedRequest, opts NormalizeOption
 	endpointGroups := make(map[endpointKey][]classify.ClassifiedRequest)
 	for _, p := range parsed {
 		// origin ("" if unparseable/host-less) is part of the key (SEC-BE-001)
-		// so a group can never mix endpoints from different origins.
+		// so a group can never mix endpoints from different origins
+		// (TestGenerate_ThreeOriginCollision_RecordsAllSuppressedOrigins).
 		origin := crawl.CanonicalOrigin(p.endpoint.URL)
 		key := endpointKey{path: normalized[p.path], method: strings.ToLower(p.endpoint.Method), origin: origin}
 		endpointGroups[key] = append(endpointGroups[key], p.endpoint)
@@ -366,38 +369,74 @@ func anyStaticSource(endpoints []classify.ClassifiedRequest) bool {
 // jsStaticSourceRank orders the JS-static friendly tags from most to least
 // confident: a directly AST-recovered literal is most confident, a sourcemap
 // recovery is next (recovered from original source, not the served bundle),
-// and a concat/service-prefix reconstruction is least confident (never
-// probed, speculative). computeSourceTag uses this so a group mixing distinct
-// JS-static tags resolves to the LEAST-CONFIDENT member, not "dynamic".
+// then a concat/service-prefix reconstruction (never probed, speculative), and
+// last the two Next.js chunk-URL recoveries, which have no body evidence at all
+// — the chunk path proves only that the framework serves the route, and a page
+// route is navigational rather than an endpoint. computeSourceTag uses this so a
+// group mixing distinct JS-static tags resolves to the LEAST-CONFIDENT member,
+// not "dynamic".
+//
+// Every tag friendlySourceTag can return needs an entry. A missing one reads as
+// rank 0 from this map, which collides with js-bundle — the MOST-confident label
+// — and TestJSStaticSourceRank_CoversEveryFriendlyTag fails on the gap.
 var jsStaticSourceRank = map[string]int{
 	"js-bundle":        0,
 	"js-sourcemap":     1,
 	"js-bundle-concat": 2,
+	"js-nextroute":     3,
+	"js-nextpage":      4,
 }
+
+// leastConfidentJSStaticTag is the highest-ranked entry in jsStaticSourceRank.
+// Derived rather than written out because computeSourceTag falls back to it for a
+// JS-static source that friendlySourceTag does not name, and a literal here would
+// silently stop being the last tag the next time a rank is added.
+var leastConfidentJSStaticTag = func() string {
+	tag, rank := "", -1
+	for t, r := range jsStaticSourceRank {
+		if r > rank {
+			tag, rank = t, r
+		}
+	}
+	return tag
+}()
 
 // computeSourceTag derives the x-vespasian-source value for an operation group.
 // Mapping (architecture.md §7):
-//   - any request with Source not in the JS-static set (including empty Source
-//     from pre-LAB-2108 captures, untagged dynamic entries, AND non-JS static
+//   - any request whose Source is not JS-static (including empty Source from
+//     pre-LAB-2108 captures, untagged dynamic entries, AND non-JS static
 //     sources like "static:html")                    → "dynamic"
 //   - all requests Source == "static:js"             → "js-bundle"
 //   - all requests Source == "static:js-sourcemap"   → "js-sourcemap"
 //   - all requests Source == "static:js-concat"      → "js-bundle-concat"
+//   - all requests Source == "static:js-nextroute"   → "js-nextroute"
+//   - all requests Source == "static:js-nextpage"    → "js-nextpage"
 //   - mixed JS-static tags within a group (all requests JS-static, but not all
-//     the SAME friendly tag) → the LEAST-CONFIDENT member present (confidence
-//     order, most → least: js-bundle > js-sourcemap > js-bundle-concat), e.g.
-//     js-bundle + js-bundle-concat → "js-bundle-concat"
+//     the SAME friendly tag) → the LEAST-CONFIDENT member present, per
+//     jsStaticSourceRank, e.g. js-bundle + js-bundle-concat → "js-bundle-concat"
 //   - empty group (len(group) == 0)                  → "" (no extension emitted)
 //
-// For non-empty input the function always returns one of: "dynamic",
-// "js-bundle", "js-sourcemap", or "js-bundle-concat". The "js-bundle-concat"
-// value (LAB-4992 / SEC-BE-001) flags never-probed concat/service-prefix
-// reconstructions so consumers can weight them below AST-recovered literals.
+// For non-empty input the function always returns "dynamic" or one of the five
+// named values. TestFriendlySourceTag_TotalOverJSStaticSources asserts that every
+// source crawl.IsJSStaticSource accepts has a name here, so the two cannot drift.
+//
+// The two Next.js values are NOT emitted today, and the mapping above describes
+// this function rather than the spec. RESTClassifier Rule 6a returns isAPI=false
+// for both chunk sources and RunClassifiers gates on isAPI, so a Next.js-recovered
+// route never reaches Generate at any --confidence — TestNextRoute_NeverAnOperationAtAnyThreshold
+// pins that. They are named here so the vocabulary stays total (a missing name
+// would make an all-nextroute group emit no extension rather than a wrong one),
+// and they become reachable if the generator is ever taught to emit routes from
+// ClassifiedRequest.AllowedMethods, which is what would give the route a verb.
+//
 // "dynamic" is reserved strictly for a group containing a real non-JS-static
-// source (dynamic / static:html / empty) — an all-JS-static group, even when
-// it mixes distinct JS-static tags, must never resolve to "dynamic", since
-// that is the HIGHEST-confidence label and would make a group recovered
-// entirely from offline JS analysis look directly observed (QUAL-003).
+// source (dynamic / static:html / empty). An all-JS-static group, even when it
+// mixes distinct JS-static tags, must never resolve to "dynamic", since that is
+// the HIGHEST-confidence label and would make a group recovered entirely from
+// offline JS analysis look directly observed (QUAL-003). The "js-bundle-concat"
+// value (LAB-4992 / SEC-BE-001) flags never-probed concat/service-prefix
+// reconstructions, and the two Next.js values flag routes recovered from a chunk
+// URL alone, so consumers can weight both below AST-recovered literals.
 //
 // The empty-group case is unreachable in current usage because groupEndpoints
 // only creates a key when at least one ClassifiedRequest matches; this contract
@@ -405,8 +444,20 @@ var jsStaticSourceRank = map[string]int{
 //
 // This is intentionally a closed allow-list rather than a strings.TrimPrefix
 // open list — a new "static:foo" source must NOT silently surface as
-// x-vespasian-source: foo because the extension consumer contract names only
-// the three non-empty values above.
+// x-vespasian-source: foo, because the extension is a consumer contract.
+//
+// Naming is LOCAL to friendlySourceTag rather than delegated to
+// crawl.IsJSStaticSource. IsJSStaticSource owns "is this a JS-bundle static
+// source" for the extension-emission gate (anyStaticSource); friendlySourceTag
+// owns "what does the consumer contract call it". Keeping the two in sync is the
+// test's job, not an assumption: when the Next.js tags were added to
+// IsJSStaticSource and not here, an all-nextroute group returned "" (no extension
+// at all) and a mixed group returned "dynamic", falsely claiming the endpoint had
+// been dynamically observed when it was recovered from a chunk URL and never
+// requested. That was reachable at --confidence 0.1 before RESTClassifier started
+// returning isAPI=false for these sources. The two are consulted separately here
+// so an out-of-sync JS-static source degrades to the least-confident tag instead
+// of borrowing "dynamic", which is the highest-confidence label.
 func computeSourceTag(group []classify.ClassifiedRequest) string {
 	if len(group) == 0 {
 		return ""
@@ -414,37 +465,33 @@ func computeSourceTag(group []classify.ClassifiedRequest) string {
 	leastConfident := ""
 	leastConfidentRank := -1
 	for _, ep := range group {
-		if !crawl.IsJSStaticSource(ep.Source) {
-			// Any non-JS-static source (dynamic, empty, or static:html etc.)
-			// wins immediately.
+		friendly, ok := friendlySourceTag(ep.Source)
+		switch {
+		case ok:
+		case !crawl.IsJSStaticSource(ep.Source):
+			// A real non-JS-static source — dynamic, empty, or static:html — is
+			// "dynamic", matching the documented catch-all above.
 			return "dynamic"
-		}
-		var friendly string
-		switch ep.Source {
-		case crawl.SourceStaticJS:
-			friendly = "js-bundle"
-		case crawl.SourceStaticJSSourcemap:
-			friendly = "js-sourcemap"
-		case crawl.SourceStaticJSConcat:
-			friendly = "js-bundle-concat"
 		default:
-			// QUAL-005: a JS-static source with no case above must still map to
-			// a real tag. Leaving friendly == "" made jsStaticSourceRank[""]
-			// return the zero value — which COLLIDES with "js-bundle"'s rank 0,
-			// the most-confident label. The unknown source would then win the
-			// first comparison (0 > -1), and a later genuine "js-bundle" would
-			// fail 0 > 0, so the function returned "" and suppressed the
-			// x-vespasian-source extension for the whole group, breaking the
-			// contract documented above. crawl.IsJSStaticSource (pkg/crawl) and
-			// this switch live in different packages and must be edited
-			// together, so the miss is reachable by a one-sided edit — this PR
-			// itself required exactly that two-site change.
+			// QUAL-005: a JS-static source friendlySourceTag does not name must
+			// still map to a real tag. Leaving friendly == "" made
+			// jsStaticSourceRank[""] return the zero value — which COLLIDES with
+			// js-bundle's rank 0, the most-confident label. The unknown source
+			// would then win the first comparison (0 > -1), and a later genuine
+			// js-bundle would fail 0 > 0, so the function returned "" and
+			// suppressed the x-vespasian-source extension for the whole group.
+			// crawl.IsJSStaticSource (pkg/crawl) and friendlySourceTag live in
+			// different packages and must be edited together, so the miss is
+			// reachable by a one-sided edit — this PR itself required exactly that
+			// two-site change, twice.
 			//
-			// Resolve to the LEAST-confident known tag: an unrecognized
-			// JS-static source is still offline-derived, so understating
-			// provenance is the safe direction, and it can never suppress the
-			// extension or masquerade as "dynamic".
-			friendly = "js-bundle-concat"
+			// Resolve to the least-confident known tag: an unrecognized JS-static
+			// source is still offline-derived, so understating provenance is the
+			// safe direction, and it can never suppress the extension or
+			// masquerade as "dynamic". TestJSStaticSourceRank_CoversEveryFriendlyTag
+			// keeps that fallback pointing at a ranked tag, which is what makes the
+			// claim hold — an unranked one would reintroduce the rank-0 collision.
+			friendly = leastConfidentJSStaticTag
 		}
 		if r := jsStaticSourceRank[friendly]; r > leastConfidentRank {
 			leastConfidentRank = r
@@ -452,6 +499,27 @@ func computeSourceTag(group []classify.ClassifiedRequest) string {
 		}
 	}
 	return leastConfident
+}
+
+// friendlySourceTag maps a Source to its x-vespasian-source value, reporting false
+// for any source the consumer contract does not name. Keeping this total — every
+// input gets an answer — is what stops a newly added Source constant from producing
+// an empty tag by falling through a switch.
+func friendlySourceTag(source string) (string, bool) {
+	switch source {
+	case crawl.SourceStaticJS:
+		return "js-bundle", true
+	case crawl.SourceStaticJSSourcemap:
+		return "js-sourcemap", true
+	case crawl.SourceStaticJSConcat:
+		return "js-bundle-concat", true
+	case crawl.SourceNextRouteHandler:
+		return "js-nextroute", true
+	case crawl.SourceNextPageRoute:
+		return "js-nextpage", true
+	default:
+		return "", false
+	}
 }
 
 // mergeJSONBodies infers and merges JSON schemas from multiple body observations.
@@ -471,6 +539,70 @@ func mergeJSONBodies(bodies [][]byte) *openapi3.SchemaRef {
 		merged = mergeObjectSchemas(merged, schema)
 	}
 	return merged
+}
+
+// maxSchemaUnionDepth bounds the recursion in unionSchemaProperties against a
+// pathological or deeply-nested inferred schema.
+const maxSchemaUnionDepth = 12
+
+// responseObservations flattens a group into every response the union should
+// consider: each member's retained Response, followed by the responses
+// classify.Deduplicate collapsed into it (ClassifiedRequest.MergedResponses).
+//
+// Without the merged half, the union below could only ever combine responses
+// belonging to DIFFERENT group members, and Deduplicate has already collapsed
+// same-endpoint observations into one member — its key hashes the request body,
+// so every bodyless observation of one endpoint becomes a single entry. For a
+// collection GET that left exactly one response to "union", which is why the
+// array-items recursion, written for GET /users returning [{"id":1,"name":"a"}]
+// then [{"id":2,"email":"b@x"}], never fired on that input.
+//
+// Order follows the group's existing deterministic order, and within a member
+// the retained response precedes its merged ones, so the emitted schema does not
+// depend on capture order.
+func responseObservations(group []classify.ClassifiedRequest) []crawl.ObservedResponse {
+	out := make([]crawl.ObservedResponse, 0, len(group))
+	for _, ep := range group {
+		out = append(out, ep.Response)
+		out = append(out, ep.MergedResponses...)
+	}
+	return out
+}
+
+// unionSchemaProperties merges src's object properties into dst additively
+// (LAB-4678 Phase 3): a property present in src but missing from dst is added,
+// and a property present in both whose value is itself an object is merged
+// recursively, so fields observed in only some responses of the same
+// endpoint+status are preserved rather than dropped after the first observation.
+// It never removes or retypes an existing property, so it cannot narrow the
+// documented schema. depth bounds the recursion.
+//
+// Array schemas are entered through Items. A collection endpoint is the common
+// case for partial observations — GET /users returning [{"id":1,"name":"a"}] and
+// later [{"id":2,"email":"b@x"}] — and because an array schema has no Properties
+// of its own, recursing only through Properties never reached the item schema and
+// the second observation's `email` was dropped. Items consumes one depth level,
+// same as a nested object, so the existing bound still holds.
+func unionSchemaProperties(dst, src *openapi3.Schema, depth int) {
+	if dst == nil || src == nil || depth <= 0 {
+		return
+	}
+	if dst.Items != nil && src.Items != nil {
+		unionSchemaProperties(dst.Items.Value, src.Items.Value, depth-1)
+	}
+	if dst.Properties == nil || src.Properties == nil {
+		return
+	}
+	for name, srcRef := range src.Properties {
+		dstRef, exists := dst.Properties[name]
+		if !exists {
+			dst.Properties[name] = srcRef
+			continue
+		}
+		if dstRef != nil && dstRef.Value != nil && srcRef != nil && srcRef.Value != nil {
+			unionSchemaProperties(dstRef.Value, srcRef.Value, depth-1)
+		}
+	}
 }
 
 // buildOperation builds a single OpenAPI operation from a group of classified requests.
@@ -701,10 +833,10 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 
 	// --- Responses: collect all distinct status codes, merge schemas ---
 	seenStatus := make(map[string]*openapi3.ResponseRef)
-	for _, ep := range group {
+	for _, resp := range responseObservations(group) {
 		statusCode := "200"
 		statusInt := 200
-		if sc := ep.Response.StatusCode; sc > 0 {
+		if sc := resp.StatusCode; sc > 0 {
 			statusCode = strconv.Itoa(sc)
 			statusInt = sc
 		}
@@ -717,11 +849,11 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 			// only union into an already-populated base. Otherwise a populated
 			// observation is silently dropped whenever an empty one sorts first
 			// (review finding 002).
-			if len(ep.Response.Body) > 0 && existing.Value != nil {
+			if len(resp.Body) > 0 && existing.Value != nil {
 				// Only infer JSON schema for JSON-compatible content types
-				ct := strings.ToLower(ep.Response.ContentType)
+				ct := strings.ToLower(resp.ContentType)
 				if ct == "" || strings.Contains(ct, "json") {
-					newSchema := InferSchema(ep.Response.Body)
+					newSchema := InferSchema(resp.Body)
 					if newSchema != nil && newSchema.Value != nil {
 						if existing.Value.Content == nil {
 							// Base had no body; adopt this populated schema.
@@ -734,18 +866,23 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 							existing.Value.Content = openapi3.Content{
 								"application/json": &openapi3.MediaType{Schema: newSchema},
 							}
-						} else if newSchema.Value.Properties != nil {
-							// Union additional object properties into an existing
-							// object base. Array/scalar schemas have no properties
-							// to union, so they leave the populated base unchanged.
-							if mt := existing.Value.Content["application/json"]; mt != nil && mt.Schema != nil &&
-								mt.Schema.Value != nil && mt.Schema.Value.Properties != nil {
-								for propName, propSchema := range newSchema.Value.Properties {
-									if _, exists := mt.Schema.Value.Properties[propName]; !exists {
-										mt.Schema.Value.Properties[propName] = propSchema
-									}
-								}
-							}
+						} else if mt := existing.Value.Content["application/json"]; mt != nil && mt.Schema != nil &&
+							mt.Schema.Value != nil &&
+							(mt.Schema.Value.Properties != nil || mt.Schema.Value.Items != nil) {
+							// Union additively and recursively (LAB-4678 Phase 3):
+							// a field seen in only some observations of this
+							// endpoint+status is preserved even when nested under a
+							// shared parent object, not just at the top level.
+							//
+							// The Items arm of this guard is load-bearing. A top-level
+							// JSON array — the common collection endpoint, GET /users
+							// returning [{"id":1,"name":"a"}] then [{"id":2,"email":..}]
+							// — has nil Properties, since its fields live under Items.
+							// Gating on Properties alone made unionSchemaProperties'
+							// array recursion unreachable for exactly the case it was
+							// written for, silently dropping later observations' fields.
+							// Scalar schemas have neither and still skip the union.
+							unionSchemaProperties(mt.Schema.Value, newSchema.Value, maxSchemaUnionDepth)
 						}
 					}
 				}
@@ -761,11 +898,11 @@ func buildOperation(key endpointKey, group []classify.ClassifiedRequest, emitSou
 			Description: &description,
 		}
 
-		if len(ep.Response.Body) > 0 {
+		if len(resp.Body) > 0 {
 			// Only infer JSON schema for JSON-compatible content types
-			ct := strings.ToLower(ep.Response.ContentType)
+			ct := strings.ToLower(resp.ContentType)
 			if ct == "" || strings.Contains(ct, "json") {
-				schema := InferSchema(ep.Response.Body)
+				schema := InferSchema(resp.Body)
 				if schema != nil {
 					response.Content = openapi3.Content{
 						"application/json": &openapi3.MediaType{
@@ -874,6 +1011,8 @@ func recordCollisionOrigin(winner *openapi3.Operation, origin string) {
 // by choosing a hostname that sorts first. This 3-level rank makes that
 // case explicit and impossible: rank 2 (excluded) can never beat rank 0 or
 // 1 (not excluded), regardless of which hostname sorts first.
+// TestGenerate_CollisionNeitherOriginPrimary_TrustRankPicksObservedOverExcluded
+// runs it with the attacker hostname sorting both before and after the real one.
 //
 // TEST-001 (LAB-4992 review): an empty origin — crawl.CanonicalOrigin's
 // result for a host-less literal such as "https:/api/x" (single slash, not

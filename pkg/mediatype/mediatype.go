@@ -56,3 +56,29 @@ func Header(headers map[string]string, name string) string {
 	}
 	return headers[match]
 }
+
+// IsJavaScript reports whether ct names a JavaScript media type. ct may carry
+// parameters; Base is applied internally, so a raw Content-Type header value works.
+//
+// It lives in this leaf package because two packages have to agree on the answer and
+// used not to. pkg/crawl's passive-capture scope filter deliberately RETAINS an
+// out-of-scope JavaScript body so pkg/analyze/jsstatic can read it, and it decides
+// "this is JavaScript" from the content-type. pkg/classify has to exclude exactly what
+// that filter admits, or the exemption becomes a scope escape: a bundle served from an
+// extensionless URL as application/javascript was retained by the filter and then
+// scored an endpoint by the JSON-body rule, putting an out-of-scope host in the emitted
+// spec and its servers list. Both sides now call this, so the two predicates cannot
+// drift apart (LAB-4678 review, REQ-005).
+//
+// The alternation is substring-based rather than an exact-match set because the
+// registered and legacy spellings are numerous (application/javascript,
+// text/javascript, application/x-javascript, application/ecmascript, …) and a set
+// would have to be exhaustive to be correct, where a substring test fails safe: an
+// unlisted JavaScript spelling containing "javascript" is still excluded.
+func IsJavaScript(ct string) bool {
+	base := Base(ct)
+	return strings.Contains(base, "javascript") ||
+		strings.Contains(base, "ecmascript") ||
+		base == "text/js" ||
+		base == "application/x-js"
+}

@@ -15,6 +15,7 @@
 package classify
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -714,14 +715,19 @@ func TestRESTClassifier_RequestSideSignal(t *testing.T) {
 			wantReasonSub: "request-signal:content-type",
 		},
 		{
-			name: "non-api path with Accept:json -> request signal does NOT fire",
+			// LAB-4678 Phase 3: an explicit JSON Accept is API intent on ANY
+			// path, not only allowlisted ones, so a JSON API on a non-standard
+			// path is no longer blind-spotted. The text/html and */* guards
+			// (asserted below) keep this from over-classifying navigations.
+			name: "non-allowlist path with explicit Accept:json -> request signal fires",
 			req: crawl.ObservedRequest{
 				Method:  "GET",
 				URL:     "https://example.com/dashboard",
 				Headers: map[string]string{"Accept": "application/json"},
 			},
-			wantIsAPI:   false,
-			wantMinConf: 0,
+			wantIsAPI:     true,
+			wantMinConf:   RequestSignalConfidence,
+			wantReasonSub: "request-signal:accept",
 		},
 		{
 			// TEST-010: pins the version-segment arm of the shared pathIsAPI gate
@@ -778,7 +784,10 @@ func TestRESTClassifier_RequestSideSignal(t *testing.T) {
 	// it, so without this entry an over-classification regression on a document
 	// navigation under a high version segment would ship silently.
 	const navAccept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
-	for _, p := range []string{"/api/docs", "/graphql", "/v2/dashboard", "/v4/docs"} {
+	// Includes non-allowlist paths (/dashboard, /profile): now that the request
+	// signal is path-independent (Phase 3), the navigation guard must hold there
+	// too — a browser page load must not classify regardless of path.
+	for _, p := range []string{"/api/docs", "/graphql", "/v2/dashboard", "/v4/docs", "/dashboard", "/profile"} {
 		_, navConf, navReason := c.ClassifyDetail(crawl.ObservedRequest{
 			Method:  "GET",
 			URL:     "https://example.com" + p,
@@ -852,6 +861,268 @@ func TestRESTClassifier_Deterministic(t *testing.T) {
 		assert.Equal(t, isAPI0, isAPI)
 		assert.Equal(t, conf0, conf)
 		assert.Equal(t, reason0, reason)
+	}
+}
+
+// TestMatchAPIContentType_StructuredSuffix pins the LAB-4678 audit item-4 fix:
+// classification must not be limited to the hardcoded apiContentTypes list.
+// Any RFC 6839 application/<vendor>+json or +xml structured syntax suffix is an
+// API media type, while navigation and non-application types are not.
+func TestMatchAPIContentType_StructuredSuffix(t *testing.T) {
+	tests := []struct {
+		name string
+		ct   string
+		want string
+	}{
+		// Tier 1: exact entries still return themselves, unchanged.
+		{"exact json", "application/json", "application/json"},
+		{"exact json with charset", "application/json; charset=utf-8", "application/json"},
+		{"exact text/xml", "text/xml", "text/xml"},
+		{"exact hal", "application/hal+json", "application/hal+json"},
+
+		// Tier 2: the open set the hardcoded list was blind to.
+		{"json-ld", "application/ld+json", SuffixFamilyJSON},
+		{"geo+json", "application/geo+json", SuffixFamilyJSON},
+		{"vendor github", "application/vnd.github+json", SuffixFamilyJSON},
+		{"vendor with params", "application/vnd.acme.v2+json; charset=utf-8", SuffixFamilyJSON},
+		// Syndication feeds carry a structured suffix but are documents for
+		// feed readers, not endpoints. The classifier-edge live test asserts a
+		// feed stays out of the spec.
+		{"atom feed is not an API", "application/atom+xml", ""},
+		{"rss feed is not an API", "application/rss+xml", ""},
+		{"json feed is not an API", "application/feed+json", ""},
+		{"soap+xml belongs to WSDLClassifier", "application/soap+xml", ""},
+		// A web app manifest is browser install metadata, served by essentially
+		// every modern SPA. It matched the +json arm and became a false operation
+		// in most REST specs (LAB-4678 review, QUAL-003).
+		{"web app manifest is not an API", "application/manifest+json", ""},
+		{"web app manifest with charset", "application/manifest+json; charset=utf-8", ""},
+
+		// Excluded: navigation types, one of which carries a +xml suffix and
+		// would otherwise match tier 2 on every HTML page load.
+		{"xhtml is navigation", "application/xhtml+xml", ""},
+		{"html is navigation", "text/html", ""},
+
+		// Excluded: suffix rule requires the application/ top-level type.
+		{"text plus json is not application", "text/x-thing+json", ""},
+		{"image plus xml is not application", "image/svg+xml", ""},
+
+		// Excluded: no suffix, no exact match.
+		{"plain text", "text/plain", ""},
+		{"octet stream", "application/octet-stream", ""},
+		{"empty", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, matchAPIContentType(tt.ct))
+		})
+	}
+}
+
+// TestRESTClassifier_VendorJSONResponseClassifies pins the end-to-end effect of
+// the suffix tier: a real API returning a vendor JSON media type that is absent
+// from apiContentTypes now clears the confidence threshold instead of scoring 0.
+func TestRESTClassifier_VendorJSONResponseClassifies(t *testing.T) {
+	c := &RESTClassifier{}
+	req := crawl.ObservedRequest{
+		Method: "GET",
+		URL:    "https://example.com/widgets",
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "application/vnd.acme.widget+json",
+		},
+	}
+
+	isAPI, confidence, reason := c.ClassifyDetail(req)
+	assert.True(t, isAPI)
+	assert.GreaterOrEqual(t, confidence, DefaultConfidenceThreshold,
+		"a vendor +json response must clear the threshold on its content type alone")
+	assert.Contains(t, reason, "content-type:"+SuffixFamilyJSON,
+		"the reason must report the stable suffix family, not the unbounded vendor type")
+}
+
+// TestRESTClassifier_XHTMLNavigationStillNotAPI guards the suffix tier against
+// the over-classification it could have introduced: application/xhtml+xml ends
+// in +xml, and every browser page load carries it.
+func TestRESTClassifier_XHTMLNavigationStillNotAPI(t *testing.T) {
+	c := &RESTClassifier{}
+	req := crawl.ObservedRequest{
+		Method:   "GET",
+		URL:      "https://example.com/api/docs",
+		Headers:  map[string]string{"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+		Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/xhtml+xml"},
+	}
+
+	_, confidence, _ := c.ClassifyDetail(req)
+	assert.Less(t, confidence, DefaultConfidenceThreshold,
+		"an xhtml page load under an /api/ path must stay below the threshold")
+}
+
+// TestRESTClassifier_NextRouteChunksCarryNoAPISignal pins the Codex review
+// outcome (PR #189): a route recovered from a Next.js App Router chunk URL must
+// NOT classify as an API on provenance alone. The chunk URL proves the path is
+// served but not which verbs the module exports, and jsstatic can only attach one
+// method to a synthesized request. Classifying it drove the generator to emit a
+// `get` operation for a route that may export only POST, with nothing downstream
+// to correct it. Both tags must stay sub-threshold.
+func TestRESTClassifier_NextRouteChunksCarryNoAPISignal(t *testing.T) {
+	c := &RESTClassifier{}
+	for _, src := range []string{crawl.SourceNextRouteHandler, crawl.SourceNextPageRoute} {
+		req := crawl.ObservedRequest{Method: "GET", URL: "https://app.test/api/files", Source: src}
+		_, confidence, reason := c.ClassifyDetail(req)
+		assert.Less(t, confidence, DefaultConfidenceThreshold,
+			"source %q must not reach the API threshold on provenance alone", src)
+		assert.NotContains(t, reason, "framework-route",
+			"source %q must not contribute a framework-route signal", src)
+	}
+}
+
+// TestRESTClassifier_RSSFeedNotAnAPI pins the regression the classifier-edge
+// live test caught: adding RFC 6839 suffix matching made application/rss+xml an
+// API media type, so a plain blog feed at /feed.xml landed in the OpenAPI spec.
+// It must score below the threshold on both the response content-type (Rule 2)
+// and the Accept header (Rule 6).
+func TestRESTClassifier_RSSFeedNotAnAPI(t *testing.T) {
+	c := &RESTClassifier{}
+	req := crawl.ObservedRequest{
+		Method:  "GET",
+		URL:     "http://localhost:8080/feed.xml",
+		Headers: map[string]string{"Accept": "application/rss+xml"},
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "application/rss+xml",
+			Headers:     map[string]string{"Content-Type": "application/rss+xml"},
+			Body:        []byte(`<rss version="2.0"><channel><title>Test</title></channel></rss>`),
+		},
+	}
+
+	isAPI, confidence, _ := c.ClassifyDetail(req)
+	assert.Less(t, confidence, DefaultConfidenceThreshold,
+		"an RSS feed must not clear the API confidence threshold")
+	assert.False(t, isAPI, "an RSS feed is a syndication document, not an API endpoint")
+}
+
+// TestRESTClassifier_JSONFeedNotAnAPI covers the half of the feed exclusion that
+// TestRESTClassifier_RSSFeedNotAnAPI could not reach. That test uses an XML feed,
+// whose body never triggers Rule 5. application/feed+json is a JSON Feed: it was
+// already in the exclusion set, so Rule 2 stayed silent, but its JSON object body
+// scored JSONBodyConfidence (0.85) and cleared the threshold anyway. Excluding a
+// media type from the content-type tier was never sufficient on its own; Rule 1b
+// is what makes a document type disqualifying (LAB-4678 review, QUAL-003).
+func TestRESTClassifier_JSONFeedNotAnAPI(t *testing.T) {
+	c := &RESTClassifier{}
+	isAPI, confidence, _ := c.ClassifyDetail(crawl.ObservedRequest{
+		Method: "GET",
+		URL:    "https://ex.com/feed.json",
+		Response: crawl.ObservedResponse{
+			StatusCode:  200,
+			ContentType: "application/feed+json",
+			Headers:     map[string]string{"Content-Type": "application/feed+json"},
+			Body:        []byte(`{"version":"https://jsonfeed.org/version/1.1","items":[]}`),
+		},
+	})
+	assert.Less(t, confidence, DefaultConfidenceThreshold,
+		"a JSON Feed must not clear the API confidence threshold on its body structure")
+	assert.False(t, isAPI, "a JSON Feed is a syndication document, not an API endpoint")
+}
+
+// TestRESTClassifier_WebAppManifestNotAnAPI drives the full classifier over the
+// two shapes a web app manifest actually ships as, at their conventional
+// document-root locations. Both are served by essentially every modern SPA, so
+// before this exclusion the suffix tier added a false operation to most REST
+// specs and inflated the restCount DetectAPIType weighs (LAB-4678 review,
+// QUAL-003). /manifest.json is caught by the content-type exclusion and
+// /site.webmanifest by the static-extension rule, so this covers both halves of
+// the fix.
+func TestRESTClassifier_WebAppManifestNotAnAPI(t *testing.T) {
+	const body = `{"name":"App","short_name":"App","start_url":"/","display":"standalone"}`
+	for _, tc := range []struct {
+		name string
+		url  string
+		ct   string
+	}{
+		{"manifest.json served as manifest+json", "https://ex.com/manifest.json", "application/manifest+json"},
+		{"site.webmanifest served as manifest+json", "https://ex.com/site.webmanifest", "application/manifest+json"},
+		// A manifest served with a generic or wrong content-type must still be
+		// excluded by URL. This is the case documentContentTypes alone misses.
+		{"site.webmanifest served as plain json", "https://ex.com/site.webmanifest", "application/json"},
+		// The COMMON case, and the one the original fix missed. The web app manifest
+		// is conventionally /manifest.json, and a .json file is usually served as
+		// plain application/json. Neither the .webmanifest extension rule nor the
+		// application/manifest+json content-type rule fires there, so it classified
+		// at 0.85 (content-type 0.8 promoted by the JSON object body) and became an
+		// operation in the spec. documentPaths is what catches it.
+		{"manifest.json served as plain json", "https://ex.com/manifest.json", "application/json"},
+		{"manifest.json with no content-type at all", "https://ex.com/manifest.json", ""},
+		// A subdirectory deployment must hit too.
+		{"manifest.json under a base path", "https://ex.com/app/manifest.json", "application/json"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &RESTClassifier{}
+			isAPI, confidence, _ := c.ClassifyDetail(crawl.ObservedRequest{
+				Method: "GET",
+				URL:    tc.url,
+				Response: crawl.ObservedResponse{
+					StatusCode:  200,
+					ContentType: tc.ct,
+					Headers:     map[string]string{"Content-Type": tc.ct},
+					Body:        []byte(body),
+				},
+			})
+			assert.Less(t, confidence, DefaultConfidenceThreshold,
+				"a web app manifest must not clear the API confidence threshold")
+			assert.False(t, isAPI, "a web app manifest is browser install metadata, not an API endpoint")
+		})
+	}
+}
+
+// TestNextRouteProvenanceConfidence_IsReportingOnly pins the two bounds that make
+// Rule 7 a reporting signal rather than an API signal. Both directions have already
+// been wrong once: the rule shipped at 0 (invisible everywhere, see
+// TestRESTClassifier_NextRouteIsReportedAsNearMiss), and classifying on provenance
+// at full strength is what made the generator invent a `get` operation.
+func TestNextRouteProvenanceConfidence_IsReportingOnly(t *testing.T) {
+	assert.GreaterOrEqual(t, NextRouteProvenanceConfidence, NearMissFloor,
+		"below NearMissFloor the recovered route is dropped from -v too, so the whole "+
+			"Next.js recovery feature produces no observable output")
+	assert.Less(t, NextRouteProvenanceConfidence, DefaultConfidenceThreshold,
+		"at or above the threshold a recovered route becomes a spec operation with a "+
+			"verb the chunk URL never revealed")
+}
+
+// TestRESTClassifier_NextRouteIsReportedAsNearMiss is the regression test for the
+// gap between the code and three documents. README.md, AGENTS.md and
+// pkg/analyze/jsstatic/doc.go all state that recovered Next.js routes surface as
+// sub-threshold near-misses under -v. They did not: a page route carries no
+// apiPathSegments match, no response and no headers, so it scored 0 — below
+// NearMissFloor — and appeared in neither the spec nor the near-miss list.
+//
+// The /vaults/{vaultId} case is the one the README leads with, and it is exactly
+// the one that was invisible. /api/... routes were visible only incidentally, via
+// the path heuristic.
+func TestRESTClassifier_NextRouteIsReportedAsNearMiss(t *testing.T) {
+	c := &RESTClassifier{}
+	for _, tc := range []struct {
+		name string
+		url  string
+		src  string
+	}{
+		{"page route off the api path allowlist", "https://app.test/vaults/%7BvaultId%7D", crawl.SourceNextPageRoute},
+		{"page route with a plain path", "https://app.test/dashboard", crawl.SourceNextPageRoute},
+		{"route handler off the api path allowlist", "https://app.test/vaults/%7Bid%7D", crawl.SourceNextRouteHandler},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, confidence, reason := c.ClassifyDetail(crawl.ObservedRequest{
+				Method: "GET", URL: tc.url, Source: tc.src,
+			})
+			assert.GreaterOrEqual(t, confidence, NearMissFloor,
+				"a recovered route must reach the near-miss floor so -v can report it")
+			assert.Less(t, confidence, DefaultConfidenceThreshold,
+				"a recovered route must stay out of the spec")
+			assert.Contains(t, reason, "next-route-chunk",
+				"the -v line must name provenance as the reason the route is listed")
+		})
 	}
 }
 
@@ -941,6 +1212,78 @@ func TestAPIIndicatorParityWithCrawlExtraction(t *testing.T) {
 	}
 }
 
+// TestRESTClassifier_NextRouteProvenanceDoesNotPromote guards the other direction:
+// Rule 7 raises a floor, it must never lower or override a stronger signal, and it
+// must not push a route that ALSO has real signal over the threshold on its own.
+func TestRESTClassifier_NextRouteProvenanceDoesNotPromote(t *testing.T) {
+	c := &RESTClassifier{}
+
+	// A genuine JSON API response that happens to carry the tag keeps its own
+	// (higher) confidence — the floor must not clamp it down.
+	_, strong, _ := c.ClassifyDetail(crawl.ObservedRequest{
+		Method: "GET", URL: "https://app.test/api/files", Source: crawl.SourceNextRouteHandler,
+		Response: crawl.ObservedResponse{StatusCode: 200, ContentType: "application/json"},
+	})
+	assert.GreaterOrEqual(t, strong, ContentTypeConfidence,
+		"Rule 7 is a floor, not an assignment; it must not clamp a stronger signal")
+
+	// Provenance plus the path heuristic must still not clear the threshold.
+	_, boosted, _ := c.ClassifyDetail(crawl.ObservedRequest{
+		Method: "GET", URL: "https://app.test/api/files", Source: crawl.SourceNextRouteHandler,
+	})
+	assert.Less(t, boosted, DefaultConfidenceThreshold,
+		"provenance plus the path boost must not add up to a spec operation")
+}
+
+// TestIsDocumentPath_MatchesWholeSegmentOnly pins that the suffix match cannot
+// swallow a real endpoint whose path merely ENDS with the document name. Every
+// documentPaths entry begins with "/", which is what makes the suffix test a
+// whole-final-segment test rather than a bare substring test.
+func TestIsDocumentPath_MatchesWholeSegmentOnly(t *testing.T) {
+	for _, p := range documentPaths {
+		assert.True(t, strings.HasPrefix(p, "/"),
+			"documentPaths entry %q must start with '/' or the suffix match degrades into "+
+				"a substring match and can reject a real endpoint", p)
+	}
+
+	for _, hit := range []string{"/manifest.json", "/app/manifest.json", "/a/b/manifest.json"} {
+		assert.True(t, isDocumentPath(hit), "%q should be treated as a document path", hit)
+	}
+	for _, miss := range []string{
+		"/app-manifest.json",     // different final segment
+		"/manifest.json/details", // not the final segment
+		"/api/manifests",
+		"/manifest",
+		"",
+	} {
+		assert.False(t, isDocumentPath(miss), "%q must NOT be excluded as a document path", miss)
+	}
+}
+
+func TestNextRoute_NeverAnOperationAtAnyThreshold(t *testing.T) {
+	reqs := []crawl.ObservedRequest{
+		{Method: "GET", URL: "https://ex.com/vaults/{vaultId}", Source: crawl.SourceNextPageRoute},
+		{Method: "GET", URL: "https://ex.com/admin/reports", Source: crawl.SourceNextRouteHandler},
+	}
+	classifiers := []APIClassifier{&RESTClassifier{}}
+
+	for _, threshold := range []float64{0.5, 0.2, NearMissFloor, 0.05, 0.01} {
+		got := RunClassifiers(classifiers, reqs, threshold)
+		if len(got) != 0 {
+			t.Errorf("--confidence %.2f classified %d Next.js-recovered routes; they must never "+
+				"reach the generator, which would invent a verb the chunk URL never revealed",
+				threshold, len(got))
+		}
+	}
+
+	// ...and they are still visible to the operator under -v.
+	nm := NearMisses(classifiers, reqs, NearMissFloor, DefaultConfidenceThreshold)
+	if len(nm) != len(reqs) {
+		t.Errorf("NearMisses reported %d of %d recovered routes; excluding them from the spec "+
+			"must not also make them invisible", len(nm), len(reqs))
+	}
+}
+
 // TestAPIIndicatorUnanchoredNotFloored pins the negative direction of the
 // extraction/classification asymmetry (TEST-004, LAB-4992).
 //
@@ -988,6 +1331,50 @@ func TestAPIIndicatorUnanchoredNotFloored(t *testing.T) {
 				"a substring-embedded indicator must stay below the default threshold, got %v", confidence)
 			assert.False(t, isAPI,
 				"a substring-embedded indicator must not classify as an API path")
+		})
+	}
+}
+
+// TestNextRoute_NotPromotedByStaticJSFloor pins the rule ordering the LAB-4678 x
+// LAB-4992 merge created. Both branches added a rule numbered 7: the Next.js
+// chunk-provenance disqualifier (now Rule 6a) and the offline JS-static floor
+// (Rule 7). They interact, because crawl.IsJSStaticSource — the gate on Rule 7's
+// floor — accepts both Next.js chunk sources.
+//
+// A recovered route on an /api/-style path therefore satisfies Rule 7's gate.
+// Reaching it would floor the route to StaticJSConfidence, which IS the default
+// --confidence, and return isAPI=true from `confidence > 0` — putting a guessed
+// verb in the spec for a route whose chunk URL never revealed one. That is the
+// exact defect Rule 6a exists to prevent, reintroduced by rule order alone.
+//
+// Rule 6a's early return is what prevents it. The paths below all carry an API
+// indicator, so each one fails this test if Rule 6a is moved after Rule 7 or its
+// `return` is softened to a fallthrough.
+func TestNextRoute_NotPromotedByStaticJSFloor(t *testing.T) {
+	c := &RESTClassifier{}
+	for _, tc := range []struct {
+		name, url, src string
+	}{
+		{"route handler under /api/", "https://app.test/api/vaults/%7BvaultId%7D", crawl.SourceNextRouteHandler},
+		{"page route under /api/", "https://app.test/api/dashboard", crawl.SourceNextPageRoute},
+		{"route handler under a version segment", "https://app.test/v2/vaults", crawl.SourceNextRouteHandler},
+		{"page route under /rest/", "https://app.test/rest/reports", crawl.SourceNextPageRoute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isAPI, confidence, reason := c.ClassifyDetail(crawl.ObservedRequest{
+				Method: "GET", URL: tc.url, Source: tc.src,
+			})
+
+			assert.False(t, isAPI,
+				"an API-looking path must not turn a chunk-URL route into an API: Rule 6a has to "+
+					"return before Rule 7's static-JS floor")
+			assert.Less(t, confidence, DefaultConfidenceThreshold,
+				"Rule 7's floor is StaticJSConfidence (== the default threshold), so reaching it "+
+					"puts the route in the spec at default --confidence")
+			assert.NotContains(t, reason, "static-js-candidate",
+				"the static-JS floor must not fire for a Next.js chunk source")
+			assert.Contains(t, reason, "next-route-chunk",
+				"the -v line must name provenance as the reason the route is listed")
 		})
 	}
 }

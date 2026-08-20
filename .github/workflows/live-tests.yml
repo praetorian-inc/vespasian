@@ -32,8 +32,9 @@ jobs:
       # to the StepSecurity dashboard without enforcing an allowlist. Flip to
       # 'block' with an allowed-endpoints list once telemetry confirms the set.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
-      # test. harden-runner is a SHA-pinned security control: bump ALL FOUR copies
-      # in lockstep — a missed copy silently leaves a job on a stale pin.
+      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # bump ALL FIVE copies in lockstep — a missed copy silently leaves a job on
+      # a stale pin.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -96,8 +97,9 @@ jobs:
       # to the StepSecurity dashboard without enforcing an allowlist. Flip to
       # 'block' with an allowed-endpoints list once telemetry confirms the set.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
-      # test. harden-runner is a SHA-pinned security control: bump ALL FOUR copies
-      # in lockstep — a missed copy silently leaves a job on a stale pin.
+      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # bump ALL FIVE copies in lockstep — a missed copy silently leaves a job on
+      # a stale pin.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -150,8 +152,9 @@ jobs:
       # to the StepSecurity dashboard without enforcing an allowlist. Flip to
       # 'block' with an allowed-endpoints list once telemetry confirms the set.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
-      # test. harden-runner is a SHA-pinned security control: bump ALL FOUR copies
-      # in lockstep — a missed copy silently leaves a job on a stale pin.
+      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # bump ALL FIVE copies in lockstep — a missed copy silently leaves a job on
+      # a stale pin.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -324,6 +327,81 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
+  # Integration-tagged Go tests (LAB-4678 review, TEST-005/REQ-002).
+  #
+  # Why this job exists: nothing anywhere passed `-tags=integration`. The Makefile's
+  # `test` target is `go test -race ./...` and no workflow set the tag, so 24 tests
+  # across 4 files had never executed in CI -- including
+  # TestCrawlerContract_ScopeConfinement and TestCrawlerContract_DepthLimit, the only
+  # end-to-end assertions of two crawl containment controls, and the LAB-4678 tests
+  # that pin the exact --max-pages count and assert --interact never clicks a
+  # destructive control. A regression in any of them merged green.
+  #
+  # It lives in this workflow rather than ci.yml because everything it needs is
+  # already here: the stable Chrome shipped with ubuntu-24.04, the Go toolchain, and
+  # the skip-live-tests label gate. ci.yml delegates to a shared reusable workflow
+  # that takes only build-* inputs and cannot pass a build tag.
+  #
+  # It is a SEPARATE job from `test` rather than a step inside it so a live-target
+  # setup failure and a browser-test failure are distinguishable at a glance, and so
+  # neither masks the other.
+  integration-tests:
+    needs: check-label
+    if: needs.check-label.outputs.should-run == 'true'
+    runs-on: ubuntu-24.04
+    # Measured at ~170s locally for the whole tagged suite. 15 minutes leaves room
+    # for a slower runner without letting a hung browser burn a full 30.
+    timeout-minutes: 15
+    env:
+      # The runner's Chrome cannot use its sandbox in this container; browser.go
+      # honors this env var (see shouldDisableSandbox), matching the `test` job.
+      VESPASIAN_NO_SANDBOX: "true"
+      # This runner is SUPPOSED to have a browser, so an unavailable Chrome is a
+      # failure here rather than a skip. Without it every rod row skips and this job
+      # reports green having executed none of the browser-only assertions it exists
+      # for — the diagnostic step below deliberately decides nothing, so nothing else
+      # would catch that (LAB-4678 review, TEST-014).
+      VESPASIAN_REQUIRE_CHROME: "1"
+    steps:
+      # Defense-in-depth (LAB-4732 / SEC-BE-002): monitor and record all
+      # outbound network traffic. Audit mode is non-blocking.
+      # DUPLICATED across preflight-selftest / validator-regression / docs-check /
+      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # bump ALL FIVE copies in lockstep — a missed copy silently leaves a job on
+      # a stale pin.
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
+        with:
+          go-version-file: go.mod
+
+      # DIAGNOSTIC ONLY, never a gate. Records which browser the runner has so a
+      # launch failure below is immediately explicable. Deliberately does not decide
+      # anything: the authoritative resolution is launcher.LookPath() in the Go code
+      # (the headless backend pins a local Chrome and does not download one,
+      # LAB-4999), and the repo's canonical candidate list lives in
+      # test/setup-live-targets.sh. Duplicating that list here as a pass/fail check
+      # would create a second source of truth that can drift from both.
+      - name: Report available browser (diagnostic)
+        continue-on-error: true
+        run: |
+          for candidate in google-chrome google-chrome-stable chromium chromium-browser; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+              echo "$candidate: $("$candidate" --version 2>&1)"
+            fi
+          done
+
+      - name: Run integration-tagged tests
+        run: make test-integration
+
   # Runs all test targets in one job.  Target groups are defined in
   # test/run-live-tests.sh (OFFLINE_TARGETS / LIVE_TARGETS); offline targets
   # run first so a live-setup failure cannot mask deterministic coverage.
@@ -351,8 +429,9 @@ jobs:
       # (expected: github.com, proxy.golang.org, sum.golang.org,
       # storage.googleapis.com, objects.githubusercontent.com, registry.npmjs.org).
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
-      # test. harden-runner is a SHA-pinned security control: bump ALL FOUR copies
-      # in lockstep — a missed copy silently leaves a job on a stale pin.
+      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # bump ALL FIVE copies in lockstep — a missed copy silently leaves a job on
+      # a stale pin.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:

@@ -15,11 +15,21 @@
 package crawl
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"go/types"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // mergeEnrichedLinks is the pure, DOM-free portion of enrichFromPage. These
@@ -616,6 +626,698 @@ func TestRedactSeedURL(t *testing.T) {
 			got := redactSeedURL(tc.in)
 			if got != tc.want {
 				t.Errorf("redactSeedURL(%q) = %q; want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMergeEnrichedLinks_ScopeFiltersCapturedRequests verifies that passively
+// captured network requests to out-of-scope hosts are dropped (LAB-4678 Phase 1),
+// so third-party XHR/CDN hosts do not become endpoints or spec servers. In-scope
+// captured requests and scoped form actions are retained.
+func TestMergeEnrichedLinks_ScopeFiltersCapturedRequests(t *testing.T) {
+	scopeFn := func(u string) bool { return strings.Contains(u, "ex.com") }
+	captured := []ObservedRequest{
+		{Method: "GET", URL: "https://ex.com/"},
+		{Method: "GET", URL: "https://ex.com/api/users"},
+		{Method: "GET", URL: "https://analytics.thirdparty.com/collect"},
+		{Method: "POST", URL: "https://cdn.other.net/beacon"},
+	}
+
+	got, _ := mergeEnrichedLinks(captured, nil, nil, nil, nil, "https://ex.com/", "https://ex.com/", scopeFn)
+
+	for _, r := range got {
+		if !strings.Contains(r.URL, "ex.com") {
+			t.Errorf("out-of-scope captured request survived: %s", r.URL)
+		}
+	}
+	if len(got) != 2 {
+		t.Errorf("kept %d captured requests, want 2 (in-scope only): %v", len(got), got)
+	}
+}
+
+// TestMergeEnrichedLinks_NilScopeKeepsCaptured verifies a nil scopeFn applies no
+// filtering to captured requests (matching the form-action convention).
+func TestMergeEnrichedLinks_NilScopeKeepsCaptured(t *testing.T) {
+	captured := []ObservedRequest{
+		{Method: "GET", URL: "https://ex.com/"},
+		{Method: "GET", URL: "https://third.party/x"},
+	}
+	got, _ := mergeEnrichedLinks(captured, nil, nil, nil, nil, "https://ex.com/", "https://ex.com/", nil)
+	if len(got) != 2 {
+		t.Errorf("nil scopeFn kept %d, want 2 (no filtering)", len(got))
+	}
+}
+
+// TestCrawlBudget_Reached covers the check-only pre-Pop early-out: a 0 budget is
+// unlimited for that dimension, and either dimension hitting its bound stops the
+// crawl from starting a new page. It must consume nothing.
+func TestCrawlBudget_Reached(t *testing.T) {
+	cases := []struct {
+		name                                   string
+		pageCount, maxPages, reqCount, maxReqs int
+		want                                   bool
+	}{
+		{"both unlimited", 100, 0, 100, 0, false},
+		{"pages under cap", 1, 5, 0, 0, false},
+		{"pages at cap", 5, 5, 0, 0, true},
+		{"requests at cap", 1, 0, 50, 50, true},
+		{"requests under cap", 1, 0, 49, 50, false},
+		{"pages ok, requests over", 2, 100, 500, 200, true},
+		{"requests ok, pages over", 100, 50, 10, 1000, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newCrawlBudget(tc.maxPages, tc.maxReqs)
+			b.pageCount, b.reqCount = tc.pageCount, tc.reqCount
+			if got := b.Reached(); got != tc.want {
+				t.Errorf("Reached(pages=%d/%d, reqs=%d/%d) = %v, want %v",
+					tc.pageCount, tc.maxPages, tc.reqCount, tc.maxReqs, got, tc.want)
+			}
+			if b.Pages() != tc.pageCount || b.Requests() != tc.reqCount {
+				t.Errorf("check-only call mutated state: pages %d->%d, reqs %d->%d",
+					tc.pageCount, b.Pages(), tc.reqCount, b.Requests())
+			}
+		})
+	}
+}
+
+// TestCrawlBudget_TryReserve pins the reserve semantics that keep the page cap
+// exact under concurrency: a reserving call consumes exactly one page slot when it
+// admits the page, and consumes none when it refuses — for either dimension.
+func TestCrawlBudget_TryReserve(t *testing.T) {
+	t.Run("admits and consumes one slot", func(t *testing.T) {
+		b := newCrawlBudget(5, 0)
+		b.pageCount = 3
+		if _, ok := b.TryReserve(); !ok {
+			t.Fatal("refused at 3/5 pages")
+		}
+		if b.Pages() != 4 {
+			t.Errorf("reserve did not consume a slot: pages = %d, want 4", b.Pages())
+		}
+	})
+
+	t.Run("page cap reached consumes nothing", func(t *testing.T) {
+		b := newCrawlBudget(5, 0)
+		b.pageCount = 5
+		if _, ok := b.TryReserve(); ok {
+			t.Fatal("admitted a page at 5/5")
+		}
+		if b.Pages() != 5 {
+			t.Errorf("reserve consumed a slot past the page cap: pages = %d, want 5", b.Pages())
+		}
+	})
+
+	t.Run("request cap reached consumes no page slot", func(t *testing.T) {
+		b := newCrawlBudget(100, 50)
+		b.pageCount, b.reqCount = 1, 50
+		if _, ok := b.TryReserve(); ok {
+			t.Fatal("admitted a page at 50/50 requests")
+		}
+		if b.Pages() != 1 {
+			t.Errorf("reserve consumed a page slot when the request budget stopped the crawl: pages = %d, want 1", b.Pages())
+		}
+	})
+
+	// The estimated cost of the page must be charged up front, not just the
+	// already-spent total. Without this the budget is only ever compared against
+	// requests that have already been sent, which is what let every worker start a
+	// page against a nearly-full budget.
+	t.Run("refuses when the estimate does not fit", func(t *testing.T) {
+		b := newCrawlBudget(0, 10)
+		b.reqCount = 5 // 5 spent, 5 left, estimate is initialRequestsPerPageEstimate (8)
+		b.pagesMeasured, b.requestsMeasure = 1, initialRequestsPerPageEstimate
+		if _, ok := b.TryReserve(); ok {
+			t.Errorf("admitted a page estimated at %d requests with only 5 of the budget left",
+				initialRequestsPerPageEstimate)
+		}
+	})
+
+	// A budget smaller than one page's estimated cost must still crawl one page,
+	// or an empty capture reads as "the target has no API" rather than "the budget
+	// was too small".
+	t.Run("admits the first page even when the budget is below one page", func(t *testing.T) {
+		b := newCrawlBudget(0, 1)
+		if _, ok := b.TryReserve(); !ok {
+			t.Error("refused the very first page, so a small budget would capture nothing at all")
+		}
+		if _, ok := b.TryReserve(); ok {
+			t.Error("admitted a second page: the below-one-page allowance is for the first page only")
+		}
+	})
+
+	t.Run("concurrent reservation admits exactly maxPages", func(t *testing.T) {
+		const (
+			goroutines = 200
+			maxPages   = 37 // not a divisor of goroutines, so an off-by-one cannot hide
+		)
+		b := newCrawlBudget(maxPages, 0)
+		var (
+			admitted atomic.Int64
+			wg       sync.WaitGroup
+		)
+		start := make(chan struct{})
+		for range goroutines {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start // maximize contention on the compare-and-increment
+				if _, ok := b.TryReserve(); ok {
+					admitted.Add(1)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		if got := admitted.Load(); got != maxPages {
+			t.Errorf("admitted %d pages, want exactly %d: concurrent reservation "+
+				"overshot or undershot the page cap", got, maxPages)
+		}
+		if b.Pages() != maxPages {
+			t.Errorf("pages = %d, want exactly %d: reserved slots must equal admissions",
+				b.Pages(), maxPages)
+		}
+	})
+
+	t.Run("concurrent calls stop exactly at the request cap", func(t *testing.T) {
+		const (
+			goroutines  = 200
+			maxRequests = 25
+		)
+		b := newCrawlBudget(0, maxRequests)
+		b.reqCount = maxRequests // already at the bound
+		var (
+			admitted atomic.Int64
+			wg       sync.WaitGroup
+		)
+		start := make(chan struct{})
+		for range goroutines {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				if _, ok := b.TryReserve(); ok {
+					admitted.Add(1)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		if got := admitted.Load(); got != 0 {
+			t.Errorf("admitted %d pages with the request budget already exhausted, want 0", got)
+		}
+		if b.Pages() != 0 {
+			t.Errorf("pages = %d, want 0: no page slot may be consumed when the "+
+				"request budget is what stopped the crawl", b.Pages())
+		}
+	})
+}
+
+// TestCrawlBudget_CancelDoesNotPoisonTheEstimate pins why Cancel exists separately
+// from Release. A page that failed or was abandoned is not evidence that pages cost
+// zero requests; folding it into the mean drags the estimate down, and a too-low
+// estimate is what lets too many pages start against a nearly-full budget.
+func TestCrawlBudget_CancelDoesNotPoisonTheEstimate(t *testing.T) {
+	b := newCrawlBudget(0, 1000)
+
+	r, _ := b.TryReserve()
+	b.Release(r, 12) // one real page costing 12
+
+	for range 20 {
+		r, _ := b.TryReserve()
+		b.Cancel(r) // twenty failures
+	}
+
+	b.mu.Lock()
+	est := b.estimate()
+	b.mu.Unlock()
+	if est != 12 {
+		t.Errorf("estimate = %d after 1 real page (12 requests) and 20 cancellations, want 12: "+
+			"canceled pages must not contribute a zero-cost sample", est)
+	}
+	if b.reserved != 0 {
+		t.Errorf("reserved = %d, want 0: every reservation was returned", b.reserved)
+	}
+}
+
+// TestCrawlBudget_AbandonChargesRequestsWithoutSkewingEstimate pins the two halves
+// of the part-way-canceled reconciliation, which pull in opposite directions.
+//
+// The worker's mid-emit cancellation path used Release, which is correct about the
+// budget (the emitted requests really were sent to the target) and wrong about the
+// mean (a partial count is not a sample of what a page costs). Release drags the
+// estimate down, which is the exact failure Cancel's doc comment exists to prevent:
+// a too-low estimate is what lets too many pages start against a nearly-full budget.
+func TestCrawlBudget_AbandonChargesRequestsWithoutSkewingEstimate(t *testing.T) {
+	b := newCrawlBudget(0, 1000)
+
+	r, _ := b.TryReserve()
+	b.Release(r, 12) // one complete page costing 12
+
+	r, _ = b.TryReserve()
+	b.Abandon(r, 2) // cut off after emitting 2 of its requests
+
+	b.mu.Lock()
+	est := b.estimate()
+	b.mu.Unlock()
+
+	if est != 12 {
+		t.Errorf("estimate = %d after one 12-request page and one page abandoned at 2, want 12: "+
+			"a partial count is not a sample of what a page costs", est)
+	}
+	if got := b.Requests(); got != 14 {
+		t.Errorf("Requests() = %d, want 14: the 2 emitted requests reached the target, so they "+
+			"must still count against a budget that exists to protect it", got)
+	}
+	if b.reserved != 0 {
+		t.Errorf("reserved = %d, want 0: every reservation was returned", b.reserved)
+	}
+}
+
+// TestEnrichTarget_RedactsCredentialsInNavigationNotice pins the redaction on the
+// interaction navigation notice. For the depth-0 visit pageURL is the seed exactly
+// as the operator typed it, so echoing it raw wrote cleartext credentials to
+// stderr, and stderr lands in CI job logs, shell scrollback, and any wrapper that
+// captures the capability's output (LAB-4678 review, SEC-BE-005).
+//
+// navigated=true is the only branch that writes, and it ignores the page argument,
+// so this needs no browser.
+func TestEnrichTarget_RedactsCredentialsInNavigationNotice(t *testing.T) {
+	var stderr bytes.Buffer
+	e := &rodEngine{opts: engineOptions{Stderr: &stderr}}
+
+	if got := e.enrichTarget(nil, true, "https://admin:s3cret@target.example.com/app"); got != nil {
+		t.Error("enrichTarget must return nil when a click navigated away unrecoverably")
+	}
+
+	out := stderr.String()
+	if out == "" {
+		t.Fatal("no notice written")
+	}
+	for _, secret := range []string{"s3cret", "admin:"} {
+		if strings.Contains(out, secret) {
+			t.Errorf("credential %q leaked to stderr: %q", secret, out)
+		}
+	}
+}
+
+// urlEchoIdentifiers are the identifiers in this package that hold a RAW,
+// operator-supplied URL, which may carry userinfo credentials. Identifiers holding
+// a derived origin (originOf output, which is scheme://host and so cannot contain
+// userinfo) are deliberately absent.
+var urlEchoIdentifiers = []string{
+	"pageURL", "targetURL", "seedURL", "rawURL", "effectiveURL",
+	"entry.URL", "target.URL", "req.URL.String()", "info.URL",
+}
+
+// TestOperatorFacingURLEchoesAreRedacted is the class-level guard for SEC-BE-005.
+// redactSeedURL was applied at nine echo sites and skipped at the one this PR added;
+// reviewing the diff found the new line but nothing compared it against the
+// established pattern. This scans every non-test file in the package for an
+// operator-facing message that interpolates a raw-URL identifier and requires that
+// argument to go through redactSeedURL, so the eleventh site cannot regress the way
+// the tenth did.
+//
+// It parses with go/ast and inspects whole CALL EXPRESSIONS, not lines. A
+// line-oriented scan silently missed any call whose format string and arguments sit
+// on different lines, which is how several echoes in this package are already
+// written — so a new unredacted echo wrapped across lines passed the guard, and the
+// coverage floor below could not catch it either (CodeRabbit review of the
+// SEC-BE-005 fix). Verified by mutation: a multi-line unredacted Fprintf now fails.
+//
+// It reads source rather than behavior on purpose: the alternative is one behavioral
+// test per echo site, several of which need a live browser or a real redirect.
+func TestOperatorFacingURLEchoesAreRedacted(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+
+	checked := 0
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, f, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", f, err)
+		}
+
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok || !isMessageCall(call.Fun) {
+				return true
+			}
+			for _, arg := range call.Args {
+				inner, redacted := redactedArg(arg)
+				name := types.ExprString(inner)
+				if !slices.Contains(urlEchoIdentifiers, name) {
+					continue
+				}
+				checked++
+				if !redacted {
+					pos := fset.Position(arg.Pos())
+					t.Errorf("%s:%d passes raw URL identifier %q to %s without "+
+						"redactSeedURL; an operator-supplied URL can carry userinfo "+
+						"credentials and stderr lands in CI logs",
+						f, pos.Line, name, types.ExprString(call.Fun))
+				}
+			}
+			return true
+		})
+	}
+
+	// If the identifier list ever stops matching the code, this guard silently passes
+	// over everything. Assert it still finds the known sites.
+	if checked < 5 {
+		t.Errorf("matched only %d URL echo arguments; urlEchoIdentifiers has probably "+
+			"drifted from the code and this guard is no longer checking anything", checked)
+	}
+}
+
+// isMessageCall reports whether fn is one of the fmt calls that produce an
+// operator-facing message. Restricted to these so an ordinary assignment or
+// comparison mentioning a URL identifier is not treated as an echo.
+func isMessageCall(fn ast.Expr) bool {
+	name := types.ExprString(fn)
+	return strings.HasPrefix(name, "fmt.Fprint") || name == "fmt.Errorf" || name == "fmt.Sprintf"
+}
+
+// redactedArg unwraps a redactSeedURL(x) argument, returning x and true. For any
+// other expression it returns the expression unchanged and false. Checking each
+// argument expression individually is what makes the guard insensitive to line
+// breaks: it never has to see the call and its arguments on one line.
+func redactedArg(arg ast.Expr) (inner ast.Expr, redacted bool) {
+	call, ok := arg.(*ast.CallExpr)
+	if !ok {
+		return arg, false
+	}
+	ident, ok := call.Fun.(*ast.Ident)
+	if !ok || ident.Name != "redactSeedURL" || len(call.Args) != 1 {
+		return arg, false
+	}
+	return call.Args[0], true
+}
+
+// TestLearnSeedOrigin_OnlyTheSeedWidensScope pins the containment invariant that
+// seedScope's whole argument rests on: only the seed's own navigation may widen
+// scope. The gate used to be Depth == 0, which was a valid proxy only while the
+// seed was the sole depth-0 entry.
+//
+// Resume broke that. resumeFrontier restores pending entries BEFORE the seed is
+// pushed, and urlFrontier.Restore honors whatever Depth the checkpoint claims, so a
+// restored entry carrying "Depth": 0 with a different URL is popped ahead of the
+// seed and became the page whose post-redirect origin was learned. A checkpoint is
+// unauthenticated by design, so anyone who could write to checkpoint storage chose
+// which page decided the widening (LAB-4678 review, SEC-BE-004).
+//
+// The gate is reached before any CDP call, so a nil page exercises it: a rejected
+// target returns before touching the page, and an accepted one would nil-panic —
+// which is what makes "accepted" observable here without a browser.
+func TestLearnSeedOrigin_OnlyTheSeedWidensScope(t *testing.T) {
+	const seed = "https://target.example.com/app"
+
+	cases := []struct {
+		name         string
+		target       urlEntry
+		wantConsider bool
+	}{
+		{"the seed itself is considered", urlEntry{URL: seed, Depth: 0}, true},
+		{"the seed at a non-zero depth is still the seed", urlEntry{URL: seed, Depth: 3}, true},
+		// The regression: a checkpoint-injected entry claiming depth 0.
+		{"a foreign URL claiming depth 0 is refused", urlEntry{URL: "https://attacker.example/x", Depth: 0}, false},
+		{"an ordinary deeper page is refused", urlEntry{URL: "https://target.example.com/deep", Depth: 2}, false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var learned []string
+			e := &rodEngine{
+				seedKey: seenKey(seed),
+				opts: engineOptions{
+					LearnEffectiveOrigin: func(u string) { learned = append(learned, u) },
+				},
+			}
+
+			// A considered target proceeds to page.Info() on the nil page and panics;
+			// a refused one returns before touching it. Either way the callback must
+			// not have fired, since a nil page yields no URL.
+			considered := func() (reached bool) {
+				defer func() { reached = recover() != nil }()
+				e.learnSeedOrigin(nil, c.target)
+				return false
+			}()
+
+			if considered != c.wantConsider {
+				t.Errorf("target %+v: reached the page read = %v, want %v",
+					c.target, considered, c.wantConsider)
+			}
+			if len(learned) != 0 {
+				t.Errorf("LearnEffectiveOrigin called with %v from a nil page", learned)
+			}
+		})
+	}
+}
+
+// TestLearnSeedOrigin_NoCallbackIsInert covers the nil-callback guard so the
+// identity check cannot be reordered ahead of it into a nil dereference.
+func TestLearnSeedOrigin_NoCallbackIsInert(t *testing.T) {
+	e := &rodEngine{seedKey: seenKey("https://ex.com/"), opts: engineOptions{}}
+	// Must return without touching the nil page even for the seed itself.
+	e.learnSeedOrigin(nil, urlEntry{URL: "https://ex.com/", Depth: 0})
+}
+
+// newTestEngine builds a rodEngine with no browser, for driving worker's budget and
+// requeue logic directly. visit is stubbed, so nothing touches Chrome.
+func newTestEngine(opts engineOptions, visit func(context.Context, urlEntry) ([]ObservedRequest, []string, error)) *rodEngine {
+	e := &rodEngine{
+		opts:     opts,
+		frontier: newURLFrontier(opts.MaxDepth, opts.ScopeCheck),
+		visit:    visit,
+	}
+	return e
+}
+
+// nRequests builds n distinct captured requests for one page, so a stubbed visit can
+// return a realistic multi-request page the way a real SPA visit does.
+func nRequests(pageURL string, n int) []ObservedRequest {
+	out := make([]ObservedRequest, 0, n)
+	for i := range n {
+		out = append(out, ObservedRequest{
+			Method: "GET",
+			URL:    fmt.Sprintf("%s/xhr/%d", pageURL, i),
+		})
+	}
+	return out
+}
+
+// TestWorker_MaxRequestsBudget_RodBackend covers --max-requests on the DEFAULT
+// (headless) backend, which is the one Guard runs and the one that had no coverage at
+// any level. The existing TestCrawl_MaxRequests_HTTPBackend sets Headless: false, so
+// it exercises the net/http path where one page is one request and the request budget
+// degenerates into a page cap; nothing verified that the rod worker consults the
+// request budget at all (LAB-4678 review, TEST-004).
+//
+// It asserts the three properties the PR claims:
+//   - the crawl stops taking new pages once reqCount >= MaxRequests,
+//   - the entry dequeued but not visited is REQUEUED, so it survives into resume
+//     state rather than being dropped,
+//   - the budget is a CEILING: the final count never exceeds MaxRequests by more
+//     than the page that crosses it.
+//
+// The lower bound is deliberately NOT "at least MaxRequests". crawlBudget reserves an
+// estimated cost before admitting a page, so it stops admitting once the next page
+// would not fit — which can leave part of the budget unspent. For a control whose
+// purpose is protecting the target, undershooting is the correct direction to err;
+// this test previously required the count to REACH the budget, which only held
+// because the old implementation overshot it.
+func TestWorker_MaxRequestsBudget_RodBackend(t *testing.T) {
+	const (
+		maxRequests       = 10
+		requestsPerPage   = 4
+		pagesInFrontier   = 20
+		expectedOvershoot = requestsPerPage - 1 // the page that crosses the bound still finishes
+	)
+
+	var visited atomic.Int64
+	visit := func(_ context.Context, target urlEntry) ([]ObservedRequest, []string, error) {
+		visited.Add(1)
+		// No links: the frontier is pre-seeded, so the budget is the only thing that
+		// can stop the crawl and a failure shows up as a hang or an overshoot.
+		return nRequests(target.URL, requestsPerPage), nil, nil
+	}
+
+	e := newTestEngine(engineOptions{
+		MaxRequests: maxRequests,
+		MaxDepth:    -1,
+		Concurrency: 1,
+	}, visit)
+
+	entries := make([]urlEntry, 0, pagesInFrontier)
+	for i := range pagesInFrontier {
+		entries = append(entries, urlEntry{URL: fmt.Sprintf("https://ex.com/p%d", i), Depth: 1})
+	}
+	if got := e.frontier.Push(entries); got != pagesInFrontier {
+		t.Fatalf("seeded %d entries, want %d", got, pagesInFrontier)
+	}
+
+	budget := newCrawlBudget(e.opts.MaxPages, e.opts.MaxRequests)
+	var emitted atomic.Int64
+
+	done := make(chan struct{})
+	go func() {
+		e.worker(context.Background(), 0, func(ObservedRequest) { emitted.Add(1) }, budget)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("worker did not terminate: the request budget must stop the loop, not spin")
+	}
+
+	got := int(emitted.Load())
+	if got == 0 {
+		t.Error("emitted nothing: a budget of more than one page must still crawl")
+	}
+	if got > maxRequests+expectedOvershoot {
+		t.Errorf("emitted %d requests, want at most %d (budget %d + one page's %d requests): "+
+			"the overshoot must be bounded by one page, not unbounded",
+			got, maxRequests+expectedOvershoot, maxRequests, requestsPerPage)
+	}
+	// Undershoot is allowed but must stay proportionate: reserving is meant to stop
+	// the LAST page that would not fit, not to strand most of the budget.
+	if got < maxRequests-requestsPerPage {
+		t.Errorf("emitted %d requests against a budget of %d: the reservation is stranding "+
+			"more than one page's worth of budget", got, maxRequests)
+	}
+
+	// The budget must stop the crawl well short of the frontier.
+	if v := int(visited.Load()); v >= pagesInFrontier {
+		t.Errorf("visited %d of %d pages: the request budget did not stop the crawl", v, pagesInFrontier)
+	}
+
+	// Unvisited pages must remain in resume state, including the entry that was
+	// dequeued and then returned when the budget check fired.
+	cp := e.frontier.Snapshot
+	pending, _ := cp()
+	if len(pending) == 0 {
+		t.Fatal("no pending entries survived: pages the budget prevented from being " +
+			"visited must be requeued for resume, not dropped")
+	}
+	if len(pending)+int(visited.Load()) < pagesInFrontier {
+		t.Errorf("pending(%d) + visited(%d) = %d, want at least %d: an entry was dropped "+
+			"rather than requeued", len(pending), visited.Load(), len(pending)+int(visited.Load()), pagesInFrontier)
+	}
+}
+
+// TestWorker_MaxRequestsZeroIsUnlimited pins that the budget is opt-in: with
+// MaxRequests unset the worker drains the frontier. A guard that treated 0 as "stop
+// immediately" would make the flag's default silently disable the crawl.
+func TestWorker_MaxRequestsZeroIsUnlimited(t *testing.T) {
+	const pages = 6
+	e := newTestEngine(engineOptions{MaxDepth: -1, Concurrency: 1},
+		func(_ context.Context, target urlEntry) ([]ObservedRequest, []string, error) {
+			return nRequests(target.URL, 3), nil, nil
+		})
+
+	entries := make([]urlEntry, 0, pages)
+	for i := range pages {
+		entries = append(entries, urlEntry{URL: fmt.Sprintf("https://ex.com/p%d", i), Depth: 1})
+	}
+	e.frontier.Push(entries)
+
+	budget := newCrawlBudget(e.opts.MaxPages, e.opts.MaxRequests)
+	var emitted atomic.Int64
+	e.worker(context.Background(), 0, func(ObservedRequest) { emitted.Add(1) }, budget)
+
+	if got := int(emitted.Load()); got != pages*3 {
+		t.Errorf("emitted %d requests, want %d: MaxRequests=0 must mean unlimited", got, pages*3)
+	}
+}
+
+// TestWorker_MaxRequestsBound_DoesNotScaleWithConcurrency pins the property that
+// makes --max-requests a usable politeness control: the total does NOT grow with
+// --concurrency.
+//
+// The predecessor of this test asserted the opposite, because that is what the code
+// did. reqCount was incremented only AFTER a visit returned while the budget was
+// consulted BEFORE one started, so every worker cleared the check inside the same
+// window and the real bound was MaxRequests + (Concurrency x requests-per-page):
+// a budget of 10 at the default --concurrency 10 against 4-request pages emitted 44.
+// The test parked all Concurrency workers inside a visit to force that interleaving
+// and then asserted the result was ABOVE a one-page overshoot, which locked the
+// defect in as the specification.
+//
+// crawlBudget now reserves an estimated cost before admitting a page, so the same
+// interleaving cannot occur: workers are refused at TryReserve rather than queuing
+// up inside visits. The assertion is therefore the inverse — the emitted total must
+// stay at or near the budget regardless of concurrency, and specifically must not
+// reach the old concurrency-scaled figure.
+func TestWorker_MaxRequestsBound_DoesNotScaleWithConcurrency(t *testing.T) {
+	const (
+		maxRequests     = 10
+		requestsPerPage = 4
+		pages           = 200
+	)
+
+	for _, concurrency := range []int{1, 2, DefaultConcurrency} {
+		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
+			visit := func(_ context.Context, target urlEntry) ([]ObservedRequest, []string, error) {
+				return nRequests(target.URL, requestsPerPage), nil, nil
+			}
+			e := newTestEngine(engineOptions{
+				MaxRequests: maxRequests,
+				MaxDepth:    -1,
+				Concurrency: concurrency,
+			}, visit)
+
+			entries := make([]urlEntry, 0, pages)
+			for i := range pages {
+				entries = append(entries, urlEntry{URL: fmt.Sprintf("https://ex.com/p%d", i), Depth: 1})
+			}
+			e.frontier.Push(entries)
+
+			budget := newCrawlBudget(e.opts.MaxPages, e.opts.MaxRequests)
+			var (
+				emitted atomic.Int64
+				wg      sync.WaitGroup
+			)
+			for i := range concurrency {
+				wg.Add(1)
+				go func(id int) {
+					defer wg.Done()
+					e.worker(context.Background(), id, func(ObservedRequest) { emitted.Add(1) }, budget)
+				}(i)
+			}
+
+			done := make(chan struct{})
+			go func() { wg.Wait(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(30 * time.Second):
+				t.Fatal("workers did not terminate: the request budget must stop the loop, not spin")
+			}
+
+			got := int(emitted.Load())
+			oldConcurrencyScaledBound := maxRequests + concurrency*requestsPerPage
+
+			// The page that crosses the bound still finishes, so one page's worth of
+			// overshoot is inherent to the graceful drain and is accepted.
+			upper := maxRequests + requestsPerPage
+			if got > upper {
+				t.Errorf("emitted %d requests for --max-requests %d at concurrency %d, "+
+					"above the one-page allowance of %d", got, maxRequests, concurrency, upper)
+			}
+			if concurrency > 1 && got >= oldConcurrencyScaledBound {
+				t.Errorf("emitted %d requests, at or above the old concurrency-scaled bound of %d: "+
+					"the overshoot is scaling with --concurrency again", got, oldConcurrencyScaledBound)
+			}
+			if got == 0 {
+				t.Error("emitted nothing: a budget above one page must still crawl")
 			}
 		})
 	}

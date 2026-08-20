@@ -67,7 +67,7 @@ func ParseCookiesToParams(targetURL, cookieValue string) ([]*proto.NetworkCookie
 	// don't emit cookies with an empty Host (which Chrome would drop
 	// silently, causing LAB-2222 to regress without any signal).
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("invalid target URL for cookies %q: must be an absolute http(s) URL", targetURL)
+		return nil, fmt.Errorf("invalid target URL for cookies %q: must be an absolute http(s) URL", redactSeedURL(targetURL))
 	}
 
 	var params []*proto.NetworkCookieParam

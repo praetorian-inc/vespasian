@@ -320,7 +320,7 @@ Two CI workflows gate a PR:
 
 ### PR checklist
 
-- [ ] `make check` passes (fmt, vet, lint, test, check-docs)
+- [ ] `make check` passes (fmt, vet, lint, lint-comments, test, check-docs)
 - [ ] Tests added or updated for the change
 - [ ] New classifier / generator / importer / probe registered where the pipeline expects it
 - [ ] Commit messages follow conventional commit format

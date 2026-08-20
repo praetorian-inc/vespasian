@@ -206,15 +206,38 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl
 	return requests, nil
 }
 
+// captureFileMode is the mode every file writeOutput produces must end up with.
+//
+// 0600 because capture.json carries per-request Headers and Response.Headers verbatim
+// from the browser and the HTTP backend, so an authenticated crawl (-H "Authorization:
+// ...", session cookies) lands operator and target credentials on disk through this one
+// function. TestWriteOutput_FileModeIs0600 asserts the mode the file actually lands at,
+// on both the fresh and the pre-existing path; before that nothing did, and grep for
+// Mode().Perm() across the module returned nothing (LAB-4678 review, SEC-BE-001).
+const captureFileMode = 0o600
+
 // writeOutput opens the output file (or stdout if path is empty), calls fn to
 // write content, and ensures the file is closed properly.
+//
+// The mode is applied with Chmod after the open, not left to O_CREATE. O_CREATE's perm
+// argument takes effect only when the call actually CREATES the file, so with O_TRUNC
+// and no O_EXCL, re-running a scan over an existing capture.json — one from an older
+// build, a shell redirect, or a copy made under a looser umask — truncated and rewrote
+// it while KEEPING its original mode. The source said 0600 and the credentials landed
+// in a world-readable file. Chmod on the descriptor rather than the path so the mode is
+// set on the file just opened and not on whatever the path resolves to next.
 func writeOutput(path string, fn func(io.Writer) error) error {
 	if path == "" {
 		return fn(os.Stdout)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600) //nolint:gosec // G304: CLI tool, user controls output path
+	// #nosec G304 -- the path IS the operator's -o flag; gosec's os.Root autofix would scope away the feature.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, captureFileMode)
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	if err := f.Chmod(captureFileMode); err != nil {
+		closeErr := f.Close()
+		return errors.Join(fmt.Errorf("failed to set output file permissions: %w", err), closeErr)
 	}
 	writeErr := fn(f)
 	closeErr := f.Close()
@@ -233,6 +256,8 @@ type CrawlOptions struct {
 	Output          string        `short:"o" help:"Output file path"`
 	Depth           int           `default:"3" help:"Maximum crawl depth"`
 	MaxPages        int           `default:"100" help:"Maximum number of pages (URLs visited) to crawl; pages already in flight when the limit is reached still finish"`
+	MaxRequests     int           `name:"max-requests" default:"0" help:"Captured-request budget (0 = unlimited). A rate/politeness bound distinct from --max-pages. A page's estimated request cost is reserved before the page starts and reconciled against the actual count when it finishes, so the total does NOT scale with --concurrency. The estimate is the running mean of requests per page. Overshoot is bounded by the page that crosses the limit, since in-flight pages finish rather than being cut mid-capture; the budget may also be UNDER-spent, because a page not estimated to fit does not start."`
+	Interact        bool          `name:"interact" help:"Click page controls (buttons, [role=button], [onclick]) to surface endpoints that only fire on interaction. Includes form submit buttons, so it submits forms and can mutate state. Headless backend only. Skips destructive, session-ending, and payment-commit labels on a best-effort match. Off by default."`
 	Timeout         time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
 	Scope           string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
 	Headless        bool          `default:"true" help:"Use headless browser"`
@@ -243,6 +268,36 @@ type CrawlOptions struct {
 	Verbose         bool          `short:"v" help:"Enable verbose logging"`
 	AnalyzeJS       bool          `name:"analyze-js"      default:"true"  help:"Statically analyze captured JS bundles to discover API endpoints, parameters, and request bodies."`
 	FetchSourcemaps bool          `name:"fetch-sourcemaps" default:"true"  help:"When --analyze-js is set, fetch .js.map sourcemaps referenced via //# sourceMappingURL= comments to recover original sources."`
+}
+
+// crawlerOptions maps the shared CLI crawl flags onto crawl.CrawlerOptions.
+//
+// It exists so there is exactly ONE mapping, called by both CrawlCmd.Run and
+// ScanCmd.Run. The two commands previously each built this literal inline, which
+// made "wire the flag into one command and forget the other" a live failure mode:
+// a new flag could work under `vespasian crawl` and silently do nothing under
+// `vespasian scan`, and no test compared the two blocks. That is exactly how
+// --max-requests and --interact shipped with neither wiring asserted (LAB-4678
+// review, TEST-001). With one constructor the divergence is not merely untested,
+// it is unrepresentable.
+//
+// allowPrivate is a parameter rather than a CrawlOptions field because each command
+// declares its own --dangerous-allow-private with command-specific help text: on
+// CrawlCmd it covers the crawl only, on ScanCmd the crawl and the probe path.
+func (o CrawlOptions) crawlerOptions(allowPrivate bool) crawl.CrawlerOptions {
+	return crawl.CrawlerOptions{
+		Depth:         o.Depth,
+		MaxPages:      o.MaxPages,
+		MaxRequests:   o.MaxRequests,
+		Interact:      o.Interact,
+		Timeout:       o.Timeout,
+		Scope:         o.Scope,
+		Headless:      o.Headless,
+		Proxy:         o.Proxy,
+		ProxyInsecure: o.ProxyInsecure,
+		Concurrency:   o.Concurrency,
+		AllowPrivate:  allowPrivate,
+	}
 }
 
 // SlugOptions holds the path-normalization flags shared by GenerateCmd and ScanCmd.
@@ -392,17 +447,8 @@ func (c *CrawlCmd) Run() error {
 		return err
 	}
 
-	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions, crawl.CrawlerOptions{
-		Depth:         c.Depth,
-		MaxPages:      c.MaxPages,
-		Timeout:       c.Timeout,
-		Scope:         c.Scope,
-		Headless:      c.Headless,
-		Proxy:         c.Proxy,
-		ProxyInsecure: c.ProxyInsecure,
-		Concurrency:   c.Concurrency,
-		AllowPrivate:  c.DangerousAllowPrivate,
-	})
+	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions,
+		c.crawlerOptions(c.DangerousAllowPrivate))
 	if err != nil {
 		return err
 	}
@@ -710,17 +756,8 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		return err
 	}
 
-	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions, crawl.CrawlerOptions{
-		Depth:         c.Depth,
-		MaxPages:      c.MaxPages,
-		Timeout:       c.Timeout,
-		Scope:         c.Scope,
-		Headless:      c.Headless,
-		Proxy:         c.Proxy,
-		ProxyInsecure: c.ProxyInsecure,
-		Concurrency:   c.Concurrency,
-		AllowPrivate:  c.DangerousAllowPrivate,
-	})
+	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions,
+		c.crawlerOptions(c.DangerousAllowPrivate))
 	if err != nil {
 		return err
 	}
@@ -914,10 +951,14 @@ func parseProxyConfig(addr string, insecure bool) (httpx.ProxyConfig, error) {
 // httpx.ProxyConfig, falling back to the zero (disabled) config on error. It
 // encapsulates the fail-safe used by the post-crawl builders (CrawlCmd.Run,
 // GenerateCmd.options, ScanCmd.Run): each command validates --proxy fail-fast
-// earlier in its Run (generate via resolveJSReplayConfig; crawl/scan via
-// doCrawl), so a parse error here is unreachable in the normal flow and the
-// fallback only guards that (already-rejected) case. Fail-fast validation is
-// intentionally NOT done here — that stays at the per-command entry points.
+// earlier in its Run — generate via resolveJSReplayConfig
+// (TestGenerateCmd_ResolveJSReplayConfig_RejectsInvalidProxy), crawl/scan via
+// doCrawl (TestDoCrawl_InvalidProxyRejected) — so on those paths an address
+// reaching here has already passed validation and the fallback guards a case the
+// entry point rejected. Whether every future caller keeps that ordering is not
+// something this function can enforce, which is why it degrades to the disabled
+// config rather than panicking. Fail-fast validation is intentionally NOT done
+// here — that stays at the per-command entry points.
 func parseProxyConfigOrEmpty(addr string, insecure bool) httpx.ProxyConfig {
 	cfg, err := parseProxyConfig(addr, insecure)
 	if err != nil {

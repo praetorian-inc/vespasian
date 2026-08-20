@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	restgen "github.com/praetorian-inc/vespasian/pkg/generate/rest"
 )
 
@@ -285,5 +286,55 @@ func TestToRequests_InferSchemaCompatible(t *testing.T) {
 	}
 	if _, ok := schema.Value.Properties["email"]; !ok {
 		t.Error("InferSchema schema missing 'email' property")
+	}
+}
+
+// TestSynthesizedLess_TiebreaksOnPopulatedFields pins the comparator to fields
+// toRequests actually sets. Its final tiebreaker used to be QueryParams, which
+// toRequests never populates, so two entries differing only in PageURL or Headers
+// compared equal in both directions and sort.SliceStable fell back to preserving
+// the worker pool's nondeterministic completion order — the exact variance the sort
+// exists to remove.
+func TestSynthesizedLess_TiebreaksOnPopulatedFields(t *testing.T) {
+	base := func() crawl.ObservedRequest {
+		return crawl.ObservedRequest{Method: "GET", URL: "/api/x", Source: SourceJS}
+	}
+
+	pageA, pageB := base(), base()
+	pageA.PageURL = "https://ex.com/a"
+	pageB.PageURL = "https://ex.com/b"
+	if !synthesizedLess(pageA, pageB) || synthesizedLess(pageB, pageA) {
+		t.Errorf("entries differing only in PageURL do not order: less(a,b)=%v less(b,a)=%v",
+			synthesizedLess(pageA, pageB), synthesizedLess(pageB, pageA))
+	}
+
+	hdrA, hdrB := base(), base()
+	hdrA.Headers = map[string]string{"Content-Type": "application/json"}
+	hdrB.Headers = map[string]string{"Content-Type": "text/plain"}
+	if !synthesizedLess(hdrA, hdrB) || synthesizedLess(hdrB, hdrA) {
+		t.Errorf("entries differing only in Headers do not order: less(a,b)=%v less(b,a)=%v",
+			synthesizedLess(hdrA, hdrB), synthesizedLess(hdrB, hdrA))
+	}
+
+	// Fully identical entries must still compare equal in both directions,
+	// otherwise the comparator is not a valid strict weak ordering.
+	x, y := base(), base()
+	if synthesizedLess(x, y) || synthesizedLess(y, x) {
+		t.Error("identical entries compared unequal")
+	}
+}
+
+// TestHeaderKey_StableAcrossMapOrder verifies the header tiebreaker does not
+// depend on Go's randomized map iteration.
+func TestHeaderKey_StableAcrossMapOrder(t *testing.T) {
+	h := map[string]string{"a": "1", "b": "2", "c": "3", "d": "4", "e": "5"}
+	want := headerKey(h)
+	for range 20 {
+		if got := headerKey(h); got != want {
+			t.Fatalf("headerKey unstable: %q vs %q", got, want)
+		}
+	}
+	if headerKey(nil) != "" {
+		t.Error("headerKey(nil) should be empty")
 	}
 }

@@ -15,9 +15,11 @@
 package jsstatic
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -297,10 +299,9 @@ func extractWithTimeout(ctx context.Context, source []byte, sourceURL, kind stri
 // call site is a single nil-check with no allocation and no side effects in
 // production builds.
 //
-// Dependency-injecting these hooks through Options would expose test seams as
-// part of the public API surface, which violates KISS for what amounts to two
-// conditional nil-checks. The package-level variable pattern is the accepted
-// Go idiom for this pattern and predates this PR.
+// They are package-level variables rather than Options fields so the test seam
+// stays out of the public API surface: Options is what callers configure, and two
+// fault-injection points do not belong in a caller's configuration.
 
 // testInjectPanic is a panic-fault-injection point used by jsstatic's
 // panic-recovery regression tests. The hook is consulted at exactly two
@@ -355,8 +356,9 @@ func safeAnalyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options
 // AST is small (QUAL-002).
 //
 // QUAL-003: the floor is deliberately small (concatMinReserve, additionally
-// capped at budget/2 so it can never invert and starve AST) rather than the
-// budget/2 reservation it replaced. That earlier reservation was UNCONDITIONAL,
+// capped at budget/2 so it can never invert and starve AST — the exact split is
+// pinned per budget by TestCapBundleEndpoints_SmallBudgetDoesNotStarveAST) rather
+// than the budget/2 reservation it replaced. That earlier reservation was UNCONDITIONAL,
 // so it taxed AST even when concat was abundant and low-value: with the default
 // budget of 500, a bundle yielding 600 AST endpoints and 300 concat
 // reconstructions kept only 250 AST, where a pre-LAB-4992 `eps[:budget]` kept
@@ -414,6 +416,17 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	var result perBundleResult
 	body := req.Response.Body
 
+	// Next.js App Router route recovery (LAB-4678 audit item 7). Derived from the
+	// bundle URL, not its body, so it runs before body extraction and still
+	// applies to bundles whose parse times out or panics below. See nextroute.go
+	// for why the URL carries the route.
+	if ep := extractNextRoute(req.URL, req.PageURL); ep != nil {
+		result.stats.EndpointsFound++
+		synth := toRequests([]ExtractedEndpoint{*ep}, req.URL)
+		result.requests = append(result.requests, synth...)
+		result.stats.EndpointsKept += len(synth)
+	}
+
 	// Sourcemap recovery (ctx propagated for remote fetch cancellation).
 	smSources, smStats := recoverSourcemap(ctx, body, req.URL, opts)
 	result.stats.SourcemapFetchFails += smStats.SourcemapFetchFails
@@ -436,16 +449,24 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	// sources. The cap is applied first to the bundle body and then
 	// re-evaluated as remaining-budget on each sourcemap source below.
 	//
-	// QUAL-001 (LAB-4992): a plain prefix truncation here would keep only the
-	// first MaxEndpointsPerBundle entries of bundleEps. Because
-	// ExtractFromBundle appends concat/service-prefix reconstructions AFTER
-	// all AST-recovered endpoints, any bundle whose AST endpoint count alone
-	// reaches the cap would silently drop every concat candidate — undermining
-	// the acceptance criterion that offline generate must surface concat
-	// endpoints. capBundleEndpoints reserves a fair share of the budget for
-	// concat candidates instead of truncating the combined slice blindly.
-	if len(bundleEps) > opts.MaxEndpointsPerBundle {
-		bundleEps = capBundleEndpoints(bundleEps, opts.MaxEndpointsPerBundle)
+	// A plain prefix truncation here would keep only the first
+	// MaxEndpointsPerBundle entries of bundleEps. Because ExtractFromBundle
+	// appends concat/service-prefix reconstructions AFTER all AST-recovered
+	// endpoints, any bundle whose AST endpoint count alone reaches the cap would
+	// silently drop every concat candidate — undermining the acceptance criterion
+	// that offline generate must surface concat endpoints (LAB-4992).
+	// capBundleEndpoints reserves a fair share of the budget for concat
+	// candidates instead of truncating the combined slice blindly.
+	//
+	// The budget is the cap MINUS what the Next.js chunk-URL recovery above
+	// already kept, matching how the sourcemap loop below computes `remaining`.
+	// Using the full cap here let a Next.js chunk bundle keep cap+1.
+	bodyBudget := opts.MaxEndpointsPerBundle - result.stats.EndpointsKept
+	if bodyBudget < 0 {
+		bodyBudget = 0
+	}
+	if len(bundleEps) > bodyBudget {
+		bundleEps = capBundleEndpoints(bundleEps, bodyBudget)
 	}
 	for i := range bundleEps {
 		// Preserve the distinct concat reconstruction tag; force everything else
@@ -510,6 +531,60 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	return result
 }
 
+// synthesizedLess is the deterministic ordering for synthesized static:js
+// entries (LAB-4678 Phase 2): URL, then method, then source tag, then request
+// body, then page URL, then headers. Kept as a named helper so Analyze stays
+// under the cyclomatic gate.
+//
+// The keys are exactly the fields [toRequests] populates, which is what makes this
+// a total order over synthesized entries: any two distinct entries differ in at
+// least one of them. The final tiebreakers matter — without them, entries equal on
+// the earlier keys compare equal and sort.SliceStable preserves their
+// worker-completion order, which is nondeterministic, leaving exactly the ordering
+// variance this sort exists to remove. The previous final key was QueryParams,
+// which toRequests never sets, so PageURL- and Headers-only differences fell
+// through to worker order.
+func synthesizedLess(a, b crawl.ObservedRequest) bool {
+	if a.URL != b.URL {
+		return a.URL < b.URL
+	}
+	if a.Method != b.Method {
+		return a.Method < b.Method
+	}
+	if a.Source != b.Source {
+		return a.Source < b.Source
+	}
+	if c := bytes.Compare(a.Body, b.Body); c != 0 {
+		return c < 0
+	}
+	if a.PageURL != b.PageURL {
+		return a.PageURL < b.PageURL
+	}
+	return headerKey(a.Headers) < headerKey(b.Headers)
+}
+
+// headerKey renders a header map as a canonical, comparable string: entries sorted
+// by name, joined as "name:value". Used only as a sort tiebreaker, so it needs to
+// be stable and total, not parseable.
+func headerKey(h map[string]string) string {
+	if len(h) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(h))
+	for k := range h {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, k := range names {
+		b.WriteString(k)
+		b.WriteByte(':')
+		b.WriteString(h[k])
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
 // Analyze runs static analysis on every JS body in captured. It returns a
 // Result whose Requests slice is captured with synthesized [crawl.ObservedRequest]
 // entries APPENDED at the end (so classify.Deduplicate keeps dynamic entries
@@ -521,14 +596,11 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 // canceled). Per-bundle parse failures are logged and counted in Stats but
 // do not abort the analysis.
 //
-// Length rationale: this function's body is the orchestration shape of the
-// package — pre-loop classification, worker-pool fan-out, fan-in with Stats
-// merge, output slice build, and post-run cancellation check. These phases
-// are cohesive: each step reads the output of the previous one and the
-// control flow is sequential. Splitting the merge or fan-out into helpers
-// would force them to expose Stats, work channels, and the
-// abandoned-on-cancel accounting as parameters, which would obscure rather
-// than clarify the orchestration.
+// The phases below — pre-loop classification, worker-pool fan-out, fan-in with
+// Stats merge, output slice build, post-run cancellation check — are sequential
+// and each reads the previous one's output. Splitting the merge or the fan-out
+// into helpers would force them to take Stats, the work channels, and the
+// abandoned-on-cancel accounting as parameters.
 func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options) (Result, error) {
 	// Check context before any work.
 	if ctx.Err() != nil {
@@ -624,6 +696,18 @@ func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options
 	if abandoned := len(bundles) - workerProcessed; abandoned > 0 {
 		stats.BundlesAbandonedOnCancel = abandoned
 	}
+
+	// Sort the synthesized entries into a deterministic order (LAB-4678 Phase 2).
+	// The worker pool fans results into resultCh in completion order, which is
+	// non-deterministic across runs, so without this the appended static:js
+	// entries would be ordered by worker scheduling. Downstream dedup/generate
+	// are order-independent for the retained data, but ordering the synthesized
+	// block here makes jsstatic's own output a deterministic function of the
+	// capture rather than relying on those downstream sorts. Key: URL, method,
+	// source tag, then request body.
+	sort.SliceStable(synthesized, func(i, j int) bool {
+		return synthesizedLess(synthesized[i], synthesized[j])
+	})
 
 	// Build result: original captured first, synthesized appended after.
 	out := make([]crawl.ObservedRequest, len(captured), len(captured)+len(synthesized))

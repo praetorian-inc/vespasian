@@ -144,3 +144,35 @@ func TestHeaderCollisionDeterministic(t *testing.T) {
 		}
 	}
 }
+
+func TestIsJavaScript(t *testing.T) {
+	cases := []struct {
+		ct   string
+		want bool
+	}{
+		{"application/javascript", true},
+		{"text/javascript", true},
+		{"application/x-javascript", true},
+		{"text/javascript; charset=utf-8", true},
+		{"APPLICATION/JAVASCRIPT", true},
+		{"application/ecmascript", true},
+		{"text/ecmascript", true},
+		{"text/js", true},
+		{"application/x-js", true},
+		{"module/javascript", true}, // unregistered spelling; the substring test fails safe
+		{"application/json", false},
+		{"application/manifest+json", false},
+		{"text/html", false},
+		{"text/xml", false},
+		{"application/grpc", false},
+		{"", false},
+		// A JSON media type whose PARAMETER mentions javascript must not match: Base
+		// strips parameters before the test, so only the type/subtype is considered.
+		{"application/json; profile=javascript", false},
+	}
+	for _, c := range cases {
+		if got := IsJavaScript(c.ct); got != c.want {
+			t.Errorf("IsJavaScript(%q) = %v, want %v", c.ct, got, c.want)
+		}
+	}
+}
