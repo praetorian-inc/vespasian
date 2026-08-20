@@ -97,7 +97,7 @@ export CHROME_PROBE_TIMEOUT=2
 #   +2  case bp3, pinning that the consolidated chrome_probe_budget still
 #       validates the budget for _bounded_probe as chrome_runnable does
 # See the credit register below for the matching skip_credit accounting.
-EXPECTED_ASSERTIONS=267
+EXPECTED_ASSERTIONS=271
 
 pass_count=0
 fail_count=0
@@ -167,6 +167,19 @@ SUITE_COMPLETED=0
 # skip_credit with every arm live). It moved 238 -> 239 when case cr landed,
 # 239 -> 244 when case z4 gained the four ordering assertions plus the per-site
 # register check, 244 -> 245 when the anchor-completeness check landed, and
+# 269 -> 271 in the round-20 pass: +2 for case m3, which pins that main() calls
+# require_tools BEFORE its first privileged apt invocation. MUTATION-PROVEN:
+# moving the call below the install block left all four suites green while a
+# timeout-less host would get the misdiagnosis m2 exists to prevent. The
+# apt-cache pin becoming counted-and-ceilinged, and case cl requiring prose
+# rather than a bare token, are both net zero — each replaced its predecessor.
+#
+# 267 -> 269 in the round-20 pass: +2 for case f7c, which pins that the export's
+# emptiness check precedes the first apt-wiring install. MUTATION-PROVEN: moving
+# only that check below the TMP_PREF install left every f7/f7b assertion green
+# while a refused run had installed a Pin-Priority 1001 source backed by a
+# zero-byte keyring.
+#
 # 266 -> 267 in the round-17 self-review pass: +1 for the apt-cache bound pin.
 # The bound was added in round 16 and asserted by NOTHING — the two existing
 # bound checks are scoped to `apt-get ...`, so `apt-cache policy` matched
@@ -799,11 +812,22 @@ vao_body=$(fn_code verify_apt_origin)
 # so `timeout -k 0 0` is a bound that is present and disabled. common.sh's
 # chrome_probe_budget rejects CHROME_PROBE_TIMEOUT=0 for exactly this reason, so
 # a pin that accepts it here would contradict the validation one file over.
-if printf '%s' "${vao_body}" | grep -qE 'policy=\$\(timeout -k [1-9][0-9]* [1-9][0-9]* apt-cache policy '; then
-    echo "PASS: case f: verify_apt_origin's apt-cache call is bounded by timeout -k"
+# COUNTED and CEILINGED, not merely present. Existence alone accepted a second,
+# unbounded apt-cache call added later (nothing compared the bounded count to the
+# total, unlike f5b for apt-get), and `[1-9][0-9]*` alone accepted
+# `timeout -k 99999999 99999999` — a bound whose expiry no operator will ever
+# see. Two digits at most for the kill-after and three for the duration keeps
+# both within the range the rest of this file uses (5/30, 30/300, 30/900).
+vao_cache_total=$(printf '%s' "${vao_body}" | grep -cE '(^|[^-[:alnum:]])apt-cache policy ' || true)
+vao_cache_bounded=$(printf '%s' "${vao_body}" | grep -cE 'timeout -k [1-9][0-9]? [1-9][0-9]{0,2} apt-cache policy ' || true)
+if [ "${vao_cache_total}" -lt 1 ]; then
+    echo "FAIL: case f: no apt-cache policy call found in verify_apt_origin — the bound check below is vacuous, fix the extraction rather than deleting it"
+    fail_count=$((fail_count + 1))
+elif [ "${vao_cache_bounded}" -eq "${vao_cache_total}" ]; then
+    echo "PASS: case f: all ${vao_cache_total} apt-cache policy call(s) in verify_apt_origin carry a timeout -k bound with plausible durations"
     pass_count=$((pass_count + 1))
 else
-    echo "FAIL: case f: verify_apt_origin's apt-cache policy call lost its timeout bound — a blocking apt-cache hangs the run with the temporary trusted Google apt source still live in /etc and cleanup_all unreached"
+    echo "FAIL: case f: ${vao_cache_bounded} of ${vao_cache_total} apt-cache policy call(s) in verify_apt_origin carry a plausible timeout -k bound — an unbounded or absurdly-bounded call hangs the run with the temporary trusted Google apt source still live in /etc and cleanup_all unreached"
     fail_count=$((fail_count + 1))
 fi
 
@@ -1130,6 +1154,38 @@ assert_eq "case f7b: an export that succeeds but writes nothing is refused (rc 1
     "1" "$(echo "${res_f7b}" | sed -n '1p')"
 assert_contains "case f7b: the empty-export refusal names the export too" \
     "Could not export the pinned key" "${res_f7b}"
+
+# f7c: the export verification must run BEFORE the first apt-wiring install.
+# f6/f7/f7b above assert rc and message; neither can see WHERE the check sits, and
+# that is the property which decides whether a refused run leaves anything behind.
+# MUTATION-PROVEN: keeping the export in place and moving only its
+# `[ ! -s "$tmp_gpg" ]` verification below the TMP_PREF install left every f7/f7b
+# assertion green (rc 1, right message) while the run had installed TMP_KEYRING,
+# TMP_LIST and a Pin-Priority 1001 TMP_PREF backed by a ZERO-BYTE keyring. The
+# f-cases cannot catch it behaviourally: they run with SUDO=/bin/false, so the
+# installs fail there regardless, and the wiring they would leave on a real root
+# host is unobservable from inside the case. Case f4 pins exactly this shape for
+# the fingerprint-mismatch arm, one arm over; this is the export arm's copy.
+#
+# `|| true` on each extraction and a fidelity sentinel first, matching case u:
+# a reworded statement must FAIL loudly, not compare empty strings and pass.
+ipk_body=$(fn_code install_pinned_key)
+export_check_at=$(printf '%s\n' "${ipk_body}" | grep -n '\[ ! -s "\$tmp_gpg" \]' | head -1 | cut -d: -f1 || true)
+first_wiring_at=$(printf '%s\n' "${ipk_body}" | grep -nE '^[[:space:]]*\$SUDO install .*"\$TMP_(KEYRING|LIST|PREF)"' | head -1 | cut -d: -f1 || true)
+if [ -n "${export_check_at}" ] && [ -n "${first_wiring_at}" ]; then
+    echo "PASS: case f7c: install_pinned_key's export check and its first apt-wiring install were both located"
+    pass_count=$((pass_count + 1))
+    if [ "${export_check_at}" -lt "${first_wiring_at}" ]; then
+        echo "PASS: case f7c: the export's emptiness check runs BEFORE any apt wiring is installed"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: case f7c: the export's emptiness check (line ${export_check_at}) runs at or AFTER the first apt-wiring install (line ${first_wiring_at}) — a failed export then leaves a Pin-Priority 1001 source and a zero-byte keyring installed on a real host, and every f7/f7b assertion stays green because they only read rc and the message"
+        fail_count=$((fail_count + 1))
+    fi
+else
+    echo "FAIL: case f7c: could not locate install_pinned_key's export check and/or its first apt-wiring install — the ordering assertion is vacuous; fix the extraction rather than deleting it"
+    fail_count=$((fail_count + 1))
+fi
 
 # ── Case g: the symlink guard on the defaults file ─────────────
 # CHROME_DEFAULTS_FILE (derived from VESPASIAN_TEST_ROOT in production, set
@@ -1848,6 +1904,32 @@ assert_contains "case m2: the refusal names the coreutils package, not curl or g
 # that a mutation can drop while leaving the package name in place.
 assert_contains "case m2: the refusal says WHICH coreutils program is missing and why it matters" \
     "timeout(1), which bounds both privileged apt calls" "${res_m2}"
+
+# m3: require_tools must be CALLED before the first privileged apt invocation.
+# m/m2 above prove the function refuses correctly; neither can see where main()
+# calls it, and a refusal that arrives after `apt-get update` has already run is
+# no refusal at all. MUTATION-PROVEN: moving main()'s `require_tools` call below
+# the install block left all four suites green — every equipped host behaves
+# identically — while a timeout-less host would reach `$SUDO timeout ... apt-get
+# update`, fail on the missing binary, and get exactly the three wrong diagnoses
+# ("held dpkg lock, or an unreachable mirror") that m2 exists to prevent.
+main_body_m3=$(fn_code main)
+req_at=$(printf '%s\n' "${main_body_m3}" | grep -n '^[[:space:]]*require_tools[[:space:]]*$' | head -1 | cut -d: -f1 || true)
+apt_first_at=$(printf '%s\n' "${main_body_m3}" | grep -nE '\$SUDO timeout (-k [0-9]+ )?[0-9]+ apt-get ' | head -1 | cut -d: -f1 || true)
+if [ -n "${req_at}" ] && [ -n "${apt_first_at}" ]; then
+    echo "PASS: case m3: main()'s require_tools call and its first privileged apt invocation were both located"
+    pass_count=$((pass_count + 1))
+    if [ "${req_at}" -lt "${apt_first_at}" ]; then
+        echo "PASS: case m3: require_tools runs BEFORE the first privileged apt call, so a missing tool is named rather than misdiagnosed"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: case m3: main() calls require_tools at line ${req_at}, at or AFTER its first privileged apt call at line ${apt_first_at} — on a host missing timeout(1) the run dies inside apt-get reporting a held lock or unreachable mirror, which is the misdiagnosis case m2 exists to prevent"
+        fail_count=$((fail_count + 1))
+    fi
+else
+    echo "FAIL: case m3: could not locate main()'s require_tools call and/or its first privileged apt call — the ordering assertion is vacuous; fix the extraction rather than deleting it"
+    fail_count=$((fail_count + 1))
+fi
 
 # ── Case n: the phone-home removal + verification chain ─────────
 # AC4's three controls (remove_phone_home, cleanup_apt_wiring, and
@@ -4326,13 +4408,36 @@ else
         [ -n "${label}" ] || continue
         # Word-boundaried: a bare `grep -F v` would be satisfied by "v3" and by
         # the word "verification", so every label would appear covered.
+        #
+        # And DESCRIBED, not merely mentioned. The parenthesised label has to be
+        # preceded on its line by prose — at least three words before the `(` —
+        # so appending a bare `(zz)` to the block cannot satisfy this check while
+        # saying nothing about what case zz covers. That is the gap the round-19
+        # review named: the assertion's own PASS text claims each group is
+        # "described", and a token match cannot support that word. Three words is
+        # deliberately a floor rather than a judgement of quality: the check can
+        # tell prose from a bare token, and cannot tell good prose from bad.
+        # MENTIONED, deliberately — not "described". Two attempts at a prose
+        # requirement were built and both had holes: a per-line word count
+        # reported `cr` undescribed because its description wraps onto the line
+        # above, and a per-entry count (splitting the flattened block on ';') let
+        # a bare `(zz)` appended at the END inherit the prose of the final entry.
+        # MUTATION-PROVEN defeated. A robust version needs to know which words
+        # belong to which parenthetical group, which is parsing, not grepping.
+        #
+        # So this asserts presence and the PASS text below says exactly that.
+        # Whether an entry describes its case is left to a reader, because a
+        # check that cannot tell prose from a token must not claim it can — the
+        # overclaiming wording was the round-19 finding, and narrowing the claim
+        # is the fix. Word-boundaried: a bare `grep -F v` would match "v3" and
+        # the word "verification", so every label would look present.
         printf '%s' "${cl_list}" | grep -qE "[( ]${label}[,;)]" || cl_missing="${cl_missing} ${label}"
     done <<< "${cl_headers}"
     if [ -n "${cl_missing}" ]; then
-        echo "FAIL: case cl: case group(s) with a '── Case X:' header but no mention in the COVERED-LIST block:${cl_missing} — the header block understates what this suite covers; add them to the list rather than deleting this check"
+        echo "FAIL: case cl: case group(s) with a '── Case X:' header but no entry in the COVERED-LIST block:${cl_missing} — the header block understates what this suite covers; add them rather than deleting this check"
         fail_count=$((fail_count + 1))
     else
-        echo "PASS: case cl: every case group with a header is described in the COVERED-LIST block"
+        echo "PASS: case cl: every case group with a header is listed in the COVERED-LIST block (presence, not prose quality — see the note above)"
         pass_count=$((pass_count + 1))
     fi
 fi
