@@ -5,7 +5,7 @@ go 1.25.8
 require (
 	github.com/BishopFox/jsluice v0.0.0-20240110145140-0ddfab153e06
 	github.com/PuerkitoBio/goquery v1.12.0
-	github.com/alecthomas/kong v1.16.0
+	github.com/alecthomas/kong v1.16.1
 	github.com/getkin/kin-openapi v0.146.0
 	github.com/go-rod/rod v0.116.2
 	github.com/jhump/protoreflect v1.18.0
