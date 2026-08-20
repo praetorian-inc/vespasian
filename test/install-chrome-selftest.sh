@@ -5,22 +5,37 @@
 # same shape as preflight-selftest.sh: source the script (its BASH_SOURCE guard
 # means main() does not run), then exercise the pure helpers.
 #
-# Covered (TEST-004: kept in sync with the actual case letters, not just the
-# ones with the most interesting rationale): argument handling (a-c),
-# architecture resolution (d), the pinned signing-key trust anchor including
-# its success path from a committed fixture (e-f, j-j2), the symlink/hardlink
-# guard on the defaults file and its rewrite branches (g, k, q), container
-# detection for the apt-cache wipe (h), the unsupported-arch diagnostic (i),
-# the phone-home removal and verification chain on both the container and
-# non-container arms (n/n3a/n4a/n4b, o, o2), resolve_sudo/require_apt/curl+gpg
-# refusals (l, m), INT/TERM signal handling (p, p2), the browser-present-
-# without-curl/gpg path (r), the log helpers' escape hardening (s),
-# VESPASIAN_TEST_ROOT containment (t), cleanup_all's failed-install arm (u),
-# in_container() gating the MAIN install path (v), verify_apt_origin's accept
-# and reject arms (w), cleanup_all's step order/errexit tolerance (x), the
-# pre-install origin gate (y), and the install lock's symlink/hardlink guard
-# and acquisition-failure handling (z). Each of those is behavioural: it fails
-# if its check is removed, which an assertion on the message alone does not.
+# Covered. CHECKED, not asserted in prose: case cl at the end of this file
+# derives the case labels from this file's own `── Case X:` headers and fails if
+# any is missing below, so the list cannot quietly stop describing the suite —
+# which it had, for a2, bp, cr, v3 and v4. Every label is spelled out rather than
+# ranged (`a, b, c`, not `a-c`) because that is what makes the comparison a token
+# match instead of a range parse.
+#
+# COVERED-LIST-BEGIN
+# argument handling (a, b, c); the script's committed exec bit (a2);
+# architecture resolution (d); the pinned signing-key trust anchor, including
+# its success path from a committed fixture and its two gpg-malfunction refusals
+# (e, f, j); the symlink/hardlink guard on the defaults file and its rewrite
+# branches (g, k, q); container detection for the apt-cache wipe (h); the
+# unsupported-arch diagnostic (i); resolve_sudo/require_apt refusals (l);
+# require_tools' curl/gpg and coreutils arms (m); the phone-home removal and
+# verification chain on both the container and non-container arms (n, o, o2);
+# INT/TERM signal handling (p); the log helpers' escape hardening (s);
+# VESPASIAN_TEST_ROOT containment (t); cleanup_all's failed-install arm (u);
+# in_container() gating the MAIN install path, plus both apt failure diagnostics
+# (v); main()'s AC4 and origin-recheck call sites by position (v3);
+# record_chrome_version's write-failure arm (v4); the browser-present-without-
+# curl/gpg path (r); verify_apt_origin's accept and reject arms (w);
+# cleanup_all's step order and errexit tolerance (x); the pre-install origin gate
+# (y); _bounded_probe's timeout enforcement (bp); the install lock's
+# symlink/hardlink guard and acquisition-failure handling (z); and this header
+# block's own two self-checks — the Covered list (cl) and the skip-credit
+# register (cr).
+# COVERED-LIST-END
+#
+# Each of those is behavioural: it fails if its check is removed, which an
+# assertion on the message alone does not.
 #
 # NOT COVERED HERE: the actual download, `apt-get install`, and the system-wide
 # mutations that follow a successful key verification. Those need root,
@@ -82,7 +97,7 @@ export CHROME_PROBE_TIMEOUT=2
 #   +2  case bp3, pinning that the consolidated chrome_probe_budget still
 #       validates the budget for _bounded_probe as chrome_runnable does
 # See the credit register below for the matching skip_credit accounting.
-EXPECTED_ASSERTIONS=245
+EXPECTED_ASSERTIONS=266
 
 pass_count=0
 fail_count=0
@@ -132,11 +147,11 @@ SUITE_COMPLETED=0
 #                                        own stubbed gpg, which needs no gate)
 #   f4    = 3    gpg absent (same reason as f2) OR timeout(1) absent: f4 drives
 #                main(), whose require_tools() refuses a timeout-less host
-#   j/j2  = 14   key fixture missing or empty
-#   j/j2  = 14   gpg absent  (mutually exclusive with the above,
-#                                        so j/j2 contributes 14, never 28)
+#   j/j2  = 13   key fixture missing or empty
+#   j/j2  = 13   gpg absent  (mutually exclusive with the above,
+#                                        so j/j2 contributes 13, never 26)
 #   l     = 3    running as root
-#   v     = 12   needs the same key fixture / gpg as j/j2, OR timeout(1): v
+#   v     = 19   needs the same key fixture / gpg as j/j2, OR timeout(1): v
 #                drives main(), same require_tools() refusal as f4
 #   y     = 3    needs the same key fixture / gpg as j/j2, OR timeout(1): y
 #                drives main(), same require_tools() refusal as f4
@@ -144,37 +159,51 @@ SUITE_COMPLETED=0
 #   z4    = 3    no flock on PATH (the concurrency half only; z4's source-level
 #                ordering assertions need nothing ambient and always run)
 #
-# Maximum skip_credit on a maximally-degraded host: 1+4+3+14+3+12+3+4+3 = 47.
+# Maximum skip_credit on a maximally-degraded host: 1+4+3+13+3+19+3+4+3 = 53.
 # f4, v and y each have TWO independent triggers (gpg/fixture, or timeout) but
 # one skip() call apiece, so a host missing both tools still credits 3/12/3 --
 # never double.
-# EXPECTED_ASSERTIONS above is 245, MEASURED on a fully-equipped host (pass+fail+
-# skip_credit with every arm live). It moved 238 -> 239 when case cr landed, and
+# EXPECTED_ASSERTIONS above is 266, MEASURED on a fully-equipped host (pass+fail+
+# skip_credit with every arm live). It moved 238 -> 239 when case cr landed,
 # 239 -> 244 when case z4 gained the four ordering assertions plus the per-site
-# register check, and 244 -> 245 when the anchor-completeness check landed.
+# register check, 244 -> 245 when the anchor-completeness check landed, and
+# 245 -> 266 in the round-16 review pass (+3 case m2, +7 cases f6/f7/f7b, +1
+# case u's INSTALL_ATTEMPTED ordering, +1 case v's rerooted defaults content,
+# +6 cases v5/v6, +1 case w5's candidate-gate arm, +1 case x's derived step
+# list, +2 case cl, -1 case j's two source-line fragments becoming one equality
+# on the whole line).
 #
-# Every figure quoted below was re-measured at 245, not carried forward. This note
+# Every figure quoted below was re-measured at 266, not carried forward. This note
 # had gone stale by carry-forward in four consecutive review rounds before that
 # discipline was adopted.
 #
 # PROVENANCE, stated precisely rather than blanket-claimed as "MEASURED":
-#   * f2 = 4, f4 = 3, j/j2 = 14, v = 12 and y = 3 were FORCED this round on a
-#     host with no gpg on PATH (every PATH entry containing a gpg binary was
-#     replaced by a symlink farm omitting it). RE-MEASURED at the current pin:
-#     209 passed, 0 failed, 5 skipped; 209 + 0 + 36 = 245, so the pin held and
-#     these five credits are measured rather than declared. f2 and f4 are the
-#     two this list previously omitted altogether -- they were added in abc36ed,
-#     after the round-8 measurement that the rest of the register inherits.
+#   * f2 = 4, f4 = 3, j/j2 = 13, v = 19 and y = 3 were FORCED on a host with no
+#     gpg on PATH (a symlink farm mirroring PATH but omitting every gpg binary).
+#     RE-MEASURED at the current pin: 224 passed, 0 failed, 5 skipped;
+#     224 + 0 + (4+3+13+19+3) = 266, so the pin held and these five credits are
+#     measured rather than declared. f2 and f4 are the two this list previously
+#     omitted altogether -- they were added in abc36ed, after the round-8
+#     measurement that the rest of the register inherits.
 #   * a2 = 1 and l = 3 remain INHERITED from the round-8 measurement and were
 #     not re-forced. Forcing them needs a non-git checkout and a root shell
 #     respectively, neither of which the equipped-host run can produce.
-#   * f4 = 3, v = 12 and y = 3 were ALSO forced this round on a host with no
-#     timeout and no gtimeout on PATH. RE-MEASURED at the current pin: 223
-#     passed, 0 failed, 4 skipped, and 223 + 0 + (3+12+3+4) = 245. Before those
-#     three gained the timeout gate the
-#     same host reported 223/11/1 (at the then-current pin of 238) -- 11 hard
-#     failures naming the fingerprint
-#     check, the cache wipe and the version record, plus 3 vacuous passes.
+#   * f4 = 3, v = 19 and y = 3 were ALSO forced on a host with no timeout and no
+#     gtimeout on PATH. RE-MEASURED at the current pin: 237 passed, 0 failed,
+#     4 skipped, and 237 + 0 + (3+19+3+4) = 266. Before those three gained the
+#     timeout gate the same host reported 223/11/1 (at the then-current pin of
+#     238) -- 11 hard failures naming the fingerprint check, the cache wipe and
+#     the version record, plus 3 vacuous passes.
+#   * z4 = 3 was forced on a host with no flock on PATH: 263 passed, 0 failed,
+#     1 skipped, and 263 + 0 + 3 = 266. Before the plant_flock_stub arms landed
+#     that same host did not produce a number at all -- 11 hard failures across
+#     cases f, i, o and o2, then the suite TERMINATED at case p2 (whose
+#     `trap_probe=$(...)` assignment takes main()'s non-zero status under this
+#     file's errexit), printing no summary and crediting nothing after it.
+#   * ALL FOUR AT ONCE (no gpg, no timeout, no gtimeout, no flock): 217 passed,
+#     0 failed, 7 skipped, and 217 + 0 + (4+3+13+19+3+4+3) = 266. The register
+#     is per-site, so this is the arithmetic that would expose an offsetting
+#     re-credit between two arms that always co-fire.
 #   * bp = 4 is NEW this round: it was 2 (covering case bp2's two assertions) and
 #     case bp3 added two more when the probe budget was consolidated into
 #     common.sh's chrome_probe_budget. It WAS forced on the timeout-less host
@@ -214,6 +243,87 @@ assert_contains() {
         echo "FAIL: ${desc} (output did not contain [${needle}])"
         fail_count=$((fail_count + 1))
     fi
+}
+
+# `stat -c` is GNU-only. BSD/macOS spells the same query `stat -f %Lp`, so with
+# only the GNU form every mode assertion in this file compares against an empty
+# string on a BSD userland — 17 sites, all of them in the case groups that run
+# after case g, each failing for the platform rather than for the property it
+# names. One helper, probed once, asks the same question everywhere; a host with
+# neither form gets the literal "no-stat", which fails the comparison with a
+# value that says why instead of an empty string that does not.
+_STAT_STYLE=""
+file_mode() {
+    if [ -z "${_STAT_STYLE}" ]; then
+        if stat -c '%a' . >/dev/null 2>&1; then
+            _STAT_STYLE=gnu
+        elif stat -f '%Lp' . >/dev/null 2>&1; then
+            _STAT_STYLE=bsd
+        else
+            _STAT_STYLE=none
+        fi
+    fi
+    case "${_STAT_STYLE}" in
+        gnu) stat -c '%a' "$1" 2>/dev/null ;;
+        bsd) stat -f '%Lp' "$1" 2>/dev/null ;;
+        *)   printf 'no-stat' ;;
+    esac
+}
+
+# install-chrome.sh REFUSES to run without flock (case z5 pins that refusal), so
+# on a host without util-linux every main()-driving case below fails for the
+# platform rather than for the property it names — and the failure is worse than
+# uncredited: case p2's `trap_probe=$(run_trap_probe ...)` assignment takes
+# main()'s non-zero status under this file's own errexit, so the suite ABORTS
+# there. MEASURED on a PATH with flock hidden: 11 FAIL lines across cases f, i,
+# o and o2, then termination at case p2 with no summary at all and no credit for
+# any case after it.
+#
+# Planted ONLY when the real binary is absent. Where flock exists these cases go
+# on driving it for real; where it does not, this is what keeps them running.
+# The stub grants unconditionally rather than simulating exclusion, and that is
+# deliberate: mutual exclusion is case z4's property, and z4 requires the real
+# flock and skips with an explicit credit without it. A stub that pretended to
+# exclude would let z4 pass without ever testing exclusion.
+HAS_FLOCK=true
+command -v flock >/dev/null 2>&1 || HAS_FLOCK=false
+plant_flock_stub() {
+    [ "${HAS_FLOCK}" = false ] || return 0
+    printf '#!/bin/bash\nexit 0\n' > "$1/flock"
+    chmod +x "$1/flock"
+}
+
+# The same idea for `timeout`, needed by the cases that call a BOUNDED helper
+# directly rather than through main(). verify_apt_origin's apt-cache call is
+# bounded the way the two apt-get calls are, and in production that bound is
+# safe unconditionally because require_tools refuses a timeout-less host before
+# main() ever reaches it — but case w calls verify_apt_origin on its own, so on
+# a timeout-less host the bounded call was a command-not-found, `|| policy=""`
+# turned it into an empty policy, and all eight of case w's origin assertions
+# failed for the missing binary rather than for the origins they name. MEASURED:
+# 229 passed, 8 failed on a PATH with timeout and gtimeout hidden.
+#
+# Planted only when the real binary is absent, same as the flock stub — case bp
+# is the case that proves the bound actually bounds anything, and it requires the
+# real timeout and skips with an explicit credit without it.
+plant_timeout_stub() {
+    [ "${HAS_TIMEOUT}" = false ] || return 0
+    cat > "$1/timeout" <<'TIMEOUT_STUB'
+#!/bin/bash
+# Drop timeout's own options and its DURATION argument, then exec the rest. It
+# does not bound anything; it makes the call transparent so the code under test
+# runs at all.
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -k|-s|--kill-after|--signal) shift 2 ;;
+        -k*|-s*|--kill-after=*|--signal=*|--preserve-status|--foreground) shift ;;
+        *) break ;;
+    esac
+done
+shift   # the duration
+exec "$@"
+TIMEOUT_STUB
+    chmod +x "$1/timeout"
 }
 
 # Extract a function's body from the installer with COMMENT LINES REMOVED.
@@ -460,8 +570,16 @@ main_deps_missing() {
 # network and no root — every rejection path returns before the first $SUDO.
 #
 # This is the case that fails if the fingerprint comparison is removed.
+# $2, when given, is the body of a `gpg` stub planted alongside the curl stub.
+# Two of install_pinned_key's refusals cannot be reached with the REAL gpg: the
+# empty-fingerprint arm needs a gpg that imports successfully and then reports no
+# `pub`/`fpr` records at all, and the export arm needs one that reports the pinned
+# fingerprint and then fails to export it. Both are gpg malfunctions, not key
+# problems, and both were unreachable from this suite — deleting either refusal
+# left it green. Stubbing gpg is the only way in; when $2 is empty the real gpg is
+# used, so every existing f-case is unaffected.
 run_install_pinned_key() {
-    local stub_body=$1
+    local stub_body=$1 gpg_stub=${2:-}
     # Own bin (bin-f), not the shared FIXTURE_DIR/bin -- TEST-002. This curl
     # stub is rewritten on every f0/f1/f2 call, so a shared dir would make each
     # call's curl silently depend on whatever the PREVIOUS f-case last wrote.
@@ -478,6 +596,17 @@ done
 ${stub_body}
 EOF
     chmod +x "${FIXTURE_DIR}/bin-f/curl"
+    # Removed, not left in place, when no stub is asked for: bin-f is shared
+    # across the f-cases, so a stub left behind by an earlier call would
+    # silently answer a later case's real-gpg expectations.
+    rm -f "${FIXTURE_DIR}/bin-f/gpg"
+    if [ -n "${gpg_stub}" ]; then
+        cat > "${FIXTURE_DIR}/bin-f/gpg" <<EOF
+#!/bin/bash
+${gpg_stub}
+EOF
+        chmod +x "${FIXTURE_DIR}/bin-f/gpg"
+    fi
     # shellcheck disable=SC2030,SC2031  # subshell-local PATH/SUDO overrides are deliberate
     (
         PATH="${FIXTURE_DIR}/bin-f:${PATH}"
@@ -838,6 +967,7 @@ done
 cat '${SCRIPT_DIR}/fixtures/not-google-signing-key.asc' > "\$out"
 EOF
     chmod +x "${bin_f4}/sudo" "${bin_f4}/dpkg" "${bin_f4}/curl"
+    plant_flock_stub "${bin_f4}"
     # NOT the usual `set +e` INSIDE the subshell before calling main(): the ordering
     # property being tested is main()'s reliance on `set -e` ITSELF to abort before
     # suppress_permanent_repo runs (install_pinned_key's failure is a bare
@@ -876,6 +1006,79 @@ EOF
 else
     skip "case f4: main() ordering guarantee on a fingerprint mismatch ($(main_deps_missing) not found on PATH)" 3
 fi
+
+# f6: gpg imports the key and then reports NO fingerprints. A broken or
+# sandboxed gpg produces exactly this: the import succeeds, the
+# `--with-colons --fingerprint` read emits nothing, and `$fprs` is empty. Without
+# the `[ -z "$fprs" ]` refusal the next line is `grep -qxF -- "$GOOGLE_KEY_FPR"`
+# against an empty list, which fails, so the run would still refuse — but it
+# would refuse as a FINGERPRINT MISMATCH, sending the reader after a
+# supply-chain attack when the real fault is the local toolchain. The message is
+# the control here, which is why it is asserted rather than just the rc.
+res_f6=$(run_install_pinned_key 'printf "key bytes\n" > "$out"' '
+case "$*" in
+    *--import*)      exit 0 ;;
+    *--fingerprint*) exit 0 ;;   # succeeds, prints nothing
+    *--export*)      exit 0 ;;
+esac
+exit 0
+')
+assert_eq "case f6: a gpg that reports no fingerprints is refused (rc 1)" \
+    "1" "$(echo "${res_f6}" | sed -n '1p')"
+assert_contains "case f6: the refusal blames the unreadable fingerprint, not a substituted key" \
+    "Could not read any key fingerprint" "${res_f6}"
+if printf '%s' "${res_f6}" | grep -q "fingerprint mismatch"; then
+    echo "FAIL: case f6: a gpg that read no fingerprints was reported as a key substitution"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS: case f6: a gpg that read no fingerprints is not reported as a key substitution"
+    pass_count=$((pass_count + 1))
+fi
+
+# f7: the PINNED fingerprint is present and matches, and the export of that
+# fingerprint then fails. This is the arm that keeps apt from being handed
+# nothing, or a truncated keyring: install_pinned_key's whole membership-not-
+# equality design is safe only BECAUSE it exports exactly the pinned key, so an
+# export failure that fell through would install a keyring the fingerprint check
+# never vouched for. Nothing exercised it — the real gpg always exports a key it
+# just imported.
+#
+# The stub answers --export with a non-zero exit; the `[ ! -s "$tmp_gpg" ]` half
+# of the same condition (a zero-byte export that "succeeded") is the sibling
+# shape, covered by f7b below.
+#
+# The fingerprint comes from $fpr (extracted from the script at case e), not a
+# second literal: a hardcoded copy here would go stale the day GOOGLE_KEY_FPR is
+# rotated and this case would silently start exercising the MISMATCH arm instead
+# of the export arm, while still passing its rc assertion. Case e remains the
+# tripwire on the constant's value.
+f7_stub="
+case \"\$*\" in
+    *--import*) exit 0 ;;
+    *--fingerprint*)
+        echo 'pub:u:4096:1:${fpr: -16}:'
+        echo 'fpr:::::::::${fpr}:'
+        exit 0 ;;
+    *--export*) exit 1 ;;
+esac
+exit 0
+"
+res_f7=$(run_install_pinned_key 'printf "key bytes\n" > "$out"' "${f7_stub}")
+assert_eq "case f7: a failed export of the pinned key is refused (rc 1)" \
+    "1" "$(echo "${res_f7}" | sed -n '1p')"
+assert_contains "case f7: the refusal names the export, not the fingerprint" \
+    "Could not export the pinned key" "${res_f7}"
+
+# f7b: the export "succeeds" but writes nothing. `--export` of a fingerprint gpg
+# does not hold exits 0 with an empty file, which is why the condition is
+# `|| [ ! -s "$tmp_gpg" ]` rather than an rc check alone; an rc-only guard would
+# hand apt a zero-byte keyring and let the install proceed unverified.
+f7b_stub=${f7_stub/'*--export*) exit 1 ;;'/'*--export*) exit 0 ;;'}
+res_f7b=$(run_install_pinned_key 'printf "key bytes\n" > "$out"' "${f7b_stub}")
+assert_eq "case f7b: an export that succeeds but writes nothing is refused (rc 1)" \
+    "1" "$(echo "${res_f7b}" | sed -n '1p')"
+assert_contains "case f7b: the empty-export refusal names the export too" \
+    "Could not export the pinned key" "${res_f7b}"
 
 # ── Case g: the symlink guard on the defaults file ─────────────
 # CHROME_DEFAULTS_FILE (derived from VESPASIAN_TEST_ROOT in production, set
@@ -921,7 +1124,7 @@ assert_eq "case g: repo_add_once=true is rewritten to false" \
 # in the source is not evidence of what lands; only stat proves it, same
 # reasoning as case j's three keyring/list/pref mode assertions below.
 assert_eq "case g: the rewritten defaults file is world-readable but not writable (0644)" \
-    "644" "$(stat -c '%a' "${FIXTURE_DIR}/defaults-existing" 2>/dev/null)"
+    "644" "$(file_mode "${FIXTURE_DIR}/defaults-existing")"
 
 # g3: absent file is created opted-out.
 res_g3=$(run_suppress "${FIXTURE_DIR}/defaults-new")
@@ -929,7 +1132,7 @@ assert_eq "case g: an absent defaults file is created (rc 0)" "0" "$(echo "${res
 assert_eq "case g: the created file opts out of the repo" \
     "repo_add_once=false" "$(cat "${FIXTURE_DIR}/defaults-new")"
 assert_eq "case g: the newly-created defaults file is world-readable but not writable (0644)" \
-    "644" "$(stat -c '%a' "${FIXTURE_DIR}/defaults-new" 2>/dev/null)"
+    "644" "$(file_mode "${FIXTURE_DIR}/defaults-new")"
 
 # g4: a hardlinked defaults file is refused (TEST-009). A hardlink is neither
 # a symlink nor caught by the [ -L ] guard above, and it defeats that guard
@@ -1163,6 +1366,7 @@ for _t in apt-get curl gpg; do
     printf '#!/bin/bash\nexit 0\n' > "${ARCH_STUBS}/${_t}"
 done
 chmod +x "${ARCH_STUBS}"/*
+plant_flock_stub "${ARCH_STUBS}"
 unset _t
 arch_result=$(
     VESPASIAN_TEST_ROOT="${FIXTURE_DIR}/root-arch"
@@ -1284,23 +1488,34 @@ EOF
     )
     assert_eq "case j: the real Google key satisfies the pin (rc 0)" \
         "0" "$(echo "${res_j}" | sed -n '1p')"
-    # The load-bearing assertion: signed-by= is what makes the pin gate apt.
-    assert_contains "case j: the emitted apt source pins signed-by to our keyring" \
-        "signed-by=${root_j}/usr/share/keyrings/google-chrome-vespasian-temp.gpg" \
-        "$(cat "${root_j}/etc/apt/sources.list.d/google-chrome-vespasian-temp.list" 2>/dev/null)"
-    assert_contains "case j: the emitted apt source pins the architecture" \
-        "arch=amd64" \
+    # The WHOLE line, by equality, not two `assert_contains` fragments. Both
+    # fragments are satisfied by a line that ALSO carries extra options, and one
+    # of those options retires the control the fragments exist to prove: apt
+    # reads `trusted=yes` as "accept this source's metadata regardless of
+    # signature", so `deb [arch=amd64 signed-by=... trusted=yes] ...` passes a
+    # signed-by check and a fingerprint pin while making both ornamental.
+    # Containment cannot see an ADDED option; equality can.
+    #
+    # Both sides are built from the same constants the script uses (ARCH,
+    # TMP_KEYRING, GOOGLE_APT_URL read back out of it) rather than a second
+    # hardcoded copy of the URL, so a deliberate change to the apt URL updates
+    # this expectation with the script instead of failing as drift.
+    expected_list_line="deb [arch=amd64 signed-by=${root_j}/usr/share/keyrings/google-chrome-vespasian-temp.gpg] $(
+        source "${INSTALL_SCRIPT}" >/dev/null 2>&1; printf '%s' "${GOOGLE_APT_URL}"
+    ) stable main"
+    assert_eq "case j: the emitted apt source line is exactly the pinned one (no added options such as trusted=yes)" \
+        "${expected_list_line}" \
         "$(cat "${root_j}/etc/apt/sources.list.d/google-chrome-vespasian-temp.list" 2>/dev/null)"
     # Modes actually achieved on disk -- a literal `install -m 0644` in the
     # source is not evidence of what lands; only stat proves it. All three of
     # install_pinned_key's `install -m 0644` writes are checked, not just the
     # keyring: TMP_LIST and TMP_PREF get the same treatment and had no assertion.
     assert_eq "case j: the installed keyring is world-readable but not writable (0644)" \
-        "644" "$(stat -c '%a' "${root_j}/usr/share/keyrings/google-chrome-vespasian-temp.gpg" 2>/dev/null)"
+        "644" "$(file_mode "${root_j}/usr/share/keyrings/google-chrome-vespasian-temp.gpg")"
     assert_eq "case j: the installed apt source list is world-readable but not writable (0644)" \
-        "644" "$(stat -c '%a' "${root_j}/etc/apt/sources.list.d/google-chrome-vespasian-temp.list" 2>/dev/null)"
+        "644" "$(file_mode "${root_j}/etc/apt/sources.list.d/google-chrome-vespasian-temp.list")"
     assert_eq "case j: the installed origin pin is world-readable but not writable (0644)" \
-        "644" "$(stat -c '%a' "${root_j}/etc/apt/preferences.d/google-chrome-vespasian-temp.pref" 2>/dev/null)"
+        "644" "$(file_mode "${root_j}/etc/apt/preferences.d/google-chrome-vespasian-temp.pref")"
     # The pin's CONTENT, not just its mode (TEST-007). Asserting 0644 alone left
     # the file's actual policy untested: rewriting it to `Pin: origin
     # evil.example.com` / `Pin-Priority: 1` keeps the mode at 0644 and stays
@@ -1387,9 +1602,9 @@ else
     # Counted separately: this is the trust anchor's ONLY success-path coverage,
     # so skipping it is a coverage hole rather than an unsuitable environment.
     if [ "${have_gpg}" -eq 1 ]; then
-        skip "case j/j2: trust-anchor success path (fixture test/fixtures/google-linux-signing-key.asc missing or empty)" 14
+        skip "case j/j2: trust-anchor success path (fixture test/fixtures/google-linux-signing-key.asc missing or empty)" 13
     else
-        skip "case j/j2: trust-anchor success path (gpg not found on PATH)" 14
+        skip "case j/j2: trust-anchor success path (gpg not found on PATH)" 13
     fi
     trust_anchor_skips=$((trust_anchor_skips + 1))
 fi
@@ -1410,7 +1625,7 @@ assert_contains "case k: the pre-existing unrelated setting is preserved" \
 assert_contains "case k: the opt-out is appended" \
     "repo_add_once=false" "$(cat "${FIXTURE_DIR}/defaults-no-key")"
 assert_eq "case k: the appended-to defaults file is world-readable but not writable (0644)" \
-    "644" "$(stat -c '%a' "${FIXTURE_DIR}/defaults-no-key" 2>/dev/null)"
+    "644" "$(file_mode "${FIXTURE_DIR}/defaults-no-key")"
 
 # ── Case l: resolve_sudo and require_apt refusals ───────────────
 # Both are pure precondition paths that return before any mutation, and neither
@@ -1473,7 +1688,20 @@ fi
 # exactly the string "sudo", not merely rc 0 (rc 0 alone is also what a broken
 # resolve_sudo that always "succeeds" would produce).
 mkdir -p "${FIXTURE_DIR}/sudo-bin"
-cp "${FIXTURE_DIR}/empty-bin/id" "${FIXTURE_DIR}/sudo-bin/id"
+# A FIXED non-zero uid, not a copy of empty-bin/id (which reports the REAL uid).
+# On a root host — every container this suite runs in as root, including the
+# install-chrome-e2e job's — that copy reports 0, resolve_sudo short-circuits on
+# the already-root branch, and this case silently stops exercising the
+# sudo-discovery branch it exists for while still printing both PASS lines: SUDO
+# comes back "" on that path, so only the rc assertion would survive, and the
+# "SUDO is set to the sudo prefix" assertion would fail for the wrong reason.
+# 1000 is arbitrary; all that matters is that it is not 0.
+cat > "${FIXTURE_DIR}/sudo-bin/id" <<'EOF'
+#!/bin/bash
+[ "$1" = "-u" ] && { echo 1000; exit 0; }
+exit 1
+EOF
+chmod +x "${FIXTURE_DIR}/sudo-bin/id"
 printf '#!/bin/bash\nexec "$@"\n' > "${FIXTURE_DIR}/sudo-bin/sudo"
 chmod +x "${FIXTURE_DIR}/sudo-bin/sudo"
 res_l3=$(run_resolve_sudo "${FIXTURE_DIR}/sudo-bin")
@@ -1541,6 +1769,34 @@ else
     echo "PASS: case m: a missing tool is not misreported as a bad signing key"
     pass_count=$((pass_count + 1))
 fi
+
+# m2: the coreutils/timeout arm, which had no assertion at all. Case m above
+# runs against an empty bin, so `curl` is already missing by the time the
+# timeout check is reached and the refusal is satisfied by curl alone — deleting
+# the whole `command -v timeout` block left case m green. That block is not
+# decoration: both privileged apt invocations hard-code `$SUDO timeout -k N M
+# apt-get`, so on a host without timeout(1) the run reaches `apt-get update`
+# and dies there reporting a held dpkg lock or an unreachable mirror — three
+# wrong diagnoses, none of them the missing binary, which is the same
+# misdiagnosis class case m exists to prevent for gnupg.
+#
+# curl and gpg are stubbed PRESENT so the refusal can only come from the
+# timeout check, and `env -i` is not usable here (require_tools reads PATH
+# only), so the bin holds just the two stubs and nothing else.
+mkdir -p "${FIXTURE_DIR}/bin-notimeout"
+printf '#!/bin/bash\nexit 0\n' > "${FIXTURE_DIR}/bin-notimeout/curl"
+printf '#!/bin/bash\nexit 0\n' > "${FIXTURE_DIR}/bin-notimeout/gpg"
+chmod +x "${FIXTURE_DIR}/bin-notimeout/curl" "${FIXTURE_DIR}/bin-notimeout/gpg"
+res_m2=$(run_require_tools "${FIXTURE_DIR}/bin-notimeout")
+assert_eq "case m2: a missing timeout(1) is refused before any apt call (rc 1)" \
+    "1" "$(echo "${res_m2}" | sed -n '1p')"
+assert_contains "case m2: the refusal names the coreutils package, not curl or gnupg" \
+    "coreutils" "${res_m2}"
+# The package name alone names ~100 programs, so the note is what actually
+# tells the operator which one is absent -- and it is a separate `log_info`
+# that a mutation can drop while leaving the package name in place.
+assert_contains "case m2: the refusal says WHICH coreutils program is missing and why it matters" \
+    "timeout(1), which bounds both privileged apt calls" "${res_m2}"
 
 # ── Case n: the phone-home removal + verification chain ─────────
 # AC4's three controls (remove_phone_home, cleanup_apt_wiring, and
@@ -1784,6 +2040,7 @@ cat > "${FIXTURE_DIR}/bin-o/sudo" <<'EOF'
 exec "$@"
 EOF
 chmod +x "${FIXTURE_DIR}/bin-o/sudo"
+plant_flock_stub "${FIXTURE_DIR}/bin-o"
 
 plant_phone_home
 # The container marker is planted EXPLICITLY. Phone-home removal on the early
@@ -1844,6 +2101,7 @@ cat > "${FIXTURE_DIR}/bin-o2/sudo" <<'EOF'
 exec "$@"
 EOF
 chmod +x "${FIXTURE_DIR}/bin-o2/sudo"
+plant_flock_stub "${FIXTURE_DIR}/bin-o2"
 
 plant_phone_home
 rm -f "${root_n}/.dockerenv"
@@ -2007,6 +2265,7 @@ run_trap_probe() {
 mkdir -p "${FIXTURE_DIR}/root-p-trap" "${FIXTURE_DIR}/bin-p"
 printf '#!/bin/bash\nexec "$@"\n' > "${FIXTURE_DIR}/bin-p/sudo"
 chmod +x "${FIXTURE_DIR}/bin-p/sudo"
+plant_flock_stub "${FIXTURE_DIR}/bin-p"
 trap_probe=$(run_trap_probe "${FIXTURE_DIR}/root-p-trap")
 assert_contains "case p2 (runtime): cleanup_all is actually installed on EXIT" \
     "trap -- 'cleanup_all' EXIT" "${trap_probe}"
@@ -2087,6 +2346,7 @@ cat > "${root_r}/bin/google-chrome" <<'EOF'
 echo "Fake Chrome 999.0.0.0"
 EOF
 chmod +x "${root_r}/bin/google-chrome"
+plant_flock_stub "${root_r}/bin"
 
 # An unprivileged `sudo` shim. Passing SUDO="" is NOT enough here: this case
 # executes the script rather than sourcing it, so resolve_sudo runs and
@@ -2418,6 +2678,18 @@ main_body_u=$(fn_code main)
 # is the point of having it — the moment that flag landed.
 apt_at=$(printf '%s\n' "${main_body_u}" | grep -nE '^[[:space:]]*(if ! )?\$SUDO timeout (-k [0-9]+ )?[0-9]+ apt-get install ' | head -1 | cut -d: -f1 || true)
 succ_at=$(printf '%s\n' "${main_body_u}" | grep -n '^[[:space:]]*INSTALL_SUCCEEDED=1[[:space:]]*$' | head -1 | cut -d: -f1 || true)
+# The OTHER half of the same window, and it had no assertion at all.
+# INSTALL_ATTEMPTED is what makes cleanup_all willing to remove the phone-home
+# artifacts, and dpkg's postinst plants them DURING `apt-get install` — so the
+# flag has to be set before that command runs, not after it returns. Moved
+# after, a run that dies mid-install (the postinst having already created the
+# permanent Google source and the root-run daily pinger) fires the trap with
+# INSTALL_ATTEMPTED still 0, cleanup_all's whole gated block is skipped, and the
+# standing egress AC4 exists to eliminate survives the failure. Every other
+# assertion in this file stays green with the assignment in the wrong place,
+# for the same reason case u documents for INSTALL_SUCCEEDED: no case drives
+# that exact window. Hence the same structural check, on the same anchor.
+att_at=$(printf '%s\n' "${main_body_u}" | grep -n '^[[:space:]]*INSTALL_ATTEMPTED=1[[:space:]]*$' | head -1 | cut -d: -f1 || true)
 rm_at=""
 if [ -n "${apt_at}" ]; then
     rm_at=$(printf '%s\n' "${main_body_u}" | awk -v start="${apt_at}" \
@@ -2426,8 +2698,8 @@ fi
 # Fidelity sentinel first: a broken extraction (main() renamed, any of the three
 # statements reworded) must FAIL loudly rather than let the comparison below pass
 # vacuously on empty strings.
-if [ -n "${succ_at}" ] && [ -n "${rm_at}" ] && [ -n "${apt_at}" ]; then
-    echo "PASS: case u: apt-get install, the install-path removal, and INSTALL_SUCCEEDED=1 all located in main()"
+if [ -n "${succ_at}" ] && [ -n "${rm_at}" ] && [ -n "${apt_at}" ] && [ -n "${att_at}" ]; then
+    echo "PASS: case u: apt-get install, the install-path removal, INSTALL_ATTEMPTED=1 and INSTALL_SUCCEEDED=1 all located in main()"
     pass_count=$((pass_count + 1))
     if [ "${succ_at}" -gt "${rm_at}" ]; then
         echo "PASS: case u: INSTALL_SUCCEEDED is set after main()'s container-aware removal"
@@ -2436,8 +2708,15 @@ if [ -n "${succ_at}" ] && [ -n "${rm_at}" ] && [ -n "${apt_at}" ]; then
         echo "FAIL: case u: INSTALL_SUCCEEDED=1 precedes remove_phone_home — a failed run between apt-get and the removal would strand the Google apt source and pinger"
         fail_count=$((fail_count + 1))
     fi
+    if [ "${att_at}" -lt "${apt_at}" ]; then
+        echo "PASS: case u: INSTALL_ATTEMPTED is set before apt-get install, so cleanup_all can still remove what the postinst plants"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: case u: INSTALL_ATTEMPTED=1 does not precede apt-get install — a run that dies mid-install fires the trap with the flag unset, cleanup_all's whole gated block is skipped, and the postinst's Google apt source and daily pinger survive a FAILED run"
+        fail_count=$((fail_count + 1))
+    fi
 else
-    echo "FAIL: case u: could not locate apt-get install, the install-path remove_phone_home, and/or INSTALL_SUCCEEDED=1 in main() — ordering guard is vacuous"
+    echo "FAIL: case u: could not locate apt-get install, the install-path remove_phone_home, INSTALL_ATTEMPTED=1 and/or INSTALL_SUCCEEDED=1 in main() — ordering guard is vacuous"
     fail_count=$((fail_count + 1))
 fi
 
@@ -2466,7 +2745,15 @@ run_main_install_path() {
     # subshell sources and calls -- silently making in_container() see "host"/
     # "container" as a non-empty value and answer true unconditionally. Verified
     # by the collision itself: this is what happened before this var was renamed.
-    local root="$1" mode="$2" bin_v
+    # $3, when given, names the apt-get subcommand the stub must FAIL on
+    # ("update" or "install"). Both of main()'s apt failure diagnostics — the one
+    # blaming a held dpkg lock or an unreachable mirror, and the one blaming the
+    # install itself — had no assertion anywhere: the stub always exited 0, so
+    # neither `exit 1` was ever taken and deleting either message left the suite
+    # green. A failing update must also stop the run BEFORE `apt-get install`, so
+    # the stub records which subcommands it saw and the cases below read that
+    # back rather than inferring it.
+    local root="$1" mode="$2" fail_step="${3:-}" bin_v
     bin_v="${FIXTURE_DIR}/bin-v-${mode}"
     rm -rf "${root}" "${bin_v}"
     mkdir -p "${root}" "${bin_v}"
@@ -2515,6 +2802,16 @@ POLICY_STUB
     # them, so `apt-get update` (and anything else) stays a no-op.
     cat > "${bin_v}/apt-get" <<EOF
 #!/bin/bash
+# One line per invocation, so a case can assert that a later subcommand was
+# never reached rather than inferring it from a missing side effect.
+case "\$*" in
+    *update*)  echo update  >> '${root}/apt-get.calls' ;;
+    *install*) echo install >> '${root}/apt-get.calls' ;;
+esac
+case "${fail_step}" in
+    update)  case "\$*" in *update*)  exit 100 ;; esac ;;
+    install) case "\$*" in *install*) exit 100 ;; esac ;;
+esac
 case "\$*" in
     *install*google-chrome-stable*)
         mkdir -p '${root}/etc/apt/sources.list.d' '${root}/etc/cron.daily' '${root}/usr/share/keyrings'
@@ -2529,6 +2826,7 @@ esac
 exit 0
 EOF
     chmod +x "${bin_v}/sudo" "${bin_v}/dpkg" "${bin_v}/curl" "${bin_v}/apt-cache" "${bin_v}/apt-get"
+    plant_flock_stub "${bin_v}"
 
     (
         # umask 0 (SEC-BE-003): a Dockerfile RUN commonly runs with one, and
@@ -2597,9 +2895,9 @@ if [ "${have_real_key}" -eq 1 ] && [ "${HAS_TIMEOUT}" = true ]; then
     assert_contains "case v: an install writes the chrome-version record" \
         "999.0.0.0" "$(cat "${root_v1}/usr/share/vespasian/chrome-version" 2>/dev/null)"
     assert_eq "case v: the chrome-version record is world-readable but not writable (0644)" \
-        "644" "$(stat -c '%a' "${root_v1}/usr/share/vespasian/chrome-version" 2>/dev/null)"
+        "644" "$(file_mode "${root_v1}/usr/share/vespasian/chrome-version")"
     assert_eq "case v: the chrome-version record's parent directory is 0755" \
-        "755" "$(stat -c '%a' "${root_v1}/usr/share/vespasian" 2>/dev/null)"
+        "755" "$(file_mode "${root_v1}/usr/share/vespasian")"
     # SEC-BE-005/TEST-005: the lock file is the only privileged write in the
     # whole script with no stat -c %a assertion anywhere in this suite before
     # this line. run_main_install_path runs main() under `umask 0` (see the
@@ -2611,7 +2909,17 @@ if [ "${have_real_key}" -eq 1 ] && [ "${HAS_TIMEOUT}" = true ]; then
     # "$LOCK_FILE"` on a scratch copy left the whole suite green before this
     # assertion existed.
     assert_eq "case v: the install lock is created 0644 even under umask 0" \
-        "644" "$(stat -c '%a' "${root_v1}/tmp/vespasian-install-chrome.lock" 2>/dev/null)"
+        "644" "$(file_mode "${root_v1}/tmp/vespasian-install-chrome.lock")"
+    # The rerooted defaults file's CONTENT, on the only path that reaches
+    # suppress_permanent_repo through main(). Case f4 proves the file is ABSENT
+    # when trust is never earned, but absence is satisfied for any value of the
+    # constant — and also by a reroot that silently stopped pointing at the
+    # fixture, in which case f4's check passes while the write lands on the real
+    # /etc/default/google-chrome. This is the positive half: main() under a
+    # reroot writes the file, under the reroot, opting OUT. g2/g3 pin the same
+    # content at unit level; nothing pinned it end to end.
+    assert_eq "case v: main() writes the rerooted defaults file opting OUT of the permanent repo" \
+        "repo_add_once=false" "$(cat "${root_v1}/etc/default/google-chrome" 2>/dev/null)"
 
     root_v2="${FIXTURE_DIR}/root-v2"
     res_v2=$(run_main_install_path "${root_v2}" "host")
@@ -2646,8 +2954,37 @@ if [ "${have_real_key}" -eq 1 ] && [ "${HAS_TIMEOUT}" = true ]; then
     # created the permanent source or pinger in the first place.
     assert_contains "case v: the non-container message names the actual state (no update channel), not a false 'left alone'" \
         "no apt update channel" "${res_v2}"
+
+    # v5: `apt-get update` fails. The diagnostic is the whole point — apt's own
+    # output is suppressed by -qq, so without this message the operator sees an
+    # exit 1 and nothing else. It must also STOP there: `apt-get update -qq`
+    # exits 0 even when the just-pinned source failed to fetch, so if the run
+    # continued past a HARD update failure, `apt-get install` could resolve the
+    # package name from whatever other source offers it and dpkg would run that
+    # package's postinst as root.
+    root_v5="${FIXTURE_DIR}/root-v5"
+    res_v5=$(run_main_install_path "${root_v5}" "updatefail" "update")
+    assert_eq "case v5: a failing apt-get update aborts the run (rc 1)" \
+        "1" "$(echo "${res_v5}" | sed -n '1p')"
+    assert_contains "case v5: the abort names the update failure and its likely causes" \
+        "apt-get update failed or timed out" "${res_v5}"
+    assert_eq "case v5: apt-get install is never reached after a failing update" \
+        "update" "$(tr '\n' ' ' < "${root_v5}/apt-get.calls" 2>/dev/null | sed 's/ $//')"
+
+    # v6: `apt-get install` fails, after a successful update. The stub records
+    # both calls, so this also proves the run got as far as the install rather
+    # than failing earlier for an unrelated reason and matching the message by
+    # accident.
+    root_v6="${FIXTURE_DIR}/root-v6"
+    res_v6=$(run_main_install_path "${root_v6}" "installfail" "install")
+    assert_eq "case v6: a failing apt-get install aborts the run (rc 1)" \
+        "1" "$(echo "${res_v6}" | sed -n '1p')"
+    assert_contains "case v6: the abort names the install failure, not the update" \
+        "apt-get install failed or timed out" "${res_v6}"
+    assert_eq "case v6: the run reached the install, so the message is not matched by an earlier failure" \
+        "update install" "$(tr '\n' ' ' < "${root_v6}/apt-get.calls" 2>/dev/null | sed 's/ $//')"
 else
-    skip "case v: main-install-path in_container() gating (needs the same key fixture/gpg as j/j2, plus timeout(1) for require_tools; missing: $(main_deps_missing))" 12
+    skip "case v: main-install-path in_container() gating (needs the same key fixture/gpg as j/j2, plus timeout(1) for require_tools; missing: $(main_deps_missing))" 19
 fi
 
 # ── Case v4: record_chrome_version's write-failure arm is non-fatal, not
@@ -2771,6 +3108,7 @@ run_verify_apt_origin() {
         printf 'POLICY\n'
     } > "${stub_bin}/apt-cache"
     chmod +x "${stub_bin}/apt-cache"
+    plant_timeout_stub "${stub_bin}"
     (
         # shellcheck source=install-chrome.sh
         source "${INSTALL_SCRIPT}"
@@ -2791,6 +3129,7 @@ run_verify_apt_origin_raw() {
         printf 'cat <<'"'"'POLICY'"'"'\n%s\nPOLICY\n' "${policy_out}"
     } > "${stub_bin}/apt-cache"
     chmod +x "${stub_bin}/apt-cache"
+    plant_timeout_stub "${stub_bin}"
     (
         # shellcheck source=install-chrome.sh
         source "${INSTALL_SCRIPT}"
@@ -2906,8 +3245,20 @@ assert_contains "case w: the priority-collision fixture is refused as evil.examp
 res_w5=$(run_verify_apt_origin_raw '' emptypolicy)
 assert_eq "case w: an unreadable apt policy is refused, not silently accepted" \
     "1" "$(echo "${res_w5}" | sed -n '1p')"
-assert_contains "case w: the empty-policy refusal is diagnosed as unknown" \
-    "unknown" "${res_w5}"
+# The CANDIDATE gate's own wording, not the "unexpected origin: unknown" text
+# the host gate below also emits. Against the shared sentence this assertion
+# passed with the candidate gate deleted: an empty candidate fell through, the
+# host comparison saw an empty host, and it refused with the same words. Pinning
+# the gate-specific sentence is what makes deleting this gate red.
+assert_contains "case w5: an empty apt policy is refused by the CANDIDATE gate, naming the unresolvable candidate rather than a wrong origin" \
+    "no resolvable apt candidate" "${res_w5}"
+if printf '%s' "${res_w5}" | grep -q "unexpected origin"; then
+    echo "FAIL: case w5: an unresolvable candidate was reported as a wrong ORIGIN — the candidate gate fell through to the host comparison"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS: case w5: an unresolvable candidate is not misreported as a wrong origin"
+    pass_count=$((pass_count + 1))
+fi
 
 # w6 (SEC-BE-002): the RIGHT HOST over the WRONG TRANSPORT. The host comparison
 # alone accepted `http://dl.google.com/...` — a plaintext apt transport for the
@@ -3046,7 +3397,40 @@ assert_eq "case x: remove_phone_home runs BEFORE cleanup_apt_wiring" \
 # a source-level check is the honest form, and it is the same derive-from-
 # source idiom the CI-wiring guards in test-runner-args.sh already use.
 cleanup_all_src=$(sed -n '/^cleanup_all() {/,/^}/p' "${INSTALL_SCRIPT}")
-for guarded_step in remove_phone_home cleanup_apt_wiring; do
+# DERIVED from cleanup_all's own body, not the two names enumerated by hand: an
+# enumerated pair stops covering the handler the day a third step is added, and
+# an unguarded third step is exactly the defect this check exists to catch — one
+# failing step aborting the handler under errexit before the security-relevant
+# removals run. A step is a call to a function this script defines elsewhere,
+# taken at statement position; the predicates and loggers cleanup_all uses to
+# DECIDE (in_container, log_warn) are not steps and carry no tolerance
+# requirement, so they are excluded by name.
+#
+# fn_code is not usable here: it strips comments but keeps the whole body as one
+# blob, and this needs the statement-leading token of each line.
+installer_fns=$(grep -oE '^[a-z_][a-z0-9_]*\(\) \{' "${INSTALL_SCRIPT}" | sed 's/() {$//' | sort -u)
+cleanup_steps=$(printf '%s\n' "${cleanup_all_src}" \
+    | grep -vE '^[[:space:]]*#' \
+    | grep -oE '^[[:space:]]*[a-z_][a-z0-9_]*' \
+    | tr -d ' \t' \
+    | sort -u \
+    | grep -Fxf <(printf '%s\n' "${installer_fns}") \
+    | grep -vxE 'in_container|log_warn|log_info|log_fail|cleanup_all' || true)
+# Fidelity sentinel: a derivation that matched nothing would make the loop below
+# iterate zero times and print no FAIL at all — the vacuous-guard shape this
+# suite exists to catch. The two steps that exist today are named here as the
+# FLOOR the derivation must find, not as the whole expected set: a third step
+# still has to appear in ${cleanup_steps} and be checked, it just does not have
+# to be listed here.
+if printf '%s\n' "${cleanup_steps}" | grep -qx remove_phone_home \
+   && printf '%s\n' "${cleanup_steps}" | grep -qx cleanup_apt_wiring; then
+    echo "PASS: case x: cleanup_all's step list derived from its own body ($(printf '%s\n' "${cleanup_steps}" | tr '\n' ' ' | sed 's/ $//'))"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case x: could not derive cleanup_all's steps from its body (got [$(printf '%s' "${cleanup_steps}" | tr '\n' ' ')]) — the tolerance checks below would be vacuous"
+    fail_count=$((fail_count + 1))
+fi
+for guarded_step in ${cleanup_steps}; do
     if printf '%s' "${cleanup_all_src}" \
         | grep -qE "^[[:space:]]*${guarded_step}[[:space:]]*\|\|[[:space:]]*(true|log_warn)"; then
         echo "PASS: case x: cleanup_all still tolerates a failing ${guarded_step} (|| true / || log_warn)"
@@ -3145,6 +3529,7 @@ esac
 exit 0
 EOF
     chmod +x "${bin_y}"/sudo "${bin_y}"/dpkg "${bin_y}"/curl "${bin_y}"/apt-cache "${bin_y}"/apt-get
+    plant_flock_stub "${bin_y}"
     res_y=$(
         VESPASIAN_TEST_ROOT="${root_y}"
         export VESPASIAN_TEST_ROOT
@@ -3304,6 +3689,7 @@ run_lock_plant() {
     printf '#!/bin/bash\nexec "$@"\n' > "${bin}/sudo"
     chmod +x "${bin}/sudo"
     printf 'do not touch me\n' > "${root}/victim"
+    plant_flock_stub "${bin}"
     case "${attack}" in
         symlink)  ln -s "${root}/victim" "${root}/tmp/vespasian-install-chrome.lock" ;;
         hardlink) ln "${root}/victim" "${root}/tmp/vespasian-install-chrome.lock" ;;
@@ -3859,6 +4245,46 @@ else
     pass_count=$((pass_count + 1))
 fi
 
+# ── Case cl: the COVERED list is derived from the case headers, not believed ──
+# The header block said the Covered list is "kept in sync with the actual case
+# letters" and nothing checked it — the same shape of unbacked claim this suite
+# exists to catch, and it had already drifted: a2, bp, cr, v3 and v4 all existed
+# as `── Case X:` headers with no mention in the list. A reader using that list
+# to decide what is covered would have concluded five case groups did not exist.
+#
+# Direction matters. This checks header ⇒ list (every case group that exists is
+# described), which is the direction that misleads a reader when it breaks. The
+# reverse — list ⇒ header — is deliberately NOT checked: the list also names
+# sub-cases that carry no `── Case` header of their own, and requiring one for
+# each would force a header per sub-case rather than per case group.
+cl_headers=$(grep -oE '^# ── Case [a-z0-9]+' "${BASH_SOURCE[0]}" | sed 's/^# ── Case //' | sort -u)
+cl_list=$(sed -n '/^# COVERED-LIST-BEGIN$/,/^# COVERED-LIST-END$/p' "${BASH_SOURCE[0]}")
+# Both extractions asserted non-empty first: an empty header set makes the loop
+# below iterate zero times, and an empty list makes every label "missing" —
+# opposite failures, both of which must name the extraction rather than the
+# labels.
+if [ -z "${cl_headers}" ] || [ -z "${cl_list}" ]; then
+    echo "FAIL: case cl: could not extract the case headers and/or the COVERED-LIST block — the coverage-list check is vacuous"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS: case cl: case headers and the COVERED-LIST block both extracted ($(printf '%s\n' "${cl_headers}" | wc -l | tr -d ' ') case groups)"
+    pass_count=$((pass_count + 1))
+    cl_missing=""
+    while IFS= read -r label; do
+        [ -n "${label}" ] || continue
+        # Word-boundaried: a bare `grep -F v` would be satisfied by "v3" and by
+        # the word "verification", so every label would appear covered.
+        printf '%s' "${cl_list}" | grep -qE "[( ]${label}[,;)]" || cl_missing="${cl_missing} ${label}"
+    done <<< "${cl_headers}"
+    if [ -n "${cl_missing}" ]; then
+        echo "FAIL: case cl: case group(s) with a '── Case X:' header but no mention in the COVERED-LIST block:${cl_missing} — the header block understates what this suite covers; add them to the list rather than deleting this check"
+        fail_count=$((fail_count + 1))
+    else
+        echo "PASS: case cl: every case group with a header is described in the COVERED-LIST block"
+        pass_count=$((pass_count + 1))
+    fi
+fi
+
 # ── Case cr: the CREDIT REGISTER is derived from the call sites, not believed ──
 # TEST-001. The register above says it "can be checked against the source rather
 # than believed" -- but nothing checked it, which is the same shape of unbacked
@@ -3878,10 +4304,10 @@ fi
 EXPECTED_SKIP_REGISTER='case a2: committed-mode check (not a git checkout)=1
 case f2: fingerprint-mismatch diagnosis for an unexpected real key (gpg not found on PATH)=4
 case f4: main() ordering guarantee on a fingerprint mismatch ($(main_deps_missing) not found on PATH)=3
-case j/j2: trust-anchor success path (fixture test/fixtures/google-linux-signing-key.asc missing or empty)=14
-case j/j2: trust-anchor success path (gpg not found on PATH)=14
+case j/j2: trust-anchor success path (fixture test/fixtures/google-linux-signing-key.asc missing or empty)=13
+case j/j2: trust-anchor success path (gpg not found on PATH)=13
 case l: non-root sudo refusal (running as root)=3
-case v: main-install-path in_container() gating (needs the same key fixture/gpg as j/j2, plus timeout(1) for require_tools; missing: $(main_deps_missing))=12
+case v: main-install-path in_container() gating (needs the same key fixture/gpg as j/j2, plus timeout(1) for require_tools; missing: $(main_deps_missing))=19
 case y: pre-install origin gate (needs the same key fixture/gpg as j/j2, plus timeout(1) for require_tools; missing: $(main_deps_missing))=3
 case bp: _bounded_probe timeout enforcement (no timeout/gtimeout on PATH)=4
 case z4: concurrent lock acquisition (flock not found on PATH)=3'

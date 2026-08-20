@@ -526,7 +526,16 @@ verify_apt_origin() {
     # names the version dpkg is about to unpack (or already has).
     candidate=$(printf '%s\n' "$policy" | awk -F': ' '/^  Candidate:/ { print $2; exit }')
     if [ -z "$candidate" ] || [ "$candidate" = "(none)" ]; then
-        log_fail "google-chrome-stable was satisfied from an unexpected origin: unknown (expected dl.google.com)" >&2
+        # Distinct wording from the host-mismatch refusal below, which reads
+        # "...unexpected origin: ${origin:-unknown}...". With both gates emitting
+        # the same sentence, an assertion on "unexpected origin: unknown" was
+        # satisfied by either one, so the case covering THIS gate — an apt-cache
+        # that produced no policy at all — also passed when this gate was deleted
+        # and the empty candidate fell through to the host comparison. These are
+        # different faults with different remedies: no resolvable candidate means
+        # apt cannot see the package (a held lock, a corrupted cache, a source
+        # that failed to fetch), not that the package came from the wrong place.
+        log_fail "google-chrome-stable has no resolvable apt candidate — cannot verify its origin (a held dpkg lock, a corrupted cache, or a source that failed to fetch)." >&2
         return 1
     fi
 
