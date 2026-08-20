@@ -22,7 +22,7 @@ skip_count=0
 # stay enforced even when a block legitimately skips, instead of going dark
 # the moment skip_count is nonzero.
 skip_credit=0
-# TEST-006: flips to 1 immediately before the Summary section runs, matching
+# Flips to 1 immediately before the Summary section runs, matching
 # install-chrome-selftest.sh and test-runner-args.sh. Every case here is a flat
 # sequence under this script's own `set -euo pipefail`; a stray `exit 0` (or an
 # errexit abort) anywhere above the summary would otherwise print PASS lines,
@@ -61,11 +61,11 @@ skip() {
 #
 # Update deliberately when adding or removing an assertion, and update the
 # matching skip() credit if the change touches an environment-gated block.
-# 88 = 84 + case f1's 4 assertions (TEST-011: gtimeout arm coverage). Case f1
+# 88 = 84 + case f1's 4 assertions (gtimeout arm coverage). Case f1
 # synthesises its own fixture gtimeout rather than depending on ambient PATH,
 # so it runs unconditionally on every host and needs no skip() credit.
 #
-# Round-15 review, TEST-001: 88 -> 90. MEASURED by running the suite, not
+# Round-15 review: 88 -> 90. MEASURED by running the suite, not
 # derived. +2 for case f1b, which pins the PRODUCTION `${CHROME_PROBE_TIMEOUT:-2}`
 # default — the value every real run uses and which nothing asserted, because
 # both suites that could exercise the `:-` arm export the variable first. It
@@ -84,7 +84,7 @@ assert_eq() {
 }
 
 # ── Fixture setup ──────────────────────────────────────────────
-# SEC-BE-006: pin the parent instead of inheriting $TMPDIR. This tree holds
+# Pin the parent instead of inheriting $TMPDIR. This tree holds
 # executable fixtures that get PATH-prepended and RUN, so an inherited TMPDIR
 # pointing at a non-sticky directory a second local user can write to would let
 # them rename it away between creation and use and choose the binaries this suite
@@ -94,7 +94,7 @@ FIXTURE_DIR=$(TMPDIR=/tmp mktemp -d)
 # code, so without an explicit exit a Ctrl-C left the fixture tree in $TMPDIR.
 #
 # The completion sentinel is folded into THIS trap rather than registered as a
-# second one (TEST-006): bash keeps a single EXIT trap, so a separate
+# second one: bash keeps a single EXIT trap, so a separate
 # `trap ... EXIT` declared here would silently REPLACE this one and never
 # fire — exactly the inert-assertion failure mode this suite exists to catch.
 trap 'rm -rf "${FIXTURE_DIR}"; if [ "${SUITE_COMPLETED}" != 1 ]; then echo "preflight-selftest: FAIL — suite terminated before reaching the summary; results are incomplete" >&2; exit 1; fi' EXIT
@@ -138,7 +138,7 @@ chmod +x "${GENERIC_BROKEN}"
 # happen AFTER sourcing — source first, then override, then call
 # detect_chrome_binary.
 
-# Pin the probe budget for the whole suite (TEST-014).
+# Pin the probe budget for the whole suite.
 #
 # Only cases f2/f3 used to pin it, so every OTHER case inherited whatever the
 # ambient environment had. That is not hypothetical: `CHROME_PROBE_TIMEOUT=0.0001
@@ -149,7 +149,7 @@ chmod +x "${GENERIC_BROKEN}"
 # it per-invocation, which still overrides this default.
 export CHROME_PROBE_TIMEOUT=2
 
-# ── Case a0: the PRODUCTION candidate list (TEST-005) ──────────
+# ── Case a0: the PRODUCTION candidate list ──────────
 # Every other case in every suite OVERRIDES CHROME_CANDIDATES with fixtures, so
 # the shipped list in common.sh was asserted nowhere: trimming it to a single
 # `google-chrome` entry — deleting `chromium-browser`, the very snap-stub name
@@ -305,7 +305,7 @@ else
     fail_count=$((fail_count + 1))
 fi
 
-# ── Case e2: EVERY member of the snap-hint glob set (TEST-009) ──
+# ── Case e2: EVERY member of the snap-hint glob set ──
 #
 # Cases b and e between them cover one glob member (*/snap/*) and the `*)` arm.
 # The set is `*/snap/*|*/chromium-browser|*/chromium`, so the other two members
@@ -400,7 +400,7 @@ else
     fi
 fi
 
-# ── Case e3: the FIRST broken stub is the one reported (TEST-012) ──
+# ── Case e3: the FIRST broken stub is the one reported ──
 #
 # detect_chrome_binary keeps `stub` set to the FIRST non-runnable candidate it saw
 # and echoes that one on rc 2, so the diagnostic names the browser the operator most
@@ -425,7 +425,7 @@ assert_eq "case e3: two broken candidates still report 'stub found, none runnabl
 assert_eq "case e3: the FIRST broken candidate is the one echoed, not the last" \
     "${SNAP_STUB}" "$(echo "${result}" | sed -n '2p')"
 
-# ── Case e4: a runnable candidate wins even when listed after a stub (TEST-012) ──
+# ── Case e4: a runnable candidate wins even when listed after a stub ──
 # The other half of the same contract: the loop must keep looking past a stub rather
 # than reporting the first thing it finds. Case a0 pins the production candidate
 # ORDER (real Chrome ahead of the snap stub); this pins that the order is honoured
@@ -470,7 +470,7 @@ out_f=$(echo "${result}" | sed -n '2p')
 assert_eq "case f: no-timeout fallback still detects a working browser (rc 0)" "0" "${rc_f}"
 assert_eq "case f: no-timeout fallback returns the working browser path" "${WORKING_BROWSER}" "${out_f}"
 
-# ── Case f0: the fallback REJECTS a broken browser (TEST-010) ───
+# ── Case f0: the fallback REJECTS a broken browser ───
 #
 # Case f above pins the fallback only in the direction where the browser works,
 # so an accept-all fallback was indistinguishable from a correct one.
@@ -504,7 +504,7 @@ assert_eq "case f0: no-timeout fallback REJECTS a broken browser (rc 2, not 0)" 
 assert_eq "case f0: no-timeout fallback still echoes the stub path it rejected" "${GENERIC_BROKEN}" "${out_f0}"
 
 # ── Case f1: the gtimeout arm (macOS + coreutils) actually runs ─
-# TEST-011: chrome_runnable's `elif command -v gtimeout` was dead coverage —
+# Chrome_runnable's `elif command -v gtimeout` was dead coverage —
 # no case anywhere selects it. Measured: deleting both gtimeout lines from
 # common.sh (the elif condition and `t=gtimeout`) left this suite green with
 # no case failing. Cases f/f0 above force the BARE-probe fallback by emptying
@@ -529,7 +529,7 @@ GTIMEOUT_BIN_DIR="${FIXTURE_DIR}/gtimeout-only-bin"
 mkdir -p "${GTIMEOUT_BIN_DIR}"
 ln -s "$(command -v sleep)" "${GTIMEOUT_BIN_DIR}/sleep"
 GTIMEOUT_MARKER="${FIXTURE_DIR}/gtimeout.invocations"
-# TEST-001: a SECOND, independent marker recording the duration gtimeout was
+# A SECOND, independent marker recording the duration gtimeout was
 # handed. Separate from GTIMEOUT_MARKER on purpose — case f1's four existing
 # assertions read that one and must keep reading exactly what they did before.
 GTIMEOUT_BUDGET_MARKER="${FIXTURE_DIR}/gtimeout.budget"
@@ -597,7 +597,7 @@ assert_eq "case f1: CHROME_PROBE_TIMEOUT=0.2 kills the slow probe via gtimeout (
 assert_eq "case f1: the fixture gtimeout was invoked to kill the slow probe" \
     "invoked" "$(cat "${GTIMEOUT_MARKER}")"
 
-# ── Case f1b: the PRODUCTION default budget (TEST-001) ──────────────────────
+# ── Case f1b: the PRODUCTION default budget ──────────────────────
 #
 # `chrome_probe_budget` reads `${CHROME_PROBE_TIMEOUT:-2}` (test/common.sh:104).
 # That literal 2 is what every real developer run and every CI run uses, and
@@ -647,7 +647,7 @@ assert_eq "case f1b: the un-overridden production budget reaches timeout as 2s �
 # An earlier version pinned the pass side to that literal default, which made
 # the assertion load-sensitive: the fixture's sleep had to outlive bash/
 # timeout process-startup jitter on a throttled CI runner while still fitting
-# inside a fixed 2s ceiling it does not control (TEST-013). An explicit,
+# inside a fixed 2s ceiling it does not control. An explicit,
 # generous override turns this into a RATIO assertion — budget far exceeds
 # sleep — rather than an absolute-wall-clock one, so ordinary CI jitter cannot
 # flip it. This does mean case f2 no longer pins the literal "2" default
@@ -721,7 +721,7 @@ EOF
         )
         cat "${errf}"
     }
-    # TEST-011: continuation lines and the loop keyword now sit at this block's own
+    # Continuation lines and the loop keyword now sit at this block's own
     # indentation. The comment's 2nd and 3rd lines were at column 0 and the `for` was
     # too, while the loop BODY was indented 8 — which reads as though the loop is
     # outside the enclosing block when it is inside it.
@@ -779,7 +779,7 @@ else
     skip "case f2: no timeout/gtimeout on PATH — no probe budget to override" 27
 fi
 
-# ── Case p: _CHROME_BUDGET_WARNED dedups within ONE shell (TEST-002) ──
+# ── Case p: _CHROME_BUDGET_WARNED dedups within ONE shell ──
 # The warn-once guard added alongside _CHROME_BUDGET_WARNED has no coverage
 # anywhere: every existing budget-warning case above (f3's warn_of /
 # probe_working_browser) sources the script in a FRESH subshell per
@@ -989,7 +989,7 @@ PAST_PREREQS_MARKER="STUB-REACHED-BUILD-PHASE"
 # scripts "need no Go, Node, or Chrome" is about running the SUITE, not about
 # what a non-fatal gate needs downstream of it in main()). Without this guard
 # a python3-less host would see the browser gate behave correctly yet still
-# fail these two assertions on an unrelated missing prerequisite (TEST-016) —
+# fail these two assertions on an unrelated missing prerequisite —
 # a false RED, not a false green, but one that couples this un-gated
 # preflight-selftest job to the runner image's toolchain. Gate the
 # marker/epilogue checks on it and SKIP with a clear reason otherwise; the
@@ -1024,7 +1024,7 @@ run_setup_main() {
     ) || true
 }
 
-# ── Case n2: a browserless run REACHES write_config (TEST-013) ──
+# ── Case n2: a browserless run REACHES write_config ──
 #
 # Case n proves a browserless setup gets past the prerequisite gate, and that is where
 # its stub exits. Nothing proved the run goes on to WRITE the config, which is the
@@ -1069,7 +1069,7 @@ mkdir -p "${n2_state}"
     )
 } > "${n2_state}/main.out" 2>&1 || true
 # Gated on HAS_NONBROWSER_PREREQS for exactly the reason case n's marker/epilogue
-# checks are (TEST-016): both assertions below require the run to reach
+# checks are: both assertions below require the run to reach
 # write_config, and check_prerequisites fails first on a host missing go or
 # python3 — an unrelated missing prerequisite, not the browser gate under test.
 # Ungated, this suite went RED on any such host for an environmental reason,
@@ -1125,7 +1125,7 @@ else
 fi
 
 # Case n (continued): isolate --skip-start AT THE CALL SITE against a
-# browser-backed target (TEST-017). out_n above isolates the TARGETS argument
+# browser-backed target. out_n above isolates the TARGETS argument
 # (grpc-server has no browser target at all) but not skip_start: grpc-server
 # is already outside BROWSER_TARGETS, so browser_required returns 1 and the
 # gate degrades to WARN whether or not --skip-start is even passed — a
@@ -1181,7 +1181,7 @@ fi
 # run_prereqs_with_no_browser) — every one of them exercises a FAILURE arm of
 # the browser probe. The rc==0 "browser found" arm — the one that runs on
 # every correctly provisioned machine — was never fed to check_prerequisites
-# anywhere in this suite (TEST-015). A mutation that condemns a healthy
+# anywhere in this suite. A mutation that condemns a healthy
 # browser (e.g. replacing the rc==0 branch's `return 0` with a failure) would
 # therefore leave every case in this file green.
 #
@@ -1205,7 +1205,7 @@ fi
 # (see the comment above PAST_PREREQS_MARKER): check_prerequisites exits 1 on
 # ANY failed prerequisite, so on a go/python3-less host this line would print
 # regardless of the browser arm's own (correct) behaviour, coupling this
-# assertion to the runner image's toolchain the same way TEST-016 flagged.
+# assertion to the runner image's toolchain, which is what the review flagged.
 if [ "${HAS_NONBROWSER_PREREQS}" = true ]; then
     if printf '%s' "${out_o}" | grep -q "Prerequisites check failed"; then
         echo "FAIL: case o: a working browser still hard-failed prerequisites"
@@ -1224,7 +1224,7 @@ SUITE_COMPLETED=1
 echo ""
 echo "preflight-selftest: ${pass_count} passed, ${fail_count} failed, ${skip_count} skipped"
 
-# Assertion accounting (TEST-015 / TEST-013). Nothing may vanish on ANY host,
+# Assertion accounting. Nothing may vanish on ANY host,
 # degraded or not: pass + fail + skip_credit is pinned to EXPECTED_ASSERTIONS
 # unconditionally, so deleting a case fails here even on a host where some
 # blocks legitimately skip for want of Go, Python3, or timeout/gtimeout — the

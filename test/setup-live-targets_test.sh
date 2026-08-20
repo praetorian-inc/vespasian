@@ -35,7 +35,7 @@ SCRIPT_UNDER_TEST="${THIS_DIR}/setup-live-targets.sh"
 # Isolate all PID/state files in a temp dir so we never touch the real test/
 # tree. This uses the dedicated state-dir override, NOT SCRIPT_DIR — the script
 # always resolves SCRIPT_DIR from its own location and sources common.sh there.
-# SEC-BE-006: pin the parent instead of inheriting $TMPDIR. This tree holds
+# Pin the parent instead of inheriting $TMPDIR. This tree holds
 # executable fixtures that get PATH-prepended and RUN, so an inherited TMPDIR
 # pointing at a non-sticky directory a second local user can write to would let
 # them rename it away between creation and use and choose the binaries this suite
@@ -52,7 +52,7 @@ cleanup() {
     done
     rm -rf "${STATE_DIR}"
     # The completion sentinel is folded into THIS trap rather than registered
-    # as a second one (TEST-006): bash keeps a single EXIT trap, so a separate
+    # as a second one: bash keeps a single EXIT trap, so a separate
     # `trap ... EXIT` declared anywhere else would silently REPLACE this one
     # and never fire — exactly the inert-assertion failure mode this suite
     # exists to catch.
@@ -101,7 +101,7 @@ PASS=0
 FAIL=0
 SKIP=0
 SKIP_CREDIT=0
-# TEST-006: flips to 1 immediately before the Summary section runs, matching
+# Flips to 1 immediately before the Summary section runs, matching
 # install-chrome-selftest.sh and test-runner-args.sh. This file runs under
 # `set -uo pipefail` (no -e), but an explicit `exit` anywhere above the
 # summary — or a bare-variable/unset-command abort under -u — would otherwise
@@ -431,7 +431,7 @@ if command -v lsof >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
         lsof -nP -iTCP:"$nnport" -sTCP:LISTEN >/dev/null 2>&1 && { nn_listening=true; break; }
         sleep 0.2
     done
-    # TEST-014: the readiness loop above is best-effort — if the fixture never
+    # The readiness loop above is best-effort — if the fixture never
     # actually binds (e.g. free_port's TOCTOU window let something else grab
     # the port first, or the process failed to start), the loop just falls
     # through and the exclusion check below would trivially pass for the WRONG
@@ -460,7 +460,7 @@ if command -v lsof >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     if ! cp "$(command -v python3)" "${STATE_DIR}/node"; then
         fail "could not stage node stand-in (cp failed)"
         # Both arms of this block must emit 3 counted outcomes or the accounting
-        # sentinel fires a second, misleading failure (TEST-008). The two node-listener
+        # sentinel fires a second, misleading failure. The two node-listener
         # sub-cases below cannot run without the stand-in, so they are credited here.
         skip "node-listener sub-cases need the staged stand-in" 1
     else
@@ -514,7 +514,7 @@ else
     skip "pgrep required" 2
 fi
 
-# ── Test 17b: no lsof means "cannot determine", not "no match" (SEC-BE-008) ──
+# ── Test 17b: no lsof means "cannot determine", not "no match" ──
 #
 # orphan_pids_by_port used to `return 0` with no output when lsof was absent, which
 # is indistinguishable from "looked, found nothing". pid_matches_service's
@@ -525,7 +525,7 @@ fi
 #
 # Driven with a PATH that deliberately lacks lsof, built by symlinking just the
 # tools the seam itself needs, so `command -v lsof` genuinely misses.
-echo "Test 17b: teardown can still identify graphql-server on a host without lsof (SEC-BE-008)"
+echo "Test 17b: teardown can still identify graphql-server on a host without lsof"
 nolsof_bin="${STATE_DIR}/nolsof-bin"
 mkdir -p "${nolsof_bin}"
 for t in ps basename sleep grep sed awk cat head cut tr sort; do
@@ -554,11 +554,11 @@ if [ -x "${nolsof_bin}/ps" ] && ! PATH="${nolsof_bin}" command -v lsof >/dev/nul
     assert_eq "$?" "0" "pid_matches_service accepts a recorded node PID when the port check cannot look"
     kill -9 "$nl_pid" 2>/dev/null || true
 else
-    skip "could not build an lsof-free PATH for the SEC-BE-008 check" 2
+    skip "could not build an lsof-free PATH for the teardown-identity check" 2
 fi
 
 # ── Test 18: LIVE_TARGET_BIND_HOST seam reaches every non-hardened target ────
-echo "Test 18: rest-api/soap-service/concat-spa/graphql-server pass an explicit bind host (SEC-BE-015)"
+echo "Test 18: rest-api/soap-service/concat-spa/graphql-server pass an explicit bind host"
 for fn in start_rest_api start_soap_service start_concat_spa start_graphql_server; do
     case "$(declare -f "$fn")" in
         *'BIND_HOST="${LIVE_TARGET_BIND_HOST:-127.0.0.1}"'*)
@@ -567,7 +567,7 @@ for fn in start_rest_api start_soap_service start_concat_spa start_graphql_serve
             fail "${fn} passes an explicit BIND_HOST seam (source changed)" ;;
     esac
 done
-# TEST-009: the four names above are hand-picked and never include grpc-server,
+# The four names above are hand-picked and never include grpc-server,
 # which IS a first-class ALL_TARGETS member. Being on the exemption list below
 # is not itself a finding — an UNLISTED, UNCHECKED target is.
 #   forms-target  — uses its own FORMS_TARGET_BIND_HOST seam; pinned by Test 19.
@@ -614,14 +614,14 @@ else
     ok "every ALL_TARGETS member is either bind-host-asserted or on the documented exemption list"
 fi
 
-# ── Test 18b: the TARGETS THEMSELVES honour the seam (TEST-007) ─────────────
+# ── Test 18b: the TARGETS THEMSELVES honour the seam ─────────────
 #
 # Test 18 above asserts only that the SHELL passes BIND_HOST. That is half the
 # contract and it was the half that hid the bug: no suite referenced
 # rest-api/main.go, soap-service/main.go, concat-spa/main.go or
 # graphql-server/server.js at all, so reverting the four targets to their old
 # wildcard bind — `addr := ":" + port` / `listen(port)` — left every assertion
-# in every suite green while the exposure SEC-BE-015 was filed for came back.
+# in every suite green while the exposure the explicit bind was added for came back.
 # The seam is inert unless BOTH ends exist, so both ends are asserted.
 #
 # This is a source-level check, not a socket-level one, and that is a deliberate
@@ -629,13 +629,13 @@ fi
 # built and started a target would skip in exactly the environment that runs the
 # guards. It fails on the mutation the finding named, which a behavioural test
 # in an unreachable job would not.
-echo "Test 18b: the loopback default lives in one asserted place and every target uses it (SEC-BE-015 / TEST-014 / QUAL-007)"
-# QUAL-007 moved the BIND_HOST resolution out of four byte-identical copies into
+echo "Test 18b: the loopback default lives in one asserted place and every target uses it"
+# The BIND_HOST resolution moved out of four byte-identical copies into
 # test/internal/target. That changes what this test must pin, and makes the pin
 # stronger: the security-relevant default is asserted ONCE, and each target is
 # asserted to DELEGATE rather than to re-derive it.
 #
-# TEST-014, why a literal grep is not enough. The previous version grepped each
+# Why a literal grep is not enough. The previous version grepped each
 # target for `host = "127.0.0.1"`. That caught rewriting the literal to "0.0.0.0"
 # (measured: 72 passed / 4 FAILED, exit 1) but NOT a logic inversion, because the
 # inversion leaves the literal exactly where it was: flipping `if host == ""` to
@@ -648,7 +648,7 @@ echo "Test 18b: the loopback default lives in one asserted place and every targe
 # Source-level rather than socket-level, deliberately: the preflight-selftest job
 # that runs this suite installs no Go and no Node, so a test that built and started
 # a target would skip in exactly the environment the guard is for.
-# TEST-015: strip `/* */` BLOCK comments as well as `//` and `#` line comments.
+# Strip `/* */` BLOCK comments as well as `//` and `#` line comments.
 #
 # Stripping only line comments was the same defect this file was hardened against
 # one round earlier, regenerated one level down. The earlier fix taught the
@@ -681,7 +681,7 @@ if [ ! -f "${SHARED_TARGET}" ]; then
 else
     shared_code=$(collapse_code "${SHARED_TARGET}")
 
-    # TEST-010 / D2. Both a structural pin over the collapsed source AND the Go
+    # Both a structural pin over the collapsed source AND the Go
     # behavioural tests in target_test.go are kept deliberately — this is the
     # defence-in-depth the review found was lost, not a choice between the two:
     # the shell pin below runs in the Go-less preflight-selftest job, the Go
@@ -689,7 +689,7 @@ else
     # a /* */ block comment could satisfy it undetected, but collapse_code
     # strips block comments in the very commit that theory rested on, so the
     # pin is sound again as a fixed-string whole-structure match.
-    # SELF-5: ANCHORED, not containment. `grep -qF` asks only whether the text
+    # ANCHORED, not containment. `grep -qF` asks only whether the text
     # appears SOMEWHERE — so a new code path prepended AHEAD of the pinned block
     # leaves it matching. MUTATION-PROVEN: adding
     #   if os.Getenv("BIND_ALL") != "" { return net.JoinHostPort("0.0.0.0", port) }
@@ -698,16 +698,16 @@ else
     # whole function body — from `func Addr` to its closing return — is what makes
     # the comment's "whole-structure match" claim actually true.
     if printf '%s' "${shared_code}" | grep -qF 'func Addr(port string) string { host := os.Getenv("BIND_HOST") if host == "" { host = "127.0.0.1" } return net.JoinHostPort(host, port) }'; then
-        ok "shared target.Addr's whole body is the loopback default (no other code path can reach the bind) (SEC-BE-015)"
+        ok "shared target.Addr's whole body is the loopback default (no other code path can reach the bind)"
     else
-        fail "shared target.Addr's body is no longer exactly the loopback-default structure — either the default changed, or another code path was added that can return a different host before it. These targets are unauthenticated, so a wildcard bind exposes them to the local network for the lifetime of a test run (SEC-BE-015)"
+        fail "shared target.Addr's body is no longer exactly the loopback-default structure — either the default changed, or another code path was added that can return a different host before it. These targets are unauthenticated, so a wildcard bind exposes them to the local network for the lifetime of a test run"
     fi
 
     # TWO conditions, deliberately. The quantifier is [1-9][0-9]*, not [0-9]+:
     # the round-13 predecessor used [0-9]+, which matches the literal `0` it
     # claimed to forbid.
     #
-    # SELF-3: the second condition is NOT optional and was wrongly dropped when
+    # The second condition is NOT optional and was wrongly dropped when
     # this pin was restored. The first proves the CONSTANT is declared non-zero;
     # only the second proves Server() still APPLIES it. MUTATION-PROVEN: deleting
     # `ReadHeaderTimeout: ReadHeaderTimeout,` from the Server struct left this
@@ -715,9 +715,9 @@ else
     # restoration kept one. Do not drop it again.
     if printf '%s' "${shared_code}" | grep -qE 'ReadHeaderTimeout = [1-9][0-9]* \* time\.Second' \
        && printf '%s' "${shared_code}" | grep -qF 'ReadHeaderTimeout: ReadHeaderTimeout'; then
-        ok "shared target server declares a non-zero ReadHeaderTimeout AND applies it in Server() (SEC-BE-007)"
+        ok "shared target server declares a non-zero ReadHeaderTimeout AND applies it in Server()"
     else
-        fail "shared target server's ReadHeaderTimeout is zero, gone, or no longer applied by Server() — an unbounded header read is a slow-loris against a developer machine or CI runner once LIVE_TARGET_BIND_HOST widens the bind (SEC-BE-007)"
+        fail "shared target server's ReadHeaderTimeout is zero, gone, or no longer applied by Server() — an unbounded header read is a slow-loris against a developer machine or CI runner once LIVE_TARGET_BIND_HOST widens the bind"
     fi
 fi
 
@@ -726,7 +726,7 @@ fi
 # above cannot: a comparison inversion, and (for the timeout) the exact-zero
 # value the old, looser regex used to accept. This check does not depend on
 # target.go existing, so it is its own top-level check rather than nested
-# inside the block above (TEST-008): target.go being absent does not prevent
+# inside the block above: target.go being absent does not prevent
 # checking whether target_test.go still asserts these things, and folding it
 # into the "target.go missing" arm would falsely claim that it does.
 #
@@ -744,7 +744,7 @@ else
         grep -qF -- "$needle" "${shared_test}" || missing="${missing} ${needle#func }"
     done
     if [ -n "$missing" ]; then
-        fail "target_test.go no longer asserts:${missing} — these are the behavioural pins for SEC-BE-015 and SEC-BE-007"
+        fail "target_test.go no longer asserts:${missing} — these are the behavioural pins for the loopback default and the header-read bound"
     else
         ok "target_test.go carries the behavioural pins for the loopback default and the header-read bound (run by 'make test', not by this job)"
     fi
@@ -772,7 +772,7 @@ for src in rest-api/main.go soap-service/main.go concat-spa/main.go forms-target
         fail "${src} no longer delegates to test/internal/target — it resolves its own bind and/or builds its own server, so the shared loopback default and timeout do not apply to it"
     fi
 done
-# TEST-009: the four `src` entries above are hand-picked; grpc-server and any
+# The four `src` entries above are hand-picked; grpc-server and any
 # future ALL_TARGETS member are invisible to this loop unless named here.
 #   graphql-server — Node, cannot share the Go helper; pinned by its own arm below.
 #   grpc-server    — builds no http.Server, so target.Server is inapplicable;
@@ -809,21 +809,21 @@ fi
 # grpc-server builds no http.Server, so it cannot use target.Server, and it
 # takes no BIND_HOST — its bind is a branch-free literal. A fixed-string
 # structural match is therefore complete for it: there is no logic to invert
-# (TEST-009).
+#.
 grpcsrc="${THIS_DIR}/grpc-server/main.go"
 if [ ! -f "$grpcsrc" ]; then
     fail "grpc-server/main.go not found — cannot verify its loopback bind"
 else
     if printf '%s' "$(collapse_code "$grpcsrc")" | grep -qF 'net.Listen("tcp", "127.0.0.1:"+resolved)'; then
-        ok "grpc-server/main.go binds loopback explicitly (SEC-BE-015)"
+        ok "grpc-server/main.go binds loopback explicitly"
     else
-        fail "grpc-server/main.go no longer binds 127.0.0.1 — the gRPC live target is unauthenticated, so a wildcard bind exposes it to the local network for the lifetime of a test run (SEC-BE-015)"
+        fail "grpc-server/main.go no longer binds 127.0.0.1 — the gRPC live target is unauthenticated, so a wildcard bind exposes it to the local network for the lifetime of a test run"
     fi
 fi
 
-# ── Test 18c: the graphql dep install stays script-free (TEST-011) ──────────
+# ── Test 18c: the graphql dep install stays script-free ──────────
 #
-# SEC-BE-007 changed `npm install --silent` to `npm ci --ignore-scripts --silent`
+# `npm install --silent` became `npm ci --ignore-scripts --silent`
 # in build_graphql_server, and nothing guarded it. `npm install` runs package
 # lifecycle scripts — arbitrary registry code on a developer's machine and on the
 # CI runner — and resolves loosely instead of honouring the committed lockfile,
@@ -833,7 +833,7 @@ fi
 # Scoped to build_graphql_server()'s own body, not the whole file: the flag name
 # appears in this script's comments and in the workflow, and a whole-file grep
 # would be satisfied by prose while the call itself regressed — the exact defect
-# TEST-003 records against install-chrome-selftest case f.
+# the review records against install-chrome-selftest case f.
 echo "Test 18c: build_graphql_server installs deps with npm ci --ignore-scripts"
 gql_fn_body="$(awk '/^build_graphql_server\(\) \{/,/^\}/' "${SCRIPT_UNDER_TEST}")"
 gql_npm_lines="$(printf '%s\n' "${gql_fn_body}" | grep -E '^[[:space:]]*npm ' || true)"
@@ -845,15 +845,15 @@ fi
 if printf '%s\n' "${gql_npm_lines}" | grep -qF -- 'npm ci --ignore-scripts'; then
     ok "the dep install uses npm ci --ignore-scripts (lockfile honoured, lifecycle scripts blocked)"
 else
-    fail "the dep install no longer uses npm ci --ignore-scripts — registry lifecycle scripts execute and the committed lockfile is bypassed (SEC-BE-007)"
+    fail "the dep install no longer uses npm ci --ignore-scripts — registry lifecycle scripts execute and the committed lockfile is bypassed"
 fi
 if printf '%s\n' "${gql_npm_lines}" | grep -qE '^[[:space:]]*npm install\b'; then
-    fail "build_graphql_server has reverted to npm install — lifecycle scripts run again (SEC-BE-007)"
+    fail "build_graphql_server has reverted to npm install — lifecycle scripts run again"
 else
     ok "build_graphql_server does not use npm install"
 fi
 
-# ── Test 19: forms-target's own bind default is loopback (TEST-019) ─────────
+# ── Test 19: forms-target's own bind default is loopback ─────────
 echo "Test 19: forms-target defaults its bind host to loopback"
 case "$(declare -f start_forms_target)" in
     *'BIND_HOST="${FORMS_TARGET_BIND_HOST:-127.0.0.1}"'*)
@@ -861,14 +861,14 @@ case "$(declare -f start_forms_target)" in
     *)
         fail "start_forms_target defaults BIND_HOST to 127.0.0.1 (source changed)" ;;
 esac
-# TEST-008: the check above covers only the SHELL half. forms-target is the
+# The check above covers only the SHELL half. forms-target is the
 # target this seam was modelled on, so it gets the same both-halves treatment as
 # Test 18b: the value the shell passes is inert unless the target reads it, and
 # asserting one without the other is how the four siblings' inert seam went
 # unnoticed for a whole review round. Source-level for the same reason 18b is —
 # the preflight-selftest CI job installs no Go, so a build-and-start assertion
 # would skip in exactly the job that runs the guards.
-# QUAL-007: forms-target no longer reads BIND_HOST itself — the resolution moved to
+# Forms-target no longer reads BIND_HOST itself — the resolution moved to
 # test/internal/target, which Test 18b above asserts once (the loopback default AND
 # that every target including this one delegates to it). Re-grepping this file for
 # `os.Getenv("BIND_HOST")` here would now FAIL on correct code, and re-asserting the
@@ -904,12 +904,12 @@ else
     fail "forms-target/main.go hardcodes its bind address — FORMS_TARGET_BIND_HOST cannot widen it and the shell half above is inert"
 fi
 
-# ── Test 20: wait_for_http bounds its curl probe (TEST-017, SEC-BE-012) ─────
+# ── Test 20: wait_for_http bounds its curl probe ─────
 #
-# TEST-008: a source-text match cannot tell "curl has --max-time and it works"
+# A source-text match cannot tell "curl has --max-time and it works"
 # from "curl has --max-time and something else swallowed the effect" — the
 # property is directly observable, so it is observed instead: a listener that
-# accepts the TCP handshake and then never responds is exactly the SEC-BE-012
+# accepts the TCP handshake and then never responds is exactly the tarpit
 # scenario the function's own comment names, so wait_for_http is driven
 # against one for real. The whole call is wrapped in an outer `timeout` (the
 # same belt-and-suspenders shape Test 21 uses): if a mutation deletes
@@ -950,9 +950,9 @@ else
     skip "timeout/gtimeout, curl, and python3 required" 1
 fi
 
-# ── Test 21: wait_for_grpc's timeout-wrapped /dev/tcp arm (TEST-020) ────────
+# ── Test 21: wait_for_grpc's timeout-wrapped /dev/tcp arm ────────
 echo "Test 21: wait_for_grpc connects via the timeout-wrapped /dev/tcp arm when grpcurl/nc are absent"
-# python3 is required too (TEST-009): the body below spawns a python3
+# python3 is required too: the body below spawns a python3
 # http.server as the listener the /dev/tcp arm connects to, and every other
 # environment-gated block in this file guards python3 explicitly for the same
 # reason — without the guard this hard-fails on a host without python3
@@ -975,7 +975,7 @@ if { command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; 
     gsp=$!
     SPAWNED_PIDS+=("$gsp")
     disown "$gsp" 2>/dev/null || true
-    # TEST-010: poll for the listener to actually accept a connection instead
+    # Poll for the listener to actually accept a connection instead
     # of a fixed `sleep 0.3` — on a loaded runner 0.3s can be short of the
     # interpreter's own startup, which would make the rc=0 arm below flake
     # red for a reason that has nothing to do with wait_for_grpc. Same
@@ -997,7 +997,7 @@ if { command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; 
     kill -9 "$gsp" 2>/dev/null || true
     assert_contains "$out" "rc=0" "connects via the timeout-wrapped /dev/tcp arm with grpcurl/nc absent"
 
-    # TEST-010: no wall-clock upper-bound assertion here (a "returns within
+    # No wall-clock upper-bound assertion here (a "returns within
     # roughly the outer timeout" check computed from $SECONDS was removed —
     # a 2s outer timeout with only 2s of headroom flakes on a loaded runner).
     # The rc=1 assertion below already proves the call does not hang: it
@@ -1018,7 +1018,7 @@ else
 fi
 
 # ── Test 22: write_config lands the config at 0644 regardless of umask ──────
-echo "Test 22: write_config lands .live-test-config at mode 644 under umask 0 (SEC-BE-017, TEST-021)"
+echo "Test 22: write_config lands .live-test-config at mode 644 under umask 0"
 if command -v stat >/dev/null 2>&1; then
     (
         umask 0
@@ -1031,7 +1031,7 @@ if command -v stat >/dev/null 2>&1; then
     assert_contains "$contents" "REST_API_PORT=1111" "config carries the written port value"
     rm -f "$CONFIG_FILE"
     pidmode="$(stat -c '%a' "${STATE_DIR}/.modetest.pids" 2>/dev/null)"
-    assert_eq "$pidmode" "600" "pid log lands at mode 600 even under umask 0 (SEC-BE-003)"
+    assert_eq "$pidmode" "600" "pid log lands at mode 600 even under umask 0"
     rm -f "${STATE_DIR}/.modetest.pids"
 
     # ROUND-16: the graphql log's mode had NO assertion at all. Its sibling
@@ -1101,11 +1101,11 @@ if command -v stat >/dev/null 2>&1; then
         # Blank the extraction too. fail() only increments a counter and returns,
         # so without this the block fell through and eval'd head -1's arbitrary
         # pick anyway — loud AND arbitrary, while the comment claimed otherwise.
-        fail "start_graphql_server has ${gql_install_n} install(1) statements targeting .graphql-server.log — the extraction above would pick one arbitrarily; disambiguate rather than trusting head -1 (SEC-BE-003)"
+        fail "start_graphql_server has ${gql_install_n} install(1) statements targeting .graphql-server.log — the extraction above would pick one arbitrarily; disambiguate rather than trusting head -1"
         gql_install_line=""
         gql_extraction_ok=false
     elif [ -z "$gql_install_line" ]; then
-        fail "start_graphql_server no longer pre-creates its log with install(1) — a bare redirection lands at the caller's umask, so under umask 0 the log holding service output would be world-writable (SEC-BE-003)"
+        fail "start_graphql_server no longer pre-creates its log with install(1) — a bare redirection lands at the caller's umask, so under umask 0 the log holding service output would be world-writable"
         gql_extraction_ok=false
     else
         ok "start_graphql_server's install(1) line for .graphql-server.log extracted unambiguously"
@@ -1124,10 +1124,10 @@ if command -v stat >/dev/null 2>&1; then
         if ( umask 0; eval "$gql_install_line" ) >/dev/null 2>&1; then
             ok "start_graphql_server's install line runs in isolation, so the mode assertion below reads a real file"
         else
-            fail "could not execute start_graphql_server's install line in isolation (extracted: ${gql_install_line}) — the mode assertion below would report an empty mode as a 0600 violation; fix the extraction rather than deleting the check (SEC-BE-003)"
+            fail "could not execute start_graphql_server's install line in isolation (extracted: ${gql_install_line}) — the mode assertion below would report an empty mode as a 0600 violation; fix the extraction rather than deleting the check"
         fi
         logmode="$(stat -c '%a' "${STATE_DIR}/.graphql-server.log" 2>/dev/null)"
-        assert_eq "$logmode" "600" "start_graphql_server's own install line creates .graphql-server.log at mode 600 under umask 0 — pinning the path too, so an install pointed at another file cannot satisfy this (SEC-BE-003)"
+        assert_eq "$logmode" "600" "start_graphql_server's own install line creates .graphql-server.log at mode 600 under umask 0 — pinning the path too, so an install pointed at another file cannot satisfy this"
 
         # BEHAVIOURAL. Everything else in this block reads the function's TEXT;
         # this RUNS it. A textual scan can only recognise a clobber that spells
@@ -1162,7 +1162,7 @@ if command -v stat >/dev/null 2>&1; then
             ' 2>/dev/null | tail -1
         )"
         rm -rf "$gql_stub_bin" "$gql_beh_state"
-        assert_eq "$gql_beh_mode" "600" "RUNNING start_graphql_server under umask 0 leaves .graphql-server.log at mode 600 — pins the mode of the file the service actually writes, so a clobber spelled through a variable or a helper cannot evade it the way it evades the textual scans below (SEC-BE-003)"
+        assert_eq "$gql_beh_mode" "600" "RUNNING start_graphql_server under umask 0 leaves .graphql-server.log at mode 600 — pins the mode of the file the service actually writes, so a clobber spelled through a variable or a helper cannot evade it the way it evades the textual scans below"
 
         # ORDERING. The mode only holds if nothing between the install and the
         # truncating redirect removes the file: `>` on an EXISTING file truncates
@@ -1231,13 +1231,13 @@ $(declare -f "$w")"
         gql_redirect_at=$(printf '%s\n' "$gql_body" | grep -nE '^[[:space:]]*.*node server\.js >' | head -1 | cut -d: -f1 || true)
         gql_clobber_at=$(printf '%s\n' "$gql_body" | grep -nE '^[[:space:]]*(rm|unlink|mv|truncate|chmod|setfacl|chown)[[:space:]][^;]*graphql-server\.log' | head -1 | cut -d: -f1 || true)
         if [ -z "$gql_install_at" ] || [ -z "$gql_redirect_at" ]; then
-            fail "could not locate start_graphql_server's install line and/or its node redirect — the ordering assertion below would compare empty strings and pass vacuously; fix the extraction rather than deleting the check (SEC-BE-003)"
+            fail "could not locate start_graphql_server's install line and/or its node redirect — the ordering assertion below would compare empty strings and pass vacuously; fix the extraction rather than deleting the check"
         elif [ "$gql_install_at" -ge "$gql_redirect_at" ]; then
-            fail "start_graphql_server's install(1) runs at or AFTER the redirect (install line ${gql_install_at}, redirect line ${gql_redirect_at}) — the redirect creates .graphql-server.log at the caller's umask first, so the explicit 0600 mode never applies to the file the service writes (SEC-BE-003)"
+            fail "start_graphql_server's install(1) runs at or AFTER the redirect (install line ${gql_install_at}, redirect line ${gql_redirect_at}) — the redirect creates .graphql-server.log at the caller's umask first, so the explicit 0600 mode never applies to the file the service writes"
         elif [ -n "$gql_clobber_at" ] && [ "$gql_clobber_at" -gt "$gql_install_at" ] && [ "$gql_clobber_at" -lt "$gql_redirect_at" ]; then
-            fail "start_graphql_server removes, renames or re-modes .graphql-server.log at line ${gql_clobber_at}, between its install(1) (line ${gql_install_at}) and the redirect (line ${gql_redirect_at}) — the redirect then re-creates it at the caller's umask (SEC-BE-003)"
+            fail "start_graphql_server removes, renames or re-modes .graphql-server.log at line ${gql_clobber_at}, between its install(1) (line ${gql_install_at}) and the redirect (line ${gql_redirect_at}) — the redirect then re-creates it at the caller's umask"
         else
-            ok "start_graphql_server installs .graphql-server.log at 0600 BEFORE the redirect (lines ${gql_install_at} < ${gql_redirect_at}) and nothing clobbers it in between (SEC-BE-003)"
+            ok "start_graphql_server installs .graphql-server.log at 0600 BEFORE the redirect (lines ${gql_install_at} < ${gql_redirect_at}) and nothing clobbers it in between"
         fi
     fi
     rm -f "${STATE_DIR}/.graphql-server.log"
@@ -1246,11 +1246,11 @@ else
 fi
 
 # ── Test 23: teardown_on_failure EXIT trap tears down a failed partial setup ─
-# Exercises the exact call chain SEC-BE-015 added: EXIT trap -> teardown_on_
+# Exercises the exact call chain the teardown hardening added: EXIT trap -> teardown_on_
 # failure -> do_teardown -> stop_service -> pid_matches_service, with the trap
 # firing from a genuinely non-zero exit (so $? at trap-entry is 1, the specific
-# condition TEST-018 says pid_matches_service's bare-return bug depended on).
-echo "Test 23: teardown_on_failure tears down services started before a failed setup exits (TEST-022, TEST-018)"
+# condition pid_matches_service's bare-return bug depended on).
+echo "Test 23: teardown_on_failure tears down services started before a failed setup exits"
 spawn_named rest-api; trap_pid=$REPLY
 record_pid rest-api "$trap_pid"
 (
@@ -1262,7 +1262,7 @@ assert_dead "$trap_pid" "EXIT trap's do_teardown kills the service this run star
 assert_no_file "${STATE_DIR}/.rest-api.pids" "EXIT trap's do_teardown clears the pid log"
 
 # ── Test 24: the same trap is a no-op once SETUP_IN_PROGRESS is cleared ─────
-# Covers the OTHER arm TEST-022 calls out: a successful setup clears
+# Covers the OTHER arm of the teardown regression: a successful setup clears
 # SETUP_IN_PROGRESS after write_config, so the trap must not tear down the
 # services it just started on a normal, successful exit.
 echo "Test 24: the teardown_on_failure trap is a no-op once SETUP_IN_PROGRESS is cleared"
@@ -1278,9 +1278,9 @@ assert_alive "$safe_pid" "disarmed trap leaves a successfully-started service ru
 kill -9 "$safe_pid" 2>/dev/null || true
 clear_recorded_pids soap-service
 
-# Test 24b (TEST-011): Tests 23/24 above register `trap 'teardown_on_failure'
+# Test 24b: Tests 23/24 above register `trap 'teardown_on_failure'
 # EXIT` THEMSELVES, inside their own subshell — real coverage of what the
-# function does, but none of the regression TEST-022 names (a failed partial
+# function does, but none of the regression this covers (a failed partial
 # setup leaving unauthenticated listeners running) depends on main() actually
 # performing that registration. MEASURED on a scratch copy: deleting
 # `SETUP_IN_PROGRESS=true` and `trap 'teardown_on_failure' EXIT` from main()
@@ -1288,11 +1288,11 @@ clear_recorded_pids soap-service
 # never touch main() at all. Mirrors install-chrome-selftest.sh case p, which
 # extracts main()'s body with awk rather than trusting a whole-file grep.
 #
-# TEST-014: the three checks below were unordered PRESENCE greps, and the
+# The three checks below were unordered PRESENCE greps, and the
 # property that matters is POSITION. MEASURED: hoisting `SETUP_IN_PROGRESS=false`
 # from after write_config up to just after the trap arm makes the failure
 # teardown a no-op across the entire service-start span -- fully restoring the
-# TEST-022 regression -- and all three greps still matched, so the suite stayed
+# teardown regression -- and all three greps still matched, so the suite stayed
 # at 65/0/0 and exited 0 while the third assertion's own message ("clears ...
 # AFTER a successful write_config") had become false. Line numbers inside the
 # same awk-extracted body settle it, the way install-chrome-selftest case u does
@@ -1341,7 +1341,7 @@ if [ -n "${trap_at}" ] && [ -n "${firststart_at}" ] && [ "${trap_at}" -lt "${fir
 else
     fail "the teardown_on_failure trap is armed after the first service start — an early failure leaks listeners"
 fi
-# TEST-015: reworded, because the old text ("AFTER write_config succeeds") claimed
+# Reworded, because the old text ("AFTER write_config succeeds") claimed
 # more than a line-number comparison can know. This assertion compares POSITIONS
 # inside main()'s body; it says nothing about execution or exit status. Measured:
 # wrapping main()'s write_config call in a never-true conditional left the suite at
@@ -1350,7 +1350,7 @@ fi
 if [ -n "${disarm_at}" ] && [ -n "${writecfg_at}" ] && [ "${disarm_at}" -gt "${writecfg_at}" ]; then
     ok "SETUP_IN_PROGRESS=false is positioned AFTER main()'s write_config call"
 else
-    fail "SETUP_IN_PROGRESS=false is cleared before write_config completes — the trap is a no-op for the whole start span, restoring the TEST-022 regression"
+    fail "SETUP_IN_PROGRESS=false is cleared before write_config completes — the trap is a no-op for the whole start span, restoring the teardown regression"
 fi
 # And the claim the position comparison cannot make: that the call is REACHED.
 # main()'s statements sit at one level of indentation; a call nested deeper is
@@ -1378,7 +1378,7 @@ python3 and (lsof or ss) required=2
 node-listener sub-cases need the staged stand-in=1
 lsof and python3 required=3
 pgrep required=2
-could not build an lsof-free PATH for the SEC-BE-008 check=2
+could not build an lsof-free PATH for the teardown-identity check=2
 timeout/gtimeout, curl, and python3 required=1
 timeout/gtimeout, dirname, and sleep required=2
 start_graphql_server log-mode and ordering assertions (install-line extraction failed above)=4
@@ -1405,13 +1405,13 @@ echo ""
 echo "──────────────────────────────────────────"
 echo "Passed: ${PASS}   Skipped: ${SKIP}   Failed: ${FAIL}"
 echo "──────────────────────────────────────────"
-# Assertion accounting (TEST-006): this file had no EXPECTED_ASSERTIONS pin at
+# Assertion accounting: this file had no EXPECTED_ASSERTIONS pin at
 # all before this line, so deleting a whole Test block silently shrank PASS
 # with nothing to compare it against — the exact deletion-detection gap
 # install-chrome-selftest.sh and test-runner-args.sh already close for
 # themselves.
 #
-# TEST-015: the pin used to be gated on `SKIP -eq 0`, which switched it OFF in
+# The pin used to be gated on `SKIP -eq 0`, which switched it OFF in
 # precisely the environments most likely to differ from the author's. Every
 # trigger here is ambient (python3/lsof/ss/pgrep/curl/timeout/stat), so on a host
 # missing any one of them the pin stopped being checked at all: deleting a whole
@@ -1419,7 +1419,7 @@ echo "────────────────────────�
 # exited 0. It is now enforced UNCONDITIONALLY against pass+fail+credit.
 #
 # The credits are a DERIVED INVARIANT, not a frozen literal list (this record
-# went stale once already — see TEST-002's twin in install-chrome-selftest.sh):
+# went stale once already — see this note's twin in install-chrome-selftest.sh):
 # the credits of the skip arms that actually fired, plus the observed
 # pass+fail, always total EXPECTED_ASSERTIONS. Each credit equals the number of
 # counted outcomes its guarded block would have emitted on a fully-equipped
@@ -1438,13 +1438,13 @@ echo "────────────────────────�
 # without updating these two numbers, the assertion fails and names the delta.
 # Line numbers are deliberately absent — they are what rots.
 #
-# 80 = 74 (round-15 baseline) + 2 (C1: the two Test 18b structural pins
-# restored, D2 — both layers, source pin and Go behavioural test, are kept
-# deliberately) + 3 (C3: TEST-009's two ALL_TARGETS-exhaustiveness assertions
-# plus the grpc-server loopback-bind pin) + 1 (C4: the SEC-BE-003 pid-log mode
-# assertion in Test 22). C2 and C5 are net zero: C2 rebalances Test 16's
-# cp-failure arm with a credited skip instead of adding a real assertion; C5
-# trades one Go test for another with no shell-side pin at all.
+# 80 = 74 (round-15 baseline) + 2 (the two Test 18b structural pins restored;
+# both layers, source pin and Go behavioural test, are kept deliberately)
+# + 3 (the two ALL_TARGETS-exhaustiveness assertions plus the grpc-server
+# loopback-bind pin) + 1 (the pid-log mode assertion in Test 22). Two further
+# changes were net zero: rebalancing Test 16's cp-failure arm with a credited
+# skip instead of a real assertion, and trading one Go test for another with no
+# shell-side pin at all.
 # ROUND-16: 80 -> 83. MEASURED. +2 in the Test 22 mode block (the graphql log's
 # 0600 mode, and that start_graphql_server still creates it with install(1)
 # rather than a bare redirection) -- that write was hardened last round with NO
@@ -1465,7 +1465,7 @@ echo "────────────────────────�
 # already gone stale twice. The ALL_TARGETS bidirectional check is net zero — it
 # replaced the liveness-only sentinel rather than adding to it.
 #
-# 84 -> 85. MEASURED. +1 in 1ea83e0, which replaced the SEC-BE-003 log-mode
+# 84 -> 85. MEASURED. +1 in 1ea83e0, which replaced the log-mode
 # TEXTUAL scan with a run of the real start_graphql_server under umask 0 against a
 # stubbed node, then stat'd the file the service actually writes. A clobber spelled
 # through the function's own variable --

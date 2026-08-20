@@ -225,7 +225,7 @@ load_config() {
             # regex still admits '@'/':' in the VALUE, so
             # REST_API_PORT=@evil.com would pass both checks and, unvalidated,
             # make _probe_target_host build a URL curl parses as userinfo +
-            # an attacker-chosen host (SEC-BE-011). Every allowlisted key
+            # an attacker-chosen host. Every allowlisted key
             # except TARGETS_SETUP is a TCP port, so require a numeric
             # 1-65535 value for those, and a plain target-list charset for
             # TARGETS_SETUP.
@@ -244,7 +244,7 @@ load_config() {
                     # with no value), not a tampered one. Warning on that
                     # trains readers to scroll past the one alarm that
                     # matters when a value is genuinely malformed
-                    # (SEC-BE-014). Every other consumer already reads
+                    #. Every other consumer already reads
                     # ${VAR:-default}, so skipping silently changes nothing
                     # about the resolved port.
                     if [ -z "$value" ]; then
@@ -516,7 +516,7 @@ test_rest_api() {
     # templated path such as "/api/{slug}" — which merge-slugs is designed to
     # produce. scan-rest already has this literal check; without it here the
     # fixture's capability claim rests on a wildcard-tolerant matcher
-    # (PR #187 review finding TEST-001).
+    # (PR #187 review).
     if grep -q "/api/subscribe" "$spec_file"; then
         log_ok "rest-api: /api/subscribe present (generate's ExtractForms augmentation ran)"
     else
@@ -529,8 +529,8 @@ test_rest_api() {
     # exact path key), and that the form's urlencoded body fields (email, name)
     # surface as request-body schema properties UNDER THAT ENDPOINT
     # (assert_form_body_fields). Without these, the fixture's POST-method + body
-    # -field expectations for /api/subscribe were inert (PR #187 review finding
-    # TEST-006). These are the same helpers forms-target uses; $expected already
+    # -field expectations for /api/subscribe were inert (PR #187 review)
+    # . These are the same helpers forms-target uses; $expected already
     # points at rest-api/expected-paths.json, which now carries post_form_paths
     # and post_form_body_fields_by_path for /api/subscribe.
     #
@@ -538,7 +538,7 @@ test_rest_api() {
     # registers no /api/subscribe handler, so the catch-all mux serves the
     # crawler's GET probe as 200 text/html (the index page), NOT a 404. The GET
     # stays out of the spec via non-API/HTML content-type classification, not via
-    # a 404/confidence filter (PR #208 review finding TEST-002).
+    # a 404/confidence filter (PR #208 review).
     if ! assert_post_get_operations "$spec_file" "$expected"; then
         failures=$((failures + 1))
     fi
@@ -546,7 +546,7 @@ test_rest_api() {
         failures=$((failures + 1))
     fi
 
-    # TEST-001 (PR #208): lock the per-path method sets this fixture declares.
+    # PR #208 review: lock the per-path method sets this fixture declares.
     # expected-paths.json intentionally lists /api/login and /api/upload as
     # GET-only here (two-stage crawl + generate --probe=false: no JS runs, the
     # inline fetch POST literals are recovered statically as GET candidates); a
@@ -562,7 +562,7 @@ test_rest_api() {
     # naming, ordering) varies between runs. Exact spec-text comparison is done
     # in test_generate_rest, which uses a fixed import as input. The path COUNT
     # is deterministic (same recovered set as scan-rest) and IS asserted below
-    # (TEST-004).
+    #.
 
     local endpoint_count
     endpoint_count=$(count_spec_endpoints "$spec_file")
@@ -574,7 +574,7 @@ test_rest_api() {
     # scan (see the fixtures' lockstep note), so — exactly as test_scan_rest
     # already does against the same server — a regression that emitted the
     # expected paths plus spurious ones must not report PASS with a mismatched
-    # pair of numbers in the summary (PR #187 review finding TEST-004).
+    # pair of numbers in the summary (PR #187 review).
     if ! assert_exact_path_count "rest-api" "$endpoint_count" "$expected_count"; then
         failures=$((failures + 1))
     fi
@@ -656,7 +656,7 @@ test_scan_rest() {
         failures=$((failures + 1))
     fi
 
-    # As with test_rest_api (TEST-006): prove ExtractForms produced a POST-only
+    # As with test_rest_api: prove ExtractForms produced a POST-only
     # /api/subscribe operation with its urlencoded body fields (email, name)
     # attached to that endpoint, not merely that the path string appears.
     # $expected here points at rest-api/scan-expected-paths.json (kept in
@@ -664,7 +664,7 @@ test_scan_rest() {
     #
     # As in test_rest_api, GET-absence here is enforced by non-API/HTML
     # classification — the unrouted /api/subscribe is served 200 text/html by the
-    # catch-all mux, NOT a 404 (PR #208 review finding TEST-002).
+    # catch-all mux, NOT a 404 (PR #208 review).
     if ! assert_post_get_operations "$spec_file" "$expected"; then
         failures=$((failures + 1))
     fi
@@ -672,7 +672,7 @@ test_scan_rest() {
         failures=$((failures + 1))
     fi
 
-    # TEST-001 (PR #208): the scan counterpart. scan-expected-paths.json lists
+    # PR #208 review: the scan counterpart. scan-expected-paths.json lists
     # /api/login and /api/upload as GET+POST here (single-stage headless scan: JS
     # fires the POSTs and probing observes them), diverging from the two-stage
     # fixture on exactly those two paths. Locking both sides makes the
@@ -689,7 +689,7 @@ test_scan_rest() {
     # Exact-count: validate_path_coverage only detects MISSING paths, so without
     # this a scan regression that emitted the expected paths plus spurious ones
     # would report PASS with a mismatched pair of numbers in the summary
-    # (PR #187 review finding TEST-002).
+    # (PR #187 review).
     if ! assert_exact_path_count "scan-rest" "$endpoint_count" "$expected_count"; then
         failures=$((failures + 1))
     fi
@@ -708,7 +708,7 @@ test_scan_rest() {
 # generated spec. It is called identically by test_concat_spa (single-stage
 # scan) and test_concat_spa_two_stage (two-stage crawl+generate) so the two
 # tests stay directly comparable while the battery lives in one place
-# (LAB-3892 review, TEST-001). The four checks + exact-count assertion are
+# (LAB-3892 review). The four checks + exact-count assertion are
 # preserved exactly; see test_concat_spa for what each layer proves.
 #
 # It follows the existing resolve_port_or_die convention of returning multiple
@@ -1110,7 +1110,7 @@ test_forms_target() {
         failures=$((failures + 1))
     fi
     # Each POST form action must carry a POST operation and NO GET operation,
-    # scoped to its own path block (TEST-003: assert_post_get_operations walks the
+    # scoped to its own path block (assert_post_get_operations walks the
     # spec per exact path key instead of whole-file grepping a summary line). This
     # covers both the "POST present" half (extraction/classification reached the
     # spec) and the "GET absent" half (the crawler's 404 GET probes were filtered).
@@ -1148,7 +1148,7 @@ test_forms_target() {
         failures=$((failures + 1))
     fi
 
-    # Value-blanking guard (TEST-001): ExtractForms blanks hidden/password/CSRF
+    # Value-blanking guard: ExtractForms blanks hidden/password/CSRF
     # field VALUES while keeping their names. The fixture seeds distinctive
     # sentinels on the hidden fields (test/forms-target/main.go: csrf_token,
     # _token); assert neither leaks into either generated spec. A regression that
@@ -2399,7 +2399,7 @@ test_import_malformed() {
     # panic / goroutine stack trace (LAB-3890 T3, gap B3). The detection itself
     # lives in validate.sh:assert_no_panic so validate_test.sh can regression-test
     # the regex; this thin wrapper keeps sharing this function's `failures` via
-    # bash dynamic scoping (PR #187 review finding TEST-002).
+    # bash dynamic scoping (PR #187 review).
     check_panic() {
         assert_no_panic "$1" "$2" || failures=$((failures + 1))
     }
@@ -2492,7 +2492,7 @@ test_ssrf_rejection() {
     # a reason unrelated to what it asserts. No server and no browser needed —
     # rejection happens before any connection.
     #
-    # SCOPE (PR #187 review finding SEC-BE-002): vespasian gates private/loopback
+    # SCOPE (PR #187 review): vespasian gates private/loopback
     # traffic on TWO independent surfaces, each with its own
     # --dangerous-allow-private bypass — the crawl frontier asserted above, and
     # the separate probe path (GenerateCmd, cmd/vespasian/main.go:472; enabled by
@@ -2558,7 +2558,7 @@ test_auth_capture() {
     # file, with no proof the header is attached to the right request. This
     # requires exactly one imported entry whose method/url round-tripped from the
     # fixture and whose Authorization header carries the fixture's token
-    # (PR #187 review finding TEST-003).
+    # (PR #187 review).
     local result rc=0
     result=$(python3 - "$imported_file" << 'PYEOF'
 import json, sys
@@ -2605,7 +2605,7 @@ PYEOF
 
     # Measured, not hardcoded — the summary row must report what was actually
     # imported, not a literal that would keep reading "1" even if the import
-    # stopped producing entries entirely (PR #187 review finding TEST-003).
+    # stopped producing entries entirely (PR #187 review).
     local entry_count
     entry_count=$(json_len "$imported_file")
 
@@ -3181,7 +3181,7 @@ urls = [r['url'] for r in data]
 beyond = [u for u in urls if '/deep/4' in u or '/deep/5' in u or '/deep/6' in u]
 # Positive side of the boundary: --depth 2 from seed /deep/1 MUST actually reach
 # /deep/2 or /deep/3. Without this, an under-crawl that stops at the seed also
-# reports zero /deep/4+ and would pass green (PR #187 review finding TEST-003).
+# reports zero /deep/4+ and would pass green (PR #187 review).
 reached = [u for u in urls if '/deep/2' in u or '/deep/3' in u]
 print(len(beyond), len(reached))
 PYEOF
@@ -3191,7 +3191,7 @@ PYEOF
         # Both counts come from word-splitting one line of python stdout, so a
         # change to that print format yields garbage rather than a number.
         # assert_within_depth rejects a non-numeric value on EITHER side; the
-        # old inline check guarded only reached_depth (PR #187 finding TEST-004).
+        # old inline check guarded only reached_depth (PR #187 review).
         if assert_within_depth "Depth limit" "$beyond_depth" "$reached_depth"; then
             log_ok "Depth limit: stayed within depth 2 and followed ${reached_depth} link(s) past the seed"
         else
@@ -3231,8 +3231,7 @@ PYEOF
         # — CI has shown "visited 10 page(s) (limit=10)" across runs. A floor
         # below 10 would let a regression that crawled only a few of the 20 links
         # still pass; matching the exact upper bound the function already asserts
-        # closes that slack (PR #187 review finding TEST-020, tightened per PR
-        # #208 review finding TEST-004).
+        # closes that slack (PR #187 review, tightened per PR #208 review).
         if assert_max_pages "Max-pages limit" "$page_count" 10 10; then
             log_ok "Max-pages limit: visited ${page_count} page(s) (limit=10)"
         else
@@ -3901,7 +3900,7 @@ main() {
 
     log_header "Vespasian Live Test Runner"
 
-    # VESPASIAN and RESULTS_DIR are ambient env-override seams (SEC-BE-012):
+    # VESPASIAN and RESULTS_DIR are ambient env-override seams:
     # generic names that unrelated tooling in a devcontainer or image build
     # could set, silently redirecting which binary is under test or where
     # results land. Logging the effective values makes an ambient override

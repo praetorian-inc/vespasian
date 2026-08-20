@@ -203,7 +203,7 @@ TMP_KEYRING="${TEST_ROOT}/usr/share/keyrings/google-chrome-vespasian-temp.gpg"
 # a stale local package cannot win over the origin this run trusts either.
 TMP_PREF="${TEST_ROOT}/etc/apt/preferences.d/google-chrome-vespasian-temp.pref"
 
-# Mutual exclusion for the whole apt-wiring lifecycle (SEC-BE-007). TMP_LIST,
+# Mutual exclusion for the whole apt-wiring lifecycle. TMP_LIST,
 # TMP_KEYRING and TMP_PREF above are FIXED filenames, not per-run, so two
 # concurrent invocations of this script — a postCreateCommand racing a
 # developer's manual run, or two parallel provisioning steps, both patterns
@@ -325,8 +325,8 @@ require_apt() {
 #
 # `timeout` is listed for the same reason flock is refused rather than degraded
 # around (see main()): it is REQUIRED here, not optional. Both privileged apt
-# invocations below hard-code `$SUDO timeout -k 30 N apt-get ...` (SEC-BE-006/
-# SEC-BE-008), so on a host without it the run died at `apt-get update` with
+# invocations below hard-code `$SUDO timeout -k 30 N apt-get ...`, so on a host
+# without it the run died at `apt-get update` with
 # "apt-get update failed or timed out (held dpkg lock, or an unreachable
 # mirror)" — three wrong diagnoses, none of them the missing binary.
 #
@@ -516,7 +516,7 @@ verify_apt_origin() {
     # $SUDO for the same reason as above — the call is read-only.
     policy=$(timeout -k 5 30 apt-cache policy google-chrome-stable 2>/dev/null) || policy=""
 
-    # Read the CANDIDATE's version, not the `***` marker (SEC-BE-002). `***`
+    # Read the CANDIDATE's version, not the `***` marker. `***`
     # flags ONLY the installed version, and a package that is not yet
     # installed has no `***` line in its version table at all — anchoring
     # there made this check refuse on every host BEFORE the package was
@@ -547,7 +547,7 @@ verify_apt_origin() {
     # without that prefix is what makes this work whether or not the package
     # is installed yet.
     #
-    # SEC-BE-001: `$1 == ver` alone cannot tell a VERSION row from a SOURCE
+    # `$1 == ver` alone cannot tell a VERSION row from a SOURCE
     # row. `apt-cache policy`'s version table alternates
     # `<version> <priority>` lines with `   <priority> <scheme>://...` lines
     # beneath them, and a bare-integer Debian version ("500", "1001" are both
@@ -581,7 +581,7 @@ verify_apt_origin() {
         log_fail "google-chrome-stable was satisfied from an unexpected origin: ${origin:-unknown} (expected dl.google.com)" >&2
         return 1
     fi
-    # SEC-BE-002: the host alone is not the whole property. Two gaps it left:
+    # The host alone is not the whole property. Two gaps it left:
     #
     #   * SCHEME. `http://dl.google.com/...` passed, because only the text after
     #     `://` was compared. A plaintext apt transport for the right host is still
@@ -672,7 +672,7 @@ suppress_permanent_repo() {
         # `|| true` would treat 2 exactly like 1 and silently write out a file
         # containing only our opt-out, discarding whatever settings we could not
         # read. Only 0 and 1 are acceptable here.
-        # SEC-BE-002: re-verify the link guards INSIDE the privileged read.
+        # Re-verify the link guards INSIDE the privileged read.
         #
         # The [ -L ] and nlink checks above run in the caller's shell, minutes of
         # wall-clock and several privileged commands before this read. That is a
@@ -741,7 +741,7 @@ in_container() {
     case "${REMOTE_CONTAINERS:-}" in
         true | True | TRUE | 1) return 0 ;;
     esac
-    # $container is validated against known runtime names (SEC-BE-004), not
+    # $container is validated against known runtime names, not
     # accepted as any non-empty value: it is a bare, lowercase,
     # un-namespaced systemd convention -- far more collidable than the two
     # marker paths above, and unlike VESPASIAN_TEST_ROOT it is read straight
@@ -783,7 +783,7 @@ INSTALL_ATTEMPTED=0
 INSTALL_SUCCEEDED=0
 
 # Set to 1 only once flock has actually granted THIS run exclusive ownership
-# of the shared apt-wiring lifecycle (SEC-BE-008) — see the lock acquisition
+# of the shared apt-wiring lifecycle — see the lock acquisition
 # in main() for where. A run that never held the lock (the 300s timeout
 # branch, or the flock-absent degrade) cannot tell its OWN temporary wiring
 # apart from a CONCURRENT run's, so cleanup_all must not blindly tear either
@@ -811,7 +811,7 @@ cleanup_all() {
     # that ADDED standing egress. remove_phone_home is an rm -f of fixed paths,
     # so it is idempotent and safe to reach twice.
     #
-    # Gated on in_container() too (SEC-BE-006): a run that died mid-install
+    # Gated on in_container() too: a run that died mid-install
     # never reached main()'s own container-aware removal below, so this is the
     # only place that decision gets made for a failed run — but "a failed run
     # leaves no working Chrome whose update channel is worth preserving" is
@@ -831,7 +831,7 @@ cleanup_all() {
     # delete a pre-existing Chrome's update channel on a developer's machine —
     # undoing the in_container check on that path by the back door.
     #
-    # Guarded on LOCK_HELD too (SEC-BE-008): TMP_LIST/TMP_KEYRING/TMP_PREF and
+    # Guarded on LOCK_HELD too: TMP_LIST/TMP_KEYRING/TMP_PREF and
     # the phone-home paths are FIXED filenames shared by every run, and this
     # trap fires on the lock-timeout `exit 1` too — at which point THIS run
     # never held the lock and cannot tell its own wiring apart from a
@@ -850,7 +850,7 @@ cleanup_all() {
     if [ "$LOCK_HELD" -eq 1 ]; then
         if [ "$INSTALL_ATTEMPTED" -eq 1 ] && [ "$INSTALL_SUCCEEDED" -ne 1 ]; then
             if in_container; then
-                # log_warn, not a bare `|| true` (SEC-BE-005): the tolerance
+                # log_warn, not a bare `|| true`: the tolerance
                 # itself must stay (an expired sudo credential cache, a
                 # read-only mount, or an immutable attribute must not abort
                 # the rest of this handler under errexit), but a removal that
@@ -862,7 +862,7 @@ cleanup_all() {
                 # is fixed.
                 remove_phone_home || log_warn "Could not remove all google-chrome phone-home artifacts — a Google apt source, keyring, or update pinger may remain. Remove ${PHONE_HOME_PATHS[*]} by hand."
             else
-                log_warn "Failed install left the google-chrome apt source and updater in place (not a container — see SEC-BE-006)."
+                log_warn "Failed install left the google-chrome apt source and updater in place (not a container — see cleanup_all's in_container gate)."
             fi
         fi
         cleanup_apt_wiring || log_warn "Could not remove this run's temporary apt wiring — ${TMP_LIST}, ${TMP_KEYRING}, and/or ${TMP_PREF} may remain. Remove them by hand."
@@ -880,7 +880,7 @@ cleanup_all() {
 # INSTALL_SUCCEEDED) that the EXIT trap reads have to be set at exact points in
 # this one sequence — splitting it would scatter that ordering across
 # functions rather than removing it.
-# QUAL-006: main() is deliberately one long linear function (~320 lines, ~19 decision
+# Main() is deliberately one long linear function (~320 lines, ~19 decision
 # points) rather than a set of helpers, and this comment is the rubric's required
 # justification rather than an excuse.
 #
@@ -890,7 +890,8 @@ cleanup_all() {
 # BEFORE apt-get install so the postinst never creates the phone-home artifacts;
 # verify the apt origin both before AND after the install, because the postinst can
 # change it mid-install; set INSTALL_SUCCEEDED only after the install returns. Three
-# separate review findings (TEST-005, TEST-007 and case u's ordering anchors) turn on
+# separate review findings (the two comment-stripping fixes and case u's ordering
+# anchors) turn on
 # those relative positions, and the guard suite asserts them by LINE NUMBER inside
 # this function's own body.
 #
@@ -913,7 +914,7 @@ main() {
 
     # The scratch dir and its teardown are set up BEFORE the idempotency check,
     # because that path now also removes phone-home artifacts and so needs both.
-    # SEC-BE-004: pin the parent instead of inheriting $TMPDIR. Every file staged
+    # Pin the parent instead of inheriting $TMPDIR. Every file staged
     # here is subsequently `install`-ed into a root-owned location, so a TMPDIR
     # pointing at a non-sticky directory another local user can write to would let
     # them swap the staged apt source or keyring between staging and install. /tmp's
@@ -967,12 +968,12 @@ main() {
         # and this whole block runs as root whenever the script itself does (a
         # Dockerfile RUN, a devcontainer postCreateCommand, or install-chrome-e2e)
         # — the same guard suppress_permanent_repo applies to the defaults file,
-        # for the same two reasons (SEC-BE-006). A symlink here would redirect
+        # for the same two reasons. A symlink here would redirect
         # a root-owned open at a target of the planter's choosing; a hardlink
         # defeats the symlink guard from the read side the same way it does for
         # the defaults file.
         #
-        # Create ONLY when absent (SEC-BE-004). The previous line here was an
+        # Create ONLY when absent. The previous line here was an
         # unconditional `install -m 0644 -- /dev/null "$LOCK_FILE"`, and
         # `install(1)` unlinks the destination before creating it — so every run
         # got a FRESH INODE and `flock` serialised nothing. Reproduced directly:
@@ -989,7 +990,7 @@ main() {
             $SUDO install -m 0644 -- /dev/null "$LOCK_FILE"
         fi
 
-        # SEC-BE-001: the guards run AFTER the create and immediately before the
+        # The guards run AFTER the create and immediately before the
         # open, so they inspect the very inode `exec` is about to attach to.
         #
         # They used to sit ABOVE the create, wrapped in `if [ -e "$LOCK_FILE" ]`,
@@ -1096,7 +1097,7 @@ main() {
             exit 1
         fi
         # Only now does this run own the shared apt-wiring lifecycle
-        # (SEC-BE-008) — see LOCK_HELD's declaration for why cleanup_all reads
+        # — see LOCK_HELD's declaration for why cleanup_all reads
         # this before touching TMP_LIST/TMP_KEYRING/TMP_PREF or the phone-home
         # paths. With the degrade path gone, LOCK_HELD=0 now means exactly one
         # thing: this run never acquired the lock, and therefore never wrote any
@@ -1172,11 +1173,11 @@ main() {
     # Both apt invocations are bounded, the same reasoning as the key fetch
     # above: a held dpkg/apt lock or a tarpitted mirror would otherwise wedge
     # this run indefinitely with the temporary Google source still live in
-    # /etc (SEC-BE-008). DPkg::Lock::Timeout turns a held lock into a
+    # /etc. DPkg::Lock::Timeout turns a held lock into a
     # diagnosable apt error instead of a silent hang; `timeout` is the outer
     # backstop for every other way an apt run can wedge.
     #
-    # $SUDO in the COMMAND-NAME position, not `timeout $SUDO apt-get` (SEC-BE-010):
+    # $SUDO in the COMMAND-NAME position, not `timeout $SUDO apt-get`:
     # on the unprivileged path $SUDO is "sudo", and `timeout N $SUDO apt-get`
     # ran `timeout` itself as the invoking user while `sudo`/`apt-get` ran as
     # root — signal permission requires the sender's UID to match the
@@ -1187,7 +1188,7 @@ main() {
     # the position every other call site in this file already unquotes
     # without a shellcheck exemption, so none is needed here either.
     #
-    # `-k 30` (SEC-BE-006): apt defers SIGTERM while a dpkg transaction is in
+    # `-k 30`: apt defers SIGTERM while a dpkg transaction is in
     # flight, so the plain TERM on expiry can leave the process still running
     # at the 300s/900s mark. `-k 30` has timeout follow up with SIGKILL 30s
     # later if apt-get is still alive, so a wedged run is bounded even when it
@@ -1236,7 +1237,7 @@ main() {
     if in_container; then
         remove_phone_home
     else
-        # NOT "leaving the apt source and updater alone" (SEC-BE-009): unlike
+        # NOT "leaving the apt source and updater alone": unlike
         # the idempotent early-exit branch above, suppress_permanent_repo
         # already ran on THIS path (unconditionally, before apt-get install),
         # so the package's postinst never created its own apt source or daily
@@ -1284,9 +1285,9 @@ main() {
 # then `install -m 0644`, matching how the keyring is written: the mode is
 # stated at the call site instead of being left to the caller's umask, and the
 # file lands atomically. `tee` did neither.
-# SEC-BE-005: run `<browser> --version` under the same bound chrome_runnable uses,
+# Run `<browser> --version` under the same bound chrome_runnable uses,
 # so a binary that hangs on --version cannot wedge the tail of a provisioning run.
-# SEC-BE-002: reuses common.sh's chrome_probe_budget() for the validated read of
+# Reuses common.sh's chrome_probe_budget() for the validated read of
 # CHROME_PROBE_TIMEOUT (this used to read the raw env var straight into timeout(1)'s
 # duration/option position — an unvalidated zero disabled the bound entirely, and a
 # leading-dash value reached timeout's OPTION position) and timeout_cmd() for the
@@ -1331,7 +1332,7 @@ verify_install() {
     # Log the exact version: this script tracks stable rather than pinning, so
     # the version string is the only record of what actually landed.
     local version
-    # SEC-BE-005: bound this exec the way chrome_runnable bounds its own probe.
+    # Bound this exec the way chrome_runnable bounds its own probe.
     # detect_chrome_binary only reached this point by running the binary under a
     # timeout; re-running it unbounded here reintroduces the hang that bound guards
     # against, at the very end of a root provisioning run and with no diagnostic.

@@ -322,7 +322,7 @@ build_graphql_server() {
     log_info "Installing graphql-server dependencies..."
     cd "${SCRIPT_DIR}/graphql-server"
     if [ ! -d "node_modules" ]; then
-        # SEC-BE-007: `npm ci --ignore-scripts`, matching every other npm call
+        # `npm ci --ignore-scripts`, matching every other npm call
         # site in this repo (both `npm ci --ignore-scripts` invocations in
         # .github/workflows/live-tests.yml). `npm install` runs package lifecycle
         # scripts from the dependency tree, which is arbitrary code execution
@@ -364,7 +364,7 @@ wait_for_http() {
         # probes: without it curl has no default overall timeout, so a
         # service that accepts the TCP handshake and then never responds
         # wedges here forever and the outer $timeout deadline below is never
-        # even reached (SEC-BE-012). run-live-tests.sh:214's sibling probe
+        # even reached. run-live-tests.sh:214's sibling probe
         # already does this; this matches it.
         if curl -sf --max-time 2 -o /dev/null "$url" 2>/dev/null; then
             return 0
@@ -380,7 +380,7 @@ wait_for_http() {
 # (append, not overwrite) so teardown can kill them all, not just the latest.
 record_pid() {
     local name=$1 pid=$2
-    # SEC-BE-003: this log is the sole input to the teardown kill loop, so its
+    # This log is the sole input to the teardown kill loop, so its
     # mode is stated here rather than left to the caller's umask — same
     # reasoning write_config applies to the config file. A subshell umask (not
     # install -m) because this is an APPEND: install would truncate the earlier
@@ -445,9 +445,9 @@ service_default_port() {
 # For it we additionally require the PID to be listening in the service's port
 # window, reusing the same node-in-window identity filter as the orphan sweep
 # (orphan_pids_by_port). If that check CANNOT RUN (lsof unavailable) we accept the
-# match on provenance instead — see the SEC-BE-008 note at the port check below.
+# match on provenance instead — see the note at the port check below.
 # This comment previously said the opposite ("we decline the match"), describing
-# the behaviour from before SEC-BE-008 and telling the next auditor the guard was
+# the behaviour from before that change and telling the next auditor the guard was
 # closed when the code had deliberately opened it.
 pid_matches_service() {
     local pid=$1 name=$2 comm binary base wpid
@@ -457,7 +457,7 @@ pid_matches_service() {
 
     # Explicit return codes, not a bare `return` picking up the `[ ]`
     # test's status: this function is now reachable from the EXIT trap
-    # (SEC-BE-015) below, and a bare `return` inside a function invoked
+    # below, and a bare `return` inside a function invoked
     # from an EXIT trap under `set -e` does not reliably propagate the
     # last command's own status — it can echo back the ORIGINAL exit
     # code that fired the trap instead, silently turning a real match
@@ -477,7 +477,7 @@ pid_matches_service() {
     [ "$comm" = "node" ] || return 1
     base="$(service_default_port "$name")"
     [ -n "$base" ] || return 1
-    # SEC-BE-008: honour "cannot determine" separately from "does not match".
+    # Honour "cannot determine" separately from "does not match".
     # orphan_pids_by_port returns 2 when lsof is absent; treating that as
     # not-a-match (which a bare `for` over its output does, since the loop ignores
     # the exit status) meant teardown declined to kill graphql-server on every host
@@ -517,7 +517,7 @@ pid_matches_service() {
 
 # LIVE_TARGET_BIND_HOST is the same seam FORMS_TARGET_BIND_HOST already gives
 # forms-target, extended to rest-api, soap-service, concat-spa and
-# graphql-server (SEC-BE-015). All four used to bind the wildcard address in
+# graphql-server. All four used to bind the wildcard address in
 # their own main.go/server.js; each now reads BIND_HOST and defaults to
 # 127.0.0.1, mirroring forms-target/main.go (`host := os.Getenv("BIND_HOST")`)
 # and grpc-server, which hardcodes loopback. So the seam is LIVE end to end:
@@ -550,7 +550,7 @@ start_concat_spa() {
     local port=$1
     log_info "Starting concat-spa on port ${port}..."
     cd "${SCRIPT_DIR}/concat-spa"
-    # See LIVE_TARGET_BIND_HOST comment above start_rest_api (SEC-BE-015).
+    # See LIVE_TARGET_BIND_HOST comment above start_rest_api.
     PORT="$port" BIND_HOST="${LIVE_TARGET_BIND_HOST:-127.0.0.1}" ./concat-spa &
     local pid=$!
     record_pid concat-spa "$pid"
@@ -571,7 +571,7 @@ start_forms_target() {
     # forms-target binds loopback by default (matching its own Go default,
     # main.go:95) — an unauthenticated HTTP app with login/register/feedback
     # forms has no business listening on every interface of the operator's
-    # machine unless asked (SEC-BE-013). Widen explicitly for the devcontainer
+    # machine unless asked. Widen explicitly for the devcontainer
     # case (TEST_HOST=host.docker.internal) with:
     #   FORMS_TARGET_BIND_HOST=0.0.0.0 ./test/setup-live-targets.sh
     PORT="$port" BIND_HOST="${FORMS_TARGET_BIND_HOST:-127.0.0.1}" ./forms-target &
@@ -591,7 +591,7 @@ start_soap_service() {
     local port=$1
     log_info "Starting soap-service on port ${port}..."
     cd "${SCRIPT_DIR}/soap-service"
-    # See LIVE_TARGET_BIND_HOST comment above start_rest_api (SEC-BE-015).
+    # See LIVE_TARGET_BIND_HOST comment above start_rest_api.
     PORT="$port" WSDL_PATH="${SCRIPT_DIR}/soap-service/service.wsdl" BIND_HOST="${LIVE_TARGET_BIND_HOST:-127.0.0.1}" ./soap-service &
     local pid=$!
     record_pid soap-service "$pid"
@@ -609,8 +609,8 @@ start_graphql_server() {
     local port=$1
     log_info "Starting graphql-server on port ${port}..."
     cd "${SCRIPT_DIR}/graphql-server"
-    # See LIVE_TARGET_BIND_HOST comment above start_rest_api (SEC-BE-015).
-    # SEC-BE-003: pre-create the log with an explicit mode — a `>` redirect onto
+    # See LIVE_TARGET_BIND_HOST comment above start_rest_api.
+    # Pre-create the log with an explicit mode — a `>` redirect onto
     # an existing file truncates without changing its mode, so the mode has to
     # be set before the truncating redirect below, not after.
     install -m 0600 /dev/null "${STATE_DIR}/.graphql-server.log"
@@ -642,7 +642,7 @@ wait_for_grpc() {
 
     while true; do
         # Each arm is bounded to 2s so the probe itself cannot outlive the
-        # outer $timeout deadline (SEC-BE-012, same shape as wait_for_http).
+        # outer $timeout deadline (same shape as wait_for_http).
         if command -v grpcurl >/dev/null 2>&1; then
             if grpcurl -max-time 2 -plaintext "${host}:${port}" list >/dev/null 2>&1; then
                 return 0
@@ -656,7 +656,7 @@ wait_for_grpc() {
             # spliced into the program text: this is the one listener-spawning
             # script in the repo, and interpolating them into the string would
             # make the two values the only thing separating this from arbitrary
-            # command execution (SEC-BE-016). `_` fills $0 so $1/$2 land where
+            # command execution. `_` fills $0 so $1/$2 land where
             # expected.
             if "$t" 2 bash -c 'echo >/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null; then
                 return 0
@@ -736,7 +736,7 @@ orphan_pids_by_name() {
 orphan_pids_by_port() {
     local base=$1
     local end=$((base + 20)) pid comm
-    # SEC-BE-008: distinguish "no listeners found" from "cannot look". Returning 0
+    # Distinguish "no listeners found" from "cannot look". Returning 0
     # with no output for BOTH made the two indistinguishable to callers, and the
     # consequence was silent: pid_matches_service's graphql-server arm requires a
     # listening socket in the port window, so on a host without lsof it always
@@ -885,7 +885,7 @@ write_config() {
     local targets=$7
 
     # Rendered to a staged file, then installed with an explicit mode
-    # (SEC-BE-014): a bare `cat >` lands at the caller's umask, so under
+    #: a bare `cat >` lands at the caller's umask, so under
     # umask 0 (a Dockerfile RUN commonly runs with one) this config —
     # load_config declare -g's it straight into run-live-tests.sh — would
     # land world-writable. Mirrors install-chrome.sh:424-441's reasoning for
@@ -994,7 +994,7 @@ run_tests_guidance() {
 }
 
 # Set true for the duration of the start-services window and read by the
-# EXIT trap below (SEC-BE-015). Left false the rest of the run so --teardown,
+# EXIT trap below. Left false the rest of the run so --teardown,
 # --skip-start, --help, and a normal successful exit never trigger it.
 SETUP_IN_PROGRESS=false
 
@@ -1067,7 +1067,7 @@ main() {
     # next service's port check sees the previous one as occupied.
     log_header "Starting Services"
 
-    # Arm the teardown trap for this window only (SEC-BE-015). INT/TERM exit
+    # Arm the teardown trap for this window only. INT/TERM exit
     # THROUGH the EXIT trap (128+signo) rather than calling teardown_on_failure
     # directly: a signal handler that doesn't exit RETURNS to the interrupted
     # code afterward and the script would carry on starting more services with

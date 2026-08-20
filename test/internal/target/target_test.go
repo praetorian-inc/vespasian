@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-// TEST-009 / TEST-016. The loopback default and the header-read bound are
-// security controls (SEC-BE-015, SEC-BE-007), and until now the only thing
+// The loopback default and the header-read bound are
+// security controls, and until now the only thing
 // pinning them was a source-text grep in test/setup-live-targets_test.sh
 // (Test 18b). That grep was defeated twice: its ReadHeaderTimeout pattern
 // `[0-9]+ \* time\.Second` matches `0 * time.Second`, the exact value it

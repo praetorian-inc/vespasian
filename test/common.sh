@@ -86,7 +86,7 @@ CHROME_CANDIDATES=(
 # nine times for one misconfiguration.
 _CHROME_BUDGET_WARNED=""
 
-# The single validated reader of CHROME_PROBE_TIMEOUT (SEC-BE-002). Two callers
+# The single validated reader of CHROME_PROBE_TIMEOUT. Two callers
 # today — chrome_runnable below and _bounded_probe in install-chrome.sh, which
 # used to read the raw value straight into timeout(1)'s duration/option
 # position with no validation of its own.
@@ -138,7 +138,7 @@ chrome_probe_budget() {
 }
 
 # Echoes `timeout`, `gtimeout` (macOS + coreutils), or nothing. Three callers:
-# chrome_runnable and _bounded_probe (install-chrome.sh, SEC-BE-002) share the
+# chrome_runnable and _bounded_probe (install-chrome.sh) share the
 # CHROME_PROBE_TIMEOUT-bounded browser probe; wait_for_grpc (setup-live-
 # targets.sh) reuses only this selection, not the budget validation above — its
 # hardcoded 2s bounds a gRPC connect probe, not a browser probe, and must not

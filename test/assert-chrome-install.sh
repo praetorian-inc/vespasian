@@ -18,7 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 . "${SCRIPT_DIR}/common.sh"
 
-# QUAL-001: check the exit status explicitly, don't just take stdout.
+# Check the exit status explicitly, don't just take stdout.
 # On failure detect_chrome_binary returns non-zero with an EMPTY stdout.
 # The `|| { … }` is what makes that failure actionable: without it the
 # next line ran `"" --headless …`, whose "command not found" is a far

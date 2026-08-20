@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      # Defense-in-depth (LAB-4732 / SEC-BE-002): monitor and record all
+      # Defense-in-depth (LAB-4732): monitor and record all
       # outbound network traffic. Audit mode is non-blocking — it logs egress
       # to the StepSecurity dashboard without enforcing an allowlist. Flip to
       # 'block' with an allowed-endpoints list once telemetry confirms the set.
@@ -92,7 +92,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      # Defense-in-depth (LAB-4732 / SEC-BE-002): monitor and record all
+      # Defense-in-depth (LAB-4732): monitor and record all
       # outbound network traffic. Audit mode is non-blocking — it logs egress
       # to the StepSecurity dashboard without enforcing an allowlist. Flip to
       # 'block' with an allowed-endpoints list once telemetry confirms the set.
@@ -120,7 +120,7 @@ jobs:
           cache: npm
           cache-dependency-path: test/spec-validators/package-lock.json
 
-      # SEC-BE-001: --ignore-scripts prevents install/preinstall/postinstall
+      # --ignore-scripts prevents install/preinstall/postinstall
       # lifecycle scripts from running under harden-runner's non-blocking
       # audit-only egress policy. These validators are pure libraries with no
       # install step, but this protects against a future lockfile refresh
@@ -147,7 +147,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      # Defense-in-depth (LAB-4732 / SEC-BE-002): monitor and record all
+      # Defense-in-depth (LAB-4732): monitor and record all
       # outbound network traffic. Audit mode is non-blocking — it logs egress
       # to the StepSecurity dashboard without enforcing an allowlist. Flip to
       # 'block' with an allowed-endpoints list once telemetry confirms the set.
@@ -246,10 +246,10 @@ jobs:
                    /etc/apt/preferences.d/google-chrome-vespasian-temp.pref; do
             if [ -e "$p" ]; then echo "LEFTOVER: $p"; fail=1; fi
           done
-          # TEST-001: `[ -s ]` passed on any non-empty byte, so a bare newline or
+          # `[ -s ]` passed on any non-empty byte, so a bare newline or
           # a stale record from an earlier image layer satisfied it. Assert the
           # record actually names the browser that was just installed, and that
-          # it landed at the mode SEC-BE-003 requires — the fixture-level case v
+          # it landed at the mode the record is installed with — the fixture-level case v
           # in install-chrome-selftest.sh already checks both, so the real
           # install was being verified less specifically than the mock.
           [ -s /usr/share/vespasian/chrome-version ] || { echo "missing version record"; fail=1; }
@@ -323,7 +323,7 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
-  # Integration-tagged Go tests (LAB-4678 review, TEST-005/REQ-002).
+  # Integration-tagged Go tests (LAB-4678 review).
   #
   # Why this job exists: nothing anywhere passed `-tags=integration`. The Makefile's
   # `test` target is `go test -race ./...` and no workflow set the tag, so 24 tests
@@ -356,10 +356,10 @@ jobs:
       # failure here rather than a skip. Without it every rod row skips and this job
       # reports green having executed none of the browser-only assertions it exists
       # for — the diagnostic step below deliberately decides nothing, so nothing else
-      # would catch that (LAB-4678 review, TEST-014).
+      # would catch that (LAB-4678 review).
       VESPASIAN_REQUIRE_CHROME: "1"
     steps:
-      # Defense-in-depth (LAB-4732 / SEC-BE-002): monitor and record all
+      # Defense-in-depth (LAB-4732): monitor and record all
       # outbound network traffic. Audit mode is non-blocking.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
@@ -418,7 +418,7 @@ jobs:
     env:
       VESPASIAN_NO_SANDBOX: "true"
     steps:
-      # Defense-in-depth (LAB-4732 / SEC-BE-002): monitor and record all
+      # Defense-in-depth (LAB-4732): monitor and record all
       # outbound network traffic. Audit mode is non-blocking — it logs egress
       # to the StepSecurity dashboard without enforcing an allowlist. Flip to
       # 'block' with an allowed-endpoints list once telemetry confirms the set
@@ -456,7 +456,7 @@ jobs:
       # output with real parsers (swagger-parser + graphql-js) instead of grep.
       # Deps are hermetic once installed; the only egress is registry.npmjs.org
       # (already in the anticipated harden-runner allowlist above).
-      # SEC-BE-001: --ignore-scripts prevents install/preinstall/postinstall
+      # --ignore-scripts prevents install/preinstall/postinstall
       # lifecycle scripts from running under harden-runner's non-blocking
       # audit-only egress policy.
       - name: Install spec validators

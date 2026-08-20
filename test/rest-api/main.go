@@ -851,7 +851,7 @@ func main() {
 	mux.HandleFunc("/api/assets/", handleUUIDItem)
 	// /api/users/{id}/orders is routed via handleUserByID
 
-	// SEC-BE-015 / QUAL-007: loopback default and the shared server timeout both
+	// Loopback default and the shared server timeout both
 	// live in test/internal/target, so there is one copy to reason about and one
 	// place for Test 18b to assert.
 	addr := target.Addr(port)

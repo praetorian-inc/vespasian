@@ -9,7 +9,7 @@ import (
 
 // ReadHeaderTimeout bounds how long a client may take to send request headers.
 //
-// SEC-BE-007: rest-api and soap-service previously called
+// Rest-api and soap-service previously called
 // http.ListenAndServe with no server struct at all, and concat-spa set
 // ReadHeaderTimeout: 0 explicitly, each carrying a "test server, timeouts not
 // needed" rationale. That rationale held only while the targets were reachable

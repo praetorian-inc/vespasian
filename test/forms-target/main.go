@@ -87,7 +87,7 @@ func main() {
 		fmt.Fprint(w, `{"results":[],"query":""}`) //nolint:errcheck // test target best-effort
 	})
 
-	// SEC-BE-015 / QUAL-007: loopback default and the shared server timeout both
+	// Loopback default and the shared server timeout both
 	// live in test/internal/target. forms-target keeps its own FORMS_TARGET_BIND_HOST
 	// seam in setup-live-targets.sh; only the in-process resolution is shared.
 	addr := target.Addr(port)

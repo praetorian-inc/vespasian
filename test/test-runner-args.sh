@@ -21,7 +21,7 @@ PASS=0
 FAIL=0
 SKIP=0
 SKIP_CREDIT=0
-# TEST-025: a completion sentinel, matching install-chrome-selftest.sh. Without
+# A completion sentinel, matching install-chrome-selftest.sh. Without
 # it an `exit 0` or an errexit abort part-way through this file printed a run of
 # PASS lines, no summary, and a green CI check — the suite reporting success for
 # the assertions it happened to reach before dying.
@@ -29,10 +29,10 @@ SUITE_COMPLETED=0
 
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1" >&2; }
-# TEST-017: this suite gained one environmental arm (test/.results may already
+# This suite gained one environmental arm (test/.results may already
 # exist from a developer's own run-live-tests.sh run, since that is its default
 # RESULTS_DIR). It takes a credit so the pin below stays exact instead of being
-# switched off, which is the defect TEST-015 records against the sibling suite.
+# switched off, which is the defect the review records against the sibling suite.
 skip() { SKIP=$((SKIP + 1)); SKIP_CREDIT=$((SKIP_CREDIT + ${2:-0})); echo "  SKIP: $1"; }
 
 # All temp configs live under one directory removed by a single EXIT trap, so
@@ -41,7 +41,7 @@ skip() { SKIP=$((SKIP + 1)); SKIP_CREDIT=$((SKIP_CREDIT + ${2:-0})); echo "  SKI
 # because new_tmp is called via command substitution ($(new_tmp)), whose
 # subshell would discard any array registration; a filesystem dir created in the
 # parent and torn down by the trap has no such scoping problem.
-# SEC-BE-006: pin the parent instead of inheriting $TMPDIR. This tree holds
+# Pin the parent instead of inheriting $TMPDIR. This tree holds
 # executable fixtures that get PATH-prepended and RUN, so an inherited TMPDIR
 # pointing at a non-sticky directory a second local user can write to would let
 # them rename it away between creation and use and choose the binaries this suite
@@ -523,7 +523,7 @@ else
     fail "targets_need_config: '*' was glob-expanded against the cwd"
 fi
 
-# TEST-017: every case above drives the predicate with a WHOLE group list
+# Every case above drives the predicate with a WHOLE group list
 # (join_targets of a real array) or a target that shares no characters with any
 # real one ("totally-unknown-target"). None feeds a bare SUBSTRING of a real
 # offline target name, so replacing the whole-word match
@@ -539,7 +539,7 @@ else
     fail "targets_need_config: 'import' was matched as if it were a real target — whole-word anchoring lost (substring match regressed)"
 fi
 
-# TEST-017: the case pattern's `" ${target} "` is deliberately quoted so a
+# The case pattern's `" ${target} "` is deliberately quoted so a
 # glob-metacharacter-bearing target value is matched LITERALLY rather than as
 # a wildcard (see the function's own comment on the here-string vs IFS split).
 # That quoting is untested: a target that is a real offline target name with a
@@ -593,7 +593,7 @@ fi
 # check — deterministically, in every environment.
 #
 # The message must name the EXACT overridden path, not merely contain "vespasian
-# binary not found" (TEST-018). A substring-only match is satisfied just as well
+# binary not found". A substring-only match is satisfied just as well
 # by the default ${PROJECT_ROOT}/bin/vespasian path, which is what a broken
 # VESPASIAN="${VESPASIAN:-...}" indirection (dropped back to a plain assignment
 # that ignores the env override) would report instead — in CI (no build) that
@@ -634,8 +634,8 @@ fi
 # plain assignment, the override would be silently discarded and the
 # real_offline block (which reaches `mkdir -p "$RESULTS_DIR"` before the
 # binary-absent exit) would create test/.results inside this repo checkout —
-# invisible to `git status` because test/.results is gitignored (TEST-020).
-# TEST-017: this check used to be one-shot, and it disabled itself in exactly
+# invisible to `git status` because test/.results is gitignored.
+# This check used to be one-shot, and it disabled itself in exactly
 # the state where the regression is present. The first arm emitted a bare `echo`
 # — neither pass nor fail — so it silently REMOVED itself from the count instead
 # of reporting anything. Measured sequence: on a clean tree the check passes
@@ -664,7 +664,7 @@ else
     pass "RESULTS_DIR override honoured — no test/.results written into the repo checkout by the real-run block"
 fi
 
-# ── Unknown-flag rejection (TEST-020) ──────────────────────────────────────
+# ── Unknown-flag rejection ──────────────────────────────────────
 #
 # run-live-tests.sh's parse loop has a catch-all that names the offending option,
 # prints usage and exits 1 — and NO suite asserted it. Replacing the catch-all
@@ -758,13 +758,13 @@ echo "=== Browser probe shared with common.sh ==="
 #
 # This is a DRIFT guard, in the same spirit as the target-group check above.
 # Both greps below are structural: they are satisfied by a body that calls
-# detect_chrome_binary and throws the answer away (TEST-021), e.g.
+# detect_chrome_binary and throws the answer away, e.g.
 # `detect_chrome_binary >/dev/null 2>&1; return 0`. Make the RESULT
 # load-bearing by extracting chrome_available the same way targets_need_config
 # is above — a sed range over the source, not the whole runner (which calls
 # `main "$@"` unguarded) — and driving it against a fixture CHROME_CANDIDATES.
 chrome_avail_body=$(awk '/^chrome_available\(\) \{/,/^\}/' "$RUNNER")
-# TEST-016: strip comment lines before grepping, the same way the workflow
+# Strip comment lines before grepping, the same way the workflow
 # step-list guards below strip them. Grepping the raw body was a false
 # certification: re-implementing the probe inline and leaving
 # "previously delegated to detect_chrome_binary" in a comment kept this printing
@@ -893,7 +893,7 @@ else
     pass "chrome_available: reports unavailable with only a non-runnable candidate and no rod cache"
 fi
 
-# The rod-cache FALLBACK arm (TEST-016). The two polarities above both leave
+# The rod-cache FALLBACK arm. The two polarities above both leave
 # $HOME without a rod cache, so the `|| [ -d "$HOME/.cache/rod/browser" ]` half
 # of chrome_available was never the deciding term: deleting it entirely kept
 # this suite green. That arm is what lets a host whose only browser is one
@@ -912,7 +912,7 @@ else
 fi
 
 echo ""
-echo "=== print_summary: RESULTS_DIR is data, not format (TEST-019) ==="
+echo "=== print_summary: RESULTS_DIR is data, not format ==="
 # This PR converts print_summary's RESULTS_DIR line from `echo -e` to
 # `printf '%s'`, with an explicit rationale: RESULTS_DIR is env-overridable, so
 # it is data, not format, and must not have backslash escapes interpreted.
@@ -943,7 +943,7 @@ else
 fi
 
 echo ""
-echo "=== print_summary: all-skipped-is-not-a-pass gate (TEST-016 / AC3) ==="
+echo "=== print_summary: all-skipped-is-not-a-pass gate (AC3) ==="
 # The block above declares EMPTY TEST_STATUS/TEST_ENDPOINTS/TEST_EXPECTED/
 # TEST_DURATION arrays precisely so the per-target loop never runs — which
 # also makes total_pass=0 AND total_skip=0, so the AC3 gate's own
@@ -1086,10 +1086,10 @@ fi
 # job enforces it — `skip-live-tests` no longer disables it. This drift guard
 # runs only in the label-gated `test` job, so the parity check lived behind a
 # gate; the richer checks now live in the "rest-api fixture parity" section of
-# validate_test.sh (LAB-5611 / PR #208 review TEST-005/006/007/008).
+# validate_test.sh (LAB-5611 / PR #208 review).
 
 echo ""
-echo "=== load_config value validation (TEST-015 / SEC-BE-011 / SEC-BE-013) ==="
+echo "=== load_config value validation ==="
 # The block above only exercises the KEY half of load_config's allowlist. The
 # format regex still admits '@'/':' in the VALUE, so REST_API_PORT=@evil.com
 # passes both the format check and the key allowlist and, unvalidated, would
@@ -1097,7 +1097,7 @@ echo "=== load_config value validation (TEST-015 / SEC-BE-011 / SEC-BE-013) ==="
 # attacker-chosen host. Drive the real load_config against a config that
 # exercises every value-validation arm: an out-of-charset port, an
 # out-of-range port on both ends, an empty port (must be skipped SILENTLY —
-# SEC-BE-014 — since setup-live-targets.sh's write_config always emits every
+# Since setup-live-targets.sh's write_config always emits every
 # allowlisted key, so a partial setup writes empty values for targets it
 # never configured), and a TARGETS_SETUP value outside its own charset.
 invalid_values_cfg=$(new_tmp)
@@ -1165,12 +1165,12 @@ else
     fail "load_config: GRAPHQL_SERVER_PORT was rebound despite an out-of-range value: $invalid_values_out"
 fi
 
-# SEC-BE-014: an EMPTY port value is "target not set up", not tampering, so it
+# An EMPTY port value is "target not set up", not tampering, so it
 # must be skipped WITHOUT a warning — unlike every other reject case above.
 if printf '%s\n' "$invalid_values_out" | grep -q "GRPC_SERVER_PORT"'.*not a valid port'; then
-    fail "load_config: empty GRPC_SERVER_PORT logged a 'not a valid port' warning — SEC-BE-014 desensitization regressed"
+    fail "load_config: empty GRPC_SERVER_PORT logged a 'not a valid port' warning — the empty-value desensitization regressed"
 else
-    pass "load_config: empty GRPC_SERVER_PORT is skipped without a warning (SEC-BE-014)"
+    pass "load_config: empty GRPC_SERVER_PORT is skipped without a warning"
 fi
 if printf '%s\n' "$invalid_values_out" | grep -qx "RESULT_GRPC_SERVER_PORT=__sentinel_grpc__"; then
     pass "load_config: empty GRPC_SERVER_PORT value not applied (sentinel preserved)"
@@ -1197,7 +1197,7 @@ printf '%s\n' "TARGETS_SETUP=rest-api,soap-service" > "$valid_targets_cfg"
 valid_targets_out=$(
     source "$SCRIPT_DIR/common.sh"
     source <(sed -n '/^load_config()/,/^}/p' "$RUNNER")
-    # N-2: this extraction's two siblings (969-991, 1029-1051) both echo
+    # This extraction's two siblings (969-991, 1029-1051) both echo
     # SENTINEL_LOAD_CONFIG_MISSING out of their subshell and grep for it, so a
     # broken sed range is caught. This copy had neither, so a broken range
     # here would leave the accept-direction assertion below reading an empty
@@ -1234,15 +1234,15 @@ WORKFLOW="$SCRIPT_DIR/../.github/workflows/live-tests.yml"
 # lines strictly between "  <name>:" and the next top-level job key. Defined
 # once, here, so every job-block extraction in this file (preflight_block,
 # e2e_block, test_block, and the hosting-job loop below) shares one
-# implementation instead of four hand-copied ones (TEST-013).
+# implementation instead of four hand-copied ones.
 #
 # The end-of-block regex adds 0-9 to the character class a narrower copy
 # would use ([a-zA-Z_-]+): that narrower class alone stops mid-name on
 # install-chrome-e2e (the digit in "e2e" breaks the match), which would
 # silently swallow the next job's content whenever the search starts at the
-# job immediately before it (N-3). It also compares $0 to the job line
+# job immediately before it. It also compares $0 to the job line
 # EXACTLY, unlike an unanchored `/^  test:/`-style regex, which would also
-# match a future two-space-indented `  test:` key that is not the job (N-5).
+# match a future two-space-indented `  test:` key that is not the job.
 extract_job_block() {
     awk -v job_line="  $1:" '
         $0 == job_line { inblock=1; next }
@@ -1256,21 +1256,21 @@ extract_job_block() {
 # closes preserves the text while changing the meaning, or the reverse (a
 # reordered step key, a paths: filter, a needs: on a sibling job).
 #
-# yq, not python3+PyYAML (binding decision D1-REVISED): PyYAML is NOT on the
+# yq, not python3+PyYAML: PyYAML is NOT on the
 # ubuntu-24.04 runner image, whereas yq 4.53.3 is — a single static Go
 # binary, no interpreter or site-packages provenance problem. yq is also
 # YAML 1.2, where `on` is a plain string key; PyYAML is YAML 1.1, where a
 # bare `on:` parses as the BOOLEAN True, a live footgun for the next
 # maintainer.
 #
-# Absence is a FAIL, never a skip (D1): a guard that cannot run is the exact
+# Absence is a FAIL, never a skip: a guard that cannot run is the exact
 # defect this suite exists to catch. The presence check is memoised once,
 # and on absence this prints the sentinel __NO_YQ__ on stdout rather than
 # calling fail() itself: every call site below reads this via command
 # substitution ($(yq_query ...)), which runs in a SUBSHELL — a fail() call
 # from inside it would increment a subshell-local copy of $FAIL, discarded
-# when the subshell exits, silently UNDER-counting the very hard failure D1
-# requires to be counted (the identical trap AD-3 records for
+# when the subshell exits, silently UNDER-counting the very hard failure this
+# fail-closed rule requires to be counted (the identical trap the sibling review records for
 # chrome_probe_budget in the sibling suite). So each call site's own `case`
 # calls fail_no_yq in the parent shell instead, keeping the counted-outcome
 # total identical whether yq is present or absent.
@@ -1281,7 +1281,7 @@ yq_query() {
     fi
     if [[ "$_YQ_OK" != 1 ]]; then printf '%s\n' '__NO_YQ__'; return 0; fi
     local expr=$1; shift
-    # SELF-3: distinguish a yq FAILURE from a legitimate empty/false answer. yq
+    # Distinguish a yq FAILURE from a legitimate empty/false answer. yq
     # exits non-zero with empty stdout on unparseable YAML; without this, a
     # corrupted live-tests.yml aborted the suite mid-run under `set -e` and was
     # caught only by the whole-suite completion sentinel — fail-closed, but the
@@ -1309,7 +1309,7 @@ fail_no_yq() {
 if [[ ! -f "$WORKFLOW" ]]; then
     fail "live-tests.yml not found at $WORKFLOW"
 else
-    # TEST-020: every script the workflow DIRECT-EXECS must be committed executable.
+    # Every script the workflow DIRECT-EXECS must be committed executable.
     #
     # install-chrome-selftest.sh was 100755 for twenty-one commits and silently
     # became 100644 at 5f45b53 ("assertions now prove, not grep"). live-tests.yml
@@ -1346,7 +1346,7 @@ else
         fi
     fi
 
-    # TEST-018: the per-suite/continue-on-error/if: checks below all operate on
+    # The per-suite/continue-on-error/if: checks below all operate on
     # the preflight-selftest JOB BLOCK, which by construction starts after the
     # `preflight-selftest:` line — so none of them can see the top-level `on:`
     # triggers (line 3 of this file, structurally outside every job block).
@@ -1360,13 +1360,13 @@ else
         true)      pass "live-tests.yml still triggers on pull_request (the un-gated guard suites only run on PRs because of this)" ;;
         *)         fail "live-tests.yml no longer triggers on pull_request — the un-gated guard suites (preflight-selftest, validator-regression) would never run on a PR" ;;
     esac
-    # TEST-011: the vacuity check above only proves pull_request: exists — not
+    # The vacuity check above only proves pull_request: exists — not
     # that it still fires on every PR. A paths/paths-ignore filter under it
     # silently switches every un-gated guard suite off for a PR that touches
     # only test/*.sh or the workflow itself, which is every PR they exist to
     # police (ci.yml already carries exactly such a filter, so this is not
     # hypothetical). Two properties with different remedies get two messages.
-    # SELF-2: pin the trigger's WHOLE SHAPE, not an enumeration of known-bad keys.
+    # Pin the trigger's WHOLE SHAPE, not an enumeration of known-bad keys.
     #
     # The predecessor of this check asked `has("paths") or has("paths-ignore")`.
     # That was the same mistake one level down: `types:` and `branches:` narrow a
@@ -1392,7 +1392,7 @@ else
         *)  fail "live-tests.yml's pull_request trigger shape changed: expected ${EXPECTED_PR_TRIGGER}, got ${actual_pr_trigger} — a paths/paths-ignore narrowing switches off every un-gated guard suite for the PRs they exist to police, and dropping a types entry (labeled/unlabeled) stops a label change re-evaluating the gate; if the change is deliberate, update EXPECTED_PR_TRIGGER" ;;
     esac
 
-    # SELF-1: the test job's OWN gate. The per-step if: check further below asks
+    # The test job's OWN gate. The per-step if: check further below asks
     # whether the two suite-running STEPS are gated; it cannot see a gate on the
     # JOB that contains them, which is strictly more powerful. MUTATION-PROVEN:
     # replacing this job's condition with `if: false` left this suite at 129/0
@@ -1410,7 +1410,7 @@ else
         *)  fail "the test job's gate condition is no longer ${EXPECTED_TEST_JOB_IF} — retargeting or falsifying it stops the ENTIRE live suite while CI stays green; if the change is deliberate, update EXPECTED_TEST_JOB_IF" ;;
     esac
 
-    # TEST-014: the checks in the loop below apply to preflight-selftest AND
+    # The checks in the loop below apply to preflight-selftest AND
     # validator-regression — live-tests.yml's SECOND un-gated guard job (its
     # own header comment says "Deliberately outside the check-label gate —
     # same rationale as preflight-selftest above"), which this suite's own
@@ -1444,7 +1444,7 @@ else
             else
                 pass "${job} has no continue-on-error: true"
             fi
-            # TEST-017: the cheapest neutering shape of all — a trailing
+            # The cheapest neutering shape of all — a trailing
             # '|| true' / '|| exit 0' / '|| :' on a run line — trips neither the
             # continue-on-error check above nor the per-suite invocation regexes,
             # which only assert the invocation is PRESENT, not un-neutered.
@@ -1474,7 +1474,7 @@ else
                 pass "${job} has no if: conditions at any level"
             fi
 
-            # TEST-018: an `if:` isn't the only way to gate this job — a `needs:`
+            # An `if:` isn't the only way to gate this job — a `needs:`
             # on a job the check-label gate blocks (or that never runs on a plain
             # PR push) has the same effect, and this job's own header comment says
             # it is deliberately un-gated so that 'skip-live-tests' cannot switch
@@ -1511,7 +1511,7 @@ else
         # `install-chrome-selftestXsh`. Harmless today, but this guard exists
         # precisely to notice small edits nobody meant to make.
         suite_re=${suite//./\\.}
-        # TEST-017: anchored strictly to end-of-line (only trailing
+        # Anchored strictly to end-of-line (only trailing
         # whitespace allowed after the script name) — previously the
         # `([[:space:]]|$)` alternation matched the space before a
         # trailing '|| true' too, so appending that to a run line still
@@ -1526,7 +1526,7 @@ else
 fi
 
 echo ""
-echo "=== Suite coverage: every suite in test/ is wired into some CI job (TEST-022) ==="
+echo "=== Suite coverage: every suite in test/ is wired into some CI job ==="
 # The hardcoded loop above only proves the DELETE direction for four names
 # inside ONE job. It misses (1) a suite wired into a DIFFERENT job — e.g.
 # test/validate_test.sh runs under validator-regression, not
@@ -1537,7 +1537,7 @@ echo "=== Suite coverage: every suite in test/ is wired into some CI job (TEST-0
 # add the CI step in the first place. Mirrors the ALL_TARGETS/BROWSER_TARGETS
 # exhaustiveness pattern below: derive the candidate set from the tree instead
 # of trusting a hardcoded list to stay current.
-# TEST-019: derive from TRACKED files, not a working-tree listing. An `ls` picks up
+# Derive from TRACKED files, not a working-tree listing. An `ls` picks up
 # untracked scratch copies — a `test/foo_test.sh` left over from debugging — and then
 # demands CI wiring for a file that is not in the repo, failing the suite on the
 # developer's machine and nowhere else. Falls back to `ls` only outside a git
@@ -1560,7 +1560,7 @@ else
 fi
 
 if [[ -f "$WORKFLOW" ]]; then
-    # TEST-018: presence of a matching `run:` line anywhere in the file proves
+    # Presence of a matching `run:` line anywhere in the file proves
     # only that the text exists, not that anything can execute it — a job
     # gated off with `if: false` (or any other neutering) still contains the
     # line. Resolve which job actually HOSTS the match, the same way
@@ -1590,8 +1590,8 @@ if [[ -f "$WORKFLOW" ]]; then
     fi
 
     # Jobs whose if: gate is deliberate and already pinned elsewhere in this
-    # file: install-chrome-e2e's exact trigger arms (TEST-001, above). `test`
-    # is deliberately NOT on this list (TEST-023): it is the label-gated job
+    # file: install-chrome-e2e's exact trigger arms, above. `test`
+    # is deliberately NOT on this list: it is the label-gated job
     # (`skip-live-tests` switches it off via check-label), so a guard suite
     # hosted ONLY by `test` would satisfy "wired into some CI job" while
     # staying silently skippable on any PR carrying that label — precisely
@@ -1606,7 +1606,7 @@ if [[ -f "$WORKFLOW" ]]; then
         hosting_job=""
         for job_name in "${all_job_names[@]}"; do
             job_runlines=$(extract_job_block "$job_name" | grep -vE '^[[:space:]]*#')
-            # TEST-024: end-anchored, matching the TEST-017 tightening applied
+            # End-anchored, matching the tightening applied
             # to the preflight-selftest block's own per-suite regex (below,
             # and at the hardcoded block above) — the loose `([[:space:]]|$)`
             # alternation also matches the space before a trailing
@@ -1641,7 +1641,7 @@ if [[ -f "$WORKFLOW" ]]; then
             pass "job '$job_name' (hosts suite coverage asserted above) has no continue-on-error: true"
         fi
 
-        # TEST-024: the two checks above only re-implemented two of the three
+        # The two checks above only re-implemented two of the three
         # neutering shapes the hardcoded preflight-selftest/install-chrome-e2e
         # blocks apply to themselves — this generic loop was missing the
         # cheapest one of all, a trailing '|| true'/'|| exit 0'/'|| :' on a
@@ -1679,10 +1679,10 @@ if [[ -f "$WORKFLOW" ]]; then
     if grep -qE '^  install-chrome-e2e:' "$WORKFLOW"; then
         pass "install-chrome-e2e job still defined (privileged-path coverage present)"
         e2e_block=$(extract_job_block install-chrome-e2e)
-        # N-1: e2e_block's two siblings (preflight_block, test_block) each
+        # e2e_block's two siblings (preflight_block, test_block) each
         # guard their extraction with a fidelity sentinel; this one had
         # neither, so every assertion below would pass vacuously if the
-        # extraction ever returned empty — the same shape as TEST-016.
+        # extraction ever returned empty — the same vacuous-guard shape this file polices.
         if [[ -z "$e2e_block" ]]; then
         fail "could not extract the install-chrome-e2e job block (extraction broken — the assertions below would be vacuous)"
         else
@@ -1692,7 +1692,7 @@ if [[ -f "$WORKFLOW" ]]; then
             fail "install-chrome-e2e no longer runs test/install-chrome.sh — the privileged path is uncovered"
         fi
 
-        # TEST-001: the checks above prove the job exists and still runs the
+        # The checks above prove the job exists and still runs the
         # script, but say nothing about the one thing that decides whether it
         # ever runs at all — its `if:`. This job is deliberately opt-in
         # (workflow_dispatch, plus push to main so a break there cannot stay
@@ -1708,14 +1708,14 @@ if [[ -f "$WORKFLOW" ]]; then
         fi
 
         # The job-exists / script-runs checks above say nothing about the
-        # STEPS that turn that run into a test (TEST-023): deleting the "Assert
+        # STEPS that turn that run into a test: deleting the "Assert
         # no phone-home artifacts survive" step — the only place AC4 and the
         # version record are verified against a real install — left the two
         # checks above green with no other signal. Require the verification
         # steps explicitly, and reject the same continue-on-error escape hatch
         # the preflight-selftest block above rejects.
         e2e_runlines=$(printf '%s\n' "$e2e_block" | grep -vE '^[[:space:]]*#')
-        # TEST-002: also require the headless-render assertion — the only
+        # Also require the headless-render assertion — the only
         # place anything actually drives the installed binary — not just the
         # three needles below (chrome-version, cron.daily absence, idempotent
         # re-run). --dump-dom is the most specific token: it appears nowhere
@@ -1738,7 +1738,7 @@ if [[ -f "$WORKFLOW" ]]; then
         else
             fail "test/assert-chrome-install.sh no longer asserts a runnable headless render — the --dump-dom check was removed"
         fi
-        # TEST-019: match the assertion's own shape, not the bare path — the
+        # Match the assertion's own shape, not the bare path — the
         # bare 'chrome-version' token also matches the purely informational
         # `echo "recorded build: ..."` line beneath it, so deleting the real
         # assertion while keeping the echo left this guard green.
@@ -1747,7 +1747,7 @@ if [[ -f "$WORKFLOW" ]]; then
         else
             fail "install-chrome-e2e no longer asserts the chrome-version record — AC4 version-record coverage dropped silently"
         fi
-        # TEST-001: `[ -s ]` alone passes on a bare newline or a record left by
+        # `[ -s ]` alone passes on a bare newline or a record left by
         # an earlier image layer, so the real install was verified LESS
         # specifically than the fixture-level case v, which already asserts both
         # the version string and 0644. Require the two content checks that close
@@ -1761,14 +1761,14 @@ if [[ -f "$WORKFLOW" ]]; then
         if printf '%s\n' "$e2e_runlines" | grep -qE '\[ "\$rec_major" = "\$major" \]'; then
             pass "install-chrome-e2e asserts the record's version number EQUALS the installed major"
         else
-            fail "install-chrome-e2e no longer compares the record's version to the installed major — a bare newline, or a record naming another build, would satisfy the -s test alone (TEST-001)"
+            fail "install-chrome-e2e no longer compares the record's version to the installed major — a bare newline, or a record naming another build, would satisfy the -s test alone"
         fi
         if printf '%s\n' "$e2e_runlines" | grep -qE 'stat -c .%a. "\$record"'; then
             pass "install-chrome-e2e asserts the record's achieved mode"
         else
-            fail "install-chrome-e2e no longer asserts the version record's mode — a literal 0644 in the installer is not evidence of the mode on disk (SEC-BE-003/TEST-001)"
+            fail "install-chrome-e2e no longer asserts the version record's mode — a literal 0644 in the installer is not evidence of the mode on disk"
         fi
-        # TEST-019: same tightening for the cron.daily check — the bare path
+        # Same tightening for the cron.daily check — the bare path
         # also matches the `for p in ...` list on its own, without proving the
         # loop body that actually inspects each $p and sets fail=1 is intact.
         if printf '%s\n' "$e2e_runlines" | grep -qE '/etc/cron\.daily/google-chrome' \
@@ -1782,7 +1782,7 @@ if [[ -f "$WORKFLOW" ]]; then
         else
             fail "install-chrome-e2e no longer asserts the 'already present' idempotent re-run marker"
         fi
-        # QUAL-001: the workflow hardcodes the phone-home path list that
+        # The workflow hardcodes the phone-home path list that
         # install-chrome.sh already defines once (PHONE_HOME_PATHS, plus
         # TMP_LIST/TMP_KEYRING/TMP_PREF). The duplication is deliberate — an
         # assertion that sourced the script under test would inherit the
@@ -1818,7 +1818,7 @@ if [[ -f "$WORKFLOW" ]]; then
         else
             pass "install-chrome-e2e has no continue-on-error: true"
         fi
-        # TEST-017: continue-on-error isn't the only neutering shape — a
+        # Continue-on-error isn't the only neutering shape — a
         # trailing '|| true' / '|| exit 0' / '|| :' on a run line swallows the
         # failure just as effectively and trips neither the check above nor
         # the invocation regexes elsewhere in this file.
@@ -1829,7 +1829,7 @@ if [[ -f "$WORKFLOW" ]]; then
         fi
 
         echo ""
-        echo "=== Phone-home path list: workflow vs install-chrome.sh (TEST-001) ==="
+        echo "=== Phone-home path list: workflow vs install-chrome.sh ==="
         # AC4's control surface is hand-copied under a "KEEP IN LOCKSTEP" comment
         # with no guard: PHONE_HOME_PATHS + TMP_LIST/TMP_KEYRING/TMP_PREF in
         # install-chrome.sh, and the `for p in ...` list in this job's own
@@ -1887,7 +1887,7 @@ if [[ -f "$WORKFLOW" ]]; then
 fi
 
 echo ""
-echo "=== test job wiring (TEST-003) ==="
+echo "=== test job wiring ==="
 # preflight-selftest and install-chrome-e2e got step-list wiring guards above
 # because a hand-maintained YAML block can silently lose a step with every
 # other check in the repo still green. The `test` job — where the entire
@@ -1923,7 +1923,7 @@ if [[ -f "$WORKFLOW" ]]; then
         # stub-config step ahead of "Run offline tests" would silently revert
         # that without tripping either check above, since the offline run
         # step itself is untouched.
-        # TEST-018: match the SCRIPT that writes the config, not just the config
+        # Match the SCRIPT that writes the config, not just the config
         # FILENAME. Grepping only for `.live-test-config` was a false negative:
         # `setup-live-targets.sh` is what writes that file, and a `run:
         # ./test/setup-live-targets.sh` step contains the filename nowhere, so
@@ -1932,7 +1932,7 @@ if [[ -f "$WORKFLOW" ]]; then
         # with the filename-only grep, adding a setup step before the offline run
         # left the suite at 112/0, exit 0.
         #
-        # TEST-019: do not anchor on `run:` being on the SAME line as the script
+        # Do not anchor on `run:` being on the SAME line as the script
         # path. A YAML block scalar step —
         #   run: |
         #     ./test/setup-live-targets.sh
@@ -1951,7 +1951,7 @@ if [[ -f "$WORKFLOW" ]]; then
             pass "test job writes no config before the offline run (AC3 no-config path preserved)"
         fi
 
-        # TEST-017: the same three neutering shapes the un-gated job is held to.
+        # The same three neutering shapes the un-gated job is held to.
         # This job is where the entire offline+live suite actually executes, and
         # it had NONE of these checks: the four assertions above prove the run
         # steps are PRESENT, not that a failure from them can still fail CI.
@@ -1975,7 +1975,7 @@ if [[ -f "$WORKFLOW" ]]; then
         # An `if: false` (or any condition) on either is the neutering this
         # catches, and it is invisible to the three checks above.
         #
-        # TEST-016: locate each step by the invocation it CONTAINS, not by its
+        # Locate each step by the invocation it CONTAINS, not by its
         # human-readable name. A name-anchored sed range fails OPEN: reorder the
         # step's keys so `if:` leads the mapping (YAML mappings are unordered,
         # so this is valid) and the `- name: ...` line loses its `- ` prefix —
@@ -2043,11 +2043,11 @@ SUITE_COMPLETED=1
 echo ""
 echo "=== Summary ==="
 echo "  $PASS passed, $FAIL failed, $SKIP skipped"
-# TEST-025: both sibling suites pin their assertion total; this one did not, so
+# Both sibling suites pin their assertion total; this one did not, so
 # deleting a case reduced coverage in silence — every remaining assertion still
 # passed and the suite still exited 0.
 #
-# TEST-017: the pin now counts skip credit. One arm here is environmental (the
+# The pin now counts skip credit. One arm here is environmental (the
 # RESULTS_DIR isolation check cannot measure anything when test/.results already
 # existed before the run), and it takes a credit of 1 rather than emitting
 # nothing, so a genuinely deleted assertion is still caught on a host where that
@@ -2056,10 +2056,9 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # ambient condition.
 #
 # Bumped 117 -> 121: +2 for the un-gated job's on:/pull_request and needs:
-# checks (TEST-018), +2 for targets_need_config's substring/glob-anchoring
-# checks (TEST-017 in the LAB-5064 review-round sense, not the TEST-017
-# skip-credit note above).
-# TEST-020: 121 -> 122. One assertion added, checking that every script
+# checks, +2 for targets_need_config's substring/glob-anchoring
+# checks.
+# 121 -> 122. One assertion added, checking that every script
 # live-tests.yml direct-execs is committed 100755 — the gap that let
 # install-chrome-selftest.sh run as 100644 and kill CI with exit 126 for three
 # review rounds without any assertion noticing.
@@ -2088,9 +2087,9 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # by repo-relative path, and collapsing the double-fail at the browser-target
 # classification arm to one counted outcome.
 # Adversarial self-review: 129 -> 130. MEASURED. +1 for the test job's own gate
-# check (SELF-1): the per-step if: check could not see a JOB-level gate, and
+# check: the per-step if: check could not see a JOB-level gate, and
 # replacing the test job's condition with `if: false` stopped the entire live
-# suite while this file stayed at 129/0 exit 0. The trigger-shape check (SELF-2)
+# suite while this file stayed at 129/0 exit 0. The trigger-shape check
 # is net zero — it replaced the narrower paths/paths-ignore check rather than
 # adding to it.
 #
