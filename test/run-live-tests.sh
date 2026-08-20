@@ -2597,7 +2597,7 @@ PYEOF
     # KNOWN GAP (LAB-3890 T4 / A5, rescoped to import-side auth preservation
     # only): the generator does not yet emit OpenAPI securitySchemes from
     # captured auth. Asserting captured-auth -> securitySchemes ships with
-    # LAB-5332 (PR #187 review finding REQ-001 — the prior claim that this was
+    # LAB-5332 (PR #187 review — the prior claim that this was
     # tracked elsewhere was unverifiable at review time, since no such ticket
     # existed); this target asserts only that auth is captured/preserved.
     log_info "auth-capture: NOTE — securitySchemes generation from captured auth is tracked in LAB-5332 (not yet implemented)."

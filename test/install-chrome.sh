@@ -1203,8 +1203,8 @@ main() {
         log_fail "apt-get update failed or timed out (held dpkg lock, or an unreachable mirror)." >&2
         exit 1
     fi
-    # Gate BEFORE dpkg ever runs a maintainer script, not only after (SEC-
-    # BE-009). `apt-get update -qq` exits 0 even when the just-pinned source
+    # Gate BEFORE dpkg ever runs a maintainer script, not only after.
+    # `apt-get update -qq` exits 0 even when the just-pinned source
     # failed to fetch — apt only warns — so without this, `apt-get install`
     # below could still resolve the package NAME from whatever OTHER source
     # already offers it, and dpkg would run that package's postinst as root

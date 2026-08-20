@@ -43,15 +43,19 @@ echo "detected: ${bin}"
 # not, rather than refusing to run. 30s, not CHROME_PROBE_BUDGET's 2s default,
 # because that budget bounds a --version call and this one paints a document.
 #
+# `-k 5` for the reason install-chrome.sh gives for its own apt bounds: a
+# process can defer the first SIGTERM, so without a kill-after a wedged browser
+# outlives the bound. Every other bounded call in this tree carries one.
+#
 # --no-sandbox is unconditional: this script's only caller is the
 # install-chrome-e2e job, which runs as root in a container where Chrome's
 # sandbox cannot initialise. The Go path makes the same choice behind
-# VESPASIAN_NO_SANDBOX (browser.go's shouldDisableSandbox); it is spelled out
+# VESPASIAN_NO_SANDBOX (browser.go's vespasianEnablesNoSandbox); it is spelled out
 # here rather than gated because there is exactly one caller and it always
 # needs it.
 render_timeout=$(timeout_cmd)
 if [ -n "${render_timeout}" ]; then
-    "${render_timeout}" 30 "${bin}" --headless --no-sandbox --dump-dom about:blank >/dev/null
+    "${render_timeout}" -k 5 30 "${bin}" --headless --no-sandbox --dump-dom about:blank >/dev/null
 else
     "${bin}" --headless --no-sandbox --dump-dom about:blank >/dev/null
 fi

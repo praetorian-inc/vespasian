@@ -349,7 +349,24 @@ TIMEOUT_STUB
 # strip wrong at any single site silently reintroduces the whole defect class, which
 # is the failure mode this file has now hit in three consecutive review rounds.
 fn_code() {
-    awk "/^$1\\(\\) \\{/,/^\\}/" "${INSTALL_SCRIPT}" | grep -vE '^[[:space:]]*#' || true
+    # Whole-line comments AND trailing comments. The filter was line-anchored
+    # (`grep -vE '^[[:space:]]*#'`), which strips a comment occupying its own
+    # line but leaves one appended to a CODE line — so
+    #     policy=$(apt-cache policy ...)   # was: timeout -k 5 30 apt-cache policy
+    # kept every literal this helper's callers pin while the real bound was gone.
+    # MUTATION-PROVEN defeated against the apt-cache pin below, which is exactly
+    # the defeat this helper exists to prevent and which the comment at its call
+    # site claimed was impossible.
+    #
+    # `sed 's/[[:space:]]#.*$//'` needs a preceding space so a `#` inside a
+    # word — `${VAR#prefix}`, `$#`, a URL fragment — is not treated as a comment
+    # opener. That is not a general shell-comment parser (a `#` inside a quoted
+    # string preceded by a space is still stripped), and it does not need to be:
+    # over-stripping can only make a pin FAIL, never falsely pass, so the error
+    # direction is fail-closed.
+    awk "/^$1\\(\\) \\{/,/^\\}/" "${INSTALL_SCRIPT}" \
+        | sed 's/[[:space:]]#.*$//' \
+        | grep -vE '^[[:space:]]*#' || true
 }
 
 # Pin the fixture tree's parent instead of inheriting $TMPDIR. This
@@ -775,7 +792,8 @@ fi
 # runs with the TEMPORARY, fully trusted Google apt source live in /etc, so a
 # blocking apt-cache (held dpkg lock, NFS-stalled /var/lib/apt) hangs there with
 # cleanup_all unreached and that source standing for the life of the process.
-# fn_code strips comments, so a literal on a comment line cannot satisfy this.
+# fn_code strips whole-line AND trailing comments, so a literal parked in a
+# comment cannot satisfy this.
 vao_body=$(fn_code verify_apt_origin)
 # POSITIVE durations, not [0-9]+: `timeout 0` means "wait forever" in coreutils,
 # so `timeout -k 0 0` is a bound that is present and disabled. common.sh's
@@ -3500,10 +3518,9 @@ res_x2=$(
 assert_contains "case x: a failing remove_phone_home is reported, not silently swallowed" \
     "Could not remove" "${res_x2}"
 
-# ── Case y: the pre-install origin gate refuses BEFORE apt-get install runs ──.
-# verify_apt_origin now runs twice: once right after `apt-get
-# update`, before `apt-get install` ever executes, and again afterward as a
-# second check. This pins the FIRST call specifically -- apt-cache policy
+# ── Case y: the pre-install origin gate refuses BEFORE apt-get install runs ──
+# verify_apt_origin now runs twice: once right after `apt-get update`, before
+# `apt-get install` ever executes, and again afterward as a second check. This pins the FIRST call specifically -- apt-cache policy
 # reports a non-Google origin for the candidate, so the install must never
 # run at all, and no maintainer script from the wrong origin ever executes as
 # root. Depends on the same committed key fixture as cases j/j2/v (install_

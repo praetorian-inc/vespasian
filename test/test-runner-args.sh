@@ -1764,11 +1764,61 @@ if [[ -f "$WORKFLOW" ]]; then
         # at exit 0 with nothing driving the browser. install-chrome-selftest.sh
         # built fn_code() for exactly this class and records it as hit in three
         # consecutive review rounds; this check is the same idea, inline.
-        elif grep -vE '^[[:space:]]*#' "$RENDER_ASSERT" | grep -q -e '--dump-dom' && \
-             grep -vE '^[[:space:]]*#' "$RENDER_ASSERT" | grep -e '--dump-dom' | grep -q '\${bin}'; then
-            pass "install-chrome-e2e invokes test/assert-chrome-install.sh, which still asserts a runnable headless render (--dump-dom)"
+        elif ! { grep -vE '^[[:space:]]*#' "$RENDER_ASSERT" | grep -e '--dump-dom' | grep -q '\${bin}'; }; then
+            fail "test/assert-chrome-install.sh no longer drives the browser on a line carrying --dump-dom — the only assertion that actually renders a page is gone, on the privileged install path that had no automated coverage at all before this PR"
+        # EXECUTED, not grepped. Every text form of this check has now been
+        # defeated: grepping the raw file was satisfied by a comment; stripping
+        # comments and requiring ${bin} on the token's line was satisfied by the
+        # unbounded fallback; requiring the bound's literal text was satisfied by
+        # a `cat >/dev/null <<EOF` here-doc holding the same line. All three
+        # MUTATION-PROVEN. A source scan cannot distinguish a command from a
+        # string that looks like one, so this runs the script and observes what
+        # it actually invokes.
+        #
+        # The stubs are the observation: a `timeout` that logs its argv then
+        # execs, and a browser answering --version. If the script drives the
+        # browser under a bound, the log holds a timeout invocation naming both a
+        # positive duration and --dump-dom. Nothing textual is asserted.
+        elif ! command -v mktemp >/dev/null 2>&1; then
+            fail "mktemp unavailable — cannot execute test/assert-chrome-install.sh to observe its render call"
         else
-            fail "test/assert-chrome-install.sh no longer asserts a runnable headless render — the --dump-dom check was removed"
+            rdir=$(mktemp -d)
+            # The stub logs its argv, then drops timeout's own options and the
+            # DURATION before exec-ing the rest — same shape as
+            # install-chrome-selftest.sh's plant_timeout_stub. A stub that
+            # exec'd "$@" verbatim would try to run the duration as a command,
+            # which is how the first draft of this check reported the script
+            # broken when the script was fine.
+            cat > "$rdir/timeout" <<TIMEOUT_STUB
+#!/bin/bash
+printf '%s\n' "\$*" >> "$rdir/timeout.log"
+while [ \$# -gt 0 ]; do
+    case "\$1" in
+        -k|-s|--kill-after|--signal) shift 2 ;;
+        -k*|-s*|--kill-after=*|--signal=*|--preserve-status|--foreground) shift ;;
+        *) break ;;
+    esac
+done
+shift   # the duration
+exec "\$@"
+TIMEOUT_STUB
+            printf '#!/bin/bash\n[ "$1" = "--version" ] && { echo "Google Chrome 999.0.0.0"; exit 0; }\necho "<html></html>"\n' > "$rdir/google-chrome"
+            chmod +x "$rdir/timeout" "$rdir/google-chrome"
+            # `|| render_rc=$?` rather than a bare call: this suite runs under
+            # `set -e`, so a non-zero exit here would abort the whole run before
+            # the arms below could report it — the completion sentinel would then
+            # blame the suite rather than naming the defect.
+            render_rc=0
+            PATH="$rdir:$PATH" bash "$RENDER_ASSERT" >/dev/null 2>&1 || render_rc=$?
+            render_log=$(cat "$rdir/timeout.log" 2>/dev/null || true)
+            rm -rf "$rdir"
+            if [[ $render_rc -ne 0 ]]; then
+                fail "executing test/assert-chrome-install.sh against a healthy stub browser failed (rc $render_rc) — the assertion install-chrome-e2e depends on does not run"
+            elif [[ "$render_log" == *"--dump-dom"* ]] && [[ "$render_log" =~ -k[[:space:]]+[1-9][0-9]*[[:space:]]+[1-9][0-9]* ]]; then
+                pass "executing test/assert-chrome-install.sh drives the browser with --dump-dom under a timeout carrying a positive -k bound (observed, not grepped)"
+            else
+                fail "executing test/assert-chrome-install.sh did not invoke timeout with a positive -k bound around a --dump-dom render (observed argv: ${render_log:-<none>}) — the render either does not run or runs unbounded"
+            fi
         fi
         # Match the assertion's own shape, not the bare path — the
         # bare 'chrome-version' token also matches the purely informational
