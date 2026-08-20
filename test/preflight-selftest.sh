@@ -321,7 +321,31 @@ fi
 #
 # Derived from the source, not hardcoded, so the test cannot drift from the arm
 # it guards.
-snap_glob=$(grep -oE '^\s+\*/snap/\*[^)]*\)' "${SETUP_SCRIPT}" | head -1 | tr -d ' )')
+#
+# The UNION of every arm that emits the snap hint, not the single arm that
+# happens to begin with `*/snap/*`. Splitting the arm in a behaviour-preserving
+# way --
+#
+#     */snap/*|*/chromium-browser)  log_info "(looks like the Ubuntu snap stub ..."  ;;
+#     */chromium)                   log_info "(looks like the Ubuntu snap stub ..."  ;;
+#
+# -- leaves the hint firing for all three paths, so nothing about the script's
+# behaviour changed; but a `head -1` extraction anchored on `*/snap/*` then
+# returns two members instead of three, the sentinel below still passes because
+# the result is non-empty, and `*/chromium` silently stops being asserted. A
+# LATER edit deleting that second arm is then invisible. Unioning by the hint's
+# own text ties the member set to the behaviour rather than to one arm's spelling.
+snap_hint='looks like the Ubuntu snap stub'
+snap_glob=$(awk -v hint="${snap_hint}" '
+    # Remember the most recent case-arm pattern line, then emit it when the
+    # body beneath it turns out to carry the hint. Arms are one-per-line here
+    # (the pattern and the `)` on their own line), which is the shape the whole
+    # case statement uses; a pattern sharing a line with its body would need a
+    # parser rather than a scan, and this asserts the shape by finding nothing
+    # if it ever changes -- caught by the sentinel below.
+    /^[[:space:]]*[^[:space:]#][^)]*\)[[:space:]]*$/ { pat = $0; next }
+    index($0, hint) && pat != "" { print pat; pat = "" }
+' "${SETUP_SCRIPT}" | tr -d ' )' | paste -sd'|' - | tr -s '|')
 if [ -z "${snap_glob}" ]; then
     echo "FAIL: case e2: could not extract the snap-hint glob set from ${SETUP_SCRIPT} — the per-member assertions below are vacuous"
     fail_count=$((fail_count + 1))

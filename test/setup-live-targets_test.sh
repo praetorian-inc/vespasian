@@ -1085,23 +1085,45 @@ if command -v stat >/dev/null 2>&1; then
     gql_install_matches="$(declare -f start_graphql_server | grep -oE 'install -m [0-7]+ [^;&|<>`]*graphql-server\.log[^;&|<>`]*')"
     gql_install_line="$(printf '%s\n' "${gql_install_matches}" | head -1)"
     gql_install_n="$(printf '%s' "${gql_install_matches}" | grep -c '.')"
+    # ONE counted outcome for the extraction, whichever way it goes, and a
+    # CREDIT for the assertions it gates. Both extraction-failure arms used to
+    # emit a bare fail() and then skip the three assertions below, so a genuine
+    # extraction defect reported TWO causes: the real one, and an accounting
+    # drift blaming a maintainer for adding or deleting a Test block. The pin is
+    # enforced unconditionally against pass+fail+credit precisely so it cannot be
+    # switched off, which means every arm of every block has to keep the count
+    # invariant — a block that emits a variable number of outcomes converts its
+    # own failure into a second, misattributing one. This is the same defect the
+    # review recorded against test-runner-args.sh:194 (LAB-4773), on the arm that
+    # actually fires here.
+    gql_extraction_ok=true
     if [ "$gql_install_n" -gt 1 ]; then
         # Blank the extraction too. fail() only increments a counter and returns,
         # so without this the block fell through and eval'd head -1's arbitrary
         # pick anyway — loud AND arbitrary, while the comment claimed otherwise.
-        # Empty routes control to the [ -z ] arm below, which reports the
-        # extraction failure instead of acting on a coin-flip.
         fail "start_graphql_server has ${gql_install_n} install(1) statements targeting .graphql-server.log — the extraction above would pick one arbitrarily; disambiguate rather than trusting head -1 (SEC-BE-003)"
         gql_install_line=""
-    fi
-    if [ -z "$gql_install_line" ]; then
+        gql_extraction_ok=false
+    elif [ -z "$gql_install_line" ]; then
         fail "start_graphql_server no longer pre-creates its log with install(1) — a bare redirection lands at the caller's umask, so under umask 0 the log holding service output would be world-writable (SEC-BE-003)"
+        gql_extraction_ok=false
+    else
+        ok "start_graphql_server's install(1) line for .graphql-server.log extracted unambiguously"
+    fi
+    if [ "$gql_extraction_ok" = false ]; then
+        skip "start_graphql_server log-mode and ordering assertions (install-line extraction failed above)" 4
     else
         # Status captured, not discarded: a second install line, a compound
         # statement, or an unset var under `set +u` otherwise surfaced only as
         # "expected '600', got ''", which reads as a mode defect rather than an
         # extraction defect and sends the next reader to the wrong place.
-        if ! ( umask 0; eval "$gql_install_line" ) >/dev/null 2>&1; then
+        #
+        # Symmetric, for the same accounting reason as the extraction arms above:
+        # a bare conditional fail() emits an outcome the healthy path does not,
+        # so this sentinel firing would ALSO have tripped the pin.
+        if ( umask 0; eval "$gql_install_line" ) >/dev/null 2>&1; then
+            ok "start_graphql_server's install line runs in isolation, so the mode assertion below reads a real file"
+        else
             fail "could not execute start_graphql_server's install line in isolation (extracted: ${gql_install_line}) — the mode assertion below would report an empty mode as a 0600 violation; fix the extraction rather than deleting the check (SEC-BE-003)"
         fi
         logmode="$(stat -c '%a' "${STATE_DIR}/.graphql-server.log" 2>/dev/null)"
@@ -1220,7 +1242,7 @@ $(declare -f "$w")"
     fi
     rm -f "${STATE_DIR}/.graphql-server.log"
 else
-    skip "stat required" 6
+    skip "stat required" 8
 fi
 
 # ── Test 23: teardown_on_failure EXIT trap tears down a failed partial setup ─
@@ -1359,7 +1381,8 @@ pgrep required=2
 could not build an lsof-free PATH for the SEC-BE-008 check=2
 timeout/gtimeout, curl, and python3 required=1
 timeout/gtimeout, dirname, and sleep required=2
-stat required=6'
+start_graphql_server log-mode and ordering assertions (install-line extraction failed above)=4
+stat required=8'
 actual_skip_register=$(grep -oE '^[[:space:]]*skip "[^"]*" [0-9]+' "$THIS_DIR/setup-live-targets_test.sh" \
     | sed -E 's/^[[:space:]]*skip "([^"]*)" ([0-9]+)$/\1=\2/')
 # Sites WITHOUT an explicit credit default to 0 and would silently not appear
@@ -1452,7 +1475,22 @@ echo "────────────────────────�
 # on the offending line; the suite exited 0 with the log world-writable. The
 # executed stat carries the property now, and the textual checks were KEPT for
 # their diagnostics, which is why this is +1 rather than a replacement.
-EXPECTED_ASSERTIONS=85
+#
+# 85 -> 87. MEASURED. Both from making Test 22's graphql log-mode block emit an
+# INVARIANT number of outcomes on every path, which is what the unconditional pin
+# requires of every block and what this one did not do: +1 for the extraction
+# check becoming a two-armed outcome (it was a bare conditional fail(), so an
+# extraction defect reported the real cause AND an accounting drift blaming a
+# maintainer for adding or deleting a Test block), and +1 for the isolation
+# sentinel beneath it, which had the same shape. The FOUR outcomes those arms
+# gate (isolation sentinel, the extracted line's mode, the running function's
+# mode, and the install-before-redirect ordering) are now displaced onto a
+# credited skip rather than silently vanishing, so `stat required` moves 6 -> 8
+# to match the block's new healthy count. MUTATION-PROVEN both ways: replacing
+# the install(1) with a bare redirection, and duplicating it, each now report
+# exactly one cause (82 passed + 1 failed + 4 credit = 87) where before they
+# reported the real defect plus an accounting drift.
+EXPECTED_ASSERTIONS=87
 if [ "$((PASS + FAIL + SKIP_CREDIT))" -ne "${EXPECTED_ASSERTIONS}" ]; then
     echo "setup-live-targets_test: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (Passed+Failed+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A Test block was added or removed without updating EXPECTED_ASSERTIONS."

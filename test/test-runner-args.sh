@@ -674,7 +674,8 @@ fi
 # difference between running the browser tests and not.
 #
 # Both sibling suites already pin this for their own script
-# (install-chrome-selftest case b, setup-live-targets_test Test 22), so this was
+# (install-chrome-selftest case b, setup-live-targets_test Test 14 (parse_args
+# unknown option)), so this was
 # the one un-pinned parser of the three. Driven behaviourally against the real
 # script rather than by grepping its source: the flag reaches a real parse loop
 # and the process really exits, so there is no source-vs-behaviour gap to hide in.
@@ -694,6 +695,46 @@ if [[ "$unknown_rc" -eq 1 ]] && $unknown_named; then
 else
     fail "run-live-tests.sh did not reject an unknown flag (rc $unknown_rc, named=$unknown_named) — a typo'd flag is silently ignored and the run proceeds with the wrong target selection"
 fi
+# ── The ambient-VESPASIAN override notice ──────────────────────────────────
+#
+# run-live-tests.sh honours a VESPASIAN already present in the environment and
+# warns that every crawl/generate in the run will use THAT binary rather than
+# the one under ${PROJECT_ROOT}/bin. None of the three pieces — the capture, the
+# guard, or the message — had any assertion in any suite: deleting all three
+# left every suite green, and a run under an ambient override then reported
+# results for an arbitrary binary with nothing in the output saying so, which is
+# what makes a green live-test run unfalsifiable.
+#
+# Driven through the same invocation as the unknown-flag check above. The notice
+# is emitted immediately after common.sh is sourced, which is BEFORE the parse
+# loop rejects the flag, so one extra run with VESPASIAN set captures it without
+# needing a working binary or any live target.
+override_path=/tmp/vespasian-ambient-override-probe
+override_out=$(VESPASIAN="$override_path" bash "$RUNNER" --not-a-real-flag 2>&1 || true)
+case "$override_out" in
+    *"VESPASIAN was set in the environment"*)
+        pass "run-live-tests.sh announces an ambient VESPASIAN override" ;;
+    *)  fail "run-live-tests.sh did not announce an ambient VESPASIAN override — the run silently uses a binary the operator did not build, and the output says nothing about it" ;;
+esac
+# The PATH, not just the fact. A notice that says an override is in effect
+# without naming it leaves the operator unable to tell which binary produced
+# the results, which is the only actionable part of the warning.
+case "$override_out" in
+    *"$override_path"*)
+        pass "the override notice names the overriding path, so the operator can see which binary ran" ;;
+    *)  fail "the override notice does not name the overriding path — it reports that SOME override is active without saying which binary the results came from" ;;
+esac
+# And the negative: absent from the run WITHOUT the override. The unknown-flag
+# capture above is that run, so this needs no third invocation. Without this,
+# an unconditional notice — the guard at :184 deleted, the message left behind —
+# satisfies both assertions above while telling every normal run it is using a
+# binary it is not.
+case "$unknown_out" in
+    *"VESPASIAN was set in the environment"*)
+        fail "the override notice fired on a run with no ambient VESPASIAN — it is unconditional, so it now misreports every normal run" ;;
+    *)  pass "the override notice stays silent when VESPASIAN is not set in the environment" ;;
+esac
+
 # Matched without a leading path: usage() prints "Usage: $0", so the text varies
 # with how the script was invoked (relative here, absolute via $RUNNER). Anchoring
 # on the basename plus "[options]" is invocation-independent.
@@ -755,6 +796,40 @@ if printf '%s' "$chrome_avail_code" | grep -qE 'CHROME_CANDIDATES'; then
     fail "chrome_available iterates CHROME_CANDIDATES itself — resolution belongs to detect_chrome_binary, not the runner"
 else
     pass "chrome_available does not re-implement candidate resolution"
+fi
+# POSITION, not just presence. All three pins above are per-line, and each of
+# them is evaded by the same mutation: a presence-only FAST PATH spread across
+# more than one line, ahead of the delegation.
+#
+#     chrome_available() {
+#         for b in google-chrome chromium chromium-browser; do
+#             command -v "$b" >/dev/null 2>&1 && return 0
+#         done
+#         detect_chrome_binary >/dev/null 2>&1 || [ -d "$HOME/.cache/rod/browser" ]
+#     }
+#
+# The delegation pin passes (the call is still there). The presence-only pin
+# passes: its regex needs a browser NAME on the same line as `command -v`, and
+# here the names are on the `for` line while the probe reads "$b". The
+# CHROME_CANDIDATES pin passes: this list is local. And the behavioural polarity
+# checks below pass too, because on a host WITH a runnable browser both routes
+# answer yes. What has actually happened is that a snap stub — the entire reason
+# this probe is shared — now returns 0 before detect_chrome_binary is consulted.
+#
+# What no per-line pin can see is ORDER, so pin that instead: the FIRST
+# executable statement of the body must be the detect_chrome_binary call. A fast
+# path has to go somewhere, and every position that neuters the delegation is
+# before it.
+chrome_avail_first=$(printf '%s\n' "$chrome_avail_code" \
+    | sed -e '1d' -e '/^[[:space:]]*$/d' \
+    | head -1 \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+if [[ -z "$chrome_avail_first" ]]; then
+    fail "could not read chrome_available's first statement — the ordering pin below would be vacuous"
+elif [[ "$chrome_avail_first" == detect_chrome_binary* ]]; then
+    pass "chrome_available's FIRST statement is the detect_chrome_binary call (no probe runs ahead of the shared one)"
+else
+    fail "chrome_available's first statement is [${chrome_avail_first}], not the detect_chrome_binary call — something answers ahead of the shared probe, and a multi-line presence-only fast path there passes all three text pins above while letting a snap stub report a usable browser"
 fi
 
 # shellcheck source=common.sh
@@ -1313,8 +1388,8 @@ else
         __NO_YQ__) fail_no_yq "live-tests.yml's pull_request trigger shape" ;;
         __YQ_ERROR__) fail_yq_error "live-tests.yml's pull_request trigger shape" ;;
         "$EXPECTED_PR_TRIGGER")
-            pass "live-tests.yml's pull_request trigger is unnarrowed (no paths/paths-ignore/types/branches filter that would stop a shell-only PR running the guard suites)" ;;
-        *)  fail "live-tests.yml's pull_request trigger shape changed: expected ${EXPECTED_PR_TRIGGER}, got ${actual_pr_trigger} — a paths/paths-ignore/types/branches narrowing switches off every un-gated guard suite for the PRs they exist to police; if the change is deliberate, update EXPECTED_PR_TRIGGER" ;;
+            pass "live-tests.yml's pull_request trigger carries no paths/paths-ignore narrowing, so a shell-only PR still runs the un-gated guard suites (branches and types are expected and are part of EXPECTED_PR_TRIGGER)" ;;
+        *)  fail "live-tests.yml's pull_request trigger shape changed: expected ${EXPECTED_PR_TRIGGER}, got ${actual_pr_trigger} — a paths/paths-ignore narrowing switches off every un-gated guard suite for the PRs they exist to police, and dropping a types entry (labeled/unlabeled) stops a label change re-evaluating the gate; if the change is deliberate, update EXPECTED_PR_TRIGGER" ;;
     esac
 
     # SELF-1: the test job's OWN gate. The per-step if: check further below asks
@@ -2018,7 +2093,17 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # suite while this file stayed at 129/0 exit 0. The trigger-shape check (SELF-2)
 # is net zero — it replaced the narrower paths/paths-ignore check rather than
 # adding to it.
-EXPECTED_ASSERTIONS=130
+#
+# Round-16 review: 130 -> 134. MEASURED. +1 for chrome_available's ORDERING pin
+# (the three per-line pins above it are all evaded by the same multi-line
+# presence-only fast path, and order is the one property none of them can see),
+# and +3 for the ambient-VESPASIAN override notice, which had no assertion in
+# any suite — deleting the capture, the guard and the message together left
+# every suite green while a run under an override reported results for an
+# arbitrary binary. The --dump-dom pin is net zero: the assertion moved into
+# test/assert-chrome-install.sh and the pin now requires both links (the job
+# invokes the script, the script drives the binary) in one counted outcome.
+EXPECTED_ASSERTIONS=134
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
