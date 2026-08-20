@@ -1812,16 +1812,29 @@ if [[ -f "$WORKFLOW" ]]; then
             # since its stub does not log; it is not the same situation.
             cat > "$rdir/timeout-impl" <<'TIMEOUT_STUB'
 #!/bin/bash
+# Resolve timeout's own options the way timeout(1) does, then log the RESOLVED
+# kill-after and duration alongside the argv. The assertion reads those two
+# numbers instead of re-parsing argv with a regex — four successive regexes over
+# this log were each defeated or made to false-alarm (satisfiable from a comment,
+# satisfiable across two invocations, blind to the bound's position, then blind to
+# the DURATION while rejecting `--preserve-status -k 5 30`). A parser cannot be
+# out-spelled: `-k 5`, `-k5`, `--kill-after=5` and a leading `-s KILL` all resolve
+# to the same two numbers.
 log=$1; shift
-printf '%s\n' "$*" >> "$log"
+argv="$*"
+ka=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        -k|-s|--kill-after|--signal) shift 2 ;;
-        -k*|-s*|--kill-after=*|--signal=*|--preserve-status|--foreground) shift ;;
+        -k|--kill-after)  ka=$2; shift 2 ;;
+        --kill-after=*)   ka=${1#--kill-after=}; shift ;;
+        -k?*)             ka=${1#-k}; shift ;;
+        -s|--signal)      shift 2 ;;
+        -s*|--signal=*|--preserve-status|--foreground) shift ;;
         *) break ;;
     esac
 done
-shift   # the duration
+dur=$1; shift
+printf 'kill_after=%s duration=%s argv=%s\n' "${ka:-none}" "${dur:-none}" "$argv" >> "$log"
 exec "$@"
 TIMEOUT_STUB
             printf '#!/bin/bash\nexec "%s/timeout-impl" "%s/timeout.log" "$@"\n' "$rdir" "$rdir" > "$rdir/timeout"
@@ -1852,15 +1865,17 @@ TIMEOUT_STUB
             # and a regex pinning one spelling would fail it with text naming a
             # regression that had not happened. A false alarm here is as much a
             # defect as a false pass: it trains a reader to edit the guard.
-            # POSITION too: the bound must precede the binary, which for the
-            # logged argv means the line STARTS with timeout's own options. Pinning
-            # only that both tokens appear on one line let the bound be moved PAST
-            # the binary — `"${render_timeout}" 30 "${bin}" ... about:blank -k 5 30`
-            # logs `30 <bin> ... --dump-dom about:blank -k 5 30`, which satisfies
-            # both predicates while timeout parses `-k 5 30` as arguments to the
-            # BROWSER and applies no kill-after at all. MUTATION-PROVEN.
-            elif printf '%s\n' "$render_log" | grep -- '--dump-dom' \
-                 | grep -qE -- '^[[:space:]]*(-k[[:space:]]*|--kill-after=)[1-9][0-9]*[a-z]?([[:space:]]|$)'; then
+            # Read the RESOLVED numbers the stub logged, and require BOTH to be
+            # positive. `timeout --help`: "A duration of 0 disables the associated
+            # timeout" — verified locally, `timeout -k 5 0 sleep 2` returns 0 after
+            # 2s — so a zero duration is an unbounded render, and the regex this
+            # replaces constrained only the kill-after and passed it. Position is
+            # implicit: a bound written after the binary is parsed by timeout as
+            # arguments to the BROWSER, so it never becomes kill_after/duration at
+            # all and the numbers come back `none`.
+            elif printf '%s\n' "$render_log" \
+                 | grep -- '--dump-dom' \
+                 | grep -qE 'kill_after=[1-9][0-9]*[a-z]?[[:space:]]+duration=[1-9][0-9]*[a-z]?[[:space:]]'; then
                 pass "executing test/assert-chrome-install.sh drives the browser with --dump-dom under a timeout carrying a positive -k bound (observed, not grepped)"
             else
                 fail "executing test/assert-chrome-install.sh did not invoke timeout with a positive -k bound around a --dump-dom render (observed argv: ${render_log:-<none>}) — the render either does not run or runs unbounded"

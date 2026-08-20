@@ -45,24 +45,23 @@ echo "detected: ${bin}"
 #
 # `-k 5` for the reason install-chrome.sh gives for its own apt bounds: a
 # process can defer the first SIGTERM, so without a kill-after a wedged browser
-# outlives the bound.
+# outlives the bound. That is the whole argument for it here.
 #
-# Which calls in the tree carry one, counted rather than asserted: three do —
-# install-chrome.sh's two PRIVILEGED apt-get invocations (`-k 30 300` on update,
-# `-k 30 900` on install) and its UNPRIVILEGED `apt-cache policy` origin check
-# (`-k 5 30`, read-only, and its own comment says so). Three do not:
-# common.sh's chrome_runnable, install-chrome.sh's _bounded_probe, and
-# setup-live-targets.sh's wait_for_grpc, which pass a bare duration. Those
-# predate this change; whether they SHOULD carry one is not settled here and no
-# comment in the tree argues it either way.
+# What the rest of the tree does, as fact rather than theory. Three calls carry a
+# kill-after: `timeout -k 30 300 apt-get update`, `timeout -k 30 900 apt-get
+# install`, and `timeout -k 5 30 apt-cache policy` (the last unprivileged — its
+# own comment says the call is read-only and needs no $SUDO). Three do not, all
+# passing a bare duration: common.sh's chrome_runnable, install-chrome.sh's
+# _bounded_probe, setup-live-targets.sh's wait_for_grpc.
 #
-# So privilege is NOT the dividing line — an earlier version of this paragraph
-# said it was, and miscounted the apt-cache call as privileged to make that
-# split work. What actually separates the two groups is how long the bounded
-# command can legitimately run: an apt transaction or a network-backed policy
-# lookup can sit for tens of seconds, where a `--version` call or a TCP connect
-# resolves in milliseconds or not at all. This render paints a document, so it
-# belongs with the first group.
+# No rule is offered for which group a new call belongs to, deliberately. Three
+# earlier versions of this paragraph each proposed one — that all bounded calls
+# carry `-k`, that privilege is the split, that duration is the split — and each
+# was falsified by the source within a round: the first by three counter-examples,
+# the second by miscounting apt-cache as privileged, the third by claiming apt
+# "sits for tens of seconds" when its budgets are 300s and 900s. The counts above
+# are checkable; a taxonomy over six call sites was not, and it is not what this
+# comment needs to do. Its job is to stop someone deleting the `-k`.
 #
 # --no-sandbox is unconditional: this script's only caller is the
 # install-chrome-e2e job, which runs as root in a container where Chrome's

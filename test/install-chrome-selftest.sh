@@ -167,8 +167,10 @@ SUITE_COMPLETED=0
 # skip_credit with every arm live). It moved 238 -> 239 when case cr landed,
 # 239 -> 244 when case z4 gained the four ordering assertions plus the per-site
 # register check, 244 -> 245 when the anchor-completeness check landed, and
-# 271 -> 272 in the round-22 pass: +1 for case pn, which pins this very sentence
-# against the constant after it went stale three rounds running.
+# 271 -> 273 across the round-22 and round-25 passes: +2 for case pn, which pins
+# this sentence against the constant after it went stale three rounds running, and
+# then every other total in this block after the arithmetic drifted while the
+# sentence was correct.
 #
 # 269 -> 271 in the round-20 pass: +2 for case m3, which pins that main() calls
 # require_tools BEFORE its first privileged apt invocation. MUTATION-PROVEN:
@@ -377,9 +379,11 @@ TIMEOUT_STUB
 # ${VAR#prefix}, $#, a URL fragment — is not read as a comment opener. It is not
 # a shell parser: a `#` inside a quoted string, preceded by a space, is still
 # stripped. For a PRESENCE pin that is fail-closed (the pin stops matching and
-# FAILS). For the COUNTED pins this PR added it is NOT: total and bounded are
-# derived from the same stripped text, so a call hidden from both leaves their
-# equality intact. install-chrome.sh has exactly one whitespace-preceded `#` on a
+# FAILS). For a COUNTED pin it depends on how the two counts are derived: f5b's
+# total and bounded deliberately use DIFFERENT filters for this reason, so a call
+# hidden from one is still seen by the other. A counted pin that took both figures
+# from one stripped body would not be fail-closed — that was f5b's own defect in
+# round 23, and the two-filter split is what fixed it. install-chrome.sh has exactly one whitespace-preceded `#` on a
 # code line today (a real trailing comment on a `case` arm, which strips to valid
 # code), so nothing is over-stripped now — but a future quoted `#` before an
 # apt-cache call would silence it. Recorded rather than left implied.
@@ -898,7 +902,15 @@ fi
 # never undercount, the bounded must never overcount. One shared filter cannot
 # satisfy both, which is why strip_comments is deliberately NOT used for the
 # total here despite being used for the bounded count two lines down.
-script_body_f5_total=$(grep -vE '^[[:space:]]*#' "${INSTALL_SCRIPT}" | normalize_commands)
+# Trailing comments are BLANKED, not deleted to end-of-line: `s/[[:space:]]#.*$/ /`
+# leaves the code before the `#` intact, so a comment can neither hide a call from
+# the total (deleting to EOL took the call with it — the round-23 medium) nor
+# inflate it (a comment reading "historically: cd /tmp && apt-get update" counted
+# as a third call and reddened both arms on correct code — MEASURED). The
+# whole-line filter still runs first, and a bash line whose first non-space
+# character is `#` does not execute, so dropping those matches shell semantics.
+script_body_f5_total=$(grep -vE '^[[:space:]]*#' "${INSTALL_SCRIPT}" \
+    | sed 's/[[:space:]]#.*$/ /' | normalize_commands)
 script_body_f5_joined=$(strip_comments < "${INSTALL_SCRIPT}" | normalize_commands)
 # The prefix set is a CHAIN of command words, not a fixed `$SUDO?timeout?`.
 # The predecessor required the literal `$SUDO`, so three behaviourally identical
@@ -914,7 +926,10 @@ script_body_f5_joined=$(strip_comments < "${INSTALL_SCRIPT}" | normalize_command
 # not in command position, and a free `.*` before apt-get would turn this red on
 # correct code. Verified against the real script: exactly 2 matches, 0 of them the
 # help string; and each of the three evasions above raises the count to 3.
-aptget_call_re='(^|[;&|][[:space:]]*)[[:space:]]*(if[[:space:]]+!:?[[:space:]]+)?([[:space:]]*(\$SUDO|sudo|env|timeout|nice|ionice)[[:space:]]+([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+|-[^[:space:]]+[[:space:]]+|[0-9]+[[:space:]]+)*)*apt-get[[:space:]]+(update|install)[[:space:]]'
+# `(` is in the separator class so command substitution counts: without it,
+# `out=$($SUDO apt-get install -y x)` sat in neither line-start nor `;&|`
+# position and was invisible to this scan. MEASURED before and after.
+aptget_call_re='(^|[;&|(][[:space:]]*)[[:space:]]*(if[[:space:]]+!:?[[:space:]]+)?([[:space:]]*(\$SUDO|sudo|env|timeout|nice|ionice)[[:space:]]+([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+|-[^[:space:]]+[[:space:]]+|[0-9]+[[:space:]]+)*)*apt-get[[:space:]]+(update|install)[[:space:]]'
 f5_aptget_lines=$(printf '%s\n' "${script_body_f5_total}" \
     | grep -cE "$aptget_call_re" || true)
 f5_aptget_bounded=$(printf '%s\n' "${script_body_f5_joined}" \
@@ -928,8 +943,25 @@ else
     echo "FAIL: case f: only ${f5_aptget_bounded} of ${f5_aptget_lines} apt-get call(s) in the script carry the DPkg::Lock::Timeout=120 bound — an unbounded apt-get call is reachable"
     fail_count=$((fail_count + 1))
 fi
-# Residual, stated honestly: a call smuggled through `eval` or `bash -c` is
-# still not counted by a source-text scan.
+# Residual, stated honestly and now enumerated rather than sampled. MEASURED by
+# inserting an unbounded `$SUDO apt-get install` into remove_phone_home in five
+# shapes and running the suite:
+#   caught   — a bare call, a line continuation, and a here-doc body (which is
+#              data, not a command, so counting it would be the false alarm)
+#   caught   — `out=$($SUDO apt-get install ...)`, command substitution, which
+#              this scan MISSED until the separator class below gained `(`. It
+#              had been absent from this residual list, and it is the shape most
+#              likely to appear innocently — capturing apt's output is ordinary
+#              code, where `eval` is not.
+#   NOT caught — any form that puts the call somewhere this regex's prefix set
+#              does not reach: `eval "..."`, `bash -c "..."`, `sh -c "..."`,
+#              backticks, and `xargs apt-get ...`. The prefix set is the fixed
+#              list `$SUDO|sudo|env|timeout|nice|ionice`, so a new wrapper word is
+#              a new hole by construction — this is a blind spot with a shape, not
+#              a list of two exceptions. Closing it means evaluating strings the
+#              scan only reads, i.e. writing a shell parser, which is why the two
+#              real apt calls are ALSO pinned by exact literal in the check above:
+#              this count is one layer, deliberately not the only one.
 
 # An EXACT expected total, not a `>= 1` floor. The equality check above compares
 # two counts derived from the SAME stripped text, so anything that hides a call
@@ -4471,8 +4503,8 @@ pn_declared=$(grep -oE '^# EXPECTED_ASSERTIONS above is [0-9]+' "${BASH_SOURCE[0
 # example total from its own comment, 4200 lines away, as a stale live figure.
 pn_block=$(sed -n '/^# CREDIT REGISTER/,/^skip() {/p' "${BASH_SOURCE[0]}")
 pn_totals=$(printf '%s\n' "${pn_block}" \
-    | grep -oE '(= |at the pin of )(2[0-9][0-9])([^0-9]|$)' \
-    | grep -oE '2[0-9][0-9]' | sort -u || true)
+    | grep -oE '(= |at the pin of )([1-9][0-9]{2,})([^0-9]|$)' \
+    | grep -oE '[1-9][0-9]{2,}' | sort -u || true)
 pn_wrong=""
 for t in ${pn_totals}; do
     [ "$t" = "${EXPECTED_ASSERTIONS}" ] || pn_wrong="${pn_wrong} ${t}"
