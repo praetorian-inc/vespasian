@@ -361,6 +361,29 @@ TIMEOUT_STUB
 # One helper rather than the same two-line pipeline at five call sites: getting the
 # strip wrong at any single site silently reintroduces the whole defect class, which
 # is the failure mode this file has now hit in three consecutive review rounds.
+# Whole-line AND trailing comments, in one place. THREE call sites now need
+# identical stripping — fn_code below, f5b's whole-script apt-get scan, and case
+# z4's anchor scan — and they had drifted: the trailing-comment half was added to
+# fn_code only, leaving f5b scanning with the old line-anchored filter while its
+# own comment claimed it stripped "exactly as fn_code does". MUTATION-PROVEN: an
+# unbounded `$SUDO apt-get install ...   # bound: timeout -k 30 900 -o
+# DPkg::Lock::Timeout=120` inside remove_phone_home measured 271 passed, exit 0,
+# printing "all 3 apt-get call(s) in the script carry the bound".
+#
+# The trailing-comment rule needs a preceding space so a `#` inside a word —
+# ${VAR#prefix}, $#, a URL fragment — is not read as a comment opener. It is not
+# a shell parser: a `#` inside a quoted string, preceded by a space, is still
+# stripped. For a PRESENCE pin that is fail-closed (the pin stops matching and
+# FAILS). For the COUNTED pins this PR added it is NOT: total and bounded are
+# derived from the same stripped text, so a call hidden from both leaves their
+# equality intact. install-chrome.sh has exactly one whitespace-preceded `#` on a
+# code line today (a real trailing comment on a `case` arm, which strips to valid
+# code), so nothing is over-stripped now — but a future quoted `#` before an
+# apt-cache call would silence it. Recorded rather than left implied.
+strip_comments() {
+    sed 's/[[:space:]]#.*$//' | grep -vE '^[[:space:]]*#' || true
+}
+
 fn_code() {
     # Whole-line comments AND trailing comments. The filter was line-anchored
     # (`grep -vE '^[[:space:]]*#'`), which strips a comment occupying its own
@@ -377,9 +400,7 @@ fn_code() {
     # string preceded by a space is still stripped), and it does not need to be:
     # over-stripping can only make a pin FAIL, never falsely pass, so the error
     # direction is fail-closed.
-    awk "/^$1\\(\\) \\{/,/^\\}/" "${INSTALL_SCRIPT}" \
-        | sed 's/[[:space:]]#.*$//' \
-        | grep -vE '^[[:space:]]*#' || true
+    awk "/^$1\\(\\) \\{/,/^\\}/" "${INSTALL_SCRIPT}" | strip_comments
 }
 
 # Pin the fixture tree's parent instead of inheriting $TMPDIR. This
@@ -863,7 +884,7 @@ fi
 # joining alone let two apt-get calls chained by `&&` across a continuation count
 # as one line, so an unbounded call rode along with a bounded one. Verified: a
 # two-call continuation counted 1 before this change and 2 after.
-script_body_f5_joined=$(grep -vE '^[[:space:]]*#' "${INSTALL_SCRIPT}" | normalize_commands)
+script_body_f5_joined=$(strip_comments < "${INSTALL_SCRIPT}" | normalize_commands)
 # The prefix set is a CHAIN of command words, not a fixed `$SUDO?timeout?`.
 # The predecessor required the literal `$SUDO`, so three behaviourally identical
 # forms evaded it and measured GREEN with an unbounded call present:
@@ -3543,7 +3564,7 @@ cleanup_all_src=$(sed -n '/^cleanup_all() {/,/^}/p' "${INSTALL_SCRIPT}")
 # blob, and this needs the statement-leading token of each line.
 installer_fns=$(grep -oE '^[a-z_][a-z0-9_]*\(\) \{' "${INSTALL_SCRIPT}" | sed 's/() {$//' | sort -u)
 cleanup_steps=$(printf '%s\n' "${cleanup_all_src}" \
-    | grep -vE '^[[:space:]]*#' \
+    | strip_comments \
     | grep -oE '^[[:space:]]*[a-z_][a-z0-9_]*' \
     | tr -d ' \t' \
     | sort -u \

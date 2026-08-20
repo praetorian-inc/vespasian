@@ -1782,26 +1782,43 @@ if [[ -f "$WORKFLOW" ]]; then
         elif ! command -v mktemp >/dev/null 2>&1; then
             fail "mktemp unavailable — cannot execute test/assert-chrome-install.sh to observe its render call"
         else
-            rdir=$(mktemp -d)
+            # Under THIS file's pinned temp root (see TMPDIR_T's rationale at the
+            # top), not a bare `mktemp -d`. This is the one fixture in the suite
+            # that holds EXECUTABLES which are then PATH-prepended and run, which
+            # is precisely the hazard that pin exists for: an inherited TMPDIR on
+            # a non-sticky directory lets a second local user swap the tree
+            # between creation and use and choose the binaries this suite
+            # executes. Living under TMPDIR_T also means the file-scope EXIT trap
+            # removes it if the suite dies before the `rm -rf` below.
+            rdir=$(TMPDIR="$TMPDIR_T" mktemp -d)
             # The stub logs its argv, then drops timeout's own options and the
             # DURATION before exec-ing the rest — same shape as
             # install-chrome-selftest.sh's plant_timeout_stub. A stub that
             # exec'd "$@" verbatim would try to run the duration as a command,
             # which is how the first draft of this check reported the script
             # broken when the script was fine.
-            cat > "$rdir/timeout" <<TIMEOUT_STUB
+            # QUOTED delimiter, with the log path passed as $1 by a tiny wrapper
+            # rather than interpolated. An unquoted here-doc was needed only to
+            # splice $rdir in, and that let a quote character in the path break
+            # out into the generated script — which is then EXECUTED.
+            # install-chrome-selftest.sh's copy of this stub takes the dir as an
+            # argument for the same reason.
+            cat > "$rdir/timeout-impl" <<'TIMEOUT_STUB'
 #!/bin/bash
-printf '%s\n' "\$*" >> "$rdir/timeout.log"
-while [ \$# -gt 0 ]; do
-    case "\$1" in
+log=$1; shift
+printf '%s\n' "$*" >> "$log"
+while [ $# -gt 0 ]; do
+    case "$1" in
         -k|-s|--kill-after|--signal) shift 2 ;;
         -k*|-s*|--kill-after=*|--signal=*|--preserve-status|--foreground) shift ;;
         *) break ;;
     esac
 done
 shift   # the duration
-exec "\$@"
+exec "$@"
 TIMEOUT_STUB
+            printf '#!/bin/bash\nexec "%s/timeout-impl" "%s/timeout.log" "$@"\n' "$rdir" "$rdir" > "$rdir/timeout"
+            chmod +x "$rdir/timeout-impl"
             printf '#!/bin/bash\n[ "$1" = "--version" ] && { echo "Google Chrome 999.0.0.0"; exit 0; }\necho "<html></html>"\n' > "$rdir/google-chrome"
             chmod +x "$rdir/timeout" "$rdir/google-chrome"
             # `|| render_rc=$?` rather than a bare call: this suite runs under
@@ -1814,7 +1831,14 @@ TIMEOUT_STUB
             rm -rf "$rdir"
             if [[ $render_rc -ne 0 ]]; then
                 fail "executing test/assert-chrome-install.sh against a healthy stub browser failed (rc $render_rc) — the assertion install-chrome-e2e depends on does not run"
-            elif [[ "$render_log" == *"--dump-dom"* ]] && [[ "$render_log" =~ -k[[:space:]]+[1-9][0-9]*[[:space:]]+[1-9][0-9]* ]]; then
+            # ONE LINE must satisfy BOTH predicates. Matching them against the
+            # whole concatenated log let two SEPARATE timeout invocations satisfy
+            # it jointly — one carrying the bound, another carrying --dump-dom.
+            # Not defeatable today, because chrome_runnable's probe passes a bare
+            # duration and is the only other timeout in the log; but adding `-k`
+            # to that probe would activate it, and the comment this commit adds
+            # to assert-chrome-install.sh discusses exactly that choice.
+            elif printf '%s\n' "$render_log" | grep -- '--dump-dom' | grep -qE -- '-k[[:space:]]+[1-9][0-9]*[[:space:]]+[1-9][0-9]*'; then
                 pass "executing test/assert-chrome-install.sh drives the browser with --dump-dom under a timeout carrying a positive -k bound (observed, not grepped)"
             else
                 fail "executing test/assert-chrome-install.sh did not invoke timeout with a positive -k bound around a --dump-dom render (observed argv: ${render_log:-<none>}) — the render either does not run or runs unbounded"

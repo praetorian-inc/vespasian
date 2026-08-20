@@ -45,7 +45,14 @@ echo "detected: ${bin}"
 #
 # `-k 5` for the reason install-chrome.sh gives for its own apt bounds: a
 # process can defer the first SIGTERM, so without a kill-after a wedged browser
-# outlives the bound. Every other bounded call in this tree carries one.
+# outlives the bound. That matches the three PRIVILEGED apt invocations, which
+# all carry one (`-k 5 30`, `-k 30 300`, `-k 30 900`). It deliberately does NOT
+# match the tree's three unprivileged probes — common.sh's chrome_runnable,
+# install-chrome.sh's _bounded_probe, and setup-live-targets.sh's wait_for_grpc
+# — which pass a bare duration. Those bound a `--version` call or a TCP connect
+# that either answers at once or is already wedged, so a kill-after buys nothing;
+# this one renders a document inside a root provisioning run, which is the shape
+# the apt bounds are written for.
 #
 # --no-sandbox is unconditional: this script's only caller is the
 # install-chrome-e2e job, which runs as root in a container where Chrome's
