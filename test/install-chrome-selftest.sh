@@ -30,8 +30,8 @@
 # cleanup_all's step order and errexit tolerance (x); the pre-install origin gate
 # (y); _bounded_probe's timeout enforcement (bp); the install lock's
 # symlink/hardlink guard and acquisition-failure handling (z); and this header
-# block's own two self-checks — the Covered list (cl) and the skip-credit
-# register (cr).
+# block's own three self-checks — the Covered list (cl), the skip-credit register
+# (cr), and the provenance note's pin figure (pn).
 # COVERED-LIST-END
 #
 # Each of those is behavioural: it fails if its check is removed, which an
@@ -97,7 +97,7 @@ export CHROME_PROBE_TIMEOUT=2
 #   +2  case bp3, pinning that the consolidated chrome_probe_budget still
 #       validates the budget for _bounded_probe as chrome_runnable does
 # See the credit register below for the matching skip_credit accounting.
-EXPECTED_ASSERTIONS=271
+EXPECTED_ASSERTIONS=272
 
 pass_count=0
 fail_count=0
@@ -163,10 +163,13 @@ SUITE_COMPLETED=0
 # f4, v and y each have TWO independent triggers (gpg/fixture, or timeout) but
 # one skip() call apiece, so a host missing both tools still credits 3/19/3 --
 # never double.
-# EXPECTED_ASSERTIONS above is 266, MEASURED on a fully-equipped host (pass+fail+
+# EXPECTED_ASSERTIONS above is 272, MEASURED on a fully-equipped host (pass+fail+
 # skip_credit with every arm live). It moved 238 -> 239 when case cr landed,
 # 239 -> 244 when case z4 gained the four ordering assertions plus the per-site
 # register check, 244 -> 245 when the anchor-completeness check landed, and
+# 271 -> 272 in the round-22 pass: +1 for case pn, which pins this very sentence
+# against the constant after it went stale three rounds running.
+#
 # 269 -> 271 in the round-20 pass: +2 for case m3, which pins that main() calls
 # require_tools BEFORE its first privileged apt invocation. MUTATION-PROVEN:
 # moving the call below the install block left all four suites green while a
@@ -192,7 +195,7 @@ SUITE_COMPLETED=0
 # list, +2 case cl, -1 case j's two source-line fragments becoming one equality
 # on the whole line).
 #
-# Every figure quoted below was re-measured at 266, not carried forward. This note
+# Every figure quoted below was re-measured at the CURRENT pin, not carried forward. This note
 # had gone stale by carry-forward in four consecutive review rounds before that
 # discipline was adopted.
 #
@@ -4400,6 +4403,28 @@ else
     pass_count=$((pass_count + 1))
 fi
 
+# ── Case pn: the provenance note's own pin figure matches the constant ──────
+# This note has now gone stale THREE times in three rounds — 238, 266 and 271 —
+# each time because a pin bump updated the constant and left the prose behind,
+# and each time it was caught by a reviewer rather than by the suite. Case cr
+# already derives the skip-credit register from the call sites for exactly this
+# reason; this is the same idea one figure over.
+#
+# Only the "EXPECTED_ASSERTIONS above is N" sentence is pinned. The delta history
+# below it ("238 -> 239", "266 -> 267") is a record of past measurements and is
+# correct as written; pinning those would freeze the history.
+pn_declared=$(grep -oE '^# EXPECTED_ASSERTIONS above is [0-9]+' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+$' || true)
+if [ -z "${pn_declared}" ]; then
+    echo "FAIL: case pn: could not find the 'EXPECTED_ASSERTIONS above is N' sentence in the provenance note — the check below is vacuous; fix the extraction rather than deleting it"
+    fail_count=$((fail_count + 1))
+elif [ "${pn_declared}" -eq "${EXPECTED_ASSERTIONS}" ]; then
+    echo "PASS: case pn: the provenance note's pin figure (${pn_declared}) matches EXPECTED_ASSERTIONS"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: case pn: the provenance note says the pin is ${pn_declared}, but EXPECTED_ASSERTIONS is ${EXPECTED_ASSERTIONS} — the note went stale when the pin moved, which is the carry-forward decay it warns about four paragraphs earlier"
+    fail_count=$((fail_count + 1))
+fi
+
 # ── Case cl: the COVERED list is derived from the case headers, not believed ──
 # The header block said the Covered list is "kept in sync with the actual case
 # letters" and nothing checked it — the same shape of unbacked claim this suite
@@ -4430,14 +4455,6 @@ else
         # Word-boundaried: a bare `grep -F v` would be satisfied by "v3" and by
         # the word "verification", so every label would appear covered.
         #
-        # And DESCRIBED, not merely mentioned. The parenthesised label has to be
-        # preceded on its line by prose — at least three words before the `(` —
-        # so appending a bare `(zz)` to the block cannot satisfy this check while
-        # saying nothing about what case zz covers. That is the gap the round-19
-        # review named: the assertion's own PASS text claims each group is
-        # "described", and a token match cannot support that word. Three words is
-        # deliberately a floor rather than a judgement of quality: the check can
-        # tell prose from a bare token, and cannot tell good prose from bad.
         # MENTIONED, deliberately — not "described". Two attempts at a prose
         # requirement were built and both had holes: a per-line word count
         # reported `cr` undescribed because its description wraps onto the line
