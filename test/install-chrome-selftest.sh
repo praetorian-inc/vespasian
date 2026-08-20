@@ -777,7 +777,11 @@ fi
 # cleanup_all unreached and that source standing for the life of the process.
 # fn_code strips comments, so a literal on a comment line cannot satisfy this.
 vao_body=$(fn_code verify_apt_origin)
-if printf '%s' "${vao_body}" | grep -qE 'policy=\$\(timeout -k [0-9]+ [0-9]+ apt-cache policy '; then
+# POSITIVE durations, not [0-9]+: `timeout 0` means "wait forever" in coreutils,
+# so `timeout -k 0 0` is a bound that is present and disabled. common.sh's
+# chrome_probe_budget rejects CHROME_PROBE_TIMEOUT=0 for exactly this reason, so
+# a pin that accepts it here would contradict the validation one file over.
+if printf '%s' "${vao_body}" | grep -qE 'policy=\$\(timeout -k [1-9][0-9]* [1-9][0-9]* apt-cache policy '; then
     echo "PASS: case f: verify_apt_origin's apt-cache call is bounded by timeout -k"
     pass_count=$((pass_count + 1))
 else
