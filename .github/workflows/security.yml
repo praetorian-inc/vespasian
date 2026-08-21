@@ -38,4 +38,16 @@ jobs:
       # noise. Mirrors golangci-lint's `exclusions.generated: lax`. The rest of
       # the args match the reusable workflow's default (observe-only + SARIF).
       gosec-args: "-no-fail -exclude-generated -fmt sarif -out gosec-results.sarif ./..."
+      # Override the reusable workflow's v2.22.11 default, which links
+      # golang.org/x/tools v0.39.0 and cannot read go1.27 export data. The gosec
+      # job runs `go-version: stable`, so when go1.27.0 became stable on
+      # 2026-08-20 every scan died before writing SARIF with
+      # `internal error: package "<stdlib pkg>" without types was imported from
+      # "command-line-arguments"` (the named package varies by run).
+      # v2.28.0 links x/tools v0.48.0, which reads it. Measured against this
+      # module: v2.22.11+go1.26.3 exit 0 / 21 findings, v2.22.11+go1.27.0 exit 1
+      # / no SARIF, v2.28.0+go1.27.0 exit 0 / 30 findings.
+      # Pin, never `latest`: a gosec release can require a newer Go than the
+      # runner provides. Re-pin when a future Go stable outruns x/tools v0.48.0.
+      gosec-version: "v2.28.0"
     secrets: inherit
