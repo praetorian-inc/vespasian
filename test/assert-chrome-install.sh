@@ -43,28 +43,21 @@ echo "detected: ${bin}"
 # not, rather than refusing to run. 30s, not CHROME_PROBE_BUDGET's 2s default,
 # because that budget bounds a --version call and this one paints a document.
 #
-# `-k 5` for the reason install-chrome.sh gives for its own apt bounds: a
-# process can defer the first SIGTERM, so without a kill-after a wedged browser
-# outlives the bound. That is the whole argument for it here.
+# `-k 5` for the reason install-chrome.sh gives for its own apt bounds: a process
+# can defer the first SIGTERM, so without a kill-after a wedged browser outlives
+# the bound. The pin in test-runner-args.sh reads the resolved kill-after and
+# duration from a stub and requires both positive, so deleting either reds CI.
 #
-# What the rest of the tree does, as fact rather than theory. Three calls carry a
-# kill-after: `timeout -k 30 300 apt-get update`, `timeout -k 30 900 apt-get
-# install`, and `timeout -k 5 30 apt-cache policy` (the last unprivileged — its
-# own comment says the call is read-only and needs no $SUDO). FOUR do not, all
-# passing a bare duration: common.sh's chrome_runnable, install-chrome.sh's
-# _bounded_probe, setup-live-targets.sh's wait_for_grpc, and validate.sh's
-# `"$runner" "$SPEC_VALIDATOR_TIMEOUT" node ...`. The fourth was missing from the
-# first count of this list — a reviewer found it — which is the third arithmetic
-# error this one paragraph has produced and the reason the next sentence exists.
-#
-# No rule is offered for which group a new call belongs to, deliberately. Three
-# earlier versions of this paragraph each proposed one — that all bounded calls
-# carry `-k`, that privilege is the split, that duration is the split — and each
-# was falsified by the source within a round: the first by three counter-examples,
-# the second by miscounting apt-cache as privileged, the third by claiming apt
-# "sits for tens of seconds" when its budgets are 300s and 900s. The counts above
-# are checkable; a taxonomy over six call sites was not, and it is not what this
-# comment needs to do. Its job is to stop someone deleting the `-k`.
+# This paragraph used to survey which other bounded calls in the tree carry a
+# kill-after and which do not. That inventory was wrong in four consecutive
+# reviews — a miscount, a mislabel, an unproven absolute, and a missing entry —
+# because it was hand-counted prose with nothing checking it, describing six call
+# sites this file does not own. It is gone rather than corrected a fifth time. If
+# you need to know what the tree does, `grep -rnE '(timeout|\}") -k' test/*.sh`
+# answers it in one command and cannot go stale. Note the second alternative: this
+# file and common.sh invoke timeout through a variable, so a search for the
+# literal `timeout -k` alone misses them — which is also why the deleted
+# hand-count kept missing entries.
 #
 # --no-sandbox is unconditional: this script's only caller is the
 # install-chrome-e2e job, which runs as root in a container where Chrome's

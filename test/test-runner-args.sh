@@ -1877,9 +1877,22 @@ TIMEOUT_STUB
             # implicit: a bound written after the binary is parsed by timeout as
             # arguments to the BROWSER, so it never becomes kill_after/duration at
             # all and the numbers come back `none`.
+            # ANCHORED to the start of the line, so only the stub's OWN resolved
+            # fields can satisfy this. Unanchored, the browser's argv — appended
+            # to the same line as `argv=` — could carry the text `kill_after=5
+            # duration=30` and satisfy the read while the bound was `0`.
+            # MUTATION-PROVEN defeated at head 68b9484.
+            #
+            # A fractional duration is allowed (`-k 5 1.5`), which timeout(1)
+            # accepts. Options this stub's loop does not model (`-v`, an
+            # abbreviation) land in the duration slot and fail this read with a
+            # named message — a false alarm in principle, accepted because this
+            # guard covers exactly one call site whose invocation shape is fixed
+            # and reviewed, and modelling all of timeout(1)'s options to remove a
+            # false alarm nobody can trigger is not worth the code.
             elif printf '%s\n' "$render_log" \
                  | grep -- '--dump-dom' \
-                 | grep -qE 'kill_after=[1-9][0-9]*[a-z]?[[:space:]]+duration=[1-9][0-9]*[a-z]?[[:space:]]'; then
+                 | grep -qE '^kill_after=[1-9][0-9]*(\.[0-9]+)?[a-z]?[[:space:]]+duration=[1-9][0-9]*(\.[0-9]+)?[a-z]?[[:space:]]'; then
                 pass "executing test/assert-chrome-install.sh drives the browser with --dump-dom under a timeout carrying a positive -k bound (observed, not grepped)"
             else
                 fail "executing test/assert-chrome-install.sh did not invoke timeout with a positive -k bound around a --dump-dom render (observed argv: ${render_log:-<none>}) — the render either does not run or runs unbounded"

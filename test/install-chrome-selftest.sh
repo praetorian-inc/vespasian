@@ -4569,9 +4569,12 @@ fi
 #     unexamined.
 # A strict pattern keeps `$(( ))` from ever seeing a non-decimal, and the count
 # pin turns a line that drops out of the extraction into a named failure.
+# Whitespace around `+` is tolerated: `grep -o` is a substring match, so spacing a
+# credit list out matched only its TAIL and reported `[3 + 4 + 3) = 275 -> 10]`,
+# a false "does not add up" on arithmetic that was correct. MEASURED.
 PN_EXPECTED_SUMS=4
 pn_sums=$(printf '%s\n' "${pn_block}" \
-    | grep -oE '(0|[1-9][0-9]*) \+ (0|[1-9][0-9]*) \+ \(?(0|[1-9][0-9]*)(\+(0|[1-9][0-9]*))*\)? = (0|[1-9][0-9]*)' || true)
+    | grep -oE '(0|[1-9][0-9]*) \+ (0|[1-9][0-9]*) \+ \(?(0|[1-9][0-9]*)([[:space:]]*\+[[:space:]]*(0|[1-9][0-9]*))*\)? = (0|[1-9][0-9]*)' || true)
 pn_sum_count=$(printf '%s\n' "${pn_sums}" | grep -c . || true)
 # TWO-ARMED, so this block emits the same number of counted outcomes whichever
 # way it goes. A bare conditional FAIL would add an outcome only when failing,
