@@ -1,7 +1,7 @@
 BINARY := vespasian
 MODULE := github.com/praetorian-inc/vespasian
 BUILD_DIR := bin
-# Keep in step with gosec-version in .github/workflows/security.yml; that job fails on
+# Must match gosec-version in .github/workflows/security.yml; that job fails on
 # findings, so a local run at another version can disagree with CI.
 GOSEC_VERSION ?= v2.28.0
 VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -61,15 +61,13 @@ fmt:
 vet:
 	go vet ./...
 
-# The scan the `security / Gosec` job runs, same args and pin, so a finding can be
-# reproduced locally. That job no longer passes -no-fail. Expects gosec on PATH, the
-# way `lint` expects golangci-lint.
+# The scan the `security / Gosec` job runs, so a finding can be reproduced locally;
+# that job no longer passes -no-fail. Run through `go run @$(GOSEC_VERSION)` rather
+# than a PATH binary because a go-installed gosec reports its version as "dev", so
+# there is no way to check that an already-installed one matches CI. Text output
+# instead of the workflow's SARIF, which exists for the upload step.
 gosec:
-	@command -v gosec >/dev/null 2>&1 || { \
-		echo "gosec not found. Install the pinned version:"; \
-		echo "  go install github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION)"; \
-		exit 1; }
-	gosec -exclude-generated ./...
+	go run github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION) -exclude-generated ./...
 
 check: fmt vet lint lint-comments gosec test check-docs
 

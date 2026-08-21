@@ -185,7 +185,7 @@ func handleWSDL(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 	// #nosec G104 G705
-	w.Write(wsdlData) //nolint:errcheck,gosec // test server best-effort response
+	w.Write(wsdlData) //nolint:errcheck // test server best-effort response
 }
 
 func handleIndex(w http.ResponseWriter, _ *http.Request) {

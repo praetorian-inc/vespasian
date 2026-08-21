@@ -103,9 +103,9 @@ func (p *OptionsProbe) probeURL(ctx context.Context, url string) []string {
 	}
 	defer func() {
 		// #nosec G104
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // best-effort drain
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck // best-effort drain
 		// #nosec G104
-		resp.Body.Close() //nolint:errcheck,gosec // best-effort close on read-only response
+		resp.Body.Close() //nolint:errcheck // best-effort close on read-only response
 	}()
 
 	if resp.StatusCode >= 400 {

@@ -625,7 +625,7 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 	}
 	defer func() {
 		// #nosec G104
-		page.Close() //nolint:errcheck,gosec // best-effort close; page may already be closed
+		page.Close() //nolint:errcheck // best-effort close; page may already be closed
 	}()
 
 	// Apply context and per-page timeout. pageDeadline mirrors that timeout as a

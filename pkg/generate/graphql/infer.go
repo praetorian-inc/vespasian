@@ -2094,7 +2094,7 @@ func parseGraphQLURL(rawURL string) *graphqlBody {
 	gb := &graphqlBody{Query: query}
 	if vars := u.Query().Get("variables"); vars != "" {
 		// #nosec G104
-		json.Unmarshal([]byte(vars), &gb.Variables) //nolint:errcheck,gosec // best-effort parse; invalid variables are silently ignored
+		json.Unmarshal([]byte(vars), &gb.Variables) //nolint:errcheck // best-effort parse; invalid variables are silently ignored
 	}
 	return gb
 }

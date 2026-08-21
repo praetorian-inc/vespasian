@@ -81,7 +81,7 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	// #nosec G104
-	json.NewEncoder(w).Encode(v) //nolint:errcheck,gosec // test server best-effort response
+	json.NewEncoder(w).Encode(v) //nolint:errcheck // test server best-effort response
 }
 
 func setCORSHeaders(w http.ResponseWriter) {
@@ -425,7 +425,7 @@ func handleBinaryResponse(w http.ResponseWriter, _ *http.Request) {
 	data := make([]byte, 128)
 	copy(data, []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A})
 	// #nosec G104
-	w.Write(data) //nolint:errcheck,gosec // test server best-effort response
+	w.Write(data) //nolint:errcheck // test server best-effort response
 }
 
 // handleMixedContent returns JSON with a field containing base64 binary data.
@@ -471,7 +471,7 @@ func handleMismatchedContentType(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
 	w.WriteHeader(http.StatusOK)
 	// #nosec G104
-	json.NewEncoder(w).Encode(map[string]string{"status": "mismatched"}) //nolint:errcheck,gosec // test server best-effort response
+	json.NewEncoder(w).Encode(map[string]string{"status": "mismatched"}) //nolint:errcheck // test server best-effort response
 }
 
 // handleAuthRequired returns 401 unless Authorization header is present.
@@ -492,7 +492,7 @@ func handleDeepLinks(w http.ResponseWriter, r *http.Request) {
 	level := strings.TrimPrefix(r.URL.Path, "/api/deep/")
 	var depth int
 	// #nosec G104
-	fmt.Sscanf(level, "%d", &depth) //nolint:errcheck,gosec // test server best-effort parse
+	fmt.Sscanf(level, "%d", &depth) //nolint:errcheck // test server best-effort parse
 	if depth <= 0 {
 		depth = 1
 	}
@@ -556,9 +556,9 @@ func handleGzipResponse(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Encoding", "gzip")
 	gz := gzip.NewWriter(w)
 	// #nosec G104
-	json.NewEncoder(gz).Encode(map[string]string{"compressed": "true", "data": "gzip-test-payload"}) //nolint:errcheck,gosec // test server best-effort response
+	json.NewEncoder(gz).Encode(map[string]string{"compressed": "true", "data": "gzip-test-payload"}) //nolint:errcheck // test server best-effort response
 	// #nosec G104
-	gz.Close() //nolint:errcheck,gosec // best-effort cleanup
+	gz.Close() //nolint:errcheck // best-effort cleanup
 }
 
 // ── Classifier edge case endpoints ──────────────────────────

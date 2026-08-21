@@ -58,10 +58,6 @@ No CLA or DCO sign-off is required to contribute.
   ```bash
   go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
   ```
-- **gosec v2.28.0** — pin this version to match CI, which fails the build on findings:
-  ```bash
-  go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
-  ```
 - **CGO enabled** (`CGO_ENABLED=1`) — CI builds with it, so keep it on locally
 - **A real Chrome/Chromium** — only needed for headless crawling and the live test suite, not for unit tests
 
@@ -74,7 +70,7 @@ make test             # go test -race ./...
 make fmt              # gofmt -s -w .
 make vet              # go vet ./...
 make lint             # golangci-lint run
-make gosec            # gosec, same args and pin as the security / Gosec CI job
+make gosec            # gosec at the version CI pins; fetched via `go run`, nothing to install
 make check            # fmt + vet + lint + lint-comments + gosec + test + check-docs
 make coverage         # Coverage profile + per-function report (excludes test/)
 make live-test-clean  # Stop orphaned live-test services
