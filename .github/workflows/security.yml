@@ -38,4 +38,9 @@ jobs:
       # noise. Mirrors golangci-lint's `exclusions.generated: lax`. The rest of
       # the args match the reusable workflow's default (observe-only + SARIF).
       gosec-args: "-no-fail -exclude-generated -fmt sarif -out gosec-results.sarif ./..."
+      # The reusable workflow's v2.22.11 default links x/tools v0.39.0, which
+      # cannot read go1.27 export data. Since the Gosec job runs
+      # `go-version: stable`, every scan died before writing SARIF once go1.27
+      # became stable. v2.28.0 links x/tools v0.48.0. Pinned, never `latest`.
+      gosec-version: "v2.28.0"
     secrets: inherit
