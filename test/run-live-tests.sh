@@ -288,25 +288,56 @@ _probe_target_host() {
 # a bare TCP connect where grpcurl is absent. Mirrors _probe_target_host's
 # contract, including returning 0 when the port is unset because
 # setup-live-targets.sh did not configure this target.
+#
+# EVERY branch carries a timeout, matching the `--max-time 5` its HTTP sibling
+# passes to curl. This is a PREFLIGHT: it exists so a misconfigured TEST_HOST
+# fails fast with a named URL instead of surfacing as mysterious empty captures
+# downstream. A probe that blocks defeats that purpose — against a filtered port
+# (a devcontainer TEST_HOST pointing at a host gateway, not the loopback
+# default) a connect attempt sits in SYN-retry, and the job reports nothing until
+# live-tests.yml's 30-minute ceiling kills it. grpcurl takes -max-time, nc takes
+# -w, and bash's /dev/tcp has no timeout of its own, so it runs under common.sh's
+# timeout_cmd — the same timeout/gtimeout seam chrome_runnable and
+# setup-live-targets.sh already resolve, rather than a fourth copy of that choice.
+#
+# With no bounded option at all (no grpcurl, no nc, no timeout/gtimeout) this
+# reports unreachable and names the missing tools instead of falling back to an
+# unbounded connect. Degrading to an unbounded probe would reintroduce the hang
+# the bound exists to prevent, and a preflight that hangs is strictly worse than
+# one that fails with a diagnosable reason.
 _probe_grpc_target() {
     local port=$1
     [ -z "$port" ] && return 0
+
+    # Same budget as _probe_target_host's curl --max-time, so the two probes
+    # agree on how long "unreachable" takes to decide.
+    local budget=5
+
     if command -v grpcurl >/dev/null 2>&1; then
-        if grpcurl -plaintext "${TEST_HOST}:${port}" list >/dev/null 2>&1; then
+        if grpcurl -max-time "$budget" -plaintext "${TEST_HOST}:${port}" list >/dev/null 2>&1; then
             log_ok "grpc-server reachable at ${TEST_HOST}:${port}"
             return 0
         fi
         log_fail "grpc-server is unreachable at ${TEST_HOST}:${port}"
         return 1
     fi
-    if command -v nc >/dev/null 2>&1 && nc -z "${TEST_HOST}" "${port}" 2>/dev/null; then
+
+    if command -v nc >/dev/null 2>&1 && nc -z -w "$budget" "${TEST_HOST}" "${port}" 2>/dev/null; then
         log_ok "grpc-server reachable at ${TEST_HOST}:${port} (nc)"
         return 0
     fi
-    if (echo >/dev/tcp/"${TEST_HOST}"/"${port}") 2>/dev/null; then
+
+    local t
+    t=$(timeout_cmd)
+    if [ -z "$t" ]; then
+        log_fail "grpc-server: no bounded probe available for ${TEST_HOST}:${port} (need grpcurl, nc, or timeout/gtimeout)"
+        return 1
+    fi
+    if "$t" "$budget" bash -c "echo > /dev/tcp/${TEST_HOST}/${port}" 2>/dev/null; then
         log_ok "grpc-server reachable at ${TEST_HOST}:${port} (/dev/tcp)"
         return 0
     fi
+
     log_fail "grpc-server is unreachable at ${TEST_HOST}:${port}"
     return 1
 }
@@ -1492,11 +1523,12 @@ PYEOF
         # multi-file blob. The lab target emits a single file, so this branch is
         # only a guard for future multi-file targets.
         log_info "Skipping .proto compile: emitted spec is multi-file (concatenated)"
-    elif (cd "$PROJECT_ROOT" && go run ./test/proto-validate "$spec_file") 2>/tmp/proto-validate.err; then
+    elif (cd "$PROJECT_ROOT" && go run ./test/proto-validate "$spec_file") \
+        2>"${target_dir}/proto-validate.err"; then
         log_ok "emitted .proto compiles (protocompile)"
     else
         log_fail "emitted .proto failed to compile:"
-        cat /tmp/proto-validate.err >&2
+        cat "${target_dir}/proto-validate.err" >&2
         failures=$((failures + 1))
     fi
 

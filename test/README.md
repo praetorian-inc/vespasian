@@ -540,7 +540,7 @@ All 32 tests should pass. Order is non-deterministic and durations vary by machi
   spec-edge                   PASS      -           -          0s
   ssrf-rejection              PASS      -           -          0s
 
-  Total: 31 passed, 0 failed, 0 skipped
+  Total: 32 passed, 0 failed, 0 skipped
 ```
 
 Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are informational and do not cause failures.
