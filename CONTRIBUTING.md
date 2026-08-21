@@ -76,7 +76,7 @@ make coverage         # Coverage profile + per-function report (excludes test/)
 make live-test-clean  # Stop orphaned live-test services
 ```
 
-Note that `make check` runs `make fmt` first, which rewrites files in place via `gofmt -s -w .` — it validates *and* reformats. Expect it to modify your working tree, and check `git status` afterwards so any reformatting lands in your commit rather than surprising you later. Use `make vet lint test` if you want the checks without the rewrite.
+Note that `make check` runs `make fmt` first, which rewrites files in place via `gofmt -s -w .` — it validates *and* reformats. Expect it to modify your working tree, and check `git status` afterwards so any reformatting lands in your commit rather than surprising you later. Use `make vet lint gosec test` if you want the checks without the rewrite.
 
 ### Devcontainers
 

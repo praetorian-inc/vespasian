@@ -595,7 +595,8 @@ cd vespasian
 make build       # Build the binary to bin/vespasian
 make test        # Run tests with race detection
 make lint        # Run golangci-lint (gocritic, misspell, revive)
-make check       # Run all checks (fmt, vet, lint, test)
+make gosec       # Run gosec at the version CI pins (fetched via go run)
+make check       # Run all checks (fmt, vet, lint, lint-comments, gosec, test, check-docs)
 ```
 
 ```bash

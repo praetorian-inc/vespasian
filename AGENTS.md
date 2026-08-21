@@ -27,7 +27,11 @@ make lint                     # Runs golangci-lint (gocritic, misspell, revive)
 # Format
 make fmt                      # Runs gofmt -s -w .
 
-# All checks (format, vet, lint, comment-claims, test, docs)
+# Gosec, at the version .github/workflows/security.yml pins. Fetched via `go run`,
+# so nothing needs installing. That CI job fails on findings, so this must be clean.
+make gosec
+
+# All checks (format, vet, lint, comment-claims, gosec, test, docs)
 make check
 
 # Community-health docs only (presence, link/anchor resolution, CODEOWNERS roster)
@@ -186,6 +190,7 @@ A file being edited is the moment to clear it.
 - Test files match source files (`foo.go` → `foo_test.go`)
 - Formatting enforced by `gofmt -s` (run `make fmt`)
 - Linting via `golangci-lint` with gocritic, misspell, revive (run `make lint`)
+- Gosec suppressions use `#nosec <RULE> -- <reason>`, never `//nolint:gosec`. gosec runs both inside `golangci-lint`, which honors `//nolint`, and as the separate `security / Gosec` job, which honors only `#nosec`, so a `//nolint:gosec` leaves `make lint` green while that job fails (LAB-6011). Run `make gosec`.
 - Package-level documentation lives in `doc.go` files
 
 ## Development Workflow
