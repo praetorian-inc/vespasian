@@ -902,15 +902,29 @@ fi
 # never undercount, the bounded must never overcount. One shared filter cannot
 # satisfy both, which is why strip_comments is deliberately NOT used for the
 # total here despite being used for the bounded count two lines down.
-# Trailing comments are BLANKED, not deleted to end-of-line: `s/[[:space:]]#.*$/ /`
-# leaves the code before the `#` intact, so a comment can neither hide a call from
-# the total (deleting to EOL took the call with it — the round-23 medium) nor
-# inflate it (a comment reading "historically: cd /tmp && apt-get update" counted
-# as a third call and reddened both arms on correct code — MEASURED). The
-# whole-line filter still runs first, and a bash line whose first non-space
-# character is `#` does not execute, so dropping those matches shell semantics.
-script_body_f5_total=$(grep -vE '^[[:space:]]*#' "${INSTALL_SCRIPT}" \
-    | sed 's/[[:space:]]#.*$/ /' | normalize_commands)
+# The TOTAL strips WHOLE-LINE comments only — deliberately, and it errs LOUD.
+#
+# No single filter is fail-closed in both directions, because a `#` cannot be
+# classified as a comment opener without knowing whether it sits inside quotes,
+# which is parsing. MEASURED on the two carriers that matter:
+#   whole-line only    : hidden call counted 1 (CAUGHT), a trailing comment
+#                        naming an apt-get call counted 1 (FALSE ALARM)
+#   also-trailing strip: hidden call counted 0 (MISSED), trailing comment 0 (quiet)
+# The second is what this filter did for two rounds, and it is why the round-23
+# medium survived being "fixed" twice: `: "step #1" ; $SUDO apt-get install ...`
+# has its `#` inside a quoted string, so real shell runs the apt-get while both
+# a delete-to-EOL and a blank-to-EOL remove it. Measured DEFEATED at head
+# 68b9484 after two commits that each claimed to close it.
+#
+# So this takes the loud error. A trailing comment that names an apt-get call
+# trips the count and must be reworded — visible, cheap, and the reviewer sees
+# exactly why. The alternative admits an unbounded privileged apt-get in silence,
+# on the root provisioning path, which is the whole reason this pin exists.
+#
+# The BOUNDED count below keeps the trailing strip, so a comment parking the
+# bound literals beside an unbounded call still cannot satisfy it. The two
+# filters differ, and the direction each protects is stated rather than implied.
+script_body_f5_total=$(grep -vE '^[[:space:]]*#' "${INSTALL_SCRIPT}" | normalize_commands)
 script_body_f5_joined=$(strip_comments < "${INSTALL_SCRIPT}" | normalize_commands)
 # The prefix set is a CHAIN of command words, not a fixed `$SUDO?timeout?`.
 # The predecessor required the literal `$SUDO`, so three behaviourally identical
@@ -926,10 +940,11 @@ script_body_f5_joined=$(strip_comments < "${INSTALL_SCRIPT}" | normalize_command
 # not in command position, and a free `.*` before apt-get would turn this red on
 # correct code. Verified against the real script: exactly 2 matches, 0 of them the
 # help string; and each of the three evasions above raises the count to 3.
-# `(` is in the separator class so command substitution counts: without it,
+# `(` and a backtick are in the separator class so both command-substitution
+# spellings count: without them,
 # `out=$($SUDO apt-get install -y x)` sat in neither line-start nor `;&|`
 # position and was invisible to this scan. MEASURED before and after.
-aptget_call_re='(^|[;&|(][[:space:]]*)[[:space:]]*(if[[:space:]]+!:?[[:space:]]+)?([[:space:]]*(\$SUDO|sudo|env|timeout|nice|ionice)[[:space:]]+([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+|-[^[:space:]]+[[:space:]]+|[0-9]+[[:space:]]+)*)*apt-get[[:space:]]+(update|install)[[:space:]]'
+aptget_call_re='(^|[;&|(`][[:space:]]*)[[:space:]]*(if[[:space:]]+!:?[[:space:]]+)?([[:space:]]*(\$SUDO|sudo|env|timeout|nice|ionice)[[:space:]]+([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+|-[^[:space:]]+[[:space:]]+|[0-9]+[[:space:]]+)*)*apt-get[[:space:]]+(update|install)[[:space:]]'
 f5_aptget_lines=$(printf '%s\n' "${script_body_f5_total}" \
     | grep -cE "$aptget_call_re" || true)
 f5_aptget_bounded=$(printf '%s\n' "${script_body_f5_joined}" \
@@ -953,12 +968,23 @@ fi
 #              had been absent from this residual list, and it is the shape most
 #              likely to appear innocently — capturing apt's output is ordinary
 #              code, where `eval` is not.
-#   NOT caught — any form that puts the call somewhere this regex's prefix set
-#              does not reach: `eval "..."`, `bash -c "..."`, `sh -c "..."`,
-#              backticks, and `xargs apt-get ...`. The prefix set is the fixed
-#              list `$SUDO|sudo|env|timeout|nice|ionice`, so a new wrapper word is
-#              a new hole by construction — this is a blind spot with a shape, not
-#              a list of two exceptions. Closing it means evaluating strings the
+#   NOT caught — and the causes are NOT one shape, which an earlier version of
+#              this note claimed. Three distinct causes, each needing a different
+#              fix, established by testing them rather than grouping them:
+#                * a QUOTING barrier — `eval "..."`, `bash -c "..."`, `sh -c "..."`.
+#                  The call is inside a string this scan reads but never
+#                  evaluates. No regex reaches it; closing it means writing a
+#                  shell parser.
+#                * the PREFIX SET — `xargs apt-get ...`. The set is the fixed list
+#                  `$SUDO|sudo|env|timeout|nice|ionice`, so each new wrapper word
+#                  is a new hole. This one IS extensible, one word at a time.
+#                * the SEPARATOR CLASS — a backtick was in this list until it was
+#                  measured and found to be a one-character fix, now applied.
+#                  `; then $SUDO apt-get ...` and `&& { apt-get ...` remain: after
+#                  normalize_commands splits on `;`, `then` and `{` sit in the
+#                  prefix slot and match nothing.
+#              Grouping all five under the prefix set read as one extensible hole
+#              when two of the three causes are not. Closing it means evaluating strings the
 #              scan only reads, i.e. writing a shell parser, which is why the two
 #              real apt calls are ALSO pinned by exact literal in the check above:
 #              this count is one layer, deliberately not the only one.

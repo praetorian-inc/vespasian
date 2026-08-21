@@ -1818,8 +1818,12 @@ if [[ -f "$WORKFLOW" ]]; then
 # this log were each defeated or made to false-alarm (satisfiable from a comment,
 # satisfiable across two invocations, blind to the bound's position, then blind to
 # the DURATION while rejecting `--preserve-status -k 5 30`). A parser cannot be
-# out-spelled: `-k 5`, `-k5`, `--kill-after=5` and a leading `-s KILL` all resolve
-# to the same two numbers.
+# out-spelled by the shapes this call can take: `-k 5`, `-k5`, `--kill-after=5`,
+# `--kill-after 5` and a leading `-s KILL` all resolve to the same two numbers,
+# verified against timeout(1) itself. Not an absolute — a token this loop does not
+# recognise lands in the duration slot, where it fails the numeric check or breaks
+# the exec. That is fail-closed, which is the property being claimed, rather than
+# completeness, which is not.
 log=$1; shift
 argv="$*"
 ka=""

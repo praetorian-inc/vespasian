@@ -137,12 +137,14 @@ chrome_probe_budget() {
     CHROME_PROBE_BUDGET=$budget
 }
 
-# Echoes `timeout`, `gtimeout` (macOS + coreutils), or nothing. Three callers:
+# Echoes `timeout`, `gtimeout` (macOS + coreutils), or nothing. Four callers:
 # chrome_runnable and _bounded_probe (install-chrome.sh) share the
 # CHROME_PROBE_TIMEOUT-bounded browser probe; wait_for_grpc (setup-live-
 # targets.sh) reuses only this selection, not the budget validation above — its
 # hardcoded 2s bounds a gRPC connect probe, not a browser probe, and must not
-# start reading CHROME_PROBE_TIMEOUT. `t=$(timeout_cmd)` is a safe command
+# start reading CHROME_PROBE_TIMEOUT. The fourth is assert-chrome-install.sh's
+# post-install render, added by LAB-5064; it reuses only this selection too, and
+# bounds at 30s because it paints a document rather than reading a version. `t=$(timeout_cmd)` is a safe command
 # substitution here: this function sets no latch/state, unlike
 # chrome_probe_budget above.
 timeout_cmd() {
