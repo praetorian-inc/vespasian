@@ -171,7 +171,7 @@ func handleWSDL(w http.ResponseWriter, r *http.Request) {
 
 	var wsdlData []byte
 	for _, path := range candidates {
-		data, readErr := os.ReadFile(path) //nolint:gosec // G304: test server, path from known WSDL files
+		data, readErr := os.ReadFile(path) // #nosec G304 G703 -- test server, path from known WSDL files
 		if readErr == nil {
 			wsdlData = data
 			break
@@ -184,6 +184,7 @@ func handleWSDL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	// #nosec G104 G705
 	w.Write(wsdlData) //nolint:errcheck,gosec // test server best-effort response
 }
 
@@ -207,7 +208,7 @@ func main() {
 	// live in test/internal/target, so there is one copy to reason about and one
 	// place for Test 18b to assert.
 	addr := target.Addr(port)
-	log.Printf("soap-service listening on http://%s/", addr) //nolint:gosec // test server, log injection N/A
+	log.Printf("soap-service listening on http://%s/", addr) // #nosec G706 -- test server, log injection N/A
 	srv := target.Server(addr, mux)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)

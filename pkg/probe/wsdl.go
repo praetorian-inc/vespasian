@@ -116,8 +116,10 @@ func (p *WSDLProbe) fetchWSDL(ctx context.Context, baseURL string) []byte {
 		return nil
 	}
 	defer func() {
+		// #nosec G104
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // best-effort drain
-		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close
+		// #nosec G104
+		resp.Body.Close() //nolint:errcheck,gosec // best-effort close
 	}()
 
 	if resp.StatusCode >= 400 {
