@@ -23,8 +23,28 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # Path to the resolved-ports config written by setup-live-targets.sh. Overridable
 # via the CONFIG_FILE env var (used by test/test-runner-args.sh --dry-run runs).
 CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/.live-test-config}"
-RESULTS_DIR="${SCRIPT_DIR}/.results"
-VESPASIAN="${PROJECT_ROOT}/bin/vespasian"
+# Where per-target results are written. Overridable via the RESULTS_DIR env var
+# (same pattern as CONFIG_FILE below) so test/test-runner-args.sh can point a
+# real run at a temp dir instead of writing into the repo checkout.
+RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/.results}"
+# Overridable so test-runner-args.sh can pin the binary-absent arm and get the
+# same assertion in CI (where this runs before the build) as locally (where
+# bin/vespasian already exists). Also lets an operator point the suite at a
+# binary built elsewhere.
+# ANNOUNCED when it comes from the environment. The name is generic enough for
+# an unrelated ambient value to select the binary every crawl/generate in this
+# suite executes, and a silent redirect means the run reports on a binary the
+# operator did not mean to test. Not renamed to a namespaced form: this is a
+# read-only selector with no privilege boundary (unlike install-chrome.sh's
+# VESPASIAN_TEST_ROOT, which gates privileged writes and IS namespaced), and
+# test-runner-args.sh pins this name to exercise the binary-absent arm.
+# Derived into a name the environment cannot pre-set: an inherited
+# VESPASIAN_FROM_ENV fired the notice below with VESPASIAN UNSET, printing the
+# default path on both sides of "not". `local` is unavailable at file scope, so
+# the flag is cleared first and only then set — an inherited value cannot survive.
+_vespasian_from_env=""
+if [ -n "${VESPASIAN:-}" ]; then _vespasian_from_env="${VESPASIAN}"; fi
+VESPASIAN="${VESPASIAN:-${PROJECT_ROOT}/bin/vespasian}"
 
 # Hostname the test harness uses to reach the target services. Defaults to
 # "localhost" for host-only runs. Set TEST_HOST=host.docker.internal (or the
@@ -115,9 +135,55 @@ resolve_targets() {
     printf '%s\n' "$resolved"
 }
 
+# targets_need_config returns 0 when the resolved target list contains at least
+# one target that talks to a live service — i.e. one that needs the ports
+# setup-live-targets.sh writes into .live-test-config.
+#
+# Membership in OFFLINE_TARGETS is the test, rather than a second
+# hand-maintained list: an offline target is service-free by definition, and
+# test-runner-args.sh already guards that array against drift from the dispatch
+# block. A target absent from OFFLINE_TARGETS is assumed to need config, so the
+# unknown/typo case fails loudly on a missing config instead of running
+# half-configured against default ports.
+targets_need_config() {
+    # read -ra from a QUOTED here-string rather than an unquoted ${1//,/ }:
+    # word-splitting an unquoted expansion also GLOBS, so a target list
+    # containing * would expand against the cwd before it was ever compared.
+    # This predicate decides whether a gate applies, so it must not rely on
+    # downstream validation to catch that.
+    #
+    # Note the here-string, NOT `local IFS=,` + read: IFS also controls how
+    # "${OFFLINE_TARGETS[*]}" below joins, so setting it to a comma silently
+    # turns the haystack into a comma-joined string and breaks the
+    # space-delimited match.
+    #
+    # SIBLING: setup-live-targets.sh's browser_required uses this same split for
+    # the same reason. The two are deliberately NOT factored into a shared
+    # helper — not because sharing is impossible, but because it isn't worth it
+    # for one shared line; see the note there for the divergence that makes a
+    # common predicate awkward. If you change this split, change that one too;
+    # both are pinned by glob assertions.
+    local target parts
+    read -ra parts <<< "${1//,/ }"
+    for target in "${parts[@]}"; do
+        case " ${OFFLINE_TARGETS[*]} " in
+            *" ${target} "*) ;;   # service-free — needs nothing from the config
+            *) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 # Source shared colors, logging, and validation functions
 # shellcheck source=common.sh
 source "${SCRIPT_DIR}/common.sh"
+
+# Announced HERE, not at the VESPASIAN default above: common.sh (which defines
+# log_warn) is not sourced until this line, so the notice cannot be emitted
+# earlier without calling an undefined function.
+if [ -n "$_vespasian_from_env" ]; then
+    log_warn "VESPASIAN was set in the environment (${_vespasian_from_env}) — every crawl/generate in this run uses THAT binary, not ${PROJECT_ROOT}/bin/vespasian."
+fi
 # shellcheck source=validate.sh
 source "${SCRIPT_DIR}/validate.sh"
 # shellcheck source=form-spec-asserts.sh
@@ -134,10 +200,14 @@ load_config() {
         exit 1
     fi
 
-    # Only these keys may be set from the config file. An explicit allowlist
+    # Only these keys may be set from the CONFIG FILE. An explicit allowlist
     # (rather than any KEY=VALUE) ensures a crafted or hand-edited config can
-    # never rebind security-relevant globals such as VESPASIAN, PATH,
-    # RESULTS_DIR, or TEST_HOST.
+    # never rebind PATH or TEST_HOST, or a global this file itself only ever
+    # sets from the environment (VESPASIAN, RESULTS_DIR — see their
+    # env-override assignments above; a config-file value can never reach
+    # them). It does NOT constrain those two globals' own environment
+    # overrides, which are deliberately settable by the same user who runs
+    # this script (see test/README.md's TEST_HOST/RESULTS_DIR docs).
     local allowed_keys=" REST_API_PORT SOAP_SERVICE_PORT GRAPHQL_SERVER_PORT GRPC_SERVER_PORT CONCAT_SPA_PORT FORMS_TARGET_PORT TARGETS_SETUP "
 
     # Safety: only allow safe KEY=VALUE lines
@@ -146,11 +216,46 @@ load_config() {
         [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
         # Validate format
         if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@,+\"\ -]*$ ]]; then
-            local key="${line%%=*}"
+            local key="${line%%=*}" value="${line#*=}"
             if [[ "$allowed_keys" != *" ${key} "* ]]; then
                 log_warn "Skipping unexpected config key: ${key}"
                 continue
             fi
+            # The allowlist above only protects the KEY half — the format
+            # regex still admits '@'/':' in the VALUE, so
+            # REST_API_PORT=@evil.com would pass both checks and, unvalidated,
+            # make _probe_target_host build a URL curl parses as userinfo +
+            # an attacker-chosen host. Every allowlisted key
+            # except TARGETS_SETUP is a TCP port, so require a numeric
+            # 1-65535 value for those, and a plain target-list charset for
+            # TARGETS_SETUP.
+            case "$key" in
+                TARGETS_SETUP)
+                    if [[ ! "$value" =~ ^[A-Za-z0-9,-]*$ ]]; then
+                        log_warn "Skipping ${key}: unexpected characters in value: ${value}"
+                        continue
+                    fi
+                    ;;
+                *)
+                    # An EMPTY port value means "this target was never set up"
+                    # (setup-live-targets.sh's write_config emits every
+                    # allowlisted key unconditionally, so a partial setup —
+                    # e.g. `--targets rest-api` — writes SOAP_SERVICE_PORT=
+                    # with no value), not a tampered one. Warning on that
+                    # trains readers to scroll past the one alarm that
+                    # matters when a value is genuinely malformed.
+                    # Every other consumer already reads
+                    # ${VAR:-default}, so skipping silently changes nothing
+                    # about the resolved port.
+                    if [ -z "$value" ]; then
+                        continue
+                    fi
+                    if [[ ! "$value" =~ ^[0-9]{1,5}$ ]] || [ "$value" -lt 1 ] || [ "$value" -gt 65535 ]; then
+                        log_warn "Skipping ${key}: not a valid port (1-65535): ${value}"
+                        continue
+                    fi
+                    ;;
+            esac
             declare -g "$line"
         else
             log_warn "Skipping invalid config line: $line"
@@ -307,18 +412,22 @@ crawl_backend() {
 }
 
 # chrome_available returns 0 if Chrome is likely reachable, 1 otherwise.
-# This is a best-effort shell heuristic (binary presence or rod's cached
-# Chromium directory) and may diverge from the Go skipIfNoChrome probe, which
-# actually attempts to launch a headless browser via NewBrowserManager. A false
-# positive here (chrome_available returns 0 but Chrome fails to launch) degrades
-# to a log_warn + skip, never a hard failure. A false negative causes the rod
-# backend to be skipped even when Chrome is present; re-run with an explicit
-# Chrome binary on PATH if rod skips unexpectedly.
+#
+# Delegates to detect_chrome_binary (test/common.sh), which RUNS the candidate
+# rather than merely resolving it. That matters on a stock devcontainer, where
+# /usr/bin/chromium-browser is a snap launcher stub: the old presence-only probe
+# (command -v) returned 0 for it, so rod-backed targets were attempted and then
+# failed inside the crawl instead of skipping with a clear reason. Sharing the
+# probe also means the runner, setup-live-targets.sh's preflight, and
+# install-chrome.sh's idempotency check can no longer disagree about whether this
+# host has a usable browser.
+#
+# The rod cache remains a fallback: go-rod can drive a browser it downloaded
+# itself, which is not on PATH and so invisible to the candidate list.
+#
+# A false positive still degrades to a log_warn + skip, never a hard failure.
 chrome_available() {
-    command -v google-chrome >/dev/null 2>&1 || \
-    command -v chromium >/dev/null 2>&1 || \
-    command -v chromium-browser >/dev/null 2>&1 || \
-    [ -d "$HOME/.cache/rod/browser" ]
+    detect_chrome_binary >/dev/null 2>&1 || [ -d "$HOME/.cache/rod/browser" ]
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -407,7 +516,7 @@ test_rest_api() {
     # templated path such as "/api/{slug}" — which merge-slugs is designed to
     # produce. scan-rest already has this literal check; without it here the
     # fixture's capability claim rests on a wildcard-tolerant matcher
-    # (PR #187 review finding TEST-001).
+    # (PR #187 review).
     if grep -q "/api/subscribe" "$spec_file"; then
         log_ok "rest-api: /api/subscribe present (generate's ExtractForms augmentation ran)"
     else
@@ -420,8 +529,8 @@ test_rest_api() {
     # exact path key), and that the form's urlencoded body fields (email, name)
     # surface as request-body schema properties UNDER THAT ENDPOINT
     # (assert_form_body_fields). Without these, the fixture's POST-method + body
-    # -field expectations for /api/subscribe were inert (PR #187 review finding
-    # TEST-006). These are the same helpers forms-target uses; $expected already
+    # -field expectations for /api/subscribe were inert (PR #187 review).
+    # These are the same helpers forms-target uses; $expected already
     # points at rest-api/expected-paths.json, which now carries post_form_paths
     # and post_form_body_fields_by_path for /api/subscribe.
     #
@@ -429,7 +538,7 @@ test_rest_api() {
     # registers no /api/subscribe handler, so the catch-all mux serves the
     # crawler's GET probe as 200 text/html (the index page), NOT a 404. The GET
     # stays out of the spec via non-API/HTML content-type classification, not via
-    # a 404/confidence filter (PR #208 review finding TEST-002).
+    # a 404/confidence filter (PR #208 review).
     if ! assert_post_get_operations "$spec_file" "$expected"; then
         failures=$((failures + 1))
     fi
@@ -437,7 +546,7 @@ test_rest_api() {
         failures=$((failures + 1))
     fi
 
-    # TEST-001 (PR #208): lock the per-path method sets this fixture declares.
+    # PR #208 review: lock the per-path method sets this fixture declares.
     # expected-paths.json intentionally lists /api/login and /api/upload as
     # GET-only here (two-stage crawl + generate --probe=false: no JS runs, the
     # inline fetch POST literals are recovered statically as GET candidates); a
@@ -452,8 +561,7 @@ test_rest_api() {
     # non-deterministic, so the generated spec's serialization (parameter
     # naming, ordering) varies between runs. Exact spec-text comparison is done
     # in test_generate_rest, which uses a fixed import as input. The path COUNT
-    # is deterministic (same recovered set as scan-rest) and IS asserted below
-    # (TEST-004).
+    # is deterministic (same recovered set as scan-rest) and IS asserted below.
 
     local endpoint_count
     endpoint_count=$(count_spec_endpoints "$spec_file")
@@ -465,7 +573,7 @@ test_rest_api() {
     # scan (see the fixtures' lockstep note), so — exactly as test_scan_rest
     # already does against the same server — a regression that emitted the
     # expected paths plus spurious ones must not report PASS with a mismatched
-    # pair of numbers in the summary (PR #187 review finding TEST-004).
+    # pair of numbers in the summary (PR #187 review).
     if ! assert_exact_path_count "rest-api" "$endpoint_count" "$expected_count"; then
         failures=$((failures + 1))
     fi
@@ -547,7 +655,7 @@ test_scan_rest() {
         failures=$((failures + 1))
     fi
 
-    # As with test_rest_api (TEST-006): prove ExtractForms produced a POST-only
+    # As with test_rest_api: prove ExtractForms produced a POST-only
     # /api/subscribe operation with its urlencoded body fields (email, name)
     # attached to that endpoint, not merely that the path string appears.
     # $expected here points at rest-api/scan-expected-paths.json (kept in
@@ -555,7 +663,7 @@ test_scan_rest() {
     #
     # As in test_rest_api, GET-absence here is enforced by non-API/HTML
     # classification — the unrouted /api/subscribe is served 200 text/html by the
-    # catch-all mux, NOT a 404 (PR #208 review finding TEST-002).
+    # catch-all mux, NOT a 404 (PR #208 review).
     if ! assert_post_get_operations "$spec_file" "$expected"; then
         failures=$((failures + 1))
     fi
@@ -563,7 +671,7 @@ test_scan_rest() {
         failures=$((failures + 1))
     fi
 
-    # TEST-001 (PR #208): the scan counterpart. scan-expected-paths.json lists
+    # PR #208 review: the scan counterpart. scan-expected-paths.json lists
     # /api/login and /api/upload as GET+POST here (single-stage headless scan: JS
     # fires the POSTs and probing observes them), diverging from the two-stage
     # fixture on exactly those two paths. Locking both sides makes the
@@ -580,7 +688,7 @@ test_scan_rest() {
     # Exact-count: validate_path_coverage only detects MISSING paths, so without
     # this a scan regression that emitted the expected paths plus spurious ones
     # would report PASS with a mismatched pair of numbers in the summary
-    # (PR #187 review finding TEST-002).
+    # (PR #187 review).
     if ! assert_exact_path_count "scan-rest" "$endpoint_count" "$expected_count"; then
         failures=$((failures + 1))
     fi
@@ -599,7 +707,7 @@ test_scan_rest() {
 # generated spec. It is called identically by test_concat_spa (single-stage
 # scan) and test_concat_spa_two_stage (two-stage crawl+generate) so the two
 # tests stay directly comparable while the battery lives in one place
-# (LAB-3892 review, TEST-001). The four checks + exact-count assertion are
+# (LAB-3892 review). The four checks + exact-count assertion are
 # preserved exactly; see test_concat_spa for what each layer proves.
 #
 # It follows the existing resolve_port_or_die convention of returning multiple
@@ -1001,7 +1109,7 @@ test_forms_target() {
         failures=$((failures + 1))
     fi
     # Each POST form action must carry a POST operation and NO GET operation,
-    # scoped to its own path block (TEST-003: assert_post_get_operations walks the
+    # scoped to its own path block (assert_post_get_operations walks the
     # spec per exact path key instead of whole-file grepping a summary line). This
     # covers both the "POST present" half (extraction/classification reached the
     # spec) and the "GET absent" half (the crawler's 404 GET probes were filtered).
@@ -1039,7 +1147,7 @@ test_forms_target() {
         failures=$((failures + 1))
     fi
 
-    # Value-blanking guard (TEST-001): ExtractForms blanks hidden/password/CSRF
+    # Value-blanking guard: ExtractForms blanks hidden/password/CSRF
     # field VALUES while keeping their names. The fixture seeds distinctive
     # sentinels on the hidden fields (test/forms-target/main.go: csrf_token,
     # _token); assert neither leaks into either generated spec. A regression that
@@ -2290,7 +2398,7 @@ test_import_malformed() {
     # panic / goroutine stack trace (LAB-3890 T3, gap B3). The detection itself
     # lives in validate.sh:assert_no_panic so validate_test.sh can regression-test
     # the regex; this thin wrapper keeps sharing this function's `failures` via
-    # bash dynamic scoping (PR #187 review finding TEST-002).
+    # bash dynamic scoping (PR #187 review).
     check_panic() {
         assert_no_panic "$1" "$2" || failures=$((failures + 1))
     }
@@ -2383,7 +2491,7 @@ test_ssrf_rejection() {
     # a reason unrelated to what it asserts. No server and no browser needed —
     # rejection happens before any connection.
     #
-    # SCOPE (PR #187 review finding SEC-BE-002): vespasian gates private/loopback
+    # SCOPE (PR #187 review): vespasian gates private/loopback
     # traffic on TWO independent surfaces, each with its own
     # --dangerous-allow-private bypass — the crawl frontier asserted above, and
     # the separate probe path (GenerateCmd, cmd/vespasian/main.go:472; enabled by
@@ -2449,7 +2557,7 @@ test_auth_capture() {
     # file, with no proof the header is attached to the right request. This
     # requires exactly one imported entry whose method/url round-tripped from the
     # fixture and whose Authorization header carries the fixture's token
-    # (PR #187 review finding TEST-003).
+    # (PR #187 review).
     local result rc=0
     result=$(python3 - "$imported_file" << 'PYEOF'
 import json, sys
@@ -2489,14 +2597,14 @@ PYEOF
     # KNOWN GAP (LAB-3890 T4 / A5, rescoped to import-side auth preservation
     # only): the generator does not yet emit OpenAPI securitySchemes from
     # captured auth. Asserting captured-auth -> securitySchemes ships with
-    # LAB-5332 (PR #187 review finding REQ-001 — the prior claim that this was
+    # LAB-5332 (PR #187 review — the prior claim that this was
     # tracked elsewhere was unverifiable at review time, since no such ticket
     # existed); this target asserts only that auth is captured/preserved.
     log_info "auth-capture: NOTE — securitySchemes generation from captured auth is tracked in LAB-5332 (not yet implemented)."
 
     # Measured, not hardcoded — the summary row must report what was actually
     # imported, not a literal that would keep reading "1" even if the import
-    # stopped producing entries entirely (PR #187 review finding TEST-003).
+    # stopped producing entries entirely (PR #187 review).
     local entry_count
     entry_count=$(json_len "$imported_file")
 
@@ -3072,7 +3180,7 @@ urls = [r['url'] for r in data]
 beyond = [u for u in urls if '/deep/4' in u or '/deep/5' in u or '/deep/6' in u]
 # Positive side of the boundary: --depth 2 from seed /deep/1 MUST actually reach
 # /deep/2 or /deep/3. Without this, an under-crawl that stops at the seed also
-# reports zero /deep/4+ and would pass green (PR #187 review finding TEST-003).
+# reports zero /deep/4+ and would pass green (PR #187 review).
 reached = [u for u in urls if '/deep/2' in u or '/deep/3' in u]
 print(len(beyond), len(reached))
 PYEOF
@@ -3082,7 +3190,7 @@ PYEOF
         # Both counts come from word-splitting one line of python stdout, so a
         # change to that print format yields garbage rather than a number.
         # assert_within_depth rejects a non-numeric value on EITHER side; the
-        # old inline check guarded only reached_depth (PR #187 finding TEST-004).
+        # old inline check guarded only reached_depth (PR #187 review).
         if assert_within_depth "Depth limit" "$beyond_depth" "$reached_depth"; then
             log_ok "Depth limit: stayed within depth 2 and followed ${reached_depth} link(s) past the seed"
         else
@@ -3122,8 +3230,7 @@ PYEOF
         # — CI has shown "visited 10 page(s) (limit=10)" across runs. A floor
         # below 10 would let a regression that crawled only a few of the 20 links
         # still pass; matching the exact upper bound the function already asserts
-        # closes that slack (PR #187 review finding TEST-020, tightened per PR
-        # #208 review finding TEST-004).
+        # closes that slack (PR #187 review, tightened per PR #208 review).
         if assert_max_pages "Max-pages limit" "$page_count" 10 10; then
             log_ok "Max-pages limit: visited ${page_count} page(s) (limit=10)"
         else
@@ -3670,10 +3777,36 @@ print_summary() {
     done
 
     echo ""
-    echo -e "  Total: ${GREEN}${total_pass} passed${NC}, ${RED}${total_fail} failed${NC}, ${YELLOW}${total_skip} skipped${NC}"
-    echo -e "  Results saved to: ${RESULTS_DIR}/"
+    printf '  Total: %b%s passed%b, %b%s failed%b, %b%s skipped%b\n' \
+        "$GREEN" "$total_pass" "$NC" "$RED" "$total_fail" "$NC" "$YELLOW" "$total_skip" "$NC"
+    # %s for RESULTS_DIR: it is env-overridable, so it is data, not format.
+    printf '  Results saved to: %s/\n' "$RESULTS_DIR"
 
     if [ $total_fail -gt 0 ]; then
+        return 1
+    fi
+
+    # A run that EXECUTED NOTHING is not a pass (AC3).
+    #
+    # The only failure condition used to be `total_fail -gt 0`, so a live group
+    # whose rod-backed targets all SKIPped — three SKIPs, zero passes — returned
+    # 0 and CI went green. That is precisely the state AC3 forbids: "rod-backed
+    # targets, including no-download, execute rather than SKIP". Losing Chrome on
+    # the runner, or regressing chrome_available, would therefore make the
+    # headline criterion silently untrue with nothing red to show for it, and it
+    # swallows the no-download half of AC4 along with it.
+    #
+    # Skips remain legitimate when something else in the same run actually ran;
+    # this only fires when the whole selection was skipped. A developer
+    # deliberately running the live group on a browserless box can opt out.
+    if [ $total_pass -eq 0 ] && [ $total_skip -gt 0 ]; then
+        if [ -n "${LIVE_TESTS_ALLOW_NO_EXECUTION:-}" ]; then
+            log_warn "Every selected target was skipped; LIVE_TESTS_ALLOW_NO_EXECUTION is set, treating as success."
+            return 0
+        fi
+        log_fail "Every selected target was skipped — nothing executed, so this run proves nothing."
+        log_info "  A rod-backed target SKIPs when no runnable browser is found: run test/install-chrome.sh,"
+        log_info "  or set LIVE_TESTS_ALLOW_NO_EXECUTION=1 to accept an all-skipped run."
         return 1
     fi
     return 0
@@ -3766,14 +3899,24 @@ main() {
 
     log_header "Vespasian Live Test Runner"
 
-    # Load config only when it is actually needed. A real run always needs it
-    # (TEST_HOST and service ports for preflight and the tests). A --dry-run
-    # needs it only to resolve the "all" group, whose config-driven
-    # TARGETS_SETUP folds in config-only targets like grpc-server. The offline
-    # and live groups — and an explicit --targets list — resolve purely from the
-    # in-script arrays, so requiring a config there would make --dry-run fail on
-    # a fresh checkout for no reason.
-    if [ "$dry_run" != true ] || { [ -z "$targets" ] && [ "${group:-all}" = all ]; }; then
+    # VESPASIAN and RESULTS_DIR are ambient env-override seams:
+    # generic names that unrelated tooling in a devcontainer or image build
+    # could set, silently redirecting which binary is under test or where
+    # results land. Logging the effective values makes an ambient override
+    # visible in the run output instead of only in the results path.
+    log_info "VESPASIAN=${VESPASIAN}"
+    log_info "RESULTS_DIR=${RESULTS_DIR}"
+
+    # Load config only when it is actually needed.
+    #
+    # The "all" group must be resolved AFTER load_config, because its
+    # config-driven TARGETS_SETUP folds in config-only targets like grpc-server.
+    # Every other selection — the offline and live groups, and an explicit
+    # --targets list — resolves purely from the in-script arrays, so it can be
+    # resolved first and only then decide whether a config is needed at all.
+    local resolving_all=false
+    if [ -z "$targets" ] && [ "${group:-all}" = all ]; then
+        resolving_all=true
         load_config
     fi
 
@@ -3789,6 +3932,17 @@ main() {
     if [ "$dry_run" = true ]; then
         echo "targets=$targets"
         return 0
+    fi
+
+    # For every non-"all" selection, require a config only when a selected
+    # target actually talks to a live service (LAB-5064). Offline targets are
+    # service-free, so `--group offline` — and any importer/generator --targets
+    # list — now runs on a fresh checkout with no setup-live-targets.sh run at
+    # all. That is the whole point on a browserless host, where setup used to
+    # bail at the Chrome preflight before ever writing .live-test-config and
+    # took deterministic offline coverage down with it.
+    if [ "$resolving_all" != true ] && targets_need_config "$targets"; then
+        load_config
     fi
 
     preflight_test_host "$targets"

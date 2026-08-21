@@ -85,8 +85,6 @@ const typeDefs = `#graphql
     USER
     POST
   }
-
-  union SearchItem = User | Post
 `;
 
 // Seed data (frozen) — working copies are reset on each server start
@@ -493,19 +491,38 @@ async function start() {
 
   const httpServer = http.createServer(app);
   const port = parseInt(process.env.PORT, 10) || 4000;
-  httpServer.listen(port, () => {
-    console.log("Server ready at http://localhost:" + port + "/");
-    console.log("GraphQL endpoint: http://localhost:" + port + "/graphql");
+  // Bind loopback by default. This target is unauthenticated by
+  // design, and listen(port) with no host binds every interface, exposing it to
+  // the whole local network for the lifetime of a test run.
+  // setup-live-targets.sh passes BIND_HOST explicitly and opts into a wider
+  // bind only when the devcontainer flow needs it (a crawler in a container
+  // reaching the host via TEST_HOST). Mirrors test/forms-target/main.go.
+  const host = process.env.BIND_HOST || "127.0.0.1";
+  httpServer.listen(port, host, () => {
+    // Computed INSIDE the callback: Test 18b in setup-live-targets_test.sh pins
+    // `const host = ...` and `httpServer.listen(port, host,` as ADJACENT, so no
+    // statement may sit between reading BIND_HOST and binding it. That pin is
+    // stricter than two independent greps -- it rejects a decoy that keeps the
+    // default in a dead variable while binding something else -- and it is worth
+    // more than the convenience of hoisting this line.
+    // Announce the address actually bound, not a hardcoded "localhost": under
+    // LIVE_TARGET_BIND_HOST=0.0.0.0 this fixture listens on every interface, and
+    // a log line still saying "localhost" hid that widening from whoever read
+    // the startup output. Matches the four Go fixtures, which all print their
+    // resolved addr. Bracketing mirrors net.JoinHostPort for an IPv6 BIND_HOST.
+    const addr = host.includes(":") ? "[" + host + "]:" + port : host + ":" + port;
+    console.log("Server ready at http://" + addr + "/");
+    console.log("GraphQL endpoint: http://" + addr + "/graphql");
     console.log("\nPages:");
-    console.log("  http://localhost:" + port + "/          (home + recent posts)");
-    console.log("  http://localhost:" + port + "/users      (all users)");
-    console.log("  http://localhost:" + port + "/users/1    (user detail)");
-    console.log("  http://localhost:" + port + "/posts      (all posts)");
-    console.log("  http://localhost:" + port + "/posts/10   (post detail + like)");
-    console.log("  http://localhost:" + port + "/search     (search)");
-    console.log("  http://localhost:" + port + "/create     (create post form)");
+    console.log("  http://" + addr + "/          (home + recent posts)");
+    console.log("  http://" + addr + "/users      (all users)");
+    console.log("  http://" + addr + "/users/1    (user detail)");
+    console.log("  http://" + addr + "/posts      (all posts)");
+    console.log("  http://" + addr + "/posts/10   (post detail + like)");
+    console.log("  http://" + addr + "/search     (search)");
+    console.log("  http://" + addr + "/create     (create post form)");
     console.log("\nVespasian:");
-    console.log("  ./vespasian-test scan http://localhost:" + port + "/ --api-type graphql -v -o schema.graphql");
+    console.log("  ./vespasian-test scan http://" + addr + "/ --api-type graphql -v -o schema.graphql");
   });
 }
 

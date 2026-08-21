@@ -18,9 +18,125 @@ End-to-end live tests that spin up intentionally simple target applications, run
 ## Prerequisites
 
 - **Go 1.25+** — [https://go.dev/dl/](https://go.dev/dl/)
-- **Chrome/Chromium** — Required for headless crawling
+- **Chrome/Chromium** — Required for headless crawling (see below)
 - **python3** — Required for test validation scripts
 - **Node.js** — Required for the graphql-server target
+
+### Chrome in containers
+
+A stock Ubuntu devcontainer ships `/usr/bin/chromium-browser` as a **snap
+launcher stub**, and snapd is unavailable inside the container. The stub
+satisfies `command -v` and `-x` but fails the moment it runs, so `setup-live-targets.sh`
+reports it as *"found … but it is not runnable"* rather than passing preflight
+and failing later mid-crawl.
+
+Install a real, non-snap Chrome (`.deb`, amd64 or arm64):
+
+```bash
+./test/install-chrome.sh          # idempotent; if a runnable browser exists it skips the
+                                  # install but still clears this script's own apt
+                                  # leftovers (and, in a container, the package's
+                                  # phone-home artifacts). Uses sudo.
+export VESPASIAN_NO_SANDBOX=true  # containers generally cannot use the Chrome sandbox
+```
+
+> **This is a manual step today** — tracked in [LAB-5766](https://linear.app/praetorianlabs/issue/LAB-5766).
+> Nothing in this repo runs the installer automatically, because the devcontainer
+> definition lives elsewhere, so a fresh container comes up browserless and you
+> must run the command above once. To remove that step, the image that owns the
+> devcontainer needs to call the script at build or create time:
+>
+> ```dockerfile
+> # Dockerfile layer. Both files are copied into the SAME directory: the
+> # installer sources common.sh from its own dirname, so copying it alone
+> # fails at `source` with "No such file or directory".
+> COPY test/install-chrome.sh test/common.sh /tmp/vespasian-chrome/
+> RUN /tmp/vespasian-chrome/install-chrome.sh && rm -rf /tmp/vespasian-chrome
+> ```
+>
+> ```jsonc
+> // .devcontainer/devcontainer.json — alternative, runs on container create
+> { "postCreateCommand": "./test/install-chrome.sh" }
+> ```
+>
+> The script is idempotent and exits 0 when a runnable browser is already
+> present, so either hook is safe to invoke on every build or rebuild.
+
+**How the package is trusted.** Google's apt repository is added *temporarily*,
+with its signing key pinned by primary-key fingerprint. apt then verifies the
+chain — Release signature → `Packages` digest → `.deb` digest — before dpkg runs
+the package's maintainer scripts as root. Downloading the `.deb` directly would
+leave TLS as the only control: `apt-get install ./local.deb` does **not**
+authenticate a local file argument, and Google's `.deb` carries no embedded
+`debsigs` signature to check instead. The fingerprint pin is what makes the
+check meaningful — a key fetched over the same channel as the package, unpinned,
+buys nothing against an attacker who controls that channel. If Google rotates
+its primary key the script fails loudly and the constant must be updated
+deliberately.
+
+**No background egress.** The temporary repo and keyring this script itself
+adds are removed once the install completes (via an `EXIT` trap, so an aborted
+run cannot leave them behind). The `google-chrome-stable` package's own
+permanent apt source and daily update pinger (`/etc/cron.daily/google-chrome`)
+are always suppressed via `repo_add_once=false`, so the package never creates
+them in the first place. Inside a throwaway image the script goes further and
+also removes and verifies absent whatever the package planted anyway — that
+pair is the "no phone-home from the devcontainer image" acceptance criterion.
+Outside a container (a developer's own machine), removing artifacts the
+package owns is not this script's call, so they are left alone as Chrome's
+normal update channel. Chrome's telemetry is separately disabled on every
+browser vespasian launches (LAB-4999), and the live suite always launches
+through vespasian, so it inherits those flags.
+
+**Version policy.** The script tracks Chrome *stable* rather than pinning a
+version — for a test-only layer that is the right trade, since a pinned version
+goes stale and eventually 404s. The installed version is logged on success so an
+image build record identifies exactly what landed.
+
+`apt install chromium` / `chromium-browser` are **not** alternatives on Ubuntu
+noble — both are transitional packages that pre-depend on snapd.
+
+The non-privileged surface (argument handling, architecture resolution, the
+pinned fingerprint) is covered by `test/install-chrome-selftest.sh`, which runs
+in CI on every push. The download / apt / privileged-mutation paths are not
+reachable from that suite — they need root, network, and destructive system
+changes — so they are covered separately by the `install-chrome-e2e` CI job,
+which runs the installer end-to-end as root inside a disposable `ubuntu:24.04`
+container. That job is opt-in (`workflow_dispatch`) and also runs on every push
+to `main`, rather than on every PR, because it is slow and depends on Google's
+apt repo being reachable.
+
+### Running without a browser
+
+Browser-free work does not require a browser to be present:
+
+```bash
+./test/run-live-tests.sh --group offline   # importers, generators, fixtures — no setup run needed
+./test/setup-live-targets.sh --skip-start  # build binaries only
+```
+
+The offline group talks to no service, so it needs neither `.live-test-config`
+nor a browser and runs on a fresh checkout. Likewise, `setup-live-targets.sh`
+treats a missing browser as fatal only when the selected targets actually drive
+the headless backend — `--skip-start` and a `grpc-server`-only setup warn and
+continue. Selections that do need a browser still fail loudly at preflight.
+
+### Dynamic (integration) tests
+
+Separate from this live suite, `pkg/crawl` carries `//go:build integration`
+tests that launch a real browser to exercise `NewBrowserManager`'s launch / kill
+/ close lifecycle. They are excluded from `make test` by the build tag and need
+the same non-snap Chrome as above:
+
+```bash
+export VESPASIAN_NO_SANDBOX=true
+go test -tags integration ./pkg/crawl/...
+```
+
+`TestConfigureLauncher_PinsSystemBrowser` is the exception: it only needs a
+browser binary to exist on disk (it asserts go-rod's `.Bin` is pinned so no
+Chromium is auto-downloaded — LAB-4999), so it runs even where Chrome cannot
+launch, and skips cleanly when no browser is present at all.
 
 ## Targets
 
@@ -174,15 +290,94 @@ For Linux devcontainers without Docker Desktop, use the detected host gateway (e
 
 ### `FORMS_TARGET_BIND_HOST` (optional)
 
-The `forms-target` server binds `127.0.0.1` by default (via its `BIND_HOST` env var). `setup-live-targets.sh` starts it with `BIND_HOST=${FORMS_TARGET_BIND_HOST:-0.0.0.0}` so a crawler running inside a devcontainer (reaching the host via `TEST_HOST=host.docker.internal`) can connect. For host-only local runs, pin it back to loopback:
+The `forms-target` server binds `127.0.0.1` by default (via its `BIND_HOST` env var), and `setup-live-targets.sh` now honours that default rather than overriding it. It is an unauthenticated HTTP app serving login / register / feedback forms, so it has no business listening on every interface of the operator's machine unless asked.
+
+Widen it explicitly when the crawler runs inside a devcontainer and reaches the host via `TEST_HOST=host.docker.internal`:
 
 ```bash
-FORMS_TARGET_BIND_HOST=127.0.0.1 ./test/setup-live-targets.sh --targets forms-target
+FORMS_TARGET_BIND_HOST=0.0.0.0 ./test/setup-live-targets.sh --targets forms-target
 ```
+
+Nothing else needs this variable: the other four rod-backed targets share `LIVE_TARGET_BIND_HOST` (below), and `grpc-server` hard-pins loopback in its own Go source. Every target defaults to loopback — this variable exists because `forms-target` reads its own `BIND_HOST` rather than the shared one.
 
 ### `CONFIG_FILE` (optional)
 
 `run-live-tests.sh` reads resolved ports and `TARGETS_SETUP` from `CONFIG_FILE`, which defaults to `test/.live-test-config` (written by `setup-live-targets.sh`). Override it with the `CONFIG_FILE` environment variable — an internal test-harness knob that `test/test-runner-args.sh` uses to point `--dry-run` invocations at a throwaway stub config, so the group-resolution tests need no real setup. Only an allowlisted set of keys (the `*_PORT` values and `TARGETS_SETUP`) is honored from the file.
+
+The config file is loaded only when a selected target actually talks to a live service, so `--group offline` runs on a fresh checkout with no config and no prior setup.
+
+### `RESULTS_DIR` (optional)
+
+Where per-target result files are written; defaults to `test/.results/`. Override it to keep a run's output out of the repo — `test/test-runner-args.sh` sets it to a temp dir for the one block that really executes the runner, so the guard suite leaves nothing behind.
+
+### `LIVE_TARGET_BIND_HOST` (optional — widens an exposure)
+
+Bind address for `rest-api`, `soap-service`, `concat-spa` and `graphql-server`. Defaults to
+`127.0.0.1`.
+
+These four targets are unauthenticated by design — they exist to give the scanner something to
+discover — so they bind loopback and stay unreachable from the network. Setting this to `0.0.0.0`
+exposes all four on every interface for as long as the run lasts.
+
+The one legitimate reason to set it is the devcontainer flow, where the crawler runs inside a
+container and reaches the host through `TEST_HOST` rather than loopback:
+
+```bash
+LIVE_TARGET_BIND_HOST=0.0.0.0 ./test/setup-live-targets.sh
+```
+
+`forms-target` has its own equivalent (`FORMS_TARGET_BIND_HOST`, below) and `grpc-server` hardcodes
+loopback. Both halves of this seam are asserted — that `setup-live-targets.sh` passes the value, and
+that each target's own source reads it — because either half alone is inert.
+
+### `LIVE_TESTS_ALLOW_NO_EXECUTION` (optional — disables a merge gate)
+
+Set to any non-empty value to make `run-live-tests.sh` treat a run in which **every** selected target
+skipped as a success instead of a failure.
+
+Leave it unset. The check it disables is what makes this ticket's AC3 — "rod-backed targets, including
+`no-download`, execute rather than SKIP" — enforceable at all: without it a `--group live` run of three
+SKIPs and zero passes exits 0, and CI stays green while proving nothing. Setting this variable in CI
+therefore retires AC3's enforcement silently, which is the opposite of what a green build would imply.
+
+The legitimate use is interactive and local: a developer deliberately running the live group on a
+browserless box who wants the skips reported without a non-zero exit. Prefer running
+`./test/install-chrome.sh` instead, so the targets actually execute. `--group offline` needs no browser
+and is unaffected by this variable either way.
+
+### `VESPASIAN` (optional)
+
+Path to the `vespasian` binary under test; defaults to `bin/vespasian`. Override it to test a binary built elsewhere. Note this is **not** settable from `CONFIG_FILE`: `VESPASIAN` is deliberately absent from `load_config`'s allowlist, so a config file cannot redirect which binary the suite executes.
+
+### `VESPASIAN_TEST_ROOT` (internal, test-only)
+
+Read by `install-chrome.sh` to reroot every absolute system path it reads or
+writes — the pinned keyring, the temporary apt source, `/etc/default/google-chrome`,
+the phone-home artifacts it may remove, and the version record — under a
+caller-supplied directory instead of the real filesystem. It exists solely so
+`test/install-chrome-selftest.sh` can drive the installer's privileged branches
+(the defaults-file rewrite, the container gate, phone-home removal and
+verification) against fixtures, unprivileged. **No production caller sets
+it** — `install-chrome.sh` itself, `setup-live-targets.sh`, the
+Dockerfile/`postCreateCommand` snippets above, and the CI jobs all leave it
+unset.
+
+The script validates the value before using it — it must be an absolute,
+existing directory containing only `[A-Za-z0-9._/-]`, with no `..` component,
+and must not resolve to `/` or `//` — which closes the obvious ways a
+caller-controlled value could redirect a root-privileged write onto the real
+system. It does **not** defend against a symlink planted inside the root
+*after* validation, a bind mount at the root, or the root being swapped out
+from under it between validation and the write (TOCTOU): those are accepted
+residuals, because the variable's whole trust model assumes its caller is
+*already* privileged — either the process runs as root, or it runs
+unprivileged and already holds the `sudo` rights the script would use anyway.
+
+Because it feeds root-privileged writes, it must never be exposed through a
+narrowly-scoped `sudoers` grant that also permits environment passing
+(`SETENV`, `sudo -E`, or an `env_keep` entry) — default `sudoers`
+(`Defaults env_reset`) already drops it, and that default must not be loosened
+for this script.
 
 ### `.live-test-config`
 
@@ -335,10 +530,22 @@ Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are inform
 test/
 ├── setup-live-targets.sh    # Setup script
 ├── run-live-tests.sh        # Test runner
+├── install-chrome.sh        # Provisions a real non-snap Chrome (see "Chrome in containers")
+├── common.sh                # Shared logging + Chrome detection (detect_chrome_binary)
 ├── validate.sh              # Shared validation functions
 ├── README.md                # This file
 ├── .live-test-config        # Auto-generated (gitignored)
 ├── .results/                # Test output (gitignored)
+│
+│   # Guard suites — CI-run regression nets, no Go/Node/Chrome needed
+├── preflight-selftest.sh        # Chrome/Chromium detection (LAB-3893)
+├── install-chrome-selftest.sh   # install-chrome.sh's non-privileged surface
+├── setup-live-targets_test.sh   # Teardown / orphan-PID hardening (LAB-2893)
+├── test-runner-args.sh          # Target-group vs dispatch drift, CI step lists
+├── validate_test.sh             # Spec validators still reject malformed specs
+│
+├── internal/
+│   └── target/              # Shared bind-host + server-timeout helper for the Go targets
 │
 ├── rest-api/
 │   ├── main.go              # REST API server
@@ -406,26 +613,34 @@ processes holding the port window so you can see what to stop. Use `--teardown`
 Install Chrome or Chromium:
 
 ```bash
-# Ubuntu/Debian
-sudo apt install chromium-browser
+# Ubuntu/Debian — installs a real, non-snap Chrome (see "Chrome in containers" above).
+# Do NOT use `apt install chromium-browser`: on recent Ubuntu that package is the
+# snap stub described below, which installs cleanly and then fails at runtime.
+./test/install-chrome.sh
 
 # macOS
 brew install --cask google-chrome
 ```
 
-**Found but not runnable:** on recent Ubuntu / WSL2 (and many CI base images),
-`/usr/bin/chromium-browser` is a snap *stub* — a launcher that satisfies
-`command -v` / `-x` but fails at runtime with "requires the chromium snap to
-be installed". `setup-live-targets.sh` probes each candidate binary with
-`--version` before accepting it, so this now fails preflight with `Found
-<path> but it is not runnable` instead of failing later during `vespasian
-crawl`. Fix with `snap install chromium`, or install `google-chrome` instead.
+**Found but not runnable:** this is the snap-stub case described under
+[Chrome in containers](#chrome-in-containers) above — the same cause, seen from the
+troubleshooting side. `setup-live-targets.sh` probes each candidate binary with
+`--version` before accepting it, so it fails preflight with `Found <path> but it is
+not runnable` instead of failing later during `vespasian crawl`. Fix with
+`./test/install-chrome.sh`, `snap install chromium`, or install `google-chrome`
+directly.
 
 **macOS note:** the runnability probe uses `timeout` (falling back to
 `gtimeout` from Homebrew coreutils) to guard against a hanging binary. Stock
 macOS ships neither, so on an unpatched macOS install the probe runs without a
 timeout — a binary that hangs on `--version` would block preflight rather
 than failing fast.
+
+**Slow hosts:** the probe gives each candidate 2 seconds to answer
+`--version`. On a cold or throttled container mount a healthy browser's first
+exec can take longer, which surfaces as a spurious `Found <path> but it is not
+runnable`. Set `CHROME_PROBE_TIMEOUT` (seconds, fractions allowed) to widen
+the budget: `CHROME_PROBE_TIMEOUT=10 ./test/setup-live-targets.sh`.
 
 ### Crawl produces empty capture
 

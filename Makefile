@@ -23,7 +23,7 @@ test:
 # executed — including TestCrawlerContract_ScopeConfinement and _DepthLimit, the
 # only end-to-end assertions of two containment controls, and the LAB-4678 tests
 # that pin the exact --max-pages cap and the --interact destructive-control gate
-# (LAB-4678 review, TEST-005/REQ-002).
+# (LAB-4678 review).
 test-integration:
 	go test -race -tags=integration ./...
 
