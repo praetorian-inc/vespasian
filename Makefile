@@ -1,12 +1,15 @@
 BINARY := vespasian
 MODULE := github.com/praetorian-inc/vespasian
 BUILD_DIR := bin
+# Keep in step with gosec-version in .github/workflows/security.yml; that job fails on
+# findings, so a local run at another version can disagree with CI.
+GOSEC_VERSION ?= v2.28.0
 VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 LDFLAGS   := -s -w -X main.version=$(VERSION) -X main.gitCommit=$(GIT_COMMIT) -X main.buildDate=$(BUILD_DATE)
 
-.PHONY: build test test-integration lint lint-comments lint-comments-selftest lint-comments-all fmt vet check check-docs coverage clean deps live-test-clean
+.PHONY: build test test-integration lint lint-comments lint-comments-selftest lint-comments-all fmt vet gosec check check-docs coverage clean deps live-test-clean
 
 build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/vespasian
@@ -58,7 +61,17 @@ fmt:
 vet:
 	go vet ./...
 
-check: fmt vet lint lint-comments test check-docs
+# The scan the `security / Gosec` job runs, same args and pin, so a finding can be
+# reproduced locally. That job no longer passes -no-fail. Expects gosec on PATH, the
+# way `lint` expects golangci-lint.
+gosec:
+	@command -v gosec >/dev/null 2>&1 || { \
+		echo "gosec not found. Install the pinned version:"; \
+		echo "  go install github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION)"; \
+		exit 1; }
+	gosec -exclude-generated ./...
+
+check: fmt vet lint lint-comments gosec test check-docs
 
 # Community-health docs: presence, link/anchor resolution, CODEOWNERS-vs-GOVERNANCE
 # roster equality. Also runs as its own CI job, because ci.yml's paths filter means a
