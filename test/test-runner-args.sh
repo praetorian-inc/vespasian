@@ -100,15 +100,19 @@ mapfile -t DISPATCH_TARGETS < <(
     ' "$RUNNER" | sort
 )
 
-# Targets that are intentionally not in either group (config-driven).
-CONFIG_ONLY=(grpc-server)
-
 # ungrouped_dispatch_targets prints any of the given targets that are absent
-# from OFFLINE_TARGETS, LIVE_TARGETS, and CONFIG_ONLY. This is the real
-# coverage check shared by the drift guard and its negative self-test, so a
-# regression here trips both — not just a hand-written copy of the loop.
+# from OFFLINE_TARGETS and LIVE_TARGETS. This is the real coverage check shared
+# by the drift guard and its negative self-test, so a regression here trips
+# both — not just a hand-written copy of the loop.
+#
+# There is deliberately no config-only tier any more. It existed for exactly one
+# target, grpc-server, and its only effect was to exempt that target from the
+# "every dispatch target is grouped" check — which is precisely why grpc-server
+# ran on no PR for the life of the epic (LAB-5549). Requiring every dispatch
+# target to name a group makes this guard strictly stronger, and means a future
+# target cannot be added without deciding where it runs.
 ungrouped_dispatch_targets() {
-    local grouped=("${OFFLINE_TARGETS[@]}" "${LIVE_TARGETS[@]}" "${CONFIG_ONLY[@]}")
+    local grouped=("${OFFLINE_TARGETS[@]}" "${LIVE_TARGETS[@]}")
     local target
     for target in "$@"; do
         if ! printf '%s\n' "${grouped[@]}" | grep -qx "$target"; then
@@ -138,7 +142,7 @@ report_undispatched_group_members() {
     local target
     while IFS= read -r target; do
         [[ -z "$target" ]] && continue
-        fail "Grouped/config-only target '$target' has no case-dispatch entry in run-live-tests.sh"
+        fail "Grouped target '$target' has no case-dispatch entry in run-live-tests.sh"
     done < <(undispatched_group_members "$@")
 }
 
@@ -146,7 +150,7 @@ report_ungrouped_dispatch_targets() {
     local target
     while IFS= read -r target; do
         [[ -z "$target" ]] && continue
-        fail "Dispatch target '$target' is not in OFFLINE_TARGETS, LIVE_TARGETS, or CONFIG_ONLY"
+        fail "Dispatch target '$target' is not in OFFLINE_TARGETS or LIVE_TARGETS"
     done < <(ungrouped_dispatch_targets "$@")
 }
 
@@ -163,13 +167,12 @@ else
     fail "DISPATCH_TARGETS extraction is broken/empty (sentinel 'rest-api' missing)"
 fi
 
-# Every group member AND config-only target must have a case-dispatch entry
-# (direction a). Including CONFIG_ONLY means grpc-server cannot silently lose its
-# dispatch arm while staying config-only — which would send `--targets grpc-server`
-# to the unknown-target path.
-report_undispatched_group_members "${OFFLINE_TARGETS[@]}" "${LIVE_TARGETS[@]}" "${CONFIG_ONLY[@]}"
+# Every group member must have a case-dispatch entry (direction a), so a target
+# cannot be listed in a group while `--targets <it>` falls through to the
+# unknown-target path.
+report_undispatched_group_members "${OFFLINE_TARGETS[@]}" "${LIVE_TARGETS[@]}"
 
-# Every dispatch target must be in a group or in CONFIG_ONLY (direction b).
+# Every dispatch target must be in a group (direction b).
 report_ungrouped_dispatch_targets "${DISPATCH_TARGETS[@]}"
 
 # No target should appear in both groups.
@@ -181,44 +184,64 @@ done
 
 group_count=$(( ${#OFFLINE_TARGETS[@]} + ${#LIVE_TARGETS[@]} ))
 dispatch_count=${#DISPATCH_TARGETS[@]}
-config_count=${#CONFIG_ONLY[@]}
 
 # Belt-and-suspenders count assertion: with robust extraction the arm count must
-# equal grouped + config-only. This catches drift the per-target loops cannot —
-# e.g. an accidental duplicate arm, or a target both grouped and extracted but
+# equal the grouped count exactly. This catches drift the per-target loops cannot
+# — e.g. an accidental duplicate arm, or a target both grouped and extracted but
 # miscounted — by comparing totals directly instead of per-target membership.
-if [[ $(( group_count + config_count )) -ne "$dispatch_count" ]]; then
-    fail "Coverage count mismatch: groups (${group_count}) + config-only (${config_count}) != dispatch (${dispatch_count})"
+if [[ "$group_count" -ne "$dispatch_count" ]]; then
+    fail "Coverage count mismatch: grouped (${group_count}) != dispatch (${dispatch_count})"
 fi
 
 if [[ "$FAIL" -eq "$drift_fail_before" ]]; then
-    pass "Groups (${group_count}) + config-only (${config_count}) cover all dispatch targets (${dispatch_count})"
+    pass "Groups (${group_count}) cover all dispatch targets (${dispatch_count})"
 fi
 
 echo ""
-echo "=== Absolute group-size anchors (AC#3: 21 offline + 10 live = 31) ==="
+echo "=== Absolute group-size anchors (AC#3: 21 offline + 11 live = 32) ==="
 
 # Pin concrete group sizes as literals, independent of the sourced arrays. The
 # behavioral --group tests derive expected from the same OFFLINE_TARGETS/
 # LIVE_TARGETS under test, so a coordinated silent target drop shrinks expected
 # and actual in lockstep and passes green. These literals encode the LAB-4773
-# AC#3 contract ("all 31 targets still run") so any such drop trips here.
+# AC#3 contract — "all grouped targets still run", 32 of them as of LAB-5549 —
+# so any such drop trips here.
 # (LAB-3890 T2 added scan-rest; LAB-3269 added forms-target; LAB-4999 added the
-# live-only no-download egress guard: 21 offline + 10 live = 31 total.)
+# live-only no-download egress guard; LAB-5549 moved grpc-server out of the
+# config-only tier and into LIVE_TARGETS: 21 offline + 11 live = 32 total.)
 if [[ "${#OFFLINE_TARGETS[@]}" -eq 21 ]]; then
     pass "OFFLINE_TARGETS has exactly 21 members"
 else
     fail "OFFLINE_TARGETS count drifted: expected 21, got ${#OFFLINE_TARGETS[@]}"
 fi
-if [[ "${#LIVE_TARGETS[@]}" -eq 10 ]]; then
-    pass "LIVE_TARGETS has exactly 10 members"
+if [[ "${#LIVE_TARGETS[@]}" -eq 11 ]]; then
+    pass "LIVE_TARGETS has exactly 11 members"
 else
-    fail "LIVE_TARGETS count drifted: expected 10, got ${#LIVE_TARGETS[@]}"
+    fail "LIVE_TARGETS count drifted: expected 11, got ${#LIVE_TARGETS[@]}"
 fi
-if [[ "$group_count" -eq 31 ]]; then
-    pass "Grouped targets total 31 (AC#3: all 31 targets still run)"
+if [[ "$group_count" -eq 32 ]]; then
+    pass "Grouped targets total 32 (AC#3: all 32 targets still run)"
 else
-    fail "Grouped-target total drifted: expected 31, got $group_count"
+    fail "Grouped-target total drifted: expected 32, got $group_count"
+fi
+
+echo ""
+echo "=== Live group is startable by setup-live-targets.sh ==="
+
+# grpc-server is in LIVE_TARGETS, so `--group live` now runs it on every PR with
+# no TARGETS_SETUP or --targets override (LAB-5549). That only works because a
+# bare `./test/setup-live-targets.sh` — exactly what live-tests.yml runs — starts
+# it, which it does by defaulting --targets to ALL_TARGETS. If grpc-server were
+# dropped from setup's ALL_TARGETS while staying in LIVE_TARGETS, the runner
+# would probe a server nobody started and the target would fail on an unset
+# port rather than on anything about gRPC. This pins that cross-script seam;
+# ALL_TARGETS is sourced from setup-live-targets.sh above.
+if printf '%s\n' "${LIVE_TARGETS[@]}" | grep -qx 'grpc-server'; then
+    if printf '%s' "$ALL_TARGETS" | tr ',' '\n' | grep -qx 'grpc-server'; then
+        pass "grpc-server is in LIVE_TARGETS and startable by setup-live-targets.sh"
+    else
+        fail "grpc-server is in LIVE_TARGETS but absent from setup-live-targets.sh ALL_TARGETS"
+    fi
 fi
 
 echo ""
@@ -311,13 +334,25 @@ else
 fi
 
 # TARGETS_SETUP applies ONLY to the "all" group. --group offline / --group live
-# must ignore it entirely (no config-only targets leak in).
-tmpconfig_scoped=$(new_tmp)
-echo "TARGETS_SETUP=grpc-server" > "$tmpconfig_scoped"
-scoped_offline=$(env CONFIG_FILE="$tmpconfig_scoped" bash -c "source '$RUNNER' --group offline --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
-scoped_live=$(env CONFIG_FILE="$tmpconfig_scoped" bash -c "source '$RUNNER' --group live --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
+# must ignore it entirely.
+#
+# TARGETS_SETUP is passed in the ENVIRONMENT, not via CONFIG_FILE. Two reasons,
+# both of which made the previous form of this check unable to fail:
+#   1. --group offline/live --dry-run deliberately does not call load_config
+#      (see the runner's load_config guard), so a TARGETS_SETUP written to a
+#      config file is never set on this path and resolve_targets is handed an
+#      empty value no matter what it does with it.
+#   2. The probe value was grpc-server, which is now itself a member of
+#      LIVE_TARGETS (LAB-5549) — so even had it been set, a leak into
+#      --group live would have been indistinguishable from correct output.
+# Setting it in the environment reaches the same global that load_config's
+# `declare -g` would, and a sentinel in neither group keeps both halves
+# discriminating. Verified by mutation: adding the "all" arm's TARGETS_SETUP
+# prepend to the live arm fails this assertion.
+scoped_offline=$(env TARGETS_SETUP=phantom-setup-target bash -c "source '$RUNNER' --group offline --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
+scoped_live=$(env TARGETS_SETUP=phantom-setup-target bash -c "source '$RUNNER' --group live --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
 if [[ "$scoped_offline" == "$(join_targets "${OFFLINE_TARGETS[@]}")" && "$scoped_live" == "$(join_targets "${LIVE_TARGETS[@]}")" ]]; then
-    pass "TARGETS_SETUP ignored for --group offline/live (grpc-server absent)"
+    pass "TARGETS_SETUP ignored for --group offline/live (sentinel absent from both)"
 else
     fail "TARGETS_SETUP leaked into --group offline/live: offline='$scoped_offline' live='$scoped_live'"
 fi
@@ -2268,7 +2303,18 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # install-chrome-e2e ever executed — lost two steps to `set -euo pipefail` dying
 # on line 1. Nothing could have caught it: an inline block is not a file, so
 # `bash -n` never sees it, and the job is opt-in, so no PR run exercised it.
-EXPECTED_ASSERTIONS=135
+#
+# 135 -> 136. MEASURED. +1 for the setup/live-group seam guard (LAB-5549):
+# grpc-server moved into LIVE_TARGETS, so `--group live` now runs it on every PR
+# with no TARGETS_SETUP or --targets override. That only works because a bare
+# `./test/setup-live-targets.sh` starts it, via --targets defaulting to
+# ALL_TARGETS. Dropping grpc-server from setup's ALL_TARGETS while leaving it in
+# LIVE_TARGETS would make the runner probe a server nobody started, so the target
+# would fail on an unset port rather than on anything about gRPC. Nothing else
+# pins that cross-script pairing: the coverage guards check groups against the
+# dispatch block, and the browser-classification guard checks ALL_TARGETS
+# membership, but neither relates a live-group member to its startability.
+EXPECTED_ASSERTIONS=136
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."

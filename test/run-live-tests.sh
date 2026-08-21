@@ -56,10 +56,11 @@ TEST_HOST="${TEST_HOST:-localhost}"
 # Target groups (single source of truth — CI references these
 # via --group instead of maintaining its own target lists)
 #
-# Some dispatchable targets (e.g. grpc-server) are intentionally NOT in
-# either group: they are config-only and run only when TARGETS_SETUP (or an
-# explicit --targets) selects them. test/test-runner-args.sh tracks these in
-# its CONFIG_ONLY array so the drift guard does not flag them.
+# Every dispatchable target belongs to exactly one group. There is no
+# config-only tier: a target absent from both groups runs nowhere in CI, which
+# is how grpc-server sat unexercised on every PR despite being fully built
+# (LAB-5549). test/test-runner-args.sh's drift guard enforces this in both
+# directions, so a new target cannot be added without choosing a group.
 # ──────────────────────────────────────────────────────────────
 
 OFFLINE_TARGETS=(
@@ -91,6 +92,7 @@ LIVE_TARGETS=(
     scan-rest
     soap-service
     graphql-server
+    grpc-server
     concat-spa
     concat-spa-two-stage
     edge-cases
@@ -120,8 +122,8 @@ resolve_targets() {
             ;;
         all)
             # Always include both defined groups. Config may prepend extra
-            # live targets (e.g. grpc-server); deduplicate so overlapping
-            # targets don't run their test function twice.
+            # targets via TARGETS_SETUP; deduplicate so a target named in both
+            # TARGETS_SETUP and a group doesn't run its test function twice.
             resolved="$(join_targets "${OFFLINE_TARGETS[@]}"),$(join_targets "${LIVE_TARGETS[@]}")"
             if [ -n "${TARGETS_SETUP:-}" ]; then
                 resolved="${TARGETS_SETUP},${resolved}"
@@ -280,6 +282,35 @@ _probe_target_host() {
     return 1
 }
 
+# Probe the gRPC target's port at TEST_HOST. gRPC speaks no HTTP health
+# endpoint, so this cannot reuse _probe_target_host: it tries grpcurl first
+# (proves reflection answers, not just that the port is open) and falls back to
+# a bare TCP connect where grpcurl is absent. Mirrors _probe_target_host's
+# contract, including returning 0 when the port is unset because
+# setup-live-targets.sh did not configure this target.
+_probe_grpc_target() {
+    local port=$1
+    [ -z "$port" ] && return 0
+    if command -v grpcurl >/dev/null 2>&1; then
+        if grpcurl -plaintext "${TEST_HOST}:${port}" list >/dev/null 2>&1; then
+            log_ok "grpc-server reachable at ${TEST_HOST}:${port}"
+            return 0
+        fi
+        log_fail "grpc-server is unreachable at ${TEST_HOST}:${port}"
+        return 1
+    fi
+    if command -v nc >/dev/null 2>&1 && nc -z "${TEST_HOST}" "${port}" 2>/dev/null; then
+        log_ok "grpc-server reachable at ${TEST_HOST}:${port} (nc)"
+        return 0
+    fi
+    if (echo >/dev/tcp/"${TEST_HOST}"/"${port}") 2>/dev/null; then
+        log_ok "grpc-server reachable at ${TEST_HOST}:${port} (/dev/tcp)"
+        return 0
+    fi
+    log_fail "grpc-server is unreachable at ${TEST_HOST}:${port}"
+    return 1
+}
+
 # Verify each selected live target is reachable at TEST_HOST before any
 # crawls run. A misconfigured TEST_HOST (typical for devcontainer users
 # who forgot to set it) otherwise surfaces as mysterious empty captures
@@ -303,27 +334,19 @@ preflight_test_host() {
             _probe_target_host "${GRAPHQL_SERVER_PORT:-}" "/" "graphql-server" || failed=1
             ;;
     esac
+    # grpc-server gets its own case block. It previously shared one with
+    # concat-spa, and `case` stops at the first matching arm — so any run
+    # selecting both probed grpc-server and silently skipped concat-spa
+    # entirely. Harmless only while grpc-server was config-only and never
+    # co-selected with concat-spa by a group; moving it into LIVE_TARGETS
+    # would have made that skip permanent for every `--group live` run
+    # (LAB-5549).
     case ",${targets}," in
         *,grpc-server,*)
-            local grpc_port="${GRPC_SERVER_PORT:-}"
-            if [ -n "$grpc_port" ]; then
-                if command -v grpcurl >/dev/null 2>&1; then
-                    if grpcurl -plaintext "${TEST_HOST}:${grpc_port}" list >/dev/null 2>&1; then
-                        log_ok "grpc-server reachable at ${TEST_HOST}:${grpc_port}"
-                    else
-                        log_fail "grpc-server is unreachable at ${TEST_HOST}:${grpc_port}"
-                        failed=1
-                    fi
-                elif nc -z "${TEST_HOST}" "${grpc_port}" 2>/dev/null; then
-                    log_ok "grpc-server reachable at ${TEST_HOST}:${grpc_port} (nc)"
-                elif (echo >/dev/tcp/"${TEST_HOST}"/"${grpc_port}") 2>/dev/null; then
-                    log_ok "grpc-server reachable at ${TEST_HOST}:${grpc_port} (/dev/tcp)"
-                else
-                    log_fail "grpc-server is unreachable at ${TEST_HOST}:${grpc_port}"
-                    failed=1
-                fi
-            fi
+            _probe_grpc_target "${GRPC_SERVER_PORT:-}" || failed=1
             ;;
+    esac
+    case ",${targets}," in
         *,concat-spa,*|*,concat-spa-two-stage,*)
             _probe_target_host "${CONCAT_SPA_PORT:-}" "/healthz" "concat-spa" || failed=1
             ;;
@@ -1447,25 +1470,34 @@ PYEOF
         log_ok "Proto validation: $validation_result"
     fi
 
-    # AC4 (LAB-2778): prove the emitted .proto actually compiles with protoc,
-    # not just that it matches the expected service/method shapes textually.
-    if command -v protoc >/dev/null 2>&1; then
-        if grep -q '^// ---$' "$spec_file"; then
-            # renderProto concatenates multiple reflection files into one output
-            # separated by "// ---"; protoc cannot compile a multi-file blob from a
-            # single input. The lab target emits a single file, so this branch is
-            # only a guard for future multi-file targets.
-            log_info "Skipping protoc compile: emitted spec is multi-file (concatenated)"
-        elif protoc --proto_path="$target_dir" --descriptor_set_out=/dev/null \
-            "$(basename "$spec_file")" 2>/tmp/protoc-grpc.err; then
-            log_ok "protoc compiled emitted .proto successfully"
-        else
-            log_fail "protoc failed to compile emitted .proto:"
-            cat /tmp/protoc-grpc.err >&2
-            failures=$((failures + 1))
-        fi
+    # AC4 (LAB-2778): prove the emitted .proto actually compiles, not just that
+    # it matches the expected service/method shapes textually.
+    #
+    # This used to shell out to protoc behind `command -v protoc`, which meant
+    # the assertion most directly proving AC4 passed by never executing: protoc
+    # ships on no GitHub-hosted ubuntu-24.04 image, so CI took the skip branch
+    # 100% of the time. It cannot simply be installed either —
+    # live-tests.yml runs under `disable-sudo: true` (ruling out
+    # `apt-get install protobuf-compiler`, the same constraint that forced
+    # LAB-3890 to drop `xmllint --schema`), and a marketplace action such as
+    # arduino/setup-protoc needs the praetorian-inc enterprise allowlist that
+    # blocked LAB-4747. So the external dependency is removed rather than
+    # provisioned: test/proto-validate compiles the file in-process with
+    # bufbuild/protocompile, already present in the module graph. The check now
+    # runs unconditionally, identically, on every runner and dev machine
+    # (LAB-5549).
+    if grep -q '^// ---$' "$spec_file"; then
+        # renderProto concatenates multiple reflection files into one output
+        # separated by "// ---"; a single-file compile cannot resolve a
+        # multi-file blob. The lab target emits a single file, so this branch is
+        # only a guard for future multi-file targets.
+        log_info "Skipping .proto compile: emitted spec is multi-file (concatenated)"
+    elif (cd "$PROJECT_ROOT" && go run ./test/proto-validate "$spec_file") 2>/tmp/proto-validate.err; then
+        log_ok "emitted .proto compiles (protocompile)"
     else
-        log_info "protoc not installed — skipping .proto compile check (AC4)"
+        log_fail "emitted .proto failed to compile:"
+        cat /tmp/proto-validate.err >&2
+        failures=$((failures + 1))
     fi
 
     local expected_count
@@ -3824,8 +3856,8 @@ usage() {
     echo "  --targets <list>      Comma-separated targets to test (overrides --group)"
     echo "                        Valid targets:"
     echo "                          Service:    rest-api, scan-rest, soap-service, graphql-server,"
-    echo "                                      concat-spa, concat-spa-two-stage, forms-target"
-    echo "                          Config:     grpc-server (included via TARGETS_SETUP when set up)"
+    echo "                                      grpc-server, concat-spa, concat-spa-two-stage,"
+    echo "                                      forms-target"
     echo "                          Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,"
     echo "                                      generate-graphql, generate-graphql-imports,"
     echo "                                      generate-js-static, generate-merge-slugs"
@@ -3910,7 +3942,7 @@ main() {
     # Load config only when it is actually needed.
     #
     # The "all" group must be resolved AFTER load_config, because its
-    # config-driven TARGETS_SETUP folds in config-only targets like grpc-server.
+    # config-driven TARGETS_SETUP folds in whatever extra targets it names.
     # Every other selection — the offline and live groups, and an explicit
     # --targets list — resolves purely from the in-script arrays, so it can be
     # resolved first and only then decide whether a config is needed at all.

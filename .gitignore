@@ -51,10 +51,12 @@ test/.*.log
 test/rest-api/rest-api
 test/soap-service/soap-service
 test/grpc-server/grpc-server
+test/proto-validate/proto-validate
 test/concat-spa/concat-spa
 test/forms-target/forms-target
 test/graphql-server/node_modules/
 test/spec-validators/node_modules/
 
-# go build artifact when run at repo root
+# go build artifacts when run at repo root
 /vespasian
+/proto-validate

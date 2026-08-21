@@ -169,6 +169,23 @@ For the GraphQL live test (`graphql-server`):
 3. **Generate** — `vespasian generate graphql capture.json --dangerous-allow-private` (with introspection probe)
 4. **Validate** — SDL structure, expected operations, introspection-quality checks (schema block, non-null types, enums)
 
+For the gRPC live test (`grpc-server`):
+
+1. **Synthesize** a minimal capture so the classifier tags the request as gRPC and the reflection probe dials the right host:port
+2. **Generate** — `vespasian generate grpc capture.json --dangerous-allow-private -o spec.proto` (via Server Reflection)
+3. **Validate services** — expected services and methods are present, each RPC scoped to its own `service` body, and server-streaming methods keep their `stream` return marker
+4. **Compile the emitted `.proto`** — `test/proto-validate` compiles the generated file and fails the target on any syntax, duplicate-tag, or unresolved-reference error (AC4 of LAB-2778)
+
+> **No `protoc` required.** The compile check runs in-process via `bufbuild/protocompile`
+> rather than shelling out. It used to call `protoc` behind `command -v protoc`, which
+> meant the assertion proving the emitted spec compiles passed by never running: `protoc`
+> ships on no GitHub-hosted `ubuntu-24.04` image, and `live-tests.yml` runs under
+> `disable-sudo: true`, so it could not be installed from a later step either. Removing
+> the external dependency — rather than provisioning it — makes the check behave
+> identically on CI and on a developer machine (LAB-5549). `grpcurl` remains optional:
+> the reachability probe uses it when present for a stronger signal (reflection answers,
+> not just an open port) and falls back to a TCP connect otherwise.
+
 For deterministic GraphQL tests (`generate-graphql`, `generate-graphql-imports`):
 
 1. **Generate** SDL from fixed reference capture or imported Burp/HAR files
@@ -213,7 +230,8 @@ For importer tests:
 
 Options:
   --targets <list>   Comma-separated targets (default: all)
-                     Valid: rest-api,soap-service,graphql-server,grpc-server
+                     Valid: rest-api,soap-service,graphql-server,grpc-server,
+                            concat-spa,forms-target
   --skip-start       Only build, don't start services
   --teardown         Stop all running targets and clean up
   --sweep            With --teardown, also sweep untracked orphans by name/port
@@ -254,8 +272,8 @@ Options:
   --targets <list>      Comma-separated targets to test (overrides --group)
                         Valid targets:
                           Service:    rest-api, scan-rest, soap-service, graphql-server,
-                                      concat-spa, concat-spa-two-stage, forms-target
-                          Config:     grpc-server (included via TARGETS_SETUP when set up)
+                                      grpc-server, concat-spa, concat-spa-two-stage,
+                                      forms-target
                           Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,
                                       generate-graphql, generate-graphql-imports,
                                       generate-js-static, generate-merge-slugs
@@ -393,8 +411,10 @@ TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server
 
 > **`TARGETS_SETUP` is additive, not restrictive.** A bare `./test/run-live-tests.sh`
 > resolves the full `all` group (every `OFFLINE_TARGETS` + `LIVE_TARGETS`).
-> `TARGETS_SETUP` only *adds* config-only targets such as `grpc-server` to that run —
-> it does **not** narrow it. To run only the targets you set up, pass
+> `TARGETS_SETUP` only *adds* targets to that run — it does **not** narrow it.
+> Every shipped target is in `OFFLINE_TARGETS` or `LIVE_TARGETS`, so a default run
+> already covers all of them and `TARGETS_SETUP` is only a hook for out-of-tree
+> additions. To run only the targets you set up, pass
 > `--targets <list>` (or use `--group offline` / `--group live`). After a partial
 > `setup-live-targets.sh --targets <subset>`, the setup script prints the exact
 > `--targets` command to use.
@@ -482,7 +502,7 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 ## Expected Results
 
-All 31 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest). The sample below is a default `--group all` run (21 offline + 10 live targets); the config-only `grpc-server` target runs additionally only when `TARGETS_SETUP` is configured.
+All 32 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest). The sample below is a default `--group all` run (21 offline + 11 live targets). `grpc-server` is part of the live group as of LAB-5549 — it runs on a bare `--group live` with no `TARGETS_SETUP` or `--targets` override, so CI exercises it on every PR.
 
 ```text
   TARGET                      STATUS    ENDPOINTS   EXPECTED   DURATION
@@ -503,6 +523,7 @@ All 31 tests should pass. Order is non-deterministic and durations vary by machi
   generate-wsdl               PASS      3           3          1s
   generate-wsdl-matrix        PASS      3           3          1s
   graphql-server              PASS      8           8          1s
+  grpc-server                 PASS      3           3          1s
   import-base64               PASS      2           2          0s
   import-burp                 PASS      5           5          0s
   import-duplicates           PASS      2           2          0s
