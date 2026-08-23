@@ -30,7 +30,15 @@ satisfies `command -v` and `-x` but fails the moment it runs, so `setup-live-tar
 reports it as *"found … but it is not runnable"* rather than passing preflight
 and failing later mid-crawl.
 
-Install a real, non-snap Chrome (`.deb`, amd64 or arm64):
+**In this repo's devcontainer there is nothing to do.** `.devcontainer/Dockerfile`
+runs `test/install-chrome.sh` as an image layer, so a fresh container comes up
+with a real, non-snap Chrome already installed, and `.devcontainer/devcontainer.json`
+sets `VESPASIAN_NO_SANDBOX=true` for you. The `devcontainer-image` CI job
+builds that image and asserts the browser it ships is runnable, so what you get
+is what CI checked.
+
+Outside that image — macOS, a bare Ubuntu host, your own container — install a
+real, non-snap Chrome (`.deb`, amd64 or arm64) yourself:
 
 ```bash
 ./test/install-chrome.sh          # idempotent; if a runnable browser exists it skips the
@@ -40,27 +48,9 @@ Install a real, non-snap Chrome (`.deb`, amd64 or arm64):
 export VESPASIAN_NO_SANDBOX=true  # containers generally cannot use the Chrome sandbox
 ```
 
-> **This is a manual step today** — tracked in [LAB-5766](https://linear.app/praetorianlabs/issue/LAB-5766).
-> Nothing in this repo runs the installer automatically, because the devcontainer
-> definition lives elsewhere, so a fresh container comes up browserless and you
-> must run the command above once. To remove that step, the image that owns the
-> devcontainer needs to call the script at build or create time:
->
-> ```dockerfile
-> # Dockerfile layer. Both files are copied into the SAME directory: the
-> # installer sources common.sh from its own dirname, so copying it alone
-> # fails at `source` with "No such file or directory".
-> COPY test/install-chrome.sh test/common.sh /tmp/vespasian-chrome/
-> RUN /tmp/vespasian-chrome/install-chrome.sh && rm -rf /tmp/vespasian-chrome
-> ```
->
-> ```jsonc
-> // .devcontainer/devcontainer.json — alternative, runs on container create
-> { "postCreateCommand": "./test/install-chrome.sh" }
-> ```
->
-> The script is idempotent and exits 0 when a runnable browser is already
-> present, so either hook is safe to invoke on every build or rebuild.
+The script is idempotent and exits 0 when a runnable browser is already present,
+so running it inside the devcontainer anyway is harmless — it re-clears its own
+apt leftovers and exits.
 
 **How the package is trusted.** Google's apt repository is added *temporarily*,
 with its signing key pinned by primary-key fingerprint. apt then verifies the
@@ -81,7 +71,10 @@ permanent apt source and daily update pinger (`/etc/cron.daily/google-chrome`)
 are always suppressed via `repo_add_once=false`, so the package never creates
 them in the first place. Inside a throwaway image the script goes further and
 also removes and verifies absent whatever the package planted anyway — that
-pair is the "no phone-home from the devcontainer image" acceptance criterion.
+pair is the "no phone-home from the devcontainer image" acceptance criterion,
+and `.devcontainer/Dockerfile` is what makes it apply: it names
+`container=docker` for the install layer, so the removal AND the
+verify-absent pass both run, and a survivor fails the image build.
 Outside a container (a developer's own machine), removing artifacts the
 package owns is not this script's call, so they are left alone as Chrome's
 normal update channel. Chrome's telemetry is separately disabled on every
@@ -126,10 +119,11 @@ continue. Selections that do need a browser still fail loudly at preflight.
 Separate from this live suite, `pkg/crawl` carries `//go:build integration`
 tests that launch a real browser to exercise `NewBrowserManager`'s launch / kill
 / close lifecycle. They are excluded from `make test` by the build tag and need
-the same non-snap Chrome as above:
+the same non-snap Chrome as above — which the devcontainer already provides, so
+inside it the export is redundant:
 
 ```bash
-export VESPASIAN_NO_SANDBOX=true
+export VESPASIAN_NO_SANDBOX=true   # already set in the devcontainer
 go test -tags integration ./pkg/crawl/...
 ```
 
@@ -358,9 +352,8 @@ caller-supplied directory instead of the real filesystem. It exists solely so
 `test/install-chrome-selftest.sh` can drive the installer's privileged branches
 (the defaults-file rewrite, the container gate, phone-home removal and
 verification) against fixtures, unprivileged. **No production caller sets
-it** — `install-chrome.sh` itself, `setup-live-targets.sh`, the
-Dockerfile/`postCreateCommand` snippets above, and the CI jobs all leave it
-unset.
+it** — `install-chrome.sh` itself, `setup-live-targets.sh`,
+`.devcontainer/Dockerfile`, and the CI jobs all leave it unset.
 
 The script validates the value before using it — it must be an absolute,
 existing directory containing only `[A-Za-z0-9._/-]`, with no `..` component,
