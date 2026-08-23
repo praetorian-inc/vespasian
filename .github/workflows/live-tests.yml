@@ -54,16 +54,27 @@ permissions:
 #   * example.com:443 — TestDoCrawl_ProxyPortlessWarning crawls it through a
 #     deliberately broken proxy and discards the result, asserting only on a
 #     stderr warning, so a blocked crawl does not change the test's outcome.
-#   * hosted-compute-*.githubapp.com — GitHub's own host agents (provjobd,
-#     hosted-compute-agent), outside the job's process tree.
+#   * hosted-compute-{watchdog,request-orchestrator}-prod-*.githubapp.com —
+#     GitHub's own host agents (provjobd, hosted-compute-agent). These ARE
+#     subject to the policy and ARE blocked: run 32651870901 logged
+#     "domain not allowed" for them in preflight-selftest, integration-tests and
+#     test, and all three passed. Left off deliberately rather than by oversight
+#     — the region suffix rotates, so listing them means a wildcard over
+#     githubapp.com for traffic no step of ours makes.
 #   * prod.app-api.stepsecurity.io / agent.api.stepsecurity.io — implicitly
 #     allowed by harden-runner in block mode.
 #
 # `*.blob.core.windows.net:443` is wider than what any job needs, and that is a
-# known cost, not an oversight: the Actions cache/artifact storage account
-# rotates per run and region (productionresultssa2/7/8/11/15/16/18 across the six
-# runs), so no tighter form exists. Only the three jobs that use `cache: npm` or
-# `upload-artifact` carry it.
+# known cost, not an oversight. harden-runner resolves the job's OWN Actions
+# results storage account at start-up and injects it — run 32651870901 shows
+# productionresultssa13 in the effective allow-set of all five jobs, including
+# the two whose lists name no blob endpoint at all — so the injection alone
+# covers a job that only uploads its step results, which is why preflight-selftest
+# and docs-check need no entry. It does NOT cover the Actions cache or
+# upload-artifact: in the same run the `test` job used productionresultssa2 AND
+# productionresultssa14, neither of them the injected one. Three accounts in one
+# job is why no tighter form exists. Only the three jobs that use `cache: npm` or
+# `upload-artifact` carry the wildcard.
 #
 # install-chrome-e2e has no harden-runner step to flip — the action does not
 # support container jobs — and its own comment records why.
