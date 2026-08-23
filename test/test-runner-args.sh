@@ -2047,6 +2047,52 @@ TIMEOUT_STUB
 fi
 
 echo ""
+echo ""
+echo "=== harden-runner egress policy ==="
+# LAB-6015 flipped all five non-container jobs from `egress-policy: audit` to
+# `block` with a per-job allowlist. Nothing guarded that. A revert to `audit`, or
+# an emptied `allowed-endpoints:`, leaves the step present, the workflow valid,
+# and every other assertion in this file green while the jobs that drive a
+# browser and an HTTP crawler regain unrestricted outbound network access — the
+# silent-loss shape this file exists to catch, one level up from a dropped step.
+# `audit` is a legitimate outcome for a job that genuinely cannot be flipped, but
+# LAB-6015's AC6 requires that to be recorded rather than silent: reaching it
+# means editing this guard, which is the recording.
+#
+# The job list is DERIVED from the workflow, not hardcoded, so a sixth job
+# opening with harden-runner is covered the day it is added, and install-chrome-e2e
+# (a container job, which the action does not support) is excluded by having no
+# such step rather than by an allowlist that would go stale.
+if [[ -f "$WORKFLOW" ]]; then
+    hr_jobs=$(yq_query '[.jobs | to_entries[] | select([.value.steps[]? | select((.uses // "") | test("step-security/harden-runner"))] | length > 0) | .key] | .[]')
+    case "$hr_jobs" in
+        __NO_YQ__)    fail_no_yq "the harden-runner egress-policy pin" ;;
+        __YQ_ERROR__) fail_yq_error "the harden-runner egress-policy pin" ;;
+        "")           fail "no job in live-tests.yml carries a step-security/harden-runner step — the egress policy was removed wholesale, or the derivation broke and the per-job assertions below would be vacuous" ;;
+        *)
+            pass "harden-runner job list derived from live-tests.yml ($(wc -l <<< "$hr_jobs") jobs)"
+            while IFS= read -r hr_job; do
+                [[ -n "$hr_job" ]] || continue
+                # One counted outcome per job: the policy and the allowlist are a
+                # single control. `block` with an empty allowed-endpoints is not a
+                # tighter policy, it is a job that cannot check out its own source,
+                # and `audit` with a full list is the pre-LAB-6015 state wearing the
+                # new list as camouflage. Asking for both in one query means neither
+                # half can be reverted while the other keeps the assertion green.
+                verdict=$(yq_query "[.jobs.\"${hr_job}\".steps[] | select((.uses // \"\") | test(\"step-security/harden-runner\")) | (.with.\"egress-policy\" // \"<unset>\") + \" \" + (((.with.\"allowed-endpoints\" // \"\") | split(\" \") | map(select(. != \"\")) | length) | tostring)] | join(\", \")")
+                case "$verdict" in
+                    __NO_YQ__)    fail_no_yq "${hr_job}'s harden-runner egress policy" ;;
+                    __YQ_ERROR__) fail_yq_error "${hr_job}'s harden-runner egress policy" ;;
+                    "block "[1-9]*) pass "${hr_job} harden-runner is egress-policy: block with a non-empty allowlist (${verdict})" ;;
+                    *)            fail "${hr_job} harden-runner is not 'block' with a non-empty allowed-endpoints list (got: ${verdict}) — LAB-6015 flipped all five jobs off audit; reverting one silently restores unrestricted egress for that job" ;;
+                esac
+            done <<< "$hr_jobs"
+            ;;
+    esac
+else
+    fail "live-tests.yml not found at $WORKFLOW (harden-runner egress assertions vacuous)"
+fi
+
 echo "=== test job wiring ==="
 # preflight-selftest and install-chrome-e2e got step-list wiring guards above
 # because a hand-maintained YAML block can silently lose a step with every
@@ -2268,7 +2314,14 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # install-chrome-e2e ever executed — lost two steps to `set -euo pipefail` dying
 # on line 1. Nothing could have caught it: an inline block is not a file, so
 # `bash -n` never sees it, and the job is opt-in, so no PR run exercised it.
-EXPECTED_ASSERTIONS=135
+#
+# LAB-6015: 135 -> 141. MEASURED. +1 for the derivation sentinel and +5 for the
+# per-job harden-runner egress pin (one counted outcome per job, policy and
+# allowlist asked for together). Mutation-proven: reverting preflight-selftest to
+# `egress-policy: audit` and, separately, emptying the `test` job's
+# `allowed-endpoints:` each left every other assertion in this file green and were
+# caught only here.
+EXPECTED_ASSERTIONS=141
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."

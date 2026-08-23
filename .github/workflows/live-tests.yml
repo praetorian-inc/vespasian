@@ -15,6 +15,63 @@ concurrency:
 permissions:
   contents: read
 
+# ── ALLOWLIST PROVENANCE (LAB-6015) ───────────────────────────────────────────
+# Every harden-runner step below runs `egress-policy: block`. The per-job
+# `allowed-endpoints` lists are DERIVED FROM TELEMETRY, not guessed: the union of
+# the `endpoint called` lines in the harden-runner post-step output of six green
+# `live-tests` push runs on main —
+#
+#   32500986374 (393bf02) 32494976039 (b575e67) 32398237813 (c0bb167)
+#   32395398188 (d2a4e90) 32382787790 (f6c0624) 32297452612 (ff299ba)
+#
+# read back with `gh run view <id> --log`. `endpoint called` is a connect that
+# actually happened; `domain resolved` is only a DNS lookup, and the two differ
+# here. Three guesses recorded on LAB-4732/LAB-6015 did not survive that check:
+# objects.githubusercontent.com and nodejs.org are never contacted (setup-go and
+# setup-node fetch from release-assets.githubusercontent.com), and
+# storage.googleapis.com is needed only by the one job that has no setup-go.
+#
+# The lists are per job, not shared. preflight-selftest and docs-check are
+# near-hermetic and a shared list would over-grant them; docs-check needs two
+# endpoints.
+#
+# ONE DELIBERATE SUPERSET, so this is not read as pure observation:
+# sum.golang.org:443 appears in integration-tests and test although the six runs
+# never dialled it there. setup-go restored the module cache in every one of
+# them, so `go mod download` verified nothing against the checksum database. A
+# go.sum change, a new dependency or an evicted cache takes the miss path, which
+# does dial it — and a blocked sumdb fails `go mod download` in a way that reads
+# as a network flake rather than as a policy gap. The endpoint is Go's module
+# checksum database, so allowing it strengthens the supply chain rather than
+# weakening it. preflight-selftest reaches it for real (GOTOOLCHAIN), so it is
+# telemetry-derived there.
+#
+# Deliberately NOT allowed, though observed:
+#   * clients2.google.com:80, www.google.com:443, update.googleapis.com:443 —
+#     Chrome's component updater and connectivity probes. LAB-4999 pinned the
+#     system browser and added telemetry-suppressing flags; these survived it.
+#     Stopping them is the point of the flip, and no assertion reads them.
+#   * example.com:443 — TestDoCrawl_ProxyPortlessWarning crawls it through a
+#     deliberately broken proxy and discards the result, asserting only on a
+#     stderr warning, so a blocked crawl does not change the test's outcome.
+#   * hosted-compute-*.githubapp.com — GitHub's own host agents (provjobd,
+#     hosted-compute-agent), outside the job's process tree.
+#   * prod.app-api.stepsecurity.io / agent.api.stepsecurity.io — implicitly
+#     allowed by harden-runner in block mode.
+#
+# `*.blob.core.windows.net:443` is wider than what any job needs, and that is a
+# known cost, not an oversight: the Actions cache/artifact storage account
+# rotates per run and region (productionresultssa2/7/8/11/15/16/18 across the six
+# runs), so no tighter form exists. Only the three jobs that use `cache: npm` or
+# `upload-artifact` carry it.
+#
+# install-chrome-e2e has no harden-runner step to flip — the action does not
+# support container jobs — and its own comment records why.
+#
+# WHEN A RUN IS BLOCKED: harden-runner's job summary marks the destination
+# "❌ Blocked". Add it to THAT job's list with a note on why the job needs it;
+# do not widen a sibling job's list to match.
+# ──────────────────────────────────────────────────────────────────────────────
 jobs:
   # Fast, un-gated regression net: a syntax check plus all four guard suites —
   # preflight Chrome/Chromium detection (LAB-3893), install-chrome.sh's
@@ -27,19 +84,29 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      # Defense-in-depth (LAB-4732): monitor and record all
-      # outbound network traffic. Audit mode is non-blocking — it logs egress
-      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
-      # 'block' with an allowed-endpoints list once telemetry confirms the set.
+      # Egress allowlist derived from telemetry — see the ALLOWLIST PROVENANCE
+      # block above jobs:. This job has no setup-go, but preflight-selftest.sh
+      # sources setup-live-targets.sh, whose check_prerequisites runs `go version`
+      # (test/setup-live-targets.sh:248); go.mod pins go 1.25.8, so GOTOOLCHAIN
+      # fetches the toolchain — hence the three Go endpoints. No npm, no Actions
+      # cache and no artifact upload here, so no registry.npmjs.org and no blob
+      # storage: this is the tightest of the five lists.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
       # bump ALL FIVE copies in lockstep — a missed copy silently leaves a job on
-      # a stale pin.
+      # a stale pin. test/test-runner-args.sh fails the build if any of the five
+      # drops out of 'block' or empties its allowlist.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
-          egress-policy: audit
+          egress-policy: block
           disable-sudo: true
+          allowed-endpoints: >
+            github.com:443
+            proxy.golang.org:443
+            storage.googleapis.com:443
+            sum.golang.org:443
+            results-receiver.actions.githubusercontent.com:443
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
@@ -92,19 +159,28 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      # Defense-in-depth (LAB-4732): monitor and record all
-      # outbound network traffic. Audit mode is non-blocking — it logs egress
-      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
-      # 'block' with an allowed-endpoints list once telemetry confirms the set.
+      # Egress allowlist derived from telemetry — see the ALLOWLIST PROVENANCE
+      # block above jobs:. setup-node fetches Node from release-assets (via
+      # api.github.com), `npm ci` fetches from registry.npmjs.org, and `cache: npm`
+      # reads/writes the Actions cache in blob storage. No Go endpoints: nothing
+      # in this job invokes the toolchain.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
       # bump ALL FIVE copies in lockstep — a missed copy silently leaves a job on
-      # a stale pin.
+      # a stale pin. test/test-runner-args.sh fails the build if any of the five
+      # drops out of 'block' or empties its allowlist.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
-          egress-policy: audit
+          egress-policy: block
           disable-sudo: true
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            registry.npmjs.org:443
+            release-assets.githubusercontent.com:443
+            results-receiver.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
@@ -120,11 +196,13 @@ jobs:
           cache: npm
           cache-dependency-path: test/spec-validators/package-lock.json
 
-      # --ignore-scripts prevents install/preinstall/postinstall
-      # lifecycle scripts from running under harden-runner's non-blocking
-      # audit-only egress policy. These validators are pure libraries with no
-      # install step, but this protects against a future lockfile refresh
-      # silently introducing one.
+      # --ignore-scripts prevents install/preinstall/postinstall lifecycle
+      # scripts from running at all. Still load-bearing under `block`, not
+      # redundant with it: the egress policy bounds WHERE a lifecycle script can
+      # reach, and registry.npmjs.org is necessarily on this job's allowlist, so
+      # a script running at install time would inherit exactly the endpoint it
+      # would want. These validators are pure libraries with no install step, but
+      # this protects against a future lockfile refresh silently introducing one.
       - name: Install spec validators
         working-directory: test/spec-validators
         run: npm ci --ignore-scripts
@@ -147,19 +225,23 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      # Defense-in-depth (LAB-4732): monitor and record all
-      # outbound network traffic. Audit mode is non-blocking — it logs egress
-      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
-      # 'block' with an allowed-endpoints list once telemetry confirms the set.
+      # Egress allowlist derived from telemetry — see the ALLOWLIST PROVENANCE
+      # block above jobs:. Two entries because that is genuinely all this job does:
+      # checkout, then python3 check-docs.py against the working tree. If a future
+      # docs check reaches the network, this list is where that shows up.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
       # bump ALL FIVE copies in lockstep — a missed copy silently leaves a job on
-      # a stale pin.
+      # a stale pin. test/test-runner-args.sh fails the build if any of the five
+      # drops out of 'block' or empties its allowlist.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
-          egress-policy: audit
+          egress-policy: block
           disable-sudo: true
+          allowed-endpoints: >
+            github.com:443
+            results-receiver.actions.githubusercontent.com:443
 
       # fetch-depth 0 is NOT needed: the checker reads the working tree and uses
       # `git ls-files`, which works on a shallow clone.
@@ -371,17 +453,31 @@ jobs:
       # would catch that (LAB-4678 review).
       VESPASIAN_REQUIRE_CHROME: "1"
     steps:
-      # Defense-in-depth (LAB-4732): monitor and record all
-      # outbound network traffic. Audit mode is non-blocking.
+      # Egress allowlist derived from telemetry — see the ALLOWLIST PROVENANCE
+      # block above jobs:. setup-go pins the toolchain from go.mod, so there is no
+      # GOTOOLCHAIN fetch and storage.googleapis.com is NOT needed here (unlike
+      # preflight-selftest). Chrome's egress is deliberately absent: this job drives
+      # a browser and the observed clients2.google.com / www.google.com /
+      # update.googleapis.com calls are Chrome phoning home, which no assertion
+      # depends on and which this policy exists to stop.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
       # bump ALL FIVE copies in lockstep — a missed copy silently leaves a job on
-      # a stale pin.
+      # a stale pin. test/test-runner-args.sh fails the build if any of the five
+      # drops out of 'block' or empties its allowlist.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
-          egress-policy: audit
+          egress-policy: block
           disable-sudo: true
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            proxy.golang.org:443
+            release-assets.githubusercontent.com:443
+            results-receiver.actions.githubusercontent.com:443
+            sum.golang.org:443
+            *.blob.core.windows.net:443
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
@@ -430,21 +526,31 @@ jobs:
     env:
       VESPASIAN_NO_SANDBOX: "true"
     steps:
-      # Defense-in-depth (LAB-4732): monitor and record all
-      # outbound network traffic. Audit mode is non-blocking — it logs egress
-      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
-      # 'block' with an allowed-endpoints list once telemetry confirms the set
-      # (expected: github.com, proxy.golang.org, sum.golang.org,
-      # storage.googleapis.com, objects.githubusercontent.com, registry.npmjs.org).
+      # Egress allowlist derived from telemetry — see the ALLOWLIST PROVENANCE
+      # block above jobs:. The widest of the five: Go plus npm plus the Actions
+      # cache plus upload-artifact. The six live targets are local servers on
+      # loopback ports and contribute nothing here — confirmed in the telemetry,
+      # not assumed. Chrome's phone-home is deliberately absent, same as
+      # integration-tests.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
       # bump ALL FIVE copies in lockstep — a missed copy silently leaves a job on
-      # a stale pin.
+      # a stale pin. test/test-runner-args.sh fails the build if any of the five
+      # drops out of 'block' or empties its allowlist.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
-          egress-policy: audit
+          egress-policy: block
           disable-sudo: true
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            proxy.golang.org:443
+            registry.npmjs.org:443
+            release-assets.githubusercontent.com:443
+            results-receiver.actions.githubusercontent.com:443
+            sum.golang.org:443
+            *.blob.core.windows.net:443
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
@@ -466,11 +572,12 @@ jobs:
 
       # LAB-3890 T1: the offline generate-{rest,graphql,wsdl} targets validate
       # output with real parsers (swagger-parser + graphql-js) instead of grep.
-      # Deps are hermetic once installed; the only egress is registry.npmjs.org
-      # (already in the anticipated harden-runner allowlist above).
-      # --ignore-scripts prevents install/preinstall/postinstall
-      # lifecycle scripts from running under harden-runner's non-blocking
-      # audit-only egress policy.
+      # Deps are hermetic once installed; the only egress is registry.npmjs.org,
+      # which is on this job's harden-runner allowlist above — telemetry-confirmed,
+      # not anticipated.
+      # --ignore-scripts prevents install/preinstall/postinstall lifecycle
+      # scripts from running at all — see the same note in validator-regression
+      # for why `block` does not make it redundant.
       - name: Install spec validators
         working-directory: test/spec-validators
         run: npm ci --ignore-scripts
