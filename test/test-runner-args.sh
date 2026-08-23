@@ -2047,52 +2047,115 @@ TIMEOUT_STUB
 fi
 
 echo ""
-echo ""
 echo "=== harden-runner egress policy ==="
-# LAB-6015 flipped all five non-container jobs from `egress-policy: audit` to
-# `block` with a per-job allowlist. Nothing guarded that. A revert to `audit`, or
-# an emptied `allowed-endpoints:`, leaves the step present, the workflow valid,
-# and every other assertion in this file green while the jobs that drive a
-# browser and an HTTP crawler regain unrestricted outbound network access — the
-# silent-loss shape this file exists to catch, one level up from a dropped step.
-# `audit` is a legitimate outcome for a job that genuinely cannot be flipped, but
-# LAB-6015's AC6 requires that to be recorded rather than silent: reaching it
-# means editing this guard, which is the recording.
+# LAB-6015 flipped the five policy-carrying jobs in live-tests.yml from
+# `egress-policy: audit` to `block` with a per-job allowlist. This block is what
+# stops that from being silently undone.
 #
-# The job list is DERIVED from the workflow, not hardcoded, so a sixth job
-# opening with harden-runner is covered the day it is added, and install-chrome-e2e
-# (a container job, which the action does not support) is excluded by having no
-# such step rather than by an allowlist that would go stale.
-if [[ -f "$WORKFLOW" ]]; then
-    hr_jobs=$(yq_query '[.jobs | to_entries[] | select([.value.steps[]? | select((.uses // "") | test("step-security/harden-runner"))] | length > 0) | .key] | .[]')
-    case "$hr_jobs" in
-        __NO_YQ__)    fail_no_yq "the harden-runner egress-policy pin" ;;
-        __YQ_ERROR__) fail_yq_error "the harden-runner egress-policy pin" ;;
-        "")           fail "no job in live-tests.yml carries a step-security/harden-runner step — the egress policy was removed wholesale, or the derivation broke and the per-job assertions below would be vacuous" ;;
-        *)
-            pass "harden-runner job list derived from live-tests.yml ($(wc -l <<< "$hr_jobs") jobs)"
-            while IFS= read -r hr_job; do
-                [[ -n "$hr_job" ]] || continue
-                # One counted outcome per job: the policy and the allowlist are a
-                # single control. `block` with an empty allowed-endpoints is not a
-                # tighter policy, it is a job that cannot check out its own source,
-                # and `audit` with a full list is the pre-LAB-6015 state wearing the
-                # new list as camouflage. Asking for both in one query means neither
-                # half can be reverted while the other keeps the assertion green.
-                verdict=$(yq_query "[.jobs.\"${hr_job}\".steps[] | select((.uses // \"\") | test(\"step-security/harden-runner\")) | (.with.\"egress-policy\" // \"<unset>\") + \" \" + (((.with.\"allowed-endpoints\" // \"\") | split(\" \") | map(select(. != \"\")) | length) | tostring)] | join(\", \")")
-                case "$verdict" in
-                    __NO_YQ__)    fail_no_yq "${hr_job}'s harden-runner egress policy" ;;
-                    __YQ_ERROR__) fail_yq_error "${hr_job}'s harden-runner egress policy" ;;
-                    "block "[1-9]*) pass "${hr_job} harden-runner is egress-policy: block with a non-empty allowlist (${verdict})" ;;
-                    *)            fail "${hr_job} harden-runner is not 'block' with a non-empty allowed-endpoints list (got: ${verdict}) — LAB-6015 flipped all five jobs off audit; reverting one silently restores unrestricted egress for that job" ;;
-                esac
-            done <<< "$hr_jobs"
-            ;;
+# It compares each job's policy against a PINNED EXPECTATION below rather than
+# checking its shape, because the first version of this guard checked shape —
+# "is the value `block`, are there one or more endpoints" — and eight mutations
+# walked straight through it: an allowlist collapsed to `*:443` (one entry, so it
+# passed), a SECOND harden-runner step on `audit` in the same job, `if: false` on
+# the step so the policy never installs, the step moved below checkout so it
+# polices nothing before it, a changed SHA, a look-alike action name, and a
+# deleted `disable-sudo: true`. Each left the suite at 141/0, exit 0. Comparing
+# an exact normalised value makes every one of those a mismatch, because they all
+# change the value and none of them changes the shape.
+#
+# EXPECTED_HR_JOBS is HARDCODED, deliberately, and this is the second half of the
+# fix. The first version derived the job list from the workflow, which meant a
+# job that should carry the step but does not was invisible (check-label is the
+# live example), and DELETING a step removed an assertion instead of failing one
+# — so the only signal was the accounting pin at the bottom of this file, whose
+# message reads "a case was added or removed without updating
+# EXPECTED_ASSERTIONS", i.e. it instructs the maintainer to bump the pin and turn
+# a removed egress control green. Iterating a constant list fails the named job
+# instead, and keeps this block's counted-outcome total CONSTANT — the derived
+# version emitted six outcomes with yq and one without, so EXPECTED_ASSERTIONS
+# was wrong on any host lacking yq (measured: 136 against a pin of 141, where
+# base was exact at 135).
+#
+# Changing a job's egress policy therefore means editing this table. That is the
+# point: LAB-6015's AC6 asks for a job leaving `block` to be RECORDED rather than
+# silent, and editing the pin is the recording.
+EXPECTED_HR_JOBS=(preflight-selftest validator-regression docs-check integration-tests test)
+
+# One entry per job above, and the value is the whole policy: the pinned action,
+# the egress mode, disable-sudo, whether the step carries an `if:`, whether
+# harden-runner is the job's FIRST step, and the allowlist as a sorted set.
+# hr_policy() below builds the same string from the workflow with one yq call.
+HR_PIN='step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920'
+hr_expected() {
+    local endpoints
+    case "$1" in
+        preflight-selftest)   endpoints='github.com:443,results-receiver.actions.githubusercontent.com:443' ;;
+        validator-regression) endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443' ;;
+        docs-check)           endpoints='github.com:443,results-receiver.actions.githubusercontent.com:443' ;;
+        integration-tests)    endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ;;
+        test)                 endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ;;
+        *) printf '%s\n' '<no expectation pinned>'; return 0 ;;
     esac
-else
+    printf 'first=true || uses=%s policy=block sudo=true if=false endpoints=%s\n' "$HR_PIN" "$endpoints"
+}
+
+# The observed counterpart. Built with ONE yq call so each job costs exactly one
+# counted outcome on every path, yq present or absent.
+#
+# `[.with."allowed-endpoints"] | flatten | join(" ")` rather than `split` on the
+# raw value: the previous version called `split(" ")` directly, which type-errors
+# on a SEQUENCE-valued allowed-endpoints ("cannot split !!seq") and routed a
+# perfectly parseable workflow into fail_yq_error's "the workflow is broken"
+# wording. Wrapping in a list and flattening accepts a scalar and a sequence
+# alike. The `sub("\s+"; " ")` then collapses the newline a `>` block scalar
+# leaves on its last element, which a plain space-split silently carried into the
+# endpoint name.
+hr_policy() {
+    local job=$1
+    yq_query "\"first=\" + ((.jobs.\"${job}\".steps[0].uses // \"\") | test(\"step-security/harden-runner\") | tostring)
+      + \" || \" + ([.jobs.\"${job}\".steps[] | select((.uses // \"\") | test(\"step-security/harden-runner\"))]
+        | map(\"uses=\" + (.uses // \"<none>\")
+            + \" policy=\" + (.with.\"egress-policy\" // \"<unset>\")
+            + \" sudo=\" + ((.with.\"disable-sudo\" // \"<unset>\") | tostring)
+            + \" if=\" + ((has(\"if\")) | tostring)
+            + \" endpoints=\" + ([.with.\"allowed-endpoints\"] | flatten | join(\" \") | sub(\"\s+\"; \" \") | split(\" \") | map(select(. != \"\")) | sort | join(\",\")))
+        | join(\" ;; \"))" -r
+}
+
+if [[ ! -f "$WORKFLOW" ]]; then
     fail "live-tests.yml not found at $WORKFLOW (harden-runner egress assertions vacuous)"
+    for _ in "${EXPECTED_HR_JOBS[@]}"; do
+        fail "harden-runner policy for a pinned job could not be checked: $WORKFLOW is missing"
+    done
+else
+    for hr_job in "${EXPECTED_HR_JOBS[@]}"; do
+        hr_want=$(hr_expected "$hr_job")
+        hr_got=$(hr_policy "$hr_job")
+        case "$hr_got" in
+            __NO_YQ__)    fail_no_yq "${hr_job}'s harden-runner egress policy" ;;
+            __YQ_ERROR__) fail_yq_error "${hr_job}'s harden-runner egress policy" ;;
+            "$hr_want")   pass "${hr_job} harden-runner policy matches the pin (block, sudo, no if:, first step, exact allowlist)" ;;
+            *)            fail "${hr_job} harden-runner policy does not match the pin — a job leaving 'block', gaining a second harden-runner step, an if:, a moved step, a changed SHA, a dropped disable-sudo, or a widened allowlist all land here. Update this file's pin deliberately if the change is intended.
+        want: ${hr_want}
+        got:  ${hr_got}" ;;
+        esac
+    done
+
+    # The pin above says which jobs MUST carry the policy; this says no OTHER job
+    # may. A sixth job appearing with harden-runner is not covered by a pin, so it
+    # would otherwise be unchecked — the mirror image of the check-label gap that
+    # the derived job list had.
+    hr_actual=$(yq_query '[.jobs | to_entries[] | select([.value.steps[]? | select((.uses // "") | test("step-security/harden-runner"))] | length > 0) | .key] | sort | join(" ")' -r)
+    hr_pinned_sorted=$(printf '%s\n' "${EXPECTED_HR_JOBS[@]}" | sort | tr '\n' ' ' | sed 's/ $//')
+    case "$hr_actual" in
+        __NO_YQ__)    fail_no_yq "the set of jobs carrying harden-runner" ;;
+        __YQ_ERROR__) fail_yq_error "the set of jobs carrying harden-runner" ;;
+        "$hr_pinned_sorted") pass "exactly the pinned jobs carry harden-runner (${hr_pinned_sorted})" ;;
+        *)            fail "the set of jobs carrying harden-runner has changed — pinned '${hr_pinned_sorted}', found '${hr_actual}'. A new job carrying the policy needs an entry in EXPECTED_HR_JOBS and hr_expected; a job that lost it needs the removal recorded here." ;;
+    esac
 fi
 
+echo ""
 echo "=== test job wiring ==="
 # preflight-selftest and install-chrome-e2e got step-list wiring guards above
 # because a hand-maintained YAML block can silently lose a step with every
@@ -2315,12 +2378,25 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # on line 1. Nothing could have caught it: an inline block is not a file, so
 # `bash -n` never sees it, and the job is opt-in, so no PR run exercised it.
 #
-# LAB-6015: 135 -> 141. MEASURED. +1 for the derivation sentinel and +5 for the
-# per-job harden-runner egress pin (one counted outcome per job, policy and
-# allowlist asked for together). Mutation-proven: reverting preflight-selftest to
-# `egress-policy: audit` and, separately, emptying the `test` job's
-# `allowed-endpoints:` each left every other assertion in this file green and were
-# caught only here.
+# LAB-6015: 135 -> 141. MEASURED. +5 for the per-job harden-runner policy pin (one
+# counted outcome per job in EXPECTED_HR_JOBS) and +1 for the "exactly these jobs
+# carry it" check.
+#
+# The +6 is CONSTANT BY CONSTRUCTION, which is the property that matters here and
+# the one the first version of that block got wrong. It iterated a job list
+# DERIVED from the workflow, so it emitted six outcomes with yq and one without —
+# leaving this pin wrong on any host lacking yq and producing a spurious
+# "accounting drift" failure that blamed deleted assertions for a missing tool.
+# Measured then: 136 against a pin of 141, where base was exact at 135. Measured
+# now, with yq hidden from PATH: 127 passed + 14 failed = 141, no drift message.
+# Iterating the hardcoded EXPECTED_HR_JOBS is what makes the total independent of
+# both yq and the workflow's contents.
+#
+# Mutation-proven, ten mutations, every one CAUGHT (each left the PREVIOUS
+# shape-checking version at 141/0, exit 0): policy -> audit; allowlist emptied; a
+# second harden-runner step on audit; allowlist -> `*:443`; an extra endpoint
+# added; SHA -> 000...0; a look-alike action name; `if: false` on the step; the
+# step moved below checkout; disable-sudo deleted from all five.
 EXPECTED_ASSERTIONS=141
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
