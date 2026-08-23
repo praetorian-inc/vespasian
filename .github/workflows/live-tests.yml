@@ -252,6 +252,21 @@ jobs:
       - name: Check community-health docs
         run: python3 test/check-docs.py --verbose
 
+      # SCRATCH — LAB-6015 AC3 demonstration ONLY. Not for merge.
+      #
+      # Proves the block policy actually blocks, and that it is scoped PER JOB.
+      # proxy.golang.org is on preflight-selftest / integration-tests / test's
+      # allowlists but deliberately not on docs-check's, so it is a host the
+      # workflow demonstrably reaches elsewhere in the same run.
+      #
+      # The control runs first: if github.com (allowed here) also failed, the
+      # demonstration below would be proving nothing but a broken runner.
+      - name: Control — an ALLOWED host is reachable
+        run: curl -fsS --max-time 20 -o /dev/null https://github.com/
+
+      - name: Demonstration — an UNLISTED host must fail the job
+        run: curl -fsS --max-time 20 -o /dev/null https://proxy.golang.org/
+
   # End-to-end exercise of install-chrome.sh's PRIVILEGED path — the download,
   # the signature-verified apt install, the trap teardown, and the AC4 cleanup
   # that runs after the package's postinst. install-chrome-selftest.sh covers
