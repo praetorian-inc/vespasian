@@ -3,7 +3,9 @@
 #
 # Post-install assertion for install-chrome.sh: the install must have produced a
 # browser that detect_chrome_binary resolves and that actually renders a page.
-# Run by live-tests.yml's install-chrome-e2e job, after install-chrome.sh.
+# Run by live-tests.yml's install-chrome-e2e job after install-chrome.sh, and by
+# devcontainer-image via `devcontainer exec` against the built image. Both are
+# containerised, which is why --no-sandbox below is unconditional.
 #
 # A committed script rather than an inline `run:` block: the install-chrome-e2e
 # job is opt-in (workflow_dispatch, plus push to main), so a syntax error in an

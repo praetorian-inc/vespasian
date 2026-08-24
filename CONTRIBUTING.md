@@ -83,7 +83,7 @@ This repo ships a devcontainer ([`.devcontainer/`](.devcontainer/)). It builds o
 the standard Go image and runs [`test/install-chrome.sh`](test/install-chrome.sh)
 as an image layer, so a fresh container already has a real, non-snap Chrome. It
 also installs the `python3` and `yq` the guard suites need, and its
-`onCreateCommand` runs `npm ci` for the spec validators the live and generator
+`onCreateCommand` runs `npm ci --ignore-scripts` for the spec validators the live and generator
 targets use — so the full suite runs with no setup step, not just the
 browser-driven part. Prefer it if you have a choice.
 

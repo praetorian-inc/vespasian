@@ -335,7 +335,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
-      changed: ${{ steps.filter.outputs.devcontainer }}
+      # Only should-run is exported. An earlier revision also exported the raw
+      # `changed` filter result, which nothing consumed — a second surface a
+      # maintainer could reach for expecting "the image should build", and get
+      # subtly wrong behaviour, since `changed` alone omits the
+      # workflow_dispatch and push-to-main arms.
+      #
       # The full run condition, computed ONCE. Both image jobs consume this
       # instead of each restating the three-arm expression: duplicated gating is
       # how the amd64 and arm64 legs would silently desynchronise, and unlike the
@@ -377,6 +382,10 @@ jobs:
               - 'test/common.sh'
               - 'test/assert-chrome-install.sh'
               - 'test/assert-devcontainer-lookpath.sh'
+              # The AC3 step execs these two INSIDE the image, so a change to
+              # either can break the job while touching nothing else listed here.
+              - 'test/setup-live-targets.sh'
+              - 'test/run-live-tests.sh'
 
       # workflow_dispatch and push-to-main are unconditional, for the same reason
       # install-chrome-e2e has them: live egress to Google and a browser download,
@@ -407,7 +416,13 @@ jobs:
     # should-run output for the three arms and why each is there.
     if: needs.devcontainer-changes.outputs.should-run == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # 45, not 30. This job does strictly more than the `test` job (also 30): it
+    # builds an image from scratch, pulls a base image and a browser, and THEN
+    # runs the same live suite that job runs, plus two guard suites and the
+    # integration tests — all under a container runtime. The live step is the
+    # one that would be dropped under time pressure, and it is the only evidence
+    # AC3 has.
+    timeout-minutes: 45
     env:
       # One pin, referenced by every step below. It was six literals, which is
       # the same lockstep hazard the harden-runner comment names — except this
@@ -553,11 +568,39 @@ jobs:
       # This is the only step that exercises the whole chain the criterion
       # describes: setup builds and starts the target services, then the live
       # group drives real crawls through go-rod against them.
+      #
+      # The exit code alone is not enough. run-live-tests.sh only fails an
+      # all-skipped run when the WHOLE selection skipped (`total_pass -eq 0 &&
+      # total_skip -gt 0`), and LIVE_TARGETS mixes rod-backed targets with plain
+      # HTTP ones (scan-rest, edge-cases, crawl-depth, no-download are not in
+      # BROWSER_TARGETS). So if the browser stopped resolving inside the image,
+      # the HTTP targets would still pass, total_pass > 0, the gate would not
+      # fire, and this step would go green having proved nothing about AC3 —
+      # asserting that SOMETHING ran rather than that the rod-backed targets did.
+      # Capture the output and require the browser-driven rows by name.
       - name: Assert the live suite runs in the image (AC3)
         run: |
           set -euo pipefail
-          npx --yes "$DEVCONTAINER_CLI" exec --workspace-folder . bash -c \
-            './test/setup-live-targets.sh && ./test/run-live-tests.sh --no-build --group live'
+          out=$(npx --yes "$DEVCONTAINER_CLI" exec --workspace-folder . bash -c \
+            './test/setup-live-targets.sh && ./test/run-live-tests.sh --no-build --group live' 2>&1) || {
+            printf '%s\n' "$out"
+            echo "live suite failed inside the devcontainer image" >&2
+            exit 1
+          }
+          printf '%s\n' "$out"
+          # no-download is named by LAB-4999 and is rod-backed; concat-spa and
+          # forms-target are in BROWSER_TARGETS. Each must report PASS, not SKIP.
+          missing=""
+          for t in no-download concat-spa forms-target; do
+            printf '%s' "$out" | grep -qE "(^|[^a-z-])${t}[^a-z-].*PASS|PASS.*[^a-z-]${t}([^a-z-]|$)" \
+              || missing="${missing} ${t}"
+          done
+          if [ -n "$missing" ]; then
+            echo "AC3: these rod-backed targets did not report PASS:${missing}" >&2
+            echo "  A green run with these skipped means the image shipped no usable browser." >&2
+            exit 1
+          fi
+          echo "AC3: rod-backed targets (no-download, concat-spa, forms-target) reported PASS in the image"
 
       # Always, so a failed live run still stops the target services rather than
       # leaving them for the next job on this runner. Mirrors the `test` job's

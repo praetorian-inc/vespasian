@@ -42,8 +42,10 @@ The `devcontainer-image` CI job builds that image **through `devcontainer.json`*
 (via `@devcontainers/cli`, not a hand-written `docker build`), then runs the
 assertions inside it as the `vscode` user with that same environment — so the
 configuration CI measures is the one you get, rather than a similar one. It
-asserts the browser resolves and launches, and that the guard suites run in the
-image.
+asserts the browser resolves and launches, that two of the four guard suites
+(`test-runner-args.sh` and `preflight-selftest.sh`) run in the image, and that
+`./test/run-live-tests.sh --group live` runs there with the rod-backed targets
+reporting PASS rather than SKIP.
 
 Outside that image — macOS, a bare Ubuntu host, your own container — install a
 real, non-snap Chrome (`.deb`, amd64 or arm64) yourself:

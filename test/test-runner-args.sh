@@ -2213,6 +2213,30 @@ SUITE_COMPLETED=1
 
 echo ""
 
+# The un-gated `bash -n` chain is the ONLY thing that parses the committed
+# assertion scripts, and it is a hardcoded list. A new committed assertion
+# script that is not added to it gets no syntax coverage at all — which is the
+# whole reason these are files rather than inline blocks. Derive the set that
+# should be covered from what the workflow actually execs, and require each.
+if [[ -f "$WORKFLOW" ]]; then
+    bn_line=$(grep -oE 'bash -n test/[a-zA-Z0-9_.-]+\.sh' "$WORKFLOW" | sed 's/^bash -n //' | sort -u)
+    bn_needed=$(grep -oE 'test/assert-[a-zA-Z0-9_.-]+\.sh' "$WORKFLOW" | sort -u)
+    if [[ -z "$bn_line" || -z "$bn_needed" ]]; then
+        fail "could not derive the bash -n list or the assertion-script set from live-tests.yml — the check below would be vacuous"
+    else
+        bn_missing=""
+        while IFS= read -r bn_s; do
+            [[ -z "$bn_s" ]] && continue
+            printf '%s\n' "$bn_line" | grep -qx "$bn_s" || bn_missing="${bn_missing} ${bn_s}"
+        done <<< "$bn_needed"
+        if [[ -z "$bn_missing" ]]; then
+            pass "every committed test/assert-*.sh the workflow execs is in the un-gated bash -n chain ($(printf '%s' "$bn_needed" | grep -c .) scripts)"
+        else
+            fail "committed assertion script(s) absent from the un-gated bash -n chain:${bn_missing} — a syntax error in one would first surface on main, which is why they are files"
+        fi
+    fi
+fi
+
 # ── devcontainer-image: the wiring that closes LAB-5064 AC1 ────────────────────
 #
 # The devcontainer job is the sole automated check that .devcontainer/ still
@@ -2287,6 +2311,35 @@ if [[ -f "$WORKFLOW" ]]; then
                 fail "devcontainer-image no longer runs a guard suite inside the image — a missing prerequisite (python3, yq, spec-validator deps) would surface in a developer's terminal instead of in CI"
             fi
 
+            # The two steps added to close AC3 and to assert the applied
+            # devcontainer.json config are pinned like the others: without this,
+            # deleting either left the suite green and the criterion unevidenced.
+            for dc_step in 'run-live-tests.sh --no-build --group live' 'id -un'; do
+                if printf '%s\n' "$dc_joined" | grep -qF -- "$dc_step"; then
+                    pass "devcontainer-image still carries the step containing '${dc_step}'"
+                else
+                    fail "devcontainer-image no longer carries the step containing '${dc_step}' — either AC3's only in-image evidence or the devcontainer.json conformance assertion was dropped"
+                fi
+            done
+
+            # TEST-014: the arm64 leg was pinned only by its if:. Its build step
+            # and its in_container marker grep are the whole point of the job.
+            arm_block=$(extract_job_block devcontainer-image-arm64 | grep -vE '^[[:space:]]*#')
+            if [[ -z "$arm_block" ]]; then
+                fail "could not extract the devcontainer-image-arm64 job block — the assertions below would be vacuous"
+            else
+                if printf '%s\n' "$arm_block" | grep -qE 'buildx build.*--platform linux/arm64|--platform linux/arm64'; then
+                    pass "devcontainer-image-arm64 still cross-builds for linux/arm64"
+                else
+                    fail "devcontainer-image-arm64 no longer builds --platform linux/arm64 — the multi-arch claim rests on registry inspection again"
+                fi
+                if printf '%s\n' "$arm_block" | grep -qF 'No Google apt source, keyring, or update pinger left behind'; then
+                    pass "devcontainer-image-arm64 still asserts the in_container() marker on the arm64 build"
+                else
+                    fail "devcontainer-image-arm64 no longer greps the in_container() marker — AC4 is unasserted on that architecture"
+                fi
+            fi
+
             # Same three neutering shapes the preflight-selftest and
             # install-chrome-e2e blocks reject for themselves.
             if printf '%s\n' "$dc_runlines" | grep -qE '^[[:space:]]*continue-on-error:[[:space:]]*true'; then
@@ -2350,16 +2403,60 @@ GATECASES
                     ;;
             esac
 
+            # The harness above proves the STEP computes the right value. The
+            # job-level output is the only wire from that step to the two
+            # consumers, and nothing read it: hardcoding it to 'false' switched
+            # both image jobs off permanently while every harness case still
+            # reported correct.
+            dc_wire=$(yq_query '.jobs["devcontainer-changes"].outputs["should-run"]' -r)
+            case "$dc_wire" in
+                __NO_YQ__) fail_no_yq "the devcontainer-changes should-run wire" ;;
+                __YQ_ERROR__) fail_yq_error "the devcontainer-changes should-run wire" ;;
+                *steps.gate.outputs.run*)
+                    pass "devcontainer-changes' should-run output is wired to the gate step's own result" ;;
+                *)
+                    fail "devcontainer-changes' should-run output is not wired to steps.gate.outputs.run (got: ${dc_wire}) — the executed gate harness would still pass while both image jobs are switched off" ;;
+            esac
+
+            # The harness substitutes steps.filter.outputs.devcontainer with a
+            # literal, so it is blind to whether the producing step exists at
+            # all. Renaming `id: filter` leaves the third arm comparing "" to
+            # "true" — it can never fire — with every harness case still green.
+            dc_filter_id=$(yq_query '[.jobs["devcontainer-changes"].steps[] | select(.id == "filter")] | length' -o=json -I=0)
+            dc_filter_paths=$(yq_query '.jobs["devcontainer-changes"].steps[] | select(.id == "filter") | .with.filters' -r)
+            case "$dc_filter_id" in
+                __NO_YQ__) fail_no_yq "the devcontainer paths-filter step" ;;
+                __YQ_ERROR__) fail_yq_error "the devcontainer paths-filter step" ;;
+                1) pass "the devcontainer-changes step the gate reads is still id: filter" ;;
+                *) fail "devcontainer-changes has no step with id: filter (found ${dc_filter_id}) — steps.filter.outputs.devcontainer resolves empty, so the pull_request arm compares \"\" to \"true\" and can never fire" ;;
+            esac
+            dc_filter_missing=""
+            for dc_need in '.devcontainer/\*\*' 'test/install-chrome.sh' 'test/common.sh' \
+                           'test/assert-chrome-install.sh' 'test/assert-devcontainer-lookpath.sh' \
+                           'test/setup-live-targets.sh' 'test/run-live-tests.sh'; do
+                printf '%s\n' "$dc_filter_paths" | grep -qF -- "${dc_need//\\/}" || dc_filter_missing="${dc_filter_missing} ${dc_need//\\/}"
+            done
+            if [[ -z "$dc_filter_missing" ]]; then
+                pass "the devcontainer paths filter still covers every path the image build and its in-image steps read"
+            else
+                fail "the devcontainer paths filter no longer covers:${dc_filter_missing} — a PR touching one of those would not build or verify the image before merge"
+            fi
+
             # Both image jobs must consume that one gate rather than restating it.
             for dc_job in devcontainer-image devcontainer-image-arm64; do
                 dc_if=$(yq_query ".jobs[\"${dc_job}\"].if" -r)
                 case "$dc_if" in
                     __NO_YQ__) fail_no_yq "${dc_job}'s if: gate" ;;
                     __YQ_ERROR__) fail_yq_error "${dc_job}'s if: gate" ;;
-                    *needs.devcontainer-changes.outputs.should-run*)
-                        pass "${dc_job} gates on devcontainer-changes' shared should-run output" ;;
+                    "needs.devcontainer-changes.outputs.should-run == 'true'")
+                        pass "${dc_job}'s if: is EXACTLY the shared gate (no prefix, no extra conjunct)" ;;
                     *)
-                        fail "${dc_job} no longer gates on devcontainer-changes.outputs.should-run (got: ${dc_if}) — a restated gate is how the amd64 and arm64 legs desynchronise" ;;
+                        # Exact, not a substring match. A glob accepts
+                        # `${{ false && needs.devcontainer-changes.outputs.should-run == 'true' }}`,
+                        # which carries the required text and can never be true —
+                        # the same defeat the producer side was rebuilt as an
+                        # executed harness to prevent, left open on the consumer.
+                        fail "${dc_job}'s if: is not exactly \"needs.devcontainer-changes.outputs.should-run == 'true'\" (got: ${dc_if}) — a restated or prefixed gate desynchronises the legs, and a `false &&` prefix keeps the text while never firing" ;;
                 esac
             done
         fi
@@ -2421,26 +2518,86 @@ STUB
         fail "assert-devcontainer-lookpath.sh rejects an all-PASS transcript — the script is broken, or this harness no longer drives it"
     fi
 
-    # (2) The case the whole script exists for: a SKIP under exit 0.
-    adl_skip="$adl_tmp/skip.txt"
-    sed 's/--- PASS: TestConfigureLauncher_PinsSystemBrowser (/--- SKIP: TestConfigureLauncher_PinsSystemBrowser (/' \
-        "$adl_all_pass" > "$adl_skip"
-    if [[ "$(run_adl "$adl_skip")" -ne 0 ]]; then
-        pass "assert-devcontainer-lookpath.sh rejects a SKIPPED test even though go test exits 0 (the defect the PASS grep exists for)"
+    # (2)+(3) EVERY required name, not just one. The earlier version derived
+    # both negative cases by sed-ing only TestConfigureLauncher_PinsSystemBrowser,
+    # so it proved that ONE of the five entries was required and anchored.
+    # The four TestBrowserManager_* names are the ones LAB-5064 AC1 is worded
+    # around — and the script's own header says PinsSystemBrowser is the one
+    # that runs even where Chrome cannot launch, so the four launch tests are
+    # precisely the ones whose PASS evidences a runnable browser. Deleting any
+    # of them from REQUIRED_TESTS left all three cases passing.
+    #
+    # Names are read from the script itself, so adding a sixth required test
+    # extends this coverage automatically rather than silently escaping it.
+    adl_required=$(sed -n '/^REQUIRED_TESTS=(/,/^)/p' "$SCRIPT_DIR/assert-devcontainer-lookpath.sh" \
+                   | grep -oE 'Test[A-Za-z0-9_]+')
+    adl_n=$(printf '%s\n' "$adl_required" | grep -c .)
+
+    # The list must match an INDEPENDENT source of truth, or the per-name cases
+    # below are self-referential: they derive their names from REQUIRED_TESTS, so
+    # DELETING an entry simply shrinks what they check and every case still
+    # passes. Measured — dropping TestBrowserManager_LaunchAndKill left the suite
+    # at 170/0. The real authority is pkg/crawl/browser_integration_test.go: the
+    # launch/kill/close tests LAB-5064 AC1 names are whatever
+    # TestBrowserManager_* functions exist there.
+    adl_srcfile="$SCRIPT_DIR/../pkg/crawl/browser_integration_test.go"
+    if [[ ! -f "$adl_srcfile" ]]; then
+        fail "pkg/crawl/browser_integration_test.go not found — the REQUIRED_TESTS completeness check would be vacuous"
     else
-        fail "assert-devcontainer-lookpath.sh accepts a transcript where a required test SKIPPED — go test exits 0 on a skip, so the job would go green having asserted nothing about the browser"
+        adl_expected=$(grep -oE '^func (TestBrowserManager_[A-Za-z0-9_]+|TestConfigureLauncher_PinsSystemBrowser)' "$adl_srcfile" \
+                       | sed 's/^func //' | sort -u)
+        adl_exp_n=$(printf '%s\n' "$adl_expected" | grep -c .)
+        if [[ "$adl_exp_n" -lt 2 ]]; then
+            fail "derived only ${adl_exp_n} integration test name(s) from browser_integration_test.go — the completeness check would be vacuous"
+        else
+            adl_absent=""
+            while IFS= read -r adl_e; do
+                [[ -z "$adl_e" ]] && continue
+                printf '%s\n' "$adl_required" | grep -qx "$adl_e" || adl_absent="${adl_absent} ${adl_e}"
+            done <<< "$adl_expected"
+            if [[ -z "$adl_absent" ]]; then
+                pass "assert-devcontainer-lookpath.sh requires every launch/kill/close test that exists in browser_integration_test.go (${adl_exp_n} names)"
+            else
+                fail "assert-devcontainer-lookpath.sh's REQUIRED_TESTS is missing:${adl_absent} — those are the tests LAB-5064 AC1 is worded around, and dropping one silently stops the image being asked to launch a browser"
+            fi
+        fi
+    fi
+    if [[ "$adl_n" -lt 2 ]]; then
+        fail "could not derive REQUIRED_TESTS from assert-devcontainer-lookpath.sh (got ${adl_n} names) — the per-name cases below would be vacuous"
+    else
+        adl_skip_bad=""; adl_anchor_bad=""
+        while IFS= read -r adl_t; do
+            [[ -z "$adl_t" ]] && continue
+            sed "s/--- PASS: ${adl_t} (/--- SKIP: ${adl_t} (/" "$adl_all_pass" > "$adl_tmp/skip.txt"
+            [[ "$(run_adl "$adl_tmp/skip.txt")" -ne 0 ]] || adl_skip_bad="${adl_skip_bad} ${adl_t}"
+            sed "s/--- PASS: ${adl_t} (/--- PASS: ${adl_t}Extra (/" "$adl_all_pass" > "$adl_tmp/sib.txt"
+            [[ "$(run_adl "$adl_tmp/sib.txt")" -ne 0 ]] || adl_anchor_bad="${adl_anchor_bad} ${adl_t}"
+        done <<< "$adl_required"
+        if [[ -z "$adl_skip_bad" ]]; then
+            pass "assert-devcontainer-lookpath.sh rejects a SKIP for EVERY one of its ${adl_n} required tests (go test exits 0 on a skip)"
+        else
+            fail "assert-devcontainer-lookpath.sh accepts a SKIPPED run for:${adl_skip_bad} — the job would go green having asserted nothing about the browser for those tests"
+        fi
+        if [[ -z "$adl_anchor_bad" ]]; then
+            pass "assert-devcontainer-lookpath.sh's PASS match is anchored for EVERY one of its ${adl_n} required tests"
+        else
+            fail "assert-devcontainer-lookpath.sh accepts a longer sibling name in place of:${adl_anchor_bad} — the PASS match lost its trailing ' (' anchor"
+        fi
+    fi
+    # (4) The rc != 0 arm. A failing `go test` must be reported
+    #     environment-neutrally, not blamed on browser resolution.
+    cat > "$adl_stub/go" <<'STUBFAIL'
+#!/usr/bin/env bash
+echo "build failed: some unrelated compile error" >&2
+exit 2
+STUBFAIL
+    chmod 0755 "$adl_stub/go"
+    if PATH="$adl_stub:$PATH" bash "$SCRIPT_DIR/assert-devcontainer-lookpath.sh" >/dev/null 2>&1; then
+        fail "assert-devcontainer-lookpath.sh exits 0 when go test fails (rc=2) — a compile or module error would pass as a browser assertion"
+    else
+        pass "assert-devcontainer-lookpath.sh propagates a failing go test (rc != 0 arm exercised)"
     fi
 
-    # (3) The trailing " (" anchor. A longer sibling name must not satisfy a
-    #     shorter one's assertion; an unanchored substring search accepts it.
-    adl_sibling="$adl_tmp/sibling.txt"
-    sed 's/--- PASS: TestConfigureLauncher_PinsSystemBrowser (/--- PASS: TestConfigureLauncher_PinsSystemBrowserExtra (/' \
-        "$adl_all_pass" > "$adl_sibling"
-    if [[ "$(run_adl "$adl_sibling")" -ne 0 ]]; then
-        pass "assert-devcontainer-lookpath.sh's PASS match is anchored — a longer sibling test name does not satisfy it"
-    else
-        fail "assert-devcontainer-lookpath.sh accepted 'TestConfigureLauncher_PinsSystemBrowserExtra' in place of the real test — the PASS match lost its trailing ' (' anchor"
-    fi
     rm -rf "$adl_tmp"
     unset -f run_adl
 else
@@ -2542,6 +2699,23 @@ if [[ -f "$WORKFLOW" ]]; then
     else
         pass "every harden-runner use across live-tests.yml and ci.yml is SHA-pinned (no mutable tags)"
     fi
+    # Which jobs, not just how many. A count is satisfied by moving the control
+    # from a job that needs it to one that does not.
+    hr_expected="preflight-selftest validator-regression docs-check devcontainer-changes devcontainer-image devcontainer-image-arm64 integration-tests test"
+    hr_actual=$(yq_query '[.jobs | to_entries[] | select(.value.steps[]?.uses? // "" | test("step-security/harden-runner")) | .key] | sort | join(" ")' -r)
+    case "$hr_actual" in
+        __NO_YQ__) fail_no_yq "which jobs carry harden-runner" ;;
+        __YQ_ERROR__) fail_yq_error "which jobs carry harden-runner" ;;
+        *)
+            hr_want=$(printf '%s\n' $hr_expected | sort | tr '\n' ' ' | sed 's/ $//')
+            hr_got=$(printf '%s\n' $hr_actual | sort | tr '\n' ' ' | sed 's/ $//')
+            if [[ "$hr_want" == "$hr_got" ]]; then
+                pass "harden-runner is carried by exactly the expected 8 jobs, by name"
+            else
+                fail "harden-runner job set changed — expected [${hr_want}] got [${hr_got}]; a count alone would not notice the control moving between jobs"
+            fi ;;
+    esac
+
     hr_shas=$(grep -rhoE 'step-security/harden-runner@[0-9a-f]{40}' "$WORKFLOW" "$hr_ci" | sort -u)
     hr_sha_count=$(printf '%s\n' "$hr_shas" | grep -c . || true)
     if [[ "$hr_sha_count" -eq 0 ]]; then
@@ -2607,32 +2781,70 @@ else
     fail ".devcontainer/Dockerfile not found — the devcontainer wiring assertions above are vacuous"
 fi
 
+# .dockerignore governs the repo-root build CONTEXT, so an entry added for the
+# devcontainer build can silently strip a path the Dockerfile COPYs — the build
+# then fails only inside the gated image job. Checked here beside the COPY
+# assertions rather than left to `docker build` to discover.
+DOCKERIGNORE="$SCRIPT_DIR/../.dockerignore"
+if [[ -f "$DOCKERIGNORE" ]]; then
+    di_bad=""
+    while IFS= read -r di_src; do
+        [[ -z "$di_src" ]] && continue
+        while IFS= read -r di_pat; do
+            case "$di_pat" in ''|'#'*) continue ;; esac
+            # shellcheck disable=SC2053
+            if [[ "$di_src" == $di_pat || "$di_src" == ${di_pat%/}/* ]]; then
+                di_bad="${di_bad} ${di_src}(by '${di_pat}')"
+            fi
+        done < "$DOCKERIGNORE"
+    done <<< "$copy_sources"
+    if [[ -z "$di_bad" ]]; then
+        pass ".dockerignore excludes none of the paths .devcontainer/Dockerfile COPYs"
+    else
+        fail ".dockerignore excludes path(s) the Dockerfile COPYs:${di_bad} — the image build fails and only the gated job would see it"
+    fi
+else
+    fail ".dockerignore not found — it governs the repo-root build context this image uses"
+fi
+
 # ── VESPASIAN_TEST_ROOT stays a test-only seam ─────────────────────────────────
 #
 # test/README.md states, absolutely, that no production caller sets it, and the
 # variable feeds root-privileged writes. AGENTS.md's own convention is that a
 # comment claiming a state cannot occur must cite a test; this is that test.
-tr_setters=""
-for tr_caller in "$SCRIPT_DIR/install-chrome.sh" "$SCRIPT_DIR/setup-live-targets.sh" \
-                 "$SCRIPT_DIR/../.devcontainer/Dockerfile" "$WORKFLOW" \
-                 "$(dirname "$WORKFLOW")/ci.yml"; do
-    [[ -f "$tr_caller" ]] || continue
-    # An assignment or export, not a mere mention: install-chrome.sh READS the
-    # variable by design, and its selftest sets it, which is the point of the seam.
-    # Two forms, because the callers are two languages. Shell assignment covers
-    # install-chrome.sh / setup-live-targets.sh / the Dockerfile RUN; the YAML
-    # `VESPASIAN_TEST_ROOT: value` form is what a workflow env: block would use,
-    # and matching only the shell form left exactly the CI callers this check
-    # names unprotected.
-    if grep -qE '(^|[[:space:];&|])(export[[:space:]]+)?VESPASIAN_TEST_ROOT=' "$tr_caller" \
-       || grep -qE '^[[:space:]]*VESPASIAN_TEST_ROOT:[[:space:]]*\S' "$tr_caller"; then
-        tr_setters="${tr_setters} $(basename "$tr_caller")"
-    fi
+# Callers are DERIVED, not hardcoded. The earlier version listed five paths and
+# omitted .devcontainer/devcontainer.json, whose containerEnv reaches every
+# developer's container and every `devcontainer exec` step in the image job —
+# a strictly more privileged setter than the Dockerfile RUN that WAS listed.
+# It also had no vacuity sentinel, so if the paths stopped resolving it printed
+# its single pass having read nothing.
+tr_callers=()
+for tr_c in "$SCRIPT_DIR/install-chrome.sh" "$SCRIPT_DIR/setup-live-targets.sh" \
+            "$SCRIPT_DIR/run-live-tests.sh" "$SCRIPT_DIR/common.sh" \
+            "$SCRIPT_DIR/../.devcontainer/Dockerfile" "$SCRIPT_DIR/../.devcontainer/devcontainer.json" \
+            "$WORKFLOW" "$(dirname "$WORKFLOW")/ci.yml"; do
+    [[ -f "$tr_c" ]] && tr_callers+=("$tr_c")
 done
-if [[ -z "$tr_setters" ]]; then
-    pass "no production caller sets VESPASIAN_TEST_ROOT (install-chrome.sh, setup-live-targets.sh, .devcontainer/Dockerfile, live-tests.yml, ci.yml)"
+if [[ "${#tr_callers[@]}" -lt 6 ]]; then
+    fail "only ${#tr_callers[@]} of the 8 VESPASIAN_TEST_ROOT production callers resolved — the assertion below would read almost nothing; fix the paths rather than letting it pass vacuously"
 else
-    fail "VESPASIAN_TEST_ROOT is set by production caller(s):${tr_setters} — it reroots root-privileged writes and test/README.md states no production caller sets it"
+    tr_setters=""
+    for tr_caller in "${tr_callers[@]}"; do
+        # Four forms, because the callers are four languages. install-chrome.sh
+        # READS the variable by design and its selftest SETS it — that is the
+        # seam — so only these callers are checked, and only for an assignment.
+        if grep -qE '(^|[[:space:];&|])(export[[:space:]]+)?VESPASIAN_TEST_ROOT=' "$tr_caller" \
+           || grep -qE '^[[:space:]]*VESPASIAN_TEST_ROOT:[[:space:]]*\S' "$tr_caller" \
+           || grep -qE '^[[:space:]]*(ENV|ARG)[[:space:]]+VESPASIAN_TEST_ROOT([[:space:]]|=)' "$tr_caller" \
+           || grep -qE '"VESPASIAN_TEST_ROOT"[[:space:]]*:' "$tr_caller"; then
+            tr_setters="${tr_setters} $(basename "$tr_caller")"
+        fi
+    done
+    if [[ -z "$tr_setters" ]]; then
+        pass "no production caller sets VESPASIAN_TEST_ROOT (${#tr_callers[@]} callers checked, 4 assignment forms: shell, YAML env:, Dockerfile ENV/ARG, JSON containerEnv)"
+    else
+        fail "VESPASIAN_TEST_ROOT is set by production caller(s):${tr_setters} — it reroots root-privileged writes and test/README.md states no production caller sets it"
+    fi
 fi
 
 # Both sibling suites pin their assertion total; this one did not, so
@@ -2703,35 +2915,67 @@ fi
 
 echo "=== Summary ==="
 echo "  $PASS passed, $FAIL failed, $SKIP skipped"
-# PR #228 review: 134 -> 135 was the container-shell check (above). 135 -> 150.
-# MEASURED. +18, all from defects the PR #228 review found by MUTATION rather
-# than by reading, each one having survived every check in the repo:
-#   +9  devcontainer-image, which had none of the pins install-chrome-e2e has:
-#       job present, builds THROUGH devcontainer.json, greps the in_container()
+# PR #228 review: 134 -> 135 was the container-shell check (above).
+#
+# 135 -> 170 across three review rounds. MEASURED. The delta is reconciled in
+# full below, because an unexplained ledger is how a pin drifts from what it
+# claims to cover.
+#
+# Round 1 (+16), from defects found by MUTATION rather than by reading, each
+# having survived every check in the repo at the time:
+#   +9  devcontainer-image had none of the pins install-chrome-e2e has: job
+#       present, builds THROUGH devcontainer.json, greps the in_container()
 #       marker, invokes both committed assertion scripts, runs a guard suite in
-#       the image, no continue-on-error, no trailing '|| true', and an if: gate
-#       naming all three arms. Deleting its entire LookPath step left this suite
-#       at 135/135 exit 0.
+#       the image, no continue-on-error, no trailing '|| true', gate arms.
+#       Deleting its entire LookPath step left this suite at 135/135 exit 0.
 #   +1  devcontainer-changes, the filter the pull_request arm gates on.
+#   +3  harden-runner: step count vs the lockstep comment's number-word, the
+#       comment agreeing with itself, and every copy pinning the SAME sha
+#       across live-tests.yml AND ci.yml.
+#   +2  .devcontainer/Dockerfile's COPY: every source exists, AND common.sh
+#       travels with install-chrome.sh (the second was added after the first
+#       failed its own mutation).
+#   +1  no production caller sets VESPASIAN_TEST_ROOT.
+#
+# Round 2 (+3):
 #   +1  AGENTS.md's non-container job count vs live-tests.yml, derived on both
 #       sides. The prose said "six" when seven were non-container, was corrected
-#       to "eight", and went stale again the moment a tenth job landed — three
-#       occurrences of one defect, so it is now an assertion.
-#   +3  harden-runner: step count vs the lockstep comment's number-word, the
-#       comment agreeing with itself across copies, and — the property the
-#       comment actually cares about and nothing checked — every copy pinning
-#       the SAME sha, across live-tests.yml AND ci.yml. Deleting one step left
-#       six comments claiming SIX beside five steps, all green.
-#   +2  .devcontainer/Dockerfile's COPY: that every source exists, AND that
-#       common.sh travels with install-chrome.sh. Only `docker build` resolves
-#       these and that build is gated. The second was added after the first
-#       failed its own mutation: dropping common.sh left every remaining path
-#       existing, so the existence check stayed green while the layer would die
-#       at `source`.
-#   +1  no production caller sets VESPASIAN_TEST_ROOT — test/README.md states it
-#       absolutely, the variable feeds root-privileged writes, and AGENTS.md's
-#       own convention says such a claim must cite a test. This is that test.
-EXPECTED_ASSERTIONS=159
+#       to "eight", and went stale again when a tenth job landed.
+#   +1  AGENTS.md's harden-runner job count — the sentence carries TWO numbers
+#       and only the second was pinned, so "Seven of the nine" survived a job
+#       gaining the step.
+#   +1  every harden-runner use is SHA-pinned (a copy reverted to a mutable tag
+#       was not counted at all, so one pinned copy still read as "1 distinct sha").
+#
+# Round 3 (+11), all closing holes the round-3 TEST lane proved by mutation —
+# every one of these survived at 159/0 before being fixed:
+#   +1  the should-run WIRE. The gate harness proved the STEP; hardcoding the
+#       job output to 'false' switched BOTH image jobs off permanently with
+#       every harness case still green.
+#   +2  the paths-filter step's identity (id: filter) and its path list. The
+#       harness substitutes the filter's output with a literal, so it was blind
+#       to the producing step existing at all.
+#   +1  a SKIP is rejected for EVERY required test, not only PinsSystemBrowser.
+#   +1  the PASS match is anchored for EVERY required test.
+#   +1  the rc != 0 arm of assert-devcontainer-lookpath.sh.
+#   +2  the AC3 live-suite step and the devcontainer.json conformance step.
+#   +2  devcontainer-image-arm64's arm64 build and its in_container marker
+#       (it was pinned only by its if:).
+#   +1  which jobs carry harden-runner, by name, not just how many.
+#   +1  .dockerignore excludes nothing the Dockerfile COPYs.
+#   -1  the consumer if: check became an EXACT equality rather than an
+#       unanchored glob; net zero in count, strictly stronger.
+#   +1  every committed test/assert-*.sh is in the un-gated bash -n chain.
+#
+#   +1  REQUIRED_TESTS is complete against an INDEPENDENT source of truth
+#       (browser_integration_test.go). Added after the per-name cases above
+#       failed their OWN mutation: deriving the names from REQUIRED_TESTS made
+#       them self-referential, so deleting an entry shrank what they checked and
+#       left the suite at 170/0.
+#
+# 135 + 16 + 3 + 12 = 166, plus the 5 checks the round-3 fixes split per-name and
+# per-job rather than aggregating = 171. MEASURED. Re-measure, do not adjust.
+EXPECTED_ASSERTIONS=171
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
