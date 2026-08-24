@@ -2262,11 +2262,20 @@ if [[ -f "$WORKFLOW" ]]; then
             # committed rather than inline precisely so the un-gated `bash -n`
             # step can see them; dropping the invocation leaves the file present
             # and syntactically fine while nothing runs it.
+            # The invocation SHAPE, not the path. The whole value of these steps
+            # is that they run INSIDE the built image via `devcontainer exec`; a
+            # bare path grep cannot see `exec` and is satisfied by
+            # `run: bash test/assert-devcontainer-lookpath.sh`, which executes on
+            # the ubuntu-24.04 runner instead. That is worse than a silent-green
+            # guard: the runner ships its own Chrome, so the host-side run can
+            # PASS, leaving a green "resolves and launches" step that never
+            # touched the image. Matched on the continuation-joined stream so a
+            # multi-line invocation still reads as one line.
             for dc_script in assert-chrome-install.sh assert-devcontainer-lookpath.sh; do
-                if printf '%s\n' "$dc_runlines" | grep -qE "test/${dc_script//./\\.}"; then
-                    pass "devcontainer-image still invokes test/${dc_script}"
+                if printf '%s\n' "$dc_joined" | grep -qE "exec[[:space:]].*--workspace-folder.*test/${dc_script//./\\.}"; then
+                    pass "devcontainer-image invokes test/${dc_script} INSIDE the image (exec + --workspace-folder)"
                 else
-                    fail "devcontainer-image no longer invokes test/${dc_script} — that assertion is not run against the built image"
+                    fail "devcontainer-image does not invoke test/${dc_script} via 'devcontainer exec --workspace-folder' — either the step is gone, or it was changed to run on the host, where the runner's own Chrome can make it pass without ever touching the built image"
                 fi
             done
 
@@ -2295,13 +2304,64 @@ if [[ -f "$WORKFLOW" ]]; then
             # pull_request arm that builds the image before merge when the PR
             # actually touches it. Losing the third arm silently restores the
             # state where .devcontainer/ merges unverified and breaks on main.
-            if printf '%s\n' "$dc_runlines" | grep -qE '^[[:space:]]*(if:|\|\|)?.*workflow_dispatch' \
-               && printf '%s\n' "$dc_runlines" | grep -qE 'refs/heads/main' \
-               && printf '%s\n' "$dc_runlines" | grep -qE 'pull_request'; then
-                pass "devcontainer-image's if: gate still names all three arms (workflow_dispatch, push-to-main, and the paths-filtered pull_request)"
-            else
-                fail "devcontainer-image's if: gate no longer names all three arms — losing the pull_request arm means .devcontainer/ merges unverified again"
-            fi
+            # Both image jobs consume one computed gate, so assert the GATE'S
+            # BEHAVIOUR rather than tokens in an expression. The previous form was
+            # three unanchored substring searches for `workflow_dispatch`,
+            # `refs/heads/main` and `pull_request`; swapping the two `||`
+            # operators for `&&` keeps all three tokens, satisfies all three
+            # greps, and yields a condition no event can satisfy — the job would
+            # silently never run again. Tokens cannot express disjunction, so this
+            # extracts the gate step's shell and RUNS it against synthetic events,
+            # the same execute-and-observe approach the assert-chrome-install.sh
+            # block below uses instead of grepping.
+            gate_body=$(yq_query '.jobs["devcontainer-changes"].steps[] | select(.id == "gate") | .run' -r)
+            case "$gate_body" in
+                __NO_YQ__) fail_no_yq "the devcontainer gate's behaviour" ;;
+                __YQ_ERROR__) fail_yq_error "the devcontainer gate's behaviour" ;;
+                "" ) fail "could not extract the devcontainer-changes gate step's run: body — the behaviour assertions below would be vacuous" ;;
+                *)
+                    gate_bad=""
+                    # event | ref | filter-output | expected run=
+                    while IFS='|' read -r ev ref filt want; do
+                        [ -z "$ev" ] && continue
+                        got=$(
+                            GITHUB_OUTPUT=$(mktemp)
+                            export GITHUB_OUTPUT
+                            body=${gate_body//'${{ github.event_name }}'/$ev}
+                            body=${body//'${{ github.ref }}'/$ref}
+                            body=${body//'${{ steps.filter.outputs.devcontainer }}'/$filt}
+                            bash -c "$body" >/dev/null 2>&1
+                            sed -n 's/^run=//p' "$GITHUB_OUTPUT" | tail -1
+                            rm -f "$GITHUB_OUTPUT"
+                        )
+                        [ "$got" = "$want" ] || gate_bad="${gate_bad} ${ev}/${ref}/${filt}:got=${got:-<none>},want=${want}"
+                    done <<'GATECASES'
+workflow_dispatch|refs/heads/anything|false|true
+push|refs/heads/main|false|true
+push|refs/heads/other|true|false
+pull_request|refs/pull/1/merge|true|true
+pull_request|refs/pull/1/merge|false|false
+GATECASES
+                    if [ -z "$gate_bad" ]; then
+                        pass "the devcontainer gate fires on exactly the three intended arms (5 synthetic events, executed not grepped)"
+                    else
+                        fail "the devcontainer gate does not behave as intended —${gate_bad}. An &&-joined or narrowed gate can keep every token and still never fire."
+                    fi
+                    ;;
+            esac
+
+            # Both image jobs must consume that one gate rather than restating it.
+            for dc_job in devcontainer-image devcontainer-image-arm64; do
+                dc_if=$(yq_query ".jobs[\"${dc_job}\"].if" -r)
+                case "$dc_if" in
+                    __NO_YQ__) fail_no_yq "${dc_job}'s if: gate" ;;
+                    __YQ_ERROR__) fail_yq_error "${dc_job}'s if: gate" ;;
+                    *needs.devcontainer-changes.outputs.should-run*)
+                        pass "${dc_job} gates on devcontainer-changes' shared should-run output" ;;
+                    *)
+                        fail "${dc_job} no longer gates on devcontainer-changes.outputs.should-run (got: ${dc_if}) — a restated gate is how the amd64 and arm64 legs desynchronise" ;;
+                esac
+            done
         fi
     else
         fail "devcontainer-image job is gone from live-tests.yml — nothing builds .devcontainer/Dockerfile, and LAB-5064's AC1 wiring can rot invisibly"
@@ -2314,6 +2374,77 @@ if [[ -f "$WORKFLOW" ]]; then
     else
         fail "devcontainer-changes job is gone — devcontainer-image's pull_request arm gates on an undefined output and can never fire"
     fi
+fi
+
+# ── test/assert-devcontainer-lookpath.sh: EXECUTED, not grepped ────────────────
+#
+# The script's load-bearing logic is its per-test `--- PASS: NAME (` loop, and
+# nothing tested it. `go test` exits 0 on a skip — the script's own comment says
+# so — so that loop is the ONLY thing separating "the browser resolved and
+# launched" from "every test skipped" or "the -run regex matched nothing".
+# Deleting the loop left `bash -n` happy and this suite green.
+#
+# Its sibling test/assert-chrome-install.sh is covered far more strongly in this
+# same file: executed against a stub browser on a prepared PATH, with the result
+# observed rather than grepped. Same treatment here — a stub `go` printing a
+# synthetic `go test -v` transcript, three transcripts, three observed outcomes.
+if [[ -x "$SCRIPT_DIR/assert-devcontainer-lookpath.sh" ]]; then
+    adl_tmp=$(mktemp -d)
+    adl_stub="$adl_tmp/bin"
+    mkdir -p "$adl_stub"
+    # run_adl <transcript-file> -> exit code of the script under a stub `go`
+    run_adl() {
+        cat > "$adl_stub/go" <<STUB
+#!/usr/bin/env bash
+cat "\$ADL_TRANSCRIPT"
+exit 0
+STUB
+        chmod 0755 "$adl_stub/go"
+        ADL_TRANSCRIPT="$1" PATH="$adl_stub:$PATH" \
+            bash "$SCRIPT_DIR/assert-devcontainer-lookpath.sh" >/dev/null 2>&1
+        echo $?
+    }
+    adl_all_pass="$adl_tmp/all-pass.txt"
+    {
+        for t in TestBrowserManager_LaunchAndKill TestBrowserManager_KillIdempotent \
+                 TestBrowserManager_Close TestBrowserManager_CloseIdempotent \
+                 TestConfigureLauncher_PinsSystemBrowser; do
+            printf -- '=== RUN   %s\n--- PASS: %s (0.01s)\n' "$t" "$t"
+        done
+        printf 'PASS\nok  \tgithub.com/praetorian-inc/vespasian/pkg/crawl\t0.05s\n'
+    } > "$adl_all_pass"
+
+    # (1) The honest green path must be green, or the other two prove nothing.
+    if [[ "$(run_adl "$adl_all_pass")" -eq 0 ]]; then
+        pass "assert-devcontainer-lookpath.sh accepts a transcript where all five tests PASS (executed against a stub go, not grepped)"
+    else
+        fail "assert-devcontainer-lookpath.sh rejects an all-PASS transcript — the script is broken, or this harness no longer drives it"
+    fi
+
+    # (2) The case the whole script exists for: a SKIP under exit 0.
+    adl_skip="$adl_tmp/skip.txt"
+    sed 's/--- PASS: TestConfigureLauncher_PinsSystemBrowser (/--- SKIP: TestConfigureLauncher_PinsSystemBrowser (/' \
+        "$adl_all_pass" > "$adl_skip"
+    if [[ "$(run_adl "$adl_skip")" -ne 0 ]]; then
+        pass "assert-devcontainer-lookpath.sh rejects a SKIPPED test even though go test exits 0 (the defect the PASS grep exists for)"
+    else
+        fail "assert-devcontainer-lookpath.sh accepts a transcript where a required test SKIPPED — go test exits 0 on a skip, so the job would go green having asserted nothing about the browser"
+    fi
+
+    # (3) The trailing " (" anchor. A longer sibling name must not satisfy a
+    #     shorter one's assertion; an unanchored substring search accepts it.
+    adl_sibling="$adl_tmp/sibling.txt"
+    sed 's/--- PASS: TestConfigureLauncher_PinsSystemBrowser (/--- PASS: TestConfigureLauncher_PinsSystemBrowserExtra (/' \
+        "$adl_all_pass" > "$adl_sibling"
+    if [[ "$(run_adl "$adl_sibling")" -ne 0 ]]; then
+        pass "assert-devcontainer-lookpath.sh's PASS match is anchored — a longer sibling test name does not satisfy it"
+    else
+        fail "assert-devcontainer-lookpath.sh accepted 'TestConfigureLauncher_PinsSystemBrowserExtra' in place of the real test — the PASS match lost its trailing ' (' anchor"
+    fi
+    rm -rf "$adl_tmp"
+    unset -f run_adl
+else
+    fail "test/assert-devcontainer-lookpath.sh is missing or not executable — the devcontainer job's Go-side assertion cannot run"
 fi
 
 # ── harden-runner: count and pin, not just prose ───────────────────────────────
@@ -2566,7 +2697,7 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #   +1  no production caller sets VESPASIAN_TEST_ROOT — test/README.md states it
 #       absolutely, the variable feeds root-privileged writes, and AGENTS.md's
 #       own convention says such a claim must cite a test. This is that test.
-EXPECTED_ASSERTIONS=153
+EXPECTED_ASSERTIONS=158
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."

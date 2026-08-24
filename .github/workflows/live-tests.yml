@@ -336,6 +336,12 @@ jobs:
     timeout-minutes: 5
     outputs:
       changed: ${{ steps.filter.outputs.devcontainer }}
+      # The full run condition, computed ONCE. Both image jobs consume this
+      # instead of each restating the three-arm expression: duplicated gating is
+      # how the amd64 and arm64 legs would silently desynchronise, and unlike the
+      # harden-runner pin there is no lockstep comment or assertion that would
+      # notice. One producer, two consumers, nothing to keep in step.
+      should-run: ${{ steps.gate.outputs.run }}
     steps:
       # Defense-in-depth (LAB-4732): monitor and record all
       # outbound network traffic. Audit mode is non-blocking — it logs egress
@@ -372,21 +378,34 @@ jobs:
               - 'test/assert-chrome-install.sh'
               - 'test/assert-devcontainer-lookpath.sh'
 
+      # workflow_dispatch and push-to-main are unconditional, for the same reason
+      # install-chrome-e2e has them: live egress to Google and a browser download,
+      # against an image that changes far less often than the code. The
+      # pull_request arm is what stops .devcontainer/ merging unverified, and it
+      # is filtered so an ordinary PR still pays nothing.
+      - id: gate
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "pull_request" && "${{ steps.filter.outputs.devcontainer }}" == "true" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping the devcontainer image build — no path in the devcontainer filter changed."
+          fi
+
   # .devcontainer/Dockerfile is what closes LAB-5064's AC1; this job is the only
   # thing that checks it still does. Nothing else in this repo builds a
   # Dockerfile, so without it the wiring would rot invisibly and the ticket would
   # be closed on an assertion nobody re-checks.
   devcontainer-image:
     needs: devcontainer-changes
-    # Three arms. workflow_dispatch and push-to-main are the original two, kept
-    # for the same reason install-chrome-e2e has them: live egress to Google's
-    # apt repo and a browser download, against an image that changes far less
-    # often than the code. The third arm builds the image on a PR that actually
-    # touches it, so a broken image is caught before merge rather than on main.
-    if: >-
-      github.event_name == 'workflow_dispatch'
-      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-      || (github.event_name == 'pull_request' && needs.devcontainer-changes.outputs.changed == 'true')
+    # Gate computed once in devcontainer-changes; see the comment on its
+    # should-run output for the three arms and why each is there.
+    if: needs.devcontainer-changes.outputs.should-run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -464,6 +483,26 @@ jobs:
           set -euo pipefail
           npx --yes "$DEVCONTAINER_CLI" up --workspace-folder . 2>&1 | tee /tmp/devcontainer-up.log
 
+      # Applying devcontainer.json's settings is not the same as asserting them.
+      # The job was rebuilt around the file so containerEnv, runArgs, remoteUser
+      # and the onCreateCommand are exercised — but deleting `remoteUser` would
+      # make every exec below run as root and change no other signal, deleting
+      # containerEnv would change nothing observable, and an about:blank render
+      # would not notice --shm-size going away. So assert the environment the
+      # exec steps actually inherit, once, cheaply, before using it.
+      - name: Assert the container matches devcontainer.json
+        run: |
+          set -euo pipefail
+          npx --yes "$DEVCONTAINER_CLI" exec --workspace-folder . bash -c '
+            set -euo pipefail
+            [ "$(id -un)" = vscode ] || { echo "expected remoteUser vscode, got $(id -un)" >&2; exit 1; }
+            [ "${VESPASIAN_NO_SANDBOX:-}" = true ] || { echo "containerEnv VESPASIAN_NO_SANDBOX not applied" >&2; exit 1; }
+            shm=$(df -B1 --output=size /dev/shm | tail -1 | tr -d " ")
+            [ "$shm" -ge 1000000000 ] || { echo "runArgs --shm-size=1g not applied: /dev/shm is $shm bytes" >&2; exit 1; }
+            [ -d test/spec-validators/node_modules ] || { echo "onCreateCommand did not install the spec-validator deps" >&2; exit 1; }
+            echo "container matches devcontainer.json: user=vscode, VESPASIAN_NO_SANDBOX=true, /dev/shm=${shm}B, spec-validator deps present"
+          '
+
       # Reuses the committed assertion script rather than restating it: this is
       # the same script install-chrome-e2e runs, so the two cannot disagree about
       # what "a runnable browser" means.
@@ -525,10 +564,9 @@ jobs:
   # the yq pin's arm64 digest going stale).
   devcontainer-image-arm64:
     needs: devcontainer-changes
-    if: >-
-      github.event_name == 'workflow_dispatch'
-      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-      || (github.event_name == 'pull_request' && needs.devcontainer-changes.outputs.changed == 'true')
+    # Same gate as its amd64 sibling, and the same single producer — see
+    # devcontainer-changes' should-run output.
+    if: needs.devcontainer-changes.outputs.should-run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -577,6 +615,7 @@ jobs:
             . 2>&1 | tee /tmp/devcontainer-arm64.log
           grep -qF 'No Google apt source, keyring, or update pinger left behind' /tmp/devcontainer-arm64.log \
             || { echo "arm64 build did not take install-chrome.sh's in_container() branch" >&2; exit 1; }
+
   # Gate: run by default; skip PR runs only when 'skip-live-tests' label is present.
   # Push-to-main and workflow_dispatch always run.
   check-label:

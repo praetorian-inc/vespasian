@@ -33,10 +33,15 @@ FROM mcr.microsoft.com/devcontainers/go:1.25-bookworm@sha256:30cbde1de62f1909044
 # yq is not optional either, and it is the one this image previously missed:
 # test/test-runner-args.sh answers structural questions about live-tests.yml
 # through it and routes to fail() — not skip() — when it is absent, so a
-# fresh devcontainer without it reports 8 failures from one of the four guard
-# suites the repo tells contributors to run. Measured by forcing that guard's
-# absent arm: 127 passed, 8 failed, and the assertion-count pin correctly does
-# NOT fire, so the failure is honest rather than an accounting artefact.
+# fresh devcontainer without it fails one of the four guard suites the repo
+# tells contributors to run. Deliberately no pass/fail counts here: the first
+# version of this comment quoted the numbers measured at the time, and they went
+# stale TWICE inside this one PR as the suite grew (135 -> 151 -> 153 assertions),
+# which is the same stale-figure defect the comment was warning about. The
+# invariant is what matters and it does not move: the guard routes to fail(), so
+# the failures are COUNTED, so `PASS + FAIL + SKIP_CREDIT` still equals
+# EXPECTED_ASSERTIONS and the accounting pin does not fire. The suite reports an
+# honest failure rather than a misleading accounting-drift message.
 RUN apt-get update -qq \
     && apt-get install -y --no-install-recommends python3 \
     && rm -rf /var/lib/apt/lists/*
