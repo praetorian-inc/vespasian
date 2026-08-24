@@ -1,6 +1,6 @@
 module github.com/praetorian-inc/vespasian
 
-go 1.25.8
+go 1.27.0
 
 require (
 	github.com/BishopFox/jsluice v0.0.0-20240110145140-0ddfab153e06
