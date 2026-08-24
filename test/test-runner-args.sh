@@ -2367,6 +2367,21 @@ if [[ -f "$WORKFLOW" ]]; then
                 else
                     fail "AGENTS.md claims ${nc_word} (${nc_claimed}) non-container jobs but live-tests.yml has ${nc_actual} — the prose went stale when a job was added or gained a container:"
                 fi
+
+                # The sentence carries TWO numbers — "<N> of the <M> non-container
+                # jobs open with harden-runner" — and pinning only M let the N half
+                # go stale the moment a job gained the step. Pin both.
+                hr_word_agents=$(grep -oE '(One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten) of the (one|two|three|four|five|six|seven|eight|nine|ten) non-container jobs' "$agents_md" | head -1 | awk '{print $1}')
+                declare -A hr_agents_numbers=( [One]=1 [Two]=2 [Three]=3 [Four]=4 [Five]=5 [Six]=6 [Seven]=7 [Eight]=8 [Nine]=9 [Ten]=10 )
+                hr_agents_claimed=${hr_agents_numbers[${hr_word_agents:-None}]:-}
+                hr_actual_steps=$(grep -cE '^[[:space:]]*uses:[[:space:]]*step-security/harden-runner@' "$WORKFLOW")
+                if [[ -z "$hr_agents_claimed" ]]; then
+                    fail "could not read AGENTS.md's harden-runner job-count claim (the comparison would be vacuous) — got '${hr_word_agents:-<none>}'"
+                elif [[ "$hr_actual_steps" -eq "$hr_agents_claimed" ]]; then
+                    pass "AGENTS.md's harden-runner job count ($hr_word_agents) matches live-tests.yml ($hr_actual_steps steps)"
+                else
+                    fail "AGENTS.md says ${hr_word_agents} (${hr_agents_claimed}) non-container jobs open with harden-runner but live-tests.yml has ${hr_actual_steps} — the prose went stale when a job gained or lost the step"
+                fi
                 ;;
         esac
     else
@@ -2524,7 +2539,7 @@ fi
 echo "=== Summary ==="
 echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # PR #228 review: 134 -> 135 was the container-shell check (above). 135 -> 150.
-# MEASURED. +17, all from defects the PR #228 review found by MUTATION rather
+# MEASURED. +18, all from defects the PR #228 review found by MUTATION rather
 # than by reading, each one having survived every check in the repo:
 #   +9  devcontainer-image, which had none of the pins install-chrome-e2e has:
 #       job present, builds THROUGH devcontainer.json, greps the in_container()
@@ -2551,7 +2566,7 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #   +1  no production caller sets VESPASIAN_TEST_ROOT — test/README.md states it
 #       absolutely, the variable feeds root-privileged writes, and AGENTS.md's
 #       own convention says such a claim must cite a test. This is that test.
-EXPECTED_ASSERTIONS=152
+EXPECTED_ASSERTIONS=153
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
