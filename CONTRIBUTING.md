@@ -233,7 +233,7 @@ make coverage         # Writes coverage.out, prints per-function coverage
 make coverage-gate    # Fails if total statement coverage is below the threshold
 ```
 
-CI enforces a minimum of **85%** total statement coverage on every Go PR: the `coverage-gate` job in `ci.yml` runs `make coverage-gate`, which fails the build when total coverage falls below 85%. Run `make coverage-gate` locally before pushing. The threshold lives in one place — `COVERAGE_THRESHOLD` in the `Makefile` — and sits just under the 86.4% baseline measured when the gate was introduced (LAB-5331), so keep coverage at or above 85% for the packages you touch rather than spending that headroom.
+CI enforces a minimum of **85%** total statement coverage on every Go PR: the `coverage-gate` job in `ci.yml` runs `make coverage-gate`, which fails the build when total coverage falls below 85%. Run `make coverage-gate` locally before pushing. The threshold lives in one place — `COVERAGE_THRESHOLD` in the `Makefile` — and sits just under the 86.4% baseline measured when the gate was introduced (LAB-5331), so keep coverage at or above 85% for the repository total rather than spending that headroom. The gate reads the single `total:` line, so it is not enforced per package: a drop in one package can be masked by a rise in another.
 
 ### Live tests
 

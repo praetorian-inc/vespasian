@@ -28,7 +28,7 @@ test:
 # executed — including TestCrawlerContract_ScopeConfinement and _DepthLimit, the
 # only end-to-end assertions of two containment controls, and the LAB-4678 tests
 # that pin the exact --max-pages cap and the --interact destructive-control gate
-# (LAB-4678 review, TEST-005/REQ-002).
+# (LAB-4678 review).
 test-integration:
 	go test -race -tags=integration ./...
 
@@ -78,8 +78,15 @@ coverage:
 # CI gate (LAB-5331): rebuild the profile via `coverage`, then fail if total statement
 # coverage is below COVERAGE_THRESHOLD. Parses the `total:` line from `go tool cover
 # -func`; fails closed (exit 2) if that line is ever absent.
+#
+# COVERAGE_THRESHOLD is validated in BEGIN before any comparison. awk's `threshold + 0`
+# silently converts a non-numeric value to 0, which would let ANY coverage pass a gate
+# that still prints a reassuring PASS -- the one failure mode a coverage gate must not
+# have. The regex admits only digits with an optional decimal part, so it rejects
+# negatives by construction; the second check bounds the top end. `exit` in BEGIN still
+# runs END, hence the `bad` flag so END does not overwrite the status with its own.
 coverage-gate: coverage
-	@go tool cover -func=coverage.out | awk -v threshold=$(COVERAGE_THRESHOLD) 'BEGIN { seen = 0 } /^total:/ { pct = $$NF; sub(/%/, "", pct); seen = 1; printf "total coverage %.1f%% (threshold %d%%)\n", pct, threshold; if (pct + 0 < threshold + 0) { printf "FAIL: coverage %.1f%% is below the %d%% threshold\n", pct, threshold; exit 1 } print "PASS: coverage meets the threshold" } END { if (!seen) { print "ERROR: no total: line in go tool cover output"; exit 2 } }'
+	@go tool cover -func=coverage.out | awk -v threshold=$(COVERAGE_THRESHOLD) 'BEGIN { seen = 0; bad = 0; if (threshold !~ /^[0-9]+(\.[0-9]+)?$$/) { printf "ERROR: COVERAGE_THRESHOLD \"%s\" is not a number\n", threshold; bad = 2; exit 2 } if (threshold + 0 > 100) { printf "ERROR: COVERAGE_THRESHOLD %s is outside 0..100\n", threshold; bad = 2; exit 2 } } /^total:/ { pct = $$NF; sub(/%/, "", pct); seen = 1; printf "total coverage %.1f%% (threshold %.1f%%)\n", pct, threshold; if (pct + 0 < threshold + 0) { printf "FAIL: coverage %.1f%% is below the %.1f%% threshold\n", pct, threshold; exit 1 } print "PASS: coverage meets the threshold" } END { if (bad) exit bad; if (!seen) { print "ERROR: no total: line in go tool cover output"; exit 2 } }'
 
 deps:
 	go mod download
