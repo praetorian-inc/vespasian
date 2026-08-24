@@ -52,7 +52,7 @@ jobs:
       # `bash <script>` silently works on a file that lost +x. One style for all
       # four, so there is nothing to keep in sync.
       - name: Syntax check
-        run: bash -n test/setup-live-targets.sh && bash -n test/install-chrome.sh && bash -n test/assert-chrome-install.sh && bash -n test/assert-devcontainer-lookpath.sh
+        run: bash -n test/setup-live-targets.sh && bash -n test/install-chrome.sh && bash -n test/assert-chrome-install.sh && bash -n test/assert-devcontainer-lookpath.sh && bash -n .devcontainer/on-create.sh
 
       - name: Run preflight self-test
         run: ./test/preflight-selftest.sh

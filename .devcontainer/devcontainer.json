@@ -67,5 +67,5 @@
   // --ignore-scripts matches every other npm call site in this repo (both
   // invocations in .github/workflows/live-tests.yml), keeping package lifecycle
   // scripts from executing under the non-blocking audit-only egress policy.
-  "onCreateCommand": "cd test/spec-validators && npm ci --ignore-scripts"
+  "onCreateCommand": "bash .devcontainer/on-create.sh"
 }
