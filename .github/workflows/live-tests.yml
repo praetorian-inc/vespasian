@@ -499,7 +499,18 @@ jobs:
             [ "${VESPASIAN_NO_SANDBOX:-}" = true ] || { echo "containerEnv VESPASIAN_NO_SANDBOX not applied" >&2; exit 1; }
             shm=$(df -B1 --output=size /dev/shm | tail -1 | tr -d " ")
             [ "$shm" -ge 1000000000 ] || { echo "runArgs --shm-size=1g not applied: /dev/shm is $shm bytes" >&2; exit 1; }
-            [ -d test/spec-validators/node_modules ] || { echo "onCreateCommand did not install the spec-validator deps" >&2; exit 1; }
+            # The same check _ensure_spec_validators makes (test/validate.sh:57-62),
+            # and deliberately not `-d node_modules`: that is the weaker form the
+            # repo already rejected, because an interrupted npm ci or a pruned
+            # cache leaves node_modules present but unusable. It matters more
+            # here than anywhere else, because the devcontainers CLI does not
+            # surface a failing onCreateCommand as a non-zero exit from `up`
+            # (microsoft/vscode-remote-release#8906), so `set -euo pipefail` on
+            # the start step cannot catch it — this is the only thing that does.
+            for pkg in @apidevtools/swagger-parser graphql; do
+              [ -f "test/spec-validators/node_modules/$pkg/package.json" ] \
+                || { echo "onCreateCommand did not install the spec-validator deps: $pkg is missing or incomplete" >&2; exit 1; }
+            done
             echo "container matches devcontainer.json: user=vscode, VESPASIAN_NO_SANDBOX=true, /dev/shm=${shm}B, spec-validator deps present"
           '
 

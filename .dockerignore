@@ -1,4 +1,12 @@
-# Build context exclusions for .devcontainer/Dockerfile.
+# Build context exclusions for the REPO ROOT build context.
+#
+# Scoped to the context, not to a named Dockerfile: any `docker build` rooted
+# here reads this file, so it governs BOTH .devcontainer/Dockerfile (whose
+# devcontainer.json sets "context": "..") and the release Dockerfile at the repo
+# root. That is currently harmless for the release build — its `COPY . .` needs
+# none of the entries below, and the module is not vendored — but an entry added
+# for the devcontainer's benefit can silently strip something the release build
+# copies. Check both before adding one.
 #
 # The devcontainer build uses the REPO ROOT as its context ("context": ".." in
 # .devcontainer/devcontainer.json, and the same root in the devcontainer-image
