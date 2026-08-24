@@ -366,44 +366,70 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           persist-credentials: false
+          # Full history: the filter below diffs against the base branch, which a
+          # shallow clone cannot resolve a merge base for.
+          fetch-depth: 0
 
+      # Plain git, not a marketplace action. dorny/paths-filter is NOT on this
+      # org's Actions allowlist: a workflow referencing it fails at STARTUP, with
+      # no jobs, no annotations and no logs. Measured — a minimal workflow off
+      # main whose only non-standard action was dorny/paths-filter returned
+      # startup_failure, while the two docker/* actions in the arm64 leg returned
+      # success on the same probe. That is why live-tests.yml could not run at all
+      # between the first devcontainer commit and this one.
+      #
+      # WATCHED is the single source of truth for what makes the image job run;
+      # test/test-runner-args.sh asserts its contents.
       - id: filter
-        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36  # v3.0.2
-        with:
-          filters: |
-            devcontainer:
-              - '.devcontainer/**'
-              # .dockerignore lives at the repo root and the build context IS the
-              # repo root, so the daemon reads it on every build. Widening an
-              # exclude here can drop a file the Dockerfile COPYs; that breaks the
-              # image and touches nothing else in this list.
-              - '.dockerignore'
-              - 'test/install-chrome.sh'
-              - 'test/common.sh'
-              - 'test/assert-chrome-install.sh'
-              - 'test/assert-devcontainer-lookpath.sh'
-              # The AC3 step execs these two INSIDE the image, so a change to
-              # either can break the job while touching nothing else listed here.
-              - 'test/setup-live-targets.sh'
-              - 'test/run-live-tests.sh'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          # Only a pull_request needs a path decision; the other two arms of the
+          # gate below are unconditional.
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "devcontainer=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags origin "$BASE_REF"
+          changed=$(git diff --name-only "origin/${BASE_REF}...HEAD")
+          printf 'changed files:\n%s\n' "$changed"
+          WATCHED='.devcontainer/* .dockerignore test/install-chrome.sh test/common.sh test/assert-chrome-install.sh test/assert-devcontainer-lookpath.sh test/setup-live-targets.sh test/run-live-tests.sh'
+          hit=false
+          for f in $changed; do
+            for pat in $WATCHED; do
+              # shellcheck disable=SC2254
+              case "$f" in $pat) hit=true; break 2 ;; esac
+            done
+          done
+          echo "devcontainer=$hit" >> "$GITHUB_OUTPUT"
+          echo "::notice::devcontainer paths changed: $hit"
 
       # workflow_dispatch and push-to-main are unconditional, for the same reason
       # install-chrome-e2e has them: live egress to Google and a browser download,
       # against an image that changes far less often than the code. The
       # pull_request arm is what stops .devcontainer/ merging unverified, and it
       # is filtered so an ordinary PR still pays nothing.
+      # Context values come through env:, never interpolated into the shell body.
+      # `${{ }}` is substituted into the source BEFORE bash parses it, so a ref
+      # carrying $(...) would execute; the env: form removes the class outright.
       - id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          FILTER: ${{ steps.filter.outputs.devcontainer }}
         run: |
           set -euo pipefail
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+          elif [[ "$EVENT_NAME" == "push" && "$REF" == "refs/heads/main" ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ github.event_name }}" == "pull_request" && "${{ steps.filter.outputs.devcontainer }}" == "true" ]]; then
+          elif [[ "$EVENT_NAME" == "pull_request" && "$FILTER" == "true" ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Skipping the devcontainer image build — no path in the devcontainer filter changed."
+            echo "::notice::Skipping the devcontainer image build — no watched path changed."
           fi
 
   # .devcontainer/Dockerfile is what closes LAB-5064's AC1; this job is the only

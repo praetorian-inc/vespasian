@@ -2377,13 +2377,15 @@ if [[ -f "$WORKFLOW" ]]; then
                     # event | ref | filter-output | expected run=
                     while IFS='|' read -r ev ref filt want; do
                         [ -z "$ev" ] && continue
+                        # The gate reads its context from env: rather than having
+                        # ${{ }} interpolated into its body, so the harness sets
+                        # those variables instead of substituting tokens. That is
+                        # both simpler and the reason the injection class is gone:
+                        # nothing attacker-shaped reaches the shell source.
                         got=$(
                             GITHUB_OUTPUT=$(mktemp)
-                            export GITHUB_OUTPUT
-                            body=${gate_body//'${{ github.event_name }}'/$ev}
-                            body=${body//'${{ github.ref }}'/$ref}
-                            body=${body//'${{ steps.filter.outputs.devcontainer }}'/$filt}
-                            bash -c "$body" >/dev/null 2>&1
+                            export GITHUB_OUTPUT EVENT_NAME="$ev" REF="$ref" FILTER="$filt"
+                            bash -c "$gate_body" >/dev/null 2>&1
                             sed -n 's/^run=//p' "$GITHUB_OUTPUT" | tail -1
                             rm -f "$GITHUB_OUTPUT"
                         )
@@ -2423,7 +2425,11 @@ GATECASES
             # all. Renaming `id: filter` leaves the third arm comparing "" to
             # "true" — it can never fire — with every harness case still green.
             dc_filter_id=$(yq_query '[.jobs["devcontainer-changes"].steps[] | select(.id == "filter")] | length' -o=json -I=0)
-            dc_filter_paths=$(yq_query '.jobs["devcontainer-changes"].steps[] | select(.id == "filter") | .with.filters' -r)
+            # The watch list moved out of a marketplace action's `with.filters`
+            # into the step's own shell (WATCHED=), because dorny/paths-filter is
+            # not on this org's Actions allowlist and referencing it made the
+            # whole workflow fail at STARTUP — no jobs, no annotations, no logs.
+            dc_filter_paths=$(yq_query '.jobs["devcontainer-changes"].steps[] | select(.id == "filter") | .run' -r)
             case "$dc_filter_id" in
                 __NO_YQ__) fail_no_yq "the devcontainer paths-filter step" ;;
                 __YQ_ERROR__) fail_yq_error "the devcontainer paths-filter step" ;;
@@ -2431,7 +2437,7 @@ GATECASES
                 *) fail "devcontainer-changes has no step with id: filter (found ${dc_filter_id}) — steps.filter.outputs.devcontainer resolves empty, so the pull_request arm compares \"\" to \"true\" and can never fire" ;;
             esac
             dc_filter_missing=""
-            for dc_need in '.devcontainer/\*\*' 'test/install-chrome.sh' 'test/common.sh' \
+            for dc_need in '.devcontainer/\*' 'test/install-chrome.sh' 'test/common.sh' \
                            'test/assert-chrome-install.sh' 'test/assert-devcontainer-lookpath.sh' \
                            'test/setup-live-targets.sh' 'test/run-live-tests.sh'; do
                 printf '%s\n' "$dc_filter_paths" | grep -qF -- "${dc_need//\\/}" || dc_filter_missing="${dc_filter_missing} ${dc_need//\\/}"
@@ -2441,6 +2447,25 @@ GATECASES
             else
                 fail "the devcontainer paths filter no longer covers:${dc_filter_missing} — a PR touching one of those would not build or verify the image before merge"
             fi
+
+            # The gate must take its context through env:, not ${{ }} in the body.
+            # GitHub substitutes ${{ }} into the source before bash parses it, so
+            # a ref carrying $(...) would execute. Cheap to assert, and it also
+            # keeps the harness above honest — it drives the gate through the same
+            # env vars the runner would set.
+            gate_env=$(yq_query '.jobs["devcontainer-changes"].steps[] | select(.id == "gate") | .env | keys | join(" ")' -r)
+            case "$gate_env" in
+                __NO_YQ__) fail_no_yq "the gate step's env: block" ;;
+                __YQ_ERROR__) fail_yq_error "the gate step's env: block" ;;
+                *EVENT_NAME*REF*|*EVENT_NAME*FILTER*|*FILTER*REF*)
+                    if printf '%s\n' "$gate_body" | grep -q '\${{'; then
+                        fail "the gate step still interpolates \${{ }} into its shell body — a ref containing \$(...) is executed before bash parses the line"
+                    else
+                        pass "the gate step takes its context through env: and interpolates nothing into its shell body"
+                    fi ;;
+                *)
+                    fail "the gate step's env: does not carry EVENT_NAME/REF/FILTER (got: ${gate_env}) — the harness drives it through those, and without them the gate must be interpolating \${{ }} instead" ;;
+            esac
 
             # Both image jobs must consume that one gate rather than restating it.
             for dc_job in devcontainer-image devcontainer-image-arm64; do
@@ -2975,7 +3000,7 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #
 # 135 + 16 + 3 + 12 = 166, plus the 5 checks the round-3 fixes split per-name and
 # per-job rather than aggregating = 171. MEASURED. Re-measure, do not adjust.
-EXPECTED_ASSERTIONS=171
+EXPECTED_ASSERTIONS=172
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
