@@ -2382,6 +2382,23 @@ if [[ -f "$DEVCONTAINER_DOCKERFILE" ]]; then
         else
             fail ".devcontainer/Dockerfile COPYs path(s) that do not exist:${copy_missing} — the image build fails and no un-gated check can see it"
         fi
+
+        # Existence is not the invariant. install-chrome.sh derives SCRIPT_DIR
+        # from its own dirname and sources common.sh from there, so the two must
+        # land in the SAME directory — copying the installer alone leaves every
+        # path valid and dies at `source` with "No such file or directory", which
+        # is what the Dockerfile's own comment at that COPY warns about. Caught
+        # by mutation: dropping common.sh from the COPY left the existence check
+        # above green at 150/150, because the one remaining path did exist.
+        if printf '%s\n' "$copy_sources" | grep -qx 'test/install-chrome.sh'; then
+            if printf '%s\n' "$copy_sources" | grep -qx 'test/common.sh'; then
+                pass ".devcontainer/Dockerfile COPYs common.sh alongside install-chrome.sh (the installer sources it from its own dirname)"
+            else
+                fail ".devcontainer/Dockerfile COPYs install-chrome.sh WITHOUT common.sh — the installer sources common.sh from its own dirname, so the layer dies at \`source\`; every path it names still exists, so an existence check cannot see this"
+            fi
+        else
+            fail ".devcontainer/Dockerfile no longer COPYs test/install-chrome.sh — the image ships no browser and LAB-5064's AC1 wiring is gone"
+        fi
     fi
 else
     fail ".devcontainer/Dockerfile not found — the devcontainer wiring assertions above are vacuous"
@@ -2478,7 +2495,7 @@ fi
 echo "=== Summary ==="
 echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # PR #228 review: 134 -> 135 was the container-shell check (above). 135 -> 150.
-# MEASURED. +15, all from defects the PR #228 review found by MUTATION rather
+# MEASURED. +16, all from defects the PR #228 review found by MUTATION rather
 # than by reading, each one having survived every check in the repo:
 #   +9  devcontainer-image, which had none of the pins install-chrome-e2e has:
 #       job present, builds THROUGH devcontainer.json, greps the in_container()
@@ -2492,13 +2509,16 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       comment actually cares about and nothing checked — every copy pinning
 #       the SAME sha, across live-tests.yml AND ci.yml. Deleting one step left
 #       six comments claiming SIX beside five steps, all green.
-#   +1  .devcontainer/Dockerfile's COPY sources exist. Only `docker build`
-#       resolves them and that build is gated, so renaming test/common.sh broke
-#       the image with every un-gated check green.
+#   +2  .devcontainer/Dockerfile's COPY: that every source exists, AND that
+#       common.sh travels with install-chrome.sh. Only `docker build` resolves
+#       these and that build is gated. The second was added after the first
+#       failed its own mutation: dropping common.sh left every remaining path
+#       existing, so the existence check stayed green while the layer would die
+#       at `source`.
 #   +1  no production caller sets VESPASIAN_TEST_ROOT — test/README.md states it
 #       absolutely, the variable feeds root-privileged writes, and AGENTS.md's
 #       own convention says such a claim must cite a test. This is that test.
-EXPECTED_ASSERTIONS=150
+EXPECTED_ASSERTIONS=151
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
