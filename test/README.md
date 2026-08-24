@@ -17,7 +17,7 @@ End-to-end live tests that spin up intentionally simple target applications, run
 
 ## Prerequisites
 
-- **Go 1.25+** — [https://go.dev/dl/](https://go.dev/dl/)
+- **Go 1.27.0+** — [https://go.dev/dl/](https://go.dev/dl/)
 - **Chrome/Chromium** — Required for headless crawling (see below)
 - **python3** — Required for test validation scripts
 - **Node.js** — Required for the graphql-server target

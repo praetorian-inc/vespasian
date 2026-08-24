@@ -27,6 +27,7 @@ jobs:
     permissions:
       contents: read
     with:
+      golangci-lint-version: "v2.13.1"
       build-cmd-path: ./cmd/vespasian
       build-binary-name: vespasian
       build-cgo-enabled: "1"

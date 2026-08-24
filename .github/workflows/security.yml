@@ -43,4 +43,5 @@ jobs:
       # `go-version: stable`, every scan died before writing SARIF once go1.27
       # became stable. v2.28.0 links x/tools v0.48.0. Pinned, never `latest`.
       gosec-version: "v2.28.0"
+      govulncheck-version: "v1.7.0"
     secrets: inherit
