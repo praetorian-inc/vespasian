@@ -124,52 +124,124 @@ resolve_port_or_die() {
 # Prerequisites
 # ──────────────────────────────────────────────────────────────
 
-# Candidate browsers, in priority order. Overridable by tests.
-CHROME_CANDIDATES=(
-    google-chrome chromium-browser chromium chrome
-    /usr/bin/google-chrome /usr/bin/chromium-browser /usr/bin/chromium
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-    /snap/bin/chromium
-)
+# CHROME_CANDIDATES, chrome_runnable, and detect_chrome_binary now live in
+# common.sh (sourced above) so install-chrome.sh can reuse the same probe.
 
-# Probe a candidate for actual runnability. --version is fast and needs no X/DBus.
-chrome_runnable() {
-    local t=""
-    if command -v timeout >/dev/null 2>&1; then
-        t=timeout
-    elif command -v gtimeout >/dev/null 2>&1; then   # macOS + coreutils
-        t=gtimeout
-    fi
-    if [ -n "$t" ]; then
-        "$t" 2 "$1" --version >/dev/null 2>&1
-    else
-        # No timeout available (e.g. stock macOS): probe directly. A binary that
-        # hangs on --version would block here — known limitation, documented in
-        # test/README.md.
-        "$1" --version >/dev/null 2>&1
-    fi
-}
+# Setup targets whose live tests drive the rod (headless-browser) backend.
+# grpc-server is deliberately absent: its live test speaks gRPC reflection and
+# never launches Chrome, so setting it up on a browserless host is legitimate.
+# Consulted by browser_required to decide whether a missing browser is fatal.
+BROWSER_TARGETS="rest-api soap-service graphql-server concat-spa forms-target"
 
-# Resolve + probe candidates. On success: echo the runnable binary, return 0.
-# On "present but not runnable": echo the first broken binary, return 2.
-# On "nothing found": echo nothing, return 1.
-detect_chrome_binary() {
-    local browser bin stub=""
-    for browser in "${CHROME_CANDIDATES[@]}"; do
-        bin=$(command -v "$browser" 2>/dev/null) || continue
-        if chrome_runnable "$bin"; then
-            printf '%s\n' "$bin"
-            return 0
-        fi
-        [ -z "$stub" ] && stub="$bin"
+# browser_required returns 0 when the selected target list contains at least one
+# target whose live test needs a runnable browser.
+#
+# The point of the distinction (LAB-5064): a hard browser gate on EVERY setup
+# blocks work that provably needs no browser — `--skip-start` (build-only) and
+# grpc-server-only setups — and, because the gate exits before write_config,
+# it also blocked the browserless `--group offline` run downstream. When no
+# selected target needs a browser the check degrades to a warning, matching the
+# warn-and-skip contract run-live-tests.sh already applies per rod target.
+#
+# Unrecognised names fail OPEN (no browser required) — deliberately, and unlike
+# run-live-tests.sh's targets_need_config, which fails closed. The asymmetry is
+# safe because the consequence differs: failing open here only relaxes a
+# warning, and main()'s build dispatch rejects an unknown target with
+# "Unknown target" + exit 1 before anything is provisioned. Pinned by
+# preflight-selftest.sh case k.
+browser_required() {
+    # read -ra from a QUOTED here-string rather than an unquoted
+    # ${selected//,/ }: an unquoted expansion both splits AND globs, so a list
+    # containing * would expand against the cwd before comparison.
+    #
+    # SIBLING: run-live-tests.sh's targets_need_config uses this same split for
+    # the same reason. The two are deliberately NOT factored into a shared
+    # helper: it is not that sharing is impossible — a split-only helper using
+    # this file's own RESOLVED_PORT-style global-output convention would work —
+    # but that it isn't worth it for ONE shared line. The classification around
+    # that line diverges on all three axes that matter: haystack type (string
+    # here, array there), quantifier (any-is-in here, any-is-NOT-in there), and
+    # unknown-target default (open here, closed there). If you "simplify" this
+    # split back to an unquoted expansion, fix the sibling too — and note both
+    # are pinned by glob assertions (preflight-selftest case k, test-runner-args).
+    local target parts
+    read -ra parts <<< "${1//,/ }"
+    for target in "${parts[@]}"; do
+        case " ${BROWSER_TARGETS} " in
+            *" ${target} "*) return 0 ;;
+        esac
     done
-    [ -n "$stub" ] && { printf '%s\n' "$stub"; return 2; }
     return 1
 }
 
+# report_browser_prerequisite prints the browser diagnosis at the right severity
+# and returns 0 when the browser requirement is SATISFIED, 1 when it is not and
+# the caller should count that as a failure. Split out of check_prerequisites so
+# the "is a browser required, and how loudly do we complain" policy lives apart
+# from the flat go/python3/node checklist.
+#
+# $1 = browser_fatal ("true"/"false")
+report_browser_prerequisite() {
+    local browser_fatal=$1
+    # `chrome_bin=$(detect_chrome_binary) || rc=$?` (not `; rc=$?`) — under this
+    # script's `set -e`, a bare `chrome_bin=$(cmd); rc=$?` would abort the script
+    # the instant detect_chrome_binary returned non-zero, before rc=$? ever ran.
+    local chrome_bin rc=0
+    chrome_bin=$(detect_chrome_binary) || rc=$?
+
+    if [ $rc -eq 0 ]; then
+        log_ok "Browser: $chrome_bin"
+        return 0
+    fi
+
+    # Same diagnosis either way; only the severity and the return differ.
+    local browser_log=log_fail
+    if [ "$browser_fatal" != true ]; then
+        browser_log=log_warn
+    fi
+
+    if [ $rc -eq 2 ]; then
+        $browser_log "Found ${chrome_bin} but it is not runnable"
+        case "$chrome_bin" in
+            */snap/*|*/chromium-browser|*/chromium)
+                log_info "(looks like the Ubuntu snap stub — install the chromium snap: 'snap install chromium', or use google-chrome)."
+                ;;
+            *)
+                log_info "(the binary exists but failed to run — check permissions, missing shared libraries, or reinstall the browser)."
+                ;;
+        esac
+    else
+        $browser_log "Chrome/Chromium not found. Required for headless crawling."
+        # Deliberately NOT suggesting 'apt install chromium-browser': on Ubuntu
+        # noble that package is a transitional stub that pre-depends on snapd,
+        # i.e. the unrunnable binary this check exists to catch.
+        log_info "Install: './test/install-chrome.sh' (Debian/Ubuntu container) or https://www.google.com/chrome/"
+    fi
+
+    if [ "$browser_fatal" = true ]; then
+        return 1
+    fi
+    log_info "(no browser needed for this setup — browser-backed targets will skip when you run them)."
+    return 0
+}
+
+# check_prerequisites <targets> <skip_start>
+#
+# Both arguments feed the browser gate only; every other prerequisite is
+# unconditional. skip_start is passed as "true"/"false" from main.
 check_prerequisites() {
+    local selected="${1:-$ALL_TARGETS}"
+    local skip_start="${2:-false}"
     log_header "Checking Prerequisites"
     local failed=0
+
+    # A browser is fatal only when this setup is actually provisioning targets
+    # whose live tests launch one. --skip-start builds binaries and starts
+    # nothing, so it never needs a browser regardless of target selection.
+    local browser_fatal=true
+    if [ "$skip_start" = true ] || ! browser_required "$selected"; then
+        browser_fatal=false
+    fi
 
     # Go
     if command -v go >/dev/null 2>&1; then
@@ -180,30 +252,14 @@ check_prerequisites() {
     fi
 
     # Chrome/Chromium — presence alone is not enough (snap stubs satisfy
-    # command -v / -x but fail at runtime). detect_chrome_binary probes
-    # runnability so preflight fails loudly here, not during `vespasian crawl`.
-    # Note: `chrome_bin=$(detect_chrome_binary) || rc=$?` (not `; rc=$?`) — under
-    # this script's `set -e`, a bare `chrome_bin=$(cmd); rc=$?` would abort the
-    # script the instant detect_chrome_binary returns non-zero, before rc=$?
-    # ever ran, and the elif/else branches below would never execute.
-    local chrome_bin rc=0
-    chrome_bin=$(detect_chrome_binary) || rc=$?
-    if [ $rc -eq 0 ]; then
-        log_ok "Browser: $chrome_bin"
-    elif [ $rc -eq 2 ]; then
-        log_fail "Found ${chrome_bin} but it is not runnable"
-        case "$chrome_bin" in
-            */snap/*|*/chromium-browser|*/chromium)
-                log_info "(looks like the Ubuntu snap stub — install the chromium snap: 'snap install chromium', or use google-chrome)."
-                ;;
-            *)
-                log_info "(the binary exists but failed to run — check permissions, missing shared libraries, or reinstall the browser)."
-                ;;
-        esac
-        failed=1
-    else
-        log_fail "Chrome/Chromium not found. Required for headless crawling."
-        log_info "Install: https://www.google.com/chrome/ or 'apt install chromium-browser'"
+    # command -v / -x but fail at runtime). report_browser_prerequisite probes
+    # runnability so preflight fails loudly here, not during `vespasian crawl`,
+    # and downgrades to a warning when this setup needs no browser.
+    #
+    # Explicit `if` rather than `report_browser_prerequisite ... || failed=1`:
+    # under this script's `set -e` a trailing AND/OR-list whose final status is
+    # non-zero would abort the script mid-preflight.
+    if ! report_browser_prerequisite "$browser_fatal"; then
         failed=1
     fi
 
@@ -266,7 +322,16 @@ build_graphql_server() {
     log_info "Installing graphql-server dependencies..."
     cd "${SCRIPT_DIR}/graphql-server"
     if [ ! -d "node_modules" ]; then
-        npm install --silent
+        # `npm ci --ignore-scripts`, matching every other npm call
+        # site in this repo (both `npm ci --ignore-scripts` invocations in
+        # .github/workflows/live-tests.yml). `npm install` runs package lifecycle
+        # scripts from the dependency tree, which is arbitrary code execution
+        # from the registry on a developer's machine and on the CI runner, and it
+        # resolves loosely instead of honouring the committed lockfile.
+        # package-lock.json is committed here, so `ci` is a drop-in. It only ever
+        # runs when node_modules is absent, so `ci`'s clean-slate install costs
+        # nothing extra.
+        npm ci --ignore-scripts --silent
     fi
     log_ok "graphql-server dependencies installed"
 }
@@ -295,7 +360,13 @@ wait_for_http() {
     local start=$SECONDS
 
     while true; do
-        if curl -sf -o /dev/null "$url" 2>/dev/null; then
+        # --max-time bounds the PROBE itself, not just the interval between
+        # probes: without it curl has no default overall timeout, so a
+        # service that accepts the TCP handshake and then never responds
+        # wedges here forever and the outer $timeout deadline below is never
+        # even reached. run-live-tests.sh:214's sibling probe
+        # already does this; this matches it.
+        if curl -sf --max-time 2 -o /dev/null "$url" 2>/dev/null; then
             return 0
         fi
         if [ $((SECONDS - start)) -ge "$timeout" ]; then
@@ -309,7 +380,12 @@ wait_for_http() {
 # (append, not overwrite) so teardown can kill them all, not just the latest.
 record_pid() {
     local name=$1 pid=$2
-    echo "$pid" >> "${STATE_DIR}/.${name}.pids"
+    # This log is the sole input to the teardown kill loop, so its
+    # mode is stated here rather than left to the caller's umask — same
+    # reasoning write_config applies to the config file. A subshell umask (not
+    # install -m) because this is an APPEND: install would truncate the earlier
+    # generations teardown still needs.
+    ( umask 077; echo "$pid" >> "${STATE_DIR}/.${name}.pids" )
 }
 
 # Kill a PID if it is alive: TERM, brief grace period, then KILL. Works for
@@ -368,18 +444,32 @@ service_default_port() {
 # of the user's node processes onto which the recorded PID may have been recycled.
 # For it we additionally require the PID to be listening in the service's port
 # window, reusing the same node-in-window identity filter as the orphan sweep
-# (orphan_pids_by_port). If that check cannot run (e.g. lsof unavailable) we
-# decline the match rather than kill an unverified node process.
+# (orphan_pids_by_port). If that check CANNOT RUN (lsof unavailable) we accept the
+# match on provenance instead — see the note at the port check below.
+# This comment previously said the opposite ("we decline the match"), describing
+# the behaviour from before that change and telling the next auditor the guard was
+# closed when the code had deliberately opened it.
 pid_matches_service() {
     local pid=$1 name=$2 comm binary base wpid
     comm="$(ps -p "$pid" -o comm= 2>/dev/null)"
     comm="$(basename "$comm" 2>/dev/null)"
     [ -n "$comm" ] || return 1
 
+    # Explicit return codes, not a bare `return` picking up the `[ ]`
+    # test's status: this function is now reachable from the EXIT trap
+    # below, and a bare `return` inside a function invoked
+    # from an EXIT trap under `set -e` does not reliably propagate the
+    # last command's own status — it can echo back the ORIGINAL exit
+    # code that fired the trap instead, silently turning a real match
+    # into a false "no match". Verified: a bare `return` reintroduces
+    # this exact failure when this function runs inside the trap.
     binary="$(service_binary "$name")"
     if [ -n "$binary" ]; then
-        [ "$comm" = "$binary" ]
-        return
+        if [ "$comm" = "$binary" ]; then
+            return 0
+        else
+            return 1
+        fi
     fi
 
     # No unique binary → node-based graphql-server: require node AND a listening
@@ -387,17 +477,63 @@ pid_matches_service() {
     [ "$comm" = "node" ] || return 1
     base="$(service_default_port "$name")"
     [ -n "$base" ] || return 1
-    for wpid in $(orphan_pids_by_port "$base"); do
+    # Honour "cannot determine" separately from "does not match".
+    # orphan_pids_by_port returns 2 when lsof is absent; treating that as
+    # not-a-match (which a bare `for` over its output does, since the loop ignores
+    # the exit status) meant teardown declined to kill graphql-server on every host
+    # without lsof, cleared its pid record anyway, and reported success.
+    #
+    # The port check exists to avoid killing an UNRELATED node process during a
+    # --sweep, where the candidate PID was discovered rather than recorded. When
+    # the PID came from our own pid log the provenance is already established, so
+    # the port check is corroboration, not the basis — and falling back to
+    # "node with the right name in our log" is correct rather than lax.
+    #
+    # Provenance is guaranteed by the call sites, not by sweep_orphans: BOTH
+    # callers (stop_service, cleanup_stale_state) read their PIDs from
+    # `recorded_pids`, i.e. our own pid log. sweep_orphans never calls this
+    # function at all — it filters candidates through orphan_pids_by_name /
+    # orphan_pids_by_port directly — so a discovered PID cannot reach here.
+    # (An earlier version of this comment justified the fallback by claiming
+    # sweep_orphans routed through here; it does not, and the real guarantee
+    # is the stronger one above.)
+    #
+    # Residual, accepted: on an lsof-less host a recorded PID recycled onto an
+    # unrelated `node` process would be signalled. That is strictly better than
+    # the alternative it replaced, which left a live graphql-server holding its
+    # port on EVERY lsof-less host while clearing the pid record and reporting
+    # success.
+    local port_pids port_rc
+    port_pids="$(orphan_pids_by_port "$base")"
+    port_rc=$?
+    if [ "$port_rc" -eq 2 ]; then
+        return 0
+    fi
+    for wpid in $port_pids; do
         [ "$wpid" = "$pid" ] && return 0
     done
     return 1
 }
 
+# LIVE_TARGET_BIND_HOST is the same seam FORMS_TARGET_BIND_HOST already gives
+# forms-target, extended to rest-api, soap-service, concat-spa and
+# graphql-server. All four used to bind the wildcard address in
+# their own main.go/server.js; each now reads BIND_HOST and defaults to
+# 127.0.0.1, mirroring forms-target/main.go (`host := os.Getenv("BIND_HOST")`)
+# and grpc-server, which hardcodes loopback. So the seam is LIVE end to end:
+# both halves — the value this script passes and the read in each target — are
+# asserted, by setup-live-targets_test.sh Tests 18 and 18b respectively, because
+# either half alone is inert.
+#
+# These are unauthenticated services, so loopback is the default and widening is
+# explicit and opt-in — needed only for the devcontainer flow where a crawler in
+# a container reaches the host by TEST_HOST:
+#   LIVE_TARGET_BIND_HOST=0.0.0.0 ./test/setup-live-targets.sh
 start_rest_api() {
     local port=$1
     log_info "Starting rest-api on port ${port}..."
     cd "${SCRIPT_DIR}/rest-api"
-    PORT="$port" ./rest-api &
+    PORT="$port" BIND_HOST="${LIVE_TARGET_BIND_HOST:-127.0.0.1}" ./rest-api &
     local pid=$!
     record_pid rest-api "$pid"
 
@@ -405,7 +541,7 @@ start_rest_api() {
         log_ok "rest-api started (PID: ${pid}, port: ${port})"
     else
         log_fail "rest-api failed to start within 15s"
-        kill "$pid" 2>/dev/null || true
+        kill_pid "$pid" || true
         return 1
     fi
 }
@@ -414,7 +550,8 @@ start_concat_spa() {
     local port=$1
     log_info "Starting concat-spa on port ${port}..."
     cd "${SCRIPT_DIR}/concat-spa"
-    PORT="$port" ./concat-spa &
+    # See LIVE_TARGET_BIND_HOST comment above start_rest_api.
+    PORT="$port" BIND_HOST="${LIVE_TARGET_BIND_HOST:-127.0.0.1}" ./concat-spa &
     local pid=$!
     record_pid concat-spa "$pid"
 
@@ -422,7 +559,7 @@ start_concat_spa() {
         log_ok "concat-spa started (PID: ${pid}, port: ${port})"
     else
         log_fail "concat-spa failed to start within 15s"
-        kill "$pid" 2>/dev/null || true
+        kill_pid "$pid" || true
         return 1
     fi
 }
@@ -431,10 +568,13 @@ start_forms_target() {
     local port=$1
     log_info "Starting forms-target on port ${port}..."
     cd "${SCRIPT_DIR}/forms-target"
-    # forms-target binds loopback by default; bind all interfaces so a
-    # devcontainer crawler (TEST_HOST=host.docker.internal) can reach the host.
-    # Override with FORMS_TARGET_BIND_HOST=127.0.0.1 for host-only local runs.
-    PORT="$port" BIND_HOST="${FORMS_TARGET_BIND_HOST:-0.0.0.0}" ./forms-target &
+    # forms-target binds loopback by default (matching its own Go default,
+    # main.go:95) — an unauthenticated HTTP app with login/register/feedback
+    # forms has no business listening on every interface of the operator's
+    # machine unless asked. Widen explicitly for the devcontainer
+    # case (TEST_HOST=host.docker.internal) with:
+    #   FORMS_TARGET_BIND_HOST=0.0.0.0 ./test/setup-live-targets.sh
+    PORT="$port" BIND_HOST="${FORMS_TARGET_BIND_HOST:-127.0.0.1}" ./forms-target &
     local pid=$!
     record_pid forms-target "$pid"
 
@@ -442,7 +582,7 @@ start_forms_target() {
         log_ok "forms-target started (PID: ${pid}, port: ${port})"
     else
         log_fail "forms-target failed to start within 15s"
-        kill "$pid" 2>/dev/null || true
+        kill_pid "$pid" || true
         return 1
     fi
 }
@@ -451,7 +591,8 @@ start_soap_service() {
     local port=$1
     log_info "Starting soap-service on port ${port}..."
     cd "${SCRIPT_DIR}/soap-service"
-    PORT="$port" WSDL_PATH="${SCRIPT_DIR}/soap-service/service.wsdl" ./soap-service &
+    # See LIVE_TARGET_BIND_HOST comment above start_rest_api.
+    PORT="$port" WSDL_PATH="${SCRIPT_DIR}/soap-service/service.wsdl" BIND_HOST="${LIVE_TARGET_BIND_HOST:-127.0.0.1}" ./soap-service &
     local pid=$!
     record_pid soap-service "$pid"
 
@@ -459,7 +600,7 @@ start_soap_service() {
         log_ok "soap-service started (PID: ${pid}, port: ${port})"
     else
         log_fail "soap-service failed to start within 15s"
-        kill "$pid" 2>/dev/null || true
+        kill_pid "$pid" || true
         return 1
     fi
 }
@@ -468,7 +609,12 @@ start_graphql_server() {
     local port=$1
     log_info "Starting graphql-server on port ${port}..."
     cd "${SCRIPT_DIR}/graphql-server"
-    PORT="$port" node server.js > "${STATE_DIR}/.graphql-server.log" 2>&1 &
+    # See LIVE_TARGET_BIND_HOST comment above start_rest_api.
+    # Pre-create the log with an explicit mode — a `>` redirect onto
+    # an existing file truncates without changing its mode, so the mode has to
+    # be set before the truncating redirect below, not after.
+    install -m 0600 /dev/null "${STATE_DIR}/.graphql-server.log"
+    PORT="$port" BIND_HOST="${LIVE_TARGET_BIND_HOST:-127.0.0.1}" node server.js > "${STATE_DIR}/.graphql-server.log" 2>&1 &
     local pid=$!
     record_pid graphql-server "$pid"
 
@@ -476,7 +622,7 @@ start_graphql_server() {
         log_ok "graphql-server started (PID: ${pid}, port: ${port})"
     else
         log_fail "graphql-server failed to start within 15s"
-        kill "$pid" 2>/dev/null || true
+        kill_pid "$pid" || true
         return 1
     fi
 }
@@ -486,17 +632,38 @@ wait_for_grpc() {
     local port=$2
     local timeout=${3:-30}
     local start=$SECONDS
+    # Resolves the same timeout/gtimeout seam common.sh's chrome_runnable
+    # already establishes, reused here to bound the bare /dev/tcp arm below.
+    # timeout_cmd only — NOT chrome_probe_budget: the hardcoded 2s below bounds
+    # a gRPC connect probe, not a browser probe, and must not start reading
+    # CHROME_PROBE_TIMEOUT.
+    local t
+    t=$(timeout_cmd)
 
     while true; do
+        # Each arm is bounded to 2s so the probe itself cannot outlive the
+        # outer $timeout deadline (same shape as wait_for_http).
         if command -v grpcurl >/dev/null 2>&1; then
-            if grpcurl -plaintext "${host}:${port}" list >/dev/null 2>&1; then
+            if grpcurl -max-time 2 -plaintext "${host}:${port}" list >/dev/null 2>&1; then
                 return 0
             fi
         elif command -v nc >/dev/null 2>&1; then
-            if nc -z "${host}" "${port}" 2>/dev/null; then
+            if nc -z -w 2 "${host}" "${port}" 2>/dev/null; then
+                return 0
+            fi
+        elif [ -n "$t" ]; then
+            # host/port are passed as argv ($1/$2 inside the -c script), not
+            # spliced into the program text: this is the one listener-spawning
+            # script in the repo, and interpolating them into the string would
+            # make the two values the only thing separating this from arbitrary
+            # command execution. `_` fills $0 so $1/$2 land where
+            # expected.
+            if "$t" 2 bash -c 'echo >/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null; then
                 return 0
             fi
         else
+            # No timeout/gtimeout available: falls back to the unbounded
+            # probe (same documented limitation as chrome_runnable).
             if (echo >/dev/tcp/"${host}"/"${port}") 2>/dev/null; then
                 return 0
             fi
@@ -520,7 +687,7 @@ start_grpc_server() {
         log_ok "grpc-server started (PID: ${pid}, port: ${port})"
     else
         log_fail "grpc-server failed to start within 15s"
-        kill "$pid" 2>/dev/null || true
+        kill_pid "$pid" || true
         return 1
     fi
 }
@@ -569,7 +736,21 @@ orphan_pids_by_name() {
 orphan_pids_by_port() {
     local base=$1
     local end=$((base + 20)) pid comm
-    command -v lsof >/dev/null 2>&1 || return 0
+    # Distinguish "no listeners found" from "cannot look". Returning 0
+    # with no output for BOTH made the two indistinguishable to callers, and the
+    # consequence was silent: pid_matches_service's graphql-server arm requires a
+    # listening socket in the port window, so on a host without lsof it always
+    # answered "not a match" — stop_service then skipped the kill, cleared the pid
+    # record anyway, and reported "no running processes found" while an
+    # unauthenticated Apollo server kept listening with its only record erased.
+    # Return 2 for "cannot determine" so a caller can tell, and warn once.
+    if ! command -v lsof >/dev/null 2>&1; then
+        if [ -z "${_LSOF_MISSING_WARNED:-}" ]; then
+            log_warn "lsof not found — cannot identify node listeners by port; graphql-server may be left running by teardown. Install lsof for reliable teardown." >&2
+            _LSOF_MISSING_WARNED=1
+        fi
+        return 2
+    fi
     # One ranged lsof call (mirrors show_port_holders) instead of 21 per-port
     # invocations; -t yields de-duplicated PIDs, which we then filter to node.
     for pid in $(lsof -nP -tiTCP:"${base}-${end}" -sTCP:LISTEN 2>/dev/null || true); do
@@ -703,7 +884,15 @@ write_config() {
     local forms_port=$6
     local targets=$7
 
-    cat > "$CONFIG_FILE" <<EOF
+    # Rendered to a staged file, then installed with an explicit mode:
+    # a bare `cat >` lands at the caller's umask, so under
+    # umask 0 (a Dockerfile RUN commonly runs with one) this config —
+    # load_config declare -g's it straight into run-live-tests.sh — would
+    # land world-writable. Mirrors install-chrome.sh:424-441's reasoning for
+    # its own writes.
+    local staged
+    staged="$(mktemp "${STATE_DIR}/.live-test-config.XXXXXX")"
+    cat > "$staged" <<EOF
 # Auto-generated by setup-live-targets.sh on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 # Source this or let run-live-tests.sh read it automatically.
 REST_API_PORT=${rest_port}
@@ -714,6 +903,8 @@ CONCAT_SPA_PORT=${concat_port}
 FORMS_TARGET_PORT=${forms_port}
 TARGETS_SETUP=${targets}
 EOF
+    install -m 0644 -- "$staged" "$CONFIG_FILE"
+    rm -f -- "$staged"
     log_ok "Wrote config to ${CONFIG_FILE}"
 }
 
@@ -802,6 +993,25 @@ run_tests_guidance() {
     fi
 }
 
+# Set true for the duration of the start-services window and read by the
+# EXIT trap below. Left false the rest of the run so --teardown,
+# --skip-start, --help, and a normal successful exit never trigger it.
+SETUP_IN_PROGRESS=false
+
+# EXIT handler for the start-services window: a failed start used to leave
+# every already-started service running and .live-test-config unwritten.
+# Reuses do_teardown — the same stop_service/kill_pid/pid_matches_service
+# machinery --teardown already uses — rather than a parallel kill path.
+# cleanup_stale_state (called right before this window opens) already
+# cleared any leftover PIDs from a PRIOR run, so every pid log entry present
+# when this fires belongs to the CURRENT invocation.
+teardown_on_failure() {
+    if [ "$SETUP_IN_PROGRESS" = true ]; then
+        log_warn "Setup interrupted or failed — tearing down what this run started."
+        do_teardown
+    fi
+}
+
 # Pipeline orchestrator: parse args → teardown? → prereqs → build → stale
 # cleanup → resolve ports + start → write config. Intentionally longer than the
 # ~60-line guideline: each stage is a distinct sequential step that delegates to
@@ -819,7 +1029,9 @@ main() {
 
     log_header "Vespasian Live Test Setup"
 
-    check_prerequisites
+    # Pass the selection through: the browser gate is fatal only for setups that
+    # actually provision browser-backed targets (LAB-5064).
+    check_prerequisites "$targets" "$skip_start"
 
     # ── Build phase ──
     log_header "Building Binaries"
@@ -854,6 +1066,16 @@ main() {
     # Each port is resolved immediately before starting that service so the
     # next service's port check sees the previous one as occupied.
     log_header "Starting Services"
+
+    # Arm the teardown trap for this window only. INT/TERM exit
+    # THROUGH the EXIT trap (128+signo) rather than calling teardown_on_failure
+    # directly: a signal handler that doesn't exit RETURNS to the interrupted
+    # code afterward and the script would carry on starting more services with
+    # its state already torn down (mirrors install-chrome.sh's trap wiring).
+    SETUP_IN_PROGRESS=true
+    trap 'teardown_on_failure' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     local start_failed=0
     REST_API_PORT="" SOAP_SERVICE_PORT="" GRAPHQL_SERVER_PORT="" GRPC_SERVER_PORT="" CONCAT_SPA_PORT="" FORMS_TARGET_PORT=""
@@ -899,7 +1121,7 @@ main() {
     done
 
     if [ $start_failed -ne 0 ]; then
-        log_fail "One or more services failed to start. Run --teardown and retry."
+        log_fail "One or more services failed to start. Tearing down and exiting."
         exit 1
     fi
 
@@ -911,6 +1133,10 @@ main() {
     # so a no-arg run-live-tests.sh exercises the two-stage flow too (LAB-3892).
     local run_targets="${targets/concat-spa/concat-spa,concat-spa-two-stage}"
     write_config "${REST_API_PORT:-}" "${SOAP_SERVICE_PORT:-}" "${GRAPHQL_SERVER_PORT:-}" "${GRPC_SERVER_PORT:-}" "${CONCAT_SPA_PORT:-}" "${FORMS_TARGET_PORT:-}" "$run_targets"
+
+    # Disarm: setup succeeded and the config is written, so a later signal or
+    # exit must leave the just-started services (and this config) alone.
+    SETUP_IN_PROGRESS=false
 
     log_header "Setup Complete"
     # Emit the run guidance (full vs partial setup) via the shared, testable

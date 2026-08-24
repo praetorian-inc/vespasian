@@ -24,6 +24,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/praetorian-inc/vespasian/test/internal/target"
 )
 
 // SOAPEnvelope wraps a SOAP request or response body.
@@ -201,9 +203,13 @@ func main() {
 	mux.HandleFunc("/service.wsdl", handleWSDL)
 	mux.HandleFunc("/soap", handleSOAP)
 
-	addr := ":" + port
-	log.Printf("soap-service listening on %s", addr)       //nolint:gosec // test server, log injection N/A
-	if err := http.ListenAndServe(addr, mux); err != nil { //nolint:gosec // test server, timeouts not needed
+	// Loopback default and the shared server timeout both
+	// live in test/internal/target, so there is one copy to reason about and one
+	// place for Test 18b to assert.
+	addr := target.Addr(port)
+	log.Printf("soap-service listening on http://%s/", addr) //nolint:gosec // test server, log injection N/A
+	srv := target.Server(addr, mux)
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }
