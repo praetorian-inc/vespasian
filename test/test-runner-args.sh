@@ -2523,7 +2523,26 @@ if [[ -f "$WORKFLOW" ]]; then
     # SHA, which is the property the comment actually cares about. ci.yml carries
     # its own copy and is included deliberately: a partial bump across files is
     # the same defect across a file boundary.
-    hr_shas=$(grep -rhoE 'step-security/harden-runner@[0-9a-f]{40}' "$WORKFLOW" "$(dirname "$WORKFLOW")/ci.yml" 2>/dev/null | sort -u)
+    # ci.yml is named in the failure message, so its absence must be a failure
+    # rather than a silently dropped file — `2>/dev/null` on the grep would have
+    # hidden it and still reported success over live-tests.yml alone.
+    hr_ci="$(dirname "$WORKFLOW")/ci.yml"
+    if [[ ! -f "$hr_ci" ]]; then
+        fail "ci.yml not found at ${hr_ci} — it carries a harden-runner copy this check claims to cover, so the pin-uniformity assertion would be silently narrower than its own message"
+        hr_ci="$WORKFLOW"
+    fi
+    # Every use must be SHA-pinned. Matching only @<40-hex> means a copy reverted
+    # to a mutable tag (@v2.20.0) is not counted at all, so one remaining pinned
+    # copy still reports "1 distinct sha" and the check passes over a job that
+    # lost its pin entirely.
+    hr_all_uses=$(grep -rhoE 'step-security/harden-runner@[^[:space:]]+' "$WORKFLOW" "$hr_ci" | sed 's/#.*//' | sort -u)
+    hr_unpinned=$(printf '%s\n' "$hr_all_uses" | grep -vE '@[0-9a-f]{40}$' || true)
+    if [[ -n "$hr_unpinned" ]]; then
+        fail "harden-runner use(s) are not SHA-pinned: $(printf '%s ' $hr_unpinned) — a mutable tag defeats the pin the lockstep comment exists to protect"
+    else
+        pass "every harden-runner use across live-tests.yml and ci.yml is SHA-pinned (no mutable tags)"
+    fi
+    hr_shas=$(grep -rhoE 'step-security/harden-runner@[0-9a-f]{40}' "$WORKFLOW" "$hr_ci" | sort -u)
     hr_sha_count=$(printf '%s\n' "$hr_shas" | grep -c . || true)
     if [[ "$hr_sha_count" -eq 0 ]]; then
         fail "found no SHA-pinned harden-runner uses at all (the pin-uniformity check would be vacuous) — is the action still SHA-pinned?"
@@ -2565,9 +2584,18 @@ if [[ -f "$DEVCONTAINER_DOCKERFILE" ]]; then
         # is what the Dockerfile's own comment at that COPY warns about. Caught
         # by mutation: dropping common.sh from the COPY left the existence check
         # above green at 150/150, because the one remaining path did exist.
+        # Per-COPY-line, not aggregated. The installer sources common.sh from its
+        # OWN dirname, so the two must share ONE COPY instruction's destination;
+        # aggregating across every COPY line meant splitting the pair into two
+        # instructions with different destinations still passed.
+        copy_pair_ok=0
+        while IFS= read -r cl; do
+            printf '%s' "$cl" | grep -q 'test/install-chrome\.sh' || continue
+            printf '%s' "$cl" | grep -q 'test/common\.sh' && copy_pair_ok=1
+        done < <(grep -E '^COPY[[:space:]]' "$DEVCONTAINER_DOCKERFILE")
         if printf '%s\n' "$copy_sources" | grep -qx 'test/install-chrome.sh'; then
-            if printf '%s\n' "$copy_sources" | grep -qx 'test/common.sh'; then
-                pass ".devcontainer/Dockerfile COPYs common.sh alongside install-chrome.sh (the installer sources it from its own dirname)"
+            if [[ "$copy_pair_ok" -eq 1 ]]; then
+                pass ".devcontainer/Dockerfile COPYs common.sh in the SAME instruction as install-chrome.sh (the installer sources it from its own dirname)"
             else
                 fail ".devcontainer/Dockerfile COPYs install-chrome.sh WITHOUT common.sh — the installer sources common.sh from its own dirname, so the layer dies at \`source\`; every path it names still exists, so an existence check cannot see this"
             fi
@@ -2591,7 +2619,13 @@ for tr_caller in "$SCRIPT_DIR/install-chrome.sh" "$SCRIPT_DIR/setup-live-targets
     [[ -f "$tr_caller" ]] || continue
     # An assignment or export, not a mere mention: install-chrome.sh READS the
     # variable by design, and its selftest sets it, which is the point of the seam.
-    if grep -qE '(^|[[:space:];&|])(export[[:space:]]+)?VESPASIAN_TEST_ROOT=' "$tr_caller"; then
+    # Two forms, because the callers are two languages. Shell assignment covers
+    # install-chrome.sh / setup-live-targets.sh / the Dockerfile RUN; the YAML
+    # `VESPASIAN_TEST_ROOT: value` form is what a workflow env: block would use,
+    # and matching only the shell form left exactly the CI callers this check
+    # names unprotected.
+    if grep -qE '(^|[[:space:];&|])(export[[:space:]]+)?VESPASIAN_TEST_ROOT=' "$tr_caller" \
+       || grep -qE '^[[:space:]]*VESPASIAN_TEST_ROOT:[[:space:]]*\S' "$tr_caller"; then
         tr_setters="${tr_setters} $(basename "$tr_caller")"
     fi
 done
@@ -2697,7 +2731,7 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #   +1  no production caller sets VESPASIAN_TEST_ROOT — test/README.md states it
 #       absolutely, the variable feeds root-privileged writes, and AGENTS.md's
 #       own convention says such a claim must cite a test. This is that test.
-EXPECTED_ASSERTIONS=158
+EXPECTED_ASSERTIONS=159
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
