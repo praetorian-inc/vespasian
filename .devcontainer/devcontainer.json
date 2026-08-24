@@ -49,5 +49,23 @@
   // it is redundant today. Kept as a deliberate pin: if the FROM is ever
   // repointed at an image without a `vscode` user, this fails loudly instead of
   // silently dropping every developer into a root shell.
-  "remoteUser": "vscode"
+  "remoteUser": "vscode",
+
+  // The live suite's spec validators are real Node parsers (@apidevtools/swagger-parser,
+  // graphql) and their node_modules is gitignored rather than committed, so a fresh
+  // clone has none and test/validate.sh's _ensure_spec_validators returns 1. Without
+  // this the container looks ready and then fails partway: `--group live` stops in
+  // test_rest_api and test_soap_service, and five of the `--group offline` generate-*
+  // targets stop too, all with "spec-validators deps missing or incomplete".
+  //
+  // This is onCreateCommand rather than an image layer because the workspace is
+  // bind-mounted OVER the image's copy of it: anything npm installs into the
+  // workspace path at build time is shadowed the moment the container starts.
+  // yq and python3 are system binaries and so DO belong in the Dockerfile; this
+  // one cannot.
+  //
+  // --ignore-scripts matches every other npm call site in this repo (both
+  // invocations in .github/workflows/live-tests.yml), keeping package lifecycle
+  // scripts from executing under the non-blocking audit-only egress policy.
+  "onCreateCommand": "cd test/spec-validators && npm ci --ignore-scripts"
 }

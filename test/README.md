@@ -30,12 +30,20 @@ satisfies `command -v` and `-x` but fails the moment it runs, so `setup-live-tar
 reports it as *"found … but it is not runnable"* rather than passing preflight
 and failing later mid-crawl.
 
-**In this repo's devcontainer there is nothing to do.** `.devcontainer/Dockerfile`
-runs `test/install-chrome.sh` as an image layer, so a fresh container comes up
-with a real, non-snap Chrome already installed, and `.devcontainer/devcontainer.json`
-sets `VESPASIAN_NO_SANDBOX=true` for you. The `devcontainer-image` CI job
-builds that image and asserts the browser it ships is runnable, so what you get
-is what CI checked.
+**In this repo's devcontainer there is nothing to do.**
+[`.devcontainer/Dockerfile`](../.devcontainer/Dockerfile) runs
+`test/install-chrome.sh` as an image layer, so a fresh container comes up with a
+real, non-snap Chrome already installed, plus the `python3` and `yq` the guard
+suites need. [`.devcontainer/devcontainer.json`](../.devcontainer/devcontainer.json)
+sets `VESPASIAN_NO_SANDBOX=true` for you, and its `onCreateCommand` installs the
+spec-validator deps the live and generator targets parse specs with.
+
+The `devcontainer-image` CI job builds that image **through `devcontainer.json`**
+(via `@devcontainers/cli`, not a hand-written `docker build`), then runs the
+assertions inside it as the `vscode` user with that same environment — so the
+configuration CI measures is the one you get, rather than a similar one. It
+asserts the browser resolves and launches, and that the guard suites run in the
+image.
 
 Outside that image — macOS, a bare Ubuntu host, your own container — install a
 real, non-snap Chrome (`.deb`, amd64 or arm64) yourself:
@@ -353,7 +361,11 @@ caller-supplied directory instead of the real filesystem. It exists solely so
 (the defaults-file rewrite, the container gate, phone-home removal and
 verification) against fixtures, unprivileged. **No production caller sets
 it** — `install-chrome.sh` itself, `setup-live-targets.sh`,
-`.devcontainer/Dockerfile`, and the CI jobs all leave it unset.
+[`.devcontainer/Dockerfile`](../.devcontainer/Dockerfile), and the CI jobs all
+leave it unset. That is not left as prose: `test/test-runner-args.sh` asserts it,
+greping each of those callers for an assignment and failing if one appears — the
+citation AGENTS.md's "comments that claim a state is impossible must cite a test"
+convention asks for.
 
 The script validates the value before using it — it must be an absolute,
 existing directory containing only `[A-Za-z0-9._/-]`, with no `..` component,

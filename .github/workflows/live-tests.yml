@@ -32,9 +32,9 @@ jobs:
       # to the StepSecurity dashboard without enforcing an allowlist. Flip to
       # 'block' with an allowed-endpoints list once telemetry confirms the set.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
-      # devcontainer-image / integration-tests / test. harden-runner is a SHA-pinned
-      # security control: bump ALL SIX copies in lockstep — a missed copy silently
-      # leaves a job on a stale pin.
+      # devcontainer-changes / devcontainer-image / integration-tests / test.
+      # harden-runner is a SHA-pinned security control: bump ALL SEVEN copies in
+      # lockstep — a missed copy silently leaves a job on a stale pin.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -51,7 +51,7 @@ jobs:
       # `bash <script>` silently works on a file that lost +x. One style for all
       # four, so there is nothing to keep in sync.
       - name: Syntax check
-        run: bash -n test/setup-live-targets.sh && bash -n test/install-chrome.sh && bash -n test/assert-chrome-install.sh
+        run: bash -n test/setup-live-targets.sh && bash -n test/install-chrome.sh && bash -n test/assert-chrome-install.sh && bash -n test/assert-devcontainer-lookpath.sh
 
       - name: Run preflight self-test
         run: ./test/preflight-selftest.sh
@@ -97,9 +97,9 @@ jobs:
       # to the StepSecurity dashboard without enforcing an allowlist. Flip to
       # 'block' with an allowed-endpoints list once telemetry confirms the set.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
-      # devcontainer-image / integration-tests / test. harden-runner is a SHA-pinned
-      # security control: bump ALL SIX copies in lockstep — a missed copy silently
-      # leaves a job on a stale pin.
+      # devcontainer-changes / devcontainer-image / integration-tests / test.
+      # harden-runner is a SHA-pinned security control: bump ALL SEVEN copies in
+      # lockstep — a missed copy silently leaves a job on a stale pin.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -152,9 +152,9 @@ jobs:
       # to the StepSecurity dashboard without enforcing an allowlist. Flip to
       # 'block' with an allowed-endpoints list once telemetry confirms the set.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
-      # devcontainer-image / integration-tests / test. harden-runner is a SHA-pinned
-      # security control: bump ALL SIX copies in lockstep — a missed copy silently
-      # leaves a job on a stale pin.
+      # devcontainer-changes / devcontainer-image / integration-tests / test.
+      # harden-runner is a SHA-pinned security control: bump ALL SEVEN copies in
+      # lockstep — a missed copy silently leaves a job on a stale pin.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -317,29 +317,69 @@ jobs:
           printf '%s' "$out" | grep -q "already present" \
             || { echo "second run did not take the idempotent path"; exit 1; }
 
+  # Decides whether a PULL REQUEST touches the devcontainer image or anything it
+  # copies. GitHub Actions has no per-job `paths` filter and this workflow must
+  # run on every PR (the un-gated guard suites depend on that), so the filter has
+  # to be a job whose output the image job gates on.
+  #
+  # This exists because the image job used to run only on push-to-main and
+  # workflow_dispatch, which meant .devcontainer/ merged unverified and a broken
+  # image first surfaced on main — the branch that can least afford it. Scoped to
+  # the paths that can actually break the build, so an ordinary PR still pays
+  # nothing: the live egress to Google and the browser download only happen when
+  # the image or the installer it copies actually changed.
+  devcontainer-changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      changed: ${{ steps.filter.outputs.devcontainer }}
+    steps:
+      # Defense-in-depth (LAB-4732): monitor and record all
+      # outbound network traffic. Audit mode is non-blocking — it logs egress
+      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
+      # 'block' with an allowed-endpoints list once telemetry confirms the set.
+      # DUPLICATED across preflight-selftest / validator-regression / docs-check /
+      # devcontainer-changes / devcontainer-image / integration-tests / test.
+      # harden-runner is a SHA-pinned security control: bump ALL SEVEN copies in
+      # lockstep — a missed copy silently leaves a job on a stale pin.
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - id: filter
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36  # v3.0.2
+        with:
+          filters: |
+            devcontainer:
+              - '.devcontainer/**'
+              - 'test/install-chrome.sh'
+              - 'test/common.sh'
+              - 'test/assert-chrome-install.sh'
+              - 'test/assert-devcontainer-lookpath.sh'
+
   # .devcontainer/Dockerfile is what closes LAB-5064's AC1; this job is the only
   # thing that checks it still does. Nothing else in this repo builds a
   # Dockerfile, so without it the wiring would rot invisibly and the ticket would
-  # be re-opened by the same observation that opened it (LAB-5766). It is deliberately narrow: install-chrome.sh's
-  # privileged path is ALREADY covered by install-chrome-e2e above, so what this
-  # adds is only the surface that job cannot see — that the COPY sources resolve
-  # against a repo-root build context, that the base image carries what the
-  # installer needs, and that in_container() is true during a build layer.
-  #
-  # AC4 ("no new background egress from the image") needs no assertions here.
-  # Because the Dockerfile names container=docker, install-chrome.sh takes its
-  # in_container() branch and itself iterates PHONE_HOME_PATHS and exits 1 on any
-  # survivor before the layer can commit. A successful build IS that assertion,
-  # which is why this job does not carry a third copy of the path list — the two
-  # that exist have already drifted once.
+  # be closed on an assertion nobody re-checks.
   devcontainer-image:
-    # Gated on the same two arms as install-chrome-e2e, and for the same reason:
-    # it needs live egress to Google's apt repo and it downloads a browser. The
-    # image changes far less often than the code, so paying that on every PR
-    # would buy very little.
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: devcontainer-changes
+    # Three arms. workflow_dispatch and push-to-main are the original two, kept
+    # for the same reason install-chrome-e2e has them: live egress to Google's
+    # apt repo and a browser download, against an image that changes far less
+    # often than the code. The third arm builds the image on a PR that actually
+    # touches it, so a broken image is caught before merge rather than on main.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || (github.event_name == 'pull_request' && needs.devcontainer-changes.outputs.changed == 'true')
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     # Restated at job level for the reason install-chrome-e2e states it: this
     # job pulls a base image and installs a browser from a third-party repo, so
     # it is a place a future widening of the workflow-level default must not
@@ -352,9 +392,9 @@ jobs:
       # to the StepSecurity dashboard without enforcing an allowlist. Flip to
       # 'block' with an allowed-endpoints list once telemetry confirms the set.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
-      # devcontainer-image / integration-tests / test. harden-runner is a SHA-pinned
-      # security control: bump ALL SIX copies in lockstep — a missed copy silently
-      # leaves a job on a stale pin.
+      # devcontainer-changes / devcontainer-image / integration-tests / test.
+      # harden-runner is a SHA-pinned security control: bump ALL SEVEN copies in
+      # lockstep — a missed copy silently leaves a job on a stale pin.
       #
       # disable-sudo is NOT set here, unlike preflight-selftest: `docker build`
       # on a GitHub runner reaches the daemon through the docker group, but the
@@ -369,54 +409,111 @@ jobs:
         with:
           persist-credentials: false
 
-      # `.` as the context, not `.devcontainer`: the Dockerfile copies out of
-      # test/, which is exactly what devcontainer.json's "context": ".." arranges
-      # for a real devcontainer build. Building it any other way here would pass
-      # while the thing developers actually run fails.
-      - name: Build the devcontainer image
-        run: docker build -f .devcontainer/Dockerfile -t vespasian-devcontainer:ci .
-
-      # The image intentionally does not keep the installer or the assertions —
-      # the Dockerfile removes its staging directory — so mount the repo and run
-      # the committed assertion script against the browser the image shipped.
-      # Reusing assert-chrome-install.sh rather than restating it is the point:
-      # it is the same script install-chrome-e2e runs, so the two cannot disagree
-      # about what "a runnable browser" means.
+      # Built through devcontainer.json, not around it. A raw `docker build -f
+      # .devcontainer/Dockerfile . ` re-specifies the build by hand, so the file
+      # every developer's "Reopen in Container" actually consumes is never
+      # parsed: its "context": "..", its containerEnv, its runArgs and its
+      # remoteUser were all unasserted, and breaking any of them changed no
+      # signal in this repository. Driving the CLI means the thing under test is
+      # the thing developers run.
       #
-      # Mounted read-only, and the base image's default user is root, which is
-      # why. Nothing either container runs writes in-tree — the assertion script
-      # only reads, execs and greps, and `go test` writes to GOCACHE and TMPDIR
-      # inside the container, not the source tree — so :ro costs nothing and
-      # closes the door on a root-owned file landing in the runner workspace if a
-      # future step here does start writing.
-      - name: Assert the image ships a runnable browser
-        run: docker run --rm -v "$PWD:/repo:ro" -w /repo vespasian-devcontainer:ci ./test/assert-chrome-install.sh
-
-      # LookPath is what go-rod actually calls, and it resolves on existence plus
-      # the executable bit alone — a snap stub satisfies it. Asserting the Go
-      # side agrees with the shell side is therefore not redundant with the step
-      # above: together they say the binary both resolves the way pkg/crawl
-      # resolves it and starts.
-      #
-      # The PASS grep is the point of the step, not decoration. This test SKIPS
-      # when launcher.LookPath() finds nothing, and `go test` exits 0 on a skip —
-      # so without the grep the one assertion AC1 is actually worded around
-      # ("launcher.LookPath() resolves it") could vanish and leave the job green.
-      # The step above cannot cover that: it resolves the browser through
-      # common.sh's CHROME_CANDIDATES, which is a DIFFERENT list from go-rod's, so
-      # a browser only one of them can see passes there and skips here.
-      - name: Assert launcher.LookPath resolves the installed browser
+      # The build log is captured because a successful build is AC4's only
+      # proof: `container=docker` on the Dockerfile's RUN is what makes
+      # install-chrome.sh take its in_container() branch, and that branch is the
+      # one that removes AND verifies-absent the package's phone-home artifacts.
+      # The marker below is emitted only on that arm — the non-container arm
+      # prints "No temporary apt artifacts left behind" instead — so grepping for
+      # it is what distinguishes "the audit ran and passed" from "the audit never
+      # ran".
+      - name: Build the devcontainer image (through devcontainer.json)
         run: |
           set -euo pipefail
-          out=$(docker run --rm -v "$PWD:/repo:ro" -w /repo vespasian-devcontainer:ci \
-            go test -tags integration -run TestConfigureLauncher_PinsSystemBrowser -v ./pkg/crawl 2>&1) || {
-            printf '%s\n' "$out"
-            echo "LookPath assertion failed" >&2
-            exit 1
-          }
-          printf '%s\n' "$out"
-          printf '%s' "$out" | grep -q -- "--- PASS: TestConfigureLauncher_PinsSystemBrowser" \
-            || { echo "test did not run (skipped?) — launcher.LookPath found no browser in the image" >&2; exit 1; }
+          npx --yes @devcontainers/cli@0.88.0 build \
+            --workspace-folder . \
+            --image-name vespasian-devcontainer:ci \
+            --log-level info 2>&1 | tee /tmp/devcontainer-build.log
+          grep -qF 'No Google apt source, keyring, or update pinger left behind' /tmp/devcontainer-build.log \
+            || { echo "install-chrome.sh did not take its in_container() branch during the build — AC4's verify-absent pass never ran" >&2; exit 1; }
+
+      # `up` rather than `run`: this creates the container the way a developer
+      # gets it — containerEnv (VESPASIAN_NO_SANDBOX), runArgs (--shm-size=1g),
+      # remoteUser (vscode), and the onCreateCommand that installs the live
+      # suite's spec-validator deps. Every `devcontainer exec` below therefore
+      # runs as vscode with that environment, instead of as root with none of
+      # it, which is what the raw `docker run` steps used to do.
+      - name: Start the devcontainer
+        run: |
+          set -euo pipefail
+          npx --yes @devcontainers/cli@0.88.0 up --workspace-folder . 2>&1 | tee /tmp/devcontainer-up.log
+
+      # Reuses the committed assertion script rather than restating it: this is
+      # the same script install-chrome-e2e runs, so the two cannot disagree about
+      # what "a runnable browser" means.
+      - name: Assert the image ships a runnable browser
+        run: npx --yes @devcontainers/cli@0.88.0 exec --workspace-folder . bash test/assert-chrome-install.sh
+
+      # The Go side. Committed as a script for the reason its header gives: an
+      # inline block is not a file, so `bash -n` cannot see it and a syntax error
+      # in one first surfaces on main.
+      - name: Assert launcher.LookPath resolves and the browser launches
+        run: npx --yes @devcontainers/cli@0.88.0 exec --workspace-folder . bash test/assert-devcontainer-lookpath.sh
+
+      # The image is only useful if the suites the repo tells contributors to run
+      # actually run in it. Asserting the tool list in prose is what let the
+      # image ship without yq: test-runner-args.sh routes to fail() rather than
+      # skip() when yq is missing, so a yq-less image reported 8 failures from a
+      # suite CONTRIBUTING.md tells every contributor to run. These two suites
+      # exercise python3, yq and the spec-validator deps between them, so a
+      # missing prerequisite fails here instead of in a developer's terminal.
+      - name: Assert the image can run the guard suites
+        run: |
+          set -euo pipefail
+          npx --yes @devcontainers/cli@0.88.0 exec --workspace-folder . bash test/test-runner-args.sh
+          npx --yes @devcontainers/cli@0.88.0 exec --workspace-folder . bash test/preflight-selftest.sh
+
+  # Build-only arm64 leg. The Dockerfile's header, devcontainer.json's premise and
+  # the PR that added them all commit to arm64 working, and the base image index
+  # does carry linux/arm64 — but only linux/amd64 was ever built, so the claim
+  # rested on registry inspection rather than on a build. No run steps: QEMU
+  # emulation is too slow to drive a browser through, and the failure this guards
+  # against is the layer not building at all (an arch-specific apt resolution, or
+  # the yq pin's arm64 digest going stale).
+  devcontainer-image-arm64:
+    needs: devcontainer-changes
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || (github.event_name == 'pull_request' && needs.devcontainer-changes.outputs.changed == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      # No harden-runner: this job's whole purpose is QEMU-emulated cross-build,
+      # and binfmt registration mutates the runner in ways the action's audit
+      # mode reports as anomalies without adding signal. It runs no repo code —
+      # it builds and discards.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392  # v3.6.0
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435  # v3.11.1
+
+      # Same context the devcontainer build uses (repo root), for the same
+      # reason: the Dockerfile COPYs out of test/.
+      - name: Build the devcontainer image for linux/arm64
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/arm64 \
+            -f .devcontainer/Dockerfile \
+            --progress=plain \
+            . 2>&1 | tee /tmp/devcontainer-arm64.log
+          grep -qF 'No Google apt source, keyring, or update pinger left behind' /tmp/devcontainer-arm64.log \
+            || { echo "arm64 build did not take install-chrome.sh's in_container() branch" >&2; exit 1; }
   # Gate: run by default; skip PR runs only when 'skip-live-tests' label is present.
   # Push-to-main and workflow_dispatch always run.
   check-label:
@@ -475,9 +572,9 @@ jobs:
       # Defense-in-depth (LAB-4732): monitor and record all
       # outbound network traffic. Audit mode is non-blocking.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
-      # devcontainer-image / integration-tests / test. harden-runner is a SHA-pinned
-      # security control: bump ALL SIX copies in lockstep — a missed copy silently
-      # leaves a job on a stale pin.
+      # devcontainer-changes / devcontainer-image / integration-tests / test.
+      # harden-runner is a SHA-pinned security control: bump ALL SEVEN copies in
+      # lockstep — a missed copy silently leaves a job on a stale pin.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -538,9 +635,9 @@ jobs:
       # (expected: github.com, proxy.golang.org, sum.golang.org,
       # storage.googleapis.com, objects.githubusercontent.com, registry.npmjs.org).
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
-      # devcontainer-image / integration-tests / test. harden-runner is a SHA-pinned
-      # security control: bump ALL SIX copies in lockstep — a missed copy silently
-      # leaves a job on a stale pin.
+      # devcontainer-changes / devcontainer-image / integration-tests / test.
+      # harden-runner is a SHA-pinned security control: bump ALL SEVEN copies in
+      # lockstep — a missed copy silently leaves a job on a stale pin.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:

@@ -13,7 +13,9 @@
 # 1.25.8, which matters because GOTOOLCHAIN=local means Go will NOT fetch a
 # newer toolchain), ca-certificates/curl/gnupg, the non-root `vscode` user with
 # sudo, git, and Node (needed by the graphql-server target and
-# test/spec-validators). It builds as root, so install-chrome.sh resolves
+# test/spec-validators; their npm deps are installed by devcontainer.json's
+# onCreateCommand, not here — see the note there). It builds as root, so
+# install-chrome.sh resolves
 # SUDO="" and takes its privileged branches directly, exactly as the
 # install-chrome-e2e job does. Multi-arch: the index carries linux/amd64 and
 # linux/arm64, and Google publishes google-chrome-stable for both
@@ -21,13 +23,43 @@
 # Silicon build is not a dead end.
 FROM mcr.microsoft.com/devcontainers/go:1.25-bookworm@sha256:30cbde1de62f190904446d8b81dcfd0befcfd60889419edb8872d598be9632cc
 
-# python3 is the one hard prerequisite the base image lacks — its baked-in
-# devcontainer features are common-utils, git, go and node only. It is not
-# optional: setup-live-targets.sh's preflight fails outright without it, and
-# test/validate.sh and `make check-docs` both shell to it.
+# python3 and yq are the two hard prerequisites the base image lacks. Its
+# baked-in devcontainer features are common-utils, git, go and node only —
+# confirmed from the image's own `devcontainer.metadata` label, not assumed.
+#
+# python3 is not optional: setup-live-targets.sh's preflight fails outright
+# without it, and test/validate.sh and `make check-docs` both shell to it.
+#
+# yq is not optional either, and it is the one this image previously missed:
+# test/test-runner-args.sh answers structural questions about live-tests.yml
+# through it and routes to fail() — not skip() — when it is absent, so a
+# fresh devcontainer without it reports 8 failures from one of the four guard
+# suites the repo tells contributors to run. Measured by forcing that guard's
+# absent arm: 127 passed, 8 failed, and the assertion-count pin correctly does
+# NOT fire, so the failure is honest rather than an accounting artefact.
 RUN apt-get update -qq \
     && apt-get install -y --no-install-recommends python3 \
     && rm -rf /var/lib/apt/lists/*
+
+# Debian's `yq` package is a DIFFERENT tool (a Python wrapper around jq) whose
+# CLI does not accept the `-o=json -I=0` form the guard suite uses, so this is
+# the upstream Go binary rather than an apt install. Pinned by SHA-256 for both
+# architectures the base image index carries, and the architecture is resolved
+# at build time so an arm64 build gets the arm64 binary. Same posture as the
+# Chrome installer's fingerprint pin: a binary fetched over TLS alone is not
+# verified. Refresh version and BOTH digests together, deliberately.
+RUN set -eu; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) sha=0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb ;; \
+      arm64) sha=b7f7c991abe262b0c6f96bbcb362f8b35429cefd59c8b4c2daa4811f1e9df599 ;; \
+      *) echo "unsupported architecture for the yq pin: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/mikefarah/yq/releases/download/v4.47.1/yq_linux_${arch}" \
+      -o /usr/local/bin/yq; \
+    printf '%s  %s\n' "$sha" /usr/local/bin/yq | sha256sum -c -; \
+    chmod 0755 /usr/local/bin/yq; \
+    yq --version
 
 # Both files into the SAME directory, and that is not stylistic: install-chrome.sh
 # derives SCRIPT_DIR from its own dirname and sources common.sh from there, so

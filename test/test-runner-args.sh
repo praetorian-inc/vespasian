@@ -1686,7 +1686,18 @@ if [[ -f "$WORKFLOW" ]]; then
         if [[ -z "$e2e_block" ]]; then
         fail "could not extract the install-chrome-e2e job block (extraction broken — the assertions below would be vacuous)"
         else
-        if printf '%s\n' "$e2e_block" | grep -qE 'run:[[:space:]]*(\./|bash )?test/install-chrome\.sh'; then
+        # Strip comments BEFORE any content grep below. extract_job_block stops at
+        # the next `^  <name>:` line, and a comment line begins `  #`, which does
+        # not match that terminator — so a job's extracted block runs on to the
+        # last comment line preceding the NEXT job key. The devcontainer jobs
+        # added a long preamble immediately after this one, which widened this
+        # block by those comment lines. Grepping the raw block would then let a
+        # sentence in a FOREIGN job's preamble satisfy an assertion about THIS
+        # job's steps: quote `run: ./test/install-chrome.sh` in a comment down
+        # there, delete the real step, and the guard passes vacuously. Only the
+        # step-list greps further down used to strip; these two did not.
+        e2e_runlines=$(printf '%s\n' "$e2e_block" | grep -vE '^[[:space:]]*#')
+        if printf '%s\n' "$e2e_runlines" | grep -qE 'run:[[:space:]]*(\./|bash )?test/install-chrome\.sh'; then
             pass "install-chrome-e2e still invokes test/install-chrome.sh end-to-end"
         else
             fail "install-chrome-e2e no longer runs test/install-chrome.sh — the privileged path is uncovered"
@@ -1700,8 +1711,8 @@ if [[ -f "$WORKFLOW" ]]; then
         # every other check in this file green while the installer's
         # privileged path silently loses all coverage. Pin the gate's
         # content, not just its absence — require both trigger arms by name.
-        if printf '%s\n' "$e2e_block" | grep -qE '^[[:space:]]*if:.*workflow_dispatch' \
-           && printf '%s\n' "$e2e_block" | grep -qE '^[[:space:]]*if:.*refs/heads/main'; then
+        if printf '%s\n' "$e2e_runlines" | grep -qE '^[[:space:]]*if:.*workflow_dispatch' \
+           && printf '%s\n' "$e2e_runlines" | grep -qE '^[[:space:]]*if:.*refs/heads/main'; then
             pass "install-chrome-e2e's if: gate still names both the workflow_dispatch and push-to-main arms"
         else
             fail "install-chrome-e2e's if: gate no longer names both trigger arms — the opt-in gate may have been narrowed or disabled, silently dropping the installer's only privileged-path coverage"
@@ -1714,7 +1725,7 @@ if [[ -f "$WORKFLOW" ]]; then
         # checks above green with no other signal. Require the verification
         # steps explicitly, and reject the same continue-on-error escape hatch
         # the preflight-selftest block above rejects.
-        e2e_runlines=$(printf '%s\n' "$e2e_block" | grep -vE '^[[:space:]]*#')
+        # (e2e_runlines is computed above, before the first content grep.)
         # Every CONTAINER job that uses bash in an inline `run:` must declare
         # `shell: bash`. The runner does NOT default a container job's `run:` to
         # bash — it uses `sh -e {0}` — so `set -euo pipefail` in an inline block
@@ -2201,8 +2212,203 @@ fi
 SUITE_COMPLETED=1
 
 echo ""
-echo "=== Summary ==="
-echo "  $PASS passed, $FAIL failed, $SKIP skipped"
+
+# ── devcontainer-image: the wiring that closes LAB-5064 AC1 ────────────────────
+#
+# The devcontainer job is the sole automated check that .devcontainer/ still
+# builds and still ships a browser the Go side can resolve and drive. It sits in
+# exactly the position install-chrome-e2e sits in and had none of the pins that
+# job has: measured on PR #228, deleting its whole LookPath assertion step left
+# this suite at 135/135 exit 0 and every other check in the repo green.
+if [[ -f "$WORKFLOW" ]]; then
+    if grep -qE '^  devcontainer-image:' "$WORKFLOW"; then
+        pass "devcontainer-image job still defined (the devcontainer wiring has automated coverage)"
+        dc_block=$(extract_job_block devcontainer-image)
+        if [[ -z "$dc_block" ]]; then
+            fail "could not extract the devcontainer-image job block (extraction broken — the assertions below would be vacuous)"
+        else
+            dc_runlines=$(printf '%s\n' "$dc_block" | grep -vE '^[[:space:]]*#')
+
+            # Built THROUGH devcontainer.json, not around it. A raw
+            # `docker build -f .devcontainer/Dockerfile` re-specifies the build by
+            # hand, so devcontainer.json's context, containerEnv, runArgs and
+            # remoteUser go unparsed and unasserted — breaking any of them changed
+            # no signal anywhere in this repo.
+            # Backslash-continuations are joined first: the invocation spans
+            # several lines, so a per-line grep for "build ... --workspace-folder"
+            # can never match it. Safe here because these are `grep -q`
+            # existence tests — joining before a `grep -c` is what silently
+            # broke a count elsewhere in this repo's history, and that is a
+            # different operation.
+            dc_joined=$(printf '%s\n' "$dc_runlines" | sed -e ':a' -e '/\\$/{N; s/\\\n[[:space:]]*//; ta}')
+            if printf '%s\n' "$dc_joined" | grep -qE '@devcontainers/cli@[0-9]' \
+               && printf '%s\n' "$dc_joined" | grep -qE 'build[[:space:]].*--workspace-folder'; then
+                pass "devcontainer-image builds through devcontainer.json (@devcontainers/cli, pinned, --workspace-folder)"
+            else
+                fail "devcontainer-image no longer builds through devcontainer.json — a hand-written docker build leaves the file developers actually use unparsed and unasserted"
+            fi
+
+            # A successful build is AC4's only proof, and only the in_container()
+            # arm emits this marker; the other arm prints "No temporary apt
+            # artifacts left behind". Without the grep the build can suppress the
+            # phone-home artifacts without ever confirming their absence.
+            if printf '%s\n' "$dc_runlines" | grep -qF 'No Google apt source, keyring, or update pinger left behind'; then
+                pass "devcontainer-image asserts install-chrome.sh took its in_container() branch (AC4's verify-absent pass ran)"
+            else
+                fail "devcontainer-image no longer greps the in_container() marker — the build could suppress phone-home artifacts without verifying their absence, and AC4 becomes an assumption"
+            fi
+
+            # Both committed assertion scripts must still be invoked. They are
+            # committed rather than inline precisely so the un-gated `bash -n`
+            # step can see them; dropping the invocation leaves the file present
+            # and syntactically fine while nothing runs it.
+            for dc_script in assert-chrome-install.sh assert-devcontainer-lookpath.sh; do
+                if printf '%s\n' "$dc_runlines" | grep -qE "test/${dc_script//./\\.}"; then
+                    pass "devcontainer-image still invokes test/${dc_script}"
+                else
+                    fail "devcontainer-image no longer invokes test/${dc_script} — that assertion is not run against the built image"
+                fi
+            done
+
+            # The image is only useful if the suites the repo tells contributors
+            # to run actually run in it. This is what caught the missing yq.
+            if printf '%s\n' "$dc_runlines" | grep -qE 'test/test-runner-args\.sh'; then
+                pass "devcontainer-image runs a guard suite inside the image (prerequisites are asserted by execution, not by prose)"
+            else
+                fail "devcontainer-image no longer runs a guard suite inside the image — a missing prerequisite (python3, yq, spec-validator deps) would surface in a developer's terminal instead of in CI"
+            fi
+
+            # Same three neutering shapes the preflight-selftest and
+            # install-chrome-e2e blocks reject for themselves.
+            if printf '%s\n' "$dc_runlines" | grep -qE '^[[:space:]]*continue-on-error:[[:space:]]*true'; then
+                fail "devcontainer-image sets continue-on-error: true — a failing image build would not fail CI"
+            else
+                pass "devcontainer-image has no continue-on-error: true"
+            fi
+            if printf '%s\n' "$dc_runlines" | grep -qE '\|\|[[:space:]]*(true|exit 0|:)([[:space:]]|$)'; then
+                fail "devcontainer-image neuters a step with a trailing '|| true'/'|| exit 0'/'|| :'"
+            else
+                pass "devcontainer-image has no trailing '|| true'/'|| exit 0'/'|| :' step neutering"
+            fi
+
+            # The gate. Three arms now: the original opt-in pair, plus the
+            # pull_request arm that builds the image before merge when the PR
+            # actually touches it. Losing the third arm silently restores the
+            # state where .devcontainer/ merges unverified and breaks on main.
+            if printf '%s\n' "$dc_runlines" | grep -qE '^[[:space:]]*(if:|\|\|)?.*workflow_dispatch' \
+               && printf '%s\n' "$dc_runlines" | grep -qE 'refs/heads/main' \
+               && printf '%s\n' "$dc_runlines" | grep -qE 'pull_request'; then
+                pass "devcontainer-image's if: gate still names all three arms (workflow_dispatch, push-to-main, and the paths-filtered pull_request)"
+            else
+                fail "devcontainer-image's if: gate no longer names all three arms — losing the pull_request arm means .devcontainer/ merges unverified again"
+            fi
+        fi
+    else
+        fail "devcontainer-image job is gone from live-tests.yml — nothing builds .devcontainer/Dockerfile, and LAB-5064's AC1 wiring can rot invisibly"
+    fi
+
+    # The paths filter the pull_request arm depends on. Without this job the
+    # third arm above evaluates against an undefined output and never fires.
+    if grep -qE '^  devcontainer-changes:' "$WORKFLOW"; then
+        pass "devcontainer-changes job still defined (the pull_request arm has a filter to gate on)"
+    else
+        fail "devcontainer-changes job is gone — devcontainer-image's pull_request arm gates on an undefined output and can never fire"
+    fi
+fi
+
+# ── harden-runner: count and pin, not just prose ───────────────────────────────
+#
+# The lockstep comment states its own failure mode ("bump ALL SEVEN copies in
+# lockstep — a missed copy silently leaves a job on a stale pin") and nothing
+# computed either half. Measured on PR #228: deleting one harden-runner step left
+# six comments claiming seven beside six actual steps, with every check green.
+if [[ -f "$WORKFLOW" ]]; then
+    hr_steps=$(grep -cE '^[[:space:]]*uses:[[:space:]]*step-security/harden-runner@' "$WORKFLOW")
+    hr_word=$(grep -oE 'bump ALL [A-Z]+ copies' "$WORKFLOW" | head -1 | awk '{print $3}')
+    declare -A hr_numbers=( [ONE]=1 [TWO]=2 [THREE]=3 [FOUR]=4 [FIVE]=5 [SIX]=6 [SEVEN]=7 [EIGHT]=8 [NINE]=9 [TEN]=10 )
+    hr_claimed=${hr_numbers[${hr_word:-NONE}]:-}
+    if [[ -z "$hr_claimed" ]]; then
+        fail "could not read the harden-runner lockstep comment's number-word from ${WORKFLOW} (the count check below would be vacuous) — got '${hr_word:-<none>}'"
+    elif [[ "$hr_steps" -eq "$hr_claimed" ]]; then
+        pass "harden-runner step count ($hr_steps) matches the lockstep comment's claim ($hr_word)"
+    else
+        fail "harden-runner drift: ${hr_steps} step(s) present but the lockstep comment claims ${hr_word} (${hr_claimed}) — a job gained or lost the control without the comment moving"
+    fi
+
+    # Every copy of the comment must claim the same number, or bumping "one" of
+    # them is meaningless.
+    hr_word_variants=$(grep -oE 'bump ALL [A-Z]+ copies' "$WORKFLOW" | sort -u | wc -l | tr -d ' ')
+    if [[ "$hr_word_variants" -eq 1 ]]; then
+        pass "all harden-runner lockstep comments claim the same count"
+    else
+        fail "the harden-runner lockstep comment disagrees with itself across copies (${hr_word_variants} distinct claims) — at least one was updated and the rest were not"
+    fi
+
+    # The pin itself. Counting copies says nothing about whether they agree on a
+    # SHA, which is the property the comment actually cares about. ci.yml carries
+    # its own copy and is included deliberately: a partial bump across files is
+    # the same defect across a file boundary.
+    hr_shas=$(grep -rhoE 'step-security/harden-runner@[0-9a-f]{40}' "$WORKFLOW" "$(dirname "$WORKFLOW")/ci.yml" 2>/dev/null | sort -u)
+    hr_sha_count=$(printf '%s\n' "$hr_shas" | grep -c . || true)
+    if [[ "$hr_sha_count" -eq 0 ]]; then
+        fail "found no SHA-pinned harden-runner uses at all (the pin-uniformity check would be vacuous) — is the action still SHA-pinned?"
+    elif [[ "$hr_sha_count" -eq 1 ]]; then
+        pass "every harden-runner copy across live-tests.yml and ci.yml pins the same SHA"
+    else
+        fail "harden-runner copies pin ${hr_sha_count} DIFFERENT SHAs — a bump missed at least one copy, leaving a job on a stale pin: $(printf '%s ' $hr_shas)"
+    fi
+fi
+
+# ── .devcontainer/Dockerfile: the COPY sources must exist ──────────────────────
+#
+# The Dockerfile hardcodes repo-relative paths that only `docker build` resolves,
+# and that build is gated. Renaming test/common.sh would leave every un-gated
+# check green and break the image — the exact failure the Dockerfile's own
+# comment warns about ("copying the installer alone fails at `source`").
+DEVCONTAINER_DOCKERFILE="$SCRIPT_DIR/../.devcontainer/Dockerfile"
+if [[ -f "$DEVCONTAINER_DOCKERFILE" ]]; then
+    copy_sources=$(grep -oE '^COPY[[:space:]]+.*[[:space:]]/' "$DEVCONTAINER_DOCKERFILE" \
+        | sed -E 's/^COPY[[:space:]]+//; s/[[:space:]]+\/[^[:space:]]*$//' | tr ' ' '\n' | grep -E '^test/' || true)
+    if [[ -z "$copy_sources" ]]; then
+        fail "could not derive any COPY source from .devcontainer/Dockerfile — the existence assertion below would be vacuous"
+    else
+        copy_missing=""
+        while IFS= read -r src; do
+            [[ -z "$src" ]] && continue
+            [[ -f "$SCRIPT_DIR/../$src" ]] || copy_missing="${copy_missing} ${src}"
+        done <<< "$copy_sources"
+        if [[ -z "$copy_missing" ]]; then
+            pass "every path .devcontainer/Dockerfile COPYs exists ($(printf '%s' "$copy_sources" | grep -c .) checked)"
+        else
+            fail ".devcontainer/Dockerfile COPYs path(s) that do not exist:${copy_missing} — the image build fails and no un-gated check can see it"
+        fi
+    fi
+else
+    fail ".devcontainer/Dockerfile not found — the devcontainer wiring assertions above are vacuous"
+fi
+
+# ── VESPASIAN_TEST_ROOT stays a test-only seam ─────────────────────────────────
+#
+# test/README.md states, absolutely, that no production caller sets it, and the
+# variable feeds root-privileged writes. AGENTS.md's own convention is that a
+# comment claiming a state cannot occur must cite a test; this is that test.
+tr_setters=""
+for tr_caller in "$SCRIPT_DIR/install-chrome.sh" "$SCRIPT_DIR/setup-live-targets.sh" \
+                 "$SCRIPT_DIR/../.devcontainer/Dockerfile" "$WORKFLOW" \
+                 "$(dirname "$WORKFLOW")/ci.yml"; do
+    [[ -f "$tr_caller" ]] || continue
+    # An assignment or export, not a mere mention: install-chrome.sh READS the
+    # variable by design, and its selftest sets it, which is the point of the seam.
+    if grep -qE '(^|[[:space:];&|])(export[[:space:]]+)?VESPASIAN_TEST_ROOT=' "$tr_caller"; then
+        tr_setters="${tr_setters} $(basename "$tr_caller")"
+    fi
+done
+if [[ -z "$tr_setters" ]]; then
+    pass "no production caller sets VESPASIAN_TEST_ROOT (install-chrome.sh, setup-live-targets.sh, .devcontainer/Dockerfile, live-tests.yml, ci.yml)"
+else
+    fail "VESPASIAN_TEST_ROOT is set by production caller(s):${tr_setters} — it reroots root-privileged writes and test/README.md states no production caller sets it"
+fi
+
 # Both sibling suites pin their assertion total; this one did not, so
 # deleting a case reduced coverage in silence — every remaining assertion still
 # passed and the suite still exited 0.
@@ -2268,7 +2474,31 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # install-chrome-e2e ever executed — lost two steps to `set -euo pipefail` dying
 # on line 1. Nothing could have caught it: an inline block is not a file, so
 # `bash -n` never sees it, and the job is opt-in, so no PR run exercised it.
-EXPECTED_ASSERTIONS=135
+
+echo "=== Summary ==="
+echo "  $PASS passed, $FAIL failed, $SKIP skipped"
+# PR #228 review: 134 -> 135 was the container-shell check (above). 135 -> 150.
+# MEASURED. +15, all from defects the PR #228 review found by MUTATION rather
+# than by reading, each one having survived every check in the repo:
+#   +9  devcontainer-image, which had none of the pins install-chrome-e2e has:
+#       job present, builds THROUGH devcontainer.json, greps the in_container()
+#       marker, invokes both committed assertion scripts, runs a guard suite in
+#       the image, no continue-on-error, no trailing '|| true', and an if: gate
+#       naming all three arms. Deleting its entire LookPath step left this suite
+#       at 135/135 exit 0.
+#   +1  devcontainer-changes, the filter the pull_request arm gates on.
+#   +3  harden-runner: step count vs the lockstep comment's number-word, the
+#       comment agreeing with itself across copies, and — the property the
+#       comment actually cares about and nothing checked — every copy pinning
+#       the SAME sha, across live-tests.yml AND ci.yml. Deleting one step left
+#       six comments claiming SIX beside five steps, all green.
+#   +1  .devcontainer/Dockerfile's COPY sources exist. Only `docker build`
+#       resolves them and that build is gated, so renaming test/common.sh broke
+#       the image with every un-gated check green.
+#   +1  no production caller sets VESPASIAN_TEST_ROOT — test/README.md states it
+#       absolutely, the variable feeds root-privileged writes, and AGENTS.md's
+#       own convention says such a claim must cite a test. This is that test.
+EXPECTED_ASSERTIONS=150
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
