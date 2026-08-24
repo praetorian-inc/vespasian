@@ -2344,6 +2344,35 @@ if [[ -f "$WORKFLOW" ]]; then
         fail "the harden-runner lockstep comment disagrees with itself across copies (${hr_word_variants} distinct claims) — at least one was updated and the rest were not"
     fi
 
+    # AGENTS.md states the non-container job count in prose, and prose is what
+    # went stale twice: it said "the six non-container jobs" when seven were
+    # non-container, was corrected to "eight", and was wrong again the moment a
+    # tenth job landed. Derive both numbers and compare, so the third recurrence
+    # is a failing assertion rather than a review finding.
+    agents_md="$SCRIPT_DIR/../AGENTS.md"
+    if [[ -f "$agents_md" ]]; then
+        # A job declares `container:` at job level; everything else is non-container.
+        nc_actual=$(yq_query '[.jobs[] | select(has("container") | not)] | length' -o=json -I=0)
+        nc_word=$(grep -oE '(One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten) of the (one|two|three|four|five|six|seven|eight|nine|ten) non-container jobs' "$agents_md" | head -1 | awk '{print $4}')
+        declare -A nc_numbers=( [one]=1 [two]=2 [three]=3 [four]=4 [five]=5 [six]=6 [seven]=7 [eight]=8 [nine]=9 [ten]=10 )
+        nc_claimed=${nc_numbers[${nc_word:-none}]:-}
+        case "$nc_actual" in
+            __NO_YQ__) fail_no_yq "the non-container job count" ;;
+            __YQ_ERROR__) fail_yq_error "the non-container job count" ;;
+            *)
+                if [[ -z "$nc_claimed" ]]; then
+                    fail "could not read AGENTS.md's non-container job count claim (the comparison below would be vacuous) — got '${nc_word:-<none>}'"
+                elif [[ "$nc_actual" -eq "$nc_claimed" ]]; then
+                    pass "AGENTS.md's non-container job count ($nc_word) matches live-tests.yml ($nc_actual)"
+                else
+                    fail "AGENTS.md claims ${nc_word} (${nc_claimed}) non-container jobs but live-tests.yml has ${nc_actual} — the prose went stale when a job was added or gained a container:"
+                fi
+                ;;
+        esac
+    else
+        fail "AGENTS.md not found — its job-count claim cannot be checked"
+    fi
+
     # The pin itself. Counting copies says nothing about whether they agree on a
     # SHA, which is the property the comment actually cares about. ci.yml carries
     # its own copy and is included deliberately: a partial bump across files is
@@ -2495,7 +2524,7 @@ fi
 echo "=== Summary ==="
 echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # PR #228 review: 134 -> 135 was the container-shell check (above). 135 -> 150.
-# MEASURED. +16, all from defects the PR #228 review found by MUTATION rather
+# MEASURED. +17, all from defects the PR #228 review found by MUTATION rather
 # than by reading, each one having survived every check in the repo:
 #   +9  devcontainer-image, which had none of the pins install-chrome-e2e has:
 #       job present, builds THROUGH devcontainer.json, greps the in_container()
@@ -2504,6 +2533,10 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       naming all three arms. Deleting its entire LookPath step left this suite
 #       at 135/135 exit 0.
 #   +1  devcontainer-changes, the filter the pull_request arm gates on.
+#   +1  AGENTS.md's non-container job count vs live-tests.yml, derived on both
+#       sides. The prose said "six" when seven were non-container, was corrected
+#       to "eight", and went stale again the moment a tenth job landed — three
+#       occurrences of one defect, so it is now an assertion.
 #   +3  harden-runner: step count vs the lockstep comment's number-word, the
 #       comment agreeing with itself across copies, and — the property the
 #       comment actually cares about and nothing checked — every copy pinning
@@ -2518,7 +2551,7 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #   +1  no production caller sets VESPASIAN_TEST_ROOT — test/README.md states it
 #       absolutely, the variable feeds root-privileged writes, and AGENTS.md's
 #       own convention says such a claim must cite a test. This is that test.
-EXPECTED_ASSERTIONS=151
+EXPECTED_ASSERTIONS=152
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
