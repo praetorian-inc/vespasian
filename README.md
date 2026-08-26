@@ -584,7 +584,7 @@ When analyzing JavaScript bundles served by an attacker-controlled application, 
 
 ### Prerequisites
 
-- [Go 1.24+](https://go.dev/dl/)
+- [Go 1.27.0+](https://go.dev/dl/)
 - [golangci-lint](https://golangci-lint.run/welcome/install/)
 
 ### Build and Test

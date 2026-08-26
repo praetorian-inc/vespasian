@@ -53,10 +53,10 @@ No CLA or DCO sign-off is required to contribute.
 
 ### Prerequisites
 
-- **Go 1.25.8+** — the version in `go.mod` is the source of truth, and CI reads it from there
-- **golangci-lint v2.12.2** — pin this version to match CI:
+- **Go 1.27.0+** — the version in `go.mod` is the source of truth, and CI reads it from there
+- **golangci-lint v2.13.1** — pin this version to match CI:
   ```bash
-  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.1
   ```
 - **CGO enabled** (`CGO_ENABLED=1`) — CI builds with it, so keep it on locally
 - **A real Chrome/Chromium** — only needed for headless crawling and the live test suite, not for unit tests
