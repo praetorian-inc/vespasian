@@ -86,7 +86,7 @@ coverage:
 # negatives by construction; the second check bounds the top end. `exit` in BEGIN still
 # runs END, hence the `bad` flag so END does not overwrite the status with its own.
 coverage-gate: coverage
-	@go tool cover -func=coverage.out | awk -v threshold=$(COVERAGE_THRESHOLD) 'BEGIN { seen = 0; bad = 0; if (threshold !~ /^[0-9]+(\.[0-9]+)?$$/) { printf "ERROR: COVERAGE_THRESHOLD \"%s\" is not a number\n", threshold; bad = 2; exit 2 } if (threshold + 0 > 100) { printf "ERROR: COVERAGE_THRESHOLD %s is outside 0..100\n", threshold; bad = 2; exit 2 } } /^total:/ { pct = $$NF; sub(/%/, "", pct); seen = 1; printf "total coverage %.1f%% (threshold %.1f%%)\n", pct, threshold; if (pct + 0 < threshold + 0) { printf "FAIL: coverage %.1f%% is below the %.1f%% threshold\n", pct, threshold; exit 1 } print "PASS: coverage meets the threshold" } END { if (bad) exit bad; if (!seen) { print "ERROR: no total: line in go tool cover output"; exit 2 } }'
+	@go tool cover -func=coverage.out | awk -v threshold='$(COVERAGE_THRESHOLD)' 'BEGIN { seen = 0; bad = 0; if (threshold !~ /^[0-9]+(\.[0-9]+)?$$/) { printf "ERROR: COVERAGE_THRESHOLD \"%s\" is not a number\n", threshold; bad = 2; exit 2 } if (threshold + 0 > 100) { printf "ERROR: COVERAGE_THRESHOLD %s is outside 0..100\n", threshold; bad = 2; exit 2 } } /^total:/ { pct = $$NF; sub(/%/, "", pct); seen = 1; printf "total coverage %.1f%% (threshold %.1f%%)\n", pct, threshold; if (pct + 0 < threshold + 0) { printf "FAIL: coverage %.1f%% is below the %.1f%% threshold\n", pct, threshold; exit 1 } print "PASS: coverage meets the threshold" } END { if (bad) exit bad; if (!seen) { print "ERROR: no total: line in go tool cover output"; exit 2 } }'
 
 deps:
 	go mod download
