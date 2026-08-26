@@ -12,10 +12,11 @@
 # install-chrome.sh requires and a devcontainer expects — Go 1.25.12 (>= go.mod's
 # 1.25.8, which matters because GOTOOLCHAIN=local means Go will NOT fetch a
 # newer toolchain), ca-certificates/curl/gnupg, the non-root `vscode` user with
-# sudo, git, and Node (needed by the graphql-server target and
-# test/spec-validators; their npm deps are installed by devcontainer.json's
-# onCreateCommand, not here — see the note there). It builds as root, so
-# install-chrome.sh resolves
+# sudo and git. It does NOT carry a usable Node: its metadata label lists the
+# node feature, but nvm's versions/ directory is empty, so node and npm are
+# installed below. Their npm deps come from devcontainer.json's onCreateCommand,
+# which cannot be a layer because the workspace is bind-mounted over it. It
+# builds as root, so install-chrome.sh resolves
 # SUDO="" and takes its privileged branches directly, exactly as the
 # install-chrome-e2e job does. Multi-arch: the index carries linux/amd64 and
 # linux/arm64, and Google publishes google-chrome-stable for both
@@ -66,38 +67,38 @@ RUN set -eu; \
     chmod 0755 /usr/local/bin/yq; \
     yq --version
 
-# Node reaches PATH only through nvm's profile hook, and several things that
-# need it never load a profile: devcontainer.json's onCreateCommand runs under
-# `/bin/sh -c`, and so does every `devcontainer exec`. MEASURED — the first CI
-# run of this job that reached container creation died with
-#   /bin/sh: 1: npm: not found
-#   onCreateCommand from devcontainer.json failed with exit code 127
-# even though the image declares PATH=/usr/local/share/nvm/current/bin and
-# NVM_DIR=/usr/local/share/nvm. A second attempt that resolved nvm inside the
-# onCreateCommand script failed the same way, so the runtime shell genuinely
-# cannot see it.
+# Node is NOT present in the base image, despite its devcontainer.metadata label
+# listing ghcr.io/devcontainers/features/node:1. MEASURED, from the build log of
+# the first run that got this far: /usr/local/share/nvm holds nvm's own source
+# checkout and its versions/ directory is EMPTY — there is no versions/node at
+# all. The feature set up nvm, PATH=$NVM_DIR/current/bin and
+# NVM_SYMLINK_CURRENT=true, but never installed a version, so `current` dangles
+# and nothing resolves node or npm at any point.
 #
-# Resolve it ONCE here instead, where the image's own PATH is in effect, and pin
-# the result into /usr/local/bin — on every PATH, no profile required. If it
-# cannot be resolved the BUILD fails, which is the right place to find out: the
-# alternative is every developer's container-create failing instead.
-RUN set -eu; \
+# That is why two earlier attempts failed: onCreateCommand died with
+# `/bin/sh: 1: npm: not found`, and resolving nvm inside the script hit the same
+# wall. The problem was never PATH or profile loading — the binary was absent.
+#
+# Install it here, pinned to the same major the CI jobs use (actions/setup-node
+# node-version: 20 at live-tests.yml:121 and :845), so the container and CI agree
+# on the Node that parses specs. bash, not /bin/sh: nvm requires bash and
+# Debian's sh is dash. The binaries are then symlinked into /usr/local/bin, which
+# is on every PATH, because onCreateCommand and every `devcontainer exec` run
+# under `/bin/sh -c` and load no profile.
+RUN bash -c 'set -euo pipefail; \
+    export NVM_DIR="${NVM_DIR:-/usr/local/share/nvm}"; \
+    [ -s "$NVM_DIR/nvm.sh" ] || { echo "FATAL: nvm not found at $NVM_DIR; the FROM changed" >&2; exit 1; }; \
+    . "$NVM_DIR/nvm.sh"; \
+    nvm install 20; \
+    nvm alias default 20; \
+    nvm use default; \
     for b in node npm npx; do \
-        p="$(command -v "$b" 2>/dev/null || true)"; \
-        if [ -z "$p" ]; then \
-            p="$(ls -d "${NVM_DIR:-/usr/local/share/nvm}"/versions/node/*/bin/"$b" 2>/dev/null | tail -1 || true)"; \
-        fi; \
-        if [ -z "$p" ] || [ ! -x "$p" ]; then \
-            echo "FATAL: could not resolve '$b' in the base image." >&2; \
-            echo "  NVM_DIR=${NVM_DIR:-<unset>}  PATH=$PATH" >&2; \
-            ls -la "${NVM_DIR:-/usr/local/share/nvm}" >&2 || true; \
-            ls -la "${NVM_DIR:-/usr/local/share/nvm}"/versions/node 2>/dev/null >&2 || true; \
-            exit 1; \
-        fi; \
+        p="$(command -v "$b")"; \
+        [ -n "$p" ] && [ -x "$p" ] || { echo "FATAL: $b missing after nvm install" >&2; exit 1; }; \
         ln -sfn "$p" "/usr/local/bin/$b"; \
     done; \
     /usr/local/bin/node --version; \
-    /usr/local/bin/npm --version
+    /usr/local/bin/npm --version'
 
 # Both files into the SAME directory, and that is not stylistic: install-chrome.sh
 # derives SCRIPT_DIR from its own dirname and sources common.sh from there, so
