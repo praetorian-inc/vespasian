@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The gRPC live target's AC4 assertion is only as good as compile's ability to
@@ -159,7 +160,7 @@ func TestRun(t *testing.T) {
 	t.Run("wrong argument count exits 2 with usage on stderr", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 
-		if got := run([]string{"proto-validate"}, &stdout, &stderr); got != 2 {
+		if got := run([]string{"proto-validate"}, &stdout, &stderr, compileTimeout); got != 2 {
 			t.Errorf("run(no args) = %d, want 2", got)
 		}
 		if !strings.Contains(stderr.String(), "usage:") {
@@ -171,7 +172,7 @@ func TestRun(t *testing.T) {
 
 		stdout.Reset()
 		stderr.Reset()
-		if got := run([]string{"proto-validate", "a.proto", "b.proto"}, &stdout, &stderr); got != 2 {
+		if got := run([]string{"proto-validate", "a.proto", "b.proto"}, &stdout, &stderr, compileTimeout); got != 2 {
 			t.Errorf("run(two specs) = %d, want 2", got)
 		}
 	})
@@ -180,7 +181,7 @@ func TestRun(t *testing.T) {
 		path := writeSpec(t, "syntax = \"proto3\";\nmessage Dup { string a = 1; string b = 1; }\n")
 		var stdout, stderr bytes.Buffer
 
-		if got := run([]string{"proto-validate", path}, &stdout, &stderr); got != 1 {
+		if got := run([]string{"proto-validate", path}, &stdout, &stderr, compileTimeout); got != 1 {
 			t.Errorf("run(malformed) = %d, want 1", got)
 		}
 		if !strings.Contains(stderr.String(), "proto compile failed") {
@@ -193,11 +194,35 @@ func TestRun(t *testing.T) {
 		}
 	})
 
+	t.Run("compile timeout is reported as a timeout, not a compile failure", func(t *testing.T) {
+		// The timeout branch is the one path a malformed spec never reaches, so
+		// without this it was the only uncovered branch in run(). It matters
+		// because the two failures need different responses: "your spec is
+		// broken" versus "the compile did not finish". A regression collapsing
+		// them would send whoever reads the live-test log after the wrong thing.
+		//
+		// An already-expired budget is what makes this deterministic -- no
+		// sleep, no pathological fixture, no dependence on how fast the host
+		// compiles.
+		path := writeSpec(t, "syntax = \"proto3\";\nmessage M { string a = 1; }\n")
+		var stdout, stderr bytes.Buffer
+
+		if got := run([]string{"proto-validate", path}, &stdout, &stderr, 1*time.Nanosecond); got != 1 {
+			t.Errorf("run(expired budget) = %d, want 1", got)
+		}
+		if !strings.Contains(stderr.String(), "timed out") {
+			t.Errorf("stderr = %q, want it to report a timeout distinctly from a compile failure", stderr.String())
+		}
+		if stdout.Len() != 0 {
+			t.Errorf("stdout = %q, want empty", stdout.String())
+		}
+	})
+
 	t.Run("valid spec exits 0 with the OK line on stdout", func(t *testing.T) {
 		path := writeSpec(t, "syntax = \"proto3\";\nmessage M { string a = 1; }\n")
 		var stdout, stderr bytes.Buffer
 
-		if got := run([]string{"proto-validate", path}, &stdout, &stderr); got != 0 {
+		if got := run([]string{"proto-validate", path}, &stdout, &stderr, compileTimeout); got != 0 {
 			t.Errorf("run(valid) = %d, want 0; stderr=%q", got, stderr.String())
 		}
 		if !strings.Contains(stdout.String(), "OK:") {

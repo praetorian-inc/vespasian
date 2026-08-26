@@ -282,11 +282,17 @@ probe_base="$TMPDIR_T/probe-base"
 mkdir -p "$probe_base"
 ln -s "$(command -v bash)" "$probe_base/bash"
 
+# The stub RECORDS its argv before exiting. Without that the probe assertions
+# below can only observe reachability and exit status, which leaves every
+# timeout bound deletable undetected: dropping `-max-time`, dropping `-w`, or
+# widening `budget` all keep the suite at its pin while removing the property
+# the bounds exist to provide. The whole point of this probe is that it fails
+# FAST, so the bound is the behaviour under test, not an implementation detail.
 new_probe_dir() { # $1 = tool name, $2 = exit status
     local d
     d="$TMPDIR_T/probe-$1-$2"
     mkdir -p "$d"
-    printf '#!/bin/sh\nexit %s\n' "$2" > "$d/$1"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "%s/argv-%s.log"\nexit %s\n' "$TMPDIR_T" "$1" "$2" > "$d/$1"
     chmod +x "$d/$1"
     printf '%s' "$d"
 }
@@ -343,6 +349,16 @@ else
     fail "_probe_grpc_target: grpcurl success arm, got: $out"
 fi
 
+# The BOUND, not just the outcome. `-max-time` is the only thing making the
+# grpcurl arm fail fast; deleting it leaves every reachability assertion above
+# green while restoring the hang this probe exists to prevent.
+if grep -qx -- '-max-time' "$TMPDIR_T/argv-grpcurl.log" 2>/dev/null &&
+   grep -qx -- '5' "$TMPDIR_T/argv-grpcurl.log" 2>/dev/null; then
+    pass "_probe_grpc_target: grpcurl arm passes -max-time 5 (bound is asserted, not just the outcome)"
+else
+    fail "_probe_grpc_target: grpcurl arm must pass '-max-time 5'; recorded argv: $(tr '\n' ' ' < "$TMPDIR_T/argv-grpcurl.log" 2>/dev/null)"
+fi
+
 # Arm 3: grpcurl present and refusing. grpcurl is authoritative when present —
 # it must NOT fall through to the weaker nc/dev-tcp arms.
 out=$(run_probe "$d_grpcurl_fail:$d_nc_ok:$probe_base" localhost 50051)
@@ -360,6 +376,16 @@ else
     fail "_probe_grpc_target: nc success arm, got: $out"
 fi
 
+# Same reasoning as the grpcurl bound above: `-w` is what makes the nc arm
+# finite. This is the arm CI actually takes when grpc-server is down, because
+# ubuntu-24.04 ships nc but not grpcurl.
+if grep -qx -- '-w' "$TMPDIR_T/argv-nc.log" 2>/dev/null &&
+   grep -qx -- '5' "$TMPDIR_T/argv-nc.log" 2>/dev/null; then
+    pass "_probe_grpc_target: nc arm passes -w 5 (bound is asserted, not just the outcome)"
+else
+    fail "_probe_grpc_target: nc arm must pass '-w 5'; recorded argv: $(tr '\n' ' ' < "$TMPDIR_T/argv-nc.log" 2>/dev/null)"
+fi
+
 # Arm 5: nothing bounded available. This must FAIL rather than degrade to an
 # unbounded connect — a preflight exists to fail fast, so a hang is strictly
 # worse than a diagnosable failure (a deliberate divergence from the
@@ -369,6 +395,18 @@ if [[ "$out" == *"no bounded probe available for localhost:50051"* && "$out" == 
     pass "_probe_grpc_target: no bounded probe available fails and names the missing tools"
 else
     fail "_probe_grpc_target: no-bounded-probe arm, got: $out"
+fi
+
+# The /dev/tcp arm's own failure outcome. Port 1 on loopback has no listener, so
+# the connect fails without this suite starting anything -- the assertion stays
+# hermetic. It pins the arm's `return 1`: flipping that to `return 0` makes an
+# unreachable gRPC target report success and the whole preflight pointless, and
+# without this assertion that mutation survives the entire suite.
+out=$(run_probe "$d_timeout:$probe_base" 127.0.0.1 1)
+if [[ "$out" == *"grpc-server is unreachable at 127.0.0.1:1"* && "$out" == *"rc=1"* ]]; then
+    pass "_probe_grpc_target: /dev/tcp arm reports unreachable and returns 1 on a closed port"
+else
+    fail "_probe_grpc_target: /dev/tcp closed-port arm expected unreachable + rc=1, got: $out"
 fi
 
 # Arms 6-7: the /dev/tcp arm must not let TEST_HOST reach a shell PARSER.
@@ -404,6 +442,40 @@ else
     fail "_probe_grpc_target: hostile TEST_HOST was EXECUTED by the /dev/tcp probe (command injection); output: $out"
 fi
 rm -f "$probe_marker"
+
+echo ""
+echo "=== AC4 compile check is unconditional (LAB-5549's whole point) ==="
+
+# LAB-5549 exists because the AC4 compile assertion was gated on
+# `command -v protoc` and therefore passed by NEVER RUNNING. Removing that gate
+# is the deliverable, so the property worth pinning is not "the check works" but
+# "the check cannot opt itself out again". Both regressions below are one-line
+# edits that leave every other assertion in this suite green.
+# Comment lines are stripped before matching. The block's own comments narrate
+# the removed `command -v protoc` gate at length, so grepping the raw text
+# reports the history as a live gate -- caught by this assertion failing on a
+# correct tree the first time it ran. The check must look at CODE, not prose.
+ac4_block=$(sed -n '/# AC4 (LAB-2778)/,/^    local expected_count/p' "$RUNNER" | sed 's/#.*$//')
+
+# (a) No capability gate may guard the compile invocation. This is the exact
+# shape that was removed: `command -v <tool>` deciding whether the assertion runs.
+if printf '%s' "$ac4_block" | grep -qE 'command -v|which |type -p'; then
+    fail "AC4 compile check reintroduced a capability gate (command -v/which/type) — the assertion can skip again, which is the defect LAB-5549 removed"
+else
+    pass "AC4 compile check has no capability gate — it cannot skip on a missing tool"
+fi
+
+# (b) Every non-success arm must count a failure. A branch that neither compiles
+# nor increments `failures` reports PASS with AC4 never evaluated -- the same
+# false green as the protoc gate, triggered by artifact content instead. The
+# multi-file `// ---` arm is the one that changed skip->fail; log_info alone
+# there would silently restore the hole.
+multifile_arm=$(printf '%s' "$ac4_block" | sed -n "/grep -q /,/elif/p")
+if printf '%s' "$multifile_arm" | grep -q 'failures=$((failures + 1))'; then
+    pass "AC4 multi-file '// ---' arm counts a failure (cannot report PASS with the compile check unevaluated)"
+else
+    fail "AC4 multi-file '// ---' arm does not increment failures — a multi-file spec would report PASS with AC4 never evaluated"
+fi
 
 echo ""
 echo "=== gRPC preflight case-block dispatch (preflight_test_host) ==="
@@ -2434,6 +2506,46 @@ else
 fi
 
 echo ""
+echo "=== ci.yml proto-validate-tests job wiring ==="
+
+# test/proto-validate is a separate module, so a root `go test ./...` does not
+# reach it -- verified, not assumed. ci.yml's proto-validate-tests job is the
+# ONLY thing running its tests in CI, which makes that job the single point of
+# failure for the AC4 helper's entire test suite. Switch it off and every one of
+# those tests silently stops running while this suite stays green: the exact
+# never-executed-assertion shape LAB-5549 exists to remove.
+#
+# Reuses the live-tests.yml helpers by repointing $WORKFLOW rather than growing a
+# parallel copy of yq_query's no-yq and parse-error handling. Both arms of that
+# handling are counted failures, not skips, so this adds no skip credit.
+_WORKFLOW_SAVED="$WORKFLOW"
+WORKFLOW="$SCRIPT_DIR/../.github/workflows/ci.yml"
+
+# has("if"), NOT `.if // "__ABSENT__"`. yq's `//` is jq's alternative operator,
+# which falls through on `false` as well as null -- so `if: false`, the single
+# most likely way to switch a job off, reads EXACTLY like having no `if:` at all.
+# Measured: with `if: false` present, `.if // "__ABSENT__"` returns __ABSENT__
+# while `has("if")` returns true. A guard that cannot see the disabling edit is
+# the "unable to fail" defect this suite exists to catch.
+case "$(yq_query '.jobs["proto-validate-tests"] | has("if")')" in
+    __NO_YQ__)    fail_no_yq "ci.yml proto-validate-tests is unconditional" ;;
+    __YQ_ERROR__) fail_yq_error "ci.yml proto-validate-tests is unconditional" ;;
+    false)        pass "ci.yml proto-validate-tests runs unconditionally (no job-level if:)" ;;
+    *)            fail "ci.yml proto-validate-tests has a job-level if: — the nested module's tests can be switched off while this suite stays green" ;;
+esac
+
+# Existence of the job is not the property; RUNNING THE NESTED MODULE is. A job
+# that still exists but no longer names ./test/proto-validate/... tests nothing.
+pv_block=$(extract_job_block proto-validate-tests)
+if printf '%s' "$pv_block" | grep -q 'go test .*\./test/proto-validate/\.\.\.'; then
+    pass "ci.yml proto-validate-tests actually runs go test against ./test/proto-validate/..."
+else
+    fail "ci.yml proto-validate-tests no longer runs 'go test ./test/proto-validate/...' — the nested module's tests would not run in CI"
+fi
+
+WORKFLOW="$_WORKFLOW_SAVED"
+
+echo ""
 echo "=== Browser-target classification is exhaustive (no fail-open) ==="
 # BROWSER_TARGETS is hand-maintained and decides whether the Chrome preflight is
 # fatal. A target missing from it fails OPEN: setup proceeds browserless and the
@@ -2575,7 +2687,36 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # asserts the whole live group probes every target, so a future target folded
 # into an existing arm is caught too — the skip produces no output and no
 # failure, which is why the original survived from PR #159.
-EXPECTED_ASSERTIONS=147
+# 147 -> 154. MEASURED. +7 closing regression gaps a review DEMONSTRATED, not
+# hypothesised: each mutation below was run against the previous tree and
+# survived at 147/0, so every one of these assertions is known to catch
+# something nothing else caught.
+#
+# +2 timeout bounds (grpcurl `-max-time 5`, nc `-w 5`). The probe fixtures now
+# record their argv, because outcome-and-exit-status assertions cannot see a
+# deleted bound: dropping `-max-time`, dropping `-w`, or widening `budget` all
+# kept the suite green while restoring the hang the bounds exist to prevent.
+# Failing FAST is this probe's whole purpose, so the bound is the behaviour.
+#
+# +1 /dev/tcp closed-port outcome. Pins that arm's `return 1`; flipping it to
+# `return 0` made an unreachable gRPC target report success and survived.
+# Hermetic -- port 1 on loopback needs no listener, so the suite still starts
+# nothing. The /dev/tcp SUCCESS outcome stays unasserted deliberately: it needs a
+# live listener, which would break this file's no-services property and add a
+# skip/credit arm, i.e. the vespasian#197 hazard.
+#
+# +2 AC4 unconditionality. LAB-5549's deliverable is that the compile assertion
+# cannot skip; prefixing the elif with `! command -v protoc ||` restored the
+# original defect verbatim and survived. One arm rejects any capability gate,
+# the other requires the multi-file arm to count a failure so it cannot report
+# PASS with AC4 unevaluated. Comments are stripped before matching -- the block
+# narrates the removed gate, and grepping raw text reported that history as a
+# live gate.
+#
+# +2 ci.yml proto-validate-tests wiring. That job is the ONLY thing running the
+# nested module's tests in CI (a root `go test ./...` cannot reach a separate
+# module), so `if: false` on it silently disabled that entire suite and survived.
+EXPECTED_ASSERTIONS=154
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."

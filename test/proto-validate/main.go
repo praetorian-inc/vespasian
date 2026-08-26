@@ -49,19 +49,23 @@ func compile(ctx context.Context, path string) error {
 // rather than calling os.Exit, and writes through the io.Writers it is handed
 // rather than to the process streams, so the contract run-live-tests.sh actually
 // depends on — exit 0 compiles, non-zero does not, diagnostics on stderr — is
-// unit-testable. main() consumed only the exit status, so a regression that
+// unit-testable. The timeout is a PARAMETER rather than a read of the package
+// const: that is what makes the timeout branch reachable from a test without
+// mutable package state or a clock interface -- a function that accepts its
+// inputs is testable by construction. main() passes compileTimeout.
+// main() consumed only the exit status, so a regression that
 // returned bare instead of exiting non-zero, or that wrote the diagnostic to
 // stdout, would have left every compile() subtest green while the gRPC target
 // reported PASS on a malformed spec: the same silent pass the `command -v protoc`
 // gate produced, relocated one level up. TestRun pins each return.
-func run(args []string, stdout, stderr io.Writer) int {
+func run(args []string, stdout, stderr io.Writer, timeout time.Duration) int {
 	if len(args) != 2 {
 		fmt.Fprintln(stderr, "usage: proto-validate <file.proto>")
 		return 2
 	}
 	path := args[1]
 
-	ctx, cancel := context.WithTimeout(context.Background(), compileTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	if err := compile(ctx, path); err != nil {
@@ -69,7 +73,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		// distinguishable from a malformed one rather than reading as a stuck
 		// runner.
 		if ctx.Err() != nil {
-			fmt.Fprintf(stderr, "proto compile timed out after %s: %v\n", compileTimeout, err)
+			fmt.Fprintf(stderr, "proto compile timed out after %s: %v\n", timeout, err)
 			return 1
 		}
 		fmt.Fprintf(stderr, "proto compile failed: %v\n", err)
@@ -80,5 +84,5 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 func main() {
-	os.Exit(run(os.Args, os.Stdout, os.Stderr))
+	os.Exit(run(os.Args, os.Stdout, os.Stderr, compileTimeout))
 }

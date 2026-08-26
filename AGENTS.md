@@ -13,7 +13,10 @@ Vespasian is an API discovery and specification generation tool for security ass
 make build                    # Build binary to bin/vespasian
 
 # Run all tests with race detection
-make test                     # Equivalent to: go test -race ./...
+# Two invocations, not one: test/proto-validate is a separate module (see
+# test/proto-validate/go.mod) and a root ./... pattern stops at the module
+# boundary, so `go test -race ./...` alone does NOT run its tests.
+make test                     # go test -race ./...  AND  ./test/proto-validate/...
 
 # Run tests for a specific package
 go test ./pkg/classify/...

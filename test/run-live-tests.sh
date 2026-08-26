@@ -52,6 +52,30 @@ VESPASIAN="${VESPASIAN:-${PROJECT_ROOT}/bin/vespasian}"
 # devcontainer while the target services run on the Docker host.
 TEST_HOST="${TEST_HOST:-localhost}"
 
+# Validate the ambient env seams ONCE, here, rather than per-sink. load_config's
+# 1-65535 check (see the port `case` arm below) screens only values it reads OUT
+# of a config file; a value already in the ENVIRONMENT reaches every consumer
+# unscreened. That is the gap: TEST_HOST and GRPC_SERVER_PORT flow into a curl
+# URL, a grpcurl host:port operand, an nc operand, and a `bash -c` argv, and
+# hardening one sink leaves the other three trusting the value.
+#
+# Rejecting a leading dash is the point of the second pattern: an option-looking
+# host is otherwise consumed as a FLAG by grpcurl and nc rather than as an
+# operand, which is why this is fixed at the seam instead of by adding `--` to
+# each arm -- one check covers every present and future consumer.
+# Bracketed IPv6 (`[::1]`) is allowed explicitly; it is the documented form for
+# an IPv6 TEST_HOST and would otherwise fail the hostname pattern.
+if [[ ! "$TEST_HOST" =~ ^([A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:]+\])$ ]]; then
+    echo "test/run-live-tests.sh: refusing to run: TEST_HOST is not a plain hostname, IPv4, or bracketed IPv6 literal: ${TEST_HOST}" >&2
+    exit 1
+fi
+if [ -n "${GRPC_SERVER_PORT:-}" ]; then
+    if [[ ! "$GRPC_SERVER_PORT" =~ ^[0-9]{1,5}$ ]] || [ "$GRPC_SERVER_PORT" -lt 1 ] || [ "$GRPC_SERVER_PORT" -gt 65535 ]; then
+        echo "test/run-live-tests.sh: refusing to run: GRPC_SERVER_PORT is not a valid port (1-65535): ${GRPC_SERVER_PORT}" >&2
+        exit 1
+    fi
+fi
+
 # ──────────────────────────────────────────────────────────────
 # Target groups (single source of truth — CI references these
 # via --group instead of maintaining its own target lists)
