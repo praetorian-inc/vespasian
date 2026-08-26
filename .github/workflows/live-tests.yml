@@ -395,7 +395,7 @@ jobs:
           git fetch --no-tags origin "$BASE_REF"
           changed=$(git diff --name-only "origin/${BASE_REF}...HEAD")
           printf 'changed files:\n%s\n' "$changed"
-          WATCHED='.devcontainer/* .dockerignore test/install-chrome.sh test/common.sh test/assert-chrome-install.sh test/assert-devcontainer-lookpath.sh test/setup-live-targets.sh test/run-live-tests.sh'
+          WATCHED='.devcontainer/* .dockerignore .github/workflows/live-tests.yml test/install-chrome.sh test/common.sh test/assert-chrome-install.sh test/assert-devcontainer-lookpath.sh test/setup-live-targets.sh test/run-live-tests.sh'
           hit=false
           for f in $changed; do
             for pat in $WATCHED; do

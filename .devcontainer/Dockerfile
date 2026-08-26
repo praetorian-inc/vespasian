@@ -66,6 +66,39 @@ RUN set -eu; \
     chmod 0755 /usr/local/bin/yq; \
     yq --version
 
+# Node reaches PATH only through nvm's profile hook, and several things that
+# need it never load a profile: devcontainer.json's onCreateCommand runs under
+# `/bin/sh -c`, and so does every `devcontainer exec`. MEASURED — the first CI
+# run of this job that reached container creation died with
+#   /bin/sh: 1: npm: not found
+#   onCreateCommand from devcontainer.json failed with exit code 127
+# even though the image declares PATH=/usr/local/share/nvm/current/bin and
+# NVM_DIR=/usr/local/share/nvm. A second attempt that resolved nvm inside the
+# onCreateCommand script failed the same way, so the runtime shell genuinely
+# cannot see it.
+#
+# Resolve it ONCE here instead, where the image's own PATH is in effect, and pin
+# the result into /usr/local/bin — on every PATH, no profile required. If it
+# cannot be resolved the BUILD fails, which is the right place to find out: the
+# alternative is every developer's container-create failing instead.
+RUN set -eu; \
+    for b in node npm npx; do \
+        p="$(command -v "$b" 2>/dev/null || true)"; \
+        if [ -z "$p" ]; then \
+            p="$(ls -d "${NVM_DIR:-/usr/local/share/nvm}"/versions/node/*/bin/"$b" 2>/dev/null | tail -1 || true)"; \
+        fi; \
+        if [ -z "$p" ] || [ ! -x "$p" ]; then \
+            echo "FATAL: could not resolve '$b' in the base image." >&2; \
+            echo "  NVM_DIR=${NVM_DIR:-<unset>}  PATH=$PATH" >&2; \
+            ls -la "${NVM_DIR:-/usr/local/share/nvm}" >&2 || true; \
+            ls -la "${NVM_DIR:-/usr/local/share/nvm}"/versions/node 2>/dev/null >&2 || true; \
+            exit 1; \
+        fi; \
+        ln -sfn "$p" "/usr/local/bin/$b"; \
+    done; \
+    /usr/local/bin/node --version; \
+    /usr/local/bin/npm --version
+
 # Both files into the SAME directory, and that is not stylistic: install-chrome.sh
 # derives SCRIPT_DIR from its own dirname and sources common.sh from there, so
 # copying the installer alone fails at `source` with "No such file or directory".

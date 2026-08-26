@@ -25,19 +25,11 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 if ! command -v npm >/dev/null 2>&1; then
-    # Prefer the version nvm has marked current; fall back to sourcing nvm.
-    if [ -n "${NVM_DIR:-}" ] && [ -x "${NVM_DIR}/current/bin/npm" ]; then
-        PATH="${NVM_DIR}/current/bin:${PATH}"
-        export PATH
-    elif [ -n "${NVM_DIR:-}" ] && [ -s "${NVM_DIR}/nvm.sh" ]; then
-        # shellcheck disable=SC1091
-        . "${NVM_DIR}/nvm.sh"
-    fi
-fi
-
-if ! command -v npm >/dev/null 2>&1; then
-    echo "on-create: npm not found. The base image is expected to ship Node via nvm" >&2
-    echo "  (NVM_DIR=${NVM_DIR:-<unset>}); check the FROM in .devcontainer/Dockerfile." >&2
+    echo "on-create: npm not on PATH." >&2
+    echo "  .devcontainer/Dockerfile pins node/npm/npx into /usr/local/bin at build" >&2
+    echo "  time precisely so this shell does not need a profile; that layer is" >&2
+    echo "  missing or the image was not built from this Dockerfile." >&2
+    echo "  NVM_DIR=${NVM_DIR:-<unset>} PATH=$PATH" >&2
     exit 1
 fi
 

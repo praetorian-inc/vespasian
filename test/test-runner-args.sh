@@ -2437,7 +2437,8 @@ GATECASES
                 *) fail "devcontainer-changes has no step with id: filter (found ${dc_filter_id}) — steps.filter.outputs.devcontainer resolves empty, so the pull_request arm compares \"\" to \"true\" and can never fire" ;;
             esac
             dc_filter_missing=""
-            for dc_need in '.devcontainer/\*' 'test/install-chrome.sh' 'test/common.sh' \
+            for dc_need in '.devcontainer/\*' '.dockerignore' '.github/workflows/live-tests.yml' \
+                           'test/install-chrome.sh' 'test/common.sh' \
                            'test/assert-chrome-install.sh' 'test/assert-devcontainer-lookpath.sh' \
                            'test/setup-live-targets.sh' 'test/run-live-tests.sh'; do
                 printf '%s\n' "$dc_filter_paths" | grep -qF -- "${dc_need//\\/}" || dc_filter_missing="${dc_filter_missing} ${dc_need//\\/}"
@@ -2481,7 +2482,7 @@ GATECASES
                         # which carries the required text and can never be true —
                         # the same defeat the producer side was rebuilt as an
                         # executed harness to prevent, left open on the consumer.
-                        fail "${dc_job}'s if: is not exactly \"needs.devcontainer-changes.outputs.should-run == 'true'\" (got: ${dc_if}) — a restated or prefixed gate desynchronises the legs, and a `false &&` prefix keeps the text while never firing" ;;
+                        fail "${dc_job}'s if: is not exactly \"needs.devcontainer-changes.outputs.should-run == 'true'\" (got: ${dc_if}) — a restated or prefixed gate desynchronises the legs, and a 'false &&' prefix keeps the text while never firing" ;;
                 esac
             done
         fi
@@ -2796,7 +2797,7 @@ if [[ -f "$DEVCONTAINER_DOCKERFILE" ]]; then
             if [[ "$copy_pair_ok" -eq 1 ]]; then
                 pass ".devcontainer/Dockerfile COPYs common.sh in the SAME instruction as install-chrome.sh (the installer sources it from its own dirname)"
             else
-                fail ".devcontainer/Dockerfile COPYs install-chrome.sh WITHOUT common.sh — the installer sources common.sh from its own dirname, so the layer dies at \`source\`; every path it names still exists, so an existence check cannot see this"
+                fail ".devcontainer/Dockerfile COPYs install-chrome.sh WITHOUT common.sh — the installer sources common.sh from its own dirname, so the layer dies at 'source'; every path it names still exists, so an existence check cannot see this"
             fi
         else
             fail ".devcontainer/Dockerfile no longer COPYs test/install-chrome.sh — the image ships no browser and LAB-5064's AC1 wiring is gone"
