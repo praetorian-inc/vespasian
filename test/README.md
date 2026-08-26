@@ -599,7 +599,10 @@ test/
 │   ├── main.go              # gRPC server (UserService, OrderService, AccountService)
 │   └── expected-paths.json  # Expected services/methods for validation
 │
-├── proto-validate/
+├── proto-validate/          # NESTED MODULE (see go.work) — keeps protocompile out
+│   │                        # of the shipped module's requires
+│   ├── go.mod               # Its own module; root `go test ./...` does NOT reach it
+│   ├── go.sum
 │   ├── doc.go               # Package docs + the exit-code contract run-live-tests.sh consumes
 │   ├── main.go              # Compiles a generated .proto in-process (protocompile); AC4 check
 │   └── main_test.go         # Reject cases + the exit-code contract

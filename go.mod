@@ -6,7 +6,6 @@ require (
 	github.com/BishopFox/jsluice v0.0.0-20240110145140-0ddfab153e06
 	github.com/PuerkitoBio/goquery v1.12.0
 	github.com/alecthomas/kong v1.16.1
-	github.com/bufbuild/protocompile v0.14.1
 	github.com/getkin/kin-openapi v0.147.0
 	github.com/go-rod/rod v0.116.2
 	github.com/jhump/protoreflect v1.18.0
@@ -39,7 +38,6 @@ require (
 	github.com/ysmood/leakless v0.9.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/exp v0.0.0-20260218203240-3dfff04db8fa // indirect
-	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect

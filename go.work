@@ -1,0 +1,11 @@
+// Workspace so `go build`/`go test ./...` and `go run ./test/proto-validate`
+// span both the product module and the test-only proto-validate module. The
+// split exists to keep protocompile out of the shipped module's dependency
+// contract (see test/proto-validate/go.mod); the workspace is what keeps that
+// split from costing anything at development or CI time.
+go 1.27.0
+
+use (
+	.
+	./test/proto-validate
+)

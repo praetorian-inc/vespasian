@@ -11,8 +11,16 @@ LDFLAGS   := -s -w -X main.version=$(VERSION) -X main.gitCommit=$(GIT_COMMIT) -X
 build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/vespasian
 
+# ./... does NOT reach test/proto-validate: it is a separate module (so that
+# protocompile stays out of the shipped module's require list) and a root
+# package pattern stops at the module boundary even inside a workspace. The
+# second path is therefore load-bearing, not belt-and-braces — without it the
+# AC4 helper's tests are simply not run. CI covers the same ground in ci.yml's
+# proto-validate-tests job, since the reusable workflow it delegates to cannot
+# be told about a second module.
 test:
 	go test -race ./...
+	go test -race ./test/proto-validate/...
 
 # Integration-tagged tests. Separate from `test` because these need a real Chrome,
 # so a developer without one can still run `make test`/`make check`. That is why
@@ -27,8 +35,12 @@ test:
 test-integration:
 	go test -race -tags=integration ./...
 
+# golangci-lint resolves one module per invocation, so the nested
+# test/proto-validate module needs its own run from inside its directory —
+# ./... from the root does not reach it.
 lint:
 	golangci-lint run
+	cd test/proto-validate && golangci-lint run
 
 # Fails when a comment guarantees a state cannot occur without naming the test that
 # pins it. Scoped to comment BLOCKS whose lines changed against BASE_REF (default
@@ -55,8 +67,11 @@ lint-comments-all:
 fmt:
 	gofmt -s -w .
 
+# Second path for the same reason as `test`: test/proto-validate is a separate
+# module and ./... stops at the module boundary.
 vet:
 	go vet ./...
+	go vet ./test/proto-validate/...
 
 check: fmt vet lint lint-comments test check-docs
 
@@ -73,6 +88,7 @@ coverage:
 deps:
 	go mod download
 	go mod tidy
+	cd test/proto-validate && go mod tidy
 
 clean:
 	rm -rf $(BUILD_DIR) dist coverage.out

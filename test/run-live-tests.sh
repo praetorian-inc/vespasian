@@ -1562,7 +1562,15 @@ PYEOF
         log_fail "emitted .proto is multi-file (concatenated); the compile check cannot validate it:"
         log_info "teach test/proto-validate to split on '// ---' and compile the parts together"
         failures=$((failures + 1))
-    elif (cd "$PROJECT_ROOT" && go run ./test/proto-validate "$spec_abs") \
+    # Run from INSIDE test/proto-validate rather than `go run
+    # ./test/proto-validate` at the repo root. It is a separate module (its
+    # protocompile dependency is deliberately not in the shipped module's
+    # requires), so the root-relative form resolves only through go.work and
+    # fails with "main module does not contain package ..." under GOWORK=off or
+    # any checkout where the workspace file is absent. Entering the module
+    # directory works in both cases. $spec_abs is already absolute, so the cd
+    # cannot change what it points at.
+    elif (cd "$PROJECT_ROOT/test/proto-validate" && go run . "$spec_abs") \
         2>"$proto_err"; then
         log_ok "emitted .proto compiles (protocompile)"
     else
