@@ -91,7 +91,7 @@ func main() {
 	// live in test/internal/target. forms-target keeps its own FORMS_TARGET_BIND_HOST
 	// seam in setup-live-targets.sh; only the in-process resolution is shared.
 	addr := target.Addr(port)
-	log.Printf("forms-target listening on http://%s/", addr) //nolint:gosec // G706: host/port come from controlled BIND_HOST/PORT env vars for a local test target, not attacker input
+	log.Printf("forms-target listening on http://%s/", addr) // #nosec G706 -- host/port come from controlled BIND_HOST/PORT env vars for a local test target, not attacker input
 	srv := target.Server(addr, mux)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)

@@ -70,12 +70,13 @@ make test             # go test -race ./...
 make fmt              # gofmt -s -w .
 make vet              # go vet ./...
 make lint             # golangci-lint run
-make check            # fmt + vet + lint + test — run this before opening a PR
+make gosec            # gosec at the version CI pins; fetched via `go run`, nothing to install
+make check            # fmt + vet + lint + lint-comments + gosec + test + check-docs
 make coverage         # Coverage profile + per-function report (excludes test/)
 make live-test-clean  # Stop orphaned live-test services
 ```
 
-Note that `make check` runs `make fmt` first, which rewrites files in place via `gofmt -s -w .` — it validates *and* reformats. Expect it to modify your working tree, and check `git status` afterwards so any reformatting lands in your commit rather than surprising you later. Use `make vet lint test` if you want the checks without the rewrite.
+Note that `make check` runs `make fmt` first, which rewrites files in place via `gofmt -s -w .` — it validates *and* reformats. Expect it to modify your working tree, and check `git status` afterwards so any reformatting lands in your commit rather than surprising you later. Use `make vet lint gosec test` if you want the checks without the rewrite.
 
 ### Devcontainers
 
@@ -273,6 +274,7 @@ Run `make check` before submitting.
 - **Go file naming: lowercase with underscores** — `rest_classifier.go`, not `restClassifier.go`.
 - Keep functions under complexity 15. If the linter complains, split the function rather than suppressing it.
 - Add a `//nolint` directive only with a comment explaining why, and expect it to be questioned in review.
+- Suppress a **gosec** finding with `#nosec <RULE> -- <reason>`, never `//nolint:gosec`. gosec runs both inside `golangci-lint`, which honors `//nolint`, and as the separate `security / Gosec` job, which honors only `#nosec` — so `//nolint:gosec` leaves `make lint` green while the Gosec job fails. Put it trailing on the line, or on the line above when another linter already shares the trailing comment (LAB-6011).
 - Use `context.Context` for cancellation in all I/O paths.
 - Check every error. Return `(result, error)` rather than panicking.
 - Every source file carries the Apache 2.0 license header. Copy it from an existing file into new ones.
@@ -320,7 +322,7 @@ Two CI workflows gate a PR:
 
 ### PR checklist
 
-- [ ] `make check` passes (fmt, vet, lint, lint-comments, test, check-docs)
+- [ ] `make check` passes (fmt, vet, lint, lint-comments, gosec, test, check-docs)
 - [ ] Tests added or updated for the change
 - [ ] New classifier / generator / importer / probe registered where the pipeline expects it
 - [ ] Commit messages follow conventional commit format

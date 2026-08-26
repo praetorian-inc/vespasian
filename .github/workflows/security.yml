@@ -35,9 +35,14 @@ jobs:
       # `// Code generated ... DO NOT EDIT.` marker, e.g. test/grpc-server/labpb/*.pb.go).
       # Their unsafe.Pointer fast-paths are protoc-gen-go boilerplate, not
       # hand-written code, so gosec's G103 "audit unsafe" alerts on them are
-      # noise. Mirrors golangci-lint's `exclusions.generated: lax`. The rest of
-      # the args match the reusable workflow's default (observe-only + SARIF).
-      gosec-args: "-no-fail -exclude-generated -fmt sarif -out gosec-results.sarif ./..."
+      # noise. Mirrors golangci-lint's `exclusions.generated: lax`.
+      #
+      # No `-no-fail`: under it the job passed while publishing findings, which is how
+      # 28 accumulated unseen (LAB-6011). The reusable workflow passes these args through
+      # verbatim and exits on gosec's own code, so a finding now fails the job.
+      # `fail-on-findings: true` would do the same but also gates govulncheck, which is
+      # a separate concern here.
+      gosec-args: "-exclude-generated -fmt sarif -out gosec-results.sarif ./..."
       # The reusable workflow's v2.22.11 default links x/tools v0.39.0, which
       # cannot read go1.27 export data. Since the Gosec job runs
       # `go-version: stable`, every scan died before writing SARIF once go1.27
