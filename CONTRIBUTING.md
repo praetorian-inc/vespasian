@@ -340,10 +340,18 @@ curated, human-readable history, and the canonical record of breaking changes.
   requires a major-version bump at release time.
 - **Releases are cut by a maintainer.** At release time the maintainer renames
   `[Unreleased]` to the new version with a date and opens a fresh `[Unreleased]`.
+  Then update the link-reference definitions at the bottom of `CHANGELOG.md`, or
+  the new heading renders as literal bracketed text and the `[Unreleased]` diff
+  keeps showing already-released work (`make check-docs` will not catch either —
+  it does not resolve reference-style links):
+  - add `[<new>]: https://github.com/praetorian-inc/vespasian/compare/<prev>...v<new>`, and
+  - retarget `[Unreleased]:` to `.../compare/v<new>...HEAD`.
+
   Contributors do not assign version numbers.
 - **`CHANGELOG.md` and the GitHub Release notes are complementary.** goreleaser
   generates per-release notes from conventional commits (see
-  [`.goreleaser.yml`](.goreleaser.yml)) — the complete, raw commit log.
+  [`.goreleaser.yml`](.goreleaser.yml)) — the commit log for the release, minus
+  `docs:`/`ci:`/`deps:` commits (per that file's `changelog.filters.exclude`).
   `CHANGELOG.md` is the curated summary. Writing good conventional-commit messages
   (see [Commit messages](#commit-messages)) keeps both useful.
 

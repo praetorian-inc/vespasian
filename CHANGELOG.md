@@ -10,10 +10,11 @@ pull request that changes user-facing behavior adds an entry under
 [Unreleased](#unreleased), and at release time a maintainer renames that section
 to the new version. It complements — rather than replaces — the per-release
 GitHub Release notes that goreleaser generates from conventional commits (see
-[`.goreleaser.yml`](.goreleaser.yml)). Those notes list every shipped commit;
-this file summarizes what matters to users and is the canonical record of
-breaking changes. See [CONTRIBUTING.md](CONTRIBUTING.md#changelog) for the
-per-PR update workflow.
+[`.goreleaser.yml`](.goreleaser.yml)). Those notes list the commit log for the
+release, minus `docs:`/`ci:`/`deps:` commits (per that file's
+`changelog.filters.exclude`); this file summarizes what matters to users and is
+the canonical record of breaking changes. See
+[CONTRIBUTING.md](CONTRIBUTING.md#changelog) for the per-PR update workflow.
 
 ## [Unreleased]
 
@@ -28,8 +29,16 @@ release is a new major version under SemVer.
   request changed from `map[string]string` to `map[string][]string`. Capture
   files produced by `v1.0.0` use the old single-value shape and are **not
   compatible** — they will not round-trip through `generate`. Regenerate the
-  capture against the target with `crawl`, `scan`, or `import`.
+  capture against the target with `crawl` or `import` (`scan` writes a
+  generated spec, not a `capture.json`).
   ([LAB-2110](https://linear.app/praetorianlabs/issue/LAB-2110))
+- **`crawl` now rejects private seed URLs by default.** At `v1.0.0` a `crawl`
+  against a private host (`localhost`, `127.0.0.1`, RFC1918, link-local)
+  succeeded; the crawl frontier's SSRF scope check now rejects such a seed and
+  the crawl exits non-zero with no captures. Interactive users see an error
+  naming the remedy, but scripted/CI callers crawling internal targets must be
+  updated. Migration: pass `--dangerous-allow-private` to crawl a private host.
+  ([LAB-2438](https://linear.app/praetorianlabs/issue/LAB-2438))
 
 ### Added
 
@@ -84,8 +93,8 @@ release is a new major version under SemVer.
   ([LAB-2785](https://linear.app/praetorianlabs/issue/LAB-2785),
   [LAB-2786](https://linear.app/praetorianlabs/issue/LAB-2786))
 - **Crawler egress hardened.** The crawler now pins the system Chrome (no
-  auto-download) and disables browser telemetry; set `VESPASIAN_NO_SANDBOX=1` for
-  containerized runs.
+  auto-download) and disables browser telemetry; set `VESPASIAN_NO_SANDBOX=true`
+  for containerized runs.
   ([LAB-4999](https://linear.app/praetorianlabs/issue/LAB-4999))
 - **Deterministic output.** Request-to-endpoint mapping and classification
   ordering are now stable, so repeated runs and `scan` vs. two-stage
@@ -105,8 +114,10 @@ release is a new major version under SemVer.
 - SSRF validation applied to proxied source-map fetches, so reaching private
   targets still requires `--dangerous-allow-private`.
   ([LAB-4993](https://linear.app/praetorianlabs/issue/LAB-4993))
-- Importer input hardened against untrusted traffic: host/port smuggling rejected
-  and attacker-controlled payload sizes bounded across all parse paths.
+- Importer input hardened against untrusted traffic. A shared 500 MB file-size
+  cap bounds every format (Burp XML, HAR, and both mitmproxy paths). The native
+  mitmproxy tnetstring path adds finer-grained limits — a 64 MB per-element cap
+  and a 500k flow-count cap — and rejects host/port smuggling.
 
 ### Compatibility notes
 
