@@ -62,11 +62,16 @@ fi
 failures=0
 cases=0
 
-# assert_gate NAME THRESHOLD FIXTURE WANT_EXIT WANT_SUBSTRING
+# assert_gate NAME THRESHOLD FIXTURE WANT_EXIT WANT_SUBSTRING [WANT_ABSENT]
 # Runs the extracted awk program with THRESHOLD over FIXTURE on stdin and checks
-# the exit code and (if non-empty) an expected substring of the output.
+# the exit code, an expected substring (if non-empty), and -- if WANT_ABSENT is
+# given -- that the output does NOT contain it. WANT_ABSENT pins branches that
+# share an exit code with another: a BEGIN threshold-validation error and a
+# missing `total:` line both exit 2, so asserting the "no total:" message is
+# ABSENT is what proves the BEGIN error was not overwritten by the END `bad`
+# guard (`if (bad) exit bad`) -- the only otherwise-untested branch.
 assert_gate() {
-  local name="$1" threshold="$2" fixture="$3" want_exit="$4" want_sub="$5"
+  local name="$1" threshold="$2" fixture="$3" want_exit="$4" want_sub="$5" want_absent="${6:-}"
   cases=$((cases + 1))
 
   local out rc
@@ -81,6 +86,10 @@ assert_gate() {
   if [ -n "$want_sub" ] && ! printf '%s' "$out" | grep -qF -- "$want_sub"; then
     ok=0
     printf 'FAIL %s\n  output lacks %q\n' "$name" "$want_sub"
+  fi
+  if [ -n "$want_absent" ] && printf '%s' "$out" | grep -qF -- "$want_absent"; then
+    ok=0
+    printf 'FAIL %s\n  output contains %q and must not\n' "$name" "$want_absent"
   fi
 
   if [ "$ok" -eq 1 ]; then
@@ -101,6 +110,8 @@ total:							(statements)	80.0%'
 AT_FIXTURE='github.com/praetorian-inc/vespasian/cmd/vespasian/main.go:20:	run		85.0%
 total:							(statements)	85.0%'
 NO_TOTAL_FIXTURE='github.com/praetorian-inc/vespasian/cmd/vespasian/main.go:20:	run		100.0%'
+FULL_FIXTURE='github.com/praetorian-inc/vespasian/cmd/vespasian/main.go:20:	run		100.0%
+total:							(statements)	100.0%'
 
 # 1. Coverage below the threshold fails the build (exit 1). The core gate.
 assert_gate "below threshold fails" 85 "$LOW_FIXTURE" 1 "FAIL"
@@ -114,14 +125,14 @@ assert_gate "coverage exactly at threshold passes" 85 "$AT_FIXTURE" 0 "PASS"
 
 # 4. A non-numeric threshold exits 2 rather than coercing to 0 and printing PASS.
 #    This is the exact false-green this gate was fixed to remove.
-assert_gate "non-numeric threshold fails closed" "abc" "$PASS_FIXTURE" 2 "not a number"
+assert_gate "non-numeric threshold fails closed" "abc" "$PASS_FIXTURE" 2 "not a number" "no total: line"
 
 # 5. An empty threshold is likewise rejected (empty string fails the numeric regex).
-assert_gate "empty threshold fails closed" "" "$PASS_FIXTURE" 2 "not a number"
+assert_gate "empty threshold fails closed" "" "$PASS_FIXTURE" 2 "not a number" "no total: line"
 
 # 6. A threshold above 100 is out of range and exits 2 -- otherwise no coverage
 #    could ever pass, a silent mis-set knob rather than an error.
-assert_gate "threshold over 100 fails closed" 150 "$PASS_FIXTURE" 2 "outside 0..100"
+assert_gate "threshold over 100 fails closed" 150 "$PASS_FIXTURE" 2 "outside 0..100" "no total: line"
 
 # 7. No `total:` line means `go tool cover` produced nothing usable; the gate must
 #    fail closed (exit 2) rather than pass because it found no failure.
@@ -134,6 +145,18 @@ assert_gate "decimal threshold above coverage passes" 85.5 "$PASS_FIXTURE" 0 "PA
 # 9. A decimal threshold below coverage still fails, so the decimal path shares the
 #    real comparison rather than being merely accepted.
 assert_gate "decimal threshold below coverage fails" 85.5 "$AT_FIXTURE" 1 "FAIL"
+
+# A negative threshold is rejected: the regex admits only digits with an optional
+# decimal part, so a leading '-' fails it (exit 2). Guards against a regex loosened
+# to '^-?[0-9]+...' that would let COVERAGE_THRESHOLD=-5 pass every `pct < threshold`
+# comparison and print PASS -- the exact fail-open class this gate removes. Also
+# asserts "no total: line" is absent, so the BEGIN error is not masked by the END guard.
+assert_gate "negative threshold fails closed" -5 "$PASS_FIXTURE" 2 "not a number" "no total: line"
+
+# A threshold of exactly 100 is IN range -- the check rejects >100, not ==100 -- and
+# over 100% coverage it passes (exit 0). Pins the upper boundary as accepted, so a
+# regression tightening the bound to `>= 100` would be caught.
+assert_gate "threshold exactly 100 is accepted" 100 "$FULL_FIXTURE" 0 "PASS"
 
 echo
 if [ "$failures" -ne 0 ]; then

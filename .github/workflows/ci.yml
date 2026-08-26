@@ -84,7 +84,7 @@ jobs:
   # `make coverage-gate`, which fails the build when total statement coverage drops
   # below COVERAGE_THRESHOLD (Makefile). No third-party service, token, or new egress.
   coverage-gate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
