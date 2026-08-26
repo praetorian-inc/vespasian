@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,6 +62,16 @@ message Event { google.protobuf.Timestamp at = 1; }`,
 			proto:   "syntax = \"proto3\";\nimport \"nope/absent.proto\";\n",
 			wantErr: "absent.proto",
 		},
+		{
+			// An empty spec COMPILES. That is not a defect in compile() but it is
+			// the documented limit of this check: a truncated emission passes it.
+			// Detecting missing content is the python service/method validation's
+			// job in run-live-tests.sh, immediately above the compile call — this
+			// case exists so that division of labour is recorded rather than
+			// rediscovered if that validation is ever refactored away.
+			name:  "empty spec compiles (content coverage is the python validation's job)",
+			proto: "",
+		},
 	}
 
 	for _, tt := range tests {
@@ -69,7 +81,7 @@ message Event { google.protobuf.Timestamp at = 1; }`,
 				t.Fatalf("write fixture: %v", err)
 			}
 
-			err := compile(path)
+			err := compile(context.Background(), path)
 
 			if tt.wantErr == "" {
 				if err != nil {
@@ -87,29 +99,112 @@ message Event { google.protobuf.Timestamp at = 1; }`,
 	}
 }
 
+// A generate step that produced no file at all reaches compile() as a
+// nonexistent path, and the shell reports that as "emitted .proto failed to
+// compile" — misattributing an upstream failure to the spec. Pin that the
+// diagnostic at least names the file, so the misattribution is diagnosable from
+// the message rather than looking like a syntax problem.
+func TestCompileNonexistentPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "never-written.proto")
+
+	err := compile(context.Background(), path)
+	if err == nil {
+		t.Fatal("compile(nonexistent) = nil, want an error")
+	}
+	if !strings.Contains(err.Error(), "never-written.proto") {
+		t.Errorf("compile() error = %q, want it to name the missing file", err)
+	}
+}
+
 // compile is handed an absolute path by run-live-tests.sh but a bare filename is
 // the easy thing to type by hand, and the dir=="." fallback exists only for that
 // case. Without a test it could be deleted as dead code.
+//
+// t.Chdir (Go 1.24+) rather than a hand-rolled Getwd/Chdir/Cleanup trio: it
+// restores the directory automatically AND panics if this test or a parent ever
+// calls t.Parallel(), which a manual restore cannot do. Without that interlock,
+// adding t.Parallel() anywhere in this package would let this chdir race against
+// siblings reading relative paths, and the only symptom would be an intermittent
+// failure in the suite whose whole job is to be the deterministic guard the live
+// suite is not.
 func TestCompileBareFilename(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "bare.proto"), []byte("syntax = \"proto3\";\n"), 0o600); err != nil {
 		t.Fatalf("write fixture: %v", err)
 	}
 
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := os.Chdir(wd); err != nil {
-			t.Fatalf("restore wd: %v", err)
-		}
-	})
-	if err := os.Chdir(dir); err != nil {
-		t.Fatalf("chdir: %v", err)
-	}
+	t.Chdir(dir)
 
-	if err := compile("bare.proto"); err != nil {
+	if err := compile(context.Background(), "bare.proto"); err != nil {
 		t.Fatalf("compile(bare filename) = %v, want nil", err)
 	}
+}
+
+// run-live-tests.sh consumes this command purely through its exit status, so the
+// contract that actually gates AC4 is: 0 when the spec compiles, non-zero when it
+// does not, diagnostics on STDERR. TestCompile covers compile() thoroughly but
+// none of that — a regression returning bare instead of non-zero, or printing the
+// diagnostic to stdout, would leave every subtest above green while the gRPC
+// target reported PASS on a malformed spec.
+func TestRun(t *testing.T) {
+	writeSpec := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "spec.proto")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+		return path
+	}
+
+	t.Run("wrong argument count exits 2 with usage on stderr", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+
+		if got := run([]string{"proto-validate"}, &stdout, &stderr); got != 2 {
+			t.Errorf("run(no args) = %d, want 2", got)
+		}
+		if !strings.Contains(stderr.String(), "usage:") {
+			t.Errorf("stderr = %q, want it to contain the usage line", stderr.String())
+		}
+		if stdout.Len() != 0 {
+			t.Errorf("stdout = %q, want empty", stdout.String())
+		}
+
+		stdout.Reset()
+		stderr.Reset()
+		if got := run([]string{"proto-validate", "a.proto", "b.proto"}, &stdout, &stderr); got != 2 {
+			t.Errorf("run(two specs) = %d, want 2", got)
+		}
+	})
+
+	t.Run("malformed spec exits 1 with the diagnostic on stderr", func(t *testing.T) {
+		path := writeSpec(t, "syntax = \"proto3\";\nmessage Dup { string a = 1; string b = 1; }\n")
+		var stdout, stderr bytes.Buffer
+
+		if got := run([]string{"proto-validate", path}, &stdout, &stderr); got != 1 {
+			t.Errorf("run(malformed) = %d, want 1", got)
+		}
+		if !strings.Contains(stderr.String(), "proto compile failed") {
+			t.Errorf("stderr = %q, want it to report the compile failure", stderr.String())
+		}
+		// The shell prints stderr on failure and nothing else; a diagnostic that
+		// leaked to stdout would be invisible in the live-test output.
+		if stdout.Len() != 0 {
+			t.Errorf("stdout = %q, want the diagnostic on stderr only", stdout.String())
+		}
+	})
+
+	t.Run("valid spec exits 0 with the OK line on stdout", func(t *testing.T) {
+		path := writeSpec(t, "syntax = \"proto3\";\nmessage M { string a = 1; }\n")
+		var stdout, stderr bytes.Buffer
+
+		if got := run([]string{"proto-validate", path}, &stdout, &stderr); got != 0 {
+			t.Errorf("run(valid) = %d, want 0; stderr=%q", got, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "OK:") {
+			t.Errorf("stdout = %q, want it to contain the OK line", stdout.String())
+		}
+		if stderr.Len() != 0 {
+			t.Errorf("stderr = %q, want empty on success", stderr.String())
+		}
+	})
 }

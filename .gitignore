@@ -51,7 +51,6 @@ test/.*.log
 test/rest-api/rest-api
 test/soap-service/soap-service
 test/grpc-server/grpc-server
-test/proto-validate/proto-validate
 test/concat-spa/concat-spa
 test/forms-target/forms-target
 test/graphql-server/node_modules/

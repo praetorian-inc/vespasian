@@ -333,7 +333,21 @@ _probe_grpc_target() {
         log_fail "grpc-server: no bounded probe available for ${TEST_HOST}:${port} (need grpcurl, nc, or timeout/gtimeout)"
         return 1
     fi
-    if "$t" "$budget" bash -c "echo > /dev/tcp/${TEST_HOST}/${port}" 2>/dev/null; then
+    # host/port go in as argv ($1/$2 inside the -c script), NOT spliced into the
+    # program text. `bash -c` PARSES its argument as shell source, so an
+    # interpolated "${TEST_HOST}/${port}" makes those two values the only thing
+    # separating this from arbitrary command execution: TEST_HOST='x/1; id #'
+    # would run `id`. Both values reach here unvalidated — TEST_HOST is an
+    # env-only seam (line 53) and port arrives as ${GRPC_SERVER_PORT:-}, which
+    # load_config's 1-65535 check only screens when it reads it OUT of a config
+    # file, never for a value already in the environment. As argv the inner
+    # shell never re-parses them. `_` fills $0 so $1/$2 land where expected.
+    # This mirrors wait_for_grpc at setup-live-targets.sh:661, whose comment
+    # spells out the same reasoning. Pinned by the hostile-TEST_HOST assertion
+    # in test-runner-args.sh ("_probe_grpc_target: hostile TEST_HOST is not
+    # executed by the /dev/tcp probe") — that assertion fails if this reverts to
+    # an interpolated string.
+    if "$t" "$budget" bash -c 'echo > /dev/tcp/"$1"/"$2"' _ "$TEST_HOST" "$port" 2>/dev/null; then
         log_ok "grpc-server reachable at ${TEST_HOST}:${port} (/dev/tcp)"
         return 0
     fi
@@ -1517,18 +1531,43 @@ PYEOF
     # bufbuild/protocompile, already present in the module graph. The check now
     # runs unconditionally, identically, on every runner and dev machine
     # (LAB-5549).
+    # $spec_file derives from RESULTS_DIR, an env override seam that permits a
+    # RELATIVE value (line 29). The compile runs under `cd "$PROJECT_ROOT"`, so a
+    # relative spec path would resolve against the wrong directory and report
+    # "failed to compile" for a spec that is fine. Resolve it to an absolute path
+    # BEFORE the cd so the subshell's cwd cannot change what it points at.
+    local spec_abs
+    spec_abs="$(cd "$(dirname "$spec_file")" && pwd)/$(basename "$spec_file")"
+
+    # Unlink before redirecting: `>` FOLLOWS symlinks, and the results tree
+    # persists across runs (the mkdir -p above does not clean it), so a symlink
+    # planted once at this exact path would silently truncate its destination on
+    # every later run as the user running the suite. rm -f replaces it instead.
+    local proto_err="${target_dir}/proto-validate.err"
+    rm -f "$proto_err"
+
     if grep -q '^// ---$' "$spec_file"; then
         # renderProto concatenates multiple reflection files into one output
-        # separated by "// ---"; a single-file compile cannot resolve a
-        # multi-file blob. The lab target emits a single file, so this branch is
-        # only a guard for future multi-file targets.
-        log_info "Skipping .proto compile: emitted spec is multi-file (concatenated)"
-    elif (cd "$PROJECT_ROOT" && go run ./test/proto-validate "$spec_file") \
-        2>"${target_dir}/proto-validate.err"; then
+        # separated by "// ---", and a single-file compile cannot resolve a
+        # multi-file blob. This target emits a single file, so reaching this
+        # branch means the emission shape changed.
+        #
+        # It FAILS rather than skipping. This whole block exists because the
+        # previous `command -v protoc` gate let the assertion pass by never
+        # executing; a skip here would be the same false green with a different
+        # trigger — read out of the very artifact being validated, so the
+        # artifact could switch off its own compile check while the target still
+        # reported PASS. A future multi-file target must teach proto-validate to
+        # split on "// ---" and compile the parts together, not re-open the skip.
+        log_fail "emitted .proto is multi-file (concatenated); the compile check cannot validate it:"
+        log_info "teach test/proto-validate to split on '// ---' and compile the parts together"
+        failures=$((failures + 1))
+    elif (cd "$PROJECT_ROOT" && go run ./test/proto-validate "$spec_abs") \
+        2>"$proto_err"; then
         log_ok "emitted .proto compiles (protocompile)"
     else
         log_fail "emitted .proto failed to compile:"
-        cat "${target_dir}/proto-validate.err" >&2
+        cat "$proto_err" >&2
         failures=$((failures + 1))
     fi
 

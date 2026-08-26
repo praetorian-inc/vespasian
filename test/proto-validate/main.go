@@ -1,37 +1,31 @@
-// Command proto-validate compiles a .proto file and exits non-zero if it does
-// not compile, printing the compiler diagnostics.
-//
-// It exists because the live-test suite's AC4 assertion (LAB-2778) — "the
-// emitted .proto actually compiles" — was gated on `command -v protoc` and so
-// silently skipped everywhere it mattered: protoc ships on no GitHub-hosted
-// ubuntu-24.04 image, and live-tests.yml runs under `disable-sudo: true`, which
-// rules out `apt-get install protobuf-compiler` (the same constraint that
-// forced LAB-3890 to drop `xmllint --schema`). A marketplace action such as
-// arduino/setup-protoc would need the praetorian-inc enterprise allowlist —
-// exactly what blocked LAB-4747. Compiling in-process with protocompile removes
-// the external dependency instead of provisioning it, so the check runs
-// unconditionally on every runner and developer machine (LAB-5549).
-//
-// protocompile is deliberately a DIFFERENT implementation from the
-// jhump/protoreflect protoprint that writes the spec, so this stays an
-// independent check rather than a printer agreeing with itself.
 package main
 
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/bufbuild/protocompile"
 )
+
+// compileTimeout bounds the in-process compile. The input is generated from a
+// remote server's reflection data rather than from a fixture in the repo, so a
+// pathological spec (deep nesting, a pathological import graph) would otherwise
+// turn a one-second check into a hang whose only backstop is live-tests.yml's
+// 30-minute job ceiling — with no diagnostic. The companion preflight in
+// run-live-tests.sh takes the same position: a check that hangs is strictly
+// worse than one that fails with a reason you can read.
+const compileTimeout = 60 * time.Second
 
 // compile compiles the .proto at path, returning the compiler's diagnostic on
 // failure. Split out from main so the reject cases have a unit test: this helper
 // is what stands between a malformed emitted spec and a green live-test run, and
 // a regression that made it always succeed would otherwise only show up as the
 // gRPC target quietly passing.
-func compile(path string) error {
+func compile(ctx context.Context, path string) error {
 	dir, file := filepath.Split(path)
 	if dir == "" {
 		dir = "."
@@ -47,20 +41,44 @@ func compile(path string) error {
 		SourceInfoMode: protocompile.SourceInfoNone,
 	}
 
-	_, err := compiler.Compile(context.Background(), file)
+	_, err := compiler.Compile(ctx, file)
 	return err
 }
 
-func main() {
-	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: proto-validate <file.proto>")
-		os.Exit(2)
+// run is the whole command, minus the process exit. It returns the exit code
+// rather than calling os.Exit, and writes through the io.Writers it is handed
+// rather than to the process streams, so the contract run-live-tests.sh actually
+// depends on — exit 0 compiles, non-zero does not, diagnostics on stderr — is
+// unit-testable. main() consumed only the exit status, so a regression that
+// returned bare instead of exiting non-zero, or that wrote the diagnostic to
+// stdout, would have left every compile() subtest green while the gRPC target
+// reported PASS on a malformed spec: the same silent pass the `command -v protoc`
+// gate produced, relocated one level up. TestRun pins each return.
+func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) != 2 {
+		fmt.Fprintln(stderr, "usage: proto-validate <file.proto>")
+		return 2
 	}
-	path := os.Args[1]
+	path := args[1]
 
-	if err := compile(path); err != nil {
-		fmt.Fprintf(os.Stderr, "proto compile failed: %v\n", err)
-		os.Exit(1)
+	ctx, cancel := context.WithTimeout(context.Background(), compileTimeout)
+	defer cancel()
+
+	if err := compile(ctx, path); err != nil {
+		// Name the timeout as its own outcome so a pathological spec is
+		// distinguishable from a malformed one rather than reading as a stuck
+		// runner.
+		if ctx.Err() != nil {
+			fmt.Fprintf(stderr, "proto compile timed out after %s: %v\n", compileTimeout, err)
+			return 1
+		}
+		fmt.Fprintf(stderr, "proto compile failed: %v\n", err)
+		return 1
 	}
-	fmt.Printf("OK: %s compiles\n", path)
+	fmt.Fprintf(stdout, "OK: %s compiles\n", path)
+	return 0
+}
+
+func main() {
+	os.Exit(run(os.Args, os.Stdout, os.Stderr))
 }

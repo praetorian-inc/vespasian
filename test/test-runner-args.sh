@@ -169,7 +169,9 @@ fi
 
 # Every group member must have a case-dispatch entry (direction a), so a target
 # cannot be listed in a group while `--targets <it>` falls through to the
-# unknown-target path.
+# unknown-target path. The call below is what enforces that: if the guarantee
+# ever becomes false, `report_undispatched_group_members` emits the
+# "in a group but has no case-dispatch entry" failure and this suite fails.
 report_undispatched_group_members "${OFFLINE_TARGETS[@]}" "${LIVE_TARGETS[@]}"
 
 # Every dispatch target must be in a group (direction b).
@@ -236,12 +238,236 @@ echo "=== Live group is startable by setup-live-targets.sh ==="
 # would probe a server nobody started and the target would fail on an unset
 # port rather than on anything about gRPC. This pins that cross-script seam;
 # ALL_TARGETS is sourced from setup-live-targets.sh above.
-if printf '%s\n' "${LIVE_TARGETS[@]}" | grep -qx 'grpc-server'; then
-    if printf '%s' "$ALL_TARGETS" | tr ',' '\n' | grep -qx 'grpc-server'; then
-        pass "grpc-server is in LIVE_TARGETS and startable by setup-live-targets.sh"
-    else
-        fail "grpc-server is in LIVE_TARGETS but absent from setup-live-targets.sh ALL_TARGETS"
-    fi
+#
+# Written as ONE assertion on every path, with a third arm, rather than as an
+# `if in LIVE_TARGETS` wrapper with no else. Wrapped, this was the only assertion
+# in the file whose EXISTENCE depended on the data it asserts about: drop
+# grpc-server from LIVE_TARGETS and it emitted neither pass nor fail, so the
+# accounting pin below failed with "a case was added or removed without updating
+# EXPECTED_ASSERTIONS" — blaming test maintenance for a real coverage regression.
+# The third arm names the actual cause instead.
+if ! printf '%s\n' "${LIVE_TARGETS[@]}" | grep -qx 'grpc-server'; then
+    fail "grpc-server left LIVE_TARGETS — this guard and the LAB-5549 rationale (gRPC runs by default) need revisiting"
+elif printf '%s' "$ALL_TARGETS" | tr ',' '\n' | grep -qx 'grpc-server'; then
+    pass "grpc-server is in LIVE_TARGETS and startable by setup-live-targets.sh"
+else
+    fail "grpc-server is in LIVE_TARGETS but absent from setup-live-targets.sh ALL_TARGETS"
+fi
+
+echo ""
+echo "=== gRPC preflight probe arms (_probe_grpc_target) ==="
+
+# _probe_grpc_target decides whether the whole live run aborts
+# (preflight_test_host ends in `exit 1`), and its arms are mutually exclusive on
+# tool availability, so on any given machine at most ONE of them ever executes:
+# CI exercises whichever of grpcurl/nc/timeout the runner image happens to ship
+# and the rest are dead in practice. That is the same environment-dependent,
+# never-executed-where-it-matters shape LAB-5549 removed from the protoc gate, so
+# it is not left to the runner image here. Each arm is driven with executable
+# fixtures on a controlled PATH — the pattern the load_config value-validation
+# block below already uses.
+#
+# The function text is extracted to a file BEFORE the PATH is restricted, because
+# `sed` would not be resolvable inside the sandbox; `source` is a builtin and
+# needs no PATH.
+probe_fn=$(new_tmp)
+sed -n '/^_probe_grpc_target()/,/^}/p' "$RUNNER" > "$probe_fn"
+
+# The sandbox holds ONLY bash (needed by the /dev/tcp arm). Everything else the
+# function looks for is absent unless a scenario dir supplies it, which is what
+# makes "grpcurl absent" and "no bounded probe available" reachable at all — a
+# real /usr/bin on PATH would supply the host's own nc or timeout and silently
+# route every case into one arm.
+probe_base="$TMPDIR_T/probe-base"
+mkdir -p "$probe_base"
+ln -s "$(command -v bash)" "$probe_base/bash"
+
+new_probe_dir() { # $1 = tool name, $2 = exit status
+    local d
+    d="$TMPDIR_T/probe-$1-$2"
+    mkdir -p "$d"
+    printf '#!/bin/sh\nexit %s\n' "$2" > "$d/$1"
+    chmod +x "$d/$1"
+    printf '%s' "$d"
+}
+d_grpcurl_ok=$(new_probe_dir grpcurl 0)
+d_grpcurl_fail=$(new_probe_dir grpcurl 1)
+d_nc_ok=$(new_probe_dir nc 0)
+# A real timeout replacement: drop the budget argument and exec the rest, so the
+# /dev/tcp arm actually runs its `bash -c` payload.
+d_timeout="$TMPDIR_T/probe-timeout"
+mkdir -p "$d_timeout"
+printf '#!/bin/sh\nshift\nexec "$@"\n' > "$d_timeout/timeout"
+chmod +x "$d_timeout/timeout"
+
+# Runs _probe_grpc_target under a restricted PATH, echoing "rc=<status>" after
+# the function's own output so both are assertable. `|| rc=$?` is required: this
+# suite runs under `set -e`, so a returning-1 arm would otherwise abort the
+# subshell before the status was printed.
+run_probe() { # $1 = PATH, $2 = TEST_HOST, $3 = port
+    (
+        PATH="$1"
+        export PATH
+        source "$SCRIPT_DIR/common.sh"
+        source "$probe_fn"
+        declare -F _probe_grpc_target >/dev/null || { echo "SENTINEL_PROBE_MISSING"; exit 0; }
+        TEST_HOST="$2"
+        rc=0
+        _probe_grpc_target "$3" || rc=$?
+        echo "rc=$rc"
+    ) 2>&1
+}
+
+# Guard the extraction itself: an empty or broken sed range would make every
+# assertion below vacuous rather than failing.
+if [[ "$(run_probe "$probe_base" localhost "")" == *SENTINEL_PROBE_MISSING* ]]; then
+    fail "_probe_grpc_target extraction is broken/empty — the probe-arm assertions below are vacuous"
+else
+    pass "_probe_grpc_target sourced from run-live-tests.sh (probe-arm block)"
+fi
+
+# Arm 1: port unset. Mirrors _probe_target_host's contract — a target
+# setup-live-targets.sh never configured is not a failure.
+out=$(run_probe "$probe_base" localhost "")
+if [[ "$out" == "rc=0" ]]; then
+    pass "_probe_grpc_target: unset port returns 0 with no log output"
+else
+    fail "_probe_grpc_target: unset port expected bare 'rc=0', got: $out"
+fi
+
+# Arm 2: grpcurl present and answering.
+out=$(run_probe "$d_grpcurl_ok:$probe_base" localhost 50051)
+if [[ "$out" == *"grpc-server reachable at localhost:50051"* && "$out" == *"rc=0"* ]]; then
+    pass "_probe_grpc_target: grpcurl success reports reachable and returns 0"
+else
+    fail "_probe_grpc_target: grpcurl success arm, got: $out"
+fi
+
+# Arm 3: grpcurl present and refusing. grpcurl is authoritative when present —
+# it must NOT fall through to the weaker nc/dev-tcp arms.
+out=$(run_probe "$d_grpcurl_fail:$d_nc_ok:$probe_base" localhost 50051)
+if [[ "$out" == *"grpc-server is unreachable at localhost:50051"* && "$out" == *"rc=1"* && "$out" != *"(nc)"* ]]; then
+    pass "_probe_grpc_target: grpcurl failure returns 1 without falling through to nc"
+else
+    fail "_probe_grpc_target: grpcurl failure arm, got: $out"
+fi
+
+# Arm 4: no grpcurl, nc answers.
+out=$(run_probe "$d_nc_ok:$probe_base" localhost 50051)
+if [[ "$out" == *"grpc-server reachable at localhost:50051 (nc)"* && "$out" == *"rc=0"* ]]; then
+    pass "_probe_grpc_target: nc success reports reachable via nc and returns 0"
+else
+    fail "_probe_grpc_target: nc success arm, got: $out"
+fi
+
+# Arm 5: nothing bounded available. This must FAIL rather than degrade to an
+# unbounded connect — a preflight exists to fail fast, so a hang is strictly
+# worse than a diagnosable failure (a deliberate divergence from the
+# graceful-degrade precedent in setup-live-targets.sh's wait_for_grpc).
+out=$(run_probe "$probe_base" localhost 50051)
+if [[ "$out" == *"no bounded probe available for localhost:50051"* && "$out" == *"rc=1"* ]]; then
+    pass "_probe_grpc_target: no bounded probe available fails and names the missing tools"
+else
+    fail "_probe_grpc_target: no-bounded-probe arm, got: $out"
+fi
+
+# Arms 6-7: the /dev/tcp arm must not let TEST_HOST reach a shell PARSER.
+# `bash -c` parses its argument as shell source, so an interpolated
+# "${TEST_HOST}/${port}" would execute anything TEST_HOST carries. TEST_HOST is an
+# env-only seam and the port is unvalidated when it comes from the environment, so
+# neither value is screened before this call.
+#
+# The payload uses only the `printf` builtin and a redirect — no external command
+# — because the sandbox PATH holds nothing else. A payload needing /usr/bin/touch
+# would be inert here for the wrong reason and the assertion could never fail.
+probe_marker="$TMPDIR_T/probe-injection-marker"
+hostile_host="x/1; printf pwned > $probe_marker #"
+
+# Positive control FIRST: prove the payload really does fire against the
+# vulnerable interpolated form. Without this, the negative assertion below cannot
+# be distinguished from a payload that never had a chance to run.
+rm -f "$probe_marker"
+( PATH="$d_timeout:$probe_base"; export PATH
+  timeout 5 bash -c "echo > /dev/tcp/${hostile_host}/50051" ) >/dev/null 2>&1 || true
+if [[ -f "$probe_marker" ]]; then
+    pass "_probe_grpc_target: injection payload fires against the interpolated form (positive control — this assertion can fail)"
+else
+    fail "_probe_grpc_target: injection payload did not fire even against the interpolated form — the hostile-TEST_HOST assertion below would be vacuous"
+fi
+
+# The real assertion: the shipped function must NOT execute it.
+rm -f "$probe_marker"
+out=$(run_probe "$d_timeout:$probe_base" "$hostile_host" 50051)
+if [[ ! -f "$probe_marker" ]]; then
+    pass "_probe_grpc_target: hostile TEST_HOST is not executed by the /dev/tcp probe"
+else
+    fail "_probe_grpc_target: hostile TEST_HOST was EXECUTED by the /dev/tcp probe (command injection); output: $out"
+fi
+rm -f "$probe_marker"
+
+echo ""
+echo "=== gRPC preflight case-block dispatch (preflight_test_host) ==="
+
+# grpc-server and concat-spa were arms of the SAME `case ',${targets},' in`
+# statement, and `case` stops at the first matching arm — so any run selecting
+# both probed gRPC and silently SKIPPED concat-spa's /healthz probe. Harmless
+# only while grpc-server was config-only; moving it into LIVE_TARGETS made that
+# skip permanent for every `--group live` run. Splitting the arms into separate
+# `case` statements fixed it, and this pins the fix.
+#
+# The failure mode is silent by construction — a skipped probe produces no output
+# and no failure — which is why it survived from PR #159 until LAB-5549. It
+# recurs the moment anyone adds a target by appending an arm to an existing
+# `case` instead of opening a new one, so the guard is on the dispatch, not on
+# grpc-server specifically.
+preflight_fn=$(new_tmp)
+sed -n '/^preflight_test_host()/,/^}/p' "$RUNNER" > "$preflight_fn"
+
+run_preflight() { # $1 = targets list
+    (
+        source "$SCRIPT_DIR/common.sh"
+        source "$preflight_fn"
+        declare -F preflight_test_host >/dev/null || { echo "SENTINEL_PREFLIGHT_MISSING"; exit 0; }
+        # Stubs record the call instead of touching the network. $3 is the target
+        # name _probe_target_host is passed; the gRPC probe takes only a port.
+        _probe_target_host() { echo "PROBED:$3"; return 0; }
+        _probe_grpc_target() { echo "PROBED:grpc-server"; return 0; }
+        REST_API_PORT=1
+        SOAP_SERVICE_PORT=2
+        GRAPHQL_SERVER_PORT=3
+        GRPC_SERVER_PORT=4
+        CONCAT_SPA_PORT=5
+        FORMS_TARGET_PORT=6
+        preflight_test_host "$1" || true
+    ) 2>&1
+}
+
+if [[ "$(run_preflight grpc-server)" == *SENTINEL_PREFLIGHT_MISSING* ]]; then
+    fail "preflight_test_host extraction is broken/empty — the dispatch assertions below are vacuous"
+else
+    pass "preflight_test_host sourced from run-live-tests.sh (case-dispatch block)"
+fi
+
+# The exact co-selection that was broken: both probes must fire.
+out=$(run_preflight "grpc-server,concat-spa")
+if [[ "$out" == *"PROBED:grpc-server"* && "$out" == *"PROBED:concat-spa"* ]]; then
+    pass "preflight_test_host: grpc-server and concat-spa co-selected both probe (no shared case arm)"
+else
+    fail "preflight_test_host: co-selecting grpc-server,concat-spa must probe both, got: $out"
+fi
+
+# Generalised: selecting the whole live group must fire every case block, so a
+# future target folded into an existing arm is caught even if it is not
+# concat-spa.
+out=$(run_preflight "$(join_targets "${LIVE_TARGETS[@]}")")
+missing_probes=""
+for expected_probe in rest-api soap-service graphql-server grpc-server concat-spa forms-target; do
+    [[ "$out" == *"PROBED:${expected_probe}"* ]] || missing_probes="${missing_probes} ${expected_probe}"
+done
+if [[ -z "$missing_probes" ]]; then
+    pass "preflight_test_host: --group live selection fires every target's probe"
+else
+    fail "preflight_test_host: --group live selection skipped probe(s):${missing_probes}; got: $out"
 fi
 
 echo ""
@@ -349,8 +575,22 @@ fi
 # `declare -g` would, and a sentinel in neither group keeps both halves
 # discriminating. Verified by mutation: adding the "all" arm's TARGETS_SETUP
 # prepend to the live arm fails this assertion.
-scoped_offline=$(env TARGETS_SETUP=phantom-setup-target bash -c "source '$RUNNER' --group offline --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
-scoped_live=$(env TARGETS_SETUP=phantom-setup-target bash -c "source '$RUNNER' --group live --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
+#
+# CONFIG_FILE is ALSO pinned to an empty fixture, so the sentinel survives
+# whether or not load_config runs on this path. Reason 1 above is a property of
+# the runner (--dry-run returns before the `targets_need_config` → load_config
+# call), not of this test, and nothing here asserts it. Left unpinned, the day
+# that gating changes load_config's `declare -g TARGETS_SETUP` would overwrite
+# the sentinel from whatever real .live-test-config happens to exist on the
+# machine — in CI, one naming rest-api,soap-service,graphql-server,grpc-server,
+# every one of them a group member — the comparison would pass for the wrong
+# reason, and this assertion would be unable to fail again. Every sibling config
+# assertion in this file pins CONFIG_FILE to a new_tmp fixture for the same
+# reason (see the --group all subset check above).
+scoped_cfg=$(new_tmp)
+: > "$scoped_cfg"
+scoped_offline=$(env CONFIG_FILE="$scoped_cfg" TARGETS_SETUP=phantom-setup-target bash -c "source '$RUNNER' --group offline --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
+scoped_live=$(env CONFIG_FILE="$scoped_cfg" TARGETS_SETUP=phantom-setup-target bash -c "source '$RUNNER' --group live --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
 if [[ "$scoped_offline" == "$(join_targets "${OFFLINE_TARGETS[@]}")" && "$scoped_live" == "$(join_targets "${LIVE_TARGETS[@]}")" ]]; then
     pass "TARGETS_SETUP ignored for --group offline/live (sentinel absent from both)"
 else
@@ -2314,7 +2554,28 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # pins that cross-script pairing: the coverage guards check groups against the
 # dispatch block, and the browser-classification guard checks ALL_TARGETS
 # membership, but neither relates a live-group member to its startability.
-EXPECTED_ASSERTIONS=136
+# 136 -> 147. MEASURED. +11 for the gRPC preflight coverage the LAB-5549 review
+# found missing: _probe_grpc_target and preflight_test_host's case dispatch were
+# both new behaviour with no test at all.
+#
+# +8 for _probe_grpc_target (1 extraction sentinel, 5 arms, 2 for injection).
+# Its arms are mutually exclusive on tool availability, so at most one ever runs
+# on a given machine and CI covered whichever of grpcurl/nc/timeout the runner
+# image ships — the other four were dead in practice. They are driven here on a
+# sandboxed PATH holding only bash, so "grpcurl absent" and "no bounded probe
+# available" are reachable at all. Two of the eight are the /dev/tcp injection
+# pair: TEST_HOST must not reach the `bash -c` PARSER, and the positive control
+# proves the payload fires against the interpolated form, so the negative
+# assertion cannot pass because the payload was inert.
+#
+# +3 for preflight_test_host (1 extraction sentinel, 2 dispatch). grpc-server and
+# concat-spa shared one `case` statement and `case` stops at the first match, so
+# every run selecting both silently skipped concat-spa's probe. The fix (separate
+# `case` blocks) had only a one-off manual run behind it. The generalised arm
+# asserts the whole live group probes every target, so a future target folded
+# into an existing arm is caught too — the skip produces no output and no
+# failure, which is why the original survived from PR #159.
+EXPECTED_ASSERTIONS=147
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."

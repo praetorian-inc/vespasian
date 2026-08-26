@@ -406,8 +406,16 @@ REST_API_PORT=8990
 SOAP_SERVICE_PORT=8991
 GRAPHQL_SERVER_PORT=8992
 GRPC_SERVER_PORT=50051
-TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server
+CONCAT_SPA_PORT=8993
+FORMS_TARGET_PORT=8994
+TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server,concat-spa,forms-target
 ```
+
+That is what a **default** `./test/setup-live-targets.sh` writes: all six port keys
+and every member of the setup script's `ALL_TARGETS`. A partial run
+(`--targets <subset>`) writes an empty value for each port it did not configure,
+which is why `load_config` skips empty values rather than treating them as
+invalid.
 
 > **`TARGETS_SETUP` is additive, not restrictive.** A bare `./test/run-live-tests.sh`
 > resolves the full `all` group (every `OFFLINE_TARGETS` + `LIVE_TARGETS`).
@@ -427,6 +435,7 @@ TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server
 | soap-service | 8991 |
 | graphql-server | 8992 |
 | grpc-server | 50051 |
+| concat-spa | 8993 |
 | forms-target | 8994 |
 
 Ports are auto-resolved if the default is in use (searches up to 20 ports ahead).
@@ -590,6 +599,11 @@ test/
 │   ├── main.go              # gRPC server (UserService, OrderService, AccountService)
 │   └── expected-paths.json  # Expected services/methods for validation
 │
+├── proto-validate/
+│   ├── doc.go               # Package docs + the exit-code contract run-live-tests.sh consumes
+│   ├── main.go              # Compiles a generated .proto in-process (protocompile); AC4 check
+│   └── main_test.go         # Reject cases + the exit-code contract
+│
 ├── forms-target/
 │   ├── main.go              # HTML forms server (POST/GET <form> endpoints)
 │   └── expected-paths.json  # Expected form-derived paths + query params for validation
@@ -648,8 +662,11 @@ brew install --cask google-chrome
 troubleshooting side. `setup-live-targets.sh` probes each candidate binary with
 `--version` before accepting it, so it fails preflight with `Found <path> but it is
 not runnable` instead of failing later during `vespasian crawl`. Fix with
-`./test/install-chrome.sh`, `snap install chromium`, or install `google-chrome`
-directly.
+`./test/install-chrome.sh` or install `google-chrome` directly. `snap install
+chromium` is **not** a fix for the container case described here — snapd is
+unavailable inside the container (see [Chrome in containers](#chrome-in-containers)),
+which is what produced the stub in the first place; it only applies on a host
+where snapd is actually running.
 
 **macOS note:** the runnability probe uses `timeout` (falling back to
 `gtimeout` from Homebrew coreutils) to guard against a hanging binary. Stock
