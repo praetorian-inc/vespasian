@@ -76,7 +76,10 @@ permissions:
 # and docs-check need no entry. It does NOT cover the ACTIONS CACHE or
 # upload-artifact: in the same run the `test` job used productionresultssa2 AND
 # productionresultssa14, neither of them the injected one. Three accounts in one
-# job is why no tighter form exists.
+# job in that run is why no tighter form has held. Narrowing it is not left to
+# reviewer attention: the exact-endpoint pin in test/test-runner-args.sh compares
+# the whole set per job, so replacing the wildcard with a named account mismatches
+# the pin and fails that job by name.
 #
 # The rule for a NEW job is "does it touch the Actions cache or upload an
 # artifact", NOT "does it use `cache: npm`". integration-tests carries the
@@ -156,6 +159,41 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           persist-credentials: false
+
+      # AC3 RUNTIME PROOF (LAB-6015). The policy pin in test/test-runner-args.sh
+      # verifies that this workflow SAYS `block`; it cannot verify that block
+      # ENFORCES. A harden-runner that stopped enforcing — or failed open after a
+      # runner-image change — leaves the YAML byte-identical and every static
+      # assertion green, which is the "assertion that passes by not executing"
+      # shape 13T-146 exists to stop. This step is the only thing in the repo that
+      # reads the runtime behaviour rather than the file.
+      #
+      # BOTH verdicts are load-bearing:
+      #   * proxy.golang.org is a real, reachable host deliberately absent from
+      #     THIS job's two-entry allowlist, so under `block` it must be REFUSED.
+      #     Under `audit` the same request succeeds — that is what makes this
+      #     assertion discriminating instead of vacuous.
+      #   * github.com IS on the allowlist and must SUCCEED. Without this control a
+      #     runner with no egress at all would satisfy the refusal above for the
+      #     wrong reason and still report green.
+      #
+      # Keep proxy.golang.org OFF this job's allowlist: adding it there silently
+      # turns this assertion into a no-op. That is not left to reviewer attention —
+      # the exact-endpoint pin in test/test-runner-args.sh compares the whole set
+      # and fails this job by name if the endpoint is added.
+      - name: Assert egress policy enforces (AC3)
+        run: |
+          set -euo pipefail
+          if curl -sS --max-time 15 -o /dev/null https://proxy.golang.org/ 2>/dev/null; then
+            echo "FAIL: reached proxy.golang.org, which is absent from this job's allowlist — the egress policy is not enforcing"
+            exit 1
+          fi
+          echo "ok: unlisted host refused"
+          if ! curl -sS --max-time 15 -o /dev/null https://github.com/; then
+            echo "FAIL: cannot reach github.com, which IS allowlisted — this runner has no egress at all, so the refusal above proves nothing"
+            exit 1
+          fi
+          echo "ok: allowlisted host reachable — the refusal above is attributable to the policy"
 
       # All four guard suites below are invoked by DIRECT EXEC, not via `bash`.
       # They are committed 100755 and the repo tells operators to run them that
@@ -504,11 +542,13 @@ jobs:
     steps:
       # Egress allowlist derived from telemetry — see the ALLOWLIST PROVENANCE
       # block above jobs:. setup-go pins the toolchain from go.mod, so there is no
-      # GOTOOLCHAIN fetch and storage.googleapis.com is NOT needed here (unlike
-      # preflight-selftest). Chrome's egress is deliberately absent: this job drives
-      # a browser and the observed clients2.google.com / www.google.com /
-      # update.googleapis.com calls are Chrome phoning home, which no assertion
-      # depends on and which this policy exists to stop.
+      # GOTOOLCHAIN fetch and storage.googleapis.com is NOT needed here:
+      # preflight-selftest reaches that same end by a different route, its
+      # GOTOOLCHAIN: local, so the endpoint is on no job's list at all. Chrome's
+      # egress is deliberately absent: this job drives a browser and the observed
+      # clients2.google.com / www.google.com / update.googleapis.com calls are
+      # Chrome phoning home, which no assertion depends on and which this policy
+      # exists to stop.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
       # bump ALL FIVE copies in lockstep — a missed copy silently leaves a job on

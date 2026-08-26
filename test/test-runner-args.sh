@@ -2056,12 +2056,18 @@ echo "=== harden-runner egress policy ==="
 # checking its shape, because the first version of this guard checked shape —
 # "is the value `block`, are there one or more endpoints" — and eight mutations
 # walked straight through it: an allowlist collapsed to `*:443` (one entry, so it
-# passed), a SECOND harden-runner step on `audit` in the same job, `if: false` on
-# the step so the policy never installs, the step moved below checkout so it
-# polices nothing before it, a changed SHA, a look-alike action name, and a
-# deleted `disable-sudo: true`. Each left the suite at 141/0, exit 0. Comparing
-# an exact normalised value makes every one of those a mismatch, because they all
-# change the value and none of them changes the shape.
+# passed), an extra endpoint added, a SECOND harden-runner step on `audit` in the
+# same job, `if: false` on the step so the policy never installs, the step moved
+# below checkout so it polices nothing before it, a changed SHA, a look-alike
+# action name, and a deleted `disable-sudo: true`. Each left the suite at 141/0,
+# exit 0. Comparing an exact normalised value makes every one of those a
+# mismatch, because they all change the value and none of them changes the shape.
+#
+# That last sentence is MEASURED, not argued — but by hand, and there is no
+# standing mutation test that would fail if it stopped being true. The full run
+# (these eight, plus the two the shape check did already catch) is recorded with
+# the EXPECTED_ASSERTIONS pin at the bottom of this file. Re-run it by hand when
+# this block or hr_policy() changes.
 #
 # EXPECTED_HR_JOBS is HARDCODED, deliberately, and this is the second half of the
 # fix. The first version derived the job list from the workflow, which meant a
@@ -2390,7 +2396,10 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # Measured then: 136 against a pin of 141, where base was exact at 135. Measured
 # now, with yq hidden from PATH: 127 passed + 14 failed = 141, no drift message.
 # Iterating the hardcoded EXPECTED_HR_JOBS is what makes the total independent of
-# both yq and the workflow's contents.
+# both yq and the workflow's contents. The test that fails if it stops being
+# constant is the EXPECTED_ASSERTIONS comparison immediately below: it runs on
+# every host, and a count that varied with yq's presence would trip its
+# "accounting drift" branch on any host without it.
 #
 # Mutation-proven, ten mutations, every one CAUGHT (each left the PREVIOUS
 # shape-checking version at 141/0, exit 0): policy -> audit; allowlist emptied; a
