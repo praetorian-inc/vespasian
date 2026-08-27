@@ -11,6 +11,6 @@ permissions:
 
 jobs:
   metrics:
-    uses: praetorian-inc/public-workflows/.github/workflows/leaderboard-metrics.yml@c351826e6de27cadeb5b32ce81157355b283518b # v2.16.3
+    uses: praetorian-inc/public-workflows/.github/workflows/leaderboard-metrics.yml@2cce562404572f0e8004fc0fa1ad91a62a41592f # v2.19.0
     with:
       capability_map: '[{"path": ".", "name": "vespasian"}]'
