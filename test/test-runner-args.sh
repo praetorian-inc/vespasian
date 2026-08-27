@@ -600,20 +600,27 @@ fi
 # MALFORMED spec, and assert it counts a failure. A reintroduced
 # `! command -v protoc ||` short-circuits to success on a protoc-absent host,
 # which is precisely CI's state.
-ac4_bin="$TMPDIR_T/ac4-bin"; mkdir -p "$ac4_bin"
-for _t in sh bash go sed grep dirname basename cat rm mkdir uname env tr; do
-    _p=$(command -v "$_t" 2>/dev/null) && ln -sf "$_p" "$ac4_bin/$_t"
-done
-ac4_dir="$TMPDIR_T/ac4-run"; mkdir -p "$ac4_dir"
-printf 'syntax = "proto3";\nmessage D { string a = 1; string b = 1; }\n' > "$ac4_dir/spec.proto"
-# WRAPPED IN A FUNCTION. The block declares `local spec_dir spec_abs` and
-# `local proto_err=...`, and `local` outside a function is a hard error: sourced at
-# top level those assignments never happened, `2>"$proto_err"` became an invalid
-# redirect, the compound command failed BEFORE `go run` was reached, and control
-# always landed in the else arm. failures=1 unconditionally -- so the assertion
-# below, which only tests for failures=1, passed on a VALID spec too. Measured: it
-# also survived reverting the elif to the root-relative form that cannot resolve
-# without a workspace. A vacuous guard in the one place LAB-5549 must not regress.
+# Driven with a STUB validator, not the real toolchain. The property under test is
+# the BLOCK's control flow -- does it invoke the validator, and does it count the
+# result -- not whether protocompile works, which test/proto-validate's own unit
+# tests and ci.yml's proto-validate-tests job already cover.
+#
+# That distinction is load-bearing for WHERE this suite runs. Requiring a real
+# `go run` put a Go toolchain AND a module-proxy fetch inside live-tests.yml's
+# `preflight-selftest` job, which has no setup-go and whose documented property is
+# that these suites need "no Go, Node, or Chrome" (AGENTS.md). Measured: with
+# GOPROXY=off and an empty module cache the real-toolchain form FAILED, and the
+# LAB-4732 egress audit->block flip would have made that CI's steady state, with a
+# message blaming run-live-tests.sh.
+#
+# The stub is also STRICTLY STRONGER: it records that it was CALLED, so the
+# round-4 vacuity (the block failing before ever reaching the validator) is caught
+# directly rather than inferred from an exit status.
+# WRAPPED IN A FUNCTION. The block declares `local spec_abs`, and `local` outside a
+# function is a hard error: sourced at top level that assignment failed, the
+# compound command died before the validator was reached, and failures=1 came back
+# for every input -- so a single-direction assertion passed vacuously. That was the
+# round-4 defect in this very guard.
 ac4_fn=$(new_tmp)
 {
     printf '_ac4_block() {\n'
@@ -621,16 +628,34 @@ ac4_fn=$(new_tmp)
     printf '}\n'
 } > "$ac4_fn"
 
-# Guard the extraction: a broken end anchor would otherwise wrap ~1000 lines of
-# the runner into the function and source it.
+# Guard the extraction: a broken end anchor would otherwise wrap ~1000 lines of the
+# runner into the function and source it.
 if [ -s "$ac4_fn" ] && grep -q 'proto-validate' "$ac4_fn" && [ "$(wc -l < "$ac4_fn")" -lt 120 ]; then
     pass "AC4 block extracted and wrapped for execution (bounded, non-empty)"
 else
-    fail "AC4 block extraction is empty, oversized ($(wc -l < "$ac4_fn") lines), or missing its proto-validate call — the behavioural assertion below cannot be trusted"
+    fail "AC4 block extraction is empty, oversized ($(wc -l < "$ac4_fn") lines), or missing its proto-validate call — the behavioural assertions below cannot be trusted"
 fi
-ac4_run() { # $1 = spec body
-    printf '%s' "$1" > "$ac4_dir/spec.proto"
+
+ac4_bin="$TMPDIR_T/ac4-bin"; mkdir -p "$ac4_bin"
+for _t in sh bash sed grep dirname basename cat rm mkdir uname env tr printf; do
+    _p=$(command -v "$_t" 2>/dev/null) && ln -sf "$_p" "$ac4_bin/$_t"
+done
+# Fake `go`: records its argv, then exits with the status in AC4_STUB_RC.
+cat > "$ac4_bin/go" <<'AC4GO'
+#!/bin/sh
+printf '%s\n' "$*" >> "$AC4_STUB_LOG"
+exit "${AC4_STUB_RC:-0}"
+AC4GO
+chmod +x "$ac4_bin/go"
+
+ac4_dir="$TMPDIR_T/ac4-run"; mkdir -p "$ac4_dir"
+ac4_stub_log="$TMPDIR_T/ac4-stub.log"
+
+ac4_run() { # $1 = stub exit status
+    : > "$ac4_stub_log"
+    printf 'syntax = "proto3";\nmessage M { string a = 1; }\n' > "$ac4_dir/spec.proto"
     PATH="$ac4_bin" AC4_ROOT="$SCRIPT_DIR/.." AC4_DIR="$ac4_dir" AC4_FN="$ac4_fn" \
+    AC4_STUB_RC="$1" AC4_STUB_LOG="$ac4_stub_log" \
     "$ac4_bin/bash" -c '
         log_ok(){ printf "OK:%s\n" "$1"; }
         log_fail(){ printf "FAIL:%s\n" "$1"; }
@@ -645,20 +670,22 @@ ac4_run() { # $1 = spec body
     ' 2>&1 || true
 }
 
-# BOTH directions. Asserting only "a malformed spec fails" is what let the vacuous
-# version through -- a block that fails on everything satisfies it. The valid case
-# is what proves the compile actually ran.
-ac4_bad=$(ac4_run 'syntax = "proto3";
-message D { string a = 1; string b = 1; }
-')
-ac4_good=$(ac4_run 'syntax = "proto3";
-message M { string a = 1; }
-')
-if [[ "$ac4_bad" == *"failures=1"* ]] && [[ "$ac4_good" == *"failures=0"* ]] &&
-   ! PATH="$ac4_bin" command -v protoc >/dev/null 2>&1; then
-    pass "AC4 block evaluates the compile with protoc ABSENT: rejects a malformed spec AND accepts a valid one"
+ac4_pass_out=$(ac4_run 0); ac4_pass_log=$(cat "$ac4_stub_log" 2>/dev/null)
+ac4_fail_out=$(ac4_run 1)
+
+# The validator must actually be INVOKED. This is the anti-vacuity property: the
+# round-4 guard failed before reaching it and still reported failures=1.
+if printf '%s' "$ac4_pass_log" | grep -q 'run \.'; then
+    pass "AC4 block actually invokes the proto validator (\`go run .\` observed, not inferred)"
 else
-    fail "AC4 block must reject a malformed spec and ACCEPT a valid one on a protoc-absent PATH — otherwise the compile is not running. malformed=[$ac4_bad] valid=[$ac4_good]"
+    fail "AC4 block never invoked the validator — the compile assertion is not running at all. Stub log: [$ac4_pass_log]"
+fi
+
+# And it must COUNT the result in both directions.
+if [[ "$ac4_pass_out" == *"failures=0"* ]] && [[ "$ac4_fail_out" == *"failures=1"* ]]; then
+    pass "AC4 block counts the validator's verdict: success -> failures=0, failure -> failures=1"
+else
+    fail "AC4 block must map the validator's exit status onto failures (0 and 1). success=[$ac4_pass_out] failure=[$ac4_fail_out]"
 fi
 
 # (b) Every non-success arm must count a failure. A branch that neither compiles
@@ -2769,11 +2796,23 @@ pv_block=$(extract_job_block proto-validate-tests)
 # so it pinned YAML KEY ORDER: moving `run:` above `working-directory:` -- identical
 # semantics to Actions -- failed the assertion. That traded a false negative for a
 # false positive. yq answers the structural question directly.
+# BOTH properties, on the SAME step. The awk form this replaced checked
+# working-directory AND `-race`; the first yq rewrite kept only the
+# working-directory, so `run: go test ./...` -- dropping -race from the only job
+# that runs the nested module's tests in CI -- survived at 179/0 while the file
+# still visibly contained a -race pin (which by then covered the Makefile alone).
+# Fixing the key-order false positive must not cost the property being pinned.
 pv_step_wd=$(yq_query '.jobs["proto-validate-tests"].steps[] | select(.run | test("go test")) | .["working-directory"] // "__ABSENT__"')
+pv_step_run=$(yq_query '.jobs["proto-validate-tests"].steps[] | select(.run | test("go test")) | .run')
 case "$pv_step_wd" in
-    __NO_YQ__)    fail_no_yq "ci.yml's go-test step runs inside test/proto-validate" ;;
-    __YQ_ERROR__) fail_yq_error "ci.yml's go-test step runs inside test/proto-validate" ;;
-    test/proto-validate) pass "ci.yml proto-validate-tests' go-test step runs with working-directory: test/proto-validate (key order independent)" ;;
+    __NO_YQ__)    fail_no_yq "ci.yml's go-test step runs inside test/proto-validate with -race" ;;
+    __YQ_ERROR__) fail_yq_error "ci.yml's go-test step runs inside test/proto-validate with -race" ;;
+    test/proto-validate)
+        if printf '%s' "$pv_step_run" | grep -q -- '-race'; then
+            pass "ci.yml proto-validate-tests' go-test step runs with working-directory: test/proto-validate AND -race (key-order independent)"
+        else
+            fail "ci.yml's go-test step lost -race — this job is the only thing running the nested module's tests in CI, so the race detector would stop running there entirely. Got run: $pv_step_run"
+        fi ;;
     *)            fail "ci.yml's go-test step must set working-directory: test/proto-validate — without a workspace a root-relative module pattern does not resolve, so the nested module's tests would not run. Got: $pv_step_wd" ;;
 esac
 
@@ -2814,17 +2853,30 @@ if [ -f "$WORKFLOW" ]; then
         *)            fail "security.yml proto-validate-security has a job-level if: — the nested module's dependency scan can be switched off while every suite stays green" ;;
     esac
 
-    # Scoped to the govulncheck STEP, not the job: the sibling gosec step also
-    # carries a working-directory, so grepping the job block would pass with the
-    # govulncheck one deleted (the hole the ci.yml assertion already hit once).
+    # Both scanners pinned BY THEIR run: COMMAND via yq, not by grepping an awk
+    # slice. The earlier form extracted from `- name: govulncheck ...` and then
+    # grepped the slice for "govulncheck" — which the NAME LINE satisfies. Measured:
+    # replacing `run: govulncheck ./...` with `run: true` kept the suite at 179/179
+    # while leaving the nested module entirely unscanned. That is the very failure
+    # this block exists to prevent, inside the block itself. yq also makes the check
+    # independent of YAML key order, the false positive the ci.yml twin already hit.
     pvs_block=$(extract_job_block proto-validate-security)
-    pvs_vuln_step=$(printf '%s\n' "$pvs_block" | awk '/- name: govulncheck/{f=1} f{print} f&&/^[[:space:]]*run:/{exit}')
-    if printf '%s' "$pvs_vuln_step" | grep -q 'working-directory:[[:space:]]*test/proto-validate' &&
-       printf '%s' "$pvs_vuln_step" | grep -q 'govulncheck'; then
-        pass "security.yml govulncheck step enters test/proto-validate and scans there"
+    if [ -n "$pvs_block" ] && printf '%s' "$pvs_block" | grep -q 'proto-validate'; then
+        pass "security.yml proto-validate-security job block extracted (assertions below are non-vacuous)"
     else
-        fail "security.yml's govulncheck STEP must itself set working-directory: test/proto-validate — otherwise it re-scans the repo root the reusable job already covers and the nested module goes unscanned. Step was: $pvs_vuln_step"
+        fail "security.yml proto-validate-security job block is empty — the scan-wiring assertions below would pass vacuously; fix extract_job_block rather than deleting them"
     fi
+
+    for pvs_tool in govulncheck gosec; do
+        pvs_wd=$(yq_query ".jobs[\"proto-validate-security\"].steps[] | select(.run | test(\"^${pvs_tool} \")) | .[\"working-directory\"] // \"__ABSENT__\"")
+        case "$pvs_wd" in
+            __NO_YQ__)    fail_no_yq "security.yml's ${pvs_tool} step runs inside test/proto-validate" ;;
+            __YQ_ERROR__) fail_yq_error "security.yml's ${pvs_tool} step runs inside test/proto-validate" ;;
+            test/proto-validate) pass "security.yml's ${pvs_tool} step RUNS ${pvs_tool} with working-directory: test/proto-validate" ;;
+            __ABSENT__)   fail "security.yml has no step whose run: command starts with '${pvs_tool} ', or it lacks working-directory: test/proto-validate — the nested module would go unscanned while every suite stays green" ;;
+            *)            fail "security.yml's ${pvs_tool} step runs with working-directory '$pvs_wd', not test/proto-validate — it would scan the repo root the reusable job already covers and leave the nested module unscanned" ;;
+        esac
+    done
 
     if printf '%s' "$pvs_block" | grep -qE 'continue-on-error:[[:space:]]*true|\|\|[[:space:]]*(true|exit 0|:)[[:space:]]*$|^[[:space:]]+if:'; then
         fail "security.yml proto-validate-security contains step-level neutering (continue-on-error, a trailing '|| true', or a step if:) — the scan would stay green while detecting nothing"
@@ -2834,7 +2886,9 @@ if [ -f "$WORKFLOW" ]; then
 else
     # Credit 4, MEASURED: presence, job-level if, govulncheck-step scoping, step
     # neutering. Credited 3, so renaming security.yml gave `saw 173` against 174.
-    skip "security.yml not found at $WORKFLOW — its four scan-wiring assertions cannot be evaluated" 4
+    # Credit 6, MEASURED: presence, block-extraction sentinel, job-level if,
+    # govulncheck step, gosec step, step neutering.
+    skip "security.yml not found at $WORKFLOW — its six scan-wiring assertions cannot be evaluated" 6
 fi
 
 WORKFLOW="$_WORKFLOW_SAVED"
@@ -3119,7 +3173,38 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # 3 -> 4 (both MEASURED by renaming the workflow -- the wrong credits made a missing
 # workflow report as assertion-accounting drift), and the ci.yml step assertion now
 # uses yq instead of an awk truncation that pinned YAML key order.
-EXPECTED_ASSERTIONS=179
+# 179 -> 181. MEASURED. +2 closing a hole in the guard round 4 added for
+# security.yml's scan job -- the guard could not fail.
+#
+# Its govulncheck assertion extracted an awk slice starting at
+# `- name: govulncheck (nested module)` and then grepped that slice for
+# "govulncheck", which the NAME LINE satisfies. Measured: replacing
+# `run: govulncheck ./...` with `run: true` kept the suite at 179/179 with the
+# nested module entirely unscanned. Both scanners are now pinned by their `run:`
+# COMMAND via yq (`select(.run | test("^govulncheck "))`), which also makes the
+# check independent of YAML key order -- the false positive the ci.yml twin
+# already hit. +1 for pinning gosec, which was named load-bearing in a comment
+# and pinned nowhere, and +1 for a block-extraction fidelity sentinel matching
+# the AC4 and live-tests.yml extractions.
+#
+# The gate's skip credit moves 4 -> 6 to match the six counted outcomes.
+# 181 -> 182. MEASURED. Round 5 found two defects in round 4's own guards, plus a
+# CI-environment problem this guard created.
+#
+# The AC4 guard is now driven by a STUB validator rather than a real `go run`. The
+# real-toolchain form required Go AND a module-proxy fetch inside live-tests.yml's
+# preflight-selftest job, which has no setup-go and whose documented property is
+# that these suites need "no Go, Node or Chrome" -- measured RED under GOPROXY=off
+# with an empty module cache, which the LAB-4732 egress audit->block flip would
+# have made CI's steady state. The stub is also stronger: +1 asserts the validator
+# was actually INVOKED (the round-4 vacuity failed before reaching it and still
+# reported failures=1), and the verdict assertion covers both directions.
+#
+# Net zero, not counted: the ci.yml go-test step assertion now checks
+# working-directory AND -race again. The awk form it replaced checked both; the
+# first yq rewrite kept only working-directory, so dropping -race from the only job
+# that runs the nested module's tests survived at 179/0.
+EXPECTED_ASSERTIONS=182
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."

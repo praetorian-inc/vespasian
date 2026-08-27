@@ -1577,17 +1577,16 @@ PYEOF
     # relative spec path would resolve against the wrong directory and report
     # "failed to compile" for a spec that is fine. Resolve it to an absolute path
     # BEFORE the cd so the subshell's cwd cannot change what it points at.
-    # A failed `cd` must not be swallowed: `$(cd bad && pwd)` yields the empty
-    # string, so spec_abs collapsed to "/spec.proto" and the compile then reported
-    # "emitted .proto failed to compile" — misattributing a missing generate step
-    # to a malformed spec, which is exactly what absolutising is here to prevent.
-    local spec_dir spec_abs
-    if ! spec_dir="$(cd "$(dirname "$spec_file")" 2>/dev/null && pwd)" || [ -z "$spec_dir" ]; then
-        log_fail "cannot resolve the emitted spec's directory ($(dirname "$spec_file")) — the generate step above likely produced no file"
-        failures=$((failures + 1))
-        spec_dir=""
-    fi
-    spec_abs="${spec_dir}/$(basename "$spec_file")"
+    # No cd-failure guard here, deliberately. `$(cd bad && pwd)` does yield the
+    # empty string — spec_abs would collapse to "/spec.proto" and the compile would
+    # then misreport a missing generate step as a malformed spec — but that state is
+    # unreachable at this point: the `[ ! -s "$spec_file" ]` check earlier in this
+    # function returns 1 before here, so by now the file exists and is non-empty,
+    # which means its directory exists and is traversable. A guard for it would be
+    # dead code, and a comment describing a scenario that cannot occur is worse
+    # than no comment. If that earlier check is ever removed, this needs one.
+    local spec_abs
+    spec_abs="$(cd "$(dirname "$spec_file")" && pwd)/$(basename "$spec_file")"
 
     # Unlink before redirecting: `>` FOLLOWS symlinks, and the results tree
     # persists across runs (the mkdir -p above does not clean it), so a symlink

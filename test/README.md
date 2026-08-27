@@ -613,7 +613,7 @@ test/
 │   └── expected-paths.json  # Expected services/methods for validation
 │
 ├── proto-validate/          # NESTED MODULE (own go.mod, no workspace) — keeps
-│   │                        # of the shipped module's requires
+│   │                        # protocompile out of the shipped module's requires
 │   ├── go.mod               # Its own module; root `go test ./...` does NOT reach it
 │   ├── go.sum
 │   ├── doc.go               # Package docs + the exit-code contract run-live-tests.sh consumes
