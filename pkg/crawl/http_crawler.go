@@ -45,7 +45,7 @@ import (
 //     check and redirectScopeGuard. (LAB-4011.)
 //   - proxyURL == nil, allowPrivate false: a clone of http.DefaultTransport
 //     with DialContext wired to ssrfSafeDialContext so the DNS-rebinding TOCTOU
-//     window is closed at connect time (SEC-BE-002).
+//     window is closed at connect time.
 //   - proxyURL == nil, allowPrivate true: http.DefaultTransport unchanged.
 func newHTTPClient(scopeFn func(string) bool, allowPrivate bool, timeout time.Duration, proxyURL *url.URL, proxyInsecure bool) *http.Client {
 	transport := http.RoundTripper(http.DefaultTransport)
@@ -77,14 +77,14 @@ func newHTTPClient(scopeFn func(string) bool, allowPrivate bool, timeout time.Du
 		// real target through the tunnel and no substitute CA is involved, so
 		// verification is always kept for socks5 regardless of proxyInsecure.
 		if proxyInsecure && (proxyURL.Scheme == "http" || proxyURL.Scheme == "https") {
-			t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // G402: opt-in via --proxy-insecure for http/https proxy MITM (see doc comment)
+			t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- opt-in via --proxy-insecure for http/https proxy MITM (see doc comment)
 		}
 		transport = t
 	case !allowPrivate:
 		// Clone DefaultTransport and override only DialContext so we keep its
 		// TLS, keep-alive, HTTP/2, proxy, and idle-connection tunings while
 		// re-resolving and re-validating IPs at connect time, closing the
-		// DNS-rebinding TOCTOU window (SEC-BE-002).
+		// DNS-rebinding TOCTOU window.
 		base, ok := http.DefaultTransport.(*http.Transport)
 		if !ok {
 			// Defensive: stdlib always sets *http.Transport, but if a future
@@ -170,8 +170,8 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	// HTTP client with redirect scope guard and bounded timeout.
 	// The per-page context (c.pageTimeout) already cancels hung fetches, but an
 	// explicit Client.Timeout provides defense-in-depth if the context is ever
-	// mis-wired on a future code path (SEC-BE-001). Both use c.pageTimeout so
-	// they track the same source (QUAL-004).
+	// mis-wired on a future code path. Both use c.pageTimeout so they track the
+	// same source.
 	client := newHTTPClient(scopeFn, c.opts.AllowPrivate, c.pageTimeout, proxyURL, c.opts.ProxyInsecure)
 
 	resumeCfg := c.opts.resume(targetURL)
@@ -454,7 +454,7 @@ func (c *HTTPCrawler) extractLinks(observed ObservedRequest, fullBody []byte, pa
 		// extractHTMLAndInlineScripts parses the body exactly once, returning
 		// both the navigable links and inline-script jsluice results. Previously
 		// extractFromHTML and extractInlineScripts each called
-		// goquery.NewDocumentFromReader separately (QUAL-002 double-parse fix).
+		// goquery.NewDocumentFromReader separately, which parsed the body twice.
 		var htmlLinks []string
 		var inlineScripts []jsExtractedURL
 		htmlLinks, base, inlineScripts = extractHTMLAndInlineScripts(fullBody, pageURL)

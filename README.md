@@ -584,7 +584,7 @@ When analyzing JavaScript bundles served by an attacker-controlled application, 
 
 ### Prerequisites
 
-- [Go 1.24+](https://go.dev/dl/)
+- [Go 1.27.0+](https://go.dev/dl/)
 - [golangci-lint](https://golangci-lint.run/welcome/install/)
 
 ### Build and Test
@@ -595,7 +595,8 @@ cd vespasian
 make build       # Build the binary to bin/vespasian
 make test        # Run tests with race detection
 make lint        # Run golangci-lint (gocritic, misspell, revive)
-make check       # Run all checks (fmt, vet, lint, test)
+make gosec       # Run gosec at the version CI pins (fetched via go run)
+make check       # Run all checks (fmt, vet, lint, lint-comments, gosec, test, check-docs)
 ```
 
 ```bash

@@ -85,7 +85,7 @@ func main() {
 
 	lis, err := net.Listen("tcp", "127.0.0.1:"+resolved)
 	if err != nil {
-		log.Fatalf("listen on :%s failed: %v", resolved, err) //nolint:gosec // G706: test server, log injection N/A
+		log.Fatalf("listen on :%s failed: %v", resolved, err) // #nosec G706 -- test server, log injection N/A
 	}
 
 	s := grpc.NewServer()
@@ -102,7 +102,7 @@ func main() {
 		s.GracefulStop()
 	}()
 
-	log.Printf("gRPC server listening on %s (reflection enabled, services: UserService, OrderService, AccountService)", lis.Addr().String()) //nolint:gosec // G706: test server, log injection N/A
+	log.Printf("gRPC server listening on %s (reflection enabled, services: UserService, OrderService, AccountService)", lis.Addr().String()) // #nosec G706 -- test server, log injection N/A
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("serve: %v", err)
 	}

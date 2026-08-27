@@ -172,7 +172,7 @@ func inferSDL(endpoints []classify.ClassifiedRequest) ([]byte, error) { //nolint
 		}
 	}
 
-	// Reconcile type/union name collisions (D2, D6):
+	// Reconcile type/union name collisions:
 	// If a union XResult exists and a type XResponse also exists, merge XResponse fields
 	// into the first union member type and remove the empty XResponse.
 	for unionName, members := range syntheticUnions {
@@ -2093,7 +2093,8 @@ func parseGraphQLURL(rawURL string) *graphqlBody {
 	}
 	gb := &graphqlBody{Query: query}
 	if vars := u.Query().Get("variables"); vars != "" {
-		json.Unmarshal([]byte(vars), &gb.Variables) //nolint:errcheck,gosec // best-effort parse; invalid variables are silently ignored
+		// #nosec G104
+		json.Unmarshal([]byte(vars), &gb.Variables) //nolint:errcheck // best-effort parse; invalid variables are silently ignored
 	}
 	return gb
 }
