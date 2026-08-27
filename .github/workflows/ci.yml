@@ -90,9 +90,14 @@ jobs:
       contents: read
     steps:
       # Defense-in-depth (LAB-4732 / SEC-BE-002): monitor/record outbound
-      # traffic. Audit mode is non-blocking. Expected egress: github.com,
-      # proxy.golang.org, sum.golang.org, storage.googleapis.com,
-      # objects.githubusercontent.com (Go toolchain + module download).
+      # traffic. Audit mode is non-blocking. Egress observed in this job's audit
+      # run: api.github.com plus results-receiver.actions.githubusercontent.com,
+      # release-assets.githubusercontent.com and productionresultssa6.blob.core.windows.net
+      # (checkout, setup-go, and Actions runner infrastructure), and example.com,
+      # which cmd/vespasian/main_test.go probes with Probe:true under `-race`.
+      # go.mod-driven module fetches (proxy.golang.org) may also appear on a cache
+      # miss. This list is the artifact LAB-4732's audit->block work will read, so
+      # keep it matched to the run's `endpoint called` log lines.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
