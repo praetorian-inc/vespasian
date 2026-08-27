@@ -395,14 +395,33 @@ jobs:
           git fetch --no-tags origin "$BASE_REF"
           changed=$(git diff --name-only "origin/${BASE_REF}...HEAD")
           printf 'changed files:\n%s\n' "$changed"
-          WATCHED='.devcontainer/* .dockerignore .github/workflows/live-tests.yml test/install-chrome.sh test/common.sh test/assert-chrome-install.sh test/assert-devcontainer-lookpath.sh test/setup-live-targets.sh test/run-live-tests.sh'
+          WATCHED='.devcontainer/* .dockerignore .github/workflows/live-tests.yml go.mod test/install-chrome.sh test/common.sh test/assert-chrome-install.sh test/assert-devcontainer-lookpath.sh test/setup-live-targets.sh test/run-live-tests.sh'
           hit=false
-          for f in $changed; do
+          # read -r per line, NOT `for f in $changed`: the default IFS splits on
+          # space and tab too, so a tracked path containing either would be torn
+          # into fragments matching no pattern and the job would conclude the
+          # image needs no rebuild. Setting IFS=$'\n' globally is NOT the fix —
+          # it also stops `$WATCHED` (a space-separated list) from splitting, so
+          # every path stops matching. `IFS=` scoped to the read affects only the
+          # read; $WATCHED keeps the default IFS it needs.
+          # set -f is load-bearing. $WATCHED must stay unquoted so it word-splits,
+          # but unquoted also means PATHNAME EXPANSION, and this runs in a checkout
+          # where .devcontainer/ exists — so `.devcontainer/*` was being replaced by
+          # the files present on disk before it was ever used as a case pattern.
+          # MEASURED: it then matched .devcontainer/Dockerfile but NOT
+          # .devcontainer/nested/thing.sh, and not any .devcontainer file the PR
+          # DELETES, since a deleted path is absent from the working tree the glob
+          # expands against. A PR removing part of the devcontainer skipped the
+          # image rebuild. set -f keeps the patterns literal for `case` to match.
+          set -f
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
             for pat in $WATCHED; do
               # shellcheck disable=SC2254
               case "$f" in $pat) hit=true; break 2 ;; esac
             done
-          done
+          done <<< "$changed"
+          set +f
           echo "devcontainer=$hit" >> "$GITHUB_OUTPUT"
           echo "::notice::devcontainer paths changed: $hit"
 
@@ -631,7 +650,21 @@ jobs:
           # forms-target are in BROWSER_TARGETS. Each must report PASS, not SKIP.
           missing=""
           for t in no-download concat-spa forms-target; do
-            printf '%s' "$out" | grep -qE "(^|[^a-z-])${t}[^a-z-].*PASS|PASS.*[^a-z-]${t}([^a-z-]|$)" \
+            # A herestring, NOT `printf ... | grep -q`. Under `set -o pipefail`,
+            # grep -q exits the instant it matches, closing the pipe; printf then
+            # takes SIGPIPE and the PIPELINE reports 141, which this `||` reads as
+            # "target absent" and turns into a failed AC3 — a false red on a green
+            # suite. It is a scheduling race between grep exiting and printf
+            # filling the pipe buffer, so it is intermittent rather than a clean
+            # size cutoff: MEASURED with GNU grep 3.11 (the version on the CI
+            # runner), an input whose first line matches returns 0 at 60 KB and
+            # 141 at 200 KB, and the same 200 KB input returns 0 with pipefail
+            # off while a file-based grep finds the match either way. The captured
+            # $out is ~28.8 KB today, so this is latent, and it grows with every
+            # target added. A herestring feeds grep from a temp file with no pipe
+            # and no writer to signal — verified 0 up to 2 MB, while a SKIPped
+            # target still correctly reports missing.
+            grep -qE "(^|[^a-z-])${t}[^a-z-].*PASS|PASS.*[^a-z-]${t}([^a-z-]|$)" <<<"$out" \
               || missing="${missing} ${t}"
           done
           if [ -n "$missing" ]; then

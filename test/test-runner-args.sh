@@ -2219,8 +2219,16 @@ echo ""
 # whole reason these are files rather than inline blocks. Derive the set that
 # should be covered from what the workflow actually execs, and require each.
 if [[ -f "$WORKFLOW" ]]; then
-    bn_line=$(grep -oE 'bash -n test/[a-zA-Z0-9_.-]+\.sh' "$WORKFLOW" | sed 's/^bash -n //' | sort -u)
-    bn_needed=$(grep -oE 'test/assert-[a-zA-Z0-9_.-]+\.sh' "$WORKFLOW" | sort -u)
+    # `|| true` is load-bearing, not defensive noise. The suite runs under
+    # `set -euo pipefail` and SUITE_COMPLETED is already 1 by here, so an
+    # unmatched grep makes the ASSIGNMENT non-zero, kills the script, and
+    # produces exit 1 with no summary, no message, and the EXIT trap's
+    # truncation warning suppressed. The vacuity sentinel below — the thing
+    # written to report exactly this — becomes unreachable dead code. Measured
+    # in a clean child shell: rewriting the Syntax check step without its
+    # `bash -n test/...` chain gave rc=1 with an empty last line.
+    bn_line=$( { grep -oE 'bash -n test/[a-zA-Z0-9_.-]+\.sh' "$WORKFLOW" || true; } | sed 's/^bash -n //' | sort -u)
+    bn_needed=$(grep -oE 'test/assert-[a-zA-Z0-9_.-]+\.sh' "$WORKFLOW" | sort -u || true)
     if [[ -z "$bn_line" || -z "$bn_needed" ]]; then
         fail "could not derive the bash -n list or the assertion-script set from live-tests.yml — the check below would be vacuous"
     else
@@ -2324,9 +2332,13 @@ if [[ -f "$WORKFLOW" ]]; then
 
             # TEST-014: the arm64 leg was pinned only by its if:. Its build step
             # and its in_container marker grep are the whole point of the job.
-            arm_block=$(extract_job_block devcontainer-image-arm64 | grep -vE '^[[:space:]]*#')
+            arm_block=$( { extract_job_block devcontainer-image-arm64 || true; } | grep -vE '^[[:space:]]*#' || true)
             if [[ -z "$arm_block" ]]; then
                 fail "could not extract the devcontainer-image-arm64 job block — the assertions below would be vacuous"
+                # Credit the outcome the else-arm does not emit, so this reports
+                # the REAL cause instead of also tripping the accounting pin with
+                # a misleading "assertion accounting drift".
+                skip "devcontainer-image-arm64 in_container marker (job block unreadable)" 1
             else
                 if printf '%s\n' "$arm_block" | grep -qE 'buildx build.*--platform linux/arm64|--platform linux/arm64'; then
                     pass "devcontainer-image-arm64 still cross-builds for linux/arm64"
@@ -2437,13 +2449,29 @@ GATECASES
                 *) fail "devcontainer-changes has no step with id: filter (found ${dc_filter_id}) — steps.filter.outputs.devcontainer resolves empty, so the pull_request arm compares \"\" to \"true\" and can never fire" ;;
             esac
             dc_filter_missing=""
+            # dc_filter_paths carries yq's sentinel when yq is absent or the
+            # workflow is unparseable. The case above switches on dc_filter_id,
+            # not on this, so without an explicit check the loop below would grep
+            # the literal string __NO_YQ__ for nine paths, find none, and report
+            # every watched path as missing — naming the wrong defect.
+            case "$dc_filter_paths" in
+                __NO_YQ__|__YQ_ERROR__|"")
+                    dc_filter_paths="" ;;
+            esac
+            # go.mod is in this list because the conformance step READS it: the
+            # in-image check compares the container's toolchain against go.mod's
+            # `go` directive. Bumping that directive is exactly the change that
+            # broke the image (1.25.12 shipped against a go.mod asking 1.27.0),
+            # and without go.mod watched, that PR does not run this job at all.
             for dc_need in '.devcontainer/\*' '.dockerignore' '.github/workflows/live-tests.yml' \
-                           'test/install-chrome.sh' 'test/common.sh' \
+                           'go.mod' 'test/install-chrome.sh' 'test/common.sh' \
                            'test/assert-chrome-install.sh' 'test/assert-devcontainer-lookpath.sh' \
                            'test/setup-live-targets.sh' 'test/run-live-tests.sh'; do
                 printf '%s\n' "$dc_filter_paths" | grep -qF -- "${dc_need//\\/}" || dc_filter_missing="${dc_filter_missing} ${dc_need//\\/}"
             done
-            if [[ -z "$dc_filter_missing" ]]; then
+            if [[ -z "$dc_filter_paths" ]]; then
+                fail "could not read the devcontainer filter step's watch list (yq unavailable or the workflow is unparseable) — the coverage check below would be vacuous"
+            elif [[ -z "$dc_filter_missing" ]]; then
                 pass "the devcontainer paths filter still covers every path the image build and its in-image steps read"
             else
                 fail "the devcontainer paths filter no longer covers:${dc_filter_missing} — a PR touching one of those would not build or verify the image before merge"
@@ -2556,7 +2584,7 @@ STUB
     # Names are read from the script itself, so adding a sixth required test
     # extends this coverage automatically rather than silently escaping it.
     adl_required=$(sed -n '/^REQUIRED_TESTS=(/,/^)/p' "$SCRIPT_DIR/assert-devcontainer-lookpath.sh" \
-                   | grep -oE 'Test[A-Za-z0-9_]+')
+                   | { grep -oE 'Test[A-Za-z0-9_]+' || true; })
     adl_n=$(printf '%s\n' "$adl_required" | grep -c .)
 
     # The list must match an INDEPENDENT source of truth, or the per-name cases
@@ -2570,7 +2598,7 @@ STUB
     if [[ ! -f "$adl_srcfile" ]]; then
         fail "pkg/crawl/browser_integration_test.go not found — the REQUIRED_TESTS completeness check would be vacuous"
     else
-        adl_expected=$(grep -oE '^func (TestBrowserManager_[A-Za-z0-9_]+|TestConfigureLauncher_PinsSystemBrowser)' "$adl_srcfile" \
+        adl_expected=$( { grep -oE '^func (TestBrowserManager_[A-Za-z0-9_]+|TestConfigureLauncher_PinsSystemBrowser)' "$adl_srcfile" || true; } \
                        | sed 's/^func //' | sort -u)
         adl_exp_n=$(printf '%s\n' "$adl_expected" | grep -c .)
         if [[ "$adl_exp_n" -lt 2 ]]; then
@@ -2590,6 +2618,7 @@ STUB
     fi
     if [[ "$adl_n" -lt 2 ]]; then
         fail "could not derive REQUIRED_TESTS from assert-devcontainer-lookpath.sh (got ${adl_n} names) — the per-name cases below would be vacuous"
+        skip "assert-devcontainer-lookpath.sh PASS anchoring (REQUIRED_TESTS unreadable)" 1
     else
         adl_skip_bad=""; adl_anchor_bad=""
         while IFS= read -r adl_t; do
@@ -2941,80 +2970,329 @@ fi
 
 
 # ---------------------------------------------------------------------------
-# The devcontainer's Go toolchain must satisfy go.mod, and the check that says
-# so must be EXECUTED, not grepped.
-#
-# Why this exists: the image was pinned to a base tag shipping Go 1.25.12 while
-# go.mod on main asked for 1.27.0. Under GOTOOLCHAIN=local — which the image
-# keeps on purpose — every Go step in the container died with
-#   go: go.mod requires go >= 1.27.0 (running go 1.25.12; GOTOOLCHAIN=local)
-# taking LAB-5766 AC2 with it. Nothing in this suite noticed, because nothing
-# compared the two numbers.
-#
-# Grepping that live-tests.yml MENTIONS a version check would be the weak form
-# this repo has rejected repeatedly: it asserts the control exists, not that it
-# discriminates. So the comparison is lifted out of the workflow and RUN against
-# synthetic (want, have) pairs, and the outcome is observed. Swapping `sort -V`
-# for `sort` or dropping the guard fails case (1) rather than passing quietly.
-dcgo_yml="$WORKFLOW"
-if [[ -f "$dcgo_yml" ]]; then
-    dcgo_cmp=$(grep -E '^\s*oldest=\$\(printf' "$dcgo_yml" | head -1 | sed 's/^[[:space:]]*//')
-    dcgo_guard=$(grep -E '^\s*\[ "\$oldest" = "\$want" \]' "$dcgo_yml" | head -1 | sed 's/^[[:space:]]*//')
-    if [[ -n "$dcgo_cmp" && -n "$dcgo_guard" ]]; then
-        # run_dcgo <want> <have> -> exit code of the workflow's own comparison
-        run_dcgo() {
-            want="$1" have="$2" bash -c "
-                set -u
-                $dcgo_cmp
-                $dcgo_guard
-            " >/dev/null 2>&1
-            echo $?
-        }
-        # (1) The measured break: image older than go.mod must be REJECTED.
-        if [[ "$(run_dcgo 1.27.0 1.25.12)" -ne 0 ]]; then
-            pass "the devcontainer Go gate rejects an image older than go.mod (1.25.12 < 1.27.0, executed not grepped)"
-        else
-            fail "the devcontainer Go gate ACCEPTS Go 1.25.12 against a go.mod asking 1.27.0 — this is the exact break that took AC2 down; the comparison is not discriminating"
-        fi
-        # (2) Exact match must be accepted, or (1) proves only that it rejects everything.
-        if [[ "$(run_dcgo 1.27.0 1.27.0)" -eq 0 ]]; then
-            pass "the devcontainer Go gate accepts an exact go.mod match (1.27.0 == 1.27.0)"
-        else
-            fail "the devcontainer Go gate rejects an exact match — it would fail every conforming image"
-        fi
-        # (3) Newer is fine, or (1) and (2) together would still be satisfied by
-        #     a gate that only ever accepts an exact string match.
-        if [[ "$(run_dcgo 1.27.0 1.28.1)" -eq 0 ]]; then
-            pass "the devcontainer Go gate accepts a NEWER image than go.mod (1.28.1 > 1.27.0)"
-        else
-            fail "the devcontainer Go gate rejects Go 1.28.1 against a go.mod asking 1.27.0 — it is demanding an exact match rather than a minimum"
-        fi
-        # (4) The case that actually separates `sort -V` from `sort`, and the
-        #     reason this is a separate assertion from (1): 1.9.5 is OLDER than
-        #     1.27.0 but sorts lexically AFTER it ("1.9" > "1.2" at the third
-        #     character), so a lexical comparison picks 1.27.0 as the oldest,
-        #     finds it equal to want, and ACCEPTS an image two decades of
-        #     releases too old. Cases (1)-(3) all pass under a plain `sort`;
-        #     only this one fails, which is what makes the -V load-bearing.
-        if [[ "$(run_dcgo 1.27.0 1.9.5)" -ne 0 ]]; then
-            pass "the devcontainer Go gate rejects Go 1.9.5 against go.mod 1.27.0 (version-aware, not lexical: 1.9.5 sorts after 1.27.0 as a string)"
-        else
-            fail "the devcontainer Go gate ACCEPTS Go 1.9.5 against a go.mod asking 1.27.0 — the comparison is lexical; sort -V has been lost"
-        fi
+# ---------------------------------------------------------------------------
+# .devcontainer/on-create.sh, executed. It was in the `bash -n` chain and
+# nothing else — and syntax is not the failure this script has. It already
+# failed once in CI for real (`/bin/sh: 1: npm: not found`, onCreateCommand exit
+# 127), and the devcontainers CLI does NOT surface a failing onCreateCommand as
+# a non-zero exit from `devcontainer up`
+# (microsoft/vscode-remote-release#8906), so a regression here is silent at the
+# only moment it runs. Both arms are driven with npm stubbed.
+oc_script="$SCRIPT_DIR/../.devcontainer/on-create.sh"
+if [[ -f "$oc_script" ]]; then
+    oc_tmp=$(mktemp -d); mkdir -p "$oc_tmp/bin" "$oc_tmp/nonpm"
+    # (1) npm absent: must fail, and must say WHY rather than dying on `npm ci`.
+    #     The PATH must genuinely lack npm — pointing at /usr/bin finds the
+    #     system one and the case passes vacuously, which is what happened on the
+    #     first run of this block. So: a directory holding symlinks to only the
+    #     externals the script actually needs. Everything else it uses
+    #     (command -v, echo, cd) is a bash builtin.
+    # bash as well as dirname: the script's `$(dirname ...)` substitution spawns a
+    # subshell, and an npm-free PATH that cannot find bash makes the script die at
+    # 127 BEFORE its diagnostic — which the assertion would then read as the
+    # diagnostic being absent. /usr/bin:/bin is not an alternative here: this image
+    # carries /usr/bin/npm, so that PATH is not npm-free at all and the case passed
+    # vacuously against a real `npm ci`.
+    for oc_bin in bash dirname; do
+        oc_p=$(command -v "$oc_bin" 2>/dev/null) && ln -sf "$oc_p" "$oc_tmp/nonpm/$oc_bin"
+    done
+    # `|| oc_rc=$?` and not a bare assignment: this case EXPECTS a non-zero exit,
+    # and under `set -e` a failing command substitution kills the whole suite
+    # before the assertion can read it — the same shape that made seven other
+    # extractions in this file unable to report their own vacuity.
+    oc_rc=0
+    oc_out=$(PATH="$oc_tmp/nonpm" bash "$oc_script" 2>&1) || oc_rc=$?
+    if [[ "$oc_rc" -ne 0 ]] && printf '%s\n' "$oc_out" | grep -q 'npm not on PATH' \
+       && printf '%s\n' "$oc_out" | grep -q 'NVM_DIR='; then
+        pass "on-create.sh fails with a diagnostic naming NVM_DIR/PATH when npm is absent (executed, not grepped)"
     else
-        fail "live-tests.yml no longer carries the devcontainer Go-version comparison (oldest=/guard lines not found) — the toolchain gate has been removed or renamed"
+        fail "on-create.sh did not fail with its npm-absent diagnostic (rc=${oc_rc}) — the one failure this script actually has in CI would surface as a bare exit 127 that devcontainer up does not even report"
     fi
-    # (5) The requirement must be DERIVED from go.mod, not pinned to a literal.
-    #     A literal is what goes stale: it is why the image sat two minor
-    #     versions behind main without anything failing.
-    if grep -qE 'want=\$\(sed -n "s/\^go //p" go\.mod \| head -1\)' "$dcgo_yml"; then
-        pass "the devcontainer Go gate reads its requirement from go.mod rather than a hardcoded version"
+    # (2) npm present: must invoke `npm ci --ignore-scripts`. --ignore-scripts is
+    #     the control — it blocks package lifecycle scripts under the audit-only
+    #     egress policy — so losing the flag is the regression worth catching.
+    cat > "$oc_tmp/bin/npm" <<'NPMSTUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then echo "0.0.0-stub"; exit 0; fi
+printf '%s\n' "$*" >> "$NPM_ARGS_LOG"
+exit 0
+NPMSTUB
+    chmod 0755 "$oc_tmp/bin/npm"
+    : > "$oc_tmp/npm-args"
+    NPM_ARGS_LOG="$oc_tmp/npm-args" PATH="$oc_tmp/bin:/usr/bin:/bin" bash "$oc_script" >/dev/null 2>&1 || true
+    if grep -q -- 'ci --ignore-scripts' "$oc_tmp/npm-args" 2>/dev/null; then
+        pass "on-create.sh runs 'npm ci --ignore-scripts' for the spec validators (observed via a stub npm, not grepped)"
     else
-        fail "the devcontainer Go gate no longer derives its requirement from go.mod — a literal version here goes stale the next time the go directive moves"
+        fail "on-create.sh no longer invokes 'npm ci --ignore-scripts' (recorded: $(tr '\n' ';' < "$oc_tmp/npm-args" 2>/dev/null)) — either the install was dropped, or --ignore-scripts was, which is the flag that stops package lifecycle scripts running under the audit-only egress policy"
+    fi
+    rm -rf "$oc_tmp"
+else
+    fail ".devcontainer/on-create.sh is missing — devcontainer.json's onCreateCommand points at it, so container creation would fail"
+    skip "on-create.sh npm ci --ignore-scripts invocation (script absent)" 1
+fi
+
+
+# ---------------------------------------------------------------------------
+# The devcontainer paths FILTER, executed rather than described.
+#
+# d7f5129 replaced dorny/paths-filter (rejected by the org Actions allowlist)
+# with hand-written shell: a per-line read over `git diff --name-only`, a
+# `for pat in $WATCHED` inner loop, and `case "$f" in $pat)`. That matcher is
+# the sole producer of the output the gate's pull_request arm consumes, and
+# nothing executed it — the suite asserted only that a step with `id: filter`
+# exists and that its run: TEXT contains the nine watched paths, while the gate
+# harness two blocks up stubs steps.filter.outputs.devcontainer with a literal
+# and is blind to the producer entirely.
+#
+# That gap is not theoretical, and it was demonstrated while writing this block:
+# an `IFS=$'\n'` added to make the outer loop newline-safe ALSO stopped the
+# space-separated $WATCHED from splitting, so every pattern became one long
+# string, every path stopped matching, and the filter reported
+# devcontainer=false for every PR. The suite stayed at 177 passed / 0 failed.
+# A one-token `case "$f" in "$pat")` quoting cleanup does the same thing.
+#
+# So: pull the step's run: with yq, stub `git` so the changed list is an input,
+# and drive a table of (event, path, expected) through the real code.
+filter_body=$(yq_query '.jobs["devcontainer-changes"].steps[] | select(.id == "filter") | .run' -r)
+case "$filter_body" in
+    __NO_YQ__)    fail_no_yq "the devcontainer paths-filter behaviour" ;;
+    __YQ_ERROR__) fail_yq_error "the devcontainer paths-filter behaviour" ;;
+    "")           fail "could not extract the devcontainer-changes filter step's run: body — the matcher assertions below would be vacuous" ;;
+    *)
+        flt_tmp=$(mktemp -d)
+        mkdir -p "$flt_tmp/bin"
+        cat > "$flt_tmp/bin/git" <<'GITSTUB'
+#!/usr/bin/env bash
+# Only the two subcommands the filter step uses. `diff` replays the synthetic
+# changed-file list so the matcher, not git, is what is under test.
+case "${1:-}" in
+    fetch) exit 0 ;;
+    diff)  printf '%s\n' "$FILTER_CHANGED" ;;
+    *)     exit 0 ;;
+esac
+GITSTUB
+        chmod 0755 "$flt_tmp/bin/git"
+        # run_filter <event> <newline-separated changed paths> -> "true"/"false"
+        run_filter() {
+            : > "$flt_tmp/out"
+            EVENT_NAME="$1" BASE_REF="main" FILTER_CHANGED="$2" \
+                GITHUB_OUTPUT="$flt_tmp/out" PATH="$flt_tmp/bin:$PATH" \
+                bash -c "$filter_body" >/dev/null 2>&1 || true
+            sed -n 's/^devcontainer=//p' "$flt_tmp/out" | head -1
+        }
+        flt_bad=""
+        # event|changed paths (\n-separated)|expected
+        while IFS='|' read -r flt_ev flt_changed flt_want; do
+            [ -z "$flt_ev" ] && continue
+            flt_got=$(run_filter "$flt_ev" "$(printf '%b' "$flt_changed")")
+            [ "$flt_got" = "$flt_want" ] \
+                || flt_bad="${flt_bad} [${flt_ev} ${flt_changed} -> got '${flt_got}' want '${flt_want}']"
+        done <<'FLTCASES'
+pull_request|.devcontainer/Dockerfile|true
+pull_request|.devcontainer/nested/thing.sh|true
+pull_request|test/common.sh|true
+pull_request|.github/workflows/live-tests.yml|true
+pull_request|README.md|false
+pull_request|test/some-other-file.sh|false
+pull_request|README.md\ntest/install-chrome.sh|true
+pull_request|docs/a file with spaces.md|false
+push|.devcontainer/Dockerfile|false
+FLTCASES
+        if [ -z "$flt_bad" ]; then
+            pass "the devcontainer paths filter MATCHES the paths it watches and rejects the ones it does not (9 cases executed against the real step, stubbed git)"
+        else
+            fail "the devcontainer paths filter misclassified:${flt_bad} — the image job's pull_request arm is driven by this output, so a wrong answer means a PR touching the image is never built before merge"
+        fi
+        rm -rf "$flt_tmp"
+        unset -f run_filter
+        ;;
+esac
+
+
+# ---------------------------------------------------------------------------
+# The devcontainer's Go toolchain must satisfy go.mod — checked TWICE, because
+# the two checks fail on different days and only one of them is un-gated.
+#
+# The break: the image shipped Go 1.25.12 while go.mod on main asked 1.27.0.
+# Under GOTOOLCHAIN=local (kept on purpose, so no build silently downloads a
+# compiler) Go refuses rather than upgrading, so every Go step in the container
+# died and AC2 went with it.
+#
+# (A) is un-gated and runs on every PR: the Dockerfile's pin against go.mod,
+#     here in this suite. It exists because the in-image check lives in
+#     devcontainer-image, which only runs when the paths filter fires — and a PR
+#     whose ONLY change is bumping go.mod's `go` directive is precisely the one
+#     that caused this break. go.mod is now in WATCHED, but a filter is a
+#     heuristic and this assertion is not.
+# (B) is the in-image gate, executed here against a stub `go` and a synthetic
+#     go.mod. Greping that live-tests.yml MENTIONS a version check would assert
+#     the control exists, not that it discriminates.
+
+# ── (A) un-gated: the Dockerfile's Go pin vs go.mod ───────────────────────────
+dcgo_df="$SCRIPT_DIR/../.devcontainer/Dockerfile"
+dcgo_mod="$SCRIPT_DIR/../go.mod"
+if [[ -f "$dcgo_df" && -f "$dcgo_mod" ]]; then
+    dcgo_pin=$(grep -oE '^[[:space:]]*ver=[0-9]+\.[0-9]+(\.[0-9]+)?' "$dcgo_df" | head -1 | sed 's/.*ver=//' || true)
+    dcgo_want=$(sed -n 's/^go //p' "$dcgo_mod" | head -1 || true)
+    # Compare against the STRICTER of this branch's go.mod and the merge target's,
+    # because that is what CI actually builds: a pull_request checkout is the MERGE
+    # commit, so the container sees main's go.mod, not the branch's. Measured — the
+    # branch reads `go 1.25.8` while main reads `go 1.27.0`, and reverting the
+    # Dockerfile pin to 1.25.12 satisfies the branch and still fails in CI, which
+    # is precisely the break this block exists to catch. Read from a local ref, so
+    # no network: if origin/main has never been fetched the check quietly falls
+    # back to the branch's own go.mod rather than failing on an absent ref.
+    if git -C "$SCRIPT_DIR/.." rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
+        dcgo_main=$(git -C "$SCRIPT_DIR/.." show origin/main:go.mod 2>/dev/null | sed -n 's/^go //p' | head -1 || true)
+        if [[ -n "$dcgo_main" && -n "$dcgo_want" ]]; then
+            dcgo_want=$(printf '%s\n%s\n' "$dcgo_want" "$dcgo_main" | sort -V | tail -1)
+        fi
+    fi
+    if [[ -z "$dcgo_pin" || -z "$dcgo_want" ]]; then
+        fail "could not read the Dockerfile Go pin (got '${dcgo_pin}') or go.mod's go directive (got '${dcgo_want}') — the un-gated toolchain check would be vacuous"
+    else
+        dcgo_oldest=$(printf '%s\n%s\n' "$dcgo_want" "$dcgo_pin" | sort -V | head -1)
+        if [[ "$dcgo_oldest" == "$dcgo_want" ]]; then
+            pass "the .devcontainer/Dockerfile Go pin (${dcgo_pin}) satisfies go.mod (>= ${dcgo_want}) — checked un-gated, on every PR"
+        else
+            fail "the .devcontainer/Dockerfile pins Go ${dcgo_pin} but go.mod requires >= ${dcgo_want} — under GOTOOLCHAIN=local every Go step in the devcontainer fails with 'go.mod requires go >= ${dcgo_want}'; bump ver= in the Dockerfile's Go layer"
+        fi
     fi
 else
-    fail "live-tests.yml not found at ${dcgo_yml} — cannot check the devcontainer Go toolchain gate"
+    fail "missing .devcontainer/Dockerfile or go.mod — the un-gated devcontainer toolchain check cannot run"
 fi
+
+# ── (B) the in-image gate, lifted whole and executed ──────────────────────────
+#
+# Scoped to the conformance STEP, not grepped file-wide. An earlier version
+# matched the lines anywhere in live-tests.yml, so moving the gate out of the
+# `devcontainer exec` block into a host-side run: step of the same job left every
+# case passing — and the runner ships its own conforming Go, so it would pass
+# there forever while the image rotted. That is the same defeat this suite
+# already blocks for the two chrome scripts by requiring `--workspace-folder`.
+dcgo_step=$(yq_query '.jobs["devcontainer-image"].steps[] | select(.name == "Assert the container matches devcontainer.json") | .run' -r)
+case "$dcgo_step" in
+    __NO_YQ__)    fail_no_yq "the devcontainer conformance step"
+                  skip "devcontainer conformance step properties (yq unavailable)" 1
+                  skip "devcontainer Go gate executed cases (yq unavailable)" 4 ;;
+    __YQ_ERROR__) fail_yq_error "the devcontainer conformance step"
+                  skip "devcontainer conformance step properties (workflow unparseable)" 1
+                  skip "devcontainer Go gate executed cases (workflow unparseable)" 4 ;;
+    "")           fail "devcontainer-image has no step named 'Assert the container matches devcontainer.json' — the conformance and Go-toolchain assertions below would be vacuous"
+                  skip "devcontainer conformance step properties (step absent)" 1
+                  skip "devcontainer Go gate executed cases (step absent)" 4 ;;
+    *)
+        # M4: each property as its own requirement. The previous loop grepped the
+        # token 'id -un', which appears TWICE in this step (the check and its
+        # error message), so it survived deleting every other assertion in the
+        # step it claimed to pin — measured: removing the VESPASIAN_NO_SANDBOX,
+        # /dev/shm and spec-validator checks left the suite green. The
+        # spec-validator one matters most: the workflow's own comment says it is
+        # the only thing that detects a failing onCreateCommand, because the
+        # devcontainers CLI does not report that as a non-zero exit from `up`.
+        dcgo_prop_missing=""
+        while IFS='|' read -r dcgo_pat dcgo_label; do
+            [ -z "$dcgo_pat" ] && continue
+            printf '%s\n' "$dcgo_step" | grep -qF -- "$dcgo_pat" \
+                || dcgo_prop_missing="${dcgo_prop_missing} ${dcgo_label}"
+        done <<'DCPROPS'
+[ "$(id -un)" = vscode ]|remoteUser is vscode
+${VESPASIAN_NO_SANDBOX:-}|containerEnv VESPASIAN_NO_SANDBOX
+/dev/shm|runArgs --shm-size
+test/spec-validators/node_modules/|onCreateCommand spec-validator entry points
+go.mod|the go.mod toolchain requirement
+DCPROPS
+        if [ -z "$dcgo_prop_missing" ]; then
+            pass "the devcontainer conformance step still asserts every property devcontainer.json promises (5 pinned individually, not by one shared token)"
+        else
+            fail "the devcontainer conformance step no longer asserts:${dcgo_prop_missing} — each is the only check of that devcontainer.json setting, and the spec-validator one is the only detector of a failing onCreateCommand"
+        fi
+
+        # Lift ALL FOUR gate lines — want=, have=, oldest= and the guard — from
+        # THIS step. The earlier harness lifted only the last two and injected
+        # want/have itself, so the lines that actually read the artifacts were
+        # untested: mutating have= to `$want`, or to `go env GOVERSION` (whose
+        # output keeps the "go" prefix, putting 1.27.0 first under sort -V),
+        # accepted every stale image with the suite still green.
+        # All FIVE lines, including the emptiness guard: `[ -n "$want" ]` is not
+        # decoration. Without it an unreadable go.mod leaves want and have both
+        # empty, sort -V calls two empty strings equal, and the gate accepts any
+        # toolchain. Lifting only the other four made the harness test a gate
+        # that does not exist — caught by case (5) below on its first run.
+        dcgo_lines=$(printf '%s\n' "$dcgo_step" \
+            | grep -E '^[[:space:]]*(want=|have=|\[ -n "\$want" \]|oldest=|\[ "\$oldest" = "\$want" \])' || true)
+        dcgo_n=$(printf '%s\n' "$dcgo_lines" | grep -c . || true)
+        if [ "${dcgo_n:-0}" -lt 5 ]; then
+            fail "found only ${dcgo_n:-0} of the 5 Go-gate lines (want=/have=/emptiness guard/oldest=/comparison guard) inside the conformance step — either part of the gate was removed, or it was moved OUT of the devcontainer exec block onto the host runner, which ships its own conforming Go and would pass forever"
+            skip "devcontainer Go gate executed cases (gate not inside the conformance step)" 4
+        else
+            dcgo_tmp=$(mktemp -d); mkdir -p "$dcgo_tmp/bin"
+            # run_dcgo <stub go version> <go.mod version> -> exit code of the real gate
+            run_dcgo() {
+                cat > "$dcgo_tmp/bin/go" <<STUB
+#!/usr/bin/env bash
+echo "go version go$1 linux/amd64"
+STUB
+                chmod 0755 "$dcgo_tmp/bin/go"
+                printf 'module x\n\ngo %s\n' "$2" > "$dcgo_tmp/go.mod"
+                ( cd "$dcgo_tmp" && PATH="$dcgo_tmp/bin:$PATH" bash -c "
+                    set -u
+                    $dcgo_lines
+                  " ) >/dev/null 2>&1
+                echo $?
+            }
+            # (1) the measured break: image older than go.mod must be REJECTED
+            if [ "$(run_dcgo 1.25.12 1.27.0)" -ne 0 ]; then
+                pass "the devcontainer Go gate rejects an image older than go.mod (stub go1.25.12 vs go.mod 1.27.0 — the exact break, executed end to end)"
+            else
+                fail "the devcontainer Go gate ACCEPTS Go 1.25.12 against a go.mod asking 1.27.0 — this is the break that took AC2 down; the gate does not discriminate"
+            fi
+            # (2) exact match accepted, or (1) is satisfied by a gate that rejects everything
+            if [ "$(run_dcgo 1.27.0 1.27.0)" -eq 0 ]; then
+                pass "the devcontainer Go gate accepts an exact go.mod match (stub go1.27.0 vs go.mod 1.27.0)"
+            else
+                fail "the devcontainer Go gate rejects an exact match — it would fail every conforming image"
+            fi
+            # (3) newer accepted, or (1)+(2) are satisfied by a string equality test
+            if [ "$(run_dcgo 1.28.1 1.27.0)" -eq 0 ]; then
+                pass "the devcontainer Go gate accepts a NEWER image than go.mod (stub go1.28.1 vs go.mod 1.27.0)"
+            else
+                fail "the devcontainer Go gate rejects Go 1.28.1 against go.mod 1.27.0 — it demands an exact match rather than a minimum"
+            fi
+            # (4) the case that makes sort -V load-bearing: 1.9.5 is OLDER than
+            #     1.27.0 but sorts lexically AFTER it, so a plain `sort` accepts
+            #     it. Cases (1)-(3) all pass under a lexical sort; only this fails.
+            if [ "$(run_dcgo 1.9.5 1.27.0)" -ne 0 ]; then
+                pass "the devcontainer Go gate rejects Go 1.9.5 against go.mod 1.27.0 (version-aware, not lexical: 1.9.5 sorts after 1.27.0 as a string)"
+            else
+                fail "the devcontainer Go gate ACCEPTS Go 1.9.5 against go.mod 1.27.0 — the comparison is lexical; sort -V has been lost"
+            fi
+            # (5) The gate's own empty-input arm. `[ -n "$want" ] && [ -n "$have" ]`
+            #     exists so an unreadable go.mod or an unparseable `go version`
+            #     fails LOUDLY rather than comparing two empty strings — which
+            #     `sort -V` would call equal, making the gate accept anything.
+            #     Driven by pointing it at a directory with no go.mod at all.
+            rm -f "$dcgo_tmp/go.mod"
+            cat > "$dcgo_tmp/bin/go" <<'STUBEMPTY'
+#!/usr/bin/env bash
+echo "go version go1.27.0 linux/amd64"
+STUBEMPTY
+            chmod 0755 "$dcgo_tmp/bin/go"
+            dcgo_rc=$( ( cd "$dcgo_tmp" && PATH="$dcgo_tmp/bin:$PATH" bash -c "
+                set -u
+                $dcgo_lines
+              " ) >/dev/null 2>&1; echo $? )
+            if [ "$dcgo_rc" -ne 0 ]; then
+                pass "the devcontainer Go gate fails closed when go.mod cannot be read (empty want/have arm exercised)"
+            else
+                fail "the devcontainer Go gate exits 0 with an unreadable go.mod — two empty strings compare equal under sort -V, so the gate would accept any toolchain"
+            fi
+            rm -rf "$dcgo_tmp"
+            unset -f run_dcgo
+        fi
+        ;;
+esac
+
 
 
 echo "=== Summary ==="
@@ -3080,18 +3358,56 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # 135 + 16 + 3 + 12 = 166, plus the 5 checks the round-3 fixes split per-name and
 # per-job rather than aggregating = 171. MEASURED. Re-measure, do not adjust.
 #
-#   +5  the devcontainer Go-toolchain gate (172 -> 177). Added after the image
-#       shipped Go 1.25.12 against a go.mod on main asking 1.27.0: under
-#       GOTOOLCHAIN=local every Go step in the container failed, AC2 with it,
-#       and no assertion here compared the two numbers. Three of the four are
-#       EXECUTED — the workflow's own comparison lifted out and driven with
-#       synthetic (want, have) pairs — because a grep for the check would have
-#       passed against a comparison that discriminates nothing. One of the four
-#       exists solely to make `sort -V` load-bearing: the other three all pass
-#       under a plain lexical `sort`. The fifth pins
+#   +7  the devcontainer Go-toolchain gate and the conformance-step properties
+#       (172 -> 182 with the filter and on-create blocks below), after round-4 review rejected the first version of this
+#       block. The image had shipped Go 1.25.12 against a go.mod on main asking
+#       1.27.0: under GOTOOLCHAIN=local every Go step in the container failed and
+#       AC2 with it, and nothing here compared the two numbers. The block is now:
+#         +1 an UN-GATED check of the Dockerfile pin against go.mod, because the
+#            in-image gate only runs when the paths filter fires, and a PR whose
+#            only change is bumping the `go` directive is exactly the one that
+#            caused this. Reverting the pin to 1.25.12 left the old suite at
+#            177/0.
+#         +1 the conformance step's five properties pinned INDIVIDUALLY. The
+#            previous loop grepped the token `id -un`, which occurs twice in that
+#            step, so deleting the VESPASIAN_NO_SANDBOX, /dev/shm and
+#            spec-validator checks left the suite green.
+#         +4 the gate EXECUTED against a stub `go` and a synthetic go.mod, with
+#            all four of its lines (want=/have=/oldest=/guard) lifted from the
+#            named conformance step rather than grepped file-wide. The earlier
+#            version lifted only the last two and injected want/have itself, so
+#            `have=$(go env GOVERSION)` — whose output keeps the `go` prefix —
+#            accepted every stale image while staying green. Scoping to the step
+#            also blocks relocating the gate to the host runner, which ships its
+#            own conforming Go. One of the four exists solely to make `sort -V`
+#            load-bearing: the other three all pass under a plain lexical `sort`.
+#
+#   +1  the devcontainer paths FILTER executed against a stubbed git (9 cases),
+#       not just its path list grepped. It found a real defect on its first run:
+#       `$WATCHED` is unquoted so it word-splits, but unquoted also means
+#       PATHNAME EXPANSION, so `.devcontainer/*` was replaced by the files on
+#       disk before ever being used as a case pattern — nested paths and any
+#       .devcontainer file a PR DELETES stopped matching. Fixed with `set -f`.
+#
+#   +2  .devcontainer/on-create.sh EXECUTED, both arms. It was in the `bash -n`
+#       chain and nothing else, and syntax is not the failure it has: it already
+#       died in CI with `/bin/sh: 1: npm: not found` (onCreateCommand exit 127),
+#       and the devcontainers CLI does not report a failing onCreateCommand as a
+#       non-zero exit from `devcontainer up`, so a regression is silent at the
+#       only moment the script runs. One case drives it on a genuinely npm-free
+#       PATH (this image carries /usr/bin/npm, so `/usr/bin:/bin` is NOT
+#       npm-free — the first version of this case passed vacuously against a real
+#       `npm ci`); the other observes `npm ci --ignore-scripts` through a stub.
+#
+#   ~   seven grep extractions gained `|| true`. Under `set -euo pipefail` with
+#       SUITE_COMPLETED already 1, an unmatched grep made the ASSIGNMENT non-zero
+#       and killed the suite with no summary and no message — making each block's
+#       own vacuity sentinel unreachable dead code. Sentinel arms were given
+#       matching skip credits so a degraded host reports the real cause instead
+#       of a misleading accounting-drift message. The fifth pins
 #       that the requirement is read from go.mod rather than a literal, which is
 #       the property that keeps it from going stale again.
-EXPECTED_ASSERTIONS=177
+EXPECTED_ASSERTIONS=182
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."

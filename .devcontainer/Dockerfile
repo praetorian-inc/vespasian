@@ -124,6 +124,15 @@ RUN set -eu; \
 # Debian's sh is dash. The binaries are then symlinked into /usr/local/bin, which
 # is on every PATH, because onCreateCommand and every `devcontainer exec` run
 # under `/bin/sh -c` and load no profile.
+#
+# Unpinned, unlike the yq and Go layers on either side, and that asymmetry is
+# deliberate rather than an oversight: `nvm install 20` floats within a major.
+# Those two layers pin because their binaries are fetched over plain TLS from a
+# release host, so a digest is the only thing distinguishing the intended
+# artifact from a substituted one. nvm resolves through its own index and this
+# Node only has to parse JSON and YAML specs for the validators; no artifact
+# under test is built by it, and no assertion depends on its patch level. Pin it
+# the day one does.
 RUN bash -c 'set -euo pipefail; \
     export NVM_DIR="${NVM_DIR:-/usr/local/share/nvm}"; \
     [ -s "$NVM_DIR/nvm.sh" ] || { echo "FATAL: nvm not found at $NVM_DIR; the FROM changed" >&2; exit 1; }; \
@@ -132,7 +141,7 @@ RUN bash -c 'set -euo pipefail; \
     nvm alias default 20; \
     nvm use default; \
     for b in node npm npx; do \
-        p="$(command -v "$b")"; \
+        p="$(command -v "$b" || true)"; \
         [ -n "$p" ] && [ -x "$p" ] || { echo "FATAL: $b missing after nvm install" >&2; exit 1; }; \
         ln -sfn "$p" "/usr/local/bin/$b"; \
     done; \
