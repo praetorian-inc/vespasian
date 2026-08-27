@@ -552,7 +552,20 @@ jobs:
               [ -f "test/spec-validators/node_modules/$pkg/package.json" ] \
                 || { echo "onCreateCommand did not install the spec-validator deps: $pkg is missing or incomplete" >&2; exit 1; }
             done
-            echo "container matches devcontainer.json: user=vscode, VESPASIAN_NO_SANDBOX=true, /dev/shm=${shm}B, spec-validator deps present"
+            # The toolchain the image ships must satisfy go.mod, or every Go step
+            # in the container dies with "go.mod requires go >= X (running Y;
+            # GOTOOLCHAIN=local)" — a message that names the setting rather than
+            # the image, and reads as a knob to relax. That is exactly what
+            # happened here: the base tag ships Go 1.25.12 and main moved go.mod
+            # to 1.27.0. Derived from go.mod rather than pinned to a literal, so
+            # the next bump of the go directive fails HERE, naming both versions,
+            # instead of surfacing as an opaque toolchain error in a later step.
+            want=$(sed -n "s/^go //p" go.mod | head -1)
+            have=$(go version | sed -n "s/.*go\([0-9][0-9.]*\).*/\1/p")
+            [ -n "$want" ] && [ -n "$have" ] || { echo "could not read go.mod (got: $want) or go version (got: $have)" >&2; exit 1; }
+            oldest=$(printf "%s\n%s\n" "$want" "$have" | sort -V | head -1)
+            [ "$oldest" = "$want" ] || { echo "the image ships Go $have but go.mod requires >= $want; bump the Go layer in .devcontainer/Dockerfile" >&2; exit 1; }
+            echo "container matches devcontainer.json: user=vscode, VESPASIAN_NO_SANDBOX=true, /dev/shm=${shm}B, spec-validator deps present, go=${have} (go.mod wants >= ${want})"
           '
 
       # Reuses the committed assertion script rather than restating it: this is

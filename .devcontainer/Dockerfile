@@ -1,5 +1,5 @@
-# Development image for vespasian. Its one job beyond the stock Go toolchain is
-# to close LAB-5064's AC1: ship a runnable, non-snap Chrome so `launcher.LookPath()`
+# Development image for vespasian. Its headline job is to close LAB-5064's AC1:
+# ship a runnable, non-snap Chrome so `launcher.LookPath()`
 # resolves a browser that can actually start, and the pkg/crawl
 # `//go:build integration` launch/kill/close tests and the rod-backed live
 # targets run instead of failing or skipping.
@@ -9,10 +9,11 @@
 # change under us between builds. Refresh deliberately.
 #
 # Why this base rather than a bare golang image: it already carries the pieces
-# install-chrome.sh requires and a devcontainer expects — Go 1.25.12 (>= go.mod's
-# 1.25.8, which matters because GOTOOLCHAIN=local means Go will NOT fetch a
-# newer toolchain), ca-certificates/curl/gnupg, the non-root `vscode` user with
-# sudo and git. It does NOT carry a usable Node: its metadata label lists the
+# install-chrome.sh requires and a devcontainer expects — ca-certificates,
+# curl/gnupg, the non-root `vscode` user with sudo and git. Its Go is NOT one of
+# those pieces: the tag ships 1.25.12 and the layer below replaces it, because
+# GOTOOLCHAIN=local means Go will not fetch a newer toolchain and go.mod on main
+# already asks for 1.27.0. It does NOT carry a usable Node: its metadata label lists the
 # node feature, but nvm's versions/ directory is empty, so node and npm are
 # installed below. Their npm deps come from devcontainer.json's onCreateCommand,
 # which cannot be a layer because the workspace is bind-mounted over it. It
@@ -46,6 +47,44 @@ FROM mcr.microsoft.com/devcontainers/go:1.25-bookworm@sha256:30cbde1de62f1909044
 RUN apt-get update -qq \
     && apt-get install -y --no-install-recommends python3 \
     && rm -rf /var/lib/apt/lists/*
+
+# The base image's Go is too old and cannot fix itself. `mcr.microsoft.com/devcontainers/go`
+# publishes no 1.27 tag yet (newest is 1.26), and GOTOOLCHAIN=local — which this
+# image keeps deliberately, so no build silently downloads a compiler — means Go
+# will NOT fetch the toolchain go.mod asks for. It errors instead:
+#
+#   go: go.mod requires go >= 1.27.0 (running go 1.25.12; GOTOOLCHAIN=local)
+#
+# MEASURED, not hypothesised: that is verbatim what the devcontainer-image job
+# printed when `go test ./pkg/crawl` ran in this image against main's go.mod.
+# Every Go step in the container fails that way, which takes AC2 of LAB-5766
+# with it, and the message names GOTOOLCHAIN rather than the image, so it reads
+# as a toolchain setting to relax rather than a base image to bump.
+#
+# So install the toolchain go.mod actually requires, over the base image's, at
+# /usr/local/go — the path the base image already puts on PATH. SHA-256 pinned
+# per architecture exactly like the yq layer below; refresh version and BOTH
+# digests together, deliberately.
+#
+# This pin will go stale when go.mod's `go` directive moves again. That is not
+# left to a reader noticing: the devcontainer-image job's conformance step
+# compares this toolchain against go.mod at runtime and fails naming both
+# versions, so the next bump reports the mismatch rather than reproducing the
+# opaque GOTOOLCHAIN error above.
+RUN set -eu; \
+    ver=1.27.0; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) sha=675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685 ;; \
+      arm64) sha=51798d2c42d0e1c6ed7fd9f48728b4193abac9e8aad6dbac2fe96a81f5909bda ;; \
+      *) echo "unsupported architecture for the Go pin: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://go.dev/dl/go${ver}.linux-${arch}.tar.gz" -o /tmp/go.tgz; \
+    printf '%s  %s\n' "$sha" /tmp/go.tgz | sha256sum -c -; \
+    rm -rf /usr/local/go; \
+    tar -C /usr/local -xzf /tmp/go.tgz; \
+    rm -f /tmp/go.tgz; \
+    /usr/local/go/bin/go version
 
 # Debian's `yq` package is a DIFFERENT tool (a Python wrapper around jq) whose
 # CLI does not accept the `-o=json -I=0` form the guard suite uses, so this is

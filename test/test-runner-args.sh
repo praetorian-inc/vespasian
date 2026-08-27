@@ -2939,6 +2939,84 @@ fi
 # on line 1. Nothing could have caught it: an inline block is not a file, so
 # `bash -n` never sees it, and the job is opt-in, so no PR run exercised it.
 
+
+# ---------------------------------------------------------------------------
+# The devcontainer's Go toolchain must satisfy go.mod, and the check that says
+# so must be EXECUTED, not grepped.
+#
+# Why this exists: the image was pinned to a base tag shipping Go 1.25.12 while
+# go.mod on main asked for 1.27.0. Under GOTOOLCHAIN=local — which the image
+# keeps on purpose — every Go step in the container died with
+#   go: go.mod requires go >= 1.27.0 (running go 1.25.12; GOTOOLCHAIN=local)
+# taking LAB-5766 AC2 with it. Nothing in this suite noticed, because nothing
+# compared the two numbers.
+#
+# Grepping that live-tests.yml MENTIONS a version check would be the weak form
+# this repo has rejected repeatedly: it asserts the control exists, not that it
+# discriminates. So the comparison is lifted out of the workflow and RUN against
+# synthetic (want, have) pairs, and the outcome is observed. Swapping `sort -V`
+# for `sort` or dropping the guard fails case (1) rather than passing quietly.
+dcgo_yml="$WORKFLOW"
+if [[ -f "$dcgo_yml" ]]; then
+    dcgo_cmp=$(grep -E '^\s*oldest=\$\(printf' "$dcgo_yml" | head -1 | sed 's/^[[:space:]]*//')
+    dcgo_guard=$(grep -E '^\s*\[ "\$oldest" = "\$want" \]' "$dcgo_yml" | head -1 | sed 's/^[[:space:]]*//')
+    if [[ -n "$dcgo_cmp" && -n "$dcgo_guard" ]]; then
+        # run_dcgo <want> <have> -> exit code of the workflow's own comparison
+        run_dcgo() {
+            want="$1" have="$2" bash -c "
+                set -u
+                $dcgo_cmp
+                $dcgo_guard
+            " >/dev/null 2>&1
+            echo $?
+        }
+        # (1) The measured break: image older than go.mod must be REJECTED.
+        if [[ "$(run_dcgo 1.27.0 1.25.12)" -ne 0 ]]; then
+            pass "the devcontainer Go gate rejects an image older than go.mod (1.25.12 < 1.27.0, executed not grepped)"
+        else
+            fail "the devcontainer Go gate ACCEPTS Go 1.25.12 against a go.mod asking 1.27.0 — this is the exact break that took AC2 down; the comparison is not discriminating"
+        fi
+        # (2) Exact match must be accepted, or (1) proves only that it rejects everything.
+        if [[ "$(run_dcgo 1.27.0 1.27.0)" -eq 0 ]]; then
+            pass "the devcontainer Go gate accepts an exact go.mod match (1.27.0 == 1.27.0)"
+        else
+            fail "the devcontainer Go gate rejects an exact match — it would fail every conforming image"
+        fi
+        # (3) Newer is fine, or (1) and (2) together would still be satisfied by
+        #     a gate that only ever accepts an exact string match.
+        if [[ "$(run_dcgo 1.27.0 1.28.1)" -eq 0 ]]; then
+            pass "the devcontainer Go gate accepts a NEWER image than go.mod (1.28.1 > 1.27.0)"
+        else
+            fail "the devcontainer Go gate rejects Go 1.28.1 against a go.mod asking 1.27.0 — it is demanding an exact match rather than a minimum"
+        fi
+        # (4) The case that actually separates `sort -V` from `sort`, and the
+        #     reason this is a separate assertion from (1): 1.9.5 is OLDER than
+        #     1.27.0 but sorts lexically AFTER it ("1.9" > "1.2" at the third
+        #     character), so a lexical comparison picks 1.27.0 as the oldest,
+        #     finds it equal to want, and ACCEPTS an image two decades of
+        #     releases too old. Cases (1)-(3) all pass under a plain `sort`;
+        #     only this one fails, which is what makes the -V load-bearing.
+        if [[ "$(run_dcgo 1.27.0 1.9.5)" -ne 0 ]]; then
+            pass "the devcontainer Go gate rejects Go 1.9.5 against go.mod 1.27.0 (version-aware, not lexical: 1.9.5 sorts after 1.27.0 as a string)"
+        else
+            fail "the devcontainer Go gate ACCEPTS Go 1.9.5 against a go.mod asking 1.27.0 — the comparison is lexical; sort -V has been lost"
+        fi
+    else
+        fail "live-tests.yml no longer carries the devcontainer Go-version comparison (oldest=/guard lines not found) — the toolchain gate has been removed or renamed"
+    fi
+    # (5) The requirement must be DERIVED from go.mod, not pinned to a literal.
+    #     A literal is what goes stale: it is why the image sat two minor
+    #     versions behind main without anything failing.
+    if grep -qE 'want=\$\(sed -n "s/\^go //p" go\.mod \| head -1\)' "$dcgo_yml"; then
+        pass "the devcontainer Go gate reads its requirement from go.mod rather than a hardcoded version"
+    else
+        fail "the devcontainer Go gate no longer derives its requirement from go.mod — a literal version here goes stale the next time the go directive moves"
+    fi
+else
+    fail "live-tests.yml not found at ${dcgo_yml} — cannot check the devcontainer Go toolchain gate"
+fi
+
+
 echo "=== Summary ==="
 echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # PR #228 review: 134 -> 135 was the container-shell check (above).
@@ -3001,7 +3079,19 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #
 # 135 + 16 + 3 + 12 = 166, plus the 5 checks the round-3 fixes split per-name and
 # per-job rather than aggregating = 171. MEASURED. Re-measure, do not adjust.
-EXPECTED_ASSERTIONS=172
+#
+#   +5  the devcontainer Go-toolchain gate (172 -> 177). Added after the image
+#       shipped Go 1.25.12 against a go.mod on main asking 1.27.0: under
+#       GOTOOLCHAIN=local every Go step in the container failed, AC2 with it,
+#       and no assertion here compared the two numbers. Three of the four are
+#       EXECUTED — the workflow's own comparison lifted out and driven with
+#       synthetic (want, have) pairs — because a grep for the check would have
+#       passed against a comparison that discriminates nothing. One of the four
+#       exists solely to make `sort -V` load-bearing: the other three all pass
+#       under a plain lexical `sort`. The fifth pins
+#       that the requirement is read from go.mod rather than a literal, which is
+#       the property that keeps it from going stale again.
+EXPECTED_ASSERTIONS=177
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
