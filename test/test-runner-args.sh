@@ -537,12 +537,18 @@ else
     fail "_probe_grpc_target: TEST_HOST='[::1]' must reach nc as '::1' (nc rejects brackets); recorded argv: $(tr '\n' ' ' < "$TMPDIR_T/argv-nc.log" 2>/dev/null)"
 fi
 
-seam_port=$(GRPC_SERVER_PORT=99999 bash -c "source '$RUNNER' --group offline --dry-run" 2>&1) || true
-if [[ "$seam_port" == *"refusing to run"* ]]; then
-    pass "env seam: an out-of-range GRPC_SERVER_PORT is refused"
-else
-    fail "env seam: GRPC_SERVER_PORT=99999 was NOT refused; got: $seam_port"
-fi
+# Four cases, not one. With only 99999 pinned, deleting BOTH the `^[0-9]{1,5}$`
+# shape check and the `-lt 1` bound left the suite green while admitting 0, -1 and
+# abc into a curl URL and into grpcurl/nc argv.
+for seam_port_bad in 99999 0 -1 abc; do
+    rc=0
+    out=$(GRPC_SERVER_PORT="$seam_port_bad" bash -c "source '$RUNNER' --group offline --dry-run" 2>&1) || rc=$?
+    if [[ "$out" == *"refusing to run"* ]] && [ "$rc" -ne 0 ]; then
+        pass "env seam: GRPC_SERVER_PORT '${seam_port_bad}' is refused"
+    else
+        fail "env seam: GRPC_SERVER_PORT '${seam_port_bad}' must be refused; rc=$rc, got: $out"
+    fi
+done
 
 echo ""
 echo "=== AC4 compile check is unconditional (LAB-5549's whole point) ==="
@@ -600,9 +606,30 @@ for _t in sh bash go sed grep dirname basename cat rm mkdir uname env tr; do
 done
 ac4_dir="$TMPDIR_T/ac4-run"; mkdir -p "$ac4_dir"
 printf 'syntax = "proto3";\nmessage D { string a = 1; string b = 1; }\n' > "$ac4_dir/spec.proto"
+# WRAPPED IN A FUNCTION. The block declares `local spec_dir spec_abs` and
+# `local proto_err=...`, and `local` outside a function is a hard error: sourced at
+# top level those assignments never happened, `2>"$proto_err"` became an invalid
+# redirect, the compound command failed BEFORE `go run` was reached, and control
+# always landed in the else arm. failures=1 unconditionally -- so the assertion
+# below, which only tests for failures=1, passed on a VALID spec too. Measured: it
+# also survived reverting the elif to the root-relative form that cannot resolve
+# without a workspace. A vacuous guard in the one place LAB-5549 must not regress.
 ac4_fn=$(new_tmp)
-sed -n '/# AC4 (LAB-2778)/,/^    local expected_count/p' "$RUNNER" | sed '$d' > "$ac4_fn"
-ac4_out=$(
+{
+    printf '_ac4_block() {\n'
+    sed -n '/# AC4 (LAB-2778)/,/^    local expected_count/p' "$RUNNER" | sed '$d'
+    printf '}\n'
+} > "$ac4_fn"
+
+# Guard the extraction: a broken end anchor would otherwise wrap ~1000 lines of
+# the runner into the function and source it.
+if [ -s "$ac4_fn" ] && grep -q 'proto-validate' "$ac4_fn" && [ "$(wc -l < "$ac4_fn")" -lt 120 ]; then
+    pass "AC4 block extracted and wrapped for execution (bounded, non-empty)"
+else
+    fail "AC4 block extraction is empty, oversized ($(wc -l < "$ac4_fn") lines), or missing its proto-validate call — the behavioural assertion below cannot be trusted"
+fi
+ac4_run() { # $1 = spec body
+    printf '%s' "$1" > "$ac4_dir/spec.proto"
     PATH="$ac4_bin" AC4_ROOT="$SCRIPT_DIR/.." AC4_DIR="$ac4_dir" AC4_FN="$ac4_fn" \
     "$ac4_bin/bash" -c '
         log_ok(){ printf "OK:%s\n" "$1"; }
@@ -613,13 +640,25 @@ ac4_out=$(
         target_dir="$AC4_DIR"
         spec_file="$AC4_DIR/spec.proto"
         source "$AC4_FN"
+        _ac4_block
         printf "failures=%s\n" "$failures"
-    ' 2>&1
-) || true
-if [[ "$ac4_out" == *"failures=1"* ]] && ! PATH="$ac4_bin" command -v protoc >/dev/null 2>&1; then
-    pass "AC4 block counts a failure for a malformed spec with protoc ABSENT (behavioural — a reintroduced capability gate is caught)"
+    ' 2>&1 || true
+}
+
+# BOTH directions. Asserting only "a malformed spec fails" is what let the vacuous
+# version through -- a block that fails on everything satisfies it. The valid case
+# is what proves the compile actually ran.
+ac4_bad=$(ac4_run 'syntax = "proto3";
+message D { string a = 1; string b = 1; }
+')
+ac4_good=$(ac4_run 'syntax = "proto3";
+message M { string a = 1; }
+')
+if [[ "$ac4_bad" == *"failures=1"* ]] && [[ "$ac4_good" == *"failures=0"* ]] &&
+   ! PATH="$ac4_bin" command -v protoc >/dev/null 2>&1; then
+    pass "AC4 block evaluates the compile with protoc ABSENT: rejects a malformed spec AND accepts a valid one"
 else
-    fail "AC4 block did not count a failure for a malformed spec on a protoc-absent PATH — the compile assertion can skip again, the defect LAB-5549 removed. Got: $ac4_out"
+    fail "AC4 block must reject a malformed spec and ACCEPT a valid one on a protoc-absent PATH — otherwise the compile is not running. malformed=[$ac4_bad] valid=[$ac4_good]"
 fi
 
 # (b) Every non-success arm must count a failure. A branch that neither compiles
@@ -2726,13 +2765,17 @@ esac
 # step, because the sibling VET step still supplied one -- the same
 # any-two-lines-anywhere hole the timeout-bound assertions had.
 pv_block=$(extract_job_block proto-validate-tests)
-pv_test_step=$(printf '%s\n' "$pv_block" | awk '/- name: Test test\/proto-validate/{f=1} f{print} f&&/^[[:space:]]*run:/{exit}')
-if printf '%s' "$pv_test_step" | grep -q 'working-directory:[[:space:]]*test/proto-validate' &&
-   printf '%s' "$pv_test_step" | grep -qE 'go test .*-race.*\./\.\.\.'; then
-    pass "ci.yml proto-validate-tests' test step both enters test/proto-validate and runs go test -race ./... there"
-else
-    fail "ci.yml proto-validate-tests' TEST STEP must itself set working-directory: test/proto-validate AND run 'go test -race ./...' — otherwise the nested module's tests do not run in CI. Step was: $pv_test_step"
-fi
+# Parsed, not truncated with awk. The awk form stopped at the first `run:` key,
+# so it pinned YAML KEY ORDER: moving `run:` above `working-directory:` -- identical
+# semantics to Actions -- failed the assertion. That traded a false negative for a
+# false positive. yq answers the structural question directly.
+pv_step_wd=$(yq_query '.jobs["proto-validate-tests"].steps[] | select(.run | test("go test")) | .["working-directory"] // "__ABSENT__"')
+case "$pv_step_wd" in
+    __NO_YQ__)    fail_no_yq "ci.yml's go-test step runs inside test/proto-validate" ;;
+    __YQ_ERROR__) fail_yq_error "ci.yml's go-test step runs inside test/proto-validate" ;;
+    test/proto-validate) pass "ci.yml proto-validate-tests' go-test step runs with working-directory: test/proto-validate (key order independent)" ;;
+    *)            fail "ci.yml's go-test step must set working-directory: test/proto-validate — without a workspace a root-relative module pattern does not resolve, so the nested module's tests would not run. Got: $pv_step_wd" ;;
+esac
 
 # A job-level `if:` is not the only way to switch this off. A step-level `if:`,
 # `continue-on-error: true`, or a trailing `|| true` on the test command each
@@ -2745,7 +2788,12 @@ else
 fi
 
 else
-    skip "ci.yml not found at $WORKFLOW — its three wiring assertions cannot be evaluated" 3
+    # Credit 5, MEASURED: the block emits five counted outcomes (presence, paths
+    # filter, job-level if, test-step scoping, step neutering). It credited 3, so
+    # renaming ci.yml gave `saw 172` against a pin of 174 -- blaming test
+    # maintenance for a missing workflow, the exact wrong-credit failure this
+    # repo has been bitten by before.
+    skip "ci.yml not found at $WORKFLOW — its five wiring assertions cannot be evaluated" 5
 fi
 
 WORKFLOW="$SCRIPT_DIR/../.github/workflows/security.yml"
@@ -2784,10 +2832,25 @@ if [ -f "$WORKFLOW" ]; then
         pass "security.yml proto-validate-security has no step-level neutering"
     fi
 else
-    skip "security.yml not found at $WORKFLOW — its three scan-wiring assertions cannot be evaluated" 3
+    # Credit 4, MEASURED: presence, job-level if, govulncheck-step scoping, step
+    # neutering. Credited 3, so renaming security.yml gave `saw 173` against 174.
+    skip "security.yml not found at $WORKFLOW — its four scan-wiring assertions cannot be evaluated" 4
 fi
 
 WORKFLOW="$_WORKFLOW_SAVED"
+
+# ci.yml's job is pinned five ways; the Makefile path that runs the same tests
+# locally was pinned nowhere. Without a workspace a root-relative pattern does not
+# resolve, so reverting `make test`'s second line to `./test/proto-validate/...`
+# makes it fail rather than silently skip -- but nothing asserted the working form,
+# and `make test` is what a developer runs before pushing.
+# [[:space:]] rather than \t -- POSIX ERE has no \t escape, so the literal form
+# matched a backslash followed by 't' and the assertion failed on a correct tree.
+if grep -qE '^[[:space:]]+cd test/proto-validate && go test .*-race.*\./\.\.\.' "$SCRIPT_DIR/../Makefile"; then
+    pass "Makefile's test target enters test/proto-validate and runs go test -race ./... there"
+else
+    fail "Makefile's test target must run 'cd test/proto-validate && go test -race ./...' — without a workspace a root-relative module pattern does not resolve, so the nested module's tests would not run locally"
+fi
 
 echo ""
 echo "=== No Go workspace file (product/scan graph coupling) ==="
@@ -3034,7 +3097,29 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # a live-test helper's manifest, and the GOWORK=off belt that used to mask that
 # was removed when the workspace went -- so recreating the file now re-couples
 # them with no override left, and silently.
-EXPECTED_ASSERTIONS=174
+# 174 -> 179. MEASURED. Round 4 found the guard added in round 3 for the AC4 gate
+# was itself VACUOUS, plus two wrong skip credits. Net +5:
+#
+# +1 AC4 extraction bound (empty / oversized / missing-call sentinel) and the
+# behavioural check now asserts BOTH directions -- a malformed spec must fail AND a
+# valid one must pass. The previous version sourced the extracted block at top
+# level, where its `local` declarations are a hard error: proto_err stayed empty,
+# `2>"$proto_err"` was an invalid redirect, the compound command failed before
+# `go run` ran, and failures=1 came back for EVERY input. Asserting only the
+# malformed direction is what let that through. The block is now wrapped in a
+# function so `local` is legal.
+#
+# +3 GRPC_SERVER_PORT cases (0, -1, abc alongside 99999). With only 99999 pinned,
+# deleting both the shape check and the lower bound left the suite green.
+#
+# +1 Makefile test-target invocation. ci.yml's equivalent is pinned five ways; the
+# Makefile path a developer actually runs was pinned zero ways.
+#
+# Also corrected, net zero: the ci.yml gate's skip credit 3 -> 5 and security.yml's
+# 3 -> 4 (both MEASURED by renaming the workflow -- the wrong credits made a missing
+# workflow report as assertion-accounting drift), and the ci.yml step assertion now
+# uses yq instead of an awk truncation that pinned YAML key order.
+EXPECTED_ASSERTIONS=179
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
