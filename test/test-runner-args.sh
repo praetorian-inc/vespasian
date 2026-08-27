@@ -301,9 +301,19 @@ d_grpcurl_fail=$(new_probe_dir grpcurl 1)
 d_nc_ok=$(new_probe_dir nc 0)
 # A real timeout replacement: drop the budget argument and exec the rest, so the
 # /dev/tcp arm actually runs its `bash -c` payload.
+# Delegates to the REAL timeout binary by absolute path so the fixture actually
+# BOUNDS the probe. The earlier `shift; exec "$@"` form discarded the budget, so
+# every assertion below ran unbounded: fine against a closed loopback port (which
+# refuses instantly) but a hang against a filtered one, in the very block written
+# to prove this probe cannot hang.
 d_timeout="$TMPDIR_T/probe-timeout"
 mkdir -p "$d_timeout"
-printf '#!/bin/sh\nshift\nexec "$@"\n' > "$d_timeout/timeout"
+_real_timeout=$(command -v timeout || true)
+if [ -n "$_real_timeout" ]; then
+    printf '#!/bin/sh\nexec %s "$@"\n' "$_real_timeout" > "$d_timeout/timeout"
+else
+    printf '#!/bin/sh\nshift\nexec "$@"\n' > "$d_timeout/timeout"
+fi
 chmod +x "$d_timeout/timeout"
 
 # Runs _probe_grpc_target under a restricted PATH, echoing "rc=<status>" after
@@ -352,8 +362,11 @@ fi
 # The BOUND, not just the outcome. `-max-time` is the only thing making the
 # grpcurl arm fail fast; deleting it leaves every reachability assertion above
 # green while restoring the hang this probe exists to prevent.
-if grep -qx -- '-max-time' "$TMPDIR_T/argv-grpcurl.log" 2>/dev/null &&
-   grep -qx -- '5' "$TMPDIR_T/argv-grpcurl.log" 2>/dev/null; then
+# Adjacency, not mere presence. Two independent greps pass on `-max-time 99 ...
+# 5` whenever a bare "5" appears anywhere else in argv -- for the nc arm that is
+# the PORT, so budget 99 with port 5 slipped through. Compare the line that
+# FOLLOWS the flag.
+if [ "$(grep -A1 -x -- '-max-time' "$TMPDIR_T/argv-grpcurl.log" 2>/dev/null | tail -1)" = "5" ]; then
     pass "_probe_grpc_target: grpcurl arm passes -max-time 5 (bound is asserted, not just the outcome)"
 else
     fail "_probe_grpc_target: grpcurl arm must pass '-max-time 5'; recorded argv: $(tr '\n' ' ' < "$TMPDIR_T/argv-grpcurl.log" 2>/dev/null)"
@@ -379,8 +392,9 @@ fi
 # Same reasoning as the grpcurl bound above: `-w` is what makes the nc arm
 # finite. This is the arm CI actually takes when grpc-server is down, because
 # ubuntu-24.04 ships nc but not grpcurl.
-if grep -qx -- '-w' "$TMPDIR_T/argv-nc.log" 2>/dev/null &&
-   grep -qx -- '5' "$TMPDIR_T/argv-nc.log" 2>/dev/null; then
+# Adjacency for the same reason as the grpcurl bound above; this is the arm where
+# the port made the independent form pass with a mutated budget.
+if [ "$(grep -A1 -x -- '-w' "$TMPDIR_T/argv-nc.log" 2>/dev/null | tail -1)" = "5" ]; then
     pass "_probe_grpc_target: nc arm passes -w 5 (bound is asserted, not just the outcome)"
 else
     fail "_probe_grpc_target: nc arm must pass '-w 5'; recorded argv: $(tr '\n' ' ' < "$TMPDIR_T/argv-nc.log" 2>/dev/null)"
@@ -444,6 +458,39 @@ fi
 rm -f "$probe_marker"
 
 echo ""
+echo "=== Env-seam validation (TEST_HOST / GRPC_SERVER_PORT) ==="
+
+# run-live-tests.sh refuses to run on a TEST_HOST that is not a plain hostname,
+# IPv4 or bracketed IPv6, and on a GRPC_SERVER_PORT outside 1-65535. Both values
+# flow into a curl URL, a grpcurl authority, an nc operand and a `bash -c` argv,
+# so this seam is what keeps every one of those sinks fed only screened values.
+# It shipped with no assertion at all: deleting the whole block left the suite
+# green, which is the "guard that cannot fail" shape this file exists to prevent.
+#
+# Each case runs in its own `bash -c` subshell, so the seam's `exit 1` terminates
+# that subshell and not this suite.
+seam_hostile=$(TEST_HOST='x/1; id #' bash -c "source '$RUNNER' --group offline --dry-run" 2>&1) || true
+if [[ "$seam_hostile" == *"refusing to run"* ]]; then
+    pass "env seam: TEST_HOST carrying shell metacharacters is refused"
+else
+    fail "env seam: a TEST_HOST containing ';' and '#' was NOT refused; got: $seam_hostile"
+fi
+
+seam_ok=$(TEST_HOST='host.docker.internal' bash -c "source '$RUNNER' --group offline --dry-run" 2>&1) || true
+if [[ "$seam_ok" != *"refusing to run"* && "$seam_ok" == *"targets="* ]]; then
+    pass "env seam: the documented devcontainer TEST_HOST is still accepted"
+else
+    fail "env seam: TEST_HOST=host.docker.internal must be accepted — the validator cannot reject a documented value; got: $seam_ok"
+fi
+
+seam_port=$(GRPC_SERVER_PORT=99999 bash -c "source '$RUNNER' --group offline --dry-run" 2>&1) || true
+if [[ "$seam_port" == *"refusing to run"* ]]; then
+    pass "env seam: an out-of-range GRPC_SERVER_PORT is refused"
+else
+    fail "env seam: GRPC_SERVER_PORT=99999 was NOT refused; got: $seam_port"
+fi
+
+echo ""
 echo "=== AC4 compile check is unconditional (LAB-5549's whole point) ==="
 
 # LAB-5549 exists because the AC4 compile assertion was gated on
@@ -451,11 +498,28 @@ echo "=== AC4 compile check is unconditional (LAB-5549's whole point) ==="
 # is the deliverable, so the property worth pinning is not "the check works" but
 # "the check cannot opt itself out again". Both regressions below are one-line
 # edits that leave every other assertion in this suite green.
-# Comment lines are stripped before matching. The block's own comments narrate
-# the removed `command -v protoc` gate at length, so grepping the raw text
-# reports the history as a live gate -- caught by this assertion failing on a
-# correct tree the first time it ran. The check must look at CODE, not prose.
-ac4_block=$(sed -n '/# AC4 (LAB-2778)/,/^    local expected_count/p' "$RUNNER" | sed 's/#.*$//')
+# Whole comment LINES are dropped; a `#` inside a code line is left alone. The
+# block's own comments narrate the removed `command -v protoc` gate at length, so
+# matching raw text reports that history as a live gate -- this assertion failed
+# on a correct tree the first time it ran. But truncating each line at its first
+# `#` over-corrects: a gate written as `... "#" ... || ! command -v protoc` would
+# be silently erased along with the comment, hiding exactly what this checks for.
+# `|| true` is load-bearing: grep exits 1 when it filters everything out, and
+# under `set -e` a failing command substitution aborts the whole suite. Without
+# it a broken sed anchor killed the run mid-file -- the completion sentinel
+# caught it, but reported "terminated before reaching the summary" instead of the
+# real cause, which is the misattributed-diagnostic failure this file warns about
+# elsewhere. With it, a broken anchor becomes the counted failure below.
+ac4_block=$(sed -n '/# AC4 (LAB-2778)/,/^    local expected_count/p' "$RUNNER" | grep -vE '^[[:space:]]*#' || true)
+
+# Fidelity sentinel, matching the four sibling extractions in this file. Without
+# it an anchor that stops matching yields an EMPTY block, and assertion (a) below
+# -- which passes when it finds no capability gate -- passes vacuously on nothing.
+if [ -n "$ac4_block" ] && printf '%s' "$ac4_block" | grep -q 'proto-validate'; then
+    pass "AC4 block extracted from run-live-tests.sh (assertions below are non-vacuous)"
+else
+    fail "AC4 block extraction is broken/empty — the two assertions below would pass vacuously; fix the sed anchors rather than deleting them"
+fi
 
 # (a) No capability gate may guard the compile invocation. This is the exact
 # shape that was removed: `command -v <tool>` deciding whether the assertion runs.
@@ -2521,6 +2585,27 @@ echo "=== ci.yml proto-validate-tests job wiring ==="
 _WORKFLOW_SAVED="$WORKFLOW"
 WORKFLOW="$SCRIPT_DIR/../.github/workflows/ci.yml"
 
+# File-existence guard, matching the live-tests.yml block above. Without it a
+# renamed or deleted ci.yml makes every assertion below fail with a yq parse
+# error that names the wrong cause.
+if [ -f "$WORKFLOW" ]; then
+    pass "ci.yml is present and readable"
+else
+    fail "ci.yml not found at $WORKFLOW — the proto-validate-tests assertions below cannot be evaluated"
+fi
+
+# The job being unconditional is worthless if the WORKFLOW never fires. ci.yml is
+# paths-filtered, and the nested module's manifests are not matched by the
+# root-scoped go.mod/go.sum patterns -- so a change confined to
+# test/proto-validate/go.mod must still trigger the job that tests it.
+ci_paths=$(yq_query '.on.pull_request.paths | join(" ")')
+case "$ci_paths" in
+    __NO_YQ__)    fail_no_yq "ci.yml fires on the nested module's manifests" ;;
+    __YQ_ERROR__) fail_yq_error "ci.yml fires on the nested module's manifests" ;;
+    *test/proto-validate/go.mod*) pass "ci.yml's paths filter covers test/proto-validate/go.mod" ;;
+    *)            fail "ci.yml's paths filter does not name test/proto-validate/go.mod — a change to the nested module's manifest would not trigger the job that tests it" ;;
+esac
+
 # has("if"), NOT `.if // "__ABSENT__"`. yq's `//` is jq's alternative operator,
 # which falls through on `false` as well as null -- so `if: false`, the single
 # most likely way to switch a job off, reads EXACTLY like having no `if:` at all.
@@ -2541,6 +2626,16 @@ if printf '%s' "$pv_block" | grep -q 'go test .*\./test/proto-validate/\.\.\.'; 
     pass "ci.yml proto-validate-tests actually runs go test against ./test/proto-validate/..."
 else
     fail "ci.yml proto-validate-tests no longer runs 'go test ./test/proto-validate/...' — the nested module's tests would not run in CI"
+fi
+
+# A job-level `if:` is not the only way to switch this off. A step-level `if:`,
+# `continue-on-error: true`, or a trailing `|| true` on the test command each
+# leave the job green while running nothing that can fail -- the same neutering
+# the live-tests.yml block above already checks for.
+if printf '%s' "$pv_block" | grep -qE 'continue-on-error:[[:space:]]*true|\|\|[[:space:]]*(true|exit 0|:)[[:space:]]*$|^[[:space:]]+if:'; then
+    fail "ci.yml proto-validate-tests contains step-level neutering (continue-on-error, a trailing '|| true', or a step if:) — the job would stay green while testing nothing"
+else
+    pass "ci.yml proto-validate-tests has no step-level neutering"
 fi
 
 WORKFLOW="$_WORKFLOW_SAVED"
@@ -2716,7 +2811,26 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # +2 ci.yml proto-validate-tests wiring. That job is the ONLY thing running the
 # nested module's tests in CI (a root `go test ./...` cannot reach a separate
 # module), so `if: false` on it silently disabled that entire suite and survived.
-EXPECTED_ASSERTIONS=154
+# 154 -> 161. MEASURED. +7 closing gaps a second review round found in the
+# round-1 FIX code -- every one of them a guard that could not fail.
+#
+# +3 env-seam validation (TEST_HOST hostile / TEST_HOST documented-value /
+# GRPC_SERVER_PORT out of range). The seam shipped with no assertion at all;
+# deleting the whole validation block left the suite green. The documented-value
+# case is the counterweight: a validator that rejects host.docker.internal would
+# break every devcontainer run, so both directions are pinned.
+#
+# +1 AC4 extraction fidelity sentinel, matching the four siblings in this file.
+# The AC4 "no capability gate" assertion passes when it finds no gate, so an
+# anchor that stops matching yields an empty block and a vacuous pass.
+#
+# +3 ci.yml wiring (file present / paths filter reaches the nested manifests /
+# no step-level neutering). The job-level `if:` check alone was insufficient:
+# ci.yml is paths-filtered and the root-scoped go.mod pattern does not match
+# test/proto-validate/go.mod, so the job that tests the nested module could stop
+# firing for changes to that module; and continue-on-error, a trailing `|| true`
+# or a step-level `if:` each keep the job green while running nothing.
+EXPECTED_ASSERTIONS=161
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."

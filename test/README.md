@@ -306,6 +306,19 @@ For Linux devcontainers without Docker Desktop, use the detected host gateway (e
 
 `setup-live-targets.sh` does not read `TEST_HOST` — run it on the host that actually runs the target binaries.
 
+> **Accepted values.** `run-live-tests.sh` validates `TEST_HOST` before it runs anything and
+> **refuses to start** on a value outside the grammar, with
+> `refusing to run: TEST_HOST is not a plain hostname, IPv4, or bracketed IPv6 literal`.
+> Accepted: a plain hostname (`localhost`, `host.docker.internal`), an IPv4 literal, or a
+> **bracketed** IPv6 literal (`[::1]`). The brackets are required because `curl` and `grpcurl`
+> take a `host:port` authority and need them to disambiguate the colons; the gRPC preflight
+> strips them again for `nc` and bash's `/dev/tcp`, which take a bare host. Anything carrying a
+> leading dash, whitespace, or a shell metacharacter is rejected — those values reach a URL, a
+> command operand and a `bash -c` argv, so they are screened once here rather than at each sink.
+>
+> The same check applies to an environment-supplied `GRPC_SERVER_PORT`, which must be 1-65535.
+> (Ports read from `.live-test-config` were already validated; this closes the environment path.)
+
 ### `FORMS_TARGET_BIND_HOST` (optional)
 
 The `forms-target` server binds `127.0.0.1` by default (via its `BIND_HOST` env var), and `setup-live-targets.sh` now honours that default rather than overriding it. It is an unauthenticated HTTP app serving login / register / feedback forms, so it has no business listening on every interface of the operator's machine unless asked.

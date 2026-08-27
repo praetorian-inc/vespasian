@@ -12,7 +12,6 @@
 *.out
 
 # Go workspace file
-go.work.sum
 
 # Dependency directories
 vendor/

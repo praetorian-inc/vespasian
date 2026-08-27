@@ -63,8 +63,10 @@ TEST_HOST="${TEST_HOST:-localhost}"
 # host is otherwise consumed as a FLAG by grpcurl and nc rather than as an
 # operand, which is why this is fixed at the seam instead of by adding `--` to
 # each arm -- one check covers every present and future consumer.
-# Bracketed IPv6 (`[::1]`) is allowed explicitly; it is the documented form for
-# an IPv6 TEST_HOST and would otherwise fail the hostname pattern.
+# Bracketed IPv6 (`[::1]`) is allowed explicitly because curl and grpcurl need
+# the brackets to parse a host:port authority. It is NOT a form any consumer can
+# take verbatim: _probe_grpc_target strips them before handing the host to nc and
+# to /dev/tcp, which reject them. test/README.md documents the accepted grammar.
 if [[ ! "$TEST_HOST" =~ ^([A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:]+\])$ ]]; then
     echo "test/run-live-tests.sh: refusing to run: TEST_HOST is not a plain hostname, IPv4, or bracketed IPv6 literal: ${TEST_HOST}" >&2
     exit 1
@@ -337,6 +339,16 @@ _probe_grpc_target() {
     # agree on how long "unreachable" takes to decide.
     local budget=5
 
+    # The four consumers of TEST_HOST do NOT agree on IPv6 spelling, so the
+    # bracketed literal cannot simply be passed through. curl and grpcurl take a
+    # host:port authority and REQUIRE brackets to disambiguate the colons;
+    # nc and bash's /dev/tcp take a bare host operand and REJECT them --
+    # measured: `/dev/tcp/[::1]/22` fails with "Invalid argument" while
+    # `/dev/tcp/::1/22` connects. Strip them for the two that take a bare host.
+    local host_bare="${TEST_HOST}"
+    host_bare="${host_bare#[}"
+    host_bare="${host_bare%]}"
+
     if command -v grpcurl >/dev/null 2>&1; then
         if grpcurl -max-time "$budget" -plaintext "${TEST_HOST}:${port}" list >/dev/null 2>&1; then
             log_ok "grpc-server reachable at ${TEST_HOST}:${port}"
@@ -346,7 +358,7 @@ _probe_grpc_target() {
         return 1
     fi
 
-    if command -v nc >/dev/null 2>&1 && nc -z -w "$budget" "${TEST_HOST}" "${port}" 2>/dev/null; then
+    if command -v nc >/dev/null 2>&1 && nc -z -w "$budget" "${host_bare}" "${port}" 2>/dev/null; then
         log_ok "grpc-server reachable at ${TEST_HOST}:${port} (nc)"
         return 0
     fi
@@ -361,17 +373,18 @@ _probe_grpc_target() {
     # program text. `bash -c` PARSES its argument as shell source, so an
     # interpolated "${TEST_HOST}/${port}" makes those two values the only thing
     # separating this from arbitrary command execution: TEST_HOST='x/1; id #'
-    # would run `id`. Both values reach here unvalidated — TEST_HOST is an
-    # env-only seam (line 53) and port arrives as ${GRPC_SERVER_PORT:-}, which
-    # load_config's 1-65535 check only screens when it reads it OUT of a config
-    # file, never for a value already in the environment. As argv the inner
+    # would run `id`. Both values ARE screened at the env seam near the top of
+    # this file, which rejects shell metacharacters outright — but the argv form
+    # is kept as defence in depth rather than deleted, because it is the property
+    # that holds even if the seam check is ever loosened or bypassed, and because
+    # a sink that cannot be injected is stronger than one guarded only upstream. As argv the inner
     # shell never re-parses them. `_` fills $0 so $1/$2 land where expected.
     # This mirrors wait_for_grpc at setup-live-targets.sh:661, whose comment
     # spells out the same reasoning. Pinned by the hostile-TEST_HOST assertion
     # in test-runner-args.sh ("_probe_grpc_target: hostile TEST_HOST is not
     # executed by the /dev/tcp probe") — that assertion fails if this reverts to
     # an interpolated string.
-    if "$t" "$budget" bash -c 'echo > /dev/tcp/"$1"/"$2"' _ "$TEST_HOST" "$port" 2>/dev/null; then
+    if "$t" "$budget" bash -c 'echo > /dev/tcp/"$1"/"$2"' _ "$host_bare" "$port" 2>/dev/null; then
         log_ok "grpc-server reachable at ${TEST_HOST}:${port} (/dev/tcp)"
         return 0
     fi

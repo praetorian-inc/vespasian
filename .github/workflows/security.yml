@@ -81,25 +81,32 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # Versions pinned to match the reusable workflow's inputs above, so the
-      # nested module is held to the same bar as the root module rather than
-      # whatever `latest` happens to be.
+      # Versions pinned to match the reusable workflow's inputs above rather than
+      # whatever `latest` happens to be. Installed AFTER setup-go so both build
+      # with the repo's go1.27 toolchain -- a scanner built against an older Go
+      # cannot read go1.27 export data, which is the failure the gosec-version
+      # comment above already records.
       - name: Install scanners
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
           go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
 
-      # GOWORK=off so the scan resolves this module's OWN manifest rather than
-      # the workspace's merged view -- otherwise root pins could mask a
-      # vulnerable version this module actually builds against under GOWORK=off.
+      # Deliberately WITHOUT GOWORK=off: scan what actually runs. go.work is
+      # committed, so every real invocation of this module resolves through the
+      # workspace -- `go run .` from run-live-tests.sh, `go test
+      # ./test/proto-validate/...` from the Makefile, and the proto-validate-tests
+      # job. Measured: the workspace selects google.golang.org/protobuf v1.36.12
+      # while GOWORK=off selects v1.34.2, so scanning with it off would report on
+      # a dependency set no build path in this repo produces.
       - name: govulncheck (nested module)
         working-directory: test/proto-validate
-        env:
-          GOWORK: "off"
         run: govulncheck ./...
 
+      # No -no-fail here, unlike the root scan above. That flag is safe there
+      # because the root job writes SARIF and uploads it, so an observed finding
+      # is still recorded in code scanning. This job has no SARIF output and only
+      # `contents: read`, so -no-fail would send every finding to a job log and
+      # nowhere else -- an observe-only step that observes into the void.
       - name: gosec (nested module)
         working-directory: test/proto-validate
-        env:
-          GOWORK: "off"
-        run: gosec -no-fail -exclude-generated ./...
+        run: gosec -exclude-generated ./...

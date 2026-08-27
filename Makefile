@@ -8,8 +8,14 @@ LDFLAGS   := -s -w -X main.version=$(VERSION) -X main.gitCommit=$(GIT_COMMIT) -X
 
 .PHONY: build test test-integration lint lint-comments lint-comments-selftest lint-comments-all fmt vet check check-docs coverage clean deps live-test-clean
 
+# GOWORK=off for the same reason .goreleaser.yml sets it: the shipped binary must
+# resolve from the root go.mod/go.sum alone. go.work pulls the test-only
+# test/proto-validate module into MVS, so without this a bump in a live-test
+# helper's manifest could move the product's dependency set -- and dependabot now
+# opens PRs against that manifest weekly. Verified byte-identical either way today;
+# this keeps it that way by construction rather than by coincidence.
 build:
-	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/vespasian
+	GOWORK=off go build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/vespasian
 
 # ./... does NOT reach test/proto-validate: it is a separate module (so that
 # protocompile stays out of the shipped module's require list) and a root
