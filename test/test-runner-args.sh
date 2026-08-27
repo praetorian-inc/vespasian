@@ -2873,15 +2873,23 @@ fi
 # a strictly more privileged setter than the Dockerfile RUN that WAS listed.
 # It also had no vacuity sentinel, so if the paths stopped resolving it printed
 # its single pass having read nothing.
+tr_expect=()
 tr_callers=()
 for tr_c in "$SCRIPT_DIR/install-chrome.sh" "$SCRIPT_DIR/setup-live-targets.sh" \
             "$SCRIPT_DIR/run-live-tests.sh" "$SCRIPT_DIR/common.sh" \
             "$SCRIPT_DIR/../.devcontainer/Dockerfile" "$SCRIPT_DIR/../.devcontainer/devcontainer.json" \
             "$WORKFLOW" "$(dirname "$WORKFLOW")/ci.yml"; do
+    tr_expect+=("$tr_c")
     [[ -f "$tr_c" ]] && tr_callers+=("$tr_c")
 done
-if [[ "${#tr_callers[@]}" -lt 6 ]]; then
-    fail "only ${#tr_callers[@]} of the 8 VESPASIAN_TEST_ROOT production callers resolved — the assertion below would read almost nothing; fix the paths rather than letting it pass vacuously"
+# ALL of them, not "at least 6". Every entry is a committed path, so a shortfall
+# is a real repo change worth naming — and tolerating two missing let two callers
+# be renamed or moved while the check passed silently over the rest, which is a
+# narrower version of the omission this sentinel was added for.
+if [[ "${#tr_callers[@]}" -ne "${#tr_expect[@]}" ]]; then
+    tr_absent=""
+    for tr_c in "${tr_expect[@]}"; do [[ -f "$tr_c" ]] || tr_absent="${tr_absent} ${tr_c#"$SCRIPT_DIR"/}"; done
+    fail "only ${#tr_callers[@]} of the ${#tr_expect[@]} VESPASIAN_TEST_ROOT production callers resolved (missing:${tr_absent}) — the assertion below would read less than it claims; fix the paths rather than letting it pass vacuously"
 else
     tr_setters=""
     for tr_caller in "${tr_callers[@]}"; do
@@ -2896,7 +2904,7 @@ else
         fi
     done
     if [[ -z "$tr_setters" ]]; then
-        pass "no production caller sets VESPASIAN_TEST_ROOT (${#tr_callers[@]} callers checked, 4 assignment forms: shell, YAML env:, Dockerfile ENV/ARG, JSON containerEnv)"
+        pass "no production caller sets VESPASIAN_TEST_ROOT (all ${#tr_expect[@]} callers checked — $(for tr_c in "${tr_expect[@]}"; do printf '%s ' "$(basename "$tr_c")"; done)— 4 assignment forms: shell, YAML env:, Dockerfile ENV/ARG, JSON containerEnv)"
     else
         fail "VESPASIAN_TEST_ROOT is set by production caller(s):${tr_setters} — it reroots root-privileged writes and test/README.md states no production caller sets it"
     fi

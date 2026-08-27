@@ -664,7 +664,14 @@ jobs:
             # target added. A herestring feeds grep from a temp file with no pipe
             # and no writer to signal — verified 0 up to 2 MB, while a SKIPped
             # target still correctly reports missing.
-            grep -qE "(^|[^a-z-])${t}[^a-z-].*PASS|PASS.*[^a-z-]${t}([^a-z-]|$)" <<<"$out" \
+            # One shape only. The suite never prints PASS before the target name:
+            # the summary row is `printf "  %-26s  %-8s" "$name" "$status"` and the
+            # per-target line is `log_ok "concat-spa: ALL CHECKS PASSED"`. The
+            # dropped `PASS.*name` alternative matched nothing real and could only
+            # false-positive off an unrelated line that mentions a target after the
+            # word PASS. The [^a-z-] boundaries are load-bearing and must stay:
+            # without them `concat-spa` is satisfied by a `concat-spa-two-stage` row.
+            grep -qE "(^|[^a-z-])${t}[^a-z-].*PASS" <<<"$out" \
               || missing="${missing} ${t}"
           done
           if [ -n "$missing" ]; then
