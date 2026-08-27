@@ -212,7 +212,7 @@ jobs:
       # RUNS LAST, DELIBERATELY, and its position is pinned. It is the only
       # network-dependent step in this job; the four guard suites above need no network.
       # Placed earlier, a transient failure on either host aborted the job before any of
-      # them ran, suppressing 141 network-free assertions and skipping the `test` job via
+      # them ran, suppressing 144 network-free assertions and skipping the `test` job via
       # its `needs:`. Last means a flake costs only this assertion.
       - name: Assert egress policy enforces (AC3)
         run: ./test/assert-egress-enforced.sh

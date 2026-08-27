@@ -37,9 +37,13 @@
 #   * NOT established: that the first refusal was a POLICY refusal rather than an
 #     outage of that specific host. harden-runner blocks at the DNS layer, so a blocked
 #     domain and an unresolvable one both surface as curl exit 6 and cannot be told
-#     apart from inside the job. The mitigation is that both hostnames are pinned in
-#     test/test-runner-args.sh, so a rename or typo fails the build rather than quietly
-#     making this a no-op.
+#     apart from inside the job. Be precise about what is and is not guarded here: the
+#     ABSENCE of proxy.golang.org from preflight-selftest's allowlist IS pinned (the
+#     per-job endpoints pin in test/test-runner-args.sh), so nobody can quietly make the
+#     probe reach its target by allowlisting it. The hostnames in THIS file are NOT
+#     pinned, because nothing pins this file's contents — so retyping UNLISTED_URL to
+#     another unreachable host would pass vacuously. That is the same declared residual
+#     as the rest of this script's body.
 set -euo pipefail
 
 # Pinned in test/test-runner-args.sh. proxy.golang.org must stay OFF
