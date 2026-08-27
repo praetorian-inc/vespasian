@@ -2102,7 +2102,7 @@ hr_expected() {
         test)                 endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ;;
         *) printf '%s\n' '<no expectation pinned>'; return 0 ;;
     esac
-    printf 'first=true || uses=%s policy=block sudo=true if=false endpoints=%s\n' "$HR_PIN" "$endpoints"
+    printf 'first=true || uses=%s policy=block sudo=true if=false eptype=!!str endpoints=%s\n' "$HR_PIN" "$endpoints"
 }
 
 # The observed counterpart. Built with ONE yq call so each job costs exactly one
@@ -2116,6 +2116,16 @@ hr_expected() {
 # alike. The `sub("\s+"; " ")` then collapses the newline a `>` block scalar
 # leaves on its last element, which a plain space-split silently carried into the
 # endpoint name.
+#
+# BUT accepting both shapes is not the same as ACCEPTING both shapes as equal, and
+# the first version of this fix conflated them: a block sequence of the same
+# entries normalised to a string byte-identical to the pin, so rewriting a list as
+# a YAML sequence passed (measured: 141/0), where the pre-fix `split(" ")` had
+# type-errored into a counted FAIL. That is a coverage regression dressed as a bug
+# fix. `eptype=` restores the distinction by pinning the NODE TYPE alongside the
+# entries: the folded scalar every job uses is `!!str`, a sequence is `!!seq`, and
+# only the former matches. The shape matters because harden-runner takes a string
+# input — a sequence is not an equivalent spelling of the same policy.
 hr_policy() {
     local job=$1
     yq_query "\"first=\" + ((.jobs.\"${job}\".steps[0].uses // \"\") | test(\"step-security/harden-runner\") | tostring)
@@ -2124,6 +2134,7 @@ hr_policy() {
             + \" policy=\" + (.with.\"egress-policy\" // \"<unset>\")
             + \" sudo=\" + ((.with.\"disable-sudo\" // \"<unset>\") | tostring)
             + \" if=\" + ((has(\"if\")) | tostring)
+            + \" eptype=\" + ((.with.\"allowed-endpoints\" | type) // \"<unset>\")
             + \" endpoints=\" + ([.with.\"allowed-endpoints\"] | flatten | join(\" \") | sub(\"\s+\"; \" \") | split(\" \") | map(select(. != \"\")) | sort | join(\",\")))
         | join(\" ;; \"))" -r
 }
@@ -2152,7 +2163,46 @@ else
     # would otherwise be unchecked — the mirror image of the check-label gap that
     # the derived job list had.
     hr_actual=$(yq_query '[.jobs | to_entries[] | select([.value.steps[]? | select((.uses // "") | test("step-security/harden-runner"))] | length > 0) | .key] | sort | join(" ")' -r)
+    # ...but that query only sees jobs that ALREADY carry harden-runner, so a NEW
+    # job added WITHOUT one is invisible to it: measured, appending a job whose
+    # only step is `run: curl ...` left this suite at 141/0 and shipped a job with
+    # unrestricted egress. Pinning the FULL job list closes that direction. Every
+    # new job now forces a decision — carry the policy and join EXPECTED_HR_JOBS,
+    # or have its exemption recorded here. The two standing exemptions are
+    # install-chrome-e2e (a CONTAINER job; the action does not support those) and
+    # check-label (one inline bash gate, no checkout, no network).
+    EXPECTED_ALL_JOBS=(check-label docs-check install-chrome-e2e integration-tests preflight-selftest test validator-regression)
+    all_actual=$(yq_query '[.jobs | keys | .[]] | sort | join(" ")' -r)
+    all_pinned=$(printf '%s\n' "${EXPECTED_ALL_JOBS[@]}" | sort | tr '\n' ' ' | sed 's/ $//')
+    case "$all_actual" in
+        __NO_YQ__)    fail_no_yq "the full set of jobs in live-tests.yml" ;;
+        __YQ_ERROR__) fail_yq_error "the full set of jobs in live-tests.yml" ;;
+        "$all_pinned") pass "the job set is exactly the pinned seven (${all_pinned})" ;;
+        *)            fail "live-tests.yml's job set has changed — pinned '${all_pinned}', found '${all_actual}'. A new job must either carry harden-runner (add it to EXPECTED_HR_JOBS and hr_expected) or have its exemption recorded in EXPECTED_ALL_JOBS' comment. A job that went away needs the removal recorded here." ;;
+    esac
     hr_pinned_sorted=$(printf '%s\n' "${EXPECTED_HR_JOBS[@]}" | sort | tr '\n' ' ' | sed 's/ $//')
+
+    # The AC3 runtime proof is the only assertion in the repo that tests egress
+    # ENFORCEMENT rather than the YAML that describes it, and it shipped unpinned:
+    # measured, deleting the whole step left this suite at 141/0. Pin its existence
+    # AND both host strings. The hosts are load-bearing in opposite directions —
+    # proxy.golang.org must stay OFF this job's allowlist (the endpoints pin above
+    # enforces that) and must stay a real, resolvable host, because an unreachable
+    # one satisfies the refusal verdict for the wrong reason and turns the step
+    # into a no-op that still prints ok. github.com must stay the allowlisted
+    # control. A rename, a typo, or a deletion fails here instead of silently
+    # retiring the only enforcement check.
+    ac3_run=$(yq_query '[.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | .run] | join("")' -r)
+    case "$ac3_run" in
+        __NO_YQ__)    fail_no_yq "the AC3 egress-enforcement step" ;;
+        __YQ_ERROR__) fail_yq_error "the AC3 egress-enforcement step" ;;
+        *)
+            if [[ "$ac3_run" == *"https://proxy.golang.org/"* && "$ac3_run" == *"https://github.com/"* ]]; then
+                pass "AC3 enforcement step present and still probes proxy.golang.org (unlisted) against github.com (allowlisted)"
+            else
+                fail "preflight-selftest's 'Assert egress policy enforces (AC3)' step is gone, renamed, or no longer probes BOTH hosts — this is the only runtime check that block mode actually enforces. Restore it, or record the decision to drop it here deliberately."
+            fi ;;
+    esac
     case "$hr_actual" in
         __NO_YQ__)    fail_no_yq "the set of jobs carrying harden-runner" ;;
         __YQ_ERROR__) fail_yq_error "the set of jobs carrying harden-runner" ;;
@@ -2388,6 +2438,13 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # counted outcome per job in EXPECTED_HR_JOBS) and +1 for the "exactly these jobs
 # carry it" check.
 #
+# LAB-6015 review round 2: 141 -> 143. MEASURED. +1 for the FULL job-set pin
+# (EXPECTED_ALL_JOBS — the "exactly these jobs carry it" check above is
+# one-directional and cannot see a new job added WITHOUT harden-runner) and +1 for
+# the AC3 enforcement-step pin (the step shipped unpinned; deleting it left the
+# suite at 141/0). Both are single counted outcomes on every path, yq or no yq, so
+# the constant-by-construction property below still holds.
+#
 # The +6 is CONSTANT BY CONSTRUCTION, which is the property that matters here and
 # the one the first version of that block got wrong. It iterated a job list
 # DERIVED from the workflow, so it emitted six outcomes with yq and one without —
@@ -2397,16 +2454,26 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # now, with yq hidden from PATH: 127 passed + 14 failed = 141, no drift message.
 # Iterating the hardcoded EXPECTED_HR_JOBS is what makes the total independent of
 # both yq and the workflow's contents. The test that fails if it stops being
-# constant is the EXPECTED_ASSERTIONS comparison immediately below: it runs on
-# every host, and a count that varied with yq's presence would trip its
-# "accounting drift" branch on any host without it.
+# constant is the EXPECTED_ASSERTIONS comparison immediately below — but be exact
+# about WHERE it fires: it runs on every host, and a count that varied with yq's
+# presence would trip its "accounting drift" branch only on a host WITHOUT yq. CI
+# always has yq, so no CI job exercises that arm; pre- and post-fix code are both
+# green there. The yq-absent path is covered by a local run on a machine without
+# it (`PATH` shorn of yq: measured 127 passed + 14 failed = 141, no drift), and
+# that is the whole of its coverage. A standing CI check would mean building a
+# yq-free PATH inside the job — `disable-sudo: true` rules out moving the binary —
+# which is more machinery than the developer-experience bug it guards warrants.
+# Stated rather than left implied, per the AGENTS.md rule on claims like this one.
 #
-# Mutation-proven, ten mutations, every one CAUGHT (each left the PREVIOUS
-# shape-checking version at 141/0, exit 0): policy -> audit; allowlist emptied; a
+# Mutation-proven, ten mutations, every one CAUGHT. Eight of them left the
+# PREVIOUS shape-checking version at 141/0, exit 0; the first two below are the
+# exceptions its `block`/non-empty checks did already catch, which is why the
+# account above this block counts eight rather than ten: policy -> audit;
+# allowlist emptied; a
 # second harden-runner step on audit; allowlist -> `*:443`; an extra endpoint
 # added; SHA -> 000...0; a look-alike action name; `if: false` on the step; the
 # step moved below checkout; disable-sudo deleted from all five.
-EXPECTED_ASSERTIONS=141
+EXPECTED_ASSERTIONS=143
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
