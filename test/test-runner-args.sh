@@ -2157,8 +2157,8 @@ if [[ ! -f "$WORKFLOW" ]]; then
     # else arm and emit nothing. That imbalance predates this ticket and is not
     # LAB-6015's to fix; stated here so the next reader does not take a balanced
     # section for a balanced suite.
-    for _ in "the set of jobs carrying harden-runner" "the full job set" "the AC3 enforcement step and the exemption rationale"; do
-        fail "a harden-runner section check could not be run: $WORKFLOW is missing"
+    for hr_pad in "the set of jobs carrying harden-runner" "the full job set" "the AC3 enforcement step and the exemption rationale"; do
+        fail "${hr_pad} could not be checked: $WORKFLOW is missing"
     done
 else
     for hr_job in "${EXPECTED_HR_JOBS[@]}"; do
@@ -2167,10 +2167,23 @@ else
         case "$hr_got" in
             __NO_YQ__)    fail_no_yq "${hr_job}'s harden-runner egress policy" ;;
             __YQ_ERROR__) fail_yq_error "${hr_job}'s harden-runner egress policy" ;;
-            "$hr_want")   pass "${hr_job} harden-runner policy matches the pin (block, sudo, no if:, first step, exact allowlist)" ;;
-            *)            fail "${hr_job} harden-runner policy does not match the pin — a job leaving 'block', gaining a second harden-runner step, an if:, a moved step, a changed SHA, a dropped disable-sudo, or a widened allowlist all land here. Update this file's pin deliberately if the change is intended.
+            *)
+            # Literal [[ == ]] with the right side QUOTED, not a `case` pattern. hr_want
+            # contains `*.blob.core.windows.net:443`, and in a case pattern that `*` is a GLOB,
+            # not a literal: proven in bash, pattern `*.blob.core.windows.net:443` matches the
+            # subject `evil.blob.core.windows.net:443`. No exploit was constructible — the
+            # endpoint list is sorted, so a substituted host moves position and the pattern's
+            # literal tail stops aligning (measured: a look-alike host gives 142/2) — but
+            # "compares an exact normalised value" is this block's whole claim, and a glob is
+            # not that. The other two comparisons below are converted for the same reason: they
+            # are metacharacter-free only by accident of today's job names.
+                if [[ "$hr_got" == "$hr_want" ]]; then
+                    pass "${hr_job} harden-runner policy matches the pin (block, sudo, no if:, first step, exact allowlist)"
+                else
+                    fail "${hr_job} harden-runner policy does not match the pin — a job leaving 'block', gaining a second harden-runner step, an if:, a moved step, a changed SHA, a dropped disable-sudo, or a widened allowlist all land here. Update this file's pin deliberately if the change is intended.
         want: ${hr_want}
-        got:  ${hr_got}" ;;
+        got:  ${hr_got}"
+                fi ;;
         esac
     done
 
@@ -2193,8 +2206,12 @@ else
     case "$all_actual" in
         __NO_YQ__)    fail_no_yq "the full set of jobs in live-tests.yml" ;;
         __YQ_ERROR__) fail_yq_error "the full set of jobs in live-tests.yml" ;;
-        "$all_pinned") pass "the job set is exactly the pinned seven (${all_pinned})" ;;
-        *)            fail "live-tests.yml's job set has changed — pinned '${all_pinned}', found '${all_actual}'. A new job must either carry harden-runner (add it to EXPECTED_HR_JOBS and hr_expected) or have its exemption recorded in EXPECTED_ALL_JOBS' comment. A job that went away needs the removal recorded here." ;;
+        *)
+            if [[ "$all_actual" == "$all_pinned" ]]; then
+                pass "the job set is exactly the pinned seven (${all_pinned})"
+            else
+                fail "live-tests.yml's job set has changed — pinned '${all_pinned}', found '${all_actual}'. A new job must either carry harden-runner (add it to EXPECTED_HR_JOBS and hr_expected) or have its exemption recorded in EXPECTED_ALL_JOBS' comment. A job that went away needs the removal recorded here."
+            fi ;;
     esac
     hr_pinned_sorted=$(printf '%s\n' "${EXPECTED_HR_JOBS[@]}" | sort | tr '\n' ' ' | sed 's/ $//')
 
@@ -2225,55 +2242,91 @@ else
             ac3_last=${ac3_raw%% || *}
             ac3_body=${ac3_raw#* || }
             # Comments stripped BEFORE matching: a hostname surviving only in a
-            # comment must not satisfy the pin. Every count is `|| true`-guarded
-            # because grep -c exits 1 on zero matches and this file runs set -e,
-            # where a bare assignment would abort the suite mid-section.
-            ac3_code=$(printf '%s\n' "$ac3_body" | grep -vE '^[[:space:]]*#' || true)
+            # comment must not satisfy the pin. BOTH spellings are stripped — whole-line
+            # `#` AND a trailing ` # ...`. The line-anchored strip alone left an escape:
+            # replacing the first `exit 1` with `echo skipped  # exit 1` restored the
+            # counted total while the step printed FAIL: and exited 0. Safe to strip
+            # trailing comments here because no `#` appears anywhere in this step's body
+            # (checked) — the echo strings contain none.
+            #
+            # Every count is `|| true`-guarded: grep -c exits 1 on zero matches and this
+            # file runs set -e (line 16), where a bare assignment would abort the suite
+            # mid-section rather than fail the assertion.
+            ac3_code=$(printf '%s\n' "$ac3_body" | grep -vE '^[[:space:]]*#' | sed 's/[[:space:]]#.*$//' || true)
             ac3_unlisted=$(printf '%s\n' "$ac3_code" | grep -cE 'curl .*https://proxy\.golang\.org/' || true)
             ac3_control=$(printf '%s\n' "$ac3_code" | grep -cE 'curl .*https://github\.com/' || true)
             ac3_exits=$(printf '%s\n' "$ac3_code" | grep -c 'exit 1' || true)
+            # COUNTING `exit 1` IS NOT ENOUGH, because a count says nothing about
+            # reachability. Measured: inserting one bare `exit 0` after `set -euo pipefail`,
+            # or wrapping the body in `if false; then ... fi`, left every other field
+            # byte-identical at 144/0 AND made the step exit 0 — the only runtime proof that
+            # block mode enforces became a silent permanent no-op. `neutered=` cannot catch
+            # it either: its pattern is the literal `|| exit 0`. Two more fields close it.
+            #   * allexits pins the total number of `exit` statements, so an added `exit 0`
+            #     is a mismatch even though both `exit 1`s survive.
+            #   * firstop pins that the FIRST executable statement is the unlisted-host
+            #     probe, so anything short-circuiting or wrapping ahead of it is a mismatch.
+            ac3_allexits=$(printf '%s\n' "$ac3_code" | grep -cE '(^|[[:space:];])exit[[:space:]]' || true)
+            ac3_first=$(printf '%s\n' "$ac3_code" | grep -vE '^[[:space:]]*(set[[:space:]]|$)' | head -1 || true)
+            ac3_firstop=no
+            case "$ac3_first" in *'if curl '*'https://proxy.golang.org/'*) ac3_firstop=yes ;; esac
             ac3_neutered=false
             case "$ac3_code" in *'|| true'*|*'|| :'*|*'|| exit 0'*) ac3_neutered=true ;; esac
-            ac3_got="${ac3_last} unlisted=${ac3_unlisted} control=${ac3_control} exits=${ac3_exits} neutered=${ac3_neutered}"
-            ac3_want='last=true unlisted=1 control=1 exits=2 neutered=false'
+            ac3_got="${ac3_last} firstop=${ac3_firstop} unlisted=${ac3_unlisted} control=${ac3_control} exits=${ac3_exits} allexits=${ac3_allexits} neutered=${ac3_neutered}"
+            ac3_want='last=true firstop=yes unlisted=1 control=1 exits=2 allexits=2 neutered=false'
             if [[ "$ac3_got" == "$ac3_want" ]]; then
                 pass "AC3 enforcement step is last in preflight-selftest and still probes proxy.golang.org (unlisted) against github.com (allowlisted), both verdicts fatal"
             else
-                fail "the AC3 egress-enforcement step no longer matches its pin — deleted, renamed, moved off the end of the job, commented out, stripped of an \`exit 1\`, or neutered with a trailing '|| true'. This is the only runtime check that block mode actually ENFORCES; the policy pin above only checks what the YAML says. Restore it, or record the decision to drop it here deliberately.
+                fail "the AC3 egress-enforcement step no longer matches its pin — deleted, renamed, moved off the end of the job, commented out, stripped of an \`exit 1\`, short-circuited with an added \`exit 0\` or an \`if false\` wrapper, or neutered with a trailing '|| true'. This is the only runtime check that block mode actually ENFORCES; the policy pin above only checks what the YAML says. Restore it, or record the decision to drop it here deliberately.
         want: ${ac3_want}
         got:  ${ac3_got}"
             fi ;;
     esac
 
-    # TEST-004: the two checks above cover jobs that carry the policy and the job
+    # The two checks above cover jobs that carry the policy and the job (LAB-6015 review)
     # SET, but not the two jobs that are exempt from it. Measured: appending a
     # `curl` step to check-label leaves the job set the pinned seven, the carrying
     # set the pinned five, every hr_expected comparison untouched, and the suite at
     # 143/0 — an exempt job silently gaining unrestricted egress. Each exemption
     # rests on a specific, checkable fact, so pin the fact rather than the name:
     #   * check-label is exempt because its single step is an inline bash gate with
-    #     no checkout and no network. A second step means that rationale no longer
-    #     holds, whatever the step does.
+    #     no checkout and no network. BOTH halves of that are pinned. Counting steps
+    #     alone was not enough: measured, adding one `curl` line INSIDE the existing
+    #     single `run:` block left the count at 1, the job set the pinned seven, the
+    #     carrying set the pinned five, and the suite at 144/0 — an exempt job making
+    #     network calls under no egress policy. Since that step is already an inline
+    #     bash block, adding a line to it is the natural edit, not a contrived one, so
+    #     checklabel_net greps the step body for the fetch commands that would matter.
     #   * install-chrome-e2e is exempt because it is a CONTAINER job and
     #     harden-runner does not support those. Losing `container:` makes it an
     #     ordinary non-container job with no egress policy at all.
     exempt_got=$(yq_query '"checklabel_steps=" + (.jobs."check-label".steps | length | tostring)
+      + " checklabel_net=" + (([.jobs."check-label".steps[] | (.run // "")] | join(" "))
+          | test("curl|wget|nc |npm |yarn |pip[0-9]? |go get|go mod|git clone|apt-get|docker ") | tostring)
       + " e2e_container=" + ((.jobs."install-chrome-e2e" | has("container")) | tostring)' -r)
-    exempt_want='checklabel_steps=1 e2e_container=true'
+    exempt_want='checklabel_steps=1 checklabel_net=false e2e_container=true'
     case "$exempt_got" in
         __NO_YQ__)    fail_no_yq "the harden-runner exemption rationale for check-label and install-chrome-e2e" ;;
         __YQ_ERROR__) fail_yq_error "the harden-runner exemption rationale for check-label and install-chrome-e2e" ;;
-        "$exempt_want") pass "both harden-runner-exempt jobs still match their exemption rationale (check-label single inline step; install-chrome-e2e is a container job)" ;;
-        *)            fail "a harden-runner-EXEMPT job no longer matches the rationale that exempts it, so it may now make network calls under no egress policy. Either restore the rationale, or give the job a harden-runner step and add it to EXPECTED_HR_JOBS and hr_expected.
+        *)
+            if [[ "$exempt_got" == "$exempt_want" ]]; then
+                pass "both harden-runner-exempt jobs still match their exemption rationale (check-label: one inline step, no fetch commands; install-chrome-e2e: a container job)"
+            else
+                fail "a harden-runner-EXEMPT job no longer matches the rationale that exempts it, so it may now make network calls under no egress policy. Either restore the rationale, or give the job a harden-runner step and add it to EXPECTED_HR_JOBS and hr_expected.
         want: ${exempt_want}
-        got:  ${exempt_got}" ;;
+        got:  ${exempt_got}"
+            fi ;;
     esac
 
     case "$hr_actual" in
         __NO_YQ__)    fail_no_yq "the set of jobs carrying harden-runner" ;;
         __YQ_ERROR__) fail_yq_error "the set of jobs carrying harden-runner" ;;
-        "$hr_pinned_sorted") pass "exactly the pinned jobs carry harden-runner (${hr_pinned_sorted})" ;;
-        *)            fail "the set of jobs carrying harden-runner has changed — pinned '${hr_pinned_sorted}', found '${hr_actual}'. A new job carrying the policy needs an entry in EXPECTED_HR_JOBS and hr_expected; a job that lost it needs the removal recorded here." ;;
+        *)
+            if [[ "$hr_actual" == "$hr_pinned_sorted" ]]; then
+                pass "exactly the pinned jobs carry harden-runner (${hr_pinned_sorted})"
+            else
+                fail "the set of jobs carrying harden-runner has changed — pinned '${hr_pinned_sorted}', found '${hr_actual}'. A new job carrying the policy needs an entry in EXPECTED_HR_JOBS and hr_expected; a job that lost it needs the removal recorded here."
+            fi ;;
     esac
 fi
 
