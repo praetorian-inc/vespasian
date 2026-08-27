@@ -2134,7 +2134,7 @@ hr_policy() {
             + \" policy=\" + (.with.\"egress-policy\" // \"<unset>\")
             + \" sudo=\" + ((.with.\"disable-sudo\" // \"<unset>\") | tostring)
             + \" if=\" + ((has(\"if\")) | tostring)
-            + \" eptype=\" + ((.with.\"allowed-endpoints\" | type) // \"<unset>\")
+            + \" eptype=\" + (.with.\"allowed-endpoints\" | type)
             + \" endpoints=\" + ([.with.\"allowed-endpoints\"] | flatten | join(\" \") | sub(\"\s+\"; \" \") | split(\" \") | map(select(. != \"\")) | sort | join(\",\")))
         | join(\" ;; \"))" -r
 }
@@ -2143,6 +2143,22 @@ if [[ ! -f "$WORKFLOW" ]]; then
     fail "live-tests.yml not found at $WORKFLOW (harden-runner egress assertions vacuous)"
     for _ in "${EXPECTED_HR_JOBS[@]}"; do
         fail "harden-runner policy for a pinned job could not be checked: $WORKFLOW is missing"
+    done
+    # Keep this arm's counted-outcome total equal to the `else` arm's. The else emits
+    # 9: five per-job pins, the carrying-jobs set, the full job set, the AC3 step,
+    # and the exemption rationale. This arm emits the "not found" line above plus
+    # five per-job pads, so it owes three more. Adding a check to the else without a
+    # pad here is what silently unbalanced it in review round 2. MEASURED both ways:
+    # 9 outcomes in each arm.
+    #
+    # This makes THIS SECTION constant, not the file. With the workflow absent the
+    # whole suite still reports 93 against a pin of 144, because three other blocks
+    # (at the `if [[ -f "$WORKFLOW" ]]` guards further up and down this file) have no
+    # else arm and emit nothing. That imbalance predates this ticket and is not
+    # LAB-6015's to fix; stated here so the next reader does not take a balanced
+    # section for a balanced suite.
+    for _ in "the set of jobs carrying harden-runner" "the full job set" "the AC3 enforcement step and the exemption rationale"; do
+        fail "a harden-runner section check could not be run: $WORKFLOW is missing"
     done
 else
     for hr_job in "${EXPECTED_HR_JOBS[@]}"; do
@@ -2184,25 +2200,75 @@ else
 
     # The AC3 runtime proof is the only assertion in the repo that tests egress
     # ENFORCEMENT rather than the YAML that describes it, and it shipped unpinned:
-    # measured, deleting the whole step left this suite at 141/0. Pin its existence
-    # AND both host strings. The hosts are load-bearing in opposite directions —
-    # proxy.golang.org must stay OFF this job's allowlist (the endpoints pin above
-    # enforces that) and must stay a real, resolvable host, because an unreachable
-    # one satisfies the refusal verdict for the wrong reason and turns the step
-    # into a no-op that still prints ok. github.com must stay the allowlisted
-    # control. A rename, a typo, or a deletion fails here instead of silently
-    # retiring the only enforcement check.
-    ac3_run=$(yq_query '[.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | .run] | join("")' -r)
-    case "$ac3_run" in
+    # measured, deleting the whole step left this suite at 141/0. This pins the whole
+    # shape of it against ONE expectation, the same way hr_expected/hr_policy do,
+    # because a pin on its existence alone was measurably not enough. Round-3
+    # mutations, every one of which left the suite GREEN under the existence-only pin:
+    #   * the step moved back above `Syntax check` — reinstating the flake
+    #     amplification the move to LAST exists to prevent (its position is the
+    #     `last=` field; there is no other guard on step order in this job)
+    #   * the two verdicts commented out, leaving both hostnames present in the
+    #     comment text so a raw substring match still matched. Line 1507 already
+    #     strips comments before matching for exactly this reason.
+    #   * the two `exit 1` lines deleted, leaving a step that prints FAIL: and
+    #     exits 0
+    #   * `|| true` appended to the first verdict
+    # `if:` and `continue-on-error:` are deliberately NOT checked here: the un-gated
+    # job guards above already catch both on this job (measured 141/2 each), and
+    # duplicating them would report one defect twice.
+    ac3_raw=$(yq_query '"last=" + (((.jobs."preflight-selftest".steps[-1].name) // "") == "Assert egress policy enforces (AC3)" | tostring)
+      + " || " + ([.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | .run] | join(""))' -r)
+    case "$ac3_raw" in
         __NO_YQ__)    fail_no_yq "the AC3 egress-enforcement step" ;;
         __YQ_ERROR__) fail_yq_error "the AC3 egress-enforcement step" ;;
         *)
-            if [[ "$ac3_run" == *"https://proxy.golang.org/"* && "$ac3_run" == *"https://github.com/"* ]]; then
-                pass "AC3 enforcement step present and still probes proxy.golang.org (unlisted) against github.com (allowlisted)"
+            ac3_last=${ac3_raw%% || *}
+            ac3_body=${ac3_raw#* || }
+            # Comments stripped BEFORE matching: a hostname surviving only in a
+            # comment must not satisfy the pin. Every count is `|| true`-guarded
+            # because grep -c exits 1 on zero matches and this file runs set -e,
+            # where a bare assignment would abort the suite mid-section.
+            ac3_code=$(printf '%s\n' "$ac3_body" | grep -vE '^[[:space:]]*#' || true)
+            ac3_unlisted=$(printf '%s\n' "$ac3_code" | grep -cE 'curl .*https://proxy\.golang\.org/' || true)
+            ac3_control=$(printf '%s\n' "$ac3_code" | grep -cE 'curl .*https://github\.com/' || true)
+            ac3_exits=$(printf '%s\n' "$ac3_code" | grep -c 'exit 1' || true)
+            ac3_neutered=false
+            case "$ac3_code" in *'|| true'*|*'|| :'*|*'|| exit 0'*) ac3_neutered=true ;; esac
+            ac3_got="${ac3_last} unlisted=${ac3_unlisted} control=${ac3_control} exits=${ac3_exits} neutered=${ac3_neutered}"
+            ac3_want='last=true unlisted=1 control=1 exits=2 neutered=false'
+            if [[ "$ac3_got" == "$ac3_want" ]]; then
+                pass "AC3 enforcement step is last in preflight-selftest and still probes proxy.golang.org (unlisted) against github.com (allowlisted), both verdicts fatal"
             else
-                fail "preflight-selftest's 'Assert egress policy enforces (AC3)' step is gone, renamed, or no longer probes BOTH hosts — this is the only runtime check that block mode actually enforces. Restore it, or record the decision to drop it here deliberately."
+                fail "the AC3 egress-enforcement step no longer matches its pin — deleted, renamed, moved off the end of the job, commented out, stripped of an \`exit 1\`, or neutered with a trailing '|| true'. This is the only runtime check that block mode actually ENFORCES; the policy pin above only checks what the YAML says. Restore it, or record the decision to drop it here deliberately.
+        want: ${ac3_want}
+        got:  ${ac3_got}"
             fi ;;
     esac
+
+    # TEST-004: the two checks above cover jobs that carry the policy and the job
+    # SET, but not the two jobs that are exempt from it. Measured: appending a
+    # `curl` step to check-label leaves the job set the pinned seven, the carrying
+    # set the pinned five, every hr_expected comparison untouched, and the suite at
+    # 143/0 — an exempt job silently gaining unrestricted egress. Each exemption
+    # rests on a specific, checkable fact, so pin the fact rather than the name:
+    #   * check-label is exempt because its single step is an inline bash gate with
+    #     no checkout and no network. A second step means that rationale no longer
+    #     holds, whatever the step does.
+    #   * install-chrome-e2e is exempt because it is a CONTAINER job and
+    #     harden-runner does not support those. Losing `container:` makes it an
+    #     ordinary non-container job with no egress policy at all.
+    exempt_got=$(yq_query '"checklabel_steps=" + (.jobs."check-label".steps | length | tostring)
+      + " e2e_container=" + ((.jobs."install-chrome-e2e" | has("container")) | tostring)' -r)
+    exempt_want='checklabel_steps=1 e2e_container=true'
+    case "$exempt_got" in
+        __NO_YQ__)    fail_no_yq "the harden-runner exemption rationale for check-label and install-chrome-e2e" ;;
+        __YQ_ERROR__) fail_yq_error "the harden-runner exemption rationale for check-label and install-chrome-e2e" ;;
+        "$exempt_want") pass "both harden-runner-exempt jobs still match their exemption rationale (check-label single inline step; install-chrome-e2e is a container job)" ;;
+        *)            fail "a harden-runner-EXEMPT job no longer matches the rationale that exempts it, so it may now make network calls under no egress policy. Either restore the rationale, or give the job a harden-runner step and add it to EXPECTED_HR_JOBS and hr_expected.
+        want: ${exempt_want}
+        got:  ${exempt_got}" ;;
+    esac
+
     case "$hr_actual" in
         __NO_YQ__)    fail_no_yq "the set of jobs carrying harden-runner" ;;
         __YQ_ERROR__) fail_yq_error "the set of jobs carrying harden-runner" ;;
@@ -2438,6 +2504,14 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # counted outcome per job in EXPECTED_HR_JOBS) and +1 for the "exactly these jobs
 # carry it" check.
 #
+# LAB-6015 review round 3: 143 -> 144. MEASURED. +1 for the harden-runner EXEMPTION
+# pin (check-label's step count and install-chrome-e2e's `container:` key — the two
+# facts that justify those jobs carrying no policy). The AC3 position check added
+# NONE: it folded into the existing AC3 outcome, which now compares a derived string
+# against a pinned one rather than testing for a substring. The workflow-missing arm
+# was padded to match the else arm at 9, restoring the constant-total property that
+# adding checks in round 2 had quietly broken.
+#
 # LAB-6015 review round 2: 141 -> 143. MEASURED. +1 for the FULL job-set pin
 # (EXPECTED_ALL_JOBS — the "exactly these jobs carry it" check above is
 # one-directional and cannot see a new job added WITHOUT harden-runner) and +1 for
@@ -2473,7 +2547,7 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # second harden-runner step on audit; allowlist -> `*:443`; an extra endpoint
 # added; SHA -> 000...0; a look-alike action name; `if: false` on the step; the
 # step moved below checkout; disable-sudo deleted from all five.
-EXPECTED_ASSERTIONS=143
+EXPECTED_ASSERTIONS=144
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
