@@ -168,7 +168,7 @@ jobs:
       # `bash <script>` silently works on a file that lost +x. One style for all
       # four, so there is nothing to keep in sync.
       - name: Syntax check
-        run: bash -n test/setup-live-targets.sh && bash -n test/install-chrome.sh && bash -n test/assert-chrome-install.sh
+        run: bash -n test/setup-live-targets.sh && bash -n test/install-chrome.sh && bash -n test/assert-chrome-install.sh && bash -n test/assert-egress-enforced.sh
 
       - name: Run preflight self-test
         run: ./test/preflight-selftest.sh
@@ -199,49 +199,23 @@ jobs:
       - name: Drift guard (target groups vs dispatch)
         run: ./test/test-runner-args.sh
 
-      # AC3 RUNTIME PROOF (LAB-6015). The policy pin in test/test-runner-args.sh
-      # verifies that this workflow SAYS `block`; it cannot verify that block
-      # ENFORCES. A harden-runner that stopped enforcing — or failed open after a
-      # runner-image change — leaves the YAML byte-identical and every static
-      # assertion green. This step is the only thing in the repo that reads the
-      # runtime behaviour rather than the file.
+      # AC3 RUNTIME PROOF (LAB-6015). The only check in the repo that tests whether
+      # `block` ENFORCES, rather than what the YAML says. The probe lives in a
+      # committed script, not inline here: five review rounds of pinning inline shell
+      # from test/test-runner-args.sh each closed the measured bypass and left an
+      # adjacent one, because a text pin over free-form shell cannot be exhaustive.
+      # As a file the pin is one exact invocation string, and the body is covered by
+      # the un-gated `bash -n` step above — the same reasoning AGENTS.md records for
+      # test/assert-chrome-install.sh. Rationale, both verdicts, and the residual are
+      # documented in the script itself.
       #
-      # RUNS LAST, DELIBERATELY. It is the only network-dependent step in this job;
-      # the four guard suites above need no network at all. Placed earlier (as it
-      # was when first added) a transient failure on either host aborted the job
-      # before any of them ran, suppressing 141 network-free assertions and
-      # skipping the `test` job via its `needs:` — a flake on one curl silently
-      # costing the whole un-gated regression net. Last means a flake costs only
-      # this assertion.
-      #
-      # WHAT THE TWO VERDICTS DO AND DO NOT ESTABLISH:
-      #   * proxy.golang.org is deliberately absent from this job's allowlist, so
-      #     it must be unreachable. Under `audit` the same request SUCCEEDS, which
-      #     is what makes this discriminating rather than vacuous — verified: with
-      #     no policy in play the step fails.
-      #   * github.com IS allowlisted and must succeed, which rules out a runner
-      #     with no egress at all satisfying the first verdict for the wrong
-      #     reason.
-      #   * NOT established: that the first refusal was a POLICY refusal rather
-      #     than an outage of that specific host. harden-runner blocks at the DNS
-      #     layer, so a blocked domain and an unresolvable one both surface as
-      #     curl exit 6 and cannot be told apart from inside the job. The residual
-      #     is a host that goes away: that is why test/test-runner-args.sh pins
-      #     BOTH host strings and this step's existence, so a rename, a typo or a
-      #     deletion fails the build instead of quietly making this a no-op.
+      # RUNS LAST, DELIBERATELY, and its position is pinned. It is the only
+      # network-dependent step in this job; the four guard suites above need no network.
+      # Placed earlier, a transient failure on either host aborted the job before any of
+      # them ran, suppressing 141 network-free assertions and skipping the `test` job via
+      # its `needs:`. Last means a flake costs only this assertion.
       - name: Assert egress policy enforces (AC3)
-        run: |
-          set -euo pipefail
-          if curl -sS --max-time 15 -o /dev/null https://proxy.golang.org/ 2>/dev/null; then
-            echo "FAIL: reached proxy.golang.org, which is absent from this job's allowlist — the egress policy is not enforcing"
-            exit 1
-          fi
-          echo "ok: unlisted host unreachable"
-          if ! curl -sS --max-time 15 -o /dev/null https://github.com/; then
-            echo "FAIL: cannot reach github.com, which IS allowlisted — this runner has no egress at all, so the refusal above proves nothing"
-            exit 1
-          fi
-          echo "ok: allowlisted host reachable — so the refusal above is not a blanket loss of egress"
+        run: ./test/assert-egress-enforced.sh
 
   # Fast, un-gated regression test for the spec validators (PR #187 review,
   # advisory finding). Proves the validators reject malformed specs (no grep

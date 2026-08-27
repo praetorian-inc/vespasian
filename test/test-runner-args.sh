@@ -2168,15 +2168,17 @@ else
             __NO_YQ__)    fail_no_yq "${hr_job}'s harden-runner egress policy" ;;
             __YQ_ERROR__) fail_yq_error "${hr_job}'s harden-runner egress policy" ;;
             *)
-            # Literal [[ == ]] with the right side QUOTED, not a `case` pattern. hr_want
-            # contains `*.blob.core.windows.net:443`, and in a case pattern that `*` is a GLOB,
-            # not a literal: proven in bash, pattern `*.blob.core.windows.net:443` matches the
-            # subject `evil.blob.core.windows.net:443`. No exploit was constructible — the
-            # endpoint list is sorted, so a substituted host moves position and the pattern's
-            # literal tail stops aligning (measured: a look-alike host gives 142/2) — but
-            # "compares an exact normalised value" is this block's whole claim, and a glob is
-            # not that. The other two comparisons below are converted for the same reason: they
-            # are metacharacter-free only by accident of today's job names.
+            # Literal [[ == ]] with the right side quoted. NOTE, because an earlier
+            # review round got this wrong and the wrong version was briefly documented here:
+            # the `case "$hr_got" in "$hr_want")` form this replaced was ALREADY literal. A
+            # quoted expansion in a case pattern does not glob — measured in bash 5.2.21,
+            # `case "$got" in "$want")` does not match when $want holds
+            # `*.blob.core.windows.net:443` and $got holds the `evil.` variant, while the
+            # UNQUOTED `in $want)` does. The review probe that "proved" a glob had used the
+            # unquoted form, which is not what the code did. So this conversion is
+            # behaviour-identical, kept only because `[[ == ]]` makes the literal intent
+            # unmistakable at the call site rather than depending on the reader knowing that
+            # rule. It fixes no defect, and there was none.
                 if [[ "$hr_got" == "$hr_want" ]]; then
                     pass "${hr_job} harden-runner policy matches the pin (block, sudo, no if:, first step, exact allowlist)"
                 else
@@ -2217,67 +2219,39 @@ else
 
     # The AC3 runtime proof is the only assertion in the repo that tests egress
     # ENFORCEMENT rather than the YAML that describes it, and it shipped unpinned:
-    # measured, deleting the whole step left this suite at 141/0. This pins the whole
-    # shape of it against ONE expectation, the same way hr_expected/hr_policy do,
-    # because a pin on its existence alone was measurably not enough. Round-3
-    # mutations, every one of which left the suite GREEN under the existence-only pin:
-    #   * the step moved back above `Syntax check` — reinstating the flake
-    #     amplification the move to LAST exists to prevent (its position is the
-    #     `last=` field; there is no other guard on step order in this job)
-    #   * the two verdicts commented out, leaving both hostnames present in the
-    #     comment text so a raw substring match still matched. Line 1507 already
-    #     strips comments before matching for exactly this reason.
-    #   * the two `exit 1` lines deleted, leaving a step that prints FAIL: and
-    #     exits 0
-    #   * `|| true` appended to the first verdict
-    # `if:` and `continue-on-error:` are deliberately NOT checked here: the un-gated
-    # job guards above already catch both on this job (measured 141/2 each), and
-    # duplicating them would report one defect twice.
-    ac3_raw=$(yq_query '"last=" + (((.jobs."preflight-selftest".steps[-1].name) // "") == "Assert egress policy enforces (AC3)" | tostring)
-      + " || " + ([.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | .run] | join(""))' -r)
-    case "$ac3_raw" in
+    # measured, deleting the whole step left this suite green. It is now a COMMITTED
+    # SCRIPT, so this pin is one exact invocation string plus its position.
+    #
+    # WHY THE PIN LOOKS LIKE THIS. The probe used to be inline shell, and pinning
+    # inline shell from here failed five review rounds running. Each round closed the
+    # measured bypass and left an adjacent one, because a text pin over free-form shell
+    # cannot be exhaustive. Everything below kept the suite green AND left the step
+    # exiting 0: a bare `exit 0`; an `if false` wrapper; an argument-less `exit`
+    # appended to the `set` line (the count pattern required whitespace after `exit`);
+    # two exits on one line (`grep -c` counts lines, not occurrences); ` && false`
+    # appended to the probe (the first-op glob only anchored the line prefix); a `#`
+    # inside a string ahead of `; exit 0` (the comment strip has no notion of quoting);
+    # and a trailing `# exit 1` comment. Extracting the body removes the whole class:
+    # there is no free-form shell left in the workflow to pattern-match.
+    #
+    # RESIDUAL, stated rather than implied: nothing here pins the SCRIPT's contents, so
+    # editing it to a no-op still passes. That is deliberate and consistent — this file
+    # pins that preflight-selftest INVOKES its four guard suites, never what they
+    # contain, and content-pinning a script would fail on every legitimate edit. The
+    # script is covered instead by `bash -n` in the un-gated syntax-check step and by
+    # review of a real file. AGENTS.md records the same reasoning for
+    # test/assert-chrome-install.sh.
+    ac3_got=$(yq_query '"last=" + (((.jobs."preflight-selftest".steps[-1].name) // "") == "Assert egress policy enforces (AC3)" | tostring)
+      + " run=" + (([.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | .run] | join("")) | sub("\s+$"; ""))' -r)
+    ac3_want='last=true run=./test/assert-egress-enforced.sh'
+    case "$ac3_got" in
         __NO_YQ__)    fail_no_yq "the AC3 egress-enforcement step" ;;
         __YQ_ERROR__) fail_yq_error "the AC3 egress-enforcement step" ;;
         *)
-            ac3_last=${ac3_raw%% || *}
-            ac3_body=${ac3_raw#* || }
-            # Comments stripped BEFORE matching: a hostname surviving only in a
-            # comment must not satisfy the pin. BOTH spellings are stripped — whole-line
-            # `#` AND a trailing ` # ...`. The line-anchored strip alone left an escape:
-            # replacing the first `exit 1` with `echo skipped  # exit 1` restored the
-            # counted total while the step printed FAIL: and exited 0. Safe to strip
-            # trailing comments here because no `#` appears anywhere in this step's body
-            # (checked) — the echo strings contain none.
-            #
-            # Every count is `|| true`-guarded: grep -c exits 1 on zero matches and this
-            # file runs set -e (line 16), where a bare assignment would abort the suite
-            # mid-section rather than fail the assertion.
-            ac3_code=$(printf '%s\n' "$ac3_body" | grep -vE '^[[:space:]]*#' | sed 's/[[:space:]]#.*$//' || true)
-            ac3_unlisted=$(printf '%s\n' "$ac3_code" | grep -cE 'curl .*https://proxy\.golang\.org/' || true)
-            ac3_control=$(printf '%s\n' "$ac3_code" | grep -cE 'curl .*https://github\.com/' || true)
-            ac3_exits=$(printf '%s\n' "$ac3_code" | grep -c 'exit 1' || true)
-            # COUNTING `exit 1` IS NOT ENOUGH, because a count says nothing about
-            # reachability. Measured: inserting one bare `exit 0` after `set -euo pipefail`,
-            # or wrapping the body in `if false; then ... fi`, left every other field
-            # byte-identical at 144/0 AND made the step exit 0 — the only runtime proof that
-            # block mode enforces became a silent permanent no-op. `neutered=` cannot catch
-            # it either: its pattern is the literal `|| exit 0`. Two more fields close it.
-            #   * allexits pins the total number of `exit` statements, so an added `exit 0`
-            #     is a mismatch even though both `exit 1`s survive.
-            #   * firstop pins that the FIRST executable statement is the unlisted-host
-            #     probe, so anything short-circuiting or wrapping ahead of it is a mismatch.
-            ac3_allexits=$(printf '%s\n' "$ac3_code" | grep -cE '(^|[[:space:];])exit[[:space:]]' || true)
-            ac3_first=$(printf '%s\n' "$ac3_code" | grep -vE '^[[:space:]]*(set[[:space:]]|$)' | head -1 || true)
-            ac3_firstop=no
-            case "$ac3_first" in *'if curl '*'https://proxy.golang.org/'*) ac3_firstop=yes ;; esac
-            ac3_neutered=false
-            case "$ac3_code" in *'|| true'*|*'|| :'*|*'|| exit 0'*) ac3_neutered=true ;; esac
-            ac3_got="${ac3_last} firstop=${ac3_firstop} unlisted=${ac3_unlisted} control=${ac3_control} exits=${ac3_exits} allexits=${ac3_allexits} neutered=${ac3_neutered}"
-            ac3_want='last=true firstop=yes unlisted=1 control=1 exits=2 allexits=2 neutered=false'
             if [[ "$ac3_got" == "$ac3_want" ]]; then
-                pass "AC3 enforcement step is last in preflight-selftest and still probes proxy.golang.org (unlisted) against github.com (allowlisted), both verdicts fatal"
+                pass "AC3 enforcement step is last in preflight-selftest and still invokes test/assert-egress-enforced.sh"
             else
-                fail "the AC3 egress-enforcement step no longer matches its pin — deleted, renamed, moved off the end of the job, commented out, stripped of an \`exit 1\`, short-circuited with an added \`exit 0\` or an \`if false\` wrapper, or neutered with a trailing '|| true'. This is the only runtime check that block mode actually ENFORCES; the policy pin above only checks what the YAML says. Restore it, or record the decision to drop it here deliberately.
+                fail "the AC3 egress-enforcement step no longer matches its pin — deleted, renamed, moved off the end of the job, or pointed at something other than test/assert-egress-enforced.sh. This is the only runtime check that block mode actually ENFORCES; the policy pin above only checks what the YAML says. Restore it, or record the decision to drop it here deliberately.
         want: ${ac3_want}
         got:  ${ac3_got}"
             fi ;;
@@ -2290,27 +2264,40 @@ else
     # 143/0 — an exempt job silently gaining unrestricted egress. Each exemption
     # rests on a specific, checkable fact, so pin the fact rather than the name:
     #   * check-label is exempt because its single step is an inline bash gate with
-    #     no checkout and no network. BOTH halves of that are pinned. Counting steps
-    #     alone was not enough: measured, adding one `curl` line INSIDE the existing
-    #     single `run:` block left the count at 1, the job set the pinned seven, the
-    #     carrying set the pinned five, and the suite at 144/0 — an exempt job making
-    #     network calls under no egress policy. Since that step is already an inline
-    #     bash block, adding a line to it is the natural edit, not a contrived one, so
-    #     checklabel_net greps the step body for the fetch commands that would matter.
+    #     no checkout and no network. Its step body is pinned by DIGEST, which is
+    #     exhaustive without enumerating anything. Two weaker versions were tried and
+    #     measured first: counting steps alone missed a `curl` added INSIDE the existing
+    #     single `run:` block, and grepping that body for a fixed command list
+    #     (curl/wget/npm/go/git) missed `gh api`, `python3 -c "urllib.request..."` and
+    #     `exec 3<>/dev/tcp/host/443` — all three left the suite green with the job
+    #     making network calls under no egress policy. Enumerating egress methods has no
+    #     end; pinning the body has one. ANY edit to that step now fails here, whatever
+    #     it does, and the failure message says to re-pin deliberately.
     #   * install-chrome-e2e is exempt because it is a CONTAINER job and
     #     harden-runner does not support those. Losing `container:` makes it an
     #     ordinary non-container job with no egress policy at all.
-    exempt_got=$(yq_query '"checklabel_steps=" + (.jobs."check-label".steps | length | tostring)
-      + " checklabel_net=" + (([.jobs."check-label".steps[] | (.run // "")] | join(" "))
-          | test("curl|wget|nc |npm |yarn |pip[0-9]? |go get|go mod|git clone|apt-get|docker ") | tostring)
-      + " e2e_container=" + ((.jobs."install-chrome-e2e" | has("container")) | tostring)' -r)
-    exempt_want='checklabel_steps=1 checklabel_net=false e2e_container=true'
-    case "$exempt_got" in
+    # sha256sum is GNU; shasum -a 256 ships with perl and is what macOS has. Both were
+    # verified to produce the same digest for this body, so the fallback is sound rather
+    # than assumed. `head=`/`body=` are split on the LAST field so a body containing the
+    # delimiter cannot mis-split them.
+    exempt_raw=$(yq_query '"checklabel_steps=" + (.jobs."check-label".steps | length | tostring)
+      + " e2e_container=" + ((.jobs."install-chrome-e2e" | has("container")) | tostring)
+      + " body=" + ([.jobs."check-label".steps[] | (.run // "")] | join("\n"))' -r)
+    exempt_want="checklabel_steps=1 e2e_container=true bodysha=adfd8746e0765af09eae6267eb7262aff5f638fb39cdcf08de408c08a5a1a8c6"
+    case "$exempt_raw" in
         __NO_YQ__)    fail_no_yq "the harden-runner exemption rationale for check-label and install-chrome-e2e" ;;
         __YQ_ERROR__) fail_yq_error "the harden-runner exemption rationale for check-label and install-chrome-e2e" ;;
         *)
+            exempt_head=${exempt_raw%% body=*}
+            exempt_body=${exempt_raw#* body=}
+            if command -v sha256sum >/dev/null 2>&1; then
+                exempt_sha=$(printf '%s' "$exempt_body" | sha256sum | cut -d' ' -f1)
+            else
+                exempt_sha=$(printf '%s' "$exempt_body" | shasum -a 256 | cut -d' ' -f1)
+            fi
+            exempt_got="${exempt_head} bodysha=${exempt_sha}"
             if [[ "$exempt_got" == "$exempt_want" ]]; then
-                pass "both harden-runner-exempt jobs still match their exemption rationale (check-label: one inline step, no fetch commands; install-chrome-e2e: a container job)"
+                pass "both harden-runner-exempt jobs still match their exemption rationale (check-label: one inline step, body digest unchanged; install-chrome-e2e: a container job)"
             else
                 fail "a harden-runner-EXEMPT job no longer matches the rationale that exempts it, so it may now make network calls under no egress policy. Either restore the rationale, or give the job a harden-runner step and add it to EXPECTED_HR_JOBS and hr_expected.
         want: ${exempt_want}
