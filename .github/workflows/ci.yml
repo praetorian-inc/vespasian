@@ -9,7 +9,6 @@ on:
       - '**/*.go'
       - 'go.mod'
       - 'go.sum'
-      - 'go.work'
       # The two patterns above are root-scoped, so the nested proto-validate
       # module's own manifests would not otherwise trigger CI.
       - 'test/proto-validate/go.mod'

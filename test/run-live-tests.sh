@@ -1577,8 +1577,17 @@ PYEOF
     # relative spec path would resolve against the wrong directory and report
     # "failed to compile" for a spec that is fine. Resolve it to an absolute path
     # BEFORE the cd so the subshell's cwd cannot change what it points at.
-    local spec_abs
-    spec_abs="$(cd "$(dirname "$spec_file")" && pwd)/$(basename "$spec_file")"
+    # A failed `cd` must not be swallowed: `$(cd bad && pwd)` yields the empty
+    # string, so spec_abs collapsed to "/spec.proto" and the compile then reported
+    # "emitted .proto failed to compile" — misattributing a missing generate step
+    # to a malformed spec, which is exactly what absolutising is here to prevent.
+    local spec_dir spec_abs
+    if ! spec_dir="$(cd "$(dirname "$spec_file")" 2>/dev/null && pwd)" || [ -z "$spec_dir" ]; then
+        log_fail "cannot resolve the emitted spec's directory ($(dirname "$spec_file")) — the generate step above likely produced no file"
+        failures=$((failures + 1))
+        spec_dir=""
+    fi
+    spec_abs="${spec_dir}/$(basename "$spec_file")"
 
     # Unlink before redirecting: `>` FOLLOWS symlinks, and the results tree
     # persists across runs (the mkdir -p above does not clean it), so a symlink
@@ -1606,11 +1615,10 @@ PYEOF
     # Run from INSIDE test/proto-validate rather than `go run
     # ./test/proto-validate` at the repo root. It is a separate module (its
     # protocompile dependency is deliberately not in the shipped module's
-    # requires), so the root-relative form resolves only through go.work and
-    # fails with "main module does not contain package ..." under GOWORK=off or
-    # any checkout where the workspace file is absent. Entering the module
-    # directory works in both cases. $spec_abs is already absolute, so the cd
-    # cannot change what it points at.
+    # requires) and this repo has NO go.work, so a root-relative module pattern
+    # never resolves — it fails with "main module does not contain package ...".
+    # Entering the module directory is the only form that works. $spec_abs is
+    # already absolute, so the cd cannot change what it points at.
     elif (cd "$PROJECT_ROOT/test/proto-validate" && go run . "$spec_abs") \
         2>"$proto_err"; then
         log_ok "emitted .proto compiles (protocompile)"

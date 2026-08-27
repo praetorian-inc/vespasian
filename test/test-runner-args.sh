@@ -2748,7 +2748,61 @@ else
     skip "ci.yml not found at $WORKFLOW — its three wiring assertions cannot be evaluated" 3
 fi
 
+WORKFLOW="$SCRIPT_DIR/../.github/workflows/security.yml"
+
+# security.yml's proto-validate-security job is the ONLY place the nested
+# module's dependency graph is scanned, and with go.work deleted its correctness
+# rests entirely on two `working-directory` lines. Its ci.yml twin has a whole
+# guard block; this job had none, so deleting working-directory (govulncheck then
+# re-scans the repo root the reusable job already covers, and exits 0) or adding
+# `if: false` left every suite green and the nested module unscanned.
+if [ -f "$WORKFLOW" ]; then
+    pass "security.yml is present and readable"
+
+    case "$(yq_query '.jobs["proto-validate-security"] | has("if")')" in
+        __NO_YQ__)    fail_no_yq "security.yml proto-validate-security is unconditional" ;;
+        __YQ_ERROR__) fail_yq_error "security.yml proto-validate-security is unconditional" ;;
+        false)        pass "security.yml proto-validate-security runs unconditionally (no job-level if:)" ;;
+        *)            fail "security.yml proto-validate-security has a job-level if: — the nested module's dependency scan can be switched off while every suite stays green" ;;
+    esac
+
+    # Scoped to the govulncheck STEP, not the job: the sibling gosec step also
+    # carries a working-directory, so grepping the job block would pass with the
+    # govulncheck one deleted (the hole the ci.yml assertion already hit once).
+    pvs_block=$(extract_job_block proto-validate-security)
+    pvs_vuln_step=$(printf '%s\n' "$pvs_block" | awk '/- name: govulncheck/{f=1} f{print} f&&/^[[:space:]]*run:/{exit}')
+    if printf '%s' "$pvs_vuln_step" | grep -q 'working-directory:[[:space:]]*test/proto-validate' &&
+       printf '%s' "$pvs_vuln_step" | grep -q 'govulncheck'; then
+        pass "security.yml govulncheck step enters test/proto-validate and scans there"
+    else
+        fail "security.yml's govulncheck STEP must itself set working-directory: test/proto-validate — otherwise it re-scans the repo root the reusable job already covers and the nested module goes unscanned. Step was: $pvs_vuln_step"
+    fi
+
+    if printf '%s' "$pvs_block" | grep -qE 'continue-on-error:[[:space:]]*true|\|\|[[:space:]]*(true|exit 0|:)[[:space:]]*$|^[[:space:]]+if:'; then
+        fail "security.yml proto-validate-security contains step-level neutering (continue-on-error, a trailing '|| true', or a step if:) — the scan would stay green while detecting nothing"
+    else
+        pass "security.yml proto-validate-security has no step-level neutering"
+    fi
+else
+    skip "security.yml not found at $WORKFLOW — its three scan-wiring assertions cannot be evaluated" 3
+fi
+
 WORKFLOW="$_WORKFLOW_SAVED"
+
+echo ""
+echo "=== No Go workspace file (product/scan graph coupling) ==="
+
+# go.work is deliberately absent: a workspace puts test/proto-validate into the
+# product's MVS build list, so a bump to that helper's manifest could move the
+# shipped binary's dependency set, and the repo-root security scan could then
+# report on a graph ABOVE the one that ships. The GOWORK=off belt that used to
+# mask this was removed once the workspace went, so recreating the file
+# re-couples them silently. Nothing else asserts the absence.
+if [ ! -e "$SCRIPT_DIR/../go.work" ]; then
+    pass "no go.work at the repo root (product and scan resolve the same graph)"
+else
+    fail "go.work exists at the repo root — it puts test/proto-validate into the product's MVS build list, so a bump to that helper's manifest can move the shipped binary's dependencies and the security scan can report on a graph above what ships. Delete it; consumers enter the module with cd/working-directory."
+fi
 
 echo ""
 echo "=== Browser-target classification is exhaustive (no fail-open) ==="
@@ -2964,7 +3018,23 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # ci.yml's presence check now GATES its block with a skip credit of 3 instead of
 # emitting a bare fail(): as a bare fail it reported correctly and then let
 # extract_job_block's unguarded awk abort the suite before this pin was reached.
-EXPECTED_ASSERTIONS=169
+# 169 -> 174. MEASURED. +5 for the two surfaces the round-4 review found
+# unguarded, both created by this PR.
+#
+# +4 security.yml proto-validate-security wiring (presence, gated with skip
+# credit 3; job unconditional; the govulncheck STEP's own working-directory; no
+# step-level neutering). With go.work gone, that job is the only place the nested
+# module's dependency graph is scanned, and its correctness rested on two
+# working-directory lines nothing pinned -- deleting one makes govulncheck
+# re-scan the repo root the reusable job already covers and exit 0, leaving the
+# nested module unscanned with every suite green. Its ci.yml twin already had
+# this block; the security twin had nothing.
+#
+# +1 asserting go.work is ABSENT. The workspace coupled the product's MVS list to
+# a live-test helper's manifest, and the GOWORK=off belt that used to mask that
+# was removed when the workspace went -- so recreating the file now re-couples
+# them with no override left, and silently.
+EXPECTED_ASSERTIONS=174
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."

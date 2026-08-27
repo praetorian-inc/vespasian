@@ -612,7 +612,7 @@ test/
 │   ├── main.go              # gRPC server (UserService, OrderService, AccountService)
 │   └── expected-paths.json  # Expected services/methods for validation
 │
-├── proto-validate/          # NESTED MODULE (see go.work) — keeps protocompile out
+├── proto-validate/          # NESTED MODULE (own go.mod, no workspace) — keeps
 │   │                        # of the shipped module's requires
 │   ├── go.mod               # Its own module; root `go test ./...` does NOT reach it
 │   ├── go.sum
