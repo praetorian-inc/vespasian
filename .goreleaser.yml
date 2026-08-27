@@ -5,13 +5,6 @@ builds:
     binary: vespasian
     env:
       - CGO_ENABLED=1
-      # Resolve strictly from the root go.mod/go.sum. go.work pulls the
-      # test-only test/proto-validate module into MVS, so without this a bump
-      # in a live-test helper's manifest could move the shipped binary's
-      # dependency set. No divergence today (verified: the binary is
-      # byte-identical either way) -- this keeps that true by construction
-      # rather than by coincidence.
-      - GOWORK=off
     flags:
       - -trimpath
     ldflags:

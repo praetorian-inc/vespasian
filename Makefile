@@ -8,25 +8,20 @@ LDFLAGS   := -s -w -X main.version=$(VERSION) -X main.gitCommit=$(GIT_COMMIT) -X
 
 .PHONY: build test test-integration lint lint-comments lint-comments-selftest lint-comments-all fmt vet check check-docs coverage clean deps live-test-clean
 
-# GOWORK=off for the same reason .goreleaser.yml sets it: the shipped binary must
-# resolve from the root go.mod/go.sum alone. go.work pulls the test-only
-# test/proto-validate module into MVS, so without this a bump in a live-test
-# helper's manifest could move the product's dependency set -- and dependabot now
-# opens PRs against that manifest weekly. Verified byte-identical either way today;
-# this keeps it that way by construction rather than by coincidence.
 build:
-	GOWORK=off go build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/vespasian
+	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/vespasian
 
 # ./... does NOT reach test/proto-validate: it is a separate module (so that
-# protocompile stays out of the shipped module's require list) and a root
-# package pattern stops at the module boundary even inside a workspace. The
-# second path is therefore load-bearing, not belt-and-braces — without it the
-# AC4 helper's tests are simply not run. CI covers the same ground in ci.yml's
-# proto-validate-tests job, since the reusable workflow it delegates to cannot
-# be told about a second module.
+# protocompile stays out of the shipped module's require list) and a package
+# pattern stops at the module boundary. There is deliberately NO go.work -- a
+# workspace would couple the product's dependency resolution to a live-test
+# helper's manifest -- so the module is entered with `cd` rather than named by a
+# root-relative path, which is the only form that works without one. The second
+# line is load-bearing: without it the AC4 helper's tests simply do not run.
+# CI covers the same ground in ci.yml's proto-validate-tests job.
 test:
 	go test -race ./...
-	go test -race ./test/proto-validate/...
+	cd test/proto-validate && go test -race ./...
 
 # Integration-tagged tests. Separate from `test` because these need a real Chrome,
 # so a developer without one can still run `make test`/`make check`. That is why
@@ -42,8 +37,7 @@ test-integration:
 	go test -race -tags=integration ./...
 
 # golangci-lint resolves one module per invocation, so the nested
-# test/proto-validate module needs its own run from inside its directory —
-# ./... from the root does not reach it.
+# test/proto-validate module needs its own run from inside its directory.
 lint:
 	golangci-lint run
 	cd test/proto-validate && golangci-lint run
@@ -73,11 +67,11 @@ lint-comments-all:
 fmt:
 	gofmt -s -w .
 
-# Second path for the same reason as `test`: test/proto-validate is a separate
-# module and ./... stops at the module boundary.
+# Same reason as `test`: a separate module, entered with `cd` because there is no
+# workspace to make a root-relative pattern reach it.
 vet:
 	go vet ./...
-	go vet ./test/proto-validate/...
+	cd test/proto-validate && go vet ./...
 
 check: fmt vet lint lint-comments test check-docs
 

@@ -334,6 +334,17 @@ run_probe() { # $1 = PATH, $2 = TEST_HOST, $3 = port
     ) 2>&1
 }
 
+# The fixture must actually BOUND, not just forward. Reverting it to the earlier
+# `shift; exec "$@"` form changed no assertion, leaving the block that proves this
+# probe cannot hang running unbounded itself.
+if [ -n "$_real_timeout" ] && grep -q "exec $_real_timeout" "$d_timeout/timeout"; then
+    pass "probe timeout fixture delegates to the real timeout binary (it bounds, not just forwards)"
+elif [ -z "$_real_timeout" ]; then
+    pass "probe timeout fixture: no timeout binary on this host, unbounded fallback is the documented degraded arm"
+else
+    fail "probe timeout fixture no longer execs the real timeout binary — the bounded-probe assertions below would run unbounded"
+fi
+
 # Guard the extraction itself: an empty or broken sed range would make every
 # assertion below vacuous rather than failing.
 if [[ "$(run_probe "$probe_base" localhost "")" == *SENTINEL_PROBE_MISSING* ]]; then
@@ -362,10 +373,12 @@ fi
 # The BOUND, not just the outcome. `-max-time` is the only thing making the
 # grpcurl arm fail fast; deleting it leaves every reachability assertion above
 # green while restoring the hang this probe exists to prevent.
-# Adjacency, not mere presence. Two independent greps pass on `-max-time 99 ...
-# 5` whenever a bare "5" appears anywhere else in argv -- for the nc arm that is
-# the PORT, so budget 99 with port 5 slipped through. Compare the line that
-# FOLLOWS the flag.
+# Adjacency, not mere presence: assert the value that FOLLOWS the flag. Two
+# independent greps pass whenever a bare "5" appears anywhere else in argv, which
+# is a latent hole rather than one this harness reaches today -- its fixtures use
+# port 50051, so the loose form does catch a widened budget here. Pinned on
+# adjacency anyway because the property under test is "the budget is 5", and a
+# harness that later probed port 5 would silently stop testing it.
 if [ "$(grep -A1 -x -- '-max-time' "$TMPDIR_T/argv-grpcurl.log" 2>/dev/null | tail -1)" = "5" ]; then
     pass "_probe_grpc_target: grpcurl arm passes -max-time 5 (bound is asserted, not just the outcome)"
 else
@@ -392,8 +405,7 @@ fi
 # Same reasoning as the grpcurl bound above: `-w` is what makes the nc arm
 # finite. This is the arm CI actually takes when grpc-server is down, because
 # ubuntu-24.04 ships nc but not grpcurl.
-# Adjacency for the same reason as the grpcurl bound above; this is the arm where
-# the port made the independent form pass with a mutated budget.
+# Adjacency for the same reason as the grpcurl bound above.
 if [ "$(grep -A1 -x -- '-w' "$TMPDIR_T/argv-nc.log" 2>/dev/null | tail -1)" = "5" ]; then
     pass "_probe_grpc_target: nc arm passes -w 5 (bound is asserted, not just the outcome)"
 else
@@ -469,18 +481,60 @@ echo "=== Env-seam validation (TEST_HOST / GRPC_SERVER_PORT) ==="
 #
 # Each case runs in its own `bash -c` subshell, so the seam's `exit 1` terminates
 # that subshell and not this suite.
-seam_hostile=$(TEST_HOST='x/1; id #' bash -c "source '$RUNNER' --group offline --dry-run" 2>&1) || true
-if [[ "$seam_hostile" == *"refusing to run"* ]]; then
-    pass "env seam: TEST_HOST carrying shell metacharacters is refused"
+# Captures the STATUS as well as the message. Matching only the text pinned the
+# wording, not the refusal: deleting `exit 1` from the seam left the message on
+# stderr and the suite green, and that mutant is genuinely broken because the
+# /dev/tcp argv comment now rests on the seam actually stopping the run.
+seam_rc=0
+seam_hostile=$(TEST_HOST='x/1; id #' bash -c "source '$RUNNER' --group offline --dry-run" 2>&1) || seam_rc=$?
+if [[ "$seam_hostile" == *"refusing to run"* ]] && [ "$seam_rc" -ne 0 ] && [[ "$seam_hostile" != *"targets="* ]]; then
+    pass "env seam: TEST_HOST carrying shell metacharacters is refused (non-zero status, no target list)"
 else
-    fail "env seam: a TEST_HOST containing ';' and '#' was NOT refused; got: $seam_hostile"
+    fail "env seam: a TEST_HOST containing ';' and '#' must abort with non-zero status and emit no target list; rc=$seam_rc, got: $seam_hostile"
 fi
 
-seam_ok=$(TEST_HOST='host.docker.internal' bash -c "source '$RUNNER' --group offline --dry-run" 2>&1) || true
-if [[ "$seam_ok" != *"refusing to run"* && "$seam_ok" == *"targets="* ]]; then
-    pass "env seam: the documented devcontainer TEST_HOST is still accepted"
+# TEST-005: one payload pinned one character class. This payload ENDS in '#', so
+# the trailing-character rule alone rejected it and the middle of the pattern was
+# never exercised; and admitting a leading dash -- which the seam comment calls
+# "the point of the second pattern" -- changed no assertion at all.
+for seam_bad in '-X' 'a b' 'foo$(id)bar' 'ho`id`st'; do
+    rc=0
+    out=$(TEST_HOST="$seam_bad" bash -c "source '$RUNNER' --group offline --dry-run" 2>&1) || rc=$?
+    if [[ "$out" == *"refusing to run"* ]] && [ "$rc" -ne 0 ]; then
+        pass "env seam: TEST_HOST '${seam_bad}' is refused"
+    else
+        fail "env seam: TEST_HOST '${seam_bad}' must be refused; rc=$rc, got: $out"
+    fi
+done
+
+# Accept-direction cases. A validator that rejects a documented value breaks every
+# run that uses it, so both the devcontainer form and the bracketed IPv6 literal
+# are pinned. Deleting the `\[[0-9A-Fa-f:]+\]` alternative from the seam pattern
+# previously changed no assertion, so the documented IPv6 form could have been
+# refused silently.
+for seam_good in 'host.docker.internal' '127.0.0.1' '[::1]'; do
+    if out=$(TEST_HOST="$seam_good" bash -c "source '$RUNNER' --group offline --dry-run" 2>&1) &&
+       [[ "$out" != *"refusing to run"* && "$out" == *"targets="* ]]; then
+        pass "env seam: documented TEST_HOST '${seam_good}' is accepted"
+    else
+        fail "env seam: TEST_HOST '${seam_good}' must be accepted — the validator cannot reject a documented value; got: $out"
+    fi
+done
+
+# host_bare strips the brackets a bracketed IPv6 literal carries, because nc and
+# bash's /dev/tcp take a bare host and REJECT them while curl and grpcurl require
+# them. Deleting the stripping changed no assertion, so this drives the real
+# function and asserts the probe reports the BARE form.
+# Asserted on the RECORDED ARGV, not the log line: the log deliberately echoes the
+# operator's TEST_HOST verbatim (brackets and all) so the diagnostic names what
+# they set, while the stripping applies only to what reaches the bare-host
+# consumers. Matching the log would pin the wrong surface.
+rm -f "$TMPDIR_T/argv-nc.log"
+run_probe "$d_nc_ok:$probe_base" '[::1]' 50051 >/dev/null
+if grep -qx -- '::1' "$TMPDIR_T/argv-nc.log" 2>/dev/null; then
+    pass "_probe_grpc_target: bracketed IPv6 TEST_HOST reaches nc as the bare '::1' it accepts"
 else
-    fail "env seam: TEST_HOST=host.docker.internal must be accepted — the validator cannot reject a documented value; got: $seam_ok"
+    fail "_probe_grpc_target: TEST_HOST='[::1]' must reach nc as '::1' (nc rejects brackets); recorded argv: $(tr '\n' ' ' < "$TMPDIR_T/argv-nc.log" 2>/dev/null)"
 fi
 
 seam_port=$(GRPC_SERVER_PORT=99999 bash -c "source '$RUNNER' --group offline --dry-run" 2>&1) || true
@@ -521,12 +575,51 @@ else
     fail "AC4 block extraction is broken/empty — the two assertions below would pass vacuously; fix the sed anchors rather than deleting them"
 fi
 
-# (a) No capability gate may guard the compile invocation. This is the exact
-# shape that was removed: `command -v <tool>` deciding whether the assertion runs.
-if printf '%s' "$ac4_block" | grep -qE 'command -v|which |type -p'; then
-    fail "AC4 compile check reintroduced a capability gate (command -v/which/type) — the assertion can skip again, which is the defect LAB-5549 removed"
+# (a) BEHAVIOURAL, not textual. Three earlier revisions of this check grepped the
+# block's source and mis-fired every time: first matching `command -v protoc`
+# inside the comments that narrate its removal, then over-correcting by truncating
+# each line at its first `#` (which would erase a real gate written beside one),
+# and then going red on a harmless trailing comment. The property is not "the text
+# contains no gate" -- it is "the compile assertion evaluates on a host with no
+# protoc", which is exactly CI's state. So run it there.
+#
+# A stripped PATH holding only the interpreters and go makes protoc genuinely
+# absent regardless of this host, then a deliberately MALFORMED spec must be
+# reported as a failure. A reintroduced `command -v protoc ||` gate short-circuits
+# and reports success instead, which this catches on any host.
+# Drives the AC4 BLOCK ITSELF, on a PATH where protoc is genuinely absent. The
+# first attempt at this ran the validator binary directly, which tests the wrong
+# subject: the gate would live in the SHELL, so mutating the shell changed nothing
+# and the mutation survived. Extract the block, stub the loggers, feed it a
+# MALFORMED spec, and assert it counts a failure. A reintroduced
+# `! command -v protoc ||` short-circuits to success on a protoc-absent host,
+# which is precisely CI's state.
+ac4_bin="$TMPDIR_T/ac4-bin"; mkdir -p "$ac4_bin"
+for _t in sh bash go sed grep dirname basename cat rm mkdir uname env tr; do
+    _p=$(command -v "$_t" 2>/dev/null) && ln -sf "$_p" "$ac4_bin/$_t"
+done
+ac4_dir="$TMPDIR_T/ac4-run"; mkdir -p "$ac4_dir"
+printf 'syntax = "proto3";\nmessage D { string a = 1; string b = 1; }\n' > "$ac4_dir/spec.proto"
+ac4_fn=$(new_tmp)
+sed -n '/# AC4 (LAB-2778)/,/^    local expected_count/p' "$RUNNER" | sed '$d' > "$ac4_fn"
+ac4_out=$(
+    PATH="$ac4_bin" AC4_ROOT="$SCRIPT_DIR/.." AC4_DIR="$ac4_dir" AC4_FN="$ac4_fn" \
+    "$ac4_bin/bash" -c '
+        log_ok(){ printf "OK:%s\n" "$1"; }
+        log_fail(){ printf "FAIL:%s\n" "$1"; }
+        log_info(){ printf "INFO:%s\n" "$1"; }
+        failures=0
+        PROJECT_ROOT="$AC4_ROOT"
+        target_dir="$AC4_DIR"
+        spec_file="$AC4_DIR/spec.proto"
+        source "$AC4_FN"
+        printf "failures=%s\n" "$failures"
+    ' 2>&1
+) || true
+if [[ "$ac4_out" == *"failures=1"* ]] && ! PATH="$ac4_bin" command -v protoc >/dev/null 2>&1; then
+    pass "AC4 block counts a failure for a malformed spec with protoc ABSENT (behavioural — a reintroduced capability gate is caught)"
 else
-    pass "AC4 compile check has no capability gate — it cannot skip on a missing tool"
+    fail "AC4 block did not count a failure for a malformed spec on a protoc-absent PATH — the compile assertion can skip again, the defect LAB-5549 removed. Got: $ac4_out"
 fi
 
 # (b) Every non-success arm must count a failure. A branch that neither compiles
@@ -2588,11 +2681,14 @@ WORKFLOW="$SCRIPT_DIR/../.github/workflows/ci.yml"
 # File-existence guard, matching the live-tests.yml block above. Without it a
 # renamed or deleted ci.yml makes every assertion below fail with a yq parse
 # error that names the wrong cause.
+# GATES the block, rather than merely reporting. As a bare fail() this emitted its
+# correct diagnostic and then let the assertions run on: two yq errors naming the
+# wrong cause, then extract_job_block's unguarded awk aborted the whole suite
+# BEFORE the accounting pin. The live-tests.yml sibling gates its block for the
+# same reason. Skip credit 3 keeps the pin exact for the three assertions the
+# gate skips.
 if [ -f "$WORKFLOW" ]; then
     pass "ci.yml is present and readable"
-else
-    fail "ci.yml not found at $WORKFLOW — the proto-validate-tests assertions below cannot be evaluated"
-fi
 
 # The job being unconditional is worthless if the WORKFLOW never fires. ci.yml is
 # paths-filtered, and the nested module's manifests are not matched by the
@@ -2621,11 +2717,21 @@ esac
 
 # Existence of the job is not the property; RUNNING THE NESTED MODULE is. A job
 # that still exists but no longer names ./test/proto-validate/... tests nothing.
+# The job enters the module with working-directory (there is no go.work, so a
+# root-relative module pattern does not resolve). BOTH halves are required: the
+# working-directory that selects the module, and a `go test` that actually runs
+# its packages. Either alone tests nothing.
+# Scoped to the TEST STEP, not the whole job. Grepping the job block for the two
+# strings independently passed even with working-directory deleted from the test
+# step, because the sibling VET step still supplied one -- the same
+# any-two-lines-anywhere hole the timeout-bound assertions had.
 pv_block=$(extract_job_block proto-validate-tests)
-if printf '%s' "$pv_block" | grep -q 'go test .*\./test/proto-validate/\.\.\.'; then
-    pass "ci.yml proto-validate-tests actually runs go test against ./test/proto-validate/..."
+pv_test_step=$(printf '%s\n' "$pv_block" | awk '/- name: Test test\/proto-validate/{f=1} f{print} f&&/^[[:space:]]*run:/{exit}')
+if printf '%s' "$pv_test_step" | grep -q 'working-directory:[[:space:]]*test/proto-validate' &&
+   printf '%s' "$pv_test_step" | grep -qE 'go test .*-race.*\./\.\.\.'; then
+    pass "ci.yml proto-validate-tests' test step both enters test/proto-validate and runs go test -race ./... there"
 else
-    fail "ci.yml proto-validate-tests no longer runs 'go test ./test/proto-validate/...' — the nested module's tests would not run in CI"
+    fail "ci.yml proto-validate-tests' TEST STEP must itself set working-directory: test/proto-validate AND run 'go test -race ./...' — otherwise the nested module's tests do not run in CI. Step was: $pv_test_step"
 fi
 
 # A job-level `if:` is not the only way to switch this off. A step-level `if:`,
@@ -2636,6 +2742,10 @@ if printf '%s' "$pv_block" | grep -qE 'continue-on-error:[[:space:]]*true|\|\|[[
     fail "ci.yml proto-validate-tests contains step-level neutering (continue-on-error, a trailing '|| true', or a step if:) — the job would stay green while testing nothing"
 else
     pass "ci.yml proto-validate-tests has no step-level neutering"
+fi
+
+else
+    skip "ci.yml not found at $WORKFLOW — its three wiring assertions cannot be evaluated" 3
 fi
 
 WORKFLOW="$_WORKFLOW_SAVED"
@@ -2830,7 +2940,31 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # test/proto-validate/go.mod, so the job that tests the nested module could stop
 # firing for changes to that module; and continue-on-error, a trailing `|| true`
 # or a step-level `if:` each keep the job green while running nothing.
-EXPECTED_ASSERTIONS=161
+# 161 -> 169. MEASURED. +8 closing gaps a third review round found in the
+# round-2 fix code -- again, mostly guards that pinned TEXT rather than BEHAVIOUR.
+#
+# +4 env-seam hostile inputs (-X, embedded space, $(...), backticks) and +1 for
+# asserting the REFUSAL rather than the message: the single earlier payload ended
+# in '#', so only the trailing character class was ever exercised, and matching
+# the message alone meant deleting `exit 1` left the suite green.
+#
+# +2 accept-direction seam cases (127.0.0.1 and the bracketed IPv6 literal) plus
+# +1 asserting host_bare strips those brackets before nc sees them. All the IPv6
+# handling had shipped with zero coverage in both directions: deleting the seam's
+# bracket alternative, or the stripping itself, changed no assertion.
+#
+# +1 timeout-fixture fidelity: reverting it to `shift; exec "$@"` changed no
+# assertion, so the block proving this probe cannot hang ran unbounded itself.
+#
+# The AC4 capability-gate check is now BEHAVIOURAL rather than a grep over the
+# block's source (net zero, it replaces the textual one). Three textual revisions
+# each mis-fired on prose. It now runs the validator on a stripped PATH with
+# protoc genuinely absent -- CI's normal state -- against a malformed spec.
+#
+# ci.yml's presence check now GATES its block with a skip credit of 3 instead of
+# emitting a bare fail(): as a bare fail it reported correctly and then let
+# extract_job_block's unguarded awk abort the suite before this pin was reached.
+EXPECTED_ASSERTIONS=169
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."

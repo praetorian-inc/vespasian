@@ -11,7 +11,12 @@
 # Output of the go coverage tool
 *.out
 
-# Go workspace file
+# Go workspace file. Deliberately NOT committed: a workspace would put
+# test/proto-validate into the product's MVS build list, so the shipped binary's
+# dependency set could be moved by a bump to a live-test helper's manifest. The
+# module is reached by `cd`-ing into it instead (see AGENTS.md).
+go.work
+go.work.sum
 
 # Dependency directories
 vendor/

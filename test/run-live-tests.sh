@@ -52,12 +52,15 @@ VESPASIAN="${VESPASIAN:-${PROJECT_ROOT}/bin/vespasian}"
 # devcontainer while the target services run on the Docker host.
 TEST_HOST="${TEST_HOST:-localhost}"
 
-# Validate the ambient env seams ONCE, here, rather than per-sink. load_config's
-# 1-65535 check (see the port `case` arm below) screens only values it reads OUT
-# of a config file; a value already in the ENVIRONMENT reaches every consumer
-# unscreened. That is the gap: TEST_HOST and GRPC_SERVER_PORT flow into a curl
-# URL, a grpcurl host:port operand, an nc operand, and a `bash -c` argv, and
-# hardening one sink leaves the other three trusting the value.
+# Validate the ambient env seams ONCE, here, rather than per-sink. The two values
+# were unscreened for DIFFERENT reasons, so both are named precisely:
+#   - GRPC_SERVER_PORT is in load_config's key allowlist, and its 1-65535 check
+#     (the port `case` arm below) screens only values read OUT of a config file.
+#     A port already in the ENVIRONMENT bypassed it entirely.
+#   - TEST_HOST is not in that allowlist at all -- load_config deliberately
+#     refuses to let a config file rebind it -- so it was never screened anywhere.
+# Both flow into a curl URL, a grpcurl host:port operand, an nc operand and a
+# `bash -c` argv, and hardening one sink leaves the other three trusting the value.
 #
 # Rejecting a leading dash is the point of the second pattern: an option-looking
 # host is otherwise consumed as a FLAG by grpcurl and nc rather than as an
@@ -377,8 +380,9 @@ _probe_grpc_target() {
     # this file, which rejects shell metacharacters outright — but the argv form
     # is kept as defence in depth rather than deleted, because it is the property
     # that holds even if the seam check is ever loosened or bypassed, and because
-    # a sink that cannot be injected is stronger than one guarded only upstream. As argv the inner
-    # shell never re-parses them. `_` fills $0 so $1/$2 land where expected.
+    # a sink that cannot be injected is stronger than one guarded only upstream.
+    # As argv the inner shell never re-parses the values; `_` fills $0 so $1/$2
+    # land where expected.
     # This mirrors wait_for_grpc at setup-live-targets.sh:661, whose comment
     # spells out the same reasoning. Pinned by the hostile-TEST_HOST assertion
     # in test-runner-args.sh ("_probe_grpc_target: hostile TEST_HOST is not

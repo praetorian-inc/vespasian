@@ -52,9 +52,10 @@ jobs:
   # comment-claims is one: that job delegates to a shared reusable workflow which
   # accepts only build-* inputs, so it cannot be told about a second module.
   #
-  # `-race` and the go.work-aware explicit path match what `make test` runs
-  # locally; go.work is committed, so the toolchain resolves both modules the
-  # same way here and on a developer machine.
+  # Enters the module with working-directory rather than naming a root-relative
+  # path: there is deliberately no go.work (a workspace would couple the product's
+  # dependency resolution to this helper's manifest), and without one a
+  # root-relative module pattern does not resolve. Same form as `make test`.
   proto-validate-tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -74,10 +75,12 @@ jobs:
           go-version-file: go.mod
 
       - name: Vet test/proto-validate (nested module)
-        run: go vet ./test/proto-validate/...
+        working-directory: test/proto-validate
+        run: go vet ./...
 
       - name: Test test/proto-validate (nested module)
-        run: go test -race ./test/proto-validate/...
+        working-directory: test/proto-validate
+        run: go test -race ./...
 
   # Fails when a comment changed by this PR guarantees a state cannot occur without
   # naming the test that pins it. See scripts/check-unreachability-claims.sh for the
