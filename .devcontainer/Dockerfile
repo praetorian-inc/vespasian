@@ -149,14 +149,20 @@ RUN set -eu; \
 # On the `command -v "$b" || true` below: an assignment takes its substitution's
 # exit status, so under errexit a missing binary would kill the build before the
 # FATAL branch could name which one. The `|| true` is what lets the diagnostic
-# run. It is documented up here, not inline, for a reason worth stating because
-# the inline version was written first and was wrong: Dockerfile
-# line-continuations join every `\`-terminated line into ONE logical shell line,
-# so a `#` comment inside the block below comments out the REST of that joined
-# line — the probe, the FATAL branch and the loop's `done` — leaving an
-# unterminated `for` and a build that dies on a bare syntax error. `bash -n`
-# cannot see it (a Dockerfile is not a shell script) and no guard suite builds
-# the image, so it would have surfaced only in CI.
+# run.
+#
+# A note on where comments may go inside this block, because the first version of
+# this paragraph got the rule backwards. Dockerfile line-continuations join every
+# `\`-terminated line into ONE logical shell line, but a comment on its OWN line
+# is NOT part of that join: BuildKit strips it first — `parser.go`'s `isComment()`
+# trims leading whitespace and tests `line[0] == '#'`, and the continuation
+# assembly loop skips such lines — so an indented whole-line comment here is
+# harmless. What is NOT harmless is a `#` AFTER code on a line: the parser passes
+# that through as an argument, it survives the join, and it comments out the rest
+# of the instruction — the probe, the FATAL branch and the loop's `done` — leaving
+# an unterminated `for`. `bash -n` cannot see either form (a Dockerfile is not a
+# shell script) and nothing local builds the image, so it would surface only in
+# CI. test/test-runner-args.sh guards the dangerous form specifically.
 RUN bash -c 'set -euo pipefail; \
     export NVM_DIR="${NVM_DIR:-/usr/local/share/nvm}"; \
     [ -s "$NVM_DIR/nvm.sh" ] || { echo "FATAL: nvm not found at $NVM_DIR; the FROM changed" >&2; exit 1; }; \

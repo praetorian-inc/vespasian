@@ -54,6 +54,48 @@ jobs:
       - name: Syntax check
         run: bash -n test/setup-live-targets.sh && bash -n test/install-chrome.sh && bash -n test/assert-chrome-install.sh && bash -n test/assert-devcontainer-lookpath.sh && bash -n .devcontainer/on-create.sh
 
+      # The guard suites again, on a PATH with yq removed. Every assertion block
+      # with a vacuity sentinel has to credit exactly the counted outcomes its
+      # other arm does not emit; get that wrong and the suite is green here and
+      # reports a misleading "assertion accounting drift" on a contributor's
+      # machine instead of the real cause. That defect class has now recurred
+      # FIVE times on this repo (once live at merge, LAB-5766 review rounds 4-6),
+      # and EVERY instance was found by executing this configuration — none by
+      # reading the code. CI ships yq, so nothing else here exercises the arm.
+      - name: Guard suites on a yq-less PATH (skip-credit accounting)
+        run: |
+          set -euo pipefail
+          noyq="$(mktemp -d)/bin"; mkdir -p "$noyq"
+          IFS=: read -ra dirs <<< "$PATH"
+          for d in "${dirs[@]}"; do
+            [ -d "$d" ] || continue
+            for f in "$d"/*; do
+              if [ ! -x "$f" ] || [ -d "$f" ]; then continue; fi
+              b=$(basename "$f")
+              if [ "$b" = yq ]; then continue; fi
+              if [ ! -e "$noyq/$b" ]; then ln -sf "$f" "$noyq/$b"; fi
+            done
+          done
+          if ! command -v yq >/dev/null 2>&1; then
+            echo "yq is absent from the normal PATH, so this check cannot tell the two arms apart" >&2; exit 1
+          fi
+          if PATH="$noyq" command -v yq >/dev/null 2>&1; then
+            echo "yq still resolves on the stripped PATH, so this check would be vacuous" >&2; exit 1
+          fi
+          # No trailing `|| true` here: this job's own guard rejects that pattern on
+          # a run line, and rightly — it is how a failing step gets neutered. The
+          # non-zero exit is expected (the suite fails without yq) and is captured
+          # deliberately, so the checks below can distinguish an honest failure from
+          # an accounting-drift one.
+          if out=$(PATH="$noyq" bash test/test-runner-args.sh 2>&1); then :; else :; fi
+          printf '%s\n' "$out"
+          if printf '%s\n' "$out" | grep -q 'accounting drift'; then
+            echo "::error::the guard suite reports assertion accounting drift without yq — a vacuity sentinel arm credits the wrong number of outcomes, so a yq-less contributor is told the ledger is stale instead of the real cause" >&2
+            exit 1
+          fi
+          printf '%s\n' "$out" | grep -q '=== Summary ===' \
+            || { echo "::error::the guard suite did not reach its summary without yq — it died before reporting" >&2; exit 1; }
+
       - name: Run preflight self-test
         run: ./test/preflight-selftest.sh
 

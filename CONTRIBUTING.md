@@ -82,8 +82,8 @@ Note that `make check` runs `make fmt` first, which rewrites files in place via 
 This repo ships a devcontainer ([`.devcontainer/`](.devcontainer/)). It builds on
 the standard Go image and runs [`test/install-chrome.sh`](test/install-chrome.sh)
 as an image layer, so a fresh container already has a real, non-snap Chrome. It
-also installs the `python3`, `yq`, Node 20 and Go 1.27.0 the suites need (the base image ships nvm but no installed Node, and a Go release older than `go.mod` requires; the base image
-ships nvm but no installed Node), and its
+also installs the `python3`, `yq`, Node 20 and Go 1.27.0 the suites need (the base image ships nvm but no installed Node, and a Go release older than
+`go.mod` requires), and its
 `onCreateCommand` runs `npm ci --ignore-scripts` for the spec validators the live and generator
 targets use — so the full suite runs with no setup step, not just the
 browser-driven part. Prefer it if you have a choice.
