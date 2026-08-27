@@ -3062,6 +3062,27 @@ fi
 
 
 # ---------------------------------------------------------------------------
+# The yq-less guard step must exist. It is the only mechanical check on
+# skip-credit accounting, and the four guard suites in this job are each pinned
+# by name for exactly this reason — a step nothing asserts can be deleted to save
+# CI minutes and nothing notices. Pinned on the command it runs, not its name, so
+# a rename does not silently drop the coverage.
+if [[ -f "$WORKFLOW" ]]; then
+    yqless=$(yq_query '.jobs["preflight-selftest"].steps[] | select(.run != null) | .run' -r 2>/dev/null || true)
+    case "$yqless" in
+        __NO_YQ__)    fail_no_yq "the yq-less guard step" ;;
+        __YQ_ERROR__) fail_yq_error "the yq-less guard step" ;;
+        *)
+            if printf '%s\n' "$yqless" | grep -q 'PATH="\$noyq" bash test/test-runner-args.sh' \
+               && printf '%s\n' "$yqless" | grep -q 'accounting drift'; then
+                pass "preflight-selftest still runs test-runner-args.sh on a yq-less PATH and fails on accounting drift"
+            else
+                fail "preflight-selftest no longer runs the guard suite on a yq-less PATH — the skip-credit accounting class it catches has recurred repeatedly here and CI ships yq, so nothing else exercises those arms"
+            fi ;;
+    esac
+fi
+
+# ---------------------------------------------------------------------------
 # The AC3 rod-backed-target matcher, EXECUTED. This delta rewrote it twice —
 # `printf | grep -q` became a herestring (SIGPIPE under pipefail turned a green
 # suite red), and the pattern lost one of its two alternatives — and the suite
@@ -3098,9 +3119,15 @@ case "$ac3_step" in
         # `if [ -n "$missing" ]; then ... exit 1; fi` block left the suite at
         # 187/0 while AC3 became incapable of failing. MEASURED. Pin the
         # enforcement separately from the matching.
-        if printf '%s\n' "$ac3_step" | grep -qE '^[[:space:]]*if \[ -n "\$missing" \]' \
-           && printf '%s\n' "$ac3_step" | grep -qE '^[[:space:]]*exit 1'; then
-            pass "the AC3 step ENFORCES its result (a non-empty \$missing exits 1), not merely computes it"
+        # The `exit 1` must be INSIDE the missing-block. Grepping the two patterns
+        # independently was defeated by deleting only the `exit 1` from the block:
+        # the step has three other `exit 1` lines (the live-suite failure handler
+        # among them), so both greps still matched and the suite stayed at 188/0
+        # with AC3 unable to fail. MEASURED. Extract the block, then look inside it.
+        ac3_enforce=$(printf '%s\n' "$ac3_step" \
+            | sed -n '/^[[:space:]]*if \[ -n "\$missing" \]/,/^[[:space:]]*fi[[:space:]]*$/p')
+        if [ -n "$ac3_enforce" ] && printf '%s\n' "$ac3_enforce" | grep -qE '^[[:space:]]*exit 1[[:space:]]*$'; then
+            pass "the AC3 step ENFORCES its result (the missing-block itself exits 1), not merely computes it"
         else
             fail "the AC3 step computes \$missing but no longer acts on it — the rod-backed-target check cannot fail, so a browserless image reports AC3 green"
         fi
@@ -3115,11 +3142,14 @@ case "$ac3_step" in
         fi
         if [[ -z "$ac3_grep" || -z "$ac3_names" ]]; then
             fail "could not lift the AC3 matcher (loop='${ac3_loop}' grep='${ac3_grep}') — either it was restructured or it no longer feeds grep from a herestring, which is what keeps SIGPIPE from reporting a green suite as red"
-            # 2, not 3: this arm sits INSIDE the `*)` arm, so the independent-names
-            # check above has already emitted its outcome. Crediting 3 here made a
-            # whitespace-only edit to the lifted grep report 188 against a pin of
-            # 187. MEASURED.
-            skip "AC3 matcher executed cases (matcher not liftable)" 2
+            # 1, not 2. This arm sits inside the `*)` arm, so BOTH the enforcement
+            # pin and the independent-names check have already emitted; only the two
+            # matcher cases are lost, and this arm's own `fail` covers one of them.
+            # The previous comment reasoned in the wrong direction and left the
+            # credit at 2: a whitespace-only edit to the lifted grep then reported
+            # `saw 189` against a pin of 188. MEASURED — sixth recurrence of this
+            # class, which is why the yq-less CI step now exists.
+            skip "AC3 matcher executed cases (matcher not liftable)" 1
         else
             # run_ac3 <out> -> the targets the matcher reports MISSING
             run_ac3() {
@@ -3282,13 +3312,7 @@ GITSTUB
         # the newline separation misses it. The rename row covers the
         # --no-renames flag on the producer: git reports a rename as delete+add,
         # so the SOURCE path under .devcontainer/ must reach the matcher.
-        while IFS='|' read -r flt_ev flt_changed flt_want; do
-            [ -z "$flt_ev" ] && continue
-            flt_n=$((flt_n + 1))
-            flt_got=$(run_filter "$flt_ev" "$(printf '%b' "$flt_changed")")
-            [ "$flt_got" = "$flt_want" ] \
-                || flt_bad="${flt_bad} [${flt_ev} ${flt_changed} -> got '${flt_got}' want '${flt_want}']"
-        done <<'FLTCASES'
+        flt_table=$(cat <<'FLTCASES'
 pull_request|.devcontainer/Dockerfile|true
 pull_request|.devcontainer/nested/thing.sh|true
 pull_request|test/common.sh|true
@@ -3301,6 +3325,14 @@ pull_request|docs/notes .devcontainer/x.sh|false
 pull_request|.devcontainer/moved-away.sh\ndocs/moved-away.sh|true
 push|.devcontainer/Dockerfile|false
 FLTCASES
+        )
+        while IFS='|' read -r flt_ev flt_changed flt_want; do
+            [ -z "$flt_ev" ] && continue
+            flt_n=$((flt_n + 1))
+            flt_got=$(run_filter "$flt_ev" "$(printf '%b' "$flt_changed")")
+            [ "$flt_got" = "$flt_want" ] \
+                || flt_bad="${flt_bad} [${flt_ev} ${flt_changed} -> got '${flt_got}' want '${flt_want}']"
+        done <<< "$flt_table"
         # The rename ROW above exercises the matcher, not the producer: the stub
         # git replays FILTER_CHANGED verbatim and ignores flags, so the row passes
         # whether or not the real step asks git for both paths. MEASURED — dropping
@@ -3315,8 +3347,17 @@ FLTCASES
         # An empty table drives zero cases, finds nothing bad, and passes while
         # printing "0 cases executed". MEASURED: emptying the heredoc left the
         # suite at 187/0. Floor the count the same way DCPROPS is floored.
-        if [ "$flt_n" -lt 8 ]; then
-            fail "the FLTCASES table drove only ${flt_n} case(s) — the matcher check would assert almost nothing; restore the rows rather than letting it pass vacuously"
+        # Content, not count. A floor of 8 against 11 rows let the THREE
+        # discriminating rows be deleted while the count stayed legal, leaving the
+        # suite at 188/0. MEASURED. Require the rows that actually discriminate:
+        # the whitespace row (separates the read-loop from a for-loop), the rename
+        # source (covers --no-renames), and the nested path (covers set -f).
+        flt_want=""
+        for flt_req in 'docs/notes .devcontainer/x.sh' '.devcontainer/moved-away.sh' '.devcontainer/nested/thing.sh' 'go.mod'; do
+            printf '%s\n' "$flt_table" | grep -qF -- "$flt_req" || flt_want="${flt_want} [${flt_req}]"
+        done
+        if [ -n "$flt_want" ]; then
+            fail "the FLTCASES table lost the discriminating row(s):${flt_want} — the remaining rows pass under a broken matcher too; restore them rather than letting it pass vacuously"
         elif [ -z "$flt_bad" ]; then
             pass "the devcontainer paths filter MATCHES the paths it watches and rejects the ones it does not (${flt_n} cases executed against the real step, stubbed git)"
         else
@@ -3384,7 +3425,14 @@ if [[ -f "$dcgo_df" && -f "$dcgo_mod" ]]; then
         fail "could not read the Dockerfile Go pin (got '${dcgo_pin}') or go.mod's go directive (got '${dcgo_want}') — the un-gated toolchain check would be vacuous"
     else
         dcgo_oldest=$(printf '%s\n%s\n' "$dcgo_want" "$dcgo_pin" | sort -V | head -1)
-        if [[ "$dcgo_oldest" == "$dcgo_want" ]]; then
+        if [[ "$dcgo_basis" != stricter* ]]; then
+            # Without origin/main this compares against the BRANCH's go.mod, which
+            # is older, so a stale pin passes. Relabelling that in the message (the
+            # previous fix) left the pass ambient — a green line that means
+            # different things on different machines. Report it as a skip instead,
+            # so the log says the check did not run rather than that it succeeded.
+            skip "the Dockerfile Go pin vs go.mod (origin/main not fetched, so the merge-target basis is unavailable)" 1
+        elif [[ "$dcgo_oldest" == "$dcgo_want" ]]; then
             pass "the .devcontainer/Dockerfile Go pin (${dcgo_pin}) satisfies go.mod (>= ${dcgo_want}, basis: ${dcgo_basis}) — checked un-gated, on every PR"
         else
             fail "the .devcontainer/Dockerfile pins Go ${dcgo_pin} but go.mod requires >= ${dcgo_want} — under GOTOOLCHAIN=local every Go step in the devcontainer fails with 'go.mod requires go >= ${dcgo_want}'; bump ver= in the Dockerfile's Go layer"
@@ -3432,23 +3480,33 @@ case "$dcgo_step" in
         # is the only thing that detects a failing onCreateCommand, because the
         # devcontainers CLI does not report that as a non-zero exit from `up`.
         dcgo_prop_missing=""; dcgo_prop_n=0
-        while IFS='|' read -r dcgo_pat dcgo_label; do
-            [ -z "$dcgo_pat" ] && continue
-            dcgo_prop_n=$((dcgo_prop_n + 1))
-            printf '%s\n' "$dcgo_step" | grep -qF -- "$dcgo_pat" \
-                || dcgo_prop_missing="${dcgo_prop_missing} ${dcgo_label}"
-        done <<'DCPROPS'
+        dcgo_table=$(cat <<'DCPROPS'
 [ "$(id -un)" = vscode ]|remoteUser is vscode
 ${VESPASIAN_NO_SANDBOX:-}|containerEnv VESPASIAN_NO_SANDBOX
 [ "$shm" -ge 1000000000 ]|runArgs --shm-size (the size comparison, not the word /dev/shm)
 test/spec-validators/node_modules/|onCreateCommand spec-validator entry points
 DCPROPS
+        )
+        while IFS='|' read -r dcgo_pat dcgo_label; do
+            [ -z "$dcgo_pat" ] && continue
+            dcgo_prop_n=$((dcgo_prop_n + 1))
+            printf '%s\n' "$dcgo_step" | grep -qF -- "$dcgo_pat" \
+                || dcgo_prop_missing="${dcgo_prop_missing} ${dcgo_label}"
+        done <<< "$dcgo_table"
         # A table that consumes zero rows finds nothing missing and passes. Emptying
         # the heredoc left the suite at 187/0 still printing "5 pinned individually"
         # — a vacuous check whose message actively misreported it. MEASURED. The
         # count is derived and floored.
-        if [ "$dcgo_prop_n" -lt 4 ]; then
-            fail "the DCPROPS table drove only ${dcgo_prop_n} row(s) — the conformance check would assert almost nothing; restore the rows rather than letting it pass vacuously"
+        # Content, not count. A row-count floor was satisfied by four junk rows
+        # (`e|row1` ... `e|row4`), which match almost anything, leaving the suite at
+        # 188/0 still printing "4 pinned individually". MEASURED. Require the
+        # specific properties by name.
+        dcgo_want_props=""
+        for dcgo_req in 'id -un' 'VESPASIAN_NO_SANDBOX' 'shm' 'spec-validators'; do
+            printf '%s\n' "$dcgo_table" | grep -qF -- "$dcgo_req" || dcgo_want_props="${dcgo_want_props} ${dcgo_req}"
+        done
+        if [ -n "$dcgo_want_props" ]; then
+            fail "the DCPROPS table no longer names:${dcgo_want_props} — the conformance check would assert almost nothing; restore the rows rather than letting it pass vacuously"
         elif [ -z "$dcgo_prop_missing" ]; then
             pass "the devcontainer conformance step still asserts every property devcontainer.json promises (${dcgo_prop_n} pinned individually, not by one shared token)"
         else
@@ -3552,179 +3610,56 @@ SUITE_COMPLETED=1
 
 echo "=== Summary ==="
 echo "  $PASS passed, $FAIL failed, $SKIP skipped"
-# PR #228 review: 134 -> 135 was the container-shell check (above).
+# ── Assertion ledger ─────────────────────────────────────────────────────────
 #
-# 135 -> 170 across three review rounds. MEASURED. The delta is reconciled in
-# full below, because an unexplained ledger is how a pin drifts from what it
-# claims to cover.
+# EXPECTED_ASSERTIONS is a pin, not a target: PASS + FAIL + SKIP_CREDIT must equal
+# it exactly. A wrong value does not merely annoy — it fires an "accounting drift"
+# message that NAMES THE WRONG DEFECT, sending the reader to reconcile a ledger
+# when the real cause is elsewhere. Re-measure after any change; never adjust to
+# make a run pass.
 #
-# Round 1 (+16), from defects found by MUTATION rather than by reading, each
-# having survived every check in the repo at the time:
-#   +9  devcontainer-image had none of the pins install-chrome-e2e has: job
-#       present, builds THROUGH devcontainer.json, greps the in_container()
-#       marker, invokes both committed assertion scripts, runs a guard suite in
-#       the image, no continue-on-error, no trailing '|| true', gate arms.
-#       Deleting its entire LookPath step left this suite at 135/135 exit 0.
-#   +1  devcontainer-changes, the filter the pull_request arm gates on.
-#   +3  harden-runner: step count vs the lockstep comment's number-word, the
-#       comment agreeing with itself, and every copy pinning the SAME sha
-#       across live-tests.yml AND ci.yml.
-#   +2  .devcontainer/Dockerfile's COPY: every source exists, AND common.sh
-#       travels with install-chrome.sh (the second was added after the first
-#       failed its own mutation).
-#   +1  no production caller sets VESPASIAN_TEST_ROOT.
+# This ledger was rewritten at 189 because it had grown by accretion across four
+# review rounds and its arithmetic no longer summed — successive rounds appended
+# their deltas without repairing the running totals, so it stated 135 -> 170,
+# 135 + 16 + 3 + 12 = 166, and 172 -> 185 in three places that disagreed. Rather
+# than append a fifth inconsistent line, the history is stated as bands.
 #
-# Round 2 (+3):
-#   +1  AGENTS.md's non-container job count vs live-tests.yml, derived on both
-#       sides. The prose said "six" when seven were non-container, was corrected
-#       to "eight", and went stale again when a tenth job landed.
-#   +1  AGENTS.md's harden-runner job count — the sentence carries TWO numbers
-#       and only the second was pinned, so "Seven of the nine" survived a job
-#       gaining the step.
-#   +1  every harden-runner use is SHA-pinned (a copy reverted to a mutable tag
-#       was not counted at all, so one pinned copy still read as "1 distinct sha").
+#   135   the pre-LAB-5766 baseline (target-group/dispatch drift, the un-gated
+#         job's own step list, browser-target classification, the config and
+#         override guards, and the ambient-VESPASIAN notice).
 #
-# Round 3 (+11), all closing holes the round-3 TEST lane proved by mutation —
-# every one of these survived at 159/0 before being fixed:
-#   +1  the should-run WIRE. The gate harness proved the STEP; hardcoding the
-#       job output to 'false' switched BOTH image jobs off permanently with
-#       every harness case still green.
-#   +2  the paths-filter step's identity (id: filter) and its path list. The
-#       harness substitutes the filter's output with a literal, so it was blind
-#       to the producing step existing at all.
-#   +1  a SKIP is rejected for EVERY required test, not only PinsSystemBrowser.
-#   +1  the PASS match is anchored for EVERY required test.
-#   +1  the rc != 0 arm of assert-devcontainer-lookpath.sh.
-#   +2  the AC3 live-suite step and the devcontainer.json conformance step.
-#   +2  devcontainer-image-arm64's arm64 build and its in_container marker
-#       (it was pinned only by its if:).
-#   +1  which jobs carry harden-runner, by name, not just how many.
-#   +1  .dockerignore excludes nothing the Dockerfile COPYs.
-#   -1  the consumer if: check became an EXACT equality rather than an
-#       unanchored glob; net zero in count, strictly stronger.
-#   +1  every committed test/assert-*.sh is in the un-gated bash -n chain.
+#   +37   LAB-5766 review rounds 1-3: the devcontainer wiring. The image job's
+#         gate arms and paths filter, the arm64 leg, harden-runner counts and SHA
+#         lockstep, the Dockerfile COPY / .dockerignore pair, VESPASIAN_TEST_ROOT
+#         staying a test-only seam, and assert-devcontainer-lookpath.sh driven
+#         against a stub `go`.
 #
-#   +1  REQUIRED_TESTS is complete against an INDEPENDENT source of truth
-#       (browser_integration_test.go). Added after the per-name cases above
-#       failed their OWN mutation: deriving the names from REQUIRED_TESTS made
-#       them self-referential, so deleting an entry shrank what they checked and
-#       left the suite at 170/0.
+#   +15   rounds 4-6: the Go toolchain and the executed harnesses. An un-gated
+#         Dockerfile-pin-vs-go.mod check; the in-image gate lifted WHOLE from the
+#         named conformance step and run against a stub `go`; the conformance
+#         step's properties pinned individually after a shared token proved to
+#         match three places; the paths filter executed against a stubbed git;
+#         on-create.sh executed on a genuinely npm-free PATH; the AC3 matcher
+#         executed, and its ENFORCEMENT pinned separately after deleting the
+#         `exit 1` alone left the suite green; and a Dockerfile RUN-continuation
+#         comment guard.
 #
-# 135 + 16 + 3 + 12 = 166, plus the 5 checks the round-3 fixes split per-name and
-# per-job rather than aggregating = 171. MEASURED. Re-measure, do not adjust.
+#   +2    round 7: the yq-less guard step pinned so its deletion is not silent,
+#         and the Dockerfile-pin check reporting a SKIP rather than an ambient
+#         PASS when origin/main is unfetched and the merge-target basis is
+#         therefore unavailable.
 #
-#   +7  the devcontainer Go-toolchain gate and the conformance-step properties
-#       (172 -> 185 with the filter, on-create, AC3-matcher and Dockerfile-comment blocks below), after round-4 review rejected the first version of this
-#       block. The image had shipped Go 1.25.12 against a go.mod on main asking
-#       1.27.0: under GOTOOLCHAIN=local every Go step in the container failed and
-#       AC2 with it, and nothing here compared the two numbers. The block is now:
-#         +1 an UN-GATED check of the Dockerfile pin against go.mod, because the
-#            in-image gate only runs when the paths filter fires, and a PR whose
-#            only change is bumping the `go` directive is exactly the one that
-#            caused this. Reverting the pin to 1.25.12 left the old suite at
-#            177/0.
-#         +1 the conformance step's five properties pinned INDIVIDUALLY. The
-#            previous loop grepped the token `id -un`, which occurs twice in that
-#            step, so deleting the VESPASIAN_NO_SANDBOX, /dev/shm and
-#            spec-validator checks left the suite green.
-#         +4 the gate EXECUTED against a stub `go` and a synthetic go.mod, with
-#            all four of its lines (want=/have=/oldest=/guard) lifted from the
-#            named conformance step rather than grepped file-wide. The earlier
-#            version lifted only the last two and injected want/have itself, so
-#            `have=$(go env GOVERSION)` — whose output keeps the `go` prefix —
-#            accepted every stale image while staying green. Scoping to the step
-#            also blocks relocating the gate to the host runner, which ships its
-#            own conforming Go. One of the four exists solely to make `sort -V`
-#            load-bearing: the other three all pass under a plain lexical `sort`.
+#   = 189  MEASURED, in a clean child shell (`env -u 'BASH_FUNC_grep%%' bash
+#         test/test-runner-args.sh`) — a plain `bash` here inherits an exported
+#         ugrep `grep` function that gives different answers than CI.
 #
-#   +1  the devcontainer paths FILTER executed against a stubbed git (9 cases),
-#       not just its path list grepped. It found a real defect on its first run:
-#       `$WATCHED` is unquoted so it word-splits, but unquoted also means
-#       PATHNAME EXPANSION, so `.devcontainer/*` was replaced by the files on
-#       disk before ever being used as a case pattern — nested paths and any
-#       .devcontainer file a PR DELETES stopped matching. Fixed with `set -f`.
-#
-#   +2  .devcontainer/on-create.sh EXECUTED, both arms. It was in the `bash -n`
-#       chain and nothing else, and syntax is not the failure it has: it already
-#       died in CI with `/bin/sh: 1: npm: not found` (onCreateCommand exit 127),
-#       and the devcontainers CLI does not report a failing onCreateCommand as a
-#       non-zero exit from `devcontainer up`, so a regression is silent at the
-#       only moment the script runs. One case drives it on a genuinely npm-free
-#       PATH (this image carries /usr/bin/npm, so `/usr/bin:/bin` is NOT
-#       npm-free — the first version of this case passed vacuously against a real
-#       `npm ci`); the other observes `npm ci --ignore-scripts` through a stub.
-#
-#   +2  the AC3 rod-backed-target matcher EXECUTED (185). The suite pinned only
-#       that the AC3 step exists, by a substring of its command, while this PR
-#       rewrote the matcher twice — herestring for SIGPIPE, and two pattern
-#       alternatives down to one. One case drives the real PASS rows, the other
-#       requires a SKIP to be caught AND a `concat-spa-two-stage` row to be
-#       refused in place of `concat-spa`, which is what the `[^a-z-]` boundary is
-#       for.
-#
-#   +1  the AC3 step's ENFORCEMENT, pinned separately from its matcher (187 ->
-#       188). The matcher cases proved the pattern discriminates and said nothing
-#       about whether the step acts on the result: deleting the whole
-#       `if [ -n "$missing" ]; then ... exit 1; fi` block left the suite at 187/0
-#       with AC3 incapable of failing. MEASURED.
-#
-#   ~   round-6 corrections to the blocks added above, all MEASURED by execution:
-#       * DCPROPS and FLTCASES now floor their row counts. Emptying either
-#         heredoc left the suite green — DCPROPS still printing "5 pinned
-#         individually" while checking nothing.
-#       * The AC3 sentinel arms credit 3, not 2, now that the enforcement pin
-#         joined that arm; and the filter sentinels credit 1, now that the
-#         --no-renames pin joined theirs. Both were caught by running the suite
-#         on a yq-less PATH, and both are the SAME skip-credit class that has now
-#         recurred five times here. The new `Guard suites on a yq-less PATH` step
-#         in preflight-selftest exists so the sixth is caught by CI rather than by
-#         someone re-deriving it.
-#       * The whitespace FLTCASES row now DISCRIMINATES the loop form: paired as
-#         `docs/notes .devcontainer/x.sh`, a `for f in $changed` loop splits it and
-#         matches `.devcontainer/*` while the `while read` loop keeps it whole.
-#         The previous row passed under both.
-#       * The Dockerfile RUN guard was retargeted. It flagged any `#`, but a
-#         whole-line comment is STRIPPED by BuildKit before the continuation is
-#         joined (parser.go `isComment()` trims leading whitespace then tests
-#         `line[0] == '#'`). The real hazard is a `#` AFTER code on a line, which
-#         survives the join. It is also quote-aware and names a sentinel when
-#         python3 is absent, which previously killed the suite outright.
-#
-#   +2  the two survivors of the mutation battery on the blocks above (185 ->
-#       187). Dropping `--no-renames` from the filter's git diff left the whole
-#       filter harness green, because the stub git replays its input verbatim and
-#       ignores flags — so the flag needed its own pin. And deleting a target from
-#       the AC3 loop left the matcher cases green, because they read the target
-#       names FROM the loop under test: the same self-referential shape as
-#       round-3 TEST-015, reproduced in a brand-new harness. The three names are
-#       now also stated independently in this file.
-#
-#   +1  no `#` inside a joined Dockerfile RUN continuation. Added after exactly
-#       that defect was written into the Node layer during this PR: continuations
-#       join into ONE shell line, so the comment swallowed the node/npm probe,
-#       the FATAL branch and the loop's `done`, leaving an unterminated `for`.
-#       `bash -n` cannot see it (a Dockerfile is not a shell script) and nothing
-#       local builds the image, so it would have failed only in CI.
-#
-#   ~   EIGHT grep extractions and all eight `grep -c` assignments gained
-#       `|| true` — `grep -c` EXITS 1 when the count is zero, which the first
-#       round of this fix missed entirely, so `adl_n` and `hr_steps` still killed
-#       the suite. And `SUITE_COMPLETED=1` moved from 1119 lines early to just
-#       above the summary: while it was early the trap suppressed its own
-#       "terminated before reaching the summary" warning, so every one of these
-#       deaths exited 1 with NO output at all. Sentinel arms were given matching
-#       skip credits. MEASURED across seven degraded configurations (yq absent,
-#       unparseable workflow, and each of four files removed): every one now
-#       either completes with an honest count or names itself via the trap; none
-#       reports accounting drift and none dies silently. Under `set -euo pipefail` with
-#       SUITE_COMPLETED already 1, an unmatched grep made the ASSIGNMENT non-zero
-#       and killed the suite with no summary and no message — making each block's
-#       own vacuity sentinel unreachable dead code. Sentinel arms were given
-#       matching skip credits so a degraded host reports the real cause instead
-#       of a misleading accounting-drift message. The fifth pins
-#       that the requirement is read from go.mod rather than a literal, which is
-#       the property that keeps it from going stale again.
-EXPECTED_ASSERTIONS=188
+# The recurring lesson, recorded because it cost six rounds: when a block gains a
+# counted outcome, its vacuity-sentinel arms must gain the matching credit in the
+# same edit. That was missed five times, each time caught by RUNNING a degraded
+# configuration and never by reading. preflight-selftest now runs this suite with
+# yq removed for that reason.
+
+EXPECTED_ASSERTIONS=189
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."

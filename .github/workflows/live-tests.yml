@@ -58,11 +58,13 @@ jobs:
       # with a vacuity sentinel has to credit exactly the counted outcomes its
       # other arm does not emit; get that wrong and the suite is green here and
       # reports a misleading "assertion accounting drift" on a contributor's
-      # machine instead of the real cause. That defect class has now recurred
-      # FIVE times on this repo (once live at merge, LAB-5766 review rounds 4-6),
-      # and EVERY instance was found by executing this configuration — none by
-      # reading the code. CI ships yq, so nothing else here exercises the arm.
-      - name: Guard suites on a yq-less PATH (skip-credit accounting)
+      # machine instead of the real cause. That class has recurred repeatedly on
+      # this repo (once live at merge, and again through the LAB-5766 review
+      # rounds). Most instances were found by executing this configuration rather
+      # than by reading — which is why it runs here. Two were found by other
+      # means, so this is the cheapest net, not the only one. CI ships yq, so
+      # nothing else in this workflow exercises those arms.
+      - name: test-runner-args.sh on a yq-less PATH (skip-credit accounting)
         run: |
           set -euo pipefail
           noyq="$(mktemp -d)/bin"; mkdir -p "$noyq"
@@ -87,14 +89,47 @@ jobs:
           # non-zero exit is expected (the suite fails without yq) and is captured
           # deliberately, so the checks below can distinguish an honest failure from
           # an accounting-drift one.
+          # The suite is EXPECTED to exit non-zero here (yq-gated assertions fail),
+          # so its status is captured rather than propagated. `if ...; then :; else :; fi`
+          # is deliberate and is NOT a disguised `|| true`: the checks below decide
+          # the step's outcome, and they fail it on anything other than the expected
+          # shape.
           if out=$(PATH="$noyq" bash test/test-runner-args.sh 2>&1); then :; else :; fi
           printf '%s\n' "$out"
-          if printf '%s\n' "$out" | grep -q 'accounting drift'; then
+          # Anchored to the suite's actual drift line, not the bare phrase. The
+          # suite now also PRINTS that phrase inside an assertion message (the pin
+          # asserting this very step exists), so a loose grep would match its own
+          # subject. It happens not to collide today only because that pin is
+          # yq-gated and so does not emit on this run — which is exactly the kind
+          # of accident that stops being true after an unrelated edit.
+          if printf '%s\n' "$out" | grep -q '^test-runner-args: FAIL — assertion accounting drift'; then
             echo "::error::the guard suite reports assertion accounting drift without yq — a vacuity sentinel arm credits the wrong number of outcomes, so a yq-less contributor is told the ledger is stale instead of the real cause" >&2
             exit 1
           fi
           printf '%s\n' "$out" | grep -q '=== Summary ===' \
             || { echo "::error::the guard suite did not reach its summary without yq — it died before reporting" >&2; exit 1; }
+          # The yq-gated arms must actually have been REACHED, or this step passes
+          # while proving nothing — a suite that never touched them looks identical
+          # to one whose credits are correct.
+          # Two wordings are yq-attributed: fail_no_yq()'s "yq is required", and the
+          # filter step's own "yq unavailable or the workflow is unparseable". Match
+          # both, or the honest run fails the equality check below by exactly one.
+          yqpat='yq is required|yq unavailable'
+          if ! printf '%s\n' "$out" | grep -qE "$yqpat"; then
+            echo "::error::the yq-less run produced no 'yq is required' diagnostic, so the yq-gated arms were never reached and this step asserted nothing" >&2
+            exit 1
+          fi
+          # And every failure must BE one of those arms. Checking only for drift let
+          # an unrelated regression through: with one assertion flipped to fail, the
+          # run showed 21 failures instead of the expected yq ones and this step
+          # still exited 0. MEASURED. Compare the failure count against the number
+          # of yq-attributed diagnostics.
+          fails=$(printf '%s\n' "$out" | sed -n 's/^  \([0-9]*\) passed, \([0-9]*\) failed.*/\2/p' | head -1)
+          yqfails=$(printf '%s\n' "$out" | grep -cE "^  FAIL:.*($yqpat)" || true)
+          if [ "${fails:-0}" -ne "${yqfails:-0}" ]; then
+            echo "::error::the yq-less run reported ${fails} failure(s) but only ${yqfails} are yq-attributed — the extra failure(s) are a real regression this step must not mask" >&2
+            exit 1
+          fi
 
       - name: Run preflight self-test
         run: ./test/preflight-selftest.sh
