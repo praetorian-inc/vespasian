@@ -393,7 +393,16 @@ jobs:
             exit 0
           fi
           git fetch --no-tags origin "$BASE_REF"
-          changed=$(git diff --name-only "origin/${BASE_REF}...HEAD")
+          # --no-renames is load-bearing. Rename detection is on by default
+          # (diff.renames has defaulted to true since git 2.9) and reports ONLY
+          # the destination of a rename, so moving a file OUT of a watched path
+          # emitted just the new path and the filter said false. MEASURED in a
+          # scratch repo: after `git mv .devcontainer/thing.sh docs/thing.sh`,
+          # --name-only printed only `docs/thing.sh` and the matcher returned
+          # devcontainer=false; with --no-renames it printed BOTH paths and the
+          # filter fired. A rename becomes a delete plus an add, which is what
+          # the matcher needs, and it costs nothing on a non-rename PR.
+          changed=$(git diff --no-renames --name-only "origin/${BASE_REF}...HEAD")
           printf 'changed files:\n%s\n' "$changed"
           WATCHED='.devcontainer/* .dockerignore .github/workflows/live-tests.yml go.mod test/install-chrome.sh test/common.sh test/assert-chrome-install.sh test/assert-devcontainer-lookpath.sh test/setup-live-targets.sh test/run-live-tests.sh'
           hit=false
@@ -665,7 +674,9 @@ jobs:
             # and no writer to signal — verified 0 up to 2 MB, while a SKIPped
             # target still correctly reports missing.
             # One shape only. The suite never prints PASS before the target name:
-            # the summary row is `printf "  %-26s  %-8s" "$name" "$status"` and the
+            # print_summary emits the target name and then the status on one row,
+            # with ANSI colour escapes interposed between them — which is why the
+            # pattern needs `.*` there rather than a fixed-width gap — and the
             # per-target line is `log_ok "concat-spa: ALL CHECKS PASSED"`. The
             # dropped `PASS.*name` alternative matched nothing real and could only
             # false-positive off an unrelated line that mentions a target after the

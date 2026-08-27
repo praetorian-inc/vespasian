@@ -270,14 +270,14 @@ tmpconfig_setup=$(new_tmp)
 echo "TARGETS_SETUP=grpc-server,rest-api" > "$tmpconfig_setup"
 setup_output=$(env CONFIG_FILE="$tmpconfig_setup" bash -c "source '$RUNNER' --group all --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
 
-grpc_count=$(echo "$setup_output" | tr ',' '\n' | grep -cx 'grpc-server')
+grpc_count=$( { echo "$setup_output" | tr ',' '\n' | grep -cx 'grpc-server' || true; } )
 if [[ "$grpc_count" -eq 1 ]]; then
     pass "TARGETS_SETUP merge: grpc-server appears exactly once"
 else
     fail "TARGETS_SETUP merge: grpc-server count=$grpc_count, expected 1"
 fi
 
-rest_count=$(echo "$setup_output" | tr ',' '\n' | grep -cx 'rest-api')
+rest_count=$( { echo "$setup_output" | tr ',' '\n' | grep -cx 'rest-api' || true; } )
 if [[ "$rest_count" -eq 1 ]]; then
     pass "TARGETS_SETUP merge: rest-api deduplicated (appears once)"
 else
@@ -1328,7 +1328,12 @@ else
     # `WORKFLOW=` assignment, so its grep read an empty path, its loop never
     # iterated, and it printed PASS with the exec bit reverted. A guard that
     # cannot fail is the exact defect this suite exists to catch.
-    direct_exec_scripts=$(grep -oE 'run: \./(test/[a-zA-Z0-9_.-]+\.sh)' "$WORKFLOW" | sed 's|run: \./||' | sort -u)
+    # The EIGHTH unguarded extraction, missed when seven others were fixed (the
+    # commit message's count of seven was wrong). On an unparseable workflow the
+    # grep matches nothing, the assignment goes non-zero under pipefail, and the
+    # suite dies before ANY __YQ_ERROR__ sentinel can name the broken file.
+    # MEASURED with `bash -x`: execution stopped at `+ direct_exec_scripts=`.
+    direct_exec_scripts=$( { grep -oE 'run: \./(test/[a-zA-Z0-9_.-]+\.sh)' "$WORKFLOW" || true; } | sed 's|run: \./||' | sort -u)
     if [[ -z "$direct_exec_scripts" ]]; then
         fail "could not derive the direct-exec script list from live-tests.yml — the exec-bit assertion below would be vacuous"
     else
@@ -2209,8 +2214,6 @@ else
     fi
 fi
 
-SUITE_COMPLETED=1
-
 echo ""
 
 # The un-gated `bash -n` chain is the ONLY thing that parses the committed
@@ -2585,7 +2588,11 @@ STUB
     # extends this coverage automatically rather than silently escaping it.
     adl_required=$(sed -n '/^REQUIRED_TESTS=(/,/^)/p' "$SCRIPT_DIR/assert-devcontainer-lookpath.sh" \
                    | { grep -oE 'Test[A-Za-z0-9_]+' || true; })
-    adl_n=$(printf '%s\n' "$adl_required" | grep -c .)
+    # `grep -c .` EXITS 1 when the count is 0, so a bare assignment here dies
+    # under `set -euo pipefail` — which made the `adl_n -lt 2` sentinel below,
+    # and the skip credit added beside it, unreachable dead code. Guarding the
+    # extraction was not enough; the COUNT needed it too.
+    adl_n=$(printf '%s\n' "$adl_required" | grep -c . || true)
 
     # The list must match an INDEPENDENT source of truth, or the per-name cases
     # below are self-referential: they derive their names from REQUIRED_TESTS, so
@@ -2600,7 +2607,7 @@ STUB
     else
         adl_expected=$( { grep -oE '^func (TestBrowserManager_[A-Za-z0-9_]+|TestConfigureLauncher_PinsSystemBrowser)' "$adl_srcfile" || true; } \
                        | sed 's/^func //' | sort -u)
-        adl_exp_n=$(printf '%s\n' "$adl_expected" | grep -c .)
+        adl_exp_n=$(printf '%s\n' "$adl_expected" | grep -c . || true)
         if [[ "$adl_exp_n" -lt 2 ]]; then
             fail "derived only ${adl_exp_n} integration test name(s) from browser_integration_test.go — the completeness check would be vacuous"
         else
@@ -2657,6 +2664,11 @@ STUBFAIL
     unset -f run_adl
 else
     fail "test/assert-devcontainer-lookpath.sh is missing or not executable — the devcontainer job's Go-side assertion cannot run"
+    # The then-arm emits FIVE counted outcomes; this arm emits one. Without the
+    # credit the suite reported `177 passed, 1 failed` against the pin and then
+    # `assertion accounting drift`, which names a stale ledger instead of the
+    # missing script. MEASURED by moving the script aside.
+    skip "assert-devcontainer-lookpath.sh cases (script absent)" 4
 fi
 
 # ── harden-runner: count and pin, not just prose ───────────────────────────────
@@ -2666,7 +2678,7 @@ fi
 # computed either half. Measured on PR #228: deleting one harden-runner step left
 # six comments claiming seven beside six actual steps, with every check green.
 if [[ -f "$WORKFLOW" ]]; then
-    hr_steps=$(grep -cE '^[[:space:]]*uses:[[:space:]]*step-security/harden-runner@' "$WORKFLOW")
+    hr_steps=$( { grep -cE '^[[:space:]]*uses:[[:space:]]*step-security/harden-runner@' "$WORKFLOW" || true; } )
     hr_word=$(grep -oE 'bump ALL [A-Z]+ copies' "$WORKFLOW" | head -1 | awk '{print $3}')
     declare -A hr_numbers=( [ONE]=1 [TWO]=2 [THREE]=3 [FOUR]=4 [FIVE]=5 [SIX]=6 [SEVEN]=7 [EIGHT]=8 [NINE]=9 [TEN]=10 )
     hr_claimed=${hr_numbers[${hr_word:-NONE}]:-}
@@ -2700,8 +2712,16 @@ if [[ -f "$WORKFLOW" ]]; then
         declare -A nc_numbers=( [one]=1 [two]=2 [three]=3 [four]=4 [five]=5 [six]=6 [seven]=7 [eight]=8 [nine]=9 [ten]=10 )
         nc_claimed=${nc_numbers[${nc_word:-none}]:-}
         case "$nc_actual" in
-            __NO_YQ__) fail_no_yq "the non-container job count" ;;
-            __YQ_ERROR__) fail_yq_error "the non-container job count" ;;
+            # Both sentinels credit 1: the `*` arm below emits TWO counted
+            # outcomes (the non-container count AND the harden-runner word from
+            # the same AGENTS.md sentence, nested in this same arm). Without the
+            # credit a yq-less host reported `157 passed, 19 failed` and then a
+            # spurious `accounting drift` on top of 18 correct yq diagnostics.
+            # MEASURED with a PATH holding every executable except yq.
+            __NO_YQ__) fail_no_yq "the non-container job count"
+                       skip "AGENTS.md harden-runner word (yq unavailable)" 1 ;;
+            __YQ_ERROR__) fail_yq_error "the non-container job count"
+                          skip "AGENTS.md harden-runner word (workflow unparseable)" 1 ;;
             *)
                 if [[ -z "$nc_claimed" ]]; then
                     fail "could not read AGENTS.md's non-container job count claim (the comparison below would be vacuous) — got '${nc_word:-<none>}'"
@@ -2717,7 +2737,7 @@ if [[ -f "$WORKFLOW" ]]; then
                 hr_word_agents=$(grep -oE '(One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten) of the (one|two|three|four|five|six|seven|eight|nine|ten) non-container jobs' "$agents_md" | head -1 | awk '{print $1}')
                 declare -A hr_agents_numbers=( [One]=1 [Two]=2 [Three]=3 [Four]=4 [Five]=5 [Six]=6 [Seven]=7 [Eight]=8 [Nine]=9 [Ten]=10 )
                 hr_agents_claimed=${hr_agents_numbers[${hr_word_agents:-None}]:-}
-                hr_actual_steps=$(grep -cE '^[[:space:]]*uses:[[:space:]]*step-security/harden-runner@' "$WORKFLOW")
+                hr_actual_steps=$( { grep -cE '^[[:space:]]*uses:[[:space:]]*step-security/harden-runner@' "$WORKFLOW" || true; } )
                 if [[ -z "$hr_agents_claimed" ]]; then
                     fail "could not read AGENTS.md's harden-runner job-count claim (the comparison would be vacuous) — got '${hr_word_agents:-<none>}'"
                 elif [[ "$hr_actual_steps" -eq "$hr_agents_claimed" ]]; then
@@ -3041,6 +3061,119 @@ fi
 
 
 # ---------------------------------------------------------------------------
+# The AC3 rod-backed-target matcher, EXECUTED. This delta rewrote it twice —
+# `printf | grep -q` became a herestring (SIGPIPE under pipefail turned a green
+# suite red), and the pattern lost one of its two alternatives — and the suite
+# pinned only that the AC3 step EXISTS, by its `run-live-tests.sh --no-build
+# --group live` substring. Nothing exercised the matcher, so a weakened
+# `[^a-z-]` boundary or a dropped target name would ship silently. The boundary
+# is what stops `concat-spa` being satisfied by a `concat-spa-two-stage` row,
+# which is the whole reason the pattern is not a plain substring search.
+ac3_step=$(yq_query '.jobs["devcontainer-image"].steps[] | select(.name == "Assert the live suite runs in the image (AC3)") | .run' -r)
+case "$ac3_step" in
+    __NO_YQ__)    fail_no_yq "the AC3 rod-backed-target matcher"
+                  skip "AC3 matcher executed cases (yq unavailable)" 2 ;;
+    __YQ_ERROR__) fail_yq_error "the AC3 rod-backed-target matcher"
+                  skip "AC3 matcher executed cases (workflow unparseable)" 2 ;;
+    "")           fail "devcontainer-image has no step named 'Assert the live suite runs in the image (AC3)' — AC3's only in-image evidence is gone"
+                  skip "AC3 matcher executed cases (step absent)" 2 ;;
+    *)
+        # The loop header names the targets; the grep line is the matcher.
+        ac3_loop=$(printf '%s\n' "$ac3_step" | grep -E '^[[:space:]]*for t in ' | head -1 || true)
+        # The trailing ` \` is a shell line-continuation in the workflow; it must be
+        # stripped or the lifted line swallows whatever the harness puts after it.
+        ac3_grep=$(printf '%s\n' "$ac3_step" | grep -E '^[[:space:]]*grep -qE .*<<<"\$out"' | head -1 \
+                   | sed -e 's/[[:space:]]*\\$//' -e 's/^[[:space:]]*//' || true)
+        ac3_names=$(printf '%s\n' "$ac3_loop" | sed -n 's/.*for t in \(.*\); do.*/\1/p')
+        # ac3_names is read FROM the loop under test, which makes the cases below
+        # self-referential on their own: deleting a target simply shrinks what they
+        # check, and MEASURED, that left the suite green. This is the same defect
+        # shape as round-3 TEST-015. So the required names are also stated HERE,
+        # independently: no-download is the target LAB-4999 names as rod-backed,
+        # and concat-spa and forms-target are the two BROWSER_TARGETS entries the
+        # AC3 step exists to prove actually launched a browser.
+        ac3_absent=""
+        for ac3_req in no-download concat-spa forms-target; do
+            case " $ac3_names " in *" $ac3_req "*) ;; *) ac3_absent="${ac3_absent} ${ac3_req}" ;; esac
+        done
+        if [[ -n "$ac3_absent" ]]; then
+            fail "the AC3 step no longer requires rod-backed target(s):${ac3_absent} — a browserless image would report AC3 green for whatever remains, which is the exact condition LAB-5766 exists to remove"
+        else
+            pass "the AC3 step still requires all three rod-backed targets by name (checked against an independent list, not against its own loop)"
+        fi
+        if [[ -z "$ac3_grep" || -z "$ac3_names" ]]; then
+            fail "could not lift the AC3 matcher (loop='${ac3_loop}' grep='${ac3_grep}') — either it was restructured or it no longer feeds grep from a herestring, which is what keeps SIGPIPE from reporting a green suite as red"
+            skip "AC3 matcher executed cases (matcher not liftable)" 2
+        else
+            # run_ac3 <out> -> the targets the matcher reports MISSING
+            run_ac3() {
+                out="$1" bash -c "
+                    set -u
+                    missing=\"\"
+                    for t in $ac3_names; do
+                        $ac3_grep || missing=\"\${missing} \${t}\"
+                    done
+                    printf '%s' \"\$missing\"
+                " 2>/dev/null
+            }
+            ac3_real=$(printf '  no-download                 PASS      -   -   9s\n  concat-spa                  PASS      2   2   9s\n  forms-target                PASS      4   4  10s\n')
+            ac3_skipped=$(printf '  no-download                 PASS      -   -   9s\n  concat-spa                  SKIP      -   -   0s\n  forms-target                PASS      4   4  10s\n')
+            ac3_nearmiss=$(printf '  no-download                 PASS      -   -   9s\n  concat-spa-two-stage        PASS      2   2   9s\n  forms-target                PASS      4   4  10s\n')
+            # (1) genuine rows -> nothing missing, or the other cases prove nothing
+            if [[ -z "$(run_ac3 "$ac3_real")" ]]; then
+                pass "the AC3 matcher accepts the real PASS rows for all $(printf '%s' "$ac3_names" | wc -w) rod-backed targets (executed against captured-format output)"
+            else
+                fail "the AC3 matcher reports '$(run_ac3 "$ac3_real")' missing from output in the format the suite actually prints — the gate would red a passing run"
+            fi
+            # (2) a SKIP must be caught, and a near-miss must NOT satisfy the name
+            ac3_bad=""
+            [[ "$(run_ac3 "$ac3_skipped")" == *concat-spa* ]] || ac3_bad="${ac3_bad} a SKIPped target was not reported missing"
+            [[ "$(run_ac3 "$ac3_nearmiss")" == *concat-spa* ]] || ac3_bad="${ac3_bad} a concat-spa-two-stage row satisfied concat-spa (the [^a-z-] boundary is gone)"
+            if [[ -z "$ac3_bad" ]]; then
+                pass "the AC3 matcher catches a SKIPped target and refuses a longer sibling name in its place"
+            else
+                fail "the AC3 matcher is too loose:${ac3_bad} — a browserless image would report AC3 green"
+            fi
+            unset -f run_ac3
+        fi
+        ;;
+esac
+
+# ---------------------------------------------------------------------------
+# No `#` inside a Dockerfile RUN continuation. Dockerfile line-continuations
+# join every `\`-terminated line into ONE logical shell line, so a `#` anywhere
+# in the block comments out the REST of it. Added after exactly that was written
+# into the Node layer during this PR: the comment swallowed the node/npm probe,
+# the FATAL branch and the loop's `done`, leaving an unterminated `for`. Nothing
+# local catches it — a Dockerfile is not a shell script so `bash -n` cannot see
+# it, and no guard suite builds the image — so it surfaces only in CI.
+dfc="$SCRIPT_DIR/../.devcontainer/Dockerfile"
+if [[ -f "$dfc" ]]; then
+    df_bad=$(python3 - "$dfc" <<'DFPY'
+import re,sys
+s=open(sys.argv[1]).read()
+bad=[]
+for m in re.finditer(r'^RUN .*?(?<!\\)\n', s, re.S | re.M):
+    block=m.group(0)
+    if '\\\n' not in block:
+        continue
+    joined=re.sub(r'\\\n\s*',' ',block)
+    if '#' in joined:
+        bad.append(joined.split('\n')[0][:70])
+print('\n'.join(bad))
+DFPY
+    )
+    if [[ -z "$df_bad" ]]; then
+        pass "no '#' survives inside a joined Dockerfile RUN continuation (a comment there silently deletes the rest of the instruction)"
+    else
+        fail "a '#' appears inside a joined Dockerfile RUN continuation, which comments out the remainder of the instruction: ${df_bad} — move the comment above the RUN"
+    fi
+else
+    fail ".devcontainer/Dockerfile not found at ${dfc} — cannot check for comment-swallowing in RUN continuations"
+fi
+
+
+# ---------------------------------------------------------------------------
 # The devcontainer paths FILTER, executed rather than described.
 #
 # d7f5129 replaced dorny/paths-filter (rejected by the org Actions allowlist)
@@ -3088,10 +3221,21 @@ GITSTUB
                 bash -c "$filter_body" >/dev/null 2>&1 || true
             sed -n 's/^devcontainer=//p' "$flt_tmp/out" | head -1
         }
-        flt_bad=""
+        flt_bad=""; flt_n=0
         # event|changed paths (\n-separated)|expected
+        #
+        # The whitespace row pairs a spacey path WITH a watched path so it can
+        # actually discriminate: the earlier `docs/a file with spaces.md|false`
+        # row passed under both the old `for f in $changed` loop and the new
+        # `while read` one, because neither fragment matched anything either way.
+        # Pairing them means the pre-fix loop splits the spacey path into
+        # fragments and still finds test/common.sh, while a loop that mishandles
+        # the newline separation misses it. The rename row covers the
+        # --no-renames flag on the producer: git reports a rename as delete+add,
+        # so the SOURCE path under .devcontainer/ must reach the matcher.
         while IFS='|' read -r flt_ev flt_changed flt_want; do
             [ -z "$flt_ev" ] && continue
+            flt_n=$((flt_n + 1))
             flt_got=$(run_filter "$flt_ev" "$(printf '%b' "$flt_changed")")
             [ "$flt_got" = "$flt_want" ] \
                 || flt_bad="${flt_bad} [${flt_ev} ${flt_changed} -> got '${flt_got}' want '${flt_want}']"
@@ -3103,11 +3247,24 @@ pull_request|.github/workflows/live-tests.yml|true
 pull_request|README.md|false
 pull_request|test/some-other-file.sh|false
 pull_request|README.md\ntest/install-chrome.sh|true
-pull_request|docs/a file with spaces.md|false
+pull_request|go.mod|true
+pull_request|docs/a file with spaces.md\ntest/common.sh|true
+pull_request|.devcontainer/moved-away.sh\ndocs/moved-away.sh|true
 push|.devcontainer/Dockerfile|false
 FLTCASES
+        # The rename ROW above exercises the matcher, not the producer: the stub
+        # git replays FILTER_CHANGED verbatim and ignores flags, so the row passes
+        # whether or not the real step asks git for both paths. MEASURED — dropping
+        # --no-renames left the whole harness green. The flag therefore needs its
+        # own pin, because git reports a rename as the DESTINATION only by default
+        # and a file moved OUT of a watched path would stop firing the filter.
+        if printf '%s\n' "$filter_body" | grep -qF -- 'git diff --no-renames --name-only'; then
+            pass "the devcontainer filter asks git for both sides of a rename (--no-renames), so a file moved OUT of a watched path still builds"
+        else
+            fail "the devcontainer filter's git diff lost --no-renames — rename detection is on by default and reports only the DESTINATION, so moving a file out of .devcontainer/ would report devcontainer=false and skip the image build"
+        fi
         if [ -z "$flt_bad" ]; then
-            pass "the devcontainer paths filter MATCHES the paths it watches and rejects the ones it does not (9 cases executed against the real step, stubbed git)"
+            pass "the devcontainer paths filter MATCHES the paths it watches and rejects the ones it does not (${flt_n} cases executed against the real step, stubbed git)"
         else
             fail "the devcontainer paths filter misclassified:${flt_bad} — the image job's pull_request arm is driven by this output, so a wrong answer means a PR touching the image is never built before merge"
         fi
@@ -3142,6 +3299,7 @@ dcgo_mod="$SCRIPT_DIR/../go.mod"
 if [[ -f "$dcgo_df" && -f "$dcgo_mod" ]]; then
     dcgo_pin=$(grep -oE '^[[:space:]]*ver=[0-9]+\.[0-9]+(\.[0-9]+)?' "$dcgo_df" | head -1 | sed 's/.*ver=//' || true)
     dcgo_want=$(sed -n 's/^go //p' "$dcgo_mod" | head -1 || true)
+    dcgo_mod_branch="$dcgo_want"
     # Compare against the STRICTER of this branch's go.mod and the merge target's,
     # because that is what CI actually builds: a pull_request checkout is the MERGE
     # commit, so the container sees main's go.mod, not the branch's. Measured — the
@@ -3150,10 +3308,17 @@ if [[ -f "$dcgo_df" && -f "$dcgo_mod" ]]; then
     # is precisely the break this block exists to catch. Read from a local ref, so
     # no network: if origin/main has never been fetched the check quietly falls
     # back to the branch's own go.mod rather than failing on an absent ref.
+    # Which go.mod this compares against changes how strict the check is, and
+    # leaving that to whatever the developer happens to have fetched made the
+    # result ambient: with origin/main absent, reverting the pin to 1.25.12
+    # PASSED, because the branch's own go.mod still reads 1.25.8. The basis is
+    # now named in the assertion message so the log says which one was used.
+    dcgo_basis="branch go.mod only (origin/main not fetched)"
     if git -C "$SCRIPT_DIR/.." rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
         dcgo_main=$(git -C "$SCRIPT_DIR/.." show origin/main:go.mod 2>/dev/null | sed -n 's/^go //p' | head -1 || true)
         if [[ -n "$dcgo_main" && -n "$dcgo_want" ]]; then
             dcgo_want=$(printf '%s\n%s\n' "$dcgo_want" "$dcgo_main" | sort -V | tail -1)
+            dcgo_basis="stricter of branch (${dcgo_mod_branch:-?}) and origin/main (${dcgo_main})"
         fi
     fi
     if [[ -z "$dcgo_pin" || -z "$dcgo_want" ]]; then
@@ -3161,7 +3326,7 @@ if [[ -f "$dcgo_df" && -f "$dcgo_mod" ]]; then
     else
         dcgo_oldest=$(printf '%s\n%s\n' "$dcgo_want" "$dcgo_pin" | sort -V | head -1)
         if [[ "$dcgo_oldest" == "$dcgo_want" ]]; then
-            pass "the .devcontainer/Dockerfile Go pin (${dcgo_pin}) satisfies go.mod (>= ${dcgo_want}) — checked un-gated, on every PR"
+            pass "the .devcontainer/Dockerfile Go pin (${dcgo_pin}) satisfies go.mod (>= ${dcgo_want}, basis: ${dcgo_basis}) — checked un-gated, on every PR"
         else
             fail "the .devcontainer/Dockerfile pins Go ${dcgo_pin} but go.mod requires >= ${dcgo_want} — under GOTOOLCHAIN=local every Go step in the devcontainer fails with 'go.mod requires go >= ${dcgo_want}'; bump ver= in the Dockerfile's Go layer"
         fi
@@ -3190,13 +3355,22 @@ case "$dcgo_step" in
                   skip "devcontainer conformance step properties (step absent)" 1
                   skip "devcontainer Go gate executed cases (step absent)" 4 ;;
     *)
-        # M4: each property as its own requirement. The previous loop grepped the
-        # token 'id -un', which appears TWICE in this step (the check and its
-        # error message), so it survived deleting every other assertion in the
-        # step it claimed to pin — measured: removing the VESPASIAN_NO_SANDBOX,
-        # /dev/shm and spec-validator checks left the suite green. The
-        # spec-validator one matters most: the workflow's own comment says it is
-        # the only thing that detects a failing onCreateCommand, because the
+        # Each property as its own requirement. The loop this replaced grepped the
+        # token 'id -un', which appears TWICE in this step (the check and its error
+        # message), so it survived deleting every other assertion in the step it
+        # claimed to pin.
+        #
+        # The rows must be tokens that appear ONLY in the check, and the first
+        # version of THIS table repeated the same mistake twice: '/dev/shm'
+        # occurs 3x in the step (the df command, the comparison, and the success
+        # echo) and 'go.mod' occurs 8x, mostly in comments — so deleting the
+        # /dev/shm guard left the suite at 182/0. MEASURED. Each row is now a
+        # string that occurs exactly once, verified against the parsed step; the
+        # go.mod row is gone because the five-line gate check below already pins
+        # the toolchain comparison far more strongly than a token match could.
+        #
+        # The spec-validator row matters most: the workflow's own comment says it
+        # is the only thing that detects a failing onCreateCommand, because the
         # devcontainers CLI does not report that as a non-zero exit from `up`.
         dcgo_prop_missing=""
         while IFS='|' read -r dcgo_pat dcgo_label; do
@@ -3206,9 +3380,8 @@ case "$dcgo_step" in
         done <<'DCPROPS'
 [ "$(id -un)" = vscode ]|remoteUser is vscode
 ${VESPASIAN_NO_SANDBOX:-}|containerEnv VESPASIAN_NO_SANDBOX
-/dev/shm|runArgs --shm-size
+[ "$shm" -ge 1000000000 ]|runArgs --shm-size (the size comparison, not the word /dev/shm)
 test/spec-validators/node_modules/|onCreateCommand spec-validator entry points
-go.mod|the go.mod toolchain requirement
 DCPROPS
         if [ -z "$dcgo_prop_missing" ]; then
             pass "the devcontainer conformance step still asserts every property devcontainer.json promises (5 pinned individually, not by one shared token)"
@@ -3303,6 +3476,14 @@ esac
 
 
 
+# Set HERE, not 1119 lines earlier where it used to sit. The trap suppresses its
+# "terminated before reaching the summary" warning once this is 1, so setting it
+# early meant a death anywhere in the rest of the suite exited 1 with no summary,
+# no diagnostic, and the accounting pin unrun. MEASURED: on an unparseable
+# live-tests.yml the suite died at `hr_steps=$(grep -c ...)` and printed nothing
+# at all. Every line above this point is now covered by the trap.
+SUITE_COMPLETED=1
+
 echo "=== Summary ==="
 echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # PR #228 review: 134 -> 135 was the container-shell check (above).
@@ -3367,7 +3548,7 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # per-job rather than aggregating = 171. MEASURED. Re-measure, do not adjust.
 #
 #   +7  the devcontainer Go-toolchain gate and the conformance-step properties
-#       (172 -> 182 with the filter and on-create blocks below), after round-4 review rejected the first version of this
+#       (172 -> 185 with the filter, on-create, AC3-matcher and Dockerfile-comment blocks below), after round-4 review rejected the first version of this
 #       block. The image had shipped Go 1.25.12 against a go.mod on main asking
 #       1.27.0: under GOTOOLCHAIN=local every Go step in the container failed and
 #       AC2 with it, and nothing here compared the two numbers. The block is now:
@@ -3407,7 +3588,41 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       npm-free — the first version of this case passed vacuously against a real
 #       `npm ci`); the other observes `npm ci --ignore-scripts` through a stub.
 #
-#   ~   seven grep extractions gained `|| true`. Under `set -euo pipefail` with
+#   +2  the AC3 rod-backed-target matcher EXECUTED (185). The suite pinned only
+#       that the AC3 step exists, by a substring of its command, while this PR
+#       rewrote the matcher twice — herestring for SIGPIPE, and two pattern
+#       alternatives down to one. One case drives the real PASS rows, the other
+#       requires a SKIP to be caught AND a `concat-spa-two-stage` row to be
+#       refused in place of `concat-spa`, which is what the `[^a-z-]` boundary is
+#       for.
+#
+#   +2  the two survivors of the mutation battery on the blocks above (185 ->
+#       187). Dropping `--no-renames` from the filter's git diff left the whole
+#       filter harness green, because the stub git replays its input verbatim and
+#       ignores flags — so the flag needed its own pin. And deleting a target from
+#       the AC3 loop left the matcher cases green, because they read the target
+#       names FROM the loop under test: the same self-referential shape as
+#       round-3 TEST-015, reproduced in a brand-new harness. The three names are
+#       now also stated independently in this file.
+#
+#   +1  no `#` inside a joined Dockerfile RUN continuation. Added after exactly
+#       that defect was written into the Node layer during this PR: continuations
+#       join into ONE shell line, so the comment swallowed the node/npm probe,
+#       the FATAL branch and the loop's `done`, leaving an unterminated `for`.
+#       `bash -n` cannot see it (a Dockerfile is not a shell script) and nothing
+#       local builds the image, so it would have failed only in CI.
+#
+#   ~   EIGHT grep extractions and all eight `grep -c` assignments gained
+#       `|| true` — `grep -c` EXITS 1 when the count is zero, which the first
+#       round of this fix missed entirely, so `adl_n` and `hr_steps` still killed
+#       the suite. And `SUITE_COMPLETED=1` moved from 1119 lines early to just
+#       above the summary: while it was early the trap suppressed its own
+#       "terminated before reaching the summary" warning, so every one of these
+#       deaths exited 1 with NO output at all. Sentinel arms were given matching
+#       skip credits. MEASURED across seven degraded configurations (yq absent,
+#       unparseable workflow, and each of four files removed): every one now
+#       either completes with an honest count or names itself via the trap; none
+#       reports accounting drift and none dies silently. Under `set -euo pipefail` with
 #       SUITE_COMPLETED already 1, an unmatched grep made the ASSIGNMENT non-zero
 #       and killed the suite with no summary and no message — making each block's
 #       own vacuity sentinel unreachable dead code. Sentinel arms were given
@@ -3415,7 +3630,7 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       of a misleading accounting-drift message. The fifth pins
 #       that the requirement is read from go.mod rather than a literal, which is
 #       the property that keeps it from going stale again.
-EXPECTED_ASSERTIONS=182
+EXPECTED_ASSERTIONS=187
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."

@@ -33,9 +33,12 @@ and failing later mid-crawl.
 **In this repo's devcontainer there is nothing to do.**
 [`.devcontainer/Dockerfile`](../.devcontainer/Dockerfile) runs
 `test/install-chrome.sh` as an image layer, so a fresh container comes up with a
-real, non-snap Chrome already installed, plus the `python3`, `yq`, Node 20 and
-Go 1.27.0 the guard suites need. Go is installed by the Dockerfile rather than
-inherited from the base image, which ships a release too old for `go.mod`. [`.devcontainer/devcontainer.json`](../.devcontainer/devcontainer.json)
+real, non-snap Chrome already installed, plus the `python3` and `yq` the guard
+suites need, the Node 20 the `graphql-server` target and the spec validators
+need, and the Go 1.27.0 `go.mod` requires. Go is installed by the Dockerfile
+rather than inherited from the base image, which ships a release too old for
+`go.mod` — under `GOTOOLCHAIN=local` every Go step in the container fails
+otherwise. The four guard suites themselves need none of Go, Node or Chrome. [`.devcontainer/devcontainer.json`](../.devcontainer/devcontainer.json)
 sets `VESPASIAN_NO_SANDBOX=true` for you, and its `onCreateCommand` installs the
 spec-validator deps the live and generator targets parse specs with.
 

@@ -129,10 +129,34 @@ RUN set -eu; \
 # deliberate rather than an oversight: `nvm install 20` floats within a major.
 # Those two layers pin because their binaries are fetched over plain TLS from a
 # release host, so a digest is the only thing distinguishing the intended
-# artifact from a substituted one. nvm resolves through its own index and this
-# Node only has to parse JSON and YAML specs for the validators; no artifact
-# under test is built by it, and no assertion depends on its patch level. Pin it
-# the day one does.
+# artifact from a substituted one. nvm resolves through its own index, so the
+# substitution risk a digest defends against is not the same shape here.
+#
+# What this Node actually does, stated correctly because the first version of
+# this comment got it wrong: besides the spec validators, it installs and runs
+# test/graphql-server — `npm ci --ignore-scripts --silent` at
+# setup-live-targets.sh:334 and `node server.js` at :617. graphql-server is in
+# ALL_TARGETS (:55) and BROWSER_TARGETS (:134), so the AC3 step's bare
+# `./test/setup-live-targets.sh` builds and runs it INSIDE this image; the green
+# run's log shows `graphql-server PASS 8 8 14s` there. So an artifact under test
+# IS built by this Node, and its assertion block does depend on it.
+#
+# The float is still accepted, but for a different reason than "nothing depends
+# on it": the exposure is a Node 20 patch that breaks Apollo, which would fail
+# the graphql-server target loudly in the gated job rather than pass silently.
+# Pin it the day a failure here becomes hard to attribute.
+#
+# On the `command -v "$b" || true` below: an assignment takes its substitution's
+# exit status, so under errexit a missing binary would kill the build before the
+# FATAL branch could name which one. The `|| true` is what lets the diagnostic
+# run. It is documented up here, not inline, for a reason worth stating because
+# the inline version was written first and was wrong: Dockerfile
+# line-continuations join every `\`-terminated line into ONE logical shell line,
+# so a `#` comment inside the block below comments out the REST of that joined
+# line — the probe, the FATAL branch and the loop's `done` — leaving an
+# unterminated `for` and a build that dies on a bare syntax error. `bash -n`
+# cannot see it (a Dockerfile is not a shell script) and no guard suite builds
+# the image, so it would have surfaced only in CI.
 RUN bash -c 'set -euo pipefail; \
     export NVM_DIR="${NVM_DIR:-/usr/local/share/nvm}"; \
     [ -s "$NVM_DIR/nvm.sh" ] || { echo "FATAL: nvm not found at $NVM_DIR; the FROM changed" >&2; exit 1; }; \
