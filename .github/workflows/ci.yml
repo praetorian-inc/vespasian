@@ -125,3 +125,48 @@ jobs:
         run: |
           git fetch --no-tags origin "${BASE_REF#origin/}"
           make lint-comments
+
+  # LAB-5331: local coverage gate. The reusable go-ci.yml (the `ci` job) produces a
+  # coverage profile but never enforces a threshold, so this sibling job runs
+  # `make coverage-gate`, which fails the build when total statement coverage drops
+  # below COVERAGE_THRESHOLD (Makefile). No third-party service, token, or new egress.
+  coverage-gate:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      # Defense-in-depth (LAB-4732 / SEC-BE-002): monitor/record outbound
+      # traffic. Audit mode is non-blocking. Egress observed in this job's audit
+      # run: api.github.com plus results-receiver.actions.githubusercontent.com,
+      # release-assets.githubusercontent.com and productionresultssa6.blob.core.windows.net
+      # (checkout, setup-go, and Actions runner infrastructure), and example.com,
+      # which cmd/vespasian/main_test.go probes with Probe:true under `-race`.
+      # go.mod-driven module fetches (proxy.golang.org) may also appear on a cache
+      # miss. This list is the artifact LAB-4732's audit->block work will read, so
+      # keep it matched to the run's `endpoint called` log lines.
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
+        with:
+          go-version-file: go.mod
+      # Runs BEFORE the gate itself, deliberately -- the same reasoning as the
+      # "Self-test the claims checker" step above. The gate's awk one-liner is
+      # authored on macOS and first runs for real here on ubuntu, and it already
+      # shipped one false-green bug (a non-numeric threshold coerced to 0 still
+      # printed PASS). This exercises each documented exit code against fixtures
+      # so a fail-open regression in the one-liner reports as a self-test failure
+      # here rather than as a silently green gate below. No Go build (make -n).
+      - name: Self-test the coverage gate
+        run: ./scripts/coverage-gate_test.sh
+      # `make coverage` runs the suite under -race, which requires CGO + a C
+      # compiler; ubuntu-latest ships gcc. The profile excludes test/.
+      - name: Enforce coverage threshold
+        env:
+          CGO_ENABLED: "1"
+        run: make coverage-gate

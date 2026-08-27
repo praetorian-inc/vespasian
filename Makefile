@@ -9,7 +9,25 @@ GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 LDFLAGS   := -s -w -X main.version=$(VERSION) -X main.gitCommit=$(GIT_COMMIT) -X main.buildDate=$(BUILD_DATE)
 
-.PHONY: build test test-integration lint lint-comments lint-comments-selftest lint-comments-all fmt vet gosec check check-docs coverage clean deps live-test-clean
+# Minimum total statement coverage (%) enforced by `make coverage-gate` (see ci.yml).
+# The gate was introduced against an 86.4% baseline (LAB-5331); 85 leaves headroom for
+# minor run-to-run/refactor noise while still failing a build on a real regression.
+COVERAGE_THRESHOLD ?= 85
+# Exported (rather than passed via `awk -v`) so the gate reads it from ENVIRON: make
+# places the value straight into the recipe's environment, where it never transits an
+# `sh -c` word-split, so a value like `100' 'BEGIN{exit 0}` cannot smuggle a second
+# program argument into awk. See coverage-gate-check below.
+export COVERAGE_THRESHOLD
+
+# Coverage profile path, and the command that emits the `go tool cover -func` report
+# the gate parses. Both are seams. COVERAGE_PROFILE lets `coverage`/`coverage-gate`
+# target an alternate profile; COVERAGE_FUNC lets scripts/coverage-gate_test.sh drive
+# the real `coverage-gate-check` target against a fixture (COVERAGE_FUNC='cat fixture')
+# with no Go build, so the test can assert make's own exit code.
+COVERAGE_PROFILE ?= coverage.out
+COVERAGE_FUNC ?= go tool cover -func=$(COVERAGE_PROFILE)
+
+.PHONY: build test test-integration lint lint-comments lint-comments-selftest lint-comments-all fmt vet gosec check check-docs coverage coverage-gate coverage-gate-check clean deps live-test-clean
 
 build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/vespasian
@@ -93,8 +111,34 @@ check-docs:
 	python3 test/check-docs.py
 
 coverage:
-	go test -race -coverprofile=coverage.out $$(go list ./... | grep -v '/test/')
-	go tool cover -func=coverage.out
+	go test -race -coverprofile=$(COVERAGE_PROFILE) $$(go list ./... | grep -v '/test/')
+	go tool cover -func=$(COVERAGE_PROFILE)
+
+# CI gate (LAB-5331): rebuild the profile via `coverage`, then enforce the threshold.
+# The enforcement lives in `coverage-gate-check` so it can run against an existing
+# profile without a rebuild -- that seam is what lets scripts/coverage-gate_test.sh
+# invoke the real target and assert make's exit code, closing three regressions the
+# awk-fragment test cannot see: a `-` recipe prefix that would make `make` swallow a
+# FAIL, a dropped `+ 0` that turns the numeric compare lexicographic, and a zeroed
+# default threshold.
+coverage-gate: coverage coverage-gate-check
+
+# Enforce COVERAGE_THRESHOLD against an already-built profile (COVERAGE_FUNC emits the
+# `go tool cover -func` report). Fails (exit 1) if total statement coverage is below
+# the threshold; fails closed (exit 2) if the `total:` line is ever absent.
+#
+# COVERAGE_THRESHOLD is validated in BEGIN before any comparison and read from ENVIRON
+# (see the `export` above) rather than interpolated into the awk command, so an
+# untrusted value cannot inject a second program argument. awk's `threshold + 0` would
+# silently coerce a non-numeric value to 0, letting ANY coverage pass a gate that still
+# prints a reassuring PASS -- the one failure mode a coverage gate must not have -- so
+# the regex admits only digits with an optional decimal part (rejecting negatives by
+# construction) and the second check bounds the top end. `exit` in BEGIN still runs
+# END, hence the `bad` flag so END does not overwrite the status with its own.
+# scripts/coverage-gate_test.sh pins each of these exit codes, including via the real
+# target through the COVERAGE_FUNC seam.
+coverage-gate-check:
+	@$(COVERAGE_FUNC) | awk 'BEGIN { threshold = ENVIRON["COVERAGE_THRESHOLD"]; seen = 0; bad = 0; if (threshold !~ /^[0-9]+(\.[0-9]+)?$$/) { printf "ERROR: COVERAGE_THRESHOLD \"%s\" is not a number\n", threshold; bad = 2; exit 2 } if (threshold + 0 > 100) { printf "ERROR: COVERAGE_THRESHOLD %s is outside 0..100\n", threshold; bad = 2; exit 2 } } /^total:/ { pct = $$NF; sub(/%/, "", pct); seen = 1; printf "total coverage %.1f%% (threshold %.1f%%)\n", pct, threshold; if (pct + 0 < threshold + 0) { printf "FAIL: coverage %.1f%% is below the %.1f%% threshold\n", pct, threshold; exit 1 } print "PASS: coverage meets the threshold" } END { if (bad) exit bad; if (!seen) { print "ERROR: no total: line in go tool cover output"; exit 2 } }'
 
 deps:
 	go mod download
@@ -102,7 +146,7 @@ deps:
 	cd test/proto-validate && go mod tidy
 
 clean:
-	rm -rf $(BUILD_DIR) dist coverage.out
+	rm -rf $(BUILD_DIR) dist $(COVERAGE_PROFILE)
 
 # Escape hatch for orphaned live-test services: stops every recorded generation
 # (kills recorded PIDs only, which is safe). For untracked orphans whose pid log

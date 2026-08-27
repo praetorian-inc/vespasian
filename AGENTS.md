@@ -42,6 +42,7 @@ make check-docs
 
 # Coverage
 make coverage                 # Generates coverage.out and prints per-function coverage
+make coverage-gate            # Fails if total coverage is below the CI threshold (85%)
 
 # Dependencies
 make deps                     # go mod download && go mod tidy
@@ -212,14 +213,14 @@ A file being edited is the moment to clear it.
 
 GitHub Actions runs on push to main and PRs:
 
-- **ci.yml**: Build, test (`go test -race`, 80% coverage threshold), lint (golangci-lint v2), and format check. Runs on all pushes and PRs. It delegates to a shared reusable workflow that takes only `build-*` inputs, so it cannot pass a build tag — integration-tagged tests run from live-tests.yml instead.
+- **ci.yml**: Build, test (`go test -race`), an 85% statement-coverage gate (`make coverage-gate`), lint (golangci-lint v2), and format check. Runs on every push to `main`, and on PRs to `main` whose changes match its `paths` filter — the filter is nested under `pull_request` only (so pushes are unfiltered), and it covers `**/*.go`, `go.mod`, `go.sum`, `.golangci*`, `Makefile`, and `scripts/**`, not Go files alone. It delegates to a shared reusable workflow whose inputs are all `build-*` (see the `with:` block), so today it passes no build tag — integration-tagged tests run from live-tests.yml instead, and the coverage gate is a separate job for the same reason.
 - **live-tests.yml**: seven jobs — three un-gated guard jobs, an opt-in end-to-end installer job, a label gate, the integration-tagged Go suite, and the full suite.
 
   **`preflight-selftest`** (un-gated) is the shell regression net. It runs a `bash -n` syntax check (over `setup-live-targets.sh`, `install-chrome.sh` and `assert-chrome-install.sh`) and then all four guard suites: `test/preflight-selftest.sh` (Chrome/Chromium detection, LAB-3893), `test/install-chrome-selftest.sh` (the installer's non-privileged surface), `test/setup-live-targets_test.sh` (teardown / orphan-PID hardening, LAB-2893), and `test/test-runner-args.sh` (target-group vs dispatch drift, the un-gated job's own step list, browser-target classification, and two further guards: the `test` job is excluded from the gated-job allowlist, so a suite hosted only there cannot satisfy the wiring check while staying skippable via `skip-live-tests`, and `install-chrome-e2e`'s verification steps are pinned by name so deleting one fails CI). None need Go, Node, or Chrome. `test-runner-args.sh` fails CI if a dispatch target is not covered by `OFFLINE_TARGETS` or `LIVE_TARGETS` (there is no config-only tier: it existed for `grpc-server` alone and its only effect was to exempt that target from the coverage check, which is why the epic's headline gRPC target ran on no PR until LAB-5549 moved it into `LIVE_TARGETS`), if this job stops invoking one of the four suites, or if a target in `ALL_TARGETS` is classified neither browser nor non-browser.
 
   **`validator-regression`** (un-gated) does its own `npm ci --ignore-scripts` in `test/spec-validators` and runs `./test/validate_test.sh` to prove the spec validators still reject malformed specs.
 
-  **`docs-check`** (un-gated) runs `python3 test/check-docs.py --verbose` (LAB-5870): the required community-health docs exist, every relative markdown link and heading anchor resolves, and the `*` owner line in `CODEOWNERS` matches the maintainer table in `GOVERNANCE.md`. It lives in this workflow rather than `ci.yml` because `ci.yml`'s `paths` filter is Go-only — a docs-only PR never triggers it, so the job guarding docs must not be gated on Go files changing.
+  **`docs-check`** (un-gated) runs `python3 test/check-docs.py --verbose` (LAB-5870): the required community-health docs exist, every relative markdown link and heading anchor resolves, and the `*` owner line in `CODEOWNERS` matches the maintainer table in `GOVERNANCE.md`. It lives in this workflow rather than `ci.yml` because `ci.yml`'s `paths` filter (on `pull_request` only, and covering Go sources, `go.mod`/`go.sum`, `.golangci*`, `Makefile`, and `scripts/**`) does not list Markdown — a docs-only PR never triggers it, so the job guarding docs must not be gated on it.
 
   All three guard jobs (`preflight-selftest`, `validator-regression`, `docs-check`) sit deliberately **outside** the label gate, so `skip-live-tests` cannot switch off the regression net. All three have ~5-minute timeouts.
 

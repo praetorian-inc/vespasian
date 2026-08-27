@@ -601,6 +601,7 @@ make check       # Run all checks (fmt, vet, lint, lint-comments, gosec, test, c
 
 ```bash
 make coverage    # Generate coverage report
+make coverage-gate # Fail if total coverage is below the CI threshold (85%)
 make deps        # Download and tidy modules
 make clean       # Remove build artifacts
 ```
