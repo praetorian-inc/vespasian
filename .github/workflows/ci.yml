@@ -9,6 +9,10 @@ on:
       - '**/*.go'
       - 'go.mod'
       - 'go.sum'
+      # The two patterns above are root-scoped, so the nested proto-validate
+      # module's own manifests would not otherwise trigger CI.
+      - 'test/proto-validate/go.mod'
+      - 'test/proto-validate/go.sum'
       - '.golangci*'
       - 'Makefile'
       - 'scripts/**'
@@ -34,6 +38,48 @@ jobs:
       build-matrix-os: '["linux"]'
       build-matrix-arch: '["amd64"]'
     secrets: inherit
+
+  # test/proto-validate is its own module (see test/proto-validate/go.mod), so
+  # protocompile stays out of the shipped module's require list and downstream
+  # pkg/sdk consumers no longer resolve it. The cost of that split is that the
+  # nested module's packages are NOT matched by a root `go test ./...` — verified,
+  # not assumed — so without this job the AC4 helper's unit tests would silently
+  # stop running, which is precisely the never-executed-assertion failure
+  # LAB-5549 exists to remove.
+  #
+  # A separate job rather than an input to `ci` above, for the same reason
+  # comment-claims is one: that job delegates to a shared reusable workflow which
+  # accepts only build-* inputs, so it cannot be told about a second module.
+  #
+  # Enters the module with working-directory rather than naming a root-relative
+  # path: there is deliberately no go.work (a workspace would couple the product's
+  # dependency resolution to this helper's manifest), and without one a
+  # root-relative module pattern does not resolve. Same form as `make test`.
+  proto-validate-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Vet test/proto-validate (nested module)
+        working-directory: test/proto-validate
+        run: go vet ./...
+
+      - name: Test test/proto-validate (nested module)
+        working-directory: test/proto-validate
+        run: go test -race ./...
 
   # Fails when a comment changed by this PR guarantees a state cannot occur without
   # naming the test that pins it. See scripts/check-unreachability-claims.sh for the

@@ -14,8 +14,17 @@ LDFLAGS   := -s -w -X main.version=$(VERSION) -X main.gitCommit=$(GIT_COMMIT) -X
 build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/vespasian
 
+# ./... does NOT reach test/proto-validate: it is a separate module (so that
+# protocompile stays out of the shipped module's require list) and a package
+# pattern stops at the module boundary. There is deliberately NO go.work -- a
+# workspace would couple the product's dependency resolution to a live-test
+# helper's manifest -- so the module is entered with `cd` rather than named by a
+# root-relative path, which is the only form that works without one. The second
+# line is load-bearing: without it the AC4 helper's tests simply do not run.
+# CI covers the same ground in ci.yml's proto-validate-tests job.
 test:
 	go test -race ./...
+	cd test/proto-validate && go test -race ./...
 
 # Integration-tagged tests. Separate from `test` because these need a real Chrome,
 # so a developer without one can still run `make test`/`make check`. That is why
@@ -30,8 +39,11 @@ test:
 test-integration:
 	go test -race -tags=integration ./...
 
+# golangci-lint resolves one module per invocation, so the nested
+# test/proto-validate module needs its own run from inside its directory.
 lint:
 	golangci-lint run
+	cd test/proto-validate && golangci-lint run
 
 # Fails when a comment guarantees a state cannot occur without naming the test that
 # pins it. Scoped to comment BLOCKS whose lines changed against BASE_REF (default
@@ -58,8 +70,11 @@ lint-comments-all:
 fmt:
 	gofmt -s -w .
 
+# Same reason as `test`: a separate module, entered with `cd` because there is no
+# workspace to make a root-relative pattern reach it.
 vet:
 	go vet ./...
+	cd test/proto-validate && go vet ./...
 
 # The scan the `security / Gosec` job runs, so a finding can be reproduced locally;
 # that job no longer passes -no-fail. Run through `go run @$(GOSEC_VERSION)` rather
@@ -84,6 +99,7 @@ coverage:
 deps:
 	go mod download
 	go mod tidy
+	cd test/proto-validate && go mod tidy
 
 clean:
 	rm -rf $(BUILD_DIR) dist coverage.out

@@ -176,7 +176,10 @@ vespasian generate grpc capture.json --dangerous-allow-private -o lab.proto
 The generated `lab.proto` declares the discovered services and their RPCs
 (including the server-streaming method's `stream` return marker) and compiles
 with `protoc`. The live-test harness (`test/run-live-tests.sh`) runs exactly
-this flow, then verifies the emitted spec compiles with `protoc`.
+this flow, then verifies the emitted spec compiles — using `test/proto-validate`,
+which compiles it in-process with `bufbuild/protocompile`. No `protoc` is
+required to run the harness (LAB-5549); see `test/README.md` for why the
+external dependency was removed rather than provisioned.
 
 For a TLS target presenting a self-signed or internal-CA certificate, add
 `--grpc-insecure-skip-verify` (see [SSRF and TLS](#ssrf-and-tls)); it is not

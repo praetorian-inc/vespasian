@@ -7,6 +7,17 @@ updates:
     commit-message:
       prefix: "deps"
 
+  # test/proto-validate is a separate module (see test/proto-validate/go.mod), and
+  # a `directory: /` entry does not reach a nested manifest -- it would never get
+  # an update PR. Already visible as drift: the root pins protobuf v1.36.12 while
+  # this module resolved v1.34.2.
+  - package-ecosystem: gomod
+    directory: /test/proto-validate
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

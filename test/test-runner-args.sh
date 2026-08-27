@@ -100,15 +100,19 @@ mapfile -t DISPATCH_TARGETS < <(
     ' "$RUNNER" | sort
 )
 
-# Targets that are intentionally not in either group (config-driven).
-CONFIG_ONLY=(grpc-server)
-
 # ungrouped_dispatch_targets prints any of the given targets that are absent
-# from OFFLINE_TARGETS, LIVE_TARGETS, and CONFIG_ONLY. This is the real
-# coverage check shared by the drift guard and its negative self-test, so a
-# regression here trips both — not just a hand-written copy of the loop.
+# from OFFLINE_TARGETS and LIVE_TARGETS. This is the real coverage check shared
+# by the drift guard and its negative self-test, so a regression here trips
+# both — not just a hand-written copy of the loop.
+#
+# There is deliberately no config-only tier any more. It existed for exactly one
+# target, grpc-server, and its only effect was to exempt that target from the
+# "every dispatch target is grouped" check — which is precisely why grpc-server
+# ran on no PR for the life of the epic (LAB-5549). Requiring every dispatch
+# target to name a group makes this guard strictly stronger, and means a future
+# target cannot be added without deciding where it runs.
 ungrouped_dispatch_targets() {
-    local grouped=("${OFFLINE_TARGETS[@]}" "${LIVE_TARGETS[@]}" "${CONFIG_ONLY[@]}")
+    local grouped=("${OFFLINE_TARGETS[@]}" "${LIVE_TARGETS[@]}")
     local target
     for target in "$@"; do
         if ! printf '%s\n' "${grouped[@]}" | grep -qx "$target"; then
@@ -138,7 +142,7 @@ report_undispatched_group_members() {
     local target
     while IFS= read -r target; do
         [[ -z "$target" ]] && continue
-        fail "Grouped/config-only target '$target' has no case-dispatch entry in run-live-tests.sh"
+        fail "Grouped target '$target' has no case-dispatch entry in run-live-tests.sh"
     done < <(undispatched_group_members "$@")
 }
 
@@ -146,7 +150,7 @@ report_ungrouped_dispatch_targets() {
     local target
     while IFS= read -r target; do
         [[ -z "$target" ]] && continue
-        fail "Dispatch target '$target' is not in OFFLINE_TARGETS, LIVE_TARGETS, or CONFIG_ONLY"
+        fail "Dispatch target '$target' is not in OFFLINE_TARGETS or LIVE_TARGETS"
     done < <(ungrouped_dispatch_targets "$@")
 }
 
@@ -163,13 +167,14 @@ else
     fail "DISPATCH_TARGETS extraction is broken/empty (sentinel 'rest-api' missing)"
 fi
 
-# Every group member AND config-only target must have a case-dispatch entry
-# (direction a). Including CONFIG_ONLY means grpc-server cannot silently lose its
-# dispatch arm while staying config-only — which would send `--targets grpc-server`
-# to the unknown-target path.
-report_undispatched_group_members "${OFFLINE_TARGETS[@]}" "${LIVE_TARGETS[@]}" "${CONFIG_ONLY[@]}"
+# Every group member must have a case-dispatch entry (direction a), so a target
+# cannot be listed in a group while `--targets <it>` falls through to the
+# unknown-target path. The call below is what enforces that: if the guarantee
+# ever becomes false, `report_undispatched_group_members` emits the
+# "in a group but has no case-dispatch entry" failure and this suite fails.
+report_undispatched_group_members "${OFFLINE_TARGETS[@]}" "${LIVE_TARGETS[@]}"
 
-# Every dispatch target must be in a group or in CONFIG_ONLY (direction b).
+# Every dispatch target must be in a group (direction b).
 report_ungrouped_dispatch_targets "${DISPATCH_TARGETS[@]}"
 
 # No target should appear in both groups.
@@ -181,44 +186,583 @@ done
 
 group_count=$(( ${#OFFLINE_TARGETS[@]} + ${#LIVE_TARGETS[@]} ))
 dispatch_count=${#DISPATCH_TARGETS[@]}
-config_count=${#CONFIG_ONLY[@]}
 
 # Belt-and-suspenders count assertion: with robust extraction the arm count must
-# equal grouped + config-only. This catches drift the per-target loops cannot —
-# e.g. an accidental duplicate arm, or a target both grouped and extracted but
+# equal the grouped count exactly. This catches drift the per-target loops cannot
+# — e.g. an accidental duplicate arm, or a target both grouped and extracted but
 # miscounted — by comparing totals directly instead of per-target membership.
-if [[ $(( group_count + config_count )) -ne "$dispatch_count" ]]; then
-    fail "Coverage count mismatch: groups (${group_count}) + config-only (${config_count}) != dispatch (${dispatch_count})"
+if [[ "$group_count" -ne "$dispatch_count" ]]; then
+    fail "Coverage count mismatch: grouped (${group_count}) != dispatch (${dispatch_count})"
 fi
 
 if [[ "$FAIL" -eq "$drift_fail_before" ]]; then
-    pass "Groups (${group_count}) + config-only (${config_count}) cover all dispatch targets (${dispatch_count})"
+    pass "Groups (${group_count}) cover all dispatch targets (${dispatch_count})"
 fi
 
 echo ""
-echo "=== Absolute group-size anchors (AC#3: 21 offline + 10 live = 31) ==="
+echo "=== Absolute group-size anchors (AC#3: 21 offline + 11 live = 32) ==="
 
 # Pin concrete group sizes as literals, independent of the sourced arrays. The
 # behavioral --group tests derive expected from the same OFFLINE_TARGETS/
 # LIVE_TARGETS under test, so a coordinated silent target drop shrinks expected
 # and actual in lockstep and passes green. These literals encode the LAB-4773
-# AC#3 contract ("all 31 targets still run") so any such drop trips here.
+# AC#3 contract — "all grouped targets still run", 32 of them as of LAB-5549 —
+# so any such drop trips here.
 # (LAB-3890 T2 added scan-rest; LAB-3269 added forms-target; LAB-4999 added the
-# live-only no-download egress guard: 21 offline + 10 live = 31 total.)
+# live-only no-download egress guard; LAB-5549 moved grpc-server out of the
+# config-only tier and into LIVE_TARGETS: 21 offline + 11 live = 32 total.)
 if [[ "${#OFFLINE_TARGETS[@]}" -eq 21 ]]; then
     pass "OFFLINE_TARGETS has exactly 21 members"
 else
     fail "OFFLINE_TARGETS count drifted: expected 21, got ${#OFFLINE_TARGETS[@]}"
 fi
-if [[ "${#LIVE_TARGETS[@]}" -eq 10 ]]; then
-    pass "LIVE_TARGETS has exactly 10 members"
+if [[ "${#LIVE_TARGETS[@]}" -eq 11 ]]; then
+    pass "LIVE_TARGETS has exactly 11 members"
 else
-    fail "LIVE_TARGETS count drifted: expected 10, got ${#LIVE_TARGETS[@]}"
+    fail "LIVE_TARGETS count drifted: expected 11, got ${#LIVE_TARGETS[@]}"
 fi
-if [[ "$group_count" -eq 31 ]]; then
-    pass "Grouped targets total 31 (AC#3: all 31 targets still run)"
+if [[ "$group_count" -eq 32 ]]; then
+    pass "Grouped targets total 32 (AC#3: all 32 targets still run)"
 else
-    fail "Grouped-target total drifted: expected 31, got $group_count"
+    fail "Grouped-target total drifted: expected 32, got $group_count"
+fi
+
+echo ""
+echo "=== Live group is startable by setup-live-targets.sh ==="
+
+# grpc-server is in LIVE_TARGETS, so `--group live` now runs it on every PR with
+# no TARGETS_SETUP or --targets override (LAB-5549). That only works because a
+# bare `./test/setup-live-targets.sh` — exactly what live-tests.yml runs — starts
+# it, which it does by defaulting --targets to ALL_TARGETS. If grpc-server were
+# dropped from setup's ALL_TARGETS while staying in LIVE_TARGETS, the runner
+# would probe a server nobody started and the target would fail on an unset
+# port rather than on anything about gRPC. This pins that cross-script seam;
+# ALL_TARGETS is sourced from setup-live-targets.sh above.
+#
+# Written as ONE assertion on every path, with a third arm, rather than as an
+# `if in LIVE_TARGETS` wrapper with no else. Wrapped, this was the only assertion
+# in the file whose EXISTENCE depended on the data it asserts about: drop
+# grpc-server from LIVE_TARGETS and it emitted neither pass nor fail, so the
+# accounting pin below failed with "a case was added or removed without updating
+# EXPECTED_ASSERTIONS" — blaming test maintenance for a real coverage regression.
+# The third arm names the actual cause instead.
+if ! printf '%s\n' "${LIVE_TARGETS[@]}" | grep -qx 'grpc-server'; then
+    fail "grpc-server left LIVE_TARGETS — this guard and the LAB-5549 rationale (gRPC runs by default) need revisiting"
+elif printf '%s' "$ALL_TARGETS" | tr ',' '\n' | grep -qx 'grpc-server'; then
+    pass "grpc-server is in LIVE_TARGETS and startable by setup-live-targets.sh"
+else
+    fail "grpc-server is in LIVE_TARGETS but absent from setup-live-targets.sh ALL_TARGETS"
+fi
+
+echo ""
+echo "=== gRPC preflight probe arms (_probe_grpc_target) ==="
+
+# _probe_grpc_target decides whether the whole live run aborts
+# (preflight_test_host ends in `exit 1`), and its arms are mutually exclusive on
+# tool availability, so on any given machine at most ONE of them ever executes:
+# CI exercises whichever of grpcurl/nc/timeout the runner image happens to ship
+# and the rest are dead in practice. That is the same environment-dependent,
+# never-executed-where-it-matters shape LAB-5549 removed from the protoc gate, so
+# it is not left to the runner image here. Each arm is driven with executable
+# fixtures on a controlled PATH — the pattern the load_config value-validation
+# block below already uses.
+#
+# The function text is extracted to a file BEFORE the PATH is restricted, because
+# `sed` would not be resolvable inside the sandbox; `source` is a builtin and
+# needs no PATH.
+probe_fn=$(new_tmp)
+sed -n '/^_probe_grpc_target()/,/^}/p' "$RUNNER" > "$probe_fn"
+
+# The sandbox holds ONLY bash (needed by the /dev/tcp arm). Everything else the
+# function looks for is absent unless a scenario dir supplies it, which is what
+# makes "grpcurl absent" and "no bounded probe available" reachable at all — a
+# real /usr/bin on PATH would supply the host's own nc or timeout and silently
+# route every case into one arm.
+probe_base="$TMPDIR_T/probe-base"
+mkdir -p "$probe_base"
+ln -s "$(command -v bash)" "$probe_base/bash"
+
+# The stub RECORDS its argv before exiting. Without that the probe assertions
+# below can only observe reachability and exit status, which leaves every
+# timeout bound deletable undetected: dropping `-max-time`, dropping `-w`, or
+# widening `budget` all keep the suite at its pin while removing the property
+# the bounds exist to provide. The whole point of this probe is that it fails
+# FAST, so the bound is the behaviour under test, not an implementation detail.
+new_probe_dir() { # $1 = tool name, $2 = exit status
+    local d
+    d="$TMPDIR_T/probe-$1-$2"
+    mkdir -p "$d"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "%s/argv-%s.log"\nexit %s\n' "$TMPDIR_T" "$1" "$2" > "$d/$1"
+    chmod +x "$d/$1"
+    printf '%s' "$d"
+}
+d_grpcurl_ok=$(new_probe_dir grpcurl 0)
+d_grpcurl_fail=$(new_probe_dir grpcurl 1)
+d_nc_ok=$(new_probe_dir nc 0)
+# A real timeout replacement: drop the budget argument and exec the rest, so the
+# /dev/tcp arm actually runs its `bash -c` payload.
+# Delegates to the REAL timeout binary by absolute path so the fixture actually
+# BOUNDS the probe. The earlier `shift; exec "$@"` form discarded the budget, so
+# every assertion below ran unbounded: fine against a closed loopback port (which
+# refuses instantly) but a hang against a filtered one, in the very block written
+# to prove this probe cannot hang.
+d_timeout="$TMPDIR_T/probe-timeout"
+mkdir -p "$d_timeout"
+_real_timeout=$(command -v timeout || true)
+if [ -n "$_real_timeout" ]; then
+    printf '#!/bin/sh\nexec %s "$@"\n' "$_real_timeout" > "$d_timeout/timeout"
+else
+    printf '#!/bin/sh\nshift\nexec "$@"\n' > "$d_timeout/timeout"
+fi
+chmod +x "$d_timeout/timeout"
+
+# Runs _probe_grpc_target under a restricted PATH, echoing "rc=<status>" after
+# the function's own output so both are assertable. `|| rc=$?` is required: this
+# suite runs under `set -e`, so a returning-1 arm would otherwise abort the
+# subshell before the status was printed.
+run_probe() { # $1 = PATH, $2 = TEST_HOST, $3 = port
+    (
+        PATH="$1"
+        export PATH
+        source "$SCRIPT_DIR/common.sh"
+        source "$probe_fn"
+        declare -F _probe_grpc_target >/dev/null || { echo "SENTINEL_PROBE_MISSING"; exit 0; }
+        TEST_HOST="$2"
+        rc=0
+        _probe_grpc_target "$3" || rc=$?
+        echo "rc=$rc"
+    ) 2>&1
+}
+
+# The fixture must actually BOUND, not just forward. Reverting it to the earlier
+# `shift; exec "$@"` form changed no assertion, leaving the block that proves this
+# probe cannot hang running unbounded itself.
+if [ -n "$_real_timeout" ] && grep -q "exec $_real_timeout" "$d_timeout/timeout"; then
+    pass "probe timeout fixture delegates to the real timeout binary (it bounds, not just forwards)"
+elif [ -z "$_real_timeout" ]; then
+    pass "probe timeout fixture: no timeout binary on this host, unbounded fallback is the documented degraded arm"
+else
+    fail "probe timeout fixture no longer execs the real timeout binary — the bounded-probe assertions below would run unbounded"
+fi
+
+# Guard the extraction itself: an empty or broken sed range would make every
+# assertion below vacuous rather than failing.
+if [[ "$(run_probe "$probe_base" localhost "")" == *SENTINEL_PROBE_MISSING* ]]; then
+    fail "_probe_grpc_target extraction is broken/empty — the probe-arm assertions below are vacuous"
+else
+    pass "_probe_grpc_target sourced from run-live-tests.sh (probe-arm block)"
+fi
+
+# Arm 1: port unset. Mirrors _probe_target_host's contract — a target
+# setup-live-targets.sh never configured is not a failure.
+out=$(run_probe "$probe_base" localhost "")
+if [[ "$out" == "rc=0" ]]; then
+    pass "_probe_grpc_target: unset port returns 0 with no log output"
+else
+    fail "_probe_grpc_target: unset port expected bare 'rc=0', got: $out"
+fi
+
+# Arm 2: grpcurl present and answering.
+out=$(run_probe "$d_grpcurl_ok:$probe_base" localhost 50051)
+if [[ "$out" == *"grpc-server reachable at localhost:50051"* && "$out" == *"rc=0"* ]]; then
+    pass "_probe_grpc_target: grpcurl success reports reachable and returns 0"
+else
+    fail "_probe_grpc_target: grpcurl success arm, got: $out"
+fi
+
+# The BOUND, not just the outcome. `-max-time` is the only thing making the
+# grpcurl arm fail fast; deleting it leaves every reachability assertion above
+# green while restoring the hang this probe exists to prevent.
+# Adjacency, not mere presence: assert the value that FOLLOWS the flag. Two
+# independent greps pass whenever a bare "5" appears anywhere else in argv, which
+# is a latent hole rather than one this harness reaches today -- its fixtures use
+# port 50051, so the loose form does catch a widened budget here. Pinned on
+# adjacency anyway because the property under test is "the budget is 5", and a
+# harness that later probed port 5 would silently stop testing it.
+if [ "$(grep -A1 -x -- '-max-time' "$TMPDIR_T/argv-grpcurl.log" 2>/dev/null | tail -1)" = "5" ]; then
+    pass "_probe_grpc_target: grpcurl arm passes -max-time 5 (bound is asserted, not just the outcome)"
+else
+    fail "_probe_grpc_target: grpcurl arm must pass '-max-time 5'; recorded argv: $(tr '\n' ' ' < "$TMPDIR_T/argv-grpcurl.log" 2>/dev/null)"
+fi
+
+# Arm 3: grpcurl present and refusing. grpcurl is authoritative when present —
+# it must NOT fall through to the weaker nc/dev-tcp arms.
+out=$(run_probe "$d_grpcurl_fail:$d_nc_ok:$probe_base" localhost 50051)
+if [[ "$out" == *"grpc-server is unreachable at localhost:50051"* && "$out" == *"rc=1"* && "$out" != *"(nc)"* ]]; then
+    pass "_probe_grpc_target: grpcurl failure returns 1 without falling through to nc"
+else
+    fail "_probe_grpc_target: grpcurl failure arm, got: $out"
+fi
+
+# Arm 4: no grpcurl, nc answers.
+out=$(run_probe "$d_nc_ok:$probe_base" localhost 50051)
+if [[ "$out" == *"grpc-server reachable at localhost:50051 (nc)"* && "$out" == *"rc=0"* ]]; then
+    pass "_probe_grpc_target: nc success reports reachable via nc and returns 0"
+else
+    fail "_probe_grpc_target: nc success arm, got: $out"
+fi
+
+# Same reasoning as the grpcurl bound above: `-w` is what makes the nc arm
+# finite. This is the arm CI actually takes when grpc-server is down, because
+# ubuntu-24.04 ships nc but not grpcurl.
+# Adjacency for the same reason as the grpcurl bound above.
+if [ "$(grep -A1 -x -- '-w' "$TMPDIR_T/argv-nc.log" 2>/dev/null | tail -1)" = "5" ]; then
+    pass "_probe_grpc_target: nc arm passes -w 5 (bound is asserted, not just the outcome)"
+else
+    fail "_probe_grpc_target: nc arm must pass '-w 5'; recorded argv: $(tr '\n' ' ' < "$TMPDIR_T/argv-nc.log" 2>/dev/null)"
+fi
+
+# Arm 5: nothing bounded available. This must FAIL rather than degrade to an
+# unbounded connect — a preflight exists to fail fast, so a hang is strictly
+# worse than a diagnosable failure (a deliberate divergence from the
+# graceful-degrade precedent in setup-live-targets.sh's wait_for_grpc).
+out=$(run_probe "$probe_base" localhost 50051)
+if [[ "$out" == *"no bounded probe available for localhost:50051"* && "$out" == *"rc=1"* ]]; then
+    pass "_probe_grpc_target: no bounded probe available fails and names the missing tools"
+else
+    fail "_probe_grpc_target: no-bounded-probe arm, got: $out"
+fi
+
+# The /dev/tcp arm's own failure outcome. Port 1 on loopback has no listener, so
+# the connect fails without this suite starting anything -- the assertion stays
+# hermetic. It pins the arm's `return 1`: flipping that to `return 0` makes an
+# unreachable gRPC target report success and the whole preflight pointless, and
+# without this assertion that mutation survives the entire suite.
+out=$(run_probe "$d_timeout:$probe_base" 127.0.0.1 1)
+if [[ "$out" == *"grpc-server is unreachable at 127.0.0.1:1"* && "$out" == *"rc=1"* ]]; then
+    pass "_probe_grpc_target: /dev/tcp arm reports unreachable and returns 1 on a closed port"
+else
+    fail "_probe_grpc_target: /dev/tcp closed-port arm expected unreachable + rc=1, got: $out"
+fi
+
+# Arms 6-7: the /dev/tcp arm must not let TEST_HOST reach a shell PARSER.
+# `bash -c` parses its argument as shell source, so an interpolated
+# "${TEST_HOST}/${port}" would execute anything TEST_HOST carries. TEST_HOST is an
+# env-only seam and the port is unvalidated when it comes from the environment, so
+# neither value is screened before this call.
+#
+# The payload uses only the `printf` builtin and a redirect — no external command
+# — because the sandbox PATH holds nothing else. A payload needing /usr/bin/touch
+# would be inert here for the wrong reason and the assertion could never fail.
+probe_marker="$TMPDIR_T/probe-injection-marker"
+hostile_host="x/1; printf pwned > $probe_marker #"
+
+# Positive control FIRST: prove the payload really does fire against the
+# vulnerable interpolated form. Without this, the negative assertion below cannot
+# be distinguished from a payload that never had a chance to run.
+rm -f "$probe_marker"
+( PATH="$d_timeout:$probe_base"; export PATH
+  timeout 5 bash -c "echo > /dev/tcp/${hostile_host}/50051" ) >/dev/null 2>&1 || true
+if [[ -f "$probe_marker" ]]; then
+    pass "_probe_grpc_target: injection payload fires against the interpolated form (positive control — this assertion can fail)"
+else
+    fail "_probe_grpc_target: injection payload did not fire even against the interpolated form — the hostile-TEST_HOST assertion below would be vacuous"
+fi
+
+# The real assertion: the shipped function must NOT execute it.
+rm -f "$probe_marker"
+out=$(run_probe "$d_timeout:$probe_base" "$hostile_host" 50051)
+if [[ ! -f "$probe_marker" ]]; then
+    pass "_probe_grpc_target: hostile TEST_HOST is not executed by the /dev/tcp probe"
+else
+    fail "_probe_grpc_target: hostile TEST_HOST was EXECUTED by the /dev/tcp probe (command injection); output: $out"
+fi
+rm -f "$probe_marker"
+
+echo ""
+echo "=== Env-seam validation (TEST_HOST / GRPC_SERVER_PORT) ==="
+
+# run-live-tests.sh refuses to run on a TEST_HOST that is not a plain hostname,
+# IPv4 or bracketed IPv6, and on a GRPC_SERVER_PORT outside 1-65535. Both values
+# flow into a curl URL, a grpcurl authority, an nc operand and a `bash -c` argv,
+# so this seam is what keeps every one of those sinks fed only screened values.
+# It shipped with no assertion at all: deleting the whole block left the suite
+# green, which is the "guard that cannot fail" shape this file exists to prevent.
+#
+# Each case runs in its own `bash -c` subshell, so the seam's `exit 1` terminates
+# that subshell and not this suite.
+# Captures the STATUS as well as the message. Matching only the text pinned the
+# wording, not the refusal: deleting `exit 1` from the seam left the message on
+# stderr and the suite green, and that mutant is genuinely broken because the
+# /dev/tcp argv comment now rests on the seam actually stopping the run.
+seam_rc=0
+seam_hostile=$(TEST_HOST='x/1; id #' bash -c "source '$RUNNER' --group offline --dry-run" 2>&1) || seam_rc=$?
+if [[ "$seam_hostile" == *"refusing to run"* ]] && [ "$seam_rc" -ne 0 ] && [[ "$seam_hostile" != *"targets="* ]]; then
+    pass "env seam: TEST_HOST carrying shell metacharacters is refused (non-zero status, no target list)"
+else
+    fail "env seam: a TEST_HOST containing ';' and '#' must abort with non-zero status and emit no target list; rc=$seam_rc, got: $seam_hostile"
+fi
+
+# TEST-005: one payload pinned one character class. This payload ENDS in '#', so
+# the trailing-character rule alone rejected it and the middle of the pattern was
+# never exercised; and admitting a leading dash -- which the seam comment calls
+# "the point of the second pattern" -- changed no assertion at all.
+for seam_bad in '-X' 'a b' 'foo$(id)bar' 'ho`id`st'; do
+    rc=0
+    out=$(TEST_HOST="$seam_bad" bash -c "source '$RUNNER' --group offline --dry-run" 2>&1) || rc=$?
+    if [[ "$out" == *"refusing to run"* ]] && [ "$rc" -ne 0 ]; then
+        pass "env seam: TEST_HOST '${seam_bad}' is refused"
+    else
+        fail "env seam: TEST_HOST '${seam_bad}' must be refused; rc=$rc, got: $out"
+    fi
+done
+
+# Accept-direction cases. A validator that rejects a documented value breaks every
+# run that uses it, so both the devcontainer form and the bracketed IPv6 literal
+# are pinned. Deleting the `\[[0-9A-Fa-f:]+\]` alternative from the seam pattern
+# previously changed no assertion, so the documented IPv6 form could have been
+# refused silently.
+for seam_good in 'host.docker.internal' '127.0.0.1' '[::1]'; do
+    if out=$(TEST_HOST="$seam_good" bash -c "source '$RUNNER' --group offline --dry-run" 2>&1) &&
+       [[ "$out" != *"refusing to run"* && "$out" == *"targets="* ]]; then
+        pass "env seam: documented TEST_HOST '${seam_good}' is accepted"
+    else
+        fail "env seam: TEST_HOST '${seam_good}' must be accepted — the validator cannot reject a documented value; got: $out"
+    fi
+done
+
+# host_bare strips the brackets a bracketed IPv6 literal carries, because nc and
+# bash's /dev/tcp take a bare host and REJECT them while curl and grpcurl require
+# them. Deleting the stripping changed no assertion, so this drives the real
+# function and asserts the probe reports the BARE form.
+# Asserted on the RECORDED ARGV, not the log line: the log deliberately echoes the
+# operator's TEST_HOST verbatim (brackets and all) so the diagnostic names what
+# they set, while the stripping applies only to what reaches the bare-host
+# consumers. Matching the log would pin the wrong surface.
+rm -f "$TMPDIR_T/argv-nc.log"
+run_probe "$d_nc_ok:$probe_base" '[::1]' 50051 >/dev/null
+if grep -qx -- '::1' "$TMPDIR_T/argv-nc.log" 2>/dev/null; then
+    pass "_probe_grpc_target: bracketed IPv6 TEST_HOST reaches nc as the bare '::1' it accepts"
+else
+    fail "_probe_grpc_target: TEST_HOST='[::1]' must reach nc as '::1' (nc rejects brackets); recorded argv: $(tr '\n' ' ' < "$TMPDIR_T/argv-nc.log" 2>/dev/null)"
+fi
+
+# Four cases, not one. With only 99999 pinned, deleting BOTH the `^[0-9]{1,5}$`
+# shape check and the `-lt 1` bound left the suite green while admitting 0, -1 and
+# abc into a curl URL and into grpcurl/nc argv.
+for seam_port_bad in 99999 0 -1 abc; do
+    rc=0
+    out=$(GRPC_SERVER_PORT="$seam_port_bad" bash -c "source '$RUNNER' --group offline --dry-run" 2>&1) || rc=$?
+    if [[ "$out" == *"refusing to run"* ]] && [ "$rc" -ne 0 ]; then
+        pass "env seam: GRPC_SERVER_PORT '${seam_port_bad}' is refused"
+    else
+        fail "env seam: GRPC_SERVER_PORT '${seam_port_bad}' must be refused; rc=$rc, got: $out"
+    fi
+done
+
+echo ""
+echo "=== AC4 compile check is unconditional (LAB-5549's whole point) ==="
+
+# LAB-5549 exists because the AC4 compile assertion was gated on
+# `command -v protoc` and therefore passed by NEVER RUNNING. Removing that gate
+# is the deliverable, so the property worth pinning is not "the check works" but
+# "the check cannot opt itself out again". Both regressions below are one-line
+# edits that leave every other assertion in this suite green.
+# Whole comment LINES are dropped; a `#` inside a code line is left alone. The
+# block's own comments narrate the removed `command -v protoc` gate at length, so
+# matching raw text reports that history as a live gate -- this assertion failed
+# on a correct tree the first time it ran. But truncating each line at its first
+# `#` over-corrects: a gate written as `... "#" ... || ! command -v protoc` would
+# be silently erased along with the comment, hiding exactly what this checks for.
+# `|| true` is load-bearing: grep exits 1 when it filters everything out, and
+# under `set -e` a failing command substitution aborts the whole suite. Without
+# it a broken sed anchor killed the run mid-file -- the completion sentinel
+# caught it, but reported "terminated before reaching the summary" instead of the
+# real cause, which is the misattributed-diagnostic failure this file warns about
+# elsewhere. With it, a broken anchor becomes the counted failure below.
+ac4_block=$(sed -n '/# AC4 (LAB-2778)/,/^    local expected_count/p' "$RUNNER" | grep -vE '^[[:space:]]*#' || true)
+
+# Fidelity sentinel, matching the four sibling extractions in this file. Without
+# it an anchor that stops matching yields an EMPTY block, and assertion (a) below
+# -- which passes when it finds no capability gate -- passes vacuously on nothing.
+if [ -n "$ac4_block" ] && printf '%s' "$ac4_block" | grep -q 'proto-validate'; then
+    pass "AC4 block extracted from run-live-tests.sh (assertions below are non-vacuous)"
+else
+    fail "AC4 block extraction is broken/empty — the two assertions below would pass vacuously; fix the sed anchors rather than deleting them"
+fi
+
+# (a) BEHAVIOURAL, not textual. Three earlier revisions of this check grepped the
+# block's source and mis-fired every time: first matching `command -v protoc`
+# inside the comments that narrate its removal, then over-correcting by truncating
+# each line at its first `#` (which would erase a real gate written beside one),
+# and then going red on a harmless trailing comment. The property is not "the text
+# contains no gate" -- it is "the compile assertion evaluates on a host with no
+# protoc", which is exactly CI's state. So run it there.
+#
+# A stripped PATH holding only the interpreters and go makes protoc genuinely
+# absent regardless of this host, then a deliberately MALFORMED spec must be
+# reported as a failure. A reintroduced `command -v protoc ||` gate short-circuits
+# and reports success instead, which this catches on any host.
+# Drives the AC4 BLOCK ITSELF, on a PATH where protoc is genuinely absent. The
+# first attempt at this ran the validator binary directly, which tests the wrong
+# subject: the gate would live in the SHELL, so mutating the shell changed nothing
+# and the mutation survived. Extract the block, stub the loggers, feed it a
+# MALFORMED spec, and assert it counts a failure. A reintroduced
+# `! command -v protoc ||` short-circuits to success on a protoc-absent host,
+# which is precisely CI's state.
+# Driven with a STUB validator, not the real toolchain. The property under test is
+# the BLOCK's control flow -- does it invoke the validator, and does it count the
+# result -- not whether protocompile works, which test/proto-validate's own unit
+# tests and ci.yml's proto-validate-tests job already cover.
+#
+# That distinction is load-bearing for WHERE this suite runs. Requiring a real
+# `go run` put a Go toolchain AND a module-proxy fetch inside live-tests.yml's
+# `preflight-selftest` job, which has no setup-go and whose documented property is
+# that these suites need "no Go, Node, or Chrome" (AGENTS.md). Measured: with
+# GOPROXY=off and an empty module cache the real-toolchain form FAILED, and the
+# LAB-4732 egress audit->block flip would have made that CI's steady state, with a
+# message blaming run-live-tests.sh.
+#
+# The stub is also STRICTLY STRONGER: it records that it was CALLED, so the
+# round-4 vacuity (the block failing before ever reaching the validator) is caught
+# directly rather than inferred from an exit status.
+# WRAPPED IN A FUNCTION. The block declares `local spec_abs`, and `local` outside a
+# function is a hard error: sourced at top level that assignment failed, the
+# compound command died before the validator was reached, and failures=1 came back
+# for every input -- so a single-direction assertion passed vacuously. That was the
+# round-4 defect in this very guard.
+ac4_fn=$(new_tmp)
+{
+    printf '_ac4_block() {\n'
+    sed -n '/# AC4 (LAB-2778)/,/^    local expected_count/p' "$RUNNER" | sed '$d'
+    printf '}\n'
+} > "$ac4_fn"
+
+# Guard the extraction: a broken end anchor would otherwise wrap ~1000 lines of the
+# runner into the function and source it.
+if [ -s "$ac4_fn" ] && grep -q 'proto-validate' "$ac4_fn" && [ "$(wc -l < "$ac4_fn")" -lt 120 ]; then
+    pass "AC4 block extracted and wrapped for execution (bounded, non-empty)"
+else
+    fail "AC4 block extraction is empty, oversized ($(wc -l < "$ac4_fn") lines), or missing its proto-validate call — the behavioural assertions below cannot be trusted"
+fi
+
+ac4_bin="$TMPDIR_T/ac4-bin"; mkdir -p "$ac4_bin"
+for _t in sh bash sed grep dirname basename cat rm mkdir uname env tr printf; do
+    _p=$(command -v "$_t" 2>/dev/null) && ln -sf "$_p" "$ac4_bin/$_t"
+done
+# Fake `go`: records its argv, then exits with the status in AC4_STUB_RC.
+cat > "$ac4_bin/go" <<'AC4GO'
+#!/bin/sh
+printf '%s\n' "$*" >> "$AC4_STUB_LOG"
+exit "${AC4_STUB_RC:-0}"
+AC4GO
+chmod +x "$ac4_bin/go"
+
+ac4_dir="$TMPDIR_T/ac4-run"; mkdir -p "$ac4_dir"
+ac4_stub_log="$TMPDIR_T/ac4-stub.log"
+
+ac4_run() { # $1 = stub exit status
+    : > "$ac4_stub_log"
+    printf 'syntax = "proto3";\nmessage M { string a = 1; }\n' > "$ac4_dir/spec.proto"
+    PATH="$ac4_bin" AC4_ROOT="$SCRIPT_DIR/.." AC4_DIR="$ac4_dir" AC4_FN="$ac4_fn" \
+    AC4_STUB_RC="$1" AC4_STUB_LOG="$ac4_stub_log" \
+    "$ac4_bin/bash" -c '
+        log_ok(){ printf "OK:%s\n" "$1"; }
+        log_fail(){ printf "FAIL:%s\n" "$1"; }
+        log_info(){ printf "INFO:%s\n" "$1"; }
+        failures=0
+        PROJECT_ROOT="$AC4_ROOT"
+        target_dir="$AC4_DIR"
+        spec_file="$AC4_DIR/spec.proto"
+        source "$AC4_FN"
+        _ac4_block
+        printf "failures=%s\n" "$failures"
+    ' 2>&1 || true
+}
+
+ac4_pass_out=$(ac4_run 0); ac4_pass_log=$(cat "$ac4_stub_log" 2>/dev/null)
+ac4_fail_out=$(ac4_run 1)
+
+# The validator must actually be INVOKED. This is the anti-vacuity property: the
+# round-4 guard failed before reaching it and still reported failures=1.
+if printf '%s' "$ac4_pass_log" | grep -q 'run \.'; then
+    pass "AC4 block actually invokes the proto validator (\`go run .\` observed, not inferred)"
+else
+    fail "AC4 block never invoked the validator — the compile assertion is not running at all. Stub log: [$ac4_pass_log]"
+fi
+
+# And it must COUNT the result in both directions.
+if [[ "$ac4_pass_out" == *"failures=0"* ]] && [[ "$ac4_fail_out" == *"failures=1"* ]]; then
+    pass "AC4 block counts the validator's verdict: success -> failures=0, failure -> failures=1"
+else
+    fail "AC4 block must map the validator's exit status onto failures (0 and 1). success=[$ac4_pass_out] failure=[$ac4_fail_out]"
+fi
+
+# (b) Every non-success arm must count a failure. A branch that neither compiles
+# nor increments `failures` reports PASS with AC4 never evaluated -- the same
+# false green as the protoc gate, triggered by artifact content instead. The
+# multi-file `// ---` arm is the one that changed skip->fail; log_info alone
+# there would silently restore the hole.
+multifile_arm=$(printf '%s' "$ac4_block" | sed -n "/grep -q /,/elif/p")
+if printf '%s' "$multifile_arm" | grep -q 'failures=$((failures + 1))'; then
+    pass "AC4 multi-file '// ---' arm counts a failure (cannot report PASS with the compile check unevaluated)"
+else
+    fail "AC4 multi-file '// ---' arm does not increment failures — a multi-file spec would report PASS with AC4 never evaluated"
+fi
+
+echo ""
+echo "=== gRPC preflight case-block dispatch (preflight_test_host) ==="
+
+# grpc-server and concat-spa were arms of the SAME `case ',${targets},' in`
+# statement, and `case` stops at the first matching arm — so any run selecting
+# both probed gRPC and silently SKIPPED concat-spa's /healthz probe. Harmless
+# only while grpc-server was config-only; moving it into LIVE_TARGETS made that
+# skip permanent for every `--group live` run. Splitting the arms into separate
+# `case` statements fixed it, and this pins the fix.
+#
+# The failure mode is silent by construction — a skipped probe produces no output
+# and no failure — which is why it survived from PR #159 until LAB-5549. It
+# recurs the moment anyone adds a target by appending an arm to an existing
+# `case` instead of opening a new one, so the guard is on the dispatch, not on
+# grpc-server specifically.
+preflight_fn=$(new_tmp)
+sed -n '/^preflight_test_host()/,/^}/p' "$RUNNER" > "$preflight_fn"
+
+run_preflight() { # $1 = targets list
+    (
+        source "$SCRIPT_DIR/common.sh"
+        source "$preflight_fn"
+        declare -F preflight_test_host >/dev/null || { echo "SENTINEL_PREFLIGHT_MISSING"; exit 0; }
+        # Stubs record the call instead of touching the network. $3 is the target
+        # name _probe_target_host is passed; the gRPC probe takes only a port.
+        _probe_target_host() { echo "PROBED:$3"; return 0; }
+        _probe_grpc_target() { echo "PROBED:grpc-server"; return 0; }
+        REST_API_PORT=1
+        SOAP_SERVICE_PORT=2
+        GRAPHQL_SERVER_PORT=3
+        GRPC_SERVER_PORT=4
+        CONCAT_SPA_PORT=5
+        FORMS_TARGET_PORT=6
+        preflight_test_host "$1" || true
+    ) 2>&1
+}
+
+if [[ "$(run_preflight grpc-server)" == *SENTINEL_PREFLIGHT_MISSING* ]]; then
+    fail "preflight_test_host extraction is broken/empty — the dispatch assertions below are vacuous"
+else
+    pass "preflight_test_host sourced from run-live-tests.sh (case-dispatch block)"
+fi
+
+# The exact co-selection that was broken: both probes must fire.
+out=$(run_preflight "grpc-server,concat-spa")
+if [[ "$out" == *"PROBED:grpc-server"* && "$out" == *"PROBED:concat-spa"* ]]; then
+    pass "preflight_test_host: grpc-server and concat-spa co-selected both probe (no shared case arm)"
+else
+    fail "preflight_test_host: co-selecting grpc-server,concat-spa must probe both, got: $out"
+fi
+
+# Generalised: selecting the whole live group must fire every case block, so a
+# future target folded into an existing arm is caught even if it is not
+# concat-spa.
+out=$(run_preflight "$(join_targets "${LIVE_TARGETS[@]}")")
+missing_probes=""
+for expected_probe in rest-api soap-service graphql-server grpc-server concat-spa forms-target; do
+    [[ "$out" == *"PROBED:${expected_probe}"* ]] || missing_probes="${missing_probes} ${expected_probe}"
+done
+if [[ -z "$missing_probes" ]]; then
+    pass "preflight_test_host: --group live selection fires every target's probe"
+else
+    fail "preflight_test_host: --group live selection skipped probe(s):${missing_probes}; got: $out"
 fi
 
 echo ""
@@ -311,13 +855,39 @@ else
 fi
 
 # TARGETS_SETUP applies ONLY to the "all" group. --group offline / --group live
-# must ignore it entirely (no config-only targets leak in).
-tmpconfig_scoped=$(new_tmp)
-echo "TARGETS_SETUP=grpc-server" > "$tmpconfig_scoped"
-scoped_offline=$(env CONFIG_FILE="$tmpconfig_scoped" bash -c "source '$RUNNER' --group offline --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
-scoped_live=$(env CONFIG_FILE="$tmpconfig_scoped" bash -c "source '$RUNNER' --group live --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
+# must ignore it entirely.
+#
+# TARGETS_SETUP is passed in the ENVIRONMENT, not via CONFIG_FILE. Two reasons,
+# both of which made the previous form of this check unable to fail:
+#   1. --group offline/live --dry-run deliberately does not call load_config
+#      (see the runner's load_config guard), so a TARGETS_SETUP written to a
+#      config file is never set on this path and resolve_targets is handed an
+#      empty value no matter what it does with it.
+#   2. The probe value was grpc-server, which is now itself a member of
+#      LIVE_TARGETS (LAB-5549) — so even had it been set, a leak into
+#      --group live would have been indistinguishable from correct output.
+# Setting it in the environment reaches the same global that load_config's
+# `declare -g` would, and a sentinel in neither group keeps both halves
+# discriminating. Verified by mutation: adding the "all" arm's TARGETS_SETUP
+# prepend to the live arm fails this assertion.
+#
+# CONFIG_FILE is ALSO pinned to an empty fixture, so the sentinel survives
+# whether or not load_config runs on this path. Reason 1 above is a property of
+# the runner (--dry-run returns before the `targets_need_config` → load_config
+# call), not of this test, and nothing here asserts it. Left unpinned, the day
+# that gating changes load_config's `declare -g TARGETS_SETUP` would overwrite
+# the sentinel from whatever real .live-test-config happens to exist on the
+# machine — in CI, one naming rest-api,soap-service,graphql-server,grpc-server,
+# every one of them a group member — the comparison would pass for the wrong
+# reason, and this assertion would be unable to fail again. Every sibling config
+# assertion in this file pins CONFIG_FILE to a new_tmp fixture for the same
+# reason (see the --group all subset check above).
+scoped_cfg=$(new_tmp)
+: > "$scoped_cfg"
+scoped_offline=$(env CONFIG_FILE="$scoped_cfg" TARGETS_SETUP=phantom-setup-target bash -c "source '$RUNNER' --group offline --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
+scoped_live=$(env CONFIG_FILE="$scoped_cfg" TARGETS_SETUP=phantom-setup-target bash -c "source '$RUNNER' --group live --dry-run" 2>&1 | grep '^targets=' | sed 's/^targets=//') || true
 if [[ "$scoped_offline" == "$(join_targets "${OFFLINE_TARGETS[@]}")" && "$scoped_live" == "$(join_targets "${LIVE_TARGETS[@]}")" ]]; then
-    pass "TARGETS_SETUP ignored for --group offline/live (grpc-server absent)"
+    pass "TARGETS_SETUP ignored for --group offline/live (sentinel absent from both)"
 else
     fail "TARGETS_SETUP leaked into --group offline/live: offline='$scoped_offline' live='$scoped_live'"
 fi
@@ -2159,6 +2729,199 @@ else
 fi
 
 echo ""
+echo "=== ci.yml proto-validate-tests job wiring ==="
+
+# test/proto-validate is a separate module, so a root `go test ./...` does not
+# reach it -- verified, not assumed. ci.yml's proto-validate-tests job is the
+# ONLY thing running its tests in CI, which makes that job the single point of
+# failure for the AC4 helper's entire test suite. Switch it off and every one of
+# those tests silently stops running while this suite stays green: the exact
+# never-executed-assertion shape LAB-5549 exists to remove.
+#
+# Reuses the live-tests.yml helpers by repointing $WORKFLOW rather than growing a
+# parallel copy of yq_query's no-yq and parse-error handling. Both arms of that
+# handling are counted failures, not skips, so this adds no skip credit.
+_WORKFLOW_SAVED="$WORKFLOW"
+WORKFLOW="$SCRIPT_DIR/../.github/workflows/ci.yml"
+
+# File-existence guard, matching the live-tests.yml block above. Without it a
+# renamed or deleted ci.yml makes every assertion below fail with a yq parse
+# error that names the wrong cause.
+# GATES the block, rather than merely reporting. As a bare fail() this emitted its
+# correct diagnostic and then let the assertions run on: two yq errors naming the
+# wrong cause, then extract_job_block's unguarded awk aborted the whole suite
+# BEFORE the accounting pin. The live-tests.yml sibling gates its block for the
+# same reason. Skip credit 3 keeps the pin exact for the three assertions the
+# gate skips.
+if [ -f "$WORKFLOW" ]; then
+    pass "ci.yml is present and readable"
+
+# The job being unconditional is worthless if the WORKFLOW never fires. ci.yml is
+# paths-filtered, and the nested module's manifests are not matched by the
+# root-scoped go.mod/go.sum patterns -- so a change confined to
+# test/proto-validate/go.mod must still trigger the job that tests it.
+ci_paths=$(yq_query '.on.pull_request.paths | join(" ")')
+case "$ci_paths" in
+    __NO_YQ__)    fail_no_yq "ci.yml fires on the nested module's manifests" ;;
+    __YQ_ERROR__) fail_yq_error "ci.yml fires on the nested module's manifests" ;;
+    *test/proto-validate/go.mod*) pass "ci.yml's paths filter covers test/proto-validate/go.mod" ;;
+    *)            fail "ci.yml's paths filter does not name test/proto-validate/go.mod — a change to the nested module's manifest would not trigger the job that tests it" ;;
+esac
+
+# has("if"), NOT `.if // "__ABSENT__"`. yq's `//` is jq's alternative operator,
+# which falls through on `false` as well as null -- so `if: false`, the single
+# most likely way to switch a job off, reads EXACTLY like having no `if:` at all.
+# Measured: with `if: false` present, `.if // "__ABSENT__"` returns __ABSENT__
+# while `has("if")` returns true. A guard that cannot see the disabling edit is
+# the "unable to fail" defect this suite exists to catch.
+case "$(yq_query '.jobs["proto-validate-tests"] | has("if")')" in
+    __NO_YQ__)    fail_no_yq "ci.yml proto-validate-tests is unconditional" ;;
+    __YQ_ERROR__) fail_yq_error "ci.yml proto-validate-tests is unconditional" ;;
+    false)        pass "ci.yml proto-validate-tests runs unconditionally (no job-level if:)" ;;
+    *)            fail "ci.yml proto-validate-tests has a job-level if: — the nested module's tests can be switched off while this suite stays green" ;;
+esac
+
+# Existence of the job is not the property; RUNNING THE NESTED MODULE is. A job
+# that still exists but no longer names ./test/proto-validate/... tests nothing.
+# The job enters the module with working-directory (there is no go.work, so a
+# root-relative module pattern does not resolve). BOTH halves are required: the
+# working-directory that selects the module, and a `go test` that actually runs
+# its packages. Either alone tests nothing.
+# Scoped to the TEST STEP, not the whole job. Grepping the job block for the two
+# strings independently passed even with working-directory deleted from the test
+# step, because the sibling VET step still supplied one -- the same
+# any-two-lines-anywhere hole the timeout-bound assertions had.
+pv_block=$(extract_job_block proto-validate-tests)
+# Parsed, not truncated with awk. The awk form stopped at the first `run:` key,
+# so it pinned YAML KEY ORDER: moving `run:` above `working-directory:` -- identical
+# semantics to Actions -- failed the assertion. That traded a false negative for a
+# false positive. yq answers the structural question directly.
+# BOTH properties, on the SAME step. The awk form this replaced checked
+# working-directory AND `-race`; the first yq rewrite kept only the
+# working-directory, so `run: go test ./...` -- dropping -race from the only job
+# that runs the nested module's tests in CI -- survived at 179/0 while the file
+# still visibly contained a -race pin (which by then covered the Makefile alone).
+# Fixing the key-order false positive must not cost the property being pinned.
+pv_step_wd=$(yq_query '.jobs["proto-validate-tests"].steps[] | select(.run | test("go test")) | .["working-directory"] // "__ABSENT__"')
+pv_step_run=$(yq_query '.jobs["proto-validate-tests"].steps[] | select(.run | test("go test")) | .run')
+case "$pv_step_wd" in
+    __NO_YQ__)    fail_no_yq "ci.yml's go-test step runs inside test/proto-validate with -race" ;;
+    __YQ_ERROR__) fail_yq_error "ci.yml's go-test step runs inside test/proto-validate with -race" ;;
+    test/proto-validate)
+        if printf '%s' "$pv_step_run" | grep -q -- '-race'; then
+            pass "ci.yml proto-validate-tests' go-test step runs with working-directory: test/proto-validate AND -race (key-order independent)"
+        else
+            fail "ci.yml's go-test step lost -race — this job is the only thing running the nested module's tests in CI, so the race detector would stop running there entirely. Got run: $pv_step_run"
+        fi ;;
+    *)            fail "ci.yml's go-test step must set working-directory: test/proto-validate — without a workspace a root-relative module pattern does not resolve, so the nested module's tests would not run. Got: $pv_step_wd" ;;
+esac
+
+# A job-level `if:` is not the only way to switch this off. A step-level `if:`,
+# `continue-on-error: true`, or a trailing `|| true` on the test command each
+# leave the job green while running nothing that can fail -- the same neutering
+# the live-tests.yml block above already checks for.
+if printf '%s' "$pv_block" | grep -qE 'continue-on-error:[[:space:]]*true|\|\|[[:space:]]*(true|exit 0|:)[[:space:]]*$|^[[:space:]]+if:'; then
+    fail "ci.yml proto-validate-tests contains step-level neutering (continue-on-error, a trailing '|| true', or a step if:) — the job would stay green while testing nothing"
+else
+    pass "ci.yml proto-validate-tests has no step-level neutering"
+fi
+
+else
+    # Credit 5, MEASURED: the block emits five counted outcomes (presence, paths
+    # filter, job-level if, test-step scoping, step neutering). It credited 3, so
+    # renaming ci.yml gave `saw 172` against a pin of 174 -- blaming test
+    # maintenance for a missing workflow, the exact wrong-credit failure this
+    # repo has been bitten by before.
+    skip "ci.yml not found at $WORKFLOW — its five wiring assertions cannot be evaluated" 5
+fi
+
+WORKFLOW="$SCRIPT_DIR/../.github/workflows/security.yml"
+
+# security.yml's proto-validate-security job is the ONLY place the nested
+# module's dependency graph is scanned, and with go.work deleted its correctness
+# rests entirely on two `working-directory` lines. Its ci.yml twin has a whole
+# guard block; this job had none, so deleting working-directory (govulncheck then
+# re-scans the repo root the reusable job already covers, and exits 0) or adding
+# `if: false` left every suite green and the nested module unscanned.
+if [ -f "$WORKFLOW" ]; then
+    pass "security.yml is present and readable"
+
+    case "$(yq_query '.jobs["proto-validate-security"] | has("if")')" in
+        __NO_YQ__)    fail_no_yq "security.yml proto-validate-security is unconditional" ;;
+        __YQ_ERROR__) fail_yq_error "security.yml proto-validate-security is unconditional" ;;
+        false)        pass "security.yml proto-validate-security runs unconditionally (no job-level if:)" ;;
+        *)            fail "security.yml proto-validate-security has a job-level if: — the nested module's dependency scan can be switched off while every suite stays green" ;;
+    esac
+
+    # Both scanners pinned BY THEIR run: COMMAND via yq, not by grepping an awk
+    # slice. The earlier form extracted from `- name: govulncheck ...` and then
+    # grepped the slice for "govulncheck" — which the NAME LINE satisfies. Measured:
+    # replacing `run: govulncheck ./...` with `run: true` kept the suite at 179/179
+    # while leaving the nested module entirely unscanned. That is the very failure
+    # this block exists to prevent, inside the block itself. yq also makes the check
+    # independent of YAML key order, the false positive the ci.yml twin already hit.
+    pvs_block=$(extract_job_block proto-validate-security)
+    if [ -n "$pvs_block" ] && printf '%s' "$pvs_block" | grep -q 'proto-validate'; then
+        pass "security.yml proto-validate-security job block extracted (assertions below are non-vacuous)"
+    else
+        fail "security.yml proto-validate-security job block is empty — the scan-wiring assertions below would pass vacuously; fix extract_job_block rather than deleting them"
+    fi
+
+    for pvs_tool in govulncheck gosec; do
+        pvs_wd=$(yq_query ".jobs[\"proto-validate-security\"].steps[] | select(.run | test(\"^${pvs_tool} \")) | .[\"working-directory\"] // \"__ABSENT__\"")
+        case "$pvs_wd" in
+            __NO_YQ__)    fail_no_yq "security.yml's ${pvs_tool} step runs inside test/proto-validate" ;;
+            __YQ_ERROR__) fail_yq_error "security.yml's ${pvs_tool} step runs inside test/proto-validate" ;;
+            test/proto-validate) pass "security.yml's ${pvs_tool} step RUNS ${pvs_tool} with working-directory: test/proto-validate" ;;
+            __ABSENT__)   fail "security.yml has no step whose run: command starts with '${pvs_tool} ', or it lacks working-directory: test/proto-validate — the nested module would go unscanned while every suite stays green" ;;
+            *)            fail "security.yml's ${pvs_tool} step runs with working-directory '$pvs_wd', not test/proto-validate — it would scan the repo root the reusable job already covers and leave the nested module unscanned" ;;
+        esac
+    done
+
+    if printf '%s' "$pvs_block" | grep -qE 'continue-on-error:[[:space:]]*true|\|\|[[:space:]]*(true|exit 0|:)[[:space:]]*$|^[[:space:]]+if:'; then
+        fail "security.yml proto-validate-security contains step-level neutering (continue-on-error, a trailing '|| true', or a step if:) — the scan would stay green while detecting nothing"
+    else
+        pass "security.yml proto-validate-security has no step-level neutering"
+    fi
+else
+    # Credit 4, MEASURED: presence, job-level if, govulncheck-step scoping, step
+    # neutering. Credited 3, so renaming security.yml gave `saw 173` against 174.
+    # Credit 6, MEASURED: presence, block-extraction sentinel, job-level if,
+    # govulncheck step, gosec step, step neutering.
+    skip "security.yml not found at $WORKFLOW — its six scan-wiring assertions cannot be evaluated" 6
+fi
+
+WORKFLOW="$_WORKFLOW_SAVED"
+
+# ci.yml's job is pinned five ways; the Makefile path that runs the same tests
+# locally was pinned nowhere. Without a workspace a root-relative pattern does not
+# resolve, so reverting `make test`'s second line to `./test/proto-validate/...`
+# makes it fail rather than silently skip -- but nothing asserted the working form,
+# and `make test` is what a developer runs before pushing.
+# [[:space:]] rather than \t -- POSIX ERE has no \t escape, so the literal form
+# matched a backslash followed by 't' and the assertion failed on a correct tree.
+if grep -qE '^[[:space:]]+cd test/proto-validate && go test .*-race.*\./\.\.\.' "$SCRIPT_DIR/../Makefile"; then
+    pass "Makefile's test target enters test/proto-validate and runs go test -race ./... there"
+else
+    fail "Makefile's test target must run 'cd test/proto-validate && go test -race ./...' — without a workspace a root-relative module pattern does not resolve, so the nested module's tests would not run locally"
+fi
+
+echo ""
+echo "=== No Go workspace file (product/scan graph coupling) ==="
+
+# go.work is deliberately absent: a workspace puts test/proto-validate into the
+# product's MVS build list, so a bump to that helper's manifest could move the
+# shipped binary's dependency set, and the repo-root security scan could then
+# report on a graph ABOVE the one that ships. The GOWORK=off belt that used to
+# mask this was removed once the workspace went, so recreating the file
+# re-couples them silently. Nothing else asserts the absence.
+if [ ! -e "$SCRIPT_DIR/../go.work" ]; then
+    pass "no go.work at the repo root (product and scan resolve the same graph)"
+else
+    fail "go.work exists at the repo root — it puts test/proto-validate into the product's MVS build list, so a bump to that helper's manifest can move the shipped binary's dependencies and the security scan can report on a graph above what ships. Delete it; consumers enter the module with cd/working-directory."
+fi
+
+echo ""
 echo "=== Browser-target classification is exhaustive (no fail-open) ==="
 # BROWSER_TARGETS is hand-maintained and decides whether the Chrome preflight is
 # fatal. A target missing from it fails OPEN: setup proceeds browserless and the
@@ -2268,7 +3031,180 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # install-chrome-e2e ever executed — lost two steps to `set -euo pipefail` dying
 # on line 1. Nothing could have caught it: an inline block is not a file, so
 # `bash -n` never sees it, and the job is opt-in, so no PR run exercised it.
-EXPECTED_ASSERTIONS=135
+#
+# 135 -> 136. MEASURED. +1 for the setup/live-group seam guard (LAB-5549):
+# grpc-server moved into LIVE_TARGETS, so `--group live` now runs it on every PR
+# with no TARGETS_SETUP or --targets override. That only works because a bare
+# `./test/setup-live-targets.sh` starts it, via --targets defaulting to
+# ALL_TARGETS. Dropping grpc-server from setup's ALL_TARGETS while leaving it in
+# LIVE_TARGETS would make the runner probe a server nobody started, so the target
+# would fail on an unset port rather than on anything about gRPC. Nothing else
+# pins that cross-script pairing: the coverage guards check groups against the
+# dispatch block, and the browser-classification guard checks ALL_TARGETS
+# membership, but neither relates a live-group member to its startability.
+# 136 -> 147. MEASURED. +11 for the gRPC preflight coverage the LAB-5549 review
+# found missing: _probe_grpc_target and preflight_test_host's case dispatch were
+# both new behaviour with no test at all.
+#
+# +8 for _probe_grpc_target (1 extraction sentinel, 5 arms, 2 for injection).
+# Its arms are mutually exclusive on tool availability, so at most one ever runs
+# on a given machine and CI covered whichever of grpcurl/nc/timeout the runner
+# image ships — the other four were dead in practice. They are driven here on a
+# sandboxed PATH holding only bash, so "grpcurl absent" and "no bounded probe
+# available" are reachable at all. Two of the eight are the /dev/tcp injection
+# pair: TEST_HOST must not reach the `bash -c` PARSER, and the positive control
+# proves the payload fires against the interpolated form, so the negative
+# assertion cannot pass because the payload was inert.
+#
+# +3 for preflight_test_host (1 extraction sentinel, 2 dispatch). grpc-server and
+# concat-spa shared one `case` statement and `case` stops at the first match, so
+# every run selecting both silently skipped concat-spa's probe. The fix (separate
+# `case` blocks) had only a one-off manual run behind it. The generalised arm
+# asserts the whole live group probes every target, so a future target folded
+# into an existing arm is caught too — the skip produces no output and no
+# failure, which is why the original survived from PR #159.
+# 147 -> 154. MEASURED. +7 closing regression gaps a review DEMONSTRATED, not
+# hypothesised: each mutation below was run against the previous tree and
+# survived at 147/0, so every one of these assertions is known to catch
+# something nothing else caught.
+#
+# +2 timeout bounds (grpcurl `-max-time 5`, nc `-w 5`). The probe fixtures now
+# record their argv, because outcome-and-exit-status assertions cannot see a
+# deleted bound: dropping `-max-time`, dropping `-w`, or widening `budget` all
+# kept the suite green while restoring the hang the bounds exist to prevent.
+# Failing FAST is this probe's whole purpose, so the bound is the behaviour.
+#
+# +1 /dev/tcp closed-port outcome. Pins that arm's `return 1`; flipping it to
+# `return 0` made an unreachable gRPC target report success and survived.
+# Hermetic -- port 1 on loopback needs no listener, so the suite still starts
+# nothing. The /dev/tcp SUCCESS outcome stays unasserted deliberately: it needs a
+# live listener, which would break this file's no-services property and add a
+# skip/credit arm, i.e. the vespasian#197 hazard.
+#
+# +2 AC4 unconditionality. LAB-5549's deliverable is that the compile assertion
+# cannot skip; prefixing the elif with `! command -v protoc ||` restored the
+# original defect verbatim and survived. One arm rejects any capability gate,
+# the other requires the multi-file arm to count a failure so it cannot report
+# PASS with AC4 unevaluated. Comments are stripped before matching -- the block
+# narrates the removed gate, and grepping raw text reported that history as a
+# live gate.
+#
+# +2 ci.yml proto-validate-tests wiring. That job is the ONLY thing running the
+# nested module's tests in CI (a root `go test ./...` cannot reach a separate
+# module), so `if: false` on it silently disabled that entire suite and survived.
+# 154 -> 161. MEASURED. +7 closing gaps a second review round found in the
+# round-1 FIX code -- every one of them a guard that could not fail.
+#
+# +3 env-seam validation (TEST_HOST hostile / TEST_HOST documented-value /
+# GRPC_SERVER_PORT out of range). The seam shipped with no assertion at all;
+# deleting the whole validation block left the suite green. The documented-value
+# case is the counterweight: a validator that rejects host.docker.internal would
+# break every devcontainer run, so both directions are pinned.
+#
+# +1 AC4 extraction fidelity sentinel, matching the four siblings in this file.
+# The AC4 "no capability gate" assertion passes when it finds no gate, so an
+# anchor that stops matching yields an empty block and a vacuous pass.
+#
+# +3 ci.yml wiring (file present / paths filter reaches the nested manifests /
+# no step-level neutering). The job-level `if:` check alone was insufficient:
+# ci.yml is paths-filtered and the root-scoped go.mod pattern does not match
+# test/proto-validate/go.mod, so the job that tests the nested module could stop
+# firing for changes to that module; and continue-on-error, a trailing `|| true`
+# or a step-level `if:` each keep the job green while running nothing.
+# 161 -> 169. MEASURED. +8 closing gaps a third review round found in the
+# round-2 fix code -- again, mostly guards that pinned TEXT rather than BEHAVIOUR.
+#
+# +4 env-seam hostile inputs (-X, embedded space, $(...), backticks) and +1 for
+# asserting the REFUSAL rather than the message: the single earlier payload ended
+# in '#', so only the trailing character class was ever exercised, and matching
+# the message alone meant deleting `exit 1` left the suite green.
+#
+# +2 accept-direction seam cases (127.0.0.1 and the bracketed IPv6 literal) plus
+# +1 asserting host_bare strips those brackets before nc sees them. All the IPv6
+# handling had shipped with zero coverage in both directions: deleting the seam's
+# bracket alternative, or the stripping itself, changed no assertion.
+#
+# +1 timeout-fixture fidelity: reverting it to `shift; exec "$@"` changed no
+# assertion, so the block proving this probe cannot hang ran unbounded itself.
+#
+# The AC4 capability-gate check is now BEHAVIOURAL rather than a grep over the
+# block's source (net zero, it replaces the textual one). Three textual revisions
+# each mis-fired on prose. It now runs the validator on a stripped PATH with
+# protoc genuinely absent -- CI's normal state -- against a malformed spec.
+#
+# ci.yml's presence check now GATES its block with a skip credit of 3 instead of
+# emitting a bare fail(): as a bare fail it reported correctly and then let
+# extract_job_block's unguarded awk abort the suite before this pin was reached.
+# 169 -> 174. MEASURED. +5 for the two surfaces the round-4 review found
+# unguarded, both created by this PR.
+#
+# +4 security.yml proto-validate-security wiring (presence, gated with skip
+# credit 3; job unconditional; the govulncheck STEP's own working-directory; no
+# step-level neutering). With go.work gone, that job is the only place the nested
+# module's dependency graph is scanned, and its correctness rested on two
+# working-directory lines nothing pinned -- deleting one makes govulncheck
+# re-scan the repo root the reusable job already covers and exit 0, leaving the
+# nested module unscanned with every suite green. Its ci.yml twin already had
+# this block; the security twin had nothing.
+#
+# +1 asserting go.work is ABSENT. The workspace coupled the product's MVS list to
+# a live-test helper's manifest, and the GOWORK=off belt that used to mask that
+# was removed when the workspace went -- so recreating the file now re-couples
+# them with no override left, and silently.
+# 174 -> 179. MEASURED. Round 4 found the guard added in round 3 for the AC4 gate
+# was itself VACUOUS, plus two wrong skip credits. Net +5:
+#
+# +1 AC4 extraction bound (empty / oversized / missing-call sentinel) and the
+# behavioural check now asserts BOTH directions -- a malformed spec must fail AND a
+# valid one must pass. The previous version sourced the extracted block at top
+# level, where its `local` declarations are a hard error: proto_err stayed empty,
+# `2>"$proto_err"` was an invalid redirect, the compound command failed before
+# `go run` ran, and failures=1 came back for EVERY input. Asserting only the
+# malformed direction is what let that through. The block is now wrapped in a
+# function so `local` is legal.
+#
+# +3 GRPC_SERVER_PORT cases (0, -1, abc alongside 99999). With only 99999 pinned,
+# deleting both the shape check and the lower bound left the suite green.
+#
+# +1 Makefile test-target invocation. ci.yml's equivalent is pinned five ways; the
+# Makefile path a developer actually runs was pinned zero ways.
+#
+# Also corrected, net zero: the ci.yml gate's skip credit 3 -> 5 and security.yml's
+# 3 -> 4 (both MEASURED by renaming the workflow -- the wrong credits made a missing
+# workflow report as assertion-accounting drift), and the ci.yml step assertion now
+# uses yq instead of an awk truncation that pinned YAML key order.
+# 179 -> 181. MEASURED. +2 closing a hole in the guard round 4 added for
+# security.yml's scan job -- the guard could not fail.
+#
+# Its govulncheck assertion extracted an awk slice starting at
+# `- name: govulncheck (nested module)` and then grepped that slice for
+# "govulncheck", which the NAME LINE satisfies. Measured: replacing
+# `run: govulncheck ./...` with `run: true` kept the suite at 179/179 with the
+# nested module entirely unscanned. Both scanners are now pinned by their `run:`
+# COMMAND via yq (`select(.run | test("^govulncheck "))`), which also makes the
+# check independent of YAML key order -- the false positive the ci.yml twin
+# already hit. +1 for pinning gosec, which was named load-bearing in a comment
+# and pinned nowhere, and +1 for a block-extraction fidelity sentinel matching
+# the AC4 and live-tests.yml extractions.
+#
+# The gate's skip credit moves 4 -> 6 to match the six counted outcomes.
+# 181 -> 182. MEASURED. Round 5 found two defects in round 4's own guards, plus a
+# CI-environment problem this guard created.
+#
+# The AC4 guard is now driven by a STUB validator rather than a real `go run`. The
+# real-toolchain form required Go AND a module-proxy fetch inside live-tests.yml's
+# preflight-selftest job, which has no setup-go and whose documented property is
+# that these suites need "no Go, Node or Chrome" -- measured RED under GOPROXY=off
+# with an empty module cache, which the LAB-4732 egress audit->block flip would
+# have made CI's steady state. The stub is also stronger: +1 asserts the validator
+# was actually INVOKED (the round-4 vacuity failed before reaching it and still
+# reported failures=1), and the verdict assertion covers both directions.
+#
+# Net zero, not counted: the ci.yml go-test step assertion now checks
+# working-directory AND -race again. The awk form it replaced checked both; the
+# first yq rewrite kept only working-directory, so dropping -race from the only job
+# that runs the nested module's tests survived at 179/0.
+EXPECTED_ASSERTIONS=182
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
