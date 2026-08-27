@@ -2234,6 +2234,15 @@ else
     # and a trailing `# exit 1` comment. Extracting the body removes the whole class:
     # there is no free-form shell left in the workflow to pattern-match.
     #
+    # `shell=` is pinned because the invocation string alone was not enough. Measured:
+    # `shell: cat {0}` leaves the run value byte-identical, so the pin stayed green while
+    # the runner merely CAT-ed the script and exited 0 — the only runtime enforcement check
+    # permanently no-op, job green, suite 144/0. `shell: bash -n {0}` and `shell: python3
+    # {0}` are the same bypass in shapes a reviewer might wave through, and both were
+    # measured. Nothing else in this file reads `shell:`. `if:` and `continue-on-error:`
+    # need no entry here — the un-gated-job guards above already catch both on this job,
+    # measured at 141/2 each.
+    #
     # RESIDUAL, stated rather than implied: nothing here pins the SCRIPT's contents, so
     # editing it to a no-op still passes. That is deliberate and consistent — this file
     # pins that preflight-selftest INVOKES its four guard suites, never what they
@@ -2242,8 +2251,9 @@ else
     # review of a real file. AGENTS.md records the same reasoning for
     # test/assert-chrome-install.sh.
     ac3_got=$(yq_query '"last=" + (((.jobs."preflight-selftest".steps[-1].name) // "") == "Assert egress policy enforces (AC3)" | tostring)
+      + " shell=" + ([.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | (.shell // "<default>")] | join(""))
       + " run=" + (([.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | .run] | join("")) | sub("\s+$"; ""))' -r)
-    ac3_want='last=true run=./test/assert-egress-enforced.sh'
+    ac3_want='last=true shell=<default> run=./test/assert-egress-enforced.sh'
     case "$ac3_got" in
         __NO_YQ__)    fail_no_yq "the AC3 egress-enforcement step" ;;
         __YQ_ERROR__) fail_yq_error "the AC3 egress-enforcement step" ;;
@@ -2278,8 +2288,14 @@ else
     #     ordinary non-container job with no egress policy at all.
     # sha256sum is GNU; shasum -a 256 ships with perl and is what macOS has. Both were
     # verified to produce the same digest for this body, so the fallback is sound rather
-    # than assumed. `head=`/`body=` are split on the LAST field so a body containing the
-    # delimiter cannot mis-split them.
+    # than assumed, and a MISSING hasher fails as a counted outcome rather than aborting.
+    #
+    # `head=`/`body=` split on the FIRST ` body=`: `${r%% body=*}` removes the longest
+    # matching SUFFIX and `${r#* body=}` the shortest matching PREFIX, so both cut at the
+    # same, first, delimiter. That is what makes a body containing ` body=` safe — the head
+    # ends before the real delimiter and the body starts after it. An earlier version of
+    # this comment said "split on the LAST field", which was the wrong rule for the right
+    # code; recorded because the same commit corrects another wrong bash rule elsewhere.
     exempt_raw=$(yq_query '"checklabel_steps=" + (.jobs."check-label".steps | length | tostring)
       + " e2e_container=" + ((.jobs."install-chrome-e2e" | has("container")) | tostring)
       + " body=" + ([.jobs."check-label".steps[] | (.run // "")] | join("\n"))' -r)
@@ -2290,10 +2306,17 @@ else
         *)
             exempt_head=${exempt_raw%% body=*}
             exempt_body=${exempt_raw#* body=}
+            # A missing hasher must FAIL as a counted outcome, not abort the suite. Under
+            # set -euo pipefail the bare fallback died before the EXPECTED_ASSERTIONS check
+            # ran, so the run ended on the generic "terminated before reaching the summary"
+            # guard without naming the cause — the shape yq_query's __NO_YQ__ sentinel
+            # exists to avoid. Measured with both tools hidden from PATH.
             if command -v sha256sum >/dev/null 2>&1; then
                 exempt_sha=$(printf '%s' "$exempt_body" | sha256sum | cut -d' ' -f1)
-            else
+            elif command -v shasum >/dev/null 2>&1; then
                 exempt_sha=$(printf '%s' "$exempt_body" | shasum -a 256 | cut -d' ' -f1)
+            else
+                exempt_sha='<no sha256 tool on PATH: install coreutils or perl>'
             fi
             exempt_got="${exempt_head} bodysha=${exempt_sha}"
             if [[ "$exempt_got" == "$exempt_want" ]]; then

@@ -52,11 +52,25 @@ set -euo pipefail
 UNLISTED_URL="https://proxy.golang.org/"
 CONTROL_URL="https://github.com/"
 
-if curl -sS --max-time 15 -o /dev/null "$UNLISTED_URL" 2>/dev/null; then
+# Discriminate on HOW the request failed, not just that it did. harden-runner blocks at
+# the DNS layer, so a refused domain surfaces as curl exit 6 (could not resolve host). A
+# connect-level outage of that host would give 7 (refused) or 28 (timeout) — indistinguishable
+# from enforcement if we only checked "did it fail", which is how a host going down could
+# masquerade as a working policy. Exit 6 does not separate a policy block from a genuinely
+# unresolvable name, and nothing available inside the job does, so that part stays residual.
+set +e
+curl -sS --max-time 15 -o /dev/null "$UNLISTED_URL" 2>/dev/null
+unlisted_rc=$?
+set -e
+if [ "$unlisted_rc" -eq 0 ]; then
     echo "FAIL: reached ${UNLISTED_URL}, which is absent from this job's allowlist — the egress policy is not enforcing"
     exit 1
 fi
-echo "ok: unlisted host unreachable"
+if [ "$unlisted_rc" -ne 6 ]; then
+    echo "FAIL: ${UNLISTED_URL} failed with curl exit ${unlisted_rc}, not 6 (could not resolve host). A block-mode refusal fails at DNS; 7/28 mean the host itself was unreachable, which does not demonstrate the policy."
+    exit 1
+fi
+echo "ok: unlisted host refused at DNS (curl exit 6)"
 
 if ! curl -sS --max-time 15 -o /dev/null "$CONTROL_URL"; then
     echo "FAIL: cannot reach ${CONTROL_URL}, which IS allowlisted — this runner has no egress at all, so the refusal above proves nothing"
