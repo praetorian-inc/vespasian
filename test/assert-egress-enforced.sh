@@ -52,12 +52,24 @@ set -euo pipefail
 UNLISTED_URL="https://proxy.golang.org/"
 CONTROL_URL="https://github.com/"
 
-# Discriminate on HOW the request failed, not just that it did. harden-runner blocks at
-# the DNS layer, so a refused domain surfaces as curl exit 6 (could not resolve host). A
-# connect-level outage of that host would give 7 (refused) or 28 (timeout) — indistinguishable
-# from enforcement if we only checked "did it fail", which is how a host going down could
-# masquerade as a working policy. Exit 6 does not separate a policy block from a genuinely
-# unresolvable name, and nothing available inside the job does, so that part stays residual.
+# WHY THIS ACCEPTS ANY NON-ZERO EXIT, AND WHY EXIT-CODE DISCRIMINATION DOES NOT WORK.
+# A reviewer observed, correctly, that "the request failed" is weaker than "the policy
+# refused it": a connect-level outage of the unlisted host would pass as proof of
+# enforcement. The obvious fix — require the exit code that a block produces — was tried
+# and REVERTED, because it rests on a false premise about harden-runner.
+#
+# MEASURED on run 33107912104 (head 715fc1d): under a working block policy, curl against
+# proxy.golang.org exits 7 (failed to connect), NOT 6 (could not resolve host), while
+# harden-runner's own post-step logs "domain not allowed: proxy.golang.org." for the same
+# request. Its DNS proxy answers with a sinkhole address and the CONNECT is what fails. So
+# exit 7 is the signature of a correct refusal here — and it is also the signature of a
+# host that is simply down. The two are indistinguishable by exit code, which means the
+# reviewer's concern is real but not closable this way. Requiring exit 6 turned a passing
+# job red on a correctly-enforcing runner; that is worse than the gap it chased.
+#
+# What actually bounds the risk: the control request below. If the unlisted host were down
+# AND the policy were off, this step would still pass — but that needs two independent
+# failures at once, and the allowlisted control proves the runner has working egress.
 set +e
 curl -sS --max-time 15 -o /dev/null "$UNLISTED_URL" 2>/dev/null
 unlisted_rc=$?
@@ -66,11 +78,7 @@ if [ "$unlisted_rc" -eq 0 ]; then
     echo "FAIL: reached ${UNLISTED_URL}, which is absent from this job's allowlist — the egress policy is not enforcing"
     exit 1
 fi
-if [ "$unlisted_rc" -ne 6 ]; then
-    echo "FAIL: ${UNLISTED_URL} failed with curl exit ${unlisted_rc}, not 6 (could not resolve host). A block-mode refusal fails at DNS; 7/28 mean the host itself was unreachable, which does not demonstrate the policy."
-    exit 1
-fi
-echo "ok: unlisted host refused at DNS (curl exit 6)"
+echo "ok: unlisted host unreachable (curl exit ${unlisted_rc}; a block-mode refusal surfaces as 7)"
 
 if ! curl -sS --max-time 15 -o /dev/null "$CONTROL_URL"; then
     echo "FAIL: cannot reach ${CONTROL_URL}, which IS allowlisted — this runner has no egress at all, so the refusal above proves nothing"
