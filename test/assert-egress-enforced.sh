@@ -70,6 +70,17 @@ CONTROL_URL="https://github.com/"
 # reviewer's concern is real but not closable this way. Requiring exit 6 turned a passing
 # job red on a correctly-enforcing runner; that is worse than the gap it chased.
 #
+# SCOPE, stated because the assertion is narrower than "block enforces": this script runs
+# in ONE job, preflight-selftest, whose allowlist is the two-entry wildcard-free one. The
+# four jobs whose effective allow-set includes `*.blob.core.windows.net:443` — the only
+# entry whose matching is non-trivial, and the one this workflow admits is wider than
+# needed — get no runtime proof. If harden-runner ever failed open on a wildcard entry,
+# that is exactly what this step exists to catch and exactly what it cannot see, while
+# every static pin stayed green. Reusing the script there is not a one-liner either:
+# UNLISTED_URL below is proxy.golang.org, which IS allowlisted in integration-tests and
+# test, so a second job would need a different unlisted host. So read the pass as "block
+# enforces in a job with a two-entry literal allowlist", not "block enforces".
+#
 # What actually bounds the risk: the control request below. If the unlisted host were down
 # AND the policy were off, this step would still pass — but that needs two independent
 # failures at once, and the allowlisted control proves the runner has working egress.

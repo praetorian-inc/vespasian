@@ -2672,17 +2672,21 @@ EXPECTED_HR_JOBS=(preflight-selftest validator-regression docs-check integration
 # coverage uniform across all five rather than incidental.
 # hr_policy() below builds the same string from the workflow with one yq call.
 HR_PIN='step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920'
+# The two gated jobs legitimately carry a job-level `if:`; the three un-gated guard jobs
+# must not. So `jobif` is pinned per job by VALUE rather than as a blanket absence — the
+# same reasoning as the shell-override pin below, where one job's override is required.
+GATED_JOB_IF="needs.check-label.outputs.should-run == 'true'"
 hr_expected() {
-    local endpoints
+    local endpoints jobif
     case "$1" in
-        preflight-selftest)   endpoints='github.com:443,results-receiver.actions.githubusercontent.com:443' ;;
-        validator-regression) endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443' ;;
-        docs-check)           endpoints='github.com:443,results-receiver.actions.githubusercontent.com:443' ;;
-        integration-tests)    endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ;;
-        test)                 endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ;;
+        preflight-selftest)   endpoints='github.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='<none>' ;;
+        validator-regression) endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='<none>' ;;
+        docs-check)           endpoints='github.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='<none>' ;;
+        integration-tests)    endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ; jobif="$GATED_JOB_IF" ;;
+        test)                 endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ; jobif="$GATED_JOB_IF" ;;
         *) printf '%s\n' '<no expectation pinned>'; return 0 ;;
     esac
-    printf 'first=true runs=ubuntu-24.04 || uses=%s policy=block sudo=true if=false coe=false eptype=!!str endpoints=%s\n' "$HR_PIN" "$endpoints"
+    printf 'first=true runs=ubuntu-24.04 container=false services=false jobcoe=false jobif=%s || uses=%s policy=block sudo=true if=false coe=false eptype=!!str withkeys=allowed-endpoints,disable-sudo,egress-policy endpoints=%s\n' "$jobif" "$HR_PIN" "$endpoints"
 }
 
 # The observed counterpart. Built with ONE yq call so each job costs exactly one
@@ -2710,6 +2714,10 @@ hr_policy() {
     local job=$1
     yq_query "\"first=\" + ((.jobs.\"${job}\".steps[0].uses // \"\") | test(\"step-security/harden-runner\") | tostring)
       + \" runs=\" + ((.jobs.\"${job}\".\"runs-on\" // \"<unset>\") | tostring)
+      + \" container=\" + ((.jobs.\"${job}\" | has(\"container\")) | tostring)
+      + \" services=\" + ((.jobs.\"${job}\" | has(\"services\")) | tostring)
+      + \" jobcoe=\" + ((.jobs.\"${job}\".\"continue-on-error\" // false) | tostring)
+      + \" jobif=\" + ((.jobs.\"${job}\".\"if\" // \"<none>\") | tostring)
       + \" || \" + ([.jobs.\"${job}\".steps[] | select((.uses // \"\") | test(\"step-security/harden-runner\"))]
         | map(\"uses=\" + (.uses // \"<none>\")
             + \" policy=\" + (.with.\"egress-policy\" // \"<unset>\")
@@ -2717,6 +2725,7 @@ hr_policy() {
             + \" if=\" + ((has(\"if\")) | tostring)
             + \" coe=\" + ((.\"continue-on-error\" // false) | tostring)
             + \" eptype=\" + (.with.\"allowed-endpoints\" | type)
+            + \" withkeys=\" + ([.with | keys | .[]] | sort | join(\",\"))
             + \" endpoints=\" + ([.with.\"allowed-endpoints\"] | flatten | join(\" \") | sub(\"\s+\"; \" \") | split(\" \") | map(select(. != \"\")) | sort | join(\",\")))
         | join(\" ;; \"))" -r
 }
@@ -2726,20 +2735,23 @@ if [[ ! -f "$WORKFLOW" ]]; then
     for _ in "${EXPECTED_HR_JOBS[@]}"; do
         fail "harden-runner policy for a pinned job could not be checked: $WORKFLOW is missing"
     done
-    # Keep this arm's counted-outcome total equal to the `else` arm's. The else emits
-    # 9: five per-job pins, the carrying-jobs set, the full job set, the AC3 step,
-    # and the exemption rationale. This arm emits the "not found" line above plus
-    # five per-job pads, so it owes three more. Adding a check to the else without a
-    # pad here is what silently unbalanced it in review round 2. MEASURED both ways:
-    # 9 outcomes in each arm.
+    # Keep this arm's counted-outcome total equal to the `else` arm's. The else emits TEN:
+    # five per-job policy pins, the carrying-jobs set, the full job set, the AC3 step, the
+    # exemption rationale, and the workflow-shape (shell / permissions / env) pin. This arm
+    # emits the "not found" line above plus five per-job pads, so it owes four more.
     #
-    # This makes THIS SECTION constant, not the file. With the workflow absent the
-    # whole suite still comes up short of its pin — 140 outcomes against 194, MEASURED at
-    # this head — because three other blocks (at the `if [[ -f "$WORKFLOW" ]]` guards
-    # further up and down this file) have no else arm and emit nothing. That imbalance
-    # predates this ticket and is not LAB-6015's to fix; stated here so the next reader
-    # does not take a balanced section for a balanced suite. Those two figures are a measurement, not a pin, and
-    # will drift as the suite grows — re-measure rather than trusting them. Only
+    # Adding a check to the else without a pad here is what silently unbalanced it in review
+    # round 2, and again in round 8 — the second time the count was right and only this
+    # comment was stale, which is its own defect in a file whose audit trail IS these
+    # MEASURED annotations. Re-measure both arms when you touch either.
+    #
+    # This makes THIS SECTION constant, not the file. With the workflow absent the whole
+    # suite still comes up short of its pin — 144 outcomes against 195, MEASURED at this
+    # head — because three other blocks (at the `if [[ -f "$WORKFLOW" ]]` guards further up
+    # and down this file) have no else arm and emit nothing. That imbalance predates this
+    # ticket and is not LAB-6015's to fix; stated here so the next reader does not take a
+    # balanced section for a balanced suite. Those two figures are a measurement, not a pin,
+    # and will drift as the suite grows — re-measure rather than trusting them. Only
     # EXPECTED_ASSERTIONS at the bottom of this file is self-enforcing.
     for hr_pad in "the set of jobs carrying harden-runner" "the full job set" "the AC3 enforcement step and the exemption rationale" "the defaults.run.shell absence pin"; do
         fail "${hr_pad} could not be checked: $WORKFLOW is missing"
@@ -2764,7 +2776,7 @@ else
             # unmistakable at the call site rather than depending on the reader knowing that
             # rule. It fixes no defect, and there was none.
                 if [[ "$hr_got" == "$hr_want" ]]; then
-                    pass "${hr_job} harden-runner policy matches the pin (block, sudo, no if:, first step, exact allowlist)"
+                    pass "${hr_job} harden-runner policy matches the pin (block, sudo, no step if:, first step, exact allowlist, plus the job shape that decides whether the policy applies at all: runs-on, no container:, no services:, job-level continue-on-error and if:, and the exact with: key set)"
                 else
                     fail "${hr_job} harden-runner policy does not match the pin — a job leaving 'block', gaining a second harden-runner step, an if:, a moved step, a changed SHA, a dropped disable-sudo, or a widened allowlist all land here. Update this file's pin deliberately if the change is intended.
         want: ${hr_want}
@@ -2886,6 +2898,18 @@ else
     # the job still green. It is a strictly wider bypass than the per-step `shell:` this
     # file already pins, and it was invisible to every existing check.
     #
+    # `permissions` and a workflow-level `env` ride along on this same yq call, for zero
+    # extra counted outcomes. Both were measured MISSED before being added: widening the
+    # workflow's `contents: read` to `contents: write` left the suite green at 195/0, and
+    # nothing read `.env` at all — which matters because the AC3 proof resolves `curl` from
+    # PATH, so a workflow-level `env: PATH:` prepending a fake `curl` is the same bypass as
+    # the `defaults.run.shell` one in a different key. Token scope is also the one thing
+    # the two egress-UNRESTRICTED jobs inherit: `check-label` and `install-chrome-e2e` run
+    # with no policy, so what their token can do is the whole of their blast radius. The
+    # in-file comment on install-chrome-e2e's `permissions:` block previously said
+    # detecting a widening "is a separate job for a workflow-shape guard, not something
+    # this block can do" — this file now IS that guard, so the reason no longer holds.
+    #
     # Pinned as an exact SET rather than a blanket absence, because there is one legitimate
     # override and pinning `0` would have been a lie that failed on the first run. The
     # container job install-chrome-e2e sets `defaults.run.shell: bash` and MUST: a container
@@ -2898,15 +2922,19 @@ else
     # point.
     shelldef_got=$(yq_query '"wf=" + ((.defaults.run.shell // "<none>") | tostring)
       + " jobs=" + ([.jobs | to_entries[] | select(.value.defaults.run.shell)
-                     | .key + ":" + .value.defaults.run.shell] | sort | join(",") | (. // ""))
-      + " steps=" + ([.jobs[].steps[] | select(.shell)] | length | tostring)' -r)
-    shelldef_want='wf=<none> jobs=install-chrome-e2e:bash steps=0'
+                     | .key + ":" + .value.defaults.run.shell] | sort | join(","))
+      + " steps=" + ([.jobs[].steps[] | select(.shell)] | length | tostring)
+      + " wfperms=" + ((.permissions | tostring))
+      + " jobperms=" + ([.jobs | to_entries[] | select(.value.permissions)
+                     | .key + ":" + (.value.permissions | tostring)] | sort | join(","))
+      + " wfenv=" + ((.env // {} | keys | join(",")))' -r)
+    shelldef_want='wf=<none> jobs=install-chrome-e2e:bash steps=0 wfperms=contents: read jobperms=install-chrome-e2e:contents: read wfenv='
     case "$shelldef_got" in
         __NO_YQ__)    fail_no_yq "the defaults.run.shell absence pin" ;;
         __YQ_ERROR__) fail_yq_error "the defaults.run.shell absence pin" ;;
         *)
             if [[ "$shelldef_got" == "$shelldef_want" ]]; then
-                pass "the only shell override is install-chrome-e2e's required defaults.run.shell: bash — none at workflow level, none on any step, no other job"
+                pass "workflow shape pinned: the only shell override is install-chrome-e2e's required defaults.run.shell: bash, permissions are contents: read at both levels, and there is no workflow-level env:"
             else
                 fail "a shell override appeared in live-tests.yml. A workflow- or job-level \`defaults.run.shell\` applies to every run: step without appearing on any of them, so it silently redirects all four guard suites and the AC3 egress proof through a different interpreter — measured green at 194/0 with \`shell: cat {0}\`, every step a no-op. If an override is genuinely wanted, update this pin deliberately.
         want: ${shelldef_want}
@@ -3659,7 +3687,19 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       first, the job's `runs-on`, the step's `continue-on-error`, allowed-endpoints node
 #       type, exact endpoint set) rather than its shape. `runs-on` and `continue-on-error`
 #       were folded into this same string in review rather than added as new outcomes, so
-#       the count did not move: `runs-on: macos-14` left the policy byte-identical while
+#       the count did not move. Round 8 folded in five more for the same reason —
+#       `container=`, `services=`, `jobcoe=`, `jobif=` and `withkeys=` — each a measured
+#       survivor at 195/0: a `container:` key on any policy job (the workflow's own comment
+#       says harden-runner does not support container jobs, so the policy stops applying),
+#       `services:` (service containers start before steps[0], so `first=true` does not mean
+#       nothing ran first), job-level `continue-on-error: true` and job-level `if:` on
+#       docs-check or integration-tests (the step-level `coe=` does not see either, and the
+#       text-grep neutering guards cover only three of the five policy jobs), and any FOURTH
+#       `with:` input — `use-policy-store: true` moves the enforced allowlist to
+#       StepSecurity's off-repo control plane with every pinned field byte-identical, which
+#       is the widest of the five. `withkeys=` pins the key SET rather than enumerating
+#       inputs, the same way check-label's body is pinned by digest rather than by grepping
+#       for egress methods. Original evidence: `runs-on: macos-14` left the policy byte-identical while
 #       harden-runner silently does not enforce off Linux, and `continue-on-error: true`
 #       on the step was caught for three of the five jobs by the un-gated-job guards
 #       above but not for docs-check or integration-tests. Both measured MISSED first.
