@@ -1949,17 +1949,24 @@ else
     # removed or altered key is a mismatch. sort_keys makes it order-independent so
     # a benign reformat cannot trip it.
     #
-    # If you INTENTIONALLY change the trigger, update EXPECTED_PR_TRIGGER below and
+    # If you INTENTIONALLY change the trigger, update EXPECTED_TRIGGERS below and
     # say why in the commit — that edit is exactly the review moment this pin exists
     # to force.
-    EXPECTED_PR_TRIGGER='{"branches":["main"],"types":["opened","synchronize","reopened","labeled","unlabeled"]}'
-    actual_pr_trigger="$(yq_query '.on.pull_request | sort_keys(..)' -o=json -I=0)"
+    # Pins the WHOLE `on:` node, not just `.on.pull_request`. It was the pull_request
+    # subtree alone, which left `.on.push` readable by nothing in this file — measured:
+    # deleting the `push:` block left the suite at 195/0 while install-chrome-e2e's
+    # push-to-main arm became unreachable, i.e. exactly the coverage the `e2e_if=` field
+    # further down was added to protect, defeated one level up. Widening to the whole node
+    # closes `push` and `workflow_dispatch` in the same outcome at no extra assertion, which
+    # is what the comment above already argues for: complete by construction.
+    EXPECTED_TRIGGERS='{"pull_request":{"branches":["main"],"types":["opened","synchronize","reopened","labeled","unlabeled"]},"push":{"branches":["main"]},"workflow_dispatch":null}'
+    actual_pr_trigger="$(yq_query '.on | sort_keys(..)' -o=json -I=0)"
     case "$actual_pr_trigger" in
         __NO_YQ__) fail_no_yq "live-tests.yml's pull_request trigger shape" ;;
         __YQ_ERROR__) fail_yq_error "live-tests.yml's pull_request trigger shape" ;;
-        "$EXPECTED_PR_TRIGGER")
-            pass "live-tests.yml's pull_request trigger carries no paths/paths-ignore narrowing, so a shell-only PR still runs the un-gated guard suites (branches and types are expected and are part of EXPECTED_PR_TRIGGER)" ;;
-        *)  fail "live-tests.yml's pull_request trigger shape changed: expected ${EXPECTED_PR_TRIGGER}, got ${actual_pr_trigger} — a paths/paths-ignore narrowing switches off every un-gated guard suite for the PRs they exist to police, and dropping a types entry (labeled/unlabeled) stops a label change re-evaluating the gate; if the change is deliberate, update EXPECTED_PR_TRIGGER" ;;
+        "$EXPECTED_TRIGGERS")
+            pass "live-tests.yml's whole on: node matches its pin — pull_request with no paths/paths-ignore narrowing so a shell-only PR still runs the un-gated guard suites, push restricted to main, and workflow_dispatch present" ;;
+        *)  fail "live-tests.yml's on: node changed: expected ${EXPECTED_TRIGGERS}, got ${actual_pr_trigger} — a paths/paths-ignore narrowing under pull_request switches off every un-gated guard suite for the PRs they exist to police; dropping a types entry (labeled/unlabeled) stops a label change re-evaluating the gate; and losing or retargeting push:branches[main] makes install-chrome-e2e unreachable (the only automated coverage of install-chrome.sh's privileged path) and stops the main-push runs the harden-runner allowlist provenance is derived from. If the change is deliberate, update EXPECTED_TRIGGERS" ;;
     esac
 
     # The test job's OWN gate. The per-step if: check further below asks
@@ -2791,8 +2798,14 @@ else
                     # `[a-z0-9_][a-z0-9_]*=` and not `[a-z0-9_]*=`: the star form matches the
                     # EMPTY name, so it split on the bare ` =` inside the gated jobs' `if:`
                     # expression (`== 'true'`) and broke one field across two lines.
-                    hr_want_lines=$(sed 's/ \([a-z0-9_][a-z0-9_]*=\)/\n        \1/g' <<< "$hr_want")
-                    hr_got_lines=$(sed 's/ \([a-z0-9_][a-z0-9_]*=\)/\n        \1/g' <<< "$hr_got")
+                    # awk, not sed: `\n` on the RIGHT-hand side of a sed `s///` is a GNU extension, and
+                    # BSD/macOS sed substitutes a literal `n` — so on the platform AGENTS.md says these
+                    # scripts are AUTHORED on, the sed form rendered the fourteen fields as one line with
+                    # `n        needs=` at each boundary: noisier than the single line it replaced, and the
+                    # opposite of what this change is for. awk's `\n` in a replacement is POSIX. Same
+                    # reason `shasum -a 256` sits beside `sha256sum` further down.
+                    hr_want_lines=$(awk '{gsub(/ [a-z0-9_]+=/, "\n        &")}1' <<< "$hr_want")
+                    hr_got_lines=$(awk '{gsub(/ [a-z0-9_]+=/, "\n        &")}1' <<< "$hr_got")
                     fail "${hr_job} harden-runner policy does not match the pin. Any of these lands here: the egress policy leaving 'block'; a second harden-runner step; a changed action SHA; a dropped disable-sudo; a widened allowlist or a changed allowed-endpoints node type; a fourth with: input; a step-level if: or continue-on-error; a moved step; or — the job-shape half — a changed runs-on, a container: or services: key, a job-level continue-on-error or if:, a changed needs:, or an action added to or removed from the job. Update this file's pin deliberately if the change is intended.
         want:${hr_want_lines}
         got: ${hr_got_lines}"
@@ -2913,6 +2926,19 @@ else
     # the job still green. It is a strictly wider bypass than the per-step `shell:` this
     # file already pins, and it was invisible to every existing check.
     #
+    # `env` and `defaults.run` render through `tojson(0)` rather than a hand-rolled
+    # `key=value` join, because the join was delimiter-injectable: deleting a key while folding
+    # its rendered text into a lexicographically-earlier sibling's value produced a
+    # byte-identical string, measured surviving at 195/0. JSON quoting cannot collide.
+    #
+    # `map_values(tostring)` on top of that, and it is not decoration: `tojson` preserves the
+    # YAML type, so `VESPASIAN_REQUIRE_CHROME: 1` and `: "1"` rendered differently and the pin
+    # fired on a quote-style edit with no runtime effect at all — Actions coerces every `env`
+    # value to a string. The hand-rolled join used `tostring` and so did not have that problem;
+    # converting to JSON reintroduced it in the other direction. Coercing first keeps JSON's
+    # unambiguous quoting AND drops the false positive, measured both ways: the two quote-style
+    # edits render identically, and the deletion-collision above still differs.
+    #
     # `permissions` and a workflow-level `env` ride along on this same yq call, for zero
     # extra counted outcomes. Both were measured MISSED before being added: widening the
     # workflow's `contents: read` to `contents: write` left the suite green at 195/0, and
@@ -2938,21 +2964,23 @@ else
     wfshape_got=$(yq_query '"wfdefrun=" + ((.defaults.run // {} | to_entries
                      | map(.key + "=" + (.value | tostring)) | sort | join(";")))
       + " jobdefrun=" + ([.jobs | to_entries[] | select(.value.defaults.run)
-                     | {(.key): (.value.defaults.run | sort_keys(..))}] | sort_by(keys[0]) | tojson(0))
+                     | {(.key): (.value.defaults.run | sort_keys(..) | map_values(tostring))}]
+                     | sort_by(keys[0]) | tojson(0))
       + " steps=" + ([.jobs[].steps[] | select(.shell)] | length | tostring)
       + " wfperms=" + ((.permissions | tostring))
       + " jobperms=" + ([.jobs | to_entries[] | select(.value.permissions)
                      | .key + ":" + (.value.permissions | tostring)] | sort | join(","))
-      + " wfenv=" + ((.env // {} | keys | join(",")))
+      + " wfenv=" + ((.env // {} | sort_keys(..) | map_values(tostring)) | tojson(0))
       + " jobenv=" + ([.jobs | to_entries[] | select(.value.env)
-                     | {(.key): (.value.env | sort_keys(..))}] | sort_by(keys[0]) | tojson(0))' -r)
-    wfshape_want='wfdefrun= jobdefrun=[{"install-chrome-e2e":{"shell":"bash"}}] steps=0 wfperms=contents: read jobperms=install-chrome-e2e:contents: read wfenv= jobenv=[{"integration-tests":{"VESPASIAN_NO_SANDBOX":"true","VESPASIAN_REQUIRE_CHROME":"1"}},{"preflight-selftest":{"GOTOOLCHAIN":"local"}},{"test":{"VESPASIAN_NO_SANDBOX":"true"}}]'
+                     | {(.key): (.value.env | sort_keys(..) | map_values(tostring))}]
+                     | sort_by(keys[0]) | tojson(0))' -r)
+    wfshape_want='wfdefrun= jobdefrun=[{"install-chrome-e2e":{"shell":"bash"}}] steps=0 wfperms=contents: read jobperms=install-chrome-e2e:contents: read wfenv={} jobenv=[{"integration-tests":{"VESPASIAN_NO_SANDBOX":"true","VESPASIAN_REQUIRE_CHROME":"1"}},{"preflight-selftest":{"GOTOOLCHAIN":"local"}},{"test":{"VESPASIAN_NO_SANDBOX":"true"}}]'
     case "$wfshape_got" in
         __NO_YQ__)    fail_no_yq "the workflow-shape pin (shell overrides, permissions, env)" ;;
         __YQ_ERROR__) fail_yq_error "the workflow-shape pin (shell overrides, permissions, env)" ;;
         *)
             if [[ "$wfshape_got" == "$wfshape_want" ]]; then
-                pass "workflow shape pinned: the whole defaults.run node at both levels (only install-chrome-e2e's shell: bash), no step-level shell:, permissions contents: read at both levels, no workflow-level env:, and every job-level env: block matches its pinned key=value set"
+                pass "workflow shape pinned: the whole defaults.run node at both levels (only install-chrome-e2e's shell: bash), no step-level shell:, permissions contents: read at both levels, no workflow-level env:, and every env: block — workflow-level and per-job — matches its pinned JSON encoding, keys AND values"
             else
                 fail "the workflow SHAPE changed in live-tests.yml — a defaults.run override (shell OR working-directory), a step-level shell:, a permissions widening, a workflow-level env:, or an edit to a job-level env: block. A workflow- or job-level \`defaults.run.shell\` applies to every run: step without appearing on any of them, so it silently redirects all four guard suites and the AC3 egress proof through a different interpreter — measured green at 194/0 with \`shell: cat {0}\`, every step a no-op. If an override is genuinely wanted, update this pin deliberately.
         want: ${wfshape_want}
@@ -2991,9 +3019,10 @@ else
     # code; recorded because the same commit corrects another wrong bash rule elsewhere.
     exempt_raw=$(yq_query '"checklabel_steps=" + (.jobs."check-label".steps | length | tostring)
       + " e2e_container=" + ((.jobs."install-chrome-e2e" | has("container")) | tostring)
+      + " e2e_image=" + ((.jobs."install-chrome-e2e".container.image // "<unset>") | tostring)
       + " e2e_if=" + ((.jobs."install-chrome-e2e".if | tostring))
       + " body=" + (.jobs."check-label" | sort_keys(..) | tojson(0))' -r)
-    exempt_want="checklabel_steps=1 e2e_container=true e2e_if=github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') bodysha=03883c7aed8cf43558774ccfa505a3a0c65f823b7f04bbcd6cc97298c36c16cc"
+    exempt_want="checklabel_steps=1 e2e_container=true e2e_image=ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea e2e_if=github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') bodysha=03883c7aed8cf43558774ccfa505a3a0c65f823b7f04bbcd6cc97298c36c16cc"
     case "$exempt_raw" in
         __NO_YQ__)    fail_no_yq "the harden-runner exemption rationale for check-label and install-chrome-e2e" ;;
         __YQ_ERROR__) fail_yq_error "the harden-runner exemption rationale for check-label and install-chrome-e2e" ;;
@@ -3016,9 +3045,10 @@ else
             if [[ "$exempt_got" == "$exempt_want" ]]; then
                 pass "both harden-runner-exempt jobs still match their exemption rationale (check-label: one inline step, and a digest over its WHOLE job node — if:, outputs:, step ids, runs-on and all — unchanged; install-chrome-e2e: a container job with its trigger if: unchanged)"
             else
-                fail "a harden-runner-EXEMPT job no longer matches the rationale that exempts it. Two things land here: it may now make network calls under no egress policy, OR — for check-label, whose whole node is digested because both gated jobs depend on its outputs — an edit to its if:, outputs:, step ids or runs-on that would skip integration-tests and test on every event while every other pin stays green. Either restore the rationale, or give the job a harden-runner step and add it to EXPECTED_HR_JOBS and hr_expected.
+                fail "a harden-runner-EXEMPT job no longer matches the rationale that exempts it. Two things land here: it may now make network calls under no egress policy, OR — for check-label, whose whole node is digested because both gated jobs depend on its outputs — an edit to its if:, outputs:, step ids or runs-on that would skip integration-tests and test on every event while every other pin stays green; OR — for install-chrome-e2e — an edit to its container image or to its trigger if:, including a narrowing like \`if: false && (...)\` that keeps both trigger-arm names visible to the grep-based pin above and is caught only here, which drops the installer's only privileged-path coverage. Either restore the rationale, or give the job a harden-runner step and add it to EXPECTED_HR_JOBS and hr_expected.
         want: ${exempt_want}
-        got:  ${exempt_got}"
+        got:  ${exempt_got}
+        check-label node, which is what the digest is over: ${exempt_body}"
             fi ;;
     esac
 
@@ -3782,8 +3812,13 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       probe, each left every grep count identical and the suite green at 191/0 while the
 #       assertion meant the opposite of what AC3 needs. Text pins cannot read a condition's
 #       sense; running it can.
-#   +1  the two harden-runner-EXEMPT jobs' rationale — check-label's step body by sha256
-#       digest, install-chrome-e2e's `container:` key. Two weaker versions were measured
+#   +1  the two harden-runner-EXEMPT jobs' rationale — check-label's WHOLE JOB NODE by
+#       sha256 digest over its canonical JSON, plus install-chrome-e2e's `container:` key,
+#       its digest-pinned image and its trigger `if:`. The digest covered only check-label's
+#       step BODIES until round 10, which left every job-level key on the one gate-bearing
+#       job unread: `if: false`, a deleted or renamed `outputs.should-run`, a renamed gate
+#       step `id:`, a job-level `continue-on-error` and a changed `runs-on` were each
+#       measured surviving at 195/0, and each skips BOTH gated jobs on every event. Two weaker versions were measured
 #       first: counting steps missed a `curl` added INSIDE the existing single `run:`
 #       block, and grepping that body for a command list missed `gh api`,
 #       `python3 -c "urllib.request..."` and `exec 3<>/dev/tcp/host/443`. Enumerating
@@ -3813,7 +3848,7 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # disable-sudo deleted; allowed-endpoints rewritten as a YAML sequence. Caught by the
 # newer pins: a job added without harden-runner; install-chrome-e2e losing `container:`;
 # the AC3 step deleted, moved off the end, repointed, or given a `shell:` override; any
-# edit at all to check-label's step body; the AC3 script's unlisted host retyped, its
+# edit at all to check-label's job node; the AC3 script's unlisted host retyped, its
 # control probe deleted, its whole body no-op'd, its unlisted condition inverted to
 # `-ne 0`, and its control condition un-negated. The last two are caught only by the
 # behavioural scenarios — every grep count stays identical under both. The first two of the per-job list are the only
