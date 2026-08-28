@@ -50,6 +50,8 @@ Releases are triggered by pushing a `v*` tag; [`.github/workflows/release.yml`](
 
 Creating the tag is the gated part. An organization-level ruleset restricts creation of `refs/tags/v*`, so being on the roster above does not by itself let you cut a release. A maintainer without that permission asks a Praetorian organization administrator to create the tag.
 
+When cutting a release, update [`CITATION.cff`](CITATION.cff) so its `version` and `date-released` match the new tag and its release date. GitHub renders the "Cite this repository" metadata from that file, and nothing fails the build when it drifts, so it goes stale silently unless bumped here.
+
 ## Escalation
 
 If a pull request or issue stalls:
