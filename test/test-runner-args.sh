@@ -3570,6 +3570,19 @@ if [[ -f "$WORKFLOW" ]]; then
           # block's outcome. Emitting a cross-FILE uniformity pass over ONE file
           # would be a false claim, and emitting it in ADDITION to that fail put
           # the block one counted outcome above the pin — MEASURED: saw 237 vs 236.
+          #
+          # This arm sits ABOVE the -eq 1 case, so in the ci.yml-absent state it
+          # swallows EVERY non-zero count, not only the count-of-1 it was written
+          # for: with ci.yml gone AND a divergent SHA in live-tests.yml, no
+          # 'DIFFERENT SHAs' message is emitted. That is a deliberate trade, not
+          # an oversight — tightening it to `&& "$hr_sha_count" -eq 1` re-
+          # introduces the 237-vs-236 overcount in exactly that sub-case. It is
+          # tolerable because the arm is unreachable while ci.yml exists, and in
+          # the ci.yml-absent state the suite is already red on two other counted
+          # outcomes, so no GREEN run can hide a divergence behind it.
+          # block's outcome. Emitting a cross-FILE uniformity pass over ONE file
+          # would be a false claim, and emitting it in ADDITION to that fail put
+          # the block one counted outcome above the pin — MEASURED: saw 237 vs 236.
     elif [[ "$hr_sha_count" -eq 1 ]]; then
         pass "every harden-runner copy across live-tests.yml and ci.yml pins the same SHA"
     else
