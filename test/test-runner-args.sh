@@ -2677,16 +2677,16 @@ HR_PIN='step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920'
 # same reasoning as the shell-override pin below, where one job's override is required.
 GATED_JOB_IF="needs.check-label.outputs.should-run == 'true'"
 hr_expected() {
-    local endpoints jobif
+    local endpoints jobif needs
     case "$1" in
-        preflight-selftest)   endpoints='github.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='<none>' ;;
-        validator-regression) endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='<none>' ;;
-        docs-check)           endpoints='github.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='<none>' ;;
-        integration-tests)    endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ; jobif="$GATED_JOB_IF" ;;
-        test)                 endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ; jobif="$GATED_JOB_IF" ;;
+        preflight-selftest)   endpoints='github.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='false:' ; needs='' ;;
+        validator-regression) endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='false:' ; needs='' ;;
+        docs-check)           endpoints='github.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='false:' ; needs='' ;;
+        integration-tests)    endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ; jobif="true:$GATED_JOB_IF" ; needs='check-label' ;;
+        test)                 endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ; jobif="true:$GATED_JOB_IF" ; needs='check-label,preflight-selftest' ;;
         *) printf '%s\n' '<no expectation pinned>'; return 0 ;;
     esac
-    printf 'first=true runs=ubuntu-24.04 container=false services=false jobcoe=false jobif=%s || uses=%s policy=block sudo=true if=false coe=false eptype=!!str withkeys=allowed-endpoints,disable-sudo,egress-policy endpoints=%s\n' "$jobif" "$HR_PIN" "$endpoints"
+    printf 'first=true runs=ubuntu-24.04 container=false services=false jobcoe=false jobif=%s needs=%s || uses=%s policy=block sudo=true if=false coe=false eptype=!!str withkeys=allowed-endpoints,disable-sudo,egress-policy endpoints=%s\n' "$jobif" "$needs" "$HR_PIN" "$endpoints"
 }
 
 # The observed counterpart. Built with ONE yq call so each job costs exactly one
@@ -2717,7 +2717,8 @@ hr_policy() {
       + \" container=\" + ((.jobs.\"${job}\" | has(\"container\")) | tostring)
       + \" services=\" + ((.jobs.\"${job}\" | has(\"services\")) | tostring)
       + \" jobcoe=\" + ((.jobs.\"${job}\".\"continue-on-error\" // false) | tostring)
-      + \" jobif=\" + ((.jobs.\"${job}\".\"if\" // \"<none>\") | tostring)
+      + \" jobif=\" + ((.jobs.\"${job}\" | has(\"if\")) | tostring) + \":\" + ((.jobs.\"${job}\".\"if\" | tostring))
+      + \" needs=\" + (([.jobs.\"${job}\".needs] | flatten | map(select(. != null)) | sort | join(\",\")))
       + \" || \" + ([.jobs.\"${job}\".steps[] | select((.uses // \"\") | test(\"step-security/harden-runner\"))]
         | map(\"uses=\" + (.uses // \"<none>\")
             + \" policy=\" + (.with.\"egress-policy\" // \"<unset>\")
@@ -2753,7 +2754,7 @@ if [[ ! -f "$WORKFLOW" ]]; then
     # balanced section for a balanced suite. Those two figures are a measurement, not a pin,
     # and will drift as the suite grows — re-measure rather than trusting them. Only
     # EXPECTED_ASSERTIONS at the bottom of this file is self-enforcing.
-    for hr_pad in "the set of jobs carrying harden-runner" "the full job set" "the AC3 enforcement step and the exemption rationale" "the defaults.run.shell absence pin"; do
+    for hr_pad in "the set of jobs carrying harden-runner" "the full job set" "the AC3 enforcement step and the exemption rationale" "the workflow-shape pin (shell overrides, permissions, env)"; do
         fail "${hr_pad} could not be checked: $WORKFLOW is missing"
     done
 else
@@ -2776,7 +2777,7 @@ else
             # unmistakable at the call site rather than depending on the reader knowing that
             # rule. It fixes no defect, and there was none.
                 if [[ "$hr_got" == "$hr_want" ]]; then
-                    pass "${hr_job} harden-runner policy matches the pin (block, sudo, no step if:, first step, exact allowlist, plus the job shape that decides whether the policy applies at all: runs-on, no container:, no services:, job-level continue-on-error and if:, and the exact with: key set)"
+                    pass "${hr_job} harden-runner policy matches the pin (block, sudo, no step if:, first step, exact allowlist, plus the job shape that decides whether the policy applies at all or whether the job runs at all: runs-on, no container:, no services:, job-level continue-on-error, job-level if: by presence AND value, needs:, and the exact with: key set)"
                 else
                     fail "${hr_job} harden-runner policy does not match the pin — a job leaving 'block', gaining a second harden-runner step, an if:, a moved step, a changed SHA, a dropped disable-sudo, or a widened allowlist all land here. Update this file's pin deliberately if the change is intended.
         want: ${hr_want}
@@ -2920,23 +2921,28 @@ else
     # one, a workflow-level override, or any step-level `shell:` all fail. If another job
     # ever legitimately needs one, add it here deliberately — forcing that review is the
     # point.
-    shelldef_got=$(yq_query '"wf=" + ((.defaults.run.shell // "<none>") | tostring)
-      + " jobs=" + ([.jobs | to_entries[] | select(.value.defaults.run.shell)
-                     | .key + ":" + .value.defaults.run.shell] | sort | join(","))
+    shelldef_got=$(yq_query '"wfdefrun=" + ((.defaults.run // {} | to_entries
+                     | map(.key + "=" + (.value | tostring)) | sort | join(";")))
+      + " jobdefrun=" + ([.jobs | to_entries[] | select(.value.defaults.run) | .key + ":"
+                     + (.value.defaults.run | to_entries | map(.key + "=" + (.value | tostring))
+                        | sort | join("/"))] | sort | join(","))
       + " steps=" + ([.jobs[].steps[] | select(.shell)] | length | tostring)
       + " wfperms=" + ((.permissions | tostring))
       + " jobperms=" + ([.jobs | to_entries[] | select(.value.permissions)
                      | .key + ":" + (.value.permissions | tostring)] | sort | join(","))
-      + " wfenv=" + ((.env // {} | keys | join(",")))' -r)
-    shelldef_want='wf=<none> jobs=install-chrome-e2e:bash steps=0 wfperms=contents: read jobperms=install-chrome-e2e:contents: read wfenv='
+      + " wfenv=" + ((.env // {} | keys | join(",")))
+      + " jobenv=" + ([.jobs | to_entries[] | select(.value.env) | .key + ":"
+                     + (.value.env | to_entries | map(.key + "=" + (.value | tostring))
+                        | sort | join("/"))] | sort | join(","))' -r)
+    shelldef_want='wfdefrun= jobdefrun=install-chrome-e2e:shell=bash steps=0 wfperms=contents: read jobperms=install-chrome-e2e:contents: read wfenv= jobenv=integration-tests:VESPASIAN_NO_SANDBOX=true/VESPASIAN_REQUIRE_CHROME=1,preflight-selftest:GOTOOLCHAIN=local,test:VESPASIAN_NO_SANDBOX=true'
     case "$shelldef_got" in
-        __NO_YQ__)    fail_no_yq "the defaults.run.shell absence pin" ;;
-        __YQ_ERROR__) fail_yq_error "the defaults.run.shell absence pin" ;;
+        __NO_YQ__)    fail_no_yq "the workflow-shape pin (shell overrides, permissions, env)" ;;
+        __YQ_ERROR__) fail_yq_error "the workflow-shape pin (shell overrides, permissions, env)" ;;
         *)
             if [[ "$shelldef_got" == "$shelldef_want" ]]; then
-                pass "workflow shape pinned: the only shell override is install-chrome-e2e's required defaults.run.shell: bash, permissions are contents: read at both levels, and there is no workflow-level env:"
+                pass "workflow shape pinned: the whole defaults.run node at both levels (only install-chrome-e2e's shell: bash), no step-level shell:, permissions contents: read at both levels, no workflow-level env:, and every job-level env: block matches its pinned key=value set"
             else
-                fail "a shell override appeared in live-tests.yml. A workflow- or job-level \`defaults.run.shell\` applies to every run: step without appearing on any of them, so it silently redirects all four guard suites and the AC3 egress proof through a different interpreter — measured green at 194/0 with \`shell: cat {0}\`, every step a no-op. If an override is genuinely wanted, update this pin deliberately.
+                fail "the workflow SHAPE changed in live-tests.yml — a defaults.run override (shell OR working-directory), a step-level shell:, a permissions widening, a workflow-level env:, or an edit to a job-level env: block. A workflow- or job-level \`defaults.run.shell\` applies to every run: step without appearing on any of them, so it silently redirects all four guard suites and the AC3 egress proof through a different interpreter — measured green at 194/0 with \`shell: cat {0}\`, every step a no-op. If an override is genuinely wanted, update this pin deliberately.
         want: ${shelldef_want}
         got:  ${shelldef_got}"
             fi ;;
@@ -3699,7 +3705,19 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       StepSecurity's off-repo control plane with every pinned field byte-identical, which
 #       is the widest of the five. `withkeys=` pins the key SET rather than enumerating
 #       inputs, the same way check-label's body is pinned by digest rather than by grepping
-#       for egress methods. Original evidence: `runs-on: macos-14` left the policy byte-identical while
+#       for egress methods. Round 9 folded in three more, again for zero new outcomes, again
+#       each a measured survivor at 195/0: `needs=` (dropping `check-label` from a gated
+#       job's `needs:` makes the pinned `if:` expression resolve false, so the job is skipped
+#       on every event with every field byte-identical), and `jobif=` re-spelled as
+#       presence-AND-value because `//` substitutes on FALSE as well as null — `if: false`
+#       rendered identically to no `if:` at all, and docs-check is on neither grep-based
+#       if-guard list, so `if: false` there was green. The workflow-shape pin likewise moved
+#       from the `.defaults.run.shell` LEAF to the whole `.defaults.run` NODE, because
+#       `working-directory` is the unpinned sibling of the key the pin was built around and
+#       re-roots every relative guard invocation; and it gained per-job `env:` by key=value,
+#       because workflow-level `env:` was pinned while THREE policy jobs already carry a
+#       job-level block — including `preflight-selftest`, where a `PATH:` entry shadows the
+#       `yq` every pin in this section depends on. Original evidence: `runs-on: macos-14` left the policy byte-identical while
 #       harden-runner silently does not enforce off Linux, and `continue-on-error: true`
 #       on the step was caught for three of the five jobs by the un-gated-job guards
 #       above but not for docs-check or integration-tests. Both measured MISSED first.
@@ -3713,13 +3731,18 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       invocation of test/assert-egress-enforced.sh. Measured: the step shipped
 #       unpinned and deleting it left the suite green; later, `shell: cat {0}` left the
 #       run value byte-identical while the runner merely CAT-ed the script and exited 0.
-#   +1  the absence of any shell override beyond install-chrome-e2e's required one. A
+#   +1  the workflow SHAPE: shell overrides, `permissions` at both levels, and the absence
+#       of a workflow-level `env:`. Shell first, since that is why the pin exists. A
 #       workflow- or job-level `defaults.run.shell` applies to every `run:` step without
 #       appearing on any of them, so it is a strictly wider bypass than the per-step
 #       `shell:` pinned by the AC3 entry above. Measured: three lines of
 #       `defaults: run: shell: cat {0}` at the top of the file left every assertion
 #       untouched and the suite green at 194/0 while all four guard suites and the AC3
-#       proof became `cat` no-ops.
+#       proof became `cat` no-ops. `permissions` and `env:` were folded onto this same yq
+#       call in round 8 for zero extra outcomes, both also measured survivors: widening the
+#       workflow's `contents: read` to `contents: write` was green at 195/0, and nothing read
+#       `.env` at all — which matters because the AC3 proof resolves `curl` from `PATH`, so a
+#       workflow-level `env: PATH:` is the shell bypass in a different key.
 #   +3  the AC3 script's BEHAVIOUR — the script executed against a stub `curl` in three
 #       scenarios (enforcing; unlisted host reachable; no egress at all), asserted on exit
 #       code. Measured: inverting `-eq 0` to `-ne 0`, and dropping the `!` from the control
