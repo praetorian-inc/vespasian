@@ -2780,9 +2780,22 @@ else
                 if [[ "$hr_got" == "$hr_want" ]]; then
                     pass "${hr_job} harden-runner policy matches the pin (block, sudo, no step if:, first step, exact allowlist, plus the job shape that decides whether the policy applies at all or whether the job runs at all: runs-on, no container:, no services:, job-level continue-on-error, job-level if: by presence AND value, needs:, the set of actions the job uses, and the exact with: key set)"
                 else
-                    fail "${hr_job} harden-runner policy does not match the pin — a job leaving 'block', gaining a second harden-runner step, an if:, a moved step, a changed SHA, a dropped disable-sudo, or a widened allowlist all land here. Update this file's pin deliberately if the change is intended.
-        want: ${hr_want}
-        got:  ${hr_got}"
+                    # Rendered ONE FIELD PER LINE, not as two 600-character strings. The
+                    # pin now compares fourteen fields per job and the old output put them on
+                    # a single line, so a one-token drift — `needs=check-label` to `needs=` —
+                    # was a byte-diff a reader had to find by eye between a quoted `if:`
+                    # expression and a comma-joined action list. Two review lanes independently
+                    # called that the failure people bump the pin to silence rather than
+                    # investigate. `sed` on a herestring, not a pipe: this file has a
+                    # pipefail/SIGPIPE history on large inputs.
+                    # `[a-z0-9_][a-z0-9_]*=` and not `[a-z0-9_]*=`: the star form matches the
+                    # EMPTY name, so it split on the bare ` =` inside the gated jobs' `if:`
+                    # expression (`== 'true'`) and broke one field across two lines.
+                    hr_want_lines=$(sed 's/ \([a-z0-9_][a-z0-9_]*=\)/\n        \1/g' <<< "$hr_want")
+                    hr_got_lines=$(sed 's/ \([a-z0-9_][a-z0-9_]*=\)/\n        \1/g' <<< "$hr_got")
+                    fail "${hr_job} harden-runner policy does not match the pin. Any of these lands here: the egress policy leaving 'block'; a second harden-runner step; a changed action SHA; a dropped disable-sudo; a widened allowlist or a changed allowed-endpoints node type; a fourth with: input; a step-level if: or continue-on-error; a moved step; or — the job-shape half — a changed runs-on, a container: or services: key, a job-level continue-on-error or if:, a changed needs:, or an action added to or removed from the job. Update this file's pin deliberately if the change is intended.
+        want:${hr_want_lines}
+        got: ${hr_got_lines}"
                 fi ;;
         esac
     done
@@ -2922,30 +2935,28 @@ else
     # one, a workflow-level override, or any step-level `shell:` all fail. If another job
     # ever legitimately needs one, add it here deliberately — forcing that review is the
     # point.
-    shelldef_got=$(yq_query '"wfdefrun=" + ((.defaults.run // {} | to_entries
+    wfshape_got=$(yq_query '"wfdefrun=" + ((.defaults.run // {} | to_entries
                      | map(.key + "=" + (.value | tostring)) | sort | join(";")))
-      + " jobdefrun=" + ([.jobs | to_entries[] | select(.value.defaults.run) | .key + ":"
-                     + (.value.defaults.run | to_entries | map(.key + "=" + (.value | tostring))
-                        | sort | join("/"))] | sort | join(","))
+      + " jobdefrun=" + ([.jobs | to_entries[] | select(.value.defaults.run)
+                     | {(.key): (.value.defaults.run | sort_keys(..))}] | sort_by(keys[0]) | tojson(0))
       + " steps=" + ([.jobs[].steps[] | select(.shell)] | length | tostring)
       + " wfperms=" + ((.permissions | tostring))
       + " jobperms=" + ([.jobs | to_entries[] | select(.value.permissions)
                      | .key + ":" + (.value.permissions | tostring)] | sort | join(","))
       + " wfenv=" + ((.env // {} | keys | join(",")))
-      + " jobenv=" + ([.jobs | to_entries[] | select(.value.env) | .key + ":"
-                     + (.value.env | to_entries | map(.key + "=" + (.value | tostring))
-                        | sort | join("/"))] | sort | join(","))' -r)
-    shelldef_want='wfdefrun= jobdefrun=install-chrome-e2e:shell=bash steps=0 wfperms=contents: read jobperms=install-chrome-e2e:contents: read wfenv= jobenv=integration-tests:VESPASIAN_NO_SANDBOX=true/VESPASIAN_REQUIRE_CHROME=1,preflight-selftest:GOTOOLCHAIN=local,test:VESPASIAN_NO_SANDBOX=true'
-    case "$shelldef_got" in
+      + " jobenv=" + ([.jobs | to_entries[] | select(.value.env)
+                     | {(.key): (.value.env | sort_keys(..))}] | sort_by(keys[0]) | tojson(0))' -r)
+    wfshape_want='wfdefrun= jobdefrun=[{"install-chrome-e2e":{"shell":"bash"}}] steps=0 wfperms=contents: read jobperms=install-chrome-e2e:contents: read wfenv= jobenv=[{"integration-tests":{"VESPASIAN_NO_SANDBOX":"true","VESPASIAN_REQUIRE_CHROME":"1"}},{"preflight-selftest":{"GOTOOLCHAIN":"local"}},{"test":{"VESPASIAN_NO_SANDBOX":"true"}}]'
+    case "$wfshape_got" in
         __NO_YQ__)    fail_no_yq "the workflow-shape pin (shell overrides, permissions, env)" ;;
         __YQ_ERROR__) fail_yq_error "the workflow-shape pin (shell overrides, permissions, env)" ;;
         *)
-            if [[ "$shelldef_got" == "$shelldef_want" ]]; then
+            if [[ "$wfshape_got" == "$wfshape_want" ]]; then
                 pass "workflow shape pinned: the whole defaults.run node at both levels (only install-chrome-e2e's shell: bash), no step-level shell:, permissions contents: read at both levels, no workflow-level env:, and every job-level env: block matches its pinned key=value set"
             else
                 fail "the workflow SHAPE changed in live-tests.yml — a defaults.run override (shell OR working-directory), a step-level shell:, a permissions widening, a workflow-level env:, or an edit to a job-level env: block. A workflow- or job-level \`defaults.run.shell\` applies to every run: step without appearing on any of them, so it silently redirects all four guard suites and the AC3 egress proof through a different interpreter — measured green at 194/0 with \`shell: cat {0}\`, every step a no-op. If an override is genuinely wanted, update this pin deliberately.
-        want: ${shelldef_want}
-        got:  ${shelldef_got}"
+        want: ${wfshape_want}
+        got:  ${wfshape_got}"
             fi ;;
     esac
 
@@ -2980,8 +2991,9 @@ else
     # code; recorded because the same commit corrects another wrong bash rule elsewhere.
     exempt_raw=$(yq_query '"checklabel_steps=" + (.jobs."check-label".steps | length | tostring)
       + " e2e_container=" + ((.jobs."install-chrome-e2e" | has("container")) | tostring)
-      + " body=" + ([.jobs."check-label".steps[] | (.run // "")] | join("\n"))' -r)
-    exempt_want="checklabel_steps=1 e2e_container=true bodysha=adfd8746e0765af09eae6267eb7262aff5f638fb39cdcf08de408c08a5a1a8c6"
+      + " e2e_if=" + ((.jobs."install-chrome-e2e".if | tostring))
+      + " body=" + (.jobs."check-label" | sort_keys(..) | tojson(0))' -r)
+    exempt_want="checklabel_steps=1 e2e_container=true e2e_if=github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') bodysha=03883c7aed8cf43558774ccfa505a3a0c65f823b7f04bbcd6cc97298c36c16cc"
     case "$exempt_raw" in
         __NO_YQ__)    fail_no_yq "the harden-runner exemption rationale for check-label and install-chrome-e2e" ;;
         __YQ_ERROR__) fail_yq_error "the harden-runner exemption rationale for check-label and install-chrome-e2e" ;;
@@ -3713,21 +3725,27 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       presence-AND-value because `//` substitutes on FALSE as well as null — `if: false`
 #       rendered identically to no `if:` at all, and docs-check is on neither grep-based
 #       if-guard list, so `if: false` there was green. The workflow-shape pin likewise moved
-#       from the `.defaults.run.shell` LEAF to the whole `.defaults.run` NODE, because
-#       `working-directory` is the unpinned sibling of the key the pin was built around and
-#       re-roots every relative guard invocation; and it gained per-job `env:` by key=value,
-#       because workflow-level `env:` was pinned while THREE policy jobs already carry a
-#       job-level block — including `preflight-selftest`, where a `PATH:` entry shadows the
-#       `yq` every pin in this section depends on. Round 9 also folded in `usesset=`, the
+#       from the `.defaults.run.shell` leaf to the whole node and gained per-job `env:` —
+#       both accounted under the workflow-shape +1 below, where they are counted. Round 9
+#       also folded in `usesset=`, the
 #       per-job set of `uses:` action names: `first=true` pins that harden-runner is
 #       steps[0], but the runner hoists every action's `pre:` script to the start of the
-#       job, so an action later in the list could still execute before the policy takes
-#       effect. No action in this workflow declares a `pre:` today (checked at each pinned
-#       SHA: checkout, setup-go, setup-node and upload-artifact are `post:`-only), so there
-#       is no exposure right now — the pin is there so that ADDING one is not silent, and it
-#       makes any action added to or removed from a policy job a counted failure.
-#       Measured CAUGHT: `actions/cache` added to three different policy jobs, the
-#       upload-artifact step deleted, and its action name swapped. Original evidence: `runs-on: macos-14` left the policy byte-identical while
+#       job. Be exact about what that does and does not buy, because the first version of
+#       this entry overstated it: harden-runner ITSELF declares a `pre:` (read at the pinned
+#       SHA — `runs.using: node24`, `pre: dist/pre/index.js`), and the runner executes `pre`
+#       scripts in step-declaration order, so harden-runner being steps[0] means its own
+#       `pre:` runs BEFORE any other action's. Another action's `pre:` therefore runs after
+#       the policy is installed, not before it, and `first=true` already carries that. Of the
+#       four other actions here, none declares a `pre:` at its pinned SHA anyway (checkout,
+#       setup-go and setup-node are `post:`-only; upload-artifact has neither).
+#
+#       So `usesset=` is NOT closing a live hole, and the earlier claim that it was is
+#       withdrawn. What it buys is narrower and still worth one field: any action ADDED to or
+#       REMOVED from a policy job becomes a counted failure rather than a silent edit, which
+#       matters because every action is extra code running inside a job whose whole point is
+#       a constrained egress policy. Measured CAUGHT: `actions/cache` added to three
+#       different policy jobs, the upload-artifact step deleted, and its action name
+#       swapped at the same SHA. Original evidence: `runs-on: macos-14` left the policy byte-identical while
 #       harden-runner silently does not enforce off Linux, and `continue-on-error: true`
 #       on the step was caught for three of the five jobs by the un-gated-job guards
 #       above but not for docs-check or integration-tests. Both measured MISSED first.
@@ -3741,8 +3759,13 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       invocation of test/assert-egress-enforced.sh. Measured: the step shipped
 #       unpinned and deleting it left the suite green; later, `shell: cat {0}` left the
 #       run value byte-identical while the runner merely CAT-ed the script and exited 0.
-#   +1  the workflow SHAPE: shell overrides, `permissions` at both levels, and the absence
-#       of a workflow-level `env:`. Shell first, since that is why the pin exists. A
+#   +1  the workflow SHAPE, in one outcome: the whole `defaults.run` NODE at workflow and
+#       job level (so `working-directory`, which re-roots every relative guard invocation,
+#       is covered alongside `shell`), no step-level `shell:`, `permissions` at both levels,
+#       and EVERY `env:` block — workflow-level and per-job. The per-job half matters because
+#       three policy jobs already carry one, `preflight-selftest` included, where a `PATH:`
+#       entry shadows the `yq` this whole section depends on; pinning only the workflow level
+#       left the exposure one key away. Shell came first, since that is why the pin exists. A
 #       workflow- or job-level `defaults.run.shell` applies to every `run:` step without
 #       appearing on any of them, so it is a strictly wider bypass than the per-step
 #       `shell:` pinned by the AC3 entry above. Measured: three lines of
