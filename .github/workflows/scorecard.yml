@@ -15,6 +15,13 @@ on:
   push:
     branches: ["main"]
 
+# Serialize overlapping runs on the same ref (rapid pushes to main, or a push
+# landing during the scheduled run) so a later commit's score/SARIF never loses
+# a publish race to an earlier run. Matches the ci.yml/security.yml convention.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 # Declare default permissions as read-only.
 permissions: read-all
 
