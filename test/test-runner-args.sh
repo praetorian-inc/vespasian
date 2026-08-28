@@ -2677,16 +2677,16 @@ HR_PIN='step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920'
 # same reasoning as the shell-override pin below, where one job's override is required.
 GATED_JOB_IF="needs.check-label.outputs.should-run == 'true'"
 hr_expected() {
-    local endpoints jobif needs
+    local endpoints jobif needs usesset
     case "$1" in
-        preflight-selftest)   endpoints='github.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='false:' ; needs='' ;;
-        validator-regression) endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='false:' ; needs='' ;;
-        docs-check)           endpoints='github.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='false:' ; needs='' ;;
-        integration-tests)    endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ; jobif="true:$GATED_JOB_IF" ; needs='check-label' ;;
-        test)                 endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ; jobif="true:$GATED_JOB_IF" ; needs='check-label,preflight-selftest' ;;
+        preflight-selftest)   endpoints='github.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='false:' ; needs='' ; usesset='actions/checkout,step-security/harden-runner' ;;
+        validator-regression) endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='false:' ; needs='' ; usesset='actions/checkout,actions/setup-node,step-security/harden-runner' ;;
+        docs-check)           endpoints='github.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='false:' ; needs='' ; usesset='actions/checkout,step-security/harden-runner' ;;
+        integration-tests)    endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ; jobif="true:$GATED_JOB_IF" ; needs='check-label' ; usesset='actions/checkout,actions/setup-go,step-security/harden-runner' ;;
+        test)                 endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ; jobif="true:$GATED_JOB_IF" ; needs='check-label,preflight-selftest' ; usesset='actions/checkout,actions/setup-go,actions/setup-node,actions/upload-artifact,step-security/harden-runner' ;;
         *) printf '%s\n' '<no expectation pinned>'; return 0 ;;
     esac
-    printf 'first=true runs=ubuntu-24.04 container=false services=false jobcoe=false jobif=%s needs=%s || uses=%s policy=block sudo=true if=false coe=false eptype=!!str withkeys=allowed-endpoints,disable-sudo,egress-policy endpoints=%s\n' "$jobif" "$needs" "$HR_PIN" "$endpoints"
+    printf 'first=true runs=ubuntu-24.04 container=false services=false jobcoe=false jobif=%s needs=%s usesset=%s || uses=%s policy=block sudo=true if=false coe=false eptype=!!str withkeys=allowed-endpoints,disable-sudo,egress-policy endpoints=%s\n' "$jobif" "$needs" "$usesset" "$HR_PIN" "$endpoints"
 }
 
 # The observed counterpart. Built with ONE yq call so each job costs exactly one
@@ -2719,6 +2719,7 @@ hr_policy() {
       + \" jobcoe=\" + ((.jobs.\"${job}\".\"continue-on-error\" // false) | tostring)
       + \" jobif=\" + ((.jobs.\"${job}\" | has(\"if\")) | tostring) + \":\" + ((.jobs.\"${job}\".\"if\" | tostring))
       + \" needs=\" + (([.jobs.\"${job}\".needs] | flatten | map(select(. != null)) | sort | join(\",\")))
+      + \" usesset=\" + (([.jobs.\"${job}\".steps[] | select(.uses) | (.uses | sub(\"@.*\"; \"\"))] | sort | join(\",\")))
       + \" || \" + ([.jobs.\"${job}\".steps[] | select((.uses // \"\") | test(\"step-security/harden-runner\"))]
         | map(\"uses=\" + (.uses // \"<none>\")
             + \" policy=\" + (.with.\"egress-policy\" // \"<unset>\")
@@ -2777,7 +2778,7 @@ else
             # unmistakable at the call site rather than depending on the reader knowing that
             # rule. It fixes no defect, and there was none.
                 if [[ "$hr_got" == "$hr_want" ]]; then
-                    pass "${hr_job} harden-runner policy matches the pin (block, sudo, no step if:, first step, exact allowlist, plus the job shape that decides whether the policy applies at all or whether the job runs at all: runs-on, no container:, no services:, job-level continue-on-error, job-level if: by presence AND value, needs:, and the exact with: key set)"
+                    pass "${hr_job} harden-runner policy matches the pin (block, sudo, no step if:, first step, exact allowlist, plus the job shape that decides whether the policy applies at all or whether the job runs at all: runs-on, no container:, no services:, job-level continue-on-error, job-level if: by presence AND value, needs:, the set of actions the job uses, and the exact with: key set)"
                 else
                     fail "${hr_job} harden-runner policy does not match the pin — a job leaving 'block', gaining a second harden-runner step, an if:, a moved step, a changed SHA, a dropped disable-sudo, or a widened allowlist all land here. Update this file's pin deliberately if the change is intended.
         want: ${hr_want}
@@ -3717,7 +3718,16 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       re-roots every relative guard invocation; and it gained per-job `env:` by key=value,
 #       because workflow-level `env:` was pinned while THREE policy jobs already carry a
 #       job-level block — including `preflight-selftest`, where a `PATH:` entry shadows the
-#       `yq` every pin in this section depends on. Original evidence: `runs-on: macos-14` left the policy byte-identical while
+#       `yq` every pin in this section depends on. Round 9 also folded in `usesset=`, the
+#       per-job set of `uses:` action names: `first=true` pins that harden-runner is
+#       steps[0], but the runner hoists every action's `pre:` script to the start of the
+#       job, so an action later in the list could still execute before the policy takes
+#       effect. No action in this workflow declares a `pre:` today (checked at each pinned
+#       SHA: checkout, setup-go, setup-node and upload-artifact are `post:`-only), so there
+#       is no exposure right now — the pin is there so that ADDING one is not silent, and it
+#       makes any action added to or removed from a policy job a counted failure.
+#       Measured CAUGHT: `actions/cache` added to three different policy jobs, the
+#       upload-artifact step deleted, and its action name swapped. Original evidence: `runs-on: macos-14` left the policy byte-identical while
 #       harden-runner silently does not enforce off Linux, and `continue-on-error: true`
 #       on the step was caught for three of the five jobs by the un-gated-job guards
 #       above but not for docs-check or integration-tests. Both measured MISSED first.
