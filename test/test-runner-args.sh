@@ -2659,7 +2659,17 @@ EXPECTED_HR_JOBS=(preflight-selftest validator-regression docs-check integration
 
 # One entry per job above, and the value is the whole policy: the pinned action,
 # the egress mode, disable-sudo, whether the step carries an `if:`, whether
-# harden-runner is the job's FIRST step, and the allowlist as a sorted set.
+# harden-runner is the job's FIRST step, the job's `runs-on`, whether the step is
+# marked `continue-on-error`, and the allowlist as a sorted set.
+#
+# `runs=` and `coe=` were added in review of this PR, both measured MISSED first.
+# `runs-on` matters because harden-runner only enforces on Linux GitHub-hosted
+# runners: switching a job to `macos-14` leaves every other field byte-identical
+# and the policy simply does not apply — `block` degrades to nothing, job green.
+# `continue-on-error: true` on the harden-runner step was caught for three of the
+# five jobs by the un-gated-job guards further up, but NOT for docs-check or
+# integration-tests, which those guards do not cover; folding it in here makes the
+# coverage uniform across all five rather than incidental.
 # hr_policy() below builds the same string from the workflow with one yq call.
 HR_PIN='step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920'
 hr_expected() {
@@ -2672,7 +2682,7 @@ hr_expected() {
         test)                 endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ;;
         *) printf '%s\n' '<no expectation pinned>'; return 0 ;;
     esac
-    printf 'first=true || uses=%s policy=block sudo=true if=false eptype=!!str endpoints=%s\n' "$HR_PIN" "$endpoints"
+    printf 'first=true runs=ubuntu-24.04 || uses=%s policy=block sudo=true if=false coe=false eptype=!!str endpoints=%s\n' "$HR_PIN" "$endpoints"
 }
 
 # The observed counterpart. Built with ONE yq call so each job costs exactly one
@@ -2699,11 +2709,13 @@ hr_expected() {
 hr_policy() {
     local job=$1
     yq_query "\"first=\" + ((.jobs.\"${job}\".steps[0].uses // \"\") | test(\"step-security/harden-runner\") | tostring)
+      + \" runs=\" + ((.jobs.\"${job}\".\"runs-on\" // \"<unset>\") | tostring)
       + \" || \" + ([.jobs.\"${job}\".steps[] | select((.uses // \"\") | test(\"step-security/harden-runner\"))]
         | map(\"uses=\" + (.uses // \"<none>\")
             + \" policy=\" + (.with.\"egress-policy\" // \"<unset>\")
             + \" sudo=\" + ((.with.\"disable-sudo\" // \"<unset>\") | tostring)
             + \" if=\" + ((has(\"if\")) | tostring)
+            + \" coe=\" + ((.\"continue-on-error\" // false) | tostring)
             + \" eptype=\" + (.with.\"allowed-endpoints\" | type)
             + \" endpoints=\" + ([.with.\"allowed-endpoints\"] | flatten | join(\" \") | sub(\"\s+\"; \" \") | split(\" \") | map(select(. != \"\")) | sort | join(\",\")))
         | join(\" ;; \"))" -r
@@ -2722,12 +2734,14 @@ if [[ ! -f "$WORKFLOW" ]]; then
     # 9 outcomes in each arm.
     #
     # This makes THIS SECTION constant, not the file. With the workflow absent the
-    # whole suite still reports 93 against a pin of 144, because three other blocks
-    # (at the `if [[ -f "$WORKFLOW" ]]` guards further up and down this file) have no
-    # else arm and emit nothing. That imbalance predates this ticket and is not
-    # LAB-6015's to fix; stated here so the next reader does not take a balanced
-    # section for a balanced suite.
-    for hr_pad in "the set of jobs carrying harden-runner" "the full job set" "the AC3 enforcement step and the exemption rationale"; do
+    # whole suite still comes up short of its pin — 140 outcomes against 194, MEASURED at
+    # this head — because three other blocks (at the `if [[ -f "$WORKFLOW" ]]` guards
+    # further up and down this file) have no else arm and emit nothing. That imbalance
+    # predates this ticket and is not LAB-6015's to fix; stated here so the next reader
+    # does not take a balanced section for a balanced suite. Those two figures are a measurement, not a pin, and
+    # will drift as the suite grows — re-measure rather than trusting them. Only
+    # EXPECTED_ASSERTIONS at the bottom of this file is self-enforcing.
+    for hr_pad in "the set of jobs carrying harden-runner" "the full job set" "the AC3 enforcement step and the exemption rationale" "the defaults.run.shell absence pin"; do
         fail "${hr_pad} could not be checked: $WORKFLOW is missing"
     done
 else
@@ -2856,67 +2870,49 @@ else
             fi ;;
     esac
 
-    # BEHAVIOUR, not text: run the script against a stub `curl` and assert its exit code
-    # in three scenarios. This exists because the grep pin above counts the probe calls
-    # but cannot read their SENSE, and a reviewer on PR #226 pointed out the consequence:
-    # flipping `-eq 0` to `-ne 0`, or `if ! curl` to `if curl`, leaves all three counts at
-    # 1/1/2 and the pin green while the assertion means the OPPOSITE of what AC3 needs —
-    # the unlisted host becoming reachable would then pass as proof of enforcement. Both
-    # inversions were measured MISSED before this block was written. No pattern over
-    # free-form shell closes that; executing it does.
-    #
-    # The stub also removes the last of the "editing the body to a no-op still passes"
-    # residual: an early `exit 0` passes scenario 1 and fails 2 and 3.
-    #
-    # Three outcomes in every arm, including when the script is absent, so the count stays
-    # constant by construction the way the rest of this section is.
-    ac3_beh_dir=$(mktemp -d)
-    cat > "$ac3_beh_dir/curl" <<'AC3SHIM'
-#!/usr/bin/env bash
-# Stub curl: exit code chosen per host from the environment. Any other URL exits 0.
-for a in "$@"; do
-    case "$a" in
-        *proxy.golang.org*) exit "${SHIM_UNLISTED_RC:-7}" ;;
-        *github.com*)       exit "${SHIM_CONTROL_RC:-0}" ;;
-    esac
-done
-exit 0
-AC3SHIM
-    chmod +x "$ac3_beh_dir/curl"
-    # $1 = stubbed exit for the unlisted host, $2 = for the allowlisted control host.
-    _ac3_behaviour() {
-        local _rc
-        set +e
-        SHIM_UNLISTED_RC="$1" SHIM_CONTROL_RC="$2" PATH="$ac3_beh_dir:$PATH" \
-            bash "$SCRIPT_DIR/assert-egress-enforced.sh" >/dev/null 2>&1
-        _rc=$?
-        set -e
-        printf '%s' "$_rc"
-    }
-    if [[ -f "$SCRIPT_DIR/assert-egress-enforced.sh" ]]; then
-        ac3_b_enforcing=$(_ac3_behaviour 7 0)
-        ac3_b_notenforcing=$(_ac3_behaviour 0 0)
-        ac3_b_noegress=$(_ac3_behaviour 7 7)
-    else
-        ac3_b_enforcing=absent; ac3_b_notenforcing=absent; ac3_b_noegress=absent
-    fi
-    rm -rf "$ac3_beh_dir"
 
-    if [[ "$ac3_b_enforcing" == 0 ]]; then
-        pass "AC3 behaviour: a correctly enforcing runner (unlisted refused, control reachable) exits 0"
-    else
-        fail "test/assert-egress-enforced.sh does NOT exit 0 on the enforcing case (stub: unlisted exit 7, control exit 0) — got exit ${ac3_b_enforcing}. A working block policy would fail this job. The usual cause is an inverted condition: \`-ne 0\` where the unlisted probe needs \`-eq 0\`, or a dropped \`!\` on the control probe."
-    fi
-    if [[ "$ac3_b_notenforcing" == 1 ]]; then
-        pass "AC3 behaviour: an unlisted host that is REACHABLE fails the job (the policy is not enforcing)"
-    else
-        fail "test/assert-egress-enforced.sh does NOT fail when the unlisted host is reachable (stub: unlisted exit 0, control exit 0) — got exit ${ac3_b_notenforcing}, expected 1. This is the inversion that matters: the one runtime proof that block mode enforces would pass on a runner where it does not. Check the sense of the unlisted-probe condition."
-    fi
-    if [[ "$ac3_b_noegress" == 1 ]]; then
-        pass "AC3 behaviour: a runner with NO egress at all fails the job rather than passing vacuously"
-    else
-        fail "test/assert-egress-enforced.sh does NOT fail when the allowlisted control host is also unreachable (stub: both exit 7) — got exit ${ac3_b_noegress}, expected 1. Without this the refusal above proves nothing: a total egress outage would read as a working policy."
-    fi
+    # A `defaults.run.shell` override defeats EVERY run: step in one place, so pin its
+    # absence. The AC3 pin above reads the STEP's own `shell:` key, and GitHub also honours
+    # `defaults.run.shell` at workflow level and at job level, neither of which appears on
+    # the step. Measured: adding three lines at the top of the file —
+    #
+    #     defaults:
+    #       run:
+    #         shell: cat {0}
+    #
+    # left the AC3 pin reading `shell=<default>`, every other assertion untouched, and the
+    # suite green at 194/0 — while every `run:` in the workflow became `cat <file>`. That is
+    # all four guard suites AND the AC3 enforcement proof turned into no-ops at once, with
+    # the job still green. It is a strictly wider bypass than the per-step `shell:` this
+    # file already pins, and it was invisible to every existing check.
+    #
+    # Pinned as an exact SET rather than a blanket absence, because there is one legitimate
+    # override and pinning `0` would have been a lie that failed on the first run. The
+    # container job install-chrome-e2e sets `defaults.run.shell: bash` and MUST: a container
+    # job's `run:` defaults to `sh -e {0}`, so `set -euo pipefail` dies on line 1 with
+    # "Illegal option -o pipefail" before any assertion executes — measured in run
+    # 32388761616, the first time that job ran. So the expectation names that job and its
+    # value, and everything else must be empty. A NEW job-level override, a change to this
+    # one, a workflow-level override, or any step-level `shell:` all fail. If another job
+    # ever legitimately needs one, add it here deliberately — forcing that review is the
+    # point.
+    shelldef_got=$(yq_query '"wf=" + ((.defaults.run.shell // "<none>") | tostring)
+      + " jobs=" + ([.jobs | to_entries[] | select(.value.defaults.run.shell)
+                     | .key + ":" + .value.defaults.run.shell] | sort | join(",") | (. // ""))
+      + " steps=" + ([.jobs[].steps[] | select(.shell)] | length | tostring)' -r)
+    shelldef_want='wf=<none> jobs=install-chrome-e2e:bash steps=0'
+    case "$shelldef_got" in
+        __NO_YQ__)    fail_no_yq "the defaults.run.shell absence pin" ;;
+        __YQ_ERROR__) fail_yq_error "the defaults.run.shell absence pin" ;;
+        *)
+            if [[ "$shelldef_got" == "$shelldef_want" ]]; then
+                pass "the only shell override is install-chrome-e2e's required defaults.run.shell: bash — none at workflow level, none on any step, no other job"
+            else
+                fail "a shell override appeared in live-tests.yml. A workflow- or job-level \`defaults.run.shell\` applies to every run: step without appearing on any of them, so it silently redirects all four guard suites and the AC3 egress proof through a different interpreter — measured green at 194/0 with \`shell: cat {0}\`, every step a no-op. If an override is genuinely wanted, update this pin deliberately.
+        want: ${shelldef_want}
+        got:  ${shelldef_got}"
+            fi ;;
+    esac
 
     # The two checks above cover jobs that carry the policy and the job (LAB-6015 review)
     # SET, but not the two jobs that are exempt from it. Measured: appending a
@@ -3336,6 +3332,81 @@ else
     fi
 fi
 
+# ── AC3 script behaviour: workflow-INDEPENDENT, so it sits OUTSIDE the guard above ──
+# This block reads only test/assert-egress-enforced.sh. It was first written inside the
+# harden-runner section's workflow-PRESENT arm, which quietly broke the constant-outcome
+# property that section documents: 3 outcomes with the workflow present and 0 with it
+# missing, so the arms were 12 and 9 while the comment there claimed 12 in both. Caught in
+# review of this PR. Moving it out here is the fix rather than padding the other arm,
+# because the check genuinely does not need the workflow — a pad would have preserved the
+# count and kept the coverage asymmetry, which is the thing that actually mattered.
+
+# BEHAVIOUR, not text: run the script against a stub `curl` and assert its exit code
+# in three scenarios. This exists because the grep pin above counts the probe calls
+# but cannot read their SENSE, and a reviewer on PR #226 pointed out the consequence:
+# flipping `-eq 0` to `-ne 0`, or `if ! curl` to `if curl`, leaves all three counts at
+# 1/1/2 and the pin green while the assertion means the OPPOSITE of what AC3 needs —
+# the unlisted host becoming reachable would then pass as proof of enforcement. Both
+# inversions were measured MISSED before this block was written. No pattern over
+# free-form shell closes that; executing it does.
+#
+# The stub also removes the last of the "editing the body to a no-op still passes"
+# residual: an early `exit 0` passes scenario 1 and fails 2 and 3.
+#
+# Three outcomes in every arm, including when the script is absent, so the count stays
+# constant by construction the way the rest of this section is.
+# TMPDIR is pinned to the suite root created at the top of this file rather than left to an
+# inherited TMPDIR: this directory holds an executable fixture that gets PATH-prepended and
+# RUN, which is exactly the case the header comment says a bare `mktemp -d` is wrong for. It
+# also means the EXIT trap removes it if the suite aborts before the rm below.
+ac3_beh_dir=$(TMPDIR="$TMPDIR_T" mktemp -d)
+cat > "$ac3_beh_dir/curl" <<'AC3SHIM'
+#!/usr/bin/env bash
+# Stub curl: exit code chosen per host from the environment. Any other URL exits 0.
+for a in "$@"; do
+case "$a" in
+    *proxy.golang.org*) exit "${SHIM_UNLISTED_RC:-7}" ;;
+    *github.com*)       exit "${SHIM_CONTROL_RC:-0}" ;;
+esac
+done
+exit 0
+AC3SHIM
+chmod +x "$ac3_beh_dir/curl"
+# $1 = stubbed exit for the unlisted host, $2 = for the allowlisted control host.
+_ac3_behaviour() {
+    local _rc
+    set +e
+    SHIM_UNLISTED_RC="$1" SHIM_CONTROL_RC="$2" PATH="$ac3_beh_dir:$PATH" \
+        bash "$SCRIPT_DIR/assert-egress-enforced.sh" >/dev/null 2>&1
+    _rc=$?
+    set -e
+    printf '%s' "$_rc"
+}
+if [[ -f "$SCRIPT_DIR/assert-egress-enforced.sh" ]]; then
+    ac3_b_enforcing=$(_ac3_behaviour 7 0)
+    ac3_b_notenforcing=$(_ac3_behaviour 0 0)
+    ac3_b_noegress=$(_ac3_behaviour 7 7)
+else
+    ac3_b_enforcing=absent; ac3_b_notenforcing=absent; ac3_b_noegress=absent
+fi
+rm -rf "$ac3_beh_dir"
+
+if [[ "$ac3_b_enforcing" == 0 ]]; then
+    pass "AC3 behaviour: a correctly enforcing runner (unlisted refused, control reachable) exits 0"
+else
+    fail "test/assert-egress-enforced.sh does NOT exit 0 on the enforcing case (stub: unlisted exit 7, control exit 0) — got exit ${ac3_b_enforcing}. A working block policy would fail this job. The usual cause is an inverted condition: \`-ne 0\` where the unlisted probe needs \`-eq 0\`, or a dropped \`!\` on the control probe."
+fi
+if [[ "$ac3_b_notenforcing" == 1 ]]; then
+    pass "AC3 behaviour: an unlisted host that is REACHABLE fails the job (the policy is not enforcing)"
+else
+    fail "test/assert-egress-enforced.sh does NOT fail when the unlisted host is reachable (stub: unlisted exit 0, control exit 0) — got exit ${ac3_b_notenforcing}, expected 1. This is the inversion that matters: the one runtime proof that block mode enforces would pass on a runner where it does not. Check the sense of the unlisted-probe condition."
+fi
+if [[ "$ac3_b_noegress" == 1 ]]; then
+    pass "AC3 behaviour: a runner with NO egress at all fails the job rather than passing vacuously"
+else
+    fail "test/assert-egress-enforced.sh does NOT fail when the allowlisted control host is also unreachable (stub: both exit 7) — got exit ${ac3_b_noegress}, expected 1. Without this the refusal above proves nothing: a total egress outage would read as a working policy."
+fi
+
 SUITE_COMPLETED=1
 
 echo ""
@@ -3581,11 +3652,17 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # that runs the nested module's tests survived at 179/0.
 #
 # ── LAB-6015 (harden-runner egress: audit -> block) ───────────────────────────
-# This branch adds TWELVE counted outcomes on top of main's 182, all in the
+# This branch adds THIRTEEN counted outcomes on top of main's 182, all in the
 # "harden-runner egress policy" section. Measured at each step, never computed:
 #   +5  one per job in EXPECTED_HR_JOBS — each job's WHOLE policy compared against a
 #       pinned expectation (action SHA, `block`, disable-sudo, no `if:`, harden-runner
-#       first, allowed-endpoints node type, exact endpoint set) rather than its shape.
+#       first, the job's `runs-on`, the step's `continue-on-error`, allowed-endpoints node
+#       type, exact endpoint set) rather than its shape. `runs-on` and `continue-on-error`
+#       were folded into this same string in review rather than added as new outcomes, so
+#       the count did not move: `runs-on: macos-14` left the policy byte-identical while
+#       harden-runner silently does not enforce off Linux, and `continue-on-error: true`
+#       on the step was caught for three of the five jobs by the un-gated-job guards
+#       above but not for docs-check or integration-tests. Both measured MISSED first.
 #       A shape check ("is it block, is the list non-empty") let eight mutations through.
 #   +1  the set of jobs that CARRY harden-runner — the only check that catches the step
 #       being ADDED to a job meant to be exempt.
@@ -3596,6 +3673,13 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       invocation of test/assert-egress-enforced.sh. Measured: the step shipped
 #       unpinned and deleting it left the suite green; later, `shell: cat {0}` left the
 #       run value byte-identical while the runner merely CAT-ed the script and exited 0.
+#   +1  the absence of any shell override beyond install-chrome-e2e's required one. A
+#       workflow- or job-level `defaults.run.shell` applies to every `run:` step without
+#       appearing on any of them, so it is a strictly wider bypass than the per-step
+#       `shell:` pinned by the AC3 entry above. Measured: three lines of
+#       `defaults: run: shell: cat {0}` at the top of the file left every assertion
+#       untouched and the suite green at 194/0 while all four guard suites and the AC3
+#       proof became `cat` no-ops.
 #   +3  the AC3 script's BEHAVIOUR — the script executed against a stub `curl` in three
 #       scenarios (enforcing; unlisted host reachable; no egress at all), asserted on exit
 #       code. Measured: inverting `-eq 0` to `-ne 0`, and dropping the `!` from the control
@@ -3609,8 +3693,8 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       `python3 -c "urllib.request..."` and `exec 3<>/dev/tcp/host/443`. Enumerating
 #       egress methods has no end; pinning the body has one.
 #
-# The +12 is CONSTANT BY CONSTRUCTION across all three arms — workflow present with yq,
-# present without yq, and missing — at 12 outcomes each. The three behavioural
+# The +13 is CONSTANT BY CONSTRUCTION across all three arms — workflow present with yq,
+# present without yq, and missing — at 13 outcomes each. The three behavioural
 # outcomes read only the script file, never the workflow or yq, so they are constant too. That property is why
 # EXPECTED_HR_JOBS is a HARDCODED list: the first version derived it from the workflow,
 # which emitted six outcomes with yq and one without, leaving this pin wrong on any host
@@ -3638,7 +3722,7 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # `-ne 0`, and its control condition un-negated. The last two are caught only by the
 # behavioural scenarios — every grep count stays identical under both. The first two of the per-job list are the only
 # ones the pre-LAB-6015 shape check also caught.
-EXPECTED_ASSERTIONS=194
+EXPECTED_ASSERTIONS=195
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."

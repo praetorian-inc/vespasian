@@ -130,8 +130,8 @@ jobs:
       # this job ever reached proxy.golang.org, sum.golang.org and
       # storage.googleapis.com. Pinning `local` removes the fetch, and with it
       # three endpoints from the allowlist below — including
-      # storage.googleapis.com, which run-live-tests.sh:3721 lists as a go-rod
-      # browser-download marker and fails the build on. Measured: with go.mod
+      # storage.googleapis.com, which run-live-tests.sh names in its `dl_markers` list as
+      # a go-rod browser-download marker and fails the build on. Measured: with go.mod
       # requiring an unavailable toolchain, `GOTOOLCHAIN=auto go version`
       # downloads while `GOTOOLCHAIN=local go version` prints the local build.
       GOTOOLCHAIN: local
@@ -212,8 +212,11 @@ jobs:
       # RUNS LAST, DELIBERATELY, and its position is pinned. It is the only
       # network-dependent step in this job; the four guard suites above need no network.
       # Placed earlier, a transient failure on either host aborted the job before any of
-      # them ran, suppressing 144 network-free assertions and skipping the `test` job via
-      # its `needs:`. Last means a flake costs only this assertion.
+      # them ran, suppressing every network-free assertion in the four guard suites above
+      # and skipping the `test` job via its `needs:`. Last means a flake costs only this
+      # assertion. (No count is quoted here on purpose — AGENTS.md records that every
+      # hand-maintained count in this repo has been wrong; test-runner-args.sh pins its
+      # own total.)
       - name: Assert egress policy enforces (AC3)
         run: ./test/assert-egress-enforced.sh
 
