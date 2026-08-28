@@ -35,15 +35,18 @@
 #   * The control host IS allowlisted and must succeed, which rules out a runner with
 #     no egress at all satisfying the first verdict for the wrong reason.
 #   * NOT established: that the first refusal was a POLICY refusal rather than an
-#     outage of that specific host. harden-runner blocks at the DNS layer, so a blocked
-#     domain and an unresolvable one both surface as curl exit 6 and cannot be told
-#     apart from inside the job. Be precise about what is and is not guarded here: the
-#     ABSENCE of proxy.golang.org from preflight-selftest's allowlist IS pinned (the
-#     per-job endpoints pin in test/test-runner-args.sh), so nobody can quietly make the
-#     probe reach its target by allowlisting it. The hostnames in THIS file are NOT
-#     pinned, because nothing pins this file's contents — so retyping UNLISTED_URL to
-#     another unreachable host would pass vacuously. That is the same declared residual
-#     as the rest of this script's body.
+#     outage of that specific host. MEASURED (CI run 33107912104): harden-runner's DNS
+#     proxy answers with a sinkhole address and the CONNECT fails, so a refusal surfaces
+#     as curl exit 7 — the SAME code a genuinely unreachable host gives, which is why
+#     exit code cannot separate them from inside the job. An earlier version of this
+#     paragraph said both cases give exit 6; that was wrong, and requiring 6 turned a
+#     correctly-enforcing runner red. Be precise about what IS guarded: the ABSENCE of
+#     proxy.golang.org from preflight-selftest's allowlist is pinned (the per-job
+#     endpoints pin in test/test-runner-args.sh), so nobody can quietly give the probe
+#     its target by allowlisting it; and both hostname assignments plus both curl calls
+#     in THIS file are pinned by the AC3 body check in that same suite, so retyping
+#     UNLISTED_URL or deleting a probe fails the build. What remains unguarded is the
+#     rest of this script's body, which no pin covers.
 set -euo pipefail
 
 # Pinned in test/test-runner-args.sh. proxy.golang.org must stay OFF

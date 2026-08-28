@@ -9,6 +9,10 @@ on:
       - '**/*.go'
       - 'go.mod'
       - 'go.sum'
+      # Root-scoped, so the nested test/proto-validate module's own manifests
+      # would not otherwise trigger a scan of its dependencies.
+      - 'test/proto-validate/go.mod'
+      - 'test/proto-validate/go.sum'
       - '.golangci*'
       - 'Makefile'
   schedule:
@@ -35,12 +39,78 @@ jobs:
       # `// Code generated ... DO NOT EDIT.` marker, e.g. test/grpc-server/labpb/*.pb.go).
       # Their unsafe.Pointer fast-paths are protoc-gen-go boilerplate, not
       # hand-written code, so gosec's G103 "audit unsafe" alerts on them are
-      # noise. Mirrors golangci-lint's `exclusions.generated: lax`. The rest of
-      # the args match the reusable workflow's default (observe-only + SARIF).
-      gosec-args: "-no-fail -exclude-generated -fmt sarif -out gosec-results.sarif ./..."
+      # noise. Mirrors golangci-lint's `exclusions.generated: lax`.
+      #
+      # No `-no-fail`: under it the job passed while publishing findings, which is how
+      # 28 accumulated unseen (LAB-6011). The reusable workflow passes these args through
+      # verbatim and exits on gosec's own code, so a finding now fails the job.
+      # `fail-on-findings: true` would do the same but also gates govulncheck, which is
+      # a separate concern here.
+      gosec-args: "-exclude-generated -fmt sarif -out gosec-results.sarif ./..."
       # The reusable workflow's v2.22.11 default links x/tools v0.39.0, which
       # cannot read go1.27 export data. Since the Gosec job runs
       # `go-version: stable`, every scan died before writing SARIF once go1.27
       # became stable. v2.28.0 links x/tools v0.48.0. Pinned, never `latest`.
       gosec-version: "v2.28.0"
+      govulncheck-version: "v1.7.0"
     secrets: inherit
+
+  # test/proto-validate is a separate module, and both scans above run `./...`
+  # from the repo root -- a package pattern stops at the module boundary, so
+  # `go list ./...` returns zero proto-validate packages and its dependencies
+  # (bufbuild/protocompile and its transitive set) get NO vulnerability
+  # detection at all. That is the same never-executed-check class LAB-5549
+  # exists to remove, one directory over.
+  #
+  # A separate job for the same reason ci.yml's proto-validate-tests is one: the
+  # `security` job above delegates to a shared reusable workflow whose inputs
+  # cannot name a second module.
+  proto-validate-security:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
+        with:
+          go-version-file: go.mod
+
+      # Versions pinned to match the reusable workflow's inputs above rather than
+      # whatever `latest` happens to be. Installed AFTER setup-go so both build
+      # with the repo's go1.27 toolchain -- a scanner built against an older Go
+      # cannot read go1.27 export data, which is the failure the gosec-version
+      # comment above already records.
+      - name: Install scanners
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
+
+      # No GOWORK override, and none is needed: there is no go.work in the repo,
+      # so this module always resolves from its OWN go.mod -- here, in the
+      # Makefile, in ci.yml, and in run-live-tests.sh alike. That is also what
+      # keeps this scan honest: with a workspace, MVS took the max across both
+      # modules, so the scanned graph could sit ABOVE the graph the release
+      # actually shipped and a CVE in the shipped version would pass clean.
+      - name: govulncheck (nested module)
+        working-directory: test/proto-validate
+        run: govulncheck ./...
+
+      # No -no-fail here, unlike the root scan above -- a DELIBERATE asymmetry,
+      # not an oversight. The root job may observe-only because it writes SARIF
+      # and holds `security-events: write`, so a finding still lands in code
+      # scanning. This job has neither, so -no-fail would send every finding to a
+      # job log and nowhere else. Gating is the only way a finding here is seen.
+      # Two files and 105 lines make that a cheap bar to hold.
+      - name: gosec (nested module)
+        working-directory: test/proto-validate
+        run: gosec -exclude-generated ./...

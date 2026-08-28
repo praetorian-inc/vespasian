@@ -17,7 +17,7 @@ End-to-end live tests that spin up intentionally simple target applications, run
 
 ## Prerequisites
 
-- **Go 1.25+** — [https://go.dev/dl/](https://go.dev/dl/)
+- **Go 1.27.0+** — [https://go.dev/dl/](https://go.dev/dl/)
 - **Chrome/Chromium** — Required for headless crawling (see below)
 - **python3** — Required for test validation scripts
 - **Node.js** — Required for the graphql-server target
@@ -169,6 +169,23 @@ For the GraphQL live test (`graphql-server`):
 3. **Generate** — `vespasian generate graphql capture.json --dangerous-allow-private` (with introspection probe)
 4. **Validate** — SDL structure, expected operations, introspection-quality checks (schema block, non-null types, enums)
 
+For the gRPC live test (`grpc-server`):
+
+1. **Synthesize** a minimal capture so the classifier tags the request as gRPC and the reflection probe dials the right host:port
+2. **Generate** — `vespasian generate grpc capture.json --dangerous-allow-private -o spec.proto` (via Server Reflection)
+3. **Validate services** — expected services and methods are present, each RPC scoped to its own `service` body, and server-streaming methods keep their `stream` return marker
+4. **Compile the emitted `.proto`** — `test/proto-validate` compiles the generated file and fails the target on any syntax, duplicate-tag, or unresolved-reference error (AC4 of LAB-2778)
+
+> **No `protoc` required.** The compile check runs in-process via `bufbuild/protocompile`
+> rather than shelling out. It used to call `protoc` behind `command -v protoc`, which
+> meant the assertion proving the emitted spec compiles passed by never running: `protoc`
+> ships on no GitHub-hosted `ubuntu-24.04` image, and `live-tests.yml` runs under
+> `disable-sudo: true`, so it could not be installed from a later step either. Removing
+> the external dependency — rather than provisioning it — makes the check behave
+> identically on CI and on a developer machine (LAB-5549). `grpcurl` remains optional:
+> the reachability probe uses it when present for a stronger signal (reflection answers,
+> not just an open port) and falls back to a TCP connect otherwise.
+
 For deterministic GraphQL tests (`generate-graphql`, `generate-graphql-imports`):
 
 1. **Generate** SDL from fixed reference capture or imported Burp/HAR files
@@ -213,7 +230,8 @@ For importer tests:
 
 Options:
   --targets <list>   Comma-separated targets (default: all)
-                     Valid: rest-api,soap-service,graphql-server,grpc-server
+                     Valid: rest-api,soap-service,graphql-server,grpc-server,
+                            concat-spa,forms-target
   --skip-start       Only build, don't start services
   --teardown         Stop all running targets and clean up
   --sweep            With --teardown, also sweep untracked orphans by name/port
@@ -254,8 +272,8 @@ Options:
   --targets <list>      Comma-separated targets to test (overrides --group)
                         Valid targets:
                           Service:    rest-api, scan-rest, soap-service, graphql-server,
-                                      concat-spa, concat-spa-two-stage, forms-target
-                          Config:     grpc-server (included via TARGETS_SETUP when set up)
+                                      grpc-server, concat-spa, concat-spa-two-stage,
+                                      forms-target
                           Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,
                                       generate-graphql, generate-graphql-imports,
                                       generate-js-static, generate-merge-slugs
@@ -287,6 +305,19 @@ TEST_HOST=host.docker.internal ./test/run-live-tests.sh --targets rest-api
 For Linux devcontainers without Docker Desktop, use the detected host gateway (e.g. the address of the `docker0` bridge or whatever name resolves to the host from inside the container).
 
 `setup-live-targets.sh` does not read `TEST_HOST` — run it on the host that actually runs the target binaries.
+
+> **Accepted values.** `run-live-tests.sh` validates `TEST_HOST` before it runs anything and
+> **refuses to start** on a value outside the grammar, with
+> `refusing to run: TEST_HOST is not a plain hostname, IPv4, or bracketed IPv6 literal`.
+> Accepted: a plain hostname (`localhost`, `host.docker.internal`), an IPv4 literal, or a
+> **bracketed** IPv6 literal (`[::1]`). The brackets are required because `curl` and `grpcurl`
+> take a `host:port` authority and need them to disambiguate the colons; the gRPC preflight
+> strips them again for `nc` and bash's `/dev/tcp`, which take a bare host. Anything carrying a
+> leading dash, whitespace, or a shell metacharacter is rejected — those values reach a URL, a
+> command operand and a `bash -c` argv, so they are screened once here rather than at each sink.
+>
+> The same check applies to an environment-supplied `GRPC_SERVER_PORT`, which must be 1-65535.
+> (Ports read from `.live-test-config` were already validated; this closes the environment path.)
 
 ### `FORMS_TARGET_BIND_HOST` (optional)
 
@@ -388,13 +419,23 @@ REST_API_PORT=8990
 SOAP_SERVICE_PORT=8991
 GRAPHQL_SERVER_PORT=8992
 GRPC_SERVER_PORT=50051
-TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server
+CONCAT_SPA_PORT=8993
+FORMS_TARGET_PORT=8994
+TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server,concat-spa,forms-target
 ```
+
+That is what a **default** `./test/setup-live-targets.sh` writes: all six port keys
+and every member of the setup script's `ALL_TARGETS`. A partial run
+(`--targets <subset>`) writes an empty value for each port it did not configure,
+which is why `load_config` skips empty values rather than treating them as
+invalid.
 
 > **`TARGETS_SETUP` is additive, not restrictive.** A bare `./test/run-live-tests.sh`
 > resolves the full `all` group (every `OFFLINE_TARGETS` + `LIVE_TARGETS`).
-> `TARGETS_SETUP` only *adds* config-only targets such as `grpc-server` to that run —
-> it does **not** narrow it. To run only the targets you set up, pass
+> `TARGETS_SETUP` only *adds* targets to that run — it does **not** narrow it.
+> Every shipped target is in `OFFLINE_TARGETS` or `LIVE_TARGETS`, so a default run
+> already covers all of them and `TARGETS_SETUP` is only a hook for out-of-tree
+> additions. To run only the targets you set up, pass
 > `--targets <list>` (or use `--group offline` / `--group live`). After a partial
 > `setup-live-targets.sh --targets <subset>`, the setup script prints the exact
 > `--targets` command to use.
@@ -407,6 +448,7 @@ TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server
 | soap-service | 8991 |
 | graphql-server | 8992 |
 | grpc-server | 50051 |
+| concat-spa | 8993 |
 | forms-target | 8994 |
 
 Ports are auto-resolved if the default is in use (searches up to 20 ports ahead).
@@ -482,7 +524,7 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 ## Expected Results
 
-All 31 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest). The sample below is a default `--group all` run (21 offline + 10 live targets); the config-only `grpc-server` target runs additionally only when `TARGETS_SETUP` is configured.
+All 32 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest). The sample below is a default `--group all` run (21 offline + 11 live targets). `grpc-server` is part of the live group as of LAB-5549 — it runs on a bare `--group live` with no `TARGETS_SETUP` or `--targets` override, so CI exercises it on every PR.
 
 ```text
   TARGET                      STATUS    ENDPOINTS   EXPECTED   DURATION
@@ -503,6 +545,7 @@ All 31 tests should pass. Order is non-deterministic and durations vary by machi
   generate-wsdl               PASS      3           3          1s
   generate-wsdl-matrix        PASS      3           3          1s
   graphql-server              PASS      8           8          1s
+  grpc-server                 PASS      3           3          1s
   import-base64               PASS      2           2          0s
   import-burp                 PASS      5           5          0s
   import-duplicates           PASS      2           2          0s
@@ -519,7 +562,7 @@ All 31 tests should pass. Order is non-deterministic and durations vary by machi
   spec-edge                   PASS      -           -          0s
   ssrf-rejection              PASS      -           -          0s
 
-  Total: 31 passed, 0 failed, 0 skipped
+  Total: 32 passed, 0 failed, 0 skipped
 ```
 
 Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are informational and do not cause failures.
@@ -568,6 +611,14 @@ test/
 ├── grpc-server/
 │   ├── main.go              # gRPC server (UserService, OrderService, AccountService)
 │   └── expected-paths.json  # Expected services/methods for validation
+│
+├── proto-validate/          # NESTED MODULE (own go.mod, no workspace) — keeps
+│   │                        # protocompile out of the shipped module's requires
+│   ├── go.mod               # Its own module; root `go test ./...` does NOT reach it
+│   ├── go.sum
+│   ├── doc.go               # Package docs + the exit-code contract run-live-tests.sh consumes
+│   ├── main.go              # Compiles a generated .proto in-process (protocompile); AC4 check
+│   └── main_test.go         # Reject cases + the exit-code contract
 │
 ├── forms-target/
 │   ├── main.go              # HTML forms server (POST/GET <form> endpoints)
@@ -627,8 +678,11 @@ brew install --cask google-chrome
 troubleshooting side. `setup-live-targets.sh` probes each candidate binary with
 `--version` before accepting it, so it fails preflight with `Found <path> but it is
 not runnable` instead of failing later during `vespasian crawl`. Fix with
-`./test/install-chrome.sh`, `snap install chromium`, or install `google-chrome`
-directly.
+`./test/install-chrome.sh` or install `google-chrome` directly. `snap install
+chromium` is **not** a fix for the container case described here — snapd is
+unavailable inside the container (see [Chrome in containers](#chrome-in-containers)),
+which is what produced the stub in the first place; it only applies on a host
+where snapd is actually running.
 
 **macOS note:** the runnability probe uses `timeout` (falling back to
 `gtimeout` from Homebrew coreutils) to guard against a hanging binary. Stock

@@ -374,7 +374,8 @@ func TestValidateTargetURL_RedactsUserinfoInErrors(t *testing.T) {
 		{"fails validateURL (bad scheme)", "ftp://" + username + ":" + password + "@" + host + "/", host},
 		{"fails validateURL (missing host)", "https://" + username + ":" + password + "@", `"https:"`},
 		{"percent-encoded credential (missing host)", "https://" + username + ":" + encodedPassword + "@", `"https:"`},
-		{"fails CanonicalOrigin (duplicated port)", "https://" + username + ":" + password + "@" + host + ":8443:8443/", host},
+		{"url.Parse rejects duplicated port", "https://" + username + ":" + password + "@" + host + ":8443:8443/", "URL with userinfo redacted"},
+		{"fails CanonicalOrigin (IPv6 zone id)", "https://" + username + ":" + password + "@[fe80::1%25eth0]/", "fe80::1%25eth0"},
 	}
 
 	for _, tt := range tests {

@@ -53,10 +53,10 @@ No CLA or DCO sign-off is required to contribute.
 
 ### Prerequisites
 
-- **Go 1.25.8+** — the version in `go.mod` is the source of truth, and CI reads it from there
-- **golangci-lint v2.12.2** — pin this version to match CI:
+- **Go 1.27.0+** — the version in `go.mod` is the source of truth, and CI reads it from there
+- **golangci-lint v2.13.1** — pin this version to match CI:
   ```bash
-  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.1
   ```
 - **CGO enabled** (`CGO_ENABLED=1`) — CI builds with it, so keep it on locally
 - **A real Chrome/Chromium** — only needed for headless crawling and the live test suite, not for unit tests
@@ -70,12 +70,14 @@ make test             # go test -race ./...
 make fmt              # gofmt -s -w .
 make vet              # go vet ./...
 make lint             # golangci-lint run
-make check            # fmt + vet + lint + test — run this before opening a PR
+make gosec            # gosec at the version CI pins; fetched via `go run`, nothing to install
+make check            # fmt + vet + lint + lint-comments + gosec + test + check-docs
 make coverage         # Coverage profile + per-function report (excludes test/)
+make coverage-gate    # Fail if total coverage is below the CI threshold (85%)
 make live-test-clean  # Stop orphaned live-test services
 ```
 
-Note that `make check` runs `make fmt` first, which rewrites files in place via `gofmt -s -w .` — it validates *and* reformats. Expect it to modify your working tree, and check `git status` afterwards so any reformatting lands in your commit rather than surprising you later. Use `make vet lint test` if you want the checks without the rewrite.
+Note that `make check` runs `make fmt` first, which rewrites files in place via `gofmt -s -w .` — it validates *and* reformats. Expect it to modify your working tree, and check `git status` afterwards so any reformatting lands in your commit rather than surprising you later. Use `make vet lint gosec test` if you want the checks without the rewrite.
 
 ### Devcontainers
 
@@ -228,10 +230,11 @@ Conventions:
 ### Coverage
 
 ```bash
-make coverage    # Writes coverage.out, prints per-function coverage
+make coverage         # Writes coverage.out, prints per-function coverage
+make coverage-gate    # Fails if total statement coverage is below the threshold
 ```
 
-Aim to keep coverage at or above **80%** for the packages you touch. CI measures coverage on every Go PR but does not currently fail a build below a threshold, so this is enforced at review time — a PR that materially drops coverage will be asked for tests.
+CI enforces a minimum of **85%** total statement coverage on every Go PR: the `coverage-gate` job in `ci.yml` runs `make coverage-gate`, which fails the build when total coverage falls below 85%. Run `make coverage-gate` locally before pushing. The threshold lives in one place — `COVERAGE_THRESHOLD` in the `Makefile` — and sits just under the 86.4% baseline measured when the gate was introduced (LAB-5331), so keep coverage at or above 85% for the repository total rather than spending that headroom. The gate reads the single `total:` line, so it is not enforced per package: a drop in one package can be masked by a rise in another.
 
 ### Live tests
 
@@ -273,6 +276,7 @@ Run `make check` before submitting.
 - **Go file naming: lowercase with underscores** — `rest_classifier.go`, not `restClassifier.go`.
 - Keep functions under complexity 15. If the linter complains, split the function rather than suppressing it.
 - Add a `//nolint` directive only with a comment explaining why, and expect it to be questioned in review.
+- Suppress a **gosec** finding with `#nosec <RULE> -- <reason>`, never `//nolint:gosec`. gosec runs both inside `golangci-lint`, which honors `//nolint`, and as the separate `security / Gosec` job, which honors only `#nosec` — so `//nolint:gosec` leaves `make lint` green while the Gosec job fails. Put it trailing on the line, or on the line above when another linter already shares the trailing comment (LAB-6011).
 - Use `context.Context` for cancellation in all I/O paths.
 - Check every error. Return `(result, error)` rather than panicking.
 - Every source file carries the Apache 2.0 license header. Copy it from an existing file into new ones.
@@ -320,7 +324,7 @@ Two CI workflows gate a PR:
 
 ### PR checklist
 
-- [ ] `make check` passes (fmt, vet, lint, lint-comments, test, check-docs)
+- [ ] `make check` passes (fmt, vet, lint, lint-comments, gosec, test, check-docs)
 - [ ] Tests added or updated for the change
 - [ ] New classifier / generator / importer / probe registered where the pipeline expects it
 - [ ] Commit messages follow conventional commit format
