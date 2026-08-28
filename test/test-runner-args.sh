@@ -4158,25 +4158,19 @@ if [[ -f "$dcgo_df" && -f "$dcgo_mod" ]]; then
     dcgo_pin=$(grep -oE '^[[:space:]]*ver=[0-9]+\.[0-9]+(\.[0-9]+)?' "$dcgo_df" | head -1 | sed 's/.*ver=//' || true)
     dcgo_want=$(sed -n 's/^go //p' "$dcgo_mod" | head -1 || true)
     dcgo_mod_branch="$dcgo_want"
-    # Compare against the STRICTER of this branch's go.mod and the merge target's,
-    # because that is what CI actually builds: a pull_request checkout is the MERGE
-    # commit, so the container sees main's go.mod, not the branch's. Measured — the
-    # branch reads `go 1.25.8` while main reads `go 1.27.0`, and reverting the
-    # Dockerfile pin to 1.25.12 satisfies the branch and still fails in CI, which
-    # is precisely the break this block exists to catch. Read from a local ref, so
-    # no network: if origin/main has never been fetched the check quietly falls
-    # back to the branch's own go.mod rather than failing on an absent ref.
-    # Which go.mod this compares against changes how strict the check is, and
-    # leaving that to whatever the developer happens to have fetched made the
-    # result ambient: with origin/main absent, reverting the pin to 1.25.12
-    # PASSED, because the branch's own go.mod still reads 1.25.8. The basis is
-    # now named in the assertion message so the log says which one was used.
-    # The basis is NAMED in the assertion message rather than left ambient: which
-    # go.mod this compares against changes how strict the check is, and with
-    # origin/main unfetched a stale pin PASSES because the branch's own go.mod is
-    # older. Naming it means the log says which basis was used instead of the
-    # result silently depending on what the developer happened to fetch.
-    dcgo_basis="branch go.mod only (origin/main not fetched — a stale pin can pass here)"
+    # The working tree's go.mod is ALWAYS the requirement for the tree under test,
+    # so it is always a valid basis and this check never needs to skip. On a
+    # pull_request, actions/checkout resolves the MERGE commit, so that go.mod is
+    # already the merge-target one. On a branch checkout it is the branch's, which
+    # origin/main then tightens when the ref happens to be present.
+    #
+    # It skipped before, whenever origin/main was unfetched — and preflight-selftest
+    # checks out at depth 1 without it, so the one check built to be UN-GATED never
+    # ran in CI at all. MEASURED on the merge commit: `235 passed, 0 failed,
+    # 1 skipped`, and that 1 was this. The basis is named in the message so the log
+    # says which go.mod was used rather than the result depending silently on what
+    # the developer happened to fetch.
+    dcgo_basis="working-tree go.mod (${dcgo_mod_branch:-?})"
     if git -C "$SCRIPT_DIR/.." rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
         dcgo_main=$(git -C "$SCRIPT_DIR/.." show origin/main:go.mod 2>/dev/null | sed -n 's/^go //p' | head -1 || true)
         if [[ -n "$dcgo_main" && -n "$dcgo_want" ]]; then
@@ -4188,14 +4182,7 @@ if [[ -f "$dcgo_df" && -f "$dcgo_mod" ]]; then
         fail "could not read the Dockerfile Go pin (got '${dcgo_pin}') or go.mod's go directive (got '${dcgo_want}') — the un-gated toolchain check would be vacuous"
     else
         dcgo_oldest=$(printf '%s\n%s\n' "$dcgo_want" "$dcgo_pin" | sort -V | head -1)
-        if [[ "$dcgo_basis" != stricter* ]]; then
-            # Without origin/main this compares against the BRANCH's go.mod, which
-            # is older, so a stale pin passes. Relabelling that in the message (the
-            # previous fix) left the pass ambient — a green line that means
-            # different things on different machines. Report it as a skip instead,
-            # so the log says the check did not run rather than that it succeeded.
-            skip "the Dockerfile Go pin vs go.mod (origin/main not fetched, so the merge-target basis is unavailable)" 1
-        elif [[ "$dcgo_oldest" == "$dcgo_want" ]]; then
+        if [[ "$dcgo_oldest" == "$dcgo_want" ]]; then
             pass "the .devcontainer/Dockerfile Go pin (${dcgo_pin}) satisfies go.mod (>= ${dcgo_want}, basis: ${dcgo_basis}) — checked un-gated, on every PR"
         else
             fail "the .devcontainer/Dockerfile pins Go ${dcgo_pin} but go.mod requires >= ${dcgo_want} — under GOTOOLCHAIN=local every Go step in the devcontainer fails with 'go.mod requires go >= ${dcgo_want}'; bump ver= in the Dockerfile's Go layer"
@@ -4408,9 +4395,12 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #         comment guard.
 #
 #   +2    round 7: the yq-less guard step pinned so its deletion is not silent,
-#         and the Dockerfile-pin check reporting a SKIP rather than an ambient
-#         PASS when origin/main is unfetched and the merge-target basis is
-#         therefore unavailable.
+#         and the Dockerfile-pin check comparing against the working-tree go.mod,
+#         which is always the requirement for the tree under test. It briefly
+#         reported a SKIP when origin/main was unfetched — honest about the
+#         ambiguity, but preflight-selftest checks out at depth 1 without that
+#         ref, so the one check built to be UN-GATED never ran in CI. It runs
+#         now, and origin/main only tightens it when present.
 #
 #   +47   main, merged in: LAB-5549 and the commits alongside it (the gRPC live
 #         target, the AC4 compile check, the setup/live-group seam guard). Its
