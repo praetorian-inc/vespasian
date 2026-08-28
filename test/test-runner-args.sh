@@ -3513,6 +3513,10 @@ if [[ -f "$WORKFLOW" ]]; then
         esac
     else
         fail "AGENTS.md not found — its job-count claim cannot be checked"
+    # The normal arm emits TWO counted outcomes from this one AGENTS.md sentence —
+    # the non-container job count and the harden-runner word. MEASURED with the file
+    # removed: 234 + 1 = 235 against a pin of 236.
+    skip "AGENTS.md harden-runner word (AGENTS.md absent)" 1
     fi
 
     # The pin itself. Counting copies says nothing about whether they agree on a
@@ -3523,7 +3527,9 @@ if [[ -f "$WORKFLOW" ]]; then
     # rather than a silently dropped file — `2>/dev/null` on the grep would have
     # hidden it and still reported success over live-tests.yml alone.
     hr_ci="$(dirname "$WORKFLOW")/ci.yml"
+        hr_ci_present=1
     if [[ ! -f "$hr_ci" ]]; then
+            hr_ci_present=0
         fail "ci.yml not found at ${hr_ci} — it carries a harden-runner copy this check claims to cover, so the pin-uniformity assertion would be silently narrower than its own message"
         hr_ci="$WORKFLOW"
     fi
@@ -3559,6 +3565,11 @@ if [[ -f "$WORKFLOW" ]]; then
     hr_sha_count=$(printf '%s\n' "$hr_shas" | grep -c . || true)
     if [[ "$hr_sha_count" -eq 0 ]]; then
         fail "found no SHA-pinned harden-runner uses at all (the pin-uniformity check would be vacuous) — is the action still SHA-pinned?"
+    elif [[ "${hr_ci_present:-1}" -eq 0 ]]; then
+        : # ci.yml is absent, and its not-found fail above already stands as this
+          # block's outcome. Emitting a cross-FILE uniformity pass over ONE file
+          # would be a false claim, and emitting it in ADDITION to that fail put
+          # the block one counted outcome above the pin — MEASURED: saw 237 vs 236.
     elif [[ "$hr_sha_count" -eq 1 ]]; then
         pass "every harden-runner copy across live-tests.yml and ci.yml pins the same SHA"
     else

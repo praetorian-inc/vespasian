@@ -119,7 +119,9 @@ RUN set -eu; \
 # wall. The problem was never PATH or profile loading — the binary was absent.
 #
 # Install it here, pinned to the same major the CI jobs use (actions/setup-node
-# node-version: 20 at live-tests.yml:121 and :845), so the container and CI agree
+# node-version: 20 in live-tests.yml — cited by setting, not by line number, because
+# line numbers shift on every edit to that file and these two already had), so the
+# container and CI agree
 # on the Node that parses specs. bash, not /bin/sh: nvm requires bash and
 # Debian's sh is dash. The binaries are then symlinked into /usr/local/bin, which
 # is on every PATH, because onCreateCommand and every `devcontainer exec` run
