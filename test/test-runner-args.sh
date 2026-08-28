@@ -2813,14 +2813,16 @@ else
     # need no entry here — the un-gated-job guards above already catch both on this job,
     # measured at 141/2 each.
     #
-    # RESIDUAL, narrowed: the script's probe calls and hosts ARE pinned just above, so what
-    # remains unpinned is the rest of its body —
-    # editing it to a no-op still passes. That is deliberate and consistent — this file
-    # pins that preflight-selftest INVOKES its four guard suites, never what they
-    # contain, and content-pinning a script would fail on every legitimate edit. The
-    # script is covered instead by `bash -n` in the un-gated syntax-check step and by
-    # review of a real file. AGENTS.md records the same reasoning for
-    # test/assert-chrome-install.sh.
+    # RESIDUAL, narrowed twice. The probe calls and hosts are pinned by grep just below,
+    # and the script's BEHAVIOUR is pinned by executing it against a stub `curl` in three
+    # scenarios after that — so an inverted condition and a no-op'd body both fail now,
+    # each measured. What remains unpinned is everything the three scenarios do not
+    # distinguish: the log wording, the timeout value, and any behaviour that depends on a
+    # real network rather than the stub's exit code. Content-pinning the whole file is
+    # still deliberately not done, because a digest fails on every comment edit; this file
+    # likewise pins that preflight-selftest INVOKES its four guard suites, never what they
+    # contain. `bash -n` in the un-gated syntax-check step covers syntax.
+    # AGENTS.md records the same reasoning for test/assert-chrome-install.sh.
     ac3_got=$(yq_query '"last=" + (((.jobs."preflight-selftest".steps[-1].name) // "") == "Assert egress policy enforces (AC3)" | tostring)
       + " shell=" + ([.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | (.shell // "<default>")] | join(""))
       + " run=" + (([.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | .run] | join("")) | sub("\s+$"; ""))' -r)
@@ -2853,6 +2855,68 @@ else
         got:  ${ac3_got}"
             fi ;;
     esac
+
+    # BEHAVIOUR, not text: run the script against a stub `curl` and assert its exit code
+    # in three scenarios. This exists because the grep pin above counts the probe calls
+    # but cannot read their SENSE, and a reviewer on PR #226 pointed out the consequence:
+    # flipping `-eq 0` to `-ne 0`, or `if ! curl` to `if curl`, leaves all three counts at
+    # 1/1/2 and the pin green while the assertion means the OPPOSITE of what AC3 needs —
+    # the unlisted host becoming reachable would then pass as proof of enforcement. Both
+    # inversions were measured MISSED before this block was written. No pattern over
+    # free-form shell closes that; executing it does.
+    #
+    # The stub also removes the last of the "editing the body to a no-op still passes"
+    # residual: an early `exit 0` passes scenario 1 and fails 2 and 3.
+    #
+    # Three outcomes in every arm, including when the script is absent, so the count stays
+    # constant by construction the way the rest of this section is.
+    ac3_beh_dir=$(mktemp -d)
+    cat > "$ac3_beh_dir/curl" <<'AC3SHIM'
+#!/usr/bin/env bash
+# Stub curl: exit code chosen per host from the environment. Any other URL exits 0.
+for a in "$@"; do
+    case "$a" in
+        *proxy.golang.org*) exit "${SHIM_UNLISTED_RC:-7}" ;;
+        *github.com*)       exit "${SHIM_CONTROL_RC:-0}" ;;
+    esac
+done
+exit 0
+AC3SHIM
+    chmod +x "$ac3_beh_dir/curl"
+    # $1 = stubbed exit for the unlisted host, $2 = for the allowlisted control host.
+    _ac3_behaviour() {
+        local _rc
+        set +e
+        SHIM_UNLISTED_RC="$1" SHIM_CONTROL_RC="$2" PATH="$ac3_beh_dir:$PATH" \
+            bash "$SCRIPT_DIR/assert-egress-enforced.sh" >/dev/null 2>&1
+        _rc=$?
+        set -e
+        printf '%s' "$_rc"
+    }
+    if [[ -f "$SCRIPT_DIR/assert-egress-enforced.sh" ]]; then
+        ac3_b_enforcing=$(_ac3_behaviour 7 0)
+        ac3_b_notenforcing=$(_ac3_behaviour 0 0)
+        ac3_b_noegress=$(_ac3_behaviour 7 7)
+    else
+        ac3_b_enforcing=absent; ac3_b_notenforcing=absent; ac3_b_noegress=absent
+    fi
+    rm -rf "$ac3_beh_dir"
+
+    if [[ "$ac3_b_enforcing" == 0 ]]; then
+        pass "AC3 behaviour: a correctly enforcing runner (unlisted refused, control reachable) exits 0"
+    else
+        fail "test/assert-egress-enforced.sh does NOT exit 0 on the enforcing case (stub: unlisted exit 7, control exit 0) — got exit ${ac3_b_enforcing}. A working block policy would fail this job. The usual cause is an inverted condition: \`-ne 0\` where the unlisted probe needs \`-eq 0\`, or a dropped \`!\` on the control probe."
+    fi
+    if [[ "$ac3_b_notenforcing" == 1 ]]; then
+        pass "AC3 behaviour: an unlisted host that is REACHABLE fails the job (the policy is not enforcing)"
+    else
+        fail "test/assert-egress-enforced.sh does NOT fail when the unlisted host is reachable (stub: unlisted exit 0, control exit 0) — got exit ${ac3_b_notenforcing}, expected 1. This is the inversion that matters: the one runtime proof that block mode enforces would pass on a runner where it does not. Check the sense of the unlisted-probe condition."
+    fi
+    if [[ "$ac3_b_noegress" == 1 ]]; then
+        pass "AC3 behaviour: a runner with NO egress at all fails the job rather than passing vacuously"
+    else
+        fail "test/assert-egress-enforced.sh does NOT fail when the allowlisted control host is also unreachable (stub: both exit 7) — got exit ${ac3_b_noegress}, expected 1. Without this the refusal above proves nothing: a total egress outage would read as a working policy."
+    fi
 
     # The two checks above cover jobs that carry the policy and the job (LAB-6015 review)
     # SET, but not the two jobs that are exempt from it. Measured: appending a
@@ -3517,7 +3581,7 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # that runs the nested module's tests survived at 179/0.
 #
 # ── LAB-6015 (harden-runner egress: audit -> block) ───────────────────────────
-# This branch adds NINE counted outcomes on top of main's 182, all in the
+# This branch adds TWELVE counted outcomes on top of main's 182, all in the
 # "harden-runner egress policy" section. Measured at each step, never computed:
 #   +5  one per job in EXPECTED_HR_JOBS — each job's WHOLE policy compared against a
 #       pinned expectation (action SHA, `block`, disable-sudo, no `if:`, harden-runner
@@ -3532,6 +3596,12 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       invocation of test/assert-egress-enforced.sh. Measured: the step shipped
 #       unpinned and deleting it left the suite green; later, `shell: cat {0}` left the
 #       run value byte-identical while the runner merely CAT-ed the script and exited 0.
+#   +3  the AC3 script's BEHAVIOUR — the script executed against a stub `curl` in three
+#       scenarios (enforcing; unlisted host reachable; no egress at all), asserted on exit
+#       code. Measured: inverting `-eq 0` to `-ne 0`, and dropping the `!` from the control
+#       probe, each left every grep count identical and the suite green at 191/0 while the
+#       assertion meant the opposite of what AC3 needs. Text pins cannot read a condition's
+#       sense; running it can.
 #   +1  the two harden-runner-EXEMPT jobs' rationale — check-label's step body by sha256
 #       digest, install-chrome-e2e's `container:` key. Two weaker versions were measured
 #       first: counting steps missed a `curl` added INSIDE the existing single `run:`
@@ -3539,8 +3609,9 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       `python3 -c "urllib.request..."` and `exec 3<>/dev/tcp/host/443`. Enumerating
 #       egress methods has no end; pinning the body has one.
 #
-# The +9 is CONSTANT BY CONSTRUCTION across all three arms — workflow present with yq,
-# present without yq, and missing — at 9 outcomes each. That property is why
+# The +12 is CONSTANT BY CONSTRUCTION across all three arms — workflow present with yq,
+# present without yq, and missing — at 12 outcomes each. The three behavioural
+# outcomes read only the script file, never the workflow or yq, so they are constant too. That property is why
 # EXPECTED_HR_JOBS is a HARDCODED list: the first version derived it from the workflow,
 # which emitted six outcomes with yq and one without, leaving this pin wrong on any host
 # lacking yq and producing a spurious "accounting drift" failure that blamed deleted
@@ -3562,9 +3633,12 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # disable-sudo deleted; allowed-endpoints rewritten as a YAML sequence. Caught by the
 # newer pins: a job added without harden-runner; install-chrome-e2e losing `container:`;
 # the AC3 step deleted, moved off the end, repointed, or given a `shell:` override; any
-# edit at all to check-label's step body. The first two of the per-job list are the only
+# edit at all to check-label's step body; the AC3 script's unlisted host retyped, its
+# control probe deleted, its whole body no-op'd, its unlisted condition inverted to
+# `-ne 0`, and its control condition un-negated. The last two are caught only by the
+# behavioural scenarios — every grep count stays identical under both. The first two of the per-job list are the only
 # ones the pre-LAB-6015 shape check also caught.
-EXPECTED_ASSERTIONS=191
+EXPECTED_ASSERTIONS=194
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
