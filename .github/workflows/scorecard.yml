@@ -28,8 +28,24 @@ jobs:
       security-events: write
       # Needed to publish results and get a badge (publish_results below).
       id-token: write
+      # A job-level permissions block replaces the top-level default outright
+      # (unlisted scopes become none), so re-grant the reads this job needs:
+      # checkout reads the repo, and codeql-action/upload-sarif reads run
+      # metadata (matches security.yml's convention in this repo).
+      contents: read
+      actions: read
 
     steps:
+      # Defense-in-depth egress monitoring on this non-container job, per
+      # AGENTS.md (LAB-4732) and the ci.yml/security.yml convention. Audit mode
+      # logs (does not block) outbound traffic — including this workflow's
+      # intended publish to api.scorecard.dev.
+      - name: "Harden the runner"
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
       - name: "Checkout code"
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -54,6 +70,6 @@ jobs:
 
       # Surface findings in the repository's code-scanning dashboard.
       - name: "Upload to code-scanning"
-        uses: github/codeql-action/upload-sarif@6f5948dfacef28e207b48d0905cf90c03365536d # v3.37.9
+        uses: github/codeql-action/upload-sarif@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
         with:
           sarif_file: results.sarif
