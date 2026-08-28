@@ -334,18 +334,23 @@ curated, human-readable history, and the canonical record of breaking changes.
   Purely internal changes (tests, CI, refactors, dependency bumps with no
   behavior change) don't need an entry.
 - **Breaking changes are mandatory and go first.** Anything that invalidates an
-  existing `capture.json`, changes a persisted format, removes a flag, or changes
-  a default in a way that alters output goes under the `Breaking changes`
-  subsection of `[Unreleased]`, with a one-line migration note. A breaking change
-  requires a major-version bump at release time.
+  existing `capture.json`, changes a persisted format, removes a flag, changes a
+  default in a way that alters output, or breaks an exported Go API in an
+  importable package (`pkg/...`, including the embeddable `pkg/sdk`) goes under
+  the `Breaking changes` subsection of `[Unreleased]`, with a one-line migration
+  note. A breaking change requires a major-version bump at release time.
 - **Releases are cut by a maintainer.** At release time the maintainer renames
   `[Unreleased]` to the new version with a date and opens a fresh `[Unreleased]`.
   Then update the link-reference definitions at the bottom of `CHANGELOG.md`, or
   the new heading renders as literal bracketed text and the `[Unreleased]` diff
-  keeps showing already-released work (`make check-docs` will not catch either —
-  it does not resolve reference-style links):
+  keeps showing already-released work:
   - add `[<new>]: https://github.com/praetorian-inc/vespasian/compare/<prev>...v<new>`, and
   - retarget `[Unreleased]:` to `.../compare/v<new>...HEAD`.
+
+  `make check-docs` flags a version heading with no matching definition, and a
+  definition nothing uses, so a forgotten or orphaned reference is caught; it
+  cannot tell whether a definition's URL points at the right compare range, so
+  verify that by eye.
 
   Contributors do not assign version numbers.
 - **`CHANGELOG.md` and the GitHub Release notes are complementary.** goreleaser

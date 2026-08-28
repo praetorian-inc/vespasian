@@ -18,9 +18,10 @@ the canonical record of breaking changes. See
 
 ## [Unreleased]
 
-Work landed on `main` since `v1.0.0` but not yet tagged. Because this includes a
-change to a persisted on-disk format (see Breaking changes), the next tagged
-release is a new major version under SemVer.
+Curated, user-facing work landed on `main` since `v1.0.0` but not yet tagged —
+this section summarizes what matters to users rather than mirroring every commit.
+Because it includes a change to a persisted on-disk format (see Breaking
+changes), the next tagged release is a new major version under SemVer.
 
 ### Breaking changes
 
@@ -30,7 +31,10 @@ release is a new major version under SemVer.
   files produced by `v1.0.0` use the old single-value shape and are **not
   compatible** — they will not round-trip through `generate`. Regenerate the
   capture against the target with `crawl` or `import` (`scan` writes a
-  generated spec, not a `capture.json`).
+  generated spec, not a `capture.json`). This is also a source break for Go
+  consumers of `pkg/crawl`: `ObservedRequest.QueryParams` is now
+  `map[string][]string`, so importers of the package must update field access
+  and rebuild.
   ([LAB-2110](https://linear.app/praetorianlabs/issue/LAB-2110))
 - **`crawl` now rejects private seed URLs by default.** At `v1.0.0` a `crawl`
   against a private host (`localhost`, `127.0.0.1`, RFC1918, link-local)
@@ -39,6 +43,16 @@ release is a new major version under SemVer.
   naming the remedy, but scripted/CI callers crawling internal targets must be
   updated. Migration: pass `--dangerous-allow-private` to crawl a private host.
   ([LAB-2438](https://linear.app/praetorianlabs/issue/LAB-2438))
+- **Headless `crawl`/`scan` now require a system Chrome by default.** At `v1.0.0`
+  the headless crawler left the browser binary unset when none was configured, so
+  go-rod downloaded a managed Chromium and the crawl succeeded on a bare host. It
+  now resolves a locally installed Chrome/Chromium and, finding none, exits
+  non-zero rather than downloading one. Hosts that relied on the old
+  auto-download — CI images, arm64 Linux (where Google ships no Chrome build) —
+  now fail. Migration: install Chromium, pass `--headless=false` to use the
+  `net/http` backend, or set `VESPASIAN_ALLOW_BROWSER_DOWNLOAD=true` to restore
+  the managed download.
+  ([LAB-4999](https://linear.app/praetorianlabs/issue/LAB-4999))
 
 ### Added
 
@@ -64,8 +78,10 @@ release is a new major version under SemVer.
   ([LAB-2106](https://linear.app/praetorianlabs/issue/LAB-2106)) and typed
   parameter extraction from SOAP request bodies
   ([LAB-2111](https://linear.app/praetorianlabs/issue/LAB-2111)).
-- **Multi-value query parameters** preserved end-to-end from capture through spec
-  generation (the change behind the breaking `query_params` shape above).
+- **Multi-value query parameters** carried from capture through spec generation
+  (the change behind the breaking `query_params` shape above). To bound untrusted
+  captures, at most 512 keys and 256 values per key are retained; excess is
+  dropped silently.
   ([LAB-2110](https://linear.app/praetorianlabs/issue/LAB-2110))
 - **Richer REST path handling.** Path-parameter detection beyond UUIDs and numeric
   IDs, and opt-in slug path-merging via `--merge-slugs` / `--slug-threshold`.
@@ -79,6 +95,12 @@ release is a new major version under SemVer.
   [LAB-4993](https://linear.app/praetorianlabs/issue/LAB-4993))
 - **Session cookie propagation** across headless crawl requests.
   ([LAB-2222](https://linear.app/praetorianlabs/issue/LAB-2222))
+- **Interaction-driven crawling.** `--interact` clicks page controls (buttons,
+  `[role=button]`, `[onclick]`, and form submit buttons) to surface endpoints
+  that only fire on interaction. Because it submits forms it can mutate state; it
+  is headless-backend only and off by default.
+- **Captured-request budget.** `--max-requests` caps the total number of captured
+  requests (`0` = unlimited), a politeness bound distinct from `--max-pages`.
 - **mitmproxy native tnetstring flow format** support in the importer, alongside
   the existing Burp XML and HAR importers.
   ([LAB-2309](https://linear.app/praetorianlabs/issue/LAB-2309))
@@ -92,10 +114,10 @@ release is a new major version under SemVer.
   go-rod (headless) and `net/http` backends; Katana was removed entirely.
   ([LAB-2785](https://linear.app/praetorianlabs/issue/LAB-2785),
   [LAB-2786](https://linear.app/praetorianlabs/issue/LAB-2786))
-- **Crawler egress hardened.** The crawler now pins the system Chrome (no
-  auto-download) and disables browser telemetry; set `VESPASIAN_NO_SANDBOX=true`
-  for containerized runs.
-  ([LAB-4999](https://linear.app/praetorianlabs/issue/LAB-4999))
+- **OpenAPI schema component names changed.** Generated OpenAPI schema component
+  names changed since `v1.0.0` (e.g. `Email-addressResponse` →
+  `EmailAddressResponse`), so downstream OpenAPI code generators emit different
+  type names from the spec. Endpoint paths and payloads are unchanged.
 - **Deterministic output.** Request-to-endpoint mapping and classification
   ordering are now stable, so repeated runs and `scan` vs. two-stage
   `crawl`/`generate` produce byte-identical specs.
@@ -114,10 +136,24 @@ release is a new major version under SemVer.
 - SSRF validation applied to proxied source-map fetches, so reaching private
   targets still requires `--dangerous-allow-private`.
   ([LAB-4993](https://linear.app/praetorianlabs/issue/LAB-4993))
+- **Crawler egress hardened, with two Chrome protections traded off.** The
+  headless crawler pins a locally installed Chrome instead of downloading one
+  (removing a third-party-mirror fetch) and suppresses Chrome's telemetry chatter
+  to Google. Two of those suppressions reduce in-crawl defense-in-depth:
+  `--disable-component-update` also stops CRLSet and Safe Browsing list refreshes
+  (Chrome falls back to the build-time CRLSet for the crawl's duration), and
+  disabling `SafeBrowsingHashPrefixRealTimeLookups` turns off real-time
+  hash-prefix lookups (the locally-cached list still applies). Accepted for
+  short-lived, operator-initiated crawls; TLS chain verification against the OS
+  trust store and the SSRF/scope guards remain in force.
+  ([LAB-4999](https://linear.app/praetorianlabs/issue/LAB-4999))
 - Importer input hardened against untrusted traffic. A shared 500 MB file-size
   cap bounds every format (Burp XML, HAR, and both mitmproxy paths). The native
   mitmproxy tnetstring path adds finer-grained limits — a 64 MB per-element cap
-  and a 500k flow-count cap — and rejects host/port smuggling.
+  and a 500k flow-count cap. Host-field validation — rejecting empty, overlong,
+  userinfo-bearing, and port-smuggling hosts — is applied at the importer
+  boundary for both mitmproxy paths, including the JSON importer that shipped in
+  `v1.0.0`.
 
 ### Compatibility notes
 
@@ -141,8 +177,11 @@ that discovers endpoints from observed HTTP traffic.
   and `generate` run them independently.
 - **Specification generators:** OpenAPI 3.0 (REST), GraphQL SDL, and WSDL.
 - **Traffic importers:** Burp XML, HAR, and mitmproxy.
-- **SSRF protection** with connect-time re-resolution to defeat DNS rebinding;
-  private targets require an explicit `--dangerous-allow-private`.
+- **SSRF protection** for the probe path, with connect-time re-resolution to
+  defeat DNS rebinding: `generate` and `scan` require an explicit
+  `--dangerous-allow-private` to probe private targets. (`crawl` had no
+  private-target gate at `v1.0.0`; the crawl frontier's SSRF check is an
+  `[Unreleased]` breaking change.)
 
 [Unreleased]: https://github.com/praetorian-inc/vespasian/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/praetorian-inc/vespasian/releases/tag/v1.0.0
