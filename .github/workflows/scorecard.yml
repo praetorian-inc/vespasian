@@ -1,0 +1,59 @@
+# OpenSSF Scorecard — objective, ongoing supply-chain hygiene scoring.
+# Complements (does not replace) security.yml, secrets-scan.yml, dependabot.yml
+# and verify-pins.yml. verify-pins.yml remains the enforced source of truth for
+# pin honesty on praetorian-inc/public-workflows references; Scorecard's
+# Pinned-Dependencies check is advisory scoring only — see the PR that added
+# this file for the reconciliation rationale.
+name: Scorecard supply-chain security
+
+on:
+  # Keeps the Branch-Protection check evaluating the current default-branch rules.
+  branch_protection_rule:
+  # Keeps the Maintained check fresh and re-scores on a regular cadence.
+  schedule:
+    - cron: "20 6 * * 1" # Mondays 06:20 UTC (aligns with security.yml's weekly cadence)
+  push:
+    branches: ["main"]
+
+# Declare default permissions as read-only.
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # Needed to upload the results to the code-scanning dashboard.
+      security-events: write
+      # Needed to publish results and get a badge (publish_results below).
+      id-token: write
+
+    steps:
+      - name: "Checkout code"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: "Run analysis"
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # Publish results to the OpenSSF REST API so the README badge resolves
+          # to a live score. Requires the id-token: write permission above.
+          publish_results: true
+
+      # Upload the raw SARIF as a workflow artifact for offline inspection.
+      - name: "Upload artifact"
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: SARIF file
+          path: results.sarif
+          retention-days: 5
+
+      # Surface findings in the repository's code-scanning dashboard.
+      - name: "Upload to code-scanning"
+        uses: github/codeql-action/upload-sarif@6f5948dfacef28e207b48d0905cf90c03365536d # v3.37.9
+        with:
+          sarif_file: results.sarif
