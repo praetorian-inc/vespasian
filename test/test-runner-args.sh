@@ -3014,9 +3014,9 @@ else
             fi
             exempt_got="${exempt_head} bodysha=${exempt_sha}"
             if [[ "$exempt_got" == "$exempt_want" ]]; then
-                pass "both harden-runner-exempt jobs still match their exemption rationale (check-label: one inline step, body digest unchanged; install-chrome-e2e: a container job)"
+                pass "both harden-runner-exempt jobs still match their exemption rationale (check-label: one inline step, and a digest over its WHOLE job node — if:, outputs:, step ids, runs-on and all — unchanged; install-chrome-e2e: a container job with its trigger if: unchanged)"
             else
-                fail "a harden-runner-EXEMPT job no longer matches the rationale that exempts it, so it may now make network calls under no egress policy. Either restore the rationale, or give the job a harden-runner step and add it to EXPECTED_HR_JOBS and hr_expected.
+                fail "a harden-runner-EXEMPT job no longer matches the rationale that exempts it. Two things land here: it may now make network calls under no egress policy, OR — for check-label, whose whole node is digested because both gated jobs depend on its outputs — an edit to its if:, outputs:, step ids or runs-on that would skip integration-tests and test on every event while every other pin stays green. Either restore the rationale, or give the job a harden-runner step and add it to EXPECTED_HR_JOBS and hr_expected.
         want: ${exempt_want}
         got:  ${exempt_got}"
             fi ;;
