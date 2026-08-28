@@ -149,9 +149,8 @@ type engineOptions struct {
 	// an empty capture. Only the visit of the SEED ITSELF calls it, gated on
 	// frontier-key identity rather than on Depth == 0 — resume restores pending
 	// entries before the seed is pushed and honors the depth the checkpoint claims,
-	// so depth 0 stopped being a reliable proxy for "is the seed" (LAB-4678 review,
-	// SEC-BE-004). See [learnSeedOrigin] and [seedScope] for the containment
-	// reasoning.
+	// so depth 0 stopped being a reliable proxy for "is the seed" (LAB-4678 review).
+	// See [learnSeedOrigin] and [seedScope] for the containment reasoning.
 	LearnEffectiveOrigin func(effectiveURL string)
 
 	// Completion-driven capture bounds (0 → the Default* above).
@@ -193,7 +192,7 @@ type rodEngine struct {
 	// backend, where one page is one request so it degenerates to a page cap.
 	// Removing `maxRequests := e.opts.MaxRequests` would have left --max-requests
 	// silently inert on the backend Guard actually uses, with every test still green
-	// (LAB-4678 review, TEST-004).
+	// (LAB-4678 review).
 	visit func(ctx context.Context, target urlEntry) ([]ObservedRequest, []string, error)
 }
 
@@ -280,7 +279,7 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 			"pass %s", redactSeedURL(seedURL), flagDangerousAllowPrivate)
 	}
 
-	// Track pages VISITED for MaxPages enforcement (LAB-4678, A1). The budget
+	// Track pages VISITED for MaxPages enforcement (LAB-4678). The budget
 	// counts pages (URLs visited), not captured requests: a single SPA page can
 	// fire dozens of XHR/fetch calls, so counting requests truncated the crawl
 	// far earlier than "max pages" implies, and hard-canceling the shared
@@ -302,7 +301,7 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 	// Workers run under ctx directly. The page budget no longer cancels the
 	// crawl (it just stops workers from taking new pages under the mutex), so
 	// the former context.WithCancel wrapper served no purpose beyond ctx's own
-	// parent cancellation and was removed (QUAL-006).
+	// parent cancellation and was removed.
 	var wg sync.WaitGroup
 	for i := range e.opts.Concurrency {
 		wg.Add(1)
@@ -625,7 +624,8 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 		return nil, nil, fmt.Errorf("create tab: %w", err)
 	}
 	defer func() {
-		page.Close() //nolint:errcheck,gosec // best-effort close; page may already be closed
+		// #nosec G104
+		page.Close() //nolint:errcheck // best-effort close; page may already be closed
 	}()
 
 	// Apply context and per-page timeout. pageDeadline mirrors that timeout as a
@@ -732,7 +732,7 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 // config — so under the proxy gate anyone able to write to checkpoint storage chose
 // which page decided the scope widening. Comparing against the seed's frontier key
 // restores the invariant seedScope's containment argument depends on
-// (LAB-4678 review, SEC-BE-004).
+// (LAB-4678 review).
 func (e *rodEngine) learnSeedOrigin(page *rod.Page, target urlEntry) {
 	if e.opts.LearnEffectiveOrigin == nil || seenKey(target.URL) != e.seedKey {
 		return
@@ -764,7 +764,7 @@ func (e *rodEngine) enrichTarget(page *rod.Page, navigated bool, pageURL string)
 		// https://admin:s3cret@target/` wrote cleartext credentials to stderr, which
 		// lands in CI job logs, shell scrollback, and any wrapper capturing the
 		// capability's stderr. Every other operator-facing URL echo in this package
-		// already redacts; this one was added without it (LAB-4678 review, SEC-BE-005).
+		// already redacts; this one was added without it (LAB-4678 review).
 		fmt.Fprintf(e.opts.Stderr, "interact: a click navigated away from %s and the page could not be restored; skipping DOM enrichment for it\n", redactSeedURL(pageURL)) //nolint:errcheck // best-effort
 	}
 	return nil
@@ -783,7 +783,7 @@ func (e *rodEngine) enrichTarget(page *rod.Page, navigated bool, pageURL string)
 // each return was O(total captured bytes) for the page. interactPage calls this once
 // per click plus once per returnToPage, so a page paid up to 16 full reconstructions
 // purely to throw them away, across Concurrency tabs, scaled by attacker-controlled
-// page content (LAB-4678 review, QUAL-005/SEC-BE-006).
+// page content (LAB-4678 review).
 //
 // deadline is the WHOLE PAGE's ceiling, shared by the baseline wait and every
 // interaction wait, so a page cannot exceed its budget by calling this
@@ -886,10 +886,10 @@ func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, 
 	// A nil page means the DOM must not (or cannot) be read. visitPage passes nil
 	// when an interaction click navigated away, so the live DOM belongs to a
 	// document this worker was never assigned; the merger-threading contract is
-	// also tested through this path without standing up a real rod.Page (round-11
-	// TEST-001). jsluice over the captured RESPONSE bodies is a pure function of
-	// `captured` and stays valid either way, so it still runs — only the
-	// DOM-sourced inputs (hrefs, inline scripts, forms) are dropped.
+	// also tested through this path without standing up a real rod.Page. jsluice
+	// over the captured RESPONSE bodies is a pure function of `captured` and stays
+	// valid either way, so it still runs — only the DOM-sourced inputs (hrefs,
+	// inline scripts, forms) are dropped.
 	if page == nil {
 		captured, links := mergeEnrichedLinksFn(captured, nil, extractURLsFromResponses(captured), nil, nil, pageURL, pageURL, scopeFn)
 		return captured, links
@@ -934,7 +934,7 @@ func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, 
 // page-extracted inputs with scope enforcement. Package-level var so tests
 // can verify the scopeFn argument is threaded correctly from e.opts.ScopeCheck
 // through enrichFromPage to mergeEnrichedLinks (the one-line call was
-// previously integration-only coverage — see LAB-2221 round-11 TEST-001).
+// previously integration-only coverage — see LAB-2221).
 // Production callers always see the real mergeEnrichedLinks.
 //
 // NOT PARALLEL-SAFE: tests swap this via a t.Cleanup-restored pattern and

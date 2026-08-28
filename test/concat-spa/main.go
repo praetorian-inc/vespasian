@@ -80,7 +80,7 @@ func main() {
 	// live in test/internal/target, so there is one copy to reason about and one
 	// place for Test 18b to assert.
 	addr := target.Addr(port)
-	log.Printf("concat-spa listening on http://%s/", addr) //nolint:gosec // G706: local test target; port is a controlled PORT env/default, not attacker input
+	log.Printf("concat-spa listening on http://%s/", addr) // #nosec G706 -- local test target; port is a controlled PORT env/default, not attacker input
 	srv := target.Server(addr, mux)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
